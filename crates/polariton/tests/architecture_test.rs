@@ -4666,7 +4666,31 @@ fn product_0114_band_requirements_precede_and_feed_shared_geometry() {
 			.find("grid_tiled_area_with_requirements")
 			.expect("tiled geometry reads aggregated requirements");
 		assert!(layouts < requirements && requirements < tiled);
+
+		// PRODUCT-0139 §6, composite half: cell geometry resolves per cell, and
+		// all three entry points must say so identically. They re-derive this
+		// sequence independently, so a rule enforced in one of them and not the
+		// others is the same divergence the step-0 audit found between
+		// `settings` and `settings_model`.
+		assert!(
+			section.contains("self.cell_layouts(settings)"),
+			"{entrypoint} must pass the settings model, not a figure-wide resolution"
+		);
 	}
+
+	// The per-cell plot rectangle — the raster's width and height — is cell
+	// geometry too, and is resolved once per cell in each entry point's loop.
+	assert_eq!(
+		composite
+			.matches("cell.kernel.resolve_settings(settings)")
+			.count(),
+		3,
+		"each grid entry point resolves the cell's plot area through its own kernel"
+	);
+	assert!(
+		!composite.contains("grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &resolved)"),
+		"no grid entry point may take a cell's plot area from the figure-wide resolution"
+	);
 }
 
 #[test]

@@ -794,6 +794,59 @@ mod product_0013_baseline_tests {
 		"</svg>"
 	);
 
+	/// PRODUCT-0139 §3 gate 5: the plot-area clip follows the mark, so both
+	/// authoring spellings of one mark clip alike.
+	///
+	/// `scatter("x","y")` lowers to `ScatterPlotKernel`; `scatter("x","y")
+	/// .point_size(n)` lowers to a one-layer `LayeredPlotKernel`. Before the
+	/// declaration moved to the mark, only the first clipped, and the same
+	/// picture rendered differently depending on whether a modifier was spelled.
+	///
+	/// The line-only layered kernel is the discriminating control: without it
+	/// this gate would pass on an implementation that clips every layered plot
+	/// unconditionally, which is a different rule with a much wider blast
+	/// radius.
+	#[test]
+	fn product_0139_the_plot_area_clip_follows_the_mark_not_the_kernel() {
+		let frame = df!("x" => [0.0_f64, 1.0, 2.0], "y" => [2.0_f64, 4.0, 6.0]).expect("frame");
+
+		let bare = create_authored_plot(
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x", "y"),
+			&frame,
+			200,
+			200,
+		)
+		.expect("bare scatter kernel");
+
+		let mut modified_layer = LayerSpec::xy(LayerMark::Scatter, "x", "y");
+		modified_layer.settings.point_size = Override::Set(PointSize::new(2.0).expect("in range"));
+		let modified = create_layered_plot(&LayeredPlotSpec::new(modified_layer), &frame, 200, 200)
+			.expect("modified scatter kernel");
+
+		let line_only = create_layered_plot(
+			&LayeredPlotSpec::new(LayerSpec::xy(LayerMark::Line, "x", "y")),
+			&frame,
+			200,
+			200,
+		)
+		.expect("line kernel");
+
+		// Control first: the probe must be able to answer "no".
+		assert!(
+			!line_only.requires_plot_area_clip(),
+			"a line-only layered kernel must not request the clip, or this gate \
+			 cannot distinguish a mark-driven rule from an unconditional one"
+		);
+
+		// The claim: one mark, two kernels, one answer.
+		assert!(bare.requires_plot_area_clip());
+		assert!(modified.requires_plot_area_clip());
+		assert_eq!(
+			bare.requires_plot_area_clip(),
+			modified.requires_plot_area_clip()
+		);
+	}
+
 	#[test]
 	fn product_0021_full_band_default_retires_the_legacy_inset() {
 		let prepared = Arc::new(bar::prepare_bar_data(&bar_fixture(), "cat", "", "val"));
@@ -2289,7 +2342,7 @@ mod product_0013_baseline_tests {
 
 			for extent in [200.0_f32, 600.0] {
 				let bounds = Rectangle::new(Point::ORIGIN, Size::new(extent, extent));
-				let layout = kernel.layout(plot_settings.resolve());
+				let layout = kernel.layout(kernel.resolve_settings(&plot_settings));
 				let transform = CoordinateTransformer::new(&layout, bounds);
 				let mut backend = RectangleBackend::default();
 				kernel.plot_with_settings(

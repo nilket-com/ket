@@ -170,7 +170,7 @@ impl DatabaseAdapter for ToronAdapter {
 #[cfg(test)]
 mod tests {
 	use super::{DatabaseAdapter, ExecutionResult, ToronAdapter};
-	use crate::plot::common::{PlotRenderLayer, PlotWidget, ResolvedPlotSettings};
+	use crate::plot::common::{PlotRenderLayer, PlotWidget};
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::core::PlotType;
 	use crate::plot::export::SvgBackend;
@@ -264,16 +264,15 @@ mod tests {
 
 			let composition = PlotComposition::single(PlotType::Scatter);
 			let kernel = create_automatic_plot(composition, &frame, 800, 480)?;
-			let widget = PlotWidget {
-				kernel: kernel.as_ref(),
-				title: "Toron SQL live gate".to_owned(),
-				padding: 0.0,
-				settings: ResolvedPlotSettings::default(),
-				settings_model: crate::plot::theme::PlotSettings::default(),
-				render_revision: 0,
-				resize_render_suspended: false,
-				layer: PlotRenderLayer::Full,
-			};
+			let widget = PlotWidget::new(
+				kernel.as_ref(),
+				"Toron SQL live gate".to_owned(),
+				0.0,
+				crate::plot::theme::PlotSettings::default(),
+				0,
+				false,
+				PlotRenderLayer::Full,
+			);
 			let mut backend = SvgBackend::new(800.0, 480.0);
 			widget.render(
 				&mut backend,
@@ -383,16 +382,15 @@ mod tests {
 						.expect("resolve relation plot fields");
 						assert_eq!(kernel.x_label(), expected_x);
 						assert_eq!(kernel.y_label(), expected_y);
-						let widget = PlotWidget {
-							kernel: kernel.as_ref(),
-							title: "Rune relation first contact".to_owned(),
-							padding: 0.0,
-							settings: ResolvedPlotSettings::default(),
-							settings_model: crate::plot::theme::PlotSettings::default(),
-							render_revision: 0,
-							resize_render_suspended: false,
-							layer: PlotRenderLayer::Full,
-						};
+						let widget = PlotWidget::new(
+							kernel.as_ref(),
+							"Rune relation first contact".to_owned(),
+							0.0,
+							crate::plot::theme::PlotSettings::default(),
+							0,
+							false,
+							PlotRenderLayer::Full,
+						);
 						let mut backend = SvgBackend::new(800.0, 480.0);
 						widget.render(
 							&mut backend,
@@ -549,16 +547,15 @@ mod tests {
 			let transfer_prepare_ms = started.elapsed().as_secs_f64() * 1000.0;
 			assert_eq!(frame.height(), n as usize);
 
-			let widget = PlotWidget {
-				kernel: kernel.as_ref(),
-				title: format!("{n} points"),
-				padding: 0.0,
-				settings: ResolvedPlotSettings::default(),
-				settings_model: crate::plot::theme::PlotSettings::default(),
-				render_revision: 0,
-				resize_render_suspended: false,
-				layer: PlotRenderLayer::Full,
-			};
+			let widget = PlotWidget::new(
+				kernel.as_ref(),
+				format!("{n} points"),
+				0.0,
+				crate::plot::theme::PlotSettings::default(),
+				0,
+				false,
+				PlotRenderLayer::Full,
+			);
 			let bounds = Rectangle::new([0.0, 0.0].into(), [1200.0, 720.0].into());
 
 			// Stage 3 — first render, then steady state. Separate backends so
@@ -697,16 +694,15 @@ mod tests {
 		let kernel =
 			create_authored_plot(AuthoredPlotSpec::violin(violin.0.clone()), &frame, 800, 480)
 				.expect("the delivered density relation resolves into a violin kernel");
-		let widget = PlotWidget {
-			kernel: kernel.as_ref(),
-			title: "PRODUCT-0108 violin".to_owned(),
-			padding: 0.0,
-			settings: ResolvedPlotSettings::default(),
-			settings_model: crate::plot::theme::PlotSettings::default(),
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			kernel.as_ref(),
+			"PRODUCT-0108 violin".to_owned(),
+			0.0,
+			crate::plot::theme::PlotSettings::default(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		let mut backend = SvgBackend::new(800.0, 480.0);
 		widget.render(
 			&mut backend,
@@ -763,16 +759,15 @@ mod tests {
 		assert_eq!(kernel.x_label(), "x");
 		assert_eq!(kernel.y_label(), "y");
 
-		let widget = PlotWidget {
-			kernel: kernel.as_ref(),
-			title: "Rune line view".to_owned(),
-			padding: 0.0,
-			settings: ResolvedPlotSettings::default(),
-			settings_model: crate::plot::theme::PlotSettings::default(),
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			kernel.as_ref(),
+			"Rune line view".to_owned(),
+			0.0,
+			crate::plot::theme::PlotSettings::default(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		let mut backend = SvgBackend::new(800.0, 480.0);
 		widget.render(
 			&mut backend,

@@ -1,6 +1,6 @@
 use crate::plot::common::{
 	AxisType, CoordinateTransformer, MarkHit, MarkRenderer, PlotBackend, PlotKernel, PlotLayout,
-	ResolvedPlotSettings, ScatterRenderMode, TemporalAxisDomain, format_label,
+	ResolvedPlotSettings, ScatterRenderMode, TemporalAxisDomain, ViewportMotion, format_label,
 	polars_type_to_axis_type, temporal_axis_domain,
 };
 use crate::plot::legend::LegendProvenance;
@@ -53,7 +53,94 @@ struct ScatterRasterKey {
 	series_colors: Vec<[u8; 4]>,
 }
 
+/// PRODUCT-0139 §2: the placement of a reused raster, in image space.
+///
+/// `cartesian` (`plot/common.rs`) is linear in the domain, so the old-to-new
+/// screen map is affine and determined entirely by the two key range pairs and
+/// the raster size — no access to the data, and no access to anything the cache
+/// does not already store.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ReusePlacement {
+	top_left: Point,
+	size: iced::Size,
+}
+
+/// `None` when the map is not derivable — a degenerate extent, or a
+/// non-Cartesian key whose ranges are recorded as `(0, 0)`.
+fn reuse_placement(
+	cached: &ScatterRasterKey,
+	current: &ScatterRasterKey,
+	width: f32,
+	height: f32,
+) -> Option<ReusePlacement> {
+	let (x0o, x1o) = (
+		f64::from_bits(cached.x_range.0),
+		f64::from_bits(cached.x_range.1),
+	);
+	let (y0o, y1o) = (
+		f64::from_bits(cached.y_range.0),
+		f64::from_bits(cached.y_range.1),
+	);
+	let (x0n, x1n) = (
+		f64::from_bits(current.x_range.0),
+		f64::from_bits(current.x_range.1),
+	);
+	let (y0n, y1n) = (
+		f64::from_bits(current.y_range.0),
+		f64::from_bits(current.y_range.1),
+	);
+	let (dxo, dyo) = (x1o - x0o, y1o - y0o);
+	let (dxn, dyn_) = (x1n - x0n, y1n - y0n);
+	if ![dxo, dyo, dxn, dyn_]
+		.iter()
+		.all(|d| d.is_finite() && d.abs() > f64::EPSILON)
+	{
+		return None;
+	}
+
+	let scale_x = dxo / dxn;
+	let scale_y = dyo / dyn_;
+	let left = (x0o - x0n) * f64::from(width) / dxn;
+	// The vertical axis is inverted by `cartesian`, so the offset absorbs the
+	// flip: a row of the cached image maps to `H - (y0ᵒ − y0ⁿ)·H/Δyⁿ − H·scale_y`
+	// plus `scale_y` times its own position.
+	let top =
+		f64::from(height) - (y0o - y0n) * f64::from(height) / dyn_ - f64::from(height) * scale_y;
+	Some(ReusePlacement {
+		top_left: Point::new(left as f32, top as f32),
+		size: iced::Size::new(width * scale_x as f32, height * scale_y as f32),
+	})
+}
+
+impl ScatterRasterKey {
+	/// PRODUCT-0139 §2: everything except the domain must be identical, or the
+	/// cached pixels do not depict the same marks at a different viewport.
+	fn reusable_for(&self, current: &Self) -> bool {
+		self.width == current.width
+			&& self.height == current.height
+			&& self.point_size == current.point_size
+			&& self.background == current.background
+			&& self.series_colors == current.series_colors
+			&& (self.x_range != current.x_range || self.y_range != current.y_range)
+	}
+}
+
 impl PlotKernel for ScatterPlotKernel {
+	/// PRODUCT-0139 §3: honoured, not decided — the answer comes from the mark,
+	/// so this kernel and the one-layer `LayeredPlotKernel` that a modified
+	/// spelling produces cannot disagree.
+	fn requires_plot_area_clip(&self) -> bool {
+		self.renderer.requires_plot_area_clip()
+	}
+
+	/// PRODUCT-0139 §6: scatter is single-layer, so the value its renderer draws
+	/// with is the authority for geometry too. `draw` resolves exactly this via
+	/// `plot_with_settings` below, which is what makes the transform, the
+	/// resolved render mode, and `ScatterRasterKey` one resolution, not two.
+	fn resolve_settings(&self, settings: &PlotSettings) -> ResolvedPlotSettings {
+		settings.resolve_for_layer(&self.layer_settings)
+	}
+
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		if let Some(categories) = &self.prepared_data.x_categories {
 			return PlotLayout::CategoricalX {
@@ -105,6 +192,24 @@ impl PlotKernel for ScatterPlotKernel {
 			bounds,
 			transform,
 			settings.resolve_for_layer(&self.layer_settings),
+		);
+	}
+
+	fn plot_with_motion(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		_cursor: Cursor,
+		settings: &PlotSettings,
+		motion: ViewportMotion,
+	) {
+		self.renderer.draw_with_motion(
+			backend,
+			bounds,
+			transform,
+			settings.resolve_for_layer(&self.layer_settings),
+			motion,
 		);
 	}
 
@@ -308,14 +413,52 @@ impl ScatterMarkRenderer {
 		bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		settings: &ResolvedPlotSettings,
+		motion: ViewportMotion,
 	) {
-		let raster = self.rasterize(bounds, transform, settings);
-		let size = iced::Size::new(bounds.width.max(1.0), bounds.height.max(1.0));
+		let width = bounds.width.max(1.0);
+		let height = bounds.height.max(1.0);
+		let key = self.raster_key(bounds, transform, settings);
+
+		// PRODUCT-0139 §1 and §5. A settled frame always rasterizes truly, so
+		// "exactly one true rasterization at settle" needs no settle event: it
+		// is the first frame after motion stops. Reuse is attempted only while
+		// moving, and only against the **last true raster** — the reuse branch
+		// stores nothing, which is §5's no-chaining rule by construction rather
+		// than by discipline.
+		if motion == ViewportMotion::Moving {
+			let cached = self.raster_cache.lock().unwrap().clone();
+			if let Some(cached) = cached {
+				if cached.key != key
+					&& cached.key.reusable_for(&key)
+					&& let Some(placement) = reuse_placement(&cached.key, &key, width, height)
+				{
+					self.draw_raster(backend, placement.top_left, placement.size, &cached);
+					return;
+				}
+			}
+		}
+
+		let raster = self.rasterize_with_key(key, bounds, transform, settings);
+		self.draw_raster(
+			backend,
+			Point::ORIGIN,
+			iced::Size::new(width, height),
+			&raster,
+		);
+	}
+
+	fn draw_raster(
+		&self,
+		backend: &mut dyn PlotBackend,
+		top_left: Point,
+		size: iced::Size,
+		raster: &ScatterRasterCache,
+	) {
 		if backend.supports_native_image_handle() {
-			backend.draw_image_handle(Point::ORIGIN, size, &raster.image_handle);
+			backend.draw_image_handle(top_left, size, &raster.image_handle);
 		} else {
 			backend.draw_image_rgba(
-				Point::ORIGIN,
+				top_left,
 				size,
 				raster.width,
 				raster.height,
@@ -324,17 +467,42 @@ impl ScatterMarkRenderer {
 		}
 	}
 
-	fn rasterize(
+	/// PRODUCT-0139 §1. `MarkRenderer::draw` delegates here with `Settled`, so
+	/// every path that has not opted into motion rasterizes truly.
+	pub(crate) fn draw_with_motion(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		settings: ResolvedPlotSettings,
+		motion: ViewportMotion,
+	) {
+		let mode = resolve_render_mode(
+			self.prepared_data.total_points,
+			backend.supports_embedded_raster(),
+			bounds,
+			&settings,
+		);
+		match mode {
+			ResolvedScatterRenderMode::Vector => self.plot_vector(backend, transform, &settings),
+			ResolvedScatterRenderMode::Downsampled => {
+				self.plot_downsampled(backend, bounds, transform, &settings)
+			}
+			ResolvedScatterRenderMode::Rasterized => {
+				self.plot_rasterized(backend, bounds, transform, &settings, motion)
+			}
+		}
+	}
+
+	fn raster_key(
 		&self,
 		bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		settings: &ResolvedPlotSettings,
-	) -> ScatterRasterCache {
-		let width = bounds.width.max(1.0).ceil() as u32;
-		let height = bounds.height.max(1.0).ceil() as u32;
-		let key = ScatterRasterKey {
-			width,
-			height,
+	) -> ScatterRasterKey {
+		ScatterRasterKey {
+			width: bounds.width.max(1.0).ceil() as u32,
+			height: bounds.height.max(1.0).ceil() as u32,
 			point_size: settings.point_size.factor().to_bits(),
 			x_range: current_x_range_bits(transform),
 			y_range: current_y_range_bits(transform),
@@ -345,7 +513,30 @@ impl ScatterMarkRenderer {
 				.iter()
 				.map(|series| color_to_rgba8(series_color(series, settings)))
 				.collect(),
-		};
+		}
+	}
+
+	/// The whole-key form: compute the key, then hit or build. Reuse needs the
+	/// key before deciding, so the two steps are separate above.
+	fn rasterize(
+		&self,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		settings: &ResolvedPlotSettings,
+	) -> ScatterRasterCache {
+		let key = self.raster_key(bounds, transform, settings);
+		self.rasterize_with_key(key, bounds, transform, settings)
+	}
+
+	fn rasterize_with_key(
+		&self,
+		key: ScatterRasterKey,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		settings: &ResolvedPlotSettings,
+	) -> ScatterRasterCache {
+		let width = key.width;
+		let height = key.height;
 
 		if let Some(existing) = self
 			.raster_cache
@@ -378,6 +569,15 @@ impl ScatterMarkRenderer {
 }
 
 impl MarkRenderer for ScatterMarkRenderer {
+	/// PRODUCT-0139 §3. A translated or scaled raster is not bounded the way
+	/// today's ORIGIN-anchored, exact-size blit is, so image-space reuse would
+	/// paint over the axis bands and the legend without this. It also bounds the
+	/// vector and downsampled paths, whose marks carry a radius and can already
+	/// overhang a domain edge by it.
+	fn requires_plot_area_clip(&self) -> bool {
+		true
+	}
+
 	fn draw(
 		&self,
 		backend: &mut dyn PlotBackend,
@@ -385,21 +585,13 @@ impl MarkRenderer for ScatterMarkRenderer {
 		transform: &CoordinateTransformer,
 		settings: ResolvedPlotSettings,
 	) {
-		let mode = resolve_render_mode(
-			self.prepared_data.total_points,
-			backend.supports_embedded_raster(),
+		self.draw_with_motion(
+			backend,
 			bounds,
-			&settings,
+			transform,
+			settings,
+			ViewportMotion::Settled,
 		);
-		match mode {
-			ResolvedScatterRenderMode::Vector => self.plot_vector(backend, transform, &settings),
-			ResolvedScatterRenderMode::Downsampled => {
-				self.plot_downsampled(backend, bounds, transform, &settings)
-			}
-			ResolvedScatterRenderMode::Rasterized => {
-				self.plot_rasterized(backend, bounds, transform, &settings)
-			}
-		}
 	}
 
 	fn hit_test(
@@ -497,6 +689,17 @@ fn series_color(series: &ScatterSeries, settings: &ResolvedPlotSettings) -> Colo
 		.unwrap_or_else(|| settings.color_theme.get_color(series.color_t))
 }
 
+/// PRODUCT-0139 §10 gate 1's instrument: how many times the source points have
+/// been scanned. A reused frame must not move it.
+///
+/// Thread-local, not global: libtest runs each test on its own thread, and a
+/// shared counter would be raced by any other test that rasterizes — which
+/// showed up immediately as a gate that passed alone and failed in the suite.
+#[cfg(test)]
+thread_local! {
+	pub(crate) static RASTER_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn build_raster_rgba(
 	prepared_data: &ScatterPreparedData,
 	bounds: Rectangle,
@@ -505,6 +708,8 @@ fn build_raster_rgba(
 ) -> Vec<u8> {
 	let width = bounds.width.max(1.0).ceil() as usize;
 	let height = bounds.height.max(1.0).ceil() as usize;
+	#[cfg(test)]
+	RASTER_BUILDS.with(|builds| builds.set(builds.get() + 1));
 	let mut accum = vec![[0.0_f32; 4]; width * height];
 	let radius = settings.point_size.radius_px();
 	let radius_squared = radius * radius;
@@ -1170,7 +1375,9 @@ mod tests {
 		fn frame(n: usize, series: usize) -> DataFrame {
 			let mut state: u64 = 0x2026_0825;
 			let mut next = || {
-				state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+				state = state
+					.wrapping_mul(6364136223846793005)
+					.wrapping_add(1442695040888963407);
 				((state >> 11) as f64) / ((1u64 << 53) as f64)
 			};
 			let xs: Vec<f64> = (0..n).map(|_| next()).collect();
@@ -1178,8 +1385,7 @@ mod tests {
 			if series <= 1 {
 				df!("x" => xs, "y" => ys).expect("frame")
 			} else {
-				let labels: Vec<String> =
-					(0..n).map(|i| format!("s{}", i % series)).collect();
+				let labels: Vec<String> = (0..n).map(|i| format!("s{}", i % series)).collect();
 				df!("x" => xs, "y" => ys, "series" => labels).expect("frame")
 			}
 		}
@@ -1208,30 +1414,25 @@ mod tests {
 			let kernel = create_authored_plot(spec, &df, bounds_px.0 as u32, bounds_px.1 as u32)
 				.expect("kernel");
 			let prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
-			// The kernel resolves its mode from `settings_model`, not from the
-			// widget's `ResolvedPlotSettings`: `plot_with_settings` calls
-			// `settings.resolve_for_layer(..)` on the model. Setting the cap
-			// anywhere else silently leaves every arm on the default path —
-			// which is how an earlier revision of this exhibit produced three
-			// identical arms.
-			let settings = ResolvedPlotSettings {
-				scatter_render_mode: mode,
-				scatter_max_vector_points: vector_cap,
-				..ResolvedPlotSettings::default()
-			};
+			// PRODUCT-0139 §6: the model is the only settings input, and
+			// `PlotWidget::new` resolves it once through the kernel for both
+			// geometry and marks. Before that rule, this exhibit also handed the
+			// widget a separate `ResolvedPlotSettings`, and setting the cap on
+			// the wrong one of the two silently left every arm on the default
+			// path — which is how an earlier revision produced three identical
+			// arms.
 			let mut settings_model = crate::plot::theme::PlotSettings::default();
 			settings_model.library_defaults.scatter_render_mode = mode;
 			settings_model.library_defaults.scatter_max_vector_points = vector_cap;
-			let widget = PlotWidget {
-				kernel: kernel.as_ref(),
-				title: String::new(),
-				padding: 0.0,
-				settings,
+			let widget = PlotWidget::new(
+				kernel.as_ref(),
+				String::new(),
+				0.0,
 				settings_model,
-				render_revision: 0,
-				resize_render_suspended: false,
-				layer: PlotRenderLayer::Full,
-			};
+				0,
+				false,
+				PlotRenderLayer::Full,
+			);
 			let rect = Rectangle::new([0.0, 0.0].into(), [bounds_px.0, bounds_px.1].into());
 			// Latency from the real drawing backend; the counting backend does
 			// no drawing and under-measures it by about two orders of
@@ -1247,7 +1448,12 @@ mod tests {
 			times.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
 			let mut counter = CountingBackend::default();
 			widget.render(&mut counter, rect);
-			(prepare_ms, times[times.len() / 2], counter.circles, counter.images)
+			(
+				prepare_ms,
+				times[times.len() / 2],
+				counter.circles,
+				counter.images,
+			)
 		}
 
 		let viewport = (1200.0_f32, 720.0_f32);
@@ -1259,8 +1465,7 @@ mod tests {
 		// is axes, legend swatches, and decoration. Reported, never silently
 		// subtracted.
 		for series in [1_usize, 4, 8] {
-			let (p, r, c, i) =
-				measure(10, series, ScatterRenderMode::Auto, PRESENT_CAP, viewport);
+			let (p, r, c, i) = measure(10, series, ScatterRenderMode::Auto, PRESENT_CAP, viewport);
 			println!("10,{series},chrome-baseline,{p:.1},{r:.1},{c},{i}");
 		}
 
@@ -1315,7 +1520,9 @@ mod tests {
 		fn frame(n: usize) -> DataFrame {
 			let mut state: u64 = 0x2026_0825;
 			let mut next = || {
-				state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+				state = state
+					.wrapping_mul(6364136223846793005)
+					.wrapping_add(1442695040888963407);
 				((state >> 11) as f64) / ((1u64 << 53) as f64)
 			};
 			let xs: Vec<f64> = (0..n).map(|_| next()).collect();
@@ -1323,12 +1530,17 @@ mod tests {
 			df!("x" => xs, "y" => ys).expect("frame")
 		}
 
-		fn domain(x_min: f64, x_max: f64) -> ResolvedPlotSettings {
-			ResolvedPlotSettings {
-				x_min: Some(x_min),
-				x_max: Some(x_max),
-				..ResolvedPlotSettings::default()
-			}
+		// PRODUCT-0139 §6: the domain rides on the settings *model*, the one
+		// authority `PlotWidget::new` resolves for geometry and marks alike. An
+		// earlier revision handed the widget a separate `ResolvedPlotSettings`
+		// carrying the domain while the model stayed default — the exact
+		// divergence the record closed, and the reason a previous run's
+		// "invalidated" column was measuring cache hits.
+		fn domain(x_min: f64, x_max: f64) -> crate::plot::theme::PlotSettings {
+			let mut model = crate::plot::theme::PlotSettings::default();
+			model.library_defaults.x_min = Some(x_min);
+			model.library_defaults.x_max = Some(x_max);
+			model
 		}
 
 		fn x_range_bits(layout: &PlotLayout) -> (u64, u64) {
@@ -1351,52 +1563,79 @@ mod tests {
 
 		// Proof before timing: the key input must actually move. These are the
 		// exact bits `ScatterRasterKey.x_range` is built from.
-		let base = x_range_bits(&kernel.layout(domain(0.0, 1.0)));
-		let panned = x_range_bits(&kernel.layout(domain(0.10, 1.10)));
-		let zoomed = x_range_bits(&kernel.layout(domain(0.25, 0.75)));
+		let resolved = |model: &crate::plot::theme::PlotSettings| kernel.resolve_settings(model);
+		let base = x_range_bits(&kernel.layout(resolved(&domain(0.0, 1.0))));
+		let panned = x_range_bits(&kernel.layout(resolved(&domain(0.10, 1.10))));
+		let zoomed = x_range_bits(&kernel.layout(resolved(&domain(0.25, 0.75))));
 		assert_ne!(base, panned, "a pan must move the raster key");
 		assert_ne!(base, zoomed, "a zoom must move the raster key");
-		println!("\nkey_moves_on_pan={} key_moves_on_zoom={}", base != panned, base != zoomed);
+		println!(
+			"\nkey_moves_on_pan={} key_moves_on_zoom={}",
+			base != panned,
+			base != zoomed
+		);
 
-		let render = |settings: ResolvedPlotSettings, backend: &mut dyn PlotBackend| {
-			let widget = PlotWidget {
-				kernel: kernel.as_ref(),
-				title: String::new(),
-				padding: 0.0,
-				settings,
-				settings_model: crate::plot::theme::PlotSettings::default(),
-				render_revision: 0,
-				resize_render_suspended: false,
-				layer: PlotRenderLayer::Full,
-			};
+		let render = |model: crate::plot::theme::PlotSettings,
+		              motion: ViewportMotion,
+		              backend: &mut dyn PlotBackend| {
+			let widget = PlotWidget::new(
+				kernel.as_ref(),
+				String::new(),
+				0.0,
+				model,
+				0,
+				false,
+				PlotRenderLayer::Full,
+			)
+			.with_viewport_motion(motion);
 			widget.render(backend, rect);
 		};
 
-		let time = |settings: ResolvedPlotSettings| {
+		let time = |model: crate::plot::theme::PlotSettings, motion: ViewportMotion| {
 			let mut b = SvgBackend::new(w, h);
 			let started = Instant::now();
-			render(settings, &mut b);
+			render(model, motion, &mut b);
 			let ms = started.elapsed().as_secs_f64() * 1000.0;
 			let _ = b.finish();
 			ms
 		};
 
 		// Cache miss: nothing rasterized yet for this domain.
-		let miss_ms = time(domain(0.0, 1.0));
+		let miss_ms = time(domain(0.0, 1.0), ViewportMotion::Settled);
 		// Cache hits: identical domain, so the key matches.
-		let mut hits: Vec<f64> = (0..5).map(|_| time(domain(0.0, 1.0))).collect();
+		let mut hits: Vec<f64> = (0..5)
+			.map(|_| time(domain(0.0, 1.0), ViewportMotion::Settled))
+			.collect();
 		hits.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
-		// A real gesture: the domain moves every frame, as a drag would move it.
+		// The baseline this record was written against: a moving domain with no
+		// reuse, which rescans every source point per frame.
 		let mut pans: Vec<f64> = (1..=5)
 			.map(|i| {
 				let shift = i as f64 * 0.01;
-				time(domain(shift, 1.0 + shift))
+				time(domain(shift, 1.0 + shift), ViewportMotion::Settled)
 			})
 			.collect();
 		pans.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
 
+		// PRODUCT-0139 §9's stop condition: is the blit materially cheaper than
+		// the rescan? The same pan, with the frames declared as motion. The
+		// cache is primed at the base domain first, because reuse composes from
+		// the last true raster and there must be one.
+		let _ = time(domain(0.0, 1.0), ViewportMotion::Settled);
+		let mut reused: Vec<f64> = (1..=5)
+			.map(|i| {
+				let shift = i as f64 * 0.01;
+				time(domain(shift, 1.0 + shift), ViewportMotion::Moving)
+			})
+			.collect();
+		reused.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+
+		// And the settle: the first frame after motion stops rasterizes truly,
+		// so it should cost a cache miss, not a hit.
+		let settle_ms = time(domain(0.05, 1.05), ViewportMotion::Settled);
+
 		let mut counter = CountingBackend::default();
-		render(domain(0.0, 1.0), &mut counter);
+		render(domain(0.0, 1.0), ViewportMotion::Settled, &mut counter);
 		let (iw, ih) = counter.image_size.unwrap_or((0.0, 0.0));
 		let inner_budget = (iw as usize) * (ih as usize);
 
@@ -1410,7 +1649,491 @@ mod tests {
 		println!("first_render_cache_miss,{miss_ms:.1}");
 		println!("steady_same_domain_hit,{:.1}", hits[hits.len() / 2]);
 		println!("pan_domain_moves_each_frame,{:.1}", pans[pans.len() / 2]);
+		println!("pan_with_reuse_moving,{:.1}", reused[reused.len() / 2]);
+		println!("settle_after_motion,{settle_ms:.1}");
 		println!("circles={} images={}", counter.circles, counter.images);
+		println!(
+			"reuse_speedup_vs_rescan={:.1}x",
+			pans[pans.len() / 2] / reused[reused.len() / 2].max(f64::EPSILON)
+		);
+	}
+
+	/// PRODUCT-0139 §1 and §5, end to end through the widget.
+	///
+	/// Instrument: `RASTER_BUILDS` counts scans of the source points, and the
+	/// capture backend records where each frame's image was placed. Both are
+	/// needed — a build count alone cannot tell a reused frame from a skipped
+	/// one, and a placement alone cannot tell reuse from a rebuild that happened
+	/// to land at the origin.
+	#[derive(Default)]
+	struct RasterCaptureBackend {
+		placements: Vec<(Point, iced::Size)>,
+		last_rgba: Option<Vec<u8>>,
+	}
+
+	impl PlotBackend for RasterCaptureBackend {
+		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {}
+		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {}
+		fn fill_rectangle(&mut self, _tl: Point, _size: iced::Size, _color: Color) {}
+		fn fill_text_raw(&mut self, _text: Text) {}
+		fn supports_embedded_raster(&self) -> bool {
+			true
+		}
+		fn supports_native_image_handle(&self) -> bool {
+			false
+		}
+		fn draw_image_rgba(
+			&mut self,
+			top_left: Point,
+			size: iced::Size,
+			_width: u32,
+			_height: u32,
+			rgba: &[u8],
+		) {
+			self.placements.push((top_left, size));
+			self.last_rgba = Some(rgba.to_vec());
+		}
+		fn translate(&mut self, _translation: iced::Vector) {}
+		fn rotate(&mut self, _angle: f32) {}
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+		fn with_clip(&mut self, _bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+	}
+
+	fn reuse_fixture() -> (
+		Arc<dyn PlotKernel + Send + Sync>,
+		crate::plot::theme::PlotSettings,
+	) {
+		use crate::plot::factory::create_authored_plot;
+		let frame = df!(
+			"x" => [0.0_f64, 0.25, 0.5, 0.75, 1.0],
+			"y" => [0.0_f64, 0.4, 0.8, 0.3, 1.0]
+		)
+		.expect("frame");
+		let kernel = create_authored_plot(
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x", "y"),
+			&frame,
+			200,
+			200,
+		)
+		.expect("kernel");
+		let mut model = crate::plot::theme::PlotSettings::default();
+		// Force the raster path rather than reaching it by point count: this
+		// gate is about reuse, not about the auto gate.
+		model.library_defaults.scatter_render_mode = ScatterRenderMode::Rasterized;
+		(kernel, model)
+	}
+
+	fn reuse_domain(
+		model: &crate::plot::theme::PlotSettings,
+		x: (f64, f64),
+	) -> crate::plot::theme::PlotSettings {
+		let mut model = model.clone();
+		model.library_defaults.x_min = Some(x.0);
+		model.library_defaults.x_max = Some(x.1);
+		model
+	}
+
+	fn render_frame(
+		kernel: &Arc<dyn PlotKernel + Send + Sync>,
+		model: &crate::plot::theme::PlotSettings,
+		motion: ViewportMotion,
+	) -> RasterCaptureBackend {
+		render_frame_sized(kernel, model, motion, 200.0)
+	}
+
+	fn render_frame_sized(
+		kernel: &Arc<dyn PlotKernel + Send + Sync>,
+		model: &crate::plot::theme::PlotSettings,
+		motion: ViewportMotion,
+		extent: f32,
+	) -> RasterCaptureBackend {
+		use crate::plot::common::{PlotRenderLayer, PlotWidget};
+		let widget = PlotWidget::new(
+			kernel.as_ref(),
+			String::new(),
+			0.0,
+			model.clone(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_viewport_motion(motion);
+		let mut backend = RasterCaptureBackend::default();
+		widget.render(
+			&mut backend,
+			Rectangle::new(Point::ORIGIN, iced::Size::new(extent, extent)),
+		);
+		backend
+	}
+
+	fn builds_during(f: impl FnOnce()) -> usize {
+		let before = RASTER_BUILDS.with(std::cell::Cell::get);
+		f();
+		RASTER_BUILDS.with(std::cell::Cell::get) - before
+	}
+
+	#[test]
+	fn product_0139_motion_reuses_and_settling_rasterizes_exactly_once() {
+		let (kernel, model) = reuse_fixture();
+		let pans: Vec<_> = (1..=4)
+			.map(|i| reuse_domain(&model, (i as f64 * 0.05, 1.0 + i as f64 * 0.05)))
+			.collect();
+
+		// Prime the cache with one true raster at the base domain.
+		let base = reuse_domain(&model, (0.0, 1.0));
+		let primed = builds_during(|| {
+			render_frame(&kernel, &base, ViewportMotion::Settled);
+		});
+		assert_eq!(primed, 1, "the first settled frame rasterizes");
+
+		// Gate 1 claim: a pan under motion performs no scans at all.
+		let moving = builds_during(|| {
+			for domain in &pans {
+				render_frame(&kernel, domain, ViewportMotion::Moving);
+			}
+		});
+		assert_eq!(
+			moving, 0,
+			"a moving frame must not rescan the source points"
+		);
+
+		// Gate 1 control, asserted in the tree: the same sequence without motion
+		// rescans once per frame. A zero that has never been shown nonzero
+		// against the unchanged path proves nothing.
+		let (control_kernel, control_model) = reuse_fixture();
+		let control_base = reuse_domain(&control_model, (0.0, 1.0));
+		render_frame(&control_kernel, &control_base, ViewportMotion::Settled);
+		let settled = builds_during(|| {
+			for domain in &pans {
+				render_frame(&control_kernel, domain, ViewportMotion::Settled);
+			}
+		});
+		assert_eq!(
+			settled,
+			pans.len(),
+			"without motion every moved domain must rescan, or the gate above is vacuous"
+		);
+
+		// Gate 2: settling performs exactly one scan, and the frame it produces
+		// is byte-identical to a cold raster at the same domain.
+		let settle_domain = pans.last().expect("pans");
+		let settle = builds_during(|| {
+			render_frame(&kernel, settle_domain, ViewportMotion::Settled);
+		});
+		assert_eq!(settle, 1, "settling rasterizes exactly once");
+
+		let settled_frame = render_frame(&kernel, settle_domain, ViewportMotion::Settled);
+		let (cold_kernel, cold_model) = reuse_fixture();
+		let cold_frame = render_frame(
+			&cold_kernel,
+			&reuse_domain(
+				&cold_model,
+				(
+					settle_domain.library_defaults.x_min.expect("x"),
+					settle_domain.library_defaults.x_max.expect("x"),
+				),
+			),
+			ViewportMotion::Settled,
+		);
+		assert_eq!(
+			settled_frame.last_rgba, cold_frame.last_rgba,
+			"a settled frame after motion must equal a cold raster at that domain"
+		);
+	}
+
+	#[test]
+	fn product_0139_a_reused_frame_is_placed_not_redrawn_and_never_chains() {
+		let (kernel, model) = reuse_fixture();
+		let base = reuse_domain(&model, (0.0, 1.0));
+		let primed = render_frame(&kernel, &base, ViewportMotion::Settled);
+		assert_eq!(primed.placements.len(), 1, "one image per frame");
+		let (origin, base_size) = primed.placements[0];
+		assert_eq!(
+			origin,
+			Point::ORIGIN,
+			"a true raster is drawn at the origin"
+		);
+		// The raster is the **inner plot area**, not the widget rect — chrome
+		// takes the difference. The expectation is read from the frame rather
+		// than assumed, which is how the widget-sized version of this assertion
+		// was wrong.
+		assert!(base_size.width > 0.0 && base_size.width < 200.0);
+
+		// Each moving frame is a placement of the same last true raster, so the
+		// offsets grow with the pan rather than resetting — which is what
+		// composing from the last true raster (§5) looks like from outside.
+		let mut offsets = Vec::new();
+		for i in 1..=3 {
+			let shift = f64::from(i) * 0.05;
+			let moved = render_frame(
+				&kernel,
+				&reuse_domain(&model, (shift, 1.0 + shift)),
+				ViewportMotion::Moving,
+			);
+			let (top_left, size) = moved.placements[0];
+			// A pure pan never rescales: the baked-in point radius is preserved.
+			assert!(
+				(size.width - base_size.width).abs() < 1e-3
+					&& (size.height - base_size.height).abs() < 1e-3,
+				"a pure pan must place the cached image at its own size"
+			);
+			offsets.push(top_left.x);
+		}
+		assert!(
+			offsets.windows(2).all(|w| w[1] < w[0]),
+			"panning right moves the cached image left, monotonically: {offsets:?}"
+		);
+
+		// No chaining, observed from outside rather than by reading private
+		// state: if any reuse frame had replaced the cache entry, the base
+		// domain would no longer be cached and would have to rescan. It does
+		// not, so the entry the reuses composed from is still the last true
+		// raster.
+		let rescans = builds_during(|| {
+			render_frame(&kernel, &base, ViewportMotion::Settled);
+		});
+		assert_eq!(
+			rescans, 0,
+			"reuse must never replace the cache entry it composed from"
+		);
+	}
+
+	/// PRODUCT-0139 §10 gate 6: refusal, each case asserted on its own.
+	///
+	/// Reuse depicts the same marks at a different viewport, so **only** the
+	/// domain may differ. Each case here changes one non-domain key term while
+	/// the plot is moving, and each must still rescan. A single "any change"
+	/// case would pass on the strength of whichever one happened to work — and
+	/// a mutant that dropped every non-domain term from the reuse predicate
+	/// survived the rest of this file's gates until these existed.
+	#[test]
+	fn product_0139_reuse_refuses_every_non_domain_change_individually() {
+		use crate::plot::colors::ColorTheme;
+		use crate::plot::spec::PointSize;
+
+		// Case 1 — the raster size. A different widget rect gives a different
+		// inner plot area, so the cached pixels are the wrong shape.
+		{
+			let (kernel, model) = reuse_fixture();
+			let base = reuse_domain(&model, (0.0, 1.0));
+			render_frame(&kernel, &base, ViewportMotion::Settled);
+			let moved = reuse_domain(&model, (0.1, 1.1));
+			let rescans = builds_during(|| {
+				render_frame_sized(&kernel, &moved, ViewportMotion::Moving, 260.0);
+			});
+			assert_eq!(rescans, 1, "a size change must rescan even while moving");
+		}
+
+		// Case 2 — point size. The radius is baked into the bitmap.
+		{
+			let (kernel, model) = reuse_fixture();
+			let base = reuse_domain(&model, (0.0, 1.0));
+			render_frame(&kernel, &base, ViewportMotion::Settled);
+			let mut changed = reuse_domain(&model, (0.1, 1.1));
+			changed.library_defaults.point_size = PointSize::new(2.0).expect("in range");
+			let rescans = builds_during(|| {
+				render_frame(&kernel, &changed, ViewportMotion::Moving);
+			});
+			assert_eq!(
+				rescans, 1,
+				"a point-size change must rescan even while moving"
+			);
+		}
+
+		// Case 3 — series colour. The colour is baked in too.
+		{
+			let (kernel, model) = reuse_fixture();
+			let base = reuse_domain(&model, (0.0, 1.0));
+			render_frame(&kernel, &base, ViewportMotion::Settled);
+			let mut changed = reuse_domain(&model, (0.1, 1.1));
+			changed.library_defaults.color_theme = ColorTheme::Black;
+			let rescans = builds_during(|| {
+				render_frame(&kernel, &changed, ViewportMotion::Moving);
+			});
+			assert_eq!(rescans, 1, "a colour change must rescan even while moving");
+		}
+
+		// Case 4 — a categorical x. Placement is by category index and band
+		// width, which is not a function of the key, so the map is not
+		// derivable and reuse must refuse rather than guess.
+		{
+			use crate::plot::factory::create_authored_plot;
+			let frame = df!(
+				"x" => ["a", "b", "c", "d"],
+				"y" => [1.0_f64, 2.0, 3.0, 4.0]
+			)
+			.expect("frame");
+			let kernel = create_authored_plot(
+				AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x", "y"),
+				&frame,
+				200,
+				200,
+			)
+			.expect("kernel");
+			let mut model = crate::plot::theme::PlotSettings::default();
+			model.library_defaults.scatter_render_mode = ScatterRenderMode::Rasterized;
+
+			let mut moved = model.clone();
+			moved.library_defaults.y_min = Some(0.5);
+			moved.library_defaults.y_max = Some(4.5);
+			render_frame(&kernel, &model, ViewportMotion::Settled);
+			let rescans = builds_during(|| {
+				render_frame(&kernel, &moved, ViewportMotion::Moving);
+			});
+			assert_eq!(
+				rescans, 1,
+				"a categorical x is not reusable: its placement is not derivable from the key"
+			);
+		}
+	}
+
+	/// PRODUCT-0139 §2 gate: the reuse placement maps the cached image onto the
+	/// new viewport exactly.
+	///
+	/// The oracle is the **production projection**, not this test's own algebra:
+	/// each data point is projected through `CoordinateTransformer::cartesian`
+	/// under the cached domain and again under the new one, and the placement
+	/// must carry the first onto the second. Recomputing the offset from the
+	/// same formula the implementation uses would be circular.
+	#[test]
+	fn product_0139_reuse_placement_carries_old_pixels_onto_the_new_viewport() {
+		fn key(x: (f64, f64), y: (f64, f64)) -> ScatterRasterKey {
+			ScatterRasterKey {
+				width: 400,
+				height: 300,
+				point_size: 1.0_f32.to_bits(),
+				x_range: (x.0.to_bits(), x.1.to_bits()),
+				y_range: (y.0.to_bits(), y.1.to_bits()),
+				background: [0, 0, 0, 255],
+				series_colors: vec![[1, 2, 3, 255]],
+			}
+		}
+		fn layout(x: (f64, f64), y: (f64, f64)) -> PlotLayout {
+			PlotLayout::Cartesian {
+				x_range: x,
+				y_range: y,
+				x_axis_type: AxisType::Linear,
+				y_axis_type: AxisType::Linear,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
+			}
+		}
+
+		let (w, h) = (400.0_f32, 300.0_f32);
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(w, h));
+		let cached_domain = ((0.0, 1.0), (0.0, 1.0));
+
+		for (label, new_domain) in [
+			("pure pan", ((0.10, 1.10), (0.0, 1.0))),
+			("pan in y", ((0.0, 1.0), (-0.25, 0.75))),
+			("zoom in", ((0.25, 0.75), (0.25, 0.75))),
+			("zoom out", ((-1.0, 2.0), (-1.0, 2.0))),
+			("pan and zoom", ((0.30, 0.80), (0.10, 0.60))),
+		] {
+			let cached = key(cached_domain.0, cached_domain.1);
+			let current = key(new_domain.0, new_domain.1);
+			let placement =
+				reuse_placement(&cached, &current, w, h).expect("cartesian keys are derivable");
+
+			let cached_layout = layout(cached_domain.0, cached_domain.1);
+			let new_layout = layout(new_domain.0, new_domain.1);
+			let cached_transform = CoordinateTransformer::new(&cached_layout, bounds);
+			let new_transform = CoordinateTransformer::new(&new_layout, bounds);
+
+			let scale_x = placement.size.width / w;
+			let scale_y = placement.size.height / h;
+			for (dx, dy) in [(0.0, 0.0), (1.0, 1.0), (0.5, 0.5), (0.25, 0.75)] {
+				let old_pixel = cached_transform.cartesian(dx, dy);
+				let new_pixel = new_transform.cartesian(dx, dy);
+				let carried = Point::new(
+					placement.top_left.x + old_pixel.x * scale_x,
+					placement.top_left.y + old_pixel.y * scale_y,
+				);
+				assert!(
+					(carried.x - new_pixel.x).abs() < 1e-2
+						&& (carried.y - new_pixel.y).abs() < 1e-2,
+					"{label}: ({dx},{dy}) carried to {carried:?} but projects to {new_pixel:?}"
+				);
+			}
+		}
+
+		// A pure pan must not rescale: radius is baked into the bitmap, and
+		// PRODUCT-0139 §2 says a translation preserves it exactly.
+		let panned = reuse_placement(
+			&key((0.0, 1.0), (0.0, 1.0)),
+			&key((0.10, 1.10), (0.0, 1.0)),
+			w,
+			h,
+		)
+		.expect("derivable");
+		assert!((panned.size.width - w).abs() < 1e-3);
+		assert!((panned.size.height - h).abs() < 1e-3);
+
+		// A non-Cartesian key records (0, 0) ranges, which is not a domain and
+		// must refuse rather than produce a placement.
+		let degenerate = ScatterRasterKey {
+			x_range: (0, 0),
+			y_range: (0, 0),
+			..key((0.0, 1.0), (0.0, 1.0))
+		};
+		assert!(reuse_placement(&degenerate, &degenerate, w, h).is_none());
+	}
+
+	/// PRODUCT-0139 §6 gate, scatter's half: the kernel's resolution is exactly
+	/// what its renderer draws with, so the transform, the resolved mode, and
+	/// `ScatterRasterKey` are one resolution. The control asserts the fixture
+	/// actually discriminates before the claim is made.
+	#[test]
+	fn product_0139_scatter_resolves_geometry_through_its_own_layer_settings() {
+		use crate::plot::spec::{LayerSettings, Override, PointSize};
+		use crate::plot::theme::{PlotDomainOverrides, PlotSettings};
+
+		let layer_settings = LayerSettings {
+			point_size: Override::Set(PointSize::new(1.5).expect("in range")),
+			..LayerSettings::default()
+		};
+		let frame = df!("x" => [0.0_f64, 1.0, 2.0], "y" => [2_i64, 5, 3]).expect("frame");
+		let (spec, _) = resolved_scatter(
+			frame.clone(),
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x", "y"),
+			&ColorIdentity::default(),
+		);
+		let prepared = prepare_scatter_data_resolved(&frame, &spec, 800, 480);
+		let scatter =
+			ScatterPlotKernel::with_layer_settings(Arc::new(prepared), layer_settings.clone());
+
+		let mut model = PlotSettings::default();
+		model.layer.domains = Override::Set(PlotDomainOverrides {
+			x_min: Some(100.0),
+			x_max: Some(200.0),
+			y_min: None,
+			y_max: None,
+		});
+		model.layer.point_size = Override::Set(PointSize::new(4.0).expect("in range"));
+
+		let authority = scatter.resolve_settings(&model);
+		let figure_wide = model.resolve();
+
+		// Control: the fixture must make the two resolutions disagree.
+		assert_ne!(figure_wide.point_size, authority.point_size);
+		assert_ne!(figure_wide.x_min, authority.x_min);
+
+		// Claim: scatter's authority is exactly what its renderer resolves.
+		// `ResolvedPlotSettings` is not `PartialEq`, so the comparison names the
+		// fields the layer tier actually moves — the point size it sets and the
+		// domain it drops — rather than widening a public type for a test.
+		let renderer_resolution = model.resolve_for_layer(&layer_settings);
+		assert_eq!(authority.point_size, renderer_resolution.point_size);
+		assert_eq!(authority.x_min, renderer_resolution.x_min);
+		assert_eq!(authority.x_max, renderer_resolution.x_max);
+		assert_eq!(
+			authority.scatter_max_vector_points,
+			renderer_resolution.scatter_max_vector_points
+		);
 	}
 
 	#[test]

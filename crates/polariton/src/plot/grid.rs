@@ -570,11 +570,21 @@ impl PlotGridKernel {
 		)
 	}
 
-	fn cell_layouts(&self, settings: ResolvedPlotSettings) -> Vec<(GridPosition, PlotLayout)> {
+	/// PRODUCT-0139 §6, applied to the composite: each cell's layout comes from
+	/// **that cell kernel's own resolution**, not from one figure-wide value.
+	/// The shared-domain union below is then computed across those per-cell
+	/// resolutions. Figure chrome — legend union, band requirements, tiling —
+	/// stays figure-wide; only cell geometry moves.
+	fn cell_layouts(&self, settings: &PlotSettings) -> Vec<(GridPosition, PlotLayout)> {
 		let local: Vec<_> = self
 			.cells
 			.iter()
-			.map(|cell| (cell.cell.position, cell.kernel.layout(settings.clone())))
+			.map(|cell| {
+				(
+					cell.cell.position,
+					cell.kernel.layout(cell.kernel.resolve_settings(settings)),
+				)
+			})
 			.collect();
 		let shared = shared_layout(&local, &self.cells.first().cell.body);
 		local
@@ -639,16 +649,15 @@ impl PlotComposite for PlotGridKernel {
 	) {
 		if self.cells.len() == 1 {
 			let cell = self.cells.first();
-			let helper = PlotWidget {
-				kernel: cell.kernel.as_ref(),
-				title: title.to_owned(),
+			let helper = PlotWidget::new(
+				cell.kernel.as_ref(),
+				title.to_owned(),
 				padding,
-				settings: settings.resolve(),
-				settings_model: settings.clone(),
-				render_revision: 0,
-				resize_render_suspended: false,
-				layer: crate::plot::common::PlotRenderLayer::Full,
-			};
+				settings.clone(),
+				0,
+				false,
+				crate::plot::common::PlotRenderLayer::Full,
+			);
 			helper.render_plot_layer(backend, bounds.into_iced());
 			return;
 		}
@@ -673,7 +682,7 @@ impl PlotComposite for PlotGridKernel {
 		);
 		let legend = crate::plot::legend::legend_layout(bounds, figure_legend.as_ref(), &resolved);
 		let outer = grid_outer_area(legend.content_bounds, padding);
-		let layouts = self.cell_layouts(resolved.clone());
+		let layouts = self.cell_layouts(settings);
 		let requirements =
 			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
 		let x_label_visible = grid_x_label_visible(self, &resolved);
@@ -692,18 +701,21 @@ impl PlotComposite for PlotGridKernel {
 				*position,
 				self.figure_grid,
 			);
-			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &resolved);
+			// PRODUCT-0139 §6: the cell's plot rectangle is cell geometry, so it
+			// resolves through the cell kernel like its layout does. This is the
+			// rectangle that becomes a raster's width and height.
+			let cell_resolved = cell.kernel.resolve_settings(settings);
+			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
 			let transform = CoordinateTransformer::new(layout, inner.into_iced());
-			let helper = PlotWidget {
-				kernel: cell.kernel.as_ref(),
-				title: String::new(),
-				padding: 0.0,
-				settings: resolved.clone(),
-				settings_model: settings.clone(),
-				render_revision: 0,
-				resize_render_suspended: false,
-				layer: crate::plot::common::PlotRenderLayer::Full,
-			};
+			let helper = PlotWidget::new(
+				cell.kernel.as_ref(),
+				String::new(),
+				0.0,
+				settings.clone(),
+				0,
+				false,
+				crate::plot::common::PlotRenderLayer::Full,
+			);
 			let clipped_plot = cell.kernel.requires_plot_area_clip();
 			backend.with_clip(cell_bounds.into_iced(), &mut |backend| {
 				backend.fill_rectangle(
@@ -751,16 +763,15 @@ impl PlotComposite for PlotGridKernel {
 	) {
 		if self.cells.len() == 1 {
 			let cell = self.cells.first();
-			let helper = PlotWidget {
-				kernel: cell.kernel.as_ref(),
-				title: title.to_owned(),
+			let helper = PlotWidget::new(
+				cell.kernel.as_ref(),
+				title.to_owned(),
 				padding,
-				settings: settings.resolve(),
-				settings_model: settings.clone(),
-				render_revision: 0,
-				resize_render_suspended: false,
-				layer: crate::plot::common::PlotRenderLayer::Full,
-			};
+				settings.clone(),
+				0,
+				false,
+				crate::plot::common::PlotRenderLayer::Full,
+			);
 			helper.render_overlay_layer(backend, bounds.into_iced());
 			return;
 		}
@@ -772,7 +783,7 @@ impl PlotComposite for PlotGridKernel {
 		);
 		let legend = crate::plot::legend::legend_layout(bounds, figure_legend.as_ref(), &resolved);
 		let outer = grid_outer_area(legend.content_bounds, padding);
-		let layouts = self.cell_layouts(resolved.clone());
+		let layouts = self.cell_layouts(settings);
 		let requirements =
 			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
 		let x_label_visible = grid_x_label_visible(self, &resolved);
@@ -792,19 +803,22 @@ impl PlotComposite for PlotGridKernel {
 				*position,
 				self.figure_grid,
 			);
-			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &resolved);
+			// PRODUCT-0139 §6: the cell's plot rectangle is cell geometry, so it
+			// resolves through the cell kernel like its layout does. This is the
+			// rectangle that becomes a raster's width and height.
+			let cell_resolved = cell.kernel.resolve_settings(settings);
+			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
 			let transform = CoordinateTransformer::new(layout, inner.into_iced());
 			let axis_text = axis_text_visibility(axis_cells[index], &axis_cells);
-			let helper = PlotWidget {
-				kernel: cell.kernel.as_ref(),
-				title: String::new(),
-				padding: 0.0,
-				settings: resolved.clone(),
-				settings_model: settings.clone(),
-				render_revision: 0,
-				resize_render_suspended: false,
-				layer: crate::plot::common::PlotRenderLayer::Full,
-			};
+			let helper = PlotWidget::new(
+				cell.kernel.as_ref(),
+				String::new(),
+				0.0,
+				settings.clone(),
+				0,
+				false,
+				crate::plot::common::PlotRenderLayer::Full,
+			);
 			// PRODUCT-0077 anchors bound-coincident numeric text inward at an
 			// occupied shared edge. Outer edges and vacant slots deliberately keep
 			// centred text, so use the figure clip rather than orphaning either.
@@ -908,16 +922,15 @@ impl PlotComposite for PlotGridKernel {
 			&resolved,
 		);
 		let first = self.cells.first();
-		let helper = PlotWidget {
-			kernel: first.kernel.as_ref(),
-			title: String::new(),
-			padding: 0.0,
-			settings: resolved.clone(),
-			settings_model: settings.clone(),
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: crate::plot::common::PlotRenderLayer::Full,
-		};
+		let helper = PlotWidget::new(
+			first.kernel.as_ref(),
+			String::new(),
+			0.0,
+			settings.clone(),
+			0,
+			false,
+			crate::plot::common::PlotRenderLayer::Full,
+		);
 		helper.draw_axis_labels(backend, shared_extent.into_iced(), &requirements);
 		if let (Some(content), Some(origin)) =
 			(figure_legend.as_ref(), legend.origin(shared_extent))
@@ -942,7 +955,7 @@ impl PlotComposite for PlotGridKernel {
 		);
 		let legend = crate::plot::legend::legend_layout(bounds, figure_legend.as_ref(), &resolved);
 		let outer = grid_outer_area(legend.content_bounds, padding);
-		let layouts = self.cell_layouts(resolved.clone());
+		let layouts = self.cell_layouts(settings);
 		let requirements =
 			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
 		let x_label_visible = grid_x_label_visible(self, &resolved);
@@ -964,7 +977,11 @@ impl PlotComposite for PlotGridKernel {
 			if !cell_bounds.contains(cursor) {
 				continue;
 			}
-			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &resolved);
+			// PRODUCT-0139 §6: the cell's plot rectangle is cell geometry, so it
+			// resolves through the cell kernel like its layout does. This is the
+			// rectangle that becomes a raster's width and height.
+			let cell_resolved = cell.kernel.resolve_settings(settings);
+			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
 			let inner_bounds = inner.into_iced();
 			let transform = CoordinateTransformer::new(
 				layout,
@@ -1568,6 +1585,347 @@ mod tests {
 		})
 	}
 
+	/// PRODUCT-0139 §7's per-cell gates.
+	///
+	/// These establish two separate things and deliberately do not lift the
+	/// exclusion: that a facet **cannot** reuse today, and that the per-cell
+	/// conditions §2 needs **would** hold if it were lifted.
+	#[derive(Default)]
+	struct FacetRasterBackend {
+		images: usize,
+	}
+
+	impl crate::plot::common::PlotBackend for FacetRasterBackend {
+		fn stroke_path(
+			&mut self,
+			_f: &dyn Fn(&mut dyn crate::plot::common::PathBuilder),
+			_stroke: iced::widget::canvas::Stroke,
+		) {
+		}
+		fn fill_path(
+			&mut self,
+			_f: &dyn Fn(&mut dyn crate::plot::common::PathBuilder),
+			_color: iced::Color,
+		) {
+		}
+		fn fill_rectangle(&mut self, _tl: Point, _size: iced::Size, _color: iced::Color) {}
+		fn fill_text_raw(&mut self, _text: iced::widget::canvas::Text) {}
+		fn supports_embedded_raster(&self) -> bool {
+			true
+		}
+		fn supports_native_image_handle(&self) -> bool {
+			false
+		}
+		fn draw_image_rgba(
+			&mut self,
+			_top_left: Point,
+			_size: iced::Size,
+			_width: u32,
+			_height: u32,
+			_rgba: &[u8],
+		) {
+			self.images += 1;
+		}
+		fn translate(&mut self, _translation: iced::Vector) {}
+		fn rotate(&mut self, _angle: f32) {}
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn crate::plot::common::PlotBackend)) {
+			f(self);
+		}
+		fn with_clip(
+			&mut self,
+			_bounds: IcedRectangle,
+			f: &mut dyn FnMut(&mut dyn crate::plot::common::PlotBackend),
+		) {
+			f(self);
+		}
+	}
+
+	fn facet_scatter_fixture() -> (PlotGridKernel, crate::plot::theme::PlotSettings) {
+		let data = Arc::new(
+			df!(
+				"facet" => ["A", "B", "A", "B"],
+				"x" => [0.0_f64, 1.0, 2.0, 3.0],
+				"y" => [1.0_f64, 2.0, 3.0, 4.0]
+			)
+			.expect("fixture frame"),
+		);
+		let resolved = plan(PlotRequest {
+			source: PlotSource::Materialized {
+				name: "facet reuse fixture".to_owned(),
+				data: artifact(&data),
+			},
+			authored_spec: AuthoredPlotSpec::xy(
+				PlotComposition::single(PlotType::Scatter),
+				"x",
+				"y",
+			),
+		})
+		.expect("fixture resolves");
+		let stamped = StampedResult {
+			data: artifact(&data),
+			provenance: PlotProvenance {
+				source_name: "facet reuse fixture".to_owned(),
+				revision: None,
+			},
+		};
+		let grid = PlotGrid::value_facet(
+			Arc::new(resolved.resolved_spec),
+			&stamped,
+			"facet",
+			GridArrangement::new(1, 2).expect("arrangement"),
+		)
+		.expect("facet");
+		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
+		let mut model = crate::plot::theme::PlotSettings::default();
+		// Force the raster path; this gate is about reuse, not the auto gate.
+		model.library_defaults.scatter_render_mode =
+			crate::plot::common::ScatterRenderMode::Rasterized;
+		(kernel, model)
+	}
+
+	fn with_domain(
+		model: &crate::plot::theme::PlotSettings,
+		x: (f64, f64),
+	) -> crate::plot::theme::PlotSettings {
+		let mut model = model.clone();
+		model.library_defaults.x_min = Some(x.0);
+		model.library_defaults.x_max = Some(x.1);
+		model
+	}
+
+	fn rescans_during(f: impl FnOnce()) -> usize {
+		use crate::plot::kernels::scatter::RASTER_BUILDS;
+		let before = RASTER_BUILDS.with(std::cell::Cell::get);
+		f();
+		RASTER_BUILDS.with(std::cell::Cell::get) - before
+	}
+
+	#[test]
+	fn product_0139_a_facet_cannot_reuse_and_an_unfaceted_plot_can() {
+		use crate::plot::common::{PlotRenderLayer, PlotWidget, ViewportMotion};
+
+		let (kernel, model) = facet_scatter_fixture();
+		let rect = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
+		let render = |model: &crate::plot::theme::PlotSettings, motion: ViewportMotion| {
+			let widget = PlotWidget::new(
+				&kernel,
+				String::new(),
+				0.0,
+				model.clone(),
+				0,
+				false,
+				PlotRenderLayer::Full,
+			)
+			.with_viewport_motion(motion);
+			let mut backend = FacetRasterBackend::default();
+			widget.render(&mut backend, rect);
+			backend.images
+		};
+
+		// Prime every cell.
+		let base = with_domain(&model, (0.0, 3.0));
+		let cells = render(&base, ViewportMotion::Settled);
+		assert_eq!(cells, 2, "the fixture draws one raster per facet cell");
+
+		// PRODUCT-0139 §7: a facet cannot reuse, and this is enforced by
+		// construction rather than by policy — the composite calls
+		// `plot_with_settings`, never `plot_with_motion`, so every cell is
+		// `Settled` no matter what the widget was told.
+		let moved = with_domain(&model, (0.1, 3.1));
+		let facet_rescans = rescans_during(|| {
+			render(&moved, ViewportMotion::Moving);
+		});
+		assert_eq!(
+			facet_rescans, cells,
+			"every facet cell must rescan even when the frame declares motion"
+		);
+
+		// The control, and the whole reason this gate is not vacuous: the same
+		// mark, unfaceted, does reuse under the same motion. Without it, an
+		// implementation where nothing reuses anywhere would pass the assertion
+		// above and look like proof of the exclusion.
+		let frame = df!(
+			"x" => [0.0_f64, 1.0, 2.0, 3.0],
+			"y" => [1.0_f64, 2.0, 3.0, 4.0]
+		)
+		.expect("frame");
+		let unfaceted = crate::plot::factory::create_authored_plot(
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x", "y"),
+			&frame,
+			800,
+			400,
+		)
+		.expect("unfaceted scatter");
+		let render_unfaceted = |model: &crate::plot::theme::PlotSettings,
+		                        motion: ViewportMotion| {
+			let widget = PlotWidget::new(
+				unfaceted.as_ref(),
+				String::new(),
+				0.0,
+				model.clone(),
+				0,
+				false,
+				PlotRenderLayer::Full,
+			)
+			.with_viewport_motion(motion);
+			let mut backend = FacetRasterBackend::default();
+			widget.render(&mut backend, rect);
+		};
+		render_unfaceted(&base, ViewportMotion::Settled);
+		let unfaceted_rescans = rescans_during(|| {
+			render_unfaceted(&moved, ViewportMotion::Moving);
+		});
+		assert_eq!(
+			unfaceted_rescans, 0,
+			"the same mark unfaceted must reuse under motion, or the exclusion above proves nothing"
+		);
+	}
+
+	#[test]
+	fn product_0139_per_cell_conditions_for_reuse_hold_across_a_viewport_move() {
+		let (kernel, model) = facet_scatter_fixture();
+		let base = with_domain(&model, (0.0, 3.0));
+		let moved = with_domain(&model, (0.5, 3.5));
+
+		let ranges = |model: &crate::plot::theme::PlotSettings| -> Vec<(f64, f64)> {
+			kernel
+				.cell_layouts(model)
+				.into_iter()
+				.map(|(_, layout)| match layout {
+					PlotLayout::Cartesian { x_range, .. } => x_range,
+					_ => panic!("fixture is cartesian"),
+				})
+				.collect()
+		};
+
+		let before = ranges(&base);
+		let after = ranges(&moved);
+		assert_eq!(before.len(), 2);
+
+		// Control: the move must actually move the domain, or everything below
+		// is asserted about a viewport that never changed.
+		assert_ne!(
+			before[0], after[0],
+			"the fixture's move must move the domain"
+		);
+
+		// §2, per cell, condition one: every cell shares one domain, so a single
+		// gesture maps them all with the same delta.
+		assert!(
+			before.windows(2).all(|w| w[0] == w[1]),
+			"facet cells share one domain before the move: {before:?}"
+		);
+		assert!(
+			after.windows(2).all(|w| w[0] == w[1]),
+			"facet cells share one domain after the move: {after:?}"
+		);
+
+		// §2, per cell, condition two: the cell's plot rectangle — which is the
+		// raster's width and height — is unchanged by a domain move, so only the
+		// domain terms of a cell's key would differ.
+		for index in 0..before.len() {
+			let inner_before = product_0097_inner(&kernel, index, &base);
+			let inner_after = product_0097_inner(&kernel, index, &moved);
+			assert_eq!(
+				(inner_before.width(), inner_before.height()),
+				(inner_after.width(), inner_after.height()),
+				"cell {index}'s raster size must not move with the domain"
+			);
+		}
+	}
+
+	/// PRODUCT-0139 §6 applied to the composite: a cell's geometry resolves
+	/// through **that cell's kernel**, not through one figure-wide value.
+	///
+	/// The fixture is built so the two resolutions disagree — the model's layer
+	/// tier carries a domain that `resolve_for_layer` drops — and the
+	/// disagreement is asserted before the claim, because in production the two
+	/// coincide and a gate without the control would pass on nothing.
+	struct CellAuthorityKernel;
+
+	impl PlotKernel for CellAuthorityKernel {
+		fn resolve_settings(
+			&self,
+			settings: &crate::plot::theme::PlotSettings,
+		) -> ResolvedPlotSettings {
+			settings.resolve_for_layer(&crate::plot::spec::LayerSettings::default())
+		}
+
+		fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
+			PlotLayout::Cartesian {
+				x_range: (settings.x_min.unwrap_or(0.0), settings.x_max.unwrap_or(1.0)),
+				y_range: (0.0, 1.0),
+				x_axis_type: crate::plot::common::AxisType::Linear,
+				y_axis_type: crate::plot::common::AxisType::Linear,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
+			}
+		}
+
+		fn plot(
+			&self,
+			_backend: &mut dyn crate::plot::common::PlotBackend,
+			_bounds: IcedRectangle,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+			_settings: ResolvedPlotSettings,
+		) {
+		}
+
+		fn hit(
+			&self,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+		) -> Option<crate::plot::common::PlotHit> {
+			None
+		}
+	}
+
+	#[test]
+	fn product_0139_cell_geometry_resolves_through_the_cell_kernel() {
+		use crate::plot::spec::Override;
+		use crate::plot::theme::{PlotDomainOverrides, PlotSettings};
+
+		let mut model = PlotSettings::default();
+		model.layer.domains = Override::Set(PlotDomainOverrides {
+			x_min: Some(100.0),
+			x_max: Some(200.0),
+			y_min: None,
+			y_max: None,
+		});
+
+		// Control: the two resolutions must actually disagree for this fixture.
+		let figure_wide = model.resolve();
+		let per_cell = CellAuthorityKernel.resolve_settings(&model);
+		assert_ne!(
+			figure_wide.x_min, per_cell.x_min,
+			"fixture must make the figure-wide and per-cell resolutions differ"
+		);
+
+		let frames = [
+			df!("x" => [0.0_f64, 1.0], "y" => [0.0_f64, 1.0]).expect("frame"),
+			df!("x" => [0.0_f64, 1.0], "y" => [0.0_f64, 1.0]).expect("frame"),
+		];
+		let kernel = product_0097_grid(frames, |_| Arc::new(CellAuthorityKernel));
+
+		let layouts = kernel.cell_layouts(&model);
+		for (_, layout) in &layouts {
+			let PlotLayout::Cartesian { x_range, .. } = layout else {
+				panic!("fixture is cartesian");
+			};
+			// The cell kernel drops the layer tier, so its range is the default
+			// one — not the figure-wide (100, 200) the composite used to apply.
+			assert_eq!(*x_range, (0.0, 1.0));
+			assert_ne!(
+				*x_range,
+				(
+					figure_wide.x_min.expect("control"),
+					figure_wide.x_max.expect("control")
+				)
+			);
+		}
+	}
+
 	fn product_0097_grid(
 		frames: [DataFrame; 2],
 		mut factory: impl FnMut(&DataFrame) -> Arc<dyn PlotKernel + Send + Sync>,
@@ -1605,7 +1963,9 @@ mod tests {
 		let resolved = settings.resolve();
 		let outer = grid_outer_area(bounds, 0.0);
 		let tiled = grid_tiled_area_for_kernel(kernel, outer, "", &resolved);
-		let (position, _) = &kernel.cell_layouts(resolved.clone())[cell_index];
+		let (position, _) = &kernel.cell_layouts(&crate::plot::theme::PlotSettings::from_resolved(
+			resolved.clone(),
+		))[cell_index];
 		grid_plot_area(
 			grid_cell_bounds(tiled, kernel.arrangement, *position),
 			None,
@@ -1719,16 +2079,15 @@ mod tests {
 			..ResolvedPlotSettings::default()
 		};
 		let model = PlotSettings::from_resolved(resolved.clone());
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: resolved,
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		let mut backend = TextBackend::default();
 		widget.render(
 			&mut backend,
@@ -1771,16 +2130,15 @@ mod tests {
 		let kernel = PlotGridKernel::from_grid(grid, width as u32, height as u32);
 		let model = PlotSettings::default();
 		let mut backend = SvgBackend::new(width, height);
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: model.resolve(),
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		widget.render(
 			&mut backend,
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(width, height)),
@@ -1794,7 +2152,9 @@ mod tests {
 		title: &str,
 		settings: &ResolvedPlotSettings,
 	) -> Rect<Widget> {
-		let layouts = kernel.cell_layouts(settings.clone());
+		let layouts = kernel.cell_layouts(&crate::plot::theme::PlotSettings::from_resolved(
+			settings.clone(),
+		));
 		let requirements =
 			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), settings);
 		grid_tiled_area_with_requirements(
@@ -2050,16 +2410,15 @@ mod tests {
 		let model = PlotSettings::default();
 		let resolved = model.resolve();
 		let mut backend = SvgBackend::new(400.0, 300.0);
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: resolved.clone(),
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		widget.render(
 			&mut backend,
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(400.0, 300.0)),
@@ -2246,16 +2605,15 @@ mod tests {
 		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
 		let model = PlotSettings::default();
 		let mut backend = SvgBackend::new(800.0, 400.0);
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: model.resolve(),
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		widget.render(
 			&mut backend,
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0)),
@@ -2375,7 +2733,7 @@ mod tests {
 		)
 		.expect("facet");
 		let kernel = PlotGridKernel::from_grid(grid, 400, 300);
-		let layouts = kernel.cell_layouts(ResolvedPlotSettings::default());
+		let layouts = kernel.cell_layouts(&crate::plot::theme::PlotSettings::default());
 		let ranges: Vec<_> = layouts
 			.iter()
 			.map(|(_, layout)| match layout {
@@ -2408,16 +2766,15 @@ mod tests {
 		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
 		let model = PlotSettings::default();
 		let mut backend = SvgBackend::new(800.0, 400.0);
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: model.resolve(),
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		widget.render(
 			&mut backend,
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0)),
@@ -2534,16 +2891,15 @@ mod tests {
 		let kernel = PlotGridKernel::from_grid(grid, 800, 600);
 		let model = PlotSettings::default();
 		let mut backend = SvgBackend::new(800.0, 600.0);
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: model.resolve(),
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		widget.render(
 			&mut backend,
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0)),
@@ -2644,16 +3000,15 @@ mod tests {
 
 		let model = PlotSettings::default();
 		let mut backend = SvgBackend::new(800.0, 600.0);
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: model.resolve(),
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		widget.render(
 			&mut backend,
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0)),
@@ -2751,7 +3106,9 @@ mod tests {
 				.map(|(_, range)| range.1)
 				.fold(f64::NEG_INFINITY, f64::max),
 		);
-		let merged = kernel.cell_layouts(settings.clone());
+		let merged = kernel.cell_layouts(&crate::plot::theme::PlotSettings::from_resolved(
+			settings.clone(),
+		));
 		for (_, layout) in &merged {
 			let PlotLayout::CategoricalX {
 				categories,
@@ -2892,7 +3249,9 @@ mod tests {
 			let mut backend = TextBackend::default();
 			PlotComposite::render_overlay_layer(&kernel, &mut backend, bounds, 0.0, "", &settings);
 
-			let layouts = kernel.cell_layouts(resolved.clone());
+			let layouts = kernel.cell_layouts(&crate::plot::theme::PlotSettings::from_resolved(
+				resolved.clone(),
+			));
 			let requirements = BandRequirements::across_layouts(
 				layouts.iter().map(|(_, layout)| layout),
 				&resolved,
@@ -3028,7 +3387,9 @@ mod tests {
 				.map(|(_, range)| range.1)
 				.fold(f64::NEG_INFINITY, f64::max),
 		);
-		let merged = kernel.cell_layouts(settings.clone());
+		let merged = kernel.cell_layouts(&crate::plot::theme::PlotSettings::from_resolved(
+			settings.clone(),
+		));
 		for (_, layout) in &merged {
 			let PlotLayout::CategoricalY {
 				categories,
@@ -3293,7 +3654,9 @@ mod tests {
 		.unwrap();
 		let kernel = PlotGridKernel::from_grid(grid, 600, 240);
 		let settings = ResolvedPlotSettings::default();
-		let merged = kernel.cell_layouts(settings.clone());
+		let merged = kernel.cell_layouts(&crate::plot::theme::PlotSettings::from_resolved(
+			settings.clone(),
+		));
 		let bounds = IcedRectangle::new(Point::ORIGIN, Size::new(300.0, 180.0));
 		for (cell, (_, merged_layout)) in kernel.cells.iter().zip(&merged) {
 			let local_layout = cell.kernel.layout(settings.clone());
@@ -3393,7 +3756,9 @@ mod tests {
 		let kernel =
 			PlotGridKernel::from_styled_grid(grid, LayerSettings::default(), 800, 400).unwrap();
 		let settings = ResolvedPlotSettings::default();
-		let layouts = kernel.cell_layouts(settings.clone());
+		let layouts = kernel.cell_layouts(&crate::plot::theme::PlotSettings::from_resolved(
+			settings.clone(),
+		));
 		assert_eq!(layouts.len(), 2);
 		let ranges = layouts
 			.iter()
@@ -3433,16 +3798,15 @@ mod tests {
 
 		let model = PlotSettings::default();
 		let mut backend = SvgBackend::new(800.0, 400.0);
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: model.resolve(),
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		widget.render(
 			&mut backend,
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0)),
@@ -3497,7 +3861,7 @@ mod tests {
 		.unwrap();
 		let kernel =
 			PlotGridKernel::from_styled_grid(grid, LayerSettings::default(), 800, 400).unwrap();
-		for (_, layout) in kernel.cell_layouts(ResolvedPlotSettings::default()) {
+		for (_, layout) in kernel.cell_layouts(&crate::plot::theme::PlotSettings::default()) {
 			let PlotLayout::CategoricalX {
 				y_range,
 				y_axis_type,
@@ -3558,7 +3922,9 @@ mod tests {
 		.unwrap();
 		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
 		let settings = ResolvedPlotSettings::default();
-		let layouts = kernel.cell_layouts(settings.clone());
+		let layouts = kernel.cell_layouts(&crate::plot::theme::PlotSettings::from_resolved(
+			settings.clone(),
+		));
 		assert_eq!(layouts.len(), 2);
 		let cartesian = layouts
 			.iter()
@@ -3603,16 +3969,15 @@ mod tests {
 
 		let model = PlotSettings::default();
 		let mut backend = SvgBackend::new(800.0, 400.0);
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: model.resolve(),
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		widget.render(
 			&mut backend,
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0)),
@@ -3810,16 +4175,15 @@ mod tests {
 		}
 
 		let mut backend = SvgBackend::new(800.0, 600.0);
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: model.resolve(),
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		widget.render(
 			&mut backend,
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0)),
@@ -3861,19 +4225,18 @@ mod tests {
 		)
 		.expect("facet");
 		let kernel = PlotGridKernel::from_grid(grid, 800, 600);
-		let layouts = kernel.cell_layouts(ResolvedPlotSettings::default());
+		let layouts = kernel.cell_layouts(&crate::plot::theme::PlotSettings::default());
 		let model = PlotSettings::default();
 		let mut backend = SvgBackend::new(800.0, 600.0);
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: model.resolve(),
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		widget.render(
 			&mut backend,
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0)),
@@ -3963,16 +4326,15 @@ mod tests {
 			..ResolvedPlotSettings::default()
 		};
 		let model = PlotSettings::from_resolved(resolved.clone());
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: resolved.clone(),
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		let mut backend = TextBackend::default();
 		widget.render(
 			&mut backend,
@@ -4034,16 +4396,15 @@ mod tests {
 				crate::plot::spec::ResolvedPresence::Show(Arc::new("Figure heading".to_owned()));
 			let model = PlotSettings::from_resolved(resolved.clone());
 			let mut backend = SvgBackend::new(800.0, height);
-			let widget = PlotWidget {
-				kernel: &kernel,
-				title: String::new(),
-				padding: 0.0,
-				settings: resolved.clone(),
-				settings_model: model,
-				render_revision: 0,
-				resize_render_suspended: false,
-				layer: PlotRenderLayer::Full,
-			};
+			let widget = PlotWidget::new(
+				&kernel,
+				String::new(),
+				0.0,
+				model,
+				0,
+				false,
+				PlotRenderLayer::Full,
+			);
 			widget.render(
 				&mut backend,
 				IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, height)),
@@ -4184,16 +4545,15 @@ mod tests {
 		resolved.y_label = ResolvedPresence::Show(Arc::new("Authored Y".to_owned()));
 		let model = PlotSettings::from_resolved(resolved.clone());
 		let mut backend = SvgBackend::new(800.0, 600.0);
-		PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: resolved,
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		}
+		PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		)
 		.render(
 			&mut backend,
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0)),
@@ -4679,16 +5039,15 @@ mod tests {
 		};
 		let resolved = ResolvedPlotSettings::default();
 		let model = PlotSettings::from_resolved(resolved.clone());
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: resolved,
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		let bounds = IcedRectangle::new(Point::ORIGIN, Size::new(400.0, 300.0));
 		let transform = CoordinateTransformer::new(&layout, bounds);
 		let mut backend = TextBackend::default();
@@ -4766,16 +5125,15 @@ mod tests {
 		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
 		let model = PlotSettings::default();
 		let mut backend = SvgBackend::new(800.0, 400.0);
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: model.resolve(),
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		widget.render(
 			&mut backend,
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0)),
@@ -4816,16 +5174,15 @@ mod tests {
 		let model = PlotSettings::default();
 		let render_at = |origin: Point| {
 			let mut backend = SvgBackend::new(800.0, 400.0);
-			let widget = PlotWidget {
-				kernel: &kernel,
-				title: String::new(),
-				padding: 0.0,
-				settings: model.resolve(),
-				settings_model: model.clone(),
-				render_revision: 0,
-				resize_render_suspended: false,
-				layer: PlotRenderLayer::Full,
-			};
+			let widget = PlotWidget::new(
+				&kernel,
+				String::new(),
+				0.0,
+				model.clone(),
+				0,
+				false,
+				PlotRenderLayer::Full,
+			);
 			widget.render(
 				&mut backend,
 				IcedRectangle::new(origin, iced::Size::new(800.0, 400.0)),
@@ -4854,7 +5211,9 @@ mod tests {
 		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
 		let model = PlotSettings::default();
 		let resolved = model.resolve();
-		let layouts = kernel.cell_layouts(resolved.clone());
+		let layouts = kernel.cell_layouts(&crate::plot::theme::PlotSettings::from_resolved(
+			resolved.clone(),
+		));
 		let local = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
 		let outer = grid_outer_area(widget_rect(local), 0.0);
 		let tiled = grid_tiled_area_for_kernel(&kernel, outer, "", &resolved);
@@ -5175,16 +5534,15 @@ mod tests {
 		let admissible_kernel = PlotGridKernel::from_grid(admissible_grid, 640, 480);
 		let model = PlotSettings::default();
 		let mut backend = SvgBackend::new(640.0, 480.0);
-		let widget = PlotWidget {
-			kernel: &admissible_kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: model.resolve(),
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&admissible_kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		widget.render(
 			&mut backend,
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(640.0, 480.0)),
@@ -5249,16 +5607,15 @@ mod tests {
 		let grid_color = resolved.chrome.gridline.iced();
 		let axis_color = resolved.chrome.axis_line.iced();
 		let model = PlotSettings::from_resolved(resolved.clone());
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: resolved,
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		let mut backend = StrataBackend::default();
 		let bounds = IcedRectangle::new(Point::ORIGIN, Size::new(600.0, 300.0));
 		widget.render(&mut backend, bounds);
@@ -5352,16 +5709,15 @@ mod tests {
 		let model = PlotSettings::default();
 		let make_svg = |kernel: &dyn PlotKernel| {
 			let mut backend = SvgBackend::new(400.0, 300.0);
-			let widget = PlotWidget {
+			let widget = PlotWidget::new(
 				kernel,
-				title: "fallback title".to_owned(),
-				padding: 0.0,
-				settings: model.resolve(),
-				settings_model: model.clone(),
-				render_revision: 0,
-				resize_render_suspended: false,
-				layer: PlotRenderLayer::Full,
-			};
+				"fallback title".to_owned(),
+				0.0,
+				model.clone(),
+				0,
+				false,
+				PlotRenderLayer::Full,
+			);
 			widget.render(
 				&mut backend,
 				IcedRectangle::new(Point::ORIGIN, iced::Size::new(400.0, 300.0)),
@@ -5473,16 +5829,15 @@ mod tests {
 		let kernel = PlotGridKernel::from_grid(grid, 640, 480);
 		let model = PlotSettings::default();
 		let mut backend = SvgBackend::new(640.0, 480.0);
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: model.resolve(),
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		widget.render(
 			&mut backend,
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(640.0, 480.0)),

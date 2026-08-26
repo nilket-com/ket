@@ -1539,6 +1539,21 @@ pub trait PlotComposite: Send + Sync {
 pub trait PlotKernel: Send + Sync {
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout;
 
+	/// PRODUCT-0139 §6: the resolution the mark renderer draws with is the
+	/// authority, and geometry consumes that same value. A single-layer kernel
+	/// overrides this to return exactly what its renderer resolves, so the
+	/// transform, the render-mode decision, and any mark-side cache key are
+	/// derived from one resolution rather than from two structs that agree only
+	/// by convention.
+	///
+	/// The default is the figure-wide resolution. A layered kernel keeps it: its
+	/// layers resolve per mark renderer (`plot_with_settings`), so no single
+	/// value is the authority for the whole figure, and PRODUCT-0139 refuses
+	/// raster reuse for that case rather than inventing one.
+	fn resolve_settings(&self, settings: &PlotSettings) -> ResolvedPlotSettings {
+		settings.resolve()
+	}
+
 	/// Whether the common renderer must place the grid and marks together in a
 	/// plot-area clip. This is required when emitted geometry deliberately
 	/// extends beyond authored bounds and must be clipped without introducing a
@@ -1567,6 +1582,22 @@ pub trait PlotKernel: Send + Sync {
 		settings: &PlotSettings,
 	) {
 		self.plot(backend, bounds, transform, cursor, settings.resolve());
+	}
+
+	/// PRODUCT-0139 §1: the raster-reuse seam. The default ignores motion, so a
+	/// kernel that cannot reuse anything is unaffected and a composite — which
+	/// never routes through here — is `Settled` by construction, which is how
+	/// §7's facet exclusion is enforced rather than merely stated.
+	fn plot_with_motion(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &PlotSettings,
+		_motion: ViewportMotion,
+	) {
+		self.plot_with_settings(backend, bounds, transform, cursor, settings);
 	}
 
 	fn legend_content(&self, _settings: &ResolvedPlotSettings) -> Option<LegendContent> {
@@ -2044,17 +2075,82 @@ pub trait MarkRenderer: Send + Sync {
 		cursor: Cursor,
 		settings: &ResolvedPlotSettings,
 	) -> Option<MarkHit>;
+
+	/// PRODUCT-0139 §3: the mark declares whether it must be clipped to the plot
+	/// area, and every kernel that renders it honours the declaration. A kernel
+	/// does not decide this — one mark reaches the screen through more than one
+	/// kernel (a bare spelling through its own kernel, a modified spelling
+	/// through a one-layer `LayeredPlotKernel`), and the two must clip alike.
+	fn requires_plot_area_clip(&self) -> bool {
+		false
+	}
+}
+
+/// PRODUCT-0139 §1: whether the viewport is moving this frame.
+///
+/// Reuse is a **motion-only** degraded preview, so it needs an input saying
+/// motion is happening. `Settled` is the default everywhere and the only value
+/// any current caller produces — PRODUCT-0133 stages 3–4 supply the gesture
+/// that will produce `Moving`. A settled frame always rasterizes truly, which
+/// is what makes §5's "exactly one true rasterization at settle" hold without a
+/// separate settle event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewportMotion {
+	#[default]
+	Settled,
+	Moving,
 }
 
 pub struct PlotWidget<'a> {
 	pub kernel: &'a dyn PlotKernel,
 	pub title: String,
 	pub padding: f32,
-	pub settings: ResolvedPlotSettings,
+	/// PRODUCT-0139 §6: derived from `settings_model` through the kernel's own
+	/// resolution, never supplied. Private by construction — two independently
+	/// supplied settings values is precisely the divergence the record forbids.
+	settings: ResolvedPlotSettings,
 	pub settings_model: PlotSettings,
 	pub render_revision: u64,
 	pub resize_render_suspended: bool,
 	pub layer: PlotRenderLayer,
+	/// PRODUCT-0139 §1. Defaults to `Settled`; a gesture opts in per frame.
+	viewport_motion: ViewportMotion,
+}
+
+impl<'a> PlotWidget<'a> {
+	pub fn new(
+		kernel: &'a dyn PlotKernel,
+		title: String,
+		padding: f32,
+		settings_model: PlotSettings,
+		render_revision: u64,
+		resize_render_suspended: bool,
+		layer: PlotRenderLayer,
+	) -> Self {
+		let settings = kernel.resolve_settings(&settings_model);
+		Self {
+			kernel,
+			title,
+			padding,
+			settings,
+			settings_model,
+			render_revision,
+			resize_render_suspended,
+			layer,
+			viewport_motion: ViewportMotion::Settled,
+		}
+	}
+
+	/// PRODUCT-0139 §1: opt this frame into motion-only raster reuse. Only a
+	/// viewport gesture may call it, and only for the frames it is moving.
+	///
+	/// PRODUCT-0133 stages 3–4 supply the first production caller; until then
+	/// only PRODUCT-0139's gates produce `Moving`.
+	#[allow(dead_code)]
+	pub fn with_viewport_motion(mut self, motion: ViewportMotion) -> Self {
+		self.viewport_motion = motion;
+		self
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2648,12 +2744,13 @@ impl<'a> PlotWidget<'a> {
 		let draw_plot = &mut |backend: &mut dyn PlotBackend| {
 			backend.translate(iced::Vector::new(plot_area.x, plot_area.y));
 			self.draw_layout_grid(backend, plot_area, &transform, &layout);
-			self.kernel.plot_with_settings(
+			self.kernel.plot_with_motion(
 				backend,
 				plot_area,
 				&transform,
 				Cursor::Unavailable,
 				&self.settings_model,
+				self.viewport_motion,
 			);
 		};
 		if clipped_plot {
@@ -5025,16 +5122,15 @@ mod product_0031_pre_extraction_oracle {
 	) -> String {
 		let settings_model = PlotSettings::from_resolved(settings.clone());
 		let kernel = OracleKernel { legend };
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: "fallback title".to_owned(),
-			padding: 0.0,
-			settings,
+		let widget = PlotWidget::new(
+			&kernel,
+			"fallback title".to_owned(),
+			0.0,
 			settings_model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		let mut backend = SvgBackend::new(width, height);
 		widget.render(
 			&mut backend,
@@ -5280,16 +5376,15 @@ mod product_0067_0068_strata_oracles {
 	fn render(layout: PlotLayout, settings: ResolvedPlotSettings, mark: bool) -> Vec<Operation> {
 		let model = PlotSettings::from_resolved(settings.clone());
 		let kernel = OrderKernel { layout, mark };
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings,
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		let mut backend = OperationBackend::default();
 		widget.render(
 			&mut backend,
@@ -5745,16 +5840,15 @@ mod product_0067_0068_strata_oracles {
 	) -> Vec<Operation> {
 		let model = PlotSettings::from_resolved(settings.clone());
 		let kernel = OrderKernel { layout, mark: true };
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: settings.clone(),
-			settings_model: model.clone(),
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model.clone(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 120.0));
 		let layout = kernel.layout(settings.clone());
 		let requirements = BandRequirements::from_layout(&layout, &settings);
@@ -5803,16 +5897,15 @@ mod product_0067_0068_strata_oracles {
 	fn product_0079_plot_area_clip_keeps_background_below_grid_and_marks() {
 		let settings = settings();
 		let model = PlotSettings::from_resolved(settings.clone());
-		let widget = PlotWidget {
-			kernel: &ClippedOrderKernel,
-			title: String::new(),
-			padding: 0.0,
-			settings,
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			&ClippedOrderKernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 120.0));
 		let mut backend = OperationBackend::default();
 		widget.render_plot_layer(&mut backend, bounds);
@@ -6510,16 +6603,15 @@ mod product_0056_categorical_y_oracles {
 
 	fn widget<'a>(kernel: &'a FrameKernel) -> PlotWidget<'a> {
 		let model = PlotSettings::default();
-		PlotWidget {
+		PlotWidget::new(
 			kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings: model.resolve(),
-			settings_model: model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		}
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		)
 	}
 
 	#[test]
@@ -6534,16 +6626,15 @@ mod product_0056_categorical_y_oracles {
 		settings.title_size = TitleTextSize::new(48.0).unwrap();
 		settings.subtitle_size = SubtitleTextSize::new(36.0).unwrap();
 		let settings_model = PlotSettings::from_resolved(settings.clone());
-		let widget = PlotWidget {
-			kernel: &kernel,
-			title: String::new(),
-			padding: 0.0,
-			settings,
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
 			settings_model,
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
 		let mut backend = RecordingBackend::default();
 		widget.render(
 			&mut backend,
@@ -6575,16 +6666,15 @@ mod product_0056_categorical_y_oracles {
 			let mut settings = ResolvedPlotSettings::default();
 			settings.x_label_size = size;
 			let settings_model = PlotSettings::from_resolved(settings.clone());
-			let widget = PlotWidget {
-				kernel: &kernel,
-				title: String::new(),
-				padding: 0.0,
-				settings,
+			let widget = PlotWidget::new(
+				&kernel,
+				String::new(),
+				0.0,
 				settings_model,
-				render_revision: 0,
-				resize_render_suspended: false,
-				layer: PlotRenderLayer::Full,
-			};
+				0,
+				false,
+				PlotRenderLayer::Full,
+			);
 			let transform = CoordinateTransformer::new(&layout, bounds);
 			let mut backend = RecordingBackend::default();
 			widget.draw_parallel_axes(
@@ -6794,5 +6884,149 @@ mod product_0133_structured_hit_tests {
 			axis_hit_value(1.0, &AxisType::Linear, "number"),
 			HitValue::Quantitative { .. }
 		));
+	}
+}
+
+/// PRODUCT-0139 §6 gate: geometry consumes the mark renderer's resolution.
+///
+/// The fixture is built so the two resolutions genuinely disagree — a layer
+/// tier carrying a domain and a point size that `resolve_for_layer` drops —
+/// and that disagreement is asserted before the gate's real claim, so the
+/// claim cannot pass for the wrong reason.
+#[cfg(test)]
+mod product_0139_settings_authority {
+	use super::*;
+	use crate::plot::spec::{LayerSettings, Override, PointSize};
+	use crate::plot::theme::{PlotDomainOverrides, PlotSettings};
+
+	/// Resolves the layer tier the way a single-layer kernel does.
+	struct LayerAuthorityKernel {
+		layer_settings: LayerSettings,
+	}
+
+	impl PlotKernel for LayerAuthorityKernel {
+		fn resolve_settings(&self, settings: &PlotSettings) -> ResolvedPlotSettings {
+			settings.resolve_for_layer(&self.layer_settings)
+		}
+
+		fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
+			PlotLayout::Cartesian {
+				x_range: (settings.x_min.unwrap_or(0.0), settings.x_max.unwrap_or(1.0)),
+				y_range: (0.0, 1.0),
+				x_axis_type: AxisType::Linear,
+				y_axis_type: AxisType::Linear,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
+			}
+		}
+
+		fn plot(
+			&self,
+			_backend: &mut dyn PlotBackend,
+			_bounds: Rectangle,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+			_settings: ResolvedPlotSettings,
+		) {
+		}
+
+		fn hit(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<PlotHit> {
+			None
+		}
+	}
+
+	fn model_whose_layer_tier_disagrees() -> PlotSettings {
+		let mut model = PlotSettings::default();
+		model.layer.domains = Override::Set(PlotDomainOverrides {
+			x_min: Some(100.0),
+			x_max: Some(200.0),
+			y_min: None,
+			y_max: None,
+		});
+		model.layer.point_size = Override::Set(PointSize::new(4.0).expect("in range"));
+		model
+	}
+
+	fn kernel() -> LayerAuthorityKernel {
+		LayerAuthorityKernel {
+			layer_settings: LayerSettings {
+				point_size: Override::Set(PointSize::new(1.5).expect("in range")),
+				..LayerSettings::default()
+			},
+		}
+	}
+
+	#[test]
+	fn product_0139_the_two_resolutions_disagree_for_this_fixture() {
+		let model = model_whose_layer_tier_disagrees();
+		let kernel = kernel();
+		let figure_wide = model.resolve();
+		let authority = kernel.resolve_settings(&model);
+
+		// The discriminating control. Without it the gate below would pass on a
+		// fixture where both resolutions happen to be equal, proving nothing.
+		assert_ne!(
+			figure_wide.point_size, authority.point_size,
+			"fixture must make the figure-wide and kernel resolutions differ"
+		);
+		assert_ne!(
+			figure_wide.x_min, authority.x_min,
+			"fixture must make the resolved domain differ too"
+		);
+	}
+
+	#[test]
+	fn product_0139_plot_widget_derives_geometry_from_the_kernels_resolution() {
+		let model = model_whose_layer_tier_disagrees();
+		let kernel = kernel();
+		let authority = kernel.resolve_settings(&model);
+		let figure_wide = model.resolve();
+
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model.clone(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
+
+		assert_eq!(widget.settings.point_size, authority.point_size);
+		assert_eq!(widget.settings.x_min, authority.x_min);
+		assert_ne!(widget.settings.x_min, figure_wide.x_min);
+	}
+
+	#[test]
+	fn product_0139_the_geometry_the_widget_lays_out_follows_the_authority() {
+		let model = model_whose_layer_tier_disagrees();
+		let kernel = kernel();
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model.clone(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
+
+		let PlotLayout::Cartesian { x_range, .. } = kernel.layout(widget.settings.clone()) else {
+			panic!("fixture is cartesian");
+		};
+		let PlotLayout::Cartesian {
+			x_range: figure_wide_range,
+			..
+		} = kernel.layout(model.resolve())
+		else {
+			panic!("fixture is cartesian");
+		};
+
+		// The layer tier's domain is dropped by the authority, so the widget
+		// lays out the kernel's own range and not the figure-wide one. This is
+		// the value `ScatterRasterKey` is keyed on in the raster path.
+		assert_eq!(x_range, (0.0, 1.0));
+		assert_eq!(figure_wide_range, (100.0, 200.0));
+		assert_ne!(x_range, figure_wide_range);
 	}
 }

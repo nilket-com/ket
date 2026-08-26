@@ -14,28 +14,26 @@ fn hover_text_pixels(settings: &ResolvedPlotSettings) -> Pixels {
 /// closing and layout, so this surface emits plot interaction only.
 pub fn host_view(state: &HostPlotState) -> Element<'_, PlotMessage> {
 	let title = state.display_label.clone();
-	let data = canvas(PlotWidget {
-		kernel: state.kernel.as_ref(),
-		title: title.clone(),
-		padding: 20.0,
-		settings: state.plot_settings.clone(),
-		settings_model: state.plot_settings_model.clone(),
-		render_revision: state.render_revision,
-		resize_render_suspended: state.resize_render_suspended,
-		layer: PlotRenderLayer::Data,
-	})
+	let data = canvas(PlotWidget::new(
+		state.kernel.as_ref(),
+		title.clone(),
+		20.0,
+		state.plot_settings_model.clone(),
+		state.render_revision,
+		state.resize_render_suspended,
+		PlotRenderLayer::Data,
+	))
 	.width(Fill)
 	.height(Fill);
-	let interaction = canvas(PlotWidget {
-		kernel: state.kernel.as_ref(),
+	let interaction = canvas(PlotWidget::new(
+		state.kernel.as_ref(),
 		title,
-		padding: 20.0,
-		settings: state.plot_settings.clone(),
-		settings_model: state.plot_settings_model.clone(),
-		render_revision: state.render_revision,
-		resize_render_suspended: state.resize_render_suspended,
-		layer: PlotRenderLayer::OverlayInteractive,
-	})
+		20.0,
+		state.plot_settings_model.clone(),
+		state.render_revision,
+		state.resize_render_suspended,
+		PlotRenderLayer::OverlayInteractive,
+	))
 	.width(Fill)
 	.height(Fill);
 	let mut layers = stack![data, interaction];

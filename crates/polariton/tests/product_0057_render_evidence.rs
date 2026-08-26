@@ -627,16 +627,15 @@ fn render_product_0068_bar(
 	}
 	let resolved = settings.resolve();
 	let bounds = Rectangle::with_size(Size::new(size.width as f32, size.height as f32));
-	let widget = PlotWidget {
-		kernel: &kernel,
-		title: String::new(),
-		padding: 0.0,
-		settings: resolved.clone(),
-		settings_model: settings.clone(),
-		render_revision: 0,
-		resize_render_suspended: false,
-		layer: PlotRenderLayer::Full,
-	};
+	let widget = PlotWidget::new(
+		&kernel,
+		String::new(),
+		0.0,
+		settings.clone(),
+		0,
+		false,
+		PlotRenderLayer::Full,
+	);
 	if overlay_control {
 		render_frame(renderer, size, |frame| {
 			let mut backend = IcedBackend { frame };
@@ -777,16 +776,15 @@ fn render_product_0127_selected_ticks(
 	)
 	.plot_area(Rect::from_iced_frame(bounds), 0.0, &settings)
 	.into_iced();
-	let widget = PlotWidget {
-		kernel: &kernel,
-		title: String::new(),
-		padding: 0.0,
-		settings,
+	let widget = PlotWidget::new(
+		&kernel,
+		String::new(),
+		0.0,
 		settings_model,
-		render_revision: 0,
-		resize_render_suspended: false,
-		layer: PlotRenderLayer::Full,
-	};
+		0,
+		false,
+		PlotRenderLayer::Full,
+	);
 	let capture = render_frame(renderer, size, |frame| {
 		let mut backend = IcedBackend { frame };
 		widget.render(&mut backend, bounds);
@@ -858,16 +856,15 @@ fn render_product_rotation(
 		size.width as f32 - 160.0,
 		size.height as f32 - 80.0,
 	));
-	let widget = PlotWidget {
-		kernel: &kernel,
-		title: String::new(),
-		padding: 0.0,
-		settings: resolved,
-		settings_model: settings,
-		render_revision: 0,
-		resize_render_suspended: false,
-		layer: PlotRenderLayer::Full,
-	};
+	let widget = PlotWidget::new(
+		&kernel,
+		String::new(),
+		0.0,
+		settings,
+		0,
+		false,
+		PlotRenderLayer::Full,
+	);
 	let capture = render_plot_and_overlay(
 		renderer,
 		size,
@@ -899,16 +896,15 @@ fn render_product_kernel_rotation(
 	.plot_area(Rect::from_iced_frame(figure_bounds), 0.0, &resolved)
 	.into_iced();
 	let settings_model = settings;
-	let widget = PlotWidget {
+	let widget = PlotWidget::new(
 		kernel,
-		title: "Count control".to_owned(),
-		padding: 0.0,
-		settings: resolved,
+		"Count control".to_owned(),
+		0.0,
 		settings_model,
-		render_revision: 0,
-		resize_render_suspended: false,
-		layer: PlotRenderLayer::Full,
-	};
+		0,
+		false,
+		PlotRenderLayer::Full,
+	);
 	let capture = render_plot_and_overlay(
 		renderer,
 		size,
@@ -1161,16 +1157,15 @@ fn render_product_0068_cartesian_mark(
 ) -> Capture {
 	let resolved = settings.resolve();
 	let bounds = Rectangle::with_size(Size::new(size.width as f32, size.height as f32));
-	let widget = PlotWidget {
+	let widget = PlotWidget::new(
 		kernel,
-		title: String::new(),
-		padding: 0.0,
-		settings: resolved.clone(),
-		settings_model: settings.clone(),
-		render_revision: 0,
-		resize_render_suspended: false,
-		layer: PlotRenderLayer::Full,
-	};
+		String::new(),
+		0.0,
+		settings.clone(),
+		0,
+		false,
+		PlotRenderLayer::Full,
+	);
 	if overlay_control {
 		render_frame(renderer, size, |frame| {
 			let mut backend = IcedBackend { frame };
@@ -1668,16 +1663,15 @@ fn render_product_0077_percent_grid(
 	let settings = product_0077_settings(tick_label_text);
 	let resolved = settings.resolve();
 	let bounds = Rectangle::with_size(Size::new(size.width as f32, size.height as f32));
-	let widget = PlotWidget {
-		kernel: &kernel,
-		title: String::new(),
-		padding: 0.0,
-		settings: resolved,
-		settings_model: settings,
-		render_revision: 0,
-		resize_render_suspended: false,
-		layer: PlotRenderLayer::Full,
-	};
+	let widget = PlotWidget::new(
+		&kernel,
+		String::new(),
+		0.0,
+		settings,
+		0,
+		false,
+		PlotRenderLayer::Full,
+	);
 	render_plot_and_overlay(
 		renderer,
 		size,

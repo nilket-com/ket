@@ -55,6 +55,15 @@ impl LayerRenderer {
 		}
 	}
 
+	/// PRODUCT-0139 §3: the declaration belongs to the mark, so this asks the
+	/// renderer rather than answering for it.
+	fn requires_plot_area_clip(&self) -> bool {
+		match self {
+			Self::Line(renderer, _) => renderer.requires_plot_area_clip(),
+			Self::Scatter(renderer, _) => renderer.requires_plot_area_clip(),
+		}
+	}
+
 	fn mark_family(&self) -> crate::plot::common::MarkFamily {
 		match self {
 			Self::Line(_, _) => crate::plot::common::MarkFamily::LINE,
@@ -176,6 +185,16 @@ impl LayeredPlotKernel {
 }
 
 impl PlotKernel for LayeredPlotKernel {
+	/// PRODUCT-0139 §3: any layer whose mark must be clipped clips the figure.
+	/// A one-layer wrapper around a scatter therefore clips exactly as the bare
+	/// scatter kernel does, which is what makes the two authoring spellings of
+	/// one mark agree.
+	fn requires_plot_area_clip(&self) -> bool {
+		self.layers
+			.iter()
+			.any(LayerRenderer::requires_plot_area_clip)
+	}
+
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Cartesian {
 			x_range: (

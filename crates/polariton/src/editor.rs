@@ -1496,16 +1496,15 @@ impl CodeEditor {
 		let PanelContent::Plot(plot) = &entry.content else {
 			return None;
 		};
-		let widget = PlotWidget {
-			kernel: plot.kernel.as_ref(),
-			title: plot.display_label.clone(),
-			padding: 0.0,
-			settings: plot.plot_settings.clone(),
-			settings_model: plot.plot_settings_model.clone(),
-			render_revision: plot.render_revision,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
+		let widget = PlotWidget::new(
+			plot.kernel.as_ref(),
+			plot.display_label.clone(),
+			0.0,
+			plot.plot_settings_model.clone(),
+			plot.render_revision,
+			false,
+			PlotRenderLayer::Full,
+		);
 		let mut backend = crate::plot::export::SvgBackend::new(800.0, 480.0);
 		widget.render(
 			&mut backend,
@@ -1527,7 +1526,11 @@ impl CodeEditor {
 		let PanelContent::Plot(plot) = &entry.content else {
 			return None;
 		};
-		let layout = plot.kernel.layout(plot.plot_settings.clone());
+		// PRODUCT-0139 §6: geometry from the kernel's own resolution, which is
+		// the same value `hover_with_settings` resolves below.
+		let layout = plot
+			.kernel
+			.layout(plot.kernel.resolve_settings(&plot.plot_settings_model));
 		let transform = crate::plot::common::CoordinateTransformer::new(&layout, bounds);
 		plot.kernel.hover_with_settings(
 			&transform,
@@ -1768,7 +1771,6 @@ impl CodeEditor {
 				(width >= 1.0 && height >= 1.0).then(|| HostPlotExport {
 					title: plot.display_label.clone(),
 					kernel: Arc::clone(&plot.kernel),
-					settings: plot.plot_settings.clone(),
 					settings_model: plot.plot_settings_model.clone(),
 					render_revision: plot.render_revision,
 					resize_render_suspended: plot.resize_render_suspended,
@@ -3019,7 +3021,9 @@ pub struct PanelRegistry {
 pub(crate) struct HostPlotExport {
 	pub(crate) title: String,
 	pub(crate) kernel: Arc<dyn PlotKernel + Send + Sync>,
-	pub(crate) settings: ResolvedPlotSettings,
+	/// PRODUCT-0139 §6: the model is the only settings carried across this
+	/// seam; the resolved value is derived by `PlotWidget::new` at the point of
+	/// use, so an export cannot ship a geometry that disagrees with its marks.
 	pub(crate) settings_model: crate::plot::theme::PlotSettings,
 	pub(crate) render_revision: u64,
 	pub(crate) resize_render_suspended: bool,
@@ -4461,18 +4465,15 @@ fn markdown_cell_output_surface<'a>(
 				.into()
 		}
 		NotebookCellOutput::Plot { surface } => {
-			let plot: Element<'_, crate::gui::messages::PlotMessage> = canvas(PlotWidget {
-				kernel: surface.kernel.as_ref(),
-				title: surface.composition.title(),
-				padding: 20.0,
-				settings: surface.settings.clone(),
-				settings_model: crate::plot::theme::PlotSettings::from_resolved(
-					surface.settings.clone(),
-				),
-				render_revision: surface.render_revision,
-				resize_render_suspended: false,
-				layer: PlotRenderLayer::Full,
-			})
+			let plot: Element<'_, crate::gui::messages::PlotMessage> = canvas(PlotWidget::new(
+				surface.kernel.as_ref(),
+				surface.composition.title(),
+				20.0,
+				crate::plot::theme::PlotSettings::from_resolved(surface.settings.clone()),
+				surface.render_revision,
+				false,
+				PlotRenderLayer::Full,
+			))
 			.width(Length::Fill)
 			.height(Length::Fill)
 			.into();

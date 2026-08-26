@@ -301,16 +301,15 @@ fn render_plot_export(
 		width,
 		height,
 	};
-	let widget = crate::plot::common::PlotWidget {
-		kernel: snapshot.kernel.as_ref(),
-		title: snapshot.title,
-		padding: 20.0,
-		settings: snapshot.settings,
-		settings_model: snapshot.settings_model,
-		render_revision: snapshot.render_revision,
-		resize_render_suspended: snapshot.resize_render_suspended,
-		layer: crate::plot::common::PlotRenderLayer::Full,
-	};
+	let widget = crate::plot::common::PlotWidget::new(
+		snapshot.kernel.as_ref(),
+		snapshot.title,
+		20.0,
+		snapshot.settings_model,
+		snapshot.render_revision,
+		snapshot.resize_render_suspended,
+		crate::plot::common::PlotRenderLayer::Full,
+	);
 	match format {
 		ExportFormat::SVG => {
 			let mut backend = SvgBackend::new(width, height);
