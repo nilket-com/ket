@@ -203,3 +203,69 @@ attributed against its own baseline, which is the only claim it needs.
 Next largest, on the post-cut profile: `materialize` at 25% and
 `accumulator push` at 17% of a 1,867 ns/row scan. `materialize` is the one the
 `batch.num_rows() != 1` guard in the matcher still forces to stay per-row.
+
+## The absolute-rate discrepancy: what it is not
+
+The rail above reads ~5x faster than the 13,000 rows in 0.18 s (~72,000 rows/s)
+this ADR banked. Before any rate is published as a ceiling, that gap needed an
+account.
+
+**The original run cannot be reproduced.** `ctrl_plain` and `ctrl_packed` have
+both been dropped from the shared deployment, and the August journal is rotated.
+Nothing is left to re-measure, so every arm below is a reconstruction.
+
+Five arms at the banked 13,000-row rung, medians of three, every arm through the
+Arrow-IPC adapter so none pays for text rendering. Run twice: once on HEAD and
+once on `9e773b28` — **the exact binary vintage of the banked measurement** —
+each on its own fresh data dir, with the serving process's executable hash
+checked before the run rather than assumed.
+
+| arm | fixture | path | projected | bound | HEAD | `9e773b28` |
+|---|---|---|---|---|---|---|
+| A | 2xFloat64 | rune | 2 | none | 38.8 ms | 37.7 ms |
+| B | 2xFloat64 | sql | 2 | none | 34.5 ms | 33.4 ms |
+| C | 2xFloat64 | sql | 1 | LIMIT 13000 | 30.7 ms | 32.4 ms |
+| D | 1xInt64 | sql | 1 | LIMIT 13000 | **30.9 ms** | **31.6 ms** |
+| E | 1xInt64 | rune | 1 | none | 37.7 ms | 34.2 ms |
+
+Arm D reconstructs the banked query shape. Against the banked 180 ms it is
+**5.7x faster on the banked run's own engine version.**
+
+Four candidate causes, each now measured:
+
+- **Engine version: ruled out.** The two vintages are indistinguishable — within
+  6%, and not consistently favouring the newer one (A, B and E slightly favour
+  the older). At this rung with a `LIMIT`, the schema hoist's 17% is diluted
+  into noise.
+- **Fixture width: ruled out.** One `Int64` against two `Float64` at an
+  identical query is 30.9 vs 30.7 ms.
+- **Query path: insufficient.** Rune against SQL is 8%; projection and bound
+  together 19%. The whole arm spread is 1.35x, against a 5.7x gap.
+- **Client build: ruled out** by the debug-vs-`evidence` control above (0.8%).
+
+**Deployment state is the only candidate left standing, and it is too small
+here.** Ten rounds of the attribution rail on one deployment — roughly 2.1M rows
+written and dropped, reclaimed asynchronously — drifted 13,000-row scans 40.9 ->
+46.5 ms (+13.7%) and 200,000-row scans 515.5 -> 592.8 ms (+15.0%). Eight rounds
+on `9e773b28` gave +12%. Real, reproducible, and roughly linear over this range,
+but nowhere near 5.7x at any churn level reachable in one session. Whether weeks
+of soak compound it that far is unmeasured, and with `ctrl_plain` gone it is
+unmeasurable on the original.
+
+### What to publish
+
+**Retire the ~72,000 rows/s figure.** It is not a property of the engine: its
+own binary version, on a clean deployment, against the closest reconstruction of
+its own query, reads 5.7x faster. Quoting it as a ceiling would attribute to the
+engine something no engine version exhibits.
+
+**~420,000 rows/s at the 13,000-row rung is publishable with its scope stated:**
+single node, fresh deployment, one column projected under a `LIMIT`. The scope
+is not boilerplate — arm A is 38.8 ms against arm D's 30.9 ms on the same data,
+so projection width alone moves the number 26%, and ten rounds of churn move it
+another 14%.
+
+**What stays open:** no mechanism explains the 5.7x. The honest statement is that
+the banked number is unreproducible and its conditions are unrecoverable, not
+that it was wrong. A soak-scale churn experiment is the only remaining way to
+test the last hypothesis, and it needs weeks of deployment history, not a rail.
