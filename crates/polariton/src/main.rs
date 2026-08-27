@@ -22,6 +22,8 @@ mod rune_view;
 mod rune_view_compiler;
 #[cfg(feature = "toron")]
 mod session_persistence;
+#[cfg(feature = "toron")]
+mod settings_writeback;
 
 fn ensure_rustls_provider() {
 	if rustls::crypto::CryptoProvider::get_default().is_none() {

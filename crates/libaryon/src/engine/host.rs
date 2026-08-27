@@ -379,6 +379,25 @@ pub fn supported_languages() -> Vec<LanguageInfo> {
 #[cfg(test)]
 mod tests {
 	use super::{EngineConfig, EngineHandle, build_language_registry, supported_languages};
+	use crate::core::{DocByte, RequestId};
+	use crate::engine::{
+		DocumentEditOutcome, DocumentEditRefusal, DocumentTextEdit, HostEvent, SplitDirection,
+	};
+
+	fn document_reply(
+		viewports: &std::sync::mpsc::Receiver<crate::uast::Viewport>,
+	) -> crate::uast::Viewport {
+		let deadline = Instant::now() + Duration::from_secs(10);
+		loop {
+			let remaining = deadline.saturating_duration_since(Instant::now());
+			let viewport = viewports
+				.recv_timeout(remaining)
+				.expect("document-text viewport reply");
+			if viewport.document_text.is_some() {
+				return viewport;
+			}
+		}
+	}
 
 	#[test]
 	fn host_event_stream_transfers_to_a_single_consumer() {
@@ -397,6 +416,167 @@ mod tests {
 			events.try_recv().is_err(),
 			"idle engine emits no host events"
 		);
+		handle.shutdown().expect("engine thread");
+	}
+
+	#[test]
+	fn atomic_document_edits_acknowledge_an_unfocused_buffer_and_undo_once() {
+		let mut handle = EngineHandle::spawn(EngineConfig::default());
+		let commands = handle.command_sender();
+		let viewports = handle.take_viewports().expect("viewport stream");
+		let events = handle.take_host_events().expect("host-event stream");
+		let original = "title(\"Old\")\npadding(4.0)\n";
+		commands
+			.send(EditorCommand::ReplaceDocument {
+				text: original.to_owned(),
+				language: Some("rune".to_owned()),
+				virtual_path: Some("plot.rn".to_owned()),
+			})
+			.expect("install source");
+		commands
+			.send(EditorCommand::QueryDocumentText)
+			.expect("query source generation");
+		let baseline = document_reply(&viewports);
+		let buffer_id = baseline
+			.document_text_buffer_id
+			.expect("source buffer identity");
+		let generation = baseline.document_text_state_id.expect("source generation");
+
+		// Move focus to another fresh buffer: targeting is by BufferId, not by
+		// whichever pane happens to own editor focus when the request arrives.
+		commands
+			.send(EditorCommand::NewPane {
+				direction: SplitDirection::Vertical,
+				language: None,
+			})
+			.expect("open another focused pane");
+		let request_id = RequestId::new(91);
+		commands
+			.send(EditorCommand::ApplyDocumentEdits {
+				request_id,
+				buffer_id,
+				expected_generation: generation,
+				edits: vec![
+					DocumentTextEdit {
+						start: DocByte::new(6),
+						end: DocByte::new(11),
+						replacement: "\"New\"".to_owned(),
+					},
+					DocumentTextEdit {
+						start: DocByte::new(21),
+						end: DocByte::new(24),
+						replacement: "8.0".to_owned(),
+					},
+				],
+			})
+			.expect("apply source transaction");
+		let applied = events
+			.recv_timeout(Duration::from_secs(10))
+			.expect("correlated edit acknowledgement");
+		let new_generation = match applied {
+			HostEvent::DocumentEditResult(result) => {
+				assert_eq!(result.request_id, request_id);
+				assert_eq!(result.buffer_id, buffer_id);
+				match result.outcome {
+					DocumentEditOutcome::Applied { new_generation } => new_generation,
+					other => panic!("expected applied acknowledgement, got {other:?}"),
+				}
+			}
+			other => panic!("expected document edit result, got {other:?}"),
+		};
+		assert!(new_generation > generation);
+
+		commands
+			.send(EditorCommand::FocusPane(baseline.focused_pane_id))
+			.expect("return to source pane");
+		commands
+			.send(EditorCommand::QueryDocumentText)
+			.expect("query edited source");
+		assert_eq!(
+			document_reply(&viewports).document_text.as_deref(),
+			Some("title(\"New\")\npadding(8.0)\n")
+		);
+
+		commands
+			.send(EditorCommand::Undo)
+			.expect("undo transaction");
+		commands
+			.send(EditorCommand::QueryDocumentText)
+			.expect("query undo result");
+		assert_eq!(
+			document_reply(&viewports).document_text.as_deref(),
+			Some(original),
+			"both edits belong to one undo unit"
+		);
+
+		let invalid_request = RequestId::new(92);
+		commands
+			.send(EditorCommand::ApplyDocumentEdits {
+				request_id: invalid_request,
+				buffer_id,
+				expected_generation: generation,
+				edits: vec![
+					DocumentTextEdit {
+						start: DocByte::ZERO,
+						end: DocByte::new(1),
+						replacement: "T".to_owned(),
+					},
+					DocumentTextEdit {
+						start: DocByte::new(999),
+						end: DocByte::new(999),
+						replacement: "bad".to_owned(),
+					},
+				],
+			})
+			.expect("send invalid atomic edit");
+		match events
+			.recv_timeout(Duration::from_secs(10))
+			.expect("invalid edit acknowledgement")
+		{
+			HostEvent::DocumentEditResult(result) => assert_eq!(
+				result.outcome,
+				DocumentEditOutcome::Refused {
+					reason: DocumentEditRefusal::InvalidRange,
+				}
+			),
+			other => panic!("expected invalid document edit result, got {other:?}"),
+		}
+		commands
+			.send(EditorCommand::QueryDocumentText)
+			.expect("query after atomic refusal");
+		assert_eq!(
+			document_reply(&viewports).document_text.as_deref(),
+			Some(original),
+			"one invalid span refuses the complete edit plan"
+		);
+
+		let stale_request = RequestId::new(93);
+		commands
+			.send(EditorCommand::ApplyDocumentEdits {
+				request_id: stale_request,
+				buffer_id,
+				expected_generation: new_generation,
+				edits: vec![DocumentTextEdit {
+					start: DocByte::ZERO,
+					end: DocByte::ZERO,
+					replacement: "// stale\n".to_owned(),
+				}],
+			})
+			.expect("send stale edit");
+		match events
+			.recv_timeout(Duration::from_secs(10))
+			.expect("stale edit acknowledgement")
+		{
+			HostEvent::DocumentEditResult(result) => assert_eq!(
+				result.outcome,
+				DocumentEditOutcome::Refused {
+					reason: DocumentEditRefusal::GenerationMismatch {
+						actual_generation: generation,
+					},
+				}
+			),
+			other => panic!("expected stale document edit result, got {other:?}"),
+		}
 		handle.shutdown().expect("engine thread");
 	}
 	use crate::core::DocLine;

@@ -656,12 +656,78 @@ pub(crate) struct TransformedRuneView {
 	pub(crate) presentation_source_model: PresentationSourceModel,
 }
 
+/// The relation VM entrypoint chosen by static compilation. Kept in the
+/// transformed envelope because the generated program text alone must not be
+/// used to infer which root object receives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum RelationRootIdentity {
+	Workspace,
+	Ket,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TransformedRuneRelation {
 	pub(crate) origin: String,
+	pub(crate) root: RelationRootIdentity,
 	pub(crate) source: String,
 	pub(crate) views: Vec<SpannedRuneViewIntent>,
 	pub(crate) source_map: RuneEnvelopeSourceMap,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RelationExecutionKey {
+	pub(crate) origin: String,
+	pub(crate) root: RelationRootIdentity,
+	pub(crate) program: String,
+	pub(crate) views: Vec<LocalViewIdentity>,
+}
+
+/// Compiler-derived semantic equality for deciding whether a retained
+/// relation result may answer a candidate presentation compile. Diagnostic
+/// spans and source-map offsets are intentionally absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RelationPlanKey {
+	pub(crate) executions: Vec<RelationExecutionKey>,
+}
+
+impl RelationPlanKey {
+	pub(crate) fn from_view(view: &TransformedRuneView) -> Self {
+		Self {
+			executions: view
+				.executions
+				.iter()
+				.map(|execution| RelationExecutionKey {
+					origin: execution.origin.clone(),
+					root: execution.root,
+					program: execution.source.clone(),
+					views: execution
+						.views
+						.iter()
+						.map(|view| view.identity.clone())
+						.collect(),
+				})
+				.collect(),
+		}
+	}
+}
+
+/// Runtime half of the reuse proof. The compiler key proves sameness of work;
+/// this witness proves the retained answer is still the authoritative
+/// publication for that work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArtifactReuseWitness {
+	pub(crate) baseline: RelationPlanKey,
+	pub(crate) artifact_generation: u64,
+}
+
+impl ArtifactReuseWitness {
+	pub(crate) fn proves(
+		&self,
+		candidate: &RelationPlanKey,
+		authoritative_generation: u64,
+	) -> bool {
+		self.baseline == *candidate && self.artifact_generation == authoritative_generation
+	}
 }
 
 impl TransformedRuneView {
@@ -4290,6 +4356,50 @@ workspace.table("t").views([table()])
 		assert_eq!(old.next.as_ref().map(|work| work.revision), Some(2));
 		let current = scheduler.complete_presentation(buffer, 2);
 		assert!(current.accepted);
+	}
+
+	#[test]
+	fn product_0142_relation_plan_key_ignores_presentation_and_source_offsets() {
+		let baseline =
+			transform("workspace.table(\"t\").views([figure([title(\"A\"), line(\"x\", \"y\")])])")
+				.expect("baseline compile");
+		let candidate = transform(
+			"workspace.table(\"t\").views([figure([title(\"A much longer title\"), line(\"x\", \"y\")])])",
+		)
+		.expect("candidate compile");
+		assert_ne!(
+			baseline, candidate,
+			"presentation intent and diagnostic offsets really did change"
+		);
+		let baseline_key = RelationPlanKey::from_view(&baseline);
+		let candidate_key = RelationPlanKey::from_view(&candidate);
+		assert_eq!(baseline_key, candidate_key);
+		assert!(
+			ArtifactReuseWitness {
+				baseline: baseline_key,
+				artifact_generation: 12,
+			}
+			.proves(&candidate_key, 12)
+		);
+	}
+
+	#[test]
+	fn product_0142_relation_plan_key_refuses_changed_relation_work_or_stale_artifact() {
+		let baseline = transform("workspace.table(\"t\").views([line(\"x\", \"y\")])")
+			.expect("baseline compile");
+		let candidate = transform(
+			"workspace.table(\"t\").filter(col(\"x\").gt(0)).views([line(\"x\", \"y\")])",
+		)
+		.expect("changed relation compile");
+		let baseline_key = RelationPlanKey::from_view(&baseline);
+		let candidate_key = RelationPlanKey::from_view(&candidate);
+		assert_ne!(baseline_key, candidate_key);
+		let witness = ArtifactReuseWitness {
+			baseline: baseline_key.clone(),
+			artifact_generation: 12,
+		};
+		assert!(!witness.proves(&candidate_key, 12));
+		assert!(!witness.proves(&baseline_key, 13));
 	}
 
 	#[test]

@@ -207,6 +207,35 @@ pub enum EditorMsg {
 	},
 }
 
+#[cfg(feature = "toron")]
+#[derive(Clone, Debug)]
+pub(crate) enum PlotWritebackGesture {
+	Preview {
+		panel_id: HostPanelId,
+		key: crate::presentation_registry::SettingKey,
+		value: String,
+	},
+	Commit {
+		panel_id: HostPanelId,
+		key: crate::presentation_registry::SettingKey,
+	},
+	Reset {
+		panel_id: HostPanelId,
+		key: crate::presentation_registry::SettingKey,
+	},
+	Cancel {
+		panel_id: HostPanelId,
+	},
+}
+
+#[cfg(feature = "toron")]
+#[derive(Clone)]
+pub(crate) struct PlotWritebackContext {
+	pub(crate) attachment: crate::presentation_registry::PlotSourceAttachment,
+	pub(crate) settings: crate::plot::theme::PlotSettings,
+	pub(crate) drafts: std::collections::HashMap<crate::presentation_registry::SettingKey, String>,
+}
+
 enum EngineOutput {
 	Viewport(Box<Viewport>),
 	HostEvent(HostEvent),
@@ -350,6 +379,11 @@ pub struct CodeEditor {
 	document_texts: HashMap<libaryon::core::BufferId, String>,
 	/// Generation paired atomically with each cached document snapshot.
 	document_state_ids: HashMap<libaryon::core::BufferId, libaryon::core::StateId>,
+	/// Exact acknowledgements for source-writeback transactions. AppState drains
+	/// these after each editor poll; unlike viewports they are never coalesced.
+	document_edit_results: VecDeque<libaryon::engine::DocumentEditResult>,
+	#[cfg(feature = "toron")]
+	plot_writeback_gestures: VecDeque<PlotWritebackGesture>,
 	/// Buffers still projected by the engine. Historical view-panel mappings do
 	/// not establish this liveness fact.
 	live_buffer_ids: std::collections::HashSet<libaryon::core::BufferId>,
@@ -530,6 +564,12 @@ impl NotebookPlotSurface {
 			crate::gui::messages::PlotMessage::UpdateHover(hover) => self.hovered_info = hover,
 			crate::gui::messages::PlotMessage::ToggleSettingsInspector => {
 				// Notebook plots do not render the host-panel inspector control.
+			}
+			crate::gui::messages::PlotMessage::SettingChanged(..)
+			| crate::gui::messages::PlotMessage::SettingSubmitted(_)
+			| crate::gui::messages::PlotMessage::SettingReset(_)
+			| crate::gui::messages::PlotMessage::CancelSettingPreview => {
+				// PRODUCT-0142 explicitly refuses notebook-cell span rebasing.
 			}
 		}
 	}
@@ -815,6 +855,9 @@ impl CodeEditor {
 			viewport: None,
 			document_texts: HashMap::new(),
 			document_state_ids: HashMap::new(),
+			document_edit_results: VecDeque::new(),
+			#[cfg(feature = "toron")]
+			plot_writeback_gestures: VecDeque::new(),
 			live_buffer_ids: std::collections::HashSet::new(),
 			current_rune_view_identities: HashMap::new(),
 			text_queries: VecDeque::new(),
@@ -1864,6 +1907,150 @@ impl CodeEditor {
 		}
 	}
 
+	#[cfg(feature = "toron")]
+	pub(crate) fn document_snapshot(
+		&self,
+		buffer_id: libaryon::core::BufferId,
+	) -> Option<(&str, libaryon::core::StateId)> {
+		Some((
+			self.document_texts.get(&buffer_id)?.as_str(),
+			*self.document_state_ids.get(&buffer_id)?,
+		))
+	}
+
+	#[cfg(feature = "toron")]
+	pub(crate) fn apply_document_edits(
+		&self,
+		request_id: libaryon::core::RequestId,
+		buffer_id: libaryon::core::BufferId,
+		expected_generation: libaryon::core::StateId,
+		edits: Vec<libaryon::engine::DocumentTextEdit>,
+	) -> bool {
+		self.send(EditorCommand::ApplyDocumentEdits {
+			request_id,
+			buffer_id,
+			expected_generation,
+			edits,
+		})
+	}
+
+	#[cfg(feature = "toron")]
+	pub(crate) fn take_document_edit_results(
+		&mut self,
+	) -> impl Iterator<Item = libaryon::engine::DocumentEditResult> + '_ {
+		self.document_edit_results.drain(..)
+	}
+
+	#[cfg(feature = "toron")]
+	pub(crate) fn take_plot_writeback_gestures(
+		&mut self,
+	) -> impl Iterator<Item = PlotWritebackGesture> + '_ {
+		self.plot_writeback_gestures.drain(..)
+	}
+
+	#[cfg(feature = "toron")]
+	pub(crate) fn plot_writeback_context(
+		&self,
+		panel_id: HostPanelId,
+	) -> Option<PlotWritebackContext> {
+		let entry = self.panels.panels.get(&panel_id)?;
+		let PanelContent::Plot(plot) = &entry.content else {
+			return None;
+		};
+		let attachment = plot.writeback_attachment()?.clone();
+		let status = plot_source_attachment_status(
+			Some(&attachment),
+			matches!(entry.status, PanelStatus::Fresh),
+			&self.live_buffer_ids,
+			&self.document_state_ids,
+			&self.current_rune_view_identities,
+		);
+		(status == crate::presentation_registry::SourceAttachmentStatus::Attached).then(|| {
+			PlotWritebackContext {
+				attachment,
+				settings: plot.writeback_settings_model().clone(),
+				drafts: plot.setting_drafts.clone(),
+			}
+		})
+	}
+
+	#[cfg(feature = "toron")]
+	pub(crate) fn show_plot_source_preview(
+		&mut self,
+		panel_id: HostPanelId,
+		display_label: String,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		authored_settings: PlotSettingsLayer,
+		attachment: crate::presentation_registry::PlotSourceAttachment,
+		plot_type: Option<crate::plot::core::PlotType>,
+	) {
+		if let Some(PanelEntry {
+			content: PanelContent::Plot(plot),
+			..
+		}) = self.panels.panels.get_mut(&panel_id)
+		{
+			plot.show_source_preview(
+				display_label,
+				kernel,
+				authored_settings,
+				attachment,
+				plot_type,
+			);
+		}
+	}
+
+	#[cfg(feature = "toron")]
+	pub(crate) fn discard_plot_source_preview(&mut self, panel_id: HostPanelId) {
+		if let Some(PanelEntry {
+			content: PanelContent::Plot(plot),
+			..
+		}) = self.panels.panels.get_mut(&panel_id)
+		{
+			plot.discard_source_preview();
+		}
+	}
+
+	#[cfg(feature = "toron")]
+	pub(crate) fn promote_plot_source_preview(
+		&mut self,
+		panel_id: HostPanelId,
+		new_generation: libaryon::core::StateId,
+		candidate_source: String,
+	) -> bool {
+		if let Some(PanelEntry {
+			content: PanelContent::Plot(plot),
+			..
+		}) = self.panels.panels.get_mut(&panel_id)
+		{
+			if !plot.promote_source_preview(new_generation) {
+				return false;
+			}
+			if let Some(attachment) = &plot.source_attachment {
+				self.document_texts
+					.insert(attachment.source.buffer_id, candidate_source);
+				self.document_state_ids
+					.insert(attachment.source.buffer_id, new_generation);
+			}
+			return true;
+		}
+		false
+	}
+
+	#[cfg(feature = "toron")]
+	pub(crate) fn set_plot_writeback_status(
+		&mut self,
+		panel_id: HostPanelId,
+		status: Option<String>,
+	) {
+		if let Some(PanelEntry {
+			content: PanelContent::Plot(plot),
+			..
+		}) = self.panels.panels.get_mut(&panel_id)
+		{
+			plot.writeback_status = status;
+		}
+	}
+
 	/// Queue an execution barrier after all input already forwarded to the
 	/// engine. This deliberately does not coalesce with ordinary cache queries:
 	/// its own reply is the proof that Run has crossed the last edit.
@@ -1943,6 +2130,9 @@ impl CodeEditor {
 		while let Ok(output) = self.engine_outputs.try_recv() {
 			let EngineOutput::Viewport(viewport) = output else {
 				if let EngineOutput::HostEvent(event) = output {
+					if let HostEvent::DocumentEditResult(result) = &event {
+						self.document_edit_results.push_back(result.clone());
+					}
 					events.push(event);
 				}
 				continue;
@@ -2135,6 +2325,36 @@ impl CodeEditor {
 				self.request_content();
 			}
 			EditorMsg::HostPlot { panel_id, message } => {
+				#[cfg(feature = "toron")]
+				match &message {
+					PlotPaneMsg::SettingChanged(key, value) => {
+						self.plot_writeback_gestures
+							.push_back(PlotWritebackGesture::Preview {
+								panel_id,
+								key: *key,
+								value: value.clone(),
+							});
+					}
+					PlotPaneMsg::SettingSubmitted(key) => {
+						self.plot_writeback_gestures
+							.push_back(PlotWritebackGesture::Commit {
+								panel_id,
+								key: *key,
+							});
+					}
+					PlotPaneMsg::SettingReset(key) => {
+						self.plot_writeback_gestures
+							.push_back(PlotWritebackGesture::Reset {
+								panel_id,
+								key: *key,
+							});
+					}
+					PlotPaneMsg::CancelSettingPreview => {
+						self.plot_writeback_gestures
+							.push_back(PlotWritebackGesture::Cancel { panel_id });
+					}
+					PlotPaneMsg::UpdateHover(_) | PlotPaneMsg::ToggleSettingsInspector => {}
+				}
 				self.panels.update_plot(panel_id, message);
 			}
 			EditorMsg::NotebookPlot { identity, message } => {
@@ -3185,6 +3405,11 @@ impl PanelRegistry {
 	fn reconcile(&mut self, events: &[HostEvent], viewport: Option<&Viewport>) {
 		for event in events {
 			match event {
+				HostEvent::DocumentEditResult(_) => {
+					// Consumed by CodeEditor as an application-level correlated
+					// acknowledgement; panel reconciliation has no state projection
+					// for it.
+				}
 				HostEvent::PanelRebound { panel_id, revision } => {
 					// Only the revision syncs here. Polariton is the sole
 					// producer of RefreshHostPanel and sets the new content
@@ -5653,6 +5878,103 @@ mod tests {
 		);
 		plot.update(PlotPaneMsg::ToggleSettingsInspector);
 		assert!(!plot.settings_inspector_open);
+	}
+
+	#[test]
+	fn product_0142_preview_discards_or_promotes_without_a_durable_override() {
+		use crate::presentation_registry::{
+			PlotSourceAttachment, PresentationSourceModel, StampedPresentationSourceModel,
+		};
+		use crate::rune_view::LocalViewIdentity;
+		use libaryon::core::{BufferId, StateId};
+		use std::sync::Arc;
+
+		let (_, kernel) = product_0075_test_plot();
+		let attachment = |generation| PlotSourceAttachment {
+			identity: LocalViewIdentity::Anonymous(0),
+			source: StampedPresentationSourceModel {
+				buffer_id: BufferId::new(7),
+				document_generation: generation,
+				model: Arc::new(PresentationSourceModel::default()),
+			},
+		};
+		let mut plot = HostPlotState::new_with_source(
+			"authoritative".to_owned(),
+			Arc::clone(&kernel),
+			crate::plot::theme::PlotSettingsLayer::default(),
+			Some(attachment(StateId::new(3))),
+			Some(crate::plot::core::PlotType::Line),
+		);
+		plot.show_source_preview(
+			"candidate".to_owned(),
+			Arc::clone(&kernel),
+			crate::plot::theme::PlotSettingsLayer::default(),
+			attachment(StateId::new(3)),
+			Some(crate::plot::core::PlotType::Line),
+		);
+		assert_eq!(plot.display_label, "candidate");
+		plot.discard_source_preview();
+		assert_eq!(plot.display_label, "authoritative");
+		assert_eq!(
+			plot.writeback_attachment()
+				.unwrap()
+				.source
+				.document_generation,
+			StateId::new(3)
+		);
+
+		plot.show_source_preview(
+			"committed".to_owned(),
+			kernel,
+			crate::plot::theme::PlotSettingsLayer::default(),
+			attachment(StateId::new(3)),
+			Some(crate::plot::core::PlotType::Line),
+		);
+		assert!(plot.promote_source_preview(StateId::new(4)));
+		plot.discard_source_preview();
+		assert_eq!(plot.display_label, "committed");
+		assert_eq!(
+			plot.writeback_attachment()
+				.unwrap()
+				.source
+				.document_generation,
+			StateId::new(4),
+			"promotion envelopes the candidate source model with the acknowledged generation"
+		);
+
+		plot.show_source_preview(
+			"superseded candidate".to_owned(),
+			Arc::clone(&plot.kernel),
+			crate::plot::theme::PlotSettingsLayer::default(),
+			attachment(StateId::new(4)),
+			Some(crate::plot::core::PlotType::Line),
+		);
+		plot.setting_drafts.insert(
+			crate::presentation_registry::SettingKey::Title,
+			"draft".to_owned(),
+		);
+		plot.replace_with_source(
+			"fresh rerun".to_owned(),
+			Arc::clone(&plot.kernel),
+			crate::plot::theme::PlotSettingsLayer::default(),
+			Some(attachment(StateId::new(4))),
+			Some(crate::plot::core::PlotType::Line),
+		);
+		plot.discard_source_preview();
+		assert_eq!(plot.display_label, "fresh rerun");
+		assert!(plot.setting_drafts.is_empty());
+		assert!(
+			!plot.promote_source_preview(StateId::new(5)),
+			"an acknowledgement cannot promote after a rerun supersedes its preview"
+		);
+		assert_eq!(
+			plot.writeback_attachment()
+				.unwrap()
+				.source
+				.document_generation,
+			StateId::new(4),
+			"a superseded candidate must not restamp the rerun source model"
+		);
 	}
 
 	fn product_0074_framed_host_panel() -> iced::Element<'static, EditorMsg, iced::Theme, ()> {

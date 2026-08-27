@@ -158,6 +158,7 @@ pub enum Message {
 	RunRuneViewSetResult {
 		source_buffer: BufferId,
 		revision: u64,
+		execution_index: usize,
 		origin: String,
 		views: Vec<LocalViewIdentity>,
 		result: std::result::Result<RuneRelationCompletion, String>,
@@ -191,6 +192,36 @@ pub enum Message {
 		authored_settings: PlotSettingsLayer,
 		span: std::ops::Range<u32>,
 		result: std::result::Result<Arc<dyn PlotKernel + Send + Sync>, String>,
+	},
+	#[cfg(feature = "toron")]
+	SettingsCandidateCompiled {
+		preview_generation: u64,
+		panel_id: libaryon::engine::HostPanelId,
+		commit: bool,
+		source_buffer: BufferId,
+		document_generation: libaryon::core::StateId,
+		relation_revision: u64,
+		identity: LocalViewIdentity,
+		result: std::result::Result<
+			crate::settings_writeback::CompiledCandidate,
+			crate::settings_writeback::CandidatePreviewRefusal,
+		>,
+	},
+	#[cfg(feature = "toron")]
+	SettingsPreviewPlotReady {
+		preview_generation: u64,
+		panel_id: libaryon::engine::HostPanelId,
+		commit: bool,
+		source_buffer: BufferId,
+		document_generation: libaryon::core::StateId,
+		relation_revision: u64,
+		identity: LocalViewIdentity,
+		candidate: crate::settings_writeback::CompiledCandidate,
+		presentation: ViewPresentation,
+		authored_settings: PlotSettingsLayer,
+		continuation: RuneCategoricalContinuation,
+		resolved: ResolvedPlot,
+		kernel: std::result::Result<Arc<dyn PlotKernel + Send + Sync>, String>,
 	},
 	RunRuneCellResult {
 		identity: libaryon::uast::projection::MarkdownCellIdentity,

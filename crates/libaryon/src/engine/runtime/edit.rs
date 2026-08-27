@@ -2,13 +2,16 @@ use super::super::core::resolve_byte_range;
 use super::super::document::cursor::{next_word_end, next_word_start, prev_word_start};
 use super::super::document::edit::{
 	apply_deltas_to_document, apply_deltas_to_document_internal, delete_char_delta_at_cursor,
-	delete_line_delta_sparse, linewise_put_insertion_sparse,
+	delete_line_delta_sparse, fold_edits_for_deltas, linewise_put_insertion_sparse,
 };
 use super::super::document::io::read_loaded_document;
 use super::super::document::parse::word_object_delta_at_cursor;
 use super::super::document::selection::{extract_visual_text_sparse, resolve_visual_ranges_sparse};
 use super::super::folding::FoldSet;
-use super::super::protocol::{CommandRange, EditorCommand, EditorMode, VisualKind, WordMotion};
+use super::super::protocol::{
+	CommandRange, DocumentEditOutcome, DocumentEditRefusal, DocumentTextEdit, EditorCommand,
+	EditorMode, VisualKind, WordMotion,
+};
 use super::super::session::TextEditorMut;
 use super::super::session::{
 	Affinity, Caret, ClipboardSession, CursorSet, CursorSnapshot, ParkedGenerationRoot,
@@ -115,6 +118,124 @@ fn apply_single_delta(
 		diagnostic_spans,
 		vec![delta],
 	)
+}
+
+/// Apply an externally planned source transaction without retargeting the
+/// acting caret to the final splice. Every coordinate is validated against one
+/// UTF-8 snapshot, the deltas are committed in descending order as one undo
+/// group, and the acting cursor/selection follows the same anchor transform as
+/// sibling views.
+pub(super) fn apply_guarded_document_edits(
+	registry: &UastRegistry,
+	tab: &mut TextEditorMut<'_>,
+	expected_generation: StateId,
+	mut edits: Vec<DocumentTextEdit>,
+) -> DocumentEditOutcome {
+	let actual_generation = tab.document.ledger.current_state_id;
+	if actual_generation != expected_generation {
+		return DocumentEditOutcome::Refused {
+			reason: DocumentEditRefusal::GenerationMismatch { actual_generation },
+		};
+	}
+
+	let bytes = match read_loaded_document(registry, tab.document.root_id) {
+		Ok(bytes) => bytes,
+		Err(error) => {
+			return DocumentEditOutcome::Refused {
+				reason: DocumentEditRefusal::MutationFailed(error.to_string()),
+			};
+		}
+	};
+	let text = match std::str::from_utf8(&bytes) {
+		Ok(text) => text,
+		Err(_) => {
+			return DocumentEditOutcome::Refused {
+				reason: DocumentEditRefusal::DocumentIsNotUtf8,
+			};
+		}
+	};
+
+	for edit in &edits {
+		let (Ok(start), Ok(end)) = (
+			usize::try_from(edit.start.get()),
+			usize::try_from(edit.end.get()),
+		) else {
+			return DocumentEditOutcome::Refused {
+				reason: DocumentEditRefusal::InvalidRange,
+			};
+		};
+		if start > end
+			|| end > text.len()
+			|| !text.is_char_boundary(start)
+			|| !text.is_char_boundary(end)
+		{
+			return DocumentEditOutcome::Refused {
+				reason: DocumentEditRefusal::InvalidRange,
+			};
+		}
+	}
+
+	edits.sort_unstable_by_key(|edit| std::cmp::Reverse((edit.start, edit.end)));
+	for pair in edits.windows(2) {
+		let higher = &pair[0];
+		let lower = &pair[1];
+		if lower.end > higher.start || lower.start == higher.start {
+			return DocumentEditOutcome::Refused {
+				reason: DocumentEditRefusal::OverlappingEdits,
+			};
+		}
+	}
+
+	let deltas = edits
+		.into_iter()
+		.filter_map(|edit| {
+			let start = usize::try_from(edit.start.get()).expect("range was validated");
+			let end = usize::try_from(edit.end.get()).expect("range was validated");
+			let inserted_bytes = edit.replacement.into_bytes();
+			let deleted_bytes = bytes[start..end].to_vec();
+			(deleted_bytes != inserted_bytes).then_some(TextDelta {
+				global_byte_offset: edit.start,
+				deleted_bytes,
+				inserted_bytes,
+				state_before: StateId::ZERO,
+				state_after: StateId::ZERO,
+			})
+		})
+		.collect::<Vec<_>>();
+	if deltas.is_empty() {
+		return DocumentEditOutcome::Applied {
+			new_generation: actual_generation,
+		};
+	}
+
+	let cursor_before = tab.cursor.snapshot();
+	let cursor_edits = fold_edits_for_deltas(&deltas);
+	let mut root_id = Some(tab.document.root_id);
+	if let Err(error) = apply_deltas_to_document(
+		registry,
+		&mut root_id,
+		&mut tab.view.folds,
+		&mut tab.document.ledger,
+		&mut tab.document.semantic.highlights,
+		&mut tab.document.semantic.diagnostics,
+		deltas,
+	) {
+		return DocumentEditOutcome::Refused {
+			reason: DocumentEditRefusal::MutationFailed(error),
+		};
+	}
+	tab.document.root_id = root_id.expect("incremental source edits retain a root");
+	tab.cursor.rebase_after_edits(&cursor_edits);
+	tab.cursor
+		.clamp_anchors(registry.get_total_bytes(tab.document.root_id));
+	tab.document.ledger.finish_cursor_transaction(
+		actual_generation,
+		cursor_before,
+		tab.cursor.snapshot(),
+	);
+	DocumentEditOutcome::Applied {
+		new_generation: tab.document.ledger.current_state_id,
+	}
 }
 
 #[derive(Clone, Copy)]

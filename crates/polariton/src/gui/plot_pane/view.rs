@@ -2,7 +2,11 @@ use super::HostPlotState;
 use crate::gui::messages::PlotMessage;
 use crate::plot::common::{PlotRenderLayer, PlotWidget, ResolvedPlotSettings};
 use crate::presentation_registry::{InspectorSection, SourceAttachmentStatus, inspector_rows};
-use iced::widget::{button, canvas, column, container, row, rule, scrollable, stack, text};
+#[cfg(feature = "toron")]
+use crate::settings_writeback::{WritebackCapability, writeback_spec};
+use iced::widget::{
+	button, canvas, column, container, row, rule, scrollable, stack, text, text_input,
+};
 use iced::{Background, Element, Fill, Length, Pixels};
 
 /// PRODUCT-0112's sole conversion from resolved hover typography to iced.
@@ -122,6 +126,9 @@ fn settings_inspector(
 		rule::horizontal(1),
 	]
 	.spacing(5);
+	if let Some(status) = &state.writeback_status {
+		content = content.push(text(status).size(10));
+	}
 	let mut previous_section = None;
 	for setting in rows {
 		if previous_section != Some(setting.section) {
@@ -135,16 +142,52 @@ fn settings_inspector(
 		if setting.shared_source {
 			badges.push_str(" · shared source");
 		}
-		content = content.push(
-			column![
-				row![
-					text(setting.label).size(12).width(Fill),
-					text(setting.value.to_string()).size(12),
-				]
-				.spacing(8),
-				text(badges).size(10),
+		if setting.provenance == crate::presentation_registry::ProvenanceTier::AuthoredSpec
+			&& !setting.source_occurrence
+		{
+			badges.push_str(" · unattributed source");
+		}
+		#[cfg(feature = "toron")]
+		let editable = attachment_status == SourceAttachmentStatus::Attached
+			&& writeback_spec(setting.key).capability == WritebackCapability::Editable
+			&& !setting.expression_authored
+			&& !setting.shared_source
+			&& !(setting.provenance == crate::presentation_registry::ProvenanceTier::AuthoredSpec
+				&& !setting.source_occurrence);
+		#[cfg(not(feature = "toron"))]
+		let editable = false;
+		let value = state
+			.setting_drafts
+			.get(&setting.key)
+			.cloned()
+			.unwrap_or_else(|| setting.value.to_string());
+		let value_row: Element<'_, PlotMessage> = if editable {
+			let key = setting.key;
+			let mut controls = row![
+				text_input(setting.label, &value)
+					.on_input(move |value| PlotMessage::SettingChanged(key, value))
+					.on_submit(PlotMessage::SettingSubmitted(key))
+					.size(12),
 			]
-			.spacing(1),
+			.spacing(4);
+			if setting.provenance == crate::presentation_registry::ProvenanceTier::AuthoredSpec {
+				controls = controls
+					.push(button(text("Reset").size(10)).on_press(PlotMessage::SettingReset(key)));
+			}
+			controls.into()
+		} else {
+			row![
+				text(setting.label).size(12).width(Fill),
+				text(value).size(12),
+			]
+			.spacing(8)
+			.into()
+		};
+		content = content.push(column![value_row, text(badges).size(10)].spacing(1));
+	}
+	if state.writeback_status.is_some() {
+		content = content.push(
+			button(text("Cancel preview").size(10)).on_press(PlotMessage::CancelSettingPreview),
 		);
 	}
 	container(scrollable(content).height(Fill))

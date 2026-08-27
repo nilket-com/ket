@@ -1,5 +1,6 @@
 use crate::core::{
-	CursorPosition, DocByte, DocDisplayCol, DocLine, PaneId, Rgb, ViewId, ViewportId,
+	BufferId, CursorPosition, DocByte, DocDisplayCol, DocLine, PaneId, RequestId, Rgb, StateId,
+	ViewId, ViewportId,
 };
 use crate::engine::settings::SaveDurability;
 use crate::engine::ui_colors::UiColorKey;
@@ -286,6 +287,55 @@ pub struct SubstituteFlags {
 	pub case_insensitive: bool,
 }
 
+/// One UTF-8 source replacement expressed in byte coordinates against the
+/// document generation named by [`EditorCommand::ApplyDocumentEdits`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentTextEdit {
+	pub start: DocByte,
+	pub end: DocByte,
+	pub replacement: String,
+}
+
+/// Why an atomic document-edit request was not applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocumentEditRefusal {
+	BufferUnavailable,
+	GenerationMismatch { actual_generation: StateId },
+	InvalidRange,
+	OverlappingEdits,
+	DocumentIsNotUtf8,
+	MutationFailed(String),
+}
+
+impl std::fmt::Display for DocumentEditRefusal {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let message = match self {
+			Self::BufferUnavailable => "source buffer is unavailable",
+			Self::GenerationMismatch { .. } => "source changed before the edit could be applied",
+			Self::InvalidRange => "the planned source range is no longer valid",
+			Self::OverlappingEdits => "the planned source edits overlap",
+			Self::DocumentIsNotUtf8 => "source document is not valid UTF-8",
+			Self::MutationFailed(_) => "the editor could not apply the source edit",
+		};
+		formatter.write_str(message)
+	}
+}
+
+/// Exact outcome for one correlated document-edit request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocumentEditOutcome {
+	Applied { new_generation: StateId },
+	Refused { reason: DocumentEditRefusal },
+}
+
+/// Non-coalescing acknowledgement for [`EditorCommand::ApplyDocumentEdits`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentEditResult {
+	pub request_id: RequestId,
+	pub buffer_id: BufferId,
+	pub outcome: DocumentEditOutcome,
+}
+
 #[derive(Debug, Clone)]
 /// A frontend-to-engine request.
 pub enum EditorCommand {
@@ -303,6 +353,18 @@ pub enum EditorCommand {
 	WriteEncryptedFileAs(String),
 	InsertChar(char),
 	InsertText(String),
+	/// Apply one atomic, generation-guarded transaction to a live text buffer.
+	///
+	/// Coordinates are measured against `expected_generation`; libaryon never
+	/// rebases them across document generations. The request may target a
+	/// non-focused buffer and produces exactly one [`DocumentEditResult`] on
+	/// the ordered host-event stream.
+	ApplyDocumentEdits {
+		request_id: RequestId,
+		buffer_id: BufferId,
+		expected_generation: StateId,
+		edits: Vec<DocumentTextEdit>,
+	},
 	/// Compile and evaluate a Rune source as a replaceable source generation.
 	SourceRune(String),
 	/// Retire one Rune source generation and all of its registrations.

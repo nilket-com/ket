@@ -1794,10 +1794,20 @@ pub(crate) struct PresentationSyntaxBoundary {
 	pub(crate) owners: HashSet<LocalViewIdentity>,
 }
 
+/// The exact source expression occupying one `views([...])` slot. This is a
+/// compiler fact, not permission to edit it; ADR 0142 uses it to distinguish
+/// an inline bare mark from helper-built furniture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PresentationViewSlotBoundary {
+	pub(crate) expression_span: Range<u32>,
+	pub(crate) owner: LocalViewIdentity,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PresentationSourceModel {
 	pub(crate) occurrences: Vec<SettingOccurrence>,
 	pub(crate) syntax: Vec<PresentationSyntaxBoundary>,
+	pub(crate) view_slots: Vec<PresentationViewSlotBoundary>,
 }
 
 /// The compiler emits `PresentationSourceModel` from text alone. The host adds
@@ -1852,6 +1862,10 @@ pub(crate) struct InspectorSettingRow {
 	pub(crate) provenance: ProvenanceTier,
 	pub(crate) expression_authored: bool,
 	pub(crate) shared_source: bool,
+	/// Whether the static source model attributed this setting. Authored
+	/// provenance can still be true from evaluated spec projection when the
+	/// scanner is partial; 0142 treats that combination as read-only.
+	pub(crate) source_occurrence: bool,
 }
 
 pub(crate) fn inspector_rows(
@@ -1909,6 +1923,7 @@ pub(crate) fn inspector_rows(
 					occurrence.expression_shape == ExpressionShape::ExpressionOrBinding
 				}),
 				shared_source: occurrence.is_some_and(|occurrence| occurrence.owners.len() > 1),
+				source_occurrence: occurrence.is_some(),
 			})
 		})
 		.collect()
@@ -2109,6 +2124,7 @@ mod tests {
 				model: std::sync::Arc::new(PresentationSourceModel {
 					occurrences: vec![occurrence],
 					syntax: Vec::new(),
+					view_slots: Vec::new(),
 				}),
 			},
 		};

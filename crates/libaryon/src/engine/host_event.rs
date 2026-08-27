@@ -12,7 +12,7 @@
 //! means the frontend is gone, which is a normal shutdown condition rather than
 //! an error.
 
-use super::InputEvent;
+use super::{DocumentEditResult, InputEvent};
 use std::sync::mpsc;
 
 /// Identity of a host-rendered panel. Stable across the panel's lifetime and
@@ -76,6 +76,9 @@ impl PanelRevision {
 /// An engine-to-frontend occurrence that must not be coalesced away.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostEvent {
+	/// Correlated acknowledgement for an atomic document-edit request. This is
+	/// an occurrence, not projected state, so it cannot be coalesced away.
+	DocumentEditResult(DocumentEditResult),
 	/// A key the engine declined to interpret while a host panel held workspace
 	/// focus. The engine cannot know that `j` scrolls a table, so it forwards.
 	UnhandledInput {

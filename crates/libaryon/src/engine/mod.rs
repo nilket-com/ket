@@ -71,7 +71,8 @@ pub use self::minimap::{
 	dominant_preview_bin_for_rows, minimap_click_viewport_start_line, sample_preview_bin_range,
 };
 pub use self::protocol::{
-	CommandRange, ConfirmAction, DEFAULT_GIT_REFRESH_SECONDS, EditorCommand, EditorMode,
+	CommandRange, ConfirmAction, DEFAULT_GIT_REFRESH_SECONDS, DocumentEditOutcome,
+	DocumentEditRefusal, DocumentEditResult, DocumentTextEdit, EditorCommand, EditorMode,
 	GitRefreshMode, HostPanelGroupLayout, HostPanelGroupMember, HostPanelGroupShape,
 	HostPanelPlacement, MouseIntent, MoveDirection, PaneDividerReservation, PaneDropEdge,
 	PaneFocusDirection, PaneResizeDirection, PickerAction, PickerCursorMovement, RepoSearchMode,

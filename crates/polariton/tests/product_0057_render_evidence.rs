@@ -45,6 +45,9 @@ mod rune_view_compiler;
 #[cfg(feature = "toron")]
 #[path = "../src/session_persistence.rs"]
 mod session_persistence;
+#[cfg(feature = "toron")]
+#[path = "../src/settings_writeback.rs"]
+mod settings_writeback;
 
 use coordinate::Rect;
 use gui::table::{Product0057TableEvidenceGeometry, draw_product_0057_table_evidence};

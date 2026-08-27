@@ -48,11 +48,11 @@ use crate::result_registry::{ResultRegistry, parse_result_annotation};
 use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
-	DisposableRunePlotSink, PendingRunePresentation, PendingRuneView, RuneEnvelopeError,
-	RunePlotBody, RunePlotDomainSpans, RunePlotMinorTickSpans, RunePlotTickEverySpans,
-	RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent, RuneTableSkinProjection,
-	RuneViewIntent, RuneViewScheduler, SpannedRuneViewIntent, StyledRunePlotSink,
-	TransformedRuneRelation, TransformedRuneView,
+	ArtifactReuseWitness, DisposableRunePlotSink, PendingRunePresentation, PendingRuneView,
+	RelationPlanKey, RuneEnvelopeError, RunePlotBody, RunePlotDomainSpans, RunePlotMinorTickSpans,
+	RunePlotTickEverySpans, RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent,
+	RuneTableSkinProjection, RuneViewIntent, RuneViewScheduler, SpannedRuneViewIntent,
+	StyledRunePlotSink, TransformedRuneRelation, TransformedRuneView,
 };
 use crate::rune_view::{LocalViewIdentity, ViewContentKind, ViewPresentation};
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, window};
@@ -70,6 +70,51 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 #[cfg(feature = "toron")]
 use toron_client::TemporalInterval;
+
+#[cfg(feature = "toron")]
+#[derive(Clone)]
+struct RetainedRelationGeneration {
+	revision: u64,
+	plan_key: RelationPlanKey,
+	transformed: Arc<TransformedRuneView>,
+	artifacts: Vec<Option<Arc<crate::result_artifact::ResultArtifact>>>,
+}
+
+#[cfg(feature = "toron")]
+#[derive(Clone)]
+struct PendingSettingsPreview {
+	preview_generation: u64,
+	panel_id: libaryon::engine::HostPanelId,
+	commit: bool,
+	source_buffer: BufferId,
+	document_generation: libaryon::core::StateId,
+	identity: LocalViewIdentity,
+	plan: crate::settings_writeback::CandidateEditPlan,
+	witness: ArtifactReuseWitness,
+	artifact_generation: u64,
+}
+
+#[cfg(feature = "toron")]
+#[derive(Clone)]
+struct PendingSettingsCommit {
+	panel_id: libaryon::engine::HostPanelId,
+	source_buffer: BufferId,
+	revision: u64,
+	candidate: crate::settings_writeback::CompiledCandidate,
+	identity: LocalViewIdentity,
+	continuation: crate::gui::messages::RuneCategoricalContinuation,
+}
+
+#[cfg(feature = "toron")]
+impl RetainedRelationGeneration {
+	fn witness(&self, authoritative_revision: u64) -> Option<ArtifactReuseWitness> {
+		(self.revision == authoritative_revision && self.artifacts.iter().all(Option::is_some))
+			.then(|| ArtifactReuseWitness {
+				baseline: self.plan_key.clone(),
+				artifact_generation: self.revision,
+			})
+	}
+}
 
 struct AppState {
 	menu_state: MenuState,
@@ -93,6 +138,20 @@ struct AppState {
 	#[cfg(feature = "toron")]
 	rune_presentation_models:
 		HashMap<(BufferId, u64), Arc<crate::presentation_registry::PresentationSourceModel>>,
+	#[cfg(feature = "toron")]
+	retained_rune_relations: HashMap<BufferId, RetainedRelationGeneration>,
+	#[cfg(feature = "toron")]
+	settings_preview_sequence: u64,
+	#[cfg(feature = "toron")]
+	settings_preview_latest: HashMap<libaryon::engine::HostPanelId, u64>,
+	#[cfg(feature = "toron")]
+	settings_preview_in_flight: Option<u64>,
+	#[cfg(feature = "toron")]
+	settings_preview_pending: HashMap<libaryon::engine::HostPanelId, PendingSettingsPreview>,
+	#[cfg(feature = "toron")]
+	settings_commit_sequence: u64,
+	#[cfg(feature = "toron")]
+	pending_settings_commits: HashMap<libaryon::core::RequestId, PendingSettingsCommit>,
 	#[cfg(feature = "toron")]
 	rune_view_scheduler: RuneViewScheduler,
 	/// Session-local categorical continuation keyed by producer, semantic view,
@@ -601,6 +660,20 @@ fn new_with_authority(
 		#[cfg(feature = "toron")]
 		rune_presentation_models: HashMap::new(),
 		#[cfg(feature = "toron")]
+		retained_rune_relations: HashMap::new(),
+		#[cfg(feature = "toron")]
+		settings_preview_sequence: 0,
+		#[cfg(feature = "toron")]
+		settings_preview_latest: HashMap::new(),
+		#[cfg(feature = "toron")]
+		settings_preview_in_flight: None,
+		#[cfg(feature = "toron")]
+		settings_preview_pending: HashMap::new(),
+		#[cfg(feature = "toron")]
+		settings_commit_sequence: 0,
+		#[cfg(feature = "toron")]
+		pending_settings_commits: HashMap::new(),
+		#[cfg(feature = "toron")]
 		rune_view_scheduler: RuneViewScheduler::default(),
 		#[cfg(feature = "toron")]
 		rune_categorical_identities: HashMap::new(),
@@ -1101,6 +1174,16 @@ fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> 
 		view,
 	} = work;
 	let relation_count = view.relation_count();
+	let plan_key = RelationPlanKey::from_view(&view);
+	app_state.retained_rune_relations.insert(
+		source_buffer,
+		RetainedRelationGeneration {
+			revision,
+			plan_key,
+			transformed: Arc::new(view.clone()),
+			artifacts: vec![None; relation_count],
+		},
+	);
 	app_state
 		.rune_presentation_models
 		.retain(|(buffer, candidate), _| *buffer != source_buffer || *candidate >= revision);
@@ -1115,27 +1198,361 @@ fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> 
 	app_state.status_error.clear();
 	app_state.status_time_elapsed = None;
 	app_state.code_started = Instant::now();
-	let tasks = view.into_relations().map(|view| {
-		let connection = connection.clone();
-		let origin = view.origin.clone();
-		let palettes = prepare_rune_categorical_palettes(app_state, source_buffer, &view);
-		let views = view
-			.views
-			.iter()
-			.map(|view| view.identity.clone())
-			.collect::<Vec<_>>();
-		Task::perform(
-			dispatch_rune_relation_with_palettes(connection, view, palettes),
-			move |result| Message::RunRuneViewSetResult {
-				source_buffer,
-				revision,
-				origin,
-				views,
-				result,
-			},
-		)
-	});
+	let tasks = view
+		.into_relations()
+		.enumerate()
+		.map(|(execution_index, view)| {
+			let connection = connection.clone();
+			let origin = view.origin.clone();
+			let palettes = prepare_rune_categorical_palettes(app_state, source_buffer, &view);
+			let views = view
+				.views
+				.iter()
+				.map(|view| view.identity.clone())
+				.collect::<Vec<_>>();
+			Task::perform(
+				dispatch_rune_relation_with_palettes(connection, view, palettes),
+				move |result| Message::RunRuneViewSetResult {
+					source_buffer,
+					revision,
+					execution_index,
+					origin,
+					views,
+					result,
+				},
+			)
+		});
 	Task::batch(tasks)
+}
+
+#[cfg(feature = "toron")]
+fn start_settings_preview_task(
+	app_state: &mut AppState,
+	work: PendingSettingsPreview,
+) -> Task<Message> {
+	app_state.settings_preview_in_flight = Some(work.preview_generation);
+	let PendingSettingsPreview {
+		preview_generation,
+		panel_id,
+		commit,
+		source_buffer,
+		document_generation,
+		identity,
+		plan,
+		witness,
+		artifact_generation,
+	} = work;
+	Task::perform(
+		async move {
+			tokio::task::spawn_blocking(move || {
+				crate::settings_writeback::compile_candidate(plan, &witness, artifact_generation)
+			})
+			.await
+			.unwrap_or_else(|error| {
+				Err(crate::settings_writeback::CandidatePreviewRefusal::Compile(
+					format!("candidate presentation task panicked: {error}"),
+				))
+			})
+		},
+		move |result| Message::SettingsCandidateCompiled {
+			preview_generation,
+			panel_id,
+			commit,
+			source_buffer,
+			document_generation,
+			relation_revision: artifact_generation,
+			identity,
+			result,
+		},
+	)
+}
+
+#[cfg(feature = "toron")]
+fn start_next_settings_preview_task(app_state: &mut AppState) -> Task<Message> {
+	let Some(panel_id) = app_state
+		.settings_preview_pending
+		.iter()
+		.min_by_key(|(_, work)| work.preview_generation)
+		.map(|(panel_id, _)| *panel_id)
+	else {
+		return Task::none();
+	};
+	let work = app_state
+		.settings_preview_pending
+		.remove(&panel_id)
+		.expect("selected pending preview remains queued");
+	start_settings_preview_task(app_state, work)
+}
+
+#[cfg(feature = "toron")]
+fn refuse_settings_preview(
+	app_state: &mut AppState,
+	panel_id: libaryon::engine::HostPanelId,
+	message: String,
+) {
+	app_state.code_editor.discard_plot_source_preview(panel_id);
+	app_state
+		.code_editor
+		.set_plot_writeback_status(panel_id, Some(message));
+}
+
+#[cfg(feature = "toron")]
+fn queue_settings_preview(
+	app_state: &mut AppState,
+	gesture: crate::editor::PlotWritebackGesture,
+) -> Task<Message> {
+	use crate::editor::PlotWritebackGesture;
+	use crate::settings_writeback::{WritebackAction, parse_editor_value, plan_writeback};
+	let gesture_panel = match &gesture {
+		PlotWritebackGesture::Preview { panel_id, .. }
+		| PlotWritebackGesture::Commit { panel_id, .. }
+		| PlotWritebackGesture::Reset { panel_id, .. }
+		| PlotWritebackGesture::Cancel { panel_id } => *panel_id,
+	};
+	if app_state
+		.pending_settings_commits
+		.values()
+		.any(|pending| pending.panel_id == gesture_panel)
+	{
+		app_state
+			.code_editor
+			.set_plot_writeback_status(gesture_panel, Some("committing…".to_owned()));
+		return Task::none();
+	}
+
+	let (panel_id, key, commit, action, input) = match gesture {
+		PlotWritebackGesture::Preview {
+			panel_id,
+			key,
+			value,
+		} => (panel_id, key, false, WritebackAction::Set, Some(value)),
+		PlotWritebackGesture::Commit { panel_id, key } => {
+			let input = app_state
+				.code_editor
+				.plot_writeback_context(panel_id)
+				.and_then(|context| context.drafts.get(&key).cloned());
+			(panel_id, key, true, WritebackAction::Set, input)
+		}
+		PlotWritebackGesture::Reset { panel_id, key } => {
+			(panel_id, key, true, WritebackAction::Reset, None)
+		}
+		PlotWritebackGesture::Cancel { panel_id } => {
+			app_state.settings_preview_sequence =
+				app_state.settings_preview_sequence.saturating_add(1);
+			app_state
+				.settings_preview_latest
+				.insert(panel_id, app_state.settings_preview_sequence);
+			app_state.settings_preview_pending.remove(&panel_id);
+			app_state.code_editor.discard_plot_source_preview(panel_id);
+			return Task::none();
+		}
+	};
+	let Some(context) = app_state.code_editor.plot_writeback_context(panel_id) else {
+		refuse_settings_preview(
+			app_state,
+			panel_id,
+			"read-only · source is no longer attached".to_owned(),
+		);
+		return Task::none();
+	};
+	let source_buffer = context.attachment.source.buffer_id;
+	let Some((source, document_generation)) = app_state
+		.code_editor
+		.document_snapshot(source_buffer)
+		.map(|(source, generation)| (source.to_owned(), generation))
+	else {
+		refuse_settings_preview(
+			app_state,
+			panel_id,
+			"read-only · source snapshot unavailable".to_owned(),
+		);
+		return Task::none();
+	};
+	let occurrence_exists = context
+		.attachment
+		.source
+		.model
+		.occurrences
+		.iter()
+		.any(|occurrence| {
+			occurrence.key == key
+				&& occurrence.target == crate::presentation_registry::setting_spec(key).target
+				&& occurrence.owners.contains(&context.attachment.identity)
+		});
+	let authored_without_occurrence = !occurrence_exists
+		&& crate::presentation_registry::setting_spec(key)
+			.authored_projection
+			.is_some_and(|projection| projection(&context.settings.authored_spec));
+	let value = match (action, input.as_deref()) {
+		(WritebackAction::Set, Some(input)) => match parse_editor_value(key, input) {
+			Ok(value) => Some(value),
+			Err(error) => {
+				refuse_settings_preview(app_state, panel_id, error.to_string());
+				return Task::none();
+			}
+		},
+		(WritebackAction::Set, None) => {
+			refuse_settings_preview(
+				app_state,
+				panel_id,
+				"enter a value before committing".to_owned(),
+			);
+			return Task::none();
+		}
+		(WritebackAction::Reset, _) => None,
+	};
+	let plan = match plan_writeback(
+		&source,
+		Some(&context.attachment),
+		None,
+		key,
+		action,
+		value.as_ref(),
+		authored_without_occurrence,
+	) {
+		Ok(plan) => plan,
+		Err(error) => {
+			refuse_settings_preview(app_state, panel_id, error.to_string());
+			return Task::none();
+		}
+	};
+	let Some(authoritative_revision) = app_state.rune_buffer_revisions.get(&source_buffer).copied()
+	else {
+		refuse_settings_preview(
+			app_state,
+			panel_id,
+			"read-only · no authoritative relation publication".to_owned(),
+		);
+		return Task::none();
+	};
+	let Some(retained) = app_state.retained_rune_relations.get(&source_buffer) else {
+		refuse_settings_preview(
+			app_state,
+			panel_id,
+			"read-only · relation artifact was not retained".to_owned(),
+		);
+		return Task::none();
+	};
+	if !retained
+		.transformed
+		.presentation_order
+		.contains(&context.attachment.identity)
+	{
+		refuse_settings_preview(
+			app_state,
+			panel_id,
+			"read-only · producing view is no longer current".to_owned(),
+		);
+		return Task::none();
+	}
+	let Some(witness) = retained.witness(authoritative_revision) else {
+		refuse_settings_preview(
+			app_state,
+			panel_id,
+			"this change requires running the relation again".to_owned(),
+		);
+		return Task::none();
+	};
+	app_state.settings_preview_sequence = app_state.settings_preview_sequence.saturating_add(1);
+	let preview_generation = app_state.settings_preview_sequence;
+	app_state
+		.settings_preview_latest
+		.insert(panel_id, preview_generation);
+	let work = PendingSettingsPreview {
+		preview_generation,
+		panel_id,
+		commit,
+		source_buffer,
+		document_generation,
+		identity: context.attachment.identity,
+		plan,
+		witness,
+		artifact_generation: authoritative_revision,
+	};
+	if app_state.settings_preview_in_flight.is_some() {
+		app_state.settings_preview_pending.insert(panel_id, work);
+		Task::none()
+	} else {
+		start_settings_preview_task(app_state, work)
+	}
+}
+
+#[cfg(feature = "toron")]
+fn settle_settings_commit(app_state: &mut AppState, result: libaryon::engine::DocumentEditResult) {
+	let Some(pending) = app_state
+		.pending_settings_commits
+		.remove(&result.request_id)
+	else {
+		return;
+	};
+	if result.buffer_id != pending.source_buffer {
+		app_state
+			.code_editor
+			.discard_plot_source_preview(pending.panel_id);
+		app_state.code_editor.set_plot_writeback_status(
+			pending.panel_id,
+			Some("commit refused · acknowledgement targeted another buffer".to_owned()),
+		);
+		return;
+	}
+	match result.outcome {
+		libaryon::engine::DocumentEditOutcome::Applied { new_generation } => {
+			let candidate_source = pending.candidate.plan.candidate_source.clone();
+			let promoted = app_state.code_editor.promote_plot_source_preview(
+				pending.panel_id,
+				new_generation,
+				candidate_source,
+			);
+			if !promoted {
+				app_state.status_error.clear();
+				app_state.status_msg =
+					"Plot setting committed; a newer plot publication superseded its preview."
+						.to_owned();
+				return;
+			}
+			let model = Arc::new(
+				pending
+					.candidate
+					.transformed
+					.presentation_source_model
+					.clone(),
+			);
+			app_state
+				.rune_document_generations
+				.insert((pending.source_buffer, pending.revision), new_generation);
+			app_state
+				.rune_presentation_models
+				.insert((pending.source_buffer, pending.revision), model);
+			if let Some(retained) = app_state
+				.retained_rune_relations
+				.get_mut(&pending.source_buffer)
+				&& retained.revision == pending.revision
+			{
+				retained.plan_key = RelationPlanKey::from_view(&pending.candidate.transformed);
+				retained.transformed = Arc::new(pending.candidate.transformed);
+			}
+			app_state.rune_categorical_identities.insert(
+				(
+					pending.source_buffer,
+					pending.identity,
+					pending.continuation.palette_len,
+				),
+				pending.continuation.identity,
+			);
+			app_state.status_error.clear();
+			app_state.status_msg = "Plot setting committed to Rune source.".to_owned();
+		}
+		libaryon::engine::DocumentEditOutcome::Refused { reason } => {
+			app_state
+				.code_editor
+				.discard_plot_source_preview(pending.panel_id);
+			app_state.code_editor.set_plot_writeback_status(
+				pending.panel_id,
+				Some(format!("commit refused · {reason}")),
+			);
+			app_state.status_error = format!("Plot setting commit refused: {reason}");
+		}
+	}
 }
 
 #[cfg(feature = "toron")]
@@ -3098,7 +3515,35 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			if app_state.code_editor.take_quit_request() {
 				return update(app_state, Message::CloseWindow);
 			}
+			#[cfg(feature = "toron")]
+			{
+				let acknowledgements = app_state
+					.code_editor
+					.take_document_edit_results()
+					.collect::<Vec<_>>();
+				for acknowledgement in acknowledgements {
+					settle_settings_commit(app_state, acknowledgement);
+				}
+			}
 			let run_task = finish_pending_runs(app_state);
+			#[cfg(feature = "toron")]
+			let settings_tasks = {
+				let gestures = app_state
+					.code_editor
+					.take_plot_writeback_gestures()
+					.collect::<Vec<_>>();
+				gestures
+					.into_iter()
+					.map(|gesture| queue_settings_preview(app_state, gesture))
+					.collect::<Vec<_>>()
+			};
+			#[cfg(feature = "toron")]
+			return Task::batch(
+				std::iter::once(task)
+					.chain(std::iter::once(run_task))
+					.chain(settings_tasks),
+			);
+			#[cfg(not(feature = "toron"))]
 			return Task::batch([task, run_task]);
 		}
 		Message::CodeEditResize(size) => {
@@ -3729,6 +4174,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::RunRuneViewSetResult {
 			source_buffer,
 			revision,
+			execution_index,
 			origin,
 			views,
 			result,
@@ -3741,6 +4187,13 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			}
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
 				return Task::none();
+			}
+			if let Ok(crate::gui::messages::RuneRelationCompletion::Views(outcome)) = &result
+				&& let Some(retained) = app_state.retained_rune_relations.get_mut(&source_buffer)
+				&& retained.revision == revision
+				&& let Some(slot) = retained.artifacts.get_mut(execution_index)
+			{
+				*slot = Some(Arc::clone(&outcome.result));
 			}
 			app_state.status_time_elapsed = Some(app_state.code_started.elapsed());
 			match result {
@@ -4114,6 +4567,314 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							"{} at bytes {}..{}: {error}",
 							presentation.display_label, span.start, span.end
 						),
+					);
+				}
+			}
+		}
+		#[cfg(feature = "toron")]
+		Message::SettingsCandidateCompiled {
+			preview_generation,
+			panel_id,
+			commit,
+			source_buffer,
+			document_generation,
+			relation_revision,
+			identity,
+			result,
+		} => {
+			if app_state.settings_preview_in_flight == Some(preview_generation) {
+				app_state.settings_preview_in_flight = None;
+			}
+			let next = start_next_settings_preview_task(app_state);
+			if app_state.settings_preview_latest.get(&panel_id) != Some(&preview_generation) {
+				return next;
+			}
+			let candidate = match result {
+				Ok(candidate) => candidate,
+				Err(crate::settings_writeback::CandidatePreviewRefusal::RelationReuseRequired) => {
+					refuse_settings_preview(
+						app_state,
+						panel_id,
+						"this change requires running the relation again".to_owned(),
+					);
+					return next;
+				}
+				Err(crate::settings_writeback::CandidatePreviewRefusal::Compile(error)) => {
+					refuse_settings_preview(
+						app_state,
+						panel_id,
+						format!("preview refused · {error}"),
+					);
+					return next;
+				}
+			};
+			let Some(retained) = app_state.retained_rune_relations.get(&source_buffer) else {
+				return next;
+			};
+			let candidate_key = RelationPlanKey::from_view(&candidate.transformed);
+			let reuse_is_current = app_state
+				.rune_buffer_revisions
+				.get(&source_buffer)
+				.copied()
+				.filter(|revision| *revision == relation_revision)
+				.and_then(|revision| {
+					retained
+						.witness(revision)
+						.map(|witness| (revision, witness))
+				})
+				.is_some_and(|(revision, witness)| witness.proves(&candidate_key, revision));
+			if !reuse_is_current {
+				refuse_settings_preview(
+					app_state,
+					panel_id,
+					"this change requires running the relation again".to_owned(),
+				);
+				return next;
+			}
+			let Some((execution_index, execution)) = candidate
+				.transformed
+				.executions
+				.iter()
+				.enumerate()
+				.find(|(_, execution)| {
+					execution.views.iter().any(|view| view.identity == identity)
+				})
+			else {
+				refuse_settings_preview(
+					app_state,
+					panel_id,
+					"preview refused · producing view disappeared".to_owned(),
+				);
+				return next;
+			};
+			let Some(artifact) = retained
+				.artifacts
+				.get(execution_index)
+				.and_then(Option::as_ref)
+				.cloned()
+			else {
+				refuse_settings_preview(
+					app_state,
+					panel_id,
+					"this change requires running the relation again".to_owned(),
+				);
+				return next;
+			};
+			let palettes = prepare_rune_categorical_palettes(app_state, source_buffer, execution);
+			let outcome = match rune_view_outcome_with_palettes(
+				artifact,
+				execution.views.clone(),
+				palettes,
+			) {
+				Ok(outcome) => outcome,
+				Err(error) => {
+					refuse_settings_preview(
+						app_state,
+						panel_id,
+						format!("preview refused · {error}"),
+					);
+					return next;
+				}
+			};
+			let Some(sink) = outcome
+				.sinks
+				.into_iter()
+				.find(|sink| sink.identity == identity)
+			else {
+				refuse_settings_preview(
+					app_state,
+					panel_id,
+					"preview refused · producing view was not rendered".to_owned(),
+				);
+				return next;
+			};
+			let presentation = sink.presentation;
+			let facet = sink.facet;
+			let figure_grid = sink.figure_grid;
+			let source = sink.source;
+			let build = match sink.output {
+				Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(
+					resolved,
+					authored_settings,
+					continuation,
+				)) => {
+					let candidate = candidate.clone();
+					let identity = identity.clone();
+					build_facet_resolved_plot_task(
+						resolved,
+						source,
+						facet,
+						figure_grid,
+						None,
+						move |resolved, kernel| Message::SettingsPreviewPlotReady {
+							preview_generation,
+							panel_id,
+							commit,
+							source_buffer,
+							document_generation,
+							relation_revision,
+							identity,
+							candidate,
+							presentation,
+							authored_settings,
+							continuation,
+							resolved,
+							kernel,
+						},
+					)
+				}
+				Ok(crate::gui::messages::RuneRelationSinkOutput::StyledPlot(
+					resolved,
+					layer_settings,
+					authored_settings,
+					continuation,
+				)) => {
+					let candidate = candidate.clone();
+					let identity = identity.clone();
+					build_facet_resolved_plot_task(
+						resolved,
+						source,
+						facet,
+						figure_grid,
+						Some(layer_settings),
+						move |resolved, kernel| Message::SettingsPreviewPlotReady {
+							preview_generation,
+							panel_id,
+							commit,
+							source_buffer,
+							document_generation,
+							relation_revision,
+							identity,
+							candidate,
+							presentation,
+							authored_settings,
+							continuation,
+							resolved,
+							kernel,
+						},
+					)
+				}
+				Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(..)) => {
+					refuse_settings_preview(
+						app_state,
+						panel_id,
+						"per-layer settings editing is not supported".to_owned(),
+					);
+					Task::none()
+				}
+				Ok(crate::gui::messages::RuneRelationSinkOutput::Table(_)) => {
+					refuse_settings_preview(
+						app_state,
+						panel_id,
+						"preview refused · producing view is not a plot".to_owned(),
+					);
+					Task::none()
+				}
+				Err(error) => {
+					refuse_settings_preview(
+						app_state,
+						panel_id,
+						format!("preview refused · {error}"),
+					);
+					Task::none()
+				}
+			};
+			return Task::batch([next, build]);
+		}
+		#[cfg(feature = "toron")]
+		Message::SettingsPreviewPlotReady {
+			preview_generation,
+			panel_id,
+			commit,
+			source_buffer,
+			document_generation,
+			relation_revision,
+			identity,
+			candidate,
+			presentation,
+			authored_settings,
+			continuation,
+			resolved,
+			kernel,
+		} => {
+			if app_state.settings_preview_latest.get(&panel_id) != Some(&preview_generation) {
+				return Task::none();
+			}
+			let still_attached = app_state
+				.code_editor
+				.plot_writeback_context(panel_id)
+				.is_some_and(|context| {
+					context.attachment.source.buffer_id == source_buffer
+						&& context.attachment.source.document_generation == document_generation
+						&& context.attachment.identity == identity
+				}) && app_state.rune_buffer_revisions.get(&source_buffer)
+				== Some(&relation_revision);
+			if !still_attached {
+				app_state.code_editor.discard_plot_source_preview(panel_id);
+				app_state.code_editor.set_plot_writeback_status(
+					panel_id,
+					Some("preview refused · source attachment changed".to_owned()),
+				);
+				return Task::none();
+			}
+			let kernel = match kernel {
+				Ok(kernel) => kernel,
+				Err(error) => {
+					refuse_settings_preview(
+						app_state,
+						panel_id,
+						format!("preview refused · {error}"),
+					);
+					return Task::none();
+				}
+			};
+			let attachment = crate::presentation_registry::PlotSourceAttachment {
+				identity: identity.clone(),
+				source: crate::presentation_registry::StampedPresentationSourceModel {
+					buffer_id: source_buffer,
+					document_generation,
+					model: Arc::new(candidate.transformed.presentation_source_model.clone()),
+				},
+			};
+			let plot_type = Some(resolved.resolved_spec.composition.primary_plot_type());
+			app_state.code_editor.show_plot_source_preview(
+				panel_id,
+				presentation.display_label,
+				kernel,
+				authored_settings,
+				attachment,
+				plot_type,
+			);
+			if commit {
+				app_state.settings_commit_sequence =
+					app_state.settings_commit_sequence.saturating_add(1);
+				let request_id = libaryon::core::RequestId::new(app_state.settings_commit_sequence);
+				let revision = app_state.rune_buffer_revisions[&source_buffer];
+				if app_state.code_editor.apply_document_edits(
+					request_id,
+					source_buffer,
+					document_generation,
+					candidate.plan.edits.clone(),
+				) {
+					app_state.pending_settings_commits.insert(
+						request_id,
+						PendingSettingsCommit {
+							panel_id,
+							source_buffer,
+							revision,
+							candidate,
+							identity,
+							continuation,
+						},
+					);
+					app_state
+						.code_editor
+						.set_plot_writeback_status(panel_id, Some("committing…".to_owned()));
+				} else {
+					app_state.code_editor.discard_plot_source_preview(panel_id);
+					app_state.code_editor.set_plot_writeback_status(
+						panel_id,
+						Some("commit refused · editor unavailable".to_owned()),
 					);
 				}
 			}
@@ -5385,6 +6146,7 @@ mod tests {
 			Message::RunRuneViewSetResult {
 				source_buffer: BufferId::new(7),
 				revision: 1,
+				execution_index: 0,
 				origin,
 				views: Vec::new(),
 				result: Ok(RuneRelationCompletion::Materialized(
@@ -5609,6 +6371,7 @@ mod tests {
 			Message::RunRuneViewSetResult {
 				source_buffer,
 				revision,
+				execution_index: 0,
 				origin,
 				views,
 				result: Ok(crate::gui::messages::RuneRelationCompletion::Views(outcome)),
@@ -6452,6 +7215,7 @@ mod tests {
 			Message::RunRuneViewSetResult {
 				source_buffer,
 				revision: 1,
+				execution_index: 0,
 				origin,
 				views: views.clone(),
 				result: Ok(crate::gui::messages::RuneRelationCompletion::Views(outcome)),
@@ -6853,6 +7617,7 @@ ket.table("test2") // Comment Test1.
 			Message::RunRuneViewSetResult {
 				source_buffer,
 				revision: 1,
+				execution_index: 0,
 				origin: relation.origin,
 				views: vec![styled.clone(), plain.clone(), bad.clone()],
 				result: Ok(crate::gui::messages::RuneRelationCompletion::Views(outcome)),
@@ -6926,6 +7691,7 @@ ket.table("test2") // Comment Test1.
 			Message::RunRuneViewSetResult {
 				source_buffer,
 				revision: 2,
+				execution_index: 0,
 				origin: relation.origin,
 				views: vec![styled.clone(), plain, bad],
 				result: Ok(crate::gui::messages::RuneRelationCompletion::Views(outcome)),
@@ -8076,6 +8842,7 @@ workspace.table("t").views([
 			Message::RunRuneViewSetResult {
 				source_buffer,
 				revision: 2,
+				execution_index: 0,
 				origin: relation_b.origin,
 				views: relation_b
 					.views
@@ -8650,6 +9417,7 @@ workspace.table("bad").views([view("bad", table())]);
 			Message::RunRuneViewSetResult {
 				source_buffer,
 				revision: 2,
+				execution_index: 0,
 				origin: bad_relation.origin,
 				views: bad_relation
 					.views

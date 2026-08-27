@@ -4,8 +4,8 @@ mod search;
 mod system;
 
 use self::edit::{
-	handle_clipboard_doctab_command, handle_edit_doctab_command, handle_history_doctab_command,
-	handle_sort_doctab_command, handle_uniq_doctab_command,
+	apply_guarded_document_edits, handle_clipboard_doctab_command, handle_edit_doctab_command,
+	handle_history_doctab_command, handle_sort_doctab_command, handle_uniq_doctab_command,
 };
 use self::navigation::{handle_file_browser_navigation_command, handle_navigation_doctab_command};
 use self::search::handle_search_doctab_command;
@@ -47,8 +47,9 @@ use super::markdown_image_preview::{
 };
 use super::navigation::{GotoDefinitionRequest, JumpEntry, NavigationResolved, NavigationStamp};
 use super::protocol::{
-	ConfirmAction, EditorCommand, EditorMode, HostPanelPlacement, MouseIntent, MoveDirection,
-	PickerAction, PickerCursorMovement, RepoSearchMode, SplitDirection,
+	ConfirmAction, DocumentEditOutcome, DocumentEditRefusal, DocumentEditResult, EditorCommand,
+	EditorMode, HostPanelPlacement, MouseIntent, MoveDirection, PickerAction, PickerCursorMovement,
+	RepoSearchMode, SplitDirection,
 };
 use super::render::{RenderParams, render_frame};
 use super::request::{EngineRequest, InternalEvent};
@@ -3559,6 +3560,7 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::Picker(_)
 		| EditorCommand::MouseIntent { .. }
 		| EditorCommand::QueryDocumentText
+		| EditorCommand::ApplyDocumentEdits { .. }
 		| EditorCommand::BeginPasswordPrompt { .. }
 		| EditorCommand::SubmitPassword(_)
 		| EditorCommand::LockSecrets
@@ -4134,6 +4136,42 @@ fn dispatch_command(
 			return write_encrypted_focused(registry, session, Some(path), false);
 		}
 		_ => {}
+	}
+
+	if let EditorCommand::ApplyDocumentEdits {
+		request_id,
+		buffer_id,
+		expected_generation,
+		edits,
+	} = cmd
+	{
+		let outcome = match session.layout.view_id_for_buffer(buffer_id) {
+			Some(view_id) => {
+				let EditorSession {
+					buffers,
+					layout,
+					events,
+					..
+				} = session;
+				with_text_buffer_mut(registry, buffers, layout, events, view_id, |tab| {
+					apply_guarded_document_edits(registry, tab, expected_generation, edits)
+				})
+				.unwrap_or(DocumentEditOutcome::Refused {
+					reason: DocumentEditRefusal::BufferUnavailable,
+				})
+			}
+			None => DocumentEditOutcome::Refused {
+				reason: DocumentEditRefusal::BufferUnavailable,
+			},
+		};
+		session.queue_host_event(crate::engine::HostEvent::DocumentEditResult(
+			DocumentEditResult {
+				request_id,
+				buffer_id,
+				outcome,
+			},
+		));
+		return DispatchOutcome::continue_with(true);
 	}
 
 	if let Some(effect) = handle_browser_command(runtime, session, cmd.clone()) {
@@ -5529,6 +5567,9 @@ fn dispatch_command(
 		| EditorCommand::WriteEncryptedFile
 		| EditorCommand::WriteEncryptedFileAs(_) => {
 			unreachable!("encrypted file commands are handled before the main command match");
+		}
+		EditorCommand::ApplyDocumentEdits { .. } => {
+			unreachable!("document edit transactions are handled before focused dispatch");
 		}
 		EditorCommand::Quit => {
 			// Frontends need one final projection to hand the quit request to

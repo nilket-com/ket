@@ -5,16 +5,16 @@
 
 use crate::presentation_registry::{
 	self, CALLABLES, CallPosition, ContainerKind, ExpressionShape, HandlerId,
-	PresentationSourceModel, PresentationSyntaxBoundary, SemanticReceiver, SettingOccurrence,
-	setting_for_call,
+	PresentationSourceModel, PresentationSyntaxBoundary, PresentationViewSlotBoundary,
+	SemanticReceiver, SettingOccurrence, setting_for_call,
 };
 use crate::rune_presentation::{
 	PresentationLimits, PresentationMapKind, PresentationMapSegment, PresentationSourceMap,
 	execute_generated,
 };
 use crate::rune_relation_envelope::{
-	LocalViewIdentity, RuneEnvelopeError, RuneEnvelopeSourceMap, SourceMapSegment,
-	SpannedRuneViewIntent, TransformedRuneRelation, TransformedRuneView,
+	LocalViewIdentity, RelationRootIdentity, RuneEnvelopeError, RuneEnvelopeSourceMap,
+	SourceMapSegment, SpannedRuneViewIntent, TransformedRuneRelation, TransformedRuneView,
 };
 use rune::ast::{self, Spanned};
 use std::collections::{HashMap, HashSet};
@@ -203,6 +203,10 @@ pub(crate) fn compile(source: &str) -> Result<TransformedRuneView, RuneEnvelopeE
 			.collect::<Result<Vec<_>, RuneEnvelopeError>>()?;
 		executions.push(TransformedRuneRelation {
 			origin: execution.origin.clone(),
+			root: match execution.root {
+				RelationRoot::Workspace => RelationRootIdentity::Workspace,
+				RelationRoot::Ket => RelationRootIdentity::Ket,
+			},
 			source: rendered.source,
 			views,
 			source_map: rendered.source_map,
@@ -237,6 +241,10 @@ fn build_presentation_source_model(
 	let mut model = PresentationSourceModel::default();
 	for slot in slots {
 		let owner = slot_identity(slot);
+		model.view_slots.push(PresentationViewSlotBoundary {
+			expression_span: u32_range(&slot.span, "view slot expression")?,
+			owner: owner.clone(),
+		});
 		let mut fragments = HashSet::new();
 		for range in slot.expression.dependency_ranges() {
 			collect_dependencies(source, range, &analysis.definitions, &mut fragments)?;
@@ -256,6 +264,9 @@ fn build_presentation_source_model(
 	model
 		.syntax
 		.sort_by_key(|boundary| boundary.call_span.start);
+	model
+		.view_slots
+		.sort_by_key(|boundary| boundary.expression_span.start);
 	Ok(model)
 }
 
@@ -3696,6 +3707,12 @@ workspace.table("t").views([figure([
 			.expect("figure boundary");
 		assert!(matches!(figure.container, Some((ContainerKind::Figure, _))));
 		assert_eq!(figure.separators.len(), 1, "figure child-list separator");
+		let slot = &compiled.presentation_source_model.view_slots[0];
+		assert_eq!(slot.owner, LocalViewIdentity::Anonymous(0));
+		let slot_text =
+			&source[slot.expression_span.start as usize..slot.expression_span.end as usize];
+		assert!(slot_text.starts_with("figure(["));
+		assert!(slot_text.ends_with("])"));
 	}
 
 	#[test]
