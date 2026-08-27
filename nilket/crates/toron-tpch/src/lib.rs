@@ -5085,11 +5085,17 @@ pub struct TimingAtlasChild {
 	pub pair_index: Option<usize>,
 	pub position_in_pair: usize,
 	pub attempt: u32,
-	/// ADR 554 follow-on: the id this attempt executed under, so a chain-stage
-	/// profile line joins back to its cell without row-count inference. The atlas
-	/// mints it (`TimingAtlasChildPlan::query_id`) and hands it to the engine as
-	/// `ExecutionContext::query_id`, so both sides already agree — only the
-	/// persisted record was missing.
+	/// ADR 554 follow-on: the **distributed** engine `QueryId` this attempt
+	/// executed under, so a distributed profile record joins back to its cell
+	/// without row-count inference.
+	///
+	/// `None` on the local arm, and deliberately so. The local arm runs through
+	/// `execute_query_with_metadata_coordinate`, which takes no id and therefore
+	/// executes under `ExecutionContext::local_test()` — a constant
+	/// `QueryId::from_u128(1)` shared by every local attempt. Recording the minted
+	/// id there would assert an execution fact that is false. Passing the minted
+	/// id into the local executor to make this field true would change execution
+	/// semantics to satisfy a receipt, which is the wrong direction.
 	pub query_id: Option<String>,
 	pub query_elapsed_ms: f64,
 	pub row_count: Option<usize>,
@@ -5427,9 +5433,10 @@ async fn run_timing_atlas_child<H: TimingAtlasHarness>(
 		arm: child_plan.arm.label(),
 		pair_index,
 		position_in_pair: position,
-		// From the plan, not minted here: this must be the id the engine actually
-		// executed under, which is what `ExecutionContext::query_id` receives.
-		query_id: Some(child_plan.query_id.get().to_string()),
+		// Distributed only: the local arm never receives this id, so claiming it
+		// there would record an execution that did not happen.
+		query_id: (child_plan.arm == TimingArm::Distributed)
+			.then(|| child_plan.query_id.get().to_string()),
 		attempt: 1,
 		query_elapsed_ms: 0.0,
 		row_count: None,
