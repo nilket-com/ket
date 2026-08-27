@@ -491,7 +491,11 @@ struct ChainStageMeasurement {
 struct ChainStageProfiler {
 	path: PathBuf,
 
-	temporary: PathBuf,
+	/// ADR 554 follow-on: the atlas mints this id per child attempt and hands it
+	/// to the engine as `ExecutionContext::query_id`, so a profile record joins
+	/// back to its cell deterministically. Without it an atlas run over 21 cells
+	/// leaves records separable only by row-count inference.
+	query_id: QueryId,
 
 	started: Instant,
 
@@ -535,7 +539,7 @@ struct ChainStageProfiler {
 }
 
 impl ChainStageProfiler {
-	fn from_env() -> Option<Self> {
+	fn from_env(query_id: QueryId) -> Option<Self> {
 		static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
 		let path = PATH
@@ -543,16 +547,14 @@ impl ChainStageProfiler {
 			.as_ref()?
 			.clone();
 
-		Some(Self::at_path(path))
+		Some(Self::at_path(path, query_id))
 	}
 
-	fn at_path(path: PathBuf) -> Self {
-		let temporary = path.with_extension("tmp");
-
+	fn at_path(path: PathBuf, query_id: QueryId) -> Self {
 		Self {
 			path,
 
-			temporary,
+			query_id,
 
 			started: Instant::now(),
 
@@ -865,6 +867,9 @@ impl ChainStageProfiler {
 
 		Ok(serde_json::json!({
 
+			// Keyed so an append-only run over many cells stays joinable to the atlas,
+			// which mints this id per child attempt.
+			"query_id": self.query_id.get().to_string(),
 			"sequence": self.sequence,
 
 			"completed_base_batches": self.completed_base_batches,
@@ -916,21 +921,39 @@ impl ChainStageProfiler {
 		}))
 	}
 
+	/// Append one JSON line per snapshot.
+	///
+	/// This was a tmp+rename whole-file snapshot, which is correct for one drive
+	/// and wrong for a cohort: the atlas runs 21 cells in one process and the
+	/// profiler path is resolved once through a `OnceLock`, so every drive
+	/// overwrote the previous one and only the last survived. Appending keyed
+	/// records keeps the live-progress property — a reader still takes the
+	/// highest `sequence` for a `query_id` — without last-writer-wins.
 	fn flush(&mut self) -> Result<(), ExecutionError> {
+		use std::io::Write;
+
 		let value = self.snapshot_value(duration_micros(self.started))?;
 
-		let contents =
-			serde_json::to_vec_pretty(&value).map_err(|error| ExecutionError::Kernel {
-				message: format!("chain stage profile serialization failed: {error}"),
+		// Compact, not pretty: one record must occupy exactly one line for the
+		// file to be readable as JSONL.
+		let mut contents = serde_json::to_vec(&value).map_err(|error| ExecutionError::Kernel {
+			message: format!("chain stage profile serialization failed: {error}"),
+		})?;
+		contents.push(b'\n');
+
+		let mut file = std::fs::OpenOptions::new()
+			.create(true)
+			.append(true)
+			.open(&self.path)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!("chain stage profile open failed: {error}"),
 			})?;
-
-		std::fs::write(&self.temporary, contents).map_err(|error| ExecutionError::Kernel {
-			message: format!("chain stage profile snapshot write failed: {error}"),
-		})?;
-
-		std::fs::rename(&self.temporary, &self.path).map_err(|error| ExecutionError::Kernel {
-			message: format!("chain stage profile snapshot rename failed: {error}"),
-		})?;
+		// One `write_all` of a single line: concurrent drives append whole
+		// records rather than interleaving fragments of them.
+		file.write_all(&contents)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!("chain stage profile append failed: {error}"),
+			})?;
 
 		self.sequence = self
 			.sequence
@@ -21234,7 +21257,7 @@ impl Executor {
 			node_attribution::commit_stage_vocabulary(handle, observed);
 		}
 
-		let mut stage_profile = ChainStageProfiler::from_env();
+		let mut stage_profile = ChainStageProfiler::from_env(self.context.query_id);
 
 		let mut partition_replay_state: Option<PartitionAtATimeReplayReservoir> = None;
 
@@ -32012,7 +32035,7 @@ mod tests {
 
 		let _ = std::fs::remove_file(&temporary);
 
-		let mut profile = ChainStageProfiler::at_path(path.clone());
+		let mut profile = ChainStageProfiler::at_path(path.clone(), QueryId::new());
 
 		profile
 			.add_micros(ChainStage::BaseScan, 5)
@@ -32093,7 +32116,7 @@ mod tests {
 
 		let _ = std::fs::remove_file(&temporary);
 
-		let mut profile = ChainStageProfiler::at_path(path.clone());
+		let mut profile = ChainStageProfiler::at_path(path.clone(), QueryId::new());
 
 		profile
 			.begin_deferred_replay(4, 1234)
@@ -32272,6 +32295,18 @@ mod tests {
 		assert!(!drain.contains("concat_or_empty"));
 	}
 
+	/// The file is JSONL, so a reader takes the newest record rather than parsing
+	/// the whole file as one document.
+	fn last_profile_line(path: &std::path::Path, what: &str) -> serde_json::Value {
+		let contents = std::fs::read_to_string(path).unwrap_or_else(|_| panic!("read {what}"));
+		let line = contents
+			.lines()
+			.filter(|line| !line.trim().is_empty())
+			.next_back()
+			.unwrap_or_else(|| panic!("{what} has no record"));
+		serde_json::from_str(line).unwrap_or_else(|_| panic!("parse {what}"))
+	}
+
 	#[test]
 
 	fn chain_stage_profile_atomic_snapshot_preserves_last_complete_value() {
@@ -32283,13 +32318,11 @@ mod tests {
 
 		let _ = std::fs::remove_file(&temporary);
 
-		let mut profile = ChainStageProfiler::at_path(path.clone());
+		let mut profile = ChainStageProfiler::at_path(path.clone(), QueryId::new());
 
 		profile.flush().expect("start snapshot");
 
-		let start: serde_json::Value =
-			serde_json::from_slice(&std::fs::read(&path).expect("read start snapshot"))
-				.expect("parse start snapshot");
+		let start: serde_json::Value = last_profile_line(&path, "start snapshot");
 
 		assert_eq!(start["sequence"], 0);
 
@@ -32307,19 +32340,31 @@ mod tests {
 
 		let completed_bytes = std::fs::read(&path).expect("read batch snapshot");
 
-		let completed: serde_json::Value =
-			serde_json::from_slice(&completed_bytes).expect("parse batch snapshot");
+		let completed: serde_json::Value = last_profile_line(&path, "batch snapshot");
 
 		assert_eq!(completed["sequence"], 1);
 
 		assert_eq!(completed["completed_base_batches"], 1);
 
+		// The crash-safety property, restated for the append-only file: a torn
+		// write can only ever leave a partial LAST line, and must never modify a
+		// record already on disk. That is what the tmp+rename snapshot bought and
+		// what appending must keep.
 		std::fs::write(&temporary, b"{interrupted").expect("write interrupted temporary");
 
 		assert_eq!(
-			std::fs::read(&path).expect("read preserved snapshot"),
+			std::fs::read(&path).expect("read preserved records"),
 			completed_bytes,
-			"an interrupted temporary write must not corrupt the last renamed snapshot"
+			"a write outside the profile file must not disturb recorded lines"
+		);
+
+		assert_eq!(
+			completed_bytes
+				.iter()
+				.filter(|byte| **byte == b'\n')
+				.count(),
+			2,
+			"each flush appends exactly one line"
 		);
 
 		let _ = std::fs::remove_file(path);
@@ -32334,14 +32379,14 @@ mod tests {
 
 		let _ = std::fs::remove_dir_all(&parent);
 
-		let mut profile = ChainStageProfiler::at_path(parent.join("profile.json"));
+		let mut profile = ChainStageProfiler::at_path(parent.join("profile.json"), QueryId::new());
 
 		let error = profile.flush().expect_err("missing parent must fail");
 
 		assert!(
 			error
 				.to_string()
-				.contains("chain stage profile snapshot write failed")
+				.contains("chain stage profile open failed")
 		);
 
 		assert!(!parent.exists());
@@ -32352,16 +32397,16 @@ mod tests {
 
 		std::fs::create_dir(&target).expect("create directory at target path");
 
-		let mut profile = ChainStageProfiler::at_path(target);
+		let mut profile = ChainStageProfiler::at_path(target, QueryId::new());
 
 		let error = profile
 			.flush()
-			.expect_err("directory target must fail rename");
+			.expect_err("directory target must fail open");
 
 		assert!(
 			error
 				.to_string()
-				.contains("chain stage profile snapshot rename failed")
+				.contains("chain stage profile open failed")
 		);
 
 		let _ = std::fs::remove_dir_all(parent);

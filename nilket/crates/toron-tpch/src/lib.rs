@@ -5085,6 +5085,12 @@ pub struct TimingAtlasChild {
 	pub pair_index: Option<usize>,
 	pub position_in_pair: usize,
 	pub attempt: u32,
+	/// ADR 554 follow-on: the id this attempt executed under, so a chain-stage
+	/// profile line joins back to its cell without row-count inference. The atlas
+	/// mints it (`TimingAtlasChildPlan::query_id`) and hands it to the engine as
+	/// `ExecutionContext::query_id`, so both sides already agree — only the
+	/// persisted record was missing.
+	pub query_id: Option<String>,
 	pub query_elapsed_ms: f64,
 	pub row_count: Option<usize>,
 	pub identity_matches: Option<bool>,
@@ -5421,6 +5427,9 @@ async fn run_timing_atlas_child<H: TimingAtlasHarness>(
 		arm: child_plan.arm.label(),
 		pair_index,
 		position_in_pair: position,
+		// From the plan, not minted here: this must be the id the engine actually
+		// executed under, which is what `ExecutionContext::query_id` receives.
+		query_id: Some(child_plan.query_id.get().to_string()),
 		attempt: 1,
 		query_elapsed_ms: 0.0,
 		row_count: None,
@@ -6462,6 +6471,7 @@ pub fn timing_atlas_child_row(child: &TimingAtlasChild) -> serde_json::Value {
 		"pair_index": child.pair_index,
 		"position_in_pair": child.position_in_pair,
 		"attempt": child.attempt,
+		"query_id": child.query_id,
 		"query_elapsed_ms": child.query_elapsed_ms,
 		"row_count": child.row_count,
 		"identity_matches": child.identity_matches,
@@ -23608,6 +23618,7 @@ mod adr538_timing_atlas_failure_paths {
 			pair_index: Some(0),
 			position_in_pair: 0,
 			attempt: 1,
+			query_id: None,
 			query_elapsed_ms: 10.0,
 			row_count: Some(4),
 			identity_matches: Some(true),
@@ -23850,6 +23861,7 @@ mod adr538_timing_atlas_execution {
 				pair_index: Some(index),
 				position_in_pair: 0,
 				attempt: 1,
+				query_id: None,
 				query_elapsed_ms: 10.0,
 				row_count: Some(4),
 				identity_matches: Some(true),
@@ -23864,6 +23876,7 @@ mod adr538_timing_atlas_execution {
 				pair_index: Some(index),
 				position_in_pair: 1,
 				attempt: 1,
+				query_id: None,
 				query_elapsed_ms: 20.0,
 				row_count: Some(4),
 				identity_matches: Some(true),
@@ -23923,6 +23936,7 @@ mod adr538_timing_atlas_execution {
 					pair_index: Some(0),
 					position_in_pair: 0,
 					attempt: 1,
+					query_id: None,
 					query_elapsed_ms: 10.0,
 					row_count: Some(4),
 					identity_matches: Some(true),
@@ -23937,6 +23951,7 @@ mod adr538_timing_atlas_execution {
 					pair_index: Some(0),
 					position_in_pair: 1,
 					attempt: 1,
+					query_id: None,
 					query_elapsed_ms: 25.0,
 					row_count: Some(4),
 					identity_matches: Some(true),
@@ -25544,6 +25559,7 @@ mod adr538_timing_atlas_journal_replay {
 			pair_index: Some(pair_index),
 			position_in_pair: 0,
 			attempt: 1,
+			query_id: None,
 			query_elapsed_ms: elapsed,
 			row_count: Some(4),
 			identity_matches: Some(true),
@@ -25777,6 +25793,7 @@ mod adr538_timing_atlas_journal_replay {
 			pair_index: Some(0),
 			position_in_pair: 0,
 			attempt: 1,
+			query_id: None,
 			query_elapsed_ms: elapsed,
 			row_count: Some(1),
 			identity_matches: Some(true),
