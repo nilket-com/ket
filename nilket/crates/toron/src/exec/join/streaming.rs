@@ -7323,7 +7323,11 @@ impl Executor {
 		};
 
 		if let Some(handle) = stage_handle.as_ref() {
-			node_attribution::commit_stage_vocabulary(handle, join0_route.vocabulary_name());
+			node_attribution::commit_stage_vocabulary(
+				&self.context.task_telemetry,
+				handle,
+				join0_route.vocabulary_name(),
+			);
 		}
 
 		let mut state = init_global_aggregate_state(&self.context, aggr_expr)?;
@@ -16982,7 +16986,11 @@ impl Executor {
 		// stages it buffered are discarded with the pending declaration.
 
 		if let (Some(handle), Some(variant)) = (stage_handle, observed) {
-			node_attribution::commit_stage_vocabulary(handle, variant);
+			node_attribution::commit_stage_vocabulary(
+				&self.context.task_telemetry,
+				handle,
+				variant,
+			);
 		}
 
 		Ok(observed.map(|_| ()))
@@ -21254,7 +21262,11 @@ impl Executor {
 				"inner_prefix_semi_anti_direct_replay"
 			};
 
-			node_attribution::commit_stage_vocabulary(handle, observed);
+			node_attribution::commit_stage_vocabulary(
+				&self.context.task_telemetry,
+				handle,
+				observed,
+			);
 		}
 
 		let mut stage_profile = ChainStageProfiler::from_env(self.context.query_id);

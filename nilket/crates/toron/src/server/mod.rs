@@ -1385,6 +1385,10 @@ fn task_telemetry_for_spec(spec: &TaskSpec) -> TaskTelemetry {
 			stage_role: stage_role_label(spec).to_string(),
 			operator_kind: operator_kind_label(&spec.plan).to_string(),
 			worker_count: worker_count_label(spec),
+			// Filled by `commit_stage_vocabulary` as routes commit during execution;
+			// empty at spec time is the correct starting state, not a missing value.
+			committed_vocabularies: Vec::new(),
+			vocabulary_overflow: 0,
 		},
 		..TaskTelemetry::default()
 	}

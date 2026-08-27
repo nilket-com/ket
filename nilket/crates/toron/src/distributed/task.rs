@@ -285,6 +285,27 @@ pub struct TaskTelemetryLabels {
 	pub stage_role: String,
 	pub operator_kind: String,
 	pub worker_count: Option<u32>,
+	/// ADR 554 follow-on: every streaming route this task COMMITTED, by the
+	/// vocabulary name `commit_stage_vocabulary` publishes. Task-local on purpose:
+	/// the node-attribution ledger is one process-global stack that concurrent
+	/// in-process workers interleave on, so it cannot say which task ran what.
+	/// This rides the task's own telemetry, which the atlas already stamps with
+	/// query, stage, task, arm and attempt.
+	///
+	/// Deduplicated and bounded. Read `vocabulary_overflow` before treating this
+	/// as the complete set.
+	///
+	/// `serde(default)` like every other added telemetry field: `TaskTelemetry`
+	/// crosses the worker/coordinator boundary, so a peer that predates this field
+	/// must still deserialize.
+	#[serde(default)]
+	pub committed_vocabularies: Vec<String>,
+	/// Distinct route names dropped because the bound was reached. **Any non-zero
+	/// value means `committed_vocabularies` is a partial set**, so a reader can
+	/// never mistake a truncated list for complete coverage. Repeats of an
+	/// already-recorded name are not overflow.
+	#[serde(default)]
+	pub vocabulary_overflow: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
