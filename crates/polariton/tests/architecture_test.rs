@@ -9,6 +9,46 @@ mod manifest_dependency_guard;
 
 use manifest_dependency_guard::{ProductBoundary, assert_product_dependency_boundary};
 
+fn presentation_registry(root: &Path) -> String {
+	std::fs::read_to_string(root.join("presentation_registry.rs"))
+		.expect("read PRODUCT-0141 presentation registry")
+}
+
+fn registry_callable<'a>(
+	registry: &'a str,
+	name: &str,
+	position: &str,
+	handler: &str,
+) -> Option<&'a str> {
+	registry.split("callable!(").skip(1).find(|block| {
+		let block = block.split("\n\t),").next().unwrap_or(block);
+		block.contains(&format!("\"{name}\""))
+			&& block.contains(&format!("\n\t\t{position},"))
+			&& block.contains(&format!("\n\t\t{handler},"))
+	})
+}
+
+fn registry_has(registry: &str, name: &str, position: &str) -> bool {
+	registry.split("callable!(").skip(1).any(|block| {
+		let block = block.split("\n\t),").next().unwrap_or(block);
+		block.contains(&format!("\"{name}\"")) && block.contains(&format!("\n\t\t{position},"))
+	})
+}
+
+fn assert_registered_handler(root: &Path, name: &str, position: &str, handler: &str, raw: &str) {
+	let registry = presentation_registry(root);
+	assert!(
+		registry_callable(&registry, name, position, handler).is_some(),
+		"registry is missing {position} {name} -> {handler}"
+	);
+	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
+		.expect("read Rune presentation evaluator");
+	assert!(
+		presentation.contains(&format!("HandlerId::{handler} => {raw}")),
+		"raw handler map is missing {handler} -> {raw}"
+	);
+}
+
 fn rust_files(root: &Path) -> Vec<std::path::PathBuf> {
 	let mut pending = vec![root.to_path_buf()];
 	let mut files = Vec::new();
@@ -556,7 +596,7 @@ fn product_0092_heatmap_surface_keeps_one_explicit_three_role_pipeline() {
 	assert!(spec.contains("attribution: FieldAttribution::Channel(Channel::Color)"));
 	assert!(request.contains("if let Some(mark_fields) = spec.mark_fields()"));
 	assert!(request.contains("for field in mark_fields.all()"));
-	assert!(presentation.contains("(\"__heatmap\", raw_heatmap as RawFunction)"));
+	assert_registered_handler(&root, "heatmap", "Free", "Heatmap", "raw_heatmap");
 	assert!(presentation.contains("fn raw_heatmap("));
 	assert!(compiler.contains("\"heatmap\","));
 	assert!(compiler.contains("\"heatmap\" => Some(&[3])"));
@@ -1092,9 +1132,15 @@ fn product_0018_rune_surface_keeps_point_size_out_of_prepared_data() {
 	);
 	let presentation = std::fs::read_to_string(source.join("rune_presentation.rs"))
 		.expect("read typed Rune presentation VM");
+	assert_registered_handler(
+		&source,
+		"point_size",
+		"Method",
+		"MarkPointSize",
+		"raw_mark_point_size",
+	);
 	assert!(
-		presentation.contains("(\"__point_size\", raw_mark_point_size as RawFunction)")
-			&& presentation.contains("PointSize::new")
+		presentation.contains("PointSize::new")
 			&& presentation.contains("sink.settings.point_size = Override::Set(value)"),
 		"PRODUCT-0018 must validate the closed Rune spelling through PRODUCT-0017's typed handoff"
 	);
@@ -1125,9 +1171,16 @@ fn product_0020_extends_the_closed_typed_modifier_register() {
 		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rune_presentation.rs"),
 	)
 	.expect("read typed Rune presentation VM");
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	assert_registered_handler(
+		&root,
+		"stroke_width",
+		"Method",
+		"MarkStrokeWidth",
+		"raw_mark_stroke_width",
+	);
 	assert!(
-		presentation.contains("(\"__stroke_width\", raw_mark_stroke_width as RawFunction)")
-			&& presentation.contains("StrokeWidth::new")
+		presentation.contains("StrokeWidth::new")
 			&& presentation.contains("sink.settings.stroke_width = Override::Set(value)"),
 		"PRODUCT-0020 must lower the named modifier through PRODUCT-0019's typed handoff"
 	);
@@ -1183,9 +1236,15 @@ fn product_0022_bar_width_extends_only_the_closed_styled_single_register() {
 		.expect("read transported intent");
 	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
 		.expect("read typed Rune presentation VM");
+	assert_registered_handler(
+		&root,
+		"bar_width",
+		"Method",
+		"MarkBarWidth",
+		"raw_mark_bar_width",
+	);
 	assert!(
 		envelope.contains("pub(crate) struct StyledRunePlotSink")
-			&& presentation.contains("(\"__bar_width\", raw_mark_bar_width as RawFunction)")
 			&& presentation.contains("BarWidth::new")
 			&& presentation.contains("sink.settings.bar_width = Override::Set(value)"),
 		"PRODUCT-0022 must use the general styled-single carrier and typed substrate"
@@ -1201,9 +1260,15 @@ fn product_0053_category_gap_stays_in_the_closed_bar_register() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
 		.expect("read typed Rune presentation VM");
+	assert_registered_handler(
+		&root,
+		"category_gap",
+		"Method",
+		"MarkCategoryGap",
+		"raw_mark_category_gap",
+	);
 	assert!(
-		presentation.contains("(\"__category_gap\", raw_mark_category_gap as RawFunction)")
-			&& presentation.contains("CategoryGap::new")
+		presentation.contains("CategoryGap::new")
 			&& presentation.contains("sink.settings.category_gap = Override::Set(value)"),
 		"PRODUCT-0053 must lower the named modifier through the closed typed bar register"
 	);
@@ -1362,7 +1427,7 @@ fn product_0025_theme_projection_and_table_register_keep_their_authority_boundar
 	assert!(envelope_production.contains("pub(crate) enum RuneTableSkinIntent"));
 	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
 		.expect("read typed presentation VM");
-	assert!(presentation.contains("(\"__skin\", raw_table_skin as RawFunction)"));
+	assert_registered_handler(&root, "skin", "Method", "TableSkin", "raw_table_skin");
 	assert!(presentation.contains("table.skin_name = Some(name.to_owned())"));
 	assert!(!envelope_production.contains("use crate::gui::table_skin"));
 	assert!(!envelope_production.contains("TableSkin::"));
@@ -1483,21 +1548,30 @@ fn product_0027_surface_keeps_projection_intent_bounded_and_plot_registers_close
 	));
 	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
 		.expect("read typed presentation VM");
-	assert!(presentation.contains("(\"__duotone\", raw_table_duotone as RawFunction)"));
+	assert_registered_handler(
+		&root,
+		"duotone",
+		"Method",
+		"TableDuotone",
+		"raw_table_duotone",
+	);
 	assert!(presentation.contains("\"duotone() takes no arguments\""));
 	assert!(presentation.contains("if table.duotone && table.skin_name.is_none()"));
 	assert!(presentation.contains("\"duotone() requires skin(string)\""));
 	assert!(presentation.contains(".build_associated::<RuneTable>()"));
 	assert!(presentation.contains(".build_associated::<RuneMark>()"));
-	let mark_register = presentation
-		.split("for (name, function) in [\n\t\t(\"__point_size\"")
-		.nth(1)
-		.expect("typed mark register")
-		.split(".build_associated::<RuneMark>()")
-		.next()
-		.expect("bounded typed mark register");
-	assert!(!mark_register.contains("raw_table_skin"));
-	assert!(!mark_register.contains("raw_table_duotone"));
+	let registry = presentation_registry(&root);
+	assert!(
+		registry_callable(&registry, "point_size", "Method", "MarkPointSize")
+			.expect("point-size registry entry")
+			.contains("MARK")
+	);
+	for (name, handler) in [("skin", "TableSkin"), ("duotone", "TableDuotone")] {
+		let callable =
+			registry_callable(&registry, name, "Method", handler).expect("table registry entry");
+		assert!(callable.contains("TABLE_ROUTE"));
+		assert!(!callable.contains("MARK,"));
+	}
 
 	let state = std::fs::read_to_string(root.join("gui/state.rs")).expect("read GUI state");
 	let state_production = state
@@ -1572,15 +1646,13 @@ fn product_0036_numeric_bounds_have_one_figure_producer_and_no_magnitude_gate() 
 			"numeric bounds acquired a magnitude admission rule through {forbidden}"
 		);
 	}
-	let mark_register = production
-		.split("for (name, function) in [\n\t\t(\"__point_size\"")
-		.nth(1)
-		.expect("typed mark register")
-		.split(".build_associated::<RuneMark>()")
-		.next()
-		.expect("bounded typed mark register");
-	assert!(!mark_register.contains("x_bounds"));
-	assert!(!mark_register.contains("y_bounds"));
+	let registry = presentation_registry(&root);
+	let bounds_callable = registry_callable(&registry, "bounds", "Method", "AxisBounds")
+		.expect("axis bounds registry entry");
+	assert!(bounds_callable.contains("FIGURE_AND_SKIN"));
+	assert!(!bounds_callable.contains("MARK,"));
+	assert!(!registry_has(&registry, "x_bounds", "Free"));
+	assert!(!registry_has(&registry, "y_bounds", "Free"));
 
 	let state = std::fs::read_to_string(root.join("gui/state.rs")).expect("read GUI state");
 	let state_production = state
@@ -1902,15 +1974,13 @@ fn product_0030_surface_default_and_continuation_stay_at_the_rune_head_boundary(
 			"Rune normal form acquired resolved/head state through {forbidden}"
 		);
 	}
-	let mark_register = presentation
-		.split("for (name, function) in [\n\t\t(\"__point_size\"")
-		.nth(1)
-		.expect("typed mark register")
-		.split(".build_associated::<RuneMark>()")
-		.next()
-		.expect("bounded typed mark register");
-	assert!(!mark_register.contains("\"palette\""));
-	assert!(!mark_register.contains("\"skin\""));
+	let registry = presentation_registry(&root);
+	for (name, handler) in [("palette", "Palette"), ("skin", "Skin")] {
+		let callable = registry_callable(&registry, name, "Free", handler)
+			.expect("figure-setting registry entry");
+		assert!(callable.contains("FREE"));
+		assert!(!callable.contains("MARK,"));
+	}
 
 	let theme = std::fs::read_to_string(root.join("plot/theme.rs")).expect("read plot settings");
 	assert!(theme.contains("DEFAULT_CATEGORICAL_PALETTE: &'static str = \"viridis\""));
@@ -1945,7 +2015,9 @@ fn product_0030_surface_default_and_continuation_stay_at_the_rune_head_boundary(
 	let stale_check = ready
 		.find("rune_buffer_revisions.get(&source_buffer) != Some(&revision)")
 		.expect("stale check");
-	let content = ready.find("set_rune_view_plot(").expect("content install");
+	let content = ready
+		.find("set_rune_view_plot_with_source(")
+		.expect("content install with presentation source facts");
 	let continuation = ready
 		.find("rune_categorical_identities.insert(")
 		.expect("continuation commit");
@@ -2714,6 +2786,41 @@ fn product_0076_presentation_has_one_typed_semantic_authority() {
 }
 
 #[test]
+fn product_0141_registry_is_the_only_surface_inventory_and_the_inspector_is_read_only() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let registry = presentation_registry(&root);
+	let compiler = std::fs::read_to_string(root.join("rune_view_compiler.rs"))
+		.expect("read presentation compiler");
+	let evaluator = std::fs::read_to_string(root.join("rune_presentation.rs"))
+		.expect("read presentation evaluator");
+	let inspector = std::fs::read_to_string(root.join("gui/plot_pane/view.rs"))
+		.expect("read settings inspector");
+
+	for fact in [
+		"pub(crate) struct CallableSpec",
+		"registration_routes:",
+		"accepted_receivers:",
+		"pub(crate) struct SettingSpec",
+		"pub(crate) enum SettingKey",
+		"pub(crate) struct PresentationSourceModel",
+	] {
+		assert!(registry.contains(fact), "registry is missing {fact}");
+	}
+	assert!(!compiler.contains("const PRESENTATION_FREE"));
+	assert!(!compiler.contains("const PRESENTATION_METHODS"));
+	assert!(compiler.contains("presentation_registry::is_presentation_callable"));
+	assert!(evaluator.contains("for callable in CALLABLES"));
+	assert!(evaluator.contains("fn raw_handler(handler: HandlerId)"));
+	assert!(inspector.contains("inspector_rows("));
+	for forbidden in ["ApplyDocumentEdits", "WritebackSpec", "ReplaceDocument"] {
+		assert!(
+			!registry.contains(forbidden) && !inspector.contains(forbidden),
+			"ADR 0142 writeback authority leaked into ADR 0141 through {forbidden}"
+		);
+	}
+}
+
+#[test]
 fn product_0076_showcase_and_seed_are_repository_owned() {
 	let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let compiler = std::fs::read_to_string(crate_root.join("src/rune_view_compiler.rs"))
@@ -2996,21 +3103,11 @@ fn product_0085_keeps_one_semantic_axis_title_derivation_authority() {
 		);
 	}
 
-	let compiler =
-		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
 	let presentation =
 		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation VM");
-	for axis in ["x_axis", "y_axis"] {
-		assert!(
-			compiler.contains(&format!("\"{axis}\",")),
-			"PRODUCT-0085 {axis} must participate in presentation partitioning"
-		);
-		assert!(
-			presentation.contains(&format!("\"__{axis}\"")),
-			"PRODUCT-0085 {axis} must be registered in the local Rune VM"
-		);
-	}
-	assert!(compiler.contains("\"label\""));
+	assert_registered_handler(&root, "x_axis", "Free", "XAxis", "raw_x_axis");
+	assert_registered_handler(&root, "y_axis", "Free", "YAxis", "raw_y_axis");
+	assert_registered_handler(&root, "label", "Method", "AxisLabel", "raw_axis_label");
 	assert!(presentation.contains("raw_axis_label"));
 }
 
@@ -3177,7 +3274,7 @@ fn product_0094_mark_field_transport_is_exhaustive_coupled_and_identity_neutral(
 		assert!(!observations.contains(duplicate));
 	}
 	assert_eq!(presentation.matches("SpannedMarkFields::Bubble").count(), 1);
-	assert!(presentation.contains("(\"__bubble\", raw_bubble as RawFunction)"));
+	assert_registered_handler(&root, "bubble", "Free", "Bubble", "raw_bubble");
 	assert!(factory.contains("let fields = crate::plot::spec::BoxPlotFields {"));
 }
 
@@ -3192,8 +3289,6 @@ fn product_0095_bubble_surface_keeps_roles_projection_and_kernel_boundaries_stru
 	let request = std::fs::read_to_string(root.join("plot/request.rs")).expect("read request");
 	let presentation =
 		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation");
-	let compiler =
-		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
 
 	let raw_bubble = presentation
 		.split("fn raw_bubble(")
@@ -3202,8 +3297,7 @@ fn product_0095_bubble_surface_keeps_roles_projection_and_kernel_boundaries_stru
 		.split("\nfn ")
 		.next()
 		.expect("bounded bubble Rune constructor");
-	assert!(presentation.contains("(\"__bubble\", raw_bubble as RawFunction)"));
-	assert!(compiler.contains("\"bubble\""));
+	assert_registered_handler(&root, "bubble", "Free", "Bubble", "raw_bubble");
 	assert!(!raw_bubble.contains("OptionalAuthoredChannel::Auto"));
 	assert!(raw_bubble.contains("SpannedMarkFields::Bubble"));
 
@@ -3315,7 +3409,7 @@ fn product_0098_funnel_surface_has_one_durable_assignment_and_transport_path() {
 	assert!(!projection.contains("MarkFields::Funnel"));
 	assert!(!projection.contains("funnel_fields"));
 
-	assert!(presentation.contains("(\"__funnel\", raw_funnel as RawFunction)"));
+	assert_registered_handler(&root, "funnel", "Free", "Funnel", "raw_funnel");
 	assert_eq!(presentation.matches("SpannedMarkFields::Funnel").count(), 1);
 	assert!(compiler.contains("\"funnel\" => Some(&[2])"));
 	assert!(envelope.contains("Self::Funnel { fields, origins }"));
@@ -3349,8 +3443,6 @@ fn product_0091_continuous_authoring_has_only_the_two_recorded_origins_and_no_st
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let presentation =
 		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read Rune presentation");
-	let compiler =
-		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
 	let theme = std::fs::read_to_string(root.join("plot/theme.rs")).expect("read plot theme");
 	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
 	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
@@ -3359,26 +3451,42 @@ fn product_0091_continuous_authoring_has_only_the_two_recorded_origins_and_no_st
 		.split("#[cfg(test)]\nmod tests")
 		.next()
 		.expect("production presentation region");
-	let compiler_surface = compiler
-		.split("enum RelationRoot")
-		.next()
-		.expect("presentation vocabulary region");
-
-	for spelling in [
-		"__sequential_palette",
-		"__diverging_palette",
-		"__diverging",
-		"__diverging_at",
-	] {
-		assert!(production.contains(spelling), "missing {spelling}");
-	}
+	assert_registered_handler(
+		&root,
+		"sequential_palette",
+		"Free",
+		"SequentialPalette",
+		"raw_sequential_palette",
+	);
+	assert_registered_handler(
+		&root,
+		"diverging_palette",
+		"Free",
+		"DivergingPalette",
+		"raw_diverging_palette",
+	);
+	assert_registered_handler(
+		&root,
+		"diverging",
+		"Method",
+		"MarkDiverging",
+		"raw_mark_diverging",
+	);
+	assert_registered_handler(
+		&root,
+		"diverging_at",
+		"Method",
+		"MarkDivergingAt",
+		"raw_mark_diverging_at",
+	);
 	assert_eq!(production.matches("ColorJob::Diverging").count(), 1);
 	assert_eq!(production.matches("ContinuousAnchor::Authored").count(), 1);
 	assert!(!production.contains("FieldAttribution::Role(\"anchor\")"));
-	assert!(!compiler_surface.contains("status_palette"));
+	let registry = presentation_registry(&root);
+	assert!(!registry.contains("status_palette"));
 	assert!(!production.contains("status_palette"));
-	assert!(compiler_surface.contains("\"diverging\""));
-	assert!(compiler_surface.contains("\"diverging_at\""));
+	assert!(registry_has(&registry, "diverging", "Method"));
+	assert!(registry_has(&registry, "diverging_at", "Method"));
 
 	assert!(theme.contains("pub sequential_ramp: Override<ColorTheme>"));
 	assert!(theme.contains("pub diverging_ramp: Override<ColorTheme>"));
@@ -3614,7 +3722,13 @@ fn product_0100_radial_dial_surface_reuses_transport_identity_and_one_colour_aut
 	assert!(factory.contains("category_colors: spec"));
 	assert!(!readings.contains("All Data"));
 
-	assert!(presentation.contains("(\"__radial_dial\", raw_radial_dial as RawFunction)"));
+	assert_registered_handler(
+		&root,
+		"radial_dial",
+		"Free",
+		"RadialDial",
+		"raw_radial_dial",
+	);
 	assert_eq!(
 		presentation
 			.matches("SpannedMarkFields::RadialDial")
@@ -3834,7 +3948,7 @@ fn product_0103_pie_surface_reuses_transport_and_has_one_colour_and_guide_author
 	assert!(!production.contains("apply_policy("));
 	assert!(factory.contains("category_colors: spec"));
 
-	assert!(presentation.contains("(\"__pie\", raw_pie as RawFunction)"));
+	assert_registered_handler(&root, "pie", "Free", "Pie", "raw_pie");
 	assert_eq!(presentation.matches("SpannedMarkFields::Pie").count(), 1);
 	assert!(compiler.contains("\"pie\" => Some(&[2])"));
 	assert!(envelope.contains("Self::Pie { fields, origins }"));
@@ -3851,8 +3965,6 @@ fn product_0108_violin_surface_consumes_one_relation_side_density_authority() {
 		std::fs::read_to_string(root.join("plot/kernels/violin.rs")).expect("read violin kernel");
 	let density = std::fs::read_to_string(root.join("plot/kernels/violin_density.rs"))
 		.expect("read violin density substrate");
-	let presentation =
-		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation");
 	let compiler =
 		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
 	let envelope =
@@ -3865,7 +3977,7 @@ fn product_0108_violin_surface_consumes_one_relation_side_density_authority() {
 	assert!(spec.contains("violin cannot be resolved from a schema"));
 	assert!(spec.contains("kernel_density(...) joined to grouped approx_quantile(...)"));
 	assert!(spec.contains("a text or boolean (Nominal) dtype"));
-	assert!(presentation.contains("(\"__violin\", raw_violin as RawFunction)"));
+	assert_registered_handler(&root, "violin", "Free", "Violin", "raw_violin");
 	assert!(compiler.contains("\"violin\" => Some(&[4])"));
 	assert!(envelope.contains("Self::Violin { fields, origins }"));
 	assert!(host.contains("fn violin_failure_span("));
@@ -3995,9 +4107,15 @@ fn product_0105_variadic_multivariate_surface_has_one_transport_admission_and_co
 	assert!(rows.contains("use crate::plot::spec::MultivariateFields;"));
 	assert!(!rows.contains("pub struct MultivariateFields"));
 
-	assert!(presentation.contains("(\"__radar\", raw_radar as RawFunction)"));
-	assert!(presentation.contains("(\"__parallel\", raw_parallel as RawFunction)"));
-	assert!(presentation.contains("(\"__category\", raw_mark_category as RawFunction)"));
+	assert_registered_handler(&root, "radar", "Free", "Radar", "raw_radar");
+	assert_registered_handler(&root, "parallel", "Free", "Parallel", "raw_parallel");
+	assert_registered_handler(
+		&root,
+		"category",
+		"Method",
+		"MarkCategory",
+		"raw_mark_category",
+	);
 	assert!(presentation.contains("(values.len() - 2) % 3 != 0"));
 	assert!(presentation.contains("(3n + 2 values)"));
 	assert!(presentation.contains("validate_multivariate_dimension_count(field_count)"));
@@ -4281,16 +4399,10 @@ fn product_0112_hover_typography_stays_typed_and_off_canvas() {
 		.expect("production plot-pane view section");
 	assert!(production_view.contains("text(info).size(hover_text_pixels(&state.plot_settings))"));
 
-	let compiler =
-		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read view compiler");
-	let free = compiler
-		.split("const PRESENTATION_FREE")
-		.nth(1)
-		.and_then(|rest| rest.split("];\n").next())
-		.expect("presentation free vocabulary");
-	assert!(free.contains("\"hover_size\""));
+	let registry = presentation_registry(&root);
+	assert!(registry_has(&registry, "hover_size", "Free"));
 	assert!(
-		!free.contains("\"font_size\""),
+		!registry_has(&registry, "font_size", "Free"),
 		"hover_size remains the standalone spelling because hover has no receiver"
 	);
 
@@ -4355,33 +4467,22 @@ fn product_0122_axis_and_tick_typography_is_typed_partial_and_keeps_legend_block
 	assert!(!backend.contains("TextSize"));
 	assert!(!backend.contains("text_extent"));
 
-	let compiler =
-		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read view compiler");
-	let methods = compiler
-		.split("const PRESENTATION_METHODS")
-		.nth(1)
-		.and_then(|rest| rest.split("];\n").next())
-		.expect("presentation method vocabulary");
-	assert!(methods.contains("\"font_size\""));
-	let free = compiler
-		.split("const PRESENTATION_FREE")
-		.nth(1)
-		.and_then(|rest| rest.split("];\n").next())
-		.expect("presentation free vocabulary");
+	let registry = presentation_registry(&root);
+	assert!(registry_has(&registry, "font_size", "Method"));
 	for blocked in ["font_size", "legend_size"] {
 		assert!(
-			!free.contains(&format!("\"{blocked}\"")),
+			!registry_has(&registry, blocked, "Free"),
 			"{blocked} is not a new top-level spelling"
 		);
 	}
 	for member in ["x_axis", "y_axis"] {
-		assert!(free.contains(&format!("\"{member}\"")));
+		assert!(registry_has(&registry, member, "Free"));
 	}
 	for modifier in ["label", "label_size", "tick_size"] {
-		assert!(methods.contains(&format!("\"{modifier}\"")));
+		assert!(registry_has(&registry, modifier, "Method"));
 	}
 	for retired in ["x_tick_size", "y_tick_size", "x_label", "y_label"] {
-		assert!(!free.contains(&format!("\"{retired}\"")));
+		assert!(!registry_has(&registry, retired, "Free"));
 	}
 
 	let presentation =
@@ -4429,20 +4530,9 @@ fn product_0124_facet_label_typography_is_typed_member_owned_and_independent_fro
 			.contains("label_size(...) requires an x_axis(), y_axis(), or facet(...) receiver")
 	);
 
-	let compiler =
-		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read view compiler");
-	let free = compiler
-		.split("const PRESENTATION_FREE")
-		.nth(1)
-		.and_then(|rest| rest.split("];\\n").next())
-		.expect("presentation free vocabulary");
-	assert!(!free.contains("\"facet_label_size\""));
-	let methods = compiler
-		.split("const PRESENTATION_METHODS")
-		.nth(1)
-		.and_then(|rest| rest.split("];\\n").next())
-		.expect("presentation method vocabulary");
-	assert!(methods.contains("\"label_size\""));
+	let registry = presentation_registry(&root);
+	assert!(!registry_has(&registry, "facet_label_size", "Free"));
+	assert!(registry_has(&registry, "label_size", "Method"));
 }
 
 #[test]
@@ -4471,24 +4561,13 @@ fn product_0125_legend_member_owns_typed_legend_text_without_measurement() {
 		.expect("bounded plot backend contract");
 	assert!(!backend.contains("text_extent"));
 
-	let compiler =
-		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read view compiler");
-	let free = compiler
-		.split("const PRESENTATION_FREE")
-		.nth(1)
-		.and_then(|rest| rest.split("];\n").next())
-		.expect("presentation free vocabulary");
-	assert!(free.contains("\"legend\""));
+	let registry = presentation_registry(&root);
+	assert!(registry_has(&registry, "legend", "Free"));
 	for retired in ["legend_at", "hide_legend"] {
-		assert!(!free.contains(&format!("\"{retired}\"")));
+		assert!(!registry_has(&registry, retired, "Free"));
 	}
-	let methods = compiler
-		.split("const PRESENTATION_METHODS")
-		.nth(1)
-		.and_then(|rest| rest.split("];\n").next())
-		.expect("presentation method vocabulary");
 	for method in ["at", "hide", "font_size"] {
-		assert!(methods.contains(&format!("\"{method}\"")));
+		assert!(registry_has(&registry, method, "Method"));
 	}
 
 	let presentation =
@@ -4504,20 +4583,9 @@ fn product_0125_legend_member_owns_typed_legend_text_without_measurement() {
 #[test]
 fn product_0123_axis_members_are_the_only_axis_surface_and_merge_fieldwise() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-	let compiler =
-		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read view compiler");
-	let free = compiler
-		.split("const PRESENTATION_FREE")
-		.nth(1)
-		.and_then(|rest| rest.split("];\n").next())
-		.expect("presentation free vocabulary");
-	let methods = compiler
-		.split("const PRESENTATION_METHODS")
-		.nth(1)
-		.and_then(|rest| rest.split("];\n").next())
-		.expect("presentation method vocabulary");
+	let registry = presentation_registry(&root);
 	for member in ["x_axis", "y_axis"] {
-		assert!(free.contains(&format!("\"{member}\"")));
+		assert!(registry_has(&registry, member, "Free"));
 	}
 	for modifier in [
 		"label",
@@ -4528,7 +4596,7 @@ fn product_0123_axis_members_are_the_only_axis_surface_and_merge_fieldwise() {
 		"tick_size",
 		"tick_rotation",
 	] {
-		assert!(methods.contains(&format!("\"{modifier}\"")));
+		assert!(registry_has(&registry, modifier, "Method"));
 	}
 	for retired in [
 		"x_bounds",
@@ -4544,7 +4612,7 @@ fn product_0123_axis_members_are_the_only_axis_surface_and_merge_fieldwise() {
 		"y_tick_size",
 	] {
 		assert!(
-			!free.contains(&format!("\"{retired}\"")),
+			!registry_has(&registry, retired, "Free"),
 			"retired axis spelling remains in the free vocabulary: {retired}"
 		);
 	}
@@ -4895,23 +4963,12 @@ fn product_0115_rotation_is_typed_and_axis_overlays_share_one_policy() {
 	assert!(!backend.contains("measure_text"));
 	assert!(!backend.contains("text_extent"));
 
-	let compiler =
-		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
-	let free = compiler
-		.split("const PRESENTATION_FREE")
-		.nth(1)
-		.and_then(|rest| rest.split("];\n").next())
-		.expect("presentation free vocabulary");
-	assert!(free.contains("\"x_axis\""));
-	let methods = compiler
-		.split("const PRESENTATION_METHODS")
-		.nth(1)
-		.and_then(|rest| rest.split("];\n").next())
-		.expect("presentation method vocabulary");
-	assert!(methods.contains("\"tick_rotation\""));
-	assert!(!free.contains("\"x_tick_rotation\""));
-	assert!(!free.contains("\"x_label_rotation\""));
-	assert!(!free.contains("\"y_tick_rotation\""));
+	let registry = presentation_registry(&root);
+	assert!(registry_has(&registry, "x_axis", "Free"));
+	assert!(registry_has(&registry, "tick_rotation", "Method"));
+	assert!(!registry_has(&registry, "x_tick_rotation", "Free"));
+	assert!(!registry_has(&registry, "x_label_rotation", "Free"));
+	assert!(!registry_has(&registry, "y_tick_rotation", "Free"));
 }
 
 #[test]

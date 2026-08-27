@@ -476,6 +476,7 @@ mod tests {
 			status_message: None,
 			document_text: None,
 			document_text_buffer_id: None,
+			document_text_state_id: None,
 			dividers: Vec::new(),
 			busy: false,
 			should_quit: false,

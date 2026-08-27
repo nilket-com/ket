@@ -89,6 +89,11 @@ struct AppState {
 	result_registry: ResultRegistry,
 	rune_buffer_revisions: HashMap<BufferId, u64>,
 	#[cfg(feature = "toron")]
+	rune_document_generations: HashMap<(BufferId, u64), libaryon::core::StateId>,
+	#[cfg(feature = "toron")]
+	rune_presentation_models:
+		HashMap<(BufferId, u64), Arc<crate::presentation_registry::PresentationSourceModel>>,
+	#[cfg(feature = "toron")]
 	rune_view_scheduler: RuneViewScheduler,
 	/// Session-local categorical continuation keyed by producer, semantic view,
 	/// and the natural length of the selected ordered palette.
@@ -592,6 +597,10 @@ fn new_with_authority(
 		result_registry: ResultRegistry::default(),
 		rune_buffer_revisions: HashMap::new(),
 		#[cfg(feature = "toron")]
+		rune_document_generations: HashMap::new(),
+		#[cfg(feature = "toron")]
+		rune_presentation_models: HashMap::new(),
+		#[cfg(feature = "toron")]
 		rune_view_scheduler: RuneViewScheduler::default(),
 		#[cfg(feature = "toron")]
 		rune_categorical_identities: HashMap::new(),
@@ -908,10 +917,11 @@ fn run_language_code(
 	language_id: libaryon::engine::LanguageId,
 	code: String,
 	annotation_source: &str,
+	document_generation: libaryon::core::StateId,
 ) -> Task<Message> {
 	match language_id.as_str() {
 		"sql" => run_code(app_state, source_buffer, code, annotation_source),
-		"rune" => run_rune_code(app_state, source_buffer, code),
+		"rune" => run_rune_code_at_generation(app_state, source_buffer, code, document_generation),
 		language => {
 			app_state.status_msg = format!("No executor is registered for language: {language}");
 			Task::none()
@@ -919,7 +929,22 @@ fn run_language_code(
 	}
 }
 
+#[cfg(test)]
 fn run_rune_code(app_state: &mut AppState, source_buffer: BufferId, code: String) -> Task<Message> {
+	run_rune_code_at_generation(
+		app_state,
+		source_buffer,
+		code,
+		libaryon::core::StateId::ZERO,
+	)
+}
+
+fn run_rune_code_at_generation(
+	app_state: &mut AppState,
+	source_buffer: BufferId,
+	code: String,
+	document_generation: libaryon::core::StateId,
+) -> Task<Message> {
 	if code.trim().is_empty() {
 		app_state.status_msg = "Nothing to run in the current Rune buffer.".into();
 		return Task::none();
@@ -931,6 +956,12 @@ fn run_rune_code(app_state: &mut AppState, source_buffer: BufferId, code: String
 		.or_insert(1);
 	#[cfg(feature = "toron")]
 	{
+		app_state
+			.rune_document_generations
+			.retain(|(buffer, candidate), _| *buffer != source_buffer || *candidate >= revision);
+		app_state
+			.rune_document_generations
+			.insert((source_buffer, revision), document_generation);
 		let work = PendingRunePresentation::new(source_buffer, revision, code);
 		let Some(work) = app_state.rune_view_scheduler.submit_presentation(work) else {
 			app_state.status_msg = "Rune presentation queued newest revision…".into();
@@ -1070,6 +1101,13 @@ fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> 
 		view,
 	} = work;
 	let relation_count = view.relation_count();
+	app_state
+		.rune_presentation_models
+		.retain(|(buffer, candidate), _| *buffer != source_buffer || *candidate >= revision);
+	app_state.rune_presentation_models.insert(
+		(source_buffer, revision),
+		Arc::new(view.presentation_source_model.clone()),
+	);
 	app_state.status_msg = format!(
 		"Rune workspace running {relation_count} independent quer{}…",
 		if relation_count == 1 { "y" } else { "ies" }
@@ -2757,6 +2795,7 @@ fn finish_pending_runs(app_state: &mut AppState) -> Task<Message> {
 			pending.language_id,
 			code,
 			&snapshot.text,
+			snapshot.state_id,
 		));
 	}
 	Task::batch(tasks)
@@ -4009,11 +4048,34 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
 				return Task::none();
 			}
-			app_state.code_editor.set_rune_view_plot(
+			let source_attachment = app_state
+				.rune_presentation_models
+				.get(&(source_buffer, revision))
+				.cloned()
+				.zip(
+					app_state
+						.rune_document_generations
+						.get(&(source_buffer, revision))
+						.copied(),
+				)
+				.map(|(model, document_generation)| {
+					crate::presentation_registry::PlotSourceAttachment {
+						identity: identity.clone(),
+						source: crate::presentation_registry::StampedPresentationSourceModel {
+							buffer_id: source_buffer,
+							document_generation,
+							model,
+						},
+					}
+				});
+			let plot_type = Some(resolved.resolved_spec.composition.primary_plot_type());
+			app_state.code_editor.set_rune_view_plot_with_source(
 				panel_id,
 				presentation.display_label,
 				kernel,
 				authored_settings,
+				source_attachment,
+				plot_type,
 			);
 			app_state.rune_categorical_identities.insert(
 				(source_buffer, identity, continuation.palette_len),

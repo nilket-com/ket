@@ -20,6 +20,7 @@ use crate::plot::spec::{
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
 };
+use crate::presentation_registry::{CALLABLES, HandlerId, RegistrationRoute};
 use crate::rune_relation_envelope::{
 	BoxPlotFieldOrigins, BubbleFieldOrigins, DisposableRunePlotSink, FunnelFieldOrigins,
 	HeatmapFieldOrigins, MultivariateFieldOrigins, PieFieldOrigins, RadialDialFieldOrigins,
@@ -532,108 +533,32 @@ fn build_context() -> Result<Context, String> {
 	module.ty::<RuneTable>().map_err(module_error)?;
 	module.ty::<RunePresentation>().map_err(module_error)?;
 
-	for (name, function) in [
-		("__bar", raw_bar as RawFunction),
-		("__line", raw_line as RawFunction),
-		("__scatter", raw_scatter as RawFunction),
-		("__area", raw_area as RawFunction),
-		("__histogram", raw_histogram as RawFunction),
-		("__box", raw_box as RawFunction),
-		("__bubble", raw_bubble as RawFunction),
-		("__heatmap", raw_heatmap as RawFunction),
-		("__funnel", raw_funnel as RawFunction),
-		("__radial_dial", raw_radial_dial as RawFunction),
-		("__pie", raw_pie as RawFunction),
-		("__violin", raw_violin as RawFunction),
-		("__radar", raw_radar as RawFunction),
-		("__parallel", raw_parallel as RawFunction),
-		("__title", raw_title as RawFunction),
-		("__subtitle", raw_subtitle as RawFunction),
-		("__x_axis", raw_x_axis as RawFunction),
-		("__y_axis", raw_y_axis as RawFunction),
-		("__facet", raw_facet as RawFunction),
-		("__palette", raw_palette as RawFunction),
-		(
-			"__sequential_palette",
-			raw_sequential_palette as RawFunction,
-		),
-		("__diverging_palette", raw_diverging_palette as RawFunction),
-		("__skin", raw_skin as RawFunction),
-		("__legend", raw_legend as RawFunction),
-		("__hover_size", raw_hover_size as RawFunction),
-		("__padding", raw_padding as RawFunction),
-		("__table", raw_table as RawFunction),
-		("__layers", raw_layers as RawFunction),
-		("__figure", raw_figure as RawFunction),
-	] {
-		module
-			.raw_function(name, function)
-			.build()
-			.map_err(module_error)?;
-	}
-	module
-		.raw_function("__font_size", raw_figure_font_size as RawFunction)
-		.build_associated::<RuneFigureElement>()
-		.map_err(module_error)?;
-	module
-		.raw_function("__font_size", raw_figure_font_size as RawFunction)
-		.build_associated::<RuneSkin>()
-		.map_err(module_error)?;
-	for (name, function) in [
-		("__gutter", raw_figure_facet_gutter as RawFunction),
-		("__top", raw_figure_padding_top as RawFunction),
-		("__right", raw_figure_padding_right as RawFunction),
-		("__bottom", raw_figure_padding_bottom as RawFunction),
-		("__left", raw_figure_padding_left as RawFunction),
-		("__label", raw_axis_label as RawFunction),
-		("__label_size", raw_figure_label_size as RawFunction),
-		("__bounds", raw_axis_bounds as RawFunction),
-		("__tick_step", raw_axis_tick_step as RawFunction),
-		("__tick_every", raw_axis_tick_every as RawFunction),
-		("__minor_ticks", raw_axis_minor_ticks as RawFunction),
-		("__tick_size", raw_axis_tick_size as RawFunction),
-		("__tick_rotation", raw_axis_tick_rotation as RawFunction),
-		("__at", raw_legend_at as RawFunction),
-		("__hide", raw_legend_hide as RawFunction),
-	] {
-		module
-			.raw_function(name, function)
-			.build_associated::<RuneFigureElement>()
-			.map_err(module_error)?;
-		module
-			.raw_function(name, function)
-			.build_associated::<RuneSkin>()
-			.map_err(module_error)?;
-	}
-	for (name, function) in [
-		("__point_size", raw_mark_point_size as RawFunction),
-		("__stroke_width", raw_mark_stroke_width as RawFunction),
-		("__bar_width", raw_mark_bar_width as RawFunction),
-		("__category_gap", raw_mark_category_gap as RawFunction),
-		("__category", raw_mark_category as RawFunction),
-		("__stacked", raw_mark_stacked as RawFunction),
-		("__percent", raw_mark_percent as RawFunction),
-		("__diverging", raw_mark_diverging as RawFunction),
-		("__diverging_at", raw_mark_diverging_at as RawFunction),
-	] {
-		module
-			.raw_function(name, function)
-			.build_associated::<RuneMark>()
-			.map_err(module_error)?;
-	}
-	module
-		.raw_function("__duotone", raw_skin_duotone as RawFunction)
-		.build_associated::<RuneSkin>()
-		.map_err(module_error)?;
-	for (name, function) in [
-		("__skin", raw_table_skin as RawFunction),
-		("__duotone", raw_table_duotone as RawFunction),
-		("__show_types", raw_table_show_types as RawFunction),
-	] {
-		module
-			.raw_function(name, function)
-			.build_associated::<RuneTable>()
-			.map_err(module_error)?;
+	for callable in CALLABLES {
+		let function = raw_handler(callable.handler);
+		for route in callable.registration_routes {
+			match route {
+				RegistrationRoute::Free => module
+					.raw_function(callable.rune_name, function)
+					.build()
+					.map_err(module_error)?,
+				RegistrationRoute::FigureElement => module
+					.raw_function(callable.rune_name, function)
+					.build_associated::<RuneFigureElement>()
+					.map_err(module_error)?,
+				RegistrationRoute::Skin => module
+					.raw_function(callable.rune_name, function)
+					.build_associated::<RuneSkin>()
+					.map_err(module_error)?,
+				RegistrationRoute::Mark => module
+					.raw_function(callable.rune_name, function)
+					.build_associated::<RuneMark>()
+					.map_err(module_error)?,
+				RegistrationRoute::Table => module
+					.raw_function(callable.rune_name, function)
+					.build_associated::<RuneTable>()
+					.map_err(module_error)?,
+			};
+		}
 	}
 
 	context.install(module).map_err(module_error)?;
@@ -645,6 +570,69 @@ fn module_error(error: impl std::fmt::Display) -> String {
 }
 
 type RawFunction = fn(&mut dyn Memory, InstAddress, usize, Output) -> VmResult<()>;
+
+fn raw_handler(handler: HandlerId) -> RawFunction {
+	match handler {
+		HandlerId::Bar => raw_bar,
+		HandlerId::Line => raw_line,
+		HandlerId::Scatter => raw_scatter,
+		HandlerId::Area => raw_area,
+		HandlerId::Histogram => raw_histogram,
+		HandlerId::Box => raw_box,
+		HandlerId::Bubble => raw_bubble,
+		HandlerId::Heatmap => raw_heatmap,
+		HandlerId::Funnel => raw_funnel,
+		HandlerId::RadialDial => raw_radial_dial,
+		HandlerId::Pie => raw_pie,
+		HandlerId::Violin => raw_violin,
+		HandlerId::Radar => raw_radar,
+		HandlerId::Parallel => raw_parallel,
+		HandlerId::Title => raw_title,
+		HandlerId::Subtitle => raw_subtitle,
+		HandlerId::XAxis => raw_x_axis,
+		HandlerId::YAxis => raw_y_axis,
+		HandlerId::Facet => raw_facet,
+		HandlerId::Palette => raw_palette,
+		HandlerId::SequentialPalette => raw_sequential_palette,
+		HandlerId::DivergingPalette => raw_diverging_palette,
+		HandlerId::Skin => raw_skin,
+		HandlerId::Legend => raw_legend,
+		HandlerId::HoverSize => raw_hover_size,
+		HandlerId::Padding => raw_padding,
+		HandlerId::Table => raw_table,
+		HandlerId::Layers => raw_layers,
+		HandlerId::Figure => raw_figure,
+		HandlerId::FigureFontSize => raw_figure_font_size,
+		HandlerId::FacetGutter => raw_figure_facet_gutter,
+		HandlerId::PaddingTop => raw_figure_padding_top,
+		HandlerId::PaddingRight => raw_figure_padding_right,
+		HandlerId::PaddingBottom => raw_figure_padding_bottom,
+		HandlerId::PaddingLeft => raw_figure_padding_left,
+		HandlerId::AxisLabel => raw_axis_label,
+		HandlerId::FigureLabelSize => raw_figure_label_size,
+		HandlerId::AxisBounds => raw_axis_bounds,
+		HandlerId::AxisTickStep => raw_axis_tick_step,
+		HandlerId::AxisTickEvery => raw_axis_tick_every,
+		HandlerId::AxisMinorTicks => raw_axis_minor_ticks,
+		HandlerId::AxisTickSize => raw_axis_tick_size,
+		HandlerId::AxisTickRotation => raw_axis_tick_rotation,
+		HandlerId::LegendAt => raw_legend_at,
+		HandlerId::LegendHide => raw_legend_hide,
+		HandlerId::MarkPointSize => raw_mark_point_size,
+		HandlerId::MarkStrokeWidth => raw_mark_stroke_width,
+		HandlerId::MarkBarWidth => raw_mark_bar_width,
+		HandlerId::MarkCategoryGap => raw_mark_category_gap,
+		HandlerId::MarkCategory => raw_mark_category,
+		HandlerId::MarkStacked => raw_mark_stacked,
+		HandlerId::MarkPercent => raw_mark_percent,
+		HandlerId::MarkDiverging => raw_mark_diverging,
+		HandlerId::MarkDivergingAt => raw_mark_diverging_at,
+		HandlerId::SkinDuotone => raw_skin_duotone,
+		HandlerId::TableSkin => raw_table_skin,
+		HandlerId::TableDuotone => raw_table_duotone,
+		HandlerId::TableShowTypes => raw_table_show_types,
+	}
+}
 
 fn raw_bar(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) -> VmResult<()> {
 	raw_mark(PlotType::Bar, "bar", stack, addr, args, out)

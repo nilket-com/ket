@@ -1,11 +1,14 @@
 use crate::plot::common::{PlotKernel, ResolvedPlotSettings};
+use crate::plot::core::PlotType;
 use crate::plot::spec::Override;
 use crate::plot::theme::{PlotSettings, PlotSettingsLayer, PlotThemeSpec};
+use crate::presentation_registry::PlotSourceAttachment;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub enum PlotPaneMsg {
 	UpdateHover(Option<String>),
+	ToggleSettingsInspector,
 }
 
 fn default_application_plot_settings() -> PlotSettingsLayer {
@@ -35,6 +38,9 @@ pub struct HostPlotState {
 	pub hovered_info: Option<String>,
 	pub render_revision: u64,
 	pub resize_render_suspended: bool,
+	pub(crate) settings_inspector_open: bool,
+	pub(crate) source_attachment: Option<PlotSourceAttachment>,
+	pub(crate) plot_type: Option<PlotType>,
 }
 
 impl HostPlotState {
@@ -54,7 +60,23 @@ impl HostPlotState {
 			hovered_info: None,
 			render_revision: 0,
 			resize_render_suspended: false,
+			settings_inspector_open: false,
+			source_attachment: None,
+			plot_type: None,
 		}
+	}
+
+	pub(crate) fn new_with_source(
+		display_label: String,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		authored_settings: PlotSettingsLayer,
+		source_attachment: Option<PlotSourceAttachment>,
+		plot_type: Option<PlotType>,
+	) -> Self {
+		let mut state = Self::new(display_label, kernel, authored_settings);
+		state.source_attachment = source_attachment;
+		state.plot_type = plot_type;
+		state
 	}
 
 	pub fn replace(
@@ -70,11 +92,29 @@ impl HostPlotState {
 		self.plot_settings = self.plot_settings_model.resolve();
 		self.hovered_info = None;
 		self.render_revision = self.render_revision.wrapping_add(1);
+		self.source_attachment = None;
+		self.plot_type = None;
+	}
+
+	pub(crate) fn replace_with_source(
+		&mut self,
+		display_label: String,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		authored_settings: PlotSettingsLayer,
+		source_attachment: Option<PlotSourceAttachment>,
+		plot_type: Option<PlotType>,
+	) {
+		self.replace(display_label, kernel, authored_settings);
+		self.source_attachment = source_attachment;
+		self.plot_type = plot_type;
 	}
 
 	pub fn update(&mut self, message: PlotPaneMsg) {
 		match message {
 			PlotPaneMsg::UpdateHover(hover) => self.hovered_info = hover,
+			PlotPaneMsg::ToggleSettingsInspector => {
+				self.settings_inspector_open = !self.settings_inspector_open;
+			}
 		}
 	}
 }

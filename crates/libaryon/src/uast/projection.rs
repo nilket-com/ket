@@ -426,6 +426,8 @@ pub struct Viewport {
 	/// independently of the viewport's current focus because a queued focus
 	/// command may be rendered immediately after the text query.
 	pub document_text_buffer_id: Option<BufferId>,
+	/// Document state read atomically with [`Self::document_text`].
+	pub document_text_state_id: Option<crate::core::StateId>,
 	/// Whether foreground I/O or semantic analysis is still in progress.
 	///
 	/// Frontends can animate this state without asking the engine to render

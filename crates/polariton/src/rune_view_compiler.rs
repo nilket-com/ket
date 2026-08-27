@@ -3,6 +3,11 @@
 //! This module may recognize where relation and presentation syntax meet. It
 //! does not interpret presentation values; those execute in `rune_presentation`.
 
+use crate::presentation_registry::{
+	self, CALLABLES, CallPosition, ContainerKind, ExpressionShape, HandlerId,
+	PresentationSourceModel, PresentationSyntaxBoundary, SemanticReceiver, SettingOccurrence,
+	setting_for_call,
+};
 use crate::rune_presentation::{
 	PresentationLimits, PresentationMapKind, PresentationMapSegment, PresentationSourceMap,
 	execute_generated,
@@ -19,69 +24,6 @@ const WORKSPACE_ENTRYPOINT_PREFIX: &str = "pub fn main(workspace) {\n";
 const KET_ENTRYPOINT_PREFIX: &str = "pub fn main(ket) {\n";
 const ENTRYPOINT_SUFFIX: &str = "\n}\n";
 const PRESENTATION_PREFIX: &str = "polariton_presentation";
-
-const PRESENTATION_FREE: &[&str] = &[
-	"area",
-	"bar",
-	"box",
-	"bubble",
-	"facet",
-	"figure",
-	"funnel",
-	"parallel",
-	"radial_dial",
-	"radar",
-	"pie",
-	"violin",
-	"histogram",
-	"heatmap",
-	"hover_size",
-	"legend",
-	"layers",
-	"line",
-	"palette",
-	"padding",
-	"scatter",
-	"sequential_palette",
-	"skin",
-	"subtitle",
-	"diverging_palette",
-	"table",
-	"title",
-	"x_axis",
-	"y_axis",
-];
-
-const PRESENTATION_METHODS: &[&str] = &[
-	"bar_width",
-	"category",
-	"category_gap",
-	"diverging",
-	"diverging_at",
-	"duotone",
-	"font_size",
-	"at",
-	"hide",
-	"gutter",
-	"percent",
-	"point_size",
-	"top",
-	"right",
-	"bottom",
-	"left",
-	"label",
-	"label_size",
-	"bounds",
-	"tick_step",
-	"tick_every",
-	"minor_ticks",
-	"tick_size",
-	"tick_rotation",
-	"show_types",
-	"skin",
-	"stacked",
-	"stroke_width",
-];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RelationRoot {
@@ -211,6 +153,8 @@ pub(crate) fn compile(source: &str) -> Result<TransformedRuneView, RuneEnvelopeE
 
 	let partition = partition(source, &analysis)?;
 	let ordered_slots = ordered_slots(&analysis);
+	let presentation_source_model =
+		build_presentation_source_model(source, &ordered_slots, &analysis)?;
 	let presentation =
 		render_presentation(source, &ordered_slots, &analysis, &partition.presentation)?;
 	let slot_spans = ordered_slots
@@ -274,7 +218,331 @@ pub(crate) fn compile(source: &str) -> Result<TransformedRuneView, RuneEnvelopeE
 	Ok(TransformedRuneView {
 		executions,
 		presentation_order,
+		presentation_source_model,
 	})
+}
+
+fn slot_identity(slot: &StaticSlot) -> LocalViewIdentity {
+	match &slot.name {
+		Some((name, _)) => LocalViewIdentity::Named(name.clone()),
+		None => LocalViewIdentity::Anonymous(slot.output_order),
+	}
+}
+
+fn build_presentation_source_model(
+	source: &str,
+	slots: &[&StaticSlot],
+	analysis: &StaticAnalysis,
+) -> Result<PresentationSourceModel, RuneEnvelopeError> {
+	let mut model = PresentationSourceModel::default();
+	for slot in slots {
+		let owner = slot_identity(slot);
+		let mut fragments = HashSet::new();
+		for range in slot.expression.dependency_ranges() {
+			collect_dependencies(source, range, &analysis.definitions, &mut fragments)?;
+		}
+		if let StaticPresentationExpr::Copied(span) = &slot.expression {
+			fragments.insert(span.clone());
+		}
+		let mut fragments = fragments.into_iter().collect::<Vec<_>>();
+		fragments.sort_by_key(|span| span.start);
+		for fragment in fragments {
+			scan_source_fragment(source, fragment, &owner, &mut model)?;
+		}
+	}
+	model
+		.occurrences
+		.sort_by_key(|occurrence| occurrence.call_span.start);
+	model
+		.syntax
+		.sort_by_key(|boundary| boundary.call_span.start);
+	Ok(model)
+}
+
+fn scan_source_fragment(
+	source: &str,
+	fragment_span: Range<usize>,
+	owner: &LocalViewIdentity,
+	model: &mut PresentationSourceModel,
+) -> Result<(), RuneEnvelopeError> {
+	let fragment = source.get(fragment_span.clone()).ok_or_else(|| {
+		RuneEnvelopeError::Invalid("presentation source-model fragment is not UTF-8".to_owned())
+	})?;
+	let tokens = lex(fragment, fragment_span.start);
+	let mut receiver_by_close = HashMap::<usize, (SemanticReceiver, usize)>::new();
+	for (index, token) in tokens.iter().enumerate() {
+		let LexKind::Ident(name) = &token.kind else {
+			continue;
+		};
+		if !matches!(
+			tokens.get(index + 1).map(|token| &token.kind),
+			Some(LexKind::Punct('('))
+		) {
+			continue;
+		}
+		let method_chain = index >= 2
+			&& tokens[index - 1].kind == LexKind::Punct('.')
+			&& tokens[index - 2].kind == LexKind::Punct(')');
+		let position = if method_chain {
+			CallPosition::Method
+		} else {
+			CallPosition::Free
+		};
+		if !presentation_registry::is_presentation_callable(name, position) {
+			continue;
+		}
+		let open_index = index + 1;
+		let Some(close_index) = matching_paren(&tokens, open_index) else {
+			return Err(RuneEnvelopeError::Invalid(
+				"presentation source-model call has no matching close parenthesis".to_owned(),
+			));
+		};
+		let inherited = method_chain
+			.then(|| receiver_by_close.get(&(index - 2)).copied())
+			.flatten();
+		let receiver = inherited.map(|(receiver, _)| receiver);
+		let callable = CALLABLES
+			.iter()
+			.filter(|callable| callable.name == name && callable.position == position)
+			.find(|callable| {
+				receiver
+					.map(|receiver| callable.accepted_receivers.contains(&receiver))
+					.unwrap_or(true)
+			})
+			.or_else(|| {
+				CALLABLES
+					.iter()
+					.find(|callable| callable.name == name && callable.position == position)
+			})
+			.expect("recognition comes from CALLABLES");
+		let produced_receiver = receiver.or_else(|| produced_receiver(callable.handler));
+		let call_start = if method_chain {
+			tokens[index - 1].span.start
+		} else {
+			token.span.start
+		};
+		let chain_start = inherited
+			.map(|(_, chain_start)| chain_start)
+			.unwrap_or(call_start);
+		if let Some(receiver) = produced_receiver {
+			receiver_by_close.insert(close_index, (receiver, chain_start));
+		}
+		let arguments = call_argument_ranges(
+			fragment,
+			fragment_span.start,
+			&tokens,
+			open_index,
+			close_index,
+		)?;
+		let call_span = u32_range(&(call_start..tokens[close_index].span.end), "call")?;
+		let argument_spans = arguments
+			.iter()
+			.map(|argument| u32_range(argument, "call argument"))
+			.collect::<Result<Vec<_>, _>>()?;
+		let argument_text = arguments
+			.iter()
+			.map(|argument| source.get(argument.clone()).unwrap_or_default().to_owned())
+			.collect::<Vec<_>>();
+		let expression_shape = if arguments
+			.iter()
+			.all(|argument| is_direct_literal(source.get(argument.clone()).unwrap_or_default()))
+		{
+			ExpressionShape::DirectLiteral
+		} else {
+			ExpressionShape::ExpressionOrBinding
+		};
+		if let Some(setting) = setting_for_call(callable.handler, receiver) {
+			if let Some(existing) = model.occurrences.iter_mut().find(|occurrence| {
+				occurrence.key == setting.key && occurrence.call_span == call_span
+			}) {
+				existing.owners.insert(owner.clone());
+			} else {
+				model.occurrences.push(SettingOccurrence {
+					key: setting.key,
+					target: setting.target,
+					call_span: call_span.clone(),
+					argument_spans: argument_spans.clone(),
+					argument_text: argument_text.clone(),
+					expression_shape,
+					owners: HashSet::from([owner.clone()]),
+				});
+			}
+		}
+		let mut separator_ranges = top_level_separators(&tokens, open_index, close_index);
+		if matches!(callable.handler, HandlerId::Figure | HandlerId::Layers)
+			&& let Some(child_list) = arguments.first()
+		{
+			separator_ranges.extend(child_list_separators(&tokens, child_list));
+		}
+		let separators = separator_ranges
+			.into_iter()
+			.map(|span| u32_range(&span, "call separator"))
+			.collect::<Result<Vec<_>, _>>()?;
+		let container = match callable.handler {
+			HandlerId::Figure => arguments
+				.first()
+				.map(|span| (ContainerKind::Figure, span.clone())),
+			HandlerId::Layers => arguments
+				.first()
+				.map(|span| (ContainerKind::Layers, span.clone())),
+			_ => None,
+		}
+		.map(|(kind, span)| Ok((kind, u32_range(&span, "container child list")?)))
+		.transpose()?;
+		if let Some(existing) = model.syntax.iter_mut().find(|boundary| {
+			boundary.handler == callable.handler && boundary.call_span == call_span
+		}) {
+			existing.owners.insert(owner.clone());
+		} else {
+			model.syntax.push(PresentationSyntaxBoundary {
+				handler: callable.handler,
+				call_span,
+				chain_span: u32_range(&(chain_start..tokens[close_index].span.end), "call chain")?,
+				argument_list_span: u32_range(
+					&(tokens[open_index].span.end..tokens[close_index].span.start),
+					"argument list",
+				)?,
+				separators,
+				container,
+				owners: HashSet::from([owner.clone()]),
+			});
+		}
+	}
+	Ok(())
+}
+
+fn produced_receiver(handler: HandlerId) -> Option<SemanticReceiver> {
+	match handler {
+		HandlerId::Title => Some(SemanticReceiver::Title),
+		HandlerId::Subtitle => Some(SemanticReceiver::Subtitle),
+		HandlerId::XAxis => Some(SemanticReceiver::XAxis),
+		HandlerId::YAxis => Some(SemanticReceiver::YAxis),
+		HandlerId::Facet => Some(SemanticReceiver::Facet),
+		HandlerId::Legend => Some(SemanticReceiver::Legend),
+		HandlerId::Padding => Some(SemanticReceiver::Padding),
+		HandlerId::Skin => Some(SemanticReceiver::Skin),
+		HandlerId::Table => Some(SemanticReceiver::Table),
+		HandlerId::Bar
+		| HandlerId::Line
+		| HandlerId::Scatter
+		| HandlerId::Area
+		| HandlerId::Histogram
+		| HandlerId::Box
+		| HandlerId::Bubble
+		| HandlerId::Heatmap
+		| HandlerId::Funnel
+		| HandlerId::RadialDial
+		| HandlerId::Pie
+		| HandlerId::Violin
+		| HandlerId::Radar
+		| HandlerId::Parallel => Some(SemanticReceiver::Mark),
+		_ => None,
+	}
+}
+
+fn is_direct_literal(source: &str) -> bool {
+	let source = source.trim();
+	is_complete_quoted_literal(source)
+		|| matches!(source, "true" | "false")
+		|| is_numeric_literal(source)
+}
+
+fn is_complete_quoted_literal(source: &str) -> bool {
+	let bytes = source.as_bytes();
+	let Some(&quote @ (b'"' | b'\'')) = bytes.first() else {
+		return false;
+	};
+	let mut index = 1;
+	while index < bytes.len() {
+		if bytes[index] == b'\\' {
+			index = index.saturating_add(2);
+		} else if bytes[index] == quote {
+			return index + 1 == bytes.len();
+		} else {
+			index += 1;
+		}
+	}
+	false
+}
+
+fn is_numeric_literal(source: &str) -> bool {
+	let unsigned = source.strip_prefix('-').unwrap_or(source);
+	if unsigned.is_empty() || !unsigned.as_bytes()[0].is_ascii_digit() {
+		return false;
+	}
+	let normalized = source.replace('_', "");
+	if normalized.parse::<f64>().is_ok() {
+		return true;
+	}
+	let radix = unsigned
+		.strip_prefix("0x")
+		.or_else(|| unsigned.strip_prefix("0X"))
+		.map(|digits| (16, digits))
+		.or_else(|| {
+			unsigned
+				.strip_prefix("0o")
+				.or_else(|| unsigned.strip_prefix("0O"))
+				.map(|digits| (8, digits))
+		})
+		.or_else(|| {
+			unsigned
+				.strip_prefix("0b")
+				.or_else(|| unsigned.strip_prefix("0B"))
+				.map(|digits| (2, digits))
+		});
+	radix.is_some_and(|(radix, digits)| {
+		!digits.is_empty()
+			&& digits
+				.chars()
+				.all(|character| character == '_' || character.is_digit(radix))
+	})
+}
+
+fn top_level_separators(tokens: &[LexToken], open: usize, close: usize) -> Vec<Range<usize>> {
+	let mut parens = 0usize;
+	let mut brackets = 0usize;
+	let mut braces = 0usize;
+	let mut separators = Vec::new();
+	for token in &tokens[open + 1..close] {
+		match token.kind {
+			LexKind::Punct('(') => parens += 1,
+			LexKind::Punct(')') => parens = parens.saturating_sub(1),
+			LexKind::Punct('[') => brackets += 1,
+			LexKind::Punct(']') => brackets = brackets.saturating_sub(1),
+			LexKind::Punct('{') => braces += 1,
+			LexKind::Punct('}') => braces = braces.saturating_sub(1),
+			LexKind::Punct(',') if parens == 0 && brackets == 0 && braces == 0 => {
+				separators.push(token.span.clone());
+			}
+			_ => {}
+		}
+	}
+	separators
+}
+
+fn child_list_separators(tokens: &[LexToken], list: &Range<usize>) -> Vec<Range<usize>> {
+	let mut parens = 0usize;
+	let mut brackets = 0usize;
+	let mut braces = 0usize;
+	let mut separators = Vec::new();
+	for token in tokens
+		.iter()
+		.filter(|token| token.span.start >= list.start && token.span.end <= list.end)
+	{
+		match token.kind {
+			LexKind::Punct('(') => parens += 1,
+			LexKind::Punct(')') => parens = parens.saturating_sub(1),
+			LexKind::Punct('[') => brackets += 1,
+			LexKind::Punct(']') => brackets = brackets.saturating_sub(1),
+			LexKind::Punct('{') => braces += 1,
+			LexKind::Punct('}') => braces = braces.saturating_sub(1),
+			LexKind::Punct(',') if parens == 0 && brackets == 1 && braces == 0 => {
+				separators.push(token.span.clone());
+			}
+			_ => {}
+		}
+	}
+	separators
 }
 
 fn ordered_slots(analysis: &StaticAnalysis) -> Vec<&StaticSlot> {
@@ -950,9 +1218,9 @@ fn vocabulary_usage(tokens: &[LexToken], definitions: &[Definition]) -> (bool, b
 		let presentation_call = called
 			&& !declaration
 			&& if method {
-				PRESENTATION_METHODS.contains(&name.as_str())
+				presentation_registry::is_presentation_callable(name, CallPosition::Method)
 			} else {
-				PRESENTATION_FREE.contains(&name.as_str())
+				presentation_registry::is_presentation_callable(name, CallPosition::Free)
 					&& !definitions
 						.iter()
 						.any(|definition| definition.name == *name)
@@ -1327,9 +1595,9 @@ fn rewrite_calls_mapped(
 			Some(LexKind::Punct('.'))
 		);
 		let recognized = if is_method {
-			PRESENTATION_METHODS.contains(&name.as_str())
+			presentation_registry::is_presentation_callable(name, CallPosition::Method)
 		} else {
-			PRESENTATION_FREE.contains(&name.as_str())
+			presentation_registry::is_presentation_callable(name, CallPosition::Free)
 				&& !matches!(tokens.get(index.wrapping_sub(1)).map(|token| &token.kind), Some(LexKind::Ident(keyword)) if keyword == "fn")
 		};
 		if !recognized {
@@ -3382,6 +3650,92 @@ r.views([
 			.map(|view| &view.intent)
 			.collect::<Vec<_>>();
 		assert_eq!(helper_intents, inline_intents);
+	}
+
+	#[test]
+	fn product_0141_source_model_retains_arguments_shape_and_container_facts() {
+		let source = r#"let angle = 45;
+workspace.table("t").views([figure([
+    x_axis().label("Revenue").tick_rotation(angle),
+    bar("region", "revenue")
+])])"#;
+		let compiled = compile(source).expect("presentation source model compiles");
+		let label = compiled
+			.presentation_source_model
+			.occurrences
+			.iter()
+			.find(|occurrence| {
+				occurrence.key == crate::presentation_registry::SettingKey::XAxisLabel
+			})
+			.expect("x label occurrence");
+		assert_eq!(
+			&source[label.argument_spans[0].start as usize..label.argument_spans[0].end as usize],
+			"\"Revenue\""
+		);
+		assert_eq!(
+			label.expression_shape,
+			crate::presentation_registry::ExpressionShape::DirectLiteral
+		);
+		let rotation = compiled
+			.presentation_source_model
+			.occurrences
+			.iter()
+			.find(|occurrence| {
+				occurrence.key == crate::presentation_registry::SettingKey::XAxisTickRotation
+			})
+			.expect("x rotation occurrence");
+		assert_eq!(
+			rotation.expression_shape,
+			crate::presentation_registry::ExpressionShape::ExpressionOrBinding
+		);
+		let figure = compiled
+			.presentation_source_model
+			.syntax
+			.iter()
+			.find(|boundary| boundary.handler == HandlerId::Figure)
+			.expect("figure boundary");
+		assert!(matches!(figure.container, Some((ContainerKind::Figure, _))));
+		assert_eq!(figure.separators.len(), 1, "figure child-list separator");
+	}
+
+	#[test]
+	fn product_0141_expression_shape_requires_one_complete_literal() {
+		assert!(is_direct_literal(r#""Revenue""#));
+		assert!(is_direct_literal("-45.0"));
+		assert!(is_direct_literal("0xff"));
+		assert!(!is_direct_literal(r#""Rev" + "enue""#));
+		assert!(!is_direct_literal("NaN"));
+		assert!(!is_direct_literal("angle"));
+	}
+
+	#[test]
+	fn product_0141_shared_helper_occurrence_has_plural_owners() {
+		let source = r#"let shared_axis = || x_axis().label("Shared axis");
+let r = workspace.table("t");
+r.views([
+    view("first", figure([shared_axis(), bar("x", "y")])),
+    view("second", figure([shared_axis(), line("x", "y")]))
+])"#;
+		let compiled = compile(source).expect("shared helper compiles");
+		let occurrence = compiled
+			.presentation_source_model
+			.occurrences
+			.iter()
+			.find(|occurrence| {
+				occurrence.key == crate::presentation_registry::SettingKey::XAxisLabel
+			})
+			.expect("shared x label occurrence");
+		assert_eq!(occurrence.owners.len(), 2);
+		assert!(
+			occurrence
+				.owners
+				.contains(&LocalViewIdentity::Named("first".to_owned()))
+		);
+		assert!(
+			occurrence
+				.owners
+				.contains(&LocalViewIdentity::Named("second".to_owned()))
+		);
 	}
 
 	#[test]

@@ -250,6 +250,7 @@ fn engine_wake_stream(wake: &EngineWake) -> iced::futures::stream::BoxStream<'st
 /// after every input event that preceded the user's Run command.
 pub struct ExecutionSnapshot {
 	pub buffer_id: libaryon::core::BufferId,
+	pub state_id: libaryon::core::StateId,
 	pub text: String,
 }
 
@@ -347,6 +348,15 @@ pub struct CodeEditor {
 	/// Keeping these attributed prevents a focus projection for one pane from
 	/// being paired with a still-in-flight text reply from another.
 	document_texts: HashMap<libaryon::core::BufferId, String>,
+	/// Generation paired atomically with each cached document snapshot.
+	document_state_ids: HashMap<libaryon::core::BufferId, libaryon::core::StateId>,
+	/// Buffers still projected by the engine. Historical view-panel mappings do
+	/// not establish this liveness fact.
+	live_buffer_ids: std::collections::HashSet<libaryon::core::BufferId>,
+	/// The exact view identities produced by the latest successful compilation
+	/// of each live Rune buffer. Unlike `view_panel_ids`, this set is replaced.
+	current_rune_view_identities:
+		HashMap<libaryon::core::BufferId, std::collections::HashSet<LocalViewIdentity>>,
 	/// Queries and input share one engine FIFO. Retaining the matching host
 	/// intent lets a Run-specific reply bypass the eventually-consistent cache.
 	text_queries: VecDeque<TextQuery>,
@@ -516,8 +526,12 @@ impl NotebookPlotSurface {
 	}
 
 	fn update(&mut self, message: crate::gui::messages::PlotMessage) {
-		let crate::gui::messages::PlotMessage::UpdateHover(hover) = message;
-		self.hovered_info = hover;
+		match message {
+			crate::gui::messages::PlotMessage::UpdateHover(hover) => self.hovered_info = hover,
+			crate::gui::messages::PlotMessage::ToggleSettingsInspector => {
+				// Notebook plots do not render the host-panel inspector control.
+			}
+		}
 	}
 }
 
@@ -800,6 +814,9 @@ impl CodeEditor {
 			engine_wake,
 			viewport: None,
 			document_texts: HashMap::new(),
+			document_state_ids: HashMap::new(),
+			live_buffer_ids: std::collections::HashSet::new(),
+			current_rune_view_identities: HashMap::new(),
 			text_queries: VecDeque::new(),
 			next_execution_query: 0,
 			execution_snapshots: HashMap::new(),
@@ -1255,6 +1272,8 @@ impl CodeEditor {
 			.iter()
 			.map(|(identity, _)| identity.clone())
 			.collect::<std::collections::HashSet<_>>();
+		self.current_rune_view_identities
+			.insert(producer, active.clone());
 		let orphaned = self
 			.view_panel_ids
 			.iter()
@@ -1415,6 +1434,26 @@ impl CodeEditor {
 	) {
 		self.panels
 			.set_plot(panel_id, display_label, kernel, authored_settings);
+	}
+
+	#[cfg(feature = "toron")]
+	pub fn set_rune_view_plot_with_source(
+		&mut self,
+		panel_id: HostPanelId,
+		display_label: String,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		authored_settings: PlotSettingsLayer,
+		source_attachment: Option<crate::presentation_registry::PlotSourceAttachment>,
+		plot_type: Option<crate::plot::core::PlotType>,
+	) {
+		self.panels.set_plot_with_source(
+			panel_id,
+			display_label,
+			kernel,
+			authored_settings,
+			source_attachment,
+			plot_type,
+		);
 	}
 
 	#[cfg(feature = "toron")]
@@ -1917,16 +1956,19 @@ impl CodeEditor {
 			if let Some(message) = viewport.status_message.as_ref() {
 				self.status_message = Some(message.clone());
 			}
-			if let (Some(document_text), Some(buffer_id)) = (
+			if let (Some(document_text), Some(buffer_id), Some(state_id)) = (
 				viewport.document_text.as_ref(),
 				viewport.document_text_buffer_id,
+				viewport.document_text_state_id,
 			) {
 				self.document_texts.insert(buffer_id, document_text.clone());
+				self.document_state_ids.insert(buffer_id, state_id);
 				if let Some(TextQuery::Execution(request)) = self.text_queries.pop_front() {
 					self.execution_snapshots.insert(
 						request,
 						ExecutionSnapshot {
 							buffer_id,
+							state_id,
 							text: document_text.clone(),
 						},
 					);
@@ -1944,6 +1986,11 @@ impl CodeEditor {
 				.collect::<std::collections::HashSet<_>>();
 			self.document_texts
 				.retain(|buffer_id, _| live_buffers.contains(buffer_id));
+			self.document_state_ids
+				.retain(|buffer_id, _| live_buffers.contains(buffer_id));
+			self.current_rune_view_identities
+				.retain(|buffer_id, _| live_buffers.contains(buffer_id));
+			self.live_buffer_ids = live_buffers;
 			self.reconcile_notebook_outputs(&viewport);
 			self.reconcile_preview_blocks(&viewport);
 			self.viewport = Some(viewport);
@@ -2240,7 +2287,14 @@ impl CodeEditor {
 				)
 			} else {
 				match pane.host_panel.as_ref() {
-					Some(panel) => self.panels.surface(panel, palette, self.show_column_types),
+					Some(panel) => self.panels.surface(
+						panel,
+						palette,
+						self.show_column_types,
+						&self.live_buffer_ids,
+						&self.document_state_ids,
+						&self.current_rune_view_identities,
+					),
 					None => {
 						text_pane_surface(pane, palette, focused && self.cursor_blink.visible())
 					}
@@ -3096,6 +3150,35 @@ enum PanelStatus {
 	Orphaned,
 }
 
+fn plot_source_attachment_status(
+	attachment: Option<&crate::presentation_registry::PlotSourceAttachment>,
+	panel_is_fresh: bool,
+	live_buffers: &std::collections::HashSet<libaryon::core::BufferId>,
+	document_state_ids: &HashMap<libaryon::core::BufferId, libaryon::core::StateId>,
+	current_views: &HashMap<libaryon::core::BufferId, std::collections::HashSet<LocalViewIdentity>>,
+) -> crate::presentation_registry::SourceAttachmentStatus {
+	use crate::presentation_registry::SourceAttachmentStatus;
+
+	let Some(attachment) = attachment else {
+		return SourceAttachmentStatus::Detached;
+	};
+	let buffer_id = attachment.source.buffer_id;
+	if !live_buffers.contains(&buffer_id) {
+		return SourceAttachmentStatus::Detached;
+	}
+	let generation_matches = document_state_ids
+		.get(&buffer_id)
+		.is_some_and(|generation| *generation == attachment.source.document_generation);
+	let identity_is_current = current_views
+		.get(&buffer_id)
+		.is_some_and(|identities| identities.contains(&attachment.identity));
+	if panel_is_fresh && generation_matches && identity_is_current {
+		SourceAttachmentStatus::Attached
+	} else {
+		SourceAttachmentStatus::OutOfDate
+	}
+}
+
 impl PanelRegistry {
 	/// Apply ordered events, then reconcile against the latest projection.
 	/// Called from `poll`, after the viewport has been updated.
@@ -3323,6 +3406,44 @@ impl PanelRegistry {
 		);
 	}
 
+	#[cfg(feature = "toron")]
+	fn set_plot_with_source(
+		&mut self,
+		panel_id: HostPanelId,
+		display_label: String,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		authored_settings: PlotSettingsLayer,
+		source_attachment: Option<crate::presentation_registry::PlotSourceAttachment>,
+		plot_type: Option<crate::plot::core::PlotType>,
+	) {
+		if let Some(PanelEntry {
+			content: PanelContent::Plot(plot),
+			status,
+			..
+		}) = self.panels.get_mut(&panel_id)
+		{
+			plot.replace_with_source(
+				display_label,
+				kernel,
+				authored_settings,
+				source_attachment,
+				plot_type,
+			);
+			*status = PanelStatus::Fresh;
+			return;
+		}
+		self.set_content(
+			panel_id,
+			PanelContent::Plot(Box::new(HostPlotState::new_with_source(
+				display_label,
+				kernel,
+				authored_settings,
+				source_attachment,
+				plot_type,
+			))),
+		);
+	}
+
 	/// Native surface for a host panel. Backing objects will replace the
 	/// placeholder without touching the topology seam.
 	fn surface<'a>(
@@ -3330,6 +3451,12 @@ impl PanelRegistry {
 		panel: &'a libaryon::uast::projection::HostPanelViewport,
 		palette: UiPalette,
 		show_column_types: bool,
+		live_buffers: &std::collections::HashSet<libaryon::core::BufferId>,
+		document_state_ids: &HashMap<libaryon::core::BufferId, libaryon::core::StateId>,
+		current_views: &HashMap<
+			libaryon::core::BufferId,
+			std::collections::HashSet<LocalViewIdentity>,
+		>,
 	) -> Element<'a, EditorMsg> {
 		let entry = self.panels.get(&panel.panel_id);
 		let content = entry
@@ -3355,9 +3482,18 @@ impl PanelRegistry {
 			)
 			.into(),
 			PanelContent::Plot(plot) => {
-				plot_pane::host_view(plot).map(move |message| EditorMsg::HostPlot {
-					panel_id: panel.panel_id,
-					message,
+				let attachment_status = plot_source_attachment_status(
+					plot.source_attachment.as_ref(),
+					entry.is_some_and(|entry| matches!(entry.status, PanelStatus::Fresh)),
+					live_buffers,
+					document_state_ids,
+					current_views,
+				);
+				plot_pane::host_view(plot, attachment_status).map(move |message| {
+					EditorMsg::HostPlot {
+						panel_id: panel.panel_id,
+						message,
+					}
 				})
 			}
 			PanelContent::Running => {
@@ -5389,18 +5525,82 @@ fn key_code(key: &Key) -> Option<KeyCode> {
 mod tests {
 	use super::{
 		BUSY_SPINNER_INTERVAL, BusySpinner, CodeEditor, DIVIDER_GRAB_PROXIMITY_PX,
-		DRAG_ACTIVATION_DEADBAND_PX, EditorCommand, EditorMsg, HostPanelPlacement, INITIAL_ROWS,
-		InputEvent, KeyCode, LanguageId, MarkdownBlock, MarkdownPreviewColors, Modifiers,
-		PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, PaneDividerReservation, PaneTabAction, PanelContent,
-		PanelStatus, Rgb, SplitDirection, UiPalette, command_bar_fragments, divider_candidate_at,
-		divider_candidate_rect_px, divider_press_is_candidate, drag_activation_reached,
-		fence_body_start, highlight_span_at, host_panel_content_frame, host_panel_content_style,
-		markdown_code_fragments, metrics, pane_content_stack, pane_gutter_width, pane_title,
-		parse_markdown_blocks, polariton_engine_config, preview_row_budget, preview_source_window,
-		prompt_cursor_byte, viewport_cells, visible_blocks,
+		DRAG_ACTIVATION_DEADBAND_PX, EditorCommand, EditorMsg, HostPanelPlacement, HostPlotState,
+		INITIAL_ROWS, InputEvent, KeyCode, LanguageId, MarkdownBlock, MarkdownPreviewColors,
+		Modifiers, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, PaneDividerReservation, PaneTabAction,
+		PanelContent, PanelStatus, PlotPaneMsg, Rgb, SplitDirection, UiPalette,
+		command_bar_fragments, divider_candidate_at, divider_candidate_rect_px,
+		divider_press_is_candidate, drag_activation_reached, fence_body_start, highlight_span_at,
+		host_panel_content_frame, host_panel_content_style, markdown_code_fragments, metrics,
+		pane_content_stack, pane_gutter_width, pane_title, parse_markdown_blocks,
+		plot_source_attachment_status, polariton_engine_config, preview_row_budget,
+		preview_source_window, prompt_cursor_byte, viewport_cells, visible_blocks,
 	};
 	use crate::gui::table_skin::{TableRgba, TableSkin};
 	use libaryon::svp::markdown_highlight::MarkdownConstruct;
+
+	#[test]
+	fn product_0141_attachment_requires_live_generation_and_current_view_identity() {
+		use crate::presentation_registry::{
+			PlotSourceAttachment, PresentationSourceModel, SourceAttachmentStatus,
+			StampedPresentationSourceModel,
+		};
+		use crate::rune_view::LocalViewIdentity;
+		use libaryon::core::{BufferId, StateId};
+		use std::collections::{HashMap, HashSet};
+		use std::sync::Arc;
+
+		let buffer_id = BufferId::new(7);
+		let generation = StateId::new(11);
+		let identity = LocalViewIdentity::Named("plot".to_owned());
+		let attachment = PlotSourceAttachment {
+			identity: identity.clone(),
+			source: StampedPresentationSourceModel {
+				buffer_id,
+				document_generation: generation,
+				model: Arc::new(PresentationSourceModel::default()),
+			},
+		};
+		let live = HashSet::from([buffer_id]);
+		let generations = HashMap::from([(buffer_id, generation)]);
+		let views = HashMap::from([(buffer_id, HashSet::from([identity.clone()]))]);
+
+		assert_eq!(
+			plot_source_attachment_status(Some(&attachment), true, &live, &generations, &views,),
+			SourceAttachmentStatus::Attached
+		);
+		assert_eq!(
+			plot_source_attachment_status(
+				Some(&attachment),
+				true,
+				&live,
+				&HashMap::from([(buffer_id, StateId::new(12))]),
+				&views,
+			),
+			SourceAttachmentStatus::OutOfDate
+		);
+		assert_eq!(
+			plot_source_attachment_status(
+				Some(&attachment),
+				true,
+				&live,
+				&generations,
+				&HashMap::from([(buffer_id, HashSet::new())]),
+			),
+			SourceAttachmentStatus::OutOfDate,
+			"the append-only panel map is not a current-view witness"
+		);
+		assert_eq!(
+			plot_source_attachment_status(
+				Some(&attachment),
+				true,
+				&HashSet::new(),
+				&generations,
+				&views,
+			),
+			SourceAttachmentStatus::Detached
+		);
+	}
 	use libaryon::svp::rust_highlight::TokenCategory;
 	use std::thread;
 	use std::time::{Duration, Instant};
@@ -5428,6 +5628,31 @@ mod tests {
 		let kernel =
 			crate::plot::factory::create_plot(&resolved.resolved_spec, &resolved.data, 800, 480);
 		(resolved, kernel)
+	}
+
+	#[test]
+	fn product_0141_settings_inspector_is_collapsed_and_toggles_per_pane() {
+		let (_, kernel) = product_0075_test_plot();
+		let mut plot = HostPlotState::new(
+			"plot.line".to_owned(),
+			std::sync::Arc::clone(&kernel),
+			crate::plot::theme::PlotSettingsLayer::default(),
+		);
+		assert!(!plot.settings_inspector_open);
+		plot.update(PlotPaneMsg::ToggleSettingsInspector);
+		assert!(plot.settings_inspector_open);
+
+		plot.replace(
+			"plot.line rerun".to_owned(),
+			kernel,
+			crate::plot::theme::PlotSettingsLayer::default(),
+		);
+		assert!(
+			plot.settings_inspector_open,
+			"a rerun preserves the pane-local disclosure choice"
+		);
+		plot.update(PlotPaneMsg::ToggleSettingsInspector);
+		assert!(!plot.settings_inspector_open);
 	}
 
 	fn product_0074_framed_host_panel() -> iced::Element<'static, EditorMsg, iced::Theme, ()> {

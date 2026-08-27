@@ -21,6 +21,8 @@ mod gui;
 mod local_workspace;
 #[path = "../src/plot/mod.rs"]
 mod plot;
+#[path = "../src/presentation_registry.rs"]
+mod presentation_registry;
 #[path = "../src/profile_store.rs"]
 mod profile_store;
 #[path = "../src/result_artifact.rs"]

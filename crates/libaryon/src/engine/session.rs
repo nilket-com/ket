@@ -2010,6 +2010,8 @@ pub(crate) struct UiState {
 	pub(crate) document_text_response: Option<String>,
 	/// Buffer that produced `document_text_response`.
 	pub(crate) document_text_response_buffer_id: Option<BufferId>,
+	/// State read with `document_text_response`.
+	pub(crate) document_text_response_state_id: Option<StateId>,
 	pub(crate) busy: bool,
 	pub(crate) pending_quit: bool,
 	pub(crate) mode_override: Option<EditorMode>,
@@ -4995,6 +4997,7 @@ impl EditorSession {
 				capacity_warning_shown: false,
 				document_text_response: None,
 				document_text_response_buffer_id: None,
+				document_text_response_state_id: None,
 				busy: false,
 				pending_quit: false,
 				mode_override: None,

@@ -8,6 +8,7 @@ mod gui;
 #[cfg(feature = "toron")]
 mod local_workspace;
 mod plot;
+mod presentation_registry;
 mod profile_store;
 mod result_artifact;
 mod result_registry;

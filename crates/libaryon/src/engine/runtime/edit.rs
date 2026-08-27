@@ -2245,6 +2245,7 @@ mod tests {
 			capacity_warning_shown: false,
 			document_text_response: None,
 			document_text_response_buffer_id: None,
+			document_text_response_state_id: None,
 			busy: false,
 			pending_quit: false,
 			mode_override: None,

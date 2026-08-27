@@ -345,10 +345,16 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 	let status_message = ui.status_message.take();
 	let document_text = ui.document_text_response.take();
 	let document_text_buffer_id = ui.document_text_response_buffer_id.take();
+	let document_text_state_id = ui.document_text_response_state_id.take();
 	debug_assert_eq!(
 		document_text.is_some(),
 		document_text_buffer_id.is_some(),
 		"document text replies must carry their source buffer"
+	);
+	debug_assert_eq!(
+		document_text.is_some(),
+		document_text_state_id.is_some(),
+		"document text replies must carry their document generation"
 	);
 	let io_busy = ui.busy;
 	let should_quit = ui.pending_quit;
@@ -413,6 +419,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 		dividers,
 		document_text,
 		document_text_buffer_id,
+		document_text_state_id,
 		busy: viewport_is_busy(io_busy, semantic_busy),
 		should_quit,
 		search_pattern: search_pattern.clone(),

@@ -1505,6 +1505,7 @@ pub(super) fn handle_file_doctab_command(
 		) {
 			Ok(bytes) => {
 				ui.document_text_response = Some(String::from_utf8_lossy(&bytes).into_owned());
+				ui.document_text_response_state_id = Some(tab.document.ledger.current_state_id);
 			}
 			Err(msg) => ui.status_message = Some(msg),
 		}
@@ -3077,6 +3078,7 @@ mod tests {
 			capacity_warning_shown: false,
 			document_text_response: None,
 			document_text_response_buffer_id: None,
+			document_text_response_state_id: None,
 			busy: false,
 			pending_quit: false,
 			mode_override: None,
@@ -3179,6 +3181,7 @@ mod tests {
 			capacity_warning_shown: false,
 			document_text_response: None,
 			document_text_response_buffer_id: None,
+			document_text_response_state_id: None,
 			busy: false,
 			pending_quit: false,
 			mode_override: None,
@@ -5852,6 +5855,10 @@ mod tests {
 				assert_eq!(
 					view.document_text_buffer_id, focused_buffer_id,
 					"document text must identify the buffer it was read from"
+				);
+				assert!(
+					view.document_text_state_id.is_some(),
+					"document text must carry the exact document generation"
 				);
 				return document_text;
 			}

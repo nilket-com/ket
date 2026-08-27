@@ -21,6 +21,7 @@ use crate::plot::spec::{
 use crate::plot::theme::PlotSettingsLayer;
 #[cfg(test)]
 use crate::plot::theme::{PlotDomainOverrides, PlotSkinSelection};
+use crate::presentation_registry::PresentationSourceModel;
 pub(crate) use crate::rune_view::{LocalViewIdentity, ViewContentKind, ViewPresentation};
 use libaryon::core::BufferId;
 #[cfg(test)]
@@ -652,6 +653,7 @@ impl RuneEnvelopeSourceMap {
 pub(crate) struct TransformedRuneView {
 	pub(crate) executions: Vec<TransformedRuneRelation>,
 	pub(crate) presentation_order: Vec<LocalViewIdentity>,
+	pub(crate) presentation_source_model: PresentationSourceModel,
 }
 
 #[derive(Clone, Debug, PartialEq)]
