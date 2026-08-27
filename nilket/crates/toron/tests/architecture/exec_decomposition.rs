@@ -10,7 +10,12 @@ const EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT: usize = 10_000;
 // beside its constructors, so the ratchet returns to its pre-560 value.
 // ADR 569 adds the Range synthesis arms (bound + legacy executor); ADR 571
 // the scalar-subquery kernel's unbound reject arms.
-const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_570;
+// ADR 554 Branch A follow-on: +3 for the `time_input_processing` brackets at the
+// `Filter` and `Project` arms. The helper and its test were carved to
+// `exec/input_processing.rs` first; these three lines are the call sites
+// themselves, which have to sit at the arms they measure. The bound still fails
+// on expression-evaluator drift, which is what it is for.
+const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_573;
 const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
 const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_825;
 
