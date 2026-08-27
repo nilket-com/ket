@@ -7322,13 +7322,13 @@ impl Executor {
 			return Ok(None);
 		};
 
-		if let Some(handle) = stage_handle.as_ref() {
-			node_attribution::commit_stage_vocabulary(
-				&self.context.task_telemetry,
-				handle,
-				join0_route.vocabulary_name(),
-			);
-		}
+		// Outside any handle guard: the route is an execution fact, and the handle
+		// exists only when the node-attribution diagnostic is on.
+		node_attribution::commit_stage_vocabulary(
+			&self.context.task_telemetry,
+			stage_handle.as_ref(),
+			join0_route.vocabulary_name(),
+		);
 
 		let mut state = init_global_aggregate_state(&self.context, aggr_expr)?;
 
@@ -16985,10 +16985,12 @@ impl Executor {
 
 		// stages it buffered are discarded with the pending declaration.
 
-		if let (Some(handle), Some(variant)) = (stage_handle, observed) {
+		// Still inside the `observed` check — a declined branch names no lifecycle,
+		// so there is no execution fact to record. Only the handle check moves out.
+		if let Some(variant) = observed {
 			node_attribution::commit_stage_vocabulary(
 				&self.context.task_telemetry,
-				handle,
+				stage_handle,
 				variant,
 			);
 		}
@@ -21255,19 +21257,19 @@ impl Executor {
 			node_attribution::close_stage(stage, &attribution_telemetry);
 		}
 
-		if let Some(handle) = stage_handle {
-			let observed = if partition_replay_spec.is_some() {
-				"inner_prefix_semi_anti_deferred_replay"
-			} else {
-				"inner_prefix_semi_anti_direct_replay"
-			};
+		// The route is decided by the replay spec, not by whether the diagnostic is
+		// on, so this records unconditionally.
+		let observed = if partition_replay_spec.is_some() {
+			"inner_prefix_semi_anti_deferred_replay"
+		} else {
+			"inner_prefix_semi_anti_direct_replay"
+		};
 
-			node_attribution::commit_stage_vocabulary(
-				&self.context.task_telemetry,
-				handle,
-				observed,
-			);
-		}
+		node_attribution::commit_stage_vocabulary(
+			&self.context.task_telemetry,
+			stage_handle,
+			observed,
+		);
 
 		let mut stage_profile = ChainStageProfiler::from_env(self.context.query_id);
 

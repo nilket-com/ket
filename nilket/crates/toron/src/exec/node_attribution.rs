@@ -1354,12 +1354,22 @@ fn record_committed_vocabulary(
 ///
 /// One writer for both destinations — the process-global ledger and the
 /// task-local receipt — so the two cannot drift apart at the three call sites.
+///
+/// **The handle is optional on purpose.** `declare_stage_vocabulary` returns
+/// `None` when the node-attribution file diagnostic is off, so taking
+/// `&VocabularyHandle` forced every call site under an `if let Some(handle)`
+/// guard — which silently disabled the task receipt in exactly the ordinary
+/// atlas run it exists for. An observed vocabulary is a fact about execution and
+/// is recorded whenever one exists; the ledger is the opt-in part.
 pub(in crate::exec) fn commit_stage_vocabulary(
 	telemetry: &Option<std::sync::Arc<Mutex<TaskTelemetry>>>,
-	handle: &VocabularyHandle,
+	handle: Option<&VocabularyHandle>,
 	observed: &'static str,
 ) {
 	record_committed_vocabulary(telemetry, observed);
+	let Some(handle) = handle else {
+		return;
+	};
 	if !enabled() {
 		return;
 	}

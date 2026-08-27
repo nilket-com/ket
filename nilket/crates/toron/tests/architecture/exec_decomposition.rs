@@ -759,6 +759,54 @@ pub(crate) fn adr353_exec_root_is_bounded_after_aggregate_carve() {
 	);
 }
 
+/// ADR 554 follow-on: the receipt must not drift back under the handle guard.
+///
+/// `declare_stage_vocabulary` returns `None` when the node-attribution file
+/// diagnostic is off, so a `commit_stage_vocabulary` call placed inside
+/// `if let Some(handle) = stage_handle` never runs in an ordinary atlas run.
+/// That is not hypothetical: it shipped, and an authoritative SF=8 run came back
+/// with an empty receipt on all 1,323 distributed nodes. The handle is an
+/// `Option` argument now precisely so the call sites cannot be guarded on it.
+#[test]
+pub(crate) fn adr554_vocabulary_commits_are_not_guarded_on_the_handle() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let source = std::fs::read_to_string(manifest_dir.join("src/exec/join/streaming.rs")).unwrap();
+	let calls: Vec<usize> = source
+		.match_indices("commit_stage_vocabulary(")
+		.map(|(index, _)| index)
+		.collect();
+	assert!(
+		!calls.is_empty(),
+		"the vocabulary commit sites vanished; this guard is now vacuous"
+	);
+	let guarded: Vec<usize> = calls
+		.iter()
+		.filter(|index| {
+			// Look back over the enclosing statement, not the whole function: a
+			// handle guard that applies to this call sits immediately above it.
+			let start = index.saturating_sub(240);
+			let preamble = &source[start..**index];
+			let Some(tail) = preamble.rsplit_once('\n').map(|(head, _)| head) else {
+				return false;
+			};
+			// An `if let Some(..) = stage_handle` with no intervening close brace
+			// still covers this call.
+			match tail.rfind("= stage_handle") {
+				None => false,
+				Some(at) => !tail[at..].contains('}'),
+			}
+		})
+		.copied()
+		.collect();
+	assert!(
+		guarded.is_empty(),
+		"commit_stage_vocabulary must be called unconditionally and passed the \
+		 optional handle, never placed under an `if let Some(..) = stage_handle` \
+		 guard — that guard is off whenever the diagnostic is off; {} site(s) are \
+		 guarded",
+		guarded.len()
+	);
+}
 /// ADR 554 follow-on: every committed route reaches the task-local receipt.
 ///
 /// A unit test can prove the helper works but not that all call sites use it.

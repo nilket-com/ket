@@ -2,8 +2,9 @@ use arrow::array::{ArrayRef, Decimal128Array, Float64Array, Int64Array, StringAr
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use toron::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
+use toron::distributed::task::TaskTelemetry;
 use toron::error::{ExecutionError, StorageError};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
@@ -47,6 +48,50 @@ impl StorageScan for BatchStorage {
 			vec![batch],
 		))
 	}
+}
+
+/// ADR 554 follow-on: a real route records its committed vocabulary into the
+/// task receipt **with the node-attribution diagnostic off**.
+///
+/// The unit test beside the helper calls `record_committed_vocabulary` directly,
+/// so it passed while the production path was dead: every call site sat under
+/// `if let Some(handle) = stage_handle`, and that handle is `None` whenever
+/// `TORON_NODE_ATTRIBUTION_PROFILE_PATH` is unset. An authoritative SF=8 atlas
+/// came back with an empty receipt on all 1,323 distributed nodes before this
+/// was caught. This drives a real chain route end to end instead.
+#[tokio::test]
+async fn committed_vocabulary_reaches_the_task_receipt_without_the_diagnostic() {
+	assert!(
+		std::env::var_os("TORON_NODE_ATTRIBUTION_PROFILE_PATH").is_none(),
+		"this test asserts the receipt works with the diagnostic OFF; \
+		 the variable being set would make it prove the opposite"
+	);
+
+	let telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+	let rows = STREAM_CHUNK_ROWS_UNDER_TEST + 257;
+	let (executor, plan) = right_growing_inner_chain_fixture_with_telemetry(
+		StreamingValueKind::Float64,
+		rows,
+		0,
+		high_test_budget(),
+		true,
+		Some(telemetry.clone()),
+	);
+	executor
+		.execute_bound(&plan, None)
+		.await
+		.expect("streamed right-growing chain");
+
+	let labels = telemetry.lock().expect("telemetry").labels.clone();
+	assert!(
+		!labels.committed_vocabularies.is_empty(),
+		"a committed route must reach the task receipt with the node-attribution \
+		 diagnostic off; empty here is the exact failure that shipped"
+	);
+	assert_eq!(
+		labels.vocabulary_overflow, 0,
+		"a single committed route must not overflow the receipt bound"
+	);
 }
 
 #[tokio::test]
@@ -120,6 +165,24 @@ fn right_growing_inner_chain_fixture(
 	blob_len: usize,
 	budget: TaskBudget,
 	streaming_replay_ids: bool,
+) -> (Executor, ExecutionPlan) {
+	right_growing_inner_chain_fixture_with_telemetry(
+		kind,
+		rows,
+		blob_len,
+		budget,
+		streaming_replay_ids,
+		None,
+	)
+}
+
+fn right_growing_inner_chain_fixture_with_telemetry(
+	kind: StreamingValueKind,
+	rows: usize,
+	blob_len: usize,
+	budget: TaskBudget,
+	streaming_replay_ids: bool,
+	telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
 ) -> (Executor, ExecutionPlan) {
 	let amount_type = match kind {
 		StreamingValueKind::Float64 => DataType::Float64,
@@ -197,10 +260,11 @@ fn right_growing_inner_chain_fixture(
 			),
 		]),
 	});
-	let executor = Executor::with_context(
-		storage,
-		ExecutionContext::local_test().with_task_budget(budget),
-	);
+	let mut context = ExecutionContext::local_test().with_task_budget(budget);
+	if let Some(telemetry) = telemetry {
+		context = context.with_task_telemetry(telemetry);
+	}
+	let executor = Executor::with_context(storage, context);
 	let replay = |id| {
 		if streaming_replay_ids {
 			JoinReplayId(id)
