@@ -1310,10 +1310,56 @@ pub(in crate::exec) fn predeclare_stage_vocabulary(
 	Some(VocabularyHandle { invocation_id })
 }
 
+/// The bound on `TaskTelemetryLabels::committed_vocabularies`.
+///
+/// A task commits one route per streaming invocation and a plan fragment holds a
+/// handful; eight leaves room without letting a pathological plan grow telemetry
+/// without limit. Exceeding it increments `vocabulary_overflow` rather than
+/// dropping silently.
+pub(in crate::exec) const MAX_COMMITTED_VOCABULARIES: usize = 8;
+
+/// Record a committed route into the task's own label receipt.
+///
+/// Deliberately **outside** the `enabled()` gate below: the node-attribution
+/// ledger is an opt-in file diagnostic, but this receipt must be present in an
+/// ordinary atlas run, which is the only place the distributed arm is exercised.
+fn record_committed_vocabulary(
+	telemetry: &Option<std::sync::Arc<Mutex<TaskTelemetry>>>,
+	observed: &'static str,
+) {
+	crate::exec::join::record_task_telemetry(telemetry, |task| {
+		if task
+			.labels
+			.committed_vocabularies
+			.iter()
+			.any(|name| name == observed)
+		{
+			// A repeat is not overflow: the set already covers this route, so
+			// counting it would make a complete receipt look truncated.
+			return;
+		}
+		if task.labels.committed_vocabularies.len() >= MAX_COMMITTED_VOCABULARIES {
+			task.labels.vocabulary_overflow = task.labels.vocabulary_overflow.saturating_add(1);
+			return;
+		}
+		task.labels
+			.committed_vocabularies
+			.push(observed.to_string());
+	});
+}
+
 /// Phase two: commit the observed lifecycle variant. Only a variant fixed at predeclaration can be
 /// selected; anything else fails the invocation closed. An attempted branch that declines simply
 /// never calls this, and its buffered stages are discarded when the frame exits.
-pub(in crate::exec) fn commit_stage_vocabulary(handle: &VocabularyHandle, observed: &'static str) {
+///
+/// One writer for both destinations — the process-global ledger and the
+/// task-local receipt — so the two cannot drift apart at the three call sites.
+pub(in crate::exec) fn commit_stage_vocabulary(
+	telemetry: &Option<std::sync::Arc<Mutex<TaskTelemetry>>>,
+	handle: &VocabularyHandle,
+	observed: &'static str,
+) {
+	record_committed_vocabulary(telemetry, observed);
 	if !enabled() {
 		return;
 	}
@@ -1323,7 +1369,6 @@ pub(in crate::exec) fn commit_stage_vocabulary(handle: &VocabularyHandle, observ
 		accounting.commit_vocabulary(handle.invocation_id, observed);
 	}
 }
-
 /// An open stage inside a handler. Like [`HandlerSpan`], it carries the invocation id and a child
 /// accounting snapshot, so closing it verifies identity and subtracts nested `execute_bound` work
 /// itself. The caller never supplies a duration: a stage cannot be accidentally timed inclusive of
@@ -4339,5 +4384,102 @@ mod tests {
 		assert!(acc.exit(NodeKind::Aggregate, 500, 0, 0));
 		assert_eq!(acc.nodes[NodeKind::Aggregate.index()].exclusive_micros, 0);
 		assert_eq!(acc.interleaved_frames, 1);
+	}
+}
+
+#[cfg(test)]
+mod vocabulary_receipt_tests {
+	use super::*;
+	use crate::distributed::task::TaskTelemetry;
+	use std::sync::Arc;
+
+	fn slot() -> Option<Arc<Mutex<TaskTelemetry>>> {
+		Some(Arc::new(Mutex::new(TaskTelemetry::default())))
+	}
+
+	fn names(slot: &Option<Arc<Mutex<TaskTelemetry>>>) -> Vec<String> {
+		slot.as_ref()
+			.unwrap()
+			.lock()
+			.unwrap()
+			.labels
+			.committed_vocabularies
+			.clone()
+	}
+
+	fn overflow(slot: &Option<Arc<Mutex<TaskTelemetry>>>) -> u32 {
+		slot.as_ref()
+			.unwrap()
+			.lock()
+			.unwrap()
+			.labels
+			.vocabulary_overflow
+	}
+
+	/// Concurrent worker tasks each own their receipt. This is the property the
+	/// process-global `NODE_LEDGER` cannot provide: its single frame stack merges
+	/// interleaved workers, which is why the receipt lives on the task instead.
+	#[test]
+	fn concurrent_task_slots_stay_isolated() {
+		let left = slot();
+		let right = slot();
+		record_committed_vocabulary(&left, "left_route");
+		record_committed_vocabulary(&right, "right_route");
+		record_committed_vocabulary(&left, "left_second");
+
+		assert_eq!(names(&left), vec!["left_route", "left_second"]);
+		assert_eq!(names(&right), vec!["right_route"]);
+		assert_eq!(overflow(&left), 0);
+		assert_eq!(overflow(&right), 0);
+	}
+
+	/// A repeat is not overflow. If it were, a task that commits the same route
+	/// on every batch would report a truncated set while holding a complete one.
+	#[test]
+	fn repeats_deduplicate_without_signalling_overflow() {
+		let task = slot();
+		for _ in 0..64 {
+			record_committed_vocabulary(&task, "same_route");
+		}
+		assert_eq!(names(&task), vec!["same_route"]);
+		assert_eq!(overflow(&task), 0);
+	}
+
+	/// Overflow must be visible, never silent. A reader that ignores the counter
+	/// would see a full-looking list and wrongly conclude a route was not taken.
+	#[test]
+	fn overflow_cannot_masquerade_as_complete_coverage() {
+		const NAMES: [&str; 11] = [
+			"r00", "r01", "r02", "r03", "r04", "r05", "r06", "r07", "r08", "r09", "r10",
+		];
+		let task = slot();
+		for name in NAMES {
+			record_committed_vocabulary(&task, name);
+		}
+		assert_eq!(names(&task).len(), MAX_COMMITTED_VOCABULARIES);
+		assert_eq!(
+			overflow(&task),
+			(NAMES.len() - MAX_COMMITTED_VOCABULARIES) as u32,
+			"every distinct name past the bound must be counted, so a truncated \
+			 receipt can never be read as complete coverage"
+		);
+		assert!(
+			!names(&task).contains(&"r10".to_string()),
+			"the dropped names really are absent; the counter is the only signal"
+		);
+	}
+
+	/// The receipt is written even with the node-attribution file diagnostic off.
+	/// It has to be: that diagnostic is opt-in, and an ordinary atlas run is the
+	/// only place the distributed arm executes.
+	#[test]
+	fn receipt_does_not_depend_on_the_node_attribution_env() {
+		assert!(
+			!enabled(),
+			"unit tests run without the profile path set; that is the case this asserts"
+		);
+		let task = slot();
+		record_committed_vocabulary(&task, "route_without_ledger");
+		assert_eq!(names(&task), vec!["route_without_ledger"]);
 	}
 }

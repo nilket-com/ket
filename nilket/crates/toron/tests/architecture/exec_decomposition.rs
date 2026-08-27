@@ -759,6 +759,41 @@ pub(crate) fn adr353_exec_root_is_bounded_after_aggregate_carve() {
 	);
 }
 
+/// ADR 554 follow-on: every committed route reaches the task-local receipt.
+///
+/// A unit test can prove the helper works but not that all call sites use it.
+/// This proves reach structurally: each `commit_stage_vocabulary` call must pass
+/// the task telemetry slot, so a new streaming route cannot commit a vocabulary
+/// that never lands in an atlas node.
+#[test]
+pub(crate) fn adr554_every_vocabulary_commit_reaches_the_task_receipt() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let source = std::fs::read_to_string(manifest_dir.join("src/exec/join/streaming.rs")).unwrap();
+	let calls: Vec<usize> = source
+		.match_indices("commit_stage_vocabulary(")
+		.map(|(index, _)| index)
+		.collect();
+	assert!(
+		!calls.is_empty(),
+		"the vocabulary commit sites vanished; this guard is now vacuous"
+	);
+	let missing: Vec<usize> = calls
+		.iter()
+		.filter(|index| {
+			// The slot may sit on the same line or the next, depending on rustfmt.
+			let tail = &source[**index..source.len().min(**index + 200)];
+			!tail.contains("&self.context.task_telemetry")
+		})
+		.copied()
+		.collect();
+	assert!(
+		missing.is_empty(),
+		"every commit_stage_vocabulary call must pass &self.context.task_telemetry \
+		 so the committed route reaches the task-local receipt; {} call(s) do not",
+		missing.len()
+	);
+}
+
 #[test]
 pub(crate) fn adr354_exec_root_is_bounded_after_expr_carve() {
 	let lines = exec_root_source().lines().count();

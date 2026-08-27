@@ -5091,7 +5091,7 @@ pub struct TimingAtlasChild {
 	///
 	/// `None` on the local arm, and deliberately so. The local arm runs through
 	/// `execute_query_with_metadata_coordinate`, which takes no id and therefore
-	/// executes under `ExecutionContext::local_test()` — a constant
+	/// executes under the shared local-test execution context — a constant
 	/// `QueryId::from_u128(1)` shared by every local attempt. Recording the minted
 	/// id there would assert an execution fact that is false. Passing the minted
 	/// id into the local executor to make this field true would change execution
@@ -6675,6 +6675,25 @@ fn timing_atlas_replay_attribution_path(
 				.get("input_processing_ms")
 				.and_then(|value| value.as_f64())
 				.unwrap_or(0.0),
+			committed_vocabularies: node
+				.get("committed_vocabularies")
+				.and_then(|value| value.as_array())
+				.map(|values| {
+					values
+						.iter()
+						.filter_map(|value| value.as_str().map(ToOwned::to_owned))
+						.collect()
+				})
+				.unwrap_or_default(),
+			vocabulary_overflow: node
+				.get("vocabulary_overflow")
+				.and_then(|value| value.as_u64())
+				.unwrap_or(0) as u32,
+			stage_role: node
+				.get("stage_role")
+				.and_then(|value| value.as_str())
+				.unwrap_or_default()
+				.to_owned(),
 			telemetry_lock_ms: node
 				.get("telemetry_lock_ms")
 				.and_then(|value| value.as_f64())
@@ -7878,6 +7897,18 @@ pub struct TimingAtlasTaskNode {
 	/// projection evaluation) on this node. Same standing as accumulation — a
 	/// remainder subterm, never an ADR 538 component.
 	pub input_processing_ms: f64,
+	/// ADR 554 follow-on: every streaming route this task committed, from the
+	/// task-local label receipt. This is what names the arm's actual execution
+	/// shape; the node-attribution ledger cannot, because concurrent in-process
+	/// workers interleave on one global stack.
+	pub committed_vocabularies: Vec<String>,
+	/// Non-zero means `committed_vocabularies` is a PARTIAL set. A reader must
+	/// check this before concluding a route was not taken.
+	pub vocabulary_overflow: u32,
+	/// The coarse role the scheduler assigned this task (`join_publish`,
+	/// `source_publish`, `shuffle_consumer`, `scan`, `join_final`). Already
+	/// produced by the engine and previously dropped by this harness.
+	pub stage_role: String,
 	/// The worker this task ran on, as its UUID string. Present so an artifact can
 	/// answer whether concurrent stage siblings actually landed on different
 	/// workers — the question ADR 554 Branch B could only answer "consistent
@@ -8836,6 +8867,9 @@ fn placement_attempt_from_row(row: &serde_json::Value) -> Result<PlacementAttemp
 			framework_overhead_ms: 0.0,
 			aggregate_accumulation_ms: 0.0,
 			input_processing_ms: 0.0,
+			committed_vocabularies: Vec::new(),
+			vocabulary_overflow: 0,
+			stage_role: String::new(),
 			worker_id,
 			upstream,
 		});
@@ -9254,6 +9288,9 @@ pub fn timing_atlas_nodes_from_report(
 					as f64 / 1000.0,
 				input_processing_ms: record.telemetry.phases.input_processing_micros as f64
 					/ 1000.0,
+				committed_vocabularies: record.telemetry.labels.committed_vocabularies.clone(),
+				vocabulary_overflow: record.telemetry.labels.vocabulary_overflow,
+				stage_role: record.telemetry.labels.stage_role.clone(),
 				telemetry_lock_ms: record.telemetry.phases.telemetry_lock_micros as f64 / 1000.0,
 				framework_overhead_ms: record.telemetry.phases.framework_overhead_micros as f64
 					/ 1000.0,
@@ -9284,6 +9321,9 @@ pub fn timing_atlas_local_task_node(
 		worker_id: String::new(),
 		aggregate_accumulation_ms: phases.aggregate_accumulation_micros as f64 / 1000.0,
 		input_processing_ms: phases.input_processing_micros as f64 / 1000.0,
+		committed_vocabularies: Vec::new(),
+		vocabulary_overflow: 0,
+		stage_role: String::new(),
 		telemetry_lock_ms: phases.telemetry_lock_micros as f64 / 1000.0,
 		framework_overhead_ms: phases.framework_overhead_micros as f64 / 1000.0,
 		upstream: Vec::new(),
@@ -9353,6 +9393,9 @@ pub fn timing_atlas_attribution_path_row(
 				"worker_id": node.worker_id,
 				"aggregate_accumulation_ms": node.aggregate_accumulation_ms,
 				"input_processing_ms": node.input_processing_ms,
+				"committed_vocabularies": node.committed_vocabularies,
+				"vocabulary_overflow": node.vocabulary_overflow,
+				"stage_role": node.stage_role,
 				"telemetry_lock_ms": node.telemetry_lock_ms,
 				"framework_overhead_ms": node.framework_overhead_ms,
 				"upstream": node.upstream,
@@ -25396,6 +25439,36 @@ mod adr538_timing_atlas_journal_replay {
 		);
 	}
 
+	/// ADR 554 follow-on: both labels survive the node round trip.
+	///
+	/// The route name is the whole point of the receipt — an atlas that drops it
+	/// on serialization would look complete and answer nothing. `stage_role` was
+	/// produced by the engine and silently discarded here until this cut.
+	#[test]
+	fn timing_atlas_node_serialization_retains_vocabulary_and_stage_role() {
+		let mut node = decomposition_node(0.0, 0.0, 10.0);
+		node.committed_vocabularies = vec![
+			"inner_prefix_semi_anti_direct_replay".to_owned(),
+			"join0".to_owned(),
+		];
+		node.vocabulary_overflow = 3;
+		node.stage_role = "join_publish".to_owned();
+
+		let attribution = timing_atlas_child_attribution(vec![node]).expect("fixture attributes");
+		let row = timing_atlas_attribution_path_row("q21", "distributed", 0, 1, 10.0, &attribution);
+		let serialized = row["nodes"][0].clone();
+
+		assert_eq!(
+			serialized["committed_vocabularies"][0],
+			"inner_prefix_semi_anti_direct_replay"
+		);
+		assert_eq!(serialized["committed_vocabularies"][1], "join0");
+		assert_eq!(
+			serialized["vocabulary_overflow"], 3,
+			"a partial receipt must stay partial through serialization"
+		);
+		assert_eq!(serialized["stage_role"], "join_publish");
+	}
 	/// One node carrying components, bookkeeping, and a wall far larger than either.
 	fn decomposition_node(
 		telemetry_lock_ms: f64,
@@ -25405,6 +25478,9 @@ mod adr538_timing_atlas_journal_replay {
 		TimingAtlasTaskNode {
 			aggregate_accumulation_ms: 0.0,
 			input_processing_ms: 0.0,
+			committed_vocabularies: Vec::new(),
+			vocabulary_overflow: 0,
+			stage_role: String::new(),
 			stage_id: 0,
 			task_id: 0,
 			wall_ms,
@@ -25502,6 +25578,9 @@ mod adr538_timing_atlas_journal_replay {
 			worker_id: String::new(),
 			aggregate_accumulation_ms: 0.0,
 			input_processing_ms: 0.0,
+			committed_vocabularies: Vec::new(),
+			vocabulary_overflow: 0,
+			stage_role: String::new(),
 			telemetry_lock_ms: 0.0,
 			framework_overhead_ms: 0.0,
 			upstream: Vec::new(),
@@ -25527,6 +25606,9 @@ mod adr538_timing_atlas_journal_replay {
 				worker_id: String::new(),
 				aggregate_accumulation_ms: 0.0,
 				input_processing_ms: 0.0,
+				committed_vocabularies: Vec::new(),
+				vocabulary_overflow: 0,
+				stage_role: String::new(),
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: Vec::new(),
@@ -25545,6 +25627,9 @@ mod adr538_timing_atlas_journal_replay {
 				worker_id: String::new(),
 				aggregate_accumulation_ms: 0.0,
 				input_processing_ms: 0.0,
+				committed_vocabularies: Vec::new(),
+				vocabulary_overflow: 0,
+				stage_role: String::new(),
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![(0, 0)],
@@ -26519,6 +26604,9 @@ mod adr538_timing_atlas_critical_path {
 			worker_id: String::new(),
 			aggregate_accumulation_ms: 0.0,
 			input_processing_ms: 0.0,
+			committed_vocabularies: Vec::new(),
+			vocabulary_overflow: 0,
+			stage_role: String::new(),
 			telemetry_lock_ms: 0.0,
 			framework_overhead_ms: 0.0,
 			upstream,
@@ -26738,6 +26826,9 @@ mod adr538_path_bound_validation {
 				worker_id: String::new(),
 				aggregate_accumulation_ms: 0.0,
 				input_processing_ms: 0.0,
+				committed_vocabularies: Vec::new(),
+				vocabulary_overflow: 0,
+				stage_role: String::new(),
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![],
@@ -26750,6 +26841,9 @@ mod adr538_path_bound_validation {
 				worker_id: String::new(),
 				aggregate_accumulation_ms: 0.0,
 				input_processing_ms: 0.0,
+				committed_vocabularies: Vec::new(),
+				vocabulary_overflow: 0,
+				stage_role: String::new(),
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![(0, 0)],
@@ -26763,6 +26857,9 @@ mod adr538_path_bound_validation {
 				worker_id: String::new(),
 				aggregate_accumulation_ms: 0.0,
 				input_processing_ms: 0.0,
+				committed_vocabularies: Vec::new(),
+				vocabulary_overflow: 0,
+				stage_role: String::new(),
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![(0, 0)],
