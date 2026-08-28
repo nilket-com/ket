@@ -1868,12 +1868,25 @@ pub(crate) struct InspectorSettingRow {
 	pub(crate) source_occurrence: bool,
 }
 
+/// The authored presentation family for a resolved renderer type. Orientation
+/// is decided by resolution after the x/y pair selects it; the settings
+/// surface is authored in orientation-free vocabulary, so applicability is
+/// judged against the family, never the physical renderer.
+fn presentation_family(plot_type: PlotType) -> PlotType {
+	match plot_type {
+		PlotType::HorizontalBar => PlotType::Bar,
+		PlotType::HorizontalStackedBar => PlotType::StackedBar,
+		other => other,
+	}
+}
+
 pub(crate) fn inspector_rows(
 	settings: &PlotSettings,
 	resolved: &ResolvedPlotSettings,
 	plot_type: Option<PlotType>,
 	attachment: Option<&PlotSourceAttachment>,
 ) -> Vec<InspectorSettingRow> {
+	let plot_type = plot_type.map(presentation_family);
 	SETTINGS
 		.iter()
 		.filter(|spec| {
@@ -2158,6 +2171,28 @@ mod tests {
 			)),
 			"an unknown or layered mark family exposes only universally applicable settings"
 		);
+	}
+
+	#[test]
+	fn horizontal_renderers_inspect_as_their_authored_family() {
+		let settings = PlotSettings::default();
+		let resolved = settings.resolve();
+		for (renderer, family) in [
+			(PlotType::HorizontalBar, PlotType::Bar),
+			(PlotType::HorizontalStackedBar, PlotType::StackedBar),
+		] {
+			let horizontal = inspector_rows(&settings, &resolved, Some(renderer), None);
+			let vertical = inspector_rows(&settings, &resolved, Some(family), None);
+			assert!(
+				!horizontal.is_empty(),
+				"{renderer:?} must expose its authored family's settings"
+			);
+			assert_eq!(
+				horizontal.iter().map(|row| row.key).collect::<Vec<_>>(),
+				vertical.iter().map(|row| row.key).collect::<Vec<_>>(),
+				"orientation must not change the inspected surface"
+			);
+		}
 	}
 
 	#[test]
