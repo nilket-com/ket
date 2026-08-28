@@ -338,6 +338,96 @@ fn time_join_materialization<T>(
 	outcome
 }
 
+/// Measure one selection's run structure and fold it into the task accumulator.
+///
+/// ADR 554 follow-on locality probe. One pass over the selection, extracting the
+/// same indices `materialize_join_selection` will gather by, so the statistic
+/// describes the gather that actually happens rather than a model of it.
+///
+/// Deliberately unconditional and deliberately cheap: a few integer comparisons
+/// per row against a gather that costs 3.8-37.8 ns/row. Gating it on an env var
+/// would make it invisible in exactly the ordinary atlas run that is the only
+/// place the distributed arm is exercised — the failure this arc already made
+/// once with the vocabulary receipt.
+pub(super) fn record_join_selection_locality(
+	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
+	selection: &[JoinOutputRow],
+) {
+	if selection.is_empty() {
+		return;
+	}
+	use crate::distributed::task::JoinSelectionLocality;
+	let mut left = JoinSelectionLocality::default();
+	let mut right = JoinSelectionLocality::default();
+	// `None` means the side has not seen an index yet, or the previous row nulled
+	// it — either way the next index starts a fresh run rather than continuing one
+	// across a gap that the gather will not see as contiguous.
+	let mut left_previous: Option<u32> = None;
+	let mut right_previous: Option<u32> = None;
+	let mut left_run = 0u64;
+	let mut right_run = 0u64;
+
+	for row in selection {
+		let (left_index, right_index) = match *row {
+			JoinOutputRow::Paired { left, right } => (Some(left), Some(right)),
+			JoinOutputRow::LeftFillNull { left } => (Some(left), None),
+			JoinOutputRow::RightFillNull { right } => (None, Some(right)),
+			JoinOutputRow::LeftPreserved { left } => (Some(left), None),
+			JoinOutputRow::RightPreserved { right } => (None, Some(right)),
+		};
+		step(&mut left, &mut left_previous, &mut left_run, left_index);
+		step(&mut right, &mut right_previous, &mut right_run, right_index);
+	}
+	left.observe_run(left_run);
+	right.observe_run(right_run);
+	left.invocations = u64::from(left.selected_rows > 0);
+	right.invocations = u64::from(right.selected_rows > 0);
+
+	record_task_telemetry(telemetry, |task| {
+		task.join_selection_locality.left.merge(&left);
+		task.join_selection_locality.right.merge(&right);
+	});
+}
+
+/// Advance one side by one selection row.
+///
+/// A run is a maximal ascending-by-exactly-one sequence. A repeated index is
+/// counted as a duplicate and **ends** the run: the gather still pays a separate
+/// lookup for it, so treating duplicates as contiguous would overstate what
+/// slice reuse could claim.
+fn step(
+	stats: &mut crate::distributed::task::JoinSelectionLocality,
+	previous: &mut Option<u32>,
+	run: &mut u64,
+	index: Option<u32>,
+) {
+	let Some(index) = index else {
+		// A null on this side breaks contiguity; close the run and forget the
+		// predecessor so the next index cannot appear to continue it.
+		stats.observe_run(*run);
+		*run = 0;
+		*previous = None;
+		return;
+	};
+	stats.selected_rows = stats.selected_rows.saturating_add(1);
+	match *previous {
+		Some(last) if index == last.saturating_add(1) => {
+			stats.ascending_steps = stats.ascending_steps.saturating_add(1);
+			*run = run.saturating_add(1);
+		}
+		Some(last) if index == last => {
+			stats.duplicate_steps = stats.duplicate_steps.saturating_add(1);
+			stats.observe_run(*run);
+			*run = 1;
+		}
+		_ => {
+			stats.observe_run(*run);
+			*run = 1;
+		}
+	}
+	*previous = Some(index);
+}
+
 pub(super) fn record_join_runtime_observation(
 	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
 
@@ -706,6 +796,11 @@ pub(super) async fn execute_hash_join(
 	});
 
 	probe_scope.commit_after_write();
+
+	// Locality probe (ADR 554 follow-on): measured on the same selection the
+	// gather below is about to consume, before it is consumed, so the statistic
+	// and the cost it explains describe one event.
+	record_join_selection_locality(&telemetry, &selection);
 
 	let output = vec![time_join_output_materialization(&telemetry, || {
 		materialize_join_selection(
@@ -2656,5 +2751,158 @@ mod join_materialization_timing_tests {
 		let none: Option<Arc<Mutex<TaskTelemetry>>> = None;
 		time_join_input_materialization(&none, busy).expect("succeeds without a slot");
 		time_join_output_materialization(&none, busy).expect("succeeds without a slot");
+	}
+}
+
+#[cfg(test)]
+mod join_selection_locality_tests {
+	use super::*;
+	use crate::distributed::task::{RUN_LENGTH_BUCKET_MINIMUMS, TaskTelemetry};
+
+	fn slot() -> Option<Arc<Mutex<TaskTelemetry>>> {
+		Some(Arc::new(Mutex::new(TaskTelemetry::default())))
+	}
+
+	fn sides(
+		slot: &Option<Arc<Mutex<TaskTelemetry>>>,
+	) -> crate::distributed::task::JoinSelectionLocalitySides {
+		slot.as_ref()
+			.unwrap()
+			.lock()
+			.unwrap()
+			.join_selection_locality
+	}
+
+	fn paired(pairs: &[(u32, u32)]) -> Vec<JoinOutputRow> {
+		pairs
+			.iter()
+			.map(|(left, right)| JoinOutputRow::Paired {
+				left: *left,
+				right: *right,
+			})
+			.collect()
+	}
+
+	/// A fully ascending side is one run covering every row, and lands in every
+	/// bucket its length reaches — and in none above it.
+	#[test]
+	fn an_ascending_side_is_one_run_in_every_bucket_it_reaches() {
+		let task = slot();
+		// Right ascends 0..8 (a run of 8); left is a constant, so every step is a
+		// duplicate and no run exceeds one.
+		let selection = paired(&(0..8).map(|row| (7u32, row)).collect::<Vec<_>>());
+		record_join_selection_locality(&task, &selection);
+		let sides = sides(&task);
+
+		assert_eq!(sides.right.selected_rows, 8);
+		assert_eq!(
+			sides.right.ascending_steps, 7,
+			"seven +1 steps across 8 rows"
+		);
+		assert_eq!(sides.right.run_count, 1);
+		assert_eq!(sides.right.max_run, 8);
+		assert_eq!(
+			sides.right.rows_in_runs_at_least,
+			[8, 8, 8, 0, 0, 0],
+			"a run of 8 covers the >=2, >=4 and >=8 buckets and no higher one; \
+			 buckets are {RUN_LENGTH_BUCKET_MINIMUMS:?}"
+		);
+
+		assert_eq!(sides.left.duplicate_steps, 7);
+		assert_eq!(sides.left.ascending_steps, 0);
+		assert_eq!(
+			sides.left.max_run, 1,
+			"a repeated index is not a run: the gather still pays a lookup per row"
+		);
+	}
+
+	/// Scatter produces runs of one and reaches no bucket. This is the reading
+	/// that would justify abandoning slice reuse, so it must be unambiguous.
+	#[test]
+	fn a_scattered_side_reaches_no_bucket() {
+		let task = slot();
+		let selection = paired(&[(5, 100), (5, 3), (5, 77), (5, 42)]);
+		record_join_selection_locality(&task, &selection);
+		let sides = sides(&task);
+
+		assert_eq!(sides.right.selected_rows, 4);
+		assert_eq!(sides.right.ascending_steps, 0);
+		assert_eq!(sides.right.run_count, 4, "four runs of one");
+		assert_eq!(sides.right.max_run, 1);
+		assert_eq!(sides.right.rows_in_runs_at_least, [0; 6]);
+	}
+
+	/// The bimodal case a mean run length would hide: one long run beside pure
+	/// scatter. The buckets must show both.
+	#[test]
+	fn buckets_separate_a_long_run_from_surrounding_scatter() {
+		let task = slot();
+		let mut pairs: Vec<(u32, u32)> = (0..16).map(|row| (0u32, row)).collect();
+		pairs.extend([(0, 900), (0, 31), (0, 700), (0, 12)]);
+		record_join_selection_locality(&task, &paired(&pairs));
+		let right = sides(&task).right;
+
+		assert_eq!(right.selected_rows, 20);
+		assert_eq!(right.max_run, 16);
+		assert_eq!(right.run_count, 5, "one run of 16 plus four singletons");
+		assert_eq!(
+			right.rows_in_runs_at_least,
+			[16, 16, 16, 16, 0, 0],
+			"the 16 contiguous rows are visible at every bucket up to 16; the mean \
+			 run length here is 4, which would have suggested no run worth slicing"
+		);
+		// The headline fraction alone would read as 75% contiguous, which is true
+		// but says nothing about whether the contiguity is usably clustered.
+		assert_eq!(right.ascending_steps, 15);
+	}
+
+	/// A null on one side breaks that side's run without touching the other.
+	#[test]
+	fn a_null_side_breaks_only_its_own_run() {
+		let task = slot();
+		let selection = vec![
+			JoinOutputRow::Paired { left: 0, right: 0 },
+			JoinOutputRow::Paired { left: 1, right: 1 },
+			JoinOutputRow::RightFillNull { right: 2 },
+			JoinOutputRow::Paired { left: 2, right: 3 },
+		];
+		record_join_selection_locality(&task, &selection);
+		let sides = sides(&task);
+
+		assert_eq!(
+			(sides.left.selected_rows, sides.left.max_run),
+			(3, 2),
+			"the left side contributes no index on the nulled row, and its run \
+			 cannot span the gap the gather will not see as contiguous"
+		);
+		assert_eq!(
+			(sides.right.selected_rows, sides.right.max_run),
+			(4, 4),
+			"the right side ascends through all four rows uninterrupted"
+		);
+	}
+
+	/// Invocations accumulate; the task-local receipt is a sum, not a snapshot of
+	/// the last join. A max is a max across all of them.
+	#[test]
+	fn repeated_invocations_accumulate_on_the_task() {
+		let task = slot();
+		record_join_selection_locality(&task, &paired(&[(0, 0), (1, 1)]));
+		record_join_selection_locality(&task, &paired(&(0..5).map(|r| (r, r)).collect::<Vec<_>>()));
+		let left = sides(&task).left;
+
+		assert_eq!(left.invocations, 2);
+		assert_eq!(left.selected_rows, 7);
+		assert_eq!(left.max_run, 5, "the max spans invocations");
+		assert_eq!(left.run_count, 2);
+	}
+
+	/// An empty selection records nothing at all — not an invocation with zero
+	/// rows, which would make "never gathered" and "gathered nothing" identical.
+	#[test]
+	fn an_empty_selection_records_no_invocation() {
+		let task = slot();
+		record_join_selection_locality(&task, &[]);
+		assert_eq!(sides(&task), Default::default());
 	}
 }

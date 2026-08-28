@@ -6701,6 +6701,7 @@ fn timing_atlas_replay_attribution_path(
 				.get("join_output_materialization_ms")
 				.and_then(|value| value.as_f64())
 				.unwrap_or(0.0),
+			join_selection_locality: node.get("join_selection_locality").cloned(),
 			committed_vocabularies: string_array(node, "committed_vocabularies"),
 			vocabulary_overflow: node
 				.get("vocabulary_overflow")
@@ -7949,6 +7950,13 @@ pub struct TimingAtlasTaskNode {
 	/// ADR 554 follow-on: named join output gathering on this node. Same standing
 	/// and same subtraction rule as `join_input_materialization_ms`.
 	pub join_output_materialization_ms: f64,
+	/// ADR 554 follow-on: run-length structure of this node's join output
+	/// selections, per side, aggregated over the task.
+	///
+	/// **Structure, not cost.** These counters say how contiguous the gathered
+	/// indices were; they say nothing about how long the gather took. Pair them
+	/// with `join_output_materialization_ms`, never read one from the other.
+	pub join_selection_locality: Option<serde_json::Value>,
 	/// ADR 554 follow-on: every streaming route this task committed, from the
 	/// task-local label receipt. This is what names the arm's actual execution
 	/// shape; the node-attribution ledger cannot, because concurrent in-process
@@ -8982,6 +8990,7 @@ fn placement_attempt_from_row(row: &serde_json::Value) -> Result<PlacementAttemp
 			input_processing_ms: 0.0,
 			join_input_materialization_ms: 0.0,
 			join_output_materialization_ms: 0.0,
+			join_selection_locality: None,
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
 			stage_role: String::new(),
@@ -9420,6 +9429,10 @@ pub fn timing_atlas_nodes_from_report(
 					.phases
 					.join_output_materialization_micros as f64
 					/ 1000.0,
+				join_selection_locality: (record.telemetry.join_selection_locality
+					!= Default::default())
+				.then(|| serde_json::to_value(record.telemetry.join_selection_locality).ok())
+				.flatten(),
 				committed_vocabularies: record.telemetry.labels.committed_vocabularies.clone(),
 				vocabulary_overflow: record.telemetry.labels.vocabulary_overflow,
 				stage_role: record.telemetry.labels.stage_role.clone(),
@@ -9462,6 +9475,9 @@ pub fn timing_atlas_local_task_node(
 		input_processing_ms: phases.input_processing_micros as f64 / 1000.0,
 		join_input_materialization_ms: phases.join_input_materialization_micros as f64 / 1000.0,
 		join_output_materialization_ms: phases.join_output_materialization_micros as f64 / 1000.0,
+		// The local arm records no per-task join selection receipt: this synthetic
+		// node stands for a whole local execution, not one task.
+		join_selection_locality: None,
 		committed_vocabularies: Vec::new(),
 		vocabulary_overflow: 0,
 		stage_role: String::new(),
@@ -9545,6 +9561,7 @@ pub fn timing_atlas_attribution_path_row(
 				"input_processing_ms": node.input_processing_ms,
 				"join_input_materialization_ms": node.join_input_materialization_ms,
 				"join_output_materialization_ms": node.join_output_materialization_ms,
+				"join_selection_locality": node.join_selection_locality,
 				"committed_vocabularies": node.committed_vocabularies,
 				"vocabulary_overflow": node.vocabulary_overflow,
 				"stage_role": node.stage_role,
@@ -25770,6 +25787,7 @@ mod adr538_timing_atlas_journal_replay {
 			input_processing_ms: 0.0,
 			join_input_materialization_ms: 0.0,
 			join_output_materialization_ms: 0.0,
+			join_selection_locality: None,
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
 			stage_role: String::new(),
@@ -25879,6 +25897,7 @@ mod adr538_timing_atlas_journal_replay {
 			input_processing_ms: 0.0,
 			join_input_materialization_ms: 0.0,
 			join_output_materialization_ms: 0.0,
+			join_selection_locality: None,
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
 			stage_role: String::new(),
@@ -25916,6 +25935,7 @@ mod adr538_timing_atlas_journal_replay {
 				input_processing_ms: 0.0,
 				join_input_materialization_ms: 0.0,
 				join_output_materialization_ms: 0.0,
+				join_selection_locality: None,
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
 				stage_role: String::new(),
@@ -25946,6 +25966,7 @@ mod adr538_timing_atlas_journal_replay {
 				input_processing_ms: 0.0,
 				join_input_materialization_ms: 0.0,
 				join_output_materialization_ms: 0.0,
+				join_selection_locality: None,
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
 				stage_role: String::new(),
@@ -26932,6 +26953,7 @@ mod adr538_timing_atlas_critical_path {
 			input_processing_ms: 0.0,
 			join_input_materialization_ms: 0.0,
 			join_output_materialization_ms: 0.0,
+			join_selection_locality: None,
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
 			stage_role: String::new(),
@@ -27163,6 +27185,7 @@ mod adr538_path_bound_validation {
 				input_processing_ms: 0.0,
 				join_input_materialization_ms: 0.0,
 				join_output_materialization_ms: 0.0,
+				join_selection_locality: None,
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
 				stage_role: String::new(),
@@ -27187,6 +27210,7 @@ mod adr538_path_bound_validation {
 				input_processing_ms: 0.0,
 				join_input_materialization_ms: 0.0,
 				join_output_materialization_ms: 0.0,
+				join_selection_locality: None,
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
 				stage_role: String::new(),
@@ -27212,6 +27236,7 @@ mod adr538_path_bound_validation {
 				input_processing_ms: 0.0,
 				join_input_materialization_ms: 0.0,
 				join_output_materialization_ms: 0.0,
+				join_selection_locality: None,
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
 				stage_role: String::new(),

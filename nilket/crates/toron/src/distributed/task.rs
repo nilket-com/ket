@@ -115,6 +115,102 @@ pub struct TaskTelemetry {
 	/// exist so a divergence can be localized to a seam instead of inferred from a plan.
 	#[serde(default)]
 	pub shuffle_routing_observations: Vec<ShuffleRoutingObservation>,
+	/// ADR 554 follow-on: run-length structure of join output selections, per side,
+	/// aggregated over this task. Zero invocations means no join gathered here.
+	#[serde(default)]
+	pub join_selection_locality: JoinSelectionLocalitySides,
+}
+
+/// Run-length structure of one side of a join's output selection, accumulated
+/// across every invocation on a task.
+///
+/// ADR 554 follow-on. The output gather costs 3.8 ns/row at sequential indices
+/// and 37.8 ns/row at scattered ones (bench `join_output_gather_shape`), a 5-10x
+/// spread — so whether contiguous-slice reuse is worth a redesign depends
+/// entirely on the run structure of real selections, which no artifact records
+/// today.
+///
+/// **Buckets, not a mean.** A mean run length cannot answer the question: the
+/// useful threshold depends on per-slice and per-batch overhead, which is not
+/// known in advance, and a mean hides a bimodal distribution of long runs mixed
+/// with scatter. `rows_in_runs_at_least` is indexed by
+/// [`RUN_LENGTH_BUCKET_MINIMUMS`], and a row inside a run of length L counts in
+/// every bucket whose minimum is <= L.
+///
+/// **Aggregated task-locally on purpose.** One record per invocation would put
+/// millions of rows of receipts in an artifact to answer a question that twenty
+/// counters answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinSelectionLocality {
+	/// Selections observed. Zero means this side was never gathered — an absence,
+	/// never a claim that its indices were scattered.
+	pub invocations: u64,
+	/// Index positions contributed by this side, summed across invocations. A
+	/// `FillNull` row contributes nothing on the side it nulls.
+	pub selected_rows: u64,
+	/// Steps where the index advanced by exactly one. The `+1` fraction against
+	/// `selected_rows` is the headline locality number.
+	pub ascending_steps: u64,
+	/// Steps that repeated the previous index. Duplicates are what a
+	/// many-to-one join produces; they are neither a run nor scatter, so they are
+	/// counted apart rather than folded into either.
+	pub duplicate_steps: u64,
+	/// Maximal ascending-by-one sequences, counting single rows as runs of one.
+	pub run_count: u64,
+	/// Longest such sequence. A large maximum beside a low `+1` fraction is the
+	/// bimodal case a mean would have hidden.
+	pub max_run: u64,
+	/// Rows inside runs of at least `RUN_LENGTH_BUCKET_MINIMUMS[i]`.
+	pub rows_in_runs_at_least: [u64; RUN_LENGTH_BUCKETS],
+}
+
+/// Run-length thresholds for [`JoinSelectionLocality::rows_in_runs_at_least`].
+pub const RUN_LENGTH_BUCKET_MINIMUMS: [u64; RUN_LENGTH_BUCKETS] = [2, 4, 8, 16, 32, 64];
+
+pub const RUN_LENGTH_BUCKETS: usize = 6;
+
+impl JoinSelectionLocality {
+	/// Fold one completed run into the buckets.
+	pub fn observe_run(&mut self, run: u64) {
+		if run == 0 {
+			return;
+		}
+		self.run_count = self.run_count.saturating_add(1);
+		self.max_run = self.max_run.max(run);
+		for (bucket, minimum) in RUN_LENGTH_BUCKET_MINIMUMS.iter().enumerate() {
+			if run >= *minimum {
+				self.rows_in_runs_at_least[bucket] =
+					self.rows_in_runs_at_least[bucket].saturating_add(run);
+			}
+		}
+	}
+
+	/// Merge another accumulation into this one. Used to combine invocations.
+	pub fn merge(&mut self, other: &Self) {
+		self.invocations = self.invocations.saturating_add(other.invocations);
+		self.selected_rows = self.selected_rows.saturating_add(other.selected_rows);
+		self.ascending_steps = self.ascending_steps.saturating_add(other.ascending_steps);
+		self.duplicate_steps = self.duplicate_steps.saturating_add(other.duplicate_steps);
+		self.run_count = self.run_count.saturating_add(other.run_count);
+		self.max_run = self.max_run.max(other.max_run);
+		for (bucket, rows) in other.rows_in_runs_at_least.iter().enumerate() {
+			self.rows_in_runs_at_least[bucket] =
+				self.rows_in_runs_at_least[bucket].saturating_add(*rows);
+		}
+	}
+}
+
+/// Both sides of a join's selection, kept apart.
+///
+/// The right (probe) side is the one a run-batch emission strategy would
+/// exploit: `probe_in_memory_join_rows` walks probe rows in order. The left
+/// (build) side is the control — hash lookup should scatter it, and a left side
+/// that came back sequential would mean the probe order, not the gather, is
+/// what these numbers describe.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinSelectionLocalitySides {
+	pub left: JoinSelectionLocality,
+	pub right: JoinSelectionLocality,
 }
 
 /// Publication state for ADR 551's task-local phase partition.
