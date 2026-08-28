@@ -26,7 +26,8 @@ use crate::distributed::task::{
 	PartitionEntry, PartitionManifest, RowCount, ShufflePartitionRef, ShuffleRoutingObservation,
 	ShuffleRoutingRole, TaskCompletionOutput, TaskInputBinding, TaskOutputBinding, TaskSpec,
 	TaskTelemetry, TaskTelemetryLabels, is_streamable_exchange_producer,
-	is_streamable_final_result, is_streamable_shuffle_consumer, shuffle_input_table_id,
+	is_streamable_final_result, is_streamable_shuffle_consumer, record_bounded_route,
+	shuffle_input_table_id,
 };
 use crate::distributed::worker_registry::WorkerEndpoint;
 use crate::error::{
@@ -352,9 +353,11 @@ impl ToronWorker {
 							scan_meter: task_context.scan_meter.clone(),
 						});
 						let executor = Executor::with_context(storage, task_context);
+						record_executor_entry_point(&telemetry, "streamable_final:live_input");
 						drive_streamable_plan(&spec.plan, &executor, morsel, sink).await?;
 					} else if overrides.is_empty() {
 						let executor = Executor::with_context(self.storage.clone(), task_context);
+						record_executor_entry_point(&telemetry, "streamable_final:plain");
 						drive_streamable_plan(&spec.plan, &executor, morsel, sink).await?;
 					} else {
 						let executor = Executor::with_context(
@@ -367,6 +370,7 @@ impl ToronWorker {
 							}),
 							task_context,
 						);
+						record_executor_entry_point(&telemetry, "streamable_final:task_input");
 						drive_streamable_plan(&spec.plan, &executor, morsel, sink).await?;
 					}
 					streamed_rows = sink.emitted_rows();
@@ -380,10 +384,12 @@ impl ToronWorker {
 						}),
 					)
 				} else if is_streamable_exchange_producer(spec) {
+					record_executor_entry_point(&telemetry, "live_shuffle_producer");
 					self.execute_live_shuffle_producer(spec, task_context, morsel)
 						.await?
 				} else if self.has_live_shuffle_input(spec) {
 					if is_streamable_shuffle_consumer(spec) {
+						record_executor_entry_point(&telemetry, "live_shuffle_consumer");
 						self.execute_live_shuffle_consumer(spec, task_context, morsel)
 							.await?
 					} else {
@@ -405,10 +411,12 @@ impl ToronWorker {
 							scan_meter: task_context.scan_meter.clone(),
 						});
 						let executor = Executor::with_context(storage, task_context);
+						record_executor_entry_point(&telemetry, "execute_bound:live_input");
 						(executor.execute_bound(&spec.plan, morsel).await?, None)
 					}
 				} else if overrides.is_empty() {
 					let executor = Executor::with_context(self.storage.clone(), task_context);
+					record_executor_entry_point(&telemetry, "execute_bound:plain");
 					(executor.execute_bound(&spec.plan, morsel).await?, None)
 				} else {
 					let executor = Executor::with_context(
@@ -421,6 +429,7 @@ impl ToronWorker {
 						}),
 						task_context,
 					);
+					record_executor_entry_point(&telemetry, "execute_bound:task_input");
 					(executor.execute_bound(&spec.plan, morsel).await?, None)
 				};
 			record_worker_telemetry(&telemetry, |task| {
@@ -1333,6 +1342,26 @@ fn record_worker_telemetry(
 	}
 }
 
+/// Record which task-level dispatch arm took this task.
+///
+/// One call immediately before each arm's driver, so the label and the call it
+/// describes cannot drift apart. The chain is single-shot, so a task records
+/// exactly one arm; the set is bounded anyway because a label receipt must never
+/// be the thing that grows a completion message without limit.
+///
+/// Deliberately unconditional. Every other route diagnostic in this engine is
+/// gated on an opt-in env var, and the distributed arm is exercised only by an
+/// ordinary atlas run — which is exactly where a gated receipt is invisible.
+fn record_executor_entry_point(telemetry: &Arc<Mutex<TaskTelemetry>>, arm: &'static str) {
+	record_worker_telemetry(telemetry, |task| {
+		record_bounded_route(
+			&mut task.labels.executor_entry_points,
+			&mut task.labels.entry_point_overflow,
+			arm,
+		);
+	});
+}
+
 fn snapshot_worker_telemetry(telemetry: &Arc<Mutex<TaskTelemetry>>) -> TaskTelemetry {
 	telemetry
 		.lock()
@@ -1389,6 +1418,13 @@ fn task_telemetry_for_spec(spec: &TaskSpec) -> TaskTelemetry {
 			// empty at spec time is the correct starting state, not a missing value.
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
+			// Filled by `record_executor_entry_point` when the dispatch chain picks an
+			// arm, and by the executor as it walks the fragment. Empty at spec time is
+			// the correct starting state, not a missing value.
+			executor_entry_points: Vec::new(),
+			entry_point_overflow: 0,
+			executed_node_kinds: Vec::new(),
+			node_kind_overflow: 0,
 		},
 		..TaskTelemetry::default()
 	}
@@ -1461,6 +1497,19 @@ fn contains_join(plan: &ExecutionPlan) -> bool {
 	}
 }
 
+/// The fragment's operator kind: a join anywhere in the tree dominates, otherwise
+/// the root node names it. Whole-tree by design — this is a *fragment shape*
+/// label, computed before execution and never updated by it. The per-node route
+/// receipt is `TaskTelemetryLabels::executed_node_kinds`, which is the opposite:
+/// recorded during execution and non-dominating.
+///
+/// The arm list below is deliberately spelled out rather than delegated to
+/// `ExecutionPlan::node_label`, which produces the same names. Several ADR
+/// guards (033, 034, 036, 062, 063, 064, 070, 095, 099) assert that a specific
+/// variant is labelled *here*, in the worker layer, and delegating would move
+/// the text out from under all of them at once. `adr554_operator_kind_label_and_
+/// node_label_agree` pins the two lists together instead, so the duplication
+/// cannot drift.
 fn operator_kind_label(plan: &ExecutionPlan) -> &'static str {
 	if contains_join(plan) {
 		"join"

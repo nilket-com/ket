@@ -6606,6 +6606,24 @@ impl TimingAtlasReplay {
 /// Re-derive one attribution-path row from its own nodes. The persisted path, its wall,
 /// its portions and its remainder are all recomputed and compared; on success the
 /// recomputed portions are returned for the cell-level component checks.
+/// Read a JSON string array from an atlas node, defaulting to empty.
+///
+/// Empty is the right default for a route receipt: the field is absent in every
+/// artifact written before it existed, and an absent receipt genuinely means "no
+/// routes recorded". Unlike a timing figure, defaulting one to zero cannot make a
+/// residual recompute to a wrong number — it only makes the set say nothing.
+fn string_array(node: &serde_json::Value, key: &str) -> Vec<String> {
+	node.get(key)
+		.and_then(|value| value.as_array())
+		.map(|values| {
+			values
+				.iter()
+				.filter_map(|value| value.as_str().map(ToOwned::to_owned))
+				.collect()
+		})
+		.unwrap_or_default()
+}
+
 fn timing_atlas_replay_attribution_path(
 	row: &serde_json::Value,
 ) -> Result<BTreeMap<String, f64>, Vec<String>> {
@@ -6675,16 +6693,7 @@ fn timing_atlas_replay_attribution_path(
 				.get("input_processing_ms")
 				.and_then(|value| value.as_f64())
 				.unwrap_or(0.0),
-			committed_vocabularies: node
-				.get("committed_vocabularies")
-				.and_then(|value| value.as_array())
-				.map(|values| {
-					values
-						.iter()
-						.filter_map(|value| value.as_str().map(ToOwned::to_owned))
-						.collect()
-				})
-				.unwrap_or_default(),
+			committed_vocabularies: string_array(node, "committed_vocabularies"),
 			vocabulary_overflow: node
 				.get("vocabulary_overflow")
 				.and_then(|value| value.as_u64())
@@ -6694,6 +6703,29 @@ fn timing_atlas_replay_attribution_path(
 				.and_then(|value| value.as_str())
 				.unwrap_or_default()
 				.to_owned(),
+			executor_entry_points: string_array(node, "executor_entry_points"),
+			entry_point_overflow: node
+				.get("entry_point_overflow")
+				.and_then(|value| value.as_u64())
+				.unwrap_or(0) as u32,
+			executed_node_kinds: string_array(node, "executed_node_kinds"),
+			node_kind_overflow: node
+				.get("node_kind_overflow")
+				.and_then(|value| value.as_u64())
+				.unwrap_or(0) as u32,
+			strategy: node
+				.get("strategy")
+				.and_then(|value| value.as_str())
+				.map(ToOwned::to_owned),
+			operator_kind: node
+				.get("operator_kind")
+				.and_then(|value| value.as_str())
+				.unwrap_or_default()
+				.to_owned(),
+			worker_count: node
+				.get("worker_count")
+				.and_then(|value| value.as_u64())
+				.map(|value| value as u32),
 			telemetry_lock_ms: node
 				.get("telemetry_lock_ms")
 				.and_then(|value| value.as_f64())
@@ -7909,6 +7941,39 @@ pub struct TimingAtlasTaskNode {
 	/// `source_publish`, `shuffle_consumer`, `scan`, `join_final`). Already
 	/// produced by the engine and previously dropped by this harness.
 	pub stage_role: String,
+	/// The task-level dispatch arm that ran this fragment, from the engine's
+	/// task-local receipt. This is the fact `committed_vocabularies` could not
+	/// supply on the distributed arm: it is written at the dispatch chain, so it
+	/// is present whatever route the fragment then takes.
+	///
+	/// **Presence is not attribution.** Knowing a task ran through
+	/// `live_shuffle_producer` says nothing about where its time went; pair it
+	/// with the components and the remainder subterms, never read it as either.
+	pub executor_entry_points: Vec<String>,
+	/// Non-zero means `executor_entry_points` is a PARTIAL set.
+	pub entry_point_overflow: u32,
+	/// The `ExecutionPlan` variants the recursive executor dispatched on, from the
+	/// same receipt. Kept separate from the entry points on purpose: that names the
+	/// driver, this names the plan nodes the driver walked. Merging them would
+	/// answer neither question.
+	///
+	/// Same warning: a node kind appearing here means it executed, not that it cost
+	/// anything.
+	pub executed_node_kinds: Vec<String>,
+	/// Non-zero means `executed_node_kinds` is a PARTIAL set, so an absent kind
+	/// cannot be read as "never executed".
+	pub node_kind_overflow: u32,
+	/// The join strategy the scheduler chose for this fragment (`hash_partitioned`
+	/// or `broadcast`), or `None` when the fragment holds no join. Produced by the
+	/// engine since ADR 538 and previously dropped by this harness.
+	pub strategy: Option<String>,
+	/// The fragment's operator kind, join-dominant: a join anywhere in the tree
+	/// labels the whole fragment. A *plan shape* label computed before execution —
+	/// contrast `executed_node_kinds`, which is recorded during it.
+	pub operator_kind: String,
+	/// Upstream worker count for this task's shuffle inputs, where the binding
+	/// declares one.
+	pub worker_count: Option<u32>,
 	/// The worker this task ran on, as its UUID string. Present so an artifact can
 	/// answer whether concurrent stage siblings actually landed on different
 	/// workers — the question ADR 554 Branch B could only answer "consistent
@@ -8870,6 +8935,13 @@ fn placement_attempt_from_row(row: &serde_json::Value) -> Result<PlacementAttemp
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
 			stage_role: String::new(),
+			executor_entry_points: Vec::new(),
+			entry_point_overflow: 0,
+			executed_node_kinds: Vec::new(),
+			node_kind_overflow: 0,
+			strategy: None,
+			operator_kind: String::new(),
+			worker_count: None,
 			worker_id,
 			upstream,
 		});
@@ -9291,6 +9363,13 @@ pub fn timing_atlas_nodes_from_report(
 				committed_vocabularies: record.telemetry.labels.committed_vocabularies.clone(),
 				vocabulary_overflow: record.telemetry.labels.vocabulary_overflow,
 				stage_role: record.telemetry.labels.stage_role.clone(),
+				executor_entry_points: record.telemetry.labels.executor_entry_points.clone(),
+				entry_point_overflow: record.telemetry.labels.entry_point_overflow,
+				executed_node_kinds: record.telemetry.labels.executed_node_kinds.clone(),
+				node_kind_overflow: record.telemetry.labels.node_kind_overflow,
+				strategy: record.telemetry.labels.strategy.clone(),
+				operator_kind: record.telemetry.labels.operator_kind.clone(),
+				worker_count: record.telemetry.labels.worker_count,
 				telemetry_lock_ms: record.telemetry.phases.telemetry_lock_micros as f64 / 1000.0,
 				framework_overhead_ms: record.telemetry.phases.framework_overhead_micros as f64
 					/ 1000.0,
@@ -9324,6 +9403,13 @@ pub fn timing_atlas_local_task_node(
 		committed_vocabularies: Vec::new(),
 		vocabulary_overflow: 0,
 		stage_role: String::new(),
+		executor_entry_points: Vec::new(),
+		entry_point_overflow: 0,
+		executed_node_kinds: Vec::new(),
+		node_kind_overflow: 0,
+		strategy: None,
+		operator_kind: String::new(),
+		worker_count: None,
 		telemetry_lock_ms: phases.telemetry_lock_micros as f64 / 1000.0,
 		framework_overhead_ms: phases.framework_overhead_micros as f64 / 1000.0,
 		upstream: Vec::new(),
@@ -9396,6 +9482,13 @@ pub fn timing_atlas_attribution_path_row(
 				"committed_vocabularies": node.committed_vocabularies,
 				"vocabulary_overflow": node.vocabulary_overflow,
 				"stage_role": node.stage_role,
+				"executor_entry_points": node.executor_entry_points,
+				"entry_point_overflow": node.entry_point_overflow,
+				"executed_node_kinds": node.executed_node_kinds,
+				"node_kind_overflow": node.node_kind_overflow,
+				"strategy": node.strategy,
+				"operator_kind": node.operator_kind,
+				"worker_count": node.worker_count,
 				"telemetry_lock_ms": node.telemetry_lock_ms,
 				"framework_overhead_ms": node.framework_overhead_ms,
 				"upstream": node.upstream,
@@ -25469,6 +25562,80 @@ mod adr538_timing_atlas_journal_replay {
 		);
 		assert_eq!(serialized["stage_role"], "join_publish");
 	}
+
+	/// ADR 554 follow-on: the two route receipts stay separate, and stay whole,
+	/// through serialization.
+	///
+	/// Separation is the property under test. The entry point names the task-level
+	/// driver; the node kinds name what that driver walked. A serialization that
+	/// merged them, or that let one set's overflow stand in for the other's, would
+	/// let a partial list read as complete coverage of a different question.
+	#[test]
+	fn timing_atlas_node_serialization_keeps_the_two_route_receipts_separate() {
+		let mut node = decomposition_node(0.0, 0.0, 10.0);
+		node.executor_entry_points = vec!["live_shuffle_producer".to_owned()];
+		node.entry_point_overflow = 0;
+		node.executed_node_kinds =
+			vec!["exchange".to_owned(), "join".to_owned(), "scan".to_owned()];
+		node.node_kind_overflow = 2;
+		node.strategy = Some("hash_partitioned".to_owned());
+		node.operator_kind = "join".to_owned();
+		node.worker_count = Some(4);
+
+		let attribution = timing_atlas_child_attribution(vec![node]).expect("fixture attributes");
+		let row = timing_atlas_attribution_path_row("q21", "distributed", 0, 1, 10.0, &attribution);
+		let serialized = row["nodes"][0].clone();
+
+		assert_eq!(
+			serialized["executor_entry_points"][0],
+			"live_shuffle_producer"
+		);
+		assert_eq!(serialized["executed_node_kinds"][1], "join");
+		assert_eq!(serialized["strategy"], "hash_partitioned");
+		assert_eq!(serialized["operator_kind"], "join");
+		assert_eq!(serialized["worker_count"], 4);
+		assert_eq!(
+			(
+				serialized["entry_point_overflow"].as_u64(),
+				serialized["node_kind_overflow"].as_u64()
+			),
+			(Some(0), Some(2)),
+			"each set carries its OWN overflow; one standing in for the other would \
+			 make a complete entry-point set read as truncated, or a truncated node \
+			 kind set read as complete"
+		);
+	}
+
+	/// Replay reads the route sets back from the artifact, and reads them the same
+	/// way for all three.
+	///
+	/// Replay does not compute anything from these fields — they are labels, not
+	/// terms — so a wrong reader would never fail an arithmetic check. What it
+	/// would do is make a replayed node claim a route it never took, or lose one it
+	/// did. The absent and wrong-typed cases are the ones an old artifact actually
+	/// produces.
+	#[test]
+	fn route_set_replay_reader_defaults_empty_and_ignores_non_strings() {
+		let node = serde_json::json!({
+			"executed_node_kinds": ["scan", 7, "join", null],
+			"executor_entry_points": "not_an_array",
+		});
+
+		assert_eq!(
+			string_array(&node, "executed_node_kinds"),
+			["scan", "join"],
+			"a non-string entry is dropped, not rendered as its debug form"
+		);
+		assert!(
+			string_array(&node, "executor_entry_points").is_empty(),
+			"a wrong-typed field reads as no routes, never as one route named by \
+			 the field's own text"
+		);
+		assert!(
+			string_array(&node, "committed_vocabularies").is_empty(),
+			"absent in every artifact written before the receipt existed"
+		);
+	}
 	/// One node carrying components, bookkeeping, and a wall far larger than either.
 	fn decomposition_node(
 		telemetry_lock_ms: f64,
@@ -25481,6 +25648,13 @@ mod adr538_timing_atlas_journal_replay {
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
 			stage_role: String::new(),
+			executor_entry_points: Vec::new(),
+			entry_point_overflow: 0,
+			executed_node_kinds: Vec::new(),
+			node_kind_overflow: 0,
+			strategy: None,
+			operator_kind: String::new(),
+			worker_count: None,
 			stage_id: 0,
 			task_id: 0,
 			wall_ms,
@@ -25581,6 +25755,13 @@ mod adr538_timing_atlas_journal_replay {
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
 			stage_role: String::new(),
+			executor_entry_points: Vec::new(),
+			entry_point_overflow: 0,
+			executed_node_kinds: Vec::new(),
+			node_kind_overflow: 0,
+			strategy: None,
+			operator_kind: String::new(),
+			worker_count: None,
 			telemetry_lock_ms: 0.0,
 			framework_overhead_ms: 0.0,
 			upstream: Vec::new(),
@@ -25609,6 +25790,13 @@ mod adr538_timing_atlas_journal_replay {
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
 				stage_role: String::new(),
+				executor_entry_points: Vec::new(),
+				entry_point_overflow: 0,
+				executed_node_kinds: Vec::new(),
+				node_kind_overflow: 0,
+				strategy: None,
+				operator_kind: String::new(),
+				worker_count: None,
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: Vec::new(),
@@ -25630,6 +25818,13 @@ mod adr538_timing_atlas_journal_replay {
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
 				stage_role: String::new(),
+				executor_entry_points: Vec::new(),
+				entry_point_overflow: 0,
+				executed_node_kinds: Vec::new(),
+				node_kind_overflow: 0,
+				strategy: None,
+				operator_kind: String::new(),
+				worker_count: None,
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![(0, 0)],
@@ -26607,6 +26802,13 @@ mod adr538_timing_atlas_critical_path {
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
 			stage_role: String::new(),
+			executor_entry_points: Vec::new(),
+			entry_point_overflow: 0,
+			executed_node_kinds: Vec::new(),
+			node_kind_overflow: 0,
+			strategy: None,
+			operator_kind: String::new(),
+			worker_count: None,
 			telemetry_lock_ms: 0.0,
 			framework_overhead_ms: 0.0,
 			upstream,
@@ -26829,6 +27031,13 @@ mod adr538_path_bound_validation {
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
 				stage_role: String::new(),
+				executor_entry_points: Vec::new(),
+				entry_point_overflow: 0,
+				executed_node_kinds: Vec::new(),
+				node_kind_overflow: 0,
+				strategy: None,
+				operator_kind: String::new(),
+				worker_count: None,
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![],
@@ -26844,6 +27053,13 @@ mod adr538_path_bound_validation {
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
 				stage_role: String::new(),
+				executor_entry_points: Vec::new(),
+				entry_point_overflow: 0,
+				executed_node_kinds: Vec::new(),
+				node_kind_overflow: 0,
+				strategy: None,
+				operator_kind: String::new(),
+				worker_count: None,
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![(0, 0)],
@@ -26860,6 +27076,13 @@ mod adr538_path_bound_validation {
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
 				stage_role: String::new(),
+				executor_entry_points: Vec::new(),
+				entry_point_overflow: 0,
+				executed_node_kinds: Vec::new(),
+				node_kind_overflow: 0,
+				strategy: None,
+				operator_kind: String::new(),
+				worker_count: None,
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![(0, 0)],

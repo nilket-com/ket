@@ -306,6 +306,59 @@ pub struct TaskTelemetryLabels {
 	/// already-recorded name are not overflow.
 	#[serde(default)]
 	pub vocabulary_overflow: u32,
+	/// The task-level dispatch arm that took this task, from the if/else chain in
+	/// `server::execute_task_local_with_telemetry_and_stream_sink`. Six arms exist
+	/// (three `drive_streamable_plan` shapes, the live shuffle producer, the live
+	/// shuffle consumer, and three `execute_bound` shapes); the chain is
+	/// single-shot, so an ordinary task records exactly one.
+	///
+	/// Kept separate from `executed_node_kinds` on purpose. This says which
+	/// *driver* ran the fragment; that says which plan nodes the driver walked.
+	/// One list holding both would answer neither question cleanly.
+	#[serde(default)]
+	pub executor_entry_points: Vec<String>,
+	/// Non-zero means `executor_entry_points` is a PARTIAL set. See
+	/// `vocabulary_overflow` for why a repeat is not overflow.
+	#[serde(default)]
+	pub entry_point_overflow: u32,
+	/// Every `ExecutionPlan` variant `exec::execute_bound_node` actually dispatched
+	/// on, by `ExecutionPlan::node_label`. Recorded on entry to the recursive
+	/// executor, so it covers the whole fragment tree the driver walked, not just
+	/// its root.
+	///
+	/// **Presence is not attribution.** This says a node kind executed, never how
+	/// long it took or what share it held. Reading a cost from membership here is
+	/// the same error as reading one from a plan dump.
+	#[serde(default)]
+	pub executed_node_kinds: Vec<String>,
+	/// Non-zero means `executed_node_kinds` is a PARTIAL set, so an absent kind
+	/// cannot be read as "never executed".
+	#[serde(default)]
+	pub node_kind_overflow: u32,
+}
+
+/// Bound on a task-local route set. Small on purpose: these sets name *which*
+/// routes ran, and a receipt that could grow without limit would turn a label
+/// into an unbounded payload on every task completion message.
+pub const MAX_TASK_ROUTE_LABELS: usize = 16;
+
+/// Record `name` into a bounded, deduplicated route set, counting what the bound
+/// dropped.
+///
+/// One writer for every such set — committed vocabularies, executor entry points,
+/// executed node kinds — so the three cannot drift into different notions of what
+/// overflow means. A repeat of an already-recorded name is **not** overflow: the
+/// set already covers that route, and counting it would make a complete receipt
+/// read as truncated.
+pub fn record_bounded_route(set: &mut Vec<String>, overflow: &mut u32, name: &str) {
+	if set.iter().any(|existing| existing == name) {
+		return;
+	}
+	if set.len() >= MAX_TASK_ROUTE_LABELS {
+		*overflow = overflow.saturating_add(1);
+		return;
+	}
+	set.push(name.to_string());
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -410,6 +463,16 @@ mod join_spill_observation_tests {
 		.expect("legacy telemetry remains readable");
 		assert!(legacy.join_spill_observations.is_empty());
 		assert!(legacy.partition_work_concurrency_observations.is_empty());
+
+		// The route receipts are label fields on the same struct, so a peer that
+		// predates them must still deserialize. Asserted per field rather than as a
+		// whole-struct default: `serde(default)` is easy to omit on one of four.
+		assert!(legacy.labels.committed_vocabularies.is_empty());
+		assert_eq!(legacy.labels.vocabulary_overflow, 0);
+		assert!(legacy.labels.executor_entry_points.is_empty());
+		assert_eq!(legacy.labels.entry_point_overflow, 0);
+		assert!(legacy.labels.executed_node_kinds.is_empty());
+		assert_eq!(legacy.labels.node_kind_overflow, 0);
 
 		let observation = JoinSpillObservation {
 			replay_id: JoinReplayId(0),
