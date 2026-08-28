@@ -338,6 +338,58 @@ fn time_join_materialization<T>(
 	outcome
 }
 
+/// Whether a `materialize_join_selection` call charges its per-side `take` loops
+/// to the nested child counters.
+///
+/// An explicit type rather than an `Option`, so every call site states which it
+/// is. The generic path charges; the spilled and streaming paths must not,
+/// because their gathers already run inside the Spill and operator brackets and
+/// charging them here would attribute the same work to two accounting families.
+/// A caller cannot forget to decide — there is no default.
+#[derive(Clone, Copy)]
+pub(super) enum SideTakeTiming<'a> {
+	/// Charge both side loops to the task's nested child counters.
+	Charged(&'a Option<Arc<Mutex<TaskTelemetry>>>),
+	/// Do not charge. The gather is accounted elsewhere.
+	AccountedElsewhere,
+}
+
+impl SideTakeTiming<'_> {
+	fn time<T>(
+		self,
+		side: fn(&mut crate::distributed::task::TaskTelemetryPhases) -> &mut u64,
+		body: impl FnOnce() -> Result<T, ExecutionError>,
+	) -> Result<T, ExecutionError> {
+		let Self::Charged(telemetry) = self else {
+			return body();
+		};
+		let started = Instant::now();
+		let outcome = body();
+		let elapsed = duration_micros(started);
+		// Charged on the error path for the same reason the parent bracket is: the
+		// time was inside the task wall either way.
+		record_task_telemetry(telemetry, |task| {
+			let slot = side(&mut task.phases);
+			*slot = slot.saturating_add(elapsed);
+		});
+		outcome
+	}
+
+	fn time_left<T>(
+		self,
+		body: impl FnOnce() -> Result<T, ExecutionError>,
+	) -> Result<T, ExecutionError> {
+		self.time(|phases| &mut phases.join_output_left_take_micros, body)
+	}
+
+	fn time_right<T>(
+		self,
+		body: impl FnOnce() -> Result<T, ExecutionError>,
+	) -> Result<T, ExecutionError> {
+		self.time(|phases| &mut phases.join_output_right_take_micros, body)
+	}
+}
+
 /// Environment variable enabling the join selection locality probe.
 ///
 /// **Opt-in on purpose, unlike every other ADR 554 receipt.** The others record
@@ -867,6 +919,7 @@ pub(super) async fn execute_hash_join(
 			&selection,
 			output_schema,
 			task_budget.memory.get(),
+			SideTakeTiming::Charged(&telemetry),
 		)
 	})?];
 
@@ -1372,6 +1425,7 @@ pub(super) fn execute_cross_join_match_all(
 							&selection,
 							output_schema,
 							memory_cap,
+							SideTakeTiming::Charged(telemetry),
 						)
 					})?);
 
@@ -1389,6 +1443,7 @@ pub(super) fn execute_cross_join_match_all(
 					&selection,
 					output_schema,
 					memory_cap,
+					SideTakeTiming::Charged(telemetry),
 				)
 			})?);
 		}
@@ -1449,6 +1504,8 @@ pub(super) fn materialize_join_selection(
 	output_schema: &arrow::datatypes::SchemaRef,
 
 	memory_cap: u64,
+
+	side_timing: SideTakeTiming<'_>,
 ) -> Result<RecordBatch, ExecutionError> {
 	if selection.is_empty() {
 		return Ok(RecordBatch::new_empty(output_schema.clone()));
@@ -1508,16 +1565,21 @@ pub(super) fn materialize_join_selection(
 
 			let right_indices = UInt32Array::from(right_indices);
 
-			let mut columns =
-				Vec::with_capacity(left_batch.num_columns() + right_batch.num_columns());
+			let mut columns = side_timing.time_left(|| {
+				let mut columns =
+					Vec::with_capacity(left_batch.num_columns() + right_batch.num_columns());
+				for column in left_batch.columns() {
+					columns.push(arrow::compute::take(column, &left_indices, None)?);
+				}
+				Ok(columns)
+			})?;
 
-			for column in left_batch.columns() {
-				columns.push(arrow::compute::take(column, &left_indices, None)?);
-			}
-
-			for column in right_batch.columns() {
-				columns.push(arrow::compute::take(column, &right_indices, None)?);
-			}
+			side_timing.time_right(|| {
+				for column in right_batch.columns() {
+					columns.push(arrow::compute::take(column, &right_indices, None)?);
+				}
+				Ok(())
+			})?;
 
 			columns
 		}
@@ -1535,13 +1597,13 @@ pub(super) fn materialize_join_selection(
 
 			let left_indices = UInt32Array::from(left_indices);
 
-			let mut columns = Vec::with_capacity(left_batch.num_columns());
-
-			for column in left_batch.columns() {
-				columns.push(arrow::compute::take(column, &left_indices, None)?);
-			}
-
-			columns
+			side_timing.time_left(|| {
+				let mut columns = Vec::with_capacity(left_batch.num_columns());
+				for column in left_batch.columns() {
+					columns.push(arrow::compute::take(column, &left_indices, None)?);
+				}
+				Ok(columns)
+			})?
 		}
 
 		JoinKind::RightSemi | JoinKind::RightAnti => {
@@ -1557,13 +1619,13 @@ pub(super) fn materialize_join_selection(
 
 			let right_indices = UInt32Array::from(right_indices);
 
-			let mut columns = Vec::with_capacity(right_batch.num_columns());
-
-			for column in right_batch.columns() {
-				columns.push(arrow::compute::take(column, &right_indices, None)?);
-			}
-
-			columns
+			side_timing.time_right(|| {
+				let mut columns = Vec::with_capacity(right_batch.num_columns());
+				for column in right_batch.columns() {
+					columns.push(arrow::compute::take(column, &right_indices, None)?);
+				}
+				Ok(columns)
+			})?
 		}
 	};
 

@@ -569,6 +569,29 @@ pub struct TaskTelemetryPhases {
 	/// not a component.
 	#[serde(default)]
 	pub join_output_materialization_micros: u64,
+	/// Time inside `join_output_materialization_micros` spent in the LEFT side's
+	/// complete `take` column loop.
+	///
+	/// **A nested child of the parent, not a sibling.** It is deliberately absent
+	/// from `recompute_framework_overhead`: the parent already left the residual,
+	/// and subtracting a child again would remove the same microseconds twice and
+	/// break the task-wall partition. `adr554_join_output_side_children_are_not_
+	/// subtracted_again` pins that.
+	///
+	/// One timer around the whole loop, never per column: the probe side already
+	/// runs at 3.8-7.9 ns/row, and a per-column `Instant::now()` pair would be a
+	/// material fraction of what it claims to measure.
+	#[serde(default)]
+	pub join_output_left_take_micros: u64,
+	/// The RIGHT side's complete `take` column loop. Same standing as
+	/// `join_output_left_take_micros`.
+	///
+	/// The two children do not have to sum to the parent, and normally will not:
+	/// `output_total - left - right` is the shared cost — index-vector
+	/// construction, `UInt32Array` creation, and final batch assembly. That
+	/// residual is where the `Vec<Option<u32>>` opportunity lives.
+	#[serde(default)]
+	pub join_output_right_take_micros: u64,
 	/// Time spent partitioning batches across an exchange boundary. Written by the executor,
 	/// so it is produced on both arms: locally as in-memory repartitioning, and inside a
 	/// distributed producer task. That symmetry is what makes it a paired component.

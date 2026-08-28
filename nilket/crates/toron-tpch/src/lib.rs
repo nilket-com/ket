@@ -6708,6 +6708,14 @@ fn timing_atlas_replay_attribution_path(
 				.get("join_output_materialization_ms")
 				.and_then(|value| value.as_f64())
 				.unwrap_or(0.0),
+			join_output_left_take_ms: node
+				.get("join_output_left_take_ms")
+				.and_then(|value| value.as_f64())
+				.unwrap_or(0.0),
+			join_output_right_take_ms: node
+				.get("join_output_right_take_ms")
+				.and_then(|value| value.as_f64())
+				.unwrap_or(0.0),
 			join_selection_locality: node.get("join_selection_locality").cloned(),
 			committed_vocabularies: string_array(node, "committed_vocabularies"),
 			vocabulary_overflow: node
@@ -7957,6 +7965,16 @@ pub struct TimingAtlasTaskNode {
 	/// ADR 554 follow-on: named join output gathering on this node. Same standing
 	/// and same subtraction rule as `join_input_materialization_ms`.
 	pub join_output_materialization_ms: f64,
+	/// ADR 554 follow-on: the LEFT side's complete `take` loop, nested INSIDE
+	/// `join_output_materialization_ms`.
+	///
+	/// **Never subtract this from a residual.** The parent already left
+	/// `framework_overhead`; removing a child again would take the same
+	/// microseconds out twice. `left + right <= parent` is the identity, and
+	/// `parent - left - right` is the shared index and assembly cost.
+	pub join_output_left_take_ms: f64,
+	/// The RIGHT side's complete `take` loop, nested the same way.
+	pub join_output_right_take_ms: f64,
 	/// ADR 554 follow-on: run-length structure of this node's join output
 	/// selections, per side, aggregated over the task.
 	///
@@ -8351,6 +8369,15 @@ pub fn timing_atlas_validate_path_bound_receipts(
 /// subtracted again wherever this harness recomputes an unnamed residual.
 /// Distinct from `TIMING_ATLAS_UNATTRIBUTED_PHASES`, which is bookkeeping and
 /// envelopes — those name nothing and explain nothing.
+/// Phase counters nested INSIDE another counter. They are neither mapped to a
+/// component nor subtracted from any residual: their parent already left the
+/// residual, and subtracting a child again would remove the same microseconds
+/// twice. They exist to split a parent, never to reduce it.
+pub const TIMING_ATLAS_NESTED_CHILD_PHASES: [&str; 2] = [
+	"join_output_left_take_micros",
+	"join_output_right_take_micros",
+];
+
 pub const TIMING_ATLAS_NAMED_REMAINDER_PHASES: [&str; 4] = [
 	"aggregate_accumulation_micros",
 	"input_processing_micros",
@@ -8997,6 +9024,8 @@ fn placement_attempt_from_row(row: &serde_json::Value) -> Result<PlacementAttemp
 			input_processing_ms: 0.0,
 			join_input_materialization_ms: 0.0,
 			join_output_materialization_ms: 0.0,
+			join_output_left_take_ms: 0.0,
+			join_output_right_take_ms: 0.0,
 			join_selection_locality: None,
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
@@ -9436,6 +9465,10 @@ pub fn timing_atlas_nodes_from_report(
 					.phases
 					.join_output_materialization_micros as f64
 					/ 1000.0,
+				join_output_left_take_ms: record.telemetry.phases.join_output_left_take_micros
+					as f64 / 1000.0,
+				join_output_right_take_ms: record.telemetry.phases.join_output_right_take_micros
+					as f64 / 1000.0,
 				join_selection_locality: (record.telemetry.join_selection_locality
 					!= Default::default())
 				.then(|| serde_json::to_value(record.telemetry.join_selection_locality).ok())
@@ -9484,6 +9517,8 @@ pub fn timing_atlas_local_task_node(
 		join_output_materialization_ms: phases.join_output_materialization_micros as f64 / 1000.0,
 		// The local arm records no per-task join selection receipt: this synthetic
 		// node stands for a whole local execution, not one task.
+		join_output_left_take_ms: 0.0,
+		join_output_right_take_ms: 0.0,
 		join_selection_locality: None,
 		committed_vocabularies: Vec::new(),
 		vocabulary_overflow: 0,
@@ -9568,6 +9603,8 @@ pub fn timing_atlas_attribution_path_row(
 				"input_processing_ms": node.input_processing_ms,
 				"join_input_materialization_ms": node.join_input_materialization_ms,
 				"join_output_materialization_ms": node.join_output_materialization_ms,
+				"join_output_left_take_ms": node.join_output_left_take_ms,
+				"join_output_right_take_ms": node.join_output_right_take_ms,
 				"join_selection_locality": node.join_selection_locality,
 				"committed_vocabularies": node.committed_vocabularies,
 				"vocabulary_overflow": node.vocabulary_overflow,
@@ -25794,6 +25831,8 @@ mod adr538_timing_atlas_journal_replay {
 			input_processing_ms: 0.0,
 			join_input_materialization_ms: 0.0,
 			join_output_materialization_ms: 0.0,
+			join_output_left_take_ms: 0.0,
+			join_output_right_take_ms: 0.0,
 			join_selection_locality: None,
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
@@ -25904,6 +25943,8 @@ mod adr538_timing_atlas_journal_replay {
 			input_processing_ms: 0.0,
 			join_input_materialization_ms: 0.0,
 			join_output_materialization_ms: 0.0,
+			join_output_left_take_ms: 0.0,
+			join_output_right_take_ms: 0.0,
 			join_selection_locality: None,
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
@@ -25942,6 +25983,8 @@ mod adr538_timing_atlas_journal_replay {
 				input_processing_ms: 0.0,
 				join_input_materialization_ms: 0.0,
 				join_output_materialization_ms: 0.0,
+				join_output_left_take_ms: 0.0,
+				join_output_right_take_ms: 0.0,
 				join_selection_locality: None,
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
@@ -25973,6 +26016,8 @@ mod adr538_timing_atlas_journal_replay {
 				input_processing_ms: 0.0,
 				join_input_materialization_ms: 0.0,
 				join_output_materialization_ms: 0.0,
+				join_output_left_take_ms: 0.0,
+				join_output_right_take_ms: 0.0,
 				join_selection_locality: None,
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
@@ -26960,6 +27005,8 @@ mod adr538_timing_atlas_critical_path {
 			input_processing_ms: 0.0,
 			join_input_materialization_ms: 0.0,
 			join_output_materialization_ms: 0.0,
+			join_output_left_take_ms: 0.0,
+			join_output_right_take_ms: 0.0,
 			join_selection_locality: None,
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
@@ -27192,6 +27239,8 @@ mod adr538_path_bound_validation {
 				input_processing_ms: 0.0,
 				join_input_materialization_ms: 0.0,
 				join_output_materialization_ms: 0.0,
+				join_output_left_take_ms: 0.0,
+				join_output_right_take_ms: 0.0,
 				join_selection_locality: None,
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
@@ -27217,6 +27266,8 @@ mod adr538_path_bound_validation {
 				input_processing_ms: 0.0,
 				join_input_materialization_ms: 0.0,
 				join_output_materialization_ms: 0.0,
+				join_output_left_take_ms: 0.0,
+				join_output_right_take_ms: 0.0,
 				join_selection_locality: None,
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
@@ -27243,6 +27294,8 @@ mod adr538_path_bound_validation {
 				input_processing_ms: 0.0,
 				join_input_materialization_ms: 0.0,
 				join_output_materialization_ms: 0.0,
+				join_output_left_take_ms: 0.0,
+				join_output_right_take_ms: 0.0,
 				join_selection_locality: None,
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
@@ -27590,6 +27643,12 @@ mod adr538_phase_component_wiring {
 			input_processing_micros: 53,
 			join_input_materialization_micros: 59,
 			join_output_materialization_micros: 61,
+			// Nested children of the parent above. They carry primes too, and the
+			// assertions below require them to appear on NEITHER side of the
+			// totality equation — a child folded into a component or into the
+			// remainder would double-count against its own parent.
+			join_output_left_take_micros: 67,
+			join_output_right_take_micros: 71,
 		};
 		let portions = timing_atlas_component_portions_ms(&phases);
 		let by_label: BTreeMap<&str, f64> = portions
@@ -27628,6 +27687,15 @@ mod adr538_phase_component_wiring {
 		);
 		assert_eq!(TIMING_ATLAS_UNATTRIBUTED_PHASES.len(), 3);
 		assert_eq!(TIMING_ATLAS_NAMED_REMAINDER_PHASES.len(), 4);
+		assert_eq!(TIMING_ATLAS_NESTED_CHILD_PHASES.len(), 2);
+		assert_eq!(
+			mapped_micros + bookkeeping_micros + named_remainder_micros,
+			(2 + 3 + 5 + 7 + 11 + 13 + 17 + 19 + 23 + 29 + 31 + 37 + 41 + 43 + 47 + 53 + 59 + 61)
+				as f64,
+			"the nested children (67, 71) appear on NEITHER side: a child that reached\
+			 a component would inflate the mapped sum, and one that reached the\
+			 remainder would be subtracted twice with its parent"
+		);
 	}
 
 	/// Presence at zero is what distinguishes an observed zero from a missing receipt, so

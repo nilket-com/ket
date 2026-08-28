@@ -13744,6 +13744,7 @@ impl Executor {
 				chunk,
 				join_output_schema,
 				self.context.task_budget.memory.get(),
+				crate::exec::join::SideTakeTiming::AccountedElsewhere,
 			)?;
 
 			self.fold_left_outer_grouped_batch(
@@ -17284,6 +17285,7 @@ impl Executor {
 						chunk,
 						join0_output_schema,
 						self.context.task_budget.memory.get(),
+						crate::exec::join::SideTakeTiming::AccountedElsewhere,
 					)?;
 
 					if let Some(stage) = materialize_stage {
@@ -20036,6 +20038,7 @@ impl Executor {
 						chunk,
 						join0_output_schema,
 						self.context.task_budget.memory.get(),
+						crate::exec::join::SideTakeTiming::AccountedElsewhere,
 					)?;
 
 					let batch = if let Some(join0_filter) = join0_filter {
@@ -21452,6 +21455,7 @@ impl Executor {
 							chunk,
 							join0_output_schema,
 							self.context.task_budget.memory.get(),
+							crate::exec::join::SideTakeTiming::AccountedElsewhere,
 						)?;
 
 						let batch = if let Some(join0_filter) = join0_filter {
@@ -23350,6 +23354,7 @@ impl Executor {
 				chunk,
 				&runtime.output_schema,
 				self.context.task_budget.memory.get(),
+				crate::exec::join::SideTakeTiming::AccountedElsewhere,
 			)?;
 
 			if batch.num_rows() > 0 {

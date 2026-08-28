@@ -1827,6 +1827,61 @@ mod tests {
 			 dropped both fail here"
 		);
 	}
+
+	/// ADR 554 follow-on: the nested side children must NOT be subtracted again.
+	///
+	/// `join_output_materialization_micros` already left the residual. Its two
+	/// children measure parts of that same span, so joining `accounted` a second
+	/// time would remove the same microseconds twice and drive
+	/// `framework_overhead` below the time actually unaccounted — a residual that
+	/// under-reports is worse than one that is merely large, because it looks
+	/// solved.
+	#[test]
+	fn adr554_join_output_side_children_are_not_subtracted_again() {
+		let mut parent_only = TaskTelemetry::default();
+		parent_only.phases.task_wall_micros = 10_000;
+		parent_only.phases.join_output_materialization_micros = 4_000;
+		recompute_framework_overhead(&mut parent_only);
+		assert_eq!(parent_only.phases.framework_overhead_micros, 6_000);
+
+		let mut with_children = TaskTelemetry::default();
+		with_children.phases.task_wall_micros = 10_000;
+		with_children.phases.join_output_materialization_micros = 4_000;
+		// A realistic split: most of the parent is the two take loops.
+		with_children.phases.join_output_left_take_micros = 3_000;
+		with_children.phases.join_output_right_take_micros = 700;
+		recompute_framework_overhead(&mut with_children);
+
+		assert_eq!(
+			with_children.phases.framework_overhead_micros, 6_000,
+			"splitting a parent into children must not move the residual at all; \
+			 a child that joined `accounted` would report 2_300 here"
+		);
+	}
+
+	/// The acceptance identity: children sum to at most their parent.
+	///
+	/// Stated as an inequality, not an equality, on purpose — the difference is
+	/// the shared index-vector, `UInt32Array` and batch-assembly cost, which is
+	/// the term this split exists to expose. An equality would assert that shared
+	/// cost is zero, which is exactly the thing not yet known.
+	#[test]
+	fn adr554_join_output_children_never_exceed_their_parent() {
+		for (left, right, parent) in [(0u64, 0u64, 0u64), (3_000, 700, 4_000), (1, 1, 2)] {
+			let mut telemetry = TaskTelemetry::default();
+			telemetry.phases.join_output_left_take_micros = left;
+			telemetry.phases.join_output_right_take_micros = right;
+			telemetry.phases.join_output_materialization_micros = parent;
+			let children = telemetry.phases.join_output_left_take_micros
+				+ telemetry.phases.join_output_right_take_micros;
+			assert!(
+				children <= telemetry.phases.join_output_materialization_micros,
+				"children {children} exceed parent {parent}: the side loops are \
+				 nested inside the parent bracket, so a sum above it means one of \
+				 them is timing work outside it"
+			);
+		}
+	}
 	use crate::audit::{
 		ToronAuditDropReason, ToronAuditEventClass, ToronAuditMetrics, ToronAuditOperation,
 	};

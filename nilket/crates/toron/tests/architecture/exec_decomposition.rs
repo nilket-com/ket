@@ -22,7 +22,11 @@ const EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT: usize = 10_000;
 // and env name. The re-export has to sit in the executor root because the harness
 // stamps the probe's state into its artifact header, and `join` is a private
 // module. Still fails on expression-evaluator drift, which is what it is for.
-const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_584;
+// ADR 554 follow-on: +3 for the `SideTakeTiming::AccountedElsewhere` markers at
+// this root's three `materialize_join_selection` test call sites. The marker is
+// required at every call site by design — the exclusion of the spilled and
+// streaming gathers must be stated, not defaulted.
+const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_587;
 const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
 const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_825;
 

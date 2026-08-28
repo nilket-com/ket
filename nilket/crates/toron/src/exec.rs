@@ -5665,6 +5665,7 @@ mod tests {
 			&selection,
 			&output_schema,
 			1,
+			crate::exec::join::SideTakeTiming::AccountedElsewhere,
 		)
 		.expect_err("over-budget materialization must fail before take");
 
@@ -5692,6 +5693,7 @@ mod tests {
 			&selection,
 			&output_schema,
 			1024 * 1024,
+			crate::exec::join::SideTakeTiming::AccountedElsewhere,
 		)
 		.expect("fitting materialization");
 
@@ -5773,6 +5775,7 @@ mod tests {
 			&selection,
 			&left_schema,
 			1024,
+			crate::exec::join::SideTakeTiming::AccountedElsewhere,
 		)
 		.expect("semi join should not charge unmaterialized right side");
 
