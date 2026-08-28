@@ -18,7 +18,11 @@ const EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT: usize = 10_000;
 // ADR 554 follow-on: +5 for the executed-node-kind route receipt at the top of
 // `execute_bound_node`. It cannot be carved out — the receipt has to sit at the
 // dispatch it names, above the attribution gate that would otherwise hide it.
-const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_578;
+// ADR 554 follow-on: +6 for re-exporting the join selection locality probe's gate
+// and env name. The re-export has to sit in the executor root because the harness
+// stamps the probe's state into its artifact header, and `join` is a private
+// module. Still fails on expression-evaluator drift, which is what it is for.
+const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_584;
 const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
 const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_825;
 

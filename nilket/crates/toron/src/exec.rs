@@ -114,6 +114,12 @@ mod density;
 mod expr;
 mod input_processing;
 mod join;
+
+/// ADR 554 follow-on: the join selection locality probe's gate and env name, re-exported
+/// so the TPC-H harness can stamp the probe's state into an artifact header. Without
+/// that stamp, all-zero locality counters cannot be told apart from a probe that
+/// never ran.
+pub use join::{JOIN_SELECTION_LOCALITY_ENV, join_selection_locality_enabled};
 mod node_attribution;
 mod phase_receipt;
 mod scan_open;

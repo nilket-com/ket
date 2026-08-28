@@ -142,9 +142,16 @@ pub struct TaskTelemetry {
 /// counters answer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinSelectionLocality {
-	/// Selections observed. Zero means this side was never gathered — an absence,
-	/// never a claim that its indices were scattered.
+	/// Gathers of this side, whether or not it received any index. `kind` decides
+	/// participation: a LeftSemi selection never touches the right side, so the
+	/// right side records nothing. Zero means this side was never gathered — an
+	/// absence, never a claim that its indices were scattered.
 	pub invocations: u64,
+	/// Invocations where this side contributed no index at all. An outer join
+	/// whose rows all null this side is the real case. Without this counter,
+	/// `selected_rows == 0` could not be told apart from a side the gather never
+	/// touched — the two have opposite meanings for a locality reading.
+	pub empty_invocations: u64,
 	/// Index positions contributed by this side, summed across invocations. A
 	/// `FillNull` row contributes nothing on the side it nulls.
 	pub selected_rows: u64,
@@ -188,6 +195,9 @@ impl JoinSelectionLocality {
 	/// Merge another accumulation into this one. Used to combine invocations.
 	pub fn merge(&mut self, other: &Self) {
 		self.invocations = self.invocations.saturating_add(other.invocations);
+		self.empty_invocations = self
+			.empty_invocations
+			.saturating_add(other.empty_invocations);
 		self.selected_rows = self.selected_rows.saturating_add(other.selected_rows);
 		self.ascending_steps = self.ascending_steps.saturating_add(other.ascending_steps);
 		self.duplicate_steps = self.duplicate_steps.saturating_add(other.duplicate_steps);
