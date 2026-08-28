@@ -91,6 +91,7 @@ pub(in crate::exec) async fn execute_spilled_hash_join(
 			&selection,
 			output_schema,
 			task_budget.memory.get(),
+			crate::exec::join::SideTakeTiming::AccountedElsewhere,
 		)?]);
 	}
 
@@ -595,6 +596,7 @@ pub(in crate::exec) async fn probe_spilled_hash_join(
 		&selection,
 		output_schema,
 		memory_cap,
+		crate::exec::join::SideTakeTiming::AccountedElsewhere,
 	)?])
 }
 
@@ -807,6 +809,7 @@ pub(in crate::exec) fn fold_join_selection_chunks_into_global_aggregate(
 			chunk,
 			join_output_schema,
 			memory_cap,
+			crate::exec::join::SideTakeTiming::AccountedElsewhere,
 		)?;
 
 		let batch = if let Some(predicate) = filter_predicate {
@@ -853,6 +856,7 @@ where
 			chunk,
 			join_output_schema,
 			memory_cap,
+			crate::exec::join::SideTakeTiming::AccountedElsewhere,
 		)?;
 
 		let batch = if let Some(predicate) = filter_predicate {
