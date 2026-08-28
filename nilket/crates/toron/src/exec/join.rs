@@ -289,6 +289,55 @@ pub(super) fn record_task_telemetry(
 	}
 }
 
+/// Time a join input concatenation and charge it to the input-materialization
+/// subterm.
+///
+/// Charged even when the body fails, for the same reason input processing is: the
+/// time was spent inside the task wall either way, and dropping it on the error
+/// path would silently move it back into the residual this counter exists to
+/// reduce.
+pub(super) fn time_join_input_materialization<T>(
+	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
+	body: impl FnOnce() -> Result<T, ExecutionError>,
+) -> Result<T, ExecutionError> {
+	time_join_materialization(telemetry, body, |phases| {
+		&mut phases.join_input_materialization_micros
+	})
+}
+
+/// Time a join output gather and charge it to the output-materialization subterm.
+///
+/// Called only at the generic sites. The spilled and streaming paths run their
+/// own `materialize_join_selection` inside the Spill and operator brackets, and
+/// charging those here as well would count the same microseconds twice against a
+/// task wall the two must partition.
+pub(super) fn time_join_output_materialization<T>(
+	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
+	body: impl FnOnce() -> Result<T, ExecutionError>,
+) -> Result<T, ExecutionError> {
+	time_join_materialization(telemetry, body, |phases| {
+		&mut phases.join_output_materialization_micros
+	})
+}
+
+/// The shared body. One writer for both subterms so the bracket boundary — open
+/// before the first instruction, close after the result exists, charge on both
+/// exits — cannot drift between them.
+fn time_join_materialization<T>(
+	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
+	body: impl FnOnce() -> Result<T, ExecutionError>,
+	select: fn(&mut crate::distributed::task::TaskTelemetryPhases) -> &mut u64,
+) -> Result<T, ExecutionError> {
+	let started = Instant::now();
+	let outcome = body();
+	let elapsed = duration_micros(started);
+	record_task_telemetry(telemetry, |task| {
+		let slot = select(&mut task.phases);
+		*slot = slot.saturating_add(elapsed);
+	});
+	outcome
+}
+
 pub(super) fn record_join_runtime_observation(
 	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
 
@@ -456,9 +505,12 @@ pub(super) async fn execute_hash_join(
 		return Ok(output);
 	}
 
-	let left_batch = concat_or_empty(left_schema, left_batches)?;
+	let left_batch =
+		time_join_input_materialization(&telemetry, || concat_or_empty(left_schema, left_batches))?;
 
-	let right_batch = concat_or_empty(right_schema, right_batches)?;
+	let right_batch = time_join_input_materialization(&telemetry, || {
+		concat_or_empty(right_schema, right_batches)
+	})?;
 
 	// ADR 239: CROSS is keyless — route through the explicit match-all path instead of the hash
 
@@ -655,14 +707,16 @@ pub(super) async fn execute_hash_join(
 
 	probe_scope.commit_after_write();
 
-	let output = vec![materialize_join_selection(
-		kind,
-		&left_batch,
-		&right_batch,
-		&selection,
-		output_schema,
-		task_budget.memory.get(),
-	)?];
+	let output = vec![time_join_output_materialization(&telemetry, || {
+		materialize_join_selection(
+			kind,
+			&left_batch,
+			&right_batch,
+			&selection,
+			output_schema,
+			task_budget.memory.get(),
+		)
+	})?];
 
 	record_join_runtime_observation(
 		&telemetry,
@@ -855,9 +909,12 @@ pub(super) async fn execute_hash_join_into_global_aggregate(
 
 	streamed_build_scope.discard_before_measurement();
 
-	let left_batch = concat_or_empty(left_schema, left_batches)?;
+	let left_batch =
+		time_join_input_materialization(&telemetry, || concat_or_empty(left_schema, left_batches))?;
 
-	let right_batch = concat_or_empty(right_schema, right_batches)?;
+	let right_batch = time_join_input_materialization(&telemetry, || {
+		concat_or_empty(right_schema, right_batches)
+	})?;
 
 	let left_key_arrays = key_arrays(&left_batch, left_keys)?;
 
@@ -1155,14 +1212,16 @@ pub(super) fn execute_cross_join_match_all(
 				selection.push(JoinOutputRow::Paired { left, right });
 
 				if selection.len() >= CROSS_JOIN_OUTPUT_CHUNK_ROWS {
-					output.push(materialize_join_selection(
-						JoinKind::Cross,
-						left_batch,
-						right_batch,
-						&selection,
-						output_schema,
-						memory_cap,
-					)?);
+					output.push(time_join_output_materialization(telemetry, || {
+						materialize_join_selection(
+							JoinKind::Cross,
+							left_batch,
+							right_batch,
+							&selection,
+							output_schema,
+							memory_cap,
+						)
+					})?);
 
 					selection.clear();
 				}
@@ -1170,14 +1229,16 @@ pub(super) fn execute_cross_join_match_all(
 		}
 
 		if !selection.is_empty() {
-			output.push(materialize_join_selection(
-				JoinKind::Cross,
-				left_batch,
-				right_batch,
-				&selection,
-				output_schema,
-				memory_cap,
-			)?);
+			output.push(time_join_output_materialization(telemetry, || {
+				materialize_join_selection(
+					JoinKind::Cross,
+					left_batch,
+					right_batch,
+					&selection,
+					output_schema,
+					memory_cap,
+				)
+			})?);
 		}
 	}
 
@@ -2492,4 +2553,108 @@ pub(super) fn estimated_build_hash_bytes_for_batches(
 	}
 
 	Ok(bytes)
+}
+
+#[cfg(test)]
+mod join_materialization_timing_tests {
+	use super::*;
+	use crate::distributed::task::TaskTelemetry;
+
+	fn slot() -> Option<Arc<Mutex<TaskTelemetry>>> {
+		Some(Arc::new(Mutex::new(TaskTelemetry::default())))
+	}
+
+	fn charged(slot: &Option<Arc<Mutex<TaskTelemetry>>>) -> (u64, u64) {
+		let guard = slot.as_ref().unwrap().lock().unwrap();
+		(
+			guard.phases.join_input_materialization_micros,
+			guard.phases.join_output_materialization_micros,
+		)
+	}
+
+	fn busy() -> Result<u64, ExecutionError> {
+		// Enough work that the elapsed micros round above zero on any host. A
+		// sleep would be flaky under load and slow under nextest.
+		let mut total = 0u64;
+		for value in 0..2_000_000u64 {
+			total = total.wrapping_add(value ^ (total >> 3));
+		}
+		Ok(total)
+	}
+
+	/// The two subterms are charged to their own counters and never to each other.
+	#[test]
+	fn each_bracket_charges_only_its_own_counter() {
+		let task = slot();
+		time_join_input_materialization(&task, busy).expect("input body succeeds");
+		let (input_only, output_at_rest) = charged(&task);
+		assert!(input_only > 0, "the input bracket must charge something");
+		assert_eq!(
+			output_at_rest, 0,
+			"an input concatenation must not land in the output subterm; the two \
+			 answer different questions and a shared counter answers neither"
+		);
+
+		time_join_output_materialization(&task, busy).expect("output body succeeds");
+		let (input_after, output_after) = charged(&task);
+		assert_eq!(
+			input_after, input_only,
+			"timing an output gather must not move the input counter"
+		);
+		assert!(output_after > 0, "the output bracket must charge something");
+	}
+
+	/// Charged on the error path too.
+	///
+	/// This is the case that decides whether the subterm can be trusted as a
+	/// subtraction: `recompute_framework_overhead` removes it from the residual
+	/// unconditionally, so a bracket that skipped failures would shrink the
+	/// residual by less than it claimed and the wall partition would stop closing.
+	/// A concat that exceeds its budget is a real occurrence, not a hypothetical.
+	#[test]
+	fn both_brackets_charge_when_the_body_fails() {
+		let task = slot();
+		let failing = || -> Result<u64, ExecutionError> {
+			busy()?;
+			Err(ExecutionError::InvalidExpression {
+				message: "materialization failed".to_string(),
+			})
+		};
+
+		time_join_input_materialization(&task, failing).expect_err("input body fails");
+		time_join_output_materialization(&task, failing).expect_err("output body fails");
+
+		let (input, output) = charged(&task);
+		assert!(
+			input > 0 && output > 0,
+			"time spent before a failure is still time inside the task wall; \
+			 dropping it here would silently return it to the residual these \
+			 counters exist to reduce"
+		);
+	}
+
+	/// Repeated brackets accumulate. A join concatenates two inputs, and the
+	/// aggregate-fused variant does it again, so a counter that overwrote instead
+	/// of adding would report only the last one.
+	#[test]
+	fn repeated_brackets_accumulate_rather_than_overwrite() {
+		let task = slot();
+		time_join_input_materialization(&task, busy).expect("first");
+		let (after_one, _) = charged(&task);
+		time_join_input_materialization(&task, busy).expect("second");
+		let (after_two, _) = charged(&task);
+		assert!(
+			after_two > after_one,
+			"two concatenations must charge more than one: {after_two} vs {after_one}"
+		);
+	}
+
+	/// Absent telemetry is a no-op, not a panic. The local arm runs the same join
+	/// code with no task slot.
+	#[test]
+	fn a_task_without_telemetry_is_unaffected() {
+		let none: Option<Arc<Mutex<TaskTelemetry>>> = None;
+		time_join_input_materialization(&none, busy).expect("succeeds without a slot");
+		time_join_output_materialization(&none, busy).expect("succeeds without a slot");
+	}
 }
