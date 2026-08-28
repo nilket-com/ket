@@ -1391,6 +1391,11 @@ fn recompute_framework_overhead(telemetry: &mut TaskTelemetry) {
 		// subterm must leave the residual, or it double-counts against a bucket
 		// that never moves.
 		.saturating_add(telemetry.phases.input_processing_micros)
+		// ADR 554 follow-on: the two join materialization subterms. Same discipline
+		// again — a bracket that does not subtract here would name time without
+		// moving it, leaving the residual it was built to explain untouched.
+		.saturating_add(telemetry.phases.join_input_materialization_micros)
+		.saturating_add(telemetry.phases.join_output_materialization_micros)
 		.saturating_add(telemetry.phases.aggregate_accumulation_micros);
 	telemetry.phases.framework_overhead_micros =
 		telemetry.phases.task_wall_micros.saturating_sub(accounted);
@@ -1756,6 +1761,70 @@ mod tests {
 			without.phases.framework_overhead_micros - with.phases.framework_overhead_micros,
 			with.phases.aggregate_accumulation_micros,
 			"a counter that does not join `accounted` would leave this difference at zero"
+		);
+	}
+
+	/// ADR 554 follow-on: the ablation, stated as an equality.
+	///
+	/// Each join materialization subterm must shrink `framework_overhead` by
+	/// exactly its own value, and removing it must return exactly that value. This
+	/// is the property the atlas run tests empirically; asserting it here means a
+	/// null reading on the board can only mean "the work was cheap", never "the
+	/// bracket never joined the accounting".
+	///
+	/// Both subterms are exercised together AND separately: a single accounting
+	/// line that added one counter twice, or added one and dropped the other,
+	/// passes a combined check and fails these.
+	#[test]
+	fn adr554_join_materialization_subterms_each_shrink_the_residual() {
+		let baseline = {
+			let mut telemetry = TaskTelemetry::default();
+			telemetry.phases.task_wall_micros = 10_000;
+			telemetry.phases.scan_micros = 1_000;
+			recompute_framework_overhead(&mut telemetry);
+			telemetry.phases.framework_overhead_micros
+		};
+		assert_eq!(baseline, 9_000);
+
+		for (name, apply) in [
+			(
+				"input",
+				(|phases: &mut crate::distributed::task::TaskTelemetryPhases| {
+					phases.join_input_materialization_micros = 2_500;
+				}) as fn(&mut crate::distributed::task::TaskTelemetryPhases),
+			),
+			("output", |phases| {
+				phases.join_output_materialization_micros = 1_500;
+			}),
+		] {
+			let mut telemetry = TaskTelemetry::default();
+			telemetry.phases.task_wall_micros = 10_000;
+			telemetry.phases.scan_micros = 1_000;
+			apply(&mut telemetry.phases);
+			let named = telemetry.phases.join_input_materialization_micros
+				+ telemetry.phases.join_output_materialization_micros;
+			recompute_framework_overhead(&mut telemetry);
+			assert_eq!(
+				baseline - telemetry.phases.framework_overhead_micros,
+				named,
+				"naming {name} materialization must move exactly that much out of \
+				 the residual; a bracket that does not join `accounted` leaves this \
+				 difference at zero"
+			);
+		}
+
+		// Together, and disjointly: the two must not share a term.
+		let mut both = TaskTelemetry::default();
+		both.phases.task_wall_micros = 10_000;
+		both.phases.scan_micros = 1_000;
+		both.phases.join_input_materialization_micros = 2_500;
+		both.phases.join_output_materialization_micros = 1_500;
+		recompute_framework_overhead(&mut both);
+		assert_eq!(
+			both.phases.framework_overhead_micros,
+			baseline - 4_000,
+			"the two subterms subtract independently, so one counted twice or one \
+			 dropped both fail here"
 		);
 	}
 	use crate::audit::{

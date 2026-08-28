@@ -436,6 +436,33 @@ pub struct TaskTelemetryPhases {
 	/// component, and the frozen phase-to-component mapping is not reopened.
 	#[serde(default)]
 	pub input_processing_micros: u64,
+	/// Time spent concatenating a join's two inputs into single build and probe
+	/// batches, at the generic `execute_hash_join` entry. `concat_batches` copies
+	/// every input row, and the copy sits between the children's own brackets and
+	/// the Build transition, so it was previously in no bracket at all.
+	///
+	/// Measured on the ADR 554 route-receipt board: join-bearing distributed nodes
+	/// carried 12.2% of their wall as framework overhead against 3.0% elsewhere,
+	/// with 89% of the board's 18.7 s residual on those nodes. This counter and
+	/// `join_output_materialization_micros` are what test whether that is input
+	/// copying, output gathering, or neither.
+	///
+	/// A **named subterm of the remainder**, never an ADR 538 component: the
+	/// frozen phase-to-component mapping is not reopened. Like every other named
+	/// subterm it participates in `framework_overhead = task_wall - accounted`, so
+	/// naming this time shrinks the residual by exactly the same amount.
+	#[serde(default)]
+	pub join_input_materialization_micros: u64,
+	/// Time spent gathering a join's selected rows into the output batch, in
+	/// `materialize_join_selection`. Charged at the generic sites only — the
+	/// spilled and streaming paths already run theirs inside the Spill and
+	/// operator brackets, and charging those here would double-count against the
+	/// task-wall partition.
+	///
+	/// Same standing as `join_input_materialization_micros`: a remainder subterm,
+	/// not a component.
+	#[serde(default)]
+	pub join_output_materialization_micros: u64,
 	/// Time spent partitioning batches across an exchange boundary. Written by the executor,
 	/// so it is produced on both arms: locally as in-memory repartitioning, and inside a
 	/// distributed producer task. That symmetry is what makes it a paired component.
@@ -473,6 +500,13 @@ mod join_spill_observation_tests {
 		assert_eq!(legacy.labels.entry_point_overflow, 0);
 		assert!(legacy.labels.executed_node_kinds.is_empty());
 		assert_eq!(legacy.labels.node_kind_overflow, 0);
+
+		// The join materialization subterms are phase counters on the same struct.
+		// A peer that predates them must still deserialize, and must read them as
+		// zero rather than as absent-and-therefore-unknown: zero is the correct
+		// reading, because a task that never ran the bracket spent no time in it.
+		assert_eq!(legacy.phases.join_input_materialization_micros, 0);
+		assert_eq!(legacy.phases.join_output_materialization_micros, 0);
 
 		let observation = JoinSpillObservation {
 			replay_id: JoinReplayId(0),

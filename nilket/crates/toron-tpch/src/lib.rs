@@ -6693,6 +6693,14 @@ fn timing_atlas_replay_attribution_path(
 				.get("input_processing_ms")
 				.and_then(|value| value.as_f64())
 				.unwrap_or(0.0),
+			join_input_materialization_ms: node
+				.get("join_input_materialization_ms")
+				.and_then(|value| value.as_f64())
+				.unwrap_or(0.0),
+			join_output_materialization_ms: node
+				.get("join_output_materialization_ms")
+				.and_then(|value| value.as_f64())
+				.unwrap_or(0.0),
 			committed_vocabularies: string_array(node, "committed_vocabularies"),
 			vocabulary_overflow: node
 				.get("vocabulary_overflow")
@@ -7929,6 +7937,18 @@ pub struct TimingAtlasTaskNode {
 	/// projection evaluation) on this node. Same standing as accumulation — a
 	/// remainder subterm, never an ADR 538 component.
 	pub input_processing_ms: f64,
+	/// ADR 554 follow-on: named join input concatenation on this node — the
+	/// `concat_batches` copy of both join inputs at the generic entry.
+	///
+	/// A remainder subterm beside accumulation and input processing, never an ADR
+	/// 538 component. It must be subtracted from the unnamed residual wherever
+	/// that is computed: the engine has already removed it from
+	/// `framework_overhead`, so omitting it here relocates it into the unnamed
+	/// term rather than accounting for it.
+	pub join_input_materialization_ms: f64,
+	/// ADR 554 follow-on: named join output gathering on this node. Same standing
+	/// and same subtraction rule as `join_input_materialization_ms`.
+	pub join_output_materialization_ms: f64,
 	/// ADR 554 follow-on: every streaming route this task committed, from the
 	/// task-local label receipt. This is what names the arm's actual execution
 	/// shape; the node-attribution ledger cannot, because concurrent in-process
@@ -8000,6 +8020,11 @@ pub struct TimingAtlasCriticalPath {
 	pub aggregate_accumulation_ms: f64,
 	/// Named input processing summed over the same path nodes.
 	pub input_processing_ms: f64,
+	/// ADR 554 follow-on: named join input concatenation, summed over this path.
+	/// Subtracted from the unnamed residual for the same reason input processing is.
+	pub join_input_materialization_ms: f64,
+	/// ADR 554 follow-on: named join output gathering, summed over this path.
+	pub join_output_materialization_ms: f64,
 	/// In-task unattributed time summed over **the same path nodes** the
 	/// components are summed over. Summing it over a different node set would
 	/// make the residual incoherent with the components it sits beside.
@@ -8074,6 +8099,8 @@ pub fn timing_atlas_critical_path(
 	let mut in_task_unattributed_ms = 0.0_f64;
 	let mut aggregate_accumulation_ms = 0.0_f64;
 	let mut input_processing_ms = 0.0_f64;
+	let mut join_input_materialization_ms = 0.0_f64;
+	let mut join_output_materialization_ms = 0.0_f64;
 	for key in &path {
 		let Some(node) = index.get(key) else { continue };
 		for (component, portion) in &node.components {
@@ -8084,6 +8111,8 @@ pub fn timing_atlas_critical_path(
 		in_task_unattributed_ms += node.telemetry_lock_ms + node.framework_overhead_ms;
 		aggregate_accumulation_ms += node.aggregate_accumulation_ms;
 		input_processing_ms += node.input_processing_ms;
+		join_input_materialization_ms += node.join_input_materialization_ms;
+		join_output_materialization_ms += node.join_output_materialization_ms;
 	}
 	Some(TimingAtlasCriticalPath {
 		path,
@@ -8092,6 +8121,8 @@ pub fn timing_atlas_critical_path(
 		in_task_unattributed_ms,
 		aggregate_accumulation_ms,
 		input_processing_ms,
+		join_input_materialization_ms,
+		join_output_materialization_ms,
 	})
 }
 
@@ -8300,6 +8331,18 @@ pub fn timing_atlas_validate_path_bound_receipts(
 
 /// Phase counters that stay in the unattributed remainder: bookkeeping, the residual the
 /// worker computes, and the task wall itself.
+/// Phase counters that are named subterms OF the remainder: real measured work,
+/// already subtracted from `framework_overhead` by the engine, and therefore
+/// subtracted again wherever this harness recomputes an unnamed residual.
+/// Distinct from `TIMING_ATLAS_UNATTRIBUTED_PHASES`, which is bookkeeping and
+/// envelopes — those name nothing and explain nothing.
+pub const TIMING_ATLAS_NAMED_REMAINDER_PHASES: [&str; 4] = [
+	"aggregate_accumulation_micros",
+	"input_processing_micros",
+	"join_input_materialization_micros",
+	"join_output_materialization_micros",
+];
+
 pub const TIMING_ATLAS_UNATTRIBUTED_PHASES: [&str; 3] = [
 	"telemetry_lock_micros",
 	"framework_overhead_micros",
@@ -8383,6 +8426,11 @@ pub struct TimingAtlasChildAttribution {
 	pub aggregate_accumulation_ms: f64,
 	/// Named input processing along the path. Same standing as accumulation.
 	pub input_processing_ms: f64,
+	/// ADR 554 follow-on: named join input concatenation, summed over this path.
+	/// Subtracted from the unnamed residual for the same reason input processing is.
+	pub join_input_materialization_ms: f64,
+	/// ADR 554 follow-on: named join output gathering, summed over this path.
+	pub join_output_materialization_ms: f64,
 	/// In-task unattributed time along the path. Reporting only: it is not a
 	/// component, is not eligible, and never enters `attributed_ms`.
 	pub in_task_unattributed_ms: f64,
@@ -8932,6 +8980,8 @@ fn placement_attempt_from_row(row: &serde_json::Value) -> Result<PlacementAttemp
 			framework_overhead_ms: 0.0,
 			aggregate_accumulation_ms: 0.0,
 			input_processing_ms: 0.0,
+			join_input_materialization_ms: 0.0,
+			join_output_materialization_ms: 0.0,
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
 			stage_role: String::new(),
@@ -9360,6 +9410,16 @@ pub fn timing_atlas_nodes_from_report(
 					as f64 / 1000.0,
 				input_processing_ms: record.telemetry.phases.input_processing_micros as f64
 					/ 1000.0,
+				join_input_materialization_ms: record
+					.telemetry
+					.phases
+					.join_input_materialization_micros as f64
+					/ 1000.0,
+				join_output_materialization_ms: record
+					.telemetry
+					.phases
+					.join_output_materialization_micros as f64
+					/ 1000.0,
 				committed_vocabularies: record.telemetry.labels.committed_vocabularies.clone(),
 				vocabulary_overflow: record.telemetry.labels.vocabulary_overflow,
 				stage_role: record.telemetry.labels.stage_role.clone(),
@@ -9400,6 +9460,8 @@ pub fn timing_atlas_local_task_node(
 		worker_id: String::new(),
 		aggregate_accumulation_ms: phases.aggregate_accumulation_micros as f64 / 1000.0,
 		input_processing_ms: phases.input_processing_micros as f64 / 1000.0,
+		join_input_materialization_ms: phases.join_input_materialization_micros as f64 / 1000.0,
+		join_output_materialization_ms: phases.join_output_materialization_micros as f64 / 1000.0,
 		committed_vocabularies: Vec::new(),
 		vocabulary_overflow: 0,
 		stage_role: String::new(),
@@ -9441,6 +9503,8 @@ pub fn timing_atlas_child_attribution_with_lifecycle(
 		in_task_unattributed_ms: selected.in_task_unattributed_ms,
 		aggregate_accumulation_ms: selected.aggregate_accumulation_ms,
 		input_processing_ms: selected.input_processing_ms,
+		join_input_materialization_ms: selected.join_input_materialization_ms,
+		join_output_materialization_ms: selected.join_output_materialization_ms,
 		sql_planning_ms,
 		pre_dispatch_ms: lifecycle.pre_dispatch_micros as f64 / 1000.0,
 		dispatch_loop_wall_ms: lifecycle.dispatch_loop_wall_micros as f64 / 1000.0,
@@ -9479,6 +9543,8 @@ pub fn timing_atlas_attribution_path_row(
 				"worker_id": node.worker_id,
 				"aggregate_accumulation_ms": node.aggregate_accumulation_ms,
 				"input_processing_ms": node.input_processing_ms,
+				"join_input_materialization_ms": node.join_input_materialization_ms,
+				"join_output_materialization_ms": node.join_output_materialization_ms,
 				"committed_vocabularies": node.committed_vocabularies,
 				"vocabulary_overflow": node.vocabulary_overflow,
 				"stage_role": node.stage_role,
@@ -9507,7 +9573,9 @@ pub fn timing_atlas_attribution_path_row(
 	let unnamed_residual_ms = remainder_ms
 		- attribution.in_task_unattributed_ms
 		- attribution.aggregate_accumulation_ms
-		- attribution.input_processing_ms;
+		- attribution.input_processing_ms
+		- attribution.join_input_materialization_ms
+		- attribution.join_output_materialization_ms;
 	let path_dispatch_sum_ms = attribution
 		.path_components
 		.get("dispatch")
@@ -9557,6 +9625,8 @@ pub fn timing_atlas_attribution_path_row(
 		"in_task_unattributed_ms": attribution.in_task_unattributed_ms,
 		"aggregate_accumulation_ms": attribution.aggregate_accumulation_ms,
 		"input_processing_ms": attribution.input_processing_ms,
+		"join_input_materialization_ms": attribution.join_input_materialization_ms,
+		"join_output_materialization_ms": attribution.join_output_materialization_ms,
 		"unnamed_residual_ms": unnamed_residual_ms,
 		// ADR 554 §3 B2: three sequential spans with distinct owners, plus what
 		// they do not cover. The residual is carried even when small — dropping it
@@ -25636,6 +25706,59 @@ mod adr538_timing_atlas_journal_replay {
 			"absent in every artifact written before the receipt existed"
 		);
 	}
+
+	/// ADR 554 follow-on: the join materialization subterms reconcile node-by-node
+	/// and leave the unnamed residual by exactly their own size.
+	///
+	/// Two properties in one fixture because they can only fail together in a way
+	/// that matters: the path row must carry the per-node sums, and the unnamed
+	/// residual must fall by that same sum. A subterm emitted but not subtracted
+	/// would look like an explanation while explaining nothing — the exact failure
+	/// the first ADR 554 Branch A run produced with accumulation.
+	#[test]
+	fn join_materialization_subterms_reconcile_and_leave_the_unnamed_residual() {
+		let mut node = decomposition_node(0.0, 400.0, 1_000.0);
+		node.join_input_materialization_ms = 250.0;
+		node.join_output_materialization_ms = 90.0;
+
+		let attribution = timing_atlas_child_attribution(vec![node]).expect("fixture attributes");
+		assert_eq!(attribution.join_input_materialization_ms, 250.0);
+		assert_eq!(attribution.join_output_materialization_ms, 90.0);
+
+		let row =
+			timing_atlas_attribution_path_row("q09", "distributed", 0, 1, 1_000.0, &attribution);
+		assert_eq!(row["nodes"][0]["join_input_materialization_ms"], 250.0);
+		assert_eq!(row["nodes"][0]["join_output_materialization_ms"], 90.0);
+		assert_eq!(row["join_input_materialization_ms"], 250.0);
+		assert_eq!(row["join_output_materialization_ms"], 90.0);
+
+		// The same fixture with the subterms unnamed: the unnamed residual must be
+		// larger by exactly 340 ms, which is what "removing the bracket returns the
+		// time" means at this layer.
+		let mut bare = decomposition_node(0.0, 400.0, 1_000.0);
+		bare.join_input_materialization_ms = 0.0;
+		bare.join_output_materialization_ms = 0.0;
+		let bare_attribution =
+			timing_atlas_child_attribution(vec![bare]).expect("fixture attributes");
+		let bare_row = timing_atlas_attribution_path_row(
+			"q09",
+			"distributed",
+			0,
+			1,
+			1_000.0,
+			&bare_attribution,
+		);
+
+		let named = row["unnamed_residual_ms"].as_f64().expect("named residual");
+		let unnamed = bare_row["unnamed_residual_ms"]
+			.as_f64()
+			.expect("bare residual");
+		assert!(
+			(unnamed - named - 340.0).abs() < 1e-9,
+			"naming 340 ms of materialization must remove exactly 340 ms from the \
+			 unnamed residual; got {unnamed} vs {named}"
+		);
+	}
 	/// One node carrying components, bookkeeping, and a wall far larger than either.
 	fn decomposition_node(
 		telemetry_lock_ms: f64,
@@ -25645,6 +25768,8 @@ mod adr538_timing_atlas_journal_replay {
 		TimingAtlasTaskNode {
 			aggregate_accumulation_ms: 0.0,
 			input_processing_ms: 0.0,
+			join_input_materialization_ms: 0.0,
+			join_output_materialization_ms: 0.0,
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
 			stage_role: String::new(),
@@ -25752,6 +25877,8 @@ mod adr538_timing_atlas_journal_replay {
 			worker_id: String::new(),
 			aggregate_accumulation_ms: 0.0,
 			input_processing_ms: 0.0,
+			join_input_materialization_ms: 0.0,
+			join_output_materialization_ms: 0.0,
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
 			stage_role: String::new(),
@@ -25787,6 +25914,8 @@ mod adr538_timing_atlas_journal_replay {
 				worker_id: String::new(),
 				aggregate_accumulation_ms: 0.0,
 				input_processing_ms: 0.0,
+				join_input_materialization_ms: 0.0,
+				join_output_materialization_ms: 0.0,
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
 				stage_role: String::new(),
@@ -25815,6 +25944,8 @@ mod adr538_timing_atlas_journal_replay {
 				worker_id: String::new(),
 				aggregate_accumulation_ms: 0.0,
 				input_processing_ms: 0.0,
+				join_input_materialization_ms: 0.0,
+				join_output_materialization_ms: 0.0,
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
 				stage_role: String::new(),
@@ -26799,6 +26930,8 @@ mod adr538_timing_atlas_critical_path {
 			worker_id: String::new(),
 			aggregate_accumulation_ms: 0.0,
 			input_processing_ms: 0.0,
+			join_input_materialization_ms: 0.0,
+			join_output_materialization_ms: 0.0,
 			committed_vocabularies: Vec::new(),
 			vocabulary_overflow: 0,
 			stage_role: String::new(),
@@ -27028,6 +27161,8 @@ mod adr538_path_bound_validation {
 				worker_id: String::new(),
 				aggregate_accumulation_ms: 0.0,
 				input_processing_ms: 0.0,
+				join_input_materialization_ms: 0.0,
+				join_output_materialization_ms: 0.0,
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
 				stage_role: String::new(),
@@ -27050,6 +27185,8 @@ mod adr538_path_bound_validation {
 				worker_id: String::new(),
 				aggregate_accumulation_ms: 0.0,
 				input_processing_ms: 0.0,
+				join_input_materialization_ms: 0.0,
+				join_output_materialization_ms: 0.0,
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
 				stage_role: String::new(),
@@ -27073,6 +27210,8 @@ mod adr538_path_bound_validation {
 				worker_id: String::new(),
 				aggregate_accumulation_ms: 0.0,
 				input_processing_ms: 0.0,
+				join_input_materialization_ms: 0.0,
+				join_output_materialization_ms: 0.0,
 				committed_vocabularies: Vec::new(),
 				vocabulary_overflow: 0,
 				stage_role: String::new(),
@@ -27396,8 +27535,6 @@ mod adr538_phase_component_wiring {
 	#[test]
 	fn every_phase_counter_is_mapped_once_or_named_as_remainder() {
 		let phases = TaskTelemetryPhases {
-			aggregate_accumulation_micros: 0,
-			input_processing_micros: 0,
 			task_wall_micros: 104_729,
 			shuffle_pull_decode_micros: 2,
 			build_micros: 3,
@@ -27413,6 +27550,14 @@ mod adr538_phase_component_wiring {
 			exchange_repartition_micros: 37,
 			scan_micros: 41,
 			framework_overhead_micros: 43,
+			// The named subterms carry distinct primes too. They were previously all
+			// zero here, which let the totality sum balance whether or not they were
+			// mapped — the check could not fail for the counters most at risk of
+			// being wired into a component by mistake.
+			aggregate_accumulation_micros: 47,
+			input_processing_micros: 53,
+			join_input_materialization_micros: 59,
+			join_output_materialization_micros: 61,
 		};
 		let portions = timing_atlas_component_portions_ms(&phases);
 		let by_label: BTreeMap<&str, f64> = portions
@@ -27424,17 +27569,33 @@ mod adr538_phase_component_wiring {
 		assert_eq!(by_label["shuffle"], (37.0 + 2.0 + 11.0) / 1000.0);
 		assert_eq!(by_label["dispatch"], (29.0 + 13.0) / 1000.0);
 		assert_eq!(by_label["transport"], (17.0 + 19.0 + 23.0) / 1000.0);
-		// Totality: mapped micros plus the named remainder counters account for every
-		// counter except the wall itself.
+
+		// Totality: mapped micros, plus bookkeeping, plus the named subterms account
+		// for every counter except the wall itself. Each counter's prime appears on
+		// exactly one side, so mapping a subterm into a component — or dropping one —
+		// moves a sum and fails.
 		let mapped_micros: f64 = portions.iter().map(|(_, portion)| portion * 1000.0).sum();
-		let remainder_micros =
+		let bookkeeping_micros =
 			(phases.telemetry_lock_micros + phases.framework_overhead_micros) as f64;
+		let named_remainder_micros = (phases.aggregate_accumulation_micros
+			+ phases.input_processing_micros
+			+ phases.join_input_materialization_micros
+			+ phases.join_output_materialization_micros) as f64;
 		assert_eq!(
-			mapped_micros + remainder_micros,
-			(2 + 3 + 5 + 7 + 11 + 13 + 17 + 19 + 23 + 29 + 31 + 37 + 41 + 43) as f64,
-			"a counter is either mapped to exactly one component or named as remainder"
+			mapped_micros + bookkeeping_micros + named_remainder_micros,
+			(2 + 3 + 5 + 7 + 11 + 13 + 17 + 19 + 23 + 29 + 31 + 37 + 41 + 43 + 47 + 53 + 59 + 61)
+				as f64,
+			"a counter is either mapped to exactly one component, bookkeeping, or a \
+			 named subterm of the remainder"
+		);
+		assert_eq!(
+			mapped_micros,
+			(2 + 3 + 5 + 7 + 11 + 13 + 17 + 19 + 23 + 29 + 37 + 41) as f64,
+			"the ADR 538 components must not absorb a named subterm: the frozen \
+			 phase-to-component mapping is not reopened by naming remainder time"
 		);
 		assert_eq!(TIMING_ATLAS_UNATTRIBUTED_PHASES.len(), 3);
+		assert_eq!(TIMING_ATLAS_NAMED_REMAINDER_PHASES.len(), 4);
 	}
 
 	/// Presence at zero is what distinguishes an observed zero from a missing receipt, so
