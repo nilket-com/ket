@@ -15,7 +15,10 @@ const EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT: usize = 10_000;
 // `exec/input_processing.rs` first; these three lines are the call sites
 // themselves, which have to sit at the arms they measure. The bound still fails
 // on expression-evaluator drift, which is what it is for.
-const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_573;
+// ADR 554 follow-on: +5 for the executed-node-kind route receipt at the top of
+// `execute_bound_node`. It cannot be carved out — the receipt has to sit at the
+// dispatch it names, above the attribution gate that would otherwise hide it.
+const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_578;
 const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
 const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_825;
 
@@ -840,6 +843,167 @@ pub(crate) fn adr554_every_vocabulary_commit_reaches_the_task_receipt() {
 		 so the committed route reaches the task-local receipt; {} call(s) do not",
 		missing.len()
 	);
+}
+
+/// Every task-level dispatch arm carries an entry-point receipt.
+///
+/// The dispatch chain in `execute_task_local_with_telemetry_and_stream_sink` is
+/// the only place that decides which driver runs a fragment, and an arm added
+/// without a receipt is invisible rather than wrong — the set would simply be
+/// empty for that shape, which reads as "no data" and not "missing call". This
+/// counts drivers against receipts so a new arm fails the build instead.
+#[test]
+pub(crate) fn adr554_every_task_dispatch_arm_records_an_entry_point() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let source = std::fs::read_to_string(manifest_dir.join("src/server/mod.rs")).unwrap();
+	let body = dispatch_chain_body(&source);
+	let drivers = body.matches("drive_streamable_plan(&spec.plan").count()
+		+ body.matches("self.execute_live_shuffle_producer(").count()
+		+ body.matches("self.execute_live_shuffle_consumer(").count()
+		+ body.matches("executor.execute_bound(&spec.plan").count();
+	let receipts = body
+		.matches("record_executor_entry_point(&telemetry, \"")
+		.count();
+	assert!(
+		drivers > 0,
+		"the task dispatch arms vanished; this guard is now vacuous"
+	);
+	assert_eq!(
+		receipts, drivers,
+		"each of the {drivers} dispatch arm(s) must record an entry point; found \
+		 {receipts} receipt call(s). An arm without one reports an empty set, \
+		 which reads as an absent route rather than a missing call."
+	);
+
+	// Distinct labels, or two arms merge into one indistinguishable receipt.
+	let mut labels: Vec<&str> = body
+		.match_indices("record_executor_entry_point(&telemetry, \"")
+		.map(|(index, matched)| {
+			let rest = &body[index + matched.len()..];
+			&rest[..rest
+				.find('"')
+				.expect("entry point label is a string literal")]
+		})
+		.collect();
+	labels.sort_unstable();
+	let distinct = labels.len();
+	labels.dedup();
+	assert_eq!(
+		labels.len(),
+		distinct,
+		"entry point labels must be distinct; a repeated label makes two arms \
+		 indistinguishable in the receipt"
+	);
+}
+
+/// The executed-node-kind receipt stays outside the node-attribution gate.
+///
+/// `node_attribution::enter` returns an inert span when the file diagnostic is
+/// off. Recording the node kind through it — or after it, inside a block it
+/// guards — would make the receipt empty in exactly the ordinary atlas run it
+/// exists for. That failure already happened once with the vocabulary receipt;
+/// this pins the ordering so it cannot happen again silently.
+#[test]
+pub(crate) fn adr554_node_kind_receipt_precedes_the_attribution_gate() {
+	let source = exec_root_source();
+	let receipt = source
+		.find("node_attribution::record_executed_node_kind(")
+		.expect("the executed-node-kind receipt vanished; this guard is now vacuous");
+	let gate = source
+		.find("node_attribution::enter(")
+		.expect("the node attribution span vanished; this guard is now vacuous");
+	assert!(
+		receipt < gate,
+		"record_executed_node_kind must be called before node_attribution::enter, \
+		 never under it: `enter` is inert when the file diagnostic is off, and the \
+		 receipt has to be present in an ordinary atlas run"
+	);
+	assert_eq!(
+		source
+			.matches("node_attribution::record_executed_node_kind(")
+			.count(),
+		1,
+		"exactly one receipt site: the recursive executor dispatch. A second site \
+		 would double-count nothing but would blur where the fact comes from."
+	);
+}
+
+/// The dispatch chain's body, from the task telemetry it writes into down to the
+/// end of the arm chain. Scoping the guard to this span keeps unrelated
+/// `execute_bound` calls elsewhere in the file from inflating either count.
+fn dispatch_chain_body(source: &str) -> &str {
+	let start = source
+		.find("let telemetry = Arc::new(Mutex::new(task_telemetry_for_spec(spec)));")
+		.expect("task telemetry construction moved; rescope this guard");
+	let rest = &source[start..];
+	// The chain is bracketed by two `record_worker_telemetry` calls: the shuffle
+	// pull bookkeeping above it and the row/batch bookkeeping below. Anchoring on
+	// those rather than on body text keeps the guard from silently widening to the
+	// whole file — which would count unrelated `execute_bound` calls as arms and
+	// make the assertion fail for the wrong reason.
+	let marker = "record_worker_telemetry(&telemetry, |task| {";
+	let first = rest.find(marker).expect("pre-chain bookkeeping moved") + marker.len();
+	let end = first
+		+ rest[first..]
+			.find(marker)
+			.expect("post-chain bookkeeping moved; rescope this guard");
+	&rest[..end]
+}
+
+/// The two plan-label lists agree, arm for arm.
+///
+/// `server::operator_kind_label` and `ExecutionPlan::node_label` spell out the
+/// same variant-to-name mapping in two places. That duplication is deliberate —
+/// nine ADR guards assert the arm text lives in the worker layer, and delegating
+/// would move it out from under all of them — but duplication that nothing checks
+/// drifts. This is the check: same variants, same names, in both.
+///
+/// The join short-circuit in `operator_kind_label` is above its match and so is
+/// not an arm; it is a property of the fragment, not of a node, and is out of
+/// scope here on purpose.
+#[test]
+pub(crate) fn adr554_operator_kind_label_and_node_label_agree() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let server = std::fs::read_to_string(manifest_dir.join("src/server/mod.rs")).unwrap();
+	let ir = std::fs::read_to_string(manifest_dir.join("src/ir/execution.rs")).unwrap();
+
+	let worker = label_arms(&server, "fn operator_kind_label(", "ExecutionPlan::");
+	let plan = label_arms(&ir, "pub fn node_label(", "Self::");
+
+	assert!(
+		worker.len() >= 20,
+		"operator_kind_label arms did not parse ({} found); this guard is now \
+		 vacuous",
+		worker.len()
+	);
+	assert_eq!(
+		worker, plan,
+		"operator_kind_label and ExecutionPlan::node_label must map every variant \
+		 to the same name. They are spelled out separately so the worker-layer ADR \
+		 guards keep their target; drift between them means one label list has been \
+		 updated for a new variant and the other has not."
+	);
+}
+
+/// Extract `(variant, label)` pairs from the first `match` in the named function.
+fn label_arms(source: &str, signature: &str, prefix: &str) -> Vec<(String, String)> {
+	let start = source
+		.find(signature)
+		.unwrap_or_else(|| panic!("{signature} not found; rescope this guard"));
+	let body = &source[start..];
+	let end = body.find("\n}\n").map_or(body.len(), |at| at);
+	let mut arms: Vec<(String, String)> = body[..end]
+		.lines()
+		.filter_map(|line| {
+			let line = line.trim();
+			let rest = line.strip_prefix(prefix)?;
+			let (variant, tail) = rest.split_once(" { .. } => \"")?;
+			let label = tail.strip_suffix("\",")?;
+			Some((variant.to_owned(), label.to_owned()))
+		})
+		.collect();
+	arms.sort();
+	arms
 }
 
 #[test]

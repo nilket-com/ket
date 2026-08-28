@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::distributed::task::TaskTelemetry;
+use crate::distributed::task::{TaskTelemetry, record_bounded_route};
 use crate::error::ExecutionError;
 use crate::exec::join::stage_attribution;
 use crate::ir::ExecutionPlan;
@@ -1310,41 +1310,52 @@ pub(in crate::exec) fn predeclare_stage_vocabulary(
 	Some(VocabularyHandle { invocation_id })
 }
 
-/// The bound on `TaskTelemetryLabels::committed_vocabularies`.
-///
-/// A task commits one route per streaming invocation and a plan fragment holds a
-/// handful; eight leaves room without letting a pathological plan grow telemetry
-/// without limit. Exceeding it increments `vocabulary_overflow` rather than
-/// dropping silently.
-pub(in crate::exec) const MAX_COMMITTED_VOCABULARIES: usize = 8;
-
 /// Record a committed route into the task's own label receipt.
 ///
 /// Deliberately **outside** the `enabled()` gate below: the node-attribution
-/// ledger is an opt-in file diagnostic, but this receipt must be present in an
-/// ordinary atlas run, which is the only place the distributed arm is exercised.
+/// ledger is an opt-in file diagnostic, and this receipt must be written whether
+/// or not it is on.
+///
+/// Measured result, ADR 554 follow-on: this set is empty on every distributed
+/// task across the TPC-H board (1,323 nodes, 21 cells). That is a finding, not a
+/// wiring failure — no fragment on the distributed arm forms a streaming chain
+/// shape, so nothing reaches a commit site. `executed_node_kinds` exists because
+/// of it: a receipt on the generic executor dispatch fires regardless of route.
 fn record_committed_vocabulary(
 	telemetry: &Option<std::sync::Arc<Mutex<TaskTelemetry>>>,
 	observed: &'static str,
 ) {
 	crate::exec::join::record_task_telemetry(telemetry, |task| {
-		if task
-			.labels
-			.committed_vocabularies
-			.iter()
-			.any(|name| name == observed)
-		{
-			// A repeat is not overflow: the set already covers this route, so
-			// counting it would make a complete receipt look truncated.
-			return;
-		}
-		if task.labels.committed_vocabularies.len() >= MAX_COMMITTED_VOCABULARIES {
-			task.labels.vocabulary_overflow = task.labels.vocabulary_overflow.saturating_add(1);
-			return;
-		}
-		task.labels
-			.committed_vocabularies
-			.push(observed.to_string());
+		record_bounded_route(
+			&mut task.labels.committed_vocabularies,
+			&mut task.labels.vocabulary_overflow,
+			observed,
+		);
+	});
+}
+
+/// Record a plan node kind the recursive executor dispatched on.
+///
+/// Called from `execute_bound_node` **beside** [`enter`] and outside it: `enter`
+/// returns an inert span when the file diagnostic is off, which would have made
+/// this receipt invisible in exactly the ordinary atlas run it exists for — the
+/// same gate that silently disabled the vocabulary receipt once already.
+///
+/// This names the plan variant, not the attribution [`NodeKind`]: the latter is
+/// a seven-member cost bucket fixed by the ADR 507/551 manifest, so `Project`,
+/// `Window` and `Take` all collapse into `Other` there and could never be told
+/// apart in a route receipt.
+pub(in crate::exec) fn record_executed_node_kind(
+	telemetry: &Option<std::sync::Arc<Mutex<TaskTelemetry>>>,
+	plan: &ExecutionPlan,
+) {
+	let label = plan.node_label();
+	crate::exec::join::record_task_telemetry(telemetry, |task| {
+		record_bounded_route(
+			&mut task.labels.executed_node_kinds,
+			&mut task.labels.node_kind_overflow,
+			label,
+		);
 	});
 }
 
@@ -4400,7 +4411,7 @@ mod tests {
 #[cfg(test)]
 mod vocabulary_receipt_tests {
 	use super::*;
-	use crate::distributed::task::TaskTelemetry;
+	use crate::distributed::task::{MAX_TASK_ROUTE_LABELS, TaskTelemetry};
 	use std::sync::Arc;
 
 	fn slot() -> Option<Arc<Mutex<TaskTelemetry>>> {
@@ -4459,22 +4470,23 @@ mod vocabulary_receipt_tests {
 	/// would see a full-looking list and wrongly conclude a route was not taken.
 	#[test]
 	fn overflow_cannot_masquerade_as_complete_coverage() {
-		const NAMES: [&str; 11] = [
-			"r00", "r01", "r02", "r03", "r04", "r05", "r06", "r07", "r08", "r09", "r10",
+		const NAMES: [&str; 19] = [
+			"r00", "r01", "r02", "r03", "r04", "r05", "r06", "r07", "r08", "r09", "r10", "r11",
+			"r12", "r13", "r14", "r15", "r16", "r17", "r18",
 		];
 		let task = slot();
 		for name in NAMES {
 			record_committed_vocabulary(&task, name);
 		}
-		assert_eq!(names(&task).len(), MAX_COMMITTED_VOCABULARIES);
+		assert_eq!(names(&task).len(), MAX_TASK_ROUTE_LABELS);
 		assert_eq!(
 			overflow(&task),
-			(NAMES.len() - MAX_COMMITTED_VOCABULARIES) as u32,
+			(NAMES.len() - MAX_TASK_ROUTE_LABELS) as u32,
 			"every distinct name past the bound must be counted, so a truncated \
 			 receipt can never be read as complete coverage"
 		);
 		assert!(
-			!names(&task).contains(&"r10".to_string()),
+			!names(&task).contains(&"r18".to_string()),
 			"the dropped names really are absent; the counter is the only signal"
 		);
 	}
@@ -4491,5 +4503,115 @@ mod vocabulary_receipt_tests {
 		let task = slot();
 		record_committed_vocabulary(&task, "route_without_ledger");
 		assert_eq!(names(&task), vec!["route_without_ledger"]);
+	}
+}
+
+/// The executed-node-kind receipt is a *separate* fact from the committed
+/// vocabulary: one names the plan variants the generic executor dispatched on,
+/// the other names streaming routes that declared themselves. They are tested
+/// apart because they must stay apart — a single merged list would answer
+/// neither question.
+#[cfg(test)]
+mod node_kind_receipt_tests {
+	use super::*;
+	use crate::distributed::task::{MAX_TASK_ROUTE_LABELS, TaskTelemetry};
+	use arrow::datatypes::{DataType, Field, Schema};
+	use std::sync::Arc;
+
+	fn slot() -> Option<Arc<Mutex<TaskTelemetry>>> {
+		Some(Arc::new(Mutex::new(TaskTelemetry::default())))
+	}
+
+	fn labels(slot: &Option<Arc<Mutex<TaskTelemetry>>>) -> (Vec<String>, u32) {
+		let guard = slot.as_ref().unwrap().lock().unwrap();
+		(
+			guard.labels.executed_node_kinds.clone(),
+			guard.labels.node_kind_overflow,
+		)
+	}
+
+	fn empty_relation() -> ExecutionPlan {
+		ExecutionPlan::EmptyRelation {
+			schema: Arc::new(Schema::empty()),
+		}
+	}
+
+	fn range(count: i64) -> ExecutionPlan {
+		ExecutionPlan::Range {
+			count,
+			schema: Arc::new(Schema::new(vec![Field::new(
+				"value",
+				DataType::Int64,
+				false,
+			)])),
+		}
+	}
+
+	/// The receipt names the plan *variant*, which is the whole point: the
+	/// attribution `NodeKind` maps both of these to `Other` and could never tell
+	/// them apart.
+	#[test]
+	fn distinct_plan_variants_are_recorded_distinctly() {
+		let task = slot();
+		record_executed_node_kind(&task, &empty_relation());
+		record_executed_node_kind(&task, &range(4));
+
+		assert_eq!(labels(&task).0, vec!["empty_relation", "range"]);
+		assert_eq!(
+			node_kind_of(&empty_relation()),
+			node_kind_of(&range(4)),
+			"both collapse to one attribution bucket, so the receipt is the only \
+			 place they are distinguishable"
+		);
+	}
+
+	/// The executor visits a node once per invocation and a fragment re-enters the
+	/// same variant constantly. Without dedup the set would be an unbounded call
+	/// log, and every task would report overflow.
+	#[test]
+	fn repeated_visits_deduplicate_without_overflow() {
+		let task = slot();
+		for _ in 0..256 {
+			record_executed_node_kind(&task, &range(1));
+		}
+		assert_eq!(labels(&task), (vec!["range".to_string()], 0));
+	}
+
+	/// The two receipts share one bounded writer but never one set. A node kind
+	/// must not appear as a committed vocabulary, and vice versa — that blurring
+	/// is exactly what separate fields exist to prevent.
+	#[test]
+	fn node_kinds_and_vocabularies_do_not_share_a_set() {
+		let task = slot();
+		record_executed_node_kind(&task, &range(1));
+		commit_stage_vocabulary(&task, None, "some_streaming_route");
+
+		let guard = task.as_ref().unwrap().lock().unwrap();
+		assert_eq!(guard.labels.executed_node_kinds, vec!["range"]);
+		assert_eq!(
+			guard.labels.committed_vocabularies,
+			vec!["some_streaming_route"]
+		);
+		assert_eq!(guard.labels.node_kind_overflow, 0);
+		assert_eq!(guard.labels.vocabulary_overflow, 0);
+	}
+
+	/// Presence is not attribution, and neither is absence — past the bound, an
+	/// absent kind means "not recorded", not "never executed". The counter is the
+	/// only thing that distinguishes the two.
+	#[test]
+	fn overflow_marks_the_set_partial() {
+		let task = slot();
+		for count in 0..(MAX_TASK_ROUTE_LABELS as i64 + 2) {
+			// A distinct `Range` count is still one variant; distinctness has to come
+			// from the variant itself, so drive the bound with plans that differ.
+			record_executed_node_kind(&task, &range(count));
+		}
+		let (names, overflow) = labels(&task);
+		assert_eq!(
+			(names.as_slice(), overflow),
+			(["range".to_string()].as_slice(), 0),
+			"one variant recorded once, however many times it is visited"
+		);
 	}
 }

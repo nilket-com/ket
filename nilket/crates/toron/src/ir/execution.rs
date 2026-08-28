@@ -455,6 +455,48 @@ pub fn range_relation_schema() -> SchemaRef {
 }
 
 impl ExecutionPlan {
+	/// This node's own variant, as a stable snake_case name.
+	///
+	/// Structural and non-recursive: it names *this* node and never inspects
+	/// children, so a caller that wants a whole-tree summary must compose one.
+	/// `server::operator_kind_label` does exactly that, letting a join anywhere in
+	/// the fragment dominate; a per-node route receipt must not, which is why the
+	/// two are separate.
+	///
+	/// Distinct from `exec::node_attribution::NodeKind`, which is a *cost bucket*
+	/// with seven members and an `Other` catch-all: that vocabulary is fixed by
+	/// the ADR 507/551 attribution manifest and cannot grow to name a variant.
+	pub fn node_label(&self) -> &'static str {
+		match self {
+			Self::Exchange { .. } => "exchange",
+			Self::Filter { .. } => "filter",
+			Self::Project { .. } => "project",
+			Self::Union { .. } => "union",
+			Self::Repeat { .. } => "repeat",
+			Self::Aggregate { .. } => "aggregate",
+			Self::KernelDensity { .. } => "kernel_density",
+			Self::Sort { .. } => "sort",
+			Self::Window { .. } => "window",
+			Self::Take { .. } => "take",
+			Self::EmptyRelation { .. } => "empty_relation",
+			Self::SystemTable { .. } => "system_table",
+			Self::Scan { .. } => "scan",
+			Self::Join { .. } => "join",
+			Self::CreateTable { .. } => "catalog",
+			Self::CreateLogicalType { .. } => "catalog",
+			Self::CreateTableAsSelect { .. } => "create_table_as_select",
+			Self::DropTable { .. } => "drop_table",
+			Self::Delete { .. } => "delete",
+			Self::Update { .. } => "update",
+			Self::Insert { .. } => "insert",
+			Self::InsertSelect { .. } => "insert_select",
+			// ADR 255: a recursive CTE's body is opaque; it is labelled as one node.
+			Self::RecursiveCte { .. } => "recursive_cte",
+			Self::RecursiveRef { .. } => "recursive_ref",
+			Self::Range { .. } => "range",
+		}
+	}
+
 	pub fn schema(&self) -> SchemaRef {
 		match self {
 			Self::EmptyRelation { schema } => schema.clone(),

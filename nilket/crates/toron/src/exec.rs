@@ -902,6 +902,11 @@ impl Executor {
 		Box<dyn std::future::Future<Output = Result<Vec<RecordBatch>, ExecutionError>> + Send + 'b>,
 	> {
 		Box::pin(async move {
+			// The route receipt, recorded before the ledger span and NOT under it:
+			// `enter` returns an inert span when the file diagnostic is off, and this
+			// must be present in an ordinary atlas run. It names the plan variant,
+			// which the ledger's seven-member `NodeKind` cannot.
+			node_attribution::record_executed_node_kind(&self.context.task_telemetry, plan);
 			// ADR 507: attribute this plan node's exclusive time and spill across the executor tree.
 			// A Drop-guard held for the whole body records on every exit (including an arm's early
 			// `return`), so the node match below is untouched — same shape, same indentation. Zero
