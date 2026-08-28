@@ -6458,6 +6458,13 @@ pub fn timing_atlas_header_row(
 		"spill_bytes_reserved_per_query": EXECUTION_CENSUS_SPILL_BYTES,
 		"host_start_service_inactive": conditions_start.service_inactive,
 		"host_start_sql_port_free": conditions_start.sql_port_free,
+		// ADR 554 follow-on positive control. The locality probe is opt-in because
+		// its O(rows) pass would inflate the framework overhead it explains, so an
+		// ordinary run records nothing. Without this flag, all-zero locality
+		// counters would be ambiguous between "probe off" and "joins had no
+		// contiguity" — opposite conclusions from identical numbers. A run with
+		// this true must NOT be used for timing comparisons.
+		"join_selection_locality_probe": toron::exec::join_selection_locality_enabled(),
 	})
 }
 

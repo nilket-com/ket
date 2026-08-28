@@ -338,30 +338,75 @@ fn time_join_materialization<T>(
 	outcome
 }
 
-/// Measure one selection's run structure and fold it into the task accumulator.
+/// Environment variable enabling the join selection locality probe.
 ///
-/// ADR 554 follow-on locality probe. One pass over the selection, extracting the
-/// same indices `materialize_join_selection` will gather by, so the statistic
-/// describes the gather that actually happens rather than a model of it.
+/// **Opt-in on purpose, unlike every other ADR 554 receipt.** The others record
+/// a fact the executor already knows — a route name, a bracket's elapsed time.
+/// This one walks the whole selection, so leaving it on would add unaccounted
+/// O(rows) work *outside* the output bracket and inflate the framework overhead
+/// it exists to explain. A diagnostic must not move the number it measures.
 ///
-/// Deliberately unconditional and deliberately cheap: a few integer comparisons
-/// per row against a gather that costs 3.8-37.8 ns/row. Gating it on an env var
-/// would make it invisible in exactly the ordinary atlas run that is the only
-/// place the distributed arm is exercised — the failure this arc already made
-/// once with the vocabulary receipt.
+/// The cost of gating is that an ordinary atlas records nothing here. That is
+/// why `run_timing_atlas` stamps the probe's state into the artifact header: a
+/// reader must be able to tell "the probe was off" from "the joins had no
+/// locality", and an absent counter alone cannot say which.
+pub const JOIN_SELECTION_LOCALITY_ENV: &str = "TORON_JOIN_SELECTION_LOCALITY";
+
+/// Whether the locality probe is enabled for this process.
+pub fn join_selection_locality_enabled() -> bool {
+	static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*ENABLED.get_or_init(|| std::env::var(JOIN_SELECTION_LOCALITY_ENV).is_ok())
+}
+
+/// Fold one selection's run structure into the task accumulator, when the probe
+/// is enabled.
 pub(super) fn record_join_selection_locality(
 	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
+	kind: JoinKind,
 	selection: &[JoinOutputRow],
 ) {
-	if selection.is_empty() {
+	if !join_selection_locality_enabled() {
 		return;
 	}
-	use crate::distributed::task::JoinSelectionLocality;
+	let measured = measure_join_selection_locality(kind, selection);
+	record_task_telemetry(telemetry, |task| {
+		task.join_selection_locality.left.merge(&measured.left);
+		task.join_selection_locality.right.merge(&measured.right);
+	});
+}
+
+/// Measure one selection's run structure, per side.
+///
+/// Pure and unconditional so the arithmetic can be tested without touching
+/// process environment — the gate is tested separately.
+///
+/// `kind` decides which sides participate, mirroring
+/// `materialize_join_selection`'s own dispatch exactly. A side that the gather
+/// does not touch records no invocation; a side it *does* touch records one even
+/// when the selection contributed no index to it, which is what separates "never
+/// gathered here" from "gathered nothing here". An outer join whose rows all
+/// null one side is precisely that case, and it is real.
+pub(super) fn measure_join_selection_locality(
+	kind: JoinKind,
+	selection: &[JoinOutputRow],
+) -> crate::distributed::task::JoinSelectionLocalitySides {
+	use crate::distributed::task::{JoinSelectionLocality, JoinSelectionLocalitySides};
+
+	let (touches_left, touches_right) = match kind {
+		JoinKind::Inner
+		| JoinKind::Cross
+		| JoinKind::LeftOuter
+		| JoinKind::RightOuter
+		| JoinKind::FullOuter => (true, true),
+		JoinKind::LeftSemi | JoinKind::LeftAnti => (true, false),
+		JoinKind::RightSemi | JoinKind::RightAnti => (false, true),
+	};
+
 	let mut left = JoinSelectionLocality::default();
 	let mut right = JoinSelectionLocality::default();
 	// `None` means the side has not seen an index yet, or the previous row nulled
 	// it — either way the next index starts a fresh run rather than continuing one
-	// across a gap that the gather will not see as contiguous.
+	// across a gap the gather will not see as contiguous.
 	let mut left_previous: Option<u32> = None;
 	let mut right_previous: Option<u32> = None;
 	let mut left_run = 0u64;
@@ -380,13 +425,21 @@ pub(super) fn record_join_selection_locality(
 	}
 	left.observe_run(left_run);
 	right.observe_run(right_run);
-	left.invocations = u64::from(left.selected_rows > 0);
-	right.invocations = u64::from(right.selected_rows > 0);
 
-	record_task_telemetry(telemetry, |task| {
-		task.join_selection_locality.left.merge(&left);
-		task.join_selection_locality.right.merge(&right);
-	});
+	// One invocation per side the gather touches, counted whether or not that
+	// side received any index. `empty_invocations` carries the difference, so a
+	// zero row count can never be mistaken for a side that was never gathered.
+	for (side, touched) in [(&mut left, touches_left), (&mut right, touches_right)] {
+		if !touched {
+			continue;
+		}
+		side.invocations = 1;
+		if side.selected_rows == 0 {
+			side.empty_invocations = 1;
+		}
+	}
+
+	JoinSelectionLocalitySides { left, right }
 }
 
 /// Advance one side by one selection row.
@@ -411,7 +464,11 @@ fn step(
 	};
 	stats.selected_rows = stats.selected_rows.saturating_add(1);
 	match *previous {
-		Some(last) if index == last.saturating_add(1) => {
+		// `checked_add`, not `saturating_add`: at `u32::MAX` a saturating
+		// successor equals the predecessor, so a REPEATED `u32::MAX` would be
+		// counted as an ascending step and inflate the contiguity this probe
+		// exists to measure.
+		Some(last) if last.checked_add(1) == Some(index) => {
 			stats.ascending_steps = stats.ascending_steps.saturating_add(1);
 			*run = run.saturating_add(1);
 		}
@@ -800,7 +857,7 @@ pub(super) async fn execute_hash_join(
 	// Locality probe (ADR 554 follow-on): measured on the same selection the
 	// gather below is about to consume, before it is consumed, so the statistic
 	// and the cost it explains describe one event.
-	record_join_selection_locality(&telemetry, &selection);
+	record_join_selection_locality(&telemetry, kind, &selection);
 
 	let output = vec![time_join_output_materialization(&telemetry, || {
 		materialize_join_selection(
@@ -2757,20 +2814,15 @@ mod join_materialization_timing_tests {
 #[cfg(test)]
 mod join_selection_locality_tests {
 	use super::*;
-	use crate::distributed::task::{RUN_LENGTH_BUCKET_MINIMUMS, TaskTelemetry};
+	use crate::distributed::task::{
+		JoinSelectionLocalitySides, RUN_LENGTH_BUCKET_MINIMUMS, TaskTelemetry,
+	};
 
-	fn slot() -> Option<Arc<Mutex<TaskTelemetry>>> {
-		Some(Arc::new(Mutex::new(TaskTelemetry::default())))
-	}
-
-	fn sides(
-		slot: &Option<Arc<Mutex<TaskTelemetry>>>,
-	) -> crate::distributed::task::JoinSelectionLocalitySides {
-		slot.as_ref()
-			.unwrap()
-			.lock()
-			.unwrap()
-			.join_selection_locality
+	/// The arithmetic is exercised through the pure measurement, never through the
+	/// gated recorder: the gate reads process environment, and a test that set it
+	/// would race every other test in the same process.
+	fn measure(kind: JoinKind, selection: &[JoinOutputRow]) -> JoinSelectionLocalitySides {
+		measure_join_selection_locality(kind, selection)
 	}
 
 	fn paired(pairs: &[(u32, u32)]) -> Vec<JoinOutputRow> {
@@ -2787,12 +2839,8 @@ mod join_selection_locality_tests {
 	/// bucket its length reaches — and in none above it.
 	#[test]
 	fn an_ascending_side_is_one_run_in_every_bucket_it_reaches() {
-		let task = slot();
-		// Right ascends 0..8 (a run of 8); left is a constant, so every step is a
-		// duplicate and no run exceeds one.
 		let selection = paired(&(0..8).map(|row| (7u32, row)).collect::<Vec<_>>());
-		record_join_selection_locality(&task, &selection);
-		let sides = sides(&task);
+		let sides = measure(JoinKind::Inner, &selection);
 
 		assert_eq!(sides.right.selected_rows, 8);
 		assert_eq!(
@@ -2820,10 +2868,10 @@ mod join_selection_locality_tests {
 	/// that would justify abandoning slice reuse, so it must be unambiguous.
 	#[test]
 	fn a_scattered_side_reaches_no_bucket() {
-		let task = slot();
-		let selection = paired(&[(5, 100), (5, 3), (5, 77), (5, 42)]);
-		record_join_selection_locality(&task, &selection);
-		let sides = sides(&task);
+		let sides = measure(
+			JoinKind::Inner,
+			&paired(&[(5, 100), (5, 3), (5, 77), (5, 42)]),
+		);
 
 		assert_eq!(sides.right.selected_rows, 4);
 		assert_eq!(sides.right.ascending_steps, 0);
@@ -2836,11 +2884,9 @@ mod join_selection_locality_tests {
 	/// scatter. The buckets must show both.
 	#[test]
 	fn buckets_separate_a_long_run_from_surrounding_scatter() {
-		let task = slot();
 		let mut pairs: Vec<(u32, u32)> = (0..16).map(|row| (0u32, row)).collect();
 		pairs.extend([(0, 900), (0, 31), (0, 700), (0, 12)]);
-		record_join_selection_locality(&task, &paired(&pairs));
-		let right = sides(&task).right;
+		let right = measure(JoinKind::Inner, &paired(&pairs)).right;
 
 		assert_eq!(right.selected_rows, 20);
 		assert_eq!(right.max_run, 16);
@@ -2851,23 +2897,42 @@ mod join_selection_locality_tests {
 			"the 16 contiguous rows are visible at every bucket up to 16; the mean \
 			 run length here is 4, which would have suggested no run worth slicing"
 		);
-		// The headline fraction alone would read as 75% contiguous, which is true
-		// but says nothing about whether the contiguity is usably clustered.
 		assert_eq!(right.ascending_steps, 15);
+	}
+
+	/// A repeated `u32::MAX` is a duplicate, not an ascending step.
+	///
+	/// `saturating_add(1)` at the boundary returns the predecessor, so the
+	/// ascending arm would swallow a repeat and report perfect contiguity on the
+	/// one input where there is none. Unreachable at TPC-H scale; pinned because
+	/// the counter's whole purpose is to be believed.
+	#[test]
+	fn a_repeated_maximum_index_is_a_duplicate_not_an_ascending_step() {
+		let sides = measure(
+			JoinKind::Inner,
+			&paired(&[(0, u32::MAX), (0, u32::MAX), (0, u32::MAX)]),
+		);
+
+		assert_eq!(
+			(sides.right.ascending_steps, sides.right.duplicate_steps),
+			(0, 2),
+			"u32::MAX repeated must read as duplicates; saturating successor \
+			 arithmetic reports (2, 0) here"
+		);
+		assert_eq!(sides.right.max_run, 1);
+		assert_eq!(sides.right.rows_in_runs_at_least, [0; 6]);
 	}
 
 	/// A null on one side breaks that side's run without touching the other.
 	#[test]
 	fn a_null_side_breaks_only_its_own_run() {
-		let task = slot();
 		let selection = vec![
 			JoinOutputRow::Paired { left: 0, right: 0 },
 			JoinOutputRow::Paired { left: 1, right: 1 },
 			JoinOutputRow::RightFillNull { right: 2 },
 			JoinOutputRow::Paired { left: 2, right: 3 },
 		];
-		record_join_selection_locality(&task, &selection);
-		let sides = sides(&task);
+		let sides = measure(JoinKind::LeftOuter, &selection);
 
 		assert_eq!(
 			(sides.left.selected_rows, sides.left.max_run),
@@ -2882,27 +2947,87 @@ mod join_selection_locality_tests {
 		);
 	}
 
+	/// A side the gather never touches records nothing; a side it touches records
+	/// an invocation even when the selection gave it no index.
+	///
+	/// These two zeros mean opposite things — "not gathered" versus "gathered
+	/// nothing" — and `empty_invocations` is the only thing that separates them.
+	#[test]
+	fn an_untouched_side_and_an_empty_side_are_distinguishable() {
+		let semi = measure(
+			JoinKind::LeftSemi,
+			&[JoinOutputRow::LeftPreserved { left: 4 }],
+		);
+		assert_eq!(
+			(semi.right.invocations, semi.right.empty_invocations),
+			(0, 0),
+			"a LeftSemi gather never touches the right side"
+		);
+		assert_eq!((semi.left.invocations, semi.left.selected_rows), (1, 1));
+
+		// Every row nulls the left side: the gather DOES build left indices (all
+		// null) and take() runs on them, so the invocation is real.
+		let all_null_left = measure(
+			JoinKind::FullOuter,
+			&[
+				JoinOutputRow::RightFillNull { right: 0 },
+				JoinOutputRow::RightFillNull { right: 1 },
+			],
+		);
+		assert_eq!(
+			(
+				all_null_left.left.invocations,
+				all_null_left.left.empty_invocations,
+				all_null_left.left.selected_rows
+			),
+			(1, 1, 0),
+			"an outer join that nulls one side entirely gathered that side and got \
+			 nothing; that is not the same as never gathering it"
+		);
+	}
+
 	/// Invocations accumulate; the task-local receipt is a sum, not a snapshot of
 	/// the last join. A max is a max across all of them.
 	#[test]
 	fn repeated_invocations_accumulate_on_the_task() {
-		let task = slot();
-		record_join_selection_locality(&task, &paired(&[(0, 0), (1, 1)]));
-		record_join_selection_locality(&task, &paired(&(0..5).map(|r| (r, r)).collect::<Vec<_>>()));
-		let left = sides(&task).left;
+		let mut total = JoinSelectionLocalitySides::default();
+		for selection in [
+			paired(&[(0, 0), (1, 1)]),
+			paired(&(0..5).map(|r| (r, r)).collect::<Vec<_>>()),
+		] {
+			let measured = measure(JoinKind::Inner, &selection);
+			total.left.merge(&measured.left);
+			total.right.merge(&measured.right);
+		}
 
-		assert_eq!(left.invocations, 2);
-		assert_eq!(left.selected_rows, 7);
-		assert_eq!(left.max_run, 5, "the max spans invocations");
-		assert_eq!(left.run_count, 2);
+		assert_eq!(total.left.invocations, 2);
+		assert_eq!(total.left.selected_rows, 7);
+		assert_eq!(total.left.max_run, 5, "the max spans invocations");
+		assert_eq!(total.left.run_count, 2);
+		assert_eq!(total.left.empty_invocations, 0);
 	}
 
-	/// An empty selection records nothing at all — not an invocation with zero
-	/// rows, which would make "never gathered" and "gathered nothing" identical.
+	/// The probe is OFF unless its environment variable is set.
+	///
+	/// This is the positive control's negative half: it proves an ordinary atlas
+	/// records nothing here, so all-zero counters in such a run mean "probe off"
+	/// and never "joins had no locality". The atlas stamps the probe's state into
+	/// its artifact header for the same reason.
 	#[test]
-	fn an_empty_selection_records_no_invocation() {
-		let task = slot();
-		record_join_selection_locality(&task, &[]);
-		assert_eq!(sides(&task), Default::default());
+	fn the_probe_is_off_without_its_environment_variable() {
+		if std::env::var(JOIN_SELECTION_LOCALITY_ENV).is_ok() {
+			// A diagnostic run of the suite legitimately has it set; the assertion
+			// below would then be testing the opposite contract.
+			return;
+		}
+		let telemetry = Some(Arc::new(Mutex::new(TaskTelemetry::default())));
+		record_join_selection_locality(&telemetry, JoinKind::Inner, &paired(&[(0, 0), (1, 1)]));
+		assert_eq!(
+			telemetry.unwrap().lock().unwrap().join_selection_locality,
+			JoinSelectionLocalitySides::default(),
+			"the locality probe must not run on the production join path: its \
+			 O(rows) pass sits outside the output bracket and would inflate the \
+			 framework overhead it exists to explain"
+		);
 	}
 }
