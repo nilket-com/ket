@@ -68,3 +68,7 @@ harness = false
 [[bench]]
 name = "join_materialization_shape"
 harness = false
+
+[[bench]]
+name = "join_output_gather_shape"
+harness = false
