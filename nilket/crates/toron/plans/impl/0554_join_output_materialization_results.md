@@ -376,19 +376,66 @@ So the substitution is worth an A/B and is not worth a prediction. What it decid
 whether ~200 ms of a 1,124.9 ms term is reachable by narrowing a vector, given that the
 walk, the row match and the contiguity observation stay exactly where they are.
 
-## 9. Forward
+## 9. The plain-index substitution: a decisive negative - `822ae985`, reverted in `1ab76a8d`
 
-- **Index construction is 1,124.9 ms** after the deferral took 233.1 ms of it (§7). What
-  remains is 253.2 M rows that genuinely need a vector, plus the walk, the row match and the
-  contiguity observation, which no substitution reaches. The plain `Vec<u32>` substitution is
-  the next candidate against it and its per-row ceiling is below the deferral's 1.37 ns/row,
-  since it narrows a vector rather than skipping one — worth pricing in a bench before it is
-  built, not after.
-- **Carve before adding.** The join root took ~800 lines across the last two cuts and its
-  ADR 352 bound was raised twice. The gather machinery — run tracking, lazy build, slice,
-  equivalence — is a coherent body with its own tests and belongs in a submodule beside
-  `spill` and `streaming`. That carve comes before the next addition to the join root, not
-  after it.
+§8 forecast **190-306 ms** saved, point estimate ~233 ms. The measurement is **+92.0 ms
+spent**: the forecast was wrong in direction, not only in size.
+
+Artifact `adr554_plain_indices_sf8.jsonl`, build `822ae985f5c1`, binary mtime 1788036733,
+authority granted, 21/21, no replay violations. Comparability against the deferral
+baseline: mean 0.967, range 0.819-1.089 - this run was **faster** overall.
+
+| term | deferral `e45f5e75` | plain `822ae985` | delta |
+|---|---:|---:|---:|
+| **eligible index build** | 1,124.9 | **1,216.9** | **+92.0 (+8.2%)** |
+| nullable child (control) | 6.8 | 8.7 | +1.9 |
+| left take | 2,378.3 | 2,304.6 | -73.7 |
+| right take | 389.8 | 375.1 | -14.7 |
+| board elapsed | 178,518 | 169,707 | -8,811 (-4.9%) |
+
+**The controls are what make this decisive rather than dismissible.** The substitution
+fired: `join_output_plain_index_rows` recorded **250,509,799 of 253,153,029** materialized
+rows, 98.96%, the remainder being the outer kinds. Coverage was untouched to the digit -
+avoided 169,827,032, materialized 253,153,029, slice rows 1,248,135 left and 168,578,897
+right, all identical to the baseline. Storage changed; nothing else did. And the rise
+concentrates on the largest eligible cells - q11 +25.8, q08 +24.1, q09 +22.8, q02 +21.3,
+q21 +14.0 - while the small ones drifted down with the faster board.
+
+A term that rises 8.2% on a board running 3.3% faster cannot be read as drift: drift
+pushed the other way.
+
+### The explanation is a hypothesis and must stay one
+
+The substitution replaced one `Option::as_mut` check per row with a `matches!` on the
+storage plus a four-arm match over `(&mut IndexStorage, Option<u32>)`. About 0.36 ns/row
+over 253 M rows is +92 ms, which fits - and fitting is all it does. Nothing here measured
+a branch.
+
+**This does not authorize a specialized-loop retry.** The bench in §8 priced BULK
+construction - `collect` against `to_vec` - not row-wise representation dispatch, so it
+has nothing to say about the cost this cut actually incurred, and its 0.75-1.21 ns/row
+difference should not be carried forward as a saving that a hoisted loop would recover.
+A revisit must first price **two branch-free row-wise loops** directly, one pushing
+`u32` and one pushing `Option<u32>`, and show a difference that survives at the
+cardinalities on this board. Without that, a specialized loop is the same forecast in a
+new shape.
+
+### What stands
+
+The eligible index child remains **1,124.9 ms** after the deferral, and the join output
+gather machinery is unchanged from `e45f5e75` plus the carve. The negative result cost one
+atlas run and is worth more than the forecast was: the per-row cost of index construction
+is now known to be dominated by something other than the width of the vector.
+
+## 10. Forward
+
+- **Index construction stays at 1,124.9 ms and is CLOSED to the obvious lever.** The
+  substitution was built, measured and reverted (§9); the width of the index vector is not
+  what that time is made of. A revisit needs a row-wise branch-free price first, and the
+  §8 bench does not supply one.
+- **Carve done.** The gather machinery lives in `join/output_materialization.rs` and the
+  ADR 352 bound was ratcheted back down to 3,420. The next addition to that machinery goes
+  in the module, not the join root.
 - **The left side, 2,189.0 ms**, is intrinsically scattered and cannot be sliced. Before it is
   scoped, §1's unresolved question - why the contiguous side cost more than the scattered one
   - should be settled, because the answer decides whether the lever is locality at all.
