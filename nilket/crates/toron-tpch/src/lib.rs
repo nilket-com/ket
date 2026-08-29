@@ -6753,6 +6753,38 @@ fn timing_atlas_replay_attribution_path(
 				.get("join_output_right_take_ms")
 				.and_then(|value| value.as_f64())
 				.unwrap_or(0.0),
+			join_input_left_concat_ms: node
+				.get("join_input_left_concat_ms")
+				.and_then(|value| value.as_f64())
+				.unwrap_or(0.0),
+			join_input_right_concat_ms: node
+				.get("join_input_right_concat_ms")
+				.and_then(|value| value.as_f64())
+				.unwrap_or(0.0),
+			join_input_left_batches: node
+				.get("join_input_left_batches")
+				.and_then(|value| value.as_u64())
+				.unwrap_or(0),
+			join_input_left_rows: node
+				.get("join_input_left_rows")
+				.and_then(|value| value.as_u64())
+				.unwrap_or(0),
+			join_input_left_bytes: node
+				.get("join_input_left_bytes")
+				.and_then(|value| value.as_u64())
+				.unwrap_or(0),
+			join_input_right_batches: node
+				.get("join_input_right_batches")
+				.and_then(|value| value.as_u64())
+				.unwrap_or(0),
+			join_input_right_rows: node
+				.get("join_input_right_rows")
+				.and_then(|value| value.as_u64())
+				.unwrap_or(0),
+			join_input_right_bytes: node
+				.get("join_input_right_bytes")
+				.and_then(|value| value.as_u64())
+				.unwrap_or(0),
 			join_output_nonnull_index_build_ms: node
 				.get("join_output_nonnull_index_build_ms")
 				.and_then(|value| value.as_f64())
@@ -8030,6 +8062,19 @@ pub struct TimingAtlasTaskNode {
 	pub join_output_left_take_ms: f64,
 	/// The RIGHT side's complete `take` loop, nested the same way.
 	pub join_output_right_take_ms: f64,
+	/// ADR 554 follow-on: the two INPUT concatenations, nested inside
+	/// `join_input_materialization_ms` and charged from the same clock read, so the
+	/// pair partitions its parent rather than merely fitting inside it.
+	pub join_input_left_concat_ms: f64,
+	pub join_input_right_concat_ms: f64,
+	/// What each side handed to its concatenation: batches, rows, bytes. Bytes are
+	/// slice sizes, not allocation sizes.
+	pub join_input_left_batches: u64,
+	pub join_input_left_rows: u64,
+	pub join_input_left_bytes: u64,
+	pub join_input_right_batches: u64,
+	pub join_input_right_rows: u64,
+	pub join_input_right_bytes: u64,
 	/// ADR 554 follow-on: index-vector construction inside the same parent, split
 	/// by whether the substitution to a plain `Vec<u32>` could serve it.
 	///
@@ -8450,11 +8495,13 @@ pub fn timing_atlas_validate_path_bound_receipts(
 /// component nor subtracted from any residual: their parent already left the
 /// residual, and subtracting a child again would remove the same microseconds
 /// twice. They exist to split a parent, never to reduce it.
-pub const TIMING_ATLAS_NESTED_CHILD_PHASES: [&str; 4] = [
+pub const TIMING_ATLAS_NESTED_CHILD_PHASES: [&str; 6] = [
 	"join_output_left_take_micros",
 	"join_output_right_take_micros",
 	"join_output_nonnull_index_build_micros",
 	"join_output_nullable_index_build_micros",
+	"join_input_left_concat_micros",
+	"join_input_right_concat_micros",
 ];
 
 pub const TIMING_ATLAS_NAMED_REMAINDER_PHASES: [&str; 4] = [
@@ -9109,6 +9156,14 @@ fn placement_attempt_from_row(row: &serde_json::Value) -> Result<PlacementAttemp
 			join_output_index_rows_materialized: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
+			join_input_left_concat_ms: 0.0,
+			join_input_right_concat_ms: 0.0,
+			join_input_left_batches: 0,
+			join_input_left_rows: 0,
+			join_input_left_bytes: 0,
+			join_input_right_batches: 0,
+			join_input_right_rows: 0,
+			join_input_right_bytes: 0,
 			join_output_nonnull_index_build_ms: 0.0,
 			join_output_nullable_index_build_ms: 0.0,
 			join_selection_locality: None,
@@ -9567,6 +9622,16 @@ pub fn timing_atlas_nodes_from_report(
 					as f64 / 1000.0,
 				join_output_right_take_ms: record.telemetry.phases.join_output_right_take_micros
 					as f64 / 1000.0,
+				join_input_left_concat_ms: record.telemetry.phases.join_input_left_concat_micros
+					as f64 / 1000.0,
+				join_input_right_concat_ms: record.telemetry.phases.join_input_right_concat_micros
+					as f64 / 1000.0,
+				join_input_left_batches: record.telemetry.counters.join_input_left_batches,
+				join_input_left_rows: record.telemetry.counters.join_input_left_rows,
+				join_input_left_bytes: record.telemetry.counters.join_input_left_bytes,
+				join_input_right_batches: record.telemetry.counters.join_input_right_batches,
+				join_input_right_rows: record.telemetry.counters.join_input_right_rows,
+				join_input_right_bytes: record.telemetry.counters.join_input_right_bytes,
 				join_output_nonnull_index_build_ms: record
 					.telemetry
 					.phases
@@ -9631,6 +9696,14 @@ pub fn timing_atlas_local_task_node(
 		join_output_index_rows_materialized: 0,
 		join_output_left_take_ms: 0.0,
 		join_output_right_take_ms: 0.0,
+		join_input_left_concat_ms: 0.0,
+		join_input_right_concat_ms: 0.0,
+		join_input_left_batches: 0,
+		join_input_left_rows: 0,
+		join_input_left_bytes: 0,
+		join_input_right_batches: 0,
+		join_input_right_rows: 0,
+		join_input_right_bytes: 0,
 		join_output_nonnull_index_build_ms: 0.0,
 		join_output_nullable_index_build_ms: 0.0,
 		join_selection_locality: None,
@@ -9723,6 +9796,14 @@ pub fn timing_atlas_attribution_path_row(
 				"join_output_index_rows_materialized": node.join_output_index_rows_materialized,
 				"join_output_left_take_ms": node.join_output_left_take_ms,
 				"join_output_right_take_ms": node.join_output_right_take_ms,
+				"join_input_left_concat_ms": node.join_input_left_concat_ms,
+				"join_input_right_concat_ms": node.join_input_right_concat_ms,
+				"join_input_left_batches": node.join_input_left_batches,
+				"join_input_left_rows": node.join_input_left_rows,
+				"join_input_left_bytes": node.join_input_left_bytes,
+				"join_input_right_batches": node.join_input_right_batches,
+				"join_input_right_rows": node.join_input_right_rows,
+				"join_input_right_bytes": node.join_input_right_bytes,
 				"join_output_nonnull_index_build_ms": node.join_output_nonnull_index_build_ms,
 				"join_output_nullable_index_build_ms": node.join_output_nullable_index_build_ms,
 				"join_selection_locality": node.join_selection_locality,
@@ -25972,6 +26053,14 @@ mod adr538_timing_atlas_journal_replay {
 			join_output_index_rows_materialized: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
+			join_input_left_concat_ms: 0.0,
+			join_input_right_concat_ms: 0.0,
+			join_input_left_batches: 0,
+			join_input_left_rows: 0,
+			join_input_left_bytes: 0,
+			join_input_right_batches: 0,
+			join_input_right_rows: 0,
+			join_input_right_bytes: 0,
 			join_output_nonnull_index_build_ms: 0.0,
 			join_output_nullable_index_build_ms: 0.0,
 			join_selection_locality: None,
@@ -26090,6 +26179,14 @@ mod adr538_timing_atlas_journal_replay {
 			join_output_index_rows_materialized: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
+			join_input_left_concat_ms: 0.0,
+			join_input_right_concat_ms: 0.0,
+			join_input_left_batches: 0,
+			join_input_left_rows: 0,
+			join_input_left_bytes: 0,
+			join_input_right_batches: 0,
+			join_input_right_rows: 0,
+			join_input_right_bytes: 0,
 			join_output_nonnull_index_build_ms: 0.0,
 			join_output_nullable_index_build_ms: 0.0,
 			join_selection_locality: None,
@@ -26136,6 +26233,14 @@ mod adr538_timing_atlas_journal_replay {
 				join_output_index_rows_materialized: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
+				join_input_left_concat_ms: 0.0,
+				join_input_right_concat_ms: 0.0,
+				join_input_left_batches: 0,
+				join_input_left_rows: 0,
+				join_input_left_bytes: 0,
+				join_input_right_batches: 0,
+				join_input_right_rows: 0,
+				join_input_right_bytes: 0,
 				join_output_nonnull_index_build_ms: 0.0,
 				join_output_nullable_index_build_ms: 0.0,
 				join_selection_locality: None,
@@ -26175,6 +26280,14 @@ mod adr538_timing_atlas_journal_replay {
 				join_output_index_rows_materialized: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
+				join_input_left_concat_ms: 0.0,
+				join_input_right_concat_ms: 0.0,
+				join_input_left_batches: 0,
+				join_input_left_rows: 0,
+				join_input_left_bytes: 0,
+				join_input_right_batches: 0,
+				join_input_right_rows: 0,
+				join_input_right_bytes: 0,
 				join_output_nonnull_index_build_ms: 0.0,
 				join_output_nullable_index_build_ms: 0.0,
 				join_selection_locality: None,
@@ -27172,6 +27285,14 @@ mod adr538_timing_atlas_critical_path {
 			join_output_index_rows_materialized: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
+			join_input_left_concat_ms: 0.0,
+			join_input_right_concat_ms: 0.0,
+			join_input_left_batches: 0,
+			join_input_left_rows: 0,
+			join_input_left_bytes: 0,
+			join_input_right_batches: 0,
+			join_input_right_rows: 0,
+			join_input_right_bytes: 0,
 			join_output_nonnull_index_build_ms: 0.0,
 			join_output_nullable_index_build_ms: 0.0,
 			join_selection_locality: None,
@@ -27412,6 +27533,14 @@ mod adr538_path_bound_validation {
 				join_output_index_rows_materialized: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
+				join_input_left_concat_ms: 0.0,
+				join_input_right_concat_ms: 0.0,
+				join_input_left_batches: 0,
+				join_input_left_rows: 0,
+				join_input_left_bytes: 0,
+				join_input_right_batches: 0,
+				join_input_right_rows: 0,
+				join_input_right_bytes: 0,
 				join_output_nonnull_index_build_ms: 0.0,
 				join_output_nullable_index_build_ms: 0.0,
 				join_selection_locality: None,
@@ -27445,6 +27574,14 @@ mod adr538_path_bound_validation {
 				join_output_index_rows_materialized: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
+				join_input_left_concat_ms: 0.0,
+				join_input_right_concat_ms: 0.0,
+				join_input_left_batches: 0,
+				join_input_left_rows: 0,
+				join_input_left_bytes: 0,
+				join_input_right_batches: 0,
+				join_input_right_rows: 0,
+				join_input_right_bytes: 0,
 				join_output_nonnull_index_build_ms: 0.0,
 				join_output_nullable_index_build_ms: 0.0,
 				join_selection_locality: None,
@@ -27479,6 +27616,14 @@ mod adr538_path_bound_validation {
 				join_output_index_rows_materialized: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
+				join_input_left_concat_ms: 0.0,
+				join_input_right_concat_ms: 0.0,
+				join_input_left_batches: 0,
+				join_input_left_rows: 0,
+				join_input_left_bytes: 0,
+				join_input_right_batches: 0,
+				join_input_right_rows: 0,
+				join_input_right_bytes: 0,
 				join_output_nonnull_index_build_ms: 0.0,
 				join_output_nullable_index_build_ms: 0.0,
 				join_selection_locality: None,
@@ -27838,6 +27983,10 @@ mod adr538_phase_component_wiring {
 			// parent, so two more primes that must appear on neither side.
 			join_output_nonnull_index_build_micros: 73,
 			join_output_nullable_index_build_micros: 79,
+			// The input side split, same standing: children of
+			// `join_input_materialization_micros`, on neither side of the sum.
+			join_input_left_concat_micros: 83,
+			join_input_right_concat_micros: 89,
 		};
 		let portions = timing_atlas_component_portions_ms(&phases);
 		let by_label: BTreeMap<&str, f64> = portions
@@ -27876,12 +28025,12 @@ mod adr538_phase_component_wiring {
 		);
 		assert_eq!(TIMING_ATLAS_UNATTRIBUTED_PHASES.len(), 3);
 		assert_eq!(TIMING_ATLAS_NAMED_REMAINDER_PHASES.len(), 4);
-		assert_eq!(TIMING_ATLAS_NESTED_CHILD_PHASES.len(), 4);
+		assert_eq!(TIMING_ATLAS_NESTED_CHILD_PHASES.len(), 6);
 		assert_eq!(
 			mapped_micros + bookkeeping_micros + named_remainder_micros,
 			(2 + 3 + 5 + 7 + 11 + 13 + 17 + 19 + 23 + 29 + 31 + 37 + 41 + 43 + 47 + 53 + 59 + 61)
 				as f64,
-			"the nested children (67, 71, 73, 79) appear on NEITHER side: a child that reached\
+			"the nested children (67, 71, 73, 79, 83, 89) appear on NEITHER side: a child that reached\
 			 a component would inflate the mapped sum, and one that reached the\
 			 remainder would be subtracted twice with its parent"
 		);

@@ -28,6 +28,8 @@ mod streamed_spill;
 
 pub(in crate::exec) mod stage_attribution;
 
+mod input_materialization;
+
 mod output_materialization;
 
 mod streaming;
@@ -44,6 +46,8 @@ pub use self::output_materialization::{
 	JOIN_SLICE_EQUIVALENCE_ENV, join_slice_equivalence_columns_verified,
 	join_slice_equivalence_enabled,
 };
+
+use self::input_materialization::{JoinInputSide, time_join_input_materialization};
 
 use self::output_materialization::{LazyIndexBuilder, gather_side, index_deferral_available};
 
@@ -296,22 +300,6 @@ pub(super) fn record_task_telemetry(
 
 		update(&mut telemetry);
 	}
-}
-
-/// Time a join input concatenation and charge it to the input-materialization
-/// subterm.
-///
-/// Charged even when the body fails, for the same reason input processing is: the
-/// time was spent inside the task wall either way, and dropping it on the error
-/// path would silently move it back into the residual this counter exists to
-/// reduce.
-pub(super) fn time_join_input_materialization<T>(
-	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
-	body: impl FnOnce() -> Result<T, ExecutionError>,
-) -> Result<T, ExecutionError> {
-	time_join_materialization(telemetry, body, |phases| {
-		&mut phases.join_input_materialization_micros
-	})
 }
 
 /// Time a join output gather and charge it to the output-materialization subterm.
@@ -809,11 +797,14 @@ pub(super) async fn execute_hash_join(
 	}
 
 	let left_batch =
-		time_join_input_materialization(&telemetry, || concat_or_empty(left_schema, left_batches))?;
+		time_join_input_materialization(&telemetry, JoinInputSide::Left, left_batches, || {
+			concat_or_empty(left_schema, left_batches)
+		})?;
 
-	let right_batch = time_join_input_materialization(&telemetry, || {
-		concat_or_empty(right_schema, right_batches)
-	})?;
+	let right_batch =
+		time_join_input_materialization(&telemetry, JoinInputSide::Right, right_batches, || {
+			concat_or_empty(right_schema, right_batches)
+		})?;
 
 	// ADR 239: CROSS is keyless — route through the explicit match-all path instead of the hash
 
@@ -1219,11 +1210,14 @@ pub(super) async fn execute_hash_join_into_global_aggregate(
 	streamed_build_scope.discard_before_measurement();
 
 	let left_batch =
-		time_join_input_materialization(&telemetry, || concat_or_empty(left_schema, left_batches))?;
+		time_join_input_materialization(&telemetry, JoinInputSide::Left, left_batches, || {
+			concat_or_empty(left_schema, left_batches)
+		})?;
 
-	let right_batch = time_join_input_materialization(&telemetry, || {
-		concat_or_empty(right_schema, right_batches)
-	})?;
+	let right_batch =
+		time_join_input_materialization(&telemetry, JoinInputSide::Right, right_batches, || {
+			concat_or_empty(right_schema, right_batches)
+		})?;
 
 	let left_key_arrays = key_arrays(&left_batch, left_keys)?;
 
@@ -2925,7 +2919,8 @@ mod join_materialization_timing_tests {
 	#[test]
 	fn each_bracket_charges_only_its_own_counter() {
 		let task = slot();
-		time_join_input_materialization(&task, busy).expect("input body succeeds");
+		time_join_input_materialization(&task, JoinInputSide::Left, &[], busy)
+			.expect("input body succeeds");
 		let (input_only, output_at_rest) = charged(&task);
 		assert!(input_only > 0, "the input bracket must charge something");
 		assert_eq!(
@@ -2960,7 +2955,8 @@ mod join_materialization_timing_tests {
 			})
 		};
 
-		time_join_input_materialization(&task, failing).expect_err("input body fails");
+		time_join_input_materialization(&task, JoinInputSide::Left, &[], failing)
+			.expect_err("input body fails");
 		time_join_output_materialization(&task, failing).expect_err("output body fails");
 
 		let (input, output) = charged(&task);
@@ -2978,9 +2974,9 @@ mod join_materialization_timing_tests {
 	#[test]
 	fn repeated_brackets_accumulate_rather_than_overwrite() {
 		let task = slot();
-		time_join_input_materialization(&task, busy).expect("first");
+		time_join_input_materialization(&task, JoinInputSide::Left, &[], busy).expect("first");
 		let (after_one, _) = charged(&task);
-		time_join_input_materialization(&task, busy).expect("second");
+		time_join_input_materialization(&task, JoinInputSide::Left, &[], busy).expect("second");
 		let (after_two, _) = charged(&task);
 		assert!(
 			after_two > after_one,
@@ -2993,7 +2989,8 @@ mod join_materialization_timing_tests {
 	#[test]
 	fn a_task_without_telemetry_is_unaffected() {
 		let none: Option<Arc<Mutex<TaskTelemetry>>> = None;
-		time_join_input_materialization(&none, busy).expect("succeeds without a slot");
+		time_join_input_materialization(&none, JoinInputSide::Left, &[], busy)
+			.expect("succeeds without a slot");
 		time_join_output_materialization(&none, busy).expect("succeeds without a slot");
 	}
 }

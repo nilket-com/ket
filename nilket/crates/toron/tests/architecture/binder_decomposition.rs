@@ -465,6 +465,10 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// equivalence check — carved out of the join root behaviour-unchanged, for
 				// the same reason. It owns no binder decomposition surface.
 				"crates/toron/src/exec/join/output_materialization.rs",
+				// Its input-side sibling: the concatenation bracket, its per-side split
+				// and the shape counters that price a multi-batch redesign. Executor
+				// telemetry, no binder decomposition surface.
+				"crates/toron/src/exec/join/input_materialization.rs",
 			];
 			*path != "crates/toron/src/binder.rs"
 				&& !path.starts_with("crates/toron/src/binder/")
