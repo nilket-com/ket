@@ -214,6 +214,7 @@ authority it should not have.
   scoped, §1's unresolved question - why the contiguous side cost more than the scattered one
   - should be settled, because the answer decides whether the lever is locality at all.
 - **Input concatenation, 7,146 ms**, is untouched and is now the larger half of the named
-  materialization cost. Direct multi-batch input processing is the structural project there.
+  materialization cost. Direct multi-batch join build/probe, eliminating concatenation, is the
+  structural project there.
 - **Arbitrary contiguous sub-slices** remain available and remain gated on retained-memory
   accounting, per §2.
