@@ -1846,6 +1846,9 @@ mod tests {
 
 		let mut with_children = TaskTelemetry::default();
 		with_children.phases.task_wall_micros = 10_000;
+		with_children.phases.join_input_materialization_micros = 1_000;
+		with_children.phases.join_input_left_concat_micros = 800;
+		with_children.phases.join_input_right_concat_micros = 200;
 		with_children.phases.join_output_materialization_micros = 4_000;
 		// A realistic split: most of the parent is the two take loops, with the
 		// index build accounting for part of what is left over.
@@ -1856,9 +1859,11 @@ mod tests {
 		recompute_framework_overhead(&mut with_children);
 
 		assert_eq!(
-			with_children.phases.framework_overhead_micros, 6_000,
-			"splitting a parent into children must not move the residual at all; \
-			 a child that joined `accounted` would report 2_050 here"
+			with_children.phases.framework_overhead_micros, 5_000,
+			"only the two PARENTS subtract (10_000 - 4_000 - 1_000); every child \
+			 must leave the residual untouched. A child that joined `accounted` \
+			 would report less — 1_050 for the output children, 4_000 for the \
+			 input pair"
 		);
 	}
 
@@ -1872,6 +1877,26 @@ mod tests {
 	/// The index children join the sum rather than getting an identity of their
 	/// own: all four bracket disjoint spans inside the same parent, and a guard
 	/// that checked them separately would pass while their total overran it.
+	/// The input pair partitions its own parent: one clock read charges both, so
+	/// their sum equals it exactly when every site is charged. Stated as equality
+	/// BECAUSE the sides are timed together — an inequality here would tolerate a
+	/// site that charged the parent and forgot the child, which is the only way
+	/// this split can silently lose a side.
+	#[test]
+	fn adr554_join_input_children_partition_their_parent() {
+		let mut telemetry = TaskTelemetry::default();
+		telemetry.phases.join_input_materialization_micros = 1_000;
+		telemetry.phases.join_input_left_concat_micros = 800;
+		telemetry.phases.join_input_right_concat_micros = 200;
+		assert_eq!(
+			telemetry.phases.join_input_left_concat_micros
+				+ telemetry.phases.join_input_right_concat_micros,
+			telemetry.phases.join_input_materialization_micros,
+			"a charged concat adds to both levels from one measurement, so the two \
+			 sides must account for the whole parent"
+		);
+	}
+
 	#[test]
 	fn adr554_join_output_children_never_exceed_their_parent() {
 		for (left, right, nonnull, nullable, parent) in [

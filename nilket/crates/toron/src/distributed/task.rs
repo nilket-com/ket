@@ -507,6 +507,27 @@ pub struct TaskTelemetryCounters {
 	/// walked, and the ratio is the deferral's coverage.
 	#[serde(default)]
 	pub join_output_index_rows_materialized: u64,
+	/// Shape of what each side handed to its input concatenation: batches, rows
+	/// and the bytes those rows actually occupy.
+	///
+	/// Three counters per side because they answer different questions and a
+	/// multi-batch redesign is priced by all three: batch count bounds what
+	/// re-chunking could remove, rows scale the per-row cost, bytes are what the
+	/// copy moves. Bytes come from `get_slice_memory_size`, never
+	/// `get_array_memory_size` — shuffle and scan inputs are routinely slices of a
+	/// larger allocation, and the allocation is not what gets copied.
+	#[serde(default)]
+	pub join_input_left_batches: u64,
+	#[serde(default)]
+	pub join_input_left_rows: u64,
+	#[serde(default)]
+	pub join_input_left_bytes: u64,
+	#[serde(default)]
+	pub join_input_right_batches: u64,
+	#[serde(default)]
+	pub join_input_right_rows: u64,
+	#[serde(default)]
+	pub join_input_right_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -587,6 +608,22 @@ pub struct TaskTelemetryPhases {
 	/// naming this time shrinks the residual by exactly the same amount.
 	#[serde(default)]
 	pub join_input_materialization_micros: u64,
+	/// Time inside `join_input_materialization_micros` spent concatenating the
+	/// LEFT input, and below it the RIGHT.
+	///
+	/// Nested children on the same terms as the output side split: inside the
+	/// parent bracket, absent from `recompute_framework_overhead`, charged from
+	/// the SAME clock read as the parent so a child cannot drift from it.
+	///
+	/// The two inputs are not one quantity. The left side is the build input,
+	/// held for the whole probe; the right is the probe input, streamed past
+	/// once. Whether building or probing directly over multiple batches is worth
+	/// a structural API change depends on which of them the 7,146 ms is, and the
+	/// single parent counter cannot say.
+	#[serde(default)]
+	pub join_input_left_concat_micros: u64,
+	#[serde(default)]
+	pub join_input_right_concat_micros: u64,
 	/// Time spent gathering a join's selected rows into the output batch, in
 	/// `materialize_join_selection`. Charged at the generic sites only — the
 	/// spilled and streaming paths already run theirs inside the Spill and
