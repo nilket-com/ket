@@ -45,9 +45,7 @@ pub use self::output_materialization::{
 	join_slice_equivalence_enabled,
 };
 
-use self::output_materialization::{
-	IndexRepresentation, IndexRows, LazyIndexBuilder, gather_side, index_deferral_available,
-};
+use self::output_materialization::{LazyIndexBuilder, gather_side, index_deferral_available};
 
 pub(super) use self::columns::{collect_program_column_ordinals, grouped_aggregate_input_columns};
 
@@ -432,26 +430,22 @@ impl SideTakeTiming<'_> {
 	/// like every other counter here — the spilled and streaming paths run the
 	/// same builder, and counting their rows would credit this cut with coverage
 	/// it did not produce.
-	fn record_index_rows(self, rows: IndexRows) {
+	fn record_index_rows(self, avoided: u64, materialized: u64) {
 		let Self::Charged(telemetry) = self else {
 			return;
 		};
-		if rows.avoided == 0 && rows.materialized == 0 {
+		if avoided == 0 && materialized == 0 {
 			return;
 		}
 		record_task_telemetry(telemetry, |task| {
 			task.counters.join_output_index_rows_avoided = task
 				.counters
 				.join_output_index_rows_avoided
-				.saturating_add(rows.avoided);
+				.saturating_add(avoided);
 			task.counters.join_output_index_rows_materialized = task
 				.counters
 				.join_output_index_rows_materialized
-				.saturating_add(rows.materialized);
-			task.counters.join_output_plain_index_rows = task
-				.counters
-				.join_output_plain_index_rows
-				.saturating_add(rows.plain);
+				.saturating_add(materialized);
 		});
 	}
 
@@ -486,31 +480,16 @@ impl SideTakeTiming<'_> {
 fn index_build_slot(
 	kind: JoinKind,
 ) -> fn(&mut crate::distributed::task::TaskTelemetryPhases) -> &mut u64 {
-	match index_representation(kind) {
-		IndexRepresentation::Plain => |phases| &mut phases.join_output_nonnull_index_build_micros,
-		IndexRepresentation::Nullable => {
-			|phases| &mut phases.join_output_nullable_index_build_micros
-		}
-	}
-}
-
-/// Which index vector a join kind's gather builds — and, by the same answer,
-/// which timing child it charges.
-///
-/// One dispatch for both, so a kind cannot be timed as eligible while being built
-/// nullable, or the reverse. That pairing is what makes the eligible child a
-/// baseline the substitution can be measured against.
-fn index_representation(kind: JoinKind) -> IndexRepresentation {
 	match kind {
 		JoinKind::Inner
 		| JoinKind::Cross
 		| JoinKind::LeftSemi
 		| JoinKind::LeftAnti
 		| JoinKind::RightSemi
-		| JoinKind::RightAnti => IndexRepresentation::Plain,
+		| JoinKind::RightAnti => |phases| &mut phases.join_output_nonnull_index_build_micros,
 
 		JoinKind::LeftOuter | JoinKind::RightOuter | JoinKind::FullOuter => {
-			IndexRepresentation::Nullable
+			|phases| &mut phases.join_output_nullable_index_build_micros
 		}
 	}
 }
@@ -1656,22 +1635,13 @@ pub(super) fn materialize_join_selection(
 		| JoinKind::LeftOuter
 		| JoinKind::RightOuter
 		| JoinKind::FullOuter => {
-			let (left_indices, right_indices, rows_built) =
-				side_timing.time_index_build(kind, || {
+			let (left_indices, right_indices, avoided, materialized) = side_timing
+				.time_index_build(kind, || {
 					let deferrable = index_deferral_available();
-					let representation = index_representation(kind);
-					let mut left_indices = LazyIndexBuilder::new(
-						selection.len(),
-						left_batch.num_rows(),
-						deferrable,
-						representation,
-					);
-					let mut right_indices = LazyIndexBuilder::new(
-						selection.len(),
-						right_batch.num_rows(),
-						deferrable,
-						representation,
-					);
+					let mut left_indices =
+						LazyIndexBuilder::new(selection.len(), left_batch.num_rows(), deferrable);
+					let mut right_indices =
+						LazyIndexBuilder::new(selection.len(), right_batch.num_rows(), deferrable);
 
 					for row in selection {
 						match *row {
@@ -1700,12 +1670,16 @@ pub(super) fn materialize_join_selection(
 					// Inside the bracket on purpose: the `UInt32Array` and its null
 					// buffer are built here when they are built at all, and not
 					// building them is what this cut measures.
-					let left = left_indices.finish();
-					let right = right_indices.finish();
-					let rows_built = left.rows_built(&right);
-					Ok((left.indices, right.indices, rows_built))
+					let (left_indices, left_avoided, left_materialized) = left_indices.finish();
+					let (right_indices, right_avoided, right_materialized) = right_indices.finish();
+					Ok((
+						left_indices,
+						right_indices,
+						left_avoided + right_avoided,
+						left_materialized + right_materialized,
+					))
 				})?;
-			side_timing.record_index_rows(rows_built);
+			side_timing.record_index_rows(avoided, materialized);
 
 			let rows = selection.len();
 			let mut columns =
@@ -1720,27 +1694,25 @@ pub(super) fn materialize_join_selection(
 		}
 
 		JoinKind::LeftSemi | JoinKind::LeftAnti => {
-			let (left_indices, rows_built) = side_timing.time_index_build(kind, || {
-				let mut left_indices = LazyIndexBuilder::new(
-					selection.len(),
-					left_batch.num_rows(),
-					index_deferral_available(),
-					index_representation(kind),
-				);
+			let (left_indices, avoided, materialized) =
+				side_timing.time_index_build(kind, || {
+					let mut left_indices = LazyIndexBuilder::new(
+						selection.len(),
+						left_batch.num_rows(),
+						index_deferral_available(),
+					);
 
-				for row in selection {
-					match *row {
-						JoinOutputRow::LeftPreserved { left } => left_indices.push(Some(left)),
+					for row in selection {
+						match *row {
+							JoinOutputRow::LeftPreserved { left } => left_indices.push(Some(left)),
 
-						_ => return Err(invalid_join_selection(kind, row)),
+							_ => return Err(invalid_join_selection(kind, row)),
+						}
 					}
-				}
 
-				let built = left_indices.finish();
-				let rows = built.rows();
-				Ok((built.indices, rows))
-			})?;
-			side_timing.record_index_rows(rows_built);
+					Ok(left_indices.finish())
+				})?;
+			side_timing.record_index_rows(avoided, materialized);
 
 			let rows = selection.len();
 			let mut columns = Vec::with_capacity(left_batch.num_columns());
@@ -1751,27 +1723,27 @@ pub(super) fn materialize_join_selection(
 		}
 
 		JoinKind::RightSemi | JoinKind::RightAnti => {
-			let (right_indices, rows_built) = side_timing.time_index_build(kind, || {
-				let mut right_indices = LazyIndexBuilder::new(
-					selection.len(),
-					right_batch.num_rows(),
-					index_deferral_available(),
-					index_representation(kind),
-				);
+			let (right_indices, avoided, materialized) =
+				side_timing.time_index_build(kind, || {
+					let mut right_indices = LazyIndexBuilder::new(
+						selection.len(),
+						right_batch.num_rows(),
+						index_deferral_available(),
+					);
 
-				for row in selection {
-					match *row {
-						JoinOutputRow::RightPreserved { right } => right_indices.push(Some(right)),
+					for row in selection {
+						match *row {
+							JoinOutputRow::RightPreserved { right } => {
+								right_indices.push(Some(right))
+							}
 
-						_ => return Err(invalid_join_selection(kind, row)),
+							_ => return Err(invalid_join_selection(kind, row)),
+						}
 					}
-				}
 
-				let built = right_indices.finish();
-				let rows = built.rows();
-				Ok((built.indices, rows))
-			})?;
-			side_timing.record_index_rows(rows_built);
+					Ok(right_indices.finish())
+				})?;
+			side_timing.record_index_rows(avoided, materialized);
 
 			let rows = selection.len();
 			let mut columns = Vec::with_capacity(right_batch.num_columns());

@@ -6745,10 +6745,6 @@ fn timing_atlas_replay_attribution_path(
 				.get("join_output_index_rows_materialized")
 				.and_then(|value| value.as_u64())
 				.unwrap_or(0),
-			join_output_plain_index_rows: node
-				.get("join_output_plain_index_rows")
-				.and_then(|value| value.as_u64())
-				.unwrap_or(0),
 			join_output_left_take_ms: node
 				.get("join_output_left_take_ms")
 				.and_then(|value| value.as_f64())
@@ -8056,11 +8052,6 @@ pub struct TimingAtlasTaskNode {
 	/// The distinction is the one this record got wrong once already.
 	pub join_output_index_rows_avoided: u64,
 	pub join_output_index_rows_materialized: u64,
-	/// Of the materialized rows, those stored as plain `u32` indices. The positive
-	/// control for the substitution: `materialized` counts rows, not
-	/// representations, so only this column can tell a working substitution from an
-	/// inert one.
-	pub join_output_plain_index_rows: u64,
 	/// ADR 554 follow-on: run-length structure of this node's join output
 	/// selections, per side, aggregated over the task.
 	///
@@ -9116,7 +9107,6 @@ fn placement_attempt_from_row(row: &serde_json::Value) -> Result<PlacementAttemp
 			join_output_right_slice_rows: 0,
 			join_output_index_rows_avoided: 0,
 			join_output_index_rows_materialized: 0,
-			join_output_plain_index_rows: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
 			join_output_nonnull_index_build_ms: 0.0,
@@ -9573,10 +9563,6 @@ pub fn timing_atlas_nodes_from_report(
 					.telemetry
 					.counters
 					.join_output_index_rows_materialized,
-				join_output_plain_index_rows: record
-					.telemetry
-					.counters
-					.join_output_plain_index_rows,
 				join_output_left_take_ms: record.telemetry.phases.join_output_left_take_micros
 					as f64 / 1000.0,
 				join_output_right_take_ms: record.telemetry.phases.join_output_right_take_micros
@@ -9643,7 +9629,6 @@ pub fn timing_atlas_local_task_node(
 		join_output_right_slice_rows: 0,
 		join_output_index_rows_avoided: 0,
 		join_output_index_rows_materialized: 0,
-		join_output_plain_index_rows: 0,
 		join_output_left_take_ms: 0.0,
 		join_output_right_take_ms: 0.0,
 		join_output_nonnull_index_build_ms: 0.0,
@@ -9736,7 +9721,6 @@ pub fn timing_atlas_attribution_path_row(
 				"join_output_right_slice_rows": node.join_output_right_slice_rows,
 				"join_output_index_rows_avoided": node.join_output_index_rows_avoided,
 				"join_output_index_rows_materialized": node.join_output_index_rows_materialized,
-				"join_output_plain_index_rows": node.join_output_plain_index_rows,
 				"join_output_left_take_ms": node.join_output_left_take_ms,
 				"join_output_right_take_ms": node.join_output_right_take_ms,
 				"join_output_nonnull_index_build_ms": node.join_output_nonnull_index_build_ms,
@@ -25986,7 +25970,6 @@ mod adr538_timing_atlas_journal_replay {
 			join_output_right_slice_rows: 0,
 			join_output_index_rows_avoided: 0,
 			join_output_index_rows_materialized: 0,
-			join_output_plain_index_rows: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
 			join_output_nonnull_index_build_ms: 0.0,
@@ -26105,7 +26088,6 @@ mod adr538_timing_atlas_journal_replay {
 			join_output_right_slice_rows: 0,
 			join_output_index_rows_avoided: 0,
 			join_output_index_rows_materialized: 0,
-			join_output_plain_index_rows: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
 			join_output_nonnull_index_build_ms: 0.0,
@@ -26152,7 +26134,6 @@ mod adr538_timing_atlas_journal_replay {
 				join_output_right_slice_rows: 0,
 				join_output_index_rows_avoided: 0,
 				join_output_index_rows_materialized: 0,
-				join_output_plain_index_rows: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
 				join_output_nonnull_index_build_ms: 0.0,
@@ -26192,7 +26173,6 @@ mod adr538_timing_atlas_journal_replay {
 				join_output_right_slice_rows: 0,
 				join_output_index_rows_avoided: 0,
 				join_output_index_rows_materialized: 0,
-				join_output_plain_index_rows: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
 				join_output_nonnull_index_build_ms: 0.0,
@@ -27190,7 +27170,6 @@ mod adr538_timing_atlas_critical_path {
 			join_output_right_slice_rows: 0,
 			join_output_index_rows_avoided: 0,
 			join_output_index_rows_materialized: 0,
-			join_output_plain_index_rows: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
 			join_output_nonnull_index_build_ms: 0.0,
@@ -27431,7 +27410,6 @@ mod adr538_path_bound_validation {
 				join_output_right_slice_rows: 0,
 				join_output_index_rows_avoided: 0,
 				join_output_index_rows_materialized: 0,
-				join_output_plain_index_rows: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
 				join_output_nonnull_index_build_ms: 0.0,
@@ -27465,7 +27443,6 @@ mod adr538_path_bound_validation {
 				join_output_right_slice_rows: 0,
 				join_output_index_rows_avoided: 0,
 				join_output_index_rows_materialized: 0,
-				join_output_plain_index_rows: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
 				join_output_nonnull_index_build_ms: 0.0,
@@ -27500,7 +27477,6 @@ mod adr538_path_bound_validation {
 				join_output_right_slice_rows: 0,
 				join_output_index_rows_avoided: 0,
 				join_output_index_rows_materialized: 0,
-				join_output_plain_index_rows: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
 				join_output_nonnull_index_build_ms: 0.0,

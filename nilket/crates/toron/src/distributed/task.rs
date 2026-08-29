@@ -507,16 +507,6 @@ pub struct TaskTelemetryCounters {
 	/// walked, and the ratio is the deferral's coverage.
 	#[serde(default)]
 	pub join_output_index_rows_materialized: u64,
-	/// Of the materialized rows, those stored as PLAIN `u32` indices — the
-	/// substitution for kinds that cannot produce a null.
-	///
-	/// Its own counter because `join_output_index_rows_materialized` cannot
-	/// identify a representation: the substitution changes how a row is stored,
-	/// not whether it is stored. Without this number a run could not tell a
-	/// working substitution from an inert one, which is the only thing its A/B
-	/// is trying to establish.
-	#[serde(default)]
-	pub join_output_plain_index_rows: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
