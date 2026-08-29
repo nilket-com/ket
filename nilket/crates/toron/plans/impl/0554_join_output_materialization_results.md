@@ -249,12 +249,20 @@ Two limits on what this licenses, both material to scoping:
   substitution could remove is UNMEASURED. The bracket also contains the
   `ContiguousRun` observation this line itself added, and the row match; a
   substitution reaches neither. 1,358.0 ms is an upper bound, not a target.
-- **92% of it is spent on indices that are then discarded.** Of pair 0's
-  1,385.9 ms, 1,275.1 ms sits on the 21 nodes that slice a side - and on a sliced
-  side the index array is built and never read, because `gather_side` slices
-  instead. That is dead work the slice cut created and did not clean up: a
-  whole-source run's indices are `0..rows`, which need not be materialized at
-  all.
+- **A sliced side's index array is built and never read** — `gather_side` slices
+  instead — so the slice cut left dead work behind it. That is a mechanism,
+  established from the code, and its **magnitude is unknown**.
+
+  The tempting number here is wrong and is recorded as such: 1,275.1 ms of pair
+  0's 1,385.9 ms falls on the 21 nodes that slice at least one side, which reads
+  as "92% of index construction is discarded" and is not what the counter says.
+  It is a per-NODE aggregate. Those nodes also run invocations that slice
+  nothing, and every invocation builds BOTH sides while at most one is sliced —
+  so the figure bounds where the time sits, never what it was spent on. This is
+  §4's trap, one section later, in a record that had just written the rule down:
+  a per-invocation opportunity needs a per-invocation counter, and no aggregate
+  substitutes for one. The share of index construction that is actually
+  discarded stays unmeasured until a counter reports it directly.
 
 Comparability: this run is uniformly slower than the slice board (mean 1.09,
 range 0.967-1.214) and level with the side-split board (mean 1.00). Cross-run
@@ -266,11 +274,12 @@ elapsed drop was drift, not a win - see "What is not claimed".
 
 - **Index construction, 1,358.0 ms**, is now measured and almost entirely eligible (§6). The
   first cut against it is not the plain-index substitution but **not building the vector at
-  all for a side that ends up sliced** — 92% of the time sits there, and a whole-source run's
-  indices are `0..rows`. The substitution then applies to whatever vector remains. Both are
-  bounded by the share of the bracket a substitution can actually reach, which §6 records as
-  unmeasured; a cut that claims the full 1,358.0 ms is claiming the row match and the run
-  observation too.
+  all for a side that ends up sliced**: a whole-source run's indices are `0..rows`, and today
+  they are materialized and then discarded. How much of the 1,358.0 ms that is, no existing
+  counter can say (§6) — the cut carries its own avoided/materialized row counters and claims
+  only the reduction they explain. The substitution applies to whatever vector still gets
+  built, and is a separate cut; neither may claim the row match or the run observation, which
+  no substitution reaches.
 - **The left side, 2,189.0 ms**, is intrinsically scattered and cannot be sliced. Before it is
   scoped, §1's unresolved question - why the contiguous side cost more than the scattered one
   - should be settled, because the answer decides whether the lever is locality at all.
