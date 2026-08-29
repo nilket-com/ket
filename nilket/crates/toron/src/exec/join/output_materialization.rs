@@ -142,46 +142,155 @@ pub(super) struct SideIndices {
 /// the lazy path adds no branch to selections it can never serve.
 pub(super) struct LazyIndexBuilder {
 	run: ContiguousRun,
-	/// `None` while the allocation is still deferred.
-	indices: Option<Vec<Option<u32>>>,
+	storage: IndexStorage,
+	/// The representation this side intends to build, decided by join kind before
+	/// any row arrives — never by the rows observed, which is the same rule the
+	/// eligible/control timing split follows.
+	representation: IndexRepresentation,
 	/// Rows accepted so far. While deferred these are exactly `0..accepted`.
 	accepted: usize,
 	rows: usize,
 	source_rows: usize,
 }
 
+/// Which index vector a join kind's gather builds.
+///
+/// `Plain` is the substitution: a `Vec<u32>` and a null-free `UInt32Array`, half
+/// the per-row storage and no null buffer. It is available only to kinds whose
+/// arms cannot emit a null index — `Inner`, `Cross` and the four semi/anti kinds.
+/// The outer kinds keep `Nullable` and are byte-identical to before this cut.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum IndexRepresentation {
+	Plain,
+	Nullable,
+}
+
+enum IndexStorage {
+	/// No allocation yet: a whole-source run is still reachable.
+	Deferred,
+	Plain(Vec<u32>),
+	Nullable(Vec<Option<u32>>),
+}
+
+/// What one side's build produced, with the row counts that make it checkable.
+pub(super) struct SideBuild {
+	pub(super) indices: SideIndices,
+	/// Rows the deferral never materialized.
+	pub(super) avoided: u64,
+	/// Rows materialized into a vector, in either representation.
+	pub(super) materialized: u64,
+	/// Of those, the rows materialized as PLAIN indices.
+	///
+	/// Its own counter because `materialized` cannot identify a representation:
+	/// the substitution changes how a row is stored, not whether it is stored, so
+	/// a run without this number could not tell a working substitution from an
+	/// inert one.
+	pub(super) plain: u64,
+}
+
+/// The index-row counts a gather reports, over one side or both.
+#[derive(Clone, Copy, Default)]
+pub(super) struct IndexRows {
+	pub(super) avoided: u64,
+	pub(super) materialized: u64,
+	pub(super) plain: u64,
+}
+
+impl SideBuild {
+	/// This side's counts alone, for the semi and anti arms that gather one side.
+	pub(super) fn rows(&self) -> IndexRows {
+		IndexRows {
+			avoided: self.avoided,
+			materialized: self.materialized,
+			plain: self.plain,
+		}
+	}
+
+	/// Both sides' counts, for the arms that gather a pair.
+	pub(super) fn rows_built(&self, other: &Self) -> IndexRows {
+		IndexRows {
+			avoided: self.avoided + other.avoided,
+			materialized: self.materialized + other.materialized,
+			plain: self.plain + other.plain,
+		}
+	}
+}
+
 impl LazyIndexBuilder {
-	pub(super) fn new(rows: usize, source_rows: usize, deferrable: bool) -> Self {
+	pub(super) fn new(
+		rows: usize,
+		source_rows: usize,
+		deferrable: bool,
+		representation: IndexRepresentation,
+	) -> Self {
 		let deferred = deferrable && rows == source_rows && rows > 0;
 		Self {
 			run: ContiguousRun::new(),
-			indices: (!deferred).then(|| Vec::with_capacity(rows)),
+			storage: if deferred {
+				IndexStorage::Deferred
+			} else {
+				Self::allocate(representation, rows)
+			},
+			representation,
 			accepted: 0,
 			rows,
 			source_rows,
 		}
 	}
 
+	fn allocate(representation: IndexRepresentation, rows: usize) -> IndexStorage {
+		match representation {
+			IndexRepresentation::Plain => IndexStorage::Plain(Vec::with_capacity(rows)),
+			IndexRepresentation::Nullable => IndexStorage::Nullable(Vec::with_capacity(rows)),
+		}
+	}
+
 	pub(super) fn push(&mut self, index: Option<u32>) {
 		self.run.observe(index);
-		if let Some(indices) = self.indices.as_mut() {
-			indices.push(index);
-			self.accepted += 1;
-			return;
+		if matches!(self.storage, IndexStorage::Deferred) {
+			// Still deferred only while a whole-source run remains reachable: the
+			// run has to be intact AND anchored at zero, since `slice_offset`
+			// accepts no other offset. The check is on the run's own state rather
+			// than on this row, so a null — which breaks the run without being a
+			// wrong index — materializes here too.
+			if self.run.intact && self.run.start == Some(0) {
+				self.accepted += 1;
+				return;
+			}
+			self.materialize();
 		}
-		// Still deferred only while a whole-source run remains reachable: the run
-		// has to be intact AND anchored at zero, since `slice_offset` accepts no
-		// other offset. The check is on the run's own state rather than on this
-		// row, so a null — which breaks the run without being a wrong index —
-		// materializes here too.
-		if self.run.intact && self.run.start == Some(0) {
-			self.accepted += 1;
-			return;
-		}
-		self.materialize();
-		let indices = self.indices.as_mut().expect("materialized above");
-		indices.push(index);
+		self.push_materialized(index);
 		self.accepted += 1;
+	}
+
+	fn push_materialized(&mut self, index: Option<u32>) {
+		match (&mut self.storage, index) {
+			(IndexStorage::Plain(indices), Some(index)) => indices.push(index),
+			(IndexStorage::Nullable(indices), index) => indices.push(index),
+			(IndexStorage::Plain(_), None) => {
+				// A null reaching a plain side means the selection carried a fill
+				// row for a kind whose arm is not supposed to produce one. Widen
+				// rather than panic or error: the output must be exactly what the
+				// nullable path would have produced, and a representation choice is
+				// never worth a behaviour change. `an_eligible_side_that_meets_a_
+				// null_widens_to_nullable` pins the values.
+				self.widen_to_nullable();
+				self.push_materialized(None);
+			}
+			(IndexStorage::Deferred, _) => {
+				unreachable!("push_materialized runs only after materialize")
+			}
+		}
+	}
+
+	fn widen_to_nullable(&mut self) {
+		let IndexStorage::Plain(plain) = &mut self.storage else {
+			return;
+		};
+		let mut widened = Vec::with_capacity(self.rows);
+		widened.extend(plain.iter().copied().map(Some));
+		self.storage = IndexStorage::Nullable(widened);
+		self.representation = IndexRepresentation::Nullable;
 	}
 
 	/// Allocate and backfill the rows accepted while deferred.
@@ -193,46 +302,59 @@ impl LazyIndexBuilder {
 	/// `a_broken_run_backfills_exactly_what_the_eager_builder_would` compares the
 	/// result against eager construction rather than against a row count.
 	fn materialize(&mut self) {
-		let mut indices = Vec::with_capacity(self.rows);
-		indices.extend((0..self.accepted).map(|row| Some(row as u32)));
-		self.indices = Some(indices);
+		self.storage = match self.representation {
+			IndexRepresentation::Plain => {
+				let mut indices = Vec::with_capacity(self.rows);
+				indices.extend(0..self.accepted as u32);
+				IndexStorage::Plain(indices)
+			}
+			IndexRepresentation::Nullable => {
+				let mut indices = Vec::with_capacity(self.rows);
+				indices.extend((0..self.accepted).map(|row| Some(row as u32)));
+				IndexStorage::Nullable(indices)
+			}
+		};
 	}
 
-	/// Finish the side, reporting the indices, the rows the deferral avoided
-	/// materializing, and the rows it did materialize.
+	/// Finish the side, reporting the indices and the row counts that let a run
+	/// check what actually happened.
 	///
-	/// The two counts are the positive control: they are recorded per gather, so
-	/// an index-build time that falls with nothing avoided means something else
-	/// moved. Exactly one of them is non-zero — a side is deferred or it is not,
-	/// and this cut never materializes part of one.
-	pub(super) fn finish(mut self) -> (SideIndices, u64, u64) {
+	/// `avoided` and `materialized` are exclusive — a side is deferred or it is
+	/// not — and `plain` is a subset of `materialized`, naming the representation.
+	pub(super) fn finish(mut self) -> SideBuild {
 		// One decision, made by the run's own arithmetic. The loop's bookkeeping
 		// says only whether an allocation is still avoidable; whether a slice is
 		// legal stays with `slice_offset`, including the whole-source restriction
 		// that keeps the retention non-amplifying.
 		let slice_offset = self.run.slice_offset(self.rows, self.source_rows);
-		if self.indices.is_none() {
+		if matches!(self.storage, IndexStorage::Deferred) {
 			if slice_offset.is_some() {
-				return (
-					SideIndices {
+				return SideBuild {
+					indices: SideIndices {
 						array: None,
 						slice_offset,
 					},
-					self.rows as u64,
-					0,
-				);
+					avoided: self.rows as u64,
+					materialized: 0,
+					plain: 0,
+				};
 			}
 			self.materialize();
 		}
-		let indices = self.indices.expect("materialized above");
-		(
-			SideIndices {
-				array: Some(UInt32Array::from(indices)),
+		let (array, plain) = match self.storage {
+			IndexStorage::Plain(indices) => (UInt32Array::from(indices), self.rows as u64),
+			IndexStorage::Nullable(indices) => (UInt32Array::from(indices), 0),
+			IndexStorage::Deferred => unreachable!("materialized above"),
+		};
+		SideBuild {
+			indices: SideIndices {
+				array: Some(array),
 				slice_offset,
 			},
-			0,
-			self.rows as u64,
-		)
+			avoided: 0,
+			materialized: self.rows as u64,
+			plain,
+		}
 	}
 }
 
@@ -407,13 +529,19 @@ mod slice_fast_path_tests {
 	/// the array should have existed at all is the deferral's question, and
 	/// `index_deferral_tests` asks it separately.
 	fn gather(source: &RecordBatch, indices: &[u32]) -> u64 {
-		let mut builder = LazyIndexBuilder::new(indices.len(), source.num_rows(), false);
+		let mut builder = LazyIndexBuilder::new(
+			indices.len(),
+			source.num_rows(),
+			false,
+			IndexRepresentation::Nullable,
+		);
 		for index in indices {
 			builder.push(Some(*index));
 		}
-		let (side, avoided, materialized) = builder.finish();
+		let built = builder.finish();
+		let side = built.indices;
 		assert_eq!(
-			(avoided, materialized),
+			(built.avoided, built.materialized),
 			(0, indices.len() as u64),
 			"an eager builder materializes every row"
 		);
@@ -730,16 +858,26 @@ mod index_deferral_tests {
 		indices: &[Option<u32>],
 		source_rows: usize,
 	) -> (SideIndices, SideIndices, u64, u64) {
-		let mut lazy = LazyIndexBuilder::new(indices.len(), source_rows, true);
-		let mut eager = LazyIndexBuilder::new(indices.len(), source_rows, false);
+		let mut lazy = LazyIndexBuilder::new(
+			indices.len(),
+			source_rows,
+			true,
+			IndexRepresentation::Nullable,
+		);
+		let mut eager = LazyIndexBuilder::new(
+			indices.len(),
+			source_rows,
+			false,
+			IndexRepresentation::Nullable,
+		);
 		for index in indices {
 			lazy.push(*index);
 			eager.push(*index);
 		}
-		let (lazy, avoided, materialized) = lazy.finish();
-		let (eager, eager_avoided, _) = eager.finish();
-		assert_eq!(eager_avoided, 0, "the eager builder never avoids a row");
-		(lazy, eager, avoided, materialized)
+		let lazy = lazy.finish();
+		let eager = eager.finish();
+		assert_eq!(eager.avoided, 0, "the eager builder never avoids a row");
+		(lazy.indices, eager.indices, lazy.avoided, lazy.materialized)
 	}
 
 	fn ascending(rows: usize) -> Vec<Option<u32>> {
@@ -914,6 +1052,188 @@ mod index_deferral_tests {
 			(0, 8),
 			"slice coverage is unchanged by the deferral: the same side slices, \
 			 the same rows"
+		);
+	}
+}
+
+#[cfg(test)]
+mod index_representation_tests {
+	use super::*;
+	use crate::distributed::task::TaskTelemetry;
+	use arrow::array::Int64Array;
+	use arrow::datatypes::{DataType, Field, Schema};
+	use std::sync::Arc as StdArc;
+
+	const ROWS: usize = 64;
+
+	fn build(representation: IndexRepresentation, indices: &[Option<u32>]) -> SideBuild {
+		// Eager on purpose: the deferral's behaviour is `index_deferral_tests`'
+		// subject, and a deferred side would build no vector to inspect.
+		let mut builder =
+			LazyIndexBuilder::new(indices.len(), indices.len() + 1, false, representation);
+		for index in indices {
+			builder.push(*index);
+		}
+		builder.finish()
+	}
+
+	fn scattered() -> Vec<Option<u32>> {
+		(0..ROWS)
+			.map(|row| Some(((row * 7) % ROWS) as u32))
+			.collect()
+	}
+
+	/// An eligible kind builds a null-free array and says so.
+	///
+	/// The array comparison is the substitution's correctness rail: a plain vector
+	/// and a nullable one must produce the same indices, or every gather that
+	/// consumes them returns different rows.
+	#[test]
+	fn an_eligible_kind_builds_plain_indices_with_the_same_values() {
+		let indices = scattered();
+		let plain = build(IndexRepresentation::Plain, &indices);
+		let nullable = build(IndexRepresentation::Nullable, &indices);
+
+		assert_eq!(
+			plain.plain, ROWS as u64,
+			"every materialized row must be counted as plain"
+		);
+		assert_eq!(nullable.plain, 0, "the control builds no plain rows");
+
+		let plain_array = plain.indices.array.as_ref().expect("materialized");
+		let nullable_array = nullable.indices.array.as_ref().expect("materialized");
+		assert_eq!(
+			plain_array.values(),
+			nullable_array.values(),
+			"the substitution must not change a single index"
+		);
+		assert_eq!(
+			plain_array.null_count(),
+			0,
+			"a plain build carries no null buffer"
+		);
+		assert_eq!(plain_array.len(), nullable_array.len());
+	}
+
+	/// An outer kind is untouched by this cut.
+	#[test]
+	fn an_outer_kind_still_builds_a_nullable_array() {
+		let mut indices = scattered();
+		indices[3] = None;
+		let built = build(IndexRepresentation::Nullable, &indices);
+		let array = built.indices.array.as_ref().expect("materialized");
+
+		assert_eq!(built.plain, 0);
+		assert_eq!(array.null_count(), 1, "the null must survive");
+		assert!(array.is_null(3));
+	}
+
+	/// A null reaching an eligible side widens rather than panicking or erroring.
+	///
+	/// The arms that select `Plain` are not supposed to produce a fill row, but
+	/// nothing in the type system stops a selection from carrying one, and a
+	/// representation choice must never change what a query returns. The widened
+	/// build must equal the nullable one exactly — and it must stop counting
+	/// itself as plain, or the positive control would claim coverage the
+	/// substitution did not deliver.
+	#[test]
+	fn an_eligible_side_that_meets_a_null_widens_to_nullable() {
+		let mut indices = scattered();
+		indices[9] = None;
+		let widened = build(IndexRepresentation::Plain, &indices);
+		let nullable = build(IndexRepresentation::Nullable, &indices);
+
+		assert_eq!(
+			widened
+				.indices
+				.array
+				.as_ref()
+				.expect("materialized")
+				.to_data(),
+			nullable
+				.indices
+				.array
+				.as_ref()
+				.expect("materialized")
+				.to_data(),
+			"a widened build must equal the nullable one, nulls and values alike"
+		);
+		assert_eq!(
+			widened.plain, 0,
+			"a side that widened is no longer a plain build and must not be counted as one"
+		);
+	}
+
+	/// End to end: an eligible join records plain rows, an outer join records none,
+	/// and both gather the rows they always did.
+	#[test]
+	fn the_plain_row_counter_follows_the_join_kind() {
+		fn source(prefix: &str) -> RecordBatch {
+			let schema = StdArc::new(Schema::new(vec![Field::new(
+				format!("{prefix}_id"),
+				DataType::Int64,
+				true,
+			)]));
+			RecordBatch::try_new(
+				schema,
+				vec![StdArc::new(Int64Array::from_iter_values(0..8))],
+			)
+			.expect("fixture batch")
+		}
+
+		fn counters(kind: JoinKind, selection: &[JoinOutputRow]) -> (u64, u64, RecordBatch) {
+			let left = source("l");
+			let right = source("r");
+			let mut fields = left.schema().fields().to_vec();
+			fields.extend(right.schema().fields().iter().cloned());
+			let schema = StdArc::new(Schema::new(fields));
+			let slot: Option<Arc<Mutex<TaskTelemetry>>> =
+				Some(Arc::new(Mutex::new(TaskTelemetry::default())));
+			let batch = materialize_join_selection(
+				kind,
+				&left,
+				&right,
+				selection,
+				&schema,
+				u64::MAX,
+				SideTakeTiming::Charged(&slot),
+			)
+			.expect("materialize");
+			let guard = slot.as_ref().unwrap().lock().unwrap();
+			(
+				guard.counters.join_output_plain_index_rows,
+				guard.counters.join_output_index_rows_materialized,
+				batch.clone(),
+			)
+		}
+
+		// Scattered on both sides, so neither side defers and both build a vector.
+		let selection: Vec<JoinOutputRow> = (0..8u32)
+			.map(|row| JoinOutputRow::Paired {
+				left: (row * 3) % 8,
+				right: (row * 5) % 8,
+			})
+			.collect();
+
+		let (plain, materialized, inner_batch) = counters(JoinKind::Inner, &selection);
+		assert_eq!(
+			(plain, materialized),
+			(16, 16),
+			"an Inner gather builds both sides plain"
+		);
+
+		let (outer_plain, outer_materialized, outer_batch) =
+			counters(JoinKind::LeftOuter, &selection);
+		assert_eq!(
+			(outer_plain, outer_materialized),
+			(0, 16),
+			"a LeftOuter gather builds the same rows and none of them plain"
+		);
+
+		assert_eq!(
+			inner_batch, outer_batch,
+			"the two representations must gather identical rows from an identical \
+			 selection — the only difference is how the indices were stored"
 		);
 	}
 }
