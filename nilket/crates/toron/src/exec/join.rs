@@ -382,12 +382,234 @@ impl SideTakeTiming<'_> {
 		self.time(|phases| &mut phases.join_output_left_take_micros, body)
 	}
 
+	/// Record how many rows each side served from the zero-copy slice path.
+	///
+	/// Scoped to the charged sites like the timers: the spilled and streaming
+	/// paths use the same fast path but are accounted elsewhere, and counting
+	/// their rows here would credit this cut with coverage it did not produce.
+	fn record_slice_rows(self, left: u64, right: u64) {
+		let Self::Charged(telemetry) = self else {
+			return;
+		};
+		if left == 0 && right == 0 {
+			return;
+		}
+		record_task_telemetry(telemetry, |task| {
+			task.counters.join_output_left_slice_rows = task
+				.counters
+				.join_output_left_slice_rows
+				.saturating_add(left);
+			task.counters.join_output_right_slice_rows = task
+				.counters
+				.join_output_right_slice_rows
+				.saturating_add(right);
+		});
+	}
+
 	fn time_right<T>(
 		self,
 		body: impl FnOnce() -> Result<T, ExecutionError>,
 	) -> Result<T, ExecutionError> {
 		self.time(|phases| &mut phases.join_output_right_take_micros, body)
 	}
+}
+
+/// Tracks whether one side's indices form an EXACT contiguous ascending run over
+/// the whole selection — the only shape a zero-copy slice can serve in place of
+/// `take` while still returning a single `RecordBatch`.
+///
+/// A long run is not the same thing. A selection can carry a multi-million-row
+/// prefix run followed by a scatter tail; exploiting that prefix would need
+/// multiple output batches, and concatenating them back restores the copy the
+/// slice avoided. Only a selection contiguous end to end is a drop-in
+/// substitution — an upper bound of roughly a fifth of right-side gather time
+/// on the measured board, which the whole-source restriction below narrows
+/// further by an amount only a run can report.
+///
+/// Contiguity is necessary but not sufficient: [`Self::slice_offset`] also
+/// requires the run to cover the whole source batch, because a slice retains
+/// the source's whole buffers. See its comment for why.
+#[derive(Clone, Copy)]
+struct ContiguousRun {
+	start: Option<u32>,
+	next: u32,
+	intact: bool,
+}
+
+impl ContiguousRun {
+	fn new() -> Self {
+		Self {
+			start: None,
+			next: 0,
+			intact: true,
+		}
+	}
+
+	fn observe(&mut self, index: Option<u32>) {
+		if !self.intact {
+			return;
+		}
+		// A null cannot be sliced: the output row needs a null, and a slice of the
+		// source produces a value.
+		let Some(index) = index else {
+			self.intact = false;
+			return;
+		};
+		match self.start {
+			None => {
+				self.start = Some(index);
+				self.next = index.wrapping_add(1);
+			}
+			Some(_) if index == self.next => {
+				// `checked_add` for the same reason the locality probe uses it: at
+				// `u32::MAX` a saturating successor would let a repeat look contiguous.
+				match self.next.checked_add(1) {
+					Some(next) => self.next = next,
+					None => self.intact = false,
+				}
+			}
+			Some(_) => self.intact = false,
+		}
+	}
+
+	/// The slice offset, when this side is contiguous over exactly `rows` rows and
+	/// stays inside `source_rows`. `None` means `take` must run.
+	fn resolve(self, rows: usize, source_rows: usize) -> Option<usize> {
+		if !self.intact {
+			return None;
+		}
+		let start = self.start?;
+		// The run must span exactly the rows being gathered. Callers happen to
+		// observe once per selection row, but this function slices on the answer
+		// and a shorter or longer run would slice the wrong span with the right
+		// row count — a silent wrong answer, so it is checked here rather than
+		// assumed of the caller.
+		let observed = usize::try_from(self.next.checked_sub(start)?).ok()?;
+		if observed != rows {
+			return None;
+		}
+		let start = usize::try_from(start).ok()?;
+		// Bounds are checked, never assumed: a slice past the source panics, and
+		// these indices arrive from a probe loop this function does not own.
+		(start.checked_add(rows)? <= source_rows).then_some(start)
+	}
+
+	/// The offset this side may be sliced at, or `None` when `take` must run.
+	///
+	/// Narrower than [`Self::resolve`] on purpose: the run must also cover the
+	/// WHOLE source batch. `Array::slice` retains the source's entire backing
+	/// buffers, so a four-row slice of a million-row batch keeps the million
+	/// rows alive while the materialization budget charges it four. Whole-source
+	/// coverage makes the retention non-amplifying — the output holds exactly
+	/// what the input already held — which is what lets this cut land without
+	/// touching the budget.
+	///
+	/// A mid-batch contiguous run is therefore still gathered by `take`. Serving
+	/// it is a later cut, and it needs retained-memory accounting first, not
+	/// just this arithmetic.
+	fn slice_offset(self, rows: usize, source_rows: usize) -> Option<usize> {
+		let offset = self.resolve(rows, source_rows)?;
+		(offset == 0 && rows == source_rows).then_some(offset)
+	}
+}
+
+/// Gather one side's columns, preferring a zero-copy slice over `take`.
+///
+/// Returns the rows the fast path served, so a caller can record whether it
+/// actually fired rather than inferring it from a timing that moved.
+///
+/// When [`join_slice_equivalence_enabled`] is set, every column the fast path
+/// serves is also gathered by `take` and the two are compared. That check is
+/// opt-in for the same reason the locality probe is: it does the very work the
+/// slice exists to avoid, so leaving it on would erase the effect being
+/// measured. It is a correctness rail for a diagnostic run, not a guard.
+fn gather_side(
+	batch: &RecordBatch,
+	indices: &UInt32Array,
+	run: ContiguousRun,
+	rows: usize,
+	columns: &mut Vec<arrow::array::ArrayRef>,
+) -> Result<u64, ExecutionError> {
+	if let Some(offset) = run.slice_offset(rows, batch.num_rows()) {
+		let verify = join_slice_equivalence_enabled();
+		for (position, column) in batch.columns().iter().enumerate() {
+			let sliced = column.slice(offset, rows);
+			if verify {
+				verify_slice_matches_take(position, &sliced, column, indices)?;
+			}
+			columns.push(sliced);
+		}
+		return Ok(rows as u64);
+	}
+	for column in batch.columns() {
+		columns.push(arrow::compute::take(column, indices, None)?);
+	}
+	Ok(0)
+}
+
+/// Environment variable enabling the slice/`take` equivalence check.
+///
+/// Opt-in, like the locality probe and for the same reason: the check gathers
+/// every sliced column a second time with the `take` the slice replaced, so a
+/// run with it on measures nothing about the optimization. Enable it to prove
+/// the fast path is correct on real data; disable it to time the board.
+pub const JOIN_SLICE_EQUIVALENCE_ENV: &str = "TORON_JOIN_SLICE_EQUIVALENCE";
+
+/// Whether the slice/`take` equivalence check is enabled for this process.
+pub fn join_slice_equivalence_enabled() -> bool {
+	static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*ENABLED.get_or_init(|| std::env::var(JOIN_SLICE_EQUIVALENCE_ENV).is_ok())
+}
+
+/// Columns the equivalence check has compared and found equal in this process.
+static SLICE_EQUIVALENCE_COLUMNS: std::sync::atomic::AtomicU64 =
+	std::sync::atomic::AtomicU64::new(0);
+
+/// How many columns the equivalence check has verified.
+///
+/// The positive control for the check itself. Without it a run that reported no
+/// mismatch could not be told from a run where the fast path never fired, and
+/// those two carry opposite conclusions.
+pub fn join_slice_equivalence_columns_verified() -> u64 {
+	SLICE_EQUIVALENCE_COLUMNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Compare one sliced column against the `take` it replaced.
+///
+/// Fails the query rather than logging: this runs only under an explicit
+/// diagnostic opt-in, where a mismatch means the fast path is producing wrong
+/// rows and every later number in the run is worthless.
+fn verify_slice_matches_take(
+	position: usize,
+	sliced: &arrow::array::ArrayRef,
+	source: &arrow::array::ArrayRef,
+	indices: &UInt32Array,
+) -> Result<(), ExecutionError> {
+	let taken = arrow::compute::take(source, indices, None)?;
+	// `ArrayData`'s `PartialEq` is LOGICAL: it walks each array through its own
+	// offset, so a slice starting mid-buffer and a freshly built `take` result
+	// starting at zero compare equal when they carry the same rows. That is what
+	// makes this check possible at all — a buffer-identity comparison would
+	// reject every correct slice. It covers the data type, the length and the
+	// null bitmap as well as the values, which is the part a value-only check
+	// would miss.
+	if sliced.to_data() != taken.to_data() {
+		return Err(ExecutionError::Kernel {
+			message: format!(
+				"join output slice does not match take at column {position}: \
+				 sliced {sliced_rows} rows of {sliced_type:?} with {sliced_nulls} nulls, \
+				 take produced {taken_rows} rows of {taken_type:?} with {taken_nulls} nulls",
+				sliced_rows = sliced.len(),
+				sliced_type = sliced.data_type(),
+				sliced_nulls = sliced.null_count(),
+				taken_rows = taken.len(),
+				taken_type = taken.data_type(),
+				taken_nulls = taken.null_count(),
+			),
+		});
+	}
+	SLICE_EQUIVALENCE_COLUMNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	Ok(())
 }
 
 /// Environment variable enabling the join selection locality probe.
@@ -1532,27 +1754,35 @@ pub(super) fn materialize_join_selection(
 		| JoinKind::RightOuter
 		| JoinKind::FullOuter => {
 			let mut left_indices = Vec::with_capacity(selection.len());
+			let mut left_run = ContiguousRun::new();
 
 			let mut right_indices = Vec::with_capacity(selection.len());
+			let mut right_run = ContiguousRun::new();
 
 			for row in selection {
 				match *row {
 					JoinOutputRow::Paired { left, right } => {
 						left_indices.push(Some(left));
+						left_run.observe(Some(left));
 
 						right_indices.push(Some(right));
+						right_run.observe(Some(right));
 					}
 
 					JoinOutputRow::LeftFillNull { left } => {
 						left_indices.push(Some(left));
+						left_run.observe(Some(left));
 
 						right_indices.push(None);
+						right_run.observe(None);
 					}
 
 					JoinOutputRow::RightFillNull { right } => {
 						left_indices.push(None);
+						left_run.observe(None);
 
 						right_indices.push(Some(right));
+						right_run.observe(Some(right));
 					}
 
 					JoinOutputRow::LeftPreserved { .. } | JoinOutputRow::RightPreserved { .. } => {
@@ -1565,31 +1795,30 @@ pub(super) fn materialize_join_selection(
 
 			let right_indices = UInt32Array::from(right_indices);
 
-			let mut columns = side_timing.time_left(|| {
-				let mut columns =
-					Vec::with_capacity(left_batch.num_columns() + right_batch.num_columns());
-				for column in left_batch.columns() {
-					columns.push(arrow::compute::take(column, &left_indices, None)?);
-				}
-				Ok(columns)
+			let rows = selection.len();
+			let mut columns =
+				Vec::with_capacity(left_batch.num_columns() + right_batch.num_columns());
+			let left_sliced = side_timing.time_left(|| {
+				gather_side(left_batch, &left_indices, left_run, rows, &mut columns)
 			})?;
-
-			side_timing.time_right(|| {
-				for column in right_batch.columns() {
-					columns.push(arrow::compute::take(column, &right_indices, None)?);
-				}
-				Ok(())
+			let right_sliced = side_timing.time_right(|| {
+				gather_side(right_batch, &right_indices, right_run, rows, &mut columns)
 			})?;
+			side_timing.record_slice_rows(left_sliced, right_sliced);
 
 			columns
 		}
 
 		JoinKind::LeftSemi | JoinKind::LeftAnti => {
 			let mut left_indices = Vec::with_capacity(selection.len());
+			let mut left_run = ContiguousRun::new();
 
 			for row in selection {
 				match *row {
-					JoinOutputRow::LeftPreserved { left } => left_indices.push(Some(left)),
+					JoinOutputRow::LeftPreserved { left } => {
+						left_indices.push(Some(left));
+						left_run.observe(Some(left));
+					}
 
 					_ => return Err(invalid_join_selection(kind, row)),
 				}
@@ -1597,21 +1826,25 @@ pub(super) fn materialize_join_selection(
 
 			let left_indices = UInt32Array::from(left_indices);
 
-			side_timing.time_left(|| {
-				let mut columns = Vec::with_capacity(left_batch.num_columns());
-				for column in left_batch.columns() {
-					columns.push(arrow::compute::take(column, &left_indices, None)?);
-				}
-				Ok(columns)
-			})?
+			let rows = selection.len();
+			let mut columns = Vec::with_capacity(left_batch.num_columns());
+			let sliced = side_timing.time_left(|| {
+				gather_side(left_batch, &left_indices, left_run, rows, &mut columns)
+			})?;
+			side_timing.record_slice_rows(sliced, 0);
+			columns
 		}
 
 		JoinKind::RightSemi | JoinKind::RightAnti => {
 			let mut right_indices = Vec::with_capacity(selection.len());
+			let mut right_run = ContiguousRun::new();
 
 			for row in selection {
 				match *row {
-					JoinOutputRow::RightPreserved { right } => right_indices.push(Some(right)),
+					JoinOutputRow::RightPreserved { right } => {
+						right_indices.push(Some(right));
+						right_run.observe(Some(right));
+					}
 
 					_ => return Err(invalid_join_selection(kind, row)),
 				}
@@ -1619,13 +1852,13 @@ pub(super) fn materialize_join_selection(
 
 			let right_indices = UInt32Array::from(right_indices);
 
-			side_timing.time_right(|| {
-				let mut columns = Vec::with_capacity(right_batch.num_columns());
-				for column in right_batch.columns() {
-					columns.push(arrow::compute::take(column, &right_indices, None)?);
-				}
-				Ok(columns)
-			})?
+			let rows = selection.len();
+			let mut columns = Vec::with_capacity(right_batch.num_columns());
+			let sliced = side_timing.time_right(|| {
+				gather_side(right_batch, &right_indices, right_run, rows, &mut columns)
+			})?;
+			side_timing.record_slice_rows(0, sliced);
+			columns
 		}
 	};
 
@@ -3090,6 +3323,345 @@ mod join_selection_locality_tests {
 			"the locality probe must not run on the production join path: its \
 			 O(rows) pass sits outside the output bracket and would inflate the \
 			 framework overhead it exists to explain"
+		);
+	}
+}
+
+#[cfg(test)]
+mod slice_fast_path_tests {
+	use super::*;
+	use arrow::array::{Int64Array, StringArray};
+	use arrow::datatypes::{DataType, Field, Schema};
+	use std::sync::Arc as StdArc;
+
+	fn batch(prefix: &str, rows: i64) -> RecordBatch {
+		let schema = StdArc::new(Schema::new(vec![
+			Field::new(format!("{prefix}_id"), DataType::Int64, false),
+			Field::new(format!("{prefix}_name"), DataType::Utf8, false),
+		]));
+		RecordBatch::try_new(
+			schema,
+			vec![
+				StdArc::new(Int64Array::from_iter_values(0..rows)),
+				StdArc::new(StringArray::from_iter_values(
+					(0..rows).map(|row| format!("{prefix}-{row}")),
+				)),
+			],
+		)
+		.expect("fixture batch")
+	}
+
+	fn output_schema(left: &RecordBatch, right: &RecordBatch) -> arrow::datatypes::SchemaRef {
+		let mut fields = left.schema().fields().to_vec();
+		fields.extend(right.schema().fields().iter().cloned());
+		StdArc::new(Schema::new(fields))
+	}
+
+	fn materialize(selection: &[JoinOutputRow]) -> RecordBatch {
+		let left = batch("l", 8);
+		let right = batch("r", 8);
+		let schema = output_schema(&left, &right);
+		materialize_join_selection(
+			JoinKind::Inner,
+			&left,
+			&right,
+			selection,
+			&schema,
+			u64::MAX,
+			SideTakeTiming::AccountedElsewhere,
+		)
+		.expect("materialize")
+	}
+
+	/// Run one side through `gather_side`, reporting the rows the fast path served.
+	fn gather(source: &RecordBatch, indices: &[u32]) -> u64 {
+		let mut run = ContiguousRun::new();
+		for index in indices {
+			run.observe(Some(*index));
+		}
+		let array = UInt32Array::from(indices.to_vec());
+		let mut columns = Vec::new();
+		gather_side(source, &array, run, indices.len(), &mut columns).expect("gather")
+	}
+
+	/// The fast path must produce the SAME batch `take` would.
+	///
+	/// This is the test that matters: a slice with a wrong offset returns the
+	/// wrong rows silently, with the right row count and the right types. No
+	/// downstream check would catch it, and a query would simply return wrong
+	/// answers.
+	#[test]
+	fn a_sliced_side_matches_what_take_would_have_produced() {
+		// Right side ascends 0..8 over the whole eight-row source, so it slices.
+		// Left side is scattered, so it takes. One batch, mixed strategies.
+		let selection: Vec<JoinOutputRow> = [7u32, 1, 4, 0, 6, 2, 5, 3]
+			.iter()
+			.enumerate()
+			.map(|(right, left)| JoinOutputRow::Paired {
+				left: *left,
+				right: right as u32,
+			})
+			.collect();
+		let produced = materialize(&selection);
+
+		let left_ids = produced
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("left id column");
+		let right_ids = produced
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("right id column");
+		let right_names = produced
+			.column(3)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("right name column");
+
+		assert_eq!(
+			left_ids.values(),
+			&[7, 1, 4, 0, 6, 2, 5, 3],
+			"the taken side is unchanged"
+		);
+		assert_eq!(
+			right_ids.values(),
+			&[0, 1, 2, 3, 4, 5, 6, 7],
+			"the sliced side must carry the source's own values"
+		);
+		assert_eq!(right_names.value(0), "r-0");
+		assert_eq!(right_names.value(7), "r-7");
+		assert_eq!(produced.num_rows(), 8);
+	}
+
+	/// The positive control for the whole cut: whole-source coverage slices, and
+	/// nothing else does. Without this a passing value assertion cannot say
+	/// whether the fast path ran at all.
+	#[test]
+	fn only_whole_source_coverage_takes_the_fast_path() {
+		let source = batch("r", 8);
+		assert_eq!(
+			gather(&source, &[0, 1, 2, 3, 4, 5, 6, 7]),
+			8,
+			"an ascending run over the whole source slices"
+		);
+		assert_eq!(
+			gather(&source, &[2, 3, 4, 5]),
+			0,
+			"a contiguous run inside the source must not slice: the slice would \
+			 retain all eight rows while the budget charges four"
+		);
+		assert_eq!(
+			gather(&source, &[0, 1, 2, 3]),
+			0,
+			"a prefix run is a sub-slice too, however tidy its offset"
+		);
+		assert_eq!(gather(&source, &[7, 1, 4, 0]), 0, "a scatter takes");
+	}
+
+	/// A mid-batch run still has to produce the right rows — it just gets them
+	/// from `take`.
+	#[test]
+	fn a_mid_batch_run_falls_back_to_take_with_the_same_values() {
+		let selection: Vec<JoinOutputRow> = [(7u32, 2u32), (1, 3), (4, 4), (0, 5)]
+			.iter()
+			.map(|(left, right)| JoinOutputRow::Paired {
+				left: *left,
+				right: *right,
+			})
+			.collect();
+		let produced = materialize(&selection);
+
+		let right_ids = produced
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("right id column");
+		assert_eq!(right_ids.values(), &[2, 3, 4, 5]);
+		assert_eq!(produced.num_rows(), 4);
+	}
+
+	/// A run that does not cover the whole selection must NOT slice.
+	///
+	/// This is the distinction the measurement turned on: a selection can carry a
+	/// multi-million-row prefix run plus a scatter tail, and slicing that prefix
+	/// would need multiple output batches. Only an end-to-end contiguous
+	/// selection is a drop-in substitution.
+	#[test]
+	fn a_prefix_run_with_a_tail_does_not_slice() {
+		let mut run = ContiguousRun::new();
+		for index in 0..6u32 {
+			run.observe(Some(index));
+		}
+		run.observe(Some(99));
+		assert_eq!(
+			run.resolve(7, 128),
+			None,
+			"a 6-row prefix inside a 7-row selection is not a whole-selection run"
+		);
+	}
+
+	/// A null cannot be sliced: the output needs a null and a slice yields a value.
+	#[test]
+	fn a_null_breaks_the_fast_path() {
+		let mut run = ContiguousRun::new();
+		run.observe(Some(0));
+		run.observe(None);
+		run.observe(Some(1));
+		assert_eq!(run.resolve(3, 128), None);
+	}
+
+	/// The slice must stay inside the source. Indices arrive from a probe loop
+	/// this function does not own, and `Array::slice` panics out of bounds.
+	#[test]
+	fn a_run_past_the_source_end_does_not_slice() {
+		let mut run = ContiguousRun::new();
+		for index in 126..130u32 {
+			run.observe(Some(index));
+		}
+		assert_eq!(
+			run.resolve(4, 128),
+			None,
+			"126..130 does not fit in a 128-row source"
+		);
+		assert_eq!(
+			run.resolve(2, 128),
+			None,
+			"the run length must match the rows"
+		);
+	}
+
+	/// A whole-selection ascending run resolves to its start offset — and is
+	/// still refused by `slice_offset` unless it covers the whole source.
+	#[test]
+	fn a_whole_selection_run_resolves_to_its_offset() {
+		let mut run = ContiguousRun::new();
+		for index in 5..9u32 {
+			run.observe(Some(index));
+		}
+		assert_eq!(run.resolve(4, 128), Some(5));
+		assert_eq!(
+			run.slice_offset(4, 128),
+			None,
+			"the run arithmetic is sound but the retention restriction bites"
+		);
+		assert_eq!(run.slice_offset(4, 9), None, "offset 5 is not offset 0");
+
+		let mut whole = ContiguousRun::new();
+		for index in 0..4u32 {
+			whole.observe(Some(index));
+		}
+		assert_eq!(whole.slice_offset(4, 4), Some(0));
+	}
+
+	/// Repeated `u32::MAX` must not look contiguous, for the same reason the
+	/// locality probe uses `checked_add`.
+	#[test]
+	fn a_repeated_maximum_index_does_not_slice() {
+		let mut run = ContiguousRun::new();
+		run.observe(Some(u32::MAX));
+		run.observe(Some(u32::MAX));
+		assert_eq!(run.resolve(2, usize::MAX), None);
+	}
+
+	/// The assumption the whole equivalence check rests on: `ArrayData` equality
+	/// is LOGICAL, so a mid-source slice equals a `take` result built from zero
+	/// when the two carry the same rows.
+	///
+	/// If arrow ever compared buffer identity instead, the check would reject
+	/// every correct slice and a diagnostic run would fail with a false alarm.
+	/// This pins that, so the failure would land here and not in an atlas.
+	#[test]
+	fn equivalence_is_logical_not_buffer_identity() {
+		let source = batch("r", 8);
+		let indices = UInt32Array::from(vec![2u32, 3, 4, 5]);
+		for position in 0..source.num_columns() {
+			let column = source.column(position);
+			verify_slice_matches_take(position, &column.slice(2, 4), column, &indices)
+				.expect("a mid-source slice carrying the same rows must verify");
+		}
+	}
+
+	/// Why the fast path is restricted to whole-source coverage: a slice keeps the
+	/// source's ALLOCATION alive, while `take` allocates for the rows it produced.
+	///
+	/// This is the fact no value-equality check can see. A four-row slice of a
+	/// large batch would be charged four rows by the materialization estimate and
+	/// retain the whole thing, so `slice_offset` refuses it. If arrow ever made
+	/// `slice` copy, this test would fail and the restriction could be revisited.
+	#[test]
+	fn a_slice_retains_the_whole_source_allocation() {
+		let source = batch("r", 1_024);
+		let column = source.column(0);
+		let indices = UInt32Array::from(vec![2u32, 3, 4, 5]);
+
+		let sliced = column.slice(2, 4);
+		let taken = arrow::compute::take(column, &indices, None).expect("take");
+
+		let source_capacity = column.to_data().buffers()[0].capacity();
+		let sliced_capacity = sliced.to_data().buffers()[0].capacity();
+		let taken_capacity = taken.to_data().buffers()[0].capacity();
+
+		assert_eq!(
+			sliced_capacity, source_capacity,
+			"a slice retains the source's whole allocation"
+		);
+		assert!(
+			taken_capacity < sliced_capacity,
+			"take allocates for the rows it produced ({taken_capacity} bytes), \
+			 the slice retains {sliced_capacity}"
+		);
+	}
+
+	/// The discriminating half: the check must REJECT a wrong slice. Without
+	/// this, a clean diagnostic run would only prove the check never fires.
+	#[test]
+	fn a_slice_at_the_wrong_offset_is_rejected() {
+		let source = batch("r", 8);
+		let indices = UInt32Array::from(vec![2u32, 3, 4, 5]);
+		let column = source.column(1);
+		// Off by one: the right row count, the right type, the wrong rows —
+		// exactly the failure no downstream check would catch.
+		let wrong = column.slice(1, 4);
+		let error = verify_slice_matches_take(1, &wrong, column, &indices)
+			.expect_err("a slice one row off must not verify");
+		assert!(
+			format!("{error:?}").contains("does not match take"),
+			"the error must name what failed: {error:?}"
+		);
+	}
+
+	/// Nulls are part of the comparison, not just values.
+	#[test]
+	fn a_null_bitmap_difference_is_rejected() {
+		let schema = StdArc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+		let column: arrow::array::ArrayRef =
+			StdArc::new(Int64Array::from(vec![Some(0), None, Some(2), Some(3)]));
+		let source = RecordBatch::try_new(schema, vec![StdArc::clone(&column)]).expect("fixture");
+		let column = source.column(0);
+
+		let indices = UInt32Array::from(vec![0u32, 1, 2, 3]);
+		verify_slice_matches_take(0, &column.slice(0, 4), column, &indices)
+			.expect("a whole-source slice keeps the null in place");
+
+		// Same values in the overlapping rows, different null placement.
+		let shifted = UInt32Array::from(vec![2u32, 3, 0, 1]);
+		verify_slice_matches_take(0, &column.slice(0, 4), column, &shifted)
+			.expect_err("a moved null must not verify");
+	}
+
+	/// The tally is the positive control, so it has to count.
+	#[test]
+	fn verified_columns_are_counted() {
+		let source = batch("r", 4);
+		let indices = UInt32Array::from(vec![0u32, 1, 2, 3]);
+		let before = join_slice_equivalence_columns_verified();
+		verify_slice_matches_take(0, &source.column(0).slice(0, 4), source.column(0), &indices)
+			.expect("verify");
+		assert!(
+			join_slice_equivalence_columns_verified() > before,
+			"a verified column must advance the tally"
 		);
 	}
 }
