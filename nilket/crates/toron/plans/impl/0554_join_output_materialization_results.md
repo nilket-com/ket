@@ -270,16 +270,86 @@ term comparisons are therefore refused here and the decomposition above is
 within-run. That spread is also the second reminder that the slice board's
 elapsed drop was drift, not a win - see "What is not claimed".
 
-## 7. Forward
+## 7. Deferring the index build - `e45f5e75`
 
-- **Index construction, 1,358.0 ms**, is now measured and almost entirely eligible (§6). The
-  first cut against it is not the plain-index substitution but **not building the vector at
-  all for a side that ends up sliced**: a whole-source run's indices are `0..rows`, and today
-  they are materialized and then discarded. How much of the 1,358.0 ms that is, no existing
-  counter can say (§6) — the cut carries its own avoided/materialized row counters and claims
-  only the reduction they explain. The substitution applies to whatever vector still gets
-  built, and is a separate cut; neither may claim the row match or the run observation, which
-  no substitution reaches.
+§6 established the mechanism - a sliced side's index array is built and never read -
+and could not size it. `LazyIndexBuilder` removes the allocation and, in doing so,
+measures it: it holds nothing while a whole-source run is still reachable and
+materializes the moment one is not, backfilling the deferred prefix from the run's own
+state rather than rescanning the selection. Whether a slice is legal stays with
+`ContiguousRun::slice_offset`, retention restriction included; the builder decides only
+whether an allocation is still avoidable.
+
+The equivalence diagnostic and the deferral are mutually exclusive by construction: that
+check compares each sliced column against the `take` it replaced, so it needs the array
+the deferral declines to build. `index_deferral_available()` is exactly
+`!join_slice_equivalence_enabled()`.
+
+Artifact `adr554_index_deferral_sf8.jsonl`, build `e45f5e75480f`, binary mtime
+1788028349, authority granted, 21/21, no replay violations. Comparability against the
+`65ffd733` baseline: mean 1.022, range 0.925-1.212.
+
+### The controls, before the result
+
+| control | requirement | measured |
+|---|---|---|
+| avoided rows only where a side sliced | no node with avoided rows and no slice rows | 0 such nodes |
+| avoided rows match the slice | equality is not required, only containment | **exact on all 189 nodes**; board 169,827,032 = 1,248,135 left + 168,578,897 right |
+| slice coverage unchanged | same nodes, same rows as the baseline | 0 nodes changed |
+| rows walked reconcile | avoided + materialized covers every index row | 169,827,032 + 253,153,029 = 422,980,061, one counter charged per side |
+
+The second row is the strongest of these: `join_output_index_rows_avoided` is written by
+the builder and the slice-row counters by the gather, in different functions for
+different reasons, and they agree row for row on every node.
+
+### The result
+
+Eligible index build **1,358.0 ms -> 1,124.9 ms, a reduction of 233.1 ms (-17.2%)**,
+concentrated where the cut can act. Per-node, pair 0:
+
+| node group | nodes | before | after | delta |
+|---|---:|---:|---:|---:|
+| slice-bearing | 21 | 1,275.1 | 1,016.0 | **-259.1** |
+| zero-slice (drift control) | 168 | 110.8 | 125.3 | +14.5 |
+
+The control did not fall. It rose, on a board running 2.2% slower on average, which is
+the expected shape: the deferral cannot act where nothing slices, so a reduction there
+would have meant the reduction was not the deferral.
+
+Per cell: q09 -94.0, q08 -92.7, q21 -76.0, q07 -10.3. q02 (+7.7), q05 (+12.9) and q11
+(+4.3) moved up, each inside its own drift ratio - q02's cell ran 13.1% slower in this
+run. No claim is made on those.
+
+### What this finally sizes, and what it does not
+
+**The discarded share, measured per invocation:** 169.8 M of the 423.0 M index rows the
+charged sites walk were being materialized and thrown away - 40.2% of the rows, worth
+233.1 ms, or 17.2% of the eligible child. §6's node aggregate would have read as 92%.
+The direct counter is a fifth of that, which is the whole reason §4's rule exists.
+
+Board-wide that is **~1.37 ns per avoided row**, and ~2 ns/row on q08, q09 and q21 where
+the effect is concentrated. That price is the `Vec` push, the `UInt32Array`, and its null
+buffer - everything else the walk does survives, because an avoided row is still walked,
+matched and observed for contiguity.
+
+Which bounds the next cut rather than promising it: the plain `Vec<u32>` substitution
+applies to the 253.2 M rows still materialized, and it keeps the vector - only narrowing
+it from 8 bytes to 4 and dropping the null buffer. Its per-row ceiling is therefore
+**below** the 1.37 ns/row the deferral removed by not building anything at all.
+
+## 8. Forward
+
+- **Index construction is 1,124.9 ms** after the deferral took 233.1 ms of it (§7). What
+  remains is 253.2 M rows that genuinely need a vector, plus the walk, the row match and the
+  contiguity observation, which no substitution reaches. The plain `Vec<u32>` substitution is
+  the next candidate against it and its per-row ceiling is below the deferral's 1.37 ns/row,
+  since it narrows a vector rather than skipping one — worth pricing in a bench before it is
+  built, not after.
+- **Carve before adding.** The join root took ~800 lines across the last two cuts and its
+  ADR 352 bound was raised twice. The gather machinery — run tracking, lazy build, slice,
+  equivalence — is a coherent body with its own tests and belongs in a submodule beside
+  `spill` and `streaming`. That carve comes before the next addition to the join root, not
+  after it.
 - **The left side, 2,189.0 ms**, is intrinsically scattered and cannot be sliced. Before it is
   scoped, §1's unresolved question - why the contiguous side cost more than the scattered one
   - should be settled, because the answer decides whether the lever is locality at all.
