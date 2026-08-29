@@ -394,3 +394,10 @@ ADR 551's `remainder_ms` question is now two questions with a measurement behind
 the split. That is the whole content of this record: the scalar was hiding a
 disjunction, and the receipt found it before an instrument was built for the
 wrong one.
+
+## Successor evidence
+
+Branch A's named remainder subterms opened a perf line this record does not measure: the
+join input and output materialization brackets and what they bought. That line's evidence is
+`plans/impl/0554_join_output_materialization_results.md`. Nothing there revises the
+attribution recorded above.
