@@ -479,6 +479,18 @@ pub struct TaskTelemetryCounters {
 	pub emitted_rows: u64,
 	pub emitted_batches: u64,
 	pub spill_bytes: u64,
+	/// ADR 554 follow-on: output rows served by the zero-copy slice fast path
+	/// instead of `take`, per side.
+	///
+	/// The positive control for that path. A drop in
+	/// `join_output_right_take_micros` with zero rows here would mean something
+	/// else moved, not that the fast path fired — and the path only applies when
+	/// a side's indices are an EXACT contiguous run over the whole selection, so
+	/// its coverage is a fact to measure, never one to assume.
+	#[serde(default)]
+	pub join_output_left_slice_rows: u64,
+	#[serde(default)]
+	pub join_output_right_slice_rows: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

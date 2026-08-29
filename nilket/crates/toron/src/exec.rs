@@ -115,11 +115,18 @@ mod expr;
 mod input_processing;
 mod join;
 
-/// ADR 554 follow-on: the join selection locality probe's gate and env name, re-exported
-/// so the TPC-H harness can stamp the probe's state into an artifact header. Without
-/// that stamp, all-zero locality counters cannot be told apart from a probe that
-/// never ran.
-pub use join::{JOIN_SELECTION_LOCALITY_ENV, join_selection_locality_enabled};
+/// ADR 554 follow-on: the two opt-in join diagnostics — the selection locality probe
+/// and the slice/`take` equivalence check — re-exported with their env names and the
+/// equivalence check's verified-column tally. The TPC-H harness stamps the locality
+/// probe's state into its artifact header, the equivalence check's flag and tally into
+/// its seal (the tally only means anything once every cell has run), and reads both
+/// gates to withhold timing authority from a diagnostic run. Without those stamps,
+/// all-zero locality counters cannot be told apart from a probe that never ran, and
+/// "no mismatch" cannot be told apart from "never compared".
+pub use join::{
+	JOIN_SELECTION_LOCALITY_ENV, JOIN_SLICE_EQUIVALENCE_ENV, join_selection_locality_enabled,
+	join_slice_equivalence_columns_verified, join_slice_equivalence_enabled,
+};
 mod node_attribution;
 mod phase_receipt;
 mod scan_open;

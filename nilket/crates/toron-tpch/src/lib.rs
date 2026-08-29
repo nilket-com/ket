@@ -5043,6 +5043,12 @@ pub struct TimingAuthorityConditions {
 	pub quiescent_host: bool,
 	pub protocol_unmodified: bool,
 	pub complete_cohort: bool,
+	/// False when either opt-in join diagnostic is on. Both do work the ordinary
+	/// path does not — the locality probe walks every selection, the equivalence
+	/// check gathers every sliced column twice — so their runs measure something
+	/// other than the engine. The artifact refuses timing authority itself rather
+	/// than relying on a reader to notice a flag and know what it implies.
+	pub diagnostics_disabled: bool,
 }
 
 impl TimingAuthorityConditions {
@@ -5052,6 +5058,7 @@ impl TimingAuthorityConditions {
 			&& self.quiescent_host
 			&& self.protocol_unmodified
 			&& self.complete_cohort
+			&& self.diagnostics_disabled
 	}
 
 	pub fn withheld_reasons(&self) -> Vec<&'static str> {
@@ -5071,8 +5078,22 @@ impl TimingAuthorityConditions {
 		if !self.complete_cohort {
 			reasons.push("cohort_incomplete");
 		}
+		if !self.diagnostics_disabled {
+			reasons.push("join_diagnostics_enabled");
+		}
 		reasons
 	}
+}
+
+/// Whether both opt-in join diagnostics are off, so a run's timings mean what they
+/// say.
+///
+/// Shared by every timing artifact rather than read at one call site: a diagnostic
+/// that invalidates the atlas invalidates the placement A/B for the same reason, and
+/// a future diagnostic should have exactly one place to join.
+pub fn join_diagnostics_disabled() -> bool {
+	!toron::exec::join_slice_equivalence_enabled()
+		&& !toron::exec::join_selection_locality_enabled()
 }
 
 /// One timed child: exactly one query execution on one arm. `query_elapsed_ms` covers the
@@ -6708,6 +6729,14 @@ fn timing_atlas_replay_attribution_path(
 				.get("join_output_materialization_ms")
 				.and_then(|value| value.as_f64())
 				.unwrap_or(0.0),
+			join_output_left_slice_rows: node
+				.get("join_output_left_slice_rows")
+				.and_then(|value| value.as_u64())
+				.unwrap_or(0),
+			join_output_right_slice_rows: node
+				.get("join_output_right_slice_rows")
+				.and_then(|value| value.as_u64())
+				.unwrap_or(0),
 			join_output_left_take_ms: node
 				.get("join_output_left_take_ms")
 				.and_then(|value| value.as_f64())
@@ -7492,6 +7521,7 @@ pub async fn run_timing_atlas(
 		quiescent_host: timing_atlas_quiescent_throughout(&host_start, &host_end),
 		protocol_unmodified: true,
 		complete_cohort: finalized == timing_atlas_cells().len(),
+		diagnostics_disabled: join_diagnostics_disabled(),
 	};
 
 	// Replay what was written rather than trusting what was remembered.
@@ -7509,6 +7539,14 @@ pub async fn run_timing_atlas(
 		"replay_violations": replay.violations,
 		"finalized_cells": replay.finalized_cells.len(),
 		"distinguished_slower_cells": replay.distinguished_slower.len(),
+		// ADR 554 follow-on positive control, in the seal rather than the header
+		// because the tally is only meaningful once every cell has run. The flag
+		// and the count have to travel together: zero verified columns means the
+		// check was off when the flag is false, and means the slice fast path
+		// never fired when it is true — opposite conclusions from one number.
+		// A run with the check on must NOT be used for timing comparisons.
+		"join_slice_equivalence_check": toron::exec::join_slice_equivalence_enabled(),
+		"join_slice_equivalence_columns_verified": toron::exec::join_slice_equivalence_columns_verified(),
 	}))?;
 
 	if !authoritative {
@@ -7672,6 +7710,7 @@ pub async fn run_placement_ab(
 		quiescent_host: timing_atlas_quiescent_throughout(&host_start, &host_end),
 		protocol_unmodified: true,
 		complete_cohort: finalized == timing_atlas_cells().len(),
+		diagnostics_disabled: join_diagnostics_disabled(),
 	};
 	let journal = std::fs::read_to_string(artifact.partial_path())
 		.map_err(|error| format!("placement A/B reread: {error}"))?;
@@ -7975,6 +8014,11 @@ pub struct TimingAtlasTaskNode {
 	pub join_output_left_take_ms: f64,
 	/// The RIGHT side's complete `take` loop, nested the same way.
 	pub join_output_right_take_ms: f64,
+	/// ADR 554 follow-on: output rows served by the zero-copy slice fast path
+	/// rather than `take`, per side. The positive control for that path — a
+	/// take time that fell with zero rows here means something else moved.
+	pub join_output_left_slice_rows: u64,
+	pub join_output_right_slice_rows: u64,
 	/// ADR 554 follow-on: run-length structure of this node's join output
 	/// selections, per side, aggregated over the task.
 	///
@@ -9024,6 +9068,8 @@ fn placement_attempt_from_row(row: &serde_json::Value) -> Result<PlacementAttemp
 			input_processing_ms: 0.0,
 			join_input_materialization_ms: 0.0,
 			join_output_materialization_ms: 0.0,
+			join_output_left_slice_rows: 0,
+			join_output_right_slice_rows: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
 			join_selection_locality: None,
@@ -9465,6 +9511,11 @@ pub fn timing_atlas_nodes_from_report(
 					.phases
 					.join_output_materialization_micros as f64
 					/ 1000.0,
+				join_output_left_slice_rows: record.telemetry.counters.join_output_left_slice_rows,
+				join_output_right_slice_rows: record
+					.telemetry
+					.counters
+					.join_output_right_slice_rows,
 				join_output_left_take_ms: record.telemetry.phases.join_output_left_take_micros
 					as f64 / 1000.0,
 				join_output_right_take_ms: record.telemetry.phases.join_output_right_take_micros
@@ -9517,6 +9568,8 @@ pub fn timing_atlas_local_task_node(
 		join_output_materialization_ms: phases.join_output_materialization_micros as f64 / 1000.0,
 		// The local arm records no per-task join selection receipt: this synthetic
 		// node stands for a whole local execution, not one task.
+		join_output_left_slice_rows: 0,
+		join_output_right_slice_rows: 0,
 		join_output_left_take_ms: 0.0,
 		join_output_right_take_ms: 0.0,
 		join_selection_locality: None,
@@ -9603,6 +9656,8 @@ pub fn timing_atlas_attribution_path_row(
 				"input_processing_ms": node.input_processing_ms,
 				"join_input_materialization_ms": node.join_input_materialization_ms,
 				"join_output_materialization_ms": node.join_output_materialization_ms,
+				"join_output_left_slice_rows": node.join_output_left_slice_rows,
+				"join_output_right_slice_rows": node.join_output_right_slice_rows,
 				"join_output_left_take_ms": node.join_output_left_take_ms,
 				"join_output_right_take_ms": node.join_output_right_take_ms,
 				"join_selection_locality": node.join_selection_locality,
@@ -23868,6 +23923,7 @@ mod adr538_timing_atlas_protocol {
 			quiescent_host: true,
 			protocol_unmodified: true,
 			complete_cohort: true,
+			diagnostics_disabled: true,
 		};
 		assert!(all.granted());
 		assert!(all.withheld_reasons().is_empty());
@@ -23878,6 +23934,18 @@ mod adr538_timing_atlas_protocol {
 		};
 		assert!(!noisy_host.granted());
 		assert_eq!(noisy_host.withheld_reasons(), vec!["host_not_quiescent"]);
+
+		// A diagnostic run withholds authority on its own, without a reader having
+		// to notice an env flag and know what it implies about the timings.
+		let diagnostic = TimingAuthorityConditions {
+			diagnostics_disabled: false,
+			..all.clone()
+		};
+		assert!(!diagnostic.granted());
+		assert_eq!(
+			diagnostic.withheld_reasons(),
+			vec!["join_diagnostics_enabled"]
+		);
 	}
 }
 
@@ -24078,6 +24146,7 @@ mod adr538_timing_atlas_execution {
 			quiescent_host: true,
 			protocol_unmodified: true,
 			complete_cohort: true,
+			diagnostics_disabled: true,
 		};
 		let cells = timing_atlas_cells().len();
 		assert!(timing_atlas_artifact_is_authoritative(
@@ -25207,6 +25276,7 @@ mod adr538_timing_atlas_journal_replay {
 			quiescent_host: true,
 			protocol_unmodified: true,
 			complete_cohort: true,
+			diagnostics_disabled: true,
 		}));
 
 		let broken = journal.replacen(
@@ -25831,6 +25901,8 @@ mod adr538_timing_atlas_journal_replay {
 			input_processing_ms: 0.0,
 			join_input_materialization_ms: 0.0,
 			join_output_materialization_ms: 0.0,
+			join_output_left_slice_rows: 0,
+			join_output_right_slice_rows: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
 			join_selection_locality: None,
@@ -25943,6 +26015,8 @@ mod adr538_timing_atlas_journal_replay {
 			input_processing_ms: 0.0,
 			join_input_materialization_ms: 0.0,
 			join_output_materialization_ms: 0.0,
+			join_output_left_slice_rows: 0,
+			join_output_right_slice_rows: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
 			join_selection_locality: None,
@@ -25983,6 +26057,8 @@ mod adr538_timing_atlas_journal_replay {
 				input_processing_ms: 0.0,
 				join_input_materialization_ms: 0.0,
 				join_output_materialization_ms: 0.0,
+				join_output_left_slice_rows: 0,
+				join_output_right_slice_rows: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
 				join_selection_locality: None,
@@ -26016,6 +26092,8 @@ mod adr538_timing_atlas_journal_replay {
 				input_processing_ms: 0.0,
 				join_input_materialization_ms: 0.0,
 				join_output_materialization_ms: 0.0,
+				join_output_left_slice_rows: 0,
+				join_output_right_slice_rows: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
 				join_selection_locality: None,
@@ -26169,6 +26247,7 @@ mod adr538_timing_atlas_journal_replay {
 			quiescent_host: true,
 			protocol_unmodified: true,
 			complete_cohort: true,
+			diagnostics_disabled: true,
 		}
 	}
 
@@ -26495,6 +26574,7 @@ mod adr538_timing_atlas_driver {
 					quiescent_host: false,
 					protocol_unmodified: true,
 					complete_cohort: false,
+					diagnostics_disabled: true,
 				}),
 				"and cannot support authority"
 			);
@@ -27005,6 +27085,8 @@ mod adr538_timing_atlas_critical_path {
 			input_processing_ms: 0.0,
 			join_input_materialization_ms: 0.0,
 			join_output_materialization_ms: 0.0,
+			join_output_left_slice_rows: 0,
+			join_output_right_slice_rows: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
 			join_selection_locality: None,
@@ -27239,6 +27321,8 @@ mod adr538_path_bound_validation {
 				input_processing_ms: 0.0,
 				join_input_materialization_ms: 0.0,
 				join_output_materialization_ms: 0.0,
+				join_output_left_slice_rows: 0,
+				join_output_right_slice_rows: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
 				join_selection_locality: None,
@@ -27266,6 +27350,8 @@ mod adr538_path_bound_validation {
 				input_processing_ms: 0.0,
 				join_input_materialization_ms: 0.0,
 				join_output_materialization_ms: 0.0,
+				join_output_left_slice_rows: 0,
+				join_output_right_slice_rows: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
 				join_selection_locality: None,
@@ -27294,6 +27380,8 @@ mod adr538_path_bound_validation {
 				input_processing_ms: 0.0,
 				join_input_materialization_ms: 0.0,
 				join_output_materialization_ms: 0.0,
+				join_output_left_slice_rows: 0,
+				join_output_right_slice_rows: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
 				join_selection_locality: None,
@@ -28253,6 +28341,7 @@ mod adr538_node_partition_veto {
 			quiescent_host: true,
 			protocol_unmodified: true,
 			complete_cohort: true,
+			diagnostics_disabled: true,
 		}));
 	}
 }
