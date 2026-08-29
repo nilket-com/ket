@@ -491,6 +491,22 @@ pub struct TaskTelemetryCounters {
 	pub join_output_left_slice_rows: u64,
 	#[serde(default)]
 	pub join_output_right_slice_rows: u64,
+	/// ADR 554 follow-on: index rows a gather did NOT materialize, because the
+	/// side's selection walked the whole source in order and the slice path reads
+	/// it directly.
+	///
+	/// The positive control for the deferral. A fall in
+	/// `join_output_nonnull_index_build_micros` with zero rows here means
+	/// something else moved — and the two counters are recorded together so the
+	/// avoided share is a measurement rather than an inference from which nodes
+	/// happened to slice.
+	#[serde(default)]
+	pub join_output_index_rows_avoided: u64,
+	/// Index rows a gather did materialize. Its partner above: exactly one of the
+	/// two is charged per side, so their sum is every index row the charged sites
+	/// walked, and the ratio is the deferral's coverage.
+	#[serde(default)]
+	pub join_output_index_rows_materialized: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

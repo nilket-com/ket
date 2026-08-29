@@ -413,6 +413,33 @@ impl SideTakeTiming<'_> {
 		self.time(|phases| &mut phases.join_output_right_take_micros, body)
 	}
 
+	/// Record the index rows the deferral avoided materializing, and those it
+	/// materialized.
+	///
+	/// The positive control for the deferral: an index-build time that fell with
+	/// nothing avoided means something else moved. Scoped to the charged sites
+	/// like every other counter here — the spilled and streaming paths run the
+	/// same builder, and counting their rows would credit this cut with coverage
+	/// it did not produce.
+	fn record_index_rows(self, avoided: u64, materialized: u64) {
+		let Self::Charged(telemetry) = self else {
+			return;
+		};
+		if avoided == 0 && materialized == 0 {
+			return;
+		}
+		record_task_telemetry(telemetry, |task| {
+			task.counters.join_output_index_rows_avoided = task
+				.counters
+				.join_output_index_rows_avoided
+				.saturating_add(avoided);
+			task.counters.join_output_index_rows_materialized = task
+				.counters
+				.join_output_index_rows_materialized
+				.saturating_add(materialized);
+		});
+	}
+
 	/// Time one arm's index-vector construction — the row loop plus the
 	/// `UInt32Array` it produces.
 	///
@@ -557,6 +584,132 @@ impl ContiguousRun {
 	}
 }
 
+/// What a side's gather consumes.
+///
+/// `slice_offset` carries the fast path's decision, made once by
+/// [`ContiguousRun`] rather than re-derived by the gather. `array` is absent
+/// exactly when the deferral held to the end — the indices would have been
+/// `0..rows` and nothing needed them.
+struct SideIndices {
+	array: Option<UInt32Array>,
+	slice_offset: Option<usize>,
+}
+
+/// Builds a side's index vector, deferring the allocation while the selection is
+/// still walking the whole source in order.
+///
+/// The slice fast path reads a side's rows straight out of the source when its
+/// selection is an exact whole-source run. Until now the index vector was built
+/// anyway and then dropped unread. This builder defers that allocation: it holds
+/// nothing while the run could still turn out whole-source, and materializes —
+/// backfilling the rows it has already accepted — the moment that becomes
+/// impossible.
+///
+/// **One pass, never two.** The fallback backfills from the run it has already
+/// observed rather than rescanning the selection: a second pass would trade an
+/// allocation for a re-walk and could cost more than it saves on exactly the
+/// scattered selections that are already the expensive case.
+///
+/// The deferral is only available when the selection could cover the source
+/// exactly — `rows == source_rows` — because that is what
+/// [`ContiguousRun::slice_offset`] requires. Any other shape builds eagerly, so
+/// the lazy path adds no branch to selections it can never serve.
+struct LazyIndexBuilder {
+	run: ContiguousRun,
+	/// `None` while the allocation is still deferred.
+	indices: Option<Vec<Option<u32>>>,
+	/// Rows accepted so far. While deferred these are exactly `0..accepted`.
+	accepted: usize,
+	rows: usize,
+	source_rows: usize,
+}
+
+impl LazyIndexBuilder {
+	fn new(rows: usize, source_rows: usize, deferrable: bool) -> Self {
+		let deferred = deferrable && rows == source_rows && rows > 0;
+		Self {
+			run: ContiguousRun::new(),
+			indices: (!deferred).then(|| Vec::with_capacity(rows)),
+			accepted: 0,
+			rows,
+			source_rows,
+		}
+	}
+
+	fn push(&mut self, index: Option<u32>) {
+		self.run.observe(index);
+		if let Some(indices) = self.indices.as_mut() {
+			indices.push(index);
+			self.accepted += 1;
+			return;
+		}
+		// Still deferred only while a whole-source run remains reachable: the run
+		// has to be intact AND anchored at zero, since `slice_offset` accepts no
+		// other offset. The check is on the run's own state rather than on this
+		// row, so a null — which breaks the run without being a wrong index —
+		// materializes here too.
+		if self.run.intact && self.run.start == Some(0) {
+			self.accepted += 1;
+			return;
+		}
+		self.materialize();
+		let indices = self.indices.as_mut().expect("materialized above");
+		indices.push(index);
+		self.accepted += 1;
+	}
+
+	/// Allocate and backfill the rows accepted while deferred.
+	///
+	/// Those rows were accepted only while the run was intact from zero, so their
+	/// indices were exactly `0..accepted` — the backfill reconstructs them
+	/// without consulting the selection again. A wrong bound here would gather
+	/// the wrong rows with the right count, which is why
+	/// `a_broken_run_backfills_exactly_what_the_eager_builder_would` compares the
+	/// result against eager construction rather than against a row count.
+	fn materialize(&mut self) {
+		let mut indices = Vec::with_capacity(self.rows);
+		indices.extend((0..self.accepted).map(|row| Some(row as u32)));
+		self.indices = Some(indices);
+	}
+
+	/// Finish the side, reporting the indices, the rows the deferral avoided
+	/// materializing, and the rows it did materialize.
+	///
+	/// The two counts are the positive control: they are recorded per gather, so
+	/// an index-build time that falls with nothing avoided means something else
+	/// moved. Exactly one of them is non-zero — a side is deferred or it is not,
+	/// and this cut never materializes part of one.
+	fn finish(mut self) -> (SideIndices, u64, u64) {
+		// One decision, made by the run's own arithmetic. The loop's bookkeeping
+		// says only whether an allocation is still avoidable; whether a slice is
+		// legal stays with `slice_offset`, including the whole-source restriction
+		// that keeps the retention non-amplifying.
+		let slice_offset = self.run.slice_offset(self.rows, self.source_rows);
+		if self.indices.is_none() {
+			if slice_offset.is_some() {
+				return (
+					SideIndices {
+						array: None,
+						slice_offset,
+					},
+					self.rows as u64,
+					0,
+				);
+			}
+			self.materialize();
+		}
+		let indices = self.indices.expect("materialized above");
+		(
+			SideIndices {
+				array: Some(UInt32Array::from(indices)),
+				slice_offset,
+			},
+			0,
+			self.rows as u64,
+		)
+	}
+}
+
 /// Gather one side's columns, preferring a zero-copy slice over `take`.
 ///
 /// Returns the rows the fast path served, so a caller can record whether it
@@ -569,26 +722,45 @@ impl ContiguousRun {
 /// measured. It is a correctness rail for a diagnostic run, not a guard.
 fn gather_side(
 	batch: &RecordBatch,
-	indices: &UInt32Array,
-	run: ContiguousRun,
+	indices: &SideIndices,
 	rows: usize,
 	columns: &mut Vec<arrow::array::ArrayRef>,
 ) -> Result<u64, ExecutionError> {
-	if let Some(offset) = run.slice_offset(rows, batch.num_rows()) {
+	if let Some(offset) = indices.slice_offset {
+		// The equivalence check needs the array the slice replaced, so enabling it
+		// also disables the deferral (see `LazyIndexBuilder::new`'s caller). Both
+		// halves of that arrangement are the same doctrine: a diagnostic that
+		// performs the work it measures cannot also time the board, and it
+		// withholds timing authority for exactly that reason.
 		let verify = join_slice_equivalence_enabled();
 		for (position, column) in batch.columns().iter().enumerate() {
 			let sliced = column.slice(offset, rows);
-			if verify {
-				verify_slice_matches_take(position, &sliced, column, indices)?;
+			if verify && let Some(array) = indices.array.as_ref() {
+				verify_slice_matches_take(position, &sliced, column, array)?;
 			}
 			columns.push(sliced);
 		}
 		return Ok(rows as u64);
 	}
+	let array = indices
+		.array
+		.as_ref()
+		.expect("a side that cannot slice always materializes its indices");
 	for column in batch.columns() {
-		columns.push(arrow::compute::take(column, indices, None)?);
+		columns.push(arrow::compute::take(column, array, None)?);
 	}
 	Ok(0)
+}
+
+/// Whether a gather may defer its index-vector allocation.
+///
+/// False under the equivalence diagnostic, which compares each sliced column
+/// against the `take` it replaced and therefore needs the very array the
+/// deferral declines to build. That run measures correctness, not cost, and
+/// already withholds timing authority — so paying for the array there costs
+/// nothing this arc reads.
+fn index_deferral_available() -> bool {
+	!join_slice_equivalence_enabled()
 }
 
 /// Environment variable enabling the slice/`take` equivalence check.
@@ -1797,38 +1969,29 @@ pub(super) fn materialize_join_selection(
 		| JoinKind::LeftOuter
 		| JoinKind::RightOuter
 		| JoinKind::FullOuter => {
-			let (left_indices, right_indices, left_run, right_run) =
-				side_timing.time_index_build(kind, || {
-					let mut left_indices = Vec::with_capacity(selection.len());
-					let mut left_run = ContiguousRun::new();
-
-					let mut right_indices = Vec::with_capacity(selection.len());
-					let mut right_run = ContiguousRun::new();
+			let (left_indices, right_indices, avoided, materialized) = side_timing
+				.time_index_build(kind, || {
+					let deferrable = index_deferral_available();
+					let mut left_indices =
+						LazyIndexBuilder::new(selection.len(), left_batch.num_rows(), deferrable);
+					let mut right_indices =
+						LazyIndexBuilder::new(selection.len(), right_batch.num_rows(), deferrable);
 
 					for row in selection {
 						match *row {
 							JoinOutputRow::Paired { left, right } => {
 								left_indices.push(Some(left));
-								left_run.observe(Some(left));
-
 								right_indices.push(Some(right));
-								right_run.observe(Some(right));
 							}
 
 							JoinOutputRow::LeftFillNull { left } => {
 								left_indices.push(Some(left));
-								left_run.observe(Some(left));
-
 								right_indices.push(None);
-								right_run.observe(None);
 							}
 
 							JoinOutputRow::RightFillNull { right } => {
 								left_indices.push(None);
-								left_run.observe(None);
-
 								right_indices.push(Some(right));
-								right_run.observe(Some(right));
 							}
 
 							JoinOutputRow::LeftPreserved { .. }
@@ -1838,83 +2001,88 @@ pub(super) fn materialize_join_selection(
 						}
 					}
 
-					// Inside the bracket on purpose: building the `UInt32Array` is
-					// where a null buffer is allocated for indices that may not need
-					// one, and that allocation is the whole subject of the split.
+					// Inside the bracket on purpose: the `UInt32Array` and its null
+					// buffer are built here when they are built at all, and not
+					// building them is what this cut measures.
+					let (left_indices, left_avoided, left_materialized) = left_indices.finish();
+					let (right_indices, right_avoided, right_materialized) = right_indices.finish();
 					Ok((
-						UInt32Array::from(left_indices),
-						UInt32Array::from(right_indices),
-						left_run,
-						right_run,
+						left_indices,
+						right_indices,
+						left_avoided + right_avoided,
+						left_materialized + right_materialized,
 					))
 				})?;
+			side_timing.record_index_rows(avoided, materialized);
 
 			let rows = selection.len();
 			let mut columns =
 				Vec::with_capacity(left_batch.num_columns() + right_batch.num_columns());
-			let left_sliced = side_timing.time_left(|| {
-				gather_side(left_batch, &left_indices, left_run, rows, &mut columns)
-			})?;
-			let right_sliced = side_timing.time_right(|| {
-				gather_side(right_batch, &right_indices, right_run, rows, &mut columns)
-			})?;
+			let left_sliced = side_timing
+				.time_left(|| gather_side(left_batch, &left_indices, rows, &mut columns))?;
+			let right_sliced = side_timing
+				.time_right(|| gather_side(right_batch, &right_indices, rows, &mut columns))?;
 			side_timing.record_slice_rows(left_sliced, right_sliced);
 
 			columns
 		}
 
 		JoinKind::LeftSemi | JoinKind::LeftAnti => {
-			let (left_indices, left_run) = side_timing.time_index_build(kind, || {
-				let mut left_indices = Vec::with_capacity(selection.len());
-				let mut left_run = ContiguousRun::new();
+			let (left_indices, avoided, materialized) =
+				side_timing.time_index_build(kind, || {
+					let mut left_indices = LazyIndexBuilder::new(
+						selection.len(),
+						left_batch.num_rows(),
+						index_deferral_available(),
+					);
 
-				for row in selection {
-					match *row {
-						JoinOutputRow::LeftPreserved { left } => {
-							left_indices.push(Some(left));
-							left_run.observe(Some(left));
+					for row in selection {
+						match *row {
+							JoinOutputRow::LeftPreserved { left } => left_indices.push(Some(left)),
+
+							_ => return Err(invalid_join_selection(kind, row)),
 						}
-
-						_ => return Err(invalid_join_selection(kind, row)),
 					}
-				}
 
-				Ok((UInt32Array::from(left_indices), left_run))
-			})?;
+					Ok(left_indices.finish())
+				})?;
+			side_timing.record_index_rows(avoided, materialized);
 
 			let rows = selection.len();
 			let mut columns = Vec::with_capacity(left_batch.num_columns());
-			let sliced = side_timing.time_left(|| {
-				gather_side(left_batch, &left_indices, left_run, rows, &mut columns)
-			})?;
+			let sliced = side_timing
+				.time_left(|| gather_side(left_batch, &left_indices, rows, &mut columns))?;
 			side_timing.record_slice_rows(sliced, 0);
 			columns
 		}
 
 		JoinKind::RightSemi | JoinKind::RightAnti => {
-			let (right_indices, right_run) = side_timing.time_index_build(kind, || {
-				let mut right_indices = Vec::with_capacity(selection.len());
-				let mut right_run = ContiguousRun::new();
+			let (right_indices, avoided, materialized) =
+				side_timing.time_index_build(kind, || {
+					let mut right_indices = LazyIndexBuilder::new(
+						selection.len(),
+						right_batch.num_rows(),
+						index_deferral_available(),
+					);
 
-				for row in selection {
-					match *row {
-						JoinOutputRow::RightPreserved { right } => {
-							right_indices.push(Some(right));
-							right_run.observe(Some(right));
+					for row in selection {
+						match *row {
+							JoinOutputRow::RightPreserved { right } => {
+								right_indices.push(Some(right))
+							}
+
+							_ => return Err(invalid_join_selection(kind, row)),
 						}
-
-						_ => return Err(invalid_join_selection(kind, row)),
 					}
-				}
 
-				Ok((UInt32Array::from(right_indices), right_run))
-			})?;
+					Ok(right_indices.finish())
+				})?;
+			side_timing.record_index_rows(avoided, materialized);
 
 			let rows = selection.len();
 			let mut columns = Vec::with_capacity(right_batch.num_columns());
-			let sliced = side_timing.time_right(|| {
-				gather_side(right_batch, &right_indices, right_run, rows, &mut columns)
-			})?;
+			let sliced = side_timing
+				.time_right(|| gather_side(right_batch, &right_indices, rows, &mut columns))?;
 			side_timing.record_slice_rows(0, sliced);
 			columns
 		}
@@ -3432,14 +3600,24 @@ mod slice_fast_path_tests {
 	}
 
 	/// Run one side through `gather_side`, reporting the rows the fast path served.
+	///
+	/// Built eagerly on purpose: this helper answers what the GATHER does with a
+	/// given shape, so it hands over a materialized array in every case. Whether
+	/// the array should have existed at all is the deferral's question, and
+	/// `index_deferral_tests` asks it separately.
 	fn gather(source: &RecordBatch, indices: &[u32]) -> u64 {
-		let mut run = ContiguousRun::new();
+		let mut builder = LazyIndexBuilder::new(indices.len(), source.num_rows(), false);
 		for index in indices {
-			run.observe(Some(*index));
+			builder.push(Some(*index));
 		}
-		let array = UInt32Array::from(indices.to_vec());
+		let (side, avoided, materialized) = builder.finish();
+		assert_eq!(
+			(avoided, materialized),
+			(0, indices.len() as u64),
+			"an eager builder materializes every row"
+		);
 		let mut columns = Vec::new();
-		gather_side(source, &array, run, indices.len(), &mut columns).expect("gather")
+		gather_side(source, &side, indices.len(), &mut columns).expect("gather")
 	}
 
 	/// The fast path must produce the SAME batch `take` would.
@@ -3883,6 +4061,221 @@ mod index_build_split_tests {
 			(nonnull, nullable),
 			(0, 0),
 			"AccountedElsewhere must stay silent on both children"
+		);
+	}
+}
+
+#[cfg(test)]
+mod index_deferral_tests {
+	use super::*;
+	use crate::distributed::task::TaskTelemetry;
+	use arrow::array::Int64Array;
+	use arrow::datatypes::{DataType, Field, Schema};
+	use std::sync::Arc as StdArc;
+
+	fn source(prefix: &str, rows: i64) -> RecordBatch {
+		let schema = StdArc::new(Schema::new(vec![Field::new(
+			format!("{prefix}_id"),
+			DataType::Int64,
+			true,
+		)]));
+		RecordBatch::try_new(
+			schema,
+			vec![StdArc::new(Int64Array::from_iter_values(0..rows))],
+		)
+		.expect("fixture batch")
+	}
+
+	/// Build one side both ways and return `(lazy, eager)` index arrays, with the
+	/// lazy build's avoided and materialized row counts.
+	fn both_ways(
+		indices: &[Option<u32>],
+		source_rows: usize,
+	) -> (SideIndices, SideIndices, u64, u64) {
+		let mut lazy = LazyIndexBuilder::new(indices.len(), source_rows, true);
+		let mut eager = LazyIndexBuilder::new(indices.len(), source_rows, false);
+		for index in indices {
+			lazy.push(*index);
+			eager.push(*index);
+		}
+		let (lazy, avoided, materialized) = lazy.finish();
+		let (eager, eager_avoided, _) = eager.finish();
+		assert_eq!(eager_avoided, 0, "the eager builder never avoids a row");
+		(lazy, eager, avoided, materialized)
+	}
+
+	fn ascending(rows: usize) -> Vec<Option<u32>> {
+		(0..rows).map(|row| Some(row as u32)).collect()
+	}
+
+	/// A whole-source run allocates nothing: the gather reads the source directly,
+	/// and its indices would have been `0..rows`.
+	#[test]
+	fn a_whole_source_run_materializes_no_indices() {
+		let (lazy, _, avoided, materialized) = both_ways(&ascending(64), 64);
+
+		assert!(
+			lazy.array.is_none(),
+			"a deferred whole-source run must reach the gather with no index array"
+		);
+		assert_eq!(lazy.slice_offset, Some(0));
+		assert_eq!(
+			(avoided, materialized),
+			(64, 0),
+			"every row avoided, none materialized"
+		);
+	}
+
+	/// The correctness rail: a broken run must backfill EXACTLY what the eager
+	/// builder would have produced.
+	///
+	/// The backfill reconstructs the deferred prefix from the run rather than from
+	/// the selection, so an off-by-one would gather the wrong rows with the right
+	/// count and the right types — silently wrong answers, invisible downstream.
+	/// Compared as `ArrayData`, which covers the null bitmap as well as values.
+	#[test]
+	fn a_broken_run_backfills_exactly_what_the_eager_builder_would() {
+		let shapes: Vec<(&str, Vec<Option<u32>>)> = vec![
+			(
+				"break at the second row",
+				vec![Some(0), Some(7), Some(2), Some(3)],
+			),
+			(
+				"break at the last row",
+				vec![Some(0), Some(1), Some(2), Some(0)],
+			),
+			(
+				"never anchored at zero",
+				vec![Some(1), Some(2), Some(3), Some(4)],
+			),
+			("a null mid-run", vec![Some(0), Some(1), None, Some(3)]),
+			("a null at the head", vec![None, Some(1), Some(2), Some(3)]),
+			("a repeat", vec![Some(0), Some(1), Some(1), Some(2)]),
+			("descending tail", vec![Some(0), Some(1), Some(2), Some(1)]),
+		];
+
+		for (label, indices) in shapes {
+			let (lazy, eager, avoided, materialized) = both_ways(&indices, 4);
+			let lazy_array = lazy
+				.array
+				.as_ref()
+				.unwrap_or_else(|| panic!("{label}: a broken run must materialize"));
+			let eager_array = eager.array.as_ref().expect("eager always materializes");
+
+			assert_eq!(
+				lazy_array.to_data(),
+				eager_array.to_data(),
+				"{label}: the backfilled vector must equal eager construction"
+			);
+			assert_eq!(
+				(avoided, materialized),
+				(0, indices.len() as u64),
+				"{label}: a materialized side avoids nothing"
+			);
+			assert_eq!(
+				lazy.slice_offset, None,
+				"{label}: a broken run is not sliceable"
+			);
+		}
+	}
+
+	/// A selection that cannot cover the source never enters the lazy path.
+	///
+	/// `slice_offset` requires whole-source coverage, so a contiguous prefix of a
+	/// larger batch is ineligible however tidy it looks — and deferring for it
+	/// would buy a backfill and no slice.
+	#[test]
+	fn a_selection_shorter_than_its_source_never_defers() {
+		let (lazy, eager, avoided, materialized) = both_ways(&ascending(4), 64);
+
+		assert_eq!(
+			lazy.array.as_ref().expect("materialized").to_data(),
+			eager.array.as_ref().expect("materialized").to_data()
+		);
+		assert_eq!((avoided, materialized), (0, 4));
+		assert_eq!(lazy.slice_offset, None);
+	}
+
+	/// The equivalence diagnostic and the deferral are mutually exclusive by
+	/// construction: the check compares against the array the deferral declines
+	/// to build.
+	#[test]
+	fn the_equivalence_check_and_the_deferral_are_exclusive() {
+		assert_eq!(
+			index_deferral_available(),
+			!join_slice_equivalence_enabled(),
+			"a diagnostic run must keep its index arrays; a measuring run must not \
+			 be forced to build them"
+		);
+	}
+
+	/// End to end through the gather: the deferral fires, the slice still serves
+	/// the side, and the rows are the ones `take` would have produced.
+	#[test]
+	fn a_deferred_side_still_gathers_the_same_rows() {
+		let left = source("l", 8);
+		let right = source("r", 8);
+		let mut fields = left.schema().fields().to_vec();
+		fields.extend(right.schema().fields().iter().cloned());
+		let schema = StdArc::new(Schema::new(fields));
+		let selection: Vec<JoinOutputRow> = (0..8)
+			.map(|row| JoinOutputRow::Paired {
+				left: 7 - row,
+				right: row,
+			})
+			.collect();
+		let slot: Option<Arc<Mutex<TaskTelemetry>>> =
+			Some(Arc::new(Mutex::new(TaskTelemetry::default())));
+
+		let batch = materialize_join_selection(
+			JoinKind::Inner,
+			&left,
+			&right,
+			&selection,
+			&schema,
+			u64::MAX,
+			SideTakeTiming::Charged(&slot),
+		)
+		.expect("materialize");
+
+		let right_values = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("right column");
+		assert_eq!(
+			right_values.values(),
+			&[0, 1, 2, 3, 4, 5, 6, 7],
+			"the deferred side must still deliver its rows in selection order"
+		);
+		let left_values = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("left column");
+		assert_eq!(
+			left_values.values(),
+			&[7, 6, 5, 4, 3, 2, 1, 0],
+			"the scattered side is unaffected by the other side's deferral"
+		);
+
+		let guard = slot.as_ref().unwrap().lock().unwrap();
+		assert_eq!(
+			(
+				guard.counters.join_output_index_rows_avoided,
+				guard.counters.join_output_index_rows_materialized
+			),
+			(8, 8),
+			"one side deferred and one side materialized, both counted"
+		);
+		assert_eq!(
+			(
+				guard.counters.join_output_left_slice_rows,
+				guard.counters.join_output_right_slice_rows
+			),
+			(0, 8),
+			"slice coverage is unchanged by the deferral: the same side slices, \
+			 the same rows"
 		);
 	}
 }

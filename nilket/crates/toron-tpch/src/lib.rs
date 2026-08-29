@@ -6737,6 +6737,14 @@ fn timing_atlas_replay_attribution_path(
 				.get("join_output_right_slice_rows")
 				.and_then(|value| value.as_u64())
 				.unwrap_or(0),
+			join_output_index_rows_avoided: node
+				.get("join_output_index_rows_avoided")
+				.and_then(|value| value.as_u64())
+				.unwrap_or(0),
+			join_output_index_rows_materialized: node
+				.get("join_output_index_rows_materialized")
+				.and_then(|value| value.as_u64())
+				.unwrap_or(0),
 			join_output_left_take_ms: node
 				.get("join_output_left_take_ms")
 				.and_then(|value| value.as_f64())
@@ -8036,6 +8044,14 @@ pub struct TimingAtlasTaskNode {
 	/// take time that fell with zero rows here means something else moved.
 	pub join_output_left_slice_rows: u64,
 	pub join_output_right_slice_rows: u64,
+	/// ADR 554 follow-on: index rows the deferral avoided materializing, and those
+	/// it materialized.
+	///
+	/// The deferral is a per-INVOCATION opportunity, so these are per-invocation
+	/// counts summed at the site, not a share inferred from which nodes sliced.
+	/// The distinction is the one this record got wrong once already.
+	pub join_output_index_rows_avoided: u64,
+	pub join_output_index_rows_materialized: u64,
 	/// ADR 554 follow-on: run-length structure of this node's join output
 	/// selections, per side, aggregated over the task.
 	///
@@ -9089,6 +9105,8 @@ fn placement_attempt_from_row(row: &serde_json::Value) -> Result<PlacementAttemp
 			join_output_materialization_ms: 0.0,
 			join_output_left_slice_rows: 0,
 			join_output_right_slice_rows: 0,
+			join_output_index_rows_avoided: 0,
+			join_output_index_rows_materialized: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
 			join_output_nonnull_index_build_ms: 0.0,
@@ -9537,6 +9555,14 @@ pub fn timing_atlas_nodes_from_report(
 					.telemetry
 					.counters
 					.join_output_right_slice_rows,
+				join_output_index_rows_avoided: record
+					.telemetry
+					.counters
+					.join_output_index_rows_avoided,
+				join_output_index_rows_materialized: record
+					.telemetry
+					.counters
+					.join_output_index_rows_materialized,
 				join_output_left_take_ms: record.telemetry.phases.join_output_left_take_micros
 					as f64 / 1000.0,
 				join_output_right_take_ms: record.telemetry.phases.join_output_right_take_micros
@@ -9601,6 +9627,8 @@ pub fn timing_atlas_local_task_node(
 		// node stands for a whole local execution, not one task.
 		join_output_left_slice_rows: 0,
 		join_output_right_slice_rows: 0,
+		join_output_index_rows_avoided: 0,
+		join_output_index_rows_materialized: 0,
 		join_output_left_take_ms: 0.0,
 		join_output_right_take_ms: 0.0,
 		join_output_nonnull_index_build_ms: 0.0,
@@ -9691,6 +9719,8 @@ pub fn timing_atlas_attribution_path_row(
 				"join_output_materialization_ms": node.join_output_materialization_ms,
 				"join_output_left_slice_rows": node.join_output_left_slice_rows,
 				"join_output_right_slice_rows": node.join_output_right_slice_rows,
+				"join_output_index_rows_avoided": node.join_output_index_rows_avoided,
+				"join_output_index_rows_materialized": node.join_output_index_rows_materialized,
 				"join_output_left_take_ms": node.join_output_left_take_ms,
 				"join_output_right_take_ms": node.join_output_right_take_ms,
 				"join_output_nonnull_index_build_ms": node.join_output_nonnull_index_build_ms,
@@ -25938,6 +25968,8 @@ mod adr538_timing_atlas_journal_replay {
 			join_output_materialization_ms: 0.0,
 			join_output_left_slice_rows: 0,
 			join_output_right_slice_rows: 0,
+			join_output_index_rows_avoided: 0,
+			join_output_index_rows_materialized: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
 			join_output_nonnull_index_build_ms: 0.0,
@@ -26054,6 +26086,8 @@ mod adr538_timing_atlas_journal_replay {
 			join_output_materialization_ms: 0.0,
 			join_output_left_slice_rows: 0,
 			join_output_right_slice_rows: 0,
+			join_output_index_rows_avoided: 0,
+			join_output_index_rows_materialized: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
 			join_output_nonnull_index_build_ms: 0.0,
@@ -26098,6 +26132,8 @@ mod adr538_timing_atlas_journal_replay {
 				join_output_materialization_ms: 0.0,
 				join_output_left_slice_rows: 0,
 				join_output_right_slice_rows: 0,
+				join_output_index_rows_avoided: 0,
+				join_output_index_rows_materialized: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
 				join_output_nonnull_index_build_ms: 0.0,
@@ -26135,6 +26171,8 @@ mod adr538_timing_atlas_journal_replay {
 				join_output_materialization_ms: 0.0,
 				join_output_left_slice_rows: 0,
 				join_output_right_slice_rows: 0,
+				join_output_index_rows_avoided: 0,
+				join_output_index_rows_materialized: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
 				join_output_nonnull_index_build_ms: 0.0,
@@ -27130,6 +27168,8 @@ mod adr538_timing_atlas_critical_path {
 			join_output_materialization_ms: 0.0,
 			join_output_left_slice_rows: 0,
 			join_output_right_slice_rows: 0,
+			join_output_index_rows_avoided: 0,
+			join_output_index_rows_materialized: 0,
 			join_output_left_take_ms: 0.0,
 			join_output_right_take_ms: 0.0,
 			join_output_nonnull_index_build_ms: 0.0,
@@ -27368,6 +27408,8 @@ mod adr538_path_bound_validation {
 				join_output_materialization_ms: 0.0,
 				join_output_left_slice_rows: 0,
 				join_output_right_slice_rows: 0,
+				join_output_index_rows_avoided: 0,
+				join_output_index_rows_materialized: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
 				join_output_nonnull_index_build_ms: 0.0,
@@ -27399,6 +27441,8 @@ mod adr538_path_bound_validation {
 				join_output_materialization_ms: 0.0,
 				join_output_left_slice_rows: 0,
 				join_output_right_slice_rows: 0,
+				join_output_index_rows_avoided: 0,
+				join_output_index_rows_materialized: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
 				join_output_nonnull_index_build_ms: 0.0,
@@ -27431,6 +27475,8 @@ mod adr538_path_bound_validation {
 				join_output_materialization_ms: 0.0,
 				join_output_left_slice_rows: 0,
 				join_output_right_slice_rows: 0,
+				join_output_index_rows_avoided: 0,
+				join_output_index_rows_materialized: 0,
 				join_output_left_take_ms: 0.0,
 				join_output_right_take_ms: 0.0,
 				join_output_nonnull_index_build_ms: 0.0,

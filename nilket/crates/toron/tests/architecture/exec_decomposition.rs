@@ -40,7 +40,13 @@ const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
 // discriminating case where an all-paired outer join still charges the control.
 // The carve boundary this bound guards is unchanged: nothing added here is streaming
 // orchestration, which is what a drift back into the join root would look like.
-const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_890;
+// ADR 554 follow-on: 3_890 -> 4_290 for the lazy index builder, its backfill rail and
+// the deferral counters. Still not streaming orchestration, so the guard's own subject
+// is untouched — but the join root has taken ~800 lines across two cuts, and the output
+// gather machinery (run tracking, lazy build, slice, equivalence) is now a coherent body
+// with its own tests. The next cut in this area should carve it into a submodule beside
+// `spill` and `streaming` rather than raise this bound a third time.
+const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 4_290;
 
 #[test]
 pub(crate) fn adr350_exec_root_declares_join_module() {
