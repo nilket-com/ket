@@ -46,7 +46,11 @@ const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
 // gather machinery (run tracking, lazy build, slice, equivalence) is now a coherent body
 // with its own tests. The next cut in this area should carve it into a submodule beside
 // `spill` and `streaming` rather than raise this bound a third time.
-const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 4_290;
+// ADR 554 follow-on: that carve happened, so the bound RATCHETS DOWN, 4_290 -> 3_420. The
+// machinery and its tests now live in `join/output_materialization.rs`; the join root
+// measured 3,383 lines after the move. A bound raised for work that has since left the
+// file would silently license the next 900 lines of drift.
+const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_420;
 
 #[test]
 pub(crate) fn adr350_exec_root_declares_join_module() {
