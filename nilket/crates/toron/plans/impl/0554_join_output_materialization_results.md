@@ -15,14 +15,30 @@ pairs on the distributed arm, summed across cells for board totals.
 
 ## Outcome
 
-Board output-gather time fell **6,140.6 ms -> 3,866.9 ms (-37.0%)**, effectively all of it
-on the right side: **2,540.8 -> 362.3 ms (-85.7%)**. The mechanism is a zero-copy
-`Array::slice` substituted for `take` when a join side's selection is an exact contiguous
-run covering its whole source batch. 1,293,016 gathered columns were independently verified
-against the `take` they replaced.
+Three figures, each measured in its own A/B, and **they do not add up - deliberately**:
 
-The board's distributed elapsed also fell, 173,414 -> 158,803 ms, and **that is not claimed
-as this cut's effect** - see "What is not claimed".
+| figure | value | source |
+|---|---:|---|
+| current measured output-gather parent | **3,923.6 ms** | §7 artifact, the latest authoritative run |
+| slice fast path, named reduction | **2,178.5 ms** on right take | §2 A/B, `f15a3611` -> `4c528583` |
+| index-build deferral, named reduction | **233.1 ms** on the eligible child | §7 A/B, `65ffd733` -> `e45f5e75` |
+
+Each reduction is the delta between one artifact pair, over per-cell medians, on a board
+that drifted 0.92-1.09 between runs. Subtracting them in sequence from a starting parent
+would treat four independent runs as one continuous measurement and produce a number no
+artifact contains. The parent is what the last run measured; the reductions are what their
+own pairs measured; the arithmetic between them is not defined and is not attempted here.
+
+The mechanisms behind those two reductions: a zero-copy `Array::slice` substituted for
+`take` when a side's selection is an exact whole-source contiguous run (1,293,016 gathered
+columns verified against the `take` they replaced), and deferring the index-vector
+allocation for a side that turns out to be sliced.
+
+A third cut - plain `Vec<u32>` indices for the null-free kinds - was built, measured at
+**+92.0 ms**, and reverted (§9).
+
+Board distributed elapsed moved in every run, by more than any of these terms, and **none
+of it is claimed** for any of them - see "What is not claimed".
 
 ## 1. The per-side split - `f15a3611`
 
