@@ -1,0 +1,219 @@
+# ADR 554 - join output materialization: results
+
+Pairs with `plans/adr/0554_remainder_has_two_mechanisms.md`. That record closed as an
+attribution question; this one records what the attribution then bought. Branch A named
+`framework_overhead` as in-task unbracketed work, and the join materialization brackets
+(`c9d36f63`, on `4066df08`'s route receipts) located 13,525 ms of the distributed board's
+18,680 ms of it - **input concatenation 7,146 ms, output gathering 6,379 ms**.
+
+This document covers the **output gathering** half only: the per-side split that priced it,
+the fast path that removed most of it, the proof that the fast path is correct, and one
+method trap the line produced that is worth more than the milliseconds.
+
+All figures are SF 8, strict mode, 7 measured pairs, two workers, per-cell medians over
+pairs on the distributed arm, summed across cells for board totals.
+
+## Outcome
+
+Board output-gather time fell **6,140.6 ms -> 3,866.9 ms (-37.0%)**, effectively all of it
+on the right side: **2,540.8 -> 362.3 ms (-85.7%)**. The mechanism is a zero-copy
+`Array::slice` substituted for `take` when a join side's selection is an exact contiguous
+run covering its whole source batch. 1,293,016 gathered columns were independently verified
+against the `take` they replaced.
+
+The board's distributed elapsed also fell, 173,414 -> 158,803 ms, and **that is not claimed
+as this cut's effect** - see "What is not claimed".
+
+## 1. The per-side split - `f15a3611`
+
+`join_output_left_take_micros` and `join_output_right_take_micros` are **nested children** of
+`join_output_materialization_micros`. They are absent from `recompute_framework_overhead`:
+the parent already removed the time from the residual, and a child that subtracted again
+would relocate time twice. Two guards hold that: one fails if a child joins the accounted
+set, one asserts `left + right <= parent`. The inequality is deliberate - an equality would
+assert the shared index/assembly cost is zero, which is exactly the unknown being measured.
+
+One timer wraps each complete column loop, never each column: a per-column `Instant::now()`
+pair is a material fraction of a side running at single-digit nanoseconds per row.
+
+`SideTakeTiming` is an enum with no default, so all 15 `materialize_join_selection` call
+sites state their accounting: the generic sites pass `Charged`, the nine spilled and
+streaming sites pass `AccountedElsewhere` because their gathers already run inside Spill and
+operator brackets.
+
+Artifact `adr554_output_side_split_sf8.jsonl`, authoritative, 21/21, no replay violations,
+comparability mean 0.982 (0.875-1.059). The identity holds on all 1,323 nodes; the mean
+child/parent ratio is 0.722, so the brackets are placed inside real work rather than around
+all of it.
+
+Board: parent 6,140.6 ms = left 2,276.0 (37.1%) + right 2,540.8 (41.4%) + shared 1,323.8
+(21.6%).
+
+| cell | parent ms | left ms | right ms | shared ms |
+|---|---:|---:|---:|---:|
+| q09 | 2,042.4 | 620.5 | **1,025.6** | 396.3 |
+| q08 | 1,284.4 | 196.4 | **724.4** | 363.6 |
+| q07 | 876.4 | **504.1** | 233.1 | 139.2 |
+| q21 | 827.3 | **361.7** | 208.3 | 257.3 |
+| q02 | 437.1 | **312.7** | 83.1 | 41.3 |
+| q05 | 187.1 | 33.7 | **124.9** | 28.6 |
+
+**A prediction was falsified here.** From the gather bench
+(`benches/join_output_gather_shape.rs`) the expectation was `right << left`: the probe side's
+indices are contiguous, the build side's are hash-scattered, and scattered gathers priced
+5-10x worse per row. The opposite holds on q09 and q08, where the contiguous side costs
+2-3.7x the scattered one. Only q21 matches the prediction.
+
+The cause is **not established**. Two candidates, neither tested: column-count and width
+asymmetry between the sides (equal rows, different column sets, and the probe side is
+usually the wide fact table), or build-side cache residency (the bench held both access
+patterns at a 4M-row, 195 MB source, which is unrealistic for a small build side; scatter
+over a cache-resident source may cost little). q21 is consistent with the second - its
+self-join gives it a large build side, and it is the one cell where scatter dominates. That
+the bench overstated the scatter penalty by holding source size fixed across patterns is a
+defect in the instrument, recorded against it.
+
+## 2. The whole-source slice fast path - `4c528583`
+
+`ContiguousRun` refuses to slice unless every gathered row contributes a non-null index, the
+indices ascend by exactly one end to end, the run's length equals the rows being gathered,
+and the span lies inside the source. `checked_add` at the `u32::MAX` boundary. Anything else
+falls through to `take`, byte-identical to the previous behaviour.
+
+**The restriction to whole-source coverage is load-bearing, and it is a memory decision, not
+a correctness one.** `Array::slice` retains the source's entire backing allocation. A 4-row
+slice of a 4M-row batch is charged 4 rows by the materialization estimate and keeps 4M rows
+alive - an amplification no value-equality check can see. `slice_offset` therefore layers
+`offset == 0 && rows == source_rows` on top of the run arithmetic, and the test
+`a_slice_retains_the_whole_source_allocation` pins the fact behind it: on a 1,024-row source,
+a 4-row slice's buffer capacity equals the source's while `take` allocates for 4. Arbitrary
+contiguous sub-slices are a later cut and need explicit retained-memory accounting first.
+
+### The equivalence proof
+
+`TORON_JOIN_SLICE_EQUIVALENCE` re-gathers every sliced column with the `take` it replaced and
+compares `ArrayData` - data type, length, null bitmap, and values, not values alone - failing
+the query on mismatch. Run against the full SF 8 cohort
+(`adr554_slice_equivalence_sf8.jsonl.partial`):
+
+| fact | value |
+|---|---|
+| finalized cells | 21/21 |
+| replay violations | none |
+| child attempts valid and identity-matching | 336/336 |
+| columns verified | 1,293,016 |
+| `timing_authority` | `false` |
+| `withheld_reasons` | `["join_diagnostics_enabled"]` |
+
+The run exits non-zero **by design**: withheld authority refuses publication, so the artifact
+is retained as `.partial` and read there. That exit says nothing about equivalence; a genuine
+mismatch fails inside a cell with the column named.
+
+### The authoritative run
+
+`adr554_slice_fast_path_sf8.jsonl`, build `4c528583a13d`, `timing_authority: true`,
+`join_selection_locality_probe: false`, 21/21, no replay violations.
+
+| term | side split `f15a3611` | slice `4c528583` | delta |
+|---|---:|---:|---:|
+| right take | 2,540.8 ms | 362.3 ms | **-2,178.5 (-85.7%)** |
+| left take | 2,276.0 ms | 2,189.0 ms | -87.0 |
+| shared (index + assembly) | 1,323.8 ms | 1,315.6 ms | -8.2 |
+| parent | 6,140.6 ms | 3,866.9 ms | -2,273.7 (-37.0%) |
+
+| cell | right before | right after | delta |
+|---|---:|---:|---:|
+| q09 | 1,025.6 | 133.8 | -891.8 |
+| q08 | 724.4 | 17.5 | -706.9 |
+| q21 | 208.3 | 0.0 | -208.3 |
+| q07 | 233.1 | 36.2 | -196.9 |
+| q11 | 83.2 | 0.3 | -82.9 |
+| q02 | 83.1 | 4.1 | -79.0 |
+
+The left and shared terms are the controls: neither moved materially, which is what a
+right-side substitution should do.
+
+Coverage is recorded, not inferred. `join_output_left_slice_rows` and
+`join_output_right_slice_rows` count rows actually served by the slice, so a take time that
+falls with zero rows here means something else moved. Per pair, **21 nodes slice 169.8 M rows**
+(168.6 M right, 1.2 M left); across the seven measured pairs that is 147 node-instances and
+1.19 G rows. The path is side-agnostic and does fire on left sides - q16, q11 and q05 each
+have a left-side slice - it is simply that probe-side selections are the ones that usually
+span their whole source.
+
+### The mechanism check
+
+Sliced rows equal, node for node, the `max_run` that the independent locality probe measured
+for that same side in an earlier run:
+
+| cell / node | side | sliced rows | probe `max_run` | probe `run_count` |
+|---|---|---:|---:|---:|
+| q09 0/0 | right | 47,989,007 | 47,989,007 | 7,108,334 |
+| q08 0/0 | right | 47,989,007 | 47,989,007 | 705,456 |
+| q21 0/0 | right | 30,343,541 | 30,343,541 | 1 |
+| q07 0/0 | right | 14,584,179 | 14,584,179 | 1 |
+| q02 0/0 | right | 6,400,000 | 6,400,000 | 47,586 |
+| q05 0/0 | right | 1,820,547 | 1,820,547 | 1,837,407 |
+| q16 0/0 | left | 948,284 | 948,284 | 1 |
+| q11 2/3 | left | 240,861 | 240,861 | 1 |
+
+All 21 slicing nodes match on the sliced side. Two instruments built for different purposes,
+in different runs, agree on which gathers are whole-source runs - that plus the 1.29 M-column
+equivalence proof covers both halves of the claim: the right shapes, and the right rows.
+
+## 3. What is not claimed
+
+Board distributed elapsed went 173,414 -> 158,803 ms (-8.4%), and this cut is **not** credited
+with it. Every cell got faster, including q12, which shed 1,243 ms of elapsed on a right-take
+change of 1.35 ms. That is drift between runs, not slicing. The defensible claim is the named
+term: 2,178.5 ms of right-side gather, with the coverage counters and the equivalence proof
+standing behind it.
+
+## 4. The trap: a task-local aggregate cannot bound a per-invocation opportunity
+
+The pre-cut estimate of the prize was **534 ms across 18 nodes**, derived by joining the
+locality artifact to the side-split timings and keeping the nodes whose selection was fully
+contiguous - `run_count == 1`. The measured result is 2,178.5 ms, 4.1x that figure. The
+implementation was not slicing cases it should not; **the estimate was a floor, and was read
+as a ceiling.**
+
+The locality probe accumulates **per node, across every invocation of the gather**. A node
+that gathers four times, once over a whole 6.4 M-row contiguous run and three times over
+scattered selections, reports `run_count = 47,586` in aggregate and fails a
+fully-contiguous filter - while containing exactly the invocation the fast path serves. q02's
+stage 0 task 0 is that node literally. q08's and q09's leading nodes are the same shape, and
+those two cells alone contributed 1,598.7 ms of the 2,178.5 ms won, both excluded by the
+filter that produced 534 ms.
+
+The rule the line leaves behind: **to bound a per-invocation opportunity, the counter must be
+per-invocation.** An aggregate over invocations supports a floor and nothing more. `max_run`
+survives aggregation only because it is an extremum - which is precisely why it works as the
+mechanism check in §2 and does not work as a coverage bound.
+
+## 5. Diagnostics and the authority rule
+
+Two join diagnostics exist, both env-gated and both off by default:
+`TORON_JOIN_SELECTION_LOCALITY` (per-side run structure) and `TORON_JOIN_SLICE_EQUIVALENCE`
+(slice against `take`). Each performs work the thing it measures is meant to avoid, so a run
+with either enabled cannot also time the board.
+
+That is enforced rather than remembered. `TimingAuthorityConditions::diagnostics_disabled`,
+fed by the shared `join_diagnostics_disabled()` helper, makes both the timing atlas and the
+placement A/B withhold authority with the reason `join_diagnostics_enabled`, and the atlas
+header stamps `join_selection_locality_probe` so all-zero counters cannot be misread as "no
+contiguity". A new join diagnostic that does not join that helper will silently claim
+authority it should not have.
+
+## 6. Forward
+
+- **Shared index and assembly cost, 1,315.6 ms**, is now the largest remaining output-gather
+  term after the left side. Plain (non-null) index vectors for joins that cannot produce
+  nulls - Inner and Cross - are the candidate, measured against this term. No output-shape
+  change is required, which makes it a small cut.
+- **The left side, 2,189.0 ms**, is intrinsically scattered and cannot be sliced. Before it is
+  scoped, §1's unresolved question - why the contiguous side cost more than the scattered one
+  - should be settled, because the answer decides whether the lever is locality at all.
+- **Input concatenation, 7,146 ms**, is untouched and is now the larger half of the named
+  materialization cost. Direct multi-batch input processing is the structural project there.
+- **Arbitrary contiguous sub-slices** remain available and remain gated on retained-memory
+  accounting, per §2.
