@@ -604,6 +604,32 @@ pub struct TaskTelemetryPhases {
 	/// residual is where the `Vec<Option<u32>>` opportunity lives.
 	#[serde(default)]
 	pub join_output_right_take_micros: u64,
+	/// Time inside `join_output_materialization_micros` spent BUILDING the index
+	/// vectors for a join whose selection cannot contain a null — `Inner`, `Cross`,
+	/// and the four semi/anti kinds, whose arms reject every null-producing row
+	/// variant outright.
+	///
+	/// Split from `join_output_nullable_index_build_micros` by ELIGIBILITY, not by
+	/// convenience: only this bucket can be served by a plain `Vec<u32>` and a
+	/// null-free `UInt32Array`. A single combined index-build counter could be
+	/// large while saying nothing about the portion a substitution could change,
+	/// which is the number this split exists to produce.
+	///
+	/// A nested child on the same terms as the two `take` counters: inside the
+	/// parent bracket, absent from `recompute_framework_overhead`.
+	#[serde(default)]
+	pub join_output_nonnull_index_build_micros: u64,
+	/// The same construction for the kinds that CAN produce a null index —
+	/// `LeftOuter`, `RightOuter`, `FullOuter`. The control arm: it must carry the
+	/// null-bitmap cost that the non-null bucket does not, and a substitution
+	/// cannot touch it.
+	///
+	/// Its purpose is to make a small non-null figure interpretable. Without it, a
+	/// small `join_output_nonnull_index_build_micros` reads equally as "index
+	/// construction is cheap" and "these cells run no eligible joins", and those
+	/// carry opposite conclusions.
+	#[serde(default)]
+	pub join_output_nullable_index_build_micros: u64,
 	/// Time spent partitioning batches across an exchange boundary. Written by the executor,
 	/// so it is produced on both arms: locally as in-memory repartitioning, and inside a
 	/// distributed producer task. That symmetry is what makes it a paired component.
