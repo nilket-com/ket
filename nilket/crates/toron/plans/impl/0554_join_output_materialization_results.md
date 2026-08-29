@@ -337,7 +337,46 @@ applies to the 253.2 M rows still materialized, and it keeps the vector - only n
 it from 8 bytes to 4 and dropping the null buffer. Its per-row ceiling is therefore
 **below** the 1.37 ns/row the deferral removed by not building anything at all.
 
-## 8. Forward
+## 8. Pricing the substitution before building it - bench rail, no new instrument
+
+The existing `benches/join_output_gather_shape.rs` already prices nullable against plain
+index construction; it was re-run rather than replaced. Release build, 4,000,000-row
+5-column source, 5 replicates, median (ns per row):
+
+| locality | out rows | nullbuild | plainbuild | difference |
+|---|---:|---:|---:|---:|
+| sequential | 100,000 | 0.90 | 0.08 | 0.82 |
+| sequential | 1,000,000 | 0.88 | 0.13 | 0.75 |
+| sequential | 4,000,000 | 1.44 | 0.23 | 1.21 |
+| clustered | 100,000 | 1.01 | 0.10 | 0.91 |
+| clustered | 1,000,000 | 1.10 | 0.18 | 0.92 |
+| clustered | 4,000,000 | 1.33 | 0.22 | 1.11 |
+| scattered | 100,000 | 0.82 | 0.07 | 0.75 |
+| scattered | 1,000,000 | 1.12 | 0.15 | 0.97 |
+| scattered | 4,000,000 | 1.38 | 0.24 | 1.14 |
+
+**Forecast, not a claim:** 0.75-1.21 ns/row against the 253.2 M rows still materialized
+after the deferral is **190-306 ms**, point estimate ~233 ms at the median 0.92 ns/row.
+Nothing in the engine has been changed to produce that number and it is not evidence about
+the engine; it exists so the A/B has something to falsify.
+
+Two reasons to expect the real figure at the low end or below:
+
+- **The bench's plain arm is cheaper than the engine's would be.** It builds
+  `UInt32Array::from(raw.to_vec())` — one memcpy into a buffer arrow then owns — where the
+  engine pushes row by row into a `Vec<u32>`. Its 0.07-0.24 ns/row underprices what the
+  substitution would actually cost, so the difference column overstates the saving.
+- **The whole build is the ceiling, and it is already measured.** §7 put the complete
+  nullable construction at ~1.37 ns/row in the engine — the deferral removed all of it for
+  the rows it skipped. The bench's 0.82-1.44 ns/row for the same work corroborates that
+  independently, and it means the substitution cannot exceed ~347 ms on those rows no
+  matter how the arithmetic is arranged.
+
+So the substitution is worth an A/B and is not worth a prediction. What it decides is
+whether ~200 ms of a 1,124.9 ms term is reachable by narrowing a vector, given that the
+walk, the row match and the contiguity observation stay exactly where they are.
+
+## 9. Forward
 
 - **Index construction is 1,124.9 ms** after the deferral took 233.1 ms of it (§7). What
   remains is 253.2 M rows that genuinely need a vector, plus the walk, the row match and the
