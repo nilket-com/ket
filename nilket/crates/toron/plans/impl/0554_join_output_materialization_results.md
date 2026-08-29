@@ -1,5 +1,8 @@
 # ADR 554 - join output materialization: results
 
+**Frozen with ADR 554 at `0ab7abf3`.** The output-gather line recorded here is complete;
+the input-concatenation project that follows it is ADR 580.
+
 Pairs with `plans/adr/0554_remainder_has_two_mechanisms.md`. That record closed as an
 attribution question; this one records what the attribution then bought. Branch A named
 `framework_overhead` as in-task unbracketed work, and the join materialization brackets
@@ -455,8 +458,10 @@ is now known to be dominated by something other than the width of the vector.
 - **The left side, 2,189.0 ms**, is intrinsically scattered and cannot be sliced. Before it is
   scoped, §1's unresolved question - why the contiguous side cost more than the scattered one
   - should be settled, because the answer decides whether the lever is locality at all.
-- **Input concatenation, 7,146 ms**, is untouched and is now the larger half of the named
-  materialization cost. Direct multi-batch join build/probe, eliminating concatenation, is the
-  structural project there.
+- **Input concatenation, 7,100.6 ms on the last authoritative run**, is untouched and is now
+  the larger half of the named materialization cost by a factor of 1.8. It is no longer this
+  record's: direct multi-batch join build/probe is **ADR 580**, which owns its scope,
+  thresholds and stop conditions. The per-side instrument built at `0ab7abf3` is its first
+  measurement, not this line's.
 - **Arbitrary contiguous sub-slices** remain available and remain gated on retained-memory
   accounting, per §2.

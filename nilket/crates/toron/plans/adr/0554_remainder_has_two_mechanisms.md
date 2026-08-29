@@ -401,3 +401,10 @@ Branch A's named remainder subterms opened a perf line this record does not meas
 join input and output materialization brackets and what they bought. That line's evidence is
 `plans/impl/0554_join_output_materialization_results.md`. Nothing there revises the
 attribution recorded above.
+
+**This record is frozen at `0ab7abf3`.** The perf line it opened ran on under this number
+longer than it should have — through behaviour changes, A/B runs and a revert — and a
+closed attribution record is the wrong owner for an optimization programme. The remaining
+work, direct multi-batch consumption of join inputs, is **ADR 580**, which owns its own
+scope, thresholds and stop conditions. No further implementation or measurement lands under
+this number.
