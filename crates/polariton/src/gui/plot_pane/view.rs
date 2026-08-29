@@ -33,15 +33,18 @@ pub fn host_view(
 	))
 	.width(Fill)
 	.height(Fill);
-	let interaction = canvas(PlotWidget::new(
-		state.kernel.as_ref(),
-		title,
-		20.0,
-		state.plot_settings_model.clone(),
-		state.render_revision,
-		state.resize_render_suspended,
-		PlotRenderLayer::OverlayInteractive,
-	))
+	let interaction = canvas(
+		PlotWidget::new(
+			state.kernel.as_ref(),
+			title,
+			20.0,
+			state.plot_settings_model.clone(),
+			state.render_revision,
+			state.resize_render_suspended,
+			PlotRenderLayer::OverlayInteractive,
+		)
+		.with_settings_inspector_gesture(),
+	)
 	.width(Fill)
 	.height(Fill);
 	let mut layers = stack![data, interaction];
@@ -76,22 +79,7 @@ pub fn host_view(
 	} else {
 		plot.width(Fill).height(Fill).into()
 	};
-	let toggle_label = if state.settings_inspector_open {
-		"Hide settings"
-	} else {
-		"Plot settings"
-	};
-	column![
-		container(
-			button(text(toggle_label).size(11)).on_press(PlotMessage::ToggleSettingsInspector)
-		)
-		.width(Fill)
-		.padding([3, 6])
-		.align_x(iced::alignment::Horizontal::Right),
-		body,
-	]
-	.height(Fill)
-	.into()
+	body
 }
 
 fn section_label(section: InspectorSection) -> &'static str {

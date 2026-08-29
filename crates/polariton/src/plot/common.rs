@@ -2113,6 +2113,9 @@ pub struct PlotWidget<'a> {
 	pub render_revision: u64,
 	pub resize_render_suspended: bool,
 	pub layer: PlotRenderLayer,
+	/// Host-panel plots opt into the settings inspector shortcut. Other plot
+	/// surfaces share this widget but do not own that inspector.
+	settings_inspector_gesture: bool,
 	/// PRODUCT-0139 §1. Defaults to `Settled`; a gesture opts in per frame.
 	viewport_motion: ViewportMotion,
 }
@@ -2137,8 +2140,14 @@ impl<'a> PlotWidget<'a> {
 			render_revision,
 			resize_render_suspended,
 			layer,
+			settings_inspector_gesture: false,
 			viewport_motion: ViewportMotion::Settled,
 		}
+	}
+
+	pub fn with_settings_inspector_gesture(mut self) -> Self {
+		self.settings_inspector_gesture = true;
+		self
 	}
 
 	/// PRODUCT-0139 §1: opt this frame into motion-only raster reuse. Only a
@@ -2626,10 +2635,138 @@ impl VerticalGuideBands {
 #[derive(Default)]
 pub struct PlotCanvasState {
 	last_hover: Option<String>,
+	modifiers: iced::keyboard::Modifiers,
+	settings_click: Option<iced::advanced::mouse::Click>,
 	plot_cache: canvas::Cache,
 	overlay_cache: canvas::Cache,
 	render_revision: std::cell::Cell<u64>,
 	stable_bounds: std::cell::RefCell<Option<Rectangle>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsGesture {
+	None,
+	Tracking,
+	Activated,
+}
+
+impl PlotCanvasState {
+	fn settings_gesture(
+		&mut self,
+		event: &Event,
+		bounds: Rectangle,
+		cursor: Cursor,
+	) -> SettingsGesture {
+		match event {
+			Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
+				self.modifiers = *modifiers;
+				if !modifiers.control() {
+					self.settings_click = None;
+				}
+				SettingsGesture::None
+			}
+			Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) => {
+				if !self.modifiers.control() {
+					self.settings_click = None;
+					return SettingsGesture::None;
+				}
+				let Some(position) = cursor.position_over(bounds) else {
+					self.settings_click = None;
+					return SettingsGesture::None;
+				};
+				let click = iced::advanced::mouse::Click::new(
+					position,
+					iced::mouse::Button::Left,
+					self.settings_click,
+				);
+				if click.kind() == iced::advanced::mouse::click::Kind::Double {
+					self.settings_click = None;
+					SettingsGesture::Activated
+				} else {
+					self.settings_click = Some(click);
+					SettingsGesture::Tracking
+				}
+			}
+			_ => SettingsGesture::None,
+		}
+	}
+}
+
+#[cfg(test)]
+mod settings_gesture_tests {
+	use super::{PlotCanvasState, SettingsGesture};
+	use iced::advanced::mouse::Cursor;
+	use iced::{Event, Point, Rectangle, keyboard, mouse};
+
+	const BOUNDS: Rectangle = Rectangle {
+		x: 0.0,
+		y: 0.0,
+		width: 100.0,
+		height: 100.0,
+	};
+
+	fn left_press() -> Event {
+		Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+	}
+
+	#[test]
+	fn ctrl_double_click_activates_plot_settings_gesture() {
+		let mut state = PlotCanvasState::default();
+		let cursor = Cursor::Available(Point::new(25.0, 25.0));
+
+		assert_eq!(
+			state.settings_gesture(
+				&Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::CTRL)),
+				BOUNDS,
+				cursor,
+			),
+			SettingsGesture::None
+		);
+		assert_eq!(
+			state.settings_gesture(&left_press(), BOUNDS, cursor),
+			SettingsGesture::Tracking
+		);
+		assert_eq!(
+			state.settings_gesture(&left_press(), BOUNDS, cursor),
+			SettingsGesture::Activated
+		);
+	}
+
+	#[test]
+	fn ordinary_double_click_does_not_activate_plot_settings() {
+		let mut state = PlotCanvasState::default();
+		let cursor = Cursor::Available(Point::new(25.0, 25.0));
+
+		assert_eq!(
+			state.settings_gesture(&left_press(), BOUNDS, cursor),
+			SettingsGesture::None
+		);
+		assert_eq!(
+			state.settings_gesture(&left_press(), BOUNDS, cursor),
+			SettingsGesture::None
+		);
+	}
+
+	#[test]
+	fn releasing_ctrl_cancels_an_incomplete_settings_gesture() {
+		let mut state = PlotCanvasState::default();
+		let cursor = Cursor::Available(Point::new(25.0, 25.0));
+		let ctrl = Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::CTRL));
+		let no_modifiers =
+			Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::NONE));
+
+		state.settings_gesture(&ctrl, BOUNDS, cursor);
+		assert_eq!(
+			state.settings_gesture(&left_press(), BOUNDS, cursor),
+			SettingsGesture::Tracking
+		);
+		state.settings_gesture(&no_modifiers, BOUNDS, cursor);
+		state.settings_gesture(&ctrl, BOUNDS, cursor);
+		assert_eq!(
+			state.settings_gesture(&left_press(), BOUNDS, cursor),
+			SettingsGesture::Tracking
+		);
+	}
 }
 
 impl<'a> PlotWidget<'a> {
@@ -3070,6 +3207,17 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 	) -> Option<canvas::Action<PlotMessage>> {
 		if self.layer == PlotRenderLayer::Data {
 			return None;
+		}
+		if self.settings_inspector_gesture {
+			match state.settings_gesture(event, bounds, cursor) {
+				SettingsGesture::Activated => {
+					return Some(
+						canvas::Action::publish(PlotMessage::ToggleSettingsInspector).and_capture(),
+					);
+				}
+				SettingsGesture::Tracking => return Some(canvas::Action::capture()),
+				SettingsGesture::None => {}
+			}
 		}
 		match event {
 			Event::Mouse(iced::mouse::Event::CursorMoved { .. }) => {
