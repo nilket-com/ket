@@ -204,12 +204,73 @@ header stamps `join_selection_locality_probe` so all-zero counters cannot be mis
 contiguity". A new join diagnostic that does not join that helper will silently claim
 authority it should not have.
 
-## 6. Forward
+## 6. Index construction, bracketed by eligibility - `65ffd733`
 
-- **Shared index and assembly cost, 1,315.6 ms**, is now the largest remaining output-gather
-  term after the left side. Plain (non-null) index vectors for joins that cannot produce
-  nulls - Inner and Cross - are the candidate, measured against this term. No output-shape
-  change is required, which makes it a small cut.
+The 1,315.6 ms leftover above is a residual of three activities, and a residual
+cannot say which one moved. Two more nested children split it:
+`join_output_nonnull_index_build_micros` for the kinds whose selections cannot
+carry a null - `Inner`, `Cross`, and the four semi/anti kinds, whose arms accept
+only preserved rows and error on everything else - and
+`join_output_nullable_index_build_micros` for the outer kinds, which must keep a
+null buffer and which no substitution can reach. Both bracket the row loop AND
+the `UInt32Array` it produces, because the null-buffer allocation is the subject.
+
+**Eligibility is decided by kind, before any row is seen.** An all-`Paired`
+`LeftOuter` still builds a nullable vector, and
+`an_outer_gather_without_nulls_still_charges_the_control` fails if that is
+charged by observed nulls instead - the mis-charge that would have overstated the
+prize while passing every other test in the module.
+
+Artifact `adr554_index_build_split_sf8.jsonl`, build `65ffd733301c`, binary mtime
+1788023971, authority granted, 21/21, no replay violations. The four children
+clear their parent on **every one of the 1,323 nodes**, checked per node rather
+than per cell.
+
+| term | ms | share of parent |
+|---|---:|---:|
+| left take | 2,351.3 | 57.1% |
+| right take | 381.0 | 9.3% |
+| index build, eligible | **1,358.0** | **33.0%** |
+| index build, control | 5.1 | 0.1% |
+| leftover (estimate + batch assembly) | 19.0 | 0.5% |
+| parent | 4,114.4 | |
+
+**Index construction was essentially the whole of the unnamed leftover**, and it
+is eligible work almost everywhere: the control carries 5.1 ms, spread over q13,
+q20, q17 and q02. `RecordBatch::try_new` and the materialization estimate
+together account for half a percent.
+
+Two limits on what this licenses, both material to scoping:
+
+- **The control is too small to price the null buffer.** It proves the split
+  fires - the board simply runs almost no outer-kind gathers on the charged path
+  - but 5.1 ms against 1,358.0 ms supports no comparison of nullable against
+  plain construction. What fraction of the eligible figure a `Vec<u32>`
+  substitution could remove is UNMEASURED. The bracket also contains the
+  `ContiguousRun` observation this line itself added, and the row match; a
+  substitution reaches neither. 1,358.0 ms is an upper bound, not a target.
+- **92% of it is spent on indices that are then discarded.** Of pair 0's
+  1,385.9 ms, 1,275.1 ms sits on the 21 nodes that slice a side - and on a sliced
+  side the index array is built and never read, because `gather_side` slices
+  instead. That is dead work the slice cut created and did not clean up: a
+  whole-source run's indices are `0..rows`, which need not be materialized at
+  all.
+
+Comparability: this run is uniformly slower than the slice board (mean 1.09,
+range 0.967-1.214) and level with the side-split board (mean 1.00). Cross-run
+term comparisons are therefore refused here and the decomposition above is
+within-run. That spread is also the second reminder that the slice board's
+elapsed drop was drift, not a win - see "What is not claimed".
+
+## 7. Forward
+
+- **Index construction, 1,358.0 ms**, is now measured and almost entirely eligible (§6). The
+  first cut against it is not the plain-index substitution but **not building the vector at
+  all for a side that ends up sliced** — 92% of the time sits there, and a whole-source run's
+  indices are `0..rows`. The substitution then applies to whatever vector remains. Both are
+  bounded by the share of the bracket a substitution can actually reach, which §6 records as
+  unmeasured; a cut that claims the full 1,358.0 ms is claiming the row match and the run
+  observation too.
 - **The left side, 2,189.0 ms**, is intrinsically scattered and cannot be sliced. Before it is
   scoped, §1's unresolved question - why the contiguous side cost more than the scattered one
   - should be settled, because the answer decides whether the lever is locality at all.
