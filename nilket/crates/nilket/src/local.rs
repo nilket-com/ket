@@ -31,7 +31,7 @@ use uuid::Uuid;
 use wendelon::cli::ReadinessProbe;
 
 const READY_ENDPOINT: &str = "127.0.0.1:7432";
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TORON_DRAIN_TIMEOUT: Duration = Duration::from_secs(35);
 const WENDELON_DRAIN_TIMEOUT: Duration = Duration::from_secs(35);
