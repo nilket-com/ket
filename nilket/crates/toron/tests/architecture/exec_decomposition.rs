@@ -35,7 +35,12 @@ const EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT: usize = 10_000;
 // equivalence check in the seal — and that both gates also withhold timing authority.
 const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_594;
 const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
-const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_825;
+// ADR 554 follow-on: 3_825 -> 3_890 for the index-build split — two nested child
+// timers selected by join kind, and the tests that pin the selection, including the
+// discriminating case where an all-paired outer join still charges the control.
+// The carve boundary this bound guards is unchanged: nothing added here is streaming
+// orchestration, which is what a drift back into the join root would look like.
+const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_890;
 
 #[test]
 pub(crate) fn adr350_exec_root_declares_join_module() {

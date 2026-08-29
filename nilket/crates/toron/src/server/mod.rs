@@ -1828,7 +1828,7 @@ mod tests {
 		);
 	}
 
-	/// ADR 554 follow-on: the nested side children must NOT be subtracted again.
+	/// ADR 554 follow-on: the nested children must NOT be subtracted again.
 	///
 	/// `join_output_materialization_micros` already left the residual. Its two
 	/// children measure parts of that same span, so joining `accounted` a second
@@ -1847,38 +1847,57 @@ mod tests {
 		let mut with_children = TaskTelemetry::default();
 		with_children.phases.task_wall_micros = 10_000;
 		with_children.phases.join_output_materialization_micros = 4_000;
-		// A realistic split: most of the parent is the two take loops.
+		// A realistic split: most of the parent is the two take loops, with the
+		// index build accounting for part of what is left over.
 		with_children.phases.join_output_left_take_micros = 3_000;
 		with_children.phases.join_output_right_take_micros = 700;
+		with_children.phases.join_output_nonnull_index_build_micros = 200;
+		with_children.phases.join_output_nullable_index_build_micros = 50;
 		recompute_framework_overhead(&mut with_children);
 
 		assert_eq!(
 			with_children.phases.framework_overhead_micros, 6_000,
 			"splitting a parent into children must not move the residual at all; \
-			 a child that joined `accounted` would report 2_300 here"
+			 a child that joined `accounted` would report 2_050 here"
 		);
 	}
 
 	/// The acceptance identity: children sum to at most their parent.
 	///
 	/// Stated as an inequality, not an equality, on purpose — the difference is
-	/// the shared index-vector, `UInt32Array` and batch-assembly cost, which is
-	/// the term this split exists to expose. An equality would assert that shared
-	/// cost is zero, which is exactly the thing not yet known.
+	/// the `UInt32Array` allocation and batch-assembly cost the four children do
+	/// not cover. An equality would assert that leftover is zero, which is
+	/// exactly the thing not yet known.
+	///
+	/// The index children join the sum rather than getting an identity of their
+	/// own: all four bracket disjoint spans inside the same parent, and a guard
+	/// that checked them separately would pass while their total overran it.
 	#[test]
 	fn adr554_join_output_children_never_exceed_their_parent() {
-		for (left, right, parent) in [(0u64, 0u64, 0u64), (3_000, 700, 4_000), (1, 1, 2)] {
+		for (left, right, nonnull, nullable, parent) in [
+			(0u64, 0u64, 0u64, 0u64, 0u64),
+			(3_000, 700, 200, 50, 4_000),
+			(1, 1, 1, 1, 4),
+			// One arm builds one kind of index vector, never both, so a task whose
+			// joins are all eligible leaves the control child at zero. The identity
+			// must hold there too — that is the shape the measurement expects.
+			(3_000, 700, 250, 0, 4_000),
+		] {
 			let mut telemetry = TaskTelemetry::default();
 			telemetry.phases.join_output_left_take_micros = left;
 			telemetry.phases.join_output_right_take_micros = right;
+			telemetry.phases.join_output_nonnull_index_build_micros = nonnull;
+			telemetry.phases.join_output_nullable_index_build_micros = nullable;
 			telemetry.phases.join_output_materialization_micros = parent;
 			let children = telemetry.phases.join_output_left_take_micros
-				+ telemetry.phases.join_output_right_take_micros;
+				+ telemetry.phases.join_output_right_take_micros
+				+ telemetry.phases.join_output_nonnull_index_build_micros
+				+ telemetry.phases.join_output_nullable_index_build_micros;
 			assert!(
 				children <= telemetry.phases.join_output_materialization_micros,
-				"children {children} exceed parent {parent}: the side loops are \
-				 nested inside the parent bracket, so a sum above it means one of \
-				 them is timing work outside it"
+				"children {children} exceed parent {parent}: the side loops and the \
+				 index build are nested inside the parent bracket, so a sum above it \
+				 means one of them is timing work outside it"
 			);
 		}
 	}

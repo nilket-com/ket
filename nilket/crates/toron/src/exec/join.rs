@@ -412,6 +412,50 @@ impl SideTakeTiming<'_> {
 	) -> Result<T, ExecutionError> {
 		self.time(|phases| &mut phases.join_output_right_take_micros, body)
 	}
+
+	/// Time one arm's index-vector construction — the row loop plus the
+	/// `UInt32Array` it produces.
+	///
+	/// Charged to one of two children by whether this kind's selection can carry
+	/// a null index, because that is exactly what decides whether a plain
+	/// `Vec<u32>` could serve it. One timer around the whole construction, never
+	/// per row, for the same reason the side loops take one apiece.
+	fn time_index_build<T>(
+		self,
+		kind: JoinKind,
+		body: impl FnOnce() -> Result<T, ExecutionError>,
+	) -> Result<T, ExecutionError> {
+		self.time(index_build_slot(kind), body)
+	}
+}
+
+/// Which index-build child a join kind charges.
+///
+/// Matched exhaustively and by the same dispatch `materialize_join_selection`
+/// itself uses, so a new `JoinKind` must state its eligibility rather than
+/// inherit one from a wildcard.
+///
+/// The semi and anti kinds sit with `Inner` and `Cross`, not with the outer
+/// kinds: their arms accept only `LeftPreserved`/`RightPreserved` rows and error
+/// on everything else, so their indices are non-null by construction and the
+/// same substitution serves them. Grouping them with the outer control by family
+/// resemblance would have put eligible work in the arm that exists to prove what
+/// the substitution cannot reach.
+fn index_build_slot(
+	kind: JoinKind,
+) -> fn(&mut crate::distributed::task::TaskTelemetryPhases) -> &mut u64 {
+	match kind {
+		JoinKind::Inner
+		| JoinKind::Cross
+		| JoinKind::LeftSemi
+		| JoinKind::LeftAnti
+		| JoinKind::RightSemi
+		| JoinKind::RightAnti => |phases| &mut phases.join_output_nonnull_index_build_micros,
+
+		JoinKind::LeftOuter | JoinKind::RightOuter | JoinKind::FullOuter => {
+			|phases| &mut phases.join_output_nullable_index_build_micros
+		}
+	}
 }
 
 /// Tracks whether one side's indices form an EXACT contiguous ascending run over
@@ -1753,47 +1797,57 @@ pub(super) fn materialize_join_selection(
 		| JoinKind::LeftOuter
 		| JoinKind::RightOuter
 		| JoinKind::FullOuter => {
-			let mut left_indices = Vec::with_capacity(selection.len());
-			let mut left_run = ContiguousRun::new();
+			let (left_indices, right_indices, left_run, right_run) =
+				side_timing.time_index_build(kind, || {
+					let mut left_indices = Vec::with_capacity(selection.len());
+					let mut left_run = ContiguousRun::new();
 
-			let mut right_indices = Vec::with_capacity(selection.len());
-			let mut right_run = ContiguousRun::new();
+					let mut right_indices = Vec::with_capacity(selection.len());
+					let mut right_run = ContiguousRun::new();
 
-			for row in selection {
-				match *row {
-					JoinOutputRow::Paired { left, right } => {
-						left_indices.push(Some(left));
-						left_run.observe(Some(left));
+					for row in selection {
+						match *row {
+							JoinOutputRow::Paired { left, right } => {
+								left_indices.push(Some(left));
+								left_run.observe(Some(left));
 
-						right_indices.push(Some(right));
-						right_run.observe(Some(right));
+								right_indices.push(Some(right));
+								right_run.observe(Some(right));
+							}
+
+							JoinOutputRow::LeftFillNull { left } => {
+								left_indices.push(Some(left));
+								left_run.observe(Some(left));
+
+								right_indices.push(None);
+								right_run.observe(None);
+							}
+
+							JoinOutputRow::RightFillNull { right } => {
+								left_indices.push(None);
+								left_run.observe(None);
+
+								right_indices.push(Some(right));
+								right_run.observe(Some(right));
+							}
+
+							JoinOutputRow::LeftPreserved { .. }
+							| JoinOutputRow::RightPreserved { .. } => {
+								return Err(invalid_join_selection(kind, row));
+							}
+						}
 					}
 
-					JoinOutputRow::LeftFillNull { left } => {
-						left_indices.push(Some(left));
-						left_run.observe(Some(left));
-
-						right_indices.push(None);
-						right_run.observe(None);
-					}
-
-					JoinOutputRow::RightFillNull { right } => {
-						left_indices.push(None);
-						left_run.observe(None);
-
-						right_indices.push(Some(right));
-						right_run.observe(Some(right));
-					}
-
-					JoinOutputRow::LeftPreserved { .. } | JoinOutputRow::RightPreserved { .. } => {
-						return Err(invalid_join_selection(kind, row));
-					}
-				}
-			}
-
-			let left_indices = UInt32Array::from(left_indices);
-
-			let right_indices = UInt32Array::from(right_indices);
+					// Inside the bracket on purpose: building the `UInt32Array` is
+					// where a null buffer is allocated for indices that may not need
+					// one, and that allocation is the whole subject of the split.
+					Ok((
+						UInt32Array::from(left_indices),
+						UInt32Array::from(right_indices),
+						left_run,
+						right_run,
+					))
+				})?;
 
 			let rows = selection.len();
 			let mut columns =
@@ -1810,21 +1864,23 @@ pub(super) fn materialize_join_selection(
 		}
 
 		JoinKind::LeftSemi | JoinKind::LeftAnti => {
-			let mut left_indices = Vec::with_capacity(selection.len());
-			let mut left_run = ContiguousRun::new();
+			let (left_indices, left_run) = side_timing.time_index_build(kind, || {
+				let mut left_indices = Vec::with_capacity(selection.len());
+				let mut left_run = ContiguousRun::new();
 
-			for row in selection {
-				match *row {
-					JoinOutputRow::LeftPreserved { left } => {
-						left_indices.push(Some(left));
-						left_run.observe(Some(left));
+				for row in selection {
+					match *row {
+						JoinOutputRow::LeftPreserved { left } => {
+							left_indices.push(Some(left));
+							left_run.observe(Some(left));
+						}
+
+						_ => return Err(invalid_join_selection(kind, row)),
 					}
-
-					_ => return Err(invalid_join_selection(kind, row)),
 				}
-			}
 
-			let left_indices = UInt32Array::from(left_indices);
+				Ok((UInt32Array::from(left_indices), left_run))
+			})?;
 
 			let rows = selection.len();
 			let mut columns = Vec::with_capacity(left_batch.num_columns());
@@ -1836,21 +1892,23 @@ pub(super) fn materialize_join_selection(
 		}
 
 		JoinKind::RightSemi | JoinKind::RightAnti => {
-			let mut right_indices = Vec::with_capacity(selection.len());
-			let mut right_run = ContiguousRun::new();
+			let (right_indices, right_run) = side_timing.time_index_build(kind, || {
+				let mut right_indices = Vec::with_capacity(selection.len());
+				let mut right_run = ContiguousRun::new();
 
-			for row in selection {
-				match *row {
-					JoinOutputRow::RightPreserved { right } => {
-						right_indices.push(Some(right));
-						right_run.observe(Some(right));
+				for row in selection {
+					match *row {
+						JoinOutputRow::RightPreserved { right } => {
+							right_indices.push(Some(right));
+							right_run.observe(Some(right));
+						}
+
+						_ => return Err(invalid_join_selection(kind, row)),
 					}
-
-					_ => return Err(invalid_join_selection(kind, row)),
 				}
-			}
 
-			let right_indices = UInt32Array::from(right_indices);
+				Ok((UInt32Array::from(right_indices), right_run))
+			})?;
 
 			let rows = selection.len();
 			let mut columns = Vec::with_capacity(right_batch.num_columns());
@@ -3662,6 +3720,169 @@ mod slice_fast_path_tests {
 		assert!(
 			join_slice_equivalence_columns_verified() > before,
 			"a verified column must advance the tally"
+		);
+	}
+}
+
+#[cfg(test)]
+mod index_build_split_tests {
+	use super::*;
+	use crate::distributed::task::TaskTelemetry;
+	use arrow::array::Int64Array;
+	use arrow::datatypes::{DataType, Field, Schema};
+	use std::sync::Arc as StdArc;
+
+	/// Enough rows that the construction rounds above a microsecond on any host.
+	/// A handful of rows would leave both counters at zero, and a test that cannot
+	/// tell a charged counter from an untouched one proves nothing about either.
+	const ROWS: usize = 100_000;
+
+	const SOURCE_ROWS: u32 = 8;
+
+	fn source(prefix: &str) -> RecordBatch {
+		let schema = StdArc::new(Schema::new(vec![Field::new(
+			format!("{prefix}_id"),
+			DataType::Int64,
+			true,
+		)]));
+		RecordBatch::try_new(
+			schema,
+			vec![StdArc::new(Int64Array::from_iter_values(
+				0..i64::from(SOURCE_ROWS),
+			))],
+		)
+		.expect("fixture batch")
+	}
+
+	/// Gather under `timing` and report `(nonnull, nullable)` index-build micros.
+	fn charged(kind: JoinKind, selection: &[JoinOutputRow], charge: bool) -> (u64, u64) {
+		let left = source("l");
+		let right = source("r");
+		let fields = match kind {
+			JoinKind::LeftSemi | JoinKind::LeftAnti => left.schema().fields().to_vec(),
+			JoinKind::RightSemi | JoinKind::RightAnti => right.schema().fields().to_vec(),
+			_ => {
+				let mut fields = left.schema().fields().to_vec();
+				fields.extend(right.schema().fields().iter().cloned());
+				fields
+			}
+		};
+		let schema = StdArc::new(Schema::new(fields));
+		let slot: Option<Arc<Mutex<TaskTelemetry>>> =
+			Some(Arc::new(Mutex::new(TaskTelemetry::default())));
+		let timing = if charge {
+			SideTakeTiming::Charged(&slot)
+		} else {
+			SideTakeTiming::AccountedElsewhere
+		};
+		materialize_join_selection(kind, &left, &right, selection, &schema, u64::MAX, timing)
+			.expect("materialize");
+		let guard = slot.as_ref().unwrap().lock().unwrap();
+		(
+			guard.phases.join_output_nonnull_index_build_micros,
+			guard.phases.join_output_nullable_index_build_micros,
+		)
+	}
+
+	fn paired() -> Vec<JoinOutputRow> {
+		(0..ROWS)
+			.map(|row| {
+				let index = (row % SOURCE_ROWS as usize) as u32;
+				JoinOutputRow::Paired {
+					left: index,
+					right: index,
+				}
+			})
+			.collect()
+	}
+
+	/// An eligible kind charges the non-null child and leaves the control at rest.
+	#[test]
+	fn an_inner_gather_charges_only_the_nonnull_index_child() {
+		let (nonnull, nullable) = charged(JoinKind::Inner, &paired(), true);
+
+		assert!(
+			nonnull > 0,
+			"an Inner gather builds indices a plain Vec<u32> could serve, so the \
+			 eligible child must carry it"
+		);
+		assert_eq!(
+			nullable, 0,
+			"eligible construction must not land in the control arm: the control \
+			 exists to price what the substitution cannot reach, and a shared \
+			 counter would answer neither question"
+		);
+	}
+
+	/// An outer kind charges the control, which the substitution cannot serve.
+	#[test]
+	fn an_outer_gather_charges_only_the_nullable_index_child() {
+		let mut selection = paired();
+		for row in selection.iter_mut().step_by(5) {
+			*row = JoinOutputRow::LeftFillNull { left: 0 };
+		}
+		let (nonnull, nullable) = charged(JoinKind::LeftOuter, &selection, true);
+
+		assert!(nullable > 0, "a LeftOuter gather must charge the control");
+		assert_eq!(nonnull, 0, "a nullable build is not an eligible one");
+	}
+
+	/// The discriminating case: eligibility is a property of the KIND, not of the
+	/// rows that happened to arrive.
+	///
+	/// A `LeftOuter` selection can be entirely `Paired` — no null reaches the
+	/// index vector — and it is still ineligible, because the arm cannot know
+	/// that before it builds. Charging by observed nulls would pass every other
+	/// test here while crediting the substitution with time it could never
+	/// remove, which is the failure that would make the whole measurement lie in
+	/// the optimistic direction.
+	#[test]
+	fn an_outer_gather_without_nulls_still_charges_the_control() {
+		let (nonnull, nullable) = charged(JoinKind::LeftOuter, &paired(), true);
+
+		assert!(
+			nullable > 0,
+			"an all-paired LeftOuter still builds a nullable index vector"
+		);
+		assert_eq!(
+			nonnull, 0,
+			"charging by the rows observed rather than by the kind would report \
+			 this as eligible and overstate the prize"
+		);
+	}
+
+	/// Semi and anti sit with the eligible kinds, not with the outer control.
+	///
+	/// Their arms accept only preserved rows and error on everything else, so
+	/// their indices are non-null by construction and the same substitution
+	/// serves them. Grouping them with the outer kinds by family resemblance
+	/// would have hidden eligible work inside the control.
+	#[test]
+	fn a_semi_gather_charges_the_nonnull_index_child() {
+		let selection: Vec<JoinOutputRow> = (0..ROWS)
+			.map(|row| JoinOutputRow::LeftPreserved {
+				left: (row % SOURCE_ROWS as usize) as u32,
+			})
+			.collect();
+		let (nonnull, nullable) = charged(JoinKind::LeftSemi, &selection, true);
+
+		assert!(nonnull > 0, "a LeftSemi index vector carries no nulls");
+		assert_eq!(nullable, 0);
+	}
+
+	/// The spilled and streaming callers charge neither child.
+	///
+	/// Same boundary the side timers keep: those gathers already run inside the
+	/// Spill and operator brackets, so charging them here would attribute one
+	/// span to two accounting families.
+	#[test]
+	fn an_uncharged_gather_records_neither_child() {
+		let (nonnull, nullable) = charged(JoinKind::Inner, &paired(), false);
+
+		assert_eq!(
+			(nonnull, nullable),
+			(0, 0),
+			"AccountedElsewhere must stay silent on both children"
 		);
 	}
 }
