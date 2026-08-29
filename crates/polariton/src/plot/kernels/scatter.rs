@@ -517,7 +517,9 @@ impl ScatterMarkRenderer {
 	}
 
 	/// The whole-key form: compute the key, then hit or build. Reuse needs the
-	/// key before deciding, so the two steps are separate above.
+	/// key before deciding, so production keeps the two steps separate above.
+	/// Tests use this convenience wrapper to exercise cache identity directly.
+	#[cfg(test)]
 	fn rasterize(
 		&self,
 		bounds: Rectangle,
