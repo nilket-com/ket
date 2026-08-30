@@ -109,3 +109,58 @@ The bench prices that pipeline end to end against the current one — concat, ke
 gather or fold — at q09/q08/q17 shapes, reporting phase times, output batch count and peak
 memory. Not index arithmetic: the last forecast this line took from a component bench was
 falsified in direction.
+
+## The batch-local pipeline, priced - `f34bd6f8`
+
+ADR 580 clause 4 required the whole replacement path priced before any code. Bench
+`join_input_pipeline_shape`, release, host settled with `nilket-local.service` stopped,
+three interleaved replicates per arm, `ArrayData` equality checked outside the timed region
+on the first replicate of every case.
+
+Shapes are ONE INVOCATION of the hot cells - 4 batches x 4.2 M / 7.15 M / 12 M rows - not a
+task total the engine never concatenates in one call.
+
+| shape | kind | arm | concat | probe | gather | total | out | peak MB |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| q08-like | inner | current | 204.6 | 428.6 | 290.7 | **923.9** | 1 | 1,666 |
+| q08-like | inner | candidate | 0.0 | 296.1 | 275.8 | **572.0** | 4 | 497 |
+| q09-like | inner | current | 340.6 | 629.1 | 502.9 | **1,472.7** | 1 | 2,566 |
+| q09-like | inner | candidate | 0.0 | 463.4 | 461.7 | **925.1** | 4 | 778 |
+| q17-like | inner | current | 563.8 | 1,059.9 | 805.7 | **2,429.5** | 1 | 4,430 |
+| q17-like | inner | candidate | 0.0 | 766.3 | 801.6 | **1,567.9** | 4 | 1,336 |
+| q09-like | leftouter | current | 343.1 | 661.1 | 502.2 | **1,506.4** | 1 | 2,566 |
+| q09-like | leftouter | candidate | 0.0 | 487.3 | 458.3 | **945.6** | 4 | 778 |
+
+(q08 and q17 `leftouter` behave as q09's does: 939.4 -> 584.7 and 2,479.8 -> 1,624.9.)
+
+**The candidate wins on every shape and both kinds: -35% to -38% of pipeline time and
+-70% of peak memory.** The join-wide-state case costs it 10-20 ms more than `Inner` -
+the hoisted bitmap and its deferred finalization are cheap, measured rather than argued.
+
+### Where the win comes from, and one part of it is not the concat
+
+Removing the concatenation is 204.6-563.8 ms of it. The rest - and it is the larger
+share - is the **probe phase, 31% faster in the candidate on every shape**. That is not a
+locality claim: the current arm grows ONE selection vector to the full output length while
+the candidate reuses a per-batch vector across four passes, so much of the difference is
+allocation growth, and the bench does not separate the two. The engine's real path has the
+same asymmetry, so the effect is real; its cause is not established here.
+
+Gather is unchanged (within 5%), as it must be - the same rows are gathered either way.
+
+### What this does NOT establish
+
+- **Model, not engine.** The join internals are `pub(super)`; both arms share a faithful
+  model of the path. Absolute milliseconds are model numbers and the delta is the decision
+  input, not a board forecast.
+- **Key derivation is priced at zero.** `derive_keys` is a column clone here, so the
+  candidate's four key derivations cost nothing. Real `key_arrays` work - multi-column
+  keys, null-safe handling - would be paid four times instead of once, and this bench says
+  nothing about it.
+- **The wider output is not consumed.** The candidate returns 4 batches where the current
+  path returns 1. Nothing downstream runs here, so the cost of that shape change is
+  recorded as a fact and not as a price.
+- **The board term is the concat only.** `join_input_materialization_micros` names 6,424.8
+  ms; the probe and gather phases live in other counters. A board claim from this bench
+  would be that removing the concatenation removes up to that term - not the 35% total the
+  model shows, which spans phases this record does not own.
