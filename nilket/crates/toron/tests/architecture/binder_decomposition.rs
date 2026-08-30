@@ -460,6 +460,10 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// executor telemetry, carved out of the executor root to keep ADR 354's
 				// bound spent on evaluator logic. It owns no binder decomposition surface.
 				"crates/toron/src/exec/input_processing.rs",
+				// ADR 580: the join input pipeline bench. A benchmark, not a runtime
+				// surface — it models the probe path to price a design and owns no
+				// binder decomposition surface.
+				"crates/toron/benches/join_input_pipeline_shape.rs",
 				// ADR 554 output-materialization line: the join output gather machinery —
 				// run tracking, the lazy index build, the slice fast path and its
 				// equivalence check — carved out of the join root behaviour-unchanged, for

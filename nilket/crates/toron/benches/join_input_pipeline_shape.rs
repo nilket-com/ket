@@ -362,12 +362,25 @@ fn current_arm(
 /// The candidate: no concatenation. Each probe batch derives its own keys,
 /// probes, and materializes with batch-local rows; the matched-build bitmap
 /// outlives the loop and its unmatched rows are emitted once, at the end.
+///
+/// `reuse_selection` is the third arm, and it is not a detail. True allocates
+/// the selection vector once and clears it per batch, keeping its capacity;
+/// false allocates a fresh vector per batch and regrows it from nothing — which
+/// is what `probe_in_memory_join_rows` does today, because it owns and returns
+/// its output vector.
+///
+/// The engine cut measured at `14e87160` was therefore the FALSE arm, while the
+/// candidate this bench priced — the one that earned authorization — was the
+/// TRUE one. The two were never separated, so the engine's +2,370.9 ms of probe
+/// time has never been attributed to either the batch-local structure or the
+/// allocation it accidentally introduced. This isolates them.
 fn batch_local_arm(
 	kind: Kind,
 	build: &RecordBatch,
 	table: &HashMap<i64, Vec<u32>>,
 	batches: &[RecordBatch],
 	out_schema: &SchemaRef,
+	reuse_selection: bool,
 ) -> (Phases, Vec<RecordBatch>) {
 	let baseline = reset_peak();
 	let mut phases = Phases::default();
@@ -383,7 +396,13 @@ fn batch_local_arm(
 		phases.keys += keys_started.elapsed();
 
 		let probe_started = Instant::now();
-		selection.clear();
+		if reuse_selection {
+			selection.clear();
+		} else {
+			// A fresh vector per batch — the allocation and regrowth the engine
+			// pays, because its probe function creates the `Vec` it returns.
+			selection = Vec::new();
+		}
 		probe(table, &keys, matched.as_deref_mut(), &mut selection);
 		phases.probe += probe_started.elapsed();
 
@@ -462,28 +481,38 @@ fn main() {
 
 		for kind in [Kind::Inner, Kind::LeftOuter] {
 			let mut current_runs = Vec::with_capacity(REPLICATES);
-			let mut candidate_runs = Vec::with_capacity(REPLICATES);
+			let mut reused_runs = Vec::with_capacity(REPLICATES);
+			let mut fresh_runs = Vec::with_capacity(REPLICATES);
 
 			for replicate in 0..REPLICATES {
 				// Interleaved, not batched by arm: a machine that drifts during the
-				// run drifts through both arms rather than through one.
+				// run drifts through all three arms rather than through one.
 				let (current, current_output) =
 					current_arm(kind, &build, &table, &batches, &probe_schema, &out_schema);
-				let (candidate, candidate_output) =
-					batch_local_arm(kind, &build, &table, &batches, &out_schema);
+				let (reused, reused_output) =
+					batch_local_arm(kind, &build, &table, &batches, &out_schema, true);
+				let (fresh, fresh_output) =
+					batch_local_arm(kind, &build, &table, &batches, &out_schema, false);
 
 				if replicate == 0 {
-					assert_same_rows(&current_output, &candidate_output, &out_schema);
+					assert_same_rows(&current_output, &reused_output, &out_schema);
+					// The allocation strategy must not change a single row: if it
+					// did, the two arms would be measuring different work and the
+					// comparison would mean nothing.
+					assert_same_rows(&current_output, &fresh_output, &out_schema);
 				}
 				black_box(&current_output);
-				black_box(&candidate_output);
+				black_box(&reused_output);
+				black_box(&fresh_output);
 				current_runs.push(current);
-				candidate_runs.push(candidate);
+				reused_runs.push(reused);
+				fresh_runs.push(fresh);
 			}
 
 			for (arm, phases) in [
 				("current", median(current_runs)),
-				("candidate", median(candidate_runs)),
+				("reused-vec", median(reused_runs)),
+				("fresh-vec", median(fresh_runs)),
 			] {
 				let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
 				println!(
