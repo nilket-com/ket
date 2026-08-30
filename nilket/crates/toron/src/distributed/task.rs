@@ -119,6 +119,10 @@ pub struct TaskTelemetry {
 	/// aggregated over this task. Zero invocations means no join gathered here.
 	#[serde(default)]
 	pub join_selection_locality: JoinSelectionLocalitySides,
+	/// ADR 580: the shape of what each side handed to its input concatenation,
+	/// per invocation rather than only in total.
+	#[serde(default)]
+	pub join_input_shape: JoinInputShapeSides,
 }
 
 /// Run-length structure of one side of a join's output selection, accumulated
@@ -221,6 +225,61 @@ impl JoinSelectionLocality {
 pub struct JoinSelectionLocalitySides {
 	pub left: JoinSelectionLocality,
 	pub right: JoinSelectionLocality,
+}
+
+/// Per-invocation shape of a join input concatenation, accumulated over a task.
+///
+/// ADR 580. Totals alone cannot decide that record's gate: a task reporting 400
+/// batches could be one 400-batch concat or 400 single-batch ones, which point at
+/// opposite projects. `concats` and `concats_at_least` give the distribution the
+/// totals cannot, and the timing children say which shape the time belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinInputShape {
+	/// Concatenations of this side, including empty ones.
+	pub concats: u64,
+	/// Concatenations that received no batch at all. Held apart so a zero in the
+	/// `>= 1` bucket cannot be read as "this side was never concatenated".
+	pub empty_concats: u64,
+	pub batches: u64,
+	pub rows: u64,
+	/// Slice bytes, never allocation bytes: shuffle and scan inputs are routinely
+	/// slices of a larger buffer, and the allocation is not what a concat copies.
+	pub bytes: u64,
+	/// Concatenations whose batch count reached
+	/// `INPUT_BATCH_COUNT_BUCKET_MINIMUMS[i]`. Buckets, not a mean: the decision is
+	/// whether multi-batch inputs exist and carry the time, and a mean of 400 and
+	/// 1 hides both answers.
+	pub concats_at_least: [u64; INPUT_BATCH_COUNT_BUCKETS],
+}
+
+/// Batch-count thresholds for [`JoinInputShape::concats_at_least`].
+pub const INPUT_BATCH_COUNT_BUCKET_MINIMUMS: [u64; INPUT_BATCH_COUNT_BUCKETS] =
+	[1, 2, 4, 8, 16, 64];
+
+pub const INPUT_BATCH_COUNT_BUCKETS: usize = 6;
+
+impl JoinInputShape {
+	/// Fold one concatenation into this side.
+	pub fn observe(&mut self, batches: u64, rows: u64, bytes: u64) {
+		self.concats = self.concats.saturating_add(1);
+		if batches == 0 {
+			self.empty_concats = self.empty_concats.saturating_add(1);
+		}
+		self.batches = self.batches.saturating_add(batches);
+		self.rows = self.rows.saturating_add(rows);
+		self.bytes = self.bytes.saturating_add(bytes);
+		for (bucket, minimum) in INPUT_BATCH_COUNT_BUCKET_MINIMUMS.iter().enumerate() {
+			if batches >= *minimum {
+				self.concats_at_least[bucket] = self.concats_at_least[bucket].saturating_add(1);
+			}
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinInputShapeSides {
+	pub left: JoinInputShape,
+	pub right: JoinInputShape,
 }
 
 /// Publication state for ADR 551's task-local phase partition.
@@ -507,27 +566,6 @@ pub struct TaskTelemetryCounters {
 	/// walked, and the ratio is the deferral's coverage.
 	#[serde(default)]
 	pub join_output_index_rows_materialized: u64,
-	/// Shape of what each side handed to its input concatenation: batches, rows
-	/// and the bytes those rows actually occupy.
-	///
-	/// Three counters per side because they answer different questions and a
-	/// multi-batch redesign is priced by all three: batch count bounds what
-	/// re-chunking could remove, rows scale the per-row cost, bytes are what the
-	/// copy moves. Bytes come from `get_slice_memory_size`, never
-	/// `get_array_memory_size` — shuffle and scan inputs are routinely slices of a
-	/// larger allocation, and the allocation is not what gets copied.
-	#[serde(default)]
-	pub join_input_left_batches: u64,
-	#[serde(default)]
-	pub join_input_left_rows: u64,
-	#[serde(default)]
-	pub join_input_left_bytes: u64,
-	#[serde(default)]
-	pub join_input_right_batches: u64,
-	#[serde(default)]
-	pub join_input_right_rows: u64,
-	#[serde(default)]
-	pub join_input_right_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -608,22 +646,31 @@ pub struct TaskTelemetryPhases {
 	/// naming this time shrinks the residual by exactly the same amount.
 	#[serde(default)]
 	pub join_input_materialization_micros: u64,
-	/// Time inside `join_input_materialization_micros` spent concatenating the
-	/// LEFT input, and below it the RIGHT.
+	/// Time inside `join_input_materialization_micros`, split by SIDE and by the
+	/// SHAPE of the concatenation that spent it.
 	///
 	/// Nested children on the same terms as the output side split: inside the
 	/// parent bracket, absent from `recompute_framework_overhead`, charged from
-	/// the SAME clock read as the parent so a child cannot drift from it.
+	/// the SAME clock read as the parent so a child cannot drift from it. The
+	/// four partition the parent exactly.
 	///
-	/// The two inputs are not one quantity. The left side is the build input,
-	/// held for the whole probe; the right is the probe input, streamed past
-	/// once. Whether building or probing directly over multiple batches is worth
-	/// a structural API change depends on which of them the 7,146 ms is, and the
-	/// single parent counter cannot say.
+	/// Two axes because ADR 580's gate needs both. The sides are different work —
+	/// the left input is the build side, held for the whole probe; the right is
+	/// the probe side, streamed past once — and only a side that is BOTH large
+	/// and genuinely multi-batch justifies an addressing change. A single-batch
+	/// concatenation is already a zero-copy wrapper in arrow
+	/// (`benches/join_materialization_shape.rs`), so time sitting in the
+	/// single-batch children is not copy cost and cannot be removed by consuming
+	/// batches directly; a split that could not tell the two apart would read
+	/// wrapper overhead as evidence for a rewrite.
 	#[serde(default)]
-	pub join_input_left_concat_micros: u64,
+	pub join_input_left_single_batch_micros: u64,
 	#[serde(default)]
-	pub join_input_right_concat_micros: u64,
+	pub join_input_left_multi_batch_micros: u64,
+	#[serde(default)]
+	pub join_input_right_single_batch_micros: u64,
+	#[serde(default)]
+	pub join_input_right_multi_batch_micros: u64,
 	/// Time spent gathering a join's selected rows into the output batch, in
 	/// `materialize_join_selection`. Charged at the generic sites only — the
 	/// spilled and streaming paths already run theirs inside the Spill and

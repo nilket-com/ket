@@ -94,28 +94,23 @@ pub(super) fn time_join_input_materialization<T>(
 			.phases
 			.join_input_materialization_micros
 			.saturating_add(elapsed);
-		let child = match side {
-			JoinInputSide::Left => &mut task.phases.join_input_left_concat_micros,
-			JoinInputSide::Right => &mut task.phases.join_input_right_concat_micros,
+		// Charged by side AND by shape, because ADR 580's gate asks both. A concat
+		// of one batch is arrow's zero-copy wrapper, so its time is not copy cost
+		// and no multi-batch design removes it; folding it in with the rest would
+		// let wrapper overhead argue for a rewrite.
+		let child = match (side, shape.batches > 1) {
+			(JoinInputSide::Left, false) => &mut task.phases.join_input_left_single_batch_micros,
+			(JoinInputSide::Left, true) => &mut task.phases.join_input_left_multi_batch_micros,
+			(JoinInputSide::Right, false) => &mut task.phases.join_input_right_single_batch_micros,
+			(JoinInputSide::Right, true) => &mut task.phases.join_input_right_multi_batch_micros,
 		};
 		*child = child.saturating_add(elapsed);
 
-		let counters = &mut task.counters;
-		let (batches_slot, rows_slot, bytes_slot) = match side {
-			JoinInputSide::Left => (
-				&mut counters.join_input_left_batches,
-				&mut counters.join_input_left_rows,
-				&mut counters.join_input_left_bytes,
-			),
-			JoinInputSide::Right => (
-				&mut counters.join_input_right_batches,
-				&mut counters.join_input_right_rows,
-				&mut counters.join_input_right_bytes,
-			),
+		let side_shape = match side {
+			JoinInputSide::Left => &mut task.join_input_shape.left,
+			JoinInputSide::Right => &mut task.join_input_shape.right,
 		};
-		*batches_slot = batches_slot.saturating_add(shape.batches);
-		*rows_slot = rows_slot.saturating_add(shape.rows);
-		*bytes_slot = bytes_slot.saturating_add(shape.bytes);
+		side_shape.observe(shape.batches, shape.rows, shape.bytes);
 	});
 	outcome
 }
@@ -123,7 +118,7 @@ pub(super) fn time_join_input_materialization<T>(
 #[cfg(test)]
 mod input_side_split_tests {
 	use super::*;
-	use crate::distributed::task::TaskTelemetry;
+	use crate::distributed::task::{INPUT_BATCH_COUNT_BUCKET_MINIMUMS, TaskTelemetry};
 	use arrow::array::Int64Array;
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::sync::Arc as StdArc;
@@ -148,7 +143,6 @@ mod input_side_split_tests {
 		}
 		Ok(total)
 	}
-
 	/// Each side charges its own child, and both charge the parent.
 	///
 	/// The zero on the other side is the discriminating half: a shared timer would
@@ -157,84 +151,158 @@ mod input_side_split_tests {
 	#[test]
 	fn each_side_charges_its_own_child_and_the_shared_parent() {
 		let task = slot();
-		time_join_input_materialization(&task, JoinInputSide::Left, &[batch(4)], busy)
+		time_join_input_materialization(&task, JoinInputSide::Left, &[batch(4), batch(4)], busy)
 			.expect("left concat");
-		let (parent, left, right) = {
+		let (parent, left) = {
 			let guard = task.as_ref().unwrap().lock().unwrap();
 			(
 				guard.phases.join_input_materialization_micros,
-				guard.phases.join_input_left_concat_micros,
-				guard.phases.join_input_right_concat_micros,
+				guard.phases.join_input_left_multi_batch_micros,
 			)
 		};
 		assert!(left > 0, "the left concat must charge the left child");
-		assert_eq!(right, 0, "it must not charge the right child");
 		assert_eq!(
 			parent, left,
 			"one clock read charges both, so a single-sided task's parent equals \
 			 its child exactly"
 		);
 
-		time_join_input_materialization(&task, JoinInputSide::Right, &[batch(4)], busy)
+		time_join_input_materialization(&task, JoinInputSide::Right, &[batch(4), batch(4)], busy)
 			.expect("right concat");
 		let guard = task.as_ref().unwrap().lock().unwrap();
-		assert!(guard.phases.join_input_right_concat_micros > 0);
+		assert!(guard.phases.join_input_right_multi_batch_micros > 0);
 		assert_eq!(
-			guard.phases.join_input_left_concat_micros, left,
+			guard.phases.join_input_left_multi_batch_micros, left,
 			"the right concat must not move the left child"
 		);
 		assert_eq!(
 			guard.phases.join_input_materialization_micros,
-			guard.phases.join_input_left_concat_micros
-				+ guard.phases.join_input_right_concat_micros,
-			"the two children partition their parent when every site is charged"
+			guard.phases.join_input_left_multi_batch_micros
+				+ guard.phases.join_input_right_multi_batch_micros,
+			"the children partition their parent when every site is charged"
 		);
 	}
 
-	/// The shape counters record what the concat consumed, per side.
+	/// Shape decides the child, not just the side.
+	///
+	/// This is the correction ADR 580 needed before it could run: a single-batch
+	/// concatenation is arrow's zero-copy wrapper, so its time is not copy cost
+	/// and no multi-batch design removes it. A split that charged both shapes to
+	/// one counter would let wrapper overhead argue for an addressing change.
 	#[test]
-	fn the_shape_counters_record_batches_rows_and_bytes_per_side() {
+	fn single_and_multi_batch_concats_charge_different_children() {
 		let task = slot();
-		let inputs = [batch(4), batch(6), batch(10)];
-		time_join_input_materialization(&task, JoinInputSide::Left, &inputs, busy)
-			.expect("left concat");
+		time_join_input_materialization(&task, JoinInputSide::Left, &[batch(8)], busy)
+			.expect("single-batch concat");
+		let single = {
+			let guard = task.as_ref().unwrap().lock().unwrap();
+			assert!(
+				guard.phases.join_input_left_single_batch_micros > 0,
+				"a one-batch concat charges the single-batch child"
+			);
+			assert_eq!(
+				guard.phases.join_input_left_multi_batch_micros, 0,
+				"and never the multi-batch one"
+			);
+			guard.phases.join_input_left_single_batch_micros
+		};
 
+		time_join_input_materialization(&task, JoinInputSide::Left, &[batch(4), batch(4)], busy)
+			.expect("multi-batch concat");
 		let guard = task.as_ref().unwrap().lock().unwrap();
-		assert_eq!(guard.counters.join_input_left_batches, 3);
-		assert_eq!(guard.counters.join_input_left_rows, 20);
-		assert!(
-			guard.counters.join_input_left_bytes >= 20 * 8,
-			"20 Int64 rows are at least 160 bytes; got {}",
-			guard.counters.join_input_left_bytes
+		assert!(guard.phases.join_input_left_multi_batch_micros > 0);
+		assert_eq!(
+			guard.phases.join_input_left_single_batch_micros, single,
+			"a multi-batch concat must not move the single-batch child"
 		);
+	}
+
+	/// The shape record is per invocation, not only per task.
+	///
+	/// A task total of four batches could be one four-batch concat or four
+	/// single-batch ones, and those point at opposite projects. `concats` and the
+	/// bucket histogram are what separate them.
+	#[test]
+	fn the_shape_record_distinguishes_one_wide_concat_from_many_narrow_ones() {
+		let wide = slot();
+		time_join_input_materialization(
+			&wide,
+			JoinInputSide::Left,
+			&[batch(1), batch(1), batch(1), batch(1)],
+			busy,
+		)
+		.expect("wide concat");
+
+		let narrow = slot();
+		for _ in 0..4 {
+			time_join_input_materialization(&narrow, JoinInputSide::Left, &[batch(1)], busy)
+				.expect("narrow concat");
+		}
+
+		let wide_shape = wide.as_ref().unwrap().lock().unwrap().join_input_shape.left;
+		let narrow_shape = narrow
+			.as_ref()
+			.unwrap()
+			.lock()
+			.unwrap()
+			.join_input_shape
+			.left;
+
+		assert_eq!(
+			(wide_shape.batches, narrow_shape.batches),
+			(4, 4),
+			"the totals are identical, which is the whole problem"
+		);
+		assert_eq!((wide_shape.concats, narrow_shape.concats), (1, 4));
 		assert_eq!(
 			(
-				guard.counters.join_input_right_batches,
-				guard.counters.join_input_right_rows,
-				guard.counters.join_input_right_bytes
+				wide_shape.concats_at_least[2],
+				narrow_shape.concats_at_least[2]
 			),
-			(0, 0, 0),
-			"a left concat records nothing on the right side"
+			(1, 0),
+			"only the wide task has a concat of >= 4 batches; buckets are \
+			 {INPUT_BATCH_COUNT_BUCKET_MINIMUMS:?}"
 		);
 	}
 
-	/// A single batch is still a concatenation that was asked for, and is counted.
-	///
-	/// The one-batch case is where a multi-batch design would save the most —
-	/// `concat` of a single batch is a copy that buys nothing — so a counter that
-	/// skipped it would hide the clearest evidence for the redesign.
+	/// The reconciliation guard: every concat lands in the buckets or is empty.
 	#[test]
-	fn a_single_batch_input_is_still_recorded() {
+	fn bucket_counts_reconcile_with_the_invocation_count() {
 		let task = slot();
-		time_join_input_materialization(&task, JoinInputSide::Right, &[batch(8)], busy)
-			.expect("right concat");
+		for batches in [0usize, 1, 2, 5, 9] {
+			let inputs: Vec<RecordBatch> = (0..batches).map(|_| batch(2)).collect();
+			time_join_input_materialization(&task, JoinInputSide::Right, &inputs, busy)
+				.expect("concat");
+		}
 
-		let guard = task.as_ref().unwrap().lock().unwrap();
-		assert_eq!(guard.counters.join_input_right_batches, 1);
-		assert_eq!(guard.counters.join_input_right_rows, 8);
+		let shape = task
+			.as_ref()
+			.unwrap()
+			.lock()
+			.unwrap()
+			.join_input_shape
+			.right;
+		assert_eq!(shape.concats, 5);
+		assert_eq!(shape.empty_concats, 1);
+		assert_eq!(
+			shape.concats_at_least[0] + shape.empty_concats,
+			shape.concats,
+			"every concat either reached one batch or was empty; a shortfall means \
+			 an invocation was counted in neither"
+		);
+		assert_eq!(shape.batches, 17);
+		assert_eq!(
+			(
+				shape.concats_at_least[1],
+				shape.concats_at_least[2],
+				shape.concats_at_least[3]
+			),
+			(3, 2, 1),
+			"three concats of >= 2 batches, two of >= 4, one of >= 8"
+		);
 	}
 
-	/// An empty input records a zero-batch concat, not nothing at all.
+	/// An empty input records a concat that happened, with no batches in it.
 	#[test]
 	fn an_empty_input_records_zero_batches_and_still_charges_time() {
 		let task = slot();
@@ -242,16 +310,42 @@ mod input_side_split_tests {
 			.expect("empty concat");
 
 		let guard = task.as_ref().unwrap().lock().unwrap();
+		let shape = guard.join_input_shape.left;
 		assert_eq!(
-			(
-				guard.counters.join_input_left_batches,
-				guard.counters.join_input_left_rows
-			),
-			(0, 0)
+			(shape.concats, shape.empty_concats, shape.batches),
+			(1, 1, 0)
 		);
 		assert!(
-			guard.phases.join_input_left_concat_micros > 0,
-			"an empty concat still ran inside the task wall"
+			guard.phases.join_input_left_single_batch_micros > 0,
+			"an empty concat still ran inside the task wall, and it is not \
+			 multi-batch work"
+		);
+	}
+
+	/// Bytes are recorded per side, from slice sizes.
+	#[test]
+	fn the_shape_record_carries_rows_and_slice_bytes() {
+		let task = slot();
+		time_join_input_materialization(
+			&task,
+			JoinInputSide::Left,
+			&[batch(4), batch(6), batch(10)],
+			busy,
+		)
+		.expect("left concat");
+
+		let guard = task.as_ref().unwrap().lock().unwrap();
+		let left = guard.join_input_shape.left;
+		assert_eq!((left.batches, left.rows), (3, 20));
+		assert!(
+			left.bytes >= 20 * 8,
+			"20 Int64 rows are at least 160 bytes; got {}",
+			left.bytes
+		);
+		assert_eq!(
+			guard.join_input_shape.right,
+			Default::default(),
+			"a left concat records nothing on the right side"
 		);
 	}
 
@@ -270,6 +364,6 @@ mod input_side_split_tests {
 
 		let guard = task.as_ref().unwrap().lock().unwrap();
 		assert!(guard.phases.join_input_materialization_micros > 0);
-		assert!(guard.phases.join_input_right_concat_micros > 0);
+		assert!(guard.phases.join_input_right_single_batch_micros > 0);
 	}
 }
