@@ -164,3 +164,72 @@ Gather is unchanged (within 5%), as it must be - the same rows are gathered eith
   ms; the probe and gather phases live in other counters. A board claim from this bench
   would be that removing the concatenation removes up to that term - not the 35% total the
   model shows, which spans phases this record does not own.
+
+## The batch-local probe route: authorized, measured, rejected - `14e87160`, reverted in `b94981d8`
+
+ADR 580 fixed a retention rule before any timing existed. The cut missed it, and is gone.
+
+### Phase 1, equivalence - passed
+
+`adr580_batch_local_equivalence_sf8.jsonl.partial`, build `14e8716061f4`, binary mtime
+1788058265. 21/21 finalized, no replay violations, 336/336 child attempts valid and
+identity-matching, `timing_authority: false` with `join_diagnostics_enabled` as the sole
+withheld reason. **3,032 output columns verified** against the concatenated route, zero
+mismatches, zero row-count gaps. Post-admission declines: **0**.
+
+Route receipts, per pair: 28 batch-local joins against 78 concatenated, 106 output batches,
+21.4 GB of concatenation avoided. The route fires on q08 (6), q02 (5), q09 (4), q05 (3) and
+singly on eight more cells; never on q04, q12, q13, q14, q16, q22. Coverage is narrower than
+the multi-batch concat population because the route also requires `Inner` and an in-memory
+build.
+
+An earlier attempt at this run was killed externally at q06 and is retained separately as
+`adr580_batch_local_equivalence_killed_q06_sf8.jsonl.partial`. It is not the pass.
+
+### Phase 2, authoritative - FAILED the retention rule
+
+`adr580_batch_local_sf8.jsonl`, same build, `timing_authority: true`, 21/21, no replay
+violations, declines **0**. Served nodes are receipt-confirmed; comparability against the
+`08e06751` baseline: mean 1.046 (0.879-1.347).
+
+| term, 14 served nodes | before | after | delta |
+|---|---:|---:|---:|
+| input concatenation | 6,185.7 | 354.7 | **-5,831.0** |
+| **operator (build + probe)** | 50,496.9 | 52,867.8 | **+2,370.9** |
+| output materialization | 2,669.7 | 2,396.3 | -273.4 |
+| framework overhead | 2,078.6 | 1,835.5 | -243.1 |
+| **wall** | 98,355.4 | 98,024.3 | **-331.1** |
+
+**Two conditions failed.** Served-node wall improved **331.1 ms against a fixed 500 ms
+threshold**, and **q09 regressed** (+301.9 ms on its served node: input -2,061.9, operator
++839.1). q08 passed (-780.4).
+
+The 175 fallback nodes are the unchanged-path control and drifted **+6.3%** on wall, so the
+served nodes did beat contemporaneous drift. Reading the rule as drift-adjusted after seeing
+the miss would be the post-hoc weakening this line has refused elsewhere, and a quieter
+rerun would be result-shopping. The cut is rejected on the rule as written.
+
+Facts, not benefits: 106 output batches where the concatenating route returned one per join,
+and 21.4 GB of concatenation avoided.
+
+### What the A/B actually falsified - and what it did not
+
+**The implementation was not the design that earned authorization.** The benchmarked
+candidate reused one selection vector across probe batches, clearing it per batch and
+keeping its capacity. `probe_in_memory_join_rows_profiled` allocates
+`let mut selection = Vec::new()` per call and returns it, so the engine route allocated and
+regrew a fresh vector per batch. That component of the priced candidate was silently dropped
+in implementation, and it was not noticed until the operator read the two side by side after
+the A/B.
+
+So this measurement falsifies **fresh-allocation** batch-local probing. Batch-local probing
+with buffer reuse - the thing ADR 580 authorized - remains unmeasured in the engine, and the
++2,370.9 ms of probe time is unattributed between the batch-local structure and the
+allocation the implementation introduced.
+
+`benches/join_input_pipeline_shape.rs` now carries a third arm, `fresh-vec`, beside
+`reused-vec` and `current`, interleaved in one replicate loop with row equality asserted on
+both new arms. Until that bench separates them, no further engine cut here is authorized: a
+reusable-buffer cut would change `probe_in_memory_join_rows`'s signature to accept its output
+vector, and that is only worth doing if the measured fresh-versus-reused delta materially
+accounts for the +2,370.9 ms.
