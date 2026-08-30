@@ -72,3 +72,7 @@ harness = false
 [[bench]]
 name = "join_output_gather_shape"
 harness = false
+
+[[bench]]
+name = "join_input_pipeline_shape"
+harness = false

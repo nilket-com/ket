@@ -47,7 +47,8 @@ today.
 What such a design does need is join-wide state where the semantics are
 join-wide: `build_match_bitmap` is built per probe call today and would be hoisted
 to the join, with unmatched-build emission deferred until the last probe batch.
-That affects the left-preserving kinds — `LeftOuter`, `LeftSemi`, `LeftAnti` —
+That affects the left-preserving kinds — `LeftOuter`, `FullOuter`, `LeftSemi`,
+`LeftAnti`, the exact list `build_match_bitmap` already matches on —
 and nothing else; `Inner` and the right-preserving kinds are batch-local as they
 stand. `execute_hash_join_into_global_aggregate` is the cleanest case of all: it
 is Inner-only and folds each batch immediately, so there is no output selection to
@@ -88,10 +89,10 @@ scalar alone — a parent counter locates time, it does not name a mechanism.
 - **Build-heavy, multi-batch.** Left side dominant: direct multi-batch build.
   The build side is read once into a hash structure, so it is the cheaper half to
   serve.
-- **Probe-heavy, multi-batch.** Right side dominant: direct multi-batch probe.
-  This is the larger change — the probe loop is the hot path and emits the
-  selection, so it forces the addressing change through `JoinOutputRow` and the
-  gather.
+- **Probe-heavy, multi-batch.** Right side dominant: probe the right batches
+  directly. The probe loop is the hot path, but it already runs per batch with
+  batch-local rows, so this is the batch-local design of clause 4 rather than an
+  addressing change.
 - **Both material.** The API change is scoped once and serves both, rather than
   twice.
 
@@ -119,7 +120,7 @@ The candidate, in the order the engine already runs:
 2. Iterate the right side's 4-7 batches.
 3. Per batch: derive keys, probe, materialize — all with batch-local `u32` rows.
 4. Carry `build_match_bitmap` across batches and emit unmatched build rows after
-   the last one, for the left-preserving kinds only.
+   the last one — `LeftOuter`, `FullOuter`, `LeftSemi`, `LeftAnti` only.
 5. In `execute_hash_join_into_global_aggregate`, fold each batch immediately.
 
 **The bench prices the whole replacement pipeline, not index arithmetic.** ADR
@@ -132,8 +133,16 @@ to end:
 - **candidate**: per-batch keys -> probe -> gather (or fold), no concat.
 
 Held identical across arms: build table, schemas, row counts, selectivity, match
-filters. Shaped like the cells that carry the time — q09, q08 and q17 scale, which
-is 4-7 probe batches over 50-115 M rows and 2-7 GB.
+filters.
+
+Shaped like ONE INVOCATION of the cells that carry the time, not like a task total.
+q09's hot node is 4 concatenations of 4 batches — about 28.6 M rows and 1.87 GB
+each — not one 114 M-row concatenation, and a bench built on the task total would
+measure a shape the engine never runs. Task behaviour is reproduced by repeating
+the invocation, and the per-invocation row split is an assumption stated with the
+result: the telemetry keeps invocation counts and batch histograms but only
+aggregate rows and bytes, so evenness across a node's invocations is assumed and
+is not measured.
 
 Reported per arm: phase times, **output batch count** (the candidate returns more,
 smaller batches, and the downstream consumer pays for that), and **peak memory**
@@ -207,21 +216,29 @@ left the residual.
 
 ## Risks
 
-The measurement may find the cost uniformly spread across both sides with
-multi-batch inputs everywhere, which authorizes the largest version of the change
-on the thinnest per-cell evidence. If so, the first implementation is a build-side
-prototype behind a route receipt, measured before the probe side is touched.
+**The candidate replaces one cost with another, and only the bench says which is
+bigger.** Probing per batch runs the key derivation, the probe setup and the output
+materialization 4-7 times instead of once, and returns 4-7 output batches instead
+of one. The concatenation disappears; per-batch overhead and a wider output arrive
+in its place. A design that wins on the copy and loses on the tail is the failure
+this record expects to catch before any code lands.
 
-The addressing change touches the gather machinery this line just carved and
-stabilized. A `(batch, row)` selection invalidates the slice fast path's
-whole-source restriction as currently written, and re-deriving it per input batch
-is a second design problem inside the first. That risk is a reason to prefer the
-build side first, not a reason to avoid the project.
+**Join-wide state is where correctness would break.** `LeftOuter`, `FullOuter`,
+`LeftSemi` and `LeftAnti` need `build_match_bitmap` hoisted across batches and
+unmatched build rows emitted after the last one. That is a small change to argue
+for and an easy one to get subtly wrong — a bitmap reset per batch would silently
+emit duplicate or missing unmatched rows. The bench therefore carries a
+join-wide-state case rather than pricing `Inner` alone, so the hoisted bitmap and
+its finalization are exercised, not merely reasoned about.
 
-The single-batch case may dominate, in which case this record's structural
-project evaporates and its remaining content is a small copy-elision cut. That is
-a good outcome measured early rather than a wasted record.
+**Downstream may not be indifferent to batch count.** More, smaller output batches
+change what the consumer pays. This record measures the count and does not assume
+it is free.
 
+**Peak memory is the second prize and the easier one to overclaim.** The candidate
+never holds the concatenated copy, but it does hold the source batches and the
+per-batch outputs. The bench measures a peak delta rather than asserting the copy's
+size as a saving.
 ## Forward
 
 Prior evidence: `plans/impl/0554_join_output_materialization_results.md` — the
