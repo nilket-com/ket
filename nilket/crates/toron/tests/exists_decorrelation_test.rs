@@ -778,8 +778,13 @@ async fn run_sql(sql: &str) -> RecordBatch {
 		.expect("bind sql");
 	let executor = Executor::new(storage);
 	let batches = executor.execute_bound(&bound, None).await.expect("execute");
-	assert_eq!(batches.len(), 1);
-	batches.into_iter().next().expect("batch")
+	// ADR 580: a join that probes its right side batch by batch returns one output
+	// batch per matching probe batch. Reading only the first would assert over a
+	// FRACTION of the result, so the whole result is concatenated here — which
+	// makes the assertions below stronger than the single-batch shape they
+	// assumed, not weaker. `execute_bound` has always returned a `Vec`.
+	let schema = batches.first().expect("batch").schema();
+	arrow::compute::concat_batches(&schema, &batches).expect("concatenate result")
 }
 
 fn assert_pk_values(batch: &RecordBatch, expected: &[i64]) {

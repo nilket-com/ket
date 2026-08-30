@@ -28,6 +28,8 @@ mod streamed_spill;
 
 pub(in crate::exec) mod stage_attribution;
 
+mod batch_local_probe;
+
 mod input_materialization;
 
 mod output_materialization;
@@ -45,6 +47,15 @@ pub(super) use self::build_rows::{BuildRowList, JoinBuildRows, build_in_memory_j
 pub use self::output_materialization::{
 	JOIN_SLICE_EQUIVALENCE_ENV, join_slice_equivalence_columns_verified,
 	join_slice_equivalence_enabled,
+};
+
+pub use self::batch_local_probe::{
+	JOIN_BATCH_LOCAL_EQUIVALENCE_ENV, join_batch_local_equivalence_columns_verified,
+	join_batch_local_equivalence_enabled,
+};
+
+use self::batch_local_probe::{
+	batch_local_route_eligible, record_route, try_batch_local_inner_join,
 };
 
 use self::input_materialization::{JoinInputSide, time_join_input_materialization};
@@ -801,10 +812,35 @@ pub(super) async fn execute_hash_join(
 			concat_or_empty(left_schema, left_batches)
 		})?;
 
+	// ADR 580: probe the right batches directly where the evidence supports it —
+	// Inner, more than one batch, in-memory build. The route declines by returning
+	// `None`, leaving every line below unchanged, and both outcomes are recorded
+	// as receipts rather than inferred from which counters moved.
+	if batch_local_route_eligible(kind, right_batches)
+		&& let Some(output) = try_batch_local_inner_join(
+			kind,
+			&left_batch,
+			right_batches,
+			left_keys,
+			right_keys,
+			output_schema,
+			match_filter,
+			null_safe_keys,
+			replay_id,
+			strategy,
+			task_budget,
+			&telemetry,
+			&join_runtime_observation_mode,
+		)? {
+		return Ok(output);
+	}
+
 	let right_batch =
 		time_join_input_materialization(&telemetry, JoinInputSide::Right, right_batches, || {
 			concat_or_empty(right_schema, right_batches)
 		})?;
+
+	record_route(&telemetry, false, 0, 0);
 
 	// ADR 239: CROSS is keyless — route through the explicit match-all path instead of the hash
 
@@ -993,10 +1029,8 @@ pub(super) async fn execute_hash_join(
 	record_task_telemetry(&telemetry, |task| {
 		probe_scope.finish_at_measurement();
 
-		task.counters.matched_rows = task
-			.counters
-			.matched_rows
-			.saturating_add(selection.len() as u64);
+		task.counters
+			.add_matched_rows(selection.len() as u64, false);
 	});
 
 	probe_scope.commit_after_write();
@@ -1168,8 +1202,7 @@ pub(super) async fn execute_hash_join_into_global_aggregate(
 			if let Ok((probe_rows, output_rows)) = &result {
 				task.counters.probe_rows = task.counters.probe_rows.saturating_add(*probe_rows);
 
-				task.counters.matched_rows =
-					task.counters.matched_rows.saturating_add(*output_rows);
+				task.counters.add_matched_rows(*output_rows, false);
 			}
 		});
 
@@ -1411,10 +1444,8 @@ pub(super) async fn execute_hash_join_into_global_aggregate(
 	record_task_telemetry(&telemetry, |task| {
 		probe_scope.finish_at_measurement();
 
-		task.counters.matched_rows = task
-			.counters
-			.matched_rows
-			.saturating_add(selection.len() as u64);
+		task.counters
+			.add_matched_rows(selection.len() as u64, false);
 	});
 
 	probe_scope.commit_after_write();
@@ -1554,7 +1585,7 @@ pub(super) fn execute_cross_join_match_all(
 	let output_rows = record_batch_row_count(&output);
 
 	record_task_telemetry(telemetry, |task| {
-		task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
+		task.counters.add_matched_rows(output_rows, false);
 	});
 
 	record_join_runtime_observation(
@@ -2463,10 +2494,65 @@ pub(super) fn probe_in_memory_join_rows_profiled(
 
 	null_safe_keys: bool,
 
-	mut profile: Option<&mut InMemoryProbeProfile>,
+	profile: Option<&mut InMemoryProbeProfile>,
 ) -> Result<Vec<JoinOutputRow>, ExecutionError> {
 	let mut selection = Vec::new();
 
+	probe_in_memory_join_rows_profiled_into(
+		kind,
+		join_key_plan,
+		build_rows,
+		left_rows,
+		right_key_arrays,
+		rows,
+		match_filter,
+		left_batch,
+		right_batch,
+		null_safe_keys,
+		profile,
+		&mut selection,
+	)?;
+
+	Ok(selection)
+}
+
+/// The probe body, writing into a caller-owned selection vector.
+///
+/// ADR 580: the batch-local route reuses ONE vector across its probe batches, and
+/// the bench measured that reuse as the difference between beating concatenation
+/// and merely matching it — 5.42 to 6.63 ns per selected row, which is what the
+/// reverted route was missing.
+///
+/// Every other caller keeps the allocating wrapper above and is byte-identical to
+/// before: the spilled paths, the streaming paths, the tests, and every join kind
+/// this route does not serve. A shared buffer is only safe where one caller owns
+/// the loop, and only that caller opts in.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn probe_in_memory_join_rows_profiled_into(
+	kind: JoinKind,
+
+	join_key_plan: JoinKeyPlan,
+
+	build_rows: &JoinBuildRows,
+
+	left_rows: usize,
+
+	right_key_arrays: &[ArrayRef],
+
+	rows: usize,
+
+	match_filter: Option<&BoundExprProgram>,
+
+	left_batch: &RecordBatch,
+
+	right_batch: &RecordBatch,
+
+	null_safe_keys: bool,
+
+	mut profile: Option<&mut InMemoryProbeProfile>,
+
+	selection: &mut Vec<JoinOutputRow>,
+) -> Result<(), ExecutionError> {
 	let mut matched_build_rows = build_match_bitmap(kind, left_rows);
 
 	let mut residual = JoinMatchResidual::new(match_filter, left_batch, right_batch);
@@ -2482,7 +2568,7 @@ pub(super) fn probe_in_memory_join_rows_profiled(
 				|key| build_rows.get_int32(key),
 				|keys, out| build_rows.get_int32_batch(keys, out),
 				&mut matched_build_rows,
-				&mut selection,
+				selection,
 				&mut residual,
 				profile.as_deref_mut(),
 			)?;
@@ -2498,7 +2584,7 @@ pub(super) fn probe_in_memory_join_rows_profiled(
 				|key| build_rows.get_int64(key),
 				|keys, out| build_rows.get_int64_batch(keys, out),
 				&mut matched_build_rows,
-				&mut selection,
+				selection,
 				&mut residual,
 				profile.as_deref_mut(),
 			)?;
@@ -2514,7 +2600,7 @@ pub(super) fn probe_in_memory_join_rows_profiled(
 					join_key_bytes_null_safe(right_key_arrays, row)?
 				} else {
 					let Some(key) = join_key_bytes(right_key_arrays, row)? else {
-						append_unmatched_probe_row(kind, row, &mut selection)?;
+						append_unmatched_probe_row(kind, row, selection)?;
 
 						continue;
 					};
@@ -2530,7 +2616,7 @@ pub(super) fn probe_in_memory_join_rows_profiled(
 						row,
 						matches.rows(),
 						matched_build_rows.as_deref_mut(),
-						&mut selection,
+						selection,
 						&mut residual,
 					)?
 				} else {
@@ -2538,20 +2624,15 @@ pub(super) fn probe_in_memory_join_rows_profiled(
 				};
 
 				if !matched {
-					append_unmatched_probe_row(kind, row, &mut selection)?;
+					append_unmatched_probe_row(kind, row, selection)?;
 				}
 			}
 		}
 	}
 
-	append_build_side_after_probe_rows(
-		kind,
-		left_rows,
-		matched_build_rows.as_deref(),
-		&mut selection,
-	)?;
+	append_build_side_after_probe_rows(kind, left_rows, matched_build_rows.as_deref(), selection)?;
 
-	Ok(selection)
+	Ok(())
 }
 
 pub(super) fn single_join_key_array<'a, T: 'static>(

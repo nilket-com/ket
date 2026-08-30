@@ -535,9 +535,13 @@ async fn adr440_common_or_empty_reduced_arm_removes_the_residual_or() {
 	.execute_bound(&bound, None)
 	.await
 	.expect("execute empty reduced OR arm");
-	let batch = result.first().expect("result batch");
+	// ADR 580: assert over the WHOLE result. Reading `first()` alone checked a
+	// fraction of it once a join could return one batch per probe batch, and it
+	// took a seal to notice.
+	let schema = result.first().expect("result batch").schema();
+	let batch = arrow::compute::concat_batches(&schema, &result).expect("concatenate result");
 
-	assert_eq!(int64_int32_rows(batch), vec![(1, 23), (1, 34), (3, 99)]);
+	assert_eq!(int64_int32_rows(&batch), vec![(1, 23), (1, 34), (3, 99)]);
 	assert_eq!(
 		filter_count(&bound),
 		1,
@@ -725,8 +729,12 @@ async fn run_cross_sql(sql: &str) -> RecordBatch {
 	.execute_bound(&bound, None)
 	.await
 	.expect("execute cross fixture sql");
-	assert_eq!(batches.len(), 1, "single-partition result");
-	batches.into_iter().next().expect("result batch")
+	// ADR 580: batches are not partitions. A batch-local join returns one output
+	// batch per matching probe batch, so the result is concatenated rather than
+	// asserted to be singular — partition count is a plan property and is asserted
+	// where the plan is checked.
+	let schema = batches.first().expect("result batch").schema();
+	arrow::compute::concat_batches(&schema, &batches).expect("concatenate result")
 }
 
 fn int64_int32_rows(batch: &RecordBatch) -> Vec<(i64, i32)> {
