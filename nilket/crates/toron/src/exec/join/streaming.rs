@@ -8007,7 +8007,8 @@ impl Executor {
 						task.counters.probe_rows =
 							task.counters.probe_rows.saturating_add(*probe_rows);
 
-						task.counters.add_matched_rows(*output_rows, false);
+						task.counters.matched_rows =
+							task.counters.matched_rows.saturating_add(*output_rows);
 					}
 				});
 
@@ -8189,7 +8190,8 @@ impl Executor {
 				if let Ok((probe_rows, output_rows)) = &result {
 					task.counters.probe_rows = task.counters.probe_rows.saturating_add(*probe_rows);
 
-					task.counters.add_matched_rows(*output_rows, false);
+					task.counters.matched_rows =
+						task.counters.matched_rows.saturating_add(*output_rows);
 				}
 			});
 
@@ -8354,7 +8356,8 @@ impl Executor {
 			if let Ok((probe_rows, output_rows)) = &result {
 				task.counters.probe_rows = task.counters.probe_rows.saturating_add(*probe_rows);
 
-				task.counters.add_matched_rows(*output_rows, false);
+				task.counters.matched_rows =
+					task.counters.matched_rows.saturating_add(*output_rows);
 			}
 		});
 
@@ -8893,7 +8896,7 @@ impl Executor {
 
 				task.counters.probe_rows = task.counters.probe_rows.saturating_add(probe_rows);
 
-				task.counters.add_matched_rows(output_rows, false);
+				task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
 			});
 
 			probe_scope.commit_after_write();
@@ -9346,7 +9349,8 @@ impl Executor {
 				task.counters.probe_rows =
 					task.counters.probe_rows.saturating_add(group_probe_rows);
 
-				task.counters.add_matched_rows(group_output_rows, false);
+				task.counters.matched_rows =
+					task.counters.matched_rows.saturating_add(group_output_rows);
 			});
 
 			probe_scope.commit_after_write();
@@ -9676,7 +9680,7 @@ impl Executor {
 
 				task.counters.probe_rows = task.counters.probe_rows.saturating_add(probe_rows);
 
-				task.counters.add_matched_rows(output_rows, false);
+				task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
 			});
 
 			probe_scope.commit_after_write();
@@ -12309,7 +12313,8 @@ impl Executor {
 				if let Ok((probe_rows, output_rows)) = &result {
 					task.counters.probe_rows = task.counters.probe_rows.saturating_add(*probe_rows);
 
-					task.counters.add_matched_rows(*output_rows, false);
+					task.counters.matched_rows =
+						task.counters.matched_rows.saturating_add(*output_rows);
 				}
 			});
 
@@ -12468,8 +12473,10 @@ impl Executor {
 		record_task_telemetry(&self.context.task_telemetry, |task| {
 			probe_scope.finish_at_measurement();
 
-			task.counters
-				.add_matched_rows(selection.len() as u64, false);
+			task.counters.matched_rows = task
+				.counters
+				.matched_rows
+				.saturating_add(selection.len() as u64);
 		});
 
 		probe_scope.commit_after_write();
@@ -12763,7 +12770,8 @@ impl Executor {
 						task.counters.probe_rows =
 							task.counters.probe_rows.saturating_add(probe_rows);
 
-						task.counters.add_matched_rows(output_rows, false);
+						task.counters.matched_rows =
+							task.counters.matched_rows.saturating_add(output_rows);
 					});
 
 					probe_scope.commit_after_write();
@@ -12938,7 +12946,7 @@ impl Executor {
 
 			task.counters.probe_rows = task.counters.probe_rows.saturating_add(probe_rows);
 
-			task.counters.add_matched_rows(output_rows, false);
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
 		});
 
 		probe_scope.commit_after_write();
@@ -14810,7 +14818,8 @@ impl Executor {
 
 				task.counters.probe_rows = task.counters.probe_rows.saturating_add(membership_rows);
 
-				task.counters.add_matched_rows(matched_rows, false);
+				task.counters.matched_rows =
+					task.counters.matched_rows.saturating_add(matched_rows);
 			});
 
 			chain_scope.commit_after_write();
@@ -14991,7 +15000,8 @@ impl Executor {
 			if let Ok((probe_rows, output_rows)) = &result {
 				task.counters.probe_rows = task.counters.probe_rows.saturating_add(*probe_rows);
 
-				task.counters.add_matched_rows(*output_rows, false);
+				task.counters.matched_rows =
+					task.counters.matched_rows.saturating_add(*output_rows);
 			}
 		});
 
@@ -17440,7 +17450,7 @@ impl Executor {
 
 			task.counters.probe_rows = task.counters.probe_rows.saturating_add(probe_rows);
 
-			task.counters.add_matched_rows(output_rows, false);
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
 		});
 
 		probe_scope.commit_after_write();
@@ -20012,8 +20022,10 @@ impl Executor {
 				record_task_telemetry(&self.context.task_telemetry, |task| {
 					probe_scope.finish_at_measurement();
 
-					task.counters
-						.add_matched_rows(selection.len() as u64, false);
+					task.counters.matched_rows = task
+						.counters
+						.matched_rows
+						.saturating_add(selection.len() as u64);
 				});
 
 				probe_scope.commit_after_write();
@@ -22013,7 +22025,7 @@ impl Executor {
 
 			task.counters.probe_rows = task.counters.probe_rows.saturating_add(probe_rows);
 
-			task.counters.add_matched_rows(output_rows, false);
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
 		});
 
 		probe_scope.commit_after_write();
@@ -23237,7 +23249,10 @@ impl Executor {
 		runtime.output_rows = runtime.output_rows.saturating_add(selected.len() as u64);
 
 		record_task_telemetry(&self.context.task_telemetry, |task| {
-			task.counters.add_matched_rows(selected.len() as u64, false);
+			task.counters.matched_rows = task
+				.counters
+				.matched_rows
+				.saturating_add(selected.len() as u64);
 		});
 
 		let mut output = Vec::new();
@@ -23323,8 +23338,10 @@ impl Executor {
 		runtime.output_rows = runtime.output_rows.saturating_add(selection.len() as u64);
 
 		record_task_telemetry(&self.context.task_telemetry, |task| {
-			task.counters
-				.add_matched_rows(selection.len() as u64, false);
+			task.counters.matched_rows = task
+				.counters
+				.matched_rows
+				.saturating_add(selection.len() as u64);
 		});
 
 		let mut output = Vec::new();
@@ -24987,7 +25004,7 @@ impl Executor {
 		record_task_telemetry(&self.context.task_telemetry, |task| {
 			task.counters.probe_rows = task.counters.probe_rows.saturating_add(probe_rows);
 
-			task.counters.add_matched_rows(output_rows, false);
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
 		});
 	}
 

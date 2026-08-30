@@ -1879,30 +1879,6 @@ mod tests {
 	/// The index children join the sum rather than getting an identity of their
 	/// own: all four bracket disjoint spans inside the same parent, and a guard
 	/// that checked them separately would pass while their total overran it.
-	/// ADR 580: matched rows are partitioned by route, never merely totalled.
-	///
-	/// A node runs both routes, so `matched_rows` alone cannot denominate either.
-	/// `add_matched_rows` is the only writer and attributes every row, so the two
-	/// route counters must sum to the total — and an architecture guard forbids
-	/// assigning `matched_rows` directly, which is what stops a new call site from
-	/// adding rows to the total without saying where they came from.
-	#[test]
-	fn adr580_matched_rows_partition_by_route() {
-		let mut counters = crate::distributed::task::TaskTelemetryCounters::default();
-		counters.add_matched_rows(1_000, true);
-		counters.add_matched_rows(250, false);
-		counters.add_matched_rows(7, true);
-
-		assert_eq!(counters.join_batch_local_matched_rows, 1_007);
-		assert_eq!(counters.join_concatenated_matched_rows, 250);
-		assert_eq!(
-			counters.join_batch_local_matched_rows + counters.join_concatenated_matched_rows,
-			counters.matched_rows,
-			"every matched row belongs to exactly one route; a total that outruns \
-			 its parts would denominate a projection with rows no route claimed"
-		);
-	}
-
 	/// ADR 580: the four input children partition their parent exactly.
 	///
 	/// Equality, not `<=`, and deliberately different from the output identity

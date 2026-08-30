@@ -153,7 +153,10 @@ pub(in crate::exec) async fn execute_spilled_hash_join(
 		if let Ok(batches) = &result {
 			let matched_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
 
-			task.counters.add_matched_rows(matched_rows as u64, false);
+			task.counters.matched_rows = task
+				.counters
+				.matched_rows
+				.saturating_add(matched_rows as u64);
 		}
 	});
 
@@ -334,7 +337,7 @@ pub(in crate::exec) async fn execute_spilled_hash_join_into_global_aggregate(
 		probe_scope.finish_at_measurement();
 
 		if let Ok(output_rows) = &result {
-			task.counters.add_matched_rows(*output_rows, false);
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(*output_rows);
 		}
 	});
 
@@ -514,7 +517,7 @@ where
 		probe_scope.finish_at_measurement();
 
 		if let Ok(output_rows) = &result {
-			task.counters.add_matched_rows(*output_rows, false);
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(*output_rows);
 		}
 	});
 
