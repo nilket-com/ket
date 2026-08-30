@@ -77,12 +77,17 @@ close - yet:
 The probe side moves 6.6x the bytes and 10x the rows, but costs **48x** the time. Its
 effective copy rate is 3.85 GB/s against the build side's 27.7 GB/s.
 
-**That gap is not explained here and is not assumed away.** The obvious candidates -
-column type mix (the probe side is the fact table and carries strings), allocation cost at
-gigabyte scale, cache residency of a small build side - are hypotheses, and this record
-has measured none of them. It matters because a multi-batch probe redesign is justified by
-removing the copy, and if a large part of the 6.4 s is something other than the copy
-itself, the redesign recovers less than the counter suggests.
+**That gap is not explained here.** Column type mix (the probe side is the fact table and
+carries strings), allocation cost at gigabyte scale, cache residency of a small build side
+- all hypotheses, none measured.
+
+**It also does not gate the decision, and an earlier draft of this section said it did.**
+The 6,424.8 ms is spent inside `concat_batches`. A design that does not call
+`concat_batches` does not spend it, whatever it is made of — payload copying, allocation,
+string offsets, validity handling. The gross removable term is the whole figure. What is
+genuinely unknown is what a per-batch path costs **in its place**, and no decomposition of
+the copy answers that. The 3.85 GB/s asymmetry stays recorded as a curiosity worth a
+sentence, not as a precondition.
 
 ## What this authorizes, and what it does not
 
@@ -90,10 +95,17 @@ itself, the redesign recovers less than the counter suggests.
 concatenating them.
 
 **Not authorized:** the build side (below threshold), and any implementation at all until
-ADR 580's clause 4 is satisfied. The probe loop is per-row work, so a row-wise bench must
-price `(batch, row)` addressing against the current single-batch indexing at board
-cardinalities **before** code is written. That clause exists because this line has already
-had one forecast falsified in direction by exactly this kind of change.
+ADR 580's clause 4 is satisfied.
 
-The 3.85 GB/s question should be settled in the same bench, since it decides how much of
-the 6,424.8 ms a redesign can actually reach.
+**And the design to price is smaller than this record first assumed.**
+`execute_hash_join` already returns `Vec<RecordBatch>` and
+`probe_in_memory_join_rows` already takes one probe batch with batch-local `u32` rows, so
+probing the 4-7 right-side batches one at a time needs no `(batch, row)` addressing and
+leaves the selection vocabulary and the slice rule alone. Only the left-preserving kinds
+need anything join-wide: `build_match_bitmap` hoisted out of the per-probe call, with
+unmatched build rows emitted after the last batch.
+
+The bench prices that pipeline end to end against the current one — concat, keys, probe,
+gather or fold — at q09/q08/q17 shapes, reporting phase times, output batch count and peak
+memory. Not index arithmetic: the last forecast this line took from a component bench was
+falsified in direction.

@@ -32,17 +32,29 @@ Four charged sites produce it, both `concat_or_empty` pairs in
 `execute_hash_join` and `execute_hash_join_into_global_aggregate`. Each turns a
 `&[RecordBatch]` into one `RecordBatch` before the join does anything else.
 
-**Why this is not a local change.** The concatenated batch is what every later
-step addresses. `JoinOutputRow` carries a bare `u32` per side; `key_arrays`,
-`build_in_memory_join_rows`, `probe_in_memory_join_rows`, the spill decision at
-`estimated_build_hash_bytes`, `execute_cross_join_match_all` and the whole output
-gather all assume one batch per side, indexed by one integer. Consuming inputs
-directly means either `(batch, row)` addressing or a global row index, which
-reopens the selection vocabulary and the gather machinery just carved into
-`exec/join/output_materialization.rs` — including the slice fast path, whose
-whole-source restriction is defined against a single source batch. That is the
-API change this record exists to decide, and it is large enough that it must be
-earned by evidence rather than by the size of the parent counter.
+**How large the change is, is itself a question — and the first draft of this
+record got it wrong.** It asserted that consuming inputs directly means
+`(batch, row)` or global row addressing, reopening the selection vocabulary and
+the gather machinery in `exec/join/output_materialization.rs`, slice fast path
+included. The code says otherwise for the probe side. `execute_hash_join` already
+returns `Vec<RecordBatch>`, and `probe_in_memory_join_rows` already takes ONE
+probe batch and produces batch-LOCAL `u32` row indices. A join that probes one
+source batch at a time therefore needs no new addressing at all: each probe batch
+produces its own selection over its own rows, materializes into its own output
+batch, and the whole-source slice rule applies per probe batch exactly as it does
+today.
+
+What such a design does need is join-wide state where the semantics are
+join-wide: `build_match_bitmap` is built per probe call today and would be hoisted
+to the join, with unmatched-build emission deferred until the last probe batch.
+That affects the left-preserving kinds — `LeftOuter`, `LeftSemi`, `LeftAnti` —
+and nothing else; `Inner` and the right-preserving kinds are batch-local as they
+stand. `execute_hash_join_into_global_aggregate` is the cleanest case of all: it
+is Inner-only and folds each batch immediately, so there is no output selection to
+carry across batches.
+
+So the addressing change is a possible LATER design, not a premise. The smaller
+one comes first and gets priced first.
 
 ## Decision
 
@@ -99,15 +111,41 @@ Below 500 ms on both multi-batch children, this record stops. A side that is
 large but single-batch does not authorize multi-batch work and does not authorize
 a copy elision either — there is no copy.
 
-### 4. A row-wise cost is priced before a row-wise change is built
+### 4. Batch-local probing is the first design, and it is priced before it is built
 
-ADR 554's §9 recorded a substitution forecast from a bulk-construction bench that
-was falsified in direction by the engine: +92.0 ms measured against 190-306 ms
-forecast saved. The lesson binds here. Any design that changes per-row work —
-`(batch, row)` addressing, an index indirection, a chunked probe loop — must be
-priced by a **row-wise** bench at board cardinalities before it is implemented,
-and the bench must measure the shape the engine would actually run, not a bulk
-analogue of it.
+The candidate, in the order the engine already runs:
+
+1. Concatenate and build the left side once, as today.
+2. Iterate the right side's 4-7 batches.
+3. Per batch: derive keys, probe, materialize — all with batch-local `u32` rows.
+4. Carry `build_match_bitmap` across batches and emit unmatched build rows after
+   the last one, for the left-preserving kinds only.
+5. In `execute_hash_join_into_global_aggregate`, fold each batch immediately.
+
+**The bench prices the whole replacement pipeline, not index arithmetic.** ADR
+554's §9 recorded a forecast from a bulk-construction bench falsified in direction
+by the engine (+92.0 ms measured against 190-306 ms forecast saved) precisely
+because the bench measured a component rather than the path. So both arms run end
+to end:
+
+- **current**: `concat` -> keys -> probe -> gather (or fold);
+- **candidate**: per-batch keys -> probe -> gather (or fold), no concat.
+
+Held identical across arms: build table, schemas, row counts, selectivity, match
+filters. Shaped like the cells that carry the time — q09, q08 and q17 scale, which
+is 4-7 probe batches over 50-115 M rows and 2-7 GB.
+
+Reported per arm: phase times, **output batch count** (the candidate returns more,
+smaller batches, and the downstream consumer pays for that), and **peak memory**
+(the candidate never holds the concatenated copy, which is the second reason to
+want it and is currently unmeasured).
+
+The gross removable term is the whole 6,424.8 ms — it is spent inside
+`concat_batches` and a design that does not call it does not spend it, whatever
+the time is made of. The load-bearing unknown is what the per-batch path costs in
+its place, and that is what this bench measures. Whether the 3.85 GB/s copy rate
+has a satisfying explanation is a separate curiosity and does not gate the
+decision.
 
 ## Acceptance
 
