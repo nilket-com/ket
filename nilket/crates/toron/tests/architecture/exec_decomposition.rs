@@ -30,13 +30,10 @@ const EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT: usize = 10_000;
 // verified-column tally joining the same re-export, and for the wider comment that
 // now has to explain two diagnostics rather than one. Same reason as above: the
 // harness stamps both into its artifact header and `join` is private.
-// ADR 580: +2 for the batch-local equivalence gate joining the same re-export, so
-// the harness can stamp it into the seal and withhold timing authority from a
-// diagnostic run.
 // ADR 554 follow-on: +2 for the re-export comment, which now has to say where each
 // diagnostic's state is stamped — the locality probe in the artifact header, the
 // equivalence check in the seal — and that both gates also withhold timing authority.
-const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_596;
+const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_594;
 const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
 // ADR 554 follow-on: 3_825 -> 3_890 for the index-build split — two nested child
 // timers selected by join kind, and the tests that pin the selection, including the
