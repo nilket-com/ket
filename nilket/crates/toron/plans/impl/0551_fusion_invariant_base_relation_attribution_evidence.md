@@ -1251,6 +1251,26 @@ to check.
     matching the legacy writer; commit after the closure returns
   - pre-measurement exits: none — runtime observation, cleanup and propagation all
     occur after publication
+- ADR0551-ID: `join/try_batch_local_inner_join/Build/1`
+  - start: after the spill decision declines and the key plan resolves, immediately
+    before the in-memory build
+  - authoritative phase measurement: **inside** the telemetry closure
+  - publication: the telemetry closure; commit immediately after the Build write
+    inside it, so a skipped closure cannot publish
+  - pre-measurement exits: **2** sharing the build call — its exact kernel error,
+    and an absent build that declines the route so the caller's concatenating path
+    takes the spilled helper; both discard before preserving the outcome
+  - topology: resolves before build profiling and the first Probe/1 opens
+- ADR0551-ID: `join/try_batch_local_inner_join/Probe/1`
+  - start: once per probe batch, after that batch's key arrays resolve and
+    immediately before the in-memory probe
+  - authoritative phase measurement: **inside** the telemetry closure
+  - publication: that closure; commit after it returns
+  - pre-measurement exits: **1** — the probe kernel error discards before
+    preserving the exact error
+  - topology: opens and resolves once per right batch, each resolving before that
+    batch's output materialization; the single runtime observation resolves after
+    the last one
 - ADR0551-ID: `join/try_execute_partitioned_spilled_left_outer_join/Build/1`
   - lifecycle: one transition per partition iteration
   - start: after that partition's spill writer is created and immediately before

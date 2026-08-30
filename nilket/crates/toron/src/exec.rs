@@ -115,7 +115,7 @@ mod expr;
 mod input_processing;
 mod join;
 
-/// ADR 554 follow-on: the two opt-in join diagnostics — the selection locality probe
+/// ADR 554 follow-on and ADR 580: the THREE opt-in join diagnostics — the selection locality probe
 /// and the slice/`take` equivalence check — re-exported with their env names and the
 /// equivalence check's verified-column tally. The TPC-H harness stamps the locality
 /// probe's state into its artifact header, the equivalence check's flag and tally into
@@ -124,8 +124,11 @@ mod join;
 /// all-zero locality counters cannot be told apart from a probe that never ran, and
 /// "no mismatch" cannot be told apart from "never compared".
 pub use join::{
-	JOIN_SELECTION_LOCALITY_ENV, JOIN_SLICE_EQUIVALENCE_ENV, join_selection_locality_enabled,
-	join_slice_equivalence_columns_verified, join_slice_equivalence_enabled,
+	JOIN_BATCH_LOCAL_EQUIVALENCE_ENV, JOIN_BATCH_LOCAL_ROUTE_ENV, JOIN_SELECTION_LOCALITY_ENV,
+	JOIN_SLICE_EQUIVALENCE_ENV, join_batch_local_equivalence_columns_verified,
+	join_batch_local_equivalence_enabled, join_batch_local_route_enabled,
+	join_selection_locality_enabled, join_slice_equivalence_columns_verified,
+	join_slice_equivalence_enabled,
 };
 mod node_attribution;
 mod phase_receipt;
