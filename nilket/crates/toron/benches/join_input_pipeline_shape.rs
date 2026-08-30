@@ -388,26 +388,33 @@ fn batch_local_arm(
 
 	let mut matched = (kind == Kind::LeftOuter).then(|| vec![0u64; build.num_rows().div_ceil(64)]);
 	let mut output = Vec::with_capacity(batches.len() + 1);
-	let mut selection = Vec::new();
+	let mut reused_selection: Vec<Row> = Vec::new();
 
 	for batch in batches {
 		let keys_started = Instant::now();
 		let keys = derive_keys(batch);
 		phases.keys += keys_started.elapsed();
 
-		let probe_started = Instant::now();
-		if reuse_selection {
-			selection.clear();
+		// The fresh vector lives and DIES inside this iteration, which is the
+		// engine's lifetime: `probe_in_memory_join_rows` creates its `Vec`, the
+		// gather consumes it, and it drops at the end of the call. Allocating it
+		// at the top of the NEXT iteration would have charged the previous
+		// vector's deallocation to this one's probe timer.
+		let mut fresh_selection: Vec<Row>;
+		let selection: &mut Vec<Row> = if reuse_selection {
+			reused_selection.clear();
+			&mut reused_selection
 		} else {
-			// A fresh vector per batch — the allocation and regrowth the engine
-			// pays, because its probe function creates the `Vec` it returns.
-			selection = Vec::new();
-		}
-		probe(table, &keys, matched.as_deref_mut(), &mut selection);
+			fresh_selection = Vec::new();
+			&mut fresh_selection
+		};
+
+		let probe_started = Instant::now();
+		probe(table, &keys, matched.as_deref_mut(), selection);
 		phases.probe += probe_started.elapsed();
 
 		let gather_started = Instant::now();
-		output.push(materialize(build, batch, &selection, out_schema));
+		output.push(materialize(build, batch, selection, out_schema));
 		phases.gather += gather_started.elapsed();
 	}
 
@@ -415,14 +422,14 @@ fn batch_local_arm(
 	// are emitted after the last one, against an empty probe side.
 	if let Some(bitmap) = matched.as_deref() {
 		let probe_started = Instant::now();
-		selection.clear();
-		unmatched_build_rows(bitmap, build.num_rows(), &mut selection);
+		let mut tail: Vec<Row> = Vec::new();
+		unmatched_build_rows(bitmap, build.num_rows(), &mut tail);
 		phases.probe += probe_started.elapsed();
 
-		if !selection.is_empty() {
+		if !tail.is_empty() {
 			let gather_started = Instant::now();
 			let empty = RecordBatch::new_empty(batches[0].schema());
-			output.push(materialize(build, &empty, &selection, out_schema));
+			output.push(materialize(build, &empty, &tail, out_schema));
 			phases.gather += gather_started.elapsed();
 		}
 	}
@@ -480,35 +487,50 @@ fn main() {
 			.collect();
 
 		for kind in [Kind::Inner, Kind::LeftOuter] {
-			let mut current_runs = Vec::with_capacity(REPLICATES);
-			let mut reused_runs = Vec::with_capacity(REPLICATES);
-			let mut fresh_runs = Vec::with_capacity(REPLICATES);
-
-			for replicate in 0..REPLICATES {
-				// Interleaved, not batched by arm: a machine that drifts during the
-				// run drifts through all three arms rather than through one.
-				let (current, current_output) =
+			// Correctness first, and UNTIMED. All three arms must produce identical
+			// rows; an allocation strategy that changed one would make the timing
+			// comparison meaningless. Every output is dropped before any timed
+			// replicate begins, so no arm is measured with another's result
+			// resident.
+			{
+				let (_, current_output) =
 					current_arm(kind, &build, &table, &batches, &probe_schema, &out_schema);
-				let (reused, reused_output) =
+				let (_, reused_output) =
 					batch_local_arm(kind, &build, &table, &batches, &out_schema, true);
-				let (fresh, fresh_output) =
+				let (_, fresh_output) =
 					batch_local_arm(kind, &build, &table, &batches, &out_schema, false);
-
-				if replicate == 0 {
-					assert_same_rows(&current_output, &reused_output, &out_schema);
-					// The allocation strategy must not change a single row: if it
-					// did, the two arms would be measuring different work and the
-					// comparison would mean nothing.
-					assert_same_rows(&current_output, &fresh_output, &out_schema);
-				}
-				black_box(&current_output);
-				black_box(&reused_output);
-				black_box(&fresh_output);
-				current_runs.push(current);
-				reused_runs.push(reused);
-				fresh_runs.push(fresh);
+				assert_same_rows(&current_output, &reused_output, &out_schema);
+				assert_same_rows(&current_output, &fresh_output, &out_schema);
 			}
 
+			let mut runs: [Vec<Phases>; 3] = [
+				Vec::with_capacity(REPLICATES),
+				Vec::with_capacity(REPLICATES),
+				Vec::with_capacity(REPLICATES),
+			];
+
+			for replicate in 0..REPLICATES {
+				// Rotated, not fixed: with three arms and three replicates each arm
+				// runs first, second and last exactly once. A fixed order would let
+				// "always last" masquerade as "slowest".
+				for position in 0..3 {
+					let arm = (position + replicate) % 3;
+					let (phases, output) = match arm {
+						0 => {
+							current_arm(kind, &build, &table, &batches, &probe_schema, &out_schema)
+						}
+						1 => batch_local_arm(kind, &build, &table, &batches, &out_schema, true),
+						_ => batch_local_arm(kind, &build, &table, &batches, &out_schema, false),
+					};
+					// Consumed, then DROPPED before the next arm starts: an arm must
+					// not run under the memory pressure of its predecessors' output.
+					black_box(&output);
+					drop(output);
+					runs[arm].push(phases);
+				}
+			}
+
+			let [current_runs, reused_runs, fresh_runs] = runs;
 			for (arm, phases) in [
 				("current", median(current_runs)),
 				("reused-vec", median(reused_runs)),
