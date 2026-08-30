@@ -119,7 +119,7 @@ pub(in crate::exec) async fn try_execute_streamed_spilled_left_semi_join(
 		if let Ok((_, probe_rows, output_rows)) = &result {
 			task.counters.probe_rows = task.counters.probe_rows.saturating_add(*probe_rows);
 
-			task.counters.add_matched_rows(*output_rows, false);
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(*output_rows);
 		}
 	});
 
@@ -450,7 +450,7 @@ pub(in crate::exec) async fn try_execute_partitioned_spilled_left_outer_join(
 
 			task.counters.probe_rows = task.counters.probe_rows.saturating_add(probe_rows);
 
-			task.counters.add_matched_rows(output_rows, false);
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(output_rows);
 		});
 
 		probe_scope.commit_after_write();
@@ -913,7 +913,7 @@ pub(in crate::exec) async fn try_execute_streamed_spilled_inner_join(
 		if let Ok((_, probe_rows, output_rows)) = &result {
 			task.counters.probe_rows = task.counters.probe_rows.saturating_add(*probe_rows);
 
-			task.counters.add_matched_rows(*output_rows, false);
+			task.counters.matched_rows = task.counters.matched_rows.saturating_add(*output_rows);
 		}
 	});
 
