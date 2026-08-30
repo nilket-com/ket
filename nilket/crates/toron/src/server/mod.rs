@@ -1847,8 +1847,10 @@ mod tests {
 		let mut with_children = TaskTelemetry::default();
 		with_children.phases.task_wall_micros = 10_000;
 		with_children.phases.join_input_materialization_micros = 1_000;
-		with_children.phases.join_input_left_concat_micros = 800;
-		with_children.phases.join_input_right_concat_micros = 200;
+		with_children.phases.join_input_left_multi_batch_micros = 700;
+		with_children.phases.join_input_left_single_batch_micros = 100;
+		with_children.phases.join_input_right_multi_batch_micros = 150;
+		with_children.phases.join_input_right_single_batch_micros = 50;
 		with_children.phases.join_output_materialization_micros = 4_000;
 		// A realistic split: most of the parent is the two take loops, with the
 		// index build accounting for part of what is left over.
@@ -1877,23 +1879,30 @@ mod tests {
 	/// The index children join the sum rather than getting an identity of their
 	/// own: all four bracket disjoint spans inside the same parent, and a guard
 	/// that checked them separately would pass while their total overran it.
-	/// The input pair partitions its own parent: one clock read charges both, so
-	/// their sum equals it exactly when every site is charged. Stated as equality
-	/// BECAUSE the sides are timed together — an inequality here would tolerate a
-	/// site that charged the parent and forgot the child, which is the only way
-	/// this split can silently lose a side.
+	/// ADR 580: the four input children partition their parent exactly.
+	///
+	/// Equality, not `<=`, and deliberately different from the output identity
+	/// above: every charged concat adds to the parent and to exactly one of the
+	/// four from ONE clock read. A shortfall means a site charged the parent and
+	/// skipped its child, which is the only way this split can silently lose a
+	/// side or a shape — and losing the single-batch shape is the failure that
+	/// would let arrow's zero-copy wrapper argue for a rewrite.
 	#[test]
-	fn adr554_join_input_children_partition_their_parent() {
+	fn adr580_join_input_children_partition_their_parent() {
 		let mut telemetry = TaskTelemetry::default();
 		telemetry.phases.join_input_materialization_micros = 1_000;
-		telemetry.phases.join_input_left_concat_micros = 800;
-		telemetry.phases.join_input_right_concat_micros = 200;
+		telemetry.phases.join_input_left_multi_batch_micros = 700;
+		telemetry.phases.join_input_left_single_batch_micros = 100;
+		telemetry.phases.join_input_right_multi_batch_micros = 150;
+		telemetry.phases.join_input_right_single_batch_micros = 50;
 		assert_eq!(
-			telemetry.phases.join_input_left_concat_micros
-				+ telemetry.phases.join_input_right_concat_micros,
+			telemetry.phases.join_input_left_multi_batch_micros
+				+ telemetry.phases.join_input_left_single_batch_micros
+				+ telemetry.phases.join_input_right_multi_batch_micros
+				+ telemetry.phases.join_input_right_single_batch_micros,
 			telemetry.phases.join_input_materialization_micros,
-			"a charged concat adds to both levels from one measurement, so the two \
-			 sides must account for the whole parent"
+			"a charged concat adds to both levels from one measurement, so the four \
+			 children must account for the whole parent"
 		);
 	}
 

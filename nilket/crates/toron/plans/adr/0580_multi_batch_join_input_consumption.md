@@ -48,19 +48,31 @@ earned by evidence rather than by the size of the parent counter.
 
 ### 1. Measure the parent by side and shape before designing anything
 
-The instrument is already built and sealed (`0ab7abf3`): nested children
-`join_input_left_concat_micros` / `join_input_right_concat_micros`, charged from
-the same clock read as their parent, plus batches, rows and slice bytes per side.
-This record authorizes its first authoritative run. No design work precedes that
-run, and no design is justified by the 7,100.6 ms scalar alone — a parent counter
-locates time, it does not name a mechanism.
+The instrument is four nested children —
+`join_input_{left,right}_{single,multi}_batch_micros`, charged from the same clock
+read as their parent — plus, per side, invocation counts, batch/row/slice-byte
+totals and a bounded batch-count histogram.
+
+The side split alone was built first (`0ab7abf3`) and **could not have answered
+this record's own gate**: it recorded task totals with no invocation count, so it
+could not say whether a task's batches arrived in one wide concatenation or many
+narrow ones, and it charged single-batch wrapper work to the same counter as
+multi-batch copying. Both gaps are repaired before the first run rather than
+discovered in its numbers.
+
+No design work precedes that run, and no design is justified by the 7,100.6 ms
+scalar alone — a parent counter locates time, it does not name a mechanism.
 
 ### 2. The measurement decides which of four projects this is, by predeclared rule
 
-- **Degenerate copy.** If most concatenated rows arrive in a **single batch**,
-  the cost is a copy that buys nothing and the fix is to skip it — return the one
-  batch as-is. That is a small cut with no addressing change, and it **replaces**
-  the structural project rather than preceding it.
+- **Single-batch wrapper overhead.** If the time sits on concatenations of ONE
+  batch, it is not copy cost at all: arrow's one-batch path is already a zero-copy
+  slice (`benches/join_materialization_shape.rs`), so what remains is O(columns)
+  wrapper allocation, previously measured as negligible. That finding **stops**
+  this record's structural project — a multi-batch design cannot remove time that
+  is not spent copying — and hands back an investigation, not a cut: a wrapper
+  cost large enough to see would contradict the bench and has to be explained
+  before anything is built on it.
 - **Build-heavy, multi-batch.** Left side dominant: direct multi-batch build.
   The build side is read once into a hash structure, so it is the cheaper half to
   serve.
@@ -73,14 +85,19 @@ locates time, it does not name a mechanism.
 
 ### 3. Thresholds, fixed now
 
-A side justifies the addressing change only if it carries **≥ 500 ms** board-wide
-on its own child counter (≈7% of the parent) **and** its shape shows genuinely
-multi-batch inputs — median batches per concat > 1 on the cells carrying that
-time. Both conditions, not either.
+A side justifies the addressing change only if its **MULTI-BATCH child** carries
+**≥ 500 ms** board-wide (≈7% of the parent). Not the side total: single-batch time
+is wrapper overhead a multi-batch design cannot reach, so counting it toward the
+gate would let the instrument argue for a project it has no evidence for.
 
-Below 500 ms, or single-batch dominated, this record takes the degenerate-copy
-cut or stops. A side that is large but single-batch does not authorize
-multi-batch work; it authorizes deleting a copy.
+The histogram is the second condition, and it is about ownership rather than
+frequency: the cells carrying that ≥ 500 ms must show concatenations of more than
+one batch actually occurring, not merely a task total of many batches spread over
+many single-batch calls.
+
+Below 500 ms on both multi-batch children, this record stops. A side that is
+large but single-batch does not authorize multi-batch work and does not authorize
+a copy elision either — there is no copy.
 
 ### 4. A row-wise cost is priced before a row-wise change is built
 
@@ -94,18 +111,28 @@ analogue of it.
 
 ## Acceptance
 
-- **The side split partitions its parent exactly.** `left + right == parent` on
-  every node, not `<=`. Both sides are charged from one clock read, so a shortfall
-  means a charged site skipped its child — the only way this split can silently
-  lose a side.
+- **The four children partition their parent exactly.** `left_single +
+  left_multi + right_single + right_multi == parent` on every node, not `<=`.
+  Every charged concat adds to the parent and to exactly one child from one clock
+  read, so a shortfall means a site skipped its child — the only way this split
+  can silently lose a side or a shape.
+- **The time is split by shape, not only by side.** A single-batch concatenation
+  is arrow zero-copy wrapper work; a design that consumes batches directly cannot
+  remove it. An instrument that could not separate the two would let wrapper
+  overhead read as evidence for an addressing change, which is the specific
+  mistake this record was written to avoid.
 - **Shape is reported per side, in all three quantities.** Batches, rows and
   bytes. Batches alone cannot distinguish a large copy from many small ones;
   bytes alone cannot say whether re-chunking is available. Bytes are slice sizes,
   never allocation sizes.
-- **The degenerate-copy case is reported explicitly**, as the distribution of
-  batches per concat rather than a mean, because one 400-batch concat among
-  thousands of single-batch ones is a different project from a uniformly
-  multi-batch board.
+- **Shape is recorded per INVOCATION, not per task.** Invocation counts and a
+  bounded batch-count histogram, because a task total of 400 batches is either one
+  400-batch concat or 400 single-batch ones and those point at opposite projects.
+  A task-aggregated total cannot tell them apart — the same aggregation trap this
+  line already paid for once, recorded in section 4 of ADR 554's evidence.
+- **The histogram reconciles.** Bucketed invocations plus empty ones equal the
+  invocation count, so a concat cannot go unrecorded in the distribution while
+  still charging time.
 - **Any implemented change carries a correctness rail comparable to the slice
   equivalence check**: an opt-in diagnostic that materializes both ways and
   compares `ArrayData`, run at least once over the full cohort before the change
