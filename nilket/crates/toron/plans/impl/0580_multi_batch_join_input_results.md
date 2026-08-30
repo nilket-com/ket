@@ -101,9 +101,9 @@ ADR 580's clause 4 is satisfied.
 `execute_hash_join` already returns `Vec<RecordBatch>` and
 `probe_in_memory_join_rows` already takes one probe batch with batch-local `u32` rows, so
 probing the 4-7 right-side batches one at a time needs no `(batch, row)` addressing and
-leaves the selection vocabulary and the slice rule alone. Only the left-preserving kinds
-need anything join-wide: `build_match_bitmap` hoisted out of the per-probe call, with
-unmatched build rows emitted after the last batch.
+leaves the selection vocabulary and the slice rule alone. Only the left-preserving kinds need anything join-wide — `LeftOuter`, `FullOuter`,
+`LeftSemi`, `LeftAnti` — where `build_match_bitmap` is hoisted out of the per-probe call
+and unmatched build rows are emitted after the last batch.
 
 The bench prices that pipeline end to end against the current one — concat, keys, probe,
 gather or fold — at q09/q08/q17 shapes, reporting phase times, output batch count and peak
