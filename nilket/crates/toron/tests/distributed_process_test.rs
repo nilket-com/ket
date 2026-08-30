@@ -3482,3 +3482,72 @@ async fn adr260_verify_probe_left_outer_over_grouped_aggregate_fragments() {
 		"hash LeftOuter over grouped aggregate is a 3-stage plan"
 	);
 }
+
+/// ADR 580: a join's output batches are never mistaken for shuffle partitions.
+///
+/// The batch-local route returns one output batch per matching probe batch where
+/// the concatenating route returned one in total. That is safe only because a
+/// `ShuffleProducer` task never publishes a join's batches directly: the
+/// fragmenter puts an `Exchange` at the task's root, and the exchange decides
+/// partitions from the partition key over ALL input batches. This pins that
+/// structure — a producer task whose root stopped being an Exchange would start
+/// interpreting batch count as partition count, silently.
+#[tokio::test]
+async fn a_join_shuffle_producer_repartitions_through_an_exchange() {
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT set_left.set_key, set_right.set_key FROM set_left \
+			 INNER JOIN set_right ON set_left.set_key = set_right.set_key",
+		)
+		.expect("plan join sql");
+	let bound = bind(
+		&logical,
+		join_process_catalog().as_ref(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind join sql");
+	let stages = fragment_plan(
+		bound,
+		FragmentPlanConfig::new_for_test(
+			QueryId::new(),
+			TaskBudget::from_query_budget(QueryBudget::test_default()),
+		),
+	)
+	.expect("fragment join sql");
+
+	let mut producers = 0;
+	for stage in &stages {
+		for task in &stage.tasks {
+			let TaskOutputBinding::ShuffleProducer {
+				partition_count, ..
+			} = &task.spec.output
+			else {
+				continue;
+			};
+			producers += 1;
+			let ExecutionPlan::Exchange {
+				partition_count: plan_partitions,
+				..
+			} = &task.spec.plan
+			else {
+				panic!(
+					"a shuffle producer's plan root must be an Exchange, not {:?} — \
+					 without it the task's returned batches would be published as \
+					 partitions",
+					task.spec.plan
+				);
+			};
+			assert_eq!(
+				PartitionCount::new(*plan_partitions),
+				*partition_count,
+				"the exchange must produce exactly the partitions the binding declares"
+			);
+		}
+	}
+	assert!(
+		producers > 0,
+		"this fixture must fragment into at least one shuffle producer, or the \
+		 test proves nothing"
+	);
+}

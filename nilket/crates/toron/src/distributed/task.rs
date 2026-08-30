@@ -566,6 +566,38 @@ pub struct TaskTelemetryCounters {
 	/// walked, and the ratio is the deferral's coverage.
 	#[serde(default)]
 	pub join_output_index_rows_materialized: u64,
+	/// ADR 580: which input route each `execute_hash_join` committed to — probing
+	/// the right batches directly, or concatenating them first.
+	///
+	/// A receipt, so a run reads the batch-local figures only on nodes where the
+	/// route actually fired and a fallback is a recorded fact rather than the
+	/// absence of one.
+	#[serde(default)]
+	pub join_batch_local_routes: u64,
+	#[serde(default)]
+	pub join_concatenated_routes: u64,
+	/// Output batches the batch-local route produced. It returns one per probe
+	/// batch where the concatenating route returns one in total, and the consumer
+	/// pays for that difference, so it is measured rather than assumed free.
+	#[serde(default)]
+	pub join_batch_local_output_batches: u64,
+	/// Slice bytes the skipped concatenation would have copied.
+	///
+	/// Bytes NOT allocated, which is what the route changes. NOT a measured peak:
+	/// the source batches and the per-batch outputs are still live.
+	#[serde(default)]
+	pub join_batch_local_concat_bytes_avoided: u64,
+	/// Builds that passed the batch-local route's admission estimate and were then
+	/// declined by the build itself.
+	///
+	/// MUST BE ZERO. The admission gate tests the estimate for the whole build and
+	/// the build tests the same estimate for a row count that cannot exceed it, so
+	/// a decline here contradicts the gate. It is counted because its consequence is
+	/// otherwise invisible: the caller rebuilds on the concatenating path, and that
+	/// duplicated work lands in framework overhead while the receipt reports an
+	/// ordinary fallback.
+	#[serde(default)]
+	pub join_batch_local_post_admission_declines: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
