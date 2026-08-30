@@ -865,10 +865,18 @@ mod tests {
 			),
 		];
 		for (name, frame, plot_type) in fixtures {
+			let authored_spec = if plot_type == PlotType::Hexbin {
+				AuthoredPlotSpec::hexbin(crate::plot::spec::HexbinFields {
+					x: "x".to_owned(),
+					y: "y".to_owned(),
+				})
+			} else {
+				AuthoredPlotSpec::automatic(PlotComposition::single(plot_type))
+			};
 			let (_, after) = plan_with_categorical_palette(
 				PlotRequest {
 					source: materialized(name, frame),
-					authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(plot_type)),
+					authored_spec,
 				},
 				&selection,
 				&identity,

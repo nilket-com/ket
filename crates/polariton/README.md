@@ -279,6 +279,23 @@ and accepts percentage-point y tick steps. A zero-total x sample pinches every
 band to zero. A fully occupied percent area can occlude every interior gridline;
 the percentage ticks and resolved series boundaries remain above the fills.
 
+#### Rune hexbin presentation:
+
+Hexbin accepts two quantitative observation columns and derives count-coloured
+regular hexagons from the settled plot viewport:
+
+```rune
+workspace.table("observations").views([
+    hexbin("x", "y"),
+])
+```
+
+The spelling takes raw observations, while the system synthesizes the
+viewport-parameterized preparation that an author cannot express in the
+relation. Radius, lattice orientation, weights, and diverging colour are not
+authored controls; temporal coordinates refuse until typed temporal projection
+is defined.
+
 #### Adapters:
  - SQLite (file or memory)
  - Parquet (single file)
@@ -296,5 +313,4 @@ the percentage ticks and resolved series boundaries remain above the fills.
  - Password protection.
  - More data sources (Postgres, MySQL, BigQuery, Redshift, ad inf...)
  - Scatter / Line / Bar plots
- - Hexbin / Kernel Density plots
  - Qwen Coder SQL generator

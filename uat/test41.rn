@@ -1,0 +1,18 @@
+// PRODUCT-0144: authored viewport-prepared hexbin and temporal refusal.
+let points = workspace.table("hexbin_probe");
+points.views([
+	view("hexbin-density", figure([
+		title("Hexbin · viewport-prepared density"),
+		subtitle("Count colour rebins against the settled plot viewport"),
+		sequential_palette("magma"),
+		hexbin("x", "y"),
+	])),
+]);
+
+let stamped = workspace.table("hexbin_probe_temporal");
+stamped.views([
+	view("hexbin-temporal-refusal", figure([
+		title("Hexbin · temporal x refuses"),
+		hexbin("stamp", "y"),
+	])),
+]);

@@ -441,6 +441,7 @@ fn produced_receiver(handler: HandlerId) -> Option<SemanticReceiver> {
 		| HandlerId::Box
 		| HandlerId::Bubble
 		| HandlerId::Heatmap
+		| HandlerId::Hexbin
 		| HandlerId::Funnel
 		| HandlerId::RadialDial
 		| HandlerId::Pie
@@ -842,6 +843,7 @@ fn static_method_on_relation(
 			| "bubble"
 			| "funnel"
 			| "heatmap"
+			| "hexbin"
 			| "radial_dial"
 			| "pie" | "violin"
 			| "radar" | "parallel"
@@ -1641,6 +1643,7 @@ fn rewrite_calls_mapped(
 			"box" => Some(&[7]),
 			"bubble" => Some(&[4, 5]),
 			"heatmap" => Some(&[3]),
+			"hexbin" => Some(&[2]),
 			"funnel" => Some(&[2]),
 			"radial_dial" => Some(&[2, 3]),
 			"pie" => Some(&[2]),
@@ -2169,6 +2172,16 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0144_hexbin_rewriter_retains_two_argument_origins() {
+		let source = "hexbin(\"x\", \"y\")";
+		let rewritten = rewrite_calls(source, 100).expect("rewrite hexbin call");
+		assert_eq!(
+			rewritten,
+			"polariton_presentation::__hexbin(\"x\", \"y\", 107, 110, 112, 115, 100, 116)"
+		);
+	}
+
+	#[test]
 	fn product_0105_variadic_multivariate_words_retain_origins_and_single_routing() {
 		let rewritten =
 			rewrite_calls("radar(\"a\", \"b\", \"c\")", 100).expect("rewrite variadic radar call");
@@ -2684,6 +2697,119 @@ relation.views([figure([
 				"accepted forbidden surface: {source}"
 			);
 		}
+	}
+
+	#[test]
+	fn product_0144_hexbin_surface_is_closed_originated_and_honestly_labelled() {
+		let fields = "\"x\", \"y\"";
+		for slot in [
+			format!("hexbin({fields})"),
+			format!("view(\"named\", hexbin({fields}))"),
+			format!("view(\"named\", figure([hexbin({fields})]))"),
+			format!("figure([hexbin({fields})])"),
+		] {
+			let source = format!(
+				"let relation = workspace.table(\"hexbin_probe\");\nrelation.views([{slot}]);"
+			);
+			let compiled = compile(&source).unwrap_or_else(|error| panic!("{slot}: {error}"));
+			let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+				panic!("hexbin surface produced a table")
+			};
+			let RunePlotBody::Single(sink) = &plot.body else {
+				panic!("an unmodified hexbin must use the live Single path")
+			};
+			assert_eq!(
+				sink.composition.primary_plot_type(),
+				crate::plot::core::PlotType::Hexbin
+			);
+			let (fields, origins) = sink
+				.mark_fields
+				.as_ref()
+				.and_then(|fields| fields.hexbin())
+				.expect("hexbin fields and origins");
+			assert_eq!((fields.x.as_str(), fields.y.as_str()), ("x", "y"));
+			assert_eq!(
+				&source[origins.x.start as usize..origins.x.end as usize],
+				"\"x\""
+			);
+			assert_eq!(
+				&source[origins.y.start as usize..origins.y.end as usize],
+				"\"y\""
+			);
+			let presentation = compiled.executions[0].views[0].intent.presentation();
+			assert_eq!(presentation.display_label, "plot.hexbin");
+			assert_eq!(sink.composition.title(), "Hexbin Plot");
+		}
+
+		let layered = format!(
+			"let r = workspace.table(\"hexbin_probe\"); r.views([layers([hexbin({fields}), line(\"x\", \"y\")])]);"
+		);
+		let error = compile(&layered).expect_err("hexbin must remain outside LayerMark");
+		assert!(
+			error
+				.to_string()
+				.contains("hexbin(...) is a view sink, not a shared-Cartesian layer"),
+			"{error}"
+		);
+
+		let sugar = format!("workspace.table(\"hexbin_probe\").hexbin({fields})");
+		let error = compile(&sugar).expect_err("hexbin relation sugar is closed");
+		assert!(
+			error
+				.to_string()
+				.contains("hexbin is a sink inside .views([...]"),
+			"{error}"
+		);
+
+		for source in [
+			"workspace.table(\"hexbin_probe\").views([hexbin(\"x\")])",
+			"workspace.table(\"hexbin_probe\").views([hexbin(\"x\", \"y\", \"z\")])",
+			"workspace.table(\"hexbin_probe\").views([hexbin(1, \"y\")])",
+		] {
+			let error = compile(source).expect_err("malformed hexbin must refuse");
+			let RuneEnvelopeError::InvalidView { span, .. } = &error else {
+				panic!("malformed hexbin must retain an authored call span: {error}")
+			};
+			assert!(
+				source[span.start as usize..span.end as usize].starts_with("hexbin("),
+				"refusal did not land on the hexbin call: {error}"
+			);
+			assert!(
+				error
+					.to_string()
+					.contains("hexbin(...) takes x and y strings")
+					|| error
+						.to_string()
+						.contains("field arguments must evaluate to strings"),
+				"{error}"
+			);
+		}
+
+		let diverging =
+			"workspace.table(\"hexbin_probe\").views([hexbin(\"x\", \"y\").diverging()])";
+		let error = compile(diverging).expect_err("hexbin has no colour job word");
+		assert!(
+			error
+				.to_string()
+				.contains("diverging colour is available on heatmap and bubble marks"),
+			"{error}"
+		);
+
+		let bounded = compile(
+			"workspace.table(\"hexbin_probe\").views([figure([x_axis().bounds(0, 1), y_axis().bounds(0, 1), hexbin(\"x\", \"y\")])])",
+		)
+		.expect("hexbin accepts both quantitative axis bounds");
+		let RuneViewIntent::Plot(plot) = &bounded.executions[0].views[0].intent else {
+			panic!("bounded hexbin produced a table")
+		};
+		assert!(matches!(
+			&plot.authored_settings.domains,
+			Override::Set(domain)
+				if domain.x_min == Some(0.0)
+					&& domain.x_max == Some(1.0)
+					&& domain.y_min == Some(0.0)
+					&& domain.y_max == Some(1.0)
+		));
 	}
 
 	#[test]
@@ -4155,6 +4281,28 @@ r.views([bar(category(), "revenue")])
 			assert_eq!(
 				plot.authored_settings.legend_size,
 				Override::Set(LegendTextSize::new(18.0).unwrap())
+			);
+		}
+	}
+
+	#[test]
+	fn product_0144_test41_is_the_authored_hexbin_and_temporal_refusal_exhibit() {
+		let source = include_str!("../../../uat/test41.rn");
+		let compiled = compile(source).expect("the checked-in hexbin exhibit compiles");
+		assert_eq!(compiled.executions.len(), 2);
+		assert_eq!(compiled.presentation_order.len(), 2);
+		assert!(source.contains("hexbin(\"x\", \"y\")"));
+		assert!(source.contains("hexbin(\"stamp\", \"y\")"));
+		for execution in &compiled.executions {
+			let RuneViewIntent::Plot(plot) = &execution.views[0].intent else {
+				panic!("hexbin exhibit produced a table")
+			};
+			let RunePlotBody::Single(sink) = &plot.body else {
+				panic!("hexbin exhibit produced a styled or layered sink")
+			};
+			assert_eq!(
+				sink.composition.primary_plot_type(),
+				crate::plot::core::PlotType::Hexbin
 			);
 		}
 	}

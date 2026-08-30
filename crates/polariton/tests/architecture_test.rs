@@ -5357,7 +5357,7 @@ fn product_0143_hexbin_renderer_consumes_only_tagged_viewport_artifacts() {
 }
 
 #[test]
-fn product_0143_keeps_the_old_authority_and_premature_surfaces_absent() {
+fn product_0143_authority_survives_product_0144_precise_surface_inversions() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read plot factory");
 	let hexbin_branch = factory
@@ -5388,8 +5388,8 @@ fn product_0143_keeps_the_old_authority_and_premature_surfaces_absent() {
 
 	let registry = presentation_registry(&root);
 	assert!(
-		registry_callable(&registry, "hexbin", "Free", "Hexbin").is_none(),
-		"PRODUCT-0143 must not add the PRODUCT-0144 Rune constructor"
+		registry_callable(&registry, "hexbin", "Free", "Hexbin").is_some(),
+		"PRODUCT-0144 must expose the accepted free constructor"
 	);
 	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
 	let mark_fields = spec
@@ -5399,8 +5399,8 @@ fn product_0143_keeps_the_old_authority_and_premature_surfaces_absent() {
 		.split("pub struct AuthoredPlotSpec")
 		.next()
 		.expect("bounded MarkFields");
-	assert!(!mark_fields.contains("Hexbin"));
-	assert!(!mark_fields.contains("hexbin"));
+	assert!(mark_fields.contains("Hexbin"));
+	assert!(spec.contains("pub fn hexbin"));
 	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
 		.expect("read Rune relation envelope");
 	let spanned = envelope
@@ -5410,8 +5410,71 @@ fn product_0143_keeps_the_old_authority_and_premature_surfaces_absent() {
 		.split("impl SpannedMarkFields")
 		.next()
 		.expect("bounded SpannedMarkFields");
-	assert!(!spanned.contains("Hexbin"));
-	assert!(!spanned.contains("hexbin"));
+	assert!(spanned.contains("Hexbin"));
+	assert!(envelope.contains("pub(crate) fn hexbin"));
+}
+
+#[test]
+fn product_0144_keeps_hexbin_out_of_layers_and_colour_job_words() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let layer_mark = spec
+		.split("pub enum LayerMark")
+		.nth(1)
+		.expect("LayerMark declaration")
+		.split("impl LayerMark")
+		.next()
+		.expect("bounded LayerMark");
+	assert!(!layer_mark.contains("Hexbin"));
+
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read Rune presentation");
+	let diverging = presentation
+		.split("fn mark_diverging(")
+		.nth(1)
+		.expect("diverging modifier")
+		.split("fn mark_category(")
+		.next()
+		.expect("bounded diverging modifier");
+	assert!(diverging.contains("PlotType::Heatmap | PlotType::Bubble"));
+	assert!(!diverging.contains("PlotType::Hexbin"));
+
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune relation envelope");
+	let into_layer = envelope
+		.split("pub(crate) fn into_layer")
+		.nth(1)
+		.expect("into_layer")
+		.split("pub(crate) struct RuneViewIntent")
+		.next()
+		.expect("bounded into_layer");
+	assert!(into_layer.contains("PlotType::Hexbin"));
+	assert!(into_layer.contains("Err(self)"));
+}
+
+#[test]
+fn product_0144_diagnostics_reuse_the_retained_artifact_token() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let gui = std::fs::read_to_string(root.join("gui/state.rs")).expect("read GUI state");
+	let failure = gui
+		.split("fn hexbin_failure_span")
+		.nth(1)
+		.expect("hexbin diagnostic mapper")
+		.split("fn bubble_failure_span")
+		.next()
+		.expect("bounded hexbin mapper");
+	assert!(failure.contains("source_token"));
+	assert!(failure.contains("prepare_hexbin_observations"));
+	assert!(!failure.contains("ArtifactToken::mint"));
+	assert!(!failure.contains("error.field =="));
+	let output = gui
+		.split("let hexbin_output_span")
+		.nth(1)
+		.expect("hexbin output-span wiring")
+		.split("let bubble_output_span")
+		.next()
+		.expect("bounded hexbin output span");
+	assert!(output.contains("result.artifact_token()"));
 }
 
 #[test]

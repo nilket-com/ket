@@ -72,6 +72,7 @@ pub(crate) enum HandlerId {
 	Box,
 	Bubble,
 	Heatmap,
+	Hexbin,
 	Funnel,
 	RadialDial,
 	Pie,
@@ -265,6 +266,16 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		FREE,
 		NONE,
 		"Construct a heatmap mark."
+	),
+	callable!(
+		"hexbin",
+		Free,
+		2..=2,
+		Text,
+		Hexbin,
+		FREE,
+		NONE,
+		"Construct a hexbin mark."
 	),
 	callable!(
 		"funnel",
@@ -955,6 +966,7 @@ const ALL_MARKS: &[PlotType] = &[
 	PlotType::Bubble,
 	PlotType::Funnel,
 	PlotType::Heatmap,
+	PlotType::Hexbin,
 	PlotType::Histogram,
 	PlotType::Line,
 	PlotType::Parallel,
@@ -2192,6 +2204,43 @@ mod tests {
 				vertical.iter().map(|row| row.key).collect::<Vec<_>>(),
 				"orientation must not change the inspected surface"
 			);
+		}
+	}
+
+	#[test]
+	fn product_0144_hexbin_inspector_is_heatmap_without_colour_job_controls() {
+		let settings = PlotSettings::default();
+		let resolved = settings.resolve();
+		let heatmap = inspector_rows(&settings, &resolved, Some(PlotType::Heatmap), None)
+			.into_iter()
+			.map(|row| row.key)
+			.collect::<HashSet<_>>();
+		let hexbin = inspector_rows(&settings, &resolved, Some(PlotType::Hexbin), None)
+			.into_iter()
+			.map(|row| row.key)
+			.collect::<HashSet<_>>();
+		let expected = heatmap
+			.difference(&HashSet::from([
+				SettingKey::Diverging,
+				SettingKey::DivergingAt,
+			]))
+			.copied()
+			.collect::<HashSet<_>>();
+		assert_eq!(hexbin, expected);
+		for absent in [
+			SettingKey::PointSize,
+			SettingKey::StrokeWidth,
+			SettingKey::BarWidth,
+			SettingKey::CategoryGap,
+			SettingKey::Stacked,
+			SettingKey::Percent,
+			SettingKey::Diverging,
+			SettingKey::DivergingAt,
+		] {
+			assert!(!hexbin.contains(&absent), "hexbin exposed {absent:?}");
+		}
+		for present in [SettingKey::XAxisBounds, SettingKey::YAxisBounds] {
+			assert!(hexbin.contains(&present), "hexbin omitted {present:?}");
 		}
 	}
 

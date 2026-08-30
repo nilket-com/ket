@@ -686,6 +686,18 @@ pub struct HeatmapFields {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HexbinFields {
+	pub x: String,
+	pub y: String,
+}
+
+impl HexbinFields {
+	pub fn all(&self) -> [&str; 2] {
+		[&self.x, &self.y]
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunnelFields {
 	pub stage: String,
 	pub value: String,
@@ -747,6 +759,7 @@ impl HeatmapFields {
 pub enum MarkFields {
 	BoxPlot(BoxPlotFields),
 	Heatmap(HeatmapFields),
+	Hexbin(HexbinFields),
 	Bubble(BubbleFields),
 	Funnel(FunnelFields),
 	RadialDial(RadialDialFields),
@@ -791,6 +804,7 @@ impl MarkFields {
 		match self {
 			Self::BoxPlot(_) => 7,
 			Self::Heatmap(_) => 3,
+			Self::Hexbin(_) => 2,
 			Self::Bubble(fields) => 4 + usize::from(fields.label.is_some()),
 			Self::Funnel(_) | Self::Pie(_) => 2,
 			Self::Violin(_) => 4,
@@ -805,6 +819,7 @@ impl MarkFields {
 		match self {
 			Self::BoxPlot(fields) => fields.all().get(index).copied(),
 			Self::Heatmap(fields) => fields.all().get(index).copied(),
+			Self::Hexbin(fields) => fields.all().get(index).copied(),
 			Self::Bubble(fields) => match index {
 				0 => Some(fields.numeric.get(BubbleNumericField::X)),
 				1 => Some(fields.numeric.get(BubbleNumericField::Y)),
@@ -959,6 +974,23 @@ impl AuthoredPlotSpec {
 	pub fn heatmap_fields(&self) -> Option<&HeatmapFields> {
 		match self.mark_fields.as_ref() {
 			Some(MarkFields::Heatmap(fields)) => Some(fields),
+			_ => None,
+		}
+	}
+
+	pub fn hexbin(fields: HexbinFields) -> Self {
+		let mut spec = Self::xy(
+			PlotComposition::single(PlotType::Hexbin),
+			fields.x.clone(),
+			fields.y.clone(),
+		);
+		spec.mark_fields = Some(MarkFields::Hexbin(fields));
+		spec
+	}
+
+	pub fn hexbin_fields(&self) -> Option<&HexbinFields> {
+		match self.mark_fields.as_ref() {
+			Some(MarkFields::Hexbin(fields)) => Some(fields),
 			_ => None,
 		}
 	}
@@ -2207,6 +2239,9 @@ pub fn resolve_channels(
 	if plot_type == PlotType::Heatmap && spec.heatmap_fields().is_some() {
 		return resolve_heatmap_channels(spec, schema);
 	}
+	if plot_type == PlotType::Hexbin && spec.hexbin_fields().is_some() {
+		return resolve_hexbin_channels(spec, schema);
+	}
 	if plot_type == PlotType::Bubble && spec.bubble_fields().is_some() {
 		return resolve_bubble_channels(spec, schema);
 	}
@@ -2615,6 +2650,52 @@ fn resolve_heatmap_channels(
 			Override::Set(job) => job,
 			Override::Inherit => ColorJob::Sequential,
 		}),
+		continuous_anchor: spec.continuous_anchor,
+		categorical_limit: 0,
+		stack_normalization: StackNormalization::Absolute,
+	})
+}
+
+fn resolve_hexbin_channels(
+	spec: &AuthoredPlotSpec,
+	schema: &Schema,
+) -> Result<ChannelBinding, ChannelError> {
+	let fields = spec.hexbin_fields().ok_or_else(|| ChannelError {
+		attribution: FieldAttribution::Channel(Channel::X),
+		field: "<hexbin>".to_owned(),
+		reason: "Hexbin requires explicit x and y fields".to_owned(),
+	})?;
+	let layer = LayerIdentity {
+		ordinal: 0,
+		plot_type: PlotType::Hexbin,
+	};
+	let mut used_by_auto = HashSet::new();
+	let x = resolve_required(
+		Channel::X,
+		&spec.x,
+		PlotType::Hexbin,
+		&layer,
+		false,
+		schema,
+		&mut used_by_auto,
+	)?;
+	let y = resolve_required(
+		Channel::Y,
+		&spec.y,
+		PlotType::Hexbin,
+		&layer,
+		false,
+		schema,
+		&mut used_by_auto,
+	)?;
+	Ok(ChannelBinding {
+		composition: spec.composition.clone(),
+		channels: vec![x, y],
+		kernel_fields: Box::new(ResolvedKernelFields::Hexbin {
+			x: fields.x.clone(),
+			y: fields.y.clone(),
+		}),
+		color_job: None,
 		continuous_anchor: spec.continuous_anchor,
 		categorical_limit: 0,
 		stack_normalization: StackNormalization::Absolute,
@@ -3848,6 +3929,7 @@ fn semantic_is_compatible(plot_type: PlotType, channel: Channel, semantic: Seman
 		}
 		(PlotType::BoxPlot, Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::Heatmap, Channel::X | Channel::Y) => semantic == SemanticType::Nominal,
+		(PlotType::Hexbin, Channel::X | Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::Bubble, Channel::X | Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::Funnel, Channel::X) => semantic == SemanticType::Nominal,
 		(PlotType::Funnel, Channel::Y) => semantic == SemanticType::Quantitative,
@@ -4802,6 +4884,101 @@ mod tests {
 			(FieldAttribution::Channel(Channel::Color), "margin")
 		);
 		assert!(error.reason.contains("no supported semantic type"));
+	}
+
+	fn hexbin_spec() -> AuthoredPlotSpec {
+		AuthoredPlotSpec::hexbin(HexbinFields {
+			x: "x".to_owned(),
+			y: "y".to_owned(),
+		})
+	}
+
+	#[test]
+	fn product_0144_hexbin_resolves_only_two_quantitative_channels_without_colour_job() {
+		let numeric = df!("x" => [1_i64, 2], "y" => [3.0_f64, 4.0]).unwrap();
+		let binding = resolve_channels(&hexbin_spec(), numeric.schema().as_ref())
+			.expect("authored quantitative hexbin resolves");
+		assert_eq!(binding.channels.len(), 2);
+		assert!(binding.channels.iter().all(|channel| {
+			channel.semantic_type == SemanticType::Quantitative
+				&& channel.scale == ScaleFamily::Linear
+		}));
+		assert!(matches!(
+			binding.kernel_fields.as_ref(),
+			ResolvedKernelFields::Hexbin { x, y } if x == "x" && y == "y"
+		));
+		assert_eq!(binding.color_job, None);
+		assert_eq!(binding.categorical_limit, 0);
+		assert_eq!(binding.stack_normalization, StackNormalization::Absolute);
+	}
+
+	#[test]
+	fn product_0144_hexbin_refuses_nominal_unsupported_and_all_temporal_dtypes_by_channel() {
+		let temporal = [
+			Column::new("value".into(), [1_i32, 2_i32])
+				.cast(&DataType::Date)
+				.unwrap(),
+			Column::new("value".into(), [1_i64, 2_i64])
+				.cast(&DataType::Datetime(
+					polars::prelude::TimeUnit::Milliseconds,
+					None,
+				))
+				.unwrap(),
+			Column::new("value".into(), [1_i64, 2_i64])
+				.cast(&DataType::Datetime(
+					polars::prelude::TimeUnit::Milliseconds,
+					polars::prelude::TimeZone::opt_try_new(Some("UTC")).unwrap(),
+				))
+				.unwrap(),
+			Column::new("value".into(), [1_i64, 2_i64])
+				.cast(&DataType::Time)
+				.unwrap(),
+		];
+
+		for (channel, field) in [(Channel::X, "x"), (Channel::Y, "y")] {
+			for value in temporal
+				.iter()
+				.cloned()
+				.chain([Column::new("value".into(), ["a", "b"])])
+			{
+				let mut columns = vec![
+					Column::new("x".into(), [1.0_f64, 2.0]),
+					Column::new("y".into(), [3.0_f64, 4.0]),
+				];
+				let index = usize::from(channel == Channel::Y);
+				columns[index] = value.with_name(field.into());
+				let frame = DataFrame::new(2, columns).unwrap();
+				let error = resolve_channels(&hexbin_spec(), frame.schema().as_ref())
+					.expect_err("non-quantitative hexbin channel must refuse");
+				assert_eq!(error.attribution, FieldAttribution::Channel(channel));
+				assert_eq!(error.field, field);
+			}
+
+			let schema: Schema = [
+				(
+					"x".into(),
+					if channel == Channel::X {
+						DataType::List(Box::new(DataType::Float64))
+					} else {
+						DataType::Float64
+					},
+				),
+				(
+					"y".into(),
+					if channel == Channel::Y {
+						DataType::List(Box::new(DataType::Float64))
+					} else {
+						DataType::Float64
+					},
+				),
+			]
+			.into_iter()
+			.collect();
+			let error = resolve_channels(&hexbin_spec(), &schema)
+				.expect_err("unsupported hexbin channel must refuse");
+			assert_eq!(error.attribution, FieldAttribution::Channel(channel));
+			assert_eq!(error.field, field);
+		}
 	}
 
 	fn bubble_spec(label: Option<&str>) -> AuthoredPlotSpec {

@@ -1596,6 +1596,7 @@ fn authored_rune_plot_spec(sink: &DisposableRunePlotSink) -> AuthoredPlotSpec {
 		return match fields.to_mark_fields() {
 			crate::plot::spec::MarkFields::BoxPlot(fields) => AuthoredPlotSpec::box_plot(fields),
 			crate::plot::spec::MarkFields::Heatmap(fields) => AuthoredPlotSpec::heatmap(fields),
+			crate::plot::spec::MarkFields::Hexbin(fields) => AuthoredPlotSpec::hexbin(fields),
 			crate::plot::spec::MarkFields::Bubble(fields) => AuthoredPlotSpec::bubble(fields),
 			crate::plot::spec::MarkFields::Funnel(fields) => AuthoredPlotSpec::funnel(fields),
 			crate::plot::spec::MarkFields::RadialDial(fields) => {
@@ -1699,6 +1700,48 @@ fn heatmap_failure_span(
 		}
 		Err(crate::plot::kernels::heatmap_cells::HeatmapCellsError::DuplicateCell { .. }) => {
 			origins.keys()
+		}
+		Ok(_) => mark.clone(),
+	}
+}
+
+#[cfg(feature = "toron")]
+fn hexbin_failure_span(
+	data: &DataFrame,
+	source_token: crate::result_artifact::ArtifactToken,
+	fields: &crate::plot::spec::HexbinFields,
+	origins: &crate::rune_relation_envelope::HexbinFieldOrigins,
+	mark: &std::ops::Range<u32>,
+) -> std::ops::Range<u32> {
+	let for_channel = |channel| match channel {
+		crate::plot::kernels::hexbin_viewport::HexbinChannel::X => origins.x.clone(),
+		crate::plot::kernels::hexbin_viewport::HexbinChannel::Y => origins.y.clone(),
+	};
+	let authored = AuthoredPlotSpec::hexbin(fields.clone());
+	if let Err(error) = resolve_channels(&authored, data.schema().as_ref()) {
+		return match error.attribution {
+			crate::plot::spec::FieldAttribution::Channel(Channel::X) => origins.x.clone(),
+			crate::plot::spec::FieldAttribution::Channel(Channel::Y) => origins.y.clone(),
+			_ => mark.clone(),
+		};
+	}
+	match crate::plot::kernels::hexbin_viewport::prepare_hexbin_observations(
+		data,
+		&fields.x,
+		&fields.y,
+		source_token,
+	) {
+		Err(error) => {
+			use crate::plot::kernels::hexbin_viewport::HexbinPreparationError;
+			let channel = match error {
+				HexbinPreparationError::MissingColumn { channel, .. }
+				| HexbinPreparationError::TemporalColumn { channel, .. }
+				| HexbinPreparationError::UnsupportedColumn { channel, .. }
+				| HexbinPreparationError::NullValue { channel, .. }
+				| HexbinPreparationError::NonFiniteValue { channel, .. }
+				| HexbinPreparationError::InexactValue { channel, .. } => channel,
+			};
+			for_channel(channel)
 		}
 		Ok(_) => mark.clone(),
 	}
@@ -2686,6 +2729,10 @@ fn rune_view_outcome_with_palettes(
 				let (fields, origins) = sink.mark_fields.as_ref()?.heatmap()?;
 				Some((fields.clone(), origins.clone(), sink.origin.clone()))
 			});
+			let hexbin_diagnostic = diagnostic_sink.and_then(|sink| {
+				let (fields, origins) = sink.mark_fields.as_ref()?.hexbin()?;
+				Some((fields.clone(), origins.clone(), sink.origin.clone()))
+			});
 			let bubble_diagnostic = diagnostic_sink.and_then(|sink| {
 				let (fields, origins) = sink.mark_fields.as_ref()?.bubble()?;
 				Some((fields.clone(), origins.clone(), sink.origin.clone()))
@@ -3084,6 +3131,17 @@ fn rune_view_outcome_with_palettes(
 					heatmap_failure_span(frame.as_ref(), fields, origins, mark)
 				})
 			});
+			let hexbin_output_span = output.as_ref().err().and_then(|_| {
+				hexbin_diagnostic.as_ref().map(|(fields, origins, mark)| {
+					hexbin_failure_span(
+						frame.as_ref(),
+						result.artifact_token(),
+						fields,
+						origins,
+						mark,
+					)
+				})
+			});
 			let bubble_output_span = output.as_ref().err().and_then(|_| {
 				bubble_diagnostic.as_ref().map(|(fields, origins, mark)| {
 					bubble_failure_span(frame.as_ref(), fields, origins, mark)
@@ -3125,6 +3183,7 @@ fn rune_view_outcome_with_palettes(
 					.or(output_span)
 					.or(box_output_span)
 					.or(heatmap_output_span)
+					.or(hexbin_output_span)
 					.or(bubble_output_span)
 					.or(funnel_output_span)
 					.or(radial_dial_output_span)
@@ -12307,6 +12366,183 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			"duplicated at rows 1 and 2",
 		);
 		assert!(complete(valid).sinks[0].output.is_ok());
+	}
+
+	#[test]
+	fn product_0144_hexbin_resolves_without_identity_and_attributes_both_failure_stations() {
+		use polars::frame::DataFrame;
+		use polars::prelude::{Column, DataType};
+		let source = r#"workspace.table("hexbin_probe").views([hexbin("x", "y")])"#;
+		let complete = |frame: DataFrame| {
+			let relation = transform_rune_view(source)
+				.expect("hexbin source compiles")
+				.into_relations()
+				.next()
+				.unwrap();
+			rune_view_outcome(frame, relation.views)
+		};
+		let valid = polars::df!(
+			"x" => [0.0_f64, 0.1, 1.0],
+			"y" => [0.0_f64, 0.1, 1.0],
+		)
+		.unwrap();
+		let outcome = complete(valid.clone());
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _, continuation)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("valid authored hexbin must resolve")
+		};
+		assert!(matches!(
+			resolved.resolved_spec.kernel_fields.as_ref(),
+			crate::plot::spec::ResolvedKernelFields::Hexbin { x, y }
+				if x == "x" && y == "y"
+		));
+		assert_eq!(resolved.resolved_spec.color_job, None);
+		let snapshot = continuation.identity.persistence_snapshot();
+		assert!(snapshot.assignments.is_empty());
+		assert!(snapshot.spaces.is_empty());
+
+		let assert_span = |frame: DataFrame, expected: &str, error_fragment: &str| {
+			let outcome = complete(frame);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("invalid hexbin rendered")
+			};
+			assert!(error.contains(error_fragment), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert_eq!(&source[span.start as usize..span.end as usize], expected);
+		};
+
+		assert_span(polars::df!("y" => [1.0_f64]).unwrap(), "\"x\"", "absent");
+		assert_span(polars::df!("x" => [1.0_f64]).unwrap(), "\"y\"", "absent");
+		assert_span(
+			polars::df!("x" => ["nominal"], "y" => [1.0_f64]).unwrap(),
+			"\"x\"",
+			"incompatible with Hexbin",
+		);
+		assert_span(
+			polars::df!("x" => [1.0_f64], "y" => ["nominal"]).unwrap(),
+			"\"y\"",
+			"incompatible with Hexbin",
+		);
+		for temporal in [
+			Column::new("value".into(), [1_i32])
+				.cast(&DataType::Date)
+				.unwrap(),
+			Column::new("value".into(), [1_i64])
+				.cast(&DataType::Datetime(
+					polars::prelude::TimeUnit::Milliseconds,
+					None,
+				))
+				.unwrap(),
+			Column::new("value".into(), [1_i64])
+				.cast(&DataType::Datetime(
+					polars::prelude::TimeUnit::Milliseconds,
+					polars::prelude::TimeZone::opt_try_new(Some("UTC")).unwrap(),
+				))
+				.unwrap(),
+			Column::new("value".into(), [1_i64])
+				.cast(&DataType::Time)
+				.unwrap(),
+		] {
+			assert_span(
+				DataFrame::new(
+					1,
+					vec![
+						temporal.clone().with_name("x".into()),
+						Column::new("y".into(), [1.0_f64]),
+					],
+				)
+				.unwrap(),
+				"\"x\"",
+				"incompatible with Hexbin",
+			);
+			assert_span(
+				DataFrame::new(
+					1,
+					vec![
+						Column::new("x".into(), [1.0_f64]),
+						temporal.with_name("y".into()),
+					],
+				)
+				.unwrap(),
+				"\"y\"",
+				"incompatible with Hexbin",
+			);
+		}
+		assert_span(
+			polars::df!("x" => [None::<f64>], "y" => [1.0_f64]).unwrap(),
+			"\"x\"",
+			"null at row 1",
+		);
+		assert_span(
+			polars::df!("x" => [1.0_f64], "y" => [f64::NAN]).unwrap(),
+			"\"y\"",
+			"non-finite at row 1",
+		);
+		assert_span(
+			polars::df!("x" => [9_007_199_254_740_993_i64], "y" => [1_i64]).unwrap(),
+			"\"x\"",
+			"cannot be represented exactly",
+		);
+		assert!(complete(valid.clone()).sinks[0].output.is_ok());
+
+		let resolve = |source: &str| {
+			let relation = transform_rune_view(source)
+				.expect("bound hexbin source compiles")
+				.into_relations()
+				.next()
+				.unwrap();
+			let outcome = rune_view_outcome(valid.clone(), relation.views);
+			let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _, _)) =
+				&outcome.sinks[0].output
+			else {
+				panic!("bound hexbin resolves")
+			};
+			resolved.resolved_spec.clone()
+		};
+		let inline = resolve(r#"workspace.table("hexbin_probe").views([hexbin("x", "y")])"#);
+		let bound = resolve(
+			r#"let horizontal = "x"; let vertical = "y"; workspace.table("hexbin_probe").views([hexbin(horizontal, vertical)])"#,
+		);
+		assert_eq!(bound, inline);
+	}
+
+	#[test]
+	fn product_0144_checked_in_probe_has_repeated_but_not_total_cell_occupancy() {
+		use crate::plot::kernels::hexbin_viewport::{
+			HexLatticeSpec, HexRadiusPx, HexbinPreparationGeneration, HexbinPreparationRequest,
+			MaterializedHexbinPreparer, prepare_hexbin_observations,
+		};
+		let source = include_str!("../../../../uat/hexbin_probe.sql");
+		assert!(source.contains("DROP TABLE IF EXISTS hexbin_probe;"));
+		assert!(source.contains("DROP TABLE IF EXISTS hexbin_probe_temporal;"));
+		let frame = polars::df!(
+			"x" => [0.00_f64, 0.01, 0.02, 0.01, 0.42, 0.43, 0.44, 0.43, 0.78, 0.79, 0.80, 1.00, 0.10, 1.00],
+			"y" => [0.00_f64, 0.01, 0.01, 0.02, 0.38, 0.39, 0.38, 0.40, 0.82, 0.81, 0.83, 0.10, 1.00, 1.00],
+		)
+		.unwrap();
+		let token = crate::result_artifact::ArtifactToken::mint();
+		let observations =
+			std::sync::Arc::new(prepare_hexbin_observations(&frame, "x", "y", token).unwrap());
+		let preparer = MaterializedHexbinPreparer::new(std::sync::Arc::clone(&observations));
+		let request = HexbinPreparationRequest {
+			source_token: token,
+			generation: HexbinPreparationGeneration::INITIAL,
+			x_field: "x".to_owned(),
+			y_field: "y".to_owned(),
+			lattice: HexLatticeSpec::new(
+				(0.0, 1.0),
+				(0.0, 1.0),
+				600.0,
+				400.0,
+				HexRadiusPx::DEFAULT,
+			)
+			.unwrap(),
+		};
+		let artifact = preparer.prepare(&request).unwrap();
+		assert_eq!(artifact.total_count(), frame.height() as u64);
+		assert!(artifact.max_count() > 1);
+		assert!(artifact.max_count() < frame.height() as u64);
 	}
 
 	#[test]

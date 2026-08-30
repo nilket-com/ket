@@ -100,6 +100,19 @@ cargo run -p polariton -- uat/test40.rn
 `test40.rn` shows both legal legend forms: one chained `legend()` member and
 separate members whose placement and typography compose.
 
+Seed the PRODUCT-0144 viewport-prepared observations, then open the authored
+hexbin and temporal-refusal exhibit:
+
+```sh
+nilket toron sql --file uat/hexbin_probe.sql
+cargo run -p polariton -- uat/test41.rn
+```
+
+`hexbin_probe` contains several dense clusters plus separated boundary points,
+so repeated cell occupancy and the distinction between source count and maximum
+bin count are visible. Its temporal companion must refuse on the `"stamp"`
+argument without disturbing the healthy view.
+
 Open the semantic temporal-tick exhibit with its DATE seed:
 
 ```sh

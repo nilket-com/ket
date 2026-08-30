@@ -14,9 +14,9 @@ use crate::plot::core::PlotType;
 #[cfg(test)]
 use crate::plot::spec::{BarWidth, CategoryGap, PointSize, StrokeWidth};
 use crate::plot::spec::{
-	BoxPlotFields, BubbleFields, BubblePreparationChannel, HeatmapFields, LayerMark, LayerSettings,
-	LayerSpec, LayeredPlotSpec, MarkFields, MultivariateFields, Override, PieFields, Presence,
-	ViolinFields,
+	BoxPlotFields, BubbleFields, BubblePreparationChannel, HeatmapFields, HexbinFields, LayerMark,
+	LayerSettings, LayerSpec, LayeredPlotSpec, MarkFields, MultivariateFields, Override, PieFields,
+	Presence, ViolinFields,
 };
 use crate::plot::theme::PlotSettingsLayer;
 #[cfg(test)]
@@ -162,6 +162,7 @@ impl StyledRunePlotSink {
 			| PlotType::Histogram
 			| PlotType::BoxPlot
 			| PlotType::Heatmap
+			| PlotType::Hexbin
 			| PlotType::Bubble
 			| PlotType::Funnel
 			| PlotType::RadialDial
@@ -256,6 +257,7 @@ impl RuneViewIntent {
 						PlotType::Histogram => "plot.histogram".to_owned(),
 						PlotType::BoxPlot => "plot.box".to_owned(),
 						PlotType::Heatmap => "plot.heatmap".to_owned(),
+						PlotType::Hexbin => "plot.hexbin".to_owned(),
 						PlotType::Bubble => "plot.bubble".to_owned(),
 						PlotType::Funnel => "plot.funnel".to_owned(),
 						PlotType::RadialDial => "plot.radial_dial".to_owned(),
@@ -276,6 +278,7 @@ impl RuneViewIntent {
 							PlotType::Histogram => "plot.histogram".to_owned(),
 							PlotType::BoxPlot => "plot.box".to_owned(),
 							PlotType::Heatmap => "plot.heatmap".to_owned(),
+							PlotType::Hexbin => "plot.hexbin".to_owned(),
 							PlotType::Bubble => "plot.bubble".to_owned(),
 							PlotType::Pie => "plot.pie".to_owned(),
 							other => {
@@ -365,6 +368,12 @@ pub(crate) struct HeatmapFieldOrigins {
 	pub(crate) x: Range<u32>,
 	pub(crate) y: Range<u32>,
 	pub(crate) value: Range<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HexbinFieldOrigins {
+	pub(crate) x: Range<u32>,
+	pub(crate) y: Range<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -479,6 +488,10 @@ pub(crate) enum SpannedMarkFields {
 		fields: HeatmapFields,
 		origins: HeatmapFieldOrigins,
 	},
+	Hexbin {
+		fields: HexbinFields,
+		origins: HexbinFieldOrigins,
+	},
 	Bubble {
 		fields: BubbleFields,
 		origins: BubbleFieldOrigins,
@@ -514,6 +527,7 @@ impl SpannedMarkFields {
 		match self {
 			Self::BoxPlot { fields, .. } => MarkFields::BoxPlot(fields.clone()),
 			Self::Heatmap { fields, .. } => MarkFields::Heatmap(fields.clone()),
+			Self::Hexbin { fields, .. } => MarkFields::Hexbin(fields.clone()),
 			Self::Bubble { fields, .. } => MarkFields::Bubble(fields.clone()),
 			Self::Funnel { fields, .. } => MarkFields::Funnel(fields.clone()),
 			Self::RadialDial { fields, .. } => MarkFields::RadialDial(fields.clone()),
@@ -534,6 +548,13 @@ impl SpannedMarkFields {
 	pub(crate) fn heatmap(&self) -> Option<(&HeatmapFields, &HeatmapFieldOrigins)> {
 		match self {
 			Self::Heatmap { fields, origins } => Some((fields, origins)),
+			_ => None,
+		}
+	}
+
+	pub(crate) fn hexbin(&self) -> Option<(&HexbinFields, &HexbinFieldOrigins)> {
+		match self {
+			Self::Hexbin { fields, origins } => Some((fields, origins)),
 			_ => None,
 		}
 	}
@@ -594,6 +615,9 @@ impl SpannedMarkFields {
 				left == right
 			}
 			(Self::Heatmap { fields: left, .. }, Self::Heatmap { fields: right, .. }) => {
+				left == right
+			}
+			(Self::Hexbin { fields: left, .. }, Self::Hexbin { fields: right, .. }) => {
 				left == right
 			}
 			(Self::Bubble { fields: left, .. }, Self::Bubble { fields: right, .. }) => {
@@ -1005,6 +1029,36 @@ pub(crate) fn transform(source: &str) -> Result<TransformedRuneView, RuneEnvelop
 mod tests {
 	use super::*;
 	use crate::plot::spec::{BubbleFieldNames, BubbleFields};
+
+	#[test]
+	fn product_0144_direct_styled_hexbin_is_defensively_labelled_and_refuses_layering() {
+		let styled = StyledRunePlotSink {
+			sink: DisposableRunePlotSink {
+				composition: PlotComposition::single(PlotType::Hexbin),
+				x: "x".to_owned(),
+				y: "y".to_owned(),
+				category: None,
+				interval_end: None,
+				mark_fields: Some(SpannedMarkFields::Hexbin {
+					fields: HexbinFields {
+						x: "x".to_owned(),
+						y: "y".to_owned(),
+					},
+					origins: HexbinFieldOrigins {
+						x: 7..10,
+						y: 12..15,
+					},
+				}),
+				origin: 0..16,
+			},
+			settings: LayerSettings::default(),
+			stacked: false,
+			percent: false,
+		};
+		assert!(styled.clone().into_layer().is_err());
+		let intent = RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::StyledSingle(styled)));
+		assert_eq!(intent.presentation().display_label, "plot.hexbin");
+	}
 
 	#[derive(Clone, Debug, PartialEq)]
 	struct TestSemantics {

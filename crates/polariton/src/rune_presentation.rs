@@ -12,10 +12,10 @@ use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
 	BarWidth, BoxPlotFields, BubbleFieldNames, BubbleFields, CategoryGap, FacetLabelTextSize,
-	FunnelFields, HeatmapFields, HoverTextSize, LayerSettings, LayeredPlotSpec, LegendPosition,
-	LegendTextSize, MultivariateFields, Override, PieFields, PlotPaddingPixels, PointSize,
-	Presence, RadialDialFields, StrokeWidth, SubtitleTextSize, TickRotation, TitleTextSize,
-	ViolinFields, XLabelTextSize, XTickTextSize, YLabelTextSize, YTickTextSize,
+	FunnelFields, HeatmapFields, HexbinFields, HoverTextSize, LayerSettings, LayeredPlotSpec,
+	LegendPosition, LegendTextSize, MultivariateFields, Override, PieFields, PlotPaddingPixels,
+	PointSize, Presence, RadialDialFields, StrokeWidth, SubtitleTextSize, TickRotation,
+	TitleTextSize, ViolinFields, XLabelTextSize, XTickTextSize, YLabelTextSize, YTickTextSize,
 };
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
@@ -23,11 +23,11 @@ use crate::plot::theme::{
 use crate::presentation_registry::{CALLABLES, HandlerId, RegistrationRoute};
 use crate::rune_relation_envelope::{
 	BoxPlotFieldOrigins, BubbleFieldOrigins, DisposableRunePlotSink, FunnelFieldOrigins,
-	HeatmapFieldOrigins, MultivariateFieldOrigins, PieFieldOrigins, RadialDialFieldOrigins,
-	RunePlotBody, RunePlotDomainSpans, RunePlotIntent, RunePlotMinorTickSpans,
-	RunePlotTickEverySpans, RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent,
-	RuneTableSkinProjection, RuneViewIntent, SpannedMarkFields, StyledRunePlotSink,
-	ViolinFieldOrigins,
+	HeatmapFieldOrigins, HexbinFieldOrigins, MultivariateFieldOrigins, PieFieldOrigins,
+	RadialDialFieldOrigins, RunePlotBody, RunePlotDomainSpans, RunePlotIntent,
+	RunePlotMinorTickSpans, RunePlotTickEverySpans, RunePlotTickStepSpans, RuneTableSink,
+	RuneTableSkinIntent, RuneTableSkinProjection, RuneViewIntent, SpannedMarkFields,
+	StyledRunePlotSink, ViolinFieldOrigins,
 };
 use rune::alloc::limit;
 use rune::ast::Spanned;
@@ -581,6 +581,7 @@ fn raw_handler(handler: HandlerId) -> RawFunction {
 		HandlerId::Box => raw_box,
 		HandlerId::Bubble => raw_bubble,
 		HandlerId::Heatmap => raw_heatmap,
+		HandlerId::Hexbin => raw_hexbin,
 		HandlerId::Funnel => raw_funnel,
 		HandlerId::RadialDial => raw_radial_dial,
 		HandlerId::Pie => raw_pie,
@@ -994,6 +995,99 @@ fn raw_bubble(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Outpu
 				fields: bubble_fields,
 				origins,
 			}),
+			origin: origin.range(),
+		},
+		settings: LayerSettings::default(),
+		stacked: false,
+		percent: false,
+	};
+	store(
+		out,
+		stack,
+		RuneMark {
+			sink: Ok(sink),
+			origin,
+			modified: false,
+			point_size_origin: None,
+			stroke_width_origin: None,
+			bar_width_origin: None,
+			category_gap_origin: None,
+			stacked_origin: None,
+			percent_origin: None,
+			continuous_intent: None,
+			continuous_intent_origin: None,
+		},
+	)
+}
+
+fn raw_hexbin(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = match raw_origin(values) {
+		Ok(origin) => origin,
+		Err(failure) => return store(out, stack, RuneMark::failed(failure)),
+	};
+	if values.len() != 8 {
+		return store(
+			out,
+			stack,
+			RuneMark::failed(PresentationFailure::new(
+				origin,
+				"hexbin(...) takes x and y strings",
+			)),
+		);
+	}
+	let mut fields = Vec::with_capacity(2);
+	for value in &values[..2] {
+		match rune::from_value::<Ref<str>>(value.clone()) {
+			Ok(field) => fields.push(field.to_owned()),
+			Err(_) => {
+				return store(
+					out,
+					stack,
+					RuneMark::failed(PresentationFailure::new(
+						origin,
+						"hexbin(...) field arguments must evaluate to strings",
+					)),
+				);
+			}
+		}
+	}
+	let decode_span = |index: usize| -> Result<Range<u32>, PresentationFailure> {
+		let start = rune::from_value::<i64>(values[index].clone()).map_err(|_| {
+			PresentationFailure::new(
+				origin,
+				"hexbin(...) has an invalid injected argument origin",
+			)
+		})?;
+		let end = rune::from_value::<i64>(values[index + 1].clone()).map_err(|_| {
+			PresentationFailure::new(
+				origin,
+				"hexbin(...) has an invalid injected argument origin",
+			)
+		})?;
+		Origin::decode(start, end).map(Origin::range)
+	};
+	let origins = match (|| {
+		Ok(HexbinFieldOrigins {
+			x: decode_span(2)?,
+			y: decode_span(4)?,
+		})
+	})() {
+		Ok(origins) => origins,
+		Err(failure) => return store(out, stack, RuneMark::failed(failure)),
+	};
+	let fields = HexbinFields {
+		x: fields[0].clone(),
+		y: fields[1].clone(),
+	};
+	let sink = StyledRunePlotSink {
+		sink: DisposableRunePlotSink {
+			composition: PlotComposition::single(PlotType::Hexbin),
+			x: fields.x.clone(),
+			y: fields.y.clone(),
+			category: None,
+			interval_end: None,
+			mark_fields: Some(SpannedMarkFields::Hexbin { fields, origins }),
 			origin: origin.range(),
 		},
 		settings: LayerSettings::default(),
@@ -3505,6 +3599,7 @@ fn decode_layers(value: &Value, origin: Origin) -> Result<LayeredPlotSpec, Prese
 						PlotType::StackedArea => "area",
 						PlotType::Line => "line",
 						PlotType::Scatter => "scatter",
+						PlotType::Hexbin => "hexbin",
 						_ => "mark",
 					}
 				),
