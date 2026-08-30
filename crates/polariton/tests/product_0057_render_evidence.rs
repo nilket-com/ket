@@ -1594,6 +1594,14 @@ impl PlotKernel for FixedPercentCellKernel {
 	) {
 	}
 
+	fn hit(
+		&self,
+		_transform: &CoordinateTransformer,
+		_cursor: iced::advanced::mouse::Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
+		None
+	}
+
 	fn hover(
 		&self,
 		_transform: &CoordinateTransformer,

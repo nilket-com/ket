@@ -675,12 +675,16 @@ impl PlotComposite for PlotGridKernel {
 				resolved.chrome.canvas_background.iced(),
 			);
 		});
-		let figure_legend = crate::plot::legend::union(
+		let figure_legend_reservation = crate::plot::legend::union(
 			self.cells
 				.iter()
-				.filter_map(|cell| cell.kernel.legend_content(&resolved)),
+				.filter_map(|cell| cell.kernel.legend_reservation_content(&resolved)),
 		);
-		let legend = crate::plot::legend::legend_layout(bounds, figure_legend.as_ref(), &resolved);
+		let legend = crate::plot::legend::legend_layout(
+			bounds,
+			figure_legend_reservation.as_ref(),
+			&resolved,
+		);
 		let outer = grid_outer_area(legend.content_bounds, padding);
 		let layouts = self.cell_layouts(settings);
 		let requirements =
@@ -707,6 +711,8 @@ impl PlotComposite for PlotGridKernel {
 			let cell_resolved = cell.kernel.resolve_settings(settings);
 			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
 			let transform = CoordinateTransformer::new(layout, inner.into_iced());
+			cell.kernel
+				.prepare_viewport(&transform, crate::plot::common::ViewportMotion::Settled);
 			let helper = PlotWidget::new(
 				cell.kernel.as_ref(),
 				String::new(),
@@ -776,12 +782,16 @@ impl PlotComposite for PlotGridKernel {
 			return;
 		}
 		let resolved = settings.resolve();
-		let figure_legend = crate::plot::legend::union(
+		let figure_legend_reservation = crate::plot::legend::union(
 			self.cells
 				.iter()
-				.filter_map(|cell| cell.kernel.legend_content(&resolved)),
+				.filter_map(|cell| cell.kernel.legend_reservation_content(&resolved)),
 		);
-		let legend = crate::plot::legend::legend_layout(bounds, figure_legend.as_ref(), &resolved);
+		let legend = crate::plot::legend::legend_layout(
+			bounds,
+			figure_legend_reservation.as_ref(),
+			&resolved,
+		);
 		let outer = grid_outer_area(legend.content_bounds, padding);
 		let layouts = self.cell_layouts(settings);
 		let requirements =
@@ -809,6 +819,8 @@ impl PlotComposite for PlotGridKernel {
 			let cell_resolved = cell.kernel.resolve_settings(settings);
 			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
 			let transform = CoordinateTransformer::new(layout, inner.into_iced());
+			cell.kernel
+				.prepare_viewport(&transform, crate::plot::common::ViewportMotion::Settled);
 			let axis_text = axis_text_visibility(axis_cells[index], &axis_cells);
 			let helper = PlotWidget::new(
 				cell.kernel.as_ref(),
@@ -932,9 +944,19 @@ impl PlotComposite for PlotGridKernel {
 			crate::plot::common::PlotRenderLayer::Full,
 		);
 		helper.draw_axis_labels(backend, shared_extent.into_iced(), &requirements);
-		if let (Some(content), Some(origin)) =
-			(figure_legend.as_ref(), legend.origin(shared_extent))
-		{
+		let figure_legend = crate::plot::legend::union(
+			self.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_content(&resolved)),
+		);
+		if let Some(content) = figure_legend.as_ref()
+			&& let Some(origin) = crate::plot::legend::legend_origin_for_display(
+				bounds,
+				legend,
+				shared_extent,
+				content,
+				&resolved,
+			) {
 			crate::plot::legend::render_legend(backend, origin, content, &resolved);
 		}
 	}
@@ -948,12 +970,16 @@ impl PlotComposite for PlotGridKernel {
 		settings: &PlotSettings,
 	) -> Option<crate::plot::common::PlotHit> {
 		let resolved = settings.resolve();
-		let figure_legend = crate::plot::legend::union(
+		let figure_legend_reservation = crate::plot::legend::union(
 			self.cells
 				.iter()
-				.filter_map(|cell| cell.kernel.legend_content(&resolved)),
+				.filter_map(|cell| cell.kernel.legend_reservation_content(&resolved)),
 		);
-		let legend = crate::plot::legend::legend_layout(bounds, figure_legend.as_ref(), &resolved);
+		let legend = crate::plot::legend::legend_layout(
+			bounds,
+			figure_legend_reservation.as_ref(),
+			&resolved,
+		);
 		let outer = grid_outer_area(legend.content_bounds, padding);
 		let layouts = self.cell_layouts(settings);
 		let requirements =
@@ -987,6 +1013,8 @@ impl PlotComposite for PlotGridKernel {
 				layout,
 				IcedRectangle::new(Point::ORIGIN, inner_bounds.size()),
 			);
+			cell.kernel
+				.prepare_viewport(&transform, crate::plot::common::ViewportMotion::Settled);
 			let local_cursor = Point::new(cursor.x() - inner.x(), cursor.y() - inner.y());
 			let hit = cell.kernel.hit_with_settings(
 				&transform,

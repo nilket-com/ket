@@ -377,22 +377,25 @@ fn product_0087_gradient_guides_have_one_stop_and_construction_authority() {
 	assert!(!production_legend.contains("ColorTheme::"));
 
 	let mut producer_calls = 0;
-	for file in [
-		"kernels/bubble.rs",
-		"kernels/heatmap.rs",
-		"kernels/hexbin.rs",
+	for (file, constructor, expected_calls) in [
+		("kernels/bubble.rs", "legend::gradient_section(", 1),
+		("kernels/heatmap.rs", "legend::gradient_section(", 1),
+		("kernels/hexbin.rs", "count_gradient_section(", 2),
 	] {
 		let source = std::fs::read_to_string(root.join(file)).expect("read gradient producer");
 		let production = source
-			.split("#[cfg(test)]")
+			.split("#[cfg(test)]\nmod tests")
 			.next()
 			.expect("production kernel region");
-		let calls = production.matches("legend::gradient_section(").count();
-		assert_eq!(calls, 1, "{file} must use the shared constructor once");
+		let calls = production.matches(constructor).count();
+		assert_eq!(
+			calls, expected_calls,
+			"{file} must use the shared constructor for each honest guide role"
+		);
 		assert!(!production.contains("LegendSection::Gradient {"));
 		producer_calls += calls;
 	}
-	assert_eq!(producer_calls, 3);
+	assert_eq!(producer_calls, 4);
 
 	let colors = std::fs::read_to_string(root.join("colors.rs")).expect("read ramp authority");
 	let production_colors = colors
@@ -504,7 +507,7 @@ fn product_0089_continuous_colour_has_one_scale_and_no_decomposed_guide_path() {
 		let source = std::fs::read_to_string(root.join("kernels").join(kernel))
 			.unwrap_or_else(|error| panic!("read {kernel}: {error}"));
 		let production = source
-			.split("#[cfg(test)]")
+			.split("#[cfg(test)]\nmod tests")
 			.next()
 			.expect("production kernel region");
 		assert_eq!(
@@ -512,18 +515,30 @@ fn product_0089_continuous_colour_has_one_scale_and_no_decomposed_guide_path() {
 			1,
 			"{kernel} must construct only in its helper"
 		);
-		assert_eq!(
-			production.matches("self.continuous_scale(").count(),
-			2,
-			"{kernel} paint and guide must use the same helper"
-		);
-		assert_eq!(
-			production
-				.matches("PRODUCT-0089 planning validated")
-				.count(),
-			1,
-			"{kernel} must expect only in its helper"
-		);
+		if kernel == "hexbin.rs" {
+			assert_eq!(
+				production.matches("Self::scale(").count(),
+				3,
+				"hexbin paint, actual guide, and reservation must use the same helper"
+			);
+			assert_eq!(
+				production.matches("PRODUCT-0143 finite u64 count").count(),
+				1
+			);
+		} else {
+			assert_eq!(
+				production.matches("self.continuous_scale(").count(),
+				2,
+				"{kernel} paint and guide must use the same helper"
+			);
+			assert_eq!(
+				production
+					.matches("PRODUCT-0089 planning validated")
+					.count(),
+				1,
+				"{kernel} must expect only in its helper"
+			);
+		}
 		assert!(!production.contains("ColorJob::Diverging"));
 		assert!(!production.contains("ContinuousAnchor::Authored"));
 		assert!(!production.contains("ColorIdentity"));
@@ -5275,4 +5290,177 @@ fn product_0136_csv_export_keeps_arrow_canonical_and_polars_csv_unadmitted() {
 	assert!(artifact.contains("arrow_csv::Writer"));
 	assert!(artifact.contains("IpcStreamWriter"));
 	assert!(artifact.contains("fn write_polars_csv"));
+}
+
+#[test]
+fn product_0143_hexbin_renderer_consumes_only_tagged_viewport_artifacts() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let kernel = std::fs::read_to_string(root.join("plot/kernels/hexbin.rs"))
+		.expect("read PRODUCT-0143 hexbin renderer");
+	let production = kernel
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("bounded hexbin production renderer");
+	assert!(production.contains("HexbinViewportArtifact"));
+	assert!(production.contains("artifact.bins()"));
+	assert!(production.contains("artifact.lattice()"));
+	for forbidden in [
+		"DataFrame",
+		"polars::",
+		"group_by",
+		"q_frac",
+		"fractional_axial",
+		"round_ties_even",
+		"prepare_hexbin_observations",
+	] {
+		assert!(
+			!production.contains(forbidden),
+			"PRODUCT-0143 renderer regained preparation authority through {forbidden}"
+		);
+	}
+
+	let viewport = std::fs::read_to_string(root.join("plot/kernels/hexbin_viewport.rs"))
+		.expect("read PRODUCT-0143 viewport substrate");
+	let viewport_production = viewport
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("bounded viewport production");
+	assert_eq!(
+		viewport_production
+			.matches("pub struct HexLatticeSpec")
+			.count(),
+		1
+	);
+	assert_eq!(
+		viewport_production
+			.matches("pub struct HexbinPreparationRequest")
+			.count(),
+		1
+	);
+	assert_eq!(
+		viewport_production
+			.matches("pub struct HexbinViewportArtifact")
+			.count(),
+		1
+	);
+	assert_eq!(
+		viewport_production
+			.matches("pub struct MaterializedHexbinPreparer")
+			.count(),
+		1
+	);
+	assert_eq!(viewport_production.matches("fn nearest_axial(").count(), 1);
+	assert_eq!(viewport_production.matches("round_ties_even()").count(), 3);
+	assert!(!viewport_production.contains("group_by"));
+	assert!(!viewport_production.contains("toron"));
+	assert!(!viewport_production.contains("Deferred"));
+}
+
+#[test]
+fn product_0143_keeps_the_old_authority_and_premature_surfaces_absent() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read plot factory");
+	let hexbin_branch = factory
+		.split("ResolvedKernelFields::Hexbin")
+		.nth(1)
+		.expect("hexbin factory branch")
+		.split("ResolvedKernelFields::Line")
+		.next()
+		.expect("bounded hexbin factory branch");
+	assert!(hexbin_branch.contains("prepare_hexbin_observations"));
+	assert!(hexbin_branch.contains("source_token"));
+	assert!(!hexbin_branch.contains("ArtifactToken::mint"));
+	assert!(!hexbin_branch.contains("0.02"));
+	assert!(!factory.contains("prepare_hexbin_data"));
+	assert!(factory.contains("create_plot_from_artifact"));
+	assert!(factory.contains("source.artifact_token()"));
+	let gui = std::fs::read_to_string(root.join("gui/state.rs")).expect("read GUI plot host");
+	let planned_plot_build = gui
+		.split("fn build_resolved_plot_task")
+		.nth(1)
+		.expect("planned plot build task")
+		.split("enum RenderedPlotExport")
+		.next()
+		.expect("bounded planned plot build task");
+	assert!(planned_plot_build.contains("create_plot_from_artifact"));
+	assert!(planned_plot_build.contains("resolved.artifact"));
+	assert!(!planned_plot_build.contains("create_plot(&"));
+
+	let registry = presentation_registry(&root);
+	assert!(
+		registry_callable(&registry, "hexbin", "Free", "Hexbin").is_none(),
+		"PRODUCT-0143 must not add the PRODUCT-0144 Rune constructor"
+	);
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let mark_fields = spec
+		.split("pub enum MarkFields")
+		.nth(1)
+		.expect("MarkFields declaration")
+		.split("pub struct AuthoredPlotSpec")
+		.next()
+		.expect("bounded MarkFields");
+	assert!(!mark_fields.contains("Hexbin"));
+	assert!(!mark_fields.contains("hexbin"));
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune relation envelope");
+	let spanned = envelope
+		.split("pub(crate) enum SpannedMarkFields")
+		.nth(1)
+		.expect("SpannedMarkFields declaration")
+		.split("impl SpannedMarkFields")
+		.next()
+		.expect("bounded SpannedMarkFields");
+	assert!(!spanned.contains("Hexbin"));
+	assert!(!spanned.contains("hexbin"));
+}
+
+#[test]
+fn product_0143_count_guide_contract_is_closed_and_reservation_precedes_preparation() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let legend = std::fs::read_to_string(root.join("plot/legend.rs"))
+		.expect("read PRODUCT-0143 legend contract");
+	let count_labels = legend
+		.split("fn count(maximum: u64)")
+		.nth(1)
+		.expect("count label formatter")
+		.split("fn count_envelope_width")
+		.next()
+		.expect("bounded count label formatter");
+	assert!(count_labels.contains("low: \"0\".to_string()"));
+	assert!(count_labels.contains("high: maximum.to_string()"));
+	for forbidden in ["format!", "tick", "separator", "suffix", "abbreviat"] {
+		assert!(!count_labels.contains(forbidden));
+	}
+	let envelope = legend
+		.split("fn count_envelope_width")
+		.nth(1)
+		.expect("count envelope")
+		.split("struct GradientGeometry")
+		.next()
+		.expect("bounded count envelope");
+	assert!(envelope.contains("maximum.to_string().len()"));
+	assert!(envelope.contains("'0'..='9'"));
+	assert!(envelope.contains("f32::max"));
+
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let plot_layer = common
+		.split("fn render_plot_layer_in_widget")
+		.nth(1)
+		.expect("ordinary plot layer")
+		.split("pub fn render_overlay_layer")
+		.next()
+		.expect("bounded ordinary plot layer");
+	let reservation = plot_layer
+		.find("legend_reservation_content")
+		.expect("legend reservation call");
+	let final_transform = plot_layer
+		.find("CoordinateTransformer::new")
+		.expect("final transform");
+	let preparation = plot_layer
+		.find("prepare_viewport")
+		.expect("viewport preparation");
+	let paint = plot_layer.find("plot_with_motion").expect("mark paint");
+	assert!(reservation < final_transform);
+	assert!(final_transform < preparation);
+	assert!(preparation < paint);
 }

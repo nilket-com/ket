@@ -12,7 +12,8 @@ use crate::plot::kernels::fill_between::{self, FillBetweenPlotKernel};
 use crate::plot::kernels::fill_between_line::FillBetweenLinePlotKernel;
 use crate::plot::kernels::funnel::{self, FunnelPlotKernel};
 use crate::plot::kernels::heatmap::{self, HeatmapPlotKernel};
-use crate::plot::kernels::hexbin::{self, HexbinPlotKernel};
+use crate::plot::kernels::hexbin::HexbinPlotKernel;
+use crate::plot::kernels::hexbin_viewport::prepare_hexbin_observations;
 use crate::plot::kernels::layered::{LayerRenderer, LayeredPlotKernel};
 use crate::plot::kernels::line::{self, LinePlotKernel};
 use crate::plot::kernels::multivariate_rows::prepare_multivariate_rows;
@@ -34,12 +35,43 @@ use crate::plot::spec::{
 use polars::frame::DataFrame;
 use std::sync::Arc;
 
-/// Project a resolved product specification into an existing plot kernel.
-/// Field choice belongs to `plot::spec`; this module performs no schema or
-/// dtype inference and never substitutes one resolved role for another.
+/// Project a resolved product specification over a fresh dataframe publication
+/// into an existing plot kernel.
+///
+/// Callers that retain a [`crate::result_artifact::ResultArtifact`] must use
+/// [`create_plot_from_artifact`] so viewport-prepared products preserve the
+/// publication's adapter-neutral identity.
 pub fn create_plot(
 	spec: &ResolvedPlotSpec,
 	df: &DataFrame,
+	width: u32,
+	height: u32,
+) -> Arc<dyn PlotKernel + Send + Sync> {
+	create_plot_with_source_token(
+		spec,
+		df,
+		crate::result_artifact::ArtifactToken::mint(),
+		width,
+		height,
+	)
+}
+
+/// Project a resolved product specification while preserving the exact source
+/// publication identity carried through planning.
+pub fn create_plot_from_artifact(
+	spec: &ResolvedPlotSpec,
+	df: &DataFrame,
+	source: &crate::result_artifact::ResultArtifact,
+	width: u32,
+	height: u32,
+) -> Arc<dyn PlotKernel + Send + Sync> {
+	create_plot_with_source_token(spec, df, source.artifact_token(), width, height)
+}
+
+fn create_plot_with_source_token(
+	spec: &ResolvedPlotSpec,
+	df: &DataFrame,
+	source_token: crate::result_artifact::ArtifactToken,
 	width: u32,
 	height: u32,
 ) -> Arc<dyn PlotKernel + Send + Sync> {
@@ -64,10 +96,9 @@ pub fn create_plot(
 			})
 		}
 		ResolvedKernelFields::Hexbin { x, y } => {
-			let prepared = hexbin::prepare_hexbin_data(df, x, y, 0.02);
-			Arc::new(HexbinPlotKernel {
-				prepared_data: Arc::new(prepared),
-			})
+			let observations = prepare_hexbin_observations(df, x, y, source_token)
+				.expect("PRODUCT-0143 planning validated hexbin observations");
+			Arc::new(HexbinPlotKernel::new(Arc::new(observations)))
 		}
 		ResolvedKernelFields::Line { series, x, y } => {
 			let prepared = prepare_resolved_line(spec, df, series.as_deref().unwrap_or(""), x, y);
@@ -635,9 +666,10 @@ pub fn create_authored_plot(
 		},
 		authored_spec,
 	})?;
-	Ok(create_plot(
+	Ok(create_plot_from_artifact(
 		&resolved.resolved_spec,
 		&resolved.data,
+		&resolved.artifact,
 		width,
 		height,
 	))
@@ -1927,15 +1959,30 @@ mod product_0013_baseline_tests {
 				_ => unreachable!("bounded gradient fixture"),
 			};
 			let settings = ResolvedPlotSettings::default();
+			let layout = kernel.layout(settings.clone());
+			let transform = crate::plot::common::CoordinateTransformer::new(
+				&layout,
+				Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0)),
+			);
+			kernel.prepare_viewport(&transform, crate::plot::common::ViewportMotion::Settled);
 			let content = kernel.legend_content(&settings).expect("gradient content");
 			assert_eq!(content.0.len(), 1);
-			assert!(matches!(
-				content.0.first(),
-				crate::plot::legend::LegendSection::Gradient { stops, .. }
-					if stops.len() > 2
-						&& stops.first_value() == expected_low
-						&& stops.last_value().is_finite()
-			));
+			match (plot_type, content.0.first()) {
+				(PlotType::Heatmap, crate::plot::legend::LegendSection::Gradient { stops, .. }) => {
+					assert!(stops.len() > 2);
+					assert_eq!(stops.first_value(), expected_low);
+					assert!(stops.last_value().is_finite());
+				}
+				(
+					PlotType::Hexbin,
+					crate::plot::legend::LegendSection::CountGradient { stops, maximum, .. },
+				) => {
+					assert!(stops.len() > 2);
+					assert_eq!(stops.first_value(), expected_low);
+					assert!(*maximum > 0);
+				}
+				_ => panic!("{plot_type} emitted the wrong gradient section"),
+			}
 			let mut backend = SvgBackend::new(400.0, 300.0);
 			crate::plot::legend::render_legend(
 				&mut backend,

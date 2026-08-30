@@ -1,0 +1,23 @@
+error[E0451]: fields `source_token`, `x_field`, `y_field`, `rows`, `x_range` and `y_range` of struct `HexbinObservations` are private
+  --> tests/ui/hexbin_observations_private.rs:36:3
+   |
+35 |     let _ = HexbinObservations {
+   |             ------------------ in this type
+36 |         source_token: ArtifactToken::fixture(),
+   |         ^^^^^^^^^^^^ private field
+37 |         x_field: "x".to_owned(),
+   |         ^^^^^^^ private field
+38 |         y_field: "y".to_owned(),
+   |         ^^^^^^^ private field
+39 |         rows: Vec::new(),
+   |         ^^^^ private field
+40 |         x_range: (0.0, 1.0),
+   |         ^^^^^^^ private field
+41 |         y_range: (0.0, 1.0),
+   |         ^^^^^^^ private field
+
+error: type `HexbinObservation` is private
+  --> tests/ui/hexbin_observations_private.rs:39:9
+   |
+39 |         rows: Vec::new(),
+   |               ^^^^^^^^^^ private type

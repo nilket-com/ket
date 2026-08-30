@@ -90,7 +90,7 @@ pub fn plan(request: PlotRequest) -> Result<ResolvedPlot, String> {
 			};
 			let (resolved_spec, _) = resolve_domains(binding, &stamped, &ColorIdentity::default())
 				.map_err(|error| format!("{name}: {error}"))?;
-			validate_prepared_contract(&resolved_spec, frame.as_ref())
+			validate_prepared_contract(&resolved_spec, frame.as_ref(), data.artifact_token())
 				.map_err(|error| format!("{name}: {error}"))?;
 			let projected = project_named_channels(&request.authored_spec, frame, &name)?;
 			Ok(ResolvedPlot {
@@ -126,7 +126,7 @@ pub fn plan_with_categorical_palette(
 			let (resolved_spec, next_identity) =
 				resolve_domains_with_categorical_palette(binding, &stamped, identity, selection)
 					.map_err(|error| format!("{name}: {error}"))?;
-			validate_prepared_contract(&resolved_spec, frame.as_ref())
+			validate_prepared_contract(&resolved_spec, frame.as_ref(), data.artifact_token())
 				.map_err(|error| format!("{name}: {error}"))?;
 			let projected = project_named_channels(&request.authored_spec, frame, &name)?;
 			Ok((
@@ -143,7 +143,11 @@ pub fn plan_with_categorical_palette(
 	}
 }
 
-fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Result<(), String> {
+fn validate_prepared_contract(
+	spec: &ResolvedPlotSpec,
+	data: &DataFrame,
+	source_token: crate::result_artifact::ArtifactToken,
+) -> Result<(), String> {
 	if let crate::plot::spec::ResolvedKernelFields::Bubble {
 		x,
 		y,
@@ -174,8 +178,17 @@ fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Resu
 		)?;
 	}
 	if let crate::plot::spec::ResolvedKernelFields::Hexbin { x, y } = spec.kernel_fields.as_ref() {
-		let prepared = crate::plot::kernels::hexbin::prepare_hexbin_data(data, x, y, 0.02);
-		validate_continuous_scale((0.0, f64::from(prepared.max_count)), prepared.color_intent)?;
+		let observations = crate::plot::kernels::hexbin_viewport::prepare_hexbin_observations(
+			data,
+			x,
+			y,
+			source_token,
+		)
+		.map_err(|error| error.to_string())?;
+		validate_continuous_scale(
+			(0.0, observations.source_count() as f64),
+			crate::plot::continuous_color::ContinuousScaleIntent::SEQUENTIAL,
+		)?;
 	}
 	if let crate::plot::spec::ResolvedKernelFields::Histogram {
 		bin_start,

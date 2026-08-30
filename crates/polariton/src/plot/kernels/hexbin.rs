@@ -1,26 +1,115 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
+	AxisType, CoordinateTransformer, HitDimensionality, HitValue, MarkFamily, PlotBackend, PlotHit,
+	PlotKernel, PlotLayout, ResolvedPlotSettings, ViewportMotion,
 };
 use crate::plot::continuous_color::{ContinuousColorScale, ContinuousScaleIntent};
+use crate::plot::kernels::hexbin_viewport::{
+	HexLatticeSpec, HexRadiusPx, HexbinObservations, HexbinPreparationGeneration,
+	HexbinPreparationRequest, HexbinViewportArtifact, MaterializedHexbinPreparer,
+};
+use crate::plot::legend::{LegendContent, count_gradient_section};
+use crate::plot::spec::{NonEmpty, SemanticType};
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
-use iced::{Color, Rectangle};
-use polars::lazy::prelude::*;
-use polars::prelude::*;
-use std::sync::Arc;
+use iced::{Color, Point, Rectangle};
+use std::sync::{Arc, Mutex};
 
+#[derive(Debug)]
+struct HexbinViewportCache {
+	next_generation: HexbinPreparationGeneration,
+	latest_request: Option<HexbinPreparationRequest>,
+	artifact: Option<Arc<HexbinViewportArtifact>>,
+	stale_preview: bool,
+}
+
+impl Default for HexbinViewportCache {
+	fn default() -> Self {
+		Self {
+			next_generation: HexbinPreparationGeneration::INITIAL,
+			latest_request: None,
+			artifact: None,
+			stale_preview: false,
+		}
+	}
+}
+
+/// The renderer-facing hexbin kernel consumes only viewport artifacts. Raw
+/// observations remain private to the materialized preparer and are never
+/// aggregated from `plot` or `hit`.
 pub struct HexbinPlotKernel {
-	pub prepared_data: Arc<HexbinPreparedData>,
+	preparer: MaterializedHexbinPreparer,
+	cache: Mutex<HexbinViewportCache>,
 }
 
 impl HexbinPlotKernel {
-	fn continuous_scale(&self, settings: &ResolvedPlotSettings) -> ContinuousColorScale {
-		ContinuousColorScale::new(
-			(0.0, f64::from(self.prepared_data.max_count)),
-			self.prepared_data.color_intent,
-			settings.continuous_ramps,
+	pub fn new(observations: Arc<HexbinObservations>) -> Self {
+		Self {
+			preparer: MaterializedHexbinPreparer::new(observations),
+			cache: Mutex::new(HexbinViewportCache::default()),
+		}
+	}
+
+	fn observations(&self) -> &HexbinObservations {
+		self.preparer.observations()
+	}
+
+	fn scale(maximum: u64, settings: &ResolvedPlotSettings) -> Option<ContinuousColorScale> {
+		(maximum > 0).then(|| {
+			ContinuousColorScale::new(
+				(0.0, maximum as f64),
+				ContinuousScaleIntent::SEQUENTIAL,
+				settings.continuous_ramps,
+			)
+			.expect("PRODUCT-0143 finite u64 count domain is an ascending sequential scale")
+		})
+	}
+
+	fn lattice(transform: &CoordinateTransformer<'_>) -> Option<HexLatticeSpec> {
+		let PlotLayout::Cartesian {
+			x_range, y_range, ..
+		} = transform.layout
+		else {
+			return None;
+		};
+		HexLatticeSpec::new(
+			*x_range,
+			*y_range,
+			transform.bounds.width,
+			transform.bounds.height,
+			HexRadiusPx::DEFAULT,
 		)
-		.expect("PRODUCT-0089 planning validated this hexbin continuous colour scale")
+		.ok()
+	}
+
+	fn artifact(&self) -> Option<Arc<HexbinViewportArtifact>> {
+		self.cache
+			.lock()
+			.expect("hexbin viewport cache lock")
+			.artifact
+			.clone()
+	}
+
+	fn publish_if_newest(
+		&self,
+		request: &HexbinPreparationRequest,
+		artifact: HexbinViewportArtifact,
+	) -> bool {
+		let mut cache = self.cache.lock().expect("hexbin viewport cache lock");
+		if cache.latest_request.as_ref() == Some(request) && artifact.matches(request) {
+			cache.artifact = Some(Arc::new(artifact));
+			cache.stale_preview = false;
+			true
+		} else {
+			false
+		}
+	}
+
+	#[cfg(test)]
+	fn is_stale_preview(&self) -> bool {
+		self.cache
+			.lock()
+			.expect("hexbin viewport cache lock")
+			.stale_preview
 	}
 }
 
@@ -28,12 +117,12 @@ impl PlotKernel for HexbinPlotKernel {
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Cartesian {
 			x_range: (
-				settings.x_min.unwrap_or(self.prepared_data.x_range.0),
-				settings.x_max.unwrap_or(self.prepared_data.x_range.1),
+				settings.x_min.unwrap_or(self.observations().x_range().0),
+				settings.x_max.unwrap_or(self.observations().x_range().1),
 			),
 			y_range: (
-				settings.y_min.unwrap_or(self.prepared_data.y_range.0),
-				settings.y_max.unwrap_or(self.prepared_data.y_range.1),
+				settings.y_min.unwrap_or(self.observations().y_range().0),
+				settings.y_max.unwrap_or(self.observations().y_range().1),
 			),
 			x_axis_type: AxisType::Linear,
 			y_axis_type: AxisType::Linear,
@@ -42,327 +131,320 @@ impl PlotKernel for HexbinPlotKernel {
 		}
 	}
 
+	fn requires_plot_area_clip(&self) -> bool {
+		true
+	}
+
+	fn prepare_viewport(&self, transform: &CoordinateTransformer<'_>, motion: ViewportMotion) {
+		let Some(lattice) = Self::lattice(transform) else {
+			return;
+		};
+		let request = {
+			let mut cache = self.cache.lock().expect("hexbin viewport cache lock");
+			if cache.artifact.as_ref().is_some_and(|artifact| {
+				artifact.source_token() == self.observations().source_token()
+					&& artifact.lattice() == lattice
+			}) {
+				cache.stale_preview = false;
+				return;
+			}
+			if motion == ViewportMotion::Moving && cache.artifact.is_some() {
+				cache.stale_preview = true;
+				return;
+			}
+			let generation = cache.next_generation;
+			cache.next_generation = generation.next();
+			let request = HexbinPreparationRequest {
+				source_token: self.observations().source_token(),
+				generation,
+				x_field: self.observations().x_field().to_owned(),
+				y_field: self.observations().y_field().to_owned(),
+				lattice,
+			};
+			cache.latest_request = Some(request.clone());
+			request
+		};
+		let artifact = self
+			.preparer
+			.prepare(&request)
+			.expect("PRODUCT-0143 validated materialized observations satisfy their request");
+		let _published = self.publish_if_newest(&request, artifact);
+	}
+
 	fn plot(
 		&self,
 		backend: &mut dyn PlotBackend,
-		bounds: Rectangle,
-		transform: &CoordinateTransformer,
+		_bounds: Rectangle,
+		_transform: &CoordinateTransformer,
 		_cursor: Cursor,
 		settings: ResolvedPlotSettings,
 	) {
-		let radius = self.prepared_data.radius as f64;
-		let sqrt_3 = 3.0f64.sqrt();
-		let scale = self.continuous_scale(&settings);
-		backend.with_clip(bounds, &mut |backend| {
-			for (&(q, r), &count) in &self.prepared_data.bins {
-				if count == 0 {
-					continue;
-				}
-				let lx = radius * (sqrt_3 * q as f64 + sqrt_3 / 2.0 * r as f64);
-				let ly = radius * (3.0 / 2.0 * r as f64);
-				let hex_path = &|builder: &mut dyn crate::plot::common::PathBuilder| {
-					for i in 0..6 {
-						let angle_deg = 60.0 * i as f64 - 30.0;
-						let angle_rad = std::f64::consts::PI / 180.0 * angle_deg;
-						let dx = radius * angle_rad.cos();
-						let dy = radius * angle_rad.sin();
-						let p = transform.cartesian(lx + dx, ly + dy);
-						if i == 0 {
-							builder.move_to(p);
-						} else {
-							builder.line_to(p);
-						}
+		let Some(artifact) = self.artifact() else {
+			return;
+		};
+		let Some(scale) = Self::scale(artifact.max_count(), &settings) else {
+			return;
+		};
+		let radius = f64::from(artifact.lattice().radius_px().get());
+		for (&(q, r), &count) in artifact.bins() {
+			let (center_x, center_y) = artifact.lattice().center_for_axial(q, r);
+			let hex_path = &|builder: &mut dyn crate::plot::common::PathBuilder| {
+				for corner in 0..6 {
+					let angle = (60.0 * f64::from(corner) - 30.0).to_radians();
+					let point = Point::new(
+						(center_x + radius * angle.cos()) as f32,
+						(center_y + radius * angle.sin()) as f32,
+					);
+					if corner == 0 {
+						builder.move_to(point);
+					} else {
+						builder.line_to(point);
 					}
-					builder.close();
-				};
-				let color = scale.color(f64::from(count));
-				backend.fill_path(hex_path, color);
-				backend.stroke_path(
-					hex_path,
-					Stroke {
-						style: Style::Solid(Color::from_rgba(0.0, 0.0, 0.0, 0.1)),
-						width: 0.5,
-						..Default::default()
-					},
-				);
-			}
-		});
-	}
-
-	fn legend_content(
-		&self,
-		settings: &ResolvedPlotSettings,
-	) -> Option<crate::plot::legend::LegendContent> {
-		let scale = self.continuous_scale(settings);
-		crate::plot::legend::gradient_section("Count".to_owned(), &scale).map(|section| {
-			crate::plot::legend::LegendContent(crate::plot::spec::NonEmpty::new(section))
-		})
-	}
-
-	fn hit(
-		&self,
-		transform: &CoordinateTransformer,
-		cursor: Cursor,
-	) -> Option<crate::plot::common::PlotHit> {
-		if let Some(cursor_pos) = cursor.position()
-			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos)
-		{
-			let radius = self.prepared_data.radius as f64;
-			let sqrt_3 = 3.0f64.sqrt();
-			let q_frac = (sqrt_3 / 3.0 * x - 1.0 / 3.0 * y) / radius;
-			let r_frac = (2.0 / 3.0 * y) / radius;
-			let mut q = q_frac.round();
-			let mut r = r_frac.round();
-			let s = (-q_frac - r_frac).round();
-			let q_diff = (q - q_frac).abs();
-			let r_diff = (r - r_frac).abs();
-			let s_diff = (s - (-q_frac - r_frac)).abs();
-			if q_diff > r_diff && q_diff > s_diff {
-				q = -r - s;
-			} else if r_diff > s_diff {
-				r = -q - s;
-			}
-			if let Some(&count) = self.prepared_data.bins.get(&(q as i32, r as i32)) {
-				return Some(
-					crate::plot::common::PlotHit::new(
-						crate::plot::common::MarkFamily::HEXBIN,
-						crate::plot::common::HitDimensionality::Area,
-						count as usize,
-					)
-					.labeled(
-						"Q",
-						crate::plot::spec::SemanticType::Ordinal,
-						crate::plot::common::HitValue::ordinal(q.to_string()),
-					)
-					.labeled(
-						"R",
-						crate::plot::spec::SemanticType::Ordinal,
-						crate::plot::common::HitValue::ordinal(r.to_string()),
-					)
-					.labeled(
-						"Count",
-						crate::plot::spec::SemanticType::Quantitative,
-						crate::plot::common::HitValue::Count(count as usize),
-					)
-					.labeled(
-						"X",
-						crate::plot::spec::SemanticType::Quantitative,
-						crate::plot::common::HitValue::quantitative(x, format!("{x:.2}")),
-					)
-					.labeled(
-						"Y",
-						crate::plot::spec::SemanticType::Quantitative,
-						crate::plot::common::HitValue::quantitative(y, format!("{y:.2}")),
-					),
-				);
-			}
+				}
+				builder.close();
+			};
+			backend.fill_path(hex_path, scale.color(count as f64));
+			backend.stroke_path(
+				hex_path,
+				Stroke {
+					style: Style::Solid(Color::from_rgba(0.0, 0.0, 0.0, 0.1)),
+					width: 0.5,
+					..Default::default()
+				},
+			);
 		}
-		None
+	}
+
+	fn legend_reservation_content(&self, settings: &ResolvedPlotSettings) -> Option<LegendContent> {
+		let maximum = self.observations().source_count();
+		let scale = Self::scale(maximum, settings)?;
+		count_gradient_section("Count".to_owned(), &scale, maximum)
+			.map(|section| LegendContent(NonEmpty::new(section)))
+	}
+
+	fn legend_content(&self, settings: &ResolvedPlotSettings) -> Option<LegendContent> {
+		let maximum = self.artifact()?.max_count();
+		let scale = Self::scale(maximum, settings)?;
+		count_gradient_section("Count".to_owned(), &scale, maximum)
+			.map(|section| LegendContent(NonEmpty::new(section)))
+	}
+
+	fn hit(&self, _transform: &CoordinateTransformer, cursor: Cursor) -> Option<PlotHit> {
+		let cache = self.cache.lock().expect("hexbin viewport cache lock");
+		if cache.stale_preview {
+			return None;
+		}
+		let artifact = cache.artifact.as_ref()?;
+		let cursor = cursor.position()?;
+		let (q, r) = artifact
+			.lattice()
+			.axial_for_pixel(f64::from(cursor.x), f64::from(cursor.y))?;
+		let count = artifact.count(q, r)?;
+		let (center_x, center_y) = artifact.lattice().center_for_axial(q, r);
+		let (data_x, data_y) = artifact.lattice().data_for_pixel(center_x, center_y);
+		let count_for_hit = usize::try_from(count).unwrap_or(usize::MAX);
+		Some(
+			PlotHit::new(MarkFamily::HEXBIN, HitDimensionality::Area, count_for_hit)
+				.labeled("Q", SemanticType::Ordinal, HitValue::ordinal(q.to_string()))
+				.labeled("R", SemanticType::Ordinal, HitValue::ordinal(r.to_string()))
+				.labeled(
+					"Count",
+					SemanticType::Quantitative,
+					HitValue::Count(count_for_hit),
+				)
+				.labeled(
+					self.observations().x_field(),
+					SemanticType::Quantitative,
+					HitValue::quantitative(data_x, format!("{data_x:.2}")),
+				)
+				.labeled(
+					self.observations().y_field(),
+					SemanticType::Quantitative,
+					HitValue::quantitative(data_y, format!("{data_y:.2}")),
+				),
+		)
 	}
 
 	fn x_label(&self) -> String {
-		self.prepared_data.x_label.clone()
+		self.observations().x_field().to_owned()
 	}
 
 	fn y_label(&self) -> String {
-		self.prepared_data.y_label.clone()
-	}
-}
-
-pub struct HexbinPreparedData {
-	pub bins: std::collections::HashMap<(i32, i32), u32>,
-	pub max_count: u32,
-	pub color_intent: ContinuousScaleIntent,
-	pub radius: f32,
-	pub x_range: (f64, f64),
-	pub y_range: (f64, f64),
-	pub x_label: String,
-	pub y_label: String,
-}
-
-fn bin_data_to_hex(
-	df: DataFrame,
-	x_col: &str,
-	y_col: &str,
-	radius: f32,
-) -> PolarsResult<DataFrame> {
-	let sqrt_3 = 3.0f32.sqrt();
-	let with_frac = df.lazy().with_columns([
-		((lit(sqrt_3 / 3.0) * col(x_col) - lit(1.0f32 / 3.0) * col(y_col)) / lit(radius))
-			.alias("q_frac"),
-		((lit(2.0f32 / 3.0) * col(y_col)) / lit(radius)).alias("r_frac"),
-	]);
-	let with_rounded = with_frac.with_columns([
-		col("q_frac").round(0, RoundMode::HalfToEven).alias("q"),
-		col("r_frac").round(0, RoundMode::HalfToEven).alias("r"),
-		(-col("q_frac") - col("r_frac"))
-			.round(0, RoundMode::HalfToEven)
-			.alias("s"),
-	]);
-	let with_diffs = with_rounded.with_columns([
-		(col("q_frac") - col("q")).abs().alias("q_diff"),
-		(col("r_frac") - col("r")).abs().alias("r_diff"),
-		((-col("q_frac") - col("r_frac")) - col("s"))
-			.abs()
-			.alias("s_diff"),
-	]);
-	let with_corrected = with_diffs.with_columns([
-		when(
-			col("q_diff")
-				.gt(col("r_diff"))
-				.and(col("q_diff").gt(col("s_diff"))),
-		)
-		.then(-col("r") - col("s"))
-		.otherwise(col("q"))
-		.cast(DataType::Int32)
-		.alias("q"),
-		when(
-			col("q_diff")
-				.gt(col("r_diff"))
-				.and(col("q_diff").gt(col("s_diff")))
-				.not()
-				.and(col("r_diff").gt(col("s_diff"))),
-		)
-		.then(-col("q") - col("s"))
-		.otherwise(col("r"))
-		.cast(DataType::Int32)
-		.alias("r"),
-	]);
-	with_corrected
-		.group_by([col("q"), col("r")])
-		.agg([len().alias("count")])
-		.collect()
-}
-
-pub fn prepare_hexbin_data(
-	df: &DataFrame,
-	x_col: &str,
-	y_col: &str,
-	radius: f32,
-) -> HexbinPreparedData {
-	if df.height() == 0 || df.column(x_col).is_err() || df.column(y_col).is_err() {
-		return HexbinPreparedData {
-			bins: std::collections::HashMap::new(),
-			max_count: 1,
-			color_intent: ContinuousScaleIntent::SEQUENTIAL,
-			radius,
-			x_range: (0.0, 1.0),
-			y_range: (0.0, 1.0),
-			x_label: x_col.to_string(),
-			y_label: y_col.to_string(),
-		};
-	}
-	let x_col_series = match df.column(x_col) {
-		Ok(c) => c
-			.cast(&DataType::Float64)
-			.unwrap_or_else(|_| Column::from(Series::new_empty(x_col.into(), &DataType::Float64))),
-		Err(_) => Column::from(Series::new_empty(x_col.into(), &DataType::Float64)),
-	};
-	let y_col_series = match df.column(y_col) {
-		Ok(c) => c
-			.cast(&DataType::Float64)
-			.unwrap_or_else(|_| Column::from(Series::new_empty(y_col.into(), &DataType::Float64))),
-		Err(_) => Column::from(Series::new_empty(y_col.into(), &DataType::Float64)),
-	};
-	let x_values = x_col_series.f64().unwrap();
-	let y_values = y_col_series.f64().unwrap();
-	let x_range = (x_values.min().unwrap_or(0.0), x_values.max().unwrap_or(1.0));
-	let y_range = (y_values.min().unwrap_or(0.0), y_values.max().unwrap_or(1.0));
-	let binned = match bin_data_to_hex(df.clone(), x_col, y_col, radius) {
-		Ok(df) => df,
-		Err(_) => {
-			return HexbinPreparedData {
-				bins: std::collections::HashMap::new(),
-				max_count: 1,
-				color_intent: ContinuousScaleIntent::SEQUENTIAL,
-				radius,
-				x_range,
-				y_range,
-				x_label: x_col.to_string(),
-				y_label: y_col.to_string(),
-			};
-		}
-	};
-	let q_col = binned
-		.column("q")
-		.and_then(|c| c.i32())
-		.expect("q column not found");
-	let r_col = binned
-		.column("r")
-		.and_then(|c| c.i32())
-		.expect("r column not found");
-	let count_col = binned
-		.column("count")
-		.and_then(|c| c.u32())
-		.expect("count column not found");
-	let mut bins = std::collections::HashMap::new();
-	let mut max_count = 0;
-	for i in 0..binned.height() {
-		let q = q_col.get(i).unwrap_or(0);
-		let r = r_col.get(i).unwrap_or(0);
-		let count = count_col.get(i).unwrap_or(0);
-		bins.insert((q, r), count);
-		if count > max_count {
-			max_count = count;
-		}
-	}
-	HexbinPreparedData {
-		bins,
-		max_count,
-		color_intent: ContinuousScaleIntent::SEQUENTIAL,
-		radius,
-		x_range,
-		y_range,
-		x_label: x_col.to_string(),
-		y_label: y_col.to_string(),
+		self.observations().y_field().to_owned()
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::plot::kernels::hexbin_viewport::prepare_hexbin_observations;
+	use crate::plot::legend::LegendSection;
+	use crate::result_artifact::ResultArtifact;
+	use iced::Size;
+	use polars::df;
+
+	fn kernel() -> HexbinPlotKernel {
+		let frame = df!(
+			"x" => [0.25_f64, 0.25, 0.75],
+			"y" => [0.25_f64, 0.25, 0.75],
+		)
+		.unwrap();
+		let result = ResultArtifact::test_frame(frame.clone());
+		let observations =
+			prepare_hexbin_observations(&frame, "x", "y", result.artifact_token()).unwrap();
+		HexbinPlotKernel::new(Arc::new(observations))
+	}
+
+	fn transform<'a>(layout: &'a PlotLayout, width: f32) -> CoordinateTransformer<'a> {
+		CoordinateTransformer::new(
+			layout,
+			Rectangle::new(Point::ORIGIN, Size::new(width, 100.0)),
+		)
+	}
 
 	#[test]
-	fn product_0087_hexbin_omits_a_zero_count_gradient() {
-		let kernel = HexbinPlotKernel {
-			prepared_data: Arc::new(HexbinPreparedData {
-				bins: std::collections::HashMap::new(),
-				max_count: 0,
-				color_intent: ContinuousScaleIntent::SEQUENTIAL,
-				radius: 0.02,
-				x_range: (0.0, 1.0),
-				y_range: (0.0, 1.0),
-				x_label: "x".to_owned(),
-				y_label: "y".to_owned(),
-			}),
-		};
+	fn product_0143_kernel_prepares_exact_settled_lattice_and_disables_stale_hits() {
+		let kernel = kernel();
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings.clone());
+		let narrow = transform(&layout, 100.0);
+		kernel.prepare_viewport(&narrow, ViewportMotion::Settled);
+		assert!(kernel.legend_content(&settings).is_some());
+		assert!(!kernel.is_stale_preview());
+
+		let wide = transform(&layout, 300.0);
+		kernel.prepare_viewport(&wide, ViewportMotion::Moving);
+		assert!(kernel.is_stale_preview());
 		assert!(
 			kernel
-				.legend_content(&ResolvedPlotSettings::default())
+				.hit(&wide, Cursor::Available(Point::new(25.0, 75.0)))
 				.is_none()
+		);
+
+		kernel.prepare_viewport(&wide, ViewportMotion::Settled);
+		assert!(!kernel.is_stale_preview());
+		assert_eq!(kernel.artifact().unwrap().lattice().plot_width_px(), 300.0);
+	}
+
+	#[test]
+	fn product_0143_delayed_executor_publication_is_newest_wins() {
+		let kernel = kernel();
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings);
+		let lattice = |width| HexbinPlotKernel::lattice(&transform(&layout, width)).unwrap();
+		let request = |kernel: &HexbinPlotKernel, lattice| {
+			let mut cache = kernel.cache.lock().unwrap();
+			let generation = cache.next_generation;
+			cache.next_generation = generation.next();
+			let request = HexbinPreparationRequest {
+				source_token: kernel.observations().source_token(),
+				generation,
+				x_field: kernel.observations().x_field().to_owned(),
+				y_field: kernel.observations().y_field().to_owned(),
+				lattice,
+			};
+			cache.latest_request = Some(request.clone());
+			request
+		};
+
+		let generation_1 = request(&kernel, lattice(100.0));
+		let artifact_1 = kernel.preparer.prepare(&generation_1).unwrap();
+		let generation_2 = request(&kernel, lattice(200.0));
+		let artifact_2 = kernel.preparer.prepare(&generation_2).unwrap();
+		assert!(kernel.publish_if_newest(&generation_2, artifact_2));
+		assert!(!kernel.publish_if_newest(&generation_1, artifact_1));
+		assert_eq!(
+			kernel.artifact().unwrap().generation(),
+			generation_2.generation
+		);
+
+		let generation_3 = request(&kernel, lattice(300.0));
+		let artifact_3 = kernel.preparer.prepare(&generation_3).unwrap();
+		assert!(kernel.publish_if_newest(&generation_3, artifact_3));
+		assert_eq!(
+			kernel.artifact().unwrap().generation(),
+			generation_3.generation
 		);
 	}
 
 	#[test]
-	fn product_0089_hexbin_accepts_the_one_ulp_arithmetic_change() {
-		let kernel = HexbinPlotKernel {
-			prepared_data: Arc::new(HexbinPreparedData {
-				bins: std::collections::HashMap::new(),
-				max_count: 1_481_765_933,
-				color_intent: ContinuousScaleIntent::SEQUENTIAL,
-				radius: 0.02,
-				x_range: (0.0, 1.0),
-				y_range: (0.0, 1.0),
-				x_label: "x".to_owned(),
-				y_label: "y".to_owned(),
-			}),
+	fn product_0143_first_moving_frame_prepares_and_paint_only_change_reuses() {
+		let kernel = kernel();
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings.clone());
+		let transform = transform(&layout, 100.0);
+		kernel.prepare_viewport(&transform, ViewportMotion::Moving);
+		let generation = kernel.artifact().unwrap().generation();
+		assert!(!kernel.is_stale_preview());
+
+		let mut paint_change = settings;
+		paint_change.continuous_ramps = crate::plot::continuous_color::ContinuousRamps {
+			sequential: crate::plot::colors::ColorTheme::Blues,
+			..paint_change.continuous_ramps
 		};
-		let scale = kernel.continuous_scale(&ResolvedPlotSettings::default());
-		let count = 269_329_525_u32;
-		let old = count as f32 / kernel.prepared_data.max_count as f32;
-		let accepted = scale.normalize(f64::from(count)) as f32;
-		assert_eq!(old.to_bits(), 0x3E3A_1FF6);
-		assert_eq!(accepted.to_bits(), 0x3E3A_1FF5);
-		assert_eq!(old.to_bits().abs_diff(accepted.to_bits()), 1);
+		kernel.prepare_viewport(&transform, ViewportMotion::Settled);
+		assert_eq!(kernel.artifact().unwrap().generation(), generation);
+	}
+
+	#[test]
+	fn product_0143_reservation_uses_source_count_and_display_uses_actual_maximum() {
+		let kernel = kernel();
+		let settings = ResolvedPlotSettings::default();
+		let reservation = kernel.legend_reservation_content(&settings).unwrap();
+		let LegendSection::CountGradient {
+			maximum: reserved, ..
+		} = reservation.0.first()
+		else {
+			panic!("count reservation")
+		};
+		assert_eq!(*reserved, 3);
+
+		let layout = kernel.layout(settings.clone());
+		kernel.prepare_viewport(&transform(&layout, 100.0), ViewportMotion::Settled);
+		let actual = kernel.legend_content(&settings).unwrap();
+		let LegendSection::CountGradient {
+			maximum: displayed, ..
+		} = actual.0.first()
+		else {
+			panic!("count display")
+		};
+		assert!(*displayed < *reserved);
+
+		let outside_layout = PlotLayout::Cartesian {
+			x_range: (10.0, 20.0),
+			y_range: (10.0, 20.0),
+			x_axis_type: AxisType::Linear,
+			y_axis_type: AxisType::Linear,
+			x_temporal_domain: None,
+			y_temporal_domain: None,
+		};
+		kernel.prepare_viewport(&transform(&outside_layout, 100.0), ViewportMotion::Settled);
+		assert!(kernel.legend_content(&settings).is_none());
+		assert!(kernel.legend_reservation_content(&settings).is_some());
+	}
+
+	#[test]
+	fn product_0143_hit_reports_bin_center_for_every_cursor_in_the_cell() {
+		let kernel = kernel();
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings);
+		let transform = transform(&layout, 100.0);
+		kernel.prepare_viewport(&transform, ViewportMotion::Settled);
+		let artifact = kernel.artifact().unwrap();
+		let (&(q, r), _) = artifact.bins().iter().next().unwrap();
+		let (center_x, center_y) = artifact.lattice().center_for_axial(q, r);
+		let first = kernel
+			.hit(
+				&transform,
+				Cursor::Available(Point::new(center_x as f32, center_y as f32)),
+			)
+			.unwrap();
+		let second = kernel
+			.hit(
+				&transform,
+				Cursor::Available(Point::new(center_x as f32 + 1.0, center_y as f32 + 1.0)),
+			)
+			.unwrap();
+		assert_eq!(first.fields, second.fields);
 	}
 }

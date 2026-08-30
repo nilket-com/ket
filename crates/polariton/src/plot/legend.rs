@@ -5,7 +5,7 @@ use crate::plot::common::{PlotBackend, ResolvedPlotSettings};
 use crate::plot::continuous_color::ContinuousColorScale;
 use crate::plot::gradient_stops::GradientStops;
 use crate::plot::spec::{NonEmpty, ResolvedPresence};
-use crate::plot::text_estimate::estimate_formatted_label_width;
+use crate::plot::text_estimate::{ascii_label_advance_em, estimate_formatted_label_width};
 use iced::widget::canvas::{Stroke, Style, Text};
 use iced::{Color, Point, Size, alignment};
 
@@ -38,8 +38,24 @@ pub struct LegendEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub enum LegendSection {
 	Entries(NonEmpty<LegendEntry>),
-	Gradient { label: String, stops: GradientStops },
-	SizeSample { label: String, low: f64, high: f64 },
+	Gradient {
+		label: String,
+		stops: GradientStops,
+	},
+	/// A closed integer count guide. Its two endpoint labels are exactly `0`
+	/// and `maximum` in unabbreviated decimal, with no separators or
+	/// intermediate ticks. The maximum also drives the source-stable width
+	/// envelope required by PRODUCT-0143.
+	CountGradient {
+		label: String,
+		stops: GradientStops,
+		maximum: u64,
+	},
+	SizeSample {
+		label: String,
+		low: f64,
+		high: f64,
+	},
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -74,6 +90,24 @@ pub(crate) fn gradient_section(
 	let stops = GradientStops::projected(scale)
 		.expect("PRODUCT-0087 canonical positions project to an ascending domain");
 	Some(LegendSection::Gradient { label, stops })
+}
+
+/// Construct PRODUCT-0143's deliberately closed count-guide contract.
+pub(crate) fn count_gradient_section(
+	label: String,
+	scale: &ContinuousColorScale,
+	maximum: u64,
+) -> Option<LegendSection> {
+	if maximum == 0 || scale.is_degenerate() {
+		return None;
+	}
+	let stops = GradientStops::projected(scale)
+		.expect("PRODUCT-0087 canonical positions project to an ascending domain");
+	Some(LegendSection::CountGradient {
+		label,
+		stops,
+		maximum,
+	})
 }
 
 /// Apply PRODUCT-0044's content policy to one legend.
@@ -303,6 +337,21 @@ impl GradientLabels {
 		estimate_formatted_label_width(&self.low, font_size)
 			.max(estimate_formatted_label_width(&self.high, font_size))
 	}
+
+	fn count(maximum: u64) -> Self {
+		Self {
+			low: "0".to_string(),
+			high: maximum.to_string(),
+		}
+	}
+
+	fn count_envelope_width(maximum: u64, font_size: f32) -> f32 {
+		let positions = maximum.to_string().len().max(1) as f32;
+		let widest_digit = ('0'..='9')
+			.map(ascii_label_advance_em)
+			.fold(0.0_f32, f32::max);
+		positions * widest_digit * font_size
+	}
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -344,6 +393,14 @@ fn gradient_required_width(labels: &GradientLabels, font_size: f32) -> f32 {
 		+ LEGEND_PADDING
 }
 
+fn count_gradient_required_width(maximum: u64, font_size: f32) -> f32 {
+	LEGEND_PADDING
+		+ GRADIENT_BAR_WIDTH
+		+ GRADIENT_TEXT_GAP
+		+ GradientLabels::count_envelope_width(maximum, font_size)
+		+ LEGEND_PADDING
+}
+
 fn legend_geometry(content: &LegendContent, settings: &ResolvedPlotSettings) -> LegendGeometry {
 	let sections: Vec<&LegendSection> = content.sections().collect();
 	if let [
@@ -380,6 +437,7 @@ fn legend_geometry(content: &LegendContent, settings: &ResolvedPlotSettings) -> 
 				entries.len().div_ceil(max_rows) as f32 * 150.0 + LEGEND_PADDING * 2.0
 			}
 			LegendSection::Gradient { .. } => 60.0,
+			LegendSection::CountGradient { .. } => 60.0,
 			LegendSection::SizeSample { .. } => 180.0,
 		}
 	} else {
@@ -390,6 +448,10 @@ fn legend_geometry(content: &LegendContent, settings: &ResolvedPlotSettings) -> 
 		.filter_map(|section| match section {
 			LegendSection::Gradient { stops, .. } => Some(gradient_required_width(
 				&GradientLabels::new(stops),
+				settings.legend_size.pixels(),
+			)),
+			LegendSection::CountGradient { maximum, .. } => Some(count_gradient_required_width(
+				*maximum,
 				settings.legend_size.pixels(),
 			)),
 			_ => None,
@@ -409,6 +471,15 @@ fn legend_geometry(content: &LegendContent, settings: &ResolvedPlotSettings) -> 
 				title: Point::new(width / 2.0, offset + 10.0),
 				labels: GradientLabels::new(stops),
 			}),
+			LegendSection::CountGradient {
+				stops: _, maximum, ..
+			} => Some(GradientGeometry {
+				bar: Point::new(LEGEND_PADDING, offset + 35.0),
+				bar_height: 145.0,
+				endpoint_x: LEGEND_PADDING + GRADIENT_BAR_WIDTH + GRADIENT_TEXT_GAP,
+				title: Point::new(width / 2.0, offset + 10.0),
+				labels: GradientLabels::count(*maximum),
+			}),
 			_ => None,
 		};
 		gradients.push(gradient);
@@ -418,6 +489,7 @@ fn legend_geometry(content: &LegendContent, settings: &ResolvedPlotSettings) -> 
 				entries.len().min(max_rows) as f32 * 25.0 + LEGEND_PADDING * 2.0
 			}
 			LegendSection::Gradient { .. } => 200.0,
+			LegendSection::CountGradient { .. } => 200.0,
 			LegendSection::SizeSample { .. } => 180.0,
 		};
 	}
@@ -495,6 +567,24 @@ pub(crate) fn legend_layout(
 				)),
 			}
 		}
+	}
+}
+
+/// Resolve the displayed guide origin without letting viewport-derived content
+/// resize a fallback gutter. Authored overlays do not reserve plot width, so
+/// they retain their existing actual-content anchoring.
+pub(crate) fn legend_origin_for_display(
+	bounds: Rect<Widget>,
+	reservation: LegendLayout,
+	plot_extent: Rect<Widget>,
+	content: &LegendContent,
+	settings: &ResolvedPlotSettings,
+) -> Option<Pt<Widget>> {
+	match settings.legend {
+		ResolvedPresence::Show(_) => {
+			legend_layout(bounds, Some(content), settings).origin(plot_extent)
+		}
+		ResolvedPresence::Hide | ResolvedPresence::Fallback => reservation.origin(plot_extent),
 	}
 }
 
@@ -693,7 +783,8 @@ pub fn render_legend(
 					});
 				}
 			}
-			LegendSection::Gradient { label, stops } => {
+			LegendSection::Gradient { label, stops }
+			| LegendSection::CountGradient { label, stops, .. } => {
 				let gradient = gradient_geometry
 					.as_ref()
 					.expect("PRODUCT-0093 gradient sections carry gradient geometry");
@@ -1349,5 +1440,57 @@ mod tests {
 			let value = low + (high - low) * index as f64 / 49.0;
 			assert!(format!("{value:.1}").len() <= endpoint_width);
 		}
+	}
+
+	fn count_content(maximum: u64) -> LegendContent {
+		let scale = ContinuousColorScale::new(
+			(0.0, maximum as f64),
+			ContinuousScaleIntent::SEQUENTIAL,
+			ContinuousRamps::default(),
+		)
+		.unwrap();
+		LegendContent(NonEmpty::new(
+			count_gradient_section("Count".to_owned(), &scale, maximum).unwrap(),
+		))
+	}
+
+	#[test]
+	fn product_0143_count_envelope_bounds_power_of_ten_and_widest_digit_traps() {
+		let settings = ResolvedPlotSettings::default();
+		for (source_count, actual_maximum) in [(1_000_u64, 999_u64), (10_000, 8_888)] {
+			let reservation = count_content(source_count);
+			let actual = count_content(actual_maximum);
+			assert!(
+				measure_legend(&actual, &settings).width
+					<= measure_legend(&reservation, &settings).width
+			);
+		}
+		assert_eq!(
+			GradientLabels::count_envelope_width(1_000, 20.0),
+			4.0 * ('0'..='9')
+				.map(ascii_label_advance_em)
+				.fold(0.0_f32, f32::max)
+				* 20.0
+		);
+	}
+
+	#[test]
+	fn product_0143_count_guide_renders_only_closed_integer_endpoints() {
+		let settings = ResolvedPlotSettings::default();
+		let content = count_content(9_999);
+		let mut backend = RectangleBackend::default();
+		render_legend(
+			&mut backend,
+			Rect::<Widget>::from_iced_frame(Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0)))
+				.origin(),
+			&content,
+			&settings,
+		);
+		let labels = backend
+			.texts
+			.iter()
+			.map(|text| text.content.as_str())
+			.collect::<Vec<_>>();
+		assert_eq!(labels, ["9999", "0", "Count"]);
 	}
 }

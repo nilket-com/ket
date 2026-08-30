@@ -34,7 +34,7 @@ pub struct ArtifactToken(NonZeroU64);
 static NEXT_ARTIFACT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 impl ArtifactToken {
-	fn mint() -> Self {
+	pub(crate) fn mint() -> Self {
 		let raw = NEXT_ARTIFACT_TOKEN.fetch_add(1, Ordering::Relaxed);
 		Self(NonZeroU64::new(raw).expect("artifact token counter exhausted"))
 	}

@@ -4,7 +4,7 @@ use crate::gui::messages::PlotMessage;
 use crate::plot::chrome::{PlotChrome, PlotMarkStyle};
 use crate::plot::colors::ColorTheme;
 use crate::plot::continuous_color::ContinuousRamps;
-use crate::plot::legend::{LegendContent, legend_layout, render_legend};
+use crate::plot::legend::{LegendContent, legend_layout, legend_origin_for_display, render_legend};
 use crate::plot::spec::{
 	BarWidth, CategoryGap, FacetLabelTextSize, HoverTextSize, LegendPosition, LegendTextSize,
 	PlotPaddingPixels, PointSize, ResolvedPresence, SemanticType, StrokeWidth, SubtitleTextSize,
@@ -1600,6 +1600,19 @@ pub trait PlotKernel: Send + Sync {
 		self.plot_with_settings(backend, bounds, transform, cursor, settings);
 	}
 
+	/// Prepare data whose truth depends on the final plot rectangle. Ordinary
+	/// kernels are already viewport-independent; PRODUCT-0143's hexbin kernel
+	/// overrides this seam and keeps aggregation outside `plot` and `hit`.
+	fn prepare_viewport(&self, _transform: &CoordinateTransformer<'_>, _motion: ViewportMotion) {}
+
+	/// Content used only to reserve legend geometry before the final plot
+	/// rectangle exists. It normally equals displayed content. PRODUCT-0143
+	/// overrides it with the source-count envelope that breaks the
+	/// viewport/bin-count/layout cycle.
+	fn legend_reservation_content(&self, settings: &ResolvedPlotSettings) -> Option<LegendContent> {
+		self.legend_content(settings)
+	}
+
 	fn legend_content(&self, _settings: &ResolvedPlotSettings) -> Option<LegendContent> {
 		None
 	}
@@ -2867,17 +2880,19 @@ impl<'a> PlotWidget<'a> {
 				self.settings.chrome.canvas_background.iced(),
 			);
 		}
-		let legend_content = self
+		let legend_reservation = self
 			.kernel
-			.legend_content(&self.settings)
+			.legend_reservation_content(&self.settings)
 			.and_then(crate::plot::legend::apply_policy);
-		let legend = legend_layout(bounds, legend_content.as_ref(), &self.settings);
+		let legend = legend_layout(bounds, legend_reservation.as_ref(), &self.settings);
 		let layout = self.kernel.layout(self.settings.clone());
 		let requirements = BandRequirements::from_layout(&layout, &self.settings);
 		let plot_area = self
 			.plot_area(legend.content_bounds, &requirements)
 			.into_iced();
 		let transform = CoordinateTransformer::new(&layout, plot_area);
+		self.kernel
+			.prepare_viewport(&transform, self.viewport_motion);
 		let draw_plot = &mut |backend: &mut dyn PlotBackend| {
 			backend.translate(iced::Vector::new(plot_area.x, plot_area.y));
 			self.draw_layout_grid(backend, plot_area, &transform, &layout);
@@ -2915,17 +2930,23 @@ impl<'a> PlotWidget<'a> {
 			}
 			return;
 		}
-		let legend_content = self
+		let legend_reservation = self
 			.kernel
-			.legend_content(&self.settings)
+			.legend_reservation_content(&self.settings)
 			.and_then(crate::plot::legend::apply_policy);
-		let legend = legend_layout(bounds, legend_content.as_ref(), &self.settings);
+		let legend = legend_layout(bounds, legend_reservation.as_ref(), &self.settings);
 		let layout = self.kernel.layout(self.settings.clone());
 		let requirements = BandRequirements::from_layout(&layout, &self.settings);
 		let plot_extent = self.plot_area(legend.content_bounds, &requirements);
 		let plot_area = plot_extent.into_iced();
 		let bounds = bounds.into_iced();
 		let transform = CoordinateTransformer::new(&layout, plot_area);
+		self.kernel
+			.prepare_viewport(&transform, self.viewport_motion);
+		let legend_content = self
+			.kernel
+			.legend_content(&self.settings)
+			.and_then(crate::plot::legend::apply_policy);
 		let bg = self.settings.chrome.canvas_background.iced();
 		let canvas_w = bounds.width;
 		let canvas_h = bounds.height;
@@ -3022,8 +3043,14 @@ impl<'a> PlotWidget<'a> {
 			});
 		});
 		let size_only_bounds = Rectangle::new(Point::ORIGIN, bounds.size());
-		if let (Some(content), Some(origin)) = (legend_content.as_ref(), legend.origin(plot_extent))
-		{
+		if let Some(content) = legend_content.as_ref()
+			&& let Some(origin) = legend_origin_for_display(
+				Rect::from_iced_frame(bounds),
+				legend,
+				plot_extent,
+				content,
+				&self.settings,
+			) {
 			render_legend(backend, origin, content, &self.settings);
 		}
 		let title = resolve_canvas_text(&self.settings.title, Some(self.title.clone()));
@@ -3247,15 +3274,18 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 					}
 					return None;
 				}
-				let legend_content = self
+				let legend_reservation = self
 					.kernel
-					.legend_content(&self.settings)
+					.legend_reservation_content(&self.settings)
 					.and_then(crate::plot::legend::apply_policy);
-				let legend = legend_layout(widget_bounds, legend_content.as_ref(), &self.settings);
+				let legend =
+					legend_layout(widget_bounds, legend_reservation.as_ref(), &self.settings);
 				let layout = self.kernel.layout(self.settings.clone());
 				let requirements = BandRequirements::from_layout(&layout, &self.settings);
 				let plot_area = self.plot_area(legend.content_bounds, &requirements);
 				let transform = CoordinateTransformer::new(&layout, plot_area.into_iced());
+				self.kernel
+					.prepare_viewport(&transform, self.viewport_motion);
 				let plot_cursor = widget_cursor
 					.map(|cursor| Pt::<Plot>::from_widget(cursor, plot_area))
 					.map_or(Cursor::Unavailable, |cursor| {

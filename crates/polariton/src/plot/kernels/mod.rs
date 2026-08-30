@@ -15,6 +15,7 @@ pub mod funnel_stages;
 pub mod heatmap;
 pub mod heatmap_cells;
 pub mod hexbin;
+pub mod hexbin_viewport;
 // PRODUCT-0078 preserves the validated renderer substrate while its authored
 // producer is deliberately absent until the histogram surface record.
 #[allow(dead_code)]

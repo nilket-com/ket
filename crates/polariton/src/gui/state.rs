@@ -24,7 +24,7 @@ use crate::plot::common::{PlotLayout, TickPlacementError};
 #[cfg(feature = "toron")]
 use crate::plot::core::PlotType;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
-use crate::plot::factory::create_plot;
+use crate::plot::factory::create_plot_from_artifact;
 #[cfg(feature = "toron")]
 use crate::plot::factory::{create_layered_plot_from_artifact, create_styled_plot};
 #[cfg(feature = "toron")]
@@ -318,10 +318,12 @@ fn build_resolved_plot_task(
 		async move {
 			let spec = resolved.resolved_spec.clone();
 			let data = resolved.data.as_ref().clone();
-			let kernel =
-				tokio::task::spawn_blocking(move || create_plot(&spec, &data, 1200, height))
-					.await
-					.expect("Rune plot build task panicked");
+			let artifact = std::sync::Arc::clone(&resolved.artifact);
+			let kernel = tokio::task::spawn_blocking(move || {
+				create_plot_from_artifact(&spec, &data, &artifact, 1200, height)
+			})
+			.await
+			.expect("Rune plot build task panicked");
 			(resolved, kernel)
 		},
 		move |(resolved, kernel)| on_ready(resolved, kernel),
@@ -2861,8 +2863,13 @@ fn rune_view_outcome_with_palettes(
 										},
 									));
 								}
-								let kernel =
-									create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
+								let kernel = create_plot_from_artifact(
+									&resolved.resolved_spec,
+									&resolved.data,
+									&resolved.artifact,
+									1200,
+									720,
+								);
 								validate_rune_tick_capacity(
 									kernel.as_ref(),
 									&resolved_tick_settings,
