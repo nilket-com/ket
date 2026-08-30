@@ -30,10 +30,16 @@ const EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT: usize = 10_000;
 // verified-column tally joining the same re-export, and for the wider comment that
 // now has to explain two diagnostics rather than one. Same reason as above: the
 // harness stamps both into its artifact header and `join` is private.
+// ADR 580: +2 for the batch-local equivalence gate joining the same re-export, so
+// the harness can stamp it into the seal and withhold timing authority from a
+// diagnostic run.
+// ADR 580 measurement: +1 for the route gate beside it. The route is off by
+// default and exists to denominate one projection; the harness needs its name to
+// stamp the seal and to withhold authority while it is on.
 // ADR 554 follow-on: +2 for the re-export comment, which now has to say where each
 // diagnostic's state is stamped — the locality probe in the artifact header, the
 // equivalence check in the seal — and that both gates also withhold timing authority.
-const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_594;
+const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_597;
 const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
 // ADR 554 follow-on: 3_825 -> 3_890 for the index-build split — two nested child
 // timers selected by join kind, and the tests that pin the selection, including the
@@ -50,7 +56,11 @@ const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
 // machinery and its tests now live in `join/output_materialization.rs`; the join root
 // measured 3,383 lines after the move. A bound raised for work that has since left the
 // file would silently license the next 900 lines of drift.
-const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_420;
+// ADR 580: 3_420 -> 3_465 for splitting the probe body into an `_into` core plus its
+// allocating wrapper. The wrapper is what keeps every existing caller byte-identical while
+// the batch-local route reuses one selection vector, so the added lines ARE the seam that
+// confines the change. The carve boundary is untouched: no streaming orchestration here.
+const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_465;
 
 #[test]
 pub(crate) fn adr350_exec_root_declares_join_module() {
@@ -1173,5 +1183,38 @@ pub(crate) fn adr514_compact_sizing_scope_is_pinned() {
 			.count(),
 		7,
 		"one definition, one call in the partitioning choice, five test references"
+	);
+}
+
+/// ADR 580: `matched_rows` has exactly one writer, and it attributes by route.
+///
+/// A direct assignment would add rows to the total without saying which route
+/// produced them, and the route-scoped counters would silently stop summing to
+/// it — the projection they exist to denominate would then be computed over rows
+/// no route claimed. `add_matched_rows` is that single writer.
+#[test]
+pub(crate) fn adr580_matched_rows_has_one_attributing_writer() {
+	let manifest = manifest_dir();
+	let offenders = source_files(&manifest.join("src"))
+		.into_iter()
+		.filter(|path| !path.ends_with("distributed/task.rs"))
+		.flat_map(|path| {
+			std::fs::read_to_string(&path)
+				.expect("read source file")
+				.lines()
+				.enumerate()
+				.filter_map(|(index, line)| {
+					line.contains("counters.matched_rows =")
+						.then(|| (path.clone(), index + 1, line.to_string()))
+				})
+				.collect::<Vec<_>>()
+		})
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"matched_rows must be written only through `add_matched_rows`, which \
+		 attributes the rows to a route:\n{}",
+		format_offenders(&manifest, &offenders)
 	);
 }

@@ -566,6 +566,72 @@ pub struct TaskTelemetryCounters {
 	/// walked, and the ratio is the deferral's coverage.
 	#[serde(default)]
 	pub join_output_index_rows_materialized: u64,
+	/// ADR 580: which input route each `execute_hash_join` committed to — probing
+	/// the right batches directly, or concatenating them first.
+	///
+	/// A receipt, so a run reads the batch-local figures only on nodes where the
+	/// route actually fired and a fallback is a recorded fact rather than the
+	/// absence of one.
+	#[serde(default)]
+	pub join_batch_local_routes: u64,
+	#[serde(default)]
+	pub join_concatenated_routes: u64,
+	/// Output batches the batch-local route produced. It returns one per probe
+	/// batch where the concatenating route returns one in total, and the consumer
+	/// pays for that difference, so it is measured rather than assumed free.
+	#[serde(default)]
+	pub join_batch_local_output_batches: u64,
+	/// Slice bytes the skipped concatenation would have copied.
+	///
+	/// Bytes NOT allocated, which is what the route changes. NOT a measured peak:
+	/// the source batches and the per-batch outputs are still live.
+	#[serde(default)]
+	pub join_batch_local_concat_bytes_avoided: u64,
+	/// Builds that passed the batch-local route's admission estimate and were then
+	/// declined by the build itself.
+	///
+	/// MUST BE ZERO. The admission gate tests the estimate for the whole build and
+	/// the build tests the same estimate for a row count that cannot exceed it, so
+	/// a decline here contradicts the gate. It is counted because its consequence is
+	/// otherwise invisible: the caller rebuilds on the concatenating path, and that
+	/// duplicated work lands in framework overhead while the receipt reports an
+	/// ordinary fallback.
+	#[serde(default)]
+	pub join_batch_local_post_admission_declines: u64,
+	/// ADR 580 measurement: matched rows attributed to the route that produced
+	/// them.
+	///
+	/// A node runs both routes, so a node-level `matched_rows` cannot denominate
+	/// either one — projecting a per-row cost onto it would mix the route being
+	/// measured with the fallback work beside it, which is the aggregation trap
+	/// this line has already paid for twice. Written only through
+	/// [`TaskTelemetryCounters::add_matched_rows`], so
+	/// `batch_local + concatenated == matched_rows` holds by construction and a
+	/// new call site cannot forget to attribute.
+	#[serde(default)]
+	pub join_batch_local_matched_rows: u64,
+	#[serde(default)]
+	pub join_concatenated_matched_rows: u64,
+}
+
+impl TaskTelemetryCounters {
+	/// The one writer for `matched_rows`, which also attributes them to a route.
+	///
+	/// `batch_local` says whether these rows came from ADR 580's batch-local probe
+	/// route. Every other producer — the concatenating in-memory path, the spilled
+	/// paths, the streaming paths — is `false`. An architecture guard forbids
+	/// assigning `matched_rows` directly, so the attribution cannot drift from the
+	/// total it partitions.
+	pub fn add_matched_rows(&mut self, rows: u64, batch_local: bool) {
+		self.matched_rows = self.matched_rows.saturating_add(rows);
+		if batch_local {
+			self.join_batch_local_matched_rows =
+				self.join_batch_local_matched_rows.saturating_add(rows);
+		} else {
+			self.join_concatenated_matched_rows =
+				self.join_concatenated_matched_rows.saturating_add(rows);
+		}
+	}
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
