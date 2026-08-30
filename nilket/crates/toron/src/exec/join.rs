@@ -28,8 +28,6 @@ mod streamed_spill;
 
 pub(in crate::exec) mod stage_attribution;
 
-mod batch_local_probe;
-
 mod input_materialization;
 
 mod output_materialization;
@@ -47,15 +45,6 @@ pub(super) use self::build_rows::{BuildRowList, JoinBuildRows, build_in_memory_j
 pub use self::output_materialization::{
 	JOIN_SLICE_EQUIVALENCE_ENV, join_slice_equivalence_columns_verified,
 	join_slice_equivalence_enabled,
-};
-
-pub use self::batch_local_probe::{
-	JOIN_BATCH_LOCAL_EQUIVALENCE_ENV, join_batch_local_equivalence_columns_verified,
-	join_batch_local_equivalence_enabled,
-};
-
-use self::batch_local_probe::{
-	batch_local_route_eligible, record_route, try_batch_local_inner_join,
 };
 
 use self::input_materialization::{JoinInputSide, time_join_input_materialization};
@@ -812,35 +801,10 @@ pub(super) async fn execute_hash_join(
 			concat_or_empty(left_schema, left_batches)
 		})?;
 
-	// ADR 580: probe the right batches directly where the evidence supports it —
-	// Inner, more than one batch, in-memory build. The route declines by returning
-	// `None`, leaving every line below unchanged, and both outcomes are recorded
-	// as receipts rather than inferred from which counters moved.
-	if batch_local_route_eligible(kind, right_batches)
-		&& let Some(output) = try_batch_local_inner_join(
-			kind,
-			&left_batch,
-			right_batches,
-			left_keys,
-			right_keys,
-			output_schema,
-			match_filter,
-			null_safe_keys,
-			replay_id,
-			strategy,
-			task_budget,
-			&telemetry,
-			&join_runtime_observation_mode,
-		)? {
-		return Ok(output);
-	}
-
 	let right_batch =
 		time_join_input_materialization(&telemetry, JoinInputSide::Right, right_batches, || {
 			concat_or_empty(right_schema, right_batches)
 		})?;
-
-	record_route(&telemetry, false, 0, 0);
 
 	// ADR 239: CROSS is keyless — route through the explicit match-all path instead of the hash
 

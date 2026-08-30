@@ -469,10 +469,6 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// and the shape counters that price a multi-batch redesign. Executor
 				// telemetry, no binder decomposition surface.
 				"crates/toron/src/exec/join/input_materialization.rs",
-				// ADR 580: the batch-local probe route. An executor path change with its
-				// own receipts and equivalence diagnostic; no binder decomposition
-				// surface.
-				"crates/toron/src/exec/join/batch_local_probe.rs",
 			];
 			*path != "crates/toron/src/binder.rs"
 				&& !path.starts_with("crates/toron/src/binder/")

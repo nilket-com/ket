@@ -5094,7 +5094,6 @@ impl TimingAuthorityConditions {
 pub fn join_diagnostics_disabled() -> bool {
 	!toron::exec::join_slice_equivalence_enabled()
 		&& !toron::exec::join_selection_locality_enabled()
-		&& !toron::exec::join_batch_local_equivalence_enabled()
 }
 
 /// One timed child: exactly one query execution on one arm. `query_elapsed_ms` covers the
@@ -6771,22 +6770,6 @@ fn timing_atlas_replay_attribution_path(
 				.and_then(|value| value.as_f64())
 				.unwrap_or(0.0),
 			join_input_shape: node.get("join_input_shape").cloned(),
-			join_batch_local_routes: node
-				.get("join_batch_local_routes")
-				.and_then(|value| value.as_u64())
-				.unwrap_or(0),
-			join_concatenated_routes: node
-				.get("join_concatenated_routes")
-				.and_then(|value| value.as_u64())
-				.unwrap_or(0),
-			join_batch_local_output_batches: node
-				.get("join_batch_local_output_batches")
-				.and_then(|value| value.as_u64())
-				.unwrap_or(0),
-			join_batch_local_concat_bytes_avoided: node
-				.get("join_batch_local_concat_bytes_avoided")
-				.and_then(|value| value.as_u64())
-				.unwrap_or(0),
 			join_output_nonnull_index_build_ms: node
 				.get("join_output_nonnull_index_build_ms")
 				.and_then(|value| value.as_f64())
@@ -7596,9 +7579,6 @@ pub async fn run_timing_atlas(
 		// never fired when it is true — opposite conclusions from one number.
 		// A run with the check on must NOT be used for timing comparisons.
 		"join_slice_equivalence_check": toron::exec::join_slice_equivalence_enabled(),
-		"join_batch_local_equivalence_check": toron::exec::join_batch_local_equivalence_enabled(),
-		"join_batch_local_equivalence_columns_verified":
-			toron::exec::join_batch_local_equivalence_columns_verified(),
 		"join_slice_equivalence_columns_verified": toron::exec::join_slice_equivalence_columns_verified(),
 	}))?;
 
@@ -8084,12 +8064,6 @@ pub struct TimingAtlasTaskNode {
 	/// byte totals and the batch-count histogram. Absent when this node ran no
 	/// join input concatenation, which is not the same as running empty ones.
 	pub join_input_shape: Option<serde_json::Value>,
-	/// ADR 580: which input route each `execute_hash_join` on this node committed
-	/// to, with what the batch-local one produced and avoided.
-	pub join_batch_local_routes: u64,
-	pub join_concatenated_routes: u64,
-	pub join_batch_local_output_batches: u64,
-	pub join_batch_local_concat_bytes_avoided: u64,
 	/// ADR 554 follow-on: index-vector construction inside the same parent, split
 	/// by whether the substitution to a plain `Vec<u32>` could serve it.
 	///
@@ -9178,10 +9152,6 @@ fn placement_attempt_from_row(row: &serde_json::Value) -> Result<PlacementAttemp
 			join_input_right_single_batch_ms: 0.0,
 			join_input_right_multi_batch_ms: 0.0,
 			join_input_shape: None,
-			join_batch_local_routes: 0,
-			join_concatenated_routes: 0,
-			join_batch_local_output_batches: 0,
-			join_batch_local_concat_bytes_avoided: 0,
 			join_output_nonnull_index_build_ms: 0.0,
 			join_output_nullable_index_build_ms: 0.0,
 			join_selection_locality: None,
@@ -9663,16 +9633,6 @@ pub fn timing_atlas_nodes_from_report(
 				join_input_shape: (record.telemetry.join_input_shape != Default::default())
 					.then(|| serde_json::to_value(record.telemetry.join_input_shape).ok())
 					.flatten(),
-				join_batch_local_routes: record.telemetry.counters.join_batch_local_routes,
-				join_concatenated_routes: record.telemetry.counters.join_concatenated_routes,
-				join_batch_local_output_batches: record
-					.telemetry
-					.counters
-					.join_batch_local_output_batches,
-				join_batch_local_concat_bytes_avoided: record
-					.telemetry
-					.counters
-					.join_batch_local_concat_bytes_avoided,
 				join_output_nonnull_index_build_ms: record
 					.telemetry
 					.phases
@@ -9742,10 +9702,6 @@ pub fn timing_atlas_local_task_node(
 		join_input_right_single_batch_ms: 0.0,
 		join_input_right_multi_batch_ms: 0.0,
 		join_input_shape: None,
-		join_batch_local_routes: 0,
-		join_concatenated_routes: 0,
-		join_batch_local_output_batches: 0,
-		join_batch_local_concat_bytes_avoided: 0,
 		join_output_nonnull_index_build_ms: 0.0,
 		join_output_nullable_index_build_ms: 0.0,
 		join_selection_locality: None,
@@ -9843,10 +9799,6 @@ pub fn timing_atlas_attribution_path_row(
 				"join_input_right_single_batch_ms": node.join_input_right_single_batch_ms,
 				"join_input_right_multi_batch_ms": node.join_input_right_multi_batch_ms,
 				"join_input_shape": node.join_input_shape,
-				"join_batch_local_routes": node.join_batch_local_routes,
-				"join_concatenated_routes": node.join_concatenated_routes,
-				"join_batch_local_output_batches": node.join_batch_local_output_batches,
-				"join_batch_local_concat_bytes_avoided": node.join_batch_local_concat_bytes_avoided,
 				"join_output_nonnull_index_build_ms": node.join_output_nonnull_index_build_ms,
 				"join_output_nullable_index_build_ms": node.join_output_nullable_index_build_ms,
 				"join_selection_locality": node.join_selection_locality,
@@ -26101,10 +26053,6 @@ mod adr538_timing_atlas_journal_replay {
 			join_input_right_single_batch_ms: 0.0,
 			join_input_right_multi_batch_ms: 0.0,
 			join_input_shape: None,
-			join_batch_local_routes: 0,
-			join_concatenated_routes: 0,
-			join_batch_local_output_batches: 0,
-			join_batch_local_concat_bytes_avoided: 0,
 			join_output_nonnull_index_build_ms: 0.0,
 			join_output_nullable_index_build_ms: 0.0,
 			join_selection_locality: None,
@@ -26228,10 +26176,6 @@ mod adr538_timing_atlas_journal_replay {
 			join_input_right_single_batch_ms: 0.0,
 			join_input_right_multi_batch_ms: 0.0,
 			join_input_shape: None,
-			join_batch_local_routes: 0,
-			join_concatenated_routes: 0,
-			join_batch_local_output_batches: 0,
-			join_batch_local_concat_bytes_avoided: 0,
 			join_output_nonnull_index_build_ms: 0.0,
 			join_output_nullable_index_build_ms: 0.0,
 			join_selection_locality: None,
@@ -26283,10 +26227,6 @@ mod adr538_timing_atlas_journal_replay {
 				join_input_right_single_batch_ms: 0.0,
 				join_input_right_multi_batch_ms: 0.0,
 				join_input_shape: None,
-				join_batch_local_routes: 0,
-				join_concatenated_routes: 0,
-				join_batch_local_output_batches: 0,
-				join_batch_local_concat_bytes_avoided: 0,
 				join_output_nonnull_index_build_ms: 0.0,
 				join_output_nullable_index_build_ms: 0.0,
 				join_selection_locality: None,
@@ -26331,10 +26271,6 @@ mod adr538_timing_atlas_journal_replay {
 				join_input_right_single_batch_ms: 0.0,
 				join_input_right_multi_batch_ms: 0.0,
 				join_input_shape: None,
-				join_batch_local_routes: 0,
-				join_concatenated_routes: 0,
-				join_batch_local_output_batches: 0,
-				join_batch_local_concat_bytes_avoided: 0,
 				join_output_nonnull_index_build_ms: 0.0,
 				join_output_nullable_index_build_ms: 0.0,
 				join_selection_locality: None,
@@ -27337,10 +27273,6 @@ mod adr538_timing_atlas_critical_path {
 			join_input_right_single_batch_ms: 0.0,
 			join_input_right_multi_batch_ms: 0.0,
 			join_input_shape: None,
-			join_batch_local_routes: 0,
-			join_concatenated_routes: 0,
-			join_batch_local_output_batches: 0,
-			join_batch_local_concat_bytes_avoided: 0,
 			join_output_nonnull_index_build_ms: 0.0,
 			join_output_nullable_index_build_ms: 0.0,
 			join_selection_locality: None,
@@ -27586,10 +27518,6 @@ mod adr538_path_bound_validation {
 				join_input_right_single_batch_ms: 0.0,
 				join_input_right_multi_batch_ms: 0.0,
 				join_input_shape: None,
-				join_batch_local_routes: 0,
-				join_concatenated_routes: 0,
-				join_batch_local_output_batches: 0,
-				join_batch_local_concat_bytes_avoided: 0,
 				join_output_nonnull_index_build_ms: 0.0,
 				join_output_nullable_index_build_ms: 0.0,
 				join_selection_locality: None,
@@ -27628,10 +27556,6 @@ mod adr538_path_bound_validation {
 				join_input_right_single_batch_ms: 0.0,
 				join_input_right_multi_batch_ms: 0.0,
 				join_input_shape: None,
-				join_batch_local_routes: 0,
-				join_concatenated_routes: 0,
-				join_batch_local_output_batches: 0,
-				join_batch_local_concat_bytes_avoided: 0,
 				join_output_nonnull_index_build_ms: 0.0,
 				join_output_nullable_index_build_ms: 0.0,
 				join_selection_locality: None,
@@ -27671,10 +27595,6 @@ mod adr538_path_bound_validation {
 				join_input_right_single_batch_ms: 0.0,
 				join_input_right_multi_batch_ms: 0.0,
 				join_input_shape: None,
-				join_batch_local_routes: 0,
-				join_concatenated_routes: 0,
-				join_batch_local_output_batches: 0,
-				join_batch_local_concat_bytes_avoided: 0,
 				join_output_nonnull_index_build_ms: 0.0,
 				join_output_nullable_index_build_ms: 0.0,
 				join_selection_locality: None,
