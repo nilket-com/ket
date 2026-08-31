@@ -5579,10 +5579,12 @@ fn product_0145_fill_between_substrate_has_one_validated_colour_and_hit_authorit
 }
 
 #[test]
-fn product_0145_keeps_fill_between_surface_absent_and_resolution_non_reusing() {
+fn product_0145_authority_survives_product_0146_precise_surface_inversions() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let registry = presentation_registry(&root);
-	assert!(registry_callable(&registry, "fill_between", "Free", "FillBetween").is_none());
+	let callable = registry_callable(&registry, "fill_between", "Free", "FillBetween")
+		.expect("PRODUCT-0146 registers fill_between exactly once");
+	assert!(callable.contains("3..=4"));
 	let all_marks = registry
 		.split("const ALL_MARKS")
 		.nth(1)
@@ -5590,7 +5592,7 @@ fn product_0145_keeps_fill_between_surface_absent_and_resolution_non_reusing() {
 		.split("const POINT_MARKS")
 		.next()
 		.expect("bounded ALL_MARKS inventory");
-	assert!(!all_marks.contains("PlotType::FillBetween"));
+	assert!(all_marks.contains("PlotType::FillBetween"));
 
 	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
 	let mark_fields = spec
@@ -5600,8 +5602,8 @@ fn product_0145_keeps_fill_between_surface_absent_and_resolution_non_reusing() {
 		.split("pub struct AuthoredPlotSpec")
 		.next()
 		.expect("bounded MarkFields");
-	assert!(!mark_fields.contains("FillBetween"));
-	assert!(!spec.contains("pub fn fill_between"));
+	assert!(mark_fields.contains("FillBetween"));
+	assert!(spec.contains("pub fn fill_between"));
 	let automatic = spec
 		.split("PlotType::FillBetween => {")
 		.nth(1)
@@ -5613,4 +5615,89 @@ fn product_0145_keeps_fill_between_surface_absent_and_resolution_non_reusing() {
 	assert!(automatic.contains("middle: quantitative.get(2).cloned()"));
 	assert!(automatic.contains("lower: required(0, \"lower\")?"));
 	assert!(automatic.contains("upper: required(1, \"upper\")?"));
+
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune relation transport");
+	let spanned = envelope
+		.split("pub(crate) enum SpannedMarkFields")
+		.nth(1)
+		.expect("SpannedMarkFields declaration")
+		.split("impl SpannedMarkFields")
+		.next()
+		.expect("bounded SpannedMarkFields declaration");
+	assert!(spanned.contains("FillBetween {"));
+}
+
+#[test]
+fn product_0146_fill_between_surface_has_one_transport_and_no_colour_or_layer_widening() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let registry = presentation_registry(&root);
+	assert_eq!(
+		registry.match_indices("\"fill_between\"").count(),
+		1,
+		"fill_between has one callable spelling"
+	);
+	let compiler = std::fs::read_to_string(root.join("rune_view_compiler.rs"))
+		.expect("read Rune view compiler");
+	assert!(compiler.contains("\"fill_between\" => Some(&[3, 4])"));
+	assert!(compiler.contains("| \"fill_between\""));
+	assert!(compiler.contains("HandlerId::FillBetween"));
+
+	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
+		.expect("read Rune presentation evaluator");
+	assert!(presentation.contains("HandlerId::FillBetween => raw_fill_between"));
+	assert!(presentation.contains("PlotType::FillBetween => \"fill_between\""));
+	let diverging = presentation
+		.split("fn mark_diverging")
+		.nth(1)
+		.expect("mark_diverging function")
+		.split("fn mark_category")
+		.next()
+		.expect("bounded mark_diverging function");
+	assert!(!diverging.contains("PlotType::FillBetween"));
+
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune relation envelope");
+	assert_eq!(
+		envelope
+			.matches("PlotType::FillBetween => \"plot.fill_between\"")
+			.count(),
+		2
+	);
+	assert!(envelope.contains("| PlotType::FillBetween"));
+	assert!(!envelope.contains("LayerMark::FillBetween"));
+
+	let gui = std::fs::read_to_string(root.join("gui/state.rs")).expect("read GUI state");
+	let diagnostic = gui
+		.split("fn fill_between_failure_span")
+		.nth(1)
+		.expect("fill-between diagnostic mapper")
+		.split("fn bubble_failure_span")
+		.next()
+		.expect("bounded fill-between diagnostic mapper");
+	assert!(diagnostic.contains("prepare_fill_between_data"));
+	assert!(diagnostic.contains("error.role()"));
+	assert!(!diagnostic.contains("error.field =="));
+	assert!(!diagnostic.contains("artifact_token"));
+	assert!(!diagnostic.contains("ArtifactToken::mint"));
+
+	let settings = registry
+		.split("const ALL_MARKS")
+		.nth(1)
+		.expect("ALL_MARKS")
+		.split("const NO_DEPENDENCIES")
+		.next()
+		.expect("bounded applicability constants");
+	assert_eq!(settings.matches("PlotType::FillBetween").count(), 1);
+	assert!(settings.contains("const STROKE_MARKS"));
+	assert!(
+		!settings
+			.split("const STROKE_MARKS")
+			.nth(1)
+			.expect("STROKE_MARKS")
+			.split("const BAR_MARKS")
+			.next()
+			.expect("bounded STROKE_MARKS")
+			.contains("PlotType::FillBetween")
+	);
 }

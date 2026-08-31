@@ -12,19 +12,20 @@ use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
 	BarWidth, BoxPlotFields, BubbleFieldNames, BubbleFields, CategoryGap, FacetLabelTextSize,
-	FunnelFields, HeatmapFields, HexbinFields, HoverTextSize, LayerSettings, LayeredPlotSpec,
-	LegendPosition, LegendTextSize, MultivariateFields, Override, PieFields, PlotPaddingPixels,
-	PointSize, Presence, RadialDialFields, StrokeWidth, SubtitleTextSize, TickRotation,
-	TitleTextSize, ViolinFields, XLabelTextSize, XTickTextSize, YLabelTextSize, YTickTextSize,
+	FillBetweenFields, FunnelFields, HeatmapFields, HexbinFields, HoverTextSize, LayerSettings,
+	LayeredPlotSpec, LegendPosition, LegendTextSize, MultivariateFields, Override, PieFields,
+	PlotPaddingPixels, PointSize, Presence, RadialDialFields, StrokeWidth, SubtitleTextSize,
+	TickRotation, TitleTextSize, ViolinFields, XLabelTextSize, XTickTextSize, YLabelTextSize,
+	YTickTextSize,
 };
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
 };
 use crate::presentation_registry::{CALLABLES, HandlerId, RegistrationRoute};
 use crate::rune_relation_envelope::{
-	BoxPlotFieldOrigins, BubbleFieldOrigins, DisposableRunePlotSink, FunnelFieldOrigins,
-	HeatmapFieldOrigins, HexbinFieldOrigins, MultivariateFieldOrigins, PieFieldOrigins,
-	RadialDialFieldOrigins, RunePlotBody, RunePlotDomainSpans, RunePlotIntent,
+	BoxPlotFieldOrigins, BubbleFieldOrigins, DisposableRunePlotSink, FillBetweenFieldOrigins,
+	FunnelFieldOrigins, HeatmapFieldOrigins, HexbinFieldOrigins, MultivariateFieldOrigins,
+	PieFieldOrigins, RadialDialFieldOrigins, RunePlotBody, RunePlotDomainSpans, RunePlotIntent,
 	RunePlotMinorTickSpans, RunePlotTickEverySpans, RunePlotTickStepSpans, RuneTableSink,
 	RuneTableSkinIntent, RuneTableSkinProjection, RuneViewIntent, SpannedMarkFields,
 	StyledRunePlotSink, ViolinFieldOrigins,
@@ -582,6 +583,7 @@ fn raw_handler(handler: HandlerId) -> RawFunction {
 		HandlerId::Bubble => raw_bubble,
 		HandlerId::Heatmap => raw_heatmap,
 		HandlerId::Hexbin => raw_hexbin,
+		HandlerId::FillBetween => raw_fill_between,
 		HandlerId::Funnel => raw_funnel,
 		HandlerId::RadialDial => raw_radial_dial,
 		HandlerId::Pie => raw_pie,
@@ -1088,6 +1090,115 @@ fn raw_hexbin(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Outpu
 			category: None,
 			interval_end: None,
 			mark_fields: Some(SpannedMarkFields::Hexbin { fields, origins }),
+			origin: origin.range(),
+		},
+		settings: LayerSettings::default(),
+		stacked: false,
+		percent: false,
+	};
+	store(
+		out,
+		stack,
+		RuneMark {
+			sink: Ok(sink),
+			origin,
+			modified: false,
+			point_size_origin: None,
+			stroke_width_origin: None,
+			bar_width_origin: None,
+			category_gap_origin: None,
+			stacked_origin: None,
+			percent_origin: None,
+			continuous_intent: None,
+			continuous_intent_origin: None,
+		},
+	)
+}
+
+fn raw_fill_between(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = match raw_origin(values) {
+		Ok(origin) => origin,
+		Err(failure) => return store(out, stack, RuneMark::failed(failure)),
+	};
+	let field_count = match values.len() {
+		11 => 3,
+		14 => 4,
+		_ => {
+			return store(
+				out,
+				stack,
+				RuneMark::failed(PresentationFailure::new(
+					origin,
+					"fill_between(...) takes x, lower, upper, and optional middle strings",
+				)),
+			);
+		}
+	};
+	let mut fields = Vec::with_capacity(field_count);
+	for value in &values[..field_count] {
+		match rune::from_value::<Ref<str>>(value.clone()) {
+			Ok(field) => fields.push(field.to_owned()),
+			Err(_) => {
+				return store(
+					out,
+					stack,
+					RuneMark::failed(PresentationFailure::new(
+						origin,
+						"fill_between(...) field arguments must evaluate to strings",
+					)),
+				);
+			}
+		}
+	}
+	let decode_span = |index: usize| -> Result<Range<u32>, PresentationFailure> {
+		let start = rune::from_value::<i64>(values[index].clone()).map_err(|_| {
+			PresentationFailure::new(
+				origin,
+				"fill_between(...) has an invalid injected argument origin",
+			)
+		})?;
+		let end = rune::from_value::<i64>(values[index + 1].clone()).map_err(|_| {
+			PresentationFailure::new(
+				origin,
+				"fill_between(...) has an invalid injected argument origin",
+			)
+		})?;
+		Origin::decode(start, end).map(Origin::range)
+	};
+	let origin_base = field_count;
+	let origins = match (|| {
+		Ok(FillBetweenFieldOrigins {
+			x: decode_span(origin_base)?,
+			lower: decode_span(origin_base + 2)?,
+			upper: decode_span(origin_base + 4)?,
+			middle: (field_count == 4)
+				.then(|| decode_span(origin_base + 6))
+				.transpose()?,
+		})
+	})() {
+		Ok(origins) => origins,
+		Err(failure) => return store(out, stack, RuneMark::failed(failure)),
+	};
+	let fields = FillBetweenFields {
+		x: fields[0].clone(),
+		lower: fields[1].clone(),
+		upper: fields[2].clone(),
+		middle: (field_count == 4).then(|| fields[3].clone()),
+	};
+	let sink = StyledRunePlotSink {
+		sink: DisposableRunePlotSink {
+			composition: PlotComposition::single(PlotType::FillBetween),
+			x: fields.x.clone(),
+			y: fields.lower.clone(),
+			category: None,
+			interval_end: None,
+			mark_fields: Some(SpannedMarkFields::FillBetween { fields, origins }),
 			origin: origin.range(),
 		},
 		settings: LayerSettings::default(),
@@ -3600,6 +3711,7 @@ fn decode_layers(value: &Value, origin: Origin) -> Result<LayeredPlotSpec, Prese
 						PlotType::Line => "line",
 						PlotType::Scatter => "scatter",
 						PlotType::Hexbin => "hexbin",
+						PlotType::FillBetween => "fill_between",
 						_ => "mark",
 					}
 				),

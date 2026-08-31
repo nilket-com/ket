@@ -1597,6 +1597,9 @@ fn authored_rune_plot_spec(sink: &DisposableRunePlotSink) -> AuthoredPlotSpec {
 			crate::plot::spec::MarkFields::BoxPlot(fields) => AuthoredPlotSpec::box_plot(fields),
 			crate::plot::spec::MarkFields::Heatmap(fields) => AuthoredPlotSpec::heatmap(fields),
 			crate::plot::spec::MarkFields::Hexbin(fields) => AuthoredPlotSpec::hexbin(fields),
+			crate::plot::spec::MarkFields::FillBetween(fields) => {
+				AuthoredPlotSpec::fill_between(fields)
+			}
 			crate::plot::spec::MarkFields::Bubble(fields) => AuthoredPlotSpec::bubble(fields),
 			crate::plot::spec::MarkFields::Funnel(fields) => AuthoredPlotSpec::funnel(fields),
 			crate::plot::spec::MarkFields::RadialDial(fields) => {
@@ -1743,6 +1746,39 @@ fn hexbin_failure_span(
 			};
 			for_channel(channel)
 		}
+		Ok(_) => mark.clone(),
+	}
+}
+
+#[cfg(feature = "toron")]
+fn fill_between_failure_span(
+	data: &DataFrame,
+	fields: &crate::plot::spec::FillBetweenFields,
+	origins: &crate::rune_relation_envelope::FillBetweenFieldOrigins,
+	mark: &std::ops::Range<u32>,
+) -> std::ops::Range<u32> {
+	let authored = AuthoredPlotSpec::fill_between(fields.clone());
+	if let Err(error) = resolve_channels(&authored, data.schema().as_ref()) {
+		return match error.attribution {
+			crate::plot::spec::FieldAttribution::Channel(Channel::X) => origins.x.clone(),
+			crate::plot::spec::FieldAttribution::Channel(Channel::Y) => origins.lower.clone(),
+			crate::plot::spec::FieldAttribution::Role("upper") => origins.upper.clone(),
+			crate::plot::spec::FieldAttribution::Role("middle") => {
+				origins.middle.clone().unwrap_or_else(|| mark.clone())
+			}
+			_ => mark.clone(),
+		};
+	}
+	match crate::plot::kernels::fill_between::prepare_fill_between_data(
+		data,
+		&fields.x,
+		&fields.lower,
+		&fields.upper,
+		fields.middle.as_deref(),
+	) {
+		Err(error) => origins
+			.for_role(error.role())
+			.unwrap_or_else(|| mark.clone()),
 		Ok(_) => mark.clone(),
 	}
 }
@@ -2733,6 +2769,10 @@ fn rune_view_outcome_with_palettes(
 				let (fields, origins) = sink.mark_fields.as_ref()?.hexbin()?;
 				Some((fields.clone(), origins.clone(), sink.origin.clone()))
 			});
+			let fill_between_diagnostic = diagnostic_sink.and_then(|sink| {
+				let (fields, origins) = sink.mark_fields.as_ref()?.fill_between()?;
+				Some((fields.clone(), origins.clone(), sink.origin.clone()))
+			});
 			let bubble_diagnostic = diagnostic_sink.and_then(|sink| {
 				let (fields, origins) = sink.mark_fields.as_ref()?.bubble()?;
 				Some((fields.clone(), origins.clone(), sink.origin.clone()))
@@ -3142,6 +3182,13 @@ fn rune_view_outcome_with_palettes(
 					)
 				})
 			});
+			let fill_between_output_span = output.as_ref().err().and_then(|_| {
+				fill_between_diagnostic
+					.as_ref()
+					.map(|(fields, origins, mark)| {
+						fill_between_failure_span(frame.as_ref(), fields, origins, mark)
+					})
+			});
 			let bubble_output_span = output.as_ref().err().and_then(|_| {
 				bubble_diagnostic.as_ref().map(|(fields, origins, mark)| {
 					bubble_failure_span(frame.as_ref(), fields, origins, mark)
@@ -3184,6 +3231,7 @@ fn rune_view_outcome_with_palettes(
 					.or(box_output_span)
 					.or(heatmap_output_span)
 					.or(hexbin_output_span)
+					.or(fill_between_output_span)
 					.or(bubble_output_span)
 					.or(funnel_output_span)
 					.or(radial_dial_output_span)
@@ -12505,6 +12553,153 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			r#"let horizontal = "x"; let vertical = "y"; workspace.table("hexbin_probe").views([hexbin(horizontal, vertical)])"#,
 		);
 		assert_eq!(bound, inline);
+	}
+
+	#[test]
+	fn product_0146_fill_between_attributes_resolution_preparation_and_structure() {
+		use polars::frame::DataFrame;
+		let source = r#"workspace.table("fill_between_probe").views([fill_between("x", "low", "high", "mid")])"#;
+		let complete = |frame: DataFrame| {
+			let relation = transform_rune_view(source)
+				.expect("fill-between source compiles")
+				.into_relations()
+				.next()
+				.unwrap();
+			rune_view_outcome(frame, relation.views)
+		};
+		let valid = polars::df!(
+			"x" => [1.0_f64, 2.0],
+			"low" => [0.0_f64, 1.0],
+			"high" => [2.0_f64, 3.0],
+			"mid" => [1.0_f64, 2.0],
+		)
+		.unwrap();
+		let outcome = complete(valid.clone());
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _, continuation)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("valid authored fill-between must resolve")
+		};
+		assert!(matches!(
+			resolved.resolved_spec.kernel_fields.as_ref(),
+			crate::plot::spec::ResolvedKernelFields::FillBetween {
+				x,
+				lower,
+				upper,
+				middle: Some(middle),
+			} if x == "x" && lower == "low" && upper == "high" && middle == "mid"
+		));
+		assert_eq!(resolved.resolved_spec.color_job, None);
+		assert!(
+			continuation
+				.identity
+				.persistence_snapshot()
+				.assignments
+				.is_empty()
+		);
+
+		let assert_span = |frame: DataFrame, expected: &str, error_fragment: &str| {
+			let outcome = complete(frame);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("invalid fill-between rendered")
+			};
+			assert!(error.contains(error_fragment), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert_eq!(&source[span.start as usize..span.end as usize], expected);
+		};
+
+		assert_span(
+			polars::df!("low" => [0.0], "high" => [2.0], "mid" => [1.0]).unwrap(),
+			"\"x\"",
+			"absent",
+		);
+		assert_span(
+			polars::df!("x" => [1.0], "high" => [2.0], "mid" => [1.0]).unwrap(),
+			"\"low\"",
+			"absent",
+		);
+		assert_span(
+			polars::df!("x" => [1.0], "low" => [0.0], "mid" => [1.0]).unwrap(),
+			"\"high\"",
+			"absent",
+		);
+		assert_span(
+			polars::df!("x" => [1.0], "low" => [0.0], "high" => [2.0]).unwrap(),
+			"\"mid\"",
+			"absent",
+		);
+		assert_span(
+			polars::df!("x" => ["unordered"], "low" => [0.0], "high" => [2.0], "mid" => [1.0])
+				.unwrap(),
+			"\"x\"",
+			"incompatible with FillBetween",
+		);
+		assert_span(
+			polars::df!("x" => [1.0], "low" => [None::<f64>], "high" => [2.0], "mid" => [1.0])
+				.unwrap(),
+			"\"low\"",
+			"null at row 1",
+		);
+		assert_span(
+			polars::df!("x" => [2.0, 1.0], "low" => [0.0, 0.0], "high" => [2.0, 2.0], "mid" => [1.0, 1.0]).unwrap(),
+			"\"x\"",
+			"must increase strictly",
+		);
+		assert_span(
+			polars::df!("x" => [1.0], "low" => [3.0], "high" => [2.0], "mid" => [2.5]).unwrap(),
+			"\"low\"",
+			"band crosses at row 1",
+		);
+		assert_span(
+			polars::df!("x" => [1.0], "low" => [0.0], "high" => [2.0], "mid" => [3.0]).unwrap(),
+			"\"mid\"",
+			"middle escapes the band at row 1",
+		);
+		for (field, expected, fragment) in [
+			("low", "\"low\"", "incompatible with FillBetween"),
+			("high", "\"high\"", "requires a quantitative dtype"),
+			("mid", "\"mid\"", "requires a quantitative dtype"),
+		] {
+			let temporal = polars::prelude::Column::new(field.into(), [1_i32])
+				.cast(&polars::prelude::DataType::Date)
+				.unwrap();
+			let mut columns = vec![
+				polars::prelude::Column::new("x".into(), [1.0_f64]),
+				polars::prelude::Column::new("low".into(), [0.0_f64]),
+				polars::prelude::Column::new("high".into(), [2.0_f64]),
+				polars::prelude::Column::new("mid".into(), [1.0_f64]),
+			];
+			let index = columns
+				.iter()
+				.position(|column| column.name().as_str() == field)
+				.unwrap();
+			columns[index] = temporal;
+			assert_span(DataFrame::new(1, columns).unwrap(), expected, fragment);
+		}
+	}
+
+	#[test]
+	fn product_0146_checked_in_probe_is_idempotent_and_crosses_at_row_two() {
+		let source = include_str!("../../../../uat/fill_between_probe.sql");
+		assert!(source.contains("DROP TABLE IF EXISTS fill_between_probe;"));
+		assert!(source.contains("DROP TABLE IF EXISTS fill_between_probe_crossed;"));
+		let crossed = polars::df!(
+			"x" => [1.0_f64, 2.0, 3.0],
+			"low" => [10.0_f64, 16.0, 12.0],
+			"high" => [14.0_f64, 15.0, 17.0],
+		)
+		.unwrap();
+		let error = crate::plot::kernels::fill_between::prepare_fill_between_data(
+			&crossed, "x", "low", "high", None,
+		)
+		.expect_err("probe's second row crosses");
+		assert!(matches!(
+			error,
+			crate::plot::kernels::fill_between::FillBetweenPreparationError::CrossedBand {
+				row: 2,
+				..
+			}
+		));
 	}
 
 	#[test]

@@ -73,6 +73,7 @@ pub(crate) enum HandlerId {
 	Bubble,
 	Heatmap,
 	Hexbin,
+	FillBetween,
 	Funnel,
 	RadialDial,
 	Pie,
@@ -276,6 +277,16 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		FREE,
 		NONE,
 		"Construct a hexbin mark."
+	),
+	callable!(
+		"fill_between",
+		Free,
+		3..=4,
+		Text,
+		FillBetween,
+		FREE,
+		NONE,
+		"Construct a fill-between mark."
 	),
 	callable!(
 		"funnel",
@@ -965,6 +976,7 @@ const ALL_MARKS: &[PlotType] = &[
 	PlotType::BoxPlot,
 	PlotType::Bubble,
 	PlotType::Funnel,
+	PlotType::FillBetween,
 	PlotType::Heatmap,
 	PlotType::Hexbin,
 	PlotType::Histogram,
@@ -2241,6 +2253,41 @@ mod tests {
 		}
 		for present in [SettingKey::XAxisBounds, SettingKey::YAxisBounds] {
 			assert!(hexbin.contains(&present), "hexbin omitted {present:?}");
+		}
+	}
+
+	#[test]
+	fn product_0146_fill_between_inspector_is_exactly_hexbin() {
+		let settings = PlotSettings::default();
+		let resolved = settings.resolve();
+		let keys = |plot_type| {
+			inspector_rows(&settings, &resolved, Some(plot_type), None)
+				.into_iter()
+				.map(|row| row.key)
+				.collect::<HashSet<_>>()
+		};
+		let fill_between = keys(PlotType::FillBetween);
+		assert_eq!(fill_between, keys(PlotType::Hexbin));
+		for absent in [
+			SettingKey::PointSize,
+			SettingKey::StrokeWidth,
+			SettingKey::BarWidth,
+			SettingKey::CategoryGap,
+			SettingKey::Stacked,
+			SettingKey::Percent,
+			SettingKey::Diverging,
+			SettingKey::DivergingAt,
+		] {
+			assert!(
+				!fill_between.contains(&absent),
+				"fill-between exposed {absent:?}"
+			);
+		}
+		for present in [SettingKey::XAxisBounds, SettingKey::YAxisBounds] {
+			assert!(
+				fill_between.contains(&present),
+				"fill-between omitted {present:?}"
+			);
 		}
 	}
 

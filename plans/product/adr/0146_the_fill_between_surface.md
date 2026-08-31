@@ -242,10 +242,25 @@ exercising the temporal admission that distinguishes this surface from
 hexbin's — plus a deliberately degenerate companion whose band crosses
 (`lower > upper` at a named row), so the structural refusal and its row
 attribution are observable. `uat/test42.rn` authors both arities and the
-refusal:
+refusal. Both relations sort explicitly because Toron table scans carry no
+row-order contract and PRODUCT-0145 deliberately leaves ordering authored:
+
+**Amended at implementation after live contact.** The first checked-in exhibit
+used bare `workspace.table(...)` relations. Its compiler gate passed and its
+in-memory crossing fixture passed, but a live Toron scan returned the healthy
+forecast rows out of timestamp order; both healthy panels therefore refused
+strict ordering, exactly as the substrate requires. The defect was in the
+exhibit and in gate 14's evidence, not in temporal projection or the mark. The
+exhibit now authors ascending `stamp` and `x` sorts, the source gate pins both,
+and a live app drive—not compilation alone—is required to claim the render
+half of gate 14. Sorting the crossed companion also ensures row 2 demonstrates
+the intended band crossing instead of whichever ordering fault an unordered
+scan happens to expose.
 
 ```rune
-let forecast = workspace.table("fill_between_probe");
+let forecast = workspace
+    .table("fill_between_probe")
+    .sort([asc(col("stamp"))]);
 forecast.views([
     view("band-only", figure([
         title("Fill-between · forecast band"),
@@ -257,7 +272,9 @@ forecast.views([
     ])),
 ]);
 
-let crossed = workspace.table("fill_between_probe_crossed");
+let crossed = workspace
+    .table("fill_between_probe_crossed")
+    .sort([asc(col("x"))]);
 crossed.views([
     view("crossed-refusal", figure([
         title("Fill-between · crossed band refuses"),
@@ -363,9 +380,12 @@ inspector and colour-word gates.
 13. **The substrate is untouched.** `plot/kernels/fill_between.rs` is
     byte-identical to its PRODUCT-0145 landing.
 14. **The exhibit is live.** The probe seeds idempotently; `test42.rn`
+    explicitly sorts the forecast by `stamp` and the crossed companion by `x`,
     renders the band-only and with-middle views over temporal x, and the
-    crossed companion refuses with row attribution while the healthy
-    views render; both READMEs carry their blocks.
+    crossed companion refuses at row 2 while the healthy views render; both
+    READMEs carry the authored-order requirement. Compilation and an in-memory
+    fixture do not discharge the render claim: the checked-in exhibit is driven
+    against live Toron data and visually verified in the app.
 15. **Full battery.** Polariton unit, architecture, trybuild, Rune
     compiler, GUI, and workspace checks pass with no new ignored or
     tolerated failure.

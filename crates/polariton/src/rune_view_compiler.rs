@@ -442,6 +442,7 @@ fn produced_receiver(handler: HandlerId) -> Option<SemanticReceiver> {
 		| HandlerId::Bubble
 		| HandlerId::Heatmap
 		| HandlerId::Hexbin
+		| HandlerId::FillBetween
 		| HandlerId::Funnel
 		| HandlerId::RadialDial
 		| HandlerId::Pie
@@ -844,6 +845,7 @@ fn static_method_on_relation(
 			| "funnel"
 			| "heatmap"
 			| "hexbin"
+			| "fill_between"
 			| "radial_dial"
 			| "pie" | "violin"
 			| "radar" | "parallel"
@@ -1644,6 +1646,7 @@ fn rewrite_calls_mapped(
 			"bubble" => Some(&[4, 5]),
 			"heatmap" => Some(&[3]),
 			"hexbin" => Some(&[2]),
+			"fill_between" => Some(&[3, 4]),
 			"funnel" => Some(&[2]),
 			"radial_dial" => Some(&[2, 3]),
 			"pie" => Some(&[2]),
@@ -2057,7 +2060,7 @@ mod tests {
 	use crate::plot::spec::ColorJob;
 	use crate::plot::spec::{BubbleNumericField, BubblePreparationChannel, Override, Presence};
 	use crate::plot::spec::{FacetLabelTextSize, LegendTextSize};
-	use crate::rune_relation_envelope::{RunePlotBody, RuneViewIntent};
+	use crate::rune_relation_envelope::{RunePlotBody, RuneViewIntent, SpannedMarkFields};
 	use std::sync::Arc;
 
 	/// PRODUCT-0137: a terminal `ket` relation with no view root compiles to
@@ -2179,6 +2182,25 @@ mod tests {
 			rewritten,
 			"polariton_presentation::__hexbin(\"x\", \"y\", 107, 110, 112, 115, 100, 116)"
 		);
+	}
+
+	#[test]
+	fn product_0146_fill_between_rewriter_retains_three_or_four_argument_origins() {
+		for (source, expected) in [
+			(
+				"fill_between(\"x\", \"low\", \"high\")",
+				"polariton_presentation::__fill_between(\"x\", \"low\", \"high\", 113, 116, 118, 123, 125, 131, 100, 132)",
+			),
+			(
+				"fill_between(\"x\", \"low\", \"high\", \"mid\")",
+				"polariton_presentation::__fill_between(\"x\", \"low\", \"high\", \"mid\", 113, 116, 118, 123, 125, 131, 133, 138, 100, 139)",
+			),
+		] {
+			assert_eq!(
+				rewrite_calls(source, 100).expect("rewrite fill-between call"),
+				expected
+			);
+		}
 	}
 
 	#[test]
@@ -2810,6 +2832,99 @@ relation.views([figure([
 					&& domain.y_min == Some(0.0)
 					&& domain.y_max == Some(1.0)
 		));
+	}
+
+	#[test]
+	fn product_0146_fill_between_surface_is_variable_originated_and_closed() {
+		for fields in [
+			"\"x\", \"low\", \"high\"",
+			"\"x\", \"low\", \"high\", \"mid\"",
+		] {
+			let source = format!(
+				"let relation = workspace.table(\"fill_between_probe\"); relation.views([fill_between({fields})]);"
+			);
+			let compiled = compile(&source).unwrap_or_else(|error| panic!("{source}: {error}"));
+			let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+				panic!("fill-between surface produced a table")
+			};
+			let RunePlotBody::Single(sink) = &plot.body else {
+				panic!("unmodified fill-between must use the live Single path")
+			};
+			assert_eq!(
+				sink.composition.primary_plot_type(),
+				crate::plot::core::PlotType::FillBetween
+			);
+			let (fields, origins) = sink
+				.mark_fields
+				.as_ref()
+				.and_then(SpannedMarkFields::fill_between)
+				.expect("fill-between fields and origins");
+			assert_eq!(fields.x, "x");
+			assert_eq!(fields.lower, "low");
+			assert_eq!(fields.upper, "high");
+			assert_eq!(fields.middle.is_some(), origins.middle.is_some());
+			for (field, origin) in [
+				("\"x\"", &origins.x),
+				("\"low\"", &origins.lower),
+				("\"high\"", &origins.upper),
+			] {
+				assert_eq!(&source[origin.start as usize..origin.end as usize], field);
+			}
+			if let Some(origin) = &origins.middle {
+				assert_eq!(
+					&source[origin.start as usize..origin.end as usize],
+					"\"mid\""
+				);
+			}
+			let presentation = compiled.executions[0].views[0].intent.presentation();
+			assert_eq!(presentation.display_label, "plot.fill_between");
+			assert_eq!(sink.composition.title(), "Fill Between Plot");
+		}
+
+		let layered = "let r = workspace.table(\"fill_between_probe\"); r.views([layers([fill_between(\"x\", \"low\", \"high\"), line(\"x\", \"low\")])]);";
+		let error = compile(layered).expect_err("fill-between remains outside LayerMark");
+		assert!(
+			error
+				.to_string()
+				.contains("fill_between(...) is a view sink, not a shared-Cartesian layer"),
+			"{error}"
+		);
+
+		let sugar =
+			"workspace.table(\"fill_between_probe\").fill_between(\"x\", \"low\", \"high\")";
+		let error = compile(sugar).expect_err("fill-between relation sugar is closed");
+		assert!(
+			error
+				.to_string()
+				.contains("fill_between is a sink inside .views([...]"),
+			"{error}"
+		);
+
+		for source in [
+			"workspace.table(\"t\").views([fill_between(\"x\", \"low\")])",
+			"workspace.table(\"t\").views([fill_between(\"x\", \"low\", \"high\", \"mid\", \"extra\")])",
+			"workspace.table(\"t\").views([fill_between(1, \"low\", \"high\")])",
+		] {
+			let error = compile(source).expect_err("malformed fill-between must refuse");
+			assert!(
+				error.to_string().contains(
+					"fill_between(...) takes x, lower, upper, and optional middle strings"
+				) || error
+					.to_string()
+					.contains("field arguments must evaluate to strings"),
+				"{error}"
+			);
+		}
+
+		let diverging =
+			"workspace.table(\"t\").views([fill_between(\"x\", \"low\", \"high\").diverging()])";
+		let error = compile(diverging).expect_err("fill-between has no colour job word");
+		assert!(
+			error
+				.to_string()
+				.contains("available on heatmap and bubble"),
+			"{error}"
+		);
 	}
 
 	#[test]
@@ -4304,6 +4419,33 @@ r.views([bar(category(), "revenue")])
 				sink.composition.primary_plot_type(),
 				crate::plot::core::PlotType::Hexbin
 			);
+		}
+	}
+
+	#[test]
+	fn product_0146_test42_is_the_temporal_fill_between_and_crossing_exhibit() {
+		let source = include_str!("../../../uat/test42.rn");
+		let compiled = compile(source).expect("the checked-in fill-between exhibit compiles");
+		assert_eq!(compiled.executions.len(), 2);
+		assert_eq!(compiled.presentation_order.len(), 3);
+		assert!(source.contains(".sort([asc(col(\"stamp\"))])"));
+		assert!(source.contains(".sort([asc(col(\"x\"))])"));
+		assert!(source.contains("fill_between(\"stamp\", \"low\", \"high\")"));
+		assert!(source.contains("fill_between(\"stamp\", \"low\", \"high\", \"expected\")"));
+		assert!(source.contains("fill_between(\"x\", \"low\", \"high\")"));
+		for execution in &compiled.executions {
+			for view in &execution.views {
+				let RuneViewIntent::Plot(plot) = &view.intent else {
+					panic!("fill-between exhibit produced a table")
+				};
+				let RunePlotBody::Single(sink) = &plot.body else {
+					panic!("fill-between exhibit produced a styled or layered sink")
+				};
+				assert_eq!(
+					sink.composition.primary_plot_type(),
+					crate::plot::core::PlotType::FillBetween
+				);
+			}
 		}
 	}
 

@@ -1,0 +1,24 @@
+// PRODUCT-0146: authored temporal fill-between in both arities and a crossed-band refusal.
+let forecast = workspace
+	.table("fill_between_probe")
+	.sort([asc(col("stamp"))]);
+forecast.views([
+	view("band-only", figure([
+		title("Fill-between · forecast band"),
+		fill_between("stamp", "low", "high"),
+	])),
+	view("band-with-middle", figure([
+		title("Fill-between · band and expected path"),
+		fill_between("stamp", "low", "high", "expected"),
+	])),
+]);
+
+let crossed = workspace
+	.table("fill_between_probe_crossed")
+	.sort([asc(col("x"))]);
+crossed.views([
+	view("crossed-refusal", figure([
+		title("Fill-between · crossed band refuses"),
+		fill_between("x", "low", "high"),
+	])),
+]);

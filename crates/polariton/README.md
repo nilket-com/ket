@@ -296,6 +296,27 @@ relation. Radius, lattice orientation, weights, and diverging colour are not
 authored controls; temporal coordinates refuse until typed temporal projection
 is defined.
 
+#### Rune fill-between presentation:
+
+Fill-between accepts quantitative lower and upper fields over quantitative or
+temporal x. A trailing optional middle field draws the expected path over the
+band:
+
+```rune
+workspace.table("forecast")
+    .sort([asc(col("stamp"))])
+    .views([
+    fill_between("stamp", "low", "high", "expected"),
+])
+```
+
+Rows stay in producer order and x must increase strictly, so relations whose
+producer does not promise ordering must author a sort as above. Crossed bands
+and a middle outside its inclusive band refuse with their row number; omitted
+middle means band-only rather than a synthetic baseline. Fill-between has no
+relation sugar, colour job, legend, stroke-width control, or `layers([...])`
+admission.
+
 #### Adapters:
  - SQLite (file or memory)
  - Parquet (single file)

@@ -113,6 +113,20 @@ so repeated cell occupancy and the distinction between source count and maximum
 bin count are visible. Its temporal companion must refuse on the `"stamp"`
 argument without disturbing the healthy view.
 
+Seed the PRODUCT-0146 forecast relations, then open the authored fill-between
+exhibit:
+
+```sh
+nilket toron sql --file uat/fill_between_probe.sql
+cargo run -p polariton -- uat/test42.rn
+```
+
+`fill_between_probe` renders temporal x in both the band-only and optional-middle
+forms. The crossed companion refuses at row 2 on the `"low"` argument without
+disturbing either healthy view. Both relations author an ascending sort before
+plotting: Toron table scans have no row-order contract, while fill-between
+deliberately treats strictly increasing x as an authored data requirement.
+
 Open the semantic temporal-tick exhibit with its DATE seed:
 
 ```sh

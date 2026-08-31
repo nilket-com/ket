@@ -698,6 +698,23 @@ impl HexbinFields {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FillBetweenFields {
+	pub x: String,
+	pub lower: String,
+	pub upper: String,
+	pub middle: Option<String>,
+}
+
+impl FillBetweenFields {
+	pub fn all(&self) -> impl Iterator<Item = &str> {
+		[&self.x, &self.lower, &self.upper]
+			.into_iter()
+			.map(String::as_str)
+			.chain(self.middle.as_deref())
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunnelFields {
 	pub stage: String,
 	pub value: String,
@@ -760,6 +777,7 @@ pub enum MarkFields {
 	BoxPlot(BoxPlotFields),
 	Heatmap(HeatmapFields),
 	Hexbin(HexbinFields),
+	FillBetween(FillBetweenFields),
 	Bubble(BubbleFields),
 	Funnel(FunnelFields),
 	RadialDial(RadialDialFields),
@@ -805,6 +823,7 @@ impl MarkFields {
 			Self::BoxPlot(_) => 7,
 			Self::Heatmap(_) => 3,
 			Self::Hexbin(_) => 2,
+			Self::FillBetween(fields) => 3 + usize::from(fields.middle.is_some()),
 			Self::Bubble(fields) => 4 + usize::from(fields.label.is_some()),
 			Self::Funnel(_) | Self::Pie(_) => 2,
 			Self::Violin(_) => 4,
@@ -820,6 +839,7 @@ impl MarkFields {
 			Self::BoxPlot(fields) => fields.all().get(index).copied(),
 			Self::Heatmap(fields) => fields.all().get(index).copied(),
 			Self::Hexbin(fields) => fields.all().get(index).copied(),
+			Self::FillBetween(fields) => fields.all().nth(index),
 			Self::Bubble(fields) => match index {
 				0 => Some(fields.numeric.get(BubbleNumericField::X)),
 				1 => Some(fields.numeric.get(BubbleNumericField::Y)),
@@ -991,6 +1011,23 @@ impl AuthoredPlotSpec {
 	pub fn hexbin_fields(&self) -> Option<&HexbinFields> {
 		match self.mark_fields.as_ref() {
 			Some(MarkFields::Hexbin(fields)) => Some(fields),
+			_ => None,
+		}
+	}
+
+	pub fn fill_between(fields: FillBetweenFields) -> Self {
+		let mut spec = Self::xy(
+			PlotComposition::single(PlotType::FillBetween),
+			fields.x.clone(),
+			fields.lower.clone(),
+		);
+		spec.mark_fields = Some(MarkFields::FillBetween(fields));
+		spec
+	}
+
+	pub fn fill_between_fields(&self) -> Option<&FillBetweenFields> {
+		match self.mark_fields.as_ref() {
+			Some(MarkFields::FillBetween(fields)) => Some(fields),
 			_ => None,
 		}
 	}
@@ -2242,6 +2279,9 @@ pub fn resolve_channels(
 	if plot_type == PlotType::Hexbin && spec.hexbin_fields().is_some() {
 		return resolve_hexbin_channels(spec, schema);
 	}
+	if plot_type == PlotType::FillBetween && spec.fill_between_fields().is_some() {
+		return resolve_fill_between_channels(spec, schema);
+	}
 	if plot_type == PlotType::Bubble && spec.bubble_fields().is_some() {
 		return resolve_bubble_channels(spec, schema);
 	}
@@ -2694,6 +2734,80 @@ fn resolve_hexbin_channels(
 		kernel_fields: Box::new(ResolvedKernelFields::Hexbin {
 			x: fields.x.clone(),
 			y: fields.y.clone(),
+		}),
+		color_job: None,
+		continuous_anchor: spec.continuous_anchor,
+		categorical_limit: 0,
+		stack_normalization: StackNormalization::Absolute,
+	})
+}
+
+fn resolve_fill_between_channels(
+	spec: &AuthoredPlotSpec,
+	schema: &Schema,
+) -> Result<ChannelBinding, ChannelError> {
+	let fields = spec.fill_between_fields().ok_or_else(|| ChannelError {
+		attribution: FieldAttribution::Role("fill_between"),
+		field: "<fill_between>".to_owned(),
+		reason: "Fill-between requires explicit x, lower, upper, and optional middle fields"
+			.to_owned(),
+	})?;
+	let layer = LayerIdentity {
+		ordinal: 0,
+		plot_type: PlotType::FillBetween,
+	};
+	let mut used_by_auto = HashSet::new();
+	let x = resolve_required(
+		Channel::X,
+		&spec.x,
+		PlotType::FillBetween,
+		&layer,
+		false,
+		schema,
+		&mut used_by_auto,
+	)?;
+	let lower = resolve_required(
+		Channel::Y,
+		&spec.y,
+		PlotType::FillBetween,
+		&layer,
+		false,
+		schema,
+		&mut used_by_auto,
+	)?;
+	let validate_quantitative = |role: &'static str, field: &str| -> Result<(), ChannelError> {
+		let attribution = FieldAttribution::Role(role);
+		let dtype = schema.get(field).ok_or_else(|| ChannelError {
+			attribution,
+			field: field.to_owned(),
+			reason: format!("fill-between {role} field is absent from the returned schema"),
+		})?;
+		let semantic = semantic_type(dtype).ok_or_else(|| ChannelError {
+			attribution,
+			field: field.to_owned(),
+			reason: format!("dtype {dtype:?} has no supported semantic type"),
+		})?;
+		if semantic != SemanticType::Quantitative {
+			return Err(ChannelError {
+				attribution,
+				field: field.to_owned(),
+				reason: format!("fill-between {role} requires a quantitative dtype, got {dtype:?}"),
+			});
+		}
+		Ok(())
+	};
+	validate_quantitative("upper", &fields.upper)?;
+	if let Some(middle) = fields.middle.as_deref() {
+		validate_quantitative("middle", middle)?;
+	}
+	Ok(ChannelBinding {
+		composition: spec.composition.clone(),
+		channels: vec![x, lower],
+		kernel_fields: Box::new(ResolvedKernelFields::FillBetween {
+			x: fields.x.clone(),
+			lower: fields.lower.clone(),
+			upper: fields.upper.clone(),
+			middle: fields.middle.clone(),
 		}),
 		color_job: None,
 		continuous_anchor: spec.continuous_anchor,
@@ -3948,6 +4062,13 @@ fn semantic_is_compatible(plot_type: PlotType, channel: Channel, semantic: Seman
 		(PlotType::BoxPlot, Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::Heatmap, Channel::X | Channel::Y) => semantic == SemanticType::Nominal,
 		(PlotType::Hexbin, Channel::X | Channel::Y) => semantic == SemanticType::Quantitative,
+		(PlotType::FillBetween, Channel::X) => {
+			matches!(
+				semantic,
+				SemanticType::Quantitative | SemanticType::Temporal
+			)
+		}
+		(PlotType::FillBetween, Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::Bubble, Channel::X | Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::Funnel, Channel::X) => semantic == SemanticType::Nominal,
 		(PlotType::Funnel, Channel::Y) => semantic == SemanticType::Quantitative,
@@ -4739,6 +4860,65 @@ mod tests {
 				middle: Some("middle".to_owned()),
 			}
 		);
+	}
+
+	#[test]
+	fn product_0146_authored_fill_between_resolves_temporal_x_and_attributes_y_roles() {
+		let stamp = Column::new("stamp".into(), [1_i64, 2_i64])
+			.cast(&DataType::Datetime(
+				polars::prelude::TimeUnit::Nanoseconds,
+				polars::prelude::TimeZone::opt_try_new(Some("UTC")).unwrap(),
+			))
+			.unwrap();
+		let frame = DataFrame::new(
+			2,
+			vec![
+				stamp,
+				Column::new("low".into(), [0.0_f64, 1.0]),
+				Column::new("high".into(), [2.0_f64, 3.0]),
+				Column::new("mid".into(), [1.0_f64, 2.0]),
+			],
+		)
+		.unwrap();
+		let authored = AuthoredPlotSpec::fill_between(FillBetweenFields {
+			x: "stamp".to_owned(),
+			lower: "low".to_owned(),
+			upper: "high".to_owned(),
+			middle: Some("mid".to_owned()),
+		});
+		let resolved = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
+		assert_eq!(resolved.color_job, None);
+		assert!(matches!(
+			resolved.kernel_fields.as_ref(),
+			ResolvedKernelFields::FillBetween {
+				x,
+				lower,
+				upper,
+				middle: Some(middle),
+			} if x == "stamp" && lower == "low" && upper == "high" && middle == "mid"
+		));
+
+		let temporal_upper = AuthoredPlotSpec::fill_between(FillBetweenFields {
+			x: "low".to_owned(),
+			lower: "high".to_owned(),
+			upper: "stamp".to_owned(),
+			middle: None,
+		});
+		let error = resolve_channels(&temporal_upper, frame.schema().as_ref())
+			.expect_err("temporal upper refuses at authored resolution");
+		assert_eq!(error.attribution, FieldAttribution::Role("upper"));
+		assert_eq!(error.field, "stamp");
+
+		let temporal_middle = AuthoredPlotSpec::fill_between(FillBetweenFields {
+			x: "low".to_owned(),
+			lower: "high".to_owned(),
+			upper: "mid".to_owned(),
+			middle: Some("stamp".to_owned()),
+		});
+		let error = resolve_channels(&temporal_middle, frame.schema().as_ref())
+			.expect_err("temporal middle refuses at authored resolution");
+		assert_eq!(error.attribution, FieldAttribution::Role("middle"));
+		assert_eq!(error.field, "stamp");
 	}
 
 	#[test]

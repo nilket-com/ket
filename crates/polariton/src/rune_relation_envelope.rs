@@ -14,9 +14,9 @@ use crate::plot::core::PlotType;
 #[cfg(test)]
 use crate::plot::spec::{BarWidth, CategoryGap, PointSize, StrokeWidth};
 use crate::plot::spec::{
-	BoxPlotFields, BubbleFields, BubblePreparationChannel, HeatmapFields, HexbinFields, LayerMark,
-	LayerSettings, LayerSpec, LayeredPlotSpec, MarkFields, MultivariateFields, Override, PieFields,
-	Presence, ViolinFields,
+	BoxPlotFields, BubbleFields, BubblePreparationChannel, FillBetweenFields, HeatmapFields,
+	HexbinFields, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, MarkFields,
+	MultivariateFields, Override, PieFields, Presence, ViolinFields,
 };
 use crate::plot::theme::PlotSettingsLayer;
 #[cfg(test)]
@@ -163,6 +163,7 @@ impl StyledRunePlotSink {
 			| PlotType::BoxPlot
 			| PlotType::Heatmap
 			| PlotType::Hexbin
+			| PlotType::FillBetween
 			| PlotType::Bubble
 			| PlotType::Funnel
 			| PlotType::RadialDial
@@ -258,6 +259,7 @@ impl RuneViewIntent {
 						PlotType::BoxPlot => "plot.box".to_owned(),
 						PlotType::Heatmap => "plot.heatmap".to_owned(),
 						PlotType::Hexbin => "plot.hexbin".to_owned(),
+						PlotType::FillBetween => "plot.fill_between".to_owned(),
 						PlotType::Bubble => "plot.bubble".to_owned(),
 						PlotType::Funnel => "plot.funnel".to_owned(),
 						PlotType::RadialDial => "plot.radial_dial".to_owned(),
@@ -279,6 +281,7 @@ impl RuneViewIntent {
 							PlotType::BoxPlot => "plot.box".to_owned(),
 							PlotType::Heatmap => "plot.heatmap".to_owned(),
 							PlotType::Hexbin => "plot.hexbin".to_owned(),
+							PlotType::FillBetween => "plot.fill_between".to_owned(),
 							PlotType::Bubble => "plot.bubble".to_owned(),
 							PlotType::Pie => "plot.pie".to_owned(),
 							other => {
@@ -374,6 +377,29 @@ pub(crate) struct HeatmapFieldOrigins {
 pub(crate) struct HexbinFieldOrigins {
 	pub(crate) x: Range<u32>,
 	pub(crate) y: Range<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FillBetweenFieldOrigins {
+	pub(crate) x: Range<u32>,
+	pub(crate) lower: Range<u32>,
+	pub(crate) upper: Range<u32>,
+	pub(crate) middle: Option<Range<u32>>,
+}
+
+impl FillBetweenFieldOrigins {
+	pub(crate) fn for_role(
+		&self,
+		role: crate::plot::kernels::fill_between::FillBetweenRole,
+	) -> Option<Range<u32>> {
+		use crate::plot::kernels::fill_between::FillBetweenRole;
+		match role {
+			FillBetweenRole::X => Some(self.x.clone()),
+			FillBetweenRole::Lower => Some(self.lower.clone()),
+			FillBetweenRole::Upper => Some(self.upper.clone()),
+			FillBetweenRole::Middle => self.middle.clone(),
+		}
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -492,6 +518,10 @@ pub(crate) enum SpannedMarkFields {
 		fields: HexbinFields,
 		origins: HexbinFieldOrigins,
 	},
+	FillBetween {
+		fields: FillBetweenFields,
+		origins: FillBetweenFieldOrigins,
+	},
 	Bubble {
 		fields: BubbleFields,
 		origins: BubbleFieldOrigins,
@@ -528,6 +558,7 @@ impl SpannedMarkFields {
 			Self::BoxPlot { fields, .. } => MarkFields::BoxPlot(fields.clone()),
 			Self::Heatmap { fields, .. } => MarkFields::Heatmap(fields.clone()),
 			Self::Hexbin { fields, .. } => MarkFields::Hexbin(fields.clone()),
+			Self::FillBetween { fields, .. } => MarkFields::FillBetween(fields.clone()),
 			Self::Bubble { fields, .. } => MarkFields::Bubble(fields.clone()),
 			Self::Funnel { fields, .. } => MarkFields::Funnel(fields.clone()),
 			Self::RadialDial { fields, .. } => MarkFields::RadialDial(fields.clone()),
@@ -555,6 +586,13 @@ impl SpannedMarkFields {
 	pub(crate) fn hexbin(&self) -> Option<(&HexbinFields, &HexbinFieldOrigins)> {
 		match self {
 			Self::Hexbin { fields, origins } => Some((fields, origins)),
+			_ => None,
+		}
+	}
+
+	pub(crate) fn fill_between(&self) -> Option<(&FillBetweenFields, &FillBetweenFieldOrigins)> {
+		match self {
+			Self::FillBetween { fields, origins } => Some((fields, origins)),
 			_ => None,
 		}
 	}
@@ -618,6 +656,9 @@ impl SpannedMarkFields {
 				left == right
 			}
 			(Self::Hexbin { fields: left, .. }, Self::Hexbin { fields: right, .. }) => {
+				left == right
+			}
+			(Self::FillBetween { fields: left, .. }, Self::FillBetween { fields: right, .. }) => {
 				left == right
 			}
 			(Self::Bubble { fields: left, .. }, Self::Bubble { fields: right, .. }) => {
@@ -1058,6 +1099,40 @@ mod tests {
 		assert!(styled.clone().into_layer().is_err());
 		let intent = RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::StyledSingle(styled)));
 		assert_eq!(intent.presentation().display_label, "plot.hexbin");
+	}
+
+	#[test]
+	fn product_0146_direct_styled_fill_between_is_defensively_labelled_and_refuses_layering() {
+		let styled = StyledRunePlotSink {
+			sink: DisposableRunePlotSink {
+				composition: PlotComposition::single(PlotType::FillBetween),
+				x: "x".to_owned(),
+				y: "low".to_owned(),
+				category: None,
+				interval_end: None,
+				mark_fields: Some(SpannedMarkFields::FillBetween {
+					fields: FillBetweenFields {
+						x: "x".to_owned(),
+						lower: "low".to_owned(),
+						upper: "high".to_owned(),
+						middle: None,
+					},
+					origins: FillBetweenFieldOrigins {
+						x: 13..16,
+						lower: 18..23,
+						upper: 25..31,
+						middle: None,
+					},
+				}),
+				origin: 0..32,
+			},
+			settings: LayerSettings::default(),
+			stacked: false,
+			percent: false,
+		};
+		assert!(styled.clone().into_layer().is_err());
+		let intent = RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::StyledSingle(styled)));
+		assert_eq!(intent.presentation().display_label, "plot.fill_between");
 	}
 
 	#[derive(Clone, Debug, PartialEq)]
@@ -2843,6 +2918,33 @@ let color_field = "series";
 				product_0058_only_intent(&inline),
 				product_0058_only_intent(&bound),
 				"bound fields changed {mark}'s modifier register"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0146_bound_fill_between_fields_equal_inline_in_both_arities() {
+		let bindings = r#"
+let x = "x";
+let low = "low";
+let high = "high";
+let mid = "mid";
+"#;
+		for (inline, bound) in [
+			(
+				"fill_between(\"x\", \"low\", \"high\")",
+				"fill_between(x, low, high)",
+			),
+			(
+				"fill_between(\"x\", \"low\", \"high\", \"mid\")",
+				"fill_between(x, low, high, mid)",
+			),
+		] {
+			let inline = format!("workspace.table(\"t\").views([{inline}])");
+			let bound = format!("{bindings}\nworkspace.table(\"t\").views([{bound}])");
+			assert_eq!(
+				product_0058_only_intent(&inline),
+				product_0058_only_intent(&bound)
 			);
 		}
 	}

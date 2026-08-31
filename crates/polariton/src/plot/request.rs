@@ -923,15 +923,27 @@ mod tests {
 				polars::df!("x" => [1.0, 2.0], "y" => [2.0, 3.0]).unwrap(),
 				PlotType::Hexbin,
 			),
+			(
+				"fill_between",
+				polars::df!("x" => [1.0, 2.0], "low" => [0.0, 1.0], "high" => [2.0, 3.0]).unwrap(),
+				PlotType::FillBetween,
+			),
 		];
 		for (name, frame, plot_type) in fixtures {
-			let authored_spec = if plot_type == PlotType::Hexbin {
-				AuthoredPlotSpec::hexbin(crate::plot::spec::HexbinFields {
+			let authored_spec = match plot_type {
+				PlotType::Hexbin => AuthoredPlotSpec::hexbin(crate::plot::spec::HexbinFields {
 					x: "x".to_owned(),
 					y: "y".to_owned(),
-				})
-			} else {
-				AuthoredPlotSpec::automatic(PlotComposition::single(plot_type))
+				}),
+				PlotType::FillBetween => {
+					AuthoredPlotSpec::fill_between(crate::plot::spec::FillBetweenFields {
+						x: "x".to_owned(),
+						lower: "low".to_owned(),
+						upper: "high".to_owned(),
+						middle: None,
+					})
+				}
+				_ => AuthoredPlotSpec::automatic(PlotComposition::single(plot_type)),
 			};
 			let (_, after) = plan_with_categorical_palette(
 				PlotRequest {
