@@ -4217,6 +4217,11 @@ struct QueryExecution {
 	/// The executor's phase counters for this run. `Copy`, read once after the elapsed
 	/// boundary — the local arm's raw material for ADR 538 component receipts.
 	task_phases: TaskTelemetryPhases,
+	/// ADR 580: batch-local join routes that passed admission and then found the
+	/// build declined. Carried out of the local arm because the route runs in both
+	/// arms, and a gate that only reads the distributed one would report a partial
+	/// check as a whole one.
+	join_batch_local_post_admission_declines: u64,
 	/// The counters above are authoritative only when the task ledger sealed.
 	phase_receipt: TaskPhaseReceipt,
 }
@@ -4436,6 +4441,8 @@ async fn execute_logical_with_catalog_timed(
 	let partition_work_concurrency_observations =
 		telemetry.partition_work_concurrency_observations.clone();
 	let task_phases = telemetry.phases;
+	let join_batch_local_post_admission_declines =
+		telemetry.counters.join_batch_local_post_admission_declines;
 	let phase_receipt = telemetry.phase_receipt;
 	drop(telemetry);
 
@@ -4451,6 +4458,7 @@ async fn execute_logical_with_catalog_timed(
 		join_spill_observations,
 		partition_work_concurrency_observations,
 		task_phases,
+		join_batch_local_post_admission_declines,
 		phase_receipt,
 	})
 }
@@ -5803,7 +5811,7 @@ pub struct CensusTimingAtlasHarness {
 	telemetry_retention: toron::coordinator::TaskTelemetryRetention,
 	/// The local arm's executor window and phase counters, captured in `execute_child` (the
 	/// copy is `Copy`-cheap) and consumed in `reduce_child` after the boundary.
-	last_local_execution: Option<(f64, TaskTelemetryPhases, TaskPhaseReceipt)>,
+	last_local_execution: Option<(f64, TaskTelemetryPhases, TaskPhaseReceipt, u64)>,
 	/// ADR 554 §3 B2: SQL planning is **harness-owned**. It happens before the
 	/// coordinator is called at all, so no coordinator span can see it, and the
 	/// two arms declare different boundaries — the local arm's `execute_ms` starts
@@ -5945,6 +5953,7 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 					execution.timings.execute_ms,
 					execution.task_phases,
 					execution.phase_receipt,
+					execution.join_batch_local_post_admission_declines,
 				));
 				execution.batches
 			}
@@ -6024,13 +6033,18 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 		let mut lifecycle = toron::coordinator::QueryLifecycleSpans::default();
 		let nodes = match plan.arm {
 			TimingArm::Local => {
-				let (execute_ms, phases, receipt) = self
+				let (execute_ms, phases, receipt, batch_local_declines) = self
 					.last_local_execution
 					.take()
 					.ok_or_else(|| "local child completed without executor phases".to_string())?;
 				self.last_sql_planning_ms = None;
 				self.last_consumer_drain_ms = None;
-				vec![timing_atlas_local_task_node(execute_ms, &phases, receipt)?]
+				vec![timing_atlas_local_task_node(
+					execute_ms,
+					&phases,
+					receipt,
+					batch_local_declines,
+				)?]
 			}
 			TimingArm::Distributed => {
 				let report = self
@@ -6677,6 +6691,23 @@ fn timing_atlas_replay_attribution_path(
 			problems.push("node lacks stage, task or wall".to_string());
 			continue;
 		};
+		// ADR 580: the batch-local route may not decline after passing admission -
+		// the caller would then rebuild the hash table on the concatenating path and
+		// hide the duplicated work in framework overhead while the receipt still read
+		// as an ordinary concatenated route. Absence is a violation, not a zero: an
+		// artifact whose writer predates this counter cannot answer the question.
+		match node
+			.get("join_batch_local_post_admission_declines")
+			.map(|value| value.as_u64())
+		{
+			Some(Some(0)) => {}
+			Some(Some(declines)) => problems.push(format!(
+				"stage {stage_id} task {task_id} declined {declines} batch-local routes after admission"
+			)),
+			Some(None) | None => problems.push(format!(
+				"stage {stage_id} task {task_id} carries no batch-local decline receipt"
+			)),
+		}
 		let mut components = Vec::new();
 		if let Some(map) = node.get("components").and_then(|value| value.as_object()) {
 			for (label, portion) in map {
@@ -6785,6 +6816,12 @@ fn timing_atlas_replay_attribution_path(
 				.get("join_concatenated_routes")
 				.and_then(|value| value.as_u64())
 				.unwrap_or(0),
+			// No `unwrap_or`: an artifact written before this counter had a reporting
+			// half must read as absent, so a gate over it fails loudly instead of
+			// reporting a zero nobody measured.
+			join_batch_local_post_admission_declines: node
+				.get("join_batch_local_post_admission_declines")
+				.and_then(|value| value.as_u64()),
 			join_batch_local_output_batches: node
 				.get("join_batch_local_output_batches")
 				.and_then(|value| value.as_u64())
@@ -8106,6 +8143,12 @@ pub struct TimingAtlasTaskNode {
 	/// to, with what the batch-local one produced and avoided.
 	pub join_batch_local_routes: u64,
 	pub join_concatenated_routes: u64,
+	/// Batch-local routes that passed the admission gate and then found the build
+	/// declined, which would silently duplicate the build on the concatenating path.
+	/// `None` is "this node reports no route receipts", not "none happened": an
+	/// artifact written before this counter had a reporting half has no value here,
+	/// and a gate must fail on the absence rather than read it as zero.
+	pub join_batch_local_post_admission_declines: Option<u64>,
 	pub join_batch_local_output_batches: u64,
 	pub join_batch_local_concat_bytes_avoided: u64,
 	/// ADR 580 measurement: matched rows by the route that produced them, so a
@@ -9205,6 +9248,7 @@ fn placement_attempt_from_row(row: &serde_json::Value) -> Result<PlacementAttemp
 			join_input_shape: None,
 			join_batch_local_routes: 0,
 			join_concatenated_routes: 0,
+			join_batch_local_post_admission_declines: None,
 			join_batch_local_output_batches: 0,
 			join_batch_local_concat_bytes_avoided: 0,
 			join_batch_local_matched_rows: 0,
@@ -9693,6 +9737,12 @@ pub fn timing_atlas_nodes_from_report(
 					.flatten(),
 				join_batch_local_routes: record.telemetry.counters.join_batch_local_routes,
 				join_concatenated_routes: record.telemetry.counters.join_concatenated_routes,
+				join_batch_local_post_admission_declines: Some(
+					record
+						.telemetry
+						.counters
+						.join_batch_local_post_admission_declines,
+				),
 				join_batch_local_output_batches: record
 					.telemetry
 					.counters
@@ -9750,6 +9800,7 @@ pub fn timing_atlas_local_task_node(
 	execute_wall_ms: f64,
 	phases: &TaskTelemetryPhases,
 	receipt: TaskPhaseReceipt,
+	batch_local_post_admission_declines: u64,
 ) -> Result<TimingAtlasTaskNode, String> {
 	if receipt != TaskPhaseReceipt::Sealed {
 		return Err(format!("local phase receipt is not sealed: {receipt:?}"));
@@ -9781,6 +9832,9 @@ pub fn timing_atlas_local_task_node(
 		join_input_shape: None,
 		join_batch_local_routes: 0,
 		join_concatenated_routes: 0,
+		// The local arm reports no per-task route receipts, but the route itself runs
+		// here too, so this counter is measured and carried rather than defaulted.
+		join_batch_local_post_admission_declines: Some(batch_local_post_admission_declines),
 		join_batch_local_output_batches: 0,
 		join_batch_local_concat_bytes_avoided: 0,
 		join_batch_local_matched_rows: 0,
@@ -9885,6 +9939,8 @@ pub fn timing_atlas_attribution_path_row(
 				"join_input_shape": node.join_input_shape,
 				"join_batch_local_routes": node.join_batch_local_routes,
 				"join_concatenated_routes": node.join_concatenated_routes,
+				"join_batch_local_post_admission_declines":
+					node.join_batch_local_post_admission_declines,
 				"join_batch_local_output_batches": node.join_batch_local_output_batches,
 				"join_batch_local_concat_bytes_avoided": node.join_batch_local_concat_bytes_avoided,
 				"join_batch_local_matched_rows": node.join_batch_local_matched_rows,
@@ -25937,6 +25993,51 @@ mod adr538_timing_atlas_journal_replay {
 		);
 	}
 
+	/// ADR 580: a batch-local route that declines after admission rebuilds the hash
+	/// table on the concatenating path, so the decline has to reach replay. Both the
+	/// nonzero case and the absent case are violations, and they are separate cases:
+	/// reading an absent receipt as zero would let an artifact written before this
+	/// counter existed certify a gate it never measured.
+	#[test]
+	fn adr580_replay_rejects_declined_and_unreported_batch_local_routes() {
+		let attribution =
+			timing_atlas_child_attribution(vec![decomposition_node(10.0, 20.0, 70.0)])
+				.expect("fixture attributes");
+		let clean =
+			timing_atlas_attribution_path_row("q08", "distributed", 0, 1, 100.0, &attribution);
+		assert_eq!(
+			clean["nodes"][0]["join_batch_local_post_admission_declines"],
+			serde_json::json!(0),
+			"the fixture must publish a measured zero, not an absence"
+		);
+		timing_atlas_replay_attribution_path(&clean).expect("a measured zero replays");
+
+		let mut declined = clean.clone();
+		declined["nodes"][0]["join_batch_local_post_admission_declines"] = serde_json::json!(2);
+		let problems = timing_atlas_replay_attribution_path(&declined)
+			.expect_err("a post-admission decline must be refused");
+		assert!(
+			problems
+				.iter()
+				.any(|problem| problem.contains("declined 2 batch-local routes")),
+			"{problems:?}"
+		);
+
+		let mut absent = clean;
+		absent["nodes"][0]
+			.as_object_mut()
+			.expect("node is an object")
+			.remove("join_batch_local_post_admission_declines");
+		let problems = timing_atlas_replay_attribution_path(&absent)
+			.expect_err("an absent decline receipt must be refused, not read as zero");
+		assert!(
+			problems
+				.iter()
+				.any(|problem| problem.contains("no batch-local decline receipt")),
+			"{problems:?}"
+		);
+	}
+
 	/// Replay refuses a receipt whose residual does not follow from its own spans.
 	#[test]
 	fn adr554_replay_rejects_a_residual_that_does_not_follow_from_its_spans() {
@@ -26146,6 +26247,7 @@ mod adr538_timing_atlas_journal_replay {
 			join_input_shape: None,
 			join_batch_local_routes: 0,
 			join_concatenated_routes: 0,
+			join_batch_local_post_admission_declines: Some(0),
 			join_batch_local_output_batches: 0,
 			join_batch_local_concat_bytes_avoided: 0,
 			join_batch_local_matched_rows: 0,
@@ -26276,6 +26378,7 @@ mod adr538_timing_atlas_journal_replay {
 			join_input_shape: None,
 			join_batch_local_routes: 0,
 			join_concatenated_routes: 0,
+			join_batch_local_post_admission_declines: Some(0),
 			join_batch_local_output_batches: 0,
 			join_batch_local_concat_bytes_avoided: 0,
 			join_batch_local_matched_rows: 0,
@@ -26334,6 +26437,7 @@ mod adr538_timing_atlas_journal_replay {
 				join_input_shape: None,
 				join_batch_local_routes: 0,
 				join_concatenated_routes: 0,
+				join_batch_local_post_admission_declines: Some(0),
 				join_batch_local_output_batches: 0,
 				join_batch_local_concat_bytes_avoided: 0,
 				join_batch_local_matched_rows: 0,
@@ -26385,6 +26489,7 @@ mod adr538_timing_atlas_journal_replay {
 				join_input_shape: None,
 				join_batch_local_routes: 0,
 				join_concatenated_routes: 0,
+				join_batch_local_post_admission_declines: Some(0),
 				join_batch_local_output_batches: 0,
 				join_batch_local_concat_bytes_avoided: 0,
 				join_batch_local_matched_rows: 0,
@@ -27394,6 +27499,7 @@ mod adr538_timing_atlas_critical_path {
 			join_input_shape: None,
 			join_batch_local_routes: 0,
 			join_concatenated_routes: 0,
+			join_batch_local_post_admission_declines: Some(0),
 			join_batch_local_output_batches: 0,
 			join_batch_local_concat_bytes_avoided: 0,
 			join_batch_local_matched_rows: 0,
@@ -27646,6 +27752,7 @@ mod adr538_path_bound_validation {
 				join_input_shape: None,
 				join_batch_local_routes: 0,
 				join_concatenated_routes: 0,
+				join_batch_local_post_admission_declines: Some(0),
 				join_batch_local_output_batches: 0,
 				join_batch_local_concat_bytes_avoided: 0,
 				join_batch_local_matched_rows: 0,
@@ -27691,6 +27798,7 @@ mod adr538_path_bound_validation {
 				join_input_shape: None,
 				join_batch_local_routes: 0,
 				join_concatenated_routes: 0,
+				join_batch_local_post_admission_declines: Some(0),
 				join_batch_local_output_batches: 0,
 				join_batch_local_concat_bytes_avoided: 0,
 				join_batch_local_matched_rows: 0,
@@ -27737,6 +27845,7 @@ mod adr538_path_bound_validation {
 				join_input_shape: None,
 				join_batch_local_routes: 0,
 				join_concatenated_routes: 0,
+				join_batch_local_post_admission_declines: Some(0),
 				join_batch_local_output_batches: 0,
 				join_batch_local_concat_bytes_avoided: 0,
 				join_batch_local_matched_rows: 0,
@@ -28234,8 +28343,11 @@ mod adr538_phase_component_wiring {
 		let mut phases = TaskTelemetryPhases::default();
 		phases.exchange_repartition_micros = 4_200;
 		phases.scan_micros = 1_800;
-		let node = timing_atlas_local_task_node(25.0, &phases, TaskPhaseReceipt::Sealed)
+		let node = timing_atlas_local_task_node(25.0, &phases, TaskPhaseReceipt::Sealed, 3)
 			.expect("sealed receipt");
+		// The local arm carries its own route-decline count. A default here would make
+		// the cohort gate blind to declines that happen outside the distributed arm.
+		assert_eq!(node.join_batch_local_post_admission_declines, Some(3));
 		let attribution = timing_atlas_child_attribution(vec![node]).expect("local attributes");
 		assert_eq!(attribution.path, vec![(0, 0)]);
 		assert_eq!(attribution.path_wall_ms, 25.0);
@@ -28252,6 +28364,7 @@ mod adr538_phase_component_wiring {
 			25.0,
 			&TaskTelemetryPhases::default(),
 			TaskPhaseReceipt::NotCollected,
+			0,
 		);
 		assert!(
 			local
