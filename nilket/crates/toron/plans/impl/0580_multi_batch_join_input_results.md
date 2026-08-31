@@ -312,8 +312,42 @@ it fails if the absent case is ever read as zero again.
 The engine is untouched by that commit: it changes `crates/toron-tpch/src/lib.rs` only, so
 the diagnostic run below measures the same executor as `93ae7dec`.
 
-### The decline gate, run separately
+### The decline gate, run separately - passed
 
 The authoritative timing result above is not re-rolled after its numbers are known. The gate
-runs instead as a diagnostic-only full cohort - equivalence on, timing authority withheld -
-and is paired with the performance artifact as a two-artifact evidence package.
+ran instead as a diagnostic-only full cohort - equivalence on, timing authority withheld -
+and pairs with the performance artifact as a two-artifact evidence package.
+
+`adr580_decline_gate_sf8.jsonl.partial`, build `5b593150bf6a`, binary mtime 1788140288, sha
+`29900a6be4452113`. 21/21 finalized, `replay_violations: []`, authority withheld with
+`join_diagnostics_enabled` as the sole reason. **1,470 of 1,470 nodes report a measured
+zero** - no absent key, no null, no decline - and the empty violation list is the harness
+saying so on its own, not a tally computed beside it. 336/336 child attempts valid and
+identity-matching; 3,032 output columns verified again; zero reconciliation violations.
+
+The two artifacts pair on more than the assertion that the engine is unchanged. Both took
+**196 batch-local routes** over **1,309,724,479** batch-local matched rows - identical
+figures, not merely similar ones. The same executor made the same routing decisions over the
+same rows in both runs, which is what lets a correctness gate measured in one authorize a
+timing result measured in the other.
+
+## Retention - `93ae7dec` is kept
+
+| gate, fixed before any timing existed | measured |
+|---|---|
+| served-node wall improvement >= 500 ms | **-1,996.2 ms** |
+| exceeds contemporaneous fallback drift | fallback drifted **+5.66%**, adverse |
+| q08 no regression | **-1,184.9 ms** |
+| q09 no regression | **-1,426.8 ms** |
+| zero equivalence mismatches | **0** of 3,032 columns |
+| zero post-admission declines | **0** on 1,470 of 1,470 reporting nodes |
+| route-scoped rows reconcile | **0** violations |
+
+The rule was written before the fresh-vector route was measured, survived that route failing
+it, and is applied here unchanged and unadjusted. What separates the two attempts is one
+reused buffer: the component the bench priced and the first implementation dropped.
+
+The input-concatenation term ADR 580 was opened to own is spent on the served nodes -
+6,182.2 ms to 346.6 ms. What remains of the 6,424.8 ms parent lives on nodes the route does
+not reach, which need `Inner`, an in-memory build and more than one right batch. Widening
+that admission is the next question this record does not answer.
