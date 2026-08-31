@@ -797,6 +797,32 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0145_fill_detail_tracks_anchor_distinctness_across_plot_skins() {
+		for name in libaryon::engine::canonical_theme_names() {
+			for projection in [PlotChromeProjection::Ordered, PlotChromeProjection::Duotone] {
+				let anchors =
+					resolve_anchors(name, projection).expect("catalog plot skin resolves");
+				let style = project_mark_style(anchors);
+				assert_eq!(
+					style.fill == style.fill_detail,
+					anchors.ink == anchors.paper
+				);
+				if matches!(name, "black" | "grey" | "white") {
+					assert_eq!(
+						style.fill, style.fill_detail,
+						"PRODUCT-0145 retains the standing constant-palette collapse for {name}"
+					);
+				} else {
+					assert_ne!(
+						style.fill, style.fill_detail,
+						"PRODUCT-0145 requires distinct fill/detail when {name} has distinct anchors"
+					);
+				}
+			}
+		}
+	}
+
+	#[test]
 	fn product_0034_tab20c_s9_renders_and_reports_its_title_fact() {
 		let chrome =
 			PlotChrome::from_theme_name("tab20c_s9", PlotChromeProjection::Ordered).unwrap();

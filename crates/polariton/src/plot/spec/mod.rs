@@ -1869,9 +1869,9 @@ pub enum ResolvedKernelFields {
 	},
 	FillBetween {
 		x: String,
-		middle: String,
 		lower: String,
 		upper: String,
+		middle: Option<String>,
 	},
 }
 
@@ -3739,12 +3739,30 @@ fn resolve_automatic_kernel_fields(
 			x: number(0, "x")?,
 			y: number(1, "y")?,
 		},
-		PlotType::FillBetween => ResolvedKernelFields::FillBetween {
-			x: number(0, "x")?,
-			middle: number(1, "middle")?,
-			lower: number(2, "lower")?,
-			upper: number(3, "upper")?,
-		},
+		PlotType::FillBetween => {
+			let x = number(0, "x")?;
+			let quantitative = schema
+				.iter()
+				.filter(|(name, dtype)| dtype.is_numeric() && name.as_str() != x)
+				.map(|(name, _)| name.as_str().to_owned())
+				.collect::<Vec<_>>();
+			let required = |index: usize, role: &str| {
+				quantitative.get(index).cloned().ok_or_else(|| ChannelError {
+					attribution: FieldAttribution::Channel(Channel::Y),
+					field: format!("<{role}>"),
+					reason: format!(
+						"{plot_type} requires quantitative field {} for {role}",
+						index + 1
+					),
+				})
+			};
+			ResolvedKernelFields::FillBetween {
+				x,
+				lower: required(0, "lower")?,
+				upper: required(1, "upper")?,
+				middle: quantitative.get(2).cloned(),
+			}
+		}
 	})
 }
 
@@ -4665,6 +4683,62 @@ mod tests {
 				median,
 			} if group == "group" && evaluation_value == "evaluation_value" && density == "density" && median == "median"
 		));
+	}
+
+	#[test]
+	fn product_0145_automatic_fill_between_consumes_each_quantitative_field_once() {
+		let numeric = df!(
+			"x" => [1.0_f64, 2.0],
+			"lower" => [0.0_f64, 1.0],
+			"upper" => [2.0_f64, 3.0],
+			"middle" => [1.0_f64, 2.0]
+		)
+		.unwrap();
+		let fields =
+			resolve_automatic_kernel_fields(PlotType::FillBetween, numeric.schema().as_ref())
+				.expect("four quantitative fields resolve");
+		assert_eq!(
+			fields,
+			ResolvedKernelFields::FillBetween {
+				x: "x".to_owned(),
+				lower: "lower".to_owned(),
+				upper: "upper".to_owned(),
+				middle: Some("middle".to_owned()),
+			}
+		);
+
+		let three = numeric.drop("middle").unwrap();
+		assert!(matches!(
+			resolve_automatic_kernel_fields(PlotType::FillBetween, three.schema().as_ref()),
+			Ok(ResolvedKernelFields::FillBetween { middle: None, .. })
+		));
+	}
+
+	#[test]
+	fn product_0145_automatic_fill_between_admits_temporal_x_without_reusing_y() {
+		let temporal = Column::new("when".into(), [1_i32, 2_i32])
+			.cast(&DataType::Date)
+			.unwrap();
+		let frame = DataFrame::new(
+			2,
+			vec![
+				temporal,
+				Column::new("lower".into(), [0.0_f64, 1.0]),
+				Column::new("upper".into(), [2.0_f64, 3.0]),
+				Column::new("middle".into(), [1.0_f64, 2.0]),
+			],
+		)
+		.unwrap();
+		assert_eq!(
+			resolve_automatic_kernel_fields(PlotType::FillBetween, frame.schema().as_ref())
+				.unwrap(),
+			ResolvedKernelFields::FillBetween {
+				x: "when".to_owned(),
+				lower: "lower".to_owned(),
+				upper: "upper".to_owned(),
+				middle: Some("middle".to_owned()),
+			}
+		);
 	}
 
 	#[test]

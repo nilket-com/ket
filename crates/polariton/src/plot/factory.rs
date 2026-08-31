@@ -9,7 +9,6 @@ use crate::plot::kernels::boxplot::{self, BoxPlotKernel};
 use crate::plot::kernels::bubble::{self, BubblePlotKernel};
 use crate::plot::kernels::candlestick::{self, CandlestickPlotKernel};
 use crate::plot::kernels::fill_between::{self, FillBetweenPlotKernel};
-use crate::plot::kernels::fill_between_line::FillBetweenLinePlotKernel;
 use crate::plot::kernels::funnel::{self, FunnelPlotKernel};
 use crate::plot::kernels::heatmap::{self, HeatmapPlotKernel};
 use crate::plot::kernels::hexbin::HexbinPlotKernel;
@@ -315,22 +314,15 @@ fn create_plot_with_source_token(
 		}
 		ResolvedKernelFields::FillBetween {
 			x,
-			middle,
 			lower,
 			upper,
-		} => {
-			let fill_between_data = Arc::new(fill_between::prepare_fill_between_data(
-				df, x, middle, lower, upper,
-			));
-			if spec.composition.is_fill_between_with_line_overlay() {
-				let line_data = Arc::new(line::prepare_line_data(df, "", x, middle));
-				Arc::new(FillBetweenLinePlotKernel::new(fill_between_data, line_data))
-			} else {
-				Arc::new(FillBetweenPlotKernel {
-					prepared_data: fill_between_data,
-				})
-			}
-		}
+			middle,
+		} => Arc::new(FillBetweenPlotKernel {
+			prepared_data: Arc::new(
+				fill_between::prepare_fill_between_data(df, x, lower, upper, middle.as_deref())
+					.expect("PRODUCT-0145 planning validated fill-between preparation"),
+			),
+		}),
 	}
 }
 
@@ -1585,13 +1577,6 @@ mod product_0013_baseline_tests {
 
 	#[test]
 	fn product_0133_overlay_composites_apply_the_same_hit_priority() {
-		let frame = df!(
-			"x" => [1.0, 2.0, 3.0],
-			"y" => [2.0, 4.0, 6.0],
-			"lower" => [1.0, 3.0, 5.0],
-			"upper" => [3.0, 5.0, 7.0]
-		)
-		.expect("overlay frame");
 		let scatter_frame = df!("x" => [0.0, 10.0], "y" => [0.0, 10.0]).expect("scatter frame");
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
 
@@ -1608,21 +1593,13 @@ mod product_0013_baseline_tests {
 		assert_eq!(line_only_hit.mark_family, MarkFamily::LINE);
 		assert_eq!(line_only_hit.dimensionality, HitDimensionality::Line);
 
-		let fill_between_line = FillBetweenLinePlotKernel::new(
-			Arc::new(fill_between::prepare_fill_between_data(
-				&frame, "x", "y", "lower", "upper",
-			)),
-			Arc::new(line::prepare_line_data(&frame, "", "x", "y")),
-		);
-		let fill_between_layout = fill_between_line.layout(ResolvedPlotSettings::default());
-		let fill_between_transform = CoordinateTransformer::new(&fill_between_layout, bounds);
-		let overlap = fill_between_transform.cartesian(2.0, 4.0);
-		let overlap_hit = fill_between_line
-			.hit(&fill_between_transform, Cursor::Available(overlap))
-			.expect("fill-between-line overlap must hit");
-		assert_eq!(overlap_hit.mark_family, MarkFamily::LINE);
-		assert_eq!(overlap_hit.dimensionality, HitDimensionality::Line);
-		assert_eq!(overlap_hit.paint_order, 1);
+		let overlap = scatter_line_transform.cartesian(0.0, 0.0);
+		let overlap_hit = scatter_line
+			.hit(&scatter_line_transform, Cursor::Available(overlap))
+			.expect("scatter-line overlap must hit");
+		assert_eq!(overlap_hit.mark_family, MarkFamily::SCATTER);
+		assert_eq!(overlap_hit.dimensionality, HitDimensionality::Point);
+		assert_eq!(overlap_hit.paint_order, 0);
 	}
 
 	#[test]

@@ -5527,3 +5527,90 @@ fn product_0143_count_guide_contract_is_closed_and_reservation_precedes_preparat
 	assert!(final_transform < preparation);
 	assert!(preparation < paint);
 }
+
+#[test]
+fn product_0145_fill_between_substrate_has_one_validated_colour_and_hit_authority() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let fill = std::fs::read_to_string(root.join("plot/kernels/fill_between.rs"))
+		.expect("read fill-between kernel");
+	let production = fill
+		.split("#[cfg(test)]")
+		.next()
+		.expect("fill-between production");
+	assert!(production.contains("y_mid: Option<Vec<f64>>"));
+	assert!(production.contains("settings.mark_style.fill.iced()"));
+	assert!(production.contains("settings.mark_style.fill_detail.iced()"));
+	assert!(!production.contains("get_color"));
+	assert!(!production.contains("vec![0.0;"));
+	assert!(production.contains("OrderedX::Temporal"));
+	assert!(production.contains("partition_point"));
+	assert!(production.contains("prepare_fill_between_data"));
+	assert!(production.contains("Result<FillBetweenPreparedData, FillBetweenPreparationError>"));
+
+	let request = std::fs::read_to_string(root.join("plot/request.rs")).expect("read plot request");
+	let validation = request
+		.split("ResolvedKernelFields::FillBetween")
+		.nth(1)
+		.expect("fill-between planning branch")
+		.split("ResolvedKernelFields::Histogram")
+		.next()
+		.expect("bounded fill-between planning branch");
+	assert!(validation.contains("prepare_fill_between_data"));
+
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read plot factory");
+	let branch = factory
+		.split("ResolvedKernelFields::FillBetween")
+		.nth(1)
+		.expect("fill-between factory branch")
+		.split("fn create_bar_kernel")
+		.next()
+		.expect("bounded fill-between factory branch");
+	assert!(branch.contains("PRODUCT-0145 planning validated fill-between preparation"));
+	assert!(!factory.contains("FillBetweenLinePlotKernel"));
+	assert!(!factory.contains("is_fill_between_with_line_overlay"));
+
+	let composition =
+		std::fs::read_to_string(root.join("plot/composition.rs")).expect("read composition");
+	assert!(!composition.contains("(PlotType::Line, PlotType::FillBetween)"));
+	assert!(!composition.contains("(PlotType::FillBetween, PlotType::Line)"));
+	assert!(composition.contains("(PlotType::Line, PlotType::Scatter)"));
+	assert!(composition.contains("(PlotType::Scatter, PlotType::Line)"));
+	assert!(!root.join("plot/kernels/fill_between_line.rs").exists());
+}
+
+#[test]
+fn product_0145_keeps_fill_between_surface_absent_and_resolution_non_reusing() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let registry = presentation_registry(&root);
+	assert!(registry_callable(&registry, "fill_between", "Free", "FillBetween").is_none());
+	let all_marks = registry
+		.split("const ALL_MARKS")
+		.nth(1)
+		.expect("ALL_MARKS settings inventory")
+		.split("const POINT_MARKS")
+		.next()
+		.expect("bounded ALL_MARKS inventory");
+	assert!(!all_marks.contains("PlotType::FillBetween"));
+
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let mark_fields = spec
+		.split("pub enum MarkFields")
+		.nth(1)
+		.expect("MarkFields declaration")
+		.split("pub struct AuthoredPlotSpec")
+		.next()
+		.expect("bounded MarkFields");
+	assert!(!mark_fields.contains("FillBetween"));
+	assert!(!spec.contains("pub fn fill_between"));
+	let automatic = spec
+		.split("PlotType::FillBetween => {")
+		.nth(1)
+		.expect("automatic fill-between arm")
+		.split("\n\t})")
+		.next()
+		.expect("bounded automatic arm");
+	assert!(automatic.contains("name.as_str() != x"));
+	assert!(automatic.contains("middle: quantitative.get(2).cloned()"));
+	assert!(automatic.contains("lower: required(0, \"lower\")?"));
+	assert!(automatic.contains("upper: required(1, \"upper\")?"));
+}

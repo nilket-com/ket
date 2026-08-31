@@ -9,7 +9,6 @@ pub mod bubble;
 pub mod bubble_observations;
 pub mod candlestick;
 pub mod fill_between;
-pub mod fill_between_line;
 pub mod funnel;
 pub mod funnel_stages;
 pub mod heatmap;

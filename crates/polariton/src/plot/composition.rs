@@ -26,15 +26,10 @@ impl PlotComposition {
 
 	pub fn can_add_layer_type(&self, plot_type: PlotType) -> bool {
 		match (self.primary_plot_type(), plot_type) {
-			(PlotType::Line, PlotType::FillBetween) => !self
-				.layers
-				.iter()
-				.any(|layer| layer.plot_type == PlotType::FillBetween),
 			(PlotType::Line, PlotType::Scatter) => !self
 				.layers
 				.iter()
 				.any(|layer| layer.plot_type == PlotType::Scatter),
-			(PlotType::FillBetween, PlotType::Line) => !self.has_line_overlay(),
 			(PlotType::Scatter, PlotType::Line) => !self.has_line_overlay(),
 			_ => false,
 		}
@@ -43,13 +38,6 @@ impl PlotComposition {
 	pub fn add_layer(&mut self, plot_type: PlotType) -> bool {
 		if !self.can_add_layer_type(plot_type) {
 			return false;
-		}
-		if self.primary_plot_type() == PlotType::Line && plot_type == PlotType::FillBetween {
-			self.layers = vec![
-				PlotLayer::builtin(PlotType::FillBetween),
-				PlotLayer::builtin(PlotType::Line),
-			];
-			return true;
 		}
 		if self.primary_plot_type() == PlotType::Line && plot_type == PlotType::Scatter {
 			self.layers = vec![
@@ -71,10 +59,6 @@ impl PlotComposition {
 
 	pub fn is_scatter_with_line_overlay(&self) -> bool {
 		self.primary_plot_type() == PlotType::Scatter && self.has_line_overlay()
-	}
-
-	pub fn is_fill_between_with_line_overlay(&self) -> bool {
-		self.primary_plot_type() == PlotType::FillBetween && self.has_line_overlay()
 	}
 
 	pub fn title(&self) -> String {

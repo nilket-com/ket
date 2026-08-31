@@ -190,6 +190,22 @@ fn validate_prepared_contract(
 			crate::plot::continuous_color::ContinuousScaleIntent::SEQUENTIAL,
 		)?;
 	}
+	if let crate::plot::spec::ResolvedKernelFields::FillBetween {
+		x,
+		lower,
+		upper,
+		middle,
+	} = spec.kernel_fields.as_ref()
+	{
+		crate::plot::kernels::fill_between::prepare_fill_between_data(
+			data,
+			x,
+			lower,
+			upper,
+			middle.as_deref(),
+		)
+		.map_err(|error| error.to_string())?;
+	}
 	if let crate::plot::spec::ResolvedKernelFields::Histogram {
 		bin_start,
 		bin_end,
@@ -431,6 +447,50 @@ mod tests {
 			})
 			.is_ok()
 		);
+	}
+
+	#[test]
+	fn product_0145_planning_validates_fill_between_before_factory_reconstruction() {
+		let malformed = polars::df!(
+			"x" => [2.0_f64, 1.0],
+			"lower" => [Some(0.0_f64), None],
+			"upper" => [2.0_f64, 3.0],
+		)
+		.unwrap();
+		let error = plan(PlotRequest {
+			source: materialized("malformed fill-between", malformed),
+			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(
+				PlotType::FillBetween,
+			)),
+		})
+		.expect_err("planning must surface preparation before factory reconstruction");
+		assert!(
+			error.contains(
+				"malformed fill-between: fill-between lower field `lower` is null at row 2"
+			),
+			"{error}"
+		);
+
+		let valid = polars::df!(
+			"x" => [1.0_f64, 2.0],
+			"lower" => [0.0_f64, 1.0],
+			"upper" => [2.0_f64, 3.0],
+		)
+		.unwrap();
+		let resolved = plan(PlotRequest {
+			source: materialized("valid fill-between", valid),
+			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(
+				PlotType::FillBetween,
+			)),
+		})
+		.expect("planning approves the prepared contract");
+		let kernel = crate::plot::factory::create_plot(
+			&resolved.resolved_spec,
+			resolved.data.as_ref(),
+			400,
+			300,
+		);
+		assert_eq!(kernel.y_label(), "lower / upper");
 	}
 
 	#[test]
