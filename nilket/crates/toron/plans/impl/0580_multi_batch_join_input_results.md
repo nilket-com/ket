@@ -175,7 +175,8 @@ ADR 580 fixed a retention rule before any timing existed. The cut missed it, and
 1788058265. 21/21 finalized, no replay violations, 336/336 child attempts valid and
 identity-matching, `timing_authority: false` with `join_diagnostics_enabled` as the sole
 withheld reason. **3,032 output columns verified** against the concatenated route, zero
-mismatches, zero row-count gaps. Post-admission declines: **0**.
+mismatches, zero row-count gaps. Post-admission declines: **unsupported** - see the
+correction below; this figure was read from a field the artifact never carried.
 
 Route receipts, per pair: 28 batch-local joins against 78 concatenated, 106 output batches,
 21.4 GB of concatenation avoided. The route fires on q08 (6), q02 (5), q09 (4), q05 (3) and
@@ -189,8 +190,9 @@ An earlier attempt at this run was killed externally at q06 and is retained sepa
 ### Phase 2, authoritative - FAILED the retention rule
 
 `adr580_batch_local_sf8.jsonl`, same build, `timing_authority: true`, 21/21, no replay
-violations, declines **0**. Served nodes are receipt-confirmed; comparability against the
-`08e06751` baseline: mean 1.046 (0.879-1.347).
+violations. Declines: **unsupported**, same cause as above. Served nodes are
+receipt-confirmed; comparability against the `08e06751` baseline: mean 1.046
+(0.879-1.347).
 
 | term, 14 served nodes | before | after | delta |
 |---|---:|---:|---:|
@@ -233,3 +235,85 @@ both new arms. Until that bench separates them, no further engine cut here is au
 reusable-buffer cut would change `probe_in_memory_join_rows`'s signature to accept its output
 vector, and that is only worth doing if the measured fresh-versus-reused delta materially
 accounts for the +2,370.9 ms.
+
+## The reusable-buffer cut - `93ae7dec`
+
+The rejected route's implementation allocated a fresh selection vector per probe batch;
+the priced candidate reused one. `93ae7dec` adds an internal
+`probe_in_memory_join_rows_profiled_into(..., &mut Vec<JoinOutputRow>)` core and keeps the
+allocating wrapper, so spill, streaming, tests and every non-authorized kind stay
+byte-identical and only the batch-local route changes.
+
+The retention rule was fixed before any timing existed and is unchanged: at least 500 ms of
+served-node wall improvement, exceeding contemporaneous fallback drift; no q08 or q09
+regression; zero declines; zero equivalence mismatches.
+
+### Phase 1, equivalence - passed
+
+`adr580_batch_local_reuse_equivalence_sf8.jsonl.partial`, build `93ae7dec75e8`, binary mtime
+1788119622. 21/21 finalized, no replay violations, 336/336 child attempts valid and
+identity-matching, authority withheld with `join_diagnostics_enabled` as the sole reason.
+**3,032 output columns verified**, zero mismatches. A shared buffer's specific hazard is
+rows surviving from one probe batch into the next, and the full cohort says they do not.
+
+### Phase 2, authoritative - passed the retention rule
+
+`adr580_batch_local_reuse_sf8.jsonl`, same build, `timing_authority: true`, 21/21, no replay
+violations, no withheld reasons. 14 served nodes, all receipt-confirmed, each present in all
+seven pairs. Per-cell medians, summed:
+
+| term, 14 served nodes | before `08e06751` | after `93ae7dec` | delta |
+|---|---:|---:|---:|
+| input concatenation | 6,182.2 | 346.6 | **-5,835.6** |
+| operator (build + probe) | 50,462.4 | 52,078.1 | +1,615.6 |
+| output materialization | 2,714.7 | 2,251.3 | -463.4 |
+| framework overhead | 2,101.8 | 1,888.5 | -213.4 |
+| **wall** | **98,315.1** | **96,318.9** | **-1,996.2** |
+
+q08 **-1,184.9**, q09 **-1,426.8**. q09 had regressed +301.9 on the fresh-vector route; it
+is the cell the reuse changes most.
+
+Drift runs against the treatment, not for it. The 196 fallback nodes - the unchanged path -
+were **5.66% slower** in this run than in the baseline, and the local arm, which no served
+node belongs to, agrees at 1.056 (0.944-1.155) across 21 cells. The 500 ms rule is applied
+to the raw improvement; the drift is recorded because it makes -1,996.2 conservative, and no
+drift adjustment is taken.
+
+The operator term still rises 1,615.6 ms, but that is **+3.20%** against a fallback control
+that drifted **+4.98%** on the same term. The rise is within drift and this record does not
+claim the batch-local probe is cheaper - only that it is not measurably dearer once the
+allocation is gone.
+
+Route receipts, per pair: 28 batch-local joins against 78 concatenated, 106 output batches,
+22.9 GB of concatenation avoided, 187.1 M matched rows attributed to the batch-local route.
+`batch_local + concatenated == matched_rows` holds on all 1,470 node rows. The route fires
+on q08 (6), q02 (5), q09 (4), q05 (3), q10 (2), q11 (2) and singly on q03, q07, q17, q18,
+q20, q21.
+
+### Correction: the decline gate had no reporting half - `c37acbc1`
+
+`join_batch_local_post_admission_declines` was incremented in the engine and **never emitted
+by `toron-tpch`**. Every "declines: 0" in this record, and in the phase 1 report of this cut,
+was `unwrap_or(0)` over a key no artifact ever carried. Absence was read as zero, in a line
+that has a rule against exactly that. The claims above are corrected to *unsupported*.
+
+`c37acbc1` adds the reporting half and refuses to let it degrade again:
+
+- the counter is carried out of **both** arms - the local arm measures it too, so the gate
+  is not silently distributed-only;
+- the published field is `Option<u64>` end to end, so an artifact written before this commit
+  reads as absent rather than as zero;
+- replay itself is the gate: a node with a nonzero count **or with no count at all** is a
+  replay violation, which forfeits timing authority for the run.
+
+`adr580_replay_rejects_declined_and_unreported_batch_local_routes` locks the second half -
+it fails if the absent case is ever read as zero again.
+
+The engine is untouched by that commit: it changes `crates/toron-tpch/src/lib.rs` only, so
+the diagnostic run below measures the same executor as `93ae7dec`.
+
+### The decline gate, run separately
+
+The authoritative timing result above is not re-rolled after its numbers are known. The gate
+runs instead as a diagnostic-only full cohort - equivalence on, timing authority withheld -
+and is paired with the performance artifact as a two-artifact evidence package.
