@@ -347,7 +347,16 @@ The rule was written before the fresh-vector route was measured, survived that r
 it, and is applied here unchanged and unadjusted. What separates the two attempts is one
 reused buffer: the component the bench priced and the first implementation dropped.
 
-The input-concatenation term ADR 580 was opened to own is spent on the served nodes -
-6,182.2 ms to 346.6 ms. What remains of the 6,424.8 ms parent lives on nodes the route does
-not reach, which need `Inner`, an in-memory build and more than one right batch. Widening
-that admission is the next question this record does not answer.
+The input-concatenation term ADR 580 was opened to own is spent where the route reaches:
+6,182.2 ms to 346.6 ms on the served nodes.
+
+What remains is **multi-batch** time, and no part of it can be charged to single-batch
+joins - the whole single-batch child measured **0.18 ms** across the board (section "The
+answer: probe-heavy, multi-batch"). The residual therefore sits on multi-batch joins the
+route excludes for some other reason: non-`Inner` kinds, spilled builds, and whatever else a
+census finds.
+
+**Precondition on any successor: attribute that residual among the excluded multi-batch
+shapes before widening admission.** Widening on the assumption that the excluded shapes carry
+it would repeat the error this record already made twice - reading a parent total as though
+its distribution were known.

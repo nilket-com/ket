@@ -1,7 +1,11 @@
 # ADR 580 - Consuming join inputs without concatenating them
 
-**Status:** Open. Measurement authorized; the structural change is not, and this
-record predeclares what would authorize it.
+**Status:** CLOSED. The batch-local Inner probe with a reused selection buffer landed
+at `93ae7dec` and met every predeclared retention condition; the earlier
+fresh-allocation route (`14e87160`) missed the same rule and was reverted at
+`b94981d8`. Results: `plans/impl/0580_multi_batch_join_input_results.md`. No further
+implementation or measurement lands under this number.
+
 
 ## Context
 
@@ -248,3 +252,20 @@ it.
 
 The first act under this record is a run of the instrument already built, on a
 clean board, with the partition identity checked before any figure is read.
+
+## Closing note
+
+The concatenation term this record was opened to own is spent where the route
+reaches. What remains is **multi-batch** time: single-batch join input measured
+0.18 ms in total and can own none of it. A successor must attribute the residual
+among the multi-batch shapes this route excludes - non-`Inner` kinds, spilled
+builds, and whatever a census adds - **before** widening admission. Widening on the
+assumption that the excluded shapes carry the residual would read a parent total as
+though its distribution were known, which is the error this line has already made
+twice.
+
+One instrument defect is worth carrying forward rather than leaving in the results
+record alone: `join_batch_local_post_admission_declines` was incremented by the
+engine and never emitted by the harness, so three reports read `unwrap_or(0)` over a
+key no artifact carried. A guard counter needs its reporting half in the same cut,
+published as an option, with the gate somewhere a run can fail on it.
