@@ -5758,7 +5758,7 @@ fn product_0147_candlestick_substrate_has_one_validated_geometric_colour_authori
 }
 
 #[test]
-fn product_0147_repairs_automatic_candlestick_without_granting_a_surface() {
+fn product_0147_authority_survives_product_0148_precise_surface_inversions() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
 	let automatic = spec
@@ -5775,7 +5775,7 @@ fn product_0147_repairs_automatic_candlestick_without_granting_a_surface() {
 	assert!(!automatic.contains("category(0, \"x\")"));
 
 	let registry = presentation_registry(&root);
-	assert!(registry_callable(&registry, "candlestick", "Free", "Candlestick").is_none());
+	assert!(registry_callable(&registry, "candlestick", "Free", "Candlestick").is_some());
 	let mark_fields = spec
 		.split("pub enum MarkFields")
 		.nth(1)
@@ -5783,8 +5783,8 @@ fn product_0147_repairs_automatic_candlestick_without_granting_a_surface() {
 		.split("pub struct AuthoredPlotSpec")
 		.next()
 		.expect("bounded MarkFields");
-	assert!(!mark_fields.contains("Candlestick"));
-	assert!(!spec.contains("pub fn candlestick"));
+	assert!(mark_fields.contains("Candlestick"));
+	assert!(spec.contains("pub fn candlestick"));
 
 	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
 		.expect("read Rune relation envelope");
@@ -5795,5 +5795,74 @@ fn product_0147_repairs_automatic_candlestick_without_granting_a_surface() {
 		.split("impl SpannedMarkFields")
 		.next()
 		.expect("bounded SpannedMarkFields");
-	assert!(!spanned.contains("Candlestick"));
+	assert!(spanned.contains("Candlestick"));
+}
+
+#[test]
+fn product_0148_candlestick_surface_has_one_transport_and_no_colour_or_layer_widening() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let registry = presentation_registry(&root);
+	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
+		.expect("read Rune presentation evaluator");
+	let compiler = std::fs::read_to_string(root.join("rune_view_compiler.rs"))
+		.expect("read Rune view compiler");
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune relation envelope");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let gui = std::fs::read_to_string(root.join("gui/state.rs")).expect("read GUI state");
+	let kernel = std::fs::read_to_string(root.join("plot/kernels/candlestick.rs"))
+		.expect("read candlestick substrate");
+
+	let callable = registry_callable(&registry, "candlestick", "Free", "Candlestick")
+		.expect("candlestick registry row");
+	assert!(callable.contains("5..=5"));
+	assert_eq!(registry.matches("\"candlestick\",").count(), 1);
+	assert!(registry.contains("PlotType::Candlestick"));
+	let all_marks = registry
+		.split("const ALL_MARKS")
+		.nth(1)
+		.and_then(|rest| rest.split("const POINT_MARKS").next())
+		.expect("ALL_MARKS list");
+	assert!(all_marks.contains("PlotType::Candlestick"));
+	for list in ["const STROKE_MARKS", "const BAR_MARKS", "const STACK_MARKS"] {
+		let body = registry
+			.split(list)
+			.nth(1)
+			.and_then(|rest| rest.split(";").next())
+			.expect("settings membership list");
+		assert!(!body.contains("PlotType::Candlestick"), "{list}");
+	}
+	assert!(presentation.contains("HandlerId::Candlestick => raw_candlestick"));
+	assert!(presentation.contains("PlotType::Candlestick => \"candlestick\""));
+	assert!(compiler.contains("\"candlestick\" => Some(&[5])"));
+	assert!(compiler.contains("| HandlerId::Candlestick"));
+	assert!(envelope.contains("PlotType::Candlestick => \"plot.candlestick\".to_owned()"));
+	assert_eq!(
+		envelope
+			.matches("PlotType::Candlestick => \"plot.candlestick\".to_owned()")
+			.count(),
+		2
+	);
+	let layer = envelope
+		.split("pub(crate) fn into_layer")
+		.nth(1)
+		.and_then(|rest| rest.split("impl RunePlotIntent").next())
+		.expect("into_layer boundary");
+	assert!(layer.contains("| PlotType::Candlestick"));
+	assert!(spec.contains("fn resolve_candlestick_channels("));
+	assert!(spec.contains("color_job: None"));
+	assert!(gui.contains("fn candlestick_failure_span("));
+	let mapper = gui
+		.split("fn candlestick_failure_span(")
+		.nth(1)
+		.and_then(|rest| rest.split("fn bubble_failure_span(").next())
+		.expect("bounded candlestick diagnostic mapper");
+	assert!(mapper.contains("prepare_candlestick_data("));
+	assert!(!mapper.contains("ArtifactToken::mint"));
+	assert!(!mapper.contains("error.field =="));
+	let production = kernel
+		.split("#[cfg(test)]")
+		.next()
+		.expect("candlestick production");
+	assert!(!production.contains("get_color"));
 }

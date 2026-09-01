@@ -1014,6 +1014,15 @@ mod tests {
 						middle: None,
 					})
 				}
+				PlotType::Candlestick => {
+					AuthoredPlotSpec::candlestick(crate::plot::spec::CandlestickFields {
+						x: "x".to_owned(),
+						open: "open".to_owned(),
+						high: "high".to_owned(),
+						low: "low".to_owned(),
+						close: "close".to_owned(),
+					})
+				}
 				_ => AuthoredPlotSpec::automatic(PlotComposition::single(plot_type)),
 			};
 			let (_, after) = plan_with_categorical_palette(

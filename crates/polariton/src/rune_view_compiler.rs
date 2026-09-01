@@ -443,6 +443,7 @@ fn produced_receiver(handler: HandlerId) -> Option<SemanticReceiver> {
 		| HandlerId::Heatmap
 		| HandlerId::Hexbin
 		| HandlerId::FillBetween
+		| HandlerId::Candlestick
 		| HandlerId::Funnel
 		| HandlerId::RadialDial
 		| HandlerId::Pie
@@ -846,6 +847,7 @@ fn static_method_on_relation(
 			| "heatmap"
 			| "hexbin"
 			| "fill_between"
+			| "candlestick"
 			| "radial_dial"
 			| "pie" | "violin"
 			| "radar" | "parallel"
@@ -1647,6 +1649,7 @@ fn rewrite_calls_mapped(
 			"heatmap" => Some(&[3]),
 			"hexbin" => Some(&[2]),
 			"fill_between" => Some(&[3, 4]),
+			"candlestick" => Some(&[5]),
 			"funnel" => Some(&[2]),
 			"radial_dial" => Some(&[2, 3]),
 			"pie" => Some(&[2]),
@@ -2201,6 +2204,16 @@ mod tests {
 				expected
 			);
 		}
+	}
+
+	#[test]
+	fn product_0148_candlestick_rewriter_retains_five_argument_origins() {
+		let source = "candlestick(\"x\", \"o\", \"h\", \"l\", \"c\")";
+		let rewritten = rewrite_calls(source, 100).expect("rewrite candlestick call");
+		assert_eq!(
+			rewritten,
+			"polariton_presentation::__candlestick(\"x\", \"o\", \"h\", \"l\", \"c\", 112, 115, 117, 120, 122, 125, 127, 130, 132, 135, 100, 136)"
+		);
 	}
 
 	#[test]
@@ -2923,6 +2936,88 @@ relation.views([figure([
 			error
 				.to_string()
 				.contains("available on heatmap and bubble"),
+			"{error}"
+		);
+	}
+
+	#[test]
+	fn product_0148_candlestick_surface_is_fixed_originated_and_closed() {
+		let source = "let relation = workspace.table(\"ohlc\"); relation.views([candlestick(\"stamp\", \"open\", \"high\", \"low\", \"close\")]);";
+		let compiled = compile(source).expect("candlestick surface compiles");
+		let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+			panic!("candlestick surface produced a table")
+		};
+		let RunePlotBody::Single(sink) = &plot.body else {
+			panic!("unmodified candlestick must use the live Single path")
+		};
+		assert_eq!(
+			sink.composition.primary_plot_type(),
+			crate::plot::core::PlotType::Candlestick
+		);
+		let (fields, origins) = sink
+			.mark_fields
+			.as_ref()
+			.and_then(SpannedMarkFields::candlestick)
+			.expect("candlestick fields and origins");
+		for (field, expected, origin) in [
+			(&fields.x, "stamp", &origins.x),
+			(&fields.open, "open", &origins.open),
+			(&fields.high, "high", &origins.high),
+			(&fields.low, "low", &origins.low),
+			(&fields.close, "close", &origins.close),
+		] {
+			assert_eq!(field, expected);
+			assert_eq!(
+				&source[origin.start as usize..origin.end as usize],
+				format!("\"{expected}\"")
+			);
+		}
+		assert_eq!(
+			compiled.executions[0].views[0]
+				.intent
+				.presentation()
+				.display_label,
+			"plot.candlestick"
+		);
+
+		let layered = "let r = workspace.table(\"ohlc\"); r.views([layers([candlestick(\"stamp\", \"open\", \"high\", \"low\", \"close\"), line(\"stamp\", \"close\")])]);";
+		let error = compile(layered).expect_err("candlestick remains outside LayerMark");
+		assert!(
+			error
+				.to_string()
+				.contains("candlestick(...) is a view sink, not a shared-Cartesian layer"),
+			"{error}"
+		);
+		let sugar = "workspace.table(\"ohlc\").candlestick(\"stamp\", \"open\", \"high\", \"low\", \"close\")";
+		let error = compile(sugar).expect_err("candlestick relation sugar is closed");
+		assert!(
+			error
+				.to_string()
+				.contains("candlestick is a sink inside .views([...]"),
+			"{error}"
+		);
+		for malformed in [
+			"workspace.table(\"t\").views([candlestick(\"x\", \"o\", \"h\", \"l\")])",
+			"workspace.table(\"t\").views([candlestick(\"x\", \"o\", \"h\", \"l\", \"c\", \"v\")])",
+			"workspace.table(\"t\").views([candlestick(1, \"o\", \"h\", \"l\", \"c\")])",
+		] {
+			let error = compile(malformed).expect_err("malformed candlestick refuses");
+			assert!(
+				error
+					.to_string()
+					.contains("candlestick(...) takes x, open, high, low, and close strings")
+					|| error
+						.to_string()
+						.contains("field arguments must evaluate to strings"),
+				"{error}"
+			);
+		}
+		let diverging = "workspace.table(\"t\").views([candlestick(\"x\", \"o\", \"h\", \"l\", \"c\").diverging()])";
+		let error = compile(diverging).expect_err("candlestick has no colour job word");
+		assert!(
+			error
+				.to_string()
+				.contains("diverging colour is available on heatmap and bubble marks"),
 			"{error}"
 		);
 	}
@@ -4446,6 +4541,33 @@ r.views([bar(category(), "revenue")])
 					crate::plot::core::PlotType::FillBetween
 				);
 			}
+		}
+	}
+
+	#[test]
+	fn product_0148_test43_is_the_sorted_temporal_candlestick_and_containment_exhibit() {
+		let source = include_str!("../../../uat/test43.rn");
+		let compiled = compile(source).expect("the checked-in candlestick exhibit compiles");
+		assert_eq!(compiled.executions.len(), 2);
+		assert_eq!(compiled.presentation_order.len(), 2);
+		assert_eq!(source.matches(".sort([asc(col(\"stamp\"))])").count(), 2);
+		assert_eq!(
+			source
+				.matches("candlestick(\"stamp\", \"open\", \"high\", \"low\", \"close\")")
+				.count(),
+			2
+		);
+		for execution in &compiled.executions {
+			let RuneViewIntent::Plot(plot) = &execution.views[0].intent else {
+				panic!("candlestick exhibit produced a table")
+			};
+			let RunePlotBody::Single(sink) = &plot.body else {
+				panic!("candlestick exhibit produced a styled or layered sink")
+			};
+			assert_eq!(
+				sink.composition.primary_plot_type(),
+				crate::plot::core::PlotType::Candlestick
+			);
 		}
 	}
 

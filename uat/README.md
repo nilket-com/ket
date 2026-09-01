@@ -127,6 +127,21 @@ disturbing either healthy view. Both relations author an ascending sort before
 plotting: Toron table scans have no row-order contract, while fill-between
 deliberately treats strictly increasing x as an authored data requirement.
 
+Seed the PRODUCT-0148 OHLC relations, then open the authored candlestick
+exhibit:
+
+```sh
+nilket toron sql --file uat/candlestick_probe.sql
+cargo run -p polariton -- uat/test43.rn
+```
+
+`candlestick_probe` authors an ascending timestamp sort and shows rising,
+falling, and doji geometry across a visible weekend gap. The torn companion
+refuses at row 2 on the `"high"` argument without disturbing the healthy view.
+The render gate is discharged only by driving this file through the live
+application and capturing the resulting candles; compilation alone is not the
+visual proof.
+
 Open the semantic temporal-tick exhibit with its DATE seed:
 
 ```sh

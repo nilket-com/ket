@@ -74,6 +74,7 @@ pub(crate) enum HandlerId {
 	Heatmap,
 	Hexbin,
 	FillBetween,
+	Candlestick,
 	Funnel,
 	RadialDial,
 	Pie,
@@ -287,6 +288,16 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		FREE,
 		NONE,
 		"Construct a fill-between mark."
+	),
+	callable!(
+		"candlestick",
+		Free,
+		5..=5,
+		Text,
+		Candlestick,
+		FREE,
+		NONE,
+		"Construct a candlestick mark."
 	),
 	callable!(
 		"funnel",
@@ -977,6 +988,7 @@ const ALL_MARKS: &[PlotType] = &[
 	PlotType::Bubble,
 	PlotType::Funnel,
 	PlotType::FillBetween,
+	PlotType::Candlestick,
 	PlotType::Heatmap,
 	PlotType::Hexbin,
 	PlotType::Histogram,
@@ -2287,6 +2299,41 @@ mod tests {
 			assert!(
 				fill_between.contains(&present),
 				"fill-between omitted {present:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0148_candlestick_inspector_is_exactly_hexbin() {
+		let settings = PlotSettings::default();
+		let resolved = settings.resolve();
+		let keys = |plot_type| {
+			inspector_rows(&settings, &resolved, Some(plot_type), None)
+				.into_iter()
+				.map(|row| row.key)
+				.collect::<HashSet<_>>()
+		};
+		let candlestick = keys(PlotType::Candlestick);
+		assert_eq!(candlestick, keys(PlotType::Hexbin));
+		for absent in [
+			SettingKey::PointSize,
+			SettingKey::StrokeWidth,
+			SettingKey::BarWidth,
+			SettingKey::CategoryGap,
+			SettingKey::Stacked,
+			SettingKey::Percent,
+			SettingKey::Diverging,
+			SettingKey::DivergingAt,
+		] {
+			assert!(
+				!candlestick.contains(&absent),
+				"candlestick exposed {absent:?}"
+			);
+		}
+		for present in [SettingKey::XAxisBounds, SettingKey::YAxisBounds] {
+			assert!(
+				candlestick.contains(&present),
+				"candlestick omitted {present:?}"
 			);
 		}
 	}

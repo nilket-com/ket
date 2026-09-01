@@ -1,0 +1,20 @@
+// PRODUCT-0148: authored temporal candlesticks and a high-containment refusal.
+let sessions = workspace
+	.table("candlestick_probe")
+	.sort([asc(col("stamp"))]);
+sessions.views([
+	view("ohlc-sessions", figure([
+		title("Candlestick · sessions with an honest weekend"),
+		candlestick("stamp", "open", "high", "low", "close"),
+	])),
+]);
+
+let broken = workspace
+	.table("candlestick_probe_torn")
+	.sort([asc(col("stamp"))]);
+broken.views([
+	view("containment-refusal", figure([
+		title("Candlestick · torn containment refuses"),
+		candlestick("stamp", "open", "high", "low", "close"),
+	])),
+]);

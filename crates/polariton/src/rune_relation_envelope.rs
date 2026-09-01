@@ -14,8 +14,8 @@ use crate::plot::core::PlotType;
 #[cfg(test)]
 use crate::plot::spec::{BarWidth, CategoryGap, PointSize, StrokeWidth};
 use crate::plot::spec::{
-	BoxPlotFields, BubbleFields, BubblePreparationChannel, FillBetweenFields, HeatmapFields,
-	HexbinFields, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, MarkFields,
+	BoxPlotFields, BubbleFields, BubblePreparationChannel, CandlestickFields, FillBetweenFields,
+	HeatmapFields, HexbinFields, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, MarkFields,
 	MultivariateFields, Override, PieFields, Presence, ViolinFields,
 };
 use crate::plot::theme::PlotSettingsLayer;
@@ -164,6 +164,7 @@ impl StyledRunePlotSink {
 			| PlotType::Heatmap
 			| PlotType::Hexbin
 			| PlotType::FillBetween
+			| PlotType::Candlestick
 			| PlotType::Bubble
 			| PlotType::Funnel
 			| PlotType::RadialDial
@@ -260,6 +261,7 @@ impl RuneViewIntent {
 						PlotType::Heatmap => "plot.heatmap".to_owned(),
 						PlotType::Hexbin => "plot.hexbin".to_owned(),
 						PlotType::FillBetween => "plot.fill_between".to_owned(),
+						PlotType::Candlestick => "plot.candlestick".to_owned(),
 						PlotType::Bubble => "plot.bubble".to_owned(),
 						PlotType::Funnel => "plot.funnel".to_owned(),
 						PlotType::RadialDial => "plot.radial_dial".to_owned(),
@@ -282,6 +284,7 @@ impl RuneViewIntent {
 							PlotType::Heatmap => "plot.heatmap".to_owned(),
 							PlotType::Hexbin => "plot.hexbin".to_owned(),
 							PlotType::FillBetween => "plot.fill_between".to_owned(),
+							PlotType::Candlestick => "plot.candlestick".to_owned(),
 							PlotType::Bubble => "plot.bubble".to_owned(),
 							PlotType::Pie => "plot.pie".to_owned(),
 							other => {
@@ -398,6 +401,31 @@ impl FillBetweenFieldOrigins {
 			FillBetweenRole::Lower => Some(self.lower.clone()),
 			FillBetweenRole::Upper => Some(self.upper.clone()),
 			FillBetweenRole::Middle => self.middle.clone(),
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CandlestickFieldOrigins {
+	pub(crate) x: Range<u32>,
+	pub(crate) open: Range<u32>,
+	pub(crate) high: Range<u32>,
+	pub(crate) low: Range<u32>,
+	pub(crate) close: Range<u32>,
+}
+
+impl CandlestickFieldOrigins {
+	pub(crate) fn for_role(
+		&self,
+		role: crate::plot::kernels::candlestick::CandlestickRole,
+	) -> Range<u32> {
+		use crate::plot::kernels::candlestick::CandlestickRole;
+		match role {
+			CandlestickRole::X => self.x.clone(),
+			CandlestickRole::Open => self.open.clone(),
+			CandlestickRole::High => self.high.clone(),
+			CandlestickRole::Low => self.low.clone(),
+			CandlestickRole::Close => self.close.clone(),
 		}
 	}
 }
@@ -522,6 +550,10 @@ pub(crate) enum SpannedMarkFields {
 		fields: FillBetweenFields,
 		origins: FillBetweenFieldOrigins,
 	},
+	Candlestick {
+		fields: CandlestickFields,
+		origins: CandlestickFieldOrigins,
+	},
 	Bubble {
 		fields: BubbleFields,
 		origins: BubbleFieldOrigins,
@@ -559,6 +591,7 @@ impl SpannedMarkFields {
 			Self::Heatmap { fields, .. } => MarkFields::Heatmap(fields.clone()),
 			Self::Hexbin { fields, .. } => MarkFields::Hexbin(fields.clone()),
 			Self::FillBetween { fields, .. } => MarkFields::FillBetween(fields.clone()),
+			Self::Candlestick { fields, .. } => MarkFields::Candlestick(fields.clone()),
 			Self::Bubble { fields, .. } => MarkFields::Bubble(fields.clone()),
 			Self::Funnel { fields, .. } => MarkFields::Funnel(fields.clone()),
 			Self::RadialDial { fields, .. } => MarkFields::RadialDial(fields.clone()),
@@ -593,6 +626,13 @@ impl SpannedMarkFields {
 	pub(crate) fn fill_between(&self) -> Option<(&FillBetweenFields, &FillBetweenFieldOrigins)> {
 		match self {
 			Self::FillBetween { fields, origins } => Some((fields, origins)),
+			_ => None,
+		}
+	}
+
+	pub(crate) fn candlestick(&self) -> Option<(&CandlestickFields, &CandlestickFieldOrigins)> {
+		match self {
+			Self::Candlestick { fields, origins } => Some((fields, origins)),
 			_ => None,
 		}
 	}
@@ -659,6 +699,9 @@ impl SpannedMarkFields {
 				left == right
 			}
 			(Self::FillBetween { fields: left, .. }, Self::FillBetween { fields: right, .. }) => {
+				left == right
+			}
+			(Self::Candlestick { fields: left, .. }, Self::Candlestick { fields: right, .. }) => {
 				left == right
 			}
 			(Self::Bubble { fields: left, .. }, Self::Bubble { fields: right, .. }) => {
@@ -1133,6 +1176,42 @@ mod tests {
 		assert!(styled.clone().into_layer().is_err());
 		let intent = RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::StyledSingle(styled)));
 		assert_eq!(intent.presentation().display_label, "plot.fill_between");
+	}
+
+	#[test]
+	fn product_0148_direct_styled_candlestick_is_defensively_labelled_and_refuses_layering() {
+		let styled = StyledRunePlotSink {
+			sink: DisposableRunePlotSink {
+				composition: PlotComposition::single(PlotType::Candlestick),
+				x: "stamp".to_owned(),
+				y: "open".to_owned(),
+				category: None,
+				interval_end: None,
+				mark_fields: Some(SpannedMarkFields::Candlestick {
+					fields: CandlestickFields {
+						x: "stamp".to_owned(),
+						open: "open".to_owned(),
+						high: "high".to_owned(),
+						low: "low".to_owned(),
+						close: "close".to_owned(),
+					},
+					origins: CandlestickFieldOrigins {
+						x: 12..19,
+						open: 21..27,
+						high: 29..35,
+						low: 37..42,
+						close: 44..51,
+					},
+				}),
+				origin: 0..52,
+			},
+			settings: LayerSettings::default(),
+			stacked: false,
+			percent: false,
+		};
+		assert!(styled.clone().into_layer().is_err());
+		let intent = RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::StyledSingle(styled)));
+		assert_eq!(intent.presentation().display_label, "plot.candlestick");
 	}
 
 	#[derive(Clone, Debug, PartialEq)]
@@ -2947,6 +3026,23 @@ let mid = "mid";
 				product_0058_only_intent(&bound)
 			);
 		}
+	}
+
+	#[test]
+	fn product_0148_bound_candlestick_fields_equal_inline() {
+		let inline = "workspace.table(\"t\").views([candlestick(\"stamp\", \"open\", \"high\", \"low\", \"close\")])";
+		let bound = r#"
+let x = "stamp";
+let open = "open";
+let high = "high";
+let low = "low";
+let close = "close";
+workspace.table("t").views([candlestick(x, open, high, low, close)])
+"#;
+		assert_eq!(
+			product_0058_only_intent(inline),
+			product_0058_only_intent(bound)
+		);
 	}
 
 	#[test]

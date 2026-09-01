@@ -317,6 +317,26 @@ middle means band-only rather than a synthetic baseline. Fill-between has no
 relation sugar, colour job, legend, stroke-width control, or `layers([...])`
 admission.
 
+#### Rune candlestick presentation:
+
+Candlestick accepts quantitative or temporal x followed by quantitative OHLC
+fields in their conventional order:
+
+```rune
+workspace.table("sessions")
+    .sort([asc(col("stamp"))])
+    .views([
+    candlestick("stamp", "open", "high", "low", "close"),
+])
+```
+
+Rows stay in producer order and x must increase strictly, so unordered relation
+sources must author a sort. Rising bodies are hollow, falling bodies are filled,
+and unchanged sessions draw a doji dash; direction is geometry rather than a
+colour channel. Weekend and other temporal gaps remain honest. Candle and
+stroke widths are derived by the renderer, and candlestick has no relation
+sugar, legend, categorical identity, or `layers([...])` admission.
+
 #### Adapters:
  - SQLite (file or memory)
  - Parquet (single file)
@@ -333,5 +353,4 @@ admission.
  - Run selected code, not the entire code editor.
  - Password protection.
  - More data sources (Postgres, MySQL, BigQuery, Redshift, ad inf...)
- - Scatter / Line / Bar plots
  - Qwen Coder SQL generator

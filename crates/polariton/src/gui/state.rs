@@ -1600,6 +1600,9 @@ fn authored_rune_plot_spec(sink: &DisposableRunePlotSink) -> AuthoredPlotSpec {
 			crate::plot::spec::MarkFields::FillBetween(fields) => {
 				AuthoredPlotSpec::fill_between(fields)
 			}
+			crate::plot::spec::MarkFields::Candlestick(fields) => {
+				AuthoredPlotSpec::candlestick(fields)
+			}
 			crate::plot::spec::MarkFields::Bubble(fields) => AuthoredPlotSpec::bubble(fields),
 			crate::plot::spec::MarkFields::Funnel(fields) => AuthoredPlotSpec::funnel(fields),
 			crate::plot::spec::MarkFields::RadialDial(fields) => {
@@ -1779,6 +1782,37 @@ fn fill_between_failure_span(
 		Err(error) => origins
 			.for_role(error.role())
 			.unwrap_or_else(|| mark.clone()),
+		Ok(_) => mark.clone(),
+	}
+}
+
+#[cfg(feature = "toron")]
+fn candlestick_failure_span(
+	data: &DataFrame,
+	fields: &crate::plot::spec::CandlestickFields,
+	origins: &crate::rune_relation_envelope::CandlestickFieldOrigins,
+	mark: &std::ops::Range<u32>,
+) -> std::ops::Range<u32> {
+	let authored = AuthoredPlotSpec::candlestick(fields.clone());
+	if let Err(error) = resolve_channels(&authored, data.schema().as_ref()) {
+		return match error.attribution {
+			crate::plot::spec::FieldAttribution::Channel(Channel::X) => origins.x.clone(),
+			crate::plot::spec::FieldAttribution::Channel(Channel::Y) => origins.open.clone(),
+			crate::plot::spec::FieldAttribution::Role("high") => origins.high.clone(),
+			crate::plot::spec::FieldAttribution::Role("low") => origins.low.clone(),
+			crate::plot::spec::FieldAttribution::Role("close") => origins.close.clone(),
+			_ => mark.clone(),
+		};
+	}
+	match crate::plot::kernels::candlestick::prepare_candlestick_data(
+		data,
+		&fields.x,
+		&fields.open,
+		&fields.high,
+		&fields.low,
+		&fields.close,
+	) {
+		Err(error) => origins.for_role(error.role()),
 		Ok(_) => mark.clone(),
 	}
 }
@@ -2773,6 +2807,10 @@ fn rune_view_outcome_with_palettes(
 				let (fields, origins) = sink.mark_fields.as_ref()?.fill_between()?;
 				Some((fields.clone(), origins.clone(), sink.origin.clone()))
 			});
+			let candlestick_diagnostic = diagnostic_sink.and_then(|sink| {
+				let (fields, origins) = sink.mark_fields.as_ref()?.candlestick()?;
+				Some((fields.clone(), origins.clone(), sink.origin.clone()))
+			});
 			let bubble_diagnostic = diagnostic_sink.and_then(|sink| {
 				let (fields, origins) = sink.mark_fields.as_ref()?.bubble()?;
 				Some((fields.clone(), origins.clone(), sink.origin.clone()))
@@ -3189,6 +3227,13 @@ fn rune_view_outcome_with_palettes(
 						fill_between_failure_span(frame.as_ref(), fields, origins, mark)
 					})
 			});
+			let candlestick_output_span = output.as_ref().err().and_then(|_| {
+				candlestick_diagnostic
+					.as_ref()
+					.map(|(fields, origins, mark)| {
+						candlestick_failure_span(frame.as_ref(), fields, origins, mark)
+					})
+			});
 			let bubble_output_span = output.as_ref().err().and_then(|_| {
 				bubble_diagnostic.as_ref().map(|(fields, origins, mark)| {
 					bubble_failure_span(frame.as_ref(), fields, origins, mark)
@@ -3232,6 +3277,7 @@ fn rune_view_outcome_with_palettes(
 					.or(heatmap_output_span)
 					.or(hexbin_output_span)
 					.or(fill_between_output_span)
+					.or(candlestick_output_span)
 					.or(bubble_output_span)
 					.or(funnel_output_span)
 					.or(radial_dial_output_span)
@@ -12679,6 +12725,128 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
+	fn product_0148_candlestick_attributes_resolution_preparation_and_structure() {
+		use polars::frame::DataFrame;
+		let source = r#"workspace.table("candlestick_probe").views([candlestick("x", "open", "high", "low", "close")])"#;
+		let complete = |frame: DataFrame| {
+			let relation = transform_rune_view(source)
+				.expect("candlestick source compiles")
+				.into_relations()
+				.next()
+				.unwrap();
+			rune_view_outcome(frame, relation.views)
+		};
+		let valid = polars::df!(
+			"x" => [1.0_f64, 2.0],
+			"open" => [10.0_f64, 11.0],
+			"high" => [12.0_f64, 13.0],
+			"low" => [9.0_f64, 10.0],
+			"close" => [11.0_f64, 12.0],
+		)
+		.unwrap();
+		let outcome = complete(valid.clone());
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _, continuation)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("valid authored candlestick must resolve")
+		};
+		assert!(matches!(
+			resolved.resolved_spec.kernel_fields.as_ref(),
+			crate::plot::spec::ResolvedKernelFields::Candlestick { x, open, high, low, close }
+				if x == "x" && open == "open" && high == "high" && low == "low" && close == "close"
+		));
+		assert_eq!(resolved.resolved_spec.color_job, None);
+		assert!(
+			continuation
+				.identity
+				.persistence_snapshot()
+				.assignments
+				.is_empty()
+		);
+
+		let assert_span = |frame: DataFrame, expected: &str, fragment: &str| {
+			let outcome = complete(frame);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("invalid candlestick rendered")
+			};
+			assert!(error.contains(fragment), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert_eq!(&source[span.start as usize..span.end as usize], expected);
+		};
+		assert_span(
+			polars::df!(
+				"x" => [1.0], "open" => [10.0], "low" => [9.0], "close" => [11.0]
+			)
+			.unwrap(),
+			"\"high\"",
+			"absent",
+		);
+		assert_span(
+			polars::df!(
+				"x" => [1.0], "open" => [10.0], "high" => [12.0], "low" => [9.0],
+				"close" => [None::<f64>]
+			)
+			.unwrap(),
+			"\"close\"",
+			"null at row 1",
+		);
+		assert_span(
+			polars::df!(
+				"x" => [2.0, 1.0], "open" => [10.0, 10.0], "high" => [12.0, 12.0],
+				"low" => [9.0, 9.0], "close" => [11.0, 11.0]
+			)
+			.unwrap(),
+			"\"x\"",
+			"must increase strictly",
+		);
+		assert_span(
+			polars::df!(
+				"x" => [1.0], "open" => [10.0], "high" => [12.0], "low" => [11.0],
+				"close" => [10.5]
+			)
+			.unwrap(),
+			"\"low\"",
+			"lower bound fails",
+		);
+		assert_span(
+			polars::df!(
+				"x" => [1.0], "open" => [10.0], "high" => [10.5], "low" => [9.0],
+				"close" => [11.0]
+			)
+			.unwrap(),
+			"\"high\"",
+			"upper bound fails",
+		);
+		for (field, expected) in [
+			("open", "\"open\""),
+			("high", "\"high\""),
+			("low", "\"low\""),
+			("close", "\"close\""),
+		] {
+			let temporal = polars::prelude::Column::new(field.into(), [1_i32])
+				.cast(&polars::prelude::DataType::Date)
+				.unwrap();
+			let mut columns = vec![
+				polars::prelude::Column::new("x".into(), [1.0_f64]),
+				polars::prelude::Column::new("open".into(), [10.0_f64]),
+				polars::prelude::Column::new("high".into(), [12.0_f64]),
+				polars::prelude::Column::new("low".into(), [9.0_f64]),
+				polars::prelude::Column::new("close".into(), [11.0_f64]),
+			];
+			let index = columns
+				.iter()
+				.position(|column| column.name().as_str() == field)
+				.unwrap();
+			columns[index] = temporal;
+			assert_span(
+				DataFrame::new(1, columns).unwrap(),
+				expected,
+				if field == "open" { "Temporal" } else { "Date" },
+			);
+		}
+	}
+
+	#[test]
 	fn product_0146_checked_in_probe_is_idempotent_and_crosses_at_row_two() {
 		let source = include_str!("../../../../uat/fill_between_probe.sql");
 		assert!(source.contains("DROP TABLE IF EXISTS fill_between_probe;"));
@@ -12696,6 +12864,32 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		assert!(matches!(
 			error,
 			crate::plot::kernels::fill_between::FillBetweenPreparationError::CrossedBand {
+				row: 2,
+				..
+			}
+		));
+	}
+
+	#[test]
+	fn product_0148_checked_in_probe_is_idempotent_and_tears_high_at_row_two() {
+		let source = include_str!("../../../../uat/candlestick_probe.sql");
+		assert!(source.contains("DROP TABLE IF EXISTS candlestick_probe;"));
+		assert!(source.contains("DROP TABLE IF EXISTS candlestick_probe_torn;"));
+		let torn = polars::df!(
+			"x" => [1.0_f64, 2.0, 3.0],
+			"open" => [100.0_f64, 104.0, 101.0],
+			"high" => [106.0_f64, 101.0, 105.0],
+			"low" => [98.0_f64, 96.0, 97.0],
+			"close" => [104.0_f64, 103.0, 101.0],
+		)
+		.unwrap();
+		let error = crate::plot::kernels::candlestick::prepare_candlestick_data(
+			&torn, "x", "open", "high", "low", "close",
+		)
+		.expect_err("probe's second row violates the high bound");
+		assert!(matches!(
+			error,
+			crate::plot::kernels::candlestick::CandlestickPreparationError::UpperBoundViolation {
 				row: 2,
 				..
 			}

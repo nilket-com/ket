@@ -715,6 +715,21 @@ impl FillBetweenFields {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandlestickFields {
+	pub x: String,
+	pub open: String,
+	pub high: String,
+	pub low: String,
+	pub close: String,
+}
+
+impl CandlestickFields {
+	pub fn all(&self) -> [&str; 5] {
+		[&self.x, &self.open, &self.high, &self.low, &self.close]
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunnelFields {
 	pub stage: String,
 	pub value: String,
@@ -778,6 +793,7 @@ pub enum MarkFields {
 	Heatmap(HeatmapFields),
 	Hexbin(HexbinFields),
 	FillBetween(FillBetweenFields),
+	Candlestick(CandlestickFields),
 	Bubble(BubbleFields),
 	Funnel(FunnelFields),
 	RadialDial(RadialDialFields),
@@ -824,6 +840,7 @@ impl MarkFields {
 			Self::Heatmap(_) => 3,
 			Self::Hexbin(_) => 2,
 			Self::FillBetween(fields) => 3 + usize::from(fields.middle.is_some()),
+			Self::Candlestick(_) => 5,
 			Self::Bubble(fields) => 4 + usize::from(fields.label.is_some()),
 			Self::Funnel(_) | Self::Pie(_) => 2,
 			Self::Violin(_) => 4,
@@ -840,6 +857,7 @@ impl MarkFields {
 			Self::Heatmap(fields) => fields.all().get(index).copied(),
 			Self::Hexbin(fields) => fields.all().get(index).copied(),
 			Self::FillBetween(fields) => fields.all().nth(index),
+			Self::Candlestick(fields) => fields.all().get(index).copied(),
 			Self::Bubble(fields) => match index {
 				0 => Some(fields.numeric.get(BubbleNumericField::X)),
 				1 => Some(fields.numeric.get(BubbleNumericField::Y)),
@@ -1028,6 +1046,23 @@ impl AuthoredPlotSpec {
 	pub fn fill_between_fields(&self) -> Option<&FillBetweenFields> {
 		match self.mark_fields.as_ref() {
 			Some(MarkFields::FillBetween(fields)) => Some(fields),
+			_ => None,
+		}
+	}
+
+	pub fn candlestick(fields: CandlestickFields) -> Self {
+		let mut spec = Self::xy(
+			PlotComposition::single(PlotType::Candlestick),
+			fields.x.clone(),
+			fields.open.clone(),
+		);
+		spec.mark_fields = Some(MarkFields::Candlestick(fields));
+		spec
+	}
+
+	pub fn candlestick_fields(&self) -> Option<&CandlestickFields> {
+		match self.mark_fields.as_ref() {
+			Some(MarkFields::Candlestick(fields)) => Some(fields),
 			_ => None,
 		}
 	}
@@ -2282,6 +2317,9 @@ pub fn resolve_channels(
 	if plot_type == PlotType::FillBetween && spec.fill_between_fields().is_some() {
 		return resolve_fill_between_channels(spec, schema);
 	}
+	if plot_type == PlotType::Candlestick && spec.candlestick_fields().is_some() {
+		return resolve_candlestick_channels(spec, schema);
+	}
 	if plot_type == PlotType::Bubble && spec.bubble_fields().is_some() {
 		return resolve_bubble_channels(spec, schema);
 	}
@@ -2808,6 +2846,79 @@ fn resolve_fill_between_channels(
 			lower: fields.lower.clone(),
 			upper: fields.upper.clone(),
 			middle: fields.middle.clone(),
+		}),
+		color_job: None,
+		continuous_anchor: spec.continuous_anchor,
+		categorical_limit: 0,
+		stack_normalization: StackNormalization::Absolute,
+	})
+}
+
+fn resolve_candlestick_channels(
+	spec: &AuthoredPlotSpec,
+	schema: &Schema,
+) -> Result<ChannelBinding, ChannelError> {
+	let fields = spec.candlestick_fields().ok_or_else(|| ChannelError {
+		attribution: FieldAttribution::Role("candlestick"),
+		field: "<candlestick>".to_owned(),
+		reason: "Candlestick requires explicit x, open, high, low, and close fields".to_owned(),
+	})?;
+	let layer = LayerIdentity {
+		ordinal: 0,
+		plot_type: PlotType::Candlestick,
+	};
+	let mut used_by_auto = HashSet::new();
+	let x = resolve_required(
+		Channel::X,
+		&spec.x,
+		PlotType::Candlestick,
+		&layer,
+		false,
+		schema,
+		&mut used_by_auto,
+	)?;
+	let open = resolve_required(
+		Channel::Y,
+		&spec.y,
+		PlotType::Candlestick,
+		&layer,
+		false,
+		schema,
+		&mut used_by_auto,
+	)?;
+	let validate_quantitative = |role: &'static str, field: &str| -> Result<(), ChannelError> {
+		let attribution = FieldAttribution::Role(role);
+		let dtype = schema.get(field).ok_or_else(|| ChannelError {
+			attribution,
+			field: field.to_owned(),
+			reason: format!("candlestick {role} field is absent from the returned schema"),
+		})?;
+		let semantic = semantic_type(dtype).ok_or_else(|| ChannelError {
+			attribution,
+			field: field.to_owned(),
+			reason: format!("dtype {dtype:?} has no supported semantic type"),
+		})?;
+		if semantic != SemanticType::Quantitative {
+			return Err(ChannelError {
+				attribution,
+				field: field.to_owned(),
+				reason: format!("candlestick {role} requires a quantitative dtype, got {dtype:?}"),
+			});
+		}
+		Ok(())
+	};
+	validate_quantitative("high", &fields.high)?;
+	validate_quantitative("low", &fields.low)?;
+	validate_quantitative("close", &fields.close)?;
+	Ok(ChannelBinding {
+		composition: spec.composition.clone(),
+		channels: vec![x, open],
+		kernel_fields: Box::new(ResolvedKernelFields::Candlestick {
+			x: fields.x.clone(),
+			open: fields.open.clone(),
+			high: fields.high.clone(),
+			low: fields.low.clone(),
+			close: fields.close.clone(),
 		}),
 		color_job: None,
 		continuous_anchor: spec.continuous_anchor,
@@ -4087,6 +4198,13 @@ fn semantic_is_compatible(plot_type: PlotType, channel: Channel, semantic: Seman
 			)
 		}
 		(PlotType::FillBetween, Channel::Y) => semantic == SemanticType::Quantitative,
+		(PlotType::Candlestick, Channel::X) => {
+			matches!(
+				semantic,
+				SemanticType::Quantitative | SemanticType::Temporal
+			)
+		}
+		(PlotType::Candlestick, Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::Bubble, Channel::X | Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::Funnel, Channel::X) => semantic == SemanticType::Nominal,
 		(PlotType::Funnel, Channel::Y) => semantic == SemanticType::Quantitative,
@@ -4989,6 +5107,79 @@ mod tests {
 			.expect_err("temporal middle refuses at authored resolution");
 		assert_eq!(error.attribution, FieldAttribution::Role("middle"));
 		assert_eq!(error.field, "stamp");
+	}
+
+	#[test]
+	fn product_0148_authored_candlestick_resolves_temporal_x_and_attributes_ohlc_roles() {
+		let stamp = Column::new("stamp".into(), [1_i64, 2_i64])
+			.cast(&DataType::Datetime(
+				polars::prelude::TimeUnit::Nanoseconds,
+				polars::prelude::TimeZone::opt_try_new(Some("UTC")).unwrap(),
+			))
+			.unwrap();
+		let frame = DataFrame::new(
+			2,
+			vec![
+				stamp,
+				Column::new("open".into(), [10.0_f64, 11.0]),
+				Column::new("high".into(), [12.0_f64, 13.0]),
+				Column::new("low".into(), [9.0_f64, 10.0]),
+				Column::new("close".into(), [11.0_f64, 12.0]),
+				Column::new("nominal".into(), ["a", "b"]),
+			],
+		)
+		.unwrap();
+		let fields = CandlestickFields {
+			x: "stamp".to_owned(),
+			open: "open".to_owned(),
+			high: "high".to_owned(),
+			low: "low".to_owned(),
+			close: "close".to_owned(),
+		};
+		let resolved = resolve_channels(
+			&AuthoredPlotSpec::candlestick(fields.clone()),
+			frame.schema().as_ref(),
+		)
+		.unwrap();
+		assert_eq!(resolved.color_job, None);
+		assert!(matches!(
+			resolved.kernel_fields.as_ref(),
+			ResolvedKernelFields::Candlestick { x, open, high, low, close }
+				if x == "stamp" && open == "open" && high == "high" && low == "low" && close == "close"
+		));
+
+		let mut nominal_x = fields.clone();
+		nominal_x.x = "nominal".to_owned();
+		let error = resolve_channels(
+			&AuthoredPlotSpec::candlestick(nominal_x),
+			frame.schema().as_ref(),
+		)
+		.expect_err("nominal x refuses");
+		assert_eq!(error.attribution, FieldAttribution::Channel(Channel::X));
+		for (role, mutate) in [("open", 0_usize), ("high", 1), ("low", 2), ("close", 3)] {
+			let mut invalid = fields.clone();
+			match mutate {
+				0 => invalid.open = "stamp".to_owned(),
+				1 => invalid.high = "stamp".to_owned(),
+				2 => invalid.low = "stamp".to_owned(),
+				3 => invalid.close = "stamp".to_owned(),
+				_ => unreachable!(),
+			}
+			let error = resolve_channels(
+				&AuthoredPlotSpec::candlestick(invalid),
+				frame.schema().as_ref(),
+			)
+			.expect_err("temporal OHLC role refuses at authored resolution");
+			assert_eq!(
+				error.attribution,
+				if role == "open" {
+					FieldAttribution::Channel(Channel::Y)
+				} else {
+					FieldAttribution::Role(role)
+				}
+			);
+			assert_eq!(error.field, "stamp");
+		}
 	}
 
 	#[test]
