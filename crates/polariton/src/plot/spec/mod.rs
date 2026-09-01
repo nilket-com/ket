@@ -3837,13 +3837,31 @@ fn resolve_automatic_kernel_fields(
 			value: number(0, "value")?,
 			maximum: number(1, "maximum")?,
 		},
-		PlotType::Candlestick => ResolvedKernelFields::Candlestick {
-			x: category(0, "x")?,
-			open: number(0, "open")?,
-			high: number(1, "high")?,
-			low: number(2, "low")?,
-			close: number(3, "close")?,
-		},
+		PlotType::Candlestick => {
+			let x = number(0, "x")?;
+			let quantitative = schema
+				.iter()
+				.filter(|(name, dtype)| dtype.is_numeric() && name.as_str() != x)
+				.map(|(name, _)| name.as_str().to_owned())
+				.collect::<Vec<_>>();
+			let required = |index: usize, role: &str| {
+				quantitative.get(index).cloned().ok_or_else(|| ChannelError {
+					attribution: FieldAttribution::Channel(Channel::Y),
+					field: format!("<{role}>"),
+					reason: format!(
+						"{plot_type} requires quantitative field {} for {role}",
+						index + 1
+					),
+				})
+			};
+			ResolvedKernelFields::Candlestick {
+				x,
+				open: required(0, "open")?,
+				high: required(1, "high")?,
+				low: required(2, "low")?,
+				close: required(3, "close")?,
+			}
+		}
 		PlotType::Funnel => ResolvedKernelFields::Funnel {
 			stage: optional_category(0),
 			value: number(0, "value")?,
@@ -4858,6 +4876,58 @@ mod tests {
 				lower: "lower".to_owned(),
 				upper: "upper".to_owned(),
 				middle: Some("middle".to_owned()),
+			}
+		);
+	}
+
+	#[test]
+	fn product_0147_automatic_candlestick_consumes_each_quantitative_field_once() {
+		let frame = df!(
+			"x" => [1.0_f64, 2.0],
+			"open" => [10.0_f64, 11.0],
+			"high" => [12.0_f64, 13.0],
+			"low" => [9.0_f64, 10.0],
+			"close" => [11.0_f64, 12.0],
+		)
+		.unwrap();
+		assert_eq!(
+			resolve_automatic_kernel_fields(PlotType::Candlestick, frame.schema().as_ref())
+				.unwrap(),
+			ResolvedKernelFields::Candlestick {
+				x: "x".to_owned(),
+				open: "open".to_owned(),
+				high: "high".to_owned(),
+				low: "low".to_owned(),
+				close: "close".to_owned(),
+			}
+		);
+	}
+
+	#[test]
+	fn product_0147_automatic_candlestick_admits_temporal_x_without_reusing_it() {
+		let temporal = Column::new("when".into(), [1_i32, 2_i32])
+			.cast(&DataType::Date)
+			.unwrap();
+		let frame = DataFrame::new(
+			2,
+			vec![
+				temporal,
+				Column::new("open".into(), [10.0_f64, 11.0]),
+				Column::new("high".into(), [12.0_f64, 13.0]),
+				Column::new("low".into(), [9.0_f64, 10.0]),
+				Column::new("close".into(), [11.0_f64, 12.0]),
+			],
+		)
+		.unwrap();
+		assert_eq!(
+			resolve_automatic_kernel_fields(PlotType::Candlestick, frame.schema().as_ref())
+				.unwrap(),
+			ResolvedKernelFields::Candlestick {
+				x: "when".to_owned(),
+				open: "open".to_owned(),
+				high: "high".to_owned(),
+				low: "low".to_owned(),
+				close: "close".to_owned(),
 			}
 		);
 	}

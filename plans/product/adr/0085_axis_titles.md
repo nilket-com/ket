@@ -59,10 +59,10 @@ Two corrections this makes to the earlier draft:
   resolved `Hide`. There is deliberately no *authored* hiding surface (§9), so
   `Hide` reaches the cascade from a non-authored tier.
 - **The third step is the *kernel fallback*, not "the source field".** It is
-  usually a column name, but not always: `CandlestickPlotKernel` supplies the
-  literal `"Value"` at both of its production sites
-  (`kernels/candlestick.rs:188`, `:303`). Calling the step a source field would
-  misdescribe it. (An earlier draft also cited `histogram.rs:282`; that is
+  usually one column name, but not always: PRODUCT-0147 replaces
+  `CandlestickPlotKernel`'s former literal `"Value"` with the joined field-name
+  fallback `"open / high / low / close"`. Calling the step a source field would
+  still misdescribe it. (An earlier draft also cited `histogram.rs:282`; that is
   test-only — production histogram preparation sets `y_label: count.to_owned()`
   at `:179`, which *is* a column name.)
 

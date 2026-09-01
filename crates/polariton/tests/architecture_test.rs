@@ -5701,3 +5701,99 @@ fn product_0146_fill_between_surface_has_one_transport_and_no_colour_or_layer_wi
 			.contains("PlotType::FillBetween")
 	);
 }
+
+#[test]
+fn product_0147_candlestick_substrate_has_one_validated_geometric_colour_authority() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let candle = std::fs::read_to_string(root.join("plot/kernels/candlestick.rs"))
+		.expect("read candlestick kernel");
+	let production = candle
+		.split("#[cfg(test)]")
+		.next()
+		.expect("candlestick production");
+	assert!(production.contains("Result<CandlestickPreparedData, CandlestickPreparationError>"));
+	assert!(production.contains("OrderedX::Temporal"));
+	assert!(production.contains("partition_point"));
+	assert!(production.contains("next_down()"));
+	assert!(production.contains("next_up()"));
+	assert!(production.contains("transform.bounds.width * BODY_WIDTH_FRACTION"));
+	assert!(production.contains("settings.mark_style.fill.iced()"));
+	assert!(production.contains("settings.mark_style.decoration.iced()"));
+	assert!(production.contains("Direction::Unchanged"));
+	assert!(!production.contains("get_color"));
+	assert!(!production.contains("category(0, \"x\")"));
+
+	let request = std::fs::read_to_string(root.join("plot/request.rs")).expect("read request");
+	let validation = request
+		.split("ResolvedKernelFields::Candlestick")
+		.nth(1)
+		.expect("candlestick planning branch")
+		.split("ResolvedKernelFields::Histogram")
+		.next()
+		.expect("bounded candlestick planning branch");
+	assert!(validation.contains("prepare_candlestick_data"));
+
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read factory");
+	let branch = factory
+		.split("ResolvedKernelFields::Candlestick")
+		.nth(1)
+		.expect("candlestick factory branch")
+		.split("ResolvedKernelFields::Funnel")
+		.next()
+		.expect("bounded candlestick factory branch");
+	assert!(branch.contains("PRODUCT-0147 planning validated candlestick preparation"));
+
+	let oracle = std::fs::read_to_string(root.join("plot/mark_style_oracles.rs"))
+		.expect("read mark-style oracle");
+	let candle_bank = oracle
+		.split("let candlestick =")
+		.nth(1)
+		.expect("candlestick operation bank")
+		.split("let funnel_frame")
+		.next()
+		.expect("bounded candlestick operation bank");
+	assert!(candle_bank.contains("mark_style.decoration"));
+	assert!(candle_bank.contains("mark_style.fill"));
+	assert!(!candle_bank.contains("color_theme.get_color"));
+}
+
+#[test]
+fn product_0147_repairs_automatic_candlestick_without_granting_a_surface() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let automatic = spec
+		.split("PlotType::Candlestick => {")
+		.nth(1)
+		.expect("automatic candlestick arm")
+		.split("PlotType::Funnel")
+		.next()
+		.expect("bounded automatic candlestick arm");
+	assert!(automatic.contains("let x = number(0, \"x\")?"));
+	assert!(automatic.contains("name.as_str() != x"));
+	assert!(automatic.contains("open: required(0, \"open\")?"));
+	assert!(automatic.contains("close: required(3, \"close\")?"));
+	assert!(!automatic.contains("category(0, \"x\")"));
+
+	let registry = presentation_registry(&root);
+	assert!(registry_callable(&registry, "candlestick", "Free", "Candlestick").is_none());
+	let mark_fields = spec
+		.split("pub enum MarkFields")
+		.nth(1)
+		.expect("MarkFields declaration")
+		.split("pub struct AuthoredPlotSpec")
+		.next()
+		.expect("bounded MarkFields");
+	assert!(!mark_fields.contains("Candlestick"));
+	assert!(!spec.contains("pub fn candlestick"));
+
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune relation envelope");
+	let spanned = envelope
+		.split("pub(crate) enum SpannedMarkFields")
+		.nth(1)
+		.expect("SpannedMarkFields declaration")
+		.split("impl SpannedMarkFields")
+		.next()
+		.expect("bounded SpannedMarkFields");
+	assert!(!spanned.contains("Candlestick"));
+}

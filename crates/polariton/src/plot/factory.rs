@@ -240,7 +240,8 @@ fn create_plot_with_source_token(
 			low,
 			close,
 		} => {
-			let prepared = candlestick::prepare_candlestick_data(df, x, open, high, low, close);
+			let prepared = candlestick::prepare_candlestick_data(df, x, open, high, low, close)
+				.expect("PRODUCT-0147 planning validated candlestick preparation");
 			Arc::new(CandlestickPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})

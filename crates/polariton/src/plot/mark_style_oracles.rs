@@ -191,20 +191,17 @@ fn product_0080_0082_0083_default_operation_bank_tracks_the_box_role_split() {
 			x_range: (0.0, 1.0),
 			y_range: (0.0, 5.0),
 			x_axis_type: AxisType::Linear,
-			y_axis_type: AxisType::Linear,
 			x_temporal_domain: None,
-			y_temporal_domain: None,
 			x_label: String::new(),
-			y_label: String::new(),
+			y_label: "open / high / low / close".to_owned(),
+			minimum_x_delta: None,
 		}),
 	};
-	let bullish = settings.color_theme.get_color(1.0);
 	assert_eq!(
 		render(&candlestick),
 		vec![
-			BankOperation::Stroke(bullish, 3.0_f32.to_bits()),
-			BankOperation::FillRectangle(bullish),
-			BankOperation::Stroke(ink, 2.0_f32.to_bits()),
+			BankOperation::Stroke(settings.mark_style.decoration.iced(), 3.0_f32.to_bits()),
+			BankOperation::Stroke(settings.mark_style.fill.iced(), 1.0_f32.to_bits()),
 		]
 	);
 

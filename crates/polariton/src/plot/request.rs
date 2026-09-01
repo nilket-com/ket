@@ -206,6 +206,19 @@ fn validate_prepared_contract(
 		)
 		.map_err(|error| error.to_string())?;
 	}
+	if let crate::plot::spec::ResolvedKernelFields::Candlestick {
+		x,
+		open,
+		high,
+		low,
+		close,
+	} = spec.kernel_fields.as_ref()
+	{
+		crate::plot::kernels::candlestick::prepare_candlestick_data(
+			data, x, open, high, low, close,
+		)
+		.map_err(|error| error.to_string())?;
+	}
 	if let crate::plot::spec::ResolvedKernelFields::Histogram {
 		bin_start,
 		bin_end,
@@ -491,6 +504,54 @@ mod tests {
 			300,
 		);
 		assert_eq!(kernel.y_label(), "lower / upper");
+	}
+
+	#[test]
+	fn product_0147_planning_validates_candlestick_before_factory_reconstruction() {
+		let malformed = polars::df!(
+			"x" => [2.0_f64, 1.0],
+			"open" => [10.0_f64, 11.0],
+			"high" => [12.0_f64, 13.0],
+			"low" => [9.0_f64, 10.0],
+			"close" => [Some(11.0_f64), None],
+		)
+		.unwrap();
+		let error = plan(PlotRequest {
+			source: materialized("malformed candlestick", malformed),
+			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(
+				PlotType::Candlestick,
+			)),
+		})
+		.expect_err("planning surfaces candlestick preparation errors");
+		assert!(
+			error.contains(
+				"malformed candlestick: candlestick close field `close` is null at row 2"
+			),
+			"{error}"
+		);
+
+		let valid = polars::df!(
+			"x" => [1.0_f64, 2.0],
+			"open" => [10.0_f64, 11.0],
+			"high" => [12.0_f64, 13.0],
+			"low" => [9.0_f64, 10.0],
+			"close" => [11.0_f64, 12.0],
+		)
+		.unwrap();
+		let resolved = plan(PlotRequest {
+			source: materialized("valid candlestick", valid),
+			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(
+				PlotType::Candlestick,
+			)),
+		})
+		.expect("planning approves candlestick preparation");
+		let kernel = crate::plot::factory::create_plot(
+			&resolved.resolved_spec,
+			resolved.data.as_ref(),
+			400,
+			300,
+		);
+		assert_eq!(kernel.y_label(), "open / high / low / close");
 	}
 
 	#[test]
@@ -927,6 +988,16 @@ mod tests {
 				"fill_between",
 				polars::df!("x" => [1.0, 2.0], "low" => [0.0, 1.0], "high" => [2.0, 3.0]).unwrap(),
 				PlotType::FillBetween,
+			),
+			(
+				"candlestick",
+				polars::df!(
+					"x" => [1.0, 2.0], "open" => [10.0, 11.0],
+					"high" => [12.0, 13.0], "low" => [9.0, 10.0],
+					"close" => [11.0, 12.0]
+				)
+				.unwrap(),
+				PlotType::Candlestick,
 			),
 		];
 		for (name, frame, plot_type) in fixtures {
