@@ -504,8 +504,14 @@ PRODUCT-0148 inherits the last substrate with nothing to apologize for,
 and the five-station surface it must add — registry, handler, transport,
 resolver, exhibit under the live-drive standard — closes the PRODUCT-0075
 restoration list entirely. The 0064 colour obligation is discharged for
-the final time in this catalog; no kernel samples the legacy ramp for
-marks any longer. Direction-as-geometry gives the language its first mark
+the final time in this catalog: no restoration widening remains that
+could reach authorship while sampling the ramp. (Amended at 0148 review:
+the original sentence here claimed no kernel samples the legacy ramp any
+longer, which is false — CI-03 deliberately preserved compatibility
+fallbacks in radar, parallel, radial dial, pie, violin, funnel, and
+others; what this arc retired is the ramp on *newly surfaced* renderers,
+per the 0064 boundary, and nothing wider.)
+Direction-as-geometry gives the language its first mark
 whose core semantic no skin can selectively erase: above the stated
 raster threshold, wherever a candle renders its direction renders with
 it; the sub-threshold coincidence is a geometry exception every palette
