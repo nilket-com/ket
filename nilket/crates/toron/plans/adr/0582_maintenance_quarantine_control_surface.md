@@ -1,7 +1,8 @@
 # ADR 582 - Maintenance quarantine control surface
 
-**Status:** OPEN. Implementation is under review. Closes ADR 0097 decision 4
-when its acceptance holds. Deployment stays parked throughout.
+**Status:** CLOSED. Implemented and accepted at `f38eaa21`; this closes ADR 0097
+decision 4. Deployment stays parked pending ADR 0097's remaining acceptance and
+rollout gates.
 
 
 ## Context
@@ -273,11 +274,14 @@ The decisive test runs against two real nodes, each with its own index.
 
 ## Forward
 
-One plan commit and one implementation commit. The implementation touches the
-Wendelon control ring (two operations, their permissions, the fingerprint, and
-the audit event), a control-ring client method in Toron's admin client, and the
-`maintenance` verb in the Toron command line. Review corrections fold into the
-implementation commit until the round closes; nothing is pushed before that.
+Delivered as one plan commit and one reviewed implementation commit. The cut
+adds Wendelon's node-local, item- and byte-bounded report paging with
+incarnation-and-generation cursors; the versioned receipt-set fingerprint; the
+administrative reservation spanning compare and durable clear; authenticated
+control-ring operations with their distinct permissions and attempt/completion
+audit events; exact-node client methods; and Toron's `maintenance` report and
+requeue commands with read-after-ambiguity. The review corrections were folded
+into `f38eaa21` before it was pushed.
 
 Two follow-ups remain deliberately outside this contract. Deterministic attempts
 one and two are durable backoff receipts but do not fit the report grammar above;

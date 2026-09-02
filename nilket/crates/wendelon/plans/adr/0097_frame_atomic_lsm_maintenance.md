@@ -73,6 +73,8 @@ A failure that is a function of the input's shape is not retried on the transien
 schedule. It backs off, and after a bounded number of attempts the slab is
 quarantined out of the maintenance rotation with a receipt, so a permanently
 unhandleable slab costs a bounded amount of work rather than an unbounded loop.
+The bounded policy and its node-local report and operation-scoped requeue surface
+are delivered; ADR 0582 closed this decision at `f38eaa21`.
 
 ### 5. Slab admission and maintenance replacement are bounded
 
