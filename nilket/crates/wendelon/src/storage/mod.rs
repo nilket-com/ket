@@ -12,6 +12,7 @@ pub mod ipc;
 pub mod l2;
 pub mod lsm;
 pub mod lsm_worker;
+pub(crate) mod maintenance_policy;
 pub mod manager;
 pub mod manifest;
 pub mod multirow;

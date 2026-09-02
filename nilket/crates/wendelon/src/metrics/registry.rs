@@ -2,6 +2,7 @@ use crate::schema::{
 	CdcRejectCode, CompactionLevelIndex, IndexObjectId, RecordBodyCompressionPolicy, TableObjectId,
 	TenantId, WriteStatus,
 };
+use crate::storage::maintenance_policy::{DeterministicFailureReason, MaintenanceAttemptResult};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1585,6 +1586,67 @@ impl LsmDigestInvariantCounters {
 	}
 }
 
+/// ADR 0097 decision 4: one counter per way a policed maintenance attempt ends.
+#[derive(Default)]
+struct MaintenanceAttemptCounters(Mutex<BTreeMap<&'static str, u64>>);
+
+impl MaintenanceAttemptCounters {
+	fn inc(&self, result: MaintenanceAttemptResult) {
+		let mut values = self
+			.0
+			.lock()
+			.expect("maintenance attempt counter mutex poisoned");
+		*values.entry(result.label()).or_default() += 1;
+	}
+
+	fn get(&self, result: MaintenanceAttemptResult) -> u64 {
+		self.0
+			.lock()
+			.expect("maintenance attempt counter mutex poisoned")
+			.get(result.label())
+			.copied()
+			.unwrap_or(0)
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		for result in MaintenanceAttemptResult::ALL {
+			render_counter_with_labels(out, name, &[("result", result.label())], self.get(result));
+		}
+	}
+}
+
+/// Deterministic failures by bounded reason category. Slab ids and detail live in
+/// the receipt, never in a label.
+#[derive(Default)]
+struct MaintenanceDeterministicFailureCounters(Mutex<BTreeMap<&'static str, u64>>);
+
+impl MaintenanceDeterministicFailureCounters {
+	fn inc(&self, reason: DeterministicFailureReason) {
+		let mut values = self
+			.0
+			.lock()
+			.expect("maintenance deterministic failure counter mutex poisoned");
+		*values.entry(reason.label()).or_default() += 1;
+	}
+
+	fn get(&self, reason: DeterministicFailureReason) -> u64 {
+		self.0
+			.lock()
+			.expect("maintenance deterministic failure counter mutex poisoned")
+			.get(reason.label())
+			.copied()
+			.unwrap_or(0)
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		for reason in DeterministicFailureReason::ALL {
+			render_counter_with_labels(out, name, &[("reason", reason.label())], self.get(reason));
+		}
+	}
+}
+
 fn level_label(level: CompactionLevelIndex) -> &'static str {
 	match level {
 		CompactionLevelIndex::L0 => "0",
@@ -2656,6 +2718,10 @@ pub struct MetricsRegistry {
 	pub lsm_pending_delete_slabs: Gauge,
 	pub lsm_retired_slab_pinned_bytes: Gauge,
 	lsm_digest_invariance_violations: LsmDigestInvariantCounters,
+	maintenance_attempts: MaintenanceAttemptCounters,
+	maintenance_deterministic_failures: MaintenanceDeterministicFailureCounters,
+	pub maintenance_policy_enabled: Gauge,
+	pub maintenance_quarantined_work: Gauge,
 	storage_secondary_index_create: SecondaryIndexCounters,
 	storage_secondary_index_drop: SecondaryIndexCounters,
 	storage_secondary_index_lifecycle_transitions: SecondaryIndexTransitionCounters,
@@ -2964,6 +3030,10 @@ impl Default for MetricsRegistry {
 			lsm_pending_delete_slabs: Gauge::default(),
 			lsm_retired_slab_pinned_bytes: Gauge::default(),
 			lsm_digest_invariance_violations: LsmDigestInvariantCounters::default(),
+			maintenance_attempts: MaintenanceAttemptCounters::default(),
+			maintenance_deterministic_failures: MaintenanceDeterministicFailureCounters::default(),
+			maintenance_policy_enabled: Gauge::default(),
+			maintenance_quarantined_work: Gauge::default(),
 			storage_secondary_index_create: SecondaryIndexCounters::default(),
 			storage_secondary_index_drop: SecondaryIndexCounters::default(),
 			storage_secondary_index_lifecycle_transitions:
@@ -3651,6 +3721,27 @@ impl MetricsRegistry {
 
 	pub fn observe_lsm_digest_invariance_violation(&self, kind: LsmDigestInvariantKind) {
 		self.lsm_digest_invariance_violations.inc(kind);
+	}
+
+	pub fn observe_maintenance_attempt(&self, result: MaintenanceAttemptResult) {
+		self.maintenance_attempts.inc(result);
+	}
+
+	pub fn maintenance_attempts(&self, result: MaintenanceAttemptResult) -> u64 {
+		self.maintenance_attempts.get(result)
+	}
+
+	pub fn observe_maintenance_deterministic_failure(&self, reason: DeterministicFailureReason) {
+		self.maintenance_deterministic_failures.inc(reason);
+	}
+
+	pub fn maintenance_deterministic_failures(&self, reason: DeterministicFailureReason) -> u64 {
+		self.maintenance_deterministic_failures.get(reason)
+	}
+
+	pub fn set_maintenance_policy_state(&self, enabled: bool, quarantined_work: u64) {
+		self.maintenance_policy_enabled.set(u64::from(enabled));
+		self.maintenance_quarantined_work.set(quarantined_work);
 	}
 
 	pub fn observe_storage_secondary_index_create(
@@ -5471,6 +5562,28 @@ impl MetricsRegistry {
 			&mut out,
 			"wendelon_lsm_digest_invariance_violations_total",
 			"ADR 055 digest invariance violations by bounded digest kind.",
+		);
+		self.maintenance_attempts.render(
+			&mut out,
+			"wendelon_maintenance_attempts_total",
+			"ADR 0097 policed maintenance attempts by bounded result.",
+		);
+		self.maintenance_deterministic_failures.render(
+			&mut out,
+			"wendelon_maintenance_deterministic_failures_total",
+			"ADR 0097 deterministic maintenance failures by bounded reason.",
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_maintenance_policy_enabled",
+			"1 when ADR 0097 maintenance admission is enabled; 0 when disabled and serving continues.",
+			self.maintenance_policy_enabled.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_maintenance_quarantined_work",
+			"ADR 0097 slab-set/origin receipts currently quarantined out of the maintenance rotation.",
+			self.maintenance_quarantined_work.get(),
 		);
 		self.storage_secondary_index_create.render(
 			&mut out,

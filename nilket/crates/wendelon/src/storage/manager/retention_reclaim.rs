@@ -465,17 +465,47 @@ impl SlabManager {
 			if report.compacted_slabs >= max_slabs {
 				break;
 			}
-			if let Some(outcome) = self
-				.compact_one_sealed_slab(
-					slab_id,
-					tombstones,
-					SecondaryIndexCompactionContext {
-						table_schemas,
-						secondary_indexes,
+			// ADR 0097 decision 4: one slab is one policed attempt, as for retention.
+			// A refusal skips the slab this tick; a slab that needed no rewrite
+			// records nothing.
+			let attempt = self
+				.maintenance_policy
+				.execute(
+					MaintenanceOperation::TombstoneReclaim,
+					&[slab_id],
+					classify_io_error,
+					|outcome: &Option<CompactionOutcome>| {
+						if outcome.is_some() {
+							SuccessDisposition::Rewrote
+						} else {
+							SuccessDisposition::Neutral
+						}
+					},
+					|| {
+						self.compact_one_sealed_slab(
+							slab_id,
+							tombstones,
+							SecondaryIndexCompactionContext {
+								table_schemas,
+								secondary_indexes,
+							},
+						)
 					},
 				)
-				.await?
-			{
+				.await;
+			let outcome = match attempt {
+				MaintenanceAttempt::Skipped(refusal) => {
+					tracing::debug!(
+						slab_id = slab_id.get(),
+						?refusal,
+						"tombstone reclaim of slab not admitted this tick"
+					);
+					continue;
+				}
+				MaintenanceAttempt::Completed(outcome) => outcome,
+				MaintenanceAttempt::Failed(err) => return Err(err),
+			};
+			if let Some(outcome) = outcome {
 				report.compacted_slabs += 1;
 				report.reclaimed_bytes = report
 					.reclaimed_bytes
@@ -584,16 +614,46 @@ impl SlabManager {
 			if report.compacted_slabs >= max_slabs {
 				break;
 			}
-			let scan = self
-				.prune_one_sealed_slab_for_retention(
-					slab_id,
-					cluster_policy,
-					table_lifecycle,
-					table_schemas,
-					secondary_indexes,
-					now_ms,
+			// ADR 0097 decision 4: one slab is one policed attempt. A refusal skips the
+			// slab this tick; a failure is recorded, then propagates as before. A scan
+			// that pruned nothing rewrote nothing, and proves nothing about a receipt.
+			let attempt = self
+				.maintenance_policy
+				.execute(
+					MaintenanceOperation::RetentionPrune,
+					&[slab_id],
+					classify_io_error,
+					|scan: &RetentionSlabScanOutcome| {
+						if scan.compaction.is_some() {
+							SuccessDisposition::Rewrote
+						} else {
+							SuccessDisposition::Neutral
+						}
+					},
+					|| {
+						self.prune_one_sealed_slab_for_retention(
+							slab_id,
+							cluster_policy,
+							table_lifecycle,
+							table_schemas,
+							secondary_indexes,
+							now_ms,
+						)
+					},
 				)
-				.await?;
+				.await;
+			let scan = match attempt {
+				MaintenanceAttempt::Skipped(refusal) => {
+					tracing::debug!(
+						slab_id = slab_id.get(),
+						?refusal,
+						"retention pruning of slab not admitted this tick"
+					);
+					continue;
+				}
+				MaintenanceAttempt::Completed(scan) => scan,
+				MaintenanceAttempt::Failed(err) => return Err(err),
+			};
 			report.pruned_data_rows = report
 				.pruned_data_rows
 				.saturating_add(scan.retention_stats.pruned_data_rows);

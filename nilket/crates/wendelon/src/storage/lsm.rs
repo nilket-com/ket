@@ -812,10 +812,47 @@ pub fn pick_compaction(
 	config: &LsmConfig,
 	now: HybridTimestamp,
 ) -> Option<CompactionPlan> {
+	pick_compaction_where(manifest, config, now, |_| true)
+}
+
+/// ADR 0097 decision 4: choose the first candidate the caller will actually accept.
+///
+/// Selection skips ineligible candidates WHILE searching rather than choosing one
+/// and then rejecting it. Filtering after the choice lets a single blocked
+/// candidate - one in cooldown, or quarantined - suppress every other level's
+/// eligible work, which turns a bounded backoff on one slab into a stall of all
+/// compaction.
+///
+/// The granularity is the candidate each level produces: if a level's one
+/// candidate is ineligible this moves to the next level, and it does not search
+/// within a level for a different plan there.
+pub fn pick_compaction_where(
+	manifest: &ManifestSnapshot,
+	config: &LsmConfig,
+	now: HybridTimestamp,
+	eligible: impl Fn(&CompactionPlan) -> bool,
+) -> Option<CompactionPlan> {
 	config.validate().ok()?;
 	pick_l0_compaction(manifest, config, now)
-		.or_else(|| pick_level_pressure_compaction(manifest, config, now, CompactionLevelIndex::L1))
-		.or_else(|| pick_level_pressure_compaction(manifest, config, now, CompactionLevelIndex::L2))
+		.filter(&eligible)
+		.or_else(|| {
+			pick_level_pressure_compaction(
+				manifest,
+				config,
+				now,
+				CompactionLevelIndex::L1,
+				&eligible,
+			)
+		})
+		.or_else(|| {
+			pick_level_pressure_compaction(
+				manifest,
+				config,
+				now,
+				CompactionLevelIndex::L2,
+				&eligible,
+			)
+		})
 }
 
 fn pick_l0_compaction(
@@ -853,6 +890,7 @@ fn pick_level_pressure_compaction(
 	config: &LsmConfig,
 	now: HybridTimestamp,
 	source_level: CompactionLevelIndex,
+	eligible: &impl Fn(&CompactionPlan) -> bool,
 ) -> Option<CompactionPlan> {
 	let target_bytes = config.level_target_bytes(source_level)?;
 	let total_bytes = manifest.compaction_level_total_bytes(source_level);
@@ -870,19 +908,33 @@ fn pick_level_pressure_compaction(
 			run.slab_id,
 		)
 	});
-	let source = candidates.into_iter().next()?;
 	let target_level = source_level.next()?;
-	let overlaps = manifest.overlapping_slabs(target_level, source.min_row_hlc, source.max_row_hlc);
-	Some(CompactionPlan {
-		job_id: job_id_for(manifest, source_level),
-		source_level,
-		target_level,
-		manifest_epoch_pre: manifest.manifest_epoch,
-		input_slabs: vec![source.slab_id],
-		overlapping_slabs: overlaps.into_iter().map(|run| run.slab_id).collect(),
-		retention_floor_snapshot: zero_hlc(),
-		compaction_start_hlc: now,
-		dominant_reason: source.dominant_reason(true),
+	// ADR 0097 decision 4: walk the ranked sources and return the first the caller
+	// will accept, rather than offering only the top-ranked one.
+	//
+	// A single quarantined run must not starve its level. The ranking here is
+	// size-dominant, so the largest run is offered first - and a large run is
+	// exactly the kind that hits a shape-dependent rewrite failure and stays
+	// quarantined. Returning only that one turned a bounded quarantine on one piece
+	// of work into an unbounded stall of every other run at the level.
+	//
+	// Eligibility is applied to the WHOLE candidate, overlaps included, because a
+	// plan is ineligible if any slab it touches is.
+	candidates.into_iter().find_map(|source| {
+		let overlaps =
+			manifest.overlapping_slabs(target_level, source.min_row_hlc, source.max_row_hlc);
+		let plan = CompactionPlan {
+			job_id: job_id_for(manifest, source_level),
+			source_level,
+			target_level,
+			manifest_epoch_pre: manifest.manifest_epoch,
+			input_slabs: vec![source.slab_id],
+			overlapping_slabs: overlaps.into_iter().map(|run| run.slab_id).collect(),
+			retention_floor_snapshot: zero_hlc(),
+			compaction_start_hlc: now,
+			dominant_reason: source.dominant_reason(true),
+		};
+		eligible(&plan).then_some(plan)
 	})
 }
 

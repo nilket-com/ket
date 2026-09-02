@@ -3,6 +3,7 @@ use wendelon::schema::{
 };
 use wendelon::storage::{
 	DominantReason, LsmConfig, LsmRunSummary, ManifestSnapshot, SlabState, pick_compaction,
+	pick_compaction_where,
 };
 
 fn hlc(ms: u64) -> HybridTimestamp {
@@ -164,4 +165,109 @@ fn debt_scores_refine_dominant_reason_after_level_pressure() {
 
 	assert_eq!(plan.input_slabs, vec![SlabId::new(1)]);
 	assert_eq!(plan.dominant_reason, DominantReason::TombstoneDebt);
+}
+
+/// ADR 0097 decision 4: a quarantined run must not starve its LEVEL.
+///
+/// The ranking is size-dominant, so the largest run is offered first - and a large
+/// run is exactly the kind that hits a shape-dependent rewrite failure and stays
+/// quarantined. Offering only that one turned a bounded quarantine on one piece of
+/// work into an unbounded stall of every other run at the level.
+///
+/// The assertion is that ANOTHER L1 SOURCE is selected. Falling through to L2 would
+/// also avoid the blocked run while proving nothing about same-level progress, so
+/// this fixture deliberately has no L2 pressure to fall through to.
+#[test]
+fn a_blocked_l1_source_does_not_starve_the_rest_of_l1() {
+	let blocked = SlabId::new(90);
+	let snapshot = ManifestSnapshot::new(
+		ManifestEpoch::new(1),
+		vec![
+			// Largest, so ranked first, and rejected by the predicate.
+			run(90, CompactionLevelIndex::L1, 10, 20, 900),
+			run(91, CompactionLevelIndex::L1, 30, 40, 300),
+			run(92, CompactionLevelIndex::L1, 50, 60, 200),
+		],
+	);
+
+	// Unfiltered, the picker offers the blocked run: the fixture reproduces the
+	// starvation shape rather than assuming it.
+	let top = pick_compaction(&snapshot, &config(), hlc(10_000)).expect("L1 is over target");
+	assert_eq!(top.input_slabs, vec![blocked]);
+
+	let plan = pick_compaction_where(&snapshot, &config(), hlc(10_000), |plan| {
+		!plan.touched_slabs().contains(&blocked)
+	})
+	.expect("another L1 source is eligible");
+	assert_eq!(
+		plan.source_level,
+		CompactionLevelIndex::L1,
+		"progress must be made at the SAME level, not by falling through"
+	);
+	assert_eq!(plan.input_slabs, vec![SlabId::new(91)]);
+	assert!(!plan.touched_slabs().contains(&blocked));
+}
+
+/// With every L1 source blocked there is genuinely nothing eligible at that level,
+/// and the picker says so rather than offering one anyway.
+#[test]
+fn a_fully_blocked_level_yields_no_plan() {
+	let snapshot = ManifestSnapshot::new(
+		ManifestEpoch::new(1),
+		vec![
+			run(90, CompactionLevelIndex::L1, 10, 20, 900),
+			run(91, CompactionLevelIndex::L1, 30, 40, 300),
+		],
+	);
+	assert!(
+		pick_compaction_where(&snapshot, &config(), hlc(10_000), |_| false).is_none(),
+		"nothing eligible means no plan, not an ineligible one"
+	);
+}
+
+/// The discriminator for WHERE eligibility is applied.
+///
+/// The sibling test blocks an L1 *source*, which an implementation that only
+/// consulted `input_slabs` would also pass. Here the blocked slab is an
+/// OVERLAPPING TARGET of the top-ranked L1 source and appears nowhere in its
+/// `input_slabs`, so the top candidate is rejectable only if eligibility is applied
+/// to the whole plan.
+#[test]
+fn a_blocked_overlap_rejects_its_candidate_and_another_l1_source_is_selected() {
+	let blocked_overlap = SlabId::new(80);
+	let snapshot = ManifestSnapshot::new(
+		ManifestEpoch::new(1),
+		vec![
+			// Largest L1 source, ranked first; its HLC range meets the L2 run below.
+			run(90, CompactionLevelIndex::L1, 10, 20, 900),
+			// Second L1 source, disjoint in HLC, so it pulls in no overlap.
+			run(91, CompactionLevelIndex::L1, 30, 40, 300),
+			run(80, CompactionLevelIndex::L2, 10, 20, 50),
+		],
+	);
+
+	// The fixture must actually produce the shape it guards: the top candidate
+	// touches the blocked slab only through its overlaps.
+	let top = pick_compaction(&snapshot, &config(), hlc(10_000)).expect("L1 is over target");
+	assert_eq!(top.input_slabs, vec![SlabId::new(90)]);
+	assert!(
+		!top.input_slabs.contains(&blocked_overlap),
+		"the blocked slab must NOT be an input, or this proves nothing"
+	);
+	assert!(
+		top.overlapping_slabs.contains(&blocked_overlap),
+		"the blocked slab must be an overlap of the top candidate"
+	);
+
+	let plan = pick_compaction_where(&snapshot, &config(), hlc(10_000), |plan| {
+		!plan.touched_slabs().contains(&blocked_overlap)
+	})
+	.expect("the second L1 source pulls in no blocked overlap");
+	assert_eq!(
+		plan.source_level,
+		CompactionLevelIndex::L1,
+		"progress at the same level"
+	);
+	assert_eq!(plan.input_slabs, vec![SlabId::new(91)]);
+	assert!(!plan.touched_slabs().contains(&blocked_overlap));
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::maintenance_policy::{DeterministicOrigin, deterministic_failure};
 
 pub(super) fn lsm_run_summary_from_index(
 	key_index: &DashMap<TenantKey, Vec<RecordLocation>>,
@@ -611,11 +612,22 @@ impl SlabManager {
 		}
 		let _publication_gate = self.maintenance_publication_gate.try_read().ok()?;
 		let snapshot = self.compaction_manifest_snapshot();
-		pick_compaction(&snapshot, &worker.config(), now).filter(|plan| {
-			!plan
-				.touched_slabs()
-				.into_iter()
-				.any(|slab_id| self.is_compaction_slab_quarantined(slab_id))
+		// ADR 0097 decision 4: eligibility is applied DURING the search. Rejecting
+		// after the choice let one quarantined slab suppress every other level's
+		// work; a bounded backoff on one input must not stall all compaction.
+		// One clock sample for the whole search, so every candidate is judged
+		// against the same deadline boundary; admission re-samples under its lock.
+		let policy = &self.maintenance_policy;
+		let Some(now_ms) = policy.now_ms() else {
+			policy.disable("policy clock unavailable at selection");
+			return None;
+		};
+		crate::storage::lsm::pick_compaction_where(&snapshot, &worker.config(), now, |plan| {
+			let touched = plan.touched_slabs();
+			!touched
+				.iter()
+				.any(|slab_id| self.is_compaction_slab_quarantined(*slab_id))
+				&& policy.is_eligible(MaintenanceOperation::LsmCompaction, &touched, now_ms)
 		})
 	}
 
@@ -627,7 +639,8 @@ impl SlabManager {
 		let Some(plan) = self.pick_lsm_compaction_plan(worker, now) else {
 			return Ok(None);
 		};
-		self.run_lsm_compaction_once(worker, plan).await.map(Some)
+		self.execute_lsm_plan_under_policy(plan, |plan| self.run_lsm_compaction_once(worker, plan))
+			.await
 	}
 
 	pub async fn run_lsm_compaction_tick_via_control_ring(
@@ -639,9 +652,10 @@ impl SlabManager {
 		let Some(plan) = self.pick_lsm_compaction_plan(worker, now) else {
 			return Ok(None);
 		};
-		self.run_lsm_compaction_once_via_control_ring(worker, plan, committer)
-			.await
-			.map(Some)
+		self.execute_lsm_plan_under_policy(plan, |plan| {
+			self.run_lsm_compaction_once_via_control_ring(worker, plan, committer)
+		})
+		.await
 	}
 
 	pub async fn run_lsm_compaction_tick_via_control_ring_with_catalogs(
@@ -655,17 +669,59 @@ impl SlabManager {
 		let Some(plan) = self.pick_lsm_compaction_plan(worker, now) else {
 			return Ok(None);
 		};
-		self.run_lsm_compaction_once_via_control_ring_with_context(
-			worker,
-			plan,
-			committer,
-			Some(SecondaryIndexCompactionContext {
-				table_schemas,
-				secondary_indexes,
-			}),
-		)
+		self.execute_lsm_plan_under_policy(plan, |plan| {
+			self.run_lsm_compaction_once_via_control_ring_with_context(
+				worker,
+				plan,
+				committer,
+				Some(SecondaryIndexCompactionContext {
+					table_schemas,
+					secondary_indexes,
+				}),
+			)
+		})
 		.await
-		.map(Some)
+	}
+
+	/// ADR 0097 decision 4: every tick funnels its chosen plan through the policy.
+	///
+	/// The touched set is captured BEFORE the plan is consumed by the run, and the
+	/// reservation it names is held across the run. A refusal is not a failure: the
+	/// tick simply had no admissible work.
+	async fn execute_lsm_plan_under_policy<Fut>(
+		&self,
+		plan: CompactionPlan,
+		run: impl FnOnce(CompactionPlan) -> Fut,
+	) -> Result<Option<crate::storage::lsm::CompactionOutcome>, CompactionFailure>
+	where
+		Fut: std::future::Future<
+				Output = Result<crate::storage::lsm::CompactionOutcome, CompactionFailure>,
+			>,
+	{
+		let touched = plan.touched_slabs();
+		match self
+			.maintenance_policy
+			.execute(
+				MaintenanceOperation::LsmCompaction,
+				&touched,
+				classify_compaction_failure,
+				// A committed compaction outcome IS a published rewrite.
+				|_| SuccessDisposition::Rewrote,
+				|| run(plan),
+			)
+			.await
+		{
+			MaintenanceAttempt::Skipped(refusal) => {
+				tracing::debug!(
+					slabs = ?touched,
+					?refusal,
+					"LSM compaction plan not admitted this tick"
+				);
+				Ok(None)
+			}
+			MaintenanceAttempt::Completed(outcome) => Ok(Some(outcome)),
+			MaintenanceAttempt::Failed(err) => Err(err),
+		}
 	}
 
 	/// ADR 0097: a plan is chosen before its claims are held, so between the pick
@@ -1430,16 +1486,18 @@ impl SlabManager {
 			// one planned row resolves into, so the survivor set is never empty.
 			// Recorded rather than assumed, because an empty rewrite would silently
 			// drop every row of the frame.
-			Error::new(
+			deterministic_failure(
 				ErrorKind::InvalidData,
+				DeterministicOrigin::LsmRewriteProducedNoSurvivors,
 				"LSM multi-row rewrite produced no surviving rows",
 			)
 		})?;
 
 		let entries =
 			storage_multirow_index_entries_from_frame(&compacted.frame)?.ok_or_else(|| {
-				Error::new(
+				deterministic_failure(
 					ErrorKind::InvalidData,
+					DeterministicOrigin::LsmRewriteFrameNotMultiRow,
 					"LSM multi-row rewrite produced a frame without multi-row entries",
 				)
 			})?;
@@ -1450,16 +1508,18 @@ impl SlabManager {
 		let mut seen = HashSet::with_capacity(entries.len());
 		for entry in &entries {
 			if !seen.insert((entry.key_identity, entry.row_hlc, entry.is_tombstone)) {
-				return Err(Error::new(
+				return Err(deterministic_failure(
 					ErrorKind::InvalidData,
+					DeterministicOrigin::LsmRewriteDuplicateRowIdentity,
 					"LSM multi-row rewrite produced two rows with one identity; \
 					 position-independent mapping would be ambiguous",
 				));
 			}
 		}
 		if entries.len() != run_rows_for_source.len() {
-			return Err(Error::new(
+			return Err(deterministic_failure(
 				ErrorKind::InvalidData,
+				DeterministicOrigin::LsmRewriteKeptWrongRowCount,
 				format!(
 					"LSM multi-row rewrite kept {} rows, run planned {}",
 					entries.len(),
@@ -1514,8 +1574,9 @@ impl SlabManager {
 						&source.entry,
 						lsm_multirow_index_entry_for_version(&existing.entries, &source.entry)
 							.ok_or_else(|| {
-								Error::new(
+								deterministic_failure(
 									ErrorKind::InvalidData,
+									DeterministicOrigin::LsmSourceFrameMissingPlannedSurvivor,
 									"LSM source frame does not contain planned multi-row survivor",
 								)
 							})?,
@@ -1527,8 +1588,9 @@ impl SlabManager {
 				let Some(matching_entry) =
 					lsm_multirow_index_entry_for_version(&entries, &source.entry)
 				else {
-					return Err(Error::new(
+					return Err(deterministic_failure(
 						ErrorKind::InvalidData,
+						DeterministicOrigin::LsmSourceFrameMissingPlannedSurvivor,
 						"LSM source frame does not contain planned multi-row survivor",
 					));
 				};
@@ -1544,8 +1606,9 @@ impl SlabManager {
 					std::collections::hash_map::Entry::Occupied(entry) => {
 						let existing = entry.get();
 						if existing.frame != source.frame || existing.entries != entries {
-							return Err(Error::new(
+							return Err(deterministic_failure(
 								ErrorKind::InvalidData,
+								DeterministicOrigin::LsmInconsistentSourceFrames,
 								"inconsistent LSM source frames for the same physical record",
 							));
 						}
@@ -1648,15 +1711,17 @@ impl SlabManager {
 								.iter()
 								.any(|(_, candidate)| rows_match(entry, candidate))
 							{
-								return Err(Error::new(
+								return Err(deterministic_failure(
 									ErrorKind::InvalidData,
+									DeterministicOrigin::LsmRewrittenFrameCarriesUnplannedRow,
 									"LSM rewritten multi-row frame carries a row the run did not plan",
 								));
 							}
 						}
 						let Some(primary) = index_entries.first() else {
-							return Err(Error::new(
+							return Err(deterministic_failure(
 								ErrorKind::InvalidData,
+								DeterministicOrigin::LsmMultiRowSourceFrameHasNoEntries,
 								"LSM multi-row source frame has no index entries",
 							));
 						};
@@ -1694,8 +1759,9 @@ impl SlabManager {
 									locations_by_row_index.get(&entry.record_row_index).copied()
 								})
 							else {
-								return Err(Error::new(
+								return Err(deterministic_failure(
 									ErrorKind::InvalidData,
+									DeterministicOrigin::LsmOutputLocationMissingPlannedRow,
 									"LSM multi-row output location missing planned row",
 								));
 							};
@@ -1719,8 +1785,9 @@ impl SlabManager {
 						));
 					}
 					if storage_multirow_index_entries_from_frame(&source.frame)?.is_some() {
-						return Err(Error::new(
+						return Err(deterministic_failure(
 							ErrorKind::Unsupported,
+							DeterministicOrigin::LsmWriterCannotSplitMultiRowFrame,
 							"LSM temp-output writer does not yet split multi-row frames",
 						));
 					}

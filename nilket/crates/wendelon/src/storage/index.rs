@@ -7,7 +7,7 @@ use crate::schema::{
 use crate::storage::RecordLocation;
 use crate::storage::lsm::{LsmRunSummary, SidecarCoverage, SlabState};
 use crate::storage::manager::TieredSlabPointer;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -40,8 +40,54 @@ const TIERED_SLABS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("ti
 const SECONDARY_INDEX_SEGMENTS_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("secondary_index_segments_v1");
 const LSM_RUNS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("lsm_runs_v1");
+/// ADR 0097 decision 4: durable evidence of deterministic maintenance failures.
+///
+/// Every deterministic ATTEMPT is recorded, not only the final quarantine: the
+/// attempt count is what bounds the work, and a restart that lost it would let an
+/// OOM cycle rebuild the same working set forever - which is the incident this
+/// record exists for. Keys are `MaintenanceWorkKey` encodings; values are opaque
+/// here and decoded by the policy layer, so a decode failure is a policy decision
+/// rather than an index one.
+const MAINTENANCE_RECEIPTS_TABLE: TableDefinition<&[u8], &[u8]> =
+	TableDefinition::new("maintenance_failure_receipts_v1");
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("storage_index_meta_v1");
+
+/// Limits applied while copying the receipt table out of redb. Supplied by the
+/// policy layer, which owns the receipt schema and so knows the true maxima.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReceiptLoadBounds {
+	pub(crate) max_rows: usize,
+	pub(crate) max_key_bytes: usize,
+	pub(crate) max_value_bytes: usize,
+	pub(crate) max_total_bytes: usize,
+}
+
+fn receipt_load_exceeded(what: String) -> Error {
+	Error::new(
+		ErrorKind::InvalidData,
+		format!("receipt load bound exceeded: {what}"),
+	)
+}
+
+/// Test seam for the lost-history case: drop ONLY the receipt table from a closed
+/// index, leaving the initialization marker and every other table intact. Lives
+/// here so the table definition stays private to this module.
+#[cfg(test)]
+pub(crate) fn delete_maintenance_receipt_table_for_test(path: &Path) {
+	let db = Database::create(path).unwrap();
+	let write_txn = db.begin_write().unwrap();
+	write_txn.delete_table(MAINTENANCE_RECEIPTS_TABLE).unwrap();
+	write_txn.commit().unwrap();
+}
 const META_LAST_CONTROL_LOG_INDEX: &str = "last_control_log_index";
+/// ADR 0097 decision 4: set once, when the receipt table is first created.
+///
+/// Its whole purpose is to tell "this store has never had receipts" apart from
+/// "this store had receipts and they are gone". Creating the table whenever it is
+/// missing cannot distinguish those, and the second case must not present as an
+/// empty history - that is precisely how a lost attempt budget would silently
+/// reset.
+const META_MAINTENANCE_RECEIPTS_INITIALIZED: &str = "maintenance_receipts_initialized_v1";
 
 const RECORD_KEY_LEN: usize = 8 + 32 + 8 + 4 + 4 + 8 + 8;
 const RECORD_VALUE_LEN_V1: usize = 4;
@@ -165,6 +211,13 @@ pub(crate) struct PersistentIndexUpdate {
 pub(crate) struct PersistentLocalIndex {
 	db: Arc<Database>,
 	write_lock: Mutex<()>,
+	/// ADR 0097: false when this store previously held receipts and the table is
+	/// now gone - lost history, not empty history.
+	receipts_available: bool,
+	/// Test seam: make the next receipt mutations fail, so the policy's
+	/// fail-closed paths can be exercised against a real store.
+	#[cfg(test)]
+	pub(crate) fail_receipt_mutations: std::sync::atomic::AtomicBool,
 }
 
 impl PersistentLocalIndex {
@@ -173,7 +226,7 @@ impl PersistentLocalIndex {
 		let db = spawn_blocking_io(move || Database::create(path).map_err(redb_to_io)).await?;
 		let db = Arc::new(db);
 		let init_db = db.clone();
-		spawn_blocking_io(move || {
+		let receipts_available = spawn_blocking_io(move || {
 			let write_txn = init_db.begin_write().map_err(redb_to_io)?;
 			{
 				let _table = write_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
@@ -194,6 +247,33 @@ impl PersistentLocalIndex {
 			{
 				let _table = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
 			}
+			// ADR 0097: create the receipt table ONLY on a store that has never had
+			// one, and record that fact durably in the same transaction. On a store
+			// whose marker is set, a missing table means history was lost, and the
+			// caller is told so rather than handed an empty one.
+			let receipts_available = {
+				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+				let initialized = meta
+					.get(META_MAINTENANCE_RECEIPTS_INITIALIZED)
+					.map_err(redb_to_io)?
+					.is_some();
+				let table_present = write_txn
+					.list_tables()
+					.map_err(redb_to_io)?
+					.any(|handle| handle.name() == MAINTENANCE_RECEIPTS_TABLE.name());
+				match (initialized, table_present) {
+					(true, true) => true,
+					(true, false) => false,
+					(false, _) => {
+						let _table = write_txn
+							.open_table(MAINTENANCE_RECEIPTS_TABLE)
+							.map_err(redb_to_io)?;
+						meta.insert(META_MAINTENANCE_RECEIPTS_INITIALIZED, &1u64)
+							.map_err(redb_to_io)?;
+						true
+					}
+				}
+			};
 			// One-shot v1 → v2 migration. Every v1 row becomes a v2
 			// row with `is_encrypted = false`; the rewrite sweeper
 			// will then GET, encrypt, and stamp the truth back. v1
@@ -228,13 +308,27 @@ impl PersistentLocalIndex {
 					let _ = v1.remove(&key).map_err(redb_to_io)?;
 				}
 			}
-			write_txn.commit().map_err(redb_to_io)
+			write_txn.commit().map_err(redb_to_io)?;
+			Ok(receipts_available)
 		})
 		.await?;
 		Ok(Self {
 			db,
 			write_lock: Mutex::new(()),
+			receipts_available,
+			#[cfg(test)]
+			fail_receipt_mutations: Default::default(),
 		})
+	}
+
+	/// ADR 0097 decision 4: whether this store's receipt history is trustworthy.
+	///
+	/// `false` means the store has held receipts before and the table is now
+	/// missing. The index still serves everything else; only maintenance admission
+	/// is affected, because an empty history here is indistinguishable from a lost
+	/// one and would silently reset an attempt budget.
+	pub(crate) fn receipts_available(&self) -> bool {
+		self.receipts_available
 	}
 
 	pub(crate) async fn load_snapshot(&self) -> std::io::Result<PersistentIndexSnapshot> {
@@ -513,6 +607,142 @@ impl PersistentLocalIndex {
 				}
 			}
 			write_txn.commit().map_err(redb_to_io)
+		})
+		.await
+	}
+
+	/// ADR 0097: every receipt in the table, as raw key/value bytes.
+	///
+	/// Decoding is the policy layer's job. Returning raw pairs keeps the failure
+	/// boundary honest: an unreadable TABLE is an index error, while an
+	/// undecodable RECEIPT is a policy error, and only the policy layer can decide
+	/// that the right response to the latter is to refuse maintenance rather than
+	/// to continue with a silently shorter history.
+	///
+	/// The copy is BOUNDED while iterating, not after: a corrupted or indefinitely
+	/// accumulated table must fail closed before it can exhaust memory, or the
+	/// policy layer never gets its chance to refuse. Every bound is checked
+	/// against the borrowed entry before any byte of it is copied. The bounds come
+	/// from the caller because the value's maximum is fixed by the receipt schema,
+	/// which this layer deliberately does not know.
+	pub(crate) async fn load_maintenance_receipts(
+		&self,
+		bounds: ReceiptLoadBounds,
+	) -> std::io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+		let db = self.db.clone();
+		spawn_blocking_io(move || {
+			let read_txn = db.begin_read().map_err(redb_to_io)?;
+			let table = read_txn
+				.open_table(MAINTENANCE_RECEIPTS_TABLE)
+				.map_err(redb_to_io)?;
+			let mut out = Vec::new();
+			let mut total_bytes = 0usize;
+			for entry in table.iter().map_err(redb_to_io)? {
+				let (key, value) = entry.map_err(redb_to_io)?;
+				let (key, value) = (key.value(), value.value());
+				if out.len() >= bounds.max_rows {
+					return Err(receipt_load_exceeded(format!(
+						"more than {} maintenance receipts",
+						bounds.max_rows
+					)));
+				}
+				if key.len() > bounds.max_key_bytes {
+					return Err(receipt_load_exceeded(format!(
+						"a maintenance receipt key of {} bytes exceeds {}",
+						key.len(),
+						bounds.max_key_bytes
+					)));
+				}
+				if value.len() > bounds.max_value_bytes {
+					return Err(receipt_load_exceeded(format!(
+						"a maintenance receipt value of {} bytes exceeds {}",
+						value.len(),
+						bounds.max_value_bytes
+					)));
+				}
+				total_bytes = total_bytes
+					.checked_add(key.len())
+					.and_then(|total| total.checked_add(value.len()))
+					.filter(|total| *total <= bounds.max_total_bytes)
+					.ok_or_else(|| {
+						receipt_load_exceeded(format!(
+							"maintenance receipts exceed {} bytes in total",
+							bounds.max_total_bytes
+						))
+					})?;
+				out.push((key.to_vec(), value.to_vec()));
+			}
+			Ok(out)
+		})
+		.await
+	}
+
+	/// Durably record one receipt. The caller commits this BEFORE exposing the
+	/// cooldown or quarantine it describes, so a crash between the two leaves a
+	/// receipt that over-counts rather than a bound that under-counts.
+	pub(crate) async fn put_maintenance_receipt(
+		&self,
+		key: Vec<u8>,
+		value: Vec<u8>,
+	) -> std::io::Result<()> {
+		// Serialize with index rebuilds and with each other: a receipt write that
+		// interleaved with a rebuild could land in a table the rebuild then replaces.
+		let _guard = self.write_lock.lock().await;
+		#[cfg(test)]
+		if self
+			.fail_receipt_mutations
+			.load(std::sync::atomic::Ordering::SeqCst)
+		{
+			return Err(Error::other("injected receipt store failure"));
+		}
+		let db = self.db.clone();
+		spawn_blocking_io(move || {
+			let write_txn = db.begin_write().map_err(redb_to_io)?;
+			{
+				let mut table = write_txn
+					.open_table(MAINTENANCE_RECEIPTS_TABLE)
+					.map_err(redb_to_io)?;
+				table
+					.insert(key.as_slice(), value.as_slice())
+					.map_err(redb_to_io)?;
+			}
+			write_txn.commit().map_err(redb_to_io)?;
+			Ok(())
+		})
+		.await
+	}
+
+	/// Remove receipts. Used by success (every origin for one slab set) and by the
+	/// explicit requeue. Durable removal happens FIRST; in-memory state is cleared
+	/// only after this returns, so a failure here leaves the quarantine effective.
+	pub(crate) async fn delete_maintenance_receipts(
+		&self,
+		keys: Vec<Vec<u8>>,
+	) -> std::io::Result<()> {
+		if keys.is_empty() {
+			return Ok(());
+		}
+		let _guard = self.write_lock.lock().await;
+		#[cfg(test)]
+		if self
+			.fail_receipt_mutations
+			.load(std::sync::atomic::Ordering::SeqCst)
+		{
+			return Err(Error::other("injected receipt store failure"));
+		}
+		let db = self.db.clone();
+		spawn_blocking_io(move || {
+			let write_txn = db.begin_write().map_err(redb_to_io)?;
+			{
+				let mut table = write_txn
+					.open_table(MAINTENANCE_RECEIPTS_TABLE)
+					.map_err(redb_to_io)?;
+				for key in &keys {
+					table.remove(key.as_slice()).map_err(redb_to_io)?;
+				}
+			}
+			write_txn.commit().map_err(redb_to_io)?;
+			Ok(())
 		})
 		.await
 	}
@@ -1388,6 +1618,15 @@ fn read_array_32(bytes: &[u8], cursor: &mut usize) -> std::io::Result<[u8; 32]> 
 mod tests {
 	use super::*;
 
+	fn generous_bounds() -> ReceiptLoadBounds {
+		ReceiptLoadBounds {
+			max_rows: 1 << 16,
+			max_key_bytes: 1 << 16,
+			max_value_bytes: 1 << 16,
+			max_total_bytes: 1 << 24,
+		}
+	}
+
 	fn temp_path(tag: &str) -> PathBuf {
 		std::env::temp_dir().join(format!(
 			"wendelon-redb-{tag}-{}-{}.redb",
@@ -1804,6 +2043,191 @@ mod tests {
 		index.upsert_tiered_slab(pointer, Some(19)).await.unwrap();
 		let third = index.load_snapshot().await.unwrap();
 		assert_eq!(third.last_control_log_index, Some(19));
+	}
+
+	/// ADR 0097 decision 4: a store that HAS held receipts and no longer has the
+	/// table must report its history as unavailable - while the rest of the index
+	/// keeps serving.
+	///
+	/// This is the distinction the marker exists for. Creating the table whenever
+	/// it is missing would present lost history as an empty one, which silently
+	/// resets an attempt budget on exactly the restart where the budget matters.
+	/// A rebuild replaces the index tables and leaves the receipt table alone: the
+	/// attempt budget is not derivable from slab bytes, so a rebuild must not
+	/// reset it.
+	#[tokio::test]
+	async fn a_rebuild_leaves_maintenance_receipts_untouched() {
+		let path = temp_path("adr0097-receipt-rebuild");
+		let index = PersistentLocalIndex::open(path).await.unwrap();
+		index
+			.put_maintenance_receipt(vec![0, 11, 0, 0, 0, 0, 0, 0, 0, 5], vec![1, 2, 3])
+			.await
+			.unwrap();
+		index
+			.rebuild_with_secondary_index_segments_and_lsm_runs(
+				vec![row()],
+				Vec::new(),
+				Vec::new(),
+				Vec::new(),
+				None,
+			)
+			.await
+			.unwrap();
+		assert!(index.receipts_available());
+		assert_eq!(
+			index
+				.load_maintenance_receipts(generous_bounds())
+				.await
+				.unwrap(),
+			vec![(vec![0, 11, 0, 0, 0, 0, 0, 0, 0, 5], vec![1, 2, 3])]
+		);
+	}
+
+	/// Every bound refuses BEFORE copying the offending row, and the error is data
+	/// corruption rather than an I/O failure, so recovery treats it as history it
+	/// cannot trust.
+	#[tokio::test]
+	async fn receipt_load_refuses_rows_over_its_bounds() {
+		let path = temp_path("adr0097-receipt-bounds");
+		let index = PersistentLocalIndex::open(path).await.unwrap();
+		for slab in 1..=3u8 {
+			index
+				.put_maintenance_receipt(vec![0, 11, 0, 0, 0, 0, 0, 0, 0, slab], vec![1; 8])
+				.await
+				.unwrap();
+		}
+		let within = generous_bounds();
+		assert_eq!(
+			index.load_maintenance_receipts(within).await.unwrap().len(),
+			3
+		);
+
+		let cases = [
+			(
+				"rows",
+				ReceiptLoadBounds {
+					max_rows: 2,
+					..within
+				},
+			),
+			(
+				"key bytes",
+				ReceiptLoadBounds {
+					max_key_bytes: 9,
+					..within
+				},
+			),
+			(
+				"value bytes",
+				ReceiptLoadBounds {
+					max_value_bytes: 7,
+					..within
+				},
+			),
+			(
+				"total bytes",
+				ReceiptLoadBounds {
+					max_total_bytes: 3 * 18 - 1,
+					..within
+				},
+			),
+		];
+		for (what, bounds) in cases {
+			let error = index
+				.load_maintenance_receipts(bounds)
+				.await
+				.expect_err(what);
+			assert_eq!(error.kind(), ErrorKind::InvalidData, "{what}");
+			assert!(
+				error.to_string().contains("receipt load bound exceeded"),
+				"{what}: {error}"
+			);
+		}
+		// Exactly at the total is admitted: the bound is inclusive.
+		let exact = ReceiptLoadBounds {
+			max_total_bytes: 3 * 18,
+			..within
+		};
+		assert_eq!(
+			index.load_maintenance_receipts(exact).await.unwrap().len(),
+			3
+		);
+	}
+
+	#[tokio::test]
+	async fn a_deleted_receipt_table_disables_receipts_but_not_the_index() {
+		let path = temp_path("adr0097-receipt-marker");
+
+		// A store with ordinary index history AND a receipt.
+		let index = PersistentLocalIndex::open(path.clone()).await.unwrap();
+		assert!(
+			index.receipts_available(),
+			"a fresh store initializes its receipt table"
+		);
+		index.upsert_record(row()).await.unwrap();
+		index
+			.put_maintenance_receipt(vec![0, 11, 0, 0, 0, 0, 0, 0, 0, 5], vec![1, 2, 3])
+			.await
+			.unwrap();
+		assert_eq!(
+			index
+				.load_maintenance_receipts(generous_bounds())
+				.await
+				.unwrap()
+				.len(),
+			1
+		);
+		drop(index);
+
+		// Lose ONLY the receipt table, leaving every other table intact.
+		delete_maintenance_receipt_table_for_test(&path);
+
+		let reopened = PersistentLocalIndex::open(path.clone()).await.unwrap();
+		assert!(
+			!reopened.receipts_available(),
+			"the marker survives, so a missing table is LOST history, not empty history"
+		);
+		// Serving is unaffected: the ordinary snapshot still reads back.
+		let snapshot = reopened.load_snapshot().await.unwrap();
+		assert_eq!(
+			snapshot.record_rows.len(),
+			1,
+			"index recovery is preserved while maintenance is disabled"
+		);
+
+		let _ = std::fs::remove_file(&path);
+	}
+
+	/// The complementary case: a store that has never held receipts initializes
+	/// them, which must NOT be mistaken for lost history.
+	#[tokio::test]
+	async fn a_fresh_store_initializes_receipts_and_reopens_available() {
+		let path = temp_path("adr0097-receipt-fresh");
+		let index = PersistentLocalIndex::open(path.clone()).await.unwrap();
+		assert!(index.receipts_available());
+		assert!(
+			index
+				.load_maintenance_receipts(generous_bounds())
+				.await
+				.unwrap()
+				.is_empty()
+		);
+		drop(index);
+
+		let reopened = PersistentLocalIndex::open(path.clone()).await.unwrap();
+		assert!(
+			reopened.receipts_available(),
+			"an empty-but-present table stays available across reopen"
+		);
+		assert!(
+			reopened
+				.load_maintenance_receipts(generous_bounds())
+				.await
+				.unwrap()
+				.is_empty()
+		);
+
+		let _ = std::fs::remove_file(&path);
 	}
 }
 

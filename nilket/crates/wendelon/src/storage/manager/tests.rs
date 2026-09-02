@@ -3787,6 +3787,80 @@ async fn secondary_index_backfill_source_slab_emits_every_retained_data_version(
 	assert_eq!(coverage.covered_slabs, vec![source_slab_id]);
 }
 
+/// ADR 0097 decision 4: the deterministic class must survive the REAL path, not
+/// just its constructor.
+///
+/// A constructor-only test cannot detect a layer that re-wraps the error by its
+/// string somewhere between the origin and the scheduler; this drives a genuine
+/// production failure - a rewrite attempted without the ownership claim that makes
+/// it safe - and classifies what actually comes back, after `?` and the
+/// `CompactionFailure` conversion.
+#[tokio::test]
+async fn adr0097_deterministic_class_survives_the_real_failure_path() {
+	use crate::storage::maintenance_policy::{
+		DeterministicOrigin, MaintenanceFailureClass, classify_compaction_failure,
+	};
+
+	let manager = fresh_manager().await;
+	let table = adr0097_colocated_table_descriptor_for_test();
+	append_attributed_multirow_frame_for_test(&manager, &table, &[1, 2], hlc(1_000)).await;
+	let slab_id = manager.force_seal_active_for_test().await;
+	let slab = manager
+		.state
+		.lock()
+		.await
+		.sealed
+		.get(&slab_id)
+		.map(|slab| slab.value().clone())
+		.expect("the sealed slab is resident");
+
+	// Ownership of a DIFFERENT slab: the rewrite must refuse, deterministically.
+	let unrelated = SlabId::new(slab_id.get() + 1_000);
+	let claims = manager.acquire_maintenance_claims(&[unrelated]).await;
+	let records = [CompactionRecord {
+		tenant_id: tenant(),
+		key_identity: id(1),
+		routing_locality: Locality::new(1),
+		old_location: RecordLocation {
+			slab_id,
+			offset: 0,
+			length: 1,
+			hlc: hlc(1_000),
+			record_row_index: RecordRowIndex::ZERO,
+			is_tombstone: false,
+			placement: crate::schema::table::PlacementSemantics::RawLocality,
+			partition: None,
+		},
+		reclaim: true,
+		retention_ambiguous: false,
+		retention_lag_seconds: 0,
+	}];
+	let outcome = manager
+		.compact_sealed_slab_records(
+			slab_id,
+			slab,
+			&records,
+			SecondaryIndexCompactionContext {
+				table_schemas: &TableSchemaCatalog::default(),
+				secondary_indexes: &SecondaryIndexCatalog::default(),
+			},
+			&claims,
+		)
+		.await;
+	let error = match outcome {
+		Err(error) => error,
+		Ok(_) => panic!("a rewrite without ownership must be refused"),
+	};
+
+	// Through the `?` conversion the schedulers actually use.
+	let failure = crate::storage::lsm::CompactionFailure::from(error);
+	assert_eq!(
+		classify_compaction_failure(&failure),
+		MaintenanceFailureClass::Deterministic(DeterministicOrigin::MaintenanceRewriteWithoutClaim),
+		"the class survives the production path, not merely its constructor"
+	);
+}
+
 /// ADR 0097: a committer that stops the LSM job exactly at publication.
 ///
 /// The pause discriminates the two designs that a read-side test cannot tell
@@ -13814,4 +13888,326 @@ async fn maintenance_manifest_reapply_is_a_no_op() {
 		.apply_maintenance_manifest_publication(old_slab, Some(conflicting))
 		.expect_err("a retired source must refuse a different publication");
 	assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+// ============================================================
+//  ADR 0097 decision 4: every compaction tick funnels through the
+//  maintenance policy, and the policy is hydrated from the index
+//  the manager serves with.
+// ============================================================
+
+async fn open_policed_manager(
+	dir: std::path::PathBuf,
+	io: crate::storage::io_uring::IoRingHandle,
+) -> Arc<SlabManager> {
+	Arc::new(
+		SlabManager::open(SlabManagerConfig {
+			dir,
+			// Every append rotates, so five appends are five L0 runs.
+			max_slab_bytes: 1,
+			io,
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		})
+		.await
+		.unwrap(),
+	)
+}
+
+async fn l0_pressure(manager: &SlabManager) {
+	for n in 0..5 {
+		manager
+			.append(tenant(), id(0x9700 + n), hlc(n + 1), b"row")
+			.await
+			.unwrap();
+	}
+	manager.force_seal_active_for_test().await;
+}
+
+#[tokio::test]
+async fn a_compaction_tick_is_policed_and_its_success_is_recorded() {
+	let dir = fresh_dir("adr0097-policed-tick");
+	let io = spawn_io_thread(16).unwrap();
+	let manager = open_policed_manager(dir, io).await;
+	let policy = manager.maintenance_policy();
+	assert!(policy.is_enabled(), "{:?}", policy.diagnostic());
+	l0_pressure(&manager).await;
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let metrics = crate::metrics::global();
+	let ok_before = metrics
+		.maintenance_attempts(crate::storage::maintenance_policy::MaintenanceAttemptResult::Ok);
+
+	let outcome = manager
+		.run_lsm_compaction_tick(&worker, hlc(20_000))
+		.await
+		.unwrap()
+		.expect("five L0 runs produce a compaction");
+	assert!(outcome.rows_out > 0);
+
+	assert_eq!(
+		metrics
+			.maintenance_attempts(crate::storage::maintenance_policy::MaintenanceAttemptResult::Ok)
+			- ok_before,
+		1,
+		"the tick went through the policy, not around it"
+	);
+	let report = policy.report();
+	assert!(report.enabled);
+	assert!(report.in_flight.is_empty(), "the reservation was released");
+	assert!(report.receipts.is_empty());
+	assert_eq!(metrics.maintenance_policy_enabled.get(), 1);
+}
+
+#[tokio::test]
+async fn a_quarantined_plan_is_skipped_by_the_tick_until_requeued() {
+	let dir = fresh_dir("adr0097-quarantined-plan");
+	let io = spawn_io_thread(16).unwrap();
+	let worker_config = LsmConfig::default();
+
+	// Learn which plan the picker chooses for this pressure.
+	let touched = {
+		let manager = open_policed_manager(dir.clone(), io.clone()).await;
+		l0_pressure(&manager).await;
+		let worker = LsmCompactionWorker::new(worker_config, manager.slab_pin_table()).unwrap();
+		manager
+			.pick_lsm_compaction_plan(&worker, hlc(20_000))
+			.expect("pressure yields a plan")
+			.touched_slabs()
+	};
+
+	// Quarantine exactly that work, durably, while the manager is closed.
+	{
+		let index = PersistentLocalIndex::open(persistent_index_path(&dir))
+			.await
+			.unwrap();
+		let key = crate::storage::maintenance_policy::MaintenanceWorkKey::new(
+			crate::storage::maintenance_policy::MaintenanceOperation::LsmCompaction,
+			touched.iter().copied(),
+			crate::storage::maintenance_policy::DeterministicOrigin::LsmInconsistentSourceFrames,
+		)
+		.unwrap();
+		let receipt = {
+			use crate::storage::maintenance_policy::DeterministicReceipt;
+			let a = DeterministicReceipt::after_failure(None, 1_000, "a").unwrap();
+			let b = DeterministicReceipt::after_failure(Some(&a), 2_000, "b").unwrap();
+			DeterministicReceipt::after_failure(Some(&b), 3_000, "c").unwrap()
+		};
+		assert!(receipt.is_quarantined());
+		index
+			.put_maintenance_receipt(key.encode(), receipt.encode())
+			.await
+			.unwrap();
+	}
+
+	let manager = open_policed_manager(dir, io).await;
+	let policy = manager.maintenance_policy();
+	assert!(policy.is_enabled(), "{:?}", policy.diagnostic());
+	assert_eq!(policy.report().quarantined().count(), 1);
+	let worker = LsmCompactionWorker::new(worker_config, manager.slab_pin_table()).unwrap();
+
+	// The unfiltered picker still wants exactly this work, so the receipt - and
+	// nothing else - is what holds it back.
+	let unfiltered = crate::storage::lsm::pick_compaction(
+		&manager.compaction_manifest_snapshot(),
+		&worker_config,
+		hlc(20_000),
+	)
+	.expect("the pressure survived the reopen");
+	assert_eq!(unfiltered.touched_slabs(), touched);
+	assert!(
+		manager
+			.pick_lsm_compaction_plan(&worker, hlc(20_000))
+			.is_none()
+	);
+	assert!(
+		manager
+			.run_lsm_compaction_tick(&worker, hlc(20_000))
+			.await
+			.unwrap()
+			.is_none(),
+		"a quarantined plan is not work this tick"
+	);
+
+	// Requeue readmits it, and the success clears the record.
+	assert_eq!(
+		policy
+			.requeue(
+				crate::storage::maintenance_policy::MaintenanceOperation::LsmCompaction,
+				&touched,
+			)
+			.await,
+		Ok(1)
+	);
+	let outcome = manager
+		.run_lsm_compaction_tick(&worker, hlc(20_001))
+		.await
+		.unwrap()
+		.expect("requeued work runs");
+	assert!(outcome.rows_out > 0);
+	assert!(policy.report().receipts.is_empty());
+	assert_eq!(
+		crate::metrics::global().maintenance_quarantined_work.get(),
+		0
+	);
+}
+
+#[tokio::test]
+async fn a_manager_with_unreadable_receipt_history_serves_but_admits_no_maintenance() {
+	let dir = fresh_dir("adr0097-unreadable-history");
+	let io = spawn_io_thread(16).unwrap();
+	{
+		let manager = open_policed_manager(dir.clone(), io.clone()).await;
+		manager
+			.append(tenant(), id(0x9800), hlc(1), b"served")
+			.await
+			.unwrap();
+		manager.force_seal_active_for_test().await;
+	}
+	{
+		let index = PersistentLocalIndex::open(persistent_index_path(&dir))
+			.await
+			.unwrap();
+		// A well-formed key over an undecodable value.
+		index
+			.put_maintenance_receipt(vec![0, 11, 0, 0, 0, 0, 0, 0, 0, 5], vec![0xFF])
+			.await
+			.unwrap();
+	}
+
+	let manager = open_policed_manager(dir, io).await;
+	let policy = manager.maintenance_policy();
+	assert!(!policy.is_enabled());
+	assert!(
+		policy.diagnostic().unwrap().contains("undecodable"),
+		"{:?}",
+		policy.diagnostic()
+	);
+	assert_eq!(crate::metrics::global().maintenance_policy_enabled.get(), 0);
+
+	// Serving is intact.
+	let location = manager
+		.lookup(tenant(), id(0x9800))
+		.expect("the row is still indexed");
+	assert_eq!(manager.read(location).await.unwrap(), b"served");
+
+	// Maintenance is not: pressure produces no plan.
+	l0_pressure(&manager).await;
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	assert!(
+		manager
+			.pick_lsm_compaction_plan(&worker, hlc(20_000))
+			.is_none()
+	);
+	assert!(
+		manager
+			.run_lsm_compaction_tick(&worker, hlc(20_000))
+			.await
+			.unwrap()
+			.is_none()
+	);
+}
+
+/// ADR 0097 decision 4: tombstone reclaim is a maintenance rewrite loop like the
+/// other three, and it goes through the policy. A disabled policy admits no
+/// reclaim; the same store, reopened with the policy enabled, reclaims the slab -
+/// so it is the policy, not the fixture, that held it back.
+#[tokio::test]
+async fn tombstone_reclaim_is_policed() {
+	let dir = fresh_dir("adr0097-policed-tombstone-reclaim");
+	let io = spawn_io_thread(64).unwrap();
+	let open = |dir: std::path::PathBuf, io: crate::storage::io_uring::IoRingHandle| async move {
+		Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir,
+				max_slab_bytes: 1024 * 1024,
+				io,
+				l2: None,
+				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
+				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		)
+	};
+	let removed_key = id(0x1010);
+	let survivor_key = id(0x2020);
+	let tombstone = |target: u64| MigratedRangeTombstone {
+		migration_id: 1,
+		range_start: target,
+		range_end: target,
+		to_epoch: 2,
+		completed_by: NodeId {
+			id: 7,
+			_reserved: 0,
+		},
+		completed_at_hlc: hlc(1),
+		migration_hlc_floor: hlc(0),
+	};
+	let target = Locality::from(removed_key).get();
+
+	let manager = open(dir.clone(), io.clone()).await;
+	manager
+		.append_durable(tenant(), removed_key, hlc(10), b"drop-me")
+		.await
+		.unwrap();
+	manager
+		.append_durable(tenant(), survivor_key, hlc(20), b"keep-me")
+		.await
+		.unwrap();
+	force_seal_active(&manager).await;
+	let policy = manager.maintenance_policy();
+	assert!(policy.is_enabled(), "{:?}", policy.diagnostic());
+	policy.disable("test: no maintenance admitted");
+	let (schemas, indexes) = empty_compaction_catalogs();
+	let report = manager
+		.reclaim_tombstoned_ranges(&[tombstone(target)], &schemas, &indexes, 1)
+		.await
+		.unwrap();
+	assert_eq!(
+		report.compacted_slabs, 0,
+		"a disabled policy admits no reclaim"
+	);
+	assert!(
+		manager.lookup(tenant(), removed_key).is_some(),
+		"the tombstoned row was not reclaimed around the policy"
+	);
+	drop(manager);
+
+	// Control arm: the same store, reopened, reclaims once the policy admits.
+	let reopened = open(dir, io).await;
+	assert!(reopened.maintenance_policy().is_enabled());
+	let report = reopened
+		.reclaim_tombstoned_ranges(&[tombstone(target)], &schemas, &indexes, 1)
+		.await
+		.unwrap();
+	assert_eq!(report.compacted_slabs, 1);
+	assert!(reopened.lookup(tenant(), removed_key).is_none());
+	assert_eq!(
+		reopened
+			.read(reopened.lookup(tenant(), survivor_key).unwrap())
+			.await
+			.unwrap(),
+		b"keep-me"
+	);
+	assert!(
+		reopened.maintenance_policy().report().in_flight.is_empty(),
+		"the reservation was released"
+	);
 }

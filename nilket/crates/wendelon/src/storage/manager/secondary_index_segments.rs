@@ -721,7 +721,7 @@ impl SlabManager {
 		}
 	}
 
-	pub(crate) async fn backfill_secondary_index_candidate(
+	pub(super) async fn backfill_secondary_index_candidate(
 		&self,
 		tenant_id: TenantId,
 		table: &TableSchemaDescriptor,
@@ -761,11 +761,38 @@ impl SlabManager {
 		let mut failures = Vec::new();
 
 		for candidate in before.candidates.iter().take(max_slabs) {
-			match self
-				.backfill_secondary_index_candidate(tenant_id, table, descriptor, candidate)
-				.await
-			{
-				Ok(SecondaryIndexBackfillOutcome::Completed(info)) => {
+			// ADR 0097 decision 4: one candidate is one policed attempt over its
+			// source slab. A refusal is neither success nor failure - move on. A
+			// candidate replaced before its claim rewrote nothing.
+			let attempt = self
+				.maintenance_policy
+				.execute(
+					MaintenanceOperation::SecondaryIndexBackfill,
+					&[candidate.source_slab_id()],
+					classify_io_error,
+					|outcome: &SecondaryIndexBackfillOutcome| match outcome {
+						SecondaryIndexBackfillOutcome::Completed(_) => SuccessDisposition::Rewrote,
+						SecondaryIndexBackfillOutcome::StaleCandidate { .. } => {
+							SuccessDisposition::Neutral
+						}
+					},
+					|| {
+						self.backfill_secondary_index_candidate(
+							tenant_id, table, descriptor, candidate,
+						)
+					},
+				)
+				.await;
+			match attempt {
+				MaintenanceAttempt::Skipped(refusal) => {
+					tracing::debug!(
+						source_slab_id = candidate.source_slab_id().get(),
+						?refusal,
+						"secondary index backfill candidate not admitted this tick"
+					);
+					continue;
+				}
+				MaintenanceAttempt::Completed(SecondaryIndexBackfillOutcome::Completed(info)) => {
 					completed.push(SecondaryIndexBackfillSuccess {
 						candidate: candidate.clone(),
 						entry_count: info.entry_count,
@@ -776,7 +803,9 @@ impl SlabManager {
 				// the rest of a candidate list built from the same stale view, and
 				// re-enumerate on the next tick. Recorded as neither success nor
 				// failure, because it is neither.
-				Ok(SecondaryIndexBackfillOutcome::StaleCandidate { source_slab_id }) => {
+				MaintenanceAttempt::Completed(SecondaryIndexBackfillOutcome::StaleCandidate {
+					source_slab_id,
+				}) => {
 					tracing::debug!(
 						source_slab_id = source_slab_id.get(),
 						"secondary index backfill candidate was replaced before its claim; \
@@ -784,7 +813,7 @@ impl SlabManager {
 					);
 					break;
 				}
-				Err(err) => failures.push(SecondaryIndexBackfillFailure {
+				MaintenanceAttempt::Failed(err) => failures.push(SecondaryIndexBackfillFailure {
 					candidate: candidate.clone(),
 					error: SecondaryIndexBackfillError::new(
 						secondary_index_backfill_reason_from_io(&err),

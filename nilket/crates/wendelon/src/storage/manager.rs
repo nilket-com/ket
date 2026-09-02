@@ -127,6 +127,10 @@ use crate::storage::index::{
 use crate::storage::io_uring::IoRingHandle;
 use crate::storage::ipc::record_batch_compression_policy_from_ipc;
 use crate::storage::l2::ObjectStore;
+use crate::storage::maintenance_policy::{
+	MaintenanceAttempt, MaintenanceOperation, MaintenancePolicyInner, SuccessDisposition,
+	SystemMaintenanceClock, classify_compaction_failure, classify_io_error,
+};
 use crate::storage::multirow::{
 	MultiRowSourceRow, StorageRowMetadata, decode_batch as decode_record_batch,
 	encode_batch_with_policy, encode_multirow_from_survivors_with_policy,
@@ -165,8 +169,8 @@ use crate::storage::{
 	LsmRunSummary, LsmSourceFrame, LsmWrittenOutputRun, ManifestSnapshot, MvccRetentionPolicy,
 	OpenFlags, SlabPinGuard, SlabPinTable, SlabState, TierCommitter, VersionEntry,
 	VersionLifecycle, VisibleDomainRow, apply_elision, cluster_retention_floor,
-	compaction_visible_domain_summary, effective_table_retention, pick_compaction,
-	required_output_run_count, storage_row_table_object_id_at, survivor_records, write_file,
+	compaction_visible_domain_summary, effective_table_retention, required_output_run_count,
+	storage_row_table_object_id_at, survivor_records, write_file,
 };
 use arrow::array::{Array, BooleanArray};
 use arrow::compute::concat_batches;
@@ -645,6 +649,10 @@ pub struct SlabManager {
 	/// state machine, and their redb transactions also stamp the
 	/// highest applied control-log index we have mirrored so far.
 	persistent_index: Option<Arc<PersistentLocalIndex>>,
+	/// ADR 0097 decision 4: the one admission truth every maintenance tick, the
+	/// reservation guard and the operator accessor consult. Hydrated once at open
+	/// from the persistent index and never replaced.
+	maintenance_policy: Arc<MaintenancePolicyInner>,
 	/// Retired tier pointers that still need local cleanup retried.
 	///
 	/// A tier-retirement apply may succeed in the state machine but
@@ -1540,6 +1548,18 @@ impl SlabManager {
 			}
 		}
 
+		// ADR 0097 decision 4: admission truth is hydrated ONCE, before the manager
+		// exists, from the same index handle serving uses. `None` is not empty
+		// history - it is the absence of a record, and no record means no maintenance.
+		let maintenance_policy = match &persistent_index {
+			Some(index) => {
+				MaintenancePolicyInner::load(Arc::clone(index), Arc::new(SystemMaintenanceClock))
+					.await
+			}
+			None => MaintenancePolicyInner::disabled(
+				"no persistent index: maintenance receipts have nowhere to live",
+			),
+		};
 		let manager = Self {
 			config,
 			file_ops,
@@ -1564,6 +1584,7 @@ impl SlabManager {
 			quarantined_compaction_slabs: DashSet::new(),
 			relocated_reads: DashMap::new(),
 			persistent_index,
+			maintenance_policy,
 			retired_tiered_cleanup: DashMap::new(),
 			secondary_index_segments,
 			secondary_index_coverage,
@@ -1813,6 +1834,11 @@ impl SlabManager {
 		] {
 			self.record_missing_published_reference(missing_slab_id, reference_kind, origin);
 		}
+	}
+
+	/// ADR 0097 decision 4: the policy, for the operator accessor and the requeue.
+	pub(crate) fn maintenance_policy(&self) -> &Arc<MaintenancePolicyInner> {
+		&self.maintenance_policy
 	}
 
 	pub(crate) fn is_compaction_slab_quarantined(&self, slab_id: SlabId) -> bool {

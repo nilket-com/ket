@@ -1,5 +1,6 @@
 use super::secondary_index_segments::MaintenanceClaims;
 use super::*;
+use crate::storage::maintenance_policy::{DeterministicOrigin, deterministic_failure};
 
 #[derive(Clone, Copy)]
 pub(super) struct CompactionRecord {
@@ -880,8 +881,9 @@ impl SlabManager {
 		claims: &MaintenanceClaims,
 	) -> std::io::Result<Option<CompactionOutcome>> {
 		if !claims.covers(slab_id) {
-			return Err(Error::new(
+			return Err(deterministic_failure(
 				ErrorKind::InvalidInput,
+				DeterministicOrigin::MaintenanceRewriteWithoutClaim,
 				format!(
 					"maintenance rewrite of slab {slab_id} without holding its claim; \
 					 the job owns {:?}",
