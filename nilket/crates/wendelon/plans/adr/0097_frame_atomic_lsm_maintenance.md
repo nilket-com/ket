@@ -115,11 +115,67 @@ rather than attempted.
   protects host memory and does **not** stop the work: the rewrite and the
   backfill disagree about who owns the slab, which is decision 3 above, and it is
   the retention path rather than compaction that demonstrates it.
+- The retention half has no pause of its own: `reclaim_mvcc_retention_once` was
+  called unconditionally inside `spawn_migration_sweeper`. `9fd01c9c` adds a
+  default-false `mvcc_retention_paused` node-local switch that skips **only**
+  that call - migrations and tombstoned-range reclaim still run, and the read
+  floor is a policy decision that does not move when reclaim stops. Its test
+  asserts both halves: nothing is pruned, AND a read behind the window is still
+  refused exactly as on an unpaused node. Like the compaction switch, it is
+  containment and not a fix.
 - `MemoryMax` on the unit protects the host but converts a host OOM into a
   contained restart loop. It is not a substitute for this record.
 - The heavy-churn exhibit that discharged the ADR 0055 slab-pin work did not
   produce this shape. Whatever exhibit closes this record must generate multi-row
   frames with partial survivors, or it will pass while the defect stands.
+
+## Rollout
+
+The local profile is stopped with both maintenance workers held off. Nothing here
+is scheduled: each step is gated on evidence, and there are **two distinct
+rollouts** that must not be collapsed into one.
+
+These switches are node-local and live only in the deployed config, so nothing
+else in this repository records that they are set. That is why they are here.
+
+### 1. Containment-switch rollout - gated on need, not on the fix
+
+Triggered only when the local deployment is needed again, and performed in a
+maintenance window.
+
+- Deploy HEAD. Note that this also ships every Toron change since 2026-08-26,
+  including ADR 580's batch-local join route: it is a deliberate rollout, not a
+  containment step.
+- **Set both switches before first start**, not after. `lsm_compaction_paused`
+  and `mvcc_retention_paused` both `true`. Starting first and setting second
+  hands the sweeper a window in which to resume the rewrite loop.
+- Leave telemetry stopped.
+- Verify: `LOCAL_READY`, stable RSS, stable I/O, and **zero maintenance
+  attempts**. A quiet log is not enough on its own - the I/O counters are what
+  distinguish "not attempting" from "attempting and not logging".
+
+### 2. ADR 97 fix rollout - gated on acceptance, then on a canary
+
+Only after all five decisions above are implemented and this record's Acceptance
+passes. Deploy with **both workers still paused**, then bring them back one at a
+time so that a regression names its own owner:
+
+- **Retention alone**, for at least three cycles.
+- **LSM alone**, through a successful multi-row compaction - success, not merely
+  absence of the unsupported error.
+- **Both together**, long enough to exercise ownership arbitration between them.
+  This stage is the one that tests decision 3, and neither single-worker stage
+  can stand in for it.
+
+### Resuming telemetry and performance runs
+
+Only after **all three** hold: RSS returns to baseline, disk churn converges, and
+no `missing source`, `inconsistent frames` or `does not yet split multi-row
+frames` error appears. Any one of them alone is compatible with the defect still
+being present.
+
+Until the deployment is needed or these gates pass, the box stays offline. The
+backup at `wendelon.toml.bak-20260831` is not restored at any point above.
 
 ## Risks
 
