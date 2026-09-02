@@ -118,8 +118,12 @@ fn create_plot_with_source_token(
 			resolved_category_colors(spec),
 		),
 		ResolvedKernelFields::Scatter { color, x, y } => {
-			let scatter_data = Arc::new(scatter::prepare_scatter_data_resolved(
-				df, spec, width, height,
+			let scatter_data = Arc::new(scatter::prepare_scatter_data_resolved_with_subject(
+				df,
+				spec,
+				source_token,
+				width,
+				height,
 			));
 			if spec.composition.is_scatter_with_line_overlay() {
 				let line_data = Arc::new(prepare_resolved_line(
@@ -402,13 +406,40 @@ pub fn create_styled_plot(
 	df: &DataFrame,
 	layer_settings: LayerSettings,
 ) -> Result<Arc<dyn PlotKernel + Send + Sync>, String> {
+	create_styled_plot_with_source_token(
+		spec,
+		df,
+		crate::result_artifact::ArtifactToken::mint(),
+		layer_settings,
+	)
+}
+
+pub fn create_styled_plot_from_artifact(
+	spec: &ResolvedPlotSpec,
+	df: &DataFrame,
+	source: &crate::result_artifact::ResultArtifact,
+	layer_settings: LayerSettings,
+) -> Result<Arc<dyn PlotKernel + Send + Sync>, String> {
+	create_styled_plot_with_source_token(spec, df, source.artifact_token(), layer_settings)
+}
+
+fn create_styled_plot_with_source_token(
+	spec: &ResolvedPlotSpec,
+	df: &DataFrame,
+	source_token: crate::result_artifact::ArtifactToken,
+	layer_settings: LayerSettings,
+) -> Result<Arc<dyn PlotKernel + Send + Sync>, String> {
 	let plot_type = spec.composition.primary_plot_type();
 	match spec.kernel_fields.as_ref() {
 		ResolvedKernelFields::Scatter { .. } => Ok(Arc::new(
 			crate::plot::kernels::scatter::ScatterPlotKernel::with_layer_settings(
 				Arc::new(
-					crate::plot::kernels::scatter::prepare_scatter_data_resolved(
-						df, spec, 1200, 720,
+					crate::plot::kernels::scatter::prepare_scatter_data_resolved_with_subject(
+						df,
+						spec,
+						source_token,
+						1200,
+						720,
 					),
 				),
 				layer_settings,
@@ -531,7 +562,10 @@ fn create_layered_plot_with_artifact(
 	let (first, rest) = resolved.layers.into_parts();
 	let is_single_layer = rest.is_empty();
 	if is_single_layer && first.settings == crate::plot::spec::LayerSettings::default() {
-		return Ok(create_plot(&first.spec, df, width, height));
+		return Ok(match source {
+			Some(source) => create_plot_from_artifact(&first.spec, df, source, width, height),
+			None => create_plot(&first.spec, df, width, height),
+		});
 	}
 
 	let shared_layout = ResolvedLayout::from_spec(&first.spec, width, height);
@@ -578,7 +612,10 @@ fn create_layered_plot_with_artifact(
 	} else {
 		(None, None)
 	};
-	let first = prepare_layer_renderer(first, df, width, height);
+	let source_token = source
+		.map(crate::result_artifact::ResultArtifact::artifact_token)
+		.unwrap_or_else(crate::result_artifact::ArtifactToken::mint);
+	let first = prepare_layer_renderer(first, df, source_token, width, height);
 	// A modifier changes presentation, not scale. Preserve the established
 	// mark-specific prepared range for a styled one-layer plot; only a genuine
 	// composition enters PRODUCT-0013's shared-domain layout.
@@ -589,7 +626,13 @@ fn create_layered_plot_with_artifact(
 	};
 	let mut layers = NonEmpty::new(first);
 	for layer in rest {
-		layers.push(prepare_layer_renderer(layer, df, width, height));
+		layers.push(prepare_layer_renderer(
+			layer,
+			df,
+			source_token,
+			width,
+			height,
+		));
 	}
 	Ok(Arc::new(LayeredPlotKernel::new(
 		layers,
@@ -607,6 +650,7 @@ fn create_layered_plot_with_artifact(
 fn prepare_layer_renderer(
 	layer: ResolvedLayerSpec,
 	df: &DataFrame,
+	source_token: crate::result_artifact::ArtifactToken,
 	width: u32,
 	height: u32,
 ) -> LayerRenderer {
@@ -621,9 +665,10 @@ fn prepare_layer_renderer(
 			layer.settings,
 		),
 		(LayerMark::Scatter, ResolvedKernelFields::Scatter { .. }) => LayerRenderer::scatter(
-			Arc::new(scatter::prepare_scatter_data_resolved(
+			Arc::new(scatter::prepare_scatter_data_resolved_with_subject(
 				df,
 				&layer.spec,
+				source_token,
 				width,
 				height,
 			)),

@@ -26,7 +26,7 @@ use crate::plot::core::PlotType;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 use crate::plot::factory::create_plot_from_artifact;
 #[cfg(feature = "toron")]
-use crate::plot::factory::{create_layered_plot_from_artifact, create_styled_plot};
+use crate::plot::factory::{create_layered_plot_from_artifact, create_styled_plot_from_artifact};
 #[cfg(feature = "toron")]
 use crate::plot::grid::{PlotGrid, PlotGridKernel};
 #[cfg(feature = "toron")]
@@ -3102,9 +3102,10 @@ fn rune_view_outcome_with_palettes(
 											},
 										));
 									}
-									create_styled_plot(
+									create_styled_plot_from_artifact(
 										&resolved.resolved_spec,
 										&resolved.data,
+										&resolved.artifact,
 										settings.clone(),
 									)
 									.map_err(|error| error.to_string())
@@ -5200,17 +5201,13 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				app_state.status_msg = "No live plots to export.".to_owned();
 				return Task::none();
 			}
-			let export_jobs = snapshots
-				.into_iter()
-				.enumerate()
-				.map(|(index, snapshot)| render_plot_export(snapshot, format, index + 1))
-				.collect::<Vec<_>>();
-			let count = export_jobs.len();
+			let count = snapshots.len();
 			app_state.status_msg = format!("Exporting {count} plots as {format}...");
 			return Task::perform(
 				async move {
 					tokio::task::spawn_blocking(move || {
-						for job in export_jobs {
+						for (index, snapshot) in snapshots.into_iter().enumerate() {
+							let job = render_plot_export(snapshot, format, index + 1);
 							job.write_to(std::path::Path::new("."));
 						}
 					})
@@ -5471,7 +5468,8 @@ mod tests {
 	use crate::plot::core::PlotType;
 	#[cfg(feature = "toron")]
 	use crate::plot::factory::{
-		create_layered_plot, create_layered_plot_from_artifact, create_plot, create_styled_plot,
+		create_layered_plot, create_layered_plot_from_artifact, create_plot,
+		create_plot_from_artifact, create_styled_plot, create_styled_plot_from_artifact,
 	};
 	#[cfg(feature = "toron")]
 	use crate::plot::grid::PlotGrid;
@@ -6544,7 +6542,13 @@ mod tests {
 				.expect("prepared plot panel");
 			match plot {
 				ReadyPlot::Single(presentation, resolved, authored_settings, continuation) => {
-					let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
+					let kernel = create_plot_from_artifact(
+						&resolved.resolved_spec,
+						&resolved.data,
+						&resolved.artifact,
+						1200,
+						720,
+					);
 					drop(update(
 						state,
 						Message::RuneRelationPlotReady {
@@ -6567,9 +6571,13 @@ mod tests {
 					authored_settings,
 					continuation,
 				) => {
-					let kernel =
-						create_styled_plot(&resolved.resolved_spec, &resolved.data, layer_settings)
-							.expect("styled plot kernel");
+					let kernel = create_styled_plot_from_artifact(
+						&resolved.resolved_spec,
+						&resolved.data,
+						&resolved.artifact,
+						layer_settings,
+					)
+					.expect("styled plot kernel");
 					drop(update(
 						state,
 						Message::RuneRelationPlotReady {
@@ -9810,7 +9818,7 @@ workspace.table("bad").views([view("bad", table())]);
 	}
 
 	#[test]
-	fn product_0075_markdown_pane_plot_uses_results_while_inline_and_none_do_not() {
+	fn product_0075_product_0149_markdown_plot_exports_exact_raster_data() {
 		use crate::gui::messages::ExportFormat;
 		use crate::plot::composition::PlotComposition;
 		use crate::plot::core::PlotType;
@@ -9836,7 +9844,7 @@ workspace.table("bad").views([view("bad", table())]);
 					),
 				},
 				authored_spec: AuthoredPlotSpec::xy(
-					PlotComposition::single(PlotType::Line),
+					PlotComposition::single(PlotType::Scatter),
 					"x",
 					"y",
 				),
@@ -9898,15 +9906,22 @@ workspace.table("bad").views([view("bad", table())]);
 			let mut snapshot = state.code_editor.host_plot_exports().remove(0);
 			snapshot.width = 160.0;
 			snapshot.height = 100.0;
+			snapshot.settings_model.library_defaults.scatter_render_mode =
+				crate::plot::common::ScatterRenderMode::Rasterized;
 			super::render_plot_export(snapshot, format, ordinal).write_to(&export_root);
 			let path = export_root.join(format!("plot_{ordinal}.{extension}"));
 			let bytes = std::fs::read(&path).expect("rendered export artifact");
 			assert!(bytes.len() > 32, "{format} export is non-empty");
 			match format {
-				ExportFormat::SVG => assert!(
-					String::from_utf8(bytes).unwrap().contains("<svg"),
-					"SVG export carries the rendered plot document"
-				),
+				ExportFormat::SVG => {
+					let svg = String::from_utf8(bytes).unwrap();
+					assert!(svg.contains("<svg"), "SVG export carries the plot document");
+					assert!(
+						svg.contains("data:image/png;base64"),
+						"exact raster export contains data pixels, never a preparing marker"
+					);
+					assert!(!svg.contains("preparing raster"));
+				}
 				ExportFormat::PNG => assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n"),
 				ExportFormat::AVIF => assert!(
 					bytes.windows(8).any(|window| window == b"ftypavif"),

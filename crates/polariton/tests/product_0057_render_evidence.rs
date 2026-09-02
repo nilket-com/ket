@@ -1092,6 +1092,14 @@ fn product_0068_line_fixture(color: Color) -> LinePlotKernel {
 
 fn product_0068_scatter_fixture(color: Color) -> ScatterPlotKernel {
 	ScatterPlotKernel::new(Arc::new(ScatterPreparedData {
+		raster_subject: plot::raster::RasterSubject {
+			publication: result_artifact::ArtifactToken::mint(),
+			binding: plot::raster::RasterFieldBinding {
+				x: "x".to_owned(),
+				y: "y".to_owned(),
+				color: None,
+			},
+		},
 		series: vec![ScatterSeries {
 			name: "point".to_owned(),
 			x_values: Float64Chunked::from_slice("x".into(), &[0.5]),

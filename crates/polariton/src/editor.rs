@@ -546,6 +546,7 @@ struct NotebookPlotSurface {
 	settings: ResolvedPlotSettings,
 	hovered_info: Option<String>,
 	render_revision: u64,
+	raster_coordinator: crate::plot::raster::RasterCoordinator,
 }
 
 impl NotebookPlotSurface {
@@ -556,12 +557,26 @@ impl NotebookPlotSurface {
 			settings: ResolvedPlotSettings::default(),
 			hovered_info: None,
 			render_revision: 0,
+			raster_coordinator: crate::plot::raster::RasterCoordinator::new(),
 		}
 	}
 
-	fn update(&mut self, message: crate::gui::messages::PlotMessage) {
+	fn update(
+		&mut self,
+		message: crate::gui::messages::PlotMessage,
+	) -> Option<crate::plot::raster::RasterJob> {
 		match message {
 			crate::gui::messages::PlotMessage::UpdateHover(hover) => self.hovered_info = hover,
+			crate::gui::messages::PlotMessage::RasterRequested(wants) => {
+				return self.raster_coordinator.request(wants);
+			}
+			crate::gui::messages::PlotMessage::RasterCompleted(completion) => {
+				let update = self.raster_coordinator.complete(completion);
+				if update.published {
+					self.render_revision = self.render_revision.wrapping_add(1);
+				}
+				return update.next_job;
+			}
 			crate::gui::messages::PlotMessage::ToggleSettingsInspector => {
 				// Notebook plots do not render the host-panel inspector control.
 			}
@@ -572,6 +587,7 @@ impl NotebookPlotSurface {
 				// PRODUCT-0142 explicitly refuses notebook-cell span rebasing.
 			}
 		}
+		None
 	}
 }
 
@@ -2353,15 +2369,33 @@ impl CodeEditor {
 						self.plot_writeback_gestures
 							.push_back(PlotWritebackGesture::Cancel { panel_id });
 					}
-					PlotPaneMsg::UpdateHover(_) | PlotPaneMsg::ToggleSettingsInspector => {}
+					PlotPaneMsg::UpdateHover(_)
+					| PlotPaneMsg::RasterRequested(_)
+					| PlotPaneMsg::RasterCompleted(_)
+					| PlotPaneMsg::ToggleSettingsInspector => {}
 				}
-				self.panels.update_plot(panel_id, message);
+				if let Some(job) = self.panels.update_plot(panel_id, message) {
+					return Task::perform(
+						crate::plot::raster::run_raster_job(job),
+						move |completion| EditorMsg::HostPlot {
+							panel_id,
+							message: PlotPaneMsg::RasterCompleted(completion),
+						},
+					);
+				}
 			}
 			EditorMsg::NotebookPlot { identity, message } => {
 				if let Some(NotebookCellOutput::Plot { surface }) =
 					self.notebook_outputs.get_mut(&identity)
+					&& let Some(job) = surface.update(message)
 				{
-					surface.update(message);
+					return Task::perform(
+						crate::plot::raster::run_raster_job(job),
+						move |completion| EditorMsg::NotebookPlot {
+							identity: identity.clone(),
+							message: PlotPaneMsg::RasterCompleted(completion),
+						},
+					);
 				}
 			}
 			EditorMsg::Input(InputEvent::Key {
@@ -3594,14 +3628,19 @@ impl PanelRegistry {
 		}
 	}
 
-	fn update_plot(&mut self, panel_id: HostPanelId, message: PlotPaneMsg) {
+	fn update_plot(
+		&mut self,
+		panel_id: HostPanelId,
+		message: PlotPaneMsg,
+	) -> Option<crate::plot::raster::RasterJob> {
 		if let Some(PanelEntry {
 			content: PanelContent::Plot(plot),
 			..
 		}) = self.panels.get_mut(&panel_id)
 		{
-			plot.update(message);
+			return plot.update(message);
 		}
+		None
 	}
 
 	fn set_plot(
@@ -4826,15 +4865,18 @@ fn markdown_cell_output_surface<'a>(
 				.into()
 		}
 		NotebookCellOutput::Plot { surface } => {
-			let plot: Element<'_, crate::gui::messages::PlotMessage> = canvas(PlotWidget::new(
-				surface.kernel.as_ref(),
-				surface.composition.title(),
-				20.0,
-				crate::plot::theme::PlotSettings::from_resolved(surface.settings.clone()),
-				surface.render_revision,
-				false,
-				PlotRenderLayer::Full,
-			))
+			let plot: Element<'_, crate::gui::messages::PlotMessage> = canvas(
+				PlotWidget::new(
+					surface.kernel.as_ref(),
+					surface.composition.title(),
+					20.0,
+					crate::plot::theme::PlotSettings::from_resolved(surface.settings.clone()),
+					surface.render_revision,
+					false,
+					PlotRenderLayer::Full,
+				)
+				.with_raster_coordinator(&surface.raster_coordinator),
+			)
 			.width(Length::Fill)
 			.height(Length::Fill)
 			.into();

@@ -4763,12 +4763,14 @@ fn product_0114_band_requirements_precede_and_feed_shared_geometry() {
 
 	// The per-cell plot rectangle — the raster's width and height — is cell
 	// geometry too, and is resolved once per cell in each entry point's loop.
+	// PRODUCT-0149 adds the interactive request and draw traversals to the three
+	// exact/overlay/hit traversals banked here.
 	assert_eq!(
 		composite
 			.matches("cell.kernel.resolve_settings(settings)")
 			.count(),
-		3,
-		"each grid entry point resolves the cell's plot area through its own kernel"
+		5,
+		"all five grid entry points resolve the cell's plot area through its own kernel"
 	);
 	assert!(
 		!composite.contains("grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &resolved)"),
@@ -5865,4 +5867,105 @@ fn product_0148_candlestick_surface_has_one_transport_and_no_colour_or_layer_wid
 		.next()
 		.expect("candlestick production");
 	assert!(!production.contains("get_color"));
+}
+
+#[test]
+fn product_0149_interactive_rasters_request_in_update_and_only_draw_published_pixels() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let scatter =
+		std::fs::read_to_string(root.join("plot/kernels/scatter.rs")).expect("read scatter kernel");
+	let grid = std::fs::read_to_string(root.join("plot/grid.rs")).expect("read plot grid");
+
+	let update = common
+		.split("fn update(")
+		.nth(1)
+		.and_then(|rest| rest.split("fn mouse_interaction(").next())
+		.expect("bounded canvas update");
+	let redraw = update.find("RedrawRequested").expect("redraw request seam");
+	let data_return = update
+		.find("if self.layer == PlotRenderLayer::Data")
+		.expect("data-layer return");
+	assert!(
+		redraw < data_return,
+		"raster wants publish before the data canvas returns"
+	);
+	assert!(update.contains("PlotMessage::RasterRequested(wants)"));
+	let dedup = update
+		.find("!coordinator.is_current(&wants)")
+		.expect("pre-publication coordinator deduplication");
+	let publish = update
+		.find("PlotMessage::RasterRequested(wants)")
+		.expect("raster request publication");
+	assert!(
+		dedup < publish,
+		"deduplication must precede UI message publication"
+	);
+	assert!(common.contains("with_raster_coordinator"));
+
+	let renderer = scatter
+		.split("pub struct ScatterMarkRenderer")
+		.nth(1)
+		.and_then(|rest| rest.split("enum ResolvedScatterRenderMode").next())
+		.expect("scatter renderer fields");
+	assert!(!renderer.contains("raster_cache"));
+	let interactive = scatter
+		.split("pub(crate) fn draw_interactive(")
+		.nth(1)
+		.and_then(|rest| rest.split("impl MarkRenderer").next())
+		.expect("interactive scatter draw");
+	assert!(!interactive.contains("build_raster_rgba"));
+	assert!(interactive.contains("coordinator.bitmap(slot)"));
+	let grid_interactive = grid
+		.split("fn render_plot_layer_interactive(")
+		.nth(1)
+		.and_then(|rest| rest.split("fn render_overlay_layer(").next())
+		.expect("interactive grid render");
+	assert!(grid_interactive.contains("cell.kernel.plot_interactive("));
+	assert!(!grid_interactive.contains("plot_with_settings("));
+}
+
+#[test]
+fn product_0149_coordinators_own_identity_admission_and_exact_export_boundaries() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let raster = std::fs::read_to_string(root.join("plot/raster.rs")).expect("read raster core");
+	let scatter =
+		std::fs::read_to_string(root.join("plot/kernels/scatter.rs")).expect("read scatter kernel");
+	let host =
+		std::fs::read_to_string(root.join("gui/plot_pane/state.rs")).expect("read host plot state");
+	let editor = std::fs::read_to_string(root.join("editor.rs")).expect("read editor");
+	let gui = std::fs::read_to_string(root.join("gui/state.rs")).expect("read gui state");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read plot factory");
+
+	assert!(host.contains("pub raster_coordinator: crate::plot::raster::RasterCoordinator"));
+	let notebook = editor
+		.split("struct NotebookPlotSurface")
+		.nth(1)
+		.and_then(|rest| rest.split("impl NotebookPlotSurface").next())
+		.expect("notebook plot state");
+	assert!(notebook.contains("raster_coordinator: crate::plot::raster::RasterCoordinator"));
+	assert!(raster.contains("current_slot_request: Arc<AtomicU64>"));
+	assert!(raster.contains("pub fn is_current(&self, wants: &[ScatterRasterWant]) -> bool"));
+	assert!(scatter.contains("current.load(Ordering::Acquire) != request"));
+	assert!(raster.contains("(parallelism.get() / 2).max(1)"));
+	assert!(raster.contains("unwrap_or(1)"));
+	assert!(!raster.contains("JoinHandle::abort"));
+	assert!(factory.contains("prepare_scatter_data_resolved_with_subject"));
+	assert!(factory.contains("source.artifact_token()"));
+
+	let export = gui
+		.split("Message::Export(format) =>")
+		.nth(1)
+		.and_then(|rest| rest.split("Message::ExportDone").next())
+		.expect("export update arm");
+	let blocking = export
+		.find("spawn_blocking")
+		.expect("blocking export context");
+	let rendering = export
+		.find("render_plot_export(snapshot")
+		.expect("export rendering call");
+	assert!(
+		blocking < rendering,
+		"rendering itself belongs inside the blocking task"
+	);
 }

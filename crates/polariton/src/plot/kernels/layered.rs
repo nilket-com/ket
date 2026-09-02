@@ -91,6 +91,45 @@ impl LayerRenderer {
 		}
 	}
 
+	fn collect_raster_want(
+		&self,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		settings: &PlotSettings,
+		slot: &crate::plot::raster::RasterSlotId,
+		out: &mut Vec<crate::plot::raster::ScatterRasterWant>,
+	) {
+		if let Self::Scatter(renderer, layer) = self {
+			let resolved = settings.resolve_for_layer(layer);
+			renderer.collect_raster_want(bounds, transform, resolved, slot, out);
+		}
+	}
+
+	fn draw_interactive(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		settings: &PlotSettings,
+		coordinator: &crate::plot::raster::RasterCoordinator,
+		slot: &crate::plot::raster::RasterSlotId,
+		preparing: &mut bool,
+	) {
+		let resolved = settings.resolve_for_layer(self.settings());
+		match self {
+			Self::Line(renderer, _) => renderer.draw(backend, bounds, transform, resolved),
+			Self::Scatter(renderer, _) => renderer.draw_interactive(
+				backend,
+				bounds,
+				transform,
+				resolved,
+				coordinator,
+				slot,
+				preparing,
+			),
+		}
+	}
+
 	fn hit_test(
 		&self,
 		transform: &CoordinateTransformer,
@@ -238,6 +277,44 @@ impl PlotKernel for LayeredPlotKernel {
 				bounds,
 				transform,
 				settings.resolve_for_layer(layer.settings()),
+			);
+		}
+	}
+
+	fn collect_raster_wants(
+		&self,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		settings: &PlotSettings,
+		slot: &crate::plot::raster::RasterSlotId,
+		out: &mut Vec<crate::plot::raster::ScatterRasterWant>,
+	) {
+		for (index, layer) in self.layers.iter().enumerate() {
+			layer.collect_raster_want(bounds, transform, settings, &slot.child(index), out);
+		}
+	}
+
+	fn plot_interactive(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		_cursor: Cursor,
+		settings: &PlotSettings,
+		_motion: crate::plot::common::ViewportMotion,
+		coordinator: &crate::plot::raster::RasterCoordinator,
+		slot: &crate::plot::raster::RasterSlotId,
+		preparing: &mut bool,
+	) {
+		for (index, layer) in self.layers.iter().enumerate() {
+			layer.draw_interactive(
+				backend,
+				bounds,
+				transform,
+				settings,
+				coordinator,
+				&slot.child(index),
+				preparing,
 			);
 		}
 	}

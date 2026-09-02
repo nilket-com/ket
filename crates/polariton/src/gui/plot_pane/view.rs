@@ -22,15 +22,18 @@ pub fn host_view(
 	attachment_status: SourceAttachmentStatus,
 ) -> Element<'_, PlotMessage> {
 	let title = state.display_label.clone();
-	let data = canvas(PlotWidget::new(
-		state.kernel.as_ref(),
-		title.clone(),
-		20.0,
-		state.plot_settings_model.clone(),
-		state.render_revision,
-		state.resize_render_suspended,
-		PlotRenderLayer::Data,
-	))
+	let data = canvas(
+		PlotWidget::new(
+			state.kernel.as_ref(),
+			title.clone(),
+			20.0,
+			state.plot_settings_model.clone(),
+			state.render_revision,
+			state.resize_render_suspended,
+			PlotRenderLayer::Data,
+		)
+		.with_raster_coordinator(&state.raster_coordinator),
+	)
 	.width(Fill)
 	.height(Fill);
 	let interaction = canvas(

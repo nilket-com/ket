@@ -10,6 +10,8 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub enum PlotPaneMsg {
 	UpdateHover(Option<String>),
+	RasterRequested(Vec<crate::plot::raster::ScatterRasterWant>),
+	RasterCompleted(crate::plot::raster::RasterCompletion),
 	ToggleSettingsInspector,
 	SettingChanged(SettingKey, String),
 	SettingSubmitted(SettingKey),
@@ -44,6 +46,7 @@ pub struct HostPlotState {
 	pub hovered_info: Option<String>,
 	pub render_revision: u64,
 	pub resize_render_suspended: bool,
+	pub raster_coordinator: crate::plot::raster::RasterCoordinator,
 	pub(crate) settings_inspector_open: bool,
 	pub(crate) source_attachment: Option<PlotSourceAttachment>,
 	pub(crate) plot_type: Option<PlotType>,
@@ -93,6 +96,7 @@ impl HostPlotState {
 			hovered_info: None,
 			render_revision: 0,
 			resize_render_suspended: false,
+			raster_coordinator: crate::plot::raster::RasterCoordinator::new(),
 			settings_inspector_open: false,
 			source_attachment: None,
 			plot_type: None,
@@ -125,6 +129,7 @@ impl HostPlotState {
 		self.setting_drafts.clear();
 		self.display_label = display_label;
 		self.kernel = kernel;
+		self.raster_coordinator.invalidate();
 		self.plot_settings_model =
 			host_plot_settings_model(default_application_plot_settings(), authored_settings);
 		self.plot_settings = self.plot_settings_model.resolve();
@@ -155,6 +160,7 @@ impl HostPlotState {
 		}
 		self.display_label = display_label;
 		self.kernel = kernel;
+		self.raster_coordinator.invalidate();
 		self.plot_settings_model =
 			host_plot_settings_model(default_application_plot_settings(), authored_settings);
 		self.plot_settings = self.plot_settings_model.resolve();
@@ -172,6 +178,7 @@ impl HostPlotState {
 		};
 		self.display_label = authoritative.display_label;
 		self.kernel = authoritative.kernel;
+		self.raster_coordinator.invalidate();
 		self.plot_settings = authoritative.plot_settings;
 		self.plot_settings_model = authoritative.plot_settings_model;
 		self.source_attachment = authoritative.source_attachment;
@@ -215,9 +222,19 @@ impl HostPlotState {
 		self.plot_type = plot_type;
 	}
 
-	pub fn update(&mut self, message: PlotPaneMsg) {
+	pub fn update(&mut self, message: PlotPaneMsg) -> Option<crate::plot::raster::RasterJob> {
 		match message {
 			PlotPaneMsg::UpdateHover(hover) => self.hovered_info = hover,
+			PlotPaneMsg::RasterRequested(wants) => {
+				return self.raster_coordinator.request(wants);
+			}
+			PlotPaneMsg::RasterCompleted(completion) => {
+				let update = self.raster_coordinator.complete(completion);
+				if update.published {
+					self.render_revision = self.render_revision.wrapping_add(1);
+				}
+				return update.next_job;
+			}
 			PlotPaneMsg::ToggleSettingsInspector => {
 				self.settings_inspector_open = !self.settings_inspector_open;
 			}
@@ -236,5 +253,6 @@ impl HostPlotState {
 				self.writeback_status = None;
 			}
 		}
+		None
 	}
 }

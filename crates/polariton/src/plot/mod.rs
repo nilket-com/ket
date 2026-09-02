@@ -12,6 +12,7 @@ pub mod gradient_stops;
 pub mod grid;
 pub mod kernels;
 pub mod legend;
+pub mod raster;
 pub mod request;
 pub mod spec;
 pub(crate) mod text_estimate;

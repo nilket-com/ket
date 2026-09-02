@@ -4,16 +4,19 @@ use crate::plot::common::{
 	polars_type_to_axis_type, temporal_axis_domain,
 };
 use crate::plot::legend::LegendProvenance;
+use crate::plot::raster::{RasterFieldBinding, RasterSubject};
 use crate::plot::spec::{
 	Channel, LayerSettings, PointSize, ResolvedColor, ResolvedLayout, ResolvedPlotSpec,
 	ScaleDomain, ScaleFamily,
 };
 use crate::plot::theme::PlotSettings;
+#[cfg(test)]
 use iced::advanced::image;
 use iced::advanced::mouse::Cursor;
 use iced::{Color, Point, Rectangle};
 use polars::prelude::*;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct ScatterPlotKernel {
 	pub prepared_data: Arc<ScatterPreparedData>,
@@ -23,7 +26,6 @@ pub struct ScatterPlotKernel {
 
 pub struct ScatterMarkRenderer {
 	pub prepared_data: Arc<ScatterPreparedData>,
-	raster_cache: Mutex<Option<ScatterRasterCache>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,24 +35,22 @@ enum ResolvedScatterRenderMode {
 	Rasterized,
 }
 
-#[derive(Clone)]
-struct ScatterRasterCache {
-	key: ScatterRasterKey,
-	width: u32,
-	height: u32,
-	rgba: Arc<Vec<u8>>,
-	image_handle: image::Handle,
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScatterRasterKey {
+	pub width: u32,
+	pub height: u32,
+	pub point_size: u32,
+	pub x_range: (u64, u64),
+	pub y_range: (u64, u64),
+	pub background: [u8; 4],
+	pub series_colors: Vec<[u8; 4]>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct ScatterRasterKey {
-	width: u32,
-	height: u32,
-	point_size: u32,
-	x_range: (u64, u64),
-	y_range: (u64, u64),
-	background: [u8; 4],
-	series_colors: Vec<[u8; 4]>,
+#[derive(Clone, Debug)]
+pub struct ScatterRasterSettings {
+	pub point_radius: f32,
+	pub background: Color,
+	pub series_colors: Vec<Color>,
 }
 
 /// PRODUCT-0139 §2: the placement of a reused raster, in image space.
@@ -115,7 +115,7 @@ fn reuse_placement(
 impl ScatterRasterKey {
 	/// PRODUCT-0139 §2: everything except the domain must be identical, or the
 	/// cached pixels do not depict the same marks at a different viewport.
-	fn reusable_for(&self, current: &Self) -> bool {
+	pub(crate) fn reusable_for(&self, current: &Self) -> bool {
 		self.width == current.width
 			&& self.height == current.height
 			&& self.point_size == current.point_size
@@ -210,6 +210,43 @@ impl PlotKernel for ScatterPlotKernel {
 			transform,
 			settings.resolve_for_layer(&self.layer_settings),
 			motion,
+		);
+	}
+
+	fn collect_raster_wants(
+		&self,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		settings: &PlotSettings,
+		slot: &crate::plot::raster::RasterSlotId,
+		out: &mut Vec<crate::plot::raster::ScatterRasterWant>,
+	) {
+		let resolved = settings.resolve_for_layer(&self.layer_settings);
+		self.renderer
+			.collect_raster_want(bounds, transform, resolved, slot, out);
+	}
+
+	fn plot_interactive(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		_cursor: Cursor,
+		settings: &PlotSettings,
+		_motion: ViewportMotion,
+		coordinator: &crate::plot::raster::RasterCoordinator,
+		slot: &crate::plot::raster::RasterSlotId,
+		preparing: &mut bool,
+	) {
+		let resolved = settings.resolve_for_layer(&self.layer_settings);
+		self.renderer.draw_interactive(
+			backend,
+			bounds,
+			transform,
+			resolved,
+			coordinator,
+			slot,
+			preparing,
 		);
 	}
 
@@ -316,10 +353,7 @@ impl ScatterPlotKernel {
 
 impl ScatterMarkRenderer {
 	pub fn new(prepared_data: Arc<ScatterPreparedData>) -> Self {
-		Self {
-			prepared_data,
-			raster_cache: Mutex::new(None),
-		}
+		Self { prepared_data }
 	}
 
 	#[allow(dead_code)] // Geometric hit-testing is test-reachable until PRODUCT-0014.
@@ -357,7 +391,7 @@ impl ScatterMarkRenderer {
 		nearest
 	}
 
-	fn plot_vector(
+	pub(crate) fn plot_vector(
 		&self,
 		backend: &mut dyn PlotBackend,
 		transform: &CoordinateTransformer,
@@ -380,7 +414,7 @@ impl ScatterMarkRenderer {
 		}
 	}
 
-	fn plot_downsampled(
+	pub(crate) fn plot_downsampled(
 		&self,
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
@@ -413,58 +447,19 @@ impl ScatterMarkRenderer {
 		bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		settings: &ResolvedPlotSettings,
-		motion: ViewportMotion,
+		_motion: ViewportMotion,
 	) {
 		let width = bounds.width.max(1.0);
 		let height = bounds.height.max(1.0);
 		let key = self.raster_key(bounds, transform, settings);
-
-		// PRODUCT-0139 §1 and §5. A settled frame always rasterizes truly, so
-		// "exactly one true rasterization at settle" needs no settle event: it
-		// is the first frame after motion stops. Reuse is attempted only while
-		// moving, and only against the **last true raster** — the reuse branch
-		// stores nothing, which is §5's no-chaining rule by construction rather
-		// than by discipline.
-		if motion == ViewportMotion::Moving {
-			let cached = self.raster_cache.lock().unwrap().clone();
-			if let Some(cached) = cached {
-				if cached.key != key
-					&& cached.key.reusable_for(&key)
-					&& let Some(placement) = reuse_placement(&cached.key, &key, width, height)
-				{
-					self.draw_raster(backend, placement.top_left, placement.size, &cached);
-					return;
-				}
-			}
-		}
-
-		let raster = self.rasterize_with_key(key, bounds, transform, settings);
-		self.draw_raster(
-			backend,
+		let rgba = build_raster_rgba(&self.prepared_data, bounds, transform, settings);
+		backend.draw_image_rgba(
 			Point::ORIGIN,
 			iced::Size::new(width, height),
-			&raster,
+			key.width,
+			key.height,
+			&rgba,
 		);
-	}
-
-	fn draw_raster(
-		&self,
-		backend: &mut dyn PlotBackend,
-		top_left: Point,
-		size: iced::Size,
-		raster: &ScatterRasterCache,
-	) {
-		if backend.supports_native_image_handle() {
-			backend.draw_image_handle(top_left, size, &raster.image_handle);
-		} else {
-			backend.draw_image_rgba(
-				top_left,
-				size,
-				raster.width,
-				raster.height,
-				raster.rgba.as_slice(),
-			);
-		}
 	}
 
 	/// PRODUCT-0139 §1. `MarkRenderer::draw` delegates here with `Settled`, so
@@ -494,7 +489,7 @@ impl ScatterMarkRenderer {
 		}
 	}
 
-	fn raster_key(
+	pub(crate) fn raster_key(
 		&self,
 		bounds: Rectangle,
 		transform: &CoordinateTransformer,
@@ -516,57 +511,108 @@ impl ScatterMarkRenderer {
 		}
 	}
 
-	/// The whole-key form: compute the key, then hit or build. Reuse needs the
-	/// key before deciding, so production keeps the two steps separate above.
-	/// Tests use this convenience wrapper to exercise cache identity directly.
-	#[cfg(test)]
-	fn rasterize(
-		&self,
-		bounds: Rectangle,
-		transform: &CoordinateTransformer,
-		settings: &ResolvedPlotSettings,
-	) -> ScatterRasterCache {
-		let key = self.raster_key(bounds, transform, settings);
-		self.rasterize_with_key(key, bounds, transform, settings)
+	pub(crate) fn raster_settings(&self, settings: &ResolvedPlotSettings) -> ScatterRasterSettings {
+		ScatterRasterSettings {
+			point_radius: settings.point_size.radius_px(),
+			background: settings.chrome.canvas_background.iced(),
+			series_colors: self
+				.prepared_data
+				.series
+				.iter()
+				.map(|series| series_color(series, settings))
+				.collect(),
+		}
 	}
 
-	fn rasterize_with_key(
+	pub(crate) fn collect_raster_want(
 		&self,
-		key: ScatterRasterKey,
 		bounds: Rectangle,
 		transform: &CoordinateTransformer,
-		settings: &ResolvedPlotSettings,
-	) -> ScatterRasterCache {
-		let width = key.width;
-		let height = key.height;
-
-		if let Some(existing) = self
-			.raster_cache
-			.lock()
-			.unwrap()
-			.as_ref()
-			.filter(|cache| cache.key == key)
-			.cloned()
+		settings: ResolvedPlotSettings,
+		slot: &crate::plot::raster::RasterSlotId,
+		out: &mut Vec<crate::plot::raster::ScatterRasterWant>,
+	) {
+		if resolve_render_mode(self.prepared_data.total_points, true, bounds, &settings)
+			!= ResolvedScatterRenderMode::Rasterized
 		{
-			return existing;
+			return;
 		}
+		out.push(crate::plot::raster::ScatterRasterWant {
+			slot_id: slot.clone(),
+			subject: self.prepared_data.raster_subject.clone(),
+			key: self.raster_key(bounds, transform, &settings),
+			prepared_data: Arc::clone(&self.prepared_data),
+			layout: (*transform.layout).clone(),
+			settings: self.raster_settings(&settings),
+		});
+	}
 
-		let rgba = Arc::new(build_raster_rgba(
-			&self.prepared_data,
+	pub(crate) fn draw_interactive(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		settings: ResolvedPlotSettings,
+		coordinator: &crate::plot::raster::RasterCoordinator,
+		slot: &crate::plot::raster::RasterSlotId,
+		preparing: &mut bool,
+	) {
+		match resolve_render_mode(
+			self.prepared_data.total_points,
+			backend.supports_embedded_raster(),
 			bounds,
-			transform,
-			settings,
-		));
-		let image_handle = image::Handle::from_rgba(width, height, rgba.as_slice().to_vec());
-		let cache = ScatterRasterCache {
-			key,
-			width,
-			height,
-			rgba,
-			image_handle,
-		};
-		*self.raster_cache.lock().unwrap() = Some(cache.clone());
-		cache
+			&settings,
+		) {
+			ResolvedScatterRenderMode::Vector => self.plot_vector(backend, transform, &settings),
+			ResolvedScatterRenderMode::Downsampled => {
+				self.plot_downsampled(backend, bounds, transform, &settings)
+			}
+			ResolvedScatterRenderMode::Rasterized => {
+				let current = self.raster_key(bounds, transform, &settings);
+				let Some(bitmap) = coordinator.bitmap(slot) else {
+					*preparing = true;
+					return;
+				};
+				if bitmap.subject != self.prepared_data.raster_subject {
+					*preparing = true;
+					return;
+				}
+				let placement = if bitmap.key == current {
+					Some(ReusePlacement {
+						top_left: Point::ORIGIN,
+						size: iced::Size::new(bounds.width.max(1.0), bounds.height.max(1.0)),
+					})
+				} else if bitmap.key.reusable_for(&current) {
+					reuse_placement(
+						&bitmap.key,
+						&current,
+						bounds.width.max(1.0),
+						bounds.height.max(1.0),
+					)
+				} else {
+					None
+				};
+				let Some(placement) = placement else {
+					*preparing = true;
+					return;
+				};
+				if backend.supports_native_image_handle() {
+					backend.draw_image_handle(
+						placement.top_left,
+						placement.size,
+						&bitmap.image_handle,
+					);
+				} else {
+					backend.draw_image_rgba(
+						placement.top_left,
+						placement.size,
+						bitmap.width,
+						bitmap.height,
+						bitmap.rgba.as_slice(),
+					);
+				}
+			}
+		}
 	}
 }
 
@@ -640,6 +686,7 @@ impl ScatterSeries {
 }
 
 pub struct ScatterPreparedData {
+	pub raster_subject: RasterSubject,
 	pub series: Vec<ScatterSeries>,
 	pub x_categories: Option<Vec<String>>,
 	pub x_range: (f64, f64),
@@ -691,12 +738,9 @@ fn series_color(series: &ScatterSeries, settings: &ResolvedPlotSettings) -> Colo
 		.unwrap_or_else(|| settings.color_theme.get_color(series.color_t))
 }
 
-/// PRODUCT-0139 §10 gate 1's instrument: how many times the source points have
-/// been scanned. A reused frame must not move it.
-///
-/// Thread-local, not global: libtest runs each test on its own thread, and a
-/// shared counter would be raced by any other test that rasterizes — which
-/// showed up immediately as a gate that passed alone and failed in the suite.
+// PRODUCT-0139 §10 gate 1's instrument: how many times the source points have
+// been scanned. A reused frame must not move it. Thread-local, not global:
+// libtest runs each test on its own thread.
 #[cfg(test)]
 thread_local! {
 	pub(crate) static RASTER_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -708,24 +752,94 @@ fn build_raster_rgba(
 	transform: &CoordinateTransformer,
 	settings: &ResolvedPlotSettings,
 ) -> Vec<u8> {
+	let raster_settings = ScatterRasterSettings {
+		point_radius: settings.point_size.radius_px(),
+		background: settings.chrome.canvas_background.iced(),
+		series_colors: prepared_data
+			.series
+			.iter()
+			.map(|series| series_color(series, settings))
+			.collect(),
+	};
+	build_raster_rgba_inner(prepared_data, bounds, transform, &raster_settings, None)
+		.0
+		.expect("exact rasterization is not cancellable")
+}
+
+/// PRODUCT-0149 §6: reconstruct the affine transform from owned job inputs.
+/// Cooperative cancellation observes only this slot's current request id.
+pub(crate) fn build_raster_rgba_owned(
+	prepared_data: &ScatterPreparedData,
+	layout: &PlotLayout,
+	key: &ScatterRasterKey,
+	settings: &ScatterRasterSettings,
+	current_slot_request: &AtomicU64,
+	request_id: u64,
+) -> (Option<Vec<u8>>, usize) {
+	if current_slot_request.load(Ordering::Acquire) != request_id {
+		return (None, 0);
+	}
+	let bounds = Rectangle::new(
+		Point::ORIGIN,
+		iced::Size::new(key.width as f32, key.height as f32),
+	);
+	let transform = CoordinateTransformer::new(layout, bounds);
+	let (rgba, scanned) = build_raster_rgba_inner(
+		prepared_data,
+		bounds,
+		&transform,
+		settings,
+		Some((current_slot_request, request_id)),
+	);
+	(rgba, scanned)
+}
+
+fn build_raster_rgba_inner(
+	prepared_data: &ScatterPreparedData,
+	bounds: Rectangle,
+	transform: &CoordinateTransformer,
+	settings: &ScatterRasterSettings,
+	cancellation: Option<(&AtomicU64, u64)>,
+) -> (Option<Vec<u8>>, usize) {
 	let width = bounds.width.max(1.0).ceil() as usize;
 	let height = bounds.height.max(1.0).ceil() as usize;
 	#[cfg(test)]
 	RASTER_BUILDS.with(|builds| builds.set(builds.get() + 1));
 	let mut accum = vec![[0.0_f32; 4]; width * height];
-	let radius = settings.point_size.radius_px();
+	let radius = settings.point_radius;
 	let radius_squared = radius * radius;
+	let mut scanned_points = 0_usize;
 
-	for series in &prepared_data.series {
-		let color = series_color(series, settings);
-		series.for_each_point(|x, y| {
+	for (series_index, series) in prepared_data.series.iter().enumerate() {
+		let color = settings
+			.series_colors
+			.get(series_index)
+			.copied()
+			.unwrap_or(Color::BLACK);
+		for index in 0..series.len() {
+			scanned_points += 1;
+			if scanned_points.is_multiple_of(4_096)
+				&& cancellation
+					.is_some_and(|(current, request)| current.load(Ordering::Acquire) != request)
+			{
+				return (None, scanned_points);
+			}
+			let Some(x) = series.x_values.get(index) else {
+				continue;
+			};
+			let Some(y) = series.y_values.get(index) else {
+				continue;
+			};
+			if !x.is_finite() || !y.is_finite() {
+				continue;
+			}
 			let point = scatter_point(transform, x, y);
 			let min_x = (point.x - radius).floor().max(0.0) as usize;
 			let max_x = (point.x + radius).ceil().min(width as f32 - 1.0) as usize;
 			let min_y = (point.y - radius).floor().max(0.0) as usize;
 			let max_y = (point.y + radius).ceil().min(height as f32 - 1.0) as usize;
 			if min_x > max_x || min_y > max_y {
-				return;
+				continue;
 			}
 			for yi in min_y..=max_y {
 				for xi in min_x..=max_x {
@@ -741,10 +855,13 @@ fn build_raster_rgba(
 					accum[idx][3] += color.a.max(0.1);
 				}
 			}
-		});
+		}
 	}
 
-	let bg = settings.chrome.canvas_background.iced();
+	if cancellation.is_some_and(|(current, request)| current.load(Ordering::Acquire) != request) {
+		return (None, scanned_points);
+	}
+	let bg = settings.background;
 	let mut rgba = vec![0_u8; width * height * 4];
 	for (i, pixel) in accum.iter().enumerate() {
 		let base = i * 4;
@@ -770,7 +887,7 @@ fn build_raster_rgba(
 		rgba[base + 3] = 255;
 	}
 
-	rgba
+	(Some(rgba), scanned_points)
 }
 
 fn resolve_render_mode(
@@ -839,9 +956,26 @@ fn downsample_series(
 	cells.into_iter().flatten().collect()
 }
 
+#[cfg(test)]
 pub fn prepare_scatter_data_resolved(
 	df: &DataFrame,
 	spec: &ResolvedPlotSpec,
+	viewport_width: u32,
+	viewport_height: u32,
+) -> ScatterPreparedData {
+	prepare_scatter_data_resolved_with_subject(
+		df,
+		spec,
+		crate::result_artifact::ArtifactToken::mint(),
+		viewport_width,
+		viewport_height,
+	)
+}
+
+pub fn prepare_scatter_data_resolved_with_subject(
+	df: &DataFrame,
+	spec: &ResolvedPlotSpec,
+	publication: crate::result_artifact::ArtifactToken,
 	viewport_width: u32,
 	viewport_height: u32,
 ) -> ScatterPreparedData {
@@ -861,6 +995,14 @@ pub fn prepare_scatter_data_resolved(
 
 	if !matches!(x.binding.scale, ScaleFamily::Point | ScaleFamily::Band) {
 		let mut prepared = prepare_scatter_data(df, color_field, x_field, y_field);
+		prepared.raster_subject = RasterSubject {
+			publication,
+			binding: RasterFieldBinding {
+				x: x_field.to_owned(),
+				y: y_field.to_owned(),
+				color: (!color_field.is_empty()).then(|| color_field.to_owned()),
+			},
+		};
 		prepared.x_axis_type = axis_type_from_scale(x.binding.scale);
 		prepared.y_axis_type = axis_type_from_scale(y.binding.scale);
 		prepared.x_range = layout.x_range;
@@ -942,6 +1084,14 @@ pub fn prepare_scatter_data_resolved(
 		order_series_by_display_domain(&mut series, df, color_field);
 	}
 	ScatterPreparedData {
+		raster_subject: RasterSubject {
+			publication,
+			binding: RasterFieldBinding {
+				x: x_field.to_owned(),
+				y: y_field.to_owned(),
+				color: (!color_field.is_empty()).then(|| color_field.to_owned()),
+			},
+		},
 		series,
 		x_categories: Some(categories.clone()),
 		x_range: layout.x_range,
@@ -1035,6 +1185,14 @@ pub fn prepare_scatter_data(
 	x_col: &str,
 	y_col: &str,
 ) -> ScatterPreparedData {
+	let raster_subject = RasterSubject {
+		publication: crate::result_artifact::ArtifactToken::mint(),
+		binding: RasterFieldBinding {
+			x: x_col.to_owned(),
+			y: y_col.to_owned(),
+			color: (!cat_col.is_empty()).then(|| cat_col.to_owned()),
+		},
+	};
 	let x_col_series = match df.column(x_col) {
 		Ok(c) => c
 			.cast(&DataType::Float64)
@@ -1075,6 +1233,7 @@ pub fn prepare_scatter_data(
 	let y_range = (y_range.0 - y_pad, y_range.1 + y_pad);
 	if df.height() == 0 || x_col.is_empty() || y_col.is_empty() {
 		return ScatterPreparedData {
+			raster_subject,
 			series: vec![],
 			x_categories: None,
 			x_range,
@@ -1150,6 +1309,7 @@ pub fn prepare_scatter_data(
 		order_series_by_display_domain(&mut series_list, df, cat_col);
 	}
 	ScatterPreparedData {
+		raster_subject,
 		series: series_list,
 		x_categories: None,
 		x_range,
@@ -1175,10 +1335,13 @@ mod tests {
 	#[derive(Default)]
 	struct CountingPath {
 		circles: usize,
+		line_segments: usize,
 	}
 	impl PathBuilder for CountingPath {
 		fn move_to(&mut self, _p: Point) {}
-		fn line_to(&mut self, _p: Point) {}
+		fn line_to(&mut self, _p: Point) {
+			self.line_segments += 1;
+		}
 		fn arc_to(&mut self, _c: Point, _r: f32, _s: f32, _e: f32) {}
 		fn circle(&mut self, _center: Point, _radius: f32) {
 			self.circles += 1;
@@ -1190,7 +1353,10 @@ mod tests {
 	#[derive(Default)]
 	struct CountingBackend {
 		circles: usize,
+		line_segments: usize,
 		images: usize,
+		image_ids: Vec<image::Id>,
+		texts: Vec<String>,
 		/// The rasterized image's size is the inner plot area — the same
 		/// bounds `resolve_render_mode` divides for its pixel budget, read
 		/// from the rasterizer's own output rather than reconstructed.
@@ -1201,15 +1367,22 @@ mod tests {
 			let mut p = CountingPath::default();
 			f(&mut p);
 			self.circles += p.circles;
+			self.line_segments += p.line_segments;
 		}
 		fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {
 			let mut p = CountingPath::default();
 			f(&mut p);
 			self.circles += p.circles;
+			self.line_segments += p.line_segments;
 		}
 		fn fill_rectangle(&mut self, _tl: Point, _size: iced::Size, _color: Color) {}
-		fn fill_text_raw(&mut self, _text: Text) {}
+		fn fill_text_raw(&mut self, text: Text) {
+			self.texts.push(text.content);
+		}
 		fn supports_embedded_raster(&self) -> bool {
+			true
+		}
+		fn supports_native_image_handle(&self) -> bool {
 			true
 		}
 		fn draw_image_rgba(
@@ -1227,10 +1400,11 @@ mod tests {
 			&mut self,
 			_top_left: Point,
 			size: iced::Size,
-			_handle: &image::Handle,
+			handle: &image::Handle,
 		) {
 			self.images += 1;
 			self.image_size = Some((size.width, size.height));
+			self.image_ids.push(handle.id());
 		}
 		fn translate(&mut self, _t: iced::Vector) {}
 		fn rotate(&mut self, _angle: f32) {}
@@ -1671,13 +1845,16 @@ mod tests {
 	struct RasterCaptureBackend {
 		placements: Vec<(Point, iced::Size)>,
 		last_rgba: Option<Vec<u8>>,
+		texts: Vec<String>,
 	}
 
 	impl PlotBackend for RasterCaptureBackend {
 		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {}
 		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {}
 		fn fill_rectangle(&mut self, _tl: Point, _size: iced::Size, _color: Color) {}
-		fn fill_text_raw(&mut self, _text: Text) {}
+		fn fill_text_raw(&mut self, text: Text) {
+			self.texts.push(text.content);
+		}
 		fn supports_embedded_raster(&self) -> bool {
 			true
 		}
@@ -1772,6 +1949,59 @@ mod tests {
 		backend
 	}
 
+	fn settle_interactive_raster(
+		kernel: &Arc<dyn PlotKernel + Send + Sync>,
+		model: &crate::plot::theme::PlotSettings,
+		coordinator: &crate::plot::raster::RasterCoordinator,
+		extent: f32,
+	) {
+		use crate::plot::common::{PlotRenderLayer, PlotWidget};
+		let widget = PlotWidget::new(
+			kernel.as_ref(),
+			String::new(),
+			0.0,
+			model.clone(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
+		let wants = widget.raster_wants(Rectangle::new(
+			Point::ORIGIN,
+			iced::Size::new(extent, extent),
+		));
+		if let Some(job) = coordinator.request(wants) {
+			let completion = crate::plot::raster::run_raster_job_sync(job);
+			let update = coordinator.complete(completion);
+			assert!(update.next_job.is_none());
+		}
+	}
+
+	fn render_interactive_frame(
+		kernel: &Arc<dyn PlotKernel + Send + Sync>,
+		model: &crate::plot::theme::PlotSettings,
+		motion: ViewportMotion,
+		coordinator: &crate::plot::raster::RasterCoordinator,
+	) -> RasterCaptureBackend {
+		use crate::plot::common::{PlotRenderLayer, PlotWidget};
+		let widget = PlotWidget::new(
+			kernel.as_ref(),
+			String::new(),
+			0.0,
+			model.clone(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_raster_coordinator(coordinator)
+		.with_viewport_motion(motion);
+		let mut backend = RasterCaptureBackend::default();
+		widget.render(
+			&mut backend,
+			Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 200.0)),
+		);
+		backend
+	}
+
 	fn builds_during(f: impl FnOnce()) -> usize {
 		let before = RASTER_BUILDS.with(std::cell::Cell::get);
 		f();
@@ -1781,21 +2011,21 @@ mod tests {
 	#[test]
 	fn product_0139_motion_reuses_and_settling_rasterizes_exactly_once() {
 		let (kernel, model) = reuse_fixture();
+		let coordinator = crate::plot::raster::RasterCoordinator::new();
 		let pans: Vec<_> = (1..=4)
 			.map(|i| reuse_domain(&model, (i as f64 * 0.05, 1.0 + i as f64 * 0.05)))
 			.collect();
 
 		// Prime the cache with one true raster at the base domain.
 		let base = reuse_domain(&model, (0.0, 1.0));
-		let primed = builds_during(|| {
-			render_frame(&kernel, &base, ViewportMotion::Settled);
-		});
+		let primed =
+			builds_during(|| settle_interactive_raster(&kernel, &base, &coordinator, 200.0));
 		assert_eq!(primed, 1, "the first settled frame rasterizes");
 
 		// Gate 1 claim: a pan under motion performs no scans at all.
 		let moving = builds_during(|| {
 			for domain in &pans {
-				render_frame(&kernel, domain, ViewportMotion::Moving);
+				render_interactive_frame(&kernel, domain, ViewportMotion::Moving, &coordinator);
 			}
 		});
 		assert_eq!(
@@ -1824,11 +2054,16 @@ mod tests {
 		// is byte-identical to a cold raster at the same domain.
 		let settle_domain = pans.last().expect("pans");
 		let settle = builds_during(|| {
-			render_frame(&kernel, settle_domain, ViewportMotion::Settled);
+			settle_interactive_raster(&kernel, settle_domain, &coordinator, 200.0);
 		});
 		assert_eq!(settle, 1, "settling rasterizes exactly once");
 
-		let settled_frame = render_frame(&kernel, settle_domain, ViewportMotion::Settled);
+		let settled_frame = render_interactive_frame(
+			&kernel,
+			settle_domain,
+			ViewportMotion::Settled,
+			&coordinator,
+		);
 		let (cold_kernel, cold_model) = reuse_fixture();
 		let cold_frame = render_frame(
 			&cold_kernel,
@@ -1850,9 +2085,17 @@ mod tests {
 	#[test]
 	fn product_0139_a_reused_frame_is_placed_not_redrawn_and_never_chains() {
 		let (kernel, model) = reuse_fixture();
+		let coordinator = crate::plot::raster::RasterCoordinator::new();
 		let base = reuse_domain(&model, (0.0, 1.0));
-		let primed = render_frame(&kernel, &base, ViewportMotion::Settled);
+		settle_interactive_raster(&kernel, &base, &coordinator, 200.0);
+		let primed =
+			render_interactive_frame(&kernel, &base, ViewportMotion::Settled, &coordinator);
 		assert_eq!(primed.placements.len(), 1, "one image per frame");
+		let published = coordinator
+			.bitmap(&crate::plot::raster::RasterSlotId::root())
+			.expect("base-domain publication");
+		let published_handle = published.image_handle.id();
+		let published_key = published.key.clone();
 		let (origin, base_size) = primed.placements[0];
 		assert_eq!(
 			origin,
@@ -1871,10 +2114,11 @@ mod tests {
 		let mut offsets = Vec::new();
 		for i in 1..=3 {
 			let shift = f64::from(i) * 0.05;
-			let moved = render_frame(
+			let moved = render_interactive_frame(
 				&kernel,
 				&reuse_domain(&model, (shift, 1.0 + shift)),
 				ViewportMotion::Moving,
+				&coordinator,
 			);
 			let (top_left, size) = moved.placements[0];
 			// A pure pan never rescales: the baked-in point radius is preserved.
@@ -1884,23 +2128,284 @@ mod tests {
 				"a pure pan must place the cached image at its own size"
 			);
 			offsets.push(top_left.x);
+			let after_preview = coordinator
+				.bitmap(&crate::plot::raster::RasterSlotId::root())
+				.expect("last-good survives preview");
+			assert_eq!(after_preview.image_handle.id(), published_handle);
+			assert_eq!(after_preview.key, published_key);
 		}
 		assert!(
 			offsets.windows(2).all(|w| w[1] < w[0]),
 			"panning right moves the cached image left, monotonically: {offsets:?}"
 		);
 
-		// No chaining, observed from outside rather than by reading private
-		// state: if any reuse frame had replaced the cache entry, the base
-		// domain would no longer be cached and would have to rescan. It does
-		// not, so the entry the reuses composed from is still the last true
-		// raster.
-		let rescans = builds_during(|| {
-			render_frame(&kernel, &base, ViewportMotion::Settled);
+		// PRODUCT-0149 re-derives PRODUCT-0139's no-chaining assertion against
+		// the coordinator authority. Interactive draw can no longer scan, so the
+		// old "returning to base caused no rescan" observation became vacuous.
+		// The handle and full key remaining byte-for-byte the original
+		// publication after every placed preview proves that no preview became
+		// the next reuse authority.
+		let after_motion = coordinator
+			.bitmap(&crate::plot::raster::RasterSlotId::root())
+			.expect("published authority remains");
+		assert_eq!(after_motion.image_handle.id(), published_handle);
+		assert_eq!(after_motion.key, published_key);
+	}
+
+	#[test]
+	fn product_0149_interactive_first_contact_is_a_fast_honest_preparing_frame() {
+		let rows = 250_000;
+		let frame = df!(
+			"x" => (0..rows).map(|row| row as f64).collect::<Vec<_>>(),
+			"y" => (0..rows).map(|row| (row % 101) as f64).collect::<Vec<_>>()
+		)
+		.expect("large scatter frame");
+		let (spec, _) = resolved_scatter(
+			frame.clone(),
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x", "y"),
+			&ColorIdentity::default(),
+		);
+		let kernel: Arc<dyn PlotKernel + Send + Sync> = Arc::new(ScatterPlotKernel::new(Arc::new(
+			prepare_scatter_data_resolved(&frame, &spec, 800, 480),
+		)));
+		let mut model = crate::plot::theme::PlotSettings::default();
+		model.library_defaults.scatter_render_mode = ScatterRenderMode::Rasterized;
+		let coordinator = crate::plot::raster::RasterCoordinator::new();
+		let widget = crate::plot::common::PlotWidget::new(
+			kernel.as_ref(),
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			crate::plot::common::PlotRenderLayer::Full,
+		)
+		.with_raster_coordinator(&coordinator);
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 480.0));
+		let wants = widget.raster_wants(bounds);
+		let in_flight = coordinator
+			.request(wants.clone())
+			.expect("large-rung job enters the coordinator before draw");
+		assert!(coordinator.is_current(&wants));
+		let mut backend = RasterCaptureBackend::default();
+		let started = std::time::Instant::now();
+		let builds = builds_during(|| {
+			widget.render(&mut backend, bounds);
 		});
+		let elapsed = started.elapsed();
+		println!(
+			"product_0149_interactive_first_contact_ms={:.3}",
+			elapsed.as_secs_f64() * 1_000.0
+		);
+		assert_eq!(builds, 0, "interactive draw cannot scan source points");
+		assert!(backend.placements.is_empty(), "no bitmap exists yet");
 		assert_eq!(
-			rescans, 0,
-			"reuse must never replace the cache entry it composed from"
+			backend
+				.texts
+				.iter()
+				.filter(|text| text.as_str() == "preparing raster…")
+				.count(),
+			1,
+			"readiness is explicit and singular"
+		);
+		assert!(
+			elapsed < std::time::Duration::from_millis(250),
+			"preparing frame took {elapsed:?}; the banked true raster was seconds"
+		);
+		let completion = crate::plot::raster::run_raster_job_sync(in_flight);
+		assert_eq!(completion.scanned_points, rows);
+		assert!(coordinator.complete(completion).published);
+	}
+
+	#[test]
+	fn product_0149_redraw_publishes_only_for_a_novel_raster_want() {
+		let (kernel, mut model) = reuse_fixture();
+		model.library_defaults.scatter_render_mode = ScatterRenderMode::Rasterized;
+		let coordinator = crate::plot::raster::RasterCoordinator::new();
+		let widget = crate::plot::common::PlotWidget::new(
+			kernel.as_ref(),
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			crate::plot::common::PlotRenderLayer::Full,
+		)
+		.with_raster_coordinator(&coordinator);
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 200.0));
+		let redraw = iced::Event::Window(iced::window::Event::RedrawRequested(
+			iced::time::Instant::now(),
+		));
+		let mut state = crate::plot::common::PlotCanvasState::default();
+
+		assert!(
+			iced::widget::canvas::Program::update(
+				&widget,
+				&mut state,
+				&redraw,
+				bounds,
+				Cursor::Unavailable,
+			)
+			.is_some(),
+			"first contact publishes one RasterRequested action"
+		);
+		let job = coordinator
+			.request(widget.raster_wants(bounds))
+			.expect("first request starts");
+		assert!(
+			iced::widget::canvas::Program::update(
+				&widget,
+				&mut state,
+				&redraw,
+				bounds,
+				Cursor::Unavailable,
+			)
+			.is_none(),
+			"an in-flight identical want publishes no message"
+		);
+
+		let completion = crate::plot::raster::run_raster_job_sync(job);
+		assert!(coordinator.complete(completion).published);
+		assert!(
+			iced::widget::canvas::Program::update(
+				&widget,
+				&mut state,
+				&redraw,
+				bounds,
+				Cursor::Unavailable,
+			)
+			.is_none(),
+			"a satisfied want publishes no message on later redraws"
+		);
+	}
+
+	#[test]
+	fn product_0149_pending_scatter_suppresses_only_itself_and_marks_once() {
+		use crate::plot::kernels::line::prepare_line_data;
+		use crate::plot::kernels::scatter_line::ScatterLinePlotKernel;
+
+		let frame = df!(
+			"x" => [0.0_f64, 0.5, 1.0],
+			"y" => [0.2_f64, 0.8, 0.4]
+		)
+		.expect("mixed fixture");
+		let scatter_data = Arc::new(prepare_scatter_data(&frame, "", "x", "y"));
+		let scatter_only = ScatterPlotKernel::new(Arc::clone(&scatter_data));
+		let mixed = ScatterLinePlotKernel::new(
+			scatter_data,
+			Arc::new(prepare_line_data(&frame, "", "x", "y")),
+		);
+		let mut model = crate::plot::theme::PlotSettings::default();
+		model.library_defaults.scatter_render_mode = ScatterRenderMode::Rasterized;
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(320.0, 220.0));
+
+		let render_pending = |kernel: &dyn PlotKernel| {
+			let coordinator = crate::plot::raster::RasterCoordinator::new();
+			let widget = crate::plot::common::PlotWidget::new(
+				kernel,
+				String::new(),
+				0.0,
+				model.clone(),
+				0,
+				false,
+				crate::plot::common::PlotRenderLayer::Full,
+			)
+			.with_raster_coordinator(&coordinator);
+			let mut backend = CountingBackend::default();
+			widget.render(&mut backend, bounds);
+			backend
+		};
+
+		let scatter_frame = render_pending(&scatter_only);
+		let mixed_frame = render_pending(&mixed);
+		assert_eq!(scatter_frame.images, 0);
+		assert_eq!(
+			mixed_frame.images, 0,
+			"pending scatter contributes no marks"
+		);
+		assert!(
+			mixed_frame.line_segments > scatter_frame.line_segments,
+			"the sibling line paints normally while scatter pixels are pending"
+		);
+		assert_eq!(
+			mixed_frame
+				.texts
+				.iter()
+				.filter(|text| text.as_str() == "preparing raster…")
+				.count(),
+			1,
+			"the surface reports readiness once, not once per producer"
+		);
+	}
+
+	#[test]
+	fn product_0149_identical_twin_layers_paint_their_slot_handles_in_authored_order() {
+		use crate::plot::factory::create_layered_plot;
+		use crate::plot::spec::{LayerMark, LayerSpec, LayeredPlotSpec};
+
+		let frame = df!(
+			"x" => [0.0_f64, 0.5, 1.0],
+			"y" => [0.2_f64, 0.8, 0.4]
+		)
+		.expect("twin fixture");
+		let first = LayerSpec::xy(LayerMark::Scatter, "x", "y");
+		let second = LayerSpec::xy(LayerMark::Scatter, "x", "y");
+		let mut spec = LayeredPlotSpec::new(first);
+		spec.push(second);
+		let kernel = create_layered_plot(&spec, &frame, 320, 220).expect("twin layers");
+		let mut model = crate::plot::theme::PlotSettings::default();
+		model.library_defaults.scatter_render_mode = ScatterRenderMode::Rasterized;
+		let coordinator = crate::plot::raster::RasterCoordinator::new();
+		let widget = crate::plot::common::PlotWidget::new(
+			kernel.as_ref(),
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			crate::plot::common::PlotRenderLayer::Full,
+		)
+		.with_raster_coordinator(&coordinator);
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(320.0, 220.0));
+		let wants = widget.raster_wants(bounds);
+		assert_eq!(wants.len(), 2);
+		assert_ne!(wants[0].slot_id, wants[1].slot_id);
+		assert_eq!(wants[0].subject, wants[1].subject);
+		assert_eq!(wants[0].key, wants[1].key);
+
+		let mut pending = CountingBackend::default();
+		widget.render(&mut pending, bounds);
+		assert_eq!(pending.images, 0);
+		assert_eq!(
+			pending
+				.texts
+				.iter()
+				.filter(|text| text.as_str() == "preparing raster…")
+				.count(),
+			1,
+			"two pending slots still emit one surface marker"
+		);
+
+		let mut next = coordinator.request(wants.clone());
+		while let Some(job) = next {
+			let update = coordinator.complete(crate::plot::raster::run_raster_job_sync(job));
+			next = update.next_job;
+		}
+		let expected = wants
+			.iter()
+			.map(|want| {
+				coordinator
+					.bitmap(&want.slot_id)
+					.expect("addressed twin publication")
+					.image_handle
+					.id()
+			})
+			.collect::<Vec<_>>();
+		let mut painted = CountingBackend::default();
+		widget.render(&mut painted, bounds);
+		assert_eq!(
+			painted.image_ids, expected,
+			"authored layer order is paint order"
 		);
 	}
 
@@ -2496,7 +3001,6 @@ configuration,widget_px,inner_px,inner_share,effective_gate,naive_gate"
 			&ColorIdentity::default(),
 		);
 		let prepared = Arc::new(prepare_scatter_data_resolved(&frame, &spec, 21, 21));
-		let renderer = ScatterMarkRenderer::new(Arc::clone(&prepared));
 		let viewport = bounds(21.0, 21.0);
 		let centered_layout = PlotLayout::Cartesian {
 			x_range: (4.0, 6.0),
@@ -2508,16 +3012,14 @@ configuration,widget_px,inner_px,inner_share,effective_gate,naive_gate"
 		};
 		let centered = CoordinateTransformer::new(&centered_layout, viewport);
 		let default_settings = ResolvedPlotSettings::default();
-		let first = renderer.rasterize(viewport, &centered, &default_settings);
-		let repeat = renderer.rasterize(viewport, &centered, &default_settings);
-		assert!(
-			Arc::ptr_eq(&first.rgba, &repeat.rgba),
-			"same key must reuse cache"
+		let first = build_raster_rgba(&prepared, viewport, &centered, &default_settings);
+		let repeat = build_raster_rgba(&prepared, viewport, &centered, &default_settings);
+		assert_eq!(
+			first, repeat,
+			"same exact inputs must produce the same pixels"
 		);
-		let default_pixels = changed_pixels(
-			&first.rgba,
-			default_settings.chrome.canvas_background.iced(),
-		);
+		let default_pixels =
+			changed_pixels(&first, default_settings.chrome.canvas_background.iced());
 		assert!(
 			default_pixels > 1,
 			"default radius must be a disc, not one pixel"
@@ -2525,17 +3027,14 @@ configuration,widget_px,inner_px,inner_share,effective_gate,naive_gate"
 
 		let mut doubled = default_settings.clone();
 		doubled.point_size = PointSize::new(2.0).unwrap();
-		let large = renderer.rasterize(viewport, &centered, &doubled);
+		let large = build_raster_rgba(&prepared, viewport, &centered, &doubled);
+		assert_ne!(first, large, "size change must change the exact pixels");
 		assert!(
-			!Arc::ptr_eq(&first.rgba, &large.rgba),
-			"size change must miss the prior cache entry"
-		);
-		assert!(
-			changed_pixels(&large.rgba, doubled.chrome.canvas_background.iced()) > default_pixels,
+			changed_pixels(&large, doubled.chrome.canvas_background.iced()) > default_pixels,
 			"doubled radius must paint a larger footprint"
 		);
-		let large_repeat = renderer.rasterize(viewport, &centered, &doubled);
-		assert!(Arc::ptr_eq(&large.rgba, &large_repeat.rgba));
+		let large_repeat = build_raster_rgba(&prepared, viewport, &centered, &doubled);
+		assert_eq!(large, large_repeat);
 
 		let edge_layout = PlotLayout::Cartesian {
 			x_range: (5.0, 7.0),

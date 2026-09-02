@@ -1,9 +1,10 @@
 use crate::plot::common::{
 	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
-	TemporalAxisDomain,
+	TemporalAxisDomain, ViewportMotion,
 };
 use crate::plot::kernels::line::{LinePlotKernel, LinePreparedData};
 use crate::plot::kernels::scatter::{ScatterPlotKernel, ScatterPreparedData};
+use crate::plot::theme::PlotSettings;
 use iced::Rectangle;
 use iced::advanced::mouse::Cursor;
 use std::sync::Arc;
@@ -75,6 +76,45 @@ impl PlotKernel for ScatterLinePlotKernel {
 		self.scatter
 			.plot(backend, bounds, transform, cursor, settings.clone());
 		self.line.plot(backend, bounds, transform, cursor, settings);
+	}
+
+	fn collect_raster_wants(
+		&self,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		settings: &PlotSettings,
+		slot: &crate::plot::raster::RasterSlotId,
+		out: &mut Vec<crate::plot::raster::ScatterRasterWant>,
+	) {
+		self.scatter
+			.collect_raster_wants(bounds, transform, settings, &slot.child(0), out);
+	}
+
+	fn plot_interactive(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &PlotSettings,
+		motion: ViewportMotion,
+		coordinator: &crate::plot::raster::RasterCoordinator,
+		slot: &crate::plot::raster::RasterSlotId,
+		preparing: &mut bool,
+	) {
+		self.scatter.plot_interactive(
+			backend,
+			bounds,
+			transform,
+			cursor,
+			settings,
+			motion,
+			coordinator,
+			&slot.child(0),
+			preparing,
+		);
+		self.line
+			.plot_with_settings(backend, bounds, transform, cursor, settings);
 	}
 
 	fn legend_content(

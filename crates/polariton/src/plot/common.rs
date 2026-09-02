@@ -1504,6 +1504,31 @@ pub trait PlotComposite: Send + Sync {
 		settings: &PlotSettings,
 	);
 
+	fn collect_raster_wants(
+		&self,
+		_bounds: Rect<Widget>,
+		_padding: f32,
+		_title: &str,
+		_settings: &PlotSettings,
+		_slot: &crate::plot::raster::RasterSlotId,
+		_out: &mut Vec<crate::plot::raster::ScatterRasterWant>,
+	) {
+	}
+
+	fn render_plot_layer_interactive(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rect<Widget>,
+		padding: f32,
+		title: &str,
+		settings: &PlotSettings,
+		_coordinator: &crate::plot::raster::RasterCoordinator,
+		_slot: &crate::plot::raster::RasterSlotId,
+		_preparing: &mut bool,
+	) {
+		self.render_plot_layer(backend, bounds, padding, title, settings);
+	}
+
 	fn render_overlay_layer(
 		&self,
 		backend: &mut dyn PlotBackend,
@@ -1598,6 +1623,31 @@ pub trait PlotKernel: Send + Sync {
 		_motion: ViewportMotion,
 	) {
 		self.plot_with_settings(backend, bounds, transform, cursor, settings);
+	}
+
+	fn collect_raster_wants(
+		&self,
+		_bounds: Rectangle,
+		_transform: &CoordinateTransformer,
+		_settings: &PlotSettings,
+		_slot: &crate::plot::raster::RasterSlotId,
+		_out: &mut Vec<crate::plot::raster::ScatterRasterWant>,
+	) {
+	}
+
+	fn plot_interactive(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &PlotSettings,
+		motion: ViewportMotion,
+		_coordinator: &crate::plot::raster::RasterCoordinator,
+		_slot: &crate::plot::raster::RasterSlotId,
+		_preparing: &mut bool,
+	) {
+		self.plot_with_motion(backend, bounds, transform, cursor, settings, motion);
 	}
 
 	/// Prepare data whose truth depends on the final plot rectangle. Ordinary
@@ -2131,6 +2181,10 @@ pub struct PlotWidget<'a> {
 	settings_inspector_gesture: bool,
 	/// PRODUCT-0139 §1. Defaults to `Settled`; a gesture opts in per frame.
 	viewport_motion: ViewportMotion,
+	/// PRODUCT-0149: present only for live interactive surfaces. Exact render
+	/// callers deliberately omit it and retain synchronous completeness.
+	raster_coordinator: Option<&'a crate::plot::raster::RasterCoordinator>,
+	raster_slot: crate::plot::raster::RasterSlotId,
 }
 
 impl<'a> PlotWidget<'a> {
@@ -2155,7 +2209,22 @@ impl<'a> PlotWidget<'a> {
 			layer,
 			settings_inspector_gesture: false,
 			viewport_motion: ViewportMotion::Settled,
+			raster_coordinator: None,
+			raster_slot: crate::plot::raster::RasterSlotId::root(),
 		}
+	}
+
+	pub fn with_raster_coordinator(
+		mut self,
+		coordinator: &'a crate::plot::raster::RasterCoordinator,
+	) -> Self {
+		self.raster_coordinator = Some(coordinator);
+		self
+	}
+
+	pub(crate) fn with_raster_slot(mut self, slot: crate::plot::raster::RasterSlotId) -> Self {
+		self.raster_slot = slot;
+		self
 	}
 
 	pub fn with_settings_inspector_gesture(mut self) -> Self {
@@ -2853,15 +2922,86 @@ impl<'a> PlotWidget<'a> {
 		self.render_plot_layer_in_widget(backend, Rect::from_iced_frame(bounds));
 	}
 
-	fn render_plot_layer_in_widget(&self, backend: &mut dyn PlotBackend, bounds: Rect<Widget>) {
+	pub(crate) fn raster_wants(
+		&self,
+		bounds: Rectangle,
+	) -> Vec<crate::plot::raster::ScatterRasterWant> {
+		let bounds = Rect::<Widget>::from_iced_frame(bounds);
+		let mut wants = Vec::new();
 		if let Some(composite) = self.kernel.composite() {
-			composite.render_plot_layer(
-				backend,
+			composite.collect_raster_wants(
 				bounds,
 				self.padding,
 				&self.title,
 				&self.settings_model,
+				&self.raster_slot,
+				&mut wants,
 			);
+			return wants;
+		}
+		let legend_reservation = self
+			.kernel
+			.legend_reservation_content(&self.settings)
+			.and_then(crate::plot::legend::apply_policy);
+		let legend = legend_layout(bounds, legend_reservation.as_ref(), &self.settings);
+		let layout = self.kernel.layout(self.settings.clone());
+		let requirements = BandRequirements::from_layout(&layout, &self.settings);
+		let plot_area = self
+			.plot_area(legend.content_bounds, &requirements)
+			.into_iced();
+		let transform = CoordinateTransformer::new(&layout, plot_area);
+		self.kernel.collect_raster_wants(
+			plot_area,
+			&transform,
+			&self.settings_model,
+			&self.raster_slot,
+			&mut wants,
+		);
+		wants
+	}
+
+	fn draw_raster_preparing_marker(&self, backend: &mut dyn PlotBackend) {
+		let label = "preparing raster…";
+		backend.fill_rectangle(
+			Point::new(10.0, 10.0),
+			iced::Size::new(132.0, 25.0),
+			self.settings.chrome.canvas_background.iced(),
+		);
+		backend.fill_text(Text {
+			content: label.to_owned(),
+			position: Point::new(17.0, 15.0),
+			color: self.settings.chrome.axis_label_text.iced(),
+			size: iced::Pixels(12.0),
+			..Default::default()
+		});
+	}
+
+	fn render_plot_layer_in_widget(&self, backend: &mut dyn PlotBackend, bounds: Rect<Widget>) {
+		if let Some(composite) = self.kernel.composite() {
+			let mut preparing = false;
+			if let Some(coordinator) = self.raster_coordinator {
+				composite.render_plot_layer_interactive(
+					backend,
+					bounds,
+					self.padding,
+					&self.title,
+					&self.settings_model,
+					coordinator,
+					&self.raster_slot,
+					&mut preparing,
+				);
+			} else {
+				composite.render_plot_layer(
+					backend,
+					bounds,
+					self.padding,
+					&self.title,
+					&self.settings_model,
+				);
+			}
+			if preparing {
+				self.draw_raster_preparing_marker(backend);
+			}
 			return;
 		}
 		let clipped_plot = self.kernel.requires_plot_area_clip();
@@ -2893,22 +3033,40 @@ impl<'a> PlotWidget<'a> {
 		let transform = CoordinateTransformer::new(&layout, plot_area);
 		self.kernel
 			.prepare_viewport(&transform, self.viewport_motion);
+		let mut preparing = false;
 		let draw_plot = &mut |backend: &mut dyn PlotBackend| {
 			backend.translate(iced::Vector::new(plot_area.x, plot_area.y));
 			self.draw_layout_grid(backend, plot_area, &transform, &layout);
-			self.kernel.plot_with_motion(
-				backend,
-				plot_area,
-				&transform,
-				Cursor::Unavailable,
-				&self.settings_model,
-				self.viewport_motion,
-			);
+			if let Some(coordinator) = self.raster_coordinator {
+				self.kernel.plot_interactive(
+					backend,
+					plot_area,
+					&transform,
+					Cursor::Unavailable,
+					&self.settings_model,
+					self.viewport_motion,
+					coordinator,
+					&self.raster_slot,
+					&mut preparing,
+				);
+			} else {
+				self.kernel.plot_with_motion(
+					backend,
+					plot_area,
+					&transform,
+					Cursor::Unavailable,
+					&self.settings_model,
+					self.viewport_motion,
+				);
+			}
 		};
 		if clipped_plot {
 			backend.with_clip(plot_area, draw_plot);
 		} else {
 			backend.with_save(draw_plot);
+		}
+		if preparing {
+			self.draw_raster_preparing_marker(backend);
 		}
 	}
 
@@ -3232,6 +3390,18 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 		bounds: Rectangle,
 		cursor: Cursor,
 	) -> Option<canvas::Action<PlotMessage>> {
+		if let Some(coordinator) = self.raster_coordinator
+			&& self.layer != PlotRenderLayer::OverlayInteractive
+			&& self.viewport_motion == ViewportMotion::Settled
+			&& matches!(
+				event,
+				Event::Window(iced::window::Event::RedrawRequested(_))
+			) {
+			let wants = self.raster_wants(bounds);
+			if !wants.is_empty() && !coordinator.is_current(&wants) {
+				return Some(canvas::Action::publish(PlotMessage::RasterRequested(wants)));
+			}
+		}
 		if self.layer == PlotRenderLayer::Data {
 			return None;
 		}

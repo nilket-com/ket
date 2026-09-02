@@ -759,6 +759,191 @@ impl PlotComposite for PlotGridKernel {
 		}
 	}
 
+	fn collect_raster_wants(
+		&self,
+		bounds: Rect<Widget>,
+		padding: f32,
+		title: &str,
+		settings: &PlotSettings,
+		slot: &crate::plot::raster::RasterSlotId,
+		out: &mut Vec<crate::plot::raster::ScatterRasterWant>,
+	) {
+		if self.cells.len() == 1 {
+			let cell = self.cells.first();
+			let cell_slot = slot
+				.child(cell.cell.position.row)
+				.child(cell.cell.position.column);
+			let helper = PlotWidget::new(
+				cell.kernel.as_ref(),
+				title.to_owned(),
+				padding,
+				settings.clone(),
+				0,
+				false,
+				crate::plot::common::PlotRenderLayer::Full,
+			)
+			.with_raster_slot(cell_slot);
+			out.extend(helper.raster_wants(bounds.into_iced()));
+			return;
+		}
+		let resolved = settings.resolve();
+		let figure_legend_reservation = crate::plot::legend::union(
+			self.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_reservation_content(&resolved)),
+		);
+		let legend = crate::plot::legend::legend_layout(
+			bounds,
+			figure_legend_reservation.as_ref(),
+			&resolved,
+		);
+		let outer = grid_outer_area(legend.content_bounds, padding);
+		let layouts = self.cell_layouts(settings);
+		let requirements =
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
+		let tiled = grid_tiled_area_with_requirements(
+			outer,
+			title,
+			&requirements,
+			grid_x_label_visible(self, &resolved),
+			&resolved,
+		);
+		for (index, cell) in self.cells.iter().enumerate() {
+			let (position, layout) = &layouts[index];
+			let cell_bounds = grid_cell_bounds_with_settings(
+				tiled,
+				self.arrangement,
+				*position,
+				self.figure_grid,
+			);
+			let cell_resolved = cell.kernel.resolve_settings(settings);
+			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
+			let transform = CoordinateTransformer::new(layout, inner.into_iced());
+			let cell_slot = slot.child(position.row).child(position.column);
+			cell.kernel.collect_raster_wants(
+				inner.into_iced(),
+				&transform,
+				settings,
+				&cell_slot,
+				out,
+			);
+		}
+	}
+
+	fn render_plot_layer_interactive(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rect<Widget>,
+		padding: f32,
+		title: &str,
+		settings: &PlotSettings,
+		coordinator: &crate::plot::raster::RasterCoordinator,
+		slot: &crate::plot::raster::RasterSlotId,
+		preparing: &mut bool,
+	) {
+		if self.cells.len() == 1 {
+			let cell = self.cells.first();
+			let cell_slot = slot
+				.child(cell.cell.position.row)
+				.child(cell.cell.position.column);
+			let helper = PlotWidget::new(
+				cell.kernel.as_ref(),
+				title.to_owned(),
+				padding,
+				settings.clone(),
+				0,
+				false,
+				crate::plot::common::PlotRenderLayer::Full,
+			)
+			.with_raster_coordinator(coordinator)
+			.with_raster_slot(cell_slot);
+			helper.render_plot_layer(backend, bounds.into_iced());
+			return;
+		}
+		let resolved = settings.resolve();
+		backend.with_clip(bounds.into_iced(), &mut |backend| {
+			backend.fill_rectangle(
+				Point::ORIGIN,
+				bounds.size(),
+				resolved.chrome.canvas_background.iced(),
+			);
+		});
+		let figure_legend_reservation = crate::plot::legend::union(
+			self.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_reservation_content(&resolved)),
+		);
+		let legend = crate::plot::legend::legend_layout(
+			bounds,
+			figure_legend_reservation.as_ref(),
+			&resolved,
+		);
+		let outer = grid_outer_area(legend.content_bounds, padding);
+		let layouts = self.cell_layouts(settings);
+		let requirements =
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
+		let tiled = grid_tiled_area_with_requirements(
+			outer,
+			title,
+			&requirements,
+			grid_x_label_visible(self, &resolved),
+			&resolved,
+		);
+		for (index, cell) in self.cells.iter().enumerate() {
+			let (position, layout) = &layouts[index];
+			let cell_bounds = grid_cell_bounds_with_settings(
+				tiled,
+				self.arrangement,
+				*position,
+				self.figure_grid,
+			);
+			let cell_resolved = cell.kernel.resolve_settings(settings);
+			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
+			let transform = CoordinateTransformer::new(layout, inner.into_iced());
+			cell.kernel
+				.prepare_viewport(&transform, crate::plot::common::ViewportMotion::Settled);
+			let helper = PlotWidget::new(
+				cell.kernel.as_ref(),
+				String::new(),
+				0.0,
+				settings.clone(),
+				0,
+				false,
+				crate::plot::common::PlotRenderLayer::Full,
+			);
+			let clipped_plot = cell.kernel.requires_plot_area_clip();
+			let cell_slot = slot.child(position.row).child(position.column);
+			let draw = &mut |backend: &mut dyn PlotBackend| {
+				backend.translate(iced::Vector::new(inner.x(), inner.y()));
+				helper.draw_layout_grid(backend, inner.into_iced(), &transform, layout);
+				cell.kernel.plot_interactive(
+					backend,
+					inner.into_iced(),
+					&transform,
+					Cursor::Unavailable,
+					settings,
+					crate::plot::common::ViewportMotion::Settled,
+					coordinator,
+					&cell_slot,
+					preparing,
+				);
+			};
+			backend.with_clip(cell_bounds.into_iced(), &mut |backend| {
+				backend.fill_rectangle(
+					cell_bounds.origin().into_iced(),
+					cell_bounds.size(),
+					resolved.chrome.canvas_background.iced(),
+				);
+				if !clipped_plot {
+					backend.with_save(draw);
+				}
+			});
+			if clipped_plot {
+				backend.with_clip(inner.into_iced(), draw);
+			}
+		}
+	}
+
 	fn render_overlay_layer(
 		&self,
 		backend: &mut dyn PlotBackend,
@@ -1736,6 +1921,58 @@ mod tests {
 		RASTER_BUILDS.with(std::cell::Cell::get) - before
 	}
 
+	#[test]
+	fn product_0149_facets_request_and_draw_through_stable_cell_slots() {
+		use crate::plot::common::{PlotRenderLayer, PlotWidget};
+		use crate::plot::raster::{RasterCoordinator, RasterSlotId, run_raster_job_sync};
+
+		let (kernel, model) = facet_scatter_fixture();
+		let coordinator = RasterCoordinator::new();
+		let rect = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_raster_coordinator(&coordinator);
+		let wants = widget.raster_wants(rect);
+		let slots = wants
+			.iter()
+			.map(|want| want.slot_id.clone())
+			.collect::<Vec<_>>();
+		assert_eq!(
+			slots,
+			vec![RasterSlotId(vec![0, 0, 0]), RasterSlotId(vec![0, 0, 1])],
+			"row and column are stable parts of each facet producer address"
+		);
+
+		let mut next = coordinator.request(wants.clone());
+		let mut publications = 0;
+		while let Some(job) = next {
+			let update = coordinator.complete(run_raster_job_sync(job));
+			publications += usize::from(update.published);
+			next = update.next_job;
+		}
+		assert_eq!(publications, 2);
+		assert!(coordinator.is_current(&widget.raster_wants(rect)));
+
+		let mut backend = FacetRasterBackend::default();
+		let scans = rescans_during(|| widget.render(&mut backend, rect));
+		assert_eq!(scans, 0, "interactive facet draw consumes published pixels");
+		assert_eq!(
+			backend.images, 2,
+			"each live facet cell paints its own slot"
+		);
+		assert!(
+			slots.iter().all(|slot| coordinator.bitmap(slot).is_some()),
+			"both addressed cell publications remain independently available"
+		);
+	}
+
 	/// PRODUCT-0140 evidence: cold raster cost inside a facet cell, on both
 	/// sides of the audit's crossover.
 	///
@@ -1936,6 +2173,21 @@ mod tests {
 			400,
 		)
 		.expect("unfaceted scatter");
+		let coordinator = crate::plot::raster::RasterCoordinator::new();
+		let prime = PlotWidget::new(
+			unfaceted.as_ref(),
+			String::new(),
+			0.0,
+			base.clone(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
+		let job = coordinator
+			.request(prime.raster_wants(rect))
+			.expect("first exact raster job");
+		let update = coordinator.complete(crate::plot::raster::run_raster_job_sync(job));
+		assert!(update.published && update.next_job.is_none());
 		let render_unfaceted = |model: &crate::plot::theme::PlotSettings,
 		                        motion: ViewportMotion| {
 			let widget = PlotWidget::new(
@@ -1947,11 +2199,11 @@ mod tests {
 				false,
 				PlotRenderLayer::Full,
 			)
+			.with_raster_coordinator(&coordinator)
 			.with_viewport_motion(motion);
 			let mut backend = FacetRasterBackend::default();
 			widget.render(&mut backend, rect);
 		};
-		render_unfaceted(&base, ViewportMotion::Settled);
 		let unfaceted_rescans = rescans_during(|| {
 			render_unfaceted(&moved, ViewportMotion::Moving);
 		});
