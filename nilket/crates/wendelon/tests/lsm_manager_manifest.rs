@@ -364,7 +364,7 @@ async fn manager_reads_lsm_single_row_source_frames_for_plan() {
 	assert_eq!(frames.len(), 1);
 	assert_eq!(frames[0].entry.location, first);
 	assert_eq!(frames[0].entry.row_key_id, id(61));
-	assert_eq!(frames[0].frame, b"first-record");
+	assert_eq!(frames[0].frame.as_slice(), b"first-record");
 }
 
 #[tokio::test]

@@ -10,6 +10,7 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CompactionMergeKey {
@@ -258,7 +259,12 @@ pub struct PlannedOutputRun {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LsmSourceFrame {
 	pub entry: VersionEntry,
-	pub frame: Vec<u8>,
+	/// ADR 0097: the physical frame this row resolves into, shared by every row
+	/// that resolves into the same one. Rows of a multi-row frame outnumber the
+	/// frames they live in - one owned copy per row made the retained working set
+	/// proportional to the row count rather than the frame count, which is what
+	/// took the node to 21 GiB before it reported an unsupported plan.
+	pub frame: Arc<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -371,6 +377,26 @@ pub fn plan_output_runs(
 	Ok(out)
 }
 
+/// The identity of one physical frame: rows of a multi-row frame share all three
+/// fields and differ only in their row index and HLC. `Ord` so frame placement is
+/// deterministic for a given input.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct PhysicalFrameKey {
+	slab_id: SlabId,
+	offset: u64,
+	length: u32,
+}
+
+impl PhysicalFrameKey {
+	fn of(record: &VersionEntry) -> Self {
+		Self {
+			slab_id: record.location.slab_id,
+			offset: record.location.offset,
+			length: record.location.length,
+		}
+	}
+}
+
 pub fn required_output_run_count(
 	records: impl IntoIterator<Item = VersionEntry>,
 	target_size_bytes: u64,
@@ -390,20 +416,59 @@ fn split_records_by_target_size(
 	}
 	let mut records = records.into_iter().collect::<Vec<_>>();
 	records.sort_by_key(VersionEntry::merge_key);
-	let mut out = Vec::new();
-	let mut current_rows = Vec::new();
-	let mut current_bytes = 0_u64;
+
+	// ADR 0097: the unit of work is the PHYSICAL frame, not the logical row.
+	//
+	// `location.length` is the length of the containing frame, so charging it per
+	// row multiplied a multi-row frame by the number of rows it holds - one
+	// observed slab of 2.20 GiB in 8,428 frames and 47,050 rows planned as
+	// 18.81 GiB. Charging it once per frame makes the estimate physical.
+	//
+	// Rows of one frame are also kept in one run. A run that took some rows of a
+	// frame and left the rest forced the writer to split it, which it cannot do:
+	// that is the `does not yet split multi-row frames` path, and it was reached
+	// only after the whole working set had been built.
+	//
+	// Frames are placed in merge order of their first row, so a run stays close to
+	// a contiguous slice of that order. A frame whose rows straddle a boundary
+	// widens its run's HLC range rather than splitting; overlap between runs is
+	// already handled by `overlapping_slabs` at pick time and is not an invariant.
+	let mut rows_by_frame: BTreeMap<PhysicalFrameKey, Vec<VersionEntry>> = BTreeMap::new();
+	let mut frame_order: Vec<PhysicalFrameKey> = Vec::new();
 	for record in records {
-		let row_bytes = u64::from(record.location.length).max(1);
-		if !current_rows.is_empty() && current_bytes.saturating_add(row_bytes) > target_size_bytes {
+		let key = PhysicalFrameKey::of(&record);
+		match rows_by_frame.entry(key) {
+			std::collections::btree_map::Entry::Vacant(slot) => {
+				frame_order.push(key);
+				slot.insert(vec![record]);
+			}
+			std::collections::btree_map::Entry::Occupied(mut slot) => {
+				slot.get_mut().push(record);
+			}
+		}
+	}
+
+	let mut out: Vec<(Vec<VersionEntry>, u64)> = Vec::new();
+	let mut current_rows: Vec<VersionEntry> = Vec::new();
+	let mut current_bytes = 0_u64;
+	for key in frame_order {
+		let rows = rows_by_frame
+			.remove(&key)
+			.expect("every ordered frame key was inserted");
+		let frame_bytes = u64::from(key.length).max(1);
+		if !current_rows.is_empty() && current_bytes.saturating_add(frame_bytes) > target_size_bytes
+		{
 			out.push((std::mem::take(&mut current_rows), current_bytes));
 			current_bytes = 0;
 		}
-		current_bytes = current_bytes.saturating_add(row_bytes);
-		current_rows.push(record);
+		current_bytes = current_bytes.saturating_add(frame_bytes);
+		current_rows.extend(rows);
 	}
 	if !current_rows.is_empty() {
 		out.push((current_rows, current_bytes));
+	}
+	for (rows, _) in &mut out {
+		rows.sort_by_key(VersionEntry::merge_key);
 	}
 	Ok(out)
 }

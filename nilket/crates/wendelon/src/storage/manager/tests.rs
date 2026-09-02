@@ -12328,6 +12328,545 @@ async fn adr0089_locality_intervals_yield_exactly_the_rows_inside_them() {
 	assert!(scan(BASE - 4, BASE - 1).is_empty());
 }
 
+/// A PrimaryKey table whose spread factor is 1, so every row lands in ONE bucket
+/// and packs into ONE physical frame. The default spread of 4 scatters three rows
+/// across three frames, which is a valid layout but not the shape this test guards.
+fn adr0097_colocated_table_descriptor_for_test() -> TableSchemaDescriptor {
+	let schema = Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("age", DataType::Int64, true),
+	]);
+	TableSchemaDescriptor::new_with_layout(
+		TableObjectId::new([0x97; 16]),
+		1,
+		"analytics",
+		"colocated_events",
+		&schema,
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+		LocalityPolicy::TableSpreadProjection(
+			crate::schema::table::TableSpreadLocalityDescriptor {
+				spread_factor: 1,
+				prefix_bits: crate::schema::table::TABLE_SPREAD_DEFAULT_PREFIX_BITS,
+			},
+		),
+		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.unwrap()
+}
+
+/// Build one multi-row frame holding `ids`, attributed to `table` so its rows
+/// resolve to `VersionLifecycle::PrimaryKey` during compaction. A frame built by
+/// `encode_test_multirow_storage_frame` carries no table attribution and would
+/// resolve to `AmbiguousTable`, which elides nothing - the plan would then hold
+/// every row and never reach the partial-survivor path.
+async fn append_attributed_multirow_frame_for_test(
+	manager: &Arc<SlabManager>,
+	table: &TableSchemaDescriptor,
+	ids: &[i64],
+	row_hlc: HybridTimestamp,
+) -> Vec<Identity> {
+	let batch = RecordBatch::try_new(
+		Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("age", DataType::Int64, true),
+		])),
+		vec![
+			Arc::new(Int64Array::from(ids.to_vec())) as Arc<dyn Array>,
+			Arc::new(Int64Array::from(
+				ids.iter().map(|id| Some(id * 10)).collect::<Vec<_>>(),
+			)) as Arc<dyn Array>,
+		],
+	)
+	.unwrap();
+	let meta = layout_recluster_meta(table, batch.num_rows());
+	let packed =
+		pack_record_batch_by_bucket(&meta, table, &batch, WriterNodeId::ZERO, row_hlc).unwrap();
+	assert_eq!(
+		packed.len(),
+		1,
+		"the fixture needs ONE physical frame holding every row"
+	);
+	let entries = storage_multirow_index_entries_from_frame(&packed[0].frame_bytes)
+		.unwrap()
+		.expect("packed frame is multi-row");
+	assert_eq!(entries.len(), ids.len(), "one entry per row of the frame");
+	let identities = entries
+		.iter()
+		.map(|entry| entry.key_identity)
+		.collect::<Vec<_>>();
+	manager
+		.append_durable_multirow_with_locality(tenant(), &packed[0].frame_bytes, &entries)
+		.await
+		.unwrap();
+	identities
+}
+
+/// ADR 0097 step 2, phase 1 - the REWRITER.
+///
+/// A three-row frame with only two survivors used to be refused with
+/// `does not yet split multi-row frames`, after the whole working set had been
+/// built. It is now rewritten to hold exactly the survivors.
+///
+/// Four preconditions make this discriminating, and missing any one lets the test
+/// pass without entering the branch at all:
+///   1. BOTH versions live in sealed slabs the plan touches -
+///      `lsm_version_entries_for_plan` skips locations outside `touched_slabs`, so
+///      a newer version left in the active slab is invisible to elision.
+///   2. The rows carry real table attribution against a registered PrimaryKey
+///      table, or `lsm_version_lifecycle_for_entry` returns `AmbiguousTable`, for
+///      which `apply_elision` drops nothing.
+///   3. Compaction runs through the table-schemas path, which is the only one that
+///      resolves that lifecycle.
+///   4. The retention floor sits above every row's HLC, because
+///      `apply_primary_key_elision` only supersedes versions BELOW the floor.
+#[tokio::test]
+async fn adr0097_partial_survivor_frame_is_rewritten_before_installation() {
+	let dir = fresh_dir("adr0097-partial-survivor-rewrite");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = open_manager_at_dir(dir.clone(), io, crypto).await;
+	let table = adr0097_colocated_table_descriptor_for_test();
+
+	// Slab A: one physical frame holding k1, k2, k3.
+	let identities =
+		append_attributed_multirow_frame_for_test(&manager, &table, &[1, 2, 3], hlc(1_000)).await;
+	let (k1, k2, k3) = (identities[0], identities[1], identities[2]);
+	let slab_a = manager.force_seal_active_for_test().await;
+
+	// Slab B: a newer k2. Sealed, so the plan can see it.
+	let newer = append_attributed_multirow_frame_for_test(&manager, &table, &[2], hlc(2_000)).await;
+	assert_eq!(newer[0], k2, "the newer row must supersede the same key");
+	let slab_b = manager.force_seal_active_for_test().await;
+	assert_ne!(
+		slab_a, slab_b,
+		"the fixture needs two distinct sealed slabs"
+	);
+
+	let mut catalog_tables = TableSchemaCatalog::default();
+	catalog_tables.upsert(tenant(), table.clone()).unwrap();
+
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0x0097_0001),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![slab_a, slab_b],
+		overlapping_slabs: Vec::new(),
+		// Above every row HLC: only versions below the floor are superseded.
+		retention_floor_snapshot: hlc(9_000),
+		compaction_start_hlc: hlc(9_001),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+
+	// The plan must actually drop exactly one row, or the rest proves nothing.
+	let entries = manager
+		.lsm_version_entries_for_plan_with_table_schemas(&plan, &catalog_tables)
+		.await
+		.unwrap();
+	assert_eq!(entries.len(), 4, "three frame rows plus the newer k2");
+	let decisions = crate::storage::lsm::apply_elision(entries, plan.retention_floor_snapshot);
+	let survivors = crate::storage::lsm::survivor_records(&decisions);
+	assert_eq!(
+		survivors.len(),
+		3,
+		"the older k2 is superseded; k1, k3 and the newer k2 survive"
+	);
+	let survivors_in_frame = survivors
+		.iter()
+		.filter(|record| record.location.slab_id == slab_a)
+		.count();
+	assert_eq!(
+		survivors_in_frame, 2,
+		"the fixture must reproduce the shape it guards: a three-row frame with \
+		 two survivors"
+	);
+
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &plan, &catalog_tables)
+		.await
+		.unwrap();
+	let source_frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&source_frames,
+			Some(&catalog_tables),
+		)
+		.await
+		.unwrap();
+
+	// The source is still readable: nothing is destroyed before installation.
+	for identity in [k1, k2, k3] {
+		assert!(
+			manager.lookup(tenant(), identity).is_some(),
+			"source rows stay addressable until installation commits"
+		);
+	}
+	let k1_location = manager.lookup(tenant(), k1).expect("k1 is indexed");
+	assert_eq!(
+		k1_location.slab_id, slab_a,
+		"the index still points at the untouched source slab"
+	);
+	assert!(
+		!manager
+			.read_with_reference_origin(k1_location, PublishedReferenceOrigin::Compaction)
+			.await
+			.expect("the original frame is still readable at its source location")
+			.is_empty()
+	);
+
+	// --- Physical inspection of what was written, not just what resolves. ---
+	//
+	// Group the written locations by physical frame. A logical lookup would pass
+	// even if the rewrite had emitted three one-row frames, or had kept the old
+	// k2 in the frame and merely stopped indexing it.
+	let mut frames_written: BTreeMap<(SlabId, u64, u32), Vec<RecordLocation>> = BTreeMap::new();
+	for run in &written {
+		for location in &run.locations {
+			frames_written
+				.entry((location.slab_id, location.offset, location.length))
+				.or_default()
+				.push(*location);
+		}
+	}
+	let multi_row_frames = frames_written
+		.values()
+		.filter(|locations| locations.len() > 1)
+		.collect::<Vec<_>>();
+	assert_eq!(
+		multi_row_frames.len(),
+		1,
+		"exactly one rewritten multi-row frame: {:?}",
+		frames_written
+			.iter()
+			.map(|(key, locations)| (*key, locations.len()))
+			.collect::<Vec<_>>()
+	);
+	let rewritten_frame = multi_row_frames[0];
+	assert_eq!(
+		rewritten_frame.len(),
+		2,
+		"the frame holds exactly k1 and k3"
+	);
+
+	let mut indices = rewritten_frame
+		.iter()
+		.map(|location| location.record_row_index.get())
+		.collect::<Vec<_>>();
+	indices.sort_unstable();
+	assert_eq!(
+		indices,
+		vec![0, 1],
+		"the rewrite renumbers survivors densely from zero"
+	);
+
+	// The newer k2 survives, in its own frame; nothing carries the superseded
+	// k2's HLC. These read locations only - the temp outputs are not published
+	// yet, so their CONTENT is asserted in phase 2, after installation.
+	let newer_k2_written = frames_written
+		.values()
+		.flatten()
+		.filter(|location| location.hlc == hlc(2_000))
+		.count();
+	assert_eq!(newer_k2_written, 1, "exactly one surviving newer k2");
+	assert_eq!(
+		frames_written
+			.values()
+			.flatten()
+			.filter(|location| location.hlc == hlc(1_000))
+			.count(),
+		2,
+		"only k1 and k3 survive from the original frame's HLC"
+	);
+
+	// Digest invariance: the visible domain the outputs publish must equal the
+	// visible domain the plan's survivors describe.
+	let digest_summary = manager
+		.lsm_single_row_bridge_digest_summary(&prepared, &written, &source_frames)
+		.expect("the written outputs reproduce the planned visible domain");
+	assert_eq!(
+		digest_summary.visible_pre, digest_summary.visible_post,
+		"a rewrite that preserves survivors is digest-invariant"
+	);
+	assert!(!written.is_empty(), "the compaction wrote at least one run");
+}
+
+/// ADR 0097 step 2, phase 2 - PUBLICATION and RECOVERY.
+///
+/// Phase 1 proves the rewriter emits the right shape into unpublished temp
+/// outputs. This proves the rewritten frame survives installation and a manager
+/// reopen: the same rows resolve, they resolve into the INSTALLED outputs rather
+/// than the retired sources, and every per-row field is intact on the way back
+/// off disk. Split from phase 1 so a failure localizes to one side or the other.
+#[tokio::test]
+async fn adr0097_rewritten_partial_survivor_frame_survives_install_and_reopen() {
+	let dir = fresh_dir("adr0097-partial-survivor-install");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let table = adr0097_colocated_table_descriptor_for_test();
+
+	let identities =
+		append_attributed_multirow_frame_for_test(&manager, &table, &[1, 2, 3], hlc(1_000)).await;
+	let (k1, k2, k3) = (identities[0], identities[1], identities[2]);
+	let slab_a = manager.force_seal_active_for_test().await;
+	append_attributed_multirow_frame_for_test(&manager, &table, &[2], hlc(2_000)).await;
+	let slab_b = manager.force_seal_active_for_test().await;
+
+	let mut catalog_tables = TableSchemaCatalog::default();
+	catalog_tables.upsert(tenant(), table.clone()).unwrap();
+
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0x0097_0002),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![slab_a, slab_b],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(9_000),
+		compaction_start_hlc: hlc(9_001),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &plan, &catalog_tables)
+		.await
+		.unwrap();
+	let source_frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&source_frames,
+			Some(&catalog_tables),
+		)
+		.await
+		.unwrap();
+	// Capture the survivors' per-row fields BEFORE the sources are retired, so the
+	// post-reopen comparison is against what was actually stored rather than
+	// against values re-derived by the same rules the rewrite itself uses.
+	let before_rewrite = {
+		let location = manager
+			.lookup(tenant(), k1)
+			.expect("k1 indexed pre-install");
+		let frame = manager
+			.read_with_reference_origin(location, PublishedReferenceOrigin::Compaction)
+			.await
+			.expect("source frame readable pre-install");
+		storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("source frame is multi-row")
+	};
+	assert_eq!(
+		before_rewrite.len(),
+		3,
+		"the source frame held all three rows"
+	);
+
+	let digest_summary = manager
+		.lsm_single_row_bridge_digest_summary(&prepared, &written, &source_frames)
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest_summary);
+	let installed_slabs = written.iter().map(|run| run.slab_id).collect::<Vec<_>>();
+	manager
+		.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+		.await
+		.expect("the rewritten outputs install");
+
+	// Reopen from disk: nothing below is served from in-memory state.
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.clone(), io, crypto).await;
+
+	for identity in [k1, k3] {
+		let location = reopened
+			.lookup(tenant(), identity)
+			.unwrap_or_else(|| panic!("row still resolves after reopen"));
+		assert!(
+			installed_slabs.contains(&location.slab_id),
+			"the row resolves into an INSTALLED output, not a retired source: {:?}",
+			location.slab_id
+		);
+	}
+	let k2_location = reopened.lookup(tenant(), k2).expect("k2 still resolves");
+	assert_eq!(
+		k2_location.hlc,
+		hlc(2_000),
+		"k2 resolves to the newer version; the superseded one is gone"
+	);
+	assert!(
+		installed_slabs.contains(&k2_location.slab_id),
+		"the newer k2 also resolves into an installed output"
+	);
+
+	// The rewritten frame recovered from disk holds exactly k1 and k3, densely
+	// numbered, with every per-row field intact.
+	let k1_location = reopened.lookup(tenant(), k1).unwrap();
+	let k3_location = reopened.lookup(tenant(), k3).unwrap();
+	assert_eq!(
+		(k1_location.slab_id, k1_location.offset),
+		(k3_location.slab_id, k3_location.offset),
+		"k1 and k3 recovered into ONE physical frame"
+	);
+	let mut recovered_indices = vec![
+		k1_location.record_row_index.get(),
+		k3_location.record_row_index.get(),
+	];
+	recovered_indices.sort_unstable();
+	assert_eq!(
+		recovered_indices,
+		vec![0, 1],
+		"dense indices survive reopen"
+	);
+
+	let frame = reopened
+		.read_with_reference_origin(k1_location, PublishedReferenceOrigin::Compaction)
+		.await
+		.expect("the installed frame reads back");
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("the installed frame is still multi-row");
+	assert_eq!(entries.len(), 2, "exactly the two survivors");
+	assert!(
+		!entries.iter().any(|entry| entry.key_identity == k2),
+		"no old k2 entry anywhere in the recovered frame"
+	);
+	let batch = crate::storage::multirow::decode_batch(&frame).unwrap();
+	for identity in [k1, k3] {
+		let entry = entries
+			.iter()
+			.find(|entry| entry.key_identity == identity)
+			.expect("survivor present");
+		let before = before_rewrite
+			.iter()
+			.find(|candidate| candidate.key_identity == identity)
+			.expect("the source frame held this survivor");
+		assert_eq!(
+			entry.row_hlc, before.row_hlc,
+			"HLC preserved through install"
+		);
+		assert_eq!(
+			entry.is_tombstone, before.is_tombstone,
+			"tombstone flag preserved"
+		);
+		assert_eq!(
+			entry.routing_locality, before.routing_locality,
+			"routing locality preserved"
+		);
+		assert_eq!(entry.partition, before.partition, "partition preserved");
+		assert_eq!(
+			storage_row_table_object_id_at(&batch, entry.record_row_index).unwrap(),
+			Some(table.table_object_id),
+			"per-row table attribution preserved through install and reopen"
+		);
+	}
+}
+
+/// ADR 0097: a plan naming several rows of one physical frame must read and
+/// retain that frame ONCE. The per-row read this replaces retained a full copy
+/// of the containing frame for every logical row it held, which is how a 2.2 GiB
+/// slab became a 21 GiB working set before the run reported an unsupported plan.
+///
+/// The assertion is on buffer identity rather than on wall time or RSS: under the
+/// per-row implementation every entry owned a distinct `Vec`, so the distinct
+/// buffer count equalled the row count and this fails.
+#[tokio::test]
+async fn adr0097_source_frames_are_read_once_per_physical_frame() {
+	let mgr = fresh_manager().await;
+	let key_a = id(0x9A);
+	let key_b = id(0x9B);
+	let key_c = id(0x9C);
+	let loc = Locality::new(11);
+	let frame = encode_test_multirow_storage_frame(&[
+		(key_a, loc, hlc(10), 100),
+		(key_b, loc, hlc(11), 101),
+		(key_c, loc, hlc(12), 102),
+	]);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("multi-row entries");
+	mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let source_slab_id = force_seal_active(&mgr).await;
+
+	let snapshot = mgr.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0x0097),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![source_slab_id],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(5),
+		compaction_start_hlc: hlc(200),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+
+	let frames = mgr.read_lsm_single_row_source_frames(&plan).await.unwrap();
+
+	let physical: std::collections::HashSet<_> = frames
+		.iter()
+		.map(|source| {
+			(
+				source.entry.location.slab_id,
+				source.entry.location.offset,
+				source.entry.location.length,
+			)
+		})
+		.collect();
+	assert!(
+		frames.len() > physical.len(),
+		"the fixture must reproduce the shape it guards: {} rows over {} frames",
+		frames.len(),
+		physical.len()
+	);
+
+	let buffers: std::collections::HashSet<_> = frames
+		.iter()
+		.map(|source| std::sync::Arc::as_ptr(&source.frame))
+		.collect();
+	assert_eq!(
+		buffers.len(),
+		physical.len(),
+		"one retained buffer per physical frame, not per row"
+	);
+
+	// Sharing must not change what any row sees.
+	for source in &frames {
+		let decoded = storage_multirow_index_entries_from_frame(&source.frame)
+			.unwrap()
+			.expect("shared frame still decodes as multi-row");
+		assert!(
+			decoded.iter().any(
+				|entry| super::lsm_driver::lsm_multirow_index_entry_matches_version(
+					entry,
+					&source.entry
+				)
+			),
+			"every row still resolves inside the frame it shares"
+		);
+	}
+}
+
 /// ADR 0090 regression control: compaction re-homes bytes, never placement.
 /// The defect this pins: relocated locations built by struct-update from the
 /// replacement slab's base location silently downgraded partitioned rows to

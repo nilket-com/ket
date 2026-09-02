@@ -143,9 +143,29 @@ impl From<RecordLocation> for LsmSourceFrameKey {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct LsmMultiRowSourceFrame {
+/// ADR 0097: one physical frame re-encoded to hold exactly a run.s planned rows,
+/// with its index entries renumbered densely over them.
+pub(super) struct LsmRewrittenMultiRowFrame {
 	pub(super) frame: Vec<u8>,
 	pub(super) entries: Vec<MultiRowIndexEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LsmMultiRowSourceFrame {
+	pub(super) frame: Arc<Vec<u8>>,
+	pub(super) entries: Vec<MultiRowIndexEntry>,
+}
+
+/// ADR 0097: identity match that does NOT compare `record_row_index`. A rewritten
+/// frame renumbers its rows densely over the survivors, so the planned row and the
+/// entry that now carries it agree on key, HLC and tombstone but not on position.
+pub(super) fn lsm_multirow_index_entry_matches_version_ignoring_position(
+	entry: &MultiRowIndexEntry,
+	version: &VersionEntry,
+) -> bool {
+	entry.key_identity == version.row_key_id
+		&& entry.row_hlc == version.row_hlc
+		&& entry.is_tombstone == version.location.is_tombstone
 }
 
 pub(super) fn lsm_multirow_index_entry_matches_version(
@@ -689,6 +709,9 @@ impl SlabManager {
 		secondary_index_context: Option<SecondaryIndexCompactionContext<'_>>,
 	) -> Result<crate::storage::lsm::CompactionOutcome, CompactionFailure> {
 		let _pins = worker.acquire_plan_pins(&plan)?;
+		let table_schemas = secondary_index_context
+			.as_ref()
+			.map(|context| context.table_schemas);
 		let prepared = match secondary_index_context {
 			Some(context) => {
 				self.prepare_lsm_compaction_outputs_with_table_schemas(
@@ -702,7 +725,12 @@ impl SlabManager {
 		};
 		let source_frames = self.read_lsm_single_row_source_frames(&plan).await?;
 		let written = self
-			.write_lsm_compaction_temp_outputs(&plan, &prepared, &source_frames)
+			.write_lsm_compaction_temp_outputs_with_table_schemas(
+				&plan,
+				&prepared,
+				&source_frames,
+				table_schemas,
+			)
 			.await?;
 		let digest_summary =
 			match self.lsm_single_row_bridge_digest_summary(&prepared, &written, &source_frames) {
@@ -1251,7 +1279,20 @@ impl SlabManager {
 	) -> std::io::Result<Vec<LsmSourceFrame>> {
 		let entries = self.lsm_version_entries_for_plan(plan);
 		let mut frames = Vec::with_capacity(entries.len());
+		// ADR 0097: one read per PHYSICAL frame, shared by every row that resolves
+		// into it. Reading per row re-read and re-retained the whole containing
+		// frame once per row of a multi-row frame; the plan can name thousands of
+		// rows across far fewer frames.
+		let mut frames_by_key: HashMap<LsmSourceFrameKey, Arc<Vec<u8>>> = HashMap::new();
 		for entry in entries {
+			let key = LsmSourceFrameKey::from(entry.location);
+			if let Some(frame) = frames_by_key.get(&key) {
+				frames.push(LsmSourceFrame {
+					entry,
+					frame: Arc::clone(frame),
+				});
+				continue;
+			}
 			let frame = self
 				.read_with_reference_origin(entry.location, PublishedReferenceOrigin::Compaction)
 				.await
@@ -1267,9 +1308,120 @@ impl SlabManager {
 						),
 					)
 				})?;
+			let frame = Arc::new(frame);
+			frames_by_key.insert(key, Arc::clone(&frame));
 			frames.push(LsmSourceFrame { entry, frame });
 		}
 		Ok(frames)
+	}
+
+	/// ADR 0097: re-encode one physical frame so it holds exactly the rows the run
+	/// planned, delegating to the same `compact_physical_record_frame` the
+	/// tombstone and retention rewrites use. That path already preserves key,
+	/// routing locality, HLC, tombstone flag, durable placement, partition and
+	/// per-row table attribution, and it renumbers `record_row_index` densely over
+	/// the survivors - so the caller must match planned rows to new entries by
+	/// identity rather than by their old index.
+	///
+	/// The source frame is not touched: the rewrite is appended to the temp output
+	/// and the original stays addressable until installation commits.
+	fn rewrite_lsm_multirow_partial_survivors(
+		&self,
+		tenant_id: TenantId,
+		key: &LsmSourceFrameKey,
+		source: &LsmMultiRowSourceFrame,
+		run_rows_for_source: &[(usize, &VersionEntry)],
+		table_schemas: Option<&TableSchemaCatalog>,
+	) -> std::io::Result<LsmRewrittenMultiRowFrame> {
+		let records = source
+			.entries
+			.iter()
+			.map(|entry| {
+				// ADR 0090: the row's durable placement is derived from its own
+				// partition, never inherited from a neighbour in the same frame.
+				let placement = if entry.partition.is_some() {
+					PlacementSemantics::Partitioned
+				} else {
+					PlacementSemantics::RawLocality
+				};
+				let survives = run_rows_for_source.iter().any(|(_, candidate)| {
+					lsm_multirow_index_entry_matches_version(entry, candidate)
+				});
+				CompactionRecord {
+					tenant_id,
+					key_identity: entry.key_identity,
+					routing_locality: entry.routing_locality,
+					old_location: RecordLocation {
+						slab_id: key.slab_id,
+						offset: key.offset,
+						length: key.length,
+						hlc: entry.row_hlc,
+						record_row_index: entry.record_row_index,
+						is_tombstone: entry.is_tombstone,
+						placement,
+						partition: entry.partition,
+					},
+					reclaim: !survives,
+					retention_ambiguous: false,
+					retention_lag_seconds: 0,
+				}
+			})
+			.collect::<Vec<_>>();
+
+		let compacted = compact_physical_record_frame(
+			&source.frame,
+			&records,
+			table_schemas,
+			&self.config.row_group_writer,
+			&self.config.encoding_writer,
+			&self.config.l2_chunk_layout,
+		)?
+		.ok_or_else(|| {
+			// Unreachable from here: the caller only rewrites a frame that at least
+			// one planned row resolves into, so the survivor set is never empty.
+			// Recorded rather than assumed, because an empty rewrite would silently
+			// drop every row of the frame.
+			Error::new(
+				ErrorKind::InvalidData,
+				"LSM multi-row rewrite produced no surviving rows",
+			)
+		})?;
+
+		let entries =
+			storage_multirow_index_entries_from_frame(&compacted.frame)?.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"LSM multi-row rewrite produced a frame without multi-row entries",
+				)
+			})?;
+		// The caller maps planned rows to these entries by (key, HLC, tombstone),
+		// because the rewrite renumbers positions. A first match is only sound if
+		// that tuple is unique: two entries sharing it would let one planned row
+		// silently take the other row.s location.
+		let mut seen = HashSet::with_capacity(entries.len());
+		for entry in &entries {
+			if !seen.insert((entry.key_identity, entry.row_hlc, entry.is_tombstone)) {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"LSM multi-row rewrite produced two rows with one identity; \
+					 position-independent mapping would be ambiguous",
+				));
+			}
+		}
+		if entries.len() != run_rows_for_source.len() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"LSM multi-row rewrite kept {} rows, run planned {}",
+					entries.len(),
+					run_rows_for_source.len()
+				),
+			));
+		}
+		Ok(LsmRewrittenMultiRowFrame {
+			frame: compacted.frame,
+			entries,
+		})
 	}
 
 	pub async fn write_lsm_compaction_temp_outputs(
@@ -1278,9 +1430,50 @@ impl SlabManager {
 		prepared: &LsmPreparedOutputs,
 		source_frames: &[LsmSourceFrame],
 	) -> std::io::Result<Vec<LsmWrittenOutputRun>> {
+		self.write_lsm_compaction_temp_outputs_with_table_schemas(
+			plan,
+			prepared,
+			source_frames,
+			None,
+		)
+		.await
+	}
+
+	/// ADR 0097: the partial-survivor rewrite re-encodes a frame, so it needs the
+	/// schema catalog the row-group descriptor is chosen from. `None` keeps the
+	/// uncompressed-policy path, which is what a caller without a catalog had
+	/// before this parameter existed.
+	pub async fn write_lsm_compaction_temp_outputs_with_table_schemas(
+		&self,
+		plan: &CompactionPlan,
+		prepared: &LsmPreparedOutputs,
+		source_frames: &[LsmSourceFrame],
+		table_schemas: Option<&TableSchemaCatalog>,
+	) -> std::io::Result<Vec<LsmWrittenOutputRun>> {
 		let mut source_frames_by_location = HashMap::with_capacity(source_frames.len());
 		let mut multirow_source_frames_by_key = HashMap::new();
 		for source in source_frames {
+			// ADR 0097: rows sharing a physical frame share its buffer, so the frame is
+			// decoded once per frame rather than once per row. `Arc::ptr_eq` below is
+			// the same-buffer fast path; the byte comparison stays for the case the
+			// type still permits - two buffers claiming one physical location.
+			let key = LsmSourceFrameKey::from(source.entry.location);
+			if let Some(existing) = multirow_source_frames_by_key.get(&key) {
+				let existing: &LsmMultiRowSourceFrame = existing;
+				if Arc::ptr_eq(&existing.frame, &source.frame) {
+					validate_lsm_multirow_source_entry(
+						&source.entry,
+						lsm_multirow_index_entry_for_version(&existing.entries, &source.entry)
+							.ok_or_else(|| {
+								Error::new(
+									ErrorKind::InvalidData,
+									"LSM source frame does not contain planned multi-row survivor",
+								)
+							})?,
+					)?;
+					continue;
+				}
+			}
 			if let Some(entries) = storage_multirow_index_entries_from_frame(&source.frame)? {
 				let Some(matching_entry) =
 					lsm_multirow_index_entry_for_version(&entries, &source.entry)
@@ -1295,7 +1488,7 @@ impl SlabManager {
 				match multirow_source_frames_by_key.entry(key) {
 					std::collections::hash_map::Entry::Vacant(entry) => {
 						entry.insert(LsmMultiRowSourceFrame {
-							frame: source.frame.clone(),
+							frame: Arc::clone(&source.frame),
 							entries,
 						});
 					}
@@ -1365,41 +1558,66 @@ impl SlabManager {
 								LsmSourceFrameKey::from(candidate.location) == multirow_key
 							})
 							.collect::<Vec<_>>();
-						if run_rows_for_source.len() != source.entries.len() {
-							return Err(Error::new(
-								ErrorKind::Unsupported,
-								"LSM temp-output writer does not yet split multi-row frames",
-							));
-						}
-						for entry in &source.entries {
-							if !run_rows_for_source.iter().any(|(_, candidate)| {
+						// ADR 0097: a frame whose surviving rows are fewer than the rows it
+						// holds is rewritten to contain exactly the survivors, rather than
+						// refused after the whole working set has been built. Retention
+						// dropping some rows of a frame is the ordinary case here; the
+						// planner already guarantees a run never holds only PART of a
+						// frame's survivors, so a short run row set means rows were
+						// dropped, not split across runs.
+						let rewritten = if run_rows_for_source.len() == source.entries.len() {
+							None
+						} else {
+							Some(self.rewrite_lsm_multirow_partial_survivors(
+								row.tenant_id,
+								&multirow_key,
+								source,
+								&run_rows_for_source,
+								table_schemas,
+							)?)
+						};
+						let (frame_bytes, index_entries) = match &rewritten {
+							Some(rewritten) => {
+								(rewritten.frame.as_slice(), rewritten.entries.as_slice())
+							}
+							None => (source.frame.as_slice(), source.entries.as_slice()),
+						};
+						// A rewritten frame renumbers its rows, so position is not a
+						// stable identifier across the rewrite; an untouched frame keeps
+						// its positions and is held to the stricter match.
+						let rows_match = |entry: &MultiRowIndexEntry, candidate: &VersionEntry| {
+							if rewritten.is_some() {
+								lsm_multirow_index_entry_matches_version_ignoring_position(
+									entry, candidate,
+								)
+							} else {
 								lsm_multirow_index_entry_matches_version(entry, candidate)
-							}) {
+							}
+						};
+						for entry in index_entries {
+							if !run_rows_for_source
+								.iter()
+								.any(|(_, candidate)| rows_match(entry, candidate))
+							{
 								return Err(Error::new(
-									ErrorKind::Unsupported,
-									"LSM temp-output writer does not yet partially rewrite multi-row frames",
+									ErrorKind::InvalidData,
+									"LSM rewritten multi-row frame carries a row the run did not plan",
 								));
 							}
 						}
-						let Some(primary) = source.entries.first() else {
+						let Some(primary) = index_entries.first() else {
 							return Err(Error::new(
 								ErrorKind::InvalidData,
 								"LSM multi-row source frame has no index entries",
 							));
 						};
-						let record_hlc = source
-							.entries
+						let record_hlc = index_entries
 							.iter()
 							.map(|entry| entry.row_hlc)
 							.max()
 							.unwrap_or(primary.row_hlc);
 						let base_location = output
-							.append(
-								row.tenant_id,
-								primary.key_identity,
-								record_hlc,
-								&source.frame,
-							)
+							.append(row.tenant_id, primary.key_identity, record_hlc, frame_bytes)
 							.await?;
 						output.rollback_index_entry(
 							row.tenant_id,
@@ -1407,7 +1625,7 @@ impl SlabManager {
 							base_location,
 						);
 						let mut locations_by_row_index = HashMap::new();
-						for entry in &source.entries {
+						for entry in index_entries {
 							let new_location = RecordLocation {
 								hlc: entry.row_hlc,
 								record_row_index: entry.record_row_index,
@@ -1418,9 +1636,14 @@ impl SlabManager {
 							locations_by_row_index.insert(entry.record_row_index, new_location);
 						}
 						for (position, candidate) in run_rows_for_source {
-							let Some(new_location) = locations_by_row_index
-								.get(&candidate.record_row_index)
-								.copied()
+							// A rewritten frame renumbers its rows, so a planned row is
+							// matched by identity and HLC rather than by its old index.
+							let Some(new_location) = index_entries
+								.iter()
+								.find(|entry| rows_match(entry, candidate))
+								.and_then(|entry| {
+									locations_by_row_index.get(&entry.record_row_index).copied()
+								})
 							else {
 								return Err(Error::new(
 									ErrorKind::InvalidData,
