@@ -103,6 +103,18 @@ rather than attempted.
 - `lsm_compaction_paused = true` is containment, not a fix, and it pauses only
   `LsmCompactionService`. The secondary-index lifecycle and the MVCC retention
   sweeper keep running, so the retention half of the loop is unaffected by it.
+  **Measured over 20 minutes of containment:** resident bytes are bounded - a
+  0.23-2.88 GB sawtooth against a 7.86 GB unit peak, versus the 40+ GB climb
+  before - but the retention half is a **non-converging rewrite loop**. Wendelon
+  read **60.3 GB and wrote 13.8 GB** in those 20 minutes (41.2 GB/hour written)
+  against a **4.85 GB** store. It allocated eight slab ids, rewriting the large
+  slab into a fresh ~2.35 GB file every ~3 minutes and deleting the source; the
+  `backfill source slab N not found` ids are exactly the deleted sources
+  (30770, 30772-30775 = `0x7832`, `0x7834`-`0x7837`, none of which exist on disk,
+  while `0x7838` and `0x7839` survive at ~2.35 GB each). Containment therefore
+  protects host memory and does **not** stop the work: the rewrite and the
+  backfill disagree about who owns the slab, which is decision 3 above, and it is
+  the retention path rather than compaction that demonstrates it.
 - `MemoryMax` on the unit protects the host but converts a host OOM into a
   contained restart loop. It is not a substitute for this record.
 - The heavy-churn exhibit that discharged the ADR 0055 slab-pin work did not
