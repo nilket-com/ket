@@ -13,6 +13,7 @@
 //! correctness — dev data is synthetic and explicitly NOT a TPC-H result.
 
 mod adr444_profile_eval;
+pub mod evidence;
 pub mod telemetry;
 
 pub use adr444_profile_eval::{
@@ -5066,6 +5067,14 @@ pub struct TimingAuthorityConditions {
 }
 
 impl TimingAuthorityConditions {
+	pub fn granted_except_build_identity(&self) -> bool {
+		self.full_hash_dataset
+			&& self.quiescent_host
+			&& self.protocol_unmodified
+			&& self.complete_cohort
+			&& self.diagnostics_disabled
+	}
+
 	pub fn granted(&self) -> bool {
 		self.clean_build
 			&& self.full_hash_dataset
@@ -6487,6 +6496,7 @@ pub fn timing_atlas_header_row(
 		"kind": TIMING_ATLAS_KIND_HEADER,
 		"suite": "tpch_timing_atlas",
 		"build_commit": crate::telemetry::build_commit(),
+		"evidence_identity": crate::evidence::runtime_identity_json(),
 		"binary_modified_unix": crate::telemetry::binary_modified_unix(),
 		"scale_factor": scale_factor,
 		"mode": mode,
@@ -7640,6 +7650,7 @@ pub async fn run_timing_atlas(
 	artifact.append_seal(&serde_json::json!({
 		"kind": TIMING_ATLAS_SEAL_KIND,
 		"timing_authority": authoritative,
+		"content_identity_shadow": crate::evidence::runtime_identity_gate(),
 		"withheld_reasons": conditions.withheld_reasons(),
 		"replay_violations": replay.violations,
 		"finalized_cells": replay.finalized_cells.len(),
@@ -7664,7 +7675,16 @@ pub async fn run_timing_atlas(
 			replay.violations
 		));
 	}
-	artifact.publish()
+	let published = artifact.publish()?;
+	let content_candidate = replay.withheld_reasons().is_empty()
+		&& conditions.granted_except_build_identity()
+		&& crate::evidence::runtime_identity_gate().would_admit;
+	crate::evidence::write_runtime_evidence_manifest(
+		&published,
+		"tpch_timing_atlas",
+		content_candidate,
+	)?;
+	Ok(published)
 }
 
 /// Result of the ADR 555 paired comparison. A sealed artifact is published even when its
@@ -7692,12 +7712,14 @@ pub async fn run_placement_ab(
 		artifact.append_row(&serde_json::json!({
 			"kind": PLACEMENT_AB_KIND_HEADER,
 			"aborted": "host_not_quiescent",
+			"evidence_identity": crate::evidence::runtime_identity_json(),
 			"host_start_service_inactive": host_start.service_inactive,
 			"host_start_sql_port_free": host_start.sql_port_free,
 		}))?;
 		artifact.append_seal(&serde_json::json!({
 			"kind": PLACEMENT_AB_SEAL_KIND,
 			"paired_timing_authority": false,
+			"content_identity_shadow": crate::evidence::runtime_identity_gate(),
 			"withheld_reasons": ["host_not_quiescent"],
 			"replay_violations": [],
 		}))?;
@@ -7715,6 +7737,7 @@ pub async fn run_placement_ab(
 		"kind": PLACEMENT_AB_KIND_HEADER,
 		"suite": "tpch_placement_ab",
 		"build_commit": crate::telemetry::build_commit(),
+		"evidence_identity": crate::evidence::runtime_identity_json(),
 		"binary_modified_unix": crate::telemetry::binary_modified_unix(),
 		"scale_factor": scale_factor,
 		"mode": mode,
@@ -7828,11 +7851,20 @@ pub async fn run_placement_ab(
 	artifact.append_seal(&serde_json::json!({
 		"kind": PLACEMENT_AB_SEAL_KIND,
 		"paired_timing_authority": authority,
+		"content_identity_shadow": crate::evidence::runtime_identity_gate(),
 		"withheld_reasons": withheld_reasons,
 		"replay_violations": replay.violations,
 		"finalized_cells": replay.finalized_cells.len(),
 	}))?;
 	let path = artifact.publish()?;
+	let content_candidate = replay.withheld_reasons(&conditions).is_empty()
+		&& conditions.granted_except_build_identity()
+		&& crate::evidence::runtime_identity_gate().would_admit;
+	crate::evidence::write_runtime_evidence_manifest(
+		&path,
+		"tpch_placement_ab",
+		content_candidate,
+	)?;
 	Ok(PlacementAbRun {
 		path,
 		paired_timing_authority: authority,

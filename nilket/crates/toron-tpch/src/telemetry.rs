@@ -340,8 +340,8 @@ pub struct PerfAttempt {
 	pub dataset_verification: Option<DatasetVerification>,
 }
 
-/// The commit this gauge binary was built from, stamped at compile time
-/// (`<short-sha>` or `<short-sha>-dirty`; `unknown` when git was unavailable).
+/// Legacy compile-time stamp. ADR 581 cut 1 keeps this as the deciding authority input while
+/// content identity runs in shadow; cut 2 retires it to a navigation hint.
 pub fn build_commit() -> &'static str {
 	env!("TORON_TPCH_BUILD_COMMIT")
 }
@@ -383,6 +383,7 @@ impl PerfAttempt {
 			"engine_version": self.engine_version,
 			"duckdb_version": self.duckdb_version,
 			"build_commit": build_commit(),
+			"evidence_identity": crate::evidence::runtime_identity_json(),
 			"binary_modified_unix": binary_modified_unix(),
 			"local_join_admissions": self.local_join_admissions,
 			"join_spill_observations": self.join_spill_observations,
@@ -480,6 +481,7 @@ impl FragmentCensusRow {
 			"live_eligible_consumer_tasks": self.live_eligible_consumer_tasks,
 			"elapsed_ms": self.elapsed_ms,
 			"build_commit": build_commit(),
+			"evidence_identity": crate::evidence::runtime_identity_json(),
 			"binary_modified_unix": binary_modified_unix(),
 		});
 		if let Some(message) = &self.diagnostic_message {
@@ -612,6 +614,7 @@ impl ExecutionCensusRow {
 			"total_elapsed_ms": self.total_elapsed_ms,
 			"timing_authority": false,
 			"build_commit": build_commit(),
+			"evidence_identity": crate::evidence::runtime_identity_json(),
 			"binary_modified_unix": binary_modified_unix(),
 		});
 		if let Some(message) = &self.diagnostic_message {

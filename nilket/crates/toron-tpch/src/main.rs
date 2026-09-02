@@ -5015,6 +5015,7 @@ fn shape_preserving_spill_index_gate_record(
 	}
 	Ok(serde_json::json!({
 		"suite": "shape_preserving_spill_index_gate",
+		"content_identity_shadow": toron_tpch::evidence::compare_row_identities(on_row, off_row),
 		"candidate_mode": candidate["mode"],
 		"control_mode": control["mode"],
 		"partition_count": partition_count,
@@ -5219,6 +5220,7 @@ fn route_distinct_gate_record(
 			return Err(format!("route gate arms disagree on {key}"));
 		}
 	}
+	let content_identity_shadow = toron_tpch::evidence::compare_row_identities(on_row, off_row);
 	if row_u64(on_row, "output_row_count")? != row_u64(off_row, "output_row_count")? {
 		return Err("route gate arms disagree on output_row_count".to_string());
 	}
@@ -5268,6 +5270,7 @@ fn route_distinct_gate_record(
 	}
 	Ok(serde_json::json!({
 		"suite": "route_distinct_gate",
+		"content_identity_shadow": content_identity_shadow,
 		"plan_fingerprint": row_str(on_row, "plan_fingerprint")?,
 		"digest_equal": true,
 		"control_partition_count": off_partitions,
@@ -5479,9 +5482,11 @@ mod tests {
 	fn shape_preserving_gate_requires_equal_shape_and_opposite_lifecycle() {
 		let candidate = shape_gate_row(true);
 		let control = shape_gate_row(false);
+		let gate = shape_preserving_spill_index_gate_record(&candidate, &control).unwrap();
+		assert_eq!(gate["passed"], true);
 		assert_eq!(
-			shape_preserving_spill_index_gate_record(&candidate, &control).unwrap()["passed"],
-			true
+			gate["content_identity_shadow"]["would_admit"], false,
+			"cut 1 reports missing content identity but the legacy gate still decides"
 		);
 		assert!(
 			shape_preserving_spill_index_gate_record(&candidate, &candidate).is_err(),

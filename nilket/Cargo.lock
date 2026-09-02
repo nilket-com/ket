@@ -5516,6 +5516,7 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toron",
  "tpchgen",
