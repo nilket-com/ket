@@ -668,12 +668,56 @@ impl SlabManager {
 		.map(Some)
 	}
 
+	/// ADR 0097: a plan is chosen before its claims are held, so between the pick
+	/// and the claim another maintenance job may have rewritten or retired one of
+	/// its slabs. Re-check presence once the claims are in hand.
+	///
+	/// Deliberately a presence check, not `manifest_epoch` equality: any unrelated
+	/// compaction anywhere bumps the epoch, and failing on that would abandon
+	/// plans that are still perfectly valid. What the claim protects is that these
+	/// slabs stop moving; what this checks is that they were still there when it
+	/// started protecting them.
+	fn revalidate_lsm_plan_after_claims(
+		&self,
+		plan: &CompactionPlan,
+	) -> Result<(), CompactionFailure> {
+		let manifest = recover_rwlock_read(&self.compaction_manifest, "compaction_manifest");
+		for slab_id in plan.touched_slabs() {
+			// Presence alone is not enough: a RETIRED run stays in the manifest, so
+			// `get_run(..).is_some()` would accept a slab another job has already
+			// replaced. The plan is only still valid if every slab it names is Live
+			// and still at the level the plan chose it from.
+			let Some(run) = manifest.get_run(slab_id) else {
+				return Err(CompactionFailure::ManifestRace);
+			};
+			if !run.state.is_live() {
+				return Err(CompactionFailure::ManifestRace);
+			}
+			let planned_level = if plan.input_slabs.contains(&slab_id) {
+				plan.source_level
+			} else {
+				plan.target_level
+			};
+			if run.compaction_level != planned_level {
+				return Err(CompactionFailure::ManifestRace);
+			}
+		}
+		Ok(())
+	}
+
 	pub(super) async fn run_lsm_compaction_once_inner(
 		&self,
 		worker: &LsmCompactionWorker,
 		plan: CompactionPlan,
 	) -> Result<crate::storage::lsm::CompactionOutcome, CompactionFailure> {
 		let _pins = worker.acquire_plan_pins(&plan)?;
+		// ADR 0097: the pins above only stop the slabs being DELETED; they are
+		// shared, so another maintenance job could still rewrite one underneath
+		// this read. Take the exclusive claims over every touched slab before any
+		// read and hold them through publication, then revalidate - the plan was
+		// picked before the claims existed.
+		let _claims = self.acquire_maintenance_claims(&plan.touched_slabs()).await;
+		self.revalidate_lsm_plan_after_claims(&plan)?;
 		let prepared = self.prepare_lsm_compaction_outputs(worker, &plan).await?;
 		let source_frames = self.read_lsm_single_row_source_frames(&plan).await?;
 		let written = self
@@ -709,6 +753,11 @@ impl SlabManager {
 		secondary_index_context: Option<SecondaryIndexCompactionContext<'_>>,
 	) -> Result<crate::storage::lsm::CompactionOutcome, CompactionFailure> {
 		let _pins = worker.acquire_plan_pins(&plan)?;
+		// ADR 0097: exclusive claims over every touched slab, held for the whole
+		// job. See the sibling entry point above for why the shared pins are not
+		// enough on their own.
+		let _claims = self.acquire_maintenance_claims(&plan.touched_slabs()).await;
+		self.revalidate_lsm_plan_after_claims(&plan)?;
 		let table_schemas = secondary_index_context
 			.as_ref()
 			.map(|context| context.table_schemas);

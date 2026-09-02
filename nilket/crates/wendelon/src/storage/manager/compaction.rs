@@ -1,3 +1,4 @@
+use super::secondary_index_segments::MaintenanceClaims;
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -410,10 +411,16 @@ impl SlabManager {
 	pub(super) async fn compact_one_sealed_slab(
 		&self,
 		slab_id: SlabId,
-		slab: Arc<LocalSlabStore>,
 		tombstones: &[MigratedRangeTombstone],
 		secondary_index_context: SecondaryIndexCompactionContext<'_>,
 	) -> std::io::Result<Option<CompactionOutcome>> {
+		// ADR 0097: own the slab BEFORE scanning it, then refetch it. Scanning
+		// unowned let this job plan from bytes another maintenance job had already
+		// replaced; and the handle it was called with predates the wait for
+		// ownership, so after waiting it can name a superseded image.
+		let Some((claims, slab)) = self.claim_sealed_slab_for_maintenance(slab_id).await else {
+			return Ok(None);
+		};
 		let mut records: Vec<CompactionRecord> = slab
 			.index
 			.iter()
@@ -441,14 +448,15 @@ impl SlabManager {
 			.collect();
 		records.sort_by_key(|record| record.old_location.offset);
 
-		self.compact_sealed_slab_records(slab_id, slab, &records, secondary_index_context)
+		self.compact_sealed_slab_records(slab_id, slab, &records, secondary_index_context, &claims)
 			.await
 	}
 
 	pub(super) async fn recluster_one_sealed_slab(
 		&self,
 		slab_id: SlabId,
-		slab: Arc<LocalSlabStore>,
+		// Unused: `recluster_one_sealed_slab` refetches after claiming.
+		_stale_handle: Arc<LocalSlabStore>,
 		tenant_id: TenantId,
 		descriptor: &TableSchemaDescriptor,
 		secondary_index_context: SecondaryIndexCompactionContext<'_>,
@@ -463,7 +471,12 @@ impl SlabManager {
 		{
 			return Ok(None);
 		}
-		let _slab_rewrite_claim = self.acquire_slab_rewrite_exclusive_claim(slab_id).await;
+		// ADR 0097: own the slab before scanning it, like every other rewrite path,
+		// and refetch it afterwards - the handle this was called with predates the
+		// wait for ownership. Recluster reads the whole slab index below.
+		let Some((_claims, slab)) = self.claim_sealed_slab_for_maintenance(slab_id).await else {
+			return Ok(None);
+		};
 		self.ensure_live_lsm_run_for_maintenance(slab_id, slab.write_cursor());
 		let mut records: Vec<CompactionRecord> = slab
 			.index
@@ -854,13 +867,28 @@ impl SlabManager {
 		}))
 	}
 
+	/// ADR 0097: `claims` is the caller's proof that it already owns `slab_id`.
+	/// The claim used to be taken here, which meant the caller had scanned the
+	/// slab unowned and could arrive with a plan built from bytes another job had
+	/// already replaced. Ownership is now hoisted above the scan by every caller.
 	pub(super) async fn compact_sealed_slab_records(
 		&self,
 		slab_id: SlabId,
 		slab: Arc<LocalSlabStore>,
 		records: &[CompactionRecord],
 		secondary_index_context: SecondaryIndexCompactionContext<'_>,
+		claims: &MaintenanceClaims,
 	) -> std::io::Result<Option<CompactionOutcome>> {
+		if !claims.covers(slab_id) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"maintenance rewrite of slab {slab_id} without holding its claim; \
+					 the job owns {:?}",
+					claims.slabs()
+				),
+			));
+		}
 		if records.is_empty() || records.iter().all(|record| !record.reclaim) {
 			return Ok(None);
 		}
@@ -876,7 +904,7 @@ impl SlabManager {
 		{
 			return Ok(None);
 		}
-		let _slab_rewrite_claim = self.acquire_slab_rewrite_exclusive_claim(slab_id).await;
+		// Ownership is the caller's, proven by `claims` above.
 		self.ensure_live_lsm_run_for_maintenance(slab_id, slab.write_cursor());
 		let old_bytes = slab.write_cursor();
 		let reclaimed_records = records.iter().filter(|record| record.reclaim).count();

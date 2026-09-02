@@ -98,10 +98,56 @@ pub struct SecondaryIndexCoverageSnapshot {
 	pub last_backfill_error: Option<SecondaryIndexBackfillError>,
 }
 
+/// ADR 0097: a backfill candidate, and the PROOF that this process enumerated it
+/// while its source was live.
+///
+/// The fields are private and the constructor is crate-internal, so external code
+/// cannot forge one. That matters because only an enumerated candidate may treat an
+/// acquisition-time `NotFound` as ordinary staleness: the source it named was live
+/// when it was enumerated, so its disappearance means another maintenance job
+/// replaced it. A slab id that arrived any other way carries no such history, and
+/// its absence is an integrity failure.
+///
+/// Provenance is structural rather than evidential on purpose. The obvious
+/// alternative - proving supersession from the manifest - cannot work: a retired
+/// run's successors are overwritten when it becomes `DeletePending`, and the run is
+/// deleted outright when the backing is disposed, so by the time a backfill notices
+/// the source is gone there is nothing left in the manifest to distinguish a
+/// genuinely superseded slab from one that never existed.
+/// External code cannot construct one, which is what makes the provenance a
+/// proof rather than a convention. Pinned by compile failure, and pinned to
+/// `E0451` specifically so the test cannot pass for an unrelated reason such as
+/// a broken import:
+///
+/// ```compile_fail,E0451
+/// use wendelon::storage::SecondaryIndexBackfillCandidate;
+/// let _ = SecondaryIndexBackfillCandidate {
+///     key: todo!(),
+///     source_slab_id: todo!(),
+/// };
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecondaryIndexBackfillCandidate {
-	pub key: SecondaryIndexCoverageKey,
-	pub source_slab_id: SlabId,
+	key: SecondaryIndexCoverageKey,
+	source_slab_id: SlabId,
+}
+
+impl SecondaryIndexBackfillCandidate {
+	/// Constructed only where candidacy is decided, against a source observed live.
+	pub(crate) fn enumerated(key: SecondaryIndexCoverageKey, source_slab_id: SlabId) -> Self {
+		Self {
+			key,
+			source_slab_id,
+		}
+	}
+
+	pub fn key(&self) -> SecondaryIndexCoverageKey {
+		self.key
+	}
+
+	pub fn source_slab_id(&self) -> SlabId {
+		self.source_slab_id
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

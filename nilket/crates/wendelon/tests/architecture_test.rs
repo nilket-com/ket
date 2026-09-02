@@ -223,6 +223,9 @@ fn adr0095_async_drop_reclaim_has_one_admission_and_bounded_work_spine() {
 		fs::read_to_string(manifest_dir.join("src/storage/manager/compaction.rs")).unwrap();
 	let lsm = fs::read_to_string(manifest_dir.join("src/storage/manager/lsm_driver.rs")).unwrap();
 	let sweeper = fs::read_to_string(manifest_dir.join("src/storage/sweeper.rs")).unwrap();
+	let segments =
+		fs::read_to_string(manifest_dir.join("src/storage/manager/secondary_index_segments.rs"))
+			.unwrap();
 
 	assert_eq!(
 		raft.matches(".table_drop_fences.is_fenced(").count(),
@@ -258,10 +261,28 @@ fn adr0095_async_drop_reclaim_has_one_admission_and_bounded_work_spine() {
 	assert!(reclaim.contains("candidates.take(examined_budget)"));
 	assert!(reclaim.contains("report.examined += 1"));
 	assert!(reclaim.contains("acquire_slab_rewrite_exclusive_claim"));
+	// ADR 0097 moved these acquisitions behind `claim_sealed_slab_for_maintenance`.
+	// ADR 0095's property is preserved TRANSITIVELY, and asserted as such: each
+	// rewrite path calls the helper, and the helper acquires the claims. A summed
+	// occurrence count would not prove the second link - the helper could stop
+	// claiming entirely and the total would still be satisfied by its call sites.
+	let body_of = |source: &str, name: &str| -> String {
+		source
+			.split_once(&format!("async fn {name}("))
+			.and_then(|(_, tail)| tail.split_once("\n\t}\n"))
+			.map(|(body, _)| body.to_owned())
+			.unwrap_or_else(|| panic!("{name} not found"))
+	};
+	for path in ["compact_one_sealed_slab", "recluster_one_sealed_slab"] {
+		assert!(
+			body_of(&compaction, path).contains("claim_sealed_slab_for_maintenance"),
+			"{path} must take ownership of the slab it rewrites"
+		);
+	}
 	assert!(
-		compaction
-			.matches("acquire_slab_rewrite_exclusive_claim")
-			.count() >= 2
+		body_of(&segments, "claim_sealed_slab_for_maintenance")
+			.contains("acquire_maintenance_claims"),
+		"the ownership helper must actually acquire the exclusive claims"
 	);
 	assert!(lsm.matches("acquire_slab_rewrite_exclusive_claim").count() >= 2);
 	assert!(

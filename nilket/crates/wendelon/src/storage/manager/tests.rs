@@ -3527,13 +3527,9 @@ async fn secondary_index_coverage_plan_recovers_covered_and_enqueues_missing_sea
 		plan.snapshot.active_buffer.unwrap().source_slab_id,
 		SlabId::new(2)
 	);
-	assert_eq!(
-		plan.candidates,
-		vec![SecondaryIndexBackfillCandidate {
-			key: info.coverage_key(),
-			source_slab_id: second_sealed,
-		}]
-	);
+	assert_eq!(plan.candidates.len(), 1);
+	assert_eq!(plan.candidates[0].key(), info.coverage_key());
+	assert_eq!(plan.candidates[0].source_slab_id(), second_sealed);
 }
 
 #[tokio::test]
@@ -3742,21 +3738,25 @@ async fn secondary_index_backfill_source_slab_emits_every_retained_data_version(
 		.ensure_secondary_index_coverage(tenant(), &descriptor, 4096)
 		.await
 		.unwrap();
+	// Inspected rather than compared against a literal: a candidate carries
+	// unforgeable provenance, so only enumeration can build one.
+	assert_eq!(plan.candidates.len(), 1);
 	assert_eq!(
-		plan.candidates,
-		vec![SecondaryIndexBackfillCandidate {
-			key: SecondaryIndexCoverageKey::from(SecondaryIndexIdentity::from_descriptor(
-				tenant(),
-				&descriptor,
-			)),
-			source_slab_id,
-		}]
+		plan.candidates[0].key(),
+		SecondaryIndexCoverageKey::from(SecondaryIndexIdentity::from_descriptor(
+			tenant(),
+			&descriptor,
+		))
 	);
+	assert_eq!(plan.candidates[0].source_slab_id(), source_slab_id);
 
-	let info = manager
+	let SecondaryIndexBackfillOutcome::Completed(info) = manager
 		.backfill_secondary_index_candidate(tenant(), &table, &descriptor, &plan.candidates[0])
 		.await
-		.unwrap();
+		.unwrap()
+	else {
+		panic!("nothing replaced the source, so the candidate cannot be stale");
+	};
 	assert_eq!(info.source_slab_id, source_slab_id);
 	assert_eq!(info.entry_count, 2);
 	let segment = manager
@@ -3787,6 +3787,396 @@ async fn secondary_index_backfill_source_slab_emits_every_retained_data_version(
 	assert_eq!(coverage.covered_slabs, vec![source_slab_id]);
 }
 
+/// ADR 0097: a committer that stops the LSM job exactly at publication.
+///
+/// The pause discriminates the two designs that a read-side test cannot tell
+/// apart: a job that releases its claims once its READS are done, and a job that
+/// holds them for its whole life. Only the second keeps a competing rewrite out
+/// while it publishes.
+struct PausingLsmCommitter {
+	manager: Arc<SlabManager>,
+	reached_publication: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+	release_publication: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl TierCommitter for PausingLsmCommitter {
+	async fn commit_tier_slab(&self, _tier: crate::consensus::TieredSlab) -> std::io::Result<()> {
+		Err(Error::new(ErrorKind::Unsupported, "unused"))
+	}
+
+	async fn retire_tiered_slab(&self, _slab_id: SlabId) -> std::io::Result<()> {
+		Err(Error::new(ErrorKind::Unsupported, "unused"))
+	}
+
+	async fn commit_lsm_compaction(&self, commit: CompactionCommit) -> std::io::Result<()> {
+		if let Some(sender) = self.reached_publication.lock().await.take() {
+			let _ = sender.send(());
+		}
+		if let Some(receiver) = self.release_publication.lock().await.take() {
+			let _ = receiver.await;
+		}
+		self.manager
+			.apply_lsm_manifest_compaction_commit(&commit)
+			.map(|_| ())
+			.map_err(Error::other)
+	}
+}
+
+/// ADR 0097 decision 3, end to end: one maintenance job owns every slab it touches
+/// for its WHOLE life, and a competing job blocks and then replans rather than
+/// rewriting from a stale scan.
+///
+/// The two-slab latch makes the interleaving deterministic instead of timing-based.
+/// `acquire_maintenance_claims` sorts internally, so an LSM plan over {lower,
+/// higher} takes the lower first; holding a read claim on the HIGHER slab parks the
+/// job with the lower one owned. That is a real ordering fact, not a sleep.
+///
+/// Three separate facts fall out, and each has its own assertion:
+///   1. acquisition order - LSM owns the lower slab while parked on the higher;
+///   2. exclusion during reads - retention on the lower slab cannot proceed;
+///   3. whole-job ownership - retention is STILL excluded at publication, after
+///      every read is done, which is what a claim released after reads would not do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adr0097_lsm_owns_its_inputs_through_publication_and_retention_replans() {
+	let dir = fresh_dir("adr0097-ownership-latch");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = open_manager_at_dir(dir.clone(), io, crypto).await;
+	let table = adr0097_colocated_table_descriptor_for_test();
+
+	append_attributed_multirow_frame_for_test(&manager, &table, &[1, 2], hlc(1_000)).await;
+	let lower = manager.force_seal_active_for_test().await;
+	append_attributed_multirow_frame_for_test(&manager, &table, &[3, 4], hlc(2_000)).await;
+	let higher = manager.force_seal_active_for_test().await;
+	assert!(lower < higher, "the latch needs a known acquisition order");
+
+	// 1. Hold a read claim on the HIGHER slab: the LSM job will park there.
+	let higher_lease = manager
+		.acquire_slab_rewrite_read_claim(higher)
+		.await
+		.unwrap();
+
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0x0097_0003),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![lower, higher],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(9_000),
+		compaction_start_hlc: hlc(9_001),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+	let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+	let committer = Arc::new(PausingLsmCommitter {
+		manager: manager.clone(),
+		reached_publication: tokio::sync::Mutex::new(Some(reached_tx)),
+		release_publication: tokio::sync::Mutex::new(Some(release_rx)),
+	});
+
+	// 2. Start the LSM job. It takes `lower` and parks on `higher`.
+	let lsm = tokio::spawn({
+		let manager = manager.clone();
+		let committer = committer.clone();
+		async move {
+			let worker = LsmCompactionWorker::new(
+				crate::storage::LsmConfig::default(),
+				manager.slab_pin_table(),
+			)
+			.unwrap();
+			manager
+				.run_lsm_compaction_once_via_control_ring_with_context(
+					&worker,
+					plan,
+					committer.as_ref(),
+					None,
+				)
+				.await
+		}
+	});
+
+	// Wait for the LSM job to actually take the lower slab, rather than assuming it
+	// has been scheduled. If it never does, the job failed early and its error is
+	// far more informative than a bare ownership assertion.
+	let mut owned = false;
+	for _ in 0..40 {
+		if tokio::time::timeout(
+			Duration::from_millis(50),
+			manager.acquire_slab_rewrite_read_claim(lower),
+		)
+		.await
+		.is_err()
+		{
+			owned = true;
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(25)).await;
+	}
+	assert!(
+		owned,
+		"LSM never took the lower slab; job finished={} ",
+		lsm.is_finished()
+	);
+
+	// 3. Retention on that same slab must block, not scan.
+	let mut catalog_tables = TableSchemaCatalog::default();
+	catalog_tables.upsert(tenant(), table.clone()).unwrap();
+	let catalog_indexes = SecondaryIndexCatalog::default();
+	let mut retention = tokio::spawn({
+		let manager = manager.clone();
+		let catalog_tables = catalog_tables.clone();
+		let catalog_indexes = catalog_indexes.clone();
+		async move {
+			manager
+				.prune_one_sealed_slab(
+					lower,
+					hlc(9_000),
+					SecondaryIndexCompactionContext {
+						table_schemas: &catalog_tables,
+						secondary_indexes: &catalog_indexes,
+					},
+				)
+				.await
+		}
+	});
+	assert!(
+		tokio::time::timeout(Duration::from_millis(300), &mut retention)
+			.await
+			.is_err(),
+		"retention blocks behind the LSM claim"
+	);
+
+	// 4. Release the higher claim; the LSM job proceeds to publication.
+	drop(higher_lease);
+	reached_rx.await.expect("the LSM job reaches publication");
+
+	// 5. THE DISCRIMINATING ASSERTION. Every read is done and the job is inside
+	// publication. A claim released after reads would let retention in here.
+	assert!(
+		tokio::time::timeout(Duration::from_millis(300), &mut retention)
+			.await
+			.is_err(),
+		"ownership is held THROUGH publication, not released after the reads"
+	);
+
+	// 6. Release publication and let both finish.
+	let _ = release_tx.send(());
+	lsm.await
+		.expect("the lsm task joins")
+		.expect("the lsm compaction succeeds");
+	let pruned = retention
+		.await
+		.expect("the retention task joins")
+		.expect("retention returns cleanly rather than erroring");
+	assert!(
+		pruned.is_none(),
+		"retention discards the retired candidate BEFORE scanning it, rather than \
+		 rewriting from a scan of bytes the LSM job replaced"
+	);
+
+	let live = manager
+		.compaction_manifest_snapshot()
+		.live_runs()
+		.map(|run| run.slab_id)
+		.collect::<Vec<_>>();
+	assert!(
+		!live.contains(&lower) && !live.contains(&higher),
+		"both inputs are retired: {live:?}"
+	);
+	assert!(
+		!live.is_empty(),
+		"the LSM successor is the only thing left live: {live:?}"
+	);
+}
+
+/// ADR 0097 gap B: a backfill candidate enumerated while its source was live, then
+/// replaced by retention before the backfill takes its read claim, is STALE WORK -
+/// discarded silently, re-enumerated next tick. It is not a coverage gap and not an
+/// integrity failure.
+///
+/// This is the loop the live node ran for hours: every pass logged
+/// `secondary index backfill source slab N not found` with an advancing N, because
+/// retention kept replacing the slab each pass had just enumerated.
+#[tokio::test]
+async fn adr0097_backfill_candidate_replaced_before_its_claim_is_stale_not_uncovered() {
+	let manager = fresh_manager().await;
+	let table = secondary_index_table_descriptor_for_test();
+	let descriptor = secondary_index_descriptor_for_test();
+	for id_value in 0..3_i64 {
+		append_secondary_index_table_row_for_test(
+			&manager,
+			&table,
+			id_value,
+			Some(id_value),
+			hlc(6_000 + id_value as u64),
+		)
+		.await;
+	}
+	// A second version of key 0 gives retention something to prune, so the rewrite
+	// actually replaces the slab rather than leaving it alone.
+	append_secondary_index_table_row_for_test(&manager, &table, 0, Some(99), hlc(6_010)).await;
+	let source_slab_id = manager.force_seal_active_for_test().await;
+
+	// 1. Enumerate while the source is live.
+	let plan = manager
+		.ensure_secondary_index_coverage(tenant(), &descriptor, 4096)
+		.await
+		.unwrap();
+	let candidate = plan
+		.candidates
+		.iter()
+		.find(|candidate| candidate.source_slab_id() == source_slab_id)
+		.expect("the live source is enumerated")
+		.clone();
+
+	// 2. Retention replaces that source before the backfill claims it.
+	let mut catalog_tables = TableSchemaCatalog::default();
+	catalog_tables.upsert(tenant(), table.clone()).unwrap();
+	let mut catalog_indexes = SecondaryIndexCatalog::default();
+	catalog_indexes
+		.create(tenant(), descriptor.clone(), &catalog_tables)
+		.unwrap();
+	manager
+		.prune_one_sealed_slab(
+			source_slab_id,
+			hlc(7_000),
+			SecondaryIndexCompactionContext {
+				table_schemas: &catalog_tables,
+				secondary_indexes: &catalog_indexes,
+			},
+		)
+		.await
+		.expect("retention rewrite succeeds")
+		.expect("the fixture must actually replace the slab, not skip it");
+	// The replacement alone does not remove the source: `finish_compaction_with_
+	// replacement` deliberately keeps the old backing sealed for stale readers and
+	// leaves disposal to the delete-pending sweep. The live loop's `not found`
+	// therefore appears only once that sweep has run, so the fixture runs it too.
+	assert!(
+		manager
+			.ensure_secondary_index_source_slab_available(source_slab_id)
+			.await
+			.is_ok(),
+		"the retired source is still readable until the sweep disposes it"
+	);
+	let gc = LsmGcWorker::new(
+		crate::storage::lsm::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	manager
+		.sweep_lsm_delete_pending_once(&gc)
+		.await
+		.expect("disposal sweep runs");
+	assert!(
+		manager
+			.ensure_secondary_index_source_slab_available(source_slab_id)
+			.await
+			.is_err(),
+		"the enumerated source is genuinely gone now"
+	);
+
+	// 3. The stale candidate is discarded, not recorded as damage.
+	let outcome = manager
+		.backfill_secondary_index_candidate(tenant(), &table, &descriptor, &candidate)
+		.await
+		.expect("a replaced candidate is not an error");
+	assert!(
+		matches!(
+			outcome,
+			SecondaryIndexBackfillOutcome::StaleCandidate { source_slab_id: stale }
+				if stale == source_slab_id
+		),
+		"the replaced candidate reports staleness"
+	);
+	assert!(
+		manager
+			.secondary_index_coverage_snapshot(candidate.key())
+			.is_none_or(|snapshot| !snapshot
+				.uncovered_slabs
+				.iter()
+				.any(|(uncovered, _)| *uncovered == source_slab_id)),
+		"a stale candidate must not be recorded as uncovered: that is what spent \
+		 retry budget and reported a healthy store as damaged"
+	);
+
+	// 4. The next tick re-enumerates and covers the REPLACEMENT. Asserted
+	// positively: "no failures" is also true of a tick that did nothing at all.
+	let report = manager
+		.run_secondary_index_backfill_once(tenant(), &table, &descriptor, 8, 4096)
+		.await
+		.expect("the next tick runs cleanly");
+	assert!(
+		report.failures.is_empty(),
+		"re-enumeration produces no failures: {:?}",
+		report.failures
+	);
+	// Positively: coverage is COMPLETE and it covers the successor, not the retired
+	// source. There is deliberately no completed candidate to count - the retention
+	// rewrite reconciles the successor's segments as it publishes, so by the next
+	// tick there is no backfill work left. Asserting "one completion" here would
+	// assert behaviour the system correctly does not have; asserting only "no
+	// failures" would pass for a tick that did nothing. What must hold is that the
+	// successor ended up covered and the retired source did not linger as debt.
+	assert!(
+		report.historical_complete,
+		"coverage is complete after the replacement is indexed: after={:?}",
+		report.after.snapshot.uncovered_slabs
+	);
+	assert!(
+		report.after.snapshot.uncovered_slabs.is_empty(),
+		"nothing is left uncovered: {:?}",
+		report.after.snapshot.uncovered_slabs
+	);
+	let covered = report.after.snapshot.covered_slabs.clone();
+	assert!(
+		!covered.contains(&source_slab_id),
+		"the retired source is not carried as covered debt: {covered:?}"
+	);
+	assert!(
+		covered.iter().any(|slab| *slab != source_slab_id),
+		"the SUCCESSOR is covered: {covered:?}"
+	);
+}
+
+/// The inverse fence: a slab missing behind a DURABLE PUBLISHED REFERENCE is still a
+/// hard error. Nothing enumerated it, so nothing can re-enumerate it, and treating
+/// it as stale would silently swallow real damage.
+#[tokio::test]
+async fn adr0097_missing_published_source_is_still_an_integrity_error() {
+	let manager = fresh_manager().await;
+	let table = secondary_index_table_descriptor_for_test();
+	let descriptor = secondary_index_descriptor_for_test();
+	append_secondary_index_table_row_for_test(&manager, &table, 1, Some(1), hlc(10)).await;
+	let source_slab_id = manager.force_seal_active_for_test().await;
+	let absent = SlabId::new(source_slab_id.get() + 4_242);
+
+	// The availability check that durable published references resolve through
+	// keeps returning NotFound rather than reporting absence as ordinary staleness.
+	let err = manager
+		.ensure_secondary_index_source_slab_available(absent)
+		.await
+		.expect_err("a slab that was never enumerated cannot be stale work");
+	assert_eq!(err.kind(), ErrorKind::NotFound);
+
+	// And a caller naming ONE slab explicitly is not enumerating, so it gets the
+	// fact rather than a silent skip.
+	let err = manager
+		.backfill_secondary_index_source_slab(tenant(), &table, &descriptor, absent)
+		.await
+		.expect_err("an explicitly named missing source is an error");
+	assert_eq!(err.kind(), ErrorKind::NotFound);
+
+	// A forged candidate is no longer expressible: `SecondaryIndexBackfillCandidate`
+	// has private fields and a crate-internal constructor, so only enumeration can
+	// produce one. That is checked by the compile-fail doctest on the type rather
+	// than here - a runtime test written inside the crate could still build one and
+	// would prove nothing about external callers.
+}
+
 #[tokio::test]
 async fn secondary_index_backfill_tick_respects_limit_and_reports_completion() {
 	let manager = fresh_manager().await;
@@ -3807,7 +4197,7 @@ async fn secondary_index_backfill_tick_respects_limit_and_reports_completion() {
 	assert_eq!(first_tick.completed.len(), 1);
 	assert!(first_tick.failures.is_empty());
 	assert!(!first_tick.historical_complete);
-	assert_eq!(first_tick.completed[0].candidate.source_slab_id, first);
+	assert_eq!(first_tick.completed[0].candidate.source_slab_id(), first);
 
 	let second_tick = manager
 		.run_secondary_index_backfill_once(tenant(), &table, &descriptor, 8, 4096)
@@ -3817,7 +4207,7 @@ async fn secondary_index_backfill_tick_respects_limit_and_reports_completion() {
 	assert_eq!(second_tick.attempted, 1);
 	assert_eq!(second_tick.completed.len(), 1);
 	assert!(second_tick.failures.is_empty());
-	assert_eq!(second_tick.completed[0].candidate.source_slab_id, second);
+	assert_eq!(second_tick.completed[0].candidate.source_slab_id(), second);
 	assert!(second_tick.historical_complete);
 
 	let listed = manager.list_secondary_index_segments(
@@ -11767,7 +12157,6 @@ async fn prune_compaction_must_not_orphan_secondary_index_sources() {
 	let outcome = manager
 		.prune_one_sealed_slab(
 			slab_id,
-			slab,
 			hlc(7_000),
 			SecondaryIndexCompactionContext {
 				table_schemas: &catalog_tables,
@@ -12000,7 +12389,7 @@ async fn backfill_candidacy_survives_failures_until_the_budget_spends() {
 		assert!(
 			plan.candidates
 				.iter()
-				.any(|candidate| candidate.source_slab_id == slab_id),
+				.any(|candidate| candidate.source_slab_id() == slab_id),
 			"attempt {attempt}: an unexhausted failure record must not remove candidacy"
 		);
 		manager.mark_secondary_index_backfill_uncovered(
@@ -12020,7 +12409,7 @@ async fn backfill_candidacy_survives_failures_until_the_budget_spends() {
 		!plan
 			.candidates
 			.iter()
-			.any(|candidate| candidate.source_slab_id == slab_id),
+			.any(|candidate| candidate.source_slab_id() == slab_id),
 		"a spent budget removes candidacy"
 	);
 	// The gate refuses throughout regardless of budget state: refusal is derived from

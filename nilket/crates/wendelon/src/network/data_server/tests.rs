@@ -6851,7 +6851,7 @@ async fn table_query_secondary_index_execution_returns_sidecar_rows() {
 		.unwrap();
 	assert_eq!(backfill.completed.len(), 1);
 	assert_eq!(
-		backfill.completed[0].candidate.source_slab_id,
+		backfill.completed[0].candidate.source_slab_id(),
 		sealed_slab_id
 	);
 	assert!(backfill.historical_complete);
@@ -16827,7 +16827,7 @@ async fn secondary_index_read_serves_partitioned_rows() {
 		.unwrap();
 	assert_eq!(backfill.completed.len(), 1);
 	assert_eq!(
-		backfill.completed[0].candidate.source_slab_id,
+		backfill.completed[0].candidate.source_slab_id(),
 		sealed_slab_id
 	);
 	node.raft

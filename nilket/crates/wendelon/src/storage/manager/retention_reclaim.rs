@@ -220,13 +220,12 @@ impl SlabManager {
 			cursor.after_slab_id.is_none_or(|after| *slab_id > after)
 				&& upper_bound.is_none_or(|upper| *slab_id <= upper)
 		});
-		for (slab_id, slab) in candidates.take(examined_budget) {
+		for (slab_id, _stale_handle) in candidates.take(examined_budget) {
 			report.examined += 1;
 			report.cursor_next.after_slab_id = Some(slab_id);
 			if let Some(outcome) = self
 				.reclaim_one_sealed_table_drop_slab(
 					slab_id,
-					slab,
 					tenant_id,
 					descriptor,
 					table_schemas,
@@ -460,14 +459,15 @@ impl SlabManager {
 		};
 
 		let mut report = TombstoneCompactionReport::default();
-		for (slab_id, slab) in sealed {
+		// ADR 0097: the handle is deliberately unused - each path refetches the
+		// current slab after it acquires ownership.
+		for (slab_id, _stale_handle) in sealed {
 			if report.compacted_slabs >= max_slabs {
 				break;
 			}
 			if let Some(outcome) = self
 				.compact_one_sealed_slab(
 					slab_id,
-					slab,
 					tombstones,
 					SecondaryIndexCompactionContext {
 						table_schemas,
@@ -496,26 +496,28 @@ impl SlabManager {
 			return Ok(RetentionPruningReport::default());
 		}
 
+		// ADR 0097: enumerate IDS only. Cloning handles here would hand each pass a
+		// slab image chosen before it waits for ownership; the claim path refetches
+		// the current one after acquiring, so a stale handle has no reason to exist.
 		let sealed = {
 			let state = self.state.lock().await;
 			let mut slabs = state
 				.sealed
 				.iter()
-				.map(|entry| (*entry.key(), entry.value().clone()))
+				.map(|entry| *entry.key())
 				.collect::<Vec<_>>();
-			slabs.sort_by_key(|(slab_id, _)| *slab_id);
+			slabs.sort_unstable();
 			slabs
 		};
 
 		let mut report = RetentionPruningReport::default();
-		for (slab_id, slab) in sealed {
+		for slab_id in sealed {
 			if report.compacted_slabs >= max_slabs {
 				break;
 			}
 			if let Some(outcome) = self
 				.prune_one_sealed_slab(
 					slab_id,
-					slab,
 					retention_floor,
 					SecondaryIndexCompactionContext {
 						table_schemas,
@@ -576,14 +578,15 @@ impl SlabManager {
 		};
 
 		let mut report = RetentionPruningReport::default();
-		for (slab_id, slab) in sealed {
+		// ADR 0097: the handle is deliberately unused - each path refetches the
+		// current slab after it acquires ownership.
+		for (slab_id, _stale_handle) in sealed {
 			if report.compacted_slabs >= max_slabs {
 				break;
 			}
 			let scan = self
 				.prune_one_sealed_slab_for_retention(
 					slab_id,
-					slab,
 					cluster_policy,
 					table_lifecycle,
 					table_schemas,
@@ -645,14 +648,15 @@ impl SlabManager {
 		};
 
 		let mut report = TableDropReclaimReport::default();
-		for (slab_id, slab) in sealed {
+		// ADR 0097: the handle is deliberately unused - each path refetches the
+		// current slab after it acquires ownership.
+		for (slab_id, _stale_handle) in sealed {
 			if report.compacted_slabs >= max_slabs {
 				break;
 			}
 			if let Some(outcome) = self
 				.reclaim_one_sealed_table_drop_slab(
 					slab_id,
-					slab,
 					tenant_id,
 					descriptor,
 					table_schemas,
@@ -862,12 +866,18 @@ impl SlabManager {
 	pub(super) async fn reclaim_one_sealed_table_drop_slab(
 		&self,
 		slab_id: SlabId,
-		slab: Arc<LocalSlabStore>,
 		tenant_id: TenantId,
 		descriptor: &TableSchemaDescriptor,
 		table_schemas: &TableSchemaCatalog,
 		secondary_indexes: &SecondaryIndexCatalog,
 	) -> std::io::Result<Option<CompactionOutcome>> {
+		// ADR 0097: own the slab BEFORE scanning it, then refetch it. Scanning
+		// unowned let this job plan from bytes another maintenance job had already
+		// replaced; and the handle it was called with predates the wait for
+		// ownership, so after waiting it can name a superseded image.
+		let Some((claims, slab)) = self.claim_sealed_slab_for_maintenance(slab_id).await else {
+			return Ok(None);
+		};
 		let mut records: Vec<CompactionRecord> = slab
 			.index
 			.iter()
@@ -901,6 +911,7 @@ impl SlabManager {
 				table_schemas,
 				secondary_indexes,
 			},
+			&claims,
 		)
 		.await
 	}
@@ -908,10 +919,16 @@ impl SlabManager {
 	pub(super) async fn prune_one_sealed_slab(
 		&self,
 		slab_id: SlabId,
-		slab: Arc<LocalSlabStore>,
 		retention_floor: HybridTimestamp,
 		secondary_index_context: SecondaryIndexCompactionContext<'_>,
 	) -> std::io::Result<Option<CompactionOutcome>> {
+		// ADR 0097: own the slab BEFORE scanning it, then refetch it. Scanning
+		// unowned let this job plan from bytes another maintenance job had already
+		// replaced; and the handle it was called with predates the wait for
+		// ownership, so after waiting it can name a superseded image.
+		let Some((claims, slab)) = self.claim_sealed_slab_for_maintenance(slab_id).await else {
+			return Ok(None);
+		};
 		let mut records: Vec<CompactionRecord> = slab
 			.index
 			.iter()
@@ -941,7 +958,7 @@ impl SlabManager {
 		Self::mark_retention_prunable_row_tombstone_pairs(&mut records, retention_floor);
 		records.sort_by_key(|record| record.old_location.offset);
 
-		self.compact_sealed_slab_records(slab_id, slab, &records, secondary_index_context)
+		self.compact_sealed_slab_records(slab_id, slab, &records, secondary_index_context, &claims)
 			.await
 	}
 
@@ -1041,13 +1058,26 @@ impl SlabManager {
 	pub(super) async fn prune_one_sealed_slab_for_retention(
 		&self,
 		slab_id: SlabId,
-		slab: Arc<LocalSlabStore>,
 		cluster_policy: MvccRetentionPolicy,
 		table_lifecycle: &TableLifecycleCatalog,
 		table_schemas: &TableSchemaCatalog,
 		secondary_indexes: &SecondaryIndexCatalog,
 		now_ms: u64,
 	) -> std::io::Result<RetentionSlabScanOutcome> {
+		// ADR 0097: own the slab BEFORE scanning it. This is the retention path
+		// the live node was looping on: it scanned unowned, then waited behind
+		// whatever job held the slab, then rewrote from a stale scan.
+		// Refetch after claiming: the `slab` argument was chosen before this job
+		// waited for ownership and may be a superseded image. A slab that is no
+		// longer sealed was retired by the job this one waited for, so there is
+		// nothing left to scan and the pass reports an empty scan rather than a
+		// rewrite of bytes that are gone.
+		let Some((claims, slab)) = self.claim_sealed_slab_for_maintenance(slab_id).await else {
+			return Ok(RetentionSlabScanOutcome {
+				compaction: None,
+				retention_stats: RetentionCompactionStats::default(),
+			});
+		};
 		let mut records: Vec<CompactionRecord> = slab
 			.index
 			.iter()
@@ -1089,6 +1119,7 @@ impl SlabManager {
 					table_schemas,
 					secondary_indexes,
 				},
+				&claims,
 			)
 			.await?;
 

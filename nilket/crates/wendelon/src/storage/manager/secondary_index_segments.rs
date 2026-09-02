@@ -147,6 +147,75 @@ pub(super) fn secondary_index_sidecar_tmp_path(path: &Path) -> PathBuf {
 	PathBuf::from(tmp)
 }
 
+/// ADR 0097: where the slab a backfill is about to read came from.
+///
+/// This is the whole basis for classifying a missing source. `Enumerated` carries
+/// an unforgeable `SecondaryIndexBackfillCandidate`, which exists only because
+/// this process saw that source live while deciding candidacy; if it is gone by
+/// the time the read claim is taken, another maintenance job replaced it.
+/// `Explicit` carries a bare id a caller named, with no such history, so its
+/// absence is an integrity failure.
+pub(super) enum BackfillSource<'a> {
+	Explicit(SlabId),
+	Enumerated(&'a SecondaryIndexBackfillCandidate),
+}
+
+impl BackfillSource<'_> {
+	fn slab_id(&self) -> SlabId {
+		match self {
+			Self::Explicit(slab_id) => *slab_id,
+			Self::Enumerated(candidate) => candidate.source_slab_id(),
+		}
+	}
+
+	/// Only an enumerated source may report staleness.
+	fn may_be_stale(&self) -> bool {
+		matches!(self, Self::Enumerated(_))
+	}
+}
+
+/// ADR 0097: what one backfill candidate's tick produced.
+///
+/// `StaleCandidate` is NOT a coverage gap and NOT an integrity failure. It means
+/// the source this tick enumerated was replaced by another maintenance job before
+/// this one took its read claim - ordinary concurrency, whose correct response is
+/// to discard the stale work and re-enumerate. Recording it as uncovered spent
+/// retry budget and, worse, reported a healthy store as damaged.
+///
+/// A slab missing behind a DURABLE PUBLISHED REFERENCE is a different fact and
+/// stays a hard error: nothing enumerated it, so nothing can re-enumerate it.
+#[derive(Debug)]
+pub(super) enum SecondaryIndexBackfillOutcome {
+	Completed(SecondaryIndexSegmentInfo),
+	StaleCandidate { source_slab_id: SlabId },
+}
+
+/// ADR 0097: proof that a maintenance job owns the slabs it is about to rewrite.
+///
+/// Constructed only by `SlabManager::acquire_maintenance_claims`, which sorts and
+/// dedups INTERNALLY before taking the per-slab exclusive locks - the caller's
+/// order is not relied upon - so a job cannot deadlock against a peer by taking an
+/// overlapping set in a different order, nor against itself by claiming one slab
+/// twice.
+///
+/// Passing one is a compile-time requirement of every rewrite path; that the token
+/// actually covers the slab being rewritten is checked at RUNTIME by `covers`.
+pub(super) struct MaintenanceClaims {
+	/// Held for the lifetime of the job and released on drop.
+	_guards: Vec<OwnedRwLockWriteGuard<()>>,
+	slabs: Vec<SlabId>,
+}
+
+impl MaintenanceClaims {
+	pub(super) fn covers(&self, slab_id: SlabId) -> bool {
+		self.slabs.binary_search(&slab_id).is_ok()
+	}
+
+	pub(super) fn slabs(&self) -> &[SlabId] {
+		&self.slabs
+	}
+}
+
 impl SlabManager {
 	pub async fn acquire_secondary_index_admission_guard(&self) -> OwnedRwLockReadGuard<()> {
 		self.secondary_index_admission_gate
@@ -303,10 +372,7 @@ impl SlabManager {
 			// retry budget does. Predicting transient-versus-structural is exactly
 			// where the expensive mistake would live.
 			.filter(|slab_id| !tracker.is_backfill_exhausted(*slab_id))
-			.map(|source_slab_id| SecondaryIndexBackfillCandidate {
-				key,
-				source_slab_id,
-			})
+			.map(|source_slab_id| SecondaryIndexBackfillCandidate::enumerated(key, source_slab_id))
 			.collect::<Vec<_>>();
 		let snapshot = tracker.snapshot();
 		self.secondary_index_coverage.insert(key, tracker);
@@ -632,26 +698,40 @@ impl SlabManager {
 		descriptor: &SecondaryIndexDescriptor,
 		source_slab_id: SlabId,
 	) -> std::io::Result<SecondaryIndexSegmentInfo> {
-		self.backfill_secondary_index_source_slab_inner(
-			tenant_id,
-			table,
-			descriptor,
-			source_slab_id,
-		)
-		.await
+		match self
+			.backfill_secondary_index_source_slab_inner(
+				tenant_id,
+				table,
+				descriptor,
+				BackfillSource::Explicit(source_slab_id),
+			)
+			.await?
+		{
+			SecondaryIndexBackfillOutcome::Completed(info) => Ok(info),
+			// Unreachable: `BackfillSource::Explicit` never reports staleness. Kept
+			// as a loud failure rather than an `unreachable!` so a future change to
+			// that rule surfaces here instead of silently skipping a named slab.
+			SecondaryIndexBackfillOutcome::StaleCandidate { source_slab_id } => Err(Error::new(
+				ErrorKind::Other,
+				format!(
+					"explicitly named source slab {source_slab_id} reported staleness, \
+					 which only an enumerated candidate may do"
+				),
+			)),
+		}
 	}
 
-	pub async fn backfill_secondary_index_candidate(
+	pub(crate) async fn backfill_secondary_index_candidate(
 		&self,
 		tenant_id: TenantId,
 		table: &TableSchemaDescriptor,
 		descriptor: &SecondaryIndexDescriptor,
 		candidate: &SecondaryIndexBackfillCandidate,
-	) -> std::io::Result<SecondaryIndexSegmentInfo> {
+	) -> std::io::Result<SecondaryIndexBackfillOutcome> {
 		let expected_key = SecondaryIndexCoverageKey::from(
 			SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor),
 		);
-		if candidate.key != expected_key {
+		if candidate.key() != expected_key {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
 				"secondary index backfill candidate does not match descriptor identity",
@@ -661,7 +741,7 @@ impl SlabManager {
 			tenant_id,
 			table,
 			descriptor,
-			candidate.source_slab_id,
+			BackfillSource::Enumerated(candidate),
 		)
 		.await
 	}
@@ -685,10 +765,25 @@ impl SlabManager {
 				.backfill_secondary_index_candidate(tenant_id, table, descriptor, candidate)
 				.await
 			{
-				Ok(info) => completed.push(SecondaryIndexBackfillSuccess {
-					candidate: candidate.clone(),
-					entry_count: info.entry_count,
-				}),
+				Ok(SecondaryIndexBackfillOutcome::Completed(info)) => {
+					completed.push(SecondaryIndexBackfillSuccess {
+						candidate: candidate.clone(),
+						entry_count: info.entry_count,
+					})
+				}
+				// ADR 0097: this tick's enumeration is stale - a maintenance job
+				// replaced the source under it. Stop here rather than working through
+				// the rest of a candidate list built from the same stale view, and
+				// re-enumerate on the next tick. Recorded as neither success nor
+				// failure, because it is neither.
+				Ok(SecondaryIndexBackfillOutcome::StaleCandidate { source_slab_id }) => {
+					tracing::debug!(
+						source_slab_id = source_slab_id.get(),
+						"secondary index backfill candidate was replaced before its claim; \
+						 re-enumerating next tick"
+					);
+					break;
+				}
 				Err(err) => failures.push(SecondaryIndexBackfillFailure {
 					candidate: candidate.clone(),
 					error: SecondaryIndexBackfillError::new(
@@ -721,27 +816,38 @@ impl SlabManager {
 		tenant_id: TenantId,
 		table: &TableSchemaDescriptor,
 		descriptor: &SecondaryIndexDescriptor,
-		source_slab_id: SlabId,
-	) -> std::io::Result<SecondaryIndexSegmentInfo> {
+		source: BackfillSource<'_>,
+	) -> std::io::Result<SecondaryIndexBackfillOutcome> {
+		let source_slab_id = source.slab_id();
 		let started_at = Instant::now();
 		descriptor.validate_against_table(table)?;
 		let key = SecondaryIndexCoverageKey::from(SecondaryIndexIdentity::from_descriptor(
 			tenant_id, descriptor,
 		));
-		let source_slab_lease = self
-			.acquire_slab_rewrite_read_claim(source_slab_id)
-			.await
-			.map_err(|err| {
-				self.mark_secondary_index_uncovered(
-					key,
-					source_slab_id,
-					SecondaryIndexBackfillError::new(
-						secondary_index_backfill_reason_from_io(&err),
-						err.to_string(),
-					),
-				);
-				err
-			})?;
+		// ADR 0097: an ENUMERATED source was live when candidacy was decided, so if
+		// it is gone now another maintenance job replaced it while this one waited
+		// for the claim - stale work, discarded silently, re-enumerated next tick.
+		// An explicitly named slab has no such history and keeps the strict path.
+		let source_slab_lease =
+			match self
+				.acquire_backfill_read_claim(&source)
+				.await
+				.map_err(|err| {
+					self.mark_secondary_index_uncovered(
+						key,
+						source_slab_id,
+						SecondaryIndexBackfillError::new(
+							secondary_index_backfill_reason_from_io(&err),
+							err.to_string(),
+						),
+					);
+					err
+				})? {
+				Some(lease) => lease,
+				None => {
+					return Ok(SecondaryIndexBackfillOutcome::StaleCandidate { source_slab_id });
+				}
+			};
 		let segment = match self
 			.build_secondary_index_segment_for_source_slab(
 				tenant_id,
@@ -780,6 +886,10 @@ impl SlabManager {
 			if err.kind() != ErrorKind::NotFound {
 				return Err(err);
 			}
+			// ADR 0097: staleness is ordinary only BEFORE the read claim is held.
+			// Reaching here means the source vanished while this job HELD its read
+			// guard, which no correct owner may do: that is a broken ownership
+			// invariant or corruption, and it stays an integrity failure.
 			self.record_missing_published_references_for_slab(
 				source_slab_id,
 				PublishedReferenceOrigin::Compaction,
@@ -832,7 +942,7 @@ impl SlabManager {
 		// retire the source slab underneath a committed sidecar.
 		// Explicitly name the guard for the ADR 052 read-lease grep.
 		drop(source_slab_lease);
-		result
+		result.map(SecondaryIndexBackfillOutcome::Completed)
 	}
 
 	pub fn mark_secondary_index_backfill_uncovered(
@@ -1652,11 +1762,107 @@ impl SlabManager {
 		Ok(guard)
 	}
 
+	/// ADR 0097: take the backfill's read claim, translating a missing source to
+	/// `Ok(None)` only for an ENUMERATED candidate.
+	///
+	/// The provenance is structural - `BackfillSource::Enumerated` holds a candidate
+	/// external code cannot construct - because no evidence survives to prove it
+	/// otherwise: a retired run's successors are overwritten at `DeletePending` and
+	/// the run is removed when the backing is disposed, so at the moment a backfill
+	/// finds its source gone, a genuinely superseded slab and one that never existed
+	/// look identical in the manifest.
+	pub(super) async fn acquire_backfill_read_claim(
+		&self,
+		source: &BackfillSource<'_>,
+	) -> std::io::Result<Option<OwnedRwLockReadGuard<()>>> {
+		match self.acquire_slab_rewrite_read_claim(source.slab_id()).await {
+			Ok(guard) => Ok(Some(guard)),
+			Err(err) if err.kind() == ErrorKind::NotFound && source.may_be_stale() => Ok(None),
+			Err(err) => Err(err),
+		}
+	}
+
 	pub(crate) async fn acquire_slab_rewrite_exclusive_claim(
 		&self,
 		source_slab_id: SlabId,
 	) -> OwnedRwLockWriteGuard<()> {
 		self.slab_rewrite_claim(source_slab_id).write_owned().await
+	}
+
+	/// ADR 0097: claim one sealed slab and hand back the slab as it is NOW.
+	///
+	/// Every local maintenance path is handed an `Arc<LocalSlabStore>` chosen before
+	/// it waits for ownership. If it waits behind a rewrite, the lock it then takes
+	/// is the freed lock of a slab id whose backing has already been replaced, and
+	/// scanning the handle it arrived with would read the superseded image. This is
+	/// the same pick -> claim -> revalidate rule the LSM plan follows.
+	///
+	/// `None` means the id is no longer sealed - the job it waited for retired it -
+	/// and the caller has nothing left to do for that candidate.
+	pub(super) async fn claim_sealed_slab_for_maintenance(
+		&self,
+		slab_id: SlabId,
+	) -> Option<(MaintenanceClaims, Arc<LocalSlabStore>)> {
+		let claims = self.acquire_maintenance_claims(&[slab_id]).await;
+		let current = {
+			let state = self.state.lock().await;
+			state.sealed.get(&slab_id).map(|slab| slab.value().clone())
+		}?;
+		// The legacy bridge, preserved: a sealed slab with NO manifest run at all
+		// predates the manifest and is adopted here. It used to run inside the
+		// rewrite paths; moving ownership above the scan must not strand such a slab
+		// by mistaking "never recorded" for "retired". It runs against the refetched
+		// slab, so the size it records is the current image's.
+		self.ensure_live_lsm_run_for_maintenance(slab_id, current.write_cursor());
+		// With a run guaranteed to exist, a NON-Live one means a retired source that
+		// a replacement deliberately left sealed for stale readers until the
+		// delete-pending sweep disposes of it. That is exactly the image this job
+		// waited to stop using, and scanning it would be the stale work the wait was
+		// supposed to prevent.
+		{
+			let manifest = recover_rwlock_read(&self.compaction_manifest, "compaction_manifest");
+			if !manifest
+				.get_run(slab_id)
+				.is_some_and(|run| run.state.is_live())
+			{
+				return None;
+			}
+		}
+		Some((claims, current))
+	}
+
+	/// ADR 0097: take the exclusive rewrite claim on EVERY slab a maintenance job
+	/// will touch, before it reads any of them, and hold the guards for the whole
+	/// job.
+	///
+	/// The claims are per-slab, so jobs over disjoint slabs stay concurrent; a
+	/// global maintenance lock would serialize maintenance that never conflicts.
+	/// The set is sorted and deduped INTERNALLY - the caller's order is not relied
+	/// upon - so two jobs contending for an overlapping set cannot deadlock by
+	/// taking the same pair in opposite orders, and a job cannot hang against
+	/// itself by naming one slab twice on a non-reentrant lock.
+	///
+	/// Holding a claim and then discovering the slab is gone is NOT what this
+	/// prevents; it prevents the rewrite that makes it go. A job must still
+	/// revalidate after acquisition - both its plan and any slab handle it picked
+	/// up beforehand - because both were chosen before the claims were held.
+	pub(super) async fn acquire_maintenance_claims(&self, slabs: &[SlabId]) -> MaintenanceClaims {
+		// Sorted and deduped HERE rather than required of the caller: the ordering
+		// is what prevents two jobs with overlapping sets from taking the same pair
+		// in opposite orders, and asserting it would leave a release build to
+		// deadlock. Deduping matters on its own - these locks are not reentrant, so
+		// claiming one slab twice in a single job would hang it against itself.
+		let mut ordered = slabs.to_vec();
+		ordered.sort_unstable();
+		ordered.dedup();
+		let mut guards = Vec::with_capacity(ordered.len());
+		for slab_id in &ordered {
+			guards.push(self.acquire_slab_rewrite_exclusive_claim(*slab_id).await);
+		}
+		MaintenanceClaims {
+			_guards: guards,
+			slabs: ordered,
+		}
 	}
 
 	pub(super) async fn ensure_secondary_index_source_slab_available(
