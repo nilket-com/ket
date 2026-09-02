@@ -213,6 +213,7 @@ async fn seeded_migration_drains_without_client_reads() {
 		std::time::Duration::from_millis(20),
 		std::time::Duration::from_millis(40),
 		1,
+		false,
 	);
 
 	let completed = wait_for_migration_state(&dest, 7_001, MigrationState::Completed).await;
@@ -282,6 +283,7 @@ async fn migration_sweeper_fails_over_to_next_source_and_retries_after_backoff()
 		std::time::Duration::from_millis(20),
 		std::time::Duration::from_millis(60),
 		1,
+		false,
 	);
 
 	// First pass: source_a fails, but the sweeper still advances to

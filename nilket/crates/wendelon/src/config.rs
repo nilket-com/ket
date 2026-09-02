@@ -180,6 +180,8 @@ struct RawStorageConfig {
 	#[serde(default)]
 	lsm_compaction_paused: bool,
 	#[serde(default)]
+	mvcc_retention_paused: bool,
+	#[serde(default)]
 	l2_column_fetch: RawL2ColumnFetchConfig,
 	#[serde(default)]
 	row_group_writer: RawRowGroupWriterConfig,
@@ -933,6 +935,7 @@ impl RawConfig {
 			l2: None,
 			tiering: crate::storage::SweeperConfig::default(),
 			lsm_compaction_paused: self.storage.lsm_compaction_paused,
+			mvcc_retention_paused: self.storage.mvcc_retention_paused,
 			rehydration: crate::storage::manager::RehydrationPolicy::default(),
 			l2_column_fetch,
 			row_group_writer,

@@ -248,6 +248,7 @@ async fn background_reclaim_rewrites_mixed_slab_and_preserves_live_versions() {
 		Duration::from_millis(20),
 		Duration::from_millis(40),
 		1,
+		false,
 	);
 	let source_service: Arc<dyn HrftService> = source.router.clone();
 	let (factory, _pool) =
@@ -270,6 +271,7 @@ async fn background_reclaim_rewrites_mixed_slab_and_preserves_live_versions() {
 		Duration::from_millis(20),
 		Duration::from_millis(40),
 		1,
+		false,
 	);
 
 	let completed = wait_for_migration_state(&dest, 9_001, MigrationState::Completed).await;
@@ -351,6 +353,7 @@ async fn historical_reads_succeed_from_new_owner_after_source_reclaim() {
 		Duration::from_millis(20),
 		Duration::from_millis(40),
 		1,
+		false,
 	);
 	let source_service: Arc<dyn HrftService> = source.router.clone();
 	let (factory, _pool) =
@@ -373,6 +376,7 @@ async fn historical_reads_succeed_from_new_owner_after_source_reclaim() {
 		Duration::from_millis(20),
 		Duration::from_millis(40),
 		1,
+		false,
 	);
 
 	let completed = wait_for_migration_state(&dest, 9_002, MigrationState::Completed).await;
@@ -472,6 +476,7 @@ async fn mvcc_retention_pruning_is_audit_logged_and_preserves_retained_window_re
 		Duration::from_millis(20),
 		Duration::from_millis(40),
 		1,
+		false,
 	);
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 	loop {
@@ -519,6 +524,98 @@ async fn mvcc_retention_pruning_is_audit_logged_and_preserves_retained_window_re
 	let audit = std::fs::read_to_string(&audit_path).unwrap();
 	assert!(audit.contains("\"event_type\":\"mvcc.snapshot_pruned\""));
 	assert!(audit.contains("pruned_versions=1"));
+
+	sweeper.abort();
+	support::abort_node(&node);
+}
+
+/// The node-local pause suppresses physical MVCC reclaim and nothing else. The
+/// unpaused twin above prunes within two seconds on the same fixture, so a flag
+/// that were merely read - or gated in the wrong place - fails here.
+#[tokio::test]
+async fn paused_mvcc_retention_prunes_nothing_and_leaves_reads_unchanged() {
+	let node = bootstrap_retention_node(
+		"mvcc-retention-paused",
+		94,
+		8 * 1024,
+		Duration::from_secs(15),
+	)
+	.await;
+	support::wait_for_local_leader(&node).await;
+	node.handles.migration_sweeper.abort();
+
+	let audit_path = node.slab.data_dir().join("audit.ndjson");
+	let now_ms = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	let key = b"retention-key";
+	let oldest = hlc(now_ms.saturating_sub(50_000), 0, 1);
+	let anchor = hlc(now_ms.saturating_sub(20_000), 0, 1);
+	let latest = hlc(now_ms.saturating_sub(5_000), 0, 1);
+	seed_source(&node.slab, key, oldest, b"oldest-value").await;
+	seed_source(&node.slab, key, anchor, b"anchor-value").await;
+	seed_source(&node.slab, key, latest, b"latest-value").await;
+	let rotate_value = vec![b'x'; 16 * 1024];
+	seed_source(&node.slab, b"rotate-key", latest, &rotate_value).await;
+	assert_eq!(
+		node.slab.sealed_count().await,
+		1,
+		"precondition: history slab sealed"
+	);
+
+	let sweeper = node.data_server.clone().spawn_migration_sweeper(
+		Duration::from_millis(20),
+		Duration::from_millis(40),
+		1,
+		true,
+	);
+	// Long enough for many ticks of the 20 ms sweeper, and comfortably past the
+	// two-second window in which the unpaused arm completes.
+	tokio::time::sleep(Duration::from_secs(3)).await;
+
+	assert!(
+		node.slab
+			.lookup_as_of(tenant(), key_identity(key), oldest)
+			.is_some(),
+		"a paused node reclaims nothing: the oldest version is still resident"
+	);
+	let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();
+	assert!(
+		!audit.contains("\"event_type\":\"mvcc.snapshot_pruned\""),
+		"a paused node emits no prune event: {audit}"
+	);
+
+	// The read floor is a policy decision, not a consequence of reclaim having
+	// run. A read behind the window is refused on a paused node exactly as it is
+	// on an unpaused one, even though the version it names is still on disk.
+	let pruned_as_of = hlc(now_ms.saturating_sub(30_000), 0, 1);
+	let (pruned_resp, pruned_batch) = DataRing::read(
+		&*node.data_server,
+		stale_read_meta(pruned_as_of, key),
+		key_batch(key),
+	)
+	.await
+	.unwrap();
+	assert_eq!(pruned_resp.status, ReadStatus::RETENTION_EXPIRED);
+	assert!(pruned_batch.is_none());
+
+	// Chosen AFTER the sleep above: the read floor tracks wall clock, so a probe
+	// picked relative to seed time would drift out of the 15 s window while the
+	// test waits and would fail for a reason that has nothing to do with pausing.
+	let retained_as_of = hlc(now_ms.saturating_sub(6_000), 0, 1);
+	let (retained_resp, retained_batch) = DataRing::read(
+		&*node.data_server,
+		stale_read_meta(retained_as_of, key),
+		key_batch(key),
+	)
+	.await
+	.unwrap();
+	assert_eq!(retained_resp.status, ReadStatus::OK);
+	assert_eq!(
+		decode_single_value(&support::encode_batch(&retained_batch.unwrap()).unwrap()),
+		b"anchor-value"
+	);
 
 	sweeper.abort();
 	support::abort_node(&node);

@@ -4035,6 +4035,7 @@ impl WendelonDataServer {
 		tick: Duration,
 		failure_backoff: Duration,
 		max_migrations_per_pass: usize,
+		mvcc_retention_paused: bool,
 	) -> JoinHandle<()> {
 		let budget = max_migrations_per_pass.max(1);
 		tokio::spawn(async move {
@@ -4086,11 +4087,17 @@ impl WendelonDataServer {
 						"migration sweeper reclaim pass failed; will retry on next tick"
 					);
 				}
-				if let Err(err) = self.reclaim_mvcc_retention_once(1).await {
-					tracing::warn!(
-						error = %err,
-						"migration sweeper MVCC retention pass failed; will retry on next tick"
-					);
+				// Node-local maintenance switch. Skipping the reclaim pass suppresses
+				// physical MVCC work only; the read floor is unchanged, so a paused
+				// node answers reads exactly as an unpaused one does and merely stops
+				// reclaiming the versions behind that floor.
+				if !mvcc_retention_paused {
+					if let Err(err) = self.reclaim_mvcc_retention_once(1).await {
+						tracing::warn!(
+							error = %err,
+							"migration sweeper MVCC retention pass failed; will retry on next tick"
+						);
+					}
 				}
 
 				ticker.tick().await;

@@ -220,6 +220,12 @@ pub struct NodeBootstrapConfig {
 	/// A paused service keeps its task alive but starts no new jobs
 	/// until resumed through the exposed service control.
 	pub lsm_compaction_paused: bool,
+	/// Node-local maintenance switch for physical MVCC retention reclaim.
+	/// Skips ONLY the reclaim pass inside the migration sweeper: migrations
+	/// and tombstoned-range reclaim still run, and read-floor semantics are
+	/// untouched, so this suppresses work rather than changing what a read
+	/// can see.
+	pub mvcc_retention_paused: bool,
 	/// Policy governing when hot L2 slabs are promoted back into
 	/// local L1 storage.
 	pub rehydration: RehydrationPolicy,
@@ -301,6 +307,7 @@ impl NodeBootstrapConfig {
 			l2: None,
 			tiering: SweeperConfig::default(),
 			lsm_compaction_paused: false,
+			mvcc_retention_paused: false,
 			rehydration: RehydrationPolicy::default(),
 			l2_column_fetch: L2ColumnFetchConfig::default(),
 			row_group_writer: RowGroupWriterConfig::default(),
@@ -1894,6 +1901,7 @@ impl WendelonNode {
 			MIGRATION_SWEEP_INTERVAL,
 			MIGRATION_SWEEP_FAILURE_BACKOFF,
 			MIGRATION_SWEEP_MAX_PER_PASS,
+			cfg.mvcc_retention_paused,
 		);
 		let tiering_sweeper = l2_for_sweeper.map(|object_store| {
 			SlabSweeper::new(
