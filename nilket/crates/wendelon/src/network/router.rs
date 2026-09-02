@@ -280,6 +280,8 @@ fn is_control_extension_request(msg_type: u8) -> bool {
 		MsgType::TABLE_OPTIMIZER_FACTS_GET_REQ,
 		MsgType::SECONDARY_INDEX_STATUS_REQ,
 		MsgType::CTAS_SAGA_REQ,
+		MsgType::MAINTENANCE_REPORT_REQ,
+		MsgType::MAINTENANCE_REQUEUE_REQ,
 	]
 	.iter()
 	.any(|candidate| candidate.0 == msg_type)
@@ -297,6 +299,8 @@ fn is_extension_response(msg_type: u8) -> bool {
 		MsgType::TABLE_OPTIMIZER_FACTS_GET_RESP,
 		MsgType::SECONDARY_INDEX_STATUS_RESP,
 		MsgType::CTAS_SAGA_RESP,
+		MsgType::MAINTENANCE_REPORT_RESP,
+		MsgType::MAINTENANCE_REQUEUE_RESP,
 	]
 	.iter()
 	.any(|candidate| candidate.0 == msg_type)
@@ -327,6 +331,8 @@ const ACTOR_AUTHORIZED_CONTROL_REQUESTS: &[MsgType] = &[
 	MsgType::TABLE_OPTIMIZER_FACTS_GET_REQ,
 	MsgType::SECONDARY_INDEX_STATUS_REQ,
 	MsgType::CTAS_SAGA_REQ,
+	MsgType::MAINTENANCE_REPORT_REQ,
+	MsgType::MAINTENANCE_REQUEUE_REQ,
 ];
 
 fn ingress_requirement(msg_type: MsgType) -> Option<IngressRequirement> {

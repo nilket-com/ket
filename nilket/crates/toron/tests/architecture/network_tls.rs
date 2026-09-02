@@ -135,13 +135,28 @@ pub(crate) fn adr044_does_not_change_sql_wire_or_add_token_auth_models() {
 			"Authorization",
 			"Bearer",
 			"TOFU",
-			"fingerprint",
 			"SPIFFE",
 			"OIDC",
 		] {
 			assert!(
 				!source.contains(forbidden),
 				"{path} gained ADR 044-forbidden token auth model {forbidden}"
+			);
+		}
+		// ADR 582 uses an operation-scoped receipt fingerprint in the
+		// maintenance command. Keep ADR 044's guard on certificate/token
+		// fingerprint models without claiming the generic word globally.
+		for forbidden in [
+			"cert_fingerprint",
+			"certificate_fingerprint",
+			"server_fingerprint",
+			"tls_fingerprint",
+			"--cert-fingerprint",
+			"--tls-fingerprint",
+		] {
+			assert!(
+				!source.contains(forbidden),
+				"{path} gained ADR 044-forbidden certificate fingerprint model {forbidden}"
 			);
 		}
 	}

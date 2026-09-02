@@ -7,7 +7,10 @@
 //! layer; the handler here focuses on routing, wire compatibility, and
 //! leader-aware Control Ring behavior.
 
-use crate::audit::{AuditChainHead, AuditSink};
+use crate::audit::{
+	AdministrativeControlAction, AdministrativeControlSchema, AuditAuthority, AuditChainHead,
+	AuditEvent, AuditOperation, AuditOutcome, AuditSchema, AuditSink,
+};
 use crate::client::topology::{ClusterPeerWire, ClusterStatusWire};
 use crate::consensus::{
 	AdvanceEpochRecord, CreateTenant, EpochConfig, EpochPeer, MigrationLedgerEntry, MigrationState,
@@ -57,6 +60,11 @@ use crate::schema::{
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
+use crate::storage::maintenance_policy::{
+	MAINTENANCE_REPORT_MAX_BYTES, MAINTENANCE_REPORT_MAX_ITEMS, MaintenanceFingerprint,
+	MaintenanceOperation, MaintenancePolicyInner, MaintenanceReportItem,
+	MaintenanceReportPageError, RequeueRefusal,
+};
 use crate::storage::manager::SlabManager;
 use arrow::array::{Array, ListArray, StringArray, UInt32Array};
 use arrow::ipc::reader::StreamReader;
@@ -132,6 +140,8 @@ enum ControlOperation {
 	Join,
 	SchemaDrop,
 	IndexStatus,
+	MaintenanceReport,
+	MaintenanceRequeue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -248,6 +258,309 @@ pub struct SecondaryIndexStatusResponseWire {
 	pub indexes: Vec<SecondaryIndexStatus>,
 	#[serde(default)]
 	pub message: Option<String>,
+}
+
+pub const MAINTENANCE_CONTROL_WIRE_VERSION: u8 = 1;
+pub const MAINTENANCE_CONTROL_MAX_REQUEST_BYTES: usize = 64 * 1024;
+const MAINTENANCE_CONTROL_DIAGNOSTIC_MAX_BYTES: usize = 512;
+
+fn bounded_maintenance_diagnostic(message: impl Into<String>) -> String {
+	let mut message = message.into();
+	if message.len() <= MAINTENANCE_CONTROL_DIAGNOSTIC_MAX_BYTES {
+		return message;
+	}
+	let mut end = MAINTENANCE_CONTROL_DIAGNOSTIC_MAX_BYTES;
+	while !message.is_char_boundary(end) {
+		end -= 1;
+	}
+	message.truncate(end);
+	message
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceReportRequestWire {
+	pub version: u8,
+	pub target_node_id: u32,
+	pub max_items: u16,
+	#[serde(default)]
+	pub cursor: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceOriginWire {
+	pub origin_code: u16,
+	pub reason: String,
+	pub attempts: u32,
+	pub last_failure_ms: u64,
+	pub next_eligible_at_ms: Option<u64>,
+	pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaintenanceReportItemWire {
+	QuarantinedWork {
+		operation_code: u16,
+		slabs: Vec<u64>,
+		origins: Vec<MaintenanceOriginWire>,
+		quarantine_fingerprint: Vec<u8>,
+	},
+	RetryableCooldown {
+		operation_code: u16,
+		slabs: Vec<u64>,
+		consecutive_failures: u32,
+		next_eligible_at_ms: u64,
+	},
+	InFlight {
+		operation_code: u16,
+		slabs: Vec<u64>,
+	},
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaintenanceReportOutcomeWire {
+	Page,
+	PolicyDisabled { diagnostic: String },
+	StaleCursor,
+	InvalidRequest { diagnostic: String },
+	Unavailable { diagnostic: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceReportResponseWire {
+	pub version: u8,
+	pub serving_node_id: u32,
+	pub outcome: MaintenanceReportOutcomeWire,
+	pub incarnation: [u8; 16],
+	pub generation: u64,
+	#[serde(default)]
+	pub items: Vec<MaintenanceReportItemWire>,
+	#[serde(default)]
+	pub next_cursor: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceRequeueRequestWire {
+	pub version: u8,
+	pub target_node_id: u32,
+	pub operation_code: u16,
+	pub slabs: Vec<u64>,
+	pub expected_fingerprint: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaintenanceRequeueOutcomeWire {
+	Cleared { origins: u16 },
+	PolicyDisabled { diagnostic: String },
+	InFlight,
+	NotQuarantined,
+	StaleReport { quarantined_origins: u16 },
+	AuditUnavailable,
+	StoreFailure { maintenance_disabled: bool },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaintenanceCompletionAuditWire {
+	NotAttempted,
+	Recorded,
+	Failed { diagnostic: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceRequeueResponseWire {
+	pub version: u8,
+	pub serving_node_id: u32,
+	pub operation_code: u16,
+	pub slab_count: u32,
+	pub slab_digest: [u8; 32],
+	pub expected_fingerprint: Vec<u8>,
+	pub outcome: MaintenanceRequeueOutcomeWire,
+	pub completion_audit: MaintenanceCompletionAuditWire,
+}
+
+fn maintenance_item_wire(item: MaintenanceReportItem) -> MaintenanceReportItemWire {
+	match item {
+		MaintenanceReportItem::QuarantinedWork {
+			operation,
+			slabs,
+			origins,
+			quarantine_fingerprint,
+		} => MaintenanceReportItemWire::QuarantinedWork {
+			operation_code: operation.code(),
+			slabs: slabs.into_iter().map(|slab| slab.get()).collect(),
+			origins: origins
+				.into_iter()
+				.map(|origin| MaintenanceOriginWire {
+					origin_code: origin.origin.code(),
+					reason: origin.reason.label().to_owned(),
+					attempts: origin.attempts,
+					last_failure_ms: origin.last_failure_ms,
+					next_eligible_at_ms: origin.next_eligible_at_ms,
+					detail: origin.detail,
+				})
+				.collect(),
+			quarantine_fingerprint: quarantine_fingerprint.to_bytes().to_vec(),
+		},
+		MaintenanceReportItem::RetryableCooldown {
+			operation,
+			slabs,
+			consecutive_failures,
+			next_eligible_at_ms,
+		} => MaintenanceReportItemWire::RetryableCooldown {
+			operation_code: operation.code(),
+			slabs: slabs.into_iter().map(|slab| slab.get()).collect(),
+			consecutive_failures,
+			next_eligible_at_ms,
+		},
+		MaintenanceReportItem::InFlight { operation, slabs } => {
+			MaintenanceReportItemWire::InFlight {
+				operation_code: operation.code(),
+				slabs: slabs.into_iter().map(|slab| slab.get()).collect(),
+			}
+		}
+	}
+}
+
+fn maintenance_slab_digest(slabs: &[u64]) -> [u8; 32] {
+	let mut canonical = Vec::with_capacity(4 + slabs.len() * 8);
+	canonical.extend_from_slice(&(slabs.len() as u32).to_be_bytes());
+	for slab in slabs {
+		canonical.extend_from_slice(&slab.to_be_bytes());
+	}
+	crate::hash::sha256::digest(&canonical)
+}
+
+fn maintenance_requeue_outcome_label(outcome: &MaintenanceRequeueOutcomeWire) -> &'static str {
+	match outcome {
+		MaintenanceRequeueOutcomeWire::Cleared { .. } => "cleared",
+		MaintenanceRequeueOutcomeWire::PolicyDisabled { .. } => "policy_disabled",
+		MaintenanceRequeueOutcomeWire::InFlight => "in_flight",
+		MaintenanceRequeueOutcomeWire::NotQuarantined => "not_quarantined",
+		MaintenanceRequeueOutcomeWire::StaleReport { .. } => "stale_report",
+		MaintenanceRequeueOutcomeWire::AuditUnavailable => "audit_unavailable",
+		MaintenanceRequeueOutcomeWire::StoreFailure { .. } => "store_failure",
+	}
+}
+
+fn maintenance_requeue_audit_event(
+	audit_operation: AuditOperation,
+	node: NodeId,
+	actor: &ActorIdentity,
+	operation: MaintenanceOperation,
+	slabs: &[u64],
+	slab_digest: [u8; 32],
+	expected_fingerprint: &[u8],
+	result: &str,
+	outcome: AuditOutcome,
+) -> AuditEvent {
+	AuditEvent::new(
+		AuditAuthority::NodeLocal,
+		audit_operation,
+		node,
+		format!("maintenance requeue {result}"),
+	)
+	.with_actor(actor)
+	.with_outcome(outcome)
+	.with_parameter("maintenance_operation", operation.label())
+	.with_parameter("slab_count", slabs.len() as u64)
+	.with_parameter("slab_digest", crate::audit::hex_string(&slab_digest))
+	.with_parameter(
+		"expected_fingerprint",
+		crate::audit::hex_string(expected_fingerprint),
+	)
+	.with_parameter("result", result)
+	.with_schema(AuditSchema::AdministrativeControl {
+		action: AdministrativeControlAction::MaintenanceRequeue,
+		detail: AdministrativeControlSchema {
+			target_node_id: Some(node.format_wire()),
+			..AdministrativeControlSchema::default()
+		},
+	})
+}
+
+async fn execute_maintenance_requeue_control(
+	audit_sink: &dyn AuditSink,
+	policy: Option<&Arc<MaintenancePolicyInner>>,
+	node: NodeId,
+	actor: &ActorIdentity,
+	operation: MaintenanceOperation,
+	slabs_wire: &[u64],
+	slabs: &[crate::schema::SlabId],
+	slab_digest: [u8; 32],
+	expected_wire: &[u8],
+	expected: MaintenanceFingerprint,
+) -> (
+	MaintenanceRequeueOutcomeWire,
+	MaintenanceCompletionAuditWire,
+) {
+	let attempt = maintenance_requeue_audit_event(
+		AuditOperation::MaintenanceRequeueAttempt,
+		node,
+		actor,
+		operation,
+		slabs_wire,
+		slab_digest,
+		expected_wire,
+		"attempted",
+		AuditOutcome::Allowed,
+	);
+	if let Err(error) = audit_sink.emit(attempt) {
+		tracing::error!(error = %error, "maintenance requeue attempt audit failed");
+		return (
+			MaintenanceRequeueOutcomeWire::AuditUnavailable,
+			MaintenanceCompletionAuditWire::NotAttempted,
+		);
+	}
+
+	let outcome = match policy {
+		Some(policy) => match policy.requeue(operation, slabs, expected).await {
+			Ok(origins) => MaintenanceRequeueOutcomeWire::Cleared {
+				origins: u16::try_from(origins).unwrap_or(u16::MAX),
+			},
+			Err(RequeueRefusal::PolicyDisabled(diagnostic)) => {
+				MaintenanceRequeueOutcomeWire::PolicyDisabled { diagnostic }
+			}
+			Err(RequeueRefusal::InFlight) => MaintenanceRequeueOutcomeWire::InFlight,
+			Err(RequeueRefusal::NotQuarantined) => MaintenanceRequeueOutcomeWire::NotQuarantined,
+			Err(RequeueRefusal::StaleReport {
+				quarantined_origins,
+			}) => MaintenanceRequeueOutcomeWire::StaleReport {
+				quarantined_origins: u16::try_from(quarantined_origins).unwrap_or(u16::MAX),
+			},
+			Err(RequeueRefusal::StoreFailure(_)) => MaintenanceRequeueOutcomeWire::StoreFailure {
+				maintenance_disabled: true,
+			},
+		},
+		None => MaintenanceRequeueOutcomeWire::PolicyDisabled {
+			diagnostic: "maintenance requeue requires local storage".to_owned(),
+		},
+	};
+	let audit_outcome = if matches!(outcome, MaintenanceRequeueOutcomeWire::Cleared { .. }) {
+		AuditOutcome::Allowed
+	} else {
+		AuditOutcome::Error
+	};
+	let completion = maintenance_requeue_audit_event(
+		AuditOperation::MaintenanceRequeueCompletion,
+		node,
+		actor,
+		operation,
+		slabs_wire,
+		slab_digest,
+		expected_wire,
+		maintenance_requeue_outcome_label(&outcome),
+		audit_outcome,
+	);
+	let completion_audit = match audit_sink.emit(completion) {
+		Ok(()) => MaintenanceCompletionAuditWire::Recorded,
+		Err(error) => {
+			let diagnostic = bounded_maintenance_diagnostic(format!(
+				"maintenance requeue completion audit failed: {error}"
+			));
+			tracing::error!(diagnostic = %diagnostic);
+			MaintenanceCompletionAuditWire::Failed { diagnostic }
+		}
+	};
+	(outcome, completion_audit)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,6 +695,23 @@ pub struct WendelonControlServer {
 	storage_manager: Option<Arc<SlabManager>>,
 	protocol: ProtocolVersionWindow,
 	reconcile_lock: Mutex<()>,
+}
+
+fn control_operation_permission(operation: ControlOperation) -> ActorPermission {
+	match operation {
+		ControlOperation::Status => ActorPermission::ControlStatus,
+		ControlOperation::AuditChainHead => ActorPermission::AuditRead,
+		ControlOperation::RevocationAdmin => ActorPermission::ClusterControl,
+		ControlOperation::Lease
+		| ControlOperation::LeaseRelease
+		| ControlOperation::Transfer
+		| ControlOperation::AdvanceEpoch
+		| ControlOperation::Join => ActorPermission::ClusterControl,
+		ControlOperation::SchemaDrop => ActorPermission::TenantAdminMutation,
+		ControlOperation::IndexStatus => ActorPermission::TenantAdminRead,
+		ControlOperation::MaintenanceReport => ActorPermission::ControlStatus,
+		ControlOperation::MaintenanceRequeue => ActorPermission::ClusterControl,
+	}
 }
 
 impl WendelonControlServer {
@@ -520,18 +850,7 @@ impl WendelonControlServer {
 		// overlays like tenant-scope rejection, human-only admin
 		// restrictions, and break-glass-only destructive paths are
 		// enforced later by `require_administrative_action(...)`.
-		let permission = match op {
-			ControlOperation::Status => ActorPermission::ControlStatus,
-			ControlOperation::AuditChainHead => ActorPermission::AuditRead,
-			ControlOperation::RevocationAdmin => ActorPermission::ClusterControl,
-			ControlOperation::Lease
-			| ControlOperation::LeaseRelease
-			| ControlOperation::Transfer
-			| ControlOperation::AdvanceEpoch
-			| ControlOperation::Join => ActorPermission::ClusterControl,
-			ControlOperation::SchemaDrop => ActorPermission::TenantAdminMutation,
-			ControlOperation::IndexStatus => ActorPermission::TenantAdminRead,
-		};
+		let permission = control_operation_permission(op);
 		authorize_actor(&context.actor, permission).map_err(|error| {
 			Error::new(
 				ErrorKind::PermissionDenied,
@@ -742,6 +1061,36 @@ impl WendelonControlServer {
 				magic: HRFT_MAGIC,
 				version: 1,
 				msg_type: MsgType::SECONDARY_INDEX_STATUS_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
+		})
+	}
+
+	fn build_maintenance_frame<T: Serialize>(
+		&self,
+		stream_id: u32,
+		msg_type: MsgType,
+		response: &T,
+	) -> std::io::Result<HrftFrame> {
+		let meta = wire::encode_into(&self.pool, response)?;
+		if meta.len() > MAINTENANCE_REPORT_MAX_BYTES {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"maintenance control response exceeded its encoded byte budget",
+			));
+		}
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: msg_type.0,
 				flags: 0,
 				stream_id,
 				meta_len: meta.len() as u32,
@@ -1750,6 +2099,197 @@ impl WendelonControlServer {
 				indexes,
 				message: None,
 			},
+		)
+	}
+
+	async fn handle_maintenance_report(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"MAINTENANCE_REPORT_REQ must not carry Arrow or trailing payloads",
+			));
+		}
+		if frame.meta.len() > MAINTENANCE_CONTROL_MAX_REQUEST_BYTES {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"maintenance report request exceeds the wire byte bound",
+			));
+		}
+		let request: MaintenanceReportRequestWire = wire::decode(&frame.meta)?;
+		let invalid = if request.version != MAINTENANCE_CONTROL_WIRE_VERSION {
+			Some("maintenance control wire version is unsupported".to_owned())
+		} else if request.target_node_id != self.local_node.id {
+			Some(format!(
+				"maintenance report targeted node {} but reached node {}",
+				request.target_node_id, self.local_node.id
+			))
+		} else if request.max_items == 0
+			|| usize::from(request.max_items) > MAINTENANCE_REPORT_MAX_ITEMS
+		{
+			Some(format!(
+				"maintenance report max_items must be 1..={MAINTENANCE_REPORT_MAX_ITEMS}"
+			))
+		} else {
+			None
+		};
+		if let Some(diagnostic) = invalid {
+			return self.build_maintenance_frame(
+				frame.header.stream_id,
+				MsgType::MAINTENANCE_REPORT_RESP,
+				&MaintenanceReportResponseWire {
+					version: MAINTENANCE_CONTROL_WIRE_VERSION,
+					serving_node_id: self.local_node.id,
+					outcome: MaintenanceReportOutcomeWire::InvalidRequest { diagnostic },
+					incarnation: [0; 16],
+					generation: 0,
+					items: Vec::new(),
+					next_cursor: Vec::new(),
+				},
+			);
+		}
+		let Some(storage) = self.storage_manager.as_ref() else {
+			return self.build_maintenance_frame(
+				frame.header.stream_id,
+				MsgType::MAINTENANCE_REPORT_RESP,
+				&MaintenanceReportResponseWire {
+					version: MAINTENANCE_CONTROL_WIRE_VERSION,
+					serving_node_id: self.local_node.id,
+					outcome: MaintenanceReportOutcomeWire::Unavailable {
+						diagnostic: "maintenance report requires local storage".to_owned(),
+					},
+					incarnation: [0; 16],
+					generation: 0,
+					items: Vec::new(),
+					next_cursor: Vec::new(),
+				},
+			);
+		};
+		let cursor = (!request.cursor.is_empty()).then_some(request.cursor.as_slice());
+		let page = storage.maintenance_policy().report_page(
+			cursor,
+			usize::from(request.max_items),
+			MAINTENANCE_REPORT_MAX_BYTES,
+		);
+		let response = match page {
+			Ok(page) => MaintenanceReportResponseWire {
+				version: MAINTENANCE_CONTROL_WIRE_VERSION,
+				serving_node_id: self.local_node.id,
+				outcome: if page.enabled {
+					MaintenanceReportOutcomeWire::Page
+				} else {
+					MaintenanceReportOutcomeWire::PolicyDisabled {
+						diagnostic: page.diagnostic.unwrap_or_default(),
+					}
+				},
+				incarnation: page.incarnation,
+				generation: page.generation,
+				items: page.items.into_iter().map(maintenance_item_wire).collect(),
+				next_cursor: page.next_cursor.unwrap_or_default(),
+			},
+			Err(MaintenanceReportPageError::StaleCursor) => MaintenanceReportResponseWire {
+				version: MAINTENANCE_CONTROL_WIRE_VERSION,
+				serving_node_id: self.local_node.id,
+				outcome: MaintenanceReportOutcomeWire::StaleCursor,
+				incarnation: [0; 16],
+				generation: 0,
+				items: Vec::new(),
+				next_cursor: Vec::new(),
+			},
+			Err(MaintenanceReportPageError::InvalidCursor(diagnostic))
+			| Err(MaintenanceReportPageError::InvalidBound(diagnostic)) => MaintenanceReportResponseWire {
+				version: MAINTENANCE_CONTROL_WIRE_VERSION,
+				serving_node_id: self.local_node.id,
+				outcome: MaintenanceReportOutcomeWire::InvalidRequest { diagnostic },
+				incarnation: [0; 16],
+				generation: 0,
+				items: Vec::new(),
+				next_cursor: Vec::new(),
+			},
+		};
+		self.build_maintenance_frame(
+			frame.header.stream_id,
+			MsgType::MAINTENANCE_REPORT_RESP,
+			&response,
+		)
+	}
+
+	async fn handle_maintenance_requeue(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"MAINTENANCE_REQUEUE_REQ must not carry Arrow or trailing payloads",
+			));
+		}
+		if frame.meta.len() > MAINTENANCE_CONTROL_MAX_REQUEST_BYTES {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"maintenance requeue request exceeds the wire byte bound",
+			));
+		}
+		let request: MaintenanceRequeueRequestWire = wire::decode(&frame.meta)?;
+		if request.version != MAINTENANCE_CONTROL_WIRE_VERSION
+			|| request.target_node_id != self.local_node.id
+			|| request.slabs.is_empty()
+			|| request.slabs.len() > crate::storage::maintenance_policy::MAX_RECEIPT_KEY_SLABS
+			|| request.slabs.windows(2).any(|pair| pair[0] >= pair[1])
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"maintenance requeue request has invalid version, target, or canonical slab set",
+			));
+		}
+		let operation =
+			MaintenanceOperation::from_code(request.operation_code).ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"maintenance operation code is unknown",
+				)
+			})?;
+		let expected = MaintenanceFingerprint::from_bytes(&request.expected_fingerprint)
+			.map_err(|message| Error::new(ErrorKind::InvalidInput, message))?;
+		let slabs = request
+			.slabs
+			.iter()
+			.copied()
+			.map(crate::schema::SlabId::new)
+			.collect::<Vec<_>>();
+		let slab_digest = maintenance_slab_digest(&request.slabs);
+		let response_base = |outcome, completion_audit| MaintenanceRequeueResponseWire {
+			version: MAINTENANCE_CONTROL_WIRE_VERSION,
+			serving_node_id: self.local_node.id,
+			operation_code: request.operation_code,
+			slab_count: request.slabs.len() as u32,
+			slab_digest,
+			expected_fingerprint: request.expected_fingerprint.clone(),
+			outcome,
+			completion_audit,
+		};
+
+		let policy = self
+			.storage_manager
+			.as_ref()
+			.map(|storage| storage.maintenance_policy());
+		let (outcome, completion_audit) = execute_maintenance_requeue_control(
+			self.audit_sink.as_ref(),
+			policy,
+			self.local_node,
+			&context.actor,
+			operation,
+			&request.slabs,
+			&slabs,
+			slab_digest,
+			&request.expected_fingerprint,
+			expected,
+		)
+		.await;
+		self.build_maintenance_frame(
+			frame.header.stream_id,
+			MsgType::MAINTENANCE_REQUEUE_RESP,
+			&response_base(outcome, completion_audit),
 		)
 	}
 
@@ -4205,6 +4745,14 @@ impl ControlRingServer for WendelonControlServer {
 				self.authorize_control_operation(&context, ControlOperation::IndexStatus)?;
 				self.handle_secondary_index_status(&context, frame).await?
 			}
+			MsgType::MAINTENANCE_REPORT_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::MaintenanceReport)?;
+				self.handle_maintenance_report(frame).await?
+			}
+			MsgType::MAINTENANCE_REQUEUE_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::MaintenanceRequeue)?;
+				self.handle_maintenance_requeue(&context, frame).await?
+			}
 			MsgType::TABLE_DESCRIPTOR_GET_REQ => {
 				self.handle_table_descriptor_get(&context, frame).await?
 			}
@@ -4756,13 +5304,19 @@ mod tests {
 	use super::*;
 	use crate::consensus::TieredSlab;
 	use crate::crypto::{TenantKeyset, WrappedTenantKek};
+	use crate::network::server::HrftService;
 	use crate::network::tls::{ActorIdentity, ActorRole, ActorTrustDomain};
 	use crate::network::transport::{TransportTier, TransportTierSet};
+	use crate::node::{NodeBootstrapConfig, WendelonNode};
 	use crate::schema::table::{decode_descriptor_wire_name, encode_descriptor_wire_name};
 	use crate::schema::{
 		LocalityPolicy, PrimaryKeyDescriptor, RecordBodyCompressionPolicy, RetentionWindowMillis,
 		RowIdentityPolicy, SchemaEvolutionPolicy, SlabId, TableSchemaCatalog,
 		decode_table_schema_descriptor_v1, encode_table_schema_descriptor_v1,
+	};
+	use crate::storage::index::{PersistentLocalIndex, persistent_index_path};
+	use crate::storage::maintenance_policy::{
+		DeterministicOrigin, DeterministicReceipt, MaintenanceWorkKey, SystemMaintenanceClock,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 
@@ -4817,6 +5371,598 @@ mod tests {
 			);
 		}
 		MembershipEpoch { epoch, peers }
+	}
+
+	fn actor(role: ActorRole) -> ActorIdentity {
+		ActorIdentity {
+			role,
+			trust_domain: role.trust_domain(),
+			cert_subject: None,
+			node_id: None,
+			tenant_id: (role == ActorRole::TenantAdmin).then(|| "7".to_owned()),
+			scopes: Vec::new(),
+			key_id: vec![role as u8],
+			break_glass: role.break_glass(),
+		}
+	}
+
+	struct NthFailAuditSink {
+		calls: std::sync::atomic::AtomicUsize,
+		fail_at: Option<usize>,
+		events: std::sync::Mutex<Vec<AuditEvent>>,
+	}
+
+	impl NthFailAuditSink {
+		fn new(fail_at: usize) -> Self {
+			Self {
+				calls: std::sync::atomic::AtomicUsize::new(0),
+				fail_at: Some(fail_at),
+				events: std::sync::Mutex::new(Vec::new()),
+			}
+		}
+
+		fn never_fails() -> Self {
+			Self {
+				calls: std::sync::atomic::AtomicUsize::new(0),
+				fail_at: None,
+				events: std::sync::Mutex::new(Vec::new()),
+			}
+		}
+	}
+
+	impl AuditSink for NthFailAuditSink {
+		fn emit(&self, event: AuditEvent) -> std::io::Result<()> {
+			let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+			if self.fail_at == Some(call) {
+				return Err(Error::other("injected audit refusal"));
+			}
+			self.events.lock().unwrap().push(event);
+			Ok(())
+		}
+	}
+
+	async fn quarantined_policy_for_control_test() -> (
+		Arc<MaintenancePolicyInner>,
+		Vec<SlabId>,
+		MaintenanceFingerprint,
+	) {
+		let path = std::env::temp_dir().join(format!(
+			"wendelon-adr0582-control-{}.redb",
+			uuid::Uuid::new_v4()
+		));
+		let store = Arc::new(
+			crate::storage::index::PersistentLocalIndex::open(path)
+				.await
+				.unwrap(),
+		);
+		let slabs = vec![SlabId::new(21), SlabId::new(22)];
+		let first = DeterministicReceipt::after_failure(None, 1_000, "shape").unwrap();
+		let second = DeterministicReceipt::after_failure(Some(&first), 2_000, "shape").unwrap();
+		let receipt = DeterministicReceipt::after_failure(Some(&second), 3_000, "shape").unwrap();
+		let key = MaintenanceWorkKey::new(
+			MaintenanceOperation::LsmCompaction,
+			slabs.iter().copied(),
+			DeterministicOrigin::LsmInconsistentSourceFrames,
+		)
+		.unwrap();
+		let mut receipts = BTreeMap::new();
+		receipts.insert(key, receipt);
+		let policy =
+			MaintenancePolicyInner::enabled(store, receipts, Arc::new(SystemMaintenanceClock));
+		let fingerprint = policy
+			.quarantine_fingerprint_for_test(MaintenanceOperation::LsmCompaction, &slabs)
+			.unwrap();
+		(policy, slabs, fingerprint)
+	}
+
+	async fn seed_quarantined_receipt(
+		dir: &std::path::Path,
+		operation: MaintenanceOperation,
+		slabs: &[SlabId],
+		origin: DeterministicOrigin,
+		detail: &str,
+	) {
+		std::fs::create_dir_all(dir).unwrap();
+		let store = PersistentLocalIndex::open(persistent_index_path(dir))
+			.await
+			.unwrap();
+		let first = DeterministicReceipt::after_failure(None, 1_000, detail).unwrap();
+		let second = DeterministicReceipt::after_failure(Some(&first), 2_000, detail).unwrap();
+		let receipt = DeterministicReceipt::after_failure(Some(&second), 3_000, detail).unwrap();
+		let key = MaintenanceWorkKey::new(operation, slabs.iter().copied(), origin).unwrap();
+		store
+			.put_maintenance_receipt(key.encode(), receipt.encode())
+			.await
+			.unwrap();
+	}
+
+	fn maintenance_control_frame<T: Serialize>(
+		node: &WendelonNode,
+		stream_id: u32,
+		msg_type: MsgType,
+		request: &T,
+	) -> HrftFrame {
+		let meta = wire::encode_into(&node.pool, request).unwrap();
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: msg_type.0,
+				flags: 0,
+				stream_id,
+				meta_len: u32::try_from(meta.len()).unwrap(),
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
+		}
+	}
+
+	async fn report_real_node(
+		node: &WendelonNode,
+		role: ActorRole,
+		stream_id: u32,
+	) -> std::io::Result<MaintenanceReportResponseWire> {
+		let frame = maintenance_control_frame(
+			node,
+			stream_id,
+			MsgType::MAINTENANCE_REPORT_REQ,
+			&MaintenanceReportRequestWire {
+				version: MAINTENANCE_CONTROL_WIRE_VERSION,
+				target_node_id: node.local_node.id,
+				max_items: MAINTENANCE_REPORT_MAX_ITEMS as u16,
+				cursor: Vec::new(),
+			},
+		);
+		let response = node
+			.router
+			.handle_frame(
+				RequestContext {
+					remote: Some(node.local_node),
+					actor: actor(role),
+				},
+				frame,
+			)
+			.await?
+			.ok_or_else(|| Error::other("maintenance report returned no frame"))?;
+		wire::decode(&response.meta)
+	}
+
+	async fn bootstrap_maintenance_test_node(
+		node_id: u32,
+		dir: std::path::PathBuf,
+	) -> WendelonNode {
+		let mut config =
+			NodeBootstrapConfig::dev(node_id, dir, format!("127.0.0.1:{}", 30_000 + node_id));
+		config.lsm_compaction_paused = true;
+		config.mvcc_retention_paused = true;
+		WendelonNode::bootstrap_single_node(config).await.unwrap()
+	}
+
+	/// ADR 0582's decisive boundary: receipts are hydrated from two separate
+	/// indexes, the real authenticated router reports only the addressed node,
+	/// and an operation-scoped clear survives another reopen without touching a
+	/// sibling operation over the same slabs.
+	#[tokio::test]
+	async fn maintenance_control_is_node_local_authenticated_and_durable_across_reopen() {
+		let root = std::env::temp_dir().join(format!(
+			"wendelon-adr0582-two-node-{}",
+			uuid::Uuid::new_v4()
+		));
+		let dir_a = root.join("node-a");
+		let dir_b = root.join("node-b");
+		let slabs_a = [SlabId::new(11), SlabId::new(12)];
+		let slabs_b = [SlabId::new(99)];
+		seed_quarantined_receipt(
+			&dir_a,
+			MaintenanceOperation::LsmCompaction,
+			&slabs_a,
+			DeterministicOrigin::LsmInconsistentSourceFrames,
+			"node-a-lsm",
+		)
+		.await;
+		seed_quarantined_receipt(
+			&dir_a,
+			MaintenanceOperation::RetentionPrune,
+			&slabs_a,
+			DeterministicOrigin::MaintenanceRewriteWithoutClaim,
+			"node-a-retention",
+		)
+		.await;
+		seed_quarantined_receipt(
+			&dir_b,
+			MaintenanceOperation::SecondaryIndexBackfill,
+			&slabs_b,
+			DeterministicOrigin::MaintenanceRewriteWithoutClaim,
+			"node-b-backfill",
+		)
+		.await;
+
+		let node_a = bootstrap_maintenance_test_node(101, dir_a.clone()).await;
+		let node_b = bootstrap_maintenance_test_node(102, dir_b).await;
+		let report_a = report_real_node(&node_a, ActorRole::ReadOnlyObserver, 1)
+			.await
+			.unwrap();
+		let report_b = report_real_node(&node_b, ActorRole::ReadOnlyObserver, 2)
+			.await
+			.unwrap();
+		assert_eq!(report_a.serving_node_id, node_a.local_node.id);
+		assert_eq!(report_b.serving_node_id, node_b.local_node.id);
+		assert!(matches!(
+			report_a.outcome,
+			MaintenanceReportOutcomeWire::Page
+		));
+		assert!(matches!(
+			report_b.outcome,
+			MaintenanceReportOutcomeWire::Page
+		));
+		assert_eq!(report_a.items.len(), 2);
+		assert_eq!(report_b.items.len(), 1);
+		assert!(report_a.items.iter().all(|item| match item {
+			MaintenanceReportItemWire::QuarantinedWork { slabs, .. }
+			| MaintenanceReportItemWire::RetryableCooldown { slabs, .. }
+			| MaintenanceReportItemWire::InFlight { slabs, .. } => slabs == &[11, 12],
+		}));
+		assert!(report_b.items.iter().all(|item| match item {
+			MaintenanceReportItemWire::QuarantinedWork { slabs, .. }
+			| MaintenanceReportItemWire::RetryableCooldown { slabs, .. }
+			| MaintenanceReportItemWire::InFlight { slabs, .. } => slabs == &[99],
+		}));
+
+		let (fingerprint, lsm_operation) = report_a
+			.items
+			.iter()
+			.find_map(|item| match item {
+				MaintenanceReportItemWire::QuarantinedWork {
+					operation_code,
+					quarantine_fingerprint,
+					..
+				} if *operation_code == MaintenanceOperation::LsmCompaction.code() => {
+					Some((quarantine_fingerprint.clone(), *operation_code))
+				}
+				_ => None,
+			})
+			.expect("node A reports its LSM quarantine");
+		let requeue_request = MaintenanceRequeueRequestWire {
+			version: MAINTENANCE_CONTROL_WIRE_VERSION,
+			target_node_id: node_a.local_node.id,
+			operation_code: lsm_operation,
+			slabs: vec![11, 12],
+			expected_fingerprint: fingerprint,
+		};
+		for role in [ActorRole::ReadOnlyObserver, ActorRole::TenantAdmin] {
+			let denied = node_a
+				.router
+				.handle_frame(
+					RequestContext {
+						remote: Some(node_a.local_node),
+						actor: actor(role),
+					},
+					maintenance_control_frame(
+						&node_a,
+						3,
+						MsgType::MAINTENANCE_REQUEUE_REQ,
+						&requeue_request,
+					),
+				)
+				.await;
+			assert!(
+				denied.is_err(),
+				"{role:?} unexpectedly requeued node-wide work"
+			);
+		}
+
+		let response = node_a
+			.router
+			.handle_frame(
+				RequestContext {
+					remote: Some(node_a.local_node),
+					actor: actor(ActorRole::Operator),
+				},
+				maintenance_control_frame(
+					&node_a,
+					4,
+					MsgType::MAINTENANCE_REQUEUE_REQ,
+					&requeue_request,
+				),
+			)
+			.await
+			.unwrap()
+			.unwrap();
+		let response: MaintenanceRequeueResponseWire = wire::decode(&response.meta).unwrap();
+		assert_eq!(
+			response.outcome,
+			MaintenanceRequeueOutcomeWire::Cleared { origins: 1 }
+		);
+		assert_eq!(
+			response.completion_audit,
+			MaintenanceCompletionAuditWire::Recorded
+		);
+
+		// A restart test needs every manager/index owner gone. The node's graceful
+		// shutdown intentionally leaves the Raft worker lifetime independent; the
+		// established restart fixtures abort handles, drop the assembled node, and
+		// give those workers one scheduler turn to release their Arc graph.
+		node_a.handles.abort();
+		drop(node_a);
+		tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+		let reopened_a = bootstrap_maintenance_test_node(101, dir_a).await;
+		let after = report_real_node(&reopened_a, ActorRole::Operator, 5)
+			.await
+			.unwrap();
+		assert_eq!(
+			after.items.len(),
+			1,
+			"reopened node A report outcome: {:?}",
+			after.outcome
+		);
+		assert!(matches!(
+			&after.items[0],
+			MaintenanceReportItemWire::QuarantinedWork { operation_code, slabs, .. }
+				if *operation_code == MaintenanceOperation::RetentionPrune.code()
+					&& slabs == &[11, 12]
+		));
+		let still_b = report_real_node(&node_b, ActorRole::Operator, 6)
+			.await
+			.unwrap();
+		assert_eq!(still_b.items, report_b.items);
+
+		reopened_a.handles.abort();
+		node_b.handles.abort();
+	}
+
+	/// ADR 0582: viewing node-local maintenance state is diagnostic, while
+	/// resetting a quarantine is cluster control. Tenant administration confers
+	/// neither authority over a node-wide maintenance policy.
+	#[test]
+	fn maintenance_control_permissions_separate_report_from_requeue() {
+		let report = control_operation_permission(ControlOperation::MaintenanceReport);
+		let requeue = control_operation_permission(ControlOperation::MaintenanceRequeue);
+		let observer = actor(ActorRole::ReadOnlyObserver);
+		let tenant_admin = actor(ActorRole::TenantAdmin);
+		let operator = actor(ActorRole::Operator);
+
+		assert!(authorize_actor(&observer, report).is_ok());
+		assert!(authorize_actor(&observer, requeue).is_err());
+		assert!(authorize_actor(&tenant_admin, report).is_err());
+		assert!(authorize_actor(&tenant_admin, requeue).is_err());
+		assert!(authorize_actor(&operator, report).is_ok());
+		assert!(authorize_actor(&operator, requeue).is_ok());
+	}
+
+	#[test]
+	fn one_maximal_maintenance_report_item_fits_the_control_frame() {
+		let response = MaintenanceReportResponseWire {
+			version: MAINTENANCE_CONTROL_WIRE_VERSION,
+			serving_node_id: 7,
+			outcome: MaintenanceReportOutcomeWire::Page,
+			incarnation: [0xff; 16],
+			generation: u64::MAX,
+			items: vec![MaintenanceReportItemWire::QuarantinedWork {
+				operation_code: u16::MAX,
+				slabs: vec![u64::MAX; crate::storage::maintenance_policy::MAX_RECEIPT_KEY_SLABS],
+				origins: (1..=13)
+					.map(|origin_code| MaintenanceOriginWire {
+						origin_code,
+						reason: "corrupt_source_frame".to_owned(),
+						attempts: u32::MAX,
+						last_failure_ms: u64::MAX,
+						next_eligible_at_ms: None,
+						detail: "x".repeat(256),
+					})
+					.collect(),
+				quarantine_fingerprint: vec![0xff; 33],
+			}],
+			next_cursor: vec![0xff; 32 + 4096 * 8],
+		};
+		let encoded = wire::encode(&response).unwrap();
+		assert!(
+			encoded.len() <= MAINTENANCE_REPORT_MAX_BYTES,
+			"maximal legal item is {} bytes, above the {}-byte frame",
+			encoded.len(),
+			MAINTENANCE_REPORT_MAX_BYTES
+		);
+	}
+
+	#[tokio::test]
+	async fn maintenance_report_stops_before_the_encoded_frame_budget() {
+		let path = std::env::temp_dir().join(format!(
+			"wendelon-adr0582-page-budget-{}.redb",
+			uuid::Uuid::new_v4()
+		));
+		let store = Arc::new(PersistentLocalIndex::open(path).await.unwrap());
+		let receipt = DeterministicReceipt::after_failure(
+			Some(
+				&DeterministicReceipt::after_failure(
+					Some(
+						&DeterministicReceipt::after_failure(None, 1_000, &"x".repeat(256))
+							.unwrap(),
+					),
+					2_000,
+					&"x".repeat(256),
+				)
+				.unwrap(),
+			),
+			3_000,
+			&"x".repeat(256),
+		)
+		.unwrap();
+		let mut receipts = BTreeMap::new();
+		for item in 0..8_u64 {
+			let base = item * 10_000;
+			let slabs = (1..=crate::storage::maintenance_policy::MAX_RECEIPT_KEY_SLABS)
+				.map(|offset| SlabId::new(base + offset as u64))
+				.collect::<Vec<_>>();
+			receipts.insert(
+				MaintenanceWorkKey::new(
+					MaintenanceOperation::LsmCompaction,
+					slabs,
+					DeterministicOrigin::LsmInconsistentSourceFrames,
+				)
+				.unwrap(),
+				receipt.clone(),
+			);
+		}
+		let policy =
+			MaintenancePolicyInner::enabled(store, receipts, Arc::new(SystemMaintenanceClock));
+		let page = policy
+			.report_page(
+				None,
+				MAINTENANCE_REPORT_MAX_ITEMS,
+				MAINTENANCE_REPORT_MAX_BYTES,
+			)
+			.unwrap();
+		assert!(
+			page.next_cursor.is_some(),
+			"the byte bound did not cut the eight maximal work items"
+		);
+		assert!(page.items.len() > 1, "the bound became a one-item limit");
+		let response = MaintenanceReportResponseWire {
+			version: MAINTENANCE_CONTROL_WIRE_VERSION,
+			serving_node_id: 7,
+			outcome: MaintenanceReportOutcomeWire::Page,
+			incarnation: page.incarnation,
+			generation: page.generation,
+			items: page.items.into_iter().map(maintenance_item_wire).collect(),
+			next_cursor: page.next_cursor.unwrap(),
+		};
+		let encoded = wire::encode(&response).unwrap();
+		assert!(
+			encoded.len() <= MAINTENANCE_REPORT_MAX_BYTES,
+			"policy admitted {} encoded bytes into a {}-byte report frame",
+			encoded.len(),
+			MAINTENANCE_REPORT_MAX_BYTES
+		);
+	}
+
+	#[test]
+	fn maintenance_requeue_audit_is_bounded_and_never_names_the_slab_list() {
+		let slabs = [11, 12, 13, 14, 15];
+		let event = maintenance_requeue_audit_event(
+			AuditOperation::MaintenanceRequeueAttempt,
+			n(7),
+			&actor(ActorRole::Operator),
+			MaintenanceOperation::LsmCompaction,
+			&slabs,
+			maintenance_slab_digest(&slabs),
+			&[0xab; 33],
+			"attempted",
+			AuditOutcome::Allowed,
+		);
+		let encoded = serde_json::to_string(&event).unwrap();
+		assert!(encoded.len() < 2_048, "audit event is not bounded");
+		assert!(!encoded.contains("[11,12,13,14,15]"));
+		assert_eq!(
+			event.parameters.get("slab_count"),
+			Some(&serde_json::json!(5))
+		);
+		assert!(event.parameters.contains_key("slab_digest"));
+	}
+
+	#[tokio::test]
+	async fn maintenance_requeue_audit_brackets_mutation_and_fails_closed() {
+		let (ordered_policy, ordered_slabs, ordered_fingerprint) =
+			quarantined_policy_for_control_test().await;
+		let ordered_wire = ordered_slabs
+			.iter()
+			.map(|slab| slab.get())
+			.collect::<Vec<_>>();
+		let ordered_sink = NthFailAuditSink::never_fails();
+		let (ordered_outcome, ordered_completion) = execute_maintenance_requeue_control(
+			&ordered_sink,
+			Some(&ordered_policy),
+			n(7),
+			&actor(ActorRole::Operator),
+			MaintenanceOperation::LsmCompaction,
+			&ordered_wire,
+			&ordered_slabs,
+			maintenance_slab_digest(&ordered_wire),
+			&ordered_fingerprint.to_bytes(),
+			ordered_fingerprint,
+		)
+		.await;
+		assert_eq!(
+			ordered_outcome,
+			MaintenanceRequeueOutcomeWire::Cleared { origins: 1 }
+		);
+		assert_eq!(ordered_completion, MaintenanceCompletionAuditWire::Recorded);
+		let operations = ordered_sink
+			.events
+			.lock()
+			.unwrap()
+			.iter()
+			.map(|event| event.operation)
+			.collect::<Vec<_>>();
+		assert_eq!(
+			operations,
+			[
+				AuditOperation::MaintenanceRequeueAttempt,
+				AuditOperation::MaintenanceRequeueCompletion,
+			]
+		);
+
+		let (policy, slabs, fingerprint) = quarantined_policy_for_control_test().await;
+		let slabs_wire = slabs.iter().map(|slab| slab.get()).collect::<Vec<_>>();
+		let digest = maintenance_slab_digest(&slabs_wire);
+		let expected_wire = fingerprint.to_bytes();
+		let refusing_attempt = NthFailAuditSink::new(1);
+		let (outcome, completion) = execute_maintenance_requeue_control(
+			&refusing_attempt,
+			Some(&policy),
+			n(7),
+			&actor(ActorRole::Operator),
+			MaintenanceOperation::LsmCompaction,
+			&slabs_wire,
+			&slabs,
+			digest,
+			&expected_wire,
+			fingerprint,
+		)
+		.await;
+		assert_eq!(outcome, MaintenanceRequeueOutcomeWire::AuditUnavailable);
+		assert_eq!(completion, MaintenanceCompletionAuditWire::NotAttempted);
+		assert_eq!(
+			policy.quarantine_fingerprint_for_test(MaintenanceOperation::LsmCompaction, &slabs),
+			Some(fingerprint),
+			"attempt-audit refusal cleared state"
+		);
+
+		let failing_completion = NthFailAuditSink::new(2);
+		let (outcome, completion) = execute_maintenance_requeue_control(
+			&failing_completion,
+			Some(&policy),
+			n(7),
+			&actor(ActorRole::Operator),
+			MaintenanceOperation::LsmCompaction,
+			&slabs_wire,
+			&slabs,
+			digest,
+			&expected_wire,
+			fingerprint,
+		)
+		.await;
+		assert_eq!(
+			outcome,
+			MaintenanceRequeueOutcomeWire::Cleared { origins: 1 }
+		);
+		assert!(matches!(
+			completion,
+			MaintenanceCompletionAuditWire::Failed { .. }
+		));
+		let events = failing_completion.events.lock().unwrap();
+		assert_eq!(events.len(), 1);
+		assert_eq!(
+			events[0].operation,
+			AuditOperation::MaintenanceRequeueAttempt
+		);
+		assert!(
+			policy
+				.quarantine_fingerprint_for_test(MaintenanceOperation::LsmCompaction, &slabs)
+				.is_none(),
+			"successful clear was rolled back when completion audit failed"
+		);
 	}
 
 	#[test]

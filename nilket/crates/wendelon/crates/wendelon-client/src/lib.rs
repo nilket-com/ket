@@ -23,6 +23,12 @@ use wendelon::network::control_server::{
 	CONTROL_REASON_NOT_LEADER, CtasSagaRequestWire, CtasSagaResponseWire, SchemaUpdateResponseWire,
 	TableSchemaDropResponseWire,
 };
+pub use wendelon::network::control_server::{
+	MAINTENANCE_CONTROL_MAX_REQUEST_BYTES, MAINTENANCE_CONTROL_WIRE_VERSION,
+	MaintenanceCompletionAuditWire, MaintenanceOriginWire, MaintenanceReportItemWire,
+	MaintenanceReportOutcomeWire, MaintenanceReportRequestWire, MaintenanceReportResponseWire,
+	MaintenanceRequeueOutcomeWire, MaintenanceRequeueRequestWire, MaintenanceRequeueResponseWire,
+};
 use wendelon::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use wendelon::network::factory::TransportProviderFactory;
 use wendelon::network::pool::BufPool;
@@ -1127,6 +1133,148 @@ impl Client {
 			.into());
 		}
 		Ok(wire::decode::<TableSchemaDropResponseWire>(&frame.meta)?)
+	}
+
+	/// ADR 582: read one page from exactly one node. This deliberately does not
+	/// refresh, redirect, fan out, or aggregate; node-local policy state is useful
+	/// only when it remains attributable to the node that owns its receipt table.
+	pub async fn maintenance_report(
+		&self,
+		target_node_id: u32,
+		max_items: u16,
+		cursor: Vec<u8>,
+	) -> Result<MaintenanceReportResponseWire, ClientError> {
+		let target = NodeId {
+			id: target_node_id,
+			_reserved: 0,
+		};
+		let request = MaintenanceReportRequestWire {
+			version: MAINTENANCE_CONTROL_WIRE_VERSION,
+			target_node_id,
+			max_items,
+			cursor,
+		};
+		let frame = self
+			.submit_maintenance_once(target, MsgType::MAINTENANCE_REPORT_REQ, &request)
+			.await?;
+		if frame.header.msg_type != MsgType::MAINTENANCE_REPORT_RESP.0 {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"maintenance report target returned the wrong response type",
+			)
+			.into());
+		}
+		let response: MaintenanceReportResponseWire = wire::decode(&frame.meta)?;
+		if response.version != MAINTENANCE_CONTROL_WIRE_VERSION {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"maintenance report response has an unsupported wire version",
+			)
+			.into());
+		}
+		if response.serving_node_id != target_node_id {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"maintenance report was served by a different node than requested",
+			)
+			.into());
+		}
+		Ok(response)
+	}
+
+	/// ADR 582: compare-and-clear one reviewed node-local quarantine.
+	pub async fn maintenance_requeue(
+		&self,
+		target_node_id: u32,
+		operation_code: u16,
+		slabs: Vec<u64>,
+		expected_fingerprint: Vec<u8>,
+	) -> Result<MaintenanceRequeueResponseWire, ClientError> {
+		let target = NodeId {
+			id: target_node_id,
+			_reserved: 0,
+		};
+		let request = MaintenanceRequeueRequestWire {
+			version: MAINTENANCE_CONTROL_WIRE_VERSION,
+			target_node_id,
+			operation_code,
+			slabs,
+			expected_fingerprint,
+		};
+		let frame = self
+			.submit_maintenance_once(target, MsgType::MAINTENANCE_REQUEUE_REQ, &request)
+			.await?;
+		if frame.header.msg_type != MsgType::MAINTENANCE_REQUEUE_RESP.0 {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"maintenance requeue target returned the wrong response type",
+			)
+			.into());
+		}
+		let response: MaintenanceRequeueResponseWire = wire::decode(&frame.meta)?;
+		if response.version != MAINTENANCE_CONTROL_WIRE_VERSION {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"maintenance requeue response has an unsupported wire version",
+			)
+			.into());
+		}
+		if response.serving_node_id != target_node_id {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"maintenance requeue was served by a different node than requested",
+			)
+			.into());
+		}
+		Ok(response)
+	}
+
+	async fn submit_maintenance_once<T: serde::Serialize>(
+		&self,
+		target: NodeId,
+		msg_type: MsgType,
+		request: &T,
+	) -> Result<wendelon::network::core::HrftFrame, ClientError> {
+		let meta = wire::encode(request)?;
+		if meta.len() > MAINTENANCE_CONTROL_MAX_REQUEST_BYTES {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"maintenance request exceeds the wire byte bound",
+			)
+			.into());
+		}
+		let meta_len = u32::try_from(meta.len()).map_err(|_| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"maintenance request length does not fit the frame header",
+			)
+		})?;
+		let conn = self.inner.factory().get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: msg_type.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, &meta, None, None).await?;
+		stream
+			.finish()
+			.await
+			.map_err(|error| std::io::Error::new(std::io::ErrorKind::BrokenPipe, error))?;
+		let frame = read_frame(&mut *stream, self.inner.pool()).await?;
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"maintenance control response carried an unexpected payload",
+			)
+			.into());
+		}
+		Ok(frame)
 	}
 
 	pub async fn write(

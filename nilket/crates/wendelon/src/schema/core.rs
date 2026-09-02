@@ -764,6 +764,11 @@ impl MsgType {
 	/// ADR 0095 leader-to-participant bounded physical reclaim slices.
 	pub const DROP_RECLAIM_SLICE_REQ: Self = Self(0x58);
 	pub const DROP_RECLAIM_SLICE_RESP: Self = Self(0x59);
+	/// ADR 582 node-local maintenance policy report and compare-and-clear.
+	pub const MAINTENANCE_REPORT_REQ: Self = Self(0x5A);
+	pub const MAINTENANCE_REPORT_RESP: Self = Self(0x5B);
+	pub const MAINTENANCE_REQUEUE_REQ: Self = Self(0x5C);
+	pub const MAINTENANCE_REQUEUE_RESP: Self = Self(0x5D);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -861,6 +866,10 @@ impl MsgType {
 		Self::MUTATION_OUTCOME_PIN_RESP,
 		Self::DROP_RECLAIM_SLICE_REQ,
 		Self::DROP_RECLAIM_SLICE_RESP,
+		Self::MAINTENANCE_REPORT_REQ,
+		Self::MAINTENANCE_REPORT_RESP,
+		Self::MAINTENANCE_REQUEUE_REQ,
+		Self::MAINTENANCE_REQUEUE_RESP,
 		Self::APPEND_ENTRIES_REQ,
 		Self::APPEND_ENTRIES_RESP,
 		Self::INSTALL_SNAPSHOT_REQ,

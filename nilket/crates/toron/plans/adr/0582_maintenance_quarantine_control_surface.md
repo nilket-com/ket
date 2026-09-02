@@ -1,7 +1,7 @@
 # ADR 582 - Maintenance quarantine control surface
 
-**Status:** OPEN. Decided; no implementation has landed. Closes ADR 0097 decision
-4 when its acceptance holds. Deployment stays parked throughout.
+**Status:** OPEN. Implementation is under review. Closes ADR 0097 decision 4
+when its acceptance holds. Deployment stays parked throughout.
 
 
 ## Context
@@ -278,3 +278,16 @@ Wendelon control ring (two operations, their permissions, the fingerprint, and
 the audit event), a control-ring client method in Toron's admin client, and the
 `maintenance` verb in the Toron command line. Review corrections fold into the
 implementation commit until the round closes; nothing is pushed before that.
+
+Two follow-ups remain deliberately outside this contract. Deterministic attempts
+one and two are durable backoff receipts but do not fit the report grammar above;
+if operators need that pre-quarantine visibility, add a distinct `BackingOff`
+variant rather than misreporting them as retryable races. The page byte estimate
+is backed by a fail-closed encoder and a maximal-item fixture; a future wire-schema
+change should add an encoder-dominance test before changing either side of that
+bound.
+
+The implementation also narrows ADR 044's architecture guard from the generic
+word `fingerprint` to certificate- and TLS-fingerprint spellings. ADR 582's
+quarantine fingerprint is not an authentication model, while those narrower
+spellings retain ADR 044's boundary.

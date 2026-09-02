@@ -12216,7 +12216,7 @@ async fn prune_compaction_must_not_orphan_secondary_index_sources() {
 	// Production retention pruning over the sealed slab. The floor predates every row,
 	// so nothing is prunable: this is the routine keep-everything compaction that
 	// builds a replacement and retires the source.
-	let slab = {
+	let _slab = {
 		let state = manager.state.lock().await;
 		let (_, slab) = state.sealed.remove(&slab_id).expect("sealed slab present");
 		state.sealed.insert(slab_id, slab.clone());
@@ -13964,7 +13964,7 @@ async fn a_compaction_tick_is_policed_and_its_success_is_recorded() {
 	assert!(report.enabled);
 	assert!(report.in_flight.is_empty(), "the reservation was released");
 	assert!(report.receipts.is_empty());
-	assert_eq!(metrics.maintenance_policy_enabled.get(), 1);
+	assert_eq!(policy.gauge_snapshot_for_test(), (1, 0));
 }
 
 #[tokio::test]
@@ -14038,11 +14038,18 @@ async fn a_quarantined_plan_is_skipped_by_the_tick_until_requeued() {
 	);
 
 	// Requeue readmits it, and the success clears the record.
+	let expected = policy
+		.quarantine_fingerprint_for_test(
+			crate::storage::maintenance_policy::MaintenanceOperation::LsmCompaction,
+			&touched,
+		)
+		.expect("the report carries the quarantine fingerprint");
 	assert_eq!(
 		policy
 			.requeue(
 				crate::storage::maintenance_policy::MaintenanceOperation::LsmCompaction,
 				&touched,
+				expected,
 			)
 			.await,
 		Ok(1)
@@ -14054,10 +14061,7 @@ async fn a_quarantined_plan_is_skipped_by_the_tick_until_requeued() {
 		.expect("requeued work runs");
 	assert!(outcome.rows_out > 0);
 	assert!(policy.report().receipts.is_empty());
-	assert_eq!(
-		crate::metrics::global().maintenance_quarantined_work.get(),
-		0
-	);
+	assert_eq!(policy.gauge_snapshot_for_test(), (1, 0));
 }
 
 #[tokio::test]
@@ -14091,7 +14095,7 @@ async fn a_manager_with_unreadable_receipt_history_serves_but_admits_no_maintena
 		"{:?}",
 		policy.diagnostic()
 	);
-	assert_eq!(crate::metrics::global().maintenance_policy_enabled.get(), 0);
+	assert_eq!(policy.gauge_snapshot_for_test(), (0, 0));
 
 	// Serving is intact.
 	let location = manager

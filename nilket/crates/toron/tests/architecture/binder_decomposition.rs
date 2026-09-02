@@ -477,6 +477,10 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// own receipts and equivalence diagnostic; no binder decomposition
 				// surface.
 				"crates/toron/src/exec/join/batch_local_probe.rs",
+				// ADR 582: the authenticated node-local maintenance report and
+				// compare-and-clear command is an operator CLI surface. It owns no
+				// binder decomposition surface.
+				"crates/toron/src/cli/maintenance.rs",
 			];
 			*path != "crates/toron/src/binder.rs"
 				&& !path.starts_with("crates/toron/src/binder/")

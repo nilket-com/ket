@@ -6,7 +6,7 @@ pub mod core;
 pub mod counter;
 pub mod encoding;
 pub mod file_ops;
-mod index;
+pub(crate) mod index;
 pub mod io_uring;
 pub mod ipc;
 pub mod l2;

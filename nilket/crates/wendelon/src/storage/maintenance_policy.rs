@@ -26,11 +26,13 @@
 use crate::schema::SlabId;
 use crate::storage::index::PersistentLocalIndex;
 use crate::storage::lsm::CompactionFailure;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use uuid::Uuid;
 
 /// Why a maintenance attempt cannot succeed by being repeated.
 ///
@@ -1449,24 +1451,29 @@ mod tests {
 			metrics.maintenance_deterministic_failures(ORIGIN.reason()) - before_reason,
 			3
 		);
-		assert_eq!(metrics.maintenance_quarantined_work.get(), 1);
+		assert_eq!(policy.gauge_snapshot_for_test(), (1, 1));
 
 		// Requeue refuses work that is not quarantined ...
+		let unreviewed = MaintenanceFingerprint {
+			version: MAINTENANCE_FINGERPRINT_VERSION,
+			digest: [0; 32],
+		};
 		assert_eq!(
-			policy.requeue(OP, &[SlabId::new(99)]).await,
+			policy.requeue(OP, &[SlabId::new(99)], unreviewed).await,
 			Err(RequeueRefusal::NotQuarantined)
 		);
 		// ... and work that is in flight.
 		let other = [SlabId::new(8)];
 		let held = policy.reserve(OP, &other).unwrap();
 		assert_eq!(
-			policy.requeue(OP, &other).await,
+			policy.requeue(OP, &other, unreviewed).await,
 			Err(RequeueRefusal::InFlight)
 		);
 		held.finalize();
 
 		// The requeue clears it durably and in memory, with a fresh budget.
-		assert_eq!(policy.requeue(OP, &slabs).await, Ok(1));
+		let expected = policy.quarantine_fingerprint_for_test(OP, &slabs).unwrap();
+		assert_eq!(policy.requeue(OP, &slabs, expected).await, Ok(1));
 		assert!(receipt_for(&policy, &slabs).is_none());
 		assert!(
 			store
@@ -1475,7 +1482,7 @@ mod tests {
 				.unwrap()
 				.is_empty()
 		);
-		assert_eq!(metrics.maintenance_quarantined_work.get(), 0);
+		assert_eq!(policy.gauge_snapshot_for_test(), (1, 0));
 		assert_admits(&policy, &slabs, "after requeue");
 		fail_deterministically(&policy, &slabs).await;
 		assert_eq!(receipt_for(&policy, &slabs).unwrap().attempts, 1);
@@ -1638,7 +1645,7 @@ mod tests {
 	#[tokio::test]
 	async fn success_removes_every_origin_receipt_for_the_exact_slab_set_only() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, store) = enabled_policy_with_store(clock.clone()).await;
+		let (_policy, store) = enabled_policy_with_store(clock.clone()).await;
 		let set_a = [SlabId::new(1), SlabId::new(2)];
 		let set_b = [SlabId::new(1)];
 		let receipt = DeterministicReceipt::after_failure(None, 0, "x").unwrap();
@@ -1743,7 +1750,13 @@ mod tests {
 			.fail_receipt_mutations
 			.store(true, std::sync::atomic::Ordering::SeqCst);
 		assert!(matches!(
-			policy.requeue(OP, &slabs).await,
+			policy
+				.requeue(
+					OP,
+					&slabs,
+					policy.quarantine_fingerprint_for_test(OP, &slabs).unwrap()
+				)
+				.await,
 			Err(RequeueRefusal::StoreFailure(_))
 		));
 		assert!(!policy.is_enabled());
@@ -2482,12 +2495,20 @@ mod tests {
 		// another operation's quarantine is right there.
 		assert_eq!(
 			policy
-				.requeue(MaintenanceOperation::SecondaryIndexBackfill, &slabs)
+				.requeue(
+					MaintenanceOperation::SecondaryIndexBackfill,
+					&slabs,
+					MaintenanceFingerprint {
+						version: MAINTENANCE_FINGERPRINT_VERSION,
+						digest: [0; 32],
+					}
+				)
 				.await,
 			Err(RequeueRefusal::NotQuarantined)
 		);
 
-		assert_eq!(policy.requeue(OP, &slabs).await, Ok(1));
+		let expected = policy.quarantine_fingerprint_for_test(OP, &slabs).unwrap();
+		assert_eq!(policy.requeue(OP, &slabs, expected).await, Ok(1));
 		assert_admits_op(&policy, OP, &slabs);
 		assert_eq!(
 			policy
@@ -2514,6 +2535,303 @@ mod tests {
 			Some(AdmissionRefusal::Quarantined)
 		);
 		assert_admits_op(&reloaded, OP, &slabs);
+	}
+
+	fn quarantined_receipt(detail: &str) -> DeterministicReceipt {
+		let first = DeterministicReceipt::after_failure(None, 1_000, detail).unwrap();
+		let second = DeterministicReceipt::after_failure(Some(&first), 2_000, detail).unwrap();
+		DeterministicReceipt::after_failure(Some(&second), 3_000, detail).unwrap()
+	}
+
+	/// ADR 0582: an item is one complete work identity, never one receipt. With a
+	/// one-item page, two origins for one operation/slab set must remain together;
+	/// otherwise the fingerprint would authorize clearing an origin the page hid.
+	#[tokio::test]
+	async fn report_paging_never_splits_one_work_identity() {
+		let clock = Arc::new(ManualClock::at(10_000));
+		let (policy, store) = enabled_policy_with_store(clock).await;
+		drop(policy);
+		let slabs = [SlabId::new(4), SlabId::new(9)];
+		let receipt = quarantined_receipt("shape");
+		for origin in [
+			DeterministicOrigin::LsmInconsistentSourceFrames,
+			DeterministicOrigin::LsmSourceFrameMissingPlannedSurvivor,
+		] {
+			let key = MaintenanceWorkKey::new(OP, slabs, origin).unwrap();
+			store
+				.put_maintenance_receipt(key.encode(), receipt.encode())
+				.await
+				.unwrap();
+		}
+		let other = MaintenanceWorkKey::new(
+			MaintenanceOperation::RetentionPrune,
+			[SlabId::new(12)],
+			DeterministicOrigin::MaintenanceRewriteWithoutClaim,
+		)
+		.unwrap();
+		store
+			.put_maintenance_receipt(other.encode(), receipt.encode())
+			.await
+			.unwrap();
+		let last = MaintenanceWorkKey::new(
+			MaintenanceOperation::TombstoneReclaim,
+			[SlabId::new(20)],
+			DeterministicOrigin::MaintenanceRewriteWithoutClaim,
+		)
+		.unwrap();
+		store
+			.put_maintenance_receipt(last.encode(), receipt.encode())
+			.await
+			.unwrap();
+		let policy = MaintenancePolicyInner::load(store, Arc::new(ManualClock::at(10_000))).await;
+
+		let first = policy
+			.report_page(None, 1, MAINTENANCE_REPORT_MAX_BYTES)
+			.unwrap();
+		assert_eq!(first.items.len(), 1);
+		let MaintenanceReportItem::QuarantinedWork {
+			operation,
+			slabs: reported_slabs,
+			origins,
+			quarantine_fingerprint,
+		} = &first.items[0]
+		else {
+			panic!("the canonical first item is deterministic")
+		};
+		assert_eq!(*operation, OP);
+		assert_eq!(reported_slabs, &slabs);
+		assert_eq!(origins.len(), 2, "the work identity was not split");
+		assert_eq!(
+			quarantine_fingerprint.to_bytes(),
+			[
+				0x01, 0x40, 0x39, 0x50, 0x04, 0xfd, 0xea, 0x3e, 0xb1, 0xb4, 0xa0, 0xfd, 0x04, 0xd5,
+				0x81, 0x16, 0x08, 0x04, 0x3f, 0x5d, 0xe2, 0x76, 0xf9, 0xa1, 0x66, 0xb9, 0x20, 0xb8,
+				0xef, 0xac, 0xa1, 0x66, 0x94,
+			],
+			"fingerprint v1 is deployed schema: change requires a new version"
+		);
+
+		let second = policy
+			.report_page(
+				first.next_cursor.as_deref(),
+				1,
+				MAINTENANCE_REPORT_MAX_BYTES,
+			)
+			.unwrap();
+		assert_eq!(second.items.len(), 1);
+		let second_cursor = second.next_cursor.expect("a third identity remains");
+
+		REPORT_FINGERPRINT_CALLS.with(|calls| calls.set(0));
+		REPORT_DETERMINISTIC_VISITS.with(|visits| visits.set(0));
+		let third = policy
+			.report_page(Some(&second_cursor), 1, MAINTENANCE_REPORT_MAX_BYTES)
+			.unwrap();
+		assert_eq!(third.items.len(), 1);
+		assert!(third.next_cursor.is_none());
+		assert_eq!(
+			REPORT_FINGERPRINT_CALLS.with(std::cell::Cell::get),
+			1,
+			"a later page does not hash earlier work or its cursor identity"
+		);
+		assert_eq!(
+			REPORT_DETERMINISTIC_VISITS.with(std::cell::Cell::get),
+			2,
+			"the map range begins at the cursor identity rather than at the first receipt"
+		);
+	}
+
+	/// A cursor is a snapshot capability, not a live iterator. A report-visible
+	/// reservation invalidates it, and a fresh policy incarnation refuses it even
+	/// when the durable receipt generation happens to start at the same number.
+	#[tokio::test]
+	async fn report_cursor_is_invalidated_by_mutation_and_policy_rehydration() {
+		let clock = Arc::new(ManualClock::at(10_000));
+		let path = temp_index_path("report-cursor");
+		let (policy, store) = enabled_policy_at(&path, clock.clone()).await;
+		drop(policy);
+		for slab in [1_u64, 2] {
+			let key = MaintenanceWorkKey::new(
+				OP,
+				[SlabId::new(slab)],
+				DeterministicOrigin::LsmInconsistentSourceFrames,
+			)
+			.unwrap();
+			store
+				.put_maintenance_receipt(key.encode(), quarantined_receipt("shape").encode())
+				.await
+				.unwrap();
+		}
+		let policy = MaintenancePolicyInner::load(Arc::clone(&store), clock.clone()).await;
+		let page = policy
+			.report_page(None, 1, MAINTENANCE_REPORT_MAX_BYTES)
+			.unwrap();
+		let cursor = page.next_cursor.expect("two identities require a cursor");
+
+		let reservation = policy
+			.reserve(MaintenanceOperation::RetentionPrune, &[SlabId::new(99)])
+			.unwrap();
+		assert_eq!(
+			policy.report_page(Some(&cursor), 1, MAINTENANCE_REPORT_MAX_BYTES),
+			Err(MaintenanceReportPageError::StaleCursor)
+		);
+		reservation.finalize();
+
+		let fresh_page = policy
+			.report_page(None, 1, MAINTENANCE_REPORT_MAX_BYTES)
+			.unwrap();
+		let pre_reopen_cursor = fresh_page.next_cursor.unwrap();
+		drop(policy);
+		let store = reopen_store(store, &path).await;
+		let reopened = MaintenancePolicyInner::load(store, clock).await;
+		assert_eq!(
+			reopened.report_page(Some(&pre_reopen_cursor), 1, MAINTENANCE_REPORT_MAX_BYTES),
+			Err(MaintenanceReportPageError::StaleCursor)
+		);
+	}
+
+	/// ADR 0582 step 4a: accepting the reviewed fingerprint reserves the slab set
+	/// before durable deletion. A concurrent attempt is refused before its body;
+	/// once deletion and release complete, the next attempt enters and records a
+	/// fresh first failure normally.
+	#[tokio::test]
+	async fn compare_and_clear_reserves_between_validation_and_durable_delete() {
+		let clock = Arc::new(ManualClock::at(1_000_000));
+		let (policy, _store) = enabled_policy_with_store(clock.clone()).await;
+		let slabs = [SlabId::new(71)];
+		for attempt in 1..=3_u64 {
+			clock.set(attempt * 10_000_000);
+			fail_deterministically(&policy, &slabs).await;
+		}
+		let expected = policy.quarantine_fingerprint_for_test(OP, &slabs).unwrap();
+		let prepared = policy
+			.prepare_requeue(OP, slabs.to_vec(), expected)
+			.expect("the reviewed quarantine is reserved");
+
+		let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let body_flag = Arc::clone(&entered);
+		let refused = policy
+			.execute(OP, &slabs, classify_io_error, rewrote, move || async move {
+				body_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+				Err::<(), _>(det_err("must not run"))
+			})
+			.await;
+		assert!(matches!(
+			refused,
+			MaintenanceAttempt::Skipped(AdmissionRefusal::AlreadyInFlight)
+		));
+		assert!(!entered.load(std::sync::atomic::Ordering::SeqCst));
+
+		assert_eq!(policy.commit_requeue(prepared).await, Ok(1));
+		let body_flag = Arc::clone(&entered);
+		let attempted = policy
+			.execute(OP, &slabs, classify_io_error, rewrote, move || async move {
+				body_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+				Err::<(), _>(det_err("fresh failure"))
+			})
+			.await;
+		assert!(matches!(attempted, MaintenanceAttempt::Failed(_)));
+		assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+		assert_eq!(receipt_for(&policy, &slabs).unwrap().attempts, 1);
+	}
+
+	#[tokio::test]
+	async fn every_report_visible_policy_mutation_invalidates_a_cursor() {
+		let clock = Arc::new(ManualClock::at(10_000));
+		let (policy, store) = enabled_policy_with_store(clock.clone()).await;
+		drop(policy);
+		for slab in [1_u64, 2] {
+			let key = MaintenanceWorkKey::new(
+				OP,
+				[SlabId::new(slab)],
+				DeterministicOrigin::LsmInconsistentSourceFrames,
+			)
+			.unwrap();
+			store
+				.put_maintenance_receipt(key.encode(), quarantined_receipt("shape").encode())
+				.await
+				.unwrap();
+		}
+		let policy = MaintenancePolicyInner::load(store, clock.clone()).await;
+		let cursor = || {
+			policy
+				.report_page(None, 1, MAINTENANCE_REPORT_MAX_BYTES)
+				.unwrap()
+				.next_cursor
+				.expect("the fixture always has a second item")
+		};
+		let assert_stale = |cursor: &[u8]| {
+			assert_eq!(
+				policy.report_page(Some(cursor), 1, MAINTENANCE_REPORT_MAX_BYTES),
+				Err(MaintenanceReportPageError::StaleCursor)
+			);
+		};
+
+		let before_retryable = cursor();
+		let retryable = policy
+			.execute(
+				MaintenanceOperation::RetentionPrune,
+				&[SlabId::new(40)],
+				|_| MaintenanceFailureClass::Retryable,
+				rewrote,
+				|| async { Err::<(), _>(race_err()) },
+			)
+			.await;
+		assert!(matches!(retryable, MaintenanceAttempt::Failed(_)));
+		assert_stale(&before_retryable);
+
+		let before_receipt = cursor();
+		fail_deterministically(&policy, &[SlabId::new(41)]).await;
+		assert_stale(&before_receipt);
+
+		let before_disable = cursor();
+		policy.disable("test policy disable");
+		assert_stale(&before_disable);
+	}
+
+	#[tokio::test]
+	async fn a_recreated_quarantine_makes_the_reviewed_fingerprint_stale() {
+		let clock = Arc::new(ManualClock::at(1_000_000));
+		let (policy, _store) = enabled_policy_with_store(clock.clone()).await;
+		let slabs = [SlabId::new(81)];
+		for attempt in 1..=3_u64 {
+			clock.set(attempt * 10_000_000);
+			fail_deterministically(&policy, &slabs).await;
+		}
+		let reviewed = policy.quarantine_fingerprint_for_test(OP, &slabs).unwrap();
+		assert_eq!(policy.requeue(OP, &slabs, reviewed).await, Ok(1));
+
+		for attempt in 1..=3_u64 {
+			clock.set(100_000_000 + attempt * 10_000_000);
+			let body = policy
+				.execute(OP, &slabs, classify_io_error, rewrote, || async {
+					Err::<(), _>(det_err("new decision"))
+				})
+				.await;
+			assert!(matches!(body, MaintenanceAttempt::Failed(_)));
+		}
+		let current = policy.quarantine_fingerprint_for_test(OP, &slabs).unwrap();
+		assert_ne!(current, reviewed);
+		assert_eq!(
+			policy.requeue(OP, &slabs, reviewed).await,
+			Err(RequeueRefusal::StaleReport {
+				quarantined_origins: 1
+			})
+		);
+		assert_eq!(
+			policy.quarantine_fingerprint_for_test(OP, &slabs),
+			Some(current),
+			"stale compare-and-clear changed the reviewed state"
+		);
+	}
+
+	#[test]
+	fn unknown_fingerprint_versions_are_refused() {
+		let mut bytes = [0_u8; 33];
+		bytes[0] = MAINTENANCE_FINGERPRINT_VERSION + 1;
+		assert_eq!(
+			MaintenanceFingerprint::from_bytes(&bytes),
+			Err("maintenance fingerprint version is unsupported")
+		);
 	}
 }
 
@@ -3051,6 +3369,8 @@ fn slabs_summary(slabs: &[SlabId]) -> String {
 pub(crate) struct MaintenancePolicyInner {
 	state: std::sync::Mutex<PolicyState>,
 	clock: Arc<dyn MaintenanceClock>,
+	report_incarnation: [u8; 16],
+	report_generation: AtomicU64,
 }
 
 enum PolicyState {
@@ -3073,7 +3393,7 @@ struct MaintenanceTracker {
 	/// Canonical slab sets with an attempt in flight. Prevents two concurrent ticks
 	/// both passing eligibility and both building a working set - which would make
 	/// the three-attempt bound a bound on RECORDED attempts rather than on builds.
-	in_flight: BTreeSet<Vec<SlabId>>,
+	in_flight: BTreeMap<Vec<SlabId>, MaintenanceOperation>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3114,6 +3434,8 @@ impl MaintenancePolicyInner {
 		let policy = Arc::new(Self {
 			state: std::sync::Mutex::new(PolicyState::Disabled { diagnostic }),
 			clock,
+			report_incarnation: *Uuid::new_v4().as_bytes(),
+			report_generation: AtomicU64::new(0),
 		});
 		policy.publish_gauges();
 		policy
@@ -3235,7 +3557,13 @@ impl MaintenancePolicyInner {
 				},
 			}),
 			clock,
+			report_incarnation: *Uuid::new_v4().as_bytes(),
+			report_generation: AtomicU64::new(0),
 		})
+	}
+
+	fn bump_report_generation(&self) {
+		self.report_generation.fetch_add(1, Ordering::AcqRel);
 	}
 
 	/// A poisoned mutex means a panic left this state partially mutated. Recovering
@@ -3251,6 +3579,7 @@ impl MaintenancePolicyInner {
 					*guard = PolicyState::Disabled {
 						diagnostic: "policy state mutex poisoned".to_owned(),
 					};
+					self.bump_report_generation();
 				}
 				guard
 			}
@@ -3279,6 +3608,7 @@ impl MaintenancePolicyInner {
 				"maintenance admission disabled; serving continues"
 			);
 			*state = PolicyState::Disabled { diagnostic };
+			self.bump_report_generation();
 			drop(state);
 			self.publish_gauges();
 		}
@@ -3329,13 +3659,15 @@ impl MaintenanceTracker {
 		self.retryable.get(&operation)?.get(canonical)
 	}
 
-	fn clear_retryable(&mut self, operation: MaintenanceOperation, canonical: &[SlabId]) {
+	fn clear_retryable(&mut self, operation: MaintenanceOperation, canonical: &[SlabId]) -> bool {
+		let mut removed = false;
 		if let Some(per_set) = self.retryable.get_mut(&operation) {
-			per_set.remove(canonical);
+			removed = per_set.remove(canonical).is_some();
 			if per_set.is_empty() {
 				self.retryable.remove(&operation);
 			}
 		}
+		removed
 	}
 
 	/// THE admission decision, shared by the picker's predicate and by `reserve`.
@@ -3359,7 +3691,7 @@ impl MaintenanceTracker {
 		canonical: &[SlabId],
 		now_ms: u64,
 	) -> Option<AdmissionRefusal> {
-		if self.in_flight.contains(canonical) {
+		if self.in_flight.contains_key(canonical) {
 			return Some(AdmissionRefusal::AlreadyInFlight);
 		}
 		let mut refusal = None;
@@ -3422,7 +3754,7 @@ impl MaintenanceReservation {
 		{
 			let mut state = self.policy.lock();
 			if let PolicyState::Enabled { tracker, .. } = &mut *state
-				&& !tracker.in_flight.remove(&self.slabs)
+				&& !tracker.in_flight.remove(&self.slabs).is_some()
 			{
 				// The reservation this guard represents was not held. Something else
 				// released it, which means admission is no longer accounted for.
@@ -3433,8 +3765,10 @@ impl MaintenanceReservation {
 				*state = PolicyState::Disabled {
 					diagnostic: "reservation accounting lost".to_owned(),
 				};
+				self.policy.bump_report_generation();
 				return;
 			}
+			self.policy.bump_report_generation();
 		}
 		self.finalized = true;
 	}
@@ -3459,6 +3793,7 @@ impl Drop for MaintenanceReservation {
 			*state = PolicyState::Disabled {
 				diagnostic: "attempt abandoned before durable outcome".to_owned(),
 			};
+			self.policy.bump_report_generation();
 		}
 	}
 }
@@ -3494,7 +3829,8 @@ impl MaintenancePolicyInner {
 		if let Some(refusal) = tracker.refusal(operation, &canonical, now_ms) {
 			return Err(refusal);
 		}
-		tracker.in_flight.insert(canonical.clone());
+		tracker.in_flight.insert(canonical.clone(), operation);
+		self.bump_report_generation();
 		drop(state);
 		Ok(MaintenanceReservation {
 			policy: Arc::clone(self),
@@ -3525,10 +3861,326 @@ pub(crate) enum RequeueRefusal {
 	InFlight,
 	/// Requeue operates only on quarantined work. Waiting work needs no operator.
 	NotQuarantined,
+	/// The operator reviewed a different receipt set. Nothing was cleared.
+	StaleReport {
+		quarantined_origins: usize,
+	},
 	/// The durable receipt could not be removed. The quarantine stays effective,
 	/// on disk and in memory, and admission is disabled because the store is not
 	/// trustworthy.
 	StoreFailure(String),
+}
+
+struct PreparedRequeue {
+	operation: MaintenanceOperation,
+	canonical: Vec<SlabId>,
+	keys: Vec<MaintenanceWorkKey>,
+	store: Arc<PersistentLocalIndex>,
+	reservation: MaintenanceReservation,
+}
+
+pub(crate) const MAINTENANCE_FINGERPRINT_VERSION: u8 = 1;
+pub(crate) const MAINTENANCE_REPORT_CURSOR_VERSION: u8 = 1;
+pub(crate) const MAINTENANCE_REPORT_MAX_ITEMS: usize = 64;
+pub(crate) const MAINTENANCE_REPORT_MAX_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MaintenanceFingerprint {
+	pub(crate) version: u8,
+	pub(crate) digest: [u8; 32],
+}
+
+impl MaintenanceFingerprint {
+	pub(crate) fn to_bytes(self) -> [u8; 33] {
+		let mut bytes = [0_u8; 33];
+		bytes[0] = self.version;
+		bytes[1..].copy_from_slice(&self.digest);
+		bytes
+	}
+
+	pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
+		if bytes.len() != 33 {
+			return Err("maintenance fingerprint must be exactly 33 bytes");
+		}
+		if bytes[0] != MAINTENANCE_FINGERPRINT_VERSION {
+			return Err("maintenance fingerprint version is unsupported");
+		}
+		let mut digest = [0_u8; 32];
+		digest.copy_from_slice(&bytes[1..]);
+		Ok(Self {
+			version: bytes[0],
+			digest,
+		})
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MaintenanceOriginView {
+	pub(crate) origin: DeterministicOrigin,
+	pub(crate) reason: DeterministicFailureReason,
+	pub(crate) attempts: u32,
+	pub(crate) last_failure_ms: u64,
+	pub(crate) next_eligible_at_ms: Option<u64>,
+	pub(crate) detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MaintenanceReportItem {
+	QuarantinedWork {
+		operation: MaintenanceOperation,
+		slabs: Vec<SlabId>,
+		origins: Vec<MaintenanceOriginView>,
+		quarantine_fingerprint: MaintenanceFingerprint,
+	},
+	RetryableCooldown {
+		operation: MaintenanceOperation,
+		slabs: Vec<SlabId>,
+		consecutive_failures: u32,
+		next_eligible_at_ms: u64,
+	},
+	InFlight {
+		operation: MaintenanceOperation,
+		slabs: Vec<SlabId>,
+	},
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MaintenanceReportPosition {
+	QuarantinedWork(MaintenanceOperation, Vec<SlabId>),
+	Retryable(MaintenanceOperation, Vec<SlabId>),
+	InFlight(MaintenanceOperation, Vec<SlabId>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MaintenanceReportPage {
+	pub(crate) enabled: bool,
+	pub(crate) diagnostic: Option<String>,
+	pub(crate) incarnation: [u8; 16],
+	pub(crate) generation: u64,
+	pub(crate) items: Vec<MaintenanceReportItem>,
+	pub(crate) next_cursor: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MaintenanceReportPageError {
+	InvalidCursor(String),
+	StaleCursor,
+	InvalidBound(String),
+}
+
+fn quarantine_fingerprint(
+	operation: MaintenanceOperation,
+	slabs: &[SlabId],
+	origins: &[(DeterministicOrigin, &DeterministicReceipt)],
+) -> MaintenanceFingerprint {
+	#[cfg(test)]
+	REPORT_FINGERPRINT_CALLS.with(|calls| calls.set(calls.get() + 1));
+	const DOMAIN: &[u8] = b"nilket:maintenance-quarantine:v1\0";
+	let mut canonical =
+		Vec::with_capacity(DOMAIN.len() + 2 + 4 + slabs.len() * 8 + 2 + origins.len() * 32);
+	canonical.extend_from_slice(DOMAIN);
+	canonical.extend_from_slice(&operation.code().to_be_bytes());
+	canonical.extend_from_slice(&(slabs.len() as u32).to_be_bytes());
+	for slab in slabs {
+		canonical.extend_from_slice(&slab.get().to_be_bytes());
+	}
+	canonical.extend_from_slice(&(origins.len() as u16).to_be_bytes());
+	for (origin, receipt) in origins {
+		canonical.extend_from_slice(&origin.code().to_be_bytes());
+		canonical.extend_from_slice(&receipt.attempts().to_be_bytes());
+		canonical.extend_from_slice(&receipt.last_failure_ms.to_be_bytes());
+		match receipt.next_eligible_at_ms {
+			Some(deadline) => {
+				canonical.push(1);
+				canonical.extend_from_slice(&deadline.to_be_bytes());
+			}
+			None => canonical.push(0),
+		}
+		let detail = receipt.detail().as_bytes();
+		canonical.extend_from_slice(&(detail.len() as u16).to_be_bytes());
+		canonical.extend_from_slice(detail);
+	}
+	MaintenanceFingerprint {
+		version: MAINTENANCE_FINGERPRINT_VERSION,
+		digest: crate::hash::sha256::digest(&canonical),
+	}
+}
+
+#[cfg(test)]
+std::thread_local! {
+	static REPORT_FINGERPRINT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+	static REPORT_DETERMINISTIC_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn encode_report_cursor(
+	incarnation: [u8; 16],
+	generation: u64,
+	position: &MaintenanceReportPosition,
+) -> Vec<u8> {
+	let (kind, operation, slabs) = match position {
+		MaintenanceReportPosition::QuarantinedWork(operation, slabs) => {
+			(0, operation.code(), slabs)
+		}
+		MaintenanceReportPosition::Retryable(operation, slabs) => (1, operation.code(), slabs),
+		MaintenanceReportPosition::InFlight(operation, slabs) => (2, operation.code(), slabs),
+	};
+	let mut bytes = Vec::with_capacity(32 + slabs.len() * 8);
+	bytes.push(MAINTENANCE_REPORT_CURSOR_VERSION);
+	bytes.extend_from_slice(&incarnation);
+	bytes.extend_from_slice(&generation.to_be_bytes());
+	bytes.push(kind);
+	bytes.extend_from_slice(&operation.to_be_bytes());
+	bytes.extend_from_slice(&(slabs.len() as u32).to_be_bytes());
+	for slab in slabs {
+		bytes.extend_from_slice(&slab.get().to_be_bytes());
+	}
+	bytes
+}
+
+fn decode_report_cursor(
+	bytes: &[u8],
+) -> Result<([u8; 16], u64, MaintenanceReportPosition), MaintenanceReportPageError> {
+	const HEADER: usize = 1 + 16 + 8 + 1 + 2 + 4;
+	if bytes.len() < HEADER {
+		return Err(MaintenanceReportPageError::InvalidCursor(
+			"maintenance report cursor is truncated".to_owned(),
+		));
+	}
+	if bytes[0] != MAINTENANCE_REPORT_CURSOR_VERSION {
+		return Err(MaintenanceReportPageError::InvalidCursor(
+			"maintenance report cursor version is unsupported".to_owned(),
+		));
+	}
+	let mut incarnation = [0_u8; 16];
+	incarnation.copy_from_slice(&bytes[1..17]);
+	let generation = u64::from_be_bytes(bytes[17..25].try_into().expect("fixed slice"));
+	let kind = bytes[25];
+	let operation_code = u16::from_be_bytes(bytes[26..28].try_into().expect("fixed slice"));
+	let slab_count = u32::from_be_bytes(bytes[28..32].try_into().expect("fixed slice")) as usize;
+	if slab_count > MAX_RECEIPT_KEY_SLABS || bytes.len() != HEADER + slab_count * 8 {
+		return Err(MaintenanceReportPageError::InvalidCursor(
+			"maintenance report cursor slab set is malformed".to_owned(),
+		));
+	}
+	let mut slabs = Vec::with_capacity(slab_count);
+	for chunk in bytes[HEADER..].chunks_exact(8) {
+		slabs.push(SlabId::new(u64::from_be_bytes(
+			chunk.try_into().expect("fixed chunk"),
+		)));
+	}
+	if slabs.windows(2).any(|pair| pair[0] >= pair[1]) {
+		return Err(MaintenanceReportPageError::InvalidCursor(
+			"maintenance report cursor slabs are not canonical".to_owned(),
+		));
+	}
+	let position = match kind {
+		0 | 1 => {
+			let operation = MaintenanceOperation::from_code(operation_code).ok_or_else(|| {
+				MaintenanceReportPageError::InvalidCursor(
+					"maintenance report cursor operation is unknown".to_owned(),
+				)
+			})?;
+			if kind == 0 {
+				MaintenanceReportPosition::QuarantinedWork(operation, slabs)
+			} else {
+				MaintenanceReportPosition::Retryable(operation, slabs)
+			}
+		}
+		2 => {
+			let operation = MaintenanceOperation::from_code(operation_code).ok_or_else(|| {
+				MaintenanceReportPageError::InvalidCursor(
+					"maintenance report cursor operation is unknown".to_owned(),
+				)
+			})?;
+			MaintenanceReportPosition::InFlight(operation, slabs)
+		}
+		_ => {
+			return Err(MaintenanceReportPageError::InvalidCursor(
+				"maintenance report cursor kind is unknown".to_owned(),
+			));
+		}
+	};
+	Ok((incarnation, generation, position))
+}
+
+fn report_item_estimated_bytes(item: &MaintenanceReportItem) -> usize {
+	const ITEM_OVERHEAD: usize = 64;
+	match item {
+		MaintenanceReportItem::QuarantinedWork { slabs, origins, .. } => {
+			ITEM_OVERHEAD
+				+ slabs.len() * 10
+				+ origins
+					.iter()
+					.map(|origin| 48 + origin.detail.len())
+					.sum::<usize>()
+		}
+		MaintenanceReportItem::RetryableCooldown { slabs, .. }
+		| MaintenanceReportItem::InFlight { slabs, .. } => ITEM_OVERHEAD + slabs.len() * 10,
+	}
+}
+
+fn try_push_report_item(
+	after: Option<&MaintenanceReportPosition>,
+	max_items: usize,
+	max_bytes: usize,
+	position: MaintenanceReportPosition,
+	item: MaintenanceReportItem,
+	items: &mut Vec<MaintenanceReportItem>,
+	used_bytes: &mut usize,
+	last_position: &mut Option<MaintenanceReportPosition>,
+	has_more: &mut bool,
+) -> bool {
+	if after.is_some_and(|after| position <= *after) {
+		return true;
+	}
+	let item_bytes = report_item_estimated_bytes(&item);
+	if items.len() == max_items || used_bytes.saturating_add(item_bytes) > max_bytes {
+		*has_more = true;
+		return false;
+	}
+	*used_bytes += item_bytes;
+	*last_position = Some(position);
+	items.push(item);
+	true
+}
+
+fn quarantined_report_item(
+	operation: MaintenanceOperation,
+	slabs: Vec<SlabId>,
+	mut origins: Vec<MaintenanceOriginView>,
+) -> Option<(MaintenanceReportPosition, MaintenanceReportItem)> {
+	origins.retain(|origin| origin.next_eligible_at_ms.is_none());
+	if origins.is_empty() {
+		return None;
+	}
+	let quarantined = origins
+		.iter()
+		.map(|origin| {
+			(
+				origin.origin,
+				DeterministicReceipt {
+					attempts: origin.attempts,
+					last_failure_ms: origin.last_failure_ms,
+					next_eligible_at_ms: origin.next_eligible_at_ms,
+					detail: origin.detail.clone(),
+				},
+			)
+		})
+		.collect::<Vec<_>>();
+	let borrowed = quarantined
+		.iter()
+		.map(|(origin, receipt)| (*origin, receipt))
+		.collect::<Vec<_>>();
+	let fingerprint = quarantine_fingerprint(operation, &slabs, &borrowed);
+	Some((
+		MaintenanceReportPosition::QuarantinedWork(operation, slabs.clone()),
+		MaintenanceReportItem::QuarantinedWork {
+			operation,
+			slabs,
+			origins,
+			quarantine_fingerprint: fingerprint,
+		},
+	))
 }
 
 /// Operator-facing view of one receipt: the slab set and the reason, so a
@@ -3574,6 +4226,242 @@ impl MaintenancePolicyReport {
 }
 
 impl MaintenancePolicyInner {
+	#[cfg(test)]
+	pub(crate) fn quarantine_fingerprint_for_test(
+		&self,
+		operation: MaintenanceOperation,
+		slabs: &[SlabId],
+	) -> Option<MaintenanceFingerprint> {
+		let canonical = MaintenanceTracker::canonical(slabs);
+		let state = self.lock();
+		let PolicyState::Enabled { tracker, .. } = &*state else {
+			return None;
+		};
+		let entries = tracker
+			.deterministic
+			.iter()
+			.filter(|(key, receipt)| {
+				key.operation() == operation
+					&& key.slabs() == canonical.as_slice()
+					&& receipt.is_quarantined()
+			})
+			.map(|(key, receipt)| (key.origin(), receipt))
+			.collect::<Vec<_>>();
+		(!entries.is_empty()).then(|| quarantine_fingerprint(operation, &canonical, &entries))
+	}
+
+	pub(crate) fn report_page(
+		&self,
+		cursor: Option<&[u8]>,
+		max_items: usize,
+		max_bytes: usize,
+	) -> Result<MaintenanceReportPage, MaintenanceReportPageError> {
+		if max_items == 0 || max_items > MAINTENANCE_REPORT_MAX_ITEMS {
+			return Err(MaintenanceReportPageError::InvalidBound(format!(
+				"maintenance report item bound must be 1..={MAINTENANCE_REPORT_MAX_ITEMS}"
+			)));
+		}
+		if max_bytes == 0 || max_bytes > MAINTENANCE_REPORT_MAX_BYTES {
+			return Err(MaintenanceReportPageError::InvalidBound(format!(
+				"maintenance report byte bound must be 1..={MAINTENANCE_REPORT_MAX_BYTES}"
+			)));
+		}
+
+		let decoded_cursor = cursor.map(decode_report_cursor).transpose()?;
+		let state = self.lock();
+		let generation = self.report_generation.load(Ordering::Acquire);
+		let after = match decoded_cursor {
+			Some((incarnation, cursor_generation, position)) => {
+				if incarnation != self.report_incarnation || cursor_generation != generation {
+					return Err(MaintenanceReportPageError::StaleCursor);
+				}
+				Some(position)
+			}
+			None => None,
+		};
+		let PolicyState::Enabled { tracker, .. } = &*state else {
+			let PolicyState::Disabled { diagnostic } = &*state else {
+				unreachable!("state is one of two variants");
+			};
+			return Ok(MaintenanceReportPage {
+				enabled: false,
+				diagnostic: Some(diagnostic.clone()),
+				incarnation: self.report_incarnation,
+				generation,
+				items: Vec::new(),
+				next_cursor: None,
+			});
+		};
+
+		let mut items = Vec::new();
+		let mut used_bytes = 128_usize;
+		let mut last_position = None;
+		let mut has_more = false;
+
+		let mut group_operation = None;
+		let mut group_slabs = Vec::new();
+		let mut group_origins = Vec::new();
+
+		// The deterministic map is ordered by operation, slabs, then origin. Resume
+		// at the cursor's work identity and discard only that identity's bounded
+		// origin suffix BEFORE grouping or hashing it. Later report variants skip
+		// the deterministic map entirely. A page therefore does not repeat all
+		// receipt hashing from the beginning while holding the admission lock.
+		let deterministic: Box<
+			dyn Iterator<Item = (&MaintenanceWorkKey, &DeterministicReceipt)> + '_,
+		> = match after.as_ref() {
+			None => Box::new(tracker.deterministic.iter()),
+			Some(MaintenanceReportPosition::QuarantinedWork(operation, slabs)) => {
+				let start = MaintenanceWorkKey {
+					operation: *operation,
+					slabs: slabs.clone(),
+					origin: DeterministicOrigin::LsmWriterCannotSplitMultiRowFrame,
+				};
+				Box::new(tracker.deterministic.range(start..))
+			}
+			Some(MaintenanceReportPosition::Retryable(..))
+			| Some(MaintenanceReportPosition::InFlight(..)) => Box::new(std::iter::empty()),
+		};
+		for (key, receipt) in deterministic {
+			#[cfg(test)]
+			REPORT_DETERMINISTIC_VISITS.with(|visits| visits.set(visits.get() + 1));
+			if matches!(
+				after.as_ref(),
+				Some(MaintenanceReportPosition::QuarantinedWork(operation, slabs))
+					if *operation == key.operation() && slabs.as_slice() == key.slabs()
+			) {
+				continue;
+			}
+			let changed = group_operation.is_some_and(|operation| {
+				operation != key.operation() || group_slabs.as_slice() != key.slabs()
+			});
+			if changed {
+				let grouped = quarantined_report_item(
+					group_operation.expect("a changed group has an operation"),
+					std::mem::take(&mut group_slabs),
+					std::mem::take(&mut group_origins),
+				);
+				if let Some((position, item)) = grouped
+					&& !try_push_report_item(
+						after.as_ref(),
+						max_items,
+						max_bytes,
+						position,
+						item,
+						&mut items,
+						&mut used_bytes,
+						&mut last_position,
+						&mut has_more,
+					) {
+					break;
+				}
+			}
+			if has_more {
+				break;
+			}
+			if group_operation != Some(key.operation()) || group_slabs.as_slice() != key.slabs() {
+				group_operation = Some(key.operation());
+				group_slabs = key.slabs().to_vec();
+			}
+			group_origins.push(MaintenanceOriginView {
+				origin: key.origin(),
+				reason: key.reason(),
+				attempts: receipt.attempts(),
+				last_failure_ms: receipt.last_failure_ms,
+				next_eligible_at_ms: receipt.next_eligible_at_ms,
+				detail: receipt.detail().to_owned(),
+			});
+		}
+		if !has_more && let Some(operation) = group_operation {
+			if let Some((position, item)) =
+				quarantined_report_item(operation, group_slabs, group_origins)
+			{
+				let _ = try_push_report_item(
+					after.as_ref(),
+					max_items,
+					max_bytes,
+					position,
+					item,
+					&mut items,
+					&mut used_bytes,
+					&mut last_position,
+					&mut has_more,
+				);
+			}
+		}
+
+		if !has_more {
+			'outer_retryable: for (operation, per_set) in &tracker.retryable {
+				for (slabs, cooldown) in per_set {
+					let position = MaintenanceReportPosition::Retryable(*operation, slabs.clone());
+					let item = MaintenanceReportItem::RetryableCooldown {
+						operation: *operation,
+						slabs: slabs.clone(),
+						consecutive_failures: cooldown.failures,
+						next_eligible_at_ms: cooldown.next_eligible_at_ms,
+					};
+					if !try_push_report_item(
+						after.as_ref(),
+						max_items,
+						max_bytes,
+						position,
+						item,
+						&mut items,
+						&mut used_bytes,
+						&mut last_position,
+						&mut has_more,
+					) {
+						break 'outer_retryable;
+					}
+				}
+			}
+		}
+		if !has_more {
+			let mut in_flight = tracker
+				.in_flight
+				.iter()
+				.map(|(slabs, operation)| (*operation, slabs))
+				.collect::<Vec<_>>();
+			in_flight.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
+			for (operation, slabs) in in_flight {
+				let position = MaintenanceReportPosition::InFlight(operation, slabs.clone());
+				let item = MaintenanceReportItem::InFlight {
+					operation,
+					slabs: slabs.clone(),
+				};
+				if !try_push_report_item(
+					after.as_ref(),
+					max_items,
+					max_bytes,
+					position,
+					item,
+					&mut items,
+					&mut used_bytes,
+					&mut last_position,
+					&mut has_more,
+				) {
+					break;
+				}
+			}
+		}
+
+		let next_cursor = if has_more {
+			last_position
+				.as_ref()
+				.map(|position| encode_report_cursor(self.report_incarnation, generation, position))
+		} else {
+			None
+		};
+		Ok(MaintenanceReportPage {
+			enabled: true,
+			diagnostic: None,
+			incarnation: self.report_incarnation,
+			generation,
+			items,
+			next_cursor,
+		})
+	}
+
 	/// ADR 0097 decision 4: the ONE path a maintenance attempt takes.
 	///
 	/// Pick provisionally elsewhere; here: reserve atomically, execute with no
@@ -3677,7 +4565,9 @@ impl MaintenancePolicyInner {
 				reservation.finalize();
 				return;
 			};
-			tracker.clear_retryable(operation, &slabs);
+			if tracker.clear_retryable(operation, &slabs) {
+				self.bump_report_generation();
+			}
 			let keys = tracker
 				.deterministic
 				.keys()
@@ -3700,6 +4590,7 @@ impl MaintenancePolicyInner {
 				for key in &keys {
 					tracker.deterministic.remove(key);
 				}
+				self.bump_report_generation();
 			}
 		}
 		reservation.finalize();
@@ -3756,6 +4647,7 @@ impl MaintenancePolicyInner {
 								.entry(operation)
 								.or_default()
 								.insert(slabs, cooldown);
+							self.bump_report_generation();
 						}
 						None => {
 							drop(state);
@@ -3780,7 +4672,9 @@ impl MaintenancePolicyInner {
 					let mut state = self.lock();
 					match &mut *state {
 						PolicyState::Enabled { tracker, store } => {
-							tracker.clear_retryable(operation, &slabs);
+							if tracker.clear_retryable(operation, &slabs) {
+								self.bump_report_generation();
+							}
 							(tracker.deterministic.get(&key).cloned(), Arc::clone(store))
 						}
 						PolicyState::Disabled { .. } => {
@@ -3826,6 +4720,7 @@ impl MaintenancePolicyInner {
 				let mut state = self.lock();
 				if let PolicyState::Enabled { tracker, .. } = &mut *state {
 					tracker.deterministic.insert(key, receipt);
+					self.bump_report_generation();
 				}
 				quarantined
 			}
@@ -3846,20 +4741,34 @@ impl MaintenancePolicyInner {
 		self: &Arc<Self>,
 		operation: MaintenanceOperation,
 		slabs: &[SlabId],
+		expected: MaintenanceFingerprint,
 	) -> Result<usize, RequeueRefusal> {
 		let canonical = MaintenanceTracker::canonical(slabs);
-		let (keys, store) = {
-			let state = self.lock();
-			let PolicyState::Enabled { tracker, store } = &*state else {
+		let prepared = self.prepare_requeue(operation, canonical, expected)?;
+		self.commit_requeue(prepared).await
+	}
+
+	/// Step 3 of ADR 0582's compare-and-clear sequence. Validation and
+	/// reservation are one critical section, so no maintenance body over the slab
+	/// set can enter after the reviewed fingerprint is accepted.
+	fn prepare_requeue(
+		self: &Arc<Self>,
+		operation: MaintenanceOperation,
+		canonical: Vec<SlabId>,
+		expected: MaintenanceFingerprint,
+	) -> Result<PreparedRequeue, RequeueRefusal> {
+		let (keys, store, reservation) = {
+			let mut state = self.lock();
+			let PolicyState::Enabled { tracker, store } = &mut *state else {
 				let PolicyState::Disabled { diagnostic } = &*state else {
 					unreachable!("state is one of two variants");
 				};
 				return Err(RequeueRefusal::PolicyDisabled(diagnostic.clone()));
 			};
-			if tracker.in_flight.contains(&canonical) {
+			if tracker.in_flight.contains_key(&canonical) {
 				return Err(RequeueRefusal::InFlight);
 			}
-			let keys = tracker
+			let entries = tracker
 				.deterministic
 				.iter()
 				.filter(|(key, receipt)| {
@@ -3867,17 +4776,58 @@ impl MaintenancePolicyInner {
 						&& key.slabs() == canonical.as_slice()
 						&& receipt.is_quarantined()
 				})
-				.map(|(key, _)| key.clone())
+				.map(|(key, receipt)| (key.clone(), receipt.clone()))
 				.collect::<Vec<_>>();
-			if keys.is_empty() {
+			if entries.is_empty() {
 				return Err(RequeueRefusal::NotQuarantined);
 			}
-			(keys, Arc::clone(store))
+			let fingerprint_entries = entries
+				.iter()
+				.map(|(key, receipt)| (key.origin(), receipt))
+				.collect::<Vec<_>>();
+			let current = quarantine_fingerprint(operation, &canonical, &fingerprint_entries);
+			if current != expected {
+				return Err(RequeueRefusal::StaleReport {
+					quarantined_origins: entries.len(),
+				});
+			}
+			let keys = entries.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+			tracker.in_flight.insert(canonical.clone(), operation);
+			self.bump_report_generation();
+			let reservation = MaintenanceReservation {
+				policy: Arc::clone(self),
+				operation,
+				slabs: canonical.clone(),
+				finalized: false,
+			};
+			(keys, Arc::clone(store), reservation)
 		};
+		Ok(PreparedRequeue {
+			operation,
+			canonical,
+			keys,
+			store,
+			reservation,
+		})
+	}
+
+	/// Steps 4 and 5: delete durably, then clear memory and release.
+	async fn commit_requeue(
+		self: &Arc<Self>,
+		prepared: PreparedRequeue,
+	) -> Result<usize, RequeueRefusal> {
+		let PreparedRequeue {
+			operation,
+			canonical,
+			keys,
+			store,
+			reservation,
+		} = prepared;
 		let encoded = keys.iter().map(MaintenanceWorkKey::encode).collect();
 		if let Err(error) = store.delete_maintenance_receipts(encoded).await {
 			let diagnostic = format!("requeue could not remove the durable receipt: {error}");
 			self.disable(diagnostic.clone());
+			reservation.finalize();
 			return Err(RequeueRefusal::StoreFailure(diagnostic));
 		}
 		let mut state = self.lock();
@@ -3886,7 +4836,9 @@ impl MaintenancePolicyInner {
 				tracker.deterministic.remove(key);
 			}
 		}
+		self.bump_report_generation();
 		drop(state);
+		reservation.finalize();
 		tracing::info!(
 			operation = operation.label(),
 			slabs = ?canonical,
@@ -3939,15 +4891,13 @@ impl MaintenancePolicyInner {
 						next_eligible_at_ms: cooldown.next_eligible_at_ms,
 					})
 					.collect(),
-				in_flight: tracker.in_flight.iter().cloned().collect(),
+				in_flight: tracker.in_flight.keys().cloned().collect(),
 			},
 		}
 	}
 
-	/// Gauges are set from the state, never incremented alongside it, so they
-	/// cannot drift from what the accessor reports.
-	pub(crate) fn publish_gauges(&self) {
-		let (enabled, quarantined) = match &*self.lock() {
+	fn gauge_values(&self) -> (bool, u64) {
+		match &*self.lock() {
 			PolicyState::Disabled { .. } => (false, 0),
 			PolicyState::Enabled { tracker, .. } => (
 				true,
@@ -3957,9 +4907,46 @@ impl MaintenancePolicyInner {
 					.filter(|receipt| receipt.is_quarantined())
 					.count() as u64,
 			),
-		};
-		crate::metrics::global().set_maintenance_policy_state(enabled, quarantined);
+		}
 	}
+
+	fn publish_gauges_locked(&self) -> (u64, u64) {
+		let (enabled, quarantined) = self.gauge_values();
+		let metrics = crate::metrics::global();
+		metrics.set_maintenance_policy_state(enabled, quarantined);
+		(
+			metrics.maintenance_policy_enabled.get(),
+			metrics.maintenance_quarantined_work.get(),
+		)
+	}
+
+	/// Gauges are set from the state, never incremented alongside it, so they
+	/// cannot drift from what the accessor reports.
+	pub(crate) fn publish_gauges(&self) {
+		#[cfg(test)]
+		let _serial = maintenance_gauge_test_lock()
+			.lock()
+			.expect("maintenance gauge test lock poisoned");
+		let _ = self.publish_gauges_locked();
+	}
+
+	/// Publish this policy and read the two process-global gauges as one serialized
+	/// test operation. Every test-build publisher takes the same lock, so another
+	/// concurrently hydrated policy cannot overwrite the values between the set and
+	/// the assertions.
+	#[cfg(test)]
+	pub(crate) fn gauge_snapshot_for_test(&self) -> (u64, u64) {
+		let _serial = maintenance_gauge_test_lock()
+			.lock()
+			.expect("maintenance gauge test lock poisoned");
+		self.publish_gauges_locked()
+	}
+}
+
+#[cfg(test)]
+fn maintenance_gauge_test_lock() -> &'static std::sync::Mutex<()> {
+	static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+	LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 /// Bounded label for the attempt counter. One value per way an attempt can end,

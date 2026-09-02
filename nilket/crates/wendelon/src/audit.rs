@@ -97,6 +97,8 @@ pub enum AuditOperation {
 	TenantSuspended,
 	TenantResumed,
 	TenantDeleteRequested,
+	MaintenanceRequeueAttempt,
+	MaintenanceRequeueCompletion,
 	AuditChainRoot,
 	AuditSinkFailure,
 }
@@ -141,6 +143,8 @@ impl AuditOperation {
 			Self::TenantSuspended => "tenant.suspended",
 			Self::TenantResumed => "tenant.resumed",
 			Self::TenantDeleteRequested => "tenant.delete_requested",
+			Self::MaintenanceRequeueAttempt => "maintenance.requeue_attempt",
+			Self::MaintenanceRequeueCompletion => "maintenance.requeue_completion",
 			Self::AuditChainRoot => AUDIT_CHAIN_ROOT_OPERATION,
 			Self::AuditSinkFailure => AUDIT_SINK_FAILURE_OPERATION,
 		}
@@ -200,6 +204,8 @@ impl<'de> Deserialize<'de> for AuditOperation {
 			"tenant.suspended" => Ok(Self::TenantSuspended),
 			"tenant.resumed" => Ok(Self::TenantResumed),
 			"tenant.delete_requested" => Ok(Self::TenantDeleteRequested),
+			"maintenance.requeue_attempt" => Ok(Self::MaintenanceRequeueAttempt),
+			"maintenance.requeue_completion" => Ok(Self::MaintenanceRequeueCompletion),
 			"audit.chain_root" => Ok(Self::AuditChainRoot),
 			"audit.sink_failure" => Ok(Self::AuditSinkFailure),
 			other => Err(serde::de::Error::custom(format!(
@@ -265,6 +271,7 @@ pub enum AdministrativeControlAction {
 	TenantKekRetire,
 	ActorKeyRevoke,
 	BreakGlassIssue,
+	MaintenanceRequeue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

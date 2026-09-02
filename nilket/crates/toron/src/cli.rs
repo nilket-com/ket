@@ -14,6 +14,8 @@ use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+mod maintenance;
+
 const DEFAULT_SQL_ENDPOINT: &str = "127.0.0.1:7742";
 const DEFAULT_INSPECT_ENDPOINT: &str = "127.0.0.1:7781";
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -185,6 +187,7 @@ where
 			ExitCode::from(2)
 		}
 		[verb, rest @ ..] if verb == "inspect" => run_inspect(rest),
+		[verb, rest @ ..] if verb == "maintenance" => maintenance::run(rest),
 		[unknown, ..] => {
 			eprintln!("unknown toron command: {unknown}");
 			print_usage(program);
@@ -833,7 +836,7 @@ fn format_batches_for_display(batches: &[RecordBatch]) -> Result<String, arrow::
 
 fn print_usage(program: &str) {
 	eprintln!(
-		"usage:\n  {program} start <path/to/toron.toml>\n  {program} --print-example-config\n  {program} --write-example-config <path>\n  {program} sql [--endpoint <socket-addr>] [--timezone <iana-timezone>] [--server-name <dns-name>] [--cert <path>] [--key <path>] [--ca <path>] <statement...>\n  {program} sql [--endpoint <socket-addr>] [--timezone <iana-timezone>] [--server-name <dns-name>] [--cert <path>] [--key <path>] [--ca <path>] (--file|-f) <path>\n  {program} inspect [--endpoint <socket-addr>] --server-name <dns-name> --cert <path> --key <path> --ca <path> [--json]"
+		"usage:\n  {program} start <path/to/toron.toml>\n  {program} --print-example-config\n  {program} --write-example-config <path>\n  {program} sql [--endpoint <socket-addr>] [--timezone <iana-timezone>] [--server-name <dns-name>] [--cert <path>] [--key <path>] [--ca <path>] <statement...>\n  {program} sql [--endpoint <socket-addr>] [--timezone <iana-timezone>] [--server-name <dns-name>] [--cert <path>] [--key <path>] [--ca <path>] (--file|-f) <path>\n  {program} inspect [--endpoint <socket-addr>] --server-name <dns-name> --cert <path> --key <path> --ca <path> [--json]\n  {program} maintenance report --bootstrap <node-id>@<socket-addr> --node <node-id> --cert <path> --key <path> --ca <path> [--cluster-domain <domain>] [--page-items <count>] [--json]\n  {program} maintenance requeue --bootstrap <node-id>@<socket-addr> --node <node-id> --cert <path> --key <path> --ca <path> --operation <lsm|retention|backfill|tombstone> --slabs <id,...> --fingerprint <hex> [--cluster-domain <domain>] [--json]"
 	);
 }
 
