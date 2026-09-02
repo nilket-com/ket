@@ -14,6 +14,7 @@
 
 mod adr444_profile_eval;
 pub mod evidence;
+pub mod perf_board;
 pub mod telemetry;
 
 pub use adr444_profile_eval::{

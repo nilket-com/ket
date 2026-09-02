@@ -46,7 +46,8 @@ fn main() -> ExitCode {
 fn usage() -> ExitCode {
 	eprintln!(
 		"usage: toron-bench build [--workspace PATH] [--profile PROFILE] [--features A,B] \
-		 [--target TRIPLE] [--toron-bin PATH] [--staging-root PATH] [--manifest PATH]\n       \
+		 [--target TRIPLE] [--toron-bin PATH] [--duckdb-bin PATH] [--staging-root PATH] \
+		 [--manifest PATH]\n       \
 		 toron-bench run --manifest PATH -- <toron-tpch arguments>\n       \
 		 toron-bench seal-evidence --manifest PATH [--sealed PATH] [--repo PATH] \
 		 [--archive-root PATH] [--remote NAME] [--tag NAME] [--max-archive-bytes N]"
@@ -66,6 +67,7 @@ struct BuildOptions {
 	features: Vec<String>,
 	target: Option<String>,
 	toron_bin: Option<PathBuf>,
+	duckdb_bin: Option<PathBuf>,
 	staging_root: Option<PathBuf>,
 	manifest_path: Option<PathBuf>,
 }
@@ -163,6 +165,13 @@ fn build(args: &[OsString]) -> Result<PathBuf, String> {
 		Some(path) => workspace.join(path),
 		None => harness_binary.clone(),
 	};
+	let duckdb_binary = options.duckdb_bin.map(|path| {
+		if path.is_absolute() {
+			path
+		} else {
+			workspace.join(path)
+		}
+	});
 	let staging_root = absolute_from(
 		&workspace,
 		options
@@ -176,20 +185,30 @@ fn build(args: &[OsString]) -> Result<PathBuf, String> {
 	} else {
 		stage_executable(&toron_binary, &staging_root)?
 	};
+	let duckdb = duckdb_binary
+		.as_deref()
+		.map(|binary| stage_executable(binary, &staging_root))
+		.transpose()?;
 	let manifest = BuildManifest::new(
 		source_before.tree_id,
 		commit_hint,
 		recipe,
 		harness,
 		toron,
+		duckdb,
 		source_before.untracked_build_inputs,
 	)?;
 	let manifest_path = match options.manifest_path {
 		Some(path) => absolute_from(&workspace, path)?,
-		None => workspace.join("target/tpch/evidence/build").join(format!(
-			"{}-{}.manifest",
-			manifest.source_tree_id, manifest.recipe_digest
-		)),
+		None => {
+			let manifest_sha256 = sha256_bytes(&manifest.canonical_bytes()?);
+			workspace.join("target/tpch/evidence/build").join(format!(
+				"{}-{}-{}.manifest",
+				manifest.source_tree_id,
+				manifest.recipe_digest,
+				&manifest_sha256[..12],
+			))
+		}
 	};
 	write_or_verify_manifest(&manifest, &manifest_path)?;
 	Ok(manifest_path)
@@ -222,10 +241,22 @@ fn run_staged(args: &[OsString]) -> Result<ExitCode, String> {
 	if manifest.toron != manifest.harness {
 		verify_staged_executable(&manifest.toron, toron_root)?;
 	}
-	let status = Command::new(&manifest.harness.staged_path)
+	if let Some(duckdb) = &manifest.duckdb {
+		let duckdb_root = duckdb
+			.staged_path
+			.parent()
+			.ok_or_else(|| "staged DuckDB has no parent".to_string())?;
+		verify_staged_executable(duckdb, duckdb_root)?;
+	}
+	let mut command = Command::new(&manifest.harness.staged_path);
+	command
 		.args(&args[separator + 1..])
 		.env(BUILD_MANIFEST_ENV, &manifest_path)
-		.env("TORON_TPCH_TORON_BIN", &manifest.toron.staged_path)
+		.env("TORON_TPCH_TORON_BIN", &manifest.toron.staged_path);
+	if let Some(duckdb) = &manifest.duckdb {
+		command.env("TORON_TPCH_DUCKDB_BIN", &duckdb.staged_path);
+	}
+	let status = command
 		.status()
 		.map_err(|error| format!("run staged harness: {error}"))?;
 	Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
@@ -350,6 +381,7 @@ fn parse_build_options(args: &[OsString]) -> Result<BuildOptions, String> {
 				| "--profile"
 				| "--features"
 				| "--target" | "--toron-bin"
+				| "--duckdb-bin"
 				| "--staging-root"
 				| "--manifest"
 		) {
@@ -391,6 +423,7 @@ fn parse_build_options(args: &[OsString]) -> Result<BuildOptions, String> {
 		features,
 		target: optional_utf8(values.remove("--target"), "--target")?,
 		toron_bin: values.remove("--toron-bin").map(PathBuf::from),
+		duckdb_bin: values.remove("--duckdb-bin").map(PathBuf::from),
 		staging_root: values.remove("--staging-root").map(PathBuf::from),
 		manifest_path: values.remove("--manifest").map(PathBuf::from),
 	})
@@ -882,9 +915,12 @@ mod tests {
 			"z,a,z".into(),
 			"--profile".into(),
 			"release".into(),
+			"--duckdb-bin".into(),
+			"/opt/duckdb".into(),
 		])
 		.unwrap();
 		assert_eq!(options.features, ["a", "z"]);
+		assert_eq!(options.duckdb_bin, Some(PathBuf::from("/opt/duckdb")));
 	}
 
 	#[test]

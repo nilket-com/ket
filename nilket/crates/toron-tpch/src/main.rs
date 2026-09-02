@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! ADR 261: TPC-H Reachability Harness CLI — `status` / `prepare` / `run`, manual arg parsing (no clap,
 //! matching Toron's no-extra-framework style). An unknown command/arg is a *harness* error (exit 2),
 //! distinct from a query `blocked`/`fail` (which is structured telemetry).
@@ -10,6 +12,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
+use toron_tpch::evidence::{runtime_identity, runtime_identity_gate, runtime_identity_json};
+use toron_tpch::perf_board::{
+	PERF_BOARD_ARTIFACT, PERF_BOARD_ENGINES, PERF_BOARD_EVIDENCE, PERF_BOARD_SUITE,
+	evaluate_perf_board,
+};
 use toron_tpch::telemetry::{
 	Attempt, CorrectnessAttempt, ExecutionCensusRow, FragmentCensusRow, PerfAttempt,
 	PerfPhaseTimings, Phase, Status,
@@ -21,22 +28,23 @@ use toron_tpch::{
 	gauge_membership_first, gauge_memory_per_task, gauge_outer_count_preaggregation,
 	gauge_partition_work_concurrency_requested, gauge_scalar_agg_input_reduction,
 	gauge_semi_filtered_reachable_keys, gauge_side_local_filter_routing,
-	gauge_spill_bytes_reserved, generate_dev_lineitem, load_persisted_tpch_dataset, matrix,
-	node_attribution_outer_reconciliation, normalize_duckdb_type,
-	paired_ablation_dataset_fingerprint, parse_scale_factor, prepare_persisted_tpch_dataset,
-	primitive_ladder_intent, q17_correctness_scale, run_dev_q1, run_dev_q02, run_dev_q3,
-	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
-	run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17,
-	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22, run_execution_census_query,
-	run_fragment_census_query, run_perf_query_with_data_source, run_placement_ab,
-	run_q17_boundary_census_with_data_source, run_rune_perf_query_with_data_source,
-	run_rune_q03_profile_loop_with_data_source, run_strict_q1, run_strict_q02, run_strict_q3,
-	run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08, run_strict_q09,
-	run_strict_q10, run_strict_q11, run_strict_q12, run_strict_q13, run_strict_q14, run_strict_q15,
-	run_strict_q16, run_strict_q17, run_strict_q18, run_strict_q19, run_strict_q20, run_strict_q21,
-	run_strict_q22, rune_q03_isolation_proof_with_data_source,
-	schema_fingerprint_from_duckdb_fields, stable_fingerprint, status_rows,
-	strict_lineitem_row_count, take_parquet_scan_ledger, validate_query_scale,
+	gauge_spill_bytes_reserved, generate_dev_lineitem, join_diagnostics_disabled,
+	load_persisted_tpch_dataset, matrix, node_attribution_outer_reconciliation,
+	normalize_duckdb_type, observe_host_quiescence, paired_ablation_dataset_fingerprint,
+	parse_scale_factor, prepare_persisted_tpch_dataset, primitive_ladder_intent,
+	q17_correctness_scale, run_dev_q1, run_dev_q02, run_dev_q3, run_dev_q04, run_dev_q05,
+	run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10, run_dev_q11, run_dev_q12,
+	run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17, run_dev_q18, run_dev_q19,
+	run_dev_q20, run_dev_q21, run_dev_q22, run_execution_census_query, run_fragment_census_query,
+	run_perf_query_with_data_source, run_placement_ab, run_q17_boundary_census_with_data_source,
+	run_rune_perf_query_with_data_source, run_rune_q03_profile_loop_with_data_source,
+	run_strict_q1, run_strict_q02, run_strict_q3, run_strict_q04, run_strict_q05, run_strict_q6,
+	run_strict_q07, run_strict_q08, run_strict_q09, run_strict_q10, run_strict_q11, run_strict_q12,
+	run_strict_q13, run_strict_q14, run_strict_q15, run_strict_q16, run_strict_q17, run_strict_q18,
+	run_strict_q19, run_strict_q20, run_strict_q21, run_strict_q22,
+	rune_q03_isolation_proof_with_data_source, schema_fingerprint_from_duckdb_fields,
+	stable_fingerprint, status_rows, strict_lineitem_row_count, take_parquet_scan_ledger,
+	validate_query_scale,
 };
 
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
@@ -860,6 +868,12 @@ async fn perf_command(args: &[String]) -> ExitCode {
 		Ok(queries) => queries,
 		Err(message) => return harness_error(&message),
 	};
+	let board_context =
+		match PerfBoardRunContext::prepare(&output_dir, mode, sf, data_source, &data_dir, &engines)
+		{
+			Ok(context) => context,
+			Err(message) => return harness_error(&message),
+		};
 	let paired_switch = paired_switch_from_args(args);
 	let paired_gate = match paired_gate_from_args(args) {
 		Ok(gate) => gate,
@@ -1272,6 +1286,7 @@ async fn perf_command(args: &[String]) -> ExitCode {
 	}
 
 	apply_duckdb_output_sanity_flags(&mut raw_rows);
+	board_context.annotate_samples(&mut raw_rows);
 	let baseline_rows = read_baseline_rows(&baseline_path);
 	let summary_rows = summarize_perf_rows(&raw_rows, measured_runs, warmup, &baseline_rows);
 	let summary_rows = if let Some(gate_zero) = gate_zero {
@@ -1290,6 +1305,9 @@ async fn perf_command(args: &[String]) -> ExitCode {
 	if let Err(error) = write_perf_outputs(&output_dir, &baseline_path, &raw_rows, &summary_rows) {
 		return harness_error(&format!("write perf output: {error}"));
 	}
+	if let Err(error) = board_context.finish(&output_dir, &raw_rows, &summary_rows) {
+		return harness_error(&format!("write perf board evidence: {error}"));
+	}
 
 	for row in &summary_rows {
 		print_perf_summary(row);
@@ -1307,6 +1325,360 @@ async fn perf_command(args: &[String]) -> ExitCode {
 		eprintln!("perf completed with failed cells: {}", failed.join(", "));
 		ExitCode::FAILURE
 	}
+}
+
+#[derive(Debug)]
+struct PerfBoardRunContext {
+	mode: String,
+	scale_factor: f64,
+	data_source: String,
+	output_directory_fresh: bool,
+	host_start: toron_tpch::HostQuiescence,
+	join_spill_scratch: PathBuf,
+	join_spill_scratch_empty_before: bool,
+	dataset_verification: Option<String>,
+	dataset_manifest_fingerprint: Option<String>,
+	budget: GaugeBudget,
+	partition_work_concurrency_requested: (u64, &'static str),
+	duckdb_version: Option<String>,
+	duckdb_executable_sha256: Option<String>,
+}
+
+impl PerfBoardRunContext {
+	fn prepare(
+		output_dir: &Path,
+		mode: &str,
+		sf: f64,
+		data_source: &str,
+		data_dir: &Path,
+		engines: &[PerfEngine],
+	) -> Result<Self, String> {
+		let output_directory_fresh = !output_dir.exists();
+		let host_start = observe_host_quiescence();
+		let join_spill_scratch = std::env::var_os("TORON_JOIN_SPILL_DIR")
+			.filter(|value| !value.is_empty())
+			.map(PathBuf::from)
+			.unwrap_or_else(|| std::env::temp_dir().join("toron_join_spill"));
+		let join_spill_scratch_empty_before = directory_is_empty(&join_spill_scratch)?;
+		let budget = GaugeBudget::from_environment()?;
+		let partition_work_concurrency_requested = gauge_partition_work_concurrency_requested()?;
+		let (dataset_verification, dataset_manifest_fingerprint) =
+			if matches!(data_source, "parquet" | "persisted") {
+				let dataset = load_persisted_tpch_dataset(mode, sf, data_dir)?;
+				(
+					Some(dataset.verification.as_str().to_string()),
+					Some(dataset.manifest_fingerprint),
+				)
+			} else {
+				(None, None)
+			};
+		let (duckdb_version, duckdb_executable_sha256) = if engines.contains(&PerfEngine::DuckDb) {
+			require_single_thread_duckdb_reference(engines)?;
+			let identity = runtime_identity()?.ok_or_else(|| {
+				"DuckDB perf requires toron-bench run and a staged DuckDB executable".to_string()
+			})?;
+			let duckdb = identity.manifest.duckdb.as_ref().ok_or_else(|| {
+				"DuckDB perf requires --duckdb-bin in the toron-bench build manifest".to_string()
+			})?;
+			let configured = PathBuf::from(duckdb_binary())
+				.canonicalize()
+				.map_err(|error| format!("canonicalize staged DuckDB executable: {error}"))?;
+			let staged = duckdb
+				.staged_path
+				.canonicalize()
+				.map_err(|error| format!("canonicalize manifest DuckDB executable: {error}"))?;
+			if configured != staged {
+				return Err(format!(
+					"DuckDB perf executable is not the staged manifest executable: configured={} staged={}",
+					configured.display(),
+					staged.display()
+				));
+			}
+			let version = duckdb_cli_version(
+				staged
+					.to_str()
+					.ok_or_else(|| "staged DuckDB path is not UTF-8".to_string())?,
+			)?
+			.ok_or_else(|| "staged DuckDB executable is absent".to_string())?;
+			if !(version.contains("v1.5.4") || version.starts_with("1.5.4")) {
+				return Err(format!(
+					"ADR 583 baseline requires DuckDB 1.5.4; staged executable reports {version:?}"
+				));
+			}
+			(Some(version), Some(duckdb.sha256.clone()))
+		} else {
+			(None, None)
+		};
+		Ok(Self {
+			mode: mode.to_string(),
+			scale_factor: sf,
+			data_source: data_source.to_string(),
+			output_directory_fresh,
+			host_start,
+			join_spill_scratch,
+			join_spill_scratch_empty_before,
+			dataset_verification,
+			dataset_manifest_fingerprint,
+			budget,
+			partition_work_concurrency_requested,
+			duckdb_version,
+			duckdb_executable_sha256,
+		})
+	}
+
+	fn annotate_samples(&self, rows: &mut [serde_json::Value]) {
+		for row in rows {
+			row["data_source"] = serde_json::json!(self.data_source);
+			row["dataset_manifest_fingerprint"] =
+				serde_json::json!(self.dataset_manifest_fingerprint);
+			row["memory_per_task"] = serde_json::json!(self.budget.memory_per_task);
+			row["memory_per_task_provenance"] =
+				serde_json::json!(self.budget.memory_per_task_provenance);
+			row["spill_bytes_reserved"] = serde_json::json!(self.budget.spill_bytes_reserved);
+			row["spill_bytes_reserved_provenance"] =
+				serde_json::json!(self.budget.spill_bytes_reserved_provenance);
+			row["partition_work_concurrency_requested"] =
+				serde_json::json!(self.partition_work_concurrency_requested.0);
+			row["partition_work_concurrency_requested_provenance"] =
+				serde_json::json!(self.partition_work_concurrency_requested.1);
+			if row.get("engine").and_then(serde_json::Value::as_str) == Some("duckdb") {
+				row["duckdb_threads"] = serde_json::json!(duckdb_thread_setting());
+				row["duckdb_threads_provenance"] =
+					serde_json::json!(reference_thread_pin_provenance(&duckdb_thread_setting()));
+				row["duckdb_executable_sha256"] = serde_json::json!(self.duckdb_executable_sha256);
+			}
+		}
+	}
+
+	fn finish(
+		&self,
+		output_dir: &Path,
+		samples: &[serde_json::Value],
+		summaries: &[serde_json::Value],
+	) -> Result<(), String> {
+		let host_end = observe_host_quiescence();
+		let join_spill_scratch_empty_after = directory_is_empty(&self.join_spill_scratch)?;
+		let identity_gate = runtime_identity_gate();
+		let mut observed_queries = Vec::<String>::new();
+		let mut observed_engines = Vec::<String>::new();
+		for row in samples {
+			if let Some(query) = row.get("query").and_then(serde_json::Value::as_str)
+				&& !observed_queries.iter().any(|known| known == query)
+			{
+				observed_queries.push(query.to_string());
+			}
+			if let Some(engine) = row.get("engine").and_then(serde_json::Value::as_str)
+				&& !observed_engines.iter().any(|known| known == engine)
+			{
+				observed_engines.push(engine.to_string());
+			}
+		}
+		let mut header = serde_json::json!({
+			"kind": "artifact_header",
+			"suite": PERF_BOARD_SUITE,
+			"evidence_identity": runtime_identity_json(),
+			"content_identity_reasons": identity_gate.reasons,
+			"scale_factor": self.scale_factor,
+			"mode": self.mode,
+			"data_source": self.data_source,
+			"profile": samples.first().and_then(|row| row.get("profile")).cloned(),
+			"runs": summaries.first().and_then(|row| row.get("runs")).cloned(),
+			"warmup": summaries.first().and_then(|row| row.get("warmup")).cloned(),
+			"queries": observed_queries,
+			"engines": observed_engines,
+			"dataset_verification": self.dataset_verification,
+			"dataset_manifest_fingerprint": self.dataset_manifest_fingerprint,
+			"memory_per_task": self.budget.memory_per_task,
+			"memory_per_task_provenance": self.budget.memory_per_task_provenance,
+			"spill_bytes_reserved": self.budget.spill_bytes_reserved,
+			"spill_bytes_reserved_provenance": self.budget.spill_bytes_reserved_provenance,
+			"partition_work_concurrency_requested": self.partition_work_concurrency_requested.0,
+			"partition_work_concurrency_requested_provenance": self.partition_work_concurrency_requested.1,
+			"duckdb_threads": duckdb_thread_setting(),
+			"duckdb_threads_provenance": reference_thread_pin_provenance(&duckdb_thread_setting()),
+			"duckdb_version": self.duckdb_version,
+			"duckdb_executable_sha256": self.duckdb_executable_sha256,
+			"diagnostics_disabled": join_diagnostics_disabled(),
+			"host_start_service_inactive": self.host_start.service_inactive,
+			"host_start_sql_port_free": self.host_start.sql_port_free,
+			"host_start_quiescent": self.host_start.quiescent(),
+			"host_end_service_inactive": host_end.service_inactive,
+			"host_end_sql_port_free": host_end.sql_port_free,
+			"host_end_quiescent": host_end.quiescent(),
+			"join_spill_scratch": self.join_spill_scratch,
+			"join_spill_scratch_empty_before": self.join_spill_scratch_empty_before,
+			"join_spill_scratch_empty_after": join_spill_scratch_empty_after,
+			"output_directory_fresh": self.output_directory_fresh,
+		});
+		let ordered_summaries = ordered_perf_summaries(summaries);
+		let decision = evaluate_perf_board(&header, samples, &ordered_summaries);
+		header["candidate_authority"] = serde_json::json!(decision.candidate_authority);
+		header["authority_reasons"] = serde_json::json!(decision.reasons);
+		let artifact = output_dir.join(PERF_BOARD_ARTIFACT);
+		write_perf_board_artifact(&artifact, &header, samples, &ordered_summaries)?;
+		let (replayed_header, replayed_samples, replayed_summaries) =
+			read_perf_board_artifact(&artifact)?;
+		let replayed =
+			evaluate_perf_board(&replayed_header, &replayed_samples, &replayed_summaries);
+		if replayed != decision
+			|| replayed_header
+				.get("candidate_authority")
+				.and_then(serde_json::Value::as_bool)
+				!= Some(replayed.candidate_authority)
+			|| replayed_header.get("authority_reasons")
+				!= Some(&serde_json::json!(replayed.reasons))
+		{
+			return Err(
+				"published perf board does not replay to its claimed authority".to_string(),
+			);
+		}
+		match toron_tpch::evidence::write_runtime_evidence_manifest(
+			&artifact,
+			PERF_BOARD_SUITE,
+			replayed.candidate_authority,
+		)? {
+			Some(path) => {
+				if path.file_name().and_then(|name| name.to_str()) != Some(PERF_BOARD_EVIDENCE) {
+					return Err(format!(
+						"unexpected perf board evidence path {}",
+						path.display()
+					));
+				}
+			}
+			None if replayed.candidate_authority => {
+				return Err("candidate board has no runtime build manifest".to_string());
+			}
+			None => {}
+		}
+		Ok(())
+	}
+}
+
+fn ordered_perf_summaries(summaries: &[serde_json::Value]) -> Vec<serde_json::Value> {
+	let mut by_key = BTreeMap::new();
+	for summary in summaries {
+		if let (Some(query), Some(engine)) = (
+			summary.get("query").and_then(serde_json::Value::as_str),
+			summary.get("engine").and_then(serde_json::Value::as_str),
+		) {
+			by_key.insert((query.to_string(), engine.to_string()), summary.clone());
+		}
+	}
+	let mut ordered = Vec::with_capacity(summaries.len());
+	for query in ALL_QUERY_IDS {
+		for engine in PERF_BOARD_ENGINES {
+			if let Some(summary) = by_key.remove(&(query.to_string(), engine.to_string())) {
+				ordered.push(summary);
+			}
+		}
+	}
+	ordered.extend(by_key.into_values());
+	ordered
+}
+
+fn read_perf_board_artifact(
+	path: &Path,
+) -> Result<
+	(
+		serde_json::Value,
+		Vec<serde_json::Value>,
+		Vec<serde_json::Value>,
+	),
+	String,
+> {
+	let body = std::fs::read_to_string(path)
+		.map_err(|error| format!("read {}: {error}", path.display()))?;
+	let mut header = None;
+	let mut samples = Vec::new();
+	let mut summaries = Vec::new();
+	for (line_number, line) in body.lines().enumerate() {
+		let row: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+			format!("parse {} line {}: {error}", path.display(), line_number + 1)
+		})?;
+		match row.get("kind").and_then(serde_json::Value::as_str) {
+			Some("artifact_header") if header.is_none() && line_number == 0 => header = Some(row),
+			Some("sample") => samples.push(row),
+			Some("cell_summary") => summaries.push(row),
+			Some("artifact_header") => {
+				return Err("perf board carries more than one or a misplaced header".to_string());
+			}
+			Some(kind) => return Err(format!("unknown perf board row kind {kind:?}")),
+			None => return Err("perf board row is missing kind".to_string()),
+		}
+	}
+	Ok((
+		header.ok_or_else(|| "perf board is missing its header".to_string())?,
+		samples,
+		summaries,
+	))
+}
+
+fn directory_is_empty(path: &Path) -> Result<bool, String> {
+	match std::fs::read_dir(path) {
+		Ok(mut entries) => Ok(entries.next().is_none()),
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+		Err(error) => Err(format!("inspect {}: {error}", path.display())),
+	}
+}
+
+fn write_perf_board_artifact(
+	path: &Path,
+	header: &serde_json::Value,
+	samples: &[serde_json::Value],
+	summaries: &[serde_json::Value],
+) -> Result<(), String> {
+	if path.exists() {
+		return Err(format!(
+			"perf board artifact already exists at {}",
+			path.display()
+		));
+	}
+	let partial = PathBuf::from(format!("{}.partial", path.display()));
+	if partial.exists() {
+		return Err(format!(
+			"partial perf board artifact already exists at {}",
+			partial.display()
+		));
+	}
+	let mut file = OpenOptions::new()
+		.create_new(true)
+		.write(true)
+		.open(&partial)
+		.map_err(|error| format!("create {}: {error}", partial.display()))?;
+	let mut append = |row: &serde_json::Value| -> Result<(), String> {
+		serde_json::to_writer(&mut file, row)
+			.map_err(|error| format!("encode perf board row: {error}"))?;
+		file.write_all(b"\n")
+			.map_err(|error| format!("write perf board row: {error}"))
+	};
+	append(header)?;
+	for sample in samples {
+		let mut row = sample.clone();
+		row["kind"] = serde_json::json!("sample");
+		append(&row)?;
+	}
+	let mut by_key = BTreeMap::new();
+	for summary in summaries {
+		if let (Some(query), Some(engine)) = (
+			summary.get("query").and_then(serde_json::Value::as_str),
+			summary.get("engine").and_then(serde_json::Value::as_str),
+		) {
+			by_key.insert((query.to_string(), engine.to_string()), summary);
+		}
+	}
+	for query in ALL_QUERY_IDS {
+		for engine in PERF_BOARD_ENGINES {
+			if let Some(summary) = by_key.get(&(query.to_string(), engine.to_string())) {
+				let mut row = (*summary).clone();
+				row["kind"] = serde_json::json!("cell_summary");
+				append(&row)?;
+			}
+		}
+	}
+	file.sync_all()
+		.map_err(|error| format!("sync {}: {error}", partial.display()))?;
+	drop(file);
+	std::fs::rename(&partial, path).map_err(|error| format!("publish {}: {error}", path.display()))
 }
 
 fn adr449_gate_zero_command(args: &[String]) -> ExitCode {
@@ -1430,7 +1802,7 @@ fn adr450_scale_rungs(args: &[String]) -> Result<Vec<f64>, String> {
 	Ok((1..=10).map(f64::from).collect())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct GaugeBudget {
 	memory_per_task: u64,
 	memory_per_task_provenance: &'static str,
@@ -4118,6 +4490,12 @@ fn summarize_query_rows(
 	let duckdb_version = first
 		.and_then(|row| row.get("duckdb_version"))
 		.and_then(serde_json::Value::as_str);
+	let duckdb_executable_sha256 = first
+		.and_then(|row| row.get("duckdb_executable_sha256"))
+		.and_then(serde_json::Value::as_str);
+	let dataset_manifest_fingerprint = first
+		.and_then(|row| row.get("dataset_manifest_fingerprint"))
+		.and_then(serde_json::Value::as_str);
 	let scale_factor = first
 		.and_then(|row| row.get("scale_factor"))
 		.and_then(serde_json::Value::as_f64)
@@ -4234,11 +4612,13 @@ fn summarize_query_rows(
 		"output_schema_fingerprint": output_schema_fingerprint,
 		"engine_version": engine_version,
 		"duckdb_version": duckdb_version,
+		"duckdb_executable_sha256": duckdb_executable_sha256,
 		"duckdb_threads": duckdb_thread_setting(),
 		"duckdb_threads_provenance": reference_thread_pin_provenance(&duckdb_thread_setting()),
 		"polars_max_threads": polars_max_threads_setting(),
 		"polars_max_threads_provenance": reference_thread_pin_provenance(&polars_max_threads_setting()),
 		"dataset_verification": dataset_verification,
+		"dataset_manifest_fingerprint": dataset_manifest_fingerprint,
 		"build_commit": rows.last().and_then(|row| row.get("build_commit")).cloned(),
 		"binary_modified_unix": rows
 			.last()

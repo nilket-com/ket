@@ -11,9 +11,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 pub const BUILD_MANIFEST_ENV: &str = "TORON_TPCH_BUILD_MANIFEST";
-pub const BUILD_MANIFEST_VERSION: u8 = 1;
+pub const BUILD_MANIFEST_VERSION: u8 = 2;
 pub const RECIPE_VERSION: u8 = 1;
-pub const EVIDENCE_MANIFEST_VERSION: u8 = 1;
+pub const EVIDENCE_MANIFEST_VERSION: u8 = 2;
 pub const SHA256_HEX_LEN: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -122,6 +122,7 @@ pub struct BuildManifest {
 	pub recipe_digest: String,
 	pub harness: ExecutableIdentity,
 	pub toron: ExecutableIdentity,
+	pub duckdb: Option<ExecutableIdentity>,
 	pub untracked_build_inputs: Vec<String>,
 }
 
@@ -132,6 +133,7 @@ impl BuildManifest {
 		recipe: BuildRecipe,
 		harness: ExecutableIdentity,
 		toron: ExecutableIdentity,
+		duckdb: Option<ExecutableIdentity>,
 		mut untracked_build_inputs: Vec<String>,
 	) -> Result<Self, String> {
 		untracked_build_inputs.sort();
@@ -143,6 +145,7 @@ impl BuildManifest {
 			recipe,
 			harness,
 			toron,
+			duckdb,
 			untracked_build_inputs,
 		};
 		manifest.validate()?;
@@ -164,6 +167,9 @@ impl BuildManifest {
 		}
 		require_sha256("harness", &self.harness.sha256)?;
 		require_sha256("toron", &self.toron.sha256)?;
+		if let Some(duckdb) = &self.duckdb {
+			require_sha256("duckdb", &duckdb.sha256)?;
+		}
 		if !is_sorted_unique(&self.recipe.features) {
 			return Err("evidence recipe features are not sorted and unique".to_string());
 		}
@@ -183,6 +189,7 @@ impl BuildManifest {
 		put_string(&mut bytes, &self.recipe_digest);
 		self.harness.encode(&mut bytes)?;
 		self.toron.encode(&mut bytes)?;
+		put_optional_executable(&mut bytes, self.duckdb.as_ref())?;
 		put_strings(&mut bytes, &self.untracked_build_inputs);
 		Ok(bytes)
 	}
@@ -190,7 +197,7 @@ impl BuildManifest {
 	pub fn decode(bytes: &[u8]) -> Result<Self, String> {
 		let mut cursor = Cursor::new(bytes);
 		let version = cursor.byte()?;
-		if version != BUILD_MANIFEST_VERSION {
+		if !matches!(version, 1 | BUILD_MANIFEST_VERSION) {
 			return Err(format!("unknown build manifest version {version}"));
 		}
 		let source_tree_id = cursor.string()?;
@@ -202,6 +209,11 @@ impl BuildManifest {
 		let recipe_digest = cursor.string()?;
 		let harness = ExecutableIdentity::decode(&mut cursor)?;
 		let toron = ExecutableIdentity::decode(&mut cursor)?;
+		let duckdb = if version >= 2 {
+			decode_optional_executable(&mut cursor)?
+		} else {
+			None
+		};
 		let untracked_build_inputs = cursor.strings()?;
 		cursor.finish("build manifest")?;
 		let manifest = Self {
@@ -211,6 +223,7 @@ impl BuildManifest {
 			recipe_digest,
 			harness,
 			toron,
+			duckdb,
 			untracked_build_inputs,
 		};
 		manifest.validate()?;
@@ -236,8 +249,9 @@ impl BuildManifest {
 
 	pub fn executable_for_path(&self, path: &Path) -> Option<&ExecutableIdentity> {
 		let canonical = path.canonicalize().ok()?;
-		[&self.harness, &self.toron]
+		[Some(&self.harness), Some(&self.toron), self.duckdb.as_ref()]
 			.into_iter()
+			.flatten()
 			.find(|identity| identity.staged_path.canonicalize().ok().as_ref() == Some(&canonical))
 	}
 
@@ -248,6 +262,7 @@ impl BuildManifest {
 			"executable_sha256": executable.sha256,
 			"harness_sha256": self.harness.sha256,
 			"toron_sha256": self.toron.sha256,
+			"duckdb_sha256": self.duckdb.as_ref().map(|identity| &identity.sha256),
 			"recipe_sha256": self.recipe_digest,
 			"source_tree_id": self.source_tree_id,
 			"commit_hint": self.commit_hint,
@@ -282,6 +297,7 @@ pub struct RunEvidenceManifest {
 	pub final_authority: bool,
 	pub archived_harness: Option<PathBuf>,
 	pub archived_toron: Option<PathBuf>,
+	pub archived_duckdb: Option<PathBuf>,
 	pub source_tree_tag: Option<String>,
 }
 
@@ -315,6 +331,7 @@ impl RunEvidenceManifest {
 			final_authority: false,
 			archived_harness: None,
 			archived_toron: None,
+			archived_duckdb: None,
 			source_tree_tag: None,
 		};
 		manifest.validate()?;
@@ -351,6 +368,7 @@ impl RunEvidenceManifest {
 				if self.final_authority
 					|| self.archived_harness.is_some()
 					|| self.archived_toron.is_some()
+					|| self.archived_duckdb.is_some()
 					|| self.source_tree_tag.is_some()
 				{
 					return Err("an unsealed evidence manifest carries sealed claims".to_string());
@@ -359,6 +377,7 @@ impl RunEvidenceManifest {
 			SealState::Sealed => {
 				if self.archived_harness.is_none()
 					|| self.archived_toron.is_none()
+					|| (self.build.duckdb.is_some() != self.archived_duckdb.is_some())
 					|| self.source_tree_tag.is_none()
 				{
 					return Err(
@@ -397,6 +416,7 @@ impl RunEvidenceManifest {
 		bytes.push(u8::from(self.final_authority));
 		put_optional_path(&mut bytes, self.archived_harness.as_deref())?;
 		put_optional_path(&mut bytes, self.archived_toron.as_deref())?;
+		put_optional_path(&mut bytes, self.archived_duckdb.as_deref())?;
 		put_optional_string(&mut bytes, self.source_tree_tag.as_deref());
 		Ok(bytes)
 	}
@@ -404,7 +424,7 @@ impl RunEvidenceManifest {
 	pub fn decode(bytes: &[u8]) -> Result<Self, String> {
 		let mut cursor = Cursor::new(bytes);
 		let version = cursor.byte()?;
-		if version != EVIDENCE_MANIFEST_VERSION {
+		if !matches!(version, 1 | EVIDENCE_MANIFEST_VERSION) {
 			return Err(format!("unknown evidence manifest version {version}"));
 		}
 		let build = BuildManifest::decode(cursor.bytes()?)?;
@@ -421,6 +441,11 @@ impl RunEvidenceManifest {
 		let final_authority = cursor.boolean()?;
 		let archived_harness = cursor.optional_string()?.map(PathBuf::from);
 		let archived_toron = cursor.optional_string()?.map(PathBuf::from);
+		let archived_duckdb = if version >= 2 {
+			cursor.optional_string()?.map(PathBuf::from)
+		} else {
+			None
+		};
 		let source_tree_tag = cursor.optional_string()?;
 		cursor.finish("evidence manifest")?;
 		let manifest = Self {
@@ -433,6 +458,7 @@ impl RunEvidenceManifest {
 			final_authority,
 			archived_harness,
 			archived_toron,
+			archived_duckdb,
 			source_tree_tag,
 		};
 		manifest.validate()?;
@@ -486,16 +512,28 @@ pub fn seal_evidence_manifest(
 		if manifest.build.toron != manifest.build.harness {
 			verify_staged_executable(&manifest.build.toron, toron_root)?;
 		}
+		if let Some(duckdb) = &manifest.build.duckdb {
+			let duckdb_root = duckdb
+				.staged_path
+				.parent()
+				.ok_or_else(|| "staged DuckDB has no parent".to_string())?;
+			verify_staged_executable(duckdb, duckdb_root)?;
+		}
 		std::fs::create_dir_all(&options.archive_root).map_err(|error| {
 			format!(
 				"create evidence archive {}: {error}",
 				options.archive_root.display()
 			)
 		})?;
-		let needed = archive_bytes_needed(
-			&options.archive_root,
-			[&manifest.build.harness, &manifest.build.toron],
-		)?;
+		let identities = [
+			Some(&manifest.build.harness),
+			Some(&manifest.build.toron),
+			manifest.build.duckdb.as_ref(),
+		]
+		.into_iter()
+		.flatten()
+		.collect::<Vec<_>>();
+		let needed = archive_bytes_needed(&options.archive_root, identities.iter().copied())?;
 		let occupied = archive_bytes(&options.archive_root)?;
 		if occupied.checked_add(needed).is_none() || occupied + needed > options.max_archive_bytes {
 			return Err(format!(
@@ -509,17 +547,27 @@ pub fn seal_evidence_manifest(
 		} else {
 			archive_executable(&manifest.build.toron, &options.archive_root)?
 		};
+		let archived_duckdb = manifest
+			.build
+			.duckdb
+			.as_ref()
+			.map(|duckdb| archive_executable(duckdb, &options.archive_root))
+			.transpose()?;
 		if sha256_file(&archived_harness)? != manifest.build.harness.sha256
 			|| (archived_toron != archived_harness
 				&& sha256_file(&archived_toron)? != manifest.build.toron.sha256)
-		{
+			|| match (&archived_duckdb, &manifest.build.duckdb) {
+				(Some(archive), Some(duckdb)) => sha256_file(archive)? != duckdb.sha256,
+				(None, None) => false,
+				_ => true,
+			} {
 			return Err(
 				"archived executable hash does not match the staged executable".to_string(),
 			);
 		}
-		Ok((archived_harness, archived_toron))
+		Ok((archived_harness, archived_toron, archived_duckdb))
 	})();
-	let (archived_harness, archived_toron) = match retention {
+	let (archived_harness, archived_toron, archived_duckdb) = match retention {
 		Ok(archives) => archives,
 		Err(error) => return record_unretained(manifest, sealed_path, &error),
 	};
@@ -528,6 +576,7 @@ pub fn seal_evidence_manifest(
 		manifest.candidate_authority && manifest.build.authority_issues().is_empty();
 	manifest.archived_harness = Some(archived_harness);
 	manifest.archived_toron = Some(archived_toron);
+	manifest.archived_duckdb = archived_duckdb;
 	manifest.source_tree_tag = Some(options.tag.clone());
 	manifest.validate()?;
 	let sealed_manifest_digest = manifest.digest()?;
@@ -1029,6 +1078,30 @@ fn put_optional_path(bytes: &mut Vec<u8>, value: Option<&Path>) -> Result<(), St
 	Ok(())
 }
 
+fn put_optional_executable(
+	bytes: &mut Vec<u8>,
+	value: Option<&ExecutableIdentity>,
+) -> Result<(), String> {
+	match value {
+		Some(value) => {
+			bytes.push(1);
+			value.encode(bytes)?;
+		}
+		None => bytes.push(0),
+	}
+	Ok(())
+}
+
+fn decode_optional_executable(
+	cursor: &mut Cursor<'_>,
+) -> Result<Option<ExecutableIdentity>, String> {
+	match cursor.byte()? {
+		0 => Ok(None),
+		1 => ExecutableIdentity::decode(cursor).map(Some),
+		other => Err(format!("invalid optional executable tag {other}")),
+	}
+}
+
 struct Cursor<'a> {
 	bytes: &'a [u8],
 	position: usize,
@@ -1156,9 +1229,43 @@ mod tests {
 				sha256: hash(5),
 				staged_path: PathBuf::from("/stage/toron"),
 			},
+			None,
 			vec!["z.rs".into(), "a.rs".into(), "a.rs".into()],
 		)
 		.unwrap()
+	}
+
+	fn v1_build_bytes(build: &BuildManifest) -> Vec<u8> {
+		assert!(build.duckdb.is_none());
+		let mut bytes = vec![1];
+		put_string(&mut bytes, &build.source_tree_id);
+		put_string(&mut bytes, &build.commit_hint);
+		put_bytes(&mut bytes, &build.recipe.canonical_bytes());
+		put_string(&mut bytes, &build.recipe_digest);
+		build.harness.encode(&mut bytes).unwrap();
+		build.toron.encode(&mut bytes).unwrap();
+		put_strings(&mut bytes, &build.untracked_build_inputs);
+		bytes
+	}
+
+	fn v1_run_bytes(run: &RunEvidenceManifest) -> Vec<u8> {
+		assert!(run.archived_duckdb.is_none());
+		let mut bytes = vec![1];
+		put_bytes(&mut bytes, &v1_build_bytes(&run.build));
+		put_string(&mut bytes, &run.suite);
+		put_path(&mut bytes, &run.artifact_path).unwrap();
+		put_string(&mut bytes, &run.artifact_sha256);
+		bytes.push(u8::from(run.candidate_authority));
+		bytes.push(match run.seal_state {
+			SealState::Unsealed => 0,
+			SealState::Sealed => 1,
+			SealState::Unretained => 2,
+		});
+		bytes.push(u8::from(run.final_authority));
+		put_optional_path(&mut bytes, run.archived_harness.as_deref()).unwrap();
+		put_optional_path(&mut bytes, run.archived_toron.as_deref()).unwrap();
+		put_optional_string(&mut bytes, run.source_tree_tag.as_deref());
+		bytes
 	}
 
 	fn git(repo: &Path, args: &[&str]) -> String {
@@ -1197,6 +1304,9 @@ mod tests {
 		let binary = root.join("binary");
 		std::fs::write(&binary, b"exact executable bytes").unwrap();
 		let staged = stage_executable(&binary, &root.join("staged")).unwrap();
+		let duckdb_binary = root.join("duckdb");
+		std::fs::write(&duckdb_binary, b"exact DuckDB executable bytes").unwrap();
+		let staged_duckdb = stage_executable(&duckdb_binary, &root.join("staged")).unwrap();
 		let recipe =
 			BuildRecipe::new("release", Vec::new(), "target", "rustc", hash(1), hash(2)).unwrap();
 		let build = BuildManifest::new(
@@ -1205,6 +1315,7 @@ mod tests {
 			recipe,
 			staged.clone(),
 			staged,
+			Some(staged_duckdb),
 			Vec::new(),
 		)
 		.unwrap();
@@ -1237,15 +1348,19 @@ mod tests {
 	}
 
 	#[test]
-	fn v1_schema_bytes_are_pinned_independently_of_the_decoder() {
+	fn v1_schema_bytes_still_decode_and_are_pinned_independently_of_v2() {
 		let build = fixture();
 		assert_eq!(
 			sha256_bytes(&build.recipe.canonical_bytes()),
 			"c6d22f3f89d05c2fffa55531ba16354dc6e66e80ee41dd81122e256c7c38f306"
 		);
 		assert_eq!(
-			sha256_bytes(&build.canonical_bytes().unwrap()),
+			sha256_bytes(&v1_build_bytes(&build)),
 			"98fd75574e02d9ccfd72fe84b84481a4be64009b54842ef0d079a63ffb81f70a"
+		);
+		assert_eq!(
+			BuildManifest::decode(&v1_build_bytes(&build)).unwrap(),
+			build
 		);
 		let run = RunEvidenceManifest {
 			build,
@@ -1257,12 +1372,17 @@ mod tests {
 			final_authority: false,
 			archived_harness: None,
 			archived_toron: None,
+			archived_duckdb: None,
 			source_tree_tag: None,
 		};
 		assert_eq!(
-			sha256_bytes(&run.canonical_bytes().unwrap()),
+			sha256_bytes(&v1_run_bytes(&run)),
 			"bb6e5d1c63ec160e8c09282edfa5b01b4408bc5ee103fce707c11a736c56695d",
 			"a schema change requires a version bump and migration, not a fixture edit"
+		);
+		assert_eq!(
+			RunEvidenceManifest::decode(&v1_run_bytes(&run)).unwrap(),
+			run
 		);
 	}
 
@@ -1460,6 +1580,10 @@ mod tests {
 			(
 				sealed.archived_toron.as_ref().unwrap(),
 				&sealed.build.toron.sha256,
+			),
+			(
+				sealed.archived_duckdb.as_ref().unwrap(),
+				&sealed.build.duckdb.as_ref().unwrap().sha256,
 			),
 		] {
 			assert_eq!(sha256_file(archive).unwrap(), *expected);

@@ -1,8 +1,9 @@
 # ADR 581 - Content-addressed evidence identity
 
-**Status:** IMPLEMENTED; review closure pending. The two implementation cuts are
-local and apply before the next authoritative performance run. ADR 582 has since
-closed the formerly queued operator surface for ADR 0097 decision 4.
+**Status:** CLOSED. Implemented by the two content-identity cuts through
+`303b34ca`; ADR 583 exercised the workflow and sealed the first tree-addressed
+performance board under `evidence/9e29278d107c-100b880d2f90`, with no
+stamp-only commit.
 
 
 ## Context
@@ -185,7 +186,8 @@ old gate still decides. The second adds archive-backed sealing and moves every
 gate to content identity; that cut deletes the build script and makes the commit
 field non-authoritative.
 
-The next performance arc exercises the remaining process acceptance item: its
-results document cites the source tree and executable SHA-256, and its history
-contains no stamp-only commit. Existing sealed artifacts and their commit tags
-remain unchanged.
+ADR 583 discharged the remaining process acceptance item: its results document
+cites the source tree and executable SHA-256 values, its evidence tag points to
+the measured tree, and the implementation plus results land as one commit with
+no stamp-only cut. Existing sealed artifacts and their commit tags remain
+unchanged.

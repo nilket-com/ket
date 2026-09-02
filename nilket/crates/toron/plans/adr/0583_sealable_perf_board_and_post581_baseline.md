@@ -1,7 +1,10 @@
 # ADR 583 - Sealable perf board and the post-581 baseline
 
-**Status:** OPEN. Decided; no implementation has landed. Re-enters the TPC-H perf
-arc; closes ADR 581's last acceptance item when its own acceptance holds.
+**Status:** CLOSED. Implemented and sealed on source tree
+`9e29278d107cb08566d394edcba16d8d67178941`; results are recorded in
+`plans/impl/0583_sealable_perf_board_and_post581_baseline_results.md`. This
+closes ADR 581's last acceptance item and re-enters the TPC-H performance arc
+with q21 as the next attribution owner.
 
 
 ## Context
