@@ -114,7 +114,7 @@ async fn run() -> ExitCode {
 		"ladder" => ladder_command(&args).await,
 		"fragment-census" => fragment_census_command(&args).await,
 		"execution-census" => execution_census_command(&args).await,
-		// ADR 538: the only entry point that can produce timing authority.
+		// ADR 581: produces a sealable measurement; only explicit seal-evidence grants authority.
 		"timing-atlas" => timing_atlas_command(&args).await,
 		// ADR 555: paired fallback-placement comparison over the same distributed workers.
 		"placement-ab" => placement_ab_command(&args).await,
@@ -158,7 +158,7 @@ async fn timing_atlas_command(args: &[String]) -> ExitCode {
 	match toron_tpch::run_timing_atlas(mode, scale_factor, &data_root, &output).await {
 		Ok(path) => {
 			println!(
-				"tpch_timing_atlas published={} timing_authority=true",
+				"tpch_timing_atlas published={} final_authority=false pending=seal-evidence",
 				path.display()
 			);
 			ExitCode::SUCCESS
@@ -190,9 +190,10 @@ async fn placement_ab_command(args: &[String]) -> ExitCode {
 	match run_placement_ab(mode, scale_factor, &data_root, &output).await {
 		Ok(run) => {
 			println!(
-				"tpch_placement_ab published={} paired_timing_authority={} withheld_reasons={:?}",
+				"tpch_placement_ab published={} final_authority={} evidence_candidate_authority={} withheld_reasons={:?}",
 				run.path.display(),
 				run.paired_timing_authority,
+				run.evidence_candidate_authority,
 				run.withheld_reasons,
 			);
 			ExitCode::SUCCESS
@@ -4894,15 +4895,14 @@ fn shape_preserving_spill_index_gate_record(
 			return Err(format!("shape gate {label} row was not full-hash verified"));
 		}
 	}
-	let build_commit = on_row
-		.get("build_commit")
-		.and_then(serde_json::Value::as_str)
-		.ok_or_else(|| "shape gate candidate row lacks a string build_commit".to_string())?;
-	if build_commit.contains("dirty") || build_commit.is_empty() {
-		return Err("shape gate requires a clean sealed build identity".to_string());
+	let content_identity = toron_tpch::evidence::compare_row_identities(on_row, off_row);
+	if !content_identity.would_admit {
+		return Err(format!(
+			"shape gate content identity refused: {:?}",
+			content_identity.reasons
+		));
 	}
 	for field in [
-		"build_commit",
 		"dataset_verification",
 		"plan_fingerprint",
 		"digest",
@@ -5015,7 +5015,7 @@ fn shape_preserving_spill_index_gate_record(
 	}
 	Ok(serde_json::json!({
 		"suite": "shape_preserving_spill_index_gate",
-		"content_identity_shadow": toron_tpch::evidence::compare_row_identities(on_row, off_row),
+		"content_identity_gate": content_identity,
 		"candidate_mode": candidate["mode"],
 		"control_mode": control["mode"],
 		"partition_count": partition_count,
@@ -5210,17 +5210,18 @@ fn route_distinct_gate_record(
 			return Err(format!("route gate {arm} child is not a release build"));
 		}
 	}
-	for key in [
-		"plan_fingerprint",
-		"digest",
-		"output_schema_fingerprint",
-		"build_commit",
-	] {
+	for key in ["plan_fingerprint", "digest", "output_schema_fingerprint"] {
 		if row_str(on_row, key)? != row_str(off_row, key)? {
 			return Err(format!("route gate arms disagree on {key}"));
 		}
 	}
-	let content_identity_shadow = toron_tpch::evidence::compare_row_identities(on_row, off_row);
+	let content_identity = toron_tpch::evidence::compare_row_identities(on_row, off_row);
+	if !content_identity.would_admit {
+		return Err(format!(
+			"route gate content identity refused: {:?}",
+			content_identity.reasons
+		));
+	}
 	if row_u64(on_row, "output_row_count")? != row_u64(off_row, "output_row_count")? {
 		return Err("route gate arms disagree on output_row_count".to_string());
 	}
@@ -5270,7 +5271,7 @@ fn route_distinct_gate_record(
 	}
 	Ok(serde_json::json!({
 		"suite": "route_distinct_gate",
-		"content_identity_shadow": content_identity_shadow,
+		"content_identity_gate": content_identity,
 		"plan_fingerprint": row_str(on_row, "plan_fingerprint")?,
 		"digest_equal": true,
 		"control_partition_count": off_partitions,
@@ -5450,6 +5451,14 @@ mod tests {
 			"status": "pass",
 			"dataset_verification": "full_hash",
 			"build_commit": "seal",
+			"evidence_identity": {
+				"executable_sha256": "11".repeat(32),
+				"harness_sha256": "11".repeat(32),
+				"toron_sha256": "11".repeat(32),
+				"recipe_sha256": "22".repeat(32),
+				"source_tree_id": "3".repeat(40),
+				"authority_issues": [],
+			},
 			"plan_fingerprint": "plan",
 			"digest": "digest",
 			"output_schema_fingerprint": "schema",
@@ -5484,9 +5493,18 @@ mod tests {
 		let control = shape_gate_row(false);
 		let gate = shape_preserving_spill_index_gate_record(&candidate, &control).unwrap();
 		assert_eq!(gate["passed"], true);
-		assert_eq!(
-			gate["content_identity_shadow"]["would_admit"], false,
-			"cut 1 reports missing content identity but the legacy gate still decides"
+		assert_eq!(gate["content_identity_gate"]["would_admit"], true);
+		let mut dirty_navigation_only = candidate.clone();
+		dirty_navigation_only["build_commit"] = serde_json::json!("different-dirty");
+		assert!(
+			shape_preserving_spill_index_gate_record(&dirty_navigation_only, &control).is_ok(),
+			"the commit hint and dirty spelling are not authority inputs"
+		);
+		let mut different_recipe = candidate.clone();
+		different_recipe["evidence_identity"]["recipe_sha256"] = serde_json::json!("44".repeat(32));
+		assert!(
+			shape_preserving_spill_index_gate_record(&different_recipe, &control).is_err(),
+			"one commit built with two recipes is not one comparable cohort"
 		);
 		assert!(
 			shape_preserving_spill_index_gate_record(&candidate, &candidate).is_err(),

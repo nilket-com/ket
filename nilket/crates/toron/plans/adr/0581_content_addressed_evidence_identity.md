@@ -1,8 +1,8 @@
 # ADR 581 - Content-addressed evidence identity
 
-**Status:** OPEN. Decided; no implementation has landed. Applies before the next
-authoritative performance run. Does not touch the Toron operator-surface record
-queued for ADR 0097 decision 4.
+**Status:** IMPLEMENTED; review closure pending. The two implementation cuts are
+local and apply before the next authoritative performance run. ADR 582 has since
+closed the formerly queued operator surface for ADR 0097 decision 4.
 
 
 ## Context
@@ -114,6 +114,40 @@ executable is recorded as unretained.
   history is one plan and one impl commit per decision.
 
 
+## Implementation
+
+`toron-bench build` derives the local path-dependency closure from Cargo metadata,
+writes a temporary-index tree from the tracked contents of that closure, rejects
+untracked files only inside it, canonicalizes the recipe, builds the harness, and
+then takes the same snapshot again. Any tree-id or untracked-set change across the
+build refuses the manifest. The untracked scan excludes Cargo's metadata target
+directory and a `target` directory directly under each closure root; these are
+declared compiler output, not source. Ignored files anywhere else in the closure
+still void authority, so an ignored generated source cannot escape the check.
+
+The wrapper stages the harness and an optional comparison Toron binary under
+their SHA-256 names. `toron-bench run --manifest ... -- ...` verifies those staged
+identities, sets the resolved staged Toron path, and executes the staged harness.
+In v1 the source tree and recipe prove the wrapper-built harness only. An external
+comparison binary supplied by `--toron-bin` is identified and retained exactly by
+its SHA-256, but its source provenance is not bound to this manifest; a future
+cross-build authority workflow must accept and retain that binary's own build
+manifest rather than attributing the harness recipe to it.
+
+The timed harness writes an unsealed evidence manifest beside a successfully
+published artifact. The artifact's old authority field stays false; the run
+records only `evidence_candidate_authority`. `toron-bench seal-evidence` rehashes
+the artifact and both staged binaries, enforces its archive byte budget, archives
+the exact staged files, creates and pushes an annotated tag on the recorded tree,
+and writes the only manifest that may carry `final_authority=true`. A missing or
+unarchivable staged binary instead produces an explicit unretained record.
+
+The v1 recipe, build-manifest and run-manifest encodings have pinned golden
+digests. A schema change therefore requires a version bump and migration. The
+legacy `build_commit` field remains a navigation hint for readers of mixed-era
+artifacts, but no gate reads it and the opportunistic build script is gone.
+
+
 ## Guardrails
 
 - The gates compare identities; they do not compute them. Hashing happens in the
@@ -133,7 +167,9 @@ executable is recorded as unretained.
 - A tree id written from a temporary index still omits inputs outside the source
   roots the wrapper declares. The declared roots are the closure; an input that
   is not under one is not covered, and the record says so rather than claiming
-  completeness.
+  completeness. Cargo output roots are deliberately excluded from the untracked
+  scan; treating a file under one as source requires moving it into the declared
+  closure rather than relying on the output path.
 - Archiving executables costs space. Retention is bounded by the seal command's
   archive policy, and an unretained seal is a weaker claim, not a hidden one.
 - Two executables can differ in bytes for reasons that do not affect timing.
@@ -143,17 +179,13 @@ executable is recorded as unretained.
 
 ## Forward
 
-Two cuts, and authority moves only at the second.
+The two cuts preserve the decided transition in history. The first is the
+wrapper and manifest in shadow mode: new identity verdicts are emitted while the
+old gate still decides. The second adds archive-backed sealing and moves every
+gate to content identity; that cut deletes the build script and makes the commit
+field non-authoritative.
 
-The first cut is the wrapper and the manifest, in SHADOW mode: `bench build`
-stages and hashes the executables, records the recipe, writes the manifest, and
-the gates evaluate the new identities and report what they would have decided,
-while the existing `build_commit` gates keep deciding. The first cut cannot grant
-the new authority, because that authority requires an archived executable and
-archiving arrives with sealing.
-
-The second cut is `seal-evidence` with executable archiving. When it lands the
-new gates decide, the `build_commit` gates are retired, and the results-document
-convention changes: cite tree id and executable hash, not commit. Old and new
-receipts overlap for the one arc that runs in shadow mode, so the two verdicts
-can be compared before the switch.
+The next performance arc exercises the remaining process acceptance item: its
+results document cites the source tree and executable SHA-256, and its history
+contains no stamp-only commit. Existing sealed artifacts and their commit tags
+remain unchanged.

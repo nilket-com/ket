@@ -71,14 +71,22 @@ impl BuildRecipe {
 		if version != RECIPE_VERSION {
 			return Err(format!("unknown evidence recipe version {version}"));
 		}
-		Self::new(
-			cursor.string()?,
-			cursor.strings()?,
-			cursor.string()?,
-			cursor.string()?,
-			cursor.string()?,
-			cursor.string()?,
-		)
+		let recipe = Self {
+			profile: cursor.string()?,
+			features: cursor.strings()?,
+			target: cursor.string()?,
+			rustc_version: cursor.string()?,
+			rustflags_sha256: cursor.string()?,
+			cargo_lock_sha256: cursor.string()?,
+		};
+		if !is_sorted_unique(&recipe.features) {
+			return Err(
+				"evidence recipe features are not canonically sorted and unique".to_string(),
+			);
+		}
+		require_sha256("rustflags", &recipe.rustflags_sha256)?;
+		require_sha256("Cargo.lock", &recipe.cargo_lock_sha256)?;
+		Ok(recipe)
 	}
 }
 
@@ -277,6 +285,15 @@ pub struct RunEvidenceManifest {
 	pub source_tree_tag: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SealOptions {
+	pub repo: PathBuf,
+	pub archive_root: PathBuf,
+	pub remote: String,
+	pub tag: String,
+	pub max_archive_bytes: u64,
+}
+
 impl RunEvidenceManifest {
 	pub fn unsealed(
 		build: BuildManifest,
@@ -301,7 +318,29 @@ impl RunEvidenceManifest {
 			source_tree_tag: None,
 		};
 		manifest.validate()?;
+		manifest.validate_artifact_identity()?;
 		Ok(manifest)
+	}
+
+	pub fn validate_artifact_identity(&self) -> Result<(), String> {
+		let file = File::open(&self.artifact_path).map_err(|error| {
+			format!(
+				"open evidence artifact {}: {error}",
+				self.artifact_path.display()
+			)
+		})?;
+		let mut lines = std::io::BufRead::lines(std::io::BufReader::new(file));
+		let header = lines
+			.next()
+			.ok_or_else(|| "evidence artifact is empty".to_string())?
+			.map_err(|error| format!("read evidence artifact header: {error}"))?;
+		let header: serde_json::Value = serde_json::from_str(&header)
+			.map_err(|error| format!("decode evidence artifact header: {error}"))?;
+		let expected = self.build.json_value_for_executable(&self.build.harness);
+		if header.get("evidence_identity") != Some(&expected) {
+			return Err("artifact header does not carry its build-manifest identity".to_string());
+		}
+		Ok(())
 	}
 
 	pub fn validate(&self) -> Result<(), String> {
@@ -415,6 +454,251 @@ impl RunEvidenceManifest {
 	}
 }
 
+/// Archive the exact staged bytes, anchor their source tree, and publish a new sealed manifest.
+/// This is the only ADR 581 operation that mutates git.
+pub fn seal_evidence_manifest(
+	unsealed_path: &Path,
+	sealed_path: &Path,
+	options: &SealOptions,
+) -> Result<RunEvidenceManifest, String> {
+	let mut manifest = RunEvidenceManifest::read(unsealed_path)?;
+	if manifest.seal_state != SealState::Unsealed {
+		return Err("seal-evidence requires an unsealed manifest".to_string());
+	}
+	if sha256_file(&manifest.artifact_path)? != manifest.artifact_sha256 {
+		return Err("evidence artifact changed after the timed run".to_string());
+	}
+	manifest.validate_artifact_identity()?;
+	let retention = (|| {
+		let harness_root = manifest
+			.build
+			.harness
+			.staged_path
+			.parent()
+			.ok_or_else(|| "staged harness has no parent".to_string())?;
+		let toron_root = manifest
+			.build
+			.toron
+			.staged_path
+			.parent()
+			.ok_or_else(|| "staged Toron has no parent".to_string())?;
+		verify_staged_executable(&manifest.build.harness, harness_root)?;
+		if manifest.build.toron != manifest.build.harness {
+			verify_staged_executable(&manifest.build.toron, toron_root)?;
+		}
+		std::fs::create_dir_all(&options.archive_root).map_err(|error| {
+			format!(
+				"create evidence archive {}: {error}",
+				options.archive_root.display()
+			)
+		})?;
+		let needed = archive_bytes_needed(
+			&options.archive_root,
+			[&manifest.build.harness, &manifest.build.toron],
+		)?;
+		let occupied = archive_bytes(&options.archive_root)?;
+		if occupied.checked_add(needed).is_none() || occupied + needed > options.max_archive_bytes {
+			return Err(format!(
+				"evidence archive limit {} bytes would be exceeded",
+				options.max_archive_bytes
+			));
+		}
+		let archived_harness = archive_executable(&manifest.build.harness, &options.archive_root)?;
+		let archived_toron = if manifest.build.toron == manifest.build.harness {
+			archived_harness.clone()
+		} else {
+			archive_executable(&manifest.build.toron, &options.archive_root)?
+		};
+		if sha256_file(&archived_harness)? != manifest.build.harness.sha256
+			|| (archived_toron != archived_harness
+				&& sha256_file(&archived_toron)? != manifest.build.toron.sha256)
+		{
+			return Err(
+				"archived executable hash does not match the staged executable".to_string(),
+			);
+		}
+		Ok((archived_harness, archived_toron))
+	})();
+	let (archived_harness, archived_toron) = match retention {
+		Ok(archives) => archives,
+		Err(error) => return record_unretained(manifest, sealed_path, &error),
+	};
+	manifest.seal_state = SealState::Sealed;
+	manifest.final_authority =
+		manifest.candidate_authority && manifest.build.authority_issues().is_empty();
+	manifest.archived_harness = Some(archived_harness);
+	manifest.archived_toron = Some(archived_toron);
+	manifest.source_tree_tag = Some(options.tag.clone());
+	manifest.validate()?;
+	let sealed_manifest_digest = manifest.digest()?;
+	ensure_tree_tag(
+		&options.repo,
+		&options.remote,
+		&options.tag,
+		&manifest.build.source_tree_id,
+		&sealed_manifest_digest,
+	)?;
+	manifest.write_new(sealed_path)?;
+	Ok(manifest)
+}
+
+fn record_unretained(
+	mut manifest: RunEvidenceManifest,
+	sealed_path: &Path,
+	reason: &str,
+) -> Result<RunEvidenceManifest, String> {
+	manifest.seal_state = SealState::Unretained;
+	manifest.final_authority = false;
+	let unretained = PathBuf::from(format!("{}.unretained", sealed_path.display()));
+	manifest.write_new(&unretained)?;
+	Err(format!(
+		"{reason}; unretained seal written to {}",
+		unretained.display()
+	))
+}
+
+fn archive_executable(
+	identity: &ExecutableIdentity,
+	archive_root: &Path,
+) -> Result<PathBuf, String> {
+	let destination = archive_root.join(&identity.sha256);
+	if destination.exists() {
+		if sha256_file(&destination)? != identity.sha256 {
+			return Err(format!(
+				"evidence archive collision at {}",
+				destination.display()
+			));
+		}
+	} else {
+		let temporary = archive_root.join(format!(
+			".{}.{}.partial",
+			identity.sha256,
+			std::process::id()
+		));
+		std::fs::copy(&identity.staged_path, &temporary).map_err(|error| {
+			format!(
+				"archive staged executable {}: {error}",
+				identity.staged_path.display()
+			)
+		})?;
+		make_read_only(&temporary)?;
+		std::fs::rename(&temporary, &destination).map_err(|error| {
+			format!(
+				"publish archived executable {}: {error}",
+				destination.display()
+			)
+		})?;
+	}
+	make_read_only(&destination)?;
+	destination
+		.canonicalize()
+		.map_err(|error| format!("canonicalize archive {}: {error}", destination.display()))
+}
+
+fn archive_bytes_needed<'a>(
+	archive_root: &Path,
+	identities: impl IntoIterator<Item = &'a ExecutableIdentity>,
+) -> Result<u64, String> {
+	let mut unique = std::collections::BTreeMap::new();
+	for identity in identities {
+		unique.entry(&identity.sha256).or_insert(identity);
+	}
+	let mut bytes = 0u64;
+	for identity in unique.values() {
+		if !archive_root.join(&identity.sha256).exists() {
+			bytes = bytes
+				.checked_add(
+					std::fs::metadata(&identity.staged_path)
+						.map_err(|error| format!("stat staged executable: {error}"))?
+						.len(),
+				)
+				.ok_or_else(|| "evidence archive byte count overflow".to_string())?;
+		}
+	}
+	Ok(bytes)
+}
+
+fn archive_bytes(root: &Path) -> Result<u64, String> {
+	let mut bytes = 0u64;
+	for entry in std::fs::read_dir(root)
+		.map_err(|error| format!("read evidence archive {}: {error}", root.display()))?
+	{
+		let entry = entry.map_err(|error| format!("read evidence archive entry: {error}"))?;
+		if entry
+			.file_type()
+			.map_err(|error| format!("read evidence archive file type: {error}"))?
+			.is_file()
+		{
+			bytes = bytes
+				.checked_add(
+					entry
+						.metadata()
+						.map_err(|error| format!("stat evidence archive entry: {error}"))?
+						.len(),
+				)
+				.ok_or_else(|| "evidence archive byte count overflow".to_string())?;
+		}
+	}
+	Ok(bytes)
+}
+
+fn ensure_tree_tag(
+	repo: &Path,
+	remote: &str,
+	tag: &str,
+	tree_id: &str,
+	manifest_digest: &str,
+) -> Result<(), String> {
+	let object_type = git_output(repo, &["cat-file", "-t", tree_id])?;
+	if object_type.trim() != "tree" {
+		return Err(format!(
+			"evidence source object {tree_id} is not a git tree"
+		));
+	}
+	let reference = format!("refs/tags/{tag}");
+	let existing = std::process::Command::new("git")
+		.current_dir(repo)
+		.args(["rev-parse", "--verify", "--quiet", &reference])
+		.output()
+		.map_err(|error| format!("inspect evidence tag {tag}: {error}"))?;
+	if existing.status.success() {
+		let target = git_output(repo, &["rev-parse", &format!("{reference}^{{tree}}")])?;
+		if target.trim() != tree_id {
+			return Err(format!("evidence tag {tag} already names a different tree"));
+		}
+	} else {
+		git_output(
+			repo,
+			&[
+				"tag",
+				"-a",
+				tag,
+				tree_id,
+				"-m",
+				&format!("sealed evidence manifest sha256:{manifest_digest}"),
+			],
+		)?;
+	}
+	git_output(repo, &["push", remote, &reference])?;
+	Ok(())
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Result<String, String> {
+	let output = std::process::Command::new("git")
+		.current_dir(repo)
+		.args(args)
+		.output()
+		.map_err(|error| format!("git {}: {error}", args.join(" ")))?;
+	if !output.status.success() {
+		return Err(format!(
+			"git {} failed: {}",
+			args.join(" "),
+			String::from_utf8_lossy(&output.stderr)
+		));
+	}
+	String::from_utf8(output.stdout).map_err(|_| "git output is not UTF-8".to_string())
+}
+
 pub fn evidence_manifest_path(artifact_path: &Path) -> PathBuf {
 	PathBuf::from(format!("{}.evidence", artifact_path.display()))
 }
@@ -484,8 +768,8 @@ pub struct IdentityGateDecision {
 	pub reasons: Vec<String>,
 }
 
-/// Evaluate the content identity supplied to this process. This is shadow-only in ADR 581 cut 1:
-/// callers report the result beside the legacy verdict but must not use it to grant authority.
+/// Evaluate the content identity supplied to this process. Cut 1 reported this verdict in shadow;
+/// after cut 2 it is the build-identity input to candidate authority.
 pub fn runtime_identity_gate() -> IdentityGateDecision {
 	match runtime_identity() {
 		Ok(Some(identity)) => {
@@ -845,6 +1129,7 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::process::Command;
 
 	fn hash(byte: u8) -> String {
 		format!("{byte:02x}").repeat(32)
@@ -876,6 +1161,72 @@ mod tests {
 		.unwrap()
 	}
 
+	fn git(repo: &Path, args: &[&str]) -> String {
+		let output = Command::new("git")
+			.current_dir(repo)
+			.args(args)
+			.env("GIT_AUTHOR_NAME", "ADR 581")
+			.env("GIT_AUTHOR_EMAIL", "adr581@example.invalid")
+			.env("GIT_COMMITTER_NAME", "ADR 581")
+			.env("GIT_COMMITTER_EMAIL", "adr581@example.invalid")
+			.output()
+			.unwrap();
+		assert!(
+			output.status.success(),
+			"git {args:?}: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		String::from_utf8(output.stdout).unwrap().trim().to_string()
+	}
+
+	fn seal_fixture(root: &Path) -> (PathBuf, PathBuf, SealOptions, String) {
+		let repo = root.join("repo");
+		let remote = root.join("remote.git");
+		std::fs::create_dir_all(&repo).unwrap();
+		git(&repo, &["init", "-q"]);
+		std::fs::write(repo.join("source.rs"), "fn source() {}\n").unwrap();
+		git(&repo, &["add", "source.rs"]);
+		git(&repo, &["commit", "-qm", "source"]);
+		git(root, &["init", "--bare", "-q", remote.to_str().unwrap()]);
+		git(
+			&repo,
+			&["remote", "add", "origin", remote.to_str().unwrap()],
+		);
+		let tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
+
+		let binary = root.join("binary");
+		std::fs::write(&binary, b"exact executable bytes").unwrap();
+		let staged = stage_executable(&binary, &root.join("staged")).unwrap();
+		let recipe =
+			BuildRecipe::new("release", Vec::new(), "target", "rustc", hash(1), hash(2)).unwrap();
+		let build = BuildManifest::new(
+			tree.clone(),
+			git(&repo, &["rev-parse", "HEAD"]),
+			recipe,
+			staged.clone(),
+			staged,
+			Vec::new(),
+		)
+		.unwrap();
+		let artifact = root.join("run.jsonl");
+		let header = serde_json::json!({
+			"evidence_identity": build.json_value_for_executable(&build.harness),
+		});
+		std::fs::write(&artifact, format!("{header}\n")).unwrap();
+		let unsealed = RunEvidenceManifest::unsealed(build, "suite", &artifact, true).unwrap();
+		let unsealed_path = root.join("run.evidence");
+		unsealed.write_new(&unsealed_path).unwrap();
+		let sealed_path = root.join("run.evidence.sealed");
+		let options = SealOptions {
+			repo,
+			archive_root: root.join("archive"),
+			remote: "origin".to_string(),
+			tag: "evidence/test".to_string(),
+			max_archive_bytes: 1024,
+		};
+		(unsealed_path, sealed_path, options, tree)
+	}
+
 	#[test]
 	fn recipe_and_manifest_are_canonical_and_round_trip() {
 		let manifest = fixture();
@@ -883,6 +1234,36 @@ mod tests {
 		assert_eq!(manifest.untracked_build_inputs, ["a.rs", "z.rs"]);
 		let bytes = manifest.canonical_bytes().unwrap();
 		assert_eq!(BuildManifest::decode(&bytes).unwrap(), manifest);
+	}
+
+	#[test]
+	fn v1_schema_bytes_are_pinned_independently_of_the_decoder() {
+		let build = fixture();
+		assert_eq!(
+			sha256_bytes(&build.recipe.canonical_bytes()),
+			"c6d22f3f89d05c2fffa55531ba16354dc6e66e80ee41dd81122e256c7c38f306"
+		);
+		assert_eq!(
+			sha256_bytes(&build.canonical_bytes().unwrap()),
+			"98fd75574e02d9ccfd72fe84b84481a4be64009b54842ef0d079a63ffb81f70a"
+		);
+		let run = RunEvidenceManifest {
+			build,
+			suite: "suite".to_string(),
+			artifact_path: PathBuf::from("/artifact"),
+			artifact_sha256: hash(6),
+			candidate_authority: false,
+			seal_state: SealState::Unsealed,
+			final_authority: false,
+			archived_harness: None,
+			archived_toron: None,
+			source_tree_tag: None,
+		};
+		assert_eq!(
+			sha256_bytes(&run.canonical_bytes().unwrap()),
+			"bb6e5d1c63ec160e8c09282edfa5b01b4408bc5ee103fce707c11a736c56695d",
+			"a schema change requires a version bump and migration, not a fixture edit"
+		);
 	}
 
 	#[test]
@@ -940,6 +1321,23 @@ mod tests {
 	}
 
 	#[test]
+	fn decoder_refuses_a_noncanonical_feature_order_instead_of_normalizing_it() {
+		let mut bytes = vec![RECIPE_VERSION];
+		put_string(&mut bytes, "release");
+		put_strings(&mut bytes, &["z".to_string(), "a".to_string()]);
+		put_string(&mut bytes, "target");
+		put_string(&mut bytes, "rustc");
+		put_string(&mut bytes, &hash(1));
+		put_string(&mut bytes, &hash(2));
+		let mut cursor = Cursor::new(&bytes);
+		assert!(
+			BuildRecipe::decode(&mut cursor)
+				.unwrap_err()
+				.contains("canonically sorted")
+		);
+	}
+
+	#[test]
 	fn row_identity_gate_distinguishes_recipe_and_untracked_input() {
 		let manifest = fixture();
 		let row = serde_json::json!({
@@ -971,6 +1369,22 @@ mod tests {
 				.reasons
 				.iter()
 				.any(|reason| reason.ends_with("recipe_sha256"))
+		);
+
+		let mut navigated = clean_row.clone();
+		navigated["evidence_identity"]["commit_hint"] =
+			serde_json::json!("different-dirty-navigation-hint");
+		let decision = compare_row_identities(&clean_row, &navigated);
+		assert!(
+			decision.would_admit,
+			"commit hints are not authority inputs"
+		);
+		assert!(
+			decision
+				.reasons
+				.iter()
+				.all(|reason| !reason.contains("dirty")),
+			"dirty is not an ADR 581 gate reason"
 		);
 	}
 
@@ -1011,8 +1425,12 @@ mod tests {
 		let _ = std::fs::remove_dir_all(&root);
 		std::fs::create_dir_all(&root).unwrap();
 		let artifact = root.join("run.jsonl");
-		std::fs::write(&artifact, b"{}\n").unwrap();
-		let manifest = RunEvidenceManifest::unsealed(fixture(), "suite", &artifact, false).unwrap();
+		let build = fixture();
+		let header = serde_json::json!({
+			"evidence_identity": build.json_value_for_executable(&build.harness),
+		});
+		std::fs::write(&artifact, format!("{header}\n")).unwrap();
+		let manifest = RunEvidenceManifest::unsealed(build, "suite", &artifact, false).unwrap();
 		let bytes = manifest.canonical_bytes().unwrap();
 		assert_eq!(RunEvidenceManifest::decode(&bytes).unwrap(), manifest);
 		let mut future = bytes;
@@ -1023,5 +1441,164 @@ mod tests {
 				.contains("unknown evidence manifest")
 		);
 		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn seal_archives_the_staged_bytes_and_tags_the_tree() {
+		let root = std::env::temp_dir().join(format!("toron-evidence-seal-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&root);
+		std::fs::create_dir_all(&root).unwrap();
+		let (unsealed, sealed_path, options, tree) = seal_fixture(&root);
+		let sealed = seal_evidence_manifest(&unsealed, &sealed_path, &options).unwrap();
+		assert_eq!(sealed.seal_state, SealState::Sealed);
+		assert!(sealed.final_authority);
+		for (archive, expected) in [
+			(
+				sealed.archived_harness.as_ref().unwrap(),
+				&sealed.build.harness.sha256,
+			),
+			(
+				sealed.archived_toron.as_ref().unwrap(),
+				&sealed.build.toron.sha256,
+			),
+		] {
+			assert_eq!(sha256_file(archive).unwrap(), *expected);
+			assert!(OpenOptions::new().write(true).open(archive).is_err());
+		}
+		assert_eq!(RunEvidenceManifest::read(&sealed_path).unwrap(), sealed);
+		let remote_tree = git(
+			&root,
+			&[
+				"--git-dir",
+				options
+					.repo
+					.parent()
+					.unwrap()
+					.join("remote.git")
+					.to_str()
+					.unwrap(),
+				"rev-parse",
+				"refs/tags/evidence/test^{tree}",
+			],
+		);
+		assert_eq!(remote_tree, tree);
+		let remote_tag = git(
+			&root,
+			&[
+				"--git-dir",
+				options
+					.repo
+					.parent()
+					.unwrap()
+					.join("remote.git")
+					.to_str()
+					.unwrap(),
+				"cat-file",
+				"-p",
+				"refs/tags/evidence/test",
+			],
+		);
+		assert!(
+			remote_tag.contains(&format!("sha256:{}", sealed.digest().unwrap())),
+			"the tag names the sealed manifest, not its unsealed predecessor"
+		);
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn seal_without_archive_capacity_is_recorded_as_unretained() {
+		let root =
+			std::env::temp_dir().join(format!("toron-evidence-unretained-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&root);
+		std::fs::create_dir_all(&root).unwrap();
+		let (unsealed, sealed_path, mut options, _) = seal_fixture(&root);
+		options.max_archive_bytes = 0;
+		let error = seal_evidence_manifest(&unsealed, &sealed_path, &options).unwrap_err();
+		assert!(error.contains("unretained"));
+		let unretained = RunEvidenceManifest::read(&PathBuf::from(format!(
+			"{}.unretained",
+			sealed_path.display()
+		)))
+		.unwrap();
+		assert_eq!(unretained.seal_state, SealState::Unretained);
+		assert!(!unretained.final_authority);
+		assert!(!sealed_path.exists());
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn seal_rehashes_the_artifact_instead_of_trusting_the_manifest() {
+		let root = std::env::temp_dir().join(format!(
+			"toron-evidence-mutated-artifact-{}",
+			std::process::id()
+		));
+		let _ = std::fs::remove_dir_all(&root);
+		std::fs::create_dir_all(&root).unwrap();
+		let (unsealed, sealed_path, options, _) = seal_fixture(&root);
+		let manifest = RunEvidenceManifest::read(&unsealed).unwrap();
+		std::fs::OpenOptions::new()
+			.append(true)
+			.open(&manifest.artifact_path)
+			.unwrap()
+			.write_all(b"{}\n")
+			.unwrap();
+		let error = seal_evidence_manifest(&unsealed, &sealed_path, &options).unwrap_err();
+		assert!(error.contains("changed after the timed run"));
+		assert!(!sealed_path.exists());
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn a_missing_staged_binary_produces_an_unretained_record() {
+		let root = std::env::temp_dir().join(format!(
+			"toron-evidence-missing-binary-{}",
+			std::process::id()
+		));
+		let _ = std::fs::remove_dir_all(&root);
+		std::fs::create_dir_all(&root).unwrap();
+		let (unsealed, sealed_path, options, _) = seal_fixture(&root);
+		let staged = RunEvidenceManifest::read(&unsealed)
+			.unwrap()
+			.build
+			.harness
+			.staged_path;
+		std::fs::remove_file(staged).unwrap();
+		let error = seal_evidence_manifest(&unsealed, &sealed_path, &options).unwrap_err();
+		assert!(error.contains("unretained seal written"));
+		let unretained_path = PathBuf::from(format!("{}.unretained", sealed_path.display()));
+		assert_eq!(
+			RunEvidenceManifest::read(&unretained_path)
+				.unwrap()
+				.seal_state,
+			SealState::Unretained
+		);
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn authority_gates_have_no_compile_stamp_or_dirty_escape_hatch() {
+		assert!(
+			!Path::new(env!("CARGO_MANIFEST_DIR"))
+				.join("build.rs")
+				.exists(),
+			"ADR 581 retires compile-time git inference"
+		);
+		let main = include_str!("main.rs");
+		for (start, end) in [
+			(
+				"fn shape_preserving_spill_index_gate_record",
+				"fn run_route_distinct_gate",
+			),
+			("fn route_distinct_gate_record", "fn paired_ablation_arm"),
+		] {
+			let gate = main
+				.split(start)
+				.nth(1)
+				.and_then(|tail| tail.split(end).next())
+				.expect("authority gate source");
+			assert!(gate.contains("compare_row_identities"));
+			assert!(!gate.contains("build_commit"));
+			assert!(!gate.contains("dirty"));
+		}
 	}
 }

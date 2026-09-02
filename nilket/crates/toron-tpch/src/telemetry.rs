@@ -340,10 +340,10 @@ pub struct PerfAttempt {
 	pub dataset_verification: Option<DatasetVerification>,
 }
 
-/// Legacy compile-time stamp. ADR 581 cut 1 keeps this as the deciding authority input while
-/// content identity runs in shadow; cut 2 retires it to a navigation hint.
-pub fn build_commit() -> &'static str {
-	env!("TORON_TPCH_BUILD_COMMIT")
+/// Navigation hint supplied by ADR 581's runtime manifest. Retained for old artifact readers;
+/// authority gates do not consult it.
+pub fn build_commit() -> String {
+	crate::evidence::runtime_commit_hint()
 }
 
 /// Modification time (unix seconds) of the executable actually running — the

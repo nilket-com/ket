@@ -5053,7 +5053,7 @@ pub fn timing_atlas_verdict(paired_deltas: &[f64]) -> TimingAtlasVerdict {
 /// `timing_authority=false` with the reasons stated, never a silent downgrade.
 #[derive(Debug, Clone)]
 pub struct TimingAuthorityConditions {
-	pub clean_build: bool,
+	pub content_identity_ready: bool,
 	pub full_hash_dataset: bool,
 	pub quiescent_host: bool,
 	pub protocol_unmodified: bool,
@@ -5067,16 +5067,8 @@ pub struct TimingAuthorityConditions {
 }
 
 impl TimingAuthorityConditions {
-	pub fn granted_except_build_identity(&self) -> bool {
-		self.full_hash_dataset
-			&& self.quiescent_host
-			&& self.protocol_unmodified
-			&& self.complete_cohort
-			&& self.diagnostics_disabled
-	}
-
 	pub fn granted(&self) -> bool {
-		self.clean_build
+		self.content_identity_ready
 			&& self.full_hash_dataset
 			&& self.quiescent_host
 			&& self.protocol_unmodified
@@ -5086,8 +5078,8 @@ impl TimingAuthorityConditions {
 
 	pub fn withheld_reasons(&self) -> Vec<&'static str> {
 		let mut reasons = Vec::new();
-		if !self.clean_build {
-			reasons.push("build_not_clean");
+		if !self.content_identity_ready {
+			reasons.push("content_identity_unavailable");
 		}
 		if !self.full_hash_dataset {
 			reasons.push("dataset_not_full_hash");
@@ -7630,8 +7622,9 @@ pub async fn run_timing_atlas(
 		"sql_port_free": host_end.sql_port_free,
 	}))?;
 
+	let content_identity_gate = crate::evidence::runtime_identity_gate();
 	let conditions = TimingAuthorityConditions {
-		clean_build: !crate::telemetry::build_commit().contains("dirty"),
+		content_identity_ready: content_identity_gate.would_admit,
 		full_hash_dataset: dataset_fingerprint != "unknown",
 		quiescent_host: timing_atlas_quiescent_throughout(&host_start, &host_end),
 		protocol_unmodified: true,
@@ -7646,12 +7639,21 @@ pub async fn run_timing_atlas(
 	// The seal has not been written yet, so authority is decided on everything else the
 	// journal must show; reading the artifact back later checks the seal too.
 	let authoritative = replay.supports_authority(&conditions);
+	let mut withheld_reasons = conditions
+		.withheld_reasons()
+		.into_iter()
+		.map(ToOwned::to_owned)
+		.collect::<Vec<_>>();
+	if !content_identity_gate.would_admit {
+		withheld_reasons.extend(content_identity_gate.reasons.iter().cloned());
+	}
 
 	artifact.append_seal(&serde_json::json!({
 		"kind": TIMING_ATLAS_SEAL_KIND,
-		"timing_authority": authoritative,
-		"content_identity_shadow": crate::evidence::runtime_identity_gate(),
-		"withheld_reasons": conditions.withheld_reasons(),
+		"timing_authority": false,
+		"evidence_candidate_authority": authoritative,
+		"content_identity_gate": content_identity_gate,
+		"withheld_reasons": withheld_reasons,
 		"replay_violations": replay.violations,
 		"finalized_cells": replay.finalized_cells.len(),
 		"distinguished_slower_cells": replay.distinguished_slower.len(),
@@ -7671,18 +7673,14 @@ pub async fn run_timing_atlas(
 	if !authoritative {
 		return Err(format!(
 			"timing atlas withheld authority; partial retained. reasons={:?} violations={:?}",
-			conditions.withheld_reasons(),
-			replay.violations
+			withheld_reasons, replay.violations
 		));
 	}
 	let published = artifact.publish()?;
-	let content_candidate = replay.withheld_reasons().is_empty()
-		&& conditions.granted_except_build_identity()
-		&& crate::evidence::runtime_identity_gate().would_admit;
 	crate::evidence::write_runtime_evidence_manifest(
 		&published,
 		"tpch_timing_atlas",
-		content_candidate,
+		authoritative,
 	)?;
 	Ok(published)
 }
@@ -7694,6 +7692,7 @@ pub async fn run_timing_atlas(
 pub struct PlacementAbRun {
 	pub path: PathBuf,
 	pub paired_timing_authority: bool,
+	pub evidence_candidate_authority: bool,
 	pub withheld_reasons: Vec<String>,
 }
 
@@ -7719,14 +7718,16 @@ pub async fn run_placement_ab(
 		artifact.append_seal(&serde_json::json!({
 			"kind": PLACEMENT_AB_SEAL_KIND,
 			"paired_timing_authority": false,
-			"content_identity_shadow": crate::evidence::runtime_identity_gate(),
+			"content_identity_gate": crate::evidence::runtime_identity_gate(),
 			"withheld_reasons": ["host_not_quiescent"],
 			"replay_violations": [],
 		}))?;
 		let path = artifact.publish()?;
+		crate::evidence::write_runtime_evidence_manifest(&path, "tpch_placement_ab", false)?;
 		return Ok(PlacementAbRun {
 			path,
 			paired_timing_authority: false,
+			evidence_candidate_authority: false,
 			withheld_reasons: vec!["host_not_quiescent".to_string()],
 		});
 	}
@@ -7835,8 +7836,9 @@ pub async fn run_placement_ab(
 		"service_inactive": host_end.service_inactive,
 		"sql_port_free": host_end.sql_port_free,
 	}))?;
+	let content_identity_gate = crate::evidence::runtime_identity_gate();
 	let conditions = TimingAuthorityConditions {
-		clean_build: !crate::telemetry::build_commit().contains("dirty"),
+		content_identity_ready: content_identity_gate.would_admit,
 		full_hash_dataset: dataset_fingerprint != "unknown",
 		quiescent_host: timing_atlas_quiescent_throughout(&host_start, &host_end),
 		protocol_unmodified: true,
@@ -7847,27 +7849,25 @@ pub async fn run_placement_ab(
 		.map_err(|error| format!("placement A/B reread: {error}"))?;
 	let replay = placement_ab_replay(&journal);
 	let authority = replay.supports_authority(&conditions);
-	let withheld_reasons = replay.withheld_reasons(&conditions);
+	let mut withheld_reasons = replay.withheld_reasons(&conditions);
+	if !content_identity_gate.would_admit {
+		withheld_reasons.extend(content_identity_gate.reasons.iter().cloned());
+	}
 	artifact.append_seal(&serde_json::json!({
 		"kind": PLACEMENT_AB_SEAL_KIND,
-		"paired_timing_authority": authority,
-		"content_identity_shadow": crate::evidence::runtime_identity_gate(),
+		"paired_timing_authority": false,
+		"evidence_candidate_authority": authority,
+		"content_identity_gate": content_identity_gate,
 		"withheld_reasons": withheld_reasons,
 		"replay_violations": replay.violations,
 		"finalized_cells": replay.finalized_cells.len(),
 	}))?;
 	let path = artifact.publish()?;
-	let content_candidate = replay.withheld_reasons(&conditions).is_empty()
-		&& conditions.granted_except_build_identity()
-		&& crate::evidence::runtime_identity_gate().would_admit;
-	crate::evidence::write_runtime_evidence_manifest(
-		&path,
-		"tpch_placement_ab",
-		content_candidate,
-	)?;
+	crate::evidence::write_runtime_evidence_manifest(&path, "tpch_placement_ab", authority)?;
 	Ok(PlacementAbRun {
 		path,
-		paired_timing_authority: authority,
+		paired_timing_authority: false,
+		evidence_candidate_authority: authority,
 		withheld_reasons,
 	})
 }
@@ -24238,7 +24238,7 @@ mod adr538_timing_atlas_protocol {
 	#[test]
 	fn timing_authority_requires_every_condition() {
 		let all = TimingAuthorityConditions {
-			clean_build: true,
+			content_identity_ready: true,
 			full_hash_dataset: true,
 			quiescent_host: true,
 			protocol_unmodified: true,
@@ -24461,7 +24461,7 @@ mod adr538_timing_atlas_execution {
 	#[test]
 	fn partial_artifact_is_never_authoritative() {
 		let conditions = TimingAuthorityConditions {
-			clean_build: true,
+			content_identity_ready: true,
 			full_hash_dataset: true,
 			quiescent_host: true,
 			protocol_unmodified: true,
@@ -25591,7 +25591,7 @@ mod adr538_timing_atlas_journal_replay {
 		assert!(replay.violations.is_empty(), "{:?}", replay.violations);
 		assert_eq!(replay.finalized_cells.len(), timing_atlas_cells().len());
 		assert!(replay.supports_authority(&TimingAuthorityConditions {
-			clean_build: true,
+			content_identity_ready: true,
 			full_hash_dataset: true,
 			quiescent_host: true,
 			protocol_unmodified: true,
@@ -26675,7 +26675,7 @@ mod adr538_timing_atlas_journal_replay {
 
 	fn granted() -> TimingAuthorityConditions {
 		TimingAuthorityConditions {
-			clean_build: true,
+			content_identity_ready: true,
 			full_hash_dataset: true,
 			quiescent_host: true,
 			protocol_unmodified: true,
@@ -27002,7 +27002,7 @@ mod adr538_timing_atlas_driver {
 			);
 			assert!(
 				!replay.supports_authority(&TimingAuthorityConditions {
-					clean_build: true,
+					content_identity_ready: true,
 					full_hash_dataset: true,
 					quiescent_host: false,
 					protocol_unmodified: true,
@@ -28851,7 +28851,7 @@ mod adr538_node_partition_veto {
 			replay.violations
 		);
 		assert!(!replay.supports_authority(&TimingAuthorityConditions {
-			clean_build: true,
+			content_identity_ready: true,
 			full_hash_dataset: true,
 			quiescent_host: true,
 			protocol_unmodified: true,

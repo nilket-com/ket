@@ -3,14 +3,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 use serde::Deserialize;
 use toron_tpch::evidence::{
-	BUILD_MANIFEST_ENV, BuildManifest, BuildRecipe, sha256_bytes, sha256_file, stage_executable,
-	verify_staged_executable,
+	BUILD_MANIFEST_ENV, BuildManifest, BuildRecipe, RunEvidenceManifest, SealOptions,
+	seal_evidence_manifest, sha256_bytes, sha256_file, stage_executable, verify_staged_executable,
 };
+
+const DEFAULT_ARCHIVE_LIMIT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 fn main() -> ExitCode {
 	let args = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -26,6 +29,16 @@ fn main() -> ExitCode {
 			Ok(code) => code,
 			Err(error) => fail(&error),
 		},
+		Some("seal-evidence") => match seal(&args[1..]) {
+			Ok(manifest) => {
+				println!(
+					"{}",
+					serde_json::to_string(&manifest).expect("evidence manifest serializes")
+				);
+				ExitCode::SUCCESS
+			}
+			Err(error) => fail(&error),
+		},
 		_ => usage(),
 	}
 }
@@ -34,7 +47,9 @@ fn usage() -> ExitCode {
 	eprintln!(
 		"usage: toron-bench build [--workspace PATH] [--profile PROFILE] [--features A,B] \
 		 [--target TRIPLE] [--toron-bin PATH] [--staging-root PATH] [--manifest PATH]\n       \
-		 toron-bench run --manifest PATH -- <toron-tpch arguments>"
+		 toron-bench run --manifest PATH -- <toron-tpch arguments>\n       \
+		 toron-bench seal-evidence --manifest PATH [--sealed PATH] [--repo PATH] \
+		 [--archive-root PATH] [--remote NAME] [--tag NAME] [--max-archive-bytes N]"
 	);
 	ExitCode::from(2)
 }
@@ -55,6 +70,12 @@ struct BuildOptions {
 	manifest_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceSnapshot {
+	tree_id: String,
+	untracked_build_inputs: Vec<String>,
+}
+
 fn build(args: &[OsString]) -> Result<PathBuf, String> {
 	let options = parse_build_options(args)?;
 	let workspace = options.workspace.canonicalize().map_err(|error| {
@@ -63,15 +84,6 @@ fn build(args: &[OsString]) -> Result<PathBuf, String> {
 			options.workspace.display()
 		)
 	})?;
-	let metadata = cargo_metadata(&workspace)?;
-	let repo = git_stdout(&workspace, &["rev-parse", "--show-toplevel"])?;
-	let repo = PathBuf::from(repo.trim());
-	let source_roots = local_dependency_roots(&metadata, &repo)?;
-	let untracked_build_inputs = untracked_inputs(&repo, &source_roots)?;
-	let source_tree_id = source_tree_id(&repo, &source_roots)?;
-	let commit_hint = git_stdout(&repo, &["rev-parse", "HEAD"])?
-		.trim()
-		.to_string();
 	let rustc_version = command_stdout(Command::new("rustc").arg("-vV"), "rustc -vV")?;
 	let target = match options.target.clone() {
 		Some(target) => target,
@@ -81,6 +93,15 @@ fn build(args: &[OsString]) -> Result<PathBuf, String> {
 			.ok_or_else(|| "rustc -vV did not report a host triple".to_string())?
 			.to_string(),
 	};
+	let metadata = cargo_metadata(&workspace, &options.features, Some(&target))?;
+	let repo = git_stdout(&workspace, &["rev-parse", "--show-toplevel"])?;
+	let repo = PathBuf::from(repo.trim());
+	let source_roots = local_dependency_roots(&metadata, &repo, &workspace)?;
+	let cargo_output_roots = cargo_output_roots(&metadata, &repo, &source_roots);
+	let source_before = source_snapshot(&repo, &source_roots, &cargo_output_roots)?;
+	let commit_hint = git_stdout(&repo, &["rev-parse", "HEAD"])?
+		.trim()
+		.to_string();
 	let cargo_lock = workspace.join("Cargo.lock");
 	let cargo_lock_sha256 = sha256_file(&cargo_lock)?;
 
@@ -90,12 +111,11 @@ fn build(args: &[OsString]) -> Result<PathBuf, String> {
 		.current_dir(&workspace)
 		.arg("build")
 		.args(["-p", "toron-tpch", "--bin", "toron-tpch", "--profile"])
-		.arg(&options.profile);
+		.arg(&options.profile)
+		.arg("--target")
+		.arg(&target);
 	if !options.features.is_empty() {
 		cargo.arg("--features").arg(options.features.join(","));
-	}
-	if let Some(target) = &options.target {
-		cargo.arg("--target").arg(target);
 	}
 	let status = cargo
 		.status()
@@ -103,11 +123,22 @@ fn build(args: &[OsString]) -> Result<PathBuf, String> {
 	if !status.success() {
 		return Err(format!("cargo build failed with {status}"));
 	}
+	let source_after = source_snapshot(&repo, &source_roots, &cargo_output_roots)?;
+	if source_after != source_before {
+		return Err(format!(
+			"source inputs changed while cargo was building: before_tree={} after_tree={} \
+			 before_untracked={:?} after_untracked={:?}",
+			source_before.tree_id,
+			source_after.tree_id,
+			source_before.untracked_build_inputs,
+			source_after.untracked_build_inputs,
+		));
+	}
 
 	let recipe = BuildRecipe::new(
 		options.profile.clone(),
 		options.features.clone(),
-		target,
+		target.clone(),
 		rustc_version,
 		rustflags_sha256,
 		cargo_lock_sha256,
@@ -118,18 +149,20 @@ fn build(args: &[OsString]) -> Result<PathBuf, String> {
 		&options.profile
 	};
 	let mut harness_binary = PathBuf::from(&metadata.target_directory);
-	if let Some(target) = &options.target {
-		harness_binary.push(target);
-	}
+	harness_binary.push(&target);
 	harness_binary.push(profile_dir);
-	harness_binary.push(executable_name("toron-tpch"));
+	harness_binary.push(executable_name("toron-tpch", &target));
 	if !harness_binary.is_file() {
 		return Err(format!(
 			"cargo succeeded but harness binary is absent at {}",
 			harness_binary.display()
 		));
 	}
-	let toron_binary = options.toron_bin.unwrap_or_else(|| harness_binary.clone());
+	let toron_binary = match options.toron_bin {
+		Some(path) if path.is_absolute() => path,
+		Some(path) => workspace.join(path),
+		None => harness_binary.clone(),
+	};
 	let staging_root = absolute_from(
 		&workspace,
 		options
@@ -137,14 +170,19 @@ fn build(args: &[OsString]) -> Result<PathBuf, String> {
 			.unwrap_or_else(|| PathBuf::from("target/tpch/evidence/staged")),
 	)?;
 	let harness = stage_executable(&harness_binary, &staging_root)?;
-	let toron = stage_executable(&toron_binary, &staging_root)?;
+	let same_executable = harness_binary.canonicalize().ok() == toron_binary.canonicalize().ok();
+	let toron = if same_executable {
+		harness.clone()
+	} else {
+		stage_executable(&toron_binary, &staging_root)?
+	};
 	let manifest = BuildManifest::new(
-		source_tree_id,
+		source_before.tree_id,
 		commit_hint,
 		recipe,
 		harness,
 		toron,
-		untracked_build_inputs,
+		source_before.untracked_build_inputs,
 	)?;
 	let manifest_path = match options.manifest_path {
 		Some(path) => absolute_from(&workspace, path)?,
@@ -181,7 +219,9 @@ fn run_staged(args: &[OsString]) -> Result<ExitCode, String> {
 		.parent()
 		.ok_or_else(|| "staged Toron has no parent".to_string())?;
 	verify_staged_executable(&manifest.harness, harness_root)?;
-	verify_staged_executable(&manifest.toron, toron_root)?;
+	if manifest.toron != manifest.harness {
+		verify_staged_executable(&manifest.toron, toron_root)?;
+	}
 	let status = Command::new(&manifest.harness.staged_path)
 		.args(&args[separator + 1..])
 		.env(BUILD_MANIFEST_ENV, &manifest_path)
@@ -189,6 +229,112 @@ fn run_staged(args: &[OsString]) -> Result<ExitCode, String> {
 		.status()
 		.map_err(|error| format!("run staged harness: {error}"))?;
 	Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+}
+
+fn seal(args: &[OsString]) -> Result<RunEvidenceManifest, String> {
+	let values = parse_named_values(
+		args,
+		&[
+			"--manifest",
+			"--sealed",
+			"--repo",
+			"--archive-root",
+			"--remote",
+			"--tag",
+			"--max-archive-bytes",
+		],
+	)?;
+	let manifest_path = required_path(&values, "--manifest")?
+		.canonicalize()
+		.map_err(|error| format!("canonicalize evidence manifest: {error}"))?;
+	let unsealed = RunEvidenceManifest::read(&manifest_path)?;
+	let current = std::env::current_dir().map_err(|error| format!("current directory: {error}"))?;
+	let repo = match values.get("--repo") {
+		Some(path) => PathBuf::from(path),
+		None => PathBuf::from(git_stdout(&current, &["rev-parse", "--show-toplevel"])?.trim()),
+	};
+	let repo = repo
+		.canonicalize()
+		.map_err(|error| format!("canonicalize evidence repo: {error}"))?;
+	let sealed_path = values
+		.get("--sealed")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from(format!("{}.sealed", manifest_path.display())));
+	let archive_root = values
+		.get("--archive-root")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| repo.join("target/tpch/evidence/archive"));
+	let remote = utf8_value(&values, "--remote")?.unwrap_or_else(|| "origin".to_string());
+	let tag = utf8_value(&values, "--tag")?.unwrap_or_else(|| {
+		format!(
+			"evidence/{}-{}",
+			&unsealed.build.source_tree_id[..12],
+			&unsealed.artifact_sha256[..12]
+		)
+	});
+	let max_archive_bytes = utf8_value(&values, "--max-archive-bytes")?
+		.map(|value| {
+			value
+				.parse::<u64>()
+				.map_err(|_| "--max-archive-bytes must be a u64".to_string())
+		})
+		.transpose()?
+		.unwrap_or(DEFAULT_ARCHIVE_LIMIT_BYTES);
+	seal_evidence_manifest(
+		&manifest_path,
+		&sealed_path,
+		&SealOptions {
+			repo,
+			archive_root,
+			remote,
+			tag,
+			max_archive_bytes,
+		},
+	)
+}
+
+fn parse_named_values(
+	args: &[OsString],
+	allowed: &[&str],
+) -> Result<BTreeMap<String, OsString>, String> {
+	let mut values = BTreeMap::new();
+	let mut index = 0;
+	while index < args.len() {
+		let flag = args[index]
+			.to_str()
+			.ok_or_else(|| "command flag is not UTF-8".to_string())?;
+		if !allowed.contains(&flag) {
+			return Err(format!("unknown flag {flag}"));
+		}
+		let value = args
+			.get(index + 1)
+			.ok_or_else(|| format!("{flag} requires a value"))?
+			.clone();
+		if values.insert(flag.to_string(), value).is_some() {
+			return Err(format!("duplicate flag {flag}"));
+		}
+		index += 2;
+	}
+	Ok(values)
+}
+
+fn required_path(values: &BTreeMap<String, OsString>, flag: &str) -> Result<PathBuf, String> {
+	values
+		.get(flag)
+		.map(PathBuf::from)
+		.ok_or_else(|| format!("{flag} is required"))
+}
+
+fn utf8_value(values: &BTreeMap<String, OsString>, flag: &str) -> Result<Option<String>, String> {
+	values
+		.get(flag)
+		.map(|value| {
+			value
+				.clone()
+				.into_string()
+				.map_err(|_| format!("{flag} value is not UTF-8"))
+		})
+		.transpose()
 }
 
 fn parse_build_options(args: &[OsString]) -> Result<BuildOptions, String> {
@@ -282,13 +428,37 @@ struct MetadataResolve {
 #[derive(Debug, Deserialize)]
 struct MetadataNode {
 	id: String,
-	dependencies: Vec<String>,
+	deps: Vec<MetadataNodeDependency>,
 }
 
-fn cargo_metadata(workspace: &Path) -> Result<CargoMetadata, String> {
-	let output = Command::new("cargo")
+#[derive(Debug, Deserialize)]
+struct MetadataNodeDependency {
+	pkg: String,
+	dep_kinds: Vec<MetadataDependencyKind>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataDependencyKind {
+	kind: Option<String>,
+}
+
+fn cargo_metadata(
+	workspace: &Path,
+	features: &[String],
+	target: Option<&str>,
+) -> Result<CargoMetadata, String> {
+	let mut command = Command::new("cargo");
+	command
 		.current_dir(workspace)
-		.args(["metadata", "--format-version", "1"])
+		.args(["metadata", "--format-version", "1", "--manifest-path"])
+		.arg(workspace.join("crates/toron-tpch/Cargo.toml"));
+	if !features.is_empty() {
+		command.arg("--features").arg(features.join(","));
+	}
+	if let Some(target) = target {
+		command.arg("--filter-platform").arg(target);
+	}
+	let output = command
 		.output()
 		.map_err(|error| format!("cargo metadata: {error}"))?;
 	if !output.status.success() {
@@ -301,7 +471,11 @@ fn cargo_metadata(workspace: &Path) -> Result<CargoMetadata, String> {
 		.map_err(|error| format!("decode cargo metadata: {error}"))
 }
 
-fn local_dependency_roots(metadata: &CargoMetadata, repo: &Path) -> Result<Vec<PathBuf>, String> {
+fn local_dependency_roots(
+	metadata: &CargoMetadata,
+	repo: &Path,
+	workspace: &Path,
+) -> Result<Vec<PathBuf>, String> {
 	let packages = metadata
 		.packages
 		.iter()
@@ -330,7 +504,17 @@ fn local_dependency_roots(metadata: &CargoMetadata, repo: &Path) -> Result<Vec<P
 			continue;
 		}
 		if let Some(node) = nodes.get(id.as_str()) {
-			pending.extend(node.dependencies.iter().cloned());
+			pending.extend(
+				node.deps
+					.iter()
+					.filter(|dependency| {
+						dependency
+							.dep_kinds
+							.iter()
+							.any(|kind| kind.kind.as_deref() != Some("dev"))
+					})
+					.map(|dependency| dependency.pkg.clone()),
+			);
 		}
 	}
 	let mut roots = Vec::new();
@@ -350,10 +534,6 @@ fn local_dependency_roots(metadata: &CargoMetadata, repo: &Path) -> Result<Vec<P
 			);
 		}
 	}
-	let workspace = PathBuf::from(&metadata.target_directory)
-		.parent()
-		.ok_or_else(|| "cargo target directory has no workspace parent".to_string())?
-		.to_path_buf();
 	for input in [
 		workspace.join("Cargo.toml"),
 		workspace.join("Cargo.lock"),
@@ -373,12 +553,52 @@ fn local_dependency_roots(metadata: &CargoMetadata, repo: &Path) -> Result<Vec<P
 	Ok(roots)
 }
 
-fn untracked_inputs(repo: &Path, roots: &[PathBuf]) -> Result<Vec<String>, String> {
+fn cargo_output_roots(
+	metadata: &CargoMetadata,
+	repo: &Path,
+	source_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+	let mut outputs = source_roots
+		.iter()
+		.map(|root| root.join("target"))
+		.collect::<Vec<_>>();
+	let target_directory = Path::new(&metadata.target_directory);
+	if let Ok(relative) = target_directory.strip_prefix(repo) {
+		outputs.push(relative.to_path_buf());
+	}
+	outputs.sort();
+	outputs.dedup();
+	outputs
+}
+
+fn source_snapshot(
+	repo: &Path,
+	roots: &[PathBuf],
+	cargo_output_roots: &[PathBuf],
+) -> Result<SourceSnapshot, String> {
+	Ok(SourceSnapshot {
+		tree_id: source_tree_id(repo, roots)?,
+		untracked_build_inputs: untracked_inputs(repo, roots, cargo_output_roots)?,
+	})
+}
+
+fn untracked_inputs(
+	repo: &Path,
+	roots: &[PathBuf],
+	excluded_roots: &[PathBuf],
+) -> Result<Vec<String>, String> {
 	let mut command = Command::new("git");
 	command
 		.current_dir(repo)
-		.args(["ls-files", "-z", "--others", "--exclude-standard", "--"]);
+		.args(["ls-files", "-z", "--others", "--"]);
 	command.args(roots);
+	for root in excluded_roots {
+		let root = root
+			.to_str()
+			.ok_or_else(|| "Cargo output path is not UTF-8".to_string())?;
+		command.arg(format!(":(exclude){root}"));
+		command.arg(format!(":(exclude){root}/**"));
+	}
 	let output = command
 		.output()
 		.map_err(|error| format!("git ls-files: {error}"))?;
@@ -402,17 +622,61 @@ fn untracked_inputs(repo: &Path, roots: &[PathBuf]) -> Result<Vec<String>, Strin
 }
 
 fn source_tree_id(repo: &Path, roots: &[PathBuf]) -> Result<String, String> {
+	// Read the tracked-path universe through the caller's real index before switching to the
+	// temporary one. This includes newly added tracked files, which are absent from HEAD and
+	// therefore cannot be recovered by `git add -u` against a HEAD-seeded index.
+	let mut tracked = Command::new("git");
+	tracked
+		.current_dir(repo)
+		.args(["ls-files", "-z", "--cached", "--"])
+		.args(roots);
+	let tracked = tracked
+		.output()
+		.map_err(|error| format!("enumerate tracked inputs: {error}"))?;
+	if !tracked.status.success() {
+		return Err(format!(
+			"enumerate tracked inputs failed: {}",
+			String::from_utf8_lossy(&tracked.stderr)
+		));
+	}
+
 	let temporary = TempDirectory::new("toron-evidence-index")?;
 	let index = temporary.path().join("index");
 	git_with_index(repo, &index, &["read-tree", "HEAD"])?;
+	let mut remove = Command::new("git");
+	remove
+		.current_dir(repo)
+		.env("GIT_INDEX_FILE", &index)
+		.args(["rm", "-r", "-f", "--cached", "--ignore-unmatch", "--"])
+		.args(roots);
+	let remove = remove
+		.output()
+		.map_err(|error| format!("clear tracked snapshot roots: {error}"))?;
+	if !remove.status.success() {
+		return Err(format!(
+			"clear tracked snapshot roots failed: {}",
+			String::from_utf8_lossy(&remove.stderr)
+		));
+	}
 	let mut command = Command::new("git");
 	command
 		.current_dir(repo)
 		.env("GIT_INDEX_FILE", &index)
-		.args(["add", "-u", "--"])
-		.args(roots);
-	let output = command
-		.output()
+		.args(["update-index", "--add", "--remove", "-z", "--stdin"])
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped());
+	let mut child = command
+		.spawn()
+		.map_err(|error| format!("snapshot tracked inputs: {error}"))?;
+	child
+		.stdin
+		.take()
+		.expect("piped git stdin")
+		.write_all(&tracked.stdout)
+		.map_err(|error| format!("send tracked paths to snapshot index: {error}"))?;
+	let output = child
+		.wait_with_output()
 		.map_err(|error| format!("snapshot tracked inputs: {error}"))?;
 	if !output.status.success() {
 		return Err(format!(
@@ -479,6 +743,7 @@ fn effective_rustflags_digest(workspace: &Path, target: &str) -> Result<String, 
 	for key in [
 		"RUSTFLAGS".to_string(),
 		"CARGO_ENCODED_RUSTFLAGS".to_string(),
+		"CARGO_BUILD_RUSTFLAGS".to_string(),
 		format!(
 			"CARGO_TARGET_{}_RUSTFLAGS",
 			target.to_ascii_uppercase().replace(['-', '.'], "_")
@@ -558,8 +823,8 @@ fn absolute_from(base: &Path, path: PathBuf) -> Result<PathBuf, String> {
 	Ok(path)
 }
 
-fn executable_name(name: &str) -> OsString {
-	if cfg!(windows) {
+fn executable_name(name: &str, target: &str) -> OsString {
+	if target.split('-').any(|component| component == "windows") {
 		format!("{name}.exe").into()
 	} else {
 		name.into()
@@ -623,6 +888,86 @@ mod tests {
 	}
 
 	#[test]
+	fn executable_suffix_follows_the_build_target_not_the_wrapper_host() {
+		assert_eq!(
+			executable_name("toron-tpch", "x86_64-pc-windows-msvc"),
+			OsString::from("toron-tpch.exe")
+		);
+		assert_eq!(
+			executable_name("toron-tpch", "x86_64-unknown-linux-gnu"),
+			OsString::from("toron-tpch")
+		);
+	}
+
+	#[test]
+	fn build_input_closure_includes_normal_and_build_dependencies_but_not_dev_only_ones() {
+		let repo = Path::new("/repo");
+		let workspace = repo.join("nilket");
+		let package = |id: &str, name: &str| MetadataPackage {
+			id: id.into(),
+			name: name.into(),
+			manifest_path: workspace
+				.join("crates")
+				.join(name)
+				.join("Cargo.toml")
+				.to_string_lossy()
+				.into_owned(),
+		};
+		let dependency = |pkg: &str, kind: Option<&str>| MetadataNodeDependency {
+			pkg: pkg.into(),
+			dep_kinds: vec![MetadataDependencyKind {
+				kind: kind.map(str::to_string),
+			}],
+		};
+		let metadata = CargoMetadata {
+			packages: vec![
+				package("root", "toron-tpch"),
+				package("normal", "toron"),
+				package("build", "build-helper"),
+				package("dev", "test-helper"),
+			],
+			resolve: Some(MetadataResolve {
+				nodes: vec![
+					MetadataNode {
+						id: "root".into(),
+						deps: vec![
+							dependency("normal", None),
+							dependency("build", Some("build")),
+							dependency("dev", Some("dev")),
+						],
+					},
+					MetadataNode {
+						id: "normal".into(),
+						deps: Vec::new(),
+					},
+					MetadataNode {
+						id: "build".into(),
+						deps: Vec::new(),
+					},
+					MetadataNode {
+						id: "dev".into(),
+						deps: Vec::new(),
+					},
+				],
+			}),
+			target_directory: workspace.join("target").to_string_lossy().into_owned(),
+		};
+
+		let roots = local_dependency_roots(&metadata, repo, &workspace).unwrap();
+		assert_eq!(
+			roots,
+			[
+				PathBuf::from("nilket/crates/build-helper"),
+				PathBuf::from("nilket/crates/toron"),
+				PathBuf::from("nilket/crates/toron-tpch"),
+			]
+		);
+		let outputs = cargo_output_roots(&metadata, repo, &roots);
+		assert!(outputs.contains(&PathBuf::from("nilket/target")));
+		assert!(outputs.contains(&PathBuf::from("nilket/crates/toron/target")));
+	}
+
+	#[test]
 	fn run_requires_a_manifest_and_argument_separator() {
 		assert!(run_staged(&[]).unwrap_err().contains("requires --"));
 		assert!(
@@ -645,11 +990,21 @@ mod tests {
 		let head_before = git_stdout(repo, &["rev-parse", "HEAD"]).unwrap();
 		let index_before = git_stdout(repo, &["write-tree"]).unwrap();
 		let tree_before = source_tree_id(repo, &roots).unwrap();
+		let executable_before = stage_executable(&repo.join("source/lib.rs"), &repo.join("stage"))
+			.unwrap()
+			.sha256;
 		std::fs::write(repo.join("source/lib.rs"), "two\n").unwrap();
 		let tree_after = source_tree_id(repo, &roots).unwrap();
+		let executable_after = stage_executable(&repo.join("source/lib.rs"), &repo.join("stage"))
+			.unwrap()
+			.sha256;
 		assert_ne!(
 			tree_before, tree_after,
 			"the unstaged source edit is in the snapshot"
+		);
+		assert_ne!(
+			executable_before, executable_after,
+			"changed executable bytes receive a new content identity"
 		);
 		assert_eq!(
 			git_stdout(repo, &["rev-parse", "HEAD"]).unwrap(),
@@ -666,13 +1021,93 @@ mod tests {
 		std::fs::create_dir(repo.join("source")).unwrap();
 		std::fs::create_dir(repo.join("notes")).unwrap();
 		std::fs::write(repo.join("source/tracked.rs"), "tracked\n").unwrap();
+		std::fs::write(
+			repo.join(".gitignore"),
+			"source/ignored.rs\nsource/target/\n",
+		)
+		.unwrap();
 		git(repo, &["add", "source/tracked.rs"]);
+		git(repo, &["add", ".gitignore"]);
 		git(repo, &["commit", "-qm", "base"]);
 		std::fs::write(repo.join("source/generated.rs"), "input\n").unwrap();
+		std::fs::write(
+			repo.join("source/ignored.rs"),
+			"ignored but still an input\n",
+		)
+		.unwrap();
 		std::fs::write(repo.join("notes/run.log"), "not an input\n").unwrap();
+		std::fs::create_dir(repo.join("source/target")).unwrap();
+		std::fs::write(repo.join("source/target/output.bin"), "Cargo output\n").unwrap();
 		assert_eq!(
-			untracked_inputs(repo, &[PathBuf::from("source")]).unwrap(),
-			["source/generated.rs"]
+			untracked_inputs(
+				repo,
+				&[PathBuf::from("source")],
+				&[PathBuf::from("source/target")],
+			)
+			.unwrap(),
+			["source/generated.rs", "source/ignored.rs"]
+		);
+	}
+
+	#[test]
+	fn a_source_change_between_the_two_build_snapshots_is_detected() {
+		let temporary = TempDirectory::new("toron-evidence-build-window").unwrap();
+		let repo = temporary.path();
+		git(repo, &["init", "-q"]);
+		std::fs::create_dir(repo.join("source")).unwrap();
+		std::fs::write(repo.join("source/lib.rs"), "before\n").unwrap();
+		git(repo, &["add", "source/lib.rs"]);
+		git(repo, &["commit", "-qm", "base"]);
+		let roots = [PathBuf::from("source")];
+		let before = source_snapshot(repo, &roots, &[]).unwrap();
+
+		std::fs::write(repo.join("source/lib.rs"), "during build\n").unwrap();
+		let after_tracked_change = source_snapshot(repo, &roots, &[]).unwrap();
+		assert_ne!(before, after_tracked_change);
+
+		std::fs::write(repo.join("source/generated.rs"), "during build\n").unwrap();
+		let after_untracked_change = source_snapshot(repo, &roots, &[]).unwrap();
+		assert_ne!(after_tracked_change, after_untracked_change);
+	}
+
+	#[test]
+	fn tracked_snapshot_includes_a_newly_added_file_without_moving_the_real_index() {
+		let temporary = TempDirectory::new("toron-evidence-added-file").unwrap();
+		let repo = temporary.path();
+		git(repo, &["init", "-q"]);
+		std::fs::create_dir(repo.join("source")).unwrap();
+		std::fs::write(repo.join("source/lib.rs"), "base\n").unwrap();
+		git(repo, &["add", "source/lib.rs"]);
+		git(repo, &["commit", "-qm", "base"]);
+		std::fs::write(repo.join("source/new.rs"), "new tracked input\n").unwrap();
+		git(repo, &["add", "source/new.rs"]);
+		let index_before = git_stdout(repo, &["write-tree"]).unwrap();
+
+		let snapshot = source_tree_id(repo, &[PathBuf::from("source")]).unwrap();
+		let names = git_stdout(repo, &["ls-tree", "-r", "--name-only", &snapshot]).unwrap();
+		assert!(names.lines().any(|name| name == "source/new.rs"));
+		assert_eq!(git_stdout(repo, &["write-tree"]).unwrap(), index_before);
+		assert!(
+			untracked_inputs(repo, &[PathBuf::from("source")], &[])
+				.unwrap()
+				.is_empty()
+		);
+	}
+
+	#[test]
+	fn rustflag_identity_is_stable_across_cache_state_and_changes_with_config() {
+		let temporary = TempDirectory::new("toron-evidence-rustflags").unwrap();
+		let workspace = temporary.path();
+		std::fs::create_dir(workspace.join(".cargo")).unwrap();
+		let config = workspace.join(".cargo/config.toml");
+		std::fs::write(&config, "[build]\nrustflags = ['-Cdebuginfo=0']\n").unwrap();
+		let first = effective_rustflags_digest(workspace, "test-target").unwrap();
+		let second = effective_rustflags_digest(workspace, "test-target").unwrap();
+		assert_eq!(first, second);
+		std::fs::write(&config, "[build]\nrustflags = ['-Cdebuginfo=1']\n").unwrap();
+		assert_ne!(
+			first,
+			effective_rustflags_digest(workspace, "test-target").unwrap()
 		);
 	}
 }
