@@ -410,6 +410,19 @@ pub(crate) fn assemble(
 	let mut figures = Vec::new();
 	let mut datasets: BTreeMap<String, DatasetEntry> = BTreeMap::new();
 	let mut used_ids = std::collections::HashSet::new();
+	// PRODUCT-0154 §5: layout is relative placement. The desktop workspace's
+	// absolute cells — the editor columns a dashboard sat beside — are not
+	// content, so every rectangle is rebased to the published bounding box.
+	let origin_col = exports
+		.iter()
+		.map(|export| export.layout.col)
+		.min()
+		.unwrap_or(0);
+	let origin_row = exports
+		.iter()
+		.map(|export| export.layout.row)
+		.min()
+		.unwrap_or(0);
 
 	for (index, mut export) in exports.into_iter().enumerate() {
 		let figure_name = export.title.clone();
@@ -558,7 +571,12 @@ pub(crate) fn assemble(
 			subtitle,
 			family: family.clone(),
 			dataset: dataset_digest,
-			layout: export.layout,
+			layout: GridRect {
+				col: export.layout.col - origin_col,
+				row: export.layout.row - origin_row,
+				width: export.layout.width.max(1),
+				height: export.layout.height.max(1),
+			},
 		});
 		files.insert(
 			definition_file,
@@ -1077,6 +1095,11 @@ pub(crate) struct PublishPrompt {
 }
 
 #[cfg(test)]
+mod tests_support {
+	pub(super) use super::tests::{artifact, fixture, publish, request};
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::plot::composition::PlotComposition;
@@ -1098,7 +1121,7 @@ mod tests {
 		artifact
 	}
 
-	fn artifact() -> Arc<ResultArtifact> {
+	pub(super) fn artifact() -> Arc<ResultArtifact> {
 		artifact_with("sqlite")
 	}
 
@@ -1155,7 +1178,7 @@ mod tests {
 		})
 	}
 
-	fn fixture(
+	pub(super) fn fixture(
 		title: &str,
 		artifact: &Arc<ResultArtifact>,
 		plot_type: PlotType,
@@ -1172,7 +1195,7 @@ mod tests {
 		}
 	}
 
-	fn request() -> PublishRequest {
+	pub(super) fn request() -> PublishRequest {
 		request_at("2026-09-03T00:00:00Z")
 	}
 
@@ -1180,7 +1203,7 @@ mod tests {
 		exports.iter().map(|export| export.publication).collect()
 	}
 
-	fn publish(exports: Vec<HostPlotExport>, request: &PublishRequest) -> Package {
+	pub(super) fn publish(exports: Vec<HostPlotExport>, request: &PublishRequest) -> Package {
 		let witness = witness_of(&exports);
 		assemble(&witness, exports, request).expect("package")
 	}
@@ -1651,5 +1674,85 @@ mod tests {
 		);
 		let _ = std::fs::remove_dir_all(&root);
 		let _ = std::fs::remove_dir_all(&linked);
+	}
+}
+
+#[cfg(test)]
+mod layout_tests {
+	use super::tests_support::*;
+	use super::*;
+	use crate::plot::core::PlotType;
+
+	/// The dogfood finding: a dashboard beside a 98-column editor published its
+	/// figures at columns 99–197 and left half the browser blank. Layout is
+	/// relative placement; the workspace's absolute cells are not content.
+	#[test]
+	fn product_0154_layout_is_rebased_to_the_published_bounding_box() {
+		let artifact = artifact();
+		let mut left = fixture("Left", &artifact, PlotType::Scatter, 0);
+		left.layout = GridRect {
+			col: 99,
+			row: 3,
+			width: 49,
+			height: 20,
+		};
+		let mut right = fixture("Right", &artifact, PlotType::Line, 1);
+		right.layout = GridRect {
+			col: 148,
+			row: 3,
+			width: 49,
+			height: 20,
+		};
+		let mut below = fixture("Below", &artifact, PlotType::Scatter, 2);
+		below.layout = GridRect {
+			col: 99,
+			row: 23,
+			width: 98,
+			height: 20,
+		};
+		let package = publish(vec![left, right, below], &request());
+		let layouts: Vec<GridRect> = package.manifest.figures.iter().map(|f| f.layout).collect();
+		assert_eq!(
+			layouts,
+			[
+				GridRect {
+					col: 0,
+					row: 0,
+					width: 49,
+					height: 20
+				},
+				GridRect {
+					col: 49,
+					row: 0,
+					width: 49,
+					height: 20
+				},
+				GridRect {
+					col: 0,
+					row: 20,
+					width: 98,
+					height: 20
+				},
+			]
+		);
+		let shell = String::from_utf8(package.files[SHELL_FILE].clone()).expect("html");
+		assert!(
+			shell.contains("grid-template-columns: repeat(98, 1fr)"),
+			"{shell}"
+		);
+		assert!(shell.contains("grid-column: 1 / span 49; grid-row: 1 / span 20;"));
+		assert!(shell.contains("grid-column: 50 / span 49; grid-row: 1 / span 20;"));
+		assert!(shell.contains("grid-column: 1 / span 98; grid-row: 21 / span 20;"));
+		let unshifted = publish(
+			vec![
+				fixture("Left", &artifact, PlotType::Scatter, 0),
+				fixture("Right", &artifact, PlotType::Line, 1),
+			],
+			&request(),
+		);
+		assert_eq!(
+			unshifted.manifest.figures[0].layout.col, 0,
+			"already-rebased input is unchanged"
+		);
 	}
 }

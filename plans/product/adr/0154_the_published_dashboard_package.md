@@ -144,7 +144,9 @@ entry names: a figure id, stable within the package and derived from the
 PRODUCT-0010 §5 durable key when the view is named and from the export
 ordinal otherwise, with that distinction recorded; the title and subtitle
 from the resolved chrome; the mark family; the dataset digest; and its
-layout rectangle in the dashboard's grid, in cells. The directory holds
+layout rectangle in the dashboard's grid, in cells, rebased to the bounding
+box of the published figures so the workspace's absolute cells never enter
+the package. The directory holds
 `definition.json` — the authored plot definition as a DTO, PRODUCT-0002
 §8's saved specification — `presentation.json` — every effective
 setting with its provenance tier, projected from the PRODUCT-0141 registry —
