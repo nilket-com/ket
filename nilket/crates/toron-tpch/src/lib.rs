@@ -5142,6 +5142,7 @@ pub fn join_diagnostics_disabled() -> bool {
 		&& !toron::exec::join_batch_local_equivalence_enabled()
 		&& !toron::exec::join_replay_input_diagnostic_enabled()
 		&& !toron::exec::chain_stage_profile_enabled()
+		&& !toron::exec::node_attribution::node_attribution_profile_enabled()
 }
 
 /// One timed child: exactly one query execution on one arm. `query_elapsed_ms` covers the

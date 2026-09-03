@@ -114,6 +114,7 @@ async fn run() -> ExitCode {
 		"perf" => perf_command(&args).await,
 		"perf-run-one" => perf_run_one_command(&args).await,
 		"adr584-q21-attribution" => adr584_q21_attribution_command(&args),
+		"adr585-q21-decomposition" => adr585_q21_decomposition_command(&args),
 		"adr449-gate-zero" => adr449_gate_zero_command(&args),
 		"adr450-scale-ladder" => adr450_scale_ladder_command(&args),
 		"adr448-capability" => {
@@ -709,6 +710,8 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 						.unwrap_or(f64::NAN);
 					row["node_attribution_outer_reconciliation"] =
 						node_attribution_outer_reconciliation(&profile, execute_ms);
+					row["node_attribution_profile_receipt_path"] =
+						serde_json::json!(Path::new(&path).display().to_string());
 					row["node_attribution"] = profile;
 				}
 				Err(error) => {
@@ -1356,6 +1359,607 @@ fn evaluate_adr584_pairs(rows: &[serde_json::Value]) -> Result<serde_json::Value
 		"owner_floor_ms": owner_floor,
 		"term_medians_scaled_ms": medians.into_iter().map(|(term, value)| serde_json::json!({"term": term, "median_scaled_ms": value})).collect::<Vec<_>>(),
 		"candidate_terms": candidates,
+		"owner": owner,
+	}))
+}
+
+const ADR585_PAIRS: usize = 5;
+const ADR585_SEALED_BASELINE_EXECUTABLE: &str =
+	"b436a843b107b2f385d5e7c2486c41b1d1f89acfdb4af75f8a4793c823a05ee4";
+const ADR585_ADR584_EXECUTABLE: &str =
+	"a173e8252a3f37839166a98adad8005f22d590f858121c1fb6ff3f3f6a58ec3f";
+const ADR585_TERM_FIELDS: [(&str, &str); 13] = [
+	("runtime_prep_inner_1", "runtime_prep_inner_1_micros"),
+	("runtime_prep_inner_2", "runtime_prep_inner_2_micros"),
+	("runtime_prep_semi_read", "runtime_prep_semi_read_micros"),
+	("runtime_prep_semi_write", "runtime_prep_semi_write_micros"),
+	("runtime_prep_anti_read", "runtime_prep_anti_read_micros"),
+	("runtime_prep_anti_write", "runtime_prep_anti_write_micros"),
+	("runtime_prep_residual", "runtime_prep_residual_micros"),
+	("base_prep", "base_prep_inclusive_micros"),
+	("finalize", "finalize_inclusive_micros"),
+	("cleanup", "cleanup_inclusive_micros"),
+	("outside_handler_span", "outside_handler_span_micros"),
+	("lifecycle_residual", "lifecycle_residual_micros"),
+	("outer_residual", "outer_residual_micros"),
+];
+
+fn adr585_q21_decomposition_command(args: &[String]) -> ExitCode {
+	match run_adr585_q21_decomposition(args) {
+		Ok(summary) => {
+			println!("{summary}");
+			ExitCode::SUCCESS
+		}
+		Err(message) => harness_error(&message),
+	}
+}
+
+fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, String> {
+	let mode = flag_value(args, "--mode").unwrap_or("strict");
+	let sf = resolved_sf(args)?;
+	let data_source = flag_value(args, "--data-source").unwrap_or("parquet");
+	let data_dir = data_dir_from_args(args);
+	let output_dir = PathBuf::from(
+		flag_value(args, "--output-dir").unwrap_or("target/tpch/adr585-q21-decomposition"),
+	);
+	if mode != "strict" || sf != 8.0 || !matches!(data_source, "parquet" | "persisted") {
+		return Err(format!(
+			"ADR 585 requires --mode strict --sf 8 --data-source parquet; got mode={mode:?} sf={sf} data_source={data_source:?}"
+		));
+	}
+	if output_dir.exists() {
+		return Err(format!(
+			"ADR 585 requires a fresh output directory; {} already exists",
+			output_dir.display()
+		));
+	}
+	if std::env::var_os("TORON_NODE_ATTRIBUTION_PROFILE_PATH").is_some() {
+		return Err(
+			"ADR 585 parent environment must not set TORON_NODE_ATTRIBUTION_PROFILE_PATH"
+				.to_string(),
+		);
+	}
+	let budget = GaugeBudget::from_environment()?;
+	if budget.memory_per_task != 2_147_483_648
+		|| budget.memory_per_task_provenance != "explicit"
+		|| budget.spill_bytes_reserved != 2_147_483_648
+		|| budget.spill_bytes_reserved_provenance != "explicit"
+	{
+		return Err("ADR 585 requires explicit 2 GiB task memory and spill reserve".to_string());
+	}
+	let concurrency = gauge_partition_work_concurrency_requested()?;
+	if concurrency != (1, "explicit") {
+		return Err(format!(
+			"ADR 585 requires explicit partition parallelism 1, got {concurrency:?}"
+		));
+	}
+	let identity = runtime_identity()?.ok_or_else(|| {
+		"ADR 585 must run through toron-bench build/run with a staged executable".to_string()
+	})?;
+	if identity.manifest.recipe.profile != "release" {
+		return Err(format!(
+			"ADR 585 requires a release build, got {:?}",
+			identity.manifest.recipe.profile
+		));
+	}
+	let host_start = observe_host_quiescence();
+	if !host_start.quiescent() {
+		return Err("ADR 585 requires the local deployment and SQL port quiescent".to_string());
+	}
+	let scratch = std::env::var_os("TORON_JOIN_SPILL_DIR")
+		.filter(|value| !value.is_empty())
+		.map(PathBuf::from)
+		.unwrap_or_else(|| std::env::temp_dir().join("toron_join_spill"));
+	if !directory_is_empty(&scratch)? {
+		return Err(format!(
+			"ADR 585 spill scratch {} is not empty before the run",
+			scratch.display()
+		));
+	}
+	let dataset = load_persisted_tpch_dataset(mode, sf, &data_dir)?;
+	if dataset.verification.as_str() != "full_hash" {
+		return Err(format!(
+			"ADR 585 requires full-hash dataset verification, got {}",
+			dataset.verification.as_str()
+		));
+	}
+	let journal = prepare_perf_sample_journal(&output_dir)?;
+	std::fs::create_dir_all(output_dir.join("profiles"))
+		.map_err(|error| format!("create ADR 585 profile directory: {error}"))?;
+
+	let mut warmup = run_adr585_child(
+		0,
+		true,
+		false,
+		mode,
+		sf,
+		data_source,
+		&data_dir,
+		&output_dir,
+	)?;
+	warmup["adr585_arm"] = serde_json::json!("off");
+	warmup["adr585_pair"] = serde_json::Value::Null;
+	journal.append(&warmup)?;
+
+	let mut rows = Vec::with_capacity(ADR585_PAIRS * 2);
+	for pair in 0..ADR585_PAIRS {
+		let order = if pair % 2 == 0 {
+			[false, true]
+		} else {
+			[true, false]
+		};
+		for (position, on) in order.into_iter().enumerate() {
+			let mut row = run_adr585_child(
+				pair as u32,
+				false,
+				on,
+				mode,
+				sf,
+				data_source,
+				&data_dir,
+				&output_dir,
+			)?;
+			row["adr585_arm"] = serde_json::json!(if on { "on" } else { "off" });
+			row["adr585_pair"] = serde_json::json!(pair);
+			row["adr585_pair_position"] = serde_json::json!(position);
+			journal.append(&row)?;
+			rows.push(row);
+		}
+	}
+	let host_end = observe_host_quiescence();
+	if !host_end.quiescent() || !directory_is_empty(&scratch)? {
+		return Err(
+			"ADR 585 lost host quiescence or left spill scratch after measurement".to_string(),
+		);
+	}
+	let mut summary = evaluate_adr585_pairs(&rows)?;
+	summary["kind"] = serde_json::json!("adr585_q21_outside_drive_decomposition");
+	summary["sealed"] = serde_json::json!(false);
+	summary["candidate_authority"] = serde_json::json!(false);
+	summary["sealed_baseline_executable_sha256"] =
+		serde_json::json!(ADR585_SEALED_BASELINE_EXECUTABLE);
+	summary["adr584_instrumented_executable_sha256"] = serde_json::json!(ADR585_ADR584_EXECUTABLE);
+	summary["instrumented_evidence_identity"] = identity.json_value();
+	summary["dataset_manifest_fingerprint"] = serde_json::json!(dataset.manifest_fingerprint);
+	summary["memory_per_task"] = serde_json::json!(budget.memory_per_task);
+	summary["spill_bytes_reserved"] = serde_json::json!(budget.spill_bytes_reserved);
+	summary["partition_work_concurrency_requested"] = serde_json::json!(concurrency.0);
+	summary["warmup_execute_ms"] = warmup.get("execute_ms").cloned().unwrap_or_default();
+	write_json_atomically(&output_dir.join("summary.json"), &summary)?;
+	Ok(summary)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_adr585_child(
+	run_index: u32,
+	warmup: bool,
+	on: bool,
+	mode: &str,
+	sf: f64,
+	data_source: &str,
+	data_dir: &Path,
+	output_dir: &Path,
+) -> Result<serde_json::Value, String> {
+	let mut args = vec![
+		"perf-run-one".to_string(),
+		"--engine".to_string(),
+		"toron".to_string(),
+		"--query".to_string(),
+		"q21".to_string(),
+		"--mode".to_string(),
+		mode.to_string(),
+		"--sf".to_string(),
+		sf.to_string(),
+		"--run-index".to_string(),
+		run_index.to_string(),
+		"--data-source".to_string(),
+		data_source.to_string(),
+		"--data-dir".to_string(),
+		data_dir.display().to_string(),
+	];
+	if warmup {
+		args.push("--warmup-run".to_string());
+	}
+	let profile = output_dir
+		.join("profiles")
+		.join(format!("pair-{run_index:02}-on.json"));
+	let profile_text = profile
+		.to_str()
+		.ok_or_else(|| "ADR 585 profile path is not UTF-8".to_string())?;
+	let row = if on {
+		run_perf_child_args_with_envs(
+			&args,
+			&[("TORON_NODE_ATTRIBUTION_PROFILE_PATH", profile_text)],
+		)?
+	} else {
+		run_perf_child_args(&args)?
+	};
+	if row.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+		return Err(format!("ADR 585 child did not pass: {row}"));
+	}
+	Ok(row)
+}
+
+fn adr585_u64(value: &serde_json::Value, field: &str) -> Result<u64, String> {
+	value
+		.get(field)
+		.and_then(serde_json::Value::as_u64)
+		.ok_or_else(|| format!("ADR 585 receipt lacks integer {field}"))
+}
+
+fn adr585_target_receipt<'a>(
+	row: &'a serde_json::Value,
+	pair: usize,
+) -> Result<(&'a serde_json::Value, &'a serde_json::Value), String> {
+	let profile = row
+		.get("node_attribution")
+		.ok_or_else(|| format!("ADR 585 pair {pair} lacks node attribution"))?;
+	let matches = profile
+		.get("aggregate_invocations")
+		.and_then(serde_json::Value::as_array)
+		.ok_or_else(|| format!("ADR 585 pair {pair} lacks aggregate invocations"))?
+		.iter()
+		.filter(|invocation| {
+			invocation.get("route").and_then(serde_json::Value::as_str)
+				== Some("inner_prefix_semi_anti_grouped")
+		})
+		.collect::<Vec<_>>();
+	if matches.len() != 1 {
+		return Err(format!(
+			"ADR 585 pair {pair} requires exactly one inner_prefix_semi_anti_grouped receipt, found {}",
+			matches.len()
+		));
+	}
+	let invocation = matches[0];
+	if invocation
+		.pointer("/bridge/passed")
+		.and_then(serde_json::Value::as_bool)
+		!= Some(true)
+		|| invocation
+			.pointer("/stages/passed")
+			.and_then(serde_json::Value::as_bool)
+			!= Some(true)
+	{
+		return Err(format!(
+			"ADR 585 pair {pair} target invocation failed ADR 507's exclusive reconciliation"
+		));
+	}
+	let receipt = invocation
+		.get("inclusive_lifecycle_receipt")
+		.filter(|value| !value.is_null())
+		.ok_or_else(|| format!("ADR 585 pair {pair} target invocation lacks lifecycle receipt"))?;
+	if receipt.get("status").and_then(serde_json::Value::as_str) != Some("reconciled")
+		|| receipt.get("passed").and_then(serde_json::Value::as_bool) != Some(true)
+	{
+		return Err(format!(
+			"ADR 585 pair {pair} lifecycle receipt is not reconciled: {receipt}"
+		));
+	}
+	if receipt
+		.get("invocation_id")
+		.and_then(serde_json::Value::as_u64)
+		!= invocation
+			.get("invocation_id")
+			.and_then(serde_json::Value::as_u64)
+	{
+		return Err(format!(
+			"ADR 585 pair {pair} lifecycle receipt is not bound to its invocation"
+		));
+	}
+	Ok((profile, receipt))
+}
+
+fn evaluate_adr585_pairs(rows: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+	if rows.len() != ADR585_PAIRS * 2 {
+		return Err(format!(
+			"ADR 585 requires {} measured rows, found {}",
+			ADR585_PAIRS * 2,
+			rows.len()
+		));
+	}
+	let first = rows
+		.first()
+		.ok_or_else(|| "ADR 585 has no rows".to_string())?;
+	for row in rows {
+		let identity = toron_tpch::evidence::compare_row_identities(first, row);
+		if !identity.would_admit {
+			return Err(format!(
+				"ADR 585 arms differ in identity: {:?}",
+				identity.reasons
+			));
+		}
+		if row.get("query").and_then(serde_json::Value::as_str) != Some("q21")
+			|| row.get("status").and_then(serde_json::Value::as_str) != Some("pass")
+		{
+			return Err("ADR 585 accepts only passing q21 rows".to_string());
+		}
+	}
+	let mut movements = Vec::new();
+	let mut off_execute = Vec::new();
+	let mut on_execute = Vec::new();
+	let mut profile_paths = BTreeSet::new();
+	let mut pair_records = Vec::new();
+	let mut term_samples = ADR585_TERM_FIELDS
+		.iter()
+		.map(|(name, _)| ((*name).to_string(), Vec::<f64>::new()))
+		.collect::<BTreeMap<_, _>>();
+	let mut drive_samples = Vec::new();
+	let mut non_drive_samples = Vec::new();
+	let mut removable_samples = Vec::new();
+
+	for pair in 0..ADR585_PAIRS {
+		let pair_rows = rows
+			.iter()
+			.filter(|row| {
+				row.get("adr585_pair").and_then(serde_json::Value::as_u64) == Some(pair as u64)
+			})
+			.collect::<Vec<_>>();
+		let off = pair_rows
+			.iter()
+			.find(|row| row.get("adr585_arm").and_then(serde_json::Value::as_str) == Some("off"))
+			.ok_or_else(|| format!("ADR 585 pair {pair} lacks off arm"))?;
+		let on = pair_rows
+			.iter()
+			.find(|row| row.get("adr585_arm").and_then(serde_json::Value::as_str) == Some("on"))
+			.ok_or_else(|| format!("ADR 585 pair {pair} lacks on arm"))?;
+		let expected_order = if pair % 2 == 0 {
+			[("off", 0), ("on", 1)]
+		} else {
+			[("on", 0), ("off", 1)]
+		};
+		for (arm, position) in expected_order {
+			let observed = pair_rows
+				.iter()
+				.find(|row| row.get("adr585_arm").and_then(serde_json::Value::as_str) == Some(arm));
+			if observed
+				.and_then(|row| row.get("adr585_pair_position"))
+				.and_then(serde_json::Value::as_u64)
+				!= Some(position)
+			{
+				return Err(format!(
+					"ADR 585 pair {pair} does not use its declared alternating order"
+				));
+			}
+		}
+		if off
+			.get("diagnostics_disabled")
+			.and_then(serde_json::Value::as_bool)
+			!= Some(true)
+			|| off.get("node_attribution").is_some()
+			|| off.get("node_attribution_profile_receipt_path").is_some()
+		{
+			return Err(format!(
+				"ADR 585 pair {pair} off arm is not diagnostic-free"
+			));
+		}
+		if on
+			.get("diagnostics_disabled")
+			.and_then(serde_json::Value::as_bool)
+			!= Some(false)
+		{
+			return Err(format!(
+				"ADR 585 pair {pair} on arm did not void diagnostic authority"
+			));
+		}
+		let path = on
+			.get("node_attribution_profile_receipt_path")
+			.and_then(serde_json::Value::as_str)
+			.ok_or_else(|| format!("ADR 585 pair {pair} lacks node-profile receipt path"))?;
+		if !profile_paths.insert(path.to_string()) {
+			return Err(format!(
+				"ADR 585 pair {pair} reuses node-profile receipt path {path:?}"
+			));
+		}
+		let execute_off_ms = required_f64(off, "execute_ms")?;
+		let execute_on_ms = required_f64(on, "execute_ms")?;
+		if execute_off_ms <= 0.0 || execute_on_ms <= 0.0 {
+			return Err(format!("ADR 585 pair {pair} has non-positive execute time"));
+		}
+		let execute_on_micros = (execute_on_ms * 1000.0).round() as u64;
+		let movement = (execute_on_ms - execute_off_ms) / execute_off_ms;
+		movements.push(movement.abs());
+		off_execute.push(execute_off_ms);
+		on_execute.push(execute_on_ms);
+		let (profile, receipt) = adr585_target_receipt(on, pair)?;
+		let root_span = adr585_u64(profile, "execute_bound_span_micros")?;
+		let outer = on
+			.get("node_attribution_outer_reconciliation")
+			.ok_or_else(|| format!("ADR 585 pair {pair} lacks outer reconciliation"))?;
+		let outer_residual = adr585_u64(outer, "outer_residual_micros")?;
+		let outer_complete = outer
+			.get("within_boundary")
+			.and_then(serde_json::Value::as_bool)
+			== Some(true);
+		if root_span.checked_add(outer_residual) != Some(execute_on_micros) {
+			return Err(format!(
+				"ADR 585 pair {pair} outer algebra does not reconcile"
+			));
+		}
+		let handler = adr585_u64(receipt, "handler_inclusive_micros")?;
+		let outside_handler = adr585_u64(receipt, "outside_handler_span_micros")?;
+		if handler.checked_add(outside_handler) != Some(root_span) {
+			return Err(format!(
+				"ADR 585 pair {pair} handler algebra does not reconcile"
+			));
+		}
+		let runtime = adr585_u64(receipt, "runtime_prep_inclusive_micros")?;
+		let runtime_residual = adr585_u64(receipt, "runtime_prep_residual_micros")?;
+		for field in [
+			"runtime_prep_semi_read_micros",
+			"runtime_prep_semi_write_micros",
+			"runtime_prep_anti_read_micros",
+			"runtime_prep_anti_write_micros",
+		] {
+			if adr585_u64(receipt, field)? == 0 {
+				return Err(format!(
+					"ADR 585 pair {pair} requires non-zero multi-batch summary term {field}"
+				));
+			}
+		}
+		let runtime_children = [
+			"runtime_prep_inner_1_micros",
+			"runtime_prep_inner_2_micros",
+			"runtime_prep_semi_read_micros",
+			"runtime_prep_semi_write_micros",
+			"runtime_prep_anti_read_micros",
+			"runtime_prep_anti_write_micros",
+		]
+		.into_iter()
+		.try_fold(0u64, |total, field| {
+			adr585_u64(receipt, field).and_then(|value| {
+				total
+					.checked_add(value)
+					.ok_or_else(|| "ADR 585 runtime child sum overflowed".to_string())
+			})
+		})?;
+		if runtime_children.checked_add(runtime_residual) != Some(runtime) {
+			return Err(format!(
+				"ADR 585 pair {pair} runtime-prep algebra does not reconcile"
+			));
+		}
+		let base = adr585_u64(receipt, "base_prep_inclusive_micros")?;
+		let drive = adr585_u64(receipt, "drive_inclusive_micros")?;
+		let finalize = adr585_u64(receipt, "finalize_inclusive_micros")?;
+		let cleanup = adr585_u64(receipt, "cleanup_inclusive_micros")?;
+		let lifecycle_residual = adr585_u64(receipt, "lifecycle_residual_micros")?;
+		let lifecycle_sum = [runtime, base, drive, finalize, cleanup, lifecycle_residual]
+			.into_iter()
+			.try_fold(0u64, |total, value| total.checked_add(value))
+			.ok_or_else(|| "ADR 585 lifecycle sum overflowed".to_string())?;
+		if lifecycle_sum != handler {
+			return Err(format!(
+				"ADR 585 pair {pair} lifecycle algebra does not reconcile"
+			));
+		}
+		let overhead = (execute_on_ms - execute_off_ms).max(0.0) * 1000.0;
+		let residual_bound = overhead + 0.05 * handler as f64;
+		let residuals_complete = runtime_residual as f64 <= residual_bound
+			&& lifecycle_residual as f64 <= residual_bound;
+		let profile_complete = outer_complete && residuals_complete;
+		for (name, field) in ADR585_TERM_FIELDS {
+			let micros = if field == "outer_residual_micros" {
+				outer_residual
+			} else {
+				adr585_u64(receipt, field)?
+			};
+			term_samples
+				.get_mut(name)
+				.expect("term universe initialized")
+				.push(micros as f64 / execute_on_micros as f64 * execute_off_ms);
+		}
+		drive_samples.push(drive as f64 / execute_on_micros as f64 * execute_off_ms);
+		non_drive_samples
+			.push((execute_on_micros - drive) as f64 / execute_on_micros as f64 * execute_off_ms);
+		let removable = adr585_u64(receipt, "runtime_prep_semi_read_micros")?
+			.min(adr585_u64(receipt, "runtime_prep_anti_read_micros")?);
+		removable_samples.push(removable as f64 / execute_on_micros as f64 * execute_off_ms);
+		pair_records.push(serde_json::json!({
+			"pair": pair,
+			"execute_off_ms": execute_off_ms,
+			"execute_on_ms": execute_on_ms,
+			"movement": movement,
+			"overhead_micros": overhead,
+			"root_span_micros": root_span,
+			"outer_residual_micros": outer_residual,
+			"handler_inclusive_micros": handler,
+			"outside_handler_span_micros": outside_handler,
+			"runtime_prep_inclusive_micros": runtime,
+			"runtime_prep_inner_1_micros": adr585_u64(receipt, "runtime_prep_inner_1_micros")?,
+			"runtime_prep_inner_2_micros": adr585_u64(receipt, "runtime_prep_inner_2_micros")?,
+			"runtime_prep_semi_read_micros": adr585_u64(receipt, "runtime_prep_semi_read_micros")?,
+			"runtime_prep_semi_write_micros": adr585_u64(receipt, "runtime_prep_semi_write_micros")?,
+			"runtime_prep_anti_read_micros": adr585_u64(receipt, "runtime_prep_anti_read_micros")?,
+			"runtime_prep_anti_write_micros": adr585_u64(receipt, "runtime_prep_anti_write_micros")?,
+			"runtime_prep_residual_micros": runtime_residual,
+			"base_prep_inclusive_micros": base,
+			"drive_inclusive_micros": drive,
+			"finalize_inclusive_micros": finalize,
+			"cleanup_inclusive_micros": cleanup,
+			"lifecycle_residual_micros": lifecycle_residual,
+			"residual_bound_micros": residual_bound,
+			"profile_complete": profile_complete,
+			"profile_receipt_path": path,
+		}));
+	}
+	let median_abs_movement = median(&mut movements);
+	let perturbation_accepted = median_abs_movement <= 0.25;
+	let all_profiles_complete = pair_records
+		.iter()
+		.all(|pair| pair["profile_complete"] == true);
+	let off_min = off_execute.iter().copied().fold(f64::INFINITY, f64::min);
+	let off_max = off_execute
+		.iter()
+		.copied()
+		.fold(f64::NEG_INFINITY, f64::max);
+	let off_range = off_max - off_min;
+	let off_median = median(&mut off_execute);
+	let on_median = median(&mut on_execute);
+	let owner_floor = 500.0f64.max(2.0 * off_range);
+	let mut medians = term_samples
+		.into_iter()
+		.map(|(name, mut values)| (name, median(&mut values)))
+		.collect::<Vec<_>>();
+	medians.sort_by(|left, right| right.1.total_cmp(&left.1));
+	let candidates = medians
+		.iter()
+		.filter(|(_, value)| *value > owner_floor)
+		.map(|(name, value)| {
+			serde_json::json!({
+				"term": name,
+				"median_scaled_ms": value,
+				"share_of_off_execute": value / off_median,
+			})
+		})
+		.collect::<Vec<_>>();
+	let residual_name = |name: &str| name.contains("residual");
+	let owner = if !perturbation_accepted {
+		serde_json::json!({"status": "withheld_perturbation_rejected"})
+	} else if !all_profiles_complete {
+		serde_json::json!({"status": "withheld_incomplete_profiles"})
+	} else {
+		match (medians.first(), medians.get(1)) {
+			(Some((name, value)), _) if residual_name(name) && *value > owner_floor => {
+				serde_json::json!({
+					"status": "withheld_instrument_incomplete",
+					"leading_residual": name,
+					"median_scaled_ms": value,
+				})
+			}
+			(Some((name, value)), Some((_, second)))
+				if *value > owner_floor && value - second > off_range =>
+			{
+				serde_json::json!({
+					"status": "resolved",
+					"term": name,
+					"median_scaled_ms": value,
+					"share_of_off_execute": value / off_median,
+				})
+			}
+			(Some((name, value)), _) if *value > owner_floor => serde_json::json!({
+				"status": "unresolved_tie_within_off_range",
+				"leading_term": name,
+				"median_scaled_ms": value,
+			}),
+			_ => serde_json::json!({"status": "no_term_clears_floor"}),
+		}
+	};
+	let removable_median = median(&mut removable_samples);
+	Ok(serde_json::json!({
+		"pair_count": ADR585_PAIRS,
+		"pairs": pair_records,
+		"median_absolute_movement": median_abs_movement,
+		"perturbation_gate": if perturbation_accepted { "accepted" } else { "rejected" },
+		"all_profiles_complete": all_profiles_complete,
+		"off_execute_median_ms": off_median,
+		"on_execute_median_ms": on_median,
+		"off_execute_range_ms": off_range,
+		"owner_floor_ms": owner_floor,
+		"term_medians_scaled_ms": medians.into_iter().map(|(term, value)| serde_json::json!({"term": term, "median_scaled_ms": value})).collect::<Vec<_>>(),
+		"candidate_terms": candidates,
+		"drive_inclusive_median_scaled_ms": median(&mut drive_samples),
+		"non_drive_median_scaled_ms": median(&mut non_drive_samples),
+		"shared_source_removable_read_median_scaled_ms": removable_median,
+		"shared_source_candidate": if removable_median > owner_floor { "opens" } else { "closed_below_floor" },
 		"owner": owner,
 	}))
 }
@@ -6394,7 +6998,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|adr584-q21-attribution|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|adr584-q21-attribution|adr585-q21-decomposition|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -7259,6 +7863,247 @@ mod tests {
 			evaluate_adr584_pairs(&rows)
 				.expect_err("a stripped or partial admission set is not evidence")
 				.contains("expected three")
+		);
+	}
+
+	fn adr585_fixture_row(pair: usize, on: bool) -> serde_json::Value {
+		let off_ms = 10_000.0 + pair as f64 * 100.0;
+		let execute_ms = if on { off_ms + 100.0 } else { off_ms };
+		let identity = serde_json::json!({
+			"executable_sha256": "1".repeat(64),
+			"recipe_sha256": "2".repeat(64),
+			"source_tree_id": "3".repeat(40),
+			"harness_sha256": "4".repeat(64),
+			"toron_sha256": "5".repeat(64),
+			"authority_issues": [],
+		});
+		let mut row = serde_json::json!({
+			"query": "q21",
+			"status": "pass",
+			"execute_ms": execute_ms,
+			"adr585_pair": pair,
+			"adr585_arm": if on { "on" } else { "off" },
+			"adr585_pair_position": if pair % 2 == 0 { if on { 1 } else { 0 } } else if on { 0 } else { 1 },
+			"diagnostics_disabled": !on,
+			"evidence_identity": identity,
+		});
+		if on {
+			let execute_micros = (execute_ms * 1000.0) as u64;
+			let root = execute_micros - 1_000;
+			let handler = 8_400_000u64;
+			row["node_attribution_profile_receipt_path"] =
+				serde_json::json!(format!("pair-{pair:02}-on.json"));
+			row["node_attribution_outer_reconciliation"] = serde_json::json!({
+				"execute_bound_span_micros": root,
+				"execute_micros": execute_micros,
+				"outer_residual_micros": 1_000,
+				"within_boundary": true,
+			});
+			row["node_attribution"] = serde_json::json!({
+				"execute_bound_span_micros": root,
+				"aggregate_invocations": [{
+					"invocation_id": 17,
+					"route": "inner_prefix_semi_anti_grouped",
+					"bridge": {"passed": true},
+					"stages": {"passed": true},
+					"inclusive_lifecycle_receipt": {
+						"status": "reconciled",
+						"passed": true,
+						"invocation_id": 17,
+						"handler_inclusive_micros": handler,
+						"runtime_prep_inclusive_micros": 6_000_000,
+						"runtime_prep_inner_1_micros": 3_000_000,
+						"runtime_prep_inner_2_micros": 1_600_000,
+						"runtime_prep_semi_read_micros": 300_000,
+						"runtime_prep_semi_write_micros": 200_000,
+						"runtime_prep_anti_read_micros": 400_000,
+						"runtime_prep_anti_write_micros": 300_000,
+						"runtime_prep_residual_micros": 200_000,
+						"base_prep_inclusive_micros": 500_000,
+						"drive_inclusive_micros": 1_500_000,
+						"finalize_inclusive_micros": 100_000,
+						"cleanup_inclusive_micros": 100_000,
+						"lifecycle_residual_micros": 200_000,
+						"outside_handler_span_micros": root - handler,
+					}
+				}]
+			});
+		}
+		row
+	}
+
+	fn reconcile_adr585_fixture(row: &mut serde_json::Value) {
+		let root = row["node_attribution"]["execute_bound_span_micros"]
+			.as_u64()
+			.unwrap();
+		let receipt = row
+			.pointer_mut("/node_attribution/aggregate_invocations/0/inclusive_lifecycle_receipt")
+			.expect("fixture receipt");
+		let children = [
+			"runtime_prep_inner_1_micros",
+			"runtime_prep_inner_2_micros",
+			"runtime_prep_semi_read_micros",
+			"runtime_prep_semi_write_micros",
+			"runtime_prep_anti_read_micros",
+			"runtime_prep_anti_write_micros",
+		]
+		.into_iter()
+		.map(|field| receipt[field].as_u64().expect("fixture micros"))
+		.sum::<u64>();
+		let runtime = children + receipt["runtime_prep_residual_micros"].as_u64().unwrap();
+		receipt["runtime_prep_inclusive_micros"] = serde_json::json!(runtime);
+		let handler = runtime
+			+ receipt["base_prep_inclusive_micros"].as_u64().unwrap()
+			+ receipt["drive_inclusive_micros"].as_u64().unwrap()
+			+ receipt["finalize_inclusive_micros"].as_u64().unwrap()
+			+ receipt["cleanup_inclusive_micros"].as_u64().unwrap()
+			+ receipt["lifecycle_residual_micros"].as_u64().unwrap();
+		receipt["handler_inclusive_micros"] = serde_json::json!(handler);
+		receipt["outside_handler_span_micros"] = serde_json::json!(root - handler);
+	}
+
+	#[test]
+	fn adr585_owner_rule_uses_all_thirteen_terms_and_the_off_range() {
+		let rows = (0..ADR585_PAIRS)
+			.flat_map(|pair| {
+				[
+					adr585_fixture_row(pair, false),
+					adr585_fixture_row(pair, true),
+				]
+			})
+			.collect::<Vec<_>>();
+		let summary = evaluate_adr585_pairs(&rows).expect("complete five-pair fixture");
+		assert_eq!(summary["perturbation_gate"], "accepted");
+		assert_eq!(summary["all_profiles_complete"], true);
+		assert_eq!(summary["owner_floor_ms"], 800.0);
+		assert_eq!(
+			summary["term_medians_scaled_ms"].as_array().unwrap().len(),
+			13
+		);
+		assert_eq!(summary["owner"]["status"], "resolved");
+		assert_eq!(summary["owner"]["term"], "runtime_prep_inner_1");
+	}
+
+	#[test]
+	fn adr585_requires_exactly_one_invocation_bound_target_receipt() {
+		let mut rows = (0..ADR585_PAIRS)
+			.flat_map(|pair| {
+				[
+					adr585_fixture_row(pair, false),
+					adr585_fixture_row(pair, true),
+				]
+			})
+			.collect::<Vec<_>>();
+		let duplicate = rows[1]["node_attribution"]["aggregate_invocations"][0].clone();
+		rows[1]["node_attribution"]["aggregate_invocations"]
+			.as_array_mut()
+			.unwrap()
+			.push(duplicate);
+		assert!(
+			evaluate_adr585_pairs(&rows)
+				.expect_err("two target receipts are an instrument defect")
+				.contains("exactly one")
+		);
+	}
+
+	#[test]
+	fn adr585_node_profile_paths_are_unique_per_on_arm() {
+		let mut rows = (0..ADR585_PAIRS)
+			.flat_map(|pair| {
+				[
+					adr585_fixture_row(pair, false),
+					adr585_fixture_row(pair, true),
+				]
+			})
+			.collect::<Vec<_>>();
+		rows[3]["node_attribution_profile_receipt_path"] =
+			rows[1]["node_attribution_profile_receipt_path"].clone();
+		assert!(
+			evaluate_adr585_pairs(&rows)
+				.expect_err("profile reuse must be refused")
+				.contains("reuses node-profile receipt path")
+		);
+	}
+
+	#[test]
+	fn adr585_shared_source_floor_uses_the_pairwise_minimum_not_minimum_of_medians() {
+		let mut rows = (0..ADR585_PAIRS)
+			.flat_map(|pair| {
+				[
+					adr585_fixture_row(pair, false),
+					adr585_fixture_row(pair, true),
+				]
+			})
+			.collect::<Vec<_>>();
+		for pair in 0..ADR585_PAIRS {
+			let on = &mut rows[pair * 2 + 1];
+			let receipt = on
+				.pointer_mut(
+					"/node_attribution/aggregate_invocations/0/inclusive_lifecycle_receipt",
+				)
+				.unwrap();
+			receipt["runtime_prep_semi_read_micros"] =
+				serde_json::json!(if pair < 3 { 1_000_000 } else { 100_000 });
+			receipt["runtime_prep_anti_read_micros"] =
+				serde_json::json!(if pair >= 2 { 1_000_000 } else { 100_000 });
+			reconcile_adr585_fixture(on);
+		}
+		let summary = evaluate_adr585_pairs(&rows).expect("reconciled alias fixture");
+		let terms = summary["term_medians_scaled_ms"].as_array().unwrap();
+		let median_for = |name: &str| {
+			terms.iter().find(|term| term["term"] == name).unwrap()["median_scaled_ms"]
+				.as_f64()
+				.unwrap()
+		};
+		assert!(median_for("runtime_prep_semi_read") > 800.0);
+		assert!(median_for("runtime_prep_anti_read") > 800.0);
+		assert_eq!(summary["shared_source_candidate"], "closed_below_floor");
+		assert!(
+			summary["shared_source_removable_read_median_scaled_ms"]
+				.as_f64()
+				.unwrap() < 800.0
+		);
+	}
+
+	#[test]
+	fn adr585_incomplete_residual_is_reported_and_withholds_the_owner() {
+		let mut rows = (0..ADR585_PAIRS)
+			.flat_map(|pair| {
+				[
+					adr585_fixture_row(pair, false),
+					adr585_fixture_row(pair, true),
+				]
+			})
+			.collect::<Vec<_>>();
+		let receipt = rows[1]
+			.pointer_mut("/node_attribution/aggregate_invocations/0/inclusive_lifecycle_receipt")
+			.unwrap();
+		receipt["runtime_prep_residual_micros"] = serde_json::json!(1_000_000);
+		receipt["runtime_prep_inclusive_micros"] = serde_json::json!(6_800_000);
+		reconcile_adr585_fixture(&mut rows[1]);
+		let summary = evaluate_adr585_pairs(&rows).expect("incomplete samples remain reportable");
+		assert_eq!(summary["pairs"][0]["profile_complete"], false);
+		assert_eq!(summary["owner"]["status"], "withheld_incomplete_profiles");
+	}
+
+	#[test]
+	fn adr585_refuses_a_zero_summary_half() {
+		let mut rows = (0..ADR585_PAIRS)
+			.flat_map(|pair| {
+				[
+					adr585_fixture_row(pair, false),
+					adr585_fixture_row(pair, true),
+				]
+			})
+			.collect::<Vec<_>>();
+		rows[1].pointer_mut(
+			"/node_attribution/aggregate_invocations/0/inclusive_lifecycle_receipt/runtime_prep_semi_read_micros",
+		).unwrap().clone_from(&serde_json::json!(0));
+		reconcile_adr585_fixture(&mut rows[1]);
+		assert!(
+			evaluate_adr585_pairs(&rows)
+				.expect_err("an unobserved summary half is not a complete instrument")
+				.contains("non-zero")
 		);
 	}
 

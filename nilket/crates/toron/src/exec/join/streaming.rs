@@ -19727,9 +19727,26 @@ impl Executor {
 			Vec::with_capacity(chain.inner_stages.len());
 
 		for stage in chain.inner_stages {
+			let replay_id = stage.replay_id;
+			let lifecycle_started = Instant::now();
 			let prepared = self
 				.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(stage, morsel)
 				.await;
+			if let (Some(handle), Some(name)) = (
+				stage_handle.as_ref(),
+				match replay_id {
+					JoinReplayId(1) => Some("runtime_prep_inner_1"),
+					JoinReplayId(2) => Some("runtime_prep_inner_2"),
+					_ => None,
+				},
+			) {
+				node_attribution::record_inclusive_lifecycle_micros(
+					handle,
+					name,
+					duration_micros(lifecycle_started),
+					1,
+				)?;
+			}
 
 			let runtime = match prepared {
 				Ok(Some(runtime)) => runtime,
@@ -19767,6 +19784,9 @@ impl Executor {
 					semi_columns,
 					morsel,
 					inner_resident_bytes,
+					stage_handle.as_ref(),
+					"runtime_prep_semi_read",
+					"runtime_prep_semi_write",
 				)
 				.await
 			{
@@ -19789,6 +19809,9 @@ impl Executor {
 					anti_columns,
 					morsel,
 					anti_baseline,
+					stage_handle.as_ref(),
+					"runtime_prep_anti_read",
+					"runtime_prep_anti_write",
 				)
 				.await
 			{
@@ -21297,6 +21320,7 @@ impl Executor {
 		if let Some(profile) = stage_profile.as_mut() {
 			profile.flush()?;
 		}
+		let lifecycle_drive_started = stage_handle.map(|_| Instant::now());
 
 		let scan_stage = stage_handle.and_then(|handle| {
 			node_attribution::open_stage(handle, "base_scan", &attribution_telemetry)
@@ -22061,6 +22085,14 @@ impl Executor {
 				output_rows: RowCount::new(output_rows),
 			},
 		);
+		if let (Some(handle), Some(started)) = (stage_handle, lifecycle_drive_started) {
+			node_attribution::record_inclusive_lifecycle_micros(
+				handle,
+				"drive",
+				duration_micros(started),
+				1,
+			)?;
+		}
 
 		Ok(Some(()))
 	}
@@ -22787,6 +22819,12 @@ impl Executor {
 		morsel: Option<(MorselId, u32)>,
 
 		baseline_bytes: u64,
+
+		stage_handle: Option<&node_attribution::VocabularyHandle>,
+
+		read_term: &'static str,
+
+		write_term: &'static str,
 	) -> Result<StreamingSemiAntiRuntime<'a>, ExecutionError> {
 		let cap = join_spill_retained_footprint_memory_cap(self.context.task_budget.memory.get());
 
@@ -22805,6 +22843,9 @@ impl Executor {
 			baseline_bytes,
 			cap,
 			&mut summary,
+			stage_handle,
+			read_term,
+			write_term,
 		)
 		.await?;
 
@@ -22872,6 +22913,12 @@ impl Executor {
 		cap: u64,
 
 		summary: &mut NeqExistenceSummary,
+
+		stage_handle: Option<&node_attribution::VocabularyHandle>,
+
+		read_term: &'static str,
+
+		write_term: &'static str,
 	) -> Result<(), ExecutionError> {
 		let (scan_plan, ops) = decompose_streaming_existence_plan(plan).ok_or_else(|| {
 			ExecutionError::InvalidExpression {
@@ -22891,7 +22938,21 @@ impl Executor {
 
 		let mut stream = self.open_scan(req).await?;
 
-		while let Some(batch) = stream.next().await {
+		let mut read_micros = 0u64;
+		let mut write_micros = 0u64;
+		let mut calls = 0u64;
+		loop {
+			let read_started = Instant::now();
+			let next = stream.next().await;
+			read_micros = read_micros
+				.checked_add(duration_micros(read_started))
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "recognized Neq summary read timer overflowed".to_string(),
+				})?;
+			let Some(batch) = next else {
+				break;
+			};
+			let write_started = Instant::now();
 			let mut batch = batch?;
 
 			if let Some(limit) = remaining.as_mut() {
@@ -22974,6 +23035,31 @@ impl Executor {
 					cap,
 				)?;
 			}
+			write_micros = write_micros
+				.checked_add(duration_micros(write_started))
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "recognized Neq summary write timer overflowed".to_string(),
+				})?;
+			calls = calls.checked_add(1).ok_or_else(|| ExecutionError::Kernel {
+				message: "recognized Neq summary timing call count overflowed".to_string(),
+			})?;
+		}
+		if let Some(handle) = stage_handle {
+			let read_calls = calls.checked_add(1).ok_or_else(|| ExecutionError::Kernel {
+				message: "recognized Neq summary read call count overflowed".to_string(),
+			})?;
+			node_attribution::record_inclusive_lifecycle_micros(
+				handle,
+				read_term,
+				read_micros,
+				read_calls,
+			)?;
+			node_attribution::record_inclusive_lifecycle_micros(
+				handle,
+				write_term,
+				write_micros,
+				calls,
+			)?;
 		}
 
 		Ok(())
@@ -31801,7 +31887,15 @@ mod tests {
 		);
 
 		let runtime = executor
-			.prepare_recognized_neq_semi_anti_runtime(stage, columns, None, 0)
+			.prepare_recognized_neq_semi_anti_runtime(
+				stage,
+				columns,
+				None,
+				0,
+				None,
+				"runtime_prep_semi_read",
+				"runtime_prep_semi_write",
+			)
 			.await
 			.expect("summary runtime");
 

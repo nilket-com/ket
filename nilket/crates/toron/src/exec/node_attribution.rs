@@ -138,6 +138,9 @@ struct Frame {
 	/// fails by name rather than publishing whichever definition survived the misuse.
 	vocabulary_failure: Option<&'static str>,
 	stages: Vec<HandlerStage>,
+	/// ADR 585: raw inclusive lifecycle samples, buffered with the vocabulary until the handler
+	/// commits. These never enter ADR 507's exclusive reconciliation.
+	inclusive_lifecycle: Vec<InclusiveLifecycleTerm>,
 	/// Query-neutral diagnostics attached to this invocation while its frame is open. Kept outside
 	/// stage arithmetic: these are ownership/counter receipts, not additional timed stages.
 	diagnostics: Vec<InvocationDiagnostic>,
@@ -162,6 +165,7 @@ struct Frame {
 #[derive(Clone, Copy)]
 enum HandlerAttribution {
 	Reconciled {
+		inclusive_micros: u64,
 		exclusive_micros: u64,
 		exclusive_spill_bytes: u64,
 	},
@@ -313,7 +317,18 @@ struct Vocabulary {
 struct PendingVocabulary {
 	variants: Vec<VocabularyVariant>,
 	stages: Vec<HandlerStage>,
+	inclusive_lifecycle: Vec<InclusiveLifecycleTerm>,
 	suffix_probes: Vec<SuffixProbeProfile>,
+}
+
+/// One additive ADR 585 lifecycle term. This is deliberately parallel to `HandlerStage`: stage
+/// timing remains exclusive, while these raw elapsed samples retain nested execute-bound children.
+#[derive(Clone, Copy)]
+struct InclusiveLifecycleTerm {
+	name: &'static str,
+	calls: u64,
+	micros: u64,
+	error: Option<&'static str>,
 }
 
 /// One stage inside a handler's own work, exclusive of the nested `execute_bound` children it drove.
@@ -377,6 +392,7 @@ struct AggregateInvocation {
 	/// Carried off the frame at exit: a declaration misuse fails the completed record too.
 	vocabulary_failure: Option<&'static str>,
 	stages: Vec<HandlerStage>,
+	inclusive_lifecycle: Vec<InclusiveLifecycleTerm>,
 	diagnostics: Vec<InvocationDiagnostic>,
 	suffix_probes: Vec<SuffixProbeProfile>,
 	spill_io: Vec<SpillIoParent>,
@@ -540,6 +556,7 @@ impl NodeAccounting {
 			return;
 		};
 		frame.handler = Some(HandlerAttribution::Reconciled {
+			inclusive_micros: span_micros,
 			exclusive_micros,
 			exclusive_spill_bytes,
 		});
@@ -599,6 +616,7 @@ impl NodeAccounting {
 				vocabulary: frame.vocabulary,
 				vocabulary_failure: frame.vocabulary_failure,
 				stages: frame.stages,
+				inclusive_lifecycle: frame.inclusive_lifecycle,
 				diagnostics: frame.diagnostics,
 				suffix_probes: frame.suffix_probes,
 				spill_io: frame.spill_io,
@@ -663,6 +681,7 @@ impl NodeAccounting {
 		frame.pending = Some(PendingVocabulary {
 			variants,
 			stages: Vec::new(),
+			inclusive_lifecycle: Vec::new(),
 			suffix_probes: Vec::new(),
 		});
 		Some(frame.id)
@@ -712,6 +731,9 @@ impl NodeAccounting {
 		});
 		for stage in pending.stages {
 			Self::merge_stage(&mut frame.stages, stage);
+		}
+		for term in pending.inclusive_lifecycle {
+			Self::merge_inclusive_lifecycle_term(&mut frame.inclusive_lifecycle, term);
 		}
 		for profile in pending.suffix_probes {
 			let replay_id = profile.observation.replay_id;
@@ -983,6 +1005,15 @@ impl NodeAccounting {
 			return;
 		}
 		let frame = &mut self.stack[position];
+		Self::record_inclusive_lifecycle_term(
+			frame,
+			InclusiveLifecycleTerm {
+				name: token.name,
+				calls: 1,
+				micros: inclusive_micros,
+				error: None,
+			},
+		);
 		let outcome = match (
 			frame
 				.children_micros
@@ -1008,6 +1039,61 @@ impl NodeAccounting {
 			_ => StageOutcome::Failed("frame child accounting moved backwards under the stage"),
 		};
 		Self::record_stage_outcome(frame, token.name, token.parent, token.replay, outcome);
+	}
+
+	fn record_inclusive_lifecycle(
+		&mut self,
+		id: u64,
+		name: &'static str,
+		micros: u64,
+		calls: u64,
+	) -> Result<(), &'static str> {
+		let frame = self
+			.stack
+			.iter_mut()
+			.find(|frame| frame.id == id)
+			.ok_or("inclusive lifecycle term recorded after its invocation exited")?;
+		Self::record_inclusive_lifecycle_term(
+			frame,
+			InclusiveLifecycleTerm {
+				name,
+				calls,
+				micros,
+				error: None,
+			},
+		);
+		Ok(())
+	}
+
+	fn record_inclusive_lifecycle_term(frame: &mut Frame, term: InclusiveLifecycleTerm) {
+		let terms = match frame.pending.as_mut() {
+			Some(pending) => &mut pending.inclusive_lifecycle,
+			None => &mut frame.inclusive_lifecycle,
+		};
+		Self::merge_inclusive_lifecycle_term(terms, term);
+	}
+
+	fn merge_inclusive_lifecycle_term(
+		terms: &mut Vec<InclusiveLifecycleTerm>,
+		incoming: InclusiveLifecycleTerm,
+	) {
+		let Some(existing) = terms.iter_mut().find(|term| term.name == incoming.name) else {
+			terms.push(incoming);
+			return;
+		};
+		if existing.error.is_some() {
+			return;
+		}
+		match (
+			existing.micros.checked_add(incoming.micros),
+			existing.calls.checked_add(incoming.calls),
+		) {
+			(Some(micros), Some(calls)) => {
+				existing.micros = micros;
+				existing.calls = calls;
+			}
+			_ => existing.error = Some("inclusive lifecycle term overflowed"),
+		}
 	}
 
 	/// Record a stage outcome on a frame. While a declaration is pending, the record lands in its
@@ -1162,6 +1248,12 @@ fn node_attribution_path() -> Option<&'static PathBuf> {
 
 fn enabled() -> bool {
 	node_attribution_path().is_some()
+}
+
+/// Whether the process-level ADR 507/585 node-attribution diagnostic is enabled. Timing harnesses
+/// use this single predicate when deciding whether a row can carry candidate authority.
+pub fn node_attribution_profile_enabled() -> bool {
+	enabled()
 }
 
 /// Read the task spill counter, distinguishing "no telemetry configured" (a consistent zero scope
@@ -1480,6 +1572,32 @@ pub(in crate::exec) fn record_invocation_diagnostic(
 	}
 }
 
+/// Publish a locally accumulated raw elapsed term for ADR 585's additive lifecycle receipt. The
+/// caller samples the hot loop locally and publishes once; this ledger is never locked per batch.
+pub(in crate::exec) fn record_inclusive_lifecycle_micros(
+	handle: &VocabularyHandle,
+	name: &'static str,
+	micros: u64,
+	calls: u64,
+) -> Result<(), ExecutionError> {
+	if !enabled() {
+		return Ok(());
+	}
+	NODE_LEDGER
+		.lock()
+		.map_err(|_| ExecutionError::Kernel {
+			message: "node attribution ledger mutex poisoned".to_string(),
+		})?
+		.as_mut()
+		.ok_or_else(|| ExecutionError::Kernel {
+			message: "inclusive lifecycle timing has no active ledger".to_string(),
+		})?
+		.record_inclusive_lifecycle(handle.invocation_id, name, micros, calls)
+		.map_err(|reason| ExecutionError::Kernel {
+			message: format!("inclusive lifecycle timing failed: {reason}"),
+		})
+}
+
 /// Publish one locally accumulated primitive suffix-probe observation. The hot probe loop never
 /// locks this ledger: its window/chunk durations and counters arrive here once per enclosing suffix
 /// call, still bound to the vocabulary invocation and replay identity.
@@ -1771,6 +1889,7 @@ fn bridge_value(invocation: &AggregateInvocation) -> serde_json::Value {
 		Some(HandlerAttribution::Reconciled {
 			exclusive_micros,
 			exclusive_spill_bytes,
+			..
 		}) => (exclusive_micros, exclusive_spill_bytes),
 		Some(HandlerAttribution::Failed(reason)) => {
 			return serde_json::json!({
@@ -2290,6 +2409,129 @@ fn handler_spill_of(invocation: &AggregateInvocation) -> u64 {
 	}
 }
 
+fn inclusive_lifecycle_receipt_value(
+	invocation: &AggregateInvocation,
+	root_span_micros: u64,
+) -> serde_json::Value {
+	if invocation.route != Some("inner_prefix_semi_anti_grouped") {
+		return serde_json::Value::Null;
+	}
+	let failed = |error: &str| {
+		serde_json::json!({
+			"status": "instrument_defect",
+			"invocation_id": invocation.id,
+			"error": error,
+			"passed": false,
+		})
+	};
+	let Some(HandlerAttribution::Reconciled {
+		inclusive_micros: handler_inclusive_micros,
+		..
+	}) = invocation.handler
+	else {
+		return failed("winning handler has no reconciled inclusive span");
+	};
+	let term = |name: &'static str| -> Result<u64, &'static str> {
+		let Some(sample) = invocation
+			.inclusive_lifecycle
+			.iter()
+			.find(|sample| sample.name == name)
+		else {
+			return Err("inclusive lifecycle term is missing");
+		};
+		if sample.error.is_some() || sample.calls == 0 {
+			return Err("inclusive lifecycle term is failed");
+		}
+		Ok(sample.micros)
+	};
+	let values = [
+		("runtime_prep", term("runtime_prep")),
+		("runtime_prep_inner_1", term("runtime_prep_inner_1")),
+		("runtime_prep_inner_2", term("runtime_prep_inner_2")),
+		("runtime_prep_semi_read", term("runtime_prep_semi_read")),
+		("runtime_prep_semi_write", term("runtime_prep_semi_write")),
+		("runtime_prep_anti_read", term("runtime_prep_anti_read")),
+		("runtime_prep_anti_write", term("runtime_prep_anti_write")),
+		("base_prep", term("base_prep")),
+		("drive", term("drive")),
+		("finalize", term("finalize")),
+		("cleanup", term("cleanup")),
+	];
+	if let Some((name, Err(_))) = values.iter().find(|(_, value)| value.is_err()) {
+		return failed(&format!(
+			"inclusive lifecycle term {name} is missing or failed"
+		));
+	}
+	let get = |name: &str| {
+		values
+			.iter()
+			.find(|(candidate, _)| *candidate == name)
+			.and_then(|(_, value)| value.as_ref().ok().copied())
+			.expect("all lifecycle values were checked")
+	};
+	let runtime_prep_inclusive = get("runtime_prep");
+	let runtime_children = [
+		get("runtime_prep_inner_1"),
+		get("runtime_prep_inner_2"),
+		get("runtime_prep_semi_read"),
+		get("runtime_prep_semi_write"),
+		get("runtime_prep_anti_read"),
+		get("runtime_prep_anti_write"),
+	];
+	let Some(runtime_children_total) = runtime_children
+		.into_iter()
+		.try_fold(0u64, |total, value| total.checked_add(value))
+	else {
+		return failed("runtime-prep child sum overflowed");
+	};
+	let Some(runtime_prep_residual) = runtime_prep_inclusive.checked_sub(runtime_children_total)
+	else {
+		return failed("runtime-prep children exceed runtime-prep inclusive span");
+	};
+	let base_prep_inclusive = get("base_prep");
+	let drive_inclusive = get("drive");
+	let finalize_inclusive = get("finalize");
+	let cleanup_inclusive = get("cleanup");
+	let Some(lifecycle_parts_total) = [
+		runtime_prep_inclusive,
+		base_prep_inclusive,
+		drive_inclusive,
+		finalize_inclusive,
+		cleanup_inclusive,
+	]
+	.into_iter()
+	.try_fold(0u64, |total, value| total.checked_add(value)) else {
+		return failed("lifecycle term sum overflowed");
+	};
+	let Some(lifecycle_residual) = handler_inclusive_micros.checked_sub(lifecycle_parts_total)
+	else {
+		return failed("lifecycle terms exceed handler inclusive span");
+	};
+	let Some(outside_handler_span) = root_span_micros.checked_sub(handler_inclusive_micros) else {
+		return failed("handler inclusive span exceeds execute-bound root span");
+	};
+	serde_json::json!({
+		"status": "reconciled",
+		"invocation_id": invocation.id,
+		"handler_inclusive_micros": handler_inclusive_micros,
+		"runtime_prep_inclusive_micros": runtime_prep_inclusive,
+		"runtime_prep_inner_1_micros": get("runtime_prep_inner_1"),
+		"runtime_prep_inner_2_micros": get("runtime_prep_inner_2"),
+		"runtime_prep_semi_read_micros": get("runtime_prep_semi_read"),
+		"runtime_prep_semi_write_micros": get("runtime_prep_semi_write"),
+		"runtime_prep_anti_read_micros": get("runtime_prep_anti_read"),
+		"runtime_prep_anti_write_micros": get("runtime_prep_anti_write"),
+		"runtime_prep_residual_micros": runtime_prep_residual,
+		"base_prep_inclusive_micros": base_prep_inclusive,
+		"drive_inclusive_micros": drive_inclusive,
+		"finalize_inclusive_micros": finalize_inclusive,
+		"cleanup_inclusive_micros": cleanup_inclusive,
+		"lifecycle_residual_micros": lifecycle_residual,
+		"outside_handler_span_micros": outside_handler_span,
+		"passed": true,
+	})
+}
+
 fn suffix_probe_profiles_value(profiles: &[SuffixProbeProfile]) -> serde_json::Value {
 	serde_json::Value::Array(
 		profiles
@@ -2460,6 +2702,10 @@ fn write_profile(accounting: &NodeAccounting) -> Result<(), ExecutionError> {
 				"exclusive_spill_bytes": invocation.exclusive_spill_bytes,
 				"bridge": bridge_value(invocation),
 				"stages": stages_value(invocation, &orphaned),
+				"inclusive_lifecycle_receipt": inclusive_lifecycle_receipt_value(
+					invocation,
+					accounting.root_span_micros,
+				),
 				"suffix_probe_profiles": suffix_probe_profiles_value(&invocation.suffix_probes),
 				"spill_io": spill_io_value(&invocation.spill_io),
 				"diagnostics": invocation.diagnostics.iter().map(|entry| {
@@ -2820,12 +3066,14 @@ mod tests {
 			exclusive_micros: 100,
 			exclusive_spill_bytes: 0,
 			handler: Some(HandlerAttribution::Reconciled {
+				inclusive_micros: 500,
 				exclusive_micros: 500,
 				exclusive_spill_bytes: 0,
 			}),
 			vocabulary: None,
 			vocabulary_failure: None,
 			stages: Vec::new(),
+			inclusive_lifecycle: Vec::new(),
 			diagnostics: Vec::new(),
 			suffix_probes: Vec::new(),
 			spill_io: Vec::new(),
@@ -2844,6 +3092,7 @@ mod tests {
 			exclusive_micros: 1_000,
 			exclusive_spill_bytes: 10,
 			handler: Some(HandlerAttribution::Reconciled {
+				inclusive_micros: 900,
 				exclusive_micros: 900,
 				exclusive_spill_bytes: 500,
 			}),
@@ -2886,6 +3135,7 @@ mod tests {
 			exclusive_micros: 1_000,
 			exclusive_spill_bytes: 300,
 			handler: Some(HandlerAttribution::Reconciled {
+				inclusive_micros: 994,
 				exclusive_micros: 994,
 				exclusive_spill_bytes: 300,
 			}),
@@ -2935,6 +3185,53 @@ mod tests {
 		assert_eq!(value["passed"], false);
 	}
 
+	#[test]
+	fn adr585_inclusive_lifecycle_retains_a_nested_execute_bound_child() {
+		let mut acc = NodeAccounting::default();
+		acc.enter();
+		let handler = acc.open_handler().expect("aggregate frame open");
+		let invocation_id = acc
+			.predeclare(vec![VocabularyVariant {
+				name: "measured",
+				spill: SpillCounterKind::Flow,
+				required_stages: RequiredStages::Static(&["runtime_prep"]),
+				residual_boundary_micros: 1_000,
+			}])
+			.expect("vocabulary predeclared");
+		let stage = StageToken {
+			name: "runtime_prep",
+			parent: None,
+			replay: None,
+			invocation_id,
+			children_micros_at_open: 0,
+			children_spill_at_open: 0,
+			started: Instant::now(),
+			spill_before: 0,
+		};
+		acc.enter();
+		assert!(!acc.exit(NodeKind::Scan, 40, 0, 0));
+		acc.close_stage(stage, 100, Some(0));
+		acc.commit_vocabulary(invocation_id, "measured");
+		acc.close_handler(handler, 200, Some(0));
+		acc.set_route("inner_prefix_semi_anti_grouped");
+		assert!(acc.exit(NodeKind::Aggregate, 240, 0, 0));
+
+		let invocation = &acc.aggregate_invocations[0];
+		let exclusive = invocation.stages[0]
+			.outcome
+			.reconciled()
+			.expect("exclusive stage reconciled")
+			.0;
+		let inclusive = invocation
+			.inclusive_lifecycle
+			.iter()
+			.find(|term| term.name == "runtime_prep")
+			.expect("inclusive stage sample")
+			.micros;
+		assert_eq!(exclusive, 60, "ADR 507 still subtracts its nested child");
+		assert_eq!(inclusive, 100, "ADR 585 retains the same child");
+	}
+
 	fn invocation_with_stages(
 		handler_micros: u64,
 		handler_spill: u64,
@@ -2947,17 +3244,57 @@ mod tests {
 			exclusive_micros: handler_micros + 5,
 			exclusive_spill_bytes: handler_spill,
 			handler: Some(HandlerAttribution::Reconciled {
+				inclusive_micros: handler_micros,
 				exclusive_micros: handler_micros,
 				exclusive_spill_bytes: handler_spill,
 			}),
 			vocabulary,
 			vocabulary_failure: None,
 			stages,
+			inclusive_lifecycle: Vec::new(),
 			diagnostics: Vec::new(),
 			suffix_probes: Vec::new(),
 			spill_io: Vec::new(),
 			growth_census: None,
 		}
+	}
+
+	#[test]
+	fn adr585_receipt_reconciles_the_two_additive_domains_on_the_invocation() {
+		let mut invocation = invocation_with_stages(900, 0, None, Vec::new());
+		invocation.route = Some("inner_prefix_semi_anti_grouped");
+		invocation.handler = Some(HandlerAttribution::Reconciled {
+			inclusive_micros: 1_000,
+			exclusive_micros: 900,
+			exclusive_spill_bytes: 0,
+		});
+		invocation.inclusive_lifecycle = [
+			("runtime_prep", 400),
+			("runtime_prep_inner_1", 100),
+			("runtime_prep_inner_2", 100),
+			("runtime_prep_semi_read", 50),
+			("runtime_prep_semi_write", 50),
+			("runtime_prep_anti_read", 40),
+			("runtime_prep_anti_write", 40),
+			("base_prep", 100),
+			("drive", 300),
+			("finalize", 50),
+			("cleanup", 50),
+		]
+		.into_iter()
+		.map(|(name, micros)| InclusiveLifecycleTerm {
+			name,
+			calls: 1,
+			micros,
+			error: None,
+		})
+		.collect();
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "reconciled");
+		assert_eq!(receipt["invocation_id"], invocation.id);
+		assert_eq!(receipt["runtime_prep_residual_micros"], 20);
+		assert_eq!(receipt["lifecycle_residual_micros"], 100);
+		assert_eq!(receipt["outside_handler_span_micros"], 200);
 	}
 
 	// The innermost link reconciles to the HANDLER-exclusive span, not the node. The node link is the

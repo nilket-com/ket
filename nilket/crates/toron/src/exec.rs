@@ -130,7 +130,7 @@ pub use join::{
 	join_slice_equivalence_columns_verified, join_slice_equivalence_enabled,
 	reset_join_replay_input_diagnostic, take_join_replay_input_diagnostic,
 };
-mod node_attribution;
+pub mod node_attribution;
 mod phase_receipt;
 mod scan_open;
 pub(in crate::exec) use self::aggregate::{

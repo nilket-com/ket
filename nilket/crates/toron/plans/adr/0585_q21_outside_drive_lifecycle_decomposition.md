@@ -1,8 +1,11 @@
 # ADR 585 - q21 outside-drive lifecycle decomposition
 
-**Status:** OPEN. Decided; no measurement has run. A measurement-only record:
-it changes no engine route, widens no admission, and adds no mechanism. Its
-instrument contract is named below and each part lands with a paired test.
+**Status:** CLOSED. Implemented and measured on source tree
+`f761c601735a26eed95bf270b014ed7297875964`; results are recorded in
+`plans/impl/0585_q21_outside_drive_lifecycle_decomposition_results.md`. The
+accepted profile resolves `runtime_prep_semi_write` as the sole owner and
+closes the shared-source candidate below the inherited floor. No engine route
+or admission changed.
 
 
 ## Context
@@ -295,9 +298,11 @@ the distributed coordinate. It does not re-measure with `b436a843` or
 
 ## Forward
 
-The successor opens under its own record for the one term that clears the
-floor, carrying its median, its share of the off-arm execute median, the
-removable subterm that names its mechanism, and the 500 ms floor. If no term
-clears, q21's envelope is parity Toron's plan shape cannot reach by a single
-mechanism, and the next record is the plan-shape question. SF=10 still waits
-for a measured mechanism and a fixture.
+`runtime_prep_semi_write` owns 2,323.1 median-scaled ms, 16.64% of q21's
+unprofiled execute median, above the 500 ms floor. It contains filtering, key
+evaluation, repartition, and summary insertion; this record does not separate
+those mechanisms. The successor therefore decomposes that write boundary
+before proposing a change. The anti write and replay-1 build remain material
+secondary terms at 1,954.0 ms and 1,810.2 ms. The proposed shared-source pass
+closes here: its pairwise removable-read median is only 386.2 ms, below the
+floor. SF=10 still waits for a measured mechanism and a fixture.
