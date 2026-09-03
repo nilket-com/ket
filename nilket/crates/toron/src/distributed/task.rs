@@ -282,6 +282,43 @@ pub struct JoinInputShapeSides {
 	pub right: JoinInputShape,
 }
 
+/// One side of ADR 584's replay-keyed input-materialization ledger.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinInputReplaySideLedger {
+	pub single_batch_micros: u64,
+	pub multi_batch_micros: u64,
+	pub shape: JoinInputShape,
+}
+
+impl JoinInputReplaySideLedger {
+	pub fn observe(&mut self, batches: u64, rows: u64, bytes: u64, micros: u64) {
+		if batches > 1 {
+			self.multi_batch_micros = self.multi_batch_micros.saturating_add(micros);
+		} else {
+			self.single_batch_micros = self.single_batch_micros.saturating_add(micros);
+		}
+		self.shape.observe(batches, rows, bytes);
+	}
+}
+
+/// Input-materialization time and batch histogram for one physical join replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinInputReplayLedger {
+	pub replay_id: JoinReplayId,
+	pub left: JoinInputReplaySideLedger,
+	pub right: JoinInputReplaySideLedger,
+}
+
+impl JoinInputReplayLedger {
+	pub fn for_replay(replay_id: JoinReplayId) -> Self {
+		Self {
+			replay_id,
+			left: JoinInputReplaySideLedger::default(),
+			right: JoinInputReplaySideLedger::default(),
+		}
+	}
+}
+
 /// Publication state for ADR 551's task-local phase partition.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -1,5 +1,7 @@
 use super::partitioned_build_profile::PartitionedBuildResidencyProfile;
 
+use super::input_materialization::time_join_replay_input_materialization;
+
 use super::residency_profile::{
 	GroupedReservoirResidencyProfile, ProfilePhase, writer_set_collection_bytes,
 };
@@ -420,6 +422,17 @@ impl MembershipScheduleReceipt {
 
 const CHAIN_STAGE_PROFILE_ENV: &str = "TORON_CHAIN_STAGE_PROFILE_PATH";
 
+fn chain_stage_profile_path() -> Option<&'static PathBuf> {
+	static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+	PATH.get_or_init(|| std::env::var_os(CHAIN_STAGE_PROFILE_ENV).map(PathBuf::from))
+		.as_ref()
+}
+
+/// Whether ADR 584's opt-in chain-stage profiler is active for this process.
+pub fn chain_stage_profile_enabled() -> bool {
+	chain_stage_profile_path().is_some()
+}
+
 const CHAIN_STAGE_COUNT: usize = 7;
 
 const CHAIN_DEFERRED_BASE_FLUSH_INTERVAL: u64 = 256;
@@ -540,12 +553,7 @@ struct ChainStageProfiler {
 
 impl ChainStageProfiler {
 	fn from_env(query_id: QueryId) -> Option<Self> {
-		static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-
-		let path = PATH
-			.get_or_init(|| std::env::var_os(CHAIN_STAGE_PROFILE_ENV).map(PathBuf::from))
-			.as_ref()?
-			.clone();
+		let path = chain_stage_profile_path()?.clone();
 
 		Some(Self::at_path(path, query_id))
 	}
@@ -12342,9 +12350,21 @@ impl Executor {
 
 		build_scope.discard_before_measurement();
 
-		let left_batch = concat_or_empty(left.schema(), &left_batches)?;
+		let left_batch = time_join_replay_input_materialization(
+			&self.context.task_telemetry,
+			*replay_id,
+			JoinInputSide::Left,
+			&left_batches,
+			|| concat_or_empty(left.schema(), &left_batches),
+		)?;
 
-		let right_batch = concat_or_empty(right.schema(), &right_batches)?;
+		let right_batch = time_join_replay_input_materialization(
+			&self.context.task_telemetry,
+			*replay_id,
+			JoinInputSide::Right,
+			&right_batches,
+			|| concat_or_empty(right.schema(), &right_batches),
+		)?;
 
 		let left_key_arrays = key_arrays(&left_batch, left_keys)?;
 
@@ -19654,6 +19674,8 @@ impl Executor {
 		else {
 			return Ok(None);
 		};
+		let _concat_completeness_scope =
+			super::input_materialization::begin_join_replay_input_diagnostic_scope();
 
 		// The winning scan-probe lifecycle is known only after runtime preparation. Predeclare both
 
@@ -21129,7 +21151,13 @@ impl Executor {
 
 		let left_batches = self.execute_bound_node(left, morsel).await?;
 
-		let left_batch = concat_or_empty(left.schema(), &left_batches)?;
+		let left_batch = time_join_replay_input_materialization(
+			&self.context.task_telemetry,
+			*replay_id,
+			JoinInputSide::Left,
+			&left_batches,
+			|| concat_or_empty(left.schema(), &left_batches),
+		)?;
 
 		let left_key_arrays = key_arrays(&left_batch, left_keys)?;
 
@@ -22500,7 +22528,18 @@ impl Executor {
 			"reoriented inner in-memory runtime",
 		)?;
 
-		let build_batch = concat_or_empty(stage.build.schema(), &build_batches)?;
+		let build_side = if stage.probe_columns_first {
+			JoinInputSide::Right
+		} else {
+			JoinInputSide::Left
+		};
+		let build_batch = time_join_replay_input_materialization(
+			&self.context.task_telemetry,
+			stage.replay_id,
+			build_side,
+			&build_batches,
+			|| concat_or_empty(stage.build.schema(), &build_batches),
+		)?;
 
 		let build_key_arrays = key_arrays(&build_batch, &stage.build_keys)?;
 

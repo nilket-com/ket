@@ -1,8 +1,10 @@
 # ADR 584 - q21 attribution at the sealed coordinate
 
-**Status:** OPEN. Decided; no measurement has run. An attribution record: it
-changes no engine behaviour and widens no admission. Instrument changes it
-needs are named below and each lands with its own paired test.
+**Status:** CLOSED. Implemented and measured on source tree
+`407488d022bfffa88336f96a083ec4ced76eb12b`; results are recorded in
+`plans/impl/0584_q21_attribution_at_the_sealed_coordinate_results.md`. The
+accepted profile resolves `outside_drive` as the sole owner and opens its
+pre-drive lifecycle decomposition. No engine route or admission changed.
 
 
 ## Context
@@ -117,14 +119,13 @@ authorization threshold, so a successor opens only for a term that would have
 cleared 580's own gate. Ties within `range_off` are reported as unresolved,
 not broken.
 
-**Target-bearing decline evidence is a third instrument change.** No existing
-artifact exposes the join target with its admission verdict: the public bind
-entry discards it, and the optimizer rendering does not emit the target-bearing
-receipt. The perf row therefore gains, under the same diagnostic flag, each
-receipt's target alongside its verdict, with a paired test that a stripped
-receipt is refused by the diagnostic. Each target is then mapped to its replay
-identity: which inner replay, which build side, and the planner fact the
-build-row bound needed. Whether an
+**Trace-target decline evidence is a third instrument change.** No existing
+artifact exposes replay identity with its admission verdict: the public bind
+entry discards the optimizer trace target and surfaces only the verdict. The
+perf row therefore gains, under the same diagnostic flag, the replay identity
+derived from each trace target alongside its verdict, with a paired test that a
+stripped receipt is refused by the diagnostic. Each replay is then mapped to
+its join, build side, and the planner fact the build-row bound needed. Whether an
 estimate would change a route is recorded as a question with the evidence
 required, not as a proposal. ADR 513's finding that semi and anti placement is
 pinned by the author stands unless this evidence contradicts it, and then the
@@ -154,7 +155,7 @@ plan-shape question in their place.
 
 - The three instrument changes land first, each with a paired test: the sample
   row records the profile receipt path; the diagnostic flag exposes the
-  per-replay input ledger and the target-bearing admission receipts while
+  per-replay input ledger and trace-target-derived admission receipts while
   voiding candidate authority; and the diagnostic refuses a stripped receipt.
 - One instrumented executable staged once and used for both arms of every
   pair, reported beside the sealed `b436a843` identity; five adjacent pairs at
@@ -164,7 +165,7 @@ plan-shape question in their place.
 - A seven-stage table with `total_drive_micros`, the in-drive residual, the
   completeness bound and whether each sample met it, `outside_drive`, and
   `execute_ms`, medians and spreads per arm.
-- Each of the three verdicts mapped from target-bearing trace evidence to its
+- Each of the three verdicts mapped from trace-target-derived evidence to its
   join, its replay identity, and the missing planner fact.
 - The per-replay multi-batch input ledger from the same-boundary diagnostic,
   with batch histograms, and a statement of which replay, if any, carries the
@@ -204,6 +205,12 @@ plan-shape question in their place.
 
 ## Forward
 
-The successor named here opens under its own record with a predicted reduction
-and the 500 ms floor, and is measured on a board sealed at the same coordinate.
-SF=10 still waits for an owner and a fixture.
+`outside_drive` owns 7,887.0 median-scaled ms, 55.16% of q21's unprofiled
+execute median. The successor first decomposes the surviving pre-drive
+lifecycle: both inner runtime builds, recognized semi and anti preparation,
+base preparation, and finalization/cleanup. Replay 1's partitioned build is in
+this envelope and may be larger than either membership-source scan. A shared
+lineitem-source pass feeding both summary builders is only the first candidate
+mechanism; that subterm must independently clear the inherited 500 ms floor
+before a fusion cut opens. SF=10 still waits for the measured mechanism and a
+fixture.

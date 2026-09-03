@@ -14,6 +14,100 @@
 
 use super::*;
 
+/// Enables ADR 584's replay-keyed input-materialization diagnostic.
+pub const JOIN_REPLAY_INPUT_DIAGNOSTIC_ENV: &str = "TORON_JOIN_REPLAY_INPUT_DIAGNOSTIC";
+
+/// Process-local because each performance sample is a fresh child process.
+/// Reading the environment once keeps the disabled path out of the hot concat
+/// loop while still letting the wrapper select the arm per child.
+pub fn join_replay_input_diagnostic_enabled() -> bool {
+	static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*ENABLED.get_or_init(|| std::env::var_os(JOIN_REPLAY_INPUT_DIAGNOSTIC_ENV).is_some())
+}
+
+fn replay_ledger_slot() -> &'static Mutex<Vec<crate::distributed::task::JoinInputReplayLedger>> {
+	static LEDGER: std::sync::OnceLock<
+		Mutex<Vec<crate::distributed::task::JoinInputReplayLedger>>,
+	> = std::sync::OnceLock::new();
+	LEDGER.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn replay_total_concat_slot() -> &'static AtomicU64 {
+	static TOTAL_CONCATS: AtomicU64 = AtomicU64::new(0);
+	&TOTAL_CONCATS
+}
+
+fn replay_concat_scope_depth() -> &'static AtomicUsize {
+	static DEPTH: AtomicUsize = AtomicUsize::new(0);
+	&DEPTH
+}
+
+pub(super) struct JoinReplayInputDiagnosticScope(bool);
+
+impl Drop for JoinReplayInputDiagnosticScope {
+	fn drop(&mut self) {
+		if self.0 {
+			replay_concat_scope_depth().fetch_sub(1, Ordering::Relaxed);
+		}
+	}
+}
+
+/// Bound the independent concat total to the specialized replay handler.
+/// Sort/output concatenations after that handler returns are deliberately not
+/// join-input work and therefore do not belong in its completeness equation.
+pub(super) fn begin_join_replay_input_diagnostic_scope() -> JoinReplayInputDiagnosticScope {
+	let enabled = join_replay_input_diagnostic_enabled();
+	if enabled {
+		replay_concat_scope_depth().fetch_add(1, Ordering::Relaxed);
+	}
+	JoinReplayInputDiagnosticScope(enabled)
+}
+
+/// Count every call through the executor's shared join-concat primitive.
+///
+/// The replay ledger is useful evidence only when its recorded concat count
+/// closes against this independently placed total. Keeping the counter at the
+/// shared primitive means a new unwrapped call site fails the harness gate
+/// instead of silently looking like zero work for its replay.
+pub fn observe_join_input_concat_for_diagnostic() {
+	if join_replay_input_diagnostic_enabled()
+		&& replay_concat_scope_depth().load(Ordering::Relaxed) > 0
+	{
+		let _ = replay_total_concat_slot().fetch_update(
+			Ordering::Relaxed,
+			Ordering::Relaxed,
+			|value| value.checked_add(1),
+		);
+	}
+}
+
+/// Clear ADR 584's process-local receipt before one in-process performance run.
+///
+/// The ledger deliberately does not extend `TaskTelemetry`: doing so would change
+/// the distributed task wire format for an instrument used only by the fresh-child
+/// TPC-H harness. Each performance child executes one query, so process scope is
+/// the exact measurement boundary.
+pub fn reset_join_replay_input_diagnostic() -> std::io::Result<()> {
+	replay_ledger_slot()
+		.lock()
+		.map_err(|_| std::io::Error::other("join replay input diagnostic lock is poisoned"))?
+		.clear();
+	replay_total_concat_slot().store(0, Ordering::Relaxed);
+	replay_concat_scope_depth().store(0, Ordering::Relaxed);
+	Ok(())
+}
+
+/// Take the replay-keyed diagnostic and its independent completeness total
+/// after the in-process query completes.
+pub fn take_join_replay_input_diagnostic()
+-> std::io::Result<(Vec<crate::distributed::task::JoinInputReplayLedger>, u64)> {
+	let mut ledger = replay_ledger_slot()
+		.lock()
+		.map_err(|_| std::io::Error::other("join replay input diagnostic lock is poisoned"))?;
+	let total_concats = replay_total_concat_slot().swap(0, Ordering::Relaxed);
+	Ok((std::mem::take(&mut *ledger), total_concats))
+}
+
 /// Which of a join's two inputs a concatenation is building.
 ///
 /// Named by SIDE, not by role. `left` is the build input and `right` the probe
@@ -78,6 +172,84 @@ impl InputShape {
 /// either way, and dropping it on the error path would silently return it to the
 /// residual these counters exist to reduce.
 pub(super) fn time_join_input_materialization<T>(
+	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
+	side: JoinInputSide,
+	batches: &[RecordBatch],
+	body: impl FnOnce() -> Result<T, ExecutionError>,
+) -> Result<T, ExecutionError> {
+	time_join_input_materialization_with_diagnostic(telemetry, side, batches, body)
+}
+
+/// Time a join-input concatenation performed by a specialized replay path.
+///
+/// Those paths bypass `execute_hash_join`, so ADR 580's task-wide brackets do
+/// not own their time. ADR 584 still needs the same shape at the affected chain boundary,
+/// keyed by the replay that performed it. When the diagnostic is disabled this
+/// is exactly the body call: no clock read, shape walk, or telemetry growth.
+pub(super) fn time_join_replay_input_materialization<T>(
+	_telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
+	replay_id: JoinReplayId,
+	side: JoinInputSide,
+	batches: &[RecordBatch],
+	body: impl FnOnce() -> Result<T, ExecutionError>,
+) -> Result<T, ExecutionError> {
+	time_join_replay_input_materialization_with_diagnostic(
+		replay_id,
+		side,
+		batches,
+		join_replay_input_diagnostic_enabled(),
+		replay_ledger_slot(),
+		body,
+	)
+}
+
+fn time_join_replay_input_materialization_with_diagnostic<T>(
+	replay_id: JoinReplayId,
+	side: JoinInputSide,
+	batches: &[RecordBatch],
+	replay_diagnostic: bool,
+	replay_ledger: &Mutex<Vec<crate::distributed::task::JoinInputReplayLedger>>,
+	body: impl FnOnce() -> Result<T, ExecutionError>,
+) -> Result<T, ExecutionError> {
+	if !replay_diagnostic {
+		return body();
+	}
+	let shape = InputShape::of(batches);
+	let started = Instant::now();
+	let outcome = body();
+	let elapsed = duration_micros(started);
+	if let Ok(mut ledger) = replay_ledger.lock() {
+		record_replay_input_materialization(&mut ledger, replay_id, side, shape, elapsed);
+	}
+	outcome
+}
+
+fn record_replay_input_materialization(
+	ledger: &mut Vec<crate::distributed::task::JoinInputReplayLedger>,
+	replay_id: JoinReplayId,
+	side: JoinInputSide,
+	shape: InputShape,
+	elapsed: u64,
+) {
+	let replay = match ledger.iter_mut().find(|entry| entry.replay_id == replay_id) {
+		Some(entry) => entry,
+		None => {
+			ledger.push(crate::distributed::task::JoinInputReplayLedger::for_replay(
+				replay_id,
+			));
+			ledger
+				.last_mut()
+				.expect("the replay ledger entry was just appended")
+		}
+	};
+	let side = match side {
+		JoinInputSide::Left => &mut replay.left,
+		JoinInputSide::Right => &mut replay.right,
+	};
+	side.observe(shape.batches, shape.rows, shape.bytes, elapsed);
+}
+
+fn time_join_input_materialization_with_diagnostic<T>(
 	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
 	side: JoinInputSide,
 	batches: &[RecordBatch],
@@ -365,5 +537,109 @@ mod input_side_split_tests {
 		let guard = task.as_ref().unwrap().lock().unwrap();
 		assert!(guard.phases.join_input_materialization_micros > 0);
 		assert!(guard.phases.join_input_right_single_batch_micros > 0);
+	}
+
+	/// ADR 584: replay identity, side, timing shape and the batch histogram are
+	/// one receipt. Two invocations for replay 3 must fold together while replay
+	/// 4 remains distinct; an invocation-sized vector would fail the length check.
+	#[test]
+	fn replay_ledger_aggregates_by_replay_and_side() {
+		let replay_ledger = Mutex::new(Vec::new());
+		for batches in [vec![batch(2)], vec![batch(2), batch(3), batch(5), batch(7)]] {
+			time_join_replay_input_materialization_with_diagnostic(
+				JoinReplayId(3),
+				JoinInputSide::Right,
+				&batches,
+				true,
+				&replay_ledger,
+				busy,
+			)
+			.expect("replay 3 concat");
+		}
+		time_join_replay_input_materialization_with_diagnostic(
+			JoinReplayId(4),
+			JoinInputSide::Left,
+			&[batch(11), batch(13)],
+			true,
+			&replay_ledger,
+			busy,
+		)
+		.expect("replay 4 concat");
+
+		let replay_ledger = replay_ledger.lock().unwrap();
+		assert_eq!(replay_ledger.len(), 2);
+		let replay3 = replay_ledger
+			.iter()
+			.find(|entry| entry.replay_id == JoinReplayId(3))
+			.expect("replay 3");
+		assert_eq!(replay3.left, Default::default());
+		assert!(replay3.right.single_batch_micros > 0);
+		assert!(replay3.right.multi_batch_micros > 0);
+		assert_eq!(replay3.right.shape.concats, 2);
+		assert_eq!(replay3.right.shape.batches, 5);
+		assert_eq!(replay3.right.shape.rows, 19);
+		assert_eq!(replay3.right.shape.concats_at_least[0], 2);
+		assert_eq!(replay3.right.shape.concats_at_least[1], 1);
+		assert_eq!(replay3.right.shape.concats_at_least[2], 1);
+		let replay4 = replay_ledger
+			.iter()
+			.find(|entry| entry.replay_id == JoinReplayId(4))
+			.expect("replay 4");
+		assert_eq!(replay4.left.shape.batches, 2);
+		assert_eq!(replay4.right, Default::default());
+	}
+
+	/// Specialized chain replays do not own ADR 580's task-wide parent. Their
+	/// opt-in receipt must therefore move only the replay ledger; charging the
+	/// parent here would make the historical and same-boundary instruments count
+	/// different universes under the same name.
+	#[test]
+	fn specialized_replay_timing_is_diagnostic_only() {
+		let task = slot();
+		let replay_ledger = Mutex::new(Vec::new());
+		time_join_replay_input_materialization_with_diagnostic(
+			JoinReplayId(2),
+			JoinInputSide::Right,
+			&[batch(2), batch(3)],
+			true,
+			&replay_ledger,
+			busy,
+		)
+		.expect("specialized concat");
+		let guard = task.as_ref().unwrap().lock().unwrap();
+		assert_eq!(guard.phases.join_input_materialization_micros, 0);
+		assert_eq!(guard.join_input_shape, Default::default());
+		drop(guard);
+		let replay_ledger = replay_ledger.lock().unwrap();
+		assert_eq!(replay_ledger.len(), 1);
+		assert_eq!(replay_ledger[0].replay_id, JoinReplayId(2));
+		assert_eq!(replay_ledger[0].right.shape.concats, 1);
+		assert_eq!(
+			replay_ledger[0].right.shape.concats_at_least[1], 1,
+			"two batches must land in the >=2 histogram bucket"
+		);
+	}
+
+	/// Off means exactly the original body: no replay record and no task-wide
+	/// counters. A helper that always records would make both pair arms
+	/// instrumented and invalidate ADR 584's perturbation gate.
+	#[test]
+	fn specialized_replay_timing_is_absent_when_disabled() {
+		let task = slot();
+		let replay_ledger = Mutex::new(Vec::new());
+		time_join_replay_input_materialization_with_diagnostic(
+			JoinReplayId(2),
+			JoinInputSide::Right,
+			&[batch(2), batch(3)],
+			false,
+			&replay_ledger,
+			busy,
+		)
+		.expect("unprofiled specialized concat");
+		assert_eq!(
+			*task.as_ref().unwrap().lock().unwrap(),
+			TaskTelemetry::default()
+		);
+		assert!(replay_ledger.lock().unwrap().is_empty());
 	}
 }

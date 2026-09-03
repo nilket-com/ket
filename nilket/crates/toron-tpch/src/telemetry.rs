@@ -265,6 +265,15 @@ pub struct PerfPhaseTimings {
 	pub total_ms: f64,
 }
 
+/// ADR 584's opt-in local-admission receipt. Ordinary rows retain the compact
+/// verdict-only list; diagnostic rows add the replay identity derived from the
+/// optimizer trace target, so bind order is never mistaken for identity.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TargetedLocalJoinAdmission {
+	pub replay_id: u32,
+	pub verdict: String,
+}
+
 impl PerfPhaseTimings {
 	pub fn json_value(self) -> serde_json::Value {
 		serde_json::json!({
@@ -329,6 +338,15 @@ pub struct PerfAttempt {
 	/// ADR 490: one compact admission receipt per binder-physicalized hash join,
 	/// in bind order — toron rows only.
 	pub local_join_admissions: Option<Vec<String>>,
+	/// ADR 584: present only under the replay-input diagnostic. Every compact
+	/// verdict above must have one trace-target-derived sibling here.
+	pub targeted_local_join_admissions: Option<Vec<TargetedLocalJoinAdmission>>,
+	/// ADR 584: per-replay, per-side input materialization and batch histograms.
+	/// Empty ordinary task telemetry is surfaced as `None`, never as observed zero.
+	pub join_input_replay_ledger: Option<Vec<toron::distributed::task::JoinInputReplayLedger>>,
+	/// ADR 584: independent count at the shared concat primitive. The diagnostic
+	/// is complete only when its replay-ledger concat counts sum to this value.
+	pub join_input_total_concats: Option<u64>,
 	/// Runtime hash-join path and attributed spill bytes, keyed by replay id.
 	pub join_spill_observations: Option<Vec<toron::distributed::task::JoinSpillObservation>>,
 	/// ADR 527: route-local requested/effective partition-work facts. An empty Toron vector means
@@ -399,6 +417,24 @@ impl PerfAttempt {
 			.clone();
 		for (key, value) in timings {
 			object.insert(key, value);
+		}
+		if let Some(receipts) = &self.targeted_local_join_admissions {
+			object.insert(
+				"targeted_local_join_admissions".to_string(),
+				serde_json::json!(receipts),
+			);
+		}
+		if let Some(ledger) = &self.join_input_replay_ledger {
+			object.insert(
+				"join_input_replay_ledger".to_string(),
+				serde_json::json!(ledger),
+			);
+		}
+		if let Some(total) = self.join_input_total_concats {
+			object.insert(
+				"join_input_total_concats".to_string(),
+				serde_json::json!(total),
+			);
 		}
 		if let Some(message) = &self.diagnostic_message {
 			object.insert("diagnostic_message".to_string(), serde_json::json!(message));

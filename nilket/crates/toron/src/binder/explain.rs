@@ -72,6 +72,17 @@ pub(crate) struct LocalHashJoinAdmissionReceipt {
 	pub(crate) admission: LocalHashJoinAdmission,
 }
 
+/// Public diagnostic form of one local hash-join admission receipt.
+///
+/// The ordinary perf surface deliberately strips `replay_id`; ADR 584's
+/// opt-in diagnostic uses this sibling type so a caller cannot accidentally
+/// treat an in-bind-order verdict as trace-target-derived evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetedLocalHashJoinAdmission {
+	pub replay_id: JoinReplayId,
+	pub admission: LocalHashJoinAdmission,
+}
+
 /// ADR 490: bind and surface each binder-physicalized hash join's local-admission
 /// receipt, in bind order. The gauge threads these into perf rows so a live cell
 /// always names the exact admission outcome instead of inferring it from a
@@ -81,14 +92,36 @@ pub async fn bind_with_local_join_admissions(
 	catalog: &dyn Catalog,
 	config: &PlannerConfig,
 ) -> Result<(ExecutionPlan, Vec<LocalHashJoinAdmission>), BindingError> {
+	let (plan, receipts) = bind_with_targeted_local_join_admissions(plan, catalog, config).await?;
+	Ok((
+		plan,
+		receipts
+			.into_iter()
+			.map(|receipt| receipt.admission)
+			.collect(),
+	))
+}
+
+/// Bind with the replay identity retained beside every local-admission verdict.
+/// This is the only binder entry the ADR 584 diagnostic may consume.
+pub async fn bind_with_targeted_local_join_admissions(
+	plan: &LogicalPlan,
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> Result<(ExecutionPlan, Vec<TargetedLocalHashJoinAdmission>), BindingError> {
 	let (plan, trace) = bind_with_trace(plan, catalog, config).await?;
 	Ok((
 		plan,
 		trace
 			.local_hash_join_admissions
-			.iter()
-			.map(|receipt| receipt.admission)
-			.collect(),
+			.into_iter()
+			.map(|receipt| {
+				Ok(TargetedLocalHashJoinAdmission {
+					replay_id: join_replay_id_for_trace_target(receipt.target)?,
+					admission: receipt.admission,
+				})
+			})
+			.collect::<Result<Vec<_>, BindingError>>()?,
 	))
 }
 

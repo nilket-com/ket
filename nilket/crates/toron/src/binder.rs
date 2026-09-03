@@ -78,33 +78,33 @@ mod set_ops;
 use self::aggregate::*;
 use self::aggregate_exchange::*;
 use self::arithmetic::*;
+pub use self::decision_log::OptimizerDecisionLog;
 use self::decision_log::*;
+pub use self::explain::bind_with_explain_summary;
+pub use self::explain::bind_with_local_join_admissions;
 use self::explain::*;
+pub use self::explain::{TargetedLocalHashJoinAdmission, bind_with_targeted_local_join_admissions};
 use self::expression_walk::*;
 pub(crate) use self::generated::bind_generated_relation_for_authoring;
 use self::generated::require_certificate_describes_bound_source;
+pub(crate) use self::join::JoinStrategyDecisionReason;
+pub use self::join::LocalHashJoinAdmission;
+pub use self::join::join_schema;
 use self::join::*;
+pub use self::join_order::SoftMarginLadderStep;
 use self::join_order::*;
 use self::outer_count_preaggregation::*;
 use self::outer_join_demotion::*;
 use self::pushdown::*;
+pub use self::runtime_evidence::{DurableEvidenceBinding, OptimizerRuntimeEvidence};
+pub(crate) use self::runtime_evidence::{
+	OptimizerEvidenceStatusSnapshot, OptimizerReceiptGateSnapshot, OptimizerRuntimeDecisionRecorder,
+};
 use self::scalar_function::*;
 use self::selectivity::*;
 use self::set_ops::{
 	all_output_columns_program, bind_union, distinct_input_unsupported_message,
 	normalize_set_op_arm, repeat_count_column, repeat_output_schema, set_op_output_schema,
-};
-
-pub use self::decision_log::OptimizerDecisionLog;
-pub use self::explain::bind_with_explain_summary;
-pub use self::explain::bind_with_local_join_admissions;
-pub(crate) use self::join::JoinStrategyDecisionReason;
-pub use self::join::LocalHashJoinAdmission;
-pub use self::join::join_schema;
-pub use self::join_order::SoftMarginLadderStep;
-pub use self::runtime_evidence::{DurableEvidenceBinding, OptimizerRuntimeEvidence};
-pub(crate) use self::runtime_evidence::{
-	OptimizerEvidenceStatusSnapshot, OptimizerReceiptGateSnapshot, OptimizerRuntimeDecisionRecorder,
 };
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;

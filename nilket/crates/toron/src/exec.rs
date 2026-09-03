@@ -1,5 +1,4 @@
 use crate::aggregate_kernel;
-
 use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
 use crate::distributed::cancellation::DownstreamCancellationContext;
 use crate::distributed::task::{
@@ -124,15 +123,16 @@ mod join;
 /// all-zero locality counters cannot be told apart from a probe that never ran, and
 /// "no mismatch" cannot be told apart from "never compared".
 pub use join::{
-	JOIN_BATCH_LOCAL_EQUIVALENCE_ENV, JOIN_SELECTION_LOCALITY_ENV, JOIN_SLICE_EQUIVALENCE_ENV,
+	JOIN_BATCH_LOCAL_EQUIVALENCE_ENV, JOIN_REPLAY_INPUT_DIAGNOSTIC_ENV,
+	JOIN_SELECTION_LOCALITY_ENV, JOIN_SLICE_EQUIVALENCE_ENV, chain_stage_profile_enabled,
 	join_batch_local_equivalence_columns_verified, join_batch_local_equivalence_enabled,
-	join_selection_locality_enabled, join_slice_equivalence_columns_verified,
-	join_slice_equivalence_enabled,
+	join_replay_input_diagnostic_enabled, join_selection_locality_enabled,
+	join_slice_equivalence_columns_verified, join_slice_equivalence_enabled,
+	reset_join_replay_input_diagnostic, take_join_replay_input_diagnostic,
 };
 mod node_attribution;
 mod phase_receipt;
 mod scan_open;
-
 pub(in crate::exec) use self::aggregate::{
 	AggState, BoundGroupedAggregateGroups, add_avg_value, add_sum_value, avg_state_array,
 	finalize_global_aggregate_state, fresh_window_agg_state, init_global_aggregate_state,
@@ -1786,6 +1786,7 @@ fn concat_or_empty(
 	schema: arrow::datatypes::SchemaRef,
 	batches: &[RecordBatch],
 ) -> Result<RecordBatch, ExecutionError> {
+	join::observe_join_input_concat_for_diagnostic();
 	if batches.is_empty() {
 		Ok(RecordBatch::new_empty(schema))
 	} else {

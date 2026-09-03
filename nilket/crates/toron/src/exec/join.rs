@@ -1,5 +1,4 @@
 use super::*;
-
 use crate::phase_ledger::OperatorKind as PhaseOperatorKind;
 
 mod build_profile;
@@ -53,12 +52,17 @@ pub use self::batch_local_probe::{
 	JOIN_BATCH_LOCAL_EQUIVALENCE_ENV, join_batch_local_equivalence_columns_verified,
 	join_batch_local_equivalence_enabled,
 };
-
 use self::batch_local_probe::{
 	batch_local_route_eligible, record_route, try_batch_local_inner_join,
 };
 
+pub use self::input_materialization::{
+	JOIN_REPLAY_INPUT_DIAGNOSTIC_ENV, join_replay_input_diagnostic_enabled,
+	observe_join_input_concat_for_diagnostic, reset_join_replay_input_diagnostic,
+	take_join_replay_input_diagnostic,
+};
 use self::input_materialization::{JoinInputSide, time_join_input_materialization};
+pub use self::streaming::chain_stage_profile_enabled;
 
 use self::output_materialization::{LazyIndexBuilder, gather_side, index_deferral_available};
 

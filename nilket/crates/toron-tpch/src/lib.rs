@@ -55,6 +55,7 @@ use tpchgen::generators::{
 
 use toron::binder::{
 	PlannerConfig, bind, bind_with_explain_summary, bind_with_local_join_admissions,
+	bind_with_targeted_local_join_admissions,
 };
 use toron::catalog::{Catalog, MockCatalog, TableOptimizerFacts, TableRef, UniqueKeyProof};
 use toron::coordinator::DistributedQueryCoordinator;
@@ -94,7 +95,7 @@ use wendelon::schema::{
 use telemetry::{
 	Attempt, CorrectnessAttempt, DatasetVerification, ExecutionCensusBackpressureReceipt,
 	ExecutionCensusRow, FragmentCensusRow, PerfAttempt, PerfPhaseTimings, Phase, Status,
-	reason_for_error, status_for_reason,
+	TargetedLocalJoinAdmission, reason_for_error, status_for_reason,
 };
 
 /// Default cache / output root — always under `target/`, never a tracked path.
@@ -4214,6 +4215,9 @@ struct QueryExecution {
 	plan_fingerprint: String,
 	spill_bytes: u64,
 	local_join_admissions: Vec<String>,
+	targeted_local_join_admissions: Option<Vec<TargetedLocalJoinAdmission>>,
+	join_input_replay_ledger: Option<Vec<toron::distributed::task::JoinInputReplayLedger>>,
+	join_input_total_concats: Option<u64>,
 	join_spill_observations: Vec<JoinSpillObservation>,
 	partition_work_concurrency_observations: Vec<PartitionWorkConcurrencyObservation>,
 	/// The executor's phase counters for this run. `Copy`, read once after the elapsed
@@ -4394,7 +4398,7 @@ async fn execute_logical_with_catalog_timed(
 	let mut spill_bytes = 0;
 	let bind_start = Instant::now();
 	let (bound, local_join_admissions) =
-		match bind_with_local_join_admissions(&logical, &catalog, &planner_config).await {
+		match bind_with_targeted_local_join_admissions(&logical, &catalog, &planner_config).await {
 			Ok(bound) => bound,
 			Err(error) => {
 				timings.bind_ms = bind_start.elapsed().as_secs_f64() * 1000.0;
@@ -4410,6 +4414,11 @@ async fn execute_logical_with_catalog_timed(
 	plan_fingerprint = Some(physical_plan_fingerprint(&bound));
 
 	let task_telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+	let replay_diagnostic = toron::exec::join_replay_input_diagnostic_enabled();
+	if replay_diagnostic {
+		toron::exec::reset_join_replay_input_diagnostic()
+			.map_err(|error| StageError::from_debug(Phase::Execute, error))?;
+	}
 	let context = query_budget.map_or_else(
 		|| tpch_execution_context(task_telemetry.clone()),
 		|budget| tpch_execution_context_with_budget(task_telemetry.clone(), budget),
@@ -4448,6 +4457,23 @@ async fn execute_logical_with_catalog_timed(
 	let phase_receipt = telemetry.phase_receipt;
 	drop(telemetry);
 
+	let targeted_local_join_admissions = replay_diagnostic.then(|| {
+		local_join_admissions
+			.iter()
+			.map(|receipt| TargetedLocalJoinAdmission {
+				replay_id: receipt.replay_id.0,
+				verdict: receipt.admission.describe(),
+			})
+			.collect()
+	});
+	let (join_input_replay_ledger, join_input_total_concats) = if replay_diagnostic {
+		let (ledger, total) = toron::exec::take_join_replay_input_diagnostic()
+			.map_err(|error| StageError::from_debug(Phase::Execute, error))?;
+		(Some(ledger), Some(total))
+	} else {
+		(None, None)
+	};
+
 	Ok(QueryExecution {
 		batches,
 		timings,
@@ -4455,8 +4481,11 @@ async fn execute_logical_with_catalog_timed(
 		spill_bytes,
 		local_join_admissions: local_join_admissions
 			.iter()
-			.map(|admission| admission.describe())
+			.map(|receipt| receipt.admission.describe())
 			.collect(),
+		targeted_local_join_admissions,
+		join_input_replay_ledger,
+		join_input_total_concats,
 		join_spill_observations,
 		partition_work_concurrency_observations,
 		task_phases,
@@ -5101,8 +5130,8 @@ impl TimingAuthorityConditions {
 	}
 }
 
-/// Whether both opt-in join diagnostics are off, so a run's timings mean what they
-/// say.
+/// Whether every opt-in join diagnostic is off, so a run's timings mean what
+/// they say.
 ///
 /// Shared by every timing artifact rather than read at one call site: a diagnostic
 /// that invalidates the atlas invalidates the placement A/B for the same reason, and
@@ -5111,6 +5140,8 @@ pub fn join_diagnostics_disabled() -> bool {
 	!toron::exec::join_slice_equivalence_enabled()
 		&& !toron::exec::join_selection_locality_enabled()
 		&& !toron::exec::join_batch_local_equivalence_enabled()
+		&& !toron::exec::join_replay_input_diagnostic_enabled()
+		&& !toron::exec::chain_stage_profile_enabled()
 }
 
 /// One timed child: exactly one query execution on one arm. `query_elapsed_ms` covers the
@@ -11960,6 +11991,9 @@ async fn run_rune_q03_perf_query_with_metadata(
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
+				targeted_local_join_admissions: None,
+				join_input_replay_ledger: None,
+				join_input_total_concats: None,
 				join_spill_observations: None,
 				partition_work_concurrency_observations: None,
 				dataset_verification: None,
@@ -11998,6 +12032,9 @@ async fn run_rune_q03_perf_query_with_metadata(
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
+				targeted_local_join_admissions: None,
+				join_input_replay_ledger: None,
+				join_input_total_concats: None,
 				join_spill_observations: None,
 				partition_work_concurrency_observations: None,
 				dataset_verification: None,
@@ -12035,6 +12072,9 @@ async fn run_rune_q03_perf_query_with_metadata(
 			duckdb_version: None,
 			debug_build: cfg!(debug_assertions),
 			local_join_admissions: None,
+			targeted_local_join_admissions: None,
+			join_input_replay_ledger: None,
+			join_input_total_concats: None,
 			join_spill_observations: None,
 			partition_work_concurrency_observations: None,
 			dataset_verification: None,
@@ -12065,6 +12105,9 @@ async fn run_rune_q03_perf_query_with_metadata(
 			duckdb_version: None,
 			debug_build: cfg!(debug_assertions),
 			local_join_admissions: None,
+			targeted_local_join_admissions: None,
+			join_input_replay_ledger: None,
+			join_input_total_concats: None,
 			join_spill_observations: None,
 			partition_work_concurrency_observations: None,
 			dataset_verification: None,
@@ -12094,6 +12137,9 @@ async fn run_rune_q03_perf_query_with_metadata(
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: None,
+		targeted_local_join_admissions: None,
+		join_input_replay_ledger: None,
+		join_input_total_concats: None,
 		join_spill_observations: None,
 		partition_work_concurrency_observations: None,
 		dataset_verification: None,
@@ -12142,6 +12188,9 @@ async fn run_perf_query_with_tables(
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
+				targeted_local_join_admissions: None,
+				join_input_replay_ledger: None,
+				join_input_total_concats: None,
 				join_spill_observations: None,
 				partition_work_concurrency_observations: None,
 				dataset_verification: None,
@@ -12180,6 +12229,9 @@ async fn run_perf_query_with_tables(
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
+				targeted_local_join_admissions: None,
+				join_input_replay_ledger: None,
+				join_input_total_concats: None,
 				join_spill_observations: None,
 				partition_work_concurrency_observations: None,
 				dataset_verification: None,
@@ -12214,6 +12266,9 @@ async fn run_perf_query_with_tables(
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: Some(execution.local_join_admissions),
+		targeted_local_join_admissions: execution.targeted_local_join_admissions,
+		join_input_replay_ledger: execution.join_input_replay_ledger,
+		join_input_total_concats: execution.join_input_total_concats,
 		join_spill_observations: Some(execution.join_spill_observations),
 		partition_work_concurrency_observations: Some(
 			execution.partition_work_concurrency_observations,
@@ -12265,6 +12320,9 @@ async fn run_perf_query_with_metadata(
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
+				targeted_local_join_admissions: None,
+				join_input_replay_ledger: None,
+				join_input_total_concats: None,
 				join_spill_observations: None,
 				partition_work_concurrency_observations: None,
 				dataset_verification: None,
@@ -12303,6 +12361,9 @@ async fn run_perf_query_with_metadata(
 				duckdb_version: None,
 				debug_build: cfg!(debug_assertions),
 				local_join_admissions: None,
+				targeted_local_join_admissions: None,
+				join_input_replay_ledger: None,
+				join_input_total_concats: None,
 				join_spill_observations: None,
 				partition_work_concurrency_observations: None,
 				dataset_verification: None,
@@ -12337,6 +12398,9 @@ async fn run_perf_query_with_metadata(
 		duckdb_version: None,
 		debug_build: cfg!(debug_assertions),
 		local_join_admissions: Some(execution.local_join_admissions),
+		targeted_local_join_admissions: execution.targeted_local_join_admissions,
+		join_input_replay_ledger: execution.join_input_replay_ledger,
+		join_input_total_concats: execution.join_input_total_concats,
 		join_spill_observations: Some(execution.join_spill_observations),
 		partition_work_concurrency_observations: Some(
 			execution.partition_work_concurrency_observations,
@@ -22896,6 +22960,9 @@ mod dataset_verification_provenance {
 			duckdb_version: None,
 			debug_build: cfg!(debug_assertions),
 			local_join_admissions: None,
+			targeted_local_join_admissions: None,
+			join_input_replay_ledger: None,
+			join_input_total_concats: None,
 			join_spill_observations: None,
 			partition_work_concurrency_observations: None,
 			dataset_verification: None,
