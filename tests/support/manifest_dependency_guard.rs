@@ -104,7 +104,8 @@ fn assert_product_dependency_boundary_in_workspace(
 	);
 }
 
-fn forbidden_dependencies(
+#[allow(dead_code)]
+pub(crate) fn forbidden_dependencies(
 	crate_manifest: &str,
 	workspace_manifest: &str,
 	boundary: ProductBoundary,
@@ -161,11 +162,17 @@ fn is_forbidden_package(package: &str, boundary: ProductBoundary) -> bool {
 		package.as_str(),
 		"libaryon" | "baryon" | "polariton" | "spectrometer"
 	);
+	// PRODUCT-0153 gate 3 and PRODUCT-0154 §9: a boundary that renders or views
+	// Polariton figures never depends on a browser plot authority. An explicit
+	// adapter under a recorded exception lives in its own boundary.
+	let browser_plot_authority = package.starts_with("vega")
+		|| package.starts_with("vega-lite")
+		|| package.starts_with("altair");
 
 	match boundary {
 		ProductBoundary::Libaryon => analytics_or_connector || nilket_engine || package == "boson",
 		ProductBoundary::Baryon => analytics_or_connector || nilket_engine,
-		ProductBoundary::Polariton => nilket_engine,
+		ProductBoundary::Polariton => nilket_engine || browser_plot_authority,
 		ProductBoundary::NilketEngine => editor,
 		ProductBoundary::Boson => {
 			analytics_or_connector

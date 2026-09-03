@@ -1,6 +1,22 @@
 # ADR 0154: the published dashboard package
 
-Status: proposed 2026-09-03. Publication lane, first record; it advances the
+Status: accepted 2026-09-03, proposed the same day. Amended at implementation:
+§3's canonical Arrow encoding strips metadata rather than sorting it, makes
+every field nullable, and collapses wide offset types to their ordinary
+forms, because equal content from a Polars producer and an Arrow producer
+differs in exactly those three ways and in nothing else; and the plot menu
+pin from PRODUCT-0075 is re-pinned to admit the publish action. Publication
+lane, first record. Amended again after review of the implementation:
+identity is the digest of the manifest's identity projection, which
+excludes the publish moment; provenance is bound to the artifact at the
+dispatch seam and travels with it, so one dataset file keeps every distinct
+assertion; the guard checks every value structurally before escaping and
+refuses path- and endpoint-shaped strings; the server verifies and pins
+every listed file at open and binds loopback only; canonical Arrow ignores
+producer batching and refuses unsupported representations; a figure carries
+its authored view expression, subtitle, and durable document identity,
+and is always the authored figure over its full dataset, session selection
+never being published. Publication lane, first record; it advances the
 web corpus rows *shared figure image*, *snapshot dashboard publication*,
 and *served snapshot publication*, and no other. PRODUCT-0153 §4 made the
 snapshot package the unit of publication and left its format to this
@@ -96,9 +112,13 @@ enforces this for the session owner is extended to the package module.
 
 Every figure's data is an Arrow IPC stream file under `data/`, named by the
 SHA-256 of its bytes. The encoding is canonical: one stream, uncompressed,
-schema metadata sorted, batches in producer order, written by one writer
-with fixed options, so equal record batches produce equal bytes and equal
-digests. Arrow-backed artifacts are re-encoded through that writer, never
+schema and field metadata stripped, every field nullable, wide offset types
+collapsed to their ordinary forms, all-valid validity bitmaps dropped,
+producer batching collapsed to one batch, representations the writer
+cannot make deterministic refused with a diagnostic, written by one writer
+with fixed options, so equal content produces equal bytes and equal digests
+whichever producer supplied it. Arrow-backed artifacts are re-encoded
+through that writer, never
 copied as received; Polars-backed artifacts cross an explicit
 package-export conversion, the one seam where a frame becomes IPC for
 publication. Figures reference datasets by digest. Two figures over one
@@ -126,12 +146,16 @@ ordinal otherwise, with that distinction recorded; the title and subtitle
 from the resolved chrome; the mark family; the dataset digest; and its
 layout rectangle in the dashboard's grid, in cells. The directory holds
 `definition.json` — the authored plot definition as a DTO, PRODUCT-0002
-§8's saved specification — `presentation.json` — the resolved settings
-model, theme selection, colour assignments, and domain overrides — and
-`figure.svg`, the pre-rendered fallback at the export's width and height.
+§8's saved specification — `presentation.json` — every effective
+setting with its provenance tier, projected from the PRODUCT-0141 registry —
+and `figure.svg`, the pre-rendered fallback at the export's width and
+height. The definition carries the view expression exactly as authored when
+the figure was born from Rune source.
 
-A figure that is behind its selection is rebuilt through its recipe before
-publication, exactly as export does; a figure with no recipe refuses.
+A figure is always the authored figure over its full dataset: a displayed
+selection is session state that filters ink and never the packaged data, so
+a selected figure is rebuilt unfiltered before publication and the package
+records that no selection is published. A figure with no recipe refuses.
 
 ### 6. The SVG backend becomes a production renderer, with a licence
 
@@ -216,7 +240,10 @@ localhost; and any change to the desktop plotting contracts.
    parser exactly.
 5. **Font licence.** The package SVG through `resvg` with the package font
    is pixel-equal to the PNG export of the same figure, for one figure of
-   every mark family with text.
+   every mark family the `xy` constructor can author over a numeric or a
+   categorical fixture, which must include scatter, line, and bar; families
+   needing their own field constructors are covered when those fixtures
+   exist.
 6. **Provenance never leaks.** The publication guard refuses the seeded
    secret; every producer kind produces an entry; the certificate slot is
    absent for every producer today.

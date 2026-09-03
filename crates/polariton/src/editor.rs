@@ -2315,6 +2315,7 @@ impl CodeEditor {
 		projected: impl IntoIterator<Item = (HostPanelId, PaneRect)>,
 	) -> Vec<HostPlotExport> {
 		let mut seen = std::collections::HashSet::new();
+		let documents = self.durable_documents_by_buffer();
 		projected
 			.into_iter()
 			.filter_map(|(panel_id, rect)| {
@@ -2351,8 +2352,61 @@ impl CodeEditor {
 						.and_then(|publication| self.selection_contexts.revision(publication.input))
 						.unwrap_or(crate::selection::SelectionRevision::ZERO),
 					displayed_selection_revision: plot.displayed_selection_revision,
+					layout: crate::publication::GridRect {
+						col: rect.screen_col.get() as u32,
+						row: rect.screen_row.get() as u32,
+						width: rect.width.get() as u32,
+						height: rect.height.get() as u32,
+					},
+					view_name: plot.source_attachment.as_ref().and_then(|attachment| {
+						match &attachment.identity {
+							crate::rune_view::LocalViewIdentity::Named(name) => Some(name.clone()),
+							crate::rune_view::LocalViewIdentity::Anonymous(_) => None,
+						}
+					}),
+					plot_type: plot.plot_type,
+					publication: plot.publication,
+					authored_expression: plot
+						.source_attachment
+						.as_ref()
+						.and_then(|attachment| attachment.expression.clone()),
+					document: plot.source_attachment.as_ref().and_then(|attachment| {
+						documents
+							.get(&attachment.source.buffer_id)
+							.map(|document| document.get())
+					}),
 				})
 			})
+			.collect()
+	}
+
+	/// PRODUCT-0010 §5's durable document identity for each live buffer that has
+	/// one. The reduced head projects no document bindings and returns none.
+	#[cfg(feature = "toron")]
+	fn durable_documents_by_buffer(
+		&self,
+	) -> HashMap<libaryon::core::BufferId, libaryon::core::DocumentId> {
+		self.viewport
+			.as_ref()
+			.and_then(|viewport| Self::projected_document_bindings(viewport).ok())
+			.map(|bindings| bindings.0)
+			.unwrap_or_default()
+	}
+
+	#[cfg(not(feature = "toron"))]
+	fn durable_documents_by_buffer(
+		&self,
+	) -> HashMap<libaryon::core::BufferId, libaryon::core::DocumentId> {
+		HashMap::new()
+	}
+
+	/// PRODUCT-0154 §7: the publications behind every visible plot, in export
+	/// order, captured before the exports are taken so a figure that
+	/// republishes in between is refused rather than mixed.
+	pub(crate) fn host_plot_publications(&self) -> Vec<Option<crate::selection::Publication>> {
+		self.host_plot_exports()
+			.into_iter()
+			.map(|export| export.publication)
 			.collect()
 	}
 
@@ -4227,6 +4281,17 @@ pub(crate) struct HostPlotExport {
 	pub(crate) predicate: crate::selection::Predicate,
 	pub(crate) selection_revision: crate::selection::SelectionRevision,
 	pub(crate) displayed_selection_revision: crate::selection::SelectionRevision,
+	/// PRODUCT-0154 §5: the figure's grid rectangle in cells, the named view
+	/// behind it when one exists, its mark family, and the publication whose
+	/// token is the assembly witness. None of these is placement authority.
+	pub(crate) layout: crate::publication::GridRect,
+	pub(crate) view_name: Option<String>,
+	pub(crate) plot_type: Option<crate::plot::core::PlotType>,
+	pub(crate) publication: Option<crate::selection::Publication>,
+	/// PRODUCT-0154 §5: the view expression as authored, and the durable
+	/// document identity of PRODUCT-0010 §5 when the source buffer has one.
+	pub(crate) authored_expression: Option<String>,
+	pub(crate) document: Option<u64>,
 }
 
 struct PanelEntry {
@@ -6867,6 +6932,7 @@ mod tests {
 				document_generation: generation,
 				model: Arc::new(PresentationSourceModel::default()),
 			},
+			expression: None,
 		};
 		let live = HashSet::from([buffer_id]);
 		let generations = HashMap::from([(buffer_id, generation)]);
@@ -6979,6 +7045,7 @@ mod tests {
 				document_generation: generation,
 				model: Arc::new(PresentationSourceModel::default()),
 			},
+			expression: None,
 		};
 		let mut plot = HostPlotState::new_with_source(
 			"authoritative".to_owned(),

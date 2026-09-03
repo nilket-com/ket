@@ -135,6 +135,10 @@ struct AppState {
 	#[cfg(feature = "toron")]
 	rune_document_generations: HashMap<(BufferId, u64), libaryon::core::StateId>,
 	#[cfg(feature = "toron")]
+	/// PRODUCT-0154 §5: the compiled source text beside its presentation model,
+	/// so a figure can carry the view expression that authored it.
+	rune_presentation_sources: HashMap<(BufferId, u64), Arc<str>>,
+	#[cfg(feature = "toron")]
 	rune_presentation_models:
 		HashMap<(BufferId, u64), Arc<crate::presentation_registry::PresentationSourceModel>>,
 	#[cfg(feature = "toron")]
@@ -176,6 +180,9 @@ struct AppState {
 	/// unlock, cancel, or failure. A session that never touches the store
 	/// never sees a prompt.
 	profile_unlock: Option<crate::profile_store::UnlockPrompt>,
+	/// PRODUCT-0154 §7: the authored package directory, open only while the
+	/// user is publishing.
+	publish_prompt: Option<crate::publication::PublishPrompt>,
 	/// The operation that asked for the store, applied once unlock succeeds
 	/// and dropped on cancel.
 	pending_profile_operation: Option<crate::profile_store::ProfileOperation>,
@@ -695,6 +702,8 @@ fn new_with_authority(
 		#[cfg(feature = "toron")]
 		rune_presentation_models: HashMap::new(),
 		#[cfg(feature = "toron")]
+		rune_presentation_sources: HashMap::new(),
+		#[cfg(feature = "toron")]
 		retained_rune_relations: HashMap::new(),
 		#[cfg(feature = "toron")]
 		settings_preview_sequence: 0,
@@ -724,6 +733,7 @@ fn new_with_authority(
 		profile_store: crate::profile_store::ProfileStore::default(),
 		profile_store_path: crate::profile_store::ProfileStore::default_path(),
 		profile_unlock: None,
+		publish_prompt: None,
 		pending_profile_operation: None,
 		editing_profile: None,
 		sql_run_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -776,6 +786,7 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		app_state.session_id.is_some(),
 		app_state.saved_close_state == SavedCloseState::Failed,
 		app_state.profile_unlock.as_ref(),
+		app_state.publish_prompt.as_ref(),
 		// `None` while locked: names live inside the ciphertext, so no list
 		// can render before unlock (PRODUCT-0134 §8).
 		app_state
@@ -951,12 +962,19 @@ async fn dispatch_sql_gated(
 	code: String,
 	generation: u64,
 	current: Arc<std::sync::atomic::AtomicU64>,
+	producer: String,
 ) -> ExecutionResult {
 	let mut guard = db.write().await;
 	if current.load(std::sync::atomic::Ordering::SeqCst) != generation {
 		return ExecutionResult::None;
 	}
-	guard.dispatch(&code).await
+	let result = guard.dispatch(&code).await;
+	// PRODUCT-0154 §4: provenance is a birth fact bound where the adapter is
+	// known, never inferred later from whatever adapter is selected then.
+	if let ExecutionResult::Rows { artifact, .. } = &result {
+		artifact.bind_producer(&producer);
+	}
+	result
 }
 
 /// PRODUCT-0135 §4/§5: cancellation's host half, in the contract's order —
@@ -1013,7 +1031,17 @@ fn run_code(
 	let generation = app_state.current_sql_generation();
 	let current = Arc::clone(&app_state.sql_run_generation);
 	let (task, handle) = Task::perform(
-		dispatch_sql_gated(db, code, generation, current),
+		dispatch_sql_gated(
+			db,
+			code,
+			generation,
+			current,
+			app_state
+				.adapter_state
+				.selection
+				.adapter_type_str()
+				.to_owned(),
+		),
 		move |result| Message::RunResult {
 			result,
 			publish,
@@ -1242,6 +1270,12 @@ fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> 
 		(source_buffer, revision),
 		Arc::new(view.presentation_source_model.clone()),
 	);
+	app_state
+		.rune_presentation_sources
+		.retain(|(buffer, candidate), _| *buffer != source_buffer || *candidate >= revision);
+	app_state
+		.rune_presentation_sources
+		.insert((source_buffer, revision), Arc::from(view.source.as_str()));
 	app_state.status_msg = format!(
 		"Rune workspace running {relation_count} independent quer{}…",
 		if relation_count == 1 { "y" } else { "ies" }
@@ -2766,6 +2800,7 @@ async fn dispatch_rune_relation_with_palettes(
 				.to_owned(),
 		),
 		Ok(RuneDispatchSuccess::Relation(artifact)) => {
+			artifact.bind_producer("toron");
 			rune_view_outcome_with_palettes(artifact, view.views, palettes)
 				.map(RuneRelationCompletion::Views)
 		}
@@ -3513,7 +3548,17 @@ fn run_sql_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) 
 	let generation = app_state.current_sql_generation();
 	let current = Arc::clone(&app_state.sql_run_generation);
 	let (task, handle) = Task::perform(
-		dispatch_sql_gated(db, cell.code, generation, current),
+		dispatch_sql_gated(
+			db,
+			cell.code,
+			generation,
+			current,
+			app_state
+				.adapter_state
+				.selection
+				.adapter_type_str()
+				.to_owned(),
+		),
 		move |result| Message::RunMarkdownCellResult {
 			identity,
 			presentation,
@@ -4849,6 +4894,21 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 						.copied(),
 				)
 				.map(|(model, document_generation)| {
+					let expression = app_state
+						.rune_presentation_sources
+						.get(&(source_buffer, revision))
+						.and_then(|source| {
+							let slot = model
+								.view_slots
+								.iter()
+								.find(|slot| slot.owner == identity)?;
+							source
+								.get(
+									slot.expression_span.start as usize
+										..slot.expression_span.end as usize,
+								)
+								.map(str::to_owned)
+						});
 					crate::presentation_registry::PlotSourceAttachment {
 						identity: identity.clone(),
 						source: crate::presentation_registry::StampedPresentationSourceModel {
@@ -4856,6 +4916,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							document_generation,
 							model,
 						},
+						expression,
 					}
 				});
 			let plot_type = Some(resolved.resolved_spec.composition.primary_plot_type());
@@ -5177,6 +5238,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					document_generation,
 					model: Arc::new(candidate.transformed.presentation_source_model.clone()),
 				},
+				expression: app_state
+					.code_editor
+					.plot_writeback_context(panel_id)
+					.and_then(|context| context.attachment.expression.clone()),
 			};
 			let plot_type = Some(resolved.resolved_spec.composition.primary_plot_type());
 			app_state.code_editor.show_plot_source_preview(
@@ -5424,6 +5489,65 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			app_state.status_msg = "Export refused.".to_owned();
 			app_state.status_error = error;
 		}
+		Message::PublishRequested => {
+			app_state.publish_prompt = Some(crate::publication::PublishPrompt::default());
+		}
+		Message::PublishPathChanged(path) => {
+			if let Some(prompt) = &mut app_state.publish_prompt {
+				prompt.path = path;
+				prompt.error = None;
+			}
+		}
+		Message::PublishCancelled => {
+			app_state.publish_prompt = None;
+		}
+		Message::PublishSubmitted => {
+			let Some(prompt) = app_state.publish_prompt.clone() else {
+				return Task::none();
+			};
+			let path = prompt.path.trim().to_owned();
+			if path.is_empty() {
+				if let Some(prompt) = &mut app_state.publish_prompt {
+					prompt.error = Some("A directory path is required.".to_owned());
+				}
+				return Task::none();
+			}
+			// PRODUCT-0154 §7: the witness is captured before the exports are
+			// taken; a figure that republishes in between is refused.
+			let witness = app_state.code_editor.host_plot_publications();
+			let exports = app_state.code_editor.host_plot_exports();
+			let request = publish_request(app_state);
+			app_state.status_msg = format!("Publishing {} figures to {path}...", exports.len());
+			return Task::perform(
+				async move {
+					tokio::task::spawn_blocking(move || -> std::result::Result<String, String> {
+						let package = crate::publication::assemble(&witness, exports, &request)
+							.map_err(|error| error.to_string())?;
+						package
+							.write(std::path::Path::new(&path))
+							.map_err(|error| error.to_string())?;
+						Ok(format!("{path} · {}", package.digest()))
+					})
+					.await
+					.map_err(|error| format!("Publish · task failed: {error}"))?
+				},
+				|result| match result {
+					Ok(receipt) => Message::PublishDone(receipt),
+					Err(error) => Message::PublishFailed(error),
+				},
+			);
+		}
+		Message::PublishDone(receipt) => {
+			app_state.publish_prompt = None;
+			app_state.status_msg = format!("Published {receipt}");
+		}
+		Message::PublishFailed(error) => {
+			if let Some(prompt) = &mut app_state.publish_prompt {
+				prompt.error = Some(error.clone());
+			}
+			app_state.status_msg = "Publish refused.".to_owned();
+			app_state.status_error = error;
+		}
 		Message::ConnectionNameChanged(name) => {
 			app_state.adapter_state.name = name;
 		}
@@ -5598,6 +5722,7 @@ fn menu_action_to_message(action: &str) -> Option<Message> {
 		"session:checkpoint" => Some(Message::CheckpointSession),
 		"session:copy-id" => Some(Message::CopySessionId),
 		"session:close-without-checkpoint" => Some(Message::CloseWithoutCheckpoint),
+		"plot:publish" => Some(Message::PublishRequested),
 		_ => {
 			// Profile names ride after a fixed prefix and are taken verbatim,
 			// so any name the store accepts is addressable from the menu.
@@ -5615,6 +5740,56 @@ fn menu_action_to_message(action: &str) -> Option<Message> {
 			}
 			None
 		}
+	}
+}
+
+/// PRODUCT-0154 §4 and §8: what the package may carry — the producer kind
+/// and a non-secret label — and, separately, everything the guard must
+/// refuse: every secure adapter field value entered or unlocked in this
+/// session, the ad hoc connection string, and this machine's home and
+/// working directories.
+fn publish_request(app_state: &AppState) -> crate::publication::PublishRequest {
+	let selection = &app_state.adapter_state.selection;
+	let mut secrets = Vec::new();
+	for descriptor in crate::adapters::driver::fields_for(selection) {
+		if descriptor.is_secure {
+			if let Some(value) = app_state.adapter_state.fields.get(descriptor.key) {
+				secrets.push(value.clone());
+			}
+		}
+	}
+	secrets.push(app_state.adapter_state.ad_hoc_connection_string.clone());
+	if let Ok(names) = app_state.profile_store.names() {
+		let names: Vec<String> = names.into_iter().map(str::to_owned).collect();
+		for name in names {
+			let Ok(profile) = app_state.profile_store.get(&name) else {
+				continue;
+			};
+			let Some(kind) =
+				crate::adapters::driver::AdapterSelection::from_type_str(&profile.adapter_type)
+			else {
+				continue;
+			};
+			for descriptor in crate::adapters::driver::fields_for(&kind) {
+				if descriptor.is_secure {
+					if let Some(value) = profile.fields.get(descriptor.key) {
+						secrets.push(value.clone());
+					}
+				}
+			}
+		}
+	}
+	let mut forbidden_paths = Vec::new();
+	if let Ok(home) = std::env::var("HOME") {
+		forbidden_paths.push(home);
+	}
+	if let Ok(cwd) = std::env::current_dir() {
+		forbidden_paths.push(cwd.display().to_string());
+	}
+	crate::publication::PublishRequest {
+		published_at: chrono::Utc::now().to_rfc3339(),
+		secrets,
+		forbidden_paths,
 	}
 }
 
@@ -10361,6 +10536,17 @@ workspace.table("bad").views([view("bad", table())]);
 				predicate,
 				selection_revision: revision,
 				displayed_selection_revision,
+				layout: crate::publication::GridRect {
+					col: 0,
+					row: 0,
+					width: 1,
+					height: 1,
+				},
+				view_name: None,
+				plot_type: None,
+				publication: None,
+				authored_expression: None,
+				document: None,
 			};
 		let svg = |snapshot| match super::render_plot_export(snapshot, ExportFormat::SVG, 1)
 			.expect("selection export")
@@ -14483,12 +14669,19 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			"select 1".into(),
 			0,
 			current.clone(),
+			"sqlite".to_owned(),
 		));
 		assert!(matches!(result, ExecutionResult::None));
 		assert_eq!(dispatches.load(Ordering::SeqCst), 0, "no dispatch");
 
 		// A fresh generation dispatches normally.
-		let result = runtime.block_on(super::dispatch_sql_gated(db, "select 1".into(), 1, current));
+		let result = runtime.block_on(super::dispatch_sql_gated(
+			db,
+			"select 1".into(),
+			1,
+			current,
+			"sqlite".to_owned(),
+		));
 		assert!(matches!(result, ExecutionResult::Affected(1)));
 		assert_eq!(dispatches.load(Ordering::SeqCst), 1);
 	}

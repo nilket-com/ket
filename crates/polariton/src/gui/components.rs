@@ -166,6 +166,7 @@ pub fn main_screen<'a>(
 	saved_session: bool,
 	close_without_checkpoint: bool,
 	profile_unlock: Option<&'a crate::profile_store::UnlockPrompt>,
+	publish_prompt: Option<&'a crate::publication::PublishPrompt>,
 	profile_names: Option<Vec<String>>,
 	sql_cancellable: bool,
 ) -> Element<'a, Message> {
@@ -263,13 +264,16 @@ pub fn main_screen<'a>(
 	};
 	let profile_unlock_modal: Element<Message> =
 		profile_unlock.map_or_else(|| container(text("")).into(), profile_unlock_view);
+	let publish_modal: Element<Message> =
+		publish_prompt.map_or_else(|| container(text("")).into(), publish_prompt_view);
 	stack![
 		main_window,
 		adapter_modal,
 		settings_modal,
 		detail_overlay,
 		local_workspace_overlay,
-		profile_unlock_modal
+		profile_unlock_modal,
+		publish_modal
 	]
 	.into()
 }
@@ -504,21 +508,27 @@ fn build_menu_roots(
 		MenuRoot {
 			id: "plot".into(),
 			label: "Plot".into(),
-			items: vec![MenuItem::Submenu {
-				id: "plot:export".into(),
-				label: "Export".into(),
-				items: [
-					crate::gui::messages::ExportFormat::SVG,
-					crate::gui::messages::ExportFormat::PNG,
-					crate::gui::messages::ExportFormat::AVIF,
-				]
-				.into_iter()
-				.map(|format| MenuItem::Action {
-					id: format!("plot:export:{format}"),
-					label: format.to_string(),
-				})
-				.collect(),
-			}],
+			items: vec![
+				MenuItem::Action {
+					id: "plot:publish".into(),
+					label: "Publish…".into(),
+				},
+				MenuItem::Submenu {
+					id: "plot:export".into(),
+					label: "Export".into(),
+					items: [
+						crate::gui::messages::ExportFormat::SVG,
+						crate::gui::messages::ExportFormat::PNG,
+						crate::gui::messages::ExportFormat::AVIF,
+					]
+					.into_iter()
+					.map(|format| MenuItem::Action {
+						id: format!("plot:export:{format}"),
+						label: format.to_string(),
+					})
+					.collect(),
+				},
+			],
 		},
 		MenuRoot {
 			id: "settings".into(),
@@ -828,7 +838,7 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0075_plot_menu_retains_only_the_three_export_actions() {
+	fn product_0154_plot_menu_is_publish_and_the_three_export_actions() {
 		fn collect(items: &[MenuItem], ids: &mut Vec<String>) {
 			for item in items {
 				match item {
@@ -848,7 +858,12 @@ mod tests {
 		collect(&plot.items, &mut ids);
 		assert_eq!(
 			ids,
-			["plot:export:SVG", "plot:export:PNG", "plot:export:AVIF"]
+			[
+				"plot:publish",
+				"plot:export:SVG",
+				"plot:export:PNG",
+				"plot:export:AVIF"
+			]
 		);
 		assert!(ids.iter().all(|id| !id.starts_with("plot:new:")));
 	}
@@ -1181,6 +1196,60 @@ pub fn profile_unlock_view(
 				Message::ProfileUnlockSubmitted,
 				BUTTON_SIZE_DEFAULT,
 			),
+		]
+		.spacing(10)
+		.align_y(Alignment::Center),
+	);
+	let dialog: Element<Message> = container(content)
+		.width(Length::Fixed(520.0))
+		.style(|_| container::Style {
+			background: Some(colors::BG_MODAL.into()),
+			border: border::Border {
+				color: colors::BORDER_PRIMARY,
+				width: 1.0,
+				radius: 5.0.into(),
+			},
+			..Default::default()
+		})
+		.into();
+	column![
+		space::vertical().height(FillPortion((100 - MODAL_FILL_PORTION_V) / 2)),
+		row![space::horizontal(), dialog, space::horizontal()],
+		space::vertical().height(FillPortion((100 - MODAL_FILL_PORTION_V) / 2)),
+	]
+	.into()
+}
+
+/// PRODUCT-0154 §7: the publish prompt. The directory is authored, never
+/// assumed; an existing directory refuses and the refusal is shown here.
+pub fn publish_prompt_view(
+	prompt: &crate::publication::PublishPrompt,
+) -> Element<'static, Message> {
+	let mut content = column![
+		row![text("Publish dashboard").size(24), space::horizontal()].align_y(Alignment::Center),
+		field(
+			"New package directory",
+			styled_text_input("", &prompt.path)
+				.on_input(Message::PublishPathChanged)
+				.on_submit(Message::PublishSubmitted),
+		),
+	]
+	.spacing(20)
+	.padding(20);
+	if let Some(error) = &prompt.error {
+		content = content.push(
+			text(error.clone())
+				.size(14)
+				.style(|_| iced::widget::text::Style {
+					color: Some(colors::DANGER),
+				}),
+		);
+	}
+	content = content.push(
+		row![
+			space::horizontal(),
+			styled_button("Cancel", Message::PublishCancelled, BUTTON_SIZE_DEFAULT),
+			styled_button("Publish", Message::PublishSubmitted, BUTTON_SIZE_DEFAULT),
 		]
 		.spacing(10)
 		.align_y(Alignment::Center),

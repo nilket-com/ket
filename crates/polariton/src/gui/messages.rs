@@ -100,6 +100,13 @@ pub enum Message {
 	Export(ExportFormat),
 	ExportDone(usize, ExportFormat),
 	ExportFailed(String),
+	/// PRODUCT-0154 §7: Plot → Publish… and its prompt lifecycle.
+	PublishRequested,
+	PublishPathChanged(String),
+	PublishSubmitted,
+	PublishCancelled,
+	PublishDone(String),
+	PublishFailed(String),
 	MaximizeWindow,
 	Menu(menu::MenuMessage),
 	MinimizeWindow,

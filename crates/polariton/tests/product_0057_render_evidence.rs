@@ -25,6 +25,8 @@ mod plot;
 mod presentation_registry;
 #[path = "../src/profile_store.rs"]
 mod profile_store;
+#[path = "../src/publication.rs"]
+mod publication;
 #[path = "../src/result_artifact.rs"]
 mod result_artifact;
 #[path = "../src/result_registry.rs"]

@@ -107,6 +107,11 @@ pub struct ResultArtifact {
 	/// `from_polars_derived`.
 	input_identity: AtomicU64,
 	input_identity_bound: AtomicBool,
+	/// PRODUCT-0154 §4: the adapter kind that produced these rows, bound once at
+	/// the dispatch seam where the adapter is known and inherited by derived
+	/// artifacts, so provenance travels with the data instead of being
+	/// inferred at publish time.
+	producer: OnceLock<String>,
 	schema: ResultSchema,
 	backing: ResultBacking,
 	shape: (usize, usize),
@@ -230,6 +235,7 @@ impl ResultArtifact {
 			artifact_token: ArtifactToken::mint(),
 			input_identity: AtomicU64::new(InputIdentity::mint().raw()),
 			input_identity_bound: AtomicBool::new(false),
+			producer: OnceLock::new(),
 			schema: result_schema,
 			backing: ResultBacking::Arrow(ArrowBacking {
 				schema,
@@ -250,11 +256,15 @@ impl ResultArtifact {
 	/// identity. A view may change the frame allocation while remaining bound
 	/// to the same published relation for selection and staleness checks.
 	pub fn from_polars_derived(frame: Arc<DataFrame>, source: &Self) -> Arc<Self> {
-		Self::from_polars_with_publication(
+		let derived = Self::from_polars_with_publication(
 			frame,
 			source.publication(),
 			source.input_identity_is_bound(),
-		)
+		);
+		if let Some(producer) = source.producer() {
+			derived.bind_producer(producer);
+		}
+		derived
 	}
 
 	fn from_polars_with_token(frame: Arc<DataFrame>, artifact_token: ArtifactToken) -> Arc<Self> {
@@ -288,6 +298,7 @@ impl ResultArtifact {
 			artifact_token: publication.token,
 			input_identity: AtomicU64::new(publication.input.raw()),
 			input_identity_bound: AtomicBool::new(input_identity_bound),
+			producer: OnceLock::new(),
 			schema,
 			backing: ResultBacking::Polars(frame),
 			shape,
@@ -326,6 +337,16 @@ impl ResultArtifact {
 	pub(crate) fn bind_input_identity(&self, input: InputIdentity) {
 		self.input_identity.store(input.raw(), Ordering::Release);
 		self.input_identity_bound.store(true, Ordering::Release);
+	}
+
+	/// PRODUCT-0154 §4: bind the producing adapter kind. First binding wins;
+	/// a producer is a birth fact, not a mutable label.
+	pub fn bind_producer(&self, producer: &str) {
+		let _ = self.producer.set(producer.to_owned());
+	}
+
+	pub fn producer(&self) -> Option<&str> {
+		self.producer.get().map(String::as_str)
 	}
 
 	pub fn shape(&self) -> (usize, usize) {
@@ -442,6 +463,96 @@ impl ResultArtifact {
 			ResultBacking::Arrow(_) => self.projection.get().is_some(),
 			ResultBacking::Polars(_) => true,
 		}
+	}
+
+	/// PRODUCT-0154 §3: the package's canonical data encoding. One uncompressed
+	/// Arrow IPC stream, schema and field metadata stripped, batches in producer
+	/// order, written by one writer with fixed options — so equal batches yield
+	/// equal bytes. Polars-backed artifacts cross this seam through Polars' IPC
+	/// writer and back through the Arrow reader before the canonical writer.
+	pub fn canonical_ipc(&self) -> Result<Vec<u8>, ResultArtifactError> {
+		let batches: Vec<RecordBatch> = match &self.backing {
+			ResultBacking::Arrow(backing) => backing.batches.clone(),
+			ResultBacking::Polars(frame) => {
+				let mut polars_bytes = Vec::new();
+				let mut frame = frame.as_ref().clone();
+				IpcStreamWriter::new(&mut polars_bytes)
+					.finish(&mut frame)
+					.map_err(|error| ResultArtifactError::Ipc(error.to_string()))?;
+				let reader = StreamReader::try_new(Cursor::new(polars_bytes.as_slice()), None)
+					.map_err(|error| ResultArtifactError::Ipc(error.to_string()))?;
+				reader
+					.collect::<Result<Vec<_>, _>>()
+					.map_err(|error| ResultArtifactError::Ipc(error.to_string()))?
+			}
+		};
+		let source_schema = batches.first().map_or_else(
+			|| match &self.backing {
+				ResultBacking::Arrow(backing) => Arc::clone(&backing.schema),
+				ResultBacking::Polars(_) => Arc::new(arrow_schema::Schema::empty()),
+			},
+			|batch| batch.schema(),
+		);
+		let fields: Vec<arrow_schema::Field> = source_schema
+			.fields()
+			.iter()
+			.map(|field| canonical_field(field))
+			.collect();
+		let fields = fields
+			.into_iter()
+			.map(|field| {
+				canonical_type_supported(field.data_type())
+					.map(|()| field)
+					.map_err(ResultArtifactError::Ipc)
+			})
+			.collect::<Result<Vec<_>, _>>()?;
+		let schema: SchemaRef = Arc::new(arrow_schema::Schema::new(fields));
+		let mut out = Vec::new();
+		{
+			let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut out, schema.as_ref())
+				.map_err(|error| ResultArtifactError::Ipc(error.to_string()))?;
+			// Producer batching is not data: every publication is one batch.
+			let batches = if batches.len() > 1 {
+				vec![
+					arrow_select::concat::concat_batches(&batches[0].schema(), &batches)
+						.map_err(|error| ResultArtifactError::Ipc(error.to_string()))?,
+				]
+			} else {
+				batches
+			};
+			for batch in batches {
+				let columns =
+					batch
+						.columns()
+						.iter()
+						.zip(schema.fields())
+						.map(|(column, field)| {
+							let cast = arrow_cast::cast(column, field.data_type())
+								.map_err(|error| ResultArtifactError::Ipc(error.to_string()))?;
+							// An all-valid validity bitmap is not data: drop it so a producer
+							// that attached one and one that did not encode identically.
+							Ok(if cast.null_count() == 0 && cast.nulls().is_some() {
+								arrow_array::make_array(
+									cast.to_data().into_builder().nulls(None).build().map_err(
+										|error| ResultArtifactError::Ipc(error.to_string()),
+									)?,
+								)
+							} else {
+								cast
+							})
+						})
+						.collect::<Result<Vec<_>, _>>()?;
+				let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
+					.map_err(|error| ResultArtifactError::Ipc(error.to_string()))?;
+				writer
+					.write(&batch)
+					.map_err(|error| ResultArtifactError::Ipc(error.to_string()))?;
+			}
+			writer
+				.finish()
+				.map_err(|error| ResultArtifactError::Ipc(error.to_string()))?;
+		}
+		Ok(out)
 	}
 
 	#[cfg(test)]
@@ -864,5 +975,215 @@ mod tests {
 			2
 		);
 		assert_eq!(compatibility, canonical);
+	}
+}
+
+#[cfg(test)]
+mod product_0154_tests {
+	use super::*;
+	use arrow_array::{ArrayRef, Float64Array, Int64Array, StringArray};
+	use arrow_ipc::writer::StreamWriter;
+	use arrow_schema::{DataType, Field, Schema};
+
+	fn arrow_backed() -> Arc<ResultArtifact> {
+		let mut metadata = std::collections::HashMap::new();
+		metadata.insert(
+			"producer".to_owned(),
+			"noise that must not reach the package".to_owned(),
+		);
+		let schema = Arc::new(
+			Schema::new(vec![
+				Field::new("x", DataType::Int64, false),
+				Field::new("y", DataType::Float64, false),
+				Field::new("s", DataType::Utf8, false),
+			])
+			.with_metadata(metadata),
+		);
+		let batch = RecordBatch::try_new(
+			Arc::clone(&schema),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+				Arc::new(Float64Array::from(vec![2.0, 3.0, 5.0])) as ArrayRef,
+				Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+			],
+		)
+		.expect("batch");
+		let mut bytes = Vec::new();
+		{
+			let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("writer");
+			writer.write(&batch).expect("write");
+			writer.finish().expect("finish");
+		}
+		ResultArtifact::from_arrow_ipc(vec![bytes], ArrowNullabilityPolicy::Preserve)
+			.expect("artifact")
+	}
+
+	fn polars_backed() -> Arc<ResultArtifact> {
+		ResultArtifact::from_polars(Arc::new(
+			polars::df!("x" => [1_i64, 2, 3], "y" => [2.0_f64, 3.0, 5.0], "s" => ["a", "b", "c"])
+				.expect("frame"),
+		))
+	}
+
+	#[test]
+	fn product_0154_canonical_ipc_is_equal_across_backings_and_strips_metadata() {
+		let arrow = arrow_backed().canonical_ipc().expect("arrow canonical");
+		let polars = polars_backed().canonical_ipc().expect("polars canonical");
+		assert_eq!(
+			arrow, polars,
+			"equal content must yield equal canonical bytes"
+		);
+		let reader = StreamReader::try_new(Cursor::new(arrow.as_slice()), None).expect("reader");
+		assert!(
+			reader.schema().metadata().is_empty(),
+			"schema metadata is not data"
+		);
+		assert!(
+			reader
+				.schema()
+				.fields()
+				.iter()
+				.all(|field| field.metadata().is_empty()),
+			"field metadata is not data"
+		);
+		let again = arrow_backed().canonical_ipc().expect("stable");
+		assert_eq!(arrow, again);
+	}
+	#[test]
+	fn product_0154_canonical_ipc_ignores_producer_batching_and_refuses_maps() {
+		let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+		let one = RecordBatch::try_new(
+			Arc::clone(&schema),
+			vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef],
+		)
+		.expect("one batch");
+		let first = RecordBatch::try_new(
+			Arc::clone(&schema),
+			vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef],
+		)
+		.expect("first");
+		let second = RecordBatch::try_new(
+			Arc::clone(&schema),
+			vec![Arc::new(Int64Array::from(vec![3, 4])) as ArrayRef],
+		)
+		.expect("second");
+		let encode = |batches: &[RecordBatch]| {
+			let mut bytes = Vec::new();
+			{
+				let mut writer =
+					StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("writer");
+				for batch in batches {
+					writer.write(batch).expect("write");
+				}
+				writer.finish().expect("finish");
+			}
+			ResultArtifact::from_arrow_ipc(vec![bytes], ArrowNullabilityPolicy::Preserve)
+				.expect("artifact")
+				.canonical_ipc()
+				.expect("canonical")
+		};
+		let whole = encode(&[one]);
+		let split = encode(&[first, second]);
+		if whole != split {
+			let first_diff = whole.iter().zip(&split).position(|(a, b)| a != b);
+			let describe = |bytes: &[u8]| {
+				StreamReader::try_new(Cursor::new(bytes), None)
+					.expect("reader")
+					.map(|batch| {
+						let batch = batch.expect("batch");
+						batch
+							.columns()
+							.iter()
+							.map(|column| {
+								let data = column.to_data();
+								format!(
+									"rows={} offset={} nulls={:?} buffers={:?}",
+									data.len(),
+									data.offset(),
+									data.nulls().map(|n| n.len()),
+									data.buffers().iter().map(|b| b.len()).collect::<Vec<_>>()
+								)
+							})
+							.collect::<Vec<_>>()
+					})
+					.collect::<Vec<_>>()
+			};
+			panic!(
+				"batching leaked at byte {first_diff:?}: {} vs {} bytes\nwhole: {:?}\nsplit: {:?}",
+				whole.len(),
+				split.len(),
+				describe(&whole),
+				describe(&split)
+			);
+		}
+
+		let keys = Field::new("keys", DataType::Utf8, false);
+		let values = Field::new("values", DataType::Int64, true);
+		let entries = Field::new(
+			"entries",
+			DataType::Struct(vec![keys, values].into()),
+			false,
+		);
+		let map_schema = Arc::new(Schema::new(vec![Field::new(
+			"m",
+			DataType::Map(Arc::new(entries), false),
+			true,
+		)]));
+		let mut bytes = Vec::new();
+		{
+			let mut writer =
+				StreamWriter::try_new(&mut bytes, map_schema.as_ref()).expect("writer");
+			writer.finish().expect("finish");
+		}
+		let refused = ResultArtifact::from_arrow_ipc(vec![bytes], ArrowNullabilityPolicy::Preserve)
+			.expect("artifact")
+			.canonical_ipc();
+		assert!(
+			matches!(refused, Err(ResultArtifactError::Ipc(message)) if message.contains("does not support"))
+		);
+	}
+}
+
+/// PRODUCT-0154 §3: one canonical field shape. Every field is nullable, so a
+/// producer that knows a column has no nulls and one that does not yield the
+/// same schema; wide offset widths collapse to their ordinary forms, since a
+/// publication is never wider than 2 GiB per column; metadata is not data.
+fn canonical_field(field: &arrow_schema::Field) -> arrow_schema::Field {
+	arrow_schema::Field::new(field.name(), canonical_type(field.data_type()), true)
+}
+
+fn canonical_type(data_type: &ArrowDataType) -> ArrowDataType {
+	match data_type {
+		ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View => ArrowDataType::Utf8,
+		ArrowDataType::LargeBinary | ArrowDataType::BinaryView => ArrowDataType::Binary,
+		ArrowDataType::Dictionary(_, value) => canonical_type(value),
+		ArrowDataType::LargeList(inner) | ArrowDataType::List(inner) => {
+			ArrowDataType::List(Arc::new(canonical_field(inner)))
+		}
+		ArrowDataType::Struct(fields) => {
+			ArrowDataType::Struct(fields.iter().map(|f| canonical_field(f)).collect())
+		}
+		other => other.clone(),
+	}
+}
+
+/// PRODUCT-0154 §3: representations the canonical writer cannot make
+/// deterministic are refused with a diagnostic, never cloned through.
+fn canonical_type_supported(data_type: &ArrowDataType) -> Result<(), String> {
+	match data_type {
+		ArrowDataType::Map(..)
+		| ArrowDataType::Union(..)
+		| ArrowDataType::RunEndEncoded(..)
+		| ArrowDataType::ListView(_)
+		| ArrowDataType::LargeListView(_) => Err(format!(
+			"canonical Arrow encoding does not support {data_type}; the package refuses it"
+		)),
+		ArrowDataType::List(inner) | ArrowDataType::FixedSizeList(inner, _) => {
+			canonical_type_supported(inner.data_type())
+		}
+		ArrowDataType::Struct(fields) => fields
+			.iter()
+			.try_for_each(|field| canonical_type_supported(field.data_type())),
+		_ => Ok(()),
 	}
 }

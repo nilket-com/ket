@@ -200,6 +200,8 @@ fn product_0062_persistence_schema_has_no_placement_or_renderer_authority() {
 	// sanctions exactly one more durable schema, the encrypted profile store.
 	let mut expected = vec![
 		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/profile_store.rs"),
+		// PRODUCT-0154 §2: the published dashboard package owns its own DTOs.
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/publication.rs"),
 		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session_persistence.rs"),
 	];
 	expected.sort();
@@ -6216,5 +6218,104 @@ fn product_0152_plot_and_presentation_sources_never_name_the_toron_client() {
 	assert!(
 		state.contains("use boson::TemporalInterval;"),
 		"positive control: gui/state.rs still consumes the literal, so the guard is exercised"
+	);
+}
+
+/// PRODUCT-0154 §2: the package DTOs never acquire placement, token, or
+/// renderer authority, and the runtime types they convert from never learn
+/// to serialize themselves.
+#[test]
+fn product_0154_package_dtos_stay_free_of_placement_token_and_renderer_authority() {
+	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let publication =
+		std::fs::read_to_string(src.join("publication.rs")).expect("read publication");
+	let dtos = publication
+		.split("// Manifest and figure DTOs")
+		.nth(1)
+		.expect("DTO region start")
+		.split("// Canonical encodings")
+		.next()
+		.expect("DTO region end");
+	for forbidden in [
+		"BufferId",
+		"HostPanelId",
+		"PaneRect",
+		"ArtifactToken",
+		"PlotType",
+		"PlotKernel",
+		"iced",
+		"tab_index",
+		"placement",
+	] {
+		assert!(
+			!dtos.contains(forbidden),
+			"PRODUCT-0154 DTO acquired runtime authority through {forbidden}"
+		);
+	}
+	for runtime in [
+		"plot/spec/mod.rs",
+		"plot/recipe.rs",
+		"plot/theme.rs",
+		"plot/common.rs",
+		"editor.rs",
+		"selection.rs",
+	] {
+		let source = std::fs::read_to_string(src.join(runtime)).expect("read runtime source");
+		assert!(
+			!source.contains("Serialize"),
+			"PRODUCT-0154: {runtime} must not serialize itself; the package owns its DTOs"
+		);
+	}
+}
+
+/// PRODUCT-0154 §9: the shell is a document. The emitter contains no script
+/// element, so no package can either.
+#[test]
+fn product_0154_shell_emitter_contains_no_script() {
+	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let publication =
+		std::fs::read_to_string(src.join("publication.rs")).expect("read publication");
+	let shell = publication
+		.split("fn shell_html(")
+		.nth(1)
+		.expect("shell emitter")
+		.split("\n}\n")
+		.next()
+		.expect("shell emitter body");
+	assert!(!shell.to_ascii_lowercase().contains("<script"));
+	assert!(
+		shell.contains("@font-face"),
+		"positive control: the emitter is the one read"
+	);
+}
+
+/// PRODUCT-0153 gate 3 and PRODUCT-0154 §9: no boundary that renders or views
+/// Polariton figures may depend on a browser plot authority, and the assay
+/// visibly fires on a specimen.
+#[test]
+fn product_0154_browser_plot_authority_is_refused_with_a_positive_control() {
+	let specimen = r#"
+[dependencies]
+vega-lite = "5"
+charting = { package = "altair", version = "1" }
+serde = "1"
+"#;
+	let violations =
+		manifest_dependency_guard::forbidden_dependencies(specimen, "", ProductBoundary::Polariton);
+	assert_eq!(
+		violations,
+		vec![
+			"charting (package = altair)".to_owned(),
+			"vega-lite".to_owned()
+		],
+		"positive control: the browser plot-authority assay must fire"
+	);
+	let clean = r#"
+[dependencies]
+serde = "1"
+"#;
+	assert!(
+		manifest_dependency_guard::forbidden_dependencies(clean, "", ProductBoundary::Polariton)
+			.is_empty()
 	);
 }

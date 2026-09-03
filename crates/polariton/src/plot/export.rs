@@ -14,6 +14,22 @@ use std::sync::Arc;
 /// paths, colors, text, transforms, clip declarations, and clip nesting. SVG
 /// cannot prove production-canvas compositing, clip enforcement, MSAA, or
 /// realized glyph measurement and fit.
+/// PRODUCT-0154 §6.1: every data-derived string enters the document escaped.
+pub fn xml_escape(text: &str) -> String {
+	let mut out = String::with_capacity(text.len());
+	for ch in text.chars() {
+		match ch {
+			'&' => out.push_str("&amp;"),
+			'<' => out.push_str("&lt;"),
+			'>' => out.push_str("&gt;"),
+			'"' => out.push_str("&quot;"),
+			'\'' => out.push_str("&apos;"),
+			_ => out.push(ch),
+		}
+	}
+	out
+}
+
 pub struct SvgBackend {
 	pub svg: String,
 	current_transform: Affine,
@@ -191,15 +207,16 @@ impl PlotBackend for SvgBackend {
 		);
 
 		self.svg.push_str(&format!(
-			r#"<text transform="{}" x="{}" y="{}" fill="{}" font-size="{}" text-anchor="{}" dominant-baseline="{}">{}</text>"#,
+			r#"<text transform="{}" x="{}" y="{}" fill="{}" font-size="{}" font-family="{}" text-anchor="{}" dominant-baseline="{}">{}</text>"#,
 			matrix,
 			text.position.x,
 			text.position.y,
 			self.color_to_svg(text.color),
 			text.size.0,
+			crate::publication::FONT_FAMILY,
 			anchor,
 			baseline,
-			text.content
+			xml_escape(&text.content)
 		));
 		self.svg.push('\n');
 	}
@@ -405,9 +422,12 @@ impl PngBackend {
 		}
 	}
 
-	pub fn save(self, path: &StdPath) {
+	/// The export rasterization itself: the SVG through resvg with the bundled
+	/// face loaded first. PRODUCT-0154 gate 5 compares against exactly this.
+	pub fn pixmap(self) -> tiny_skia::Pixmap {
 		let svg_str = self.svg_backend.finish();
 		let mut fontdb = resvg::usvg::fontdb::Database::new();
+		fontdb.load_font_data(crate::fonts::POLARITON_PLOT_SANS_REGULAR.to_vec());
 		fontdb.load_system_fonts();
 		let options = resvg::usvg::Options {
 			fontdb: Arc::new(fontdb),
@@ -422,7 +442,11 @@ impl PngBackend {
 			tiny_skia::Transform::identity(),
 			&mut pixmap.as_mut(),
 		);
-		pixmap.save_png(path).unwrap();
+		pixmap
+	}
+
+	pub fn save(self, path: &StdPath) {
+		self.pixmap().save_png(path).unwrap();
 	}
 }
 
@@ -443,6 +467,7 @@ impl AvifBackend {
 	pub fn save(self, path: &StdPath) {
 		let svg_str = self.svg_backend.finish();
 		let mut fontdb = resvg::usvg::fontdb::Database::new();
+		fontdb.load_font_data(crate::fonts::POLARITON_PLOT_SANS_REGULAR.to_vec());
 		fontdb.load_system_fonts();
 		let options = resvg::usvg::Options {
 			fontdb: Arc::new(fontdb),

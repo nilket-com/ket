@@ -1859,6 +1859,9 @@ pub(crate) struct StampedPresentationSourceModel {
 pub(crate) struct PlotSourceAttachment {
 	pub(crate) identity: LocalViewIdentity,
 	pub(crate) source: StampedPresentationSourceModel,
+	/// PRODUCT-0154 §5: the authored view expression, sliced from the compiled
+	/// source at the view slot this attachment owns, captured at birth.
+	pub(crate) expression: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2176,6 +2179,7 @@ mod tests {
 					view_slots: Vec::new(),
 				}),
 			},
+			expression: None,
 		};
 		let mut settings = PlotSettings::default();
 		settings.authored_spec.x_label =
@@ -2348,6 +2352,7 @@ mod tests {
 				document_generation: libaryon::core::StateId::new(4),
 				model: std::sync::Arc::new(PresentationSourceModel::default()),
 			},
+			expression: None,
 		};
 		let mut settings = PlotSettings::default();
 		settings.authored_spec.x_label =

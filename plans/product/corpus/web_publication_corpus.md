@@ -17,9 +17,9 @@ deliberately by a cited record).
 
 | rung | data authority · initial rendering · interaction | status | evidence |
 |---|---|---|---|
-| shared figure image: one figure leaves the desktop as a faithful Polariton SVG or raster | snapshot · pre-rendered · passive | pending | — |
-| snapshot dashboard publication: a package with figure identity, specification, resolved presentation, shared dataset digests, provenance, and fallback renders | snapshot · pre-rendered · passive | pending | — |
-| served snapshot publication: an existing package served without credentials, adapters, or execution | snapshot · pre-rendered · passive | pending | — |
+| shared figure image: one figure leaves the desktop as a faithful Polariton SVG or raster | snapshot · pre-rendered · passive | executable | PRODUCT-0154 §6: `product_0154_labels_round_trip_through_an_xml_parser`, `product_0154_package_font_reproduces_the_png_export_for_every_admitted_family` |
+| snapshot dashboard publication: a package with figure identity, specification, resolved presentation, shared dataset digests, provenance, and fallback renders | snapshot · pre-rendered · passive | executable | PRODUCT-0154 §1–§8: `product_0154_identity_is_content_and_moves_only_with_ink`, `product_0154_duplicate_view_names_reserve_every_id`, `product_0154_provenance_travels_with_each_artifact_and_shares_content`, `product_0154_canonical_ipc_is_equal_across_backings_and_strips_metadata`, `product_0154_canonical_ipc_ignores_producer_batching_and_refuses_maps`, `product_0154_guard_refuses_secrets_paths_and_endpoints_with_controls`, `product_0154_witness_and_recipe_refusals_name_the_figure`, `product_0154_a_selected_figure_publishes_the_authored_figure_over_its_full_data`, `product_0154_package_dtos_stay_free_of_placement_token_and_renderer_authority` |
+| served snapshot publication: an existing package served without credentials, adapters, or execution | snapshot · pre-rendered · passive | executable | PRODUCT-0154 §9: `product_0154_shell_is_a_document_on_the_grid_without_script`, `product_0154_server_pins_verified_bytes_and_refuses_everything_else`, `product_0154_shell_emitter_contains_no_script`, `product_0154_browser_plot_authority_is_refused_with_a_positive_control` |
 | inspectable published dashboard: hover and inspection over published hit metadata | snapshot · pre-rendered · local over existing geometry | pending | — |
 | navigable published dashboard: local pan, zoom, and selection consuming the desktop's settled vocabulary | snapshot · pre-rendered · local over existing geometry | pending | — |
 | linked published dashboard: linked highlighting and cross-filtering over packaged data | snapshot · pre-rendered · local | pending | — |
@@ -47,5 +47,11 @@ deliberately by a cited record).
 
 ## Change log
 
+- v0.3 (2026-09-03): the PRODUCT-0154 follow-up re-grounds the three executable
+  rungs on content identity, artifact-borne provenance, a structural guard,
+  a pinning loopback server, and literal escaping and font gates.
+- v0.2 (2026-09-03): PRODUCT-0154 lands the snapshot package, the production SVG
+  renderer, the publish action, the shell, and the server; the first three
+  publication rungs become executable.
 - v0.1 (2026-09-03): chartered by PRODUCT-0153 with every publication and
   distribution rung pending; four families deferred-by-design.

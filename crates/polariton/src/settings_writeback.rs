@@ -805,6 +805,7 @@ mod tests {
 				document_generation: StateId::new(7),
 				model: Arc::new(compiled.presentation_source_model.clone()),
 			},
+			expression: None,
 		};
 		(compiled, attachment)
 	}

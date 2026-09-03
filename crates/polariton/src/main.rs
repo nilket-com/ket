@@ -10,6 +10,7 @@ mod local_workspace;
 mod plot;
 mod presentation_registry;
 mod profile_store;
+mod publication;
 mod result_artifact;
 mod result_registry;
 mod rune_host;
@@ -39,6 +40,9 @@ fn main() -> gui::Result {
 		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
 	match action {
 		ApplicationAction::ListSessions => list_saved_sessions(),
+		ApplicationAction::Serve { root, bind } => {
+			publication::serve(root, bind).map_err(|error| error.into())
+		}
 		ApplicationAction::Gui(startup_target) => {
 			ensure_rustls_provider();
 			let startup_data = configuration::load_startup_data();
@@ -51,6 +55,11 @@ fn main() -> gui::Result {
 enum ApplicationAction {
 	Gui(gui::StartupTarget),
 	ListSessions,
+	/// PRODUCT-0154 §9: `polariton serve <package> [--bind host:port]`.
+	Serve {
+		root: std::path::PathBuf,
+		bind: std::net::SocketAddr,
+	},
 }
 
 /// Match Baryon's positional-file behavior without making Polariton's GUI
@@ -62,6 +71,10 @@ where
 {
 	let mut args = args.into_iter().peekable();
 	let _program = args.next();
+	if args.peek().is_some_and(|arg| arg == "serve") {
+		args.next();
+		return serve_action(args);
+	}
 	let mut parse_flags = true;
 	let mut initial_file = None;
 	let mut session = None;
@@ -263,6 +276,7 @@ mod tests {
 		match action_from_args(args)? {
 			ApplicationAction::Gui(target) => Ok(target),
 			ApplicationAction::ListSessions => Err("expected GUI target".to_owned()),
+			ApplicationAction::Serve { .. } => Err("expected GUI target".to_owned()),
 		}
 	}
 
@@ -445,4 +459,30 @@ mod tests {
 			"saved sessions require Polariton's `toron` feature"
 		);
 	}
+}
+
+/// `serve <package-directory> [--bind host:port]`, localhost by default and
+/// never anything but a read-only package server.
+fn serve_action<I>(mut args: I) -> Result<ApplicationAction, String>
+where
+	I: Iterator<Item = String>,
+{
+	let mut root = None;
+	let mut bind: std::net::SocketAddr = ([127, 0, 0, 1], 7743).into();
+	while let Some(arg) = args.next() {
+		if arg == "--bind" {
+			let value = args
+				.next()
+				.ok_or_else(|| "--bind requires host:port".to_owned())?;
+			bind = value
+				.parse()
+				.map_err(|error| format!("invalid --bind value {value:?}: {error}"))?;
+		} else if root.is_none() {
+			root = Some(std::path::PathBuf::from(arg));
+		} else {
+			return Err(format!("unexpected argument {arg:?}"));
+		}
+	}
+	let root = root.ok_or_else(|| "serve requires a package directory".to_owned())?;
+	Ok(ApplicationAction::Serve { root, bind })
 }
