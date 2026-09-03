@@ -241,6 +241,15 @@ is a race the user did not cause and cannot act on beyond repeating the gesture,
 and it carries nothing worth copying. §11's refused rectangle is classified by
 the same test and lands in the same lane.
 
+**Superseded in part by PRODUCT-0151 (accepted 2026-09-02).** The phrase "the current token for that input identity"
+above assumed one live publication per input. PRODUCT-0151 §4 found that
+two presentation chains over one input within one binding are separate
+live publications that §4 requires to share a context. Under
+0151 the staleness check compares an intent's token with its **source
+view's** current publication, and republication clears the predicates
+bound to the **retired publication**, not every predicate of the input.
+The ordering rule below is unchanged.
+
 **A stored predicate may be stranded.** Rejecting arriving intents does nothing
 about predicates already held in a context when the relation republishes.
 Therefore: **when publication for an input identity is retired or replaced, every
