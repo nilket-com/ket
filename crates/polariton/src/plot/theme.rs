@@ -176,7 +176,7 @@ impl Default for PlotGuideSettings {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlotDomainOverrides {
 	pub x_min: Option<f64>,
 	pub x_max: Option<f64>,

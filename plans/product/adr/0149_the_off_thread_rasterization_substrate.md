@@ -297,6 +297,14 @@ and the surface shows **one** preparing marker regardless of how many
 slots are pending — the marker states the surface's condition, not a
 per-slot inventory, and markers never stack or overlap.
 
+**Amended by PRODUCT-0150 at gesture implementation.** The compatible-flight
+rule remains the default for lone and layered producers, but it no longer
+grants facet cells a placed bitmap. PRODUCT-0139 §7 is the older explicit
+judgement, so facet slots now receive `RasterReusePolicy::Refused`: their async
+exact jobs and per-cell last-good slots remain, but a non-exact key contributes
+no pixels and the surface shows its one preparing marker. This retracts the
+in-flight facet preview this section had extended without naming that widening.
+
 ### 8. Exact headless rendering is its own contract
 
 Exports (SVG/PNG/AVIF) and direct render tests are **exact**: their

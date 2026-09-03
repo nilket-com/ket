@@ -11,13 +11,13 @@ use crate::coordinate::{Pt, Rect, Widget};
 use crate::plot::common::{
 	AxisTextAnchoring, AxisTextVisibility, BandRequirements, CoordinateTransformer, PlotBackend,
 	PlotComposite, PlotKernel, PlotLayout, PlotWidget, ResolvedPlotSettings, VerticalGuideBands,
-	resolve_canvas_text, union_temporal_axis_domains,
+	ViewportGeometry, resolve_canvas_text, union_temporal_axis_domains,
 };
 use crate::plot::factory::{create_plot, create_styled_plot};
 #[cfg(test)]
 use crate::plot::spec::ResolvedPresence;
 use crate::plot::spec::{
-	Channel, LayerSettings, NonEmpty, ResolvedPlotSpec, ScaleDomain, StampedResult,
+	Channel, LayerSettings, NonEmpty, Override, ResolvedPlotSpec, ScaleDomain, StampedResult,
 };
 use crate::plot::theme::PlotSettings;
 use iced::advanced::mouse::Cursor;
@@ -639,6 +639,72 @@ impl PlotComposite for PlotGridKernel {
 		self.cells.len() == 1
 	}
 
+	fn viewport_geometry(
+		&self,
+		bounds: Rect<Widget>,
+		padding: f32,
+		title: &str,
+		cursor: Pt<Widget>,
+		settings: &PlotSettings,
+	) -> Option<ViewportGeometry> {
+		if self.cells.len() == 1 {
+			let cell = self.cells.first();
+			let helper = PlotWidget::new(
+				cell.kernel.as_ref(),
+				title.to_owned(),
+				padding,
+				settings.clone(),
+				0,
+				false,
+				crate::plot::common::PlotRenderLayer::Full,
+			);
+			return helper.viewport_geometry_for_kernel(bounds, cursor);
+		}
+
+		let resolved = settings.resolve();
+		let figure_legend_reservation = crate::plot::legend::union(
+			self.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_reservation_content(&resolved)),
+		);
+		let legend = crate::plot::legend::legend_layout(
+			bounds,
+			figure_legend_reservation.as_ref(),
+			&resolved,
+		);
+		let outer = grid_outer_area(legend.content_bounds, padding);
+		let layouts = self.cell_layouts(settings);
+		let requirements =
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
+		let tiled = grid_tiled_area_with_requirements(
+			outer,
+			title,
+			&requirements,
+			grid_x_label_visible(self, &resolved),
+			&resolved,
+		);
+		let mut prepared_settings = settings.clone();
+		prepared_settings.pane_override.domains = Override::Inherit;
+		let prepared_layouts = self.cell_layouts(&prepared_settings);
+
+		for (index, cell) in self.cells.iter().enumerate() {
+			let (position, layout) = &layouts[index];
+			let cell_bounds = grid_cell_bounds_with_settings(
+				tiled,
+				self.arrangement,
+				*position,
+				self.figure_grid,
+			);
+			let cell_resolved = cell.kernel.resolve_settings(settings);
+			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
+			if !inner.into_iced().contains(cursor.into_iced()) {
+				continue;
+			}
+			return ViewportGeometry::from_layout(inner, layout, &prepared_layouts[index].1);
+		}
+		None
+	}
+
 	fn render_plot_layer(
 		&self,
 		backend: &mut dyn PlotBackend,
@@ -837,6 +903,8 @@ impl PlotComposite for PlotGridKernel {
 		padding: f32,
 		title: &str,
 		settings: &PlotSettings,
+		motion: crate::plot::common::ViewportMotion,
+		_reuse_policy: crate::plot::common::RasterReusePolicy,
 		coordinator: &crate::plot::raster::RasterCoordinator,
 		slot: &crate::plot::raster::RasterSlotId,
 		preparing: &mut bool,
@@ -856,7 +924,9 @@ impl PlotComposite for PlotGridKernel {
 				crate::plot::common::PlotRenderLayer::Full,
 			)
 			.with_raster_coordinator(coordinator)
-			.with_raster_slot(cell_slot);
+			.with_raster_slot(cell_slot)
+			.with_viewport_motion(motion)
+			.with_raster_reuse_policy(crate::plot::common::RasterReusePolicy::Refused);
 			helper.render_plot_layer(backend, bounds.into_iced());
 			return;
 		}
@@ -900,8 +970,7 @@ impl PlotComposite for PlotGridKernel {
 			let cell_resolved = cell.kernel.resolve_settings(settings);
 			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
 			let transform = CoordinateTransformer::new(layout, inner.into_iced());
-			cell.kernel
-				.prepare_viewport(&transform, crate::plot::common::ViewportMotion::Settled);
+			cell.kernel.prepare_viewport(&transform, motion);
 			let helper = PlotWidget::new(
 				cell.kernel.as_ref(),
 				String::new(),
@@ -922,7 +991,8 @@ impl PlotComposite for PlotGridKernel {
 					&transform,
 					Cursor::Unavailable,
 					settings,
-					crate::plot::common::ViewportMotion::Settled,
+					motion,
+					crate::plot::common::RasterReusePolicy::Refused,
 					coordinator,
 					&cell_slot,
 					preparing,
@@ -951,6 +1021,7 @@ impl PlotComposite for PlotGridKernel {
 		padding: f32,
 		title: &str,
 		settings: &PlotSettings,
+		motion: crate::plot::common::ViewportMotion,
 	) {
 		if self.cells.len() == 1 {
 			let cell = self.cells.first();
@@ -962,7 +1033,8 @@ impl PlotComposite for PlotGridKernel {
 				0,
 				false,
 				crate::plot::common::PlotRenderLayer::Full,
-			);
+			)
+			.with_viewport_motion(motion);
 			helper.render_overlay_layer(backend, bounds.into_iced());
 			return;
 		}
@@ -1004,8 +1076,7 @@ impl PlotComposite for PlotGridKernel {
 			let cell_resolved = cell.kernel.resolve_settings(settings);
 			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
 			let transform = CoordinateTransformer::new(layout, inner.into_iced());
-			cell.kernel
-				.prepare_viewport(&transform, crate::plot::common::ViewportMotion::Settled);
+			cell.kernel.prepare_viewport(&transform, motion);
 			let axis_text = axis_text_visibility(axis_cells[index], &axis_cells);
 			let helper = PlotWidget::new(
 				cell.kernel.as_ref(),
@@ -1807,6 +1878,7 @@ mod tests {
 	struct FacetRasterBackend {
 		images: usize,
 		image_sizes: Vec<(f32, f32)>,
+		texts: Vec<String>,
 	}
 
 	impl crate::plot::common::PlotBackend for FacetRasterBackend {
@@ -1823,7 +1895,9 @@ mod tests {
 		) {
 		}
 		fn fill_rectangle(&mut self, _tl: Point, _size: iced::Size, _color: iced::Color) {}
-		fn fill_text_raw(&mut self, _text: iced::widget::canvas::Text) {}
+		fn fill_text_raw(&mut self, text: iced::widget::canvas::Text) {
+			self.texts.push(text.content);
+		}
 		fn supports_embedded_raster(&self) -> bool {
 			true
 		}
@@ -1933,7 +2007,7 @@ mod tests {
 			&kernel,
 			String::new(),
 			0.0,
-			model,
+			model.clone(),
 			0,
 			false,
 			PlotRenderLayer::Full,
@@ -2123,6 +2197,7 @@ mod tests {
 
 		let (kernel, model) = facet_scatter_fixture();
 		let rect = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
+		let coordinator = crate::plot::raster::RasterCoordinator::new();
 		let render = |model: &crate::plot::theme::PlotSettings, motion: ViewportMotion| {
 			let widget = PlotWidget::new(
 				&kernel,
@@ -2133,28 +2208,56 @@ mod tests {
 				false,
 				PlotRenderLayer::Full,
 			)
+			.with_raster_coordinator(&coordinator)
 			.with_viewport_motion(motion);
 			let mut backend = FacetRasterBackend::default();
 			widget.render(&mut backend, rect);
-			backend.images
+			backend
 		};
 
-		// Prime every cell.
+		// PRODUCT-0150 re-derives PRODUCT-0139 §7 for the interactive path:
+		// prime every cell exactly, then prove motion refuses affine placement.
 		let base = with_domain(&model, (0.0, 3.0));
-		let cells = render(&base, ViewportMotion::Settled);
+		let prime = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			base.clone(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_raster_coordinator(&coordinator);
+		let mut next = coordinator.request(prime.raster_wants(rect));
+		while let Some(job) = next {
+			next = coordinator
+				.complete(crate::plot::raster::run_raster_job_sync(job))
+				.next_job;
+		}
+		let base_render = render(&base, ViewportMotion::Settled);
+		let cells = base_render.images;
 		assert_eq!(cells, 2, "the fixture draws one raster per facet cell");
 
-		// PRODUCT-0139 §7: a facet cannot reuse, and this is enforced by
-		// construction rather than by policy — the composite calls
-		// `plot_with_settings`, never `plot_with_motion`, so every cell is
-		// `Settled` no matter what the widget was told.
 		let moved = with_domain(&model, (0.1, 3.1));
 		let facet_rescans = rescans_during(|| {
-			render(&moved, ViewportMotion::Moving);
+			let moved = render(&moved, ViewportMotion::Moving);
+			assert_eq!(
+				moved.images, 0,
+				"facet motion draws only exact-key pixels; old pixels are refused"
+			);
+			assert_eq!(
+				moved
+					.texts
+					.iter()
+					.filter(|text| text.as_str() == "preparing raster…")
+					.count(),
+				1,
+				"the figure owns one preparation marker regardless of pending cell count"
+			);
 		});
 		assert_eq!(
-			facet_rescans, cells,
-			"every facet cell must rescan even when the frame declares motion"
+			facet_rescans, 0,
+			"facet motion neither reuses nor synchronously rebuilds a raster"
 		);
 
 		// The control, and the whole reason this gate is not vacuous: the same
@@ -2173,7 +2276,7 @@ mod tests {
 			400,
 		)
 		.expect("unfaceted scatter");
-		let coordinator = crate::plot::raster::RasterCoordinator::new();
+		let unfaceted_coordinator = crate::plot::raster::RasterCoordinator::new();
 		let prime = PlotWidget::new(
 			unfaceted.as_ref(),
 			String::new(),
@@ -2183,10 +2286,10 @@ mod tests {
 			false,
 			PlotRenderLayer::Full,
 		);
-		let job = coordinator
+		let job = unfaceted_coordinator
 			.request(prime.raster_wants(rect))
 			.expect("first exact raster job");
-		let update = coordinator.complete(crate::plot::raster::run_raster_job_sync(job));
+		let update = unfaceted_coordinator.complete(crate::plot::raster::run_raster_job_sync(job));
 		assert!(update.published && update.next_job.is_none());
 		let render_unfaceted = |model: &crate::plot::theme::PlotSettings,
 		                        motion: ViewportMotion| {
@@ -2199,7 +2302,7 @@ mod tests {
 				false,
 				PlotRenderLayer::Full,
 			)
-			.with_raster_coordinator(&coordinator)
+			.with_raster_coordinator(&unfaceted_coordinator)
 			.with_viewport_motion(motion);
 			let mut backend = FacetRasterBackend::default();
 			widget.render(&mut backend, rect);
@@ -2210,6 +2313,150 @@ mod tests {
 		assert_eq!(
 			unfaceted_rescans, 0,
 			"the same mark unfaceted must reuse under motion, or the exclusion above proves nothing"
+		);
+	}
+
+	#[test]
+	fn product_0150_faceted_hexbin_defers_motion_and_rebins_once_per_cell_at_settle() {
+		use crate::plot::common::{PlotRenderLayer, PlotWidget, ViewportMotion};
+		use crate::plot::spec::HexbinFields;
+
+		let data = Arc::new(
+			df!(
+				"facet" => ["A", "A", "B", "B"],
+				"x" => [0.0_f64, 0.1, 0.8, 0.9],
+				"y" => [0.0_f64, 0.1, 0.8, 0.9]
+			)
+			.expect("hexbin facet frame"),
+		);
+		let authored = AuthoredPlotSpec::hexbin(HexbinFields {
+			x: "x".to_owned(),
+			y: "y".to_owned(),
+		});
+		let resolved = plan(PlotRequest {
+			source: PlotSource::Materialized {
+				name: "faceted hexbin".to_owned(),
+				data: artifact(&data),
+			},
+			authored_spec: authored,
+		})
+		.expect("hexbin resolves");
+		let stamped = StampedResult {
+			data: artifact(&data),
+			provenance: PlotProvenance {
+				source_name: "faceted hexbin".to_owned(),
+				revision: None,
+			},
+		};
+		let grid = PlotGrid::value_facet(
+			Arc::new(resolved.resolved_spec),
+			&stamped,
+			"facet",
+			GridArrangement::new(1, 2).expect("arrangement"),
+		)
+		.expect("facet");
+		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
+		let coordinator = crate::plot::raster::RasterCoordinator::new();
+		let bounds = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
+		let model = crate::plot::theme::PlotSettings::default();
+		let render = |model: crate::plot::theme::PlotSettings, motion| {
+			let widget = PlotWidget::new(
+				&kernel,
+				String::new(),
+				0.0,
+				model,
+				0,
+				false,
+				PlotRenderLayer::Full,
+			)
+			.with_raster_coordinator(&coordinator)
+			.with_viewport_motion(motion);
+			let mut backend = FacetRasterBackend::default();
+			widget.render(&mut backend, bounds);
+		};
+		let counts = || {
+			kernel
+				.cells
+				.iter()
+				.map(|cell| cell.kernel.viewport_preparation_count())
+				.collect::<Vec<_>>()
+		};
+
+		render(model.clone(), ViewportMotion::Settled);
+		assert_eq!(counts(), vec![1, 1]);
+		let moved = with_domain(&model, (0.05, 0.95));
+		render(moved.clone(), ViewportMotion::Moving);
+		assert_eq!(counts(), vec![1, 1], "moving facets do not re-bin");
+		render(moved, ViewportMotion::Settled);
+		assert_eq!(
+			counts(),
+			vec![2, 2],
+			"settle re-bins each cell exactly once"
+		);
+	}
+
+	#[test]
+	fn product_0150_facet_gesture_selects_the_cursor_cell_and_shared_domain_not_the_gutter() {
+		use crate::plot::common::{PlotRenderLayer, PlotWidget};
+		let (kernel, model) = facet_scatter_fixture();
+		let widget = PlotWidget::new(
+			&kernel,
+			String::new(),
+			0.0,
+			model.clone(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
+		let bounds = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
+		let left = widget
+			.viewport_geometry(bounds, Cursor::Available(Point::new(250.0, 200.0)))
+			.expect("left cell inner rectangle");
+		let right = widget
+			.viewport_geometry(bounds, Cursor::Available(Point::new(650.0, 200.0)))
+			.expect("right cell inner rectangle");
+		assert_eq!(
+			left.x_range, right.x_range,
+			"facets move on one shared domain"
+		);
+		assert_ne!(
+			left.plot_area.x(),
+			right.plot_area.x(),
+			"anchor geometry is cell-local"
+		);
+		let resolved = model.resolve();
+		let outer = grid_outer_area(Rect::from_iced_frame(bounds), 0.0);
+		let layouts = kernel.cell_layouts(&model);
+		let requirements =
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
+		let tiled = grid_tiled_area_with_requirements(
+			outer,
+			"",
+			&requirements,
+			grid_x_label_visible(&kernel, &resolved),
+			&resolved,
+		);
+		let left_cell = grid_cell_bounds_with_settings(
+			tiled,
+			kernel.arrangement,
+			GridPosition { row: 0, column: 0 },
+			kernel.figure_grid,
+		);
+		let right_cell = grid_cell_bounds_with_settings(
+			tiled,
+			kernel.arrangement,
+			GridPosition { row: 0, column: 1 },
+			kernel.figure_grid,
+		);
+		let gutter = Point::new(
+			(left_cell.right() + right_cell.x()) / 2.0,
+			(left_cell.y() + left_cell.bottom()) / 2.0,
+		);
+		assert!(
+			widget
+				.viewport_geometry(bounds, Cursor::Available(gutter))
+				.is_none(),
+			"the facet gutter is outside every gesture rectangle"
 		);
 	}
 
@@ -3679,7 +3926,15 @@ mod tests {
 		let capture = |width: f32| {
 			let bounds = widget_rect(IcedRectangle::new(Point::ORIGIN, Size::new(width, 400.0)));
 			let mut backend = TextBackend::default();
-			PlotComposite::render_overlay_layer(&kernel, &mut backend, bounds, 0.0, "", &settings);
+			PlotComposite::render_overlay_layer(
+				&kernel,
+				&mut backend,
+				bounds,
+				0.0,
+				"",
+				&settings,
+				crate::plot::common::ViewportMotion::Settled,
+			);
 
 			let layouts = kernel.cell_layouts(&crate::plot::theme::PlotSettings::from_resolved(
 				resolved.clone(),

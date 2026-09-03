@@ -1299,6 +1299,28 @@ fn refuse_settings_preview(
 }
 
 #[cfg(feature = "toron")]
+fn validated_displayed_pane_value(
+	settings: &crate::plot::theme::PlotSettings,
+	key: crate::presentation_registry::SettingKey,
+	displayed: &str,
+) -> Option<String> {
+	let resolved = settings.resolve();
+	crate::presentation_registry::inspector_rows(settings, &resolved, None, None)
+		.into_iter()
+		.find(|row| {
+			row.key == key
+				&& row.provenance == crate::presentation_registry::ProvenanceTier::PaneOverride
+				&& matches!(
+					key,
+					crate::presentation_registry::SettingKey::XAxisBounds
+						| crate::presentation_registry::SettingKey::YAxisBounds
+				)
+		})
+		.map(|row| row.value.to_string())
+		.filter(|current| current == displayed)
+}
+
+#[cfg(feature = "toron")]
 fn queue_settings_preview(
 	app_state: &mut AppState,
 	gesture: crate::editor::PlotWritebackGesture,
@@ -1322,21 +1344,39 @@ fn queue_settings_preview(
 		return Task::none();
 	}
 
-	let (panel_id, key, commit, action, input) = match gesture {
+	let (panel_id, key, commit, action, input, displayed_pane_value) = match gesture {
 		PlotWritebackGesture::Preview {
 			panel_id,
 			key,
 			value,
-		} => (panel_id, key, false, WritebackAction::Set, Some(value)),
-		PlotWritebackGesture::Commit { panel_id, key } => {
+		} => (
+			panel_id,
+			key,
+			false,
+			WritebackAction::Set,
+			Some(value),
+			None,
+		),
+		PlotWritebackGesture::Commit {
+			panel_id,
+			key,
+			displayed_pane_value,
+		} => {
 			let input = app_state
 				.code_editor
 				.plot_writeback_context(panel_id)
 				.and_then(|context| context.drafts.get(&key).cloned());
-			(panel_id, key, true, WritebackAction::Set, input)
+			(
+				panel_id,
+				key,
+				true,
+				WritebackAction::Set,
+				input,
+				displayed_pane_value,
+			)
 		}
 		PlotWritebackGesture::Reset { panel_id, key } => {
-			(panel_id, key, true, WritebackAction::Reset, None)
+			(panel_id, key, true, WritebackAction::Reset, None, None)
 		}
 		PlotWritebackGesture::Cancel { panel_id } => {
 			app_state.settings_preview_sequence =
@@ -1357,6 +1397,11 @@ fn queue_settings_preview(
 		);
 		return Task::none();
 	};
+	let input = input.or_else(|| {
+		displayed_pane_value.and_then(|displayed| {
+			validated_displayed_pane_value(&context.settings, key, &displayed)
+		})
+	});
 	let source_buffer = context.attachment.source.buffer_id;
 	let Some((source, document_generation)) = app_state
 		.code_editor
@@ -5523,6 +5568,37 @@ mod tests {
 	#[cfg(feature = "toron")]
 	fn render_marks(kernel: &dyn PlotKernel) -> String {
 		render_marks_with_settings(kernel, ResolvedPlotSettings::default())
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0150_commit_revalidates_the_current_pane_provenance() {
+		use crate::plot::spec::Override;
+		use crate::plot::theme::{PlotDomainOverrides, PlotSettings};
+		use crate::presentation_registry::SettingKey;
+
+		let mut settings = PlotSettings::default();
+		settings.pane_override.domains = Override::Set(PlotDomainOverrides {
+			x_min: Some(1.0),
+			x_max: Some(9.0),
+			y_min: Some(2.0),
+			y_max: Some(8.0),
+		});
+		assert_eq!(
+			super::validated_displayed_pane_value(&settings, SettingKey::XAxisBounds, "1, 9"),
+			Some("1, 9".to_owned())
+		);
+		assert_eq!(
+			super::validated_displayed_pane_value(&settings, SettingKey::XAxisBounds, "0, 10"),
+			None,
+			"a stale displayed value cannot be promoted"
+		);
+		settings.pane_override.domains = Override::Inherit;
+		assert_eq!(
+			super::validated_displayed_pane_value(&settings, SettingKey::XAxisBounds, "1, 9"),
+			None,
+			"a delayed message cannot promote after pane provenance disappears"
+		);
 	}
 
 	#[test]
@@ -9903,15 +9979,48 @@ workspace.table("bad").views([view("bad", table())]);
 			(2, ExportFormat::PNG, "png"),
 			(3, ExportFormat::AVIF, "avif"),
 		] {
+			let baseline_ordinal = ordinal + 10;
+			let mut baseline = state.code_editor.host_plot_exports().remove(0);
+			baseline.width = 160.0;
+			baseline.height = 100.0;
+			baseline.settings_model.library_defaults.scatter_render_mode =
+				crate::plot::common::ScatterRenderMode::Rasterized;
+			super::render_plot_export(baseline, format, baseline_ordinal).write_to(&export_root);
+			let baseline_bytes =
+				std::fs::read(export_root.join(format!("plot_{baseline_ordinal}.{extension}")))
+					.expect("baseline export artifact");
+
 			let mut snapshot = state.code_editor.host_plot_exports().remove(0);
 			snapshot.width = 160.0;
 			snapshot.height = 100.0;
+			snapshot.settings_model.pane_override.domains =
+				crate::plot::spec::Override::Set(crate::plot::theme::PlotDomainOverrides {
+					x_min: Some(1.25),
+					x_max: Some(1.75),
+					y_min: Some(2.25),
+					y_max: Some(2.75),
+				});
+			let viewport = snapshot.settings_model.resolve();
+			assert_eq!(
+				(
+					viewport.x_min,
+					viewport.x_max,
+					viewport.y_min,
+					viewport.y_max
+				),
+				(Some(1.25), Some(1.75), Some(2.25), Some(2.75)),
+				"PRODUCT-0150 exports consume the on-screen pane viewport in every format"
+			);
 			snapshot.settings_model.library_defaults.scatter_render_mode =
 				crate::plot::common::ScatterRenderMode::Rasterized;
 			super::render_plot_export(snapshot, format, ordinal).write_to(&export_root);
 			let path = export_root.join(format!("plot_{ordinal}.{extension}"));
 			let bytes = std::fs::read(&path).expect("rendered export artifact");
 			assert!(bytes.len() > 32, "{format} export is non-empty");
+			assert_ne!(
+				bytes, baseline_bytes,
+				"{format} rendered bytes must reflect the pane viewport, not only carry it in the snapshot"
+			);
 			match format {
 				ExportFormat::SVG => {
 					let svg = String::from_utf8(bytes).unwrap();

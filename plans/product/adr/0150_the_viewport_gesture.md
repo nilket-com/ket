@@ -6,8 +6,17 @@ identity, the promote path, anchor geometry) and two sharpenings (the scope
 of the no-scan guarantee, the gesture's active rectangle and constants),
 and again for four residues (the reflow-drift formula, the settle state
 machine across both lifetimes, per-cell hexbin settle cost, D7's exact
-behaviour under a categorical gesture). This record is the production
-activator that PRODUCT-0139 §7, PRODUCT-0140 §4, and PRODUCT-0149 each name
+behaviour under a categorical gesture). Amended at implementation to bind
+the canvas-local drag anchor to the surface lifetime, make hover clearing
+part of the viewport-start transition, and revalidate pane provenance at
+the writeback consumer. The implementation audit also reconciled gate 17
+with Stage 0: the explicitly required kept hover-cost exhibit is the one
+new ignored test; no other ignored or tolerated failure is admitted. A
+post-landing review found that iced dispatches one frame's event batch against
+one widget tree before rebuilding it; the canvas therefore chains consecutive
+gesture generations and wheel geometry locally rather than assuming a rebuild
+between input events. This record is the production activator that PRODUCT-0139
+§7, PRODUCT-0140 §4, and PRODUCT-0149 each name
 and none of them contains: the first caller of
 `ViewportMotion::Moving`, the first production author of the pane-override
 domain tier, and the gesture whose settle frame the off-thread substrate
@@ -226,7 +235,23 @@ without the bump the canvas cache serves the old geometry and the change is
 invisible.
 
 The **in-progress drag** of §3 lives in `PlotCanvasState`, beside
-`settings_click`, and is cleared on release.
+`settings_click`, and is cleared on release. **Implementation finding:**
+iced can retain that canvas state across a host kernel replacement or a
+notebook republication. The drag anchor therefore carries the surface stamp
+that accepted its press; each move advances that stamp with the published
+generation, and a move or release against another stamp clears the anchor
+and publishes nothing. A predecessor's press-time transform can never reach
+a replacement plot.
+
+**One event batch may outlive the widget stamp.** iced sends every event
+collected for a frame through one widget tree and rebuilds only after the
+batch. The canvas therefore keeps a local continuation seeded from the widget
+stamp. A press, every move, release consumption, and every wheel step advance
+that continuation; moves mint from the drag's own latest stamp, and wheel
+steps also carry forward the locally zoomed geometry so none is lost. A rebuilt
+widget with a newer generation, or any different incarnation, replaces the
+continuation and clears a predecessor drag. A widget behind the continuation
+is the ordinary same-batch case, not replacement.
 
 The **motion flag** is a `viewport_motion` field on the surface state that
 the view forwards to every `PlotWidget` it builds, so the data canvas and
@@ -312,9 +337,12 @@ against.
 
 From press to release, and from a wheel step to its settle, the overlay
 performs **no hit-test** and publishes no hover. At gesture start the hover
-bubble is cleared (`UpdateHover(None)`), so a stale reading does not ride
-along with the pan. Hover resumes on the first `CursorMoved` after settle.
-This is gesture arbitration, not a hover policy.
+bubble is cleared, so a stale reading does not ride along with the pan.
+**Implementation finding:** a canvas action publishes one message, so
+`ViewportStarted` and `ViewportChanged` clear `hovered_info` in the surface
+update instead of attempting a second `UpdateHover(None)` publication. The
+observable state transition is the same. Hover resumes on the first
+`CursorMoved` after settle. This is gesture arbitration, not a hover policy.
 
 ### 8. Pan and zoom never reach Rune; the inspector promotes a displayed pane value
 
@@ -334,7 +362,10 @@ any typed draft, and rows of every other provenance keep refusing an
 untouched submit. The path is explicit (Enter on a row the user is looking
 at), user-initiated, and disclosed before the submit by the badge this
 record gates. No new command is added; the earlier claim that no new code
-was needed was wrong, and this is the code.
+was needed was wrong, and this is the code. The consumer revalidates both
+the current row's `PaneOverride` provenance and the displayed value before
+using the fallback; a delayed submit from an older view cannot promote after
+the pane tier or its value has changed.
 
 ### 9. The composite motion seam: aggregation honours motion, facet reuse is refused
 
@@ -452,7 +483,10 @@ scatter; the constants in force banked; full battery.
    the same cell identity drops a settle minted by its predecessor even
    when the generation value coincides, and a host panel whose kernel is
    replaced in place advances its generation, reads `Settled`, and drops a
-   wheel settle spawned before the replacement.
+   wheel settle spawned before the replacement. One unchanged widget fed
+   press, two moves, and release publishes the full consecutive chain and its
+   settle; two wheel steps in the same event batch have distinct generations
+   and cumulative zoom.
 4. **Rune is untouched.** Source buffer bytes identical after
    pan/zoom/reset; no `PlotWritebackGesture` pushed; `plan_writeback` never
    called; the pane tier is the only model tier that changed.
@@ -510,7 +544,8 @@ scatter; the constants in force banked; full battery.
 16. **Threshold machinery untouched.** `resolve_render_mode`, both 0140
     constants, and the ×8 factor asserted byte-identical.
 17. **Full battery.** Polariton unit, architecture, trybuild, GUI, and
-    workspace checks pass with no new ignored or tolerated failure.
+    workspace checks pass. The Stage-0 hover-cost exhibit is the one planned
+    new `#[ignore]`; there is no other new ignored or tolerated failure.
 
 ## Guardrails and stop conditions
 

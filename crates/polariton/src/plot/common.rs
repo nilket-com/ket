@@ -7,18 +7,21 @@ use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::legend::{LegendContent, legend_layout, legend_origin_for_display, render_legend};
 use crate::plot::spec::{
 	BarWidth, CategoryGap, FacetLabelTextSize, HoverTextSize, LegendPosition, LegendTextSize,
-	PlotPaddingPixels, PointSize, ResolvedPresence, SemanticType, StrokeWidth, SubtitleTextSize,
-	TickRotation, TitleTextSize, XLabelTextSize, XTickTextSize, YLabelTextSize, YTickTextSize,
+	Override, PlotPaddingPixels, PointSize, ResolvedPresence, SemanticType, StrokeWidth,
+	SubtitleTextSize, TickRotation, TitleTextSize, XLabelTextSize, XTickTextSize, YLabelTextSize,
+	YTickTextSize,
 };
 use crate::plot::text_estimate::{estimate_ascii_label_width, estimate_formatted_label_width};
-use crate::plot::theme::PlotSettings;
+use crate::plot::theme::{PlotDomainOverrides, PlotSettings};
 use iced::advanced::image;
 use iced::advanced::mouse::Cursor;
 use iced::alignment;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Program, Stroke, Style, Text};
 use iced::{Color, Event, Point, Rectangle, Renderer, Theme};
 use std::num::NonZeroU32;
+use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use toron_client::TemporalInterval;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1522,10 +1525,13 @@ pub trait PlotComposite: Send + Sync {
 		padding: f32,
 		title: &str,
 		settings: &PlotSettings,
+		motion: ViewportMotion,
+		reuse_policy: RasterReusePolicy,
 		_coordinator: &crate::plot::raster::RasterCoordinator,
 		_slot: &crate::plot::raster::RasterSlotId,
 		_preparing: &mut bool,
 	) {
+		let _ = (motion, reuse_policy);
 		self.render_plot_layer(backend, bounds, padding, title, settings);
 	}
 
@@ -1536,6 +1542,7 @@ pub trait PlotComposite: Send + Sync {
 		padding: f32,
 		title: &str,
 		settings: &PlotSettings,
+		motion: ViewportMotion,
 	);
 
 	fn hit(
@@ -1546,6 +1553,19 @@ pub trait PlotComposite: Send + Sync {
 		cursor: Pt<Widget>,
 		settings: &PlotSettings,
 	) -> Option<PlotHit>;
+
+	/// PRODUCT-0150 §9: the active inner rectangle and continuous domains for
+	/// the facet cell under the cursor. Gaps and non-affine cells return none.
+	fn viewport_geometry(
+		&self,
+		_bounds: Rect<Widget>,
+		_padding: f32,
+		_title: &str,
+		_cursor: Pt<Widget>,
+		_settings: &PlotSettings,
+	) -> Option<ViewportGeometry> {
+		None
+	}
 
 	#[cfg(test)]
 	fn hover(
@@ -1643,6 +1663,7 @@ pub trait PlotKernel: Send + Sync {
 		cursor: Cursor,
 		settings: &PlotSettings,
 		motion: ViewportMotion,
+		_reuse_policy: RasterReusePolicy,
 		_coordinator: &crate::plot::raster::RasterCoordinator,
 		_slot: &crate::plot::raster::RasterSlotId,
 		_preparing: &mut bool,
@@ -1654,6 +1675,11 @@ pub trait PlotKernel: Send + Sync {
 	/// kernels are already viewport-independent; PRODUCT-0143's hexbin kernel
 	/// overrides this seam and keeps aggregation outside `plot` and `hit`.
 	fn prepare_viewport(&self, _transform: &CoordinateTransformer<'_>, _motion: ViewportMotion) {}
+
+	#[cfg(test)]
+	fn viewport_preparation_count(&self) -> usize {
+		0
+	}
 
 	/// Content used only to reserve legend geometry before the final plot
 	/// rectangle exists. It normally equals displayed content. PRODUCT-0143
@@ -2164,6 +2190,106 @@ pub enum ViewportMotion {
 	Moving,
 }
 
+/// PRODUCT-0150 §6: delayed settle messages need a lifetime identity as well
+/// as a within-lifetime generation. Notebook republication can replace a
+/// surface under the same cell identity, so route identity alone is not
+/// sufficient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ViewportIncarnation(NonZeroU64);
+
+static NEXT_VIEWPORT_INCARNATION: AtomicU64 = AtomicU64::new(1);
+
+impl ViewportIncarnation {
+	pub fn mint() -> Self {
+		let raw = NEXT_VIEWPORT_INCARNATION.fetch_add(1, Ordering::Relaxed);
+		Self(NonZeroU64::new(raw).expect("viewport incarnation space exhausted"))
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct ViewportGeneration(u64);
+
+impl ViewportGeneration {
+	pub fn next(self) -> Self {
+		Self(
+			self.0
+				.checked_add(1)
+				.expect("viewport generation space exhausted"),
+		)
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ViewportStamp {
+	pub incarnation: ViewportIncarnation,
+	pub generation: ViewportGeneration,
+}
+
+impl ViewportStamp {
+	pub fn mint() -> Self {
+		Self {
+			incarnation: ViewportIncarnation::mint(),
+			generation: ViewportGeneration::default(),
+		}
+	}
+
+	pub fn next(self) -> Self {
+		Self {
+			incarnation: self.incarnation,
+			generation: self.generation.next(),
+		}
+	}
+}
+
+/// PRODUCT-0150 §9: affine last-good placement is a per-producer policy.
+/// Facet cells deliberately refuse it until PRODUCT-0139 §7 is amended after
+/// live contact; ordinary plots retain it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RasterReusePolicy {
+	Placed,
+	Refused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ViewportGeometry {
+	pub plot_area: Rect<Widget>,
+	pub x_range: Option<(f64, f64)>,
+	pub y_range: Option<(f64, f64)>,
+	pub prepared_x_range: Option<(f64, f64)>,
+	pub prepared_y_range: Option<(f64, f64)>,
+}
+
+impl ViewportGeometry {
+	pub(crate) fn from_layout(
+		plot_area: Rect<Widget>,
+		layout: &PlotLayout,
+		prepared: &PlotLayout,
+	) -> Option<Self> {
+		let (x_range, y_range) = Self::ranges(layout)?;
+		let (prepared_x_range, prepared_y_range) = Self::ranges(prepared)?;
+		Some(Self {
+			plot_area,
+			x_range,
+			y_range,
+			prepared_x_range,
+			prepared_y_range,
+		})
+	}
+
+	fn ranges(layout: &PlotLayout) -> Option<(Option<(f64, f64)>, Option<(f64, f64)>)> {
+		match layout {
+			PlotLayout::Cartesian {
+				x_range, y_range, ..
+			} => Some((Some(*x_range), Some(*y_range))),
+			PlotLayout::CategoricalX { y_range, .. } => Some((None, Some(*y_range))),
+			PlotLayout::CategoricalY { x_range, .. } => Some((Some(*x_range), None)),
+			PlotLayout::CategoricalXY { .. } | PlotLayout::Parallel { .. } | PlotLayout::Radial => {
+				None
+			}
+		}
+	}
+}
+
 pub struct PlotWidget<'a> {
 	pub kernel: &'a dyn PlotKernel,
 	pub title: String,
@@ -2181,6 +2307,8 @@ pub struct PlotWidget<'a> {
 	settings_inspector_gesture: bool,
 	/// PRODUCT-0139 §1. Defaults to `Settled`; a gesture opts in per frame.
 	viewport_motion: ViewportMotion,
+	viewport_stamp: Option<ViewportStamp>,
+	raster_reuse_policy: RasterReusePolicy,
 	/// PRODUCT-0149: present only for live interactive surfaces. Exact render
 	/// callers deliberately omit it and retain synchronous completeness.
 	raster_coordinator: Option<&'a crate::plot::raster::RasterCoordinator>,
@@ -2209,6 +2337,8 @@ impl<'a> PlotWidget<'a> {
 			layer,
 			settings_inspector_gesture: false,
 			viewport_motion: ViewportMotion::Settled,
+			viewport_stamp: None,
+			raster_reuse_policy: RasterReusePolicy::Placed,
 			raster_coordinator: None,
 			raster_slot: crate::plot::raster::RasterSlotId::root(),
 		}
@@ -2241,6 +2371,61 @@ impl<'a> PlotWidget<'a> {
 	pub fn with_viewport_motion(mut self, motion: ViewportMotion) -> Self {
 		self.viewport_motion = motion;
 		self
+	}
+
+	pub fn with_viewport_state(mut self, stamp: ViewportStamp, motion: ViewportMotion) -> Self {
+		self.viewport_stamp = Some(stamp);
+		self.viewport_motion = motion;
+		self
+	}
+
+	pub(crate) fn with_raster_reuse_policy(mut self, policy: RasterReusePolicy) -> Self {
+		self.raster_reuse_policy = policy;
+		self
+	}
+
+	pub(crate) fn viewport_geometry_for_kernel(
+		&self,
+		bounds: Rect<Widget>,
+		cursor: Pt<Widget>,
+	) -> Option<ViewportGeometry> {
+		let legend_reservation = self
+			.kernel
+			.legend_reservation_content(&self.settings)
+			.and_then(crate::plot::legend::apply_policy);
+		let legend = legend_layout(bounds, legend_reservation.as_ref(), &self.settings);
+		let layout = self.kernel.layout(self.settings.clone());
+		let requirements = BandRequirements::from_layout(&layout, &self.settings);
+		let plot_area = self.plot_area(legend.content_bounds, &requirements);
+		if !plot_area.into_iced().contains(cursor.into_iced()) {
+			return None;
+		}
+		let mut prepared_model = self.settings_model.clone();
+		prepared_model.pane_override.domains = Override::Inherit;
+		let prepared_settings = self.kernel.resolve_settings(&prepared_model);
+		let prepared = self.kernel.layout(prepared_settings);
+		ViewportGeometry::from_layout(plot_area, &layout, &prepared)
+	}
+
+	pub(crate) fn viewport_geometry(
+		&self,
+		bounds: Rectangle,
+		cursor: Cursor,
+	) -> Option<ViewportGeometry> {
+		let position = cursor.position_over(bounds)?;
+		let window_bounds = Rect::<Window>::from_iced_layout(bounds);
+		let cursor =
+			Pt::<Widget>::from_window(Pt::<Window>::from_iced_event(position), window_bounds);
+		if let Some(composite) = self.kernel.composite() {
+			return composite.viewport_geometry(
+				Rect::from_iced_frame(bounds),
+				self.padding,
+				&self.title,
+				cursor,
+				&self.settings_model,
+			);
+		}
+		self.viewport_geometry_for_kernel(Rect::from_iced_frame(bounds), cursor)
 	}
 }
 
@@ -2719,10 +2904,157 @@ pub struct PlotCanvasState {
 	last_hover: Option<String>,
 	modifiers: iced::keyboard::Modifiers,
 	settings_click: Option<iced::advanced::mouse::Click>,
+	viewport_click: Option<iced::advanced::mouse::Click>,
+	viewport_drag: Option<ViewportDrag>,
+	viewport_local_stamp: Option<ViewportStamp>,
+	viewport_local_geometry: Option<(ViewportStamp, ViewportGeometry)>,
 	plot_cache: canvas::Cache,
 	overlay_cache: canvas::Cache,
 	render_revision: std::cell::Cell<u64>,
 	stable_bounds: std::cell::RefCell<Option<Rectangle>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ViewportDrag {
+	stamp: ViewportStamp,
+	press: Pt<Widget>,
+	geometry: ViewportGeometry,
+}
+
+impl PlotCanvasState {
+	/// iced dispatches every event collected for one frame against one widget
+	/// tree before application messages rebuild that tree. Keep a canvas-local
+	/// continuation of the surface stamp so a batched press/move/release or
+	/// wheel burst still publishes one consecutive generation per event.
+	fn sync_viewport_chain(&mut self, widget: ViewportStamp) -> ViewportStamp {
+		let Some(local) = self.viewport_local_stamp else {
+			self.viewport_local_stamp = Some(widget);
+			self.viewport_local_geometry = None;
+			return widget;
+		};
+		if local.incarnation != widget.incarnation || local.generation.0 < widget.generation.0 {
+			self.viewport_drag = None;
+			self.viewport_click = None;
+			self.viewport_local_stamp = Some(widget);
+			self.viewport_local_geometry = None;
+			return widget;
+		}
+		if local == widget {
+			// The rebuilt widget has caught up and now owns any band reflow.
+			self.viewport_local_geometry = None;
+		}
+		local
+	}
+
+	fn advance_viewport_chain(&mut self, stamp: ViewportStamp, geometry: Option<ViewportGeometry>) {
+		self.viewport_local_stamp = Some(stamp);
+		self.viewport_local_geometry = geometry.map(|geometry| (stamp, geometry));
+	}
+
+	fn chained_viewport_geometry(&self, stamp: ViewportStamp) -> Option<ViewportGeometry> {
+		self.viewport_local_geometry
+			.filter(|(geometry_stamp, _)| *geometry_stamp == stamp)
+			.map(|(_, geometry)| geometry)
+	}
+}
+
+const VIEWPORT_ZOOM_FACTOR: f64 = 1.1;
+const VIEWPORT_RELATIVE_FLOOR: f64 = 1.0 / 1_073_741_824.0;
+const VIEWPORT_ABSOLUTE_ULPS: f64 = 1024.0;
+
+fn viewport_axis_floor(prepared: (f64, f64), current: (f64, f64)) -> f64 {
+	let relative = (prepared.1 - prepared.0).abs() * VIEWPORT_RELATIVE_FLOOR;
+	let endpoint_ulp = [current.0, current.1]
+		.into_iter()
+		.map(|value| {
+			(value.next_up() - value)
+				.abs()
+				.max((value - value.next_down()).abs())
+		})
+		.fold(0.0, f64::max);
+	relative.max(endpoint_ulp * VIEWPORT_ABSOLUTE_ULPS)
+}
+
+fn pan_viewport(drag: ViewportDrag, cursor: Pt<Widget>) -> Option<PlotDomainOverrides> {
+	let dx = cursor.x() - drag.press.x();
+	let dy = cursor.y() - drag.press.y();
+	let shift_x = drag.geometry.x_range.map(|range| {
+		let shift =
+			-(dx as f64 / drag.geometry.plot_area.width().max(1.0) as f64) * (range.1 - range.0);
+		(range.0 + shift, range.1 + shift)
+	});
+	let shift_y = drag.geometry.y_range.map(|range| {
+		let shift =
+			(dy as f64 / drag.geometry.plot_area.height().max(1.0) as f64) * (range.1 - range.0);
+		(range.0 + shift, range.1 + shift)
+	});
+	let domains = PlotDomainOverrides {
+		x_min: shift_x.map(|range| range.0),
+		x_max: shift_x.map(|range| range.1),
+		y_min: shift_y.map(|range| range.0),
+		y_max: shift_y.map(|range| range.1),
+	};
+	[domains.x_min, domains.x_max, domains.y_min, domains.y_max]
+		.into_iter()
+		.flatten()
+		.all(f64::is_finite)
+		.then_some(domains)
+}
+
+fn viewport_geometry_with_domains(
+	mut geometry: ViewportGeometry,
+	domains: PlotDomainOverrides,
+) -> ViewportGeometry {
+	if geometry.x_range.is_some() {
+		geometry.x_range = domains.x_min.zip(domains.x_max);
+	}
+	if geometry.y_range.is_some() {
+		geometry.y_range = domains.y_min.zip(domains.y_max);
+	}
+	geometry
+}
+
+fn zoom_axis(range: (f64, f64), prepared: (f64, f64), u: f64, factor: f64) -> Option<(f64, f64)> {
+	let anchor = range.0 + u * (range.1 - range.0);
+	let candidate = (
+		anchor + (range.0 - anchor) * factor,
+		anchor + (range.1 - anchor) * factor,
+	);
+	let extent = candidate.1 - candidate.0;
+	(candidate.0.is_finite()
+		&& candidate.1.is_finite()
+		&& extent.is_finite()
+		&& extent > 0.0
+		&& extent >= viewport_axis_floor(prepared, range))
+	.then_some(candidate)
+}
+
+fn zoom_viewport(
+	geometry: ViewportGeometry,
+	cursor: Pt<Widget>,
+	steps: f64,
+) -> Option<PlotDomainOverrides> {
+	if !steps.is_finite() || steps == 0.0 {
+		return None;
+	}
+	let factor = VIEWPORT_ZOOM_FACTOR.powf(-steps);
+	let u_x = ((cursor.x() - geometry.plot_area.x()) / geometry.plot_area.width().max(1.0)) as f64;
+	let u_y =
+		(1.0 - (cursor.y() - geometry.plot_area.y()) / geometry.plot_area.height().max(1.0)) as f64;
+	let x = match (geometry.x_range, geometry.prepared_x_range) {
+		(Some(range), Some(prepared)) => Some(zoom_axis(range, prepared, u_x, factor)?),
+		_ => None,
+	};
+	let y = match (geometry.y_range, geometry.prepared_y_range) {
+		(Some(range), Some(prepared)) => Some(zoom_axis(range, prepared, u_y, factor)?),
+		_ => None,
+	};
+	Some(PlotDomainOverrides {
+		x_min: x.map(|range| range.0),
+		x_max: x.map(|range| range.1),
+		y_min: y.map(|range| range.0),
+		y_max: y.map(|range| range.1),
+	})
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2847,6 +3179,753 @@ mod settings_gesture_tests {
 		assert_eq!(
 			state.settings_gesture(&left_press(), BOUNDS, cursor),
 			SettingsGesture::Tracking
+		);
+	}
+}
+
+#[cfg(test)]
+mod product_0150_gesture_tests {
+	use super::*;
+	use crate::plot::theme::PlotSettings;
+	use iced::advanced::mouse::Cursor;
+	use iced::{Event, Point, Rectangle, keyboard, mouse};
+
+	struct GestureKernel {
+		layout: PlotLayout,
+		hits: Arc<std::sync::atomic::AtomicUsize>,
+	}
+
+	impl PlotKernel for GestureKernel {
+		fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
+			match &self.layout {
+				PlotLayout::Cartesian {
+					x_axis_type,
+					y_axis_type,
+					..
+				} => PlotLayout::Cartesian {
+					x_range: (
+						settings.x_min.unwrap_or(0.0),
+						settings.x_max.unwrap_or(10.0),
+					),
+					y_range: (
+						settings.y_min.unwrap_or(0.0),
+						settings.y_max.unwrap_or(20.0),
+					),
+					x_axis_type: x_axis_type.clone(),
+					y_axis_type: y_axis_type.clone(),
+					x_temporal_domain: None,
+					y_temporal_domain: None,
+				},
+				other => other.clone(),
+			}
+		}
+
+		fn plot(
+			&self,
+			_backend: &mut dyn PlotBackend,
+			_bounds: Rectangle,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+			_settings: ResolvedPlotSettings,
+		) {
+		}
+
+		fn hit(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<PlotHit> {
+			self.hits.fetch_add(1, Ordering::Relaxed);
+			Some(PlotHit::new(MarkFamily::LINE, HitDimensionality::Line, 0))
+		}
+	}
+
+	fn cartesian_kernel() -> GestureKernel {
+		GestureKernel {
+			layout: PlotLayout::Cartesian {
+				x_range: (0.0, 10.0),
+				y_range: (0.0, 20.0),
+				x_axis_type: AxisType::Linear,
+				y_axis_type: AxisType::Linear,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
+			},
+			hits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+		}
+	}
+
+	fn message(action: canvas::Action<PlotMessage>) -> Option<PlotMessage> {
+		action.into_inner().0
+	}
+
+	#[test]
+	fn product_0150_press_move_release_uses_the_press_geometry_and_settle_stamp() {
+		let kernel = cartesian_kernel();
+		let stamp = ViewportStamp::mint();
+		let widget = PlotWidget::new(
+			&kernel,
+			"gesture".to_owned(),
+			0.0,
+			PlotSettings::default(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_viewport_state(stamp, ViewportMotion::Settled);
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+		let mut state = PlotCanvasState::default();
+		let press_point = Point::new(400.0, 300.0);
+		let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+		let action = Program::update(
+			&widget,
+			&mut state,
+			&press,
+			bounds,
+			Cursor::Available(press_point),
+		)
+		.expect("inside press starts the viewport gesture");
+		assert!(
+			matches!(message(action), Some(PlotMessage::ViewportStarted(next)) if next == stamp.next())
+		);
+		let wheel = Event::Mouse(mouse::Event::WheelScrolled {
+			delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+		});
+		assert!(
+			Program::update(
+				&widget,
+				&mut state,
+				&wheel,
+				bounds,
+				Cursor::Available(press_point),
+			)
+			.is_none(),
+			"wheel during an active drag is refused"
+		);
+
+		let moved_stamp = stamp.next();
+		let moving_widget = PlotWidget::new(
+			&kernel,
+			"gesture".to_owned(),
+			0.0,
+			PlotSettings::default(),
+			1,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_viewport_state(moved_stamp, ViewportMotion::Moving);
+		let move_point = Point::new(440.0, 330.0);
+		let moved = Event::Mouse(mouse::Event::CursorMoved {
+			position: move_point,
+		});
+		let action = Program::update(
+			&moving_widget,
+			&mut state,
+			&moved,
+			bounds,
+			Cursor::Available(move_point),
+		)
+		.expect("drag move publishes one viewport mutation");
+		let Some(PlotMessage::ViewportChanged {
+			stamp: changed_stamp,
+			domains,
+			quiet_settle: false,
+		}) = message(action)
+		else {
+			panic!("drag move must publish a non-quiet viewport change")
+		};
+		assert_eq!(changed_stamp, moved_stamp.next());
+		assert_eq!(
+			kernel.hits.load(Ordering::Relaxed),
+			0,
+			"drag motion never hit-tests"
+		);
+		assert!(
+			domains.x_min.unwrap() < 0.0,
+			"rightward drag moves the domain left"
+		);
+		assert!(
+			domains.y_min.unwrap() > 0.0,
+			"downward drag moves the domain up"
+		);
+
+		let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+		let release_widget = PlotWidget::new(
+			&kernel,
+			"gesture".to_owned(),
+			0.0,
+			PlotSettings::default(),
+			2,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_viewport_state(changed_stamp, ViewportMotion::Moving);
+		let action = Program::update(
+			&release_widget,
+			&mut state,
+			&release,
+			bounds,
+			Cursor::Available(move_point),
+		)
+		.expect("release settles the active drag");
+		assert!(
+			matches!(message(action), Some(PlotMessage::ViewportSettled(settle)) if settle == changed_stamp)
+		);
+
+		let mut predecessor_canvas = PlotCanvasState::default();
+		let _ = Program::update(
+			&widget,
+			&mut predecessor_canvas,
+			&press,
+			bounds,
+			Cursor::Available(press_point),
+		);
+		let replacement = PlotWidget::new(
+			&kernel,
+			"replacement".to_owned(),
+			0.0,
+			PlotSettings::default(),
+			3,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_viewport_state(stamp.next().next(), ViewportMotion::Settled);
+		let replacement_action = Program::update(
+			&replacement,
+			&mut predecessor_canvas,
+			&moved,
+			bounds,
+			Cursor::Available(move_point),
+		)
+		.and_then(message);
+		assert!(
+			!matches!(
+				replacement_action,
+				Some(PlotMessage::ViewportChanged { .. } | PlotMessage::ViewportSettled(_))
+			),
+			"a replacement stamp invalidates the predecessor's drag anchor"
+		);
+		assert!(predecessor_canvas.viewport_drag.is_none());
+		assert!(predecessor_canvas.viewport_click.is_none());
+	}
+
+	#[test]
+	fn product_0150_one_widget_chains_a_batched_drag_and_wheel_burst() {
+		let kernel = cartesian_kernel();
+		let stamp = ViewportStamp::mint();
+		let widget = PlotWidget::new(
+			&kernel,
+			"gesture".to_owned(),
+			0.0,
+			PlotSettings::default(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_viewport_state(stamp, ViewportMotion::Settled);
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+		let press_point = Point::new(400.0, 300.0);
+		let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+		let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+		let mut drag_state = PlotCanvasState::default();
+
+		let started = Program::update(
+			&widget,
+			&mut drag_state,
+			&press,
+			bounds,
+			Cursor::Available(press_point),
+		)
+		.and_then(message)
+		.expect("batched press publishes");
+		assert!(matches!(started, PlotMessage::ViewportStarted(value) if value == stamp.next()));
+
+		let move_one = Point::new(420.0, 315.0);
+		let first = Program::update(
+			&widget,
+			&mut drag_state,
+			&Event::Mouse(mouse::Event::CursorMoved { position: move_one }),
+			bounds,
+			Cursor::Available(move_one),
+		)
+		.and_then(message)
+		.expect("first batched move publishes");
+		let PlotMessage::ViewportChanged {
+			stamp: first_stamp,
+			domains: first_domains,
+			quiet_settle: false,
+		} = first
+		else {
+			panic!("first batched move is a drag mutation")
+		};
+		assert_eq!(first_stamp, stamp.next().next());
+
+		let move_two = Point::new(450.0, 340.0);
+		let second = Program::update(
+			&widget,
+			&mut drag_state,
+			&Event::Mouse(mouse::Event::CursorMoved { position: move_two }),
+			bounds,
+			Cursor::Available(move_two),
+		)
+		.and_then(message)
+		.expect("second batched move publishes");
+		let PlotMessage::ViewportChanged {
+			stamp: second_stamp,
+			domains: second_domains,
+			quiet_settle: false,
+		} = second
+		else {
+			panic!("second batched move is a drag mutation")
+		};
+		assert_eq!(second_stamp, first_stamp.next());
+		assert_ne!(second_domains, first_domains);
+
+		let settled = Program::update(
+			&widget,
+			&mut drag_state,
+			&release,
+			bounds,
+			Cursor::Available(move_two),
+		)
+		.and_then(message)
+		.expect("release in the same batch settles");
+		assert!(matches!(settled, PlotMessage::ViewportSettled(value) if value == second_stamp));
+
+		let wheel = Event::Mouse(mouse::Event::WheelScrolled {
+			delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+		});
+		let mut wheel_state = PlotCanvasState::default();
+		let first = Program::update(
+			&widget,
+			&mut wheel_state,
+			&wheel,
+			bounds,
+			Cursor::Available(press_point),
+		)
+		.and_then(message)
+		.expect("first batched wheel step publishes");
+		let PlotMessage::ViewportChanged {
+			stamp: first_stamp,
+			domains: first_domains,
+			quiet_settle: true,
+		} = first
+		else {
+			panic!("first batched wheel event is a quiet mutation")
+		};
+		let second = Program::update(
+			&widget,
+			&mut wheel_state,
+			&wheel,
+			bounds,
+			Cursor::Available(press_point),
+		)
+		.and_then(message)
+		.expect("second batched wheel step publishes");
+		let PlotMessage::ViewportChanged {
+			stamp: second_stamp,
+			domains: second_domains,
+			quiet_settle: true,
+		} = second
+		else {
+			panic!("second batched wheel event is a quiet mutation")
+		};
+		assert_eq!(first_stamp, stamp.next());
+		assert_eq!(second_stamp, first_stamp.next());
+		assert!(
+			second_domains.x_max.unwrap() - second_domains.x_min.unwrap()
+				< first_domains.x_max.unwrap() - first_domains.x_min.unwrap(),
+			"both wheel steps contribute to the cumulative zoom"
+		);
+	}
+
+	#[test]
+	fn product_0150_hover_is_suppressed_while_moving_and_resumes_when_settled() {
+		let kernel = cartesian_kernel();
+		let stamp = ViewportStamp::mint();
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+		let point = Point::new(400.0, 300.0);
+		let moved = Event::Mouse(mouse::Event::CursorMoved { position: point });
+		let mut state = PlotCanvasState::default();
+		let moving = PlotWidget::new(
+			&kernel,
+			"gesture".to_owned(),
+			0.0,
+			PlotSettings::default(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_viewport_state(stamp, ViewportMotion::Moving);
+		assert!(
+			Program::update(
+				&moving,
+				&mut state,
+				&moved,
+				bounds,
+				Cursor::Available(point),
+			)
+			.is_none()
+		);
+		assert_eq!(kernel.hits.load(Ordering::Relaxed), 0);
+
+		let settled = PlotWidget::new(
+			&kernel,
+			"gesture".to_owned(),
+			0.0,
+			PlotSettings::default(),
+			1,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_viewport_state(stamp.next(), ViewportMotion::Settled);
+		let action = Program::update(
+			&settled,
+			&mut state,
+			&moved,
+			bounds,
+			Cursor::Available(point),
+		)
+		.expect("first settled move resumes hover publication");
+		assert!(matches!(
+			message(action),
+			Some(PlotMessage::UpdateHover(Some(_)))
+		));
+		assert_eq!(kernel.hits.load(Ordering::Relaxed), 1);
+	}
+
+	#[test]
+	fn product_0150_active_rectangle_layout_scope_and_arbitration_refuse_without_publish() {
+		let kernel = cartesian_kernel();
+		let stamp = ViewportStamp::mint();
+		let widget = PlotWidget::new(
+			&kernel,
+			"gesture".to_owned(),
+			0.0,
+			PlotSettings::default(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_viewport_state(stamp, ViewportMotion::Settled);
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+		let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+		let mut outside = PlotCanvasState::default();
+		assert!(
+			Program::update(
+				&widget,
+				&mut outside,
+				&press,
+				bounds,
+				Cursor::Available(Point::new(2.0, 2.0)),
+			)
+			.is_none()
+		);
+		let geometry = widget
+			.viewport_geometry(bounds, Cursor::Available(Point::new(400.0, 300.0)))
+			.expect("central cursor is in the inner plot rectangle");
+		let mid_x = geometry.plot_area.x() + geometry.plot_area.width() / 2.0;
+		let mid_y = geometry.plot_area.y() + geometry.plot_area.height() / 2.0;
+		for point in [
+			Point::new(geometry.plot_area.x() - 1.0, mid_y),
+			Point::new(geometry.plot_area.right() + 1.0, mid_y),
+			Point::new(mid_x, geometry.plot_area.y() - 1.0),
+			Point::new(mid_x, geometry.plot_area.bottom() + 1.0),
+		] {
+			let mut state = PlotCanvasState::default();
+			assert!(
+				Program::update(
+					&widget,
+					&mut state,
+					&press,
+					bounds,
+					Cursor::Available(point)
+				)
+				.is_none(),
+				"axis, title, and legend bands outside the inner rectangle refuse"
+			);
+		}
+		let one_pixel_inside = Point::new(geometry.plot_area.x() + 1.0, mid_y);
+		let mut inside = PlotCanvasState::default();
+		assert!(matches!(
+			Program::update(
+				&widget,
+				&mut inside,
+				&press,
+				bounds,
+				Cursor::Available(one_pixel_inside),
+			)
+			.and_then(message),
+			Some(PlotMessage::ViewportStarted(_))
+		));
+
+		let mut shifted = PlotCanvasState::default();
+		let shift = Event::Keyboard(keyboard::Event::ModifiersChanged(
+			keyboard::Modifiers::SHIFT,
+		));
+		Program::update(&widget, &mut shifted, &shift, bounds, Cursor::Unavailable);
+		assert!(
+			Program::update(
+				&widget,
+				&mut shifted,
+				&press,
+				bounds,
+				Cursor::Available(Point::new(400.0, 300.0)),
+			)
+			.is_none()
+		);
+
+		for layout in [
+			PlotLayout::CategoricalXY {
+				x_categories: vec!["x".into()],
+				y_categories: vec!["y".into()],
+			},
+			PlotLayout::Parallel {
+				dimensions: vec!["x".into()],
+				ranges: vec![(0.0, 1.0)],
+			},
+			PlotLayout::Radial,
+		] {
+			assert!(
+				ViewportGeometry::from_layout(
+					Rect::from_iced_frame(Rectangle::new(
+						Point::ORIGIN,
+						iced::Size::new(10.0, 10.0)
+					)),
+					&layout,
+					&layout,
+				)
+				.is_none()
+			);
+		}
+
+		let area =
+			Rect::from_iced_frame(Rectangle::new(Point::ORIGIN, iced::Size::new(100.0, 100.0)));
+		let categorical_x = PlotLayout::CategoricalX {
+			categories: vec!["A".into()],
+			y_range: (0.0, 10.0),
+			y_axis_type: AxisType::Linear,
+		};
+		let geometry = ViewportGeometry::from_layout(area, &categorical_x, &categorical_x)
+			.expect("categorical x admits its continuous y axis");
+		assert!(geometry.x_range.is_none() && geometry.y_range.is_some());
+		let panned = pan_viewport(
+			ViewportDrag {
+				stamp,
+				press: Pt::<Widget>::from_plot_kernel_cursor(Point::new(50.0, 50.0)),
+				geometry,
+			},
+			Pt::<Widget>::from_plot_kernel_cursor(Point::new(70.0, 70.0)),
+		)
+		.expect("finite y-only pan");
+		assert!(panned.x_min.is_none() && panned.x_max.is_none());
+		assert!(panned.y_min.is_some() && panned.y_max.is_some());
+
+		let categorical_y = PlotLayout::CategoricalY {
+			categories: vec!["A".into()],
+			x_range: (0.0, 10.0),
+			x_axis_type: AxisType::Linear,
+		};
+		let geometry = ViewportGeometry::from_layout(area, &categorical_y, &categorical_y)
+			.expect("categorical y admits its continuous x axis");
+		assert!(geometry.x_range.is_some() && geometry.y_range.is_none());
+	}
+
+	#[test]
+	fn product_0150_wheel_is_quiet_stamped_and_bare_double_click_resets() {
+		let kernel = cartesian_kernel();
+		let stamp = ViewportStamp::mint();
+		let widget = PlotWidget::new(
+			&kernel,
+			"gesture".to_owned(),
+			0.0,
+			PlotSettings::default(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_viewport_state(stamp, ViewportMotion::Settled);
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+		let point = Point::new(400.0, 300.0);
+		let mut state = PlotCanvasState::default();
+		let wheel = Event::Mouse(mouse::Event::WheelScrolled {
+			delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+		});
+		let action = Program::update(
+			&widget,
+			&mut state,
+			&wheel,
+			bounds,
+			Cursor::Available(point),
+		)
+		.expect("wheel inside the plot zooms");
+		assert!(matches!(
+			message(action),
+			Some(PlotMessage::ViewportChanged { stamp: next, quiet_settle: true, .. })
+				if next == stamp.next()
+		));
+
+		let mut click_state = PlotCanvasState::default();
+		let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+		let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+		let first = Program::update(
+			&widget,
+			&mut click_state,
+			&press,
+			bounds,
+			Cursor::Available(point),
+		);
+		assert!(first.is_some());
+		let _ = Program::update(
+			&widget,
+			&mut click_state,
+			&release,
+			bounds,
+			Cursor::Available(point),
+		);
+		let second = Program::update(
+			&widget,
+			&mut click_state,
+			&press,
+			bounds,
+			Cursor::Available(point),
+		)
+		.expect("second bare click resets");
+		assert!(
+			matches!(message(second), Some(PlotMessage::ViewportReset(next)) if next == stamp.next().next().next())
+		);
+	}
+
+	#[test]
+	fn product_0150_zoom_is_cursor_anchored_and_refuses_below_both_floors() {
+		let geometry = ViewportGeometry {
+			plot_area: Rect::from_iced_frame(Rectangle::new(
+				Point::ORIGIN,
+				iced::Size::new(100.0, 100.0),
+			)),
+			x_range: Some((0.0, 10.0)),
+			y_range: Some((0.0, 20.0)),
+			prepared_x_range: Some((0.0, 10.0)),
+			prepared_y_range: Some((0.0, 20.0)),
+		};
+		let cursor = Pt::<Widget>::from_plot_kernel_cursor(Point::new(25.0, 75.0));
+		let zoomed = zoom_viewport(geometry, cursor, 1.0).expect("one zoom step is admitted");
+		let x_anchor_before = 2.5;
+		let x_anchor_after =
+			zoomed.x_min.unwrap() + 0.25 * (zoomed.x_max.unwrap() - zoomed.x_min.unwrap());
+		assert!((x_anchor_before - x_anchor_after).abs() < 1e-12);
+
+		let tiny = zoom_axis(
+			(1.0, 1.0_f64.next_up()),
+			(0.0, 1.0),
+			0.5,
+			1.0 / VIEWPORT_ZOOM_FACTOR,
+		);
+		assert!(
+			tiny.is_none(),
+			"the absolute ulp floor refuses collapsed zooms"
+		);
+		let relative = zoom_axis(
+			(0.0, VIEWPORT_RELATIVE_FLOOR),
+			(0.0, 1.0),
+			0.5,
+			1.0 / VIEWPORT_ZOOM_FACTOR,
+		);
+		assert!(
+			relative.is_none(),
+			"the prepared-extent floor refuses over-zoom"
+		);
+	}
+
+	#[test]
+	fn product_0150_press_transform_is_repeatable_and_zoom_reflow_drift_is_affine() {
+		let stamp = ViewportStamp::mint();
+		let area = Rect::from_iced_frame(Rectangle::new(
+			Point::new(100.0, 50.0),
+			iced::Size::new(600.0, 400.0),
+		));
+		let geometry = ViewportGeometry {
+			plot_area: area,
+			x_range: Some((0.0, 10.0)),
+			y_range: Some((0.0, 20.0)),
+			prepared_x_range: Some((0.0, 10.0)),
+			prepared_y_range: Some((0.0, 20.0)),
+		};
+		let drag = ViewportDrag {
+			stamp,
+			press: Pt::<Widget>::from_plot_kernel_cursor(Point::new(300.0, 200.0)),
+			geometry,
+		};
+		let cursor = Pt::<Widget>::from_plot_kernel_cursor(Point::new(370.0, 260.0));
+		assert_eq!(pan_viewport(drag, cursor), pan_viewport(drag, cursor));
+
+		let old_origin = 100.0_f64;
+		let old_size = 600.0_f64;
+		let new_origin = 120.0_f64;
+		let new_size = 580.0_f64;
+		let u = 0.25_f64;
+		let observed = (new_origin + u * new_size) - (old_origin + u * old_size);
+		let affine = (new_origin - old_origin) + u * (new_size - old_size);
+		assert!((observed - affine).abs() < f64::EPSILON);
+		assert_ne!(affine, new_origin - old_origin, "band delta alone is wrong");
+
+		let kernel = cartesian_kernel();
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+		let cursor = Point::new(600.0, 300.0);
+		let mut model = PlotSettings::default();
+		model.library_defaults.x_min = Some(0.0);
+		model.library_defaults.x_max = Some(10.0);
+		model.library_defaults.y_min = Some(0.0);
+		model.library_defaults.y_max = Some(9.0);
+		let old_widget = PlotWidget::new(
+			&kernel,
+			"gesture".to_owned(),
+			0.0,
+			model.clone(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_viewport_state(stamp, ViewportMotion::Settled);
+		let old = old_widget
+			.viewport_geometry(bounds, Cursor::Available(cursor))
+			.expect("old geometry");
+		let (zoomed_domains, new) = [-10.0, -20.0, -40.0, -80.0]
+			.into_iter()
+			.find_map(|steps| {
+				let domains =
+					zoom_viewport(old, Pt::<Widget>::from_plot_kernel_cursor(cursor), steps)?;
+				let mut candidate = model.clone();
+				candidate.pane_override.domains = Override::Set(domains);
+				let widget = PlotWidget::new(
+					&kernel,
+					"gesture".to_owned(),
+					0.0,
+					candidate,
+					1,
+					false,
+					PlotRenderLayer::Full,
+				)
+				.with_viewport_state(stamp.next(), ViewportMotion::Moving);
+				let geometry = widget.viewport_geometry(bounds, Cursor::Available(cursor))?;
+				((geometry.plot_area.x() - old.plot_area.x()).abs() > f32::EPSILON
+					|| (geometry.plot_area.width() - old.plot_area.width()).abs() > f32::EPSILON)
+					.then_some((domains, geometry))
+			})
+			.expect("fixture crosses a y-label-width transition");
+		let u = ((cursor.x - old.plot_area.x()) / old.plot_area.width()) as f64;
+		let old_origin = old.plot_area.x() as f64;
+		let old_size = old.plot_area.width() as f64;
+		let new_origin = new.plot_area.x() as f64;
+		let new_size = new.plot_area.width() as f64;
+		let observed = (new_origin + u * new_size) - (old_origin + u * old_size);
+		let expected = (new_origin - old_origin) + u * (new_size - old_size);
+		assert!((observed - expected).abs() < 1e-10);
+		assert!(
+			zoomed_domains.x_min.is_some() && zoomed_domains.y_min.is_some(),
+			"the observed reflow came from a real two-axis zoom candidate"
+		);
+		let moved_cursor = Pt::<Widget>::from_plot_kernel_cursor(cursor);
+		let path_after_reflow = pan_viewport(drag, moved_cursor);
+		assert_eq!(
+			path_after_reflow,
+			pan_viewport(drag, moved_cursor),
+			"reflow cannot replace the drag's press-time transform"
 		);
 	}
 }
@@ -2986,6 +4065,8 @@ impl<'a> PlotWidget<'a> {
 					self.padding,
 					&self.title,
 					&self.settings_model,
+					self.viewport_motion,
+					self.raster_reuse_policy,
 					coordinator,
 					&self.raster_slot,
 					&mut preparing,
@@ -3045,6 +4126,7 @@ impl<'a> PlotWidget<'a> {
 					Cursor::Unavailable,
 					&self.settings_model,
 					self.viewport_motion,
+					self.raster_reuse_policy,
 					coordinator,
 					&self.raster_slot,
 					&mut preparing,
@@ -3082,6 +4164,7 @@ impl<'a> PlotWidget<'a> {
 				self.padding,
 				&self.title,
 				&self.settings_model,
+				self.viewport_motion,
 			);
 			if !composite.owns_global_headings() {
 				self.render_global_headings(backend, bounds.into_iced());
@@ -3405,6 +4488,17 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 		if self.layer == PlotRenderLayer::Data {
 			return None;
 		}
+		// PRODUCT-0150 arbitration belongs to every interactive surface,
+		// including notebook `Full` canvases that do not expose the inspector.
+		if let Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) = event {
+			state.modifiers = *modifiers;
+			if !modifiers.control() {
+				state.settings_click = None;
+			}
+			if modifiers.control() || modifiers.shift() {
+				state.viewport_click = None;
+			}
+		}
 		if self.settings_inspector_gesture {
 			match state.settings_gesture(event, bounds, cursor) {
 				SettingsGesture::Activated => {
@@ -3416,8 +4510,145 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 				SettingsGesture::None => {}
 			}
 		}
+		if let Some(stamp) = self.viewport_stamp {
+			let chain_stamp = state.sync_viewport_chain(stamp);
+			let widget_position = || {
+				let position = cursor.position_over(bounds)?;
+				Some(Pt::<Widget>::from_window(
+					Pt::<Window>::from_iced_event(position),
+					Rect::<Window>::from_iced_layout(bounds),
+				))
+			};
+			match event {
+				Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left))
+					if !state.modifiers.control() && !state.modifiers.shift() =>
+				{
+					let Some(position) = cursor.position_over(bounds) else {
+						state.viewport_click = None;
+						return None;
+					};
+					let Some(widget_position) = widget_position() else {
+						return None;
+					};
+					let Some(geometry) = state
+						.chained_viewport_geometry(chain_stamp)
+						.or_else(|| self.viewport_geometry(bounds, cursor))
+					else {
+						state.viewport_click = None;
+						return None;
+					};
+					let click = iced::advanced::mouse::Click::new(
+						position,
+						iced::mouse::Button::Left,
+						state.viewport_click,
+					);
+					if click.kind() == iced::advanced::mouse::click::Kind::Double {
+						state.viewport_click = None;
+						state.viewport_drag = None;
+						state.last_hover = None;
+						let reset = chain_stamp.next();
+						state.advance_viewport_chain(reset.next(), None);
+						return Some(
+							canvas::Action::publish(PlotMessage::ViewportReset(reset))
+								.and_capture(),
+						);
+					}
+					let started = chain_stamp.next();
+					state.viewport_click = Some(click);
+					state.viewport_drag = Some(ViewportDrag {
+						stamp: started,
+						press: widget_position,
+						geometry,
+					});
+					state.advance_viewport_chain(started, Some(geometry));
+					state.last_hover = None;
+					return Some(
+						canvas::Action::publish(PlotMessage::ViewportStarted(started))
+							.and_capture(),
+					);
+				}
+				Event::Mouse(iced::mouse::Event::CursorMoved { .. }) => {
+					if state.viewport_drag.is_some_and(|drag| {
+						drag.stamp.incarnation != stamp.incarnation
+							|| drag.stamp.generation.0 < stamp.generation.0
+					}) {
+						state.viewport_drag = None;
+						return None;
+					}
+					if let (Some(drag), Some(position)) = (state.viewport_drag, widget_position()) {
+						let Some(domains) = pan_viewport(drag, position) else {
+							return None;
+						};
+						let next = drag.stamp.next();
+						if let Some(drag) = &mut state.viewport_drag {
+							drag.stamp = next;
+						}
+						state.advance_viewport_chain(
+							next,
+							Some(viewport_geometry_with_domains(drag.geometry, domains)),
+						);
+						return Some(
+							canvas::Action::publish(PlotMessage::ViewportChanged {
+								stamp: next,
+								domains,
+								quiet_settle: false,
+							})
+							.and_capture(),
+						);
+					}
+				}
+				Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+					if let Some(drag) = state.viewport_drag.take() {
+						let geometry = state.chained_viewport_geometry(drag.stamp);
+						state.advance_viewport_chain(drag.stamp.next(), geometry);
+						return Some(
+							canvas::Action::publish(PlotMessage::ViewportSettled(drag.stamp))
+								.and_capture(),
+						);
+					}
+				}
+				Event::Mouse(iced::mouse::Event::WheelScrolled { delta })
+					if state.viewport_drag.is_none() && !state.modifiers.control() =>
+				{
+					let steps = match delta {
+						iced::mouse::ScrollDelta::Lines { y, .. } => *y as f64,
+						iced::mouse::ScrollDelta::Pixels { y, .. } => *y as f64 / 53.0,
+					};
+					let Some(position) = widget_position() else {
+						return None;
+					};
+					let Some(geometry) = state
+						.chained_viewport_geometry(chain_stamp)
+						.or_else(|| self.viewport_geometry(bounds, cursor))
+					else {
+						return None;
+					};
+					let Some(domains) = zoom_viewport(geometry, position, steps) else {
+						return None;
+					};
+					state.last_hover = None;
+					let next = chain_stamp.next();
+					state.advance_viewport_chain(
+						next,
+						Some(viewport_geometry_with_domains(geometry, domains)),
+					);
+					return Some(
+						canvas::Action::publish(PlotMessage::ViewportChanged {
+							stamp: next,
+							domains,
+							quiet_settle: true,
+						})
+						.and_capture(),
+					);
+				}
+				_ => {}
+			}
+		}
 		match event {
 			Event::Mouse(iced::mouse::Event::CursorMoved { .. }) => {
+				if self.viewport_motion == ViewportMotion::Moving {
+					return None;
+				}
 				let window_bounds = Rect::<Window>::from_iced_layout(bounds);
 				let widget_bounds = Rect::<Widget>::from_iced_frame(bounds);
 				let widget_cursor = cursor.position().map(|position| {

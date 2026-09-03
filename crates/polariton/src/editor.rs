@@ -218,6 +218,7 @@ pub(crate) enum PlotWritebackGesture {
 	Commit {
 		panel_id: HostPanelId,
 		key: crate::presentation_registry::SettingKey,
+		displayed_pane_value: Option<String>,
 	},
 	Reset {
 		panel_id: HostPanelId,
@@ -544,20 +545,30 @@ struct NotebookPlotSurface {
 	composition: PlotComposition,
 	kernel: Arc<dyn PlotKernel + Send + Sync>,
 	settings: ResolvedPlotSettings,
+	settings_model: crate::plot::theme::PlotSettings,
 	hovered_info: Option<String>,
 	render_revision: u64,
 	raster_coordinator: crate::plot::raster::RasterCoordinator,
+	viewport_motion: crate::plot::common::ViewportMotion,
+	viewport_stamp: crate::plot::common::ViewportStamp,
 }
+
+const VIEWPORT_QUIET_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
 
 impl NotebookPlotSurface {
 	fn new(composition: PlotComposition, kernel: Arc<dyn PlotKernel + Send + Sync>) -> Self {
+		let settings_model = crate::plot::theme::PlotSettings::default();
+		let settings = settings_model.resolve();
 		Self {
 			composition,
 			kernel,
-			settings: ResolvedPlotSettings::default(),
+			settings,
+			settings_model,
 			hovered_info: None,
 			render_revision: 0,
 			raster_coordinator: crate::plot::raster::RasterCoordinator::new(),
+			viewport_motion: crate::plot::common::ViewportMotion::Settled,
+			viewport_stamp: crate::plot::common::ViewportStamp::mint(),
 		}
 	}
 
@@ -581,10 +592,47 @@ impl NotebookPlotSurface {
 				// Notebook plots do not render the host-panel inspector control.
 			}
 			crate::gui::messages::PlotMessage::SettingChanged(..)
-			| crate::gui::messages::PlotMessage::SettingSubmitted(_)
+			| crate::gui::messages::PlotMessage::SettingSubmitted(..)
 			| crate::gui::messages::PlotMessage::SettingReset(_)
 			| crate::gui::messages::PlotMessage::CancelSettingPreview => {
 				// PRODUCT-0142 explicitly refuses notebook-cell span rebasing.
+			}
+			crate::gui::messages::PlotMessage::ViewportStarted(stamp) => {
+				if stamp == self.viewport_stamp.next() {
+					self.viewport_stamp = stamp;
+					self.viewport_motion = crate::plot::common::ViewportMotion::Moving;
+					self.hovered_info = None;
+					self.render_revision = self.render_revision.wrapping_add(1);
+				}
+			}
+			crate::gui::messages::PlotMessage::ViewportChanged { stamp, domains, .. } => {
+				if stamp == self.viewport_stamp.next() {
+					self.viewport_stamp = stamp;
+					self.settings_model.pane_override.domains =
+						crate::plot::spec::Override::Set(domains);
+					self.settings = self.settings_model.resolve();
+					self.viewport_motion = crate::plot::common::ViewportMotion::Moving;
+					self.hovered_info = None;
+					self.render_revision = self.render_revision.wrapping_add(1);
+				}
+			}
+			crate::gui::messages::PlotMessage::ViewportReset(stamp) => {
+				if stamp == self.viewport_stamp.next() {
+					self.settings_model.pane_override.domains =
+						crate::plot::spec::Override::Inherit;
+					self.settings = self.settings_model.resolve();
+					self.viewport_stamp = stamp.next();
+					self.viewport_motion = crate::plot::common::ViewportMotion::Settled;
+					self.hovered_info = None;
+					self.render_revision = self.render_revision.wrapping_add(1);
+				}
+			}
+			crate::gui::messages::PlotMessage::ViewportSettled(stamp) => {
+				if stamp == self.viewport_stamp {
+					self.viewport_stamp = stamp.next();
+					self.viewport_motion = crate::plot::common::ViewportMotion::Settled;
+					self.render_revision = self.render_revision.wrapping_add(1);
+				}
 			}
 		}
 		None
@@ -2341,6 +2389,31 @@ impl CodeEditor {
 				self.request_content();
 			}
 			EditorMsg::HostPlot { panel_id, message } => {
+				let quiet_settle = message.quiet_settle_stamp();
+				if matches!(
+					&message,
+					PlotPaneMsg::ViewportStarted(_) | PlotPaneMsg::ViewportReset(_)
+				) {
+					// PRODUCT-0150 captures a plot press so the workspace mouse
+					// area cannot also begin a pane drag. Preserve the focus half of
+					// that formerly shared click explicitly at the routed panel id.
+					let pane_id = self.viewport.as_ref().and_then(|viewport| {
+						viewport
+							.panes
+							.iter()
+							.find(|pane| {
+								pane.host_panel
+									.as_ref()
+									.is_some_and(|panel| panel.panel_id == panel_id)
+							})
+							.map(|pane| pane.pane_id)
+					});
+					if let Some(pane_id) = pane_id {
+						self.cursor_blink.note_activity(time::Instant::now());
+						self.send(EditorCommand::FocusPane(pane_id));
+						self.request_content();
+					}
+				}
 				#[cfg(feature = "toron")]
 				match &message {
 					PlotPaneMsg::SettingChanged(key, value) => {
@@ -2351,11 +2424,12 @@ impl CodeEditor {
 								value: value.clone(),
 							});
 					}
-					PlotPaneMsg::SettingSubmitted(key) => {
+					PlotPaneMsg::SettingSubmitted(key, displayed_pane_value) => {
 						self.plot_writeback_gestures
 							.push_back(PlotWritebackGesture::Commit {
 								panel_id,
 								key: *key,
+								displayed_pane_value: displayed_pane_value.clone(),
 							});
 					}
 					PlotPaneMsg::SettingReset(key) => {
@@ -2372,7 +2446,11 @@ impl CodeEditor {
 					PlotPaneMsg::UpdateHover(_)
 					| PlotPaneMsg::RasterRequested(_)
 					| PlotPaneMsg::RasterCompleted(_)
-					| PlotPaneMsg::ToggleSettingsInspector => {}
+					| PlotPaneMsg::ToggleSettingsInspector
+					| PlotPaneMsg::ViewportStarted(_)
+					| PlotPaneMsg::ViewportChanged { .. }
+					| PlotPaneMsg::ViewportReset(_)
+					| PlotPaneMsg::ViewportSettled(_) => {}
 				}
 				if let Some(job) = self.panels.update_plot(panel_id, message) {
 					return Task::perform(
@@ -2383,17 +2461,46 @@ impl CodeEditor {
 						},
 					);
 				}
+				if let Some(stamp) = quiet_settle {
+					return Task::perform(
+						async move {
+							tokio::time::sleep(VIEWPORT_QUIET_SETTLE).await;
+							stamp
+						},
+						move |stamp| EditorMsg::HostPlot {
+							panel_id,
+							message: PlotPaneMsg::ViewportSettled(stamp),
+						},
+					);
+				}
 			}
 			EditorMsg::NotebookPlot { identity, message } => {
-				if let Some(NotebookCellOutput::Plot { surface }) =
-					self.notebook_outputs.get_mut(&identity)
-					&& let Some(job) = surface.update(message)
-				{
+				let quiet_settle = message.quiet_settle_stamp();
+				let job =
+					self.notebook_outputs
+						.get_mut(&identity)
+						.and_then(|output| match output {
+							NotebookCellOutput::Plot { surface } => surface.update(message),
+							_ => None,
+						});
+				if let Some(job) = job {
 					return Task::perform(
 						crate::plot::raster::run_raster_job(job),
 						move |completion| EditorMsg::NotebookPlot {
 							identity: identity.clone(),
 							message: PlotPaneMsg::RasterCompleted(completion),
+						},
+					);
+				}
+				if let Some(stamp) = quiet_settle {
+					return Task::perform(
+						async move {
+							tokio::time::sleep(VIEWPORT_QUIET_SETTLE).await;
+							stamp
+						},
+						move |stamp| EditorMsg::NotebookPlot {
+							identity: identity.clone(),
+							message: PlotPaneMsg::ViewportSettled(stamp),
 						},
 					);
 				}
@@ -4870,12 +4977,13 @@ fn markdown_cell_output_surface<'a>(
 					surface.kernel.as_ref(),
 					surface.composition.title(),
 					20.0,
-					crate::plot::theme::PlotSettings::from_resolved(surface.settings.clone()),
+					surface.settings_model.clone(),
 					surface.render_revision,
 					false,
 					PlotRenderLayer::Full,
 				)
-				.with_raster_coordinator(&surface.raster_coordinator),
+				.with_raster_coordinator(&surface.raster_coordinator)
+				.with_viewport_state(surface.viewport_stamp, surface.viewport_motion),
 			)
 			.width(Length::Fill)
 			.height(Length::Fill)
@@ -5972,7 +6080,30 @@ mod tests {
 			attachment(StateId::new(3)),
 			Some(crate::plot::core::PlotType::Line),
 		);
+		let preview_viewport = plot.viewport_stamp.next();
+		plot.update(PlotPaneMsg::ViewportChanged {
+			stamp: preview_viewport,
+			domains: crate::plot::theme::PlotDomainOverrides {
+				x_min: Some(0.25),
+				x_max: Some(0.75),
+				y_min: Some(0.25),
+				y_max: Some(0.75),
+			},
+			quiet_settle: false,
+		});
+		assert!(matches!(
+			plot.plot_settings_model.pane_override.domains,
+			crate::plot::spec::Override::Set(_)
+		));
 		assert!(plot.promote_source_preview(StateId::new(4)));
+		assert!(matches!(
+			plot.plot_settings_model.pane_override.domains,
+			crate::plot::spec::Override::Inherit
+		));
+		assert_eq!(
+			plot.viewport_motion,
+			crate::plot::common::ViewportMotion::Settled
+		);
 		plot.discard_source_preview();
 		assert_eq!(plot.display_label, "committed");
 		assert_eq!(
@@ -8245,6 +8376,73 @@ mod tests {
 				.focused_pane_id,
 			panel_id,
 			"a host-panel click must update Baryon's workspace focus"
+		);
+	}
+
+	#[test]
+	fn product_0150_captured_plot_pan_press_still_focuses_its_host_pane() {
+		use super::RESULT_PANEL;
+
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		let source_pane = editor
+			.viewport
+			.as_ref()
+			.expect("source viewport")
+			.focused_pane_id;
+		editor.begin_query();
+		wait_for_host_panel(&mut editor);
+		let (_, kernel) = product_0075_test_plot();
+		editor.set_query_plot("plot.line".to_owned(), kernel);
+		let result_pane = editor
+			.viewport
+			.as_ref()
+			.expect("result viewport")
+			.panes
+			.iter()
+			.find(|pane| {
+				pane.host_panel
+					.as_ref()
+					.is_some_and(|panel| panel.panel_id == RESULT_PANEL)
+			})
+			.expect("result host pane")
+			.pane_id;
+		assert_eq!(
+			editor
+				.viewport
+				.as_ref()
+				.expect("result viewport")
+				.focused_pane_id,
+			source_pane,
+			"opening a result still does not steal source focus"
+		);
+		let stamp = match &editor.panels.panels[&RESULT_PANEL].content {
+			PanelContent::Plot(plot) => plot.viewport_stamp,
+			_ => panic!("expected plot result"),
+		};
+
+		let _ = editor.update(EditorMsg::HostPlot {
+			panel_id: RESULT_PANEL,
+			message: PlotPaneMsg::ViewportStarted(stamp.next()),
+		});
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor
+			.viewport
+			.as_ref()
+			.is_none_or(|viewport| viewport.focused_pane_id != result_pane)
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert_eq!(
+			editor
+				.viewport
+				.as_ref()
+				.expect("focused viewport")
+				.focused_pane_id,
+			result_pane,
+			"capturing the pan press must not suppress workspace focus"
 		);
 	}
 
@@ -11085,5 +11283,74 @@ mod tests {
 				.is_some_and(|viewport| matches!(viewport.input.mode, EditorMode::Visual { .. }))
 		);
 		assert_eq!(editor.cached_content(), "select 1;");
+	}
+
+	#[test]
+	fn product_0150_notebook_surface_owns_a_model_and_rejects_predecessor_settle() {
+		use crate::plot::common::{
+			AxisType, CoordinateTransformer, PlotBackend, PlotHit, PlotKernel, PlotLayout,
+			ResolvedPlotSettings, ViewportMotion,
+		};
+		use crate::plot::composition::PlotComposition;
+		use crate::plot::core::PlotType;
+		use iced::Rectangle;
+		use iced::advanced::mouse::Cursor;
+		use std::sync::Arc;
+
+		struct Kernel;
+		impl PlotKernel for Kernel {
+			fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
+				PlotLayout::Cartesian {
+					x_range: (settings.x_min.unwrap_or(0.0), settings.x_max.unwrap_or(1.0)),
+					y_range: (settings.y_min.unwrap_or(0.0), settings.y_max.unwrap_or(1.0)),
+					x_axis_type: AxisType::Linear,
+					y_axis_type: AxisType::Linear,
+					x_temporal_domain: None,
+					y_temporal_domain: None,
+				}
+			}
+			fn plot(
+				&self,
+				_backend: &mut dyn PlotBackend,
+				_bounds: Rectangle,
+				_transform: &CoordinateTransformer,
+				_cursor: Cursor,
+				_settings: ResolvedPlotSettings,
+			) {
+			}
+			fn hit(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<PlotHit> {
+				None
+			}
+		}
+
+		let composition = PlotComposition::single(PlotType::Line);
+		let mut predecessor =
+			super::NotebookPlotSurface::new(composition.clone(), Arc::new(Kernel));
+		let stale = predecessor.viewport_stamp.next();
+		predecessor.update(PlotPaneMsg::ViewportStarted(stale));
+		assert_eq!(predecessor.viewport_motion, ViewportMotion::Moving);
+
+		let mut replacement = super::NotebookPlotSurface::new(composition, Arc::new(Kernel));
+		assert_ne!(replacement.viewport_stamp.incarnation, stale.incarnation);
+		let current = replacement.viewport_stamp;
+		replacement.update(PlotPaneMsg::ViewportSettled(stale));
+		assert_eq!(replacement.viewport_stamp, current);
+		assert_eq!(replacement.viewport_motion, ViewportMotion::Settled);
+
+		let changed = current.next();
+		replacement.update(PlotPaneMsg::ViewportChanged {
+			stamp: changed,
+			domains: crate::plot::theme::PlotDomainOverrides {
+				x_min: Some(0.25),
+				x_max: Some(0.75),
+				y_min: Some(0.25),
+				y_max: Some(0.75),
+			},
+			quiet_settle: false,
+		});
+		assert!(matches!(
+			replacement.settings_model.pane_override.domains,
+			crate::plot::spec::Override::Set(_)
+		));
 	}
 }

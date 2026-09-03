@@ -12,6 +12,8 @@ use crate::plot::spec::{NonEmpty, SemanticType};
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
 use iced::{Color, Point, Rectangle};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -39,6 +41,8 @@ impl Default for HexbinViewportCache {
 pub struct HexbinPlotKernel {
 	preparer: MaterializedHexbinPreparer,
 	cache: Mutex<HexbinViewportCache>,
+	#[cfg(test)]
+	preparation_count: AtomicUsize,
 }
 
 impl HexbinPlotKernel {
@@ -46,6 +50,8 @@ impl HexbinPlotKernel {
 		Self {
 			preparer: MaterializedHexbinPreparer::new(observations),
 			cache: Mutex::new(HexbinViewportCache::default()),
+			#[cfg(test)]
+			preparation_count: AtomicUsize::new(0),
 		}
 	}
 
@@ -148,8 +154,8 @@ impl PlotKernel for HexbinPlotKernel {
 				cache.stale_preview = false;
 				return;
 			}
-			if motion == ViewportMotion::Moving && cache.artifact.is_some() {
-				cache.stale_preview = true;
+			if motion == ViewportMotion::Moving {
+				cache.stale_preview = cache.artifact.is_some();
 				return;
 			}
 			let generation = cache.next_generation;
@@ -164,11 +170,18 @@ impl PlotKernel for HexbinPlotKernel {
 			cache.latest_request = Some(request.clone());
 			request
 		};
+		#[cfg(test)]
+		self.preparation_count.fetch_add(1, Ordering::Relaxed);
 		let artifact = self
 			.preparer
 			.prepare(&request)
 			.expect("PRODUCT-0143 validated materialized observations satisfy their request");
 		let _published = self.publish_if_newest(&request, artifact);
+	}
+
+	#[cfg(test)]
+	fn viewport_preparation_count(&self) -> usize {
+		self.preparation_count.load(Ordering::Relaxed)
 	}
 
 	fn plot(
@@ -368,12 +381,17 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0143_first_moving_frame_prepares_and_paint_only_change_reuses() {
+	fn product_0143_authority_survives_product_0150_first_motion_deferral() {
 		let kernel = kernel();
 		let settings = ResolvedPlotSettings::default();
 		let layout = kernel.layout(settings.clone());
 		let transform = transform(&layout, 100.0);
 		kernel.prepare_viewport(&transform, ViewportMotion::Moving);
+		assert!(
+			kernel.artifact().is_none(),
+			"PRODUCT-0150 moving frames never perform viewport preparation"
+		);
+		kernel.prepare_viewport(&transform, ViewportMotion::Settled);
 		let generation = kernel.artifact().unwrap().generation();
 		assert!(!kernel.is_stale_preview());
 

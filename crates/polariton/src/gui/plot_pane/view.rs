@@ -15,6 +15,21 @@ fn hover_text_pixels(settings: &ResolvedPlotSettings) -> Pixels {
 	Pixels(settings.hover_size.points())
 }
 
+fn displayed_pane_submit_value(
+	key: crate::presentation_registry::SettingKey,
+	provenance: crate::presentation_registry::ProvenanceTier,
+	value: &str,
+	has_draft: bool,
+) -> Option<String> {
+	(provenance == crate::presentation_registry::ProvenanceTier::PaneOverride
+		&& matches!(
+			key,
+			crate::presentation_registry::SettingKey::XAxisBounds
+				| crate::presentation_registry::SettingKey::YAxisBounds
+		) && !has_draft)
+		.then(|| value.to_owned())
+}
+
 /// Plot content hosted directly by a libaryon panel. Host-panel chrome owns
 /// closing and layout, so this surface emits plot interaction only.
 pub fn host_view(
@@ -32,7 +47,8 @@ pub fn host_view(
 			state.resize_render_suspended,
 			PlotRenderLayer::Data,
 		)
-		.with_raster_coordinator(&state.raster_coordinator),
+		.with_raster_coordinator(&state.raster_coordinator)
+		.with_viewport_state(state.viewport_stamp, state.viewport_motion),
 	)
 	.width(Fill)
 	.height(Fill);
@@ -46,6 +62,7 @@ pub fn host_view(
 			state.resize_render_suspended,
 			PlotRenderLayer::OverlayInteractive,
 		)
+		.with_viewport_state(state.viewport_stamp, state.viewport_motion)
 		.with_settings_inspector_gesture(),
 	)
 	.width(Fill)
@@ -154,10 +171,16 @@ fn settings_inspector(
 			.unwrap_or_else(|| setting.value.to_string());
 		let value_row: Element<'_, PlotMessage> = if editable {
 			let key = setting.key;
+			let displayed_pane_value = displayed_pane_submit_value(
+				key,
+				setting.provenance,
+				&value,
+				state.setting_drafts.contains_key(&key),
+			);
 			let mut controls = row![
 				text_input(setting.label, &value)
 					.on_input(move |value| PlotMessage::SettingChanged(key, value))
-					.on_submit(PlotMessage::SettingSubmitted(key))
+					.on_submit(PlotMessage::SettingSubmitted(key, displayed_pane_value))
 					.size(12),
 			]
 			.spacing(4);
@@ -194,6 +217,49 @@ fn settings_inspector(
 			..Default::default()
 		})
 		.into()
+}
+
+#[cfg(test)]
+mod product_0150_promote_tests {
+	use super::displayed_pane_submit_value;
+	use crate::presentation_registry::{ProvenanceTier, SettingKey};
+
+	#[test]
+	fn product_0150_only_untouched_pane_bounds_seed_the_displayed_submit_value() {
+		for key in [SettingKey::XAxisBounds, SettingKey::YAxisBounds] {
+			assert_eq!(
+				displayed_pane_submit_value(key, ProvenanceTier::PaneOverride, "1, 9", false),
+				Some("1, 9".to_owned())
+			);
+			assert_eq!(
+				displayed_pane_submit_value(key, ProvenanceTier::PaneOverride, "1, 9", true),
+				None,
+				"a typed draft remains the authority"
+			);
+			for provenance in [
+				ProvenanceTier::LibraryDefault,
+				ProvenanceTier::ApplicationTheme,
+				ProvenanceTier::AuthoredSpec,
+				ProvenanceTier::Layer,
+			] {
+				assert_eq!(
+					displayed_pane_submit_value(key, provenance, "1, 9", false),
+					None,
+					"untouched non-pane rows preserve PRODUCT-0142's refusal"
+				);
+			}
+		}
+		assert_eq!(
+			displayed_pane_submit_value(
+				SettingKey::PointSize,
+				ProvenanceTier::PaneOverride,
+				"4",
+				false,
+			),
+			None,
+			"pane fallback is scoped to domain bounds"
+		);
+	}
 }
 
 #[cfg(test)]

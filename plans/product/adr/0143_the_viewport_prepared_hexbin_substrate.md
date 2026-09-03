@@ -375,10 +375,20 @@ case it may temporarily cease to be regular. Either preview remains stale and
 is never called exact. Hit-testing is disabled against it: interaction must not
 report membership from a lattice the screen no longer means.
 
-The first frame with no prior artifact prepares exactly even if motion is in
-progress. The first settled frame prepares exactly once for the final lattice.
+**Amended by PRODUCT-0150 at gesture implementation.** A moving frame with no
+prior artifact now defers preparation and paints chrome without bins. The
+original first-moving-frame exception contradicted the gesture's stronger
+cross-mark law that viewport-dependent preparation never runs during motion.
+Normal first contact is settled and remains exact; if motion genuinely arrives
+first, honesty is a temporarily empty data layer rather than hidden synchronous
+work. The first settled frame prepares exactly once for the final lattice.
 Resize outside a viewport gesture is settled and therefore exact; it does not
 receive a motion exemption.
+
+**Ratified after PRODUCT-0150 implementation review, 2026-09-02.** The
+supersession above is accepted as the stronger cross-mark contract: no
+viewport-dependent preparation runs under `Moving`, including the nearly
+unreachable first-moving/no-artifact case.
 
 Paint-only changes reuse the artifact. Source, domain, plot width/height,
 radius, orientation, or origin changes do not.
@@ -533,8 +543,10 @@ substrate oracle PRODUCT-0144 consumes.
 20. **Moving may degrade; settled may not.** A moving frame can reuse a tagged
     prior artifact with hit disabled. The first settled frame produces one exact
     current-lattice artifact and restores hit.
-21. **A first frame is not blank by policy.** With no prior artifact, even a
-    moving materialized viewport prepares an exact local result.
+21. **PRODUCT-0150 supersedes the first-moving exception precisely.** With no
+    prior artifact, `Moving` performs zero preparation and publishes nothing;
+    the first `Settled` frame prepares one exact local result. The prior-artifact
+    stale-preview and settled-exact assertions remain.
 22. **Materialized pins remain responsive.** A pinned hexbin retains its source
     snapshot and produces a different exact artifact after resize or domain
     change without relation execution.

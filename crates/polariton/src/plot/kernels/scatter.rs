@@ -234,6 +234,7 @@ impl PlotKernel for ScatterPlotKernel {
 		_cursor: Cursor,
 		settings: &PlotSettings,
 		_motion: ViewportMotion,
+		reuse_policy: crate::plot::common::RasterReusePolicy,
 		coordinator: &crate::plot::raster::RasterCoordinator,
 		slot: &crate::plot::raster::RasterSlotId,
 		preparing: &mut bool,
@@ -244,6 +245,7 @@ impl PlotKernel for ScatterPlotKernel {
 			bounds,
 			transform,
 			resolved,
+			reuse_policy,
 			coordinator,
 			slot,
 			preparing,
@@ -553,6 +555,7 @@ impl ScatterMarkRenderer {
 		bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		settings: ResolvedPlotSettings,
+		reuse_policy: crate::plot::common::RasterReusePolicy,
 		coordinator: &crate::plot::raster::RasterCoordinator,
 		slot: &crate::plot::raster::RasterSlotId,
 		preparing: &mut bool,
@@ -582,7 +585,9 @@ impl ScatterMarkRenderer {
 						top_left: Point::ORIGIN,
 						size: iced::Size::new(bounds.width.max(1.0), bounds.height.max(1.0)),
 					})
-				} else if bitmap.key.reusable_for(&current) {
+				} else if reuse_policy == crate::plot::common::RasterReusePolicy::Placed
+					&& bitmap.key.reusable_for(&current)
+				{
 					reuse_placement(
 						&bitmap.key,
 						&current,
@@ -1834,6 +1839,42 @@ mod tests {
 		);
 	}
 
+	#[test]
+	#[ignore = "PRODUCT-0150 stage-0 hover-cost evidence; allocates up to seven million points"]
+	fn product_0150_large_scatter_single_hover_cost_evidence() {
+		use crate::plot::factory::create_authored_plot;
+		use std::time::Instant;
+
+		for rows in [1_000_000_usize, 7_000_000] {
+			let xs = (0..rows)
+				.map(|index| (index % 10_000) as f64 / 10_000.0)
+				.collect::<Vec<_>>();
+			let ys = (0..rows)
+				.map(|index| ((index * 37) % 10_000) as f64 / 10_000.0)
+				.collect::<Vec<_>>();
+			let frame = df!("x" => xs, "y" => ys).expect("hover evidence frame");
+			let kernel = create_authored_plot(
+				AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x", "y"),
+				&frame,
+				1200,
+				720,
+			)
+			.expect("scatter kernel");
+			let settings = ResolvedPlotSettings::default();
+			let layout = kernel.layout(settings);
+			let transform = CoordinateTransformer::new(
+				&layout,
+				Rectangle::new(Point::ORIGIN, iced::Size::new(1000.0, 600.0)),
+			);
+			let started = Instant::now();
+			let _ = kernel.hit(&transform, Cursor::Available(Point::new(503.0, 297.0)));
+			println!(
+				"product_0150_hover rows={rows} elapsed_ms={:.3}",
+				started.elapsed().as_secs_f64() * 1_000.0
+			);
+		}
+	}
+
 	/// PRODUCT-0139 §1 and §5, end to end through the widget.
 	///
 	/// Instrument: `RASTER_BUILDS` counts scans of the source points, and the
@@ -2079,6 +2120,234 @@ mod tests {
 		assert_eq!(
 			settled_frame.last_rgba, cold_frame.last_rgba,
 			"a settled frame after motion must equal a cold raster at that domain"
+		);
+	}
+
+	#[test]
+	fn product_0150_categorical_x_raster_reuse_fails_closed_then_settles_exactly() {
+		use crate::plot::factory::create_authored_plot;
+		let frame = df!(
+			"x" => ["A", "B", "C", "D"],
+			"y" => [0.0_f64, 0.4, 0.8, 1.0]
+		)
+		.expect("categorical scatter frame");
+		let kernel = create_authored_plot(
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x", "y"),
+			&frame,
+			200,
+			200,
+		)
+		.expect("categorical scatter kernel");
+		let mut base = crate::plot::theme::PlotSettings::default();
+		base.library_defaults.scatter_render_mode = ScatterRenderMode::Rasterized;
+		let coordinator = crate::plot::raster::RasterCoordinator::new();
+		settle_interactive_raster(&kernel, &base, &coordinator, 200.0);
+
+		let mut moved = base.clone();
+		moved.library_defaults.y_min = Some(0.1);
+		moved.library_defaults.y_max = Some(1.1);
+		let moving =
+			render_interactive_frame(&kernel, &moved, ViewportMotion::Moving, &coordinator);
+		assert!(moving.placements.is_empty());
+		assert_eq!(
+			moving
+				.texts
+				.iter()
+				.filter(|text| text.as_str() == "preparing raster…")
+				.count(),
+			1,
+			"the degenerate categorical x extent refuses affine placement"
+		);
+
+		settle_interactive_raster(&kernel, &moved, &coordinator, 200.0);
+		let settled =
+			render_interactive_frame(&kernel, &moved, ViewportMotion::Settled, &coordinator);
+		assert_eq!(settled.placements.len(), 1, "settle publishes exact pixels");
+	}
+
+	#[test]
+	fn product_0150_vector_and_downsampled_motion_match_the_settled_baseline() {
+		let (kernel, mut model) = reuse_fixture();
+		let render = |model: &crate::plot::theme::PlotSettings, motion| {
+			use crate::plot::common::{PlotRenderLayer, PlotWidget};
+			let widget = PlotWidget::new(
+				kernel.as_ref(),
+				String::new(),
+				0.0,
+				model.clone(),
+				0,
+				false,
+				PlotRenderLayer::Full,
+			)
+			.with_viewport_motion(motion);
+			let mut backend = CountingBackend::default();
+			widget.render(
+				&mut backend,
+				Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 200.0)),
+			);
+			(backend.circles, backend.line_segments, backend.images)
+		};
+		for mode in [ScatterRenderMode::Vector, ScatterRenderMode::Downsampled] {
+			model.library_defaults.scatter_render_mode = mode;
+			assert_eq!(
+				render(&model, ViewportMotion::Moving),
+				render(&model, ViewportMotion::Settled),
+				"PRODUCT-0150 changes neither non-raster render path"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0150_seven_million_point_motion_reuses_then_settles_once() {
+		use crate::gui::messages::PlotMessage;
+		use crate::plot::common::{PlotCanvasState, PlotRenderLayer, PlotWidget, ViewportStamp};
+		use iced::Event;
+		use iced::widget::canvas::Program;
+		let rows = 7_000_000_usize;
+		let frame = df!(
+			"x" => (0..rows).map(|row| row as f64).collect::<Vec<_>>(),
+			"y" => (0..rows).map(|row| (row % 997) as f64).collect::<Vec<_>>()
+		)
+		.expect("seven-million-point scatter frame");
+		let (spec, _) = resolved_scatter(
+			frame.clone(),
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x", "y"),
+			&ColorIdentity::default(),
+		);
+		let kernel: Arc<dyn PlotKernel + Send + Sync> = Arc::new(ScatterPlotKernel::new(Arc::new(
+			prepare_scatter_data_resolved(&frame, &spec, 200, 200),
+		)));
+		let model = crate::plot::theme::PlotSettings::default();
+		let coordinator = crate::plot::raster::RasterCoordinator::new();
+		settle_interactive_raster(&kernel, &model, &coordinator, 200.0);
+
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 200.0));
+		let stamp = ViewportStamp::mint();
+		let mut canvas_state = PlotCanvasState::default();
+		let settled_widget = PlotWidget::new(
+			kernel.as_ref(),
+			String::new(),
+			0.0,
+			model.clone(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_viewport_state(stamp, ViewportMotion::Settled);
+		let geometry = (1..20)
+			.flat_map(|x| (1..20).map(move |y| Point::new(x as f32 * 10.0, y as f32 * 10.0)))
+			.find_map(|point| settled_widget.viewport_geometry(bounds, Cursor::Available(point)))
+			.expect("seven-million-point plot retains an inner gesture rectangle");
+		let press_point = Point::new(
+			geometry.plot_area.x() + geometry.plot_area.width() / 2.0,
+			geometry.plot_area.y() + geometry.plot_area.height() / 2.0,
+		);
+		let move_point = Point::new(press_point.x + 5.0, press_point.y + 5.0);
+		let started = Program::update(
+			&settled_widget,
+			&mut canvas_state,
+			&Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+			bounds,
+			Cursor::Available(press_point),
+		)
+		.expect("real press starts the seven-million-point drag")
+		.into_inner()
+		.0;
+		assert!(
+			matches!(started, Some(PlotMessage::ViewportStarted(next)) if next == stamp.next())
+		);
+
+		let active = stamp.next();
+		let moving_widget = PlotWidget::new(
+			kernel.as_ref(),
+			String::new(),
+			0.0,
+			model.clone(),
+			1,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_viewport_state(active, ViewportMotion::Moving);
+		let changed = Program::update(
+			&moving_widget,
+			&mut canvas_state,
+			&Event::Mouse(iced::mouse::Event::CursorMoved {
+				position: move_point,
+			}),
+			bounds,
+			Cursor::Available(move_point),
+		)
+		.expect("real move changes the seven-million-point viewport")
+		.into_inner()
+		.0;
+		let Some(PlotMessage::ViewportChanged {
+			stamp: changed_stamp,
+			domains,
+			quiet_settle: false,
+		}) = changed
+		else {
+			panic!("drag move publishes its pane domains")
+		};
+		let mut moved = model.clone();
+		moved.pane_override.domains = crate::plot::spec::Override::Set(domains);
+		let moving_builds = builds_during(|| {
+			let frame =
+				render_interactive_frame(&kernel, &moved, ViewportMotion::Moving, &coordinator);
+			assert_eq!(
+				frame.placements.len(),
+				1,
+				"motion places the last exact bitmap"
+			);
+		});
+		assert_eq!(moving_builds, 0, "moving draw performs no raster scan");
+		let released = PlotWidget::new(
+			kernel.as_ref(),
+			String::new(),
+			0.0,
+			moved.clone(),
+			2,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_viewport_state(changed_stamp, ViewportMotion::Moving);
+		let settled = Program::update(
+			&released,
+			&mut canvas_state,
+			&Event::Mouse(iced::mouse::Event::ButtonReleased(
+				iced::mouse::Button::Left,
+			)),
+			bounds,
+			Cursor::Available(move_point),
+		)
+		.expect("real release settles the seven-million-point drag")
+		.into_inner()
+		.0;
+		assert!(
+			matches!(settled, Some(PlotMessage::ViewportSettled(value)) if value == changed_stamp)
+		);
+
+		let widget = PlotWidget::new(
+			kernel.as_ref(),
+			String::new(),
+			0.0,
+			moved,
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
+		let wants =
+			widget.raster_wants(Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 200.0)));
+		let settle_builds = builds_during(|| {
+			let job = coordinator
+				.request(wants.clone())
+				.expect("settle mints one exact request");
+			let update = coordinator.complete(crate::plot::raster::run_raster_job_sync(job));
+			assert!(update.published && update.next_job.is_none());
+		});
+		assert_eq!(settle_builds, 1);
+		assert!(
+			coordinator.request(wants).is_none(),
+			"settled identity publishes once"
 		);
 	}
 

@@ -1,4 +1,4 @@
-use crate::plot::common::{PlotKernel, ResolvedPlotSettings};
+use crate::plot::common::{PlotKernel, ResolvedPlotSettings, ViewportMotion, ViewportStamp};
 use crate::plot::core::PlotType;
 use crate::plot::spec::Override;
 use crate::plot::theme::{PlotSettings, PlotSettingsLayer, PlotThemeSpec};
@@ -14,9 +14,30 @@ pub enum PlotPaneMsg {
 	RasterCompleted(crate::plot::raster::RasterCompletion),
 	ToggleSettingsInspector,
 	SettingChanged(SettingKey, String),
-	SettingSubmitted(SettingKey),
+	SettingSubmitted(SettingKey, Option<String>),
 	SettingReset(SettingKey),
 	CancelSettingPreview,
+	ViewportStarted(ViewportStamp),
+	ViewportChanged {
+		stamp: ViewportStamp,
+		domains: crate::plot::theme::PlotDomainOverrides,
+		quiet_settle: bool,
+	},
+	ViewportReset(ViewportStamp),
+	ViewportSettled(ViewportStamp),
+}
+
+impl PlotPaneMsg {
+	pub(crate) fn quiet_settle_stamp(&self) -> Option<ViewportStamp> {
+		match self {
+			Self::ViewportChanged {
+				stamp,
+				quiet_settle: true,
+				..
+			} => Some(*stamp),
+			_ => None,
+		}
+	}
 }
 
 fn default_application_plot_settings() -> PlotSettingsLayer {
@@ -47,6 +68,8 @@ pub struct HostPlotState {
 	pub render_revision: u64,
 	pub resize_render_suspended: bool,
 	pub raster_coordinator: crate::plot::raster::RasterCoordinator,
+	pub viewport_motion: ViewportMotion,
+	pub viewport_stamp: ViewportStamp,
 	pub(crate) settings_inspector_open: bool,
 	pub(crate) source_attachment: Option<PlotSourceAttachment>,
 	pub(crate) plot_type: Option<PlotType>,
@@ -97,6 +120,8 @@ impl HostPlotState {
 			render_revision: 0,
 			resize_render_suspended: false,
 			raster_coordinator: crate::plot::raster::RasterCoordinator::new(),
+			viewport_motion: ViewportMotion::Settled,
+			viewport_stamp: ViewportStamp::mint(),
 			settings_inspector_open: false,
 			source_attachment: None,
 			plot_type: None,
@@ -130,6 +155,8 @@ impl HostPlotState {
 		self.display_label = display_label;
 		self.kernel = kernel;
 		self.raster_coordinator.invalidate();
+		self.viewport_stamp = self.viewport_stamp.next();
+		self.viewport_motion = ViewportMotion::Settled;
 		self.plot_settings_model =
 			host_plot_settings_model(default_application_plot_settings(), authored_settings);
 		self.plot_settings = self.plot_settings_model.resolve();
@@ -161,6 +188,8 @@ impl HostPlotState {
 		self.display_label = display_label;
 		self.kernel = kernel;
 		self.raster_coordinator.invalidate();
+		self.viewport_stamp = self.viewport_stamp.next();
+		self.viewport_motion = ViewportMotion::Settled;
 		self.plot_settings_model =
 			host_plot_settings_model(default_application_plot_settings(), authored_settings);
 		self.plot_settings = self.plot_settings_model.resolve();
@@ -179,6 +208,8 @@ impl HostPlotState {
 		self.display_label = authoritative.display_label;
 		self.kernel = authoritative.kernel;
 		self.raster_coordinator.invalidate();
+		self.viewport_stamp = self.viewport_stamp.next();
+		self.viewport_motion = ViewportMotion::Settled;
 		self.plot_settings = authoritative.plot_settings;
 		self.plot_settings_model = authoritative.plot_settings_model;
 		self.source_attachment = authoritative.source_attachment;
@@ -204,6 +235,15 @@ impl HostPlotState {
 			self.writeback_status = None;
 			return false;
 		}
+		// PRODUCT-0150 §10: the preview's viewport is ephemeral too. Promotion
+		// acknowledges the candidate source, not any pane-only navigation that
+		// happened while inspecting it.
+		self.viewport_stamp = self.viewport_stamp.next();
+		self.viewport_motion = ViewportMotion::Settled;
+		self.plot_settings_model.pane_override.domains = Override::Inherit;
+		self.plot_settings = self.plot_settings_model.resolve();
+		self.hovered_info = None;
+		self.render_revision = self.render_revision.wrapping_add(1);
 		self.setting_drafts.clear();
 		self.writeback_status = None;
 		true
@@ -242,7 +282,7 @@ impl HostPlotState {
 				self.setting_drafts.insert(key, value);
 				self.writeback_status = Some("previewing…".to_owned());
 			}
-			PlotPaneMsg::SettingSubmitted(_) => {
+			PlotPaneMsg::SettingSubmitted(..) => {
 				self.writeback_status = Some("committing…".to_owned());
 			}
 			PlotPaneMsg::SettingReset(key) => {
@@ -252,7 +292,244 @@ impl HostPlotState {
 			PlotPaneMsg::CancelSettingPreview => {
 				self.writeback_status = None;
 			}
+			PlotPaneMsg::ViewportStarted(stamp) => {
+				if stamp == self.viewport_stamp.next() {
+					self.viewport_stamp = stamp;
+					self.viewport_motion = ViewportMotion::Moving;
+					self.hovered_info = None;
+					self.render_revision = self.render_revision.wrapping_add(1);
+				}
+			}
+			PlotPaneMsg::ViewportChanged { stamp, domains, .. } => {
+				if stamp == self.viewport_stamp.next() {
+					self.viewport_stamp = stamp;
+					self.plot_settings_model.pane_override.domains = Override::Set(domains);
+					self.plot_settings = self.plot_settings_model.resolve();
+					self.viewport_motion = ViewportMotion::Moving;
+					self.hovered_info = None;
+					self.render_revision = self.render_revision.wrapping_add(1);
+				}
+			}
+			PlotPaneMsg::ViewportReset(stamp) => {
+				if stamp == self.viewport_stamp.next() {
+					self.plot_settings_model.pane_override.domains = Override::Inherit;
+					self.plot_settings = self.plot_settings_model.resolve();
+					self.viewport_stamp = stamp.next();
+					self.viewport_motion = ViewportMotion::Settled;
+					self.hovered_info = None;
+					self.render_revision = self.render_revision.wrapping_add(1);
+				}
+			}
+			PlotPaneMsg::ViewportSettled(stamp) => {
+				if stamp == self.viewport_stamp {
+					self.viewport_stamp = stamp.next();
+					self.viewport_motion = ViewportMotion::Settled;
+					self.render_revision = self.render_revision.wrapping_add(1);
+				}
+			}
 		}
 		None
+	}
+}
+
+#[cfg(test)]
+mod product_0150_state_tests {
+	use super::*;
+	use crate::plot::common::{AxisType, CoordinateTransformer, PlotBackend, PlotHit, PlotLayout};
+	use iced::Rectangle;
+	use iced::advanced::mouse::Cursor;
+
+	struct Kernel;
+
+	impl PlotKernel for Kernel {
+		fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
+			PlotLayout::Cartesian {
+				x_range: (
+					settings.x_min.unwrap_or(0.0),
+					settings.x_max.unwrap_or(10.0),
+				),
+				y_range: (
+					settings.y_min.unwrap_or(0.0),
+					settings.y_max.unwrap_or(20.0),
+				),
+				x_axis_type: AxisType::Linear,
+				y_axis_type: AxisType::Linear,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
+			}
+		}
+
+		fn plot(
+			&self,
+			_backend: &mut dyn PlotBackend,
+			_bounds: Rectangle,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+			_settings: ResolvedPlotSettings,
+		) {
+		}
+
+		fn hit(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<PlotHit> {
+			None
+		}
+	}
+
+	fn state() -> HostPlotState {
+		HostPlotState::new(
+			"probe".to_owned(),
+			Arc::new(Kernel),
+			PlotSettingsLayer::default(),
+		)
+	}
+
+	#[test]
+	fn product_0150_matching_settle_consumes_generation_while_stale_settle_is_inert() {
+		let mut state = state();
+		let initial = state.viewport_stamp;
+		let active = initial.next();
+		state.update(PlotPaneMsg::ViewportStarted(active));
+		assert_eq!(state.viewport_stamp, active);
+		assert_eq!(state.viewport_motion, ViewportMotion::Moving);
+
+		state.update(PlotPaneMsg::ViewportSettled(initial));
+		assert_eq!(
+			state.viewport_stamp, active,
+			"stale settle advances nothing"
+		);
+		assert_eq!(state.viewport_motion, ViewportMotion::Moving);
+
+		state.update(PlotPaneMsg::ViewportSettled(active));
+		assert_eq!(state.viewport_stamp, active.next());
+		assert_eq!(state.viewport_motion, ViewportMotion::Settled);
+	}
+
+	#[test]
+	fn product_0150_wheel_quiet_settle_is_newest_wins_and_press_invalidates_it() {
+		let mut state = state();
+		let first = state.viewport_stamp.next();
+		state.update(PlotPaneMsg::ViewportChanged {
+			stamp: first,
+			domains: crate::plot::theme::PlotDomainOverrides {
+				x_min: Some(1.0),
+				x_max: Some(9.0),
+				y_min: Some(2.0),
+				y_max: Some(18.0),
+			},
+			quiet_settle: true,
+		});
+		let second = first.next();
+		state.update(PlotPaneMsg::ViewportChanged {
+			stamp: second,
+			domains: crate::plot::theme::PlotDomainOverrides {
+				x_min: Some(2.0),
+				x_max: Some(8.0),
+				y_min: Some(4.0),
+				y_max: Some(16.0),
+			},
+			quiet_settle: true,
+		});
+		state.update(PlotPaneMsg::ViewportSettled(first));
+		assert_eq!(state.viewport_stamp, second);
+		assert_eq!(state.viewport_motion, ViewportMotion::Moving);
+
+		let pressed = second.next();
+		state.update(PlotPaneMsg::ViewportStarted(pressed));
+		state.update(PlotPaneMsg::ViewportSettled(second));
+		assert_eq!(state.viewport_stamp, pressed);
+		assert_eq!(state.viewport_motion, ViewportMotion::Moving);
+
+		state.update(PlotPaneMsg::ViewportSettled(pressed));
+		assert_eq!(state.viewport_stamp, pressed.next());
+		assert_eq!(state.viewport_motion, ViewportMotion::Settled);
+	}
+
+	#[test]
+	fn product_0150_only_the_newest_of_many_wheel_settles_is_consumed() {
+		let mut state = state();
+		let mut timers = Vec::new();
+		for index in 0..8 {
+			let stamp = state.viewport_stamp.next();
+			state.update(PlotPaneMsg::ViewportChanged {
+				stamp,
+				domains: crate::plot::theme::PlotDomainOverrides {
+					x_min: Some(index as f64),
+					x_max: Some(index as f64 + 10.0),
+					y_min: Some(0.0),
+					y_max: Some(20.0),
+				},
+				quiet_settle: true,
+			});
+			timers.push(stamp);
+		}
+		let newest = *timers.last().expect("wheel timer");
+		let revision_before_settles = state.render_revision;
+		for stale in &timers[..timers.len() - 1] {
+			state.update(PlotPaneMsg::ViewportSettled(*stale));
+		}
+		assert_eq!(state.viewport_stamp, newest);
+		assert_eq!(state.render_revision, revision_before_settles);
+		state.update(PlotPaneMsg::ViewportSettled(newest));
+		assert_eq!(state.viewport_stamp, newest.next());
+		assert_eq!(state.viewport_motion, ViewportMotion::Settled);
+		assert_eq!(state.render_revision, revision_before_settles + 1);
+		state.update(PlotPaneMsg::ViewportSettled(newest));
+		assert_eq!(
+			state.render_revision,
+			revision_before_settles + 1,
+			"even the newest quiet timer is consumed only once"
+		);
+	}
+
+	#[test]
+	fn product_0150_viewport_mutates_only_the_pane_tier_and_replacement_resets_it() {
+		let mut state = state();
+		let before = state.plot_settings_model.clone();
+		let stamp = state.viewport_stamp.next();
+		state.update(PlotPaneMsg::ViewportChanged {
+			stamp,
+			domains: crate::plot::theme::PlotDomainOverrides {
+				x_min: Some(2.0),
+				x_max: Some(8.0),
+				y_min: Some(4.0),
+				y_max: Some(16.0),
+			},
+			quiet_settle: false,
+		});
+		assert_eq!(
+			state.plot_settings_model.library_defaults.x_min,
+			before.library_defaults.x_min
+		);
+		assert_eq!(
+			state.plot_settings_model.library_defaults.y_max,
+			before.library_defaults.y_max
+		);
+		assert_eq!(
+			state.plot_settings_model.application_theme,
+			before.application_theme
+		);
+		assert_eq!(
+			state.plot_settings_model.authored_spec,
+			before.authored_spec
+		);
+		assert_eq!(state.plot_settings_model.layer, before.layer);
+		assert!(matches!(
+			state.plot_settings_model.pane_override.domains,
+			Override::Set(_)
+		));
+
+		let stale = state.viewport_stamp;
+		state.replace(
+			"replacement".to_owned(),
+			Arc::new(Kernel),
+			PlotSettingsLayer::default(),
+		);
+		assert_eq!(state.viewport_motion, ViewportMotion::Settled);
+		assert!(matches!(
+			state.plot_settings_model.pane_override.domains,
+			Override::Inherit
+		));
+		let after_replace = state.viewport_stamp;
+		state.update(PlotPaneMsg::ViewportSettled(stale));
+		assert_eq!(state.viewport_stamp, after_replace);
 	}
 }

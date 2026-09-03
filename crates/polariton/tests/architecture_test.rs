@@ -3565,11 +3565,6 @@ fn product_0096_funnel_has_one_exact_numeric_authority_and_no_legacy_fallbacks()
 #[test]
 fn product_0097_widget_hit_geometry_has_closed_typed_trust_boundaries() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-	let production = rust_files(&root)
-		.into_iter()
-		.map(|path| std::fs::read_to_string(path).expect("read production source"))
-		.collect::<Vec<_>>()
-		.join("\n");
 	let coordinate =
 		std::fs::read_to_string(root.join("coordinate.rs")).expect("read coordinate vocabulary");
 	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
@@ -3592,9 +3587,38 @@ fn product_0097_widget_hit_geometry_has_closed_typed_trust_boundaries() {
 	assert_eq!(funnel.matches("widget_hit_geometry").count(), 1);
 	assert_eq!(radial.matches("widget_hit_geometry").count(), 1);
 	assert_eq!(pie.matches("widget_hit_geometry").count(), 1);
-	assert_eq!(production.matches("from_plot_kernel_cursor").count(), 4);
-	assert_eq!(production.matches("from_transformer_bounds").count(), 2);
-	assert_eq!(production.matches("widget_hit_geometry").count(), 4);
+	// Count the four admitted production consumers in their owning files. A
+	// workspace-wide textual count would also count behavioral fixtures embedded
+	// beside production code and would turn new typed-geometry coverage into a
+	// false architecture widening.
+	assert_eq!(
+		coordinate.matches("from_plot_kernel_cursor").count()
+			+ funnel.matches("from_plot_kernel_cursor").count()
+			+ radial.matches("from_plot_kernel_cursor").count()
+			+ pie.matches("from_plot_kernel_cursor").count(),
+		4
+	);
+	assert_eq!(
+		coordinate.matches("from_transformer_bounds").count()
+			+ common
+				.split("#[cfg(test)]")
+				.next()
+				.expect("production common prefix")
+				.matches("from_transformer_bounds")
+				.count(),
+		2
+	);
+	assert_eq!(
+		common
+			.split("#[cfg(test)]")
+			.next()
+			.expect("production common prefix")
+			.matches("widget_hit_geometry")
+			.count() + funnel.matches("widget_hit_geometry").count()
+			+ radial.matches("widget_hit_geometry").count()
+			+ pie.matches("widget_hit_geometry").count(),
+		4
+	);
 	assert!(!coordinate.contains("fn from_iced("));
 
 	assert!(!grid.contains("Pt::<Cell>::from_widget"));
@@ -4700,7 +4724,7 @@ fn product_0114_band_requirements_precede_and_feed_shared_geometry() {
 	for entrypoint in [
 		"fn render_plot_layer_in_widget",
 		"fn render_overlay_layer_in_widget",
-		"Event::Mouse(iced::mouse::Event::CursorMoved",
+		"let widget_bounds = Rect::<Widget>::from_iced_frame(bounds);",
 	] {
 		let section = common
 			.split(entrypoint)
@@ -4764,13 +4788,14 @@ fn product_0114_band_requirements_precede_and_feed_shared_geometry() {
 	// The per-cell plot rectangle — the raster's width and height — is cell
 	// geometry too, and is resolved once per cell in each entry point's loop.
 	// PRODUCT-0149 adds the interactive request and draw traversals to the three
-	// exact/overlay/hit traversals banked here.
+	// exact/overlay/hit traversals banked here; PRODUCT-0150 adds the gesture
+	// viewport-geometry traversal that selects the cell under the pointer.
 	assert_eq!(
 		composite
 			.matches("cell.kernel.resolve_settings(settings)")
 			.count(),
-		5,
-		"all five grid entry points resolve the cell's plot area through its own kernel"
+		6,
+		"all six grid entry points resolve the cell's plot area through its own kernel"
 	);
 	assert!(
 		!composite.contains("grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &resolved)"),
@@ -5016,7 +5041,7 @@ fn product_0127_formatted_requirements_carry_selected_pre_layout_ticks() {
 	for entrypoint in [
 		"fn render_plot_layer_in_widget",
 		"fn render_overlay_layer_in_widget",
-		"Event::Mouse(iced::mouse::Event::CursorMoved",
+		"let widget_bounds = Rect::<Widget>::from_iced_frame(bounds);",
 	] {
 		let section = common
 			.split(entrypoint)
@@ -5968,4 +5993,83 @@ fn product_0149_coordinators_own_identity_admission_and_exact_export_boundaries(
 		blocking < rendering,
 		"rendering itself belongs inside the blocking task"
 	);
+}
+
+#[test]
+fn product_0150_viewport_identity_motion_and_composite_policy_are_production_wired() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let grid = std::fs::read_to_string(root.join("plot/grid.rs")).expect("read plot grid");
+	let host =
+		std::fs::read_to_string(root.join("gui/plot_pane/state.rs")).expect("read host state");
+	let view = std::fs::read_to_string(root.join("gui/plot_pane/view.rs")).expect("read host view");
+	let editor = std::fs::read_to_string(root.join("editor.rs")).expect("read editor");
+
+	assert!(common.contains("ViewportMotion::Moving"));
+	assert!(common.contains("let started = chain_stamp.next()"));
+	assert!(common.contains("PlotMessage::ViewportStarted(started)"));
+	assert!(common.contains("PlotMessage::ViewportChanged"));
+	assert!(common.contains("PlotMessage::ViewportSettled(drag.stamp)"));
+	assert!(common.contains("viewport_local_stamp: Option<ViewportStamp>"));
+	assert!(common.contains("let chain_stamp = state.sync_viewport_chain(stamp)"));
+	assert!(common.contains("let next = drag.stamp.next()"));
+	assert!(common.contains("if self.viewport_motion == ViewportMotion::Moving"));
+	assert!(common.contains("const VIEWPORT_ZOOM_FACTOR: f64 = 1.1"));
+	assert!(common.contains("const VIEWPORT_RELATIVE_FLOOR: f64 = 1.0 / 1_073_741_824.0"));
+	assert!(common.contains("const VIEWPORT_ABSOLUTE_ULPS: f64 = 1024.0"));
+	assert!(host.contains("pub viewport_stamp: ViewportStamp"));
+	assert!(host.contains("if stamp == self.viewport_stamp"));
+	assert!(view.matches("with_viewport_state").count() >= 2);
+	assert!(editor.contains(
+		"const VIEWPORT_QUIET_SETTLE: std::time::Duration = std::time::Duration::from_millis(150)"
+	));
+	assert_eq!(editor.matches("sleep(VIEWPORT_QUIET_SETTLE)").count(), 2);
+	assert!(editor.contains("settings_model: crate::plot::theme::PlotSettings"));
+	assert!(editor.contains("self.send(EditorCommand::FocusPane(pane_id))"));
+
+	let interactive = grid
+		.split("fn render_plot_layer_interactive(")
+		.nth(1)
+		.and_then(|rest| rest.split("fn render_overlay_layer(").next())
+		.expect("interactive composite branch");
+	assert!(interactive.contains("cell.kernel.prepare_viewport(&transform, motion)"));
+	assert!(interactive.contains("RasterReusePolicy::Refused"));
+	let overlay = grid
+		.split("fn render_overlay_layer(")
+		.nth(1)
+		.and_then(|rest| rest.split("fn hit(").next())
+		.expect("composite overlay branch");
+	assert!(overlay.contains("cell.kernel.prepare_viewport(&transform, motion)"));
+}
+
+#[test]
+fn product_0150_gestures_only_author_the_pane_tier_and_thresholds_remain_unpriced() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let host =
+		std::fs::read_to_string(root.join("gui/plot_pane/state.rs")).expect("read host state");
+	let scatter =
+		std::fs::read_to_string(root.join("plot/kernels/scatter.rs")).expect("read scatter");
+	let view = std::fs::read_to_string(root.join("gui/plot_pane/view.rs")).expect("read plot view");
+	let gui = std::fs::read_to_string(root.join("gui/state.rs")).expect("read gui state");
+
+	let gesture = common
+		.split("if let Some(stamp) = self.viewport_stamp")
+		.nth(1)
+		.and_then(|rest| rest.split("match event {").nth(1))
+		.and_then(|rest| rest.split("match event {").next())
+		.expect("viewport gesture update region");
+	assert!(!gesture.contains("PlotWritebackGesture"));
+	assert!(!gesture.contains("plan_writeback"));
+	assert!(host.contains("plot_settings_model.pane_override.domains = Override::Set(domains)"));
+	assert!(host.contains("plot_settings_model.pane_override.domains = Override::Inherit"));
+	assert!(view.contains("ProvenanceTier::PaneOverride"));
+	assert!(view.contains("SettingKey::XAxisBounds"));
+	assert!(view.contains("SettingKey::YAxisBounds"));
+	assert!(gui.contains("validated_displayed_pane_value(&context.settings, key, &displayed)"));
+	assert!(gui.contains("ProvenanceTier::PaneOverride"));
+	assert!(common.contains("scatter_max_vector_points: 50_000"));
+	assert!(common.contains("scatter_downsample_target: 200_000"));
+	assert!(scatter.contains("pixel_budget.saturating_mul(8)"));
+	assert!(scatter.contains("fn resolve_render_mode("));
 }

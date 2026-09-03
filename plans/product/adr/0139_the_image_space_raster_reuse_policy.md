@@ -378,16 +378,19 @@ a figure. **Facet reuse waits for PRODUCT-0133 stages 3–4 to make the multi-ce
 preview observable**, and the judgement is then made against the thing itself
 rather than against a description of it.
 
-Until then **motion is not forwarded through the composite.** The exclusion is
-enforced by construction rather than by policy: the composite calls
-`plot_with_settings`, never `plot_with_motion`, so every facet cell is `Settled`
-whatever the frame was told — and a gate asserts exactly that, with an unfaceted
-plot reusing under the same motion as its discriminating control.
+**Amended by PRODUCT-0150 at gesture implementation.** Motion now must reach
+every composite cell so viewport-dependent preparation does not run per moving
+frame. The exclusion is therefore enforced by an explicit interactive reuse
+policy: lone plots receive `Placed`, while facet cells receive `Refused` and
+draw only an exact-key bitmap or nothing. The old by-construction assertion
+became false at the point the gesture made motion real and is re-derived by the
+same test against the interactive path, with the unfaceted placed preview as
+its discriminating control.
 
-The plumbing, when it is wanted, is small and already scoped: forward motion in
-the composite's two cell-draw branches, and extend the architecture guard to
-require it in both, since two hand-rolled branches that must agree are the same
-divergence risk the entry-point guard already covers.
+Admitting facet placement remains the same later judgement: change `Refused`
+only through an attributed amendment after observing the multi-cell preview.
+The architecture guard now requires motion in both hand-rolled composite
+branches, because preparation and overlay must agree on the moving frame.
 
 ### 8. PRODUCT-0138's withdrawal is not disturbed, and D7 stays out of scope
 
