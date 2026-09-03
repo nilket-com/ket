@@ -42,6 +42,8 @@ mod rune_view;
 #[cfg(feature = "toron")]
 #[path = "../src/rune_view_compiler.rs"]
 mod rune_view_compiler;
+#[path = "../src/selection.rs"]
+mod selection;
 #[cfg(feature = "toron")]
 #[path = "../src/session_persistence.rs"]
 mod session_persistence;
@@ -588,6 +590,8 @@ fn product_0068_bar_fixture() -> (BarPlotKernel, PlotSettings) {
 			x_label: String::new(),
 			y_label: String::new(),
 			group_provenance: LegendProvenance::Named,
+			click_selectable: false,
+			selection_candidates: Vec::new(),
 		}),
 		orientation: Orientation::Vertical,
 		layer_settings: LayerSettings::default(),
@@ -693,6 +697,8 @@ fn product_rotation_fixture(
 		x_label: String::new(),
 		y_label: String::new(),
 		group_provenance: LegendProvenance::Named,
+		click_selectable: false,
+		selection_candidates: Vec::new(),
 	});
 	kernel.group_colors.truncate(1);
 	let mut resolved = ResolvedPlotSettings {
@@ -741,6 +747,8 @@ fn product_0127_selected_tick_fixture() -> (BarPlotKernel, PlotSettings) {
 		x_label: String::new(),
 		y_label: "Revenue".to_owned(),
 		group_provenance: LegendProvenance::Named,
+		click_selectable: false,
+		selection_candidates: Vec::new(),
 	});
 	kernel.group_colors.truncate(1);
 	let resolved = ResolvedPlotSettings {
@@ -1107,6 +1115,7 @@ fn product_0068_scatter_fixture(color: Color) -> ScatterPlotKernel {
 			color_t: 0.0,
 			resolved_color: Some(color),
 			provenance: LegendProvenance::Named,
+			selection_candidates: vec![None],
 		}],
 		x_categories: None,
 		x_range: (0.0, 1.0),
@@ -1363,6 +1372,7 @@ fn product_0080_histogram_fixture(
 			y_axis_type: AxisType::Linear,
 			x_label: String::new(),
 			y_label: String::new(),
+			selection_candidates: Vec::new(),
 		}),
 	};
 	let mut resolved = product_0068_cartesian_settings().resolve();

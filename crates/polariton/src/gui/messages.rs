@@ -99,6 +99,7 @@ pub enum Message {
 	DragWindow,
 	Export(ExportFormat),
 	ExportDone(usize, ExportFormat),
+	ExportFailed(String),
 	MaximizeWindow,
 	Menu(menu::MenuMessage),
 	MinimizeWindow,
@@ -182,6 +183,7 @@ pub enum Message {
 		continuation: RuneCategoricalContinuation,
 		resolved: ResolvedPlot,
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		recipe: crate::plot::recipe::PlotRecipe,
 	},
 	#[cfg(feature = "toron")]
 	RuneRelationLayeredPlotReady {
@@ -192,6 +194,7 @@ pub enum Message {
 		authored_settings: PlotSettingsLayer,
 		span: std::ops::Range<u32>,
 		result: std::result::Result<Arc<dyn PlotKernel + Send + Sync>, String>,
+		recipe: crate::plot::recipe::PlotRecipe,
 	},
 	#[cfg(feature = "toron")]
 	SettingsCandidateCompiled {

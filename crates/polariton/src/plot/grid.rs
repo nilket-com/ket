@@ -13,7 +13,9 @@ use crate::plot::common::{
 	PlotComposite, PlotKernel, PlotLayout, PlotWidget, ResolvedPlotSettings, VerticalGuideBands,
 	ViewportGeometry, resolve_canvas_text, union_temporal_axis_domains,
 };
-use crate::plot::factory::{create_plot, create_styled_plot};
+use crate::plot::factory::{
+	create_plot, create_plot_from_artifact, create_styled_plot, create_styled_plot_from_artifact,
+};
 #[cfg(test)]
 use crate::plot::spec::ResolvedPresence;
 use crate::plot::spec::{
@@ -406,6 +408,7 @@ fn any_value_label(value: AnyValue<'_>) -> Option<String> {
 struct PreparedGridCell {
 	cell: GridCell,
 	kernel: Arc<dyn PlotKernel + Send + Sync>,
+	partition_candidate: Option<(crate::selection::FieldRef, crate::selection::ExactScalar)>,
 }
 
 #[derive(Clone, Copy)]
@@ -493,6 +496,25 @@ impl PlotGridKernel {
 		.expect("plain plot grid kernels are infallible")
 	}
 
+	/// PRODUCT-0151 §4: facet cells are projections of one publication. Every
+	/// child kernel inherits its token instead of minting a fictitious source.
+	pub fn from_grid_with_figure_grid_from_artifact(
+		grid: PlotGrid,
+		figure_grid: FigureGridLayoutSettings,
+		source: &crate::result_artifact::ResultArtifact,
+		width: u32,
+		height: u32,
+	) -> Self {
+		Self::from_grid_with_factory_and_figure_grid(
+			grid,
+			figure_grid,
+			width,
+			height,
+			|spec, data| Ok(create_plot_from_artifact(spec, data, source, width, height)),
+		)
+		.expect("artifact-backed plot grid kernels are infallible after planning")
+	}
+
 	pub fn from_grid_with_factory(
 		grid: PlotGrid,
 		_width: u32,
@@ -525,7 +547,24 @@ impl PlotGridKernel {
 		let (first, rest) = grid.cells.into_parts();
 		let mut prepare = |cell: GridCell| -> Result<PreparedGridCell, String> {
 			let kernel = factory(&cell.body, &cell.data)?;
-			Ok(PreparedGridCell { kernel, cell })
+			let partition_candidate = partition_field.as_ref().and_then(|field| {
+				let column = cell.data.column(field).ok()?;
+				let scalar_type = crate::selection::ScalarType::from_dtype(column.dtype())?;
+				let semantic_type = crate::selection::semantic_type_for_dtype(column.dtype())?;
+				let value = crate::selection::exact_column_values(column)?
+					.into_iter()
+					.next()
+					.flatten()?;
+				Some((
+					crate::selection::FieldRef::new(field, semantic_type, scalar_type),
+					value,
+				))
+			});
+			Ok(PreparedGridCell {
+				kernel,
+				cell,
+				partition_candidate,
+			})
 		};
 		let mut cells = NonEmpty::new(prepare(first)?);
 		for cell in rest {
@@ -567,6 +606,25 @@ impl PlotGridKernel {
 			width,
 			height,
 			|spec, data| create_styled_plot(spec, data, layer_settings.clone()),
+		)
+	}
+
+	pub fn from_styled_grid_with_figure_grid_from_artifact(
+		grid: PlotGrid,
+		figure_grid: FigureGridLayoutSettings,
+		layer_settings: LayerSettings,
+		source: &crate::result_artifact::ResultArtifact,
+		width: u32,
+		height: u32,
+	) -> Result<Self, String> {
+		Self::from_grid_with_factory_and_figure_grid(
+			grid,
+			figure_grid,
+			width,
+			height,
+			|spec, data| {
+				create_styled_plot_from_artifact(spec, data, source, layer_settings.clone())
+			},
 		)
 	}
 
@@ -703,6 +761,247 @@ impl PlotComposite for PlotGridKernel {
 			return ViewportGeometry::from_layout(inner, layout, &prepared_layouts[index].1);
 		}
 		None
+	}
+
+	fn selection_geometry(
+		&self,
+		bounds: Rect<Widget>,
+		padding: f32,
+		title: &str,
+		cursor: Pt<Widget>,
+		settings: &PlotSettings,
+	) -> Option<crate::plot::common::SelectionGeometry> {
+		if self.cells.len() == 1 {
+			let cell = self.cells.first();
+			let helper = PlotWidget::new(
+				cell.kernel.as_ref(),
+				title.to_owned(),
+				padding,
+				settings.clone(),
+				0,
+				false,
+				crate::plot::common::PlotRenderLayer::Full,
+			);
+			let geometry = helper
+				.selection_geometry(bounds.into_iced(), Cursor::Available(cursor.into_iced()))?;
+			return Some(crate::plot::common::SelectionGeometry {
+				facet_constraint: cell.partition_candidate.clone(),
+				..geometry
+			});
+		}
+
+		let resolved = settings.resolve();
+		let reservation = crate::plot::legend::union(
+			self.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_reservation_content(&resolved)),
+		);
+		let legend = crate::plot::legend::legend_layout(bounds, reservation.as_ref(), &resolved);
+		let outer = grid_outer_area(legend.content_bounds, padding);
+		let layouts = self.cell_layouts(settings);
+		let requirements =
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
+		let tiled = grid_tiled_area_with_requirements(
+			outer,
+			title,
+			&requirements,
+			grid_x_label_visible(self, &resolved),
+			&resolved,
+		);
+		for (index, cell) in self.cells.iter().enumerate() {
+			let (position, layout) = &layouts[index];
+			let cell_bounds = grid_cell_bounds_with_settings(
+				tiled,
+				self.arrangement,
+				*position,
+				self.figure_grid,
+			);
+			let cell_resolved = cell.kernel.resolve_settings(settings);
+			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
+			if inner.contains(cursor) {
+				return Some(crate::plot::common::SelectionGeometry {
+					plot_area: inner,
+					layout: layout.clone(),
+					facet_constraint: cell.partition_candidate.clone(),
+				});
+			}
+		}
+		None
+	}
+
+	fn admits_predicate_at(
+		&self,
+		bounds: Rect<Widget>,
+		padding: f32,
+		title: &str,
+		cursor: Pt<Widget>,
+		settings: &PlotSettings,
+		predicate: &crate::selection::Predicate,
+	) -> bool {
+		let resolved = settings.resolve();
+		let reservation = crate::plot::legend::union(
+			self.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_reservation_content(&resolved)),
+		);
+		let legend = crate::plot::legend::legend_layout(bounds, reservation.as_ref(), &resolved);
+		let outer = grid_outer_area(legend.content_bounds, padding);
+		let layouts = self.cell_layouts(settings);
+		let requirements =
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
+		let tiled = grid_tiled_area_with_requirements(
+			outer,
+			title,
+			&requirements,
+			grid_x_label_visible(self, &resolved),
+			&resolved,
+		);
+		for (index, cell) in self.cells.iter().enumerate() {
+			let (position, layout) = &layouts[index];
+			let cell_bounds = grid_cell_bounds_with_settings(
+				tiled,
+				self.arrangement,
+				*position,
+				self.figure_grid,
+			);
+			let cell_resolved = cell.kernel.resolve_settings(settings);
+			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
+			if !inner.contains(cursor) {
+				continue;
+			}
+			let local_predicate = if let Some((field, value)) = &cell.partition_candidate {
+				if !predicate.accepts_value(&field.name, value) {
+					return false;
+				}
+				predicate.without_field(&field.name)
+			} else {
+				predicate.clone()
+			};
+			let transform =
+				CoordinateTransformer::new(layout, IcedRectangle::new(Point::ORIGIN, inner.size()));
+			let local = Point::new(cursor.x() - inner.x(), cursor.y() - inner.y());
+			return cell
+				.kernel
+				.project_predicate(&local_predicate)
+				.is_some_and(|anchors| {
+					anchors.iter().any(|anchor| {
+						anchor
+							.reproject(&transform)
+							.is_some_and(|shape| shape.contains(local))
+					})
+				});
+		}
+		false
+	}
+
+	fn project_predicate_emphasis(
+		&self,
+		predicate: &crate::selection::Predicate,
+		axis_fields: &crate::selection::SelectionAxisFields,
+	) -> Option<crate::plot::common::CompositeEmphasisProjection> {
+		let mut projected = Vec::new();
+		for (cell_index, cell) in self.cells.iter().enumerate() {
+			let local_predicate = if let Some((field, value)) = &cell.partition_candidate {
+				if !predicate.accepts_value(&field.name, value) {
+					continue;
+				}
+				predicate.without_field(&field.name)
+			} else {
+				predicate.clone()
+			};
+			let Some(anchors) =
+				crate::plot::common::interval_emphasis_anchors(&local_predicate, axis_fields)
+					.or_else(|| cell.kernel.project_predicate(&local_predicate))
+			else {
+				continue;
+			};
+			projected.push(crate::plot::common::CompositeCellEmphasis {
+				cell_index,
+				anchors: anchors.into_iter().map(Arc::from).collect(),
+			});
+		}
+		Some(crate::plot::common::CompositeEmphasisProjection { cells: projected })
+	}
+
+	fn render_projected_emphasis(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rect<Widget>,
+		padding: f32,
+		title: &str,
+		settings: &PlotSettings,
+		projection: &crate::plot::common::CompositeEmphasisProjection,
+	) {
+		let resolved = settings.resolve();
+		let reservation = crate::plot::legend::union(
+			self.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_reservation_content(&resolved)),
+		);
+		let legend = crate::plot::legend::legend_layout(bounds, reservation.as_ref(), &resolved);
+		let outer = grid_outer_area(legend.content_bounds, padding);
+		let layouts = self.cell_layouts(settings);
+		let requirements =
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
+		let tiled = grid_tiled_area_with_requirements(
+			outer,
+			title,
+			&requirements,
+			grid_x_label_visible(self, &resolved),
+			&resolved,
+		);
+		for projected in &projection.cells {
+			let index = projected.cell_index;
+			let Some(cell) = self.cells.iter().nth(index) else {
+				continue;
+			};
+			let (position, layout) = &layouts[index];
+			let cell_bounds = grid_cell_bounds_with_settings(
+				tiled,
+				self.arrangement,
+				*position,
+				self.figure_grid,
+			);
+			let cell_resolved = cell.kernel.resolve_settings(settings);
+			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
+			let transform =
+				CoordinateTransformer::new(layout, IcedRectangle::new(Point::ORIGIN, inner.size()));
+			backend.with_save(&mut |backend| {
+				backend.translate(iced::Vector::new(inner.x(), inner.y()));
+				for anchor in &projected.anchors {
+					let Some(shape) = anchor.reproject(&transform) else {
+						continue;
+					};
+					let stroke = iced::widget::canvas::Stroke {
+						style: iced::widget::canvas::Style::Solid(
+							resolved.chrome.axis_label_text.iced(),
+						),
+						width: 2.0,
+						..Default::default()
+					};
+					match shape {
+						crate::plot::common::EmphasisShape::Rectangle(rectangle) => backend
+							.stroke_path(
+								&|builder| {
+									builder.rectangle(rectangle.position(), rectangle.size())
+								},
+								stroke,
+							),
+						crate::plot::common::EmphasisShape::Circle { center, radius } => {
+							backend.stroke_path(&|builder| builder.circle(center, radius), stroke)
+						}
+						crate::plot::common::EmphasisShape::Segment { start, end } => backend
+							.stroke_path(
+								&|builder| {
+									builder.move_to(start);
+									builder.line_to(end);
+								},
+								stroke,
+							),
+					}
+				}
+			});
+		}
 	}
 
 	fn render_plot_layer(
@@ -1277,12 +1576,19 @@ impl PlotComposite for PlotGridKernel {
 				Cursor::Available(local_cursor),
 				settings,
 			);
-			return hit.map(|hit| match (&self.partition_field, &cell.cell.label) {
-				(Some(field), Some(value)) => hit.with_facet(crate::plot::common::HitFacet {
-					field: field.clone(),
-					value: value.clone(),
-				}),
-				_ => hit,
+			return hit.map(|mut hit| {
+				if let Some((field, value)) = &cell.partition_candidate {
+					if let Some(candidate) = &mut hit.candidate {
+						candidate.constraints.push((field.clone(), value.clone()));
+					}
+				}
+				match (&self.partition_field, &cell.cell.label) {
+					(Some(field), Some(value)) => hit.with_facet(crate::plot::common::HitFacet {
+						field: field.clone(),
+						value: value.clone(),
+					}),
+					_ => hit,
+				}
 			});
 		}
 		None
@@ -2628,6 +2934,117 @@ mod tests {
 		.expect("PRODUCT-0097 grid");
 		PlotGridKernel::from_grid_with_factory(grid, 800, 400, |_spec, data| Ok(factory(data)))
 			.expect("PRODUCT-0097 kernels")
+	}
+
+	struct Product0151Anchor;
+
+	impl crate::plot::common::EmphasisAnchor for Product0151Anchor {
+		fn reproject(
+			&self,
+			_transform: &CoordinateTransformer,
+		) -> Option<crate::plot::common::EmphasisShape> {
+			Some(crate::plot::common::EmphasisShape::Circle {
+				center: Point::new(10.0, 10.0),
+				radius: 3.0,
+			})
+		}
+	}
+
+	struct Product0151ProjectionKernel {
+		scans: Arc<std::sync::atomic::AtomicUsize>,
+	}
+
+	impl PlotKernel for Product0151ProjectionKernel {
+		fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
+			PlotLayout::Cartesian {
+				x_range: (0.0, 1.0),
+				y_range: (0.0, 1.0),
+				x_axis_type: AxisType::Linear,
+				y_axis_type: AxisType::Linear,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
+			}
+		}
+
+		fn plot(
+			&self,
+			_backend: &mut dyn PlotBackend,
+			_bounds: IcedRectangle,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+			_settings: ResolvedPlotSettings,
+		) {
+		}
+
+		fn hit(
+			&self,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+		) -> Option<crate::plot::common::PlotHit> {
+			None
+		}
+
+		fn project_predicate(
+			&self,
+			_predicate: &crate::selection::Predicate,
+		) -> Option<Vec<Box<dyn crate::plot::common::EmphasisAnchor>>> {
+			self.scans
+				.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			Some(vec![Box::new(Product0151Anchor)])
+		}
+	}
+
+	#[test]
+	fn product_0151_facet_projection_scans_once_then_reprojects_without_scanning() {
+		let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let frames = [
+			df!("x" => [0.0_f64], "y" => [0.0_f64]).expect("frame"),
+			df!("x" => [1.0_f64], "y" => [1.0_f64]).expect("frame"),
+		];
+		let kernel = product_0097_grid(frames, |_| {
+			Arc::new(Product0151ProjectionKernel {
+				scans: Arc::clone(&scans),
+			})
+		});
+		let predicate = crate::selection::Predicate {
+			fields: vec![crate::selection::FieldConstraint {
+				field: crate::selection::FieldRef::new(
+					"x",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::selection::ScalarType::Float,
+				),
+				form: crate::selection::ConstraintForm::Values(std::collections::HashSet::from([
+					crate::selection::ExactScalar::Float(0.0),
+				])),
+			}],
+		};
+		let projection = kernel
+			.project_predicate_emphasis(
+				&predicate,
+				&crate::selection::SelectionAxisFields::default(),
+			)
+			.expect("grid admits projection");
+		assert_eq!(scans.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+		let bounds = widget_rect(IcedRectangle::new(
+			Point::ORIGIN,
+			iced::Size::new(800.0, 400.0),
+		));
+		for _ in 0..10 {
+			kernel.render_projected_emphasis(
+				&mut RectangleBackend::default(),
+				bounds,
+				0.0,
+				"",
+				&PlotSettings::default(),
+				&projection,
+			);
+		}
+		assert_eq!(
+			scans.load(std::sync::atomic::Ordering::Relaxed),
+			2,
+			"ten overlay frames reproject retained anchors without rescanning either cell"
+		);
 	}
 
 	fn product_0097_inner(
@@ -4275,6 +4692,7 @@ mod tests {
 			category_colors: None,
 			x_label: "category".to_owned(),
 			y_label: "value".to_owned(),
+			selection_candidates: Default::default(),
 		};
 		let mut violin_backend = RectangleBackend::default();
 		violin_kernel.plot(

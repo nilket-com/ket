@@ -92,6 +92,7 @@ fn create_plot_with_source_token(
 					.map(|channel| channel.colors.clone()),
 				x_label: group.clone(),
 				y_label: evaluation_value.clone(),
+				selection_candidates: violin::violin_selection_candidates(df, group),
 			})
 		}
 		ResolvedKernelFields::Hexbin { x, y } => {

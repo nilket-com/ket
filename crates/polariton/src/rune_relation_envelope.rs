@@ -773,10 +773,29 @@ pub(crate) enum RelationRootIdentity {
 	Ket,
 }
 
+/// PRODUCT-0151's compiler-carried identity for the logical relation binding.
+/// It records only the first call on the normalized workspace root; later
+/// transformations and presentation syntax never enter it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RelationLineage {
+	pub(crate) method: String,
+	pub(crate) arguments: Vec<RelationLineageLiteral>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum RelationLineageLiteral {
+	String(String),
+	Integer(i128),
+	Unsigned(u128),
+	Float(u64),
+	Bool(bool),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TransformedRuneRelation {
 	pub(crate) origin: String,
 	pub(crate) root: RelationRootIdentity,
+	pub(crate) lineage: Option<RelationLineage>,
 	pub(crate) source: String,
 	pub(crate) views: Vec<SpannedRuneViewIntent>,
 	pub(crate) source_map: RuneEnvelopeSourceMap,
@@ -786,6 +805,7 @@ pub(crate) struct TransformedRuneRelation {
 pub(crate) struct RelationExecutionKey {
 	pub(crate) origin: String,
 	pub(crate) root: RelationRootIdentity,
+	pub(crate) lineage: Option<RelationLineage>,
 	pub(crate) program: String,
 	pub(crate) views: Vec<LocalViewIdentity>,
 }
@@ -807,6 +827,7 @@ impl RelationPlanKey {
 				.map(|execution| RelationExecutionKey {
 					origin: execution.origin.clone(),
 					root: execution.root,
+					lineage: execution.lineage.clone(),
 					program: execution.source.clone(),
 					views: execution
 						.views

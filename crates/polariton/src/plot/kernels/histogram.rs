@@ -15,6 +15,25 @@ pub struct HistogramPlotKernel {
 }
 
 impl PlotKernel for HistogramPlotKernel {
+	fn project_predicate(
+		&self,
+		predicate: &crate::selection::Predicate,
+	) -> Option<Vec<Box<dyn crate::plot::common::EmphasisAnchor>>> {
+		let mut anchors: Vec<Box<dyn crate::plot::common::EmphasisAnchor>> = Vec::new();
+		for (index, candidate) in self.prepared_data.selection_candidates.iter().enumerate() {
+			if predicate.matches_candidate(candidate)
+				&& let Some(bin) = self.prepared_data.bins.iter().nth(index)
+			{
+				anchors.push(Box::new(HistogramEmphasisAnchor {
+					start: bin.start,
+					end: bin.end,
+					count: bin.count,
+				}));
+			}
+		}
+		Some(anchors)
+	}
+
 	fn requires_plot_area_clip(&self) -> bool {
 		true
 	}
@@ -88,40 +107,49 @@ impl PlotKernel for HistogramPlotKernel {
 		let cursor_pos = cursor.position()?;
 		let (x, y) = transform.pixel_to_cartesian(cursor_pos)?;
 		let bin = self.prepared_data.bins.find(x)?;
-		Some(
-			crate::plot::common::PlotHit::new(
-				crate::plot::common::MarkFamily::HISTOGRAM,
-				crate::plot::common::HitDimensionality::Area,
-				bin.count as usize,
-			)
-			.labeled(
-				"Range",
-				crate::plot::common::axis_hit_semantic_type(&self.prepared_data.x_axis_type),
-				crate::plot::common::HitValue::Interval {
-					start: Box::new(crate::plot::common::axis_hit_value(
-						bin.start,
-						&self.prepared_data.x_axis_type,
-						format_label(bin.start, &self.prepared_data.x_axis_type),
-					)),
-					end: Box::new(crate::plot::common::axis_hit_value(
-						bin.end,
-						&self.prepared_data.x_axis_type,
-						format_label(bin.end, &self.prepared_data.x_axis_type),
-					)),
-					end_inclusive: false,
-				},
-			)
-			.labeled(
-				"Count",
-				crate::plot::spec::SemanticType::Quantitative,
-				crate::plot::common::HitValue::Count(bin.count as usize),
-			)
-			.labeled(
-				"Y-Value",
-				crate::plot::spec::SemanticType::Quantitative,
-				crate::plot::common::HitValue::quantitative(y, format!("{y:.2}")),
-			),
+		let candidate = self
+			.prepared_data
+			.bins
+			.iter()
+			.position(|item| std::ptr::eq(item, bin))
+			.and_then(|index| self.prepared_data.selection_candidates.get(index))
+			.cloned();
+		let hit = crate::plot::common::PlotHit::new(
+			crate::plot::common::MarkFamily::HISTOGRAM,
+			crate::plot::common::HitDimensionality::Area,
+			bin.count as usize,
 		)
+		.labeled(
+			"Range",
+			crate::plot::common::axis_hit_semantic_type(&self.prepared_data.x_axis_type),
+			crate::plot::common::HitValue::Interval {
+				start: Box::new(crate::plot::common::axis_hit_value(
+					bin.start,
+					&self.prepared_data.x_axis_type,
+					format_label(bin.start, &self.prepared_data.x_axis_type),
+				)),
+				end: Box::new(crate::plot::common::axis_hit_value(
+					bin.end,
+					&self.prepared_data.x_axis_type,
+					format_label(bin.end, &self.prepared_data.x_axis_type),
+				)),
+				end_inclusive: false,
+			},
+		)
+		.labeled(
+			"Count",
+			crate::plot::spec::SemanticType::Quantitative,
+			crate::plot::common::HitValue::Count(bin.count as usize),
+		)
+		.labeled(
+			"Y-Value",
+			crate::plot::spec::SemanticType::Quantitative,
+			crate::plot::common::HitValue::quantitative(y, format!("{y:.2}")),
+		);
+		Some(match candidate {
+			Some(candidate) => hit.with_candidate(candidate),
+			None => hit,
+		})
 	}
 
 	fn x_label(&self) -> String {
@@ -133,6 +161,28 @@ impl PlotKernel for HistogramPlotKernel {
 	}
 }
 
+struct HistogramEmphasisAnchor {
+	start: f64,
+	end: f64,
+	count: u64,
+}
+
+impl crate::plot::common::EmphasisAnchor for HistogramEmphasisAnchor {
+	fn reproject(
+		&self,
+		transform: &CoordinateTransformer,
+	) -> Option<crate::plot::common::EmphasisShape> {
+		let top = transform.cartesian(self.start, self.count as f64);
+		let bottom = transform.cartesian(self.end, 0.0);
+		Some(crate::plot::common::EmphasisShape::Rectangle(Rectangle {
+			x: top.x.min(bottom.x),
+			y: top.y.min(bottom.y),
+			width: (bottom.x - top.x).abs().max(1.0),
+			height: (bottom.y - top.y).abs().max(1.0),
+		}))
+	}
+}
+
 #[derive(Debug)]
 pub struct HistogramPreparedData {
 	pub bins: HistogramBins,
@@ -140,6 +190,7 @@ pub struct HistogramPreparedData {
 	pub y_axis_type: AxisType,
 	pub x_label: String,
 	pub y_label: String,
+	pub selection_candidates: Vec<crate::selection::SelectionCandidate>,
 }
 
 /// PRODUCT-0079's single ingestion path from an already-aggregated relation.
@@ -184,7 +235,16 @@ pub fn prepare_histogram_data(
 		.map_err(|error| format!("histogram bin_end `{bin_end}`: {error}"))?;
 	let starts = starts.f64().map_err(|error| error.to_string())?;
 	let ends = ends.f64().map_err(|error| error.to_string())?;
+	let start_exact = crate::selection::exact_column_values(start_column)
+		.ok_or_else(|| format!("histogram bin_start `{bin_start}` is not exactly selectable"))?;
+	let end_exact = crate::selection::exact_column_values(end_column)
+		.ok_or_else(|| format!("histogram bin_end `{bin_end}` is not exactly selectable"))?;
+	let start_type = crate::selection::ScalarType::from_dtype(start_column.dtype())
+		.ok_or_else(|| format!("histogram bin_start `{bin_start}` has no exact scalar type"))?;
+	let end_type = crate::selection::ScalarType::from_dtype(end_column.dtype())
+		.ok_or_else(|| format!("histogram bin_end `{bin_end}` has no exact scalar type"))?;
 	let mut bins = Vec::with_capacity(df.height());
+	let mut selection_candidates = Vec::with_capacity(df.height());
 	for row in 0..df.height() {
 		let start = starts
 			.get(row)
@@ -197,6 +257,32 @@ pub fn prepare_histogram_data(
 			.map_err(|error| format!("histogram count `{count}` at row {row}: {error}"))?;
 		let count = histogram_count(value, count, row)?;
 		bins.push(HistogramBin { start, end, count });
+		selection_candidates.push(crate::selection::SelectionCandidate {
+			constraints: vec![
+				(
+					crate::selection::FieldRef::new(
+						bin_start,
+						crate::selection::semantic_type_for_dtype(start_column.dtype())
+							.unwrap_or(crate::plot::spec::SemanticType::Quantitative),
+						start_type.clone(),
+					),
+					start_exact[row].clone().ok_or_else(|| {
+						format!("histogram bin_start `{bin_start}` is null at row {row}")
+					})?,
+				),
+				(
+					crate::selection::FieldRef::new(
+						bin_end,
+						crate::selection::semantic_type_for_dtype(end_column.dtype())
+							.unwrap_or(crate::plot::spec::SemanticType::Quantitative),
+						end_type.clone(),
+					),
+					end_exact[row].clone().ok_or_else(|| {
+						format!("histogram bin_end `{bin_end}` is null at row {row}")
+					})?,
+				),
+			],
+		});
 	}
 	let bins = HistogramBins::new(bins).map_err(|error| match error {
 		crate::plot::kernels::histogram_bins::HistogramBinsError::Unordered { index } => format!(
@@ -210,6 +296,7 @@ pub fn prepare_histogram_data(
 		y_axis_type: AxisType::Linear,
 		x_label: bin_start.to_owned(),
 		y_label: count.to_owned(),
+		selection_candidates,
 	})
 }
 
@@ -313,6 +400,7 @@ mod tests {
 				y_axis_type: AxisType::Linear,
 				x_label: "value".to_owned(),
 				y_label: "Frequency".to_owned(),
+				selection_candidates: Vec::new(),
 			}),
 		}
 	}
@@ -333,6 +421,42 @@ mod tests {
 			settings,
 		);
 		backend
+	}
+
+	#[test]
+	fn product_0151_histogram_candidate_and_anchor_use_both_authored_bin_fields() {
+		let frame = polars::df!(
+			"start" => [0.0_f64, 1.0],
+			"end" => [1.0_f64, 2.0],
+			"count" => [4_i64, 8],
+		)
+		.expect("histogram selection fixture");
+		let prepared = prepare_histogram_data(&frame, "start", "end", "count").expect("prepared");
+		let candidate = &prepared.selection_candidates[0];
+		assert_eq!(candidate.constraints.len(), 2);
+		assert_eq!(
+			candidate
+				.constraints
+				.iter()
+				.map(|(field, _)| field.name.as_str())
+				.collect::<std::collections::HashSet<_>>(),
+			std::collections::HashSet::from(["start", "end"])
+		);
+		let predicate = crate::selection::Predicate::from_candidate(candidate).expect("predicate");
+		let kernel = HistogramPlotKernel {
+			prepared_data: Arc::new(prepared),
+		};
+		let anchors = kernel.project_predicate(&predicate).expect("admitted");
+		assert_eq!(anchors.len(), 1);
+		let layout = kernel.layout(ResolvedPlotSettings::default());
+		let transform = CoordinateTransformer::new(
+			&layout,
+			Rectangle::new(Point::ORIGIN, Size::new(400.0, 200.0)),
+		);
+		assert!(matches!(
+			anchors[0].reproject(&transform),
+			Some(crate::plot::common::EmphasisShape::Rectangle(_))
+		));
 	}
 
 	fn cursor_at(transform: &CoordinateTransformer<'_>, x: f64, y: f64) -> Cursor {

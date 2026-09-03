@@ -1375,10 +1375,31 @@ fn product_0023_table_artifact_is_the_atomic_host_and_markdown_boundary() {
 	assert!(artifact.contains("frame: Box<DataFrame>"));
 	assert!(artifact.contains("skin: TableSkin"));
 	assert!(artifact.contains("authored_show_column_types: Override<bool>"));
+	// PRODUCT-0151 keeps the table atomic while widening what crosses that
+	// boundary: the unfiltered artifact/recipe identity and selection display
+	// state now travel beside the original three presentation fields.
 	assert_eq!(
-		artifact.matches(':').count(),
-		3,
-		"the artifact owns one frame, one skin, and one authored type intent"
+		artifact
+			.lines()
+			.map(str::trim)
+			.filter(|line| line.contains(':'))
+			.map(|line| line.split(':').next().unwrap())
+			.collect::<Vec<_>>(),
+		[
+			"frame",
+			"artifact",
+			"publication",
+			"selection_enabled",
+			"selection_revision",
+			"selection_pending",
+			"displayed_filter_predicate",
+			"surface_incarnation",
+			"selection_predicate",
+			"content_revision",
+			"skin",
+			"authored_show_column_types",
+		],
+		"the table artifact remains the complete atomic table boundary"
 	);
 	assert_eq!(
 		production.matches("Table(TableArtifact)").count(),
@@ -2031,7 +2052,7 @@ fn product_0030_surface_default_and_continuation_stay_at_the_rune_head_boundary(
 		.find("rune_buffer_revisions.get(&source_buffer) != Some(&revision)")
 		.expect("stale check");
 	let content = ready
-		.find("set_rune_view_plot_with_source(")
+		.find("set_rune_view_plot_with_source_and_recipe(")
 		.expect("content install with presentation source facts");
 	let continuation = ready
 		.find("rune_categorical_identities.insert(")
@@ -2107,9 +2128,10 @@ fn product_0080_product_0083_plot_chrome_and_mark_style_are_separate_closed_tier
 
 	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
 	let production = common
-		.split("#[cfg(test)]")
-		.next()
-		.expect("plot common production");
+		.split("pub struct ResolvedPlotSettings {")
+		.nth(1)
+		.and_then(|tail| tail.split("#[cfg(test)]").next())
+		.expect("bounded resolved-settings production region");
 	for retired in [
 		"pub background_color:",
 		"pub decoration_color:",
@@ -3598,21 +3620,20 @@ fn product_0097_widget_hit_geometry_has_closed_typed_trust_boundaries() {
 			+ pie.matches("from_plot_kernel_cursor").count(),
 		4
 	);
+	let common_coordinate_boundary = common
+		.split("pub enum TimeUnit")
+		.nth(1)
+		.and_then(|tail| tail.split("#[cfg(test)]").next())
+		.expect("bounded coordinate-transform production region");
 	assert_eq!(
 		coordinate.matches("from_transformer_bounds").count()
-			+ common
-				.split("#[cfg(test)]")
-				.next()
-				.expect("production common prefix")
+			+ common_coordinate_boundary
 				.matches("from_transformer_bounds")
 				.count(),
 		2
 	);
 	assert_eq!(
-		common
-			.split("#[cfg(test)]")
-			.next()
-			.expect("production common prefix")
+		common_coordinate_boundary
 			.matches("widget_hit_geometry")
 			.count() + funnel.matches("widget_hit_geometry").count()
 			+ radial.matches("widget_hit_geometry").count()
@@ -4789,13 +4810,15 @@ fn product_0114_band_requirements_precede_and_feed_shared_geometry() {
 	// geometry too, and is resolved once per cell in each entry point's loop.
 	// PRODUCT-0149 adds the interactive request and draw traversals to the three
 	// exact/overlay/hit traversals banked here; PRODUCT-0150 adds the gesture
-	// viewport-geometry traversal that selects the cell under the pointer.
+	// viewport-geometry traversal; PRODUCT-0151 adds selection geometry,
+	// click-admission, and retained-emphasis traversals. Each independently
+	// resolves the cell's plot rectangle through its kernel.
 	assert_eq!(
 		composite
 			.matches("cell.kernel.resolve_settings(settings)")
 			.count(),
-		6,
-		"all six grid entry points resolve the cell's plot area through its own kernel"
+		9,
+		"all nine grid entry points resolve the cell's plot area through its own kernel"
 	);
 	assert!(
 		!composite.contains("grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &resolved)"),
@@ -5241,7 +5264,7 @@ fn product_0126_the_y_axis_title_draw_path_reads_only_the_shared_left_guide() {
 	// Bound on the test *modules*, not on `#[cfg(test)]`: the latter also marks
 	// inline test-only helpers far above them and would truncate production.
 	let production = common
-		.split("\n#[cfg(test)]\nmod ")
+		.split("\n#[cfg(test)]\nmod product_0150_gesture_tests")
 		.next()
 		.expect("bounded production source");
 	let reads: Vec<&str> = production
@@ -6072,4 +6095,91 @@ fn product_0150_gestures_only_author_the_pane_tier_and_thresholds_remain_unprice
 	assert!(common.contains("scatter_downsample_target: 200_000"));
 	assert!(scatter.contains("pixel_budget.saturating_mul(8)"));
 	assert!(scatter.contains("fn resolve_render_mode("));
+}
+
+#[test]
+fn product_0151_click_selection_admission_is_a_closed_kernel_table() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plot/kernels");
+	let mut admitted = std::fs::read_dir(&root)
+		.expect("read kernel directory")
+		.filter_map(Result::ok)
+		.filter(|entry| entry.path().extension().is_some_and(|ext| ext == "rs"))
+		.filter_map(|entry| {
+			let source = std::fs::read_to_string(entry.path()).ok()?;
+			source
+				.contains("fn project_predicate(")
+				.then(|| entry.file_name().to_string_lossy().into_owned())
+		})
+		.collect::<Vec<_>>();
+	admitted.sort();
+	assert_eq!(
+		admitted,
+		[
+			"bar.rs",
+			"boxplot.rs",
+			"candlestick.rs",
+			"fill_between.rs",
+			"heatmap.rs",
+			"histogram.rs",
+			"layered.rs",
+			"scatter.rs",
+			"violin.rs",
+		],
+		"a new click-selecting kernel is an ADR 0151 admission-table amendment"
+	);
+	for refused in [
+		"line.rs",
+		"hexbin.rs",
+		"pie.rs",
+		"funnel.rs",
+		"radar.rs",
+		"parallel.rs",
+		"radial_dial.rs",
+		"stacked_area.rs",
+	] {
+		let source = std::fs::read_to_string(root.join(refused)).expect("read refused kernel");
+		assert!(!source.contains("fn project_predicate("), "{refused}");
+	}
+}
+
+#[test]
+fn product_0151_identity_grid_and_in_process_boundaries_are_pinned() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let selection = std::fs::read_to_string(root.join("selection.rs")).expect("read selection");
+	let grid = std::fs::read_to_string(root.join("plot/grid.rs")).expect("read grid");
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read common");
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
+
+	assert!(
+		!selection.contains("adapter"),
+		"selection never enters an engine adapter"
+	);
+	assert!(
+		!grid.contains("ArtifactToken::mint"),
+		"facets inherit their artifact token"
+	);
+	assert!(grid.contains("from_grid_with_figure_grid_from_artifact"));
+	assert!(common.contains("pixel_to_temporal"));
+	assert!(compiler.contains("RelationLineage"));
+	assert!(compiler.contains("relation_lineage"));
+	let composite_draw = grid
+		.split("fn render_projected_emphasis(")
+		.nth(1)
+		.and_then(|rest| rest.split("fn render_plot_layer(").next())
+		.expect("composite emphasis draw region");
+	assert!(
+		!composite_draw.contains("project_predicate("),
+		"facet redraws only reproject anchors retained at selection time"
+	);
+	let selection_gesture = common
+		.split("if self.selection_axis_fields.is_some()")
+		.nth(1)
+		.and_then(|rest| {
+			rest.split("if let Some(stamp) = self.viewport_stamp")
+				.next()
+		})
+		.expect("selection gesture region");
+	assert!(!selection_gesture.contains("PlotWritebackGesture"));
+	assert!(!selection_gesture.contains("plan_writeback"));
 }

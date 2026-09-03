@@ -179,6 +179,13 @@ impl PlotKernel for ScatterPlotKernel {
 		self.renderer.draw(backend, bounds, transform, settings);
 	}
 
+	fn project_predicate(
+		&self,
+		predicate: &crate::selection::Predicate,
+	) -> Option<Vec<Box<dyn crate::plot::common::EmphasisAnchor>>> {
+		Some(self.renderer.project_selection_predicate(predicate))
+	}
+
 	fn plot_with_settings(
 		&self,
 		backend: &mut dyn PlotBackend,
@@ -310,31 +317,41 @@ impl ScatterPlotKernel {
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::common::PlotHit> {
 		let hit = self.renderer.hit_test(transform, cursor, settings)?;
-		Some(
-			crate::plot::common::PlotHit::new(
-				crate::plot::common::MarkFamily::SCATTER,
-				crate::plot::common::HitDimensionality::Point,
-				hit.mark_index,
-			)
-			.labeled(
-				"X",
-				crate::plot::common::axis_hit_semantic_type(&self.prepared_data.x_axis_type),
-				crate::plot::common::axis_hit_value(
-					hit.data_x,
-					&self.prepared_data.x_axis_type,
-					format_label(hit.data_x, &self.prepared_data.x_axis_type),
-				),
-			)
-			.labeled(
-				"Y",
-				crate::plot::common::axis_hit_semantic_type(&self.prepared_data.y_axis_type),
-				crate::plot::common::axis_hit_value(
-					hit.data_y,
-					&self.prepared_data.y_axis_type,
-					format_label(hit.data_y, &self.prepared_data.y_axis_type),
-				),
+		let candidate = self
+			.prepared_data
+			.series
+			.iter()
+			.flat_map(|series| series.selection_candidates.iter())
+			.nth(hit.mark_index)
+			.cloned()
+			.flatten();
+		let hit = crate::plot::common::PlotHit::new(
+			crate::plot::common::MarkFamily::SCATTER,
+			crate::plot::common::HitDimensionality::Point,
+			hit.mark_index,
+		)
+		.labeled(
+			"X",
+			crate::plot::common::axis_hit_semantic_type(&self.prepared_data.x_axis_type),
+			crate::plot::common::axis_hit_value(
+				hit.data_x,
+				&self.prepared_data.x_axis_type,
+				format_label(hit.data_x, &self.prepared_data.x_axis_type),
 			),
 		)
+		.labeled(
+			"Y",
+			crate::plot::common::axis_hit_semantic_type(&self.prepared_data.y_axis_type),
+			crate::plot::common::axis_hit_value(
+				hit.data_y,
+				&self.prepared_data.y_axis_type,
+				format_label(hit.data_y, &self.prepared_data.y_axis_type),
+			),
+		);
+		Some(match candidate {
+			Some(candidate) => hit.with_candidate(candidate),
+			None => hit,
+		})
 	}
 
 	pub fn new(prepared_data: Arc<ScatterPreparedData>) -> Self {
@@ -356,6 +373,39 @@ impl ScatterPlotKernel {
 impl ScatterMarkRenderer {
 	pub fn new(prepared_data: Arc<ScatterPreparedData>) -> Self {
 		Self { prepared_data }
+	}
+
+	pub(crate) fn selection_candidate(
+		&self,
+		mark_index: usize,
+	) -> Option<crate::selection::SelectionCandidate> {
+		self.prepared_data
+			.series
+			.iter()
+			.flat_map(|series| series.selection_candidates.iter())
+			.nth(mark_index)
+			.cloned()
+			.flatten()
+	}
+
+	pub(crate) fn project_selection_predicate(
+		&self,
+		predicate: &crate::selection::Predicate,
+	) -> Vec<Box<dyn crate::plot::common::EmphasisAnchor>> {
+		let categorical_x = self.prepared_data.x_categories.is_some();
+		let mut anchors: Vec<Box<dyn crate::plot::common::EmphasisAnchor>> = Vec::new();
+		for series in &self.prepared_data.series {
+			series.for_each_selectable_point(|x, y, candidate| {
+				if predicate.matches_candidate(candidate) {
+					anchors.push(Box::new(ScatterEmphasisAnchor {
+						x,
+						y,
+						categorical_x,
+					}));
+				}
+			});
+		}
+		anchors
 	}
 
 	#[allow(dead_code)] // Geometric hit-testing is test-reachable until PRODUCT-0014.
@@ -668,6 +718,7 @@ pub struct ScatterSeries {
 	pub color_t: f32,
 	pub resolved_color: Option<Color>,
 	pub provenance: LegendProvenance,
+	pub selection_candidates: Vec<Option<crate::selection::SelectionCandidate>>,
 }
 
 impl ScatterSeries {
@@ -687,6 +738,57 @@ impl ScatterSeries {
 				f(x, y);
 			}
 		}
+	}
+
+	fn for_each_selectable_point(
+		&self,
+		mut f: impl FnMut(f64, f64, &crate::selection::SelectionCandidate),
+	) {
+		let mut candidate = 0;
+		for idx in 0..self.len() {
+			let Some(x) = self.x_values.get(idx) else {
+				continue;
+			};
+			let Some(y) = self.y_values.get(idx) else {
+				continue;
+			};
+			if !x.is_finite() || !y.is_finite() {
+				continue;
+			}
+			if let Some(selection) = self
+				.selection_candidates
+				.get(candidate)
+				.and_then(Option::as_ref)
+			{
+				f(x, y, selection);
+			}
+			candidate += 1;
+		}
+	}
+}
+
+struct ScatterEmphasisAnchor {
+	x: f64,
+	y: f64,
+	categorical_x: bool,
+}
+
+impl crate::plot::common::EmphasisAnchor for ScatterEmphasisAnchor {
+	fn reproject(
+		&self,
+		transform: &CoordinateTransformer,
+	) -> Option<crate::plot::common::EmphasisShape> {
+		let center = if self.categorical_x {
+			transform.categorical(self.x.max(0.0) as usize, self.y).0
+		} else {
+			transform.cartesian(self.x, self.y)
+		};
+		(center.x.is_finite() && center.y.is_finite()).then_some(
+			crate::plot::common::EmphasisShape::Circle {
+				center,
+				radius: 6.0,
+			},
+		)
 	}
 }
 
@@ -1083,6 +1185,15 @@ pub fn prepare_scatter_data_resolved_with_subject(
 			} else {
 				LegendProvenance::Named
 			},
+			selection_candidates: scatter_selection_candidates(
+				&group,
+				x_field,
+				y_field,
+				color_field,
+				x.binding.semantic_type,
+				y.binding.semantic_type,
+				color.map(|channel| channel.binding.semantic_type),
+			),
 		});
 	}
 	if !color_field.is_empty() {
@@ -1308,6 +1419,27 @@ pub fn prepare_scatter_data(
 			} else {
 				LegendProvenance::Named
 			},
+			selection_candidates: scatter_selection_candidates(
+				&group_df,
+				x_col,
+				y_col,
+				cat_col,
+				crate::selection::semantic_type_for_dtype(
+					group_df
+						.column(x_col)
+						.map(|column| column.dtype())
+						.unwrap_or(&DataType::Float64),
+				)
+				.unwrap_or(crate::plot::spec::SemanticType::Quantitative),
+				crate::selection::semantic_type_for_dtype(
+					group_df
+						.column(y_col)
+						.map(|column| column.dtype())
+						.unwrap_or(&DataType::Float64),
+				)
+				.unwrap_or(crate::plot::spec::SemanticType::Quantitative),
+				(!cat_col.is_empty()).then_some(crate::plot::spec::SemanticType::Nominal),
+			),
 		});
 	}
 	if !cat_col.is_empty() {
@@ -1327,6 +1459,93 @@ pub fn prepare_scatter_data(
 		y_label: y_col.to_string(),
 		total_points,
 	}
+}
+
+fn scatter_selection_candidates(
+	df: &DataFrame,
+	x_field: &str,
+	y_field: &str,
+	color_field: &str,
+	x_semantic: crate::plot::spec::SemanticType,
+	y_semantic: crate::plot::spec::SemanticType,
+	color_semantic: Option<crate::plot::spec::SemanticType>,
+) -> Vec<Option<crate::selection::SelectionCandidate>> {
+	let Ok(x) = df.column(x_field) else {
+		return Vec::new();
+	};
+	let Ok(y) = df.column(y_field) else {
+		return Vec::new();
+	};
+	let Some(x_type) = crate::selection::ScalarType::from_dtype(x.dtype()) else {
+		return Vec::new();
+	};
+	let Some(y_type) = crate::selection::ScalarType::from_dtype(y.dtype()) else {
+		return Vec::new();
+	};
+	let Some(x_exact) = crate::selection::exact_column_values(x) else {
+		return Vec::new();
+	};
+	let Some(y_exact) = crate::selection::exact_column_values(y) else {
+		return Vec::new();
+	};
+	let color = (!color_field.is_empty())
+		.then(|| df.column(color_field).ok())
+		.flatten();
+	let color_values = color.and_then(crate::selection::exact_column_values);
+	let color_type =
+		color.and_then(|column| crate::selection::ScalarType::from_dtype(column.dtype()));
+	let x_float = x.cast(&DataType::Float64).ok();
+	let y_float = y.cast(&DataType::Float64).ok();
+	(0..df.height())
+		.filter_map(|row| {
+			let projected_x = x_float
+				.as_ref()
+				.and_then(|column| column.f64().ok())
+				.and_then(|column| column.get(row));
+			let projected_x = match projected_x {
+				Some(value) => value,
+				None if matches!(
+					x_semantic,
+					crate::plot::spec::SemanticType::Nominal
+						| crate::plot::spec::SemanticType::Ordinal
+				) =>
+				{
+					0.0
+				}
+				None => return None,
+			};
+			let projected_y = y_float.as_ref()?.f64().ok()?.get(row)?;
+			if !projected_x.is_finite() || !projected_y.is_finite() {
+				return None;
+			}
+			let candidate = (|| {
+				let mut constraints = vec![
+					(
+						crate::selection::FieldRef::new(x_field, x_semantic, x_type.clone()),
+						x_exact.get(row)?.clone()?,
+					),
+					(
+						crate::selection::FieldRef::new(y_field, y_semantic, y_type.clone()),
+						y_exact.get(row)?.clone()?,
+					),
+				];
+				if let (Some(values), Some(scalar_type), Some(semantic_type)) =
+					(&color_values, &color_type, color_semantic)
+				{
+					constraints.push((
+						crate::selection::FieldRef::new(
+							color_field,
+							semantic_type,
+							scalar_type.clone(),
+						),
+						values.get(row)?.clone()?,
+					));
+				}
+				Some(crate::selection::SelectionCandidate { constraints })
+			})();
+			Some(candidate)
+		})
+		.collect()
 }
 
 #[cfg(test)]
@@ -1481,6 +1700,100 @@ mod tests {
 			kernel.layout(ResolvedPlotSettings::default()),
 			PlotLayout::CategoricalX { categories, .. } if categories == ["a", "b", "c"]
 		));
+	}
+
+	#[test]
+	fn product_0151_scatter_candidate_keeps_every_bound_source_field() {
+		let frame = df!(
+			"x" => [1_i64, 2],
+			"y" => [3_i64, 4],
+			"series" => ["a", "b"],
+		)
+		.expect("scatter selection fixture");
+		let (spec, _) = resolved_scatter(
+			frame.clone(),
+			AuthoredPlotSpec::xy_color(
+				PlotComposition::single(PlotType::Scatter),
+				"x",
+				"y",
+				Some("series".to_owned()),
+			),
+			&ColorIdentity::default(),
+		);
+		let prepared = prepare_scatter_data_resolved(&frame, &spec, 800, 480);
+		let candidate = prepared.series[0]
+			.selection_candidates
+			.iter()
+			.find_map(Option::as_ref)
+			.expect("point candidate");
+		assert_eq!(
+			candidate
+				.constraints
+				.iter()
+				.map(|(field, _)| field.name.as_str())
+				.collect::<std::collections::HashSet<_>>(),
+			std::collections::HashSet::from(["x", "y", "series"])
+		);
+		let predicate = crate::selection::Predicate::from_candidate(candidate).expect("predicate");
+		let kernel = ScatterPlotKernel::new(Arc::new(prepared));
+		assert_eq!(kernel.project_predicate(&predicate).unwrap().len(), 1);
+	}
+
+	#[test]
+	fn product_0151_adjacent_nanoseconds_hit_as_distinct_exact_candidates() {
+		let first = 1_704_067_200_000_000_000_i64;
+		let zone = polars::prelude::TimeZone::opt_try_new(Some("UTC"))
+			.expect("zone syntax")
+			.expect("zone");
+		let when = Column::new("when".into(), [first, first + 1])
+			.cast(&DataType::Datetime(TimeUnit::Nanoseconds, Some(zone)))
+			.expect("datetime");
+		let frame = DataFrame::new(2, vec![when, Column::new("y".into(), [0.0_f64, 10.0])])
+			.expect("temporal scatter");
+		let (spec, _) = resolved_scatter(
+			frame.clone(),
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "when", "y"),
+			&ColorIdentity::default(),
+		);
+		let kernel = ScatterPlotKernel::new(Arc::new(prepare_scatter_data_resolved(
+			&frame, &spec, 800, 480,
+		)));
+		let layout = kernel.layout(ResolvedPlotSettings::default());
+		let transform = CoordinateTransformer::new(
+			&layout,
+			Rectangle::new(Point::ORIGIN, Size::new(800.0, 480.0)),
+		);
+		let first_hit = kernel
+			.hit(
+				&transform,
+				Cursor::Available(transform.cartesian(first as f64, 0.0)),
+			)
+			.expect("first point hit");
+		let second_hit = kernel
+			.hit(
+				&transform,
+				Cursor::Available(transform.cartesian((first + 1) as f64, 10.0)),
+			)
+			.expect("second point hit");
+		let ticks = |hit: &crate::plot::common::PlotHit| match &hit
+			.candidate
+			.as_ref()
+			.expect("exact candidate")
+			.constraints[0]
+			.1
+		{
+			crate::selection::ExactScalar::Datetime { ticks, .. } => *ticks,
+			other => panic!("expected datetime candidate, got {other:?}"),
+		};
+		assert_eq!(ticks(&first_hit), first);
+		assert_eq!(ticks(&second_hit), first + 1);
+		let mut presentation_only = first_hit.clone();
+		presentation_only.candidate = None;
+		assert_eq!(
+			first_hit.to_string(),
+			presentation_only.to_string(),
+			"the exact candidate lane cannot alter hover prose"
+		);
 	}
 
 	#[test]
@@ -2605,6 +2918,30 @@ mod tests {
 			1,
 			"the surface reports readiness once, not once per producer"
 		);
+
+		let coordinator = crate::plot::raster::RasterCoordinator::new();
+		let overlap = crate::plot::common::PlotWidget::new(
+			&mixed,
+			String::new(),
+			0.0,
+			model,
+			0,
+			false,
+			crate::plot::common::PlotRenderLayer::Full,
+		)
+		.with_raster_coordinator(&coordinator)
+		.with_selection_state(true, &[]);
+		let mut overlap_frame = CountingBackend::default();
+		overlap.render(&mut overlap_frame, bounds);
+		assert_eq!(
+			overlap_frame
+				.texts
+				.iter()
+				.filter(|text| text.as_str() == "preparing raster…")
+				.count(),
+			1,
+			"selection and raster readiness share the one surface marker"
+		);
 	}
 
 	#[test]
@@ -3238,6 +3575,7 @@ configuration,widget_px,inner_px,inner_share,effective_gate,naive_gate"
 			color_t: 0.5,
 			resolved_color: None,
 			provenance: LegendProvenance::Named,
+			selection_candidates: Vec::new(),
 		};
 
 		let sampled = downsample_series(&series, viewport, &transform, 11);

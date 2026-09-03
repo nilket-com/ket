@@ -355,10 +355,21 @@ impl PlotExportJob {
 }
 
 fn render_plot_export(
-	snapshot: crate::editor::HostPlotExport,
+	mut snapshot: crate::editor::HostPlotExport,
 	format: ExportFormat,
 	ordinal: usize,
-) -> PlotExportJob {
+) -> std::result::Result<PlotExportJob, String> {
+	if snapshot.displayed_selection_revision != snapshot.selection_revision {
+		let recipe = snapshot.recipe.as_ref().ok_or_else(|| {
+			"Export · refused: the displayed plot is behind its selection and has no rebuild recipe"
+				.to_owned()
+		})?;
+		let kernel = recipe.rebuild(&snapshot.predicate).map_err(|error| {
+			format!("Export · refused: the selected plot could not be rebuilt: {error}")
+		})?;
+		snapshot.kernel = kernel;
+		snapshot.render_revision = snapshot.render_revision.wrapping_add(1);
+	}
 	let width = snapshot.width;
 	let height = snapshot.height;
 	let bounds = iced::Rectangle {
@@ -376,7 +387,7 @@ fn render_plot_export(
 		snapshot.resize_render_suspended,
 		crate::plot::common::PlotRenderLayer::Full,
 	);
-	match format {
+	Ok(match format {
 		ExportFormat::SVG => {
 			let mut backend = SvgBackend::new(width, height);
 			widget.render(&mut backend, bounds);
@@ -401,7 +412,7 @@ fn render_plot_export(
 				artifact: RenderedPlotExport::Avif(backend),
 			}
 		}
-	}
+	})
 }
 
 #[cfg(feature = "toron")]
@@ -414,15 +425,25 @@ fn build_facet_resolved_plot_task(
 	on_ready: impl FnOnce(
 		ResolvedPlot,
 		std::result::Result<Arc<dyn crate::plot::common::PlotKernel + Send + Sync>, String>,
+		crate::plot::recipe::PlotRecipe,
 	) -> Message
 	+ Send
 	+ 'static,
 ) -> Task<Message> {
+	let recipe = crate::plot::recipe::PlotRecipe::facet(
+		Arc::clone(&source),
+		Arc::new(resolved.resolved_spec.clone()),
+		facet.clone(),
+		figure_grid,
+		layer_settings.clone(),
+		1200,
+		720,
+	);
 	Task::perform(
 		async move {
 			let frame = match source.projection() {
 				Ok(frame) => frame,
-				Err(error) => return (resolved, Err(error.to_string())),
+				Err(error) => return (resolved, Err(error.to_string()), recipe),
 			};
 			let stamped = crate::plot::spec::StampedResult {
 				data: source,
@@ -436,16 +457,20 @@ fn build_facet_resolved_plot_task(
 					None => PlotGrid::single(spec, frame),
 				};
 				match layer_settings {
-					Some(settings) => PlotGridKernel::from_styled_grid_with_figure_grid(
+					Some(settings) => {
+						PlotGridKernel::from_styled_grid_with_figure_grid_from_artifact(
+							grid,
+							figure_grid,
+							settings,
+							stamped.data.as_ref(),
+							1200,
+							720,
+						)
+					}
+					None => Ok(PlotGridKernel::from_grid_with_figure_grid_from_artifact(
 						grid,
 						figure_grid,
-						settings,
-						1200,
-						720,
-					),
-					None => Ok(PlotGridKernel::from_grid_with_figure_grid(
-						grid,
-						figure_grid,
+						stamped.data.as_ref(),
 						1200,
 						720,
 					)),
@@ -457,9 +482,9 @@ fn build_facet_resolved_plot_task(
 			.map(|kernel| {
 				Arc::new(kernel) as Arc<dyn crate::plot::common::PlotKernel + Send + Sync>
 			});
-			(resolved, result)
+			(resolved, result, recipe)
 		},
-		move |(resolved, result)| on_ready(resolved, result),
+		move |(resolved, result, recipe)| on_ready(resolved, result, recipe),
 	)
 }
 
@@ -471,10 +496,19 @@ fn build_facet_layered_plot_task(
 	figure_grid: crate::plot::grid::FigureGridLayoutSettings,
 	on_ready: impl FnOnce(
 		std::result::Result<Arc<dyn crate::plot::common::PlotKernel + Send + Sync>, String>,
+		crate::plot::recipe::PlotRecipe,
 	) -> Message
 	+ Send
 	+ 'static,
 ) -> Task<Message> {
+	let recipe = crate::plot::recipe::PlotRecipe::layered(
+		Arc::clone(&source),
+		specification.clone(),
+		facet.clone(),
+		figure_grid,
+		1200,
+		720,
+	);
 	Task::perform(
 		async move {
 			let frame = match source.projection() {
@@ -522,7 +556,7 @@ fn build_facet_layered_plot_task(
 			.map_err(|error| format!("facet layered plot build task panicked: {error}"))
 			.and_then(|result| result)
 		},
-		on_ready,
+		move |result| on_ready(result, recipe),
 	)
 }
 
@@ -890,7 +924,9 @@ fn clear_transient_execution_status_on_editor_activity(
 		&& (app_state.status_msg.starts_with("SQL · ")
 			|| app_state.status_error.starts_with("SQL · ")
 			|| app_state.status_msg.starts_with("Rune · ")
-			|| app_state.status_error.starts_with("Rune · "))
+			|| app_state.status_error.starts_with("Rune · ")
+			|| app_state.status_msg.starts_with("Selection · ")
+			|| app_state.status_error.starts_with("Selection · "))
 	{
 		app_state.status_msg.clear();
 		app_state.status_error.clear();
@@ -963,7 +999,11 @@ fn run_code(
 	};
 	let db = db.clone();
 	let connection = app_state.adapter_state.connection_identity();
+	app_state.code_editor.retire_result_panel_publication();
 	let publish = publish_name.map(|name| {
+		if let Some(publication) = app_state.result_registry.publication(&name) {
+			app_state.code_editor.retire_publication(publication);
+		}
 		app_state
 			.result_registry
 			.begin(&name, source_buffer, connection)
@@ -983,7 +1023,13 @@ fn run_code(
 	)
 	.abortable();
 	app_state.sql_abort = Some(handle);
-	task
+	Task::batch([
+		app_state
+			.code_editor
+			.take_selection_tasks()
+			.map(Message::CodeEditEvent),
+		task,
+	])
 }
 
 fn run_language_code(
@@ -1152,11 +1198,15 @@ fn run_rune_relation_view_at_revision(
 	app_state
 		.code_editor
 		.prepare_rune_view_panels(source_buffer, &presentation, revision);
+	let retirements = app_state
+		.code_editor
+		.take_selection_tasks()
+		.map(Message::CodeEditEvent);
 	let Some(work) = app_state.rune_view_scheduler.submit(work) else {
 		app_state.status_msg = "Rune workspace queued newest view…".into();
-		return Task::none();
+		return retirements;
 	};
-	start_rune_relation_task(app_state, work)
+	Task::batch([retirements, start_rune_relation_task(app_state, work)])
 }
 
 #[cfg(feature = "toron")]
@@ -3475,7 +3525,13 @@ fn run_sql_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) 
 	)
 	.abortable();
 	app_state.sql_abort = Some(handle);
-	task
+	Task::batch([
+		app_state
+			.code_editor
+			.take_selection_tasks()
+			.map(Message::CodeEditEvent),
+		task,
+	])
 }
 
 fn resolve_notebook_rune_execution(
@@ -3520,7 +3576,7 @@ fn run_rune_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution)
 	if presentation.output == MarkdownCellOutputTarget::Inline {
 		app_state.code_editor.begin_markdown_cell(identity.clone());
 	}
-	Task::perform(
+	let task = Task::perform(
 		async move {
 			tokio::task::spawn_blocking(move || {
 				let execution = rune_host::execute_body(
@@ -3547,7 +3603,14 @@ fn run_rune_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution)
 			presentation,
 			result,
 		},
-	)
+	);
+	Task::batch([
+		app_state
+			.code_editor
+			.take_selection_tasks()
+			.map(Message::CodeEditEvent),
+		task,
+	])
 }
 
 fn export_receipt_status(receipts: &[rune_host::ExportReceipt]) -> String {
@@ -3710,6 +3773,12 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				.code_editor
 				.update(edit_event)
 				.map(Message::CodeEditEvent);
+			if let Some(selection) = app_state.code_editor.take_selection_status() {
+				app_state.status_msg = selection;
+				app_state.status_error.clear();
+				app_state.status_detail = None;
+				app_state.status_detail_open = false;
+			}
 			#[cfg(feature = "toron")]
 			if let Some(colours) = app_state.code_editor.take_restored_colour_meanings() {
 				app_state.rune_categorical_identities = colours.into_map();
@@ -4229,6 +4298,9 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					artifact,
 					statements,
 				} => {
+					if publish.is_none() {
+						app_state.code_editor.bind_result_panel_artifact(&artifact);
+					}
 					let (rows, cols) = artifact.shape();
 					let df = match artifact.projection() {
 						Ok(frame) => frame,
@@ -4238,7 +4310,9 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 						}
 					};
 					app_state.code_editor.begin_query();
-					app_state.code_editor.set_query_result(df.as_ref().clone());
+					app_state
+						.code_editor
+						.set_query_result_from_artifact(df.as_ref().clone(), Arc::clone(&artifact));
 					app_state.status_df_size = Some((rows, cols));
 					set_sql_status(
 						app_state,
@@ -4294,18 +4368,24 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 						};
 						app_state.status_msg =
 							format!("Building plot from {}…", resolved.source_name);
-						return build_resolved_plot_task(
-							resolved,
-							1200,
-							move |resolved, kernel| Message::RuneBufferPlotReady {
-								source_buffer,
-								revision,
-								panel_id,
-								display_label,
-								resolved,
-								kernel,
-							},
-						);
+						let build =
+							build_resolved_plot_task(resolved, 1200, move |resolved, kernel| {
+								Message::RuneBufferPlotReady {
+									source_buffer,
+									revision,
+									panel_id,
+									display_label,
+									resolved,
+									kernel,
+								}
+							});
+						return Task::batch([
+							app_state
+								.code_editor
+								.take_selection_tasks()
+								.map(Message::CodeEditEvent),
+							build,
+						]);
 					}
 					app_state.code_editor.prepare_rune_view_panels(
 						source_buffer,
@@ -4313,6 +4393,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 						revision,
 					);
 					app_state.status_msg = "Rune finished.".to_owned();
+					return app_state
+						.code_editor
+						.take_selection_tasks()
+						.map(Message::CodeEditEvent);
 				}
 				Err(message) => {
 					app_state
@@ -4370,6 +4454,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					);
 					app_state.status_msg = "Rune view set is bound; no output root emitted.".into();
 					app_state.status_error.clear();
+					return app_state
+						.code_editor
+						.take_selection_tasks()
+						.map(Message::CodeEditEvent);
 				}
 				Err(RuneEnvelopeError::NoTerminalView | RuneEnvelopeError::Parse(_)) => {
 					return run_plain_rune_code(app_state, source_buffer, revision, source);
@@ -4385,6 +4473,11 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			views,
 			result,
 		} => {
+			let lineage = app_state
+				.retained_rune_relations
+				.get(&source_buffer)
+				.and_then(|retained| retained.transformed.executions.get(execution_index))
+				.and_then(|execution| execution.lineage.clone());
 			if let Some(next) = app_state
 				.rune_view_scheduler
 				.complete(source_buffer, &origin)
@@ -4399,6 +4492,11 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				&& retained.revision == revision
 				&& let Some(slot) = retained.artifacts.get_mut(execution_index)
 			{
+				app_state.code_editor.bind_rune_artifact(
+					source_buffer,
+					lineage.as_ref(),
+					&outcome.result,
+				);
 				*slot = Some(Arc::clone(&outcome.result));
 			}
 			app_state.status_time_elapsed = Some(app_state.code_started.elapsed());
@@ -4427,11 +4525,20 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					let sink_count = outcome.sinks.len();
 					let mut errors = Vec::new();
 					let mut plot_tasks = Vec::new();
-					for sink in outcome.sinks {
-						assert!(
-							std::sync::Arc::ptr_eq(&outcome.result, &sink.source),
-							"Rune view sinks must share one stamped result identity"
+					for mut sink in outcome.sinks {
+						let source = match outcome.result.projection() {
+							Ok(frame) => crate::result_artifact::ResultArtifact::from_polars(frame),
+							Err(error) => {
+								errors.push(error.to_string());
+								continue;
+							}
+						};
+						app_state.code_editor.bind_rune_artifact(
+							source_buffer,
+							lineage.as_ref(),
+							&source,
 						);
+						sink.source = source;
 						let panel_id = app_state
 							.code_editor
 							.rune_view_panel_id(source_buffer, &sink.identity)
@@ -4449,12 +4556,15 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 								};
 								let rows = frame.height();
 								let cols = frame.width();
-								app_state.code_editor.set_rune_view_table_with_presentation(
-									panel_id,
-									frame.as_ref().clone(),
-									presentation.skin,
-									presentation.authored_show_column_types,
-								);
+								app_state
+									.code_editor
+									.set_rune_view_table_with_presentation_from_artifact(
+										panel_id,
+										frame.as_ref().clone(),
+										presentation.skin,
+										presentation.authored_show_column_types,
+										Arc::clone(&sink.source),
+									);
 								app_state.status_df_size = Some((rows, cols));
 							}
 							Ok(RuneRelationSinkOutput::Plot(
@@ -4472,7 +4582,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										Some(facet),
 										figure_grid,
 										None,
-										move |resolved, result| match result {
+										move |resolved, result, recipe| match result {
 											Ok(kernel) => Message::RuneRelationPlotReady {
 												source_buffer,
 												revision,
@@ -4483,6 +4593,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 												continuation,
 												resolved,
 												kernel,
+												recipe: recipe.clone(),
 											},
 											Err(error) => Message::RuneRelationLayeredPlotReady {
 												source_buffer,
@@ -4492,6 +4603,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 												authored_settings,
 												span,
 												result: Err(error),
+												recipe,
 											},
 										},
 									));
@@ -4502,7 +4614,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										None,
 										figure_grid,
 										None,
-										move |resolved, result| match result {
+										move |resolved, result, recipe| match result {
 											Ok(kernel) => Message::RuneRelationPlotReady {
 												source_buffer,
 												revision,
@@ -4513,6 +4625,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 												continuation,
 												resolved,
 												kernel,
+												recipe: recipe.clone(),
 											},
 											Err(error) => Message::RuneRelationLayeredPlotReady {
 												source_buffer,
@@ -4522,6 +4635,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 												authored_settings,
 												span: sink.span,
 												result: Err(error),
+												recipe,
 											},
 										},
 									));
@@ -4543,7 +4657,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										Some(facet),
 										figure_grid,
 										Some(layer_settings),
-										move |resolved, result| match result {
+										move |resolved, result, recipe| match result {
 											Ok(kernel) => Message::RuneRelationPlotReady {
 												source_buffer,
 												revision,
@@ -4554,6 +4668,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 												continuation,
 												resolved,
 												kernel,
+												recipe: recipe.clone(),
 											},
 											Err(error) => Message::RuneRelationLayeredPlotReady {
 												source_buffer,
@@ -4563,6 +4678,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 												authored_settings,
 												span,
 												result: Err(error),
+												recipe,
 											},
 										},
 									));
@@ -4573,7 +4689,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										None,
 										figure_grid,
 										Some(layer_settings),
-										move |resolved, result| match result {
+										move |resolved, result, recipe| match result {
 											Ok(kernel) => Message::RuneRelationPlotReady {
 												source_buffer,
 												revision,
@@ -4584,6 +4700,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 												continuation,
 												resolved,
 												kernel,
+												recipe: recipe.clone(),
 											},
 											Err(error) => Message::RuneRelationLayeredPlotReady {
 												source_buffer,
@@ -4593,6 +4710,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 												authored_settings,
 												span,
 												result: Err(error),
+												recipe,
 											},
 										},
 									));
@@ -4610,14 +4728,17 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										sink.source,
 										Some(facet),
 										figure_grid,
-										move |result| Message::RuneRelationLayeredPlotReady {
-											source_buffer,
-											revision,
-											panel_id,
-											presentation,
-											authored_settings,
-											span,
-											result,
+										move |result, recipe| {
+											Message::RuneRelationLayeredPlotReady {
+												source_buffer,
+												revision,
+												panel_id,
+												presentation,
+												authored_settings,
+												span,
+												result,
+												recipe,
+											}
 										},
 									));
 								} else {
@@ -4626,14 +4747,17 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										sink.source,
 										None,
 										figure_grid,
-										move |result| Message::RuneRelationLayeredPlotReady {
-											source_buffer,
-											revision,
-											panel_id,
-											presentation,
-											authored_settings,
-											span,
-											result,
+										move |result, recipe| {
+											Message::RuneRelationLayeredPlotReady {
+												source_buffer,
+												revision,
+												panel_id,
+												presentation,
+												authored_settings,
+												span,
+												result,
+												recipe,
+											}
 										},
 									));
 								}
@@ -4683,11 +4807,18 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
 				return Task::none();
 			}
-			app_state.code_editor.set_rune_view_plot(
+			let recipe = crate::plot::recipe::PlotRecipe::single(
+				Arc::clone(&resolved.artifact),
+				resolved.resolved_spec.clone(),
+				1200,
+				720,
+			);
+			app_state.code_editor.set_rune_view_plot_with_recipe(
 				panel_id,
 				display_label,
 				kernel,
 				PlotSettingsLayer::default(),
+				recipe,
 			);
 			app_state.status_error.clear();
 			app_state.status_msg = format!("Plotted {}.", resolved.source_name);
@@ -4703,6 +4834,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			continuation,
 			resolved,
 			kernel,
+			recipe,
 		} => {
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
 				return Task::none();
@@ -4728,14 +4860,17 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					}
 				});
 			let plot_type = Some(resolved.resolved_spec.composition.primary_plot_type());
-			app_state.code_editor.set_rune_view_plot_with_source(
-				panel_id,
-				presentation.display_label,
-				kernel,
-				authored_settings,
-				source_attachment,
-				plot_type,
-			);
+			app_state
+				.code_editor
+				.set_rune_view_plot_with_source_and_recipe(
+					panel_id,
+					presentation.display_label,
+					kernel,
+					authored_settings,
+					source_attachment,
+					plot_type,
+					recipe,
+				);
 			app_state.rune_categorical_identities.insert(
 				(source_buffer, identity, continuation.palette_len),
 				continuation.identity,
@@ -4751,17 +4886,19 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			authored_settings,
 			span,
 			result,
+			recipe,
 		} => {
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
 				return Task::none();
 			}
 			match result {
 				Ok(kernel) => {
-					app_state.code_editor.set_rune_view_plot(
+					app_state.code_editor.set_rune_view_plot_with_recipe(
 						panel_id,
 						presentation.display_label.clone(),
 						kernel,
 						authored_settings,
+						recipe,
 					);
 					app_state.status_msg = format!("Built {}.", presentation.display_label);
 				}
@@ -4912,7 +5049,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 						facet,
 						figure_grid,
 						None,
-						move |resolved, kernel| Message::SettingsPreviewPlotReady {
+						move |resolved, kernel, _recipe| Message::SettingsPreviewPlotReady {
 							preview_generation,
 							panel_id,
 							commit,
@@ -4943,7 +5080,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 						facet,
 						figure_grid,
 						Some(layer_settings),
-						move |resolved, kernel| Message::SettingsPreviewPlotReady {
+						move |resolved, kernel, _recipe| Message::SettingsPreviewPlotReady {
 							preview_generation,
 							panel_id,
 							commit,
@@ -5105,6 +5242,9 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					artifact,
 					statements,
 				} => {
+					app_state
+						.code_editor
+						.bind_notebook_artifact(&identity, &artifact);
 					let (rows, cols) = artifact.shape();
 					let df = match artifact.projection() {
 						Ok(frame) => frame,
@@ -5117,14 +5257,17 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					// remains a Rune input even when it renders in a pane or nowhere.
 					app_state
 						.code_editor
-						.retain_markdown_cell_table(identity.clone(), df.as_ref());
+						.retain_markdown_cell_artifact(identity.clone(), Arc::clone(&artifact));
 					match presentation.output {
 						MarkdownCellOutputTarget::Inline => app_state
 							.code_editor
 							.set_markdown_cell_table(identity, df.as_ref().clone()),
 						MarkdownCellOutputTarget::Pane => {
 							app_state.code_editor.begin_query();
-							app_state.code_editor.set_query_result(df.as_ref().clone())
+							app_state.code_editor.set_query_result_from_artifact(
+								df.as_ref().clone(),
+								Arc::clone(&artifact),
+							)
 						}
 						MarkdownCellOutputTarget::None => {}
 					}
@@ -5178,6 +5321,9 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					plot: Some(resolved),
 					receipts,
 				}) => {
+					app_state
+						.code_editor
+						.bind_notebook_artifact(&identity, &resolved.artifact);
 					app_state.status_error.clear();
 					app_state.status_msg = format!("Building plot from {}…", resolved.source_name);
 					return build_resolved_plot_task(resolved, 720, move |resolved, kernel| {
@@ -5219,17 +5365,23 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			receipts,
 		} => {
 			let composition = resolved.resolved_spec.composition.clone();
+			let recipe = crate::plot::recipe::PlotRecipe::single(
+				Arc::clone(&resolved.artifact),
+				resolved.resolved_spec.clone(),
+				1200,
+				720,
+			);
 			match presentation.output {
-				MarkdownCellOutputTarget::Inline => {
-					app_state
-						.code_editor
-						.set_markdown_cell_plot(identity, composition, kernel)
-				}
+				MarkdownCellOutputTarget::Inline => app_state
+					.code_editor
+					.set_markdown_cell_plot_with_recipe(identity, composition, kernel, recipe),
 				MarkdownCellOutputTarget::Pane => {
 					app_state.code_editor.begin_query();
-					app_state
-						.code_editor
-						.set_query_plot(composition.title(), kernel);
+					app_state.code_editor.set_query_plot_with_recipe(
+						composition.title(),
+						kernel,
+						recipe,
+					);
 				}
 				MarkdownCellOutputTarget::None => {}
 			}
@@ -5250,20 +5402,28 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			app_state.status_msg = format!("Exporting {count} plots as {format}...");
 			return Task::perform(
 				async move {
-					tokio::task::spawn_blocking(move || {
+					tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
 						for (index, snapshot) in snapshots.into_iter().enumerate() {
-							let job = render_plot_export(snapshot, format, index + 1);
+							let job = render_plot_export(snapshot, format, index + 1)?;
 							job.write_to(std::path::Path::new("."));
 						}
+						Ok(())
 					})
 					.await
-					.unwrap();
+					.map_err(|error| format!("Export · task failed: {error}"))?
 				},
-				move |()| Message::ExportDone(count, format),
+				move |result| match result {
+					Ok(()) => Message::ExportDone(count, format),
+					Err(error) => Message::ExportFailed(error),
+				},
 			);
 		}
 		Message::ExportDone(count, format) => {
 			app_state.status_msg = format!("Exported {count} plots as {format}.");
+		}
+		Message::ExportFailed(error) => {
+			app_state.status_msg = "Export refused.".to_owned();
+			app_state.status_error = error;
 		}
 		Message::ConnectionNameChanged(name) => {
 			app_state.adapter_state.name = name;
@@ -6618,6 +6778,12 @@ mod tests {
 				.expect("prepared plot panel");
 			match plot {
 				ReadyPlot::Single(presentation, resolved, authored_settings, continuation) => {
+					let recipe = crate::plot::recipe::PlotRecipe::single(
+						Arc::clone(&resolved.artifact),
+						resolved.resolved_spec.clone(),
+						1200,
+						720,
+					);
 					let kernel = create_plot_from_artifact(
 						&resolved.resolved_spec,
 						&resolved.data,
@@ -6637,6 +6803,7 @@ mod tests {
 							continuation,
 							resolved,
 							kernel,
+							recipe,
 						},
 					));
 				}
@@ -6647,6 +6814,15 @@ mod tests {
 					authored_settings,
 					continuation,
 				) => {
+					let recipe = crate::plot::recipe::PlotRecipe::facet(
+						Arc::clone(&resolved.artifact),
+						Arc::new(resolved.resolved_spec.clone()),
+						None,
+						crate::plot::grid::FigureGridLayoutSettings::default(),
+						Some(layer_settings.clone()),
+						1200,
+						720,
+					);
 					let kernel = create_styled_plot_from_artifact(
 						&resolved.resolved_spec,
 						&resolved.data,
@@ -6666,6 +6842,7 @@ mod tests {
 							continuation,
 							resolved,
 							kernel,
+							recipe,
 						},
 					));
 				}
@@ -6676,6 +6853,14 @@ mod tests {
 					source,
 					span,
 				) => {
+					let recipe = crate::plot::recipe::PlotRecipe::layered(
+						Arc::clone(&source),
+						specification.clone(),
+						None,
+						crate::plot::grid::FigureGridLayoutSettings::default(),
+						1200,
+						720,
+					);
 					let result = source
 						.projection()
 						.map_err(|error| error.to_string())
@@ -6698,6 +6883,7 @@ mod tests {
 							authored_settings,
 							span,
 							result,
+							recipe,
 						},
 					));
 				}
@@ -8012,6 +8198,14 @@ ket.table("test2") // Comment Test1.
 			.code_editor
 			.rune_view_panel_id(source_buffer, &identity)
 			.expect("prepared layered destination");
+		let recipe = crate::plot::recipe::PlotRecipe::layered(
+			Arc::clone(&sink.source),
+			specification.clone(),
+			None,
+			crate::plot::grid::FigureGridLayoutSettings::default(),
+			1200,
+			720,
+		);
 		drop(update(
 			&mut state,
 			Message::RuneRelationLayeredPlotReady {
@@ -8022,6 +8216,7 @@ ket.table("test2") // Comment Test1.
 				authored_settings: crate::plot::theme::PlotSettingsLayer::default(),
 				span: span.clone(),
 				result: Err(error.clone()),
+				recipe,
 			},
 		));
 		let detail = state.status_detail.as_ref().expect("full Rune diagnostic");
@@ -9985,7 +10180,9 @@ workspace.table("bad").views([view("bad", table())]);
 			baseline.height = 100.0;
 			baseline.settings_model.library_defaults.scatter_render_mode =
 				crate::plot::common::ScatterRenderMode::Rasterized;
-			super::render_plot_export(baseline, format, baseline_ordinal).write_to(&export_root);
+			super::render_plot_export(baseline, format, baseline_ordinal)
+				.expect("baseline export")
+				.write_to(&export_root);
 			let baseline_bytes =
 				std::fs::read(export_root.join(format!("plot_{baseline_ordinal}.{extension}")))
 					.expect("baseline export artifact");
@@ -10013,7 +10210,9 @@ workspace.table("bad").views([view("bad", table())]);
 			);
 			snapshot.settings_model.library_defaults.scatter_render_mode =
 				crate::plot::common::ScatterRenderMode::Rasterized;
-			super::render_plot_export(snapshot, format, ordinal).write_to(&export_root);
+			super::render_plot_export(snapshot, format, ordinal)
+				.expect("viewport export")
+				.write_to(&export_root);
 			let path = export_root.join(format!("plot_{ordinal}.{extension}"));
 			let bytes = std::fs::read(&path).expect("rendered export artifact");
 			assert!(bytes.len() > 32, "{format} export is non-empty");
@@ -10102,6 +10301,109 @@ workspace.table("bad").views([view("bad", table())]);
 		);
 		assert!(!state.code_editor.has_query_surface());
 		state.code_editor.shutdown();
+	}
+
+	#[test]
+	fn product_0151_pending_export_rebuilds_the_dispatch_revision_exactly() {
+		use crate::gui::messages::ExportFormat;
+		use crate::plot::composition::PlotComposition;
+		use crate::plot::core::PlotType;
+		use crate::plot::factory::create_plot_from_artifact;
+		use crate::plot::request::{PlotRequest, PlotSource, plan};
+		use crate::plot::spec::{AuthoredPlotSpec, SemanticType};
+		use crate::selection::{
+			ConstraintForm, ExactScalar, FieldConstraint, FieldRef, InputIdentity, Predicate,
+			ScalarType, SelectionRevision,
+		};
+		use std::collections::HashSet;
+		use std::sync::Arc;
+
+		let artifact = crate::result_artifact::ResultArtifact::from_polars(Arc::new(
+			polars::df!("x" => [1_i64, 2], "y" => [2_i64, 3]).expect("export frame"),
+		));
+		artifact.bind_input_identity(InputIdentity::mint());
+		let resolved = plan(PlotRequest {
+			source: PlotSource::Materialized {
+				name: "selection export".into(),
+				data: Arc::clone(&artifact),
+			},
+			authored_spec: AuthoredPlotSpec::xy(
+				PlotComposition::single(PlotType::Scatter),
+				"x",
+				"y",
+			),
+		})
+		.expect("resolved export");
+		let recipe = crate::plot::recipe::PlotRecipe::single(
+			Arc::clone(&artifact),
+			resolved.resolved_spec.clone(),
+			320,
+			220,
+		);
+		let unfiltered =
+			create_plot_from_artifact(&resolved.resolved_spec, &resolved.data, &artifact, 320, 220);
+		let predicate = |value| Predicate {
+			fields: vec![FieldConstraint {
+				field: FieldRef::new("x", SemanticType::Quantitative, ScalarType::Int),
+				form: ConstraintForm::Values(HashSet::from([ExactScalar::Int(value)])),
+			}],
+		};
+		let revision = SelectionRevision::ZERO.next();
+		let snapshot =
+			|kernel, predicate, displayed_selection_revision| crate::editor::HostPlotExport {
+				title: "selection export".into(),
+				kernel,
+				settings_model: crate::plot::theme::PlotSettings::default(),
+				render_revision: 0,
+				resize_render_suspended: false,
+				width: 320.0,
+				height: 220.0,
+				recipe: Some(recipe.clone()),
+				predicate,
+				selection_revision: revision,
+				displayed_selection_revision,
+			};
+		let svg = |snapshot| match super::render_plot_export(snapshot, ExportFormat::SVG, 1)
+			.expect("selection export")
+			.artifact
+		{
+			super::RenderedPlotExport::Svg(svg) => svg,
+			_ => unreachable!("SVG requested"),
+		};
+
+		let dispatched = predicate(1);
+		let pending = svg(snapshot(
+			Arc::clone(&unfiltered),
+			dispatched.clone(),
+			SelectionRevision::ZERO,
+		));
+		let settled_kernel = recipe.rebuild(&dispatched).expect("settled revision");
+		let settled = svg(snapshot(settled_kernel, dispatched, revision));
+		assert_eq!(pending, settled);
+		assert!(!pending.contains("preparing raster"));
+
+		let later_kernel = recipe.rebuild(&predicate(2)).expect("later revision");
+		let later = svg(snapshot(later_kernel, predicate(2), revision));
+		assert_ne!(
+			pending, later,
+			"a later live selection cannot change the dispatch-time export snapshot"
+		);
+
+		let invalid = Predicate {
+			fields: vec![FieldConstraint {
+				field: FieldRef::new("missing", SemanticType::Quantitative, ScalarType::Int),
+				form: ConstraintForm::Values(HashSet::from([ExactScalar::Int(1)])),
+			}],
+		};
+		let refusal = super::render_plot_export(
+			snapshot(Arc::clone(&unfiltered), invalid, SelectionRevision::ZERO),
+			ExportFormat::SVG,
+			1,
+		)
+		.err()
+		.expect("a failed exact rebuild refuses export");
+		assert!(refusal.starts_with("Export · refused:"));
+		assert!(refusal.contains("missing"));
 	}
 
 	#[test]
@@ -12005,6 +12307,12 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			1200,
 			720,
 		);
+		let recipe = crate::plot::recipe::PlotRecipe::single(
+			Arc::clone(&stale_resolved.artifact),
+			stale_resolved.resolved_spec.clone(),
+			1200,
+			720,
+		);
 		drop(update(
 			&mut state,
 			Message::RuneRelationPlotReady {
@@ -12017,6 +12325,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 				continuation: stale_continuation,
 				resolved: stale_resolved,
 				kernel,
+				recipe,
 			},
 		));
 		assert_eq!(

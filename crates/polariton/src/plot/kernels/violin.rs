@@ -24,6 +24,8 @@ pub struct ViolinPlotKernel {
 	pub category_colors: Option<Vec<CategoryColorAssignment>>,
 	pub x_label: String,
 	pub y_label: String,
+	pub selection_candidates:
+		std::collections::HashMap<String, crate::selection::SelectionCandidate>,
 }
 
 impl ViolinPlotKernel {
@@ -57,6 +59,20 @@ impl ViolinPlotKernel {
 }
 
 impl PlotKernel for ViolinPlotKernel {
+	fn project_predicate(
+		&self,
+		predicate: &crate::selection::Predicate,
+	) -> Option<Vec<Box<dyn crate::plot::common::EmphasisAnchor>>> {
+		let mut anchors: Vec<Box<dyn crate::plot::common::EmphasisAnchor>> = Vec::new();
+		for (index, curve) in self.prepared_data.curves().enumerate() {
+			let candidate = self.selection_candidates.get(curve.label())?;
+			if predicate.matches_candidate(candidate) {
+				anchors.push(Box::new(ViolinEmphasisAnchor { index }));
+			}
+		}
+		Some(anchors)
+	}
+
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		let grid = self.prepared_data.grid();
 		let y_range = match (grid.first(), grid.last()) {
@@ -199,25 +215,29 @@ impl PlotKernel for ViolinPlotKernel {
 			let index = transform.category_index(curve.label())?;
 			let (center, band_width) = transform.categorical(index, 0.0);
 			if cursor.x >= center.x - band_width / 2.0 && cursor.x <= center.x + band_width / 2.0 {
-				return Some(
-					crate::plot::common::PlotHit::new(
-						crate::plot::common::MarkFamily::VIOLIN,
-						crate::plot::common::HitDimensionality::Area,
-						index,
-					)
-					.labeled(
-						"Category",
-						crate::plot::spec::SemanticType::Nominal,
-						crate::plot::common::HitValue::nominal(curve.label()),
-					)
-					.labeled(
-						"Median",
-						crate::plot::spec::SemanticType::Quantitative,
-						crate::plot::common::HitValue::quantitative(
-							curve.median(),
-							format!("{:.2}", curve.median()),
-						),
+				let hit = crate::plot::common::PlotHit::new(
+					crate::plot::common::MarkFamily::VIOLIN,
+					crate::plot::common::HitDimensionality::Area,
+					index,
+				)
+				.labeled(
+					"Category",
+					crate::plot::spec::SemanticType::Nominal,
+					crate::plot::common::HitValue::nominal(curve.label()),
+				)
+				.labeled(
+					"Median",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::plot::common::HitValue::quantitative(
+						curve.median(),
+						format!("{:.2}", curve.median()),
 					),
+				);
+				return Some(
+					match self.selection_candidates.get(curve.label()).cloned() {
+						Some(candidate) => hit.with_candidate(candidate),
+						None => hit,
+					},
 				);
 			}
 		}
@@ -231,6 +251,66 @@ impl PlotKernel for ViolinPlotKernel {
 	fn y_label(&self) -> String {
 		self.y_label.clone()
 	}
+}
+
+struct ViolinEmphasisAnchor {
+	index: usize,
+}
+
+impl crate::plot::common::EmphasisAnchor for ViolinEmphasisAnchor {
+	fn reproject(
+		&self,
+		transform: &CoordinateTransformer,
+	) -> Option<crate::plot::common::EmphasisShape> {
+		let PlotLayout::CategoricalX { y_range, .. } = transform.layout else {
+			return None;
+		};
+		let (low, band) = transform.categorical(self.index, y_range.0);
+		let (high, _) = transform.categorical(self.index, y_range.1);
+		Some(crate::plot::common::EmphasisShape::Rectangle(Rectangle {
+			x: low.x - band / 2.0,
+			y: low.y.min(high.y),
+			width: band,
+			height: (low.y - high.y).abs(),
+		}))
+	}
+}
+
+pub(crate) fn violin_selection_candidates(
+	df: &DataFrame,
+	group_field: &str,
+) -> std::collections::HashMap<String, crate::selection::SelectionCandidate> {
+	let Ok(column) = df.column(group_field) else {
+		return Default::default();
+	};
+	let Some(scalar_type) = crate::selection::ScalarType::from_dtype(column.dtype()) else {
+		return Default::default();
+	};
+	let Some(exact) = crate::selection::exact_column_values(column) else {
+		return Default::default();
+	};
+	let mut candidates = std::collections::HashMap::new();
+	for row in 0..df.height() {
+		let Some(label) = group_label(column.get(row).expect("violin group row")) else {
+			continue;
+		};
+		let Some(value) = exact.get(row).and_then(Clone::clone) else {
+			continue;
+		};
+		candidates
+			.entry(label)
+			.or_insert_with(|| crate::selection::SelectionCandidate {
+				constraints: vec![(
+					crate::selection::FieldRef::new(
+						group_field,
+						crate::plot::spec::SemanticType::Nominal,
+						scalar_type.clone(),
+					),
+					value,
+				)],
+			});
+	}
+	candidates
 }
 
 fn visible_extent(widths: &[f64]) -> Option<(usize, usize)> {
@@ -347,6 +427,7 @@ mod tests {
 			]),
 			x_label: "group".to_owned(),
 			y_label: "value".to_owned(),
+			selection_candidates: Default::default(),
 		};
 		let settings = ResolvedPlotSettings::default();
 		let aurora = Color::from_rgb8(229, 57, 53);
@@ -365,5 +446,19 @@ mod tests {
 		assert_eq!(entries.first().label, "Aurora");
 		assert_eq!(entries.first().swatch, aurora);
 		assert_eq!(entries.iter().nth(1).expect("second entry").swatch, boreal);
+	}
+
+	#[test]
+	fn product_0151_violin_candidate_is_the_exact_group_field() {
+		let frame = polars::df!("group" => ["Aurora", "Boreal", "Aurora"]).expect("violin groups");
+		let candidates = violin_selection_candidates(&frame, "group");
+		assert_eq!(candidates.len(), 2);
+		let aurora = candidates.get("Aurora").expect("candidate");
+		assert_eq!(aurora.constraints.len(), 1);
+		assert_eq!(aurora.constraints[0].0.name.as_str(), "group");
+		assert_eq!(
+			aurora.constraints[0].1,
+			crate::selection::ExactScalar::Str("Aurora".into())
+		);
 	}
 }

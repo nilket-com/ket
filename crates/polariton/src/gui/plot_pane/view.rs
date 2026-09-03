@@ -48,7 +48,17 @@ pub fn host_view(
 			PlotRenderLayer::Data,
 		)
 		.with_raster_coordinator(&state.raster_coordinator)
-		.with_viewport_state(state.viewport_stamp, state.viewport_motion),
+		.with_viewport_state(state.viewport_stamp, state.viewport_motion)
+		.with_selection_state(
+			state.selection_display == crate::selection::SelectionDisplay::Pending,
+			&state.emphasis_anchors,
+		)
+		.with_composite_emphasis(state.composite_emphasis.as_deref())
+		.with_selection_interaction(
+			state.publication.is_some(),
+			&state.selection_axis_fields,
+			&state.selection_predicate,
+		),
 	)
 	.width(Fill)
 	.height(Fill);
@@ -63,6 +73,16 @@ pub fn host_view(
 			PlotRenderLayer::OverlayInteractive,
 		)
 		.with_viewport_state(state.viewport_stamp, state.viewport_motion)
+		.with_selection_state(
+			state.selection_display == crate::selection::SelectionDisplay::Pending,
+			&state.emphasis_anchors,
+		)
+		.with_composite_emphasis(state.composite_emphasis.as_deref())
+		.with_selection_interaction(
+			state.publication.is_some(),
+			&state.selection_axis_fields,
+			&state.selection_predicate,
+		)
 		.with_settings_inspector_gesture(),
 	)
 	.width(Fill)

@@ -257,6 +257,24 @@ impl CandlestickPlotKernel {
 }
 
 impl PlotKernel for CandlestickPlotKernel {
+	fn project_predicate(
+		&self,
+		predicate: &crate::selection::Predicate,
+	) -> Option<Vec<Box<dyn crate::plot::common::EmphasisAnchor>>> {
+		let mut anchors: Vec<Box<dyn crate::plot::common::EmphasisAnchor>> = Vec::new();
+		for (index, candidate) in self.prepared_data.selection_candidates.iter().enumerate() {
+			if predicate.matches_candidate(candidate) {
+				anchors.push(Box::new(CandlestickEmphasisAnchor {
+					x: self.prepared_data.x[index],
+					low: self.prepared_data.low[index],
+					high: self.prepared_data.high[index],
+					width_fraction: self.prepared_data.minimum_x_delta,
+				}));
+			}
+		}
+		Some(anchors)
+	}
+
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Cartesian {
 			x_range: (
@@ -411,58 +429,62 @@ impl PlotKernel for CandlestickPlotKernel {
 			self.prepared_data.open[index],
 			self.prepared_data.close[index],
 		);
-		Some(
-			crate::plot::common::PlotHit::new(
-				crate::plot::common::MarkFamily::CANDLESTICK,
-				crate::plot::common::HitDimensionality::Area,
-				index,
-			)
-			.labeled(
-				"X",
-				axis_hit_semantic_type(&self.prepared_data.x_axis_type),
-				axis_hit_value(
-					xs[index],
-					&self.prepared_data.x_axis_type,
-					format_label(xs[index], &self.prepared_data.x_axis_type),
-				),
-			)
-			.labeled(
-				"Open",
-				crate::plot::spec::SemanticType::Quantitative,
-				crate::plot::common::HitValue::quantitative(
-					self.prepared_data.open[index],
-					format!("{:.2}", self.prepared_data.open[index]),
-				),
-			)
-			.labeled(
-				"High",
-				crate::plot::spec::SemanticType::Quantitative,
-				crate::plot::common::HitValue::quantitative(
-					self.prepared_data.high[index],
-					format!("{:.2}", self.prepared_data.high[index]),
-				),
-			)
-			.labeled(
-				"Low",
-				crate::plot::spec::SemanticType::Quantitative,
-				crate::plot::common::HitValue::quantitative(
-					self.prepared_data.low[index],
-					format!("{:.2}", self.prepared_data.low[index]),
-				),
-			)
-			.labeled(
-				"Close",
-				crate::plot::spec::SemanticType::Quantitative,
-				crate::plot::common::HitValue::quantitative(
-					self.prepared_data.close[index],
-					format!("{:.2}", self.prepared_data.close[index]),
-				),
-			)
-			.labeled(
-				"Direction",
-				crate::plot::spec::SemanticType::Nominal,
-				crate::plot::common::HitValue::nominal(direction.label()),
+		let hit = crate::plot::common::PlotHit::new(
+			crate::plot::common::MarkFamily::CANDLESTICK,
+			crate::plot::common::HitDimensionality::Area,
+			index,
+		)
+		.labeled(
+			"X",
+			axis_hit_semantic_type(&self.prepared_data.x_axis_type),
+			axis_hit_value(
+				xs[index],
+				&self.prepared_data.x_axis_type,
+				format_label(xs[index], &self.prepared_data.x_axis_type),
 			),
+		)
+		.labeled(
+			"Open",
+			crate::plot::spec::SemanticType::Quantitative,
+			crate::plot::common::HitValue::quantitative(
+				self.prepared_data.open[index],
+				format!("{:.2}", self.prepared_data.open[index]),
+			),
+		)
+		.labeled(
+			"High",
+			crate::plot::spec::SemanticType::Quantitative,
+			crate::plot::common::HitValue::quantitative(
+				self.prepared_data.high[index],
+				format!("{:.2}", self.prepared_data.high[index]),
+			),
+		)
+		.labeled(
+			"Low",
+			crate::plot::spec::SemanticType::Quantitative,
+			crate::plot::common::HitValue::quantitative(
+				self.prepared_data.low[index],
+				format!("{:.2}", self.prepared_data.low[index]),
+			),
+		)
+		.labeled(
+			"Close",
+			crate::plot::spec::SemanticType::Quantitative,
+			crate::plot::common::HitValue::quantitative(
+				self.prepared_data.close[index],
+				format!("{:.2}", self.prepared_data.close[index]),
+			),
+		)
+		.labeled(
+			"Direction",
+			crate::plot::spec::SemanticType::Nominal,
+			crate::plot::common::HitValue::nominal(direction.label()),
+		);
+		Some(
+			match self.prepared_data.selection_candidates.get(index).cloned() {
+				Some(candidate) => hit.with_candidate(candidate),
+				None => hit,
+			},
 		)
 	}
 
@@ -472,6 +494,38 @@ impl PlotKernel for CandlestickPlotKernel {
 
 	fn y_label(&self) -> String {
 		self.prepared_data.y_label.clone()
+	}
+}
+
+struct CandlestickEmphasisAnchor {
+	x: f64,
+	low: f64,
+	high: f64,
+	width_fraction: Option<f64>,
+}
+
+impl crate::plot::common::EmphasisAnchor for CandlestickEmphasisAnchor {
+	fn reproject(
+		&self,
+		transform: &CoordinateTransformer,
+	) -> Option<crate::plot::common::EmphasisShape> {
+		let low = transform.cartesian(self.x, self.low);
+		let high = transform.cartesian(self.x, self.high);
+		let width = match (self.width_fraction, transform.layout) {
+			(Some(delta), PlotLayout::Cartesian { x_range, .. }) => {
+				(transform.bounds.width as f64 * delta
+					/ (x_range.1 - x_range.0).abs().max(f64::EPSILON)) as f32
+					* BODY_WIDTH_FRACTION
+			}
+			_ => transform.bounds.width * BODY_WIDTH_FRACTION,
+		}
+		.max(1.0);
+		Some(crate::plot::common::EmphasisShape::Rectangle(Rectangle {
+			x: low.x - width / 2.0,
+			y: high.y.min(low.y),
+			width,
+			height: (low.y - high.y).abs().max(1.0),
+		}))
 	}
 }
 
@@ -489,6 +543,7 @@ pub struct CandlestickPreparedData {
 	pub x_label: String,
 	pub y_label: String,
 	pub(crate) minimum_x_delta: Option<f64>,
+	pub selection_candidates: Vec<crate::selection::SelectionCandidate>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -750,6 +805,31 @@ pub fn prepare_candlestick_data(
 		df.column(x_field).expect("validated x column"),
 		&x_axis_type,
 	);
+	let x_exact =
+		crate::selection::exact_column_values(df.column(x_field).expect("validated x column"))
+			.unwrap_or_default();
+	let x_scalar_type = crate::selection::ScalarType::from_dtype(&x_dtype);
+	let x_semantic_type = crate::selection::semantic_type_for_dtype(&x_dtype);
+	let selection_candidates = x_scalar_type
+		.zip(x_semantic_type)
+		.map(|(scalar_type, semantic_type)| {
+			x_exact
+				.into_iter()
+				.filter_map(|value| {
+					Some(crate::selection::SelectionCandidate {
+						constraints: vec![(
+							crate::selection::FieldRef::new(
+								x_field,
+								semantic_type,
+								scalar_type.clone(),
+							),
+							value?,
+						)],
+					})
+				})
+				.collect()
+		})
+		.unwrap_or_default();
 	Ok(CandlestickPreparedData {
 		x,
 		open,
@@ -763,6 +843,7 @@ pub fn prepare_candlestick_data(
 		x_label: x_field.to_owned(),
 		y_label: format!("{open_field} / {high_field} / {low_field} / {close_field}"),
 		minimum_x_delta,
+		selection_candidates,
 	})
 }
 
@@ -786,6 +867,29 @@ mod tests {
 
 	fn prepare(frame: &DataFrame) -> Result<CandlestickPreparedData, CandlestickPreparationError> {
 		prepare_candlestick_data(frame, "x", "open", "high", "low", "close")
+	}
+
+	#[test]
+	fn product_0151_candlestick_candidate_uses_x_and_projects_one_column() {
+		let prepared = prepare(&numeric_frame()).expect("prepared candle");
+		let candidate = &prepared.selection_candidates[1];
+		assert_eq!(candidate.constraints.len(), 1);
+		assert_eq!(candidate.constraints[0].0.name.as_str(), "x");
+		let predicate = crate::selection::Predicate::from_candidate(candidate).expect("predicate");
+		let kernel = CandlestickPlotKernel {
+			prepared_data: Arc::new(prepared),
+		};
+		let anchors = kernel.project_predicate(&predicate).expect("admitted");
+		assert_eq!(anchors.len(), 1);
+		let layout = kernel.layout(ResolvedPlotSettings::default());
+		let transform = CoordinateTransformer::new(
+			&layout,
+			Rectangle::new(Point::ORIGIN, Size::new(400.0, 200.0)),
+		);
+		assert!(matches!(
+			anchors[0].reproject(&transform),
+			Some(crate::plot::common::EmphasisShape::Rectangle(_))
+		));
 	}
 
 	#[test]
@@ -988,6 +1092,11 @@ mod tests {
 				..
 			}) if first_tick == first && last_tick == first + 1
 		));
+		assert_ne!(
+			prepared.selection_candidates[0].constraints[0].1,
+			prepared.selection_candidates[1].constraints[0].1,
+			"selection retains adjacent source ticks even when paint projection collapses"
+		);
 		let kernel = CandlestickPlotKernel {
 			prepared_data: Arc::new(prepared),
 		};
@@ -1001,6 +1110,10 @@ mod tests {
 			)
 			.expect("collapsed adjacent nanoseconds remain hittable");
 		assert_eq!(hit.sibling_ordinal, 0);
+		assert!(matches!(
+			hit.candidate.as_ref().map(|candidate| &candidate.constraints[0].1),
+			Some(crate::selection::ExactScalar::Datetime { ticks, .. }) if *ticks == first
+		));
 		assert_eq!(
 			hit.fields[0].semantic_type,
 			crate::plot::spec::SemanticType::Temporal

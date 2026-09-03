@@ -25,6 +25,24 @@ impl HeatmapPlotKernel {
 }
 
 impl PlotKernel for HeatmapPlotKernel {
+	fn project_predicate(
+		&self,
+		predicate: &crate::selection::Predicate,
+	) -> Option<Vec<Box<dyn crate::plot::common::EmphasisAnchor>>> {
+		let mut anchors: Vec<Box<dyn crate::plot::common::EmphasisAnchor>> = Vec::new();
+		for (x_index, column) in self.prepared_data.selection_candidates.iter().enumerate() {
+			for (y_index, candidate) in column.iter().enumerate() {
+				if candidate
+					.as_ref()
+					.is_some_and(|candidate| predicate.matches_candidate(candidate))
+				{
+					anchors.push(Box::new(HeatmapEmphasisAnchor { x_index, y_index }));
+				}
+			}
+		}
+		Some(anchors)
+	}
+
 	fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::CategoricalXY {
 			x_categories: self.prepared_data.cells.x_categories().to_vec(),
@@ -94,31 +112,39 @@ impl PlotKernel for HeatmapPlotKernel {
 					if rect.contains(cursor_pos) {
 						let x_cat = &self.prepared_data.cells.x_categories()[i];
 						let y_cat = &self.prepared_data.cells.y_categories()[j];
-						return Some(
-							crate::plot::common::PlotHit::new(
-								crate::plot::common::MarkFamily::HEATMAP,
-								crate::plot::common::HitDimensionality::Area,
-								i * num_y + j,
-							)
-							.labeled(
-								"X",
-								crate::plot::spec::SemanticType::Nominal,
-								crate::plot::common::HitValue::nominal(x_cat),
-							)
-							.labeled(
-								"Y",
-								crate::plot::spec::SemanticType::Nominal,
-								crate::plot::common::HitValue::nominal(y_cat),
-							)
-							.labeled(
-								"Value",
-								crate::plot::spec::SemanticType::Quantitative,
-								crate::plot::common::HitValue::quantitative(
-									value,
-									format!("{value:.2}"),
-								),
+						let hit = crate::plot::common::PlotHit::new(
+							crate::plot::common::MarkFamily::HEATMAP,
+							crate::plot::common::HitDimensionality::Area,
+							i * num_y + j,
+						)
+						.labeled(
+							"X",
+							crate::plot::spec::SemanticType::Nominal,
+							crate::plot::common::HitValue::nominal(x_cat),
+						)
+						.labeled(
+							"Y",
+							crate::plot::spec::SemanticType::Nominal,
+							crate::plot::common::HitValue::nominal(y_cat),
+						)
+						.labeled(
+							"Value",
+							crate::plot::spec::SemanticType::Quantitative,
+							crate::plot::common::HitValue::quantitative(
+								value,
+								format!("{value:.2}"),
 							),
 						);
+						let candidate = self
+							.prepared_data
+							.selection_candidates
+							.get(i)
+							.and_then(|column| column.get(j))
+							.and_then(Clone::clone);
+						return Some(match candidate {
+							Some(candidate) => hit.with_candidate(candidate),
+							None => hit,
+						});
 					}
 				}
 			}
@@ -145,12 +171,33 @@ impl PlotKernel for HeatmapPlotKernel {
 	}
 }
 
+struct HeatmapEmphasisAnchor {
+	x_index: usize,
+	y_index: usize,
+}
+
+impl crate::plot::common::EmphasisAnchor for HeatmapEmphasisAnchor {
+	fn reproject(
+		&self,
+		transform: &CoordinateTransformer,
+	) -> Option<crate::plot::common::EmphasisShape> {
+		let (center, width, height) = transform.categorical_2d(self.x_index, self.y_index);
+		Some(crate::plot::common::EmphasisShape::Rectangle(Rectangle {
+			x: center.x - width / 2.0,
+			y: center.y - height / 2.0,
+			width,
+			height,
+		}))
+	}
+}
+
 #[derive(Debug)]
 pub struct HeatmapPreparedData {
 	pub cells: HeatmapCells,
 	pub color_intent: ContinuousScaleIntent,
 	pub x_label: String,
 	pub y_label: String,
+	pub selection_candidates: Vec<Vec<Option<crate::selection::SelectionCandidate>>>,
 }
 
 pub(crate) fn prepare_heatmap_data(
@@ -181,11 +228,72 @@ pub(crate) fn prepare_heatmap_data(
 			value: values.get(row),
 		});
 	}
+	let cells = HeatmapCells::from_rows(rows)?;
+	let mut selection_candidates =
+		vec![vec![None; cells.y_categories().len()]; cells.x_categories().len()];
+	let x_exact = crate::selection::exact_column_values(x_values);
+	let y_exact = crate::selection::exact_column_values(y_values);
+	let x_type = crate::selection::ScalarType::from_dtype(x_values.dtype());
+	let y_type = crate::selection::ScalarType::from_dtype(y_values.dtype());
+	for row in 0..df.height() {
+		let (Some(x_values_exact), Some(y_values_exact), Some(x_type), Some(y_type)) =
+			(&x_exact, &y_exact, &x_type, &y_type)
+		else {
+			break;
+		};
+		let Some(x_value) = x_values_exact.get(row).and_then(Clone::clone) else {
+			continue;
+		};
+		let Some(y_value) = y_values_exact.get(row).and_then(Clone::clone) else {
+			continue;
+		};
+		let Some(x_label) = category_key(x_values.get(row).expect("heatmap x row")) else {
+			continue;
+		};
+		let Some(y_label) = category_key(y_values.get(row).expect("heatmap y row")) else {
+			continue;
+		};
+		let Some(x_index) = cells
+			.x_categories()
+			.iter()
+			.position(|item| item == &x_label)
+		else {
+			continue;
+		};
+		let Some(y_index) = cells
+			.y_categories()
+			.iter()
+			.position(|item| item == &y_label)
+		else {
+			continue;
+		};
+		selection_candidates[x_index][y_index] = Some(crate::selection::SelectionCandidate {
+			constraints: vec![
+				(
+					crate::selection::FieldRef::new(
+						x_col,
+						crate::plot::spec::SemanticType::Nominal,
+						x_type.clone(),
+					),
+					x_value,
+				),
+				(
+					crate::selection::FieldRef::new(
+						y_col,
+						crate::plot::spec::SemanticType::Nominal,
+						y_type.clone(),
+					),
+					y_value,
+				),
+			],
+		});
+	}
 	Ok(HeatmapPreparedData {
-		cells: HeatmapCells::from_rows(rows)?,
+		cells,
 		color_intent: ContinuousScaleIntent::SEQUENTIAL,
 		x_label: x_col.to_owned(),
 		y_label: y_col.to_owned(),
+		selection_candidates,
 	})
 }
 
@@ -531,5 +639,46 @@ mod tests {
 		};
 		assert!(stops.values().any(|value| value == 0.0));
 		assert_eq!(stops.sample_normalized(0.5), backend.rectangles[1].2);
+	}
+
+	#[test]
+	fn product_0151_heatmap_candidate_and_anchor_use_both_categories() {
+		let frame = polars::df!(
+			"x" => ["left", "right"],
+			"y" => ["top", "bottom"],
+			"value" => [1_i64, 2],
+		)
+		.expect("selection fixture");
+		let kernel = kernel(&frame).expect("heatmap");
+		let candidate = kernel
+			.prepared_data
+			.selection_candidates
+			.iter()
+			.flatten()
+			.find_map(Option::as_ref)
+			.expect("cell candidate");
+		assert_eq!(candidate.constraints.len(), 2);
+		assert_eq!(
+			candidate
+				.constraints
+				.iter()
+				.map(|(field, _)| field.name.as_str())
+				.collect::<std::collections::HashSet<_>>(),
+			std::collections::HashSet::from(["x", "y"])
+		);
+		let predicate = crate::selection::Predicate::from_candidate(candidate).expect("predicate");
+		let anchors = kernel
+			.project_predicate(&predicate)
+			.expect("admitted family");
+		assert_eq!(anchors.len(), 1);
+		let layout = kernel.layout(ResolvedPlotSettings::default());
+		let transform = CoordinateTransformer::new(
+			&layout,
+			Rectangle::new(Point::ORIGIN, Size::new(300.0, 200.0)),
+		);
+		assert!(matches!(
+			anchors[0].reproject(&transform),
+			Some(crate::plot::common::EmphasisShape::Rectangle(_))
+		));
 	}
 }

@@ -177,35 +177,73 @@ impl BarPlotKernel {
 			}
 			_ => return None,
 		};
-		Some(
-			crate::plot::common::PlotHit::new(
-				crate::plot::common::MarkFamily::BAR,
-				crate::plot::common::HitDimensionality::Area,
-				hit.category_index * self.prepared_data.group_names.len() + hit.group_index,
-			)
-			.labeled(
-				"Category",
-				crate::plot::spec::SemanticType::Nominal,
-				crate::plot::common::HitValue::nominal(category),
-			)
-			.labeled(
-				"Group",
-				crate::plot::spec::SemanticType::Nominal,
-				crate::plot::common::HitValue::nominal(group),
-			)
-			.labeled(
-				"Value",
-				crate::plot::spec::SemanticType::Quantitative,
-				crate::plot::common::HitValue::quantitative(
-					approximate_value,
-					format!("~{approximate_value:.2}"),
-				),
-			),
+		let plot_hit = crate::plot::common::PlotHit::new(
+			crate::plot::common::MarkFamily::BAR,
+			crate::plot::common::HitDimensionality::Area,
+			hit.category_index * self.prepared_data.group_names.len() + hit.group_index,
 		)
+		.labeled(
+			"Category",
+			crate::plot::spec::SemanticType::Nominal,
+			crate::plot::common::HitValue::nominal(category),
+		)
+		.labeled(
+			"Group",
+			crate::plot::spec::SemanticType::Nominal,
+			crate::plot::common::HitValue::nominal(group),
+		)
+		.labeled(
+			"Value",
+			crate::plot::spec::SemanticType::Quantitative,
+			crate::plot::common::HitValue::quantitative(
+				approximate_value,
+				format!("~{approximate_value:.2}"),
+			),
+		);
+		let candidate = self
+			.prepared_data
+			.selection_candidates
+			.get(hit.category_index)
+			.and_then(|groups| groups.get(hit.group_index))
+			.and_then(Clone::clone);
+		Some(match candidate {
+			Some(candidate) if self.prepared_data.click_selectable => {
+				plot_hit.with_candidate(candidate)
+			}
+			_ => plot_hit,
+		})
 	}
 }
 
 impl PlotKernel for BarPlotKernel {
+	fn project_predicate(
+		&self,
+		predicate: &crate::selection::Predicate,
+	) -> Option<Vec<Box<dyn crate::plot::common::EmphasisAnchor>>> {
+		if !self.prepared_data.click_selectable {
+			return None;
+		}
+		let group_count = self.prepared_data.group_names.len();
+		let mut anchors: Vec<Box<dyn crate::plot::common::EmphasisAnchor>> = Vec::new();
+		for (category_index, groups) in self.prepared_data.selection_candidates.iter().enumerate() {
+			for (group_index, candidate) in groups.iter().enumerate() {
+				if candidate
+					.as_ref()
+					.is_some_and(|candidate| predicate.matches_candidate(candidate))
+				{
+					anchors.push(Box::new(BarEmphasisAnchor {
+						category_index,
+						group_index,
+						group_count,
+						orientation: self.orientation,
+						value: self.prepared_data.values[category_index][group_index],
+					}));
+				}
+			}
+		}
+		Some(anchors)
+	}
+
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		match self.orientation {
 			Orientation::Vertical => PlotLayout::CategoricalX {
@@ -350,6 +388,48 @@ impl PlotKernel for BarPlotKernel {
 	}
 }
 
+struct BarEmphasisAnchor {
+	category_index: usize,
+	group_index: usize,
+	group_count: usize,
+	orientation: Orientation,
+	value: f64,
+}
+
+impl crate::plot::common::EmphasisAnchor for BarEmphasisAnchor {
+	fn reproject(
+		&self,
+		transform: &CoordinateTransformer,
+	) -> Option<crate::plot::common::EmphasisShape> {
+		let groups = self.group_count.max(1) as f32;
+		match (self.orientation, transform.layout) {
+			(Orientation::Vertical, PlotLayout::CategoricalX { y_range, .. }) => {
+				let (base, band) = transform.categorical(self.category_index, y_range.0);
+				let (tip, _) = transform.categorical(self.category_index, self.value);
+				let slot = band / groups;
+				Some(crate::plot::common::EmphasisShape::Rectangle(Rectangle {
+					x: base.x - band / 2.0 + self.group_index as f32 * slot,
+					y: tip.y.min(base.y),
+					width: slot,
+					height: (base.y - tip.y).abs().max(1.0),
+				}))
+			}
+			(Orientation::Horizontal, PlotLayout::CategoricalY { x_range, .. }) => {
+				let (base, band) = transform.categorical(self.category_index, x_range.0);
+				let (tip, _) = transform.categorical(self.category_index, self.value);
+				let slot = band / groups;
+				Some(crate::plot::common::EmphasisShape::Rectangle(Rectangle {
+					x: tip.x.min(base.x),
+					y: base.y - band / 2.0 + self.group_index as f32 * slot,
+					width: (tip.x - base.x).abs().max(1.0),
+					height: slot,
+				}))
+			}
+			_ => None,
+		}
+	}
+}
+
 pub struct BarPreparedData {
 	pub categories: Vec<String>,
 	pub group_names: Vec<String>,
@@ -358,6 +438,8 @@ pub struct BarPreparedData {
 	pub x_label: String,
 	pub y_label: String,
 	pub group_provenance: LegendProvenance,
+	pub click_selectable: bool,
+	pub selection_candidates: Vec<Vec<Option<crate::selection::SelectionCandidate>>>,
 }
 
 pub fn prepare_bar_data(
@@ -375,6 +457,8 @@ pub fn prepare_bar_data(
 			x_label: cat_col.to_string(),
 			y_label: val_col.to_string(),
 			group_provenance: LegendProvenance::Synthetic,
+			click_selectable: false,
+			selection_candidates: vec![vec![None]],
 		};
 	}
 	let (categories, _categories_series) = if cat_col.is_empty() {
@@ -455,6 +539,8 @@ pub fn prepare_bar_data(
 	let y_range = (y_min, y_max * 1.1);
 	let mut values = vec![vec![0.0f64; num_groups]; num_cats];
 	let mut assigned = vec![vec![false; num_groups]; num_cats];
+	let mut click_selectable = !cat_col.is_empty();
+	let mut selection_candidates = vec![vec![None; num_groups]; num_cats];
 	let category_indices: HashMap<&str, usize> = categories
 		.iter()
 		.enumerate()
@@ -471,6 +557,12 @@ pub fn prepare_bar_data(
 	let group_column = (!group_col.is_empty())
 		.then(|| df.column(group_col).ok())
 		.flatten();
+	let category_exact = category_column.and_then(crate::selection::exact_column_values);
+	let category_type =
+		category_column.and_then(|column| crate::selection::ScalarType::from_dtype(column.dtype()));
+	let group_exact = group_column.and_then(crate::selection::exact_column_values);
+	let group_type =
+		group_column.and_then(|column| crate::selection::ScalarType::from_dtype(column.dtype()));
 	for row in 0..df.height() {
 		let category_idx = if cat_col.is_empty() {
 			Some(0)
@@ -494,6 +586,47 @@ pub fn prepare_bar_data(
 		if !assigned[category_idx][group_idx] {
 			values[category_idx][group_idx] = vals_f64.get(row).unwrap_or(0.0);
 			assigned[category_idx][group_idx] = true;
+			let category = category_type.as_ref().and_then(|scalar_type| {
+				let value = category_exact.as_ref()?.get(row)?.clone()?;
+				Some((
+					crate::selection::FieldRef::new(
+						cat_col,
+						crate::plot::spec::SemanticType::Nominal,
+						scalar_type.clone(),
+					),
+					value,
+				))
+			});
+			if let Some(category) = category {
+				let mut constraints = vec![category];
+				if group_column.is_some() {
+					let group = group_type.as_ref().zip(group_exact.as_ref()).and_then(
+						|(scalar_type, values)| {
+							Some((
+								crate::selection::FieldRef::new(
+									group_col,
+									crate::plot::spec::SemanticType::Nominal,
+									scalar_type.clone(),
+								),
+								values.get(row)?.clone()?,
+							))
+						},
+					);
+					if let Some(group) = group {
+						constraints.push(group);
+					} else {
+						click_selectable = false;
+					}
+				}
+				selection_candidates[category_idx][group_idx] =
+					Some(crate::selection::SelectionCandidate { constraints });
+			} else {
+				click_selectable = false;
+			}
+		} else {
+			// The renderer keeps only the first row for this pair. A predicate on
+			// the pair would select data the bar never depicted.
+			click_selectable = false;
 		}
 	}
 	BarPreparedData {
@@ -508,6 +641,8 @@ pub fn prepare_bar_data(
 		} else {
 			LegendProvenance::Named
 		},
+		click_selectable,
+		selection_candidates,
 	}
 }
 
@@ -534,6 +669,60 @@ mod tests {
 			band_fills: Vec::new(),
 			group_colors: Vec::new(),
 		}
+	}
+
+	#[test]
+	fn product_0151_duplicate_bar_pairs_keep_painting_first_but_refuse_click_selection() {
+		let frame = polars::df!(
+			"cat" => ["A", "A"],
+			"group" => ["left", "left"],
+			"val" => [10_i64, 99],
+		)
+		.expect("duplicate bar fixture");
+		let prepared = prepare_bar_data(&frame, "cat", "group", "val");
+		assert_eq!(
+			prepared.values,
+			vec![vec![10.0]],
+			"paint keeps the first row"
+		);
+		assert!(!prepared.click_selectable);
+		let kernel = BarPlotKernel {
+			prepared_data: Arc::new(prepared),
+			orientation: Orientation::Vertical,
+			layer_settings: LayerSettings::default(),
+			band_fills: Vec::new(),
+			group_colors: Vec::new(),
+		};
+		let candidate = kernel.prepared_data.selection_candidates[0][0]
+			.as_ref()
+			.expect("exact candidate retained for the painted row");
+		let predicate = crate::selection::Predicate::from_candidate(candidate).expect("predicate");
+		assert!(kernel.project_predicate(&predicate).is_none());
+	}
+
+	#[test]
+	fn product_0151_bar_candidate_names_category_and_bound_group() {
+		let kernel = grouped_kernel(Orientation::Vertical);
+		assert!(kernel.prepared_data.click_selectable);
+		let candidate = kernel.prepared_data.selection_candidates[0][0]
+			.as_ref()
+			.expect("unique grouped bar is selectable");
+		assert_eq!(
+			candidate
+				.constraints
+				.iter()
+				.map(|(field, _)| field.name.as_str())
+				.collect::<Vec<_>>(),
+			["cat", "group"]
+		);
+		let predicate = crate::selection::Predicate::from_candidate(candidate).expect("predicate");
+		assert_eq!(
+			kernel
+				.project_predicate(&predicate)
+				.expect("bar admits selection")
+				.len(),
+			1
+		);
 	}
 
 	fn single_series_kernel(orientation: Orientation) -> BarPlotKernel {

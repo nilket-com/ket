@@ -13,8 +13,9 @@ use crate::rune_presentation::{
 	execute_generated,
 };
 use crate::rune_relation_envelope::{
-	LocalViewIdentity, RelationRootIdentity, RuneEnvelopeError, RuneEnvelopeSourceMap,
-	SourceMapSegment, SpannedRuneViewIntent, TransformedRuneRelation, TransformedRuneView,
+	LocalViewIdentity, RelationLineage, RelationLineageLiteral, RelationRootIdentity,
+	RuneEnvelopeError, RuneEnvelopeSourceMap, SourceMapSegment, SpannedRuneViewIntent,
+	TransformedRuneRelation, TransformedRuneView,
 };
 use rune::ast::{self, Spanned};
 use std::collections::{HashMap, HashSet};
@@ -73,11 +74,13 @@ enum StaticProvenance {
 		span: Range<usize>,
 		root: RelationRoot,
 		origin: String,
+		lineage: Option<RelationLineage>,
 	},
 	ViewSet {
 		relation: Range<usize>,
 		root: RelationRoot,
 		origin: String,
+		lineage: Option<RelationLineage>,
 		slots: Vec<StaticSlot>,
 	},
 }
@@ -88,6 +91,7 @@ struct StaticRoot {
 	relation: Range<usize>,
 	root: RelationRoot,
 	origin: String,
+	lineage: Option<RelationLineage>,
 	slots: Vec<StaticSlot>,
 }
 
@@ -96,6 +100,7 @@ struct StaticExecution {
 	relation: Range<usize>,
 	root: RelationRoot,
 	origin: String,
+	lineage: Option<RelationLineage>,
 	slots: Vec<StaticSlot>,
 }
 
@@ -207,6 +212,7 @@ pub(crate) fn compile(source: &str) -> Result<TransformedRuneView, RuneEnvelopeE
 				RelationRoot::Workspace => RelationRootIdentity::Workspace,
 				RelationRoot::Ket => RelationRootIdentity::Ket,
 			},
+			lineage: execution.lineage.clone(),
 			source: rendered.source,
 			views,
 			source_map: rendered.source_map,
@@ -617,6 +623,7 @@ fn analyze_static(source: &str) -> Result<StaticAnalysis, RuneEnvelopeError> {
 				relation,
 				root,
 				origin,
+				lineage,
 				slots,
 			}) = static_provenance(expression, source, &provenances, shadows)?
 		{
@@ -628,6 +635,7 @@ fn analyze_static(source: &str) -> Result<StaticAnalysis, RuneEnvelopeError> {
 				relation,
 				root,
 				origin,
+				lineage,
 				slots,
 			});
 			last_retained_is_expression = false;
@@ -646,6 +654,7 @@ fn analyze_static(source: &str) -> Result<StaticAnalysis, RuneEnvelopeError> {
 				span,
 				root: RelationRoot::Ket,
 				origin,
+				lineage,
 			}) = static_provenance(expression, source, &provenances, shadows)?
 		{
 			let emission = byte_range(statement.span(), source.len())?;
@@ -655,6 +664,7 @@ fn analyze_static(source: &str) -> Result<StaticAnalysis, RuneEnvelopeError> {
 				relation: span,
 				root: RelationRoot::Ket,
 				origin,
+				lineage,
 				slots: Vec::new(),
 			});
 			last_retained_is_expression = false;
@@ -700,6 +710,7 @@ fn analyze_static(source: &str) -> Result<StaticAnalysis, RuneEnvelopeError> {
 				relation: root.relation,
 				root: root.root,
 				origin: root.origin,
+				lineage: root.lineage,
 				slots: root.slots,
 			})
 			.collect(),
@@ -734,16 +745,23 @@ fn static_provenance(
 					span: byte_range(path.span(), source.len())?,
 					root,
 					origin: "workspace".to_owned(),
+					lineage: None,
 				}));
 			}
 			Ok(match bindings.get(raw).cloned() {
-				Some(StaticProvenance::Relation { root, origin, .. }) => {
+				Some(StaticProvenance::Relation {
+					root,
+					origin,
+					lineage,
+					..
+				}) => {
 					// Return the bound name from the rendered Rune program. Replaying
 					// its initializer would execute a linear relation operation twice.
 					Some(StaticProvenance::Relation {
 						span: byte_range(path.span(), source.len())?,
 						root,
 						origin,
+						lineage,
 					})
 				}
 				other => other,
@@ -756,22 +774,27 @@ fn static_provenance(
 				let method = source_slice(source, field.expr_field.span())?.trim();
 				let receiver = static_provenance(&field.expr, source, bindings, shadows)?;
 				return match receiver {
-					Some(StaticProvenance::Relation { span, root, origin }) => {
-						static_method_on_relation(
-							call,
-							method,
-							&field.expr,
-							span,
-							root,
-							origin,
-							&args,
-							source,
-						)
-					}
+					Some(StaticProvenance::Relation {
+						span,
+						root,
+						origin,
+						lineage,
+					}) => static_method_on_relation(
+						call,
+						method,
+						&field.expr,
+						span,
+						root,
+						origin,
+						lineage,
+						&args,
+						source,
+					),
 					Some(StaticProvenance::ViewSet {
 						relation,
 						root,
 						origin,
+						lineage,
 						mut slots,
 					}) => {
 						if method != "views" {
@@ -786,6 +809,7 @@ fn static_provenance(
 							relation,
 							root,
 							origin,
+							lineage,
 							slots,
 						}))
 					}
@@ -806,14 +830,19 @@ fn static_method_on_relation(
 	relation: Range<usize>,
 	root: RelationRoot,
 	mut origin: String,
+	mut lineage: Option<RelationLineage>,
 	args: &[&ast::Expr],
 	source: &str,
 ) -> Result<Option<StaticProvenance>, RuneEnvelopeError> {
+	if lineage.is_none() && origin == "workspace" {
+		lineage = relation_head_lineage(method, args, source);
+	}
 	if method == "views" {
 		return Ok(Some(StaticProvenance::ViewSet {
 			relation,
 			root,
 			origin,
+			lineage,
 			slots: parse_static_view_list(call, args, source)?,
 		}));
 	}
@@ -825,6 +854,7 @@ fn static_method_on_relation(
 			relation,
 			root,
 			origin,
+			lineage,
 			slots: vec![synthetic_slot(constructor, args, call.span(), source)?],
 		}));
 	}
@@ -865,6 +895,7 @@ fn static_method_on_relation(
 			relation,
 			root,
 			origin,
+			lineage,
 			slots: vec![synthetic_slot("table", args, call.span(), source)?],
 		}));
 	}
@@ -879,6 +910,7 @@ fn static_method_on_relation(
 		span: call_span,
 		root,
 		origin,
+		lineage,
 	}))
 }
 
@@ -1041,6 +1073,7 @@ fn recognize_legacy_root(
 		emission: emission.clone(),
 		relation: relation_span,
 		root,
+		lineage: legacy_relation_lineage(&origin),
 		origin,
 		slots: vec![StaticSlot {
 			expression: presentation,
@@ -1136,6 +1169,172 @@ fn canonical_relation_origin(raw: &str, root: &str) -> String {
 	} else {
 		raw.to_owned()
 	}
+}
+
+/// Record PRODUCT-0151's structural head directly from the Rune AST. No
+/// relation-verb list is consulted: the first method on the normalized root is
+/// the head, and every direct argument must be a physical literal.
+fn relation_head_lineage(
+	method: &str,
+	args: &[&ast::Expr],
+	source: &str,
+) -> Option<RelationLineage> {
+	let arguments = args
+		.iter()
+		.map(|argument| {
+			source_slice(source, argument.span())
+				.ok()
+				.and_then(parse_lineage_literal)
+		})
+		.collect::<Option<Vec<_>>>()?;
+	Some(RelationLineage {
+		method: method.to_owned(),
+		arguments,
+	})
+}
+
+/// Legacy `plot.*(relation, ...)` roots still arrive through the old span
+/// resolver. Keep their compatibility lineage isolated here; contemporary
+/// `.views(...)` programs never key identity from this rendered text.
+fn legacy_relation_lineage(origin: &str) -> Option<RelationLineage> {
+	let source = origin.trim();
+	let mut cursor = "workspace".len();
+	if !source.starts_with("workspace") {
+		return None;
+	}
+	cursor += source[cursor..].find('.')? + 1;
+	while source
+		.as_bytes()
+		.get(cursor)
+		.is_some_and(u8::is_ascii_whitespace)
+	{
+		cursor += 1;
+	}
+	let method_start = cursor;
+	while source
+		.as_bytes()
+		.get(cursor)
+		.is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+	{
+		cursor += 1;
+	}
+	let method = source.get(method_start..cursor)?.trim();
+	if method.is_empty() {
+		return None;
+	}
+	while source
+		.as_bytes()
+		.get(cursor)
+		.is_some_and(u8::is_ascii_whitespace)
+	{
+		cursor += 1;
+	}
+	if source.as_bytes().get(cursor) != Some(&b'(') {
+		return None;
+	}
+	let args_start = cursor + 1;
+	let mut depth = 1_u32;
+	let mut quote = None;
+	let mut escaped = false;
+	let mut end = None;
+	for (offset, byte) in source.as_bytes()[args_start..].iter().copied().enumerate() {
+		if let Some(active) = quote {
+			if escaped {
+				escaped = false;
+			} else if byte == b'\\' {
+				escaped = true;
+			} else if byte == active {
+				quote = None;
+			}
+			continue;
+		}
+		match byte {
+			b'\'' | b'"' => quote = Some(byte),
+			b'(' => depth += 1,
+			b')' => {
+				depth -= 1;
+				if depth == 0 {
+					end = Some(args_start + offset);
+					break;
+				}
+			}
+			_ => {}
+		}
+	}
+	let arguments = split_lineage_arguments(source.get(args_start..end?)?)?
+		.into_iter()
+		.map(parse_lineage_literal)
+		.collect::<Option<Vec<_>>>()?;
+	Some(RelationLineage {
+		method: method.to_owned(),
+		arguments,
+	})
+}
+
+fn split_lineage_arguments(source: &str) -> Option<Vec<&str>> {
+	if source.trim().is_empty() {
+		return Some(Vec::new());
+	}
+	let mut quote = None;
+	let mut escaped = false;
+	let mut start = 0;
+	let mut arguments = Vec::new();
+	for (index, byte) in source.as_bytes().iter().copied().enumerate() {
+		if let Some(active) = quote {
+			if escaped {
+				escaped = false;
+			} else if byte == b'\\' {
+				escaped = true;
+			} else if byte == active {
+				quote = None;
+			}
+			continue;
+		}
+		match byte {
+			b'\'' | b'"' => quote = Some(byte),
+			b',' => {
+				arguments.push(source.get(start..index)?.trim());
+				start = index + 1;
+			}
+			b'(' | b')' | b'[' | b']' | b'{' | b'}' => return None,
+			_ => {}
+		}
+	}
+	if quote.is_some() {
+		return None;
+	}
+	arguments.push(source.get(start..)?.trim());
+	Some(arguments)
+}
+
+fn parse_lineage_literal(source: &str) -> Option<RelationLineageLiteral> {
+	let source = source.trim();
+	if let Some(value) = decode_string_literal(source) {
+		return Some(RelationLineageLiteral::String(value));
+	}
+	match source {
+		"true" => return Some(RelationLineageLiteral::Bool(true)),
+		"false" => return Some(RelationLineageLiteral::Bool(false)),
+		_ => {}
+	}
+	let normalized = source.replace('_', "");
+	if normalized.starts_with('-') {
+		if let Ok(value) = normalized.parse::<i128>() {
+			return Some(RelationLineageLiteral::Integer(value));
+		}
+	} else if let Ok(value) = normalized.parse::<i128>() {
+		return Some(RelationLineageLiteral::Integer(value));
+	} else if let Ok(value) = normalized.parse::<u128>() {
+		return Some(RelationLineageLiteral::Unsigned(value));
+	}
+	let value = normalized.parse::<f64>().ok()?;
+	value
+		.is_finite()
+		.then_some(RelationLineageLiteral::Float(if value == 0.0 {
+			0.0_f64.to_bits()
+		} else {
+			value.to_bits()
+		}))
 }
 
 #[derive(Default)]
@@ -2065,6 +2264,67 @@ mod tests {
 	use crate::plot::spec::{FacetLabelTextSize, LegendTextSize};
 	use crate::rune_relation_envelope::{RunePlotBody, RuneViewIntent, SpannedMarkFields};
 	use std::sync::Arc;
+
+	#[test]
+	fn product_0151_relation_lineage_is_structural_and_root_normalized() {
+		let lineage = |source: &str| {
+			compile(source)
+				.expect("view compiles")
+				.executions
+				.into_iter()
+				.next()
+				.expect("execution")
+				.lineage
+		};
+		let direct = lineage("workspace.table( \"a\" ).views([scatter(\"x\", \"y\")])");
+		let sorted = lineage(
+			"let t = workspace.table(\"a\"); t.sort([asc(col(\"x\"))]).views([scatter(\"x\", \"y\")])",
+		);
+		let alias = lineage("ket.table(\"a\").views([scatter(\"x\", \"y\")])");
+		let other = lineage("workspace.table(\"b\").views([scatter(\"x\", \"y\")])");
+		let reformatted = lineage(
+			r#"
+				workspace
+					.table(
+						"a",
+					)
+					.views([
+						scatter("x", "y"),
+					])
+			"#,
+		);
+		assert_eq!(direct, sorted);
+		assert_eq!(direct, alias);
+		assert_eq!(direct, reformatted);
+		assert_ne!(direct, other);
+		assert_eq!(
+			direct,
+			Some(RelationLineage {
+				method: "table".to_owned(),
+				arguments: vec![RelationLineageLiteral::String("a".to_owned())],
+			})
+		);
+		assert_eq!(
+			lineage("workspace.table(name).views([scatter(\"x\", \"y\")])"),
+			None,
+			"a non-literal head is deliberately unselectable"
+		);
+
+		let two_heads = compile(
+			r#"
+				let a = workspace.table("a");
+				a.views([scatter("x", "y")]);
+				let b = workspace.table("b");
+				b.views([scatter("x", "y")]);
+			"#,
+		)
+		.expect("two head relations compile in one buffer");
+		assert_eq!(two_heads.executions.len(), 2);
+		assert_ne!(
+			two_heads.executions[0].lineage,
+			two_heads.executions[1].lineage
+		);
+	}
 
 	/// PRODUCT-0137: a terminal `ket` relation with no view root compiles to
 	/// an execution carrying zero presentation slots, so it reaches Toron

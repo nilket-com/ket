@@ -9,7 +9,17 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub enum PlotPaneMsg {
-	UpdateHover(Option<String>),
+	UpdateStructuredHit {
+		hit: Option<crate::plot::common::PlotHit>,
+		hover: Option<String>,
+	},
+	SelectionRequested {
+		predicate: crate::selection::Predicate,
+		operation: crate::selection::SelectionOperation,
+	},
+	SelectionStarted,
+	SelectionRefused(String),
+	SelectionRebuilt(crate::selection::SelectionRebuildCompletion),
 	RasterRequested(Vec<crate::plot::raster::ScatterRasterWant>),
 	RasterCompleted(crate::plot::raster::RasterCompletion),
 	ToggleSettingsInspector,
@@ -65,11 +75,23 @@ pub struct HostPlotState {
 	pub plot_settings: ResolvedPlotSettings,
 	pub plot_settings_model: PlotSettings,
 	pub hovered_info: Option<String>,
+	pub structured_hit: Option<crate::plot::common::PlotHit>,
 	pub render_revision: u64,
 	pub resize_render_suspended: bool,
 	pub raster_coordinator: crate::plot::raster::RasterCoordinator,
 	pub viewport_motion: ViewportMotion,
 	pub viewport_stamp: ViewportStamp,
+	pub recipe: Option<crate::plot::recipe::PlotRecipe>,
+	pub publication: Option<crate::selection::Publication>,
+	pub selection_revision: crate::selection::SelectionRevision,
+	pub displayed_selection_revision: crate::selection::SelectionRevision,
+	pub displayed_filter_predicate: crate::selection::Predicate,
+	pub selection_display: crate::selection::SelectionDisplay,
+	pub surface_incarnation: crate::selection::SurfaceIncarnation,
+	pub selection_predicate: crate::selection::Predicate,
+	pub emphasis_anchors: Vec<Arc<dyn crate::plot::common::EmphasisAnchor>>,
+	pub composite_emphasis: Option<Arc<crate::plot::common::CompositeEmphasisProjection>>,
+	pub selection_axis_fields: crate::selection::SelectionAxisFields,
 	pub(crate) settings_inspector_open: bool,
 	pub(crate) source_attachment: Option<PlotSourceAttachment>,
 	pub(crate) plot_type: Option<PlotType>,
@@ -86,6 +108,8 @@ struct PlotStateSnapshot {
 	plot_settings_model: PlotSettings,
 	source_attachment: Option<PlotSourceAttachment>,
 	plot_type: Option<PlotType>,
+	recipe: Option<crate::plot::recipe::PlotRecipe>,
+	publication: Option<crate::selection::Publication>,
 }
 
 impl HostPlotState {
@@ -117,11 +141,23 @@ impl HostPlotState {
 			plot_settings,
 			plot_settings_model,
 			hovered_info: None,
+			structured_hit: None,
 			render_revision: 0,
 			resize_render_suspended: false,
 			raster_coordinator: crate::plot::raster::RasterCoordinator::new(),
 			viewport_motion: ViewportMotion::Settled,
 			viewport_stamp: ViewportStamp::mint(),
+			recipe: None,
+			publication: None,
+			selection_revision: crate::selection::SelectionRevision::ZERO,
+			displayed_selection_revision: crate::selection::SelectionRevision::ZERO,
+			displayed_filter_predicate: crate::selection::Predicate::default(),
+			selection_display: crate::selection::SelectionDisplay::Ready,
+			surface_incarnation: crate::selection::SurfaceIncarnation::mint(),
+			selection_predicate: crate::selection::Predicate::default(),
+			emphasis_anchors: Vec::new(),
+			composite_emphasis: None,
+			selection_axis_fields: crate::selection::SelectionAxisFields::default(),
 			settings_inspector_open: false,
 			source_attachment: None,
 			plot_type: None,
@@ -161,10 +197,103 @@ impl HostPlotState {
 			host_plot_settings_model(default_application_plot_settings(), authored_settings);
 		self.plot_settings = self.plot_settings_model.resolve();
 		self.hovered_info = None;
+		self.structured_hit = None;
 		self.render_revision = self.render_revision.wrapping_add(1);
 		self.source_attachment = None;
 		self.plot_type = None;
 		self.writeback_status = None;
+		self.recipe = None;
+		self.publication = None;
+		self.selection_revision = crate::selection::SelectionRevision::ZERO;
+		self.displayed_selection_revision = crate::selection::SelectionRevision::ZERO;
+		self.displayed_filter_predicate = crate::selection::Predicate::default();
+		self.selection_display = crate::selection::SelectionDisplay::Ready;
+		self.surface_incarnation = crate::selection::SurfaceIncarnation::mint();
+		self.selection_predicate = crate::selection::Predicate::default();
+		self.emphasis_anchors.clear();
+		self.composite_emphasis = None;
+		self.selection_axis_fields = crate::selection::SelectionAxisFields::default();
+	}
+
+	pub fn install_recipe(&mut self, recipe: crate::plot::recipe::PlotRecipe) {
+		if recipe.artifact.input_identity_is_bound() {
+			self.selection_axis_fields =
+				crate::selection::SelectionAxisFields::from_recipe(&recipe, self.kernel.as_ref());
+			self.publication = Some(recipe.publication);
+		} else {
+			self.selection_axis_fields = crate::selection::SelectionAxisFields::default();
+			self.publication = None;
+		}
+		self.recipe = Some(recipe);
+	}
+
+	pub fn begin_selection_rebuild(
+		&mut self,
+		revision: crate::selection::SelectionRevision,
+		predicate: crate::selection::Predicate,
+	) -> Option<crate::selection::SelectionRebuildJob> {
+		if self.selection_display == crate::selection::SelectionDisplay::Ready
+			&& predicate == self.displayed_filter_predicate
+		{
+			self.selection_revision = revision;
+			self.displayed_selection_revision = revision;
+			return None;
+		}
+		let recipe = self.recipe.clone()?;
+		let publication = self.publication?;
+		self.selection_revision = revision;
+		self.selection_display = crate::selection::SelectionDisplay::Pending;
+		self.render_revision = self.render_revision.wrapping_add(1);
+		Some(crate::selection::SelectionRebuildJob {
+			stamp: crate::selection::RebuildStamp {
+				publication,
+				surface_incarnation: self.surface_incarnation,
+				selection_revision: revision,
+			},
+			recipe,
+			predicate,
+		})
+	}
+
+	pub fn complete_selection_rebuild(
+		&mut self,
+		completion: crate::selection::SelectionRebuildCompletion,
+	) -> Result<bool, String> {
+		let expected = crate::selection::RebuildStamp {
+			publication: self
+				.publication
+				.ok_or_else(|| "selection surface has no publication".to_owned())?,
+			surface_incarnation: self.surface_incarnation,
+			selection_revision: self.selection_revision,
+		};
+		if completion.stamp != expected {
+			return Ok(false);
+		}
+		self.selection_display = crate::selection::SelectionDisplay::Ready;
+		let predicate = completion.predicate;
+		let kernel = match completion.result {
+			Ok(kernel) => kernel,
+			Err(error) => {
+				self.render_revision = self.render_revision.wrapping_add(1);
+				return Err(error);
+			}
+		};
+		self.kernel = kernel;
+		self.displayed_selection_revision = self.selection_revision;
+		self.displayed_filter_predicate = predicate;
+		let emphasis = crate::plot::common::project_selection_emphasis(
+			self.kernel.as_ref(),
+			&self.selection_predicate,
+			&self.selection_axis_fields,
+		);
+		self.emphasis_anchors = emphasis.anchors;
+		self.composite_emphasis = emphasis.composite;
+		self.selection_display = crate::selection::SelectionDisplay::Ready;
+		self.viewport_stamp = self.viewport_stamp.next();
+		self.viewport_motion = ViewportMotion::Settled;
+		self.raster_coordinator.invalidate();
+		self.render_revision = self.render_revision.wrapping_add(1);
+		Ok(true)
 	}
 
 	pub(crate) fn show_source_preview(
@@ -183,6 +312,8 @@ impl HostPlotState {
 				plot_settings_model: self.plot_settings_model.clone(),
 				source_attachment: self.source_attachment.clone(),
 				plot_type: self.plot_type,
+				recipe: self.recipe.clone(),
+				publication: self.publication,
 			});
 		}
 		self.display_label = display_label;
@@ -214,6 +345,8 @@ impl HostPlotState {
 		self.plot_settings_model = authoritative.plot_settings_model;
 		self.source_attachment = authoritative.source_attachment;
 		self.plot_type = authoritative.plot_type;
+		self.recipe = authoritative.recipe;
+		self.publication = authoritative.publication;
 		self.render_revision = self.render_revision.wrapping_add(1);
 		self.setting_drafts.clear();
 		self.writeback_status = None;
@@ -264,7 +397,16 @@ impl HostPlotState {
 
 	pub fn update(&mut self, message: PlotPaneMsg) -> Option<crate::plot::raster::RasterJob> {
 		match message {
-			PlotPaneMsg::UpdateHover(hover) => self.hovered_info = hover,
+			PlotPaneMsg::SelectionRequested { .. }
+			| PlotPaneMsg::SelectionStarted
+			| PlotPaneMsg::SelectionRefused(_) => {}
+			PlotPaneMsg::SelectionRebuilt(completion) => {
+				let _ = self.complete_selection_rebuild(completion);
+			}
+			PlotPaneMsg::UpdateStructuredHit { hit, hover } => {
+				self.structured_hit = hit;
+				self.hovered_info = hover;
+			}
 			PlotPaneMsg::RasterRequested(wants) => {
 				return self.raster_coordinator.request(wants);
 			}
@@ -477,6 +619,94 @@ mod product_0150_state_tests {
 			state.render_revision,
 			revision_before_settles + 1,
 			"even the newest quiet timer is consumed only once"
+		);
+	}
+
+	#[test]
+	fn product_0151_selection_completion_is_newest_wins_and_preserves_the_viewport() {
+		let artifact = crate::result_artifact::ResultArtifact::from_polars(Arc::new(
+			polars::df!("x" => [1_i64]).expect("publication frame"),
+		));
+		artifact.bind_input_identity(crate::selection::InputIdentity::mint());
+		let publication = artifact.publication();
+		let mut state = state();
+		state.publication = Some(publication);
+		state.plot_settings_model.pane_override.domains =
+			Override::Set(crate::plot::theme::PlotDomainOverrides {
+				x_min: Some(2.0),
+				x_max: Some(8.0),
+				y_min: Some(4.0),
+				y_max: Some(16.0),
+			});
+		state.plot_settings = state.plot_settings_model.resolve();
+		let old = crate::selection::SelectionRevision::ZERO.next();
+		let newest = old.next();
+		state.selection_revision = newest;
+		state.selection_display = crate::selection::SelectionDisplay::Pending;
+		let incarnation = state.surface_incarnation;
+		let completion = |revision| crate::selection::SelectionRebuildCompletion {
+			stamp: crate::selection::RebuildStamp {
+				publication,
+				surface_incarnation: incarnation,
+				selection_revision: revision,
+			},
+			predicate: crate::selection::Predicate::default(),
+			result: Ok(Arc::new(Kernel)),
+		};
+		let render_before = state.render_revision;
+		assert!(!state.complete_selection_rebuild(completion(old)).unwrap());
+		assert_eq!(state.render_revision, render_before);
+		assert_eq!(
+			state.selection_display,
+			crate::selection::SelectionDisplay::Pending
+		);
+		assert!(
+			state
+				.complete_selection_rebuild(completion(newest))
+				.unwrap()
+		);
+		assert_eq!(state.displayed_selection_revision, newest);
+		assert_eq!(state.viewport_motion, ViewportMotion::Settled);
+		assert!(matches!(
+			state.plot_settings_model.pane_override.domains,
+			Override::Set(crate::plot::theme::PlotDomainOverrides {
+				x_min: Some(2.0),
+				x_max: Some(8.0),
+				y_min: Some(4.0),
+				y_max: Some(16.0),
+			})
+		));
+
+		let stale_after_replace = completion(newest);
+		state.replace(
+			"replacement".into(),
+			Arc::new(Kernel),
+			PlotSettingsLayer::default(),
+		);
+		let revision = state.render_revision;
+		assert!(
+			state
+				.complete_selection_rebuild(stale_after_replace)
+				.is_err()
+		);
+		assert_eq!(state.render_revision, revision);
+	}
+
+	#[test]
+	fn product_0151_ready_plot_dedupes_an_unchanged_filter_predicate() {
+		let mut state = state();
+		let revision = crate::selection::SelectionRevision::ZERO.next();
+		assert!(
+			state
+				.begin_selection_rebuild(revision, crate::selection::Predicate::default())
+				.is_none(),
+			"an unchanged displayed predicate schedules no rebuild"
+		);
+		assert_eq!(state.selection_revision, revision);
+		assert_eq!(state.displayed_selection_revision, revision);
+		assert_eq!(
+			state.selection_display,
+			crate::selection::SelectionDisplay::Ready
 		);
 	}
 

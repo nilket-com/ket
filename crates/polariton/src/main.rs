@@ -20,6 +20,7 @@ mod rune_relation_envelope;
 mod rune_view;
 #[cfg(feature = "toron")]
 mod rune_view_compiler;
+mod selection;
 #[cfg(feature = "toron")]
 mod session_persistence;
 #[cfg(feature = "toron")]

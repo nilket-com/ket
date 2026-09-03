@@ -80,7 +80,18 @@ pub enum TableScroll {
 	Bottom,
 }
 
-pub struct Table<'a> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TableSelectionEvent {
+	Selected {
+		min_col: usize,
+		max_col: usize,
+		min_row: usize,
+		max_row: usize,
+	},
+	Clear,
+}
+
+pub struct Table<'a, Message = ()> {
 	data_frame: &'a DataFrame,
 	row_offset: usize,
 	skin: TableSkin,
@@ -98,9 +109,12 @@ pub struct Table<'a> {
 	/// ends. A length mismatch (schema change) ignores the store and
 	/// re-measures.
 	width_store: Option<&'a std::cell::RefCell<Option<Vec<f32>>>>,
+	on_selection: Option<Box<dyn Fn(TableSelectionEvent) -> Message + 'a>>,
+	emphasis: Option<&'a crate::selection::Predicate>,
+	data_revision: u64,
 }
 
-impl<'a> Table<'a> {
+impl<'a, Message> Table<'a, Message> {
 	pub fn new(data_frame: &'a DataFrame, row_offset: usize, skin: TableSkin) -> Self {
 		Self {
 			data_frame,
@@ -110,7 +124,25 @@ impl<'a> Table<'a> {
 			col_width: None,
 			show_column_types: false,
 			width_store: None,
+			on_selection: None,
+			emphasis: None,
+			data_revision: 0,
 		}
+	}
+
+	pub fn emphasis(mut self, predicate: &'a crate::selection::Predicate) -> Self {
+		self.emphasis = Some(predicate);
+		self
+	}
+
+	pub fn data_revision(mut self, revision: u64) -> Self {
+		self.data_revision = revision;
+		self
+	}
+
+	pub fn on_selection(mut self, handler: impl Fn(TableSelectionEvent) -> Message + 'a) -> Self {
+		self.on_selection = Some(Box::new(handler));
+		self
 	}
 
 	pub fn width_store(mut self, store: Option<&'a std::cell::RefCell<Option<Vec<f32>>>>) -> Self {
@@ -443,9 +475,10 @@ pub struct TableState {
 	selection: Option<TableSelection>,
 	is_selecting: bool,
 	modifiers: keyboard::Modifiers,
+	data_revision: u64,
 }
 
-impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for Table<'_>
+impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for Table<'_, Message>
 where
 	Renderer: renderer::Renderer + TextRenderer<Font = iced::Font>,
 {
@@ -505,6 +538,11 @@ where
 	) {
 		let bounds = Rect::<Window>::from_iced_layout(layout.bounds());
 		let state = tree.state.downcast_mut::<TableState>();
+		if state.data_revision != self.data_revision {
+			state.data_revision = self.data_revision;
+			state.selection = None;
+			state.is_selecting = false;
+		}
 		self.apply_scroll_request(state, bounds);
 		let row_num_w = self.row_num_width(bounds, state.v_scroll_offset);
 		let viewport_w = bounds.width() - V_SCROLLBAR_WIDTH - row_num_w;
@@ -607,6 +645,16 @@ where
 					shell.request_redraw();
 				} else if state.is_selecting {
 					state.is_selecting = false;
+					if let (Some(handler), Some(selection)) = (&self.on_selection, &state.selection)
+					{
+						let (min_col, max_col, min_row, max_row) = selection.range();
+						shell.publish(handler(TableSelectionEvent::Selected {
+							min_col,
+							max_col,
+							min_row,
+							max_row,
+						}));
+					}
 				}
 			}
 			Event::Mouse(mouse::Event::WheelScrolled { delta })
@@ -689,9 +737,15 @@ where
 						}
 					}
 					keyboard::Key::Named(keyboard::key::Named::Escape)
-						if state.selection.is_some() =>
+						if state.selection.is_some()
+							|| self
+								.emphasis
+								.is_some_and(|predicate| !predicate.fields.is_empty()) =>
 					{
 						state.selection = None;
+						if let Some(handler) = &self.on_selection {
+							shell.publish(handler(TableSelectionEvent::Clear));
+						}
 						shell.request_redraw();
 					}
 					_ => {}
@@ -995,7 +1049,10 @@ where
 								.selection
 								.as_ref()
 								.is_some_and(|s| s.contains(col_idx, row_idx))
-							{
+								|| self.emphasis.is_some_and(|predicate| {
+									!predicate.fields.is_empty()
+										&& predicate.matches_frame_row(self.data_frame, row_idx)
+								}) {
 								renderer.fill_quad(
 									renderer::Quad {
 										bounds: Rectangle {
@@ -1145,11 +1202,12 @@ fn draw_text_sized<Renderer>(
 	);
 }
 
-impl<'a, Message, Theme, Renderer> From<Table<'a>> for Element<'a, Message, Theme, Renderer>
+impl<'a, Message: 'a, Theme, Renderer> From<Table<'a, Message>>
+	for Element<'a, Message, Theme, Renderer>
 where
 	Renderer: renderer::Renderer + TextRenderer<Font = iced::Font>,
 {
-	fn from(table: Table<'a>) -> Self {
+	fn from(table: Table<'a, Message>) -> Self {
 		Self::new(table)
 	}
 }
@@ -1595,7 +1653,7 @@ fill 38.00,130.00,42.58,8.00 #8c00fa/0.50"##;
 			"val" => [1.1_f64, 2.2, 3.3],
 		)
 		.expect("table fixture");
-		let table = Table::new(&frame, 0, TableSkin::DEFAULT);
+		let table: Table<'_, ()> = Table::new(&frame, 0, TableSkin::DEFAULT);
 		let mut narrow_state = TableState::default();
 		let mut wide_state = TableState::default();
 
@@ -1620,7 +1678,7 @@ fill 38.00,130.00,42.58,8.00 #8c00fa/0.50"##;
 			"very_long" => [very_long],
 		)
 		.expect("table fixture");
-		let table = Table::new(&frame, 0, TableSkin::DEFAULT);
+		let table: Table<'_, ()> = Table::new(&frame, 0, TableSkin::DEFAULT);
 
 		assert_close(table.measure_col_width(0), MIN_COL_WIDTH);
 		assert_close(
@@ -1887,7 +1945,7 @@ fill 38.00,130.00,42.58,8.00 #8c00fa/0.50"##;
 			"flag" => [true],
 		)
 		.expect("table fixture");
-		let table = Table::new(&frame, 0, TableSkin::DEFAULT);
+		let table: Table<'_, ()> = Table::new(&frame, 0, TableSkin::DEFAULT);
 
 		assert_eq!(table.column_alignment(0), ColumnAlignment::Left);
 		assert_eq!(table.column_alignment(1), ColumnAlignment::Right);
@@ -1910,6 +1968,127 @@ fill 38.00,130.00,42.58,8.00 #8c00fa/0.50"##;
 		assert_eq!(clamp_horizontal_scroll(350.0, 500.0, 100.0), 350.0);
 		assert_eq!(clamp_horizontal_scroll(350.0, 500.0, 300.0), 200.0);
 		assert_eq!(clamp_horizontal_scroll(350.0, 500.0, 600.0), 0.0);
+	}
+
+	#[test]
+	fn product_0151_release_and_escape_are_the_only_table_selection_publications() {
+		let frame =
+			polars::df!("category" => ["A", "B"], "value" => [1_i64, 2]).expect("table fixture");
+		let field = crate::selection::FieldRef::new(
+			"category",
+			crate::plot::spec::SemanticType::Nominal,
+			crate::selection::ScalarType::Str,
+		);
+		let predicate = crate::selection::Predicate {
+			fields: vec![crate::selection::FieldConstraint {
+				field,
+				form: crate::selection::ConstraintForm::Values(std::collections::HashSet::from([
+					crate::selection::ExactScalar::Str("A".into()),
+				])),
+			}],
+		};
+		let mut table = Table::new(&frame, 0, TableSkin::DEFAULT)
+			.emphasis(&predicate)
+			.on_selection(|event| event);
+		let mut tree = Tree {
+			tag: <Table<'_, TableSelectionEvent> as Widget<
+				TableSelectionEvent,
+				iced::Theme,
+				RecordingRenderer,
+			>>::tag(&table),
+			state: <Table<'_, TableSelectionEvent> as Widget<
+				TableSelectionEvent,
+				iced::Theme,
+				RecordingRenderer,
+			>>::state(&table),
+			children: Vec::new(),
+		};
+		let node = Node::new(Size::new(400.0, 300.0));
+		let renderer = RecordingRenderer::default();
+		let mut clipboard = MockClipboard { written: None };
+		let mut messages = Vec::new();
+		let bounds = Layout::new(&node).bounds();
+		let point = Point::new(
+			bounds.x + table.row_num_width(Rect::<Window>::from_iced_layout(bounds), 0.0) + 4.0,
+			bounds.y + table.header_height() + 4.0,
+		);
+		let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+		{
+			let mut shell = Shell::new(&mut messages);
+			<Table<'_, TableSelectionEvent> as Widget<
+				TableSelectionEvent,
+				iced::Theme,
+				RecordingRenderer,
+			>>::update(
+				&mut table,
+				&mut tree,
+				&press,
+				Layout::new(&node),
+				Cursor::Available(point),
+				&renderer,
+				&mut clipboard,
+				&mut shell,
+				&bounds,
+			);
+		}
+		assert!(messages.is_empty(), "press is not a publication event");
+		let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+		{
+			let mut shell = Shell::new(&mut messages);
+			<Table<'_, TableSelectionEvent> as Widget<
+				TableSelectionEvent,
+				iced::Theme,
+				RecordingRenderer,
+			>>::update(
+				&mut table,
+				&mut tree,
+				&release,
+				Layout::new(&node),
+				Cursor::Available(point),
+				&renderer,
+				&mut clipboard,
+				&mut shell,
+				&bounds,
+			);
+		}
+		assert!(matches!(
+			messages.as_slice(),
+			[TableSelectionEvent::Selected {
+				min_col: 0,
+				max_col: 0,
+				min_row: 0,
+				max_row: 0,
+			}]
+		));
+		messages.clear();
+		let escape = Event::Keyboard(keyboard::Event::KeyPressed {
+			key: keyboard::Key::Named(keyboard::key::Named::Escape),
+			modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+			physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+			location: keyboard::Location::Standard,
+			modifiers: keyboard::Modifiers::default(),
+			text: None,
+			repeat: false,
+		});
+		{
+			let mut shell = Shell::new(&mut messages);
+			<Table<'_, TableSelectionEvent> as Widget<
+				TableSelectionEvent,
+				iced::Theme,
+				RecordingRenderer,
+			>>::update(
+				&mut table,
+				&mut tree,
+				&escape,
+				Layout::new(&node),
+				Cursor::Available(point),
+				&renderer,
+				&mut clipboard,
+				&mut shell,
+				&bounds,
+			);
+		}
+		assert_eq!(messages, vec![TableSelectionEvent::Clear]);
 	}
 
 	#[test]

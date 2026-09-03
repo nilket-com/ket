@@ -12,7 +12,10 @@ and one integration pin (one preparing marker per surface); and a third
 time for three contract repairs (the supersession note's cross-buffer
 example, brush rounding that widened, retirement that left survivors
 filtered by retired predicates) and two sharpenings (export snapshots its
-predicate at dispatch; the refused families are named). This record is
+predicate at dispatch; the refused families are named). Amended at
+implementation review on 2026-09-03 after live event routing exposed an
+unscoped Escape clear, an unsigned-domain edge, and a stale-export fallback.
+This record is
 PRODUCT-0133 stage 3's selection half and stage 4's consumers, split from
 the viewport half PRODUCT-0150 shipped, on the census finding
 (`plans/product/impl/0133_selection_census.md`) that four seams the
@@ -375,7 +378,9 @@ field, and the endpoints are `ExactScalar` of the axis column's variant:
   `ViewportGeometry` and mints exact `Float` endpoints, unrounded;
 - an integral axis inverts the same way and mints `ceil(lower)` and
   `floor(upper)`, so no value whose plotted position lay outside the
-  rectangle is admitted;
+  rectangle is admitted; when an unsigned axis's lower edge lies below
+  zero, that edge clamps inward to zero while a representable upper edge
+  continues to define the interval;
 - a temporal axis inverts through a new
   `CoordinateTransformer::pixel_to_temporal(axis, pixel) -> ExactScalar`
   that interpolates the normalized pixel position over the exact
@@ -407,12 +412,21 @@ excludes, so PRODUCT-0150's arbitration is not amended:
 | --- | --- | --- | --- |
 | Shift | `replace` with the mark's candidate | `clear` | brush, `replace` |
 | Shift+Alt | toggle: `subtract` if every value of the candidate is already in the own predicate's `Values` for its field, else `add` | nothing | brush, `add` |
-| Escape, view focused | `clear` | | |
+| Escape, cursor over a view with an active predicate | `clear` | | |
 
 Alt is pressed with Shift already down, so the pan arm never sees it;
 bare Alt keeps its 0150 meaning. Toggle on a multi-field candidate
 refuses per §7 and is disclosed. A Shift-press captures and the editor
 applies the `FocusPane` compensation it applies to the pan press.
+
+**Amended at implementation review.** Iced sends a keyboard event through
+every live canvas, so focus alone let one Escape schedule a sibling rebuild
+from every selectable plot. Plot Escape therefore emits only while the cursor
+is over that view and the view owns a non-empty predicate. A clear with no
+bound predicate is a context no-op (no revision and no rebuild list), and a
+ready plot or table deduplicates an incoming predicate equal to the one it
+already displays. These are three defenses around one event-routing boundary,
+not three selection operations.
 
 ### 11. Hover and selection are separate lanes
 
@@ -454,7 +468,9 @@ rendering. The export records the snapshot revision it rendered. A
 selection made after dispatch does not restart, cancel, or alter the
 running export; the next export takes the next snapshot. An export never
 renders a kernel behind the revision it was dispatched at, adds no flag,
-and needs no 0133 amendment.
+and needs no 0133 amendment. If the required snapshot rebuild fails, the
+export refuses with disclosure; it never falls back to the stale displayed
+kernel.
 
 ### 14. The status lane
 
@@ -559,7 +575,8 @@ rebuild; full battery.
     window rebuilds from the recipe and the dispatch-time predicate, and
     its bytes equal an export taken after that revision completes; a
     selection made while the export job runs changes neither its bytes
-    nor its recorded revision.
+    nor its recorded revision; a failed dispatch-snapshot rebuild refuses
+    the export rather than rendering the stale displayed kernel.
 14. **The rebuild never leaves the process.** No adapter call; priced as
     one settle by the stage-0 exhibit.
 15. **Self-exclusion and emphasis.** The source view's rows are unchanged
@@ -591,7 +608,8 @@ rebuild; full battery.
     axis mints `ceil(lower)` and `floor(upper)` and admits no value plotted
     outside the rectangle; a temporal axis mints ticks with the zone by the
     same inward rule and never passes through `pixel_to_cartesian`;
-    refused families disclose.
+    an unsigned lower edge below zero clamps to zero when its upper edge is
+    representable; refused families disclose.
 20a. **Between two ticks is empty.** A brush whose edges both fall between
     the same adjacent integers, and one whose edges both fall between the
     same adjacent temporal ticks, each mint an empty interval; the source
@@ -603,7 +621,10 @@ rebuild; full battery.
     emphasis lies over the same data.
 23. **Chords are reachable; pan untouched.** Shift and Shift+Alt presses
     never reach the pan arm; bare Alt still pans; the 0150 arbitration
-    test is unchanged.
+    test is unchanged. Escape publishes `clear` only with the cursor over a
+    view that owns a predicate; an empty context clear advances no revision
+    and schedules no rebuild, and ready plot/table consumers deduplicate an
+    unchanged displayed predicate.
 24. **Toggle is exact.** Shift+Alt on a selected category subtracts; on an
     unselected one adds; on a two-field candidate refuses.
 25. **The table emits only lossless**, through `on_selection`: single

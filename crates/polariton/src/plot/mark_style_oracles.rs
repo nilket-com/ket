@@ -131,6 +131,7 @@ fn product_0080_0082_0083_default_operation_bank_tracks_the_box_role_split() {
 			y_axis_type: AxisType::Linear,
 			x_label: String::new(),
 			y_label: String::new(),
+			selection_candidates: Default::default(),
 		}),
 	};
 	assert_eq!(
@@ -171,6 +172,7 @@ fn product_0080_0082_0083_default_operation_bank_tracks_the_box_role_split() {
 		category_colors: None,
 		x_label: String::new(),
 		y_label: String::new(),
+		selection_candidates: Default::default(),
 	};
 	assert_eq!(
 		render(&violin),
@@ -195,6 +197,7 @@ fn product_0080_0082_0083_default_operation_bank_tracks_the_box_role_split() {
 			x_label: String::new(),
 			y_label: "open / high / low / close".to_owned(),
 			minimum_x_delta: None,
+			selection_candidates: Vec::new(),
 		}),
 	};
 	assert_eq!(

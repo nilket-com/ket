@@ -144,6 +144,26 @@ impl LayerRenderer {
 		}
 	}
 
+	fn selection_candidate(
+		&self,
+		mark_index: usize,
+	) -> Option<crate::selection::SelectionCandidate> {
+		match self {
+			Self::Line(_, _) => None,
+			Self::Scatter(renderer, _) => renderer.selection_candidate(mark_index),
+		}
+	}
+
+	fn project_predicate(
+		&self,
+		predicate: &crate::selection::Predicate,
+	) -> Option<Vec<Box<dyn crate::plot::common::EmphasisAnchor>>> {
+		match self {
+			Self::Line(_, _) => None,
+			Self::Scatter(renderer, _) => Some(renderer.project_selection_predicate(predicate)),
+		}
+	}
+
 	fn legend_content(
 		&self,
 		settings: &ResolvedPlotSettings,
@@ -369,6 +389,10 @@ impl PlotKernel for LayeredPlotKernel {
 						format_label(hit.data_y, &self.y_axis_type),
 					),
 				);
+				let candidate = match layer.selection_candidate(hit.mark_index) {
+					Some(selection) => candidate.with_candidate(selection),
+					None => candidate,
+				};
 				candidates.push(candidate);
 			}
 		}
@@ -386,11 +410,67 @@ impl PlotKernel for LayeredPlotKernel {
 		)
 	}
 
+	fn project_predicate(
+		&self,
+		predicate: &crate::selection::Predicate,
+	) -> Option<Vec<Box<dyn crate::plot::common::EmphasisAnchor>>> {
+		let mut admitted = false;
+		let mut anchors = Vec::new();
+		for layer in self.layers.iter() {
+			if let Some(mut projected) = layer.project_predicate(predicate) {
+				admitted = true;
+				anchors.append(&mut projected);
+			}
+		}
+		admitted.then_some(anchors)
+	}
+
 	fn x_label(&self) -> String {
 		self.x_label.clone()
 	}
 
 	fn y_label(&self) -> String {
 		self.y_label.clone()
+	}
+}
+
+#[cfg(test)]
+mod product_0151_tests {
+	use super::*;
+	use crate::plot::kernels::line;
+	use polars::df;
+
+	#[test]
+	fn product_0151_line_layer_refuses_click_projection() {
+		let frame = df!("x" => [0_i64, 1], "y" => [1_i64, 2]).expect("line fixture");
+		let prepared = Arc::new(line::prepare_line_data(&frame, "", "x", "y"));
+		let layout = ResolvedLayout {
+			viewport_width: 400,
+			viewport_height: 300,
+			x_range: prepared.x_range,
+			y_range: prepared.y_range,
+		};
+		let kernel = LayeredPlotKernel::new(
+			NonEmpty::new(LayerRenderer::line(prepared, LayerSettings::default())),
+			layout,
+			AxisType::Linear,
+			AxisType::Linear,
+			None,
+			None,
+			"x".to_owned(),
+			"y".to_owned(),
+		);
+		let candidate = crate::selection::SelectionCandidate {
+			constraints: vec![(
+				crate::selection::FieldRef::new(
+					"x",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::selection::ScalarType::Int,
+				),
+				crate::selection::ExactScalar::Int(0),
+			)],
+		};
+		let predicate = crate::selection::Predicate::from_candidate(&candidate).expect("predicate");
+		assert!(kernel.project_predicate(&predicate).is_none());
 	}
 }

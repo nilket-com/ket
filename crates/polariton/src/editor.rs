@@ -205,6 +205,22 @@ pub enum EditorMsg {
 		identity: MarkdownCellIdentity,
 		message: crate::gui::messages::PlotMessage,
 	},
+	HostTableSelection {
+		panel_id: HostPanelId,
+		event: crate::gui::table::TableSelectionEvent,
+	},
+	NotebookTableSelection {
+		identity: MarkdownCellIdentity,
+		event: crate::gui::table::TableSelectionEvent,
+	},
+	HostTableRebuilt {
+		panel_id: HostPanelId,
+		completion: crate::selection::TableRebuildCompletion,
+	},
+	NotebookTableRebuilt {
+		identity: MarkdownCellIdentity,
+		completion: crate::selection::TableRebuildCompletion,
+	},
 }
 
 #[cfg(feature = "toron")]
@@ -417,6 +433,7 @@ pub struct CodeEditor {
 	/// errors). Retained until the next forwarded input, vim-style: each
 	/// command's outcome replaces the previous one.
 	status_message: Option<String>,
+	selection_status_message: Option<String>,
 	/// The engine accepted `:q` and has emitted its final viewport. Further
 	/// editor traffic must stay local while the application closes its window.
 	quit_requested: bool,
@@ -425,6 +442,17 @@ pub struct CodeEditor {
 	/// a Baryon-managed HostPanel.
 	show_column_types: bool,
 	panels: PanelRegistry,
+	selection_contexts: crate::selection::SelectionContexts,
+	pending_selection_tasks: Vec<Task<EditorMsg>>,
+	result_panel_input: crate::selection::InputIdentity,
+	rune_input_identities: HashMap<
+		(
+			libaryon::core::BufferId,
+			crate::rune_relation_envelope::RelationLineage,
+		),
+		crate::selection::InputIdentity,
+	>,
+	notebook_input_identities: HashMap<MarkdownCellIdentity, crate::selection::InputIdentity>,
 	/// Session-local realization of semantic view identities. Dynamic ids live
 	/// in the upper half of the namespace; fixed application panels stay below.
 	///
@@ -547,10 +575,22 @@ struct NotebookPlotSurface {
 	settings: ResolvedPlotSettings,
 	settings_model: crate::plot::theme::PlotSettings,
 	hovered_info: Option<String>,
+	structured_hit: Option<crate::plot::common::PlotHit>,
 	render_revision: u64,
 	raster_coordinator: crate::plot::raster::RasterCoordinator,
 	viewport_motion: crate::plot::common::ViewportMotion,
 	viewport_stamp: crate::plot::common::ViewportStamp,
+	recipe: Option<crate::plot::recipe::PlotRecipe>,
+	publication: Option<crate::selection::Publication>,
+	selection_revision: crate::selection::SelectionRevision,
+	displayed_selection_revision: crate::selection::SelectionRevision,
+	displayed_filter_predicate: crate::selection::Predicate,
+	selection_display: crate::selection::SelectionDisplay,
+	surface_incarnation: crate::selection::SurfaceIncarnation,
+	selection_predicate: crate::selection::Predicate,
+	emphasis_anchors: Vec<Arc<dyn crate::plot::common::EmphasisAnchor>>,
+	composite_emphasis: Option<Arc<crate::plot::common::CompositeEmphasisProjection>>,
+	selection_axis_fields: crate::selection::SelectionAxisFields,
 }
 
 const VIEWPORT_QUIET_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
@@ -565,11 +605,40 @@ impl NotebookPlotSurface {
 			settings,
 			settings_model,
 			hovered_info: None,
+			structured_hit: None,
 			render_revision: 0,
 			raster_coordinator: crate::plot::raster::RasterCoordinator::new(),
 			viewport_motion: crate::plot::common::ViewportMotion::Settled,
 			viewport_stamp: crate::plot::common::ViewportStamp::mint(),
+			recipe: None,
+			publication: None,
+			selection_revision: crate::selection::SelectionRevision::ZERO,
+			displayed_selection_revision: crate::selection::SelectionRevision::ZERO,
+			displayed_filter_predicate: crate::selection::Predicate::default(),
+			selection_display: crate::selection::SelectionDisplay::Ready,
+			surface_incarnation: crate::selection::SurfaceIncarnation::mint(),
+			selection_predicate: crate::selection::Predicate::default(),
+			emphasis_anchors: Vec::new(),
+			composite_emphasis: None,
+			selection_axis_fields: crate::selection::SelectionAxisFields::default(),
 		}
+	}
+
+	fn new_with_recipe(
+		composition: PlotComposition,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		recipe: crate::plot::recipe::PlotRecipe,
+	) -> Self {
+		let mut surface = Self::new(composition, kernel);
+		if recipe.artifact.input_identity_is_bound() {
+			surface.selection_axis_fields = crate::selection::SelectionAxisFields::from_recipe(
+				&recipe,
+				surface.kernel.as_ref(),
+			);
+			surface.publication = Some(recipe.publication);
+		}
+		surface.recipe = Some(recipe);
+		surface
 	}
 
 	fn update(
@@ -577,7 +646,44 @@ impl NotebookPlotSurface {
 		message: crate::gui::messages::PlotMessage,
 	) -> Option<crate::plot::raster::RasterJob> {
 		match message {
-			crate::gui::messages::PlotMessage::UpdateHover(hover) => self.hovered_info = hover,
+			crate::gui::messages::PlotMessage::SelectionRequested { .. }
+			| crate::gui::messages::PlotMessage::SelectionStarted
+			| crate::gui::messages::PlotMessage::SelectionRefused(_) => {}
+			crate::gui::messages::PlotMessage::SelectionRebuilt(completion) => {
+				let expected = crate::selection::RebuildStamp {
+					publication: match self.publication {
+						Some(value) => value,
+						None => return None,
+					},
+					surface_incarnation: self.surface_incarnation,
+					selection_revision: self.selection_revision,
+				};
+				if completion.stamp == expected {
+					self.selection_display = crate::selection::SelectionDisplay::Ready;
+					self.render_revision = self.render_revision.wrapping_add(1);
+					let predicate = completion.predicate;
+					if let Ok(kernel) = completion.result {
+						self.kernel = kernel;
+						self.displayed_selection_revision = self.selection_revision;
+						self.displayed_filter_predicate = predicate;
+						let emphasis = crate::plot::common::project_selection_emphasis(
+							self.kernel.as_ref(),
+							&self.selection_predicate,
+							&self.selection_axis_fields,
+						);
+						self.emphasis_anchors = emphasis.anchors;
+						self.composite_emphasis = emphasis.composite;
+						self.selection_display = crate::selection::SelectionDisplay::Ready;
+						self.viewport_stamp = self.viewport_stamp.next();
+						self.viewport_motion = crate::plot::common::ViewportMotion::Settled;
+						self.raster_coordinator.invalidate();
+					}
+				}
+			}
+			crate::gui::messages::PlotMessage::UpdateStructuredHit { hit, hover } => {
+				self.structured_hit = hit;
+				self.hovered_info = hover;
+			}
 			crate::gui::messages::PlotMessage::RasterRequested(wants) => {
 				return self.raster_coordinator.request(wants);
 			}
@@ -636,6 +742,34 @@ impl NotebookPlotSurface {
 			}
 		}
 		None
+	}
+
+	fn begin_selection_rebuild(
+		&mut self,
+		revision: crate::selection::SelectionRevision,
+		predicate: crate::selection::Predicate,
+	) -> Option<crate::selection::SelectionRebuildJob> {
+		if self.selection_display == crate::selection::SelectionDisplay::Ready
+			&& predicate == self.displayed_filter_predicate
+		{
+			self.selection_revision = revision;
+			self.displayed_selection_revision = revision;
+			return None;
+		}
+		let recipe = self.recipe.clone()?;
+		let publication = self.publication?;
+		self.selection_revision = revision;
+		self.selection_display = crate::selection::SelectionDisplay::Pending;
+		self.render_revision = self.render_revision.wrapping_add(1);
+		Some(crate::selection::SelectionRebuildJob {
+			stamp: crate::selection::RebuildStamp {
+				publication,
+				surface_incarnation: self.surface_incarnation,
+				selection_revision: revision,
+			},
+			recipe,
+			predicate,
+		})
 	}
 }
 
@@ -935,10 +1069,16 @@ impl CodeEditor {
 			last_raw_window: None,
 			pointer_offset: None,
 			status_message: None,
+			selection_status_message: None,
 			quit_requested: false,
 			quit_notified: false,
 			show_column_types: false,
 			panels: PanelRegistry::default(),
+			selection_contexts: crate::selection::SelectionContexts::default(),
+			pending_selection_tasks: Vec::new(),
+			result_panel_input: crate::selection::InputIdentity::mint(),
+			rune_input_identities: HashMap::new(),
+			notebook_input_identities: HashMap::new(),
 			view_panel_ids: HashMap::new(),
 			next_view_panel_id: DYNAMIC_VIEW_PANEL_BASE,
 			view_group_ids: HashMap::new(),
@@ -1249,15 +1389,65 @@ impl CodeEditor {
 	}
 
 	pub fn begin_markdown_cell(&mut self, identity: MarkdownCellIdentity) {
+		if let Some(publication) =
+			self.notebook_outputs
+				.get(&identity)
+				.and_then(|output| match output {
+					NotebookCellOutput::Table(table) => Some(table.publication),
+					NotebookCellOutput::Plot { surface } => surface.publication,
+					_ => None,
+				}) {
+			self.retire_selection_publication(publication);
+		}
 		self.notebook_cell_data.remove(&identity);
 		self.notebook_outputs
 			.insert(identity, NotebookCellOutput::Running);
+	}
+
+	pub(crate) fn bind_notebook_artifact(
+		&mut self,
+		identity: &MarkdownCellIdentity,
+		artifact: &ResultArtifact,
+	) {
+		let input = *self
+			.notebook_input_identities
+			.entry(identity.clone())
+			.or_insert_with(crate::selection::InputIdentity::mint);
+		artifact.bind_input_identity(input);
+	}
+
+	pub(crate) fn bind_result_panel_artifact(&self, artifact: &ResultArtifact) {
+		artifact.bind_input_identity(self.result_panel_input);
+	}
+
+	pub(crate) fn bind_rune_artifact(
+		&mut self,
+		buffer: libaryon::core::BufferId,
+		lineage: Option<&crate::rune_relation_envelope::RelationLineage>,
+		artifact: &ResultArtifact,
+	) {
+		let Some(lineage) = lineage else { return };
+		let input = *self
+			.rune_input_identities
+			.entry((buffer, lineage.clone()))
+			.or_insert_with(crate::selection::InputIdentity::mint);
+		artifact.bind_input_identity(input);
 	}
 
 	/// Retire a SQL cell's prior data product without replacing it with
 	/// operational UI. A later table may claim the output surface; completion
 	/// messages and diagnostics belong to the application status channel.
 	pub fn clear_markdown_cell_artifact(&mut self, identity: &MarkdownCellIdentity) {
+		if let Some(publication) =
+			self.notebook_outputs
+				.get(identity)
+				.and_then(|output| match output {
+					NotebookCellOutput::Table(table) => Some(table.publication),
+					NotebookCellOutput::Plot { surface } => surface.publication,
+					_ => None,
+				}) {
+			self.retire_selection_publication(publication);
+		}
 		self.notebook_cell_data.remove(identity);
 		self.notebook_outputs.remove(identity);
 	}
@@ -1273,9 +1463,23 @@ impl CodeEditor {
 		skin: TableSkin,
 	) {
 		self.retain_markdown_cell_table(identity.clone(), &frame);
+		let artifact = self
+			.notebook_cell_data
+			.get(&identity)
+			.cloned()
+			.expect("retained notebook artifact");
+		let publication = artifact.publication();
+		let fields = crate::selection::frame_scalar_types(&frame);
 		self.notebook_outputs.insert(
-			identity,
-			NotebookCellOutput::Table(TableArtifact::new(frame, skin)),
+			identity.clone(),
+			NotebookCellOutput::Table(TableArtifact::from_artifact(frame, skin, artifact)),
+		);
+		self.selection_contexts.register(
+			crate::selection::SourceView::NotebookCell(identity),
+			crate::selection::LiveSelectionView {
+				publication,
+				fields,
+			},
 		);
 	}
 
@@ -1284,10 +1488,18 @@ impl CodeEditor {
 		identity: MarkdownCellIdentity,
 		frame: &DataFrame,
 	) {
-		self.notebook_cell_data.insert(
-			identity,
-			ResultArtifact::from_polars(Arc::new(frame.clone())),
-		);
+		let artifact = ResultArtifact::from_polars(Arc::new(frame.clone()));
+		self.bind_notebook_artifact(&identity, &artifact);
+		self.notebook_cell_data.insert(identity, artifact);
+	}
+
+	pub fn retain_markdown_cell_artifact(
+		&mut self,
+		identity: MarkdownCellIdentity,
+		artifact: Arc<ResultArtifact>,
+	) {
+		self.bind_notebook_artifact(&identity, &artifact);
+		self.notebook_cell_data.insert(identity, artifact);
 	}
 
 	pub fn set_markdown_cell_error(&mut self, identity: MarkdownCellIdentity, message: String) {
@@ -1306,6 +1518,39 @@ impl CodeEditor {
 			identity,
 			NotebookCellOutput::Plot {
 				surface: Box::new(NotebookPlotSurface::new(composition, kernel)),
+			},
+		);
+	}
+
+	pub fn set_markdown_cell_plot_with_recipe(
+		&mut self,
+		identity: MarkdownCellIdentity,
+		composition: PlotComposition,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		recipe: crate::plot::recipe::PlotRecipe,
+	) {
+		let publication = recipe.publication;
+		let fields = recipe
+			.artifact
+			.projection()
+			.ok()
+			.map(|frame| crate::selection::frame_scalar_types(&frame))
+			.unwrap_or_default();
+		self.notebook_outputs.insert(
+			identity.clone(),
+			NotebookCellOutput::Plot {
+				surface: Box::new(NotebookPlotSurface::new_with_recipe(
+					composition,
+					kernel,
+					recipe,
+				)),
+			},
+		);
+		self.selection_contexts.register(
+			crate::selection::SourceView::NotebookCell(identity),
+			crate::selection::LiveSelectionView {
+				publication,
+				fields,
 			},
 		);
 	}
@@ -1375,6 +1620,20 @@ impl CodeEditor {
 	) where
 		P: Clone + Into<ViewPresentation>,
 	{
+		let retired = self
+			.view_panel_ids
+			.iter()
+			.filter(|((buffer, _), _)| *buffer == producer)
+			.filter_map(|(_, panel_id)| self.panels.panels.get(panel_id))
+			.filter_map(|entry| match &entry.content {
+				PanelContent::Table(table) => Some(table.publication),
+				PanelContent::Plot(plot) => plot.publication,
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		for publication in retired {
+			self.retire_selection_publication(publication);
+		}
 		let active = views
 			.iter()
 			.map(|(identity, _)| identity.clone())
@@ -1522,14 +1781,46 @@ impl CodeEditor {
 		skin: TableSkin,
 		authored_show_column_types: Override<bool>,
 	) {
+		let artifact = ResultArtifact::from_polars(Arc::new(frame.clone()));
+		self.set_rune_view_table_with_presentation_from_artifact(
+			panel_id,
+			frame,
+			skin,
+			authored_show_column_types,
+			artifact,
+		);
+	}
+
+	#[cfg(feature = "toron")]
+	pub fn set_rune_view_table_with_presentation_from_artifact(
+		&mut self,
+		panel_id: HostPanelId,
+		frame: DataFrame,
+		skin: TableSkin,
+		authored_show_column_types: Override<bool>,
+		artifact: Arc<ResultArtifact>,
+	) {
+		let selectable = artifact.input_identity_is_bound();
+		let publication = artifact.publication();
+		let fields = crate::selection::frame_scalar_types(&frame);
 		self.panels.set_content(
 			panel_id,
-			PanelContent::Table(TableArtifact::with_authored_column_types(
+			PanelContent::Table(TableArtifact::with_artifact_and_column_types(
 				frame,
 				skin,
 				authored_show_column_types,
+				artifact,
 			)),
 		);
+		if selectable {
+			self.selection_contexts.register(
+				crate::selection::SourceView::HostPanel(panel_id.get()),
+				crate::selection::LiveSelectionView {
+					publication,
+					fields,
+				},
+			);
+		}
 	}
 
 	pub fn set_rune_view_plot(
@@ -1543,8 +1834,42 @@ impl CodeEditor {
 			.set_plot(panel_id, display_label, kernel, authored_settings);
 	}
 
+	pub fn set_rune_view_plot_with_recipe(
+		&mut self,
+		panel_id: HostPanelId,
+		display_label: String,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		authored_settings: PlotSettingsLayer,
+		recipe: crate::plot::recipe::PlotRecipe,
+	) {
+		let selectable = recipe.artifact.input_identity_is_bound();
+		let publication = recipe.publication;
+		let fields = recipe
+			.artifact
+			.projection()
+			.ok()
+			.map(|frame| crate::selection::frame_scalar_types(&frame))
+			.unwrap_or_default();
+		self.panels.set_plot_with_recipe(
+			panel_id,
+			display_label,
+			kernel,
+			authored_settings,
+			recipe,
+		);
+		if selectable {
+			self.selection_contexts.register(
+				crate::selection::SourceView::HostPanel(panel_id.get()),
+				crate::selection::LiveSelectionView {
+					publication,
+					fields,
+				},
+			);
+		}
+	}
+
 	#[cfg(feature = "toron")]
-	pub fn set_rune_view_plot_with_source(
+	pub fn set_rune_view_plot_with_source_and_recipe(
 		&mut self,
 		panel_id: HostPanelId,
 		display_label: String,
@@ -1552,7 +1877,16 @@ impl CodeEditor {
 		authored_settings: PlotSettingsLayer,
 		source_attachment: Option<crate::presentation_registry::PlotSourceAttachment>,
 		plot_type: Option<crate::plot::core::PlotType>,
+		recipe: crate::plot::recipe::PlotRecipe,
 	) {
+		let selectable = recipe.artifact.input_identity_is_bound();
+		let publication = recipe.publication;
+		let fields = recipe
+			.artifact
+			.projection()
+			.ok()
+			.map(|frame| crate::selection::frame_scalar_types(&frame))
+			.unwrap_or_default();
 		self.panels.set_plot_with_source(
 			panel_id,
 			display_label,
@@ -1561,6 +1895,22 @@ impl CodeEditor {
 			source_attachment,
 			plot_type,
 		);
+		if let Some(PanelEntry {
+			content: PanelContent::Plot(plot),
+			..
+		}) = self.panels.panels.get_mut(&panel_id)
+		{
+			plot.install_recipe(recipe);
+		}
+		if selectable {
+			self.selection_contexts.register(
+				crate::selection::SourceView::HostPanel(panel_id.get()),
+				crate::selection::LiveSelectionView {
+					publication,
+					fields,
+				},
+			);
+		}
 	}
 
 	#[cfg(feature = "toron")]
@@ -1853,6 +2203,18 @@ impl CodeEditor {
 		self.set_query_result_with_skin(frame, TableSkinCascade::library_floor());
 	}
 
+	pub fn set_query_result_from_artifact(
+		&mut self,
+		frame: DataFrame,
+		artifact: Arc<ResultArtifact>,
+	) {
+		self.set_query_result_with_skin_and_artifact(
+			frame,
+			TableSkinCascade::library_floor(),
+			artifact,
+		);
+	}
+
 	pub fn set_query_plot(
 		&mut self,
 		display_label: String,
@@ -1866,10 +2228,59 @@ impl CodeEditor {
 		);
 	}
 
+	pub fn set_query_plot_with_recipe(
+		&mut self,
+		display_label: String,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		recipe: crate::plot::recipe::PlotRecipe,
+	) {
+		let publication = recipe.publication;
+		let fields = recipe
+			.artifact
+			.projection()
+			.ok()
+			.map(|frame| crate::selection::frame_scalar_types(&frame))
+			.unwrap_or_default();
+		self.panels.set_plot_with_recipe(
+			RESULT_PANEL,
+			display_label,
+			kernel,
+			PlotSettingsLayer::default(),
+			recipe,
+		);
+		self.selection_contexts.register(
+			crate::selection::SourceView::HostPanel(RESULT_PANEL.get()),
+			crate::selection::LiveSelectionView {
+				publication,
+				fields,
+			},
+		);
+	}
+
 	fn set_query_result_with_skin(&mut self, frame: DataFrame, skin: TableSkin) {
+		let artifact = ResultArtifact::from_polars(Arc::new(frame.clone()));
+		self.bind_result_panel_artifact(&artifact);
+		self.set_query_result_with_skin_and_artifact(frame, skin, artifact);
+	}
+
+	fn set_query_result_with_skin_and_artifact(
+		&mut self,
+		frame: DataFrame,
+		skin: TableSkin,
+		artifact: Arc<ResultArtifact>,
+	) {
+		let publication = artifact.publication();
+		let fields = crate::selection::frame_scalar_types(&frame);
 		self.panels.set_content(
 			RESULT_PANEL,
-			PanelContent::Table(TableArtifact::new(frame, skin)),
+			PanelContent::Table(TableArtifact::from_artifact(frame, skin, artifact)),
+		);
+		self.selection_contexts.register(
+			crate::selection::SourceView::HostPanel(RESULT_PANEL.get()),
+			crate::selection::LiveSelectionView {
+				publication,
+				fields,
+			},
 		);
 	}
 
@@ -1922,6 +2333,21 @@ impl CodeEditor {
 					resize_render_suspended: plot.resize_render_suspended,
 					width,
 					height,
+					recipe: plot.recipe.clone(),
+					predicate: plot.publication.map_or_else(
+						crate::selection::Predicate::default,
+						|publication| {
+							self.selection_contexts.predicate_for(
+								publication.input,
+								&crate::selection::SourceView::HostPanel(panel_id.get()),
+							)
+						},
+					),
+					selection_revision: plot
+						.publication
+						.and_then(|publication| self.selection_contexts.revision(publication.input))
+						.unwrap_or(crate::selection::SelectionRevision::ZERO),
+					displayed_selection_revision: plot.displayed_selection_revision,
 				})
 			})
 			.collect()
@@ -1934,6 +2360,10 @@ impl CodeEditor {
 	/// Latest engine status line, if one arrived since the last input.
 	pub fn status_message(&self) -> Option<&str> {
 		self.status_message.as_deref()
+	}
+
+	pub fn take_selection_status(&mut self) -> Option<String> {
+		self.selection_status_message.take()
 	}
 
 	/// Animation phase while libaryon is performing foreground I/O or semantic
@@ -2348,6 +2778,190 @@ impl CodeEditor {
 		}
 	}
 
+	fn refresh_selection_emphasis(
+		&mut self,
+		input: crate::selection::InputIdentity,
+		view: &crate::selection::SourceView,
+	) {
+		let predicate = self
+			.selection_contexts
+			.own_predicate(input, view)
+			.cloned()
+			.unwrap_or_default();
+		match view {
+			crate::selection::SourceView::HostPanel(raw) => {
+				let panel_id = HostPanelId::new(*raw);
+				if let Some(entry) = self.panels.panels.get_mut(&panel_id) {
+					match &mut entry.content {
+						PanelContent::Plot(plot) => {
+							plot.selection_predicate = predicate;
+							let emphasis = crate::plot::common::project_selection_emphasis(
+								plot.kernel.as_ref(),
+								&plot.selection_predicate,
+								&plot.selection_axis_fields,
+							);
+							plot.emphasis_anchors = emphasis.anchors;
+							plot.composite_emphasis = emphasis.composite;
+							plot.render_revision = plot.render_revision.wrapping_add(1);
+						}
+						PanelContent::Table(table) => table.selection_predicate = predicate,
+						_ => {}
+					}
+				}
+			}
+			crate::selection::SourceView::NotebookCell(identity) => {
+				if let Some(output) = self.notebook_outputs.get_mut(identity) {
+					match output {
+						NotebookCellOutput::Plot { surface } => {
+							surface.selection_predicate = predicate;
+							let emphasis = crate::plot::common::project_selection_emphasis(
+								surface.kernel.as_ref(),
+								&surface.selection_predicate,
+								&surface.selection_axis_fields,
+							);
+							surface.emphasis_anchors = emphasis.anchors;
+							surface.composite_emphasis = emphasis.composite;
+							surface.render_revision = surface.render_revision.wrapping_add(1);
+						}
+						NotebookCellOutput::Table(table) => table.selection_predicate = predicate,
+						_ => {}
+					}
+				}
+			}
+		}
+	}
+
+	fn selection_rebuild_tasks(
+		&mut self,
+		change: crate::selection::SelectionChange,
+	) -> Task<EditorMsg> {
+		if let Some(source) = change.emphasize.as_ref() {
+			self.refresh_selection_emphasis(change.input, source);
+		}
+		let mut tasks = Vec::new();
+		for view in change.rebuild {
+			let predicate = self.selection_contexts.predicate_for(change.input, &view);
+			match view {
+				crate::selection::SourceView::HostPanel(raw) => {
+					let panel_id = HostPanelId::new(raw);
+					if let Some(entry) = self.panels.panels.get_mut(&panel_id) {
+						match &mut entry.content {
+							PanelContent::Plot(plot) => {
+								if let Some(job) =
+									plot.begin_selection_rebuild(change.revision, predicate)
+								{
+									tasks.push(Task::perform(
+										crate::selection::run_selection_rebuild(job),
+										move |completion| EditorMsg::HostPlot {
+											panel_id,
+											message: PlotPaneMsg::SelectionRebuilt(completion),
+										},
+									));
+								}
+							}
+							PanelContent::Table(table) => {
+								if let Some(job) =
+									table.begin_selection_rebuild(change.revision, predicate)
+								{
+									tasks.push(Task::perform(
+										crate::selection::run_table_rebuild(job),
+										move |completion| EditorMsg::HostTableRebuilt {
+											panel_id,
+											completion,
+										},
+									));
+								}
+							}
+							_ => {}
+						}
+					}
+				}
+				crate::selection::SourceView::NotebookCell(identity) => {
+					if let Some(output) = self.notebook_outputs.get_mut(&identity) {
+						match output {
+							NotebookCellOutput::Plot { surface } => {
+								if let Some(job) =
+									surface.begin_selection_rebuild(change.revision, predicate)
+								{
+									let target = identity.clone();
+									tasks.push(Task::perform(
+										crate::selection::run_selection_rebuild(job),
+										move |completion| EditorMsg::NotebookPlot {
+											identity: target.clone(),
+											message: PlotPaneMsg::SelectionRebuilt(completion),
+										},
+									));
+								}
+							}
+							NotebookCellOutput::Table(table) => {
+								if let Some(job) =
+									table.begin_selection_rebuild(change.revision, predicate)
+								{
+									let target = identity.clone();
+									tasks.push(Task::perform(
+										crate::selection::run_table_rebuild(job),
+										move |completion| EditorMsg::NotebookTableRebuilt {
+											identity: target.clone(),
+											completion,
+										},
+									));
+								}
+							}
+							_ => {}
+						}
+					}
+				}
+			}
+		}
+		Task::batch(tasks)
+	}
+
+	fn retire_selection_publication(&mut self, publication: crate::selection::Publication) {
+		if let Some(change) = self.selection_contexts.retire(publication) {
+			let task = self.selection_rebuild_tasks(change);
+			self.pending_selection_tasks.push(task);
+		}
+	}
+
+	pub(crate) fn retire_result_panel_publication(&mut self) {
+		let publication =
+			self.panels
+				.panels
+				.get(&RESULT_PANEL)
+				.and_then(|entry| match &entry.content {
+					PanelContent::Table(table) => Some(table.publication),
+					PanelContent::Plot(plot) => plot.publication,
+					_ => None,
+				});
+		if let Some(publication) = publication {
+			self.retire_selection_publication(publication);
+		}
+	}
+
+	pub(crate) fn retire_publication(&mut self, publication: crate::selection::Publication) {
+		self.retire_selection_publication(publication);
+	}
+
+	pub(crate) fn take_selection_tasks(&mut self) -> Task<EditorMsg> {
+		Task::batch(std::mem::take(&mut self.pending_selection_tasks))
+	}
+
+	fn apply_selection_intent(
+		&mut self,
+		intent: crate::selection::SelectionIntent,
+	) -> Task<EditorMsg> {
+		match self.selection_contexts.apply(intent) {
+			Ok(change) => {
+				self.selection_status_message = None;
+				self.selection_rebuild_tasks(change)
+			}
+			Err(error) => {
+				self.selection_status_message = Some(error.to_string());
+				Task::none()
+			}
+		}
+	}
+
 	pub fn update(&mut self, message: EditorMsg) -> Task<EditorMsg> {
 		if self.quit_requested {
 			return Task::none();
@@ -2390,9 +3004,48 @@ impl CodeEditor {
 			}
 			EditorMsg::HostPlot { panel_id, message } => {
 				let quiet_settle = message.quiet_settle_stamp();
+				if let PlotPaneMsg::SelectionRebuilt(completion) = &message
+					&& let Err(error) = &completion.result
+				{
+					self.selection_status_message =
+						Some(format!("Selection · rebuild refused: {error}"));
+				}
+				if let PlotPaneMsg::SelectionRefused(message) = &message {
+					self.selection_status_message = Some(message.clone());
+					return Task::none();
+				}
+				if let PlotPaneMsg::SelectionRequested {
+					predicate,
+					operation,
+				} = &message
+				{
+					let publication =
+						self.panels
+							.panels
+							.get(&panel_id)
+							.and_then(|entry| match &entry.content {
+								PanelContent::Plot(plot) => plot.publication,
+								_ => None,
+							});
+					let Some(publication) = publication else {
+						self.selection_status_message = Some(
+							"Selection · this view has no attributable input publication"
+								.to_owned(),
+						);
+						return Task::none();
+					};
+					return self.apply_selection_intent(crate::selection::SelectionIntent {
+						publication,
+						source_view: crate::selection::SourceView::HostPanel(panel_id.get()),
+						predicate: predicate.clone(),
+						operation: *operation,
+					});
+				}
 				if matches!(
 					&message,
-					PlotPaneMsg::ViewportStarted(_) | PlotPaneMsg::ViewportReset(_)
+					PlotPaneMsg::ViewportStarted(_)
+						| PlotPaneMsg::ViewportReset(_)
+						| PlotPaneMsg::SelectionStarted
 				) {
 					// PRODUCT-0150 captures a plot press so the workspace mouse
 					// area cannot also begin a pane drag. Preserve the focus half of
@@ -2443,7 +3096,11 @@ impl CodeEditor {
 						self.plot_writeback_gestures
 							.push_back(PlotWritebackGesture::Cancel { panel_id });
 					}
-					PlotPaneMsg::UpdateHover(_)
+					PlotPaneMsg::UpdateStructuredHit { .. }
+					| PlotPaneMsg::SelectionRequested { .. }
+					| PlotPaneMsg::SelectionStarted
+					| PlotPaneMsg::SelectionRefused(_)
+					| PlotPaneMsg::SelectionRebuilt(_)
 					| PlotPaneMsg::RasterRequested(_)
 					| PlotPaneMsg::RasterCompleted(_)
 					| PlotPaneMsg::ToggleSettingsInspector
@@ -2476,6 +3133,42 @@ impl CodeEditor {
 			}
 			EditorMsg::NotebookPlot { identity, message } => {
 				let quiet_settle = message.quiet_settle_stamp();
+				if let PlotPaneMsg::SelectionRebuilt(completion) = &message
+					&& let Err(error) = &completion.result
+				{
+					self.selection_status_message =
+						Some(format!("Selection · rebuild refused: {error}"));
+				}
+				if let PlotPaneMsg::SelectionRefused(message) = &message {
+					self.selection_status_message = Some(message.clone());
+					return Task::none();
+				}
+				if let PlotPaneMsg::SelectionRequested {
+					predicate,
+					operation,
+				} = &message
+				{
+					let publication =
+						self.notebook_outputs
+							.get(&identity)
+							.and_then(|output| match output {
+								NotebookCellOutput::Plot { surface } => surface.publication,
+								_ => None,
+							});
+					let Some(publication) = publication else {
+						self.selection_status_message = Some(
+							"Selection · this view has no attributable input publication"
+								.to_owned(),
+						);
+						return Task::none();
+					};
+					return self.apply_selection_intent(crate::selection::SelectionIntent {
+						publication,
+						source_view: crate::selection::SourceView::NotebookCell(identity),
+						predicate: predicate.clone(),
+						operation: *operation,
+					});
+				}
 				let job =
 					self.notebook_outputs
 						.get_mut(&identity)
@@ -2503,6 +3196,89 @@ impl CodeEditor {
 							message: PlotPaneMsg::ViewportSettled(stamp),
 						},
 					);
+				}
+			}
+			EditorMsg::HostTableSelection { panel_id, event } => {
+				let resolved =
+					self.panels
+						.panels
+						.get(&panel_id)
+						.and_then(|entry| match &entry.content {
+							PanelContent::Table(table) => Some((
+								table.publication,
+								crate::selection::table_event_predicate(&table.frame, &event),
+							)),
+							_ => None,
+						});
+				let Some((publication, result)) = resolved else {
+					return Task::none();
+				};
+				match result {
+					Ok((predicate, operation)) => {
+						return self.apply_selection_intent(crate::selection::SelectionIntent {
+							publication,
+							source_view: crate::selection::SourceView::HostPanel(panel_id.get()),
+							predicate,
+							operation,
+						});
+					}
+					Err(error) => self.selection_status_message = Some(error.to_string()),
+				}
+			}
+			EditorMsg::NotebookTableSelection { identity, event } => {
+				let resolved =
+					self.notebook_outputs
+						.get(&identity)
+						.and_then(|output| match output {
+							NotebookCellOutput::Table(table) => Some((
+								table.publication,
+								crate::selection::table_event_predicate(&table.frame, &event),
+							)),
+							_ => None,
+						});
+				let Some((publication, result)) = resolved else {
+					return Task::none();
+				};
+				match result {
+					Ok((predicate, operation)) => {
+						return self.apply_selection_intent(crate::selection::SelectionIntent {
+							publication,
+							source_view: crate::selection::SourceView::NotebookCell(identity),
+							predicate,
+							operation,
+						});
+					}
+					Err(error) => self.selection_status_message = Some(error.to_string()),
+				}
+			}
+			EditorMsg::HostTableRebuilt {
+				panel_id,
+				completion,
+			} => {
+				if let Err(error) = &completion.result {
+					self.selection_status_message =
+						Some(format!("Selection · rebuild refused: {error}"));
+				}
+				if let Some(PanelEntry {
+					content: PanelContent::Table(table),
+					..
+				}) = self.panels.panels.get_mut(&panel_id)
+				{
+					table.complete_selection_rebuild(completion);
+				}
+			}
+			EditorMsg::NotebookTableRebuilt {
+				identity,
+				completion,
+			} => {
+				if let Err(error) = &completion.result {
+					self.selection_status_message =
+						Some(format!("Selection · rebuild refused: {error}"));
+				}
+				if let Some(NotebookCellOutput::Table(table)) =
+					self.notebook_outputs.get_mut(&identity)
+				{
+					table.complete_selection_rebuild(completion);
 				}
 			}
 			EditorMsg::Input(InputEvent::Key {
@@ -3444,6 +4220,10 @@ pub(crate) struct HostPlotExport {
 	pub(crate) resize_render_suspended: bool,
 	pub(crate) width: f32,
 	pub(crate) height: f32,
+	pub(crate) recipe: Option<crate::plot::recipe::PlotRecipe>,
+	pub(crate) predicate: crate::selection::Predicate,
+	pub(crate) selection_revision: crate::selection::SelectionRevision,
+	pub(crate) displayed_selection_revision: crate::selection::SelectionRevision,
 }
 
 struct PanelEntry {
@@ -3460,22 +4240,50 @@ struct PanelEntry {
 
 struct TableArtifact {
 	frame: Box<DataFrame>,
+	artifact: Arc<ResultArtifact>,
+	publication: crate::selection::Publication,
+	selection_enabled: bool,
+	selection_revision: crate::selection::SelectionRevision,
+	selection_pending: bool,
+	displayed_filter_predicate: crate::selection::Predicate,
+	surface_incarnation: crate::selection::SurfaceIncarnation,
+	selection_predicate: crate::selection::Predicate,
+	content_revision: u64,
 	skin: TableSkin,
 	authored_show_column_types: Override<bool>,
 }
 
 impl TableArtifact {
-	fn new(frame: DataFrame, skin: TableSkin) -> Self {
-		Self::with_authored_column_types(frame, skin, Override::Inherit)
-	}
-
 	fn with_authored_column_types(
 		frame: DataFrame,
 		skin: TableSkin,
 		authored_show_column_types: Override<bool>,
 	) -> Self {
+		let artifact = ResultArtifact::from_polars(Arc::new(frame.clone()));
+		Self::with_artifact_and_column_types(frame, skin, authored_show_column_types, artifact)
+	}
+
+	fn from_artifact(frame: DataFrame, skin: TableSkin, artifact: Arc<ResultArtifact>) -> Self {
+		Self::with_artifact_and_column_types(frame, skin, Override::Inherit, artifact)
+	}
+
+	fn with_artifact_and_column_types(
+		frame: DataFrame,
+		skin: TableSkin,
+		authored_show_column_types: Override<bool>,
+		artifact: Arc<ResultArtifact>,
+	) -> Self {
 		Self {
 			frame: Box::new(frame),
+			publication: artifact.publication(),
+			selection_enabled: artifact.input_identity_is_bound(),
+			artifact,
+			selection_revision: crate::selection::SelectionRevision::ZERO,
+			selection_pending: false,
+			displayed_filter_predicate: crate::selection::Predicate::default(),
+			surface_incarnation: crate::selection::SurfaceIncarnation::mint(),
+			selection_predicate: crate::selection::Predicate::default(),
+			content_revision: 0,
 			skin,
 			authored_show_column_types,
 		}
@@ -3486,6 +4294,50 @@ impl TableArtifact {
 			Override::Inherit => application,
 			Override::Set(authored) => authored,
 		}
+	}
+
+	fn begin_selection_rebuild(
+		&mut self,
+		revision: crate::selection::SelectionRevision,
+		predicate: crate::selection::Predicate,
+	) -> Option<crate::selection::TableRebuildJob> {
+		if !self.selection_pending && predicate == self.displayed_filter_predicate {
+			self.selection_revision = revision;
+			return None;
+		}
+		self.selection_revision = revision;
+		self.selection_pending = true;
+		Some(crate::selection::TableRebuildJob {
+			stamp: crate::selection::RebuildStamp {
+				publication: self.publication,
+				surface_incarnation: self.surface_incarnation,
+				selection_revision: revision,
+			},
+			artifact: Arc::clone(&self.artifact),
+			predicate,
+		})
+	}
+
+	fn complete_selection_rebuild(
+		&mut self,
+		completion: crate::selection::TableRebuildCompletion,
+	) -> bool {
+		if completion.stamp
+			!= (crate::selection::RebuildStamp {
+				publication: self.publication,
+				surface_incarnation: self.surface_incarnation,
+				selection_revision: self.selection_revision,
+			}) {
+			return false;
+		}
+		self.selection_pending = false;
+		let Ok(frame) = completion.result else {
+			return false;
+		};
+		self.frame = Box::new(frame);
+		self.displayed_filter_predicate = completion.predicate;
+		self.content_revision = self.content_revision.wrapping_add(1);
+		true
 	}
 }
 
@@ -3777,6 +4629,24 @@ impl PanelRegistry {
 		);
 	}
 
+	fn set_plot_with_recipe(
+		&mut self,
+		panel_id: HostPanelId,
+		display_label: String,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		authored_settings: PlotSettingsLayer,
+		recipe: crate::plot::recipe::PlotRecipe,
+	) {
+		self.set_plot(panel_id, display_label, kernel, authored_settings);
+		if let Some(PanelEntry {
+			content: PanelContent::Plot(plot),
+			..
+		}) = self.panels.get_mut(&panel_id)
+		{
+			plot.install_recipe(recipe);
+		}
+	}
+
 	#[cfg(feature = "toron")]
 	fn set_plot_with_source(
 		&mut self,
@@ -3835,23 +4705,47 @@ impl PanelRegistry {
 			.unwrap_or(&PanelContent::Unresolved);
 
 		let inner: Element<'a, EditorMsg> = match content {
-			PanelContent::Table(artifact) => Table::new(
-				artifact.frame.as_ref(),
-				0,
-				self.table_skin_at_draw(panel.panel_id, artifact.skin),
-			)
-			.show_column_types(artifact.resolve_show_column_types(show_column_types))
-			.scroll_request(
-				self.panels
-					.get(&panel.panel_id)
-					.and_then(|entry| entry.scroll),
-			)
-			.width_store(
-				self.panels
-					.get(&panel.panel_id)
-					.map(|entry| &entry.col_widths),
-			)
-			.into(),
+			PanelContent::Table(artifact) => {
+				let table: Table<'a, EditorMsg> = Table::new(
+					artifact.frame.as_ref(),
+					0,
+					self.table_skin_at_draw(panel.panel_id, artifact.skin),
+				)
+				.show_column_types(artifact.resolve_show_column_types(show_column_types))
+				.emphasis(&artifact.selection_predicate)
+				.data_revision(artifact.content_revision)
+				.scroll_request(
+					self.panels
+						.get(&panel.panel_id)
+						.and_then(|entry| entry.scroll),
+				)
+				.width_store(
+					self.panels
+						.get(&panel.panel_id)
+						.map(|entry| &entry.col_widths),
+				);
+				let table = if artifact.selection_enabled {
+					table.on_selection({
+						let panel_id = panel.panel_id;
+						move |event| EditorMsg::HostTableSelection { panel_id, event }
+					})
+				} else {
+					table
+				};
+				let table: Element<'a, EditorMsg> = table.into();
+				if artifact.selection_pending {
+					stack![
+						table,
+						container(text("preparing…").size(12))
+							.padding([6, 10])
+							.align_x(iced::alignment::Horizontal::Left)
+							.align_y(iced::alignment::Vertical::Top),
+					]
+					.into()
+				} else {
+					table
+				}
+			}
 			PanelContent::Plot(plot) => {
 				let attachment_status = plot_source_attachment_status(
 					plot.source_attachment.as_ref(),
@@ -4967,9 +5861,34 @@ fn markdown_cell_output_surface<'a>(
 			.color(color(palette.preview_text))
 			.into(),
 		NotebookCellOutput::Table(artifact) => {
-			Table::new(artifact.frame.as_ref(), 0, artifact.skin)
+			let table: Table<'a, EditorMsg> = Table::new(artifact.frame.as_ref(), 0, artifact.skin)
 				.show_column_types(artifact.resolve_show_column_types(show_column_types))
+				.emphasis(&artifact.selection_predicate)
+				.data_revision(artifact.content_revision);
+			let table = if artifact.selection_enabled {
+				table.on_selection({
+					let identity = identity.clone();
+					move |event| EditorMsg::NotebookTableSelection {
+						identity: identity.clone(),
+						event,
+					}
+				})
+			} else {
+				table
+			};
+			let table: Element<'a, EditorMsg> = table.into();
+			if artifact.selection_pending {
+				stack![
+					table,
+					container(text("preparing…").size(12))
+						.padding([6, 10])
+						.align_x(iced::alignment::Horizontal::Left)
+						.align_y(iced::alignment::Vertical::Top),
+				]
 				.into()
+			} else {
+				table
+			}
 		}
 		NotebookCellOutput::Plot { surface } => {
 			let plot: Element<'_, crate::gui::messages::PlotMessage> = canvas(
@@ -4983,7 +5902,17 @@ fn markdown_cell_output_surface<'a>(
 					PlotRenderLayer::Full,
 				)
 				.with_raster_coordinator(&surface.raster_coordinator)
-				.with_viewport_state(surface.viewport_stamp, surface.viewport_motion),
+				.with_viewport_state(surface.viewport_stamp, surface.viewport_motion)
+				.with_selection_state(
+					surface.selection_display == crate::selection::SelectionDisplay::Pending,
+					&surface.emphasis_anchors,
+				)
+				.with_composite_emphasis(surface.composite_emphasis.as_deref())
+				.with_selection_interaction(
+					surface.publication.is_some(),
+					&surface.selection_axis_fields,
+					&surface.selection_predicate,
+				),
 			)
 			.width(Length::Fill)
 			.height(Length::Fill)
@@ -11028,7 +11957,10 @@ mod tests {
 		editor.set_markdown_cell_plot(identity.clone(), composition, kernel);
 		let _ = editor.update(EditorMsg::NotebookPlot {
 			identity: identity.clone(),
-			message: PlotMessage::UpdateHover(Some("x: 1, y: 2".to_owned())),
+			message: PlotMessage::UpdateStructuredHit {
+				hit: None,
+				hover: Some("x: 1, y: 2".to_owned()),
+			},
 		});
 
 		let Some(super::NotebookCellOutput::Plot { surface }) =
@@ -11286,7 +12218,7 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0150_notebook_surface_owns_a_model_and_rejects_predecessor_settle() {
+	fn product_0150_product_0151_notebook_surface_owns_a_model_and_dedupes_ready_selection() {
 		use crate::plot::common::{
 			AxisType, CoordinateTransformer, PlotBackend, PlotHit, PlotKernel, PlotLayout,
 			ResolvedPlotSettings, ViewportMotion,
@@ -11352,5 +12284,105 @@ mod tests {
 			replacement.settings_model.pane_override.domains,
 			crate::plot::spec::Override::Set(_)
 		));
+
+		let selection_revision = crate::selection::SelectionRevision::ZERO.next();
+		assert!(
+			replacement
+				.begin_selection_rebuild(selection_revision, crate::selection::Predicate::default(),)
+				.is_none(),
+			"a ready notebook plot schedules no unchanged filter rebuild"
+		);
+		assert_eq!(replacement.selection_revision, selection_revision);
+		assert_eq!(replacement.displayed_selection_revision, selection_revision);
+	}
+
+	#[test]
+	fn product_0151_ready_table_dedupes_an_unchanged_filter_predicate() {
+		let mut table = super::TableArtifact::with_authored_column_types(
+			polars::df!("value" => [1_i64]).expect("table frame"),
+			crate::gui::table_skin::TableSkin::DEFAULT,
+			crate::plot::spec::Override::Inherit,
+		);
+		let revision = crate::selection::SelectionRevision::ZERO.next();
+		assert!(
+			table
+				.begin_selection_rebuild(revision, crate::selection::Predicate::default())
+				.is_none(),
+			"a ready table schedules no unchanged filter rebuild"
+		);
+		assert_eq!(table.selection_revision, revision);
+		assert!(!table.selection_pending);
+	}
+
+	#[test]
+	fn product_0151_logical_bindings_keep_input_identity_and_republish_tokens() {
+		use crate::rune_relation_envelope::{RelationLineage, RelationLineageLiteral};
+		use libaryon::core::BufferId;
+		use libaryon::uast::projection::MarkdownCellIdentity;
+
+		let artifact = || {
+			crate::result_artifact::ResultArtifact::from_polars(std::sync::Arc::new(
+				polars::df!("x" => [1_i64]).expect("identity frame"),
+			))
+		};
+		let mut editor = CodeEditor::new("select 1;");
+		let query_first = artifact();
+		let query_second = artifact();
+		editor.bind_result_panel_artifact(&query_first);
+		editor.bind_result_panel_artifact(&query_second);
+		assert_eq!(
+			query_first.publication().input,
+			query_second.publication().input
+		);
+		assert_ne!(
+			query_first.publication().token,
+			query_second.publication().token
+		);
+
+		let cell = MarkdownCellIdentity::Explicit { id: "sales".into() };
+		let notebook_first = artifact();
+		let notebook_second = artifact();
+		editor.bind_notebook_artifact(&cell, &notebook_first);
+		editor.bind_notebook_artifact(&cell, &notebook_second);
+		assert_eq!(
+			notebook_first.publication().input,
+			notebook_second.publication().input
+		);
+		assert_ne!(
+			notebook_first.publication().token,
+			notebook_second.publication().token
+		);
+
+		let buffer = BufferId::new(77);
+		let sales = RelationLineage {
+			method: "table".into(),
+			arguments: vec![RelationLineageLiteral::String("sales".into())],
+		};
+		let costs = RelationLineage {
+			method: "table".into(),
+			arguments: vec![RelationLineageLiteral::String("costs".into())],
+		};
+		let rune_first = artifact();
+		let rune_second = artifact();
+		let rune_other = artifact();
+		editor.bind_rune_artifact(buffer, Some(&sales), &rune_first);
+		editor.bind_rune_artifact(buffer, Some(&sales), &rune_second);
+		editor.bind_rune_artifact(buffer, Some(&costs), &rune_other);
+		assert_eq!(
+			rune_first.publication().input,
+			rune_second.publication().input
+		);
+		assert_ne!(
+			rune_first.publication().token,
+			rune_second.publication().token
+		);
+		assert_ne!(
+			rune_first.publication().input,
+			rune_other.publication().input
+		);
+
+		let dynamic = artifact();
+		editor.bind_rune_artifact(buffer, None, &dynamic);
+		assert!(!dynamic.input_identity_is_bound());
 	}
 }

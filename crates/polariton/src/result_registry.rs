@@ -8,6 +8,7 @@
 //! restoring stale data (`plans/wip/rune-data-products.md`).
 
 use crate::result_artifact::{ArtifactToken, ResultArtifact, ResultArtifactError};
+use crate::selection::{InputIdentity, Publication};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -30,6 +31,7 @@ pub struct PendingPublication {
 	pub revision: u64,
 	pub source_buffer: libaryon::core::BufferId,
 	pub connection: String,
+	pub input_identity: InputIdentity,
 }
 
 /// Where a published binding came from, shown wherever the data is consumed.
@@ -58,6 +60,8 @@ pub struct ResultRegistry {
 	/// bind or conclude the name.
 	pending: HashMap<String, u64>,
 	bound: HashMap<String, PublishedResult>,
+	/// Stable across republication and failure; result names are the binding.
+	input_identities: HashMap<String, InputIdentity>,
 }
 
 impl ResultRegistry {
@@ -73,11 +77,16 @@ impl ResultRegistry {
 		let revision = self.next_revision;
 		self.bound.remove(name);
 		self.pending.insert(name.to_owned(), revision);
+		let input_identity = *self
+			.input_identities
+			.entry(name.to_owned())
+			.or_insert_with(InputIdentity::mint);
 		PendingPublication {
 			name: name.to_owned(),
 			revision,
 			source_buffer,
 			connection,
+			input_identity,
 		}
 	}
 
@@ -88,6 +97,7 @@ impl ResultRegistry {
 			return false;
 		}
 		self.pending.remove(&claim.name);
+		artifact.bind_input_identity(claim.input_identity);
 		let provenance = ResultProvenance {
 			source_buffer: claim.source_buffer,
 			revision: claim.revision,
@@ -146,6 +156,12 @@ impl ResultRegistry {
 	pub fn artifact_token(&self, name: &str) -> Option<ArtifactToken> {
 		self.provenance(name)
 			.map(|provenance| provenance.artifact_token)
+	}
+
+	pub fn publication(&self, name: &str) -> Option<Publication> {
+		self.bound
+			.get(name)
+			.map(|published| published.artifact.publication())
 	}
 }
 
@@ -250,6 +266,20 @@ mod tests {
 
 		assert!(registry.publish(&claim, artifact));
 		assert_eq!(registry.artifact_token("test"), Some(token));
+	}
+
+	#[test]
+	fn product_0151_named_binding_keeps_input_identity_and_republishes_token() {
+		let mut registry = ResultRegistry::default();
+		let first = begin(&mut registry, "test");
+		assert!(registry.publish(&first, frame(1)));
+		let first_publication = registry.publication("test").expect("first");
+
+		let second = begin(&mut registry, "test");
+		assert!(registry.publish(&second, frame(2)));
+		let second_publication = registry.publication("test").expect("second");
+		assert_eq!(first_publication.input, second_publication.input);
+		assert_ne!(first_publication.token, second_publication.token);
 	}
 
 	#[test]

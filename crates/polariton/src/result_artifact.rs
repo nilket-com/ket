@@ -6,6 +6,7 @@
 
 #![allow(dead_code)] // Schema/nullness availability precedes its first admission consumer.
 
+use crate::selection::{InputIdentity, Publication};
 use arrow_array::{Array, RecordBatch};
 use arrow_buffer::NullBuffer;
 use arrow_csv::Writer as ArrowCsvWriter;
@@ -19,7 +20,7 @@ use std::fmt;
 use std::io::{Cursor, Write};
 use std::num::NonZeroU64;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// Product-owned identity for one materialized publication.
@@ -99,6 +100,13 @@ enum ResultBacking {
 #[derive(Debug)]
 pub struct ResultArtifact {
 	artifact_token: ArtifactToken,
+	/// Bound before publication becomes observable. The atomic lets a producer
+	/// materialize first and the product binding (result name, buffer, Rune
+	/// lineage, or notebook cell) install its stable identity without copying
+	/// Arrow batches. Derived artifacts snapshot it through
+	/// `from_polars_derived`.
+	input_identity: AtomicU64,
+	input_identity_bound: AtomicBool,
 	schema: ResultSchema,
 	backing: ResultBacking,
 	shape: (usize, usize),
@@ -220,6 +228,8 @@ impl ResultArtifact {
 		let width = schema.fields().len();
 		Ok(Arc::new(Self {
 			artifact_token: ArtifactToken::mint(),
+			input_identity: AtomicU64::new(InputIdentity::mint().raw()),
+			input_identity_bound: AtomicBool::new(false),
 			schema: result_schema,
 			backing: ResultBacking::Arrow(ArrowBacking {
 				schema,
@@ -240,10 +250,29 @@ impl ResultArtifact {
 	/// identity. A view may change the frame allocation while remaining bound
 	/// to the same published relation for selection and staleness checks.
 	pub fn from_polars_derived(frame: Arc<DataFrame>, source: &Self) -> Arc<Self> {
-		Self::from_polars_with_token(frame, source.artifact_token)
+		Self::from_polars_with_publication(
+			frame,
+			source.publication(),
+			source.input_identity_is_bound(),
+		)
 	}
 
 	fn from_polars_with_token(frame: Arc<DataFrame>, artifact_token: ArtifactToken) -> Arc<Self> {
+		Self::from_polars_with_publication(
+			frame,
+			Publication {
+				input: InputIdentity::mint(),
+				token: artifact_token,
+			},
+			false,
+		)
+	}
+
+	fn from_polars_with_publication(
+		frame: Arc<DataFrame>,
+		publication: Publication,
+		input_identity_bound: bool,
+	) -> Arc<Self> {
 		let schema = ResultSchema {
 			fields: frame
 				.get_column_names()
@@ -256,7 +285,9 @@ impl ResultArtifact {
 		};
 		let shape = frame.shape();
 		Arc::new(Self {
-			artifact_token,
+			artifact_token: publication.token,
+			input_identity: AtomicU64::new(publication.input.raw()),
+			input_identity_bound: AtomicBool::new(input_identity_bound),
 			schema,
 			backing: ResultBacking::Polars(frame),
 			shape,
@@ -276,6 +307,25 @@ impl ResultArtifact {
 	/// The adapter-neutral identity of this materialized publication.
 	pub fn artifact_token(&self) -> ArtifactToken {
 		self.artifact_token
+	}
+
+	pub fn publication(&self) -> Publication {
+		Publication {
+			input: InputIdentity::from_raw(self.input_identity.load(Ordering::Acquire)),
+			token: self.artifact_token,
+		}
+	}
+
+	pub(crate) fn input_identity_is_bound(&self) -> bool {
+		self.input_identity_bound.load(Ordering::Acquire)
+	}
+
+	/// Bind a freshly materialized artifact to the stable logical input before
+	/// the artifact is exposed to consumers. Rebinding changes no publication
+	/// token and therefore cannot make stale data appear current.
+	pub(crate) fn bind_input_identity(&self, input: InputIdentity) {
+		self.input_identity.store(input.raw(), Ordering::Release);
+		self.input_identity_bound.store(true, Ordering::Release);
 	}
 
 	pub fn shape(&self) -> (usize, usize) {
@@ -613,6 +663,17 @@ mod tests {
 
 		assert_ne!(first.artifact_token(), second.artifact_token());
 		assert_eq!(first.artifact_token(), shared.artifact_token());
+	}
+
+	#[test]
+	fn product_0151_derived_artifacts_inherit_the_complete_publication() {
+		let source =
+			ResultArtifact::from_polars(Arc::new(polars::df!("x" => [1_i32, 2]).expect("source")));
+		let derived = ResultArtifact::from_polars_derived(
+			Arc::new(polars::df!("x" => [2_i32]).expect("derived")),
+			&source,
+		);
+		assert_eq!(derived.publication(), source.publication());
 	}
 
 	#[test]

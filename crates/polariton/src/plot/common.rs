@@ -30,6 +30,623 @@ pub enum Orientation {
 	Horizontal,
 }
 
+#[cfg(test)]
+mod product_0151_selection_gesture_tests {
+	use super::*;
+	use crate::plot::spec::SemanticType;
+	use crate::plot::theme::PlotSettings;
+	use crate::selection::{
+		ExactScalar, FieldRef, Predicate, ScalarType, SelectionAxisFields, SelectionCandidate,
+		SelectionOperation,
+	};
+	use iced::advanced::mouse::Cursor;
+	use iced::{Event, Point, Rectangle, keyboard, mouse};
+
+	struct PointAnchor;
+
+	impl EmphasisAnchor for PointAnchor {
+		fn reproject(&self, transform: &CoordinateTransformer) -> Option<EmphasisShape> {
+			Some(EmphasisShape::Circle {
+				center: transform.cartesian(5.0, 5.0),
+				radius: 6.0,
+			})
+		}
+	}
+
+	struct SelectionKernel {
+		admitted: bool,
+	}
+
+	impl PlotKernel for SelectionKernel {
+		fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
+			PlotLayout::Cartesian {
+				x_range: (0.0, 10.0),
+				y_range: (0.0, 10.0),
+				x_axis_type: AxisType::Linear,
+				y_axis_type: AxisType::Linear,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
+			}
+		}
+
+		fn plot(
+			&self,
+			_backend: &mut dyn PlotBackend,
+			_bounds: Rectangle,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+			_settings: ResolvedPlotSettings,
+		) {
+		}
+
+		fn hit(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<PlotHit> {
+			Some(
+				PlotHit::new(MarkFamily::SCATTER, HitDimensionality::Point, 0).with_candidate(
+					SelectionCandidate {
+						constraints: vec![
+							(
+								FieldRef::new("x", SemanticType::Quantitative, ScalarType::Int),
+								ExactScalar::Int(5),
+							),
+							(
+								FieldRef::new("y", SemanticType::Quantitative, ScalarType::Int),
+								ExactScalar::Int(5),
+							),
+						],
+					},
+				),
+			)
+		}
+
+		fn project_predicate(
+			&self,
+			_predicate: &Predicate,
+		) -> Option<Vec<Box<dyn EmphasisAnchor>>> {
+			self.admitted
+				.then(|| vec![Box::new(PointAnchor) as Box<dyn EmphasisAnchor>])
+		}
+	}
+
+	fn message(action: canvas::Action<PlotMessage>) -> Option<PlotMessage> {
+		action.into_inner().0
+	}
+
+	fn fixture<'a>(
+		kernel: &'a SelectionKernel,
+		own: &'a Predicate,
+		fields: &'a SelectionAxisFields,
+	) -> (PlotWidget<'a>, Rectangle, Point) {
+		let widget = PlotWidget::new(
+			kernel,
+			"selection".to_owned(),
+			0.0,
+			PlotSettings::default(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		)
+		.with_selection_interaction(true, fields, own)
+		.with_viewport_state(ViewportStamp::mint(), ViewportMotion::Settled);
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+		let geometry = widget
+			.selection_geometry(bounds, Cursor::Available(Point::new(400.0, 300.0)))
+			.expect("cartesian selection geometry");
+		let transform =
+			CoordinateTransformer::new(&geometry.layout, geometry.plot_area.into_iced());
+		let local = transform.cartesian(5.0, 5.0);
+		let point = Point::new(
+			geometry.plot_area.x() + local.x,
+			geometry.plot_area.y() + local.y,
+		);
+		(widget, bounds, point)
+	}
+
+	fn modifiers(state: &mut PlotCanvasState, value: keyboard::Modifiers) {
+		state.modifiers = value;
+	}
+
+	#[test]
+	fn product_0151_shift_click_is_reachable_and_default_projection_refuses() {
+		let fields = SelectionAxisFields {
+			x: Some(FieldRef::new(
+				"x",
+				SemanticType::Quantitative,
+				ScalarType::Int,
+			)),
+			y: Some(FieldRef::new(
+				"y",
+				SemanticType::Quantitative,
+				ScalarType::Int,
+			)),
+		};
+		for (admitted, expected_refusal) in [(true, false), (false, true)] {
+			let kernel = SelectionKernel { admitted };
+			let own = Predicate::default();
+			let (widget, bounds, point) = fixture(&kernel, &own, &fields);
+			let mut state = PlotCanvasState::default();
+			modifiers(&mut state, keyboard::Modifiers::SHIFT);
+			let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+			assert!(matches!(
+				Program::update(
+					&widget,
+					&mut state,
+					&press,
+					bounds,
+					Cursor::Available(point)
+				)
+				.and_then(message),
+				Some(PlotMessage::SelectionStarted)
+			));
+			let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+			let released = Program::update(
+				&widget,
+				&mut state,
+				&release,
+				bounds,
+				Cursor::Available(point),
+			)
+			.and_then(message)
+			.expect("release publishes");
+			if expected_refusal {
+				assert!(matches!(released, PlotMessage::SelectionRefused(_)));
+			} else {
+				assert!(matches!(
+					released,
+					PlotMessage::SelectionRequested {
+						operation: SelectionOperation::Replace,
+						..
+					}
+				));
+			}
+		}
+	}
+
+	#[test]
+	fn product_0151_shift_alt_toggles_while_bare_alt_still_pans() {
+		let fields = SelectionAxisFields {
+			x: Some(FieldRef::new(
+				"x",
+				SemanticType::Quantitative,
+				ScalarType::Int,
+			)),
+			y: Some(FieldRef::new(
+				"y",
+				SemanticType::Quantitative,
+				ScalarType::Int,
+			)),
+		};
+		let candidate = SelectionCandidate {
+			constraints: vec![
+				(fields.x.clone().expect("x"), ExactScalar::Int(5)),
+				(fields.y.clone().expect("y"), ExactScalar::Int(5)),
+			],
+		};
+		let own = Predicate::from_candidate(&candidate).expect("own predicate");
+		let kernel = SelectionKernel { admitted: true };
+		let (widget, bounds, point) = fixture(&kernel, &own, &fields);
+		let click = |state: &mut PlotCanvasState| {
+			let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+			let _ = Program::update(&widget, state, &press, bounds, Cursor::Available(point));
+			let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+			Program::update(&widget, state, &release, bounds, Cursor::Available(point))
+				.and_then(message)
+				.expect("click publishes")
+		};
+
+		let mut toggle = PlotCanvasState::default();
+		modifiers(
+			&mut toggle,
+			keyboard::Modifiers::SHIFT | keyboard::Modifiers::ALT,
+		);
+		assert!(matches!(
+			click(&mut toggle),
+			PlotMessage::SelectionRequested {
+				operation: SelectionOperation::Subtract,
+				..
+			}
+		));
+
+		let empty = Predicate::default();
+		let (widget, bounds, point) = fixture(&kernel, &empty, &fields);
+		let mut add = PlotCanvasState::default();
+		modifiers(
+			&mut add,
+			keyboard::Modifiers::SHIFT | keyboard::Modifiers::ALT,
+		);
+		let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+		let _ = Program::update(&widget, &mut add, &press, bounds, Cursor::Available(point));
+		let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+		assert!(matches!(
+			Program::update(
+				&widget,
+				&mut add,
+				&release,
+				bounds,
+				Cursor::Available(point)
+			)
+			.and_then(message),
+			Some(PlotMessage::SelectionRequested {
+				operation: SelectionOperation::Add,
+				..
+			})
+		));
+
+		let mut pan = PlotCanvasState::default();
+		modifiers(&mut pan, keyboard::Modifiers::ALT);
+		assert!(matches!(
+			Program::update(
+				&widget,
+				&mut pan,
+				&Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+				bounds,
+				Cursor::Available(point),
+			)
+			.and_then(message),
+			Some(PlotMessage::ViewportStarted(_))
+		));
+	}
+
+	#[test]
+	fn product_0151_escape_clears_only_an_active_selection_under_the_cursor() {
+		let fields = SelectionAxisFields {
+			x: Some(FieldRef::new(
+				"x",
+				SemanticType::Quantitative,
+				ScalarType::Int,
+			)),
+			y: Some(FieldRef::new(
+				"y",
+				SemanticType::Quantitative,
+				ScalarType::Int,
+			)),
+		};
+		let candidate = SelectionCandidate {
+			constraints: vec![
+				(fields.x.clone().expect("x"), ExactScalar::Int(5)),
+				(fields.y.clone().expect("y"), ExactScalar::Int(5)),
+			],
+		};
+		let active = Predicate::from_candidate(&candidate).expect("active predicate");
+		let empty = Predicate::default();
+		let kernel = SelectionKernel { admitted: true };
+		let escape = Event::Keyboard(keyboard::Event::KeyPressed {
+			key: keyboard::Key::Named(keyboard::key::Named::Escape),
+			modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+			physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+			location: keyboard::Location::Standard,
+			modifiers: keyboard::Modifiers::default(),
+			text: None,
+			repeat: false,
+		});
+
+		for (predicate, cursor, should_clear) in [
+			(&empty, Cursor::Unavailable, false),
+			(&empty, Cursor::Available(Point::new(400.0, 300.0)), false),
+			(&active, Cursor::Unavailable, false),
+			(&active, Cursor::Available(Point::new(400.0, 300.0)), true),
+		] {
+			let (widget, bounds, _) = fixture(&kernel, predicate, &fields);
+			let published = Program::update(
+				&widget,
+				&mut PlotCanvasState::default(),
+				&escape,
+				bounds,
+				cursor,
+			)
+			.and_then(message);
+			assert_eq!(
+				matches!(
+					published,
+					Some(PlotMessage::SelectionRequested {
+						operation: SelectionOperation::Clear,
+						..
+					})
+				),
+				should_clear
+			);
+		}
+	}
+}
+
+#[cfg(test)]
+mod product_0151_selection_geometry_tests {
+	use super::*;
+	use crate::plot::spec::SemanticType;
+	use crate::selection::{ConstraintForm, ExactScalar, FieldRef, ScalarTimeUnit, ScalarType};
+
+	fn field(name: &str, semantic: SemanticType, scalar: ScalarType) -> FieldRef {
+		FieldRef::new(name, semantic, scalar)
+	}
+
+	fn drag(layout: PlotLayout, press: (f32, f32), current: (f32, f32)) -> SelectionDrag {
+		SelectionDrag {
+			press: Pt::from_plot_kernel_cursor(Point::new(press.0, press.1)),
+			current: Pt::from_plot_kernel_cursor(Point::new(current.0, current.1)),
+			plot_area: Rect::from_iced_frame(Rectangle::new(
+				Point::ORIGIN,
+				iced::Size::new(100.0, 100.0),
+			)),
+			layout,
+			facet_constraint: None,
+		}
+	}
+
+	fn cartesian(
+		x_temporal_domain: Option<TemporalAxisDomain>,
+		y_temporal_domain: Option<TemporalAxisDomain>,
+	) -> PlotLayout {
+		PlotLayout::Cartesian {
+			x_range: (0.0, 10.0),
+			y_range: (0.0, 10.0),
+			x_axis_type: AxisType::Linear,
+			y_axis_type: AxisType::Linear,
+			x_temporal_domain,
+			y_temporal_domain,
+		}
+	}
+
+	#[test]
+	fn product_0151_brush_rounds_integral_and_temporal_edges_inward() {
+		let fields = crate::selection::SelectionAxisFields {
+			x: Some(field("x", SemanticType::Quantitative, ScalarType::Int)),
+			y: Some(field("y", SemanticType::Quantitative, ScalarType::Float)),
+		};
+		let predicate = brush_predicate(
+			&drag(cartesian(None, None), (22.0, 80.0), (78.0, 20.0)),
+			&fields,
+		)
+		.expect("cartesian brush");
+		let ConstraintForm::Interval { lower, upper } = &predicate.fields[0].form else {
+			panic!("x interval")
+		};
+		assert_eq!((lower, upper), (&ExactScalar::Int(3), &ExactScalar::Int(7)));
+		let ConstraintForm::Interval { lower, upper } = &predicate.fields[1].form else {
+			panic!("y interval")
+		};
+		assert_eq!(
+			(lower, upper),
+			(&ExactScalar::Float(2.0), &ExactScalar::Float(8.0))
+		);
+
+		let first = 1_800_000_000_000_000_000_i64;
+		let temporal = TemporalAxisDomain::Datetime {
+			first_tick: first,
+			last_tick: first + 10,
+			unit: TimeUnit::Nanoseconds,
+			zone: Some(Arc::from("UTC")),
+		};
+		let temporal_fields = crate::selection::SelectionAxisFields {
+			x: Some(field(
+				"stamp",
+				SemanticType::Temporal,
+				ScalarType::Datetime {
+					unit: ScalarTimeUnit::Nanoseconds,
+					zone: Some("UTC".into()),
+				},
+			)),
+			y: Some(field("y", SemanticType::Quantitative, ScalarType::Float)),
+		};
+		let predicate = brush_predicate(
+			&drag(cartesian(Some(temporal), None), (22.0, 80.0), (78.0, 20.0)),
+			&temporal_fields,
+		)
+		.expect("temporal brush");
+		let ConstraintForm::Interval { lower, upper } = &predicate.fields[0].form else {
+			panic!("temporal interval")
+		};
+		assert_eq!(
+			(lower, upper),
+			(
+				&ExactScalar::Datetime {
+					ticks: first + 3,
+					unit: ScalarTimeUnit::Nanoseconds,
+					zone: Some("UTC".into()),
+				},
+				&ExactScalar::Datetime {
+					ticks: first + 7,
+					unit: ScalarTimeUnit::Nanoseconds,
+					zone: Some("UTC".into()),
+				}
+			)
+		);
+
+		let unsigned_fields = crate::selection::SelectionAxisFields {
+			x: Some(field("x", SemanticType::Quantitative, ScalarType::UInt)),
+			y: Some(field("y", SemanticType::Quantitative, ScalarType::Float)),
+		};
+		let unsigned_layout = PlotLayout::Cartesian {
+			x_range: (-10.0, 10.0),
+			y_range: (0.0, 10.0),
+			x_axis_type: AxisType::Linear,
+			y_axis_type: AxisType::Linear,
+			x_temporal_domain: None,
+			y_temporal_domain: None,
+		};
+		let predicate = brush_predicate(
+			&drag(unsigned_layout, (40.0, 80.0), (65.0, 20.0)),
+			&unsigned_fields,
+		)
+		.expect("unsigned brush crossing zero");
+		let ConstraintForm::Interval { lower, upper } = &predicate.fields[0].form else {
+			panic!("unsigned interval")
+		};
+		assert_eq!(
+			(lower, upper),
+			(&ExactScalar::UInt(0), &ExactScalar::UInt(3)),
+			"the unrepresentable lower edge clamps inward to the unsigned domain"
+		);
+	}
+
+	#[test]
+	fn product_0151_between_ticks_is_an_empty_interval_that_still_reprojects() {
+		let fields = crate::selection::SelectionAxisFields {
+			x: Some(field("x", SemanticType::Quantitative, ScalarType::Int)),
+			y: Some(field("y", SemanticType::Quantitative, ScalarType::Int)),
+		};
+		let predicate = brush_predicate(
+			&drag(cartesian(None, None), (21.0, 79.0), (29.0, 71.0)),
+			&fields,
+		)
+		.expect("empty brush still emits");
+		for constraint in &predicate.fields {
+			let ConstraintForm::Interval { lower, upper } = &constraint.form else {
+				panic!("interval")
+			};
+			assert!(matches!(
+				(lower, upper),
+				(ExactScalar::Int(lower), ExactScalar::Int(upper)) if lower > upper
+			));
+		}
+		assert!(interval_emphasis_anchors(&predicate, &fields).is_some());
+		let frame = polars::df!("x" => [2_i64, 3], "y" => [8_i64, 7]).expect("tick fixture");
+		assert_eq!(
+			predicate
+				.filter_frame(&frame)
+				.expect("empty interval filters")
+				.height(),
+			0,
+			"neither adjacent integer is selected"
+		);
+
+		let first = 1_800_000_000_000_000_000_i64;
+		let zone = polars::prelude::TimeZone::opt_try_new(Some("UTC"))
+			.expect("zone syntax")
+			.expect("zone");
+		let temporal_fields = crate::selection::SelectionAxisFields {
+			x: Some(field(
+				"stamp",
+				SemanticType::Temporal,
+				ScalarType::Datetime {
+					unit: ScalarTimeUnit::Nanoseconds,
+					zone: Some("UTC".into()),
+				},
+			)),
+			y: Some(field("y", SemanticType::Quantitative, ScalarType::Float)),
+		};
+		let temporal = brush_predicate(
+			&drag(
+				cartesian(
+					Some(TemporalAxisDomain::Datetime {
+						first_tick: first,
+						last_tick: first + 10,
+						unit: TimeUnit::Nanoseconds,
+						zone: Some(Arc::from("UTC")),
+					}),
+					None,
+				),
+				(21.0, 80.0),
+				(29.0, 20.0),
+			),
+			&temporal_fields,
+		)
+		.expect("empty temporal brush emits");
+		assert!(matches!(
+			&temporal.fields[0].form,
+			ConstraintForm::Interval {
+				lower: ExactScalar::Datetime { ticks: lower, .. },
+				upper: ExactScalar::Datetime { ticks: upper, .. },
+			} if lower > upper
+		));
+		let stamp = polars::prelude::Column::new("stamp".into(), [first + 2, first + 3])
+			.cast(&polars::prelude::DataType::Datetime(
+				polars::prelude::TimeUnit::Nanoseconds,
+				Some(zone),
+			))
+			.expect("datetime");
+		let temporal_frame = polars::prelude::DataFrame::new(
+			2,
+			vec![
+				stamp,
+				polars::prelude::Column::new("y".into(), [2.0_f64, 8.0]),
+			],
+		)
+		.expect("frame");
+		assert_eq!(
+			temporal
+				.filter_frame(&temporal_frame)
+				.expect("empty temporal filters")
+				.height(),
+			0,
+			"neither adjacent temporal tick is selected"
+		);
+		assert!(interval_emphasis_anchors(&temporal, &temporal_fields).is_some());
+	}
+
+	#[test]
+	fn product_0151_facet_brush_carries_the_exact_partition_constraint() {
+		let facet_field = field("desk", SemanticType::Nominal, ScalarType::Str);
+		let mut drag = drag(cartesian(None, None), (10.0, 90.0), (90.0, 10.0));
+		drag.facet_constraint = Some((facet_field.clone(), ExactScalar::Str("north".into())));
+		let fields = crate::selection::SelectionAxisFields {
+			x: Some(field("x", SemanticType::Quantitative, ScalarType::Float)),
+			y: Some(field("y", SemanticType::Quantitative, ScalarType::Float)),
+		};
+		let predicate = brush_predicate(&drag, &fields).expect("facet brush");
+		assert_eq!(predicate.fields.len(), 3);
+		let facet = predicate.field(&facet_field.name).expect("facet field");
+		assert_eq!(
+			facet.form,
+			ConstraintForm::Values(std::collections::HashSet::from([ExactScalar::Str(
+				"north".into()
+			)]))
+		);
+	}
+
+	#[test]
+	fn product_0151_interval_emphasis_reprojects_after_viewport_reflow_and_rebuild() {
+		let fields = crate::selection::SelectionAxisFields {
+			x: Some(field("x", SemanticType::Quantitative, ScalarType::Float)),
+			y: Some(field("y", SemanticType::Quantitative, ScalarType::Float)),
+		};
+		let predicate = brush_predicate(
+			&drag(cartesian(None, None), (20.0, 80.0), (80.0, 20.0)),
+			&fields,
+		)
+		.expect("brush predicate");
+		let anchors = interval_emphasis_anchors(&predicate, &fields).expect("interval anchor");
+		let project = |layout: &PlotLayout, bounds: Rectangle| {
+			let transform = CoordinateTransformer::new(layout, bounds);
+			let shape = anchors[0].reproject(&transform).expect("shape");
+			assert!(shape.contains(transform.cartesian(5.0, 5.0)));
+			assert!(!shape.contains(transform.cartesian(0.0, 0.0)));
+			shape
+		};
+
+		let initial_layout = cartesian(None, None);
+		let initial = project(
+			&initial_layout,
+			Rectangle::new(Point::ORIGIN, iced::Size::new(100.0, 100.0)),
+		);
+		let panned_layout = PlotLayout::Cartesian {
+			x_range: (1.0, 11.0),
+			y_range: (-1.0, 9.0),
+			x_axis_type: AxisType::Linear,
+			y_axis_type: AxisType::Linear,
+			x_temporal_domain: None,
+			y_temporal_domain: None,
+		};
+		let panned = project(
+			&panned_layout,
+			Rectangle::new(Point::ORIGIN, iced::Size::new(100.0, 100.0)),
+		);
+		let zoomed_layout = PlotLayout::Cartesian {
+			x_range: (0.0, 6.0),
+			y_range: (0.0, 6.0),
+			x_axis_type: AxisType::Linear,
+			y_axis_type: AxisType::Linear,
+			x_temporal_domain: None,
+			y_temporal_domain: None,
+		};
+		let reflow_bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(140.0, 80.0));
+		let zoomed_reflowed = project(&zoomed_layout, reflow_bounds);
+		let rebuilt = project(&zoomed_layout, reflow_bounds);
+
+		assert_ne!(initial, panned);
+		assert_ne!(panned, zoomed_reflowed);
+		assert_eq!(zoomed_reflowed, rebuilt);
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeUnit {
 	Nanoseconds,
@@ -899,6 +1516,73 @@ impl<'a> CoordinateTransformer<'a> {
 			None
 		}
 	}
+
+	/// Invert one temporal axis against its exact integer domain. The legacy
+	/// cartesian projection is deliberately not consulted: adjacent nanoseconds
+	/// may share one `f64` while remaining distinct selectable ticks.
+	pub fn pixel_to_temporal(
+		&self,
+		x_axis: bool,
+		pixel: f32,
+		upper_edge: bool,
+	) -> Option<crate::selection::ExactScalar> {
+		let (domain, extent, inverted) = match self.layout {
+			PlotLayout::Cartesian {
+				x_temporal_domain,
+				y_temporal_domain,
+				..
+			} => {
+				if x_axis {
+					(x_temporal_domain.as_ref()?, self.bounds.width, false)
+				} else {
+					(y_temporal_domain.as_ref()?, self.bounds.height, true)
+				}
+			}
+			_ => return None,
+		};
+		let mut u = (f64::from(pixel) / f64::from(extent.max(1.0))).clamp(0.0, 1.0);
+		if inverted {
+			u = 1.0 - u;
+		}
+		let round = |first: i128, last: i128| -> Option<i128> {
+			let offset = u * (last - first) as f64;
+			if !offset.is_finite() {
+				return None;
+			}
+			let offset = if upper_edge {
+				offset.floor()
+			} else {
+				offset.ceil()
+			} as i128;
+			first.checked_add(offset)
+		};
+		match domain {
+			TemporalAxisDomain::Date {
+				first_day,
+				last_day,
+			} => Some(crate::selection::ExactScalar::Date {
+				days: i32::try_from(round(i128::from(*first_day), i128::from(*last_day))?).ok()?,
+			}),
+			TemporalAxisDomain::Datetime {
+				first_tick,
+				last_tick,
+				unit,
+				zone,
+			} => Some(crate::selection::ExactScalar::Datetime {
+				ticks: i64::try_from(round(i128::from(*first_tick), i128::from(*last_tick))?)
+					.ok()?,
+				unit: (*unit).into(),
+				zone: zone.as_ref().map(ToString::to_string),
+			}),
+			TemporalAxisDomain::Time {
+				first_nanos,
+				last_nanos,
+			} => Some(crate::selection::ExactScalar::Time {
+				nanos: i64::try_from(round(i128::from(*first_nanos), i128::from(*last_nanos))?)
+					.ok()?,
+			}),
+		}
+	}
 }
 
 // Renderer settings remain substrate after PRODUCT-0075 removes their manual
@@ -1567,6 +2251,48 @@ pub trait PlotComposite: Send + Sync {
 		None
 	}
 
+	fn selection_geometry(
+		&self,
+		_bounds: Rect<Widget>,
+		_padding: f32,
+		_title: &str,
+		_cursor: Pt<Widget>,
+		_settings: &PlotSettings,
+	) -> Option<SelectionGeometry> {
+		None
+	}
+
+	fn admits_predicate_at(
+		&self,
+		_bounds: Rect<Widget>,
+		_padding: f32,
+		_title: &str,
+		_cursor: Pt<Widget>,
+		_settings: &PlotSettings,
+		_predicate: &crate::selection::Predicate,
+	) -> bool {
+		false
+	}
+
+	fn project_predicate_emphasis(
+		&self,
+		_predicate: &crate::selection::Predicate,
+		_axis_fields: &crate::selection::SelectionAxisFields,
+	) -> Option<CompositeEmphasisProjection> {
+		None
+	}
+
+	fn render_projected_emphasis(
+		&self,
+		_backend: &mut dyn PlotBackend,
+		_bounds: Rect<Widget>,
+		_padding: f32,
+		_title: &str,
+		_settings: &PlotSettings,
+		_projection: &CompositeEmphasisProjection,
+	) {
+	}
+
 	#[cfg(test)]
 	fn hover(
 		&self,
@@ -1578,6 +2304,140 @@ pub trait PlotComposite: Send + Sync {
 	) -> Option<String> {
 		self.hit(bounds, padding, title, cursor, settings)
 			.map(|hit| hit.legacy_presentation())
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EmphasisShape {
+	Rectangle(Rectangle),
+	Circle { center: Point, radius: f32 },
+	Segment { start: Point, end: Point },
+}
+
+struct IntervalEmphasisAnchor {
+	x: Option<(f64, f64)>,
+	y: Option<(f64, f64)>,
+}
+
+impl EmphasisAnchor for IntervalEmphasisAnchor {
+	fn reproject(&self, transform: &CoordinateTransformer) -> Option<EmphasisShape> {
+		let (left, right) = match (self.x, transform.layout) {
+			(Some((a, b)), PlotLayout::Cartesian { y_range, .. }) => (
+				transform.cartesian(a, y_range.0).x,
+				transform.cartesian(b, y_range.0).x,
+			),
+			(Some((a, b)), PlotLayout::CategoricalY { .. }) => (
+				transform.categorical(0, a).0.x,
+				transform.categorical(0, b).0.x,
+			),
+			(None, _) => (0.0, transform.bounds.width),
+			_ => return None,
+		};
+		let (top, bottom) = match (self.y, transform.layout) {
+			(Some((a, b)), PlotLayout::Cartesian { x_range, .. }) => (
+				transform.cartesian(x_range.0, b).y,
+				transform.cartesian(x_range.0, a).y,
+			),
+			(Some((a, b)), PlotLayout::CategoricalX { .. }) => (
+				transform.categorical(0, b).0.y,
+				transform.categorical(0, a).0.y,
+			),
+			(None, _) => (0.0, transform.bounds.height),
+			_ => return None,
+		};
+		Some(EmphasisShape::Rectangle(Rectangle::new(
+			Point::new(left.min(right), top.min(bottom)),
+			iced::Size::new((right - left).abs().max(1.0), (bottom - top).abs().max(1.0)),
+		)))
+	}
+}
+
+pub(crate) fn interval_emphasis_anchors(
+	predicate: &crate::selection::Predicate,
+	fields: &crate::selection::SelectionAxisFields,
+) -> Option<Vec<Box<dyn EmphasisAnchor>>> {
+	let interval = |field: Option<&crate::selection::FieldRef>| {
+		let field = field?;
+		let constraint = predicate.field(&field.name)?;
+		let crate::selection::ConstraintForm::Interval { lower, upper } = &constraint.form else {
+			return None;
+		};
+		Some((lower.plot_value()?, upper.plot_value()?))
+	};
+	let x = interval(fields.x.as_ref());
+	let y = interval(fields.y.as_ref());
+	(x.is_some() || y.is_some())
+		.then(|| vec![Box::new(IntervalEmphasisAnchor { x, y }) as Box<dyn EmphasisAnchor>])
+}
+
+impl EmphasisShape {
+	pub(crate) fn contains(&self, point: Point) -> bool {
+		match self {
+			Self::Rectangle(rectangle) => rectangle.contains(point),
+			Self::Circle { center, radius } => {
+				let dx = point.x - center.x;
+				let dy = point.y - center.y;
+				dx * dx + dy * dy <= radius * radius
+			}
+			Self::Segment { start, end } => {
+				let dx = end.x - start.x;
+				let dy = end.y - start.y;
+				let length = dx * dx + dy * dy;
+				let t = if length <= f32::EPSILON {
+					0.0
+				} else {
+					(((point.x - start.x) * dx + (point.y - start.y) * dy) / length).clamp(0.0, 1.0)
+				};
+				let projected = Point::new(start.x + t * dx, start.y + t * dy);
+				let ex = point.x - projected.x;
+				let ey = point.y - projected.y;
+				ex * ex + ey * ey <= 16.0
+			}
+		}
+	}
+}
+
+/// Opaque data-space emphasis retained by the kernel that understands it.
+/// Screen geometry is derived afresh for the active viewport on every frame.
+pub trait EmphasisAnchor: Send + Sync {
+	fn reproject(&self, transform: &CoordinateTransformer) -> Option<EmphasisShape>;
+}
+
+pub struct CompositeCellEmphasis {
+	pub(crate) cell_index: usize,
+	pub(crate) anchors: Vec<Arc<dyn EmphasisAnchor>>,
+}
+
+pub struct CompositeEmphasisProjection {
+	pub(crate) cells: Vec<CompositeCellEmphasis>,
+}
+
+pub struct ProjectedEmphasis {
+	pub anchors: Vec<Arc<dyn EmphasisAnchor>>,
+	pub composite: Option<Arc<CompositeEmphasisProjection>>,
+}
+
+pub fn project_selection_emphasis(
+	kernel: &dyn PlotKernel,
+	predicate: &crate::selection::Predicate,
+	axis_fields: &crate::selection::SelectionAxisFields,
+) -> ProjectedEmphasis {
+	if let Some(composite) = kernel.composite() {
+		return ProjectedEmphasis {
+			anchors: Vec::new(),
+			composite: composite
+				.project_predicate_emphasis(predicate, axis_fields)
+				.map(Arc::new),
+		};
+	}
+	ProjectedEmphasis {
+		anchors: interval_emphasis_anchors(predicate, axis_fields)
+			.or_else(|| kernel.project_predicate(predicate))
+			.unwrap_or_default()
+			.into_iter()
+			.map(Arc::from)
+			.collect(),
+		composite: None,
 	}
 }
 
@@ -1702,6 +2562,17 @@ pub trait PlotKernel: Send + Sync {
 		_settings: &PlotSettings,
 	) -> Option<PlotHit> {
 		self.hit(transform, cursor)
+	}
+
+	/// PRODUCT-0151's admission seam. A kernel opts into click selection only
+	/// by projecting the complete predicate to honest data-space anchors.
+	/// Unsupported families return `None`; the widget discloses instead of
+	/// approximating from presentation hits.
+	fn project_predicate(
+		&self,
+		_predicate: &crate::selection::Predicate,
+	) -> Option<Vec<Box<dyn EmphasisAnchor>>> {
+		None
 	}
 
 	#[cfg(test)]
@@ -1886,6 +2757,7 @@ pub struct PlotHit {
 	pub facet: Option<HitFacet>,
 	pub paint_order: usize,
 	pub sibling_ordinal: usize,
+	pub candidate: Option<crate::selection::SelectionCandidate>,
 	presentation: String,
 }
 
@@ -1915,6 +2787,7 @@ impl PlotHit {
 			facet: None,
 			paint_order: 0,
 			sibling_ordinal,
+			candidate: None,
 			presentation: String::new(),
 		}
 	}
@@ -1953,6 +2826,11 @@ impl PlotHit {
 
 	pub fn with_paint_order(mut self, paint_order: usize) -> Self {
 		self.paint_order = paint_order;
+		self
+	}
+
+	pub fn with_candidate(mut self, candidate: crate::selection::SelectionCandidate) -> Self {
+		self.candidate = Some(candidate);
 		self
 	}
 
@@ -2259,6 +3137,13 @@ pub(crate) struct ViewportGeometry {
 	pub prepared_y_range: Option<(f64, f64)>,
 }
 
+#[derive(Clone)]
+pub(crate) struct SelectionGeometry {
+	pub plot_area: Rect<Widget>,
+	pub layout: PlotLayout,
+	pub facet_constraint: Option<(crate::selection::FieldRef, crate::selection::ExactScalar)>,
+}
+
 impl ViewportGeometry {
 	pub(crate) fn from_layout(
 		plot_area: Rect<Widget>,
@@ -2313,6 +3198,11 @@ pub struct PlotWidget<'a> {
 	/// callers deliberately omit it and retain synchronous completeness.
 	raster_coordinator: Option<&'a crate::plot::raster::RasterCoordinator>,
 	raster_slot: crate::plot::raster::RasterSlotId,
+	selection_pending: bool,
+	emphasis_anchors: &'a [Arc<dyn EmphasisAnchor>],
+	composite_emphasis: Option<&'a CompositeEmphasisProjection>,
+	selection_axis_fields: Option<&'a crate::selection::SelectionAxisFields>,
+	selection_predicate: Option<&'a crate::selection::Predicate>,
 }
 
 impl<'a> PlotWidget<'a> {
@@ -2341,7 +3231,43 @@ impl<'a> PlotWidget<'a> {
 			raster_reuse_policy: RasterReusePolicy::Placed,
 			raster_coordinator: None,
 			raster_slot: crate::plot::raster::RasterSlotId::root(),
+			selection_pending: false,
+			emphasis_anchors: &[],
+			composite_emphasis: None,
+			selection_axis_fields: None,
+			selection_predicate: None,
 		}
+	}
+
+	pub fn with_selection_interaction(
+		mut self,
+		enabled: bool,
+		axis_fields: &'a crate::selection::SelectionAxisFields,
+		predicate: &'a crate::selection::Predicate,
+	) -> Self {
+		if enabled {
+			self.selection_axis_fields = Some(axis_fields);
+			self.selection_predicate = Some(predicate);
+		}
+		self
+	}
+
+	pub fn with_selection_state(
+		mut self,
+		pending: bool,
+		anchors: &'a [Arc<dyn EmphasisAnchor>],
+	) -> Self {
+		self.selection_pending = pending;
+		self.emphasis_anchors = anchors;
+		self
+	}
+
+	pub fn with_composite_emphasis(
+		mut self,
+		projection: Option<&'a CompositeEmphasisProjection>,
+	) -> Self {
+		self.composite_emphasis = projection;
+		self
 	}
 
 	pub fn with_raster_coordinator(
@@ -2902,10 +3828,12 @@ impl VerticalGuideBands {
 #[derive(Default)]
 pub struct PlotCanvasState {
 	last_hover: Option<String>,
+	last_hit: Option<PlotHit>,
 	modifiers: iced::keyboard::Modifiers,
 	settings_click: Option<iced::advanced::mouse::Click>,
 	viewport_click: Option<iced::advanced::mouse::Click>,
 	viewport_drag: Option<ViewportDrag>,
+	selection_drag: Option<SelectionDrag>,
 	viewport_local_stamp: Option<ViewportStamp>,
 	viewport_local_geometry: Option<(ViewportStamp, ViewportGeometry)>,
 	plot_cache: canvas::Cache,
@@ -2919,6 +3847,15 @@ struct ViewportDrag {
 	stamp: ViewportStamp,
 	press: Pt<Widget>,
 	geometry: ViewportGeometry,
+}
+
+#[derive(Clone)]
+struct SelectionDrag {
+	press: Pt<Widget>,
+	current: Pt<Widget>,
+	plot_area: Rect<Widget>,
+	layout: PlotLayout,
+	facet_constraint: Option<(crate::selection::FieldRef, crate::selection::ExactScalar)>,
 }
 
 impl PlotCanvasState {
@@ -3054,6 +3991,115 @@ fn zoom_viewport(
 		x_max: x.map(|range| range.1),
 		y_min: y.map(|range| range.0),
 		y_max: y.map(|range| range.1),
+	})
+}
+
+const SELECTION_CLICK_THRESHOLD: f32 = 4.0;
+
+fn quantitative_interval_endpoint(
+	value: f64,
+	scalar_type: &crate::selection::ScalarType,
+	upper_edge: bool,
+) -> Option<crate::selection::ExactScalar> {
+	use crate::selection::{ExactScalar, ScalarType};
+	if !value.is_finite() {
+		return None;
+	}
+	match scalar_type {
+		ScalarType::Float => ExactScalar::float(value),
+		ScalarType::Int => Some(ExactScalar::Int(if upper_edge {
+			value.floor() as i64
+		} else {
+			value.ceil() as i64
+		})),
+		ScalarType::UInt if upper_edge && value >= 0.0 => {
+			Some(ExactScalar::UInt(value.floor() as u64))
+		}
+		ScalarType::UInt if !upper_edge => Some(ExactScalar::UInt(value.ceil().max(0.0) as u64)),
+		_ => None,
+	}
+}
+
+fn brush_predicate(
+	drag: &SelectionDrag,
+	fields: &crate::selection::SelectionAxisFields,
+) -> Option<crate::selection::Predicate> {
+	use crate::selection::{ConstraintForm, FieldConstraint, Predicate, ScalarType};
+	let local = |point: Pt<Widget>| {
+		Point::new(
+			(point.x() - drag.plot_area.x()).clamp(0.0, drag.plot_area.width()),
+			(point.y() - drag.plot_area.y()).clamp(0.0, drag.plot_area.height()),
+		)
+	};
+	let press = local(drag.press);
+	let current = local(drag.current);
+	let transform = CoordinateTransformer::new(&drag.layout, drag.plot_area.into_iced());
+	let mut constraints = Vec::new();
+	let (cartesian_press, cartesian_current) = (
+		transform.pixel_to_cartesian(press),
+		transform.pixel_to_cartesian(current),
+	);
+	let mut axis = |x_axis: bool, first: f32, second: f32| -> Option<()> {
+		let field = if x_axis {
+			fields.x.as_ref()?
+		} else {
+			fields.y.as_ref()?
+		};
+		let (low_px, high_px) = if x_axis {
+			(first.min(second), first.max(second))
+		} else {
+			// Screen y grows downward; data y grows upward.
+			(first.max(second), first.min(second))
+		};
+		let (lower, upper) = match &field.scalar_type {
+			ScalarType::Date | ScalarType::Datetime { .. } | ScalarType::Time => (
+				transform.pixel_to_temporal(x_axis, low_px, false)?,
+				transform.pixel_to_temporal(x_axis, high_px, true)?,
+			),
+			_ => {
+				let first_value = if x_axis {
+					cartesian_press?.0
+				} else {
+					cartesian_press?.1
+				};
+				let second_value = if x_axis {
+					cartesian_current?.0
+				} else {
+					cartesian_current?.1
+				};
+				let low = first_value.min(second_value);
+				let high = first_value.max(second_value);
+				(
+					quantitative_interval_endpoint(low, &field.scalar_type, false)?,
+					quantitative_interval_endpoint(high, &field.scalar_type, true)?,
+				)
+			}
+		};
+		constraints.push(FieldConstraint {
+			field: field.clone(),
+			form: ConstraintForm::Interval { lower, upper },
+		});
+		Some(())
+	};
+	match &drag.layout {
+		PlotLayout::Cartesian { .. } => {
+			axis(true, press.x, current.x)?;
+			axis(false, press.y, current.y)?;
+		}
+		PlotLayout::CategoricalX { .. } => axis(false, press.y, current.y)?,
+		PlotLayout::CategoricalY { .. } => axis(true, press.x, current.x)?,
+		PlotLayout::CategoricalXY { .. } | PlotLayout::Parallel { .. } | PlotLayout::Radial => {
+			return None;
+		}
+	}
+	if let Some((field, value)) = &drag.facet_constraint {
+		constraints.push(FieldConstraint {
+			field: field.clone(),
+			form: ConstraintForm::Values(std::collections::HashSet::from([value.clone()])),
+		});
+	}
+	Some(Predicate {
+		fields: constraints,
 	})
 }
 
@@ -3584,7 +4630,10 @@ mod product_0150_gesture_tests {
 		.expect("first settled move resumes hover publication");
 		assert!(matches!(
 			message(action),
-			Some(PlotMessage::UpdateHover(Some(_)))
+			Some(PlotMessage::UpdateStructuredHit {
+				hit: Some(_),
+				hover: Some(_),
+			})
 		));
 		assert_eq!(kernel.hits.load(Ordering::Relaxed), 1);
 	}
@@ -3931,6 +4980,81 @@ mod product_0150_gesture_tests {
 }
 
 impl<'a> PlotWidget<'a> {
+	pub(crate) fn selection_geometry(
+		&self,
+		bounds: Rectangle,
+		cursor: Cursor,
+	) -> Option<SelectionGeometry> {
+		if let Some(composite) = self.kernel.composite() {
+			let position = cursor.position()?;
+			let widget = Pt::<Widget>::from_window(
+				Pt::<Window>::from_iced_event(position),
+				Rect::<Window>::from_iced_layout(bounds),
+			);
+			return composite.selection_geometry(
+				Rect::<Widget>::from_iced_frame(bounds),
+				self.padding,
+				&self.title,
+				widget,
+				&self.settings_model,
+			);
+		}
+		let widget_bounds = Rect::<Widget>::from_iced_frame(bounds);
+		let legend_reservation = self
+			.kernel
+			.legend_reservation_content(&self.settings)
+			.and_then(crate::plot::legend::apply_policy);
+		let legend = legend_layout(widget_bounds, legend_reservation.as_ref(), &self.settings);
+		let layout = self.kernel.layout(self.settings.clone());
+		let requirements = BandRequirements::from_layout(&layout, &self.settings);
+		let plot_area = self.plot_area(legend.content_bounds, &requirements);
+		cursor
+			.position()
+			.filter(|point| plot_area.into_iced().contains(*point))
+			.map(|_| SelectionGeometry {
+				plot_area,
+				layout,
+				facet_constraint: None,
+			})
+	}
+
+	fn structured_hit_at(&self, bounds: Rectangle, cursor: Cursor) -> Option<PlotHit> {
+		let window_bounds = Rect::<Window>::from_iced_layout(bounds);
+		let widget_bounds = Rect::<Widget>::from_iced_frame(bounds);
+		let widget_cursor = cursor.position().map(|position| {
+			Pt::<Widget>::from_window(Pt::<Window>::from_iced_event(position), window_bounds)
+		});
+		if let Some(composite) = self.kernel.composite() {
+			return widget_cursor.and_then(|cursor| {
+				composite.hit(
+					widget_bounds,
+					self.padding,
+					&self.title,
+					cursor,
+					&self.settings_model,
+				)
+			});
+		}
+		let legend_reservation = self
+			.kernel
+			.legend_reservation_content(&self.settings)
+			.and_then(crate::plot::legend::apply_policy);
+		let legend = legend_layout(widget_bounds, legend_reservation.as_ref(), &self.settings);
+		let layout = self.kernel.layout(self.settings.clone());
+		let requirements = BandRequirements::from_layout(&layout, &self.settings);
+		let plot_area = self.plot_area(legend.content_bounds, &requirements);
+		let transform = CoordinateTransformer::new(&layout, plot_area.into_iced());
+		self.kernel
+			.prepare_viewport(&transform, self.viewport_motion);
+		let plot_cursor = widget_cursor
+			.map(|cursor| Pt::<Plot>::from_widget(cursor, plot_area))
+			.map_or(Cursor::Unavailable, |cursor| {
+				Cursor::Available(cursor.into_iced())
+			});
+		self.kernel
+			.hit_with_settings(&transform, plot_cursor, &self.settings_model)
+	}
+
 	fn resolved_x_label(&self) -> Option<String> {
 		resolve_canvas_text(&self.settings.x_label, Some(self.kernel.x_label()))
 			.filter(|label| !label.is_empty())
@@ -4039,7 +5163,7 @@ impl<'a> PlotWidget<'a> {
 		wants
 	}
 
-	fn draw_raster_preparing_marker(&self, backend: &mut dyn PlotBackend) {
+	fn draw_preparing_marker(&self, backend: &mut dyn PlotBackend) {
 		let label = "preparing raster…";
 		backend.fill_rectangle(
 			Point::new(10.0, 10.0),
@@ -4080,8 +5204,8 @@ impl<'a> PlotWidget<'a> {
 					&self.settings_model,
 				);
 			}
-			if preparing {
-				self.draw_raster_preparing_marker(backend);
+			if preparing || self.selection_pending {
+				self.draw_preparing_marker(backend);
 			}
 			return;
 		}
@@ -4147,8 +5271,8 @@ impl<'a> PlotWidget<'a> {
 		} else {
 			backend.with_save(draw_plot);
 		}
-		if preparing {
-			self.draw_raster_preparing_marker(backend);
+		if preparing || self.selection_pending {
+			self.draw_preparing_marker(backend);
 		}
 	}
 
@@ -4168,6 +5292,16 @@ impl<'a> PlotWidget<'a> {
 			);
 			if !composite.owns_global_headings() {
 				self.render_global_headings(backend, bounds.into_iced());
+			}
+			if let Some(projection) = self.composite_emphasis {
+				composite.render_projected_emphasis(
+					backend,
+					bounds,
+					self.padding,
+					&self.title,
+					&self.settings_model,
+					projection,
+				);
 			}
 			return;
 		}
@@ -4319,6 +5453,37 @@ impl<'a> PlotWidget<'a> {
 			});
 		}
 		self.draw_axis_labels(backend, plot_area, &requirements);
+		if !self.emphasis_anchors.is_empty() {
+			backend.with_save(&mut |backend| {
+				backend.translate(iced::Vector::new(plot_area.x, plot_area.y));
+				for anchor in self.emphasis_anchors {
+					let Some(shape) = anchor.reproject(&transform) else {
+						continue;
+					};
+					let stroke = Stroke {
+						style: Style::Solid(self.settings.chrome.axis_label_text.iced()),
+						width: 2.0,
+						..Default::default()
+					};
+					match shape {
+						EmphasisShape::Rectangle(rectangle) => backend.stroke_path(
+							&|builder| builder.rectangle(rectangle.position(), rectangle.size()),
+							stroke,
+						),
+						EmphasisShape::Circle { center, radius } => {
+							backend.stroke_path(&|builder| builder.circle(center, radius), stroke)
+						}
+						EmphasisShape::Segment { start, end } => backend.stroke_path(
+							&|builder| {
+								builder.move_to(start);
+								builder.line_to(end);
+							},
+							stroke,
+						),
+					}
+				}
+			});
+		}
 	}
 
 	fn render_global_headings(&self, backend: &mut dyn PlotBackend, bounds: Rectangle) {
@@ -4443,6 +5608,27 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 						.draw(renderer, effective_bounds.size(), |frame| {
 							let mut backend = IcedBackend { frame };
 							self.render_overlay_layer(&mut backend, effective_bounds);
+							if let Some(drag) = &state.selection_drag {
+								let x = drag.press.x().min(drag.current.x());
+								let y = drag.press.y().min(drag.current.y());
+								let width = (drag.current.x() - drag.press.x()).abs();
+								let height = (drag.current.y() - drag.press.y()).abs();
+								backend.stroke_path(
+									&|builder| {
+										builder.rectangle(
+											Point::new(x, y),
+											iced::Size::new(width, height),
+										)
+									},
+									Stroke {
+										style: Style::Solid(
+											self.settings.chrome.axis_label_text.iced(),
+										),
+										width: 1.0,
+										..Default::default()
+									},
+								);
+							}
 						});
 				vec![overlay_geometry]
 			}
@@ -4460,6 +5646,28 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 						.draw(renderer, effective_bounds.size(), |frame| {
 							let mut backend = IcedBackend { frame };
 							self.render_overlay_layer(&mut backend, effective_bounds);
+							if let Some(drag) = &state.selection_drag {
+								let x = drag.press.x().min(drag.current.x());
+								let y = drag.press.y().min(drag.current.y());
+								backend.stroke_path(
+									&|builder| {
+										builder.rectangle(
+											Point::new(x, y),
+											iced::Size::new(
+												(drag.current.x() - drag.press.x()).abs(),
+												(drag.current.y() - drag.press.y()).abs(),
+											),
+										)
+									},
+									Stroke {
+										style: Style::Solid(
+											self.settings.chrome.axis_label_text.iced(),
+										),
+										width: 1.0,
+										..Default::default()
+									},
+								);
+							}
 						});
 				vec![plot_geometry, overlay_geometry]
 			}
@@ -4510,6 +5718,191 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 				SettingsGesture::None => {}
 			}
 		}
+		if self.selection_axis_fields.is_some() {
+			let widget_position = || {
+				let position = cursor.position_over(bounds)?;
+				Some(Pt::<Widget>::from_window(
+					Pt::<Window>::from_iced_event(position),
+					Rect::<Window>::from_iced_layout(bounds),
+				))
+			};
+			match event {
+				Event::Keyboard(iced::keyboard::Event::KeyPressed {
+					key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+					..
+				}) if cursor.position_over(bounds).is_some()
+					&& self
+						.selection_predicate
+						.is_some_and(|predicate| !predicate.fields.is_empty()) =>
+				{
+					state.selection_drag = None;
+					state.overlay_cache.clear();
+					return Some(canvas::Action::publish(PlotMessage::SelectionRequested {
+						predicate: crate::selection::Predicate::default(),
+						operation: crate::selection::SelectionOperation::Clear,
+					}));
+				}
+				Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left))
+					if state.modifiers.shift() =>
+				{
+					let Some(position) = widget_position() else {
+						return None;
+					};
+					let Some(geometry) = self.selection_geometry(bounds, cursor) else {
+						return Some(
+							canvas::Action::publish(PlotMessage::SelectionRefused(
+								"Selection · this plot layout does not admit brushing".to_owned(),
+							))
+							.and_capture(),
+						);
+					};
+					state.selection_drag = Some(SelectionDrag {
+						press: position,
+						current: position,
+						plot_area: geometry.plot_area,
+						layout: geometry.layout,
+						facet_constraint: geometry.facet_constraint,
+					});
+					state.last_hover = None;
+					state.last_hit = None;
+					state.overlay_cache.clear();
+					return Some(
+						canvas::Action::publish(PlotMessage::SelectionStarted).and_capture(),
+					);
+				}
+				Event::Mouse(iced::mouse::Event::CursorMoved { .. })
+					if state.selection_drag.is_some() =>
+				{
+					if let Some(position) = widget_position()
+						&& let Some(drag) = &mut state.selection_drag
+					{
+						drag.current = position;
+						state.overlay_cache.clear();
+					}
+					return Some(canvas::Action::capture());
+				}
+				Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left))
+					if state.selection_drag.is_some() =>
+				{
+					let mut drag = state.selection_drag.take().expect("guarded selection drag");
+					if let Some(position) = widget_position() {
+						drag.current = position;
+					}
+					state.overlay_cache.clear();
+					let dx = drag.current.x() - drag.press.x();
+					let dy = drag.current.y() - drag.press.y();
+					if dx * dx + dy * dy <= SELECTION_CLICK_THRESHOLD * SELECTION_CLICK_THRESHOLD {
+						let Some(hit) = self.structured_hit_at(bounds, cursor) else {
+							if state.modifiers.alt() {
+								return Some(canvas::Action::capture());
+							}
+							return Some(
+								canvas::Action::publish(PlotMessage::SelectionRequested {
+									predicate: crate::selection::Predicate::default(),
+									operation: crate::selection::SelectionOperation::Clear,
+								})
+								.and_capture(),
+							);
+						};
+						let Some(candidate) = hit.candidate.as_ref() else {
+							return Some(canvas::Action::publish(PlotMessage::SelectionRefused(
+								"Selection · this mark does not expose a source-value candidate".to_owned(),
+							)).and_capture());
+						};
+						let Ok(predicate) = crate::selection::Predicate::from_candidate(candidate)
+						else {
+							return Some(
+								canvas::Action::publish(PlotMessage::SelectionRefused(
+									"Selection · this candidate is not representable".to_owned(),
+								))
+								.and_capture(),
+							);
+						};
+						let admitted = if let Some(composite) = self.kernel.composite() {
+							composite.admits_predicate_at(
+								Rect::<Widget>::from_iced_frame(bounds),
+								self.padding,
+								&self.title,
+								drag.current,
+								&self.settings_model,
+								&predicate,
+							)
+						} else {
+							let transform = CoordinateTransformer::new(
+								&drag.layout,
+								drag.plot_area.into_iced(),
+							);
+							let local = Point::new(
+								drag.current.x() - drag.plot_area.x(),
+								drag.current.y() - drag.plot_area.y(),
+							);
+							self.kernel
+								.project_predicate(&predicate)
+								.is_some_and(|anchors| {
+									anchors.iter().any(|anchor| {
+										anchor
+											.reproject(&transform)
+											.is_some_and(|shape| shape.contains(local))
+									})
+								})
+						};
+						if !admitted {
+							return Some(
+								canvas::Action::publish(PlotMessage::SelectionRefused(
+									"Selection · this mark does not admit click selection"
+										.to_owned(),
+								))
+								.and_capture(),
+							);
+						}
+						let operation = if state.modifiers.alt() {
+							if self
+								.selection_predicate
+								.is_some_and(|own| own.matches_candidate(candidate))
+							{
+								crate::selection::SelectionOperation::Subtract
+							} else {
+								crate::selection::SelectionOperation::Add
+							}
+						} else {
+							crate::selection::SelectionOperation::Replace
+						};
+						return Some(
+							canvas::Action::publish(PlotMessage::SelectionRequested {
+								predicate,
+								operation,
+							})
+							.and_capture(),
+						);
+					}
+					let Some(predicate) = brush_predicate(
+						&drag,
+						self.selection_axis_fields
+							.expect("selection fields checked"),
+					) else {
+						return Some(
+							canvas::Action::publish(PlotMessage::SelectionRefused(
+								"Selection · the brushed axes cannot be represented exactly"
+									.to_owned(),
+							))
+							.and_capture(),
+						);
+					};
+					return Some(
+						canvas::Action::publish(PlotMessage::SelectionRequested {
+							predicate,
+							operation: if state.modifiers.alt() {
+								crate::selection::SelectionOperation::Add
+							} else {
+								crate::selection::SelectionOperation::Replace
+							},
+						})
+						.and_capture(),
+					);
+				}
+				_ => {}
+			}
+		}
 		if let Some(stamp) = self.viewport_stamp {
 			let chain_stamp = state.sync_viewport_chain(stamp);
 			let widget_position = || {
@@ -4546,6 +5939,7 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 						state.viewport_click = None;
 						state.viewport_drag = None;
 						state.last_hover = None;
+						state.last_hit = None;
 						let reset = chain_stamp.next();
 						state.advance_viewport_chain(reset.next(), None);
 						return Some(
@@ -4562,6 +5956,7 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 					});
 					state.advance_viewport_chain(started, Some(geometry));
 					state.last_hover = None;
+					state.last_hit = None;
 					return Some(
 						canvas::Action::publish(PlotMessage::ViewportStarted(started))
 							.and_capture(),
@@ -4608,7 +6003,9 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 					}
 				}
 				Event::Mouse(iced::mouse::Event::WheelScrolled { delta })
-					if state.viewport_drag.is_none() && !state.modifiers.control() =>
+					if state.viewport_drag.is_none()
+						&& state.selection_drag.is_none()
+						&& !state.modifiers.control() =>
 				{
 					let steps = match delta {
 						iced::mouse::ScrollDelta::Lines { y, .. } => *y as f64,
@@ -4627,6 +6024,7 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 						return None;
 					};
 					state.last_hover = None;
+					state.last_hit = None;
 					let next = chain_stamp.next();
 					state.advance_viewport_chain(
 						next,
@@ -4658,20 +6056,23 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 					)
 				});
 				if let Some(composite) = self.kernel.composite() {
-					let hover = widget_cursor.and_then(|cursor| {
-						composite
-							.hit(
-								widget_bounds,
-								self.padding,
-								&self.title,
-								cursor,
-								&self.settings_model,
-							)
-							.map(|hit| hit.to_string())
+					let hit = widget_cursor.and_then(|cursor| {
+						composite.hit(
+							widget_bounds,
+							self.padding,
+							&self.title,
+							cursor,
+							&self.settings_model,
+						)
 					});
-					if hover != state.last_hover {
+					let hover = hit.as_ref().map(ToString::to_string);
+					if hover != state.last_hover || hit != state.last_hit {
 						state.last_hover = hover.clone();
-						return Some(canvas::Action::publish(PlotMessage::UpdateHover(hover)));
+						state.last_hit = hit.clone();
+						return Some(canvas::Action::publish(PlotMessage::UpdateStructuredHit {
+							hit,
+							hover,
+						}));
 					}
 					return None;
 				}
@@ -4692,13 +6093,17 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 					.map_or(Cursor::Unavailable, |cursor| {
 						Cursor::Available(cursor.into_iced())
 					});
-				let hover = self
-					.kernel
-					.hit_with_settings(&transform, plot_cursor, &self.settings_model)
-					.map(|hit| hit.to_string());
-				if hover != state.last_hover {
+				let hit =
+					self.kernel
+						.hit_with_settings(&transform, plot_cursor, &self.settings_model);
+				let hover = hit.as_ref().map(ToString::to_string);
+				if hover != state.last_hover || hit != state.last_hit {
 					state.last_hover = hover.clone();
-					Some(canvas::Action::publish(PlotMessage::UpdateHover(hover)))
+					state.last_hit = hit.clone();
+					Some(canvas::Action::publish(PlotMessage::UpdateStructuredHit {
+						hit,
+						hover,
+					}))
 				} else {
 					None
 				}

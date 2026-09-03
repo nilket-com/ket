@@ -195,6 +195,23 @@ pub struct FillBetweenPlotKernel {
 }
 
 impl PlotKernel for FillBetweenPlotKernel {
+	fn project_predicate(
+		&self,
+		predicate: &crate::selection::Predicate,
+	) -> Option<Vec<Box<dyn crate::plot::common::EmphasisAnchor>>> {
+		let mut anchors: Vec<Box<dyn crate::plot::common::EmphasisAnchor>> = Vec::new();
+		for (index, candidate) in self.prepared_data.selection_candidates.iter().enumerate() {
+			if predicate.matches_candidate(candidate) {
+				anchors.push(Box::new(FillBetweenEmphasisAnchor {
+					x: self.prepared_data.x[index],
+					lower: self.prepared_data.y_lower[index],
+					upper: self.prepared_data.y_upper[index],
+				}));
+			}
+		}
+		Some(anchors)
+	}
+
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Cartesian {
 			x_range: (
@@ -310,8 +327,8 @@ impl PlotKernel for FillBetweenPlotKernel {
 		} else {
 			hit
 		};
-		Some(
-			hit.labeled(
+		let hit = hit
+			.labeled(
 				"Range",
 				crate::plot::spec::SemanticType::Quantitative,
 				crate::plot::common::HitValue::Interval {
@@ -330,7 +347,12 @@ impl PlotKernel for FillBetweenPlotKernel {
 				"Cursor Y",
 				crate::plot::spec::SemanticType::Quantitative,
 				crate::plot::common::HitValue::quantitative(y, format!("{y:.2}")),
-			),
+			);
+		Some(
+			match self.prepared_data.selection_candidates.get(index).cloned() {
+				Some(candidate) => hit.with_candidate(candidate),
+				None => hit,
+			},
 		)
 	}
 
@@ -340,6 +362,24 @@ impl PlotKernel for FillBetweenPlotKernel {
 
 	fn y_label(&self) -> String {
 		self.prepared_data.y_label.clone()
+	}
+}
+
+struct FillBetweenEmphasisAnchor {
+	x: f64,
+	lower: f64,
+	upper: f64,
+}
+
+impl crate::plot::common::EmphasisAnchor for FillBetweenEmphasisAnchor {
+	fn reproject(
+		&self,
+		transform: &CoordinateTransformer,
+	) -> Option<crate::plot::common::EmphasisShape> {
+		Some(crate::plot::common::EmphasisShape::Segment {
+			start: transform.cartesian(self.x, self.lower),
+			end: transform.cartesian(self.x, self.upper),
+		})
 	}
 }
 
@@ -355,6 +395,7 @@ pub struct FillBetweenPreparedData {
 	pub x_temporal_domain: Option<TemporalAxisDomain>,
 	pub x_label: String,
 	pub y_label: String,
+	pub selection_candidates: Vec<crate::selection::SelectionCandidate>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -582,6 +623,29 @@ pub fn prepare_fill_between_data(
 	};
 	let x_axis_type = polars_type_to_axis_type(&x_dtype);
 	let x_temporal_domain = temporal_axis_domain(x_column, &x_axis_type);
+	let x_exact = crate::selection::exact_column_values(x_column).unwrap_or_default();
+	let x_scalar_type = crate::selection::ScalarType::from_dtype(&x_dtype);
+	let x_semantic_type = crate::selection::semantic_type_for_dtype(&x_dtype);
+	let selection_candidates = x_scalar_type
+		.zip(x_semantic_type)
+		.map(|(scalar_type, semantic_type)| {
+			x_exact
+				.into_iter()
+				.filter_map(|value| {
+					Some(crate::selection::SelectionCandidate {
+						constraints: vec![(
+							crate::selection::FieldRef::new(
+								x_field,
+								semantic_type,
+								scalar_type.clone(),
+							),
+							value?,
+						)],
+					})
+				})
+				.collect()
+		})
+		.unwrap_or_default();
 	Ok(FillBetweenPreparedData {
 		x,
 		y_mid,
@@ -595,6 +659,7 @@ pub fn prepare_fill_between_data(
 		y_label: middle_field
 			.map(str::to_owned)
 			.unwrap_or_else(|| format!("{lower_field} / {upper_field}")),
+		selection_candidates,
 	})
 }
 
@@ -620,6 +685,21 @@ mod tests {
 		middle: Option<&str>,
 	) -> Result<FillBetweenPreparedData, FillBetweenPreparationError> {
 		prepare_fill_between_data(frame, "x", "lower", "upper", middle)
+	}
+
+	#[test]
+	fn product_0151_fill_between_candidate_is_the_source_x_column() {
+		let prepared = prepare(&numeric_frame(), Some("middle")).expect("prepared band");
+		assert!(prepared.selection_candidates.iter().all(|candidate| {
+			candidate.constraints.len() == 1 && candidate.constraints[0].0.name.as_str() == "x"
+		}));
+		let predicate =
+			crate::selection::Predicate::from_candidate(&prepared.selection_candidates[1])
+				.expect("predicate");
+		let kernel = FillBetweenPlotKernel {
+			prepared_data: Arc::new(prepared),
+		};
+		assert_eq!(kernel.project_predicate(&predicate).unwrap().len(), 1);
 	}
 
 	#[test]

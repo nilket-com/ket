@@ -11,6 +11,12 @@ use iced::{Point, Rectangle};
 use polars::prelude::{AnyValue, DataFrame};
 use std::sync::Arc;
 
+#[derive(Clone, Debug)]
+pub struct BoxSelectionCandidates {
+	pub box_candidate: crate::selection::SelectionCandidate,
+	pub outlier_candidates: Vec<crate::selection::SelectionCandidate>,
+}
+
 const OUTLIER_RADIUS: f32 = 3.0;
 const OUTLIER_OUTLINE_WIDTH: f32 = 1.0;
 const OUTLIER_FOOTPRINT_RADIUS: f32 = OUTLIER_RADIUS + OUTLIER_OUTLINE_WIDTH / 2.0;
@@ -63,6 +69,35 @@ impl BoxPlotKernel {
 }
 
 impl PlotKernel for BoxPlotKernel {
+	fn project_predicate(
+		&self,
+		predicate: &crate::selection::Predicate,
+	) -> Option<Vec<Box<dyn crate::plot::common::EmphasisAnchor>>> {
+		let mut anchors: Vec<Box<dyn crate::plot::common::EmphasisAnchor>> = Vec::new();
+		for (category_index, (category, stats)) in self.prepared_data.boxes.iter().enumerate() {
+			let candidates = self.prepared_data.selection_candidates.get(category)?;
+			if predicate.matches_candidate(&candidates.box_candidate) {
+				anchors.push(Box::new(BoxBandEmphasisAnchor {
+					category_index,
+					low: stats.whisker_low(),
+					high: stats.whisker_high(),
+				}));
+			}
+			for (ordinal, candidate) in candidates.outlier_candidates.iter().enumerate() {
+				if predicate.matches_candidate(candidate)
+					&& let Some(value) = stats.outliers().get(ordinal)
+				{
+					anchors.push(Box::new(BoxOutlierEmphasisAnchor {
+						category_index,
+						value: *value,
+						ordinal,
+					}));
+				}
+			}
+		}
+		Some(anchors)
+	}
+
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::CategoricalX {
 			categories: self.prepared_data.boxes.categories().to_vec(),
@@ -183,27 +218,35 @@ impl PlotKernel for BoxPlotKernel {
 			&& let PlotLayout::CategoricalX { categories, .. } = transform.layout
 		{
 			if let Some(hit) = self.hit_outlier(transform, cursor_pos) {
-				return Some(
-					crate::plot::common::PlotHit::new(
-						crate::plot::common::MarkFamily::BOXPLOT,
-						crate::plot::common::HitDimensionality::Point,
-						0,
-					)
-					.labeled(
-						"Category",
-						crate::plot::spec::SemanticType::Nominal,
-						crate::plot::common::HitValue::nominal(hit.category),
-					)
-					.labeled(
-						"Outlier",
-						crate::plot::spec::SemanticType::Quantitative,
-						crate::plot::common::axis_hit_value(
-							hit.value,
-							&self.prepared_data.y_axis_type,
-							format_label(hit.value, &self.prepared_data.y_axis_type),
-						),
+				let plot_hit = crate::plot::common::PlotHit::new(
+					crate::plot::common::MarkFamily::BOXPLOT,
+					crate::plot::common::HitDimensionality::Point,
+					0,
+				)
+				.labeled(
+					"Category",
+					crate::plot::spec::SemanticType::Nominal,
+					crate::plot::common::HitValue::nominal(hit.category),
+				)
+				.labeled(
+					"Outlier",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::plot::common::axis_hit_value(
+						hit.value,
+						&self.prepared_data.y_axis_type,
+						format_label(hit.value, &self.prepared_data.y_axis_type),
 					),
 				);
+				let candidate = self
+					.prepared_data
+					.selection_candidates
+					.get(hit.category)
+					.and_then(|candidates| candidates.outlier_candidates.get(hit.ordinal))
+					.cloned();
+				return Some(match candidate {
+					Some(candidate) => plot_hit.with_candidate(candidate),
+					None => plot_hit,
+				});
 			}
 			for (category, stats) in self.prepared_data.boxes.iter() {
 				let Some(shared_index) = categories
@@ -223,63 +266,70 @@ impl PlotKernel for BoxPlotKernel {
 						.y;
 					if cursor_pos.y >= low.min(high) && cursor_pos.y <= low.max(high) {
 						let yt = self.prepared_data.y_axis_type.clone();
-						return Some(
-							crate::plot::common::PlotHit::new(
-								crate::plot::common::MarkFamily::BOXPLOT,
-								crate::plot::common::HitDimensionality::Area,
-								shared_index,
-							)
-							.labeled(
-								"Category",
-								crate::plot::spec::SemanticType::Nominal,
-								crate::plot::common::HitValue::nominal(category),
-							)
-							.labeled(
-								"Whisker high",
-								crate::plot::spec::SemanticType::Quantitative,
-								crate::plot::common::axis_hit_value(
-									stats.whisker_high(),
-									&yt,
-									format_label(stats.whisker_high(), &yt),
-								),
-							)
-							.labeled(
-								"Q3",
-								crate::plot::spec::SemanticType::Quantitative,
-								crate::plot::common::axis_hit_value(
-									stats.q3(),
-									&yt,
-									format_label(stats.q3(), &yt),
-								),
-							)
-							.labeled(
-								"Median",
-								crate::plot::spec::SemanticType::Quantitative,
-								crate::plot::common::axis_hit_value(
-									stats.median(),
-									&yt,
-									format_label(stats.median(), &yt),
-								),
-							)
-							.labeled(
-								"Q1",
-								crate::plot::spec::SemanticType::Quantitative,
-								crate::plot::common::axis_hit_value(
-									stats.q1(),
-									&yt,
-									format_label(stats.q1(), &yt),
-								),
-							)
-							.labeled(
-								"Whisker low",
-								crate::plot::spec::SemanticType::Quantitative,
-								crate::plot::common::axis_hit_value(
-									stats.whisker_low(),
-									&yt,
-									format_label(stats.whisker_low(), &yt),
-								),
+						let plot_hit = crate::plot::common::PlotHit::new(
+							crate::plot::common::MarkFamily::BOXPLOT,
+							crate::plot::common::HitDimensionality::Area,
+							shared_index,
+						)
+						.labeled(
+							"Category",
+							crate::plot::spec::SemanticType::Nominal,
+							crate::plot::common::HitValue::nominal(category),
+						)
+						.labeled(
+							"Whisker high",
+							crate::plot::spec::SemanticType::Quantitative,
+							crate::plot::common::axis_hit_value(
+								stats.whisker_high(),
+								&yt,
+								format_label(stats.whisker_high(), &yt),
+							),
+						)
+						.labeled(
+							"Q3",
+							crate::plot::spec::SemanticType::Quantitative,
+							crate::plot::common::axis_hit_value(
+								stats.q3(),
+								&yt,
+								format_label(stats.q3(), &yt),
+							),
+						)
+						.labeled(
+							"Median",
+							crate::plot::spec::SemanticType::Quantitative,
+							crate::plot::common::axis_hit_value(
+								stats.median(),
+								&yt,
+								format_label(stats.median(), &yt),
+							),
+						)
+						.labeled(
+							"Q1",
+							crate::plot::spec::SemanticType::Quantitative,
+							crate::plot::common::axis_hit_value(
+								stats.q1(),
+								&yt,
+								format_label(stats.q1(), &yt),
+							),
+						)
+						.labeled(
+							"Whisker low",
+							crate::plot::spec::SemanticType::Quantitative,
+							crate::plot::common::axis_hit_value(
+								stats.whisker_low(),
+								&yt,
+								format_label(stats.whisker_low(), &yt),
 							),
 						);
+						let candidate = self
+							.prepared_data
+							.selection_candidates
+							.get(category)
+							.map(|candidates| candidates.box_candidate.clone());
+						return Some(match candidate {
+							Some(candidate) => plot_hit.with_candidate(candidate),
+							None => plot_hit,
+						});
 					}
 				}
 			}
@@ -303,12 +353,61 @@ impl PlotKernel for BoxPlotKernel {
 	}
 }
 
+struct BoxBandEmphasisAnchor {
+	category_index: usize,
+	low: f64,
+	high: f64,
+}
+
+impl crate::plot::common::EmphasisAnchor for BoxBandEmphasisAnchor {
+	fn reproject(
+		&self,
+		transform: &CoordinateTransformer,
+	) -> Option<crate::plot::common::EmphasisShape> {
+		let (low, band) = transform.categorical(self.category_index, self.low);
+		let (high, _) = transform.categorical(self.category_index, self.high);
+		Some(crate::plot::common::EmphasisShape::Rectangle(Rectangle {
+			x: low.x - band / 2.0,
+			y: low.y.min(high.y),
+			width: band,
+			height: (low.y - high.y).abs().max(1.0),
+		}))
+	}
+}
+
+struct BoxOutlierEmphasisAnchor {
+	category_index: usize,
+	value: f64,
+	ordinal: usize,
+}
+
+impl crate::plot::common::EmphasisAnchor for BoxOutlierEmphasisAnchor {
+	fn reproject(
+		&self,
+		transform: &CoordinateTransformer,
+	) -> Option<crate::plot::common::EmphasisShape> {
+		let PlotLayout::CategoricalX { .. } = transform.layout else {
+			return None;
+		};
+		let (_, stats_width) = transform.categorical(self.category_index, self.value);
+		let mut center = transform.categorical(self.category_index, self.value).0;
+		// Duplicate outliers are jittered by the renderer. The ordinal keeps the
+		// anchor stable even though the exact source value is shared.
+		center.x += ((self.ordinal % 3) as f32 - 1.0) * (stats_width * 0.02).min(5.0);
+		Some(crate::plot::common::EmphasisShape::Circle {
+			center,
+			radius: 6.0,
+		})
+	}
+}
+
 pub struct BoxPlotPreparedData {
 	pub boxes: TukeyBoxes,
 	pub y_range: (f64, f64),
 	pub y_axis_type: AxisType,
 	pub x_label: String,
 	pub y_label: String,
+	pub selection_candidates: std::collections::HashMap<String, BoxSelectionCandidates>,
 }
 
 impl BoxPlotPreparedData {
@@ -320,6 +419,7 @@ impl BoxPlotPreparedData {
 			y_axis_type,
 			x_label,
 			y_label,
+			selection_candidates: std::collections::HashMap::new(),
 		}
 	}
 }
@@ -409,6 +509,11 @@ pub fn prepare_box_plot_data(
 		.all()
 		.map(|field| df.column(field).expect("resolved box field is present"));
 	let mut rows = Vec::with_capacity(df.height());
+	let category_type = crate::selection::ScalarType::from_dtype(columns[0].dtype());
+	let outlier_type = crate::selection::ScalarType::from_dtype(columns[6].dtype());
+	let category_exact = crate::selection::exact_column_values(columns[0]);
+	let outlier_exact = crate::selection::exact_column_values(columns[6]);
+	let mut selection_candidates = std::collections::HashMap::new();
 	for row in 0..df.height() {
 		let category_value = columns[0].get(row).expect("row is in bounds");
 		if matches!(category_value, AnyValue::Null) {
@@ -446,6 +551,56 @@ pub fn prepare_box_plot_data(
 				row,
 			)?)
 		};
+		if let (Some(category_type), Some(category_values), Some(category_value)) = (
+			&category_type,
+			&category_exact,
+			category_exact
+				.as_ref()
+				.and_then(|values| values.get(row))
+				.and_then(Clone::clone),
+		) {
+			let category_constraint = (
+				crate::selection::FieldRef::new(
+					&fields.category,
+					crate::plot::spec::SemanticType::Nominal,
+					category_type.clone(),
+				),
+				category_value,
+			);
+			let entry = selection_candidates
+				.entry(category.clone())
+				.or_insert_with(|| BoxSelectionCandidates {
+					box_candidate: crate::selection::SelectionCandidate {
+						constraints: vec![category_constraint.clone()],
+					},
+					outlier_candidates: Vec::new(),
+				});
+			let _ = category_values;
+			if outlier.is_some()
+				&& let (Some(outlier_type), Some(outlier_value)) = (
+					outlier_type.as_ref(),
+					outlier_exact
+						.as_ref()
+						.and_then(|values| values.get(row))
+						.and_then(Clone::clone),
+				) {
+				entry
+					.outlier_candidates
+					.push(crate::selection::SelectionCandidate {
+						constraints: vec![
+							category_constraint,
+							(
+								crate::selection::FieldRef::new(
+									&fields.outlier,
+									crate::plot::spec::SemanticType::Quantitative,
+									outlier_type.clone(),
+								),
+								outlier_value,
+							),
+						],
+					});
+			}
+		}
 		rows.push(TukeyBoxRow {
 			category,
 			whisker_low,
@@ -457,12 +612,14 @@ pub fn prepare_box_plot_data(
 		});
 	}
 	let boxes = TukeyBoxes::new(rows).map_err(BoxPlotPreparationError::Shape)?;
-	Ok(BoxPlotPreparedData::new(
+	let mut prepared = BoxPlotPreparedData::new(
 		boxes,
 		AxisType::Linear,
 		fields.category.clone(),
 		String::new(),
-	))
+	);
+	prepared.selection_candidates = selection_candidates;
+	Ok(prepared)
 }
 
 fn exact_box_value(
@@ -996,6 +1153,57 @@ mod tests {
 		assert_eq!(prepared.x_label, "group");
 		assert_eq!(prepared.y_label, "");
 		assert_eq!(prepared.y_axis_type, AxisType::Linear);
+	}
+
+	#[test]
+	fn product_0151_box_and_outlier_candidates_have_the_closed_field_sets() {
+		let data = df!(
+			"group" => ["all"],
+			"lo" => [0_i64],
+			"p25" => [1_i64],
+			"mid" => [2_i64],
+			"p75" => [3_i64],
+			"hi" => [4_i64],
+			"point" => [Some(20_i64)],
+		)
+		.unwrap();
+		let prepared = prepare_box_plot_data(&data, &aliased_fields()).expect("valid box relation");
+		let candidates = prepared
+			.selection_candidates
+			.get("all")
+			.expect("category candidates");
+		assert_eq!(
+			candidates
+				.box_candidate
+				.constraints
+				.iter()
+				.map(|(field, _)| field.name.as_str())
+				.collect::<Vec<_>>(),
+			["group"]
+		);
+		assert_eq!(
+			candidates.outlier_candidates[0]
+				.constraints
+				.iter()
+				.map(|(field, _)| field.name.as_str())
+				.collect::<Vec<_>>(),
+			["group", "point"]
+		);
+
+		let predicate =
+			crate::selection::Predicate::from_candidate(&candidates.outlier_candidates[0])
+				.expect("outlier predicate");
+		let kernel = BoxPlotKernel {
+			prepared_data: Arc::new(prepared),
+		};
+		assert_eq!(
+			kernel
+				.project_predicate(&predicate)
+				.expect("box plot admits selection")
+				.len(),
+			1,
+			"the two-field outlier predicate emphasizes the outlier, not the whole band"
+		);
 	}
 
 	#[test]
