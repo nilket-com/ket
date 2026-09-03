@@ -6,7 +6,6 @@
 
 #![allow(dead_code)] // Schema/nullness availability precedes its first admission consumer.
 
-use crate::selection::{InputIdentity, Publication};
 use arrow_array::{Array, RecordBatch};
 use arrow_buffer::NullBuffer;
 use arrow_csv::Writer as ArrowCsvWriter;
@@ -45,6 +44,37 @@ impl ArtifactToken {
 pub enum FieldNullability {
 	Known(bool),
 	Unknown,
+}
+
+/// PRODUCT-0151 §4: the stable logical input an artifact is bound to — a
+/// result name, a buffer, a Rune lineage, or a notebook cell — minted once per
+/// binding and never recycled within a process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InputIdentity(NonZeroU64);
+
+static NEXT_INPUT_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+impl InputIdentity {
+	pub fn mint() -> Self {
+		let raw = NEXT_INPUT_IDENTITY.fetch_add(1, Ordering::Relaxed);
+		Self(NonZeroU64::new(raw).expect("input identity counter exhausted"))
+	}
+
+	pub(crate) fn raw(self) -> u64 {
+		self.0.get()
+	}
+
+	pub(crate) fn from_raw(raw: u64) -> Self {
+		Self(NonZeroU64::new(raw).expect("stored input identity is nonzero"))
+	}
+}
+
+/// An input identity paired with the token of the artifact currently
+/// published for it: what a selection was computed against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Publication {
+	pub input: InputIdentity,
+	pub token: ArtifactToken,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

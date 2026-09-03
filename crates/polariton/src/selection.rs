@@ -5,7 +5,10 @@
 //! values never enter a predicate or a staleness decision.
 
 use crate::plot::spec::SemanticType;
+// The input identity and the publication live beside the artifact token they
+// pair with, so the artifact module never depends on the selection module.
 use crate::result_artifact::ArtifactToken;
+pub use crate::result_artifact::{InputIdentity, Publication};
 use polars::prelude::{
 	AnyValue, BooleanChunked, Column, DataFrame, DataType, NewChunkedArray,
 	TimeUnit as PolarsTimeUnit,
@@ -13,7 +16,6 @@ use polars::prelude::{
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -670,32 +672,6 @@ pub fn exact_column_values(column: &Column) -> Option<Vec<Option<ExactScalar>>> 
 			})
 			.collect(),
 	)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct InputIdentity(NonZeroU64);
-
-static NEXT_INPUT_IDENTITY: AtomicU64 = AtomicU64::new(1);
-
-impl InputIdentity {
-	pub fn mint() -> Self {
-		let raw = NEXT_INPUT_IDENTITY.fetch_add(1, Ordering::Relaxed);
-		Self(NonZeroU64::new(raw).expect("input identity counter exhausted"))
-	}
-
-	pub(crate) fn raw(self) -> u64 {
-		self.0.get()
-	}
-
-	pub(crate) fn from_raw(raw: u64) -> Self {
-		Self(NonZeroU64::new(raw).expect("stored input identity is nonzero"))
-	}
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Publication {
-	pub input: InputIdentity,
-	pub token: ArtifactToken,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
