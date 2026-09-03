@@ -5490,6 +5490,7 @@ dependencies = [
 name = "toron-client"
 version = "0.1.0"
 dependencies = [
+ "boson",
  "postcard",
  "quinn",
  "rustls",

@@ -55,6 +55,8 @@ use crate::rune_relation_envelope::{
 	StyledRunePlotSink, TransformedRuneRelation, TransformedRuneView,
 };
 use crate::rune_view::{LocalViewIdentity, ViewContentKind, ViewPresentation};
+#[cfg(feature = "toron")]
+use boson::TemporalInterval;
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, window};
 use libaryon::core::{BufferId, SessionId};
 #[cfg(feature = "toron")]
@@ -63,13 +65,10 @@ use libaryon::uast::projection::MarkdownCellOutputTarget;
 #[cfg(feature = "toron")]
 use polars::frame::DataFrame;
 use std::collections::{HashMap, VecDeque};
-#[cfg(feature = "toron")]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 #[cfg(feature = "toron")]
 use tokio::sync::RwLock;
-#[cfg(feature = "toron")]
-use toron_client::TemporalInterval;
 
 #[cfg(feature = "toron")]
 #[derive(Clone)]
@@ -12675,6 +12674,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
+	#[cfg(feature = "toron")]
 	fn product_0082_box_resolves_aliases_values_and_failure_scope() {
 		use crate::plot::common::AxisType;
 		use crate::plot::theme::PlotSettings;
@@ -12797,6 +12797,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
+	#[cfg(feature = "toron")]
 	fn product_0092_heatmap_resolves_and_attributes_binding_and_cell_refusals() {
 		use polars::frame::DataFrame;
 		let source =
@@ -12896,6 +12897,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
+	#[cfg(feature = "toron")]
 	fn product_0144_hexbin_resolves_without_identity_and_attributes_both_failure_stations() {
 		use polars::frame::DataFrame;
 		use polars::prelude::{Column, DataType};
@@ -13035,6 +13037,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
+	#[cfg(feature = "toron")]
 	fn product_0146_fill_between_attributes_resolution_preparation_and_structure() {
 		use polars::frame::DataFrame;
 		let source = r#"workspace.table("fill_between_probe").views([fill_between("x", "low", "high", "mid")])"#;
@@ -13158,6 +13161,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
+	#[cfg(feature = "toron")]
 	fn product_0148_candlestick_attributes_resolution_preparation_and_structure() {
 		use polars::frame::DataFrame;
 		let source = r#"workspace.table("candlestick_probe").views([candlestick("x", "open", "high", "low", "close")])"#;
@@ -13368,6 +13372,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
+	#[cfg(feature = "toron")]
 	fn product_0098_funnel_resolves_identity_and_attributes_every_refusal() {
 		use polars::frame::DataFrame;
 		let source = r#"workspace.table("funnel_probe").views([funnel("stage", "value")])"#;
@@ -13462,6 +13467,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
+	#[cfg(feature = "toron")]
 	fn product_0100_radial_dial_resolves_identity_and_attributes_every_refusal() {
 		use polars::frame::DataFrame;
 		let grouped = r#"workspace.table("radial_dial_probe").views([radial_dial("value", "maximum", "label")])"#;
@@ -13623,6 +13629,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
+	#[cfg(feature = "toron")]
 	fn product_0103_pie_resolves_identity_and_attributes_slice_refusals() {
 		use polars::frame::DataFrame;
 		let source = r#"workspace.table("pie_probe").views([pie("category", "value")])"#;
@@ -13687,6 +13694,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
+	#[cfg(feature = "toron")]
 	fn product_0105_multivariate_resolution_keeps_dimension_and_modifier_attribution() {
 		use polars::frame::DataFrame;
 		let source =
@@ -13751,6 +13759,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
+	#[cfg(feature = "toron")]
 	fn product_0095_bubble_resolves_and_attributes_all_five_roles() {
 		use polars::frame::DataFrame;
 		let source = r#"workspace.table("bubble_probe").views([bubble("x", "y", "size", "color", "label")])"#;
@@ -13909,6 +13918,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
+	#[cfg(feature = "toron")]
 	fn product_0091_rune_continuous_intent_reaches_planning_and_modifier_diagnostics() {
 		use crate::plot::colors::ColorTheme;
 		use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};

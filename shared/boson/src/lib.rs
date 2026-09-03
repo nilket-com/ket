@@ -5,6 +5,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod temporal_interval;
+pub use temporal_interval::{TemporalInterval, TemporalIntervalError};
+
 use std::fmt;
 
 pub const V1_FORMAT_VERSION: u16 = 1;

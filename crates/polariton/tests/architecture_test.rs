@@ -6183,3 +6183,38 @@ fn product_0151_identity_grid_and_in_process_boundaries_are_pinned() {
 	assert!(!selection_gesture.contains("PlotWritebackGesture"));
 	assert!(!selection_gesture.contains("plan_writeback"));
 }
+
+/// PRODUCT-0152 §2: the plot kit and the presentation surface consume the
+/// temporal interval literal from `boson`, never from the Toron client, so the
+/// reduced head compiles. The guard is mechanical: it never infers `cfg` scope
+/// from text. The four sources below name the client for nothing else; the
+/// state file keeps its gated Toron operations and loses only the literal.
+#[test]
+fn product_0152_plot_and_presentation_sources_never_name_the_toron_client() {
+	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let mut banned = rust_files(&src.join("plot"));
+	for file in [
+		"rune_presentation.rs",
+		"presentation_registry.rs",
+		"settings_writeback.rs",
+	] {
+		banned.push(src.join(file));
+	}
+	for path in banned {
+		let source = std::fs::read_to_string(&path).expect("read Polariton source");
+		assert!(
+			!source.contains("toron_client"),
+			"PRODUCT-0152: {} names the Toron client; the temporal literal lives in boson",
+			path.display()
+		);
+	}
+	let state = std::fs::read_to_string(src.join("gui/state.rs")).expect("read Polariton state");
+	assert!(
+		!state.contains("toron_client::TemporalInterval"),
+		"PRODUCT-0152: gui/state.rs imports the temporal literal from the Toron client"
+	);
+	assert!(
+		state.contains("use boson::TemporalInterval;"),
+		"positive control: gui/state.rs still consumes the literal, so the guard is exercised"
+	);
+}

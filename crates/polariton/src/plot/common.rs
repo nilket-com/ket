@@ -13,6 +13,7 @@ use crate::plot::spec::{
 };
 use crate::plot::text_estimate::{estimate_ascii_label_width, estimate_formatted_label_width};
 use crate::plot::theme::{PlotDomainOverrides, PlotSettings};
+use boson::TemporalInterval;
 use iced::advanced::image;
 use iced::advanced::mouse::Cursor;
 use iced::alignment;
@@ -22,7 +23,6 @@ use std::num::NonZeroU32;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use toron_client::TemporalInterval;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Orientation {

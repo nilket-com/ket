@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+boson = { path = "../../../shared/boson" }
 postcard = { version = "1.0", default-features = false, features = ["alloc", "use-std"] }
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

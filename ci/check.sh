@@ -34,7 +34,10 @@ run packaging/ubuntu/test-nilket-local-user-service.sh
 run scripts/cargo-ctrl --locked
 run env BARYON_SVP_BACKEND=blocking scripts/cargo-ctrl --locked
 run cargo test --locked --test architecture_test
+run cargo check --locked -p polariton --no-default-features
+run cargo test --locked -p polariton --no-default-features --bin polariton
 
 for target in "${TARGETS[@]}"; do
 	run cargo check --locked --target "$target"
+	run cargo check --locked -p polariton --no-default-features --target "$target"
 done

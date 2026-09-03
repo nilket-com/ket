@@ -445,6 +445,7 @@ pub struct CodeEditor {
 	selection_contexts: crate::selection::SelectionContexts,
 	pending_selection_tasks: Vec<Task<EditorMsg>>,
 	result_panel_input: crate::selection::InputIdentity,
+	#[cfg(feature = "toron")]
 	rune_input_identities: HashMap<
 		(
 			libaryon::core::BufferId,
@@ -1077,6 +1078,7 @@ impl CodeEditor {
 			selection_contexts: crate::selection::SelectionContexts::default(),
 			pending_selection_tasks: Vec::new(),
 			result_panel_input: crate::selection::InputIdentity::mint(),
+			#[cfg(feature = "toron")]
 			rune_input_identities: HashMap::new(),
 			notebook_input_identities: HashMap::new(),
 			view_panel_ids: HashMap::new(),
@@ -1420,6 +1422,7 @@ impl CodeEditor {
 		artifact.bind_input_identity(self.result_panel_input);
 	}
 
+	#[cfg(feature = "toron")]
 	pub(crate) fn bind_rune_artifact(
 		&mut self,
 		buffer: libaryon::core::BufferId,
@@ -12315,6 +12318,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "toron")]
 	fn product_0151_logical_bindings_keep_input_identity_and_republish_tokens() {
 		use crate::rune_relation_envelope::{RelationLineage, RelationLineageLiteral};
 		use libaryon::core::BufferId;

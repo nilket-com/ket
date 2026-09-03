@@ -30,6 +30,7 @@ use crate::rune_relation_envelope::{
 	RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent, RuneTableSkinProjection,
 	RuneViewIntent, SpannedMarkFields, StyledRunePlotSink, ViolinFieldOrigins,
 };
+use boson::TemporalInterval;
 use rune::alloc::limit;
 use rune::ast::Spanned;
 use rune::diagnostics::{Diagnostic, FatalDiagnosticKind};
@@ -38,7 +39,6 @@ use rune::{Any, Context, Diagnostics, Module, Ref, Source, Sources, Vm};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
-use toron_client::TemporalInterval;
 
 pub(crate) const PRESENTATION_COMPILE_ALLOCATION_CAP: usize = 256 * 1024 * 1024;
 pub(crate) const PRESENTATION_RUNTIME_ALLOCATION_CAP: usize = 256 * 1024 * 1024;

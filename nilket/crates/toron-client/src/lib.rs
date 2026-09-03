@@ -9,8 +9,8 @@
 mod client;
 mod liveness;
 mod protocol;
-mod temporal_interval;
 
+pub use boson::{TemporalInterval, TemporalIntervalError};
 pub use client::{
 	ClientError, ClientOperation, QueryResult, RuneQueryResult, ToronClient, ToronClientTls,
 	blocking_health_loopback,
@@ -32,4 +32,3 @@ pub use protocol::{
 	SQL_STATEMENT_BYTES_HARD_CEILING, SqlError, SqlErrorCode, SqlFrame, SqlMessage,
 	SqlProtocolVersion, read_frame, read_request_frame_bounded, write_frame,
 };
-pub use temporal_interval::{TemporalInterval, TemporalIntervalError};
