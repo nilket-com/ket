@@ -1701,6 +1701,9 @@ fn shell_html(
 			Some(hidden) => snapshot_classes(&svg, hidden),
 			None => svg,
 		};
+		// Every inlined SVG shares one document id namespace; a clip id must
+		// resolve to its own figure's rectangle, never the first on the page.
+		let svg = scope_svg_ids(&svg, &figure.id);
 		html.push_str(&svg);
 		html.push('\n');
 		if let Some(projection) = embedded.get(&figure.id) {
@@ -1719,6 +1722,25 @@ fn shell_html(
 	html.push_str(INSPECT_JS);
 	html.push_str("</script>\n</body>\n</html>\n");
 	html
+}
+
+/// The SVG backend mints `clip_N` per figure. Inlined together, the browser
+/// would resolve every reference to the first definition on the page, so
+/// the inlined copy prefixes each id and each reference with the figure id.
+/// `figure.svg` stays as rendered.
+fn scope_svg_ids(svg: &str, figure_id: &str) -> String {
+	// Only the two forms `SvgBackend::with_clip` emits: the definition's id
+	// attribute and the group's reference attribute. A text node cannot hold
+	// either, because the backend escapes `<` in text.
+	let scope = html_escape(figure_id);
+	svg.replace(
+		"<clipPath id=\"clip_",
+		&format!("<clipPath id=\"{scope}-clip_"),
+	)
+	.replace(
+		"<g clip-path=\"url(#clip_",
+		&format!("<g clip-path=\"url(#{scope}-clip_"),
+	)
 }
 
 /// The inlined SVG with the hidden class on every group an actionable
@@ -2464,7 +2486,9 @@ mod tests {
 		assert!(shell.contains("grid-column: 1 / span 2; grid-row: 1 / span 2;"));
 		assert!(shell.contains("grid-column: 3 / span 2; grid-row: 1 / span 2;"));
 		assert!(shell.contains(&format!("@font-face {{ font-family: \"{FONT_FAMILY}\"")));
-		assert!(shell.contains(&figure_svg(&package, "left")));
+		// The inlined copy is the file with its ids scoped to the figure.
+		assert!(shell.contains(&scope_svg_ids(&figure_svg(&package, "left"), "left")));
+		assert!(!figure_svg(&package, "left").contains("left-clip_"));
 		assert!(package.manifest.fonts[0].file == FONT_FILE);
 		assert!(package.files.contains_key(FONT_LICENCE_FILE));
 	}
@@ -4447,5 +4471,86 @@ function __pointer(x, y, mods) {
 			.unwrap();
 		let empty_ops = value.to_number(&mut context).unwrap() as u64;
 		assert!(empty_ops <= 98_304);
+	}
+}
+
+/// The published shell inlines every figure's SVG into one document, so SVG
+/// ids share one namespace. A clip id resolved to another figure's rectangle
+/// clipped a wide figure's axes to a narrow figure's width in the browser.
+#[cfg(test)]
+mod shell_id_scope_tests {
+	use super::tests_support::*;
+	use super::*;
+	use crate::plot::core::PlotType;
+
+	#[test]
+	fn shell_scopes_svg_ids_per_figure_and_every_reference_resolves_within_its_figure() {
+		let artifact = artifact();
+		let mut narrow = fixture("Narrow", &artifact, PlotType::Scatter, 0);
+		narrow.width = 200.0;
+		// A label that spells a clip reference is text, and text is never scoped.
+		let label = "Wide url(#clip_0) id=\"clip_0\"";
+		let mut wide = fixture(label, &artifact, PlotType::Line, 1);
+		wide.width = 900.0;
+		let package = publish(vec![narrow, wide], &request());
+		let shell = String::from_utf8(package.files[SHELL_FILE].clone()).unwrap();
+		// Every id in the document is unique.
+		let ids: Vec<&str> = shell
+			.split("id=\"")
+			.skip(1)
+			.filter_map(|rest| rest.split('"').next())
+			.collect();
+		let mut unique = ids.clone();
+		unique.sort_unstable();
+		unique.dedup();
+		assert_eq!(ids.len(), unique.len(), "duplicate ids: {ids:?}");
+		// Every clip reference names an id defined by its own figure, and both
+		// figures clip: the positive control for the assay.
+		let mut clipping_figures = 0;
+		let wide_id = package.manifest.figures[1].id.clone();
+		for id in ["narrow", wide_id.as_str()] {
+			let open = format!("<figure class=\"figure\" id=\"{id}\"");
+			let start = shell.find(&open).expect("figure element");
+			let body = &shell[start..];
+			let end = body.find("</figure>").expect("closed figure");
+			let body = &body[..end];
+			let references: Vec<&str> = body
+				.split("clip-path=\"url(#")
+				.skip(1)
+				.filter_map(|rest| rest.split(')').next())
+				.collect();
+			if !references.is_empty() {
+				clipping_figures += 1;
+			}
+			for reference in references {
+				assert!(
+					reference.starts_with(&format!("{id}-clip_")),
+					"{id} references {reference}"
+				);
+				assert!(
+					!reference.contains('"'),
+					"{id} reference is an attribute value"
+				);
+				assert!(
+					body.contains(&format!("id=\"{reference}\"")),
+					"{id} defines {reference} in its own SVG"
+				);
+			}
+		}
+		assert_eq!(clipping_figures, 2, "both fixtures clip their axis pass");
+		// The packaged file is the render as made; only the inlined copy is scoped.
+		let file =
+			String::from_utf8(package.files[&format!("figures/{wide_id}/figure.svg")].clone())
+				.unwrap();
+		assert!(file.contains("<clipPath id=\"clip_0\">"));
+		assert!(!file.contains(&format!("{wide_id}-clip_")));
+		// The label survives unchanged as text in the shell and in the file.
+		let escaped = xml_escape(label);
+		assert!(
+			shell.contains(&format!(">{escaped}</text>")),
+			"shell text: {escaped}"
+		);
+		assert!(file.contains(&format!(">{escaped}</text>")));
+		assert!(shell.contains(&format!("aria-label=\"{}\"", html_escape(label))));
 	}
 }
