@@ -670,6 +670,12 @@ impl PlotKernel for PlotGridKernel {
 			.flat_map(|cell| cell.kernel.series_identities())
 			.collect()
 	}
+	fn series_labels(&self) -> Vec<crate::plot::series::SeriesLabel> {
+		self.cells
+			.iter()
+			.flat_map(|cell| cell.kernel.series_labels())
+			.collect()
+	}
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		self.cells.first().kernel.layout(settings)
 	}
@@ -699,6 +705,54 @@ impl PlotKernel for PlotGridKernel {
 }
 
 impl PlotComposite for PlotGridKernel {
+	/// PRODUCT-0157 §1: the same per-cell plot areas `hit_regions` derives.
+	fn rasterizes_identified_series(
+		&self,
+		bounds: Rect<Widget>,
+		padding: f32,
+		title: &str,
+		settings: &PlotSettings,
+	) -> bool {
+		let resolved = settings.resolve();
+		let figure_legend_reservation = crate::plot::legend::union(
+			self.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_reservation_content(&resolved)),
+		);
+		let legend = crate::plot::legend::legend_layout(
+			bounds,
+			figure_legend_reservation.as_ref(),
+			&resolved,
+		);
+		let outer = grid_outer_area(legend.content_bounds, padding);
+		let layouts = self.cell_layouts(settings);
+		let requirements =
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
+		let x_label_visible = grid_x_label_visible(self, &resolved);
+		let tiled = grid_tiled_area_with_requirements(
+			outer,
+			title,
+			&requirements,
+			x_label_visible,
+			&resolved,
+		);
+		self.cells.iter().enumerate().any(|(index, cell)| {
+			let (position, _) = &layouts[index];
+			let cell_bounds = grid_cell_bounds_with_settings(
+				tiled,
+				self.arrangement,
+				*position,
+				self.figure_grid,
+			);
+			let cell_resolved = cell.kernel.resolve_settings(settings);
+			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
+			let inner_bounds = inner.into_iced();
+			cell.kernel.rasterizes_identified_series(
+				IcedRectangle::new(Point::ORIGIN, inner_bounds.size()),
+				settings,
+			)
+		})
+	}
 	fn legend_hit_geometry(
 		&self,
 		bounds: Rect<Widget>,

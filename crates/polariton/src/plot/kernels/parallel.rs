@@ -99,6 +99,18 @@ impl PlotKernel for ParallelPlotKernel {
 	fn series_identities(&self) -> Vec<crate::plot::series::SeriesIdentity> {
 		self.row_identities.iter().flatten().cloned().collect()
 	}
+	fn series_labels(&self) -> Vec<crate::plot::series::SeriesLabel> {
+		self.prepared_data
+			.iter()
+			.enumerate()
+			.filter_map(|(index, row)| {
+				crate::plot::series::SeriesLabel::pair(
+					self.row_identities.get(index).and_then(Option::as_ref),
+					row.category().unwrap_or_default(),
+				)
+			})
+			.collect()
+	}
 	fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Parallel {
 			dimensions: self.prepared_data.dimensions().to_vec(),

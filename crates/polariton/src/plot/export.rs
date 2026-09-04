@@ -180,6 +180,20 @@ impl PlotBackend for SvgBackend {
 		f(self);
 		self.svg.push_str("</g>");
 	}
+	fn with_legend_entry(
+		&mut self,
+		group: crate::plot::series::SeriesGroup,
+		f: &mut dyn FnMut(&mut dyn PlotBackend),
+	) {
+		if !self.series_groups {
+			f(self);
+			return;
+		}
+		self.svg
+			.push_str(&format!("<g data-legend=\"s{}\">", group.ordinal()));
+		f(self);
+		self.svg.push_str("</g>");
+	}
 	fn stroke_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), stroke: Stroke) {
 		let mut builder = SvgPathBuilder {
 			path: String::new(),

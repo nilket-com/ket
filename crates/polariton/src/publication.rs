@@ -34,9 +34,13 @@ pub(crate) const INSPECT_FILE: &str = "inspect.js";
 /// PRODUCT-0155 §6: the one executable script, byte-pinned into the shell and
 /// into the package. Its source contains no literal `<` or `&`.
 pub(crate) const INSPECT_JS: &str = include_str!("../assets/web/inspect.js");
-pub(crate) const PROJECTION_SCHEMA_VERSION: u32 = 1;
+/// Schema 2 since PRODUCT-0157 §6: a region names its series ordinal.
+pub(crate) const PROJECTION_SCHEMA_VERSION: u32 = 2;
 pub(crate) const PROJECTION_BYTE_BOUND: usize = 1024 * 1024;
 pub(crate) const PROJECTION_REGION_BOUND: usize = 32_768;
+/// PRODUCT-0157 §2: the series table and its bound.
+pub(crate) const SERIES_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SERIES_BOUND: usize = 4_096;
 const UNKNOWN_PRODUCER: &str = "unknown";
 
 // ---------------------------------------------------------------------------
@@ -83,7 +87,96 @@ pub(crate) struct FigureEntry {
 	/// PRODUCT-0155 §7: whether the figure carries a hit projection, and if
 	/// not, exactly why and how far over the bound it was.
 	pub(crate) inspection: Inspection,
+	/// PRODUCT-0157 §2: whether a series table exists and whether the browser
+	/// may act on it — two separate facts.
+	pub(crate) visibility: Visibility,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum Visibility {
+	/// Covered, identified, within the bound: the table is written and the
+	/// browser dispatches the four actions.
+	Actionable { series: u64 },
+	/// The table is written for the reader; the legend dispatches nothing.
+	Inert { series: u64, reason: String },
+	/// No table: no identified series, or over the bound.
+	Absent {
+		reason: String,
+		observed: Option<u64>,
+	},
+}
+
+// PRODUCT-0157 §2: the series table. Ordinals are the handle; the value
+// crosses only as the display-bearing hit value. No exact scalar, no scalar
+// type, no zone or scale, and no selection candidate ever enters this file.
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SeriesTable {
+	pub(crate) schema_version: u32,
+	pub(crate) viewbox: [f64; 2],
+	pub(crate) actions: SeriesActions,
+	/// PRODUCT-0157 §3: the publisher's hidden ordinals at the publish moment,
+	/// applied once as the browser's starting state. A snapshot, never
+	/// persistence.
+	pub(crate) initially_hidden: Vec<u32>,
+	pub(crate) series: Vec<SeriesRow>,
+	pub(crate) legend: Option<LegendTable>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum SeriesActions {
+	Available,
+	Unavailable { reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SeriesRow {
+	pub(crate) ordinal: u32,
+	/// The label preparation formatted, joined to the ordinal by identity.
+	pub(crate) label: String,
+	pub(crate) field: SeriesField,
+	/// The partition value as the tagged display DTO. For temporal values the
+	/// number is the source's own tick count in its unit; the display string
+	/// is authoritative, exactly as for a hit.
+	pub(crate) value: HitValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SeriesField {
+	pub(crate) label: String,
+	pub(crate) semantic_type: String,
+}
+
+/// The legend's bounds and one rectangle per entry, in `viewBox` units, from
+/// the same geometry that draws the legend and routes the desktop's presses.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LegendTable {
+	pub(crate) x0: f64,
+	pub(crate) y0: f64,
+	pub(crate) x1: f64,
+	pub(crate) y1: f64,
+	pub(crate) entries: Vec<LegendEntryRect>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LegendEntryRect {
+	pub(crate) x0: f64,
+	pub(crate) y0: f64,
+	pub(crate) x1: f64,
+	pub(crate) y1: f64,
+	/// The ordinal this entry addresses; absent for an entry without an
+	/// identity or with an ambiguous union identity.
+	pub(crate) series: Option<u32>,
+}
+
+// PRODUCT-0157 §2: end of the series table.
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "kebab-case")]
@@ -230,6 +323,8 @@ pub(crate) enum Region {
 		inclusive_max: bool,
 		ordinal: u32,
 		hit: usize,
+		/// PRODUCT-0157 §6: the series ordinal, skipped while hidden.
+		series: Option<u32>,
 	},
 	Circle {
 		cx: f64,
@@ -237,6 +332,7 @@ pub(crate) enum Region {
 		r: f64,
 		ordinal: u32,
 		hit: usize,
+		series: Option<u32>,
 	},
 }
 
@@ -402,11 +498,29 @@ pub(crate) struct PublishRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PublishError {
 	NoFigures,
-	Republished { figure: String },
-	NoRecipe { figure: String },
-	Rebuild { figure: String, error: String },
-	Data { figure: String, error: String },
-	Secret { file: String, field: String },
+	Republished {
+		figure: String,
+	},
+	NoRecipe {
+		figure: String,
+	},
+	Rebuild {
+		figure: String,
+		error: String,
+	},
+	Data {
+		figure: String,
+		error: String,
+	},
+	Secret {
+		file: String,
+		field: String,
+	},
+	/// PRODUCT-0157 guardrail 3: a registry identity preparation did not
+	/// label. Labels are never recovered by string matching.
+	SeriesLabel {
+		figure: String,
+	},
 	Encoding(String),
 	Write(String),
 }
@@ -438,6 +552,10 @@ impl std::fmt::Display for PublishError {
 			Self::Secret { file, field } => write!(
 				f,
 				"Publish · refused: {file} ({field}) would carry a secret, a local path, or an endpoint"
+			),
+			Self::SeriesLabel { figure } => write!(
+				f,
+				"Publish · refused: {figure} has a series its preparation did not label"
 			),
 			Self::Encoding(error) => write!(f, "Publish · refused: {error}"),
 			Self::Write(error) => write!(f, "Publish · refused: {error}"),
@@ -565,6 +683,8 @@ pub(crate) fn assemble(
 	let mut datasets: BTreeMap<String, DatasetEntry> = BTreeMap::new();
 	let mut used_ids = std::collections::HashSet::new();
 	let mut embedded: BTreeMap<String, String> = BTreeMap::new();
+	let mut embedded_series: BTreeMap<String, String> = BTreeMap::new();
+	let mut initially_hidden: BTreeMap<String, Vec<u32>> = BTreeMap::new();
 	// PRODUCT-0154 §5: layout is relative placement. The desktop workspace's
 	// absolute cells — the editor columns a dashboard sat beside — are not
 	// content, so every rectangle is rebased to the published bounding box.
@@ -708,15 +828,91 @@ pub(crate) fn assemble(
 			settings,
 		};
 
+		// PRODUCT-0157 §1 and §3: an actionable figure — covered, identified,
+		// within the table bound — is exported complete, with the desktop's
+		// hidden set carried as the browser's starting state. Every other
+		// figure publishes with the desktop's visibility applied.
+		let export_bounds = iced::Rectangle {
+			x: 0.0,
+			y: 0.0,
+			width: export.width,
+			height: export.height,
+		};
+		let desktop_widget = widget_for(&export, &export.settings_model);
+		let registry = desktop_widget.series_registry().clone();
+		let covered = desktop_widget.series_covered(export_bounds);
+		let desktop_hidden = desktop_widget.hidden_series().clone();
+		drop(desktop_widget);
+		let identified = registry.identities().len();
+		let within_bound = identified <= SERIES_BOUND;
+		let actionable = covered && identified > 0 && within_bound;
+		let mut render_model = export.settings_model.clone();
+		if actionable {
+			render_model.pane_override.hidden_series = crate::plot::spec::Override::Inherit;
+		}
+
 		// Fallback render. Labels drawn from data are checked in their raw
 		// form here; the SVG escapes them afterwards.
-		let svg = render_figure_svg(&export);
+		let svg = render_figure_svg(&export, &render_model);
+		// PRODUCT-0156 §5 kept the ordinal-to-identity mapping on the export;
+		// PRODUCT-0157 §2 is the package that carries it. The desktop widget's
+		// registry decided actionability above and must be the same registry.
+		debug_assert_eq!(svg.series, registry, "one registry per figure");
 		let svg_file = format!("{figure_dir}/figure.svg");
 		for label in svg_text_contents(&svg.svg) {
 			guarded.check(&svg_file, "text", &unescape_xml(&label))?;
 		}
+
+		// PRODUCT-0157 §2: the series table, or the reason there is none.
+		let series_file = format!("{figure_dir}/series.json");
+		let visibility = if identified == 0 {
+			Visibility::Absent {
+				reason: "no-identified-series".to_owned(),
+				observed: None,
+			}
+		} else if !within_bound {
+			Visibility::Absent {
+				reason: "series-limit".to_owned(),
+				observed: Some(identified as u64),
+			}
+		} else {
+			let legend = widget_for(&export, &render_model)
+				.legend_hit_geometry(crate::coordinate::Rect::from_iced_frame(export_bounds));
+			let table = series_table(
+				&export,
+				&svg.series,
+				&desktop_hidden,
+				legend.as_ref(),
+				actionable,
+			)
+			.ok_or_else(|| PublishError::SeriesLabel {
+				figure: figure_name.clone(),
+			})?;
+			for row in &table.series {
+				guarded.check(&series_file, "series.label", &row.label)?;
+				guarded.check(&series_file, "series.field.label", &row.field.label)?;
+				check_value(&guarded, &series_file, &row.value)?;
+			}
+			let bytes = canonical_json(&table).map_err(PublishError::Encoding)?;
+			embedded_series.insert(id.clone(), embed_json(&bytes));
+			if actionable {
+				initially_hidden.insert(id.clone(), table.initially_hidden.clone());
+			}
+			files.insert(series_file, bytes);
+			if actionable {
+				Visibility::Actionable {
+					series: identified as u64,
+				}
+			} else {
+				Visibility::Inert {
+					series: identified as u64,
+					reason: "raster".to_owned(),
+				}
+			}
+		};
+
 		// PRODUCT-0155: the hit projection, or the reason there is none.
-		let outcome = match project_export(&export) {
+		let outcome = match project_export(&export, &render_model) {
 			Some(stages) => project(stages, export.width, export.height),
 			None => ProjectionOutcome::Omitted {
 				reason: "no-regions".to_owned(),
@@ -765,6 +961,7 @@ pub(crate) fn assemble(
 				height: export.layout.height.max(1),
 			},
 			inspection,
+			visibility,
 		});
 		files.insert(
 			definition_file,
@@ -792,7 +989,14 @@ pub(crate) fn assemble(
 	files.insert(INSPECT_FILE.to_owned(), INSPECT_JS.as_bytes().to_vec());
 	files.insert(
 		SHELL_FILE.to_owned(),
-		shell_html(&figures, &files, &embedded).into_bytes(),
+		shell_html(
+			&figures,
+			&files,
+			&embedded,
+			&embedded_series,
+			&initially_hidden,
+		)
+		.into_bytes(),
 	);
 
 	let mut manifest = Manifest {
@@ -967,23 +1171,151 @@ fn setting_value_json(value: &SettingValue) -> serde_json::Value {
 	}
 }
 
-fn render_figure_svg(export: &HostPlotExport) -> crate::plot::export::SvgFigure {
+/// The widget an export renders, projects, and measures through, over the
+/// settings model the caller chose: the desktop's, or PRODUCT-0157 §3's
+/// complete model with the hidden set cleared.
+fn widget_for<'a>(
+	export: &'a HostPlotExport,
+	settings_model: &crate::plot::theme::PlotSettings,
+) -> PlotWidget<'a> {
+	PlotWidget::new(
+		export.kernel.as_ref(),
+		export.title.clone(),
+		20.0,
+		settings_model.clone(),
+		export.render_revision,
+		export.resize_render_suspended,
+		PlotRenderLayer::Full,
+	)
+}
+
+fn render_figure_svg(
+	export: &HostPlotExport,
+	settings_model: &crate::plot::theme::PlotSettings,
+) -> crate::plot::export::SvgFigure {
 	let bounds = iced::Rectangle {
 		x: 0.0,
 		y: 0.0,
 		width: export.width,
 		height: export.height,
 	};
-	let widget = PlotWidget::new(
-		export.kernel.as_ref(),
-		export.title.clone(),
-		20.0,
-		export.settings_model.clone(),
-		export.render_revision,
-		export.resize_render_suspended,
-		PlotRenderLayer::Full,
-	);
-	crate::plot::export::render_svg(&widget, bounds)
+	crate::plot::export::render_svg(&widget_for(export, settings_model), bounds)
+}
+
+/// PRODUCT-0157 §2: the series table. The registry is the authority for
+/// ordinals and order; labels and field metadata come from preparation and
+/// are joined by exact identity equality. Returns none when a registry
+/// identity has no prepared label, which guardrail 3 makes a refusal.
+fn series_table(
+	export: &HostPlotExport,
+	registry: &crate::plot::series::SeriesRegistry,
+	desktop_hidden: &crate::plot::series::HiddenSeries,
+	legend: Option<&crate::plot::legend::LegendHitGeometry>,
+	actionable: bool,
+) -> Option<SeriesTable> {
+	let labels = export.kernel.series_labels();
+	let mut series = Vec::with_capacity(registry.identities().len());
+	let mut initially_hidden = Vec::new();
+	for (ordinal, identity) in registry.identities().iter().enumerate() {
+		let label = labels.iter().find(|label| label.identity == *identity)?;
+		if desktop_hidden.contains(identity) {
+			initially_hidden.push(ordinal as u32);
+		}
+		series.push(SeriesRow {
+			ordinal: ordinal as u32,
+			label: label.label.clone(),
+			field: SeriesField {
+				label: identity.field.name.as_str().to_owned(),
+				semantic_type: semantic_type_name(identity.field.semantic_type).to_owned(),
+			},
+			value: partition_value_dto(&identity.value, identity.field.semantic_type, &label.label),
+		});
+	}
+	let legend = legend.map(|geometry| LegendTable {
+		x0: f64::from(geometry.bounds.x),
+		y0: f64::from(geometry.bounds.y),
+		x1: f64::from(geometry.bounds.x + geometry.bounds.width),
+		y1: f64::from(geometry.bounds.y + geometry.bounds.height),
+		entries: geometry
+			.entries
+			.iter()
+			.map(|(rectangle, identity)| LegendEntryRect {
+				x0: f64::from(rectangle.x),
+				y0: f64::from(rectangle.y),
+				x1: f64::from(rectangle.x + rectangle.width),
+				y1: f64::from(rectangle.y + rectangle.height),
+				// An inert figure's legend addresses nothing (§5).
+				series: identity
+					.as_ref()
+					.filter(|_| actionable)
+					.and_then(|identity| registry.group(identity))
+					.map(|group| group.ordinal() as u32),
+			})
+			.collect(),
+	});
+	Some(SeriesTable {
+		schema_version: SERIES_SCHEMA_VERSION,
+		viewbox: [f64::from(export.width), f64::from(export.height)],
+		actions: if actionable {
+			SeriesActions::Available
+		} else {
+			SeriesActions::Unavailable {
+				reason: "raster".to_owned(),
+			}
+		},
+		initially_hidden,
+		series,
+		legend,
+	})
+}
+
+/// The partition value as the display-bearing DTO. Nothing exact crosses:
+/// no unit, zone, or scale, only the kind, a number where the kind has one,
+/// and the label preparation formatted as the display.
+fn partition_value_dto(
+	value: &crate::selection::ExactScalar,
+	semantic_type: SemanticType,
+	display: &str,
+) -> HitValue {
+	use crate::selection::ExactScalar;
+	let categorical = |text: String| match semantic_type {
+		SemanticType::Ordinal => HitValue::Ordinal { value: text },
+		_ => HitValue::Nominal { value: text },
+	};
+	match value {
+		ExactScalar::Str(text) => categorical(text.clone()),
+		ExactScalar::Bool(flag) => categorical(flag.to_string()),
+		ExactScalar::Int(int) => HitValue::Quantitative {
+			value: *int as f64,
+			display: display.to_owned(),
+		},
+		ExactScalar::UInt(int) => HitValue::Quantitative {
+			value: *int as f64,
+			display: display.to_owned(),
+		},
+		ExactScalar::Float(float) => HitValue::Quantitative {
+			value: *float,
+			display: display.to_owned(),
+		},
+		ExactScalar::Decimal { mantissa, scale } => HitValue::Quantitative {
+			value: *mantissa as f64 / 10f64.powi(i32::from(*scale)),
+			display: display.to_owned(),
+		},
+		ExactScalar::Date { days } => HitValue::Temporal {
+			value: f64::from(*days),
+			display: display.to_owned(),
+		},
+		ExactScalar::Datetime { ticks, .. } | ExactScalar::Duration { ticks, .. } => {
+			HitValue::Temporal {
+				value: *ticks as f64,
+				display: display.to_owned(),
+			}
+		}
+		ExactScalar::Time { nanos } => HitValue::Temporal {
+			value: *nanos as f64,
+			display: display.to_owned(),
+		},
+	}
 }
 
 /// The text content of every `<text>` element the backend emitted, still
@@ -1190,6 +1522,7 @@ pub(crate) fn project(stages: Vec<ResolutionStage>, width: f32, height: f32) -> 
 						inclusive_max,
 						ordinal: entry.ordinal,
 						hit: index,
+						series: entry.series.map(|group| group.ordinal() as u32),
 					},
 					Err(()) => return omitted("non-finite-geometry", None),
 				},
@@ -1201,6 +1534,7 @@ pub(crate) fn project(stages: Vec<ResolutionStage>, width: f32, height: f32) -> 
 							r,
 							ordinal: entry.ordinal,
 							hit: index,
+							series: entry.series.map(|group| group.ordinal() as u32),
 						},
 						_ => return omitted("non-finite-geometry", None),
 					}
@@ -1254,23 +1588,17 @@ fn rect_region(x0: f32, y0: f32, x1: f32, y1: f32, inclusive_max: bool) -> Resul
 }
 
 /// The widget's projection for an export, in the SVG's `viewBox` space.
-pub(crate) fn project_export(export: &HostPlotExport) -> Option<Vec<ResolutionStage>> {
+pub(crate) fn project_export(
+	export: &HostPlotExport,
+	settings_model: &crate::plot::theme::PlotSettings,
+) -> Option<Vec<ResolutionStage>> {
 	let bounds = iced::Rectangle {
 		x: 0.0,
 		y: 0.0,
 		width: export.width,
 		height: export.height,
 	};
-	let widget = PlotWidget::new(
-		export.kernel.as_ref(),
-		export.title.clone(),
-		20.0,
-		export.settings_model.clone(),
-		export.render_revision,
-		export.resize_render_suspended,
-		PlotRenderLayer::Full,
-	);
-	widget.hit_projection(bounds)
+	widget_for(export, settings_model).hit_projection(bounds)
 }
 
 /// PRODUCT-0155 §6: the embedded form of the canonical bytes — every `<` as
@@ -1313,6 +1641,8 @@ fn shell_html(
 	figures: &[FigureEntry],
 	files: &BTreeMap<String, Vec<u8>>,
 	embedded: &BTreeMap<String, String>,
+	embedded_series: &BTreeMap<String, String>,
+	initially_hidden: &BTreeMap<String, Vec<u32>>,
 ) -> String {
 	let columns = figures
 		.iter()
@@ -1344,6 +1674,11 @@ fn shell_html(
 	html.push_str(".figure { min-width: 0; margin: 0; }\n.figure svg { width: 100%; height: auto; display: block; }\n");
 	html.push_str(".polariton-tooltip { position: fixed; pointer-events: none; background: #f2f2f2; color: #1a1a1a; padding: 4px 8px; border-radius: 3px; font-size: 13px; white-space: pre; z-index: 10; }\n");
 	html.push_str(".polariton-tooltip[hidden] { display: none; }\n");
+	// PRODUCT-0157 §5: hiding is one class on an ordinal-addressed group. A
+	// hidden series draws nothing; its legend sample dims to the desktop's
+	// own quarter opacity. Nothing else in the SVG is touched.
+	html.push_str("g[data-series].polariton-hidden { display: none; }\n");
+	html.push_str("g[data-legend].polariton-hidden { opacity: 0.25; }\n");
 	html.push_str("</style>\n</head>\n<body>\n<main class=\"dashboard\">\n");
 	for figure in figures {
 		let svg = files
@@ -1359,11 +1694,23 @@ fn shell_html(
 			figure.layout.height.max(1),
 			html_escape(&figure.title),
 		));
+		// PRODUCT-0157 §3: the snapshot is applied at emission, so a hidden
+		// series never paints before the script runs. `figure.svg` stays the
+		// complete render; only the inlined copy carries the class.
+		let svg = match initially_hidden.get(&figure.id) {
+			Some(hidden) => snapshot_classes(&svg, hidden),
+			None => svg,
+		};
 		html.push_str(&svg);
 		html.push('\n');
 		if let Some(projection) = embedded.get(&figure.id) {
 			html.push_str("<script type=\"application/json\" class=\"polariton-hits\">");
 			html.push_str(projection);
+			html.push_str("</script>\n");
+		}
+		if let Some(table) = embedded_series.get(&figure.id) {
+			html.push_str("<script type=\"application/json\" class=\"polariton-series\">");
+			html.push_str(table);
 			html.push_str("</script>\n");
 		}
 		html.push_str("</figure>\n");
@@ -1372,6 +1719,22 @@ fn shell_html(
 	html.push_str(INSPECT_JS);
 	html.push_str("</script>\n</body>\n</html>\n");
 	html
+}
+
+/// The inlined SVG with the hidden class on every group an actionable
+/// figure's snapshot hides: the same class the script toggles, on the same
+/// ordinal-addressed groups, and nothing else.
+fn snapshot_classes(svg: &str, hidden: &[u32]) -> String {
+	let mut out = svg.to_owned();
+	for ordinal in hidden {
+		for attribute in ["data-series", "data-legend"] {
+			out = out.replace(
+				&format!("<g {attribute}=\"s{ordinal}\">"),
+				&format!("<g {attribute}=\"s{ordinal}\" class=\"polariton-hidden\">"),
+			);
+		}
+	}
+	out
 }
 
 // ---------------------------------------------------------------------------
@@ -1565,7 +1928,7 @@ pub(crate) struct PublishPrompt {
 
 #[cfg(test)]
 mod tests_support {
-	pub(super) use super::tests::{artifact, fixture, publish, request};
+	pub(super) use super::tests::{artifact, fixture, fixture_with_spec, publish, request};
 }
 
 #[cfg(test)]
@@ -1600,12 +1963,40 @@ mod tests {
 		plot_type: PlotType,
 		ordinal: u32,
 	) -> Option<HostPlotExport> {
+		try_fixture_with_spec(
+			title,
+			artifact,
+			plot_type,
+			ordinal,
+			AuthoredPlotSpec::xy(PlotComposition::single(plot_type), "x", "y"),
+		)
+	}
+
+	/// PRODUCT-0157 fixtures author a series channel; the spec is the caller's.
+	pub(super) fn fixture_with_spec(
+		title: &str,
+		artifact: &Arc<ResultArtifact>,
+		plot_type: PlotType,
+		ordinal: u32,
+		authored_spec: AuthoredPlotSpec,
+	) -> HostPlotExport {
+		try_fixture_with_spec(title, artifact, plot_type, ordinal, authored_spec)
+			.expect("fixture plans")
+	}
+
+	fn try_fixture_with_spec(
+		title: &str,
+		artifact: &Arc<ResultArtifact>,
+		plot_type: PlotType,
+		ordinal: u32,
+		authored_spec: AuthoredPlotSpec,
+	) -> Option<HostPlotExport> {
 		let resolved = plan(PlotRequest {
 			source: PlotSource::Materialized {
 				name: title.to_owned(),
 				data: Arc::clone(artifact),
 			},
-			authored_spec: AuthoredPlotSpec::xy(PlotComposition::single(plot_type), "x", "y"),
+			authored_spec,
 		})
 		.ok()?;
 		let recipe = crate::plot::recipe::PlotRecipe::single(
@@ -2619,7 +3010,13 @@ mod product_0155_tests {
 		let canonical = canonical_json(&projection).expect("canonical");
 		let mut embedded = BTreeMap::new();
 		embedded.insert(id.clone(), embed_json(&canonical));
-		let shell = shell_html(&package.manifest.figures, &package.files, &embedded);
+		let shell = shell_html(
+			&package.manifest.figures,
+			&package.files,
+			&embedded,
+			&BTreeMap::new(),
+			&BTreeMap::new(),
+		);
 
 		let document = parse_shell(&shell);
 		let scripts: Vec<_> = document
@@ -2766,5 +3163,1289 @@ fn check_value(guarded: &Guarded<'_>, file: &str, value: &HitValue) -> Result<()
 			check_value(guarded, file, start)?;
 			check_value(guarded, file, end)
 		}
+	}
+}
+
+/// PRODUCT-0157: the category-visible published dashboard.
+#[cfg(test)]
+mod product_0157_tests {
+	use super::tests_support::*;
+	use super::*;
+	use crate::coordinate::Rect;
+	use crate::plot::common::{PlotKernel, ScatterRenderMode};
+	use crate::plot::composition::PlotComposition;
+	use crate::plot::core::PlotType;
+	use crate::plot::kernels::line::{LinePlotKernel, prepare_line_data};
+	use crate::plot::series::{HiddenSeries, SeriesVisibilityAction};
+	use crate::plot::spec::{AuthoredPlotSpec, LegendPosition, Override, Presence};
+	use crate::plot::theme::PlotSettings;
+	use crate::result_artifact::ResultArtifact;
+	use crate::selection::InputIdentity;
+	use boa_engine::{Context, JsValue, Source};
+	use iced::advanced::mouse::Cursor;
+	use iced::{Point, Rectangle};
+	use std::sync::Arc;
+
+	fn series_artifact(frame: polars::prelude::DataFrame) -> Arc<ResultArtifact> {
+		let artifact = ResultArtifact::from_polars(Arc::new(frame));
+		artifact.bind_input_identity(InputIdentity::mint());
+		artifact
+	}
+
+	fn abc() -> Arc<ResultArtifact> {
+		series_artifact(
+			polars::df!(
+				"series" => ["a", "a", "b", "b", "c", "c"],
+				"x" => [0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+				"y" => [0.0, 0.0, 1.0, 1.0, 2.0, 2.0]
+			)
+			.expect("frame"),
+		)
+	}
+
+	fn colored(title: &str, artifact: &Arc<ResultArtifact>, plot_type: PlotType) -> HostPlotExport {
+		fixture_with_spec(
+			title,
+			artifact,
+			plot_type,
+			0,
+			AuthoredPlotSpec::xy_color(
+				PlotComposition::single(plot_type),
+				"x",
+				"y",
+				Some("series".to_owned()),
+			),
+		)
+	}
+
+	fn hide(export: &mut HostPlotExport, indices: &[usize]) {
+		let ids = export.kernel.series_identities();
+		let mut hidden = HiddenSeries::default();
+		for index in indices {
+			hidden.apply(&SeriesVisibilityAction::Hide(ids[*index].clone()), &ids);
+		}
+		export.settings_model.pane_override.hidden_series = Override::Set(hidden);
+	}
+
+	fn export_bounds(export: &HostPlotExport) -> Rectangle {
+		Rectangle {
+			x: 0.0,
+			y: 0.0,
+			width: export.width,
+			height: export.height,
+		}
+	}
+
+	fn table_of(package: &Package, id: &str) -> SeriesTable {
+		serde_json::from_slice(&package.files[&format!("figures/{id}/series.json")])
+			.expect("series table parses")
+	}
+
+	fn projection_of(package: &Package, id: &str) -> Projection {
+		serde_json::from_slice(&package.files[&format!("figures/{id}/hits.json")])
+			.expect("projection parses")
+	}
+
+	fn hand_export(kernel: Arc<dyn PlotKernel + Send + Sync>) -> HostPlotExport {
+		HostPlotExport {
+			title: "hand".to_owned(),
+			kernel,
+			settings_model: PlotSettings::default(),
+			render_revision: 0,
+			resize_render_suspended: false,
+			width: 320.0,
+			height: 220.0,
+			recipe: None,
+			predicate: Predicate::default(),
+			selection_revision: crate::selection::SelectionRevision::ZERO,
+			displayed_selection_revision: crate::selection::SelectionRevision::ZERO,
+			layout: GridRect {
+				col: 0,
+				row: 0,
+				width: 2,
+				height: 2,
+			},
+			view_name: None,
+			plot_type: None,
+			publication: None,
+			authored_expression: None,
+			document: None,
+		}
+	}
+
+	/// The table the writer would produce for a hand-built export, through the
+	/// same widget, registry, legend geometry, and join.
+	fn hand_table(export: &HostPlotExport, actionable: bool) -> SeriesTable {
+		let widget = widget_for(export, &export.settings_model);
+		let registry = widget.series_registry().clone();
+		let hidden = widget.hidden_series().clone();
+		let legend = widget.legend_hit_geometry(Rect::from_iced_frame(export_bounds(export)));
+		series_table(export, &registry, &hidden, legend.as_ref(), actionable).expect("labelled")
+	}
+
+	/// The shipped asset in the engine, no document, calling one pure function.
+	fn asset_eval(script: &str) -> (Context, JsValue) {
+		let mut context = Context::default();
+		context
+			.eval(Source::from_bytes(INSPECT_JS))
+			.expect("the asset loads without a document");
+		let value = context
+			.eval(Source::from_bytes(script))
+			.expect("the asset function runs");
+		(context, value)
+	}
+
+	fn js_numbers(context: &mut Context, value: &JsValue) -> Vec<u32> {
+		let array = value.as_object().expect("array");
+		let length = array
+			.get(boa_engine::js_string!("length"), context)
+			.expect("length")
+			.to_number(context)
+			.expect("number") as usize;
+		(0..length)
+			.map(|index| {
+				array
+					.get(index as u32, context)
+					.expect("element")
+					.to_number(context)
+					.expect("number") as u32
+			})
+			.collect()
+	}
+
+	fn asset_sequence(table: &SeriesTable, hidden: &[u32], events: &str) -> Vec<u32> {
+		let script = format!(
+			"polaritonLegendSequence(JSON.parse({}), {:?}, {events})",
+			serde_json::to_string(&serde_json::to_string(table).unwrap()).unwrap(),
+			hidden
+		);
+		let (mut context, value) = asset_eval(&script);
+		js_numbers(&mut context, &value)
+	}
+
+	fn asset_resolve(projection: &str, x: f64, y: f64, hidden: &[u32]) -> (i64, u64) {
+		let script = format!(
+			"var __r = polaritonResolve(JSON.parse({}), {x:?}, {y:?}, polaritonHiddenSet({hidden:?})); [__r.index, __r.ops]",
+			serde_json::to_string(projection).unwrap()
+		);
+		let (mut context, value) = asset_eval(&script);
+		let pair = js_numbers(&mut context, &value);
+		let array = value.as_object().unwrap();
+		let index = array
+			.get(0, &mut context)
+			.unwrap()
+			.to_number(&mut context)
+			.unwrap();
+		(index as i64, u64::from(pair[1]))
+	}
+
+	/// Gate 1: two identities that print alike are two rows with two ordinals,
+	/// no exact field anywhere, and labels joined by identity.
+	#[test]
+	fn product_0157_series_table_is_a_handle_not_a_disclosure() {
+		use crate::plot::common::{AxisType, TimeUnit, format_label};
+		use polars::prelude::{Column, DataType};
+		let mut frame = polars::df!("x" => [0.0, 1.0], "y" => [1.0, 2.0]).unwrap();
+		frame
+			.with_column(
+				Column::new("series".into(), [1_i64, 2])
+					.cast(&DataType::Datetime(
+						polars::prelude::TimeUnit::Nanoseconds,
+						None,
+					))
+					.unwrap(),
+			)
+			.unwrap();
+		let mut prepared = prepare_line_data(&frame, "series", "x", "y");
+		for (index, series) in prepared.series.iter_mut().enumerate() {
+			series.name = format_label(
+				(index + 1) as f64,
+				&AxisType::Datetime {
+					unit: TimeUnit::Nanoseconds,
+					zone: None,
+				},
+			);
+		}
+		assert_eq!(prepared.series[0].name, prepared.series[1].name);
+		let export = hand_export(Arc::new(LinePlotKernel::new(Arc::new(prepared))));
+		let table = hand_table(&export, true);
+		assert_eq!(table.series.len(), 2);
+		assert_eq!(table.series[0].ordinal, 0);
+		assert_eq!(table.series[1].ordinal, 1);
+		assert_eq!(table.series[0].label, table.series[1].label);
+		assert_eq!(table.series[0].field.label, "series");
+		// The field keeps the role the desktop minted for the partition channel;
+		// the value keeps its own kind.
+		assert_eq!(table.series[0].field.semantic_type, "nominal");
+		match (&table.series[0].value, &table.series[1].value) {
+			(HitValue::Temporal { value: a, display }, HitValue::Temporal { value: b, .. }) => {
+				assert_ne!(a, b, "distinct ticks");
+				assert_eq!(display, &table.series[0].label);
+			}
+			other => panic!("temporal display DTOs expected: {other:?}"),
+		}
+		let text = String::from_utf8(canonical_json(&table).unwrap()).unwrap();
+		for exact in ["scalar_type", "zone", "scale", "candidate", "ticks", "unit"] {
+			assert!(
+				!text.contains(&format!("\"{exact}\"")),
+				"{exact} crossed: {text}"
+			);
+		}
+		let legend = table.legend.expect("legend");
+		assert_eq!(legend.entries.len(), 2);
+		assert_eq!(legend.entries[0].series, Some(0));
+		assert_eq!(legend.entries[1].series, Some(1));
+
+		// Labels move with their identity, never by position or string.
+		let frame = polars::df!("series" => ["alpha", "alpha", "beta", "beta"], "x" => [0.0, 1.0, 0.0, 1.0], "y" => [0.0, 0.0, 1.0, 1.0]).unwrap();
+		let mut swapped = prepare_line_data(&frame, "series", "x", "y");
+		let first = swapped.series[0].name.clone();
+		swapped.series[0].name = swapped.series[1].name.clone();
+		swapped.series[1].name = first;
+		let plain = hand_table(
+			&hand_export(Arc::new(LinePlotKernel::new(Arc::new(prepare_line_data(
+				&frame, "series", "x", "y",
+			))))),
+			true,
+		);
+		let swapped = hand_table(
+			&hand_export(Arc::new(LinePlotKernel::new(Arc::new(swapped)))),
+			true,
+		);
+		assert_eq!(plain.series[0].label, "alpha");
+		assert_eq!(swapped.series[0].label, "beta");
+		assert_eq!(plain.series[0].value, swapped.series[0].value);
+		assert_eq!(plain.series[0].ordinal, swapped.series[0].ordinal);
+		assert_eq!(plain.legend, swapped.legend);
+
+		// An ambiguous union entry addresses nothing; its identities keep rows.
+		use crate::plot::kernels::multivariate_rows::{
+			MultivariateInputRow, MultivariateRows, MultivariateValueCell,
+		};
+		use crate::plot::kernels::radar::RadarPlotKernel;
+		use crate::plot::spec::MultivariateFields;
+		let fields = MultivariateFields::new(
+			vec!["x".into(), "y".into(), "z".into()],
+			Some("series".into()),
+		);
+		let rows = Arc::new(
+			MultivariateRows::from_rows(
+				&fields,
+				(0..2)
+					.map(|index| MultivariateInputRow {
+						category: Some("same label".into()),
+						values: vec![MultivariateValueCell::Exact(index as f64 + 1.0); 3],
+					})
+					.collect(),
+			)
+			.unwrap(),
+		);
+		let frame = polars::df!("series" => [Some(false), Some(true)]).unwrap();
+		let radar = RadarPlotKernel {
+			prepared_data: rows,
+			row_identities: Vec::new(),
+			category_colors: None,
+		}
+		.with_series_source(&frame, Some("series"));
+		let ambiguous = hand_table(&hand_export(Arc::new(radar)), true);
+		assert_eq!(ambiguous.series.len(), 2);
+		let legend = ambiguous.legend.expect("legend");
+		assert_eq!(legend.entries.len(), 1);
+		assert_eq!(legend.entries[0].series, None);
+	}
+
+	/// Gate 2 and gate 3: byte-identical tables across publishes, and legend
+	/// rectangles equal to the desktop's geometry in gutter and overlay
+	/// placements.
+	#[test]
+	fn product_0157_table_is_deterministic_and_legend_is_the_desktop_geometry() {
+		let artifact = abc();
+		let first = publish(
+			vec![colored("Trend", &artifact, PlotType::Line)],
+			&request(),
+		);
+		let again = publish(
+			vec![colored("Trend", &artifact, PlotType::Line)],
+			&request(),
+		);
+		assert_eq!(
+			first.files["figures/trend/series.json"],
+			again.files["figures/trend/series.json"]
+		);
+		assert_eq!(
+			first.manifest.figures[0].visibility,
+			Visibility::Actionable { series: 3 }
+		);
+		for overlay in [false, true] {
+			let mut export = colored("Trend", &artifact, PlotType::Line);
+			if overlay {
+				export.settings_model.authored_spec.legend =
+					Presence::Show(LegendPosition::new(0.5, 0.5).unwrap());
+			}
+			let desktop = widget_for(&export, &export.settings_model)
+				.legend_hit_geometry(Rect::from_iced_frame(export_bounds(&export)))
+				.expect("legend");
+			let package = publish(vec![export], &request());
+			let table = table_of(&package, "trend");
+			let legend = table.legend.expect("legend");
+			assert_eq!(legend.entries.len(), desktop.entries.len());
+			for (packaged, (rectangle, _)) in legend.entries.iter().zip(&desktop.entries) {
+				assert_eq!(packaged.x0, f64::from(rectangle.x));
+				assert_eq!(packaged.y0, f64::from(rectangle.y));
+				assert_eq!(packaged.x1, f64::from(rectangle.x + rectangle.width));
+				assert_eq!(packaged.y1, f64::from(rectangle.y + rectangle.height));
+			}
+			assert_eq!(legend.x0, f64::from(desktop.bounds.x));
+			assert_eq!(
+				legend.y1,
+				f64::from(desktop.bounds.y + desktop.bounds.height)
+			);
+			assert_eq!(table.viewbox, [320.0, 220.0]);
+		}
+	}
+
+	/// Gate 4: a figure published with a series hidden carries every series'
+	/// marks, swatch group, and regions, and names the hidden ordinal as the
+	/// starting state; nothing else differs from the unhidden publish.
+	#[test]
+	fn product_0157_actionable_figures_publish_complete_with_a_snapshot() {
+		let artifact = abc();
+		let mut hidden = colored("Points", &artifact, PlotType::Scatter);
+		hide(&mut hidden, &[0]);
+		let desktop_model = hidden.settings_model.clone();
+		let hidden = publish(vec![hidden], &request());
+		let shown = publish(
+			vec![colored("Points", &artifact, PlotType::Scatter)],
+			&request(),
+		);
+		let svg = String::from_utf8(hidden.files["figures/points/figure.svg"].clone()).unwrap();
+		assert!(svg.contains("data-series=\"s0\""));
+		assert!(svg.contains("data-legend=\"s0\""));
+		assert_eq!(
+			hidden.files["figures/points/figure.svg"],
+			shown.files["figures/points/figure.svg"]
+		);
+		assert_eq!(
+			hidden.files["figures/points/hits.json"],
+			shown.files["figures/points/hits.json"]
+		);
+		let projection = projection_of(&hidden, "points");
+		assert!(projection.stages[0].regions.iter().any(|region| matches!(
+			region,
+			Region::Circle {
+				series: Some(0),
+				..
+			}
+		)));
+		let table = table_of(&hidden, "points");
+		assert_eq!(table.initially_hidden, vec![0]);
+		assert_eq!(table.actions, SeriesActions::Available);
+		let mut shown_table = table_of(&shown, "points");
+		assert_eq!(shown_table.initially_hidden, Vec::<u32>::new());
+		shown_table.initially_hidden = vec![0];
+		assert_eq!(shown_table, table, "only the snapshot differs");
+		for (name, bytes) in &shown.files {
+			if name.ends_with("series.json") || name == MANIFEST_FILE || name == SHELL_FILE {
+				continue;
+			}
+			assert_eq!(&hidden.files[name], bytes, "{name} differs");
+		}
+		// The starting state is the snapshot, applied before any gesture.
+		assert_eq!(
+			asset_sequence(&table, &table.initially_hidden, "[]"),
+			vec![0]
+		);
+		// The desktop pane's model was cloned, never cleared.
+		assert!(matches!(
+			desktop_model.pane_override.hidden_series,
+			Override::Set(ref set) if !set.is_empty()
+		));
+		let shell = String::from_utf8(hidden.files[SHELL_FILE].clone()).unwrap();
+		assert_eq!(shell.matches("class=\"polariton-series\"").count(), 1);
+		// The snapshot is in the emitted markup, before any script runs; the
+		// packaged SVG stays complete and class-free.
+		assert!(shell.contains("<g data-series=\"s0\" class=\"polariton-hidden\">"));
+		assert!(shell.contains("<g data-legend=\"s0\" class=\"polariton-hidden\">"));
+		assert!(!shell.contains("<g data-series=\"s1\" class="));
+		assert!(!svg.contains("polariton-hidden"));
+		let unhidden = String::from_utf8(shown.files[SHELL_FILE].clone()).unwrap();
+		assert!(!unhidden.contains("class=\"polariton-hidden\""));
+	}
+
+	/// Gate 5: the shipped asset's legend sequence and the desktop's legend
+	/// action produce the same hidden set for every gesture in §4.
+	#[test]
+	fn product_0157_gesture_parity_through_the_shipped_asset() {
+		let artifact = abc();
+		for overlay in [false, true] {
+			let mut export = colored("Trend", &artifact, PlotType::Line);
+			if overlay {
+				export.settings_model.authored_spec.legend =
+					Presence::Show(LegendPosition::new(0.5, 0.5).unwrap());
+			}
+			let widget = widget_for(&export, &export.settings_model);
+			let geometry = widget
+				.legend_hit_geometry(Rect::from_iced_frame(export_bounds(&export)))
+				.expect("legend");
+			let universe = widget.series_registry().identities().to_vec();
+			let registry = widget.series_registry().clone();
+			let centre = |index: usize| {
+				let (rect, _) = &geometry.entries[index];
+				(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+			};
+			let background = (
+				geometry.bounds.x + geometry.bounds.width - 1.0,
+				geometry.bounds.y + 1.0,
+			);
+			drop(widget);
+			let package = publish(vec![export], &request());
+			let table = table_of(&package, "trend");
+			let (ax, ay) = centre(0);
+			let (bx, by) = centre(1);
+			let (cx, cy) = centre(2);
+			let (gx, gy) = background;
+			#[derive(Clone, Copy)]
+			enum Ev {
+				Down(f32, f32, bool),
+				Up(f32, f32),
+				Cancel,
+				Blur,
+				Alt(f32, f32),
+				ShiftCtrl(f32, f32),
+				ShiftMeta(f32, f32),
+			}
+			let sequences: Vec<Vec<Ev>> = vec![
+				vec![Ev::Down(ax, ay, false), Ev::Up(ax, ay)],
+				vec![
+					Ev::Down(ax, ay, false),
+					Ev::Up(ax, ay),
+					Ev::Down(ax, ay, false),
+					Ev::Up(ax, ay),
+				],
+				vec![Ev::Down(bx, by, true)],
+				vec![Ev::Down(bx, by, true), Ev::Down(bx, by, true)],
+				vec![
+					Ev::Down(bx, by, true),
+					Ev::Up(bx, by),
+					Ev::Down(bx, by, false),
+					Ev::Up(bx, by),
+				],
+				vec![Ev::Down(ax, ay, false), Ev::Up(bx, by)],
+				vec![Ev::Down(ax, ay, false), Ev::Cancel, Ev::Up(ax, ay)],
+				vec![Ev::Down(ax, ay, false), Ev::Blur, Ev::Up(ax, ay)],
+				vec![Ev::Down(gx, gy, false), Ev::Up(gx, gy)],
+				vec![Ev::Alt(ax, ay), Ev::Up(ax, ay)],
+				vec![Ev::ShiftCtrl(ax, ay), Ev::Up(ax, ay)],
+				vec![Ev::ShiftMeta(bx, by)],
+				vec![
+					Ev::ShiftCtrl(ax, ay),
+					Ev::Down(ax, ay, false),
+					Ev::Up(ax, ay),
+				],
+				vec![
+					Ev::Down(cx, cy, true),
+					Ev::Down(ax, ay, false),
+					Ev::Up(ax, ay),
+					Ev::Down(bx, by, true),
+				],
+			];
+			for initial in [Vec::new(), vec![0_u32], vec![1, 2]] {
+				for sequence in &sequences {
+					// Desktop: the same presses through legend geometry and the
+					// pane's action algebra.
+					let mut desktop = HiddenSeries::default();
+					for ordinal in &initial {
+						desktop.apply(
+							&SeriesVisibilityAction::Hide(universe[*ordinal as usize].clone()),
+							&universe,
+						);
+					}
+					let mut armed: Option<usize> = None;
+					for event in sequence {
+						match *event {
+							Ev::Down(x, y, shift) => {
+								armed = None;
+								let Some((_, identity)) = geometry.entry_at(Point::new(x, y))
+								else {
+									continue;
+								};
+								let Some(identity) = identity else { continue };
+								if shift {
+									let action = desktop.legend_action(identity, true, &universe);
+									desktop.apply(&action, &universe);
+								} else {
+									armed = geometry
+										.entries
+										.iter()
+										.position(|(rect, _)| rect.contains(Point::new(x, y)));
+								}
+							}
+							Ev::Up(x, y) => {
+								let Some(pressed) = armed.take() else {
+									continue;
+								};
+								let released = geometry
+									.entries
+									.iter()
+									.position(|(rect, _)| rect.contains(Point::new(x, y)));
+								if released != Some(pressed) {
+									continue;
+								}
+								let identity = geometry.entries[pressed].1.as_ref().unwrap();
+								let action = desktop.legend_action(identity, false, &universe);
+								desktop.apply(&action, &universe);
+							}
+							Ev::Cancel
+							| Ev::Blur
+							| Ev::Alt(..)
+							| Ev::ShiftCtrl(..)
+							| Ev::ShiftMeta(..) => armed = None,
+						}
+					}
+					let mut expected: Vec<u32> = universe
+						.iter()
+						.filter(|identity| desktop.contains(identity))
+						.map(|identity| registry.group(identity).unwrap().ordinal() as u32)
+						.collect();
+					expected.sort_unstable();
+					// Asset: the pure sequence over the packaged table.
+					let events: Vec<String> = sequence
+						.iter()
+						.map(|event| match *event {
+							Ev::Down(x, y, shift) => {
+								format!("{{type:\"down\",x:{x:?},y:{y:?},shift:{shift}}}")
+							}
+							Ev::Up(x, y) => format!("{{type:\"up\",x:{x:?},y:{y:?},shift:false}}"),
+							Ev::Cancel => "{type:\"cancel\"}".to_owned(),
+							Ev::Blur => "{type:\"blur\"}".to_owned(),
+							Ev::Alt(x, y) => {
+								format!("{{type:\"down\",x:{x:?},y:{y:?},shift:false,alt:true}}")
+							}
+							Ev::ShiftCtrl(x, y) => {
+								format!("{{type:\"down\",x:{x:?},y:{y:?},shift:true,ctrl:true}}")
+							}
+							Ev::ShiftMeta(x, y) => {
+								format!("{{type:\"down\",x:{x:?},y:{y:?},shift:true,meta:true}}")
+							}
+						})
+						.collect();
+					let actual =
+						asset_sequence(&table, &initial, &format!("[{}]", events.join(",")));
+					assert_eq!(actual, expected, "overlay {overlay}, initial {initial:?}");
+				}
+			}
+			// Unknown and repeated actions are no-ops in the asset's algebra.
+			let same = format!(
+				"var t = JSON.parse({}); var h = [0]; var u = polaritonUniverse(t); [polaritonApplyVisibility(h, {{kind:\"hide\", ordinal: 0}}, u) === h, polaritonApplyVisibility(h, {{kind:\"hide\", ordinal: 9}}, u) === h, polaritonApplyVisibility(h, {{kind:\"isolate\", ordinal: 9}}, u) === h, polaritonApplyVisibility([], {{kind:\"restore\", ordinal: 0}}, u).length]",
+				serde_json::to_string(&serde_json::to_string(&table).unwrap()).unwrap()
+			);
+			let (mut context, value) = asset_eval(&same);
+			let array = value.as_object().unwrap();
+			for index in 0..3 {
+				assert!(
+					array.get(index, &mut context).unwrap().to_boolean(),
+					"no-op {index} returns the same array"
+				);
+			}
+		}
+	}
+
+	/// Gate 6: with a series hidden the asset answers what the desktop answers
+	/// under the same hidden set, including none; with nothing hidden the
+	/// answers are PRODUCT-0155's; the operation count is under the bound.
+	#[test]
+	fn product_0157_hits_obey_visibility_through_the_shipped_asset() {
+		let artifact = series_artifact(
+			polars::df!(
+				"series" => ["a", "a", "b", "b", "b", "c"],
+				"x" => [1.0, 3.0, 3.0, 5.0, 7.0, 3.0],
+				"y" => [2.0, 2.0, 2.0, 6.0, 1.0, 2.0]
+			)
+			.expect("frame"),
+		);
+		let complete = colored("Points", &artifact, PlotType::Scatter);
+		let stages = project_export(&complete, &complete.settings_model).expect("regions");
+		let ProjectionOutcome::Projected(projection) =
+			project(stages, complete.width, complete.height)
+		else {
+			panic!("projected")
+		};
+		let json = String::from_utf8(canonical_json(&projection).unwrap()).unwrap();
+		let mut vectors = Vec::new();
+		for stage in &projection.stages {
+			for region in &stage.regions {
+				if let Region::Circle { cx, cy, r, .. } = region {
+					let (cx, cy) = (cx + stage.origin[0], cy + stage.origin[1]);
+					for delta in [-0.02, 0.0, 0.02] {
+						vectors.push((cx + r + delta, cy));
+						vectors.push((cx, cy - r + delta));
+					}
+					vectors.push((cx, cy));
+				}
+			}
+		}
+		let step = 17;
+		for i in 0..(1000 - vectors.len()).max(0) {
+			let x = ((i * step) % 320) as f64 + 0.5;
+			let y = ((i * step * 7) % 220) as f64 + 0.5;
+			vectors.push((x, y));
+		}
+		assert!(vectors.len() >= 1000);
+		let bounds = export_bounds(&complete);
+		for hidden_indices in [vec![], vec![0], vec![0, 2]] {
+			let mut desktop_export = colored("Points", &artifact, PlotType::Scatter);
+			hide(&mut desktop_export, &hidden_indices);
+			let widget = widget_for(&desktop_export, &desktop_export.settings_model);
+			let hidden: Vec<u32> = hidden_indices.iter().map(|i| *i as u32).collect();
+			let mut answered = 0;
+			for (x, y) in &vectors {
+				let (index, ops) = asset_resolve(&json, *x, *y, &hidden);
+				assert!(ops <= 98_304, "{ops} operations");
+				let asset = (index >= 0).then(|| projection.hits[index as usize].clone());
+				let desktop = widget
+					.structured_hit_at(bounds, Cursor::Available(Point::new(*x as f32, *y as f32)))
+					.map(|hit| hit_dto(&hit));
+				if asset.is_some() {
+					answered += 1;
+				}
+				assert_eq!(asset, desktop, "hidden {hidden:?} at ({x}, {y})");
+			}
+			assert!(answered > 0, "positive control: something is hit");
+		}
+		// Nothing hidden: the resolver ignores the series field entirely.
+		let (index, ops) = asset_resolve(&json, 1.0, 1.0, &[]);
+		let (again, ops_again) = asset_resolve(&json, 1.0, 1.0, &[]);
+		assert_eq!((index, ops), (again, ops_again));
+	}
+
+	/// Gate 7: the shell declares exactly the two rules; the legend group wraps
+	/// the sample of every actionable entry and no label text.
+	#[test]
+	fn product_0157_ink_changes_by_class_alone() {
+		let artifact = abc();
+		let package = publish(
+			vec![colored("Trend", &artifact, PlotType::Line)],
+			&request(),
+		);
+		let shell = String::from_utf8(package.files[SHELL_FILE].clone()).unwrap();
+		let style = shell
+			.split("<style>")
+			.nth(1)
+			.unwrap()
+			.split("</style>")
+			.next()
+			.unwrap();
+		assert_eq!(style.matches("polariton-hidden").count(), 2);
+		assert!(shell.contains("g[data-series].polariton-hidden { display: none; }"));
+		assert!(shell.contains("g[data-legend].polariton-hidden { opacity: 0.25; }"));
+		let svg = String::from_utf8(package.files["figures/trend/figure.svg"].clone()).unwrap();
+		let table = table_of(&package, "trend");
+		let actionable = table
+			.legend
+			.as_ref()
+			.unwrap()
+			.entries
+			.iter()
+			.filter(|entry| entry.series.is_some())
+			.count();
+		assert_eq!(actionable, 3);
+		assert_eq!(svg.matches("<g data-legend=\"s").count(), 3);
+		for ordinal in 0..3 {
+			let open = format!("<g data-legend=\"s{ordinal}\">");
+			let start = svg.find(&open).expect("legend group");
+			let body = &svg[start + open.len()..];
+			let end = body.find("</g>").expect("closed");
+			let group = &body[..end];
+			assert!(
+				!group.contains("<text"),
+				"label text stays outside: {group}"
+			);
+			assert!(!group.contains("data-"), "only the ordinal names the group");
+		}
+	}
+
+	/// Gate 8: coverage decides. A rasterized scatter is inert with its table
+	/// present; a mixed layered figure sharing an identity is inert as a whole
+	/// and keeps the desktop's hiding in its ink and projection; no identified
+	/// series and the series bound publish with `absent`, the over-bound
+	/// figure still hiding what the desktop hid.
+	#[test]
+	fn product_0157_coverage_decides_and_mixed_figures_are_inert() {
+		let artifact = abc();
+		let mut raster = colored("Dense", &artifact, PlotType::Scatter);
+		raster.settings_model.library_defaults.scatter_render_mode = ScatterRenderMode::Rasterized;
+		hide(&mut raster, &[0]);
+		let package = publish(vec![raster], &request());
+		assert_eq!(
+			package.manifest.figures[0].visibility,
+			Visibility::Inert {
+				series: 3,
+				reason: "raster".to_owned()
+			}
+		);
+		let table = table_of(&package, "dense");
+		assert_eq!(
+			table.actions,
+			SeriesActions::Unavailable {
+				reason: "raster".to_owned()
+			}
+		);
+		assert_eq!(table.initially_hidden, vec![0]);
+		assert!(
+			table
+				.legend
+				.as_ref()
+				.unwrap()
+				.entries
+				.iter()
+				.all(|entry| entry.series.is_none())
+		);
+		let svg = String::from_utf8(package.files["figures/dense/figure.svg"].clone()).unwrap();
+		assert_eq!(svg.matches("<image ").count(), 1);
+		assert!(!svg.contains("data-series="));
+		// An inert snapshot is the desktop's own ink: no class is emitted, so
+		// its already-dimmed swatch is never dimmed again.
+		let shell = String::from_utf8(package.files[SHELL_FILE].clone()).unwrap();
+		assert!(!shell.contains("class=\"polariton-hidden\""));
+		assert!(
+			matches!(
+				package.manifest.figures[0].inspection,
+				Inspection::Projected { .. }
+			),
+			"dense: {:?}",
+			package.manifest.figures[0].inspection
+		);
+		let projection = projection_of(&package, "dense");
+		assert!(projection.stages[0].regions.iter().all(|region| !matches!(
+			region,
+			Region::Circle {
+				series: Some(0),
+				..
+			}
+		)));
+		assert!(projection.stages[0].regions.iter().any(|region| matches!(
+			region,
+			Region::Circle {
+				series: Some(1),
+				..
+			}
+		)));
+		assert_eq!(
+			asset_sequence(&table, &[], "[{type:\"down\",x:0,y:0,shift:true}]"),
+			Vec::<u32>::new()
+		);
+
+		// Mixed: grouped line marks and a rasterized scatter share identity "a".
+		use crate::plot::common::AxisType;
+		use crate::plot::kernels::{
+			layered::{LayerRenderer, LayeredPlotKernel},
+			scatter::prepare_scatter_data,
+		};
+		use crate::plot::spec::{LayerSettings, NonEmpty, ResolvedLayout};
+		let frame = polars::df!("series" => ["a", "a", "b", "b"], "x" => [0.0, 1.0, 0.0, 1.0], "y" => [0.0, 0.0, 1.0, 1.0]).unwrap();
+		let mut layers = NonEmpty::new(LayerRenderer::line(
+			Arc::new(prepare_line_data(&frame, "series", "x", "y")),
+			LayerSettings::default(),
+		));
+		layers.push(LayerRenderer::scatter(
+			Arc::new(prepare_scatter_data(&frame, "series", "x", "y")),
+			LayerSettings::default(),
+		));
+		let kernel = LayeredPlotKernel::new(
+			layers,
+			ResolvedLayout {
+				viewport_width: 320,
+				viewport_height: 220,
+				x_range: (0.0, 1.0),
+				y_range: (0.0, 1.0),
+			},
+			AxisType::Linear,
+			AxisType::Linear,
+			None,
+			None,
+			"x".to_owned(),
+			"y".to_owned(),
+		);
+		let mut mixed = hand_export(Arc::new(kernel));
+		let bounds = export_bounds(&mixed);
+		assert!(widget_for(&mixed, &mixed.settings_model).series_covered(bounds));
+		mixed.settings_model.library_defaults.scatter_render_mode = ScatterRenderMode::Rasterized;
+		assert!(!widget_for(&mixed, &mixed.settings_model).series_covered(bounds));
+		hide(&mut mixed, &[0]);
+		let table = hand_table(&mixed, false);
+		assert_eq!(table.series.len(), 2, "one row per identity across layers");
+		assert!(
+			table
+				.legend
+				.unwrap()
+				.entries
+				.iter()
+				.all(|entry| entry.series.is_none())
+		);
+		let svg = render_figure_svg(&mixed, &mixed.settings_model).svg;
+		assert!(
+			!svg.contains("data-series=\"s0\""),
+			"the hidden line marks stay absent"
+		);
+		assert!(svg.contains("data-series=\"s1\""));
+
+		// No identified series: absent, no table.
+		let plain = publish(
+			vec![fixture("Points", &artifact, PlotType::Scatter, 0)],
+			&request(),
+		);
+		assert_eq!(
+			plain.manifest.figures[0].visibility,
+			Visibility::Absent {
+				reason: "no-identified-series".to_owned(),
+				observed: None
+			}
+		);
+		assert!(!plain.files.contains_key("figures/points/series.json"));
+
+		// Over the bound, with a series hidden on the desktop: absent, no
+		// table, and the hidden series stays out of the ink and the regions.
+		let n = SERIES_BOUND + 1;
+		let many = series_artifact(
+			polars::df!(
+				"series" => (0..n).map(|i| format!("s{i}")).collect::<Vec<_>>(),
+				"x" => (0..n).map(|i| (i % 64) as f64).collect::<Vec<_>>(),
+				"y" => (0..n).map(|i| (i / 64) as f64).collect::<Vec<_>>()
+			)
+			.expect("frame"),
+		);
+		// The planner authors a colour channel over a bounded palette; the
+		// kernel is prepared directly so the registry holds every identity.
+		let mut over = fixture("Many", &many, PlotType::Scatter, 0);
+		over.kernel = Arc::new(crate::plot::kernels::scatter::ScatterPlotKernel::new(
+			Arc::new(prepare_scatter_data(
+				&many.projection().unwrap(),
+				"series",
+				"x",
+				"y",
+			)),
+		));
+		hide(&mut over, &[0]);
+		let package = publish(vec![over], &request());
+		assert_eq!(
+			package.manifest.figures[0].visibility,
+			Visibility::Absent {
+				reason: "series-limit".to_owned(),
+				observed: Some(n as u64)
+			}
+		);
+		assert!(!package.files.contains_key("figures/many/series.json"));
+		let svg = String::from_utf8(package.files["figures/many/figure.svg"].clone()).unwrap();
+		assert!(!svg.contains("data-series=\"s0\""));
+		assert!(svg.contains("data-series=\"s1\""));
+		// The entry stays, drawn in the desktop's hidden state (PRODUCT-0156 §3).
+		assert!(svg.contains("data-legend=\"s0\""));
+		// Its projection is over PRODUCT-0155's byte bound on its own, so the
+		// regions are checked at the seam the writer uses for an inert figure:
+		// the desktop's own settings, hidden set applied.
+		let mut over = fixture("Many", &many, PlotType::Scatter, 0);
+		over.kernel = Arc::new(crate::plot::kernels::scatter::ScatterPlotKernel::new(
+			Arc::new(prepare_scatter_data(
+				&many.projection().unwrap(),
+				"series",
+				"x",
+				"y",
+			)),
+		));
+		hide(&mut over, &[0]);
+		let stages = project_export(&over, &over.settings_model).expect("regions");
+		let regions: usize = stages.iter().map(|stage| stage.regions.len()).sum();
+		assert_eq!(regions, n - 1, "the hidden series' region is absent");
+		assert!(
+			stages[0]
+				.regions
+				.iter()
+				.all(|entry| { entry.series.map(|group| group.ordinal()) != Some(0) })
+		);
+	}
+}
+
+/// PRODUCT-0157 review findings: the installed handlers and the worst-case
+/// resolver, exercised in the engine rather than inferred from the pure
+/// functions.
+#[cfg(test)]
+mod product_0157_lifecycle_tests {
+	use super::tests_support::*;
+	use super::*;
+	use crate::plot::common::ScatterRenderMode;
+	use crate::plot::composition::PlotComposition;
+	use crate::plot::core::PlotType;
+	use crate::plot::series::{HiddenSeries, SeriesVisibilityAction};
+	use crate::plot::spec::{AuthoredPlotSpec, Override};
+	use crate::result_artifact::ResultArtifact;
+	use crate::selection::InputIdentity;
+	use boa_engine::{Context, Source};
+	use std::sync::Arc;
+
+	/// A document stub with exactly the surface the installer touches:
+	/// element creation, one figure per package figure, the SVG's bounding
+	/// rectangle equal to its `viewBox` so pointer mapping is the identity,
+	/// ordinal-addressed groups with a class list, recorded listeners, and
+	/// pointer capture. Nothing here computes; it records.
+	const DOM_STUB: &str = r#"
+var __log = [];
+function __El(tag) {
+	var self = this;
+	this.tag = tag; this.classes = {}; this.listeners = {}; this.hidden = false;
+	this.style = {}; this.textContent = ""; this.className = "";
+	this.classList = {
+		add: function (c) { self.classes[c] = true; },
+		remove: function (c) { delete self.classes[c]; },
+		contains: function (c) { return self.classes[c] === true; }
+	};
+	this.addEventListener = function (type, fn) {
+		if (!self.listeners[type]) { self.listeners[type] = []; }
+		self.listeners[type].push(fn);
+	};
+	this.dispatch = function (type, ev) {
+		var fns = self.listeners[type] || [];
+		for (var i = 0; i in fns; i++) { fns[i](ev); }
+	};
+}
+function __Figure(hits, series, width, height) {
+	var self = this;
+	this.svg = new __El("svg");
+	this.svg.groups = {};
+	this.svg.captured = [];
+	this.svg.viewBox = { baseVal: { width: width, height: height } };
+	this.svg.getBoundingClientRect = function () { return { left: 0, top: 0, width: width, height: height }; };
+	this.svg.setPointerCapture = function (id) { self.svg.captured.push(id); };
+	this.svg.querySelectorAll = function (selector) {
+		var out = [];
+		var parts = selector.split(", ");
+		for (var p = 0; p in parts; p++) {
+			var key = parts[p];
+			if (!self.svg.groups[key]) { self.svg.groups[key] = new __El("g"); }
+			out.push(self.svg.groups[key]);
+		}
+		return out;
+	};
+	this.querySelector = function (selector) {
+		if (selector === "svg") { return self.svg; }
+		if (selector === "script.polariton-hits") { return hits === null ? null : { textContent: hits }; }
+		if (selector === "script.polariton-series") { return series === null ? null : { textContent: series }; }
+		return null;
+	};
+	this.groupHidden = function (attribute, ordinal) {
+		var g = self.svg.groups["[" + attribute + "=\"s" + ordinal + "\"]"];
+		if (!g) { return null; }
+		return g.classes["polariton-hidden"] === true;
+	};
+}
+var __figures = [];
+var window = new __El("window");
+var document = {
+	readyState: "complete",
+	body: new __El("body"),
+	createElement: function (tag) { return new __El(tag); },
+	addEventListener: function () {},
+	querySelectorAll: function (selector) { return selector === "figure.figure" ? __figures : []; }
+};
+document.body.appendChild = function () {};
+function __pointer(x, y, mods) {
+	mods = mods || {};
+	return {
+		button: mods.button === undefined ? 0 : mods.button,
+		clientX: x, clientY: y, pointerId: 7,
+		shiftKey: !!mods.shift, altKey: !!mods.alt, ctrlKey: !!mods.ctrl, metaKey: !!mods.meta,
+		preventDefault: function () {}
+	};
+}
+"#;
+
+	fn series_artifact(frame: polars::prelude::DataFrame) -> Arc<ResultArtifact> {
+		let artifact = ResultArtifact::from_polars(Arc::new(frame));
+		artifact.bind_input_identity(InputIdentity::mint());
+		artifact
+	}
+
+	fn abc() -> Arc<ResultArtifact> {
+		series_artifact(
+			polars::df!(
+				"series" => ["a", "a", "b", "b", "c", "c"],
+				"x" => [0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+				"y" => [0.0, 0.0, 1.0, 1.0, 2.0, 2.0]
+			)
+			.expect("frame"),
+		)
+	}
+
+	fn colored(title: &str, artifact: &Arc<ResultArtifact>) -> HostPlotExport {
+		fixture_with_spec(
+			title,
+			artifact,
+			PlotType::Scatter,
+			0,
+			AuthoredPlotSpec::xy_color(
+				PlotComposition::single(PlotType::Scatter),
+				"x",
+				"y",
+				Some("series".to_owned()),
+			),
+		)
+	}
+
+	fn js_string(text: &str) -> String {
+		serde_json::to_string(text).unwrap()
+	}
+
+	/// Install the asset over stub figures, then run `script` and return its
+	/// value as JSON text.
+	fn installed(figures: &[(Option<&[u8]>, Option<&[u8]>, f32, f32)], script: &str) -> String {
+		let mut context = Context::default();
+		context
+			.eval(Source::from_bytes(DOM_STUB))
+			.expect("the stub loads");
+		for (hits, series, width, height) in figures {
+			let hits = hits.map_or("null".to_owned(), |bytes| {
+				js_string(std::str::from_utf8(bytes).unwrap())
+			});
+			let series = series.map_or("null".to_owned(), |bytes| {
+				js_string(std::str::from_utf8(bytes).unwrap())
+			});
+			context
+				.eval(Source::from_bytes(&format!(
+					"__figures.push(new __Figure({hits}, {series}, {width:?}, {height:?}));"
+				)))
+				.expect("figure stub");
+		}
+		context
+			.eval(Source::from_bytes(INSPECT_JS))
+			.expect("the asset installs over the stub");
+		let value = context
+			.eval(Source::from_bytes(&format!("JSON.stringify({script})")))
+			.expect("the probe runs");
+		value
+			.to_string(&mut context)
+			.expect("string")
+			.to_std_string_escaped()
+	}
+
+	/// Finding 1, 3, 4, and 5 through the installed handlers: the snapshot
+	/// is applied on install for an actionable figure and never for an inert
+	/// one; a release outside the SVG disarms the press; forbidden modifiers
+	/// with shift do nothing; the ordinary toggle and isolate still work.
+	#[test]
+	fn product_0157_installed_handlers_own_the_sequence_through_a_document_stub() {
+		let artifact = abc();
+		let mut export = colored("Points", &artifact);
+		let ids = export.kernel.series_identities();
+		let mut hidden = HiddenSeries::default();
+		hidden.apply(&SeriesVisibilityAction::Hide(ids[0].clone()), &ids);
+		export.settings_model.pane_override.hidden_series = Override::Set(hidden);
+		let package = publish(vec![export], &request());
+		let table: SeriesTable =
+			serde_json::from_slice(&package.files["figures/points/series.json"]).unwrap();
+		let legend = table.legend.as_ref().unwrap();
+		let centre = |index: usize| {
+			let e = &legend.entries[index];
+			((e.x0 + e.x1) / 2.0, (e.y0 + e.y1) / 2.0)
+		};
+		let (ax, ay) = centre(0);
+		let (bx, by) = centre(1);
+		let outside_legend = (1.0, 1.0);
+		assert!(
+			legend.x0 > outside_legend.0 || legend.y0 > outside_legend.1,
+			"the probe point is outside the legend"
+		);
+		let figures = [(
+			Some(package.files["figures/points/hits.json"].as_slice()),
+			Some(package.files["figures/points/series.json"].as_slice()),
+			320.0_f32,
+			220.0_f32,
+		)];
+		let probe = format!(
+			r#"(function () {{
+	var f = __figures[0]; var svg = f.svg; var steps = {{}};
+	steps.install = [f.groupHidden("data-series", 0), f.groupHidden("data-legend", 0), f.groupHidden("data-series", 1)];
+	steps.listeners = Object.keys(svg.listeners).sort();
+	svg.dispatch("pointerdown", __pointer({ax:?}, {ay:?}));
+	svg.dispatch("pointerup", __pointer({ax:?}, {ay:?}));
+	steps.toggle = [f.groupHidden("data-series", 0), f.groupHidden("data-legend", 0), svg.captured.length];
+	svg.dispatch("pointerdown", __pointer({ax:?}, {ay:?}));
+	window.dispatch("pointerup", {{}});
+	svg.dispatch("pointerdown", __pointer({ox:?}, {oy:?}));
+	svg.dispatch("pointerup", __pointer({ax:?}, {ay:?}));
+	steps.staleRelease = [f.groupHidden("data-series", 0)];
+	svg.dispatch("pointerdown", __pointer({bx:?}, {by:?}, {{shift: true, ctrl: true}}));
+	svg.dispatch("pointerup", __pointer({bx:?}, {by:?}));
+	steps.shiftCtrl = [f.groupHidden("data-series", 0), f.groupHidden("data-series", 1), f.groupHidden("data-series", 2)];
+	svg.dispatch("pointerdown", __pointer({bx:?}, {by:?}, {{shift: true}}));
+	svg.dispatch("pointerup", __pointer({bx:?}, {by:?}));
+	steps.isolate = [f.groupHidden("data-series", 0), f.groupHidden("data-series", 1), f.groupHidden("data-series", 2), f.groupHidden("data-legend", 2)];
+	svg.dispatch("pointerdown", __pointer({ax:?}, {ay:?}));
+	svg.dispatch("pointercancel", {{}});
+	svg.dispatch("pointerup", __pointer({ax:?}, {ay:?}));
+	steps.cancelled = [f.groupHidden("data-series", 0)];
+	svg.dispatch("pointerdown", __pointer({ax:?}, {ay:?}));
+	window.dispatch("blur", {{}});
+	svg.dispatch("pointerup", __pointer({ax:?}, {ay:?}));
+	steps.blurred = [f.groupHidden("data-series", 0)];
+	return steps;
+}})()"#,
+			ox = outside_legend.0,
+			oy = outside_legend.1,
+		);
+		let steps: serde_json::Value = serde_json::from_str(&installed(&figures, &probe)).unwrap();
+		assert_eq!(steps["install"], serde_json::json!([true, true, false]));
+		assert_eq!(
+			steps["listeners"],
+			serde_json::json!([
+				"lostpointercapture",
+				"pointercancel",
+				"pointerdown",
+				"pointerleave",
+				"pointermove",
+				"pointerup"
+			])
+		);
+		assert_eq!(
+			steps["toggle"],
+			serde_json::json!([false, false, 1]),
+			"a bare toggle shows s0"
+		);
+		assert_eq!(
+			steps["staleRelease"],
+			serde_json::json!([false]),
+			"a release outside the SVG disarms; the later release over the entry toggles nothing"
+		);
+		assert_eq!(steps["shiftCtrl"], serde_json::json!([false, false, false]));
+		assert_eq!(
+			steps["isolate"],
+			serde_json::json!([true, false, true, true])
+		);
+		assert_eq!(steps["cancelled"], serde_json::json!([true]));
+		assert_eq!(steps["blurred"], serde_json::json!([true]));
+
+		// An inert figure: no class on install, no gesture listeners.
+		let mut raster = colored("Dense", &artifact);
+		raster.settings_model.library_defaults.scatter_render_mode = ScatterRenderMode::Rasterized;
+		let ids = raster.kernel.series_identities();
+		let mut hidden = HiddenSeries::default();
+		hidden.apply(&SeriesVisibilityAction::Hide(ids[0].clone()), &ids);
+		raster.settings_model.pane_override.hidden_series = Override::Set(hidden);
+		let package = publish(vec![raster], &request());
+		let figures = [(
+			package
+				.files
+				.get("figures/dense/hits.json")
+				.map(Vec::as_slice),
+			Some(package.files["figures/dense/series.json"].as_slice()),
+			320.0_f32,
+			220.0_f32,
+		)];
+		let probe = r#"(function () {
+	var f = __figures[0];
+	return [Object.keys(f.svg.groups).length, Object.keys(f.svg.listeners).sort()];
+})()"#;
+		let inert: serde_json::Value = serde_json::from_str(&installed(&figures, probe)).unwrap();
+		assert_eq!(
+			inert,
+			serde_json::json!([0, ["pointerleave", "pointermove"]]),
+			"no group is touched and no gesture is installed"
+		);
+	}
+
+	/// Finding 2: the resolver at the bound with the maximum hidden set does
+	/// the counted work and nothing proportional to the hidden count. The
+	/// projection is 32,768 circles cycling through 4,096 series ordinals;
+	/// 4,095 of them hidden leaves one series answering.
+	#[test]
+	fn product_0157_resolver_at_the_bound_with_the_maximum_hidden_set() {
+		let mut regions = Vec::with_capacity(PROJECTION_REGION_BOUND);
+		for index in 0..PROJECTION_REGION_BOUND {
+			regions.push(Region::Circle {
+				cx: (index % 256) as f64 * 4.0 + 2.0,
+				cy: (index / 256) as f64 * 4.0 + 2.0,
+				r: 1.5,
+				ordinal: index as u32,
+				hit: index % 2,
+				series: Some((index % SERIES_BOUND) as u32),
+			});
+		}
+		let projection = Projection {
+			schema_version: PROJECTION_SCHEMA_VERSION,
+			viewbox: [1024.0, 512.0],
+			stages: vec![Stage {
+				policy: "nearest-centre-within".to_owned(),
+				tie: "later-wins".to_owned(),
+				within: None,
+				origin: [0.0, 0.0],
+				regions,
+			}],
+			hits: vec![
+				Hit {
+					mark_family: "scatter".to_owned(),
+					dimensionality: "point".to_owned(),
+					fields: Vec::new(),
+					facet: None,
+					presentation: "even".to_owned(),
+				},
+				Hit {
+					mark_family: "scatter".to_owned(),
+					dimensionality: "point".to_owned(),
+					fields: Vec::new(),
+					facet: None,
+					presentation: "odd".to_owned(),
+				},
+			],
+		};
+		let json = String::from_utf8(canonical_json(&projection).unwrap()).unwrap();
+		let hidden: Vec<u32> = (0..(SERIES_BOUND as u32 - 1)).collect();
+		let mut context = Context::default();
+		context.eval(Source::from_bytes(INSPECT_JS)).unwrap();
+		context
+			.eval(Source::from_bytes(&format!(
+				"var __p = JSON.parse({}); var __h = polaritonHiddenSet({hidden:?});",
+				serde_json::to_string(&json).unwrap()
+			)))
+			.unwrap();
+		// The one shown series is ordinal 4095: region 4095 sits at column 255,
+		// row 15. A pointer there answers it; a pointer on a hidden region's
+		// centre answers nothing; both count exactly the per-region budget.
+		let shown_centre = (
+			(4095 % 256) as f64 * 4.0 + 2.0,
+			(4095 / 256) as f64 * 4.0 + 2.0,
+		);
+		let hidden_centre = (2.0, 2.0);
+		for ((x, y), expected) in [(shown_centre, 1_i64), (hidden_centre, -1)] {
+			let value = context
+				.eval(Source::from_bytes(&format!(
+					"var __r = polaritonResolve(__p, {x:?}, {y:?}, __h); [__r.index, __r.ops]"
+				)))
+				.unwrap();
+			let array = value.as_object().unwrap();
+			let index = array
+				.get(0, &mut context)
+				.unwrap()
+				.to_number(&mut context)
+				.unwrap() as i64;
+			let ops = array
+				.get(1, &mut context)
+				.unwrap()
+				.to_number(&mut context)
+				.unwrap() as u64;
+			assert_eq!(index, expected, "at ({x}, {y})");
+			assert!(ops <= 98_304, "{ops} operations at ({x}, {y})");
+			assert!(
+				ops >= PROJECTION_REGION_BOUND as u64,
+				"every region was visited once"
+			);
+		}
+		// The membership structure is one lookup per region: a second full
+		// pass with an empty hidden set counts the same order of work, so the
+		// hidden count cannot be a multiplier on the counted operations.
+		let value = context
+			.eval(Source::from_bytes(
+				"var __e = polaritonResolve(__p, 2.0, 2.0, polaritonHiddenSet([])); __e.ops",
+			))
+			.unwrap();
+		let empty_ops = value.to_number(&mut context).unwrap() as u64;
+		assert!(empty_ops <= 98_304);
 	}
 }

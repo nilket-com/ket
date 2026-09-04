@@ -2000,6 +2000,15 @@ pub trait PlotBackend: AsPlotBackend {
 	) {
 		f(self.as_plot_backend());
 	}
+	/// PRODUCT-0157 §5: the legend sample of an actionable entry is addressed
+	/// by the same opaque ordinal as its marks. No drawing effect off SVG.
+	fn with_legend_entry(
+		&mut self,
+		_group: crate::plot::series::SeriesGroup,
+		f: &mut dyn FnMut(&mut dyn PlotBackend),
+	) {
+		f(self.as_plot_backend());
+	}
 	fn stroke_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), stroke: Stroke);
 	fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), color: Color);
 	fn fill_rectangle(&mut self, top_left: Point, size: iced::Size, color: Color);
@@ -2197,6 +2206,16 @@ impl<'a> PlotBackend for IcedBackend<'a> {
 /// ordinary kernel contract for marks and hover. The default is `None`, so
 /// existing kernels remain byte-for-byte on the ordinary PlotWidget path.
 pub trait PlotComposite: Send + Sync {
+	/// PRODUCT-0157 §1: coverage across every cell, at each cell's own bounds.
+	fn rasterizes_identified_series(
+		&self,
+		_bounds: Rect<Widget>,
+		_padding: f32,
+		_title: &str,
+		_settings: &PlotSettings,
+	) -> bool {
+		false
+	}
 	fn legend_hit_geometry(
 		&self,
 		_bounds: Rect<Widget>,
@@ -2490,6 +2509,18 @@ pub trait PlotKernel: Send + Sync {
 	/// Complete prepared identity universe, independent of visibility/legend union.
 	fn series_identities(&self) -> Vec<crate::plot::series::SeriesIdentity> {
 		Vec::new()
+	}
+	/// PRODUCT-0157 §2: every prepared series as its exact identity beside the
+	/// label preparation formatted for it, in the traversal order the registry
+	/// is built from and before any legend union. Consumers join on identity.
+	fn series_labels(&self) -> Vec<crate::plot::series::SeriesLabel> {
+		Vec::new()
+	}
+	/// PRODUCT-0157 §1: whether any identified series occurrence in this kernel
+	/// would draw as a density raster at these plot-area bounds on a backend
+	/// that embeds rasters. One such occurrence leaves the figure uncovered.
+	fn rasterizes_identified_series(&self, _bounds: Rectangle, _settings: &PlotSettings) -> bool {
+		false
 	}
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout;
 
@@ -2853,6 +2884,9 @@ pub struct RegionEntry {
 	pub region: HitRegion,
 	/// The kernel's own ordinal for the mark, consumed by `LowerOrdinalWins`.
 	pub ordinal: u32,
+	/// PRODUCT-0157 §6: the figure ordinal of the identified series this region
+	/// belongs to, so a browser skips it while that series is hidden.
+	pub series: Option<crate::plot::series::SeriesGroup>,
 	pub hit: PlotHit,
 }
 
@@ -3340,6 +3374,10 @@ pub struct PlotWidget<'a> {
 impl<'a> PlotWidget<'a> {
 	pub(crate) fn series_registry(&self) -> &crate::plot::series::SeriesRegistry {
 		&self.settings.series_registry
+	}
+	/// The pane's resolved hidden set, PRODUCT-0157 §3's publish-moment snapshot.
+	pub(crate) fn hidden_series(&self) -> &crate::plot::series::HiddenSeries {
+		&self.settings.hidden_series
 	}
 	pub(crate) fn legend_hit_geometry(
 		&self,
@@ -5204,6 +5242,34 @@ impl<'a> PlotWidget<'a> {
 	}
 
 	/// PRODUCT-0155 §3: the projection seam, beside the hit it mirrors. Same
+	/// PRODUCT-0157 §1: whether every identified series occurrence draws inside
+	/// the SVG series seam at these bounds. Same dispatch as the projection, and
+	/// the same plot area the render path hands the kernel.
+	pub(crate) fn series_covered(&self, bounds: Rectangle) -> bool {
+		let widget_bounds = Rect::<Widget>::from_iced_frame(bounds);
+		if let Some(composite) = self.kernel.composite() {
+			return !composite.rasterizes_identified_series(
+				widget_bounds,
+				self.padding,
+				&self.title,
+				&self.settings_model,
+			);
+		}
+		let legend_reservation = self
+			.kernel
+			.legend_reservation_content(&self.settings)
+			.and_then(crate::plot::legend::apply_policy);
+		let legend = legend_layout(widget_bounds, legend_reservation.as_ref(), &self.settings);
+		let layout = self.kernel.layout(self.settings.clone());
+		let requirements = BandRequirements::from_layout(&layout, &self.settings);
+		let plot_area = self
+			.plot_area(legend.content_bounds, &requirements)
+			.into_iced();
+		!self
+			.kernel
+			.rasterizes_identified_series(plot_area, &self.settings_model)
+	}
+
 	/// bounds, same resolved settings, same dispatch — the composite when there
 	/// is one, the kernel otherwise — and the kernel's plot-local regions are
 	/// offset into widget space, which at export is the SVG's `viewBox`.

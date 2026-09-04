@@ -58,6 +58,16 @@ impl PlotKernel for StackedAreaPlotKernel {
 			.cloned()
 			.collect()
 	}
+	fn series_labels(&self) -> Vec<crate::plot::series::SeriesLabel> {
+		self.prepared_data
+			.identities
+			.iter()
+			.zip(&self.prepared_data.categories)
+			.filter_map(|(identity, label)| {
+				crate::plot::series::SeriesLabel::pair(identity.as_ref(), label)
+			})
+			.collect()
+	}
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		let percent = matches!(self.normalization, StackNormalization::Percent);
 		PlotLayout::Cartesian {

@@ -136,6 +136,13 @@ impl PlotKernel for ScatterPlotKernel {
 			.filter_map(|series| series.identity.clone())
 			.collect()
 	}
+	fn series_labels(&self) -> Vec<crate::plot::series::SeriesLabel> {
+		self.renderer.series_labels()
+	}
+	fn rasterizes_identified_series(&self, bounds: Rectangle, settings: &PlotSettings) -> bool {
+		self.renderer
+			.rasterizes_identified_series(bounds, &settings.resolve_for_layer(&self.layer_settings))
+	}
 	/// PRODUCT-0139 §3: honoured, not decided — the answer comes from the mark,
 	/// so this kernel and the one-layer `LayeredPlotKernel` that a modified
 	/// spelling produces cannot disagree.
@@ -341,6 +348,10 @@ impl PlotKernel for ScatterPlotKernel {
 						radius: point.hit_radius,
 					},
 					ordinal: point.mark_index as u32,
+					series: self.prepared_data.series[point.series_index]
+						.identity
+						.as_ref()
+						.and_then(|identity| resolved.series_registry.group(identity)),
 					hit: self.hit_for_mark(MarkHit {
 						data_x: point.data_x,
 						data_y: point.data_y,
@@ -602,6 +613,31 @@ impl ScatterMarkRenderer {
 				},
 			);
 		}
+	}
+
+	/// PRODUCT-0157 §2 and §1: the prepared series beside their labels, and
+	/// whether an identified series would rasterize at these bounds on an
+	/// embedding backend — the same resolution `draw_with_motion` makes.
+	pub(crate) fn series_labels(&self) -> Vec<crate::plot::series::SeriesLabel> {
+		self.prepared_data
+			.series
+			.iter()
+			.filter_map(|series| {
+				crate::plot::series::SeriesLabel::pair(series.identity.as_ref(), &series.name)
+			})
+			.collect()
+	}
+	pub(crate) fn rasterizes_identified_series(
+		&self,
+		bounds: Rectangle,
+		settings: &ResolvedPlotSettings,
+	) -> bool {
+		self.prepared_data
+			.series
+			.iter()
+			.any(|series| series.identity.is_some())
+			&& resolve_render_mode(self.prepared_data.total_points, true, bounds, settings)
+				== ResolvedScatterRenderMode::Rasterized
 	}
 
 	fn plot_rasterized(

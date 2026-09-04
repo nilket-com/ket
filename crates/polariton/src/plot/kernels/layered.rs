@@ -34,6 +34,27 @@ impl LayerRenderer {
 				.collect(),
 		}
 	}
+	fn series_labels(&self) -> Vec<crate::plot::series::SeriesLabel> {
+		match self {
+			Self::Line(renderer, _) => renderer
+				.prepared_data
+				.series
+				.iter()
+				.filter_map(|series| {
+					crate::plot::series::SeriesLabel::pair(series.identity.as_ref(), &series.name)
+				})
+				.collect(),
+			Self::Scatter(renderer, _) => renderer.series_labels(),
+		}
+	}
+	fn rasterizes_identified_series(&self, bounds: Rectangle, settings: &PlotSettings) -> bool {
+		match self {
+			Self::Line(..) => false,
+			Self::Scatter(renderer, layer) => {
+				renderer.rasterizes_identified_series(bounds, &settings.resolve_for_layer(layer))
+			}
+		}
+	}
 	pub fn line(prepared_data: Arc<LinePreparedData>, settings: LayerSettings) -> Self {
 		Self::Line(LineMarkRenderer::new(prepared_data), settings)
 	}
@@ -269,6 +290,17 @@ impl PlotKernel for LayeredPlotKernel {
 			.iter()
 			.flat_map(|layer| layer.series_identities().into_iter().flatten())
 			.collect()
+	}
+	fn series_labels(&self) -> Vec<crate::plot::series::SeriesLabel> {
+		self.layers
+			.iter()
+			.flat_map(|layer| layer.series_labels())
+			.collect()
+	}
+	fn rasterizes_identified_series(&self, bounds: Rectangle, settings: &PlotSettings) -> bool {
+		self.layers
+			.iter()
+			.any(|layer| layer.rasterizes_identified_series(bounds, settings))
 	}
 	/// PRODUCT-0139 §3: any layer whose mark must be clipped clips the figure.
 	/// A one-layer wrapper around a scatter therefore clips exactly as the bare

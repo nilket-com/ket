@@ -201,6 +201,15 @@ impl PlotKernel for LinePlotKernel {
 			.filter_map(|series| series.identity.clone())
 			.collect()
 	}
+	fn series_labels(&self) -> Vec<crate::plot::series::SeriesLabel> {
+		self.prepared_data
+			.series
+			.iter()
+			.filter_map(|series| {
+				crate::plot::series::SeriesLabel::pair(series.identity.as_ref(), &series.name)
+			})
+			.collect()
+	}
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Cartesian {
 			x_range: (

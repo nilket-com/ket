@@ -195,6 +195,7 @@ impl PlotKernel for HeatmapPlotKernel {
 							inclusive_max: false,
 						},
 						ordinal: (i * num_y + j) as u32,
+						series: None,
 						hit: self.cell_hit(i, j, value),
 					});
 					true

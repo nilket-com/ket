@@ -276,6 +276,7 @@ impl PlotKernel for BubblePlotKernel {
 					regions.push(crate::plot::common::RegionEntry {
 						region: crate::plot::common::HitRegion::Circle { center, radius },
 						ordinal: regions.len() as u32,
+						series: None,
 						hit: make_hit(),
 					});
 					true

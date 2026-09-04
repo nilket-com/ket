@@ -379,6 +379,7 @@ impl PlotKernel for BoxPlotKernel {
 					radius: OUTLIER_RADIUS,
 				},
 				ordinal: point.ordinal as u32,
+				series: None,
 				hit: self.outlier_plot_hit(OutlierHit {
 					category,
 					value: point.value,
@@ -397,6 +398,7 @@ impl PlotKernel for BoxPlotKernel {
 					inclusive_max: true,
 				},
 				ordinal: shared_index as u32,
+				series: None,
 				hit: self.box_plot_hit(shared_index, category, stats),
 			});
 			true

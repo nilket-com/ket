@@ -150,6 +150,23 @@ impl HiddenSeries {
 	}
 }
 
+/// PRODUCT-0157 §2: a prepared series with the label preparation formatted for
+/// it, read next to the identity and never recovered from a printed legend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeriesLabel {
+	pub identity: SeriesIdentity,
+	pub label: String,
+}
+
+impl SeriesLabel {
+	pub fn pair(identity: Option<&SeriesIdentity>, label: &str) -> Option<Self> {
+		identity.map(|identity| Self {
+			identity: identity.clone(),
+			label: label.to_owned(),
+		})
+	}
+}
+
 /// Opaque figure ordinal, minted only by the complete figure registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SeriesGroup(usize);

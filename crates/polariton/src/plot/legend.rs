@@ -852,7 +852,10 @@ pub fn render_legend(
 							..entry.swatch
 						}
 					};
-					match entry.sample {
+					// PRODUCT-0157 §5: the sample alone is addressable by ordinal;
+					// the label text stays outside the group.
+					let sample = &entry.sample;
+					let draw_sample = &mut |backend: &mut dyn PlotBackend| match sample {
 						LegendSample::Swatch => backend.fill_rectangle(
 							Point::new(item_x, item_y + 5.0),
 							Size::new(15.0, 15.0),
@@ -875,6 +878,14 @@ pub fn render_legend(
 							},
 							swatch,
 						),
+					};
+					match entry
+						.identity
+						.as_ref()
+						.and_then(|identity| settings.series_registry.group(identity))
+					{
+						Some(group) => backend.with_legend_entry(group, draw_sample),
+						None => draw_sample(backend),
 					}
 					let text_offset = match entry.sample {
 						LegendSample::Swatch => 25.0,

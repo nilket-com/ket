@@ -4817,14 +4817,15 @@ fn product_0114_band_requirements_precede_and_feed_shared_geometry() {
 	// exact/overlay/hit traversals banked here; PRODUCT-0150 adds the gesture
 	// viewport-geometry traversal; PRODUCT-0151 adds selection geometry,
 	// click-admission, and retained-emphasis traversals. PRODUCT-0155 adds the hit-projection
-	// traversal. Each independently
+	// traversal. PRODUCT-0157 adds the series-coverage traversal.
+	// Each independently
 	// resolves the cell's plot rectangle through its kernel.
 	assert_eq!(
 		composite
 			.matches("cell.kernel.resolve_settings(settings)")
 			.count(),
-		10,
-		"all ten grid entry points resolve the cell's plot area through its own kernel"
+		11,
+		"all eleven grid entry points resolve the cell's plot area through its own kernel"
 	);
 	assert!(
 		!composite.contains("grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &resolved)"),
@@ -6303,6 +6304,63 @@ fn product_0154_shell_emitter_inlines_one_pinned_script() {
 		shell.contains("@font-face"),
 		"positive control: the emitter is the one read"
 	);
+	// PRODUCT-0157 §5: exactly the two hiding rules, both by class alone.
+	assert_eq!(shell.matches("polariton-hidden").count(), 2);
+	assert!(shell.contains("g[data-series].polariton-hidden { display: none; }"));
+	assert!(shell.contains("g[data-legend].polariton-hidden { opacity: 0.25; }"));
+}
+
+/// PRODUCT-0157 §2 and gate 1: the series table is a handle. Its DTOs name no
+/// exact scalar, scalar type, zone, scale, or selection candidate, and the
+/// assay fires on a specimen row that does.
+#[test]
+fn product_0157_series_table_dtos_carry_no_exact_identity_with_a_positive_control() {
+	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let publication =
+		std::fs::read_to_string(src.join("publication.rs")).expect("read publication");
+	let region = publication
+		.split("// PRODUCT-0157 §2: the series table.")
+		.nth(1)
+		.expect("series DTO region start")
+		.split("// PRODUCT-0157 §2: end of the series table.")
+		.next()
+		.expect("series DTO region end");
+	// Code only: the prose that names what must not cross is not a crossing.
+	let code: String = region
+		.lines()
+		.filter(|line| !line.trim_start().starts_with("//"))
+		.collect::<Vec<_>>()
+		.join("\n");
+	let dtos = code.as_str();
+	fn violations(source: &str) -> Vec<&'static str> {
+		let mut found = Vec::new();
+		for (needle, name) in [
+			("ExactScalar", "ExactScalar"),
+			("ScalarType", "ScalarType"),
+			("scalar_type", "scalar_type"),
+			("zone", "zone"),
+			("scale:", "scale"),
+			("SelectionCandidate", "SelectionCandidate"),
+			("candidate", "candidate"),
+			("FieldRef", "FieldRef"),
+		] {
+			if source.contains(needle) {
+				found.push(name);
+			}
+		}
+		found
+	}
+	assert!(violations(dtos).is_empty(), "{:?}", violations(dtos));
+	assert!(
+		dtos.contains("pub(crate) struct SeriesRow"),
+		"the region is the one read"
+	);
+	let specimen = "pub(crate) struct SeriesRow { value: ExactScalar, scalar_type: String, zone: Option<String>, candidate: u32 }";
+	assert_eq!(
+		violations(specimen),
+		["ExactScalar", "scalar_type", "zone", "candidate"],
+		"positive control: the exact-identity assay must fire"
+	);
 }
 
 /// PRODUCT-0153 gate 3 and PRODUCT-0154 §9: no boundary that renders or views
@@ -6359,6 +6417,16 @@ fn product_0155_inspection_asset_is_glue_with_a_positive_control() {
 			("XMLHttpRequest", "XMLHttpRequest"),
 			("WebSocket", "WebSocket"),
 			("import(", "dynamic import"),
+			// PRODUCT-0157 §5: the one permitted write is a class toggle on an
+			// ordinal-addressed group; no other attribute write, no geometry read.
+			("setAttribute", "setAttribute"),
+			("getAttribute", "getAttribute"),
+			("getBBox", "getBBox"),
+			("getCTM", "getCTM"),
+			("getTotalLength", "getTotalLength"),
+			("getPointAtLength", "getPointAtLength"),
+			("pathSegList", "path data"),
+			(".style.d", "path data"),
 			("<", "literal less-than"),
 			("&", "literal ampersand"),
 		] {
@@ -6374,10 +6442,16 @@ fn product_0155_inspection_asset_is_glue_with_a_positive_control() {
 		asset.contains("Math.fround"),
 		"distances are the desktop's 32-bit arithmetic"
 	);
-	let specimen = "var t = a < b; el.innerHTML = fetch(url);";
+	let specimen = "var t = a < b; el.innerHTML = fetch(url); g.setAttribute(\"d\", p.getBBox());";
 	assert_eq!(
 		violations(specimen),
-		["innerHTML", "fetch", "literal less-than"],
+		[
+			"innerHTML",
+			"fetch",
+			"setAttribute",
+			"getBBox",
+			"literal less-than"
+		],
 		"positive control: the glue assay must fire"
 	);
 }
