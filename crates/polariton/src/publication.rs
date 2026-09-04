@@ -12,7 +12,7 @@ use crate::plot::common::{
 	HitDimensionality, HitRegion, PlotHit, PlotRenderLayer, PlotWidget, ResolutionPolicy,
 	ResolutionStage, TieRule,
 };
-use crate::plot::export::{SvgBackend, xml_escape};
+use crate::plot::export::xml_escape;
 use crate::plot::recipe::PlotConstruction;
 use crate::plot::spec::{ResolvedChannel, ResolvedPlotSpec, ScaleFamily, SemanticType};
 use crate::presentation_registry::{SettingValue, inspector_rows};
@@ -712,7 +712,7 @@ pub(crate) fn assemble(
 		// form here; the SVG escapes them afterwards.
 		let svg = render_figure_svg(&export);
 		let svg_file = format!("{figure_dir}/figure.svg");
-		for label in svg_text_contents(&svg) {
+		for label in svg_text_contents(&svg.svg) {
 			guarded.check(&svg_file, "text", &unescape_xml(&label))?;
 		}
 		// PRODUCT-0155: the hit projection, or the reason there is none.
@@ -778,7 +778,7 @@ pub(crate) fn assemble(
 			presentation_file,
 			canonical_json(&presentation).map_err(PublishError::Encoding)?,
 		);
-		files.insert(svg_file, svg.into_bytes());
+		files.insert(svg_file, svg.svg.into_bytes());
 	}
 
 	files.insert(
@@ -967,7 +967,7 @@ fn setting_value_json(value: &SettingValue) -> serde_json::Value {
 	}
 }
 
-fn render_figure_svg(export: &HostPlotExport) -> String {
+fn render_figure_svg(export: &HostPlotExport) -> crate::plot::export::SvgFigure {
 	let bounds = iced::Rectangle {
 		x: 0.0,
 		y: 0.0,
@@ -983,9 +983,7 @@ fn render_figure_svg(export: &HostPlotExport) -> String {
 		export.resize_render_suspended,
 		PlotRenderLayer::Full,
 	);
-	let mut backend = SvgBackend::new(export.width, export.height);
-	widget.render(&mut backend, bounds);
-	backend.finish()
+	crate::plot::export::render_svg(&widget, bounds)
 }
 
 /// The text content of every `<text>` element the backend emitted, still

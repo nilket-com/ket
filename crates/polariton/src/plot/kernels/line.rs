@@ -96,18 +96,25 @@ impl MarkRenderer for LineMarkRenderer {
 				width: settings.stroke_width.width_px(),
 				..Default::default()
 			};
-			backend.stroke_path(
-				&|builder| {
-					for (i, p) in series.points.iter().enumerate() {
-						let pixel_p = transform.cartesian(p[0], p[1]);
-						if i == 0 {
-							builder.move_to(pixel_p);
-						} else {
-							builder.line_to(pixel_p);
-						}
-					}
+			crate::plot::series::draw_series(
+				backend,
+				series.identity.as_ref(),
+				&settings,
+				&mut |backend| {
+					backend.stroke_path(
+						&|builder| {
+							for (i, p) in series.points.iter().enumerate() {
+								let pixel_p = transform.cartesian(p[0], p[1]);
+								if i == 0 {
+									builder.move_to(pixel_p);
+								} else {
+									builder.line_to(pixel_p);
+								}
+							}
+						},
+						stroke.clone(),
+					)
 				},
-				stroke,
 			);
 		}
 	}
@@ -126,6 +133,11 @@ impl MarkRenderer for LineMarkRenderer {
 		let mut mark_index = 0;
 
 		for series in &self.prepared_data.series {
+			if !settings.hidden_series.is_visible(series.identity.as_ref()) {
+				mark_index +=
+					series.points.len().saturating_sub(1) + usize::from(series.points.len() == 1);
+				continue;
+			}
 			if series.points.len() == 1 {
 				let point = series.points[0];
 				let pixel = transform.cartesian(point[0], point[1]);
@@ -182,6 +194,13 @@ fn squared_distance_to_segment(point: Point, start: Point, end: Point) -> (f32, 
 }
 
 impl PlotKernel for LinePlotKernel {
+	fn series_identities(&self) -> Vec<crate::plot::series::SeriesIdentity> {
+		self.prepared_data
+			.series
+			.iter()
+			.filter_map(|series| series.identity.clone())
+			.collect()
+	}
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Cartesian {
 			x_range: (
@@ -256,7 +275,7 @@ impl PlotKernel for LinePlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
+		let mut content = crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
 			self.prepared_data
 				.series
 				.iter()
@@ -266,7 +285,15 @@ impl PlotKernel for LinePlotKernel {
 				.series
 				.first()
 				.map_or(LegendProvenance::Named, |series| series.provenance),
-		)
+		)?;
+		crate::plot::legend::attach_identities(
+			&mut content,
+			self.prepared_data
+				.series
+				.iter()
+				.map(|series| series.identity.clone()),
+		);
+		Some(content)
 	}
 
 	fn x_label(&self) -> String {
@@ -280,6 +307,7 @@ impl PlotKernel for LinePlotKernel {
 
 #[allow(dead_code)]
 pub struct SeriesData {
+	pub identity: Option<crate::plot::series::SeriesIdentity>,
 	pub name: String,
 	pub points: Vec<[f64; 2]>,
 	pub color_t: f32,
@@ -437,6 +465,13 @@ fn prepare_line_data_inner(
 			)
 		});
 		series_list.push(SeriesData {
+			identity: group_df.column(cat_col).ok().and_then(|column| {
+				crate::plot::series::SeriesIdentity::from_column(
+					column,
+					0,
+					crate::plot::spec::SemanticType::Nominal,
+				)
+			}),
 			name: cat_name,
 			points,
 			color_t: t,
@@ -610,6 +645,65 @@ mod product_0054_tests {
 				.iter()
 				.all(|series| series.points.len() == 3)
 		);
+	}
+
+	#[test]
+	fn product_0156_line_visibility_preserves_geometry_and_hit_ordinals() {
+		use crate::plot::series::{SeriesRegistry, SeriesVisibilityAction};
+		let frame = df!("series" => ["a", "a", "b", "b"], "x" => [0.0, 1.0, 0.0, 1.0], "y" => [0.0, 0.0, 1.0, 1.0]).unwrap();
+		let prepared = Arc::new(prepare_line_data(&frame, "series", "x", "y"));
+		let kernel = LinePlotKernel::new(Arc::clone(&prepared));
+		let renderer = LineMarkRenderer::new(Arc::clone(&prepared));
+		let mut settings = ResolvedPlotSettings::default();
+		settings.series_registry = SeriesRegistry::new(kernel.series_identities());
+		let identities = settings.series_registry.identities().to_vec();
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 100.0));
+		let layout = kernel.layout(settings.clone());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let render = |settings: &ResolvedPlotSettings| {
+			let mut backend = crate::plot::export::SvgBackend::new(200.0, 100.0);
+			renderer.draw(&mut backend, bounds, &transform, settings.clone());
+			backend.finish()
+		};
+		let before = render(&settings);
+		assert!(before.contains("data-series=\"s0\""));
+		assert!(before.contains("data-series=\"s1\""));
+		let cursor_a = Cursor::Available(transform.cartesian(0.5, 0.0));
+		let cursor_b = Cursor::Available(transform.cartesian(0.5, 1.0));
+		assert_eq!(
+			renderer
+				.hit_test(&transform, cursor_a, &settings)
+				.unwrap()
+				.mark_index,
+			0
+		);
+		assert!(settings.hidden_series.apply(
+			&SeriesVisibilityAction::Hide(identities[0].clone()),
+			&identities
+		));
+		let hidden = render(&settings);
+		assert!(!hidden.contains("data-series=\"s0\""));
+		let surviving = before
+			.split("<g data-series=\"s1\">")
+			.nth(1)
+			.unwrap()
+			.split("</g>")
+			.next()
+			.unwrap();
+		assert!(hidden.contains(surviving));
+		assert!(renderer.hit_test(&transform, cursor_a, &settings).is_none());
+		assert_eq!(
+			renderer
+				.hit_test(&transform, cursor_b, &settings)
+				.unwrap()
+				.mark_index,
+			1
+		);
+		assert!(Arc::ptr_eq(&prepared, &kernel.prepared_data));
+		settings
+			.hidden_series
+			.apply(&SeriesVisibilityAction::RestoreAll, &identities);
+		assert_eq!(before, render(&settings));
 	}
 
 	#[test]

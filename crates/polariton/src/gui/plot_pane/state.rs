@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub enum PlotPaneMsg {
+	SeriesVisibility(crate::plot::series::SeriesVisibilityAction),
 	UpdateStructuredHit {
 		hit: Option<crate::plot::common::PlotHit>,
 		hover: Option<String>,
@@ -280,6 +281,8 @@ impl HostPlotState {
 		};
 		self.kernel = kernel;
 		self.displayed_selection_revision = self.selection_revision;
+		self.plot_settings_model.pane_override.hidden_series = Override::Inherit;
+		self.plot_settings = self.plot_settings_model.resolve();
 		self.displayed_filter_predicate = predicate;
 		let emphasis = crate::plot::common::project_selection_emphasis(
 			self.kernel.as_ref(),
@@ -343,6 +346,8 @@ impl HostPlotState {
 		self.viewport_motion = ViewportMotion::Settled;
 		self.plot_settings = authoritative.plot_settings;
 		self.plot_settings_model = authoritative.plot_settings_model;
+		self.plot_settings_model.pane_override.hidden_series = Override::Inherit;
+		self.plot_settings = self.plot_settings_model.resolve();
 		self.source_attachment = authoritative.source_attachment;
 		self.plot_type = authoritative.plot_type;
 		self.recipe = authoritative.recipe;
@@ -374,6 +379,7 @@ impl HostPlotState {
 		self.viewport_stamp = self.viewport_stamp.next();
 		self.viewport_motion = ViewportMotion::Settled;
 		self.plot_settings_model.pane_override.domains = Override::Inherit;
+		self.plot_settings_model.pane_override.hidden_series = Override::Inherit;
 		self.plot_settings = self.plot_settings_model.resolve();
 		self.hovered_info = None;
 		self.render_revision = self.render_revision.wrapping_add(1);
@@ -397,6 +403,20 @@ impl HostPlotState {
 
 	pub fn update(&mut self, message: PlotPaneMsg) -> Option<crate::plot::raster::RasterJob> {
 		match message {
+			PlotPaneMsg::SeriesVisibility(action) => {
+				let mut hidden = self.plot_settings.hidden_series.clone();
+				if hidden.apply(&action, &self.kernel.series_identities()) {
+					self.plot_settings_model.pane_override.hidden_series = if hidden.is_empty() {
+						Override::Inherit
+					} else {
+						Override::Set(hidden)
+					};
+					self.plot_settings = self.plot_settings_model.resolve();
+					self.structured_hit = None;
+					self.hovered_info = None;
+					self.render_revision = self.render_revision.wrapping_add(1);
+				}
+			}
 			PlotPaneMsg::SelectionRequested { .. }
 			| PlotPaneMsg::SelectionStarted
 			| PlotPaneMsg::SelectionRefused(_) => {}

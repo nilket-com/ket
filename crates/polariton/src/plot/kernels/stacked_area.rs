@@ -50,6 +50,14 @@ impl StackedAreaPlotKernel {
 }
 
 impl PlotKernel for StackedAreaPlotKernel {
+	fn series_identities(&self) -> Vec<crate::plot::series::SeriesIdentity> {
+		self.prepared_data
+			.identities
+			.iter()
+			.flatten()
+			.cloned()
+			.collect()
+	}
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		let percent = matches!(self.normalization, StackNormalization::Percent);
 		PlotLayout::Cartesian {
@@ -126,13 +134,23 @@ impl PlotKernel for StackedAreaPlotKernel {
 				}
 				builder.close();
 			};
-			backend.fill_path(&area_closure, color);
-			let stroke = Stroke {
-				style: Style::Solid(settings.mark_style.decoration.iced()),
-				width: 0.5,
-				..Default::default()
-			};
-			backend.stroke_path(&area_closure, stroke);
+			crate::plot::series::draw_series(
+				backend,
+				self.prepared_data
+					.identities
+					.get(cat_idx)
+					.and_then(Option::as_ref),
+				&settings,
+				&mut |backend| {
+					backend.fill_path(&area_closure, color);
+					let stroke = Stroke {
+						style: Style::Solid(settings.mark_style.decoration.iced()),
+						width: 0.5,
+						..Default::default()
+					};
+					backend.stroke_path(&area_closure, stroke);
+				},
+			);
 			prev_stacked_values.copy_from_slice(&current_stacked_values);
 		}
 	}
@@ -142,6 +160,20 @@ impl PlotKernel for StackedAreaPlotKernel {
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
 	) -> Option<crate::plot::common::PlotHit> {
+		self.hit_with_settings(
+			transform,
+			cursor,
+			&crate::plot::theme::PlotSettings::default(),
+		)
+	}
+
+	fn hit_with_settings(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &crate::plot::theme::PlotSettings,
+	) -> Option<crate::plot::common::PlotHit> {
+		let hidden = settings.resolve().hidden_series;
 		if let Some(cursor_pos) = cursor.position()
 			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos)
 		{
@@ -170,12 +202,23 @@ impl PlotKernel for StackedAreaPlotKernel {
 			let actual_x = xs[idx];
 			let total = self.prepared_data.totals[idx];
 			let mut current_stack_value = 0.0;
+			let mut hidden_hit = false;
 			for (j, cat_vals) in self.prepared_data.category_values.iter().enumerate() {
 				let val = cat_vals[idx];
 				let next_stack_value = current_stack_value + val;
 				let lower = self.normalization.project(current_stack_value, total);
 				let upper = self.normalization.project(next_stack_value, total);
 				if val > 0.0 && y >= lower && y <= upper {
+					if !hidden.is_visible(
+						self.prepared_data
+							.identities
+							.get(j)
+							.and_then(Option::as_ref),
+					) {
+						hidden_hit = true;
+						current_stack_value = next_stack_value;
+						continue;
+					}
 					let result = crate::plot::common::PlotHit::new(
 						crate::plot::common::MarkFamily::STACKED_AREA,
 						crate::plot::common::HitDimensionality::Area,
@@ -239,6 +282,9 @@ impl PlotKernel for StackedAreaPlotKernel {
 				}
 				current_stack_value = next_stack_value;
 			}
+			if hidden_hit {
+				return None;
+			}
 			return Some(
 				crate::plot::common::PlotHit::new(
 					crate::plot::common::MarkFamily::STACKED_AREA,
@@ -271,7 +317,7 @@ impl PlotKernel for StackedAreaPlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		entries_from_pairs_with_sample_and_provenance(
+		let mut content = entries_from_pairs_with_sample_and_provenance(
 			self.prepared_data
 				.categories
 				.iter()
@@ -279,7 +325,12 @@ impl PlotKernel for StackedAreaPlotKernel {
 				.map(|(index, category)| (category.clone(), self.series_color(index, settings))),
 			LegendSample::Swatch,
 			self.prepared_data.series_provenance,
-		)
+		)?;
+		crate::plot::legend::attach_identities(
+			&mut content,
+			self.prepared_data.identities.iter().cloned(),
+		);
+		Some(content)
 	}
 
 	fn x_label(&self) -> String {
@@ -298,6 +349,7 @@ impl PlotKernel for StackedAreaPlotKernel {
 }
 
 pub struct StackedAreaPreparedData {
+	pub identities: Vec<Option<crate::plot::series::SeriesIdentity>>,
 	pub categories: Vec<String>,
 	pub unique_xs: Vec<f64>,
 	pub category_values: Vec<Vec<f64>>,
@@ -354,6 +406,7 @@ fn prepare_stacked_area_data_inner(
 ) -> StackedAreaPreparedData {
 	if df.height() == 0 || x_col.is_empty() || y_col.is_empty() {
 		return StackedAreaPreparedData {
+			identities: vec![None],
 			categories: vec!["No Data".to_string()],
 			unique_xs: vec![0.0, 1.0],
 			category_values: vec![vec![0.0, 0.0]],
@@ -391,27 +444,48 @@ fn prepare_stacked_area_data_inner(
 		.column(y_col)
 		.ok()
 		.and_then(|column| temporal_axis_domain(column, &y_axis_type));
-	let categories = if cat_col.is_empty() {
-		vec!["All Data".to_string()]
-	} else if let Some(assignments) = assignments {
-		assignments
-			.iter()
-			.map(|assignment| assignment.category.clone())
-			.collect()
-	} else {
-		match df.column(cat_col) {
-			Ok(column) => (0..df.height())
-				.filter_map(|row| column.get(row).ok())
-				.map(category_label)
-				.fold(Vec::new(), |mut seen, label| {
-					if !seen.contains(&label) {
-						seen.push(label);
-					}
-					seen
-				}),
-			Err(_) => vec!["All Data".to_string()],
+	// Partition on the original scalar, before formatting. Two exact values
+	// may print the same label and must still accumulate independently.
+	let source = df.column(cat_col).ok();
+	let mut partitions = Vec::new();
+	let mut seen = std::collections::HashSet::new();
+	for row in 0..df.height() {
+		let value = source
+			.and_then(|column| column.get(row).ok())
+			.unwrap_or(AnyValue::Null)
+			.into_static();
+		if seen.insert(value.clone()) {
+			let label = if source.is_some() {
+				category_label(value.clone())
+			} else {
+				"All Data".to_owned()
+			};
+			let identity = source.and_then(|column| {
+				crate::plot::series::SeriesIdentity::from_column(
+					column,
+					row,
+					crate::plot::spec::SemanticType::Nominal,
+				)
+			});
+			partitions.push((value, label, identity));
 		}
-	};
+	}
+	if let Some(assignments) = assignments {
+		partitions.sort_by_key(|(_, label, _)| {
+			assignments
+				.iter()
+				.position(|entry| &entry.category == label)
+				.unwrap_or(usize::MAX)
+		});
+	}
+	let categories: Vec<_> = partitions
+		.iter()
+		.map(|(_, label, _)| label.clone())
+		.collect();
+	let identities: Vec<_> = partitions
+		.iter()
+		.map(|(_, _, identity)| identity.clone())
+		.collect();
 	let unique_xs_series_res = df
 		.column(x_col)
 		.and_then(|c| c.unique())
@@ -426,6 +500,7 @@ fn prepare_stacked_area_data_inner(
 	let num_xs = unique_xs.len();
 	if num_xs < 2 || num_cats == 0 {
 		return StackedAreaPreparedData {
+			identities,
 			categories,
 			unique_xs: if num_xs < 2 {
 				vec![0.0, 1.0]
@@ -451,10 +526,10 @@ fn prepare_stacked_area_data_inner(
 	}
 	let mut category_values = vec![vec![0.0f64; num_xs]; num_cats];
 	let mut assigned = vec![vec![false; num_xs]; num_cats];
-	let cat_to_idx: HashMap<String, usize> = categories
+	let cat_to_idx: HashMap<AnyValue<'static>, usize> = partitions
 		.iter()
 		.enumerate()
-		.map(|(i, s)| (s.clone(), i))
+		.map(|(i, (value, _, _))| (value.clone(), i))
 		.collect();
 	let x_to_idx: HashMap<u64, usize> = unique_xs
 		.iter()
@@ -486,14 +561,12 @@ fn prepare_stacked_area_data_inner(
 	let p_y = binding_y.f64().unwrap();
 	for i in 0..df.height() {
 		let x = p_x.get(i).unwrap_or(0.0);
-		let cat_str = if let Some(p_cat) = &p_cat {
-			let cat_val = p_cat.get(i).unwrap_or(AnyValue::Null);
-			category_label(cat_val)
-		} else {
-			"All Data".to_string()
-		};
+		let cat_value = p_cat
+			.and_then(|column| column.get(i).ok())
+			.unwrap_or(AnyValue::Null)
+			.into_static();
 		let y = p_y.get(i).unwrap_or(0.0);
-		if let (Some(&xi), Some(&ci)) = (x_to_idx.get(&x.to_bits()), cat_to_idx.get(&cat_str)) {
+		if let (Some(&xi), Some(&ci)) = (x_to_idx.get(&x.to_bits()), cat_to_idx.get(&cat_value)) {
 			if !assigned[ci][xi] {
 				category_values[ci][xi] = if y.is_finite() && y > 0.0 { y } else { 0.0 };
 				assigned[ci][xi] = true;
@@ -515,6 +588,7 @@ fn prepare_stacked_area_data_inner(
 	let x_range = (unique_xs[0], unique_xs[num_xs - 1]);
 	let y_range = (0.0, max_sum.max(0.001) * 1.05);
 	StackedAreaPreparedData {
+		identities,
 		categories,
 		unique_xs,
 		category_values,
@@ -581,6 +655,7 @@ mod product_0068_tests {
 	fn stacked_area_boundaries_use_resolved_mark_decoration_at_the_existing_width() {
 		let kernel = StackedAreaPlotKernel {
 			prepared_data: Arc::new(StackedAreaPreparedData {
+				identities: Vec::new(),
 				categories: vec!["Atlas".to_owned(), "Beacon".to_owned()],
 				unique_xs: vec![0.0, 1.0, 2.0],
 				category_values: vec![vec![1.0, 2.0, 3.0], vec![2.0, 1.0, 2.0]],
@@ -864,6 +939,7 @@ mod product_0069_tests {
 		.unwrap();
 		let prepared = prepare_stacked_area_data(&frame, "series", "x", "y");
 		let banked = StackedAreaPreparedData {
+			identities: Vec::new(),
 			categories: vec!["Atlas".to_owned(), "Beacon".to_owned()],
 			unique_xs: vec![0.0, 1.0],
 			category_values: vec![vec![2.0, 4.0], vec![3.0, 5.0]],

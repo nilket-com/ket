@@ -944,6 +944,7 @@ fn product_temporal_count_fixture(rotation: f32) -> (LinePlotKernel, PlotSetting
 	(
 		LinePlotKernel::new(Arc::new(LinePreparedData {
 			series: vec![SeriesData {
+				identity: None,
 				name: "activity".to_owned(),
 				points: vec![[first as f64, 40.0], [last as f64, 70.0]],
 				color_t: 0.0,
@@ -1083,6 +1084,7 @@ fn product_0068_cartesian_settings() -> PlotSettings {
 fn product_0068_line_fixture(color: Color) -> LinePlotKernel {
 	LinePlotKernel::new(Arc::new(LinePreparedData {
 		series: vec![SeriesData {
+			identity: None,
 			name: "diagonal".to_owned(),
 			points: vec![[0.0, 0.0], [1.0, 1.0]],
 			color_t: 0.0,
@@ -1111,6 +1113,7 @@ fn product_0068_scatter_fixture(color: Color) -> ScatterPlotKernel {
 			},
 		},
 		series: vec![ScatterSeries {
+			identity: None,
 			name: "point".to_owned(),
 			x_values: Float64Chunked::from_slice("x".into(), &[0.5]),
 			y_values: Float64Chunked::from_slice("y".into(), &[0.5]),
@@ -1150,6 +1153,7 @@ fn product_0068_stacked_area_fixture() -> (StackedAreaPlotKernel, PlotSettings, 
 	(
 		StackedAreaPlotKernel {
 			prepared_data: Arc::new(StackedAreaPreparedData {
+				identities: Vec::new(),
 				categories: vec!["Atlas".to_owned(), "Beacon".to_owned()],
 				unique_xs: vec![0.0, 0.25, 0.5, 0.75, 1.0],
 				category_values: vec![vec![2.0, 2.5, 2.0, 3.0, 2.5], vec![2.0, 1.5, 2.5, 2.0, 2.5]],
@@ -1332,6 +1336,7 @@ fn product_0072_percent_area_fixture() -> (StackedAreaPlotKernel, PlotSettings, 
 	(
 		StackedAreaPlotKernel {
 			prepared_data: Arc::new(StackedAreaPreparedData {
+				identities: Vec::new(),
 				categories: vec!["Atlas".to_owned(), "Beacon".to_owned()],
 				unique_xs: vec![0.0, 0.25, 0.5, 0.75, 1.0],
 				category_values: vec![vec![30.0; 5], vec![70.0; 5]],

@@ -596,6 +596,45 @@ struct NotebookPlotSurface {
 
 const VIEWPORT_QUIET_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
 
+#[cfg(test)]
+mod product_0156_notebook_tests {
+	use super::*;
+
+	#[test]
+	fn product_0156_notebook_actions_are_pane_only_and_idempotent() {
+		use crate::plot::series::SeriesVisibilityAction;
+		let frame =
+			polars::df!("series" => ["a", "b"], "x" => [0.0, 1.0], "y" => [0.0, 1.0]).unwrap();
+		let kernel: Arc<dyn PlotKernel + Send + Sync> =
+			Arc::new(crate::plot::kernels::line::LinePlotKernel::new(Arc::new(
+				crate::plot::kernels::line::prepare_line_data(&frame, "series", "x", "y"),
+			)));
+		let ids = kernel.series_identities();
+		let mut surface = NotebookPlotSurface::new(
+			PlotComposition::single(crate::plot::core::PlotType::Line),
+			kernel,
+		);
+		let revision = surface.render_revision;
+		let hide = || {
+			crate::gui::messages::PlotMessage::SeriesVisibility(SeriesVisibilityAction::Hide(
+				ids[0].clone(),
+			))
+		};
+		surface.update(hide());
+		assert_eq!(surface.render_revision, revision + 1);
+		assert!(surface.settings.hidden_series.contains(&ids[0]));
+		surface.update(hide());
+		assert_eq!(surface.render_revision, revision + 1);
+		surface.update(crate::gui::messages::PlotMessage::SeriesVisibility(
+			SeriesVisibilityAction::RestoreAll,
+		));
+		assert!(matches!(
+			surface.settings_model.pane_override.hidden_series,
+			crate::plot::spec::Override::Inherit
+		));
+	}
+}
+
 impl NotebookPlotSurface {
 	fn new(composition: PlotComposition, kernel: Arc<dyn PlotKernel + Send + Sync>) -> Self {
 		let settings_model = crate::plot::theme::PlotSettings::default();
@@ -650,6 +689,20 @@ impl NotebookPlotSurface {
 			crate::gui::messages::PlotMessage::SelectionRequested { .. }
 			| crate::gui::messages::PlotMessage::SelectionStarted
 			| crate::gui::messages::PlotMessage::SelectionRefused(_) => {}
+			crate::gui::messages::PlotMessage::SeriesVisibility(action) => {
+				let mut hidden = self.settings.hidden_series.clone();
+				if hidden.apply(&action, &self.kernel.series_identities()) {
+					self.settings_model.pane_override.hidden_series = if hidden.is_empty() {
+						crate::plot::spec::Override::Inherit
+					} else {
+						crate::plot::spec::Override::Set(hidden)
+					};
+					self.settings = self.settings_model.resolve();
+					self.structured_hit = None;
+					self.hovered_info = None;
+					self.render_revision = self.render_revision.wrapping_add(1);
+				}
+			}
 			crate::gui::messages::PlotMessage::SelectionRebuilt(completion) => {
 				let expected = crate::selection::RebuildStamp {
 					publication: match self.publication {
@@ -665,6 +718,9 @@ impl NotebookPlotSurface {
 					let predicate = completion.predicate;
 					if let Ok(kernel) = completion.result {
 						self.kernel = kernel;
+						self.settings_model.pane_override.hidden_series =
+							crate::plot::spec::Override::Inherit;
+						self.settings = self.settings_model.resolve();
 						self.displayed_selection_revision = self.selection_revision;
 						self.displayed_filter_predicate = predicate;
 						let emphasis = crate::plot::common::project_selection_emphasis(
@@ -3154,6 +3210,7 @@ impl CodeEditor {
 							.push_back(PlotWritebackGesture::Cancel { panel_id });
 					}
 					PlotPaneMsg::UpdateStructuredHit { .. }
+					| PlotPaneMsg::SeriesVisibility(_)
 					| PlotPaneMsg::SelectionRequested { .. }
 					| PlotPaneMsg::SelectionStarted
 					| PlotPaneMsg::SelectionRefused(_)

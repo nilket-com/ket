@@ -664,6 +664,12 @@ impl PlotGridKernel {
 }
 
 impl PlotKernel for PlotGridKernel {
+	fn series_identities(&self) -> Vec<crate::plot::series::SeriesIdentity> {
+		self.cells
+			.iter()
+			.flat_map(|cell| cell.kernel.series_identities())
+			.collect()
+	}
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		self.cells.first().kernel.layout(settings)
 	}
@@ -693,6 +699,61 @@ impl PlotKernel for PlotGridKernel {
 }
 
 impl PlotComposite for PlotGridKernel {
+	fn legend_hit_geometry(
+		&self,
+		bounds: Rect<Widget>,
+		padding: f32,
+		title: &str,
+		settings: &PlotSettings,
+	) -> Option<crate::plot::legend::LegendHitGeometry> {
+		if self.cells.len() == 1 {
+			return PlotWidget::new(
+				self.cells.first().kernel.as_ref(),
+				title.to_owned(),
+				padding,
+				settings.clone(),
+				0,
+				false,
+				crate::plot::common::PlotRenderLayer::Full,
+			)
+			.legend_hit_geometry(bounds);
+		}
+		let resolved = settings.resolve();
+		let reservation = crate::plot::legend::union(
+			self.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_reservation_content(&resolved)),
+		);
+		let legend = crate::plot::legend::legend_layout(bounds, reservation.as_ref(), &resolved);
+		let layouts = self.cell_layouts(settings);
+		let requirements =
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
+		let tiled = grid_tiled_area_with_requirements(
+			grid_outer_area(legend.content_bounds, padding),
+			title,
+			&requirements,
+			grid_x_label_visible(self, &resolved),
+			&resolved,
+		);
+		let extent = grid_plot_extent(
+			tiled,
+			self.arrangement,
+			self.figure_grid,
+			self.cells.iter().any(|cell| cell.cell.label.is_some()),
+			&resolved,
+		);
+		let content = crate::plot::legend::union(
+			self.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_content(&resolved)),
+		)?;
+		let origin = crate::plot::legend::legend_origin_for_display(
+			bounds, legend, extent, &content, &resolved,
+		)?;
+		Some(crate::plot::legend::legend_hit_geometry(
+			origin, &content, &resolved,
+		))
+	}
 	fn owns_global_headings(&self) -> bool {
 		self.cells.len() == 1
 	}
@@ -1050,6 +1111,9 @@ impl PlotComposite for PlotGridKernel {
 			backend.with_save(&mut |backend| {
 				backend.translate(iced::Vector::new(inner.x(), inner.y()));
 				for anchor in &projected.anchors {
+					if !resolved.hidden_series.is_visible(anchor.series_identity()) {
+						continue;
+					}
 					let Some(shape) = anchor.reproject(&transform) else {
 						continue;
 					};
@@ -3568,12 +3632,14 @@ mod tests {
 				.trim_matches('"')
 				.to_owned();
 			let mut entries = NonEmpty::new(crate::plot::legend::LegendEntry {
+				identity: None,
 				label: "shared".to_owned(),
 				swatch: iced::Color::from_rgb8(10, 20, 30),
 				sample: crate::plot::legend::LegendSample::PointSample,
 				provenance: crate::plot::legend::LegendProvenance::Named,
 			});
 			entries.push(crate::plot::legend::LegendEntry {
+				identity: None,
 				label: format!("series-{cell}"),
 				swatch: iced::Color::from_rgb8(40, 50, 60),
 				sample: crate::plot::legend::LegendSample::PointSample,
@@ -3670,6 +3736,66 @@ mod tests {
 					&& pair[0].height() == pair[1].height()),
 			"the figure gutter must preserve cell congruence"
 		);
+	}
+
+	#[test]
+	fn product_0156_grid_shares_identity_and_keeps_legend_geometry() {
+		use crate::plot::series::{HiddenSeries, SeriesVisibilityAction};
+		let (body, _, stamped) = fixture();
+		let stamped = StampedResult {
+			data: owned_artifact(df!("facet" => ["left", "left", "right", "right"], "series" => ["a", "b", "a", "b"], "x" => [0.0, 1.0, 0.0, 1.0], "y" => [1.0, 2.0, 3.0, 4.0]).unwrap()),
+			provenance: stamped.provenance,
+		};
+		let grid =
+			PlotGrid::value_facet(body, &stamped, "facet", GridArrangement::new(1, 2).unwrap())
+				.unwrap();
+		let kernel = PlotGridKernel::from_grid_with_factory(grid, 800, 600, |_spec, data| {
+			Ok(Arc::new(crate::plot::kernels::line::LinePlotKernel::new(
+				Arc::new(crate::plot::kernels::line::prepare_line_data(
+					data, "series", "x", "y",
+				)),
+			)))
+		})
+		.unwrap();
+		let mut model = PlotSettings::default();
+		let bounds = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+		let render = |model: PlotSettings| {
+			let widget = PlotWidget::new(
+				&kernel,
+				String::new(),
+				20.0,
+				model,
+				0,
+				false,
+				crate::plot::common::PlotRenderLayer::Full,
+			);
+			let geometry = widget
+				.legend_hit_geometry(Rect::from_iced_frame(bounds))
+				.unwrap();
+			(crate::plot::export::render_svg(&widget, bounds), geometry)
+		};
+		let (before, geometry) = render(model.clone());
+		assert_eq!(before.series.identities().len(), 2);
+		assert_eq!(before.svg.matches("data-series=\"s0\"").count(), 2);
+		assert_eq!(before.svg.matches("data-series=\"s1\"").count(), 2);
+		assert!(
+			geometry
+				.entries
+				.iter()
+				.all(|(_, identity)| identity.is_some())
+		);
+		let mut hidden = HiddenSeries::default();
+		hidden.apply(
+			&SeriesVisibilityAction::Hide(before.series.identities()[0].clone()),
+			before.series.identities(),
+		);
+		model.pane_override.hidden_series = Override::Set(hidden);
+		let (after, hidden_geometry) = render(model);
+		assert!(!after.svg.contains("data-series=\"s0\""));
+		assert_eq!(after.svg.matches("data-series=\"s1\"").count(), 2);
+		assert_eq!(geometry.bounds, hidden_geometry.bounds);
+		assert_eq!(geometry.entries, hidden_geometry.entries);
+		assert_eq!(before.series, after.series);
 	}
 
 	#[test]
@@ -6914,6 +7040,7 @@ mod tests {
 
 		let content = crate::plot::legend::LegendContent::entries(NonEmpty::new(
 			crate::plot::legend::LegendEntry {
+				identity: None,
 				label: "authored series".to_owned(),
 				swatch: iced::Color::from_rgb8(10, 20, 30),
 				sample: crate::plot::legend::LegendSample::PointSample,

@@ -18,6 +18,22 @@ pub enum LayerRenderer {
 }
 
 impl LayerRenderer {
+	fn series_identities(&self) -> Vec<Option<crate::plot::series::SeriesIdentity>> {
+		match self {
+			Self::Line(renderer, _) => renderer
+				.prepared_data
+				.series
+				.iter()
+				.map(|series| series.identity.clone())
+				.collect(),
+			Self::Scatter(renderer, _) => renderer
+				.prepared_data
+				.series
+				.iter()
+				.map(|series| series.identity.clone())
+				.collect(),
+		}
+	}
 	pub fn line(prepared_data: Arc<LinePreparedData>, settings: LayerSettings) -> Self {
 		Self::Line(LineMarkRenderer::new(prepared_data), settings)
 	}
@@ -168,7 +184,7 @@ impl LayerRenderer {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		match self {
+		let mut content = match self {
 			Self::Line(renderer, _) => {
 				crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
 					renderer
@@ -206,7 +222,9 @@ impl LayerRenderer {
 						}),
 				)
 			}
-		}
+		}?;
+		crate::plot::legend::attach_identities(&mut content, self.series_identities());
+		Some(content)
 	}
 }
 
@@ -246,6 +264,12 @@ impl LayeredPlotKernel {
 }
 
 impl PlotKernel for LayeredPlotKernel {
+	fn series_identities(&self) -> Vec<crate::plot::series::SeriesIdentity> {
+		self.layers
+			.iter()
+			.flat_map(|layer| layer.series_identities().into_iter().flatten())
+			.collect()
+	}
 	/// PRODUCT-0139 §3: any layer whose mark must be clipped clips the figure.
 	/// A one-layer wrapper around a scatter therefore clips exactly as the bare
 	/// scatter kernel does, which is what makes the two authoring spellings of

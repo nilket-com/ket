@@ -37,6 +37,7 @@ enum ResolvedScatterRenderMode {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScatterRasterKey {
+	pub visible_series: Vec<bool>,
 	pub width: u32,
 	pub height: u32,
 	pub point_size: u32,
@@ -48,6 +49,7 @@ pub struct ScatterRasterKey {
 
 #[derive(Clone, Debug)]
 pub struct ScatterRasterSettings {
+	pub visible_series: Vec<bool>,
 	pub point_radius: f32,
 	pub background: Color,
 	pub series_colors: Vec<Color>,
@@ -121,11 +123,19 @@ impl ScatterRasterKey {
 			&& self.point_size == current.point_size
 			&& self.background == current.background
 			&& self.series_colors == current.series_colors
+			&& self.visible_series == current.visible_series
 			&& (self.x_range != current.x_range || self.y_range != current.y_range)
 	}
 }
 
 impl PlotKernel for ScatterPlotKernel {
+	fn series_identities(&self) -> Vec<crate::plot::series::SeriesIdentity> {
+		self.prepared_data
+			.series
+			.iter()
+			.filter_map(|series| series.identity.clone())
+			.collect()
+	}
 	/// PRODUCT-0139 §3: honoured, not decided — the answer comes from the mark,
 	/// so this kernel and the one-layer `LayeredPlotKernel` that a modified
 	/// spelling produces cannot disagree.
@@ -271,14 +281,22 @@ impl PlotKernel for ScatterPlotKernel {
 					.unwrap_or_else(|| settings.color_theme.get_color(series.color_t)),
 			)
 		});
-		crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
+		let mut content = crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
 			pairs,
 			crate::plot::legend::LegendSample::PointSample,
 			self.prepared_data
 				.series
 				.first()
 				.map_or(LegendProvenance::Named, |series| series.provenance),
-		)
+		)?;
+		crate::plot::legend::attach_identities(
+			&mut content,
+			self.prepared_data
+				.series
+				.iter()
+				.map(|series| series.identity.clone()),
+		);
+		Some(content)
 	}
 
 	fn hit(
@@ -310,6 +328,13 @@ impl PlotKernel for ScatterPlotKernel {
 			transform,
 			resolved.point_size.radius_px(),
 			|point| {
+				if !resolved.hidden_series.is_visible(
+					self.prepared_data.series[point.series_index]
+						.identity
+						.as_ref(),
+				) {
+					return;
+				}
 				regions.push(crate::plot::common::RegionEntry {
 					region: crate::plot::common::HitRegion::Circle {
 						center: point.center,
@@ -437,6 +462,7 @@ impl ScatterMarkRenderer {
 			series.for_each_selectable_point(|x, y, candidate| {
 				if predicate.matches_candidate(candidate) {
 					anchors.push(Box::new(ScatterEmphasisAnchor {
+						identity: series.identity.clone(),
 						x,
 						y,
 						categorical_x,
@@ -449,7 +475,12 @@ impl ScatterMarkRenderer {
 
 	#[allow(dead_code)] // Geometric hit-testing is test-reachable until PRODUCT-0014.
 	fn hit_point(&self, transform: &CoordinateTransformer, cursor: Point) -> Option<MarkHit> {
-		self.hit_point_with_radius(transform, cursor, PointSize::ONE.radius_px())
+		self.hit_point_with_radius(
+			transform,
+			cursor,
+			PointSize::ONE.radius_px(),
+			&Default::default(),
+		)
 	}
 
 	/// PRODUCT-0155 §3: the one geometry constructor the hit scan and the
@@ -463,9 +494,10 @@ impl ScatterMarkRenderer {
 	) {
 		let hit_radius = point_radius + 2.0;
 		let mut mark_index = 0;
-		for series in &self.prepared_data.series {
+		for (series_index, series) in self.prepared_data.series.iter().enumerate() {
 			series.for_each_point(|x, y| {
 				visit(PointGeometry {
+					series_index,
 					mark_index,
 					data_x: x,
 					data_y: y,
@@ -481,10 +513,18 @@ impl ScatterMarkRenderer {
 		transform: &CoordinateTransformer,
 		cursor: Point,
 		point_radius: f32,
+		hidden: &crate::plot::series::HiddenSeries,
 	) -> Option<MarkHit> {
 		let mut nearest_distance = (point_radius + 2.0) * (point_radius + 2.0);
 		let mut nearest = None;
 		self.for_each_point_geometry(transform, point_radius, |point| {
+			if !hidden.is_visible(
+				self.prepared_data.series[point.series_index]
+					.identity
+					.as_ref(),
+			) {
+				return;
+			}
 			let dx = cursor.x - point.center.x;
 			let dy = cursor.y - point.center.y;
 			let distance = dx * dx + dy * dy;
@@ -511,14 +551,21 @@ impl ScatterMarkRenderer {
 			let color = series
 				.resolved_color
 				.unwrap_or_else(|| settings.color_theme.get_color(series.color_t));
-			backend.fill_path(
-				&|builder| {
-					series.for_each_point(|x, y| {
-						let pixel_p = scatter_point(transform, x, y);
-						builder.circle(pixel_p, point_radius);
-					});
+			crate::plot::series::draw_series(
+				backend,
+				series.identity.as_ref(),
+				settings,
+				&mut |backend| {
+					backend.fill_path(
+						&|builder| {
+							series.for_each_point(|x, y| {
+								let pixel_p = scatter_point(transform, x, y);
+								builder.circle(pixel_p, point_radius);
+							});
+						},
+						color,
+					)
 				},
-				color,
 			);
 		}
 	}
@@ -539,13 +586,20 @@ impl ScatterMarkRenderer {
 		for series in &self.prepared_data.series {
 			let sampled = downsample_series(series, bounds, transform, per_series_target);
 			let color = series_color(series, settings);
-			backend.fill_path(
-				&|builder| {
-					for point in &sampled {
-						builder.circle(*point, point_radius);
-					}
+			crate::plot::series::draw_series(
+				backend,
+				series.identity.as_ref(),
+				settings,
+				&mut |backend| {
+					backend.fill_path(
+						&|builder| {
+							for point in &sampled {
+								builder.circle(*point, point_radius);
+							}
+						},
+						color,
+					)
 				},
-				color,
 			);
 		}
 	}
@@ -605,6 +659,12 @@ impl ScatterMarkRenderer {
 		settings: &ResolvedPlotSettings,
 	) -> ScatterRasterKey {
 		ScatterRasterKey {
+			visible_series: self
+				.prepared_data
+				.series
+				.iter()
+				.map(|series| settings.hidden_series.is_visible(series.identity.as_ref()))
+				.collect(),
 			width: bounds.width.max(1.0).ceil() as u32,
 			height: bounds.height.max(1.0).ceil() as u32,
 			point_size: settings.point_size.factor().to_bits(),
@@ -622,6 +682,12 @@ impl ScatterMarkRenderer {
 
 	pub(crate) fn raster_settings(&self, settings: &ResolvedPlotSettings) -> ScatterRasterSettings {
 		ScatterRasterSettings {
+			visible_series: self
+				.prepared_data
+				.series
+				.iter()
+				.map(|series| settings.hidden_series.is_visible(series.identity.as_ref()))
+				.collect(),
 			point_radius: settings.point_size.radius_px(),
 			background: settings.chrome.canvas_background.iced(),
 			series_colors: self
@@ -764,11 +830,13 @@ impl MarkRenderer for ScatterMarkRenderer {
 			transform,
 			cursor.position()?,
 			settings.point_size.radius_px(),
+			&settings.hidden_series,
 		)
 	}
 }
 
 pub struct ScatterSeries {
+	pub identity: Option<crate::plot::series::SeriesIdentity>,
 	pub name: String,
 	pub x_values: Float64Chunked,
 	pub y_values: Float64Chunked,
@@ -825,12 +893,16 @@ impl ScatterSeries {
 }
 
 struct ScatterEmphasisAnchor {
+	identity: Option<crate::plot::series::SeriesIdentity>,
 	x: f64,
 	y: f64,
 	categorical_x: bool,
 }
 
 impl crate::plot::common::EmphasisAnchor for ScatterEmphasisAnchor {
+	fn series_identity(&self) -> Option<&crate::plot::series::SeriesIdentity> {
+		self.identity.as_ref()
+	}
 	fn reproject(
 		&self,
 		transform: &CoordinateTransformer,
@@ -917,6 +989,11 @@ fn build_raster_rgba(
 	settings: &ResolvedPlotSettings,
 ) -> Vec<u8> {
 	let raster_settings = ScatterRasterSettings {
+		visible_series: prepared_data
+			.series
+			.iter()
+			.map(|series| settings.hidden_series.is_visible(series.identity.as_ref()))
+			.collect(),
 		point_radius: settings.point_size.radius_px(),
 		background: settings.chrome.canvas_background.iced(),
 		series_colors: prepared_data
@@ -975,6 +1052,14 @@ fn build_raster_rgba_inner(
 	let mut scanned_points = 0_usize;
 
 	for (series_index, series) in prepared_data.series.iter().enumerate() {
+		if !settings
+			.visible_series
+			.get(series_index)
+			.copied()
+			.unwrap_or(true)
+		{
+			continue;
+		}
 		let color = settings
 			.series_colors
 			.get(series_index)
@@ -1232,6 +1317,15 @@ pub fn prepare_scatter_data_resolved_with_subject(
 			.and_then(|channel| channel.colors.iter().find(|entry| entry.category == name))
 			.map(|entry| iced_color(entry.color));
 		series.push(ScatterSeries {
+			identity: group.column(color_field).ok().and_then(|column| {
+				crate::plot::series::SeriesIdentity::from_column(
+					column,
+					0,
+					color.map_or(crate::plot::spec::SemanticType::Nominal, |channel| {
+						channel.binding.semantic_type
+					}),
+				)
+			}),
 			name,
 			x_values: xs,
 			y_values: ys,
@@ -1256,6 +1350,7 @@ pub fn prepare_scatter_data_resolved_with_subject(
 	if !color_field.is_empty() {
 		order_series_by_display_domain(&mut series, df, color_field);
 	}
+	apply_resolved_series_colors(&mut series, color);
 	ScatterPreparedData {
 		raster_subject: RasterSubject {
 			publication,
@@ -1285,6 +1380,14 @@ fn apply_resolved_series_colors(
 ) {
 	let Some(channel) = channel else { return };
 	for series in series {
+		if !matches!(
+			channel.binding.semantic_type,
+			crate::plot::spec::SemanticType::Nominal | crate::plot::spec::SemanticType::Ordinal
+		) {
+			series.identity = None;
+		} else if let Some(identity) = &mut series.identity {
+			identity.field.semantic_type = channel.binding.semantic_type;
+		}
 		series.resolved_color = channel
 			.colors
 			.iter()
@@ -1466,6 +1569,13 @@ pub fn prepare_scatter_data(
 			0.5
 		};
 		series_list.push(ScatterSeries {
+			identity: group_df.column(cat_col).ok().and_then(|column| {
+				crate::plot::series::SeriesIdentity::from_column(
+					column,
+					0,
+					crate::plot::spec::SemanticType::Nominal,
+				)
+			}),
 			name: cat_name,
 			x_values: xs,
 			y_values: ys,
@@ -1610,6 +1720,145 @@ mod tests {
 	use super::*;
 	use crate::plot::common::PathBuilder;
 	use iced::widget::canvas::{Stroke, Text};
+
+	#[test]
+	fn product_0156_scatter_visibility_invalidates_raster_and_removes_hits_and_regions() {
+		use crate::plot::series::{SeriesRegistry, SeriesVisibilityAction};
+		let frame = df!("series" => ["a", "b"], "x" => [2.0, 8.0], "y" => [2.0, 8.0]).unwrap();
+		let prepared = Arc::new(prepare_scatter_data(&frame, "series", "x", "y"));
+		let renderer = ScatterMarkRenderer::new(Arc::clone(&prepared));
+		let kernel = ScatterPlotKernel::new(prepared);
+		let mut model = PlotSettings::default();
+		model.library_defaults.series_registry = SeriesRegistry::new(kernel.series_identities());
+		let mut settings = model.resolve();
+		let layout = PlotLayout::Cartesian {
+			x_range: (0.0, 10.0),
+			y_range: (0.0, 10.0),
+			x_axis_type: AxisType::Linear,
+			y_axis_type: AxisType::Linear,
+			x_temporal_domain: None,
+			y_temporal_domain: None,
+		};
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(100.0, 100.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let key = renderer.raster_key(bounds, &transform, &settings);
+		let pixels = build_raster_rgba(&renderer.prepared_data, bounds, &transform, &settings);
+		let cursor = Cursor::Available(transform.cartesian(2.0, 2.0));
+		assert!(renderer.hit_test(&transform, cursor, &settings).is_some());
+		let ids = kernel.series_identities();
+		settings
+			.hidden_series
+			.apply(&SeriesVisibilityAction::Hide(ids[0].clone()), &ids);
+		model.pane_override.hidden_series =
+			crate::plot::spec::Override::Set(settings.hidden_series.clone());
+		let hidden_key = renderer.raster_key(bounds, &transform, &settings);
+		assert_ne!(key, hidden_key);
+		let mut moved = hidden_key.clone();
+		moved.x_range = (1.0_f64.to_bits(), 11.0_f64.to_bits());
+		assert!(!key.reusable_for(&moved));
+		assert!(hidden_key.reusable_for(&moved));
+		let hidden_pixels =
+			build_raster_rgba(&renderer.prepared_data, bounds, &transform, &settings);
+		assert_ne!(pixels, hidden_pixels);
+		assert!(renderer.hit_test(&transform, cursor, &settings).is_none());
+		let stages = kernel.hit_regions(&transform, &model).unwrap();
+		assert_eq!(stages[0].regions.len(), 1);
+		assert_eq!(stages[0].regions[0].ordinal, 1);
+		settings
+			.hidden_series
+			.apply(&SeriesVisibilityAction::RestoreAll, &ids);
+		assert_eq!(
+			pixels,
+			build_raster_rgba(&renderer.prepared_data, bounds, &transform, &settings)
+		);
+	}
+
+	#[test]
+	fn product_0156_raster_visibility_rebuilds_desktop_and_exports_one_ungrouped_image() {
+		use crate::plot::common::{PlotRenderLayer, PlotWidget};
+		use crate::plot::export::{SvgBackend, render_svg};
+		use crate::plot::series::SeriesVisibilityAction;
+		use crate::plot::spec::Override;
+		let frame =
+			df!("series" => ["a", "b", "b"], "x" => [2.0, 2.0, 8.0], "y" => [2.0, 2.0, 8.0])
+				.unwrap();
+		let kernel: Arc<dyn PlotKernel + Send + Sync> = Arc::new(ScatterPlotKernel::new(Arc::new(
+			prepare_scatter_data(&frame, "series", "x", "y"),
+		)));
+		let ids = kernel.series_identities();
+		let mut model = PlotSettings::default();
+		// Exercise the authored raster path without allocating a million points;
+		// PRODUCT-0140's separate tests retain the automatic gate's boundary.
+		model.library_defaults.scatter_render_mode = ScatterRenderMode::Rasterized;
+		let coordinator = crate::plot::raster::RasterCoordinator::new();
+		settle_interactive_raster(&kernel, &model, &coordinator, 200.0);
+		let original =
+			render_interactive_frame(&kernel, &model, ViewportMotion::Settled, &coordinator);
+		let original_export = render_frame(&kernel, &model, ViewportMotion::Settled);
+		let mut hidden = model.resolve().hidden_series;
+		hidden.apply(&SeriesVisibilityAction::Hide(ids[0].clone()), &ids);
+		model.pane_override.hidden_series = Override::Set(hidden);
+		let pending =
+			render_interactive_frame(&kernel, &model, ViewportMotion::Moving, &coordinator);
+		assert!(
+			pending.last_rgba.is_none(),
+			"old visible pixels cannot be reused, even during motion"
+		);
+		assert_eq!(
+			builds_during(|| settle_interactive_raster(&kernel, &model, &coordinator, 200.0)),
+			1
+		);
+		let desktop =
+			render_interactive_frame(&kernel, &model, ViewportMotion::Settled, &coordinator);
+		assert_ne!(original.last_rgba, desktop.last_rgba);
+		assert_eq!(original.placements, desktop.placements);
+		let cold = crate::plot::raster::RasterCoordinator::new();
+		settle_interactive_raster(&kernel, &model, &cold, 200.0);
+		assert_eq!(
+			desktop.last_rgba,
+			render_interactive_frame(&kernel, &model, ViewportMotion::Settled, &cold).last_rgba
+		);
+		let exported = render_frame(&kernel, &model, ViewportMotion::Settled);
+		assert_ne!(original_export.last_rgba, exported.last_rgba);
+		assert_eq!(original_export.placements, exported.placements);
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 200.0));
+		let widget = PlotWidget::new(
+			kernel.as_ref(),
+			String::new(),
+			0.0,
+			model.clone(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		);
+		let svg = render_svg(&widget, bounds).svg;
+		assert_eq!(svg.matches("<image ").count(), 1);
+		assert!(!svg.contains("data-series="));
+		let (origin, size) = exported.placements[0];
+		let mut expected = SvgBackend::new(200.0, 200.0);
+		expected.draw_image_rgba(
+			origin,
+			size,
+			size.width.ceil() as u32,
+			size.height.ceil() as u32,
+			exported.last_rgba.as_ref().unwrap(),
+		);
+		let expected = expected.finish();
+		let image = &expected[expected.find("<image ").unwrap()..];
+		// Widget chrome translates the SVG image; the capture backend ignores
+		// transforms. Compare its local placement, extent, and encoded pixels.
+		let image = &image[image.find(" x=").unwrap()..];
+		let image = &image[..image.find("/>").unwrap() + 2];
+		assert!(
+			svg.contains(image),
+			"SVG embeds exactly the current-state export raster at the fixed extent"
+		);
+		model.pane_override.hidden_series = Override::Inherit;
+		settle_interactive_raster(&kernel, &model, &coordinator, 200.0);
+		let restored =
+			render_interactive_frame(&kernel, &model, ViewportMotion::Settled, &coordinator);
+		assert_eq!(original.last_rgba, restored.last_rgba);
+	}
 
 	// Shared measurement instrument: counts what actually reached the
 	// backend, so a render path is observed rather than inferred.
@@ -3397,6 +3646,7 @@ configuration,widget_px,inner_px,inner_share,effective_gate,naive_gate"
 	fn product_0139_reuse_placement_carries_old_pixels_onto_the_new_viewport() {
 		fn key(x: (f64, f64), y: (f64, f64)) -> ScatterRasterKey {
 			ScatterRasterKey {
+				visible_series: vec![true],
 				width: 400,
 				height: 300,
 				point_size: 1.0_f32.to_bits(),
@@ -3626,6 +3876,7 @@ configuration,widget_px,inner_px,inner_share,effective_gate,naive_gate"
 			}
 		}
 		let series = ScatterSeries {
+			identity: None,
 			name: "grid".to_owned(),
 			x_values: Series::new("x".into(), xs).f64().unwrap().clone(),
 			y_values: Series::new("y".into(), ys).f64().unwrap().clone(),
@@ -3720,6 +3971,7 @@ configuration,widget_px,inner_px,inner_share,effective_gate,naive_gate"
 /// One scatter mark's hit geometry: PRODUCT-0155 §3's shared constructor
 /// output, consumed by the hit scan and the region export alike.
 pub(crate) struct PointGeometry {
+	pub series_index: usize,
 	pub(crate) mark_index: usize,
 	pub(crate) data_x: f64,
 	pub(crate) data_y: f64,

@@ -238,6 +238,8 @@ pub struct PlotSettingsLayer {
 	pub padding: Override<PlotPadding>,
 	pub guides: Override<PlotGuideSettings>,
 	pub domains: Override<PlotDomainOverrides>,
+	/// PRODUCT-0156: only the pane tier resolves this transient state.
+	pub hidden_series: Override<crate::plot::series::HiddenSeries>,
 	pub scatter: Override<ScatterPolicy>,
 	pub point_size: Override<PointSize>,
 	pub stroke_width: Override<StrokeWidth>,
@@ -292,6 +294,7 @@ impl Default for PlotSettingsLayer {
 			padding: Override::Inherit,
 			guides: Override::Inherit,
 			domains: Override::Inherit,
+			hidden_series: Override::Inherit,
 			scatter: Override::Inherit,
 			point_size: Override::Inherit,
 			stroke_width: Override::Inherit,
@@ -366,6 +369,10 @@ impl PlotSettings {
 		apply_layer(&mut settings, &self.authored_spec, true);
 		apply_layer(&mut settings, &self.layer, false);
 		apply_layer(&mut settings, &self.pane_override, true);
+		settings.hidden_series = match &self.pane_override.hidden_series {
+			Override::Set(hidden) => hidden.clone(),
+			Override::Inherit => Default::default(),
+		};
 		settings
 	}
 
@@ -377,6 +384,10 @@ impl PlotSettings {
 		apply_layer(&mut settings, &self.authored_spec, true);
 		apply_layer_settings(&mut settings, layer);
 		apply_layer(&mut settings, &self.pane_override, true);
+		settings.hidden_series = match &self.pane_override.hidden_series {
+			Override::Set(hidden) => hidden.clone(),
+			Override::Inherit => Default::default(),
+		};
 		settings
 	}
 }

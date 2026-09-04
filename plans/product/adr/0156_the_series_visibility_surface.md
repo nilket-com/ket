@@ -1,11 +1,12 @@
 # ADR 0156: the series visibility surface
 
-Status: proposed 2026-09-04, revised the same day after review found overlay
-legends needing press priority over pan and brush, deduplicated entries with
-conflicting identities needing an explicit non-actionable rule, identity
-needing its scalar type and exact-value rules, stacked-area hiding needing a
-stated accumulation rule, and the actions needing scope, cancellation,
-unknown-identity, and no-op rules, and after implementation found that the
+Status: accepted 2026-09-04, proposed and revised the same day after review
+found overlay legends needing press priority over pan and brush,
+deduplicated entries with conflicting identities needing an explicit
+non-actionable rule, identity needing its scalar type and exact-value rules,
+stacked-area hiding needing a stated accumulation rule, and the actions
+needing scope, cancellation, unknown-identity, and no-op rules, and after
+implementation found that the
 density raster a scatter draws above the PRODUCT-0140 gate is one image
 across every series and needed its own rule. Plotting arc. The 2026-09-04
 browser dogfood of the inspectable packages found no demand for clicking

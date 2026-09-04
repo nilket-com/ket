@@ -29,6 +29,7 @@ pub enum LegendProvenance {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LegendEntry {
+	pub identity: Option<crate::plot::series::SeriesIdentity>,
 	pub label: String,
 	pub swatch: Color,
 	pub sample: LegendSample,
@@ -60,6 +61,37 @@ pub enum LegendSection {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LegendContent(pub NonEmpty<LegendSection>);
+
+/// Attach exact preparation identities before printed union. This is strictly
+/// positional: matching labels here would collapse distinct source values.
+pub fn attach_identities(
+	content: &mut LegendContent,
+	identities: impl IntoIterator<Item = Option<crate::plot::series::SeriesIdentity>>,
+) {
+	let mut identities = identities.into_iter();
+	let (first, rest) = content.0.clone().into_parts();
+	let mut sections = std::iter::once(first).chain(rest).map(|section| {
+		if let LegendSection::Entries(entries) = section {
+			let (first, rest) = entries.into_parts();
+			let mut entries = std::iter::once(first).chain(rest).map(|mut entry| {
+				entry.identity = identities.next().flatten();
+				entry
+			});
+			let mut result = NonEmpty::new(entries.next().unwrap());
+			for entry in entries {
+				result.push(entry);
+			}
+			LegendSection::Entries(result)
+		} else {
+			section
+		}
+	});
+	let mut result = NonEmpty::new(sections.next().unwrap());
+	for section in sections {
+		result.push(section);
+	}
+	content.0 = result;
+}
 
 impl LegendContent {
 	pub fn entries(entries: NonEmpty<LegendEntry>) -> Self {
@@ -149,7 +181,9 @@ where
 			match section {
 				LegendSection::Entries(entries) => {
 					let index = *entry_section.get_or_insert_with(|| {
-						sections.push(LegendSection::Entries(entries.clone()));
+						sections.push(LegendSection::Entries(NonEmpty::new(
+							entries.first().clone(),
+						)));
 						sections.len() - 1
 					});
 					if let LegendSection::Entries(existing) = &mut sections[index] {
@@ -163,6 +197,9 @@ where
 								let (first, rest) = existing.clone().into_parts();
 								let mut values = vec![first];
 								values.extend(rest);
+								if values[current].identity != candidate.identity {
+									values[current].identity = None;
+								}
 								if candidate.provenance == LegendProvenance::Named {
 									values[current].provenance = LegendProvenance::Named;
 								}
@@ -223,6 +260,7 @@ where
 	let first = iter.next()?;
 	let total = first.0 + 1 + iter.size_hint().0;
 	let mut entries = NonEmpty::new(LegendEntry {
+		identity: None,
 		label: first.1,
 		swatch: settings
 			.color_theme
@@ -237,6 +275,7 @@ where
 			0.5
 		};
 		entries.push(LegendEntry {
+			identity: None,
 			label,
 			swatch: settings.color_theme.get_color(t),
 			sample: sample.clone(),
@@ -258,6 +297,7 @@ where
 	let mut iter = pairs.into_iter();
 	let (label, swatch) = iter.next()?;
 	let mut entries = NonEmpty::new(LegendEntry {
+		identity: None,
 		label: label.into(),
 		swatch,
 		sample: sample.clone(),
@@ -265,6 +305,7 @@ where
 	});
 	for (label, swatch) in iter {
 		entries.push(LegendEntry {
+			identity: None,
 			label: label.into(),
 			swatch,
 			sample: sample.clone(),
@@ -316,6 +357,67 @@ fn sample_gradient(stops: &GradientStops, t: f32) -> Color {
 }
 
 const LEGEND_PADDING: f32 = 10.0;
+
+fn entry_rectangle(origin: Point, offset: f32, index: usize, max_rows: usize) -> iced::Rectangle {
+	iced::Rectangle::new(
+		Point::new(
+			origin.x + LEGEND_PADDING + (index / max_rows) as f32 * 150.0,
+			origin.y + offset + LEGEND_PADDING + (index % max_rows) as f32 * 25.0,
+		),
+		Size::new(150.0, 25.0),
+	)
+}
+
+#[derive(Clone, Debug)]
+pub struct LegendHitGeometry {
+	pub bounds: iced::Rectangle,
+	pub entries: Vec<(iced::Rectangle, Option<crate::plot::series::SeriesIdentity>)>,
+}
+
+impl LegendHitGeometry {
+	pub fn entry_at(
+		&self,
+		point: Point,
+	) -> Option<&(iced::Rectangle, Option<crate::plot::series::SeriesIdentity>)> {
+		self.entries
+			.iter()
+			.find(|(bounds, _)| bounds.contains(point))
+	}
+}
+
+pub fn legend_hit_geometry(
+	origin: Pt<Widget>,
+	content: &LegendContent,
+	settings: &ResolvedPlotSettings,
+) -> LegendHitGeometry {
+	let geometry = legend_geometry(content, settings);
+	let origin = Point::new(origin.x(), origin.y());
+	let mut entries = Vec::new();
+	if let LegendGeometryKind::Stacked {
+		section_offsets, ..
+	} = &geometry.kind
+	{
+		for (section, offset) in content.sections().zip(section_offsets) {
+			if let LegendSection::Entries(items) = section {
+				for (index, entry) in items.iter().enumerate() {
+					entries.push((
+						entry_rectangle(
+							origin,
+							*offset,
+							index,
+							settings.max_legend_rows.max(1) as usize,
+						),
+						entry.identity.clone(),
+					));
+				}
+			}
+		}
+	}
+	LegendHitGeometry {
+		bounds: iced::Rectangle::new(origin, geometry.size),
+		entries,
+	}
+}
 const GRADIENT_BAR_WIDTH: f32 = 15.0;
 const GRADIENT_TEXT_GAP: f32 = 5.0;
 
@@ -739,15 +841,22 @@ pub fn render_legend(
 			LegendSection::Entries(entries) => {
 				let max_rows = settings.max_legend_rows.max(1) as usize;
 				for (index, entry) in entries.iter().enumerate() {
-					let col = index / max_rows;
-					let row = index % max_rows;
-					let item_x = x + LEGEND_PADDING + col as f32 * 150.0;
-					let item_y = y + offset + LEGEND_PADDING + row as f32 * 25.0;
+					let item = entry_rectangle(Point::new(x, y), offset, index, max_rows);
+					let item_x = item.x;
+					let item_y = item.y;
+					let swatch = if settings.hidden_series.is_visible(entry.identity.as_ref()) {
+						entry.swatch
+					} else {
+						Color {
+							a: entry.swatch.a * 0.25,
+							..entry.swatch
+						}
+					};
 					match entry.sample {
 						LegendSample::Swatch => backend.fill_rectangle(
 							Point::new(item_x, item_y + 5.0),
 							Size::new(15.0, 15.0),
-							entry.swatch,
+							swatch,
 						),
 						LegendSample::LineSample => backend.stroke_path(
 							&|builder| {
@@ -755,7 +864,7 @@ pub fn render_legend(
 								builder.line_to(Point::new(item_x + 20.0, item_y + 12.5));
 							},
 							Stroke {
-								style: Style::Solid(entry.swatch),
+								style: Style::Solid(swatch),
 								width: 3.0,
 								..Default::default()
 							},
@@ -764,7 +873,7 @@ pub fn render_legend(
 							&|builder| {
 								builder.circle(Point::new(item_x + 6.0, item_y + 12.5), 6.0);
 							},
-							entry.swatch,
+							swatch,
 						),
 					}
 					let text_offset = match entry.sample {
@@ -973,11 +1082,69 @@ mod tests {
 
 	fn entry(label: &str, sample: LegendSample, provenance: LegendProvenance) -> LegendEntry {
 		LegendEntry {
+			identity: None,
 			label: label.to_owned(),
 			swatch: Color::from_rgb8(12, 34, 56),
 			sample,
 			provenance,
 		}
+	}
+
+	#[test]
+	fn product_0156_printed_union_preserves_ambiguity_in_every_order() {
+		use crate::plot::series::SeriesIdentity;
+		use crate::selection::{ExactScalar, FieldRef, ScalarType};
+		let identity = |value| SeriesIdentity {
+			field: FieldRef::new(
+				"series",
+				crate::plot::spec::SemanticType::Nominal,
+				ScalarType::Int,
+			),
+			value: ExactScalar::Int(value),
+		};
+		let make = |identity| {
+			let mut entry = entry(
+				"same label",
+				LegendSample::LineSample,
+				LegendProvenance::Named,
+			);
+			entry.identity = identity;
+			LegendContent::entries(NonEmpty::new(entry))
+		};
+		for identities in [
+			[Some(identity(1)), Some(identity(2)), Some(identity(1))],
+			[Some(identity(2)), Some(identity(1)), Some(identity(2))],
+			[None, Some(identity(1)), Some(identity(1))],
+			[Some(identity(1)), None, Some(identity(1))],
+		] {
+			let content = union(identities.into_iter().map(make)).unwrap();
+			let LegendSection::Entries(entries) = content.0.first() else {
+				panic!("entries")
+			};
+			assert_eq!(entries.len(), 1);
+			assert!(entries.first().identity.is_none());
+		}
+		let content = union([make(Some(identity(1))), make(Some(identity(1)))]).unwrap();
+		let LegendSection::Entries(entries) = content.0.first() else {
+			panic!("entries")
+		};
+		assert_eq!(entries.first().identity, Some(identity(1)));
+		let mut first = entry(
+			"same label",
+			LegendSample::LineSample,
+			LegendProvenance::Named,
+		);
+		first.identity = Some(identity(1));
+		let mut second = first.clone();
+		second.identity = Some(identity(2));
+		let mut entries = NonEmpty::new(first);
+		entries.push(second);
+		let content = union([LegendContent::entries(entries)]).unwrap();
+		let LegendSection::Entries(entries) = content.0.first() else {
+			panic!("entries")
+		};
+		assert_eq!(entries.len(), 1);
+		assert!(entries.first().identity.is_none());
 	}
 
 	fn content(entry: LegendEntry) -> LegendContent {

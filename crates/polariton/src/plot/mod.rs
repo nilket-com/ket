@@ -15,9 +15,13 @@ pub mod legend;
 pub mod raster;
 pub mod recipe;
 pub mod request;
+pub mod series;
 pub mod spec;
 pub(crate) mod text_estimate;
 pub mod theme;
 
 #[cfg(test)]
 mod mark_style_oracles;
+
+#[cfg(test)]
+mod series_tests;

@@ -32,8 +32,25 @@ pub fn xml_escape(text: &str) -> String {
 
 pub struct SvgBackend {
 	pub svg: String,
+	series_groups: bool,
 	current_transform: Affine,
 	clip_count: usize,
+}
+
+/// PRODUCT-0156: exact metadata stays in memory, separate from the SVG's
+/// opaque ordinal attributes. Package serialization is a later contract.
+pub struct SvgFigure {
+	pub svg: String,
+	pub series: crate::plot::series::SeriesRegistry,
+}
+
+pub fn render_svg(widget: &crate::plot::common::PlotWidget<'_>, bounds: Rectangle) -> SvgFigure {
+	let mut backend = SvgBackend::new(bounds.width, bounds.height);
+	widget.render(&mut backend, bounds);
+	SvgFigure {
+		svg: backend.finish(),
+		series: widget.series_registry().clone(),
+	}
 }
 
 struct SvgPathBuilder {
@@ -121,6 +138,7 @@ impl SvgBackend {
 		svg.push('\n');
 		Self {
 			svg,
+			series_groups: true,
 			current_transform: Affine::IDENTITY,
 			clip_count: 0,
 		}
@@ -129,6 +147,12 @@ impl SvgBackend {
 	pub fn finish(mut self) -> String {
 		self.svg.push_str("</svg>");
 		self.svg
+	}
+
+	fn for_raster(width: f32, height: f32) -> Self {
+		let mut backend = Self::new(width, height);
+		backend.series_groups = false;
+		backend
 	}
 
 	fn color_to_svg(&self, color: Color) -> String {
@@ -142,6 +166,20 @@ impl SvgBackend {
 }
 
 impl PlotBackend for SvgBackend {
+	fn with_series(
+		&mut self,
+		group: crate::plot::series::SeriesGroup,
+		f: &mut dyn FnMut(&mut dyn PlotBackend),
+	) {
+		if !self.series_groups {
+			f(self);
+			return;
+		}
+		self.svg
+			.push_str(&format!("<g data-series=\"s{}\">", group.ordinal()));
+		f(self);
+		self.svg.push_str("</g>");
+	}
 	fn stroke_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), stroke: Stroke) {
 		let mut builder = SvgPathBuilder {
 			path: String::new(),
@@ -418,7 +456,7 @@ pub struct PngBackend {
 impl PngBackend {
 	pub fn new(width: u32, height: u32) -> Self {
 		Self {
-			svg_backend: SvgBackend::new(width as f32, height as f32),
+			svg_backend: SvgBackend::for_raster(width as f32, height as f32),
 		}
 	}
 
@@ -460,7 +498,7 @@ pub struct AvifBackend {
 impl AvifBackend {
 	pub fn new(width: u32, height: u32) -> Self {
 		Self {
-			svg_backend: SvgBackend::new(width as f32, height as f32),
+			svg_backend: SvgBackend::for_raster(width as f32, height as f32),
 		}
 	}
 

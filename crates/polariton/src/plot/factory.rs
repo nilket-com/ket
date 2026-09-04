@@ -201,13 +201,17 @@ fn create_plot_with_source_token(
 		} => {
 			let prepared = prepare_multivariate_rows(df, dimensions, category.as_deref())
 				.expect("PRODUCT-0104 planning validated this multivariate row collection");
-			Arc::new(ParallelPlotKernel {
-				prepared_data: Arc::new(prepared),
-				category_colors: category.as_ref().and_then(|_| {
-					spec.channel(Channel::X)
-						.map(|channel| channel.colors.clone())
-				}),
-			})
+			Arc::new(
+				ParallelPlotKernel {
+					row_identities: Vec::new(),
+					prepared_data: Arc::new(prepared),
+					category_colors: category.as_ref().and_then(|_| {
+						spec.channel(Channel::X)
+							.map(|channel| channel.colors.clone())
+					}),
+				}
+				.with_series_source(df, category.as_deref()),
+			)
 		}
 		ResolvedKernelFields::Radar {
 			dimensions,
@@ -215,13 +219,17 @@ fn create_plot_with_source_token(
 		} => {
 			let prepared = prepare_multivariate_rows(df, dimensions, category.as_deref())
 				.expect("PRODUCT-0104 planning validated this multivariate row collection");
-			Arc::new(RadarPlotKernel {
-				prepared_data: Arc::new(prepared),
-				category_colors: category.as_ref().and_then(|_| {
-					spec.channel(Channel::X)
-						.map(|channel| channel.colors.clone())
-				}),
-			})
+			Arc::new(
+				RadarPlotKernel {
+					row_identities: Vec::new(),
+					prepared_data: Arc::new(prepared),
+					category_colors: category.as_ref().and_then(|_| {
+						spec.channel(Channel::X)
+							.map(|channel| channel.colors.clone())
+					}),
+				}
+				.with_series_source(df, category.as_deref()),
+			)
 		}
 		ResolvedKernelFields::RadialDial {
 			label,
@@ -264,7 +272,7 @@ fn create_plot_with_source_token(
 		}
 		ResolvedKernelFields::StackedArea { series, x, y } => {
 			let assignments = resolved_category_colors(spec);
-			let prepared = if assignments.is_empty() {
+			let mut prepared = if assignments.is_empty() {
 				stacked_area::prepare_stacked_area_data(df, series.as_deref().unwrap_or(""), x, y)
 			} else {
 				stacked_area::prepare_stacked_area_data_with_resolved_order(
@@ -275,6 +283,11 @@ fn create_plot_with_source_token(
 					assignments,
 				)
 			};
+			if let Some(channel) = spec.channel(Channel::Color) {
+				for identity in prepared.identities.iter_mut().flatten() {
+					identity.field.semantic_type = channel.binding.semantic_type;
+				}
+			}
 			Arc::new(StackedAreaPlotKernel {
 				prepared_data: Arc::new(prepared),
 				series_colors: assignments.to_vec(),
@@ -392,12 +405,20 @@ fn prepare_resolved_line(
 	x: &str,
 	y: &str,
 ) -> line::LinePreparedData {
-	match (spec.channel(Channel::Color), spec.color_job) {
+	let mut prepared = match (spec.channel(Channel::Color), spec.color_job) {
 		(Some(channel), Some(ColorJob::Categorical)) => {
 			line::prepare_line_data_with_colors(df, series, x, y, &channel.colors)
 		}
 		_ => line::prepare_line_data(df, series, x, y),
+	};
+	if let Some(channel) = spec.channel(Channel::Color) {
+		for series in &mut prepared.series {
+			if let Some(identity) = &mut series.identity {
+				identity.field.semantic_type = channel.binding.semantic_type;
+			}
+		}
 	}
+	prepared
 }
 
 /// Build a standalone mark with PRODUCT-0007 Layer-stage settings without
@@ -491,7 +512,7 @@ fn create_styled_plot_with_source_token(
 		)),
 		ResolvedKernelFields::StackedArea { series, x, y } => {
 			let assignments = resolved_category_colors(spec);
-			let prepared = if assignments.is_empty() {
+			let mut prepared = if assignments.is_empty() {
 				stacked_area::prepare_stacked_area_data(df, series.as_deref().unwrap_or(""), x, y)
 			} else {
 				stacked_area::prepare_stacked_area_data_with_resolved_order(
@@ -502,6 +523,11 @@ fn create_styled_plot_with_source_token(
 					assignments,
 				)
 			};
+			if let Some(channel) = spec.channel(Channel::Color) {
+				for identity in prepared.identities.iter_mut().flatten() {
+					identity.field.semantic_type = channel.binding.semantic_type;
+				}
+			}
 			Ok(Arc::new(StackedAreaPlotKernel {
 				prepared_data: Arc::new(prepared),
 				series_colors: assignments.to_vec(),

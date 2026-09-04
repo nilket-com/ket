@@ -1648,6 +1648,8 @@ impl std::fmt::Display for GridLineStyle {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedPlotSettings {
+	pub hidden_series: crate::plot::series::HiddenSeries,
+	pub series_registry: crate::plot::series::SeriesRegistry,
 	pub max_legend_rows: u32,
 	pub legend_x: f32,
 	pub legend_y: f32,
@@ -1746,6 +1748,8 @@ impl ResolvedPlotSettings {
 impl Default for ResolvedPlotSettings {
 	fn default() -> Self {
 		Self {
+			hidden_series: Default::default(),
+			series_registry: Default::default(),
 			max_legend_rows: 10,
 			legend_x: 0.95,
 			legend_y: 0.05,
@@ -1977,7 +1981,25 @@ pub trait PathBuilder {
 /// coordinates, content, and order only when a particular implementation
 /// records those fields. It cannot by itself prove production compositing,
 /// clipping enforcement, antialiasing, or realized glyph extents.
-pub trait PlotBackend {
+pub trait AsPlotBackend {
+	fn as_plot_backend(&mut self) -> &mut dyn PlotBackend;
+}
+
+impl<T: PlotBackend> AsPlotBackend for T {
+	fn as_plot_backend(&mut self) -> &mut dyn PlotBackend {
+		self
+	}
+}
+
+pub trait PlotBackend: AsPlotBackend {
+	/// PRODUCT-0156: grouping has no drawing effect on non-SVG backends.
+	fn with_series(
+		&mut self,
+		_group: crate::plot::series::SeriesGroup,
+		f: &mut dyn FnMut(&mut dyn PlotBackend),
+	) {
+		f(self.as_plot_backend());
+	}
 	fn stroke_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), stroke: Stroke);
 	fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), color: Color);
 	fn fill_rectangle(&mut self, top_left: Point, size: iced::Size, color: Color);
@@ -2175,6 +2197,15 @@ impl<'a> PlotBackend for IcedBackend<'a> {
 /// ordinary kernel contract for marks and hover. The default is `None`, so
 /// existing kernels remain byte-for-byte on the ordinary PlotWidget path.
 pub trait PlotComposite: Send + Sync {
+	fn legend_hit_geometry(
+		&self,
+		_bounds: Rect<Widget>,
+		_padding: f32,
+		_title: &str,
+		_settings: &PlotSettings,
+	) -> Option<crate::plot::legend::LegendHitGeometry> {
+		None
+	}
 	/// Whether this composite emitted the figure-level title and subtitle.
 	/// Ordinary composites leave those headings to `PlotWidget` so existing
 	/// kernels retain their current ownership.
@@ -2411,6 +2442,9 @@ impl EmphasisShape {
 /// Opaque data-space emphasis retained by the kernel that understands it.
 /// Screen geometry is derived afresh for the active viewport on every frame.
 pub trait EmphasisAnchor: Send + Sync {
+	fn series_identity(&self) -> Option<&crate::plot::series::SeriesIdentity> {
+		None
+	}
 	fn reproject(&self, transform: &CoordinateTransformer) -> Option<EmphasisShape>;
 }
 
@@ -2453,6 +2487,10 @@ pub fn project_selection_emphasis(
 }
 
 pub trait PlotKernel: Send + Sync {
+	/// Complete prepared identity universe, independent of visibility/legend union.
+	fn series_identities(&self) -> Vec<crate::plot::series::SeriesIdentity> {
+		Vec::new()
+	}
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout;
 
 	/// PRODUCT-0139 §6: the resolution the mark renderer draws with is the
@@ -3300,6 +3338,42 @@ pub struct PlotWidget<'a> {
 }
 
 impl<'a> PlotWidget<'a> {
+	pub(crate) fn series_registry(&self) -> &crate::plot::series::SeriesRegistry {
+		&self.settings.series_registry
+	}
+	pub(crate) fn legend_hit_geometry(
+		&self,
+		bounds: Rect<Widget>,
+	) -> Option<crate::plot::legend::LegendHitGeometry> {
+		if let Some(composite) = self.kernel.composite() {
+			return composite.legend_hit_geometry(
+				bounds,
+				self.padding,
+				&self.title,
+				&self.settings_model,
+			);
+		}
+		let reservation = self
+			.kernel
+			.legend_reservation_content(&self.settings)
+			.and_then(crate::plot::legend::apply_policy);
+		let legend = legend_layout(bounds, reservation.as_ref(), &self.settings);
+		let layout = self.kernel.layout(self.settings.clone());
+		let extent = self.plot_area(
+			legend.content_bounds,
+			&BandRequirements::from_layout(&layout, &self.settings),
+		);
+		let content = self
+			.kernel
+			.legend_content(&self.settings)
+			.and_then(crate::plot::legend::apply_policy)?;
+		let origin = legend_origin_for_display(bounds, legend, extent, &content, &self.settings)?;
+		Some(crate::plot::legend::legend_hit_geometry(
+			origin,
+			&content,
+			&self.settings,
+		))
+	}
 	pub fn new(
 		kernel: &'a dyn PlotKernel,
 		title: String,
@@ -3309,6 +3383,16 @@ impl<'a> PlotWidget<'a> {
 		resize_render_suspended: bool,
 		layer: PlotRenderLayer,
 	) -> Self {
+		let mut settings_model = settings_model;
+		if settings_model
+			.library_defaults
+			.series_registry
+			.identities()
+			.is_empty()
+		{
+			settings_model.library_defaults.series_registry =
+				crate::plot::series::SeriesRegistry::new(kernel.series_identities());
+		}
 		let settings = kernel.resolve_settings(&settings_model);
 		Self {
 			kernel,
@@ -3921,6 +4005,7 @@ impl VerticalGuideBands {
 
 #[derive(Default)]
 pub struct PlotCanvasState {
+	legend_press: Option<LegendPress>,
 	last_hover: Option<String>,
 	last_hit: Option<PlotHit>,
 	modifiers: iced::keyboard::Modifiers,
@@ -3934,6 +4019,12 @@ pub struct PlotCanvasState {
 	overlay_cache: canvas::Cache,
 	render_revision: std::cell::Cell<u64>,
 	stable_bounds: std::cell::RefCell<Option<Rectangle>>,
+}
+
+struct LegendPress {
+	stamp: Option<ViewportStamp>,
+	kernel: usize,
+	entry: Option<(Rectangle, crate::plot::series::SeriesIdentity)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5586,6 +5677,13 @@ impl<'a> PlotWidget<'a> {
 			backend.with_save(&mut |backend| {
 				backend.translate(iced::Vector::new(plot_area.x, plot_area.y));
 				for anchor in self.emphasis_anchors {
+					if !self
+						.settings
+						.hidden_series
+						.is_visible(anchor.series_identity())
+					{
+						continue;
+					}
 					let Some(shape) = anchor.reproject(&transform) else {
 						continue;
 					};
@@ -5835,6 +5933,91 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 			if modifiers.control() || modifiers.shift() {
 				state.viewport_click = None;
 			}
+		}
+		let kernel_address = self.kernel as *const dyn PlotKernel as *const () as usize;
+		if state.legend_press.as_ref().is_some_and(|press| {
+			press.kernel != kernel_address
+				|| press.stamp.map(|stamp| stamp.incarnation)
+					!= self.viewport_stamp.map(|stamp| stamp.incarnation)
+		}) {
+			state.legend_press = None;
+		}
+		let local_cursor = cursor
+			.position_over(bounds)
+			.map(|point| Point::new(point.x - bounds.x, point.y - bounds.y));
+		if matches!(event, Event::Window(iced::window::Event::Unfocused)) {
+			state.legend_press = None;
+		}
+		if matches!(
+			event,
+			Event::Mouse(iced::mouse::Event::ButtonReleased(
+				iced::mouse::Button::Left
+			))
+		) && let Some(press) = state.legend_press.take()
+		{
+			if let Some((entry_bounds, identity)) = press.entry
+				&& local_cursor.is_some_and(|point| entry_bounds.contains(point))
+				&& let Some(geometry) = self.legend_hit_geometry(Rect::from_iced_frame(bounds))
+				&& local_cursor
+					.and_then(|point| geometry.entry_at(point))
+					.is_some_and(|(rect, current)| {
+						*rect == entry_bounds && current.as_ref() == Some(&identity)
+					}) {
+				let action = self.settings.hidden_series.legend_action(
+					&identity,
+					false,
+					self.settings.series_registry.identities(),
+				);
+				return Some(
+					canvas::Action::publish(PlotMessage::SeriesVisibility(action)).and_capture(),
+				);
+			}
+			return Some(canvas::Action::capture());
+		}
+		if state.legend_press.is_some() && matches!(event, Event::Mouse(_)) {
+			return Some(canvas::Action::capture());
+		}
+		if state.viewport_drag.is_none()
+			&& state.selection_drag.is_none()
+			&& matches!(
+				event,
+				Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left))
+			) && let Some(point) = local_cursor
+			&& let Some(geometry) = self.legend_hit_geometry(Rect::from_iced_frame(bounds))
+			&& geometry.bounds.contains(point)
+		{
+			state.settings_click = None;
+			state.viewport_click = None;
+			let supported =
+				!state.modifiers.control() && !state.modifiers.alt() && !state.modifiers.logo();
+			let entry = supported
+				.then(|| geometry.entry_at(point))
+				.flatten()
+				.and_then(|(bounds, identity)| {
+					identity.clone().map(|identity| (*bounds, identity))
+				});
+			let shift_action = if state.modifiers.shift() {
+				entry.as_ref().map(|(_, identity)| {
+					self.settings.hidden_series.legend_action(
+						identity,
+						true,
+						self.settings.series_registry.identities(),
+					)
+				})
+			} else {
+				None
+			};
+			state.legend_press = Some(LegendPress {
+				stamp: self.viewport_stamp,
+				kernel: kernel_address,
+				entry: if state.modifiers.shift() { None } else { entry },
+			});
+			return Some(match shift_action {
+				Some(action) => {
+					canvas::Action::publish(PlotMessage::SeriesVisibility(action)).and_capture()
+				}
+				None => canvas::Action::capture(),
+			});
 		}
 		if self.settings_inspector_gesture {
 			match state.settings_gesture(event, bounds, cursor) {
@@ -8206,6 +8389,7 @@ mod product_0031_pre_extraction_oracle {
 				return None;
 			}
 			let entries = crate::plot::spec::NonEmpty::new(crate::plot::legend::LegendEntry {
+				identity: None,
 				label: "series".to_owned(),
 				swatch: Color::from_rgb8(17, 34, 51),
 				sample: crate::plot::legend::LegendSample::Swatch,

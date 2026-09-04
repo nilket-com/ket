@@ -154,6 +154,16 @@ fn settings_inspector(
 		rule::horizontal(1),
 	]
 	.spacing(5);
+	if !state.plot_settings.hidden_series.is_empty() {
+		content = content.push(
+			text(format!(
+				"Hidden series · {}\n{}",
+				crate::presentation_registry::ProvenanceTier::PaneOverride,
+				state.plot_settings.hidden_series.description()
+			))
+			.size(11),
+		);
+	}
 	if let Some(status) = &state.writeback_status {
 		content = content.push(text(status).size(10));
 	}

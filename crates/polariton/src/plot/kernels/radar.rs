@@ -10,11 +10,50 @@ use iced::{Color, Point, Rectangle};
 use std::sync::Arc;
 
 pub struct RadarPlotKernel {
+	pub row_identities: Vec<Option<crate::plot::series::SeriesIdentity>>,
 	pub prepared_data: Arc<MultivariateRows>,
 	pub category_colors: Option<Vec<CategoryColorAssignment>>,
 }
 
 impl RadarPlotKernel {
+	pub(crate) fn with_series_source(
+		mut self,
+		frame: &polars::prelude::DataFrame,
+		category: Option<&str>,
+	) -> Self {
+		// Validation preserves frame row order; keep identity out of that module.
+		self.row_identities = self
+			.prepared_data
+			.iter()
+			.enumerate()
+			.map(|(index, _)| {
+				category
+					.and_then(|field| frame.column(field).ok())
+					.and_then(|column| {
+						crate::plot::series::SeriesIdentity::from_column(
+							column,
+							index,
+							crate::plot::spec::SemanticType::Nominal,
+						)
+					})
+			})
+			.collect();
+		self
+	}
+
+	fn category_identity(
+		&self,
+		category: Option<&str>,
+	) -> Option<crate::plot::series::SeriesIdentity> {
+		crate::plot::series::unanimous_identity(
+			self.prepared_data
+				.iter()
+				.enumerate()
+				.filter(|(_, row)| row.category() == category)
+				.map(|(index, _)| self.row_identities.get(index).and_then(Option::as_ref)),
+		)
+	}
+
 	fn display_ranges(&self) -> Vec<(f64, f64)> {
 		self.prepared_data
 			.extrema()
@@ -60,6 +99,9 @@ impl RadarPlotKernel {
 }
 
 impl PlotKernel for RadarPlotKernel {
+	fn series_identities(&self) -> Vec<crate::plot::series::SeriesIdentity> {
+		self.row_identities.iter().flatten().cloned().collect()
+	}
 	fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Radial
 	}
@@ -173,7 +215,7 @@ impl PlotKernel for RadarPlotKernel {
 				}
 			}
 		}
-		for row in self.prepared_data.iter() {
+		for (index, row) in self.prepared_data.iter().enumerate() {
 			let color = self.category_color(row.category(), &settings);
 			let mut fill_color = color;
 			fill_color.a = 0.3;
@@ -196,13 +238,20 @@ impl PlotKernel for RadarPlotKernel {
 				}
 				builder.close();
 			};
-			backend.fill_path(&path_closure, fill_color);
-			backend.stroke_path(
-				&path_closure,
-				Stroke {
-					style: Style::Solid(color),
-					width: 2.0,
-					..Default::default()
+			crate::plot::series::draw_series(
+				backend,
+				self.row_identities.get(index).and_then(Option::as_ref),
+				&settings,
+				&mut |backend| {
+					backend.fill_path(&path_closure, fill_color);
+					backend.stroke_path(
+						&path_closure,
+						Stroke {
+							style: Style::Solid(color),
+							width: 2.0,
+							..Default::default()
+						},
+					);
 				},
 			);
 		}
@@ -212,7 +261,7 @@ impl PlotKernel for RadarPlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
+		let mut content = crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
 			self.prepared_data.categories().iter().map(|category| {
 				(
 					category.as_deref().unwrap_or("All Data").to_owned(),
@@ -221,7 +270,15 @@ impl PlotKernel for RadarPlotKernel {
 			}),
 			crate::plot::legend::LegendSample::Swatch,
 			crate::plot::legend::LegendProvenance::Named,
-		)
+		)?;
+		crate::plot::legend::attach_identities(
+			&mut content,
+			self.prepared_data
+				.categories()
+				.iter()
+				.map(|category| self.category_identity(category.as_deref())),
+		);
+		Some(content)
 	}
 
 	fn hit(
@@ -254,6 +311,7 @@ mod tests {
 		.expect("radar oracle frame");
 		let dimensions = vec!["third".to_owned(), "first".to_owned(), "second".to_owned()];
 		let kernel = RadarPlotKernel {
+			row_identities: Vec::new(),
 			prepared_data: Arc::new(
 				prepare_multivariate_rows(&frame, &dimensions, Some("group"))
 					.expect("valid radar oracle"),
@@ -310,6 +368,7 @@ mod tests {
 			.expect("radar tick fixture");
 			let dimensions = dimensions.map(str::to_owned).to_vec();
 			let kernel = RadarPlotKernel {
+				row_identities: Vec::new(),
 				prepared_data: Arc::new(
 					prepare_multivariate_rows(&frame, &dimensions, None)
 						.expect("valid radar tick fixture"),
@@ -348,6 +407,7 @@ mod tests {
 		let fields =
 			MultivariateFields::new(vec!["a".to_owned(), "b".to_owned(), "c".to_owned()], None);
 		let kernel = RadarPlotKernel {
+			row_identities: Vec::new(),
 			prepared_data: Arc::new(
 				MultivariateRows::from_rows(&fields, Vec::new()).expect("empty rows"),
 			),
@@ -375,6 +435,7 @@ mod tests {
 		let fields =
 			MultivariateFields::new(vec!["a".to_owned(), "b".to_owned(), "c".to_owned()], None);
 		let kernel = RadarPlotKernel {
+			row_identities: Vec::new(),
 			prepared_data: Arc::new(
 				MultivariateRows::from_rows(
 					&fields,

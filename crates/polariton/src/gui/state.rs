@@ -23,7 +23,7 @@ use crate::gui::{
 use crate::plot::common::{PlotLayout, TickPlacementError};
 #[cfg(feature = "toron")]
 use crate::plot::core::PlotType;
-use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
+use crate::plot::export::{AvifBackend, PngBackend};
 use crate::plot::factory::create_plot_from_artifact;
 #[cfg(feature = "toron")]
 use crate::plot::factory::{create_layered_plot_from_artifact, create_styled_plot_from_artifact};
@@ -337,7 +337,7 @@ fn build_resolved_plot_task(
 }
 
 enum RenderedPlotExport {
-	Svg(String),
+	Svg(crate::plot::export::SvgFigure),
 	Png(PngBackend),
 	Avif(AvifBackend),
 }
@@ -352,7 +352,7 @@ impl PlotExportJob {
 		let path = root.join(self.filename);
 		match self.artifact {
 			RenderedPlotExport::Svg(svg) => {
-				let _ = std::fs::write(path, svg);
+				let _ = std::fs::write(path, svg.svg);
 			}
 			RenderedPlotExport::Png(backend) => backend.save(&path),
 			RenderedPlotExport::Avif(backend) => backend.save(&path),
@@ -394,14 +394,10 @@ fn render_plot_export(
 		crate::plot::common::PlotRenderLayer::Full,
 	);
 	Ok(match format {
-		ExportFormat::SVG => {
-			let mut backend = SvgBackend::new(width, height);
-			widget.render(&mut backend, bounds);
-			PlotExportJob {
-				filename: format!("plot_{ordinal}.svg"),
-				artifact: RenderedPlotExport::Svg(backend.finish()),
-			}
-		}
+		ExportFormat::SVG => PlotExportJob {
+			filename: format!("plot_{ordinal}.svg"),
+			artifact: RenderedPlotExport::Svg(crate::plot::export::render_svg(&widget, bounds)),
+		},
 		ExportFormat::PNG => {
 			let mut backend = PngBackend::new(width as u32, height as u32);
 			widget.render(&mut backend, bounds);
@@ -10552,7 +10548,7 @@ workspace.table("bad").views([view("bad", table())]);
 			.expect("selection export")
 			.artifact
 		{
-			super::RenderedPlotExport::Svg(svg) => svg,
+			super::RenderedPlotExport::Svg(svg) => svg.svg,
 			_ => unreachable!("SVG requested"),
 		};
 

@@ -416,6 +416,7 @@ mod tests {
 			slot_id: slot,
 			subject,
 			key: ScatterRasterKey {
+				visible_series: vec![true],
 				width: 32,
 				height: 24,
 				point_size: 1.0_f32.to_bits(),
@@ -434,6 +435,7 @@ mod tests {
 				y_temporal_domain: None,
 			},
 			settings: ScatterRasterSettings {
+				visible_series: vec![true],
 				point_radius: 1.0,
 				background: Color::BLACK,
 				series_colors: vec![Color::WHITE],

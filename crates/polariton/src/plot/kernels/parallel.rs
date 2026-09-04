@@ -9,6 +9,7 @@ use iced::widget::canvas::{Stroke, Style};
 use std::sync::Arc;
 
 pub struct ParallelPlotKernel {
+	pub row_identities: Vec<Option<crate::plot::series::SeriesIdentity>>,
 	pub prepared_data: Arc<MultivariateRows>,
 	/// Present only for grouped authored figures; ungrouped and automatic
 	/// figures deliberately retain the positional compatibility path.
@@ -16,6 +17,44 @@ pub struct ParallelPlotKernel {
 }
 
 impl ParallelPlotKernel {
+	pub(crate) fn with_series_source(
+		mut self,
+		frame: &polars::prelude::DataFrame,
+		category: Option<&str>,
+	) -> Self {
+		// Validation preserves frame row order; keep identity out of that module.
+		self.row_identities = self
+			.prepared_data
+			.iter()
+			.enumerate()
+			.map(|(index, _)| {
+				category
+					.and_then(|field| frame.column(field).ok())
+					.and_then(|column| {
+						crate::plot::series::SeriesIdentity::from_column(
+							column,
+							index,
+							crate::plot::spec::SemanticType::Nominal,
+						)
+					})
+			})
+			.collect();
+		self
+	}
+
+	fn category_identity(
+		&self,
+		category: Option<&str>,
+	) -> Option<crate::plot::series::SeriesIdentity> {
+		crate::plot::series::unanimous_identity(
+			self.prepared_data
+				.iter()
+				.enumerate()
+				.filter(|(_, row)| row.category() == category)
+				.map(|(index, _)| self.row_identities.get(index).and_then(Option::as_ref)),
+		)
+	}
+
 	fn display_ranges(&self) -> Vec<(f64, f64)> {
 		self.prepared_data
 			.extrema()
@@ -57,6 +96,9 @@ impl ParallelPlotKernel {
 }
 
 impl PlotKernel for ParallelPlotKernel {
+	fn series_identities(&self) -> Vec<crate::plot::series::SeriesIdentity> {
+		self.row_identities.iter().flatten().cloned().collect()
+	}
 	fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Parallel {
 			dimensions: self.prepared_data.dimensions().to_vec(),
@@ -76,25 +118,32 @@ impl PlotKernel for ParallelPlotKernel {
 		if num_dims < 2 {
 			return;
 		}
-		for row in self.prepared_data.iter() {
+		for (index, row) in self.prepared_data.iter().enumerate() {
 			let color = self.category_color(row.category(), &settings);
 			let stroke = Stroke {
 				style: Style::Solid(color),
 				width: 1.5,
 				..Default::default()
 			};
-			backend.stroke_path(
-				&|builder| {
-					for (d, &val) in row.values().iter().enumerate() {
-						let (p, _) = transform.categorical(d, val);
-						if d == 0 {
-							builder.move_to(p);
-						} else {
-							builder.line_to(p);
-						}
-					}
+			crate::plot::series::draw_series(
+				backend,
+				self.row_identities.get(index).and_then(Option::as_ref),
+				&settings,
+				&mut |backend| {
+					backend.stroke_path(
+						&|builder| {
+							for (d, &val) in row.values().iter().enumerate() {
+								let (p, _) = transform.categorical(d, val);
+								if d == 0 {
+									builder.move_to(p);
+								} else {
+									builder.line_to(p);
+								}
+							}
+						},
+						stroke.clone(),
+					)
 				},
-				stroke,
 			);
 		}
 	}
@@ -103,7 +152,7 @@ impl PlotKernel for ParallelPlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
+		let mut content = crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
 			self.prepared_data.categories().iter().map(|category| {
 				(
 					category.as_deref().unwrap_or("All Data").to_owned(),
@@ -112,7 +161,15 @@ impl PlotKernel for ParallelPlotKernel {
 			}),
 			crate::plot::legend::LegendSample::Swatch,
 			crate::plot::legend::LegendProvenance::Named,
-		)
+		)?;
+		crate::plot::legend::attach_identities(
+			&mut content,
+			self.prepared_data
+				.categories()
+				.iter()
+				.map(|category| self.category_identity(category.as_deref())),
+		);
+		Some(content)
 	}
 
 	fn hit(
@@ -177,6 +234,7 @@ mod tests {
 		.expect("parallel oracle frame");
 		let dimensions = vec!["second".to_owned(), "first".to_owned()];
 		let kernel = ParallelPlotKernel {
+			row_identities: Vec::new(),
 			prepared_data: Arc::new(
 				prepare_multivariate_rows(&frame, &dimensions, Some("group"))
 					.expect("valid parallel oracle"),
@@ -224,6 +282,7 @@ mod tests {
 			None,
 		);
 		let kernel = ParallelPlotKernel {
+			row_identities: Vec::new(),
 			prepared_data: Arc::new(
 				MultivariateRows::from_rows(&fields, Vec::new()).expect("empty rows"),
 			),
@@ -247,6 +306,7 @@ mod tests {
 		.expect("repeated-category frame");
 		let dimensions = vec!["left".to_owned(), "right".to_owned()];
 		let kernel = ParallelPlotKernel {
+			row_identities: Vec::new(),
 			prepared_data: Arc::new(
 				prepare_multivariate_rows(&frame, &dimensions, Some("group"))
 					.expect("all repeated-category observations remain valid"),
@@ -275,6 +335,7 @@ mod tests {
 			None,
 		);
 		let kernel = ParallelPlotKernel {
+			row_identities: Vec::new(),
 			prepared_data: Arc::new(
 				MultivariateRows::from_rows(
 					&fields,

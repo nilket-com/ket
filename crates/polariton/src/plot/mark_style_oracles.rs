@@ -88,6 +88,7 @@ fn product_0080_0082_0083_default_operation_bank_tracks_the_box_role_split() {
 
 	let area = StackedAreaPlotKernel {
 		prepared_data: Arc::new(StackedAreaPreparedData {
+			identities: Vec::new(),
 			categories: vec!["A".to_owned(), "B".to_owned()],
 			unique_xs: vec![0.0, 1.0],
 			category_values: vec![vec![1.0, 2.0], vec![2.0, 1.0]],
