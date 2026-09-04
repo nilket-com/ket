@@ -31,10 +31,76 @@ impl BoxPlotKernel {
 		transform: &CoordinateTransformer<'_>,
 		cursor: Point,
 	) -> Option<OutlierHit<'a>> {
-		let PlotLayout::CategoricalX { categories, .. } = transform.layout else {
-			return None;
-		};
 		let mut nearest: Option<(f32, OutlierHit<'a>)> = None;
+		self.for_each_outlier(transform, |point, category| {
+			let dx = cursor.x - point.center.x;
+			let dy = cursor.y - point.center.y;
+			let distance = dx * dx + dy * dy;
+			if distance > OUTLIER_RADIUS * OUTLIER_RADIUS {
+				return;
+			}
+			let replace = nearest.as_ref().is_none_or(|(best, hit)| {
+				distance < *best || (distance == *best && point.ordinal < hit.ordinal)
+			});
+			if replace {
+				nearest = Some((
+					distance,
+					OutlierHit {
+						category,
+						value: point.value,
+						ordinal: point.ordinal,
+					},
+				));
+			}
+		});
+		nearest.map(|(_, hit)| hit)
+	}
+
+	/// PRODUCT-0155 §3: the box stage's geometry — each category's closed
+	/// band between its whiskers — shared by the hit and the region export.
+	fn for_each_box<'a>(
+		&'a self,
+		transform: &CoordinateTransformer<'_>,
+		mut visit: impl FnMut(usize, &'a str, &'a TukeyBox, BandEdges) -> bool,
+	) {
+		let PlotLayout::CategoricalX { categories, .. } = transform.layout else {
+			return;
+		};
+		for (category, stats) in self.prepared_data.boxes.iter() {
+			let Some(shared_index) = categories
+				.iter()
+				.position(|candidate| candidate == category)
+			else {
+				continue;
+			};
+			let (center, band_width) = transform.categorical(shared_index, 0.0);
+			let low = transform.categorical(shared_index, stats.whisker_low()).0.y;
+			let high = transform
+				.categorical(shared_index, stats.whisker_high())
+				.0
+				.y;
+			let band = BandEdges {
+				left: center.x - band_width / 2.0,
+				right: center.x + band_width / 2.0,
+				top: low.min(high),
+				bottom: low.max(high),
+			};
+			if !visit(shared_index, category, stats, band) {
+				return;
+			}
+		}
+	}
+
+	/// The outlier stage's geometry: every outlier's centre with its category
+	/// and ordinal, in the order the nearest scan visits them.
+	fn for_each_outlier<'a>(
+		&'a self,
+		transform: &CoordinateTransformer<'_>,
+		mut visit: impl FnMut(OutlierPoint, &'a str),
+	) {
+		let PlotLayout::CategoricalX { categories, .. } = transform.layout else {
+			return;
+		};
 		for (category, stats) in self.prepared_data.boxes.iter() {
 			let Some(shared_index) = categories
 				.iter()
@@ -43,28 +109,96 @@ impl BoxPlotKernel {
 				continue;
 			};
 			for point in outlier_points(transform, shared_index, stats) {
-				let dx = cursor.x - point.center.x;
-				let dy = cursor.y - point.center.y;
-				let distance = dx * dx + dy * dy;
-				if distance > OUTLIER_RADIUS * OUTLIER_RADIUS {
-					continue;
-				}
-				let replace = nearest.as_ref().is_none_or(|(best, hit)| {
-					distance < *best || (distance == *best && point.ordinal < hit.ordinal)
-				});
-				if replace {
-					nearest = Some((
-						distance,
-						OutlierHit {
-							category,
-							value: point.value,
-							ordinal: point.ordinal,
-						},
-					));
-				}
+				visit(point, category);
 			}
 		}
-		nearest.map(|(_, hit)| hit)
+	}
+
+	fn outlier_plot_hit(&self, hit: OutlierHit<'_>) -> crate::plot::common::PlotHit {
+		let plot_hit = crate::plot::common::PlotHit::new(
+			crate::plot::common::MarkFamily::BOXPLOT,
+			crate::plot::common::HitDimensionality::Point,
+			0,
+		)
+		.labeled(
+			"Category",
+			crate::plot::spec::SemanticType::Nominal,
+			crate::plot::common::HitValue::nominal(hit.category),
+		)
+		.labeled(
+			"Outlier",
+			crate::plot::spec::SemanticType::Quantitative,
+			crate::plot::common::axis_hit_value(
+				hit.value,
+				&self.prepared_data.y_axis_type,
+				format_label(hit.value, &self.prepared_data.y_axis_type),
+			),
+		);
+		let candidate = self
+			.prepared_data
+			.selection_candidates
+			.get(hit.category)
+			.and_then(|candidates| candidates.outlier_candidates.get(hit.ordinal))
+			.cloned();
+		match candidate {
+			Some(candidate) => plot_hit.with_candidate(candidate),
+			None => plot_hit,
+		}
+	}
+
+	fn box_plot_hit(
+		&self,
+		shared_index: usize,
+		category: &str,
+		stats: &TukeyBox,
+	) -> crate::plot::common::PlotHit {
+		let yt = self.prepared_data.y_axis_type.clone();
+		let labeled =
+			|value: f64| crate::plot::common::axis_hit_value(value, &yt, format_label(value, &yt));
+		let plot_hit = crate::plot::common::PlotHit::new(
+			crate::plot::common::MarkFamily::BOXPLOT,
+			crate::plot::common::HitDimensionality::Area,
+			shared_index,
+		)
+		.labeled(
+			"Category",
+			crate::plot::spec::SemanticType::Nominal,
+			crate::plot::common::HitValue::nominal(category),
+		)
+		.labeled(
+			"Whisker high",
+			crate::plot::spec::SemanticType::Quantitative,
+			labeled(stats.whisker_high()),
+		)
+		.labeled(
+			"Q3",
+			crate::plot::spec::SemanticType::Quantitative,
+			labeled(stats.q3()),
+		)
+		.labeled(
+			"Median",
+			crate::plot::spec::SemanticType::Quantitative,
+			labeled(stats.median()),
+		)
+		.labeled(
+			"Q1",
+			crate::plot::spec::SemanticType::Quantitative,
+			labeled(stats.q1()),
+		)
+		.labeled(
+			"Whisker low",
+			crate::plot::spec::SemanticType::Quantitative,
+			labeled(stats.whisker_low()),
+		);
+		let candidate = self
+			.prepared_data
+			.selection_candidates
+			.get(category)
+			.map(|candidates| candidates.box_candidate.clone());
+		match candidate {
+			Some(candidate) => plot_hit.with_candidate(candidate),
+			None => plot_hit,
+		}
 	}
 }
 
@@ -214,127 +348,78 @@ impl PlotKernel for BoxPlotKernel {
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
 	) -> Option<crate::plot::common::PlotHit> {
-		if let Some(cursor_pos) = cursor.position()
-			&& let PlotLayout::CategoricalX { categories, .. } = transform.layout
-		{
-			if let Some(hit) = self.hit_outlier(transform, cursor_pos) {
-				let plot_hit = crate::plot::common::PlotHit::new(
-					crate::plot::common::MarkFamily::BOXPLOT,
-					crate::plot::common::HitDimensionality::Point,
-					0,
-				)
-				.labeled(
-					"Category",
-					crate::plot::spec::SemanticType::Nominal,
-					crate::plot::common::HitValue::nominal(hit.category),
-				)
-				.labeled(
-					"Outlier",
-					crate::plot::spec::SemanticType::Quantitative,
-					crate::plot::common::axis_hit_value(
-						hit.value,
-						&self.prepared_data.y_axis_type,
-						format_label(hit.value, &self.prepared_data.y_axis_type),
-					),
-				);
-				let candidate = self
-					.prepared_data
-					.selection_candidates
-					.get(hit.category)
-					.and_then(|candidates| candidates.outlier_candidates.get(hit.ordinal))
-					.cloned();
-				return Some(match candidate {
-					Some(candidate) => plot_hit.with_candidate(candidate),
-					None => plot_hit,
-				});
-			}
-			for (category, stats) in self.prepared_data.boxes.iter() {
-				let Some(shared_index) = categories
-					.iter()
-					.position(|candidate| candidate == category)
-				else {
-					continue;
-				};
-				let (center, band_width) = transform.categorical(shared_index, 0.0);
-				let left = center.x - band_width / 2.0;
-				let right = center.x + band_width / 2.0;
-				if cursor_pos.x >= left && cursor_pos.x <= right {
-					let low = transform.categorical(shared_index, stats.whisker_low()).0.y;
-					let high = transform
-						.categorical(shared_index, stats.whisker_high())
-						.0
-						.y;
-					if cursor_pos.y >= low.min(high) && cursor_pos.y <= low.max(high) {
-						let yt = self.prepared_data.y_axis_type.clone();
-						let plot_hit = crate::plot::common::PlotHit::new(
-							crate::plot::common::MarkFamily::BOXPLOT,
-							crate::plot::common::HitDimensionality::Area,
-							shared_index,
-						)
-						.labeled(
-							"Category",
-							crate::plot::spec::SemanticType::Nominal,
-							crate::plot::common::HitValue::nominal(category),
-						)
-						.labeled(
-							"Whisker high",
-							crate::plot::spec::SemanticType::Quantitative,
-							crate::plot::common::axis_hit_value(
-								stats.whisker_high(),
-								&yt,
-								format_label(stats.whisker_high(), &yt),
-							),
-						)
-						.labeled(
-							"Q3",
-							crate::plot::spec::SemanticType::Quantitative,
-							crate::plot::common::axis_hit_value(
-								stats.q3(),
-								&yt,
-								format_label(stats.q3(), &yt),
-							),
-						)
-						.labeled(
-							"Median",
-							crate::plot::spec::SemanticType::Quantitative,
-							crate::plot::common::axis_hit_value(
-								stats.median(),
-								&yt,
-								format_label(stats.median(), &yt),
-							),
-						)
-						.labeled(
-							"Q1",
-							crate::plot::spec::SemanticType::Quantitative,
-							crate::plot::common::axis_hit_value(
-								stats.q1(),
-								&yt,
-								format_label(stats.q1(), &yt),
-							),
-						)
-						.labeled(
-							"Whisker low",
-							crate::plot::spec::SemanticType::Quantitative,
-							crate::plot::common::axis_hit_value(
-								stats.whisker_low(),
-								&yt,
-								format_label(stats.whisker_low(), &yt),
-							),
-						);
-						let candidate = self
-							.prepared_data
-							.selection_candidates
-							.get(category)
-							.map(|candidates| candidates.box_candidate.clone());
-						return Some(match candidate {
-							Some(candidate) => plot_hit.with_candidate(candidate),
-							None => plot_hit,
-						});
-					}
-				}
-			}
+		let cursor_pos = cursor.position()?;
+		if let Some(hit) = self.hit_outlier(transform, cursor_pos) {
+			return Some(self.outlier_plot_hit(hit));
 		}
-		None
+		let mut found = None;
+		self.for_each_box(transform, |shared_index, category, stats, band| {
+			if cursor_pos.x >= band.left
+				&& cursor_pos.x <= band.right
+				&& cursor_pos.y >= band.top
+				&& cursor_pos.y <= band.bottom
+			{
+				found = Some(self.box_plot_hit(shared_index, category, stats));
+				return false;
+			}
+			true
+		});
+		found
+	}
+	fn hit_regions(
+		&self,
+		transform: &CoordinateTransformer,
+		_settings: &crate::plot::theme::PlotSettings,
+	) -> Option<Vec<crate::plot::common::ResolutionStage>> {
+		let mut outlier_regions = Vec::new();
+		self.for_each_outlier(transform, |point, category| {
+			outlier_regions.push(crate::plot::common::RegionEntry {
+				region: crate::plot::common::HitRegion::Circle {
+					center: point.center,
+					radius: OUTLIER_RADIUS,
+				},
+				ordinal: point.ordinal as u32,
+				hit: self.outlier_plot_hit(OutlierHit {
+					category,
+					value: point.value,
+					ordinal: point.ordinal,
+				}),
+			});
+		});
+		let mut box_regions = Vec::new();
+		self.for_each_box(transform, |shared_index, category, stats, band| {
+			box_regions.push(crate::plot::common::RegionEntry {
+				region: crate::plot::common::HitRegion::Rectangle {
+					x0: band.left,
+					y0: band.top,
+					x1: band.right,
+					y1: band.bottom,
+					inclusive_max: true,
+				},
+				ordinal: shared_index as u32,
+				hit: self.box_plot_hit(shared_index, category, stats),
+			});
+			true
+		});
+		let stage = |policy, tie, regions| crate::plot::common::ResolutionStage {
+			policy,
+			tie,
+			within: None,
+			origin: iced::Point::ORIGIN,
+			regions,
+		};
+		Some(vec![
+			stage(
+				crate::plot::common::ResolutionPolicy::NearestCentreWithin,
+				crate::plot::common::TieRule::LowerOrdinalWins,
+				outlier_regions,
+			),
+			stage(
+				crate::plot::common::ResolutionPolicy::FirstInOrder,
+				crate::plot::common::TieRule::LowerOrdinalWins,
+				box_regions,
+			),
+		])
 	}
 
 	fn legend_content(
@@ -1268,4 +1353,12 @@ mod tests {
 		);
 		assert_eq!(kernel.legend_content(&settings), None);
 	}
+}
+
+/// A category band's closed edges, exactly as the hit test compares them.
+struct BandEdges {
+	left: f32,
+	right: f32,
+	top: f32,
+	bottom: f32,
 }

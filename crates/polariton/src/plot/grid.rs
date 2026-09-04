@@ -696,6 +696,87 @@ impl PlotComposite for PlotGridKernel {
 	fn owns_global_headings(&self) -> bool {
 		self.cells.len() == 1
 	}
+	fn hit_regions(
+		&self,
+		bounds: Rect<Widget>,
+		padding: f32,
+		title: &str,
+		settings: &PlotSettings,
+	) -> Option<Vec<crate::plot::common::ResolutionStage>> {
+		let resolved = settings.resolve();
+		let figure_legend_reservation = crate::plot::legend::union(
+			self.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_reservation_content(&resolved)),
+		);
+		let legend = crate::plot::legend::legend_layout(
+			bounds,
+			figure_legend_reservation.as_ref(),
+			&resolved,
+		);
+		let outer = grid_outer_area(legend.content_bounds, padding);
+		let layouts = self.cell_layouts(settings);
+		let requirements =
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
+		let x_label_visible = grid_x_label_visible(self, &resolved);
+		let tiled = grid_tiled_area_with_requirements(
+			outer,
+			title,
+			&requirements,
+			x_label_visible,
+			&resolved,
+		);
+		let mut stages = Vec::new();
+		for (index, cell) in self.cells.iter().enumerate() {
+			let (position, layout) = &layouts[index];
+			let cell_bounds = grid_cell_bounds_with_settings(
+				tiled,
+				self.arrangement,
+				*position,
+				self.figure_grid,
+			);
+			let cell_resolved = cell.kernel.resolve_settings(settings);
+			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
+			let inner_bounds = inner.into_iced();
+			let transform = CoordinateTransformer::new(
+				layout,
+				IcedRectangle::new(Point::ORIGIN, inner_bounds.size()),
+			);
+			cell.kernel
+				.prepare_viewport(&transform, crate::plot::common::ViewportMotion::Settled);
+			// A cell whose family enumerates nothing makes the whole composite
+			// non-inspectable: a partial projection would answer some cells
+			// and silently miss others.
+			let cell_stages = cell.kernel.hit_regions(&transform, settings)?;
+			let gate = cell_bounds.into_iced();
+			for stage in cell_stages {
+				let mut stage = stage.at_origin(Point::new(inner.x(), inner.y()));
+				// `Rect::contains` is iced's half-open rectangle; say so explicitly.
+				stage.within = Some(crate::plot::common::HitRegion::Rectangle {
+					x0: gate.x,
+					y0: gate.y,
+					x1: gate.x + gate.width,
+					y1: gate.y + gate.height,
+					inclusive_max: false,
+				});
+				for entry in &mut stage.regions {
+					if let Some((field, value)) = &cell.partition_candidate
+						&& let Some(candidate) = &mut entry.hit.candidate
+					{
+						candidate.constraints.push((field.clone(), value.clone()));
+					}
+					if let (Some(field), Some(value)) = (&self.partition_field, &cell.cell.label) {
+						entry.hit = entry.hit.clone().with_facet(crate::plot::common::HitFacet {
+							field: field.clone(),
+							value: value.clone(),
+						});
+					}
+				}
+				stages.push(stage);
+			}
+		}
+		Some(stages)
+	}
 
 	fn viewport_geometry(
 		&self,

@@ -82,6 +82,77 @@ impl std::error::Error for BubblePreparationError {
 	}
 }
 
+impl BubblePlotKernel {
+	/// PRODUCT-0155 §3: the one constructor the hit and the region export
+	/// share. Visits every observation's centre and radius in prepared-data
+	/// order — the order the desktop answers — without collecting; the hit for
+	/// an observation is built only when the visitor asks for it.
+	fn for_each_observation(
+		&self,
+		transform: &CoordinateTransformer,
+		mut visit: impl FnMut(iced::Point, f32, &dyn Fn() -> crate::plot::common::PlotHit) -> bool,
+	) {
+		let size_min = self.prepared_data.observations.size_range().0;
+		let size_max = self.prepared_data.observations.size_range().1;
+		let size_delta = (size_max - size_min).max(f64::EPSILON);
+		for point in self.prepared_data.observations.iter() {
+			let center = transform.cartesian(point.x(), point.y());
+			let t_size = ((point.size() - size_min) / size_delta) as f32;
+			let radius = 2.0 + t_size * 28.0;
+			let make_hit = || {
+				let mut hit = crate::plot::common::PlotHit::new(
+					crate::plot::common::MarkFamily::BUBBLE,
+					crate::plot::common::HitDimensionality::Point,
+					0,
+				);
+				if let Some(label) = point.label() {
+					hit = hit.labeled(
+						"Label",
+						crate::plot::spec::SemanticType::Nominal,
+						crate::plot::common::HitValue::nominal(label),
+					);
+				}
+				hit.labeled(
+					"X",
+					crate::plot::common::axis_hit_semantic_type(&self.prepared_data.x_axis_type),
+					crate::plot::common::axis_hit_value(
+						point.x(),
+						&self.prepared_data.x_axis_type,
+						format_label(point.x(), &self.prepared_data.x_axis_type),
+					),
+				)
+				.labeled(
+					"Y",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::plot::common::HitValue::quantitative(
+						point.y(),
+						format!("{:.2}", point.y()),
+					),
+				)
+				.labeled(
+					"Size",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::plot::common::HitValue::quantitative(
+						point.size(),
+						format!("{:.2}", point.size()),
+					),
+				)
+				.labeled(
+					"Color",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::plot::common::HitValue::quantitative(
+						point.color(),
+						format!("{:.2}", point.color()),
+					),
+				)
+			};
+			if !visit(center, radius, &make_hit) {
+				return;
+			}
+		}
+	}
+}
+
 impl PlotKernel for BubblePlotKernel {
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Cartesian {
@@ -176,91 +247,42 @@ impl PlotKernel for BubblePlotKernel {
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
 	) -> Option<crate::plot::common::PlotHit> {
-		if let Some(cursor_pos) = cursor.position() {
-			let size_min = self.prepared_data.observations.size_range().0;
-			let size_max = self.prepared_data.observations.size_range().1;
-			let size_delta = (size_max - size_min).max(f64::EPSILON);
-			for point in self.prepared_data.observations.iter() {
-				let p = transform.cartesian(point.x(), point.y());
-				let dx = cursor_pos.x - p.x;
-				let dy = cursor_pos.y - p.y;
-				let dist_sq = dx * dx + dy * dy;
-				let t_size = ((point.size() - size_min) / size_delta) as f32;
-				let radius = 2.0 + t_size * 28.0;
-				if dist_sq <= radius * radius {
-					let mut lines = Vec::with_capacity(5);
-					if let Some(label) = point.label() {
-						lines.push(label.to_owned());
-					}
-					lines.push(format!(
-						"{}: {}",
-						self.prepared_data.x_label,
-						format_label(point.x(), &self.prepared_data.x_axis_type)
-					));
-					lines.push(format!("{}: {:.2}", self.prepared_data.y_label, point.y()));
-					lines.push(format!(
-						"{}: {:.2}",
-						self.prepared_data.size_label,
-						point.size()
-					));
-					lines.push(format!(
-						"{}: {:.2}",
-						self.prepared_data.color_label,
-						point.color()
-					));
-					let mut hit = crate::plot::common::PlotHit::new(
-						crate::plot::common::MarkFamily::BUBBLE,
-						crate::plot::common::HitDimensionality::Point,
-						0,
-					);
-					if let Some(label) = point.label() {
-						hit = hit.labeled(
-							"Label",
-							crate::plot::spec::SemanticType::Nominal,
-							crate::plot::common::HitValue::nominal(label),
-						);
-					}
-					return Some(
-						hit.labeled(
-							"X",
-							crate::plot::common::axis_hit_semantic_type(
-								&self.prepared_data.x_axis_type,
-							),
-							crate::plot::common::axis_hit_value(
-								point.x(),
-								&self.prepared_data.x_axis_type,
-								format_label(point.x(), &self.prepared_data.x_axis_type),
-							),
-						)
-						.labeled(
-							"Y",
-							crate::plot::spec::SemanticType::Quantitative,
-							crate::plot::common::HitValue::quantitative(
-								point.y(),
-								format!("{:.2}", point.y()),
-							),
-						)
-						.labeled(
-							"Size",
-							crate::plot::spec::SemanticType::Quantitative,
-							crate::plot::common::HitValue::quantitative(
-								point.size(),
-								format!("{:.2}", point.size()),
-							),
-						)
-						.labeled(
-							"Color",
-							crate::plot::spec::SemanticType::Quantitative,
-							crate::plot::common::HitValue::quantitative(
-								point.color(),
-								format!("{:.2}", point.color()),
-							),
-						),
-					);
-				}
+		let cursor_pos = cursor.position()?;
+		let mut found = None;
+		self.for_each_observation(transform, |center, radius, make_hit| {
+			let dx = cursor_pos.x - center.x;
+			let dy = cursor_pos.y - center.y;
+			if dx * dx + dy * dy <= radius * radius {
+				found = Some(make_hit());
+				return false;
 			}
-		}
-		None
+			true
+		});
+		found
+	}
+	fn hit_regions(
+		&self,
+		transform: &CoordinateTransformer,
+		_settings: &crate::plot::theme::PlotSettings,
+	) -> Option<Vec<crate::plot::common::ResolutionStage>> {
+		Some(vec![crate::plot::common::ResolutionStage {
+			policy: crate::plot::common::ResolutionPolicy::FirstInOrder,
+			tie: crate::plot::common::TieRule::LowerOrdinalWins,
+			within: None,
+			origin: iced::Point::ORIGIN,
+			regions: {
+				let mut regions = Vec::new();
+				self.for_each_observation(transform, |center, radius, make_hit| {
+					regions.push(crate::plot::common::RegionEntry {
+						region: crate::plot::common::HitRegion::Circle { center, radius },
+						ordinal: regions.len() as u32,
+						hit: make_hit(),
+					});
+					true
+				});
+				regions
+			},
+		}])
 	}
 
 	fn x_label(&self) -> String {

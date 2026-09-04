@@ -2237,6 +2237,17 @@ pub trait PlotComposite: Send + Sync {
 		cursor: Pt<Widget>,
 		settings: &PlotSettings,
 	) -> Option<PlotHit>;
+	/// PRODUCT-0155 §3: the composite's regions in widget space, every cell
+	/// gated by its own bounds so "the cell under the cursor" is reproduced.
+	fn hit_regions(
+		&self,
+		_bounds: Rect<Widget>,
+		_padding: f32,
+		_title: &str,
+		_settings: &PlotSettings,
+	) -> Option<Vec<ResolutionStage>> {
+		None
+	}
 
 	/// PRODUCT-0150 §9: the active inner rectangle and continuous domains for
 	/// the facet cell under the cursor. Gaps and non-affine cells return none.
@@ -2563,6 +2574,16 @@ pub trait PlotKernel: Send + Sync {
 	) -> Option<PlotHit> {
 		self.hit(transform, cursor)
 	}
+	/// PRODUCT-0155 §3: every region this kernel's hit would answer, in the
+	/// kernel's own coordinate space, built from the same geometry the hit
+	/// method uses. `None` means the family is not yet inspectable off-desktop.
+	fn hit_regions(
+		&self,
+		_transform: &CoordinateTransformer,
+		_settings: &PlotSettings,
+	) -> Option<Vec<ResolutionStage>> {
+		None
+	}
 
 	/// PRODUCT-0151's admission seam. A kernel opts into click selection only
 	/// by projecting the complete predicate to honest data-space anchors.
@@ -2747,6 +2768,79 @@ impl HitField {
 pub struct HitFacet {
 	pub field: String,
 	pub value: String,
+}
+
+/// PRODUCT-0155 §3: one exact region a kernel's hit method would answer.
+/// Coordinates are in the space the kernel's hit takes — plot-local for a
+/// kernel, widget for a composite — and the widget seam offsets them into the
+/// figure's `viewBox`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HitRegion {
+	/// `inclusive_max` mirrors the kernel's own compare: iced's
+	/// `Rectangle::contains` is half-open on the far edges, the box plot's
+	/// band test is closed.
+	Rectangle {
+		x0: f32,
+		y0: f32,
+		x1: f32,
+		y1: f32,
+		inclusive_max: bool,
+	},
+	/// Closed disc: the kernels compare squared distance with `<=`.
+	Circle { center: Point, radius: f32 },
+}
+
+/// How one stage picks among the regions containing the pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolutionPolicy {
+	/// The first region in stage order containing the pointer.
+	FirstInOrder,
+	/// Among containing circles, the nearest centre; `TieRule` breaks equal
+	/// squared distances.
+	NearestCentreWithin,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TieRule {
+	/// Scatter's scan: a later region at an equal distance replaces the
+	/// earlier one (`<=`).
+	LaterWins,
+	/// The box plot's outlier scan: at an equal distance the lower ordinal
+	/// wins; otherwise the earlier region stands.
+	LowerOrdinalWins,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegionEntry {
+	pub region: HitRegion,
+	/// The kernel's own ordinal for the mark, consumed by `LowerOrdinalWins`.
+	pub ordinal: u32,
+	pub hit: PlotHit,
+}
+
+/// One resolution stage: the browser evaluates stages in order and stops at
+/// the first that yields. `within`, when present, gates the whole stage on
+/// the pointer being inside that rectangle — how a facet composite reproduces
+/// "the cell under the cursor" exactly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolutionStage {
+	pub policy: ResolutionPolicy,
+	pub tie: TieRule,
+	/// Explicit edges with the composite's own containment compare, in
+	/// widget space.
+	pub within: Option<HitRegion>,
+	/// The widget-space origin of the regions' own space. A pointer is moved
+	/// into region space by subtracting this first, exactly as the desktop
+	/// moves its cursor into the plot area before any kernel compares.
+	pub origin: Point,
+	pub regions: Vec<RegionEntry>,
+}
+
+impl ResolutionStage {
+	pub fn at_origin(mut self, origin: Point) -> Self {
+		self.origin = origin;
+		self
+	}
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5018,7 +5112,42 @@ impl<'a> PlotWidget<'a> {
 			})
 	}
 
-	fn structured_hit_at(&self, bounds: Rectangle, cursor: Cursor) -> Option<PlotHit> {
+	/// PRODUCT-0155 §3: the projection seam, beside the hit it mirrors. Same
+	/// bounds, same resolved settings, same dispatch — the composite when there
+	/// is one, the kernel otherwise — and the kernel's plot-local regions are
+	/// offset into widget space, which at export is the SVG's `viewBox`.
+	pub(crate) fn hit_projection(&self, bounds: Rectangle) -> Option<Vec<ResolutionStage>> {
+		let widget_bounds = Rect::<Widget>::from_iced_frame(bounds);
+		if let Some(composite) = self.kernel.composite() {
+			return composite.hit_regions(
+				widget_bounds,
+				self.padding,
+				&self.title,
+				&self.settings_model,
+			);
+		}
+		let legend_reservation = self
+			.kernel
+			.legend_reservation_content(&self.settings)
+			.and_then(crate::plot::legend::apply_policy);
+		let legend = legend_layout(widget_bounds, legend_reservation.as_ref(), &self.settings);
+		let layout = self.kernel.layout(self.settings.clone());
+		let requirements = BandRequirements::from_layout(&layout, &self.settings);
+		let plot_area = self.plot_area(legend.content_bounds, &requirements);
+		let transform = CoordinateTransformer::new(&layout, plot_area.into_iced());
+		self.kernel
+			.prepare_viewport(&transform, self.viewport_motion);
+		let stages = self.kernel.hit_regions(&transform, &self.settings_model)?;
+		let origin = Point::new(plot_area.x(), plot_area.y());
+		Some(
+			stages
+				.into_iter()
+				.map(|stage| stage.at_origin(origin))
+				.collect(),
+		)
+	}
+
+	pub(crate) fn structured_hit_at(&self, bounds: Rectangle, cursor: Cursor) -> Option<PlotHit> {
 		let window_bounds = Rect::<Window>::from_iced_layout(bounds);
 		let widget_bounds = Rect::<Widget>::from_iced_frame(bounds);
 		let widget_cursor = cursor.position().map(|position| {

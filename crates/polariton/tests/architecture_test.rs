@@ -4778,6 +4778,9 @@ fn product_0114_band_requirements_precede_and_feed_shared_geometry() {
 		"fn render_plot_layer(",
 		"fn render_overlay_layer(",
 		"fn hit(",
+		// PRODUCT-0155 §3: the projection traversal derives geometry exactly as
+		// the hit does; it is held to the same order here.
+		"fn hit_regions(",
 	] {
 		let section = composite
 			.split(entrypoint)
@@ -4813,14 +4816,15 @@ fn product_0114_band_requirements_precede_and_feed_shared_geometry() {
 	// PRODUCT-0149 adds the interactive request and draw traversals to the three
 	// exact/overlay/hit traversals banked here; PRODUCT-0150 adds the gesture
 	// viewport-geometry traversal; PRODUCT-0151 adds selection geometry,
-	// click-admission, and retained-emphasis traversals. Each independently
+	// click-admission, and retained-emphasis traversals. PRODUCT-0155 adds the hit-projection
+	// traversal. Each independently
 	// resolves the cell's plot rectangle through its kernel.
 	assert_eq!(
 		composite
 			.matches("cell.kernel.resolve_settings(settings)")
 			.count(),
-		9,
-		"all nine grid entry points resolve the cell's plot area through its own kernel"
+		10,
+		"all ten grid entry points resolve the cell's plot area through its own kernel"
 	);
 	assert!(
 		!composite.contains("grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &resolved)"),
@@ -6271,7 +6275,7 @@ fn product_0154_package_dtos_stay_free_of_placement_token_and_renderer_authority
 /// PRODUCT-0154 §9: the shell is a document. The emitter contains no script
 /// element, so no package can either.
 #[test]
-fn product_0154_shell_emitter_contains_no_script() {
+fn product_0154_shell_emitter_inlines_one_pinned_script() {
 	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let publication =
 		std::fs::read_to_string(src.join("publication.rs")).expect("read publication");
@@ -6282,7 +6286,19 @@ fn product_0154_shell_emitter_contains_no_script() {
 		.split("\n}\n")
 		.next()
 		.expect("shell emitter body");
-	assert!(!shell.to_ascii_lowercase().contains("<script"));
+	// PRODUCT-0155 §6: the emitter inlines exactly one executable script, the
+	// pinned asset, and names its hash in the policy; void elements close.
+	assert_eq!(
+		shell.matches("<script>").count(),
+		1,
+		"one executable script element"
+	);
+	assert!(shell.contains("html.push_str(INSPECT_JS);"));
+	assert!(shell.contains("script-src 'sha256-"));
+	assert!(
+		shell.contains("charset=\\\"utf-8\\\"/>"),
+		"void elements are XML-closed"
+	);
 	assert!(
 		shell.contains("@font-face"),
 		"positive control: the emitter is the one read"
@@ -6318,4 +6334,81 @@ serde = "1"
 		manifest_dependency_guard::forbidden_dependencies(clean, "", ProductBoundary::Polariton)
 			.is_empty()
 	);
+}
+
+/// PRODUCT-0155 §6: the inspection asset is lookup glue. It names no DOM
+/// markup sink, no network or evaluation primitive, and — because it is
+/// inlined into a polyglot shell — no literal `<` or `&`. The specimen proves
+/// the assay fires.
+#[test]
+fn product_0155_inspection_asset_is_glue_with_a_positive_control() {
+	let asset = std::fs::read_to_string(
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/web/inspect.js"),
+	)
+	.expect("read inspect.js");
+	fn violations(source: &str) -> Vec<&'static str> {
+		let mut found = Vec::new();
+		for (needle, name) in [
+			("innerHTML", "innerHTML"),
+			("outerHTML", "outerHTML"),
+			("insertAdjacentHTML", "insertAdjacentHTML"),
+			("document.write", "document.write"),
+			("eval(", "eval"),
+			("Function(", "Function"),
+			("fetch(", "fetch"),
+			("XMLHttpRequest", "XMLHttpRequest"),
+			("WebSocket", "WebSocket"),
+			("import(", "dynamic import"),
+			("<", "literal less-than"),
+			("&", "literal ampersand"),
+		] {
+			if source.contains(needle) {
+				found.push(name);
+			}
+		}
+		found
+	}
+	assert!(violations(&asset).is_empty(), "{:?}", violations(&asset));
+	assert!(asset.contains("textContent"), "prose is set as text");
+	assert!(
+		asset.contains("Math.fround"),
+		"distances are the desktop's 32-bit arithmetic"
+	);
+	let specimen = "var t = a < b; el.innerHTML = fetch(url);";
+	assert_eq!(
+		violations(specimen),
+		["innerHTML", "fetch", "literal less-than"],
+		"positive control: the glue assay must fire"
+	);
+}
+
+/// PRODUCT-0155 gate 1: the test-suite JavaScript engine is exactly the one
+/// the record names, default features off, a dev-dependency only, and no
+/// other engine is admitted.
+#[test]
+fn product_0155_javascript_engine_is_boa_dev_only_without_default_features() {
+	let manifest =
+		std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+			.expect("read Polariton manifest");
+	let (dependencies, dev) = manifest
+		.split_once("[dev-dependencies]")
+		.expect("dev-dependencies section");
+	assert!(
+		!dependencies.contains("boa_engine"),
+		"the engine never ships: dev-dependency only"
+	);
+	assert!(
+		dev.contains("boa_engine = { version = \"0.22.0\", default-features = false }"),
+		"the engine is boa_engine 0.22.0 with default features off"
+	);
+	for other in [
+		"rquickjs",
+		"deno_core",
+		"v8",
+		"quickjs",
+		"javascriptcore",
+		"spidermonkey",
+	] {
+		assert!(!manifest.contains(other), "no second engine: {other}");
+	}
 }

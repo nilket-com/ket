@@ -299,6 +299,39 @@ impl PlotKernel for ScatterPlotKernel {
 		let resolved = settings.resolve_for_layer(&self.layer_settings);
 		self.structured_hit(transform, cursor, &resolved)
 	}
+	fn hit_regions(
+		&self,
+		transform: &CoordinateTransformer,
+		settings: &PlotSettings,
+	) -> Option<Vec<crate::plot::common::ResolutionStage>> {
+		let resolved = settings.resolve_for_layer(&self.layer_settings);
+		let mut regions = Vec::new();
+		self.renderer.for_each_point_geometry(
+			transform,
+			resolved.point_size.radius_px(),
+			|point| {
+				regions.push(crate::plot::common::RegionEntry {
+					region: crate::plot::common::HitRegion::Circle {
+						center: point.center,
+						radius: point.hit_radius,
+					},
+					ordinal: point.mark_index as u32,
+					hit: self.hit_for_mark(MarkHit {
+						data_x: point.data_x,
+						data_y: point.data_y,
+						mark_index: point.mark_index,
+					}),
+				});
+			},
+		);
+		Some(vec![crate::plot::common::ResolutionStage {
+			policy: crate::plot::common::ResolutionPolicy::NearestCentreWithin,
+			tie: crate::plot::common::TieRule::LaterWins,
+			within: None,
+			origin: iced::Point::ORIGIN,
+			regions,
+		}])
+	}
 
 	fn x_label(&self) -> String {
 		self.prepared_data.x_label.clone()
@@ -317,6 +350,12 @@ impl ScatterPlotKernel {
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::common::PlotHit> {
 		let hit = self.renderer.hit_test(transform, cursor, settings)?;
+		Some(self.hit_for_mark(hit))
+	}
+
+	/// The structured hit for one mark, shared by the cursor path and the
+	/// PRODUCT-0155 region export.
+	fn hit_for_mark(&self, hit: MarkHit) -> crate::plot::common::PlotHit {
 		let candidate = self
 			.prepared_data
 			.series
@@ -348,10 +387,10 @@ impl ScatterPlotKernel {
 				format_label(hit.data_y, &self.prepared_data.y_axis_type),
 			),
 		);
-		Some(match candidate {
+		match candidate {
 			Some(candidate) => hit.with_candidate(candidate),
 			None => hit,
-		})
+		}
 	}
 
 	pub fn new(prepared_data: Arc<ScatterPreparedData>) -> Self {
@@ -413,33 +452,51 @@ impl ScatterMarkRenderer {
 		self.hit_point_with_radius(transform, cursor, PointSize::ONE.radius_px())
 	}
 
+	/// PRODUCT-0155 §3: the one geometry constructor the hit scan and the
+	/// region export share — every point's pixel centre and hit radius, in
+	/// mark order across series.
+	pub(crate) fn for_each_point_geometry(
+		&self,
+		transform: &CoordinateTransformer,
+		point_radius: f32,
+		mut visit: impl FnMut(PointGeometry),
+	) {
+		let hit_radius = point_radius + 2.0;
+		let mut mark_index = 0;
+		for series in &self.prepared_data.series {
+			series.for_each_point(|x, y| {
+				visit(PointGeometry {
+					mark_index,
+					data_x: x,
+					data_y: y,
+					center: scatter_point(transform, x, y),
+					hit_radius,
+				});
+				mark_index += 1;
+			});
+		}
+	}
 	fn hit_point_with_radius(
 		&self,
 		transform: &CoordinateTransformer,
 		cursor: Point,
 		point_radius: f32,
 	) -> Option<MarkHit> {
-		let hit_radius = point_radius + 2.0;
-		let mut nearest_distance = hit_radius * hit_radius;
+		let mut nearest_distance = (point_radius + 2.0) * (point_radius + 2.0);
 		let mut nearest = None;
-		let mut mark_index = 0;
-		for series in &self.prepared_data.series {
-			series.for_each_point(|x, y| {
-				let pixel = scatter_point(transform, x, y);
-				let dx = cursor.x - pixel.x;
-				let dy = cursor.y - pixel.y;
-				let distance = dx * dx + dy * dy;
-				if distance <= nearest_distance {
-					nearest_distance = distance;
-					nearest = Some(MarkHit {
-						data_x: x,
-						data_y: y,
-						mark_index,
-					});
-				}
-				mark_index += 1;
-			});
-		}
+		self.for_each_point_geometry(transform, point_radius, |point| {
+			let dx = cursor.x - point.center.x;
+			let dy = cursor.y - point.center.y;
+			let distance = dx * dx + dy * dy;
+			if distance <= nearest_distance {
+				nearest_distance = distance;
+				nearest = Some(MarkHit {
+					data_x: point.data_x,
+					data_y: point.data_y,
+					mark_index: point.mark_index,
+				});
+			}
+		});
 		nearest
 	}
 
@@ -3658,4 +3715,14 @@ configuration,widget_px,inner_px,inner_share,effective_gate,naive_gate"
 		assert!(clipped_pixels > 0);
 		assert!(clipped_pixels < default_pixels, "edge disc must be clipped");
 	}
+}
+
+/// One scatter mark's hit geometry: PRODUCT-0155 §3's shared constructor
+/// output, consumed by the hit scan and the region export alike.
+pub(crate) struct PointGeometry {
+	pub(crate) mark_index: usize,
+	pub(crate) data_x: f64,
+	pub(crate) data_y: f64,
+	pub(crate) center: Point,
+	pub(crate) hit_radius: f32,
 }

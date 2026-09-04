@@ -8,7 +8,10 @@
 //! vocabulary cannot enter a package.
 
 use crate::editor::HostPlotExport;
-use crate::plot::common::{PlotRenderLayer, PlotWidget};
+use crate::plot::common::{
+	HitDimensionality, HitRegion, PlotHit, PlotRenderLayer, PlotWidget, ResolutionPolicy,
+	ResolutionStage, TieRule,
+};
 use crate::plot::export::{SvgBackend, xml_escape};
 use crate::plot::recipe::PlotConstruction;
 use crate::plot::spec::{ResolvedChannel, ResolvedPlotSpec, ScaleFamily, SemanticType};
@@ -27,6 +30,13 @@ pub(crate) const FONT_FILE: &str = "fonts/PolaritonPlotSans-Regular.ttf";
 pub(crate) const FONT_LICENCE_FILE: &str = "fonts/NotoSans-OFL-1.1.txt";
 pub(crate) const FONT_FAMILY: &str = "Polariton Plot Sans";
 const FONT_LICENCE: &str = include_str!("../assets/fonts/NotoSans-OFL-1.1.txt");
+pub(crate) const INSPECT_FILE: &str = "inspect.js";
+/// PRODUCT-0155 §6: the one executable script, byte-pinned into the shell and
+/// into the package. Its source contains no literal `<` or `&`.
+pub(crate) const INSPECT_JS: &str = include_str!("../assets/web/inspect.js");
+pub(crate) const PROJECTION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const PROJECTION_BYTE_BOUND: usize = 1024 * 1024;
+pub(crate) const PROJECTION_REGION_BOUND: usize = 32_768;
 const UNKNOWN_PRODUCER: &str = "unknown";
 
 // ---------------------------------------------------------------------------
@@ -70,6 +80,22 @@ pub(crate) struct FigureEntry {
 	pub(crate) family: String,
 	pub(crate) dataset: String,
 	pub(crate) layout: GridRect,
+	/// PRODUCT-0155 §7: whether the figure carries a hit projection, and if
+	/// not, exactly why and how far over the bound it was.
+	pub(crate) inspection: Inspection,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum Inspection {
+	Projected {
+		regions: u64,
+		bytes: u64,
+	},
+	Omitted {
+		reason: String,
+		observed: Option<u64>,
+	},
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +193,118 @@ pub(crate) struct PresentationSetting {
 	pub(crate) section: String,
 	pub(crate) value: serde_json::Value,
 	pub(crate) provenance: String,
+}
+
+// PRODUCT-0155 §1–§3: the hit projection. Narrow hover DTOs and exact
+// regions in `viewBox` units, resolved in stages.
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Projection {
+	pub(crate) schema_version: u32,
+	pub(crate) viewbox: [f64; 2],
+	pub(crate) stages: Vec<Stage>,
+	pub(crate) hits: Vec<Hit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Stage {
+	pub(crate) policy: String,
+	pub(crate) tie: String,
+	pub(crate) within: Option<RectRegion>,
+	/// Subtracted from the pointer, in 32-bit arithmetic, before any region
+	/// compare: the desktop's own plot-area translation.
+	pub(crate) origin: [f64; 2],
+	pub(crate) regions: Vec<Region>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum Region {
+	Rect {
+		x0: f64,
+		y0: f64,
+		x1: f64,
+		y1: f64,
+		inclusive_max: bool,
+		ordinal: u32,
+		hit: usize,
+	},
+	Circle {
+		cx: f64,
+		cy: f64,
+		r: f64,
+		ordinal: u32,
+		hit: usize,
+	},
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RectRegion {
+	pub(crate) x0: f64,
+	pub(crate) y0: f64,
+	pub(crate) x1: f64,
+	pub(crate) y1: f64,
+	pub(crate) inclusive_max: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Hit {
+	pub(crate) mark_family: String,
+	pub(crate) dimensionality: String,
+	pub(crate) fields: Vec<HitField>,
+	pub(crate) facet: Option<HitFacet>,
+	pub(crate) presentation: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HitField {
+	pub(crate) label: String,
+	pub(crate) semantic_type: String,
+	pub(crate) value: HitValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HitFacet {
+	pub(crate) field: String,
+	pub(crate) value: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum HitValue {
+	Nominal {
+		value: String,
+	},
+	Ordinal {
+		value: String,
+	},
+	Quantitative {
+		value: f64,
+		display: String,
+	},
+	Temporal {
+		value: f64,
+		display: String,
+	},
+	/// A decimal string: a count may exceed what a browser number holds.
+	Count {
+		value: String,
+	},
+	Percentage {
+		value: f64,
+		display: String,
+	},
+	Interval {
+		start: Box<HitValue>,
+		end: Box<HitValue>,
+		end_inclusive: bool,
+	},
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +514,22 @@ impl<'a> Guarded<'a> {
 		}
 		Ok(())
 	}
+
+	/// PRODUCT-0155 §1: every string a hit carries — prose, labels, nominal and
+	/// ordinal values, and the facet field and value — is a data-derived
+	/// string and is checked structurally before it is serialized.
+	fn check_hit(&self, file: &str, hit: &Hit) -> Result<(), PublishError> {
+		self.check(file, "presentation", &hit.presentation)?;
+		for field in &hit.fields {
+			self.check(file, "field.label", &field.label)?;
+			check_value(self, file, &field.value)?;
+		}
+		if let Some(facet) = &hit.facet {
+			self.check(file, "facet.field", &facet.field)?;
+			self.check(file, "facet.value", &facet.value)?;
+		}
+		Ok(())
+	}
 }
 
 /// An absolute path on any platform, a home-relative path, or a URL with a
@@ -410,6 +564,7 @@ pub(crate) fn assemble(
 	let mut figures = Vec::new();
 	let mut datasets: BTreeMap<String, DatasetEntry> = BTreeMap::new();
 	let mut used_ids = std::collections::HashSet::new();
+	let mut embedded: BTreeMap<String, String> = BTreeMap::new();
 	// PRODUCT-0154 §5: layout is relative placement. The desktop workspace's
 	// absolute cells — the editor columns a dashboard sat beside — are not
 	// content, so every rectangle is rebased to the published bounding box.
@@ -560,6 +715,38 @@ pub(crate) fn assemble(
 		for label in svg_text_contents(&svg) {
 			guarded.check(&svg_file, "text", &unescape_xml(&label))?;
 		}
+		// PRODUCT-0155: the hit projection, or the reason there is none.
+		let outcome = match project_export(&export) {
+			Some(stages) => project(stages, export.width, export.height),
+			None => ProjectionOutcome::Omitted {
+				reason: "no-regions".to_owned(),
+				observed: None,
+			},
+		};
+		let hits_file = format!("{figure_dir}/hits.json");
+		let inspection = match outcome {
+			ProjectionOutcome::Projected(projection) => {
+				for hit in &projection.hits {
+					guarded.check_hit(&hits_file, hit)?;
+				}
+				let bytes = canonical_json(&projection).map_err(PublishError::Encoding)?;
+				let regions = projection
+					.stages
+					.iter()
+					.map(|stage| stage.regions.len() as u64)
+					.sum();
+				let inspection = Inspection::Projected {
+					regions,
+					bytes: bytes.len() as u64,
+				};
+				embedded.insert(id.clone(), embed_json(&bytes));
+				files.insert(hits_file, bytes);
+				inspection
+			}
+			ProjectionOutcome::Omitted { reason, observed } => {
+				Inspection::Omitted { reason, observed }
+			}
+		};
 		let family = export
 			.plot_type
 			.map_or_else(|| "unknown".to_owned(), family_name);
@@ -577,6 +764,7 @@ pub(crate) fn assemble(
 				width: export.layout.width.max(1),
 				height: export.layout.height.max(1),
 			},
+			inspection,
 		});
 		files.insert(
 			definition_file,
@@ -601,9 +789,10 @@ pub(crate) fn assemble(
 		FONT_LICENCE_FILE.to_owned(),
 		FONT_LICENCE.as_bytes().to_vec(),
 	);
+	files.insert(INSPECT_FILE.to_owned(), INSPECT_JS.as_bytes().to_vec());
 	files.insert(
 		SHELL_FILE.to_owned(),
-		shell_html(&figures, &files).into_bytes(),
+		shell_html(&figures, &files, &embedded).into_bytes(),
 	);
 
 	let mut manifest = Manifest {
@@ -841,6 +1030,260 @@ fn slug(name: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// PRODUCT-0155: the hit projection, built from the widget's stages.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ProjectionOutcome {
+	Projected(Projection),
+	Omitted {
+		reason: String,
+		observed: Option<u64>,
+	},
+}
+
+fn finite(value: f32) -> Result<f64, ()> {
+	if value.is_finite() {
+		Ok(f64::from(value))
+	} else {
+		Err(())
+	}
+}
+
+pub(crate) fn hit_dto(hit: &PlotHit) -> Hit {
+	Hit {
+		mark_family: hit.mark_family.as_str().to_owned(),
+		dimensionality: match hit.dimensionality {
+			HitDimensionality::Point => "point",
+			HitDimensionality::Line => "line",
+			HitDimensionality::Area => "area",
+		}
+		.to_owned(),
+		fields: hit
+			.fields
+			.iter()
+			.map(|field| HitField {
+				label: field.label.clone(),
+				semantic_type: semantic_type_name(field.semantic_type).to_owned(),
+				value: hit_value_dto(&field.value),
+			})
+			.collect(),
+		facet: hit.facet.as_ref().map(|facet| HitFacet {
+			field: facet.field.clone(),
+			value: facet.value.clone(),
+		}),
+		presentation: hit.to_string(),
+	}
+}
+
+fn hit_value_dto(value: &crate::plot::common::HitValue) -> HitValue {
+	use crate::plot::common::HitValue as Desktop;
+	match value {
+		Desktop::Nominal(value) => HitValue::Nominal {
+			value: value.clone(),
+		},
+		Desktop::Ordinal(value) => HitValue::Ordinal {
+			value: value.clone(),
+		},
+		Desktop::Quantitative { value, display } => HitValue::Quantitative {
+			value: *value,
+			display: display.clone(),
+		},
+		Desktop::Temporal { value, display } => HitValue::Temporal {
+			value: *value,
+			display: display.clone(),
+		},
+		Desktop::Count(count) => HitValue::Count {
+			value: count.to_string(),
+		},
+		Desktop::Percentage { value, display } => HitValue::Percentage {
+			value: *value,
+			display: display.clone(),
+		},
+		Desktop::Interval {
+			start,
+			end,
+			end_inclusive,
+		} => HitValue::Interval {
+			start: Box::new(hit_value_dto(start)),
+			end: Box::new(hit_value_dto(end)),
+			end_inclusive: *end_inclusive,
+		},
+	}
+}
+
+fn hit_value_is_finite(value: &HitValue) -> bool {
+	match value {
+		HitValue::Quantitative { value, .. }
+		| HitValue::Temporal { value, .. }
+		| HitValue::Percentage { value, .. } => value.is_finite(),
+		HitValue::Interval { start, end, .. } => {
+			hit_value_is_finite(start) && hit_value_is_finite(end)
+		}
+		_ => true,
+	}
+}
+
+/// The stages the widget answered, projected: hits deduplicated in
+/// stage-then-region order of first appearance, geometry exact and finite,
+/// or the reason the figure publishes without a projection.
+pub(crate) fn project(stages: Vec<ResolutionStage>, width: f32, height: f32) -> ProjectionOutcome {
+	let omitted = |reason: &str, observed: Option<u64>| ProjectionOutcome::Omitted {
+		reason: reason.to_owned(),
+		observed,
+	};
+	let region_count: usize = stages.iter().map(|stage| stage.regions.len()).sum();
+	if region_count > PROJECTION_REGION_BOUND {
+		return omitted("region-limit", Some(region_count as u64));
+	}
+	let mut hits: Vec<Hit> = Vec::new();
+	let mut hit_index: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+	let mut out_stages = Vec::with_capacity(stages.len());
+	for stage in stages {
+		let within = match stage.within {
+			Some(HitRegion::Rectangle {
+				x0,
+				y0,
+				x1,
+				y1,
+				inclusive_max,
+			}) => Some(match rect_region(x0, y0, x1, y1, inclusive_max) {
+				Ok(rect) => rect,
+				Err(()) => return omitted("non-finite-geometry", None),
+			}),
+			Some(HitRegion::Circle { .. }) => return omitted("gate-shape", None),
+			None => None,
+		};
+		let mut regions = Vec::with_capacity(stage.regions.len());
+		for entry in stage.regions {
+			let dto = hit_dto(&entry.hit);
+			if !dto
+				.fields
+				.iter()
+				.all(|field| hit_value_is_finite(&field.value))
+			{
+				return omitted("non-finite-value", None);
+			}
+			let key = match canonical_json(&dto) {
+				Ok(key) => key,
+				Err(_) => return omitted("encoding", None),
+			};
+			let index = match hit_index.get(&key) {
+				Some(index) => *index,
+				None => {
+					hits.push(dto);
+					hit_index.insert(key, hits.len() - 1);
+					hits.len() - 1
+				}
+			};
+			let region = match entry.region {
+				HitRegion::Rectangle {
+					x0,
+					y0,
+					x1,
+					y1,
+					inclusive_max,
+				} => match rect_region(x0, y0, x1, y1, inclusive_max) {
+					Ok(rect) => Region::Rect {
+						x0: rect.x0,
+						y0: rect.y0,
+						x1: rect.x1,
+						y1: rect.y1,
+						inclusive_max,
+						ordinal: entry.ordinal,
+						hit: index,
+					},
+					Err(()) => return omitted("non-finite-geometry", None),
+				},
+				HitRegion::Circle { center, radius } => {
+					match (finite(center.x), finite(center.y), finite(radius)) {
+						(Ok(cx), Ok(cy), Ok(r)) => Region::Circle {
+							cx,
+							cy,
+							r,
+							ordinal: entry.ordinal,
+							hit: index,
+						},
+						_ => return omitted("non-finite-geometry", None),
+					}
+				}
+			};
+			regions.push(region);
+		}
+		let origin = match (finite(stage.origin.x), finite(stage.origin.y)) {
+			(Ok(x), Ok(y)) => [x, y],
+			_ => return omitted("non-finite-geometry", None),
+		};
+		out_stages.push(Stage {
+			policy: match stage.policy {
+				ResolutionPolicy::FirstInOrder => "first-in-order",
+				ResolutionPolicy::NearestCentreWithin => "nearest-centre-within",
+			}
+			.to_owned(),
+			tie: match stage.tie {
+				TieRule::LaterWins => "later-wins",
+				TieRule::LowerOrdinalWins => "lower-ordinal-wins",
+			}
+			.to_owned(),
+			within,
+			origin,
+			regions,
+		});
+	}
+	let projection = Projection {
+		schema_version: PROJECTION_SCHEMA_VERSION,
+		viewbox: [f64::from(width), f64::from(height)],
+		stages: out_stages,
+		hits,
+	};
+	match canonical_json(&projection) {
+		Ok(bytes) if bytes.len() > PROJECTION_BYTE_BOUND => {
+			omitted("byte-limit", Some(bytes.len() as u64))
+		}
+		Ok(_) => ProjectionOutcome::Projected(projection),
+		Err(_) => omitted("encoding", None),
+	}
+}
+
+fn rect_region(x0: f32, y0: f32, x1: f32, y1: f32, inclusive_max: bool) -> Result<RectRegion, ()> {
+	Ok(RectRegion {
+		x0: finite(x0)?,
+		y0: finite(y0)?,
+		x1: finite(x1)?,
+		y1: finite(y1)?,
+		inclusive_max,
+	})
+}
+
+/// The widget's projection for an export, in the SVG's `viewBox` space.
+pub(crate) fn project_export(export: &HostPlotExport) -> Option<Vec<ResolutionStage>> {
+	let bounds = iced::Rectangle {
+		x: 0.0,
+		y: 0.0,
+		width: export.width,
+		height: export.height,
+	};
+	let widget = PlotWidget::new(
+		export.kernel.as_ref(),
+		export.title.clone(),
+		20.0,
+		export.settings_model.clone(),
+		export.render_revision,
+		export.resize_render_suspended,
+		PlotRenderLayer::Full,
+	);
+	widget.hit_projection(bounds)
+}
+
+/// PRODUCT-0155 §6: the embedded form of the canonical bytes — every `<` as
+/// `<` and every `&` as `&` — total and reversible, so no label can
+/// close the data element or start an entity.
+pub(crate) fn embed_json(canonical: &[u8]) -> String {
+	let text = String::from_utf8_lossy(canonical);
+	text.replace('<', "\\u003c").replace('&', "\\u0026")
+}
+
+// ---------------------------------------------------------------------------
 // The HTML shell: a document, no script.
 // ---------------------------------------------------------------------------
 
@@ -859,7 +1302,20 @@ pub(crate) fn html_escape(text: &str) -> String {
 	out
 }
 
-fn shell_html(figures: &[FigureEntry], files: &BTreeMap<String, Vec<u8>>) -> String {
+/// PRODUCT-0155 §6: the shell is valid HTML and well-formed XML at once. Void
+/// elements are closed XML-style; the one executable script is the pinned
+/// asset, named by hash in the content security policy; each figure's
+/// projection sits beside its SVG in a non-executable data element.
+pub(crate) fn script_hash_b64() -> String {
+	use base64::Engine as _;
+	base64::engine::general_purpose::STANDARD.encode(Sha256::digest(INSPECT_JS.as_bytes()))
+}
+
+fn shell_html(
+	figures: &[FigureEntry],
+	files: &BTreeMap<String, Vec<u8>>,
+	embedded: &BTreeMap<String, String>,
+) -> String {
 	let columns = figures
 		.iter()
 		.map(|figure| figure.layout.col + figure.layout.width)
@@ -867,8 +1323,15 @@ fn shell_html(figures: &[FigureEntry], files: &BTreeMap<String, Vec<u8>>) -> Str
 		.unwrap_or(1)
 		.max(1);
 	let mut html = String::new();
-	html.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
-	html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+	html.push_str(
+		"<!DOCTYPE html>\n<html xmlns=\"http://www.w3.org/1999/xhtml\" lang=\"en\">\n<head>\n",
+	);
+	html.push_str("<meta charset=\"utf-8\"/>\n");
+	html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>\n");
+	html.push_str(&format!(
+		"<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; font-src 'self'; img-src data:; script-src 'sha256-{}'\"/>\n",
+		script_hash_b64()
+	));
 	html.push_str("<title>Polariton dashboard</title>\n<style>\n");
 	html.push_str(&format!(
 		"@font-face {{ font-family: \"{FONT_FAMILY}\"; src: url(\"{FONT_FILE}\") format(\"truetype\"); }}\n"
@@ -880,9 +1343,9 @@ fn shell_html(figures: &[FigureEntry], files: &BTreeMap<String, Vec<u8>>) -> Str
 	html.push_str(&format!(
 		".dashboard {{ display: grid; grid-template-columns: repeat({columns}, 1fr); gap: 8px; padding: 8px; }}\n"
 	));
-	html.push_str(
-		".figure { min-width: 0; }\n.figure svg { width: 100%; height: auto; display: block; }\n",
-	);
+	html.push_str(".figure { min-width: 0; margin: 0; }\n.figure svg { width: 100%; height: auto; display: block; }\n");
+	html.push_str(".polariton-tooltip { position: fixed; pointer-events: none; background: #f2f2f2; color: #1a1a1a; padding: 4px 8px; border-radius: 3px; font-size: 13px; white-space: pre; z-index: 10; }\n");
+	html.push_str(".polariton-tooltip[hidden] { display: none; }\n");
 	html.push_str("</style>\n</head>\n<body>\n<main class=\"dashboard\">\n");
 	for figure in figures {
 		let svg = files
@@ -899,9 +1362,17 @@ fn shell_html(figures: &[FigureEntry], files: &BTreeMap<String, Vec<u8>>) -> Str
 			html_escape(&figure.title),
 		));
 		html.push_str(&svg);
-		html.push_str("\n</figure>\n");
+		html.push('\n');
+		if let Some(projection) = embedded.get(&figure.id) {
+			html.push_str("<script type=\"application/json\" class=\"polariton-hits\">");
+			html.push_str(projection);
+			html.push_str("</script>\n");
+		}
+		html.push_str("</figure>\n");
 	}
-	html.push_str("</main>\n</body>\n</html>\n");
+	html.push_str("</main>\n<script>");
+	html.push_str(INSPECT_JS);
+	html.push_str("</script>\n</body>\n</html>\n");
 	html
 }
 
@@ -1585,7 +2056,7 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0154_shell_is_a_document_on_the_grid_without_script() {
+	fn product_0154_shell_is_a_document_on_the_grid_with_one_pinned_script() {
 		let artifact = artifact();
 		let package = publish(
 			vec![
@@ -1595,7 +2066,12 @@ mod tests {
 			&request(),
 		);
 		let shell = String::from_utf8(package.files[SHELL_FILE].clone()).expect("html");
-		assert!(!shell.to_ascii_lowercase().contains("<script"));
+		// PRODUCT-0155 §6: exactly one executable script, byte-identical to the
+		// pinned asset; every other script element is a JSON data element.
+		let executable: Vec<&str> = shell.split("<script>").skip(1).collect();
+		assert_eq!(executable.len(), 1);
+		assert_eq!(executable[0].split("</script>").next(), Some(INSPECT_JS));
+		assert!(shell.contains(&format!("script-src 'sha256-{}'", script_hash_b64())));
 		assert!(shell.contains("grid-column: 1 / span 2; grid-row: 1 / span 2;"));
 		assert!(shell.contains("grid-column: 3 / span 2; grid-row: 1 / span 2;"));
 		assert!(shell.contains(&format!("@font-face {{ font-family: \"{FONT_FAMILY}\"")));
@@ -1754,5 +2230,543 @@ mod layout_tests {
 			unshifted.manifest.figures[0].layout.col, 0,
 			"already-rebased input is unchanged"
 		);
+	}
+}
+
+#[cfg(test)]
+mod product_0155_tests {
+	use super::tests_support::*;
+	use super::*;
+	use crate::plot::common::PlotKernel;
+	use crate::plot::core::PlotType;
+	use crate::plot::kernels::boxplot::{BoxPlotKernel, BoxPlotPreparedData};
+	use crate::plot::kernels::boxplot_tukey::{TukeyBoxRow, TukeyBoxes};
+	use crate::plot::kernels::bubble::{BubblePlotKernel, prepare_bubble_data};
+	use crate::plot::kernels::heatmap::{HeatmapPlotKernel, prepare_heatmap_data};
+	use crate::plot::spec::{BubbleFieldNames, BubbleFields};
+	use crate::plot::theme::PlotSettings;
+	use boa_engine::{Context, Source};
+	use iced::advanced::mouse::Cursor;
+	use iced::{Point, Rectangle};
+	use std::sync::Arc;
+
+	const WIDTH: f32 = 420.0;
+	const HEIGHT: f32 = 300.0;
+
+	fn bounds() -> Rectangle {
+		Rectangle {
+			x: 0.0,
+			y: 0.0,
+			width: WIDTH,
+			height: HEIGHT,
+		}
+	}
+
+	fn widget<'a>(kernel: &'a (dyn PlotKernel + Send + Sync), title: &str) -> PlotWidget<'a> {
+		PlotWidget::new(
+			kernel,
+			title.to_owned(),
+			20.0,
+			PlotSettings::default(),
+			0,
+			false,
+			PlotRenderLayer::Full,
+		)
+	}
+
+	fn heatmap_kernel(suffix: &str) -> HeatmapPlotKernel {
+		let frame = polars::df!(
+			"x" => ["Adopt", "Adopt", "Discover", "Discover", "Expand", "Expand"],
+			"y" => [format!("Clarity{suffix}"), "Reach".to_owned(), format!("Clarity{suffix}"), "Reach".to_owned(), format!("Clarity{suffix}"), "Reach".to_owned()],
+			"v" => [1.0_f64, 4.0, 2.0, 8.0, 3.0, 5.0],
+		)
+		.expect("frame");
+		HeatmapPlotKernel {
+			prepared_data: Arc::new(prepare_heatmap_data(&frame, "x", "y", "v").expect("heatmap")),
+		}
+	}
+
+	fn bubble_kernel() -> BubblePlotKernel {
+		// Two observations share a centre so containment overlaps; the desktop
+		// answers the first in prepared order.
+		let frame = polars::df!(
+			"x" => [1.0_f64, 5.0, 5.0, 9.0],
+			"y" => [1.0_f64, 5.0, 5.0, 9.0],
+			"size" => [1.0_f64, 3.0, 1.0, 2.0],
+			"color" => [10.0_f64, 20.0, 30.0, 40.0],
+			"label" => ["A", "B", "C", "D"],
+		)
+		.expect("frame");
+		let fields = BubbleFields::new(
+			BubbleFieldNames::new("x", "y", "size", "color"),
+			Some("label".to_owned()),
+		);
+		BubblePlotKernel {
+			prepared_data: Arc::new(prepare_bubble_data(&frame, &fields).expect("bubble")),
+		}
+	}
+
+	fn box_kernel() -> BoxPlotKernel {
+		let row = |category: &str, outlier: Option<f64>| TukeyBoxRow {
+			category: category.to_owned(),
+			whisker_low: 10.0,
+			q1: 20.0,
+			median: 30.0,
+			q3: 40.0,
+			whisker_high: 50.0,
+			outlier,
+		};
+		let boxes = TukeyBoxes::new(vec![
+			row("Atlas", Some(70.0)),
+			row("Atlas", Some(70.0)),
+			row("Atlas", Some(80.0)),
+			row("Beacon", None),
+			row("Cinder", Some(5.0)),
+		])
+		.expect("boxes");
+		BoxPlotKernel {
+			prepared_data: Arc::new(BoxPlotPreparedData::new(
+				boxes,
+				crate::plot::common::AxisType::Linear,
+				"Cohort".to_owned(),
+				"Score".to_owned(),
+			)),
+		}
+	}
+
+	/// The shipped asset, executed: no DOM, so the installer never runs, and
+	/// the resolver is called with the projection the package carries.
+	fn asset_resolve(projection: &str, x: f64, y: f64) -> (i64, u64) {
+		let mut context = Context::default();
+		context
+			.eval(Source::from_bytes(INSPECT_JS))
+			.expect("the asset loads without a document");
+		let script = format!(
+			"var __r = polaritonResolve(JSON.parse({}), {x:?}, {y:?}); [__r.index, __r.ops]",
+			serde_json::to_string(projection).expect("json string")
+		);
+		let value = context
+			.eval(Source::from_bytes(&script))
+			.expect("the resolver runs");
+		let array = value.as_object().expect("array");
+		let index = array
+			.get(0, &mut context)
+			.expect("index")
+			.to_number(&mut context)
+			.expect("number");
+		let ops = array
+			.get(1, &mut context)
+			.expect("ops")
+			.to_number(&mut context)
+			.expect("number");
+		(index as i64, ops as u64)
+	}
+
+	fn desktop(widget: &PlotWidget<'_>, x: f64, y: f64) -> Option<Hit> {
+		widget
+			.structured_hit_at(bounds(), Cursor::Available(Point::new(x as f32, y as f32)))
+			.map(|hit| hit_dto(&hit))
+	}
+
+	fn projection_for(widget: &PlotWidget<'_>) -> Projection {
+		match project(
+			widget.hit_projection(bounds()).expect("regions"),
+			WIDTH,
+			HEIGHT,
+		) {
+			ProjectionOutcome::Projected(projection) => projection,
+			other => panic!("expected a projection: {other:?}"),
+		}
+	}
+
+	/// Uniform coverage plus every region's boundary, just inside and just
+	/// outside, plus the midpoints between circle centres — equal distances
+	/// by construction whenever 32-bit arithmetic lands on them.
+	fn vectors(projection: &Projection) -> Vec<(f64, f64)> {
+		let mut vectors = Vec::new();
+		for row in 0..32 {
+			for col in 0..32 {
+				vectors.push((
+					f64::from(WIDTH) * (f64::from(col) + 0.5) / 32.0,
+					f64::from(HEIGHT) * (f64::from(row) + 0.5) / 32.0,
+				));
+			}
+		}
+		let mut centres = Vec::new();
+		for stage in &projection.stages {
+			let (ox, oy) = (stage.origin[0], stage.origin[1]);
+			for region in &stage.regions {
+				match region {
+					Region::Rect { x0, y0, x1, y1, .. } => {
+						let (x0, y0, x1, y1) = (x0 + ox, y0 + oy, x1 + ox, y1 + oy);
+						for (px, py) in [(x1, y1), (x0, y0), ((x0 + x1) / 2.0, y1)] {
+							vectors.push((px - 0.01, py - 0.01));
+							vectors.push((px + 0.01, py + 0.01));
+							vectors.push((px, py));
+						}
+					}
+					Region::Circle { cx, cy, r, .. } => {
+						let (cx, cy) = (&(cx + ox), &(cy + oy));
+						centres.push((*cx, *cy));
+						for delta in [-0.02, -0.0005, 0.0, 0.0005, 0.02] {
+							vectors.push((cx + r + delta, *cy));
+							vectors.push((*cx, cy - r + delta));
+						}
+						vectors.push((*cx, *cy));
+					}
+				}
+			}
+		}
+		for (i, a) in centres.iter().enumerate() {
+			for b in centres.iter().skip(i + 1) {
+				vectors.push(((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0));
+			}
+		}
+		vectors.truncate(1000.max(vectors.len().min(4000)));
+		vectors
+	}
+
+	fn assert_parity(kernel: &(dyn PlotKernel + Send + Sync), family: &str) {
+		let widget = widget(kernel, family);
+		let projection = projection_for(&widget);
+		let regions: usize = projection
+			.stages
+			.iter()
+			.map(|stage| stage.regions.len())
+			.sum();
+		assert!(regions <= PROJECTION_REGION_BOUND);
+		let json = String::from_utf8(canonical_json(&projection).expect("json")).expect("utf-8");
+		let mut disagreements = Vec::new();
+		let mut answered = 0;
+		for (x, y) in vectors(&projection) {
+			let (index, ops) = asset_resolve(&json, x, y);
+			assert!(ops <= 65_536, "{family}: {ops} operations at ({x}, {y})");
+			let asset = if index < 0 {
+				None
+			} else {
+				Some(projection.hits[index as usize].clone())
+			};
+			let desktop = desktop(&widget, x, y);
+			if asset.is_some() {
+				answered += 1;
+			}
+			if asset != desktop {
+				disagreements.push((x, y, asset, desktop));
+			}
+		}
+		assert!(
+			answered > 0,
+			"{family}: positive control — some vector must hit"
+		);
+		assert!(
+			disagreements.is_empty(),
+			"{family}: {} disagreements, first: {:?}",
+			disagreements.len(),
+			disagreements.first()
+		);
+	}
+
+	#[test]
+	fn product_0155_heatmap_parity_through_the_shipped_asset() {
+		assert_parity(&heatmap_kernel(""), "heatmap");
+	}
+
+	#[test]
+	fn product_0155_bubble_parity_through_the_shipped_asset() {
+		assert_parity(&bubble_kernel(), "bubble");
+	}
+
+	#[test]
+	fn product_0155_box_parity_through_the_shipped_asset() {
+		let kernel = box_kernel();
+		let widget = widget(&kernel, "box");
+		let projection = projection_for(&widget);
+		assert_eq!(projection.stages.len(), 2, "outliers then boxes");
+		assert_eq!(projection.stages[0].policy, "nearest-centre-within");
+		assert_eq!(projection.stages[0].tie, "lower-ordinal-wins");
+		assert_eq!(projection.stages[1].policy, "first-in-order");
+		assert_parity(&kernel, "box");
+	}
+
+	#[test]
+	fn product_0155_scatter_parity_through_the_shipped_asset() {
+		let artifact = ResultArtifactFixture::scatter_with_equidistant_pair();
+		let export = fixture("Points", &artifact, PlotType::Scatter, 0);
+		let widget = widget(export.kernel.as_ref(), "Points");
+		let projection = projection_for(&widget);
+		assert_eq!(projection.stages[0].policy, "nearest-centre-within");
+		assert_eq!(projection.stages[0].tie, "later-wins");
+		assert_parity(export.kernel.as_ref(), "scatter");
+	}
+
+	struct ResultArtifactFixture;
+	impl ResultArtifactFixture {
+		fn scatter_with_equidistant_pair() -> Arc<crate::result_artifact::ResultArtifact> {
+			let artifact = crate::result_artifact::ResultArtifact::from_polars(Arc::new(
+				polars::df!("x" => [1_i64, 3, 3, 5, 7], "y" => [2_i64, 2, 2, 6, 1]).expect("frame"),
+			));
+			artifact.bind_input_identity(crate::selection::InputIdentity::mint());
+			artifact
+		}
+	}
+
+	#[test]
+	fn product_0155_projection_is_deterministic_and_prose_moves_without_regions() {
+		let first = projection_for(&widget(&heatmap_kernel(""), "h"));
+		let again = projection_for(&widget(&heatmap_kernel(""), "h"));
+		assert_eq!(
+			canonical_json(&first).unwrap(),
+			canonical_json(&again).unwrap()
+		);
+		let relabeled = projection_for(&widget(&heatmap_kernel("!"), "h"));
+		assert_eq!(
+			first.stages, relabeled.stages,
+			"regions never move with a label"
+		);
+		assert_ne!(first.hits, relabeled.hits, "prose moves with the label");
+	}
+
+	#[test]
+	fn product_0155_bounds_omit_the_projection_and_publish_the_rest() {
+		let many = |n: i64| {
+			let artifact = crate::result_artifact::ResultArtifact::from_polars(Arc::new(
+				polars::df!(
+					"x" => (0..n).map(|i| (i % 200) as f64).collect::<Vec<_>>(),
+					"y" => (0..n).map(|i| (i / 200) as f64).collect::<Vec<_>>()
+				)
+				.expect("frame"),
+			));
+			artifact.bind_input_identity(crate::selection::InputIdentity::mint());
+			artifact
+		};
+		let over_regions = publish(
+			vec![fixture("Dense", &many(40_000), PlotType::Scatter, 0)],
+			&request(),
+		);
+		assert_eq!(
+			over_regions.manifest.figures[0].inspection,
+			Inspection::Omitted {
+				reason: "region-limit".to_owned(),
+				observed: Some(40_000)
+			}
+		);
+		assert!(!over_regions.files.contains_key("figures/dense/hits.json"));
+		let over_bytes = publish(
+			vec![fixture("Dense", &many(20_000), PlotType::Scatter, 0)],
+			&request(),
+		);
+		match &over_bytes.manifest.figures[0].inspection {
+			Inspection::Omitted { reason, observed } => {
+				assert_eq!(reason, "byte-limit");
+				assert!(observed.unwrap() > PROJECTION_BYTE_BOUND as u64);
+			}
+			other => panic!("expected the byte bound: {other:?}"),
+		}
+		let deferred = publish(
+			vec![fixture("Trend", &artifact(), PlotType::Line, 0)],
+			&request(),
+		);
+		assert_eq!(
+			deferred.manifest.figures[0].inspection,
+			Inspection::Omitted {
+				reason: "no-regions".to_owned(),
+				observed: None
+			}
+		);
+		let projected = publish(
+			vec![fixture("Points", &artifact(), PlotType::Scatter, 0)],
+			&request(),
+		);
+		assert!(matches!(
+			projected.manifest.figures[0].inspection,
+			Inspection::Projected { regions: 3, .. }
+		));
+		assert!(projected.files.contains_key("figures/points/hits.json"));
+		assert!(projected.files.contains_key(INSPECT_FILE));
+		assert!(projected.manifest.files.contains_key(INSPECT_FILE));
+	}
+
+	fn parse_shell(shell: &str) -> roxmltree::Document<'_> {
+		roxmltree::Document::parse_with_options(
+			shell,
+			roxmltree::ParsingOptions {
+				allow_dtd: true,
+				..roxmltree::ParsingOptions::default()
+			},
+		)
+		.expect("the shell is well-formed XML")
+	}
+
+	/// PRODUCT-0155 §6, gate 6: hostile strings in the *projected data* — the
+	/// hit prose and a nominal value — and in a label reach the shell as data
+	/// and as text; the data element parses as JSON and canonicalizes back to
+	/// the complete file bytes; exactly one executable script exists.
+	#[test]
+	fn product_0155_shell_is_a_polyglot_with_one_pinned_script_and_reversible_data() {
+		let artifact = artifact();
+		let title = "</script><script>alert(1)</script> Tom & Jerry <b>";
+		let package = publish(
+			vec![fixture(title, &artifact, PlotType::Scatter, 0)],
+			&request(),
+		);
+		let id = package.manifest.figures[0].id.clone();
+		let hostile = "</script><script>alert(2)</script> & \\u003c literal";
+		let mut projection: Projection =
+			serde_json::from_slice(&package.files[&format!("figures/{id}/hits.json")])
+				.expect("projection parses");
+		projection.hits[0].presentation = hostile.to_owned();
+		projection.hits[0].fields[0].value = HitValue::Nominal {
+			value: hostile.to_owned(),
+		};
+		let canonical = canonical_json(&projection).expect("canonical");
+		let mut embedded = BTreeMap::new();
+		embedded.insert(id.clone(), embed_json(&canonical));
+		let shell = shell_html(&package.manifest.figures, &package.files, &embedded);
+
+		let document = parse_shell(&shell);
+		let scripts: Vec<_> = document
+			.descendants()
+			.filter(|node| node.has_tag_name(("http://www.w3.org/1999/xhtml", "script")))
+			.collect();
+		let executable: Vec<_> = scripts
+			.iter()
+			.filter(|node| node.attribute("type").is_none())
+			.collect();
+		assert_eq!(executable.len(), 1, "exactly one executable script element");
+		assert_eq!(executable[0].text(), Some(INSPECT_JS));
+		let data: Vec<_> = scripts
+			.iter()
+			.filter(|node| node.attribute("type") == Some("application/json"))
+			.collect();
+		assert_eq!(data.len(), 1);
+		let embedded_text = data[0].text().expect("data element text");
+		assert!(
+			!embedded_text.contains("</script"),
+			"no raw closer inside the data element"
+		);
+		let decoded: Projection =
+			serde_json::from_str(embedded_text).expect("embedded JSON parses");
+		assert_eq!(
+			canonical_json(&decoded).expect("canonical again"),
+			canonical,
+			"the embedding canonicalizes back to the complete file bytes"
+		);
+		assert_eq!(
+			decoded.hits[0].presentation, hostile,
+			"hostile prose survives intact"
+		);
+		let texts: Vec<&str> = document
+			.descendants()
+			.filter(|node| node.has_tag_name(("http://www.w3.org/2000/svg", "text")))
+			.filter_map(|node| node.text())
+			.collect();
+		assert!(
+			texts.contains(&title),
+			"the hostile label survives as text: {texts:?}"
+		);
+		let meta: Vec<_> = document
+			.descendants()
+			.filter(|node| node.has_tag_name(("http://www.w3.org/1999/xhtml", "meta")))
+			.collect();
+		assert_eq!(meta.len(), 3, "void elements parse as XML");
+		assert!(shell.contains(&format!("'sha256-{}'", script_hash_b64())));
+		assert!(!INSPECT_JS.contains('<') && !INSPECT_JS.contains('&'));
+		// The shell assemble writes carries the complete canonical bytes too.
+		let real_shell = String::from_utf8(package.files[SHELL_FILE].clone()).expect("utf-8");
+		let real = parse_shell(&real_shell);
+		let real_data = real
+			.descendants()
+			.find(|node| node.attribute("type") == Some("application/json"))
+			.and_then(|node| node.text())
+			.expect("assembled data element");
+		let real_decoded: Projection =
+			serde_json::from_str(real_data).expect("assembled JSON parses");
+		let again = canonical_json(&real_decoded).expect("canonical");
+		let file = &package.files[&format!("figures/{id}/hits.json")];
+		if again != *file {
+			let at = again
+				.iter()
+				.zip(file.iter())
+				.position(|(a, b)| a != b)
+				.unwrap_or(0);
+			let window = |bytes: &[u8]| {
+				String::from_utf8_lossy(&bytes[at.saturating_sub(60)..(at + 60).min(bytes.len())])
+					.into_owned()
+			};
+			panic!(
+				"assembled embedding diverges at byte {at} ({} vs {} bytes)\nagain: {}\nfile:  {}",
+				again.len(),
+				file.len(),
+				window(&again),
+				window(file)
+			);
+		}
+	}
+
+	/// PRODUCT-0154 §8 extended by PRODUCT-0155 §1: facet metadata and value
+	/// displays pass through the structural guard, with a positive control.
+	#[test]
+	fn product_0155_facet_metadata_and_displays_are_guarded_with_a_control() {
+		let mut request = request();
+		request.secrets.push("hunter2".to_owned());
+		let guarded = Guarded::new(&request);
+		let clean = Hit {
+			mark_family: "scatter".to_owned(),
+			dimensionality: "point".to_owned(),
+			fields: vec![HitField {
+				label: "X".to_owned(),
+				semantic_type: "quantitative".to_owned(),
+				value: HitValue::Quantitative {
+					value: 1.0,
+					display: "1".to_owned(),
+				},
+			}],
+			facet: Some(HitFacet {
+				field: "cohort".to_owned(),
+				value: "Atlas".to_owned(),
+			}),
+			presentation: "X: 1".to_owned(),
+		};
+		assert!(
+			guarded.check_hit("hits.json", &clean).is_ok(),
+			"positive control"
+		);
+		let mut facet_value = clean.clone();
+		facet_value.facet.as_mut().unwrap().value = "hunter2".to_owned();
+		assert!(matches!(
+			guarded.check_hit("hits.json", &facet_value),
+			Err(PublishError::Secret { field, .. }) if field == "facet.value"
+		));
+		let mut facet_field = clean.clone();
+		facet_field.facet.as_mut().unwrap().field = "/home/tester/cohort".to_owned();
+		assert!(matches!(
+			guarded.check_hit("hits.json", &facet_field),
+			Err(PublishError::Secret { field, .. }) if field == "facet.field"
+		));
+		let mut display = clean.clone();
+		display.fields[0].value = HitValue::Quantitative {
+			value: 1.0,
+			display: "postgres://db/x".to_owned(),
+		};
+		assert!(matches!(
+			guarded.check_hit("hits.json", &display),
+			Err(PublishError::Secret { field, .. }) if field == "field.display"
+		));
+	}
+}
+
+fn check_value(guarded: &Guarded<'_>, file: &str, value: &HitValue) -> Result<(), PublishError> {
+	match value {
+		HitValue::Nominal { value } | HitValue::Ordinal { value } => {
+			guarded.check(file, "field.value", value)
+		}
+		HitValue::Quantitative { display, .. }
+		| HitValue::Temporal { display, .. }
+		| HitValue::Percentage { display, .. } => guarded.check(file, "field.display", display),
+		HitValue::Count { .. } => Ok(()),
+		HitValue::Interval { start, end, .. } => {
+			check_value(guarded, file, start)?;
+			check_value(guarded, file, end)
+		}
 	}
 }

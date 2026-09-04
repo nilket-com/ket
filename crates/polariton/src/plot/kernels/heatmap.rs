@@ -24,6 +24,73 @@ impl HeatmapPlotKernel {
 	}
 }
 
+impl HeatmapPlotKernel {
+	/// PRODUCT-0155 §3: the one geometry constructor the hit and the region
+	/// export share. Visits every populated cell in scan order without
+	/// collecting; returning `false` stops the visit.
+	fn for_each_cell(
+		&self,
+		transform: &CoordinateTransformer,
+		mut visit: impl FnMut(usize, usize, f64, Rectangle) -> bool,
+	) {
+		let num_x = self.prepared_data.cells.x_categories().len();
+		let num_y = self.prepared_data.cells.y_categories().len();
+		for i in 0..num_x {
+			for j in 0..num_y {
+				let Some(value) = self.prepared_data.cells.value(i, j) else {
+					continue;
+				};
+				let (center, bw, bh) = transform.categorical_2d(i, j);
+				let rect = Rectangle {
+					x: center.x - bw / 2.0,
+					y: center.y - bh / 2.0,
+					width: bw,
+					height: bh,
+				};
+				if !visit(i, j, value, rect) {
+					return;
+				}
+			}
+		}
+	}
+
+	fn cell_hit(&self, i: usize, j: usize, value: f64) -> crate::plot::common::PlotHit {
+		let num_y = self.prepared_data.cells.y_categories().len();
+		let x_cat = &self.prepared_data.cells.x_categories()[i];
+		let y_cat = &self.prepared_data.cells.y_categories()[j];
+		let hit = crate::plot::common::PlotHit::new(
+			crate::plot::common::MarkFamily::HEATMAP,
+			crate::plot::common::HitDimensionality::Area,
+			i * num_y + j,
+		)
+		.labeled(
+			"X",
+			crate::plot::spec::SemanticType::Nominal,
+			crate::plot::common::HitValue::nominal(x_cat),
+		)
+		.labeled(
+			"Y",
+			crate::plot::spec::SemanticType::Nominal,
+			crate::plot::common::HitValue::nominal(y_cat),
+		)
+		.labeled(
+			"Value",
+			crate::plot::spec::SemanticType::Quantitative,
+			crate::plot::common::HitValue::quantitative(value, format!("{value:.2}")),
+		);
+		let candidate = self
+			.prepared_data
+			.selection_candidates
+			.get(i)
+			.and_then(|column| column.get(j))
+			.and_then(Clone::clone);
+		match candidate {
+			Some(candidate) => hit.with_candidate(candidate),
+			None => hit,
+		}
+	}
+}
+
 impl PlotKernel for HeatmapPlotKernel {
 	fn project_predicate(
 		&self,
@@ -94,62 +161,47 @@ impl PlotKernel for HeatmapPlotKernel {
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
 	) -> Option<crate::plot::common::PlotHit> {
-		if let Some(cursor_pos) = cursor.position() {
-			let num_x = self.prepared_data.cells.x_categories().len();
-			let num_y = self.prepared_data.cells.y_categories().len();
-			for i in 0..num_x {
-				for j in 0..num_y {
-					let Some(value) = self.prepared_data.cells.value(i, j) else {
-						continue;
-					};
-					let (center, bw, bh) = transform.categorical_2d(i, j);
-					let rect = Rectangle {
-						x: center.x - bw / 2.0,
-						y: center.y - bh / 2.0,
-						width: bw,
-						height: bh,
-					};
-					if rect.contains(cursor_pos) {
-						let x_cat = &self.prepared_data.cells.x_categories()[i];
-						let y_cat = &self.prepared_data.cells.y_categories()[j];
-						let hit = crate::plot::common::PlotHit::new(
-							crate::plot::common::MarkFamily::HEATMAP,
-							crate::plot::common::HitDimensionality::Area,
-							i * num_y + j,
-						)
-						.labeled(
-							"X",
-							crate::plot::spec::SemanticType::Nominal,
-							crate::plot::common::HitValue::nominal(x_cat),
-						)
-						.labeled(
-							"Y",
-							crate::plot::spec::SemanticType::Nominal,
-							crate::plot::common::HitValue::nominal(y_cat),
-						)
-						.labeled(
-							"Value",
-							crate::plot::spec::SemanticType::Quantitative,
-							crate::plot::common::HitValue::quantitative(
-								value,
-								format!("{value:.2}"),
-							),
-						);
-						let candidate = self
-							.prepared_data
-							.selection_candidates
-							.get(i)
-							.and_then(|column| column.get(j))
-							.and_then(Clone::clone);
-						return Some(match candidate {
-							Some(candidate) => hit.with_candidate(candidate),
-							None => hit,
-						});
-					}
-				}
+		let cursor_pos = cursor.position()?;
+		let mut found = None;
+		self.for_each_cell(transform, |i, j, value, rect| {
+			if rect.contains(cursor_pos) {
+				found = Some((i, j, value));
+				return false;
 			}
-		}
-		None
+			true
+		});
+		found.map(|(i, j, value)| self.cell_hit(i, j, value))
+	}
+	fn hit_regions(
+		&self,
+		transform: &CoordinateTransformer,
+		_settings: &crate::plot::theme::PlotSettings,
+	) -> Option<Vec<crate::plot::common::ResolutionStage>> {
+		Some(vec![crate::plot::common::ResolutionStage {
+			policy: crate::plot::common::ResolutionPolicy::FirstInOrder,
+			tie: crate::plot::common::TieRule::LowerOrdinalWins,
+			within: None,
+			origin: iced::Point::ORIGIN,
+			regions: {
+				let num_y = self.prepared_data.cells.y_categories().len();
+				let mut regions = Vec::new();
+				self.for_each_cell(transform, |i, j, value, rect| {
+					regions.push(crate::plot::common::RegionEntry {
+						region: crate::plot::common::HitRegion::Rectangle {
+							x0: rect.x,
+							y0: rect.y,
+							x1: rect.x + rect.width,
+							y1: rect.y + rect.height,
+							inclusive_max: false,
+						},
+						ordinal: (i * num_y + j) as u32,
+						hit: self.cell_hit(i, j, value),
+					});
+					true
+				});
+				regions
+			},
+		}])
 	}
 
 	fn legend_content(
