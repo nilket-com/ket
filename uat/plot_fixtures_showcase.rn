@@ -1,0 +1,52 @@
+// PRODUCT-0157 gate-10 fixtures — the three cases the semantic showcases lack.
+//
+// Before publishing: hide one series in every pane from its legend (Base,
+// Plain, and Atlas), and size the raster pane under about 380 x 380 pixels so
+// its 1,157,625 points exceed eight per pixel. A larger pane downsamples
+// instead and the figure publishes as actionable, which is not the fixture.
+let percent = workspace
+	.table("percent_area_fixture")
+	.sort([asc(col("period")), asc(col("series"))]);
+let hostile = workspace
+	.table("hostile_label_fixture")
+	.sort([asc(col("period")), asc(col("series"))]);
+let dense = workspace.table("raster_scatter_fixture");
+
+percent.views([
+	view("fixture-percent-area", figure([
+		title("Percent stack").font_size(24),
+		subtitle("Hide Base: the gap stays, nothing above moves or renormalizes"),
+		skin("greys_rs2"),
+		palette("blues_C"),
+		x_axis().label("Period").label_size(16).tick_step(1),
+		y_axis().tick_step(25),
+		legend().at(0.70, 0.08).font_size(14),
+		area("period", "value", "series").percent(),
+	])),
+]);
+
+hostile.views([
+	view("fixture-hostile-label", figure([
+		title("Hostile label").font_size(24),
+		subtitle("The second series is named with a script closer, an ampersand, and a less-than"),
+		skin("greys_rs2"),
+		palette("blues_C"),
+		x_axis().label("Period").label_size(16).tick_step(1),
+		y_axis().label("Value").label_size(16),
+		legend().at(0.70, 0.08).font_size(14),
+		line("period", "value", "series").stroke_width(2),
+	])),
+]);
+
+dense.views([
+	view("fixture-raster-scatter", figure([
+		title("Rasterized scatter").font_size(24),
+		subtitle("Above the raster gate this figure is inert in the browser by design"),
+		skin("greys_rs2"),
+		palette("blues_C"),
+		x_axis().label("x").label_size(16),
+		y_axis().label("y").label_size(16),
+		legend().at(0.70, 0.08).font_size(14),
+		scatter("x", "y", "series").point_size(1.0),
+	])),
+]);

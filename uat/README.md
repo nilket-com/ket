@@ -69,6 +69,26 @@ The heatmap reads an explicit long-form capability matrix. Radar and parallel
 read the same wide operating profiles, making their difference one of visual
 question rather than data preparation.
 
+Seed the PRODUCT-0157 gate-10 fixtures, then open the three-pane fixture
+showcase:
+
+```sh
+nilket toron sql --file uat/plot_fixtures_showcase.sql
+cargo run --release -p polariton -- uat/plot_fixtures_showcase.rn
+```
+
+Release, deliberately: PRODUCT-0140 priced the downsampled arm at about 1.3 s
+per frame in release at full-window density 8, re-scanned on every cache
+miss, and a debug build multiplies that by tens. Drag the raster pane small
+before the million points arrive if you can; once under the gate the raster
+arm draws in tens of milliseconds.
+
+A percent-normalized stacked area, a line whose second series label is the
+PRODUCT-0155 hostile string, and a 1,157,625-point categorical scatter that
+crosses the automatic raster gate only in a pane under about 380 × 380 pixels.
+Hide one series in each pane before Plot → Publish, so every figure carries a
+snapshot.
+
 Open the PRODUCT-0123 axis-member reference exhibit after seeding the same
 sales relation:
 
