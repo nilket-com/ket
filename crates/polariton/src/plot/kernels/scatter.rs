@@ -4014,3 +4014,123 @@ pub(crate) struct PointGeometry {
 	pub(crate) center: Point,
 	pub(crate) hit_radius: f32,
 }
+
+/// Timing probe for the PRODUCT-0157 gate-10 raster fixture's desktop stall:
+/// the fixture's shape, prepared as the Rune view path prepares it, with the
+/// selection-candidate phase timed on its own. Ignored: it is evidence, not a
+/// gate. Run with `--ignored --nocapture`, in the dev profile and in release.
+#[cfg(test)]
+mod preparation_timing_probe {
+	use super::*;
+	use polars::prelude::*;
+	use std::time::Instant;
+
+	fn fixture_frame(points: usize) -> DataFrame {
+		let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+		let mut next = || {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			(state >> 11) as f64 / (1u64 << 53) as f64
+		};
+		let xs: Vec<f64> = (0..points).map(|_| next()).collect();
+		let ys: Vec<f64> = (0..points).map(|_| next()).collect();
+		let series: Vec<&str> = (0..points)
+			.map(|i| ["Atlas", "Beacon", "Cinder"][i % 3])
+			.collect();
+		df!("x" => xs, "y" => ys, "series" => series).expect("frame")
+	}
+
+	#[test]
+	#[ignore]
+	fn probe_prepare_scatter_data_at_the_raster_fixture_size() {
+		let points = 105 * 105 * 105;
+		let frame = fixture_frame(points);
+		let started = Instant::now();
+		let prepared = prepare_scatter_data(&frame, "series", "x", "y");
+		let whole = started.elapsed();
+		assert_eq!(prepared.total_points, points);
+		let partitions = frame.partition_by(["series"], true).expect("partitions");
+		let started = Instant::now();
+		let mut candidates = 0;
+		for group in &partitions {
+			candidates += scatter_selection_candidates(
+				group,
+				"x",
+				"y",
+				"series",
+				crate::plot::spec::SemanticType::Quantitative,
+				crate::plot::spec::SemanticType::Quantitative,
+				Some(crate::plot::spec::SemanticType::Nominal),
+			)
+			.len();
+		}
+		let candidate_phase = started.elapsed();
+		assert_eq!(candidates, points);
+		let started = Instant::now();
+		let _ = frame.partition_by(["series"], true).expect("partitions");
+		let partition_phase = started.elapsed();
+		eprintln!(
+			"PREPARATION_TIMING points={points} whole={:.3}s candidates={:.3}s partition={:.3}s profile={}",
+			whole.as_secs_f64(),
+			candidate_phase.as_secs_f64(),
+			partition_phase.as_secs_f64(),
+			if cfg!(debug_assertions) {
+				"dev"
+			} else {
+				"release"
+			}
+		);
+	}
+
+	/// The draw half: one full frame through the widget to the SVG backend at
+	/// the operator's pane shape (downsampled arm) and at a small pane
+	/// (rasterized arm). This prices everything but iced's tessellation of
+	/// the emitted circles, which only a stack snapshot of the stalled
+	/// process can attribute.
+	#[test]
+	#[ignore]
+	fn probe_draw_frame_at_the_raster_fixture_size() {
+		use crate::plot::common::{PlotKernel, PlotRenderLayer, PlotWidget};
+		use crate::plot::export::SvgBackend;
+		let points = 105 * 105 * 105;
+		let frame = fixture_frame(points);
+		let kernel: Arc<dyn PlotKernel + Send + Sync> = Arc::new(ScatterPlotKernel::new(Arc::new(
+			prepare_scatter_data(&frame, "series", "x", "y"),
+		)));
+		for (label, width, height) in [
+			("operator-pane", 950.0_f32, 420.0_f32),
+			("small-pane", 360.0, 360.0),
+		] {
+			let widget = PlotWidget::new(
+				kernel.as_ref(),
+				"Rasterized scatter".to_owned(),
+				20.0,
+				crate::plot::theme::PlotSettings::default(),
+				0,
+				false,
+				PlotRenderLayer::Full,
+			);
+			let started = Instant::now();
+			let mut backend = SvgBackend::new(width, height);
+			widget.render(
+				&mut backend,
+				Rectangle::new(Point::ORIGIN, iced::Size::new(width, height)),
+			);
+			let elapsed = started.elapsed();
+			let svg = backend.finish();
+			let arcs = svg.matches(" A ").count();
+			let images = svg.matches("<image ").count();
+			eprintln!(
+				"DRAW_TIMING pane={label} {width}x{height} frame={:.3}s arcs={arcs} images={images} bytes={} profile={}",
+				elapsed.as_secs_f64(),
+				svg.len(),
+				if cfg!(debug_assertions) {
+					"dev"
+				} else {
+					"release"
+				}
+			);
+		}
+	}
+}
