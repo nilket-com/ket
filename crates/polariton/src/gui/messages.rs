@@ -94,6 +94,9 @@ pub enum Message {
 	CloseWithoutCheckpoint,
 	CodeEditEvent(EditorMsg),
 	CodeEditResize(iced::Size),
+	/// PRODUCT-0159 gate 5: one tick of the opt-in event-loop latency probe,
+	/// carrying the timer's own scheduled instant.
+	LoopLatencyTick(std::time::Instant),
 	Connect,
 	ConnectionNameChanged(String),
 	DragWindow,

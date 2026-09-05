@@ -1991,6 +1991,16 @@ impl<T: PlotBackend> AsPlotBackend for T {
 	}
 }
 
+/// PRODUCT-0159 gate 5: the latency probe's arming instant, shared with the
+/// render traces so every line is stamped on one clock. `None` unless
+/// `POLARITON_LOOP_LATENCY` is set; read once.
+pub(crate) fn loop_latency_trace() -> Option<std::time::Instant> {
+	static ARMED: std::sync::OnceLock<Option<std::time::Instant>> = std::sync::OnceLock::new();
+	*ARMED.get_or_init(|| {
+		std::env::var_os("POLARITON_LOOP_LATENCY").map(|_| std::time::Instant::now())
+	})
+}
+
 pub trait PlotBackend: AsPlotBackend {
 	/// PRODUCT-0156: grouping has no drawing effect on non-SVG backends.
 	fn with_series(
@@ -2012,6 +2022,17 @@ pub trait PlotBackend: AsPlotBackend {
 	fn stroke_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), stroke: Stroke);
 	fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), color: Color);
 	fn fill_rectangle(&mut self, top_left: Point, size: iced::Size, color: Color);
+	/// PRODUCT-0159 §1: a batch of identical circles filled with one colour
+	/// and composited per mark. Never a compound path: two marks in one
+	/// non-zero fill cost lyon every pairwise intersection, which is
+	/// superlinear in overlap and stalled the desktop for minutes. The
+	/// default fills one mark per call so every recorder sees one operation
+	/// per mark.
+	fn fill_marks(&mut self, centres: &[Point], radius: f32, color: Color) {
+		for centre in centres {
+			self.fill_path(&|builder| builder.circle(*centre, radius), color);
+		}
+	}
 	/// Emits plot text through the one declared face PRODUCT-0117 binds to the
 	/// static ASCII budget. Backends receive the already-resolved operation so
 	/// operation traces and production pixels share the same font authority.
@@ -2054,9 +2075,9 @@ pub struct IcedBackend<'a> {
 	pub frame: &'a mut Frame,
 }
 
-struct IcedPathBuilder<'a> {
-	builder: &'a mut canvas::path::Builder,
-	state: ArcPathState,
+pub(crate) struct IcedPathBuilder<'a> {
+	pub(crate) builder: &'a mut canvas::path::Builder,
+	pub(crate) state: ArcPathState,
 }
 
 impl<'a> PathBuilder for IcedPathBuilder<'a> {
@@ -5891,6 +5912,16 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 						.draw(renderer, effective_bounds.size(), |frame| {
 							let mut backend = IcedBackend { frame };
 							self.render_plot_layer(&mut backend, effective_bounds);
+							// PRODUCT-0159 gate 5: the data layer's geometry is built at this
+							// instant; presentation is the operator's observation.
+							if let Some(armed) = loop_latency_trace() {
+								eprintln!(
+									"POLARITON_LOOP_LATENCY geometry built title={:?} revision={} at_ms={:.0}",
+									self.title,
+									self.render_revision,
+									armed.elapsed().as_secs_f64() * 1000.0
+								);
+							}
 						});
 				vec![plot_geometry]
 			}

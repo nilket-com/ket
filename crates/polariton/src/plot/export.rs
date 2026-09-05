@@ -35,6 +35,8 @@ pub struct SvgBackend {
 	series_groups: bool,
 	current_transform: Affine,
 	clip_count: usize,
+	/// PRODUCT-0159 §3: one definition per translucent mark batch.
+	mark_count: usize,
 }
 
 /// PRODUCT-0156: exact metadata stays in memory, separate from the SVG's
@@ -141,6 +143,7 @@ impl SvgBackend {
 			series_groups: true,
 			current_transform: Affine::IDENTITY,
 			clip_count: 0,
+			mark_count: 0,
 		}
 	}
 
@@ -230,6 +233,43 @@ impl PlotBackend for SvgBackend {
 			color.a
 		));
 		self.svg.push('\n');
+	}
+
+	/// PRODUCT-0159 §3. An opaque batch is one `<path>` of circle subpaths,
+	/// byte-for-byte what the compound path emitted, because for an opaque
+	/// colour the union and the per-mark composite are the same pixels. A
+	/// translucent batch defines one circle and places it per mark with
+	/// `<use>`, so the SVG composites per mark exactly as the desktop does.
+	fn fill_marks(&mut self, centres: &[Point], radius: f32, color: Color) {
+		if color.a >= 1.0 {
+			self.fill_path(
+				&|builder| {
+					for centre in centres {
+						builder.circle(*centre, radius);
+					}
+				},
+				color,
+			);
+			return;
+		}
+		let id = format!("mark_{}", self.mark_count);
+		self.mark_count += 1;
+		self.svg.push_str(&format!(
+			r#"<defs><circle id="{}" r="{:.2}" fill="{}" fill-opacity="{:.2}" /></defs>"#,
+			id,
+			radius,
+			self.color_to_svg(color),
+			color.a
+		));
+		self.svg.push('\n');
+		for centre in centres {
+			let p = self.current_transform * kurbo::Point::new(centre.x as f64, centre.y as f64);
+			self.svg.push_str(&format!(
+				r##"<use href="#{}" x="{:.2}" y="{:.2}" />"##,
+				id, p.x, p.y
+			));
+			self.svg.push('\n');
+		}
 	}
 
 	fn fill_rectangle(&mut self, top_left: Point, size: iced::Size, color: Color) {
@@ -579,6 +619,10 @@ impl PlotBackend for AvifBackend {
 		self.svg_backend.stroke_path(f, stroke);
 	}
 
+	fn fill_marks(&mut self, centres: &[Point], radius: f32, color: Color) {
+		self.svg_backend.fill_marks(centres, radius, color);
+	}
+
 	fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), color: Color) {
 		self.svg_backend.fill_path(f, color);
 	}
@@ -631,6 +675,10 @@ impl PlotBackend for PngBackend {
 		self.svg_backend.stroke_path(f, stroke);
 	}
 
+	fn fill_marks(&mut self, centres: &[Point], radius: f32, color: Color) {
+		self.svg_backend.fill_marks(centres, radius, color);
+	}
+
 	fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), color: Color) {
 		self.svg_backend.fill_path(f, color);
 	}
@@ -675,5 +723,265 @@ impl PlotBackend for PngBackend {
 
 	fn with_clip(&mut self, bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
 		self.svg_backend.with_clip(bounds, f);
+	}
+}
+
+/// PRODUCT-0159 §3: the SVG backend's batch.
+#[cfg(test)]
+mod product_0159_tests {
+	use super::*;
+
+	fn lattice() -> Vec<Point> {
+		(0..40)
+			.flat_map(|i| {
+				(0..20).map(move |j| Point::new(10.0 + i as f32 * 1.5, 10.0 + j as f32 * 1.5))
+			})
+			.collect()
+	}
+
+	#[test]
+	fn product_0159_opaque_batch_is_byte_identical_to_the_compound_path() {
+		let marks = lattice();
+		let color = Color::from_rgb(0.2, 0.4, 0.8);
+		let mut batch = SvgBackend::new(100.0, 60.0);
+		batch.translate(iced::Vector::new(3.0, 5.0));
+		batch.fill_marks(&marks, 3.0, color);
+		let mut compound = SvgBackend::new(100.0, 60.0);
+		compound.translate(iced::Vector::new(3.0, 5.0));
+		compound.fill_path(
+			&|builder| {
+				for centre in &marks {
+					builder.circle(*centre, 3.0);
+				}
+			},
+			color,
+		);
+		let batch = batch.finish();
+		assert_eq!(batch, compound.finish());
+		assert_eq!(batch.matches("<path ").count(), 1);
+		assert!(!batch.contains("<use "));
+	}
+
+	#[test]
+	fn product_0159_translucent_batch_composites_per_mark_in_svg_and_png() {
+		let marks = [Point::new(30.0, 30.0), Point::new(36.0, 30.0)];
+		let color = Color::from_rgba(1.0, 1.0, 1.0, 0.5);
+		let mut svg = SvgBackend::new(80.0, 60.0);
+		svg.translate(iced::Vector::new(2.0, 0.0));
+		svg.fill_marks(&marks, 6.0, color);
+		let svg = svg.finish();
+		assert_eq!(svg.matches("<defs><circle id=\"mark_0\"").count(), 1);
+		assert_eq!(svg.matches("<use href=\"#mark_0\"").count(), 2);
+		assert!(
+			svg.contains("x=\"32.00\" y=\"30.00\""),
+			"the transform applies: {svg}"
+		);
+		assert!(!svg.contains("<path "));
+
+		// The desktop's compositing, through resvg: the overlap is darker than
+		// a single mark, and the pre-cut union is the negative control.
+		let render = |batched: bool| {
+			let mut png = PngBackend::new(80, 60);
+			if batched {
+				png.fill_marks(&marks, 6.0, color);
+			} else {
+				png.fill_path(
+					&|builder| {
+						for centre in &marks {
+							builder.circle(*centre, 6.0);
+						}
+					},
+					color,
+				);
+			}
+			png.pixmap()
+		};
+		let sample = |pixmap: &tiny_skia::Pixmap, x: u32, y: u32| {
+			pixmap.pixel(x, y).map(|p| p.red()).unwrap_or(0)
+		};
+		let batched = render(true);
+		let union = render(false);
+		let single = sample(&batched, 26, 30);
+		let overlap = sample(&batched, 33, 30);
+		assert!(
+			single > 100 && single < 160,
+			"one mark at half alpha: {single}"
+		);
+		assert!(
+			overlap > single + 40,
+			"overlap composites twice: {overlap} vs {single}"
+		);
+		assert_eq!(
+			sample(&union, 33, 30),
+			sample(&union, 26, 30),
+			"negative control: the compound path is a union"
+		);
+	}
+
+	/// The pre-cut behaviour, as a borrowing adapter: every batch becomes one
+	/// compound path, so the comparison is against what the tree drew before
+	/// PRODUCT-0159, through the same widget and the same backend. Each
+	/// grouping callback wraps the backend reference the inner backend
+	/// supplies, so no reference is ever reconstructed while another is live.
+	struct CompoundMarks<'a>(&'a mut dyn PlotBackend);
+	impl PlotBackend for CompoundMarks<'_> {
+		fn with_series(
+			&mut self,
+			group: crate::plot::series::SeriesGroup,
+			f: &mut dyn FnMut(&mut dyn PlotBackend),
+		) {
+			self.0
+				.with_series(group, &mut |inner| f(&mut CompoundMarks(inner)));
+		}
+		fn with_legend_entry(
+			&mut self,
+			group: crate::plot::series::SeriesGroup,
+			f: &mut dyn FnMut(&mut dyn PlotBackend),
+		) {
+			self.0
+				.with_legend_entry(group, &mut |inner| f(&mut CompoundMarks(inner)));
+		}
+		fn translate(&mut self, translation: iced::Vector) {
+			self.0.translate(translation);
+		}
+		fn rotate(&mut self, angle: f32) {
+			self.0.rotate(angle);
+		}
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			self.0.with_save(&mut |inner| f(&mut CompoundMarks(inner)));
+		}
+		fn with_clip(&mut self, bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			self.0
+				.with_clip(bounds, &mut |inner| f(&mut CompoundMarks(inner)));
+		}
+		fn stroke_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), stroke: Stroke) {
+			self.0.stroke_path(f, stroke);
+		}
+		fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), color: Color) {
+			self.0.fill_path(f, color);
+		}
+		fn fill_marks(&mut self, centres: &[Point], radius: f32, color: Color) {
+			self.0.fill_path(
+				&|builder| {
+					for centre in centres {
+						builder.circle(*centre, radius);
+					}
+				},
+				color,
+			);
+		}
+		fn fill_rectangle(&mut self, top_left: Point, size: iced::Size, color: Color) {
+			self.0.fill_rectangle(top_left, size, color);
+		}
+		fn fill_text_raw(&mut self, text: Text) {
+			self.0.fill_text_raw(text);
+		}
+		fn supports_embedded_raster(&self) -> bool {
+			self.0.supports_embedded_raster()
+		}
+		fn draw_image_rgba(
+			&mut self,
+			top_left: Point,
+			size: iced::Size,
+			width: u32,
+			height: u32,
+			rgba: &[u8],
+		) {
+			self.0.draw_image_rgba(top_left, size, width, height, rgba);
+		}
+	}
+
+	fn showcase_scatter() -> Arc<crate::plot::kernels::scatter::ScatterPreparedData> {
+		// The Trends showcase relation (uat/plot_trends_showcase.sql), the
+		// rows its scatter view draws.
+		let frame = polars::df!(
+			"period" => [1_i64, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8],
+			"series" => ["Northstar"; 8].iter().chain(["Horizon"; 8].iter()).chain(["Pulse"; 8].iter()).copied().collect::<Vec<_>>(),
+			"value" => [32.0, 38.0, 44.0, 52.0, 60.0, 66.0, 73.0, 81.0, 61.0, 58.0, 55.0, 53.0, 49.0, 46.0, 44.0, 41.0, 20.0, 25.0, 22.0, 31.0, 39.0, 35.0, 49.0, 57.0]
+		)
+		.expect("frame");
+		Arc::new(crate::plot::kernels::scatter::prepare_scatter_data(
+			&frame, "series", "period", "value",
+		))
+	}
+
+	fn dense_scatter() -> Arc<crate::plot::kernels::scatter::ScatterPreparedData> {
+		let points = 105 * 105 * 105;
+		let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+		let mut next = || {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			(state >> 11) as f64 / (1u64 << 53) as f64
+		};
+		let xs: Vec<f64> = (0..points).map(|_| next()).collect();
+		let ys: Vec<f64> = (0..points).map(|_| next()).collect();
+		let series: Vec<&str> = (0..points)
+			.map(|i| ["Atlas", "Beacon", "Cinder"][i % 3])
+			.collect();
+		let frame = polars::df!("x" => xs, "y" => ys, "series" => series).expect("frame");
+		Arc::new(crate::plot::kernels::scatter::prepare_scatter_data(
+			&frame, "series", "x", "y",
+		))
+	}
+
+	/// Gate 2's export half: the showcase scatter and the fixture scatter at
+	/// three pane sizes, rendered through the widget to the SVG and PNG
+	/// backends, are byte-identical with the batch and with the pre-cut
+	/// compound path.
+	#[test]
+	fn product_0159_showcase_and_fixture_exports_are_byte_identical_to_the_compound_path() {
+		use crate::plot::common::{PlotKernel, PlotRenderLayer, PlotWidget};
+		use crate::plot::kernels::scatter::ScatterPlotKernel;
+		let mut cases: Vec<(&str, Arc<dyn PlotKernel + Send + Sync>, f32, f32)> = vec![(
+			"trend-scatter",
+			Arc::new(ScatterPlotKernel::new(showcase_scatter())),
+			320.0,
+			220.0,
+		)];
+		let dense = dense_scatter();
+		for (width, height) in [(320.0_f32, 220.0_f32), (950.0, 420.0), (360.0, 360.0)] {
+			cases.push((
+				"fixture-raster-scatter",
+				Arc::new(ScatterPlotKernel::new(Arc::clone(&dense))),
+				width,
+				height,
+			));
+		}
+		for (label, kernel, width, height) in cases {
+			let widget = PlotWidget::new(
+				kernel.as_ref(),
+				label.to_owned(),
+				20.0,
+				crate::plot::theme::PlotSettings::default(),
+				0,
+				false,
+				PlotRenderLayer::Full,
+			);
+			let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(width, height));
+			let mut batch = SvgBackend::new(width, height);
+			widget.render(&mut batch, bounds);
+			let mut compound = SvgBackend::new(width, height);
+			widget.render(&mut CompoundMarks(&mut compound), bounds);
+			let batch_svg = batch.finish();
+			assert_eq!(
+				batch_svg,
+				compound.finish(),
+				"{label} {width}x{height}: SVG bytes"
+			);
+			assert!(
+				batch_svg.contains("<path ") || batch_svg.contains("<image "),
+				"{label}: positive control, marks were emitted"
+			);
+			let mut batch_png = PngBackend::new(width as u32, height as u32);
+			widget.render(&mut batch_png, bounds);
+			let mut compound_png = PngBackend::new(width as u32, height as u32);
+			widget.render(&mut CompoundMarks(&mut compound_png), bounds);
+			assert_eq!(
+				batch_png.pixmap().data(),
+				compound_png.pixmap().data(),
+				"{label} {width}x{height}: PNG pixels"
+			);
+		}
 	}
 }

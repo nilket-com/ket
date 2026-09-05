@@ -126,6 +126,8 @@ struct AppState {
 	status_detail_open: bool,
 	adapter_state: AdapterState,
 	code_started: Instant,
+	/// PRODUCT-0159 gate 5: armed at start by `POLARITON_LOOP_LATENCY=1`.
+	loop_latency: Option<LoopLatencyProbe>,
 	is_maximized: bool,
 	showing_settings: bool,
 	show_column_types: bool,
@@ -577,11 +579,131 @@ fn subscription(state: &AppState) -> Subscription<Message> {
 		}
 		_ => None,
 	});
-	Subscription::batch([
+	let mut subscriptions = vec![
 		events,
 		state.code_editor.subscription().map(Message::CodeEditEvent),
 		window::resize_events().map(|(_, size)| Message::CodeEditResize(size)),
-	])
+	];
+	if state.loop_latency.is_some() {
+		subscriptions
+			.push(iced::time::every(LoopLatencyProbe::PERIOD).map(Message::LoopLatencyTick));
+	}
+	Subscription::batch(subscriptions)
+}
+
+/// PRODUCT-0159 gate 5: an event-loop latency probe. A tick subscription is
+/// armed at application start, before any fixture work. iced's timer starts
+/// one period after the subscription, skips missed ticks, and yields tokio's
+/// own scheduled instant for each delivered tick; that instant travels in the
+/// message. Two measures per delivered tick, on one clock: *lateness*, now
+/// minus the tick's scheduled instant, and *skipped*, the gap between this
+/// tick's scheduled instant and the previous one beyond one period. A stall
+/// shows in one or the other whichever instant tokio reports for the tick
+/// that follows it, so the gate reads their maximum, *unserviced*. Nothing
+/// is derived from a count of handled ticks, so skipped ticks never
+/// accumulate into drift. The first tick's arrival after arming is reported
+/// separately, not as lateness, because the timer's start is not the
+/// arming instant.
+struct LoopLatencyProbe {
+	armed: Instant,
+	first_handled: Option<Duration>,
+	previous_scheduled: Option<Instant>,
+	previous_lateness: Duration,
+	ticks: u64,
+	max_unserviced: Duration,
+	over_100ms: u64,
+}
+
+impl LoopLatencyProbe {
+	const PERIOD: Duration = Duration::from_millis(16);
+
+	fn from_environment() -> Option<Self> {
+		crate::plot::common::loop_latency_trace().map(|armed| {
+			eprintln!("POLARITON_LOOP_LATENCY armed");
+			Self::new(armed)
+		})
+	}
+
+	fn new(armed: Instant) -> Self {
+		Self {
+			armed,
+			first_handled: None,
+			previous_scheduled: None,
+			previous_lateness: Duration::ZERO,
+			ticks: 0,
+			max_unserviced: Duration::ZERO,
+			over_100ms: 0,
+		}
+	}
+
+	fn tick(&mut self, scheduled: Instant) {
+		if let Some(unserviced) = self.observe(scheduled, Instant::now()) {
+			if unserviced == self.max_unserviced {
+				self.report("new maximum");
+			}
+		}
+	}
+
+	/// The pure half: returns the tick's unserviced time when it set a new
+	/// maximum. Tested with synthetic instants for delayed and skipped
+	/// delivery under both tokio reporting conventions.
+	fn observe(&mut self, scheduled: Instant, now: Instant) -> Option<Duration> {
+		self.ticks += 1;
+		// The first tick is also measured against arming: the timer starts one
+		// period after the subscription, so anything beyond that is time the
+		// loop did not service events before the subscription even ran. It is
+		// reported separately and it counts toward the maximum.
+		let mut startup = Duration::ZERO;
+		if self.first_handled.is_none() {
+			let since_arming = now.saturating_duration_since(self.armed);
+			self.first_handled = Some(since_arming);
+			startup = since_arming.saturating_sub(Self::PERIOD);
+			eprintln!(
+				"POLARITON_LOOP_LATENCY first tick handled {:.1} ms after arming (timer starts one period after subscription; {:.1} ms counted as unserviced)",
+				since_arming.as_secs_f64() * 1000.0,
+				startup.as_secs_f64() * 1000.0
+			);
+		}
+		let lateness = now.saturating_duration_since(scheduled);
+		// The gap to the previous scheduled instant, net of the stall the
+		// previous tick already reported as lateness, so one stall is counted
+		// once whichever instant tokio reports for the tick after it.
+		let skipped = self
+			.previous_scheduled
+			.map(|previous| {
+				scheduled
+					.saturating_duration_since(previous)
+					.saturating_sub(Self::PERIOD)
+					.saturating_sub(self.previous_lateness)
+			})
+			.unwrap_or(Duration::ZERO);
+		self.previous_scheduled = Some(scheduled);
+		self.previous_lateness = lateness;
+		let unserviced = lateness.max(skipped).max(startup);
+		if unserviced > Duration::from_millis(100) {
+			self.over_100ms += 1;
+		}
+		if unserviced > self.max_unserviced {
+			self.max_unserviced = unserviced;
+			return Some(unserviced);
+		}
+		None
+	}
+
+	fn report(&self, why: &str) {
+		eprintln!(
+			"POLARITON_LOOP_LATENCY {why}: max_unserviced_ms={:.1} over_100ms={} ticks={}",
+			self.max_unserviced.as_secs_f64() * 1000.0,
+			self.over_100ms,
+			self.ticks
+		);
+	}
+}
+
+impl Drop for LoopLatencyProbe {
+	fn drop(&mut self) {
+		self.report("exit");
+	}
 }
 
 pub fn run(startup_data: StartupData, target: StartupTarget) -> Result {
@@ -687,6 +809,7 @@ fn new_with_authority(
 		status_detail_open: false,
 		adapter_state: AdapterState::default(),
 		code_started: Instant::now(),
+		loop_latency: LoopLatencyProbe::from_environment(),
 		is_maximized: false,
 		showing_settings: false,
 		show_column_types: startup_data.show_column_types,
@@ -3864,6 +3987,11 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::CodeEditResize(size) => {
 			app_state.window_size = size;
 			sync_workspace_viewport(app_state);
+		}
+		Message::LoopLatencyTick(scheduled) => {
+			if let Some(probe) = app_state.loop_latency.as_mut() {
+				probe.tick(scheduled);
+			}
 		}
 		Message::MaximizeWindow => {
 			app_state.is_maximized = !app_state.is_maximized;
@@ -14877,5 +15005,83 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		assert_eq!(state.current_sql_generation(), before + 1);
 		assert!(state.pending_runs.is_empty());
 		state.code_editor.shutdown();
+	}
+}
+
+#[cfg(test)]
+mod product_0159_probe_tests {
+	use super::*;
+
+	fn ms(value: u64) -> Duration {
+		Duration::from_millis(value)
+	}
+
+	/// Delayed and skipped delivery under both tokio conventions: the stall
+	/// is measured once, at its true length, and never accumulates.
+	#[test]
+	fn product_0159_probe_measures_a_stall_once_under_either_tick_convention() {
+		let base = Instant::now();
+		// Convention A: the tick delivered after a stall carries its original,
+		// missed deadline, so lateness is the stall.
+		let mut a = LoopLatencyProbe::new(base);
+		for n in 1..=10_u64 {
+			assert!(
+				a.observe(base + ms(16 * n), base + ms(16 * n + 1))
+					.is_none() || n == 1
+			);
+		}
+		let stalled = a.observe(base + ms(16 * 11), base + ms(16 * 11 + 2_000));
+		assert_eq!(stalled, Some(ms(2_000)));
+		// After the stall the timer skips to the next multiple after now; on-time
+		// ticks from there set no new maximum and the maximum stays the stall.
+		for n in 0..1_000_u64 {
+			let scheduled = base + ms(16 * 11 + 2_000 + 16 * (n + 1));
+			assert!(a.observe(scheduled, scheduled + ms(1)).is_none());
+		}
+		assert_eq!(a.max_unserviced, ms(2_000));
+		assert_eq!(a.over_100ms, 1);
+
+		// Convention B: the tick delivered after a stall carries the rescheduled
+		// instant near now, so lateness is small and the skipped gap is the stall.
+		let mut b = LoopLatencyProbe::new(base);
+		b.observe(base + ms(16), base + ms(17));
+		let stalled = b.observe(base + ms(16 + 2_000), base + ms(16 + 2_001));
+		// The gap is 2,000 ms minus one period, net of the previous tick's
+		// 1 ms lateness.
+		assert_eq!(stalled, Some(ms(2_000 - 16 - 1)));
+		for n in 1..=1_000_u64 {
+			let scheduled = base + ms(16 + 2_000 + 16 * n);
+			assert!(b.observe(scheduled, scheduled + ms(1)).is_none());
+		}
+		assert_eq!(b.max_unserviced, ms(2_000 - 16 - 1));
+		assert_eq!(b.over_100ms, 1);
+	}
+
+	/// The first tick is reported against arming and counts toward the
+	/// maximum beyond one period: an on-time first tick sets nothing, a late
+	/// first tick counts, and a subscription that started late with an
+	/// on-time first tick counts the startup delay.
+	#[test]
+	fn product_0159_probe_first_tick_counts_startup_delay() {
+		let base = Instant::now();
+		let mut probe = LoopLatencyProbe::new(base);
+		assert!(probe.observe(base + ms(16), base + ms(16)).is_none());
+		assert_eq!(probe.first_handled, Some(ms(16)));
+		assert_eq!(probe.max_unserviced, Duration::ZERO);
+		let mut late = LoopLatencyProbe::new(base);
+		assert_eq!(late.observe(base + ms(16), base + ms(316)), Some(ms(300)));
+		// Delayed subscription startup: the timer began two seconds after
+		// arming and its first tick arrived exactly on its own schedule.
+		let mut stalled_start = LoopLatencyProbe::new(base);
+		assert_eq!(
+			stalled_start.observe(base + ms(2_016), base + ms(2_016)),
+			Some(ms(2_000))
+		);
+		assert_eq!(stalled_start.over_100ms, 1);
+		for n in 1..=100_u64 {
+			let scheduled = base + ms(2_016 + 16 * n);
+			assert!(stalled_start.observe(scheduled, scheduled).is_none());
+		}
+		assert_eq!(stalled_start.max_unserviced, ms(2_000));
 	}
 }

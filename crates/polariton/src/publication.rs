@@ -1741,6 +1741,10 @@ fn scope_svg_ids(svg: &str, figure_id: &str) -> String {
 		"<g clip-path=\"url(#clip_",
 		&format!("<g clip-path=\"url(#{scope}-clip_"),
 	)
+	// PRODUCT-0159 §3: a translucent mark batch defines one circle and
+	// references it per mark; both halves are scoped the same way.
+	.replace("<circle id=\"mark_", &format!("<circle id=\"{scope}-mark_"))
+	.replace("<use href=\"#mark_", &format!("<use href=\"#{scope}-mark_"))
 }
 
 /// The inlined SVG with the hidden class on every group an actionable
@@ -4552,5 +4556,24 @@ mod shell_id_scope_tests {
 		);
 		assert!(file.contains(&format!(">{escaped}</text>")));
 		assert!(shell.contains(&format!("aria-label=\"{}\"", html_escape(label))));
+	}
+}
+
+/// PRODUCT-0159 §3: a translucent mark batch's definition and references
+/// are scoped per figure in the shell like clip ids.
+#[cfg(test)]
+mod product_0159_shell_tests {
+	use super::*;
+
+	#[test]
+	fn product_0159_shell_scopes_mark_definitions_and_references() {
+		let svg = "<defs><circle id=\"mark_0\" r=\"3.00\" /></defs>\n<use href=\"#mark_0\" x=\"1.00\" y=\"2.00\" />\n<text>href=\"#mark_0\" id=\"mark_0\"</text>";
+		let scoped = scope_svg_ids(svg, "dense");
+		assert!(scoped.contains("<circle id=\"dense-mark_0\""));
+		assert!(scoped.contains("<use href=\"#dense-mark_0\""));
+		assert!(
+			scoped.contains("<text>href=\"#mark_0\" id=\"mark_0\"</text>"),
+			"text is never scoped"
+		);
 	}
 }

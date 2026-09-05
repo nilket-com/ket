@@ -2056,6 +2056,7 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 	let large = Size::new(448, 320);
 	let mut msaa = gpu.renderer(Some(Antialiasing::MSAAx4)).await;
 	let mut no_aa = gpu.renderer(None).await;
+	product_0159_mark_batch(&mut msaa);
 	let product_0117_sample = "International partner enablement";
 	let product_0117_generic =
 		render_product_0117_font_probe(&mut msaa, Font::DEFAULT, product_0117_sample);
@@ -2793,5 +2794,141 @@ async fn product_0132_stage_0(gpu: &Gpu) {
 		(rotated_ticks_positive, rotated_ticks_negative),
 		PRODUCT_0132_BANKED_ROTATED_TICK_INK,
 		"PRODUCT-0132 rotated tick labels must rasterize in both signs"
+	);
+}
+
+/// PRODUCT-0159 gates 2 and 3 on the production renderer. The batch and the
+/// pre-cut compound path draw the same opaque marks; where marks do not
+/// overlap the captures must be identical at scale 1 and 2, and where they
+/// overlap every difference must sit within one physical pixel of a mark
+/// boundary. A translucent pair composites per mark, darker at the overlap,
+/// and the compound union is the negative control.
+fn product_0159_mark_batch(renderer: &mut iced::Renderer) {
+	let radius = 3.0_f32;
+	let opaque = Color::from_rgb(0.85, 0.85, 0.85);
+	let spaced: Vec<Point> = (0..8)
+		.flat_map(|i| {
+			(0..5).map(move |j| Point::new(20.0 + i as f32 * 24.0, 20.0 + j as f32 * 24.0))
+		})
+		.collect();
+	let dense: Vec<Point> = (0..60)
+		.flat_map(|i| {
+			(0..30).map(move |j| Point::new(30.0 + i as f32 * 1.5, 30.0 + j as f32 * 1.5))
+		})
+		.collect();
+	let render = |renderer: &mut iced::Renderer,
+	              marks: &[Point],
+	              scale: f32,
+	              batched: bool,
+	              color: Color| {
+		let size = Size::new((220.0 * scale) as u32, (160.0 * scale) as u32);
+		render_frame(renderer, size, |frame| {
+			frame.scale(scale);
+			let mut backend = IcedBackend { frame };
+			if batched {
+				backend.fill_marks(marks, radius, color);
+			} else {
+				backend.fill_path(
+					&|builder| {
+						for centre in marks {
+							builder.circle(*centre, radius);
+						}
+					},
+					color,
+				);
+			}
+		})
+	};
+	let mut nonoverlap_identical = true;
+	for scale in [1.0_f32, 2.0] {
+		let batch = render(renderer, &spaced, scale, true, opaque);
+		let compound = render(renderer, &spaced, scale, false, opaque);
+		nonoverlap_identical &= batch.rgba == compound.rgba;
+		assert!(
+			batch.luminous_pixels(Rectangle::with_size(Size::new(
+				batch.width as f32,
+				batch.height as f32
+			))) > 100,
+			"positive control: the marks rasterized at scale {scale}"
+		);
+	}
+	// Overlapping opaque marks: differences confined to one physical pixel of
+	// a mark boundary, widened by lyon's flattening tolerance; never interior
+	// or background.
+	let mut worst_band_violation = 0usize;
+	let mut differing = 0usize;
+	let mut max_delta = 0u8;
+	for scale in [1.0_f32, 2.0] {
+		let batch = render(renderer, &dense, scale, true, opaque);
+		let compound = render(renderer, &dense, scale, false, opaque);
+		let band = 1.0 + 0.1 * scale;
+		for y in 0..batch.height {
+			for x in 0..batch.width {
+				let a = batch.pixel(x, y);
+				let b = compound.pixel(x, y);
+				if a == b {
+					continue;
+				}
+				differing += 1;
+				max_delta = max_delta.max(
+					a.into_iter()
+						.zip(b)
+						.map(|(a, b)| a.abs_diff(b))
+						.max()
+						.unwrap_or(0),
+				);
+				let px = (x as f32 + 0.5) / scale;
+				let py = (y as f32 + 0.5) / scale;
+				let nearest_edge = dense
+					.iter()
+					.map(|centre| ((px - centre.x).powi(2) + (py - centre.y).powi(2)).sqrt())
+					.map(|distance| (distance - radius).abs() * scale)
+					.fold(f32::INFINITY, f32::min);
+				if nearest_edge > band {
+					worst_band_violation += 1;
+				}
+			}
+		}
+	}
+	// Translucent overlap: per-mark compositing on the desktop, darker where
+	// two marks overlap; the compound path is a union and is not.
+	let translucent = Color::from_rgba(1.0, 1.0, 1.0, 0.5);
+	let pair = [Point::new(60.0, 60.0), Point::new(64.0, 60.0)];
+	let batch = render(renderer, &pair, 1.0, true, translucent);
+	let union = render(renderer, &pair, 1.0, false, translucent);
+	let single = batch.pixel(58, 60)[0];
+	let overlap = batch.pixel(62, 60)[0];
+	let union_overlap = union.pixel(62, 60)[0];
+	let union_single = union.pixel(58, 60)[0];
+	// The same pair through the SVG backend and resvg: the two rasterizers
+	// agree on the composite within PRODUCT-0057's tolerance at both sample
+	// points; pixel-for-pixel agreement is not licensed and not claimed.
+	let mut png = plot::export::PngBackend::new(220, 160);
+	png.fill_marks(&pair, radius, translucent);
+	let pixmap = png.pixmap();
+	let resvg_single = pixmap.pixel(58, 60).map(|p| p.red()).unwrap_or(0);
+	let resvg_overlap = pixmap.pixel(62, 60).map(|p| p.red()).unwrap_or(0);
+	println!(
+		"PRODUCT_0159 mark_batch disposition=automated nonoverlap_identical={nonoverlap_identical} overlap_differing_pixels={differing} overlap_max_channel_delta={max_delta} band_violations={worst_band_violation} translucent_single={single} translucent_overlap={overlap} union_single={union_single} union_overlap={union_overlap} resvg_single={resvg_single} resvg_overlap={resvg_overlap}"
+	);
+	assert!(
+		single.abs_diff(resvg_single) <= 12 && overlap.abs_diff(resvg_overlap) <= 12,
+		"PRODUCT-0159 gate 3: desktop and resvg agree on the composite within the 0057 tolerance"
+	);
+	assert!(
+		nonoverlap_identical,
+		"PRODUCT-0159 gate 2: non-overlapping opaque marks are identical"
+	);
+	assert_eq!(
+		worst_band_violation, 0,
+		"PRODUCT-0159 gate 2: differences stay at mark boundaries"
+	);
+	assert!(
+		overlap > single + 40,
+		"PRODUCT-0159 gate 3: the overlap composites per mark"
+	);
+	assert!(
+		union_overlap.abs_diff(union_single) <= 8,
+		"PRODUCT-0159 gate 3 control: the union does not"
 	);
 }

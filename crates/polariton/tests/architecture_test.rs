@@ -6486,3 +6486,61 @@ fn product_0155_javascript_engine_is_boa_dev_only_without_default_features() {
 		assert!(!manifest.contains(other), "no second engine: {other}");
 	}
 }
+
+/// PRODUCT-0159 gate 6: the record moves nothing about the raster gate or the
+/// coupled downsample pair, and the mark batch is scatter's alone.
+#[test]
+fn product_0159_gate_constants_and_render_mode_are_retained_and_the_batch_is_scatters() {
+	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let common = std::fs::read_to_string(src.join("plot/common.rs")).expect("read common");
+	for retained in [
+		"scatter_max_vector_points: 50_000,",
+		"scatter_downsample_target: 200_000,",
+		"scatter_raster_threshold: 1_000_000,",
+	] {
+		assert!(
+			common.contains(retained),
+			"PRODUCT-0140 §2 retained {retained}"
+		);
+	}
+	let scatter =
+		std::fs::read_to_string(src.join("plot/kernels/scatter.rs")).expect("read scatter");
+	let gate = scatter
+		.split("fn resolve_render_mode(")
+		.nth(1)
+		.expect("resolve_render_mode")
+		.split("\n}\n")
+		.next()
+		.expect("gate body");
+	for retained in [
+		"ScatterRenderMode::Vector => ResolvedScatterRenderMode::Vector,",
+		"if total_points <= settings.scatter_max_vector_points as usize {",
+		"let raster_threshold = settings.scatter_raster_threshold as usize;",
+		"&& total_points > pixel_budget.saturating_mul(8)",
+	] {
+		assert!(
+			gate.contains(retained),
+			"PRODUCT-0140 §2 retained `{retained}`"
+		);
+	}
+	let kernels = src.join("plot/kernels");
+	let mut callers = Vec::new();
+	for entry in std::fs::read_dir(&kernels).expect("kernels") {
+		let path = entry.expect("entry").path();
+		if path.extension().is_some_and(|ext| ext == "rs") {
+			let source = std::fs::read_to_string(&path).expect("read kernel");
+			if source.contains(".fill_marks(") {
+				callers.push(path.file_name().unwrap().to_string_lossy().into_owned());
+			}
+		}
+	}
+	assert_eq!(
+		callers,
+		["scatter.rs"],
+		"the batch is scatter's alone in this cut"
+	);
+	assert!(
+		!scatter.contains("for point in &sampled {\n\t\t\t\t\t\t\t\tbuilder.circle("),
+		"no compound circle path remains in the downsampled arm"
+	);
+}

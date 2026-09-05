@@ -562,21 +562,14 @@ impl ScatterMarkRenderer {
 			let color = series
 				.resolved_color
 				.unwrap_or_else(|| settings.color_theme.get_color(series.color_t));
+			// PRODUCT-0159 §1: marks are a batch, never one compound path.
+			let mut centres = Vec::with_capacity(series.len());
+			series.for_each_point(|x, y| centres.push(scatter_point(transform, x, y)));
 			crate::plot::series::draw_series(
 				backend,
 				series.identity.as_ref(),
 				settings,
-				&mut |backend| {
-					backend.fill_path(
-						&|builder| {
-							series.for_each_point(|x, y| {
-								let pixel_p = scatter_point(transform, x, y);
-								builder.circle(pixel_p, point_radius);
-							});
-						},
-						color,
-					)
-				},
+				&mut |backend| backend.fill_marks(&centres, point_radius, color),
 			);
 		}
 	}
@@ -597,20 +590,12 @@ impl ScatterMarkRenderer {
 		for series in &self.prepared_data.series {
 			let sampled = downsample_series(series, bounds, transform, per_series_target);
 			let color = series_color(series, settings);
+			// PRODUCT-0159 §1: marks are a batch, never one compound path.
 			crate::plot::series::draw_series(
 				backend,
 				series.identity.as_ref(),
 				settings,
-				&mut |backend| {
-					backend.fill_path(
-						&|builder| {
-							for point in &sampled {
-								builder.circle(*point, point_radius);
-							}
-						},
-						color,
-					)
-				},
+				&mut |backend| backend.fill_marks(&sampled, point_radius, color),
 			);
 		}
 	}
@@ -769,12 +754,23 @@ impl ScatterMarkRenderer {
 		slot: &crate::plot::raster::RasterSlotId,
 		preparing: &mut bool,
 	) {
-		match resolve_render_mode(
+		let mode = resolve_render_mode(
 			self.prepared_data.total_points,
 			backend.supports_embedded_raster(),
 			bounds,
 			&settings,
-		) {
+		);
+		// PRODUCT-0159 gate 5: the live resolved arm, on the probe's clock.
+		if let Some(armed) = crate::plot::common::loop_latency_trace() {
+			eprintln!(
+				"POLARITON_LOOP_LATENCY scatter mode={mode:?} points={} plot_area={:.0}x{:.0} at_ms={:.0}",
+				self.prepared_data.total_points,
+				bounds.width,
+				bounds.height,
+				armed.elapsed().as_secs_f64() * 1000.0
+			);
+		}
+		match mode {
 			ResolvedScatterRenderMode::Vector => self.plot_vector(backend, transform, &settings),
 			ResolvedScatterRenderMode::Downsampled => {
 				self.plot_downsampled(backend, bounds, transform, &settings)
@@ -4022,7 +4018,6 @@ pub(crate) struct PointGeometry {
 #[cfg(test)]
 mod preparation_timing_probe {
 	use super::*;
-	use polars::prelude::*;
 	use std::time::Instant;
 
 	fn fixture_frame(points: usize) -> DataFrame {
@@ -4211,5 +4206,193 @@ mod preparation_timing_probe {
 			((780.0 / (2.0 * radius)) * (205.0 / (2.0 * radius))) as usize,
 		);
 		time("one-path-cell-equals-diameter", &coarse, radius, true);
+	}
+}
+
+/// PRODUCT-0159 gates 1 and 4: both arms emit one fill per mark and never a
+/// compound circle path.
+#[cfg(test)]
+mod product_0159_tests {
+	use super::*;
+	use crate::plot::common::{PathBuilder, PlotBackend, ScatterRenderMode};
+	use iced::widget::canvas::{Stroke, Text};
+
+	#[derive(Default)]
+	struct CirclesPerFill {
+		fills: Vec<usize>,
+	}
+	#[derive(Default)]
+	struct CircleCount(usize);
+	impl PathBuilder for CircleCount {
+		fn move_to(&mut self, _point: Point) {}
+		fn line_to(&mut self, _point: Point) {}
+		fn arc_to(&mut self, _center: Point, _radius: f32, _start: f32, _end: f32) {}
+		fn circle(&mut self, _center: Point, _radius: f32) {
+			self.0 += 1;
+		}
+		fn rectangle(&mut self, _top_left: Point, _size: iced::Size) {}
+		fn close(&mut self) {}
+	}
+	impl PlotBackend for CirclesPerFill {
+		fn translate(&mut self, _translation: iced::Vector) {}
+		fn rotate(&mut self, _angle: f32) {}
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+		fn with_clip(&mut self, _bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {}
+		fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {
+			let mut count = CircleCount::default();
+			f(&mut count);
+			self.fills.push(count.0);
+		}
+		fn fill_rectangle(&mut self, _tl: Point, _size: iced::Size, _color: Color) {}
+		fn fill_text_raw(&mut self, _text: Text) {}
+	}
+
+	fn dense_frame(points: usize) -> DataFrame {
+		let mut state = 0x2545_F491_4F6C_DD1D_u64;
+		let mut next = || {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			(state >> 11) as f64 / (1u64 << 53) as f64
+		};
+		let xs: Vec<f64> = (0..points).map(|_| next()).collect();
+		let ys: Vec<f64> = (0..points).map(|_| next()).collect();
+		let series: Vec<&str> = (0..points).map(|i| ["a", "b"][i % 2]).collect();
+		df!("x" => xs, "y" => ys, "series" => series).expect("frame")
+	}
+
+	#[test]
+	fn product_0159_both_arms_fill_one_mark_per_call_and_never_a_compound_path() {
+		let points = 12_000;
+		let prepared = Arc::new(prepare_scatter_data(
+			&dense_frame(points),
+			"series",
+			"x",
+			"y",
+		));
+		let renderer = ScatterMarkRenderer::new(Arc::clone(&prepared));
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(300.0, 120.0));
+		let layout = PlotLayout::Cartesian {
+			x_range: (0.0, 1.0),
+			y_range: (0.0, 1.0),
+			x_axis_type: AxisType::Linear,
+			y_axis_type: AxisType::Linear,
+			x_temporal_domain: None,
+			y_temporal_domain: None,
+		};
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		for (mode, expected_marks) in [
+			(ScatterRenderMode::Vector, points),
+			(ScatterRenderMode::Downsampled, {
+				let settings = crate::plot::theme::PlotSettings::default().resolve();
+				let target = (settings.scatter_downsample_target as usize).div_ceil(2);
+				prepared
+					.series
+					.iter()
+					.map(|series| downsample_series(series, bounds, &transform, target).len())
+					.sum()
+			}),
+		] {
+			let mut settings = crate::plot::theme::PlotSettings::default().resolve();
+			settings.scatter_render_mode = mode;
+			let mut backend = CirclesPerFill::default();
+			renderer.draw(&mut backend, bounds, &transform, settings);
+			let marks: usize = backend.fills.iter().sum();
+			assert_eq!(marks, expected_marks, "{mode:?}: every mark is filled once");
+			assert!(
+				backend.fills.iter().all(|circles| *circles == 1),
+				"{mode:?}: a fill carries exactly one mark; max {:?}",
+				backend.fills.iter().max()
+			);
+			assert!(
+				marks > 2_000,
+				"{mode:?}: positive control, the arm drew marks"
+			);
+		}
+	}
+
+	/// PRODUCT-0159 gate 1: the trait's own batch (`PlotBackend::fill_marks`,
+	/// one fill per mark) through a backend whose fills are iced's tessellator,
+	/// at the vector arm's ceiling, the fixture's per-series count, and the
+	/// downsample budget. Timed as evidence; the counting test is the gate's
+	/// exact half.
+	#[test]
+	#[ignore]
+	fn probe_batch_through_the_trait_on_the_iced_tessellator() {
+		use crate::plot::common::{ArcPathState, IcedPathBuilder, PathBuilder, PlotBackend};
+		use iced::advanced::graphics::geometry::frame::Backend as _;
+		use iced::widget::canvas::{Path, Stroke, Text};
+		use std::time::Instant;
+		struct WgpuFrameBackend {
+			frame: iced_wgpu::geometry::Frame,
+			fills: usize,
+		}
+		impl PlotBackend for WgpuFrameBackend {
+			fn translate(&mut self, _translation: iced::Vector) {}
+			fn rotate(&mut self, _angle: f32) {}
+			fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+				f(self);
+			}
+			fn with_clip(&mut self, _bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+				f(self);
+			}
+			fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {}
+			fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), color: Color) {
+				let path = Path::new(|builder| {
+					let mut ipb = IcedPathBuilder {
+						builder,
+						state: ArcPathState::default(),
+					};
+					f(&mut ipb);
+				});
+				self.frame.fill(&path, color);
+				self.fills += 1;
+			}
+			fn fill_rectangle(&mut self, _tl: Point, _size: iced::Size, _color: Color) {}
+			fn fill_text_raw(&mut self, _text: Text) {}
+		}
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(780.0, 205.0));
+		let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+		let mut next = || {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			(state >> 11) as f64 / (1u64 << 53) as f64
+		};
+		let radius = crate::plot::theme::PlotSettings::default()
+			.resolve()
+			.point_size
+			.radius_px();
+		for marks in [50_000_usize, 66_817, 200_000] {
+			let centres: Vec<Point> = (0..marks)
+				.map(|_| Point::new(next() as f32 * 780.0, next() as f32 * 205.0))
+				.collect();
+			let mut backend = WgpuFrameBackend {
+				frame: iced_wgpu::geometry::Frame::new(bounds),
+				fills: 0,
+			};
+			let started = Instant::now();
+			backend.fill_marks(&centres, radius, iced::Color::WHITE);
+			let elapsed = started.elapsed();
+			assert_eq!(
+				backend.fills, marks,
+				"one fill per mark through the trait default"
+			);
+			eprintln!(
+				"BATCH_TIMING marks={marks} radius={radius} fills={} elapsed={:.3}s profile={}",
+				backend.fills,
+				elapsed.as_secs_f64(),
+				if cfg!(debug_assertions) {
+					"dev"
+				} else {
+					"release"
+				}
+			);
+		}
 	}
 }
