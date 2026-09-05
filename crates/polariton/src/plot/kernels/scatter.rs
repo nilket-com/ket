@@ -4133,4 +4133,83 @@ mod preparation_timing_probe {
 			);
 		}
 	}
+
+	/// The tessellation half, measured on the same lyon tessellator iced
+	/// uses, without a device: the production shape (every downsampled
+	/// circle of a series in one fill path) against three alternatives, at
+	/// the per-series mark count the fixture produces in a 780×205 plot area.
+	#[test]
+	#[ignore]
+	fn probe_tessellate_downsampled_marks_at_the_raster_fixture_size() {
+		use iced::advanced::graphics::geometry::frame::Backend as _;
+		use iced::widget::canvas::Path;
+		let points = 105 * 105 * 105;
+		let frame = fixture_frame(points);
+		let prepared = prepare_scatter_data(&frame, "series", "x", "y");
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(780.0, 205.0));
+		let layout = PlotLayout::Cartesian {
+			x_range: (0.0, 1.0),
+			y_range: (0.0, 1.0),
+			x_axis_type: AxisType::Linear,
+			y_axis_type: AxisType::Linear,
+			x_temporal_domain: None,
+			y_temporal_domain: None,
+		};
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let settings = crate::plot::theme::PlotSettings::default().resolve();
+		let per_series_target = (settings.scatter_downsample_target as usize).div_ceil(3);
+		let series = &prepared.series[0];
+		let sampled = downsample_series(series, bounds, &transform, per_series_target);
+		let radius = settings.point_size.radius_px();
+		let grid_w = ((per_series_target as f64 * (780.0 / 205.0)).sqrt().ceil()) as usize;
+		let cell = 780.0 / grid_w as f32;
+		let color = iced::Color::WHITE;
+		let time = |label: &str, marks: &[Point], r: f32, one_path: bool| {
+			let started = Instant::now();
+			let mut frame = iced_wgpu::geometry::Frame::new(bounds);
+			if one_path {
+				let path = Path::new(|builder| {
+					for point in marks {
+						builder.circle(*point, r);
+					}
+				});
+				frame.fill(&path, color);
+			} else {
+				for point in marks {
+					let path = Path::new(|builder| builder.circle(*point, r));
+					frame.fill(&path, color);
+				}
+			}
+			eprintln!(
+				"TESSELLATION_TIMING case={label} marks={} radius={r} elapsed={:.3}s profile={}",
+				marks.len(),
+				started.elapsed().as_secs_f64(),
+				if cfg!(debug_assertions) {
+					"dev"
+				} else {
+					"release"
+				}
+			);
+		};
+		eprintln!(
+			"TESSELLATION_SHAPE per_series_target={per_series_target} sampled={} cell={cell:.2}px radius={radius}px overlap_ratio={:.2}",
+			sampled.len(),
+			2.0 * radius / cell
+		);
+		time("production-one-path-overlapping", &sampled, radius, true);
+		time("separate-paths-overlapping", &sampled, radius, false);
+		time(
+			"one-path-non-overlapping-same-count",
+			&sampled,
+			cell / 2.0 * 0.95,
+			true,
+		);
+		let coarse = downsample_series(
+			series,
+			bounds,
+			&transform,
+			((780.0 / (2.0 * radius)) * (205.0 / (2.0 * radius))) as usize,
+		);
+		time("one-path-cell-equals-diameter", &coarse, radius, true);
+	}
 }
