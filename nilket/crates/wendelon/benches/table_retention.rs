@@ -1082,6 +1082,8 @@ fn source_row(row: BenchRow) -> MultiRowSourceRow {
 		routing_locality: row.routing_locality,
 		row_hlc: row.row_hlc,
 		is_tombstone: row.is_tombstone,
+		// A raw-locality row: the bench prices retention over legacy frames.
+		partition: None,
 		table_object_id: row.table_object_id,
 	}
 }

@@ -4,10 +4,9 @@ use std::process::ExitCode;
 
 use serde::Serialize;
 use wendelon_client::{
-	BootstrapPeer, Client, ClientConfig, MAINTENANCE_CONTROL_WIRE_VERSION,
-	MaintenanceCompletionAuditWire, MaintenanceReportItemWire, MaintenanceReportOutcomeWire,
-	MaintenanceReportResponseWire, MaintenanceRequeueOutcomeWire, MaintenanceRequeueResponseWire,
-	TlsPaths,
+	BootstrapPeer, Client, ClientConfig, MaintenanceCompletionAuditWire, MaintenanceReportItemWire,
+	MaintenanceReportOutcomeWire, MaintenanceReportResponseWire, MaintenanceRequeueOutcomeWire,
+	MaintenanceRequeueResponseWire, TlsPaths,
 };
 
 const DEFAULT_PAGE_ITEMS: u16 = 64;
@@ -723,6 +722,7 @@ fn usage_error(message: &str) -> ExitCode {
 mod tests {
 	use super::*;
 	use std::sync::Mutex;
+	use wendelon_client::MAINTENANCE_CONTROL_WIRE_VERSION;
 
 	fn args(values: &[&str]) -> Vec<String> {
 		values.iter().map(|value| (*value).to_owned()).collect()

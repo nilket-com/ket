@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use wendelon::hash::state_digest::{StateDigestAccumulator, visible_row_element};
 use wendelon::schema::{
 	HybridTimestamp, Identity, IntraBatchIndex, Locality, MultiRowLayoutDescriptor,
-	RecordBodyCompressionPolicy, RecordRowIndex, SlabId, TableObjectId, TenantId, WriterNodeId,
-	synthesize_append_only_row_id,
+	PlacementSemantics, RecordBodyCompressionPolicy, RecordRowIndex, SlabId, TableObjectId,
+	TenantId, WriterNodeId, synthesize_append_only_row_id,
 };
 use wendelon::storage::{
 	MultiRowSourceRow, RecordLocation, pack_tombstone_multirow_source_rows_with_policy,
@@ -272,6 +272,7 @@ fn tombstone_rows(
 			routing_locality: Locality::from(*row_key_id),
 			row_hlc: delete_hlc,
 			is_tombstone: true,
+			partition: None,
 			table_object_id: Some(TableObjectId::new([0x47; 16])),
 		})
 		.collect()
@@ -290,6 +291,8 @@ fn record_location(
 		hlc,
 		record_row_index: RecordRowIndex::ZERO,
 		is_tombstone,
+		placement: PlacementSemantics::RawLocality,
+		partition: None,
 	}
 }
 

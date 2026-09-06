@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use wendelon::hash::state_digest::{StateDigestAccumulator, visible_row_element};
 use wendelon::schema::{
-	HybridTimestamp, Identity, Locality, MultiRowLayoutDescriptor, RecordBodyCompressionPolicy,
-	RecordRowIndex, SlabId, TableObjectId, TenantId,
+	HybridTimestamp, Identity, Locality, MultiRowLayoutDescriptor, PlacementSemantics,
+	RecordBodyCompressionPolicy, RecordRowIndex, SlabId, TableObjectId, TenantId,
 };
 use wendelon::storage::{
 	MultiRowSourceRow, RecordLocation, pack_tombstone_multirow_source_rows_with_policy,
@@ -210,6 +210,7 @@ fn tombstone_rows(keys: &[Identity], delete_hlc: HybridTimestamp) -> Vec<MultiRo
 			routing_locality: Locality::from(*key_identity),
 			row_hlc: delete_hlc,
 			is_tombstone: true,
+			partition: None,
 			table_object_id: Some(TableObjectId::new([0x50; 16])),
 		})
 		.collect()
@@ -233,6 +234,8 @@ fn location(offset: u64, hlc: HybridTimestamp, is_tombstone: bool) -> RecordLoca
 		hlc,
 		record_row_index: RecordRowIndex::ZERO,
 		is_tombstone,
+		placement: PlacementSemantics::RawLocality,
+		partition: None,
 	}
 }
 

@@ -3269,6 +3269,7 @@ fn build_pipeline_fixture_shape(
 				node_id: 1,
 			},
 			is_tombstone: false,
+			partition: None,
 			table_object_id: Some(TableObjectId::new([0x58; 16])),
 		})
 		.collect();

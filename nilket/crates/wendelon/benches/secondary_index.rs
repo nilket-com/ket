@@ -19,9 +19,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use wendelon::schema::{
 	HybridTimestamp, Identity, IndexArrowTypeTag, IndexKeyEncoding, IndexObjectId, Locality,
-	LocalityPolicy, PrimaryKeyDescriptor, RecordRowIndex, RowIdentityPolicy, SchemaEvolutionPolicy,
-	SecondaryIndexDescriptor, SecondaryIndexKeyDescriptor, SlabId, TableObjectId,
-	TableSchemaDescriptor, TableWriteAdmission, TenantId,
+	LocalityPolicy, PlacementSemantics, PrimaryKeyDescriptor, RecordRowIndex, RowIdentityPolicy,
+	SchemaEvolutionPolicy, SecondaryIndexDescriptor, SecondaryIndexKeyDescriptor, SlabId,
+	TableObjectId, TableSchemaDescriptor, TableWriteAdmission, TenantId,
 };
 use wendelon::storage::{
 	IndexBound, IndexQuery, RecordLocation, SecondaryIndexCandidateValidation,
@@ -310,6 +310,8 @@ fn location(slab_id: SlabId, row_hlc: HybridTimestamp, row: RecordRowIndex) -> R
 		hlc: row_hlc,
 		record_row_index: row,
 		is_tombstone: false,
+		placement: PlacementSemantics::RawLocality,
+		partition: None,
 	}
 }
 

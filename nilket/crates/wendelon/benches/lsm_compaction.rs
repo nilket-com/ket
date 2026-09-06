@@ -12,8 +12,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use wendelon::schema::{
-	ByteCount, CompactionLevelIndex, HybridTimestamp, Identity, ManifestEpoch, RecordRowIndex,
-	RowCount, SlabId, TenantId,
+	ByteCount, CompactionLevelIndex, HybridTimestamp, Identity, ManifestEpoch, PlacementSemantics,
+	RecordRowIndex, RowCount, SlabId, TenantId,
 };
 use wendelon::storage::{
 	LsmConfig, LsmRunSummary, ManifestSnapshot, RecordLocation, VersionEntry, VersionLifecycle,
@@ -189,6 +189,8 @@ fn version_entries(rows: usize) -> Vec<VersionEntry> {
 					hlc: row_hlc,
 					record_row_index: RecordRowIndex::ZERO,
 					is_tombstone: false,
+					placement: PlacementSemantics::RawLocality,
+					partition: None,
 				},
 				lifecycle: VersionLifecycle::PrimaryKey,
 			}

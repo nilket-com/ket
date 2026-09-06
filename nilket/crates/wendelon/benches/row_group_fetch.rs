@@ -318,6 +318,7 @@ fn source_rows(rows: usize) -> Vec<MultiRowSourceRow> {
 				node_id: 1,
 			},
 			is_tombstone: false,
+			partition: None,
 			table_object_id: Some(TableObjectId::new([0x56; 16])),
 		})
 		.collect()
@@ -338,6 +339,7 @@ fn ordered_source_rows(rows: usize) -> Vec<MultiRowSourceRow> {
 					node_id: 1,
 				},
 				is_tombstone: false,
+				partition: None,
 				table_object_id: Some(TableObjectId::new([0x60; 16])),
 			}
 		})

@@ -1,6 +1,7 @@
 # ADR 0159: the scatter mark batch
 
-Status: proposed 2026-09-05. Plotting arc. On 2026-09-04 a 1,157,625-point
+Status: accepted 2026-09-06 on the evidence in
+`plans/product/impl/0159_the_scatter_mark_batch_evidence.md`. Plotting arc. On 2026-09-04 a 1,157,625-point
 categorical scatter held the desktop's UI thread for minutes in a debug
 build, and by PRODUCT-0140's own release pricing for more than a second per
 frame in release. The evidence in `plans/product/impl/0159_stall_evidence.md`
