@@ -1,7 +1,7 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, MarkHit, MarkRenderer, PlotBackend, PlotKernel, PlotLayout,
-	ResolvedPlotSettings, TemporalAxisDomain, format_label, polars_type_to_axis_type,
-	temporal_axis_domain,
+	AxisType, CartesianExtent, CoordinateTransformer, MarkHit, MarkRenderer, PlotBackend,
+	PlotKernel, PlotLayout, ResolvedPlotSettings, TemporalAxisDomain, cartesian_column_extent,
+	format_label,
 };
 use crate::plot::legend::LegendProvenance;
 use crate::plot::spec::{CategoryColorAssignment, LayerSettings, ResolvedColor};
@@ -355,6 +355,13 @@ pub fn prepare_line_data_with_colors(
 	prepare_line_data_inner(df, cat_col, x_col, y_col, Some(colors))
 }
 
+/// The layout a line mark resolves over `x_col` and `y_col`: the data extent
+/// padded by five percent of its span on each side. Preparation and
+/// authoring-time layout resolution share this one derivation.
+pub fn line_column_extent(df: &DataFrame, x_col: &str, y_col: &str) -> CartesianExtent {
+	cartesian_column_extent(df, x_col, y_col, |span| span * 0.05)
+}
+
 fn prepare_line_data_inner(
 	df: &DataFrame,
 	cat_col: &str,
@@ -362,46 +369,14 @@ fn prepare_line_data_inner(
 	y_col: &str,
 	colors: Option<&[CategoryColorAssignment]>,
 ) -> LinePreparedData {
-	let x_col_series = match df.column(x_col) {
-		Ok(c) => c
-			.cast(&DataType::Float64)
-			.unwrap_or_else(|_| Column::from(Series::new_empty(x_col.into(), &DataType::Float64))),
-		Err(_) => Column::from(Series::new_empty(x_col.into(), &DataType::Float64)),
-	};
-	let y_col_series = match df.column(y_col) {
-		Ok(c) => c
-			.cast(&DataType::Float64)
-			.unwrap_or_else(|_| Column::from(Series::new_empty(y_col.into(), &DataType::Float64))),
-		Err(_) => Column::from(Series::new_empty(y_col.into(), &DataType::Float64)),
-	};
-	let x_dtype = df
-		.column(x_col)
-		.map(|c| c.dtype().clone())
-		.unwrap_or(DataType::Float64);
-	let y_dtype = df
-		.column(y_col)
-		.map(|c| c.dtype().clone())
-		.unwrap_or(DataType::Float64);
-	let x_axis_type = polars_type_to_axis_type(&x_dtype);
-	let y_axis_type = polars_type_to_axis_type(&y_dtype);
-	let x_temporal_domain = df
-		.column(x_col)
-		.ok()
-		.and_then(|column| temporal_axis_domain(column, &x_axis_type));
-	let y_temporal_domain = df
-		.column(y_col)
-		.ok()
-		.and_then(|column| temporal_axis_domain(column, &y_axis_type));
-	let x_series = x_col_series.f64().unwrap();
-	let y_series = y_col_series.f64().unwrap();
-	let x_range = (x_series.min().unwrap_or(0.0), x_series.max().unwrap_or(1.0));
-	let y_series_min = y_series.min().unwrap_or(0.0);
-	let y_series_max = y_series.max().unwrap_or(1.0);
-	let y_range = (y_series_min, y_series_max);
-	let x_pad = (x_range.1 - x_range.0) * 0.05;
-	let y_pad = (y_range.1 - y_range.0) * 0.05;
-	let x_range = (x_range.0 - x_pad, x_range.1 + x_pad);
-	let y_range = (y_range.0 - y_pad, y_range.1 + y_pad);
+	let CartesianExtent {
+		x_range,
+		y_range,
+		x_axis_type,
+		y_axis_type,
+		x_temporal_domain,
+		y_temporal_domain,
+	} = line_column_extent(df, x_col, y_col);
 	if df.height() == 0 || x_col.is_empty() || y_col.is_empty() {
 		return LinePreparedData {
 			series: vec![],

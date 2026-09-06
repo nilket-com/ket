@@ -7344,6 +7344,73 @@ pub fn temporal_axis_domain(
 	}
 }
 
+/// The axis extent two Cartesian columns resolve to before any mark is
+/// prepared: the padded numeric ranges, the axis types the column dtypes
+/// declare, and the exact temporal domains those columns carry.
+///
+/// Line and scatter preparation both derive their layout from this one
+/// computation, so an authoring-time layout can be resolved without
+/// materializing a single series.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CartesianExtent {
+	pub x_range: (f64, f64),
+	pub y_range: (f64, f64),
+	pub x_axis_type: AxisType,
+	pub y_axis_type: AxisType,
+	pub x_temporal_domain: Option<TemporalAxisDomain>,
+	pub y_temporal_domain: Option<TemporalAxisDomain>,
+}
+
+/// Resolve the [`CartesianExtent`] of `x_col` and `y_col`. A missing or
+/// non-numeric column contributes the unit range; `padding` maps a range's
+/// span to the padding applied on both sides of it.
+pub fn cartesian_column_extent(
+	df: &polars::prelude::DataFrame,
+	x_col: &str,
+	y_col: &str,
+	padding: impl Fn(f64) -> f64,
+) -> CartesianExtent {
+	use polars::prelude::{ChunkAgg, Column, DataType, Series};
+
+	let numeric = |name: &str| match df.column(name) {
+		Ok(column) => column
+			.cast(&DataType::Float64)
+			.unwrap_or_else(|_| Column::from(Series::new_empty(name.into(), &DataType::Float64))),
+		Err(_) => Column::from(Series::new_empty(name.into(), &DataType::Float64)),
+	};
+	let axis_type = |name: &str| {
+		polars_type_to_axis_type(
+			&df.column(name)
+				.map(|column| column.dtype().clone())
+				.unwrap_or(DataType::Float64),
+		)
+	};
+	let x_axis_type = axis_type(x_col);
+	let y_axis_type = axis_type(y_col);
+	let x_temporal_domain = df
+		.column(x_col)
+		.ok()
+		.and_then(|column| temporal_axis_domain(column, &x_axis_type));
+	let y_temporal_domain = df
+		.column(y_col)
+		.ok()
+		.and_then(|column| temporal_axis_domain(column, &y_axis_type));
+	let range = |column: Column| {
+		let values = column.f64().expect("cast to f64");
+		let range = (values.min().unwrap_or(0.0), values.max().unwrap_or(1.0));
+		let pad = padding(range.1 - range.0);
+		(range.0 - pad, range.1 + pad)
+	};
+	CartesianExtent {
+		x_range: range(numeric(x_col)),
+		y_range: range(numeric(y_col)),
+		x_axis_type,
+		y_axis_type,
+		x_temporal_domain,
+		y_temporal_domain,
+	}
+}
+
 pub fn format_label(value: f64, axis_type: &AxisType) -> String {
 	match axis_type {
 		AxisType::Linear => {

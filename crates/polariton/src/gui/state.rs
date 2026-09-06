@@ -19,14 +19,18 @@ use crate::gui::{
 	messages::{ExportFormat, Message, NotebookRuneFailure, NotebookRuneOutcome},
 };
 #[cfg(feature = "toron")]
+use crate::plot::authoring_layout::{
+	layered_plot_layout, resolved_plot_layout, styled_plot_layout,
+};
+#[cfg(feature = "toron")]
 #[cfg(feature = "toron")]
 use crate::plot::common::{PlotLayout, TickPlacementError};
 #[cfg(feature = "toron")]
 use crate::plot::core::PlotType;
 use crate::plot::export::{AvifBackend, PngBackend};
-use crate::plot::factory::create_plot_from_artifact;
 #[cfg(feature = "toron")]
-use crate::plot::factory::{create_layered_plot_from_artifact, create_styled_plot_from_artifact};
+use crate::plot::factory::create_layered_plot_from_artifact;
+use crate::plot::factory::create_plot_from_artifact;
 #[cfg(feature = "toron")]
 use crate::plot::grid::{PlotGrid, PlotGridKernel};
 #[cfg(feature = "toron")]
@@ -2642,7 +2646,7 @@ fn validate_rune_numeric_domain_applicability(
 
 #[cfg(feature = "toron")]
 fn validate_rune_tick_capacity(
-	kernel: &dyn crate::plot::common::PlotKernel,
+	layout: &PlotLayout,
 	settings: &crate::plot::common::ResolvedPlotSettings,
 	tick_step_spans: &RunePlotTickStepSpans,
 	tick_every_spans: &RunePlotTickEverySpans,
@@ -2657,7 +2661,6 @@ fn validate_rune_tick_capacity(
 	{
 		return Ok(());
 	}
-	let layout = kernel.layout(settings.clone());
 	let check_temporal = |placement: crate::plot::common::TickPlacement,
 	                      axis: &str,
 	                      domain: Option<&crate::plot::common::TemporalAxisDomain>,
@@ -2683,7 +2686,7 @@ fn validate_rune_tick_capacity(
 		})?;
 		Ok(())
 	};
-	match &layout {
+	match layout {
 		PlotLayout::Cartesian {
 			x_temporal_domain,
 			y_temporal_domain,
@@ -2798,7 +2801,7 @@ fn validate_rune_tick_capacity(
 			})
 			.map(|_| ())
 	};
-	match layout {
+	match *layout {
 		PlotLayout::Cartesian {
 			x_range, y_range, ..
 		} => {
@@ -3236,15 +3239,13 @@ fn rune_view_outcome_with_palettes(
 										},
 									));
 								}
-								let kernel = create_plot_from_artifact(
+								let layout = resolved_plot_layout(
 									&resolved.resolved_spec,
 									&resolved.data,
-									&resolved.artifact,
-									1200,
-									720,
+									&resolved_tick_settings,
 								);
 								validate_rune_tick_capacity(
-									kernel.as_ref(),
+									&layout,
 									&resolved_tick_settings,
 									&tick_step_spans,
 									&tick_every_spans,
@@ -3275,17 +3276,14 @@ fn rune_view_outcome_with_palettes(
 										authored_settings,
 									))
 								} else {
-									create_layered_plot_from_artifact(
+									layered_plot_layout(
 										&specification,
 										frame.as_ref(),
-										result.as_ref(),
-										1200,
-										720,
+										&resolved_tick_settings,
 									)
-									.map_err(|error| error.to_string())
-									.and_then(|kernel| {
+									.and_then(|layout| {
 										validate_rune_tick_capacity(
-											kernel.as_ref(),
+											&layout,
 											&resolved_tick_settings,
 											&tick_step_spans,
 											&tick_every_spans,
@@ -3350,16 +3348,14 @@ fn rune_view_outcome_with_palettes(
 											},
 										));
 									}
-									create_styled_plot_from_artifact(
+									styled_plot_layout(
 										&resolved.resolved_spec,
 										&resolved.data,
-										&resolved.artifact,
-										settings.clone(),
+										&resolved_tick_settings,
 									)
-									.map_err(|error| error.to_string())
-									.and_then(|kernel| {
+									.and_then(|layout| {
 										validate_rune_tick_capacity(
-											kernel.as_ref(),
+											&layout,
 											&resolved_tick_settings,
 											&tick_step_spans,
 											&tick_every_spans,
@@ -3393,17 +3389,14 @@ fn rune_view_outcome_with_palettes(
 									authored_settings,
 								))
 							} else {
-								create_layered_plot_from_artifact(
+								layered_plot_layout(
 									&specification,
 									frame.as_ref(),
-									result.as_ref(),
-									1200,
-									720,
+									&resolved_tick_settings,
 								)
-								.map_err(|error| error.to_string())
-								.and_then(|kernel| {
+								.and_then(|layout| {
 									validate_rune_tick_capacity(
-										kernel.as_ref(),
+										&layout,
 										&resolved_tick_settings,
 										&tick_step_spans,
 										&tick_every_spans,

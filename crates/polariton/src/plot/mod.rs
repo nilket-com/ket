@@ -1,3 +1,5 @@
+#[cfg(feature = "toron")]
+pub mod authoring_layout;
 pub mod chrome;
 pub mod colors;
 pub mod common;

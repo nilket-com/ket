@@ -6544,3 +6544,81 @@ fn product_0159_gate_constants_and_render_mode_are_retained_and_the_batch_is_sca
 		"no compound circle path remains in the downsampled arm"
 	);
 }
+
+/// Authoring-time tick validation resolves a layout, never a kernel. The
+/// Rune outcome function must reach the plot factory through no path: the
+/// decoupled layout functions are its only route to a `PlotLayout`, and the
+/// validator accepts that layout rather than a kernel to ask.
+#[test]
+fn rune_authoring_resolves_layouts_without_building_kernels() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let state = std::fs::read_to_string(root.join("gui/state.rs")).expect("read gui state");
+	let outcome = state
+		.split("fn rune_view_outcome_with_palettes(")
+		.nth(1)
+		.and_then(|tail| tail.split("\n#[cfg(").next())
+		.expect("isolate the Rune view outcome function");
+	for factory_entry in [
+		"create_plot_from_artifact(",
+		"create_styled_plot_from_artifact(",
+		"create_layered_plot_from_artifact(",
+		"create_plot(",
+		"create_styled_plot(",
+		"create_layered_plot(",
+	] {
+		assert!(
+			!outcome.contains(factory_entry),
+			"the Rune view outcome builds a kernel through {factory_entry}"
+		);
+	}
+	for layout_entry in [
+		"resolved_plot_layout(",
+		"styled_plot_layout(",
+		"layered_plot_layout(",
+	] {
+		assert!(
+			outcome.contains(layout_entry),
+			"positive control: the Rune view outcome resolves through {layout_entry}"
+		);
+	}
+	assert!(
+		state.contains("fn validate_rune_tick_capacity(\n\tlayout: &PlotLayout,"),
+		"tick capacity validation accepts a resolved layout, not a kernel"
+	);
+	let layout = std::fs::read_to_string(root.join("plot/authoring_layout.rs"))
+		.expect("read authoring layout");
+	let production = layout
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("authoring layout production");
+	for shared in [
+		"line_column_extent(",
+		"bar_column_extent(",
+		"axis_type_from_scale(",
+	] {
+		assert!(
+			production.contains(shared),
+			"the decoupled layout shares {shared} with the kernel preparations"
+		);
+	}
+	for (kernel, helper) in [
+		(
+			"plot/kernels/line.rs",
+			"line_column_extent(df, x_col, y_col)",
+		),
+		(
+			"plot/kernels/bar.rs",
+			"bar_column_extent(df, cat_col, val_col)",
+		),
+		(
+			"plot/kernels/scatter.rs",
+			"scatter_column_extent(df, x_col, y_col)",
+		),
+	] {
+		let source = std::fs::read_to_string(root.join(kernel)).expect("read kernel");
+		assert!(
+			source.contains(helper),
+			"{kernel} preparation resolves its layout through {helper}"
+		);
+	}
+}

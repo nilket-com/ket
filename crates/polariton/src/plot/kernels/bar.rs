@@ -442,6 +442,67 @@ pub struct BarPreparedData {
 	pub selection_candidates: Vec<Vec<Option<crate::selection::SelectionCandidate>>>,
 }
 
+/// The distinct labels of `col` in sorted order, or `fallback` alone when the
+/// column is unnamed or absent. Strings label themselves; every other value
+/// labels as its unquoted display form.
+fn sorted_unique_labels(df: &DataFrame, col: &str, fallback: &str) -> Vec<String> {
+	if col.is_empty() {
+		return vec![fallback.to_string()];
+	}
+	match df.column(col) {
+		Ok(c) => {
+			let series = c
+				.unique()
+				.unwrap_or_else(|_| c.clone())
+				.sort(Default::default())
+				.unwrap_or_else(|_| c.clone());
+			series
+				.as_materialized_series()
+				.iter()
+				.map(|v| {
+					if let AnyValue::String(s) = v {
+						s.to_string()
+					} else {
+						v.to_string().replace("\"", "")
+					}
+				})
+				.collect()
+		}
+		Err(_) => vec![fallback.to_string()],
+	}
+}
+
+fn bar_value_column(df: &DataFrame, val_col: &str) -> Column {
+	match df.column(val_col) {
+		Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| {
+			Column::from(Series::new_empty(val_col.into(), &DataType::Float64))
+		}),
+		Err(_) => Column::from(Series::new_empty(val_col.into(), &DataType::Float64)),
+	}
+}
+
+/// The value axis a bar mark resolves: zero up to the largest value with ten
+/// percent headroom, the unit range when no value is present.
+fn bar_value_range(values: &Float64Chunked) -> (f64, f64) {
+	(0.0, values.max().unwrap_or(1.0) * 1.1)
+}
+
+/// The layout a bar mark resolves over `cat_col` and `val_col` — its band
+/// categories and value range — without preparing a single bar. Preparation
+/// and authoring-time layout resolution share this one derivation.
+pub fn bar_column_extent(
+	df: &DataFrame,
+	cat_col: &str,
+	val_col: &str,
+) -> (Vec<String>, (f64, f64)) {
+	if df.height() == 0 || val_col.is_empty() {
+		return (vec!["No Data".to_string()], (0.0, 1.0));
+	}
+	let categories = sorted_unique_labels(df, cat_col, "All Data");
+	let values = bar_value_column(df, val_col);
+	(categories, bar_value_range(values.f64().unwrap()))
+}
+
 pub fn prepare_bar_data(
 	df: &DataFrame,
 	cat_col: &str,
@@ -461,82 +522,12 @@ pub fn prepare_bar_data(
 			selection_candidates: vec![vec![None]],
 		};
 	}
-	let (categories, _categories_series) = if cat_col.is_empty() {
-		(
-			vec!["All Data".to_string()],
-			Series::new("dummy_cat".into(), &["All Data"]),
-		)
-	} else {
-		match df.column(cat_col) {
-			Ok(c) => {
-				let series = c
-					.unique()
-					.unwrap_or_else(|_| c.clone())
-					.sort(Default::default())
-					.unwrap_or_else(|_| c.clone());
-				let cats = series
-					.as_materialized_series()
-					.iter()
-					.map(|v| {
-						if let AnyValue::String(s) = v {
-							s.to_string()
-						} else {
-							v.to_string().replace("\"", "")
-						}
-					})
-					.collect();
-				(cats, series.as_materialized_series().clone())
-			}
-			Err(_) => (
-				vec!["All Data".to_string()],
-				Series::new("dummy_cat".into(), &["All Data"]),
-			),
-		}
-	};
-	let (group_names, _groups_series) = if group_col.is_empty() {
-		(
-			vec!["Value".to_string()],
-			Series::new("dummy_group".into(), &["Value"]),
-		)
-	} else {
-		match df.column(group_col) {
-			Ok(c) => {
-				let series = c
-					.unique()
-					.unwrap_or_else(|_| c.clone())
-					.sort(Default::default())
-					.unwrap_or_else(|_| c.clone());
-				let groups = series
-					.as_materialized_series()
-					.iter()
-					.map(|v| {
-						if let AnyValue::String(s) = v {
-							s.to_string()
-						} else {
-							v.to_string().replace("\"", "")
-						}
-					})
-					.collect();
-				(groups, series.as_materialized_series().clone())
-			}
-			Err(_) => (
-				vec!["Value".to_string()],
-				Series::new("dummy_group".into(), &["Value"]),
-			),
-		}
-	};
+	let (categories, y_range) = bar_column_extent(df, cat_col, val_col);
+	let group_names = sorted_unique_labels(df, group_col, "Value");
 	let num_cats = categories.len();
 	let num_groups = group_names.len();
-	let vals_col_series = match df.column(val_col) {
-		Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| {
-			Column::from(Series::new_empty(val_col.into(), &DataType::Float64))
-		}),
-		Err(_) => Column::from(Series::new_empty(val_col.into(), &DataType::Float64)),
-	};
+	let vals_col_series = bar_value_column(df, val_col);
 	let vals_f64 = vals_col_series.f64().unwrap();
-	let y_max = vals_f64.max().unwrap_or(1.0);
-	let y_min = 0.0f64;
-	let y_range = (y_min, y_max * 1.1);
 	let mut values = vec![vec![0.0f64; num_groups]; num_cats];
 	let mut assigned = vec![vec![false; num_groups]; num_cats];
 	let mut click_selectable = !cat_col.is_empty();
