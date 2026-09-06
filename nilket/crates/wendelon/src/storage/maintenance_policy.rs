@@ -227,9 +227,15 @@ pub(crate) enum SuccessDisposition {
 	/// The job published a rewrite over the slab set. Clears this operation's
 	/// receipts and cooldown for the set.
 	Rewrote,
-	/// The job completed without rewriting anything. Records nothing: the
-	/// reservation is released and every receipt stands as it was.
+	/// The job owned the slab set, scanned it, and found nothing to rewrite.
+	/// Every receipt stands as it was; ADR 0098 decision 2 records a neutral
+	/// cooldown so the same scan is not repeated on the next tick.
 	Neutral,
+	/// The job did not get to rewrite: the claim found the slab set pinned,
+	/// retired, or replaced, or the scan found work a pin gate deferred. Nothing
+	/// is proven about the set's contents. The reservation is released and
+	/// nothing else is recorded: the next attempt is still the next attempt.
+	Unclaimed,
 }
 
 /// The payload a deterministic failure carries inside an `io::Error`, so the class
@@ -2248,8 +2254,23 @@ mod tests {
 			1
 		);
 
-		// The next failure continues the count it found.
-		clock.set(1_005_001);
+		// ADR 0098 decision 2: what a neutral completion DOES record is a cooldown
+		// on the scan itself, beside the receipt and never in place of it.
+		assert_eq!(
+			policy
+				.neutral_cooldowns_for_test()
+				.into_iter()
+				.map(|(_, slabs, cooldown)| (slabs, cooldown.next_eligible_at_ms))
+				.collect::<Vec<_>>(),
+			vec![
+				(receipted.to_vec(), 1_010_000),
+				(cooled.to_vec(), 1_010_000)
+			]
+		);
+
+		// The next failure, once the scan cooldown has passed, continues the count
+		// it found.
+		clock.set(1_010_000);
 		fail_deterministically(&policy, &receipted).await;
 		assert_eq!(receipt_for(&policy, &receipted).unwrap().attempts, 2);
 	}
@@ -2833,6 +2854,282 @@ mod tests {
 			Err("maintenance fingerprint version is unsupported")
 		);
 	}
+
+	fn neutral<T>(_: &T) -> SuccessDisposition {
+		SuccessDisposition::Neutral
+	}
+
+	fn unclaimed<T>(_: &T) -> SuccessDisposition {
+		SuccessDisposition::Unclaimed
+	}
+
+	/// ADR 0098 decision 2: a clean scan cools its set for one tick, doubling per
+	/// consecutive clean scan to the cap; a rewrite clears it; an unclaimed
+	/// completion records nothing.
+	#[tokio::test]
+	async fn neutral_completion_cools_the_set_down_and_a_rewrite_clears_it() {
+		let clock = Arc::new(ManualClock::at(1_000_000));
+		let (policy, _store) = enabled_policy_with_store(clock.clone()).await;
+		let slabs = [SlabId::new(4)];
+		let scan_clean = |policy: Arc<MaintenancePolicyInner>| async move {
+			let attempt = policy
+				.execute(OP, &slabs, classify_io_error, neutral, || async {
+					Ok::<_, Error>(())
+				})
+				.await;
+			assert!(
+				matches!(attempt, MaintenanceAttempt::Completed(())),
+				"{attempt:?}"
+			);
+		};
+
+		scan_clean(Arc::clone(&policy)).await;
+		assert_eq!(
+			policy.neutral_cooldowns_for_test(),
+			vec![(
+				OP,
+				vec![SlabId::new(4)],
+				NeutralCooldown {
+					completions: 1,
+					next_eligible_at_ms: 1_005_000,
+				}
+			)],
+			"one tick of cooldown after the first clean scan"
+		);
+		assert_eq!(
+			policy.reserve(OP, &slabs).err(),
+			Some(AdmissionRefusal::NeutralCooldown),
+			"the same scan is not repeated inside its cooldown"
+		);
+		assert_eq!(
+			MaintenanceAttemptResult::skipped(&AdmissionRefusal::NeutralCooldown).label(),
+			"skipped_neutral_cooldown"
+		);
+		assert!(
+			MaintenanceAttemptResult::ALL
+				.contains(&MaintenanceAttemptResult::SkippedNeutralCooldown),
+			"the attempt counter renders the neutral skip"
+		);
+		assert!(
+			policy.report().receipts.is_empty() && policy.report().retryable.is_empty(),
+			"a neutral cooldown is not a receipt and not a retryable cooldown"
+		);
+		// Disjoint work is unaffected.
+		assert_admits(&policy, &[SlabId::new(9)], "disjoint slab set");
+
+		// Doubling per consecutive clean scan, capped at 300 s.
+		let mut expected_wait_ms = 5_000_u64;
+		for completions in 2..=8_u32 {
+			let deadline = policy.neutral_cooldowns_for_test()[0].2.next_eligible_at_ms;
+			clock.set(deadline);
+			scan_clean(Arc::clone(&policy)).await;
+			expected_wait_ms = (expected_wait_ms * 2).min(300_000);
+			let cooldown = policy.neutral_cooldowns_for_test();
+			assert_eq!(cooldown.len(), 1);
+			assert_eq!(cooldown[0].2.completions, completions);
+			assert_eq!(
+				cooldown[0].2.next_eligible_at_ms,
+				deadline + expected_wait_ms,
+				"completion {completions}"
+			);
+		}
+		assert_eq!(neutral_cooldown(7), NEUTRAL_COOLDOWN_CAP);
+		assert_eq!(neutral_cooldown(1), NEUTRAL_COOLDOWN_BASE);
+
+		// An unclaimed completion over another set records nothing about it.
+		let attempt = policy
+			.execute(
+				OP,
+				&[SlabId::new(9)],
+				classify_io_error,
+				unclaimed,
+				|| async { Ok::<_, Error>(()) },
+			)
+			.await;
+		assert!(matches!(attempt, MaintenanceAttempt::Completed(())));
+		assert_eq!(policy.neutral_cooldowns_for_test().len(), 1);
+		assert_admits(
+			&policy,
+			&[SlabId::new(9)],
+			"an unclaimed set stays eligible",
+		);
+
+		// A rewrite clears the cooldown, and the counter with it.
+		let deadline = policy.neutral_cooldowns_for_test()[0].2.next_eligible_at_ms;
+		clock.set(deadline);
+		let attempt = policy
+			.execute(OP, &slabs, classify_io_error, rewrote, || async {
+				Ok::<_, Error>(())
+			})
+			.await;
+		assert!(matches!(attempt, MaintenanceAttempt::Completed(())));
+		assert!(policy.neutral_cooldowns_for_test().is_empty());
+		scan_clean(Arc::clone(&policy)).await;
+		assert_eq!(
+			policy.neutral_cooldowns_for_test()[0].2.completions,
+			1,
+			"the run of clean scans restarts after a rewrite"
+		);
+		assert!(policy.is_enabled());
+	}
+
+	/// ADR 0098 decision 2: a failure replaces a neutral cooldown with its own
+	/// schedule, and the cooldown table drops expired entries when one is recorded.
+	#[tokio::test]
+	async fn a_failure_replaces_the_neutral_cooldown_and_expired_entries_are_swept() {
+		let clock = Arc::new(ManualClock::at(1_000_000));
+		let (policy, _store) = enabled_policy_with_store(clock.clone()).await;
+		for slab in [1_u64, 2, 3] {
+			let attempt = policy
+				.execute(
+					OP,
+					&[SlabId::new(slab)],
+					classify_io_error,
+					neutral,
+					|| async { Ok::<_, Error>(()) },
+				)
+				.await;
+			assert!(matches!(attempt, MaintenanceAttempt::Completed(())));
+		}
+		assert_eq!(policy.neutral_cooldowns_for_test().len(), 3);
+
+		clock.set(1_005_000);
+		fail_deterministically(&policy, &[SlabId::new(1)]).await;
+		let remaining = policy.neutral_cooldowns_for_test();
+		assert!(
+			remaining
+				.iter()
+				.all(|(_, slabs, _)| slabs != &[SlabId::new(1)]),
+			"the failed set is governed by its receipt now: {remaining:?}"
+		);
+		assert_eq!(
+			policy.reserve(OP, &[SlabId::new(1)]).err(),
+			Some(AdmissionRefusal::NotYetEligible),
+			"backoff, not a neutral cooldown"
+		);
+
+		// Every remaining entry became eligible at 1,005,000 and nobody rescanned
+		// it for a whole cap period after that; the next record sweeps them.
+		clock.set(1_005_000 + NEUTRAL_COOLDOWN_CAP.as_millis() as u64);
+		let attempt = policy
+			.execute(
+				OP,
+				&[SlabId::new(7)],
+				classify_io_error,
+				neutral,
+				|| async { Ok::<_, Error>(()) },
+			)
+			.await;
+		assert!(matches!(attempt, MaintenanceAttempt::Completed(())));
+		let after = policy.neutral_cooldowns_for_test();
+		assert_eq!(after.len(), 1, "expired entries are gone: {after:?}");
+		assert_eq!(after[0].1, vec![SlabId::new(7)]);
+	}
+
+	/// ADR 0098 decision 3: a receipt inside its backoff budget reports as
+	/// backing off, never as quarantined, and a one-item page walks one work
+	/// identity's quarantined and backing-off views without losing either.
+	#[tokio::test]
+	async fn backing_off_receipts_report_as_backing_off_and_page_after_quarantine() {
+		let clock = Arc::new(ManualClock::at(10_000));
+		let (policy, store) = enabled_policy_with_store(clock).await;
+		drop(policy);
+		let slabs = [SlabId::new(4), SlabId::new(9)];
+		let backing_off = DeterministicReceipt::after_failure(None, 1_000, "shape").unwrap();
+		assert!(backing_off.next_eligible_at_ms().is_some());
+		let quarantined = quarantined_receipt("shape");
+		// One identity with both views.
+		for (origin, receipt) in [
+			(
+				DeterministicOrigin::LsmInconsistentSourceFrames,
+				&quarantined,
+			),
+			(
+				DeterministicOrigin::LsmSourceFrameMissingPlannedSurvivor,
+				&backing_off,
+			),
+		] {
+			let key = MaintenanceWorkKey::new(OP, slabs, origin).unwrap();
+			store
+				.put_maintenance_receipt(key.encode(), receipt.encode())
+				.await
+				.unwrap();
+		}
+		// An identity that is only backing off, for an operation that sorts first.
+		let only_backing_off = MaintenanceWorkKey::new(
+			MaintenanceOperation::RetentionPrune,
+			[SlabId::new(12)],
+			DeterministicOrigin::MaintenanceRewriteWithoutClaim,
+		)
+		.unwrap();
+		store
+			.put_maintenance_receipt(only_backing_off.encode(), backing_off.encode())
+			.await
+			.unwrap();
+		let policy = MaintenancePolicyInner::load(store, Arc::new(ManualClock::at(10_000))).await;
+
+		let whole = policy
+			.report_page(None, 10, MAINTENANCE_REPORT_MAX_BYTES)
+			.unwrap();
+		let describe = |item: &MaintenanceReportItem| match item {
+			MaintenanceReportItem::QuarantinedWork {
+				operation,
+				slabs,
+				origins,
+				..
+			} => format!(
+				"quarantined {operation:?} {slabs:?} origins={}",
+				origins.len()
+			),
+			MaintenanceReportItem::BackingOff {
+				operation,
+				slabs,
+				origins,
+			} => {
+				assert!(
+					origins
+						.iter()
+						.all(|origin| origin.next_eligible_at_ms.is_some())
+				);
+				format!(
+					"backing_off {operation:?} {slabs:?} origins={}",
+					origins.len()
+				)
+			}
+			other => format!("{other:?}"),
+		};
+		let expected = vec![
+			format!("quarantined {OP:?} {slabs:?} origins=1"),
+			format!("backing_off {OP:?} {slabs:?} origins=1"),
+			format!(
+				"backing_off {:?} {:?} origins=1",
+				MaintenanceOperation::RetentionPrune,
+				[SlabId::new(12)]
+			),
+		];
+		assert_eq!(
+			whole.items.iter().map(describe).collect::<Vec<_>>(),
+			expected,
+			"quarantined items first, then every backing-off identity in key order"
+		);
+		assert!(whole.next_cursor.is_none());
+
+		// One item per page walks the same sequence with no loss and no repeat.
+		let mut walked = Vec::new();
+		let mut cursor: Option<Vec<u8>> = None;
+		loop {
+			let page = policy
+				.report_page(cursor.as_deref(), 1, MAINTENANCE_REPORT_MAX_BYTES)
+				.unwrap();
+			assert_eq!(page.items.len(), 1);
+			walked.push(describe(&page.items[0]));
+			match page.next_cursor {
+				Some(next) => cursor = Some(next),
+				None => break,
+			}
+		}
+		assert_eq!(walked, expected);
+	}
 }
 
 /// ADR 0097 decision 4: the identity a failure is tracked against.
@@ -3019,6 +3316,23 @@ pub fn retryable_cooldown(failures: u32) -> Duration {
 	RETRYABLE_COOLDOWN_BASE
 		.saturating_mul(1u32 << shift)
 		.min(RETRYABLE_COOLDOWN_CAP)
+}
+
+/// ADR 0098 decision 2: a scan that found nothing to rewrite is repeated no
+/// sooner than one sweeper tick later, and each consecutive clean scan of the
+/// same set doubles the wait up to the cap. The base is the sweepers' tick so the
+/// first cooldown costs exactly one skipped tick; the cap bounds how long a slab
+/// that became reclaimable waits behind its last clean scan.
+pub const NEUTRAL_COOLDOWN_BASE: Duration = Duration::from_secs(5);
+pub const NEUTRAL_COOLDOWN_CAP: Duration = Duration::from_secs(300);
+
+/// Exponential from 5 s, doubling per consecutive neutral completion, capped at
+/// 300 s.
+pub fn neutral_cooldown(completions: u32) -> Duration {
+	let shift = completions.saturating_sub(1).min(16);
+	NEUTRAL_COOLDOWN_BASE
+		.saturating_mul(1u32 << shift)
+		.min(NEUTRAL_COOLDOWN_CAP)
 }
 
 /// ADR 0097 decision 4: the clock admission and recording share.
@@ -3394,12 +3708,22 @@ struct MaintenanceTracker {
 	/// both passing eligibility and both building a working set - which would make
 	/// the three-attempt bound a bound on RECORDED attempts rather than on builds.
 	in_flight: BTreeMap<Vec<SlabId>, MaintenanceOperation>,
+	/// ADR 0098 decision 2: canonical slab sets this operation scanned and found
+	/// clean, and when each may be scanned again. Ephemeral like `retryable`: a
+	/// restart forgets it and scans once more. Never evidence about receipts.
+	neutral: BTreeMap<MaintenanceOperation, BTreeMap<Vec<SlabId>, NeutralCooldown>>,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct RetryableCooldown {
 	failures: u32,
 	next_eligible_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NeutralCooldown {
+	pub(crate) completions: u32,
+	pub(crate) next_eligible_at_ms: u64,
 }
 
 /// Why a plan was not admitted. Distinguished so the executor can report a skip
@@ -3412,6 +3736,9 @@ pub(crate) enum AdmissionRefusal {
 	AlreadyInFlight,
 	/// Waiting out a cooldown or a backoff.
 	NotYetEligible,
+	/// ADR 0098 decision 2: the last attempt scanned this set and found nothing;
+	/// the scan is not repeated until its neutral cooldown passes.
+	NeutralCooldown,
 	/// The attempt budget is spent; only an explicit requeue clears it.
 	Quarantined,
 	/// The clock could not be read, so no schedule can be evaluated.
@@ -3712,7 +4039,49 @@ impl MaintenanceTracker {
 		{
 			refusal = Some(AdmissionRefusal::NotYetEligible);
 		}
+		if refusal.is_none()
+			&& let Some(cooldown) = self.neutral_for(operation, canonical)
+			&& now_ms < cooldown.next_eligible_at_ms
+		{
+			refusal = Some(AdmissionRefusal::NeutralCooldown);
+		}
 		refusal
+	}
+
+	fn neutral_for(
+		&self,
+		operation: MaintenanceOperation,
+		canonical: &[SlabId],
+	) -> Option<&NeutralCooldown> {
+		self.neutral.get(&operation)?.get(canonical)
+	}
+
+	fn clear_neutral(&mut self, operation: MaintenanceOperation, canonical: &[SlabId]) -> bool {
+		let mut removed = false;
+		if let Some(per_set) = self.neutral.get_mut(&operation) {
+			removed = per_set.remove(canonical).is_some();
+			if per_set.is_empty() {
+				self.neutral.remove(&operation);
+			}
+		}
+		removed
+	}
+
+	/// Drop every neutral cooldown whose deadline passed a full cap period ago.
+	/// Called when one is recorded, so the table is bounded by the sets scanned
+	/// within two cap periods rather than by every set ever scanned. The grace
+	/// period matters: an entry must outlive its own deadline so that the next
+	/// clean scan of a live set - which arrives some ticks after the deadline,
+	/// once the pass reaches it - still doubles from it. A set nobody rescanned
+	/// for a whole cap period after it became eligible was retired.
+	fn sweep_expired_neutral(&mut self, now_ms: u64) {
+		let grace_ms = NEUTRAL_COOLDOWN_CAP.as_millis() as u64;
+		self.neutral.retain(|_, per_set| {
+			per_set.retain(|_, cooldown| {
+				now_ms < cooldown.next_eligible_at_ms.saturating_add(grace_ms)
+			});
+			!per_set.is_empty()
+		});
 	}
 }
 
@@ -3932,6 +4301,14 @@ pub(crate) enum MaintenanceReportItem {
 		origins: Vec<MaintenanceOriginView>,
 		quarantine_fingerprint: MaintenanceFingerprint,
 	},
+	/// ADR 0098 decision 3: deterministic receipts still inside their backoff
+	/// budget. Every origin carries a deadline; none is quarantined, so there is
+	/// no fingerprint and nothing to requeue.
+	BackingOff {
+		operation: MaintenanceOperation,
+		slabs: Vec<SlabId>,
+		origins: Vec<MaintenanceOriginView>,
+	},
 	RetryableCooldown {
 		operation: MaintenanceOperation,
 		slabs: Vec<SlabId>,
@@ -3947,6 +4324,7 @@ pub(crate) enum MaintenanceReportItem {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum MaintenanceReportPosition {
 	QuarantinedWork(MaintenanceOperation, Vec<SlabId>),
+	BackingOff(MaintenanceOperation, Vec<SlabId>),
 	Retryable(MaintenanceOperation, Vec<SlabId>),
 	InFlight(MaintenanceOperation, Vec<SlabId>),
 }
@@ -4023,6 +4401,7 @@ fn encode_report_cursor(
 		}
 		MaintenanceReportPosition::Retryable(operation, slabs) => (1, operation.code(), slabs),
 		MaintenanceReportPosition::InFlight(operation, slabs) => (2, operation.code(), slabs),
+		MaintenanceReportPosition::BackingOff(operation, slabs) => (3, operation.code(), slabs),
 	};
 	let mut bytes = Vec::with_capacity(32 + slabs.len() * 8);
 	bytes.push(MAINTENANCE_REPORT_CURSOR_VERSION);
@@ -4086,13 +4465,17 @@ fn decode_report_cursor(
 				MaintenanceReportPosition::Retryable(operation, slabs)
 			}
 		}
-		2 => {
+		2 | 3 => {
 			let operation = MaintenanceOperation::from_code(operation_code).ok_or_else(|| {
 				MaintenanceReportPageError::InvalidCursor(
 					"maintenance report cursor operation is unknown".to_owned(),
 				)
 			})?;
-			MaintenanceReportPosition::InFlight(operation, slabs)
+			if kind == 2 {
+				MaintenanceReportPosition::InFlight(operation, slabs)
+			} else {
+				MaintenanceReportPosition::BackingOff(operation, slabs)
+			}
 		}
 		_ => {
 			return Err(MaintenanceReportPageError::InvalidCursor(
@@ -4106,7 +4489,8 @@ fn decode_report_cursor(
 fn report_item_estimated_bytes(item: &MaintenanceReportItem) -> usize {
 	const ITEM_OVERHEAD: usize = 64;
 	match item {
-		MaintenanceReportItem::QuarantinedWork { slabs, origins, .. } => {
+		MaintenanceReportItem::QuarantinedWork { slabs, origins, .. }
+		| MaintenanceReportItem::BackingOff { slabs, origins, .. } => {
 			ITEM_OVERHEAD
 				+ slabs.len() * 10
 				+ origins
@@ -4183,6 +4567,27 @@ fn quarantined_report_item(
 	))
 }
 
+/// ADR 0098 decision 3: the origins of one work identity that are backing off,
+/// or nothing when every origin is quarantined.
+fn backing_off_report_item(
+	operation: MaintenanceOperation,
+	slabs: Vec<SlabId>,
+	mut origins: Vec<MaintenanceOriginView>,
+) -> Option<(MaintenanceReportPosition, MaintenanceReportItem)> {
+	origins.retain(|origin| origin.next_eligible_at_ms.is_some());
+	if origins.is_empty() {
+		return None;
+	}
+	Some((
+		MaintenanceReportPosition::BackingOff(operation, slabs.clone()),
+		MaintenanceReportItem::BackingOff {
+			operation,
+			slabs,
+			origins,
+		},
+	))
+}
+
 /// Operator-facing view of one receipt: the slab set and the reason, so a
 /// quarantine can be understood and requeued (ADR 0097, Risks).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4226,6 +4631,26 @@ impl MaintenancePolicyReport {
 }
 
 impl MaintenancePolicyInner {
+	/// ADR 0098 decision 2: the neutral cooldowns in force, in canonical order.
+	#[cfg(test)]
+	pub(crate) fn neutral_cooldowns_for_test(
+		&self,
+	) -> Vec<(MaintenanceOperation, Vec<SlabId>, NeutralCooldown)> {
+		let state = self.lock();
+		let PolicyState::Enabled { tracker, .. } = &*state else {
+			return Vec::new();
+		};
+		tracker
+			.neutral
+			.iter()
+			.flat_map(|(operation, per_set)| {
+				per_set
+					.iter()
+					.map(|(slabs, cooldown)| (*operation, slabs.clone(), *cooldown))
+			})
+			.collect()
+	}
+
 	#[cfg(test)]
 	pub(crate) fn quarantine_fingerprint_for_test(
 		&self,
@@ -4319,7 +4744,8 @@ impl MaintenancePolicyInner {
 				};
 				Box::new(tracker.deterministic.range(start..))
 			}
-			Some(MaintenanceReportPosition::Retryable(..))
+			Some(MaintenanceReportPosition::BackingOff(..))
+			| Some(MaintenanceReportPosition::Retryable(..))
 			| Some(MaintenanceReportPosition::InFlight(..)) => Box::new(std::iter::empty()),
 		};
 		for (key, receipt) in deterministic {
@@ -4375,6 +4801,99 @@ impl MaintenancePolicyInner {
 		if !has_more && let Some(operation) = group_operation {
 			if let Some((position, item)) =
 				quarantined_report_item(operation, group_slabs, group_origins)
+			{
+				let _ = try_push_report_item(
+					after.as_ref(),
+					max_items,
+					max_bytes,
+					position,
+					item,
+					&mut items,
+					&mut used_bytes,
+					&mut last_position,
+					&mut has_more,
+				);
+			}
+		}
+
+		// ADR 0098 decision 3: the same map, read once more for the receipts still
+		// inside their backoff budget. Grouped by work identity like the quarantined
+		// pass, positioned after every quarantined item so a page boundary between
+		// one identity's two views loses neither. No hashing happens here.
+		if !has_more {
+			let backing_off: Box<
+				dyn Iterator<Item = (&MaintenanceWorkKey, &DeterministicReceipt)> + '_,
+			> = match after.as_ref() {
+				None | Some(MaintenanceReportPosition::QuarantinedWork(..)) => {
+					Box::new(tracker.deterministic.iter())
+				}
+				Some(MaintenanceReportPosition::BackingOff(operation, slabs)) => {
+					let start = MaintenanceWorkKey {
+						operation: *operation,
+						slabs: slabs.clone(),
+						origin: DeterministicOrigin::LsmWriterCannotSplitMultiRowFrame,
+					};
+					Box::new(tracker.deterministic.range(start..))
+				}
+				Some(MaintenanceReportPosition::Retryable(..))
+				| Some(MaintenanceReportPosition::InFlight(..)) => Box::new(std::iter::empty()),
+			};
+			let mut group_operation = None;
+			let mut group_slabs = Vec::new();
+			let mut group_origins = Vec::new();
+			for (key, receipt) in backing_off {
+				if receipt.next_eligible_at_ms.is_none() {
+					continue;
+				}
+				if matches!(
+					after.as_ref(),
+					Some(MaintenanceReportPosition::BackingOff(operation, slabs))
+						if *operation == key.operation() && slabs.as_slice() == key.slabs()
+				) {
+					continue;
+				}
+				let changed = group_operation.is_some_and(|operation| {
+					operation != key.operation() || group_slabs.as_slice() != key.slabs()
+				});
+				if changed {
+					let grouped = backing_off_report_item(
+						group_operation.expect("a changed group has an operation"),
+						std::mem::take(&mut group_slabs),
+						std::mem::take(&mut group_origins),
+					);
+					if let Some((position, item)) = grouped
+						&& !try_push_report_item(
+							after.as_ref(),
+							max_items,
+							max_bytes,
+							position,
+							item,
+							&mut items,
+							&mut used_bytes,
+							&mut last_position,
+							&mut has_more,
+						) {
+						break;
+					}
+				}
+				if group_operation != Some(key.operation()) || group_slabs.as_slice() != key.slabs()
+				{
+					group_operation = Some(key.operation());
+					group_slabs = key.slabs().to_vec();
+				}
+				group_origins.push(MaintenanceOriginView {
+					origin: key.origin(),
+					reason: key.reason(),
+					attempts: receipt.attempts(),
+					last_failure_ms: receipt.last_failure_ms,
+					next_eligible_at_ms: receipt.next_eligible_at_ms,
+					detail: receipt.detail().to_owned(),
+				});
+			}
+			if !has_more
+				&& let Some(operation) = group_operation
+				&& let Some((position, item)) =
+					backing_off_report_item(operation, group_slabs, group_origins)
 			{
 				let _ = try_push_report_item(
 					after.as_ref(),
@@ -4510,6 +5029,12 @@ impl MaintenancePolicyInner {
 						MaintenanceAttemptResult::CompletedWithoutRewrite,
 					);
 				}
+				SuccessDisposition::Unclaimed => {
+					self.record_unclaimed(reservation);
+					metrics.observe_maintenance_attempt(
+						MaintenanceAttemptResult::CompletedWithoutRewrite,
+					);
+				}
 			},
 			Err(error) => {
 				let class = classify(error);
@@ -4541,10 +5066,62 @@ impl MaintenancePolicyInner {
 		}
 	}
 
-	/// A completion that rewrote nothing proves nothing. The reservation is
+	/// A completion that never owned its slabs proves nothing. The reservation is
 	/// released and every receipt and cooldown stands exactly as it was: the next
 	/// attempt is still the next attempt.
+	fn record_unclaimed(&self, reservation: MaintenanceReservation) {
+		reservation.finalize();
+	}
+
+	/// ADR 0098 decision 2: a completion that scanned its slabs and found nothing
+	/// to rewrite is not evidence about any receipt - those stand exactly as they
+	/// were - but it IS evidence that scanning the same set on the next tick would
+	/// find the same nothing. The set cools down for one tick, doubling per
+	/// consecutive clean scan up to the cap. The clock is sampled after the scan,
+	/// as for failures, so a scan longer than its own cooldown does not consume it.
+	/// A clock or arithmetic failure disables admission, as every other
+	/// unrecordable outcome does.
 	fn record_neutral(&self, reservation: MaintenanceReservation) {
+		let operation = reservation.operation();
+		let slabs = reservation.slabs().to_vec();
+		let Some(now_ms) = self.clock.now_ms() else {
+			self.disable("policy clock unavailable after a neutral attempt");
+			reservation.finalize();
+			return;
+		};
+		{
+			let mut state = self.lock();
+			if let PolicyState::Enabled { tracker, .. } = &mut *state {
+				let previous = tracker
+					.neutral_for(operation, &slabs)
+					.map_or(0, |cooldown| cooldown.completions);
+				tracker.sweep_expired_neutral(now_ms);
+				let next = previous.checked_add(1).and_then(|completions| {
+					let cooldown_ms =
+						u64::try_from(neutral_cooldown(completions).as_millis()).ok()?;
+					let next_eligible_at_ms = now_ms.checked_add(cooldown_ms)?;
+					Some(NeutralCooldown {
+						completions,
+						next_eligible_at_ms,
+					})
+				});
+				match next {
+					Some(cooldown) => {
+						tracker
+							.neutral
+							.entry(operation)
+							.or_default()
+							.insert(slabs, cooldown);
+					}
+					None => {
+						drop(state);
+						self.disable(
+							"neutral completion counter or cooldown arithmetic overflowed",
+						);
+					}
+				}
+			}
+		}
 		reservation.finalize();
 	}
 
@@ -4568,6 +5145,7 @@ impl MaintenancePolicyInner {
 			if tracker.clear_retryable(operation, &slabs) {
 				self.bump_report_generation();
 			}
+			tracker.clear_neutral(operation, &slabs);
 			let keys = tracker
 				.deterministic
 				.keys()
@@ -4623,6 +5201,7 @@ impl MaintenancePolicyInner {
 			MaintenanceFailureClass::Retryable => {
 				let mut state = self.lock();
 				if let PolicyState::Enabled { tracker, .. } = &mut *state {
+					tracker.clear_neutral(operation, &slabs);
 					// Checked, not saturating: a counter pinned at its maximum would
 					// report a run of races as shorter than it was, and a cooldown
 					// computed from it would be a schedule nothing measured. Overflow
@@ -4675,6 +5254,7 @@ impl MaintenancePolicyInner {
 							if tracker.clear_retryable(operation, &slabs) {
 								self.bump_report_generation();
 							}
+							tracker.clear_neutral(operation, &slabs);
 							(tracker.deterministic.get(&key).cloned(), Arc::clone(store))
 						}
 						PolicyState::Disabled { .. } => {
@@ -4962,6 +5542,9 @@ pub enum MaintenanceAttemptResult {
 	Quarantined,
 	SkippedInFlight,
 	SkippedNotYetEligible,
+	/// ADR 0098 decision 2: the set's last scan found nothing and its cooldown
+	/// has not passed. The reporting half of the neutral cooldown.
+	SkippedNeutralCooldown,
 	SkippedQuarantined,
 	SkippedPolicyDisabled,
 	SkippedClockUnavailable,
@@ -4969,7 +5552,7 @@ pub enum MaintenanceAttemptResult {
 }
 
 impl MaintenanceAttemptResult {
-	pub const ALL: [Self; 11] = [
+	pub const ALL: [Self; 12] = [
 		Self::Ok,
 		Self::CompletedWithoutRewrite,
 		Self::Retryable,
@@ -4977,6 +5560,7 @@ impl MaintenanceAttemptResult {
 		Self::Quarantined,
 		Self::SkippedInFlight,
 		Self::SkippedNotYetEligible,
+		Self::SkippedNeutralCooldown,
 		Self::SkippedQuarantined,
 		Self::SkippedPolicyDisabled,
 		Self::SkippedClockUnavailable,
@@ -4992,6 +5576,7 @@ impl MaintenanceAttemptResult {
 			Self::Quarantined => "quarantined",
 			Self::SkippedInFlight => "skipped_in_flight",
 			Self::SkippedNotYetEligible => "skipped_not_yet_eligible",
+			Self::SkippedNeutralCooldown => "skipped_neutral_cooldown",
 			Self::SkippedQuarantined => "skipped_quarantined",
 			Self::SkippedPolicyDisabled => "skipped_policy_disabled",
 			Self::SkippedClockUnavailable => "skipped_clock_unavailable",
@@ -5004,6 +5589,7 @@ impl MaintenanceAttemptResult {
 			AdmissionRefusal::PolicyDisabled(_) => Self::SkippedPolicyDisabled,
 			AdmissionRefusal::AlreadyInFlight => Self::SkippedInFlight,
 			AdmissionRefusal::NotYetEligible => Self::SkippedNotYetEligible,
+			AdmissionRefusal::NeutralCooldown => Self::SkippedNeutralCooldown,
 			AdmissionRefusal::Quarantined => Self::SkippedQuarantined,
 			AdmissionRefusal::ClockUnavailable => Self::SkippedClockUnavailable,
 			AdmissionRefusal::EmptyWorkSet => Self::SkippedEmptyWorkSet,

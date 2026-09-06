@@ -1,3 +1,4 @@
+use super::retention_reclaim::{SealedSlabScan, TombstoneSlabScanOutcome};
 use super::secondary_index_segments::MaintenanceClaims;
 use super::*;
 use crate::storage::maintenance_policy::{DeterministicOrigin, deterministic_failure};
@@ -414,13 +415,16 @@ impl SlabManager {
 		slab_id: SlabId,
 		tombstones: &[MigratedRangeTombstone],
 		secondary_index_context: SecondaryIndexCompactionContext<'_>,
-	) -> std::io::Result<Option<CompactionOutcome>> {
+	) -> std::io::Result<TombstoneSlabScanOutcome> {
 		// ADR 0097: own the slab BEFORE scanning it, then refetch it. Scanning
 		// unowned let this job plan from bytes another maintenance job had already
 		// replaced; and the handle it was called with predates the wait for
 		// ownership, so after waiting it can name a superseded image.
 		let Some((claims, slab)) = self.claim_sealed_slab_for_maintenance(slab_id).await else {
-			return Ok(None);
+			return Ok(TombstoneSlabScanOutcome {
+				scan: SealedSlabScan::Unclaimed,
+				compaction: None,
+			});
 		};
 		let mut records: Vec<CompactionRecord> = slab
 			.index
@@ -449,8 +453,11 @@ impl SlabManager {
 			.collect();
 		records.sort_by_key(|record| record.old_location.offset);
 
-		self.compact_sealed_slab_records(slab_id, slab, &records, secondary_index_context, &claims)
-			.await
+		let scan = SealedSlabScan::after_scan(&records);
+		let compaction = self
+			.compact_sealed_slab_records(slab_id, slab, &records, secondary_index_context, &claims)
+			.await?;
+		Ok(TombstoneSlabScanOutcome { scan, compaction })
 	}
 
 	pub(super) async fn recluster_one_sealed_slab(

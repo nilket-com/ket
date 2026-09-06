@@ -808,7 +808,7 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 		frame: &[u8],
 	) -> std::io::Result<(Arc<LocalSlabStore>, RecordLocation)> {
-		let slab = self.target_for_append().await?;
+		let slab = self.target_for_append(frame.len() as u64).await?;
 		let location = slab.append(tenant_id, key_identity, hlc, frame).await?;
 		Ok((slab, location))
 	}
@@ -909,8 +909,10 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 		value: u64,
 	) -> std::io::Result<RecordLocation> {
-		let slab = self.target_for_append().await?;
 		let frame = CounterTentativeFrame { value };
+		let slab = self
+			.target_for_append(size_of::<CounterTentativeFrame>() as u64)
+			.await?;
 		let location = slab
 			.write_framed(
 				tenant_id,
@@ -937,8 +939,10 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 		tentative_op_id: u64,
 	) -> std::io::Result<()> {
-		let slab = self.target_for_append().await?;
 		let marker = CounterCommitFrame { tentative_op_id };
+		let slab = self
+			.target_for_append(size_of::<CounterCommitFrame>() as u64)
+			.await?;
 		slab.write_framed(
 			tenant_id,
 			key_identity,
@@ -3162,12 +3166,16 @@ impl SlabManager {
 		Ok(MigrationIngestOutcome::Inserted(location))
 	}
 
-	/// Acquire the slab that should receive the next append,
-	/// rotating if the current active slab has crossed the size cap.
-	async fn target_for_append(&self) -> std::io::Result<Arc<LocalSlabStore>> {
+	/// Acquire the slab that should receive the next append of `payload_bytes`,
+	/// rotating first if the active slab has crossed the size cap or the payload
+	/// would carry it across. An empty slab admits any payload: the cap bounds
+	/// overshoot to one payload and never refuses a record (ADR 0098).
+	async fn target_for_append(&self, payload_bytes: u64) -> std::io::Result<Arc<LocalSlabStore>> {
 		let mut state = self.state.lock().await;
-
-		if state.active.write_cursor() < self.config.max_slab_bytes {
+		let cursor = state.active.write_cursor();
+		let fits =
+			cursor == 0 || cursor.saturating_add(payload_bytes) <= self.config.max_slab_bytes;
+		if cursor < self.config.max_slab_bytes && fits {
 			return Ok(state.active.clone());
 		}
 

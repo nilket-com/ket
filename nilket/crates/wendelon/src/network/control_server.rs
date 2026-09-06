@@ -314,6 +314,14 @@ pub enum MaintenanceReportItemWire {
 		operation_code: u16,
 		slabs: Vec<u64>,
 	},
+	/// ADR 0098 decision 3: deterministic receipts inside their backoff budget.
+	/// Every origin's `next_eligible_at_ms` is set; there is no fingerprint
+	/// because there is nothing to requeue.
+	BackingOff {
+		operation_code: u16,
+		slabs: Vec<u64>,
+		origins: Vec<MaintenanceOriginWire>,
+	},
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,6 +385,22 @@ pub struct MaintenanceRequeueResponseWire {
 	pub completion_audit: MaintenanceCompletionAuditWire,
 }
 
+fn maintenance_origins_wire(
+	origins: Vec<crate::storage::maintenance_policy::MaintenanceOriginView>,
+) -> Vec<MaintenanceOriginWire> {
+	origins
+		.into_iter()
+		.map(|origin| MaintenanceOriginWire {
+			origin_code: origin.origin.code(),
+			reason: origin.reason.label().to_owned(),
+			attempts: origin.attempts,
+			last_failure_ms: origin.last_failure_ms,
+			next_eligible_at_ms: origin.next_eligible_at_ms,
+			detail: origin.detail,
+		})
+		.collect()
+}
+
 fn maintenance_item_wire(item: MaintenanceReportItem) -> MaintenanceReportItemWire {
 	match item {
 		MaintenanceReportItem::QuarantinedWork {
@@ -387,18 +411,17 @@ fn maintenance_item_wire(item: MaintenanceReportItem) -> MaintenanceReportItemWi
 		} => MaintenanceReportItemWire::QuarantinedWork {
 			operation_code: operation.code(),
 			slabs: slabs.into_iter().map(|slab| slab.get()).collect(),
-			origins: origins
-				.into_iter()
-				.map(|origin| MaintenanceOriginWire {
-					origin_code: origin.origin.code(),
-					reason: origin.reason.label().to_owned(),
-					attempts: origin.attempts,
-					last_failure_ms: origin.last_failure_ms,
-					next_eligible_at_ms: origin.next_eligible_at_ms,
-					detail: origin.detail,
-				})
-				.collect(),
+			origins: maintenance_origins_wire(origins),
 			quarantine_fingerprint: quarantine_fingerprint.to_bytes().to_vec(),
+		},
+		MaintenanceReportItem::BackingOff {
+			operation,
+			slabs,
+			origins,
+		} => MaintenanceReportItemWire::BackingOff {
+			operation_code: operation.code(),
+			slabs: slabs.into_iter().map(|slab| slab.get()).collect(),
+			origins: maintenance_origins_wire(origins),
 		},
 		MaintenanceReportItem::RetryableCooldown {
 			operation,
@@ -5602,11 +5625,13 @@ mod tests {
 		assert_eq!(report_b.items.len(), 1);
 		assert!(report_a.items.iter().all(|item| match item {
 			MaintenanceReportItemWire::QuarantinedWork { slabs, .. }
+			| MaintenanceReportItemWire::BackingOff { slabs, .. }
 			| MaintenanceReportItemWire::RetryableCooldown { slabs, .. }
 			| MaintenanceReportItemWire::InFlight { slabs, .. } => slabs == &[11, 12],
 		}));
 		assert!(report_b.items.iter().all(|item| match item {
 			MaintenanceReportItemWire::QuarantinedWork { slabs, .. }
+			| MaintenanceReportItemWire::BackingOff { slabs, .. }
 			| MaintenanceReportItemWire::RetryableCooldown { slabs, .. }
 			| MaintenanceReportItemWire::InFlight { slabs, .. } => slabs == &[99],
 		}));

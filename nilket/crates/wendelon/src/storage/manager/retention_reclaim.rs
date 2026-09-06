@@ -1,9 +1,60 @@
 use super::*;
 
+/// ADR 0098 decision 2: what one policed scan of a sealed slab established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SealedSlabScan {
+	/// The claim found the slab pinned, retired, or replaced: nothing was
+	/// scanned and nothing is known about its contents.
+	Unclaimed,
+	/// The scan found work and could not do it this tick - a pin gate or a
+	/// quarantined run stood in the way. The work is still there.
+	Deferred,
+	/// The scan found nothing to rewrite.
+	Clean,
+}
+
+impl SealedSlabScan {
+	pub(super) fn after_scan(records: &[CompactionRecord]) -> Self {
+		if records.iter().any(|record| record.reclaim) {
+			Self::Deferred
+		} else {
+			Self::Clean
+		}
+	}
+
+	fn disposition(self, compaction: Option<&CompactionOutcome>) -> SuccessDisposition {
+		match (self, compaction) {
+			(_, Some(_)) => SuccessDisposition::Rewrote,
+			(Self::Clean, None) => SuccessDisposition::Neutral,
+			(Self::Unclaimed | Self::Deferred, None) => SuccessDisposition::Unclaimed,
+		}
+	}
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct RetentionSlabScanOutcome {
+	pub(super) scan: SealedSlabScan,
 	pub(super) compaction: Option<CompactionOutcome>,
 	pub(super) retention_stats: RetentionCompactionStats,
+}
+
+impl RetentionSlabScanOutcome {
+	pub(super) fn disposition(&self) -> SuccessDisposition {
+		self.scan.disposition(self.compaction.as_ref())
+	}
+}
+
+/// One tombstone reclaim attempt over one sealed slab.
+#[derive(Clone, Copy)]
+pub(super) struct TombstoneSlabScanOutcome {
+	pub(super) scan: SealedSlabScan,
+	pub(super) compaction: Option<CompactionOutcome>,
+}
+
+impl TombstoneSlabScanOutcome {
+	pub(super) fn disposition(&self) -> SuccessDisposition {
+		self.scan.disposition(self.compaction.as_ref())
+	}
 }
 
 pub(super) fn retention_rewrite_tmp_path(dir: &Path, slab_id: SlabId) -> PathBuf {
@@ -459,28 +510,26 @@ impl SlabManager {
 		};
 
 		let mut report = TombstoneCompactionReport::default();
+		// ADR 0098 decision 1: the budget is on attempts that completed, not on
+		// rewrites. A pass that finds nothing to rewrite still decodes every slab
+		// it attempts, so an unbudgeted pass decodes the whole node every tick.
+		let mut attempted_slabs = 0_usize;
 		// ADR 0097: the handle is deliberately unused - each path refetches the
 		// current slab after it acquires ownership.
 		for (slab_id, _stale_handle) in sealed {
-			if report.compacted_slabs >= max_slabs {
+			if attempted_slabs >= max_slabs {
 				break;
 			}
 			// ADR 0097 decision 4: one slab is one policed attempt, as for retention.
-			// A refusal skips the slab this tick; a slab that needed no rewrite
-			// records nothing.
+			// A refusal skips the slab this tick and costs no budget; a slab that
+			// was scanned and needed no rewrite cools down (ADR 0098 decision 2).
 			let attempt = self
 				.maintenance_policy
 				.execute(
 					MaintenanceOperation::TombstoneReclaim,
 					&[slab_id],
 					classify_io_error,
-					|outcome: &Option<CompactionOutcome>| {
-						if outcome.is_some() {
-							SuccessDisposition::Rewrote
-						} else {
-							SuccessDisposition::Neutral
-						}
-					},
+					TombstoneSlabScanOutcome::disposition,
 					|| {
 						self.compact_one_sealed_slab(
 							slab_id,
@@ -493,7 +542,7 @@ impl SlabManager {
 					},
 				)
 				.await;
-			let outcome = match attempt {
+			let scan = match attempt {
 				MaintenanceAttempt::Skipped(refusal) => {
 					tracing::debug!(
 						slab_id = slab_id.get(),
@@ -502,10 +551,11 @@ impl SlabManager {
 					);
 					continue;
 				}
-				MaintenanceAttempt::Completed(outcome) => outcome,
+				MaintenanceAttempt::Completed(scan) => scan,
 				MaintenanceAttempt::Failed(err) => return Err(err),
 			};
-			if let Some(outcome) = outcome {
+			attempted_slabs += 1;
+			if let Some(outcome) = scan.compaction {
 				report.compacted_slabs += 1;
 				report.reclaimed_bytes = report
 					.reclaimed_bytes
@@ -608,28 +658,28 @@ impl SlabManager {
 		};
 
 		let mut report = RetentionPruningReport::default();
+		// ADR 0098 decision 1: the budget is on attempts that completed, not on
+		// rewrites. This is the loop the local deployment pinned a core on: with a
+		// rewrite budget, a node with nothing to prune decoded every sealed slab
+		// every tick.
+		let mut attempted_slabs = 0_usize;
 		// ADR 0097: the handle is deliberately unused - each path refetches the
 		// current slab after it acquires ownership.
 		for (slab_id, _stale_handle) in sealed {
-			if report.compacted_slabs >= max_slabs {
+			if attempted_slabs >= max_slabs {
 				break;
 			}
 			// ADR 0097 decision 4: one slab is one policed attempt. A refusal skips the
-			// slab this tick; a failure is recorded, then propagates as before. A scan
-			// that pruned nothing rewrote nothing, and proves nothing about a receipt.
+			// slab this tick and costs no budget; a failure is recorded, then
+			// propagates as before. A scan that pruned nothing rewrote nothing and
+			// proves nothing about a receipt; it cools the slab down (ADR 0098).
 			let attempt = self
 				.maintenance_policy
 				.execute(
 					MaintenanceOperation::RetentionPrune,
 					&[slab_id],
 					classify_io_error,
-					|scan: &RetentionSlabScanOutcome| {
-						if scan.compaction.is_some() {
-							SuccessDisposition::Rewrote
-						} else {
-							SuccessDisposition::Neutral
-						}
-					},
+					RetentionSlabScanOutcome::disposition,
 					|| {
 						self.prune_one_sealed_slab_for_retention(
 							slab_id,
@@ -654,6 +704,7 @@ impl SlabManager {
 				MaintenanceAttempt::Completed(scan) => scan,
 				MaintenanceAttempt::Failed(err) => return Err(err),
 			};
+			attempted_slabs += 1;
 			report.pruned_data_rows = report
 				.pruned_data_rows
 				.saturating_add(scan.retention_stats.pruned_data_rows);
@@ -1134,6 +1185,7 @@ impl SlabManager {
 		// rewrite of bytes that are gone.
 		let Some((claims, slab)) = self.claim_sealed_slab_for_maintenance(slab_id).await else {
 			return Ok(RetentionSlabScanOutcome {
+				scan: SealedSlabScan::Unclaimed,
 				compaction: None,
 				retention_stats: RetentionCompactionStats::default(),
 			});
@@ -1170,6 +1222,7 @@ impl SlabManager {
 		.await?;
 		records.sort_by_key(|record| record.old_location.offset);
 		let retention_stats = Self::retention_compaction_stats(&records);
+		let scan = SealedSlabScan::after_scan(&records);
 		let compaction = self
 			.compact_sealed_slab_records(
 				slab_id,
@@ -1184,6 +1237,7 @@ impl SlabManager {
 			.await?;
 
 		Ok(RetentionSlabScanOutcome {
+			scan,
 			compaction,
 			retention_stats,
 		})

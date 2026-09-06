@@ -14215,3 +14215,157 @@ async fn tombstone_reclaim_is_policed() {
 		"the reservation was released"
 	);
 }
+
+/// ADR 0098 decision 1: with nothing prunable, a retention pass with
+/// `max_slabs = 1` attempts exactly one slab, the next pass the next slab, and a
+/// pass after every slab is cooling attempts none. A rewrite-only budget leaves
+/// three cooldowns after the first pass.
+#[tokio::test]
+async fn retention_pass_budgets_attempts_and_walks_the_sealed_slabs() {
+	use crate::storage::maintenance_policy::MaintenanceOperation;
+
+	let mgr = fresh_manager().await;
+	let mut sealed = Vec::new();
+	for n in 0..3_u64 {
+		mgr.append_durable(tenant(), id(0x9800 + n), hlc(10 + n), b"clean-row")
+			.await
+			.unwrap();
+		sealed.push(force_seal_active(&mgr).await);
+	}
+	let (schemas, indexes) = empty_compaction_catalogs();
+	let lifecycle = TableLifecycleCatalog::default();
+	let policy = mgr.maintenance_policy();
+	assert!(policy.is_enabled(), "{:?}", policy.diagnostic());
+
+	let mut expected = Vec::new();
+	for (pass, slab_id) in sealed.iter().enumerate() {
+		let report = mgr
+			.prune_versions_for_retention(
+				MvccRetentionPolicy::Disabled,
+				&lifecycle,
+				&schemas,
+				&indexes,
+				100_000,
+				1,
+			)
+			.await
+			.unwrap();
+		assert_eq!(report.compacted_slabs, 0, "pass {pass} rewrites nothing");
+		expected.push((MaintenanceOperation::RetentionPrune, vec![*slab_id]));
+		let cooling = policy
+			.neutral_cooldowns_for_test()
+			.into_iter()
+			.map(|(operation, slabs, _)| (operation, slabs))
+			.collect::<Vec<_>>();
+		assert_eq!(
+			cooling, expected,
+			"pass {pass} attempted exactly the next slab and no other"
+		);
+	}
+	let before = policy.neutral_cooldowns_for_test();
+	let report = mgr
+		.prune_versions_for_retention(
+			MvccRetentionPolicy::Disabled,
+			&lifecycle,
+			&schemas,
+			&indexes,
+			100_000,
+			1,
+		)
+		.await
+		.unwrap();
+	assert_eq!(report.compacted_slabs, 0);
+	assert_eq!(
+		policy.neutral_cooldowns_for_test(),
+		before,
+		"every slab is cooling: the pass attempted nothing"
+	);
+	assert!(policy.report().in_flight.is_empty());
+}
+
+/// ADR 0098 decision 1: the tombstone pass budgets attempts the same way.
+#[tokio::test]
+async fn tombstone_pass_budgets_attempts_and_walks_the_sealed_slabs() {
+	use crate::storage::maintenance_policy::MaintenanceOperation;
+
+	let mgr = fresh_manager().await;
+	let mut sealed = Vec::new();
+	for n in 0..2_u64 {
+		mgr.append_durable(tenant(), id(0x9900 + n), hlc(10 + n), b"kept-row")
+			.await
+			.unwrap();
+		sealed.push(force_seal_active(&mgr).await);
+	}
+	// A tombstone over a locality no row occupies: every scan is clean.
+	let unoccupied = MigratedRangeTombstone {
+		migration_id: 1,
+		range_start: u64::MAX - 1,
+		range_end: u64::MAX - 1,
+		to_epoch: 2,
+		completed_by: NodeId {
+			id: 7,
+			_reserved: 0,
+		},
+		completed_at_hlc: hlc(1),
+		migration_hlc_floor: hlc(0),
+	};
+	let (schemas, indexes) = empty_compaction_catalogs();
+	let policy = mgr.maintenance_policy();
+	for (pass, slab_id) in sealed.iter().enumerate() {
+		let report = mgr
+			.reclaim_tombstoned_ranges(std::slice::from_ref(&unoccupied), &schemas, &indexes, 1)
+			.await
+			.unwrap();
+		assert_eq!(report.compacted_slabs, 0, "pass {pass} rewrites nothing");
+		let cooling = policy
+			.neutral_cooldowns_for_test()
+			.into_iter()
+			.map(|(operation, slabs, _)| (operation, slabs))
+			.collect::<Vec<_>>();
+		assert_eq!(cooling.len(), pass + 1, "pass {pass} attempted one slab");
+		assert_eq!(
+			cooling[pass],
+			(MaintenanceOperation::TombstoneReclaim, vec![*slab_id])
+		);
+	}
+}
+
+/// ADR 0098 decision 4: an append that would carry the active slab across the
+/// cap rotates first; the cursor-only rule lands the second 600 KiB payload in
+/// the first slab. A payload larger than the cap still enters an empty slab.
+#[tokio::test]
+async fn append_rotates_before_a_payload_would_cross_the_cap() {
+	let mgr = fresh_manager().await;
+	assert_eq!(mgr.config.max_slab_bytes, 1 << 20);
+	let payload = vec![0x5A_u8; 600 * 1024];
+	let mut slab_ids = Vec::new();
+	for n in 0..3_u64 {
+		let location = mgr
+			.append_durable(tenant(), id(0x9A00 + n), hlc(10 + n), &payload)
+			.await
+			.unwrap();
+		slab_ids.push(location.slab_id);
+	}
+	assert!(
+		slab_ids.windows(2).all(|pair| pair[0] < pair[1]),
+		"each 600 KiB payload took its own slab under a 1 MiB cap: {slab_ids:?}"
+	);
+
+	let oversized = vec![0xA5_u8; 2 << 20];
+	let big = mgr
+		.append_durable(tenant(), id(0x9A10), hlc(20), &oversized)
+		.await
+		.unwrap();
+	assert!(
+		big.slab_id > slab_ids[2],
+		"the third slab held 600 KiB, so the oversized payload rotated into a fresh one"
+	);
+	let small = mgr
+		.append_durable(tenant(), id(0x9A11), hlc(21), b"after-oversized")
+		.await
+		.unwrap();
+	assert!(
+		small.slab_id > big.slab_id,
+		"the slab holding the oversized payload is over the cap and rotates"
+	);
+}

@@ -406,6 +406,32 @@ fn print_report(document: &ReportDocument) {
 				operation_label(*operation_code),
 				slab_list(slabs),
 			),
+			MaintenanceReportItemWire::BackingOff {
+				operation_code,
+				slabs,
+				origins,
+			} => {
+				println!(
+					"backing_off operation={} slabs={} origins={}",
+					operation_label(*operation_code),
+					slab_list(slabs),
+					origins.len(),
+				);
+				for origin in origins {
+					println!(
+						"  origin={} reason={} attempts={} last_failure_ms={} deadline={} detail={}",
+						origin.origin_code,
+						origin.reason,
+						origin.attempts,
+						origin.last_failure_ms,
+						origin
+							.next_eligible_at_ms
+							.map(|value| value.to_string())
+							.unwrap_or_else(|| "quarantined".to_owned()),
+						origin.detail,
+					);
+				}
+			}
 		}
 	}
 	if document.items.is_empty() {

@@ -74,10 +74,11 @@ The cooldown is ephemeral, like the retryable cooldown: a restart forgets it and
 the first tick after restart scans once more.
 
 A completion that never **owned** the slabs - the claim was refused because the
-slab was pinned, retired, or held by another job - proved nothing about their
-contents and records no cooldown. `SuccessDisposition` gains `Unclaimed` for
-that case; `Neutral` now means "scanned and clean". The per-slab attempt bodies
-report which one happened.
+slab was pinned, retired, or held by another job - or that found work a pin
+gate deferred, proved nothing about whether the set is clean and records no
+cooldown. `SuccessDisposition` gains `Unclaimed` for both; `Neutral` now means
+"scanned and clean". The per-slab attempt bodies report which one happened,
+from the claim's answer and from whether the scan marked any record reclaimable.
 
 Together with decision 1, a node with N sealed slabs and nothing to prune scans
 one slab per tick and each slab at most once per cooldown period, converging on
@@ -150,9 +151,10 @@ record. Every append path passes the frame length it is about to write.
 
 ## Forward
 
-The neutral cooldown table is bounded by the number of live slab sets per
-operation; entries for retired slabs are dropped when expired entries are swept
-on the next neutral record. If a deployment shows the table growing, key the
+The neutral cooldown table is bounded by the slab sets scanned within two cap
+periods per operation: an entry outlives its deadline by one cap period, so the
+next clean scan of a live set still doubles from it, and is swept on the next
+neutral record after that. If a deployment shows the table growing, key the
 sweep on slab retirement instead. The 450 MB slab itself stays on disk until a
 rewrite or reclaim retires it; nothing here rewrites a slab that has nothing to
 prune.

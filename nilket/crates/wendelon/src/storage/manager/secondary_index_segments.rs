@@ -773,7 +773,7 @@ impl SlabManager {
 					|outcome: &SecondaryIndexBackfillOutcome| match outcome {
 						SecondaryIndexBackfillOutcome::Completed(_) => SuccessDisposition::Rewrote,
 						SecondaryIndexBackfillOutcome::StaleCandidate { .. } => {
-							SuccessDisposition::Neutral
+							SuccessDisposition::Unclaimed
 						}
 					},
 					|| {

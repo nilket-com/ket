@@ -466,9 +466,12 @@ async fn mvcc_retention_pruning_is_audit_logged_and_preserves_retained_window_re
 	seed_source(&node.slab, key, latest, b"latest-value").await;
 	let rotate_value = vec![b'x'; 16 * 1024];
 	seed_source(&node.slab, b"rotate-key", latest, &rotate_value).await;
+	// ADR 0098 decision 4: a payload larger than the cap rotates BEFORE it lands,
+	// so the oversized value seals the history slab itself and then sits alone
+	// in a second sealed slab once anything follows it.
 	assert_eq!(
 		node.slab.sealed_count().await,
-		1,
+		2,
 		"precondition: history slab sealed"
 	);
 
@@ -558,9 +561,12 @@ async fn paused_mvcc_retention_prunes_nothing_and_leaves_reads_unchanged() {
 	seed_source(&node.slab, key, latest, b"latest-value").await;
 	let rotate_value = vec![b'x'; 16 * 1024];
 	seed_source(&node.slab, b"rotate-key", latest, &rotate_value).await;
+	// ADR 0098 decision 4: a payload larger than the cap rotates BEFORE it lands,
+	// so the oversized value seals the history slab itself and then sits alone
+	// in a second sealed slab once anything follows it.
 	assert_eq!(
 		node.slab.sealed_count().await,
-		1,
+		2,
 		"precondition: history slab sealed"
 	);
 
