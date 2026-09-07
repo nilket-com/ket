@@ -20,11 +20,20 @@ impl AppState {
 			.baselines
 			.retain(|token, _| current.contains(token));
 		for (panel, incarnation, export) in self.code_editor.host_plot_exports_with_identity() {
-			self.surface.known.insert(incarnation.token(), panel.get());
-			self.surface
-				.baselines
-				.entry(incarnation.token())
-				.or_insert_with(|| live_state_of(&export));
+			// A baseline is captured once, on the incarnation's first appearance,
+			// which the attribution map records. An incarnation seen before but
+			// holding no baseline lost it, and a later pass must not mint one
+			// from what is live now: that would present an edit as load-time state.
+			let first_seen = self
+				.surface
+				.known
+				.insert(incarnation.token(), panel.get())
+				.is_none();
+			if first_seen {
+				self.surface
+					.baselines
+					.insert(incarnation.token(), live_state_of(&export));
+			}
 		}
 	}
 
@@ -34,14 +43,19 @@ impl AppState {
 			.iter()
 			.map(|(panel, incarnation, export)| {
 				let mut description = describe_export(*panel, *incarnation, export);
-				description.loaded = self
-					.surface
-					.baselines
-					.get(&incarnation.token())
-					.cloned()
-					.expect("projected figures have a load baseline after update");
+				// A projected figure has a baseline after every update; if one is
+				// ever missing the figure says so, and no client mints one.
+				description.loaded = self.surface.baselines.get(&incarnation.token()).cloned();
 				description
 			})
 			.collect()
+	}
+}
+
+#[cfg(test)]
+impl AppState {
+	/// Break the baseline invariant on purpose, to prove a describe survives it.
+	pub(super) fn forget_baseline_for_test(&mut self, token: u64) -> bool {
+		self.surface.baselines.remove(&token).is_some()
 	}
 }

@@ -6795,6 +6795,10 @@ fn product_0160_observation_enters_update_and_uses_application_baselines() {
 	assert!(state.contains("app_state.capture_surface_baselines()"));
 	assert!(agents.contains("self.describe_surface()"));
 	assert!(headless.contains("self.state.describe_surface()"));
-	assert!(surface.contains(".or_insert_with(|| live_state_of(&export))"));
+	assert!(surface.contains(".insert(incarnation.token(), live_state_of(&export))"));
+	assert!(
+		!surface.contains("or_insert_with"),
+		"a lost baseline must never be re-minted on a later capture pass"
+	);
 	assert!(!agents.contains("baselines.insert"));
 }

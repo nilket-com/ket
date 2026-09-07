@@ -300,7 +300,11 @@ pub(crate) struct FigureDescription {
 	/// restores no hidden set and a source has none, so this is always empty;
 	/// it is reported, not assumed, so a describe that ever found one would
 	/// show it.
-	pub(crate) loaded: LiveState,
+	/// Absent only when the application holds no load baseline for this
+	/// incarnation. That is an invariant failure, reported as absence rather
+	/// than fabricated from the state observed now (PRODUCT-0160 §6).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) loaded: Option<LiveState>,
 	/// The state after every command so far in this invocation.
 	pub(crate) live: LiveState,
 	/// The scatter render mode at this pane's plot area, from the renderer's
@@ -616,7 +620,7 @@ pub(crate) fn describe_export(
 			height: export.height,
 		},
 		series,
-		loaded: LiveState::default(),
+		loaded: None,
 		live: live_state_of(export),
 		render_mode,
 		settings,
@@ -731,7 +735,10 @@ mod tests {
 		};
 		assert_eq!(table["initially_hidden"], serde_json::json!([1]));
 		assert_eq!(description.live.hidden, vec![1]);
-		assert_eq!(description.loaded.hidden, Vec::<u32>::new());
+		assert!(
+			description.loaded.is_none(),
+			"describe_export carries no baseline of its own"
+		);
 	}
 
 	/// PRODUCT-0158 §2: a figure that identifies no series reports why, and
@@ -743,6 +750,11 @@ mod tests {
 		let description = describe(&plain);
 		assert!(matches!(description.series, SeriesReport::Absent { .. }));
 		assert_eq!(description.render_mode, None);
+		// PRODUCT-0160 §6 follow-up: a description with no baseline serializes
+		// without a `loaded` key rather than with a fabricated one.
+		assert!(description.loaded.is_none());
+		let json = serde_json::to_value(&description).expect("json");
+		assert!(json.get("loaded").is_none() && json.get("live").is_some());
 		let scatter = colored("Points", &series_artifact(), PlotType::Scatter);
 		assert_eq!(describe(&scatter).render_mode.as_deref(), Some("vector"));
 	}

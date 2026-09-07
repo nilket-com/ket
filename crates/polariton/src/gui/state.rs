@@ -15286,9 +15286,12 @@ rows.views([
 			.unwrap();
 		let snapshot = application.describe_surface();
 		assert_ne!(snapshot[0].figure, initial.figure);
-		assert!(snapshot[0].loaded.hidden.is_empty());
-		assert_eq!(snapshot[0].loaded.size, snapshot[0].live.size);
-		assert!(snapshot[0].loaded.size.width > 0.0);
+		assert!(snapshot[0].loaded.as_ref().unwrap().hidden.is_empty());
+		assert_eq!(
+			snapshot[0].loaded.as_ref().unwrap().size,
+			snapshot[0].live.size
+		);
+		assert!(snapshot[0].loaded.as_ref().unwrap().size.width > 0.0);
 	}
 
 	#[test]
@@ -15371,7 +15374,7 @@ rows.views([
 			}
 			let figures = session.application_mut().describe_surface();
 			assert_eq!(figures[0].live.hidden, vec![1]);
-			assert!(figures[0].loaded.hidden.is_empty());
+			assert!(figures[0].loaded.as_ref().unwrap().hidden.is_empty());
 			drop(session);
 			std::fs::remove_dir_all(root).unwrap();
 		}
@@ -15641,7 +15644,7 @@ rows.views([
 		// attachment, so these tests address the figure by incarnation; the
 		// view form is exercised by the fixture drive in the evidence record.
 		let figure = FigureRef::Incarnation(loaded[0].figure.clone());
-		assert!(loaded[0].loaded.hidden.is_empty());
+		assert!(loaded[0].loaded.as_ref().unwrap().hidden.is_empty());
 		assert!(loaded[0].live.hidden.is_empty());
 
 		// The legend's own path, on the same kernel: PRODUCT-0156 gate 8's
@@ -15882,9 +15885,10 @@ rows.views([
 	fn product_0158_loaded_is_the_initial_live_state_and_survives_commands() {
 		let (mut session, _) = session();
 		let figure = session.loaded()[0].clone();
-		assert_eq!(figure.loaded, figure.live);
-		assert!(figure.loaded.size.width > 0.0 && figure.loaded.size.height > 0.0);
-		assert!(figure.loaded.hidden.is_empty());
+		assert_eq!(figure.loaded.as_ref(), Some(&figure.live));
+		let baseline = figure.loaded.clone().unwrap();
+		assert!(baseline.size.width > 0.0 && baseline.size.height > 0.0);
+		assert!(baseline.hidden.is_empty());
 		let token = FigureRef::Incarnation(figure.figure.clone());
 		session.apply(&Command::Hide {
 			figure: token,
@@ -15948,8 +15952,9 @@ rows.views([
 			.expect("the view's pane projects");
 		let session = Session::new(application);
 		let figure = &session.loaded()[0];
-		assert!(figure.loaded.hidden.is_empty());
-		assert_eq!(figure.loaded.size, figure.live.size);
+		let baseline = figure.loaded.as_ref().expect("baseline");
+		assert!(baseline.hidden.is_empty());
+		assert_eq!(baseline.size, figure.live.size);
 		assert!(figure.live.size.width > 0.0);
 	}
 
@@ -16034,6 +16039,77 @@ rows.views([
 		let refused = session.apply(&Command::Hide { figure, series: 9 });
 		assert_eq!(refused.outcome, Outcome::Refused);
 		assert!(refused.failure.is_none() && refused.refusal.is_some());
+	}
+
+	/// PRODUCT-0160 §6 follow-up: a figure whose load baseline is missing is
+	/// reported with `loaded` absent. Nothing panics on the update thread and
+	/// nothing mints a baseline from the state it observes.
+	#[test]
+	fn product_0160_missing_baseline_is_reported_absent_not_fabricated() {
+		let (mut session, _) = session();
+		let figure = session.loaded()[0].clone();
+		assert!(figure.loaded.is_some());
+		let token: u64 = figure.figure.parse().unwrap();
+		assert!(
+			session
+				.application_mut()
+				.state_mut()
+				.forget_baseline_for_test(token)
+		);
+		let reference = FigureRef::Incarnation(figure.figure.clone());
+		session.apply(&Command::Hide {
+			figure: reference.clone(),
+			series: 0,
+		});
+		// Twice, with engine ticks and legend messages between, so every
+		// capture pass had the chance to mint a baseline from the edited state
+		// and did not.
+		for pass in 0..2 {
+			let described = session.apply(&Command::Describe {});
+			assert_eq!(described.outcome, Outcome::Applied);
+			let figures = described.figures.expect("figures");
+			assert_eq!(figures[0].figure, figure.figure);
+			assert!(
+				figures[0].loaded.is_none(),
+				"pass {pass}: no baseline is minted from observation"
+			);
+			assert_eq!(figures[0].live.hidden, vec![0]);
+			session
+				.application_mut()
+				.settle_until(Duration::from_millis(50), |_| false)
+				.ok();
+			session.apply(&Command::Show {
+				figure: reference.clone(),
+				series: 0,
+			});
+			session.apply(&Command::Hide {
+				figure: reference.clone(),
+				series: 0,
+			});
+		}
+		// A replacement incarnation is a first appearance and captures its own.
+		run_source(session.application_mut().state_mut(), BufferId::new(80), 2);
+		session
+			.application_mut()
+			.settle_until(Duration::from_secs(20), |state| {
+				state
+					.code_editor
+					.host_plot_exports_with_identity()
+					.iter()
+					.any(|(_, incarnation, _)| incarnation.token() != token)
+			})
+			.expect("the rerun installs a new incarnation");
+		let described = session.apply(&Command::Describe {});
+		let figures = described.figures.expect("figures");
+		let replacement = figures
+			.iter()
+			.find(|description| description.figure != figure.figure)
+			.expect("the replacement is described");
+		let baseline = replacement
+			.loaded
+			.as_ref()
+			.expect("a new incarnation captures its own baseline");
+		assert!(baseline.hidden.is_empty());
 	}
 
 	fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {

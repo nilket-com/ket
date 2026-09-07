@@ -201,3 +201,21 @@ carry the same outcome on their receipts. Applied and refused receipts
 serialize exactly as before, which a test asserts key by key; the batch
 deadline and write-failure paths each have a test. The second follow-up, a
 non-panicking answer when a baseline is missing, is still open.
+
+## Follow-up: a missing baseline is reported, not fabricated
+
+`describe_surface` asserted the baseline invariant with an `expect` on the
+update thread, so a broken invariant would have taken the window down. The
+figure description's `loaded` is now optional: absent, with no key in the
+JSON, only when the application holds no baseline for that incarnation. No
+client and no describe mints one from the state it observes; the guard on
+that stands. A test breaks the invariant on purpose and finds the describe
+applied, the figure's `live` state intact, and `loaded` absent. Review then
+found the next capture pass re-minting the lost baseline from live state,
+presenting an operator edit as load-time state; capture now happens only on
+an incarnation's first appearance, which the pane-attribution map records,
+so a lost baseline stays absent for that incarnation's life. The test hides a
+series, drops the baseline, describes twice with engine ticks and legend
+messages between, and finds the replacement incarnation after a rerun with
+a fresh baseline of its own. Both follow-ups from the acceptance review are
+closed.

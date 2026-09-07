@@ -355,7 +355,7 @@ mod tests {
 				series: crate::driver::SeriesReport::Absent {
 					reason: "test".into(),
 				},
-				loaded: crate::driver::LiveState::default(),
+				loaded: None,
 				live: crate::driver::LiveState::default(),
 				render_mode: None,
 				settings: Default::default(),
