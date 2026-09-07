@@ -43,10 +43,13 @@ pub(super) fn validate_tiered_blob(
 	Ok(())
 }
 
+/// `acknowledged` is the slab's boundary evidence (ADR 0099); the tenant check
+/// walks the decrypted bytes and must be able to resume past a leading hole.
 pub(super) fn decode_tiered_blob(
 	crypto: &CryptoManager,
 	pointer: &TieredSlabPointer,
 	blob: &[u8],
+	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<Vec<u8>> {
 	match crypto.encrypted_footer_summary(blob)? {
 		Some(FooterSummary {
@@ -64,7 +67,7 @@ pub(super) fn decode_tiered_blob(
 			let DecryptedTieredSlab { plaintext, .. } =
 				crypto.decrypt_tiered_slab(pointer.slab_id, blob)?;
 			let payload_tenant_id =
-				single_tenant_id_from_plain_slab(&plaintext, pointer.slab_id, &BTreeSet::new())?;
+				single_tenant_id_from_plain_slab(&plaintext, pointer.slab_id, acknowledged)?;
 			if payload_tenant_id != tenant_id {
 				return Err(Error::new(
 					ErrorKind::InvalidData,
@@ -697,7 +700,12 @@ impl SlabManager {
 		})?;
 		let blob = l2.get(&pointer.l2_uri).await?;
 		validate_tiered_blob(pointer, &blob)?;
-		decode_tiered_blob(self.config.crypto.as_ref(), pointer, &blob)
+		decode_tiered_blob(
+			self.config.crypto.as_ref(),
+			pointer,
+			&blob,
+			&self.acknowledged_offsets_in_slab(pointer.slab_id),
+		)
 	}
 
 	pub(super) async fn load_tiered_rows_from_l2(
@@ -882,7 +890,12 @@ impl SlabManager {
 	) -> std::io::Result<Vec<u8>> {
 		let blob = l2.get_bytes(&pointer.l2_uri).await?;
 		validate_tiered_blob(pointer, blob.as_ref())?;
-		decode_tiered_blob(self.config.crypto.as_ref(), pointer, blob.as_ref())
+		decode_tiered_blob(
+			self.config.crypto.as_ref(),
+			pointer,
+			blob.as_ref(),
+			&self.acknowledged_offsets_in_slab(pointer.slab_id),
+		)
 	}
 
 	pub(super) async fn read_encrypted_record_from_l2(

@@ -2347,7 +2347,12 @@ impl SlabManager {
 		blob: &[u8],
 	) -> std::io::Result<Vec<u8>> {
 		validate_tiered_blob(pointer, blob)?;
-		decode_tiered_blob(self.config.crypto.as_ref(), pointer, blob)
+		decode_tiered_blob(
+			self.config.crypto.as_ref(),
+			pointer,
+			blob,
+			&self.acknowledged_offsets_in_slab(pointer.slab_id),
+		)
 	}
 
 	#[allow(dead_code)]
@@ -3905,6 +3910,7 @@ impl SlabManager {
 			self.config.crypto.as_ref(),
 			pointer,
 			&old_blob,
+			&self.acknowledged_offsets_in_slab(pointer.slab_id),
 		)?);
 		let mut records = recover_slab_entries_from_blob(
 			&plaintext,
@@ -4057,6 +4063,7 @@ impl SlabManager {
 			self.config.crypto.as_ref(),
 			pointer,
 			&old_blob,
+			&self.acknowledged_offsets_in_slab(pointer.slab_id),
 		)?);
 		let mut records = recover_slab_entries_from_blob(
 			&plaintext,

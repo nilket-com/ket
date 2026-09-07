@@ -5681,6 +5681,7 @@ async fn tiered_retention_rewrite_filters_partial_multirow_storage_records() {
 		mgr.config.crypto.as_ref(),
 		&rewritten_pointer,
 		&encrypted_bytes,
+		&BTreeSet::new(),
 	)
 	.unwrap();
 	let recovered =
@@ -6456,6 +6457,7 @@ async fn tiered_retention_rewrite_pair_gc_drops_data_and_row_tombstone() {
 		mgr.config.crypto.as_ref(),
 		&rewritten_pointer,
 		&encrypted_bytes,
+		&BTreeSet::new(),
 	)
 	.unwrap();
 	let recovered =
@@ -6599,6 +6601,7 @@ async fn tiered_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor(
 		mgr.config.crypto.as_ref(),
 		&rewritten_pointer,
 		&encrypted_bytes,
+		&BTreeSet::new(),
 	)
 	.unwrap();
 	let recovered =
@@ -6734,6 +6737,7 @@ async fn tiered_table_retention_rewrite_prunes_append_only_rows_when_cluster_ret
 		mgr.config.crypto.as_ref(),
 		&rewritten_pointer,
 		&encrypted_bytes,
+		&BTreeSet::new(),
 	)
 	.unwrap();
 	let recovered =
@@ -10694,8 +10698,13 @@ async fn decode_tiered_blob_rejects_footer_tenant_mismatch_with_payload_tenant()
 		supersession_metadata: SupersessionMetadata::None,
 	};
 
-	let err =
-		decode_tiered_blob(mgr.config.crypto.as_ref(), &pointer, &encrypted.bytes).unwrap_err();
+	let err = decode_tiered_blob(
+		mgr.config.crypto.as_ref(),
+		&pointer,
+		&encrypted.bytes,
+		&BTreeSet::new(),
+	)
+	.unwrap_err();
 	assert_eq!(err.kind(), ErrorKind::InvalidData);
 	assert!(
 		err.to_string().contains("footer tenant"),
@@ -12065,6 +12074,7 @@ impl SlabManager {
 			self.config.crypto.as_ref(),
 			pointer,
 			&old_blob,
+			&self.acknowledged_offsets_in_slab(pointer.slab_id),
 		)?);
 		let mut records =
 			recover_slab_entries_from_blob(&plaintext, pointer.slab_id, &BTreeSet::new())?
@@ -14784,5 +14794,56 @@ async fn recovery_without_the_durable_index_stops_at_the_first_anomaly() {
 		reopened.lookup(tenant(), key),
 		None,
 		"without boundary evidence the walk stops at the hole"
+	);
+}
+
+/// ADR 0099 decision 3, the reviewer's round trip: a sealed slab whose first
+/// reservation was dropped encrypts with the manager's evidence and must
+/// decode with it too. The decoder's tenant check walks the decrypted bytes,
+/// so it needs the same evidence to get past the leading hole; with none it
+/// finds no record and refuses a blob the node itself produced.
+#[tokio::test]
+async fn encrypted_slab_with_a_leading_hole_round_trips_with_evidence() {
+	let mgr = fresh_manager().await;
+	let (_, reservation) = mgr.target_for_append(16).await.unwrap();
+	drop(reservation);
+	mgr.append_durable(tenant(), id(0x99C0), hlc(160), b"durable-after-hole")
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	let plaintext = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &plaintext).unwrap();
+	let pointer = TieredSlabPointer {
+		slab_id,
+		l2_uri: format!("memory://tiered/{slab_id:016x}"),
+		payload_hash: crate::hash::content::digest(&encrypted.bytes),
+		is_encrypted: true,
+		tenant_id: Some(tenant()),
+		tenant_kek_id: Some(encrypted.tenant_kek_id),
+		stats_format_version: encrypted.stats_locator.map(|v| v.stats_format_version),
+		stats_block_len: encrypted.stats_locator.map(|v| v.stats_block_len),
+		stats_block_hash128: encrypted.stats_locator.map(|v| v.stats_block_hash128),
+		tombstone_metadata: TombstoneMetadata::None,
+		supersession_metadata: SupersessionMetadata::None,
+	};
+	let evidence = mgr.acknowledged_offsets_in_slab(slab_id);
+	let decoded = decode_tiered_blob(
+		mgr.config.crypto.as_ref(),
+		&pointer,
+		&encrypted.bytes,
+		&evidence,
+	)
+	.expect("a freshly encrypted slab with an acknowledged record after a hole decodes");
+	assert_eq!(decoded, plaintext);
+	let err = decode_tiered_blob(
+		mgr.config.crypto.as_ref(),
+		&pointer,
+		&encrypted.bytes,
+		&BTreeSet::new(),
+	)
+	.unwrap_err();
+	assert!(
+		err.to_string().contains("committed records"),
+		"without evidence the leading hole ends the tenant walk: {err}"
 	);
 }
