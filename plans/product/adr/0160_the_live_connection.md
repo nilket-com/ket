@@ -297,3 +297,25 @@ Agent identity and a permission model, when more than one agent or more
 than one person shares a window. The command-surface posture across the
 application - tables, cells, the editor - with this record and
 PRODUCT-0158 as its worked examples.
+
+## Action-cut implementation sequence
+
+The observe cut is implemented in `f01a67f3`; its real-window parity and
+validation are recorded in
+[`0160_the_live_connection_evidence.md`](../impl/0160_the_live_connection_evidence.md).
+The next cut completes the decisions above without adding a verb:
+
+1. Move the resolver and command dispatch into the application surface.
+   Preserve incarnation-to-pane attribution independently of load baselines
+   so retiring a baseline does not erase a stale token's replacement.
+2. Capture a publish job on update and execute its one assemble-and-write
+   path from the menu, headless driver, or live client. Preflight refusals
+   precede side effects; an execution failure reports the attempted root.
+3. Track resize completions on application state. The request's reply handle,
+   incarnation, original size, and deadline are the pending work, not an
+   outcome history. Disconnecting does not undo the dispatched divider drag.
+4. Add `act` with sequential script execution. A lost initial answer is
+   unknown; a received applied answer followed by a lost final answer is
+   applied with completion unknown. Neither case is replayed.
+5. Exercise gates 4–8, repeat the existing batch parity tests, and validate
+   both heads and the workspace before the local implementation commit.
