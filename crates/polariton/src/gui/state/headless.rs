@@ -8,18 +8,13 @@
 //! does, and publishes as the menu does. The driver on top of it is a client
 //! of this surface exactly as the window is.
 
-use super::{
-	AppState, Message, StartupTarget, new_with_authority, publish_request, resolve_startup, update,
-};
+use super::{AppState, Message, StartupTarget, new_with_authority, resolve_startup, update};
 use crate::configuration::StartupData;
 use crate::editor::{EditorMsg, HostPlotExport};
-use crate::gui::plot_pane::PlotPaneMsg;
-use crate::publication::{Package, PublishError};
 use iced::Task;
 use iced::futures::StreamExt;
 use iced_runtime::Action;
 use libaryon::engine::HostPanelId;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// How long the engine and the tasks may stay quiet before a settle reports
@@ -40,21 +35,6 @@ pub(crate) struct HeadlessApplication {
 impl HeadlessApplication {
 	pub(crate) fn describe_surface(&self) -> Vec<crate::driver::FigureDescription> {
 		self.state.describe_surface()
-	}
-
-	/// Open the application on `source` as `polariton <source>` would, with
-	/// the configured startup data, and run its startup tasks to completion.
-	pub(crate) fn open(source: &Path, startup: StartupData) -> Result<Self, String> {
-		let initial_file = source
-			.to_str()
-			.ok_or_else(|| format!("source path is not UTF-8: {}", source.display()))?
-			.to_owned();
-		Self::open_target(
-			StartupTarget::Ephemeral {
-				initial_file: Some(initial_file),
-			},
-			startup,
-		)
 	}
 
 	/// Open the application on any startup target the window accepts - an
@@ -86,35 +66,84 @@ impl HeadlessApplication {
 
 	/// PRODUCT-0158 §3: resize one host pane through the engine's own divider
 	/// drag and wait for the projection to carry the new size.
+	#[cfg(test)]
 	pub(crate) fn resize_pane(
 		&mut self,
 		panel_id: HostPanelId,
 		width: f32,
 		height: f32,
-		deadline: Duration,
+		_deadline: Duration,
 	) -> Result<(), String> {
-		let before = self
+		let token = self
 			.exports_with_identity()
-			.into_iter()
+			.iter()
 			.find(|(id, _, _)| *id == panel_id)
-			.map(|(_, _, export)| (export.width, export.height))
-			.ok_or_else(|| format!("panel {} has no export", panel_id.get()))?;
-		let moved = self
-			.state
-			.code_editor
-			.resize_host_pane(panel_id, width, height)?;
-		if !moved {
-			// The pane already has the cells this size resolves to; there is
-			// nothing to wait for.
-			return Ok(());
+			.map(|(_, incarnation, _)| incarnation.token().to_string())
+			.ok_or("pane is not projected")?;
+		let receipt = self.apply_command(&crate::driver::Command::Resize {
+			figure: crate::driver::FigureRef::Incarnation(token),
+			width,
+			height,
+		});
+		match receipt.refusal {
+			Some(refusal) => Err(format!("{refusal:?}")),
+			None => Ok(()),
 		}
-		self.settle_quiet(deadline, |state| {
-			state
-				.code_editor
-				.host_plot_exports_with_identity()
-				.iter()
-				.any(|(id, _, export)| *id == panel_id && (export.width, export.height) != before)
-		})
+	}
+
+	pub(crate) fn apply_command(
+		&mut self,
+		command: &crate::driver::Command,
+	) -> crate::driver::CommandReceipt {
+		use super::actions::{Pending, ResizeResult};
+		use crate::driver::{Failure, PublishRefusal, published_receipt};
+		let started = {
+			let _entered = self.runtime.enter();
+			self.state.start_command(command)
+		};
+		let mut receipt = started.receipt;
+		self.spawn(started.task);
+		self.state.capture_surface_baselines();
+		self.drain();
+		match started.pending {
+			None => {}
+			Some(Pending::Publish(job)) => {
+				let root = job.root.clone();
+				match job.run() {
+					Ok(package) => receipt.publish = Some(published_receipt(&root, &package)),
+					// The job ran; whatever it wrote stays where it is.
+					Err(error) => receipt.fail(Failure::Publish {
+						reason: PublishRefusal::from(&error),
+						root: root.display().to_string(),
+					}),
+				}
+			}
+			Some(Pending::Resize(resize)) => loop {
+				self.tick();
+				match self.state.resize_result(&resize, Instant::now()) {
+					ResizeResult::Waiting => std::thread::sleep(Duration::from_millis(10)),
+					ResizeResult::Completed(state) => {
+						receipt.state = Some(state);
+						break;
+					}
+					ResizeResult::Superseded(current) => {
+						receipt.fail(Failure::ResizeSuperseded {
+							figure: resize.incarnation.token().to_string(),
+							current,
+						});
+						break;
+					}
+					ResizeResult::Failed(state) => {
+						receipt.state = Some(state);
+						receipt.fail(Failure::ResizeDeadline {
+							figure: resize.incarnation.token().to_string(),
+						});
+						break;
+					}
+				}
+			},
+		}
+		receipt
 	}
 
 	/// Apply one message through the application's `update` and pump the
@@ -155,15 +184,6 @@ impl HeadlessApplication {
 		};
 		self.spawn(task);
 		self.drain();
-	}
-
-	/// PRODUCT-0158 §3: a pane message addressed to one host panel, the
-	/// message the legend sends.
-	pub(crate) fn plot_message(&mut self, panel_id: HostPanelId, message: PlotPaneMsg) {
-		self.dispatch(Message::CodeEditEvent(EditorMsg::HostPlot {
-			panel_id,
-			message,
-		}));
 	}
 
 	/// PRODUCT-0158 §2: run the focused buffer as the Run action does, then
@@ -288,16 +308,6 @@ impl HeadlessApplication {
 			}
 		}
 		Ok(())
-	}
-
-	/// PRODUCT-0158 §4: the menu's publish action, in the menu's order - the
-	/// witness, then the exports, then the request - through the one call the
-	/// menu makes.
-	pub(crate) fn publish(&mut self, directory: &Path) -> Result<Package, PublishError> {
-		let witness = self.state.code_editor.host_plot_publications();
-		let exports = self.state.code_editor.host_plot_exports();
-		let request = publish_request(&self.state);
-		crate::publication::assemble_and_write(&witness, exports, &request, directory)
 	}
 
 	pub(crate) fn exports_with_identity(

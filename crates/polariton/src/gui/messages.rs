@@ -60,6 +60,16 @@ impl std::fmt::Display for ExportFormat {
 
 #[derive(Clone)]
 pub enum Message {
+	#[cfg(unix)]
+	AgentTick(std::time::Instant),
+	#[cfg(unix)]
+	AgentPublishFinished {
+		id: u64,
+		reply: crate::live::transport::Reply,
+		receipt: crate::driver::CommandReceipt,
+		root: String,
+		result: Result<crate::driver::PublishReceipt, crate::driver::PublishRefusal>,
+	},
 	ToggleAgents,
 	#[cfg(unix)]
 	AgentInbound(crate::live::transport::Inbound),

@@ -1,10 +1,12 @@
 #[cfg(feature = "toron")]
 use crate::adapters::common::DatabaseAdapter;
 
+mod actions;
 #[cfg(unix)]
 mod agents;
 /// PRODUCT-0158: the application without a window.
 pub(crate) mod headless;
+mod publish;
 mod surface;
 use crate::adapters::{
 	common::{AdapterStage, ExecutionResult},
@@ -3814,6 +3816,11 @@ fn export_receipt_status(receipts: &[rune_host::ExportReceipt]) -> String {
 }
 
 fn begin_window_shutdown(_app_state: &mut AppState) -> Task<Message> {
+	#[cfg(unix)]
+	{
+		_app_state.agents.closing = true;
+		_app_state.agents.disable();
+	}
 	#[cfg(feature = "toron")]
 	{
 		if _app_state.closing_local_workspace {
@@ -3855,7 +3862,40 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 	match message {
 		#[cfg(unix)]
 		Message::AgentInbound(inbound) => {
-			app_state.agent_inbound(inbound);
+			return app_state.agent_inbound(inbound);
+		}
+		#[cfg(unix)]
+		Message::AgentTick(now) => {
+			app_state.finish_agent_resizes(now);
+			return Task::none();
+		}
+		#[cfg(unix)]
+		Message::AgentPublishFinished {
+			id,
+			reply,
+			mut receipt,
+			root,
+			result,
+		} => {
+			match result {
+				Ok(published) => {
+					receipt.publish = Some(published);
+					reply.answer(crate::live::Event::Completed { id, receipt });
+				}
+				Err(reason) => {
+					receipt.fail(crate::driver::Failure::Publish {
+						reason: reason.clone(),
+						root: root.clone(),
+					});
+					reply.answer(crate::live::Event::Failed {
+						id,
+						reason: "publish_failed".into(),
+						error: Some(reason),
+						root: Some(root),
+						receipt,
+					});
+				}
+			}
 			return Task::none();
 		}
 		Message::ToggleAgents => {
@@ -3880,7 +3920,9 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 	}
 	match message {
 		#[cfg(unix)]
-		Message::AgentInbound(_) => unreachable!(),
+		Message::AgentInbound(_) | Message::AgentTick(_) | Message::AgentPublishFinished { .. } => {
+			unreachable!()
+		}
 		Message::ToggleAgents => unreachable!(),
 		Message::ToggleStatusDetail => {
 			if app_state.status_detail.is_some() {
@@ -5688,22 +5730,20 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 				}
 				return Task::none();
 			}
-			// PRODUCT-0154 §7: the witness is captured before the exports are
-			// taken; a figure that republishes in between is refused.
-			let witness = app_state.code_editor.host_plot_publications();
-			let exports = app_state.code_editor.host_plot_exports();
-			let request = publish_request(app_state);
-			app_state.status_msg = format!("Publishing {} figures to {path}...", exports.len());
+			let job = match app_state.prepare_publish(std::path::Path::new(&path)) {
+				Ok(job) => job,
+				Err(error) => {
+					if let Some(prompt) = &mut app_state.publish_prompt {
+						prompt.error = Some(error.to_string());
+					}
+					return Task::none();
+				}
+			};
+			app_state.status_msg = format!("Publishing to {path}...");
 			return Task::perform(
 				async move {
 					tokio::task::spawn_blocking(move || -> std::result::Result<String, String> {
-						let package = crate::publication::assemble_and_write(
-							&witness,
-							exports,
-							&request,
-							std::path::Path::new(&path),
-						)
-						.map_err(|error| error.to_string())?;
+						let package = job.run().map_err(|error| error.to_string())?;
 						Ok(format!("{path} · {}", package.digest()))
 					})
 					.await
@@ -15206,7 +15246,7 @@ rows.views([
 		}
 	}
 
-	fn session() -> (Session, BufferId) {
+	pub(super) fn session() -> (Session, BufferId) {
 		let (mut state, startup) = new(StartupData::default(), None);
 		drop(startup);
 		let source_buffer = BufferId::new(80);
@@ -15249,6 +15289,343 @@ rows.views([
 		assert!(snapshot[0].loaded.hidden.is_empty());
 		assert_eq!(snapshot[0].loaded.size, snapshot[0].live.size);
 		assert!(snapshot[0].loaded.size.width > 0.0);
+	}
+
+	#[test]
+	fn product_0160_same_view_name_in_two_sources_requires_an_incarnation() {
+		let (mut session, _) = session();
+		for by_name in [true, false] {
+			let mut exports = session.application_mut().exports_with_identity();
+			exports[0].2.view_name = Some("shared-name".into());
+			let mut second = session.application_mut().exports_with_identity().remove(0);
+			second.2.view_name = Some("shared-name".into());
+			second.1 = crate::selection::SurfaceIncarnation::mint();
+			let token = second.1.token().to_string();
+			exports.push(second);
+			let reference = if by_name {
+				FigureRef::View("shared-name".into())
+			} else {
+				FigureRef::Incarnation(token)
+			};
+			let result = super::actions::resolve_figure(exports, &Default::default(), &reference);
+			if by_name {
+				assert!(
+					matches!(result, Err(Refusal::AmbiguousFigure { candidates, .. }) if candidates.len() == 2)
+				);
+			} else {
+				assert!(result.is_ok());
+			}
+		}
+	}
+
+	#[cfg(unix)]
+	fn live_command(session: &mut Session, command: Command, id: u64) -> Vec<crate::live::Event> {
+		let app = session.application_mut();
+		let (message, _sink, mut answers) = app.state().agent_request_for_test(command, id);
+		app.dispatch(message);
+		let mut events = Vec::new();
+		app.settle_until(Duration::from_secs(10), |_| {
+			while let Ok(event) = answers.try_recv() {
+				events.push(event);
+			}
+			events.iter().any(crate::live::Event::is_final)
+		})
+		.expect("request has a final answer");
+		events
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn product_0160_human_and_agent_hide_commute_on_the_legend_path() {
+		for human_first in [false, true] {
+			let (mut session, _) = session();
+			let root = session
+				.application_mut()
+				.state_mut()
+				.enable_agents_for_test();
+			let (panel, incarnation, export) =
+				session.application_mut().exports_with_identity().remove(0);
+			let widget = crate::publication::widget_for(&export, &export.settings_model);
+			let identity = widget.series_registry().identities()[1].clone();
+			let human = Message::CodeEditEvent(crate::editor::EditorMsg::HostPlot {
+				panel_id: panel,
+				message: PlotPaneMsg::SeriesVisibility(SeriesVisibilityAction::Hide(identity)),
+			});
+			if human_first {
+				session.application_mut().dispatch(human.clone());
+			}
+			let events = live_command(
+				&mut session,
+				Command::Hide {
+					figure: FigureRef::Incarnation(incarnation.token().to_string()),
+					series: 1,
+				},
+				1,
+			);
+			assert!(matches!(
+				&events[0],
+				crate::live::Event::Applied { terminal: true, .. }
+			));
+			if !human_first {
+				session.application_mut().dispatch(human);
+			}
+			let figures = session.application_mut().describe_surface();
+			assert_eq!(figures[0].live.hidden, vec![1]);
+			assert!(figures[0].loaded.hidden.is_empty());
+			drop(session);
+			std::fs::remove_dir_all(root).unwrap();
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn product_0160_live_actions_and_publish_share_batch_receipts() {
+		use crate::live::Event;
+		let (mut session, _) = session();
+		let root = session
+			.application_mut()
+			.state_mut()
+			.enable_agents_for_test();
+		let token = session.loaded()[0].figure.clone();
+		for (id, command) in [
+			Command::Hide {
+				figure: FigureRef::Incarnation(token.clone()),
+				series: 1,
+			},
+			Command::Show {
+				figure: FigureRef::Incarnation(token.clone()),
+				series: 1,
+			},
+			Command::Isolate {
+				figure: FigureRef::Incarnation(token.clone()),
+				series: 2,
+			},
+			Command::Restore {
+				figure: FigureRef::Incarnation(token.clone()),
+			},
+			Command::Describe {},
+		]
+		.into_iter()
+		.enumerate()
+		{
+			let events = live_command(&mut session, command.clone(), id as u64 + 1);
+			let Event::Applied {
+				terminal: true,
+				receipt,
+				..
+			} = &events[0]
+			else {
+				panic!("{events:?}")
+			};
+			// Each verb is idempotent here. The batch call reports exactly the
+			// same state and shape from the same shared action path.
+			assert_eq!(*receipt, session.apply(&command));
+		}
+		let events = live_command(
+			&mut session,
+			Command::Hide {
+				figure: FigureRef::Incarnation(token),
+				series: 99,
+			},
+			10,
+		);
+		assert!(
+			matches!(&events[0], Event::Refused { receipt: Some(receipt), .. } if matches!(receipt.refusal, Some(Refusal::UnknownSeries { .. })))
+		);
+		let live_root = root.join("live-package");
+		let batch_root = root.join("batch-package");
+		let events = live_command(
+			&mut session,
+			Command::Publish {
+				directory: live_root.display().to_string(),
+			},
+			11,
+		);
+		assert!(matches!(
+			&events[0],
+			Event::Applied {
+				terminal: false,
+				..
+			}
+		));
+		let Event::Completed { receipt, .. } = events.last().unwrap() else {
+			panic!("{events:?}")
+		};
+		let live = receipt.publish.as_ref().unwrap();
+		let batch = session
+			.apply(&Command::Publish {
+				directory: batch_root.display().to_string(),
+			})
+			.publish
+			.unwrap();
+		assert_eq!(live.digest, batch.digest);
+		assert_eq!(live.figures, batch.figures);
+		for file in walk(&live_root) {
+			let relative = file.strip_prefix(&live_root).unwrap();
+			if relative != std::path::Path::new("manifest.json") {
+				assert_eq!(
+					std::fs::read(&file).unwrap(),
+					std::fs::read(batch_root.join(relative)).unwrap()
+				);
+			}
+		}
+		// A real write failure after admission reports the attempted root.
+		let blocked = root.join("regular-file");
+		std::fs::write(&blocked, "occupied").unwrap();
+		let attempted = blocked.join("package");
+		let events = live_command(
+			&mut session,
+			Command::Publish {
+				directory: attempted.display().to_string(),
+			},
+			12,
+		);
+		assert!(matches!(
+			&events[0],
+			Event::Applied {
+				terminal: false,
+				..
+			}
+		));
+		assert!(
+			matches!(events.last().unwrap(), Event::Failed { root: Some(actual), .. } if actual == &attempted.display().to_string())
+		);
+		drop(session);
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn product_0160_resize_finishes_supersedes_and_survives_disconnect() {
+		use crate::live::Event;
+		let (mut session, buffer) = session();
+		let root = session
+			.application_mut()
+			.state_mut()
+			.enable_agents_for_test();
+		let initial = session.loaded()[0].clone();
+		let command = |width, height| Command::Resize {
+			figure: FigureRef::Incarnation(initial.figure.clone()),
+			width,
+			height,
+		};
+		let events = live_command(
+			&mut session,
+			command(initial.size.width, initial.size.height),
+			1,
+		);
+		assert!(matches!(&events[0], Event::Applied { terminal: true, .. }));
+		let events = live_command(
+			&mut session,
+			command(initial.size.width, initial.size.height / 2.0),
+			2,
+		);
+		assert!(
+			matches!(
+				&events[0],
+				Event::Applied {
+					terminal: false,
+					..
+				}
+			),
+			"{events:?}"
+		);
+		assert!(
+			matches!(events.last().unwrap(), Event::Completed { receipt, .. } if receipt.state.as_ref().unwrap().size.height != initial.size.height)
+		);
+		let app = session.application_mut();
+		let before = app.describe_surface()[0].size;
+		let (message, sink, mut answers) = app
+			.state()
+			.agent_request_for_test(command(before.width, before.height / 2.0), 3);
+		drop(super::update(app.state_mut(), message));
+		assert!(matches!(
+			answers.try_recv().unwrap(),
+			Event::Applied {
+				terminal: false,
+				..
+			}
+		));
+		sink.close("test disconnect");
+		app.settle_until(Duration::from_secs(10), |state| {
+			state.describe_surface()[0].size.height != before.height
+		})
+		.unwrap();
+		// Admission has sent a drag, but its projection has not been consumed.
+		let before = app.describe_surface()[0].size;
+		let (message, _sink, mut answers) = app
+			.state()
+			.agent_request_for_test(command(before.width, before.height + 100.0), 4);
+		drop(super::update(app.state_mut(), message));
+		assert!(matches!(
+			answers.try_recv().unwrap(),
+			Event::Applied {
+				terminal: false,
+				..
+			}
+		));
+		run_source(app.state_mut(), buffer, 2);
+		drop(super::update(
+			app.state_mut(),
+			Message::AgentTick(std::time::Instant::now()),
+		));
+		assert!(
+			matches!(answers.try_recv().unwrap(), Event::Superseded { current: Some(current), .. } if current != initial.figure)
+		);
+		let events = live_command(
+			&mut session,
+			Command::Hide {
+				figure: FigureRef::Incarnation(initial.figure),
+				series: 0,
+			},
+			5,
+		);
+		assert!(
+			matches!(&events[0], Event::Refused { receipt: Some(receipt), .. } if matches!(receipt.refusal, Some(Refusal::StaleFigure { .. })))
+		);
+		drop(session);
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn product_0160_resize_deadline_reports_observed_size_without_rollback() {
+		use crate::live::Event;
+		let (mut session, _) = session();
+		let root = session
+			.application_mut()
+			.state_mut()
+			.enable_agents_for_test();
+		let initial = session.loaded()[0].clone();
+		let app = session.application_mut();
+		let (message, _sink, mut answers) = app.state().agent_request_for_test(
+			Command::Resize {
+				figure: FigureRef::Incarnation(initial.figure),
+				width: initial.size.width,
+				height: initial.size.height + 100.0,
+			},
+			1,
+		);
+		drop(super::update(app.state_mut(), message));
+		assert!(matches!(
+			answers.try_recv().unwrap(),
+			Event::Applied {
+				terminal: false,
+				..
+			}
+		));
+		// Do not poll the engine: no new size has been observed. Advance only
+		// the completion clock, the same path the live timer delivers.
+		drop(super::update(
+			app.state_mut(),
+			Message::AgentTick(std::time::Instant::now() + Duration::from_secs(6)),
+		));
+		assert!(
+			matches!(answers.try_recv().unwrap(), Event::Failed { reason, receipt, .. }
+			if reason == "resize_deadline" && receipt.state.as_ref().unwrap().size == initial.size)
+		);
+		drop(session);
+		std::fs::remove_dir_all(root).unwrap();
 	}
 
 	/// PRODUCT-0158 gates 2 and 3: the loaded state carries no hidden set, the
@@ -15574,6 +15951,89 @@ rows.views([
 		assert!(figure.loaded.hidden.is_empty());
 		assert_eq!(figure.loaded.size, figure.live.size);
 		assert!(figure.live.size.width > 0.0);
+	}
+
+	/// PRODUCT-0160 §4 on the batch receipt: a resize the engine clamps to
+	/// nothing runs and reaches its deadline, so the receipt says `failed`
+	/// with the observed size, not `refused`, which means nothing ran.
+	#[test]
+	fn product_0160_batch_resize_deadline_is_a_failure_with_the_observed_size() {
+		let (mut session, _) = session();
+		let loaded = session.loaded()[0].clone();
+		let figure = FigureRef::Incarnation(loaded.figure.clone());
+		// The harness pane has a vertical neighbour only, so ask for a height
+		// the engine clamps; the first request moves the divider as far as it
+		// goes, the second moves nothing and runs out its deadline.
+		let huge = |figure: FigureRef| Command::Resize {
+			figure,
+			width: loaded.size.width,
+			height: 100_000.0,
+		};
+		let first = session.apply(&huge(figure.clone()));
+		assert!(first.refusal.is_none(), "{:?}", first.refusal);
+		let described = session.apply(&Command::Describe {});
+		let clamped = described.figures.expect("figures")[0].live.size;
+		let second = session.apply(&huge(figure));
+		assert_eq!(second.outcome, Outcome::Failed);
+		assert!(matches!(
+			second.failure,
+			Some(crate::driver::Failure::ResizeDeadline { .. })
+		));
+		assert!(second.refusal.is_none());
+		assert_eq!(second.state.expect("observed state").size, clamped);
+	}
+
+	/// PRODUCT-0160 §4 on the batch receipt: a publish whose job ran and
+	/// whose write did not finish says `failed` with the root it attempted;
+	/// a publish that never ran still says `refused`.
+	#[test]
+	fn product_0160_batch_publish_write_failure_is_a_failure_with_the_root() {
+		let (mut session, _) = session();
+		let scratch = std::env::temp_dir().join(format!(
+			"polariton-0160-batch-fail-{}-{}",
+			std::process::id(),
+			crate::selection::SurfaceIncarnation::mint().token()
+		));
+		std::fs::create_dir_all(&scratch).expect("scratch");
+		let blocker = scratch.join("not-a-directory");
+		std::fs::write(&blocker, b"x").expect("blocker");
+		let root = blocker.join("package");
+		let receipt = session.apply(&Command::Publish {
+			directory: root.display().to_string(),
+		});
+		assert_eq!(receipt.outcome, Outcome::Failed);
+		assert!(receipt.publish.is_none());
+		assert!(receipt.refusal.is_none());
+		let Some(crate::driver::Failure::Publish {
+			root: attempted, ..
+		}) = receipt.failure
+		else {
+			panic!("{:?}", receipt.failure);
+		};
+		assert_eq!(attempted, root.display().to_string());
+		let refused = session.apply(&Command::Publish {
+			directory: String::new(),
+		});
+		assert_eq!(refused.outcome, Outcome::Refused);
+		assert!(refused.failure.is_none());
+		std::fs::remove_dir_all(&scratch).ok();
+	}
+
+	/// PRODUCT-0160 §4: a successful receipt and a refused receipt serialize
+	/// exactly as before the `failed` outcome existed.
+	#[test]
+	fn product_0160_applied_and_refused_receipts_are_unchanged_by_failed() {
+		let (mut session, _) = session();
+		let figure = FigureRef::Incarnation(session.loaded()[0].figure.clone());
+		let applied = session.apply(&Command::Hide {
+			figure: figure.clone(),
+			series: 0,
+		});
+		assert_eq!(applied.outcome, Outcome::Applied);
+		assert!(applied.failure.is_none() && applied.refusal.is_none());
+		let refused = session.apply(&Command::Hide { figure, series: 9 });
+		assert_eq!(refused.outcome, Outcome::Refused);
+		assert!(refused.failure.is_none() && refused.refusal.is_some());
 	}
 
 	fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {

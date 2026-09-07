@@ -47,55 +47,66 @@ pub(crate) fn windows() -> Result<(), String> {
 	Ok(())
 }
 
-pub(crate) fn observe(selector: &Selector) -> Result<(), String> {
+async fn connect(
+	selector: &Selector,
+) -> Result<(tokio::io::BufReader<tokio::net::UnixStream>, Event), String> {
 	let windows =
 		discover(&runtime_directory().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
 	let window = select(&windows, selector)?;
-	let runtime = tokio::runtime::Builder::new_current_thread()
+	let socket = tokio::net::UnixStream::connect(&window.socket)
+		.await
+		.map_err(|e| format!("cannot connect to window {}: {e}", window.window))?;
+	if !socket
+		.peer_cred()
+		.is_ok_and(|peer| peer.uid() == super::discovery::uid())
+	{
+		return Err("window peer belongs to another user".into());
+	}
+	let mut reader = tokio::io::BufReader::new(socket);
+	let first = tokio::time::timeout(
+		std::time::Duration::from_secs(5),
+		super::transport::read_line(&mut reader, usize::MAX),
+	)
+	.await
+	.map_err(|_| "window handshake timed out")?
+	.map_err(|e| e.to_string())?
+	.ok_or("window disconnected before its identity arrived")?;
+	let welcome: Event = super::decode(&first)?;
+	match &welcome {
+		Event::Welcome { window: actual, .. }
+			if actual.window == window.window
+				&& actual.pid == window.pid
+				&& actual.process_start == window.process_start => {}
+		_ => return Err("window identity changed during connection; discover again".into()),
+	}
+	Ok((reader, welcome))
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime, String> {
+	tokio::runtime::Builder::new_current_thread()
 		.enable_all()
 		.build()
-		.map_err(|e| e.to_string())?;
-	runtime.block_on(async {
-		let socket = tokio::net::UnixStream::connect(&window.socket)
-			.await
-			.map_err(|e| format!("cannot connect to window {}: {e}", window.window))?;
-		if !socket
-			.peer_cred()
-			.is_ok_and(|peer| peer.uid() == super::discovery::uid())
-		{
-			return Err("window peer belongs to another user".into());
-		}
-		let mut reader = tokio::io::BufReader::new(socket);
-		let first = tokio::time::timeout(
-			std::time::Duration::from_secs(5),
-			super::transport::read_line(&mut reader, usize::MAX),
-		)
-		.await
-		.map_err(|_| "window handshake timed out")?
-		.map_err(|e| e.to_string())?
-		.ok_or("window disconnected before its identity arrived")?;
-		let welcome: Event = super::decode(&first)?;
-		match &welcome {
-			Event::Welcome { window: actual, .. }
-				if actual.window == window.window
-					&& actual.pid == window.pid
-					&& actual.process_start == window.process_start => {}
-			_ => return Err("window identity changed during connection; discover again".into()),
-		}
+		.map_err(|e| e.to_string())
+}
+
+fn emit(output: &mut impl Write, event: &Event) -> Result<(), String> {
+	output
+		.write_all(&super::encode(event)?)
+		.and_then(|()| output.flush())
+		.map_err(|e| e.to_string())
+}
+
+pub(crate) fn observe(selector: &Selector) -> Result<(), String> {
+	runtime()?.block_on(async {
+		let (mut reader, welcome) = connect(selector).await?;
 		let mut output = io::stdout().lock();
-		output
-			.write_all(&first)
-			.and_then(|()| output.flush())
-			.map_err(|e| e.to_string())?;
+		emit(&mut output, &welcome)?;
 		while let Some(line) = super::transport::read_line(&mut reader, usize::MAX)
 			.await
 			.map_err(|e| e.to_string())?
 		{
 			let event: Event = super::decode(&line)?;
-			output
-				.write_all(&line)
-				.and_then(|()| output.flush())
-				.map_err(|e| e.to_string())?;
+			emit(&mut output, &event)?;
 			if matches!(event, Event::Closed { .. }) {
 				return Ok(());
 			}
@@ -104,9 +115,302 @@ pub(crate) fn observe(selector: &Selector) -> Result<(), String> {
 	})
 }
 
+pub(crate) fn act_arguments(
+	args: impl Iterator<Item = String>,
+) -> Result<(Selector, std::path::PathBuf), String> {
+	let mut remaining = Vec::new();
+	let mut file = None;
+	let mut args = args.peekable();
+	while let Some(arg) = args.next() {
+		if arg == "--commands" {
+			if file.is_some() {
+				return Err("--commands may occur only once".into());
+			}
+			file = Some(std::path::PathBuf::from(
+				args.next().ok_or("--commands requires a file")?,
+			));
+		} else if arg == "--source" || arg == "--session" {
+			remaining.push(arg);
+			remaining.push(args.next().ok_or("window selector requires a value")?);
+		} else {
+			remaining.push(arg);
+		}
+	}
+	Ok((
+		selector(remaining.into_iter())?,
+		file.ok_or("act requires --commands <file>")?,
+	))
+}
+
+pub(crate) fn act(selector: &Selector, commands: &std::path::Path) -> Result<(), String> {
+	// Parse and enforce wire sizes before the first connection is opened.
+	let script = crate::driver::read_commands(commands)?;
+	let lines = script
+		.commands
+		.iter()
+		.enumerate()
+		.map(|(i, command)| {
+			let bytes = super::encode(&super::Request {
+				id: i as u64 + 1,
+				command: command.clone(),
+			})?;
+			if bytes.len() > super::MAX_LINE {
+				Err(format!(
+					"command {} exceeds the 64 KiB request limit",
+					i + 1
+				))
+			} else {
+				Ok(bytes)
+			}
+		})
+		.collect::<Result<Vec<_>, String>>()?;
+	runtime()?.block_on(async {
+		let (mut reader, welcome) = connect(selector).await?;
+		let mut output = io::stdout().lock();
+		emit(&mut output, &welcome)?;
+		drive_connection(&mut reader, &lines, |event| emit(&mut output, event)).await
+	})
+}
+
+async fn drive_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+	reader: &mut tokio::io::BufReader<S>,
+	lines: &[Vec<u8>],
+	mut output: impl FnMut(&Event) -> Result<(), String>,
+) -> Result<(), String> {
+	use tokio::io::AsyncWriteExt;
+	let mut failed = false;
+	for (i, bytes) in lines.iter().enumerate() {
+		let id = i as u64 + 1;
+		let mut applied = false;
+		let result: Result<(), String> = async {
+			reader
+				.get_mut()
+				.write_all(bytes)
+				.await
+				.map_err(|e| e.to_string())?;
+			loop {
+				let line = super::transport::read_line(reader, usize::MAX)
+					.await
+					.map_err(|e| e.to_string())?
+					.ok_or("window disconnected")?;
+				let event: Event = super::decode(&line)?;
+				output(&event)?;
+				if matches!(event, Event::Closed { .. }) {
+					return Err("window closed".into());
+				}
+				if let Some(answer_id) = event.id() {
+					if answer_id != id {
+						return Err("answer named a different request".into());
+					}
+					if matches!(event, Event::Applied { .. }) {
+						applied = true;
+					}
+					if event.is_final() {
+						failed |= matches!(
+							event,
+							Event::Refused { .. } | Event::Failed { .. } | Event::Superseded { .. }
+						);
+						return Ok(());
+					}
+				}
+			}
+		}
+		.await;
+		if let Err(reason) = result {
+			output(&Event::Unknown {
+				id,
+				applied,
+				reason,
+			})?;
+			return Err(if applied {
+				"request applied; completion unknown; not replayed"
+			} else {
+				"request outcome unknown; not replayed"
+			}
+			.into());
+		}
+	}
+	if failed {
+		Err("one or more commands were refused, failed, or superseded; see receipts".into())
+	} else {
+		Ok(())
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::driver::{Command, CommandReceipt, FigureRef};
+	use tokio::io::{AsyncWriteExt, BufReader};
+
+	#[tokio::test]
+	async fn product_0160_script_waits_for_final_answers_and_does_not_replay_unknowns() {
+		for applied_before_disconnect in [false, true] {
+			let (client, server) = tokio::io::duplex(65536);
+			let commands = [
+				Command::Resize {
+					figure: FigureRef::View("plot".into()),
+					width: 360.0,
+					height: 360.0,
+				},
+				Command::Describe {},
+			];
+			let lines = commands
+				.iter()
+				.enumerate()
+				.map(|(i, command)| {
+					super::super::encode(&super::super::Request {
+						id: i as u64 + 1,
+						command: command.clone(),
+					})
+					.unwrap()
+				})
+				.collect::<Vec<_>>();
+			let first_command = commands[0].clone();
+			let server = tokio::spawn(async move {
+				let mut server = BufReader::new(server);
+				let first = super::super::transport::read_line(&mut server, super::super::MAX_LINE)
+					.await
+					.unwrap()
+					.unwrap();
+				assert_eq!(
+					super::super::decode::<super::super::Request>(&first)
+						.unwrap()
+						.id,
+					1
+				);
+				if applied_before_disconnect {
+					server
+						.get_mut()
+						.write_all(
+							&super::super::encode(&Event::Applied {
+								id: 1,
+								terminal: false,
+								receipt: CommandReceipt::new(&first_command),
+							})
+							.unwrap(),
+						)
+						.await
+						.unwrap();
+				}
+				// No second command may arrive after a nonterminal applied.
+				assert!(
+					tokio::time::timeout(
+						std::time::Duration::from_millis(30),
+						super::super::transport::read_line(&mut server, super::super::MAX_LINE)
+					)
+					.await
+					.is_err()
+				);
+			});
+			let mut events = Vec::new();
+			let result = drive_connection(&mut BufReader::new(client), &lines, |event| {
+				events.push(event.clone());
+				Ok(())
+			})
+			.await;
+			server.await.unwrap();
+			assert!(result.is_err());
+			assert!(
+				matches!(events.last().unwrap(), Event::Unknown { id: 1, applied, .. } if *applied == applied_before_disconnect)
+			);
+			assert!(!events.iter().any(|event| event.id() == Some(2)));
+		}
+	}
+
+	#[tokio::test]
+	async fn product_0160_script_advances_after_completion_or_satisfied_resize() {
+		for immediate in [false, true] {
+			let (client, server) = tokio::io::duplex(65536);
+			let commands = [
+				Command::Resize {
+					figure: FigureRef::View("plot".into()),
+					width: 360.0,
+					height: 360.0,
+				},
+				Command::Describe {},
+			];
+			let lines = commands
+				.iter()
+				.enumerate()
+				.map(|(i, command)| {
+					super::super::encode(&super::super::Request {
+						id: i as u64 + 1,
+						command: command.clone(),
+					})
+					.unwrap()
+				})
+				.collect::<Vec<_>>();
+			let server = tokio::spawn(async move {
+				let mut server = BufReader::new(server);
+				for (i, command) in commands.iter().enumerate() {
+					let line =
+						super::super::transport::read_line(&mut server, super::super::MAX_LINE)
+							.await
+							.unwrap()
+							.unwrap();
+					let request: super::super::Request = super::super::decode(&line).unwrap();
+					assert_eq!(request.id, i as u64 + 1);
+					let receipt = CommandReceipt::new(command);
+					server
+						.get_mut()
+						.write_all(
+							&super::super::encode(&Event::Applied {
+								id: request.id,
+								terminal: immediate || i > 0,
+								receipt: receipt.clone(),
+							})
+							.unwrap(),
+						)
+						.await
+						.unwrap();
+					if i == 0 && !immediate {
+						assert!(
+							tokio::time::timeout(
+								std::time::Duration::from_millis(30),
+								super::super::transport::read_line(
+									&mut server,
+									super::super::MAX_LINE
+								)
+							)
+							.await
+							.is_err()
+						);
+						server
+							.get_mut()
+							.write_all(
+								&super::super::encode(&Event::Completed {
+									id: request.id,
+									receipt,
+								})
+								.unwrap(),
+							)
+							.await
+							.unwrap();
+					}
+				}
+			});
+			drive_connection(&mut BufReader::new(client), &lines, |_| Ok(()))
+				.await
+				.unwrap();
+			server.await.unwrap();
+		}
+	}
+
+	#[test]
+	fn product_0160_act_accepts_one_selector_and_one_script() {
+		let parse = |args: &[&str]| act_arguments(args.iter().map(|s| s.to_string()));
+		assert_eq!(
+			parse(&["--commands", "commands.json", "--source", "showcase.rn"]).unwrap(),
+			(
+				Selector::Source("showcase.rn".into()),
+				"commands.json".into()
+			)
+		);
+		assert!(parse(&["window"]).is_err());
+		assert!(parse(&["window", "--commands", "a", "--commands", "b"]).is_err());
+		assert!(parse(&["window", "--commands", "a", "second-window"]).is_err());
+	}
 	#[test]
 	fn product_0160_window_selection_is_explicit() {
 		let parse = |args: &[&str]| selector(args.iter().map(|s| s.to_string()));

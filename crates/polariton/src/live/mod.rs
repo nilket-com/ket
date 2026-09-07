@@ -21,6 +21,12 @@ pub(crate) struct Request {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum Event {
+	/// Client-only report. Never a server acknowledgement or replay record.
+	Unknown {
+		id: u64,
+		applied: bool,
+		reason: String,
+	},
 	Welcome {
 		window: discovery::Advertisement,
 		generation: u64,
@@ -47,6 +53,8 @@ pub(crate) enum Event {
 	},
 	Failed {
 		id: u64,
+		error: Option<crate::driver::PublishRefusal>,
+		root: Option<String>,
 		reason: String,
 		receipt: CommandReceipt,
 	},

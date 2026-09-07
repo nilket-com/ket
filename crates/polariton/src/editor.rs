@@ -2463,7 +2463,7 @@ impl CodeEditor {
 					before: pane.pane_id,
 					after: other.pane_id,
 					axis: SplitDirection::Vertical,
-					target: left + columns,
+					target: left.saturating_add(columns),
 				},
 				(None, Some(other)) => EditorCommand::ResizePaneBoundary {
 					before: other.pane_id,
@@ -2494,7 +2494,7 @@ impl CodeEditor {
 					before: pane.pane_id,
 					after: other.pane_id,
 					axis: SplitDirection::Horizontal,
-					target: top + rows,
+					target: top.saturating_add(rows),
 				},
 				(None, Some(other)) => EditorCommand::ResizePaneBoundary {
 					before: other.pane_id,
@@ -2508,8 +2508,13 @@ impl CodeEditor {
 			});
 		}
 		let moved = !commands.is_empty();
-		for command in commands {
+		for (index, command) in commands.into_iter().enumerate() {
 			if !self.send(command) {
+				// A prior axis was already dispatched. Its outcome must be
+				// observed, never labelled a refusal that ran nothing.
+				if index > 0 {
+					return Ok(true);
+				}
 				return Err("the editor engine refused the resize".to_owned());
 			}
 		}

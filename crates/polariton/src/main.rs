@@ -47,6 +47,10 @@ fn main() -> gui::Result {
 		ApplicationAction::Windows => live::client::windows().map_err(Into::into),
 		#[cfg(unix)]
 		ApplicationAction::Observe(selector) => live::client::observe(&selector).map_err(Into::into),
+		#[cfg(unix)]
+		ApplicationAction::Act { selector, commands } => {
+			live::client::act(&selector, &commands).map_err(Into::into)
+		}
 		ApplicationAction::GuiAgents(startup_target) => {
 			ensure_rustls_provider();
 			gui::run(configuration::load_startup_data(), startup_target, true)
@@ -82,6 +86,11 @@ enum ApplicationAction {
 	Windows,
 	#[cfg(unix)]
 	Observe(live::discovery::Selector),
+	#[cfg(unix)]
+	Act {
+		selector: live::discovery::Selector,
+		commands: std::path::PathBuf,
+	},
 	ListSessions,
 	/// PRODUCT-0154 §9: `polariton serve <package> [--bind host:port]`.
 	Serve {
@@ -117,6 +126,12 @@ where
 			return Err("windows takes no arguments".into());
 		}
 		return Ok(ApplicationAction::Windows);
+	}
+	#[cfg(unix)]
+	if args.peek().is_some_and(|arg| arg == "act") {
+		args.next();
+		let (selector, commands) = live::client::act_arguments(args)?;
+		return Ok(ApplicationAction::Act { selector, commands });
 	}
 	#[cfg(unix)]
 	if args.peek().is_some_and(|arg| arg == "observe") {

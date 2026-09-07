@@ -105,10 +105,21 @@ polariton observe --source uat/plot_fixtures_showcase.rn
 Observation prints a welcome containing the loaded/live figure descriptions,
 then changes until the connection closes. Use `observe <window-id>` when
 more than one window has the source open, or `observe --session <id>` for a
-saved window. Accepting agents is off by default. The observe cut refuses
-action verbs; the existing headless `drive` remains available.
+saved window. Accepting agents is off by default. To run the fixture actions
+in that same window, using a fresh publish directory:
 
-Release, deliberately: a debug build multiplies mark preparation by tens.
+```sh
+polariton act --source uat/plot_fixtures_showcase.rn \
+  --commands uat/plot_fixtures_showcase.commands.json > live-receipts.ndjson
+```
+
+`act` uses the same verbs as `drive` and waits for resize and publish to
+finish before advancing. A lost reply is reported as unknown and is never
+replayed automatically. A changed incarnation refuses the old token; view
+names resolve at command time and refuse if more than one figure matches.
+
+Use a release build for interactive UAT: a debug build multiplies mark
+preparation by tens.
 Since PRODUCT-0159 the scatter arms batch one fill per mark instead of one
 compound path, so the million points arrive without resizing the pane; the
 desktop's worst unserviced tick during that build measured about 260 ms in

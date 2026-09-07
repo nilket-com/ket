@@ -10,6 +10,7 @@ use std::collections::HashMap;
 #[derive(Default)]
 pub(super) struct Surface {
 	baselines: HashMap<u64, LiveState>,
+	pub(super) known: HashMap<u64, u64>,
 }
 
 impl AppState {
@@ -18,7 +19,8 @@ impl AppState {
 		self.surface
 			.baselines
 			.retain(|token, _| current.contains(token));
-		for (_, incarnation, export) in self.code_editor.host_plot_exports_with_identity() {
+		for (panel, incarnation, export) in self.code_editor.host_plot_exports_with_identity() {
+			self.surface.known.insert(incarnation.token(), panel.get());
 			self.surface
 				.baselines
 				.entry(incarnation.token())

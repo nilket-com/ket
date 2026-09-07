@@ -1,6 +1,8 @@
 # ADR 0160: the live connection
 
-Status: proposed 2026-09-07. Application lane, second record; it consumes
+Status: accepted 2026-09-07 on the evidence in
+`plans/product/impl/0160_the_live_connection_evidence.md`. Application lane,
+second record; it consumes
 PRODUCT-0158 without changing its verbs or its receipt, and PRODUCT-0156 §6's
 posture that actions are the surface and the legend is one client of it.
 PRODUCT-0158 gave an agent the application in batch: open a source or a
@@ -100,6 +102,12 @@ carrying the old token is refused with the current one; a view name resolves
 to whatever stands in the pane now. The person's edits are never merged
 with an agent's command, because there is nothing to merge: both are
 messages in one queue.
+
+An authored view name must identify exactly one live figure in the window.
+Two open sources may author the same name; that reference refuses as
+`ambiguous_figure` with their incarnation tokens rather than choosing the
+first pane. An incarnation reference remains exact. This was grounded during
+the action cut, where a running window can retain results from several sources.
 
 The driver's session logic moves from the headless application onto the
 application state itself, and the headless application and the live

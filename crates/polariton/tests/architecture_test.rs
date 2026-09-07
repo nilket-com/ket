@@ -6666,8 +6666,9 @@ fn rune_authoring_resolves_layouts_without_building_kernels() {
 /// model, and no package: it reads exports through the publisher's own
 /// widget, series-table, and inspector seams, sends the pane message the
 /// legend sends, and publishes through the one call the menu makes. The
-/// positive control is that call itself: the menu's handler and the headless
-/// publish both name it, and nothing else in the GUI assembles a package.
+/// positive control is PRODUCT-0160's captured publish job: the menu and
+/// command dispatcher prepare it, both transports execute it, and only that
+/// owner calls assemble-and-write.
 #[test]
 fn product_0158_driver_and_headless_application_hold_no_authority() {
 	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -6675,6 +6676,9 @@ fn product_0158_driver_and_headless_application_hold_no_authority() {
 	let headless =
 		std::fs::read_to_string(src.join("gui/state/headless.rs")).expect("read headless.rs");
 	let state = std::fs::read_to_string(src.join("gui/state.rs")).expect("read gui/state.rs");
+	let actions = std::fs::read_to_string(src.join("gui/state/actions.rs")).unwrap();
+	let publisher = std::fs::read_to_string(src.join("gui/state/publish.rs")).unwrap();
+	let agents = std::fs::read_to_string(src.join("gui/state/agents.rs")).unwrap();
 
 	let production = driver
 		.split("#[cfg(test)]\nmod tests {")
@@ -6708,8 +6712,7 @@ fn product_0158_driver_and_headless_application_hold_no_authority() {
 		"series_table(",
 		"inspector_rows(",
 		"scatter_render_mode(",
-		"PlotPaneMsg::SeriesVisibility(",
-		"exports_with_identity()",
+		"self.application.apply_command(command)",
 	] {
 		assert!(
 			production.contains(required),
@@ -6730,25 +6733,38 @@ fn product_0158_driver_and_headless_application_hold_no_authority() {
 	for required in [
 		"new_with_authority(",
 		"update(&mut self.state, message)",
-		"EditorMsg::HostPlot",
 		"Message::Run",
-		"host_plot_publications()",
-		"publish_request(&self.state)",
-		"crate::publication::assemble_and_write(",
+		"self.state.start_command(command)",
 	] {
 		assert!(
 			headless.contains(required),
 			"PRODUCT-0158 gate 6: headless.rs no longer goes through {required:?}"
 		);
 	}
+	assert!(agents.contains("self.start_command(&request.command)"));
+	assert!(actions.contains("fn resolve(&self, figure:"));
+	assert!(actions.contains("PlotPaneMsg::SeriesVisibility(action)"));
+	assert!(actions.contains(".resize_host_pane("));
 	assert!(
-		state.contains("crate::publication::assemble_and_write("),
-		"positive control: the menu's publish handler goes through assemble_and_write"
+		actions
+			.split_whitespace()
+			.collect::<String>()
+			.contains("self.prepare_publish(")
 	);
-	assert!(
-		!state.contains("crate::publication::assemble("),
-		"the menu's publish handler must not assemble apart from the write"
+	assert!(state.contains("app_state.prepare_publish("));
+	assert_eq!(
+		publisher
+			.matches("crate::publication::assemble_and_write(")
+			.count(),
+		1
 	);
+	for source in [&headless, &state, &actions, &agents] {
+		assert!(!source.contains("crate::publication::assemble_and_write("));
+		assert!(!source.contains("crate::publication::assemble("));
+	}
+	for source in [production, headless.as_str(), agents.as_str()] {
+		assert!(!source.contains("fn resolve(&self, figure:"));
+	}
 }
 
 /// PRODUCT-0160 observe cut: transport has no application authority, and a

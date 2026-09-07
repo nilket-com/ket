@@ -76,6 +76,9 @@ pub(crate) struct Reply {
 }
 
 impl Reply {
+	pub(crate) fn is_closed(&self) -> bool {
+		self.sink.is_closed()
+	}
 	pub(crate) fn answer(&self, event: Event) {
 		if self.finished.load(Ordering::Acquire) {
 			return;
@@ -340,6 +343,93 @@ async fn connection(
 mod tests {
 	use super::*;
 
+	fn picture(title: &str) -> Event {
+		Event::Changed {
+			figures: vec![crate::driver::FigureDescription {
+				figure: "1".into(),
+				pane: 1,
+				title: title.into(),
+				view: None,
+				family: None,
+				size: crate::driver::Size::default(),
+				series: crate::driver::SeriesReport::Absent {
+					reason: "test".into(),
+				},
+				loaded: crate::driver::LiveState::default(),
+				live: crate::driver::LiveState::default(),
+				render_mode: None,
+				settings: Default::default(),
+			}],
+		}
+	}
+
+	#[tokio::test]
+	async fn product_0160_slow_socket_gets_latest_picture_and_full_answers_disconnect() {
+		use tokio::io::AsyncReadExt;
+		for overflow in [false, true] {
+			let (server, client) = tokio::net::UnixStream::pair().unwrap();
+			let (sink, receivers) = queues();
+			let (output, _events) = iced::futures::channel::mpsc::channel(8);
+			let (_stop, stopping) = watch::channel(false);
+			let job = tokio::spawn(connection(
+				server,
+				1,
+				1,
+				sink.clone(),
+				receivers,
+				output,
+				stopping,
+			));
+			// This answer exceeds the socket send buffer. Reading one byte proves
+			// the writer started; it cannot finish while this client stops reading.
+			sink.answer(Event::Refused {
+				id: 0,
+				reason: "x".repeat(2 * 1024 * 1024),
+				receipt: None,
+			});
+			let mut client = BufReader::new(client);
+			let first = client.read_u8().await.unwrap();
+			assert_eq!(first, b'{');
+			if overflow {
+				let started = std::time::Instant::now();
+				for id in 1..=MAX_ANSWERS + 1 {
+					sink.answer(Event::Refused {
+						id: id as u64,
+						reason: "busy".into(),
+						receipt: None,
+					});
+				}
+				assert!(started.elapsed() < std::time::Duration::from_secs(1));
+				assert!(sink.is_closed());
+				tokio::time::timeout(std::time::Duration::from_secs(2), job)
+					.await
+					.unwrap()
+					.unwrap();
+			} else {
+				for id in 0..1000 {
+					sink.changed(picture(&id.to_string()));
+				}
+				// Finish the large answer, then receive just the newest snapshot.
+				read_line(&mut client, usize::MAX).await.unwrap().unwrap();
+				let newest = read_line(&mut client, usize::MAX).await.unwrap().unwrap();
+				assert_eq!(
+					super::super::decode::<Event>(&newest).unwrap(),
+					picture("999")
+				);
+				assert!(
+					tokio::time::timeout(
+						std::time::Duration::from_millis(30),
+						read_line(&mut client, MAX_LINE)
+					)
+					.await
+					.is_err()
+				);
+				sink.close("done");
+				job.await.unwrap();
+			}
+		}
+	}
+
 	#[tokio::test]
 	async fn product_0160_socket_ids_are_connection_scoped_and_busy_does_not_queue() {
 		let root = std::env::temp_dir().join(format!(
@@ -485,6 +575,19 @@ mod tests {
 				..
 			}
 		));
+		second.write_all(&vec![b'x'; MAX_LINE + 1]).await.unwrap();
+		let mut second = BufReader::new(second);
+		let bytes = tokio::time::timeout(
+			std::time::Duration::from_secs(2),
+			read_line(&mut second, MAX_LINE),
+		)
+		.await
+		.unwrap()
+		.unwrap()
+		.unwrap();
+		assert!(
+			matches!(super::super::decode::<Event>(&bytes).unwrap(), Event::Closed { reason } if reason == "request_line_too_long")
+		);
 		drop(server);
 		let bytes = tokio::time::timeout(
 			std::time::Duration::from_secs(2),

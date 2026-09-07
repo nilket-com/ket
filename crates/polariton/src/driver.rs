@@ -13,8 +13,8 @@
 
 use crate::editor::HostPlotExport;
 use crate::gui::HeadlessApplication;
-use crate::gui::plot_pane::PlotPaneMsg;
 use crate::plot::common::ScatterRenderMode;
+#[cfg(test)]
 use crate::plot::series::SeriesVisibilityAction;
 use crate::presentation_registry::inspector_rows;
 use crate::publication::{
@@ -64,7 +64,6 @@ impl Target {
 /// How long a run may take to attach its workspace, run every relation, and
 /// settle. The fixture showcase's million-point scatter fits well inside it.
 const RUN_DEADLINE: Duration = Duration::from_secs(600);
-const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The commands file: one script, applied in order in one application.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -152,6 +151,9 @@ pub(crate) struct CommandReceipt {
 	pub(crate) figure: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub(crate) refusal: Option<Refusal>,
+	/// Present only with outcome `failed`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) failure: Option<Failure>,
 	/// The figure's live state after the command, for commands that act on
 	/// one.
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -166,7 +168,34 @@ pub(crate) struct CommandReceipt {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Outcome {
 	Applied,
+	/// Nothing ran.
 	Refused,
+	/// PRODUCT-0160 §4: the command ran and its effect did not finish as
+	/// asked. `failure` says how; `state` or `failure.root` says what was
+	/// observed, and nothing claims a rollback.
+	Failed,
+}
+
+/// Why a command that ran did not finish as asked.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub(crate) enum Failure {
+	/// The divider drag moved nothing within the deadline; `state` on the
+	/// receipt is the size the pane had when the deadline passed.
+	ResizeDeadline { figure: String },
+	/// The pane's incarnation changed, or the pane left the viewport, before
+	/// the resize could be observed; `current` names the replacement.
+	ResizeSuperseded {
+		figure: String,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		current: Option<String>,
+	},
+	/// The publish job ran and its write did not finish; `root` is the
+	/// directory it wrote into, which may hold partial files.
+	Publish {
+		reason: PublishRefusal,
+		root: String,
+	},
 }
 
 /// Structured, never prose alone.
@@ -179,6 +208,11 @@ pub(crate) enum Refusal {
 	ApplicationFailed { message: String },
 	/// The token names no figure in the application.
 	UnknownFigure { figure: FigureRef },
+	/// Multiple open sources can author the same view name. Name an incarnation.
+	AmbiguousFigure {
+		figure: FigureRef,
+		candidates: Vec<String>,
+	},
 	/// The token named a figure that has since been replaced; `current` is
 	/// the incarnation that stands in its pane now.
 	StaleFigure { figure: FigureRef, current: String },
@@ -358,7 +392,7 @@ pub(crate) fn describe(target: &Target) -> Result<(), String> {
 	}
 }
 
-fn read_commands(path: &Path) -> Result<Commands, String> {
+pub(crate) fn read_commands(path: &Path) -> Result<Commands, String> {
 	let bytes =
 		std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
 	serde_json::from_slice(&bytes).map_err(|error| format!("{}: {error}", path.display()))
@@ -433,205 +467,53 @@ impl Session {
 	}
 
 	pub(crate) fn apply(&mut self, command: &Command) -> CommandReceipt {
-		let mut answer = CommandReceipt {
+		self.application.apply_command(command)
+	}
+}
+
+impl CommandReceipt {
+	pub(crate) fn new(command: &Command) -> Self {
+		Self {
 			command: command.clone(),
 			outcome: Outcome::Applied,
 			figure: None,
 			refusal: None,
+			failure: None,
 			state: None,
 			figures: None,
 			publish: None,
-		};
-		match command {
-			Command::Describe {} => {
-				answer.figures = Some(self.describe_live());
-			}
-			Command::Hide { figure, series }
-			| Command::Show { figure, series }
-			| Command::Isolate { figure, series } => {
-				answer.acted(self.visibility(command, figure, *series));
-			}
-			Command::Restore { figure } => answer.acted(self.restore(figure)),
-			Command::Resize {
-				figure,
-				width,
-				height,
-			} => answer.acted(self.resize(figure, *width, *height)),
-			Command::Publish { directory } => match self.publish(Path::new(directory)) {
-				Ok(published) => answer.publish = Some(published),
-				Err(refusal) => answer.refuse(refusal),
-			},
-		}
-		answer
-	}
-
-	fn describe_live(&self) -> Vec<FigureDescription> {
-		self.application.describe_surface()
-	}
-
-	/// Resolve a figure reference to the pane it names now. A token that is
-	/// no longer live but was loaded by this invocation is stale, and the
-	/// refusal names the incarnation now in its pane.
-	fn resolve(&self, figure: &FigureRef) -> Result<Resolved, Refusal> {
-		let mut exports = self.application.exports_with_identity();
-		let position = match figure {
-			FigureRef::Incarnation(token) => {
-				let parsed: u64 = token.parse().map_err(|_| Refusal::UnknownFigure {
-					figure: figure.clone(),
-				})?;
-				let live = exports
-					.iter()
-					.position(|(_, incarnation, _)| incarnation.token() == parsed);
-				if live.is_none()
-					&& let Some(loaded) = self.loaded.iter().find(|loaded| loaded.figure == *token)
-					&& let Some((_, current, _)) = exports
-						.iter()
-						.find(|(panel, _, _)| panel.get() == loaded.pane)
-				{
-					return Err(Refusal::StaleFigure {
-						figure: figure.clone(),
-						current: current.token().to_string(),
-					});
-				}
-				live
-			}
-			FigureRef::View(name) => exports
-				.iter()
-				.position(|(_, _, export)| export.view_name.as_deref() == Some(name)),
-		};
-		let Some(position) = position else {
-			return Err(Refusal::UnknownFigure {
-				figure: figure.clone(),
-			});
-		};
-		let (panel, incarnation, export) = exports.swap_remove(position);
-		Ok(Resolved {
-			panel,
-			incarnation,
-			export,
-		})
-	}
-
-	fn visibility(
-		&mut self,
-		command: &Command,
-		figure: &FigureRef,
-		series: u32,
-	) -> Result<(String, LiveState), Refusal> {
-		let resolved = self.resolve(figure)?;
-		let token = resolved.incarnation.token().to_string();
-		series_table_of(&resolved.export).map_err(|reason| Refusal::NoSeriesTable {
-			figure: token.clone(),
-			reason,
-		})?;
-		let widget = widget_for(&resolved.export, &resolved.export.settings_model);
-		let identities = widget.series_registry().identities().to_vec();
-		drop(widget);
-		let identity =
-			identities
-				.get(series as usize)
-				.cloned()
-				.ok_or_else(|| Refusal::UnknownSeries {
-					figure: token.clone(),
-					series,
-					series_count: identities.len() as u32,
-				})?;
-		let action = match command {
-			Command::Hide { .. } => SeriesVisibilityAction::Hide(identity),
-			Command::Show { .. } => SeriesVisibilityAction::Show(identity),
-			Command::Isolate { .. } => SeriesVisibilityAction::Isolate(identity),
-			_ => unreachable!("visibility is only called for hide, show, and isolate"),
-		};
-		self.application
-			.plot_message(resolved.panel, PlotPaneMsg::SeriesVisibility(action));
-		Ok((token, self.live_state(resolved.panel)))
-	}
-
-	fn restore(&mut self, figure: &FigureRef) -> Result<(String, LiveState), Refusal> {
-		let resolved = self.resolve(figure)?;
-		self.application.plot_message(
-			resolved.panel,
-			PlotPaneMsg::SeriesVisibility(SeriesVisibilityAction::RestoreAll),
-		);
-		Ok((
-			resolved.incarnation.token().to_string(),
-			self.live_state(resolved.panel),
-		))
-	}
-
-	fn resize(
-		&mut self,
-		figure: &FigureRef,
-		width: f32,
-		height: f32,
-	) -> Result<(String, LiveState), Refusal> {
-		let resolved = self.resolve(figure)?;
-		let token = resolved.incarnation.token().to_string();
-		self.application
-			.resize_pane(resolved.panel, width, height, SETTLE_DEADLINE)
-			.map_err(|message| Refusal::ResizeRefused {
-				figure: token.clone(),
-				message,
-			})?;
-		Ok((token, self.live_state(resolved.panel)))
-	}
-
-	fn publish(&mut self, directory: &Path) -> Result<PublishReceipt, Refusal> {
-		let package =
-			self.application
-				.publish(directory)
-				.map_err(|error| Refusal::PublishRefused {
-					reason: PublishRefusal::from(&error),
-				})?;
-		Ok(PublishReceipt {
-			root: directory.display().to_string(),
-			digest: package.digest(),
-			figures: package
-				.manifest
-				.figures
-				.iter()
-				.map(|figure| PublishedFigure {
-					id: figure.id.clone(),
-					title: figure.title.clone(),
-					visibility: serde_json::to_value(&figure.visibility).unwrap_or_default(),
-					inspection: serde_json::to_value(&figure.inspection).unwrap_or_default(),
-				})
-				.collect(),
-		})
-	}
-
-	/// The pane's state now. A pane that has no export any more reports the
-	/// default, which the receipt's outcome already explains.
-	fn live_state(&self, panel: HostPanelId) -> LiveState {
-		self.application
-			.exports_with_identity()
-			.iter()
-			.find(|(id, _, _)| *id == panel)
-			.map(|(_, _, export)| live_state_of(export))
-			.unwrap_or_default()
-	}
-}
-
-struct Resolved {
-	panel: HostPanelId,
-	incarnation: SurfaceIncarnation,
-	export: HostPlotExport,
-}
-
-impl CommandReceipt {
-	fn acted(&mut self, result: Result<(String, LiveState), Refusal>) {
-		match result {
-			Ok((figure, state)) => {
-				self.figure = Some(figure);
-				self.state = Some(state);
-			}
-			Err(refusal) => self.refuse(refusal),
 		}
 	}
-
-	fn refuse(&mut self, refusal: Refusal) {
+	pub(crate) fn refuse(&mut self, refusal: Refusal) {
 		self.outcome = Outcome::Refused;
 		self.refusal = Some(refusal);
+	}
+
+	/// PRODUCT-0160 §4: the command ran; keep whatever was observed.
+	pub(crate) fn fail(&mut self, failure: Failure) {
+		self.outcome = Outcome::Failed;
+		self.failure = Some(failure);
+	}
+}
+
+pub(crate) fn published_receipt(
+	directory: &Path,
+	package: &crate::publication::Package,
+) -> PublishReceipt {
+	PublishReceipt {
+		root: directory.display().to_string(),
+		digest: package.digest(),
+		figures: package
+			.manifest
+			.figures
+			.iter()
+			.map(|figure| PublishedFigure {
+				id: figure.id.clone(),
+				title: figure.title.clone(),
+				visibility: serde_json::to_value(&figure.visibility).unwrap_or_default(),
+				inspection: serde_json::to_value(&figure.inspection).unwrap_or_default(),
+			})
+			.collect(),
 	}
 }
 
@@ -646,7 +528,9 @@ fn export_bounds(export: &HostPlotExport) -> iced::Rectangle {
 
 /// PRODUCT-0158 §2: the series table exactly as the publisher derives it -
 /// the same widget, coverage, hidden set, legend geometry, and bound.
-fn series_table_of(export: &HostPlotExport) -> Result<crate::publication::SeriesTable, String> {
+pub(crate) fn series_table_of(
+	export: &HostPlotExport,
+) -> Result<crate::publication::SeriesTable, String> {
 	let bounds = export_bounds(export);
 	let widget = widget_for(export, &export.settings_model);
 	let registry = widget.series_registry().clone();
@@ -921,6 +805,42 @@ mod tests {
 		assert_eq!(
 			publish,
 			serde_json::json!({"kind":"publish_refused","reason":{"reason":"republished","figure":"f"}})
+		);
+	}
+
+	/// PRODUCT-0160 §4: the `failed` outcome adds a key only to failed
+	/// receipts; applied and refused receipts serialize exactly as before.
+	#[test]
+	fn product_0160_failed_outcome_leaves_applied_and_refused_receipts_unchanged() {
+		let keys = |receipt: &CommandReceipt| {
+			serde_json::to_value(receipt)
+				.expect("json")
+				.as_object()
+				.expect("object")
+				.keys()
+				.cloned()
+				.collect::<Vec<_>>()
+		};
+		let applied = CommandReceipt::new(&Command::Describe {});
+		assert_eq!(keys(&applied), ["command", "outcome"]);
+		assert_eq!(
+			serde_json::to_value(&applied).unwrap()["outcome"],
+			"applied"
+		);
+		let mut refused = CommandReceipt::new(&Command::Describe {});
+		refused.refuse(Refusal::UnknownFigure {
+			figure: FigureRef::View("x".to_owned()),
+		});
+		assert_eq!(keys(&refused), ["command", "outcome", "refusal"]);
+		let mut failed = CommandReceipt::new(&Command::Describe {});
+		failed.fail(Failure::ResizeDeadline {
+			figure: "3".to_owned(),
+		});
+		let failed = serde_json::to_value(&failed).unwrap();
+		assert_eq!(failed["outcome"], "failed");
+		assert_eq!(
+			failed["failure"],
+			serde_json::json!({"kind": "resize_deadline", "figure": "3"})
 		);
 	}
 
