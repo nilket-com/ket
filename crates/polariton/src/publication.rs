@@ -669,6 +669,20 @@ pub(crate) fn looks_like_path_or_endpoint(value: &str) -> bool {
 /// The consistency witness: tokens captured from the live panels before the
 /// exports were taken. A figure whose token moved between capture and read
 /// republished, and the package refuses rather than mixing two publications.
+/// PRODUCT-0158 §4: the publish action as one call - assemble under the
+/// witness and write to `path` - so the menu and the driver cannot differ in
+/// what they do between the witness and the directory.
+pub(crate) fn assemble_and_write(
+	witness: &[Option<Publication>],
+	exports: Vec<HostPlotExport>,
+	request: &PublishRequest,
+	path: &Path,
+) -> Result<Package, PublishError> {
+	let package = assemble(witness, exports, request)?;
+	package.write(path)?;
+	Ok(package)
+}
+
 pub(crate) fn assemble(
 	witness: &[Option<Publication>],
 	exports: Vec<HostPlotExport>,
@@ -1158,7 +1172,7 @@ fn binding(channel: &ResolvedChannel) -> FigureChannel {
 	}
 }
 
-fn setting_value_json(value: &SettingValue) -> serde_json::Value {
+pub(crate) fn setting_value_json(value: &SettingValue) -> serde_json::Value {
 	match value {
 		SettingValue::Text(text) | SettingValue::Choice(text) => {
 			serde_json::Value::String(text.clone())
@@ -1174,7 +1188,7 @@ fn setting_value_json(value: &SettingValue) -> serde_json::Value {
 /// The widget an export renders, projects, and measures through, over the
 /// settings model the caller chose: the desktop's, or PRODUCT-0157 §3's
 /// complete model with the hidden set cleared.
-fn widget_for<'a>(
+pub(crate) fn widget_for<'a>(
 	export: &'a HostPlotExport,
 	settings_model: &crate::plot::theme::PlotSettings,
 ) -> PlotWidget<'a> {
@@ -1206,7 +1220,7 @@ fn render_figure_svg(
 /// ordinals and order; labels and field metadata come from preparation and
 /// are joined by exact identity equality. Returns none when a registry
 /// identity has no prepared label, which guardrail 3 makes a refusal.
-fn series_table(
+pub(crate) fn series_table(
 	export: &HostPlotExport,
 	registry: &crate::plot::series::SeriesRegistry,
 	desktop_hidden: &crate::plot::series::HiddenSeries,
@@ -1953,8 +1967,8 @@ pub(crate) struct PublishPrompt {
 }
 
 #[cfg(test)]
-mod tests_support {
-	pub(super) use super::tests::{artifact, fixture, fixture_with_spec, publish, request};
+pub(crate) mod tests_support {
+	pub(crate) use super::tests::{artifact, fixture, fixture_with_spec, publish, request};
 }
 
 #[cfg(test)]
@@ -1979,7 +1993,7 @@ mod tests {
 		artifact
 	}
 
-	pub(super) fn artifact() -> Arc<ResultArtifact> {
+	pub(crate) fn artifact() -> Arc<ResultArtifact> {
 		artifact_with("sqlite")
 	}
 
@@ -1999,7 +2013,7 @@ mod tests {
 	}
 
 	/// PRODUCT-0157 fixtures author a series channel; the spec is the caller's.
-	pub(super) fn fixture_with_spec(
+	pub(crate) fn fixture_with_spec(
 		title: &str,
 		artifact: &Arc<ResultArtifact>,
 		plot_type: PlotType,
@@ -2064,7 +2078,7 @@ mod tests {
 		})
 	}
 
-	pub(super) fn fixture(
+	pub(crate) fn fixture(
 		title: &str,
 		artifact: &Arc<ResultArtifact>,
 		plot_type: PlotType,
@@ -2081,7 +2095,7 @@ mod tests {
 		}
 	}
 
-	pub(super) fn request() -> PublishRequest {
+	pub(crate) fn request() -> PublishRequest {
 		request_at("2026-09-03T00:00:00Z")
 	}
 
@@ -2089,7 +2103,7 @@ mod tests {
 		exports.iter().map(|export| export.publication).collect()
 	}
 
-	pub(super) fn publish(exports: Vec<HostPlotExport>, request: &PublishRequest) -> Package {
+	pub(crate) fn publish(exports: Vec<HostPlotExport>, request: &PublishRequest) -> Package {
 		let witness = witness_of(&exports);
 		assemble(&witness, exports, request).expect("package")
 	}

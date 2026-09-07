@@ -69,11 +69,27 @@ The heatmap reads an explicit long-form capability matrix. Radar and parallel
 read the same wide operating profiles, making their difference one of visual
 question rather than data preparation.
 
-Seed the PRODUCT-0157 gate-10 fixtures, then open the three-pane fixture
-showcase:
+Seed the PRODUCT-0157 gate-10 fixtures, then produce the gate-10 package
+without a pointer. PRODUCT-0158's driver opens the application headless,
+runs the source, hides one series per pane, sizes the raster pane under the
+gate, and publishes; the receipt names every figure's incarnation, its hidden
+set, and the render mode the renderer resolved:
 
 ```sh
 nilket toron sql --file uat/plot_fixtures_showcase.sql
+cargo run -p polariton -- drive uat/plot_fixtures_showcase.rn \
+  --commands uat/plot_fixtures_showcase.commands.json \
+  --receipt /tmp/plot_fixtures_showcase.receipt.json
+cargo run -p polariton -- serve plot_fixtures_showcase_driven
+```
+
+The commands file addresses each figure by its view name; `polariton
+describe uat/plot_fixtures_showcase.rn` prints the same receipt shape with
+the loaded figures and their incarnation tokens, which a script can address
+instead. `polariton describe --session <id>` does the same for a saved
+session. To open the same showcase in the window:
+
+```sh
 cargo run --release -p polariton -- uat/plot_fixtures_showcase.rn
 ```
 

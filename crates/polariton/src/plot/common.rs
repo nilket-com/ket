@@ -2237,6 +2237,17 @@ pub trait PlotComposite: Send + Sync {
 	) -> bool {
 		false
 	}
+	/// PRODUCT-0158 §2: the scatter render mode across the cells, at each
+	/// cell's own plot area.
+	fn scatter_render_mode(
+		&self,
+		_bounds: Rect<Widget>,
+		_padding: f32,
+		_title: &str,
+		_settings: &PlotSettings,
+	) -> Option<ScatterRenderMode> {
+		None
+	}
 	fn legend_hit_geometry(
 		&self,
 		_bounds: Rect<Widget>,
@@ -2542,6 +2553,16 @@ pub trait PlotKernel: Send + Sync {
 	/// that embeds rasters. One such occurrence leaves the figure uncovered.
 	fn rasterizes_identified_series(&self, _bounds: Rectangle, _settings: &PlotSettings) -> bool {
 		false
+	}
+	/// PRODUCT-0158 §2: the scatter render mode this kernel resolves at these
+	/// plot-area bounds, from the same resolution the renderer makes. `None`
+	/// for kernels that have no such mode.
+	fn resolved_scatter_render_mode(
+		&self,
+		_bounds: Rectangle,
+		_settings: &PlotSettings,
+	) -> Option<ScatterRenderMode> {
+		None
 	}
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout;
 
@@ -5289,6 +5310,33 @@ impl<'a> PlotWidget<'a> {
 		!self
 			.kernel
 			.rasterizes_identified_series(plot_area, &self.settings_model)
+	}
+
+	/// PRODUCT-0158 §2: the scatter render mode at the same plot area
+	/// `series_covered` derives, read from the kernel's own resolution. A
+	/// composite reports none: its cells each resolve their own.
+	pub(crate) fn scatter_render_mode(&self, bounds: Rectangle) -> Option<ScatterRenderMode> {
+		let widget_bounds = Rect::<Widget>::from_iced_frame(bounds);
+		if let Some(composite) = self.kernel.composite() {
+			return composite.scatter_render_mode(
+				widget_bounds,
+				self.padding,
+				&self.title,
+				&self.settings_model,
+			);
+		}
+		let legend_reservation = self
+			.kernel
+			.legend_reservation_content(&self.settings)
+			.and_then(crate::plot::legend::apply_policy);
+		let legend = legend_layout(widget_bounds, legend_reservation.as_ref(), &self.settings);
+		let layout = self.kernel.layout(self.settings.clone());
+		let requirements = BandRequirements::from_layout(&layout, &self.settings);
+		let plot_area = self
+			.plot_area(legend.content_bounds, &requirements)
+			.into_iced();
+		self.kernel
+			.resolved_scatter_render_mode(plot_area, &self.settings_model)
 	}
 
 	/// bounds, same resolved settings, same dispatch — the composite when there

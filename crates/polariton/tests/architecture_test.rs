@@ -199,6 +199,9 @@ fn product_0062_persistence_schema_has_no_placement_or_renderer_authority() {
 	// PRODUCT-0062 confined serde to the opaque session owner; PRODUCT-0134
 	// sanctions exactly one more durable schema, the encrypted profile store.
 	let mut expected = vec![
+		// PRODUCT-0158 §5 and §6: the commands file and the receipt are the
+		// agent surface's own schema, owned by the driver.
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/driver.rs"),
 		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/profile_store.rs"),
 		// PRODUCT-0154 §2: the published dashboard package owns its own DTOs.
 		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/publication.rs"),
@@ -4817,16 +4820,48 @@ fn product_0114_band_requirements_precede_and_feed_shared_geometry() {
 	// exact/overlay/hit traversals banked here; PRODUCT-0150 adds the gesture
 	// viewport-geometry traversal; PRODUCT-0151 adds selection geometry,
 	// click-admission, and retained-emphasis traversals. PRODUCT-0155 adds the hit-projection
-	// traversal. PRODUCT-0157 adds the series-coverage traversal.
-	// Each independently
-	// resolves the cell's plot rectangle through its kernel.
+	// traversal. PRODUCT-0157 added the series-coverage traversal; PRODUCT-0158
+	// moved it into `cell_plot_areas` on the kernel's own impl, above this
+	// composite impl, where the render-mode traversal shares it. Each
+	// remaining traversal independently resolves the cell's plot rectangle
+	// through its kernel.
 	assert_eq!(
 		composite
 			.matches("cell.kernel.resolve_settings(settings)")
 			.count(),
-		11,
-		"all eleven grid entry points resolve the cell's plot area through its own kernel"
+		10,
+		"all ten grid entry points resolve the cell's plot area through its own kernel"
 	);
+	let shared = grid
+		.split("fn cell_plot_areas(")
+		.nth(1)
+		.expect("PRODUCT-0158: the shared per-cell plot-area derivation")
+		.split("impl PlotComposite for PlotGridKernel")
+		.next()
+		.expect("cell_plot_areas precedes the composite impl");
+	assert_eq!(
+		shared
+			.matches("cell.kernel.resolve_settings(settings)")
+			.count(),
+		1,
+		"cell_plot_areas resolves each cell's plot area through its own kernel, once"
+	);
+	for consumer in [
+		"fn rasterizes_identified_series(",
+		"fn scatter_render_mode(",
+	] {
+		let body = composite
+			.split(consumer)
+			.nth(1)
+			.expect("composite consumer")
+			.split("\n\tfn ")
+			.next()
+			.expect("consumer body");
+		assert!(
+			body.contains("self.cell_plot_areas(bounds, padding, title, settings)"),
+			"{consumer} reads the shared per-cell plot areas rather than re-deriving them"
+		);
+	}
 	assert!(
 		!composite.contains("grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &resolved)"),
 		"no grid entry point may take a cell's plot area from the figure-wide resolution"
@@ -6621,4 +6656,94 @@ fn rune_authoring_resolves_layouts_without_building_kernels() {
 			"{kernel} preparation resolves its layout through {helper}"
 		);
 	}
+}
+
+/// PRODUCT-0158 gate 6: the driver and the headless application hold no
+/// authority of their own. The driver constructs no kernel, no settings
+/// model, and no package: it reads exports through the publisher's own
+/// widget, series-table, and inspector seams, sends the pane message the
+/// legend sends, and publishes through the one call the menu makes. The
+/// positive control is that call itself: the menu's handler and the headless
+/// publish both name it, and nothing else in the GUI assembles a package.
+#[test]
+fn product_0158_driver_and_headless_application_hold_no_authority() {
+	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let driver = std::fs::read_to_string(src.join("driver.rs")).expect("read driver.rs");
+	let headless =
+		std::fs::read_to_string(src.join("gui/state/headless.rs")).expect("read headless.rs");
+	let state = std::fs::read_to_string(src.join("gui/state.rs")).expect("read gui/state.rs");
+
+	let production = driver
+		.split("#[cfg(test)]\nmod tests {")
+		.next()
+		.expect("driver production source");
+	for forbidden in [
+		"create_plot",
+		"PlotKernel",
+		"HostPlotState::new",
+		"PlotSettings::default",
+		"PlotSettingsLayer",
+		"Package {",
+		"Manifest {",
+		"assemble(",
+		"assemble_and_write(",
+		" SeriesTable {",
+		"PlotWidget::new",
+		"resolve_render_mode(",
+		"Command::Set",
+		"\"set\"",
+	] {
+		assert!(
+			!production.contains(forbidden),
+			"PRODUCT-0158 gate 6: driver.rs names {forbidden:?}; the driver is a client of the \
+			 editor, the host state, and the publisher, never their author"
+		);
+	}
+	for required in [
+		"HeadlessApplication",
+		"widget_for(",
+		"series_table(",
+		"inspector_rows(",
+		"scatter_render_mode(",
+		"PlotPaneMsg::SeriesVisibility(",
+		"exports_with_identity()",
+	] {
+		assert!(
+			production.contains(required),
+			"PRODUCT-0158 gate 6: driver.rs no longer reaches {required:?}"
+		);
+	}
+	for forbidden in [
+		"create_plot",
+		"PlotWidget::new",
+		"HostPlotState::new",
+		"assemble(",
+	] {
+		assert!(
+			!headless.contains(forbidden),
+			"PRODUCT-0158 gate 6: headless.rs names {forbidden:?}"
+		);
+	}
+	for required in [
+		"new_with_authority(",
+		"update(&mut self.state, message)",
+		"EditorMsg::HostPlot",
+		"Message::Run",
+		"host_plot_publications()",
+		"publish_request(&self.state)",
+		"crate::publication::assemble_and_write(",
+	] {
+		assert!(
+			headless.contains(required),
+			"PRODUCT-0158 gate 6: headless.rs no longer goes through {required:?}"
+		);
+	}
+	assert!(
+		state.contains("crate::publication::assemble_and_write("),
+		"positive control: the menu's publish handler goes through assemble_and_write"
+	);
+	assert!(
+		!state.contains("crate::publication::assemble("),
+		"the menu's publish handler must not assemble apart from the write"
+	);
 }

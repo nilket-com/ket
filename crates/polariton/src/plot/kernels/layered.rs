@@ -2,7 +2,7 @@
 
 use crate::plot::common::{
 	AxisType, CoordinateTransformer, MarkHit, MarkRenderer, PlotBackend, PlotKernel, PlotLayout,
-	ResolvedPlotSettings, TemporalAxisDomain, format_label,
+	ResolvedPlotSettings, ScatterRenderMode, TemporalAxisDomain, format_label,
 };
 use crate::plot::kernels::line::{LineMarkRenderer, LinePreparedData, series_color};
 use crate::plot::kernels::scatter::{ScatterMarkRenderer, ScatterPreparedData};
@@ -52,6 +52,18 @@ impl LayerRenderer {
 			Self::Line(..) => false,
 			Self::Scatter(renderer, layer) => {
 				renderer.rasterizes_identified_series(bounds, &settings.resolve_for_layer(layer))
+			}
+		}
+	}
+	fn scatter_render_mode(
+		&self,
+		bounds: Rectangle,
+		settings: &PlotSettings,
+	) -> Option<ScatterRenderMode> {
+		match self {
+			Self::Line(..) => None,
+			Self::Scatter(renderer, layer) => {
+				Some(renderer.scatter_render_mode(bounds, &settings.resolve_for_layer(layer)))
 			}
 		}
 	}
@@ -301,6 +313,17 @@ impl PlotKernel for LayeredPlotKernel {
 		self.layers
 			.iter()
 			.any(|layer| layer.rasterizes_identified_series(bounds, settings))
+	}
+	/// PRODUCT-0158 §2: the first scatter layer's mode, the one the figure's
+	/// raster gate is about.
+	fn resolved_scatter_render_mode(
+		&self,
+		bounds: Rectangle,
+		settings: &PlotSettings,
+	) -> Option<ScatterRenderMode> {
+		self.layers
+			.iter()
+			.find_map(|layer| layer.scatter_render_mode(bounds, settings))
 	}
 	/// PRODUCT-0139 §3: any layer whose mark must be clipped clips the figure.
 	/// A one-layer wrapper around a scatter therefore clips exactly as the bare

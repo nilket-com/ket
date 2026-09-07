@@ -10,6 +10,8 @@ mod configuration;
 mod coordinate;
 #[path = "../src/core/mod.rs"]
 mod core;
+#[path = "../src/driver.rs"]
+mod driver;
 #[path = "../src/editor.rs"]
 mod editor;
 #[path = "../src/fonts/mod.rs"]

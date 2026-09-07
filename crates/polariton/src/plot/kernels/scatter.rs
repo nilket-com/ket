@@ -143,6 +143,16 @@ impl PlotKernel for ScatterPlotKernel {
 		self.renderer
 			.rasterizes_identified_series(bounds, &settings.resolve_for_layer(&self.layer_settings))
 	}
+	fn resolved_scatter_render_mode(
+		&self,
+		bounds: Rectangle,
+		settings: &PlotSettings,
+	) -> Option<ScatterRenderMode> {
+		Some(
+			self.renderer
+				.scatter_render_mode(bounds, &settings.resolve_for_layer(&self.layer_settings)),
+		)
+	}
 	/// PRODUCT-0139 §3: honoured, not decided — the answer comes from the mark,
 	/// so this kernel and the one-layer `LayeredPlotKernel` that a modified
 	/// spelling produces cannot disagree.
@@ -611,6 +621,19 @@ impl ScatterMarkRenderer {
 				crate::plot::series::SeriesLabel::pair(series.identity.as_ref(), &series.name)
 			})
 			.collect()
+	}
+	/// PRODUCT-0158 §2: the mode the renderer resolves at these bounds, as the
+	/// authored enum a describe can report.
+	pub(crate) fn scatter_render_mode(
+		&self,
+		bounds: Rectangle,
+		settings: &ResolvedPlotSettings,
+	) -> ScatterRenderMode {
+		match resolve_render_mode(self.prepared_data.total_points, true, bounds, settings) {
+			ResolvedScatterRenderMode::Vector => ScatterRenderMode::Vector,
+			ResolvedScatterRenderMode::Downsampled => ScatterRenderMode::Downsampled,
+			ResolvedScatterRenderMode::Rasterized => ScatterRenderMode::Rasterized,
+		}
 	}
 	pub(crate) fn rasterizes_identified_series(
 		&self,

@@ -6652,6 +6652,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "iced",
+ "iced_runtime",
  "iced_wgpu",
  "kurbo 0.13.1",
  "libaryon",

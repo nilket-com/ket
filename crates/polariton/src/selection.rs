@@ -694,6 +694,17 @@ impl SurfaceIncarnation {
 	pub fn mint() -> Self {
 		Self(NEXT_SURFACE_INCARNATION.fetch_add(1, Ordering::Relaxed))
 	}
+
+	/// PRODUCT-0158 §3: the opaque token a command names a figure by. It is
+	/// the incarnation and nothing else; a receipt prints it and a command
+	/// carries it back.
+	pub fn token(self) -> u64 {
+		self.0
+	}
+
+	pub fn from_token(token: u64) -> Self {
+		Self(token)
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

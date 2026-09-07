@@ -1,5 +1,8 @@
 #[cfg(feature = "toron")]
 use crate::adapters::common::DatabaseAdapter;
+
+/// PRODUCT-0158: the application without a window.
+pub(crate) mod headless;
 use crate::adapters::{
 	common::{AdapterStage, ExecutionResult},
 	driver::AdapterState,
@@ -119,7 +122,7 @@ impl RetainedRelationGeneration {
 	}
 }
 
-struct AppState {
+pub(crate) struct AppState {
 	menu_state: MenuState,
 	code_editor: CodeEditor,
 	status_msg: String,
@@ -5638,11 +5641,13 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			return Task::perform(
 				async move {
 					tokio::task::spawn_blocking(move || -> std::result::Result<String, String> {
-						let package = crate::publication::assemble(&witness, exports, &request)
-							.map_err(|error| error.to_string())?;
-						package
-							.write(std::path::Path::new(&path))
-							.map_err(|error| error.to_string())?;
+						let package = crate::publication::assemble_and_write(
+							&witness,
+							exports,
+							&request,
+							std::path::Path::new(&path),
+						)
+						.map_err(|error| error.to_string())?;
 						Ok(format!("{path} · {}", package.digest()))
 					})
 					.await
@@ -6951,7 +6956,7 @@ mod tests {
 	}
 
 	#[cfg(feature = "toron")]
-	fn complete_relation_in_head(
+	pub(super) fn complete_relation_in_head(
 		state: &mut super::AppState,
 		source_buffer: libaryon::core::BufferId,
 		revision: u64,
@@ -15076,5 +15081,427 @@ mod product_0159_probe_tests {
 			assert!(stalled_start.observe(scheduled, scheduled).is_none());
 		}
 		assert_eq!(stalled_start.max_unserviced, ms(2_000));
+	}
+}
+
+/// PRODUCT-0158: the driver against host panels this test fills itself.
+#[cfg(all(test, feature = "toron"))]
+mod product_0158_driver_tests {
+	use super::tests::complete_relation_in_head;
+	use super::{StartupData, new};
+	use crate::driver::{Command, FigureRef, Outcome, Refusal, Session};
+	use crate::gui::HeadlessApplication;
+	use crate::gui::messages::Message;
+	use crate::gui::plot_pane::{HostPlotState, PlotPaneMsg};
+	use crate::plot::series::SeriesVisibilityAction;
+	use crate::plot::theme::PlotSettingsLayer;
+	use crate::rune_relation_envelope::{PendingRuneView, transform as transform_rune_view};
+	use libaryon::core::BufferId;
+	use std::sync::Arc;
+	use std::time::Duration;
+
+	const SOURCE: &str = r#"
+let rows = workspace
+	.table("trio")
+	.sort([asc(col("period")), asc(col("series"))]);
+rows.views([
+	view("lines", figure([
+		title("Trio"),
+		line("period", "value", "series"),
+	])),
+]);
+"#;
+
+	fn frame() -> polars::frame::DataFrame {
+		polars::df!(
+			"period" => [1_i64, 2, 1, 2, 1, 2],
+			"value" => [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+			"series" => ["a", "a", "b", "b", "c", "c"]
+		)
+		.expect("frame")
+	}
+
+	/// Run `SOURCE` at `revision` into the application's host panels, as the
+	/// dogfood tests do, and return the panel ids in view order.
+	fn run_source(state: &mut super::AppState, source_buffer: BufferId, revision: u64) {
+		let program = transform_rune_view(SOURCE).expect("view program");
+		let presentation = program
+			.presentation_views()
+			.into_iter()
+			.map(|view| (view.identity.clone(), view.intent.form()))
+			.collect::<Vec<_>>();
+		state.rune_buffer_revisions.insert(source_buffer, revision);
+		state
+			.code_editor
+			.prepare_rune_view_panels(source_buffer, &presentation, revision);
+		assert!(
+			state
+				.rune_view_scheduler
+				.submit(PendingRuneView {
+					source_buffer,
+					revision,
+					view: program.clone(),
+				})
+				.is_some()
+		);
+		for relation in program.into_relations() {
+			complete_relation_in_head(state, source_buffer, revision, relation, frame());
+		}
+	}
+
+	fn session() -> (Session, BufferId) {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = BufferId::new(80);
+		run_source(&mut state, source_buffer, 1);
+		let mut application = HeadlessApplication::from_state(state).expect("headless");
+		application
+			.settle_until(Duration::from_secs(20), |state| {
+				state.code_editor.host_plot_exports().len() == 1
+			})
+			.expect("the view's pane projects");
+		(Session::new(application), source_buffer)
+	}
+
+	/// PRODUCT-0158 gates 2 and 3: the loaded state carries no hidden set, the
+	/// driver's actions leave the pane exactly where the legend's would, with
+	/// the same idempotence and the same revision bumps, and an unknown series
+	/// is refused with the table's bound.
+	#[test]
+	fn product_0158_actions_are_the_legends_and_loaded_is_not_live() {
+		let (mut session, _) = session();
+		let loaded = session.loaded().to_vec();
+		assert_eq!(loaded.len(), 1);
+		// The in-head completion installs the panel without its named-view
+		// attachment, so these tests address the figure by incarnation; the
+		// view form is exercised by the fixture drive in the evidence record.
+		let figure = FigureRef::Incarnation(loaded[0].figure.clone());
+		assert!(loaded[0].loaded.hidden.is_empty());
+		assert!(loaded[0].live.hidden.is_empty());
+
+		// The legend's own path, on the same kernel: PRODUCT-0156 gate 8's
+		// sequences plus the repeated and unknown cases.
+		let (_, _, export) = session
+			.application_mut()
+			.exports_with_identity()
+			.pop()
+			.expect("export");
+		let ids = export.kernel.series_identities();
+		assert_eq!(ids.len(), 3);
+		let mut direct = HostPlotState::new(
+			"lines".to_owned(),
+			Arc::clone(&export.kernel),
+			PlotSettingsLayer::default(),
+		);
+		let revision_at_start = export.render_revision;
+		let direct_at_start = direct.render_revision;
+		let steps: Vec<(Command, Option<SeriesVisibilityAction>)> = vec![
+			(
+				Command::Hide {
+					figure: figure.clone(),
+					series: 0,
+				},
+				Some(SeriesVisibilityAction::Hide(ids[0].clone())),
+			),
+			(
+				Command::Hide {
+					figure: figure.clone(),
+					series: 0,
+				},
+				Some(SeriesVisibilityAction::Hide(ids[0].clone())),
+			),
+			(
+				Command::Show {
+					figure: figure.clone(),
+					series: 0,
+				},
+				Some(SeriesVisibilityAction::Show(ids[0].clone())),
+			),
+			(
+				Command::Isolate {
+					figure: figure.clone(),
+					series: 2,
+				},
+				Some(SeriesVisibilityAction::Isolate(ids[2].clone())),
+			),
+			(
+				Command::Isolate {
+					figure: figure.clone(),
+					series: 9,
+				},
+				None,
+			),
+			(
+				Command::Restore {
+					figure: figure.clone(),
+				},
+				Some(SeriesVisibilityAction::RestoreAll),
+			),
+			(
+				Command::Restore {
+					figure: figure.clone(),
+				},
+				Some(SeriesVisibilityAction::RestoreAll),
+			),
+		];
+		for (command, direct_action) in steps {
+			let receipt = session.apply(&command);
+			match direct_action {
+				Some(action) => {
+					direct.update(PlotPaneMsg::SeriesVisibility(action));
+					assert_eq!(receipt.outcome, Outcome::Applied, "{command:?}");
+					let expected = ids
+						.iter()
+						.enumerate()
+						.filter(|(_, id)| direct.plot_settings.hidden_series.contains(id))
+						.map(|(ordinal, _)| ordinal as u32)
+						.collect::<Vec<_>>();
+					assert_eq!(
+						receipt.state.as_ref().map(|state| state.hidden.clone()),
+						Some(expected),
+						"{command:?}"
+					);
+				}
+				None => {
+					assert_eq!(receipt.outcome, Outcome::Refused);
+					assert!(
+						matches!(
+							receipt.refusal,
+							Some(Refusal::UnknownSeries {
+								series: 9,
+								series_count: 3,
+								..
+							})
+						),
+						"{:?}",
+						receipt.refusal
+					);
+				}
+			}
+			let (_, _, live) = session
+				.application_mut()
+				.exports_with_identity()
+				.pop()
+				.expect("export");
+			assert_eq!(
+				live.render_revision - revision_at_start,
+				direct.render_revision - direct_at_start,
+				"revision bumps agree after {command:?}"
+			);
+		}
+	}
+
+	/// PRODUCT-0158 gate 3: a command carrying the incarnation of a figure
+	/// that has since been replaced is refused with the current one; the view
+	/// name still resolves.
+	#[test]
+	fn product_0158_stale_incarnations_are_refused_with_the_current_one() {
+		let (mut session, source_buffer) = session();
+		let old = session.loaded()[0].figure.clone();
+		run_source(session.application_mut().state_mut(), source_buffer, 2);
+		session
+			.application_mut()
+			.settle_until(Duration::from_secs(20), |state| {
+				state
+					.code_editor
+					.host_plot_exports_with_identity()
+					.first()
+					.is_some_and(|(_, incarnation, _)| incarnation.token().to_string() != old)
+			})
+			.expect("the rerun installs a new incarnation");
+		let receipt = session.apply(&Command::Hide {
+			figure: FigureRef::Incarnation(old.clone()),
+			series: 0,
+		});
+		assert_eq!(receipt.outcome, Outcome::Refused);
+		let Some(Refusal::StaleFigure { figure, current }) = receipt.refusal else {
+			panic!("{:?}", receipt.refusal);
+		};
+		assert_eq!(figure, FigureRef::Incarnation(old.clone()));
+		assert_ne!(current, old);
+		let receipt = session.apply(&Command::Hide {
+			figure: FigureRef::Incarnation(current.clone()),
+			series: 0,
+		});
+		assert_eq!(receipt.outcome, Outcome::Applied);
+		assert_eq!(receipt.figure.as_deref(), Some(current.as_str()));
+		let receipt = session.apply(&Command::Restore {
+			figure: FigureRef::Incarnation(current.clone()),
+		});
+		assert_eq!(receipt.figure.as_deref(), Some(current.as_str()));
+	}
+
+	/// PRODUCT-0158 gate 4: for the same application and the same hidden
+	/// set, the driver's package and the menu's package have the same identity
+	/// digest and byte-identical figure files.
+	#[test]
+	fn product_0158_publish_is_the_menus() {
+		let (mut session, _) = session();
+		let figure = FigureRef::Incarnation(session.loaded()[0].figure.clone());
+		session.apply(&Command::Hide { figure, series: 1 });
+		let scratch = std::env::temp_dir().join(format!(
+			"polariton-0158-publish-{}-{}",
+			std::process::id(),
+			crate::selection::SurfaceIncarnation::mint().token()
+		));
+		let menu_dir = scratch.join("menu");
+		let driver_dir = scratch.join("driver");
+		std::fs::create_dir_all(&scratch).expect("scratch");
+
+		let application = session.application_mut();
+		application.dispatch(Message::PublishRequested);
+		application.dispatch(Message::PublishPathChanged(
+			menu_dir.to_str().expect("utf-8").to_owned(),
+		));
+		application.dispatch(Message::PublishSubmitted);
+		application
+			.settle_until(Duration::from_secs(30), |state| {
+				state.status_msg.starts_with("Published ") || state.status_msg.contains("failed")
+			})
+			.expect("the menu's publish finishes");
+		let status = application.state().status_msg.clone();
+		let menu_digest = status
+			.rsplit(" · ")
+			.next()
+			.unwrap_or_else(|| panic!("no digest in {status:?}"))
+			.to_owned();
+
+		let receipt = session.apply(&Command::Publish {
+			directory: driver_dir.to_str().expect("utf-8").to_owned(),
+		});
+		assert_eq!(receipt.outcome, Outcome::Applied, "{:?}", receipt.refusal);
+		let published = receipt.publish.expect("publish receipt");
+		assert_eq!(published.digest, menu_digest);
+		assert_eq!(published.figures.len(), 1);
+
+		let mut compared = 0;
+		for entry in walk(&menu_dir) {
+			let relative = entry.strip_prefix(&menu_dir).expect("relative");
+			if relative == std::path::Path::new("manifest.json") {
+				continue;
+			}
+			let theirs = std::fs::read(driver_dir.join(relative)).expect("driver file");
+			assert_eq!(
+				std::fs::read(&entry).expect("menu file"),
+				theirs,
+				"{relative:?}"
+			);
+			compared += 1;
+		}
+		assert!(compared > 0);
+		std::fs::remove_dir_all(&scratch).ok();
+	}
+
+	/// PRODUCT-0158 §3: a resize the pane already satisfies is complete, not a
+	/// wait for a change that never comes.
+	#[test]
+	fn product_0158_resize_to_the_current_size_is_complete() {
+		let (mut session, _) = session();
+		let (panel, _, export) = session.application_mut().exports_with_identity().remove(0);
+		let outcome = session.application_mut().resize_pane(
+			panel,
+			export.width - 0.1,
+			export.height - 0.1,
+			Duration::from_millis(100),
+		);
+		assert!(
+			outcome.is_ok(),
+			"already satisfied resize refused: {outcome:?}"
+		);
+	}
+
+	/// PRODUCT-0158 §2: the loaded snapshot is the panes as they were when
+	/// the application opened - reported, never assumed - and it survives
+	/// later commands.
+	#[test]
+	fn product_0158_loaded_is_the_initial_live_state_and_survives_commands() {
+		let (mut session, _) = session();
+		let figure = session.loaded()[0].clone();
+		assert_eq!(figure.loaded, figure.live);
+		assert!(figure.loaded.size.width > 0.0 && figure.loaded.size.height > 0.0);
+		assert!(figure.loaded.hidden.is_empty());
+		let token = FigureRef::Incarnation(figure.figure.clone());
+		session.apply(&Command::Hide {
+			figure: token,
+			series: 0,
+		});
+		let receipt = session.apply(&Command::Describe {});
+		let described = &receipt.figures.expect("describe")[0];
+		assert_eq!(described.loaded, figure.loaded);
+		assert_eq!(described.live.hidden, vec![0]);
+	}
+
+	/// PRODUCT-0158 §2 and gate 2: `describe --session` opens a saved session
+	/// through the window's own resolver, and what it loads carries no hidden
+	/// set. The store is isolated in a child process, as the saved-session
+	/// tests do, because its location is process-global.
+	#[test]
+	fn product_0158_describe_opens_a_saved_session() {
+		const CHILD: &str = "POLARITON_PRODUCT_0158_SESSION_CHILD";
+		if std::env::var_os(CHILD).is_none() {
+			let state_home = std::env::temp_dir().join(format!(
+				"polariton-product-0158-session-{}-{}",
+				std::process::id(),
+				crate::selection::SurfaceIncarnation::mint().token()
+			));
+			let status = std::process::Command::new(std::env::current_exe().unwrap())
+				.args([
+					"--exact",
+					"gui::state::product_0158_driver_tests::product_0158_describe_opens_a_saved_session",
+					"--nocapture",
+				])
+				.env(CHILD, "1")
+				.env("XDG_STATE_HOME", &state_home)
+				.status()
+				.expect("spawn the isolated saved-session fixture");
+			let _ = std::fs::remove_dir_all(&state_home);
+			assert!(status.success(), "isolated saved-session fixture failed");
+			return;
+		}
+		let authority = super::resolve_startup(super::StartupTarget::CreateSaved).unwrap();
+		let super::StartupAuthority::Saved { session_id, .. } = &authority else {
+			panic!("create must resolve saved authority");
+		};
+		let session_id = *session_id;
+		drop(authority);
+		let target = crate::driver::Target::Session(session_id.to_string());
+		assert_eq!(
+			target.startup().expect("a session id resolves"),
+			super::StartupTarget::OpenSaved(session_id)
+		);
+		let mut application = HeadlessApplication::open_target(
+			target.startup().expect("target"),
+			StartupData::default(),
+		)
+		.expect("the driver opens the saved session");
+		assert_eq!(application.state().session_id, Some(session_id));
+		run_source(application.state_mut(), BufferId::new(80), 1);
+		application
+			.settle_until(Duration::from_secs(20), |state| {
+				state.code_editor.host_plot_exports().len() == 1
+			})
+			.expect("the view's pane projects");
+		let session = Session::new(application);
+		let figure = &session.loaded()[0];
+		assert!(figure.loaded.hidden.is_empty());
+		assert_eq!(figure.loaded.size, figure.live.size);
+		assert!(figure.live.size.width > 0.0);
+	}
+
+	fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+		let mut files = Vec::new();
+		let mut pending = vec![root.to_path_buf()];
+		while let Some(dir) = pending.pop() {
+			for entry in std::fs::read_dir(&dir).expect("read dir") {
+				let path = entry.expect("entry").path();
+				if path.is_dir() {
+					pending.push(path);
+				} else {
+					files.push(path);
+				}
+			}
+		}
+		files.sort();
+		files
 	}
 }

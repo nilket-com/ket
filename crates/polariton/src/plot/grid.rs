@@ -10,8 +10,8 @@
 use crate::coordinate::{Pt, Rect, Widget};
 use crate::plot::common::{
 	AxisTextAnchoring, AxisTextVisibility, BandRequirements, CoordinateTransformer, PlotBackend,
-	PlotComposite, PlotKernel, PlotLayout, PlotWidget, ResolvedPlotSettings, VerticalGuideBands,
-	ViewportGeometry, resolve_canvas_text, union_temporal_axis_domains,
+	PlotComposite, PlotKernel, PlotLayout, PlotWidget, ResolvedPlotSettings, ScatterRenderMode,
+	VerticalGuideBands, ViewportGeometry, resolve_canvas_text, union_temporal_axis_domains,
 };
 use crate::plot::factory::{
 	create_plot, create_plot_from_artifact, create_styled_plot, create_styled_plot_from_artifact,
@@ -704,15 +704,17 @@ impl PlotKernel for PlotGridKernel {
 	}
 }
 
-impl PlotComposite for PlotGridKernel {
-	/// PRODUCT-0157 §1: the same per-cell plot areas `hit_regions` derives.
-	fn rasterizes_identified_series(
+impl PlotGridKernel {
+	/// PRODUCT-0157 §1 and PRODUCT-0158 §2: every cell's plot area, origin at
+	/// zero, the same areas `hit_regions` derives. Coverage and the render
+	/// mode both read these, so neither can disagree with the other.
+	fn cell_plot_areas(
 		&self,
 		bounds: Rect<Widget>,
 		padding: f32,
 		title: &str,
 		settings: &PlotSettings,
-	) -> bool {
+	) -> Vec<IcedRectangle> {
 		let resolved = settings.resolve();
 		let figure_legend_reservation = crate::plot::legend::union(
 			self.cells
@@ -736,22 +738,52 @@ impl PlotComposite for PlotGridKernel {
 			x_label_visible,
 			&resolved,
 		);
-		self.cells.iter().enumerate().any(|(index, cell)| {
-			let (position, _) = &layouts[index];
-			let cell_bounds = grid_cell_bounds_with_settings(
-				tiled,
-				self.arrangement,
-				*position,
-				self.figure_grid,
-			);
-			let cell_resolved = cell.kernel.resolve_settings(settings);
-			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
-			let inner_bounds = inner.into_iced();
-			cell.kernel.rasterizes_identified_series(
-				IcedRectangle::new(Point::ORIGIN, inner_bounds.size()),
-				settings,
-			)
-		})
+		self.cells
+			.iter()
+			.enumerate()
+			.map(|(index, cell)| {
+				let (position, _) = &layouts[index];
+				let cell_bounds = grid_cell_bounds_with_settings(
+					tiled,
+					self.arrangement,
+					*position,
+					self.figure_grid,
+				);
+				let cell_resolved = cell.kernel.resolve_settings(settings);
+				let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &cell_resolved);
+				let inner_bounds = inner.into_iced();
+				IcedRectangle::new(Point::ORIGIN, inner_bounds.size())
+			})
+			.collect()
+	}
+}
+
+impl PlotComposite for PlotGridKernel {
+	/// PRODUCT-0157 §1: the same per-cell plot areas `hit_regions` derives.
+	fn rasterizes_identified_series(
+		&self,
+		bounds: Rect<Widget>,
+		padding: f32,
+		title: &str,
+		settings: &PlotSettings,
+	) -> bool {
+		self.cell_plot_areas(bounds, padding, title, settings)
+			.into_iter()
+			.zip(self.cells.iter())
+			.any(|(area, cell)| cell.kernel.rasterizes_identified_series(area, settings))
+	}
+	/// PRODUCT-0158 §2: the first cell that resolves a scatter mode.
+	fn scatter_render_mode(
+		&self,
+		bounds: Rect<Widget>,
+		padding: f32,
+		title: &str,
+		settings: &PlotSettings,
+	) -> Option<ScatterRenderMode> {
+		self.cell_plot_areas(bounds, padding, title, settings)
+			.into_iter()
+			.zip(self.cells.iter())
+			.find_map(|(area, cell)| cell.kernel.resolved_scatter_render_mode(area, settings))
 	}
 	fn legend_hit_geometry(
 		&self,

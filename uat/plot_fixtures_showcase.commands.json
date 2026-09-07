@@ -1,0 +1,11 @@
+{
+  "commands": [
+    { "describe": {} },
+    { "hide": { "figure": { "view": "fixture-percent-area" }, "series": 0 } },
+    { "hide": { "figure": { "view": "fixture-hostile-label" }, "series": 1 } },
+    { "resize": { "figure": { "view": "fixture-raster-scatter" }, "width": 360, "height": 360 } },
+    { "hide": { "figure": { "view": "fixture-raster-scatter" }, "series": 2 } },
+    { "describe": {} },
+    { "publish": { "directory": "plot_fixtures_showcase_driven" } }
+  ]
+}

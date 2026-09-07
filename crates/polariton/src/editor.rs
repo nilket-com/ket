@@ -2355,6 +2355,22 @@ impl CodeEditor {
 	/// renders. Export follows the window, including a stale last-good plot, and
 	/// never reaches into producer or persisted state.
 	pub(crate) fn host_plot_exports(&self) -> Vec<HostPlotExport> {
+		self.host_plot_exports_with_identity()
+			.into_iter()
+			.map(|(_, _, export)| export)
+			.collect()
+	}
+
+	/// PRODUCT-0158 §2: the same exports, each with the pane it came from and
+	/// the figure incarnation minted when its kernel was installed. One walk
+	/// produces both, so a describe cannot pair an export with the wrong pane.
+	pub(crate) fn host_plot_exports_with_identity(
+		&self,
+	) -> Vec<(
+		HostPanelId,
+		crate::selection::SurfaceIncarnation,
+		HostPlotExport,
+	)> {
 		let Some(viewport) = self.viewport.as_ref() else {
 			return Vec::new();
 		};
@@ -2366,10 +2382,120 @@ impl CodeEditor {
 		)
 	}
 
+	/// PRODUCT-0158 §3: resize one host pane to a plot area of about the given
+	/// pixel size through the engine's own divider drag, the command a pointer
+	/// on a split boundary sends. The pane's right and bottom boundaries move
+	/// when a neighbour shares them; otherwise its left or top. A pane with no
+	/// neighbour on an axis cannot change on that axis and says so. Returns
+	/// whether any boundary had to move: a request the pane already satisfies
+	/// sends nothing and is complete.
+	pub(crate) fn resize_host_pane(
+		&self,
+		panel_id: HostPanelId,
+		width: f32,
+		height: f32,
+	) -> Result<bool, String> {
+		let Some(viewport) = self.viewport.as_ref() else {
+			return Err("no viewport is projected".to_owned());
+		};
+		let pane = viewport
+			.panes
+			.iter()
+			.find(|pane| {
+				pane.host_panel
+					.as_ref()
+					.is_some_and(|host| host.panel_id == panel_id)
+			})
+			.ok_or_else(|| format!("panel {} is not in the viewport", panel_id.get()))?;
+		let columns = ((width + 8.0) / metrics::CELL_WIDTH).ceil().max(1.0) as u32;
+		let rows = ((height + PANE_HEADER_HEIGHT + 8.0) / metrics::LINE_HEIGHT)
+			.ceil()
+			.max(1.0) as u32;
+		let rect = pane.rect;
+		let left = rect.screen_col.get() as u32;
+		let top = rect.screen_row.get() as u32;
+		let right = left + rect.width.get() as u32;
+		let bottom = top + rect.height.get() as u32;
+		let mut commands = Vec::new();
+		if rect.width.get() as u32 != columns {
+			let at_right = viewport.panes.iter().find(|other| {
+				other.pane_id != pane.pane_id
+					&& other.rect.screen_col.get() as u32 == right
+					&& (other.rect.screen_row.get() as u32) < bottom
+					&& other.rect.screen_row.get() as u32 + other.rect.height.get() as u32 > top
+			});
+			let at_left = viewport.panes.iter().find(|other| {
+				other.pane_id != pane.pane_id
+					&& other.rect.screen_col.get() as u32 + other.rect.width.get() as u32 == left
+					&& (other.rect.screen_row.get() as u32) < bottom
+					&& other.rect.screen_row.get() as u32 + other.rect.height.get() as u32 > top
+			});
+			commands.push(match (at_right, at_left) {
+				(Some(other), _) => EditorCommand::ResizePaneBoundary {
+					before: pane.pane_id,
+					after: other.pane_id,
+					axis: SplitDirection::Vertical,
+					target: left + columns,
+				},
+				(None, Some(other)) => EditorCommand::ResizePaneBoundary {
+					before: other.pane_id,
+					after: pane.pane_id,
+					axis: SplitDirection::Vertical,
+					target: right.saturating_sub(columns),
+				},
+				(None, None) => {
+					return Err("the pane has no horizontal neighbour to resize against".to_owned());
+				}
+			});
+		}
+		if rect.height.get() as u32 != rows {
+			let below = viewport.panes.iter().find(|other| {
+				other.pane_id != pane.pane_id
+					&& other.rect.screen_row.get() as u32 == bottom
+					&& (other.rect.screen_col.get() as u32) < right
+					&& other.rect.screen_col.get() as u32 + other.rect.width.get() as u32 > left
+			});
+			let above = viewport.panes.iter().find(|other| {
+				other.pane_id != pane.pane_id
+					&& other.rect.screen_row.get() as u32 + other.rect.height.get() as u32 == top
+					&& (other.rect.screen_col.get() as u32) < right
+					&& other.rect.screen_col.get() as u32 + other.rect.width.get() as u32 > left
+			});
+			commands.push(match (below, above) {
+				(Some(other), _) => EditorCommand::ResizePaneBoundary {
+					before: pane.pane_id,
+					after: other.pane_id,
+					axis: SplitDirection::Horizontal,
+					target: top + rows,
+				},
+				(None, Some(other)) => EditorCommand::ResizePaneBoundary {
+					before: other.pane_id,
+					after: pane.pane_id,
+					axis: SplitDirection::Horizontal,
+					target: bottom.saturating_sub(rows),
+				},
+				(None, None) => {
+					return Err("the pane has no vertical neighbour to resize against".to_owned());
+				}
+			});
+		}
+		let moved = !commands.is_empty();
+		for command in commands {
+			if !self.send(command) {
+				return Err("the editor engine refused the resize".to_owned());
+			}
+		}
+		Ok(moved)
+	}
+
 	fn host_plot_exports_for(
 		&self,
 		projected: impl IntoIterator<Item = (HostPanelId, PaneRect)>,
-	) -> Vec<HostPlotExport> {
+	) -> Vec<(
+		HostPanelId,
+		crate::selection::SurfaceIncarnation,
+		HostPlotExport,
+	)> {
 		let mut seen = std::collections::HashSet::new();
 		let documents = self.durable_documents_by_buffer();
 		projected
@@ -2385,52 +2511,62 @@ impl CodeEditor {
 				let width = rect.width.get() as f32 * metrics::CELL_WIDTH - 8.0;
 				let height =
 					rect.height.get() as f32 * metrics::LINE_HEIGHT - PANE_HEADER_HEIGHT - 8.0;
-				(width >= 1.0 && height >= 1.0).then(|| HostPlotExport {
-					title: plot.display_label.clone(),
-					kernel: Arc::clone(&plot.kernel),
-					settings_model: plot.plot_settings_model.clone(),
-					render_revision: plot.render_revision,
-					resize_render_suspended: plot.resize_render_suspended,
-					width,
-					height,
-					recipe: plot.recipe.clone(),
-					predicate: plot.publication.map_or_else(
-						crate::selection::Predicate::default,
-						|publication| {
-							self.selection_contexts.predicate_for(
-								publication.input,
-								&crate::selection::SourceView::HostPanel(panel_id.get()),
-							)
+				(width >= 1.0 && height >= 1.0).then(|| {
+					(
+						panel_id,
+						plot.surface_incarnation,
+						HostPlotExport {
+							title: plot.display_label.clone(),
+							kernel: Arc::clone(&plot.kernel),
+							settings_model: plot.plot_settings_model.clone(),
+							render_revision: plot.render_revision,
+							resize_render_suspended: plot.resize_render_suspended,
+							width,
+							height,
+							recipe: plot.recipe.clone(),
+							predicate: plot.publication.map_or_else(
+								crate::selection::Predicate::default,
+								|publication| {
+									self.selection_contexts.predicate_for(
+										publication.input,
+										&crate::selection::SourceView::HostPanel(panel_id.get()),
+									)
+								},
+							),
+							selection_revision: plot
+								.publication
+								.and_then(|publication| {
+									self.selection_contexts.revision(publication.input)
+								})
+								.unwrap_or(crate::selection::SelectionRevision::ZERO),
+							displayed_selection_revision: plot.displayed_selection_revision,
+							layout: crate::publication::GridRect {
+								col: rect.screen_col.get() as u32,
+								row: rect.screen_row.get() as u32,
+								width: rect.width.get() as u32,
+								height: rect.height.get() as u32,
+							},
+							view_name: plot.source_attachment.as_ref().and_then(|attachment| {
+								match &attachment.identity {
+									crate::rune_view::LocalViewIdentity::Named(name) => {
+										Some(name.clone())
+									}
+									crate::rune_view::LocalViewIdentity::Anonymous(_) => None,
+								}
+							}),
+							plot_type: plot.plot_type,
+							publication: plot.publication,
+							authored_expression: plot
+								.source_attachment
+								.as_ref()
+								.and_then(|attachment| attachment.expression.clone()),
+							document: plot.source_attachment.as_ref().and_then(|attachment| {
+								documents
+									.get(&attachment.source.buffer_id)
+									.map(|document| document.get())
+							}),
 						},
-					),
-					selection_revision: plot
-						.publication
-						.and_then(|publication| self.selection_contexts.revision(publication.input))
-						.unwrap_or(crate::selection::SelectionRevision::ZERO),
-					displayed_selection_revision: plot.displayed_selection_revision,
-					layout: crate::publication::GridRect {
-						col: rect.screen_col.get() as u32,
-						row: rect.screen_row.get() as u32,
-						width: rect.width.get() as u32,
-						height: rect.height.get() as u32,
-					},
-					view_name: plot.source_attachment.as_ref().and_then(|attachment| {
-						match &attachment.identity {
-							crate::rune_view::LocalViewIdentity::Named(name) => Some(name.clone()),
-							crate::rune_view::LocalViewIdentity::Anonymous(_) => None,
-						}
-					}),
-					plot_type: plot.plot_type,
-					publication: plot.publication,
-					authored_expression: plot
-						.source_attachment
-						.as_ref()
-						.and_then(|attachment| attachment.expression.clone()),
-					document: plot.source_attachment.as_ref().and_then(|attachment| {
-						documents
-							.get(&attachment.source.buffer_id)
-							.map(|document| document.get())
-					}),
+					)
 				})
 			})
 			.collect()
@@ -2454,6 +2590,16 @@ impl CodeEditor {
 		&self,
 	) -> HashMap<libaryon::core::BufferId, libaryon::core::DocumentId> {
 		HashMap::new()
+	}
+
+	/// PRODUCT-0158 §2: host panels the run has prepared but not yet filled.
+	/// A headless run is finished only when this is zero.
+	pub(crate) fn host_panels_running(&self) -> usize {
+		self.panels
+			.panels
+			.values()
+			.filter(|entry| matches!(entry.content, PanelContent::Running))
+			.count()
 	}
 
 	/// PRODUCT-0154 §7: the publications behind every visible plot, in export
@@ -8402,7 +8548,7 @@ mod tests {
 		assert_eq!(
 			exports
 				.iter()
-				.map(|plot| plot.title.as_str())
+				.map(|(_, _, plot)| plot.title.as_str())
 				.collect::<Vec<_>>(),
 			["same/title", "same/title"],
 			"first viewport occurrence orders export; titles neither deduplicate nor name files"

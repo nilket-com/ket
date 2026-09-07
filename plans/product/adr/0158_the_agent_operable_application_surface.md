@@ -81,7 +81,15 @@ its **figure incarnation**: an opaque token minted when a kernel is
 installed in a pane and replaced on every kernel replacement, rerun, or
 layer change. A command carrying a stale incarnation is refused with the
 current one in the receipt, so an agent cannot act on a figure that has
-been replaced under it. Every action is dispatched as the `PlotPaneMsg` the
+been replaced under it. A command may instead name the figure by its
+authored **view name**, which resolves to whatever incarnation stands in
+that view's pane when the command runs: a script written before the
+application ran can address its figures, and the receipt still names the
+incarnation it acted on. Tokens are minted at run time, so a checked-in
+commands file has no other way to name a figure; the view form was added
+under review when gate 8 made that plain. `resize` is the engine's own
+divider drag on the pane's shared boundaries, the command a pointer on a
+split sends, and it moves a neighbour the way a pointer would. Every action is dispatched as the `PlotPaneMsg` the
 legend would send, through the same `update`, with the same idempotence,
 revision bump, and viewport independence PRODUCT-0156 §2 and gate 5 pin.
 Ordinals are the PRODUCT-0157 series-table ordinals of that incarnation.

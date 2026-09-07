@@ -1046,6 +1046,15 @@ impl RuneViewScheduler {
 		Some(pending)
 	}
 
+	/// PRODUCT-0158 §2: nothing submitted is still running or waiting, for a
+	/// headless run that has to know when the application has finished.
+	pub(crate) fn is_idle(&self) -> bool {
+		self.presentation_in_flight.is_empty()
+			&& self.presentation_pending.is_empty()
+			&& self.in_flight.is_empty()
+			&& self.pending.is_empty()
+	}
+
 	pub(crate) fn cancel(&mut self, source_buffer: BufferId) {
 		self.presentation_in_flight.remove(&source_buffer);
 		self.presentation_pending.remove(&source_buffer);

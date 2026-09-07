@@ -1,3 +1,4 @@
 /target/
 /.codex/
 .DS_Store
+/plot_fixtures_showcase_driven/

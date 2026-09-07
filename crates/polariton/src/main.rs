@@ -2,6 +2,7 @@ mod adapters;
 mod configuration;
 mod coordinate;
 mod core;
+mod driver;
 mod editor;
 mod fonts;
 mod gui;
@@ -43,6 +44,18 @@ fn main() -> gui::Result {
 		ApplicationAction::Serve { root, bind } => {
 			publication::serve(root, bind).map_err(|error| error.into())
 		}
+		ApplicationAction::Drive {
+			source,
+			commands,
+			receipt,
+		} => {
+			ensure_rustls_provider();
+			driver::drive(&source, &commands, &receipt).map_err(|error| error.into())
+		}
+		ApplicationAction::Describe { target } => {
+			ensure_rustls_provider();
+			driver::describe(&target).map_err(|error| error.into())
+		}
 		ApplicationAction::Gui(startup_target) => {
 			ensure_rustls_provider();
 			let startup_data = configuration::load_startup_data();
@@ -60,6 +73,17 @@ enum ApplicationAction {
 		root: std::path::PathBuf,
 		bind: std::net::SocketAddr,
 	},
+	/// PRODUCT-0158 §6: `polariton drive <source.rn> --commands <file> --receipt <file>`.
+	Drive {
+		source: std::path::PathBuf,
+		commands: std::path::PathBuf,
+		receipt: std::path::PathBuf,
+	},
+	/// PRODUCT-0158 §2: `polariton describe <source.rn | --session id>`, a
+	/// receipt on stdout.
+	Describe {
+		target: driver::Target,
+	},
 }
 
 /// Match Baryon's positional-file behavior without making Polariton's GUI
@@ -74,6 +98,14 @@ where
 	if args.peek().is_some_and(|arg| arg == "serve") {
 		args.next();
 		return serve_action(args);
+	}
+	if args.peek().is_some_and(|arg| arg == "drive") {
+		args.next();
+		return drive_action(args);
+	}
+	if args.peek().is_some_and(|arg| arg == "describe") {
+		args.next();
+		return describe_action(args);
 	}
 	let mut parse_flags = true;
 	let mut initial_file = None;
@@ -276,7 +308,9 @@ mod tests {
 		match action_from_args(args)? {
 			ApplicationAction::Gui(target) => Ok(target),
 			ApplicationAction::ListSessions => Err("expected GUI target".to_owned()),
-			ApplicationAction::Serve { .. } => Err("expected GUI target".to_owned()),
+			ApplicationAction::Serve { .. }
+			| ApplicationAction::Drive { .. }
+			| ApplicationAction::Describe { .. } => Err("expected GUI target".to_owned()),
 		}
 	}
 
@@ -459,6 +493,110 @@ mod tests {
 			"saved sessions require Polariton's `toron` feature"
 		);
 	}
+
+	/// PRODUCT-0158 §6: `drive` takes a source and both files, nothing else.
+	#[test]
+	fn product_0158_drive_requires_source_commands_and_receipt() {
+		let action = action_from_args(
+			[
+				"polariton",
+				"drive",
+				"uat/plot_fixtures_showcase.rn",
+				"--commands",
+				"uat/plot_fixtures_showcase.commands.json",
+				"--receipt",
+				"/tmp/receipt.json",
+			]
+			.map(str::to_owned),
+		)
+		.unwrap();
+		assert_eq!(
+			action,
+			ApplicationAction::Drive {
+				source: "uat/plot_fixtures_showcase.rn".into(),
+				commands: "uat/plot_fixtures_showcase.commands.json".into(),
+				receipt: "/tmp/receipt.json".into(),
+			}
+		);
+		for (arguments, message) in [
+			(
+				vec!["drive", "--commands", "c.json", "--receipt", "r.json"],
+				"drive requires a source file",
+			),
+			(
+				vec!["drive", "a.rn", "--receipt", "r.json"],
+				"drive requires --commands <file>",
+			),
+			(
+				vec!["drive", "a.rn", "--commands", "c.json"],
+				"drive requires --receipt <file>",
+			),
+			(
+				vec![
+					"drive",
+					"a.rn",
+					"b.rn",
+					"--commands",
+					"c.json",
+					"--receipt",
+					"r.json",
+				],
+				"drive takes exactly one source file",
+			),
+			(
+				vec![
+					"drive",
+					"a.rn",
+					"--window",
+					"1",
+					"--commands",
+					"c.json",
+					"--receipt",
+					"r.json",
+				],
+				"unknown drive option \"--window\"",
+			),
+		] {
+			let mut full = vec!["polariton"];
+			full.extend(arguments);
+			assert_eq!(
+				action_from_args(full.into_iter().map(str::to_owned)).unwrap_err(),
+				message
+			);
+		}
+	}
+
+	/// PRODUCT-0158 §2: `describe` takes exactly one source.
+	#[test]
+	fn product_0158_describe_takes_one_source() {
+		assert_eq!(
+			action_from_args(["polariton", "describe", "a.rn"].map(str::to_owned)).unwrap(),
+			ApplicationAction::Describe {
+				target: super::driver::Target::Source("a.rn".into())
+			}
+		);
+		assert_eq!(
+			action_from_args(["polariton", "describe", "--session", "abc"].map(str::to_owned))
+				.unwrap(),
+			ApplicationAction::Describe {
+				target: super::driver::Target::Session("abc".to_owned())
+			}
+		);
+		assert_eq!(
+			action_from_args(["polariton", "describe"].map(str::to_owned)).unwrap_err(),
+			"describe requires a source file or --session <id>"
+		);
+		assert_eq!(
+			action_from_args(["polariton", "describe", "--session"].map(str::to_owned))
+				.unwrap_err(),
+			"--session requires a session id"
+		);
+		assert_eq!(
+			action_from_args(["polariton", "describe", "a.rn", "b.rn"].map(str::to_owned))
+				.unwrap_err(),
+			"describe takes exactly one source file or one --session id"
+		);
+	}
 }
 
 /// `serve <package-directory> [--bind host:port]`, localhost by default and
@@ -485,4 +623,72 @@ where
 	}
 	let root = root.ok_or_else(|| "serve requires a package directory".to_owned())?;
 	Ok(ApplicationAction::Serve { root, bind })
+}
+
+/// PRODUCT-0158 §6: `drive <source.rn> --commands <file> --receipt <file>`,
+/// every part required, no other option.
+fn drive_action<I>(mut args: I) -> Result<ApplicationAction, String>
+where
+	I: Iterator<Item = String>,
+{
+	let mut source = None;
+	let mut commands = None;
+	let mut receipt = None;
+	while let Some(arg) = args.next() {
+		match arg.as_str() {
+			"--commands" => {
+				let value = args
+					.next()
+					.ok_or_else(|| "--commands requires a file path".to_owned())?;
+				if commands.replace(std::path::PathBuf::from(value)).is_some() {
+					return Err("--commands may occur at most once".to_owned());
+				}
+			}
+			"--receipt" => {
+				let value = args
+					.next()
+					.ok_or_else(|| "--receipt requires a file path".to_owned())?;
+				if receipt.replace(std::path::PathBuf::from(value)).is_some() {
+					return Err("--receipt may occur at most once".to_owned());
+				}
+			}
+			other if other.starts_with('-') => {
+				return Err(format!("unknown drive option {other:?}"));
+			}
+			other => {
+				if source.replace(std::path::PathBuf::from(other)).is_some() {
+					return Err("drive takes exactly one source file".to_owned());
+				}
+			}
+		}
+	}
+	Ok(ApplicationAction::Drive {
+		source: source.ok_or_else(|| "drive requires a source file".to_owned())?,
+		commands: commands.ok_or_else(|| "drive requires --commands <file>".to_owned())?,
+		receipt: receipt.ok_or_else(|| "drive requires --receipt <file>".to_owned())?,
+	})
+}
+
+/// PRODUCT-0158 §2: `describe <source.rn>` or `describe --session <id>`.
+fn describe_action<I>(mut args: I) -> Result<ApplicationAction, String>
+where
+	I: Iterator<Item = String>,
+{
+	let first = args
+		.next()
+		.ok_or_else(|| "describe requires a source file or --session <id>".to_owned())?;
+	let target = if first == "--session" {
+		let id = args
+			.next()
+			.ok_or_else(|| "--session requires a session id".to_owned())?;
+		driver::Target::Session(id)
+	} else if first.starts_with('-') {
+		return Err(format!("unknown describe option {first:?}"));
+	} else {
+		driver::Target::Source(std::path::PathBuf::from(first))
+	};
+	if args.next().is_some() {
+		return Err("describe takes exactly one source file or one --session id".to_owned());
+	}
+	Ok(ApplicationAction::Describe { target })
 }

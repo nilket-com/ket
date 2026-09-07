@@ -4,6 +4,7 @@ mod menu;
 pub mod messages;
 pub mod plot_pane;
 mod state;
+pub(crate) use state::headless::HeadlessApplication;
 pub mod statusbar;
 pub mod table;
 pub mod table_skin;
