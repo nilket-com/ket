@@ -1,7 +1,9 @@
 # PRODUCT-0157 gate 10: browser acceptance
 
 Status: browser checklist observations complete 2026-09-04, with transport
-and automation qualifications below. Product acceptance remains pending.
+and automation qualifications below. The table records the scope each row
+verified, per transport, across the passes dated below; PRODUCT-0157 was
+accepted on 2026-09-05.
 
 ## Environment and inputs
 
@@ -35,14 +37,14 @@ opening unless explicitly qualified.
 | Stacked-area gap | Pass: hiding Horizon leaves the lower band empty. Surviving path data and all other SVG geometry stay unchanged. Captured and visually inspected. Percent normalization remains untested in these packages. |
 | Hover | Pass on categorical scatter: a packaged mark centre gives exactly its packaged presentation string; hiding its series yields no tooltip; showing restores that same string at the same pointer. |
 | Modifier combinations | Pass: Shift+Control, Shift+Meta, and Shift+Alt are inert; plain Shift isolates. These are Chromium-dispatched modifiers on Linux, not native macOS observations. |
-| Gesture ownership | Pass for a real Chromium pointer-capture sequence releasing outside the SVG, followed by plot-area press and legend release: no toggle. Outside the OS window and Alt-Tab remain untested by this headless pass. |
+| Gesture ownership | Pass for a real Chromium pointer-capture sequence releasing outside the SVG, followed by plot-area press and legend release: no toggle. Outside the OS window: pass served (headed Chromium, ydotool) and direct-file (native follow-up), each with a positive-control click. Alt-Tab: pass direct-file by operator hand check; the served case was not repeated. |
 | Figure independence | Pass: actions on each figure leave every other figure's SVG unchanged. |
 | Clip fix / parallel axes | Pass: document IDs are unique and every group clip reference resolves inside its own SVG. All five parallel axes are visible in the capture. Operator also confirmed the fix. |
 | Restored pixels | Pass in the fixed-scroll full-page control: baseline and restored PNG bytes are identical for both packages, served and direct-file. A scroll-only control is also identical. |
 | Script/runtime | Each shell has one executable script; no page JavaScript errors were observed. This does not substitute for the hostile-label fixture. |
-| Hostile label | Pending: neither supplied package is the explicit hostile-label fixture. |
-| Raster swatches and inert legend | Pending: neither supplied package contains the rasterized-scatter fixture. |
-| Large hidden-set hover timing | Pending: the supplied categorical scatter has only three series; no near-bound latency claim is made. |
+| Hostile label | Pass in the fixture package, served and direct-file: the exact `</script><script>alert(1)</script> & <` occurs in SVG text, its own legend entry toggles, one executable script exists, and no dialogs or page errors occurred. |
+| Raster swatches and inert legend | Pass in the fixture packages, served and direct-file: the manifest says inert with reason raster, one image sits outside any series group, and plain and shift clicks on all three legend rectangles leave the SVG unchanged. The hidden-series swatch has fill opacity 0.25 with its group and ancestors at 1 and no snapshot class, so dimming is not doubled. Inspection is omitted for the 1,157,625-region bound. |
+| Large hidden-set hover timing | Pending: no package carried a near-bound hidden set; the observations are not a timing acceptance threshold. |
 
 ## Screenshot control and operator evidence
 
@@ -167,6 +169,6 @@ The test browser closed normally; the desktop Polariton was not touched.
 
 This completes the remaining outside-window check. Alt-Tab evidence remains
 the operator's direct-file observation above, not an automated or separately
-observed served pass. Earlier pending statements describe earlier passes.
-No further browser-checklist actions remain under that stated scope;
+observed served pass. The observation table above carries each row's
+verified scope. No further browser-checklist actions remain under that scope;
 product acceptance, the full verification ladder, and push are separate.

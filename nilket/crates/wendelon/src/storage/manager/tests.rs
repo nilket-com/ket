@@ -14330,8 +14330,87 @@ async fn tombstone_pass_budgets_attempts_and_walks_the_sealed_slabs() {
 	}
 }
 
+/// ADR 0098 decision 4: admission and reservation are one operation under the
+/// manager lock, so the bound on overshoot is a property of the reservation and
+/// not of a cursor read. When the guard returns, the cursor has already moved by
+/// the padded record; a second admission taken before the first write lands is
+/// judged against that reservation and rotates. A guard that reads the cursor
+/// and lets the write reserve later passes the sequential test below and fails
+/// here: the cursor is still zero after the first admission and the second
+/// payload is admitted to the same slab.
+#[tokio::test]
+async fn append_admission_reserves_the_padded_record_under_the_lock() {
+	let mgr = fresh_manager().await;
+	let cap = mgr.config.max_slab_bytes;
+	let frame_len = 600 * 1024;
+	let (_, padded) = LocalSlabStore::padded_record_size(frame_len).unwrap();
+	assert!((padded as u64) * 2 > cap && (padded as u64) < cap);
+
+	let (first_slab, first) = mgr.target_for_append(frame_len).await.unwrap();
+	assert_eq!(
+		first_slab.write_cursor(),
+		padded as u64,
+		"the guard reserved the padded record before returning"
+	);
+	assert_eq!(first.padded_size(), padded);
+
+	let (second_slab, second) = mgr.target_for_append(frame_len).await.unwrap();
+	assert!(
+		second_slab.slab_id() > first_slab.slab_id(),
+		"the second admission saw the first reservation and rotated"
+	);
+
+	// Consume both tokens so the slabs hold what they reserved.
+	let frame = vec![0x3C_u8; frame_len];
+	let second_location = second_slab
+		.append_reserved(second, tenant(), id(0x9A21), hlc(31), &frame)
+		.await
+		.unwrap();
+	let first_location = first_slab
+		.append_reserved(first, tenant(), id(0x9A20), hlc(30), &frame)
+		.await
+		.unwrap();
+	assert_eq!(first_location.offset, 0);
+	assert_eq!(second_location.offset, 0);
+	assert_eq!(first_slab.write_cursor(), padded as u64);
+}
+
+/// ADR 0098 decision 4: the guard judges the record the slab reserves, header
+/// and page padding included, not the raw frame. A frame whose raw length fits
+/// under the cap but whose padded record does not is rotated. Under a raw-length
+/// check it lands in the first slab and carries it over the cap.
+#[tokio::test]
+async fn append_admission_judges_the_padded_record_not_the_frame() {
+	let mgr = fresh_manager().await;
+	let cap = mgr.config.max_slab_bytes as usize;
+	let page = crate::storage::io_uring::DIRECT_IO_ALIGN;
+
+	// One page of prior record, then a frame chosen so that
+	// cursor + frame_len < cap but cursor + padded > cap.
+	let (_, small_padded) = LocalSlabStore::padded_record_size(16).unwrap();
+	assert_eq!(small_padded, page);
+	let header = LocalSlabStore::padded_record_size(0).unwrap().0;
+	let frame_len = cap - page - header + 1;
+	let (_, padded) = LocalSlabStore::padded_record_size(frame_len).unwrap();
+	assert_eq!(padded, cap);
+	assert!(page + frame_len < cap);
+
+	let small = mgr
+		.append_durable(tenant(), id(0x9A30), hlc(40), &[0x11_u8; 16])
+		.await
+		.unwrap();
+	let big = mgr
+		.append_durable(tenant(), id(0x9A31), hlc(41), &vec![0x22_u8; frame_len])
+		.await
+		.unwrap();
+	assert!(
+		big.slab_id > small.slab_id,
+		"the padded record would cross the cap, so the frame rotated: {small:?} {big:?}"
+	);
+}
+
 /// ADR 0098 decision 4: an append that would carry the active slab across the
-/// cap rotates first; the cursor-only rule lands the second 600 KiB payload in
+/// cap rotates first; a cursor-only rule lands the second 600 KiB payload in
 /// the first slab. A payload larger than the cap still enters an empty slab.
 #[tokio::test]
 async fn append_rotates_before_a_payload_would_cross_the_cap() {

@@ -78,9 +78,10 @@ use crate::storage::columnar::{
 	survival_mask_projected_record_batch,
 };
 use crate::storage::core::{
-	GroupCommitConfig, LocalSlabStore, MultiRowIndexEntry, RecordLocation, RecoveredSlabEntry,
-	StorageEngine, insert_version_sorted, newest_version_as_of, recover_slab_entries_from_blob,
-	remove_version_exact, storage_multirow_index_entries_from_frame, validate_row_tombstone_chain,
+	AppendReservation, GroupCommitConfig, LocalSlabStore, MultiRowIndexEntry, RecordLocation,
+	RecoveredSlabEntry, StorageEngine, insert_version_sorted, newest_version_as_of,
+	recover_slab_entries_from_blob, remove_version_exact,
+	storage_multirow_index_entries_from_frame, validate_row_tombstone_chain,
 };
 use crate::storage::encoding::compute::{
 	EncodedAggregateContext, EncodedPredicateNode, EncodedRowMask, EncodingComputeFallbackReason,
@@ -808,8 +809,10 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 		frame: &[u8],
 	) -> std::io::Result<(Arc<LocalSlabStore>, RecordLocation)> {
-		let slab = self.target_for_append(frame.len() as u64).await?;
-		let location = slab.append(tenant_id, key_identity, hlc, frame).await?;
+		let (slab, reservation) = self.target_for_append(frame.len()).await?;
+		let location = slab
+			.append_reserved(reservation, tenant_id, key_identity, hlc, frame)
+			.await?;
 		Ok((slab, location))
 	}
 
@@ -910,11 +913,12 @@ impl SlabManager {
 		value: u64,
 	) -> std::io::Result<RecordLocation> {
 		let frame = CounterTentativeFrame { value };
-		let slab = self
-			.target_for_append(size_of::<CounterTentativeFrame>() as u64)
+		let (slab, reservation) = self
+			.target_for_append(size_of::<CounterTentativeFrame>())
 			.await?;
 		let location = slab
-			.write_framed(
+			.write_reserved(
+				reservation,
 				tenant_id,
 				key_identity,
 				hlc,
@@ -940,10 +944,11 @@ impl SlabManager {
 		tentative_op_id: u64,
 	) -> std::io::Result<()> {
 		let marker = CounterCommitFrame { tentative_op_id };
-		let slab = self
-			.target_for_append(size_of::<CounterCommitFrame>() as u64)
+		let (slab, reservation) = self
+			.target_for_append(size_of::<CounterCommitFrame>())
 			.await?;
-		slab.write_framed(
+		slab.write_reserved(
+			reservation,
 			tenant_id,
 			key_identity,
 			hlc,
@@ -3166,17 +3171,25 @@ impl SlabManager {
 		Ok(MigrationIngestOutcome::Inserted(location))
 	}
 
-	/// Acquire the slab that should receive the next append of `payload_bytes`,
-	/// rotating first if the active slab has crossed the size cap or the payload
-	/// would carry it across. An empty slab admits any payload: the cap bounds
-	/// overshoot to one payload and never refuses a record (ADR 0098).
-	async fn target_for_append(&self, payload_bytes: u64) -> std::io::Result<Arc<LocalSlabStore>> {
+	/// Admit a frame of `frame_len` bytes to the active slab and reserve its
+	/// page-rounded record there, rotating first if the slab has crossed the
+	/// size cap or the record would carry it across. Admission and reservation
+	/// happen under one lock, so the cursor a later writer is judged against
+	/// already includes this record. An empty slab admits one complete record of
+	/// any size: the cap bounds overshoot to one padded record and never refuses
+	/// a frame (ADR 0098).
+	async fn target_for_append(
+		&self,
+		frame_len: usize,
+	) -> std::io::Result<(Arc<LocalSlabStore>, AppendReservation)> {
+		let (_, padded) = LocalSlabStore::padded_record_size(frame_len)?;
 		let mut state = self.state.lock().await;
 		let cursor = state.active.write_cursor();
 		let fits =
-			cursor == 0 || cursor.saturating_add(payload_bytes) <= self.config.max_slab_bytes;
+			cursor == 0 || cursor.saturating_add(padded as u64) <= self.config.max_slab_bytes;
 		if cursor < self.config.max_slab_bytes && fits {
-			return Ok(state.active.clone());
+			let reservation = state.active.reserve_append(frame_len)?;
+			return Ok((state.active.clone(), reservation));
 		}
 
 		// Rotate. The check above and the mutation below happen
@@ -3201,7 +3214,8 @@ impl SlabManager {
 		state.next_slab_id = next_id.saturating_add(1);
 		self.record_l0_compaction_run(sealed_id, sealed_size);
 
-		Ok(next_slab)
+		let reservation = next_slab.reserve_append(frame_len)?;
+		Ok((next_slab, reservation))
 	}
 
 	/// Resolve the authoritative backing for a slab, which may be

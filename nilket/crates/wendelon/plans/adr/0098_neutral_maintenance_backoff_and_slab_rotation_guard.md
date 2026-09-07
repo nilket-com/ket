@@ -41,10 +41,11 @@ report grammar cannot express, and the record says to add a distinct
 `BackingOff` variant rather than misreport them as retryable races. This cut
 touches the same report page and closes that item.
 
-Containment is applied on the local profile: `[time]
-mvcc_retention_window_secs = 0` in the local `wendelon.toml` disables the
+Containment was applied on the local profile during diagnosis: `[time]
+mvcc_retention_window_secs = 0` in the local `wendelon.toml` disabled the
 retention scan and took the daemon from 110% to 11% of a core. The tombstone
-pass still runs the neutral loop over the small slabs. Containment is not a fix.
+pass still ran the neutral loop over the small slabs. Containment is not a fix;
+the line was removed when this cut was deployed.
 
 ## Decision
 
@@ -96,11 +97,25 @@ control server, the client crate, and the Toron maintenance CLI, which prints
 
 ### 4. Append rotation is payload-aware
 
-`target_for_append(payload_bytes)` admits the active slab when the cursor is
-under the cap **and** either the slab is empty or the payload fits under the
-cap. Otherwise it rotates first. A payload larger than the cap is still admitted
-into an empty slab: the cap bounds overshoot to one payload, never refuses a
-record. Every append path passes the frame length it is about to write.
+`target_for_append(frame_len)` admits the active slab when the cursor is under
+the cap **and** either the slab is empty or the record the slab would reserve
+for the frame - header, frame, and page padding - fits under the cap.
+Otherwise it rotates first. Admission and the byte reservation are one
+operation under the manager lock: the guard reserves the record on the slab it
+chose and returns the reservation as a token the write consumes. The cursor a
+later writer is judged against therefore already includes every admitted
+record, whether or not its write has landed. The token is not `Clone`, so a
+range is written at most once; it carries its slab id, so a write on another
+slab is refused at runtime before any byte lands. A frame larger than the cap
+is still admitted into an empty slab as one complete page-rounded record: the
+cap bounds overshoot to one such record and never refuses a frame. Every append
+path passes the frame length it is about to write.
+
+The first cut of this decision read the cursor under the lock and let the
+write reserve later. Two writers reaching the guard before either reserved
+were both admitted, so the bound held per writer, not per slab; and the guard
+compared the raw frame length while the slab reserved the padded record. Both
+are corrected by reserving under the lock.
 
 ## Acceptance
 
@@ -121,6 +136,12 @@ record. Every append path passes the frame length it is about to write.
   that order without skipping or repeating one.
 - Three appends of 600 KiB against a 1 MiB cap land in three slabs. Under the
   cursor-only rule the second append lands in the first slab.
+- When the guard returns for a 600 KiB frame, the slab's cursor has already
+  advanced by the padded record, and a second admission taken before the
+  first write lands rotates. A guard that reads the cursor and lets the write
+  reserve later leaves the cursor at zero and admits both to one slab.
+- A frame whose raw length fits under the cap but whose padded record does not
+  is rotated. Under a raw-length comparison it lands in the first slab.
 - `cargo test -p wendelon --test tombstone_compaction`,
   `--test migration_sweeper`, the `maintenance_policy` and `manager` unit tests,
   `cargo test -p toron cli::maintenance`, both architecture tests, and
@@ -135,7 +156,12 @@ record. Every append path passes the frame length it is about to write.
   work still rewrites up to `max_slabs` slabs. It only stops a pass that finds
   none from decoding the whole node.
 - The rotation guard never refuses an append and never splits a frame. It moves
-  the rotation decision from "after the cap was crossed" to "before it would be".
+  the rotation decision from "after the cap was crossed" to "before it would be",
+  and the bound it states is a property of the reservation, not of a cursor
+  read: no admission happens outside the critical section that reserves.
+- A reservation that is dropped unwritten leaves the same zeroed hole a failed
+  write leaves today, and recovery treats both the same way. The guard changes
+  where the reservation is taken, not what an unwritten range means.
 
 ## Risks
 

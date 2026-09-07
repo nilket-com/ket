@@ -234,6 +234,31 @@ pub trait StorageEngine: Send + Sync {
 	) -> Option<RecordLocation>;
 }
 
+/// A page-aligned byte range one slab has set aside for one framed record.
+///
+/// Admission to a slab and the byte reservation that admission is judged
+/// against must be a single operation, or two writers can both pass the size
+/// cap against one cursor. The manager therefore reserves under its lock and
+/// hands the range to the writer as this token. It is deliberately not
+/// `Clone`: [`LocalSlabStore::write_reserved`] consumes it, so a range is
+/// written at most once. The slab id it carries lets the write refuse a token
+/// taken on another slab.
+#[derive(Debug)]
+pub struct AppendReservation {
+	slab_id: SlabId,
+	offset: u64,
+	payload_size: usize,
+	padded_size: usize,
+}
+
+impl AppendReservation {
+	/// Bytes the slab's cursor advanced for this record: header, frame, and
+	/// page padding.
+	pub fn padded_size(&self) -> usize {
+		self.padded_size
+	}
+}
+
 /// A high-performance storage implementation using io_uring and O_DIRECT.
 pub struct LocalSlabStore {
 	/// In-memory multi-version index: Identity -> versions sorted
@@ -487,16 +512,108 @@ impl LocalSlabStore {
 		record_class: u32,
 		frame: &[u8],
 	) -> std::io::Result<RecordLocation> {
+		let reservation = self.reserve_append(frame.len())?;
+		self.write_reserved(
+			reservation,
+			tenant_id,
+			key_identity,
+			hlc,
+			record_class,
+			frame,
+		)
+		.await
+	}
+
+	/// The on-disk footprint of a frame: the header-inclusive payload size and
+	/// the page-rounded size the slab actually reserves for it. Rotation
+	/// decisions and reservations must agree on this number, so both read it
+	/// from here.
+	pub(crate) fn padded_record_size(frame_len: usize) -> std::io::Result<(usize, usize)> {
 		let header_size = std::mem::size_of::<SlabRecordHeader>();
 		let payload_size = header_size
-			.checked_add(frame.len())
+			.checked_add(frame_len)
 			.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "frame length overflows usize"))?;
-		let padded_size = page_round_up(payload_size);
+		Ok((payload_size, page_round_up(payload_size)))
+	}
 
-		// Reserve a disjoint, page-aligned byte range.
+	/// Reserve a disjoint, page-aligned byte range for a frame of `frame_len`
+	/// bytes. The cursor advances here, so a caller that decides admission on
+	/// the cursor and reserves in the same critical section sees every earlier
+	/// reservation, including ones whose write has not landed yet.
+	///
+	/// A reservation that is never written leaves a zeroed hole exactly like a
+	/// failed write does today: recovery stops at the first page without a
+	/// record magic. Consume it with [`write_reserved`](Self::write_reserved)
+	/// on the same task that took it.
+	pub(crate) fn reserve_append(&self, frame_len: usize) -> std::io::Result<AppendReservation> {
+		let (payload_size, padded_size) = Self::padded_record_size(frame_len)?;
 		let offset = self
 			.next_offset
 			.fetch_add(padded_size as u64, Ordering::AcqRel);
+		Ok(AppendReservation {
+			slab_id: self.slab_id,
+			offset,
+			payload_size,
+			padded_size,
+		})
+	}
+
+	/// Write a STANDARD frame into `reservation` and index it, the reserved
+	/// counterpart of [`append`](StorageEngine::append).
+	pub(crate) async fn append_reserved(
+		&self,
+		reservation: AppendReservation,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+		frame: &[u8],
+	) -> std::io::Result<RecordLocation> {
+		let location = self
+			.write_reserved(
+				reservation,
+				tenant_id,
+				key_identity,
+				hlc,
+				crate::schema::record_class::STANDARD,
+				frame,
+			)
+			.await?;
+		self.index_location(tenant_id, key_identity, location);
+		Ok(location)
+	}
+
+	/// Write a framed record of `record_class` into a range this slab reserved
+	/// for a frame of exactly this length. The reservation is consumed by value,
+	/// so a range is written at most once; a reservation taken on another slab
+	/// or for a different frame length is refused before any byte is written.
+	pub(crate) async fn write_reserved(
+		&self,
+		reservation: AppendReservation,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+		record_class: u32,
+		frame: &[u8],
+	) -> std::io::Result<RecordLocation> {
+		let header_size = std::mem::size_of::<SlabRecordHeader>();
+		let AppendReservation {
+			slab_id,
+			offset,
+			payload_size,
+			padded_size,
+		} = reservation;
+		if slab_id != self.slab_id {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"append reservation belongs to another slab",
+			));
+		}
+		if payload_size != header_size + frame.len() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"append reservation was sized for a different frame",
+			));
+		}
 
 		// Build the payload: header (checksum=0) || frame, then patch the
 		// checksum over (header-with-zero-checksum || frame). `record_class`

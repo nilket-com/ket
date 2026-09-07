@@ -9335,15 +9335,17 @@ fn adr078_slab_manager_public_surface_stays_in_root() {
 /// retention-reclaim module, preserving ADR 078's decomposition boundary.
 /// ADR 0098 decision 4 makes append rotation payload-aware: the root's append
 /// entry points pass their payload size to `target_for_append`, nine lines that
-/// belong beside the rotation they govern rather than in a carved module.
+/// belong beside the rotation they govern rather than in a carved module. The
+/// same decision later moved the byte reservation under the rotation lock, so
+/// the guard reserves and returns a token: a dozen more lines, same home.
 #[test]
 fn adr078_root_is_bounded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let root = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
 	let lines = root.lines().count();
 	assert!(
-		lines <= 4_575,
-		"manager.rs root is {lines} lines (cap 4_575); carve more or justify a deliberate cap bump"
+		lines <= 4_590,
+		"manager.rs root is {lines} lines (cap 4_590); carve more or justify a deliberate cap bump"
 	);
 }
 

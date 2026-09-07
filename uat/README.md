@@ -77,11 +77,12 @@ nilket toron sql --file uat/plot_fixtures_showcase.sql
 cargo run --release -p polariton -- uat/plot_fixtures_showcase.rn
 ```
 
-Release, deliberately: PRODUCT-0140 priced the downsampled arm at about 1.3 s
-per frame in release at full-window density 8, re-scanned on every cache
-miss, and a debug build multiplies that by tens. Drag the raster pane small
-before the million points arrive if you can; once under the gate the raster
-arm draws in tens of milliseconds.
+Release, deliberately: a debug build multiplies mark preparation by tens.
+Since PRODUCT-0159 the scatter arms batch one fill per mark instead of one
+compound path, so the million points arrive without resizing the pane; the
+desktop's worst unserviced tick during that build measured about 260 ms in
+release. Once under the raster gate the raster arm draws in tens of
+milliseconds.
 
 A percent-normalized stacked area, a line whose second series label is the
 PRODUCT-0155 hostile string, and a 1,157,625-point categorical scatter that
