@@ -179,6 +179,7 @@ pub(crate) enum MaintenanceOperation {
 }
 
 impl MaintenanceOperation {
+	#[cfg(test)]
 	pub(crate) const ALL: [Self; 4] = [
 		Self::LsmCompaction,
 		Self::RetentionPrune,
@@ -251,14 +252,6 @@ impl DeterministicFailure {
 	pub(crate) fn origin(&self) -> DeterministicOrigin {
 		self.origin
 	}
-
-	pub(crate) fn reason(&self) -> DeterministicFailureReason {
-		self.origin.reason()
-	}
-
-	pub(crate) fn detail(&self) -> &str {
-		&self.detail
-	}
 }
 
 impl fmt::Display for DeterministicFailure {
@@ -298,6 +291,7 @@ pub enum MaintenanceFailureClass {
 	Deterministic(DeterministicOrigin),
 }
 
+#[cfg(test)]
 impl MaintenanceFailureClass {
 	pub const fn is_deterministic(self) -> bool {
 		matches!(self, Self::Deterministic(_))
@@ -3462,10 +3456,12 @@ impl DeterministicReceipt {
 		self.attempts
 	}
 
+	#[cfg(test)]
 	pub(crate) fn last_failure_ms(&self) -> u64 {
 		self.last_failure_ms
 	}
 
+	#[cfg(test)]
 	pub(crate) fn next_eligible_at_ms(&self) -> Option<u64> {
 		self.next_eligible_at_ms
 	}
@@ -3913,10 +3909,12 @@ impl MaintenancePolicyInner {
 		}
 	}
 
+	#[cfg(test)]
 	pub(crate) fn is_enabled(&self) -> bool {
 		matches!(*self.lock(), PolicyState::Enabled { .. })
 	}
 
+	#[cfg(test)]
 	pub(crate) fn diagnostic(&self) -> Option<String> {
 		match &*self.lock() {
 			PolicyState::Disabled { diagnostic } => Some(diagnostic.clone()),
@@ -5056,13 +5054,6 @@ impl MaintenancePolicyInner {
 		match result {
 			Ok(value) => MaintenanceAttempt::Completed(value),
 			Err(error) => MaintenanceAttempt::Failed(error),
-		}
-	}
-
-	fn store(&self) -> Option<Arc<PersistentLocalIndex>> {
-		match &*self.lock() {
-			PolicyState::Enabled { store, .. } => Some(Arc::clone(store)),
-			PolicyState::Disabled { .. } => None,
 		}
 	}
 
