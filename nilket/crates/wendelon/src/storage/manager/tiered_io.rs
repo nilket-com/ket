@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct TieredRowRefreshPlan {
@@ -62,7 +63,8 @@ pub(super) fn decode_tiered_blob(
 			}
 			let DecryptedTieredSlab { plaintext, .. } =
 				crypto.decrypt_tiered_slab(pointer.slab_id, blob)?;
-			let payload_tenant_id = single_tenant_id_from_plain_slab(&plaintext, pointer.slab_id)?;
+			let payload_tenant_id =
+				single_tenant_id_from_plain_slab(&plaintext, pointer.slab_id, &BTreeSet::new())?;
 			if payload_tenant_id != tenant_id {
 				return Err(Error::new(
 					ErrorKind::InvalidData,
@@ -299,8 +301,9 @@ pub(super) fn build_tiered_object_metadata(
 	blob: &[u8],
 	slab_id: SlabId,
 	chunk_layout_config: &L2ChunkLayoutConfig,
+	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<TieredSlabObjectMetadata> {
-	let entries = recover_slab_entries_from_blob(blob, slab_id)?;
+	let entries = recover_slab_entries_from_blob(blob, slab_id, acknowledged)?;
 	let Some(first_entry) = entries.first().copied() else {
 		return Err(Error::new(
 			ErrorKind::InvalidInput,
@@ -338,7 +341,12 @@ pub(super) fn build_tiered_object_metadata(
 	Ok(TieredSlabObjectMetadata {
 		tenant_id,
 		created_hlc: first_entry.location.hlc.physical_ms,
-		chunk_size_bytes: choose_tiered_object_chunk_size(blob, slab_id, chunk_layout_config)?,
+		chunk_size_bytes: choose_tiered_object_chunk_size(
+			blob,
+			slab_id,
+			chunk_layout_config,
+			acknowledged,
+		)?,
 		offset_index,
 		column_stats_block: None,
 		has_row_tombstone_records,
@@ -349,11 +357,12 @@ pub(super) fn choose_tiered_object_chunk_size(
 	blob: &[u8],
 	slab_id: SlabId,
 	chunk_layout_config: &L2ChunkLayoutConfig,
+	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<crate::schema::ChunkSizeBytes> {
 	if !chunk_layout_config.enabled {
 		return Ok(SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE);
 	}
-	let directories = encoding_directories_from_slab_blob(blob, slab_id)?;
+	let directories = encoding_directories_from_slab_blob(blob, slab_id, acknowledged)?;
 	Ok(choose_chunk_size_bytes_for_directories(
 		directories.iter(),
 		chunk_layout_config,
@@ -369,8 +378,12 @@ impl SlabManager {
 		slab_id: SlabId,
 		plaintext_blob: &[u8],
 	) -> std::io::Result<EncryptedTieredSlab> {
-		let metadata =
-			build_tiered_object_metadata(plaintext_blob, slab_id, &self.config.l2_chunk_layout)?;
+		let metadata = build_tiered_object_metadata(
+			plaintext_blob,
+			slab_id,
+			&self.config.l2_chunk_layout,
+			&self.acknowledged_offsets_in_slab(slab_id),
+		)?;
 		self.config
 			.crypto
 			.encrypt_tiered_slab_object(slab_id, &metadata, plaintext_blob)
@@ -382,8 +395,12 @@ impl SlabManager {
 		plaintext_blob: &[u8],
 		table_schemas: &TableSchemaCatalog,
 	) -> std::io::Result<EncryptedTieredSlab> {
-		let mut metadata =
-			build_tiered_object_metadata(plaintext_blob, slab_id, &self.config.l2_chunk_layout)?;
+		let mut metadata = build_tiered_object_metadata(
+			plaintext_blob,
+			slab_id,
+			&self.config.l2_chunk_layout,
+			&self.acknowledged_offsets_in_slab(slab_id),
+		)?;
 		metadata.column_stats_block = self.build_tiered_column_stats_block(
 			plaintext_blob,
 			slab_id,
@@ -688,30 +705,34 @@ impl SlabManager {
 		pointer: &TieredSlabPointer,
 	) -> std::io::Result<Vec<PersistentRecordRow>> {
 		let plaintext = self.tiered_plaintext_from_l2(pointer).await?;
-		recover_slab_entries_from_blob(&plaintext, pointer.slab_id)?
-			.into_iter()
-			.map(|entry| {
-				let frame = extract_record_from_blob(&plaintext, entry.location)?;
-				let table_object_id = decode_record_batch(&frame)
-					.ok()
-					.map(|batch| {
-						storage_row_table_object_id_at(&batch, entry.location.record_row_index)
-					})
-					.transpose()?
-					.flatten();
-				Ok(PersistentRecordRow {
-					tenant_id: entry.tenant_id,
-					key_identity: entry.key_identity,
-					routing_locality: self.recovered_entry_routing_locality(&entry),
-					table_object_id,
-					// ADR 0090: recovery read the row's placement from the frame;
-					// re-tiering must not downgrade it.
-					placement: entry.location.placement,
-					partition: entry.location.partition,
-					location: entry.location,
+		recover_slab_entries_from_blob(
+			&plaintext,
+			pointer.slab_id,
+			&self.acknowledged_offsets_in_slab(pointer.slab_id),
+		)?
+		.into_iter()
+		.map(|entry| {
+			let frame = extract_record_from_blob(&plaintext, entry.location)?;
+			let table_object_id = decode_record_batch(&frame)
+				.ok()
+				.map(|batch| {
+					storage_row_table_object_id_at(&batch, entry.location.record_row_index)
 				})
+				.transpose()?
+				.flatten();
+			Ok(PersistentRecordRow {
+				tenant_id: entry.tenant_id,
+				key_identity: entry.key_identity,
+				routing_locality: self.recovered_entry_routing_locality(&entry),
+				table_object_id,
+				// ADR 0090: recovery read the row's placement from the frame;
+				// re-tiering must not downgrade it.
+				placement: entry.location.placement,
+				partition: entry.location.partition,
+				location: entry.location,
 			})
-			.collect()
+		})
+		.collect()
 	}
 
 	pub(super) async fn build_tiered_row_refresh_plan_from_l2(
@@ -1021,5 +1042,41 @@ impl SlabManager {
 			slab,
 			keep_local_until: Instant::now() + self.config.rehydration.min_local_residency,
 		})
+	}
+}
+
+impl SlabManager {
+	/// ADR 0099: the offsets this manager's index holds for `slab_id`, the
+	/// evidence a sealed-bytes walk needs to resume past an anomaly. For a
+	/// tiered slab these were loaded from the durable rows; for a local
+	/// sealed slab they came from open-time recovery, which itself used the
+	/// durable rows, plus live appends since. A slab the index knows nothing
+	/// about yields the empty set, which is the strict walk.
+	pub(crate) fn acknowledged_offsets_in_slab(&self, slab_id: SlabId) -> BTreeSet<u64> {
+		self.key_index
+			.iter()
+			.flat_map(|entry| {
+				entry
+					.value()
+					.iter()
+					.filter(|location| location.slab_id == slab_id)
+					.map(|location| location.offset)
+					.collect::<Vec<_>>()
+			})
+			.collect()
+	}
+
+	/// The same evidence for every slab at once, for callers that walk many.
+	pub(crate) fn acknowledged_offsets_by_slab(&self) -> BTreeMap<SlabId, BTreeSet<u64>> {
+		let mut by_slab: BTreeMap<SlabId, BTreeSet<u64>> = BTreeMap::new();
+		for entry in self.key_index.iter() {
+			for location in entry.value().iter() {
+				by_slab
+					.entry(location.slab_id)
+					.or_default()
+					.insert(location.offset);
+			}
+		}
+		by_slab
 	}
 }

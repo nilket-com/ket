@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 
 pub(crate) struct ProjectedL2RecordRead {
 	pub(crate) projected: ProjectedRecordBatch,
@@ -2366,10 +2367,11 @@ pub(super) fn observe_l2_row_group_fetch_strategy(
 pub(super) fn encoding_directories_from_slab_blob(
 	blob: &[u8],
 	slab_id: SlabId,
+	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<Vec<EncodingDirectory>> {
 	let mut out = Vec::new();
 	let mut seen_records = BTreeSet::new();
-	for entry in recover_slab_entries_from_blob(blob, slab_id)? {
+	for entry in recover_slab_entries_from_blob(blob, slab_id, acknowledged)? {
 		if !seen_records.insert((entry.location.offset, entry.location.length)) {
 			continue;
 		}

@@ -5683,7 +5683,8 @@ async fn tiered_retention_rewrite_filters_partial_multirow_storage_records() {
 		&encrypted_bytes,
 	)
 	.unwrap();
-	let recovered = recover_slab_entries_from_blob(&rewritten_plaintext, slab_id).unwrap();
+	let recovered =
+		recover_slab_entries_from_blob(&rewritten_plaintext, slab_id, &BTreeSet::new()).unwrap();
 	assert!(
 		!recovered
 			.iter()
@@ -6457,7 +6458,8 @@ async fn tiered_retention_rewrite_pair_gc_drops_data_and_row_tombstone() {
 		&encrypted_bytes,
 	)
 	.unwrap();
-	let recovered = recover_slab_entries_from_blob(&rewritten_plaintext, slab_id).unwrap();
+	let recovered =
+		recover_slab_entries_from_blob(&rewritten_plaintext, slab_id, &BTreeSet::new()).unwrap();
 	assert_eq!(recovered.len(), 1);
 	assert_eq!(recovered[0].key_identity, key_b);
 	assert!(!recovered[0].location.is_tombstone);
@@ -6599,7 +6601,8 @@ async fn tiered_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor(
 		&encrypted_bytes,
 	)
 	.unwrap();
-	let recovered = recover_slab_entries_from_blob(&rewritten_plaintext, slab_id).unwrap();
+	let recovered =
+		recover_slab_entries_from_blob(&rewritten_plaintext, slab_id, &BTreeSet::new()).unwrap();
 	assert_eq!(recovered.len(), 1);
 	assert_eq!(recovered[0].key_identity, key);
 	assert_eq!(recovered[0].location.hlc, hlc(20_000));
@@ -6733,7 +6736,8 @@ async fn tiered_table_retention_rewrite_prunes_append_only_rows_when_cluster_ret
 		&encrypted_bytes,
 	)
 	.unwrap();
-	let recovered = recover_slab_entries_from_blob(&rewritten_plaintext, slab_id).unwrap();
+	let recovered =
+		recover_slab_entries_from_blob(&rewritten_plaintext, slab_id, &BTreeSet::new()).unwrap();
 	assert_eq!(recovered.len(), 1);
 	assert_eq!(recovered[0].key_identity, live_key);
 }
@@ -12062,23 +12066,24 @@ impl SlabManager {
 			pointer,
 			&old_blob,
 		)?);
-		let mut records = recover_slab_entries_from_blob(&plaintext, pointer.slab_id)?
-			.into_iter()
-			.map(|entry| CompactionRecord {
-				tenant_id: entry.tenant_id,
-				key_identity: entry.key_identity,
-				routing_locality: self.recovered_entry_routing_locality(&entry),
-				old_location: entry.location,
-				reclaim: self.is_retention_prunable(
-					entry.tenant_id,
-					entry.key_identity,
-					entry.location,
-					retention_floor,
-				),
-				retention_ambiguous: false,
-				retention_lag_seconds: 0,
-			})
-			.collect::<Vec<_>>();
+		let mut records =
+			recover_slab_entries_from_blob(&plaintext, pointer.slab_id, &BTreeSet::new())?
+				.into_iter()
+				.map(|entry| CompactionRecord {
+					tenant_id: entry.tenant_id,
+					key_identity: entry.key_identity,
+					routing_locality: self.recovered_entry_routing_locality(&entry),
+					old_location: entry.location,
+					reclaim: self.is_retention_prunable(
+						entry.tenant_id,
+						entry.key_identity,
+						entry.location,
+						retention_floor,
+					),
+					retention_ambiguous: false,
+					retention_lag_seconds: 0,
+				})
+				.collect::<Vec<_>>();
 		Self::mark_retention_prunable_row_tombstone_pairs(&mut records, retention_floor);
 		records.sort_by_key(|record| record.old_location.offset);
 		let physical_groups = physical_compaction_groups(&records);
@@ -12154,8 +12159,11 @@ impl SlabManager {
 			rewritten_plaintext.as_ref(),
 			table_schemas,
 		)?;
-		let row_tombstone_metadata =
-			row_tombstone_metadata_from_blob(rewritten_plaintext.as_ref(), pointer.slab_id)?;
+		let row_tombstone_metadata = row_tombstone_metadata_from_blob(
+			rewritten_plaintext.as_ref(),
+			pointer.slab_id,
+			&BTreeSet::new(),
+		)?;
 		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
@@ -14446,5 +14454,335 @@ async fn append_rotates_before_a_payload_would_cross_the_cap() {
 	assert!(
 		small.slab_id > big.slab_id,
 		"the slab holding the oversized payload is over the cap and rotates"
+	);
+}
+
+/// ADR 0099: an append reservation that is never written leaves a zeroed,
+/// page-aligned hole in the slab file. A later append lands after the hole,
+/// is fdatasynced, and is acknowledged durable. Recovery must still find it:
+/// an interior hole is not the end of valid data. Under the loop that stops
+/// at the first page without a record magic, the acknowledged record is
+/// invisible after reopen and the recovered write cursor sits at the hole, so
+/// the next append overwrites it.
+#[tokio::test]
+async fn durable_append_after_an_unwritten_reservation_survives_reopen() {
+	let dir = fresh_dir("adr0099-interior-hole");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+
+	// A: admitted and reserved, never written. Three pages wide so the hole
+	// is more than one probe page.
+	let hole_frame_len = 2 * crate::storage::io_uring::DIRECT_IO_ALIGN + 16;
+	let (slab, reservation) = manager.target_for_append(hole_frame_len).await.unwrap();
+	let hole_end = reservation.padded_size() as u64;
+	drop(reservation);
+	assert_eq!(slab.write_cursor(), hole_end);
+
+	// B: written after the hole and acknowledged durable.
+	let key_b = id(0x9900);
+	let bytes_b = b"acknowledged-after-the-hole".to_vec();
+	let location_b = manager
+		.append_durable(tenant(), key_b, hlc(99), &bytes_b)
+		.await
+		.unwrap();
+	assert_eq!(location_b.slab_id, slab.slab_id());
+	assert_eq!(location_b.offset, hole_end);
+
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let recovered = reopened
+		.lookup(tenant(), key_b)
+		.expect("a durably acknowledged record is recoverable past an interior hole");
+	assert_eq!(recovered, location_b);
+	assert_eq!(reopened.read(recovered).await.unwrap(), bytes_b);
+
+	// The recovered cursor resumed past B, so a new append cannot overwrite it.
+	let location_c = reopened
+		.append_durable(tenant(), id(0x9901), hlc(100), b"after-reopen")
+		.await
+		.unwrap();
+	assert!(
+		location_c.slab_id > location_b.slab_id || location_c.offset > location_b.offset,
+		"the next append landed past the recovered record: {location_c:?} vs {location_b:?}"
+	);
+	assert_eq!(reopened.read(location_b).await.unwrap(), bytes_b);
+}
+
+/// ADR 0099 decision 3: the sealed-bytes walk resumes past an anomaly only
+/// at an offset the caller vouches for. With the slab's acknowledged offsets
+/// both records are recovered across a zero hole and across a torn page
+/// alike; with no evidence the walk stops at the first anomaly either way. A
+/// zero page on its own never carries the walk forward.
+#[tokio::test]
+async fn blob_recovery_resumes_only_at_acknowledged_offsets() {
+	let dir = fresh_dir("adr0099-blob-hole");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let page = crate::storage::io_uring::DIRECT_IO_ALIGN;
+
+	let before = manager
+		.append_durable(tenant(), id(0x9910), hlc(110), b"before-the-hole")
+		.await
+		.unwrap();
+	let (_, reservation) = manager.target_for_append(16).await.unwrap();
+	assert_eq!(reservation.padded_size(), page);
+	drop(reservation);
+	let after = manager
+		.append_durable(tenant(), id(0x9911), hlc(111), b"after-the-hole")
+		.await
+		.unwrap();
+	assert_eq!(after.offset, before.offset + 2 * page as u64);
+	drop(manager);
+
+	let bytes = std::fs::read(slab_path(&dir, before.slab_id)).unwrap();
+	let offsets = |entries: &[RecoveredSlabEntry]| {
+		entries
+			.iter()
+			.map(|entry| entry.location.offset)
+			.collect::<Vec<_>>()
+	};
+	let evidence = BTreeSet::from([before.offset, after.offset]);
+	let none = BTreeSet::new();
+	let mut torn = bytes.clone();
+	torn[before.offset as usize + page + 7] = 0xFF;
+
+	for (name, blob) in [("zero hole", &bytes), ("torn page", &torn)] {
+		let recovered = recover_slab_entries_from_blob(blob, before.slab_id, &evidence).unwrap();
+		assert_eq!(
+			offsets(&recovered),
+			vec![before.offset, after.offset],
+			"{name}: with evidence both records are recovered"
+		);
+		let recovered = recover_slab_entries_from_blob(blob, before.slab_id, &none).unwrap();
+		assert_eq!(
+			offsets(&recovered),
+			vec![before.offset],
+			"{name}: without evidence the walk ends at the first anomaly"
+		);
+	}
+}
+
+/// ADR 0099 decision 3, the reviewer's direct-bytes reproducer: a torn
+/// record whose lost first page is zero and whose persisted payload page
+/// holds a byte-exact copy of another record. Fed straight to the sealed-bytes
+/// walk with the slab's real evidence, nothing is promoted: the copy's offset
+/// was never acknowledged. Without evidence the walk stops at the zero page.
+#[tokio::test]
+async fn blob_recovery_does_not_promote_a_payload_page_after_a_lost_header_page() {
+	let dir = fresh_dir("adr0099-blob-embedded");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let page = crate::storage::io_uring::DIRECT_IO_ALIGN;
+	let inner = manager
+		.append_durable(tenant(), id(0x99F0), hlc(130), b"embedded-record")
+		.await
+		.unwrap();
+	let inner_bytes = std::fs::read(slab_path(&dir, inner.slab_id)).unwrap();
+	let header = LocalSlabStore::padded_record_size(0).unwrap().0;
+	let mut payload = vec![0_u8; page - header];
+	payload.extend_from_slice(&inner_bytes[..page]);
+	let outer = manager
+		.append_durable(tenant(), id(0x99F1), hlc(131), &payload)
+		.await
+		.unwrap();
+	let evidence = manager.acknowledged_offsets_in_slab(outer.slab_id);
+	assert_eq!(evidence, BTreeSet::from([inner.offset, outer.offset]));
+	drop(manager);
+
+	let bytes = std::fs::read(slab_path(&dir, outer.slab_id)).unwrap();
+	let mut torn = bytes[outer.offset as usize..outer.offset as usize + 2 * page].to_vec();
+	torn[..page].fill(0);
+	// The torn slice starts at the outer record's offset; shift the evidence
+	// to the slice's coordinates.
+	let shifted = evidence
+		.iter()
+		.filter_map(|offset| offset.checked_sub(outer.offset))
+		.collect::<BTreeSet<_>>();
+	assert_eq!(shifted, BTreeSet::from([0]));
+	for acknowledged in [&shifted, &BTreeSet::new()] {
+		let recovered = recover_slab_entries_from_blob(&torn, outer.slab_id, acknowledged).unwrap();
+		assert!(
+			recovered.is_empty(),
+			"payload was promoted to a record: {recovered:?}"
+		);
+	}
+}
+
+/// ADR 0099 decision 2: zero pages at the end of the file are a trailing
+/// hole. Recovery keeps the records before them and resumes appending where
+/// the last record ended, over the hole, rather than preserving it.
+#[tokio::test]
+async fn recovery_resumes_at_the_last_record_over_a_trailing_hole() {
+	let dir = fresh_dir("adr0099-trailing-hole");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let page = crate::storage::io_uring::DIRECT_IO_ALIGN as u64;
+
+	let last = manager
+		.append_durable(tenant(), id(0x9920), hlc(120), b"last-record")
+		.await
+		.unwrap();
+	drop(manager);
+
+	// Extend the file by two zero pages, as a later write past a dropped
+	// reservation would have, without any record following.
+	let path = slab_path(&dir, last.slab_id);
+	let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+	let len = file.metadata().unwrap().len();
+	assert_eq!(len, last.offset + page);
+	file.set_len(len + 2 * page).unwrap();
+	drop(file);
+
+	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	assert_eq!(reopened.lookup(tenant(), id(0x9920)), Some(last));
+	let next = reopened
+		.append_durable(tenant(), id(0x9921), hlc(121), b"next-record")
+		.await
+		.unwrap();
+	assert_eq!(next.slab_id, last.slab_id);
+	assert_eq!(
+		next.offset,
+		last.offset + page,
+		"the append resumed at the last record's end, reusing the trailing hole"
+	);
+	assert_eq!(reopened.read(last).await.unwrap(), b"last-record".to_vec());
+}
+
+/// ADR 0099 decision 1, the case a zero-page skip alone gets wrong: a record
+/// whose payload carries a byte-exact copy of another record at its second
+/// page, whose first page did not persist. The copy validates by checksum,
+/// but its offset was never acknowledged, so recovery does not promote it;
+/// the torn record's region is zeroed and the original stays the only
+/// version of its key.
+#[tokio::test]
+async fn recovery_does_not_promote_a_payload_page_after_a_lost_header_page() {
+	let dir = fresh_dir("adr0099-embedded-record");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let page = crate::storage::io_uring::DIRECT_IO_ALIGN;
+
+	let inner_key = id(0x99F0);
+	let inner = manager
+		.append_durable(tenant(), inner_key, hlc(130), b"embedded-record")
+		.await
+		.unwrap();
+	let inner_bytes = std::fs::read(slab_path(&dir, inner.slab_id)).unwrap();
+	let header = LocalSlabStore::padded_record_size(0).unwrap().0;
+	let mut payload = vec![0_u8; page - header];
+	payload.extend_from_slice(&inner_bytes[..page]);
+	let outer_key = id(0x99F1);
+	let outer = manager
+		.append_durable(tenant(), outer_key, hlc(131), &payload)
+		.await
+		.unwrap();
+	assert_eq!(outer.offset, page as u64);
+	drop(manager);
+
+	// The outer record's first page is lost; its payload page persisted.
+	let path = slab_path(&dir, outer.slab_id);
+	let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+	std::os::unix::fs::FileExt::write_all_at(&file, &vec![0_u8; page], outer.offset).unwrap();
+	drop(file);
+
+	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	assert_eq!(reopened.lookup(tenant(), inner_key), Some(inner));
+	assert_eq!(reopened.lookup(tenant(), outer_key), None);
+	assert_eq!(
+		reopened.lookup_as_of(tenant(), inner_key, hlc(130)),
+		Some(inner),
+		"the embedded copy was not promoted to a second version of the key"
+	);
+	let bytes = std::fs::read(&path).unwrap();
+	assert!(
+		bytes[outer.offset as usize..].iter().all(|byte| *byte == 0),
+		"the torn region was zeroed so the file is canonical"
+	);
+}
+
+/// ADR 0099 decision 1: a torn region with bytes in it, ahead of a record
+/// the node acknowledged, no longer ends the walk. The acknowledged record is
+/// recovered, the torn region is zeroed, and appends resume past the record.
+#[tokio::test]
+async fn recovery_resumes_past_a_torn_region_at_the_next_acknowledged_record() {
+	let dir = fresh_dir("adr0099-torn-then-acked");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let page = crate::storage::io_uring::DIRECT_IO_ALIGN;
+
+	let torn_key = id(0x99A0);
+	let torn = manager
+		.append_durable(tenant(), torn_key, hlc(140), &vec![0x44_u8; 2 * page])
+		.await
+		.unwrap();
+	let acked_key = id(0x99A1);
+	let acked = manager
+		.append_durable(tenant(), acked_key, hlc(141), b"acknowledged-after-torn")
+		.await
+		.unwrap();
+	drop(manager);
+
+	// Corrupt the first record's magic without zeroing the page.
+	let path = slab_path(&dir, torn.slab_id);
+	let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+	std::os::unix::fs::FileExt::write_all_at(&file, &[0xEE; 4], torn.offset).unwrap();
+	drop(file);
+
+	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	assert_eq!(reopened.lookup(tenant(), torn_key), None);
+	assert_eq!(reopened.lookup(tenant(), acked_key), Some(acked));
+	assert_eq!(
+		reopened.read(acked).await.unwrap(),
+		b"acknowledged-after-torn".to_vec()
+	);
+	let bytes = std::fs::read(&path).unwrap();
+	assert!(
+		bytes[torn.offset as usize..acked.offset as usize]
+			.iter()
+			.all(|byte| *byte == 0),
+		"the torn region was zeroed"
+	);
+	let next = reopened
+		.append_durable(tenant(), id(0x99A2), hlc(142), b"after-reopen")
+		.await
+		.unwrap();
+	assert!(next.offset > acked.offset);
+}
+
+/// ADR 0099 decision 1 without an oracle: when the durable index cannot be
+/// opened, recovery has no evidence of boundaries and stops at the first
+/// anomaly, as it did before this record. This is the pre-record exposure,
+/// not a safe mode: the append is still acknowledged, and the warning at
+/// open that the index failed is the operator's signal.
+#[tokio::test]
+async fn recovery_without_the_durable_index_stops_at_the_first_anomaly() {
+	let dir = fresh_dir("adr0099-no-oracle");
+	// Occupy the index path with a directory so redb cannot open it.
+	std::fs::create_dir_all(persistent_index_path(&dir)).unwrap();
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	assert!(manager.persistent_index.is_none());
+
+	let (slab, reservation) = manager.target_for_append(16).await.unwrap();
+	drop(reservation);
+	let key = id(0x99B0);
+	let after = manager
+		.append_durable(tenant(), key, hlc(150), b"after-the-hole")
+		.await
+		.unwrap();
+	assert_eq!(after.slab_id, slab.slab_id());
+	drop(manager);
+
+	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	assert_eq!(
+		reopened.lookup(tenant(), key),
+		None,
+		"without boundary evidence the walk stops at the hole"
 	);
 }

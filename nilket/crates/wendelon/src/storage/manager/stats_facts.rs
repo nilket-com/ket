@@ -1043,7 +1043,11 @@ impl SlabManager {
 		if descriptors.is_empty() {
 			return Ok(None);
 		}
-		let entries = recover_slab_entries_from_blob(blob, slab_id)?;
+		let entries = recover_slab_entries_from_blob(
+			blob,
+			slab_id,
+			&self.acknowledged_offsets_in_slab(slab_id),
+		)?;
 		let mut candidates: Option<Vec<TableSchemaDescriptor>> = None;
 		let mut saw_unmatched_row = false;
 		let mut row_batches = Vec::with_capacity(entries.len());

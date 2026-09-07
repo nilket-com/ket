@@ -1333,9 +1333,25 @@ impl SlabManager {
 					None
 				}
 			};
+		// ADR 0099: the durable rows double as slab recovery's boundary
+		// oracle. A row exists only for a record that was fdatasynced and
+		// then acknowledged, so its offset is a place the walk may resume
+		// after an anomaly. Without redb there is no oracle and recovery
+		// stops at the first anomaly.
+		let mut acknowledged_by_slab: Option<BTreeMap<SlabId, BTreeSet<u64>>> = None;
 		let staged_runs = match &persistent_index {
 			Some(index) => match index.load_snapshot().await {
-				Ok(snapshot) => Some(snapshot.lsm_runs),
+				Ok(snapshot) => {
+					let mut by_slab: BTreeMap<SlabId, BTreeSet<u64>> = BTreeMap::new();
+					for row in &snapshot.record_rows {
+						by_slab
+							.entry(row.location.slab_id)
+							.or_default()
+							.insert(row.location.offset);
+					}
+					acknowledged_by_slab = Some(by_slab);
+					Some(snapshot.lsm_runs)
+				}
 				Err(err) => {
 					tracing::warn!(
 						error = %err,
@@ -1346,6 +1362,11 @@ impl SlabManager {
 				}
 			},
 			None => None,
+		};
+		let acknowledged_for = |id: SlabId| -> Option<BTreeSet<u64>> {
+			acknowledged_by_slab
+				.as_ref()
+				.map(|by_slab| by_slab.get(&id).cloned().unwrap_or_default())
 		};
 		reconcile_staged_maintenance_publications(
 			file_ops.as_ref(),
@@ -1383,11 +1404,12 @@ impl SlabManager {
 		let (active, next_slab_id) = if existing_ids.is_empty() {
 			let id = SlabId::ZERO;
 			let slab = Arc::new(
-				LocalSlabStore::open(
+				LocalSlabStore::open_with_acknowledged(
 					slab_path(&config.dir, id),
 					id,
 					file_ops.clone(),
 					config.group_commit.clone(),
+					acknowledged_for(id).as_ref(),
 				)
 				.await?,
 			);
@@ -1441,11 +1463,12 @@ impl SlabManager {
 			// shadow earlier ones.
 			for &id in &non_empty_sealed_ids {
 				let slab = Arc::new(
-					LocalSlabStore::open(
+					LocalSlabStore::open_with_acknowledged(
 						slab_path(&config.dir, id),
 						id,
 						file_ops.clone(),
 						config.group_commit.clone(),
+						acknowledged_for(id).as_ref(),
 					)
 					.await?,
 				);
@@ -1453,11 +1476,12 @@ impl SlabManager {
 				sealed.insert(id, slab);
 			}
 			let active = Arc::new(
-				LocalSlabStore::open(
+				LocalSlabStore::open_with_acknowledged(
 					active_path,
 					active_id,
 					file_ops.clone(),
 					config.group_commit.clone(),
+					acknowledged_for(active_id).as_ref(),
 				)
 				.await?,
 			);
@@ -2293,12 +2317,15 @@ impl SlabManager {
 		};
 
 		let mut bytes = 0_u64;
+		let acknowledged_by_slab = self.acknowledged_offsets_by_slab();
+		let empty = BTreeSet::new();
 		for slab_id in sealed_ids {
 			let blob = self.read_sealed_raw(slab_id).await?;
 			bytes = bytes.saturating_add(uncompressed_resident_bytes_in_slab(
 				&blob,
 				slab_id,
 				table_schemas,
+				acknowledged_by_slab.get(&slab_id).unwrap_or(&empty),
 			)?);
 		}
 		for pointer in tiered_pointers {
@@ -2307,6 +2334,7 @@ impl SlabManager {
 				&blob,
 				pointer.slab_id,
 				table_schemas,
+				acknowledged_by_slab.get(&pointer.slab_id).unwrap_or(&empty),
 			)?);
 		}
 		metrics().set_storage_compression_uncompressed_resident_bytes(bytes);
@@ -3878,18 +3906,22 @@ impl SlabManager {
 			pointer,
 			&old_blob,
 		)?);
-		let mut records = recover_slab_entries_from_blob(&plaintext, pointer.slab_id)?
-			.into_iter()
-			.map(|entry| CompactionRecord {
-				tenant_id: entry.tenant_id,
-				key_identity: entry.key_identity,
-				routing_locality: self.recovered_entry_routing_locality(&entry),
-				old_location: entry.location,
-				reclaim: false,
-				retention_ambiguous: false,
-				retention_lag_seconds: 0,
-			})
-			.collect::<Vec<_>>();
+		let mut records = recover_slab_entries_from_blob(
+			&plaintext,
+			pointer.slab_id,
+			&self.acknowledged_offsets_in_slab(pointer.slab_id),
+		)?
+		.into_iter()
+		.map(|entry| CompactionRecord {
+			tenant_id: entry.tenant_id,
+			key_identity: entry.key_identity,
+			routing_locality: self.recovered_entry_routing_locality(&entry),
+			old_location: entry.location,
+			reclaim: false,
+			retention_ambiguous: false,
+			retention_lag_seconds: 0,
+		})
+		.collect::<Vec<_>>();
 		self.mark_records_for_table_retention_from_blob(
 			&plaintext,
 			&mut records,
@@ -3977,8 +4009,11 @@ impl SlabManager {
 			rewritten_plaintext.as_ref(),
 			table_schemas,
 		)?;
-		let row_tombstone_metadata =
-			row_tombstone_metadata_from_blob(rewritten_plaintext.as_ref(), pointer.slab_id)?;
+		let row_tombstone_metadata = row_tombstone_metadata_from_blob(
+			rewritten_plaintext.as_ref(),
+			pointer.slab_id,
+			&BTreeSet::new(),
+		)?;
 		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
@@ -4023,18 +4058,22 @@ impl SlabManager {
 			pointer,
 			&old_blob,
 		)?);
-		let mut records = recover_slab_entries_from_blob(&plaintext, pointer.slab_id)?
-			.into_iter()
-			.map(|entry| CompactionRecord {
-				tenant_id: entry.tenant_id,
-				key_identity: entry.key_identity,
-				routing_locality: self.recovered_entry_routing_locality(&entry),
-				old_location: entry.location,
-				reclaim: false,
-				retention_ambiguous: false,
-				retention_lag_seconds: 0,
-			})
-			.collect::<Vec<_>>();
+		let mut records = recover_slab_entries_from_blob(
+			&plaintext,
+			pointer.slab_id,
+			&self.acknowledged_offsets_in_slab(pointer.slab_id),
+		)?
+		.into_iter()
+		.map(|entry| CompactionRecord {
+			tenant_id: entry.tenant_id,
+			key_identity: entry.key_identity,
+			routing_locality: self.recovered_entry_routing_locality(&entry),
+			old_location: entry.location,
+			reclaim: false,
+			retention_ambiguous: false,
+			retention_lag_seconds: 0,
+		})
+		.collect::<Vec<_>>();
 		self.mark_records_for_table_drop_from_blob(
 			&plaintext,
 			&mut records,
@@ -4113,8 +4152,11 @@ impl SlabManager {
 			rewritten_plaintext.as_ref(),
 			table_schemas,
 		)?;
-		let row_tombstone_metadata =
-			row_tombstone_metadata_from_blob(rewritten_plaintext.as_ref(), pointer.slab_id)?;
+		let row_tombstone_metadata = row_tombstone_metadata_from_blob(
+			rewritten_plaintext.as_ref(),
+			pointer.slab_id,
+			&BTreeSet::new(),
+		)?;
 		Ok(Some(PreparedTieredTableDropRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
@@ -4213,9 +4255,10 @@ fn uncompressed_resident_bytes_in_slab(
 	blob: &[u8],
 	slab_id: SlabId,
 	table_schemas: &TableSchemaCatalog,
+	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<u64> {
 	let mut entries_by_record: BTreeMap<(u64, u32), Vec<RecoveredSlabEntry>> = BTreeMap::new();
-	for entry in recover_slab_entries_from_blob(blob, slab_id)? {
+	for entry in recover_slab_entries_from_blob(blob, slab_id, acknowledged)? {
 		entries_by_record
 			.entry((entry.location.offset, entry.location.length))
 			.or_default()
@@ -4289,8 +4332,9 @@ fn uncompressed_resident_bytes_in_slab(
 fn row_tombstone_metadata_from_blob(
 	blob: &[u8],
 	slab_id: SlabId,
+	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<TombstoneMetadata> {
-	let entries = recover_slab_entries_from_blob(blob, slab_id)?;
+	let entries = recover_slab_entries_from_blob(blob, slab_id, acknowledged)?;
 	Ok(row_tombstone_metadata_from_entries(&entries))
 }
 
@@ -4320,8 +4364,15 @@ fn merge_row_tombstone_metadata(
 	}
 }
 
-fn single_tenant_id_from_plain_slab(blob: &[u8], slab_id: SlabId) -> std::io::Result<TenantId> {
-	Ok(build_tiered_object_metadata(blob, slab_id, &L2ChunkLayoutConfig::default())?.tenant_id)
+fn single_tenant_id_from_plain_slab(
+	blob: &[u8],
+	slab_id: SlabId,
+	acknowledged: &BTreeSet<u64>,
+) -> std::io::Result<TenantId> {
+	Ok(
+		build_tiered_object_metadata(blob, slab_id, &L2ChunkLayoutConfig::default(), acknowledged)?
+			.tenant_id,
+	)
 }
 
 fn slab_path(dir: &Path, slab_id: SlabId) -> PathBuf {

@@ -66,7 +66,7 @@ use arrow::array::{BooleanArray, FixedSizeBinaryArray, UInt64Array};
 use arrow::ipc::reader::StreamReader;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Cursor, Error, ErrorKind};
 use std::path::Path;
 use std::sync::Arc;
@@ -310,6 +310,19 @@ impl LocalSlabStore {
 		file_ops: Arc<dyn AsyncFileOps>,
 		group_commit: GroupCommitConfig,
 	) -> std::io::Result<Self> {
+		Self::open_with_acknowledged(path, slab_id, file_ops, group_commit, None).await
+	}
+
+	/// Open a slab whose acknowledged record offsets are known from the
+	/// durable index. Recovery resumes past anomalies at those offsets and
+	/// leaves the file canonical; see [`recover_slab`] (ADR 0099).
+	pub async fn open_with_acknowledged(
+		path: impl AsRef<Path>,
+		slab_id: SlabId,
+		file_ops: Arc<dyn AsyncFileOps>,
+		group_commit: GroupCommitConfig,
+		acknowledged: Option<&BTreeSet<u64>>,
+	) -> std::io::Result<Self> {
 		let file = file_ops
 			.open(
 				path.as_ref(),
@@ -325,7 +338,8 @@ impl LocalSlabStore {
 
 		// Scan any existing records so a restart resumes writing
 		// past the last complete record and serves reads immediately.
-		let (index, recovered_localities, write_cursor) = recover_slab(&file, slab_id)?;
+		let (index, recovered_localities, write_cursor) =
+			recover_slab(&file, slab_id, acknowledged)?;
 
 		Ok(Self {
 			index,
@@ -638,14 +652,46 @@ impl LocalSlabStore {
 			dst[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 		}
 
-		// Submit and await the kernel CQE.
-		let (written, _buf) = self.file_ops.write_at(&self.file, offset, buf).await?;
-		if written < payload_size {
-			return Err(Error::new(
-				ErrorKind::WriteZero,
-				"short write on slab append",
-			));
-		}
+		// Submit the write on its own task so that dropping this future
+		// mid-flight cannot strand a partly written range: the task runs
+		// to completion and, on a failure or short write, zeroes the whole
+		// reservation before reporting (ADR 0099 decision 2). A range that
+		// was never submitted is zero by construction.
+		let file_ops = self.file_ops.clone();
+		let file = self.file.clone();
+		let slab_id = self.slab_id;
+		let write = tokio::spawn(async move {
+			let outcome = match file_ops.write_at(&file, offset, buf).await {
+				Ok((written, _buf)) if written >= payload_size => return Ok(()),
+				Ok((written, _buf)) => Err(Error::new(
+					ErrorKind::WriteZero,
+					format!("short write on slab append: {written} of {payload_size} bytes"),
+				)),
+				Err(err) => Err(err),
+			};
+			let zeros = AlignedBuf::new(padded_size);
+			match file_ops.write_at(&file, offset, zeros).await {
+				Ok((written, _)) if written >= padded_size => {}
+				Ok((written, _)) => tracing::error!(
+					slab_id = slab_id.get(),
+					offset,
+					padded_size,
+					written,
+					"failed to zero a failed append's reservation; the slab is no longer canonical"
+				),
+				Err(err) => tracing::error!(
+					slab_id = slab_id.get(),
+					offset,
+					padded_size,
+					error = %err,
+					"failed to zero a failed append's reservation; the slab is no longer canonical"
+				),
+			}
+			outcome
+		});
+		write.await.map_err(|err| {
+			Error::new(ErrorKind::Other, format!("slab append task failed: {err}"))
+		})??;
 
 		Ok(RecordLocation {
 			slab_id: self.slab_id,
@@ -849,9 +895,18 @@ fn page_round_up(n: usize) -> usize {
 //  the scan at the first torn or corrupted trailing record.
 // ============================================================
 
+/// Rebuild a slab's index from its file.
+///
+/// `acknowledged` is the set of record offsets in this slab that the node
+/// acknowledged durable: each was fdatasynced and then recorded in the
+/// durable index before the client heard back, so the bytes at such an
+/// offset were persisted in full. With it, the walk resumes past any
+/// anomaly at the next acknowledged offset and zeroes what it stepped over.
+/// Without it, the first anomaly ends the walk (ADR 0099).
 fn recover_slab(
 	file: &FileHandle,
 	slab_id: SlabId,
+	acknowledged: Option<&BTreeSet<u64>>,
 ) -> std::io::Result<(
 	DashMap<TenantKey, Vec<RecordLocation>>,
 	DashMap<TenantKey, Locality>,
@@ -882,6 +937,14 @@ fn recover_slab(
 	let mut probe = AlignedBuf::new(DIRECT_IO_ALIGN);
 
 	let mut cursor: u64 = 0;
+	// Where the next append resumes: the end of the last record that
+	// validated. It trails `cursor` across interior holes so a hole at the
+	// tail is reused rather than preserved (ADR 0099).
+	let mut valid_end: u64 = 0;
+	// Regions the walk stepped over on the oracle's word. They are
+	// zeroed once the walk is done so the file carries only accepted
+	// records and zero pages (ADR 0099 decision 1).
+	let mut skipped: Vec<(u64, u64)> = Vec::new();
 	while cursor + DIRECT_IO_ALIGN as u64 <= file_size {
 		file.read_exact_at(probe.as_mut_slice(), cursor)?;
 		// Copy the header out of the probe page so we can re-use
@@ -889,39 +952,57 @@ fn recover_slab(
 		let header: SlabRecordHeader =
 			*bytemuck::from_bytes::<SlabRecordHeader>(&probe.as_slice()[..header_size]);
 
-		if header.magic != SLAB_RECORD_MAGIC {
-			// End of valid data: either never-written zeroes or a
-			// torn trailing record.
-			break;
-		}
-
-		let payload_size = header_size
-			.checked_add(header.frame_len as usize)
-			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "recovered frame_len overflow"))?;
-		let padded = page_round_up(payload_size) as u64;
-
-		// Defensive: stop if the record claims to extend past EOF.
-		if cursor + padded > file_size {
-			break;
-		}
-
-		// Pull out the frame bytes. Small records are already in
-		// `probe`; larger ones need a dedicated aligned read.
-		let frame_bytes: Vec<u8> = if padded as usize <= DIRECT_IO_ALIGN {
-			probe.as_slice()[header_size..payload_size].to_vec()
+		// Classify the page. Anything that is not a complete record
+		// with a good checksum is an anomaly, whether it is a zero
+		// page, a page with bytes but no magic, a record that claims
+		// to run past the end of the file, or a torn record. What an
+		// anomaly means depends on whether the caller can say where
+		// the next acknowledged record starts.
+		let validated = if header.magic != SLAB_RECORD_MAGIC {
+			None
 		} else {
-			let mut full = AlignedBuf::new(padded as usize);
-			file.read_exact_at(full.as_mut_slice(), cursor)?;
-			full.as_slice()[header_size..payload_size].to_vec()
+			let payload_size = header_size
+				.checked_add(header.frame_len as usize)
+				.ok_or_else(|| {
+					Error::new(ErrorKind::InvalidData, "recovered frame_len overflow")
+				})?;
+			let padded = page_round_up(payload_size) as u64;
+			if cursor + padded > file_size {
+				None
+			} else {
+				// Pull out the frame bytes. Small records are already in
+				// `probe`; larger ones need a dedicated aligned read.
+				let frame_bytes: Vec<u8> = if padded as usize <= DIRECT_IO_ALIGN {
+					probe.as_slice()[header_size..payload_size].to_vec()
+				} else {
+					let mut full = AlignedBuf::new(padded as usize);
+					file.read_exact_at(full.as_mut_slice(), cursor)?;
+					full.as_slice()[header_size..payload_size].to_vec()
+				};
+				verify_record_checksum(&header, &frame_bytes)
+					.ok()
+					.map(|()| (payload_size, padded, frame_bytes))
+			}
 		};
 
-		if verify_record_checksum(&header, &frame_bytes).is_err() {
-			// A header with the right magic but a broken checksum
-			// signals a torn trailing write. Stop here rather than
-			// trusting downstream records whose header might look
-			// intact by coincidence.
-			break;
-		}
+		let Some((payload_size, padded, frame_bytes)) = validated else {
+			let Some(acknowledged) = acknowledged else {
+				// No oracle: the first anomaly is the end of valid
+				// data, as before this record. A zero page is not
+				// evidence of anything on its own.
+				break;
+			};
+			// ADR 0099 decision 1: resume at the next offset the node
+			// acknowledged durable. Everything in between was never
+			// acknowledged and is zeroed below. No later offset means
+			// this anomaly is the tail.
+			let Some(next) = next_acknowledged_offset(acknowledged, cursor, file_size) else {
+				break;
+			};
+			skipped.push((cursor, next));
+			cursor = next;
+			continue;
+		};
 
 		let base_location = RecordLocation {
 			slab_id,
@@ -979,6 +1060,34 @@ fn recover_slab(
 			}
 		}
 		cursor += padded;
+		valid_end = cursor;
+	}
+
+	// ADR 0099 decision 1: with an oracle, leave the file canonical. Every
+	// region the walk stepped over, and whatever trails the last accepted
+	// record, was never acknowledged; zero it so that a later reader of
+	// these bytes can take "non-zero page" to mean "record".
+	if acknowledged.is_some() {
+		if valid_end < file_size {
+			skipped.push((valid_end, file_size));
+		}
+		let mut zeroed = false;
+		for (start, end) in skipped {
+			if end <= start {
+				continue;
+			}
+			let mut at = start;
+			while at < end {
+				let chunk = ((end - at) as usize).min(ZERO_FILL_CHUNK_BYTES);
+				let zeros = AlignedBuf::new(page_round_up(chunk));
+				file.write_all_at(&zeros.as_slice()[..chunk], at)?;
+				at += chunk as u64;
+			}
+			zeroed = true;
+		}
+		if zeroed {
+			file.sync_data()?;
+		}
 	}
 
 	// ADR 075 recovery rule: index a counter tentative only if a commit marker
@@ -995,12 +1104,34 @@ fn recover_slab(
 	}
 
 	validate_recovered_row_tombstone_chains(&recovered_versions)?;
-	Ok((index, recovered_localities, cursor))
+	Ok((index, recovered_localities, valid_end))
 }
 
+/// Largest single write used to zero a skipped region at recovery.
+const ZERO_FILL_CHUNK_BYTES: usize = 1 << 20;
+
+/// The smallest acknowledged offset past `cursor` that a page can start at
+/// inside `len` bytes, or `None` when the anomaly at `cursor` is the tail.
+fn next_acknowledged_offset(acknowledged: &BTreeSet<u64>, cursor: u64, len: u64) -> Option<u64> {
+	let next = *acknowledged.range(cursor + 1..).next()?;
+	(next % DIRECT_IO_ALIGN as u64 == 0 && next + DIRECT_IO_ALIGN as u64 <= len).then_some(next)
+}
+
+/// Walk sealed slab bytes and return every record they hold.
+///
+/// `acknowledged` is the caller's evidence of where records start in this
+/// slab: the offsets the manager's index holds for it, which for a tiered
+/// slab were loaded from the durable rows. On an anomaly - a zero page, a
+/// page with bytes but no magic, an overlong or torn record - the walk
+/// resumes at the next acknowledged offset and stops if there is none. An
+/// empty set is the strict walk that ends at the first anomaly. The
+/// argument is mandatory so that no caller can walk bytes without stating
+/// what it knows; there is no zero-page skip, because a zero page proves
+/// nothing about the pages after it (ADR 0099 decision 3).
 pub(crate) fn recover_slab_entries_from_blob(
 	blob: &[u8],
 	slab_id: SlabId,
+	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<Vec<RecoveredSlabEntry>> {
 	let header_size = std::mem::size_of::<SlabRecordHeader>();
 	let mut entries = Vec::new();
@@ -1011,23 +1142,34 @@ pub(crate) fn recover_slab_entries_from_blob(
 		let header: SlabRecordHeader =
 			*bytemuck::from_bytes::<SlabRecordHeader>(&blob[cursor..cursor + header_size]);
 
-		if header.magic != SLAB_RECORD_MAGIC {
-			break;
-		}
+		let validated = if header.magic != SLAB_RECORD_MAGIC {
+			None
+		} else {
+			let payload_size = header_size
+				.checked_add(header.frame_len as usize)
+				.ok_or_else(|| {
+					Error::new(ErrorKind::InvalidData, "recovered frame_len overflow")
+				})?;
+			let padded = page_round_up(payload_size);
+			if cursor + padded > blob.len() {
+				None
+			} else {
+				let frame = &blob[cursor + header_size..cursor + payload_size];
+				verify_record_checksum(&header, frame)
+					.ok()
+					.map(|()| (payload_size, padded, frame))
+			}
+		};
 
-		let payload_size = header_size
-			.checked_add(header.frame_len as usize)
-			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "recovered frame_len overflow"))?;
-		let padded = page_round_up(payload_size);
-
-		if cursor + padded > blob.len() {
-			break;
-		}
-
-		let frame = &blob[cursor + header_size..cursor + payload_size];
-		if verify_record_checksum(&header, frame).is_err() {
-			break;
-		}
+		let Some((payload_size, padded, frame)) = validated else {
+			match next_acknowledged_offset(acknowledged, cursor as u64, blob.len() as u64) {
+				Some(next) => {
+					cursor = next as usize;
+					continue;
+				}
+				None => break,
+			}
+		};
 
 		let base_location = RecordLocation {
 			slab_id,

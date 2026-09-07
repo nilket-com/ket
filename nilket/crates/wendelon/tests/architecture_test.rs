@@ -2062,10 +2062,15 @@ fn test_adr050_pk_delete_supersession_boundaries() {
 		);
 	}
 
-	let manager_source = manager_source(manifest_dir);
+	// Compared with whitespace stripped so a rustfmt line break inside the
+	// call cannot fake a violation.
+	let manager_source: String = manager_source(manifest_dir)
+		.chars()
+		.filter(|c| !c.is_whitespace())
+		.collect();
 	for needle in [
 		"row_tombstone_metadata_from_blob(rewritten_plaintext.as_ref()",
-		"tombstone_metadata: merge_row_tombstone_metadata(",
+		"tombstone_metadata:merge_row_tombstone_metadata(",
 	] {
 		if !manager_source.contains(needle) {
 			violations.push(format!(
@@ -9338,14 +9343,18 @@ fn adr078_slab_manager_public_surface_stays_in_root() {
 /// belong beside the rotation they govern rather than in a carved module. The
 /// same decision later moved the byte reservation under the rotation lock, so
 /// the guard reserves and returns a token: a dozen more lines, same home.
+/// ADR 0099 hands open-time slab recovery the durable rows as its boundary
+/// oracle; building that map beside the snapshot load is the same size again,
+/// and threading that evidence through the blob-walking free functions adds
+/// their signatures. Those free functions are the next carve.
 #[test]
 fn adr078_root_is_bounded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let root = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
 	let lines = root.lines().count();
 	assert!(
-		lines <= 4_590,
-		"manager.rs root is {lines} lines (cap 4_590); carve more or justify a deliberate cap bump"
+		lines <= 4_650,
+		"manager.rs root is {lines} lines (cap 4_650); carve more or justify a deliberate cap bump"
 	);
 }
 

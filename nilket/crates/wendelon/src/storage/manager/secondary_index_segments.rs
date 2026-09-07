@@ -1277,7 +1277,11 @@ impl SlabManager {
 		plaintext: &[u8],
 	) -> std::io::Result<BTreeSet<(TenantId, TableObjectId)>> {
 		let mut table_ids = BTreeSet::new();
-		for recovered in recover_slab_entries_from_blob(plaintext, source_slab_id)? {
+		for recovered in recover_slab_entries_from_blob(
+			plaintext,
+			source_slab_id,
+			&self.acknowledged_offsets_in_slab(source_slab_id),
+		)? {
 			let frame = match extract_record_from_blob(plaintext, recovered.location) {
 				Ok(frame) => frame,
 				Err(_) => continue,
@@ -1944,7 +1948,11 @@ impl SlabManager {
 	) -> std::io::Result<SecondaryIndexSegment> {
 		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
 		let mut index_entries = Vec::new();
-		for recovered in recover_slab_entries_from_blob(plaintext, source_slab_id)? {
+		for recovered in recover_slab_entries_from_blob(
+			plaintext,
+			source_slab_id,
+			&self.acknowledged_offsets_in_slab(source_slab_id),
+		)? {
 			if recovered.tenant_id != tenant_id || recovered.location.is_tombstone {
 				continue;
 			}
