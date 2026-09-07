@@ -60,6 +60,9 @@ impl std::fmt::Display for ExportFormat {
 
 #[derive(Clone)]
 pub enum Message {
+	ToggleAgents,
+	#[cfg(unix)]
+	AgentInbound(crate::live::transport::Inbound),
 	AdapterAdHocChanged(String),
 	AdapterConfigurationChanged(String, String),
 	AdapterConfigurationSubmitted,

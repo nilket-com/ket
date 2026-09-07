@@ -596,6 +596,7 @@ mod tests {
 
 	fn tab(view_id: u64, title: &str, is_dirty: bool) -> DocTabSummary {
 		DocTabSummary {
+			source_path: None,
 			buffer_id: libaryon::core::BufferId::new(view_id),
 			document_id: None,
 			view_id: libaryon::core::ViewId::new(view_id),

@@ -93,6 +93,21 @@ session. To open the same showcase in the window:
 cargo run --release -p polariton -- uat/plot_fixtures_showcase.rn
 ```
 
+PRODUCT-0160 can observe that running window. Start it with `--agents`, or
+use Plot → Toggle accepting agents, then run the showcase with its source
+pane focused. In another terminal:
+
+```sh
+polariton windows
+polariton observe --source uat/plot_fixtures_showcase.rn
+```
+
+Observation prints a welcome containing the loaded/live figure descriptions,
+then changes until the connection closes. Use `observe <window-id>` when
+more than one window has the source open, or `observe --session <id>` for a
+saved window. Accepting agents is off by default. The observe cut refuses
+action verbs; the existing headless `drive` remains available.
+
 Release, deliberately: a debug build multiplies mark preparation by tens.
 Since PRODUCT-0159 the scatter arms batch one fill per mark instead of one
 compound path, so the million points arrive without resizing the pane; the

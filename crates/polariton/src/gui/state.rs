@@ -1,8 +1,11 @@
 #[cfg(feature = "toron")]
 use crate::adapters::common::DatabaseAdapter;
 
+#[cfg(unix)]
+mod agents;
 /// PRODUCT-0158: the application without a window.
 pub(crate) mod headless;
+mod surface;
 use crate::adapters::{
 	common::{AdapterStage, ExecutionResult},
 	driver::AdapterState,
@@ -123,6 +126,9 @@ impl RetainedRelationGeneration {
 }
 
 pub(crate) struct AppState {
+	surface: surface::Surface,
+	#[cfg(unix)]
+	agents: agents::Agents,
 	menu_state: MenuState,
 	code_editor: CodeEditor,
 	status_msg: String,
@@ -595,6 +601,8 @@ fn subscription(state: &AppState) -> Subscription<Message> {
 		subscriptions
 			.push(iced::time::every(LoopLatencyProbe::PERIOD).map(Message::LoopLatencyTick));
 	}
+	#[cfg(unix)]
+	subscriptions.push(state.agents.subscription());
 	Subscription::batch(subscriptions)
 }
 
@@ -713,12 +721,21 @@ impl Drop for LoopLatencyProbe {
 	}
 }
 
-pub fn run(startup_data: StartupData, target: StartupTarget) -> Result {
+pub fn run(startup_data: StartupData, target: StartupTarget, accepting_agents: bool) -> Result {
 	let size = Size::new(startup_data.window_size.0, startup_data.window_size.1);
 	let authority = resolve_startup(target)
 		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-	let initial = new_with_authority(startup_data, authority)
+	let mut initial = new_with_authority(startup_data, authority)
 		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+	#[cfg(unix)]
+	initial
+		.0
+		.advertise_window(accepting_agents)
+		.map_err(std::io::Error::other)?;
+	#[cfg(not(unix))]
+	if accepting_agents {
+		return Err("live connections require Unix".into());
+	}
 	let initial = std::sync::Mutex::new(Some(initial));
 	let initialize = move || {
 		initial
@@ -806,6 +823,9 @@ fn new_with_authority(
 	};
 	code_editor.set_show_column_types(startup_data.show_column_types);
 	let mut state = AppState {
+		surface: surface::Surface::default(),
+		#[cfg(unix)]
+		agents: agents::Agents::default(),
 		menu_state: MenuState::default(),
 		code_editor,
 		status_msg: "".to_string(),
@@ -923,6 +943,10 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		// PRODUCT-0135 §6: the Cancel affordance exists only while a run is
 		// in flight.
 		app_state.sql_abort.is_some(),
+		#[cfg(unix)]
+		app_state.agents.status(),
+		#[cfg(not(unix))]
+		(false, 0),
 	)
 }
 
@@ -3819,6 +3843,35 @@ fn begin_window_shutdown(_app_state: &mut AppState) -> Task<Message> {
 }
 
 fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
+	let task = update_inner(app_state, message);
+	app_state.capture_surface_baselines();
+	#[cfg(unix)]
+	app_state.refresh_agents();
+	task
+}
+
+fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
+	// Gate closure must also work while a saved window is finishing shutdown.
+	match message {
+		#[cfg(unix)]
+		Message::AgentInbound(inbound) => {
+			app_state.agent_inbound(inbound);
+			return Task::none();
+		}
+		Message::ToggleAgents => {
+			#[cfg(unix)]
+			if let Err(error) = app_state.toggle_agents() {
+				app_state.status_error = error;
+			}
+			#[cfg(not(unix))]
+			{
+				app_state.status_error = "Live connections require Unix.".into();
+			}
+			return Task::none();
+		}
+		_ => {}
+	}
+
 	#[cfg(feature = "toron")]
 	if app_state.saved_close_state == SavedCloseState::Frozen
 		&& !matches!(&message, Message::LocalWorkspaceStopped(_))
@@ -3826,6 +3879,9 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		return Task::none();
 	}
 	match message {
+		#[cfg(unix)]
+		Message::AgentInbound(_) => unreachable!(),
+		Message::ToggleAgents => unreachable!(),
 		Message::ToggleStatusDetail => {
 			if app_state.status_detail.is_some() {
 				app_state.status_detail_open = !app_state.status_detail_open;
@@ -5845,6 +5901,7 @@ fn menu_action_to_message(action: &str) -> Option<Message> {
 		"session:copy-id" => Some(Message::CopySessionId),
 		"session:close-without-checkpoint" => Some(Message::CloseWithoutCheckpoint),
 		"plot:publish" => Some(Message::PublishRequested),
+		"plot:agents" => Some(Message::ToggleAgents),
 		_ => {
 			// Profile names ride after a fixed prefix and are taken verbatim,
 			// so any name the store accepts is addressable from the menu.
@@ -15161,6 +15218,37 @@ rows.views([
 			})
 			.expect("the view's pane projects");
 		(Session::new(application), source_buffer)
+	}
+
+	#[test]
+	fn product_0160_baseline_precedes_client_and_is_replaced_on_rerun() {
+		let (mut first, buffer) = session();
+		let initial = first.loaded()[0].clone();
+		first.apply(&Command::Hide {
+			figure: FigureRef::Incarnation(initial.figure.clone()),
+			series: 1,
+		});
+		// Joining after a human/agent edit must not relabel live state as loaded.
+		let mut joined = Session::new(first.into_application());
+		let snapshot = joined.apply(&Command::Describe {}).figures.unwrap();
+		assert_eq!(snapshot[0].loaded, initial.loaded);
+		assert_eq!(snapshot[0].live.hidden, vec![1]);
+		let application = joined.application_mut();
+		run_source(application.state_mut(), buffer, 2);
+		application
+			.settle_until(Duration::from_secs(20), |state| {
+				state
+					.code_editor
+					.host_plot_exports_with_identity()
+					.iter()
+					.any(|(_, incarnation, _)| incarnation.token().to_string() != initial.figure)
+			})
+			.unwrap();
+		let snapshot = application.describe_surface();
+		assert_ne!(snapshot[0].figure, initial.figure);
+		assert!(snapshot[0].loaded.hidden.is_empty());
+		assert_eq!(snapshot[0].loaded.size, snapshot[0].live.size);
+		assert!(snapshot[0].loaded.size.width > 0.0);
 	}
 
 	/// PRODUCT-0158 gates 2 and 3: the loaded state carries no hidden set, the

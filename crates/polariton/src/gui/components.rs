@@ -169,6 +169,7 @@ pub fn main_screen<'a>(
 	publish_prompt: Option<&'a crate::publication::PublishPrompt>,
 	profile_names: Option<Vec<String>>,
 	sql_cancellable: bool,
+	agents: (bool, usize),
 ) -> Element<'a, Message> {
 	// Baryon's workspace is the sole top-level layout owner.
 	let main_content = container(code_editor.view().map(Message::CodeEditEvent))
@@ -202,6 +203,15 @@ pub fn main_screen<'a>(
 		)
 		.gap(6)
 		.delay(std::time::Duration::from_millis(350))
+		.into()
+	} else {
+		status_bar
+	};
+	let status_bar: Element<'a, Message> = if agents.0 {
+		row![
+			status_bar,
+			text(format!("Agents on · {} connected", agents.1)).size(12)
+		]
 		.into()
 	} else {
 		status_bar
@@ -509,6 +519,10 @@ fn build_menu_roots(
 			id: "plot".into(),
 			label: "Plot".into(),
 			items: vec![
+				MenuItem::Action {
+					id: "plot:agents".into(),
+					label: "Toggle accepting agents".into(),
+				},
 				MenuItem::Action {
 					id: "plot:publish".into(),
 					label: "Publish…".into(),
@@ -859,6 +873,7 @@ mod tests {
 		assert_eq!(
 			ids,
 			[
+				"plot:agents",
 				"plot:publish",
 				"plot:export:SVG",
 				"plot:export:PNG",

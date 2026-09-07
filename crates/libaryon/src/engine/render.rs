@@ -1592,6 +1592,7 @@ fn render_pane_viewport(
 					.get(&view.buffer_id)
 					.filter(|_| buffer.file_path().is_none());
 				crate::uast::projection::DocTabSummary {
+					source_path: buffer.file_path().map(str::to_owned),
 					buffer_id: view.buffer_id,
 					document_id: saved_documents
 						.and_then(|bindings| bindings.document_id(view.buffer_id)),

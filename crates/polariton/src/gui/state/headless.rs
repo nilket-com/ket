@@ -38,6 +38,10 @@ pub(crate) struct HeadlessApplication {
 }
 
 impl HeadlessApplication {
+	pub(crate) fn describe_surface(&self) -> Vec<crate::driver::FigureDescription> {
+		self.state.describe_surface()
+	}
+
 	/// Open the application on `source` as `polariton <source>` would, with
 	/// the configured startup data, and run its startup tasks to completion.
 	pub(crate) fn open(source: &Path, startup: StartupData) -> Result<Self, String> {
@@ -118,7 +122,8 @@ impl HeadlessApplication {
 	/// Wrap an application a test built with the same startup the window uses,
 	/// so the driver can be exercised on host panels the test filled itself.
 	#[cfg(test)]
-	pub(crate) fn from_state(state: AppState) -> Result<Self, String> {
+	pub(crate) fn from_state(mut state: AppState) -> Result<Self, String> {
+		state.capture_surface_baselines();
 		let runtime = tokio::runtime::Builder::new_multi_thread()
 			.enable_all()
 			.build()

@@ -18,6 +18,9 @@ mod editor;
 mod fonts;
 #[path = "../src/gui/mod.rs"]
 mod gui;
+#[cfg(unix)]
+#[path = "../src/live/mod.rs"]
+mod live;
 #[cfg(feature = "toron")]
 #[path = "../src/local_workspace.rs"]
 mod local_workspace;

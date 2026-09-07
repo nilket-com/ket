@@ -6,6 +6,8 @@ mod driver;
 mod editor;
 mod fonts;
 mod gui;
+#[cfg(unix)]
+mod live;
 #[cfg(feature = "toron")]
 mod local_workspace;
 mod plot;
@@ -41,6 +43,14 @@ fn main() -> gui::Result {
 		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
 	match action {
 		ApplicationAction::ListSessions => list_saved_sessions(),
+		#[cfg(unix)]
+		ApplicationAction::Windows => live::client::windows().map_err(Into::into),
+		#[cfg(unix)]
+		ApplicationAction::Observe(selector) => live::client::observe(&selector).map_err(Into::into),
+		ApplicationAction::GuiAgents(startup_target) => {
+			ensure_rustls_provider();
+			gui::run(configuration::load_startup_data(), startup_target, true)
+		}
 		ApplicationAction::Serve { root, bind } => {
 			publication::serve(root, bind).map_err(|error| error.into())
 		}
@@ -59,7 +69,7 @@ fn main() -> gui::Result {
 		ApplicationAction::Gui(startup_target) => {
 			ensure_rustls_provider();
 			let startup_data = configuration::load_startup_data();
-			gui::run(startup_data, startup_target)
+			gui::run(startup_data, startup_target, false)
 		}
 	}
 }
@@ -67,6 +77,11 @@ fn main() -> gui::Result {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ApplicationAction {
 	Gui(gui::StartupTarget),
+	GuiAgents(gui::StartupTarget),
+	#[cfg(unix)]
+	Windows,
+	#[cfg(unix)]
+	Observe(live::discovery::Selector),
 	ListSessions,
 	/// PRODUCT-0154 §9: `polariton serve <package> [--bind host:port]`.
 	Serve {
@@ -95,6 +110,19 @@ where
 {
 	let mut args = args.into_iter().peekable();
 	let _program = args.next();
+	#[cfg(unix)]
+	if args.peek().is_some_and(|arg| arg == "windows") {
+		args.next();
+		if args.next().is_some() {
+			return Err("windows takes no arguments".into());
+		}
+		return Ok(ApplicationAction::Windows);
+	}
+	#[cfg(unix)]
+	if args.peek().is_some_and(|arg| arg == "observe") {
+		args.next();
+		return live::client::selector(args).map(ApplicationAction::Observe);
+	}
 	if args.peek().is_some_and(|arg| arg == "serve") {
 		args.next();
 		return serve_action(args);
@@ -107,12 +135,15 @@ where
 		args.next();
 		return describe_action(args);
 	}
+	let mut accepting_agents = false;
 	let mut parse_flags = true;
 	let mut initial_file = None;
 	let mut session = None;
 	while let Some(arg) = args.next() {
 		if parse_flags && arg == "--" {
 			parse_flags = false;
+		} else if parse_flags && arg == "--agents" {
+			accepting_agents = true;
 		} else if parse_flags && arg == "--session" {
 			if session.is_some() {
 				return Err("--session may occur at most once".to_owned());
@@ -138,11 +169,17 @@ where
 	if session.is_some() && initial_file.is_some() {
 		return Err("--session and an initial file are mutually exclusive".to_owned());
 	}
-	Ok(
-		session.unwrap_or(ApplicationAction::Gui(gui::StartupTarget::Ephemeral {
-			initial_file,
-		})),
-	)
+	let action = session.unwrap_or(ApplicationAction::Gui(gui::StartupTarget::Ephemeral {
+		initial_file,
+	}));
+	if accepting_agents {
+		match action {
+			ApplicationAction::Gui(target) => Ok(ApplicationAction::GuiAgents(target)),
+			_ => Err("--agents requires a window".into()),
+		}
+	} else {
+		Ok(action)
+	}
 }
 
 #[cfg(feature = "toron")]
@@ -307,10 +344,7 @@ mod tests {
 	{
 		match action_from_args(args)? {
 			ApplicationAction::Gui(target) => Ok(target),
-			ApplicationAction::ListSessions => Err("expected GUI target".to_owned()),
-			ApplicationAction::Serve { .. }
-			| ApplicationAction::Drive { .. }
-			| ApplicationAction::Describe { .. } => Err("expected GUI target".to_owned()),
+			_ => Err("expected GUI target".to_owned()),
 		}
 	}
 

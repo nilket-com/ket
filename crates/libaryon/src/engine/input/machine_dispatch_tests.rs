@@ -78,6 +78,7 @@ fn test_viewport() -> Viewport {
 			is_git_status_panel: false,
 			background_override: None,
 			tabs: vec![crate::uast::projection::DocTabSummary {
+				source_path: None,
 				buffer_id: crate::core::BufferId::new(1),
 				document_id: None,
 				view_id,

@@ -202,6 +202,9 @@ fn product_0062_persistence_schema_has_no_placement_or_renderer_authority() {
 		// PRODUCT-0158 §5 and §6: the commands file and the receipt are the
 		// agent surface's own schema, owned by the driver.
 		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/driver.rs"),
+		// PRODUCT-0160 owns its wire protocol and window advertisement.
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/live/mod.rs"),
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/live/discovery.rs"),
 		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/profile_store.rs"),
 		// PRODUCT-0154 §2: the published dashboard package owns its own DTOs.
 		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/publication.rs"),
@@ -6746,4 +6749,36 @@ fn product_0158_driver_and_headless_application_hold_no_authority() {
 		!state.contains("crate::publication::assemble("),
 		"the menu's publish handler must not assemble apart from the write"
 	);
+}
+
+/// PRODUCT-0160 observe cut: transport has no application authority, and a
+/// joining client cannot mint a load baseline from the state it observes.
+#[test]
+fn product_0160_observation_enters_update_and_uses_application_baselines() {
+	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let transport = std::fs::read_to_string(src.join("live/transport.rs")).unwrap();
+	let state = std::fs::read_to_string(src.join("gui/state.rs")).unwrap();
+	let agents = std::fs::read_to_string(src.join("gui/state/agents.rs")).unwrap();
+	let surface = std::fs::read_to_string(src.join("gui/state/surface.rs")).unwrap();
+	let headless = std::fs::read_to_string(src.join("gui/state/headless.rs")).unwrap();
+	for forbidden in [
+		"AppState",
+		"CodeEditor",
+		"PlotPaneMsg",
+		"assemble_and_write",
+	] {
+		assert!(
+			!transport.contains(forbidden),
+			"transport must not acquire {forbidden}"
+		);
+	}
+	assert!(transport.contains("try_send(event)"));
+	assert!(transport.contains("MAX_ANSWERS"));
+	assert!(transport.contains("MAX_OUTSTANDING"));
+	assert!(state.contains("Message::AgentInbound(inbound)"));
+	assert!(state.contains("app_state.capture_surface_baselines()"));
+	assert!(agents.contains("self.describe_surface()"));
+	assert!(headless.contains("self.state.describe_surface()"));
+	assert!(surface.contains(".or_insert_with(|| live_state_of(&export))"));
+	assert!(!agents.contains("baselines.insert"));
 }

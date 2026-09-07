@@ -6656,6 +6656,7 @@ dependencies = [
  "iced_wgpu",
  "kurbo 0.13.1",
  "libaryon",
+ "libc",
  "mysql_async",
  "nilket-local",
  "nix",

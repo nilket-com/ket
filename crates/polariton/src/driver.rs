@@ -411,16 +411,7 @@ pub(crate) struct Session {
 
 impl Session {
 	pub(crate) fn new(application: HeadlessApplication) -> Self {
-		// PRODUCT-0158 §2: the loaded state is what the application carries
-		// before any command - reported from the panes, never assumed - and it
-		// is kept across every later describe.
-		let loaded = describe_all(&application)
-			.into_iter()
-			.map(|mut description| {
-				description.loaded = description.live.clone();
-				description
-			})
-			.collect();
+		let loaded = application.describe_surface();
 		Self {
 			application,
 			loaded,
@@ -429,6 +420,11 @@ impl Session {
 
 	pub(crate) fn loaded(&self) -> &[FigureDescription] {
 		&self.loaded
+	}
+
+	#[cfg(test)]
+	pub(crate) fn into_application(self) -> HeadlessApplication {
+		self.application
 	}
 
 	#[cfg(test)]
@@ -470,20 +466,7 @@ impl Session {
 	}
 
 	fn describe_live(&self) -> Vec<FigureDescription> {
-		describe_all(&self.application)
-			.into_iter()
-			.map(|mut description| {
-				// The loaded state is what the application carried before any
-				// command; the live state is now.
-				description.loaded = self
-					.loaded
-					.iter()
-					.find(|loaded| loaded.figure == description.figure)
-					.map(|loaded| loaded.loaded.clone())
-					.unwrap_or_default();
-				description
-			})
-			.collect()
+		self.application.describe_surface()
 	}
 
 	/// Resolve a figure reference to the pane it names now. A token that is
@@ -652,14 +635,6 @@ impl CommandReceipt {
 	}
 }
 
-pub(crate) fn describe_all(application: &HeadlessApplication) -> Vec<FigureDescription> {
-	application
-		.exports_with_identity()
-		.iter()
-		.map(|(panel, incarnation, export)| describe_export(*panel, *incarnation, export))
-		.collect()
-}
-
 fn export_bounds(export: &HostPlotExport) -> iced::Rectangle {
 	iced::Rectangle {
 		x: 0.0,
@@ -688,7 +663,7 @@ fn series_table_of(export: &HostPlotExport) -> Result<crate::publication::Series
 		.ok_or_else(|| "a series label did not join its identity".to_owned())
 }
 
-fn live_state_of(export: &HostPlotExport) -> LiveState {
+pub(crate) fn live_state_of(export: &HostPlotExport) -> LiveState {
 	let widget = widget_for(export, &export.settings_model);
 	let registry = widget.series_registry();
 	let hidden = widget.hidden_series();

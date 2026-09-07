@@ -491,6 +491,8 @@ impl std::ops::DerefMut for Viewport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocTabSummary {
+	/// Engine-owned file identity, including inactive tabs (PRODUCT-0160).
+	pub source_path: Option<String>,
 	/// Stable identity of the document behind this tab.
 	pub buffer_id: BufferId,
 	/// Durable identity of an ordinary document in a saved engine.

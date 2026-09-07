@@ -2389,6 +2389,7 @@ mod tests {
 		};
 		let tabs = [
 			DocTabSummary {
+				source_path: None,
 				buffer_id: libaryon::core::BufferId::new(1),
 				document_id: None,
 				view_id: libaryon::core::ViewId::new(1),
@@ -2397,6 +2398,7 @@ mod tests {
 				snapshot: None,
 			},
 			DocTabSummary {
+				source_path: None,
 				buffer_id: libaryon::core::BufferId::new(2),
 				document_id: None,
 				view_id: libaryon::core::ViewId::new(2),

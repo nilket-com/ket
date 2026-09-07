@@ -2364,6 +2364,34 @@ impl CodeEditor {
 	/// PRODUCT-0158 §2: the same exports, each with the pane it came from and
 	/// the figure incarnation minted when its kernel was installed. One walk
 	/// produces both, so a describe cannot pair an export with the wrong pane.
+	/// Incarnations remain alive while offscreen; returning to the viewport
+	/// must not replace their original load baseline.
+	#[cfg(unix)]
+	pub(crate) fn open_source_paths(&self) -> Vec<std::path::PathBuf> {
+		let mut paths: Vec<_> = self
+			.viewport
+			.iter()
+			.flat_map(|v| &v.panes)
+			.flat_map(|p| &p.tabs)
+			.filter_map(|tab| tab.source_path.as_deref())
+			.map(|path| crate::live::discovery::normalize(std::path::Path::new(path)))
+			.collect();
+		paths.sort();
+		paths.dedup();
+		paths
+	}
+
+	pub(crate) fn host_plot_incarnations(&self) -> std::collections::HashSet<u64> {
+		self.panels
+			.panels
+			.values()
+			.filter_map(|entry| match &entry.content {
+				PanelContent::Plot(plot) => Some(plot.surface_incarnation.token()),
+				_ => None,
+			})
+			.collect()
+	}
+
 	pub(crate) fn host_plot_exports_with_identity(
 		&self,
 	) -> Vec<(
@@ -8083,6 +8111,7 @@ mod tests {
 		use libaryon::uast::projection::DocTabSummary;
 
 		let clean = DocTabSummary {
+			source_path: None,
 			buffer_id: BufferId::new(1),
 			document_id: None,
 			view_id: ViewId::new(1),
@@ -8091,10 +8120,12 @@ mod tests {
 			snapshot: None,
 		};
 		let dirty = DocTabSummary {
+			source_path: None,
 			is_dirty: true,
 			..clean.clone()
 		};
 		let unnamed = DocTabSummary {
+			source_path: None,
 			title: "_".to_owned(),
 			..clean.clone()
 		};
