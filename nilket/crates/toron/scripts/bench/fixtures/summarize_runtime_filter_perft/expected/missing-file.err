@@ -1,0 +1,1 @@
+error: cannot read does_not_exist.log: No such file or directory (os error 2)
