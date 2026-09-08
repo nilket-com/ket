@@ -6,6 +6,7 @@ mod actions;
 mod agents;
 /// PRODUCT-0158: the application without a window.
 pub(crate) mod headless;
+pub(crate) mod notebook_actions;
 mod publish;
 mod surface;
 use crate::adapters::{
@@ -129,6 +130,8 @@ impl RetainedRelationGeneration {
 
 pub(crate) struct AppState {
 	surface: surface::Surface,
+	notebook_actions: notebook_actions::NotebookActions,
+	connection_generation: u64,
 	#[cfg(unix)]
 	agents: agents::Agents,
 	menu_state: MenuState,
@@ -168,8 +171,7 @@ pub(crate) struct AppState {
 	settings_preview_in_flight: Option<u64>,
 	#[cfg(feature = "toron")]
 	settings_preview_pending: HashMap<libaryon::engine::HostPanelId, PendingSettingsPreview>,
-	#[cfg(feature = "toron")]
-	settings_commit_sequence: u64,
+	document_request_sequence: u64,
 	#[cfg(feature = "toron")]
 	pending_settings_commits: HashMap<libaryon::core::RequestId, PendingSettingsCommit>,
 	#[cfg(feature = "toron")]
@@ -783,6 +785,13 @@ fn new_with_authority(
 	startup_data: StartupData,
 	authority: StartupAuthority,
 ) -> std::result::Result<(AppState, Task<Message>), String> {
+	new_with_discovery(startup_data, authority, true)
+}
+fn new_with_discovery(
+	startup_data: StartupData,
+	authority: StartupAuthority,
+	_discover: bool,
+) -> std::result::Result<(AppState, Task<Message>), String> {
 	let window_size = Size::new(startup_data.window_size.0, startup_data.window_size.1);
 	let init_error = startup_data.init_error.clone();
 	let init_summary = init_error
@@ -826,6 +835,8 @@ fn new_with_authority(
 	code_editor.set_show_column_types(startup_data.show_column_types);
 	let mut state = AppState {
 		surface: surface::Surface::default(),
+		notebook_actions: notebook_actions::NotebookActions::default(),
+		connection_generation: 0,
 		#[cfg(unix)]
 		agents: agents::Agents::default(),
 		menu_state: MenuState::default(),
@@ -861,8 +872,7 @@ fn new_with_authority(
 		settings_preview_in_flight: None,
 		#[cfg(feature = "toron")]
 		settings_preview_pending: HashMap::new(),
-		#[cfg(feature = "toron")]
-		settings_commit_sequence: 0,
+		document_request_sequence: 0,
 		#[cfg(feature = "toron")]
 		pending_settings_commits: HashMap::new(),
 		#[cfg(feature = "toron")]
@@ -893,10 +903,14 @@ fn new_with_authority(
 	let scratch = Task::perform(AdapterState::open_scratch(), Message::ScratchReady);
 	#[cfg(feature = "toron")]
 	{
-		let discovery = Task::perform(
-			nilket_local::discover(None),
-			Message::LocalWorkspaceDiscovered,
-		);
+		let discovery = if _discover {
+			Task::perform(
+				nilket_local::discover(None),
+				Message::LocalWorkspaceDiscovered,
+			)
+		} else {
+			Task::none()
+		};
 		Ok((state, Task::batch([scratch, discovery])))
 	}
 	#[cfg(not(feature = "toron"))]
@@ -3851,6 +3865,7 @@ fn begin_window_shutdown(_app_state: &mut AppState) -> Task<Message> {
 
 fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 	let task = update_inner(app_state, message);
+	app_state.expire_notebook_action();
 	app_state.capture_surface_baselines();
 	#[cfg(unix)]
 	app_state.refresh_agents();
@@ -3858,8 +3873,25 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 }
 
 fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
+	if matches!(
+		&message,
+		Message::AdapterSelected(_)
+			| Message::AdapterConfigurationSubmitted
+			| Message::AdapterConnected(_)
+	) {
+		app_state.connection_generation = app_state.connection_generation.saturating_add(1);
+	}
+	#[cfg(feature = "toron")]
+	if matches!(&message, Message::LocalWorkspaceAttached { .. }) {
+		app_state.connection_generation = app_state.connection_generation.saturating_add(1);
+	}
 	// Gate closure must also work while a saved window is finishing shutdown.
 	match message {
+		Message::NotebookTask { id, message } => return app_state.notebook_task(id, *message),
+		Message::NotebookDataLoaded { id, result } => {
+			return app_state.notebook_data_loaded(id, result);
+		}
+
 		#[cfg(unix)]
 		Message::AgentInbound(inbound) => {
 			return app_state.agent_inbound(inbound);
@@ -3955,6 +3987,7 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 				}
 			}
 		}
+		Message::NotebookTask { .. } | Message::NotebookDataLoaded { .. } => unreachable!(),
 		Message::CopySessionId => {
 			if let Some(session_id) = app_state.session_id {
 				return iced::clipboard::write(session_identity_text(session_id));
@@ -4047,17 +4080,22 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 			if app_state.code_editor.take_quit_request() {
 				return update(app_state, Message::CloseWindow);
 			}
-			#[cfg(feature = "toron")]
-			{
-				let acknowledgements = app_state
-					.code_editor
-					.take_document_edit_results()
-					.collect::<Vec<_>>();
-				for acknowledgement in acknowledgements {
+			let acknowledgements = app_state
+				.code_editor
+				.take_document_edit_results()
+				.collect::<Vec<_>>();
+			let mut notebook_tasks = Vec::new();
+			for acknowledgement in acknowledgements {
+				if let Some(task) = app_state.notebook_edit_ack(&acknowledgement) {
+					notebook_tasks.push(task);
+				} else {
+					#[cfg(feature = "toron")]
 					settle_settings_commit(app_state, acknowledgement);
 				}
 			}
-			let run_task = finish_pending_runs(app_state);
+
+			let run_task =
+				Task::batch([finish_pending_runs(app_state), Task::batch(notebook_tasks)]);
 			#[cfg(feature = "toron")]
 			let settings_tasks = {
 				let gestures = app_state
@@ -5471,9 +5509,10 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 				plot_type,
 			);
 			if commit {
-				app_state.settings_commit_sequence =
-					app_state.settings_commit_sequence.saturating_add(1);
-				let request_id = libaryon::core::RequestId::new(app_state.settings_commit_sequence);
+				app_state.document_request_sequence =
+					app_state.document_request_sequence.saturating_add(1);
+				let request_id =
+					libaryon::core::RequestId::new(app_state.document_request_sequence);
 				let revision = app_state.rune_buffer_revisions[&source_buffer];
 				if app_state.code_editor.apply_document_edits(
 					request_id,

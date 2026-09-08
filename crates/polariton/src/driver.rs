@@ -90,6 +90,20 @@ pub(crate) enum FigureRef {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Command {
 	Describe {},
+	DescribeNotebook {
+		#[serde(default)]
+		buffer: Option<String>,
+	},
+	OpenData {
+		path: String,
+	},
+	ReplaceCell {
+		target: CellRef,
+		source: String,
+	},
+	RunCell {
+		target: CellRef,
+	},
 	Hide {
 		figure: FigureRef,
 		series: u32,
@@ -115,10 +129,42 @@ pub(crate) enum Command {
 	},
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CellRef {
+	pub buffer: String,
+	pub generation: String,
+	pub cell: u32,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct NotebookCell {
+	pub cell: u32,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub name: Option<String>,
+	pub language: String,
+	pub source: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct NotebookDescription {
+	pub buffer: String,
+	pub generation: String,
+	pub cells: Vec<NotebookCell>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DataDescription {
+	pub table: String,
+	pub columns: Vec<(String, String)>,
+}
+
 impl Command {
 	fn figure(&self) -> Option<&FigureRef> {
 		match self {
-			Command::Describe {} | Command::Publish { .. } => None,
+			Command::Describe {}
+			| Command::Publish { .. }
+			| Command::DescribeNotebook { .. }
+			| Command::OpenData { .. }
+			| Command::ReplaceCell { .. }
+			| Command::RunCell { .. } => None,
 			Command::Hide { figure, .. }
 			| Command::Show { figure, .. }
 			| Command::Isolate { figure, .. }
@@ -162,6 +208,10 @@ pub(crate) struct CommandReceipt {
 	pub(crate) figures: Option<Vec<FigureDescription>>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub(crate) publish: Option<PublishReceipt>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) notebook: Option<NotebookDescription>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) data: Option<DataDescription>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -180,9 +230,14 @@ pub(crate) enum Outcome {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(crate) enum Failure {
+	Notebook {
+		message: String,
+	},
 	/// The divider drag moved nothing within the deadline; `state` on the
 	/// receipt is the size the pane had when the deadline passed.
-	ResizeDeadline { figure: String },
+	ResizeDeadline {
+		figure: String,
+	},
 	/// The pane's incarnation changed, or the pane left the viewport, before
 	/// the resize could be observed; `current` names the replacement.
 	ResizeSuperseded {
@@ -202,12 +257,21 @@ pub(crate) enum Failure {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(crate) enum Refusal {
+	Notebook {
+		message: String,
+	},
 	/// The commands file did not parse; nothing ran.
-	CommandsUnreadable { message: String },
+	CommandsUnreadable {
+		message: String,
+	},
 	/// The application could not open or run the source.
-	ApplicationFailed { message: String },
+	ApplicationFailed {
+		message: String,
+	},
 	/// The token names no figure in the application.
-	UnknownFigure { figure: FigureRef },
+	UnknownFigure {
+		figure: FigureRef,
+	},
 	/// Multiple open sources can author the same view name. Name an incarnation.
 	AmbiguousFigure {
 		figure: FigureRef,
@@ -215,7 +279,10 @@ pub(crate) enum Refusal {
 	},
 	/// The token named a figure that has since been replaced; `current` is
 	/// the incarnation that stands in its pane now.
-	StaleFigure { figure: FigureRef, current: String },
+	StaleFigure {
+		figure: FigureRef,
+		current: String,
+	},
 	/// The ordinal is not in the figure's series table.
 	UnknownSeries {
 		figure: String,
@@ -223,11 +290,19 @@ pub(crate) enum Refusal {
 		series_count: u32,
 	},
 	/// The figure has no series table to act on.
-	NoSeriesTable { figure: String, reason: String },
+	NoSeriesTable {
+		figure: String,
+		reason: String,
+	},
 	/// The resize could not be dispatched or did not take.
-	ResizeRefused { figure: String, message: String },
+	ResizeRefused {
+		figure: String,
+		message: String,
+	},
 	/// The publish action refused, with the publisher's own reason.
-	PublishRefused { reason: PublishRefusal },
+	PublishRefused {
+		reason: PublishRefusal,
+	},
 }
 
 /// `PublishError`, one variant per refusal, so a receipt can be matched on.
@@ -486,6 +561,8 @@ impl CommandReceipt {
 			state: None,
 			figures: None,
 			publish: None,
+			notebook: None,
+			data: None,
 		}
 	}
 	pub(crate) fn refuse(&mut self, refusal: Refusal) {

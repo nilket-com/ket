@@ -5,6 +5,9 @@
 //! renders the focused pane's projection: syntax, gutter, cursor, selection,
 //! diagnostics, folds, engine-owned wrap rows and scrolling, and the minimap.
 
+#[path = "editor/notebook_surface.rs"]
+mod notebook_surface;
+
 use crate::gui::plot_pane::{self, HostPlotState, PlotPaneMsg};
 use crate::gui::{
 	table::{Table, TableScroll},
@@ -2693,7 +2696,6 @@ impl CodeEditor {
 		}
 	}
 
-	#[cfg(feature = "toron")]
 	pub(crate) fn document_snapshot(
 		&self,
 		buffer_id: libaryon::core::BufferId,
@@ -2704,7 +2706,6 @@ impl CodeEditor {
 		))
 	}
 
-	#[cfg(feature = "toron")]
 	pub(crate) fn apply_document_edits(
 		&self,
 		request_id: libaryon::core::RequestId,
@@ -2720,7 +2721,6 @@ impl CodeEditor {
 		})
 	}
 
-	#[cfg(feature = "toron")]
 	pub(crate) fn take_document_edit_results(
 		&mut self,
 	) -> impl Iterator<Item = libaryon::engine::DocumentEditResult> + '_ {

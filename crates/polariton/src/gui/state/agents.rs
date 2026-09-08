@@ -22,6 +22,7 @@ pub(super) struct Agents {
 	connections: HashMap<u64, Sink>,
 	last: Vec<(u64, u64, u64, u32, u32)>,
 	resizes: Vec<PendingResize>,
+	notebooks: Vec<PendingNotebook>,
 }
 
 struct PendingResize {
@@ -29,6 +30,13 @@ struct PendingResize {
 	reply: Reply,
 	receipt: CommandReceipt,
 	resize: Resize,
+}
+
+struct PendingNotebook {
+	id: u64,
+	reply: Reply,
+	receipt: CommandReceipt,
+	ticket: super::notebook_actions::Ticket,
 }
 
 impl Agents {
@@ -39,7 +47,7 @@ impl Agents {
 			.map_or_else(iced::Subscription::none, |server| {
 				server.subscription().map(Message::AgentInbound)
 			});
-		let timer = if self.resizes.is_empty() {
+		let timer = if self.resizes.is_empty() && self.notebooks.is_empty() {
 			iced::Subscription::none()
 		} else {
 			iced::time::every(std::time::Duration::from_millis(50)).map(Message::AgentTick)
@@ -210,13 +218,24 @@ impl AppState {
 					});
 					return started.task;
 				}
-				reply.answer(Event::Applied {
-					id: request.id,
-					terminal: started.pending.is_none(),
-					receipt: receipt.clone(),
-				});
+				if !matches!(&started.pending, Some(Pending::Notebook(_))) {
+					reply.answer(Event::Applied {
+						id: request.id,
+						terminal: started.pending.is_none(),
+						receipt: receipt.clone(),
+					});
+				}
 				match started.pending {
 					None => return started.task,
+					Some(Pending::Notebook(ticket)) => {
+						self.agents.notebooks.push(PendingNotebook {
+							id: request.id,
+							reply,
+							receipt,
+							ticket,
+						});
+						return started.task;
+					}
 					Some(Pending::Resize(resize)) => {
 						self.agents.resizes.push(PendingResize {
 							id: request.id,
@@ -261,6 +280,37 @@ impl AppState {
 
 	pub(super) fn refresh_agents(&mut self) {
 		self.finish_agent_resizes(std::time::Instant::now());
+		let pending = std::mem::take(&mut self.agents.notebooks);
+		for mut waiting in pending {
+			if waiting.reply.is_closed() {
+				continue;
+			}
+			let Some(result) = waiting.ticket.result() else {
+				self.agents.notebooks.push(waiting);
+				continue;
+			};
+			result.apply(&mut waiting.receipt);
+			waiting.receipt.figures = Some(self.describe_surface());
+			let event = match waiting.receipt.outcome {
+				Outcome::Applied => Event::Completed {
+					id: waiting.id,
+					receipt: waiting.receipt,
+				},
+				Outcome::Refused => Event::Refused {
+					id: waiting.id,
+					reason: "notebook_refused".into(),
+					receipt: Some(waiting.receipt),
+				},
+				Outcome::Failed => Event::Failed {
+					id: waiting.id,
+					error: None,
+					root: None,
+					reason: "notebook_failed".into(),
+					receipt: waiting.receipt,
+				},
+			};
+			waiting.reply.answer(event);
+		}
 		if let Some(window) = &mut self.agents.window {
 			let sources = self.code_editor.open_source_paths();
 			if window.advertisement.sources != sources {
@@ -397,7 +447,7 @@ mod tests {
 					generation: first_generation,
 					request: Request {
 						id: 7,
-						command: Command::Describe {},
+						command: Command::DescribeNotebook { buffer: None },
 					},
 					reply,
 				}),

@@ -21,6 +21,7 @@ pub(super) struct Started {
 }
 
 pub(super) enum Pending {
+	Notebook(super::notebook_actions::Ticket),
 	Resize(Resize),
 	Publish(PublishJob),
 }
@@ -59,6 +60,11 @@ impl AppState {
 	}
 
 	fn admit_command(&mut self, command: &Command, started: &mut Started) -> Result<(), Refusal> {
+		if let Some((ticket, task)) = self.start_notebook_command(command)? {
+			started.pending = Some(Pending::Notebook(ticket));
+			started.task = task;
+			return Ok(());
+		}
 		if let Command::Describe {} = command {
 			started.receipt.figures = Some(self.describe_surface());
 			return Ok(());

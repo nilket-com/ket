@@ -565,7 +565,7 @@ fn update_markdown_image_preview(
 	tab.view.scroll_row_offset = DisplayRow::ZERO;
 }
 
-pub(crate) fn markdown_cells(source: &str) -> Vec<MarkdownCellSnapshot> {
+pub fn markdown_cells(source: &str) -> Vec<MarkdownCellSnapshot> {
 	fenced_code_blocks(source)
 		.into_iter()
 		.map(|block| {

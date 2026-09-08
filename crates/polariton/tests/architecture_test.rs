@@ -3079,7 +3079,14 @@ fn product_0084_result_artifact_is_the_single_truth_boundary() {
 			source.contains("ResultArtifact::from_polars("),
 			"PRODUCT-0084 {adapter} must enter through the policy-free Polars constructor"
 		);
-		assert!(!source.contains("from_arrow_ipc"));
+		if adapter == "parquet.rs" {
+			// PRODUCT-0162 CSV input enters through Arrow; SQL results still
+			// use the Polars constructor above. Projection decoding stays owned
+			// by ResultArtifact, as the guard below requires.
+			assert!(source.contains("ArrowNullabilityPolicy::Preserve"));
+		} else {
+			assert!(!source.contains("from_arrow_ipc"));
+		}
 	}
 
 	let mut projection_decode_sites = Vec::new();
@@ -6731,7 +6738,7 @@ fn product_0158_driver_and_headless_application_hold_no_authority() {
 		);
 	}
 	for required in [
-		"new_with_authority(",
+		"new_with_discovery(",
 		"update(&mut self.state, message)",
 		"Message::Run",
 		"self.state.start_command(command)",
@@ -6801,4 +6808,31 @@ fn product_0160_observation_enters_update_and_uses_application_baselines() {
 		"a lost baseline must never be re-minted on a later capture pass"
 	);
 	assert!(!agents.contains("baselines.insert"));
+}
+
+#[test]
+fn product_0162_notebook_actions_share_admission_and_engine_generation_guards() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let actions = std::fs::read_to_string(root.join("src/gui/state/actions.rs")).unwrap();
+	let owner = std::fs::read_to_string(root.join("src/gui/state/notebook_actions.rs")).unwrap();
+	let editor = std::fs::read_to_string(root.join("src/editor/notebook_surface.rs")).unwrap();
+	let headless = std::fs::read_to_string(root.join("src/gui/state/headless.rs")).unwrap();
+	let live = std::fs::read_to_string(root.join("src/gui/state/agents.rs")).unwrap();
+	assert_eq!(
+		actions
+			.matches("self.start_notebook_command(command)")
+			.count(),
+		1
+	);
+	assert!(owner.contains("apply_document_edits"));
+	assert!(owner.contains("run_markdown_cell(self, cell)"));
+	assert!(editor.contains("libaryon::engine::project_notebook_cells(text)"));
+	assert!(headless.contains("Pending::Notebook(ticket)"));
+	assert!(live.contains("Pending::Notebook(ticket)"));
+	for client in [&headless, &live] {
+		assert!(!client.contains("project_notebook_cells"));
+		assert!(!client.contains("ApplyDocumentEdits"));
+	}
+	assert!(!owner.contains("serde_json"));
+	assert!(!owner.contains("assemble_and_write"));
 }

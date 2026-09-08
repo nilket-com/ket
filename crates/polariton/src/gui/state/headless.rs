@@ -8,7 +8,7 @@
 //! does, and publishes as the menu does. The driver on top of it is a client
 //! of this surface exactly as the window is.
 
-use super::{AppState, Message, StartupTarget, new_with_authority, resolve_startup, update};
+use super::{AppState, Message, StartupTarget, new_with_discovery, resolve_startup, update};
 use crate::configuration::StartupData;
 use crate::editor::{EditorMsg, HostPlotExport};
 use iced::Task;
@@ -49,7 +49,7 @@ impl HeadlessApplication {
 			.map_err(|error| format!("cannot start the application runtime: {error}"))?;
 		let (state, task) = {
 			let _context = runtime.enter();
-			new_with_authority(startup, authority)?
+			new_with_discovery(startup, authority, false)?
 		};
 		let (outputs, inbox) = tokio::sync::mpsc::unbounded_channel();
 		let mut application = Self {
@@ -107,6 +107,15 @@ impl HeadlessApplication {
 		self.drain();
 		match started.pending {
 			None => {}
+			Some(Pending::Notebook(ticket)) => loop {
+				self.tick();
+				if let Some(result) = ticket.result() {
+					result.apply(&mut receipt);
+					receipt.figures = Some(self.state.describe_surface());
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(5));
+			},
 			Some(Pending::Publish(job)) => {
 				let root = job.root.clone();
 				match job.run() {
@@ -192,6 +201,21 @@ impl HeadlessApplication {
 	#[cfg(feature = "toron")]
 	pub(crate) fn run_source(&mut self, deadline: Duration) -> Result<(), String> {
 		let started = Instant::now();
+		self.settle_until(deadline, |s| s.code_editor.active_language_id().is_some())?;
+		if self
+			.state
+			.code_editor
+			.active_language_id()
+			.is_some_and(|l| l.as_str() == "markdown")
+		{
+			return self.settle_until(deadline, |s| {
+				s.code_editor.notebook_description(None).is_ok()
+			});
+		}
+		self.spawn(Task::perform(
+			nilket_local::discover(None),
+			Message::LocalWorkspaceDiscovered,
+		));
 		self.settle_until(deadline, |state| {
 			state.adapter_state.rune_connection().is_some()
 		})
@@ -230,6 +254,17 @@ impl HeadlessApplication {
 	/// Without the `toron` feature there is no workspace to run a source in.
 	#[cfg(not(feature = "toron"))]
 	pub(crate) fn run_source(&mut self, _deadline: Duration) -> Result<(), String> {
+		self.settle_until(_deadline, |s| s.code_editor.active_language_id().is_some())?;
+		if self
+			.state
+			.code_editor
+			.active_language_id()
+			.is_some_and(|l| l.as_str() == "markdown")
+		{
+			return self.settle_until(_deadline, |s| {
+				s.code_editor.notebook_description(None).is_ok()
+			});
+		}
 		Err("running a source requires Polariton's `toron` feature".to_owned())
 	}
 

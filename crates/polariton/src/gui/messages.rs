@@ -60,6 +60,14 @@ impl std::fmt::Display for ExportFormat {
 
 #[derive(Clone)]
 pub enum Message {
+	NotebookTask {
+		id: libaryon::core::RequestId,
+		message: Box<Message>,
+	},
+	NotebookDataLoaded {
+		id: libaryon::core::RequestId,
+		result: Result<crate::gui::state::notebook_actions::LoadedData, String>,
+	},
 	#[cfg(unix)]
 	AgentTick(std::time::Instant),
 	#[cfg(unix)]

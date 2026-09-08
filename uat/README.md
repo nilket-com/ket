@@ -150,6 +150,35 @@ sales relation:
 cargo run -p polariton -- uat/test39.rn
 ```
 
+
+PRODUCT-0162 extends that connection to notebook authoring. Open the small
+SQL/Rune notebook with agent acceptance enabled:
+
+```sh
+polariton --agents uat/agent_notebook_showcase.md
+polariton windows
+python3 uat/agent_notebook_drive.py --binary target/debug/polariton \
+  --window <window-id> --data <your-file.parquet> --output /tmp/notebook-journey
+```
+
+The file must have two numeric columns; CSV is also supported. The output
+directory must be new. The harness uses only `polariton act`: it inspects
+cell bodies and their engine generation, runs the example, opens the file,
+replaces and runs the SQL cell, runs the plot cell, changes the query after
+the first render, and publishes. It saves each command and wire receipt
+beside the package. A refusal, failure, or unknown outcome stops the harness;
+it never replays one automatically.
+
+The four new verbs are `describe_notebook`, `open_data`, `replace_cell`, and
+`run_cell`. Edits and runs target the buffer, generation, and cell ordinal
+returned by inspection. Authored cell names help resolve that ordinal, but
+do not bypass the generation check. Replacement is a body, with a trailing
+newline and no fence lines. Notebook bodies total at most 32 KiB. The same
+verbs are available in `drive`; Markdown startup waits for commands on the
+scratch database without attaching a workspace. Runtime identities must
+come from that application's receipts, not a previous invocation.
+
+
 `test39.rn` is the compact member-ownership reference: `facet("region")`
 owns both its inter-cell gutter and its category-header `label_size`.
 

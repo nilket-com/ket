@@ -22,7 +22,10 @@ generation, and its executable cells: identity, language, and source body.
 The snapshot comes from the editor's attributed text and libaryon's own
 fence projection. It is validated against the live buffer generation before
 being returned. It never derives cell coordinates from a different revision.
-Ambiguous notebooks require a buffer selector. Source bodies are bounded to
+Ambiguous inspection and editing require a buffer selector. Cell execution
+requires one projected notebook: the existing notebook result namespace is
+application-scoped, so choosing a source buffer cannot claim to isolate
+results from another notebook. Namespacing those results is a follow-up. Source bodies are bounded to
 32 KiB in total in this cut; an oversized notebook refuses explicitly.
 This is trusted local authoring data, never reporting telemetry.
 
@@ -34,7 +37,10 @@ that query using the returned schema and the notebook actions. Opening data
 does not replace source text or discard an unsaved buffer.
 
 `replace_cell` names a buffer, an engine document generation, a cell
-identity, and replacement body text. The engine's existing
+ordinal within that generation, and replacement body text. The description
+also returns authored cell names when present, so clients can resolve a name
+to that ordinal. Nonempty replacement bodies end with a newline and cannot
+contain fence lines. The engine's existing
 `ApplyDocumentEdits` applies the replacement as one undoable transaction,
 checking that generation at the mutation owner. Typing queued before the
 request cannot be overwritten using an earlier projected generation. The

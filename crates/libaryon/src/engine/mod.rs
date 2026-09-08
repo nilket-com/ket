@@ -65,6 +65,8 @@ pub use self::layout::{
 	viewport_geometry_for_viewport_with_numbering, viewport_geometry_for_viewport_with_options,
 	viewport_geometry_with_options, viewport_max_line_on_screen,
 };
+/// Project executable cells from one attributed source snapshot.
+pub use self::markdown_image_preview::markdown_cells as project_notebook_cells;
 pub use self::minimap::{
 	EMPTY_PREVIEW_BIN, MinimapContentRevision, MinimapOverlay, MinimapSnapshot, OverviewContent,
 	OverviewSnapshot, PREVIEW_BIN_COLUMNS, PreviewContent, PreviewRow, PreviewSnapshot,

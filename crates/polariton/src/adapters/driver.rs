@@ -6,7 +6,6 @@ use crate::adapters::{
 	mysql, parquet, postgres, sqlite,
 };
 use gcloud_bigquery::client::{Client, ClientConfig};
-use polars::prelude::{HiveOptions, LazyFrame, PlRefPath, ScanArgsParquet};
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tokio_rusqlite::Connection as AsyncConnection;
@@ -440,37 +439,12 @@ impl AdapterState {
 				}
 			}
 			AdapterConfiguration::Parquet { input_path } => {
-				let input_path = Path::new(&input_path);
-				let input_ref_path = PlRefPath::try_from_path(input_path)
-					.map_err(|error| format!("Parquet path: {error}"))?;
-				let hive_options = HiveOptions {
-					enabled: Some(input_path.is_dir()),
-					try_parse_dates: true,
-					..Default::default()
-				};
-				let scan_args = ScanArgsParquet {
-					hive_options,
-					..Default::default()
-				};
-				let lf = LazyFrame::scan_parquet(input_ref_path, scan_args)
-					.map_err(|error| format!("Parquet scan: {error}"))?;
-				let table_name = if input_path.is_file() {
-					input_path
-						.file_prefix()
-						.and_then(|s| s.to_str())
-						.unwrap_or("temp_table")
-				} else {
-					input_path
-						.file_name()
-						.and_then(|s| s.to_str())
-						.unwrap_or("temp_table")
-				};
-				let context = polars::sql::SQLContext::new();
-				context.register(table_name, lf);
-				// The accepted table's Refusal row: polars executes
-				// synchronously; even abandonment waits.
+				let (adapter, _) =
+					tokio::task::spawn_blocking(move || parquet::open_data(Path::new(&input_path)))
+						.await
+						.map_err(|e| format!("File adapter task: {e}"))??;
 				Ok((
-					Arc::new(RwLock::new(parquet::ParquetAdapter { context })) as _,
+					Arc::new(RwLock::new(adapter)) as _,
 					CancelCapability::Refuse,
 				))
 			}
