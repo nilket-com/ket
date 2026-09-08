@@ -1,0 +1,88 @@
+// The same PRODUCT-0162 journey, using only the spike's generic host facilities.
+// Args: BINARY WINDOW DATA NEW_OUTPUT_DIRECTORY DATA_CELL PLOT_CELL
+fn act(state, command) {
+    state.sequence += 1;
+    let prefix = format!("{}/{}", state.output, state.sequence);
+    let commands = format!("{prefix}-commands.json");
+    host::write_new(commands, host::json_stringify(#{commands: [command]})?)?;
+    let result = host::process(state.binary,
+        ["act", state.window, "--commands", commands], 90000)?;
+    host::write_new(format!("{prefix}-events.ndjson"), result.stdout)?;
+    host::write_new(format!("{prefix}-stderr.txt"), result.stderr)?;
+    if result.code != 0 || result.timed_out || result.cancelled || result.truncated {
+        panic!("Action failed, timed out, was interrupted or exceeded capture. No replay.");
+    }
+    let answer = None;
+    for line in result.stdout.split('\n') {
+        if line.trim().is_empty() { continue; }
+        let event = host::json_parse(line)?;
+        if event.get("id") != Some(1) { continue; }
+        let terminal = match event.event {
+            "completed" => true,
+            "refused" => true,
+            "failed" => true,
+            "superseded" => true,
+            "unknown" => true,
+            "applied" => event.get("terminal") == Some(true),
+            _ => false,
+        };
+        if terminal {
+            assert!(answer.is_none(), "More than one final answer");
+            answer = Some(event);
+        }
+    }
+    let answer = answer.expect("No final answer; outcome unknown; no replay");
+    assert!(answer.event == "completed" || answer.event == "applied", "Action stopped; no replay");
+    assert!(answer.receipt.outcome == "applied", "Receipt did not apply");
+    Ok(answer.receipt)
+}
+fn inspect(state) { Ok(act(state, #{describe_notebook: #{}})?.notebook) }
+fn target(notebook, name) {
+    let found = None;
+    for cell in notebook.cells {
+        if cell.get("name") == Some(name) {
+            assert!(found.is_none(), "Ambiguous cell name");
+            found = Some(cell.cell);
+        }
+    }
+    #{buffer: notebook.buffer, generation: notebook.generation, cell: found.expect("Missing named cell")}
+}
+fn run(state, name) {
+    let notebook = inspect(state)?;
+    act(state, #{run_cell: #{target: target(notebook, name)}})
+}
+fn quote(value) { format!("\"{}\"", value.replace("\"", "\"\"")) }
+fn numeric(kind) {
+    for prefix in ["i8","i16","i32","i64","i128","u8","u16","u32","u64","f32","f64","decimal"] {
+        if kind.starts_with(prefix) { return true; }
+    }
+    false
+}
+pub fn main(args) {
+    assert!(args.len() == 6, "BINARY WINDOW DATA NEW_OUTPUT_DIRECTORY DATA_CELL PLOT_CELL");
+    host::mkdir(args[3])?;
+    let state = #{binary: args[0], window: args[1], output: host::absolute(args[3])?, sequence: 0};
+    run(state, args[4])?;
+    let example = run(state, args[5])?;
+    let previous = example.figures[0].figure;
+    let opened = act(state, #{open_data: #{path: host::absolute(args[2])?}})?.data;
+    let columns = [];
+    for column in opened.columns { if numeric(column[1]) { columns.push(column[0]); } }
+    assert!(columns.len() >= 2, "Need two numeric columns");
+    for multiplier in [1,2] {
+        let notebook = inspect(state)?;
+        let sql = format!("SELECT {} AS x, {} * {} AS y FROM {};\n",
+            quote(columns[0]), quote(columns[1]), multiplier, quote(opened.table));
+        act(state, #{replace_cell: #{target: target(notebook, args[4]), source: sql}})?;
+        run(state, args[4])?;
+        let result = run(state, args[5])?;
+        let current = result.figures[0].figure;
+        assert!(current != previous, "Run must finish with a new plot incarnation");
+        previous = current;
+    }
+    act(state, #{describe: #{}})?;
+    let result = act(state, #{publish: #{directory: format!("{}/package", state.output)}})?;
+    assert!(result.contains_key("publish"), "Publisher must return package receipt");
+    println!("Completed {} acknowledged actions: {}", state.sequence, state.output);
+    Ok(result.publish.digest)
+}

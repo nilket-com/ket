@@ -1,0 +1,19 @@
+[package]
+name = "rune-scripting-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Deliberately independent of the product workspace and its editor/GUI hosts.
+[workspace]
+
+[dependencies]
+rune = { version = "=0.14.1", default-features = false, features = ["std"] }
+serde_json = "1.0.149"
+libc = "0.2.177"
+
+[profile.dev]
+debug = false
+
+[profile.dev.package."*"]
+opt-level = 2
