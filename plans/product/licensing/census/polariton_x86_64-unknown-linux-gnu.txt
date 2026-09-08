@@ -1,0 +1,847 @@
+ab_glyph_rasterizer v0.1.10 | Apache-2.0 | default,std
+ab_glyph v0.2.32 | Apache-2.0 | default,gvar-alloc,std,variable-fonts
+adler2 v2.0.1 | 0BSD OR MIT OR Apache-2.0 | 
+aead v0.5.2 | MIT OR Apache-2.0 | alloc,getrandom,rand_core
+ahash v0.8.12 | MIT OR Apache-2.0 | default,getrandom,no-rng,runtime-rng,std
+ahash v0.8.12 | MIT OR Apache-2.0 | std
+aho-corasick v1.1.4 | Unlicense OR MIT | default,perf-literal,std
+aligned v0.4.3 | MIT OR Apache-2.0 | 
+aligned-vec v0.6.4 | MIT | default,std
+allocator-api2 v0.2.21 | MIT OR Apache-2.0 | alloc
+alloc-no-stdlib v2.0.4 | BSD-3-Clause | 
+alloc-stdlib v0.2.4 | BSD-3-Clause | 
+anyhow v1.0.103 | MIT OR Apache-2.0 | default,std
+arboard v3.6.1 | MIT OR Apache-2.0 | core-graphics,default,image,image-data,wayland-data-control,windows-sys,wl-clipboard-rs
+arc-swap v1.9.2 | MIT OR Apache-2.0 | 
+arg_enum_proc_macro v0.3.4 (proc-macro) | MIT | 
+argminmax v0.6.3 | MIT | float,half
+argon2 v0.5.3 | MIT OR Apache-2.0 | alloc,default,password-hash,rand
+array-init-cursor v0.2.1 | MIT/Apache-2.0 | 
+arrayref v0.3.9 | BSD-2-Clause | 
+arrayvec v0.7.8 | MIT OR Apache-2.0 | default,std
+arrow-arith v58.3.0 | Apache-2.0 | 
+arrow-array v58.3.0 | Apache-2.0 AND MIT | 
+arrow-buffer v58.3.0 | Apache-2.0 | 
+arrow-cast v58.3.0 | Apache-2.0 | 
+arrow-csv v58.3.0 | Apache-2.0 | 
+arrow-data v58.3.0 | Apache-2.0 | 
+arrow-ipc v58.3.0 | Apache-2.0 | default
+arrow-ord v58.3.0 | Apache-2.0 | 
+arrow-row v58.3.0 | Apache-2.0 | 
+arrow-schema v58.3.0 | Apache-2.0 | 
+arrow-select v58.3.0 | Apache-2.0 | 
+arrow-string v58.3.0 | Apache-2.0 | 
+arrow v58.3.0 | Apache-2.0 | arrow-ipc,ipc
+ash v0.38.0+1.3.281 | MIT OR Apache-2.0 | debug,default,libloading,loaded,std
+as-raw-xcb-connection v1.0.1 | MIT OR Apache-2.0 | alloc,default
+as-slice v0.2.1 | MIT OR Apache-2.0 | 
+async-broadcast v0.7.2 | MIT OR Apache-2.0 | 
+async-channel v2.5.0 | Apache-2.0 OR MIT | default,std
+async-executor v1.14.0 | Apache-2.0 OR MIT | 
+async-io v2.6.0 | Apache-2.0 OR MIT | 
+async-lock v3.4.2 | Apache-2.0 OR MIT | default,std
+async-process v2.5.0 | Apache-2.0 OR MIT | 
+async-recursion v1.1.1 (proc-macro) | MIT OR Apache-2.0 | 
+async-signal v0.2.14 | Apache-2.0 OR MIT | 
+async-stream-impl v0.3.6 (proc-macro) | MIT | 
+async-stream v0.3.6 | MIT | 
+async-task v4.7.1 | Apache-2.0 OR MIT | default,std
+async-trait v0.1.89 (proc-macro) | MIT OR Apache-2.0 | 
+atoi_simd v0.17.0 | MIT OR Apache-2.0 | default,std
+atoi v2.0.0 | MIT | default,std
+atomic-waker v1.1.2 | Apache-2.0 OR MIT | 
+av1-grain v0.2.5 | BSD-2-Clause | create,default,diff,estimate,nom,num-rational,parse,v_frame
+avif-serialize v0.8.9 | BSD-3-Clause | 
+av-scenechange v0.14.1 | MIT | 
+aws-lc-rs v1.17.3 | ISC AND (Apache-2.0 OR ISC) | aws-lc-sys,prebuilt-nasm
+aws-lc-sys v0.43.0 | ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) | prebuilt-nasm
+backon v1.6.0 | Apache-2.0 | tokio,tokio-sleep
+base16ct v0.2.0 | Apache-2.0 OR MIT | alloc
+base64ct v1.8.3 | Apache-2.0 OR MIT | alloc
+base64 v0.22.1 | MIT OR Apache-2.0 | alloc,default,std
+bigdecimal v0.4.10 | MIT/Apache-2.0 | default,serde,std
+bincode_derive v2.0.1 (proc-macro) | MIT | 
+bincode v2.0.1 | MIT | alloc,bincode_derive,default,derive,serde,std
+bit_field v0.10.3 | Apache-2.0/MIT | 
+bitflags v2.13.1 | MIT OR Apache-2.0 | serde,serde_core,std
+bit-set v0.8.0 | Apache-2.0 OR MIT | 
+bitstream-io v4.10.0 | MIT/Apache-2.0 | alloc,default,std
+bit-vec v0.8.0 | Apache-2.0 OR MIT | 
+blake2 v0.10.6 | MIT OR Apache-2.0 | 
+blake3 v1.8.5 | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | default,std
+block-buffer v0.10.4 | MIT OR Apache-2.0 | 
+block-buffer v0.12.1 | MIT OR Apache-2.0 | 
+blocking v1.6.2 | Apache-2.0 OR MIT | 
+boson v0.1.0 (<ket>/shared/boson) |  | 
+boxcar v0.2.14 | MIT | 
+brotli-decompressor v5.0.3 | BSD-3-Clause/MIT | alloc-stdlib,std
+brotli v8.0.4 | BSD-3-Clause AND MIT | alloc-stdlib,default,std
+bstr v1.13.0 | MIT OR Apache-2.0 | alloc,default,std,unicode
+btoi v0.5.0 | MIT OR Apache-2.0 | default,std
+bytemuck_derive v1.11.0 (proc-macro) | Zlib OR Apache-2.0 OR MIT | 
+bytemuck v1.25.2 | Zlib OR Apache-2.0 OR MIT | aarch64_simd,bytemuck_derive,derive,extern_crate_alloc,min_const_generics,must_cast,wasm_simd
+byteorder-lite v0.1.0 | Unlicense OR MIT | default,std
+byteorder v1.5.0 | Unlicense OR MIT | default,std
+bytes v1.12.1 | MIT | default,serde,std
+calloop v0.13.0 | MIT | 
+calloop v0.14.4 | MIT | 
+calloop-wayland-source v0.3.0 | MIT | 
+calloop-wayland-source v0.4.1 | MIT | 
+camino v1.2.4 | MIT OR Apache-2.0 | serde1
+cargo_metadata v0.23.1 | MIT | default
+cargo-platform v0.3.3 | MIT OR Apache-2.0 | 
+castaway v0.2.4 | MIT | alloc
+cfg-if v1.0.4 | MIT OR Apache-2.0 | 
+chacha20poly1305 v0.10.1 | Apache-2.0 OR MIT | alloc,default,getrandom,rand_core
+chacha20 v0.10.1 | MIT OR Apache-2.0 | rng
+chacha20 v0.9.1 | Apache-2.0 OR MIT | zeroize
+chrono-tz v0.10.4 | MIT OR Apache-2.0 | default,std
+chrono v0.4.41 | MIT OR Apache-2.0 | alloc,android-tzdata,clock,default,iana-time-zone,js-sys,now,oldtime,serde,std,wasm-bindgen,wasmbind,winapi,windows-link
+cipher v0.4.4 | MIT OR Apache-2.0 | zeroize
+clipboard_wayland v0.2.2 | Apache-2.0 | 
+clipboard_x11 v0.4.3 | MIT | 
+cmov v0.5.4 | Apache-2.0 OR MIT | 
+cobs v0.3.0 | MIT OR Apache-2.0 | 
+codespan-reporting v0.12.0 | Apache-2.0 | 
+color_quant v1.1.0 | MIT | 
+comfy-table v7.2.2 | MIT | tty
+compact_str v0.9.1 | MIT | default,serde,std
+concurrent-queue v2.5.0 | Apache-2.0 OR MIT | default,std
+constant_time_eq v0.4.2 | CC0-1.0 OR MIT-0 OR Apache-2.0 | std
+const-oid v0.10.2 | Apache-2.0 OR MIT | 
+const-oid v0.9.6 | Apache-2.0 OR MIT | db,std
+core_maths v0.1.1 | MIT | 
+cosmic-text v0.15.0 | MIT OR Apache-2.0 | default,fontconfig,std,swash,sys-locale
+countme v3.0.1 | MIT OR Apache-2.0 | 
+cov-mark v2.2.0 | MIT OR Apache-2.0 | default,enable
+cpufeatures v0.2.17 | MIT OR Apache-2.0 | 
+cpufeatures v0.3.0 | MIT OR Apache-2.0 | 
+crc32fast v1.5.0 | MIT OR Apache-2.0 | default,std
+critical-section v1.2.0 | MIT OR Apache-2.0 | 
+crossbeam-channel v0.5.16 | MIT OR Apache-2.0 | default,std
+crossbeam-deque v0.8.7 | MIT OR Apache-2.0 | default,std
+crossbeam-epoch v0.9.20 | MIT OR Apache-2.0 | alloc,std
+crossbeam-queue v0.3.13 | MIT OR Apache-2.0 | alloc,default,std
+crossbeam-utils v0.8.22 | MIT OR Apache-2.0 | default,std
+crossbeam v0.8.4 | MIT OR Apache-2.0 | alloc,crossbeam-channel,crossbeam-deque,crossbeam-epoch,crossbeam-queue,default,std
+crossterm v0.29.0 | MIT | 
+cryoglyph v0.1.0 | MIT OR Apache-2.0 OR Zlib | 
+crypto-bigint v0.5.5 | Apache-2.0 OR MIT | generic-array,rand_core,zeroize
+crypto-common v0.1.7 | MIT OR Apache-2.0 | getrandom,rand_core,std
+crypto-common v0.2.2 | MIT OR Apache-2.0 | 
+csv-core v0.1.13 | Unlicense/MIT | default
+csv v1.4.0 | Unlicense/MIT | 
+ctor v0.10.1 | Apache-2.0 OR MIT | std
+ctutils v0.4.2 | Apache-2.0 OR MIT | 
+cursor-icon v1.2.0 | MIT OR Apache-2.0 OR Zlib | alloc,default,std
+curve25519-dalek-derive v0.1.1 (proc-macro) | MIT/Apache-2.0 | 
+curve25519-dalek v4.1.3 | BSD-3-Clause | alloc,digest,precomputed-tables,zeroize
+darling_core v0.23.0 | MIT | strsim,suggestions
+darling_macro v0.23.0 (proc-macro) | MIT | 
+darling v0.23.0 | MIT | default,suggestions
+dashmap v5.5.3 | MIT | 
+dashmap v6.2.1 | MIT | inline,raw-api
+data-url v0.3.2 | MIT OR Apache-2.0 | alloc,default,std
+debug_unsafe v0.1.4 | MIT OR Apache-2.0 | 
+deranged v0.5.8 | MIT OR Apache-2.0 | default,serde
+der_derive v0.7.3 (proc-macro) | Apache-2.0 OR MIT | 
+derive-where v1.6.1 (proc-macro) | MIT OR Apache-2.0 | 
+der v0.7.10 | Apache-2.0 OR MIT | alloc,derive,flagset,oid,pem,std,zeroize
+digest v0.10.7 | MIT OR Apache-2.0 | alloc,block-buffer,const-oid,core-api,default,mac,oid,std,subtle
+digest v0.11.3 | MIT OR Apache-2.0 | alloc,block-api,default,mac,oid
+displaydoc v0.2.6 (proc-macro) | MIT OR Apache-2.0 | 
+dissimilar v1.0.11 | Apache-2.0 | 
+dlib v0.5.3 | MIT | 
+document-features v0.2.12 (proc-macro) | MIT OR Apache-2.0 | default
+dot v0.1.4 | MIT/Apache-2.0 | 
+downcast-rs v1.2.1 | MIT/Apache-2.0 | default,std
+dpi v0.1.2 | Apache-2.0 AND MIT | default,std
+drop_bomb v0.1.5 | MIT OR Apache-2.0 | 
+dyn-clone v1.0.20 | MIT OR Apache-2.0 | 
+ecdsa v0.16.9 | Apache-2.0 OR MIT | alloc,arithmetic,der,digest,hazmat,pem,pkcs8,rfc6979,signing,spki,std,verifying
+ed25519-dalek v2.2.0 | BSD-3-Clause | alloc,default,fast,pkcs8,std,zeroize
+ed25519 v2.2.3 | Apache-2.0 OR MIT | alloc,pkcs8,std
+either v1.16.0 | MIT OR Apache-2.0 | default,std,use_std
+either v1.16.0 | MIT OR Apache-2.0 | std,use_std
+elliptic-curve v0.13.8 | Apache-2.0 OR MIT | alloc,arithmetic,digest,ecdh,ff,group,hazmat,pem,pkcs8,sec1,std
+ena v0.14.4 | MIT OR Apache-2.0 | 
+encoding_rs v0.8.35 | (Apache-2.0 OR MIT) AND BSD-3-Clause | alloc,default
+endi v1.1.1 | MIT | default,std
+enumflags2_derive v0.7.12 (proc-macro) | MIT OR Apache-2.0 | 
+enumflags2 v0.7.12 | MIT OR Apache-2.0 | serde
+equator-macro v0.4.2 (proc-macro) | MIT | 
+equator v0.4.2 | MIT | 
+equivalent v1.0.2 | Apache-2.0 OR MIT | 
+errno v0.3.14 | MIT OR Apache-2.0 | default,std
+etagere v0.2.15 | MIT/Apache-2.0 | 
+ethnum v1.5.3 | MIT OR Apache-2.0 | 
+euclid v0.22.14 | MIT OR Apache-2.0 | default,std
+event-listener-strategy v0.5.4 | Apache-2.0 OR MIT | default,std
+event-listener v5.4.1 | Apache-2.0 OR MIT | default,parking,std
+exr v1.74.2 | BSD-3-Clause | rayon
+eyre v0.6.12 | MIT OR Apache-2.0 | auto-install,default,track-caller
+fallible-iterator v0.2.0 | MIT/Apache-2.0 | default,std
+fallible-iterator v0.3.0 | MIT/Apache-2.0 | alloc,default
+fallible-streaming-iterator v0.1.9 | MIT/Apache-2.0 | 
+fastbloom v0.17.0 | MIT OR Apache-2.0 | 
+fast-float2 v0.2.4 | MIT OR Apache-2.0 | default,std
+fastrand v2.4.1 | Apache-2.0 OR MIT | alloc,default,std
+fax v0.2.7 | MIT | 
+fdeflate v0.3.7 | MIT OR Apache-2.0 | 
+ff v0.13.1 | MIT/Apache-2.0 | alloc
+filetime v0.2.29 | MIT/Apache-2.0 | 
+fixedbitset v0.5.7 | MIT OR Apache-2.0 | 
+flagset v0.4.7 | Apache-2.0 | 
+flatbuffers v25.12.19 | Apache-2.0 | 
+flate2 v1.1.9 | MIT OR Apache-2.0 | any_impl,any_zlib,default,miniz_oxide,rust_backend,zlib-rs
+float-cmp v0.9.0 | MIT | std
+float_next_after v1.0.0 | MIT | 
+fnv v1.0.7 | Apache-2.0 / MIT | default,std
+foldhash v0.1.5 | Zlib | 
+foldhash v0.2.0 | Zlib | default,std
+fontconfig-parser v0.5.8 | MIT | 
+fontdb v0.23.0 | MIT | default,fontconfig,fontconfig-parser,fs,memmap,memmap2,std
+font-types v0.10.1 | MIT OR Apache-2.0 | bytemuck,std
+font-types v0.12.1 | MIT OR Apache-2.0 | bytemuck,std
+form_urlencoded v1.2.2 | MIT OR Apache-2.0 | alloc,default,std
+fs4 v0.13.1 | MIT OR Apache-2.0 | default,sync
+fst v0.4.7 | Unlicense/MIT | default
+futures-channel v0.3.32 | MIT OR Apache-2.0 | alloc,default,futures-sink,sink,std
+futures-core v0.3.32 | MIT OR Apache-2.0 | alloc,default,std
+futures-executor v0.3.32 | MIT OR Apache-2.0 | std,thread-pool
+futures-io v0.3.32 | MIT OR Apache-2.0 | default,std
+futures-lite v2.6.1 | Apache-2.0 OR MIT | alloc,default,fastrand,futures-io,parking,race,std
+futures-macro v0.3.32 (proc-macro) | MIT OR Apache-2.0 | 
+futures-sink v0.3.32 | MIT OR Apache-2.0 | alloc,default,std
+futures-task v0.3.32 | MIT OR Apache-2.0 | alloc,std
+futures-util v0.3.32 | MIT OR Apache-2.0 | alloc,async-await,async-await-macro,channel,default,futures-channel,futures-io,futures-macro,futures-sink,io,memchr,sink,slab,std
+futures v0.3.32 | MIT OR Apache-2.0 | alloc,async-await,default,executor,futures-executor,std,thread-pool
+gcloud-auth v1.3.0 | MIT | jwt-rust-crypto,rustls-tls
+gcloud-bigquery v1.7.0 | MIT | auth,google-cloud-auth,jwt-rust-crypto,rustls-tls
+gcloud-gax v1.4.0 | MIT | 
+gcloud-googleapis v1.3.0 | MIT | bigquery
+gcloud-metadata v1.0.2 | MIT | 
+generic-array v0.14.7 | MIT | more_lengths,zeroize
+gethostname v1.1.0 | Apache-2.0 | 
+getrandom v0.2.17 | MIT OR Apache-2.0 | std
+getrandom v0.3.4 | MIT OR Apache-2.0 | std
+getrandom v0.4.3 | MIT OR Apache-2.0 | std,sys_rng
+gif v0.14.2 | MIT OR Apache-2.0 | color_quant,default,raii_no_panic,std
+glam v0.25.0 | MIT OR Apache-2.0 | default,std
+glob v0.3.3 | MIT OR Apache-2.0 | 
+glow v0.16.0 | MIT OR Apache-2.0 OR Zlib | 
+gpu-alloc-types v0.3.1 | MIT OR Apache-2.0 | 
+gpu-alloc v0.6.2 | MIT OR Apache-2.0 | default,std
+gpu-descriptor-types v0.2.0 | MIT OR Apache-2.0 | 
+gpu-descriptor v0.3.2 | MIT OR Apache-2.0 | default,std
+group v0.13.0 | MIT/Apache-2.0 | alloc
+guillotiere v0.6.2 | MIT/Apache-2.0 | 
+h2 v0.4.15 | MIT | 
+half v2.7.1 | MIT OR Apache-2.0 | alloc,bytemuck,default,num-traits,serde,std
+harfrust v0.3.2 | MIT | std
+hashbrown v0.14.5 | MIT OR Apache-2.0 | ahash,allocator-api2,default,inline-more,raw
+hashbrown v0.15.5 | MIT OR Apache-2.0 | allocator-api2,default,default-hasher,equivalent,inline-more,raw-entry
+hashbrown v0.16.1 | MIT OR Apache-2.0 | allocator-api2,default,default-hasher,equivalent,inline-more,raw-entry,rayon,serde
+hashbrown v0.17.1 | MIT OR Apache-2.0 | 
+hashbrown v0.17.1 | MIT OR Apache-2.0 | allocator-api2,default,default-hasher,equivalent,inline-more,raw-entry
+hashlink v0.10.0 | MIT OR Apache-2.0 | 
+hashlink v0.12.1 | MIT OR Apache-2.0 | 
+hashlink v0.8.4 | MIT OR Apache-2.0 | 
+heck v0.4.1 | MIT OR Apache-2.0 | default
+heck v0.5.0 | MIT OR Apache-2.0 | 
+hexf-parse v0.2.1 | CC0-1.0 | 
+hex v0.4.3 | MIT OR Apache-2.0 | alloc,default,std
+hkdf v0.12.4 | MIT OR Apache-2.0 | 
+hmac v0.12.1 | MIT OR Apache-2.0 | reset
+hmac v0.13.0 | MIT OR Apache-2.0 | 
+home v0.5.12 | MIT OR Apache-2.0 | 
+httparse v1.10.1 | MIT OR Apache-2.0 | default,std
+http-body-util v0.1.4 | MIT | default
+http-body v1.1.0 | MIT | 
+httpdate v1.0.3 | MIT OR Apache-2.0 | 
+http v1.4.2 | MIT OR Apache-2.0 | default,std
+humantime v2.4.0 | MIT OR Apache-2.0 | 
+hybrid-array v0.4.13 | MIT OR Apache-2.0 | 
+hyper-rustls v0.27.9 | Apache-2.0 OR ISC OR MIT | aws-lc-rs,http1,http2,native-tokio,ring,rustls-native-certs,tls12
+hyper-timeout v0.5.2 | MIT OR Apache-2.0 | 
+hyper-util v0.1.20 | MIT | client,client-legacy,client-proxy,default,http1,http2,tokio
+hyper v1.10.1 | MIT | client,default,http1,http2,server
+iana-time-zone v0.1.65 | MIT OR Apache-2.0 | fallback
+iced_core v0.14.0 | MIT | advanced,crisp
+iced_debug v0.14.0 | MIT | 
+iced_futures v0.14.0 | MIT | thread-pool,tokio
+iced_graphics v0.14.0 | MIT | geometry,image,kamadak-exif,lyon_path,web-colors
+iced_program v0.14.0 | MIT | 
+iced_renderer v0.14.0 | MIT | geometry,iced_tiny_skia,iced_wgpu,image,tiny-skia,wayland,web-colors,wgpu,wgpu-bare,x11
+iced_runtime v0.14.0 | MIT | 
+iced_tiny_skia v0.14.0 | MIT | geometry,image,wayland,x11
+iced v0.14.0 | MIT | advanced,canvas,crisp,default,image,image-without-codecs,linux-theme-detection,thread-pool,tiny-skia,tokio,wayland,web-colors,wgpu,wgpu-bare,x11
+iced_wgpu v0.14.0 | MIT | default,geometry,image,lyon,web-colors
+iced_widget v0.14.2 | MIT | advanced,canvas,crisp,image,wgpu
+iced_winit v0.14.0 | MIT | linux-theme-detection,wayland,x11
+icu_collections v2.3.0 | Unicode-3.0 | 
+icu_locale_core v2.3.0 | Unicode-3.0 | zerovec
+icu_normalizer_data v2.3.0 | Unicode-3.0 | 
+icu_normalizer v2.3.0 | Unicode-3.0 | compiled_data
+icu_properties_data v2.3.0 | Unicode-3.0 | 
+icu_properties v2.3.0 | Unicode-3.0 | compiled_data
+icu_provider v2.3.1 | Unicode-3.0 | baked
+ident_case v1.0.1 | MIT/Apache-2.0 | 
+idna_adapter v1.2.2 | Apache-2.0 OR MIT | compiled_data
+idna v1.1.0 | MIT OR Apache-2.0 | alloc,compiled_data,std
+imagesize v0.14.0 | MIT | aesprite,bmp,dds,default,exr,farbfeld,gif,hdr,heif,ico,ilbm,jpeg,jxl,ktx2,mod,png,pnm,psd,qoi,tga,tiff,vtf,webp
+image v0.25.10 | MIT OR Apache-2.0 | avif,bmp,dds,default,default-formats,exr,ff,gif,hdr,ico,jpeg,png,pnm,qoi,rayon,tga,tiff,webp
+image-webp v0.2.4 | MIT OR Apache-2.0 | 
+imara-diff v0.2.0 | Apache-2.0 | default,unified_diff
+imgref v1.12.2 | CC0-1.0 OR Apache-2.0 | default,deprecated
+indenter v0.3.4 | MIT OR Apache-2.0 | default
+indexmap v2.14.0 | Apache-2.0 OR MIT | default,serde,std
+indexmap v2.14.0 | Apache-2.0 OR MIT | default,std
+inotify-sys v0.1.8 | ISC | 
+inotify v0.11.4 | ISC | 
+inout v0.1.4 | MIT OR Apache-2.0 | 
+intrusive-collections v0.10.3 | MIT OR Apache-2.0 | alloc,default
+inventory v0.3.24 | MIT OR Apache-2.0 | 
+io-uring v0.7.13 | MIT OR Apache-2.0 | 
+ipnet v2.12.0 | MIT OR Apache-2.0 | default,std
+is-macro v0.3.7 (proc-macro) | Apache-2.0 | 
+itertools v0.13.0 | MIT OR Apache-2.0 | default,use_alloc,use_std
+itertools v0.14.0 | MIT OR Apache-2.0 | default,use_alloc,use_std
+itertools v0.15.0 | MIT OR Apache-2.0 | default,use_alloc,use_std
+itoa v1.0.18 | MIT OR Apache-2.0 | 
+jod-thread v1.0.0 | MIT OR Apache-2.0 | 
+jsonwebtoken v10.4.0 | MIT | ed25519-dalek,hmac,p256,p384,pem,rand,rsa,rust_crypto,sha2,simple_asn1,use_pem
+kamadak-exif v0.6.1 | BSD-2-Clause | 
+keyed_priority_queue v0.4.2 | MIT | 
+khronos-egl v6.0.0 | MIT/Apache-2.0 | 1_0,1_1,1_2,1_3,1_4,1_5,default,dynamic,libloading
+kurbo v0.10.4 | MIT OR Apache-2.0 | default,std
+kurbo v0.13.1 | Apache-2.0 OR MIT | default,std
+la-arena v0.3.1 | MIT OR Apache-2.0 | 
+lazy_static v1.5.0 | MIT OR Apache-2.0 | spin,spin_no_std
+lebe v0.5.3 | BSD-3-Clause | 
+lexical-core v1.0.6 | MIT/Apache-2.0 | lexical-parse-float,lexical-parse-integer,lexical-write-float,lexical-write-integer,parse-floats,parse-integers,write-floats,write-integers
+lexical-parse-float v1.0.6 | MIT/Apache-2.0 | 
+lexical-parse-integer v1.0.6 | MIT/Apache-2.0 | 
+lexical-util v1.0.7 | MIT/Apache-2.0 | parse-floats,parse-integers,write-floats,write-integers
+lexical-write-float v1.0.6 | MIT/Apache-2.0 | 
+lexical-write-integer v1.0.6 | MIT/Apache-2.0 | 
+libaryon v0.1.0 (<ket>/crates/libaryon) |  | 
+libc v0.2.186 | MIT OR Apache-2.0 | default,extra_traits,std
+libloading v0.8.9 | ISC | 
+libm v0.2.16 | MIT | arch,default
+libsqlite3-sys v0.35.0 | MIT | bundled,bundled_bindings,cc,default,min_sqlite_version_3_14_0,pkg-config,vcpkg
+lilt v0.8.1 | MIT | 
+linebender_resource_handle v0.1.1 | Apache-2.0 OR MIT | std
+line-index v0.1.2 | MIT OR Apache-2.0 | 
+linux-raw-sys v0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | auxvec,elf,errno,general,if_ether,ioctl,net,netlink,no_std,prctl,system,xdp
+linux-raw-sys v0.4.15 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | elf,errno,general,ioctl,no_std,prctl,system
+litemap v0.8.2 | Unicode-3.0 | 
+litrs v1.0.0 | MIT OR Apache-2.0 | 
+lock_api v0.4.14 | MIT OR Apache-2.0 | atomic_usize,default
+log v0.4.33 | MIT OR Apache-2.0 | std
+loop9 v0.1.5 | MIT | 
+lru-slab v0.1.2 | MIT OR Apache-2.0 OR Zlib | 
+lru v0.16.4 | MIT | 
+lru v0.18.1 | MIT | default,hashbrown
+lyon_algorithms v1.0.20 | MIT OR Apache-2.0 | default,std
+lyon_geom v1.0.19 | MIT OR Apache-2.0 | std
+lyon_path v1.0.19 | MIT OR Apache-2.0 | default,std
+lyon_tessellation v1.0.20 | MIT OR Apache-2.0 | default,std
+lyon v1.0.19 | MIT OR Apache-2.0 | 
+lz4-sys v1.11.1+lz4-1.10.0 | MIT | 
+lz4 v1.28.1 | MIT | 
+manyhow-macros v0.11.4 (proc-macro) | MIT OR Apache-2.0 | 
+manyhow v0.11.4 | MIT OR Apache-2.0 | default,macros,syn,syn2
+maybe-rayon v0.1.1 | MIT | rayon,threads
+md-5 v0.11.0 | MIT OR Apache-2.0 | alloc,default,oid
+memchr v2.8.3 | Unlicense OR MIT | alloc,default,std
+memmap2 v0.9.11 | MIT OR Apache-2.0 | 
+memoffset v0.9.1 | MIT | default
+mime_guess v2.0.5 | MIT | 
+mime v0.3.17 | MIT OR Apache-2.0 | 
+miniz_oxide v0.8.9 | MIT OR Zlib OR Apache-2.0 | default,simd,simd-adler32,with-alloc
+mio v1.2.2 | MIT | default,log,net,os-ext,os-poll
+moxcms v0.8.1 | BSD-3-Clause OR Apache-2.0 | avx,avx_luts,avx_shaper_fixed_point_paths,avx_shaper_paths,default,lut,neon,neon_luts,neon_shaper_fixed_point_paths,neon_shaper_paths,sse,sse_luts,sse_shaper_fixed_point_paths,sse_shaper_paths
+mundy v0.2.3 | Apache-2.0 | _macos-observable,_windows-ui-settings,_winrt,async-io,color-scheme
+musli-core v0.0.124 | MIT OR Apache-2.0 | alloc,std
+musli-macros v0.0.124 (proc-macro) | MIT OR Apache-2.0 | 
+musli v0.0.124 | MIT OR Apache-2.0 | alloc,std
+mutate_once v0.1.2 | BSD-2-Clause | 
+mysql_async v0.37.0 | MIT OR Apache-2.0 | default-rustls-no-provider,default-rustls-ring,derive,ring,rustls,rustls-tls,tls12,tokio-rustls,webpki-roots
+mysql-common-derive v0.32.2 (proc-macro) | MIT OR Apache-2.0 | 
+mysql_common v0.37.3 | MIT OR Apache-2.0 | derive,mysql-common-derive
+naga v27.0.3 | MIT OR Apache-2.0 | default,glsl-out,hlsl-out,spv-out,wgsl-in
+new_debug_unreachable v1.0.6 | MIT | 
+nilket-local v0.1.0 (<ket>/nilket/crates/nilket-local) |  | 
+nix v0.29.0 | MIT | default,process,signal
+nohash-hasher v0.2.0 | Apache-2.0 OR MIT | default,std
+nom v8.0.0 | MIT | alloc,default,std
+noop_proc_macro v0.3.0 (proc-macro) | MIT | 
+no_std_io2 v0.9.4 | Apache-2.0 OR MIT | alloc,default,std
+notify-types v2.1.0 | MIT OR Apache-2.0 | 
+notify v8.2.0 | CC0-1.0 | default,fsevent-sys,macos_fsevent
+now v0.1.3 | MIT | 
+nu-ansi-term v0.50.3 | MIT | default,std
+num-bigint-dig v0.8.6 | MIT/Apache-2.0 | i128,prime,rand,u64_digit,zeroize
+num-bigint v0.4.8 | MIT OR Apache-2.0 | default,std
+num-complex v0.4.6 | MIT OR Apache-2.0 | bytemuck,default,std
+num-conv v0.2.2 | MIT OR Apache-2.0 | 
+num-derive v0.4.2 (proc-macro) | MIT OR Apache-2.0 | 
+num-integer v0.1.47 | MIT OR Apache-2.0 | i128,std
+num-iter v0.1.46 | MIT OR Apache-2.0 | i128,std
+num-rational v0.4.2 | MIT OR Apache-2.0 | default,num-bigint,num-bigint-std,std
+num_threads v0.1.7 | MIT OR Apache-2.0 | 
+num-traits v0.2.19 | MIT OR Apache-2.0 | default,i128,libm,std
+num-traits v0.2.19 | MIT OR Apache-2.0 | i128,std
+num v0.4.3 | MIT OR Apache-2.0 | alloc,num-bigint,std
+object_store v0.13.2 | MIT/Apache-2.0 | base64,cloud,form_urlencoded,fs,http,http-body-util,hyper,quick-xml,rand,reqwest,ring,serde,serde_json,serde_urlencoded,tokio,walkdir
+once_cell v1.21.4 | MIT OR Apache-2.0 | alloc,critical-section,default,portable-atomic,race,std
+once_cell v1.21.4 | MIT OR Apache-2.0 | alloc,default,race,std
+oorandom v11.1.5 | MIT | 
+opaque-debug v0.3.1 | MIT OR Apache-2.0 | 
+openssl-probe v0.2.1 | MIT OR Apache-2.0 | 
+ordered-float v5.3.0 | MIT | 
+ordered-stream v0.2.0 | MIT OR Apache-2.0 | 
+os_pipe v1.2.3 | MIT | io_safety
+owned_ttf_parser v0.25.1 | Apache-2.0 | apple-layout,default,glyph-names,gvar-alloc,opentype-layout,std,variable-fonts
+p256 v0.13.2 | Apache-2.0 OR MIT | alloc,arithmetic,default,digest,ecdsa,ecdsa-core,pem,pkcs8,sha2,sha256,std
+p384 v0.13.1 | Apache-2.0 OR MIT | alloc,arithmetic,default,digest,ecdh,ecdsa,ecdsa-core,pem,pkcs8,sha2,sha384,std
+parking_lot_core v0.9.12 | MIT OR Apache-2.0 | 
+parking_lot v0.12.5 | MIT OR Apache-2.0 | default
+parking v2.2.1 | Apache-2.0 OR MIT | 
+password-hash v0.5.0 | MIT OR Apache-2.0 | alloc,default,rand_core
+paste v1.0.15 (proc-macro) | MIT OR Apache-2.0 | 
+pastey v0.1.1 (proc-macro) | MIT OR Apache-2.0 | 
+pem-rfc7468 v0.7.0 | Apache-2.0 OR MIT | alloc
+pem v3.0.6 | MIT | default,std
+percent-encoding v2.3.2 | MIT OR Apache-2.0 | alloc,default,std
+perf-event-open-sys v4.0.0 | MIT OR Apache-2.0 | 
+perf-event v0.4.8 | MIT OR Apache-2.0 | default,hooks
+petgraph v0.8.3 | MIT OR Apache-2.0 | 
+phf_shared v0.11.3 | MIT | 
+phf_shared v0.12.1 | MIT | 
+phf_shared v0.13.1 | MIT | std
+phf v0.11.3 | MIT | 
+phf v0.12.1 | MIT | 
+phf v0.13.1 | MIT | default,std
+pico-args v0.5.0 | MIT | default,eq-separator
+pin-project-internal v1.1.13 (proc-macro) | Apache-2.0 OR MIT | 
+pin-project-lite v0.2.17 | Apache-2.0 OR MIT | 
+pin-project v1.1.13 | Apache-2.0 OR MIT | 
+piper v0.2.5 | MIT OR Apache-2.0 | default,futures-io,std
+pkcs1 v0.7.5 | Apache-2.0 OR MIT | alloc,pem,pkcs8,std,zeroize
+pkcs8 v0.10.2 | Apache-2.0 OR MIT | alloc,pem,std
+planus v1.1.1 | MIT/Apache-2.0 | bytes-cache,default,hashbrown,std,string-cache,vtable-cache
+png v0.18.1 | MIT OR Apache-2.0 | 
+polariton v0.1.0 (<ket>/crates/polariton) |  | default,toron
+polars-arrow-format v0.2.1 | Apache-2.0 | default,ipc,planus,serde
+polars-arrow v0.53.0 | MIT AND Apache-2.0 | arrow-format,atoi_simd,chrono-tz,compute,compute_aggregate,compute_arithmetics,compute_arithmetics_decimal,compute_bitwise,compute_boolean,compute_boolean_kleene,compute_comparison,compute_temporal,dtype-array,dtype-decimal,io_ipc,io_ipc_compression,itoa,lz4,serde,strings,temporal,timezones,zstd
+polars-buffer v0.53.0 | MIT | serde
+polars-compute v0.53.0 | MIT | approx_unique,cast,dtype-array,dtype-decimal,dtype-i128,gather,serde
+polars-core v0.53.0 | MIT | algorithm_group_by,chrono,chrono-tz,comfy-table,docs,dtype-array,dtype-categorical,dtype-date,dtype-datetime,dtype-decimal,dtype-duration,dtype-i128,dtype-i16,dtype-i8,dtype-struct,dtype-time,fmt,lazy,partition_by,rand,rand_distr,random,regex,reinterpret,rows,serde,serde-lazy,serde_json,strings,temporal,timezones,zip_with
+polars-dtype v0.53.0 | MIT | dtype-categorical,serde
+polars-error v0.53.0 | MIT | arrow-format,object_store,regex
+polars-expr v0.53.0 | MIT | abs,arg_where,binary_encoding,concat_str,cov,cum_agg,dtype-array,dtype-categorical,dtype-date,dtype-datetime,dtype-decimal,dtype-duration,dtype-i128,dtype-i16,dtype-i8,dtype-struct,dtype-time,is_in,log,offset_by,parquet,peaks,polars-time,range,regex,rle,round_series,sign,string_normalize,string_reverse,strings,temporal,timezones,trigonometry,unique_counts
+polars-io v0.53.0 | MIT | async,async-trait,atoi_simd,chrono,cloud,csv,dtype-categorical,dtype-date,dtype-datetime,dtype-duration,dtype-time,fast-float2,file_cache,futures,http,ipc,ipc_streaming,itoa,lazy,object_store,parquet,polars-parquet,polars-time,reqwest,serde,serde_json,simdutf8,temporal,tokio,zmij
+polars-lazy v0.53.0 | MIT | abs,binary_encoding,concat_str,cov,cross_join,csv,cum_agg,dtype-array,dtype-categorical,dtype-date,dtype-datetime,dtype-decimal,dtype-duration,dtype-i16,dtype-i8,dtype-struct,dtype-time,ipc,is_in,list_eval,log,meta,new_streaming,offset_by,parquet,polars-stream,polars-time,range,regex,round_series,sign,string_normalize,string_reverse,strings,temporal,timezones,trigonometry
+polars-mem-engine v0.53.0 | MIT | cloud,csv,dtype-categorical,dtype-date,dtype-datetime,dtype-decimal,dtype-duration,dtype-i16,dtype-i8,dtype-struct,dtype-time,ipc,parquet,polars-time
+polars-ops v0.53.0 | MIT | abs,base64,binary_encoding,chrono,chrono-tz,chunked_ids,cov,cross_join,cum_agg,dtype-array,dtype-categorical,dtype-date,dtype-datetime,dtype-decimal,dtype-duration,dtype-i128,dtype-struct,hex,is_in,log,peaks,rle,round_series,search_sorted,semi_anti_join,string_normalize,string_reverse,strings,timezones,unicode-normalization,unicode-reverse,unique_counts
+polars-parquet-format v0.1.0 | MIT AND Apache-2.0 | async,async-trait,futures
+polars-parquet v0.53.0 | MIT AND Apache-2.0 | async,async-stream,brotli,compression,flate2,futures,gzip,lz4,serde,snap,snappy,zstd
+polars-plan v0.53.0 | MIT | abs,arg_where,binary_encoding,blake3,chrono,chrono-tz,cloud,concat_str,cov,cross_join,cse,csv,cum_agg,dtype-array,dtype-categorical,dtype-date,dtype-datetime,dtype-decimal,dtype-duration,dtype-i128,dtype-i16,dtype-i8,dtype-struct,dtype-time,ipc,is_in,log,meta,offset_by,parquet,peaks,polars-parquet,polars-time,range,regex,rle,round_series,semi_anti_join,sign,string_normalize,string_reverse,strings,temporal,timezones,trigonometry,unique_counts
+polars-row v0.53.0 | MIT | 
+polars-schema v0.53.0 | MIT | serde
+polars-sql v0.53.0 | MIT | csv,parquet
+polars-stream v0.53.0 | MIT | cloud,csv,cum_agg,dtype-array,dtype-categorical,dtype-date,dtype-datetime,dtype-decimal,dtype-duration,dtype-i16,dtype-i8,dtype-time,ipc,is_in,parquet,range,semi_anti_join,strings
+polars-time v0.53.0 | MIT | chrono-tz,dtype-date,dtype-datetime,dtype-duration,dtype-time,offset_by,temporal,timezones
+polars-utils v0.53.0 | MIT | memmap,mmap,serde
+polars v0.53.0 | MIT | csv,default,docs,dtype-categorical,dtype-date,dtype-datetime,dtype-duration,dtype-slim,fmt,ipc_streaming,lazy,new_streaming,parquet,polars-io,polars-lazy,polars-ops,polars-parquet,polars-sql,polars-time,sql,temporal,zip_with
+polling v3.11.0 | Apache-2.0 OR MIT | 
+poly1305 v0.8.0 | Apache-2.0 OR MIT | 
+polycool v0.4.0 | MIT OR Apache-2.0 | std
+portable-atomic v1.15.0 | Apache-2.0 OR MIT | default,fallback
+postcard v1.1.3 | MIT OR Apache-2.0 | alloc,use-std
+postgres-protocol v0.6.12 | MIT OR Apache-2.0 | default
+postgres-types v0.2.14 | MIT OR Apache-2.0 | 
+potential_utf v0.1.5 | Unicode-3.0 | zerovec
+powerfmt v0.2.0 | MIT OR Apache-2.0 | 
+ppv-lite86 v0.2.21 | MIT OR Apache-2.0 | simd,std
+primeorder v0.13.6 | Apache-2.0 OR MIT | 
+proc-macro2 v1.0.106 | MIT OR Apache-2.0 | default,proc-macro
+proc-macro-crate v3.5.0 | MIT OR Apache-2.0 | 
+proc-macro-utils v0.10.0 | MIT OR Apache-2.0 | default,parser,proc-macro,proc-macro2,quote,smallvec
+profiling-procmacros v1.0.18 (proc-macro) | MIT OR Apache-2.0 | 
+profiling v1.0.18 | MIT OR Apache-2.0 | default,procmacros,profiling-procmacros
+prost-derive v0.14.4 (proc-macro) | Apache-2.0 | 
+prost-types v0.14.4 | Apache-2.0 | default,std
+prost v0.14.4 | Apache-2.0 | default,derive,std
+psm v0.1.31 | MIT OR Apache-2.0 | 
+pulldown-cmark-to-cmark v10.0.4 | Apache-2.0 | 
+pulldown-cmark v0.13.4 | MIT | 
+pulldown-cmark v0.9.6 | MIT | 
+pulp v0.22.3 | MIT | default,relaxed-simd,std,x86-v3
+pulp-wasm-simd-flag v0.1.1 | MIT | relaxed-simd
+pxfm v0.1.30 | BSD-3-Clause OR Apache-2.0 | 
+qoi v0.4.1 | MIT/Apache-2.0 | default,std
+quick-error v2.0.1 | MIT/Apache-2.0 | 
+quick-xml v0.39.4 | MIT | default
+quick-xml v0.39.4 | MIT | default,overlapped-lists,serde,serialize
+quinn-proto v0.11.16 | MIT OR Apache-2.0 | bloom,log,platform-verifier,ring,rustls-ring
+quinn-udp v0.5.15 | MIT OR Apache-2.0 | log,tracing
+quinn v0.11.11 | MIT OR Apache-2.0 | bloom,default,log,platform-verifier,ring,runtime-tokio,rustls-ring
+quote v1.0.47 | MIT OR Apache-2.0 | default,proc-macro
+ra_ap_base_db v0.0.342 | MIT OR Apache-2.0 | default
+ra_ap_cfg v0.0.342 | MIT OR Apache-2.0 | default,syntax,tt
+ra_ap_edition v0.0.342 | MIT OR Apache-2.0 | 
+ra_ap_hir_def v0.0.342 | MIT OR Apache-2.0 | 
+ra_ap_hir_expand v0.0.342 | MIT OR Apache-2.0 | 
+ra_ap_hir_ty v0.0.342 | MIT OR Apache-2.0 | 
+ra_ap_hir v0.0.342 | MIT OR Apache-2.0 | 
+ra_ap_ide_assists v0.0.342 | MIT OR Apache-2.0 | 
+ra_ap_ide_completion v0.0.342 | MIT OR Apache-2.0 | default
+ra_ap_ide_db v0.0.342 | MIT OR Apache-2.0 | default
+ra_ap_ide_diagnostics v0.0.342 | MIT OR Apache-2.0 | default
+ra_ap_ide_ssr v0.0.342 | MIT OR Apache-2.0 | default
+ra_ap_ide v0.0.342 | MIT OR Apache-2.0 | 
+ra_ap_intern v0.0.342 | MIT OR Apache-2.0 | 
+ra_ap_macros v0.0.342 (proc-macro) | MIT OR Apache-2.0 | 
+ra_ap_mbe v0.0.342 | MIT OR Apache-2.0 | 
+ra_ap_parser v0.0.342 | MIT OR Apache-2.0 | default
+ra_ap_paths v0.0.342 | MIT OR Apache-2.0 | serde1
+ra_ap_profile v0.0.342 | MIT OR Apache-2.0 | 
+ra_ap_project_model v0.0.342 | MIT OR Apache-2.0 | default
+ra_ap_query-group-macro v0.0.342 (proc-macro) | MIT OR Apache-2.0 | 
+ra-ap-rustc_abi v0.165.0 | MIT / Apache-2.0 | 
+ra-ap-rustc_ast_ir v0.165.0 | MIT / Apache-2.0 | 
+ra-ap-rustc_hashes v0.165.0 | MIT / Apache-2.0 | 
+ra-ap-rustc_index_macros v0.165.0 (proc-macro) | MIT / Apache-2.0 | 
+ra-ap-rustc_index v0.165.0 | MIT / Apache-2.0 | 
+ra-ap-rustc_lexer v0.165.0 | MIT / Apache-2.0 | 
+ra-ap-rustc_next_trait_solver v0.165.0 | MIT / Apache-2.0 | 
+ra-ap-rustc_parse_format v0.165.0 | MIT / Apache-2.0 | 
+ra-ap-rustc_pattern_analysis v0.165.0 | MIT / Apache-2.0 | 
+ra-ap-rustc_type_ir_macros v0.165.0 (proc-macro) | MIT / Apache-2.0 | 
+ra-ap-rustc_type_ir v0.165.0 | MIT / Apache-2.0 | 
+ra_ap_span v0.0.342 | MIT OR Apache-2.0 | default,salsa
+ra_ap_stdx v0.0.342 | MIT OR Apache-2.0 | 
+ra_ap_syntax-bridge v0.0.342 | MIT OR Apache-2.0 | 
+ra_ap_syntax v0.0.342 | MIT OR Apache-2.0 | default
+ra_ap_test_fixture v0.0.342 | MIT OR Apache-2.0 | default
+ra_ap_test_utils v0.0.342 | MIT OR Apache-2.0 | 
+ra_ap_toolchain v0.0.342 | MIT OR Apache-2.0 | 
+ra_ap_tt v0.0.342 | MIT OR Apache-2.0 | 
+ra_ap_vfs v0.0.342 | MIT OR Apache-2.0 | 
+rand_chacha v0.3.1 | MIT OR Apache-2.0 | std
+rand_chacha v0.9.0 | MIT OR Apache-2.0 | std
+rand_core v0.10.1 | MIT OR Apache-2.0 | 
+rand_core v0.6.4 | MIT OR Apache-2.0 | alloc,getrandom,std
+rand_core v0.9.5 | MIT OR Apache-2.0 | os_rng,std
+rand_distr v0.5.1 | MIT OR Apache-2.0 | alloc,default,std
+rand_distr v0.6.0 | MIT OR Apache-2.0 | alloc,default,std
+rand_pcg v0.10.2 | MIT OR Apache-2.0 | 
+rand v0.10.2 | MIT OR Apache-2.0 | alloc,default,std,std_rng,sys_rng,thread_rng
+rand v0.8.7 | MIT OR Apache-2.0 | alloc,getrandom,libc,rand_chacha,std,std_rng
+rand v0.9.5 | MIT OR Apache-2.0 | alloc,default,os_rng,small_rng,std,std_rng,thread_rng
+rangemap v1.7.1 | MIT/Apache-2.0 | 
+rav1e v0.8.1 | BSD-2-Clause | threading
+ravif v0.13.0 | BSD-3-Clause | threading
+raw-cpuid v11.6.0 | MIT | 
+raw-window-handle v0.6.2 | MIT OR Apache-2.0 OR Zlib | alloc,std
+rayon-core v1.13.0 | MIT OR Apache-2.0 | 
+rayon v1.12.0 | MIT OR Apache-2.0 | 
+rcgen v0.12.1 | MIT OR Apache-2.0 | default,pem,ring
+read-fonts v0.35.0 | MIT OR Apache-2.0 | libm,std
+read-fonts v0.41.0 | MIT OR Apache-2.0 | std
+reborrow v0.5.5 | MIT | default
+recursive-proc-macro-impl v0.1.1 (proc-macro) | MIT | 
+recursive v0.1.1 | MIT | 
+regex-automata v0.4.16 | MIT OR Apache-2.0 | alloc,default,dfa,dfa-build,dfa-onepass,dfa-search,hybrid,meta,nfa,nfa-backtrack,nfa-pikevm,nfa-thompson,perf,perf-inline,perf-literal,perf-literal-multisubstring,perf-literal-substring,std,syntax,unicode,unicode-age,unicode-bool,unicode-case,unicode-gencat,unicode-perl,unicode-script,unicode-segment,unicode-word-boundary
+regex-syntax v0.8.11 | MIT OR Apache-2.0 | default,std,unicode,unicode-age,unicode-bool,unicode-case,unicode-gencat,unicode-perl,unicode-script,unicode-segment
+regex v1.13.1 | MIT OR Apache-2.0 | default,perf,perf-backtrack,perf-cache,perf-dfa,perf-inline,perf-literal,perf-onepass,std,unicode,unicode-age,unicode-bool,unicode-case,unicode-gencat,unicode-perl,unicode-script,unicode-segment
+renderdoc-sys v1.1.0 | MIT OR Apache-2.0 | 
+reqwest-middleware v0.5.2 | MIT OR Apache-2.0 | json,multipart,query
+reqwest v0.12.28 | MIT OR Apache-2.0 | __rustls,__rustls-ring,__tls,h2,http2,json,rustls-tls-native-roots,rustls-tls-native-roots-no-provider,stream
+reqwest v0.13.4 | MIT OR Apache-2.0 | __rustls,__rustls-aws-lc-rs,__tls,charset,form,json,multipart,query,rustls,stream
+resvg v0.47.0 | Apache-2.0 OR MIT | default,gif,image-webp,memmap-fonts,raster-images,system-fonts,text
+rfc6979 v0.4.0 | Apache-2.0 OR MIT | 
+rgb v0.8.53 | MIT | argb,as-bytes,bytemuck,default,grb
+ring v0.17.14 | Apache-2.0 AND ISC | alloc,default,dev_urandom_fallback,std
+rmp-serde v1.3.1 | MIT | 
+rmp v0.8.15 | MIT | default,std
+rowan v0.15.19 | MIT OR Apache-2.0 | 
+roxmltree v0.20.0 | MIT OR Apache-2.0 | default,positions,std
+roxmltree v0.21.1 | MIT OR Apache-2.0 | default,positions,std
+rsa v0.9.10 | MIT OR Apache-2.0 | default,pem,std,u64_digit
+ruff_db v0.0.0 (https://github.com/astral-sh/ruff.git?tag=v0.4.9#4f49e918) | MIT | 
+ruff_index v0.0.0 (https://github.com/astral-sh/ruff.git?tag=v0.4.9#4f49e918) | MIT | 
+ruff_macros v0.0.0 (proc-macro) (https://github.com/astral-sh/ruff.git?tag=v0.4.9#4f49e918) | MIT | 
+ruff_python_ast v0.0.0 (https://github.com/astral-sh/ruff.git?tag=v0.4.9#4f49e918) | MIT | 
+ruff_python_parser v0.0.0 (https://github.com/astral-sh/ruff.git?tag=v0.4.9#4f49e918) | MIT | 
+ruff_python_semantic v0.0.0 (https://github.com/astral-sh/ruff.git?tag=v0.4.9#4f49e918) | MIT | 
+ruff_python_stdlib v0.0.0 (https://github.com/astral-sh/ruff.git?tag=v0.4.9#4f49e918) | MIT | 
+ruff_python_trivia v0.0.0 (https://github.com/astral-sh/ruff.git?tag=v0.4.9#4f49e918) | MIT | 
+ruff_source_file v0.0.0 (https://github.com/astral-sh/ruff.git?tag=v0.4.9#4f49e918) | MIT | 
+ruff_text_size v0.0.0 (https://github.com/astral-sh/ruff.git?tag=v0.4.9#4f49e918) |  | 
+rune-alloc-macros v0.14.2 (proc-macro) | MIT OR Apache-2.0 | 
+rune-alloc v0.14.2 | MIT OR Apache-2.0 | alloc,serde,std
+rune-core v0.14.2 | MIT OR Apache-2.0 | alloc,default,musli,std
+rune-core v0.14.2 | MIT OR Apache-2.0 | alloc,default,std
+rune-macros v0.14.2 (proc-macro) | MIT OR Apache-2.0 | 
+rune-tracing-macros v0.14.2 (proc-macro) | MIT OR Apache-2.0 | 
+rune-tracing v0.14.2 | MIT OR Apache-2.0 | default
+rune v0.14.2 | MIT OR Apache-2.0 | alloc,anyhow,std
+rusqlite v0.37.0 | MIT | bundled,modern_sqlite
+rustc_apfloat v0.2.3+llvm-462a31f5a5ab | Apache-2.0 WITH LLVM-exception | 
+rustc-hash v1.1.0 | Apache-2.0/MIT | default,std
+rustc-hash v2.1.3 | Apache-2.0 OR MIT | default,std
+rustc-literal-escaper v0.0.7 | Apache-2.0 OR MIT | 
+rustc-stable-hash v0.1.2 | Apache-2.0 OR MIT | 
+rustix v0.38.44 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | alloc,default,event,fs,libc-extra-traits,pipe,process,shm,std,system,thread,use-libc-auxv
+rustix v1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | alloc,default,event,fs,mm,net,pipe,process,shm,std,stdio,system,termios,time
+rustls-native-certs v0.8.4 | Apache-2.0 OR ISC OR MIT | 
+rustls-pki-types v1.15.0 | MIT OR Apache-2.0 | alloc,default,std
+rustls-platform-verifier v0.7.0 | MIT OR Apache-2.0 | 
+rustls v0.23.42 | Apache-2.0 OR ISC OR MIT | aws-lc-rs,aws_lc_rs,log,logging,ring,std,tls12
+rustls-webpki v0.103.13 | ISC | alloc,aws-lc-rs,ring,std
+rustversion v1.0.23 (proc-macro) | MIT OR Apache-2.0 | 
+rustybuzz v0.20.1 | MIT | default,std
+ryu v1.0.23 | Apache-2.0 OR BSL-1.0 | 
+salsa-2022-macros v0.1.0 (proc-macro) (https://github.com/salsa-rs/salsa.git?rev=05b4e3ebdcdc47730cdd359e7e97fb2470527279#05b4e3eb) |  | 
+salsa-2022 v0.1.0 (https://github.com/salsa-rs/salsa.git?rev=05b4e3ebdcdc47730cdd359e7e97fb2470527279#05b4e3eb) |  | 
+salsa-macro-rules v0.27.2 | Apache-2.0 OR MIT | 
+salsa-macros v0.27.2 (proc-macro) | Apache-2.0 OR MIT | default
+salsa v0.27.2 | Apache-2.0 OR MIT | inventory,macros,rayon,salsa_unstable
+same-file v1.0.6 | Unlicense/MIT | 
+saturating v0.1.0 | MIT | 
+scoped-tls v1.0.1 | MIT/Apache-2.0 | 
+scopeguard v1.2.0 | MIT OR Apache-2.0 | 
+sctk-adwaita v0.10.1 | MIT | ab_glyph,memmap2
+sec1 v0.7.3 | Apache-2.0 OR MIT | alloc,default,der,pem,pkcs8,point,std,subtle,zeroize
+self_cell v1.3.0 | Apache-2.0 OR GPL-2.0-only | 
+semver v1.0.28 | MIT OR Apache-2.0 | default,serde,std
+serde_bytes v0.11.19 | MIT OR Apache-2.0 | default,std
+serde_core v1.0.229 | MIT OR Apache-2.0 | alloc,default,rc,result,std
+serde_core v1.0.229 | MIT OR Apache-2.0 | alloc,result,std
+serde_derive v1.0.229 (proc-macro) | MIT OR Apache-2.0 | default
+serde_json v1.0.151 | MIT OR Apache-2.0 | default,float_roundtrip,std,unbounded_depth
+serde_repr v0.1.20 (proc-macro) | MIT OR Apache-2.0 | 
+serde_spanned v0.6.9 | MIT OR Apache-2.0 | serde
+serde_spanned v1.1.1 | MIT OR Apache-2.0 | alloc,serde,std
+serde_stacker v0.1.14 | MIT OR Apache-2.0 | 
+serde_urlencoded v0.7.1 | MIT/Apache-2.0 | 
+serde v1.0.229 | MIT OR Apache-2.0 | alloc,default,derive,rc,serde_derive,std
+serde v1.0.229 | MIT OR Apache-2.0 | alloc,default,derive,serde_derive,std
+sha1 v0.10.7 | MIT OR Apache-2.0 | default,std
+sha2 v0.10.9 | MIT OR Apache-2.0 | default,oid,std
+sha2 v0.11.0 | MIT OR Apache-2.0 | alloc,default,oid
+sharded-slab v0.1.7 | MIT | 
+signal-hook-registry v1.4.8 | MIT OR Apache-2.0 | 
+signal-hook v0.4.4 | MIT OR Apache-2.0 | channel,default,iterator
+signature v2.2.0 | Apache-2.0 OR MIT | alloc,digest,rand_core,std
+simd-adler32 v0.3.10 | MIT | const-generics,default,std
+simd_helpers v0.1.0 (proc-macro) | MIT | 
+simdutf8 v0.1.5 | MIT OR Apache-2.0 | default,std
+simple_asn1 v0.6.4 | ISC | 
+simplecss v0.2.2 | Apache-2.0 OR MIT | default,std
+siphasher v1.0.3 | MIT/Apache-2.0 | default,std
+skrifa v0.37.0 | MIT OR Apache-2.0 | std
+skrifa v0.44.0 | MIT OR Apache-2.0 | std
+slab v0.4.12 | MIT | default,std
+slotmap v1.1.1 | Zlib | default,std
+smallvec v1.15.2 | MIT OR Apache-2.0 | const_generics
+smallvec v1.15.2 | MIT OR Apache-2.0 | const_generics,const_new,union
+smithay-client-toolkit v0.19.2 | MIT | calloop,calloop-wayland-source
+smithay-client-toolkit v0.20.0 | MIT | calloop,calloop-wayland-source
+smithay-clipboard v0.7.3 | MIT | default,dlopen
+smol_str v0.2.2 | MIT OR Apache-2.0 | default,std
+smol_str v0.3.6 | MIT OR Apache-2.0 | default,std
+snap v1.1.2 | BSD-3-Clause | 
+socket2 v0.6.5 | MIT OR Apache-2.0 | all
+softbuffer v0.4.8 | MIT OR Apache-2.0 | as-raw-xcb-connection,bytemuck,fastrand,memmap2,rustix,tiny-xlib,wayland,wayland-backend,wayland-client,wayland-dlopen,wayland-sys,x11,x11-dlopen,x11rb
+spin v0.9.9 | MIT | once
+spirv v0.3.0+sdk-1.3.268.0 | Apache-2.0 | 
+spki v0.7.3 | Apache-2.0 OR MIT | alloc,pem,std
+sqlparser_derive v0.4.0 (proc-macro) | Apache-2.0 | 
+sqlparser v0.60.0 | Apache-2.0 | default,recursive,recursive-protection,sqlparser_derive,std,visitor
+sqlparser v0.61.0 | Apache-2.0 | default,recursive,recursive-protection,std
+sqlparser v0.62.0 | Apache-2.0 | std
+stable_deref_trait v1.2.1 | MIT OR Apache-2.0 | 
+stacker v0.1.24 | MIT OR Apache-2.0 | 
+static_assertions v1.1.0 | MIT OR Apache-2.0 | 
+streaming-decompression v0.1.2 | Apache-2.0 | 
+streaming-iterator v0.1.9 | MIT OR Apache-2.0 | 
+strength_reduce v0.2.4 | MIT OR Apache-2.0 | 
+strict-num v0.1.1 | MIT | approx-eq,default,float-cmp
+stringprep v0.1.5 | MIT/Apache-2.0 | 
+strsim v0.11.1 | MIT | 
+strum_macros v0.27.2 (proc-macro) | MIT | 
+subtle v2.6.1 | BSD-3-Clause | i128
+svg_fmt v0.4.5 | MIT/Apache-2.0 | 
+svgtypes v0.16.1 | Apache-2.0 OR MIT | default,std
+swash v0.2.10 | Apache-2.0 OR MIT | render,scale,std
+sync_wrapper v1.0.2 | Apache-2.0 | futures,futures-core
+synstructure v0.13.2 | MIT | default,proc-macro
+syntree v0.18.0 | MIT OR Apache-2.0 | alloc,std
+syn v1.0.109 | MIT OR Apache-2.0 | clone-impls,default,derive,extra-traits,full,parsing,printing,proc-macro,quote,visit-mut
+syn v2.0.119 | MIT OR Apache-2.0 | clone-impls,default,derive,extra-traits,fold,full,parsing,printing,proc-macro,visit,visit-mut
+syn v2.0.119 | MIT OR Apache-2.0 | clone-impls,default,derive,extra-traits,full,parsing,printing,proc-macro
+syn v3.0.4 | MIT OR Apache-2.0 | clone-impls,default,derive,extra-traits,parsing,printing,proc-macro
+sys-locale v0.3.2 | MIT OR Apache-2.0 | 
+temp-dir v0.2.0 | Apache-2.0 | 
+termcolor v1.4.1 | Unlicense OR MIT | 
+text-size v1.1.1 | MIT OR Apache-2.0 | 
+thin-vec v0.2.19 | MIT OR Apache-2.0 | default,std
+thiserror-impl v1.0.69 (proc-macro) | MIT OR Apache-2.0 | 
+thiserror-impl v2.0.20 (proc-macro) | MIT OR Apache-2.0 | 
+thiserror v1.0.69 | MIT OR Apache-2.0 | 
+thiserror v2.0.20 | MIT OR Apache-2.0 | default,std
+thread_local v1.1.10 | MIT OR Apache-2.0 | 
+tiff v0.11.3 | MIT | default,deflate,fax,jpeg,lzw
+time-core v0.1.9 | MIT OR Apache-2.0 | 
+time-macros v0.2.32 (proc-macro) | MIT OR Apache-2.0 | formatting,parsing,serde
+time v0.3.55 | MIT OR Apache-2.0 | alloc,default,formatting,local-offset,macros,parsing,serde,std
+tiny-skia-path v0.11.4 | BSD-3-Clause | std
+tiny-skia-path v0.12.0 | BSD-3-Clause | default,std
+tiny-skia v0.11.4 | BSD-3-Clause | simd,std
+tiny-skia v0.12.0 | BSD-3-Clause | default,png-format,simd,std
+tinystr v0.8.4 | Unicode-3.0 | zerovec
+tinyvec_macros v0.1.1 | MIT OR Apache-2.0 OR Zlib | 
+tinyvec v1.12.0 | Zlib OR Apache-2.0 OR MIT | alloc,default,tinyvec_macros
+tiny-xlib v0.2.5 | MIT OR Apache-2.0 OR Zlib | default,dlopen,libloading,tracing
+tls-pki v0.1.0 (<ket>/nilket/crates/tls-pki) |  | 
+token-source v1.0.0 | MIT | async-token-source,default
+tokio-macros v2.7.1 (proc-macro) | MIT | 
+tokio-postgres-rustls v0.14.0 | MIT | ring,webpki-roots
+tokio-postgres v0.7.18 | MIT OR Apache-2.0 | default,runtime
+tokio-retry2 v0.6.2 | MIT | 
+tokio-rusqlite v0.7.0 | MIT | bundled,default
+tokio-rustls v0.26.4 | MIT OR Apache-2.0 | aws-lc-rs,aws_lc_rs,logging,ring,tls12
+tokio-stream v0.1.18 | MIT | default,time
+tokio-util v0.7.18 | MIT | codec,default,io
+tokio v1.53.0 | MIT | bytes,default,fs,full,io-std,io-util,libc,macros,mio,net,parking_lot,process,rt,rt-multi-thread,signal,signal-hook-registry,socket2,sync,time,tokio-macros
+toml_datetime v0.6.11 | MIT OR Apache-2.0 | serde
+toml_datetime v1.1.1+spec-1.1.0 | MIT OR Apache-2.0 | alloc,default,std
+toml_datetime v1.1.1+spec-1.1.0 | MIT OR Apache-2.0 | alloc,serde,std
+toml_edit v0.22.27 | MIT OR Apache-2.0 | display,parse,serde
+toml_edit v0.25.13+spec-1.1.0 | MIT OR Apache-2.0 | parse
+toml_parser v1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | alloc,default,std
+toml_parser v1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | alloc,std
+toml v0.8.23 | MIT OR Apache-2.0 | default,display,parse
+toml v1.1.3+spec-1.1.0 | MIT OR Apache-2.0 | default,display,parse,serde,std
+toml_writer v1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | alloc,std
+toml_write v0.1.2 | MIT OR Apache-2.0 | alloc,default,std
+tonic-prost v0.14.6 | MIT | 
+tonic v0.14.6 | MIT | _tls-any,channel,codegen,gzip,tls-connect-info,tls-webpki-roots
+toron-client v0.1.0 (<ket>/nilket/crates/toron-client) |  | 
+tower-http v0.6.11 | MIT | follow-redirect,futures-util,tower
+tower-layer v0.3.3 | MIT | 
+tower-service v0.3.3 | MIT | 
+tower v0.5.3 | MIT | balance,buffer,discover,filter,futures-core,futures-util,indexmap,limit,load,load-shed,make,pin-project-lite,ready-cache,retry,slab,sync_wrapper,timeout,tokio,tokio-util,tracing,util
+tracing-attributes v0.1.31 (proc-macro) | MIT | 
+tracing-core v0.1.36 | MIT | default,once_cell,std
+tracing-log v0.2.0 | MIT | log-tracer,std
+tracing-subscriber v0.3.23 | MIT | alloc,fmt,local-time,registry,sharded-slab,std,thread_local,time,tracing-log
+tracing-tree v0.4.1 | MIT OR Apache-2.0 | default,tracing-log
+tracing v0.1.44 | MIT | attributes,default,log,std,tracing-attributes
+tree_magic_mini v3.2.2 | MIT | 
+triomphe v0.1.16 | MIT OR Apache-2.0 | default,serde,stable_deref_trait,std
+try-lock v0.2.5 | MIT | 
+ttf-parser v0.25.1 | MIT OR Apache-2.0 | apple-layout,core_maths,default,glyph-names,gvar-alloc,no-std-float,opentype-layout,std,variable-fonts
+twox-hash v2.1.2 | MIT | xxhash64
+typed-arena v2.0.2 | MIT | default,std
+typeid v1.0.3 | MIT OR Apache-2.0 | 
+typenum v1.20.1 | MIT OR Apache-2.0 | const-generics
+unicase v2.9.0 | MIT OR Apache-2.0 | 
+unicode-bidi-mirroring v0.4.0 | MIT/Apache-2.0 | 
+unicode-bidi v0.3.18 | MIT OR Apache-2.0 | default,hardcoded-data,std
+unicode-ccc v0.4.0 | MIT/Apache-2.0 | 
+unicode-ident v1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 | 
+unicode-linebreak v0.1.5 | Apache-2.0 | 
+unicode_names2 v1.3.0 | (MIT OR Apache-2.0) AND Unicode-DFS-2016 | default
+unicode-normalization v0.1.25 | MIT OR Apache-2.0 | default,std
+unicode-properties v0.1.4 | MIT/Apache-2.0 | default,emoji,general-category
+unicode-reverse v1.0.9 | MIT OR Apache-2.0 | 
+unicode-script v0.5.8 | MIT OR Apache-2.0 | 
+unicode-segmentation v1.13.3 | MIT OR Apache-2.0 | 
+unicode-vo v0.1.0 | MIT/Apache-2.0 | 
+unicode-width v0.2.2 | MIT OR Apache-2.0 | cjk,default
+universal-hash v0.5.1 | MIT OR Apache-2.0 | 
+untrusted v0.9.0 | ISC | 
+unty v0.0.4 | MIT OR Apache-2.0 | 
+ureq-proto v0.6.0 | MIT OR Apache-2.0 | client
+ureq v3.3.0 | MIT OR Apache-2.0 | _ring,_rustls,_tls,rustls,rustls-no-provider,rustls-webpki-roots
+urlencoding v2.1.3 | MIT | 
+url v2.5.8 | MIT OR Apache-2.0 | default,std
+usvg v0.47.0 | Apache-2.0 OR MIT | fontdb,memmap-fonts,rustybuzz,system-fonts,text,ttf-parser,unicode-bidi,unicode-script,unicode-vo
+utf8_iter v1.0.4 | Apache-2.0 OR MIT | 
+utf8-zero v0.8.1 | MIT OR Apache-2.0 | default,std
+uuid v1.24.0 | Apache-2.0 OR MIT | default,rng,serde,std,v4,v7
+v_frame v0.3.9 | BSD-2-Clause | 
+virtue v0.0.18 | MIT | 
+walkdir v2.5.0 | Unlicense/MIT | 
+want v0.3.1 | MIT | 
+wayland-backend v0.3.15 | MIT | client_system,dlopen
+wayland-client v0.31.14 | MIT | 
+wayland-csd-frame v0.3.0 | MIT | 
+wayland-cursor v0.31.14 | MIT | 
+wayland-protocols-experimental v20250721.0.1 | MIT | client,wayland-client
+wayland-protocols-misc v0.3.12 | MIT | client,wayland-client
+wayland-protocols-plasma v0.3.12 | MIT | client,wayland-client
+wayland-protocols v0.32.13 | MIT | client,staging,unstable,wayland-client
+wayland-protocols-wlr v0.3.12 | MIT | client,wayland-client
+wayland-scanner v0.31.10 (proc-macro) | MIT | 
+wayland-sys v0.31.11 | MIT | client,dlopen,once_cell
+webpki-roots v1.0.9 | CDLA-Permissive-2.0 | 
+web-time v1.1.0 | MIT OR Apache-2.0 | 
+weezl v0.1.12 | MIT OR Apache-2.0 | alloc,default,std
+wgpu-core-deps-windows-linux-android v27.0.0 | MIT OR Apache-2.0 | dx12,gles,renderdoc,vulkan
+wgpu-core v27.0.3 | MIT OR Apache-2.0 | default,dx12,gles,metal,portable-atomic,raw-window-handle,renderdoc,std,vulkan,wgpu-core-deps-windows-linux-android,wgsl
+wgpu-hal v27.0.4 | MIT OR Apache-2.0 | dx12,gles,portable-atomic,renderdoc,vulkan
+wgpu-types v27.0.1 | MIT OR Apache-2.0 | std,thiserror,web
+wgpu v27.0.1 | MIT OR Apache-2.0 | default,dx12,gles,metal,parking_lot,std,vulkan,web,webgpu,wgsl
+whoami v2.1.2 | Apache-2.0 OR BSL-1.0 OR MIT | default,std,wasi-wasite,wasm-web
+window_clipboard v0.5.1 | MIT | clipboard_wayland,clipboard_x11,wayland,x11
+winit v0.30.13 | Apache-2.0 | ahash,bytemuck,memmap2,percent-encoding,rwh_06,sctk,sctk-adwaita,wayland,wayland-backend,wayland-client,wayland-csd-adwaita,wayland-dlopen,wayland-protocols,wayland-protocols-plasma,x11,x11-dl,x11rb
+winnow v0.7.15 | MIT | alloc,default,std
+winnow v1.0.4 | MIT | alloc,ascii,binary,default,parser,std
+wl-clipboard-rs v0.9.3 | MIT/Apache-2.0 | 
+writeable v0.6.4 | Unicode-3.0 | 
+x11-dl v2.21.0 | MIT | 
+x11rb-protocol v0.13.2 | MIT OR Apache-2.0 | randr,render,resource_manager,shape,shm,std,xfixes,xinput,xkb
+x11rb v0.13.2 | MIT OR Apache-2.0 | allow-unsafe-code,as-raw-xcb-connection,dl-libxcb,libc,libloading,once_cell,randr,render,resource_manager,shape,shm,xfixes,xinput,xkb
+x509-cert v0.2.5 | Apache-2.0 OR MIT | std
+xcursor v0.3.10 | MIT | 
+xkbcommon-dl v0.4.2 | MIT | x11
+xkeysym v0.2.1 | MIT OR Apache-2.0 OR Zlib | 
+xmlwriter v0.1.0 | MIT | 
+xxhash-rust v0.8.17 | BSL-1.0 | xxh3
+y4m v0.8.0 | MIT | 
+yasna v0.5.2 | MIT OR Apache-2.0 | default,std,time
+yazi v0.2.1 | Apache-2.0 OR MIT | std
+yoke-derive v0.8.2 (proc-macro) | Unicode-3.0 | 
+yoke v0.8.3 | Unicode-3.0 | derive,zerofrom
+zbus_macros v5.18.0 (proc-macro) | MIT | default
+zbus_names v4.3.4 | MIT | 
+zbus v5.18.0 | MIT | async-executor,async-fs,async-io,async-lock,async-process,async-task,blocking
+zeno v0.3.3 | Apache-2.0 OR MIT | eval,std
+zerocopy-derive v0.8.54 (proc-macro) | BSD-2-Clause OR Apache-2.0 OR MIT | 
+zerocopy v0.8.54 | BSD-2-Clause OR Apache-2.0 OR MIT | derive,simd,zerocopy-derive
+zerocopy v0.8.54 | BSD-2-Clause OR Apache-2.0 OR MIT | simd
+zerofrom-derive v0.1.7 (proc-macro) | Unicode-3.0 | 
+zerofrom v0.1.8 | Unicode-3.0 | derive
+zeroize_derive v1.5.0 (proc-macro) | Apache-2.0 OR MIT | 
+zeroize v1.9.0 | Apache-2.0 OR MIT | alloc,default,derive,zeroize_derive
+zerotrie v0.2.5 | Unicode-3.0 | yoke,zerofrom
+zerovec-derive v0.11.6 (proc-macro) | Unicode-3.0 | 
+zerovec v0.11.8 | Unicode-3.0 | derive,yoke
+zlib-rs v0.6.6 | Zlib | rust-allocator,std
+zmij v1.0.23 | MIT | 
+zstd-safe v7.2.4 | MIT OR Apache-2.0 | arrays,legacy,std,zdict_builder
+zstd-sys v2.0.16+zstd.1.5.7 | MIT/Apache-2.0 | legacy,std,zdict_builder
+zstd v0.13.3 | MIT | arrays,default,legacy,zdict_builder
+zune-core v0.5.1 | MIT OR Apache-2.0 OR Zlib | std
+zune-inflate v0.2.54 | MIT OR Apache-2.0 OR Zlib | simd-adler32,zlib
+zune-jpeg v0.5.15 | MIT OR Apache-2.0 OR Zlib | default,neon,std,x86
+zvariant_derive v5.13.1 (proc-macro) | MIT | default
+zvariant_utils v3.5.0 | MIT | default
+zvariant v5.13.1 | MIT | default,enumflags2

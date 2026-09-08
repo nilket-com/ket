@@ -1,0 +1,12 @@
+census generated 2026-09-08T07:09:00Z
+root Cargo.lock blob 9a3218797fe57430d9e489021d0032bae4fddfa2
+nilket Cargo.lock blob 08dad32f48931531bd4788f21dc7854c6d7e9adc
+target x86_64-unknown-linux-gnu
+rustc rustc 1.95.0 (59807616e 2026-04-14)
+nilket_packages.jsonl 499 packages
+root_packages.jsonl 1170 packages
+baryon_x86_64-unknown-linux-gnu.txt 462 rows, 456 distinct name-version pairs
+nilket_x86_64-unknown-linux-gnu.txt 356 rows, 346 distinct name-version pairs
+polariton_x86_64-unknown-linux-gnu.txt 847 rows, 832 distinct name-version pairs
+toron_x86_64-unknown-linux-gnu.txt 350 rows, 341 distinct name-version pairs
+wendelon_x86_64-unknown-linux-gnu.txt 311 rows, 308 distinct name-version pairs
