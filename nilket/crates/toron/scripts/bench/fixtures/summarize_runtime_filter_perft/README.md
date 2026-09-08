@@ -43,9 +43,9 @@ its session gate.
 Each case checks four things:
 
 - Standard output is identical.
-- The exit code is identical, apart from four recorded exceptions.
+- The exit code is identical, with no exceptions.
 - The port's standard error equals the expectation in `expected/`.
-- Where the original succeeds, neither implementation wrote to standard error.
+- Where the original says nothing, the port says nothing.
 
 ## Why the diagnostics are checked and not just reported
 
@@ -61,27 +61,27 @@ groups:
 | Group | Cases | Expected |
 | --- | --- | --- |
 | success | `complete`, `digest-required`, `two-paths`, `piped-complete` | nothing at all |
-| validation failure | `mixed`, `digest-mismatch`, `probe-floor`, `every-floor`, `inline-value`, `piped-rows` | the bare `error: ` line, below |
+| validation failure | `mixed`, `digest-mismatch`, `probe-floor`, `every-floor`, `inline-value`, `piped-rows` | nothing at all: the report is on standard output |
 | input or usage failure | the other nine | the diagnostic naming what went wrong |
 
 Paths are stripped of any absolute prefix before comparing, so an expectation
 recorded here holds from another checkout.
 
-The bare `error: ` line is not something to keep. The original exits 1 with a
-complete report on standard output and nothing on standard error. A Rune
-script can only exit nonzero by returning an error, and the runner prints
-every error, so the port cannot stay silent. The expectation records what the
-port does today rather than what it should do; rnx record 0011 asks for an
-exit status the script chooses.
+Ten of the nineteen expect nothing at all from the port, which is what the
+original says in those cases too.
 
-## The four recorded exceptions
+## There are no recorded exceptions any more
 
-`unknown-flag`, `flag-without-value`, `value-not-a-number`, and
-`value-on-a-switch` are usage errors. `argparse` exits 2 for those. A Rune
-script signals failure by returning an error, and the runner exits 1 for
-every error, so 2 cannot be expressed. Those cases assert instead that the
-original exits 2, the port exits 1, both print nothing to standard output,
-and the port prints its recorded diagnostic. If that ever stops being true
-the script fails and asks for this note to be updated.
+There used to be four. `unknown-flag`, `flag-without-value`,
+`value-not-a-number`, and `value-on-a-switch` are usage errors, `argparse`
+exits 2 for those, and a Rune script could only exit 1, because failure meant
+returning an error and every error exited 1. rnx record 0013 gave a script its
+own exit status. The port now exits 2 as the original does, and the
+exceptions went with it.
 
-Findings from the exercise are in rnx record 0011.
+The same record removed the bare `error: ` line. Six cases fail with a
+complete report on standard output and nothing on standard error, exactly as
+the original does, and the gate now requires that: where the original says
+nothing, the port says nothing.
+
+Findings from the exercise are in rnx records 0011, 0012, and 0013.

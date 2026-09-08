@@ -337,6 +337,13 @@ fn check_floor(floor, measured, group_label, what, failures) {
 	}
 }
 
+/// A usage error: say what was wrong and how to call it, then leave with the
+/// status a usage error has, which is the one the original's `argparse` uses.
+fn usage_error(message) {
+	host::eprint(message + "\n" + usage() + "\n")?;
+	host::exit(2)
+}
+
 fn usage() {
 	"usage: summarize_runtime_filter_perft.rn [--require-digest-equality] \
 [--min-probe-reduction-pct PCT] [--min-shuffle-reduction-pct PCT] \
@@ -366,7 +373,7 @@ pub fn main(args) {
 			None => {}
 		}
 		if name == "--require-digest-equality" {
-			return Err(`${name} takes no value\n${usage()}`);
+			return usage_error(`${name} takes no value`);
 		}
 		let slot = if name == "--min-probe-reduction-pct" {
 			"probe"
@@ -375,7 +382,7 @@ pub fn main(args) {
 		} else if name == "--min-cluster-reduction-pct" {
 			"cluster"
 		} else if name.starts_with("--") {
-			return Err(`unrecognized flag ${name}\n${usage()}`);
+			return usage_error(`unrecognized flag ${name}`);
 		} else {
 			paths.push(argument);
 			continue;
@@ -384,7 +391,7 @@ pub fn main(args) {
 			Some(value) => value,
 			None => {
 				if index >= args.len() {
-					return Err(`${name} needs a percentage\n${usage()}`);
+					return usage_error(`${name} needs a percentage`);
 				}
 				let value = args[index];
 				index += 1;
@@ -393,7 +400,7 @@ pub fn main(args) {
 		};
 		floors[slot] = match given.parse::<f64>() {
 			Ok(number) => Some(number),
-			Err(_) => return Err(`${name} needs a number, not ${given}`),
+			Err(_) => return usage_error(`${name} needs a number, not ${given}`),
 		};
 	}
 
@@ -460,6 +467,8 @@ pub fn main(args) {
 	if failures.is_empty() {
 		Ok(())
 	} else {
-		Err("")
+		// A complete report and a failing status, with nothing on standard
+		// error, which is what the original does.
+		host::exit(1)
 	}
 }

@@ -95,4 +95,4 @@ Given no path, both read standard input, so either can sit in a pipeline
 behind a bench run. The two are kept in step by
 `fixtures/summarize_runtime_filter_perft/compare.sh`, which runs both over
 nineteen cases and checks that the report, the exit code, and the diagnostics
-all agree.
+all agree, with no exceptions.

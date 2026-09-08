@@ -4,10 +4,10 @@
 #
 #   RNX=/path/to/rnx ./compare.sh
 #
-# Standard output and the exit code must match. Standard error is checked
-# against a per-case expectation in expected/, because the two runtimes word
-# their diagnostics differently and a column that only reports is a column
-# that cannot fail.
+# Standard output and the exit code must match on every case, with no
+# exceptions. Standard error is checked against a per-case expectation in
+# expected/, because the two runtimes word their diagnostics differently and a
+# column that only reports is a column that cannot fail.
 set -u
 cd "$(dirname "$0")" || exit 2
 here=$(pwd)
@@ -22,7 +22,6 @@ cleanup() { rm -rf "$work"; }
 trap cleanup EXIT INT TERM
 
 failures=0
-stale=0
 
 # Paths reach a diagnostic as they were given on the command line, and this
 # script always runs from the fixture directory, so they are already
@@ -32,28 +31,22 @@ normalize() {
 	sed -e "s|$here/||g" -e "s|$bench/||g" -e "s|$work/||g" "$1"
 }
 
-# `case_ NAME [--known-exit-2] ARGS...` runs both implementations under a
+# `case_ NAME [--from-stdin FILE] ARGS...` runs both implementations under a
 # timeout and checks four things:
 #
 #   - standard output is identical
-#   - the exit code is identical, unless the case is marked --known-exit-2
+#   - the exit code is identical
 #   - the port's standard error equals expected/NAME.err
-#   - where the original succeeds, neither wrote to standard error
+#   - where the original says nothing, the port says nothing
 #
-# --known-exit-2 covers a usage error: argparse exits 2 for one and the Rune
-# runner can only exit 1, because a script signals failure by returning an
-# error and every error exits 1. Such a case still has to agree on standard
-# output, still has to fail in both, and still has to produce its recorded
-# diagnostic. If it ever starts agreeing on the code the script says so, so
-# the note gets removed.
+# There are no exceptions. There used to be four: argparse exits 2 for a usage
+# error and a Rune script could only exit 1, because failure meant returning
+# an error and every error exited 1. rnx record 0013 gave a script its own
+# exit status, so the port exits 2 as the original does and the exceptions
+# went with it.
 case_() {
 	local name=$1
 	shift
-	local known=0
-	if [ "${1:-}" = "--known-exit-2" ]; then
-		known=1
-		shift
-	fi
 	# --from-stdin FILE pipes the file in and passes no path, which is how
 	# both implementations are asked to read standard input.
 	local from=""
@@ -101,14 +94,7 @@ case_() {
 	fi
 
 	local code="$py_code/$rn_code"
-	if [ "$known" = 1 ]; then
-		if [ "$py_code" = 2 ] && [ "$rn_code" = 1 ]; then
-			code="2/1 known"
-		else
-			code="$py_code/$rn_code UNRECORDED"
-			stale=$((stale + 1))
-		fi
-	elif [ "$py_code" != "$rn_code" ]; then
+	if [ "$py_code" != "$rn_code" ]; then
 		failures=$((failures + 1))
 	fi
 
@@ -125,16 +111,13 @@ case_() {
 		note=$(diff "$expected" "$work/rn.norm" | head -6)
 	fi
 
-	# Where the original succeeds, neither implementation may say anything.
-	if [ "$py_code" = 0 ]; then
-		if [ -s "$work/py.err" ]; then
-			err="$err; original wrote to stderr on success"
-			failures=$((failures + 1))
-		fi
-		if [ -s "$work/rn.err" ]; then
-			err="$err; port wrote to stderr on success"
-			failures=$((failures + 1))
-		fi
+	# Where the original says nothing, the port says nothing. This is
+	# stronger than checking only the successful cases: it also covers a
+	# failure that carries its whole report on standard output, which is
+	# where the port used to print a bare `error: ` line to get its status.
+	if [ ! -s "$work/py.err" ] && [ -s "$work/rn.err" ]; then
+		err="$err; port spoke where the original was silent"
+		failures=$((failures + 1))
 	fi
 
 	printf '%-20s exit %-16s stdout %-10s stderr %s\n' \
@@ -160,17 +143,13 @@ case_ no-rows empty.log
 case_ missing-file does_not_exist.log
 case_ not-numeric rows_not_numeric.log
 case_ missing-field rows_missing_field.log
-case_ unknown-flag --known-exit-2 rows_complete.log --nope
-case_ flag-without-value --known-exit-2 rows_complete.log --min-probe-reduction-pct
-case_ value-not-a-number --known-exit-2 rows_complete.log --min-probe-reduction-pct abc
-case_ value-on-a-switch --known-exit-2 rows_complete.log --require-digest-equality=true
+case_ unknown-flag rows_complete.log --nope
+case_ flag-without-value rows_complete.log --min-probe-reduction-pct
+case_ value-not-a-number rows_complete.log --min-probe-reduction-pct abc
+case_ value-on-a-switch rows_complete.log --require-digest-equality=true
 
-if [ "$stale" -gt 0 ]; then
-	echo "$stale case(s) no longer match their recorded exit codes; update the notes"
-	exit 1
-fi
 if [ "$failures" -gt 0 ]; then
 	echo "$failures check(s) failed"
 	exit 1
 fi
-echo "standard output, exit codes, and diagnostics are all as recorded"
+echo "standard output, exit codes, and diagnostics all agree on every case"
