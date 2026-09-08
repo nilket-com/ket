@@ -1,0 +1,13 @@
+{
+  "aggregate_invocations": [
+    {
+      "stages": {
+        "vocabulary": true,
+        "stages": [
+          {"stage": "prepare", "micros": 1000.0},
+          {"stage": "row_lookup_update", "micros": 4000.0}
+        ]
+      }
+    }
+  ]
+}

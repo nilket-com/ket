@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Fixture standing in for `perf script`, so both implementations of the
+# classifier get byte-identical input. Emits period/ip/symbol lines each
+# followed by a source line, the shape the real tool produces under
+# -F ip,sym,srcline,period.
+cat <<'SAMPLES'
+1200000 ffff0001 toron::exec::group_table::find_bucket_in
+/src/crates/toron/src/exec/aggregate.rs:2180
+900000 ffff0002 toron::exec::add_sum_value
+/src/crates/toron/src/exec/aggregate.rs:2190
+450000 ffff0003 toron::exec::GroupArrayReader::read
+/src/crates/toron/src/exec/aggregate.rs:2166
+300000 ffff0004 toron::exec::fold_bound_grouped_aggregate_batch
+/src/crates/toron/src/exec/aggregate.rs:2167
+250000 ffff0005 toron::exec::fold_bound_grouped_aggregate_batch
+/src/crates/toron/src/exec/aggregate.rs:2200
+150000 ffff0006 toron::exec::fold_bound_grouped_aggregate_batch
+/src/crates/toron/src/exec/aggregate.rs:9999
+100000 ffff0007 toron::exec::quicksort
+/src/crates/toron/src/exec/aggregate.rs:2400
+100000 ffff0008 toron::exec::add_sum_value
+/src/crates/toron/src/exec/aggregate.rs:2190
+50½000 ffff0009 toron::exec::add_sum_value
+/src/crates/toron/src/exec/aggregate.rs:2190
+70000 ffff000a toron::exec::fold_bound_grouped_aggregate_batch
+/src/crates/toron/src/exec/aggregate.rs:21½0
+SAMPLES

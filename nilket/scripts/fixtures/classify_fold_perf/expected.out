@@ -1,0 +1,11 @@
+===== q20  (2 runs, period-weighted cpu-clock)
+ run row_loop ms   lookup    state  keyprep  foldunk  shortfall
+   1         4.0   30.00%   25.00%   18.75%   11.75%     14.50%
+   2         4.0   30.00%   25.00%   18.75%   11.75%     14.50%
+  share of the exact row loop, mean and cross-run range:
+    lookup_growth             30.00%   range 30.00% .. 30.00%
+    state_update              25.00%   range 25.00% .. 25.00%
+    key_preparation           18.75%   range 18.75% .. 18.75%
+    fold_body_unattributed    11.75%   range 11.75% .. 11.75%
+    shortfall                 14.50%   range 14.50% .. 14.50%
+  total row-loop samples across runs: 16

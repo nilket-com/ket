@@ -1,0 +1,394 @@
+// Classify perf cpu-clock samples inside the grouped fold's row loop.
+// A port of nilket/scripts/classify_fold_perf.py, kept beside it until the
+// two agree on output and on failure behaviour.
+//
+// Usage: rnx run classify_fold_perf.rn <cell> <key-lines> <update-lines> <run.data>...
+
+fn not_row_loop() {
+	[
+		"finalize_bound_grouped_aggregate",
+		"quicksort",
+		"stable_file_hash",
+	]
+}
+fn lookup_growth() {
+	[
+		"group_table::find_bucket_in",
+		"group_table::find_single_utf8_bucket_in",
+		"entry_or_init",
+		"lookup_entry",
+		"lookup_single_utf8",
+		"grow_table",
+		"GroupKeyStorage",
+		"key_resident_bytes",
+		"BoundGroupedAggregateGroups",
+		"BoundGroupedAggregateGroupState",
+	]
+}
+fn state_update() {
+	[
+		"add_sum_value",
+		"add_avg_value",
+		"update_min_state",
+		"update_max_state",
+		"numeric_value",
+		"init_bound_states",
+	]
+}
+fn key_preparation() {
+	["GroupArrayReader", "group_array_reader"]
+}
+fn classes() {
+	[
+		"lookup_growth",
+		"state_update",
+		"key_preparation",
+		"fold_body_unattributed",
+	]
+}
+fn fold_body() { "fold_bound_grouped_aggregate_batch" }
+fn aggregate_src() { "crates/toron/src/exec/aggregate.rs" }
+// With zero observed events, the 95% upper bound on the expected count is 3.
+fn rule_of_three() { 3.0 }
+
+fn matches_any(symbol, needles) {
+	for needle in needles {
+		if symbol.contains(needle) {
+			return true;
+		}
+	}
+	false
+}
+
+// Rune has no `String::find`, so the port carries its own index-of.
+fn index_of(haystack, needle) {
+	let h = haystack.len();
+	let n = needle.len();
+	if n > h {
+		return None;
+	}
+	let i = 0;
+	while i + n <= h {
+		if haystack[i..i + n] == needle {
+			return Some(i);
+		}
+		i += 1;
+	}
+	None
+}
+
+// The source line of a sample inside the fold body, or None. The original
+// used a regular expression; rnx has none, so this reads the digits after
+// the file marker directly.
+fn aggregate_line(srcline) {
+	let marker = `${aggregate_src()}:`;
+	let at = match index_of(srcline, marker) {
+		Some(at) => at,
+		None => return None,
+	};
+	let rest = srcline[at + marker.len()..];
+	let digits = String::new();
+	for c in rest.chars() {
+		if is_digit(c) {
+			digits.push(c);
+		} else {
+			break;
+		}
+	}
+	if digits.len() == 0 {
+		return None;
+	}
+	// Only ASCII digits reach here, so this parses; it returns None rather
+	// than unwrapping, so a future change to the alphabet cannot panic.
+	match digits.parse::<i64>() {
+		Ok(line) => Some(line),
+		Err(_) => None,
+	}
+}
+
+fn classify(symbol, srcline, key_lo, key_hi, update_lo, update_hi) {
+	if matches_any(symbol, not_row_loop()) {
+		return "other";
+	}
+	if matches_any(symbol, lookup_growth()) {
+		return "lookup_growth";
+	}
+	if matches_any(symbol, state_update()) {
+		return "state_update";
+	}
+	if matches_any(symbol, key_preparation()) {
+		return "key_preparation";
+	}
+	if symbol.contains(fold_body()) {
+		match aggregate_line(srcline) {
+			Some(line) => {
+				if line >= key_lo && line <= key_hi {
+					return "key_preparation";
+				}
+				if line >= update_lo && line <= update_hi {
+					return "state_update";
+				}
+			}
+			None => (),
+		}
+		return "fold_body_unattributed";
+	}
+	"other"
+}
+
+// Python's `split(None, 2)`: split on runs of whitespace into at most three
+// fields, the last taking the remainder. Rune has no `split_whitespace`.
+fn split_ws_max3(line) {
+	let chars = line.chars().collect::<Vec>();
+	let n = chars.len();
+	let parts = [];
+	let i = 0;
+	while i < n {
+		while i < n && chars[i] == ' ' {
+			i += 1;
+		}
+		if i >= n {
+			break;
+		}
+		if parts.len() == 2 {
+			let rest = String::new();
+			while i < n {
+				rest.push(chars[i]);
+				i += 1;
+			}
+			parts.push(rest);
+			break;
+		}
+		let word = String::new();
+		while i < n && chars[i] != ' ' {
+			word.push(chars[i]);
+			i += 1;
+		}
+		parts.push(word);
+	}
+	parts
+}
+
+// The alphabet this script accepts as a number is ASCII `0` to `9`, which is
+// what perf emits. Rune's `is_numeric` is wider than that and wider than
+// Python's `isdigit`: it accepts `½`, which would then fail to parse. Rune
+// has no ASCII-digit predicate, so the range is written out.
+fn is_digit(c) {
+	c >= '0' && c <= '9'
+}
+fn all_digits(text) {
+	text.len() > 0 && text.chars().all(|c| is_digit(c))
+}
+
+// perf emits the period and symbol on one line and the source line on the
+// next; a sample whose address resolves to no symbol has no source line.
+fn samples(path) {
+	let result = host::process(
+		"perf",
+		[
+			"script",
+			"-i",
+			path,
+			"-F",
+			"ip,sym,srcline,period",
+			"--full-source-path",
+		],
+		90000,
+	)?;
+	let lines = [];
+	for line in result.stdout.split("\n") {
+		if line.trim().len() > 0 {
+			lines.push(line);
+		}
+	}
+	let out = [];
+	let index = 0;
+	while index < lines.len() {
+		let parts = split_ws_max3(lines[index].trim());
+		if parts.len() == 3 && all_digits(parts[0]) && index + 1 < lines.len() {
+			let following = lines[index + 1].trim();
+			let head = split_ws_max3(following);
+			if following.contains(":") && !all_digits(head[0]) {
+				out.push((parts[0].parse::<i64>()?, parts[2], following));
+				index += 2;
+				continue;
+			}
+		}
+		index += 1;
+	}
+	Ok(out)
+}
+
+fn row_loop_micros(node_path) {
+	let profile = host::json_parse(host::read(node_path)?)?;
+	for invocation in profile["aggregate_invocations"] {
+		if !invocation.contains_key("stages") {
+			continue;
+		}
+		let stages = invocation["stages"];
+		if stages.contains_key("vocabulary") && stages["vocabulary"] {
+			for stage in stages["stages"] {
+				if stage["stage"] == "row_lookup_update" {
+					return Ok(stage["micros"]);
+				}
+			}
+		}
+	}
+	Err(`no reconciled row_lookup_update stage in ${node_path}`)
+}
+
+// Rune does not mix integers and floats in arithmetic, and a counter's
+// default has to be of the same kind as what is added to it, so the zero is
+// passed in rather than assumed.
+fn get(counter, name, zero) {
+	if counter.contains_key(name) { counter[name] } else { zero }
+}
+fn bump(counter, name, amount) {
+	counter[name] = if counter.contains_key(name) {
+		counter[name] + amount
+	} else {
+		amount
+	};
+}
+
+fn parse_range(text) {
+	let parts = text.split("-").collect::<Vec>();
+	if parts.len() != 2 {
+		return Err(`expected a line range like 2165-2168, got ${text}`);
+	}
+	Ok((parts[0].parse::<i64>()?, parts[1].parse::<i64>()?))
+}
+
+// Rune left-aligns numbers where Python right-aligns them, so every width
+// here is written with an explicit `>`.
+fn thousands(value) {
+	let digits = `${value}`.chars().collect::<Vec>();
+	let out = String::new();
+	let i = 0;
+	while i < digits.len() {
+		if i > 0 && (digits.len() - i) % 3 == 0 {
+			out.push(',');
+		}
+		out.push(digits[i]);
+		i += 1;
+	}
+	out
+}
+
+pub fn main(args) {
+	if args.len() < 4 {
+		return Err("usage: classify_fold_perf.rn CELL KEY-LINES UPDATE-LINES RUN.data...");
+	}
+	let cell = args[0];
+	let (key_lo, key_hi) = parse_range(args[1])?;
+	let (update_lo, update_hi) = parse_range(args[2])?;
+	let runs = args[3..];
+
+	let per_run = [];
+	for data_path in runs {
+		let node_path = data_path.replace(".data", "_node.json");
+		let parent_micros = row_loop_micros(node_path)?;
+		let nanos = #{};
+		let counts = #{};
+		for sample in samples(data_path)? {
+			let (period, symbol, srcline) = sample;
+			let name = classify(symbol, srcline, key_lo, key_hi, update_lo, update_hi);
+			// Rune does not coerce an integer to a float in arithmetic, so the
+			// period is widened once, here, rather than at every use.
+			bump(nanos, name, period as f64);
+			bump(counts, name, 1);
+		}
+		let parent_nanos = parent_micros * 1000.0;
+		let attributed = 0.0;
+		for name in classes() {
+			attributed += get(nanos, name, 0.0);
+		}
+		per_run.push(#{
+			parent_nanos: parent_nanos,
+			nanos: nanos,
+			counts: counts,
+			shortfall_nanos: parent_nanos - attributed,
+		});
+	}
+
+	println!("===== {}  ({} runs, period-weighted cpu-clock)", cell, per_run.len());
+	println!(
+		"{:>4} {:>11} {:>8} {:>8} {:>8} {:>8} {:>10}",
+		"run", "row_loop ms", "lookup", "state", "keyprep", "foldunk", "shortfall"
+	);
+	let index = 0;
+	for run in per_run {
+		let cells = String::new();
+		for name in classes() {
+			cells += format!(" {:>7.2}%", 100.0 * get(run.nanos, name, 0.0) / run.parent_nanos);
+		}
+		println!(
+			"{:>4} {:>11.1}{} {:>9.2}%",
+			index + 1,
+			run.parent_nanos / 1000000.0,
+			cells,
+			100.0 * run.shortfall_nanos / run.parent_nanos
+		);
+		index += 1;
+	}
+
+	println!("  share of the exact row loop, mean and cross-run range:");
+	let named = classes();
+	named.push("shortfall");
+	for name in named {
+		let shortfall = name == "shortfall";
+		let shares = [];
+		for run in per_run {
+			let value = if shortfall { run.shortfall_nanos } else { get(run.nanos, name, 0.0) };
+			shares.push(100.0 * value / run.parent_nanos);
+		}
+		let total_share = 0.0;
+		let low = shares[0];
+		let high = shares[0];
+		for share in shares {
+			total_share += share;
+			if share < low { low = share; }
+			if share > high { high = share; }
+		}
+		let mean = total_share / (shares.len() as f64);
+		let observed = -1;
+		if !shortfall {
+			observed = 0;
+			for run in per_run {
+				observed += get(run.counts, name, 0);
+			}
+		}
+		if observed == 0 {
+			// Zero classified samples is not a measured zero. Bound it: three
+			// events is the 95% upper limit on what could have been observed,
+			// priced at this run's mean period.
+			let total_periods = 0.0;
+			let total_samples = 0;
+			let parent_total = 0.0;
+			for run in per_run {
+				for key in run.nanos.keys() {
+					total_periods += run.nanos[key];
+				}
+				for key in run.counts.keys() {
+					total_samples += run.counts[key];
+				}
+				parent_total += run.parent_nanos;
+			}
+			let denominator = if total_samples > 1 { total_samples } else { 1 };
+			let mean_period = total_periods / (denominator as f64);
+			let bound = 100.0 * rule_of_three() * mean_period / parent_total;
+			println!("    {:24} 0 classified samples (95% upper bound {:.3}%)", name, bound);
+		} else {
+			println!("    {:24} {:>6.2}%   range {:>5.2}% .. {:>5.2}%", name, mean, low, high);
+		}
+	}
+
+	let total = 0;
+	for run in per_run {
+		for name in classes() {
+			total += get(run.counts, name, 0);
+		}
+	}
+	println!("  total row-loop samples across runs: {}", thousands(total));
+	Ok(())
+}
