@@ -60,29 +60,12 @@ fn matches_any(symbol, needles) {
 	false
 }
 
-// Rune has no `String::find`, so the port carries its own index-of.
-fn index_of(haystack, needle) {
-	let h = haystack.len();
-	let n = needle.len();
-	if n > h {
-		return None;
-	}
-	let i = 0;
-	while i + n <= h {
-		if haystack[i..i + n] == needle {
-			return Some(i);
-		}
-		i += 1;
-	}
-	None
-}
-
 // The source line of a sample inside the fold body, or None. The original
 // used a regular expression; rnx has none, so this reads the digits after
 // the file marker directly.
 fn aggregate_line(srcline) {
 	let marker = `${aggregate_src()}:`;
-	let at = match index_of(srcline, marker) {
+	let at = match text::find(srcline, marker) {
 		Some(at) => at,
 		None => return None,
 	};
@@ -136,39 +119,6 @@ fn classify(symbol, srcline, key_lo, key_hi, update_lo, update_hi) {
 	"other"
 }
 
-// Python's `split(None, 2)`: split on runs of whitespace into at most three
-// fields, the last taking the remainder. Rune has no `split_whitespace`.
-fn split_ws_max3(line) {
-	let chars = line.chars().collect::<Vec>();
-	let n = chars.len();
-	let parts = [];
-	let i = 0;
-	while i < n {
-		while i < n && chars[i] == ' ' {
-			i += 1;
-		}
-		if i >= n {
-			break;
-		}
-		if parts.len() == 2 {
-			let rest = String::new();
-			while i < n {
-				rest.push(chars[i]);
-				i += 1;
-			}
-			parts.push(rest);
-			break;
-		}
-		let word = String::new();
-		while i < n && chars[i] != ' ' {
-			word.push(chars[i]);
-			i += 1;
-		}
-		parts.push(word);
-	}
-	parts
-}
-
 // The alphabet this script accepts as a number is ASCII `0` to `9`, which is
 // what perf emits. Rune's `is_numeric` is wider than that and wider than
 // Python's `isdigit`: it accepts `½`, which would then fail to parse. Rune
@@ -204,10 +154,10 @@ fn samples(path) {
 	let out = [];
 	let index = 0;
 	while index < lines.len() {
-		let parts = split_ws_max3(lines[index].trim());
+		let parts = text::split_max(lines[index], 3)?;
 		if parts.len() == 3 && all_digits(parts[0]) && index + 1 < lines.len() {
 			let following = lines[index + 1].trim();
-			let head = split_ws_max3(following);
+			let head = text::split_max(following, 3)?;
 			if following.contains(":") && !all_digits(head[0]) {
 				out.push((parts[0].parse::<i64>()?, parts[2], following));
 				index += 2;
@@ -257,22 +207,6 @@ fn parse_range(text) {
 		return Err(`expected a line range like 2165-2168, got ${text}`);
 	}
 	Ok((parts[0].parse::<i64>()?, parts[1].parse::<i64>()?))
-}
-
-// Rune left-aligns numbers where Python right-aligns them, so every width
-// here is written with an explicit `>`.
-fn thousands(value) {
-	let digits = `${value}`.chars().collect::<Vec>();
-	let out = String::new();
-	let i = 0;
-	while i < digits.len() {
-		if i > 0 && (digits.len() - i) % 3 == 0 {
-			out.push(',');
-		}
-		out.push(digits[i]);
-		i += 1;
-	}
-	out
 }
 
 pub fn main(args) {
@@ -389,6 +323,6 @@ pub fn main(args) {
 			total += get(run.counts, name, 0);
 		}
 	}
-	println!("  total row-loop samples across runs: {}", thousands(total));
+	println!("  total row-loop samples across runs: {}", text::group_digits(total));
 	Ok(())
 }
