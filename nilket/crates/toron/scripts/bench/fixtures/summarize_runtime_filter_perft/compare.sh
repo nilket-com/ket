@@ -54,11 +54,30 @@ case_() {
 		known=1
 		shift
 	fi
+	# --from-stdin FILE pipes the file in and passes no path, which is how
+	# both implementations are asked to read standard input.
+	local from=""
+	if [ "${1:-}" = "--from-stdin" ]; then
+		from=$2
+		shift 2
+	fi
 	local note=""
 
-	timeout -s KILL "$limit" python3 "$py" "$@" >"$work/py.out" 2>"$work/py.err"
+	if [ -n "$from" ]; then
+		timeout -s KILL "$limit" python3 "$py" "$@" \
+			<"$from" >"$work/py.out" 2>"$work/py.err"
+	else
+		timeout -s KILL "$limit" python3 "$py" "$@" \
+			>"$work/py.out" 2>"$work/py.err"
+	fi
 	local py_code=$?
-	timeout -s KILL "$limit" "$rnx" run "$rn" "$@" >"$work/rn.out" 2>"$work/rn.err"
+	if [ -n "$from" ]; then
+		timeout -s KILL "$limit" "$rnx" run "$rn" "$@" \
+			<"$from" >"$work/rn.out" 2>"$work/rn.err"
+	else
+		timeout -s KILL "$limit" "$rnx" run "$rn" "$@" \
+			>"$work/rn.out" 2>"$work/rn.err"
+	fi
 	local rn_code=$?
 
 	# A killed invocation is a failure, never a comparison.
@@ -134,6 +153,9 @@ case_ every-floor rows_complete.log --min-probe-reduction-pct 5 \
 	--min-shuffle-reduction-pct 5 --min-cluster-reduction-pct 90
 case_ inline-value rows_complete.log --min-probe-reduction-pct=80
 case_ two-paths rows_complete.log rows_complete.log
+case_ piped-rows --from-stdin rows.log
+case_ piped-complete --from-stdin rows_complete.log
+case_ piped-empty --from-stdin empty.log
 case_ no-rows empty.log
 case_ missing-file does_not_exist.log
 case_ not-numeric rows_not_numeric.log

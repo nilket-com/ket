@@ -30,9 +30,15 @@ derived from it:
 RNX=/path/to/rnx ./compare.sh
 ```
 
-It runs from wherever you call it, works in a temporary directory it removes
-on the way out, and bounds each invocation with a timeout that counts as a
-failure. Set `TIMEOUT` to change the limit from 60 seconds.
+It runs nineteen cases from wherever you call it, works in a temporary
+directory it removes on the way out, and bounds each invocation with a timeout
+that counts as a failure. Set `TIMEOUT` to change the limit from 60 seconds.
+
+Three cases pipe a file in and pass no path, which is how both implementations
+are asked to read standard input. A terminal on standard input is refused by
+the port and would block the original, so there is nothing to compare and no
+case for it here; rnx tests that refusal itself, in `tests/stdin.rs` and in
+its session gate.
 
 Each case checks four things:
 
@@ -54,9 +60,9 @@ groups:
 
 | Group | Cases | Expected |
 | --- | --- | --- |
-| success | `complete`, `digest-required`, `two-paths` | nothing at all |
-| validation failure | `mixed`, `digest-mismatch`, `probe-floor`, `every-floor`, `inline-value` | the bare `error: ` line, below |
-| input or usage failure | the other eight | the diagnostic naming what went wrong |
+| success | `complete`, `digest-required`, `two-paths`, `piped-complete` | nothing at all |
+| validation failure | `mixed`, `digest-mismatch`, `probe-floor`, `every-floor`, `inline-value`, `piped-rows` | the bare `error: ` line, below |
+| input or usage failure | the other nine | the diagnostic naming what went wrong |
 
 Paths are stripped of any absolute prefix before comparing, so an expectation
 recorded here holds from another checkout.

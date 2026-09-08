@@ -91,7 +91,8 @@ rnx run crates/toron/scripts/bench/summarize_runtime_filter_perft.rn \
   crates/toron/plans/impl/0006_runtime_filter_pushdown_bench_results.md
 ```
 
-The two are kept in step by
+Given no path, both read standard input, so either can sit in a pipeline
+behind a bench run. The two are kept in step by
 `fixtures/summarize_runtime_filter_perft/compare.sh`, which runs both over
-sixteen cases and checks that the report and the exit code agree. The port
-cannot read standard input, which the original does when given no path.
+nineteen cases and checks that the report, the exit code, and the diagnostics
+all agree.

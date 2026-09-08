@@ -340,7 +340,8 @@ fn check_floor(floor, measured, group_label, what, failures) {
 fn usage() {
 	"usage: summarize_runtime_filter_perft.rn [--require-digest-equality] \
 [--min-probe-reduction-pct PCT] [--min-shuffle-reduction-pct PCT] \
-[--min-cluster-reduction-pct PCT] PATH..."
+[--min-cluster-reduction-pct PCT] [PATH...]; reads standard input when \
+given no path"
 }
 
 pub fn main(args) {
@@ -396,15 +397,18 @@ pub fn main(args) {
 		};
 	}
 
+	// Given no path the original reads standard input, and so does this.
+	let documents = [];
 	if paths.is_empty() {
-		// The original reads standard input here. rnx has no way to read it,
-		// so the port asks for a path instead of pretending to have none.
-		return Err(`no input path given; rnx cannot read standard input\n${usage()}`);
+		documents.push(host::stdin()?);
+	} else {
+		for path in paths {
+			documents.push(host::read(path)?);
+		}
 	}
 
 	let rows = [];
-	for path in paths {
-		let contents = host::read(path)?;
+	for contents in documents {
 		for line in contents.split("\n") {
 			match parse_row(line) {
 				Some(row) => rows.push(row),
