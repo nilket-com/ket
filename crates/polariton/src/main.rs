@@ -4,6 +4,7 @@ mod coordinate;
 mod core;
 mod driver;
 mod editor;
+mod first_run;
 mod fonts;
 mod gui;
 #[cfg(unix)]
@@ -14,6 +15,7 @@ mod plot;
 mod presentation_registry;
 mod profile_store;
 mod publication;
+mod reporting;
 mod result_artifact;
 mod result_registry;
 mod rune_host;
@@ -43,6 +45,10 @@ fn main() -> gui::Result {
 		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
 	match action {
 		ApplicationAction::ListSessions => list_saved_sessions(),
+		ApplicationAction::Report => {
+			ensure_rustls_provider();
+			reporting::drain_once(configuration::load_startup_data().reporting).map_err(Into::into)
+		}
 		#[cfg(unix)]
 		ApplicationAction::Windows => live::client::windows().map_err(Into::into),
 		#[cfg(unix)]
@@ -80,6 +86,7 @@ fn main() -> gui::Result {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ApplicationAction {
+	Report,
 	Gui(gui::StartupTarget),
 	GuiAgents(gui::StartupTarget),
 	#[cfg(unix)]
@@ -119,6 +126,13 @@ where
 {
 	let mut args = args.into_iter().peekable();
 	let _program = args.next();
+	if args.peek().is_some_and(|arg| arg == "report") {
+		args.next();
+		if args.next().is_some() {
+			return Err("report takes no arguments".into());
+		}
+		return Ok(ApplicationAction::Report);
+	}
 	#[cfg(unix)]
 	if args.peek().is_some_and(|arg| arg == "windows") {
 		args.next();

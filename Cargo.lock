@@ -6684,6 +6684,7 @@ dependencies = [
  "trybuild",
  "unicode-segmentation",
  "unicode-width",
+ "uuid",
  "zeroize",
 ]
 

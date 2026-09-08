@@ -1,7 +1,8 @@
 # ADR 0161: the first-run experience
 
-Status: proposed 2026-09-07, second revision under review. Application
-lane, third record, and the first record of the sales and marketing lane.
+Status: proposed 2026-09-07. Implementation evidence is in
+`../impl/0161_the_first_run_experience_evidence.md`. Application lane, third
+record, and the first record of the sales and marketing lane.
 Brief 0001 names the first customer journey - discover, get, run, first
 useful analysis - and chooses its "Run" row as the first cut: a person opens
 a fresh installation and, with nothing else present, sees a working example,
@@ -105,13 +106,13 @@ its authority.** `init.rn` is read at startup, and there is no
 in-application toggle, so the only way reporting turns off is a launch that
 reads it off. That launch performs the transition on a background task,
 never on the first-run path: it takes the reporting lock (decision 6),
-which waits for any drain attempt in progress to finish or time out; sends
-the one final "reporting disabled" report, once, on its own connection,
-with a bound of two seconds, and does not wait beyond that; publishes a
-new generation file that says *disabled* by the durable sequence of
-decision 6, so that the revocation is on disk before anything else
-happens; then deletes every segment and progress file; and releases the
-lock. A crash between the revocation and the end of cleanup is recovered
+which waits for any drain attempt in progress to finish or time out; durably
+publishes a new generation that says *disabled*; then attempts one final
+"reporting disabled" report on its own connection within two seconds,
+using the destination retained by this transition; deletes the segments and
+progress files; and releases the lock. Revocation precedes the final attempt
+so a crash cannot cause the next off launch to send it again. A crash before
+that attempt may lose the final report, which is permitted. A crash between the revocation and the end of cleanup is recovered
 at the next launch, which repeats the cleanup: every segment carries its
 generation, and one whose generation is not the current one is deleted
 wherever it is found. Re-enabling later mints a new `install_id` and a new
@@ -162,23 +163,25 @@ One protocol, in which every file has exactly one mutator.
   or touches the network.
 - **Segments, one writer each.** Each run has one writer task and one
   **active segment** at a time, a file named by `run_id` and a segment
-  number in the queue directory, which only that writer ever opens for
-  writing. Its header names the run's pid and process start token and
-  the **generation** it was written under. The writer appends a batch of up to 256 lines, calls
-  `fdatasync`, and, when the segment holds 256 reports or 64 KiB or the
-  run is quiescent for ten seconds, **seals** it: it takes the reporting
+  number in the queue directory, prefixed by a directory-local ordinal
+  allocated under the lock from existing segment names. Ordering and eviction
+  do not use the desktop clock. Only that writer opens the file for writing.
+  Its header names the run's pid and process start token and the **generation**
+  it was written under. The writer appends a batch of up to 256 lines, calls
+  `fdatasync`, and **seals** that batch immediately, splitting before 64 KiB.
+  There is no earlier persisted batch in an active segment. It takes the reporting
   lock briefly, re-checks the generation file, renames the file from its
   active name to its sealed name, syncs the directory, and releases the
   lock. A sealed segment is immutable and is the only kind a drainer ever
   reads. The rename is what publishes the sync boundary: sealed means every
   line in it was synced before the name changed, and no other process has
   to infer a boundary from line endings.
-- **A failed append.** If an append or a sync fails, the writer truncates
-  the active segment back to the length it last synced, syncs again, and
-  seals what remains; if that fails too, the writer abandons the segment
-  by removing it and stops persisting for the rest of the run, counting
-  everything thereafter as dropped in memory. It never appends after a
-  failure it has not recovered from, so a torn tail can only exist in an
+- **A failed append.** If an append or a sync fails, the writer removes the
+  active segment
+  and stops persisting for the rest of the run, counting everything
+  thereafter as dropped in memory. Early sealing means this discards only
+  the current unsynced batch, never a previous persisted batch. It never
+  appends after a failure it has not recovered from, so a torn tail can only exist in an
   active segment of a run that died.
 - **What a drain reads.** Under the lock, the drainer first rejects: any
   segment, sealed or active, whose header generation is not the current
@@ -301,11 +304,11 @@ not in this cut; the setting is `init.rn` and the transition above.
    access - the display, fonts, system libraries, the application's own
    directories - is expected and not asserted against. The marker is
    written once, and an initial file suppresses the example.
-2. **A kept figure from the person's file.** An operator's hand check: a
-   fresh installation, the example, then a Parquet file of the operator's
-   own through the closing cell's action, one deliberate change after the
-   first render, and a published package. Recorded with the build and the
-   file's shape, not its contents.
+2. **A kept figure from the person's file.** A running-window check through
+   PRODUCT-0162's agent surface: a fresh installation, the example, then a
+   real Parquet file, one deliberate change after the first render, and a
+   published package. The first-run button uses the same open/edit/run
+   owner. Record the build, wire receipts, and file shape, not its contents.
 3. **The workspace path.** With `nilket` on the path, "Start workspace"
    from the closing cell seeds the dataset and opens the Rune showcase;
    with `nilket` absent, the failure is reported as
@@ -325,10 +328,9 @@ not in this cut; the setting is `init.rn` and the transition above.
    disk write and a full channel is counted in `dropped`; a drainer reads
    only sealed segments, and a writer killed between an append and its
    seal leaves an active segment that the next drainer recovers with its
-   torn tail discarded and counted; a writer whose append fails truncates
-   to its last synced length and seals, and never appends past an
-   unrecovered failure; two launches write two segments with distinct
-   `run_id`s and `sequence` orders within each; a drain against a local
+   torn tail discarded and counted; a writer whose append fails removes
+   its unsynced batch and never appends past that failure; two launches write
+   two segments with distinct `run_id`s and `sequence` orders within each; a drain against a local
    Toron advances progress only on acknowledgement and one attempt at a
    time; a drain whose attempt times out ends at that report, and the next
    drain begins with it; a drain killed after the insert and before the
@@ -351,9 +353,9 @@ not in this cut; the setting is `init.rn` and the transition above.
    attempted.
 7. **The transition.** With segments queued, an older window still running
    and draining, and its writer still appending, a launch that reads
-   reporting off takes the lock, waits for the attempt in progress, sends
-   at most one final report within its bound, writes the disabled
-   generation, and deletes the segments; the older window's writer stops
+   reporting off takes the lock, waits for the attempt in progress, durably
+   writes the disabled generation, attempts at most one final report within
+   its bound, and deletes the segments; the older window's writer stops
    at its next seal and removes its active segment, its drainer submits no
    new attempt after observing the generation, and the first-run path of
    the new launch never waited on the lock or the network. Afterwards the

@@ -24,6 +24,7 @@ assets = [
 ]
 
 [dependencies]
+uuid = { version = "1", features = ["v4"] }
 arrow-array = "58.3.0"
 arrow-buffer = "58.3.0"
 arrow-cast = "58.3.0"

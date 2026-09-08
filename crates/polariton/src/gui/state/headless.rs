@@ -418,3 +418,49 @@ impl HeadlessApplication {
 		self.in_flight.retain(|task| !task.is_finished());
 	}
 }
+
+#[cfg(test)]
+impl HeadlessApplication {
+	pub(super) fn open_welcome() -> Result<Self, String> {
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.enable_all()
+			.build()
+			.map_err(|e| e.to_string())?;
+		let (state, task) = {
+			let _entered = runtime.enter();
+			super::new_with_authority_mode(
+				StartupData::default(),
+				super::StartupAuthority::Ephemeral { initial_file: None },
+				true,
+			)?
+		};
+		let (outputs, inbox) = tokio::sync::mpsc::unbounded_channel();
+		let mut application = Self {
+			state,
+			runtime,
+			outputs,
+			inbox,
+			in_flight: Vec::new(),
+		};
+		application.spawn(task);
+		application.drain();
+		Ok(application)
+	}
+}
+
+#[cfg(test)]
+impl HeadlessApplication {
+	pub(super) fn run_welcome_cell(&mut self, name: &str) {
+		let cell = self
+			.state
+			.code_editor
+			.welcome_cell(name)
+			.expect("welcome cell");
+		let task = {
+			let _entered = self.runtime.enter();
+			super::run_markdown_cell(&mut self.state, cell)
+		};
+		self.spawn(task);
+		self.drain();
+	}
+}

@@ -353,6 +353,7 @@ impl AppState {
 		}
 		match result {
 			Ok(loaded) => {
+				let opened_path = path.clone();
 				self.adapter_state.selection = crate::adapters::driver::AdapterSelection::Parquet;
 				self.adapter_state.configuration =
 					crate::adapters::driver::AdapterConfiguration::Parquet {
@@ -363,6 +364,7 @@ impl AppState {
 					self,
 					Message::AdapterConnected(Ok((loaded.connection, CancelCapability::Refuse))),
 				);
+				self.welcome_data_opened(&opened_path);
 				self.complete_notebook(Completion::Done {
 					notebook: None,
 					data: Some(loaded.description),
@@ -370,6 +372,14 @@ impl AppState {
 				return task;
 			}
 			Err(message) => {
+				eprintln!("Open data: {message}");
+				if self.welcome.active {
+					self.reporting.emit(
+						crate::reporting::Step::OwnFileOpened,
+						Some(crate::reporting::Reason::FileUnsupported),
+						true,
+					);
+				}
 				self.status_error = message.clone();
 				self.complete_notebook(Completion::Failed(message));
 			}

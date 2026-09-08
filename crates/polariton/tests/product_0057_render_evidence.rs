@@ -58,6 +58,11 @@ mod session_persistence;
 #[path = "../src/settings_writeback.rs"]
 mod settings_writeback;
 
+#[path = "../src/first_run.rs"]
+mod first_run;
+#[path = "../src/reporting/mod.rs"]
+mod reporting;
+
 use coordinate::Rect;
 use gui::table::{Product0057TableEvidenceGeometry, draw_product_0057_table_evidence};
 use iced::advanced::graphics::geometry::Renderer as _;
@@ -2937,3 +2942,8 @@ fn product_0159_mark_batch(renderer: &mut iced::Renderer) {
 		"PRODUCT-0159 gate 3 control: the union does not"
 	);
 }
+
+#[path = "../src/first_run.rs"]
+mod first_run;
+#[path = "../src/reporting/mod.rs"]
+mod reporting;

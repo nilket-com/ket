@@ -11,6 +11,11 @@ pub(super) struct PublishJob {
 	exports: Vec<HostPlotExport>,
 	request: PublishRequest,
 	pub(super) root: PathBuf,
+	kept: Option<(
+		crate::reporting::Reporter,
+		crate::reporting::Reason,
+		std::sync::Arc<std::sync::atomic::AtomicBool>,
+	)>,
 }
 
 impl AppState {
@@ -28,18 +33,29 @@ impl AppState {
 			exports,
 			request: publish_request(self),
 			root: root.to_owned(),
+			kept: self
+				.welcome
+				.own_kind
+				.filter(|_| self.welcome.rendered && self.welcome.changed)
+				.map(|kind| (self.reporting.clone(), kind, self.welcome.kept.clone())),
 		})
 	}
 }
 
 impl PublishJob {
 	pub(super) fn run(self) -> Result<Package, PublishError> {
-		crate::publication::assemble_and_write(
+		let package = crate::publication::assemble_and_write(
 			&self.witness,
 			self.exports,
 			&self.request,
 			&self.root,
-		)
+		)?;
+		if let Some((reporter, kind, kept)) = self.kept {
+			if !kept.swap(true, std::sync::atomic::Ordering::Relaxed) {
+				reporter.emit(crate::reporting::Step::FirstAnalysisKept, Some(kind), false);
+			}
+		}
+		Ok(package)
 	}
 }
 

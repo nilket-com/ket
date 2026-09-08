@@ -149,6 +149,12 @@ pub enum Message {
 	ProfileUnlockCancelled,
 	ResizeWindow(window::Direction),
 	Run,
+	WelcomePath(String),
+	WelcomeOpen,
+	#[cfg(feature = "toron")]
+	WelcomeWorkspace,
+	#[cfg(feature = "toron")]
+	WelcomeSeeded(Result<(), String>),
 	RunSnippet,
 	RunResult {
 		result: ExecutionResult,

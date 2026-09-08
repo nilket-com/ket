@@ -1361,6 +1361,50 @@ impl CodeEditor {
 		)
 	}
 
+	/// PRODUCT-0161 uses the ordinary engine document and preview path.
+	pub(crate) fn open_welcome_notebook(&mut self, source: &str) {
+		self.send(EditorCommand::ReplaceDocument {
+			text: source.into(),
+			language: Some("markdown".into()),
+			virtual_path: Some("welcome.md".into()),
+		});
+		self.send(EditorCommand::MarkdownPreview { serif: false });
+		self.request_content();
+	}
+	#[cfg(feature = "toron")]
+	pub(crate) fn open_welcome_rune(&mut self, source: &str) {
+		self.send(EditorCommand::NewPane {
+			direction: SplitDirection::Vertical,
+			language: Some("rune".into()),
+		});
+		self.send(EditorCommand::ReplaceDocument {
+			text: source.into(),
+			language: Some("rune".into()),
+			virtual_path: Some("welcome.rn".into()),
+		});
+		self.request_content();
+	}
+	pub(crate) fn welcome_cell(&self, name: &str) -> Option<MarkdownCellExecution> {
+		let source = self.notebook_source(self.viewport.as_ref()?)?;
+		let cell = source
+			.markdown_cells
+			.iter()
+			.find(|c| matches!(&c.identity, MarkdownCellIdentity::Explicit { id } if id == name))?;
+		let text = self.document_texts.get(&source.buffer_id)?;
+		Some(MarkdownCellExecution {
+			identity: cell.identity.clone(),
+			presentation: cell.presentation,
+			language_id: cell.language_id.clone(),
+			code: text
+				.get(cell.body_range.start.get() as usize..cell.body_range.end.get() as usize)?
+				.into(),
+			source_start_line: text
+				.get(..cell.body_range.start.get() as usize)?
+				.bytes()
+				.filter(|b| *b == b'\n')
+				.count() + 1,
+		})
+	}
 	/// The executable fenced cell containing the focused source cursor, if that source has a
 	/// paired Markdown preview. The fence ranges and identities are projected by
 	/// libaryon; Polariton only slices the authoritative source bytes.
@@ -1441,6 +1485,11 @@ impl CodeEditor {
 			return (!source.markdown_cells.is_empty()).then_some(source);
 		}
 
+		// A focused source buffer owns its own Run action. Only native
+		// output panes may borrow the notebook's execution context.
+		if focused.host_panel.is_none() {
+			return None;
+		}
 		// Native output panes have no document identity. The Markdown source
 		// remains the execution context even when its preview is closed.
 		viewport

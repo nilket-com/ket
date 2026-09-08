@@ -199,6 +199,7 @@ fn product_0062_persistence_schema_has_no_placement_or_renderer_authority() {
 	// PRODUCT-0062 confined serde to the opaque session owner; PRODUCT-0134
 	// sanctions exactly one more durable schema, the encrypted profile store.
 	let mut expected = vec![
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/reporting/mod.rs"),
 		// PRODUCT-0158 §5 and §6: the commands file and the receipt are the
 		// agent surface's own schema, owned by the driver.
 		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/driver.rs"),
@@ -6835,4 +6836,46 @@ fn product_0162_notebook_actions_share_admission_and_engine_generation_guards() 
 	}
 	assert!(!owner.contains("serde_json"));
 	assert!(!owner.contains("assemble_and_write"));
+}
+
+#[test]
+fn product_0161_reporting_has_an_explicit_destination_and_no_authoring_data() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let reporting = std::fs::read_to_string(root.join("reporting/mod.rs")).unwrap();
+	let spool = std::fs::read_to_string(root.join("reporting/spool.rs")).unwrap();
+	let welcome = std::fs::read_to_string(root.join("gui/state/welcome.rs")).unwrap();
+	let first_run = std::fs::read_to_string(root.join("first_run.rs")).unwrap();
+	for forbidden in [
+		"nilket_local::",
+		"discover(",
+		"LocalWorkspace",
+		"default_endpoint",
+	] {
+		assert!(!reporting.contains(forbidden));
+		assert!(!spool.contains(forbidden));
+	}
+	let report = reporting
+		.split("pub(crate) struct Report {")
+		.nth(1)
+		.unwrap()
+		.split("\n}")
+		.next()
+		.unwrap();
+	assert!(report.contains("reason: Option<Reason>"));
+	for forbidden in [
+		"path:",
+		"source:",
+		"query:",
+		"hostname:",
+		"error:",
+		"figure:",
+	] {
+		assert!(!report.contains(forbidden));
+	}
+	assert!(reporting.contains("sender.try_send(event)"));
+	assert!(reporting.contains("ToronClient::authenticated"));
+	assert!(welcome.contains("self.start_command(&command)"));
+	assert!(welcome.contains("Command::ReplaceCell"));
+	assert!(!first_run.contains("ResultArtifact"));
+	assert!(!welcome.contains("first_run::open_file"));
 }

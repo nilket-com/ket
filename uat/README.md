@@ -157,7 +157,7 @@ SQL/Rune notebook with agent acceptance enabled:
 ```sh
 polariton --agents uat/agent_notebook_showcase.md
 polariton windows
-python3 uat/agent_notebook_drive.py --binary target/debug/polariton \
+bash uat/agent_notebook_drive.sh --binary target/debug/polariton \
   --window <window-id> --data <your-file.parquet> --output /tmp/notebook-journey
 ```
 
@@ -408,3 +408,66 @@ cargo run -p polariton -- uat/test37.rn
 verbose facets carry different categorical label lengths, so the default capture
 can show current crowding and later prove that one figure-wide reservation keeps
 facet cells congruent.
+
+
+## PRODUCT-0161: first run and operator reporting
+
+The acceptance harness uses Bash, jq, and GNU `timeout` (`gtimeout` on macOS).
+It invokes the executable with an argument array, saves every answer, and stops
+on failures or unknown outcomes without retrying. No Python runtime is needed.
+
+An empty start with a fresh application state directory opens the bundled
+scratch notebook. No account, workspace or reporting configuration is needed.
+Use **Open my data** with a CSV or Parquet path, change the SQL after its first
+render, rerun the data and plot cells, then **Plot → Publish** to keep a figure.
+The first-run marker suppresses the example on later empty starts; explicit
+source/session startup retains its own behavior.
+
+For the same journey through PRODUCT-0162, launch `polariton --agents`, read
+its id with `polariton windows`, then use a new receipt directory:
+
+```sh
+bash uat/agent_notebook_drive.sh --binary target/debug/polariton \
+  --window <window-id> --data /absolute/path/to/file.parquet \
+  --data-cell first-data --plot-cell first-plot --output /tmp/first-run-receipts
+```
+
+The harness uses only `polariton act`, validates source generations and final
+answers, and stops on an unknown outcome rather than replaying it. It publishes
+a package after a deliberate post-render change. Close the test window when done.
+
+Reporting is off by default. Provision `uat/journey_reports.sql` through the
+operator's authenticated SQL client at the intended collector. In the operator's
+`init.rn`, explicitly enable that collector:
+
+```rune
+pub fn main(config) {
+    config.reporting(true, "127.0.0.1:17761", "/absolute/path/to/reporting-pki")?;
+}
+```
+
+The PKI directory contains `client.pem`, `client.key`, `ca.pem`, and a
+`server_name` file. The client identity must have access to the destination
+tenant. A discovered local workspace is never selected for reporting. Reports
+queue and drain in the background; `polariton report` performs an explicit drain
+with the same configuration and exclusive drainer lock. Configuration changes
+apply at startup. Starting with reporting off durably revokes the old generation,
+attempts one final settings report, and deletes queued analysis reports.
+
+Refresh with `uat/journey_business_view.sql` against the reporting tenant, then
+open or publish `uat/journey_business_view.rn` through a workspace reading that
+same tenant:
+
+```sh
+polariton drive uat/journey_business_view.rn \
+  --commands uat/journey_business_view.commands.json \
+  --receipt /tmp/journey-business-receipt.json
+```
+
+The commands publish to `/tmp/polariton-journey-package`. Refresh before loading
+the source. The verification used a separate query head restarted after table
+replacement; it does not establish cross-head schema-cache invalidation.
+These are operator dogfood rows, not an external customer funnel. Missing steps
+are unknown, reporting-off observations are not a denominator, and the total
+population of runs is unknown. Only the published artifact belongs on a public
+request path; none of these commands makes the reporting tables public.

@@ -9,6 +9,7 @@ pub(crate) mod headless;
 pub(crate) mod notebook_actions;
 mod publish;
 mod surface;
+mod welcome;
 use crate::adapters::{
 	common::{AdapterStage, ExecutionResult},
 	driver::AdapterState,
@@ -129,6 +130,9 @@ impl RetainedRelationGeneration {
 }
 
 pub(crate) struct AppState {
+	welcome: crate::first_run::Welcome,
+	welcome_action: Option<welcome::Pending>,
+	reporting: crate::reporting::Reporter,
 	surface: surface::Surface,
 	notebook_actions: notebook_actions::NotebookActions,
 	connection_generation: u64,
@@ -729,8 +733,30 @@ pub fn run(startup_data: StartupData, target: StartupTarget, accepting_agents: b
 	let size = Size::new(startup_data.window_size.0, startup_data.window_size.1);
 	let authority = resolve_startup(target)
 		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-	let mut initial = new_with_authority(startup_data, authority)
+	let root = crate::reporting::state_dir();
+	let show_welcome = root.as_ref().is_some_and(|root| {
+		crate::first_run::Welcome::eligible(
+			root,
+			matches!(
+				&authority,
+				StartupAuthority::Ephemeral { initial_file: None }
+			),
+		)
+	});
+	let destination = startup_data.reporting.clone();
+	let mut initial = new_with_authority_mode(startup_data, authority, show_welcome)
 		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+	if let Some(root) = root {
+		initial.0.reporting = crate::reporting::Reporter::start(root.clone(), destination.clone());
+		initial
+			.0
+			.reporting
+			.emit(crate::reporting::Step::RunOpened, None, false);
+		if show_welcome {
+			initial.0.welcome.marker = Some(root.join("first-run-shown"));
+		}
+	}
+	initial.0.welcome.reporting_on = destination.is_some();
 	#[cfg(unix)]
 	initial
 		.0
@@ -781,6 +807,7 @@ fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Ta
 		.expect("ephemeral startup cannot refuse")
 }
 
+#[cfg(test)]
 fn new_with_authority(
 	startup_data: StartupData,
 	authority: StartupAuthority,
@@ -790,6 +817,21 @@ fn new_with_authority(
 fn new_with_discovery(
 	startup_data: StartupData,
 	authority: StartupAuthority,
+	discover: bool,
+) -> std::result::Result<(AppState, Task<Message>), String> {
+	new_with_options(startup_data, authority, false, discover)
+}
+fn new_with_authority_mode(
+	startup_data: StartupData,
+	authority: StartupAuthority,
+	welcome: bool,
+) -> std::result::Result<(AppState, Task<Message>), String> {
+	new_with_options(startup_data, authority, welcome, !welcome)
+}
+fn new_with_options(
+	startup_data: StartupData,
+	authority: StartupAuthority,
+	welcome: bool,
 	_discover: bool,
 ) -> std::result::Result<(AppState, Task<Message>), String> {
 	let window_size = Size::new(startup_data.window_size.0, startup_data.window_size.1);
@@ -833,7 +875,13 @@ fn new_with_discovery(
 		),
 	};
 	code_editor.set_show_column_types(startup_data.show_column_types);
+	if welcome {
+		code_editor.open_welcome_notebook(crate::first_run::EXAMPLE);
+	}
 	let mut state = AppState {
+		welcome: crate::first_run::Welcome::default(),
+		welcome_action: None,
+		reporting: crate::reporting::Reporter::default(),
 		surface: surface::Surface::default(),
 		notebook_actions: notebook_actions::NotebookActions::default(),
 		connection_generation: 0,
@@ -897,6 +945,8 @@ fn new_with_discovery(
 		sql_run_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
 		sql_abort: None,
 	};
+	state.welcome.active = welcome;
+	state.welcome.original_source = crate::first_run::EXAMPLE.into();
 	sync_workspace_viewport(&mut state);
 	// Eagerly open the session scratch database so SQL always has a target;
 	// an in-memory SQLite open is effectively instant.
@@ -928,7 +978,7 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		};
 		(detail.summary == *visible_summary).then_some(detail)
 	});
-	components::main_screen(
+	let screen = components::main_screen(
 		&app_state.menu_state,
 		&app_state.code_editor,
 		&app_state.status_msg,
@@ -963,7 +1013,8 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		app_state.agents.status(),
 		#[cfg(not(unix))]
 		(false, 0),
-	)
+	);
+	welcome::view(app_state, screen)
 }
 
 fn session_identity_text(session_id: SessionId) -> String {
@@ -3864,12 +3915,14 @@ fn begin_window_shutdown(_app_state: &mut AppState) -> Task<Message> {
 }
 
 fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
+	app_state.observe_welcome_message(&message);
 	let task = update_inner(app_state, message);
 	app_state.expire_notebook_action();
+	let welcome_task = app_state.advance_welcome();
 	app_state.capture_surface_baselines();
 	#[cfg(unix)]
 	app_state.refresh_agents();
-	task
+	Task::batch([task, welcome_task])
 }
 
 fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
@@ -3880,10 +3933,14 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 			| Message::AdapterConnected(_)
 	) {
 		app_state.connection_generation = app_state.connection_generation.saturating_add(1);
+		app_state.welcome.own_kind = None;
+		app_state.welcome.own_data_ready = false;
 	}
 	#[cfg(feature = "toron")]
 	if matches!(&message, Message::LocalWorkspaceAttached { .. }) {
 		app_state.connection_generation = app_state.connection_generation.saturating_add(1);
+		app_state.welcome.own_kind = None;
+		app_state.welcome.own_data_ready = false;
 	}
 	// Gate closure must also work while a saved window is finishing shutdown.
 	match message {
@@ -3892,6 +3949,39 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 			return app_state.notebook_data_loaded(id, result);
 		}
 
+		#[cfg(feature = "toron")]
+		Message::WelcomeWorkspace => {
+			app_state.welcome.workspace_requested = true;
+			return Task::perform(
+				nilket_local::discover(None),
+				Message::LocalWorkspaceDiscovered,
+			);
+		}
+		#[cfg(feature = "toron")]
+		Message::WelcomeSeeded(result) => {
+			match result {
+				Ok(()) => {
+					app_state
+						.code_editor
+						.open_welcome_rune(welcome::WORKSPACE_SOURCE);
+					app_state.welcome.stage = 4;
+				}
+				Err(e) => {
+					app_state.status_error = e;
+					app_state.reporting.emit(
+						crate::reporting::Step::WorkspaceFailed,
+						Some(crate::reporting::Reason::ExampleSeedFailed),
+						true,
+					);
+				}
+			}
+			return Task::none();
+		}
+		Message::WelcomePath(path) => {
+			app_state.welcome.path = path;
+			return Task::none();
+		}
+		Message::WelcomeOpen => return app_state.start_welcome_open(),
 		#[cfg(unix)]
 		Message::AgentInbound(inbound) => {
 			return app_state.agent_inbound(inbound);
@@ -3955,6 +4045,11 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::AgentInbound(_) | Message::AgentTick(_) | Message::AgentPublishFinished { .. } => {
 			unreachable!()
 		}
+		Message::WelcomePath(_) | Message::WelcomeOpen => {
+			unreachable!()
+		}
+		#[cfg(feature = "toron")]
+		Message::WelcomeWorkspace | Message::WelcomeSeeded(_) => unreachable!(),
 		Message::ToggleAgents => unreachable!(),
 		Message::ToggleStatusDetail => {
 			if app_state.status_detail.is_some() {

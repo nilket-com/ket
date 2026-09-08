@@ -24,6 +24,7 @@ const DEFAULT_WINDOW_SIZE: (f32, f32) = (1920.0, 1080.0);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StartupData {
+	pub reporting: Option<crate::reporting::Destination>,
 	pub window_size: (f32, f32),
 	pub show_column_types: bool,
 	pub pane_divider_reservation: PaneDividerReservation,
@@ -33,6 +34,7 @@ pub struct StartupData {
 impl Default for StartupData {
 	fn default() -> Self {
 		Self {
+			reporting: None,
 			window_size: DEFAULT_WINDOW_SIZE,
 			show_column_types: false,
 			// `PaneDividerReservation::default()` is TERMINAL. Polariton's
@@ -176,6 +178,9 @@ fn build_context() -> Result<Context, String> {
 	module
 		.associated_function("pane_divider_gutter", config_pane_divider_gutter)
 		.map_err(|error| format!("Rune module error: {error}"))?;
+	module
+		.associated_function("reporting", config_reporting)
+		.map_err(|e| e.to_string())?;
 	context
 		.install(module)
 		.map_err(|error| format!("Rune context error: {error}"))?;
@@ -507,6 +512,31 @@ pub fn main(config) {
 	}
 
 	#[test]
+	fn product_0161_reporting_requires_an_explicit_destination() {
+		let path = temp_path("reporting-init");
+		std::fs::write(
+			&path,
+			r#"pub fn main(config) { config.reporting(true, "", "")?; }"#,
+		)
+		.unwrap();
+		let startup = load_from_path(&path);
+		assert!(startup.reporting.is_none());
+		assert!(startup.init_error.as_deref().unwrap().contains("explicit"));
+		#[cfg(feature = "toron")]
+		{
+			std::fs::write(
+				&path,
+				r#"pub fn main(config) { config.reporting(true, "127.0.0.1:17761", "/explicit/pki")?; }"#,
+			)
+			.unwrap();
+			let startup = load_from_path(&path);
+			assert!(startup.init_error.is_none(), "{:?}", startup.init_error);
+			assert_eq!(startup.reporting.unwrap().endpoint, "127.0.0.1:17761");
+		}
+		std::fs::remove_file(path).unwrap();
+	}
+
+	#[test]
 	fn compile_error_is_reported_without_losing_defaults() {
 		let path = temp_path("broken-init");
 		std::fs::write(&path, "pub fn main(").expect("write init");
@@ -522,4 +552,21 @@ pub fn main(config) {
 		);
 		let _ = std::fs::remove_file(path);
 	}
+}
+
+fn config_reporting(
+	config: &RuneConfig,
+	enabled: bool,
+	endpoint: String,
+	pki: String,
+) -> Result<(), String> {
+	if !enabled {
+		return with_startup(config, |s| s.reporting = None);
+	}
+	let destination = crate::reporting::Destination {
+		endpoint,
+		pki: PathBuf::from(pki),
+	};
+	destination.validate()?;
+	with_startup(config, |s| s.reporting = Some(destination))
 }

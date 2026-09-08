@@ -2,6 +2,13 @@
 
 Status: implemented 2026-09-07. The record remains proposed.
 
+Review correction 2026-09-08: the historical Python harness below is replaced
+by `uat/agent_notebook_drive.sh` (Bash, jq, GNU timeout). The replacement completed
+the same 19 actions in a fresh live first-run window, saving every command and
+answer under `/tmp/polariton-bash-qHHllq/receipt with spaces`. An unknown-answer
+control stopped after one invocation without replaying. This removes the Python
+dependency from the current acceptance instructions.
+
 The missing surface was notebook authoring: PRODUCT-0158/0160 could act on
 figures but could not inspect and change the SQL that produced them. This
 cut adds four commands to their shared application owner: describe_notebook,
@@ -72,4 +79,3 @@ Final Polariton ladder: 1,261 binary tests passed, 25 existing evidence tests
 ignored; 128 architecture guards passed; workspace all-target check, reduced
 head all-target check, and formatting passed. This is the application ladder,
 not a TPC-H performance run.
-

@@ -67,6 +67,7 @@ enum ProcessPhase {
 #[derive(Debug)]
 struct ProcessRecord {
 	phase: ProcessPhase,
+	report_reason: Option<crate::reporting::Reason>,
 	diagnostics: VecDeque<String>,
 }
 
@@ -74,6 +75,7 @@ impl Default for ProcessRecord {
 	fn default() -> Self {
 		Self {
 			phase: ProcessPhase::Launching,
+			report_reason: None,
 			diagnostics: VecDeque::new(),
 		}
 	}
@@ -83,6 +85,20 @@ impl Default for ProcessRecord {
 pub(crate) struct ProcessMonitor(Arc<Mutex<ProcessRecord>>);
 
 impl ProcessMonitor {
+	pub(crate) fn report_reason(&self) -> crate::reporting::Reason {
+		self.0
+			.lock()
+			.expect("process monitor poisoned")
+			.report_reason
+			.unwrap_or(crate::reporting::Reason::WorkspaceExited)
+	}
+	fn set_report_reason(&self, reason: crate::reporting::Reason) {
+		self.0
+			.lock()
+			.expect("process monitor poisoned")
+			.report_reason = Some(reason);
+	}
+
 	fn new() -> Self {
 		Self(Arc::new(Mutex::new(ProcessRecord::default())))
 	}
@@ -173,7 +189,8 @@ impl LocalWorkspaceOwner {
 			.spawn(move || {
 				let executable = match resolve_nilket_executable() {
 					Ok(executable) => executable,
-					Err(cause) => {
+					Err((reason, cause)) => {
+						thread_monitor.set_report_reason(reason);
 						thread_monitor.set_phase(ProcessPhase::SpawnFailed { cause });
 						return;
 					}
@@ -241,6 +258,9 @@ fn owning_thread_main(
 	let mut child = match command.spawn() {
 		Ok(child) => child,
 		Err(error) => {
+			if error.kind() == io::ErrorKind::NotFound {
+				monitor.set_report_reason(crate::reporting::Reason::WorkspaceLauncherMissing);
+			}
 			monitor.set_phase(ProcessPhase::SpawnFailed {
 				cause: format!("spawn Nilket local workspace: {error}"),
 			});
@@ -378,9 +398,13 @@ fn finish_readers(outcome: &StopOutcome, readers: Vec<JoinHandle<()>>) {
 	}
 }
 
-fn resolve_nilket_executable() -> Result<PathBuf, String> {
-	let current = std::env::current_exe()
-		.map_err(|error| format!("resolve current Polariton executable: {error}"))?;
+fn resolve_nilket_executable() -> Result<PathBuf, (crate::reporting::Reason, String)> {
+	let current = std::env::current_exe().map_err(|error| {
+		(
+			crate::reporting::Reason::WorkspaceExited,
+			format!("resolve current Polariton executable: {error}"),
+		)
+	})?;
 	if let Some(sibling) = current.parent().map(|parent| parent.join("nilket"))
 		&& is_executable(&sibling)
 	{
@@ -394,10 +418,10 @@ fn resolve_nilket_executable() -> Result<PathBuf, String> {
 			}
 		}
 	}
-	Err(
+	Err((crate::reporting::Reason::WorkspaceLauncherMissing,
 		"resolve nilket: no sibling or PATH executable; this sibling-then-PATH rule is shared with PRODUCT-0004 and must be extracted before a third consumer"
 			.to_owned(),
-	)
+	))
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -438,6 +462,7 @@ pub(crate) async fn watch_until_ready(
 			return StartupOutcome::Failed { observed, cause };
 		}
 		if Instant::now() >= limit {
+			monitor.set_report_reason(crate::reporting::Reason::WorkspaceStartTimeout);
 			let observed = nilket_local::discover(Some(&profile_root)).await;
 			return StartupOutcome::Failed {
 				cause: format!(

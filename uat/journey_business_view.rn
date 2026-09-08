@@ -1,0 +1,39 @@
+// PRODUCT-0161. Operator dogfood, not an external customer funnel.
+// Counts are observed runs; the total population is unknown. Refresh using
+// journey_business_view.sql. An absent report does not prove abandonment.
+workspace.table("journey_funnel").views([
+ view("journey-funnel", figure([
+  title("First-run dogfood — observed, absent, unknown"),
+  subtitle("Operator machines only. Reporting is opt-in; total runs unknown."),
+  bar("step", "runs", "state"),
+ ])),
+]);
+workspace.table("journey_reporting").views([
+ view("journey-reporting", figure([
+  title("Observed reporting states"),
+  subtitle("Reporting-off reports are not a denominator."),
+  bar("platform", "runs", "step"),
+ ])),
+]);
+workspace.table("journey_last_observed").views([
+ view("journey-last-observed", figure([
+  title("Last observed step by platform"),
+  subtitle("Later activity is unknown, not abandonment."),
+  bar("platform", "runs", "step"),
+ ])),
+]);
+workspace.table("journey_failures").views([
+ view("journey-failures", figure([
+  title("Observed failures"),
+  subtitle("Closed reason codes only; no diagnostic text leaves the desktop."),
+  bar("reason", "reports", "platform"),
+ ])),
+]);
+
+workspace.table("journey_elapsed").views([
+ view("journey-elapsed", figure([
+  title("Observed time to kept analysis"),
+  subtitle("Per run; desktop clocks, nonnegative intervals only."),
+  scatter("started", "seconds"),
+ ])),
+]);
