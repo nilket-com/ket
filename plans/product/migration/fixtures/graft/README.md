@@ -50,4 +50,15 @@ what differs. Only one of those is worth pinning.
 `RECORD=1 ./compare.sh` rewrites the expectations. Read the diff before
 keeping it: a recorded expectation is a claim about what the port should say.
 
-Findings from the exercise are in rnx record 0017.
+## A lineage the size of the real one
+
+`build_lineage.sh DIRECTORY COUNT` builds the same relationship at any size,
+for measuring the verifiers rather than comparing their diagnostics. It is
+deliberately not `build.sh` with a parameter: `build.sh`'s three commits have
+hashes baked into the expectations above, so its construction must not move.
+
+At 1,346 commits — the size of the real map — both verifiers agree on standard
+output and exit status, and the port needs `--budget 40000000` to get there.
+The command is in `../../0001_nilket_freeze.md`.
+
+Findings from the exercise are in rnx records 0017, 0021, 0022 and 0023.

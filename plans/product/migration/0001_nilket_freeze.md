@@ -74,3 +74,20 @@ repository and run:
 python3 plans/product/migration/verify_nilket_graft.py \
   SOURCE.git .git plans/product/migration/0001_nilket_commit_map.tsv
 ```
+
+Or the Rune port, which says the same thing and needs a budget to do it:
+
+```text
+rnx run --budget 40000000 plans/product/migration/verify_nilket_graft.rn \
+  SOURCE.git .git plans/product/migration/0001_nilket_commit_map.tsv
+```
+
+`--budget` is not optional at this size. `rnx run` allows two million
+instructions unless told otherwise, and the port spends between 34 and 36
+million on 1,346 commits — measured, on a lineage of that size built by
+`fixtures/graft/build_lineage.sh`. Without the flag it halts partway with
+`halted: 2000000 instructions exceeded`, which is the answer to a different
+question than the one being asked. Forty million is the figure used for the
+measurement and leaves room; rnx records 0021 and 0022 are where the number
+comes from.
+
