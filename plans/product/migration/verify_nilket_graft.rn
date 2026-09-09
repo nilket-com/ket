@@ -33,6 +33,73 @@ fn git_text(repo, arguments) {
 	Ok(ran.stdout)
 }
 
+/// Every object at once, through one `git cat-file --batch`, as the Python
+/// original does it: the ids are written to the child's standard input and
+/// closed, then a header and a payload of the stated length are read back for
+/// each. Three children for the whole verification instead of one per object,
+/// which record 0022 measured at 4.5 s against 37 ms for this repository.
+///
+/// The reply framing is `<id> <type> <size>\n`, then `size` bytes, then one
+/// newline. Every field is checked: an id that came back in the wrong order,
+/// a size that runs past the end, or a payload that is not newline-terminated
+/// is a refusal rather than a guess.
+fn batch(repo, ids) {
+	let found = #{};
+	if ids.len() == 0 {
+		return Ok(found);
+	}
+	let requests = "";
+	for id in ids {
+		requests += id;
+		requests += "\n";
+	}
+	let all = ["-C", repo, "cat-file", "--batch"];
+	let ran = host::process_bytes_input("git", all, requests.as_bytes(), 90000)?;
+	if ran.truncated {
+		return Err(`git cat-file --batch returned more than can be captured for ${ids.len()} objects; ask in smaller batches`);
+	}
+	if ran.timed_out || ran.cancelled {
+		return Err("git cat-file --batch did not complete");
+	}
+	if ran.code != 0 {
+		return Err(`git cat-file --batch failed: ${ran.stderr}`);
+	}
+	let raw = ran.stdout;
+	let at = 0;
+	for expected in ids {
+		let stop = match index_of(raw, NEWLINE, at) {
+			Some(stop) => stop,
+			None => return Err(`no reply header for ${expected}`),
+		};
+		let header = String::from_utf8(slice(raw, at, stop))?;
+		let parts = [];
+		for piece in header.split(' ') {
+			parts.push(piece);
+		}
+		if parts.len() != 3 {
+			return Err(`a reply header is not an id, a type and a size: ${header}`);
+		}
+		if parts[0] != expected {
+			return Err(`a reply is out of order: asked ${expected}, got ${parts[0]}`);
+		}
+		let size = parts[2].parse::<i64>()?;
+		let start = stop + 1;
+		let end = start + size;
+		if end >= raw.len() {
+			return Err(`a reply for ${expected} is shorter than its header says`);
+		}
+		if raw[end] != NEWLINE {
+			return Err(`a reply for ${expected} is not newline terminated`);
+		}
+		found[expected] = slice(raw, start, end);
+		at = end + 1;
+	}
+	if at != raw.len() {
+		return Err("git cat-file --batch said more than was asked of it");
+	}
+	Ok(found)
+}
+
 /// The same, as bytes, for an object that is not text.
 fn git_bytes(repo, arguments) {
 	let all = ["-C", repo];
@@ -269,11 +336,33 @@ pub fn main(args) {
 		return fail("target coverage differs");
 	}
 
+	// Three batches, in the original's order: the source commits, the target
+	// commits, and then the target trees, whose ids are only known once the
+	// target commits have been parsed.
+	let target_ids = [];
+	for old in source_commits {
+		target_ids.push(mapping[old]);
+	}
+	let source_raw = batch(source, source_commits)?;
+	let target_raw = batch(target, target_ids)?;
+	let before_by_id = #{};
+	let after_by_id = #{};
+	let tree_ids = [];
+	for old in source_commits {
+		let new = mapping[old];
+		let before = parse_commit(source_raw[old])?;
+		let after = parse_commit(target_raw[new])?;
+		before_by_id[old] = before;
+		after_by_id[old] = after;
+		tree_ids.push(after.tree);
+	}
+	let tree_raw = batch(target, tree_ids)?;
+
 	let signed_commits = 0;
 	for old in source_commits {
 		let new = mapping[old];
-		let before = parse_commit(git_bytes(source, ["cat-file", "commit", old])?)?;
-		let after = parse_commit(git_bytes(target, ["cat-file", "commit", new])?)?;
+		let before = before_by_id[old];
+		let after = after_by_id[old];
 		if before.signed {
 			signed_commits += 1;
 		}
@@ -296,7 +385,7 @@ pub fn main(args) {
 		if before.message != after.message {
 			return fail(`the message differs at ${old}`);
 		}
-		let wrapper = parse_single_prefixed_tree(git_bytes(target, ["cat-file", "tree", after.tree])?)?;
+		let wrapper = parse_single_prefixed_tree(tree_raw[after.tree])?;
 		if wrapper.mode != "40000" || wrapper.name != "nilket" || wrapper.oid != before.tree {
 			return fail(`the tree is not the source tree under nilket at ${old}`);
 		}
