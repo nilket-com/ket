@@ -145,6 +145,21 @@ fn samples(path) {
 		],
 		90000,
 	)?;
+	// Whether rnx holds all of what perf produced. This port never asked
+	// before, so a capture that stopped early — at the size cap, or when the
+	// call ended with a descendant still holding the pipe — was classified as
+	// though it were the whole profile. Record 0023 makes the second of those
+	// possible and closes both.
+	//
+	// The cause is reported before the shortfall: a deadline and a
+	// cancellation both leave `cut_short` set, and "it did not finish" tells
+	// a reader more than "the output is incomplete" does.
+	if result.timed_out || result.cancelled {
+		return Err(`perf script did not finish for ${path}`);
+	}
+	if result.truncated || result.cut_short || result.unreadable {
+		return Err(`perf script output was not captured whole for ${path}`);
+	}
 	let lines = [];
 	for line in result.stdout.split("\n") {
 		if line.trim().len() > 0 {

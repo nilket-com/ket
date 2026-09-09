@@ -24,7 +24,7 @@ fn git_text(repo, arguments) {
 		all.push(argument);
 	}
 	let ran = host::process("git", all, 90000)?;
-	if ran.truncated || ran.timed_out || ran.cancelled {
+	if ran.truncated || ran.cut_short || ran.unreadable || ran.timed_out || ran.cancelled {
 		return Err(`git ${arguments} did not complete`);
 	}
 	if ran.code != 0 {
@@ -60,6 +60,9 @@ fn batch(repo, ids) {
 	}
 	if ran.timed_out || ran.cancelled {
 		return Err("git cat-file --batch did not complete");
+	}
+	if ran.cut_short || ran.unreadable {
+		return Err("git cat-file --batch output was not read whole");
 	}
 	if ran.code != 0 {
 		return Err(`git cat-file --batch failed: ${ran.stderr}`);
@@ -107,7 +110,7 @@ fn git_bytes(repo, arguments) {
 		all.push(argument);
 	}
 	let ran = host::process_bytes("git", all, 90000)?;
-	if ran.truncated || ran.timed_out || ran.cancelled {
+	if ran.truncated || ran.cut_short || ran.unreadable || ran.timed_out || ran.cancelled {
 		return Err(`git ${arguments} did not complete`);
 	}
 	if ran.code != 0 {

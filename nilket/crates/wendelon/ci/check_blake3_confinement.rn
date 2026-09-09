@@ -82,6 +82,16 @@ pub fn main(args) {
 	if found.cancelled {
 		return Err("cannot check: interrupted while grep was running");
 	}
+	// After the two causes above, because both of them leave `cut_short` set
+	// and each says more about what happened than this does. What is left for
+	// this to catch is a capture cut short with neither a deadline nor an
+	// interrupt: a descendant outside the process group still holding the
+	// pipe, which record 0023 stops rnx waiting for.
+	if found.cut_short || found.unreadable {
+		return Err(
+			"cannot check: rnx did not read all of grep's output, so a file absent from this inventory may still be a violation",
+		);
+	}
 	// The original does not redirect grep's own complaints, so a missing
 	// source directory reaches the terminal. Neither does this.
 	if found.stderr != "" {
