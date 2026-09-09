@@ -1,0 +1,316 @@
+//! Verify a prefix-rewritten nilket lineage against its frozen source.
+//!
+//! A port of verify_nilket_graft.py, kept beside it until the outputs and the
+//! failure behaviour are shown to match. Git objects are read as bytes,
+//! because a tree holds raw twenty byte object ids and a commit message is
+//! whatever its author wrote.
+//!
+//!     rnx run verify_nilket_graft.rn SOURCE_GIT TARGET_GIT COMMIT_MAP
+
+const NEWLINE = 10;
+const SPACE = 32;
+const NUL = 0;
+const HEX = "0123456789abcdef";
+
+fn fail(message) {
+	host::eprint(message + "\n")?;
+	host::exit(1)
+}
+
+/// `git -C repo ...`, as text, refusing anything that is not text.
+fn git_text(repo, arguments) {
+	let all = ["-C", repo];
+	for argument in arguments {
+		all.push(argument);
+	}
+	let ran = host::process("git", all, 90000)?;
+	if ran.truncated || ran.timed_out || ran.cancelled {
+		return Err(`git ${arguments} did not complete`);
+	}
+	if ran.code != 0 {
+		return Err(`git ${arguments} failed: ${ran.stderr}`);
+	}
+	Ok(ran.stdout)
+}
+
+/// The same, as bytes, for an object that is not text.
+fn git_bytes(repo, arguments) {
+	let all = ["-C", repo];
+	for argument in arguments {
+		all.push(argument);
+	}
+	let ran = host::process_bytes("git", all, 90000)?;
+	if ran.truncated || ran.timed_out || ran.cancelled {
+		return Err(`git ${arguments} did not complete`);
+	}
+	if ran.code != 0 {
+		return Err(`git ${arguments} failed`);
+	}
+	Ok(ran.stdout)
+}
+
+fn slice(raw, from, to) {
+	let out = Bytes::new();
+	let i = from;
+	while i < to {
+		out.push(raw[i]);
+		i += 1;
+	}
+	out
+}
+
+fn index_of(raw, byte, from) {
+	let i = from;
+	while i < raw.len() {
+		if raw[i] == byte {
+			return Some(i);
+		}
+		i += 1;
+	}
+	None
+}
+
+/// Where the blank line separating a commit's headers from its message is.
+fn header_end(raw) {
+	let i = 0;
+	while i + 1 < raw.len() {
+		if raw[i] == NEWLINE && raw[i + 1] == NEWLINE {
+			return Some(i);
+		}
+		i += 1;
+	}
+	None
+}
+
+fn line_starts_with(raw, from, to, text) {
+	let bytes = text.as_bytes();
+	if to - from < bytes.len() {
+		return false;
+	}
+	let i = 0;
+	while i < bytes.len() {
+		if raw[from + i] != bytes[i] {
+			return false;
+		}
+		i += 1;
+	}
+	true
+}
+
+fn hex(raw) {
+	let out = "";
+	let i = 0;
+	while i < raw.len() {
+		let byte = raw[i];
+		out += HEX.get(byte / 16..byte / 16 + 1).unwrap();
+		out += HEX.get(byte % 16..byte % 16 + 1).unwrap();
+		i += 1;
+	}
+	out
+}
+
+/// The tree, the parents, the headers that survive a rewrite, the message,
+/// and whether the commit was signed.
+///
+/// A `gpgsig` header and the continuation lines that belong to it are dropped
+/// rather than compared, because a rewrite invalidates a signature. Every
+/// other continuation line is kept.
+fn parse_commit(raw) {
+	let end = match header_end(raw) {
+		Some(end) => end,
+		None => return Err("a commit object has no message separator"),
+	};
+	let message = slice(raw, end + 2, raw.len());
+	let tree = "";
+	let parents = [];
+	let retained = Bytes::new();
+	let skip_continuation = false;
+	let signed = false;
+	let first = true;
+	let at = 0;
+	while at <= end {
+		let stop = match index_of(raw, NEWLINE, at) {
+			Some(stop) => if stop > end { end } else { stop },
+			None => end,
+		};
+		if first {
+			// `tree <oid>` is always the first header. A commit spells an
+			// object id as forty ASCII characters; only a tree holds the raw
+			// twenty bytes, which is what `hex` is for.
+			tree = String::from_utf8(slice(raw, at + 5, stop))?;
+			first = false;
+		} else if line_starts_with(raw, at, stop, "parent ") {
+			parents.push(String::from_utf8(slice(raw, at + 7, stop))?);
+			skip_continuation = false;
+		} else if raw[at] == SPACE {
+			if !skip_continuation {
+				if retained.len() > 0 {
+					retained.push(NEWLINE);
+				}
+				retained.extend(slice(raw, at, stop));
+			}
+		} else {
+			skip_continuation = line_starts_with(raw, at, stop, "gpgsig ");
+			signed = signed || skip_continuation;
+			if !skip_continuation {
+				if retained.len() > 0 {
+					retained.push(NEWLINE);
+				}
+				retained.extend(slice(raw, at, stop));
+			}
+		}
+		at = stop + 1;
+	}
+	Ok(#{ tree: tree, parents: parents, headers: retained, message: message, signed: signed })
+}
+
+/// A tree holding exactly one entry: `<mode> <name>\0<twenty raw bytes>`.
+fn parse_single_prefixed_tree(raw) {
+	let nul = match index_of(raw, NUL, 0) {
+		Some(nul) => nul,
+		None => return Err("a tree object has no entry"),
+	};
+	let space = match index_of(raw, SPACE, 0) {
+		Some(space) => space,
+		None => return Err("a tree entry has no mode"),
+	};
+	let oid = slice(raw, nul + 1, raw.len());
+	if oid.len() != 20 {
+		return Err("the recorded migration uses SHA-1 object ids");
+	}
+	Ok(#{
+		mode: String::from_utf8(slice(raw, 0, space))?,
+		name: String::from_utf8(slice(raw, space + 1, nul))?,
+		oid: hex(oid),
+	})
+}
+
+/// The non-empty lines of some text. A carriage return before a newline is
+/// left on the line, where the original's `splitlines` removes it; `fields`
+/// is what makes that not matter, because a carriage return is whitespace.
+fn lines(text) {
+	let out = [];
+	for line in text.split("\n") {
+		if line != "" && line != "\r" {
+			out.push(line);
+		}
+	}
+	out
+}
+
+/// The words of a line, split on any whitespace as the original's `split`
+/// with no argument does. A commit map written with tabs, or with carriage
+/// returns at the ends of its lines, says the same thing as one written with
+/// spaces, and the original reads all three.
+fn fields(line) {
+	let out = [];
+	for part in line.split(char::is_whitespace) {
+		if part != "" {
+			out.push(part);
+		}
+	}
+	out
+}
+
+pub fn main(args) {
+	if args.len() != 3 {
+		return fail("usage: verify_nilket_graft.rn SOURCE_GIT TARGET_GIT COMMIT_MAP");
+	}
+	let source = host::absolute(args[0])?;
+	let target = host::absolute(args[1])?;
+	let map_path = host::absolute(args[2])?;
+
+	let map_lines = lines(host::read(map_path)?);
+	if fields(map_lines[0]) != ["old", "new"] {
+		return fail("the commit map has no `old new` header");
+	}
+	let mapping = #{};
+	let order = [];
+	let i = 1;
+	while i < map_lines.len() {
+		let pair = fields(map_lines[i]);
+		if pair.len() != 2 {
+			return fail(`the commit map has a malformed line: ${map_lines[i]}`);
+		}
+		if pair[1] == "0000000000000000000000000000000000000000" {
+			return fail(`the commit map maps ${pair[0]} to nothing`);
+		}
+		mapping[pair[0]] = pair[1];
+		order.push(pair[0]);
+		i += 1;
+	}
+
+	let source_tip = git_text(source, ["rev-parse", "refs/heads/main"])?.trim();
+	if !mapping.contains_key(source_tip) {
+		return fail("commit-map source coverage differs");
+	}
+	let target_tip = mapping[source_tip];
+	let source_commits = lines(git_text(source, ["rev-list", source_tip])?);
+	let target_commits = lines(git_text(target, ["rev-list", target_tip])?);
+	if source_commits.len() != order.len() || target_commits.len() != order.len() {
+		return fail("commit-map source coverage differs");
+	}
+	for old in source_commits {
+		if !mapping.contains_key(old) {
+			return fail("commit-map source coverage differs");
+		}
+	}
+	let expected = [];
+	for old in source_commits {
+		expected.push(mapping[old]);
+	}
+	expected.sort();
+	let seen = [];
+	for new in target_commits {
+		seen.push(new);
+	}
+	seen.sort();
+	if expected != seen {
+		return fail("target coverage differs");
+	}
+
+	let signed_commits = 0;
+	for old in source_commits {
+		let new = mapping[old];
+		let before = parse_commit(git_bytes(source, ["cat-file", "commit", old])?)?;
+		let after = parse_commit(git_bytes(target, ["cat-file", "commit", new])?)?;
+		if before.signed {
+			signed_commits += 1;
+		}
+		if after.signed {
+			return fail(`a rewritten commit is signed: ${new}`);
+		}
+		let mapped_parents = [];
+		for parent in before.parents {
+			if !mapping.contains_key(parent) {
+				return fail(`a parent is missing from the commit map: ${parent}`);
+			}
+			mapped_parents.push(mapping[parent]);
+		}
+		if mapped_parents != after.parents {
+			return fail(`parent topology differs at ${old}`);
+		}
+		if before.headers != after.headers {
+			return fail(`metadata differs at ${old}`);
+		}
+		if before.message != after.message {
+			return fail(`the message differs at ${old}`);
+		}
+		let wrapper = parse_single_prefixed_tree(git_bytes(target, ["cat-file", "tree", after.tree])?)?;
+		if wrapper.mode != "40000" || wrapper.name != "nilket" || wrapper.oid != before.tree {
+			return fail(`the tree is not the source tree under nilket at ${old}`);
+		}
+	}
+
+	println!("verified_commits={}", order.len());
+	println!("source_tip={}", source_tip);
+	println!("rewritten_tip={}", target_tip);
+	println!("metadata_except_invalidated_signatures=exact");
+	println!(
+		"source_signatures_removed_as_invalid_after_rewrite={}",
+		signed_commits,
+	);
+	println!("parent_topology=exact_modulo_commit_map");
+	println!("trees=exact_under_nilket_prefix");
+	Ok(())
+}
