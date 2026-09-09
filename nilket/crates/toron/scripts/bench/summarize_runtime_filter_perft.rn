@@ -37,28 +37,18 @@ fn bytes_cluster_fields() {
 
 // A row is the object of its field names to their unparsed values.
 
-/// Rune has no `join` on a sequence, so the script carries one.
+/// Rune has no `join` method on a sequence, and the fold that looks like one
+/// is wrong: without the index, a leading empty part is mistaken for an empty
+/// accumulator and loses its separator, so `["", "a"]` joins to `a`.
 fn join(parts, separator) {
-	let out = "";
-	let index = 0;
-	while index < parts.len() {
-		if index > 0 {
-			out += separator;
-		}
-		out += parts[index];
-		index += 1;
-	}
-	out
-}
-
-/// Rune has no `contains` on a sequence either.
-fn contains(items, wanted) {
-	for item in items {
-		if item == wanted {
-			return true;
-		}
-	}
-	false
+	parts
+		.iter()
+		.enumerate()
+		.fold("", |joined, part| if part.0 == 0 {
+			part.1
+		} else {
+			joined + separator + part.1
+		})
 }
 
 fn row_text(row, key) {
@@ -194,7 +184,7 @@ fn summarize_group(values, rows, require_digest_equality, floors, failures) {
 	let digests = [];
 	for row in rows {
 		let digest = row_text(row, "digest");
-		if digest != "" && !contains(digests, digest) {
+		if digest != "" && !digests.iter().any(|seen| seen == digest) {
 			digests.push(digest);
 		}
 	}

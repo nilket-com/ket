@@ -1,0 +1,116 @@
+//! Inventory every file that reaches for BLAKE3 directly, and fail if one is
+//! outside the confinement boundary.
+//!
+//! A port of check_blake3_confinement.sh, kept beside it until the outputs
+//! and the failure behaviour are shown to match. Run it from the crate root,
+//! as the original is run:
+//!
+//!     rnx run ci/check_blake3_confinement.rn
+
+/// The files allowed to use BLAKE3 directly, because they are the boundary.
+fn boundary_files() {
+	[
+		"src/hash/blake3.rs",
+		"src/hash/content.rs",
+		"src/hash/identity.rs",
+	]
+}
+
+/// A file outside the boundary that is allowed anyway, and why.
+fn exception_reason(file) {
+	if file == "src/network/ring.rs" {
+		Some("vnode placement hash pending compatibility decision")
+	} else {
+		None
+	}
+}
+
+/// The files `grep` reports, once each, in order. A line that names BLAKE3
+/// through the boundary module is a use of the boundary, not of BLAKE3, so it
+/// does not count; the original drops those lines the same way, before it
+/// reduces them to file names.
+fn offending_files(output) {
+	let files = [];
+	for line in output.split("\n") {
+		if line == "" {
+			continue;
+		}
+		match text::find(line, "hash::blake3::") {
+			Some(_) => continue,
+			None => {}
+		}
+		let file = match text::find(line, ":") {
+			Some(at) => line.get(0..at).unwrap(),
+			None => continue,
+		};
+		if !files.iter().any(|seen| seen == file) {
+			files.push(file);
+		}
+	}
+	files.sort();
+	files
+}
+
+/// How long `grep` is given. The original has no timeout at all; this is
+/// rnx's, and the comparison harness substitutes a short one to drive the
+/// case where it fires.
+const CAPTURE_TIMEOUT_MS = 60000;
+
+pub fn main(args) {
+	let found = host::process(
+		"grep",
+		["-R", "-n", "blake3::", "src"],
+		CAPTURE_TIMEOUT_MS,
+	)?;
+	// An incomplete capture cannot be read as an inventory, because what is
+	// missing from it looks exactly like a clean tree. A violation past the
+	// capture limit would be reported as a pass, which is the one answer this
+	// check must never give by accident.
+	//
+	// These are not grep's exit status. Its ordinary no-match and cannot-look
+	// cases are passed over deliberately, because the original passes over
+	// them too; these three say the output rnx holds is not the output grep
+	// produced.
+	if found.truncated {
+		return Err(
+			"cannot check: grep produced more output than rnx captures, so a file absent from this inventory may still be a violation",
+		);
+	}
+	if found.timed_out {
+		return Err(`cannot check: grep did not finish within ${CAPTURE_TIMEOUT_MS} ms`);
+	}
+	if found.cancelled {
+		return Err("cannot check: interrupted while grep was running");
+	}
+	// The original does not redirect grep's own complaints, so a missing
+	// source directory reaches the terminal. Neither does this.
+	if found.stderr != "" {
+		host::eprint(found.stderr)?;
+	}
+	// grep exits 1 when it matched nothing and 2 when it could not look.
+	// The original inspects neither, and passes in both cases.
+	println!("BLAKE3 confinement inventory");
+	let status = 0;
+	for file in offending_files(found.stdout) {
+		if boundary_files().iter().any(|allowed| allowed == file) {
+			println!("  boundary  {}", file);
+			continue;
+		}
+		match exception_reason(file) {
+			Some(reason) => {
+				println!("  exception {} ({})", file, reason);
+				continue;
+			}
+			None => {}
+		}
+		host::eprint(
+			`unexpected raw BLAKE3 usage outside the confinement boundary: ${file}\n`,
+		)?;
+		status = 1;
+	}
+	if status != 0 {
+		host::exit(status)?;
+	}
+	println!("BLAKE3 confinement check passed");
+	Ok(())
+}
