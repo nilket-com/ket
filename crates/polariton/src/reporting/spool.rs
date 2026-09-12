@@ -42,8 +42,16 @@ fn lock(root: &Path, wait: bool) -> Result<File, String> {
 	if wait {
 		file.lock().map_err(io)?;
 	} else {
-		file.try_lock()
-			.map_err(|_| "reporting queue is owned by another drainer".to_string())?;
+		// Contention is the expected refusal; any other failure to lock is an
+		// I/O problem and must say so, or its cause is lost in the receipt.
+		file.try_lock().map_err(|error| match error {
+			std::fs::TryLockError::WouldBlock => {
+				"reporting queue is owned by another drainer".to_string()
+			}
+			std::fs::TryLockError::Error(error) => {
+				format!("reporting lock could not be taken: {error}")
+			}
+		})?;
 	}
 	Ok(file)
 }
