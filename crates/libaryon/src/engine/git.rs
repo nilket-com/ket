@@ -573,7 +573,7 @@ pub(crate) fn git_step_fetch_action_lease(action: GitStepFetchAction) -> ActionL
 /// `current_dir` before climbing lets `src/new.rs` reach a repository above
 /// `src`; without a current directory such a path cannot be placed at all.
 fn resolve_context_path(path: &Path, current_dir: Option<&Path>) -> Option<PathBuf> {
-	if let Ok(canonical) = path.canonicalize() {
+	if let Ok(canonical) = crate::core::canonicalize(path) {
 		return Some(canonical);
 	}
 	if path.is_absolute() {
@@ -1089,7 +1089,11 @@ mod tests {
 		assert_ne!(path_a, path_b);
 		assert_eq!(
 			path_a,
-			format!("/repo/.baryon-snapshots/{commit_a}/src/main.rs")
+			Path::new("/repo")
+				.join(".baryon-snapshots")
+				.join(&commit_a)
+				.join("src/main.rs")
+				.to_string_lossy()
 		);
 	}
 

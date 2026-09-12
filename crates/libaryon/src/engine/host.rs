@@ -615,16 +615,20 @@ mod tests {
 		mut predicate: impl FnMut(&Viewport) -> bool,
 	) -> Viewport {
 		let deadline = Instant::now() + timeout;
+		let mut last_status: Option<String> = None;
 		loop {
 			let viewport = viewports
 				.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-				.unwrap_or_else(|_| panic!("timed out waiting for {description}"));
+				.unwrap_or_else(|_| {
+					panic!("timed out waiting for {description}; last status={last_status:?}")
+				});
 			if predicate(&viewport) {
 				return viewport;
 			}
+			last_status = viewport.status_message.clone();
 			assert!(
 				Instant::now() < deadline,
-				"timed out waiting for {description}"
+				"timed out waiting for {description}; last status={last_status:?}"
 			);
 		}
 	}
@@ -637,6 +641,7 @@ mod tests {
 		contents.into_bytes()
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0060_saved_engine_checkpoints_an_ordered_prefix_and_restores_it() {
 		let root = temp_path("saved-engine-prefix", "sessions");
@@ -684,6 +689,7 @@ mod tests {
 		let _ = fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0061_coupled_checkpoint_restores_layout_and_orders_panel_event() {
 		use crate::engine::{
@@ -819,6 +825,7 @@ mod tests {
 		let _ = fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0061_application_namespace_is_reserved_only_at_mutation_boundary() {
 		use crate::engine::ApplicationOwnerId;
@@ -866,6 +873,7 @@ mod tests {
 		let _ = fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0061_each_application_witness_census_refuses_independently() {
 		use crate::core::DocumentId;
@@ -967,6 +975,7 @@ mod tests {
 		let _ = fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0061_coupled_publication_faults_never_mix_owners() {
 		use crate::engine::session_checkpoint::CheckpointFault;
@@ -1077,6 +1086,7 @@ mod tests {
 		}
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0061_fifo_lifecycle_races_refuse_stale_application_snapshots() {
 		use crate::engine::{
@@ -1198,6 +1208,7 @@ mod tests {
 		let _ = fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0061_projected_census_makes_collected_group_refusal_actionable() {
 		use crate::engine::{
@@ -1317,6 +1328,7 @@ mod tests {
 		let _ = fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0061_registered_application_owner_is_bounded_before_startup() {
 		use crate::engine::{APPLICATION_OWNER_BUDGET, ApplicationOwnerId};
@@ -1347,6 +1359,7 @@ mod tests {
 		let _ = fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0060_saved_engine_rejects_initial_file_before_start_and_releases_lock() {
 		let root = temp_path("saved-engine-initial-file", "sessions");
@@ -1370,6 +1383,7 @@ mod tests {
 		let _ = fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0060_saved_engine_refuses_incomplete_and_future_document_images_pre_start() {
 		use crate::engine::session_checkpoint::{DOCUMENT_OWNER_ID, DOCUMENT_OWNER_SCHEMA_VERSION};
@@ -1415,6 +1429,7 @@ mod tests {
 		let _ = fs::remove_dir_all(future_root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0060_checkpoint_faults_preserve_atomic_publication_boundary() {
 		use crate::engine::session_checkpoint::CheckpointFault;
@@ -3970,6 +3985,8 @@ pub fn main(editor) {
 		let _ = fs::remove_file(init);
 	}
 
+	// Spawns /bin/echo.
+	#[cfg(unix)]
 	#[test]
 	fn rune_job_callback_runs_through_the_real_loop() {
 		let init = temp_path("rune-job", "rn");

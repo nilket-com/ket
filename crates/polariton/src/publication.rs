@@ -2564,23 +2564,27 @@ mod tests {
 			"a tampered file fails verification"
 		);
 
-		// A symlinked listed file refuses at open.
-		let linked = temp_root("symlink");
-		package.write(&linked).expect("second write");
-		let target = linked.join(SHELL_FILE);
-		std::fs::remove_file(&target).expect("remove");
-		std::os::unix::fs::symlink(root.join(MANIFEST_FILE), &target).expect("symlink");
-		assert!(
-			ServedPackage::open(&linked).is_err(),
-			"symlinks never escape the root"
-		);
+		// A symlinked listed file refuses at open. Creating a symlink on Windows
+		// needs a privilege an ordinary test run does not have.
+		#[cfg(unix)]
+		{
+			let linked = temp_root("symlink");
+			package.write(&linked).expect("second write");
+			let target = linked.join(SHELL_FILE);
+			std::fs::remove_file(&target).expect("remove");
+			std::os::unix::fs::symlink(root.join(MANIFEST_FILE), &target).expect("symlink");
+			assert!(
+				ServedPackage::open(&linked).is_err(),
+				"symlinks never escape the root"
+			);
+			let _ = std::fs::remove_dir_all(&linked);
+		}
 
 		assert!(
 			serve(root.clone(), "0.0.0.0:7743".parse().expect("addr")).is_err(),
 			"non-loopback binds refuse"
 		);
 		let _ = std::fs::remove_dir_all(&root);
-		let _ = std::fs::remove_dir_all(&linked);
 	}
 }
 

@@ -1,5 +1,35 @@
 # Polariton UAT exhibits
 
+For native Windows or any build without Toron, open
+[`native_plot_showcase.md`](native_plot_showcase.md) and run its SQL and Rune
+cells in order. It uses the built-in SQLite scratch connection and produces a
+scatter/line overlay and a second scatter plot without any seed database.
+The `workspace.table(...)` relation showcases below require the `toron` feature;
+their API is separate from `workspace.cell(...)` and `workspace.result(...)`.
+
+Capture the native notebook through the production application and GPU plot
+layers from PowerShell at the repository root:
+
+```powershell
+$env:POLARITON_RENDER_SMOKE_DIR = "$PWD/target/native-plot-evidence"
+cargo test --locked -p polariton --no-default-features --features product-0057-render-evidence --target x86_64-pc-windows-msvc --test product_0057_render_evidence
+Remove-Item Env:POLARITON_RENDER_SMOKE_DIR
+```
+
+The output directory contains cell execution receipts, GPU adapter information,
+and PNG/SVG pairs at 800×500 and 400×300 for each plot. Set
+`POLARITON_RENDER_NOTEBOOK` to another self-contained notebook to capture it;
+each Rune cell must produce one plot. This mode checks cell execution, pane
+production, and colored marks against a capture with the data layer omitted;
+inspect the PNGs for layout and mark correctness.
+The existing calibrated Linux renderer assertions still run when the smoke
+directory variable is absent.
+
+The native smoke passed on 2026-09-11 using Intel Graphics with Vulkan on
+Windows: both plots produced PNG/SVG pairs at both sizes. The small captures
+expose tick-label crowding from the current fixed eight-interval defaults;
+passing this smoke is not a claim that compact plot layout is finished.
+
 `testNN.rn` files are historical regression probes, named by birth order and
 cited by product records as provenance. Do not rename them merely to tidy the
 directory: a record may honestly cite a probe that was later deleted, but a

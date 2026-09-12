@@ -11225,7 +11225,10 @@ mod tests {
 		let path = std::env::temp_dir().join(format!(
 			"polariton-initial-file-{}-{}.rs",
 			std::process::id(),
-			std::thread::current().name().unwrap_or("test")
+			std::thread::current()
+				.name()
+				.unwrap_or("test")
+				.replace("::", "-")
 		));
 		let source = "pub fn opened_from_cli() -> bool { true }\n";
 		std::fs::write(&path, source).expect("write initial file fixture");
@@ -11263,7 +11266,10 @@ mod tests {
 		let path = std::env::temp_dir().join(format!(
 			"polariton-large-projection-{}-{}.txt",
 			std::process::id(),
-			std::thread::current().name().unwrap_or("test")
+			std::thread::current()
+				.name()
+				.unwrap_or("test")
+				.replace("::", "-")
 		));
 		let source = (0..500)
 			.map(|line| format!("line{line:03}\n"))

@@ -662,7 +662,8 @@ mod tests {
 
 	#[test]
 	fn test_render_bridge_protocol() {
-		let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+		// A unit test has no terminal to query; stdio queries block without one.
+		let picker = Picker::halfblocks();
 
 		let request = BridgeRequest {
 			left_pane_id: PaneId::new(1),

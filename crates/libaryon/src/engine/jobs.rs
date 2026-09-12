@@ -1595,6 +1595,12 @@ mod tests {
 		assert_eq!(runtime.charged_buffer_bytes(), 0);
 	}
 
+	/// ASCII whose `os_len` is exactly `bytes`: one byte per char on Unix, two on
+	/// Windows, so a cap stated in bytes is hit by fewer characters there.
+	fn ascii_of_os_len(bytes: usize) -> String {
+		"x".repeat(bytes / os_len_from_utf8("x"))
+	}
+
 	#[test]
 	fn admission_caps_accept_exact_boundaries_and_reject_the_next_value() {
 		let owner = RegistryOwnerId::new(1);
@@ -1605,21 +1611,21 @@ mod tests {
 		job.args.push(OsString::new());
 		assert_eq!(validate_spec(&job), Err(JobSpawnError::TooManyArguments));
 
-		job.args = vec![OsString::from("x".repeat(MAX_JOB_ARG_BYTES))];
+		job.args = vec![OsString::from(ascii_of_os_len(MAX_JOB_ARG_BYTES))];
 		assert_eq!(validate_spec(&job), Ok(()));
-		job.args = vec![OsString::from("x".repeat(MAX_JOB_ARG_BYTES + 1))];
+		job.args = vec![OsString::from(ascii_of_os_len(MAX_JOB_ARG_BYTES) + "x")];
 		assert_eq!(validate_spec(&job), Err(JobSpawnError::ArgumentsTooLarge));
 
 		job.args.clear();
-		job.program = PathBuf::from("x".repeat(MAX_JOB_PROGRAM_BYTES));
+		job.program = PathBuf::from(ascii_of_os_len(MAX_JOB_PROGRAM_BYTES));
 		assert_eq!(validate_spec(&job), Ok(()));
-		job.program = PathBuf::from("x".repeat(MAX_JOB_PROGRAM_BYTES + 1));
+		job.program = PathBuf::from(ascii_of_os_len(MAX_JOB_PROGRAM_BYTES) + "x");
 		assert_eq!(validate_spec(&job), Err(JobSpawnError::ProgramTooLarge));
 
 		job.program = PathBuf::from("/bin/true");
-		job.cwd = Some(PathBuf::from("x".repeat(MAX_JOB_CWD_BYTES)));
+		job.cwd = Some(PathBuf::from(ascii_of_os_len(MAX_JOB_CWD_BYTES)));
 		assert_eq!(validate_spec(&job), Ok(()));
-		job.cwd = Some(PathBuf::from("x".repeat(MAX_JOB_CWD_BYTES + 1)));
+		job.cwd = Some(PathBuf::from(ascii_of_os_len(MAX_JOB_CWD_BYTES) + "x"));
 		assert_eq!(
 			validate_spec(&job),
 			Err(JobSpawnError::WorkingDirectoryTooLarge)
@@ -1776,6 +1782,8 @@ mod tests {
 		assert!(writes.get() < 10_000, "formatting must stop at the cap");
 	}
 
+	// Spawns /bin/sh fixtures; the portable supervisor has no Windows fixture yet.
+	#[cfg(unix)]
 	#[test]
 	fn subprocess_round_trips_binary_stdin_and_releases_all_buffer_charge() {
 		let (_, _, internal, requests) = super::super::request::channel();
@@ -1799,6 +1807,8 @@ mod tests {
 		assert_eq!(runtime.charged_buffer_bytes(), 0);
 	}
 
+	// Spawns /bin/sh fixtures; the portable supervisor has no Windows fixture yet.
+	#[cfg(unix)]
 	#[test]
 	fn completion_preserves_exit_status_and_separate_byte_streams() {
 		let (_, _, internal, requests) = super::super::request::channel();
@@ -1870,6 +1880,8 @@ mod tests {
 		);
 	}
 
+	// Spawns /bin/sh fixtures; the portable supervisor has no Windows fixture yet.
+	#[cfg(unix)]
 	#[test]
 	fn timeout_is_selected_when_its_report_reaches_the_engine_first() {
 		let (_, _, internal, requests) = super::super::request::channel();
@@ -1906,6 +1918,8 @@ mod tests {
 		assert!(deliver(&mut runtime).completions.is_empty());
 	}
 
+	// Spawns /bin/sh fixtures; the portable supervisor has no Windows fixture yet.
+	#[cfg(unix)]
 	#[test]
 	fn running_slots_bound_children_and_queue_the_remainder_fifo() {
 		let (_, _, internal, requests) = super::super::request::channel();
@@ -2130,6 +2144,8 @@ mod tests {
 		let _ = std::fs::remove_file(pidfile);
 	}
 
+	// Spawns /bin/sh fixtures; the portable supervisor has no Windows fixture yet.
+	#[cfg(unix)]
 	#[test]
 	fn output_before_stdin_does_not_deadlock_the_supervisor() {
 		let (_, _, internal, requests) = super::super::request::channel();
@@ -2155,6 +2171,8 @@ mod tests {
 		assert_eq!(&stdout[2 * 1024 * 1024..], stdin);
 	}
 
+	// Spawns /bin/sh fixtures; the portable supervisor has no Windows fixture yet.
+	#[cfg(unix)]
 	#[test]
 	fn output_over_the_stream_cap_is_drained_but_marked_truncated() {
 		let (_, _, internal, requests) = super::super::request::channel();

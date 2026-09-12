@@ -367,6 +367,84 @@ impl<Mode: sealed::AccessMode> SavedSession<Mode> {
 	}
 }
 
+/// Snapshot mutations are in-memory on every platform. Only `commit` and
+/// `cleanup_unreferenced` reach the platform-specific session directory.
+impl SavedSession<Writable> {
+	pub fn mint_document(
+		&mut self,
+		path: Option<PathBuf>,
+	) -> Result<DocumentId, SessionStoreError> {
+		if self.snapshot.next_document_id == u64::MAX {
+			return Err(SessionStoreError::DocumentIdExhausted);
+		}
+		let id = DocumentId::new(self.snapshot.next_document_id)?;
+		self.snapshot.next_document_id += 1;
+		self.snapshot
+			.documents
+			.insert(id, DocumentIdentity { id, path });
+		Ok(id)
+	}
+
+	pub fn update_document_path(
+		&mut self,
+		id: DocumentId,
+		path: Option<PathBuf>,
+	) -> Result<(), SessionStoreError> {
+		let document = self
+			.snapshot
+			.documents
+			.get_mut(&id)
+			.ok_or(SessionStoreError::UnknownDocument(id))?;
+		document.path = path;
+		Ok(())
+	}
+
+	pub fn remove_document(&mut self, id: DocumentId) -> Result<(), SessionStoreError> {
+		self.snapshot
+			.documents
+			.remove(&id)
+			.map(|_| ())
+			.ok_or(SessionStoreError::UnknownDocument(id))
+	}
+
+	pub fn set_owner_payload(&mut self, owner: OwnerId, schema_version: u32, bytes: Vec<u8>) {
+		self.owners.insert(
+			owner,
+			OwnerPayload {
+				schema_version,
+				bytes,
+			},
+		);
+	}
+}
+
+/// No saved session can be opened here, so these are unreachable; they exist so
+/// the writable capability surface is the same on every platform.
+#[cfg(not(unix))]
+impl SavedSession<Writable> {
+	pub fn commit(&mut self) -> Result<(), SessionStoreError> {
+		Err(SessionStoreError::UnsupportedPlatform)
+	}
+
+	pub fn cleanup_unreferenced(&mut self) -> Result<(), SessionStoreError> {
+		Err(SessionStoreError::UnsupportedPlatform)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn commit_before_current_failure_for_test(
+		&mut self,
+	) -> Result<(), SessionStoreError> {
+		Err(SessionStoreError::UnsupportedPlatform)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn commit_after_current_failure_for_test(
+		&mut self,
+	) -> Result<(), SessionStoreError> {
+		Err(SessionStoreError::UnsupportedPlatform)
+	}
+}
+
 /// Durable-session refusal. Corruption never falls back to a guessed generation.
 #[derive(Debug)]
 pub enum SessionStoreError {
@@ -769,53 +847,6 @@ mod unix {
 	}
 
 	impl SavedSession<Writable> {
-		pub fn mint_document(
-			&mut self,
-			path: Option<PathBuf>,
-		) -> Result<DocumentId, SessionStoreError> {
-			if self.snapshot.next_document_id == u64::MAX {
-				return Err(SessionStoreError::DocumentIdExhausted);
-			}
-			let id = DocumentId::new(self.snapshot.next_document_id)?;
-			self.snapshot.next_document_id += 1;
-			self.snapshot
-				.documents
-				.insert(id, DocumentIdentity { id, path });
-			Ok(id)
-		}
-
-		pub fn update_document_path(
-			&mut self,
-			id: DocumentId,
-			path: Option<PathBuf>,
-		) -> Result<(), SessionStoreError> {
-			let document = self
-				.snapshot
-				.documents
-				.get_mut(&id)
-				.ok_or(SessionStoreError::UnknownDocument(id))?;
-			document.path = path;
-			Ok(())
-		}
-
-		pub fn remove_document(&mut self, id: DocumentId) -> Result<(), SessionStoreError> {
-			self.snapshot
-				.documents
-				.remove(&id)
-				.map(|_| ())
-				.ok_or(SessionStoreError::UnknownDocument(id))
-		}
-
-		pub fn set_owner_payload(&mut self, owner: OwnerId, schema_version: u32, bytes: Vec<u8>) {
-			self.owners.insert(
-				owner,
-				OwnerPayload {
-					schema_version,
-					bytes,
-				},
-			);
-		}
-
 		pub fn commit(&mut self) -> Result<(), SessionStoreError> {
 			self.commit_with_fault(CommitFault::None)
 		}

@@ -1,5 +1,9 @@
 # Local CI
 
+Native Windows builds use [`scripts/build-windows.ps1`](../scripts/build-windows.ps1).
+See the [Windows build guide](../docs/windows.md) for prerequisites, optional
+native tests, and the initial Polariton build without local Toron integration.
+
 The repository contains two independent Cargo workspaces after PRODUCT-0001.
 The product dispatcher preserves that isolation:
 

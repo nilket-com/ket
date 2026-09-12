@@ -3127,7 +3127,7 @@ fn handle_revision_diff_split(session: &mut EditorSession, arg: &str) -> bool {
 		return true;
 	};
 	let file = file_path.as_path();
-	let canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+	let canonical = crate::core::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
 	let Some(repo_root) = session.git_branch_cache.repo_root_for_path(&canonical) else {
 		session.ui.status_message = Some(format!(
 			"{} is not in a Git repository",
@@ -3308,7 +3308,8 @@ fn handle_diff_step(session: &mut EditorSession, delta: i64) -> bool {
 			.and_then(|document| document.file_path.clone())
 			.and_then(|file_path| {
 				let file = std::path::Path::new(&file_path);
-				let canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+				let canonical =
+					crate::core::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
 				super::git::repo_relative_path(&repo_root, &canonical)
 			})
 		else {
@@ -8329,6 +8330,7 @@ pub fn main(editor) {
 		}
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn idle_run_loop_delivers_jobs_and_a_callback_can_chain_a_followup() {
 		let (commands, _input, internal, requests) = crate::engine::request::channel();

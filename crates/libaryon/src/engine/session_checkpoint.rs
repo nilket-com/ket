@@ -1050,6 +1050,7 @@ mod tests {
 		assert!(decode_document_owner([], Some((2, b"opaque")), 0).is_err());
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0060_capture_publishes_exact_bytes_and_refuses_atomically() {
 		let registry = crate::ecs::UastRegistry::new(64);
@@ -1106,6 +1107,7 @@ mod tests {
 		let _ = std::fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0060_checkpoint_persists_only_positive_document_candidates() {
 		use crate::engine::session::{BufferContent, SnapshotProvenance, TextBuffer};
@@ -1233,6 +1235,7 @@ mod tests {
 		let _ = std::fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0060_restores_exact_dirty_bytes_and_id_order_without_undo_history() {
 		let root = temp_root("document-restore-order");
@@ -1298,6 +1301,7 @@ mod tests {
 		let _ = std::fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0060_file_restore_matrix_reports_every_divergence() {
 		let root = temp_root("document-restore-matrix");
@@ -1388,6 +1392,7 @@ mod tests {
 		let _ = std::fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0060_restore_refuses_a_clean_file_that_grew_past_the_budget() {
 		let root = temp_root("document-restore-budget");
@@ -1421,6 +1426,7 @@ mod tests {
 		let _ = std::fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0060_language_selection_provenance_survives_unavailable_providers() {
 		let root = temp_root("document-language-restore");

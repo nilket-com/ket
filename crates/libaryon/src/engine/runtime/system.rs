@@ -4152,6 +4152,8 @@ mod tests {
 		handle.join().expect("join engine");
 	}
 
+	// Windows file names cannot contain a newline at all.
+	#[cfg(unix)]
 	#[test]
 	fn revision_diff_refuses_paths_containing_newlines() {
 		let dir = temp_test_path("revision-diff-lf-path");

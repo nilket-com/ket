@@ -20,6 +20,9 @@ scripts/cargo-ctrl
 For the resource-isolated local test gate and the SSH-backed Bigfoot worker, see
 [`ci/README.md`](ci/README.md).
 
+For native Windows build commands and current validation status, see
+[`docs/windows.md`](docs/windows.md).
+
 ## Direction
 
 `libaryon` is intentionally frontend-agnostic. Polariton consumes it as a local workspace dependency:

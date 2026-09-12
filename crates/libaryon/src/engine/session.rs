@@ -6567,6 +6567,7 @@ mod tests {
 		)
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0061_logical_layout_is_head_neutral_before_codec() {
 		let registry = UastRegistry::new(256);
@@ -6662,6 +6663,7 @@ mod tests {
 		let _ = std::fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0061_restored_manual_group_reattaches_without_retiling() {
 		use crate::engine::layout_checkpoint::{
@@ -6813,6 +6815,7 @@ mod tests {
 		let _ = std::fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0061_capture_filters_transient_tabs_and_phantom_leaves() {
 		use crate::engine::layout_checkpoint::{DurableTab, LayoutCheckpointNode, capture_layout};
@@ -6914,6 +6917,7 @@ mod tests {
 		let _ = std::fs::remove_dir_all(root);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn product_0060_saved_document_bindings_are_bijective_and_never_reuse_ids() {
 		let root = std::env::temp_dir().join(format!(

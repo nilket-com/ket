@@ -2023,11 +2023,139 @@ fn assert_table_fit(capture: &Capture, geometry: &Product0057TableEvidenceGeomet
 }
 
 fn main() {
+	if let Some(directory) = std::env::var_os("POLARITON_RENDER_SMOKE_DIR") {
+		portable_notebook_render_smoke(std::path::Path::new(&directory));
+		return;
+	}
 	tokio::runtime::Builder::new_multi_thread()
 		.enable_all()
 		.build()
 		.expect("PRODUCT-0057 evidence runtime")
 		.block_on(product_0057_renderer_oracle_licenses_are_discriminating());
+}
+
+/// Exercise SQL -> Rune -> projected plot panes -> the production GPU layers.
+/// This is a portable smoke capture, separate from the designated Linux
+/// adapter's calibrated pixel assertions below.
+fn portable_notebook_render_smoke(directory: &std::path::Path) {
+	use driver::{CellRef, Command, Outcome};
+	use std::time::Duration;
+
+	std::fs::create_dir_all(directory).expect("create render smoke directory");
+	let source = std::env::var_os("POLARITON_RENDER_NOTEBOOK")
+		.map(std::path::PathBuf::from)
+		.unwrap_or_else(|| {
+			std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+				.join("../../uat/native_plot_showcase.md")
+		});
+	let mut application = gui::HeadlessApplication::open_target(
+		gui::StartupTarget::Ephemeral {
+			initial_file: Some(source.to_str().expect("UTF-8 notebook path").to_owned()),
+		},
+		configuration::StartupData::default(),
+	)
+	.expect("open native plotting notebook");
+	application
+		.run_source(Duration::from_secs(30))
+		.expect("load notebook");
+	let described = application.apply_command(&Command::DescribeNotebook { buffer: None });
+	let notebook = described.notebook.expect("describe notebook cells");
+	let mut receipts = Vec::new();
+	let mut exports = Vec::new();
+	for cell in &notebook.cells {
+		let receipt = application.apply_command(&Command::RunCell {
+			target: CellRef {
+				buffer: notebook.buffer.clone(),
+				generation: notebook.generation.clone(),
+				cell: cell.cell,
+			},
+		});
+		assert_eq!(receipt.outcome, Outcome::Applied, "{receipt:?}");
+		receipts.push(receipt);
+		if cell.language == "rune" {
+			application
+				.settle_quiet(Duration::from_secs(30), |_| true)
+				.expect("Rune cell projects its plot");
+			// Pane output is shared by cells in a notebook. Capture the current
+			// plot before the next cell replaces it.
+			let current = application.exports_with_identity();
+			assert_eq!(current.len(), 1, "each cell must project one plot pane");
+			exports.extend(current);
+		}
+	}
+	assert!(!exports.is_empty(), "notebook must produce plots");
+	assert_eq!(
+		exports.len(),
+		notebook
+			.cells
+			.iter()
+			.filter(|cell| cell.language == "rune")
+			.count()
+	);
+	std::fs::write(
+		directory.join("cells.json"),
+		serde_json::to_vec_pretty(&receipts).expect("encode cell receipts"),
+	)
+	.expect("write cell receipts");
+	drop(application);
+
+	tokio::runtime::Builder::new_multi_thread()
+		.enable_all()
+		.build()
+		.expect("render smoke runtime")
+		.block_on(async {
+			let gpu = Gpu::acquire().await;
+			let mut renderer = gpu.renderer(Some(Antialiasing::MSAAx4)).await;
+			let adapter = format!("{:#?}", gpu.info);
+			std::fs::write(directory.join("adapter.txt"), &adapter)
+				.expect("write adapter identity");
+			println!("PORTABLE_RENDER_SMOKE {adapter}");
+			for (index, (_, _, export)) in exports.iter().enumerate() {
+				let widget = publication::widget_for(export, &export.settings_model);
+				for size in [Size::new(800, 500), Size::new(400, 300)] {
+					let bounds =
+						Rectangle::with_size(Size::new(size.width as f32, size.height as f32));
+					let capture = render_plot_and_overlay(
+						&mut renderer,
+						size,
+						|backend| widget.render_plot_layer(backend, bounds),
+						|backend| widget.render_overlay_layer(backend, bounds),
+					);
+					let axes_only = render_plot_and_overlay(
+						&mut renderer,
+						size,
+						|_| {},
+						|backend| widget.render_overlay_layer(backend, bounds),
+					);
+					let colored_pixels = |image: &Capture| {
+						image
+							.rgba
+							.chunks_exact(4)
+							.filter(|pixel| {
+								let channels = &pixel[..3];
+								channels.iter().max().unwrap() - channels.iter().min().unwrap() > 40
+							})
+							.count()
+					};
+					assert!(
+						colored_pixels(&capture) > colored_pixels(&axes_only) + 16,
+						"colored data marks must survive the GPU path; axes alone do not pass"
+					);
+					assert!(
+						capture.luminous_pixels(bounds) > 100,
+						"plot must contain visible ink"
+					);
+					let name = format!("plot-{}-{}x{}", index + 1, size.width, size.height);
+					write_product_0068_png(&capture, &directory.join(format!("{name}.png")));
+					std::fs::write(
+						directory.join(format!("{name}.svg")),
+						plot::export::render_svg(&widget, bounds).svg,
+					)
+					.expect("write vector comparison");
+					println!("PORTABLE_RENDER_SMOKE captured {name}");
+				}
+			}
+		});
 }
 
 async fn product_0057_renderer_oracle_licenses_are_discriminating() {
@@ -2942,8 +3070,3 @@ fn product_0159_mark_batch(renderer: &mut iced::Renderer) {
 		"PRODUCT-0159 gate 3 control: the union does not"
 	);
 }
-
-#[path = "../src/first_run.rs"]
-mod first_run;
-#[path = "../src/reporting/mod.rs"]
-mod reporting;

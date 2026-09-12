@@ -164,10 +164,27 @@ pub fn execute(source: &str, capabilities: RuneCapabilities) -> Result<RuneExecu
 	sources
 		.insert(Source::new("polariton.rn", source).map_err(|error| error.to_string())?)
 		.map_err(|error| error.to_string())?;
+	let mut diagnostics = rune::Diagnostics::new();
 	let unit = rune::prepare(&mut sources)
 		.with_context(&context)
+		.with_diagnostics(&mut diagnostics)
 		.build()
-		.map_err(|error| format!("Rune compile error: {error}"))?;
+		.map_err(|error| {
+			let details = diagnostics
+				.diagnostics()
+				.iter()
+				.filter_map(|diagnostic| match diagnostic {
+					rune::diagnostics::Diagnostic::Fatal(error) => Some(error.to_string()),
+					_ => None,
+				})
+				.take(8)
+				.collect::<Vec<_>>();
+			if details.is_empty() {
+				format!("Rune compile error: {error}")
+			} else {
+				format!("Rune compile error: {}", details.join("\n"))
+			}
+		})?;
 	let mut vm = Vm::new(runtime, Arc::new(unit));
 	let result = vm
 		.call(["main"], (workspace, viz))
@@ -473,6 +490,11 @@ mod tests {
 
 	static NEXT_EXPORT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
+	/// The path as a Rune string literal body: Windows separators are escapes.
+	fn rune_literal(path: &std::path::Path) -> String {
+		path.display().to_string().replace('\\', "\\\\")
+	}
+
 	fn export_path(label: &str) -> std::path::PathBuf {
 		std::env::temp_dir().join(format!(
 			"polariton-product-0136-{label}-{}-{}.csv",
@@ -523,6 +545,14 @@ mod tests {
 		let execution =
 			execute_body("let _x = 1;", RuneCapabilities::default()).expect("unit body executes");
 		assert_eq!(execution.display, None);
+	}
+
+	#[test]
+	fn compile_failure_reports_the_unresolved_plot_function() {
+		let error = execute_body("missing_plot_function();", RuneCapabilities::default())
+			.expect_err("unknown plot function must fail compilation");
+		assert!(error.contains("missing_plot_function"), "{error}");
+		assert!(!error.contains("see diagnostics for details"), "{error}");
 	}
 
 	#[test]
@@ -674,7 +704,7 @@ viz.plot(workspace.result("test")?).scatter().show()?;
 		let path = export_path("cell");
 		let source = format!(
 			r#"workspace.cell("trips")?.export_csv("{}")?;"#,
-			path.display()
+			rune_literal(&path)
 		);
 		let execution = execute_body(
 			&source,
@@ -700,7 +730,7 @@ viz.plot(workspace.result("test")?).scatter().show()?;
 		let path = export_path("result");
 		let source = format!(
 			r#"workspace.result("sales")?.export_csv("{}")?;"#,
-			path.display()
+			rune_literal(&path)
 		);
 		let execution = execute_body(&source, results("sales", df!("amount" => [3_i32]).unwrap()))
 			.expect("published result exports");
@@ -718,7 +748,7 @@ viz.plot(workspace.result("test")?).scatter().show()?;
 		std::fs::write(&path, "keep me").expect("seed existing file");
 		let source = format!(
 			r#"workspace.cell("trips")?.export_csv("{}")?;"#,
-			path.display()
+			rune_literal(&path)
 		);
 		let error = execute_body(&source, cells("trips", df!("x" => [1_i32]).unwrap()))
 			.expect_err("existing file refuses");
@@ -738,7 +768,7 @@ viz.plot(workspace.result("test")?).scatter().show()?;
 		let path = parent.join("sales.csv");
 		let source = format!(
 			r#"workspace.cell("trips")?.export_csv("{}")?;"#,
-			path.display()
+			rune_literal(&path)
 		);
 		let error = execute_body(&source, cells("trips", df!("x" => [1_i32]).unwrap()))
 			.expect_err("missing parent directory fails visibly");
@@ -754,7 +784,7 @@ viz.plot(workspace.result("test")?).scatter().show()?;
 		let path = export_path("missing");
 		let source = format!(
 			r#"workspace.result("absent")?.export_csv("{}")?;"#,
-			path.display()
+			rune_literal(&path)
 		);
 		let error = execute_body(&source, RuneCapabilities::default())
 			.expect_err("unknown result is rejected before export");

@@ -112,8 +112,6 @@ fn replace_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn replace_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
-	use std::os::windows::ffi::OsStrExt;
-
 	const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
 	const MOVEFILE_WRITE_THROUGH: u32 = 0x00000008;
 
@@ -134,15 +132,25 @@ fn replace_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
 			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
 		)
 	};
-	if ok == 0 {
-		Err(std::io::Error::last_os_error())
-	} else {
-		Ok(())
+	if ok != 0 {
+		return Ok(());
 	}
+	let error = std::io::Error::last_os_error();
+	// `MoveFileExW` refuses to replace a target that any handle still has open,
+	// which is exactly the editor's own case: a document open in a buffer keeps
+	// its backing file open. `std::fs::rename` retries `ERROR_ACCESS_DENIED`
+	// with a POSIX-semantics rename that replaces an open target, at the cost
+	// of the write-through flag.
+	const ERROR_ACCESS_DENIED: i32 = 5;
+	if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+		return fs::rename(temp_path, path);
+	}
+	Err(error)
 }
 
 #[cfg(windows)]
 fn path_to_wide(path: &Path) -> Vec<u16> {
+	use std::os::windows::ffi::OsStrExt;
 	path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
@@ -157,4 +165,26 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn replaces_a_target_that_is_still_open_for_reading() {
+		let path = std::env::temp_dir().join(format!(
+			"baryon-atomic-open-target-{}.txt",
+			std::process::id()
+		));
+		fs::write(&path, b"before").expect("write original");
+		// The editor keeps a document's backing file open; the durable settings
+		// write must still be able to replace it underneath that handle.
+		let held_open = fs::File::open(&path).expect("hold the target open");
+		atomic_write(&path, b"after", AtomicWriteOptions::config()).expect("replace open target");
+		drop(held_open);
+
+		assert_eq!(fs::read(&path).expect("read replacement"), b"after");
+		let _ = fs::remove_file(&path);
+	}
 }

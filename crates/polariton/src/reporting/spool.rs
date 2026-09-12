@@ -47,8 +47,15 @@ fn lock(root: &Path, wait: bool) -> Result<File, String> {
 	}
 	Ok(file)
 }
+#[cfg(unix)]
 fn sync_dir(root: &Path) -> Result<(), String> {
 	File::open(root).and_then(|f| f.sync_all()).map_err(io)
+}
+/// Windows has no directory fsync: opening a directory needs backup semantics
+/// and flushing it needs write access, so the entry is left to the volume.
+#[cfg(not(unix))]
+fn sync_dir(_root: &Path) -> Result<(), String> {
+	Ok(())
 }
 fn publish<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
 	let temporary = path.with_extension(format!("tmp-{}", id()));
@@ -80,7 +87,53 @@ fn token(pid: u32) -> Option<String> {
 			.nth(19)
 			.map(str::to_owned);
 	}
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(windows)]
+	{
+		// The creation time from `GetProcessTimes` plays the role of the
+		// `/proc` start tick: a reused pid never reports the same one, and a
+		// process that is gone cannot be opened at all.
+		use std::ffi::c_void;
+		#[repr(C)]
+		#[derive(Clone, Copy, Default)]
+		struct FileTime {
+			low: u32,
+			high: u32,
+		}
+		unsafe extern "system" {
+			fn OpenProcess(desired_access: u32, inherit_handle: i32, pid: u32) -> *mut c_void;
+			fn GetProcessTimes(
+				process: *mut c_void,
+				creation: *mut FileTime,
+				exit: *mut FileTime,
+				kernel: *mut FileTime,
+				user: *mut FileTime,
+			) -> i32;
+			fn GetExitCodeProcess(process: *mut c_void, exit_code: *mut u32) -> i32;
+			fn CloseHandle(handle: *mut c_void) -> i32;
+		}
+		const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+		const STILL_ACTIVE: u32 = 259;
+		let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+		if process.is_null() {
+			return None;
+		}
+		// A terminated process stays openable while anyone holds a handle to
+		// it, so "openable" alone does not mean the writer is alive.
+		let mut exit_code = 0_u32;
+		let running = unsafe { GetExitCodeProcess(process, &mut exit_code) } != 0
+			&& exit_code == STILL_ACTIVE;
+		let mut times = [FileTime::default(); 4];
+		let [creation, exit, kernel, user] = &mut times;
+		let ok = running && unsafe { GetProcessTimes(process, creation, exit, kernel, user) } != 0;
+		unsafe { CloseHandle(process) };
+		ok.then(|| {
+			format!(
+				"{:016x}",
+				(u64::from(creation.high) << 32) | u64::from(creation.low)
+			)
+		})
+	}
+	#[cfg(not(any(target_os = "linux", windows)))]
 	{
 		let output = std::process::Command::new("ps")
 			.args(["-p", &pid.to_string(), "-o", "lstart="])

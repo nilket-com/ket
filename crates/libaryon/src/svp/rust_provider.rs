@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use triomphe::Arc as TriArc;
@@ -248,7 +248,7 @@ fn single_file_vfs_path(file_path: &str) -> VfsPath {
 }
 
 fn canonical_path(file_path: &str) -> Option<AbsPathBuf> {
-	let canonical = PathBuf::from(file_path).canonicalize().ok()?;
+	let canonical = crate::core::canonicalize(Path::new(file_path)).ok()?;
 	let utf8 = Utf8PathBuf::try_from(canonical).ok()?;
 	Some(AbsPathBuf::assert(utf8))
 }
@@ -687,6 +687,18 @@ fn workspace_source_roots(vfs: &Vfs, roots: &[PackageRoot]) -> Vec<SourceRoot> {
 		.collect()
 }
 
+/// A fixture-only absolute path that never touches the filesystem. Windows
+/// absolute paths need a drive prefix, so the Unix-style literal gets one.
+#[cfg(test)]
+fn fake_absolute(path: &str) -> AbsPathBuf {
+	let path = if cfg!(windows) {
+		format!("C:{path}")
+	} else {
+		path.to_owned()
+	};
+	AbsPathBuf::assert(path.into())
+}
+
 #[cfg(test)]
 fn try_init_workspace(file_path: &str) -> Result<(AnalysisHost, FileId), String> {
 	let active_source = std::fs::read_to_string(file_path)
@@ -828,7 +840,9 @@ pub(crate) fn init_single_file(initial_text: &str) -> (AnalysisHost, FileId) {
 	let source_root = SourceRoot::new_local(file_set);
 
 	let mut crate_graph = CrateGraphBuilder::default();
-	let proc_macro_cwd = TriArc::new(AbsPathBuf::assert("/tmp".into()));
+	// Nominal: no proc macro runs in the single-file universe. The platform
+	// temp dir is absolute everywhere, where a literal `/tmp` is not on Windows.
+	let proc_macro_cwd = TriArc::new(AbsPathBuf::assert_utf8(std::env::temp_dir()));
 	let ws_data = TriArc::new(CrateWorkspaceData {
 		target: Err("not loaded".into()),
 		toolchain: None,
@@ -1049,37 +1063,32 @@ mod tests {
 
 	#[test]
 	fn workspace_alias_lookup_prefers_the_most_specific_member_root() {
-		let parent = WorkspaceKey(AbsPathBuf::assert("/workspace".into()));
-		let child = WorkspaceKey(AbsPathBuf::assert("/workspace/tools/nested".into()));
+		let parent = WorkspaceKey(fake_absolute("/workspace"));
+		let child = WorkspaceKey(fake_absolute("/workspace/tools/nested"));
 		let mut state = empty_provider_state();
 		state
 			.member_roots
-			.insert(AbsPathBuf::assert("/workspace".into()), parent);
-		state.member_roots.insert(
-			AbsPathBuf::assert("/workspace/tools/nested".into()),
-			child.clone(),
-		);
+			.insert(fake_absolute("/workspace"), parent);
+		state
+			.member_roots
+			.insert(fake_absolute("/workspace/tools/nested"), child.clone());
 
 		assert_eq!(
-			state.workspace_key_for_path(&AbsPathBuf::assert(
-				"/workspace/tools/nested/src/lib.rs".into(),
-			)),
+			state.workspace_key_for_path(&fake_absolute("/workspace/tools/nested/src/lib.rs")),
 			Some(child)
 		);
 	}
 
 	#[test]
 	fn workspace_member_roots_share_one_cached_workspace_entry() {
-		let key = WorkspaceKey(AbsPathBuf::assert("/workspace".into()));
+		let key = WorkspaceKey(fake_absolute("/workspace"));
 		let mut state = empty_provider_state();
 		state.workspaces.insert(
 			key.clone(),
 			syntax_only_workspace_state(WorkspaceFingerprint(Vec::new())),
 		);
 		for root in ["/workspace/member-a", "/workspace/member-b"] {
-			state
-				.member_roots
-				.insert(AbsPathBuf::assert(root.into()), key.clone());
+			state.member_roots.insert(fake_absolute(root), key.clone());
 		}
 
 		for path in [
@@ -1087,7 +1096,7 @@ mod tests {
 			"/workspace/member-b/src/lib.rs",
 		] {
 			assert_eq!(
-				state.workspace_key_for_path(&AbsPathBuf::assert(path.into())),
+				state.workspace_key_for_path(&fake_absolute(path)),
 				Some(key.clone())
 			);
 		}
@@ -1099,7 +1108,10 @@ mod tests {
 		let path = std::env::temp_dir().join(format!(
 			"baryon-workspace-fingerprint-{}-{}",
 			std::process::id(),
-			std::thread::current().name().unwrap_or("test")
+			std::thread::current()
+				.name()
+				.unwrap_or("test")
+				.replace("::", "-")
 		));
 		let path = AbsPathBuf::assert(Utf8PathBuf::try_from(path).expect("utf8 temp path"));
 		let paths = vec![(path.clone(), None)];
@@ -1116,12 +1128,15 @@ mod tests {
 		let path = std::env::temp_dir().join(format!(
 			"baryon-workspace-fingerprint-change-{}-{}",
 			std::process::id(),
-			std::thread::current().name().unwrap_or("test")
+			std::thread::current()
+				.name()
+				.unwrap_or("test")
+				.replace("::", "-")
 		));
 		let path = AbsPathBuf::assert(Utf8PathBuf::try_from(path).expect("utf8 temp path"));
 		std::fs::write(&path, "[package]\nname = \"before\"\n").expect("write initial manifest");
 		let paths = vec![(path.clone(), None)];
-		let key = WorkspaceKey(AbsPathBuf::assert("/workspace".into()));
+		let key = WorkspaceKey(fake_absolute("/workspace"));
 		let mut state = empty_provider_state();
 		state.workspaces.insert(
 			key.clone(),
@@ -1258,7 +1273,10 @@ mod tests {
 		let directory = std::env::temp_dir().join(format!(
 			"baryon-goto-workspace-{}-{}",
 			std::process::id(),
-			std::thread::current().name().unwrap_or("test")
+			std::thread::current()
+				.name()
+				.unwrap_or("test")
+				.replace("::", "-")
 		));
 		let source_dir = directory.join("src");
 		std::fs::create_dir_all(&source_dir).expect("create fixture");
@@ -1302,7 +1320,10 @@ mod tests {
 		let directory = std::env::temp_dir().join(format!(
 			"baryon-test-aware-workspace-{}-{}",
 			std::process::id(),
-			std::thread::current().name().unwrap_or("test")
+			std::thread::current()
+				.name()
+				.unwrap_or("test")
+				.replace("::", "-")
 		));
 		let source_dir = directory.join("src");
 		std::fs::create_dir_all(&source_dir).expect("create fixture");
@@ -1445,8 +1466,8 @@ mod tests {
 
 	#[test]
 	fn external_crate_roots_remain_library_source_roots() {
-		let local = AbsPathBuf::assert("/workspace/src/lib.rs".into());
-		let external = AbsPathBuf::assert("/cargo/registry/dep/src/lib.rs".into());
+		let local = fake_absolute("/workspace/src/lib.rs");
+		let external = fake_absolute("/cargo/registry/dep/src/lib.rs");
 		let mut vfs = Vfs::default();
 		let local_path = VfsPath::from(local.clone());
 		let external_path = VfsPath::from(external.clone());
@@ -1459,12 +1480,12 @@ mod tests {
 		let package_roots = vec![
 			PackageRoot {
 				is_local: true,
-				include: vec![AbsPathBuf::assert("/workspace".into())],
+				include: vec![fake_absolute("/workspace")],
 				exclude: Vec::new(),
 			},
 			PackageRoot {
 				is_local: false,
-				include: vec![AbsPathBuf::assert("/cargo/registry/dep".into())],
+				include: vec![fake_absolute("/cargo/registry/dep")],
 				exclude: Vec::new(),
 			},
 		];
@@ -1485,7 +1506,10 @@ mod tests {
 		let directory = std::env::temp_dir().join(format!(
 			"baryon-canonical-path-{}-{}",
 			std::process::id(),
-			std::thread::current().name().unwrap_or("test")
+			std::thread::current()
+				.name()
+				.unwrap_or("test")
+				.replace("::", "-")
 		));
 		std::fs::create_dir(&directory).expect("create temporary directory");
 		let real = directory.join("real.rs");

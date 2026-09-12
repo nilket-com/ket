@@ -23,7 +23,7 @@ pub use coords::{
 	TopologyRev, ViewId, ViewportId, VisualRowCount,
 };
 #[allow(unused_imports)]
-pub use path::expand_path;
+pub use path::{canonicalize, expand_path};
 pub use session_store::{
 	DocumentId, DocumentIdentity, ForeignSessionEntry, OwnerId, ParseSessionIdError, ReadOnly,
 	SavedSession, SessionDiscoveryEntry, SessionDiscoveryReport, SessionId, SessionSnapshot,

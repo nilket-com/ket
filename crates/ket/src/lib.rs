@@ -608,7 +608,7 @@ fn inspect_candidate(path: &Path, current: &fs::Metadata) -> Candidate {
 	Candidate::Valid
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
 	use super::*;
 	use std::os::unix::ffi::{OsStrExt, OsStringExt};

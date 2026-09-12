@@ -1,0 +1,11 @@
+# Every clone gets LF regardless of core.autocrlf. Tests read repository
+# files as fixtures and snapshot byte counts, and the CI scripts run under
+# bash, so a CRLF checkout fails on Windows for reasons unrelated to the code.
+* text=auto eol=lf
+
+*.png binary
+*.jpeg binary
+*.jpg binary
+*.ttf binary
+*.parquet binary
+*.sqlite binary
