@@ -2,8 +2,8 @@
 use crate::adapters::common::DatabaseAdapter;
 
 mod actions;
-#[cfg(unix)]
 mod agents;
+mod connection;
 /// PRODUCT-0158: the application without a window.
 pub(crate) mod headless;
 pub(crate) mod notebook_actions;
@@ -136,7 +136,8 @@ pub(crate) struct AppState {
 	surface: surface::Surface,
 	notebook_actions: notebook_actions::NotebookActions,
 	connection_generation: u64,
-	#[cfg(unix)]
+	/// ADR 0166 §3: the generation of the connect attempt in flight, if any.
+	connect_in_flight: Option<u64>,
 	agents: agents::Agents,
 	menu_state: MenuState,
 	code_editor: CodeEditor,
@@ -184,11 +185,11 @@ pub(crate) struct AppState {
 	/// and the natural length of the selected ordered palette.
 	#[cfg(feature = "toron")]
 	rune_categorical_identities: HashMap<(BufferId, LocalViewIdentity, usize), ColorIdentity>,
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	local_creation: crate::local_workspace::CreationGrant,
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	local_workspace_owner: Option<crate::local_workspace::LocalWorkspaceOwner>,
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	closing_local_workspace: bool,
 	pending_runs: VecDeque<PendingRun>,
 	session_id: Option<SessionId>,
@@ -609,7 +610,6 @@ fn subscription(state: &AppState) -> Subscription<Message> {
 		subscriptions
 			.push(iced::time::every(LoopLatencyProbe::PERIOD).map(Message::LoopLatencyTick));
 	}
-	#[cfg(unix)]
 	subscriptions.push(state.agents.subscription());
 	Subscription::batch(subscriptions)
 }
@@ -757,15 +757,10 @@ pub fn run(startup_data: StartupData, target: StartupTarget, accepting_agents: b
 		}
 	}
 	initial.0.welcome.reporting_on = destination.is_some();
-	#[cfg(unix)]
 	initial
 		.0
 		.advertise_window(accepting_agents)
 		.map_err(std::io::Error::other)?;
-	#[cfg(not(unix))]
-	if accepting_agents {
-		return Err("live connections require Unix".into());
-	}
 	let initial = std::sync::Mutex::new(Some(initial));
 	let initialize = move || {
 		initial
@@ -885,7 +880,7 @@ fn new_with_options(
 		surface: surface::Surface::default(),
 		notebook_actions: notebook_actions::NotebookActions::default(),
 		connection_generation: 0,
-		#[cfg(unix)]
+		connect_in_flight: None,
 		agents: agents::Agents::default(),
 		menu_state: MenuState::default(),
 		code_editor,
@@ -927,11 +922,11 @@ fn new_with_options(
 		rune_view_scheduler: RuneViewScheduler::default(),
 		#[cfg(feature = "toron")]
 		rune_categorical_identities: HashMap::new(),
-		#[cfg(feature = "toron")]
+		#[cfg(feature = "toron-local")]
 		local_creation: crate::local_workspace::CreationGrant::default(),
-		#[cfg(feature = "toron")]
+		#[cfg(feature = "toron-local")]
 		local_workspace_owner: None,
-		#[cfg(feature = "toron")]
+		#[cfg(feature = "toron-local")]
 		closing_local_workspace: false,
 		pending_runs: VecDeque::new(),
 		session_id,
@@ -951,7 +946,7 @@ fn new_with_options(
 	// Eagerly open the session scratch database so SQL always has a target;
 	// an in-memory SQLite open is effectively instant.
 	let scratch = Task::perform(AdapterState::open_scratch(), Message::ScratchReady);
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	{
 		let discovery = if _discover {
 			Task::perform(
@@ -963,7 +958,7 @@ fn new_with_options(
 		};
 		Ok((state, Task::batch([scratch, discovery])))
 	}
-	#[cfg(not(feature = "toron"))]
+	#[cfg(not(feature = "toron-local"))]
 	{
 		Ok((state, scratch))
 	}
@@ -991,9 +986,9 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		app_state.show_column_types,
 		status_detail.map(|detail| (detail.full.as_str(), &detail.content)),
 		app_state.status_detail_open,
-		#[cfg(feature = "toron")]
+		#[cfg(feature = "toron-local")]
 		app_state.local_creation.offer(),
-		#[cfg(not(feature = "toron"))]
+		#[cfg(not(feature = "toron-local"))]
 		None,
 		app_state.session_id.is_some(),
 		app_state.saved_close_state == SavedCloseState::Failed,
@@ -1009,10 +1004,7 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		// PRODUCT-0135 §6: the Cancel affordance exists only while a run is
 		// in flight.
 		app_state.sql_abort.is_some(),
-		#[cfg(unix)]
 		app_state.agents.status(),
-		#[cfg(not(unix))]
-		(false, 0),
 	);
 	welcome::view(app_state, screen)
 }
@@ -1456,7 +1448,11 @@ fn run_rune_relation_view_at_revision(
 #[cfg(feature = "toron")]
 fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> Task<Message> {
 	let Some(connection) = app_state.adapter_state.rune_connection().cloned() else {
+		#[cfg(feature = "toron-local")]
 		let message = app_state.adapter_state.local_workspace_unavailable();
+		// ADR 0165: without local supervision the only Toron is a remote one.
+		#[cfg(not(feature = "toron-local"))]
+		let message = "no Toron connection: connect to a Toron endpoint first".to_owned();
 		app_state
 			.code_editor
 			.mark_rune_view_producer_stale(work.source_buffer);
@@ -3881,12 +3877,11 @@ fn export_receipt_status(receipts: &[rune_host::ExportReceipt]) -> String {
 }
 
 fn begin_window_shutdown(_app_state: &mut AppState) -> Task<Message> {
-	#[cfg(unix)]
 	{
 		_app_state.agents.closing = true;
 		_app_state.agents.disable();
 	}
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	{
 		if _app_state.closing_local_workspace {
 			return Task::none();
@@ -3920,27 +3915,19 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 	app_state.expire_notebook_action();
 	let welcome_task = app_state.advance_welcome();
 	app_state.capture_surface_baselines();
-	#[cfg(unix)]
 	app_state.refresh_agents();
 	Task::batch([task, welcome_task])
 }
 
 fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
-	if matches!(
-		&message,
-		Message::AdapterSelected(_)
-			| Message::AdapterConfigurationSubmitted
-			| Message::AdapterConnected(_)
-	) {
-		app_state.connection_generation = app_state.connection_generation.saturating_add(1);
-		app_state.welcome.own_kind = None;
-		app_state.welcome.own_data_ready = false;
+	// ADR 0166 §3: selection changes mint a generation here; connect attempts
+	// and disconnects mint theirs inside the shared connection operation.
+	if matches!(&message, Message::AdapterSelected(_)) {
+		app_state.next_connection_generation();
 	}
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	if matches!(&message, Message::LocalWorkspaceAttached { .. }) {
-		app_state.connection_generation = app_state.connection_generation.saturating_add(1);
-		app_state.welcome.own_kind = None;
-		app_state.welcome.own_data_ready = false;
+		app_state.next_connection_generation();
 	}
 	// Gate closure must also work while a saved window is finishing shutdown.
 	match message {
@@ -3949,7 +3936,7 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 			return app_state.notebook_data_loaded(id, result);
 		}
 
-		#[cfg(feature = "toron")]
+		#[cfg(feature = "toron-local")]
 		Message::WelcomeWorkspace => {
 			app_state.welcome.workspace_requested = true;
 			return Task::perform(
@@ -3957,7 +3944,7 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 				Message::LocalWorkspaceDiscovered,
 			);
 		}
-		#[cfg(feature = "toron")]
+		#[cfg(feature = "toron-local")]
 		Message::WelcomeSeeded(result) => {
 			match result {
 				Ok(()) => {
@@ -3982,16 +3969,13 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 			return Task::none();
 		}
 		Message::WelcomeOpen => return app_state.start_welcome_open(),
-		#[cfg(unix)]
 		Message::AgentInbound(inbound) => {
 			return app_state.agent_inbound(inbound);
 		}
-		#[cfg(unix)]
 		Message::AgentTick(now) => {
 			app_state.finish_agent_resizes(now);
 			return Task::none();
 		}
-		#[cfg(unix)]
 		Message::AgentPublishFinished {
 			id,
 			reply,
@@ -4021,34 +4005,28 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 			return Task::none();
 		}
 		Message::ToggleAgents => {
-			#[cfg(unix)]
 			if let Err(error) = app_state.toggle_agents() {
 				app_state.status_error = error;
-			}
-			#[cfg(not(unix))]
-			{
-				app_state.status_error = "Live connections require Unix.".into();
 			}
 			return Task::none();
 		}
 		_ => {}
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	if app_state.saved_close_state == SavedCloseState::Frozen
 		&& !matches!(&message, Message::LocalWorkspaceStopped(_))
 	{
 		return Task::none();
 	}
 	match message {
-		#[cfg(unix)]
 		Message::AgentInbound(_) | Message::AgentTick(_) | Message::AgentPublishFinished { .. } => {
 			unreachable!()
 		}
 		Message::WelcomePath(_) | Message::WelcomeOpen => {
 			unreachable!()
 		}
-		#[cfg(feature = "toron")]
+		#[cfg(feature = "toron-local")]
 		Message::WelcomeWorkspace | Message::WelcomeSeeded(_) => unreachable!(),
 		Message::ToggleAgents => unreachable!(),
 		Message::ToggleStatusDetail => {
@@ -4110,7 +4088,7 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 			}
 		}
 		Message::CloseWindow => {
-			#[cfg(feature = "toron")]
+			#[cfg(feature = "toron-local")]
 			{
 				if app_state.closing_local_workspace {
 					return Task::none();
@@ -4405,61 +4383,25 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 			app_state.status_msg = "Configure adapter.".into();
 		}
 		Message::AdapterConfigurationSubmitted => {
-			// PRODUCT-0134 §1: the two input kinds never merge — a submission
-			// mixing them refuses, and only a submission with no ad hoc string
-			// requires the declared fields. Secure fields stay optional: an
-			// absent credential is an authentication policy, not a form error.
-			if let Some(error) = app_state.adapter_state.input_kind_error() {
+			// PRODUCT-0134 §1 and ADR 0166 §2: the form enters the same validation
+			// and connection operation the `connect` command does.
+			if let Err(error) = app_state.validate_connection_submission() {
 				app_state.status_error = error;
 				return Task::none();
 			}
-			let ad_hoc_active = !app_state
-				.adapter_state
-				.ad_hoc_connection_string
-				.trim()
-				.is_empty();
-			let has_empty = !ad_hoc_active
-				&& crate::adapters::driver::fields_for(&app_state.adapter_state.selection)
-					.iter()
-					.filter(|f| !f.is_secure)
-					.any(|f| {
-						app_state
-							.adapter_state
-							.fields
-							.get(f.key)
-							.is_none_or(|v| v.trim().is_empty())
-					});
-			if has_empty {
-				app_state.status_error = "All connection fields are required.".to_string();
-				return Task::none();
-			}
-			app_state.adapter_state.configure();
-			app_state.status_msg = "Adapter configured.".into();
-			app_state.adapter_state.stage = AdapterStage::Configured;
-			let config = app_state.adapter_state.configuration.clone();
-			return Task::perform(
-				async move { AdapterState::connect(config).await },
-				Message::AdapterConnected,
-			);
+			return app_state.begin_connect();
 		}
-		Message::AdapterConnected(result) => match result {
-			Ok((connection, cancellation)) => {
-				app_state.adapter_state.connection = Some(connection);
-				app_state.adapter_state.cancellation = cancellation;
-				app_state.adapter_state.stage = AdapterStage::Connected;
-				app_state.status_error.clear();
-				app_state.status_msg = "Adapter connected.".into();
-			}
-			Err(error) => {
-				app_state.adapter_state.connection = None;
-				// Scratch remains explicitly available for SQL, while the
-				// attempted adapter remains visibly unattached.
-				app_state.adapter_state.stage = AdapterStage::Configured;
+		Message::AdapterConnected { generation, result } => {
+			return app_state.connect_settled(generation, result);
+		}
+		Message::AdapterDisconnectRequested => {
+			let generation = app_state.connection_generation;
+			if let Err(error) = app_state.disconnect_external(generation) {
 				app_state.status_error = error;
-				app_state.status_msg = "Adapter unavailable; SQL scratch remains active.".into();
 			}
-		},
-		#[cfg(feature = "toron")]
+			return Task::none();
+		}
+		#[cfg(feature = "toron-local")]
 		Message::LocalWorkspaceDiscovered(workspace) => {
 			if app_state.closing_local_workspace {
 				return Task::none();
@@ -4503,7 +4445,7 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 				},
 			);
 		}
-		#[cfg(feature = "toron")]
+		#[cfg(feature = "toron-local")]
 		Message::LocalWorkspaceAttached {
 			workspace,
 			connection,
@@ -4519,6 +4461,11 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 					app_state.adapter_state.configuration =
 						crate::adapters::driver::AdapterConfiguration::Toron {
 							endpoint: workspace.sql_endpoint.to_string(),
+							// The local workspace is loopback: no TLS fields (ADR 0165 §4).
+							server_name: String::new(),
+							client_cert: String::new(),
+							client_key: String::new(),
+							ca_cert: String::new(),
 						};
 					app_state.adapter_state.name = "local workspace".to_owned();
 					app_state.adapter_state.connection = Some(connection);
@@ -4540,7 +4487,7 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 				}
 			}
 		}
-		#[cfg(feature = "toron")]
+		#[cfg(feature = "toron-local")]
 		Message::StartLocalWorkspace => {
 			if app_state.closing_local_workspace {
 				return Task::none();
@@ -4572,7 +4519,7 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 				},
 			);
 		}
-		#[cfg(feature = "toron")]
+		#[cfg(feature = "toron-local")]
 		Message::LocalWorkspaceStartupSettled(result) => {
 			if app_state.closing_local_workspace {
 				return Task::none();
@@ -4595,7 +4542,7 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 				}
 			}
 		}
-		#[cfg(feature = "toron")]
+		#[cfg(feature = "toron-local")]
 		Message::LocalWorkspaceStopped(outcome) => {
 			if !app_state.closing_local_workspace {
 				return Task::none();
@@ -5999,14 +5946,9 @@ fn apply_profile_operation(
 		}
 		ProfileOperation::Connect(name) => match load_profile(app_state, &name) {
 			Ok(configuration) => {
-				app_state.adapter_state.configuration = configuration.clone();
-				app_state.adapter_state.stage = AdapterStage::Configured;
+				let task = app_state.begin_connect_with(configuration);
 				app_state.status_msg = format!("Connecting profile: {name}");
-				app_state.status_error.clear();
-				return Task::perform(
-					async move { AdapterState::connect(configuration).await },
-					Message::AdapterConnected,
-				);
+				return task;
 			}
 			Err(error) => app_state.status_error = error,
 		},
@@ -6067,6 +6009,7 @@ fn menu_action_to_message(action: &str) -> Option<Message> {
 		"connect:new" => Some(Message::Connect),
 		"connect:profiles" => Some(Message::ProfileStoreAccessRequested),
 		"connect:save-profile" => Some(Message::ProfileSaveRequested),
+		"connect:disconnect" => Some(Message::AdapterDisconnectRequested),
 		"code:run" => Some(Message::Run),
 		"code:run-snippet" => Some(Message::RunSnippet),
 		"code:cancel" => Some(Message::CancelRun),
@@ -6175,9 +6118,9 @@ fn sync_workspace_viewport(app_state: &mut AppState) {
 
 #[cfg(test)]
 mod tests {
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	use super::{AdapterState, view};
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	use super::{
 		SavedCloseState, StartupAuthority, dispatch_rune_relation, new_with_authority,
 		resolve_rune_table_skin_with, rune_view_outcome,
@@ -6188,7 +6131,7 @@ mod tests {
 		session_identity_text, set_rune_error, set_sql_error, update,
 	};
 	use crate::adapters::common::ExecutionResult;
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	use crate::adapters::common::{
 		AdapterStage, DatabaseAdapter, RuneDispatchFailure, RuneDispatchFailureKind,
 	};
@@ -6219,7 +6162,7 @@ mod tests {
 	};
 	#[cfg(feature = "toron")]
 	use libaryon::core::BufferId;
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	use nilket_local::{
 		Artifact, Evidence, LocalWorkspace, ObservationContext, ReadyWorkspace, StaleCause,
 		VersionedArtifact, WorkspaceIdentity,
@@ -6314,7 +6257,7 @@ mod tests {
 		assert_eq!(error, "saved sessions require Polariton's `toron` feature");
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0063_saved_startup_checkpoint_close_and_reopen_use_production_authority() {
 		const CHILD: &str = "POLARITON_PRODUCT_0063_SURFACE_CHILD";
@@ -6749,7 +6692,7 @@ mod tests {
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0063_sigkill_is_not_a_close_checkpoint() {
 		const MODE: &str = "POLARITON_PRODUCT_0063_CRASH_MODE";
@@ -6983,7 +6926,7 @@ mod tests {
 		);
 		backend.finish()
 	}
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	fn local_identity() -> WorkspaceIdentity {
 		WorkspaceIdentity {
 			profile_root: "/tmp/polariton-product-0005-fixture".into(),
@@ -7000,7 +6943,7 @@ mod tests {
 		fail_table: Option<&'static str>,
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[async_trait::async_trait]
 	impl DatabaseAdapter for RecordingRuneAdapter {
 		async fn dispatch(&mut self, _code: &str) -> ExecutionResult {
@@ -7114,7 +7057,7 @@ mod tests {
 	/// PRODUCT-0137: a terminal relation that returned rows asked for
 	/// nothing. It refuses with the terminal-view guidance rather than
 	/// dropping the rows silently.
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0137_terminal_relation_with_rows_refuses_rather_than_dropping() {
 		let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -7497,7 +7440,7 @@ mod tests {
 		.expect("categorical bar frame")
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	fn non_ready_local_workspaces() -> Vec<LocalWorkspace> {
 		let identity = local_identity();
 		let root = identity.profile_root.clone();
@@ -7537,7 +7480,7 @@ mod tests {
 		]
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn local_discovery_attaches_only_ready_workspaces() {
 		for workspace in non_ready_local_workspaces() {
@@ -7595,7 +7538,7 @@ mod tests {
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn first_frame_does_not_wait_for_local_discovery() {
 		let (mut state, startup) = new(StartupData::default(), None);
@@ -7615,7 +7558,7 @@ mod tests {
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0071_joined_toron_workspace_chrome_omits_the_nonce() {
 		let (mut state, startup) = new(StartupData::default(), None);
@@ -7653,7 +7596,7 @@ mod tests {
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn unavailable_workspace_keeps_scratch_explicitly_attributed() {
 		let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -7675,7 +7618,7 @@ mod tests {
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn spent_creation_failure_does_not_reoffer_or_retry() {
 		let (mut state, startup) = new(StartupData::default(), None);
@@ -7702,7 +7645,7 @@ mod tests {
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn matching_ready_observation_without_a_handle_confers_no_stop_authority() {
 		let root = std::env::temp_dir().join(format!(
@@ -7744,7 +7687,7 @@ mod tests {
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn close_with_an_owned_workspace_enters_visible_bounded_shutdown() {
 		let command = std::process::Command::new("/bin/true");
@@ -7820,7 +7763,7 @@ mod tests {
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn startup_success_enters_the_existing_attach_path_only_after_ready() {
 		let (mut state, startup) = new(StartupData::default(), None);
@@ -7843,7 +7786,7 @@ mod tests {
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn rune_relation_results_feed_the_existing_table_and_plot_surfaces() {
 		let frame = polars::df!(
@@ -7902,7 +7845,7 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0052_completion_retains_authored_type_intent_without_resolving_application_state() {
 		let relation = transform_rune_view(
@@ -7948,7 +7891,7 @@ mod tests {
 		assert_eq!(presentations[2].skin, TableSkin::DEFAULT);
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn multi_origin_dispatch_is_independent_while_each_origin_keeps_shared_identity() {
 		let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -8008,7 +7951,7 @@ mod tests {
 		assert_eq!(calls.lock().expect("recording lock").len(), 3);
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn one_origin_failure_does_not_cancel_its_sibling_dispatch() {
 		let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -8113,7 +8056,7 @@ mod tests {
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn bad_plot_field_fails_only_its_spanned_sink_while_table_survives() {
 		let source = "let r = workspace.table(\"t\"); table(r); plot.bar(r, \"missing\", \"y\")";
@@ -8187,7 +8130,7 @@ mod tests {
 		assert!(state.status_error.contains("plot.bar at bytes"));
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0035_authored_table_skin_resolution_is_per_sink_and_keeps_shared_identity() {
 		let source = r#"workspace.table("t").views([
@@ -8242,7 +8185,7 @@ mod tests {
 		));
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0035_authored_projection_resolves_once_without_advice_or_fallback() {
 		fn themed(name: &str, projection: RuneTableSkinProjection) -> RuneTableSkinIntent {
@@ -8445,7 +8388,7 @@ mod tests {
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0027_focused_high_density_shape_parses_and_completes_every_sink() {
 		let source = r#"ket.table("test1")
@@ -8513,7 +8456,7 @@ ket.table("test2") // Comment Test1.
 		));
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0035_projection_changes_reuse_panels_and_below_threshold_skin_replaces_stale() {
 		fn program(theme: &str, duotone: bool) -> TransformedRuneView {
@@ -8671,7 +8614,7 @@ ket.table("test2") // Comment Test1.
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0014_compatibility_crosses_the_factory_and_returns_to_the_outer_span() {
 		let source = "workspace.table(\"t\").views([layers([line(\"x\", \"y\"), scatter(\"other_x\", \"y\")])])";
@@ -8953,7 +8896,7 @@ workspace.table("t").views([
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0014_one_layer_spelling_keeps_anonymous_identity_and_svg() {
 		let bare_source = "workspace.table(\"t\").views([line(\"x\", \"y\")])";
@@ -9062,7 +9005,7 @@ workspace.table("t").views([
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0018_point_size_reaches_every_host_path_and_preserves_the_view() {
 		let frame = polars::df!("x" => [1.0_f64, 2.0, 3.0], "y" => [2.0_f64, 4.0, 3.0])
@@ -9174,7 +9117,7 @@ workspace.table("t").views([
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0046_category_scatter_point_size_uses_the_standalone_carrier() {
 		let frame = polars::df!(
@@ -9273,7 +9216,7 @@ workspace.table("t").views([
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0020_stroke_width_reaches_host_and_combines_with_point_size() {
 		let frame = polars::df!("x" => [1.0_f64, 2.0, 3.0], "y" => [2.0_f64, 4.0, 3.0])
@@ -9424,7 +9367,7 @@ workspace.table("t").views([
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0022_bar_width_reaches_the_shared_result_and_real_host_panel() {
 		let frame = polars::df!("cat" => ["A", "B"], "val" => [1.0_f64, 2.0]).expect("bar frame");
@@ -10158,7 +10101,7 @@ plot.bar(a, "x", "y");
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn view_identity_reuses_retargets_or_orphans_one_panel_as_declared() {
 		let (mut state, startup) = new(StartupData::default(), None);
@@ -10964,7 +10907,7 @@ workspace.table("bad").views([view("bad", table())]);
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0030_rune_default_authored_palette_and_unused_settings_are_exact() {
 		let (mut state, startup) = new(StartupData::default(), None);
@@ -11181,7 +11124,7 @@ workspace.table("bad").views([view("bad", table())]);
 		state.code_editor.shutdown();
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0036_numeric_bounds_apply_per_axis_and_discrete_bounds_never_disappear() {
 		let y_source = "workspace.table(\"t\").views([figure([y_axis().bounds(-1.0, 1.0), bar(\"cat\", \"val\")])])";
@@ -11230,7 +11173,7 @@ workspace.table("bad").views([view("bad", table())]);
 		);
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0055_horizontal_bar_keeps_physical_axes_and_family_label_through_completion() {
 		let source = r#"workspace.table("t").views([figure([
@@ -11310,7 +11253,7 @@ workspace.table("bad").views([view("bad", table())]);
 		}
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0064_stacked_members_keep_family_label_and_physical_axis_rules() {
 		let frame = polars::df!(
@@ -11431,7 +11374,7 @@ workspace.table("bad").views([view("bad", table())]);
 		}
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0072_percent_completion_fixes_value_domain_and_refuses_bounds() {
 		let frame = polars::df!(
@@ -11568,7 +11511,7 @@ workspace.table("bad").views([view("bad", table())]);
 		}
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0070_area_reaches_completion_with_cartesian_guides_and_fixed_orientation() {
 		let source = r#"workspace.table("t").views([figure([
@@ -11645,7 +11588,7 @@ workspace.table("bad").views([view("bad", table())]);
 		);
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0055_pair_refusal_is_attributed_to_the_complete_bar_sink() {
 		let source = "workspace.table(\"t\").views([bar(\"revenue\", \"profit\")])";
@@ -11671,7 +11614,7 @@ workspace.table("bad").views([view("bad", table())]);
 		);
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0058_bound_fields_resolve_before_bar_pair_and_channel_resolution() {
 		let bound_source = r#"
@@ -11789,7 +11732,7 @@ workspace.table("t").views([bar(x_field, y_field)])
 		);
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0058_bound_third_fields_share_inline_color_resolution_for_every_mark() {
 		let frame = polars::df!(
@@ -11854,7 +11797,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		}
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0055_horizontal_pair_reaches_every_bar_spelling_and_its_register() {
 		let sources = [
@@ -11935,7 +11878,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		}
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0036_exclusion_and_arbitrarily_small_positive_spans_render_exactly() {
 		for (minimum, maximum) in [(100.0, 200.0), (0.0, 1e-300)] {
@@ -11975,7 +11918,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		}
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0036_layered_bounds_reach_one_shared_cartesian_domain() {
 		let source = r#"workspace.table("t").views([figure([
@@ -12014,7 +11957,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		assert!(render_marks_with_settings(kernel.as_ref(), settings).contains("<svg"));
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0038_tick_step_reaches_the_existing_renderer_with_and_without_bounds() {
 		let bounded_source = "workspace.table(\"t\").views([figure([y_axis().bounds(0, 7), y_axis().tick_step(1), bar(\"cat\", \"val\")])])";
@@ -12076,7 +12019,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		);
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0038_tick_step_refuses_discrete_and_dense_requests_at_their_spans() {
 		use polars::prelude::{IntoColumn, NamedFrom};
@@ -12157,7 +12100,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		);
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0130_tick_every_reaches_temporal_axes_and_refuses_invalid_destinations() {
 		use polars::prelude::{IntoColumn, NamedFrom};
@@ -12235,7 +12178,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		}
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0130_tick_every_reaches_a_styled_single_temporal_layer() {
 		use polars::prelude::{IntoColumn, NamedFrom};
@@ -12269,7 +12212,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		));
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0039_minor_ticks_toggle_and_combined_capacity_are_attributed() {
 		use polars::prelude::{IntoColumn, NamedFrom};
@@ -12404,7 +12347,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		);
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0042_facet_reaches_the_head_as_structural_intent() {
 		let source = "workspace.table(\"t\").views([figure([facet(\"cat\"), title(\"Revenue\"), bar(\"cat\", \"val\")])])";
@@ -12440,7 +12383,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		);
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0080_product_0033_ordered_skin_installs_chrome_and_mark_style_atomically() {
 		fn completed(
@@ -12539,7 +12482,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		assert!(!below_threshold.chrome.passes_contrast());
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0032_skin_failures_are_destination_local() {
 		let source = r#"workspace.table("t").views([
@@ -13052,7 +12995,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	fn product_0079_histogram_resolves_values_spans_order_and_skin_without_color_identity() {
 		use crate::plot::chrome::ResolvedPlotSkin;
 		use crate::plot::spec::Channel;
@@ -13213,7 +13156,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	fn product_0082_box_resolves_aliases_values_and_failure_scope() {
 		use crate::plot::common::AxisType;
 		use crate::plot::theme::PlotSettings;
@@ -13336,7 +13279,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	fn product_0092_heatmap_resolves_and_attributes_binding_and_cell_refusals() {
 		use polars::frame::DataFrame;
 		let source =
@@ -13436,7 +13379,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	fn product_0144_hexbin_resolves_without_identity_and_attributes_both_failure_stations() {
 		use polars::frame::DataFrame;
 		use polars::prelude::{Column, DataType};
@@ -13576,7 +13519,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	fn product_0146_fill_between_attributes_resolution_preparation_and_structure() {
 		use polars::frame::DataFrame;
 		let source = r#"workspace.table("fill_between_probe").views([fill_between("x", "low", "high", "mid")])"#;
@@ -13700,7 +13643,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	fn product_0148_candlestick_attributes_resolution_preparation_and_structure() {
 		use polars::frame::DataFrame;
 		let source = r#"workspace.table("candlestick_probe").views([candlestick("x", "open", "high", "low", "close")])"#;
@@ -13911,7 +13854,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	fn product_0098_funnel_resolves_identity_and_attributes_every_refusal() {
 		use polars::frame::DataFrame;
 		let source = r#"workspace.table("funnel_probe").views([funnel("stage", "value")])"#;
@@ -14006,7 +13949,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	fn product_0100_radial_dial_resolves_identity_and_attributes_every_refusal() {
 		use polars::frame::DataFrame;
 		let grouped = r#"workspace.table("radial_dial_probe").views([radial_dial("value", "maximum", "label")])"#;
@@ -14168,7 +14111,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	fn product_0103_pie_resolves_identity_and_attributes_slice_refusals() {
 		use polars::frame::DataFrame;
 		let source = r#"workspace.table("pie_probe").views([pie("category", "value")])"#;
@@ -14233,7 +14176,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	fn product_0105_multivariate_resolution_keeps_dimension_and_modifier_attribution() {
 		use polars::frame::DataFrame;
 		let source =
@@ -14298,7 +14241,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	fn product_0095_bubble_resolves_and_attributes_all_five_roles() {
 		use polars::frame::DataFrame;
 		let source = r#"workspace.table("bubble_probe").views([bubble("x", "y", "size", "color", "label")])"#;
@@ -14457,7 +14400,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	}
 
 	#[test]
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	fn product_0091_rune_continuous_intent_reaches_planning_and_modifier_diagnostics() {
 		use crate::plot::colors::ColorTheme;
 		use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};
@@ -15455,7 +15398,6 @@ rows.views([
 		}
 	}
 
-	#[cfg(unix)]
 	fn live_command(session: &mut Session, command: Command, id: u64) -> Vec<crate::live::Event> {
 		let app = session.application_mut();
 		let (message, _sink, mut answers) = app.state().agent_request_for_test(command, id);
@@ -15471,7 +15413,6 @@ rows.views([
 		events
 	}
 
-	#[cfg(unix)]
 	#[test]
 	fn product_0160_human_and_agent_hide_commute_on_the_legend_path() {
 		for human_first in [false, true] {
@@ -15514,7 +15455,6 @@ rows.views([
 		}
 	}
 
-	#[cfg(unix)]
 	#[test]
 	fn product_0160_live_actions_and_publish_share_batch_receipts() {
 		use crate::live::Event;
@@ -15631,7 +15571,6 @@ rows.views([
 		std::fs::remove_dir_all(root).unwrap();
 	}
 
-	#[cfg(unix)]
 	#[test]
 	fn product_0160_resize_finishes_supersedes_and_survives_disconnect() {
 		use crate::live::Event;
@@ -15724,7 +15663,6 @@ rows.views([
 		std::fs::remove_dir_all(root).unwrap();
 	}
 
-	#[cfg(unix)]
 	#[test]
 	fn product_0160_resize_deadline_reports_observed_size_without_rollback() {
 		use crate::live::Event;
@@ -16038,6 +15976,8 @@ rows.views([
 	/// through the window's own resolver, and what it loads carries no hidden
 	/// set. The store is isolated in a child process, as the saved-session
 	/// tests do, because its location is process-global.
+	// Saved sessions need the Unix session store.
+	#[cfg(unix)]
 	#[test]
 	fn product_0158_describe_opens_a_saved_session() {
 		const CHILD: &str = "POLARITON_PRODUCT_0158_SESSION_CHILD";

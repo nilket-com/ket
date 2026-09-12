@@ -68,9 +68,7 @@ pub enum Message {
 		id: libaryon::core::RequestId,
 		result: Result<crate::gui::state::notebook_actions::LoadedData, String>,
 	},
-	#[cfg(unix)]
 	AgentTick(std::time::Instant),
-	#[cfg(unix)]
 	AgentPublishFinished {
 		id: u64,
 		reply: crate::live::transport::Reply,
@@ -79,31 +77,36 @@ pub enum Message {
 		result: Result<crate::driver::PublishReceipt, crate::driver::PublishRefusal>,
 	},
 	ToggleAgents,
-	#[cfg(unix)]
 	AgentInbound(crate::live::transport::Inbound),
 	AdapterAdHocChanged(String),
 	AdapterConfigurationChanged(String, String),
 	AdapterConfigurationSubmitted,
-	AdapterConnected(Result<(Arc<RwLock<dyn DatabaseAdapter>>, CancelCapability), String>),
+	/// ADR 0166 §3: carries the database connection generation the attempt
+	/// was started under; a result for any other generation is stale.
+	AdapterConnected {
+		generation: u64,
+		result: Result<(Arc<RwLock<dyn DatabaseAdapter>>, CancelCapability), String>,
+	},
+	AdapterDisconnectRequested,
 	/// PRODUCT-0135 §6: the user's brake. One verb; the capability decides the
 	/// honest outcome.
 	CancelRun,
 	/// The engine-side signal settled; report the outcome in the routine lane.
 	CancelSignalSettled(Result<(), String>),
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	LocalWorkspaceDiscovered(nilket_local::LocalWorkspace),
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	LocalWorkspaceAttached {
 		workspace: nilket_local::ReadyWorkspace,
 		connection: Result<(Arc<RwLock<dyn DatabaseAdapter>>, CancelCapability), String>,
 	},
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	StartLocalWorkspace,
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	LocalWorkspaceStartupSettled(
 		std::result::Result<nilket_local::ReadyWorkspace, (nilket_local::LocalWorkspace, String)>,
 	),
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	LocalWorkspaceStopped(String),
 	/// The session's in-memory scratch database finished opening at startup.
 	ScratchReady(Option<Arc<RwLock<dyn DatabaseAdapter>>>),
@@ -151,9 +154,9 @@ pub enum Message {
 	Run,
 	WelcomePath(String),
 	WelcomeOpen,
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	WelcomeWorkspace,
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	WelcomeSeeded(Result<(), String>),
 	RunSnippet,
 	RunResult {

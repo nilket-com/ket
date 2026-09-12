@@ -198,7 +198,7 @@ impl HeadlessApplication {
 	/// PRODUCT-0158 §2: run the focused buffer as the Run action does, then
 	/// wait until the application has finished: the workspace attached, every
 	/// submitted relation completed, and the host panels stopped changing.
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	pub(crate) fn run_source(&mut self, deadline: Duration) -> Result<(), String> {
 		let started = Instant::now();
 		self.settle_until(deadline, |s| s.code_editor.active_language_id().is_some())?;
@@ -252,7 +252,7 @@ impl HeadlessApplication {
 	}
 
 	/// Without the `toron` feature there is no workspace to run a source in.
-	#[cfg(not(feature = "toron"))]
+	#[cfg(not(feature = "toron-local"))]
 	pub(crate) fn run_source(&mut self, _deadline: Duration) -> Result<(), String> {
 		self.settle_until(_deadline, |s| s.code_editor.active_language_id().is_some())?;
 		if self

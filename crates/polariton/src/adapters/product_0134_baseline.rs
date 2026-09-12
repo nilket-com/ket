@@ -48,7 +48,16 @@ fn product_0134_fields_decompose_only_the_credentialed_adapters() {
 		("Postgres", decomposed("5432")),
 		("SQLite", vec![("connection_string", Some("memory"), false)]),
 		#[cfg(feature = "toron")]
-		("Toron", vec![("endpoint", None, false)]),
+		(
+			"Toron",
+			vec![
+				("endpoint", None, false),
+				("server_name", None, false),
+				("client_cert", None, false),
+				("client_key", None, false),
+				("ca_cert", None, false),
+			],
+		),
 	];
 	let actual: Vec<(String, Vec<FieldRow>)> = all_selections()
 		.iter()
@@ -374,7 +383,7 @@ fn product_0134_baseline_configure_assembles_each_configuration_from_fields() {
 		state.configure();
 		assert!(matches!(
 			&state.configuration,
-			AdapterConfiguration::Toron { endpoint } if endpoint == "loopback.invalid:1"
+			AdapterConfiguration::Toron { endpoint, .. } if endpoint == "loopback.invalid:1"
 		));
 	}
 }

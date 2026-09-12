@@ -77,71 +77,7 @@ fn generation(root: &Path) -> Result<Generation, String> {
 	read(&root.join("generation.json"))
 }
 fn token(pid: u32) -> Option<String> {
-	#[cfg(target_os = "linux")]
-	{
-		let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-		return stat
-			.rsplit_once(')')?
-			.1
-			.split_whitespace()
-			.nth(19)
-			.map(str::to_owned);
-	}
-	#[cfg(windows)]
-	{
-		// The creation time from `GetProcessTimes` plays the role of the
-		// `/proc` start tick: a reused pid never reports the same one, and a
-		// process that is gone cannot be opened at all.
-		use std::ffi::c_void;
-		#[repr(C)]
-		#[derive(Clone, Copy, Default)]
-		struct FileTime {
-			low: u32,
-			high: u32,
-		}
-		unsafe extern "system" {
-			fn OpenProcess(desired_access: u32, inherit_handle: i32, pid: u32) -> *mut c_void;
-			fn GetProcessTimes(
-				process: *mut c_void,
-				creation: *mut FileTime,
-				exit: *mut FileTime,
-				kernel: *mut FileTime,
-				user: *mut FileTime,
-			) -> i32;
-			fn GetExitCodeProcess(process: *mut c_void, exit_code: *mut u32) -> i32;
-			fn CloseHandle(handle: *mut c_void) -> i32;
-		}
-		const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-		const STILL_ACTIVE: u32 = 259;
-		let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-		if process.is_null() {
-			return None;
-		}
-		// A terminated process stays openable while anyone holds a handle to
-		// it, so "openable" alone does not mean the writer is alive.
-		let mut exit_code = 0_u32;
-		let running = unsafe { GetExitCodeProcess(process, &mut exit_code) } != 0
-			&& exit_code == STILL_ACTIVE;
-		let mut times = [FileTime::default(); 4];
-		let [creation, exit, kernel, user] = &mut times;
-		let ok = running && unsafe { GetProcessTimes(process, creation, exit, kernel, user) } != 0;
-		unsafe { CloseHandle(process) };
-		ok.then(|| {
-			format!(
-				"{:016x}",
-				(u64::from(creation.high) << 32) | u64::from(creation.low)
-			)
-		})
-	}
-	#[cfg(not(any(target_os = "linux", windows)))]
-	{
-		let output = std::process::Command::new("ps")
-			.args(["-p", &pid.to_string(), "-o", "lstart="])
-			.output()
-			.ok()?;
-		let text = String::from_utf8(output.stdout).ok()?;
-		(!text.trim().is_empty()).then(|| text.trim().to_owned())
-	}
+	crate::process_identity::process_start(pid)
 }
 fn progress_path(segment: &Path) -> PathBuf {
 	segment.with_extension("progress")
@@ -766,17 +702,17 @@ mod tests {
 		let mut spool = Spool::open(root.clone(), destination()).unwrap();
 		let r = report(&spool, 0);
 		fs::write(root.join("expected-id"), &r.report_id).unwrap();
-		#[cfg(feature = "toron")]
+		#[cfg(unix)]
 		if phase == "append-error" {
 			// Confine the real I/O failure to this child process. The header fits,
 			// the report batch does not: write_all must encounter EFBIG.
 			unsafe {
-				nix::libc::signal(nix::libc::SIGXFSZ, nix::libc::SIG_IGN);
-				let limit = nix::libc::rlimit {
+				libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+				let limit = libc::rlimit {
 					rlim_cur: 512,
 					rlim_max: 512,
 				};
-				assert_eq!(nix::libc::setrlimit(nix::libc::RLIMIT_FSIZE, &limit), 0);
+				assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
 			}
 			assert!(spool.persist("child", 0, &[r.clone(), r]).is_err());
 			assert!(entries(&root, "active").unwrap().is_empty());
@@ -790,7 +726,7 @@ mod tests {
 			_ => panic!("append gate should already be waiting"),
 		}
 	}
-	#[cfg(feature = "toron")]
+	#[cfg(unix)]
 	#[test]
 	fn product_0161_failed_append_discards_the_unsynced_batch() {
 		let root = Scratch::new();

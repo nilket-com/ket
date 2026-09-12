@@ -22,6 +22,7 @@ pub const FIELDS: &[AdapterField] = &[
 		default_value: None,
 		field_type: &AdapterFieldType::Text,
 		is_secure: false,
+		is_optional: false,
 	},
 	AdapterField {
 		key: "port",
@@ -29,6 +30,7 @@ pub const FIELDS: &[AdapterField] = &[
 		default_value: Some("3306"),
 		field_type: &AdapterFieldType::Text,
 		is_secure: false,
+		is_optional: false,
 	},
 	AdapterField {
 		key: "database",
@@ -36,6 +38,7 @@ pub const FIELDS: &[AdapterField] = &[
 		default_value: None,
 		field_type: &AdapterFieldType::Text,
 		is_secure: false,
+		is_optional: false,
 	},
 	AdapterField {
 		key: "user",
@@ -43,6 +46,7 @@ pub const FIELDS: &[AdapterField] = &[
 		default_value: None,
 		field_type: &AdapterFieldType::Text,
 		is_secure: false,
+		is_optional: false,
 	},
 	AdapterField {
 		key: "password",
@@ -50,6 +54,7 @@ pub const FIELDS: &[AdapterField] = &[
 		default_value: None,
 		field_type: &AdapterFieldType::Text,
 		is_secure: true,
+		is_optional: false,
 	},
 ];
 

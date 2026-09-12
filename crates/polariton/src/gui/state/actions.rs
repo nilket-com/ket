@@ -69,6 +69,18 @@ impl AppState {
 			started.receipt.figures = Some(self.describe_surface());
 			return Ok(());
 		}
+		// ADR 0166 §3: the generation gate is the whole of a disconnect's admission.
+		if let Command::Disconnect { generation } = command {
+			let description = self
+				.disconnect_external(*generation)
+				.map_err(|message| Refusal::ConnectionRefused { message })?;
+			started.receipt.connection = Some(description);
+			return Ok(());
+		}
+		if let Command::ConnectionStatus {} = command {
+			started.receipt.connection = Some(self.connection_description());
+			return Ok(());
+		}
 		if let Command::Publish { directory } = command {
 			let job = self
 				.prepare_publish(std::path::Path::new(directory))

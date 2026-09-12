@@ -47,21 +47,61 @@ pub(crate) fn windows() -> Result<(), String> {
 	Ok(())
 }
 
+/// The client end of the platform transport.
+#[cfg(unix)]
+type ClientStream = tokio::net::UnixStream;
+#[cfg(windows)]
+type ClientStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+/// ADR 0166 §4: reach the advertised process, not merely a same-user peer.
+/// Unix checks the peer's uid; Windows checks the pipe server's pid and
+/// start token against the advertisement before anything is sent.
+async fn open_stream(window: &super::discovery::Advertisement) -> Result<ClientStream, String> {
+	#[cfg(unix)]
+	{
+		let socket = tokio::net::UnixStream::connect(&window.socket)
+			.await
+			.map_err(|e| format!("cannot connect to window {}: {e}", window.window))?;
+		// SAFETY: geteuid has no preconditions and cannot fail.
+		let uid = unsafe { libc::geteuid() };
+		if !socket.peer_cred().is_ok_and(|peer| peer.uid() == uid) {
+			return Err("window peer belongs to another user".into());
+		}
+		Ok(socket)
+	}
+	#[cfg(windows)]
+	{
+		use std::os::windows::io::AsRawHandle;
+		let pipe = windows_open(window.socket.as_os_str())
+			.await
+			.map_err(|e| format!("cannot connect to window {}: {e}", window.window))?;
+		let mut pid = 0_u32;
+		// SAFETY: the handle is a connected client end owned by `pipe`.
+		if unsafe {
+			windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId(
+				pipe.as_raw_handle() as _,
+				&mut pid,
+			)
+		} == 0
+		{
+			return Err("cannot identify the window's pipe server process".into());
+		}
+		if pid != window.pid
+			|| super::discovery::process_start(pid).as_deref() != Some(&window.process_start)
+		{
+			return Err("pipe server is not the advertised window process".into());
+		}
+		Ok(pipe)
+	}
+}
+
 async fn connect(
 	selector: &Selector,
-) -> Result<(tokio::io::BufReader<tokio::net::UnixStream>, Event), String> {
+) -> Result<(tokio::io::BufReader<ClientStream>, Event), String> {
 	let windows =
 		discover(&runtime_directory().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
 	let window = select(&windows, selector)?;
-	let socket = tokio::net::UnixStream::connect(&window.socket)
-		.await
-		.map_err(|e| format!("cannot connect to window {}: {e}", window.window))?;
-	if !socket
-		.peer_cred()
-		.is_ok_and(|peer| peer.uid() == super::discovery::uid())
-	{
-		return Err("window peer belongs to another user".into());
-	}
+	let socket = open_stream(&window).await?;
 	let mut reader = tokio::io::BufReader::new(socket);
 	let first = tokio::time::timeout(
 		std::time::Duration::from_secs(5),
@@ -242,6 +282,49 @@ mod tests {
 	use super::*;
 	use crate::driver::{Command, CommandReceipt, FigureRef};
 	use tokio::io::{AsyncWriteExt, BufReader};
+
+	/// ADR 0166 §4, acceptance 4: a client refuses a pipe whose server is
+	/// not the advertised process, before sending a byte; the advertised
+	/// process is accepted.
+	#[cfg(windows)]
+	#[tokio::test]
+	async fn adr_0166_client_refuses_a_pipe_whose_server_is_not_the_advertised_process() {
+		use super::super::discovery::{Advertisement, endpoint_for, process_start};
+		use tokio::net::windows::named_pipe::ServerOptions;
+		let window = uuid::Uuid::new_v4().simple().to_string();
+		let socket = endpoint_for(std::path::Path::new(""), &window);
+		let pid = std::process::id();
+		let mut advertised = Advertisement {
+			window: window.clone(),
+			socket: socket.clone(),
+			pid,
+			process_start: process_start(pid).unwrap(),
+			session: None,
+			sources: Vec::new(),
+			started_at: 0,
+			accepting: true,
+		};
+		let mut server = ServerOptions::new()
+			.first_pipe_instance(true)
+			.create(&socket)
+			.unwrap();
+		const REFUSAL: &str = "pipe server is not the advertised window process";
+		// Another incarnation of this pid.
+		advertised.process_start = "another-incarnation".into();
+		let (attempt, _) = tokio::join!(open_stream(&advertised), server.connect());
+		assert_eq!(attempt.err().as_deref(), Some(REFUSAL));
+		server = ServerOptions::new().create(&socket).unwrap();
+		// Another pid entirely.
+		advertised.process_start = process_start(pid).unwrap();
+		advertised.pid = pid.wrapping_add(1);
+		let (attempt, _) = tokio::join!(open_stream(&advertised), server.connect());
+		assert_eq!(attempt.err().as_deref(), Some(REFUSAL));
+		server = ServerOptions::new().create(&socket).unwrap();
+		// The advertised process itself.
+		advertised.pid = pid;
+		let (attempt, connected) = tokio::join!(open_stream(&advertised), server.connect());
+		assert!(attempt.is_ok() && connected.is_ok());
+	}
 
 	#[tokio::test]
 	async fn product_0160_script_waits_for_final_answers_and_does_not_replay_unknowns() {
@@ -430,6 +513,30 @@ mod tests {
 			vec!["--session", "s", "--source", "f"],
 		] {
 			assert!(parse(&args).is_err());
+		}
+	}
+}
+
+/// Open a named pipe, waiting briefly while the server is between instances
+/// (`ERROR_PIPE_BUSY`) or has not created the next one yet (`NotFound`),
+/// which are the two transient states a live server passes through.
+#[cfg(windows)]
+pub(crate) async fn windows_open(
+	name: &std::ffi::OsStr,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+	const ERROR_PIPE_BUSY: i32 = 231;
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+	loop {
+		match tokio::net::windows::named_pipe::ClientOptions::new().open(name) {
+			Ok(pipe) => return Ok(pipe),
+			Err(error)
+				if (error.raw_os_error() == Some(ERROR_PIPE_BUSY)
+					|| error.kind() == std::io::ErrorKind::NotFound)
+					&& std::time::Instant::now() < deadline =>
+			{
+				tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+			}
+			Err(error) => return Err(error),
 		}
 	}
 }

@@ -19,6 +19,7 @@ pub const FIELDS: &[AdapterField] = &[AdapterField {
 	default_value: Some("memory"),
 	field_type: &AdapterFieldType::Text,
 	is_secure: false,
+	is_optional: false,
 }];
 
 pub struct SQLiteAdapter {

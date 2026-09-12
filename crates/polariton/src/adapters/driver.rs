@@ -92,6 +92,10 @@ pub enum AdapterConfiguration {
 	#[cfg(feature = "toron")]
 	Toron {
 		endpoint: String,
+		server_name: String,
+		client_cert: String,
+		client_key: String,
+		ca_cert: String,
 	},
 }
 
@@ -150,9 +154,15 @@ impl std::fmt::Debug for AdapterConfiguration {
 				.field("connection_string", connection_string)
 				.finish(),
 			#[cfg(feature = "toron")]
-			AdapterConfiguration::Toron { endpoint } => {
-				f.debug_struct("Toron").field("endpoint", endpoint).finish()
-			}
+			AdapterConfiguration::Toron {
+				endpoint,
+				server_name,
+				..
+			} => f
+				.debug_struct("Toron")
+				.field("endpoint", endpoint)
+				.field("server_name", server_name)
+				.finish(),
 		}
 	}
 }
@@ -172,7 +182,7 @@ pub struct AdapterState {
 	/// PRODUCT-0135 §2: the external connection's cancellation capability,
 	/// held beside the connection, never behind its lock.
 	pub cancellation: CancelCapability,
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	pub local_workspace: Option<nilket_local::LocalWorkspace>,
 	/// Session-local in-memory SQLite scratch database. Always the SQL target
 	/// when no external adapter is connected, so SQL panes and notebook cells
@@ -232,7 +242,7 @@ impl AdapterState {
 			.and(self.connection.as_ref())
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	pub fn local_workspace_unavailable(&self) -> String {
 		self.local_workspace.as_ref().map_or_else(
 			|| "Local workspace discovery has not completed.".to_owned(),
@@ -306,6 +316,10 @@ impl AdapterConfiguration {
 			#[cfg(feature = "toron")]
 			"Toron" => AdapterConfiguration::Toron {
 				endpoint: value("endpoint"),
+				server_name: value("server_name"),
+				client_cert: value("client_cert"),
+				client_key: value("client_key"),
+				ca_cert: value("ca_cert"),
 			},
 			_ => AdapterConfiguration::None,
 		}
@@ -378,8 +392,14 @@ impl AdapterState {
 			}
 			#[cfg(feature = "toron")]
 			AdapterSelection::Toron => {
-				let endpoint = self.fields.get("endpoint").cloned().unwrap_or_default();
-				self.configuration = AdapterConfiguration::Toron { endpoint };
+				let field = |key: &str| self.fields.get(key).cloned().unwrap_or_default();
+				self.configuration = AdapterConfiguration::Toron {
+					endpoint: field("endpoint"),
+					server_name: field("server_name"),
+					client_cert: field("client_cert"),
+					client_key: field("client_key"),
+					ca_cert: field("ca_cert"),
+				};
 				self.stage = AdapterStage::Configured;
 			}
 		}
@@ -520,13 +540,29 @@ impl AdapterState {
 				}
 			}
 			#[cfg(feature = "toron")]
-			AdapterConfiguration::Toron { endpoint } => toron::ToronAdapter::connect(&endpoint)
-				.await
-				.map(|adapter| {
-					let cancel = adapter.cancel_capability();
-					(Arc::new(RwLock::new(adapter)) as _, cancel)
-				})
-				.map_err(|error| format!("Toron connection: {error}")),
+			AdapterConfiguration::Toron {
+				endpoint,
+				server_name,
+				client_cert,
+				client_key,
+				ca_cert,
+			} => {
+				// ADR 0165 §4: a partial TLS configuration is refused here, before
+				// any transport is chosen; it never falls back to loopback.
+				let target = toron::target_from_fields(
+					&endpoint,
+					&server_name,
+					&client_cert,
+					&client_key,
+					&ca_cert,
+				)?;
+				toron::ToronAdapter::connect_target(&target)
+					.await
+					.map(|adapter| {
+						let cancel = adapter.cancel_capability();
+						(Arc::new(RwLock::new(adapter)) as _, cancel)
+					})
+			}
 		}
 	}
 }
@@ -668,7 +704,7 @@ mod tests {
 		#[cfg(feature = "toron")]
 		assert!(matches!(
 			AdapterConfiguration::from_saved("Toron", &map(&[("endpoint", "loopback.invalid:1")])),
-			AdapterConfiguration::Toron { endpoint } if endpoint == "loopback.invalid:1"
+			AdapterConfiguration::Toron { endpoint, .. } if endpoint == "loopback.invalid:1"
 		));
 	}
 

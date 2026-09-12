@@ -127,6 +127,21 @@ pub(crate) enum Command {
 	Publish {
 		directory: String,
 	},
+	/// ADR 0166: connect the window's external adapter through the same
+	/// operation the connection form uses. `fields` are the form's fields.
+	Connect {
+		adapter: String,
+		#[serde(default)]
+		name: String,
+		#[serde(default)]
+		fields: BTreeMap<String, String>,
+	},
+	/// Tear down the external adapter connection named by `generation`; a
+	/// superseded generation is refused, never applied to its replacement.
+	Disconnect {
+		generation: u64,
+	},
+	ConnectionStatus {},
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -164,7 +179,10 @@ impl Command {
 			| Command::DescribeNotebook { .. }
 			| Command::OpenData { .. }
 			| Command::ReplaceCell { .. }
-			| Command::RunCell { .. } => None,
+			| Command::RunCell { .. }
+			| Command::Connect { .. }
+			| Command::Disconnect { .. }
+			| Command::ConnectionStatus {} => None,
 			Command::Hide { figure, .. }
 			| Command::Show { figure, .. }
 			| Command::Isolate { figure, .. }
@@ -212,6 +230,22 @@ pub(crate) struct CommandReceipt {
 	pub(crate) notebook: Option<NotebookDescription>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub(crate) data: Option<DataDescription>,
+	/// ADR 0166: the external connection as the adapter owner reports it.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) connection: Option<ConnectionDescription>,
+}
+
+/// The adapter owner's view of the external connection: what is selected,
+/// whether it is connected, and the database connection generation that
+/// `disconnect` must name. `error` is the last connection failure, verbatim.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ConnectionDescription {
+	pub adapter: String,
+	pub name: String,
+	pub stage: String,
+	pub generation: u64,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -250,6 +284,11 @@ pub(crate) enum Failure {
 	Publish {
 		reason: PublishRefusal,
 		root: String,
+	},
+	/// ADR 0166: the connection attempt ran and did not connect; `message`
+	/// is what the adapter reported, which is what the form would show.
+	Connection {
+		message: String,
 	},
 }
 
@@ -302,6 +341,12 @@ pub(crate) enum Refusal {
 	/// The publish action refused, with the publisher's own reason.
 	PublishRefused {
 		reason: PublishRefusal,
+	},
+	/// ADR 0166: the connection operation refused before any transport was
+	/// chosen: an unknown adapter, a partial TLS configuration, a busy owner,
+	/// or a stale generation.
+	ConnectionRefused {
+		message: String,
 	},
 }
 
@@ -563,6 +608,7 @@ impl CommandReceipt {
 			publish: None,
 			notebook: None,
 			data: None,
+			connection: None,
 		}
 	}
 	pub(crate) fn refuse(&mut self, refusal: Refusal) {
@@ -848,11 +894,30 @@ mod tests {
 				{"isolate":{"figure":{"view":"trend-lines"},"series":0}},
 				{"restore":{"figure":{"view":"trend-lines"}}},
 				{"resize":{"figure":{"incarnation":"3"},"width":360,"height":360}},
-				{"publish":{"directory":"/tmp/out"}}
+				{"publish":{"directory":"/tmp/out"}},
+				{"connect":{"adapter":"Toron","name":"lab","fields":{"endpoint":"192.0.2.1:7742"}}},
+				{"connect":{"adapter":"SQLite"}},
+				{"disconnect":{"generation":4}},
+				{"connection_status":{}}
 			]}"#,
 		)
 		.expect("commands parse");
-		assert_eq!(script.commands.len(), 6);
+		assert_eq!(script.commands.len(), 10);
+		// ADR 0166: the connection verbs are on the surface, name and fields
+		// optional, and a disconnect always names its generation.
+		assert_eq!(
+			script.commands[7],
+			Command::Connect {
+				adapter: "SQLite".to_owned(),
+				name: String::new(),
+				fields: BTreeMap::new()
+			}
+		);
+		assert_eq!(script.commands[8], Command::Disconnect { generation: 4 });
+		assert!(
+			serde_json::from_str::<Commands>(r#"{"commands":[{"disconnect":{}}]}"#).is_err(),
+			"a disconnect without a generation is not a command"
+		);
 		assert_eq!(
 			script.commands[1],
 			Command::Hide {

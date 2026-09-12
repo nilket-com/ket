@@ -7,13 +7,12 @@ authors = ["Joel Bondurant"]
 description = "A strong coupling of data and visualization."
 
 [features]
-default = ["toron"]
+default = ["toron-local"]
 product-0057-render-evidence = []
-toron = [
-	"dep:nilket-local",
-	"dep:nix",
-	"dep:toron-client",
-]
+# ADR 0165: the client transport and SQL adapter are portable; local
+# workspace supervision is Linux. The Windows head builds with `toron` alone.
+toron = ["dep:toron-client"]
+toron-local = ["toron", "dep:nilket-local", "dep:nix"]
 
 [package.metadata.deb]
 maintainer = "Joel Bondurant"
@@ -66,6 +65,7 @@ sqlparser = "0.61.0"
 svg_fmt = "0.4.5"
 tiny-skia = "0.12.0"
 tokio = { version = "1.50.0", features = ["full"] }
+key-guard = { path = "../../nilket/crates/key-guard" }
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
 tokio-postgres = "0.7.16"
 tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = ["ring", "webpki-roots"] }
@@ -94,3 +94,11 @@ name = "product_0057_render_evidence"
 path = "tests/product_0057_render_evidence.rs"
 required-features = ["product-0057-render-evidence"]
 harness = false
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+	"Win32_Foundation",
+	"Win32_Security",
+	"Win32_Storage_FileSystem",
+	"Win32_System_Pipes",
+] }

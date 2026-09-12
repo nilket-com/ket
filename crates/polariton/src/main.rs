@@ -7,12 +7,12 @@ mod editor;
 mod first_run;
 mod fonts;
 mod gui;
-#[cfg(unix)]
 mod live;
-#[cfg(feature = "toron")]
+#[cfg(feature = "toron-local")]
 mod local_workspace;
 mod plot;
 mod presentation_registry;
+mod process_identity;
 mod profile_store;
 mod publication;
 mod reporting;
@@ -49,11 +49,10 @@ fn main() -> gui::Result {
 			ensure_rustls_provider();
 			reporting::drain_once(configuration::load_startup_data().reporting).map_err(Into::into)
 		}
-		#[cfg(unix)]
 		ApplicationAction::Windows => live::client::windows().map_err(Into::into),
-		#[cfg(unix)]
-		ApplicationAction::Observe(selector) => live::client::observe(&selector).map_err(Into::into),
-		#[cfg(unix)]
+		ApplicationAction::Observe(selector) => {
+			live::client::observe(&selector).map_err(Into::into)
+		}
 		ApplicationAction::Act { selector, commands } => {
 			live::client::act(&selector, &commands).map_err(Into::into)
 		}
@@ -89,11 +88,8 @@ enum ApplicationAction {
 	Report,
 	Gui(gui::StartupTarget),
 	GuiAgents(gui::StartupTarget),
-	#[cfg(unix)]
 	Windows,
-	#[cfg(unix)]
 	Observe(live::discovery::Selector),
-	#[cfg(unix)]
 	Act {
 		selector: live::discovery::Selector,
 		commands: std::path::PathBuf,
@@ -133,7 +129,6 @@ where
 		}
 		return Ok(ApplicationAction::Report);
 	}
-	#[cfg(unix)]
 	if args.peek().is_some_and(|arg| arg == "windows") {
 		args.next();
 		if args.next().is_some() {
@@ -141,13 +136,11 @@ where
 		}
 		return Ok(ApplicationAction::Windows);
 	}
-	#[cfg(unix)]
 	if args.peek().is_some_and(|arg| arg == "act") {
 		args.next();
 		let (selector, commands) = live::client::act_arguments(args)?;
 		return Ok(ApplicationAction::Act { selector, commands });
 	}
-	#[cfg(unix)]
 	if args.peek().is_some_and(|arg| arg == "observe") {
 		args.next();
 		return live::client::selector(args).map(ApplicationAction::Observe);
@@ -211,7 +204,7 @@ where
 	}
 }
 
-#[cfg(feature = "toron")]
+#[cfg(feature = "toron-local")]
 fn list_saved_sessions() -> gui::Result {
 	use libaryon::core::SessionStore;
 
@@ -220,12 +213,12 @@ fn list_saved_sessions() -> gui::Result {
 	Ok(())
 }
 
-#[cfg(not(feature = "toron"))]
+#[cfg(not(feature = "toron-local"))]
 fn list_saved_sessions() -> gui::Result {
 	Err("saved sessions require Polariton's `toron` feature".into())
 }
 
-#[cfg(feature = "toron")]
+#[cfg(feature = "toron-local")]
 fn render_session_discovery(report: &libaryon::core::SessionDiscoveryReport) -> String {
 	use chrono::{DateTime, SecondsFormat, Utc};
 	use libaryon::core::SessionDiscoveryEntry;
@@ -323,7 +316,7 @@ fn render_session_discovery(report: &libaryon::core::SessionDiscoveryReport) -> 
 	output
 }
 
-#[cfg(feature = "toron")]
+#[cfg(feature = "toron-local")]
 fn compare_committed_entries(
 	left: &libaryon::core::SessionDiscoveryEntry,
 	right: &libaryon::core::SessionDiscoveryEntry,
@@ -352,7 +345,7 @@ fn compare_committed_entries(
 	}
 }
 
-#[cfg(feature = "toron")]
+#[cfg(feature = "toron-local")]
 fn encode_cli_hex(bytes: &[u8]) -> String {
 	const DIGITS: &[u8; 16] = b"0123456789abcdef";
 	let mut output = String::with_capacity(bytes.len() * 2);
@@ -500,7 +493,7 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn committed_session_order_is_newest_then_generation_then_identity() {
 		use libaryon::core::SessionDiscoveryEntry;
@@ -548,7 +541,7 @@ mod tests {
 		);
 	}
 
-	#[cfg(not(feature = "toron"))]
+	#[cfg(not(feature = "toron-local"))]
 	#[test]
 	fn listing_refuses_explicitly_without_saved_session_support() {
 		assert_eq!(

@@ -236,7 +236,7 @@ pub fn main_screen<'a>(
 	} else {
 		container(text("")).into()
 	};
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	let local_workspace_overlay: Element<Message> = local_workspace_offer.map_or_else(
 		|| container(text("")).into(),
 		|profile_root| {
@@ -267,7 +267,7 @@ pub fn main_screen<'a>(
 			.into()
 		},
 	);
-	#[cfg(not(feature = "toron"))]
+	#[cfg(not(feature = "toron-local"))]
 	let local_workspace_overlay: Element<Message> = {
 		let _ = local_workspace_offer;
 		container(text("")).into()
@@ -493,6 +493,10 @@ fn build_menu_roots(
 				MenuItem::Action {
 					id: "connect:save-profile".into(),
 					label: "Save profile".into(),
+				},
+				MenuItem::Action {
+					id: "connect:disconnect".into(),
+					label: "Disconnect".into(),
 				},
 				profiles_item,
 			],
@@ -829,8 +833,13 @@ mod tests {
 		all_ids(&locked.items, &mut ids);
 		assert_eq!(
 			ids,
-			["connect:new", "connect:save-profile", "connect:profiles"],
-			"a locked store offers exactly one access-requesting action"
+			[
+				"connect:new",
+				"connect:save-profile",
+				"connect:disconnect",
+				"connect:profiles"
+			],
+			"a locked store offers exactly one access-requesting action; disconnect is the human form of the disconnect command (ADR 0166)"
 		);
 
 		let empty = connect_root(Some(Vec::new()));

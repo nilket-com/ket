@@ -5,13 +5,40 @@ use crate::adapters::common::{
 use crate::result_artifact::{ArrowNullabilityPolicy, ResultArtifact};
 use async_trait::async_trait;
 
-pub const FIELDS: &[AdapterField] = &[AdapterField {
-	key: "endpoint",
-	placeholder: "host:port",
-	default_value: None,
-	field_type: &AdapterFieldType::Text,
-	is_secure: false,
-}];
+mod target;
+pub use target::{ToronTarget, ToronTls, describe_connect_error, target_from_fields};
+
+const fn text(key: &'static str, placeholder: &'static str, optional: bool) -> AdapterField {
+	AdapterField {
+		key,
+		placeholder,
+		default_value: None,
+		field_type: &AdapterFieldType::Text,
+		is_secure: false,
+		is_optional: optional,
+	}
+}
+
+/// ADR 0165 §4: the four TLS fields are one unit; see `target_from_fields`.
+pub const FIELDS: &[AdapterField] = &[
+	text("endpoint", "host:port", false),
+	text(
+		"server_name",
+		"toron-<worker-id>.cluster.local (authenticated only)",
+		true,
+	),
+	text(
+		"client_cert",
+		"path to this machine's client certificate",
+		true,
+	),
+	text(
+		"client_key",
+		"path to this machine's private key (owner-only)",
+		true,
+	),
+	text("ca_cert", "path to the deployment CA certificate", true),
+];
 
 /// PRODUCT-0135 §2: the dispatch-minted query identity, shared between the
 /// adapter and its cancellation capability through this slot's own mutex —
@@ -71,6 +98,29 @@ impl ToronAdapter {
 	pub async fn connect(endpoint: &str) -> Result<Self, toron_client::ClientError> {
 		let client = toron_client::ToronClient::loopback(endpoint)?;
 		client.health().await?;
+		Ok(Self {
+			client,
+			current_query: CurrentQuery::default(),
+		})
+	}
+
+	/// ADR 0165: connect as the resolved target describes, reporting failures
+	/// by what this client can know.
+	pub async fn connect_target(target: &ToronTarget) -> Result<Self, String> {
+		let (client, tls) = match target {
+			ToronTarget::Loopback { endpoint } => {
+				(toron_client::ToronClient::loopback(endpoint), None)
+			}
+			ToronTarget::Authenticated { endpoint, tls } => (
+				toron_client::ToronClient::authenticated(endpoint, &tls.client_tls()),
+				Some(tls),
+			),
+		};
+		let client = client.map_err(|error| describe_connect_error(&error, tls))?;
+		client
+			.health()
+			.await
+			.map_err(|error| describe_connect_error(&error, tls))?;
 		Ok(Self {
 			client,
 			current_query: CurrentQuery::default(),
@@ -204,8 +254,18 @@ mod tests {
 	static LIVE_TORON_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 	fn live_endpoint() -> String {
-		std::env::var("TORON_SQL_ENDPOINT")
-			.unwrap_or_else(|_| nilket_local::SQL_ENDPOINT.to_owned())
+		#[cfg(feature = "toron-local")]
+		{
+			std::env::var("TORON_SQL_ENDPOINT")
+				.unwrap_or_else(|_| nilket_local::SQL_ENDPOINT.to_owned())
+		}
+		#[cfg(not(feature = "toron-local"))]
+		{
+			// The portable head knows no local workspace; the live gates name
+			// their Toron explicitly.
+			std::env::var("TORON_SQL_ENDPOINT")
+				.expect("TORON_SQL_ENDPOINT names the live Toron workspace for the portable head")
+		}
 	}
 
 	async fn dispatch_live_fixture(adapter: &mut ToronAdapter, sql: &str) -> ExecutionResult {

@@ -815,8 +815,9 @@ fn product_0006_creation_authority_stays_feature_gated_and_out_of_discovery() {
 		std::fs::read_to_string(manifest_dir.join("Cargo.toml")).expect("read Polariton manifest");
 	assert_product_dependency_boundary(manifest_dir, ProductBoundary::Polariton);
 	assert!(
-		manifest.contains("default = [\"toron\"]"),
-		"the dogfood Polariton build must include Toron unless explicitly reduced"
+		manifest.contains("default = [\"toron-local\"]")
+			&& manifest.contains("toron-local = [\"toron\", \"dep:nilket-local\", \"dep:nix\"]"),
+		"the dogfood Polariton build must include the local Toron workspace unless explicitly reduced"
 	);
 	assert!(manifest.contains("nix = {"));
 	assert!(manifest.contains("optional = true"));
@@ -825,8 +826,8 @@ fn product_0006_creation_authority_stays_feature_gated_and_out_of_discovery() {
 	let main =
 		std::fs::read_to_string(manifest_dir.join("src/main.rs")).expect("read Polariton main");
 	assert!(
-		main.contains("#[cfg(feature = \"toron\")]\nmod local_workspace;"),
-		"PRODUCT-0006 process authority must disappear without the Toron feature"
+		main.contains("#[cfg(feature = \"toron-local\")]\nmod local_workspace;"),
+		"PRODUCT-0006 process authority must disappear without the local Toron workspace feature"
 	);
 	let owner = std::fs::read_to_string(manifest_dir.join("src/local_workspace.rs"))
 		.expect("read session owner");

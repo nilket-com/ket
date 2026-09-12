@@ -1,15 +1,24 @@
 //! Per-window advertisements. A PID alone is never evidence of liveness.
+//!
+//! ADR 0166 §4: the runtime directory is private to the running user on
+//! every platform. Unix keeps `0700` ownership; Windows keeps a protected
+//! owner-only DACL that its files inherit. The endpoint a window advertises
+//! is a Unix socket path or a Windows named pipe name, and a client checks
+//! the process behind it against the advertised pid and start token before
+//! sending anything.
 
 use serde::{Deserialize, Serialize};
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Advertisement {
 	pub(crate) window: String,
+	/// The Unix socket path, or on Windows the named pipe name.
 	pub(crate) socket: PathBuf,
 	pub(crate) pid: u32,
 	pub(crate) process_start: String,
@@ -26,6 +35,7 @@ pub(crate) enum Selector {
 	Source(PathBuf),
 }
 
+#[cfg(unix)]
 pub(crate) fn runtime_directory() -> io::Result<PathBuf> {
 	if let Some(root) = std::env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
 		return Ok(PathBuf::from(root).join("polariton"));
@@ -46,48 +56,53 @@ pub(crate) fn runtime_directory() -> io::Result<PathBuf> {
 	Ok(root.join("polariton/run"))
 }
 
-pub(crate) fn uid() -> u32 {
-	// SAFETY: geteuid has no arguments or memory preconditions.
-	unsafe { libc::geteuid() }
+#[cfg(windows)]
+pub(crate) fn runtime_directory() -> io::Result<PathBuf> {
+	let root = std::env::var_os("LOCALAPPDATA")
+		.filter(|s| !s.is_empty())
+		.map(PathBuf::from)
+		.ok_or_else(|| io::Error::other("no LOCALAPPDATA directory"))?;
+	Ok(root.join("polariton").join("run"))
+}
+
+/// The transport endpoint a window with this id advertises under `root`.
+pub(crate) fn endpoint_for(root: &Path, window: &str) -> PathBuf {
+	#[cfg(unix)]
+	{
+		root.join(format!("{window}.sock"))
+	}
+	#[cfg(windows)]
+	{
+		let _ = root;
+		PathBuf::from(format!(r"\\.\pipe\polariton-{window}"))
+	}
 }
 
 pub(crate) fn secure_directory(root: &Path) -> io::Result<()> {
-	DirBuilder::new().recursive(true).mode(0o700).create(root)?;
-	let metadata = fs::symlink_metadata(root)?;
-	if !metadata.is_dir() || metadata.uid() != uid() {
-		return Err(io::Error::other(
-			"agent runtime directory must be owned by this user and not a symlink",
-		));
+	key_guard::ensure_private_directory(root).map_err(io::Error::other)
+}
+
+/// A manifest file is trusted only when it is the running user's own and
+/// nobody else can read it: the runtime directory's contract, per file.
+fn owned_manifest(path: &Path, metadata: &fs::Metadata) -> bool {
+	#[cfg(unix)]
+	{
+		// SAFETY: geteuid has no preconditions and cannot fail.
+		metadata.uid() == unsafe { libc::geteuid() }
 	}
-	fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+	#[cfg(windows)]
+	{
+		let _ = metadata;
+		key_guard::open_private_key_owner_only(path).is_ok()
+	}
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) fn process_start(pid: u32) -> Option<String> {
-	let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-	// comm may itself contain spaces and parentheses; fields after its last
-	// closing parenthesis begin with field 3. Start time is field 22.
-	stat.rsplit_once(')')?
-		.1
-		.split_whitespace()
-		.nth(19)
-		.map(str::to_owned)
+	crate::process_identity::process_start(pid)
 }
 
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn process_start(pid: u32) -> Option<String> {
-	let output = std::process::Command::new("ps")
-		.args(["-o", "lstart=", "-p", &pid.to_string()])
-		.output()
-		.ok()?;
-	let token = String::from_utf8(output.stdout).ok()?.trim().to_owned();
-	(output.status.success() && !token.is_empty()).then_some(token)
-}
-
-fn mint_id() -> io::Result<String> {
-	let mut bytes = [0_u8; 16];
-	fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-	Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+fn mint_id() -> String {
+	uuid::Uuid::new_v4().simple().to_string()
 }
 
 pub(crate) struct Window {
@@ -102,10 +117,10 @@ impl Window {
 		sources: Vec<PathBuf>,
 	) -> io::Result<Self> {
 		secure_directory(&root)?;
-		let window = mint_id()?;
+		let window = mint_id();
 		let pid = std::process::id();
 		let advertisement = Advertisement {
-			socket: root.join(format!("{window}.sock")),
+			socket: endpoint_for(&root, &window),
 			window,
 			pid,
 			process_start: process_start(pid)
@@ -131,11 +146,11 @@ impl Window {
 			.root
 			.join(format!("{}.json", self.advertisement.window));
 		let temporary = path.with_extension("tmp");
-		let mut file = OpenOptions::new()
-			.write(true)
-			.create_new(true)
-			.mode(0o600)
-			.open(&temporary)?;
+		let mut options = OpenOptions::new();
+		options.write(true).create_new(true);
+		#[cfg(unix)]
+		options.mode(0o600);
+		let mut file = options.open(&temporary)?;
 		let result = (|| {
 			file.write_all(&super::encode(&self.advertisement).map_err(io::Error::other)?)?;
 			fs::rename(&temporary, &path)
@@ -153,6 +168,7 @@ impl Drop for Window {
 			self.root
 				.join(format!("{}.json", self.advertisement.window)),
 		);
+		#[cfg(unix)]
 		let _ = fs::remove_file(&self.advertisement.socket);
 	}
 }
@@ -169,9 +185,11 @@ pub(crate) fn discover(root: &Path) -> io::Result<Vec<Advertisement>> {
 			continue;
 		}
 		// Ignore malformed and foreign entries; never follow a manifest's
-		// arbitrary path when pruning its socket.
+		// arbitrary path when pruning its endpoint.
 		let metadata = fs::symlink_metadata(&path)?;
-		if !metadata.is_file() || metadata.uid() != uid() || metadata.len() > super::MAX_LINE as u64
+		if !metadata.is_file()
+			|| !owned_manifest(&path, &metadata)
+			|| metadata.len() > super::MAX_LINE as u64
 		{
 			continue;
 		}
@@ -181,7 +199,7 @@ pub(crate) fn discover(root: &Path) -> io::Result<Vec<Advertisement>> {
 		if window.window.len() != 32
 			|| !window.window.bytes().all(|b| b.is_ascii_hexdigit())
 			|| path.file_stem().and_then(|s| s.to_str()) != Some(&window.window)
-			|| window.socket != root.join(format!("{}.sock", window.window))
+			|| window.socket != endpoint_for(root, &window.window)
 		{
 			continue;
 		}
@@ -189,7 +207,8 @@ pub(crate) fn discover(root: &Path) -> io::Result<Vec<Advertisement>> {
 			windows.push(window);
 		} else {
 			let _ = fs::remove_file(&path);
-			let _ = fs::remove_file(root.join(format!("{}.sock", window.window)));
+			#[cfg(unix)]
+			let _ = fs::remove_file(endpoint_for(root, &window.window));
 		}
 	}
 	windows.sort_by(|a, b| a.window.cmp(&b.window));
@@ -234,7 +253,7 @@ pub(crate) fn select(
 }
 
 pub(crate) fn normalize(path: &Path) -> PathBuf {
-	fs::canonicalize(path).unwrap_or_else(|_| {
+	libaryon::core::canonicalize(path).unwrap_or_else(|_| {
 		if path.is_absolute() {
 			path.to_owned()
 		} else {
@@ -248,42 +267,63 @@ mod tests {
 	use super::*;
 	#[test]
 	fn product_0160_discovery_is_unique_and_prunes_reused_pids() {
-		let root = std::env::temp_dir().join(format!("p16-{}", mint_id().unwrap()));
+		let root = std::env::temp_dir().join(format!("p16-{}", mint_id()));
 		let a = Window::create(
 			root.clone(),
 			None,
 			vec![normalize(Path::new("showcase.rn"))],
 		)
 		.unwrap();
-		let mut b = Window::create(
+		let mut b = Window::create(root.clone(), Some("session".into()), vec![]).unwrap();
+		let found = discover(&root).unwrap();
+		assert_eq!(found.len(), 2);
+		// Two windows share the same source: selecting by it is ambiguous and
+		// the refusal names both candidates.
+		let shared = Window::create(
 			root.clone(),
-			Some("session".into()),
-			a.advertisement.sources.clone(),
+			None,
+			vec![normalize(Path::new("showcase.rn"))],
 		)
 		.unwrap();
-		let windows = discover(&root).unwrap();
-		assert_eq!(windows.len(), 2);
-		let error = select(&windows, &Selector::Source("showcase.rn".into())).unwrap_err();
-		assert!(error.contains(&a.advertisement.window) && error.contains(&b.advertisement.window));
-		assert_eq!(
-			select(&windows, &Selector::Window(a.advertisement.window.clone())).unwrap(),
-			a.advertisement
-		);
-		assert_eq!(
-			select(&windows, &Selector::Session("session".into())).unwrap(),
-			b.advertisement
-		);
-		assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
-		assert!(!a.advertisement.socket.exists());
-		b.advertisement.process_start.push_str("-different-process");
-		b.write().unwrap();
-		assert_eq!(discover(&root).unwrap(), vec![a.advertisement.clone()]);
+		let three = discover(&root).unwrap();
+		let error = select(&three, &Selector::Source(PathBuf::from("showcase.rn"))).unwrap_err();
 		assert!(
-			!root
-				.join(format!("{}.json", b.advertisement.window))
-				.exists()
+			error.contains(&a.advertisement.window) && error.contains(&shared.advertisement.window)
 		);
-		drop((a, b));
-		fs::remove_dir_all(root).unwrap();
+		drop(shared);
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			assert_eq!(
+				fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+				0o700
+			);
+		}
+		// The endpoint is bound only when agents are accepted, never at creation.
+		#[cfg(unix)]
+		assert!(!a.advertisement.socket.exists());
+		assert!(
+			select(&found, &Selector::Source(PathBuf::from("showcase.rn")))
+				.unwrap()
+				.window == a.advertisement.window
+		);
+		assert_eq!(
+			select(&found, &Selector::Session("session".into()))
+				.unwrap()
+				.window,
+			b.advertisement.window
+		);
+		// A manifest whose start token no longer matches its pid is pruned:
+		// the pid was recycled or the process is gone.
+		b.advertisement.process_start = "not-this-incarnation".into();
+		let _ = fs::remove_file(root.join(format!("{}.json", b.advertisement.window)));
+		b.write().unwrap();
+		let found = discover(&root).unwrap();
+		assert_eq!(found.len(), 1);
+		assert_eq!(found[0].window, a.advertisement.window);
+		assert!(select(&found, &Selector::Session("session".into())).is_err());
+		drop(a);
+		drop(b);
+		let _ = fs::remove_dir_all(&root);
 	}
 }

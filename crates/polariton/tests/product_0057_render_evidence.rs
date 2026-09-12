@@ -18,16 +18,17 @@ mod editor;
 mod fonts;
 #[path = "../src/gui/mod.rs"]
 mod gui;
-#[cfg(unix)]
 #[path = "../src/live/mod.rs"]
 mod live;
-#[cfg(feature = "toron")]
+#[cfg(feature = "toron-local")]
 #[path = "../src/local_workspace.rs"]
 mod local_workspace;
 #[path = "../src/plot/mod.rs"]
 mod plot;
 #[path = "../src/presentation_registry.rs"]
 mod presentation_registry;
+#[path = "../src/process_identity.rs"]
+mod process_identity;
 #[path = "../src/profile_store.rs"]
 mod profile_store;
 #[path = "../src/publication.rs"]

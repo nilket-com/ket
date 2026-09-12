@@ -416,8 +416,11 @@ mod tests {
 			.advertisement
 			.socket
 			.clone();
+		// A Unix socket is a file; a Windows pipe name is not.
+		#[cfg(unix)]
 		assert!(!socket.exists());
 		state.toggle_agents().unwrap();
+		#[cfg(unix)]
 		assert!(socket.exists());
 		let first_generation = state.agents.generation;
 		let (sink, _, mut welcome) = test_request();

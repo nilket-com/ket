@@ -2,7 +2,8 @@
 use super::{AppState, Message, run_markdown_cell, update_inner};
 use crate::adapters::common::{CancelCapability, DatabaseAdapter};
 use crate::driver::{
-	Command, CommandReceipt, DataDescription, Failure, NotebookDescription, Refusal,
+	Command, CommandReceipt, ConnectionDescription, DataDescription, Failure, NotebookDescription,
+	Refusal,
 };
 use crate::editor::MarkdownCellExecution;
 use iced::Task;
@@ -25,6 +26,12 @@ pub(super) enum Completion {
 	},
 	Refused(String),
 	Failed(String),
+	/// ADR 0166: the connection operation settled.
+	Connected(ConnectionDescription),
+	ConnectionFailed {
+		description: ConnectionDescription,
+		message: String,
+	},
 }
 impl Completion {
 	pub(super) fn apply(self, receipt: &mut CommandReceipt) {
@@ -35,6 +42,14 @@ impl Completion {
 			}
 			Self::Refused(message) => receipt.refuse(Refusal::Notebook { message }),
 			Self::Failed(message) => receipt.fail(Failure::Notebook { message }),
+			Self::Connected(description) => receipt.connection = Some(description),
+			Self::ConnectionFailed {
+				description,
+				message,
+			} => {
+				receipt.connection = Some(description);
+				receipt.fail(Failure::Connection { message });
+			}
 		}
 	}
 }
@@ -79,6 +94,10 @@ enum Kind {
 		path: String,
 		generation: u64,
 	},
+	/// ADR 0166: a connect attempt, settled by `connect_settled`.
+	Connect {
+		generation: u64,
+	},
 }
 impl AppState {
 	pub(super) fn start_notebook_command(
@@ -91,6 +110,7 @@ impl AppState {
 				| Command::OpenData { .. }
 				| Command::ReplaceCell { .. }
 				| Command::RunCell { .. }
+				| Command::Connect { .. }
 		) {
 			return Ok(None);
 		}
@@ -99,7 +119,7 @@ impl AppState {
 			return Err(refuse("notebook action busy".into()));
 		}
 		let mut guard = None;
-		let kind = match command {
+		let mut kind = match command {
 			Command::DescribeNotebook { buffer } => {
 				let description = self
 					.code_editor
@@ -187,6 +207,36 @@ impl AppState {
 					generation: self.connection_generation,
 				}
 			}
+			Command::Connect {
+				adapter,
+				name,
+				fields,
+			} => {
+				let refuse = |message: String| Refusal::ConnectionRefused { message };
+				let selection = crate::adapters::driver::AdapterSelection::from_type_str(adapter)
+					.ok_or_else(|| refuse(format!("unknown adapter {adapter:?}")))?;
+				if self.connect_in_flight.is_some() {
+					return Err(refuse("a connection attempt is already in flight".into()));
+				}
+				// ADR 0166 §2: the form's judgement on a candidate first; only an
+				// admitted candidate becomes the form's state, so a refusal leaves
+				// the installed connection and the reported adapter untouched.
+				let mut candidate: std::collections::BTreeMap<String, String> =
+					crate::adapters::driver::fields_for(&selection)
+						.iter()
+						.filter_map(|field| {
+							field
+								.default_value
+								.map(|value| (field.key.to_owned(), value.to_owned()))
+						})
+						.collect();
+				candidate.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+				Self::validate_candidate(&selection, &candidate, false).map_err(refuse)?;
+				self.adapter_state.select(selection);
+				self.adapter_state.name = name.clone();
+				self.adapter_state.fields = candidate;
+				Kind::Connect { generation: 0 }
+			}
 			_ => unreachable!(),
 		};
 		self.document_request_sequence = self
@@ -224,6 +274,12 @@ impl AppState {
 				},
 				move |result| Message::NotebookDataLoaded { id, result },
 			)
+		} else if matches!(kind, Kind::Connect { .. }) {
+			let task = self.begin_connect();
+			kind = Kind::Connect {
+				generation: self.connect_in_flight.unwrap_or(self.connection_generation),
+			};
+			task
 		} else {
 			unreachable!()
 		};
@@ -234,6 +290,29 @@ impl AppState {
 			kind,
 		});
 		Ok(Some((Ticket { rx, deadline }, task)))
+	}
+	/// ADR 0166: a connect attempt tagged `generation` settled; answer the
+	/// command that started it, if that is what is pending.
+	pub(super) fn complete_connect_command(
+		&mut self,
+		generation: u64,
+		outcome: Result<(), String>,
+	) {
+		let pending = matches!(
+			self.notebook_actions.work.as_ref().map(|work| &work.kind),
+			Some(Kind::Connect { generation: started }) if *started == generation
+		);
+		if !pending {
+			return;
+		}
+		let description = self.connection_description();
+		self.complete_notebook(match outcome {
+			Ok(()) => Completion::Connected(description),
+			Err(message) => Completion::ConnectionFailed {
+				description,
+				message,
+			},
+		});
 	}
 	fn complete_notebook(&mut self, result: Completion) {
 		if let Some(work) = self.notebook_actions.work.take() {
@@ -329,7 +408,7 @@ impl AppState {
 					message: Box::new(message),
 				}));
 			}
-			Kind::Data { .. } => unreachable!(),
+			Kind::Data { .. } | Kind::Connect { .. } => unreachable!(),
 		}
 		Some(Task::none())
 	}
@@ -360,10 +439,10 @@ impl AppState {
 						input_path: path.clone(),
 					};
 				self.adapter_state.name.clear();
-				let task = update_inner(
-					self,
-					Message::AdapterConnected(Ok((loaded.connection, CancelCapability::Refuse))),
-				);
+				// ADR 0166 §3: an opened file is a new connection generation.
+				self.next_connection_generation();
+				self.install_connection(loaded.connection, CancelCapability::Refuse);
+				let task = Task::none();
 				self.welcome_data_opened(&opened_path);
 				self.complete_notebook(Completion::Done {
 					notebook: None,
@@ -528,7 +607,7 @@ mod tests {
 	#[test]
 	fn product_0162_headless_file_edit_run_and_publish_share_the_application() {
 		let mut f = Fixture::new();
-		#[cfg(feature = "toron")]
+		#[cfg(feature = "toron-local")]
 		assert!(f.app.state().adapter_state.local_workspace.is_none());
 		let csv = f.root.join("own.csv");
 		std::fs::write(&csv, "x,y\n1,3\n2,6\n3,4\n").unwrap();

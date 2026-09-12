@@ -2418,7 +2418,6 @@ impl CodeEditor {
 	/// produces both, so a describe cannot pair an export with the wrong pane.
 	/// Incarnations remain alive while offscreen; returning to the viewport
 	/// must not replace their original load baseline.
-	#[cfg(unix)]
 	pub(crate) fn open_source_paths(&self) -> Vec<std::path::PathBuf> {
 		let mut paths: Vec<_> = self
 			.viewport
@@ -8896,7 +8895,7 @@ mod tests {
 		);
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(feature = "toron-local")]
 	#[test]
 	fn product_0070_saved_restart_preserves_product_0062_views_groups_and_colours_before_rerun() {
 		const CHILD: &str = "POLARITON_PRODUCT_0062_0070_RESTART_CHILD";

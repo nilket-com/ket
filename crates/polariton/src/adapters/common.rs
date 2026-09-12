@@ -26,6 +26,10 @@ pub struct AdapterField {
 	pub default_value: Option<&'static str>,
 	pub field_type: &'static AdapterFieldType,
 	pub is_secure: bool,
+	/// ADR 0165 §4: optional fields form one group; the adapter decides
+	/// whether a partial group is refused. The form requires every field
+	/// that is not optional and not secure.
+	pub is_optional: bool,
 }
 
 #[allow(dead_code)]
