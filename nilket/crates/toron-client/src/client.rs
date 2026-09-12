@@ -143,8 +143,10 @@ impl ToronClient {
 		tls: &ToronClientTls,
 	) -> Result<Self, ClientError> {
 		let remote = parse_endpoint(endpoint.as_ref())?;
-		let material = tls_pki::TlsMaterial::load(&tls.cert_path, &tls.key_path, &tls.ca_path)
-			.map_err(|error| ClientError::Configuration(error.to_string()))?;
+		// ADR 0165 §3: the client key is admitted only through the owner-only loader.
+		let material =
+			tls_pki::TlsMaterial::load_client(&tls.cert_path, &tls.key_path, &tls.ca_path)
+				.map_err(|error| ClientError::Configuration(error.to_string()))?;
 		let verifier = tls_pki::build_server_cert_chain_verifier(material.ca_roots.clone())
 			.map_err(|error| ClientError::Configuration(error.to_string()))?;
 		let rustls = tls_pki::build_rustls_client_config(&material, verifier, AUTH_QUIC_ALPN)

@@ -63,6 +63,9 @@ impl From<PkiError> for TlsError {
 			| PkiError::DerParse { .. }
 			| PkiError::CborParse { .. } => TlsError::SanShapeRejected,
 			PkiError::Config(message) => TlsError::Config(message),
+			// Client-side key custody and issuance never reach a listener; they are
+			// configuration errors if they do.
+			PkiError::KeyAccess(_) | PkiError::Issue { .. } => TlsError::Config(error.to_string()),
 		}
 	}
 }

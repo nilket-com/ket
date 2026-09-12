@@ -15,6 +15,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 mod maintenance;
+mod pki;
 
 const DEFAULT_SQL_ENDPOINT: &str = "127.0.0.1:7742";
 const DEFAULT_INSPECT_ENDPOINT: &str = "127.0.0.1:7781";
@@ -188,6 +189,9 @@ where
 		}
 		[verb, rest @ ..] if verb == "inspect" => run_inspect(rest),
 		[verb, rest @ ..] if verb == "maintenance" => maintenance::run(rest),
+		[verb, rest @ ..] if verb == "pki" => {
+			pki::run(&format!("{program} pki"), rest.iter().cloned())
+		}
 		[unknown, ..] => {
 			eprintln!("unknown toron command: {unknown}");
 			print_usage(program);
@@ -1293,6 +1297,14 @@ mod tests {
 		)
 		.expect("write cert");
 		std::fs::write(key_path, cert.serialize_private_key_pem()).expect("write key");
+		// ADR 0165 §3: the authenticated client refuses a key that is not
+		// owner-only, so the fixture writes it the way an operator must.
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))
+				.expect("restrict key");
+		}
 	}
 
 	struct CliInspectPki {

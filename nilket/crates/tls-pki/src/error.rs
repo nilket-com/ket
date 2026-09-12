@@ -15,6 +15,10 @@ pub enum PkiError {
 	},
 	#[error("tls listener_key must be unencrypted PEM PKCS#8")]
 	KeyParseNotPkcs8 { path: PathBuf },
+	#[error(transparent)]
+	KeyAccess(#[from] key_guard::KeyAccessError),
+	#[error("certificate issuance failed: {reason}")]
+	Issue { reason: String },
 	#[error("tls peer_ca file not found or unreadable: {path}")]
 	CaRead { path: PathBuf, source: pem::Error },
 	#[error("tls peer_ca file not found or unreadable: {path}")]
