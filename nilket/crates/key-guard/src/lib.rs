@@ -123,23 +123,19 @@ mod platform {
 		}
 
 		let descriptor = read_descriptor(file).map_err(inspect)?;
-		let principals = Principals {
-			user: current_user_sid()?,
-			system: well_known_sid(WinLocalSystemSid)?,
-			administrators: well_known_sid(WinBuiltinAdministratorsSid)?,
-		};
+		let principals = current_principals()?;
 		admit(&descriptor, &principals).map_err(not_private)
 	}
 
 	/// The parts of a file's security descriptor the policy judges, copied
 	/// out so judgement needs no live pointers.
-	pub(crate) struct Descriptor {
+	pub(super) struct Descriptor {
 		pub(crate) owner: Vec<u8>,
 		/// `None` is a null DACL; otherwise `(ace_type, sid)` per entry.
 		pub(crate) entries: Option<Vec<(u8, Vec<u8>)>>,
 	}
 
-	pub(crate) struct Principals {
+	pub(super) struct Principals {
 		pub(crate) user: Vec<u8>,
 		pub(crate) system: Vec<u8>,
 		pub(crate) administrators: Vec<u8>,
@@ -155,7 +151,7 @@ mod platform {
 
 	/// The policy itself, free of FFI so the foreign-owner case is testable
 	/// without the privilege to hand a file to another account.
-	pub(crate) fn admit(descriptor: &Descriptor, principals: &Principals) -> Result<(), String> {
+	pub(super) fn admit(descriptor: &Descriptor, principals: &Principals) -> Result<(), String> {
 		// The owner can rewrite the DACL at will, so an acceptable DACL under
 		// a foreign owner is only acceptable until that owner changes it.
 		if !principals.admits(&descriptor.owner) {
@@ -183,7 +179,50 @@ mod platform {
 		Ok(())
 	}
 
-	fn read_descriptor(file: &File) -> Result<Descriptor, String> {
+	/// The named-pipe policy (ADR 0166 §4), stricter than the key policy: the
+	/// running user owns the instance and is the only principal any entry
+	/// admits. SYSTEM and Administrators are not admitted: nothing in the
+	/// agent transport runs as either, so nothing should be able to reach it
+	/// as either.
+	pub(super) fn admit_pipe(descriptor: &Descriptor, user: &[u8]) -> Result<(), String> {
+		if descriptor.owner != user {
+			return Err("owned by a principal other than the running user".to_owned());
+		}
+		let Some(entries) = &descriptor.entries else {
+			return Err("null DACL grants access to everyone".to_owned());
+		};
+		for (index, (ace_type, sid)) in entries.iter().enumerate() {
+			if *ace_type != ACCESS_ALLOWED_ACE_TYPE {
+				return Err(format!(
+					"access entry {index} is type {ace_type}, not an allow entry"
+				));
+			}
+			if sid != user {
+				return Err(format!(
+					"access entry {index} admits a principal other than the running user"
+				));
+			}
+		}
+		Ok(())
+	}
+
+	pub(super) fn current_principals() -> Result<Principals, KeyAccessError> {
+		Ok(Principals {
+			user: current_user_sid()?,
+			system: well_known_sid(WinLocalSystemSid)?,
+			administrators: well_known_sid(WinBuiltinAdministratorsSid)?,
+		})
+	}
+
+	pub(super) fn read_descriptor(file: &File) -> Result<Descriptor, String> {
+		// SAFETY: the handle is open for the lifetime of `file`.
+		unsafe { read_handle_descriptor(file.as_raw_handle() as HANDLE) }
+	}
+
+	/// # Safety
+	/// `handle` must be an open handle to a file-system object (a file, a
+	/// directory, or a named pipe) for the duration of the call.
+	pub(super) unsafe fn read_handle_descriptor(handle: HANDLE) -> Result<Descriptor, String> {
 		let mut owner: *mut core::ffi::c_void = ptr::null_mut();
 		let mut dacl: *mut ACL = ptr::null_mut();
 		let mut descriptor: *mut SECURITY_DESCRIPTOR = ptr::null_mut();
@@ -191,7 +230,7 @@ mod platform {
 		// are valid; the descriptor is released below with LocalFree.
 		let status = unsafe {
 			GetSecurityInfo(
-				file.as_raw_handle() as HANDLE,
+				handle,
 				SE_FILE_OBJECT,
 				OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
 				&mut owner,
@@ -395,6 +434,25 @@ mod tests {
 		use super::*;
 		use std::process::Command;
 
+		#[test]
+		fn a_private_directory_makes_its_files_owner_only() {
+			let dir = scratch("private-dir");
+			let _ = std::fs::remove_dir_all(&dir);
+			ensure_private_directory(&dir).expect("create private directory");
+			ensure_private_directory(&dir).expect("an existing private directory passes");
+			let key = dir.join("inherited.key");
+			std::fs::write(&key, b"secret").unwrap();
+			open_private_key_owner_only(&key).expect("inherits the owner-only ACL");
+			// Widening the directory itself is refused on the next check.
+			icacls(&dir, &["/grant", "*S-1-5-32-545:(R)"]);
+			let error = ensure_private_directory(&dir).expect_err("refuse Users on the directory");
+			assert!(
+				matches!(error, KeyAccessError::NotPrivate { .. }),
+				"{error}"
+			);
+			let _ = std::fs::remove_dir_all(&dir);
+		}
+
 		/// `icacls` is the operator-facing tool for exactly these ACLs, so the
 		/// tests set them the way an operator would.
 		fn icacls(path: &Path, args: &[&str]) {
@@ -497,6 +555,42 @@ mod tests {
 			}
 
 			#[test]
+			fn the_pipe_policy_admits_the_running_user_alone() {
+				use crate::platform::admit_pipe;
+				admit_pipe(&owner_only(b"user"), b"user").unwrap();
+				// What the key policy admits, the pipe policy does not.
+				for owner in [b"system".as_slice(), b"admins"] {
+					let error = admit_pipe(&owner_only(owner), b"user").unwrap_err();
+					assert!(
+						error.contains("owned by a principal other than the running user"),
+						"{error}"
+					);
+				}
+				for extra in [b"system".as_slice(), b"admins", b"everyone"] {
+					let descriptor = Descriptor {
+						owner: b"user".to_vec(),
+						entries: Some(vec![(0, b"user".to_vec()), (0, extra.to_vec())]),
+					};
+					let error = admit_pipe(&descriptor, b"user").unwrap_err();
+					assert!(error.contains("access entry 1 admits"), "{error}");
+				}
+				let null = Descriptor {
+					owner: b"user".to_vec(),
+					entries: None,
+				};
+				assert!(admit_pipe(&null, b"user").is_err());
+				let deny = Descriptor {
+					owner: b"user".to_vec(),
+					entries: Some(vec![(1, b"user".to_vec())]),
+				};
+				assert!(
+					admit_pipe(&deny, b"user")
+						.unwrap_err()
+						.contains("not an allow entry")
+				);
+			}
+
+			#[test]
 			fn the_user_system_and_administrators_may_own_the_key() {
 				for owner in [b"user".as_slice(), b"system", b"admins"] {
 					admit(&owner_only(owner), &principals()).unwrap();
@@ -549,5 +643,321 @@ mod tests {
 			);
 			let _ = std::fs::remove_file(&path);
 		}
+	}
+}
+
+/// A directory that only its owner may enter or list: the contract for an
+/// agent runtime directory. It is distinct from the private-key contract (a
+/// key is a regular file; this must be a directory) but judged by the same
+/// principals. On Unix the directory is created `0700`, must be owned by the
+/// running user, and must not be a symlink. On Windows it is created with a
+/// protected, inheritable owner-only DACL, so files written inside satisfy
+/// [`open_private_key_owner_only`] without ACL work of their own, and an
+/// existing directory must already pass that judgement.
+pub fn ensure_private_directory(path: &Path) -> Result<(), KeyAccessError> {
+	directory::ensure_private_directory(path)
+}
+
+#[cfg(unix)]
+mod directory {
+	use super::KeyAccessError;
+	use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+	use std::path::Path;
+
+	pub(super) fn ensure_private_directory(path: &Path) -> Result<(), KeyAccessError> {
+		let inspect = |reason: String| KeyAccessError::Inspect {
+			path: path.to_path_buf(),
+			reason,
+		};
+		std::fs::DirBuilder::new()
+			.recursive(true)
+			.mode(0o700)
+			.create(path)
+			.map_err(|error| inspect(error.to_string()))?;
+		let metadata =
+			std::fs::symlink_metadata(path).map_err(|error| inspect(error.to_string()))?;
+		// SAFETY: geteuid has no preconditions and cannot fail.
+		let euid = unsafe { libc::geteuid() };
+		if !metadata.is_dir() || metadata.uid() != euid {
+			return Err(KeyAccessError::NotPrivate {
+				path: path.to_path_buf(),
+				reason: "must be a directory owned by the running user and not a symlink"
+					.to_owned(),
+			});
+		}
+		std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+			.map_err(|error| inspect(error.to_string()))
+	}
+}
+
+#[cfg(windows)]
+mod directory {
+	use super::KeyAccessError;
+	use super::platform::{Principals, admit, current_principals, read_descriptor};
+	use std::os::windows::fs::OpenOptionsExt;
+	use std::os::windows::io::AsRawHandle;
+	use std::path::Path;
+	use std::ptr;
+	use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
+	use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+	use windows_sys::Win32::Security::{
+		ACL, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+		InitializeAcl, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION,
+	};
+
+	const ACL_REVISION: u32 = 2;
+	// winbase.h: required to open a directory handle at all.
+	const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+	const READ_CONTROL: u32 = 0x0002_0000;
+	const WRITE_DAC: u32 = 0x0004_0000;
+	const GENERIC_ALL: u32 = 0x1000_0000;
+
+	pub(super) fn ensure_private_directory(path: &Path) -> Result<(), KeyAccessError> {
+		let inspect = |reason: String| KeyAccessError::Inspect {
+			path: path.to_path_buf(),
+			reason,
+		};
+		let created = !path.exists();
+		std::fs::create_dir_all(path).map_err(|error| inspect(error.to_string()))?;
+		let metadata =
+			std::fs::symlink_metadata(path).map_err(|error| inspect(error.to_string()))?;
+		if !metadata.is_dir() {
+			return Err(KeyAccessError::NotPrivate {
+				path: path.to_path_buf(),
+				reason: "must be a directory and not a reparse point".to_owned(),
+			});
+		}
+		// A directory handle needs backup semantics to open at all; reading the
+		// descriptor needs READ_CONTROL and setting it needs WRITE_DAC, which the
+		// owner always holds.
+		let handle = std::fs::OpenOptions::new()
+			.access_mode(READ_CONTROL | WRITE_DAC)
+			.custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+			.open(path)
+			.map_err(|error| inspect(error.to_string()))?;
+		let principals = current_principals()?;
+		if created {
+			set_owner_only_dacl(&handle, &principals).map_err(inspect)?;
+		}
+		let descriptor = read_descriptor(&handle).map_err(inspect)?;
+		admit(&descriptor, &principals).map_err(|reason| KeyAccessError::NotPrivate {
+			path: path.to_path_buf(),
+			reason,
+		})
+	}
+
+	/// One allow entry per admitted principal, inherited by everything
+	/// created below, and protected from the parent's inheritance.
+	fn set_owner_only_dacl(handle: &std::fs::File, principals: &Principals) -> Result<(), String> {
+		let sids = [
+			&principals.user,
+			&principals.system,
+			&principals.administrators,
+		];
+		// ACL header plus, per entry, the ACE header and mask plus the SID.
+		let size: u32 = 8 + sids.iter().map(|sid| 8 + sid.len() as u32).sum::<u32>() + 64;
+		let mut buffer = vec![0u8; size as usize];
+		let acl = buffer.as_mut_ptr() as *mut ACL;
+		// SAFETY: the buffer is `size` bytes and exclusively ours.
+		if unsafe { InitializeAcl(acl, size, ACL_REVISION) } == 0 {
+			return Err("InitializeAcl failed".to_owned());
+		}
+		for sid in sids {
+			// SAFETY: acl was initialized above; sid is a valid SID copy.
+			if unsafe {
+				AddAccessAllowedAceEx(
+					acl,
+					ACL_REVISION,
+					OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+					GENERIC_ALL,
+					sid.as_ptr() as *mut _,
+				)
+			} == 0
+			{
+				return Err("AddAccessAllowedAceEx failed".to_owned());
+			}
+		}
+		// SAFETY: the handle is open for the lifetime of `handle`; acl is valid.
+		let status = unsafe {
+			SetSecurityInfo(
+				handle.as_raw_handle() as HANDLE,
+				SE_FILE_OBJECT,
+				DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+				ptr::null_mut(),
+				ptr::null_mut(),
+				acl,
+				ptr::null_mut(),
+			)
+		};
+		if status != ERROR_SUCCESS {
+			return Err(format!("SetSecurityInfo failed with {status}"));
+		}
+		Ok(())
+	}
+}
+
+/// Windows-only helpers for a same-user named pipe (ADR 0166 §4): a
+/// self-relative security descriptor whose DACL admits the running user,
+/// `SYSTEM`, and `BUILTIN\Administrators`, and a check that a connected
+/// pipe client's token belongs to the running user.
+#[cfg(windows)]
+pub mod windows {
+	use super::KeyAccessError;
+	use super::platform::current_principals;
+	use std::ptr;
+	use windows_sys::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
+	use windows_sys::Win32::Security::Authorization::{
+		ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+		SDDL_REVISION_1,
+	};
+	use windows_sys::Win32::Security::{
+		GetSecurityDescriptorLength, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+	};
+
+	fn inspect(reason: String) -> KeyAccessError {
+		KeyAccessError::Inspect {
+			path: "<named pipe>".into(),
+			reason,
+		}
+	}
+
+	fn sid_string(sid: &[u8]) -> Result<String, KeyAccessError> {
+		let mut text: *mut u16 = ptr::null_mut();
+		// SAFETY: sid is a valid SID copy; text receives a LocalAlloc'd string.
+		if unsafe { ConvertSidToStringSidW(sid.as_ptr() as *mut _, &mut text) } == 0 {
+			return Err(inspect("ConvertSidToStringSidW failed".to_owned()));
+		}
+		let mut length = 0;
+		// SAFETY: the string is NUL-terminated.
+		while unsafe { *text.add(length) } != 0 {
+			length += 1;
+		}
+		// SAFETY: `length` UTF-16 units precede the terminator.
+		let value = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+		// SAFETY: releasing what ConvertSidToStringSidW allocated.
+		unsafe { LocalFree(text as HLOCAL) };
+		Ok(value)
+	}
+
+	/// The named-pipe server instance behind `pipe` is owned by the running
+	/// user and admits that user alone (ADR 0166 §4): the pipe policy, not
+	/// the private-key policy.
+	///
+	/// # Safety
+	/// `pipe` must be an open named-pipe handle for the duration of the call.
+	pub unsafe fn pipe_admits_current_user_only(pipe: HANDLE) -> Result<(), KeyAccessError> {
+		// SAFETY: forwarded from the caller.
+		let descriptor =
+			unsafe { super::platform::read_handle_descriptor(pipe) }.map_err(inspect)?;
+		let principals = current_principals()?;
+		super::platform::admit_pipe(&descriptor, &principals.user).map_err(|reason| {
+			KeyAccessError::NotPrivate {
+				path: "<named pipe>".into(),
+				reason,
+			}
+		})
+	}
+
+	/// A protected DACL admitting the running user alone, for creating the
+	/// agent pipe. The descriptor bytes; keep them alive for as long as the
+	/// `SECURITY_ATTRIBUTES` that points at them.
+	pub fn current_user_only_security_descriptor() -> Result<Vec<u8>, KeyAccessError> {
+		let principals = current_principals()?;
+		let user = sid_string(&principals.user)?;
+		let sddl = format!("D:P(A;;GA;;;{user})");
+		let mut wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+		let mut descriptor: *mut core::ffi::c_void = ptr::null_mut();
+		let mut size = 0_u32;
+		// SAFETY: wide is NUL-terminated; descriptor receives a LocalAlloc'd
+		// self-relative descriptor of `size` bytes.
+		if unsafe {
+			ConvertStringSecurityDescriptorToSecurityDescriptorW(
+				wide.as_mut_ptr(),
+				SDDL_REVISION_1,
+				&mut descriptor as *mut _ as *mut _,
+				&mut size,
+			)
+		} == 0
+		{
+			return Err(inspect("SDDL conversion failed".to_owned()));
+		}
+		// SAFETY: descriptor is valid; its length is what the conversion reported.
+		let length = unsafe { GetSecurityDescriptorLength(descriptor as *mut _) } as usize;
+		// SAFETY: `length` bytes are readable at descriptor.
+		let bytes = unsafe { std::slice::from_raw_parts(descriptor as *const u8, length) }.to_vec();
+		// SAFETY: releasing the conversion's allocation.
+		unsafe { LocalFree(descriptor as HLOCAL) };
+		Ok(bytes)
+	}
+
+	/// The client at the far end of the named-pipe server instance `pipe` runs
+	/// as the current user: its process token's user SID equals ours. This is
+	/// a token comparison, not impersonation.
+	///
+	/// # Safety
+	/// `pipe` must be an open, connected named-pipe server handle for the
+	/// duration of the call.
+	pub unsafe fn pipe_client_is_current_user(pipe: HANDLE) -> Result<bool, KeyAccessError> {
+		use windows_sys::Win32::Foundation::CloseHandle;
+		use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+		use windows_sys::Win32::System::Threading::{
+			OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+		};
+		let mut pid = 0_u32;
+		// SAFETY: pipe is a connected server end owned by the caller.
+		if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } == 0 {
+			return Err(inspect("GetNamedPipeClientProcessId failed".to_owned()));
+		}
+		// SAFETY: querying a process object needs no memory preconditions.
+		let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+		if process.is_null() {
+			return Err(inspect(format!("cannot open pipe client process {pid}")));
+		}
+		let mut token: HANDLE = ptr::null_mut();
+		// SAFETY: process is a valid handle from OpenProcess.
+		let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } != 0;
+		// SAFETY: closing the handle we opened.
+		unsafe { CloseHandle(process) };
+		if !opened {
+			return Err(inspect(
+				"OpenProcessToken failed for the pipe client".to_owned(),
+			));
+		}
+		let result = token_user_sid(token);
+		// SAFETY: closing the token we opened.
+		unsafe { CloseHandle(token) };
+		let client = sid_string(&result?)?;
+		let own = sid_string(&current_principals()?.user)?;
+		Ok(client == own)
+	}
+
+	fn token_user_sid(token: HANDLE) -> Result<Vec<u8>, KeyAccessError> {
+		let mut needed = 0_u32;
+		// SAFETY: a null buffer with zero length asks for the needed size.
+		unsafe { GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut needed) };
+		let mut buffer = vec![0u8; needed as usize];
+		// SAFETY: the buffer is the size the previous call asked for.
+		if unsafe {
+			GetTokenInformation(
+				token,
+				TokenUser,
+				buffer.as_mut_ptr() as *mut _,
+				needed,
+				&mut needed,
+			)
+		} == 0
+		{
+			return Err(inspect("GetTokenInformation(TokenUser) failed".to_owned()));
+		}
+		// SAFETY: the buffer holds a TOKEN_USER whose Sid points inside it.
+		let token_user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
+		// SAFETY: GetLengthSid on a SID GetTokenInformation returned.
+		let length =
+			unsafe { windows_sys::Win32::Security::GetLengthSid(token_user.User.Sid) } as usize;
+		// SAFETY: sid points to `length` bytes inside `buffer`.
+		Ok(
+			unsafe { std::slice::from_raw_parts(token_user.User.Sid as *const u8, length) }
+				.to_vec(),
+		)
 	}
 }
