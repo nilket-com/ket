@@ -19,8 +19,11 @@ global `commit.gpgsign=true` reached the fixture repositories; and the
 supervisor's shutdown-order test could not trap `SIGINT` in its `/bin/sh`
 fixtures because the lane had been launched as an `&` job of a
 non-interactive shell, which POSIX requires to ignore `SIGINT` and
-`SIGQUIT` for that job. Supplying each condition by hand made the lane pass
-(8,145 tests and then the single remaining target, 14 tests), which fixed
+`SIGQUIT` for that job. Supplying each condition by hand made the lane pass: 8,145 tests with the
+shutdown-order test as the sole failure, then that one target alone at 14
+passed. The 13 other tests of that target were already inside the 8,145,
+so the lane's true total is 8,146, the figure both acceptance runs below
+report; an earlier working figure of 8,159 double-counted them. This fixed
 the diagnosis before any script changed.
 
 Git isolation is the operator's entire global and system configuration,
