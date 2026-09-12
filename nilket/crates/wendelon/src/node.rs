@@ -130,7 +130,9 @@ use tokio_rustls::TlsAcceptor;
 // The bootstrap/default tenant stays unbounded in W5 so dev and
 // single-tenant clusters exercise the same tenant create/quota code path
 // without tripping an arbitrary cap before operators set a real quota.
-const DEFAULT_TENANT_QUOTA_BYTES: u64 = u64::MAX;
+/// The quota the bootstrap tenant receives, and ADR 0167's default for a
+/// tenant an operator creates without naming one.
+pub const DEFAULT_TENANT_QUOTA_BYTES: u64 = u64::MAX;
 const SECONDARY_INDEX_LIFECYCLE_INTERVAL: Duration = Duration::from_secs(1);
 const SECONDARY_INDEX_BACKFILL_SLABS_PER_TICK: usize = 8;
 

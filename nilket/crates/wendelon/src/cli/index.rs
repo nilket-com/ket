@@ -30,14 +30,59 @@ use crate::schema::{
 	encode_secondary_index_drop_request,
 };
 
+/// How an operator command reaches the cluster: one bootstrap node and the
+/// identity it presents. Shared by `index` and `tenant` (ADR 0167).
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ConnectionOptions {
-	bootstrap_node_id: u32,
-	bootstrap_address: String,
-	cert_path: PathBuf,
-	key_path: PathBuf,
-	ca_path: PathBuf,
-	cluster_domain: String,
+pub(super) struct ConnectionOptions {
+	pub(super) bootstrap_node_id: u32,
+	pub(super) bootstrap_address: String,
+	pub(super) cert_path: PathBuf,
+	pub(super) key_path: PathBuf,
+	pub(super) ca_path: PathBuf,
+	pub(super) cluster_domain: String,
+}
+
+/// Parse the connection flags alone, in `--flag value` pairs, for the
+/// command named by `program` (used in messages).
+pub(super) fn parse_connection(
+	program: &str,
+	args: &[String],
+) -> Result<ConnectionOptions, String> {
+	let mut bootstrap = None;
+	let mut cert_path = None;
+	let mut key_path = None;
+	let mut ca_path = None;
+	let mut cluster_domain = DEFAULT_CLUSTER_DOMAIN.to_owned();
+	let mut cursor = 0usize;
+	while let Some(flag) = args.get(cursor) {
+		let value = args
+			.get(cursor + 1)
+			.cloned()
+			.ok_or_else(|| format!("{program} {flag} requires a value"))?;
+		match flag.as_str() {
+			"--bootstrap" => bootstrap = Some(value),
+			"--cert" => cert_path = Some(PathBuf::from(value)),
+			"--key" => key_path = Some(PathBuf::from(value)),
+			"--ca" => ca_path = Some(PathBuf::from(value)),
+			"--cluster-domain" => cluster_domain = value,
+			unknown => return Err(format!("unknown {program} option: {unknown}")),
+		}
+		cursor += 2;
+	}
+	let bootstrap = bootstrap.ok_or_else(|| format!("{program} requires --bootstrap"))?;
+	let (node_id, address) = bootstrap
+		.split_once('@')
+		.ok_or_else(|| "--bootstrap must be <node-id>@<address>".to_owned())?;
+	Ok(ConnectionOptions {
+		bootstrap_node_id: node_id
+			.parse::<u32>()
+			.map_err(|error| format!("invalid bootstrap node id: {error}"))?,
+		bootstrap_address: address.to_owned(),
+		cert_path: cert_path.ok_or_else(|| format!("{program} requires --cert"))?,
+		key_path: key_path.ok_or_else(|| format!("{program} requires --key"))?,
+		ca_path: ca_path.ok_or_else(|| format!("{program} requires --ca"))?,
+		cluster_domain,
+	})
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,7 +233,7 @@ fn operator_envelope(
 	)
 }
 
-async fn connect(options: &ConnectionOptions) -> std::io::Result<Arc<WendelonClient>> {
+pub(super) async fn connect(options: &ConnectionOptions) -> std::io::Result<Arc<WendelonClient>> {
 	let material = TlsMaterial::load(&options.cert_path, &options.key_path, &options.ca_path)?;
 	let endpoint = Arc::new(endpoint_from_tls(&material, "0.0.0.0:0".parse().unwrap())?);
 	let provider: Arc<dyn TransportProvider> =

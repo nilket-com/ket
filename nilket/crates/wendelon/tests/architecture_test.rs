@@ -9881,3 +9881,32 @@ fn adr0093_test_support_is_non_default_and_every_hook_site_is_gated() {
 	assert_eq!(control.matches("take_reclaim_delay(").count(), 0);
 	assert_eq!(control.matches("delay_next_drop_reclaim(").count(), 0);
 }
+
+/// ADR 0167: tenant provisioning is an operator command over the existing
+/// tenant administration RPC. The CLI dispatches `tenant`, documents its
+/// three verbs, and the client sends the opcode the handler already serves.
+#[test]
+fn adr0167_wendelon_tenant_command_reaches_the_tenant_admin_rpc() {
+	let cli = wendelon_cli_source();
+	assert!(cli.contains("[cmd, rest @ ..] if cmd == \"tenant\" => tenant::run(rest)"));
+	for verb in ["tenant create", "tenant get", "tenant list"] {
+		assert!(
+			cli.contains(&format!("{{program}} {verb} --bootstrap")),
+			"{verb} documented"
+		);
+	}
+	let client =
+		std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/client/core.rs"))
+			.expect("client source");
+	assert!(client.contains("msg_type: MsgType::TENANT_ADMIN_REQ.0"));
+	assert!(client.contains("pub async fn tenant_admin("));
+	let tenant = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/cli/tenant.rs"))
+		.expect("tenant CLI source");
+	// The CLI is a client of the RPC, never an in-process node.
+	for forbidden in ["WendelonNode", "create_tenant(", "state_machine"] {
+		assert!(
+			!tenant.contains(forbidden),
+			"tenant CLI must not use {forbidden}"
+		);
+	}
+}

@@ -31,8 +31,8 @@ pub use config_builder::{
 pub use development::{DevelopmentPki, write_local_development_pki};
 pub use error::PkiError;
 pub use issue::{
-	IssuedPem, generate_ca, issue_listener, issue_storage, load_ca, sign_client_csr,
-	validate_tenant_token,
+	IssuedPem, generate_ca, issue_listener, issue_operator, issue_storage, load_ca,
+	sign_client_csr, validate_tenant_token,
 };
 pub use material::{
 	TlsMaterial, load_ca_roots, load_ca_roots_from_pem, load_cert_chain, load_cert_chain_from_pem,

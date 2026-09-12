@@ -47,8 +47,9 @@ use crate::integration::compute::{
 use crate::metrics::NetworkCompressionPath;
 use crate::network::control_server::{
 	CONTROL_REASON_AUTHORIZATION_FAILED, CONTROL_REASON_GRANTED, CONTROL_REASON_INVALID_CONFIG,
-	CONTROL_REASON_NOT_FOUND, CONTROL_REASON_NOT_LEADER, SchemaUpdateResponseWire,
-	SecondaryIndexStatusResponseWire,
+	CONTROL_REASON_INVALID_TARGET, CONTROL_REASON_NOT_FOUND, CONTROL_REASON_NOT_LEADER,
+	SchemaUpdateResponseWire, SecondaryIndexStatusResponseWire, TenantAdminRequestWire,
+	TenantAdminResponseWire,
 };
 use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
@@ -1955,6 +1956,86 @@ impl WendelonClient {
 			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
 		let frame = read_frame(&mut *stream, &self.pool).await?;
 		decode_table_descriptor_get_response_frame(frame)
+	}
+
+	/// ADR 0167: tenant administration over the control ring. The request is
+	/// sent to the leader, following one redirect per attempt within the
+	/// retry budget; an accepted response is returned whole so the caller
+	/// reads the record or the list, and a rejection becomes the error the
+	/// handler's reason code names.
+	pub async fn tenant_admin(
+		&self,
+		request: &TenantAdminRequestWire,
+	) -> std::io::Result<TenantAdminResponseWire> {
+		let payload = crate::network::wire::encode(request)?;
+		let mut preferred_target = self.leader();
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = match preferred_target.or_else(|| self.leader()) {
+				Some(target) => target,
+				None => {
+					self.refresh_topology().await?;
+					self.leader().ok_or_else(|| {
+						Error::new(
+							ErrorKind::NotConnected,
+							"tenant administration requires a known Control Ring leader",
+						)
+					})?
+				}
+			};
+			let response = self.tenant_admin_once(target, &payload).await?;
+			if let Some(leader) = response.leader_hint {
+				*self.leader.write().unwrap() = Some(NodeId {
+					id: leader,
+					_reserved: 0,
+				});
+			}
+			if response.reason_code == CONTROL_REASON_NOT_LEADER && attempt + 1 < DATA_RETRY_BUDGET
+			{
+				let retry = RetryDirective::redirect(
+					response.leader_hint.map(|id| NodeId { id, _reserved: 0 }),
+				);
+				self.prepare_retry(None, retry).await?;
+				preferred_target = retry.preferred_target.or_else(|| self.leader());
+				continue;
+			}
+			return tenant_admin_outcome(response);
+		}
+		unreachable!("bounded retry loop must return within budget")
+	}
+
+	async fn tenant_admin_once(
+		&self,
+		target: NodeId,
+		payload: &[u8],
+	) -> std::io::Result<TenantAdminResponseWire> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TENANT_ADMIN_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: payload.len() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, payload, None, None).await?;
+		stream
+			.finish()
+			.await
+			.map_err(|error| Error::new(ErrorKind::BrokenPipe, error))?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		if frame.header.msg_type != MsgType::TENANT_ADMIN_RESP.0
+			|| frame.arrow_payload.is_some()
+			|| frame.trailing.is_some()
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"invalid TENANT_ADMIN_RESP frame",
+			));
+		}
+		crate::network::wire::decode(&frame.meta)
 	}
 
 	async fn schema_update_once(
@@ -5259,5 +5340,77 @@ mod tests {
 		let f = KeyRange::full();
 		assert_eq!(f.start_locality, Locality::ZERO);
 		assert_eq!(f.end_locality, Locality::MAX);
+	}
+}
+
+/// The handler's verdict as an error the operator can act on: the reason
+/// code selects the kind, the handler's message is kept verbatim, and an
+/// accepted response is returned whole. Pure, so the mapping is tested
+/// without a cluster.
+pub fn tenant_admin_outcome(
+	response: TenantAdminResponseWire,
+) -> std::io::Result<TenantAdminResponseWire> {
+	if response.accepted && response.reason_code == CONTROL_REASON_GRANTED {
+		return Ok(response);
+	}
+	let kind = match response.reason_code {
+		CONTROL_REASON_AUTHORIZATION_FAILED => ErrorKind::PermissionDenied,
+		CONTROL_REASON_NOT_FOUND => ErrorKind::NotFound,
+		CONTROL_REASON_INVALID_TARGET => ErrorKind::AlreadyExists,
+		CONTROL_REASON_INVALID_CONFIG => ErrorKind::InvalidInput,
+		CONTROL_REASON_NOT_LEADER => ErrorKind::NotConnected,
+		_ => ErrorKind::Other,
+	};
+	Err(Error::new(
+		kind,
+		response.message.unwrap_or_else(|| {
+			format!(
+				"tenant administration rejected: reason {}",
+				response.reason_code
+			)
+		}),
+	))
+}
+
+#[cfg(test)]
+mod tenant_admin_outcome_tests {
+	use super::*;
+
+	fn response(accepted: bool, reason_code: u8, message: Option<&str>) -> TenantAdminResponseWire {
+		TenantAdminResponseWire {
+			accepted,
+			reason_code,
+			leader_hint: None,
+			tenant: None,
+			tenants: Vec::new(),
+			message: message.map(str::to_owned),
+		}
+	}
+
+	#[test]
+	fn adr0167_reason_codes_become_actionable_error_kinds_with_the_handlers_message() {
+		assert!(tenant_admin_outcome(response(true, CONTROL_REASON_GRANTED, None)).is_ok());
+		let exists = tenant_admin_outcome(response(
+			false,
+			CONTROL_REASON_INVALID_TARGET,
+			Some("tenant 7 already exists"),
+		))
+		.unwrap_err();
+		assert_eq!(exists.kind(), ErrorKind::AlreadyExists);
+		assert_eq!(exists.to_string(), "tenant 7 already exists");
+		assert_eq!(
+			tenant_admin_outcome(response(false, CONTROL_REASON_AUTHORIZATION_FAILED, None))
+				.unwrap_err()
+				.kind(),
+			ErrorKind::PermissionDenied
+		);
+		assert_eq!(
+			tenant_admin_outcome(response(false, CONTROL_REASON_NOT_FOUND, None))
+				.unwrap_err()
+				.kind(),
+			ErrorKind::NotFound
+		);
+		// Accepted without GRANTED is not a success.
+		assert!(tenant_admin_outcome(response(true, CONTROL_REASON_INVALID_CONFIG, None)).is_err());
 	}
 }

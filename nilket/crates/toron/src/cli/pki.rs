@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use tls_pki::{
-	DEFAULT_CLUSTER_DOMAIN, generate_ca, issue_listener, issue_storage, load_ca, sign_client_csr,
+	DEFAULT_CLUSTER_DOMAIN, generate_ca, issue_listener, issue_operator, issue_storage, load_ca,
+	sign_client_csr,
 };
 
 pub fn run<I>(program: &str, args: I) -> ExitCode
@@ -33,6 +34,7 @@ where
 		Some("issue-listener") => report(issue_listener_command(&args[1..])),
 		Some("sign-client") => report(sign_client(&args[1..])),
 		Some("issue-storage") => report(issue_storage_command(&args[1..])),
+		Some("issue-operator") => report(issue_operator_command(&args[1..])),
 		Some("--help") | Some("-h") | None => {
 			print_usage(program);
 			ExitCode::SUCCESS
@@ -62,7 +64,9 @@ fn print_usage(program: &str) {
 	eprintln!(
 		"Usage: {program} COMMAND [OPTIONS]\n\nCommands:\n  init-ca --dir DIR [--name NAME]\n      Create ca.crt and ca.key in DIR.\n  issue-listener --dir DIR --worker-id UUID [--cluster-domain DOMAIN]\n      Create listener.crt and listener.key in DIR for a Toron node.\n  sign-client --dir DIR --csr FILE --tenant N --out FILE [--cluster-domain DOMAIN]\n      Sign a client's certificate request for tenant N; writes only the certificate.
   issue-storage --ca-cert FILE --ca-key FILE --tenant N --out-dir DIR [--node-index I] [--cluster-domain DOMAIN]
-      Create toron-storage.crt and toron-storage.key claiming tenant N, signed by the node CA."
+      Create toron-storage.crt and toron-storage.key claiming tenant N, signed by the node CA.
+  issue-operator --ca-cert FILE --ca-key FILE --out-dir DIR [--name NAME]
+      Create operator.crt and operator.key (role operator, no tenant), signed by the operator CA (ADR 0167)."
 	);
 }
 
@@ -201,6 +205,34 @@ fn issue_storage_command(args: &[String]) -> Result<String, String> {
 	))
 }
 
+fn issue_operator_command(args: &[String]) -> Result<String, String> {
+	let options = Options::parse(args, &["--ca-cert", "--ca-key", "--out-dir", "--name"])?;
+	let ca_cert = std::fs::read_to_string(options.required("--ca-cert")?)
+		.map_err(|error| format!("read --ca-cert: {error}"))?;
+	let ca_key = std::fs::read_to_string(options.required("--ca-key")?)
+		.map_err(|error| format!("read --ca-key: {error}"))?;
+	let out = PathBuf::from(options.required("--out-dir")?);
+	let name = options.get("--name").unwrap_or("operator");
+	let ca = load_ca(&ca_cert, &ca_key).map_err(|error| error.to_string())?;
+	// The key id is random: it distinguishes issued operator leaves from one
+	// another and from the development leaf, and carries no other meaning.
+	let key_id = uuid::Uuid::new_v4().as_bytes().to_vec();
+	let issued = issue_operator(&ca, name, &key_id).map_err(|error| error.to_string())?;
+	std::fs::create_dir_all(&out).map_err(|error| format!("create {}: {error}", out.display()))?;
+	write_cert(&out.join("operator.crt"), &issued.cert)?;
+	write_key(
+		&out.join("operator.key"),
+		issued
+			.key
+			.as_deref()
+			.expect("an operator identity has a key"),
+	)?;
+	Ok(format!(
+		"wrote {}/operator.crt and operator.key for operator {name} (role operator, no tenant)",
+		out.display()
+	))
+}
+
 fn read_ca(dir: &Path) -> Result<rcgen::Certificate, String> {
 	let cert = std::fs::read_to_string(dir.join("ca.crt"))
 		.map_err(|error| format!("read {}/ca.crt: {error}", dir.display()))?;
@@ -256,6 +288,42 @@ mod tests {
 			)
 			.is_err()
 		);
+	}
+
+	/// ADR 0167 §2: an operator identity is issued into a directory with its
+	/// key owner-only, and never overwrites an earlier one.
+	#[test]
+	fn issue_operator_writes_an_owner_only_key_once() {
+		let dir = std::env::temp_dir().join(format!("nilket-pki-op-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		init_ca(&["--dir".to_owned(), dir.display().to_string()]).unwrap();
+		let out = dir.join("ops");
+		let args = [
+			"--ca-cert".to_owned(),
+			dir.join("ca.crt").display().to_string(),
+			"--ca-key".to_owned(),
+			dir.join("ca.key").display().to_string(),
+			"--out-dir".to_owned(),
+			out.display().to_string(),
+			"--name".to_owned(),
+			"bigfoot-ops".to_owned(),
+		];
+		let message = issue_operator_command(&args).unwrap();
+		assert!(message.contains("operator bigfoot-ops"), "{message}");
+		assert!(out.join("operator.crt").exists());
+		{
+			use std::os::unix::fs::PermissionsExt;
+			let mode = std::fs::metadata(out.join("operator.key"))
+				.unwrap()
+				.permissions()
+				.mode() & 0o777;
+			assert_eq!(mode, 0o600);
+		}
+		assert!(
+			issue_operator_command(&args).is_err(),
+			"never overwrite an issued identity"
+		);
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 
 	#[test]

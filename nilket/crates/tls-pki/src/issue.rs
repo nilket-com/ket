@@ -75,6 +75,24 @@ pub fn issue_listener(
 	})
 }
 
+/// An operator's identity toward Wendelon (ADR 0167): role `operator`, no
+/// tenant claim, no DNS name, signed by the operator CA. It is what tenant
+/// administration is authorized against; a deployment beyond `nilket local`
+/// has one because an operator issued it, never the development leaf.
+pub fn issue_operator(ca: &Certificate, name: &str, key_id: &[u8]) -> Result<IssuedPem, PkiError> {
+	if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+		return Err(PkiError::Issue {
+			reason: format!("operator name {name:?} must be ASCII letters, digits, and hyphens"),
+		});
+	}
+	let leaf = crate::claims::claimed_leaf(name, None, "operator", None, key_id.to_vec())
+		.map_err(rcgen_error)?;
+	Ok(IssuedPem {
+		cert: leaf.serialize_pem_with_signer(ca).map_err(rcgen_error)?,
+		key: Some(leaf.serialize_private_key_pem()),
+	})
+}
+
 /// A node's storage identity toward Wendelon: SAN `node-<index>.<domain>`,
 /// role `data_node`, and the tenant claim Wendelon authorizes schema and data
 /// operations against. A Toron node serves the tenant its storage identity
@@ -234,6 +252,27 @@ mod tests {
 		assert!(
 			issue_storage(&ca, "0", DOMAIN, 2).is_err(),
 			"tenant 0 is not a tenant token"
+		);
+	}
+
+	/// ADR 0167 §2: an issued operator identity claims role operator and no
+	/// tenant, names no host, and chains to the CA that signed it.
+	#[test]
+	fn an_operator_identity_claims_operator_and_no_tenant() {
+		let ca_pem = generate_ca("operator-ca").unwrap();
+		let ca = load_ca(&ca_pem.cert, ca_pem.key.as_deref().unwrap()).unwrap();
+		let issued = issue_operator(&ca, "bigfoot-ops", b"key-7").unwrap();
+		let chain = load_cert_chain_from_pem(&issued.cert).unwrap();
+		assert!(extract_dns_sans(&chain[0]).unwrap().is_empty());
+		let claims = crate::extract_extension(&chain[0], &[1, 3, 6, 1, 4, 1, 55555, 1, 1])
+			.expect("claims extension")
+			.expect("claims present");
+		assert_eq!(claims, crate::actor_claims("operator", None, b"key-7"));
+		assert!(issued.key.is_some(), "the operator holds the key");
+		assert!(issue_operator(&ca, "", b"k").is_err());
+		assert!(
+			issue_operator(&ca, "ops team", b"k").is_err(),
+			"no spaces in a name"
 		);
 	}
 
