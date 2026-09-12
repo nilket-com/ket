@@ -2,8 +2,8 @@
 use super::{AppState, Message, run_markdown_cell, update_inner};
 use crate::adapters::common::{CancelCapability, DatabaseAdapter};
 use crate::driver::{
-	Command, CommandReceipt, ConnectionDescription, DataDescription, Failure, NotebookDescription,
-	Refusal,
+	Command, CommandReceipt, ConnectionDescription, DataDescription, ExecutionDescription, Failure,
+	NotebookDescription, Refusal,
 };
 use crate::editor::MarkdownCellExecution;
 use iced::Task;
@@ -34,6 +34,11 @@ pub(super) enum Completion {
 		description: ConnectionDescription,
 		message: String,
 	},
+	/// ADR 0169 §3: one identified execution settled, on its own terms.
+	Execution {
+		description: ExecutionDescription,
+		outcome: Result<(), String>,
+	},
 }
 impl Completion {
 	pub(super) fn apply(self, receipt: &mut CommandReceipt) {
@@ -57,21 +62,28 @@ impl Completion {
 				receipt.connection = Some(description);
 				receipt.fail(Failure::Connection { message });
 			}
+			Self::Execution {
+				description,
+				outcome,
+			} => {
+				receipt.execution = Some(description);
+				if let Err(message) = outcome {
+					receipt.fail(Failure::Notebook { message });
+				}
+			}
 		}
 	}
 }
 pub(super) struct Ticket {
 	rx: watch::Receiver<Option<Completion>>,
 	deadline: Instant,
+	deadline_message: String,
 }
 impl Ticket {
 	pub(super) fn result(&self) -> Option<Completion> {
 		self.rx.borrow().clone().or_else(|| {
-			(Instant::now() >= self.deadline).then(|| {
-				Completion::Failed(
-					"notebook deadline: outcome unknown; do not replay automatically".into(),
-				)
-			})
+			(Instant::now() >= self.deadline)
+				.then(|| Completion::Failed(self.deadline_message.clone()))
 		})
 	}
 }
@@ -105,6 +117,13 @@ enum Kind {
 	Connect {
 		generation: u64,
 	},
+	/// ADR 0169: one execution of the open Rune source; `revision` is the
+	/// window's execution id once the run has started.
+	RunSource {
+		buffer: BufferId,
+		revision: u64,
+		description: ExecutionDescription,
+	},
 }
 impl AppState {
 	pub(super) fn start_notebook_command(
@@ -118,10 +137,21 @@ impl AppState {
 				| Command::ReplaceCell { .. }
 				| Command::RunCell { .. }
 				| Command::Connect { .. }
+				| Command::RunSource {}
 		) {
 			return Ok(None);
 		}
 		let refuse = |message: String| Refusal::Notebook { message };
+		if let Some(Work {
+			kind: Kind::RunSource { revision, .. },
+			..
+		}) = &self.notebook_actions.work
+		{
+			// ADR 0169 §3: an overlapping request names the execution in flight.
+			return Err(refuse(format!(
+				"an execution is in flight: {revision}; wait for its receipt"
+			)));
+		}
 		if self.notebook_actions.work.is_some() {
 			return Err(refuse("notebook action busy".into()));
 		}
@@ -205,6 +235,54 @@ impl AppState {
 					render_token: None,
 				}
 			}
+			Command::RunSource {} => {
+				if self.code_editor.is_notebook() {
+					return Err(refuse(
+						"the open source is a notebook; run its cells with run_cell".into(),
+					));
+				}
+				let language = self
+					.code_editor
+					.active_language_id()
+					.ok_or_else(|| refuse("no source is open".into()))?;
+				if language.as_str() != "rune" {
+					return Err(refuse(format!(
+						"the open source is {language}, not a Rune source"
+					)));
+				}
+				let buffer = self
+					.code_editor
+					.active_buffer_id()
+					.ok_or_else(|| refuse("the open source has no buffer identity".into()))?;
+				let (_, generation) = self
+					.code_editor
+					.document_snapshot(buffer)
+					.ok_or_else(|| refuse("the source text is not yet projected".into()))?;
+				#[cfg(not(feature = "toron"))]
+				{
+					let _ = (buffer, generation);
+					return Err(refuse(
+						"running a source requires Polariton's toron feature".into(),
+					));
+				}
+				#[cfg(feature = "toron")]
+				if self.adapter_state.rune_connection().is_none() {
+					return Err(refuse(
+						"no Rune connection: connect to a Toron before run_source".into(),
+					));
+				}
+				guard = Some((buffer, generation, vec![]));
+				Kind::RunSource {
+					buffer,
+					revision: 0,
+					description: ExecutionDescription {
+						buffer: buffer.get().to_string(),
+						generation: generation.get().to_string(),
+						connection_generation: self.connection_generation,
+						id: 0,
+					},
+				}
+			}
 			Command::OpenData { path } => {
 				if path.is_empty() {
 					return Err(refuse("data path is required".into()));
@@ -252,7 +330,17 @@ impl AppState {
 			.ok_or_else(|| refuse("document request ids exhausted".into()))?;
 		let id = RequestId::new(self.document_request_sequence);
 		let (done, rx) = watch::channel(None);
-		let deadline = Instant::now() + Duration::from_secs(60);
+		let (deadline, deadline_message) = if matches!(kind, Kind::RunSource { .. }) {
+			(
+				Instant::now() + Duration::from_secs(600),
+				"the execution did not settle within 600 s; its late outcome is dropped".to_owned(),
+			)
+		} else {
+			(
+				Instant::now() + Duration::from_secs(60),
+				"notebook deadline: outcome unknown; do not replay automatically".to_owned(),
+			)
+		};
 		let task = if let Some((buffer, generation, edits)) = guard {
 			if !self
 				.code_editor
@@ -296,7 +384,14 @@ impl AppState {
 			done,
 			kind,
 		});
-		Ok(Some((Ticket { rx, deadline }, task)))
+		Ok(Some((
+			Ticket {
+				rx,
+				deadline,
+				deadline_message,
+			},
+			task,
+		)))
 	}
 	/// ADR 0166: a connect attempt tagged `generation` settled; answer the
 	/// command that started it, if that is what is pending.
@@ -324,6 +419,95 @@ impl AppState {
 	fn complete_notebook(&mut self, result: Completion) {
 		if let Some(work) = self.notebook_actions.work.take() {
 			work.done.send_replace(Some(result));
+		}
+	}
+	/// ADR 0169 §3: the execution's own verdict. Superseded, edited under,
+	/// reconnected under, or errored is a failure naming the cause; done is
+	/// the scheduler idle for it with every retained relation complete.
+	fn settle_execution(
+		&mut self,
+		buffer: BufferId,
+		revision: u64,
+		plain: Option<Result<(), String>>,
+	) {
+		let Some(Work {
+			kind: Kind::RunSource { description, .. },
+			..
+		}) = &self.notebook_actions.work
+		else {
+			return;
+		};
+		let description = description.clone();
+		if self.rune_buffer_revisions.get(&buffer) != Some(&revision) {
+			return self.fail_execution(format!(
+				"execution {revision} was superseded by a newer run of the source"
+			));
+		}
+		let generation = self
+			.code_editor
+			.document_snapshot(buffer)
+			.map(|(_, generation)| generation.get().to_string());
+		if generation.as_deref() != Some(description.generation.as_str()) {
+			return self.fail_execution(format!("the source changed during execution {revision}"));
+		}
+		if self.connection_generation != description.connection_generation {
+			return self.fail_execution(format!(
+				"the connection changed during execution {revision}: generation {} is now {}",
+				description.connection_generation, self.connection_generation
+			));
+		}
+		if !self.status_error.is_empty() {
+			let message = self.status_error.clone();
+			return self.fail_execution(format!("execution {revision} failed: {message}"));
+		}
+		if let Some(outcome) = plain {
+			return match outcome {
+				Ok(()) => self.complete_execution(),
+				Err(message) => {
+					self.fail_execution(format!("execution {revision} failed: {message}"))
+				}
+			};
+		}
+		#[cfg(feature = "toron")]
+		{
+			let retained = self
+				.retained_rune_relations
+				.get(&buffer)
+				.is_some_and(|retained| {
+					retained.revision == revision && retained.artifacts.iter().all(Option::is_some)
+				});
+			if retained
+				&& self.rune_view_scheduler.is_idle()
+				&& self.code_editor.host_panels_running() == 0
+			{
+				self.complete_execution();
+			}
+		}
+	}
+	fn complete_execution(&mut self) {
+		if let Some(Work {
+			kind: Kind::RunSource { description, .. },
+			..
+		}) = &self.notebook_actions.work
+		{
+			let description = description.clone();
+			self.complete_notebook(Completion::Execution {
+				description,
+				outcome: Ok(()),
+			});
+		}
+	}
+	fn fail_execution(&mut self, message: String) {
+		if let Some(Work {
+			kind: Kind::RunSource { description, .. },
+			..
+		}) = &self.notebook_actions.work
+		{
+			let description = description.clone();
+			self.complete_notebook(Completion::Execution {
+				description,
+				outcome: Err(message),
+			});
 		}
 	}
 	pub(super) fn expire_notebook_action(&mut self) {
@@ -418,6 +602,47 @@ impl AppState {
 					message: Box::new(message),
 				}));
 			}
+			Kind::RunSource { buffer, .. } => {
+				let id = work.id;
+				let buffer = *buffer;
+				self.status_error.clear();
+				let Some((code, generation)) = self
+					.code_editor
+					.document_snapshot(buffer)
+					.map(|(text, generation)| (text.to_owned(), generation))
+				else {
+					self.fail_execution("the source text is not yet projected".into());
+					return Some(Task::none());
+				};
+				// The run is started for this buffer directly, never through the
+				// focused pane: a person's focus elsewhere must not redirect it.
+				let task = super::run_rune_code_at_generation(self, buffer, code, generation);
+				let started = self
+					.rune_buffer_revisions
+					.get(&buffer)
+					.copied()
+					.unwrap_or(0);
+				if let Some(Work {
+					kind: Kind::RunSource {
+						revision,
+						description,
+						..
+					},
+					..
+				}) = &mut self.notebook_actions.work
+				{
+					*revision = started;
+					description.id = started;
+				}
+				if !self.status_error.is_empty() {
+					let message = self.status_error.clone();
+					self.fail_execution(format!("execution {started} failed: {message}"));
+				}
+				return Some(task.map(move |message| Message::NotebookTask {
+					id,
+					message: Box::new(message),
+				}));
+			}
 			Kind::Data { .. } | Kind::Connect { .. } => unreachable!(),
 		}
 		Some(Task::none())
@@ -484,6 +709,29 @@ impl AppState {
 				Task::none()
 			};
 		};
+		if let Kind::RunSource {
+			buffer, revision, ..
+		} = &work.kind
+		{
+			let (buffer, revision) = (*buffer, *revision);
+			// Without the `toron` feature a Rune buffer settles in one message.
+			let plain = match &message {
+				Message::RunRuneBufferResult {
+					source_buffer,
+					revision: settled,
+					result,
+				} if *source_buffer == buffer && *settled == revision => {
+					Some(result.as_ref().map(|_| ()).map_err(Clone::clone))
+				}
+				_ => None,
+			};
+			let task = update_inner(self, message);
+			self.settle_execution(buffer, revision, plain);
+			return task.map(move |message| Message::NotebookTask {
+				id,
+				message: Box::new(message),
+			});
+		}
 		let Kind::Run { description, .. } = &work.kind else {
 			return Task::none();
 		};
@@ -982,5 +1230,204 @@ mod tests {
 		let ran = f.run(0);
 		assert_eq!(ran.outcome, Outcome::Applied, "{ran:?}");
 		assert_eq!(ran.result.map(|r| r.columns.len()), Some(300));
+	}
+
+	/// ADR 0169 fixture: a Rune source (not a notebook) open in a headless
+	/// window, with the scratch adapter installed as the "Toron" connection
+	/// so admission passes. `let x = 1;` is a valid source that yields no
+	/// views, so its execution completes with no figures.
+	#[cfg(feature = "toron")]
+	fn rune_fixture() -> Fixture {
+		rune_fixture_with("let x = 1;\n")
+	}
+
+	#[cfg(feature = "toron")]
+	fn rune_fixture_with(source: &str) -> Fixture {
+		let mut f = Fixture::open_source(source);
+		let _ = std::fs::rename(f.root.join("notebook.md"), f.root.join("source.rn"));
+		f = Fixture::open_rune(&f.root);
+		let scratch = f.app.state().adapter_state.scratch.clone().unwrap();
+		let state = f.app.state_mut();
+		state
+			.adapter_state
+			.select(crate::adapters::driver::AdapterSelection::Toron);
+		state.install_connection(scratch, crate::adapters::common::CancelCapability::Refuse);
+		f
+	}
+
+	#[cfg(feature = "toron")]
+	impl Fixture {
+		fn open_rune(root: &std::path::Path) -> Self {
+			let source = root.join("source.rn");
+			let mut app = HeadlessApplication::open_target(
+				super::super::StartupTarget::Ephemeral {
+					initial_file: Some(source.display().to_string()),
+				},
+				crate::configuration::StartupData::default(),
+			)
+			.unwrap();
+			app.settle_until(Duration::from_secs(10), |s| {
+				s.code_editor
+					.active_language_id()
+					.is_some_and(|l| l.as_str() == "rune")
+					&& s.adapter_state.scratch.is_some()
+			})
+			.unwrap();
+			Self {
+				root: root.to_path_buf(),
+				app,
+			}
+		}
+	}
+
+	/// ADR 0169 acceptance 2: no Rune connection is refused before any
+	/// execution; a notebook is refused toward `run_cell`.
+	#[cfg(feature = "toron")]
+	#[test]
+	fn adr0169_run_source_is_refused_without_a_rune_connection_or_on_a_notebook() {
+		let mut f = Fixture::new();
+		let receipt = f.app.apply_command(&Command::RunSource {});
+		assert_eq!(receipt.outcome, Outcome::Refused, "{receipt:?}");
+		assert!(format!("{receipt:?}").contains("notebook"));
+
+		let mut f = Fixture::open_source("let x = 1;\n");
+		let _ = std::fs::rename(f.root.join("notebook.md"), f.root.join("source.rn"));
+		f = Fixture::open_rune(&f.root);
+		let receipt = f.app.apply_command(&Command::RunSource {});
+		assert_eq!(receipt.outcome, Outcome::Refused, "{receipt:?}");
+		assert!(
+			format!("{receipt:?}").contains("no Rune connection"),
+			"{receipt:?}"
+		);
+		assert!(receipt.execution.is_none() && receipt.figures.is_none());
+	}
+
+	/// ADR 0169 acceptance 2: a source that yields nothing completes as an
+	/// execution with no figures; a source that does not compile reports its
+	/// error, its identity, and no figures.
+	#[cfg(feature = "toron")]
+	#[test]
+	fn adr0169_a_failed_execution_reports_its_error_and_no_figures() {
+		let mut quiet = rune_fixture();
+		let receipt = quiet.app.apply_command(&Command::RunSource {});
+		assert_eq!(receipt.outcome, Outcome::Applied, "{receipt:?}");
+		assert_eq!(receipt.execution.as_ref().map(|e| e.id), Some(1));
+		assert_eq!(receipt.figures.as_deref(), Some(&[][..]));
+
+		let mut f = rune_fixture_with("let x = ;\n");
+		let receipt = f.app.apply_command(&Command::RunSource {});
+		assert_eq!(receipt.outcome, Outcome::Failed, "{receipt:?}");
+		let execution = receipt.execution.clone().expect("execution identity");
+		assert!(execution.id >= 1);
+		assert_eq!(
+			execution.connection_generation,
+			f.app.state().connection_generation
+		);
+		assert!(receipt.figures.is_none(), "{receipt:?}");
+		let message = format!("{:?}", receipt.failure);
+		assert!(
+			message.contains(&format!("execution {}", execution.id)),
+			"{message}"
+		);
+	}
+
+	/// ADR 0169 §3: an execution is settled only on its own terms. A newer
+	/// run, a source edit, or a connection change makes it stale, naming the
+	/// cause; an overlapping request names the execution in flight; a late
+	/// settle of a stale execution changes nothing.
+	#[cfg(feature = "toron")]
+	#[test]
+	fn adr0169_stale_executions_are_named_and_never_report_figures() {
+		for case in ["superseded", "source", "connection"] {
+			let mut f = rune_fixture();
+			let (ticket, task) = f
+				.app
+				.state_mut()
+				.start_notebook_command(&Command::RunSource {})
+				.unwrap()
+				.unwrap();
+			drop(task);
+			// Overlap while the request is in flight names it.
+			let overlap = match f
+				.app
+				.state_mut()
+				.start_notebook_command(&Command::RunSource {})
+			{
+				Err(refusal) => refusal,
+				Ok(_) => panic!("an overlapping run_source must be refused"),
+			};
+			assert!(
+				format!("{overlap:?}").contains("an execution is in flight"),
+				"{overlap:?}"
+			);
+			let buffer = f.app.state().code_editor.active_buffer_id().unwrap();
+			let revision = 1;
+			let state = f.app.state_mut();
+			match case {
+				"superseded" => {
+					state.rune_buffer_revisions.insert(buffer, revision + 1);
+				}
+				"source" => {
+					// The recorded generation no longer matches the document's.
+					if let Some(Work {
+						kind: Kind::RunSource { description, .. },
+						..
+					}) = &mut state.notebook_actions.work
+					{
+						description.generation = "stale".into();
+					}
+					state.rune_buffer_revisions.insert(buffer, revision);
+				}
+				_ => {
+					state.rune_buffer_revisions.insert(buffer, revision);
+					state.next_connection_generation();
+				}
+			}
+			if let Some(Work {
+				kind: Kind::RunSource { revision: r, .. },
+				..
+			}) = &mut state.notebook_actions.work
+			{
+				*r = revision;
+			}
+			state.settle_execution(buffer, revision, None);
+			let Some(Completion::Execution { outcome, .. }) = ticket.result() else {
+				panic!("{case}: the execution must have settled");
+			};
+			let message = outcome.unwrap_err();
+			let expected = match case {
+				"superseded" => "superseded by a newer run",
+				"source" => "the source changed during execution",
+				_ => "the connection changed during execution",
+			};
+			assert!(message.contains(expected), "{case}: {message}");
+			// A late settle finds no work and changes nothing.
+			assert!(f.app.state().notebook_actions.work.is_none());
+			f.app
+				.state_mut()
+				.settle_execution(buffer, revision, Some(Ok(())));
+			assert!(f.app.state().notebook_actions.work.is_none());
+			let later = f
+				.app
+				.apply_command(&Command::DescribeNotebook { buffer: None });
+			assert!(later.execution.is_none());
+		}
+	}
+
+	/// ADR 0169 §3: a run past its deadline reports the timeout and the
+	/// dropping of its late outcome.
+	#[test]
+	fn adr0169_a_timed_out_execution_says_its_late_outcome_is_dropped() {
+		let (_tx, rx) = watch::channel(None);
+		let ticket = Ticket {
+			rx,
+			deadline: Instant::now() - Duration::from_millis(1),
+			deadline_message:
+				"the execution did not settle within 600 s; its late outcome is dropped".into(),
+		};
+		let Some(Completion::Failed(message)) = ticket.result() else {
+			panic!("deadline");
+		};
+		assert!(message.contains("late outcome is dropped"));
 	}
 }

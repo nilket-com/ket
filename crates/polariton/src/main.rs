@@ -68,9 +68,10 @@ fn main() -> gui::Result {
 			source,
 			commands,
 			receipt,
+			execution,
 		} => {
 			ensure_rustls_provider();
-			driver::drive(&source, &commands, &receipt).map_err(|error| error.into())
+			driver::drive(&source, &commands, &receipt, execution).map_err(|error| error.into())
 		}
 		ApplicationAction::Describe { target } => {
 			ensure_rustls_provider();
@@ -106,6 +107,8 @@ enum ApplicationAction {
 		source: std::path::PathBuf,
 		commands: std::path::PathBuf,
 		receipt: std::path::PathBuf,
+		/// ADR 0169 §2: `--execute on-open` (default) or `--execute by-command`.
+		execution: driver::ExecutionMode,
 	},
 	/// PRODUCT-0158 §2: `polariton describe <source.rn | --session id>`, a
 	/// receipt on stdout.
@@ -552,6 +555,69 @@ mod tests {
 	}
 
 	/// PRODUCT-0158 §6: `drive` takes a source and both files, nothing else.
+
+	/// ADR 0169 §2: the execution mode is the invocation's choice, defaulting
+	/// to PRODUCT-0158's on-open order, and is never inferred from the script.
+	#[test]
+	fn adr0169_drive_execution_mode_is_explicit_and_defaults_to_on_open() {
+		let by_command = action_from_args(
+			[
+				"polariton",
+				"drive",
+				"--execute",
+				"by-command",
+				"a.rn",
+				"--commands",
+				"c.json",
+				"--receipt",
+				"r.json",
+			]
+			.map(str::to_owned),
+		)
+		.unwrap();
+		assert!(matches!(
+			by_command,
+			ApplicationAction::Drive {
+				execution: crate::driver::ExecutionMode::ByCommand,
+				..
+			}
+		));
+		for (args, message) in [
+			(
+				vec![
+					"drive",
+					"--execute",
+					"later",
+					"a.rn",
+					"--commands",
+					"c.json",
+					"--receipt",
+					"r.json",
+				],
+				"--execute must be on-open or by-command",
+			),
+			(
+				vec![
+					"drive",
+					"--execute",
+					"on-open",
+					"--execute",
+					"by-command",
+					"a.rn",
+					"--commands",
+					"c.json",
+					"--receipt",
+					"r.json",
+				],
+				"--execute may occur at most once",
+			),
+		] {
+			let mut full = vec!["polariton"];
+			full.extend(args);
+			let error = action_from_args(full.into_iter().map(str::to_owned)).unwrap_err();
+			assert!(error.starts_with(message), "{error}");
+		}
+	}
 	#[test]
 	fn product_0158_drive_requires_source_commands_and_receipt() {
 		let action = action_from_args(
@@ -573,6 +639,7 @@ mod tests {
 				source: "uat/plot_fixtures_showcase.rn".into(),
 				commands: "uat/plot_fixtures_showcase.commands.json".into(),
 				receipt: "/tmp/receipt.json".into(),
+				execution: crate::driver::ExecutionMode::OnOpen,
 			}
 		);
 		for (arguments, message) in [
@@ -691,8 +758,26 @@ where
 	let mut source = None;
 	let mut commands = None;
 	let mut receipt = None;
+	let mut execution = None;
 	while let Some(arg) = args.next() {
 		match arg.as_str() {
+			"--execute" => {
+				let value = args
+					.next()
+					.ok_or_else(|| "--execute requires on-open or by-command".to_owned())?;
+				let mode = match value.as_str() {
+					"on-open" => driver::ExecutionMode::OnOpen,
+					"by-command" => driver::ExecutionMode::ByCommand,
+					other => {
+						return Err(format!(
+							"--execute must be on-open or by-command, not {other:?}"
+						));
+					}
+				};
+				if execution.replace(mode).is_some() {
+					return Err("--execute may occur at most once".to_owned());
+				}
+			}
 			"--commands" => {
 				let value = args
 					.next()
@@ -723,6 +808,7 @@ where
 		source: source.ok_or_else(|| "drive requires a source file".to_owned())?,
 		commands: commands.ok_or_else(|| "drive requires --commands <file>".to_owned())?,
 		receipt: receipt.ok_or_else(|| "drive requires --receipt <file>".to_owned())?,
+		execution: execution.unwrap_or(driver::ExecutionMode::OnOpen),
 	})
 }
 

@@ -111,7 +111,13 @@ impl HeadlessApplication {
 				self.tick();
 				if let Some(result) = ticket.result() {
 					result.apply(&mut receipt);
-					receipt.figures = Some(self.state.describe_surface());
+					// ADR 0169 §3: an execution that did not complete reports no
+					// figures; an earlier run's never stand in for its output.
+					if receipt.execution.is_none()
+						|| receipt.outcome == crate::driver::Outcome::Applied
+					{
+						receipt.figures = Some(self.state.describe_surface());
+					}
 					break;
 				}
 				std::thread::sleep(Duration::from_millis(5));
@@ -193,6 +199,24 @@ impl HeadlessApplication {
 		};
 		self.spawn(task);
 		self.drain();
+	}
+
+	/// ADR 0169 §1: opening a source loads it and describes it; nothing runs.
+	/// A markdown notebook is open once its cells project; a Rune source once
+	/// its language is known.
+	pub(crate) fn open_source(&mut self, deadline: Duration) -> Result<(), String> {
+		self.settle_until(deadline, |s| s.code_editor.active_language_id().is_some())?;
+		if self
+			.state
+			.code_editor
+			.active_language_id()
+			.is_some_and(|l| l.as_str() == "markdown")
+		{
+			return self.settle_until(deadline, |s| {
+				s.code_editor.notebook_description(None).is_ok()
+			});
+		}
+		Ok(())
 	}
 
 	/// PRODUCT-0158 §2: run the focused buffer as the Run action does, then

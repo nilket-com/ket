@@ -3012,7 +3012,7 @@ async fn dispatch_rune_relation_with_palettes(
 				.to_owned(),
 		),
 		Ok(RuneDispatchSuccess::Relation(artifact)) => {
-			artifact.bind_producer("toron");
+			artifact.bind_producer("Toron");
 			rune_view_outcome_with_palettes(artifact, view.views, palettes)
 				.map(RuneRelationCompletion::Views)
 		}
@@ -4875,6 +4875,12 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 								continue;
 							}
 						};
+						// PRODUCT-0154 §4: the sink's artifact is this relation's data under
+						// its own identity, but its producer is a birth fact of the relation
+						// and carries over; a rebuilt frame must not forget who produced it.
+						if let Some(producer) = outcome.result.producer() {
+							source.bind_producer(producer);
+						}
 						app_state.code_editor.bind_rune_artifact(
 							source_buffer,
 							lineage.as_ref(),

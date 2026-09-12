@@ -142,6 +142,9 @@ pub(crate) enum Command {
 		generation: u64,
 	},
 	ConnectionStatus {},
+	/// ADR 0169: execute the open Rune source against the window's current
+	/// connection; one execution, identified and completed on its own terms.
+	RunSource {},
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -169,6 +172,32 @@ pub(crate) struct NotebookDescription {
 pub(crate) struct DataDescription {
 	pub table: String,
 	pub columns: Vec<(String, String)>,
+}
+
+/// ADR 0169 §2: when the batch driver executes the source. Chosen by the
+/// invocation, never inferred from the script, and stated in the receipt.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ExecutionMode {
+	/// PRODUCT-0158's documented behavior: run after opening, before the
+	/// first command.
+	OnOpen,
+	/// Open only; the source runs where the script says `run_source`.
+	ByCommand,
+}
+
+/// ADR 0169 §3: the execution a `run_source` started, as the window
+/// identified it. A receipt reports this execution's outcome and no other's.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ExecutionDescription {
+	/// The source buffer, as `describe_notebook` names buffers.
+	pub buffer: String,
+	/// The document generation the execution read.
+	pub generation: String,
+	/// The database connection generation (ADR 0166 §3) it ran against.
+	pub connection_generation: u64,
+	/// The window's execution id for this run of the buffer.
+	pub id: u64,
 }
 
 /// ADR 0168: a SQL cell's answer, bounded. The preview holds the leading
@@ -212,7 +241,8 @@ impl Command {
 			| Command::RunCell { .. }
 			| Command::Connect { .. }
 			| Command::Disconnect { .. }
-			| Command::ConnectionStatus {} => None,
+			| Command::ConnectionStatus {}
+			| Command::RunSource {} => None,
 			Command::Hide { figure, .. }
 			| Command::Show { figure, .. }
 			| Command::Isolate { figure, .. }
@@ -229,6 +259,8 @@ impl Command {
 pub(crate) struct Receipt {
 	pub(crate) schema_version: u32,
 	pub(crate) source: String,
+	/// ADR 0169 §2: how this invocation executed the source.
+	pub(crate) execution: ExecutionMode,
 	/// The figures as loaded, before any command ran.
 	pub(crate) loaded: Vec<FigureDescription>,
 	pub(crate) commands: Vec<CommandReceipt>,
@@ -263,6 +295,9 @@ pub(crate) struct CommandReceipt {
 	/// ADR 0168: the answer of the SQL cell this run executed, bounded.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub(crate) result: Option<ResultSummary>,
+	/// ADR 0169: the execution a `run_source` started.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) execution: Option<ExecutionDescription>,
 	/// ADR 0166: the external connection as the adapter owner reports it.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub(crate) connection: Option<ConnectionDescription>,
@@ -509,7 +544,12 @@ pub(crate) struct PublishedFigure {
 /// `polariton drive`: parse the commands, open and run the source, apply the
 /// commands, write the receipt. A commands file that does not parse refuses
 /// the invocation before the application opens.
-pub(crate) fn drive(source: &Path, commands: &Path, receipt: &Path) -> Result<(), String> {
+pub(crate) fn drive(
+	source: &Path,
+	commands: &Path,
+	receipt: &Path,
+	execution: ExecutionMode,
+) -> Result<(), String> {
 	let target = Target::Source(source.to_path_buf());
 	let script = match read_commands(commands) {
 		Ok(script) => script,
@@ -517,6 +557,7 @@ pub(crate) fn drive(source: &Path, commands: &Path, receipt: &Path) -> Result<()
 			let refused = Receipt {
 				schema_version: RECEIPT_SCHEMA_VERSION,
 				source: target.describe(),
+				execution,
 				loaded: Vec::new(),
 				commands: Vec::new(),
 				refusal: Some(Refusal::CommandsUnreadable { message }),
@@ -525,7 +566,7 @@ pub(crate) fn drive(source: &Path, commands: &Path, receipt: &Path) -> Result<()
 			return Err(format!("commands refused; see {}", receipt.display()));
 		}
 	};
-	let receipt_document = run(&target, &script);
+	let receipt_document = run(&target, &script, execution);
 	write_receipt(receipt, &receipt_document)?;
 	match &receipt_document.refusal {
 		Some(refusal) => Err(format!("{refusal:?}; see {}", receipt.display())),
@@ -539,7 +580,7 @@ pub(crate) fn describe(target: &Target) -> Result<(), String> {
 	let script = Commands {
 		commands: vec![Command::Describe {}],
 	};
-	let receipt_document = run(target, &script);
+	let receipt_document = run(target, &script, ExecutionMode::OnOpen);
 	let text = serde_json::to_string_pretty(&receipt_document)
 		.map_err(|error| format!("cannot encode the receipt: {error}"))?;
 	println!("{text}");
@@ -562,10 +603,11 @@ fn write_receipt(path: &Path, receipt: &Receipt) -> Result<(), String> {
 }
 
 /// Open, run, and apply. Never panics on a refusal: the receipt carries it.
-pub(crate) fn run(target: &Target, script: &Commands) -> Receipt {
+pub(crate) fn run(target: &Target, script: &Commands, execution: ExecutionMode) -> Receipt {
 	let mut receipt = Receipt {
 		schema_version: RECEIPT_SCHEMA_VERSION,
 		source: target.describe(),
+		execution,
 		loaded: Vec::new(),
 		commands: Vec::new(),
 		refusal: None,
@@ -581,7 +623,14 @@ pub(crate) fn run(target: &Target, script: &Commands) -> Receipt {
 			return receipt;
 		}
 	};
-	if let Err(message) = application.run_source(RUN_DEADLINE) {
+	// ADR 0169 §2: on-open keeps PRODUCT-0158's order; by-command opens only
+	// and leaves execution to the script's `run_source`.
+	if execution == ExecutionMode::OnOpen {
+		if let Err(message) = application.run_source(RUN_DEADLINE) {
+			receipt.refusal = Some(Refusal::ApplicationFailed { message });
+			return receipt;
+		}
+	} else if let Err(message) = application.open_source(RUN_DEADLINE) {
 		receipt.refusal = Some(Refusal::ApplicationFailed { message });
 		return receipt;
 	}
@@ -642,6 +691,7 @@ impl CommandReceipt {
 			notebook: None,
 			data: None,
 			result: None,
+			execution: None,
 			connection: None,
 		}
 	}
@@ -1050,7 +1100,12 @@ mod tests {
 		)
 		.expect("write commands");
 		let receipt = dir.join("receipt.json");
-		let outcome = drive(Path::new("/nonexistent/source.rn"), &commands, &receipt);
+		let outcome = drive(
+			Path::new("/nonexistent/source.rn"),
+			&commands,
+			&receipt,
+			ExecutionMode::OnOpen,
+		);
 		assert!(outcome.is_err());
 		let written: Receipt =
 			serde_json::from_slice(&std::fs::read(&receipt).expect("receipt")).expect("parse");
@@ -1061,5 +1116,39 @@ mod tests {
 		assert!(written.commands.is_empty());
 		assert!(written.loaded.is_empty());
 		std::fs::remove_dir_all(&dir).ok();
+	}
+
+	/// ADR 0169 §2: the mode is the invocation's. On a head without a local
+	/// workspace, on-open cannot execute a Rune source and refuses the
+	/// invocation as before; by-command opens it and applies the script,
+	/// with nothing executed and the receipt naming the mode.
+	#[cfg(not(feature = "toron-local"))]
+	#[test]
+	fn adr0169_by_command_opens_without_executing_and_on_open_keeps_its_refusal() {
+		let dir = std::env::temp_dir().join(format!(
+			"polariton-0169-{}-{}",
+			std::process::id(),
+			crate::selection::SurfaceIncarnation::mint().token()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		let source = dir.join("source.rn");
+		std::fs::write(&source, "let x = 1;\n").unwrap();
+		let script = Commands {
+			commands: vec![Command::Describe {}],
+		};
+		let target = Target::Source(source.clone());
+		let by_command = run(&target, &script, ExecutionMode::ByCommand);
+		assert_eq!(by_command.execution, ExecutionMode::ByCommand);
+		assert!(by_command.refusal.is_none(), "{by_command:?}");
+		assert!(by_command.loaded.is_empty(), "nothing executed on open");
+		assert_eq!(by_command.commands.len(), 1);
+		assert_eq!(by_command.commands[0].outcome, Outcome::Applied);
+		let on_open = run(&target, &script, ExecutionMode::OnOpen);
+		assert_eq!(on_open.execution, ExecutionMode::OnOpen);
+		assert!(
+			matches!(on_open.refusal, Some(Refusal::ApplicationFailed { .. })),
+			"{on_open:?}"
+		);
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

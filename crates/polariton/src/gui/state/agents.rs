@@ -290,7 +290,10 @@ impl AppState {
 				continue;
 			};
 			result.apply(&mut waiting.receipt);
-			waiting.receipt.figures = Some(self.describe_surface());
+			// ADR 0169 §3: an execution that did not complete reports no figures.
+			if waiting.receipt.execution.is_none() || waiting.receipt.outcome == Outcome::Applied {
+				waiting.receipt.figures = Some(self.describe_surface());
+			}
 			let event = match waiting.receipt.outcome {
 				Outcome::Applied => Event::Completed {
 					id: waiting.id,

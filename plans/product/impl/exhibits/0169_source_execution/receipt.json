@@ -1,0 +1,3329 @@
+{
+  "schema_version": 1,
+  "source": "uat/plot_trends_showcase.rn",
+  "execution": "by-command",
+  "loaded": [],
+  "commands": [
+    {
+      "command": {
+        "connect": {
+          "adapter": "Toron",
+          "name": "bigfoot-0165",
+          "fields": {
+            "ca_cert": "C:/Users/em/.nilket/pki/ca.crt",
+            "client_cert": "C:/Users/em/.nilket/pki/client.crt",
+            "client_key": "C:/Users/em/.nilket/pki/client.key",
+            "endpoint": "192.168.0.2:7742",
+            "server_name": "toron-00000000-0000-0000-0000-000000000042.cluster.local"
+          }
+        }
+      },
+      "outcome": "applied",
+      "figures": [],
+      "connection": {
+        "adapter": "Toron",
+        "name": "bigfoot-0165",
+        "stage": "connected",
+        "generation": 1
+      }
+    },
+    {
+      "command": {
+        "run_source": {}
+      },
+      "outcome": "applied",
+      "figures": [
+        {
+          "figure": "3",
+          "pane": 9223372036854775808,
+          "title": "plot.line",
+          "view": "trend-lines",
+          "family": "line",
+          "size": {
+            "width": 462.40002,
+            "height": 432.0
+          },
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 36.959999084472656,
+                    "y1": 61.959999084472656
+                  },
+                  {
+                    "series": 1,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 61.959999084472656,
+                    "y1": 86.95999908447266
+                  },
+                  {
+                    "series": 2,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 86.95999908447266,
+                    "y1": 111.95999908447266
+                  }
+                ],
+                "x0": 204.6800079345703,
+                "x1": 374.67999267578125,
+                "y0": 26.959999084472656,
+                "y1": 121.95999908447266
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Horizon",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Horizon"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Northstar",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Northstar"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Pulse",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Pulse"
+                  }
+                }
+              ],
+              "viewbox": [
+                462.4000244140625,
+                432.0
+              ]
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "width": 462.40002,
+              "height": 432.0
+            }
+          },
+          "live": {
+            "hidden": [],
+            "size": {
+              "width": 462.40002,
+              "height": 432.0
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "section": "Padding",
+              "value": 80.0,
+              "provenance": "default"
+            },
+            "Categorical palette": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "authored"
+            },
+            "Diverging ramp": {
+              "section": "Figure",
+              "value": "BlueWhiteRed",
+              "provenance": "theme"
+            },
+            "Duotone skin": {
+              "section": "Figure",
+              "value": false,
+              "provenance": "authored"
+            },
+            "Facet label size": {
+              "section": "Facet",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Hover text size": {
+              "section": "Figure",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Left": {
+              "section": "Padding",
+              "value": 100.0,
+              "provenance": "default"
+            },
+            "Point size": {
+              "section": "Mark",
+              "value": 1.0,
+              "provenance": "default"
+            },
+            "Position": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "Right": {
+              "section": "Padding",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Sequential ramp": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "theme"
+            },
+            "Skin": {
+              "section": "Figure",
+              "value": "greys_rs2",
+              "provenance": "authored"
+            },
+            "Stroke width": {
+              "section": "Mark",
+              "value": 1.0,
+              "provenance": "default"
+            },
+            "Subtitle": {
+              "section": "Figure",
+              "value": "Eight-week activation trend by product line",
+              "provenance": "authored"
+            },
+            "Subtitle size": {
+              "section": "Figure",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Text size": {
+              "section": "Legend",
+              "value": 14.0,
+              "provenance": "authored"
+            },
+            "Title": {
+              "section": "Figure",
+              "value": "Product momentum",
+              "provenance": "authored"
+            },
+            "Title size": {
+              "section": "Figure",
+              "value": 24.0,
+              "provenance": "authored"
+            },
+            "Top": {
+              "section": "Padding",
+              "value": 50.0,
+              "provenance": "default"
+            },
+            "Visible": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "X bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "X label": {
+              "section": "Axes",
+              "value": "Week",
+              "provenance": "authored"
+            },
+            "X label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "X minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "X tick interval": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "X tick rotation": {
+              "section": "Axes",
+              "value": 0.0,
+              "provenance": "default"
+            },
+            "X tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "X tick step": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "Y bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "Y label": {
+              "section": "Axes",
+              "value": "Activated accounts",
+              "provenance": "authored"
+            },
+            "Y label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "Y minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "Y tick interval": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            },
+            "Y tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "Y tick step": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            }
+          }
+        },
+        {
+          "figure": "2",
+          "pane": 9223372036854775809,
+          "title": "plot.area",
+          "view": "trend-area",
+          "family": "stacked-area",
+          "size": {
+            "width": 472.00003,
+            "height": 432.0
+          },
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 221.4000244140625,
+                    "x1": 371.4000244140625,
+                    "y0": 36.959999084472656,
+                    "y1": 61.959999084472656
+                  },
+                  {
+                    "series": 1,
+                    "x0": 221.4000244140625,
+                    "x1": 371.4000244140625,
+                    "y0": 61.959999084472656,
+                    "y1": 86.95999908447266
+                  },
+                  {
+                    "series": 2,
+                    "x0": 221.4000244140625,
+                    "x1": 371.4000244140625,
+                    "y0": 86.95999908447266,
+                    "y1": 111.95999908447266
+                  }
+                ],
+                "x0": 211.4000244140625,
+                "x1": 381.4000244140625,
+                "y0": 26.959999084472656,
+                "y1": 121.95999908447266
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Horizon",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Horizon"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Northstar",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Northstar"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Pulse",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Pulse"
+                  }
+                }
+              ],
+              "viewbox": [
+                472.0000305175781,
+                432.0
+              ]
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "width": 472.00003,
+              "height": 432.0
+            }
+          },
+          "live": {
+            "hidden": [],
+            "size": {
+              "width": 472.00003,
+              "height": 432.0
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "section": "Padding",
+              "value": 80.0,
+              "provenance": "default"
+            },
+            "Categorical palette": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "authored"
+            },
+            "Diverging ramp": {
+              "section": "Figure",
+              "value": "BlueWhiteRed",
+              "provenance": "theme"
+            },
+            "Duotone skin": {
+              "section": "Figure",
+              "value": false,
+              "provenance": "authored"
+            },
+            "Facet label size": {
+              "section": "Facet",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Hover text size": {
+              "section": "Figure",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Left": {
+              "section": "Padding",
+              "value": 100.0,
+              "provenance": "default"
+            },
+            "Percent": {
+              "section": "Mark",
+              "value": false,
+              "provenance": "default"
+            },
+            "Position": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "Right": {
+              "section": "Padding",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Sequential ramp": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "theme"
+            },
+            "Skin": {
+              "section": "Figure",
+              "value": "greys_rs2",
+              "provenance": "authored"
+            },
+            "Stacked": {
+              "section": "Mark",
+              "value": false,
+              "provenance": "default"
+            },
+            "Stroke width": {
+              "section": "Mark",
+              "value": 1.0,
+              "provenance": "default"
+            },
+            "Subtitle": {
+              "section": "Figure",
+              "value": "The same weekly activity, accumulated across product lines",
+              "provenance": "authored"
+            },
+            "Subtitle size": {
+              "section": "Figure",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Text size": {
+              "section": "Legend",
+              "value": 14.0,
+              "provenance": "authored"
+            },
+            "Title": {
+              "section": "Figure",
+              "value": "Portfolio growth",
+              "provenance": "authored"
+            },
+            "Title size": {
+              "section": "Figure",
+              "value": 24.0,
+              "provenance": "authored"
+            },
+            "Top": {
+              "section": "Padding",
+              "value": 50.0,
+              "provenance": "default"
+            },
+            "Visible": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "X bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "X label": {
+              "section": "Axes",
+              "value": "Week",
+              "provenance": "authored"
+            },
+            "X label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "X minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "X tick interval": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "X tick rotation": {
+              "section": "Axes",
+              "value": 0.0,
+              "provenance": "default"
+            },
+            "X tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "X tick step": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "Y bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "Y label": {
+              "section": "Axes",
+              "value": "Activated accounts",
+              "provenance": "authored"
+            },
+            "Y label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "Y minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "Y tick interval": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            },
+            "Y tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "Y tick step": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            }
+          }
+        },
+        {
+          "figure": "4",
+          "pane": 9223372036854775810,
+          "title": "plot.scatter",
+          "view": "trend-scatter",
+          "family": "scatter",
+          "size": {
+            "width": 462.40002,
+            "height": 432.0
+          },
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 36.959999084472656,
+                    "y1": 61.959999084472656
+                  },
+                  {
+                    "series": 1,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 61.959999084472656,
+                    "y1": 86.95999908447266
+                  },
+                  {
+                    "series": 2,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 86.95999908447266,
+                    "y1": 111.95999908447266
+                  }
+                ],
+                "x0": 204.6800079345703,
+                "x1": 374.67999267578125,
+                "y0": 26.959999084472656,
+                "y1": 121.95999908447266
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Horizon",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Horizon"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Northstar",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Northstar"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Pulse",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Pulse"
+                  }
+                }
+              ],
+              "viewbox": [
+                462.4000244140625,
+                432.0
+              ]
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "width": 462.40002,
+              "height": 432.0
+            }
+          },
+          "live": {
+            "hidden": [],
+            "size": {
+              "width": 462.40002,
+              "height": 432.0
+            }
+          },
+          "render_mode": "vector",
+          "settings": {
+            "Bottom": {
+              "section": "Padding",
+              "value": 80.0,
+              "provenance": "default"
+            },
+            "Categorical palette": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "authored"
+            },
+            "Diverging ramp": {
+              "section": "Figure",
+              "value": "BlueWhiteRed",
+              "provenance": "theme"
+            },
+            "Duotone skin": {
+              "section": "Figure",
+              "value": false,
+              "provenance": "authored"
+            },
+            "Facet label size": {
+              "section": "Facet",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Hover text size": {
+              "section": "Figure",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Left": {
+              "section": "Padding",
+              "value": 100.0,
+              "provenance": "default"
+            },
+            "Point size": {
+              "section": "Mark",
+              "value": 1.0,
+              "provenance": "default"
+            },
+            "Position": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "Right": {
+              "section": "Padding",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Sequential ramp": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "theme"
+            },
+            "Skin": {
+              "section": "Figure",
+              "value": "greys_rs2",
+              "provenance": "authored"
+            },
+            "Subtitle": {
+              "section": "Figure",
+              "value": "Each observation stays discrete while the series identity remains visible",
+              "provenance": "authored"
+            },
+            "Subtitle size": {
+              "section": "Figure",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Text size": {
+              "section": "Legend",
+              "value": 14.0,
+              "provenance": "authored"
+            },
+            "Title": {
+              "section": "Figure",
+              "value": "Momentum checkpoints",
+              "provenance": "authored"
+            },
+            "Title size": {
+              "section": "Figure",
+              "value": 24.0,
+              "provenance": "authored"
+            },
+            "Top": {
+              "section": "Padding",
+              "value": 50.0,
+              "provenance": "default"
+            },
+            "Visible": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "X bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "X label": {
+              "section": "Axes",
+              "value": "Week",
+              "provenance": "authored"
+            },
+            "X label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "X minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "X tick interval": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "X tick rotation": {
+              "section": "Axes",
+              "value": 0.0,
+              "provenance": "default"
+            },
+            "X tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "X tick step": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "Y bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "Y label": {
+              "section": "Axes",
+              "value": "Activated accounts",
+              "provenance": "authored"
+            },
+            "Y label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "Y minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "Y tick interval": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            },
+            "Y tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "Y tick step": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            }
+          }
+        },
+        {
+          "figure": "1",
+          "pane": 9223372036854775811,
+          "title": "plot.bubble",
+          "view": "trend-bubbles",
+          "family": "bubble",
+          "size": {
+            "width": 472.00003,
+            "height": 432.0
+          },
+          "series": {
+            "status": "absent",
+            "reason": "the figure identifies no series"
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "width": 472.00003,
+              "height": 432.0
+            }
+          },
+          "live": {
+            "hidden": [],
+            "size": {
+              "width": 472.00003,
+              "height": 432.0
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "section": "Padding",
+              "value": 80.0,
+              "provenance": "default"
+            },
+            "Categorical palette": {
+              "section": "Figure",
+              "value": "Blues",
+              "provenance": "theme"
+            },
+            "Diverging ramp": {
+              "section": "Figure",
+              "value": "BlueWhiteRed",
+              "provenance": "theme"
+            },
+            "Duotone skin": {
+              "section": "Figure",
+              "value": false,
+              "provenance": "authored"
+            },
+            "Facet label size": {
+              "section": "Facet",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Hover text size": {
+              "section": "Figure",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Left": {
+              "section": "Padding",
+              "value": 100.0,
+              "provenance": "default"
+            },
+            "Point size": {
+              "section": "Mark",
+              "value": 1.0,
+              "provenance": "default"
+            },
+            "Position": {
+              "section": "Legend",
+              "value": "default",
+              "provenance": "default"
+            },
+            "Right": {
+              "section": "Padding",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Sequential ramp": {
+              "section": "Figure",
+              "value": "Blues",
+              "provenance": "authored"
+            },
+            "Skin": {
+              "section": "Figure",
+              "value": "greys_rs2",
+              "provenance": "authored"
+            },
+            "Subtitle": {
+              "section": "Figure",
+              "value": "Bubble area adds engaged accounts; colour retains the activation measure",
+              "provenance": "authored"
+            },
+            "Subtitle size": {
+              "section": "Figure",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Text size": {
+              "section": "Legend",
+              "value": 14.0,
+              "provenance": "default"
+            },
+            "Title": {
+              "section": "Figure",
+              "value": "Momentum and reach",
+              "provenance": "authored"
+            },
+            "Title size": {
+              "section": "Figure",
+              "value": 24.0,
+              "provenance": "authored"
+            },
+            "Top": {
+              "section": "Padding",
+              "value": 50.0,
+              "provenance": "default"
+            },
+            "Visible": {
+              "section": "Legend",
+              "value": "default",
+              "provenance": "default"
+            },
+            "X bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "X label": {
+              "section": "Axes",
+              "value": "Week",
+              "provenance": "authored"
+            },
+            "X label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "X minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "X tick interval": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "X tick rotation": {
+              "section": "Axes",
+              "value": 0.0,
+              "provenance": "default"
+            },
+            "X tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "X tick step": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "Y bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "Y label": {
+              "section": "Axes",
+              "value": "Activated accounts",
+              "provenance": "authored"
+            },
+            "Y label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "Y minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "Y tick interval": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            },
+            "Y tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "Y tick step": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            }
+          }
+        }
+      ],
+      "execution": {
+        "buffer": "2",
+        "generation": "1",
+        "connection_generation": 1,
+        "id": 1
+      }
+    },
+    {
+      "command": {
+        "describe": {}
+      },
+      "outcome": "applied",
+      "figures": [
+        {
+          "figure": "3",
+          "pane": 9223372036854775808,
+          "title": "plot.line",
+          "view": "trend-lines",
+          "family": "line",
+          "size": {
+            "width": 462.40002,
+            "height": 432.0
+          },
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 36.959999084472656,
+                    "y1": 61.959999084472656
+                  },
+                  {
+                    "series": 1,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 61.959999084472656,
+                    "y1": 86.95999908447266
+                  },
+                  {
+                    "series": 2,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 86.95999908447266,
+                    "y1": 111.95999908447266
+                  }
+                ],
+                "x0": 204.6800079345703,
+                "x1": 374.67999267578125,
+                "y0": 26.959999084472656,
+                "y1": 121.95999908447266
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Horizon",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Horizon"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Northstar",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Northstar"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Pulse",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Pulse"
+                  }
+                }
+              ],
+              "viewbox": [
+                462.4000244140625,
+                432.0
+              ]
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "width": 462.40002,
+              "height": 432.0
+            }
+          },
+          "live": {
+            "hidden": [],
+            "size": {
+              "width": 462.40002,
+              "height": 432.0
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "section": "Padding",
+              "value": 80.0,
+              "provenance": "default"
+            },
+            "Categorical palette": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "authored"
+            },
+            "Diverging ramp": {
+              "section": "Figure",
+              "value": "BlueWhiteRed",
+              "provenance": "theme"
+            },
+            "Duotone skin": {
+              "section": "Figure",
+              "value": false,
+              "provenance": "authored"
+            },
+            "Facet label size": {
+              "section": "Facet",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Hover text size": {
+              "section": "Figure",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Left": {
+              "section": "Padding",
+              "value": 100.0,
+              "provenance": "default"
+            },
+            "Point size": {
+              "section": "Mark",
+              "value": 1.0,
+              "provenance": "default"
+            },
+            "Position": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "Right": {
+              "section": "Padding",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Sequential ramp": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "theme"
+            },
+            "Skin": {
+              "section": "Figure",
+              "value": "greys_rs2",
+              "provenance": "authored"
+            },
+            "Stroke width": {
+              "section": "Mark",
+              "value": 1.0,
+              "provenance": "default"
+            },
+            "Subtitle": {
+              "section": "Figure",
+              "value": "Eight-week activation trend by product line",
+              "provenance": "authored"
+            },
+            "Subtitle size": {
+              "section": "Figure",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Text size": {
+              "section": "Legend",
+              "value": 14.0,
+              "provenance": "authored"
+            },
+            "Title": {
+              "section": "Figure",
+              "value": "Product momentum",
+              "provenance": "authored"
+            },
+            "Title size": {
+              "section": "Figure",
+              "value": 24.0,
+              "provenance": "authored"
+            },
+            "Top": {
+              "section": "Padding",
+              "value": 50.0,
+              "provenance": "default"
+            },
+            "Visible": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "X bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "X label": {
+              "section": "Axes",
+              "value": "Week",
+              "provenance": "authored"
+            },
+            "X label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "X minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "X tick interval": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "X tick rotation": {
+              "section": "Axes",
+              "value": 0.0,
+              "provenance": "default"
+            },
+            "X tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "X tick step": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "Y bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "Y label": {
+              "section": "Axes",
+              "value": "Activated accounts",
+              "provenance": "authored"
+            },
+            "Y label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "Y minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "Y tick interval": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            },
+            "Y tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "Y tick step": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            }
+          }
+        },
+        {
+          "figure": "2",
+          "pane": 9223372036854775809,
+          "title": "plot.area",
+          "view": "trend-area",
+          "family": "stacked-area",
+          "size": {
+            "width": 472.00003,
+            "height": 432.0
+          },
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 221.4000244140625,
+                    "x1": 371.4000244140625,
+                    "y0": 36.959999084472656,
+                    "y1": 61.959999084472656
+                  },
+                  {
+                    "series": 1,
+                    "x0": 221.4000244140625,
+                    "x1": 371.4000244140625,
+                    "y0": 61.959999084472656,
+                    "y1": 86.95999908447266
+                  },
+                  {
+                    "series": 2,
+                    "x0": 221.4000244140625,
+                    "x1": 371.4000244140625,
+                    "y0": 86.95999908447266,
+                    "y1": 111.95999908447266
+                  }
+                ],
+                "x0": 211.4000244140625,
+                "x1": 381.4000244140625,
+                "y0": 26.959999084472656,
+                "y1": 121.95999908447266
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Horizon",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Horizon"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Northstar",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Northstar"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Pulse",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Pulse"
+                  }
+                }
+              ],
+              "viewbox": [
+                472.0000305175781,
+                432.0
+              ]
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "width": 472.00003,
+              "height": 432.0
+            }
+          },
+          "live": {
+            "hidden": [],
+            "size": {
+              "width": 472.00003,
+              "height": 432.0
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "section": "Padding",
+              "value": 80.0,
+              "provenance": "default"
+            },
+            "Categorical palette": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "authored"
+            },
+            "Diverging ramp": {
+              "section": "Figure",
+              "value": "BlueWhiteRed",
+              "provenance": "theme"
+            },
+            "Duotone skin": {
+              "section": "Figure",
+              "value": false,
+              "provenance": "authored"
+            },
+            "Facet label size": {
+              "section": "Facet",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Hover text size": {
+              "section": "Figure",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Left": {
+              "section": "Padding",
+              "value": 100.0,
+              "provenance": "default"
+            },
+            "Percent": {
+              "section": "Mark",
+              "value": false,
+              "provenance": "default"
+            },
+            "Position": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "Right": {
+              "section": "Padding",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Sequential ramp": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "theme"
+            },
+            "Skin": {
+              "section": "Figure",
+              "value": "greys_rs2",
+              "provenance": "authored"
+            },
+            "Stacked": {
+              "section": "Mark",
+              "value": false,
+              "provenance": "default"
+            },
+            "Stroke width": {
+              "section": "Mark",
+              "value": 1.0,
+              "provenance": "default"
+            },
+            "Subtitle": {
+              "section": "Figure",
+              "value": "The same weekly activity, accumulated across product lines",
+              "provenance": "authored"
+            },
+            "Subtitle size": {
+              "section": "Figure",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Text size": {
+              "section": "Legend",
+              "value": 14.0,
+              "provenance": "authored"
+            },
+            "Title": {
+              "section": "Figure",
+              "value": "Portfolio growth",
+              "provenance": "authored"
+            },
+            "Title size": {
+              "section": "Figure",
+              "value": 24.0,
+              "provenance": "authored"
+            },
+            "Top": {
+              "section": "Padding",
+              "value": 50.0,
+              "provenance": "default"
+            },
+            "Visible": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "X bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "X label": {
+              "section": "Axes",
+              "value": "Week",
+              "provenance": "authored"
+            },
+            "X label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "X minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "X tick interval": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "X tick rotation": {
+              "section": "Axes",
+              "value": 0.0,
+              "provenance": "default"
+            },
+            "X tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "X tick step": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "Y bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "Y label": {
+              "section": "Axes",
+              "value": "Activated accounts",
+              "provenance": "authored"
+            },
+            "Y label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "Y minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "Y tick interval": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            },
+            "Y tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "Y tick step": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            }
+          }
+        },
+        {
+          "figure": "4",
+          "pane": 9223372036854775810,
+          "title": "plot.scatter",
+          "view": "trend-scatter",
+          "family": "scatter",
+          "size": {
+            "width": 462.40002,
+            "height": 432.0
+          },
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 36.959999084472656,
+                    "y1": 61.959999084472656
+                  },
+                  {
+                    "series": 1,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 61.959999084472656,
+                    "y1": 86.95999908447266
+                  },
+                  {
+                    "series": 2,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 86.95999908447266,
+                    "y1": 111.95999908447266
+                  }
+                ],
+                "x0": 204.6800079345703,
+                "x1": 374.67999267578125,
+                "y0": 26.959999084472656,
+                "y1": 121.95999908447266
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Horizon",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Horizon"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Northstar",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Northstar"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Pulse",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Pulse"
+                  }
+                }
+              ],
+              "viewbox": [
+                462.4000244140625,
+                432.0
+              ]
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "width": 462.40002,
+              "height": 432.0
+            }
+          },
+          "live": {
+            "hidden": [],
+            "size": {
+              "width": 462.40002,
+              "height": 432.0
+            }
+          },
+          "render_mode": "vector",
+          "settings": {
+            "Bottom": {
+              "section": "Padding",
+              "value": 80.0,
+              "provenance": "default"
+            },
+            "Categorical palette": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "authored"
+            },
+            "Diverging ramp": {
+              "section": "Figure",
+              "value": "BlueWhiteRed",
+              "provenance": "theme"
+            },
+            "Duotone skin": {
+              "section": "Figure",
+              "value": false,
+              "provenance": "authored"
+            },
+            "Facet label size": {
+              "section": "Facet",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Hover text size": {
+              "section": "Figure",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Left": {
+              "section": "Padding",
+              "value": 100.0,
+              "provenance": "default"
+            },
+            "Point size": {
+              "section": "Mark",
+              "value": 1.0,
+              "provenance": "default"
+            },
+            "Position": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "Right": {
+              "section": "Padding",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Sequential ramp": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "theme"
+            },
+            "Skin": {
+              "section": "Figure",
+              "value": "greys_rs2",
+              "provenance": "authored"
+            },
+            "Subtitle": {
+              "section": "Figure",
+              "value": "Each observation stays discrete while the series identity remains visible",
+              "provenance": "authored"
+            },
+            "Subtitle size": {
+              "section": "Figure",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Text size": {
+              "section": "Legend",
+              "value": 14.0,
+              "provenance": "authored"
+            },
+            "Title": {
+              "section": "Figure",
+              "value": "Momentum checkpoints",
+              "provenance": "authored"
+            },
+            "Title size": {
+              "section": "Figure",
+              "value": 24.0,
+              "provenance": "authored"
+            },
+            "Top": {
+              "section": "Padding",
+              "value": 50.0,
+              "provenance": "default"
+            },
+            "Visible": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "X bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "X label": {
+              "section": "Axes",
+              "value": "Week",
+              "provenance": "authored"
+            },
+            "X label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "X minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "X tick interval": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "X tick rotation": {
+              "section": "Axes",
+              "value": 0.0,
+              "provenance": "default"
+            },
+            "X tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "X tick step": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "Y bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "Y label": {
+              "section": "Axes",
+              "value": "Activated accounts",
+              "provenance": "authored"
+            },
+            "Y label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "Y minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "Y tick interval": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            },
+            "Y tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "Y tick step": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            }
+          }
+        },
+        {
+          "figure": "1",
+          "pane": 9223372036854775811,
+          "title": "plot.bubble",
+          "view": "trend-bubbles",
+          "family": "bubble",
+          "size": {
+            "width": 472.00003,
+            "height": 432.0
+          },
+          "series": {
+            "status": "absent",
+            "reason": "the figure identifies no series"
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "width": 472.00003,
+              "height": 432.0
+            }
+          },
+          "live": {
+            "hidden": [],
+            "size": {
+              "width": 472.00003,
+              "height": 432.0
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "section": "Padding",
+              "value": 80.0,
+              "provenance": "default"
+            },
+            "Categorical palette": {
+              "section": "Figure",
+              "value": "Blues",
+              "provenance": "theme"
+            },
+            "Diverging ramp": {
+              "section": "Figure",
+              "value": "BlueWhiteRed",
+              "provenance": "theme"
+            },
+            "Duotone skin": {
+              "section": "Figure",
+              "value": false,
+              "provenance": "authored"
+            },
+            "Facet label size": {
+              "section": "Facet",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Hover text size": {
+              "section": "Figure",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Left": {
+              "section": "Padding",
+              "value": 100.0,
+              "provenance": "default"
+            },
+            "Point size": {
+              "section": "Mark",
+              "value": 1.0,
+              "provenance": "default"
+            },
+            "Position": {
+              "section": "Legend",
+              "value": "default",
+              "provenance": "default"
+            },
+            "Right": {
+              "section": "Padding",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Sequential ramp": {
+              "section": "Figure",
+              "value": "Blues",
+              "provenance": "authored"
+            },
+            "Skin": {
+              "section": "Figure",
+              "value": "greys_rs2",
+              "provenance": "authored"
+            },
+            "Subtitle": {
+              "section": "Figure",
+              "value": "Bubble area adds engaged accounts; colour retains the activation measure",
+              "provenance": "authored"
+            },
+            "Subtitle size": {
+              "section": "Figure",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Text size": {
+              "section": "Legend",
+              "value": 14.0,
+              "provenance": "default"
+            },
+            "Title": {
+              "section": "Figure",
+              "value": "Momentum and reach",
+              "provenance": "authored"
+            },
+            "Title size": {
+              "section": "Figure",
+              "value": 24.0,
+              "provenance": "authored"
+            },
+            "Top": {
+              "section": "Padding",
+              "value": 50.0,
+              "provenance": "default"
+            },
+            "Visible": {
+              "section": "Legend",
+              "value": "default",
+              "provenance": "default"
+            },
+            "X bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "X label": {
+              "section": "Axes",
+              "value": "Week",
+              "provenance": "authored"
+            },
+            "X label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "X minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "X tick interval": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "X tick rotation": {
+              "section": "Axes",
+              "value": 0.0,
+              "provenance": "default"
+            },
+            "X tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "X tick step": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "Y bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "Y label": {
+              "section": "Axes",
+              "value": "Activated accounts",
+              "provenance": "authored"
+            },
+            "Y label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "Y minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "Y tick interval": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            },
+            "Y tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "Y tick step": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "command": {
+        "publish": {
+          "directory": "C:/Users/em/AppData/Local/Temp/adr0169/pub3"
+        }
+      },
+      "outcome": "applied",
+      "figures": [
+        {
+          "figure": "3",
+          "pane": 9223372036854775808,
+          "title": "plot.line",
+          "view": "trend-lines",
+          "family": "line",
+          "size": {
+            "width": 462.40002,
+            "height": 432.0
+          },
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 36.959999084472656,
+                    "y1": 61.959999084472656
+                  },
+                  {
+                    "series": 1,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 61.959999084472656,
+                    "y1": 86.95999908447266
+                  },
+                  {
+                    "series": 2,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 86.95999908447266,
+                    "y1": 111.95999908447266
+                  }
+                ],
+                "x0": 204.6800079345703,
+                "x1": 374.67999267578125,
+                "y0": 26.959999084472656,
+                "y1": 121.95999908447266
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Horizon",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Horizon"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Northstar",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Northstar"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Pulse",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Pulse"
+                  }
+                }
+              ],
+              "viewbox": [
+                462.4000244140625,
+                432.0
+              ]
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "width": 462.40002,
+              "height": 432.0
+            }
+          },
+          "live": {
+            "hidden": [],
+            "size": {
+              "width": 462.40002,
+              "height": 432.0
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "section": "Padding",
+              "value": 80.0,
+              "provenance": "default"
+            },
+            "Categorical palette": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "authored"
+            },
+            "Diverging ramp": {
+              "section": "Figure",
+              "value": "BlueWhiteRed",
+              "provenance": "theme"
+            },
+            "Duotone skin": {
+              "section": "Figure",
+              "value": false,
+              "provenance": "authored"
+            },
+            "Facet label size": {
+              "section": "Facet",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Hover text size": {
+              "section": "Figure",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Left": {
+              "section": "Padding",
+              "value": 100.0,
+              "provenance": "default"
+            },
+            "Point size": {
+              "section": "Mark",
+              "value": 1.0,
+              "provenance": "default"
+            },
+            "Position": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "Right": {
+              "section": "Padding",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Sequential ramp": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "theme"
+            },
+            "Skin": {
+              "section": "Figure",
+              "value": "greys_rs2",
+              "provenance": "authored"
+            },
+            "Stroke width": {
+              "section": "Mark",
+              "value": 1.0,
+              "provenance": "default"
+            },
+            "Subtitle": {
+              "section": "Figure",
+              "value": "Eight-week activation trend by product line",
+              "provenance": "authored"
+            },
+            "Subtitle size": {
+              "section": "Figure",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Text size": {
+              "section": "Legend",
+              "value": 14.0,
+              "provenance": "authored"
+            },
+            "Title": {
+              "section": "Figure",
+              "value": "Product momentum",
+              "provenance": "authored"
+            },
+            "Title size": {
+              "section": "Figure",
+              "value": 24.0,
+              "provenance": "authored"
+            },
+            "Top": {
+              "section": "Padding",
+              "value": 50.0,
+              "provenance": "default"
+            },
+            "Visible": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "X bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "X label": {
+              "section": "Axes",
+              "value": "Week",
+              "provenance": "authored"
+            },
+            "X label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "X minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "X tick interval": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "X tick rotation": {
+              "section": "Axes",
+              "value": 0.0,
+              "provenance": "default"
+            },
+            "X tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "X tick step": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "Y bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "Y label": {
+              "section": "Axes",
+              "value": "Activated accounts",
+              "provenance": "authored"
+            },
+            "Y label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "Y minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "Y tick interval": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            },
+            "Y tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "Y tick step": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            }
+          }
+        },
+        {
+          "figure": "2",
+          "pane": 9223372036854775809,
+          "title": "plot.area",
+          "view": "trend-area",
+          "family": "stacked-area",
+          "size": {
+            "width": 472.00003,
+            "height": 432.0
+          },
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 221.4000244140625,
+                    "x1": 371.4000244140625,
+                    "y0": 36.959999084472656,
+                    "y1": 61.959999084472656
+                  },
+                  {
+                    "series": 1,
+                    "x0": 221.4000244140625,
+                    "x1": 371.4000244140625,
+                    "y0": 61.959999084472656,
+                    "y1": 86.95999908447266
+                  },
+                  {
+                    "series": 2,
+                    "x0": 221.4000244140625,
+                    "x1": 371.4000244140625,
+                    "y0": 86.95999908447266,
+                    "y1": 111.95999908447266
+                  }
+                ],
+                "x0": 211.4000244140625,
+                "x1": 381.4000244140625,
+                "y0": 26.959999084472656,
+                "y1": 121.95999908447266
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Horizon",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Horizon"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Northstar",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Northstar"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Pulse",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Pulse"
+                  }
+                }
+              ],
+              "viewbox": [
+                472.0000305175781,
+                432.0
+              ]
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "width": 472.00003,
+              "height": 432.0
+            }
+          },
+          "live": {
+            "hidden": [],
+            "size": {
+              "width": 472.00003,
+              "height": 432.0
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "section": "Padding",
+              "value": 80.0,
+              "provenance": "default"
+            },
+            "Categorical palette": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "authored"
+            },
+            "Diverging ramp": {
+              "section": "Figure",
+              "value": "BlueWhiteRed",
+              "provenance": "theme"
+            },
+            "Duotone skin": {
+              "section": "Figure",
+              "value": false,
+              "provenance": "authored"
+            },
+            "Facet label size": {
+              "section": "Facet",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Hover text size": {
+              "section": "Figure",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Left": {
+              "section": "Padding",
+              "value": 100.0,
+              "provenance": "default"
+            },
+            "Percent": {
+              "section": "Mark",
+              "value": false,
+              "provenance": "default"
+            },
+            "Position": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "Right": {
+              "section": "Padding",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Sequential ramp": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "theme"
+            },
+            "Skin": {
+              "section": "Figure",
+              "value": "greys_rs2",
+              "provenance": "authored"
+            },
+            "Stacked": {
+              "section": "Mark",
+              "value": false,
+              "provenance": "default"
+            },
+            "Stroke width": {
+              "section": "Mark",
+              "value": 1.0,
+              "provenance": "default"
+            },
+            "Subtitle": {
+              "section": "Figure",
+              "value": "The same weekly activity, accumulated across product lines",
+              "provenance": "authored"
+            },
+            "Subtitle size": {
+              "section": "Figure",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Text size": {
+              "section": "Legend",
+              "value": 14.0,
+              "provenance": "authored"
+            },
+            "Title": {
+              "section": "Figure",
+              "value": "Portfolio growth",
+              "provenance": "authored"
+            },
+            "Title size": {
+              "section": "Figure",
+              "value": 24.0,
+              "provenance": "authored"
+            },
+            "Top": {
+              "section": "Padding",
+              "value": 50.0,
+              "provenance": "default"
+            },
+            "Visible": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "X bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "X label": {
+              "section": "Axes",
+              "value": "Week",
+              "provenance": "authored"
+            },
+            "X label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "X minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "X tick interval": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "X tick rotation": {
+              "section": "Axes",
+              "value": 0.0,
+              "provenance": "default"
+            },
+            "X tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "X tick step": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "Y bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "Y label": {
+              "section": "Axes",
+              "value": "Activated accounts",
+              "provenance": "authored"
+            },
+            "Y label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "Y minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "Y tick interval": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            },
+            "Y tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "Y tick step": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            }
+          }
+        },
+        {
+          "figure": "4",
+          "pane": 9223372036854775810,
+          "title": "plot.scatter",
+          "view": "trend-scatter",
+          "family": "scatter",
+          "size": {
+            "width": 462.40002,
+            "height": 432.0
+          },
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 36.959999084472656,
+                    "y1": 61.959999084472656
+                  },
+                  {
+                    "series": 1,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 61.959999084472656,
+                    "y1": 86.95999908447266
+                  },
+                  {
+                    "series": 2,
+                    "x0": 214.6800079345703,
+                    "x1": 364.67999267578125,
+                    "y0": 86.95999908447266,
+                    "y1": 111.95999908447266
+                  }
+                ],
+                "x0": 204.6800079345703,
+                "x1": 374.67999267578125,
+                "y0": 26.959999084472656,
+                "y1": 121.95999908447266
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Horizon",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Horizon"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Northstar",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Northstar"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Pulse",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Pulse"
+                  }
+                }
+              ],
+              "viewbox": [
+                462.4000244140625,
+                432.0
+              ]
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "width": 462.40002,
+              "height": 432.0
+            }
+          },
+          "live": {
+            "hidden": [],
+            "size": {
+              "width": 462.40002,
+              "height": 432.0
+            }
+          },
+          "render_mode": "vector",
+          "settings": {
+            "Bottom": {
+              "section": "Padding",
+              "value": 80.0,
+              "provenance": "default"
+            },
+            "Categorical palette": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "authored"
+            },
+            "Diverging ramp": {
+              "section": "Figure",
+              "value": "BlueWhiteRed",
+              "provenance": "theme"
+            },
+            "Duotone skin": {
+              "section": "Figure",
+              "value": false,
+              "provenance": "authored"
+            },
+            "Facet label size": {
+              "section": "Facet",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Hover text size": {
+              "section": "Figure",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Left": {
+              "section": "Padding",
+              "value": 100.0,
+              "provenance": "default"
+            },
+            "Point size": {
+              "section": "Mark",
+              "value": 1.0,
+              "provenance": "default"
+            },
+            "Position": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "Right": {
+              "section": "Padding",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Sequential ramp": {
+              "section": "Figure",
+              "value": "Viridis",
+              "provenance": "theme"
+            },
+            "Skin": {
+              "section": "Figure",
+              "value": "greys_rs2",
+              "provenance": "authored"
+            },
+            "Subtitle": {
+              "section": "Figure",
+              "value": "Each observation stays discrete while the series identity remains visible",
+              "provenance": "authored"
+            },
+            "Subtitle size": {
+              "section": "Figure",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Text size": {
+              "section": "Legend",
+              "value": 14.0,
+              "provenance": "authored"
+            },
+            "Title": {
+              "section": "Figure",
+              "value": "Momentum checkpoints",
+              "provenance": "authored"
+            },
+            "Title size": {
+              "section": "Figure",
+              "value": 24.0,
+              "provenance": "authored"
+            },
+            "Top": {
+              "section": "Padding",
+              "value": 50.0,
+              "provenance": "default"
+            },
+            "Visible": {
+              "section": "Legend",
+              "value": [
+                0.699999988079071,
+                0.07999999821186066
+              ],
+              "provenance": "authored"
+            },
+            "X bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "X label": {
+              "section": "Axes",
+              "value": "Week",
+              "provenance": "authored"
+            },
+            "X label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "X minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "X tick interval": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "X tick rotation": {
+              "section": "Axes",
+              "value": 0.0,
+              "provenance": "default"
+            },
+            "X tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "X tick step": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "Y bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "Y label": {
+              "section": "Axes",
+              "value": "Activated accounts",
+              "provenance": "authored"
+            },
+            "Y label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "Y minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "Y tick interval": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            },
+            "Y tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "Y tick step": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            }
+          }
+        },
+        {
+          "figure": "1",
+          "pane": 9223372036854775811,
+          "title": "plot.bubble",
+          "view": "trend-bubbles",
+          "family": "bubble",
+          "size": {
+            "width": 472.00003,
+            "height": 432.0
+          },
+          "series": {
+            "status": "absent",
+            "reason": "the figure identifies no series"
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "width": 472.00003,
+              "height": 432.0
+            }
+          },
+          "live": {
+            "hidden": [],
+            "size": {
+              "width": 472.00003,
+              "height": 432.0
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "section": "Padding",
+              "value": 80.0,
+              "provenance": "default"
+            },
+            "Categorical palette": {
+              "section": "Figure",
+              "value": "Blues",
+              "provenance": "theme"
+            },
+            "Diverging ramp": {
+              "section": "Figure",
+              "value": "BlueWhiteRed",
+              "provenance": "theme"
+            },
+            "Duotone skin": {
+              "section": "Figure",
+              "value": false,
+              "provenance": "authored"
+            },
+            "Facet label size": {
+              "section": "Facet",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Hover text size": {
+              "section": "Figure",
+              "value": 16.0,
+              "provenance": "default"
+            },
+            "Left": {
+              "section": "Padding",
+              "value": 100.0,
+              "provenance": "default"
+            },
+            "Point size": {
+              "section": "Mark",
+              "value": 1.0,
+              "provenance": "default"
+            },
+            "Position": {
+              "section": "Legend",
+              "value": "default",
+              "provenance": "default"
+            },
+            "Right": {
+              "section": "Padding",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Sequential ramp": {
+              "section": "Figure",
+              "value": "Blues",
+              "provenance": "authored"
+            },
+            "Skin": {
+              "section": "Figure",
+              "value": "greys_rs2",
+              "provenance": "authored"
+            },
+            "Subtitle": {
+              "section": "Figure",
+              "value": "Bubble area adds engaged accounts; colour retains the activation measure",
+              "provenance": "authored"
+            },
+            "Subtitle size": {
+              "section": "Figure",
+              "value": 20.0,
+              "provenance": "default"
+            },
+            "Text size": {
+              "section": "Legend",
+              "value": 14.0,
+              "provenance": "default"
+            },
+            "Title": {
+              "section": "Figure",
+              "value": "Momentum and reach",
+              "provenance": "authored"
+            },
+            "Title size": {
+              "section": "Figure",
+              "value": 24.0,
+              "provenance": "authored"
+            },
+            "Top": {
+              "section": "Padding",
+              "value": 50.0,
+              "provenance": "default"
+            },
+            "Visible": {
+              "section": "Legend",
+              "value": "default",
+              "provenance": "default"
+            },
+            "X bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "X label": {
+              "section": "Axes",
+              "value": "Week",
+              "provenance": "authored"
+            },
+            "X label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "X minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "X tick interval": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "X tick rotation": {
+              "section": "Axes",
+              "value": 0.0,
+              "provenance": "default"
+            },
+            "X tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "X tick step": {
+              "section": "Axes",
+              "value": "Step(PositiveFinite(1.0))",
+              "provenance": "authored"
+            },
+            "Y bounds": {
+              "section": "Axes",
+              "value": null,
+              "provenance": "default"
+            },
+            "Y label": {
+              "section": "Axes",
+              "value": "Activated accounts",
+              "provenance": "authored"
+            },
+            "Y label size": {
+              "section": "Axes",
+              "value": 16.0,
+              "provenance": "authored"
+            },
+            "Y minor ticks": {
+              "section": "Axes",
+              "value": 4,
+              "provenance": "authored"
+            },
+            "Y tick interval": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            },
+            "Y tick size": {
+              "section": "Axes",
+              "value": 18.0,
+              "provenance": "default"
+            },
+            "Y tick step": {
+              "section": "Axes",
+              "value": "Count(8)",
+              "provenance": "authored"
+            }
+          }
+        }
+      ],
+      "publish": {
+        "root": "C:/Users/em/AppData/Local/Temp/adr0169/pub3",
+        "digest": "c19a6a86a9a8207dccb2e08e8dc82145c273f18c33ff71b1452ec56f886d41ff",
+        "figures": [
+          {
+            "id": "trend-lines",
+            "title": "plot.line",
+            "visibility": {
+              "kind": "actionable",
+              "series": 3
+            },
+            "inspection": {
+              "kind": "omitted",
+              "observed": null,
+              "reason": "no-regions"
+            }
+          },
+          {
+            "id": "trend-area",
+            "title": "plot.area",
+            "visibility": {
+              "kind": "actionable",
+              "series": 3
+            },
+            "inspection": {
+              "kind": "omitted",
+              "observed": null,
+              "reason": "no-regions"
+            }
+          },
+          {
+            "id": "trend-scatter",
+            "title": "plot.scatter",
+            "visibility": {
+              "kind": "actionable",
+              "series": 3
+            },
+            "inspection": {
+              "bytes": 10264,
+              "kind": "projected",
+              "regions": 24
+            }
+          },
+          {
+            "id": "trend-bubbles",
+            "title": "plot.bubble",
+            "visibility": {
+              "kind": "absent",
+              "observed": null,
+              "reason": "no-identified-series"
+            },
+            "inspection": {
+              "bytes": 19038,
+              "kind": "projected",
+              "regions": 24
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
