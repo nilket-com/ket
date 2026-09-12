@@ -19,7 +19,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use tls_pki::{DEFAULT_CLUSTER_DOMAIN, generate_ca, issue_listener, load_ca, sign_client_csr};
+use tls_pki::{
+	DEFAULT_CLUSTER_DOMAIN, generate_ca, issue_listener, issue_storage, load_ca, sign_client_csr,
+};
 
 pub fn run<I>(program: &str, args: I) -> ExitCode
 where
@@ -30,6 +32,7 @@ where
 		Some("init-ca") => report(init_ca(&args[1..])),
 		Some("issue-listener") => report(issue_listener_command(&args[1..])),
 		Some("sign-client") => report(sign_client(&args[1..])),
+		Some("issue-storage") => report(issue_storage_command(&args[1..])),
 		Some("--help") | Some("-h") | None => {
 			print_usage(program);
 			ExitCode::SUCCESS
@@ -57,7 +60,9 @@ fn report(result: Result<String, String>) -> ExitCode {
 
 fn print_usage(program: &str) {
 	eprintln!(
-		"Usage: {program} COMMAND [OPTIONS]\n\nCommands:\n  init-ca --dir DIR [--name NAME]\n      Create ca.crt and ca.key in DIR.\n  issue-listener --dir DIR --worker-id UUID [--cluster-domain DOMAIN]\n      Create listener.crt and listener.key in DIR for a Toron node.\n  sign-client --dir DIR --csr FILE --tenant N --out FILE [--cluster-domain DOMAIN]\n      Sign a client's certificate request for tenant N; writes only the certificate."
+		"Usage: {program} COMMAND [OPTIONS]\n\nCommands:\n  init-ca --dir DIR [--name NAME]\n      Create ca.crt and ca.key in DIR.\n  issue-listener --dir DIR --worker-id UUID [--cluster-domain DOMAIN]\n      Create listener.crt and listener.key in DIR for a Toron node.\n  sign-client --dir DIR --csr FILE --tenant N --out FILE [--cluster-domain DOMAIN]\n      Sign a client's certificate request for tenant N; writes only the certificate.
+  issue-storage --ca-cert FILE --ca-key FILE --tenant N --out-dir DIR [--node-index I] [--cluster-domain DOMAIN]
+      Create toron-storage.crt and toron-storage.key claiming tenant N, signed by the node CA."
 	);
 }
 
@@ -152,6 +157,45 @@ fn sign_client(args: &[String]) -> Result<String, String> {
 	write_cert(&out, &issued.cert)?;
 	Ok(format!(
 		"wrote {} for client-{tenant}.{}",
+		out.display(),
+		options.cluster_domain()
+	))
+}
+
+fn issue_storage_command(args: &[String]) -> Result<String, String> {
+	let options = Options::parse(
+		args,
+		&[
+			"--ca-cert",
+			"--ca-key",
+			"--tenant",
+			"--out-dir",
+			"--node-index",
+			"--cluster-domain",
+		],
+	)?;
+	let ca_cert = std::fs::read_to_string(options.required("--ca-cert")?)
+		.map_err(|error| format!("read --ca-cert: {error}"))?;
+	let ca_key = std::fs::read_to_string(options.required("--ca-key")?)
+		.map_err(|error| format!("read --ca-key: {error}"))?;
+	let tenant = options.required("--tenant")?;
+	let out = PathBuf::from(options.required("--out-dir")?);
+	let node_index: u32 = options
+		.get("--node-index")
+		.unwrap_or("2")
+		.parse()
+		.map_err(|error| format!("--node-index: {error}"))?;
+	let ca = load_ca(&ca_cert, &ca_key).map_err(|error| error.to_string())?;
+	let issued = issue_storage(&ca, tenant, options.cluster_domain(), node_index)
+		.map_err(|error| error.to_string())?;
+	std::fs::create_dir_all(&out).map_err(|error| format!("create {}: {error}", out.display()))?;
+	write_cert(&out.join("toron-storage.crt"), &issued.cert)?;
+	write_key(
+		&out.join("toron-storage.key"),
+		issued.key.as_deref().expect("a storage identity has a key"),
+	)?;
+	Ok(format!(
+		"wrote {}/toron-storage.crt and toron-storage.key claiming tenant {tenant} as node-{node_index}.{}",
 		out.display(),
 		options.cluster_domain()
 	))

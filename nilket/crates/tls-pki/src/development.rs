@@ -7,12 +7,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use rcgen::{
-	BasicConstraints, Certificate, CertificateParams, CustomExtension, DnType,
-	ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose,
-};
-
-const ACTOR_CLAIMS_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 55555, 1, 1];
+use rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyUsagePurpose};
 const CLUSTER_DOMAIN: &str = "cluster.local";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,58 +156,7 @@ fn leaf(
 	tenant_id: Option<&str>,
 	key_id: Vec<u8>,
 ) -> io::Result<Certificate> {
-	let mut params = CertificateParams::new(dns_name.into_iter().collect::<Vec<_>>());
-	params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-	params.extended_key_usages = vec![
-		ExtendedKeyUsagePurpose::ServerAuth,
-		ExtendedKeyUsagePurpose::ClientAuth,
-	];
-	params
-		.distinguished_name
-		.push(DnType::CommonName, common_name);
-	params
-		.custom_extensions
-		.push(CustomExtension::from_oid_content(
-			ACTOR_CLAIMS_OID,
-			actor_claims(role, tenant_id, &key_id),
-		));
-	Certificate::from_params(params).map_err(rcgen_error)
-}
-
-fn actor_claims(role: &str, tenant_id: Option<&str>, key_id: &[u8]) -> Vec<u8> {
-	let mut out = Vec::new();
-	cbor_len(&mut out, 5, 4);
-	cbor_text(&mut out, "role");
-	cbor_text(&mut out, role);
-	cbor_text(&mut out, "scopes");
-	cbor_len(&mut out, 4, 1);
-	cbor_text(&mut out, "cluster");
-	cbor_text(&mut out, "tenant_id");
-	match tenant_id {
-		Some(tenant_id) => cbor_text(&mut out, tenant_id),
-		None => out.push(0xf6),
-	}
-	cbor_text(&mut out, "key_id");
-	cbor_len(&mut out, 2, key_id.len());
-	out.extend_from_slice(key_id);
-	out
-}
-
-fn cbor_text(out: &mut Vec<u8>, value: &str) {
-	cbor_len(out, 3, value.len());
-	out.extend_from_slice(value.as_bytes());
-}
-
-fn cbor_len(out: &mut Vec<u8>, major: u8, length: usize) {
-	match length {
-		0..=23 => out.push((major << 5) | length as u8),
-		24..=0xff => out.extend_from_slice(&[(major << 5) | 24, length as u8]),
-		0x100..=0xffff => {
-			out.push((major << 5) | 25);
-			out.extend_from_slice(&(length as u16).to_be_bytes());
-		}
-		_ => unreachable!("local actor claim fields are bounded"),
-	}
+	crate::claims::claimed_leaf(common_name, dns_name, role, tenant_id, key_id).map_err(rcgen_error)
 }
 
 fn write_signed(

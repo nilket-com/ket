@@ -75,6 +75,31 @@ pub fn issue_listener(
 	})
 }
 
+/// A node's storage identity toward Wendelon: SAN `node-<index>.<domain>`,
+/// role `data_node`, and the tenant claim Wendelon authorizes schema and data
+/// operations against. A Toron node serves the tenant its storage identity
+/// claims, so this is what makes a deployment "tenant N".
+pub fn issue_storage(
+	ca: &Certificate,
+	tenant: &str,
+	cluster_domain: &str,
+	node_index: u32,
+) -> Result<IssuedPem, PkiError> {
+	validate_tenant_token(tenant)?;
+	let leaf = crate::claims::claimed_leaf(
+		"toron-storage",
+		Some(format!("node-{node_index}.{cluster_domain}")),
+		"data_node",
+		Some(tenant),
+		node_index.to_le_bytes().to_vec(),
+	)
+	.map_err(rcgen_error)?;
+	Ok(IssuedPem {
+		cert: leaf.serialize_pem_with_signer(ca).map_err(rcgen_error)?,
+		key: Some(leaf.serialize_private_key_pem()),
+	})
+}
+
 /// The SQL client SAN token is a tenant id: a positive integer without a
 /// leading zero, exactly what the listener's admission parses.
 pub fn validate_tenant_token(tenant: &str) -> Result<(), PkiError> {
@@ -187,6 +212,29 @@ mod tests {
 		for bad in ["", "0", "07", "-1", "1a", "18446744073709551616", "windows"] {
 			assert!(validate_tenant_token(bad).is_err(), "{bad:?}");
 		}
+	}
+
+	#[test]
+	fn a_storage_identity_claims_its_tenant() {
+		let ca_pem = generate_ca("node-ca").unwrap();
+		let ca = load_ca(&ca_pem.cert, ca_pem.key.as_deref().unwrap()).unwrap();
+		let issued = issue_storage(&ca, "1", DOMAIN, 2).unwrap();
+		let chain = load_cert_chain_from_pem(&issued.cert).unwrap();
+		assert_eq!(
+			extract_dns_sans(&chain[0]).unwrap(),
+			vec![format!("node-2.{DOMAIN}")]
+		);
+		let claims = crate::extract_extension(&chain[0], &[1, 3, 6, 1, 4, 1, 55555, 1, 1])
+			.expect("claims extension")
+			.expect("claims present");
+		assert_eq!(
+			claims,
+			crate::actor_claims("data_node", Some("1"), &2_u32.to_le_bytes())
+		);
+		assert!(
+			issue_storage(&ca, "0", DOMAIN, 2).is_err(),
+			"tenant 0 is not a tenant token"
+		);
 	}
 
 	#[test]
