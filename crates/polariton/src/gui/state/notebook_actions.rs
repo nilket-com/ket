@@ -961,4 +961,26 @@ mod tests {
 		let line = crate::live::encode(&event).unwrap();
 		assert!(line.len() < crate::live::MAX_LINE, "{} bytes", line.len());
 	}
+
+	/// Regression probe for a refusal seen once on Linux on 2026-09-12: one SQL
+	/// cell on a single ~22 KB line made every guarded action on the buffer
+	/// answer `MutationFailed`, then opaque. It did not recur once the cause
+	/// was surfaced in the message; the probe stays so a recurrence names it.
+	#[test]
+	fn probe_a_single_long_line_cell_is_still_editable() {
+		let columns: Vec<String> = (0..300)
+			.map(|i| format!("'{}' AS wide_column_{i}", "x".repeat(60)))
+			.collect();
+		let source = format!(
+			"# probe\n\n```sql {{#q, output=none}}\nSELECT {}\n```\n",
+			columns.join(", ")
+		);
+		assert!(source.len() > 20 * 1024);
+		let mut f = Fixture::with_source(&source);
+		let described = f.describe_receipt();
+		assert_eq!(described.outcome, Outcome::Applied, "{described:?}");
+		let ran = f.run(0);
+		assert_eq!(ran.outcome, Outcome::Applied, "{ran:?}");
+		assert_eq!(ran.result.map(|r| r.columns.len()), Some(300));
+	}
 }

@@ -309,13 +309,21 @@ pub enum DocumentEditRefusal {
 
 impl std::fmt::Display for DocumentEditRefusal {
 	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		if let Self::MutationFailed(reason) = self {
+			// The inner cause is the only thing that distinguishes one mutation
+			// failure from another; an opaque message has cost real diagnosis.
+			return write!(
+				formatter,
+				"the editor could not apply the source edit: {reason}"
+			);
+		}
 		let message = match self {
 			Self::BufferUnavailable => "source buffer is unavailable",
 			Self::GenerationMismatch { .. } => "source changed before the edit could be applied",
 			Self::InvalidRange => "the planned source range is no longer valid",
 			Self::OverlappingEdits => "the planned source edits overlap",
 			Self::DocumentIsNotUtf8 => "source document is not valid UTF-8",
-			Self::MutationFailed(_) => "the editor could not apply the source edit",
+			Self::MutationFailed(_) => unreachable!("handled above"),
 		};
 		formatter.write_str(message)
 	}
@@ -758,4 +766,24 @@ pub(crate) struct SearchMatch {
 	pub(crate) line: DocLine,
 	pub(crate) col: DocDisplayCol,
 	pub(crate) byte_len: usize,
+}
+
+#[cfg(test)]
+mod mutation_failure_tests {
+	use super::DocumentEditRefusal;
+
+	/// A mutation failure names its cause; the opaque form cost a day of
+	/// diagnosis on 2026-09-12.
+	#[test]
+	fn a_mutation_failure_names_its_cause() {
+		let text = DocumentEditRefusal::MutationFailed("registry: root missing".into()).to_string();
+		assert_eq!(
+			text,
+			"the editor could not apply the source edit: registry: root missing"
+		);
+		assert_eq!(
+			DocumentEditRefusal::InvalidRange.to_string(),
+			"the planned source range is no longer valid"
+		);
+	}
 }
