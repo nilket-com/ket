@@ -1,0 +1,70 @@
+// Violin mix — one relation of raw observations, three views: a violin of
+// each cohort's density with its median, a bar of each cohort's average,
+// and a summary table skinned "yellows". Data: uat/plot_distribution_showcase.sql
+// (distribution_observations: cohort, score), seeded into the tenant with
+// `nilket toron sql --file`.
+
+let density = workspace
+	.table("distribution_observations")
+	.kernel_density(col("cohort"), col("score"), 128)
+	.alias("density");
+let medians = workspace
+	.table("distribution_observations")
+	.aggregate([col("cohort")], [approx_quantile(col("score"), 0.5)])
+	.alias("medians");
+let violin_inputs = density.join(
+	medians,
+	qcol("density", "group").eq(qcol("medians", "cohort")),
+);
+
+let cohort_averages = workspace
+	.table("distribution_observations")
+	.aggregate([col("cohort")], [avg(col("score"))])
+	.project_named([
+		col("cohort").named("cohort"),
+		col("avg").named("average_score"),
+	])
+	.sort([asc(col("cohort"))]);
+
+let cohort_summary = workspace
+	.table("distribution_observations")
+	.aggregate(
+		[col("cohort")],
+		[count_all(), avg(col("score")), min(col("score")), max(col("score"))],
+	)
+	.project_named([
+		col("cohort").named("cohort"),
+		col("count").named("observations"),
+		col("avg").named("average"),
+		col("min").named("lowest"),
+		col("max").named("highest"),
+	])
+	.sort([asc(col("cohort"))]);
+
+violin_inputs.views([
+	view("mix-violin", figure([
+		title("Cohort density and median").font_size(24),
+		subtitle("Kernel density per cohort, joined to each cohort's median"),
+		skin("greys_rs2"),
+		palette("blues_C"),
+		x_axis().label("Cohort").label_size(16),
+		y_axis().label("Score").label_size(16),
+		violin("group", "evaluation_value", "density", "quantile"),
+	])),
+]);
+
+cohort_averages.views([
+	view("mix-bars", figure([
+		title("Average score by cohort").font_size(24),
+		subtitle("The same observations, one bar per cohort"),
+		skin("greys_rs2"),
+		palette("blues_C"),
+		x_axis().label("Cohort").label_size(16),
+		y_axis().label("Average score").label_size(16),
+		bar("cohort", "average_score").bar_width(0.82),
+	])),
+]);
+
+cohort_summary.views([
+	view("mix-table", table().skin("yellows")),
+]);

@@ -62,6 +62,18 @@ One relation drives its line, area, scatter, and bubble views. The four fields
 are intentionally direct mark inputs: `period`, `series`, `value`, and
 `magnitude`.
 
+Open the violin mix dashboard, which reuses the Distribution seed and puts a
+violin, a bar chart, and a `yellows`-skinned summary table in one workbook.
+Driven from Windows against a remote tenant it is the ADR 0169 form:
+
+```sh
+nilket toron sql --file uat/plot_distribution_showcase.sql
+polariton drive --execute by-command uat/plots_violin_mix.rn --commands <connect, run_source, publish> --receipt <file>
+```
+
+The table is a pane, not a figure: it shows in the window and is not part of
+the published package.
+
 Open the semantic Distribution & variation showcase with its raw-observation
 seed:
 
