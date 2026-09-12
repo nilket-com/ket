@@ -39,7 +39,22 @@ const V_SCROLLBAR_WIDTH: f32 = 12.0;
 const H_SCROLLBAR_HEIGHT: f32 = 12.0;
 const COL_RESIZE_GRAB_ZONE: f32 = 4.0;
 
+/// The text a cell shows in the grid, or `None` for a SQL NULL (and for a
+/// row outside the column). ADR 0168: the agent's preview uses this same
+/// function, so presentation is shared while nullness stays data.
+pub(crate) fn cell_text(column: &Column, row: usize) -> Option<String> {
+	if row >= column.len() {
+		return None;
+	}
+	match column.get(row) {
+		Ok(AnyValue::Null) | Err(_) => None,
+		Ok(AnyValue::String(s)) => Some(s.to_string()),
+		Ok(AnyValue::StringOwned(s)) => Some(s.to_string()),
+		Ok(v) => Some(format!("{v}")),
+	}
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+
 enum ColumnAlignment {
 	Left,
 	Right,
@@ -282,19 +297,11 @@ impl<'a, Message> Table<'a, Message> {
 	}
 
 	fn cell_str(&self, col_idx: usize, row_idx: usize) -> String {
-		let series: &Column = match self.data_frame.columns().get(col_idx) {
-			Some(s) => s,
-			None => return String::new(),
-		};
-		if row_idx >= series.len() {
-			return String::new();
-		}
-		match series.get(row_idx) {
-			Ok(AnyValue::Null) | Err(_) => String::new(),
-			Ok(AnyValue::String(s)) => s.to_string(),
-			Ok(AnyValue::StringOwned(s)) => s.to_string(),
-			Ok(v) => format!("{v}"),
-		}
+		self.data_frame
+			.columns()
+			.get(col_idx)
+			.and_then(|column| cell_text(column, row_idx))
+			.unwrap_or_default()
 	}
 
 	fn col_left_edges(&self, state: &TableState) -> Vec<f32> {

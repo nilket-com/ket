@@ -18,6 +18,7 @@ mod publication;
 mod reporting;
 mod result_artifact;
 mod result_registry;
+mod result_summary;
 mod rune_host;
 #[cfg(feature = "toron")]
 mod rune_presentation;

@@ -23,6 +23,8 @@ pub(super) enum Completion {
 	Done {
 		notebook: Option<NotebookDescription>,
 		data: Option<DataDescription>,
+		/// ADR 0168: the answer of the SQL cell this run executed.
+		result: Option<crate::driver::ResultSummary>,
 	},
 	Refused(String),
 	Failed(String),
@@ -36,9 +38,14 @@ pub(super) enum Completion {
 impl Completion {
 	pub(super) fn apply(self, receipt: &mut CommandReceipt) {
 		match self {
-			Self::Done { notebook, data } => {
+			Self::Done {
+				notebook,
+				data,
+				result,
+			} => {
 				receipt.notebook = notebook;
 				receipt.data = data;
+				receipt.result = result;
 			}
 			Self::Refused(message) => receipt.refuse(Refusal::Notebook { message }),
 			Self::Failed(message) => receipt.fail(Failure::Notebook { message }),
@@ -339,6 +346,7 @@ impl AppState {
 				self.complete_notebook(Completion::Done {
 					notebook: Some(description),
 					data: None,
+					result: None,
 				});
 			} else if !self.code_editor.host_plot_incarnations().contains(token) {
 				self.complete_notebook(Completion::Failed(
@@ -378,6 +386,7 @@ impl AppState {
 				self.complete_notebook(Completion::Done {
 					notebook: Some(description),
 					data: None,
+					result: None,
 				});
 			}
 			Kind::Replace {
@@ -393,6 +402,7 @@ impl AppState {
 				self.complete_notebook(Completion::Done {
 					notebook: Some(description),
 					data: None,
+					result: None,
 				});
 			}
 			Kind::Run { cell, .. } => {
@@ -447,6 +457,7 @@ impl AppState {
 				self.complete_notebook(Completion::Done {
 					notebook: None,
 					data: Some(loaded.description),
+					result: None,
 				});
 				return task;
 			}
@@ -479,6 +490,7 @@ impl AppState {
 		let description = description.clone();
 		let before = self.code_editor.host_plot_incarnations();
 		let plot_ready = matches!(&message, Message::NotebookPlotReady { .. });
+		let mut executed: Option<std::sync::Arc<crate::result_artifact::ResultArtifact>> = None;
 		let mut terminal = match &message {
 			Message::RunMarkdownCellResult {
 				result, generation, ..
@@ -487,6 +499,10 @@ impl AppState {
 			} else {
 				match result {
 					crate::adapters::common::ExecutionResult::Err(e) => Err(e.clone()),
+					crate::adapters::common::ExecutionResult::Rows { artifact, .. } => {
+						executed = Some(std::sync::Arc::clone(artifact));
+						Ok(())
+					}
 					_ => Ok(()),
 				}
 			}),
@@ -520,6 +536,11 @@ impl AppState {
 				Ok(()) => self.complete_notebook(Completion::Done {
 					notebook: Some(description),
 					data: None,
+					// ADR 0168 §1: the artifact this run bound, never the cell's
+					// retained one, so an earlier answer is never reported.
+					result: executed
+						.as_deref()
+						.and_then(crate::result_summary::summarize),
 				}),
 				Err(e) => self.complete_notebook(Completion::Failed(e)),
 			}
@@ -586,6 +607,10 @@ mod tests {
 				generation: n.generation,
 				cell,
 			}
+		}
+		fn describe_receipt(&mut self) -> CommandReceipt {
+			self.app
+				.apply_command(&Command::DescribeNotebook { buffer: None })
 		}
 		fn run(&mut self, cell: u32) -> CommandReceipt {
 			let target = self.target(cell);
@@ -825,5 +850,115 @@ mod tests {
 			f.app.state().adapter_state.selection,
 			crate::adapters::driver::AdapterSelection::SQLite
 		));
+	}
+
+	/// ADR 0168 §1 and §3: a SQL cell's receipt carries this run's answer with
+	/// nullness as data, an empty relation keeps its columns, and every other
+	/// receipt carries no answer.
+	#[test]
+	fn adr0168_a_sql_cells_receipt_carries_its_answer() {
+		let mut f = Fixture::with_source(
+			"# 0168\n\n```sql {#q, output=none}\nSELECT 1 AS x, NULL AS n, 'null' AS s\n```\n",
+		);
+		let receipt = f.run(0);
+		assert_eq!(receipt.outcome, Outcome::Applied, "{receipt:?}");
+		let result = receipt.result.expect("a SQL cell's answer");
+		assert_eq!(
+			result
+				.columns
+				.iter()
+				.map(|c| c.name.as_str())
+				.collect::<Vec<_>>(),
+			["x", "n", "s"]
+		);
+		assert!(result.columns.iter().all(|c| !c.dtype.is_empty()));
+		assert_eq!(result.rows, 1);
+		assert_eq!(
+			result.preview,
+			vec![vec![Some("1".to_owned()), None, Some("null".to_owned())]]
+		);
+		assert!(!result.truncated && result.truncation_reasons.is_empty());
+		assert!(f.describe_receipt().result.is_none());
+
+		let receipt = f.replace(
+			0,
+			"SELECT 1 AS x WHERE 0
+",
+		);
+		assert_eq!(receipt.outcome, Outcome::Applied, "{receipt:?}");
+		let result = f.run(0).result.expect("an empty relation is an answer");
+		assert_eq!(result.columns.len(), 1);
+		assert_eq!(result.rows, 0);
+		assert!(result.preview.is_empty() && !result.truncated);
+
+		let receipt = f.replace(
+			0,
+			"WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 1000) SELECT n FROM t
+",
+		);
+		assert_eq!(receipt.outcome, Outcome::Applied, "{receipt:?}");
+		let result = f.run(0).result.expect("a long relation is an answer");
+		assert_eq!(result.rows, 1000);
+		assert_eq!(result.preview.len(), crate::result_summary::PREVIEW_ROWS);
+		assert_eq!(
+			result.truncation_reasons,
+			vec![crate::driver::TruncationReason::Rows]
+		);
+	}
+
+	/// ADR 0168 §1: the answer is this execution's. After a success, a
+	/// statement and then a failure in the same cell report no rows.
+	#[test]
+	fn adr0168_an_earlier_answer_is_never_reported() {
+		let mut f =
+			Fixture::with_source("# 0168\n\n```sql {#q, output=none}\nSELECT 7 AS seven\n```\n");
+		assert_eq!(
+			f.run(0).result.unwrap().preview,
+			vec![vec![Some("7".to_owned())]]
+		);
+		f.replace(
+			0,
+			"CREATE TABLE t0168 (a INTEGER)
+",
+		);
+		let statement = f.run(0);
+		assert_eq!(statement.outcome, Outcome::Applied, "{statement:?}");
+		assert!(statement.result.is_none(), "a statement has no relation");
+		f.replace(
+			0,
+			"SELECT * FROM no_such_table_0168
+",
+		);
+		let failed = f.run(0);
+		assert_eq!(failed.outcome, Outcome::Failed, "{failed:?}");
+		assert!(failed.result.is_none(), "a failure reports no earlier rows");
+	}
+
+	/// ADR 0168 §2: a wide answer stays under the live line limit, and the
+	/// event that carries it encodes within bounds.
+	#[test]
+	fn adr0168_a_wide_answer_keeps_the_live_event_under_its_line_limit() {
+		let columns: Vec<String> = (0..300)
+			.map(|i| format!("'{}' AS wide_column_{i}", "x".repeat(60)))
+			.collect();
+		let source = format!(
+			"# 0168\n\n```sql {{#q, output=none}}\nSELECT\n{}\n```\n",
+			columns.join(",\n")
+		);
+		let mut f = Fixture::with_source(&source);
+		let receipt = f.run(0);
+		assert_eq!(receipt.outcome, Outcome::Applied, "{receipt:?}");
+		let result = receipt.result.clone().expect("answer");
+		assert_eq!(result.columns.len(), 300);
+		assert!(
+			result
+				.truncation_reasons
+				.contains(&crate::driver::TruncationReason::Bytes),
+			"{:?}",
+			result.truncation_reasons
+		);
+		let event = crate::live::Event::Completed { id: 1, receipt };
+		let line = crate::live::encode(&event).unwrap();
+		assert!(line.len() < crate::live::MAX_LINE, "{} bytes", line.len());
 	}
 }

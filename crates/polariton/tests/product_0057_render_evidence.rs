@@ -37,6 +37,8 @@ mod publication;
 mod result_artifact;
 #[path = "../src/result_registry.rs"]
 mod result_registry;
+#[path = "../src/result_summary.rs"]
+mod result_summary;
 #[path = "../src/rune_host.rs"]
 mod rune_host;
 #[cfg(feature = "toron")]

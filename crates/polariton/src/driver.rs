@@ -171,6 +171,36 @@ pub(crate) struct DataDescription {
 	pub columns: Vec<(String, String)>,
 }
 
+/// ADR 0168: a SQL cell's answer, bounded. The preview holds the leading
+/// rows as the grid shows them, each cell null or text; `rows` is the whole
+/// relation's height. When a bound cut the preview, `truncated` is true and
+/// `truncation_reasons` names every bound that applied.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ResultSummary {
+	pub columns: Vec<ResultColumn>,
+	pub rows: u64,
+	pub preview: Vec<Vec<Option<String>>>,
+	pub truncated: bool,
+	pub truncation_reasons: Vec<TruncationReason>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ResultColumn {
+	pub name: String,
+	pub dtype: String,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TruncationReason {
+	/// More rows exist than the preview holds.
+	Rows,
+	/// The byte budget ended the preview before the row bound.
+	Bytes,
+	/// Not every column fit the budget; the preview is empty.
+	Columns,
+	/// A single value was cut to fit the remaining budget.
+	Value,
+}
+
 impl Command {
 	fn figure(&self) -> Option<&FigureRef> {
 		match self {
@@ -230,6 +260,9 @@ pub(crate) struct CommandReceipt {
 	pub(crate) notebook: Option<NotebookDescription>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub(crate) data: Option<DataDescription>,
+	/// ADR 0168: the answer of the SQL cell this run executed, bounded.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) result: Option<ResultSummary>,
 	/// ADR 0166: the external connection as the adapter owner reports it.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub(crate) connection: Option<ConnectionDescription>,
@@ -608,6 +641,7 @@ impl CommandReceipt {
 			publish: None,
 			notebook: None,
 			data: None,
+			result: None,
 			connection: None,
 		}
 	}
