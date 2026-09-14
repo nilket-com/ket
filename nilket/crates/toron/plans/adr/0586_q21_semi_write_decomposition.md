@@ -1,9 +1,12 @@
 # ADR 586 - q21 semi-summary write decomposition
 
-**Status:** PROPOSED. Successor to ADR 585 at the same sealed ADR 583
-coordinate. Decomposes the owning term, `runtime_prep_semi_write`, into its
-four activities before any writer or route changes. No engine route,
-admission, or writer changes under this record.
+**Status:** CLOSED. Implemented and measured on source tree
+`1d99858f8addc4622b2497d23a601e6e6ec7f5ff`; results are recorded in
+`plans/impl/0586_q21_semi_write_decomposition_results.md`. Phase 0 did not
+trip; the accepted profile resolves `semi_write_insert` as the sole owner
+(1,610.7 median-scaled ms, 12.27%) and prices `semi_write_repartition` as
+gross removable work above the floor (636.0 ms) with its net unpriced. No
+engine route, admission, or writer changed.
 
 
 ## Context
@@ -267,15 +270,17 @@ the timing atlas or the distributed coordinate.
 
 ## Forward
 
-If `repartition` owns and its gross median clears the floor, the successor
-is a route-local candidate that skips the Exchange op for recognized
-existence summaries, measured for net execution improvement in paired
-off/on runs at this coordinate with a digest value gate; the consecutive-key
-cache is why gross and net can differ. If `insert` owns, the successor
-splits it into cache hits, hash and probe, and growth before touching the
-writer. If nothing clears the floor, the successor comes from the
-secondaries. Either way the anti write's decomposition, reported
-here, tells the successor whether the same mechanism prices the 1,954.0 ms
-secondary as well. `cleanup` at 586.8 ms and `runtime_prep_inner_1` at
-1,810.2 ms stay open as their own candidates. SF=10 still waits for a
-measured mechanism and a fixture.
+Measured: `semi_write_insert` owns 1,610.7 median-scaled ms (12.27% of q21's
+13,128.5 ms off median), with `anti_write_insert` at 1,365.8 ms beside it,
+2,976.5 ms on one code path. Neither summary carries a key-program op on
+this route, and the semi carries no filter; the decoded op lists say so.
+The insert child is not removable, so no mechanism opens here; the
+successor splits `NeqExistenceSummary::insert` at the same coordinate into
+consecutive-key cache hits, hash-and-probe, and growth before touching the
+writer. `semi_write_repartition` clears the floor as gross removable work
+(636.0 ms) but its net is unpriced because the insert's cache sees the order
+it imposes; a repartition cut stays a candidate for a successor that
+measures net execution improvement in paired off/on runs beside value
+parity. `cleanup` at 573.1 ms and `runtime_prep_inner_1` at 1,711.3 ms
+stay open as their own candidates. SF=10 still waits for a measured
+mechanism and a fixture.

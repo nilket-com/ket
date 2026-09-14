@@ -2510,7 +2510,21 @@ fn inclusive_lifecycle_receipt_value(
 	let Some(outside_handler_span) = root_span_micros.checked_sub(handler_inclusive_micros) else {
 		return failed("handler inclusive span exceeds execute-bound root span");
 	};
-	serde_json::json!({
+	// ADR 586's fourth band: each summary's write half decomposed into its four activities. A child
+	// may legitimately have zero passes (an op the plan did not carry, or one an earlier filter kept
+	// every batch from reaching), so unlike the terms above a zero call count is a fact, not a
+	// failure; only absence or an overflowed term is a defect.
+	let mut write_bands = serde_json::Map::new();
+	for (write_name, prefix) in [
+		("runtime_prep_semi_write", "semi_write"),
+		("runtime_prep_anti_write", "anti_write"),
+	] {
+		match write_decomposition_band(invocation, write_name, prefix, get(write_name)) {
+			Ok(band) => write_bands.extend(band),
+			Err(error) => return failed(&error),
+		}
+	}
+	let mut receipt = serde_json::json!({
 		"status": "reconciled",
 		"invocation_id": invocation.id,
 		"handler_inclusive_micros": handler_inclusive_micros,
@@ -2529,7 +2543,61 @@ fn inclusive_lifecycle_receipt_value(
 		"lifecycle_residual_micros": lifecycle_residual,
 		"outside_handler_span_micros": outside_handler_span,
 		"passed": true,
-	})
+	});
+	receipt
+		.as_object_mut()
+		.expect("receipt is an object")
+		.extend(write_bands);
+	receipt
+}
+
+/// The four write children of one summary, their pass counts, the decoded op list, and the
+/// residual by checked subtraction against the unchanged write term.
+fn write_decomposition_band(
+	invocation: &AggregateInvocation,
+	write_name: &str,
+	prefix: &str,
+	write_micros: u64,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+	let mut band = serde_json::Map::new();
+	let mut children_total = 0u64;
+	for child in ["filter", "key_program", "repartition", "insert"] {
+		let name = format!("{prefix}_{child}");
+		let Some(sample) = invocation
+			.inclusive_lifecycle
+			.iter()
+			.find(|sample| sample.name == name)
+		else {
+			return Err(format!("write child {name} is missing"));
+		};
+		if sample.error.is_some() {
+			return Err(format!("write child {name} is failed"));
+		}
+		children_total = children_total
+			.checked_add(sample.micros)
+			.ok_or_else(|| format!("{prefix} child sum overflowed"))?;
+		band.insert(format!("{name}_micros"), serde_json::json!(sample.micros));
+		band.insert(format!("{name}_passes"), serde_json::json!(sample.calls));
+	}
+	let residual = write_micros
+		.checked_sub(children_total)
+		.ok_or_else(|| format!("{prefix} children exceed {write_name}"))?;
+	band.insert(
+		format!("{prefix}_residual_micros"),
+		serde_json::json!(residual),
+	);
+	let ops_name = format!("{prefix}_ops");
+	let Some(ops) = invocation
+		.diagnostics
+		.iter()
+		.find(|entry| entry.name == ops_name)
+		.map(|entry| entry.value.clone())
+		.filter(serde_json::Value::is_array)
+	else {
+		return Err(format!("write op list {ops_name} is missing"));
+	};
+	band.insert(ops_name, ops);
+	Ok(band)
 }
 
 fn suffix_probe_profiles_value(profiles: &[SuffixProbeProfile]) -> serde_json::Value {
@@ -3289,12 +3357,189 @@ mod tests {
 			error: None,
 		})
 		.collect();
+		attach_write_decomposition(
+			&mut invocation,
+			"semi_write",
+			[0, 20, 15, 10],
+			&["project", "exchange"],
+		);
+		attach_write_decomposition(
+			&mut invocation,
+			"anti_write",
+			[5, 10, 10, 10],
+			&["filter", "project", "exchange"],
+		);
 		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
 		assert_eq!(receipt["status"], "reconciled");
 		assert_eq!(receipt["invocation_id"], invocation.id);
 		assert_eq!(receipt["runtime_prep_residual_micros"], 20);
 		assert_eq!(receipt["lifecycle_residual_micros"], 100);
 		assert_eq!(receipt["outside_handler_span_micros"], 200);
+	}
+
+	fn attach_write_decomposition(
+		invocation: &mut AggregateInvocation,
+		prefix: &str,
+		micros: [u64; 4],
+		ops: &[&str],
+	) {
+		for (child, micros) in ["filter", "key_program", "repartition", "insert"]
+			.into_iter()
+			.zip(micros)
+		{
+			let name: &'static str = Box::leak(format!("{prefix}_{child}").into_boxed_str());
+			invocation.inclusive_lifecycle.push(InclusiveLifecycleTerm {
+				name,
+				calls: if micros == 0 { 0 } else { 3 },
+				micros,
+				error: None,
+			});
+		}
+		let name: &'static str = Box::leak(format!("{prefix}_ops").into_boxed_str());
+		invocation.diagnostics.push(InvocationDiagnostic {
+			name,
+			value: serde_json::json!(ops),
+		});
+	}
+
+	fn adr586_invocation() -> AggregateInvocation {
+		let mut invocation = invocation_with_stages(900, 0, None, Vec::new());
+		invocation.route = Some("inner_prefix_semi_anti_grouped");
+		invocation.handler = Some(HandlerAttribution::Reconciled {
+			inclusive_micros: 1_000,
+			exclusive_micros: 900,
+			exclusive_spill_bytes: 0,
+		});
+		invocation.inclusive_lifecycle = [
+			("runtime_prep", 400),
+			("runtime_prep_inner_1", 100),
+			("runtime_prep_inner_2", 100),
+			("runtime_prep_semi_read", 50),
+			("runtime_prep_semi_write", 50),
+			("runtime_prep_anti_read", 40),
+			("runtime_prep_anti_write", 40),
+			("base_prep", 100),
+			("drive", 300),
+			("finalize", 50),
+			("cleanup", 50),
+		]
+		.into_iter()
+		.map(|(name, micros)| InclusiveLifecycleTerm {
+			name,
+			calls: 1,
+			micros,
+			error: None,
+		})
+		.collect();
+		invocation
+	}
+
+	// A zero child is a fact with a pass count beside it, never a failed term: the semi summary
+	// carries no filter op here, and the receipt says so through both the count and the op list.
+	#[test]
+	fn adr586_receipt_records_the_fourth_band_with_pass_counts_and_op_lists() {
+		let mut invocation = adr586_invocation();
+		attach_write_decomposition(
+			&mut invocation,
+			"semi_write",
+			[0, 20, 15, 10],
+			&["project", "exchange"],
+		);
+		attach_write_decomposition(
+			&mut invocation,
+			"anti_write",
+			[5, 10, 10, 10],
+			&["filter", "project", "exchange"],
+		);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "reconciled");
+		assert_eq!(receipt["semi_write_filter_micros"], 0);
+		assert_eq!(receipt["semi_write_filter_passes"], 0);
+		assert_eq!(receipt["semi_write_key_program_micros"], 20);
+		assert_eq!(receipt["semi_write_key_program_passes"], 3);
+		assert_eq!(receipt["semi_write_residual_micros"], 5);
+		assert_eq!(
+			receipt["semi_write_ops"],
+			serde_json::json!(["project", "exchange"])
+		);
+		assert_eq!(receipt["anti_write_residual_micros"], 5);
+		assert_eq!(
+			receipt["anti_write_ops"],
+			serde_json::json!(["filter", "project", "exchange"])
+		);
+		// The three ADR 585 bands are untouched by the fourth.
+		assert_eq!(receipt["runtime_prep_residual_micros"], 20);
+		assert_eq!(receipt["lifecycle_residual_micros"], 100);
+	}
+
+	#[test]
+	fn adr586_receipt_reports_children_exceeding_their_write_term_as_a_defect() {
+		let mut invocation = adr586_invocation();
+		attach_write_decomposition(
+			&mut invocation,
+			"semi_write",
+			[0, 20, 15, 16],
+			&["project", "exchange"],
+		);
+		attach_write_decomposition(
+			&mut invocation,
+			"anti_write",
+			[5, 10, 10, 10],
+			&["filter", "project", "exchange"],
+		);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "instrument_defect");
+		assert_eq!(receipt["passed"], false);
+		assert!(
+			receipt["error"]
+				.as_str()
+				.expect("error text")
+				.contains("semi_write children exceed runtime_prep_semi_write")
+		);
+	}
+
+	#[test]
+	fn adr586_receipt_requires_every_child_and_the_op_list() {
+		let mut invocation = adr586_invocation();
+		attach_write_decomposition(
+			&mut invocation,
+			"semi_write",
+			[0, 20, 15, 10],
+			&["project", "exchange"],
+		);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "instrument_defect");
+		assert!(
+			receipt["error"]
+				.as_str()
+				.expect("error text")
+				.contains("anti_write_filter is missing")
+		);
+
+		let mut invocation = adr586_invocation();
+		attach_write_decomposition(
+			&mut invocation,
+			"semi_write",
+			[0, 20, 15, 10],
+			&["project", "exchange"],
+		);
+		attach_write_decomposition(
+			&mut invocation,
+			"anti_write",
+			[5, 10, 10, 10],
+			&["filter", "project", "exchange"],
+		);
+		invocation
+			.diagnostics
+			.retain(|entry| entry.name != "anti_write_ops");
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "instrument_defect");
+		assert!(
+			receipt["error"]
+				.as_str()
+				.expect("error text")
+				.contains("anti_write_ops is missing")
+		);
 	}
 
 	// The innermost link reconciles to the HANDLER-exclusive span, not the node. The node link is the

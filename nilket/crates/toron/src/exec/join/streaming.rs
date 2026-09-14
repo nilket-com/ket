@@ -2972,6 +2972,103 @@ pub(in crate::exec) enum StreamingExistenceOp<'a> {
 	},
 }
 
+/// The inclusive lifecycle terms one recognized existence summary publishes: the read half at the
+/// scan stream boundary, the write half after it, and the write half's four activities beside the
+/// diagnostic that lists which plan-decoded ops the summary actually carried.
+#[derive(Clone, Copy)]
+pub(in crate::exec) struct ExistenceSummaryLifecycleTerms {
+	pub(in crate::exec) read: &'static str,
+	pub(in crate::exec) write: &'static str,
+	pub(in crate::exec) filter: &'static str,
+	pub(in crate::exec) key_program: &'static str,
+	pub(in crate::exec) repartition: &'static str,
+	pub(in crate::exec) insert: &'static str,
+	pub(in crate::exec) ops: &'static str,
+}
+
+impl ExistenceSummaryLifecycleTerms {
+	pub(in crate::exec) const SEMI: Self = Self {
+		read: "runtime_prep_semi_read",
+		write: "runtime_prep_semi_write",
+		filter: "semi_write_filter",
+		key_program: "semi_write_key_program",
+		repartition: "semi_write_repartition",
+		insert: "semi_write_insert",
+		ops: "semi_write_ops",
+	};
+
+	pub(in crate::exec) const ANTI: Self = Self {
+		read: "runtime_prep_anti_read",
+		write: "runtime_prep_anti_write",
+		filter: "anti_write_filter",
+		key_program: "anti_write_key_program",
+		repartition: "anti_write_repartition",
+		insert: "anti_write_insert",
+		ops: "anti_write_ops",
+	};
+}
+
+/// One locally accumulated write-half child: raw elapsed micros over the passes it was clocked for.
+/// A pass is one application of an op to every batch the previous op produced, or one insert loop
+/// over the batches that survived the chain, for one source batch.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(in crate::exec) struct ExistenceWriteChild {
+	pub(in crate::exec) micros: u64,
+	pub(in crate::exec) passes: u64,
+}
+
+impl ExistenceWriteChild {
+	fn add(&mut self, started: Instant) -> Result<(), ExecutionError> {
+		self.micros = self
+			.micros
+			.checked_add(duration_micros(started))
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "recognized Neq summary write child timer overflowed".to_string(),
+			})?;
+		self.passes = self
+			.passes
+			.checked_add(1)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "recognized Neq summary write child pass count overflowed".to_string(),
+			})?;
+		Ok(())
+	}
+}
+
+/// The write half's decomposition, clocked only when a caller asks for it: the off arm of a paired
+/// measurement never constructs one, so its write loop runs exactly as it did before the children
+/// existed. `write_micros` is the unconditional write half copied in at the end so a reader can
+/// reconcile the children and their residual against it without a second timer.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub(in crate::exec) struct ExistenceWriteClocks {
+	pub(in crate::exec) filter: ExistenceWriteChild,
+	pub(in crate::exec) key_program: ExistenceWriteChild,
+	pub(in crate::exec) repartition: ExistenceWriteChild,
+	pub(in crate::exec) insert: ExistenceWriteChild,
+	pub(in crate::exec) ops: Vec<&'static str>,
+	pub(in crate::exec) write_micros: u64,
+}
+
+impl ExistenceWriteClocks {
+	fn child_mut(&mut self, op: &StreamingExistenceOp<'_>) -> &mut ExistenceWriteChild {
+		match op {
+			StreamingExistenceOp::Filter(_) => &mut self.filter,
+			StreamingExistenceOp::Project { .. } => &mut self.key_program,
+			StreamingExistenceOp::Exchange { .. } => &mut self.repartition,
+		}
+	}
+}
+
+impl StreamingExistenceOp<'_> {
+	fn kind_name(&self) -> &'static str {
+		match self {
+			StreamingExistenceOp::Filter(_) => "filter",
+			StreamingExistenceOp::Project { .. } => "project",
+			StreamingExistenceOp::Exchange { .. } => "exchange",
+		}
+	}
+}
+
 pub(in crate::exec) struct StreamingSemiAntiRuntime<'a> {
 	pub(in crate::exec) replay_id: JoinReplayId,
 
@@ -19785,8 +19882,7 @@ impl Executor {
 					morsel,
 					inner_resident_bytes,
 					stage_handle.as_ref(),
-					"runtime_prep_semi_read",
-					"runtime_prep_semi_write",
+					ExistenceSummaryLifecycleTerms::SEMI,
 				)
 				.await
 			{
@@ -19810,8 +19906,7 @@ impl Executor {
 					morsel,
 					anti_baseline,
 					stage_handle.as_ref(),
-					"runtime_prep_anti_read",
-					"runtime_prep_anti_write",
+					ExistenceSummaryLifecycleTerms::ANTI,
 				)
 				.await
 			{
@@ -22822,9 +22917,7 @@ impl Executor {
 
 		stage_handle: Option<&node_attribution::VocabularyHandle>,
 
-		read_term: &'static str,
-
-		write_term: &'static str,
+		terms: ExistenceSummaryLifecycleTerms,
 	) -> Result<StreamingSemiAntiRuntime<'a>, ExecutionError> {
 		let cap = join_spill_retained_footprint_memory_cap(self.context.task_budget.memory.get());
 
@@ -22844,8 +22937,8 @@ impl Executor {
 			cap,
 			&mut summary,
 			stage_handle,
-			read_term,
-			write_term,
+			terms,
+			None,
 		)
 		.await?;
 
@@ -22916,9 +23009,9 @@ impl Executor {
 
 		stage_handle: Option<&node_attribution::VocabularyHandle>,
 
-		read_term: &'static str,
+		terms: ExistenceSummaryLifecycleTerms,
 
-		write_term: &'static str,
+		clocks: Option<&mut ExistenceWriteClocks>,
 	) -> Result<(), ExecutionError> {
 		let (scan_plan, ops) = decompose_streaming_existence_plan(plan).ok_or_else(|| {
 			ExecutionError::InvalidExpression {
@@ -22937,6 +23030,14 @@ impl Executor {
 		let mut remaining = req.row_limit;
 
 		let mut stream = self.open_scan(req).await?;
+
+		// The children are diagnostic-only: an unprofiled arm carries no handle and no caller
+		// clocks, so it never reads a child clock and its loop is the one the off arm measures.
+		let mut handle_clocks = stage_handle.map(|_| ExistenceWriteClocks::default());
+		let mut clocks = clocks.or(handle_clocks.as_mut());
+		if let Some(clocks) = clocks.as_deref_mut() {
+			clocks.ops = ops.iter().map(StreamingExistenceOp::kind_name).collect();
+		}
 
 		let mut read_micros = 0u64;
 		let mut write_micros = 0u64;
@@ -22970,6 +23071,7 @@ impl Executor {
 			let mut batches = vec![batch];
 
 			for op in &ops {
+				let pass_started = clocks.as_ref().map(|_| Instant::now());
 				let mut next = Vec::new();
 
 				for batch in batches {
@@ -23020,12 +23122,21 @@ impl Executor {
 				}
 
 				batches = next;
+				if let (Some(clocks), Some(started)) = (clocks.as_deref_mut(), pass_started) {
+					clocks.child_mut(op).add(started)?;
+				}
 
 				if batches.is_empty() {
 					break;
 				}
 			}
 
+			// An empty survivor list is not an insert pass: the op that emptied it is the one that
+			// was reached, and the insert's pass count says so.
+			let insert_started = clocks
+				.as_ref()
+				.filter(|_| !batches.is_empty())
+				.map(|_| Instant::now());
 			for batch in batches {
 				summary.write_batch(
 					&batch,
@@ -23034,6 +23145,9 @@ impl Executor {
 					baseline_bytes,
 					cap,
 				)?;
+			}
+			if let (Some(clocks), Some(started)) = (clocks.as_deref_mut(), insert_started) {
+				clocks.insert.add(started)?;
 			}
 			write_micros = write_micros
 				.checked_add(duration_micros(write_started))
@@ -23044,22 +23158,45 @@ impl Executor {
 				message: "recognized Neq summary timing call count overflowed".to_string(),
 			})?;
 		}
+		if let Some(clocks) = clocks.as_deref_mut() {
+			clocks.write_micros = write_micros;
+		}
 		if let Some(handle) = stage_handle {
 			let read_calls = calls.checked_add(1).ok_or_else(|| ExecutionError::Kernel {
 				message: "recognized Neq summary read call count overflowed".to_string(),
 			})?;
 			node_attribution::record_inclusive_lifecycle_micros(
 				handle,
-				read_term,
+				terms.read,
 				read_micros,
 				read_calls,
 			)?;
 			node_attribution::record_inclusive_lifecycle_micros(
 				handle,
-				write_term,
+				terms.write,
 				write_micros,
 				calls,
 			)?;
+			if let Some(clocks) = clocks.as_deref() {
+				for (name, child) in [
+					(terms.filter, clocks.filter),
+					(terms.key_program, clocks.key_program),
+					(terms.repartition, clocks.repartition),
+					(terms.insert, clocks.insert),
+				] {
+					node_attribution::record_inclusive_lifecycle_micros(
+						handle,
+						name,
+						child.micros,
+						child.passes,
+					)?;
+				}
+				node_attribution::record_invocation_diagnostic(
+					handle,
+					terms.ops,
+					serde_json::json!(clocks.ops),
+				);
+			}
 		}
 
 		Ok(())
@@ -31893,8 +32030,7 @@ mod tests {
 				None,
 				0,
 				None,
-				"runtime_prep_semi_read",
-				"runtime_prep_semi_write",
+				ExistenceSummaryLifecycleTerms::SEMI,
 			)
 			.await
 			.expect("summary runtime");
@@ -31929,6 +32065,238 @@ mod tests {
 		assert_eq!(profile.page_reads, 0);
 
 		assert_eq!(profile.accounted_bytes, 24_704);
+	}
+
+	/// A two-column Int64 existence source split into `batches` batches of `rows_per_batch` rows,
+	/// under a Filter (`orderkey < upper`, evaluated in Toron), a Project that keeps both columns,
+	/// and a two-way Exchange on the key: the shape a recognized existence summary decodes into.
+	fn adr586_existence_fixture(
+		batches: usize,
+		rows_per_batch: usize,
+		upper: i64,
+	) -> (
+		Vec<RecordBatch>,
+		SchemaRef,
+		BoundExprProgram,
+		BoundExprProgram,
+	) {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+		]));
+		let source = (0..batches)
+			.map(|batch| {
+				let base = (batch * rows_per_batch) as i64;
+				RecordBatch::try_new(
+					schema.clone(),
+					vec![
+						Arc::new(Int64Array::from(
+							(0..rows_per_batch as i64)
+								.map(|row| base + row)
+								.collect::<Vec<_>>(),
+						)),
+						Arc::new(Int64Array::from(
+							(0..rows_per_batch as i64)
+								.map(|row| 100 + row)
+								.collect::<Vec<_>>(),
+						)),
+					],
+				)
+				.expect("existence batch")
+			})
+			.collect();
+		let mut project = BoundExprProgramBuilder::new();
+		for (name, ordinal) in [("orderkey", 0), ("suppkey", 1)] {
+			let column = project.append_column(ResolvedColumn {
+				name: ColumnName(name.to_string()),
+				ordinal: ColumnOrdinal(ordinal),
+				data_type: DataType::Int64,
+				nullable: false,
+				pbc_eligible: false,
+			});
+			project.push_root(column);
+		}
+		(
+			source,
+			schema,
+			less_than_filter_program(ColumnOrdinal(0), upper),
+			project.build(),
+		)
+	}
+
+	async fn adr586_write_with_clocks(
+		source: Vec<RecordBatch>,
+		schema: SchemaRef,
+		plan: &ExecutionPlan,
+	) -> (ExistenceWriteClocks, NeqExistenceSummary) {
+		let executor = Executor::with_context(
+			Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::from([(TableId(86), source)]),
+				requested_tables: Arc::new(Mutex::new(Vec::new())),
+			}),
+			ExecutionContext::local_test().with_task_budget(high_test_budget()),
+		);
+		let _ = schema;
+		let mut summary = NeqExistenceSummary::new();
+		let mut clocks = ExistenceWriteClocks::default();
+		executor
+			.write_streaming_recognized_neq_existence_summary(
+				plan,
+				RecognizedNeqExistenceSummaryColumns {
+					preserved_value: ColumnOrdinal(1),
+					existence_key: ColumnOrdinal(0),
+					existence_value: ColumnOrdinal(1),
+					key_count_hint: None,
+				},
+				None,
+				0,
+				1024 * 1024,
+				&mut summary,
+				None,
+				ExistenceSummaryLifecycleTerms::SEMI,
+				Some(&mut clocks),
+			)
+			.await
+			.expect("summary write");
+		(clocks, summary)
+	}
+
+	fn adr586_children_total(clocks: &ExistenceWriteClocks) -> u64 {
+		clocks.filter.micros
+			+ clocks.key_program.micros
+			+ clocks.repartition.micros
+			+ clocks.insert.micros
+	}
+
+	// Every op is reached on every source batch, so each child counts one pass per batch, the
+	// insert counts one per batch too, and the four children never exceed the write half they
+	// were carved from.
+	#[tokio::test]
+	async fn adr586_write_children_reconcile_to_the_write_half_over_a_full_chain() {
+		let (source, schema, filter, project) = adr586_existence_fixture(4, 8, i64::MAX);
+		let scan = test_scan_plan_with_first_field_key(TableId(86), schema.clone(), 86);
+		let plan = exchange_plan(
+			ExecutionPlan::Project {
+				input: Box::new(ExecutionPlan::Filter {
+					input: Box::new(scan),
+					predicate: filter,
+					disposition: FilterDisposition::EvaluateInToron,
+				}),
+				exprs: project,
+				output_schema: schema.clone(),
+			},
+			bound_column_root("orderkey", ColumnOrdinal(0), DataType::Int64, false),
+			2,
+		);
+		let (clocks, summary) = adr586_write_with_clocks(source, schema, &plan).await;
+		assert_eq!(clocks.ops, vec!["filter", "project", "exchange"]);
+		assert_eq!(clocks.filter.passes, 4);
+		assert_eq!(clocks.key_program.passes, 4);
+		assert_eq!(clocks.repartition.passes, 4);
+		assert_eq!(clocks.insert.passes, 4);
+		assert_eq!(summary.input_rows, 32, "every row reached the summary");
+		assert!(
+			adr586_children_total(&clocks) <= clocks.write_micros,
+			"children {} exceed write half {}",
+			adr586_children_total(&clocks),
+			clocks.write_micros
+		);
+	}
+
+	// A plan with no Filter op yields an op list that says so and a filter child with zero passes;
+	// the other three still count one pass per batch.
+	#[tokio::test]
+	async fn adr586_absent_filter_op_is_listed_absent_with_zero_passes() {
+		let (source, schema, _filter, project) = adr586_existence_fixture(3, 5, i64::MAX);
+		let scan = test_scan_plan_with_first_field_key(TableId(86), schema.clone(), 86);
+		let plan = exchange_plan(
+			ExecutionPlan::Project {
+				input: Box::new(scan),
+				exprs: project,
+				output_schema: schema.clone(),
+			},
+			bound_column_root("orderkey", ColumnOrdinal(0), DataType::Int64, false),
+			2,
+		);
+		let (clocks, summary) = adr586_write_with_clocks(source, schema, &plan).await;
+		assert_eq!(clocks.ops, vec!["project", "exchange"]);
+		assert_eq!(clocks.filter, ExistenceWriteChild::default());
+		assert_eq!(clocks.key_program.passes, 3);
+		assert_eq!(clocks.repartition.passes, 3);
+		assert_eq!(clocks.insert.passes, 3);
+		assert_eq!(summary.input_rows, 15);
+		assert!(adr586_children_total(&clocks) <= clocks.write_micros);
+	}
+
+	// A Filter that empties every batch is reached on every batch, while the ops behind it and the
+	// insert are reached on none: the op list still carries them, and their pass counts are zero.
+	#[tokio::test]
+	async fn adr586_a_filter_that_empties_the_stream_leaves_downstream_passes_at_zero() {
+		let (source, schema, filter, project) = adr586_existence_fixture(3, 5, i64::MIN);
+		let scan = test_scan_plan_with_first_field_key(TableId(86), schema.clone(), 86);
+		let plan = exchange_plan(
+			ExecutionPlan::Project {
+				input: Box::new(ExecutionPlan::Filter {
+					input: Box::new(scan),
+					predicate: filter,
+					disposition: FilterDisposition::EvaluateInToron,
+				}),
+				exprs: project,
+				output_schema: schema.clone(),
+			},
+			bound_column_root("orderkey", ColumnOrdinal(0), DataType::Int64, false),
+			2,
+		);
+		let (clocks, summary) = adr586_write_with_clocks(source, schema, &plan).await;
+		assert_eq!(clocks.ops, vec!["filter", "project", "exchange"]);
+		assert_eq!(clocks.filter.passes, 3);
+		assert_eq!(clocks.key_program, ExistenceWriteChild::default());
+		assert_eq!(clocks.repartition, ExistenceWriteChild::default());
+		assert_eq!(clocks.insert, ExistenceWriteChild::default());
+		assert_eq!(summary.input_rows, 0);
+		assert!(adr586_children_total(&clocks) <= clocks.write_micros);
+	}
+
+	// Without a caller's clocks and without a stage handle the loop runs the write half as ADR 585
+	// measured it. That no clock is constructed is structural (`stage_handle.map(..)` and the
+	// caller's `Option`); this test pins that the unprofiled path still writes every row.
+	#[tokio::test]
+	async fn adr586_unprofiled_write_runs_without_child_clocks() {
+		let (source, schema, _filter, project) = adr586_existence_fixture(2, 4, i64::MAX);
+		let scan = test_scan_plan_with_first_field_key(TableId(86), schema.clone(), 86);
+		let plan = ExecutionPlan::Project {
+			input: Box::new(scan),
+			exprs: project,
+			output_schema: schema.clone(),
+		};
+		let executor = Executor::with_context(
+			Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::from([(TableId(86), source)]),
+				requested_tables: Arc::new(Mutex::new(Vec::new())),
+			}),
+			ExecutionContext::local_test().with_task_budget(high_test_budget()),
+		);
+		let mut summary = NeqExistenceSummary::new();
+		executor
+			.write_streaming_recognized_neq_existence_summary(
+				&plan,
+				RecognizedNeqExistenceSummaryColumns {
+					preserved_value: ColumnOrdinal(1),
+					existence_key: ColumnOrdinal(0),
+					existence_value: ColumnOrdinal(1),
+					key_count_hint: None,
+				},
+				None,
+				0,
+				1024 * 1024,
+				&mut summary,
+				None,
+				ExistenceSummaryLifecycleTerms::SEMI,
+				None,
+			)
+			.await
+			.expect("summary write");
+		assert_eq!(summary.input_rows, 8);
 	}
 
 	async fn projected_existence_spill(
