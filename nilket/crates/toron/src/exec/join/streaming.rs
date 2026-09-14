@@ -1527,6 +1527,111 @@ struct NeqExistenceSummaryEntry {
 	representative: i64,
 }
 
+/// ADR 589's order-aware build state for one existence summary. `max[p]` is the running
+/// maximum of every key delivered on partition stream `p`, `None` until its first key;
+/// `ordered[p]` holds the entry indices appended on the fast path for `p`, strictly increasing
+/// by key; `overflow` holds every entry appended below its partition's maximum, the only home
+/// of such a key. The bucket index does not exist until `finish_index` builds it once.
+#[derive(Debug, Default)]
+struct OrderedBuild {
+	max: Vec<Option<i64>>,
+	ordered: Vec<Vec<u32>>,
+	overflow: HashMap<i64, u32>,
+	/// Bytes of the finish's pairs array while it is live, so the guards see it.
+	finish_scratch_bytes: u64,
+}
+
+/// The bucket count hashbrown allocates for a requested capacity: 4 below 4, 8 below 8, and the
+/// next power of two above `capacity * 8 / 7` otherwise. Reported capacity is 7/8 of the buckets
+/// (all but one of them below 8), so the map's own `capacity()` maps back to the same count.
+fn hashbrown_buckets(capacity: usize) -> usize {
+	if capacity < 4 {
+		4
+	} else if capacity < 8 {
+		8
+	} else {
+		capacity
+			.saturating_mul(8)
+			.checked_div(7)
+			.and_then(usize::checked_next_power_of_two)
+			.unwrap_or(usize::MAX)
+	}
+}
+
+/// What the overflow map really occupies at a capacity: one `(i64, u32)` slot and one control
+/// byte per bucket, plus one control group of padding.
+fn overflow_map_bytes(capacity: usize) -> u64 {
+	let buckets = hashbrown_buckets(capacity);
+	summary_bytes::<(i64, u32)>(buckets)
+		.saturating_add(summary_bytes::<u8>(buckets))
+		.saturating_add(16)
+}
+
+impl OrderedBuild {
+	/// Every allocation the ordered build holds: the per-partition maxima and list headers, the
+	/// lists themselves, the overflow map at its real footprint, and the finish's pairs array
+	/// while it is live.
+	fn accounted_bytes(&self) -> u64 {
+		let ordered = self.ordered.iter().fold(0u64, |total, list| {
+			total.saturating_add(summary_bytes::<u32>(list.capacity()))
+		});
+		ordered
+			.saturating_add(summary_bytes::<Option<i64>>(self.max.capacity()))
+			.saturating_add(summary_bytes::<Vec<u32>>(self.ordered.capacity()))
+			.saturating_add(if self.overflow.capacity() == 0 {
+				0
+			} else {
+				overflow_map_bytes(self.overflow.capacity())
+			})
+			.saturating_add(self.finish_scratch_bytes)
+	}
+}
+
+/// How an existence summary is being built: probed and grown per row (the hashed build), or
+/// appended under the per-partition monotone precondition with the index built once at the
+/// end (the order-aware build, ADR 589). After `finish_index` an ordered build is hashed.
+#[derive(Debug, Default)]
+enum SummaryBuild {
+	#[default]
+	Hashed,
+	Ordered(OrderedBuild),
+}
+
+/// One `(home_bucket, entry_index)` pair of the once-built index; 8 bytes, sorted by home.
+type IndexPair = (u32, u32);
+
+/// The largest entry count the once-built index supports: its home buckets are `u32`, so the
+/// doubled bucket array may hold at most 2^32 slots, which is 2^31 entries at the load bound.
+/// The growing build's own bound is the `u32` entry index (2^32 - 1 entries); the once-built
+/// index is stricter by one bit and says so rather than truncating.
+const ONCE_BUILT_INDEX_MAX_ENTRIES: usize = 1 << 31;
+
+/// Size the once-built index for `count` entries without allocating: the entry capacity the
+/// growing build would have ended at and the doubled bucket count, refused above the width the
+/// index can address.
+fn once_built_index_sizing(count: usize) -> Result<(usize, usize), ExecutionError> {
+	if count > ONCE_BUILT_INDEX_MAX_ENTRIES {
+		return Err(ExecutionError::Kernel {
+			message: format!(
+				"recognized Neq existence summary of {count} entries exceeds the once-built index width of {ONCE_BUILT_INDEX_MAX_ENTRIES} entries"
+			),
+		});
+	}
+	let entry_limit = count
+		.max(NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY)
+		.checked_next_power_of_two()
+		.ok_or_else(|| ExecutionError::Kernel {
+			message: "recognized Neq existence summary capacity overflow".to_string(),
+		})?;
+	let bucket_count = entry_limit
+		.checked_mul(2)
+		.ok_or_else(|| ExecutionError::Kernel {
+			message: "recognized Neq existence summary bucket capacity overflow".to_string(),
+		})?;
+	debug_assert!(u32::try_from(bucket_count - 1).is_ok());
+	Ok((entry_limit, bucket_count))
+}
+
 pub(in crate::exec) struct NeqExistenceSummary {
 	buckets: Vec<u32>,
 
@@ -1553,6 +1658,13 @@ pub(in crate::exec) struct NeqExistenceSummary {
 	/// the driver's walk denominator, counted independently of the instrument's counters.
 	#[cfg(test)]
 	walk_count: u64,
+
+	/// ADR 589: how this summary is being built; hashed after `finish_index`.
+	build: SummaryBuild,
+
+	/// Slot visits of the last `finish_index` fill (test-only): the pin for its linear claim.
+	#[cfg(test)]
+	fill_slot_visits: u64,
 }
 
 impl NeqExistenceSummary {
@@ -1581,7 +1693,408 @@ impl NeqExistenceSummary {
 
 			#[cfg(test)]
 			walk_count: 0,
+
+			build: SummaryBuild::Hashed,
+
+			#[cfg(test)]
+			fill_slot_visits: 0,
 		}
+	}
+	/// An order-aware summary (ADR 589): appends under the per-partition monotone precondition
+	/// and builds its bucket index once in `finish_index`. Admitted per plan by the caller.
+	fn new_ordered() -> Self {
+		let mut summary = Self::new();
+		summary.build = SummaryBuild::Ordered(OrderedBuild::default());
+		summary
+	}
+
+	/// The build the plan admits (ADR 589): order-aware only where the plan proves the Exchange
+	/// routes by the existence key; every other shape keeps the hashed build.
+	fn for_existence_plan(plan: &ExecutionPlan, existence_key: ColumnOrdinal) -> Self {
+		let admitted = decompose_streaming_existence_plan(plan)
+			.map(|(_, ops)| order_aware_admission(&ops, existence_key).is_admitted())
+			.unwrap_or(false);
+		if admitted {
+			Self::new_ordered()
+		} else {
+			Self::new()
+		}
+	}
+
+	fn is_ordered(&self) -> bool {
+		matches!(self.build, SummaryBuild::Ordered(_))
+	}
+
+	fn ordered_build_mut(&mut self) -> &mut OrderedBuild {
+		match &mut self.build {
+			SummaryBuild::Ordered(build) => build,
+			SummaryBuild::Hashed => unreachable!("ordered build state on a hashed summary"),
+		}
+	}
+
+	/// Make room for one more entry in an ordered build, growing `entries` and the multi-key
+	/// bitset together and guarding both before either grows. The old and new arrays overlap
+	/// during the copy, so the request is the new capacity while the old is still accounted.
+	fn ensure_entry_room(&mut self, baseline_bytes: u64, cap: u64) -> Result<(), ExecutionError> {
+		if self.entries.len() < self.entries.capacity() {
+			return Ok(());
+		}
+		let target = self
+			.entries
+			.capacity()
+			.max(NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY / 2)
+			.checked_mul(2)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "recognized Neq existence summary capacity overflow".to_string(),
+			})?;
+		self.reserve_entries_exact(target, baseline_bytes, cap)
+	}
+
+	/// Bring `entries` (and the bitset) to exactly `target` capacity, guarded, overlap counted.
+	fn reserve_entries_exact(
+		&mut self,
+		target: usize,
+		baseline_bytes: u64,
+		cap: u64,
+	) -> Result<(), ExecutionError> {
+		if target <= self.entries.capacity() {
+			return Ok(());
+		}
+		let multi_words = target.saturating_add(63) / 64;
+		let requested = summary_bytes::<NeqExistenceSummaryEntry>(target)
+			.saturating_add(summary_bytes::<u64>(multi_words));
+		self.guard_allocation(baseline_bytes, requested, cap)?;
+		let mut entries = Vec::new();
+		entries
+			.try_reserve_exact(target)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!(
+					"recognized Neq existence summary entry allocation failed: {error}"
+				),
+			})?;
+		let actual = summary_bytes::<NeqExistenceSummaryEntry>(entries.capacity())
+			.saturating_add(summary_bytes::<u64>(multi_words));
+		self.guard_allocation(baseline_bytes, actual, cap)?;
+		entries.extend_from_slice(&self.entries);
+		self.observe_peak(baseline_bytes, actual);
+		self.entries = entries;
+		let mut multi = Vec::new();
+		multi
+			.try_reserve_exact(multi_words)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!(
+					"recognized Neq existence summary bitset allocation failed: {error}"
+				),
+			})?;
+		multi.resize(multi_words, 0);
+		multi[..self.multi.len()].copy_from_slice(&self.multi);
+		self.multi = multi;
+		self.entry_limit = self.entries.capacity();
+		Ok(())
+	}
+
+	/// The order-aware row path, for a row that is not a cache hit, on the partition the
+	/// instrument names. Fast path: `key` above the partition's running maximum is absent by
+	/// the precondition and is appended without a probe. Fallback: the key may exist and is
+	/// found exactly without the index, in the partition's sorted list or the overflow map; a
+	/// new key below the maximum goes to the overflow map so the list stays sorted.
+	fn insert_ordered<const INSTRUMENTED: bool>(
+		&mut self,
+		key: i64,
+		value: i64,
+		baseline_bytes: u64,
+		cap: u64,
+		instrument: &mut InsertInstrument,
+	) -> Result<(), ExecutionError> {
+		let partition = instrument.partition;
+		if INSTRUMENTED {
+			instrument.counters.lookups += 1;
+		}
+		// A partition seen for the first time grows the per-partition vectors, guarded like any
+		// other allocation: the request is the new capacity while the old is still accounted.
+		let partitions_needed = {
+			let build = self.ordered_build_mut();
+			(build.max.len() <= partition).then_some(partition + 1)
+		};
+		if let Some(needed) = partitions_needed {
+			let requested = summary_bytes::<Option<i64>>(needed)
+				.saturating_add(summary_bytes::<Vec<u32>>(needed));
+			self.guard_allocation(baseline_bytes, requested, cap)?;
+			let accounted_before = self.accounted_bytes();
+			let build = self.ordered_build_mut();
+			build
+				.max
+				.try_reserve_exact(needed - build.max.len())
+				.map_err(|error| ExecutionError::Kernel {
+					message: format!(
+						"recognized Neq existence summary partition maxima allocation failed: {error}"
+					),
+				})?;
+			build
+				.ordered
+				.try_reserve_exact(needed - build.ordered.len())
+				.map_err(|error| ExecutionError::Kernel {
+					message: format!(
+						"recognized Neq existence summary partition lists allocation failed: {error}"
+					),
+				})?;
+			build.max.resize(needed, None);
+			build.ordered.resize_with(needed, Vec::new);
+			let obtained = summary_bytes::<Option<i64>>(build.max.capacity())
+				.saturating_add(summary_bytes::<Vec<u32>>(build.ordered.capacity()));
+			self.guard_allocation(baseline_bytes, obtained.saturating_sub(requested), cap)?;
+			self.observe_overlap_peak(baseline_bytes, accounted_before, obtained);
+		}
+		let (fast, list_needs_room, list_target) = {
+			let build = self.ordered_build_mut();
+			let fast = build.max[partition].is_none_or(|max| key > max);
+
+			let list = &build.ordered[partition];
+			(
+				fast,
+				list.len() == list.capacity(),
+				list.capacity().max(8).saturating_mul(2),
+			)
+		};
+		if fast {
+			if list_needs_room {
+				self.guard_allocation(baseline_bytes, summary_bytes::<u32>(list_target), cap)?;
+				let accounted_before = self.accounted_bytes();
+				let build = self.ordered_build_mut();
+				let list = &mut build.ordered[partition];
+				let extra = list_target - list.len();
+				list.try_reserve_exact(extra)
+					.map_err(|error| ExecutionError::Kernel {
+						message: format!(
+							"recognized Neq existence summary partition list allocation failed: {error}"
+						),
+					})?;
+				// The list is accounted at its new capacity now; re-check only what the
+				// allocator added beyond the request, and record the overlap peak: the old
+				// list was still resident while the new one was filled.
+				let obtained = summary_bytes::<u32>(build.ordered[partition].capacity());
+				let requested = summary_bytes::<u32>(list_target);
+				self.guard_allocation(baseline_bytes, obtained.saturating_sub(requested), cap)?;
+				self.observe_overlap_peak(baseline_bytes, accounted_before, obtained);
+			}
+
+			self.ensure_entry_room(baseline_bytes, cap)?;
+			let entry_index = self.push_entry(key, value)?;
+			let build = self.ordered_build_mut();
+			build.max[partition] = Some(key);
+			build.ordered[partition].push(entry_index);
+			self.last_entry = Some((key, entry_index as usize));
+			if INSTRUMENTED {
+				instrument.counters.appended += 1;
+				instrument.counters.ordered_fast += 1;
+			}
+			return Ok(());
+		}
+		let found = {
+			let SummaryBuild::Ordered(build) = &self.build else {
+				unreachable!("ordered build state on a hashed summary")
+			};
+			let entries = &self.entries;
+			let list = &build.ordered[partition];
+			match list.binary_search_by_key(&key, |&index| entries[index as usize].key) {
+				Ok(position) => Some((list[position] as usize, true)),
+				Err(_) => build
+					.overflow
+					.get(&key)
+					.map(|&index| (index as usize, false)),
+			}
+		};
+		if let Some((entry_index, in_sorted_list)) = found {
+			self.observe_value(entry_index, value);
+			self.last_entry = Some((key, entry_index));
+			if INSTRUMENTED {
+				instrument.counters.lookup_found += 1;
+				if in_sorted_list {
+					instrument.counters.fallback_found_sorted += 1;
+				} else {
+					instrument.counters.fallback_found_overflow += 1;
+				}
+			}
+			return Ok(());
+		}
+		// A new key below its partition's maximum: the overflow map is its only home. The map
+		// rounds a reservation up to a power-of-two bucket count at 7/8 load, so the guard
+		// prices the buckets it will obtain, not the capacity asked for, and re-checks what it
+		// did obtain. The old table overlaps the new one during the rehash, so the request is
+		// the new footprint while the old stays accounted.
+		let (overflow_needs_room, overflow_target) = {
+			let build = self.ordered_build_mut();
+			(
+				build.overflow.len() == build.overflow.capacity(),
+				build.overflow.capacity().max(8).saturating_mul(2),
+			)
+		};
+		if overflow_needs_room {
+			self.guard_allocation(baseline_bytes, overflow_map_bytes(overflow_target), cap)?;
+			let accounted_before = self.accounted_bytes();
+			let build = self.ordered_build_mut();
+			let extra = overflow_target - build.overflow.len();
+			build
+				.overflow
+				.try_reserve(extra)
+				.map_err(|error| ExecutionError::Kernel {
+					message: format!(
+						"recognized Neq existence summary overflow allocation failed: {error}"
+					),
+				})?;
+			let obtained = overflow_map_bytes(build.overflow.capacity());
+			let predicted = overflow_map_bytes(overflow_target);
+			self.guard_allocation(baseline_bytes, obtained.saturating_sub(predicted), cap)?;
+			self.observe_overlap_peak(baseline_bytes, accounted_before, obtained);
+		}
+
+		self.ensure_entry_room(baseline_bytes, cap)?;
+		let entry_index = self.push_entry(key, value)?;
+		self.ordered_build_mut().overflow.insert(key, entry_index);
+		self.last_entry = Some((key, entry_index as usize));
+		if INSTRUMENTED {
+			instrument.counters.appended += 1;
+			instrument.counters.fallback_appended_overflow += 1;
+		}
+		Ok(())
+	}
+
+	fn push_entry(&mut self, key: i64, value: i64) -> Result<u32, ExecutionError> {
+		let entry_index =
+			u32::try_from(self.entries.len()).map_err(|_| ExecutionError::Kernel {
+				message: "recognized Neq existence summary exceeds u32 entry range".to_string(),
+			})?;
+		debug_assert!(self.entries.len() < self.entries.capacity());
+		self.entries.push(NeqExistenceSummaryEntry {
+			key,
+			representative: value,
+		});
+		Ok(entry_index)
+	}
+
+	/// Build the bucket index once, after the last batch, for an ordered build; a hashed build
+	/// finishes nothing. Five phases, each guarded before it allocates and each a window on
+	/// the profiled path: pairs, sort, allocation, fill, cleanup. Afterwards the summary is a
+	/// hashed summary with the probe invariant the growing build maintains: no empty slot
+	/// between a key's home bucket and its slot, in wraparound order.
+	fn finish_index(
+		&mut self,
+		baseline_bytes: u64,
+		cap: u64,
+		mut instrument: Option<&mut InsertInstrument>,
+	) -> Result<(), ExecutionError> {
+		if !self.is_ordered() {
+			return Ok(());
+		}
+		let count = self.entries.len();
+		let (entry_limit, bucket_count) = once_built_index_sizing(count)?;
+		let clock = |instrument: &Option<&mut InsertInstrument>| {
+			instrument.as_ref().map(|_| steady_clock_ns())
+		};
+		let record = |instrument: &mut Option<&mut InsertInstrument>,
+		              name: &'static str,
+		              started: Option<u64>|
+		 -> Result<(), ExecutionError> {
+			if let (Some(instrument), Some(started)) = (instrument.as_deref_mut(), started) {
+				instrument.record_finish_window(name, started, steady_clock_ns())?;
+			}
+			Ok(())
+		};
+
+		// Pairs: (home bucket, entry index) for every entry, guarded before allocation and
+		// accounted while live.
+		let started = clock(&instrument);
+		self.guard_allocation(baseline_bytes, summary_bytes::<IndexPair>(count), cap)?;
+		let mut pairs: Vec<IndexPair> = Vec::new();
+		pairs
+			.try_reserve_exact(count)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!(
+					"recognized Neq existence summary index pairs allocation failed: {error}"
+				),
+			})?;
+		let actual_pairs_bytes = summary_bytes::<IndexPair>(pairs.capacity());
+		self.guard_allocation(baseline_bytes, actual_pairs_bytes, cap)?;
+		self.ordered_build_mut().finish_scratch_bytes = actual_pairs_bytes;
+		self.observe_peak(baseline_bytes, 0);
+		let mask = bucket_count - 1;
+		for (index, entry) in self.entries.iter().enumerate() {
+			let home = (self.hasher.hash_one(entry.key) as usize) & mask;
+			// Both fit by the sizing above: buckets at most 2^32, entries at most 2^31.
+			let home = u32::try_from(home).map_err(|_| ExecutionError::Kernel {
+				message: "recognized Neq existence summary home bucket exceeds the index width"
+					.to_string(),
+			})?;
+			let index = u32::try_from(index).map_err(|_| ExecutionError::Kernel {
+				message: "recognized Neq existence summary exceeds u32 entry range".to_string(),
+			})?;
+			pairs.push((home, index));
+		}
+		record(&mut instrument, "index_pairs", started)?;
+
+		// Sort by home bucket, entry index within a bucket; in place, no scratch.
+		let started = clock(&instrument);
+		pairs.sort_unstable();
+		record(&mut instrument, "index_sort", started)?;
+
+		// Allocate the bucket array once, and bring `entries` to the capacity the hashed build
+		// would have ended at, each guarded first with its overlap counted.
+		let started = clock(&instrument);
+		self.reserve_entries_exact(entry_limit, baseline_bytes, cap)?;
+		self.guard_allocation(baseline_bytes, summary_bytes::<u32>(bucket_count), cap)?;
+		let mut buckets: Vec<u32> = Vec::new();
+		buckets
+			.try_reserve_exact(bucket_count)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!(
+					"recognized Neq existence summary bucket allocation failed: {error}"
+				),
+			})?;
+		let actual_bucket_bytes = summary_bytes::<u32>(buckets.capacity());
+		self.guard_allocation(baseline_bytes, actual_bucket_bytes, cap)?;
+		self.observe_peak(baseline_bytes, actual_bucket_bytes);
+		buckets.resize(bucket_count, EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET);
+		record(&mut instrument, "index_alloc", started)?;
+
+		// Fill with one unwrapped cursor over 0..2N: `max(home, cursor)` only while the cursor
+		// is below N and never reset after wrapping, so the fill is linear and every entry lands
+		// at the first empty slot at or after its home bucket in the probe's wraparound order.
+		let started = clock(&instrument);
+		let n = bucket_count as u64;
+		let mut cursor: u64 = 0;
+		let mut visits = 0u64;
+		for (home, index) in pairs.iter().copied() {
+			if cursor < n {
+				cursor = cursor.max(home as u64);
+			}
+			loop {
+				debug_assert!(cursor < 2 * n, "a wrapped cluster reached its own origin");
+				let slot = (cursor % n) as usize;
+				visits += 1;
+				cursor += 1;
+				if buckets[slot] == EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET {
+					buckets[slot] = index;
+					break;
+				}
+			}
+		}
+		self.buckets = buckets;
+		self.entry_limit = entry_limit;
+		record(&mut instrument, "index_fill", started)?;
+
+		// Cleanup: the pairs array, the partition lists, and the overflow map are dropped, and
+		// the summary is a hashed summary from here on.
+		let started = clock(&instrument);
+		drop(pairs);
+		self.build = SummaryBuild::Hashed;
+		#[cfg(test)]
+		{
+			self.fill_slot_visits = visits;
+		}
+		#[cfg(not(test))]
+		let _ = visits;
+		record(&mut instrument, "build_cleanup", started)?;
+		Ok(())
 	}
 
 	#[cfg(test)]
@@ -1635,6 +2148,15 @@ impl NeqExistenceSummary {
 			return Ok(());
 		}
 
+		if self.is_ordered() {
+			return self.insert_ordered::<INSTRUMENTED>(
+				key,
+				value,
+				baseline_bytes,
+				cap,
+				instrument,
+			);
+		}
 		if INSTRUMENTED {
 			instrument.counters.lookups += 1;
 			if self.buckets.is_empty() {
@@ -1970,6 +2492,10 @@ impl NeqExistenceSummary {
 				message: "recognized Neq existence summary capacity overflow".to_string(),
 			})?;
 
+		if self.is_ordered() {
+			return self.reserve_entries_exact(target, baseline_bytes, cap);
+		}
+
 		if target > self.entry_limit {
 			self.resize_capacity(target, baseline_bytes, cap)?;
 		}
@@ -2101,6 +2627,10 @@ impl NeqExistenceSummary {
 		key: i64,
 		steps: &mut u64,
 	) -> Option<usize> {
+		debug_assert!(
+			!self.is_ordered(),
+			"an ordered build is probed before finish_index built its index"
+		);
 		if self.buckets.is_empty() {
 			return None;
 		}
@@ -2197,11 +2727,16 @@ impl NeqExistenceSummary {
 	}
 
 	fn accounted_bytes(&self) -> u64 {
+		let build = match &self.build {
+			SummaryBuild::Ordered(build) => build.accounted_bytes(),
+			SummaryBuild::Hashed => 0,
+		};
 		summary_bytes::<u32>(self.buckets.capacity())
 			.saturating_add(summary_bytes::<NeqExistenceSummaryEntry>(
 				self.entries.capacity(),
 			))
 			.saturating_add(summary_bytes::<u64>(self.multi.capacity()))
+			.saturating_add(build)
 	}
 
 	fn guard_allocation(
@@ -2234,6 +2769,18 @@ impl NeqExistenceSummary {
 			baseline_bytes
 				.saturating_add(self.accounted_bytes())
 				.saturating_add(allocation_bytes),
+		);
+	}
+
+	/// The peak of a reallocation that replaced an accounted allocation: while the copy or
+	/// rehash ran, the old storage (inside `accounted_before`) and the new storage (`obtained`)
+	/// were both resident. Called after the reallocation, when the current accounting no
+	/// longer sees the old storage.
+	fn observe_overlap_peak(&mut self, baseline_bytes: u64, accounted_before: u64, obtained: u64) {
+		self.peak_combined_bytes = self.peak_combined_bytes.max(
+			baseline_bytes
+				.saturating_add(accounted_before)
+				.saturating_add(obtained),
 		);
 	}
 
@@ -3209,8 +3756,6 @@ pub(in crate::exec) enum OrderAwareAdmission {
 }
 
 impl OrderAwareAdmission {
-	// Consumed by the order-aware build; the hashed build records admission without acting on it.
-	#[allow(dead_code)]
 	pub(in crate::exec) fn is_admitted(&self) -> bool {
 		matches!(self, Self::Admitted { .. })
 	}
@@ -3425,6 +3970,12 @@ pub(in crate::exec) struct InsertCounters {
 	pub(in crate::exec) empty_table_lookups: u64,
 	/// Probes of a fresh bucket array after a growth operation, the first allocation included.
 	pub(in crate::exec) growth_reprobes: u64,
+	/// ADR 589's order-aware build: rows appended on the fast path, rows found in a partition's
+	/// sorted list, rows found in the overflow map, and rows appended into the overflow map.
+	pub(in crate::exec) ordered_fast: u64,
+	pub(in crate::exec) fallback_found_sorted: u64,
+	pub(in crate::exec) fallback_found_overflow: u64,
+	pub(in crate::exec) fallback_appended_overflow: u64,
 }
 
 /// One half-open `[start_ns, end_ns)` window on the thread that opened it.
@@ -3570,9 +4121,6 @@ impl InsertInstrument {
 	}
 
 	/// Record one finish phase's window; phases must be recorded in the order they ran.
-	// Recorded by the order-aware build's finish; the hashed build finishes nothing after its
-	// last batch and publishes the finish term at zero.
-	#[allow(dead_code)]
 	pub(in crate::exec) fn record_finish_window(
 		&mut self,
 		name: &'static str,
@@ -3811,6 +4359,10 @@ impl InsertInstrument {
 				"probe_steps": self.counters.probe_steps,
 				"empty_table_lookups": self.counters.empty_table_lookups,
 				"growth_reprobes": self.counters.growth_reprobes,
+				"ordered_fast": self.counters.ordered_fast,
+				"fallback_found_sorted": self.counters.fallback_found_sorted,
+				"fallback_found_overflow": self.counters.fallback_found_overflow,
+				"fallback_appended_overflow": self.counters.fallback_appended_overflow,
 				"grow_events": self.growth.len(),
 			},
 			"key_count_hint": key_count_hint,
@@ -23731,7 +24283,8 @@ impl Executor {
 
 		let build_started = Instant::now();
 
-		let mut summary = NeqExistenceSummary::new();
+		let mut summary =
+			NeqExistenceSummary::for_existence_plan(stage.existence, columns.existence_key);
 
 		if let Some(key_count_hint) = columns.key_count_hint {
 			summary.reserve_key_count(key_count_hint, baseline_bytes, cap)?;
@@ -23992,6 +24545,16 @@ impl Executor {
 				message: "recognized Neq summary timing call count overflowed".to_string(),
 			})?;
 		}
+		// ADR 589: an ordered build builds its index once here, after the last batch; the work
+		// is clocked in its own finish windows on the profiled path and reported as the
+		// runtime-prep finish term, outside the per-batch write and insert accumulations.
+		summary.finish_index(
+			baseline_bytes,
+			cap,
+			clocks
+				.as_deref_mut()
+				.map(|clocks| &mut clocks.insert_instrument),
+		)?;
 		if let Some(clocks) = clocks.as_deref_mut() {
 			clocks.write_micros = write_micros;
 		}
@@ -33006,7 +33569,7 @@ mod tests {
 			ExecutionContext::local_test().with_task_budget(high_test_budget()),
 		);
 		let _ = schema;
-		let mut summary = NeqExistenceSummary::new();
+		let mut summary = NeqExistenceSummary::for_existence_plan(plan, ColumnOrdinal(0));
 		let mut clocks = ExistenceWriteClocks::default();
 		executor
 			.write_streaming_recognized_neq_existence_summary(
@@ -33645,6 +34208,868 @@ mod tests {
 				reason: "more than one exchange op"
 			}
 		);
+	}
+
+	const ADR589_CAP: u64 = 64 * 1024 * 1024;
+
+	fn adr589_ordered() -> NeqExistenceSummary {
+		NeqExistenceSummary::new_ordered()
+	}
+
+	/// Write one partition batch through the plain (unprofiled) path.
+	fn adr589_plain_write(summary: &mut NeqExistenceSummary, partition: usize, keys: &[i64]) {
+		summary
+			.write_batch(
+				partition,
+				&adr587_batch(keys),
+				ColumnOrdinal(0),
+				ColumnOrdinal(1),
+				0,
+				ADR589_CAP,
+			)
+			.expect("write");
+	}
+
+	/// Write one partition batch through the instrumented path with the given values.
+	fn adr589_write_values(
+		summary: &mut NeqExistenceSummary,
+		instrument: &mut InsertInstrument,
+		partition: usize,
+		rows: &[(i64, i64)],
+	) {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+		]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(
+					rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+				)),
+				Arc::new(Int64Array::from(
+					rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+				)),
+			],
+		)
+		.expect("batch");
+		instrument.partition = partition;
+		summary
+			.write_batch_with::<true>(
+				&batch,
+				ColumnOrdinal(0),
+				ColumnOrdinal(1),
+				0,
+				ADR589_CAP,
+				instrument,
+			)
+			.expect("instrumented write");
+	}
+
+	fn adr589_entry(summary: &NeqExistenceSummary, key: i64) -> Option<(i64, bool)> {
+		let index = summary.lookup_entry_index(key)?;
+		Some((
+			summary.entries[index].representative,
+			summary.is_multi(index),
+		))
+	}
+
+	// ADR 589, recurrence across batches: a key that ends one batch and opens the next on the
+	// same partition is found by the fallback in the partition's sorted list, observed, not
+	// appended.
+	#[test]
+	fn adr589_ordered_build_finds_a_boundary_straddle_without_appending() {
+		let mut summary = adr589_ordered();
+		let mut instrument = InsertInstrument::new();
+		adr589_write_values(
+			&mut summary,
+			&mut instrument,
+			0,
+			&[(1, 10), (2, 20), (3, 30)],
+		);
+		adr589_write_values(&mut summary, &mut instrument, 1, &[(5, 50)]);
+		adr589_write_values(&mut summary, &mut instrument, 0, &[(3, 31), (4, 40)]);
+		assert_eq!(summary.entries.len(), 5, "3 was found, not appended");
+		assert_eq!(instrument.counters.fallback_found_sorted, 1);
+		assert_eq!(instrument.counters.lookup_found, 1);
+		assert_eq!(instrument.counters.ordered_fast, 5);
+		assert_eq!(
+			instrument.counters.probe_steps, 0,
+			"no walks during the build"
+		);
+		assert_eq!(summary.walk_count, 0);
+		summary.finish_index(0, ADR589_CAP, None).expect("finish");
+		assert_eq!(
+			adr589_entry(&summary, 3),
+			Some((30, true)),
+			"multi-valued on 31"
+		);
+		assert_eq!(adr589_entry(&summary, 4), Some((40, false)));
+		assert_eq!(summary.multi_keys, 1);
+	}
+
+	// ADR 589, recurrence across partitions: each partition has its own running maximum, and a
+	// key repeated on its partition after another partition advanced is still found.
+	#[test]
+	fn adr589_ordered_build_keeps_a_maximum_per_partition() {
+		let mut summary = adr589_ordered();
+		let mut instrument = InsertInstrument::new();
+		adr589_write_values(&mut summary, &mut instrument, 0, &[(100, 1)]);
+		adr589_write_values(&mut summary, &mut instrument, 1, &[(5, 2), (6, 3)]);
+		adr589_write_values(&mut summary, &mut instrument, 0, &[(50, 4)]);
+		adr589_write_values(&mut summary, &mut instrument, 1, &[(6, 9), (7, 5)]);
+		{
+			let SummaryBuild::Ordered(build) = &summary.build else {
+				panic!("ordered")
+			};
+			assert_eq!(build.max, vec![Some(100), Some(7)]);
+			assert_eq!(
+				build.overflow.len(),
+				1,
+				"50 on partition 0 went to overflow"
+			);
+		}
+		assert_eq!(instrument.counters.ordered_fast, 4, "100, 5, 6, 7");
+		assert_eq!(instrument.counters.fallback_appended_overflow, 1, "50");
+		assert_eq!(
+			instrument.counters.fallback_found_sorted, 1,
+			"6 on partition 1"
+		);
+		summary.finish_index(0, ADR589_CAP, None).expect("finish");
+		assert_eq!(adr589_entry(&summary, 50), Some((4, false)));
+		assert_eq!(adr589_entry(&summary, 6), Some((3, true)));
+		assert_eq!(summary.entries.len(), 5);
+	}
+
+	// ADR 589, descending keys: a key below the partition's maximum takes the fallback, lands in
+	// the overflow map, leaves the sorted list sorted and the maximum unchanged, and is found
+	// again later, on the fallback and after the index is built.
+	#[test]
+	fn adr589_ordered_build_sends_descending_keys_to_the_overflow_map() {
+		let mut summary = adr589_ordered();
+		let mut instrument = InsertInstrument::new();
+		adr589_write_values(
+			&mut summary,
+			&mut instrument,
+			0,
+			&[(10, 1), (20, 2), (30, 3)],
+		);
+		adr589_write_values(
+			&mut summary,
+			&mut instrument,
+			0,
+			&[(15, 4), (12, 5), (25, 6)],
+		);
+		{
+			let SummaryBuild::Ordered(build) = &summary.build else {
+				panic!("ordered")
+			};
+			assert_eq!(build.max[0], Some(30), "unchanged by below-max rows");
+			let keys = build.ordered[0]
+				.iter()
+				.map(|&i| summary.entries[i as usize].key)
+				.collect::<Vec<_>>();
+			assert_eq!(keys, vec![10, 20, 30], "the sorted list stays sorted");
+			assert_eq!(build.overflow.len(), 3);
+		}
+		assert_eq!(instrument.counters.fallback_appended_overflow, 3);
+		adr589_write_values(&mut summary, &mut instrument, 0, &[(15, 7)]);
+		assert_eq!(instrument.counters.fallback_found_overflow, 1);
+		assert_eq!(summary.entries.len(), 6);
+		summary.finish_index(0, ADR589_CAP, None).expect("finish");
+		assert_eq!(adr589_entry(&summary, 15), Some((4, true)));
+		assert_eq!(adr589_entry(&summary, 12), Some((5, false)));
+		assert_eq!(adr589_entry(&summary, 25), Some((6, false)));
+		assert_eq!(adr589_entry(&summary, 30), Some((3, false)));
+	}
+
+	// ADR 589, repeated keys with differing supplier values: the multi-key bit is set exactly as
+	// the hashed build sets it on every path, cache, sorted-list fallback, and overflow.
+	#[test]
+	fn adr589_ordered_build_sets_multi_bits_exactly_as_the_hashed_build() {
+		let rows: Vec<(usize, Vec<(i64, i64)>)> = vec![
+			(0, vec![(1, 5), (1, 5), (2, 6), (2, 7)]),
+			(1, vec![(9, 1)]),
+			(0, vec![(2, 6), (3, 8)]),
+			(0, vec![(1, 9), (0, 4), (0, 4), (0, 5)]),
+		];
+		let mut ordered = adr589_ordered();
+		let mut hashed = NeqExistenceSummary::new();
+		hashed.hasher = ordered.hasher.clone();
+		for (partition, batch) in &rows {
+			adr589_plain_write_values(&mut ordered, *partition, batch);
+			adr589_plain_write_values(&mut hashed, *partition, batch);
+		}
+		ordered.finish_index(0, ADR589_CAP, None).expect("finish");
+		assert_eq!(ordered.multi_keys, hashed.multi_keys);
+		assert_eq!(ordered.input_rows, hashed.input_rows);
+		for key in [0, 1, 2, 3, 9] {
+			assert_eq!(
+				adr589_entry(&ordered, key),
+				adr589_entry(&hashed, key),
+				"key {key}"
+			);
+		}
+		assert_eq!(adr589_entry(&ordered, 2), Some((6, true)));
+		assert_eq!(adr589_entry(&ordered, 3), Some((8, false)));
+		assert_eq!(adr589_entry(&ordered, 0), Some((4, true)));
+	}
+
+	fn adr589_plain_write_values(
+		summary: &mut NeqExistenceSummary,
+		partition: usize,
+		rows: &[(i64, i64)],
+	) {
+		let mut instrument = InsertInstrument::default();
+		adr589_write_values_with::<false>(summary, &mut instrument, partition, rows);
+	}
+
+	fn adr589_write_values_with<const INSTRUMENTED: bool>(
+		summary: &mut NeqExistenceSummary,
+		instrument: &mut InsertInstrument,
+		partition: usize,
+		rows: &[(i64, i64)],
+	) {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+		]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(
+					rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+				)),
+				Arc::new(Int64Array::from(
+					rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+				)),
+			],
+		)
+		.expect("batch");
+		instrument.partition = partition;
+		summary
+			.write_batch_with::<INSTRUMENTED>(
+				&batch,
+				ColumnOrdinal(0),
+				ColumnOrdinal(1),
+				0,
+				ADR589_CAP,
+				instrument,
+			)
+			.expect("write");
+	}
+
+	// ADR 589, equivalence: for pseudo-random inputs of mixed order across partitions the
+	// order-aware build and the hashed build agree on every entry, representative, multi bit,
+	// and probe result, and the once-built index finds every entry a fresh walk would.
+	#[test]
+	fn adr589_ordered_build_matches_the_hashed_build_on_mixed_order_input() {
+		let mut state = 0x9E37_79B9_7F4A_7C15u64;
+		let mut next = || {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			state
+		};
+		let mut ordered = adr589_ordered();
+		let mut hashed = NeqExistenceSummary::new();
+		hashed.hasher = ordered.hasher.clone();
+		let mut all_keys = Vec::new();
+		// A key belongs to exactly one partition, as a hash-routed Exchange guarantees: key =
+		// 3m + p on partition p. Per partition m mostly ascends, sometimes repeats, sometimes
+		// descends to an earlier value.
+		let mut running = [0i64; 3];
+		for _ in 0..400 {
+			let partition = (next() % 3) as usize;
+			let mut rows = Vec::new();
+			for _ in 0..(1 + next() % 12) {
+				let roll = next() % 10;
+				let m = if roll < 7 {
+					running[partition] += 1 + (next() % 3) as i64;
+					running[partition]
+				} else if roll < 9 {
+					running[partition]
+				} else {
+					(next() % (running[partition].max(1) as u64)) as i64
+				};
+				let key = 3 * m + partition as i64;
+				let value = (next() % 5) as i64;
+				rows.push((key, value));
+				all_keys.push(key);
+			}
+			adr589_plain_write_values(&mut ordered, partition, &rows);
+			adr589_plain_write_values(&mut hashed, partition, &rows);
+		}
+		ordered.finish_index(0, ADR589_CAP, None).expect("finish");
+		assert_eq!(ordered.entries.len(), hashed.entries.len());
+		assert_eq!(ordered.multi_keys, hashed.multi_keys);
+		assert_eq!(ordered.input_rows, hashed.input_rows);
+		assert_eq!(
+			ordered.buckets.len(),
+			hashed.buckets.len(),
+			"sized as the grown table"
+		);
+		assert_eq!(ordered.entry_limit, hashed.entry_limit);
+		let max_key = *all_keys.iter().max().unwrap();
+		for key in -5..=(max_key + 5) {
+			assert_eq!(
+				adr589_entry(&ordered, key),
+				adr589_entry(&hashed, key),
+				"key {key}"
+			);
+			for value in 0..5 {
+				assert_eq!(ordered.matches(key, value), hashed.matches(key, value));
+			}
+		}
+		for entry in &ordered.entries {
+			let bucket = ordered.find_bucket(entry.key).unwrap();
+			assert_eq!(
+				ordered.entries[ordered.buckets[bucket] as usize].key,
+				entry.key
+			);
+		}
+		// Probe steps on the once-built table beside the grown table's, over the same keys.
+		let steps = |summary: &NeqExistenceSummary| {
+			let mut total = 0u64;
+			for key in &all_keys {
+				let mut walked = 0u64;
+				NeqExistenceSummary::find_bucket_in_with::<true>(
+					&summary.hasher,
+					&summary.buckets,
+					&summary.entries,
+					*key,
+					&mut walked,
+				)
+				.unwrap();
+				total += walked;
+			}
+			total
+		};
+		let (once_built, grown) = (steps(&ordered), steps(&hashed));
+		assert!(
+			once_built <= grown * 2 + all_keys.len() as u64,
+			"{once_built} vs {grown}"
+		);
+	}
+
+	/// An ordered summary with a deterministic hasher and every key on its own partition, so
+	/// the fast path is taken regardless of key order and homes can be chosen by trial.
+	fn adr589_index_fixture(seed: u64) -> NeqExistenceSummary {
+		let mut summary = adr589_ordered();
+		summary.hasher = RandomState::with_seeds(seed, seed ^ 1, seed ^ 2, seed ^ 3);
+		summary
+	}
+
+	fn adr589_home(summary: &NeqExistenceSummary, key: i64, buckets: usize) -> usize {
+		(summary.hasher.hash_one(key) as usize) & (buckets - 1)
+	}
+
+	/// Keys whose home bucket, in a `buckets`-slot array, is exactly `home`.
+	fn adr589_keys_with_home(
+		summary: &NeqExistenceSummary,
+		buckets: usize,
+		home: usize,
+		count: usize,
+		exclude: &[i64],
+	) -> Vec<i64> {
+		let mut keys = Vec::new();
+		let mut candidate = 1_000_000i64;
+		while keys.len() < count {
+			if adr589_home(summary, candidate, buckets) == home && !exclude.contains(&candidate) {
+				keys.push(candidate);
+			}
+			candidate += 1;
+		}
+		keys
+	}
+
+	// ADR 589, the once-built index: collisions on a home bucket at the array's end wrap into
+	// low buckets already occupied by low-home entries; every key is found and every absent
+	// key's probe ends at an empty slot.
+	#[test]
+	fn adr589_index_wraps_end_of_array_collisions_into_occupied_low_buckets() {
+		let mut summary = adr589_index_fixture(7);
+		let buckets = 2 * NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY;
+		let last = buckets - 1;
+		let low = adr589_keys_with_home(&summary, buckets, 0, 3, &[]);
+		let low1 = adr589_keys_with_home(&summary, buckets, 1, 2, &low);
+		let mut exclude = low.clone();
+		exclude.extend(&low1);
+		let high = adr589_keys_with_home(&summary, buckets, last, 6, &exclude);
+		let mut partition = 0;
+		for key in low.iter().chain(low1.iter()).chain(high.iter()) {
+			adr589_plain_write_values(&mut summary, partition, &[(*key, 1)]);
+			partition += 1;
+		}
+		summary.finish_index(0, ADR589_CAP, None).expect("finish");
+		assert_eq!(summary.buckets.len(), buckets);
+		// Slot last holds one high key; the other five wrapped past the five low-home entries
+		// in slots 0..4 and sit in slots 5..9.
+		assert_ne!(summary.buckets[last], EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET);
+		for slot in 0..10 {
+			assert_ne!(
+				summary.buckets[slot], EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET,
+				"slot {slot}"
+			);
+		}
+		assert_eq!(summary.buckets[10], EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET);
+		for key in low.iter().chain(low1.iter()).chain(high.iter()) {
+			assert_eq!(adr589_entry(&summary, *key), Some((1, false)), "key {key}");
+		}
+		// An absent key whose home lies inside the wrapped cluster probes to the first empty
+		// slot and is absent; one whose home is the wrapped high bucket likewise.
+		let absent_inside = adr589_keys_with_home(&summary, buckets, 3, 1, &exclude)[0];
+		let absent_high = adr589_keys_with_home(&summary, buckets, last, 1, &high)[0];
+		for absent in [absent_inside, absent_high] {
+			assert!(!exclude.contains(&absent) && !high.contains(&absent));
+			assert_eq!(adr589_entry(&summary, absent), None);
+			let bucket = summary.find_bucket(absent).unwrap();
+			assert_eq!(summary.buckets[bucket], EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET);
+		}
+	}
+
+	// ADR 589, the once-built index: several groups of collisions on consecutive high home
+	// buckets whose run continues through the one wrap into occupied low slots, at a load
+	// under one half; every key found, and the fill's slot visits bounded by N + pairs.
+	#[test]
+	fn adr589_index_fill_is_linear_through_one_wrap() {
+		let mut summary = adr589_index_fixture(11);
+		let buckets = 2 * NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY;
+		let mut keys = Vec::new();
+		for home in 0..40 {
+			keys.extend(adr589_keys_with_home(&summary, buckets, home, 2, &keys));
+		}
+		for home in (buckets - 12)..buckets {
+			keys.extend(adr589_keys_with_home(&summary, buckets, home, 9, &keys));
+		}
+		assert!(keys.len() * 2 < buckets, "load under one half");
+		for (partition, key) in keys.iter().enumerate() {
+			adr589_plain_write_values(&mut summary, partition, &[(*key, 1)]);
+		}
+		summary.finish_index(0, ADR589_CAP, None).expect("finish");
+		assert!(
+			summary.fill_slot_visits <= (buckets + keys.len()) as u64,
+			"visits {} exceed N + pairs {}",
+			summary.fill_slot_visits,
+			buckets + keys.len()
+		);
+		for key in &keys {
+			assert_eq!(adr589_entry(&summary, *key), Some((1, false)), "key {key}");
+		}
+		let occupied = summary
+			.buckets
+			.iter()
+			.filter(|&&b| b != EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET)
+			.count();
+		assert_eq!(occupied, keys.len());
+	}
+
+	// ADR 589, the once-built index on an empty input: an empty table that finds nothing.
+	#[test]
+	fn adr589_index_of_an_empty_build_finds_nothing() {
+		let mut summary = adr589_ordered();
+		summary.finish_index(0, ADR589_CAP, None).expect("finish");
+		assert_eq!(
+			summary.buckets.len(),
+			2 * NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY
+		);
+		assert!(summary.entries.is_empty());
+		assert_eq!(adr589_entry(&summary, 1), None);
+		assert!(!summary.matches(1, 1));
+		assert!(!summary.is_ordered());
+	}
+
+	// ADR 589, budget: the fallback's growth, the pairs array, and the bucket array are each
+	// refused before the allocation, with the summary intact.
+	#[test]
+	fn adr589_ordered_build_refuses_allocations_before_making_them() {
+		// Fallback growth: the overflow map's first reservation asks for 8 slots of 16 bytes.
+		let mut summary = adr589_ordered();
+		adr589_plain_write_values(&mut summary, 0, &[(10, 1), (20, 2)]);
+		let cap = summary.accounted_bytes() + 64;
+		let error = summary
+			.write_batch(
+				0,
+				&adr587_batch(&[5]),
+				ColumnOrdinal(0),
+				ColumnOrdinal(1),
+				0,
+				cap,
+			)
+			.expect_err("overflow growth refused");
+		assert!(error.to_string().contains("Memory"), "{error}");
+		assert_eq!(summary.entries.len(), 2, "nothing appended on refusal");
+		let SummaryBuild::Ordered(build) = &summary.build else {
+			panic!("still ordered")
+		};
+		assert!(build.overflow.is_empty());
+
+		// Pairs array: admits the entries, refuses the pairs.
+		let mut summary = adr589_ordered();
+		adr589_plain_write_values(&mut summary, 0, &[(1, 1), (2, 2), (3, 3)]);
+		let cap = summary.accounted_bytes() + summary_bytes::<IndexPair>(3) - 1;
+		let error = summary
+			.finish_index(0, cap, None)
+			.expect_err("pairs refused");
+		assert!(error.to_string().contains("Memory"), "{error}");
+		assert!(summary.buckets.is_empty(), "no index was built");
+		assert!(summary.is_ordered(), "the build is untouched");
+
+		// Bucket array: admits the pairs and the entries at the final capacity, refuses the
+		// buckets.
+		let mut summary = adr589_ordered();
+		adr589_plain_write_values(&mut summary, 0, &[(1, 1), (2, 2), (3, 3)]);
+		let entries_final =
+			summary_bytes::<NeqExistenceSummaryEntry>(NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY)
+				+ summary_bytes::<u64>(NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY / 64);
+		let cap = summary.accounted_bytes()
+			- summary_bytes::<NeqExistenceSummaryEntry>(summary.entries.capacity())
+			- summary_bytes::<u64>(summary.multi.capacity())
+			+ entries_final
+			+ summary_bytes::<IndexPair>(3)
+			+ summary_bytes::<u32>(2 * NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY)
+			- 1;
+		let error = summary
+			.finish_index(0, cap, None)
+			.expect_err("buckets refused");
+		assert!(error.to_string().contains("Memory"), "{error}");
+		assert!(summary.buckets.is_empty());
+	}
+
+	// ADR 589, budget: the overflow map obtains more than it is asked for (a reservation of 16
+	// obtains 28 at 32 buckets), so a cap between the naive request and the real footprint
+	// must refuse before the allocation, with nothing appended and the map still empty.
+	#[test]
+	fn adr589_overflow_guard_prices_the_buckets_the_map_will_obtain() {
+		assert_eq!(hashbrown_buckets(7), 8);
+		assert_eq!(
+			hashbrown_buckets(8),
+			16,
+			"a capacity of 8 needs 16 buckets at 7/8 load"
+		);
+		assert_eq!(
+			hashbrown_buckets(16),
+			32,
+			"16 * 8 / 7 rounds up to 32 buckets"
+		);
+		assert_eq!(hashbrown_buckets(28), 32);
+		assert_eq!(hashbrown_buckets(3), 4);
+		let mut probe: HashMap<i64, u32> = HashMap::new();
+		probe.try_reserve(16).unwrap();
+		assert_eq!(
+			probe.capacity(),
+			28,
+			"this target rounds a 16 reservation up to 28"
+		);
+		assert_eq!(overflow_map_bytes(16), overflow_map_bytes(probe.capacity()));
+
+		let mut summary = adr589_ordered();
+		adr589_plain_write_values(&mut summary, 0, &[(10, 1), (20, 2)]);
+		let naive = summary_bytes::<(i64, u32)>(16);
+		let real = overflow_map_bytes(16);
+		assert!(real > naive, "{real} > {naive}");
+		let cap = summary.accounted_bytes() + naive + (real - naive) / 2;
+		let error = summary
+			.write_batch(
+				0,
+				&adr587_batch(&[5]),
+				ColumnOrdinal(0),
+				ColumnOrdinal(1),
+				0,
+				cap,
+			)
+			.expect_err("refused between the naive request and the real footprint");
+		assert!(error.to_string().contains("Memory"), "{error}");
+		assert_eq!(summary.entries.len(), 2);
+		let SummaryBuild::Ordered(build) = &summary.build else {
+			panic!("ordered")
+		};
+		assert_eq!(build.overflow.capacity(), 0, "nothing was allocated");
+		// With room for the real footprint the same insert succeeds and is accounted at it.
+		let before = summary.accounted_bytes();
+		summary
+			.write_batch(
+				0,
+				&adr587_batch(&[5]),
+				ColumnOrdinal(0),
+				ColumnOrdinal(1),
+				0,
+				before + real + 64,
+			)
+			.expect("admitted at the real footprint");
+		let SummaryBuild::Ordered(build) = &summary.build else {
+			panic!("ordered")
+		};
+		assert_eq!(build.overflow.capacity(), 28);
+		assert_eq!(summary.accounted_bytes(), before + real);
+	}
+
+	// ADR 589, peak: a growth that replaces an allocation records the overlap, old plus new,
+	// as the peak, not merely the new resident storage; on the list, the overflow map, and the
+	// partition vectors alike.
+	#[test]
+	fn adr589_growth_records_the_overlap_peak_not_only_the_new_storage() {
+		let baseline = 1_000u64;
+		// Partition list growth: fill partition 0's list to its capacity, then one more.
+		let mut summary = adr589_ordered();
+		let mut instrument = InsertInstrument::default();
+		instrument.partition = 0;
+		summary
+			.insert_with::<false>(1, 1, baseline, ADR589_CAP, &mut instrument)
+			.unwrap();
+		let capacity_before = {
+			let SummaryBuild::Ordered(build) = &summary.build else {
+				panic!("ordered")
+			};
+			build.ordered[0].capacity()
+		};
+		for key in 2..=capacity_before as i64 {
+			summary
+				.insert_with::<false>(key, 1, baseline, ADR589_CAP, &mut instrument)
+				.unwrap();
+		}
+		let accounted_before = summary.accounted_bytes();
+		summary.peak_combined_bytes = 0;
+		summary
+			.insert_with::<false>(
+				capacity_before as i64 + 1,
+				1,
+				baseline,
+				ADR589_CAP,
+				&mut instrument,
+			)
+			.unwrap();
+		let capacity_after = {
+			let SummaryBuild::Ordered(build) = &summary.build else {
+				panic!("ordered")
+			};
+			build.ordered[0].capacity()
+		};
+		assert!(capacity_after > capacity_before, "the list grew");
+		let new_list = summary_bytes::<u32>(capacity_after);
+		assert_eq!(
+			summary.peak_combined_bytes,
+			baseline + accounted_before + new_list,
+			"old list still resident while the new one was filled"
+		);
+		assert!(summary.peak_combined_bytes > baseline + summary.accounted_bytes());
+
+		// Overflow map growth from empty: the peak counts the map's real footprint on top of
+		// everything accounted before it.
+		let mut summary = adr589_ordered();
+		adr589_plain_write_values(&mut summary, 0, &[(10, 1), (20, 2)]);
+		let accounted_before = summary.accounted_bytes();
+		summary.peak_combined_bytes = 0;
+		let mut instrument = InsertInstrument::default();
+		summary
+			.insert_with::<false>(5, 1, baseline, ADR589_CAP, &mut instrument)
+			.unwrap();
+		let map_bytes = {
+			let SummaryBuild::Ordered(build) = &summary.build else {
+				panic!("ordered")
+			};
+			overflow_map_bytes(build.overflow.capacity())
+		};
+		assert_eq!(
+			summary.peak_combined_bytes,
+			baseline + accounted_before + map_bytes
+		);
+
+		// Partition vectors on a first-seen partition: old vectors plus new.
+		let mut summary = adr589_ordered();
+		adr589_plain_write_values(&mut summary, 0, &[(1, 1)]);
+		let accounted_before = summary.accounted_bytes();
+		summary.peak_combined_bytes = 0;
+		let mut instrument = InsertInstrument::default();
+		instrument.partition = 3;
+		summary
+			.insert_with::<false>(9, 1, baseline, ADR589_CAP, &mut instrument)
+			.unwrap();
+		let (vectors, old_vectors, list) = {
+			let SummaryBuild::Ordered(build) = &summary.build else {
+				panic!("ordered")
+			};
+			(
+				summary_bytes::<Option<i64>>(build.max.capacity())
+					+ summary_bytes::<Vec<u32>>(build.ordered.capacity()),
+				summary_bytes::<Option<i64>>(1) + summary_bytes::<Vec<u32>>(1),
+				summary_bytes::<u32>(build.ordered[3].capacity()),
+			)
+		};
+		// Two overlaps in one insert: the vectors (old ones still resident), then partition
+		// 3's list (the old vectors released, the new list filled beside nothing old); the
+		// peak is the larger.
+		let vectors_peak = baseline + accounted_before + vectors;
+		let list_peak = baseline + accounted_before - old_vectors + vectors + list;
+		assert_eq!(summary.peak_combined_bytes, vectors_peak.max(list_peak));
+		assert!(summary.peak_combined_bytes >= vectors_peak);
+	}
+
+	// ADR 589, budget: a partition seen for the first time grows the per-partition vectors,
+	// guarded like everything else.
+	#[test]
+	fn adr589_new_partition_vectors_are_guarded() {
+		let mut summary = adr589_ordered();
+		adr589_plain_write_values(&mut summary, 0, &[(1, 1)]);
+		let before = summary.accounted_bytes();
+		let error = summary
+			.write_batch(
+				7,
+				&adr587_batch(&[2]),
+				ColumnOrdinal(0),
+				ColumnOrdinal(1),
+				0,
+				before + 8,
+			)
+			.expect_err("eight partitions' maxima and list headers do not fit in 8 bytes");
+		assert!(error.to_string().contains("Memory"), "{error}");
+		let SummaryBuild::Ordered(build) = &summary.build else {
+			panic!("ordered")
+		};
+		assert_eq!(build.max.len(), 1, "the vectors did not grow");
+		summary
+			.write_batch(
+				7,
+				&adr587_batch(&[2]),
+				ColumnOrdinal(0),
+				ColumnOrdinal(1),
+				0,
+				ADR589_CAP,
+			)
+			.expect("admitted");
+		assert!(summary.accounted_bytes() > before);
+	}
+
+	// ADR 589, the index width: sized without allocating, and refused above 2^31 entries,
+	// where a home bucket would no longer fit the pair's u32.
+	#[test]
+	fn adr589_once_built_index_refuses_entry_counts_beyond_its_width() {
+		assert_eq!(once_built_index_sizing(0).unwrap(), (1024, 2048));
+		assert_eq!(once_built_index_sizing(1024).unwrap(), (1024, 2048));
+		assert_eq!(once_built_index_sizing(1025).unwrap(), (2048, 4096));
+		assert_eq!(
+			once_built_index_sizing(12_000_000).unwrap(),
+			(16_777_216, 33_554_432)
+		);
+		let (limit, buckets) = once_built_index_sizing(1 << 31).unwrap();
+		assert_eq!((limit, buckets), (1 << 31, 1 << 32));
+		assert!(
+			u32::try_from(buckets - 1).is_ok(),
+			"the last home bucket fits"
+		);
+		let error = once_built_index_sizing((1 << 31) + 1).unwrap_err();
+		assert!(
+			error
+				.to_string()
+				.contains("exceeds the once-built index width"),
+			"{error}"
+		);
+	}
+
+	// ADR 589, the finish windows: five, disjoint, ordered, summing to the finish term, and
+	// zero windows on a hashed build.
+	#[test]
+	fn adr589_finish_windows_are_five_disjoint_ordered_and_sum_to_the_term() {
+		let mut summary = adr589_ordered();
+		let mut instrument = InsertInstrument::new();
+		adr589_write_values(&mut summary, &mut instrument, 0, &[(1, 1), (2, 2)]);
+		summary
+			.finish_index(0, ADR589_CAP, Some(&mut instrument))
+			.expect("finish");
+		let names = instrument
+			.finish
+			.iter()
+			.map(|(name, _)| *name)
+			.collect::<Vec<_>>();
+		assert_eq!(
+			names,
+			vec![
+				"index_pairs",
+				"index_sort",
+				"index_alloc",
+				"index_fill",
+				"build_cleanup"
+			]
+		);
+		for pair in instrument.finish.windows(2) {
+			assert!(
+				pair[0].1.end_ns <= pair[1].1.start_ns,
+				"disjoint and ordered"
+			);
+		}
+		let sum: u64 = instrument
+			.finish
+			.iter()
+			.map(|(_, w)| (w.end_ns - w.start_ns) / 1_000)
+			.sum();
+		assert_eq!(instrument.finish_micros, sum);
+		let value =
+			instrument.diagnostic_value(None, 2, summary.entry_limit, summary.buckets.len());
+		assert_eq!(value["finish_windows"].as_array().unwrap().len(), 5);
+
+		let mut hashed = NeqExistenceSummary::new();
+		let mut instrument = InsertInstrument::new();
+		adr589_write_values(&mut hashed, &mut instrument, 0, &[(1, 1)]);
+		hashed
+			.finish_index(0, ADR589_CAP, Some(&mut instrument))
+			.expect("nothing to finish");
+		assert!(instrument.finish.is_empty());
+		assert_eq!(instrument.finish_micros, 0);
+	}
+
+	// ADR 589, admission at the writer: an Exchange keyed on a column other than the existence
+	// key takes the hashed build, and the fast path is never taken.
+	#[tokio::test]
+	async fn adr589_writer_uses_the_hashed_build_when_admission_is_refused() {
+		let (source, schema, _filter, project) = adr586_existence_fixture(3, 5, i64::MAX);
+		let scan = test_scan_plan_with_first_field_key(TableId(86), schema.clone(), 86);
+		let plan = exchange_plan(
+			ExecutionPlan::Project {
+				input: Box::new(scan),
+				exprs: project,
+				output_schema: schema.clone(),
+			},
+			bound_column_root("suppkey", ColumnOrdinal(1), DataType::Int64, false),
+			2,
+		);
+		let (clocks, summary) = adr586_write_with_clocks(source, schema, &plan).await;
+		assert_eq!(clocks.insert_instrument.counters.ordered_fast, 0);
+		assert!(clocks.insert_instrument.finish.is_empty());
+		assert_eq!(summary.input_rows, 15);
+		assert!(
+			!summary.buckets.is_empty(),
+			"the hashed build grew its own index"
+		);
+	}
+
+	// ADR 589, admission at the writer: an Exchange keyed on the existence key takes the
+	// order-aware build; every key is a fast-path append and the index is built once.
+	#[tokio::test]
+	async fn adr589_writer_uses_the_ordered_build_when_admitted() {
+		let (source, schema, _filter, project) = adr586_existence_fixture(3, 5, i64::MAX);
+		let scan = test_scan_plan_with_first_field_key(TableId(86), schema.clone(), 86);
+		let plan = exchange_plan(
+			ExecutionPlan::Project {
+				input: Box::new(scan),
+				exprs: project,
+				output_schema: schema.clone(),
+			},
+			bound_column_root("orderkey", ColumnOrdinal(0), DataType::Int64, false),
+			2,
+		);
+		let (clocks, summary) = adr586_write_with_clocks(source, schema, &plan).await;
+		let counters = clocks.insert_instrument.counters;
+		assert_eq!(counters.ordered_fast, 15);
+		assert_eq!(counters.appended, 15);
+		assert_eq!(counters.probe_steps, 0);
+		assert_eq!(counters.growth_reprobes, 0);
+		assert_eq!(clocks.insert_instrument.growth.len(), 0, "no growth events");
+		assert_eq!(clocks.insert_instrument.finish.len(), 5);
+		assert!(!summary.is_ordered(), "finished into a hashed summary");
+		assert_eq!(summary.input_rows, 15);
+		for key in 0..15 {
+			assert_eq!(adr589_entry(&summary, key), Some((100 + key % 5, false)));
+		}
 	}
 
 	// The compact rows-window encoding is exact, including a thread change and a zero gap.
