@@ -638,6 +638,8 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 	row["membership_first_composition_provenance"] = serde_json::json!(membership_first_provenance);
 	row["side_local_filter_routing"] = serde_json::json!(side_local_routing);
 	row["side_local_filter_routing_provenance"] = serde_json::json!(side_local_routing_provenance);
+	// The data source this child was asked to read, so a paired driver can bind every arm to one.
+	row["data_source"] = serde_json::json!(data_source);
 	row["semi_filtered_reachable_keys"] = serde_json::json!(semi_filtered_reachable_keys);
 	row["semi_filtered_reachable_keys_provenance"] =
 		serde_json::json!(semi_filtered_reachable_keys_provenance);
@@ -2472,91 +2474,90 @@ const ADR587_LINE_CLASSES: [Adr587LineRange; 14] = [
 		end: 1637,
 		anchor: "fn insert_with<const INSTRUMENTED: bool>(",
 	},
-	// insert_with: the lookup counters, the single probe, and the found path.
+	// insert_with: the lookup counters, the lookup, and the found path.
 	Adr587LineRange {
 		class: "hash_and_probe",
 		start: 1638,
-		end: 1665,
+		end: 1660,
 		anchor: "if INSTRUMENTED {",
 	},
 	// insert_with: the capacity check that precedes growth (growth itself is a window).
 	Adr587LineRange {
 		class: "hash_and_probe",
-		start: 1666,
-		end: 1677,
+		start: 1661,
+		end: 1672,
 		anchor: "let grew = self.entries.len() == self.entry_limit;",
 	},
-	// insert_with: bucket reuse or the post-growth re-probe, and the append.
+	// insert_with: the second walk and the append.
 	Adr587LineRange {
 		class: "hash_and_probe",
-		start: 1678,
-		end: 1726,
+		start: 1673,
+		end: 1717,
 		anchor: "let entry_index =",
 	},
 	Adr587LineRange {
 		class: "shared",
-		start: 1727,
-		end: 1736,
+		start: 1718,
+		end: 1727,
 		anchor: "fn observe_value(&mut self, entry_index: usize, value: i64) {",
 	},
 	Adr587LineRange {
 		class: "shared",
-		start: 1823,
-		end: 1897,
+		start: 1814,
+		end: 1888,
 		anchor: "fn write_batch_with<const INSTRUMENTED: bool>(",
 	},
 	Adr587LineRange {
 		class: "growth_other",
-		start: 1898,
-		end: 1934,
+		start: 1889,
+		end: 1925,
 		anchor: "fn grow(&mut self, baseline_bytes: u64, cap: u64) -> Result<(), ExecutionError> {",
 	},
 	Adr587LineRange {
 		class: "growth_other",
-		start: 1935,
-		end: 2027,
+		start: 1926,
+		end: 2018,
 		anchor: "fn resize_capacity(",
 	},
 	Adr587LineRange {
 		class: "rehash",
-		start: 2028,
-		end: 2034,
+		start: 2019,
+		end: 2025,
 		anchor: "for (entry_index, entry) in self.entries.iter().enumerate() {",
 	},
 	Adr587LineRange {
 		class: "growth_other",
-		start: 2035,
-		end: 2049,
+		start: 2026,
+		end: 2040,
 		anchor: "",
 	},
-	// lookup_entry_index, probe_with, find_bucket (test-only), find_bucket_in.
 	Adr587LineRange {
 		class: "hash_and_probe",
-		start: 2050,
-		end: 2087,
+		start: 2041,
+		end: 2067,
 		anchor: "fn lookup_entry_index(&self, key: i64) -> Option<usize> {",
 	},
 	Adr587LineRange {
 		class: "hash_and_probe",
-		start: 2088,
-		end: 2142,
-		anchor: "fn find_bucket_in(",
+		start: 2068,
+		end: 2126,
+		anchor: "fn find_bucket(&self, key: i64) -> Result<usize, ExecutionError> {",
 	},
 	Adr587LineRange {
 		class: "shared",
-		start: 2143,
-		end: 2152,
+		start: 2127,
+		end: 2136,
 		anchor: "fn is_multi(&self, entry_index: usize) -> bool {",
 	},
 	Adr587LineRange {
 		class: "shared",
-		start: 2153,
-		end: 2160,
+		start: 2137,
+		end: 2144,
 		anchor: "fn set_multi(&mut self, entry_index: usize) {",
 	},
 ];
 /// Lines inside `resize_capacity` that copy or initialise the grown arrays.
-const ADR587_COPY_LINES: [u32; 4] = [1968, 1994, 1996, 2026];
+const ADR587_COPY_LINES: [u32; 4] = [1959, 1985, 1987, 2017];
 
 fn adr587_is_copy_symbol(symbol: &str) -> bool {
 	[
@@ -2932,7 +2933,25 @@ fn run_adr588_q21_second_walk(args: &[String]) -> Result<serde_json::Value, Stri
 		));
 	}
 	let journal = prepare_perf_sample_journal(&output_dir)?;
+	let expected = Adr588Expected {
+		control: Adr588ArmExpectation {
+			name: "control",
+			manifest: control.manifest.clone(),
+			manifest_path: control.manifest_path.display().to_string(),
+		},
+		treatment: Adr588ArmExpectation {
+			name: "treatment",
+			manifest: treatment.manifest.clone(),
+			manifest_path: treatment.manifest_path.display().to_string(),
+		},
+	};
+	let expected_dataset = Adr588Dataset {
+		manifest_fingerprint: dataset.manifest_fingerprint.clone(),
+		data_source: data_source.to_string(),
+	};
 
+	// Every child, phase 0 and warmups included, is validated the moment it returns: a row that
+	// fails parity or identity stops the run there, as the record promises, and is journaled.
 	let mut run_index = 0u32;
 	let mut child = |arm: &Adr588Arm, warmup: bool| -> Result<serde_json::Value, String> {
 		let index = run_index;
@@ -2942,6 +2961,15 @@ fn run_adr588_q21_second_walk(args: &[String]) -> Result<serde_json::Value, Stri
 		row["adr588_launched_manifest"] =
 			serde_json::json!(arm.manifest_path.display().to_string());
 		row["adr588_launched_executable_sha256"] = serde_json::json!(arm.manifest.toron.sha256);
+		let expectation = if arm.name == "control" {
+			&expected.control
+		} else {
+			&expected.treatment
+		};
+		if let Err(error) = adr588_validate_row(&row, expectation, &expected_dataset) {
+			journal.append(&row)?;
+			return Err(format!("{error}; run stopped, row retained"));
+		}
 		Ok(row)
 	};
 
@@ -3018,7 +3046,7 @@ fn run_adr588_q21_second_walk(args: &[String]) -> Result<serde_json::Value, Stri
 			"ADR 588 lost host quiescence or left spill scratch after measurement".to_string(),
 		);
 	}
-	let mut summary = evaluate_adr588_pairs(&rows, &control.manifest, &treatment.manifest)?;
+	let mut summary = evaluate_adr588_pairs(&rows, &expected, &expected_dataset)?;
 	summary["kind"] = serde_json::json!("adr588_q21_second_walk");
 	summary["outcome"] = serde_json::json!("pairs_measured");
 	summary["sealed"] = serde_json::json!(false);
@@ -3041,6 +3069,122 @@ fn run_adr588_q21_second_walk(args: &[String]) -> Result<serde_json::Value, Stri
 	);
 	write_json_atomically(&output_dir.join("summary.json"), &summary)?;
 	Ok(summary)
+}
+
+/// What every row of one arm must report: the arm's manifest, the path it was launched with,
+/// and the executable it ran.
+struct Adr588ArmExpectation {
+	name: &'static str,
+	manifest: BuildManifest,
+	manifest_path: String,
+}
+
+struct Adr588Expected {
+	control: Adr588ArmExpectation,
+	treatment: Adr588ArmExpectation,
+}
+
+/// The dataset the driver verified before any child ran; every row must name the same one.
+struct Adr588Dataset {
+	manifest_fingerprint: String,
+	data_source: String,
+}
+
+/// The one validator every ADR 588 row passes through, phase 0 and warmups included, at the
+/// moment the child returns and again in the evaluator: a passing q21 Toron row at the sealed
+/// coordinate, unprofiled, carrying the pinned digest byte for byte, reporting the identity of
+/// its arm's manifest, launched with that manifest and executable, over the verified dataset.
+fn adr588_validate_row(
+	row: &serde_json::Value,
+	arm: &Adr588ArmExpectation,
+	dataset: &Adr588Dataset,
+) -> Result<(), String> {
+	let name = arm.name;
+	let text = |field: &str| row.get(field).and_then(serde_json::Value::as_str);
+	if text("status") != Some("pass") {
+		return Err(format!("ADR 588 {name} row did not pass: {row}"));
+	}
+	if text("query") != Some("q21") || text("engine") != Some("toron") {
+		return Err(format!("ADR 588 {name} row is not a q21 Toron row"));
+	}
+	if text("mode") != Some("strict")
+		|| row.get("scale_factor").and_then(serde_json::Value::as_f64) != Some(8.0)
+		|| row
+			.get("memory_per_task")
+			.and_then(serde_json::Value::as_u64)
+			!= Some(2_147_483_648)
+		|| row
+			.get("spill_bytes_reserved")
+			.and_then(serde_json::Value::as_u64)
+			!= Some(2_147_483_648)
+		|| row
+			.get("partition_work_concurrency_requested")
+			.and_then(serde_json::Value::as_u64)
+			!= Some(1)
+	{
+		return Err(format!(
+			"ADR 588 {name} row is not at the sealed coordinate (mode/sf/memory/spill/parallelism)"
+		));
+	}
+	if row.get("diagnostics_disabled") != Some(&serde_json::Value::Bool(true)) {
+		return Err(format!(
+			"ADR 588 {name} row does not have diagnostics disabled"
+		));
+	}
+	match text("digest") {
+		Some(digest) if digest == ADR588_SEALED_Q21_DIGEST => {}
+		Some(digest) => {
+			return Err(format!(
+				"ADR 588 digest parity failed on a {name} row: {digest}"
+			));
+		}
+		None => return Err(format!("ADR 588 {name} row lacks a digest")),
+	}
+	if text("dataset_verification") != Some("full_hash") {
+		return Err(format!(
+			"ADR 588 {name} row was not run over a fully verified dataset"
+		));
+	}
+	if text("dataset_manifest_fingerprint") != Some(dataset.manifest_fingerprint.as_str()) {
+		return Err(format!(
+			"ADR 588 {name} row names dataset {:?}, expected {}",
+			text("dataset_manifest_fingerprint"),
+			dataset.manifest_fingerprint
+		));
+	}
+	if text("data_source") != Some(dataset.data_source.as_str()) {
+		return Err(format!(
+			"ADR 588 {name} row names data source {:?}, expected {}",
+			text("data_source"),
+			dataset.data_source
+		));
+	}
+	let identity = |field: &str| {
+		row.pointer(&format!("/evidence_identity/{field}"))
+			.and_then(serde_json::Value::as_str)
+	};
+	if identity("executable_sha256") != Some(arm.manifest.toron.sha256.as_str())
+		|| identity("source_tree_id") != Some(arm.manifest.source_tree_id.as_str())
+		|| identity("recipe_sha256") != Some(arm.manifest.recipe_digest.as_str())
+	{
+		return Err(format!(
+			"ADR 588 {name} row reports an identity that is not its manifest's: {}",
+			row.get("evidence_identity").cloned().unwrap_or_default()
+		));
+	}
+	if text("adr588_launched_manifest") != Some(arm.manifest_path.as_str()) {
+		return Err(format!(
+			"ADR 588 {name} row was launched with manifest {:?}, expected {}",
+			text("adr588_launched_manifest"),
+			arm.manifest_path
+		));
+	}
+	if text("adr588_launched_executable_sha256") != Some(arm.manifest.toron.sha256.as_str()) {
+		return Err(format!(
+			"ADR 588 {name} row was launched from the other arm's executable"
+		));
+	}
+	Ok(())
 }
 
 fn run_adr588_child(
@@ -3081,20 +3225,6 @@ fn run_adr588_child(
 	if row.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
 		return Err(format!("ADR 588 {} child did not pass: {row}", arm.name));
 	}
-	// The child's own identity check is the second witness: it must have found itself in the
-	// manifest it was handed, or the row is not this arm's.
-	if row
-		.pointer("/evidence_identity/executable_sha256")
-		.and_then(serde_json::Value::as_str)
-		!= Some(arm.manifest.toron.sha256.as_str())
-	{
-		return Err(format!(
-			"ADR 588 {} child did not run the {} executable: {}",
-			arm.name,
-			arm.name,
-			row.get("evidence_identity").cloned().unwrap_or_default()
-		));
-	}
 	Ok(row)
 }
 
@@ -3103,8 +3233,8 @@ fn run_adr588_child(
 /// gain is strictly positive; a zero pair fails exactly as a negative one.
 fn evaluate_adr588_pairs(
 	rows: &[serde_json::Value],
-	control: &BuildManifest,
-	treatment: &BuildManifest,
+	expected: &Adr588Expected,
+	expected_dataset: &Adr588Dataset,
 ) -> Result<serde_json::Value, String> {
 	if rows.len() != ADR585_PAIRS * 2 {
 		return Err(format!(
@@ -3113,86 +3243,20 @@ fn evaluate_adr588_pairs(
 			rows.len()
 		));
 	}
-	adr588_manifest_gate(control, treatment)?;
-	let settings = [
-		"query",
-		"mode",
-		"scale_factor",
-		"memory_per_task",
-		"spill_bytes_reserved",
-		"partition_work_concurrency_requested",
-		"engine",
-	];
-	let first = &rows[0];
+	adr588_manifest_gate(&expected.control.manifest, &expected.treatment.manifest)?;
 	let mut executables = BTreeSet::new();
 	for row in rows {
-		if row.get("status").and_then(serde_json::Value::as_str) != Some("pass")
-			|| row.get("query").and_then(serde_json::Value::as_str) != Some("q21")
-		{
-			return Err("ADR 588 accepts only passing q21 rows".to_string());
-		}
-		if row.get("diagnostics_disabled") != Some(&serde_json::Value::Bool(true)) {
-			return Err("ADR 588 requires diagnostics_disabled on every row".to_string());
-		}
-		for field in settings {
-			if row.get(field).is_none() || row.get(field) != first.get(field) {
-				return Err(format!(
-					"ADR 588 rows disagree on measurement setting {field}"
-				));
-			}
-		}
-		let digest = row
-			.get("digest")
-			.and_then(serde_json::Value::as_str)
-			.ok_or_else(|| "ADR 588 row lacks a digest".to_string())?;
-		if digest != ADR588_SEALED_Q21_DIGEST {
-			return Err(format!(
-				"ADR 588 digest parity failed on a {} row: {digest}",
-				row.get("adr588_arm")
-					.and_then(serde_json::Value::as_str)
-					.unwrap_or("?")
-			));
-		}
 		let arm = row
 			.get("adr588_arm")
 			.and_then(serde_json::Value::as_str)
 			.ok_or_else(|| "ADR 588 row lacks its arm".to_string())?;
 		let expected = match arm {
-			"control" => control,
-			"treatment" => treatment,
+			"control" => &expected.control,
+			"treatment" => &expected.treatment,
 			other => return Err(format!("ADR 588 row names unknown arm {other:?}")),
 		};
-		let launched = row
-			.get("adr588_launched_manifest")
-			.and_then(serde_json::Value::as_str)
-			.ok_or_else(|| "ADR 588 row lacks the manifest it was launched with".to_string())?;
-		let reported = row
-			.pointer("/evidence_identity/executable_sha256")
-			.and_then(serde_json::Value::as_str);
-		let tree = row
-			.pointer("/evidence_identity/source_tree_id")
-			.and_then(serde_json::Value::as_str);
-		let recipe = row
-			.pointer("/evidence_identity/recipe_sha256")
-			.and_then(serde_json::Value::as_str);
-		if reported != Some(expected.toron.sha256.as_str())
-			|| tree != Some(expected.source_tree_id.as_str())
-			|| recipe != Some(expected.recipe_digest.as_str())
-		{
-			return Err(format!(
-				"ADR 588 {arm} row reports an identity that is not its manifest's (launched from {launched})"
-			));
-		}
-		if row
-			.get("adr588_launched_executable_sha256")
-			.and_then(serde_json::Value::as_str)
-			!= Some(expected.toron.sha256.as_str())
-		{
-			return Err(format!(
-				"ADR 588 {arm} row was launched from the other arm's executable"
-			));
-		}
-		executables.insert(expected.toron.sha256.clone());
+		adr588_validate_row(row, expected, &expected_dataset)?;
+		executables.insert(expected.manifest.toron.sha256.clone());
 	}
 	if executables.len() != 2 {
 		return Err(format!(
@@ -6766,6 +6830,7 @@ fn duckdb_not_attempted_row(
 		join_spill_observations: None,
 		partition_work_concurrency_observations: None,
 		dataset_verification: None,
+		dataset_manifest_fingerprint: None,
 	}
 	.json_value()
 }
@@ -6809,6 +6874,7 @@ fn polars_not_attempted_row(
 		join_spill_observations: None,
 		partition_work_concurrency_observations: None,
 		dataset_verification: None,
+		dataset_manifest_fingerprint: None,
 	}
 	.json_value()
 }
@@ -6873,6 +6939,7 @@ fn perf_stub_row(stub: PerfStubRow<'_>) -> serde_json::Value {
 		join_spill_observations: None,
 		partition_work_concurrency_observations: None,
 		dataset_verification: None,
+		dataset_manifest_fingerprint: None,
 	}
 	.json_value()
 }
@@ -7057,6 +7124,7 @@ fn run_polars_perf_export(
 		join_spill_observations: None,
 		partition_work_concurrency_observations: None,
 		dataset_verification: None,
+		dataset_manifest_fingerprint: None,
 	}
 }
 
@@ -7183,6 +7251,9 @@ fn run_polars_perf_export(
 		join_spill_observations: None,
 		partition_work_concurrency_observations: None,
 		dataset_verification: export.dataset_verification,
+		dataset_manifest_fingerprint: export
+			.dataset_verification
+			.map(|_| export.manifest_fingerprint.clone()),
 	}
 }
 
@@ -7538,6 +7609,9 @@ fn polars_unsupported_attempt(
 		join_spill_observations: None,
 		partition_work_concurrency_observations: None,
 		dataset_verification: export.dataset_verification,
+		dataset_manifest_fingerprint: export
+			.dataset_verification
+			.map(|_| export.manifest_fingerprint.clone()),
 	}
 }
 
@@ -7589,6 +7663,9 @@ fn polars_fail_attempt(
 		join_spill_observations: None,
 		partition_work_concurrency_observations: None,
 		dataset_verification: export.dataset_verification,
+		dataset_manifest_fingerprint: export
+			.dataset_verification
+			.map(|_| export.manifest_fingerprint.clone()),
 	}
 }
 
@@ -7742,6 +7819,9 @@ fn run_duckdb_perf_child(
 			join_spill_observations: None,
 			partition_work_concurrency_observations: None,
 			dataset_verification: export.dataset_verification,
+			dataset_manifest_fingerprint: export
+				.dataset_verification
+				.map(|_| export.manifest_fingerprint.clone()),
 		}
 		.json_value());
 	}
@@ -7788,6 +7868,9 @@ fn run_duckdb_perf_child(
 		join_spill_observations: None,
 		partition_work_concurrency_observations: None,
 		dataset_verification: export.dataset_verification,
+		dataset_manifest_fingerprint: export
+			.dataset_verification
+			.map(|_| export.manifest_fingerprint.clone()),
 	}
 	.json_value())
 }
@@ -10951,18 +11034,18 @@ mod tests {
 	fn adr587_binner_places_samples_by_thread_window_and_class() {
 		let windows = adr587_test_windows();
 		let samples = vec![
-			adr587_sample(7, 1_000, "poll", Some(1_620)), // start edge: inside, shared
-			adr587_sample(7, 2_000, "poll", Some(1_620)), // end edge: outside
-			adr587_sample(9, 1_500, "poll", Some(1_620)), // other thread: outside every window
-			adr587_sample(7, 1_250, "poll", Some(1_620)), // inside growth: growth, not shared
+			adr587_sample(7, 1_000, "poll", Some(1_625)), // start edge: inside, shared
+			adr587_sample(7, 2_000, "poll", Some(1_625)), // end edge: outside
+			adr587_sample(9, 1_500, "poll", Some(1_625)), // other thread: outside every window
+			adr587_sample(7, 1_250, "poll", Some(1_625)), // inside growth: growth, not shared
 			adr587_sample(7, 1_300, "__memmove_avx_unaligned_erms", None), // growth copy
-			adr587_sample(7, 1_350, "NeqExistenceSummary::find_bucket_in", Some(2_110)), // rehash
-			adr587_sample(7, 1_500, "NeqExistenceSummary::find_bucket_in", Some(2_110)), // rows: probe
-			adr587_sample(7, 1_600, "poll", Some(1_700)), // append lines: probe
-			adr587_sample(7, 1_700, "poll", Some(1_760)), // matches(): unclassified line: other
+			adr587_sample(7, 1_350, "NeqExistenceSummary::find_bucket_in", Some(2_100)), // rehash
+			adr587_sample(7, 1_500, "NeqExistenceSummary::find_bucket_in", Some(2_100)), // rows: probe
+			adr587_sample(7, 1_600, "poll", Some(1_690)), // append lines: probe
+			adr587_sample(7, 1_700, "poll", Some(1_745)), // matches(): unclassified line: other
 			adr587_sample(7, 1_800, "poll", None),        // unresolved line: other
-			adr587_sample(7, 3_500, "poll", Some(1_730)), // observe_value: shared
-			adr587_sample(7, 2_500, "poll", Some(1_620)), // between windows: on-thread outside
+			adr587_sample(7, 3_500, "poll", Some(1_722)), // observe_value: shared
+			adr587_sample(7, 2_500, "poll", Some(1_625)), // between windows: on-thread outside
 		];
 		// The fixture lines must sit in the classes the comments claim, under the current table.
 		let class_of = |line: u32| {
@@ -10971,11 +11054,11 @@ mod tests {
 				.find(|range| line >= range.start && line <= range.end)
 				.map(|range| range.class)
 		};
-		assert_eq!(class_of(1_620), Some("shared"));
-		assert_eq!(class_of(1_700), Some("hash_and_probe"));
-		assert_eq!(class_of(1_730), Some("shared"));
-		assert_eq!(class_of(1_760), None, "matches() is unclassified");
-		assert_eq!(class_of(2_110), Some("hash_and_probe"));
+		assert_eq!(class_of(1_625), Some("shared"));
+		assert_eq!(class_of(1_690), Some("hash_and_probe"));
+		assert_eq!(class_of(1_722), Some("shared"));
+		assert_eq!(class_of(1_745), None, "matches() is unclassified");
+		assert_eq!(class_of(2_100), Some("hash_and_probe"));
 		let bin = adr587_bin_summary(&samples, &windows);
 		assert_eq!(bin["thread_present"], true);
 		assert_eq!(bin["tids"], serde_json::json!([7]));
@@ -11068,16 +11151,16 @@ mod tests {
 			tid: 8,
 		});
 		let samples = vec![
-			adr587_sample(7, 1_500, "poll", Some(1_620)),
-			adr587_sample(7, 3_500, "poll", Some(1_620)),
+			adr587_sample(7, 1_500, "poll", Some(1_625)),
+			adr587_sample(7, 3_500, "poll", Some(1_625)),
 		];
 		let bin = adr587_bin_summary(&samples, &windows);
 		assert_eq!(bin["tids"], serde_json::json!([7, 8]));
 		assert_eq!(bin["thread_present"], false);
 		assert_eq!(bin["missing_tids"], serde_json::json!([8]));
 		let samples = vec![
-			adr587_sample(7, 1_500, "poll", Some(1_620)),
-			adr587_sample(8, 5_500, "poll", Some(1_620)),
+			adr587_sample(7, 1_500, "poll", Some(1_625)),
+			adr587_sample(8, 5_500, "poll", Some(1_625)),
 		];
 		let bin = adr587_bin_summary(&samples, &windows);
 		assert_eq!(bin["thread_present"], true);
@@ -11129,7 +11212,7 @@ mod tests {
 	#[test]
 	fn adr587_binner_reports_an_absent_thread() {
 		let windows = adr587_test_windows();
-		let samples = vec![adr587_sample(9, 1_500, "poll", Some(1_620))];
+		let samples = vec![adr587_sample(9, 1_500, "poll", Some(1_625))];
 		let bin = adr587_bin_summary(&samples, &windows);
 		assert_eq!(bin["thread_present"], false);
 		assert_eq!(bin["rows_inclusive"]["samples"], 0);
@@ -11464,6 +11547,9 @@ mod tests {
 			"partition_work_concurrency_requested": 1,
 			"diagnostics_disabled": true,
 			"digest": ADR588_SEALED_Q21_DIGEST,
+			"dataset_verification": "full_hash",
+			"dataset_manifest_fingerprint": "fnv1a64:0fc5c06d19c5ed23",
+			"data_source": "parquet",
 			"execute_ms": execute_ms,
 			"adr588_arm": arm,
 			"adr588_pair": pair,
@@ -11478,8 +11564,30 @@ mod tests {
 		})
 	}
 
+	fn adr588_expected(control: &BuildManifest, treatment: &BuildManifest) -> Adr588Expected {
+		Adr588Expected {
+			control: Adr588ArmExpectation {
+				name: "control",
+				manifest: control.clone(),
+				manifest_path: "/manifests/control.manifest".to_string(),
+			},
+			treatment: Adr588ArmExpectation {
+				name: "treatment",
+				manifest: treatment.clone(),
+				manifest_path: "/manifests/treatment.manifest".to_string(),
+			},
+		}
+	}
+
+	fn adr588_dataset() -> Adr588Dataset {
+		Adr588Dataset {
+			manifest_fingerprint: "fnv1a64:0fc5c06d19c5ed23".to_string(),
+			data_source: "parquet".to_string(),
+		}
+	}
+
 	/// Control at 13,000..13,400 (range 400, required gain 800); treatment = control - gain[i].
-	fn adr588_rows(gains: [f64; 5]) -> (Vec<serde_json::Value>, BuildManifest, BuildManifest) {
+	fn adr588_rows(gains: [f64; 5]) -> (Vec<serde_json::Value>, Adr588Expected) {
 		let control = adr588_manifest("1", "c", "release", "b");
 		let treatment = adr588_manifest("2", "d", "release", "b");
 		let rows = (0..ADR585_PAIRS)
@@ -11491,27 +11599,27 @@ mod tests {
 				]
 			})
 			.collect();
-		(rows, control, treatment)
+		(rows, adr588_expected(&control, &treatment))
 	}
 
 	#[test]
 	fn adr588_retains_only_an_established_gain() {
-		let (rows, control, treatment) = adr588_rows([900.0, 950.0, 1_000.0, 880.0, 1_100.0]);
-		let summary = evaluate_adr588_pairs(&rows, &control, &treatment).expect("fixture");
+		let (rows, expected) = adr588_rows([900.0, 950.0, 1_000.0, 880.0, 1_100.0]);
+		let summary = evaluate_adr588_pairs(&rows, &expected, &adr588_dataset()).expect("fixture");
 		assert_eq!(summary["control_execute_range_ms"], 400.0);
 		assert_eq!(summary["required_gain_ms"], 800.0);
 		assert_eq!(summary["verdict"]["status"], "retained");
 		assert_eq!(summary["gain_median_ms"], 950.0);
 
 		// A positive median with one negative pair fails.
-		let (rows, control, treatment) = adr588_rows([900.0, 950.0, 1_000.0, -5.0, 1_100.0]);
-		let summary = evaluate_adr588_pairs(&rows, &control, &treatment).expect("fixture");
+		let (rows, expected) = adr588_rows([900.0, 950.0, 1_000.0, -5.0, 1_100.0]);
+		let summary = evaluate_adr588_pairs(&rows, &expected, &adr588_dataset()).expect("fixture");
 		assert_eq!(summary["verdict"]["status"], "not_established");
 		assert_eq!(summary["verdict"]["every_pair_positive"], false);
 
 		// A positive median with one zero pair fails exactly the same way.
-		let (rows, control, treatment) = adr588_rows([900.0, 950.0, 1_000.0, 0.0, 1_100.0]);
-		let summary = evaluate_adr588_pairs(&rows, &control, &treatment).expect("fixture");
+		let (rows, expected) = adr588_rows([900.0, 950.0, 1_000.0, 0.0, 1_100.0]);
+		let summary = evaluate_adr588_pairs(&rows, &expected, &adr588_dataset()).expect("fixture");
 		assert_eq!(summary["verdict"]["status"], "not_established");
 		assert_eq!(
 			summary["verdict"]["reason"],
@@ -11519,8 +11627,8 @@ mod tests {
 		);
 
 		// A median inside twice the control range fails even with every pair positive.
-		let (rows, control, treatment) = adr588_rows([700.0, 750.0, 790.0, 600.0, 810.0]);
-		let summary = evaluate_adr588_pairs(&rows, &control, &treatment).expect("fixture");
+		let (rows, expected) = adr588_rows([700.0, 750.0, 790.0, 600.0, 810.0]);
+		let summary = evaluate_adr588_pairs(&rows, &expected, &adr588_dataset()).expect("fixture");
 		assert_eq!(summary["verdict"]["status"], "not_established");
 		assert_eq!(summary["verdict"]["every_pair_positive"], true);
 		assert_eq!(
@@ -11531,52 +11639,148 @@ mod tests {
 
 	#[test]
 	fn adr588_refuses_digest_identity_and_setting_mismatches() {
-		let (mut rows, control, treatment) = adr588_rows([900.0; 5]);
+		let (mut rows, expected) = adr588_rows([900.0; 5]);
 		rows[3]["digest"] = serde_json::json!("ArrowIpcDigest([0])");
 		assert!(
-			evaluate_adr588_pairs(&rows, &control, &treatment)
+			evaluate_adr588_pairs(&rows, &expected, &adr588_dataset())
 				.unwrap_err()
 				.contains("digest parity failed on a treatment row")
 		);
 
-		let (mut rows, control, treatment) = adr588_rows([900.0; 5]);
+		let (mut rows, expected) = adr588_rows([900.0; 5]);
 		rows[2]["evidence_identity"]["executable_sha256"] = serde_json::json!("d".repeat(64));
 		assert!(
-			evaluate_adr588_pairs(&rows, &control, &treatment)
+			evaluate_adr588_pairs(&rows, &expected, &adr588_dataset())
 				.unwrap_err()
 				.contains("control row reports an identity that is not its manifest's")
 		);
 
-		let (mut rows, control, treatment) = adr588_rows([900.0; 5]);
+		let (mut rows, expected) = adr588_rows([900.0; 5]);
 		rows[2]["adr588_launched_executable_sha256"] = serde_json::json!("d".repeat(64));
 		assert!(
-			evaluate_adr588_pairs(&rows, &control, &treatment)
+			evaluate_adr588_pairs(&rows, &expected, &adr588_dataset())
 				.unwrap_err()
-				.contains("launched from the other arm's executable")
+				.contains("other arm's executable")
 		);
 
-		let (mut rows, control, treatment) = adr588_rows([900.0; 5]);
+		let (mut rows, expected) = adr588_rows([900.0; 5]);
 		rows[5]["memory_per_task"] = serde_json::json!(1_073_741_824u64);
 		assert!(
-			evaluate_adr588_pairs(&rows, &control, &treatment)
+			evaluate_adr588_pairs(&rows, &expected, &adr588_dataset())
 				.unwrap_err()
-				.contains("disagree on measurement setting memory_per_task")
+				.contains("sealed coordinate")
 		);
 
-		let (mut rows, control, treatment) = adr588_rows([900.0; 5]);
+		let (mut rows, expected) = adr588_rows([900.0; 5]);
 		rows[1]["diagnostics_disabled"] = serde_json::json!(false);
 		assert!(
-			evaluate_adr588_pairs(&rows, &control, &treatment)
+			evaluate_adr588_pairs(&rows, &expected, &adr588_dataset())
 				.unwrap_err()
-				.contains("diagnostics_disabled")
+				.contains("diagnostics disabled")
 		);
 
-		let (rows, control, _) = adr588_rows([900.0; 5]);
+		let (rows, expected) = adr588_rows([900.0; 5]);
+		let same = Adr588Expected {
+			control: Adr588ArmExpectation {
+				name: "control",
+				manifest: expected.control.manifest.clone(),
+				manifest_path: expected.control.manifest_path.clone(),
+			},
+			treatment: Adr588ArmExpectation {
+				name: "treatment",
+				manifest: expected.control.manifest.clone(),
+				manifest_path: expected.treatment.manifest_path.clone(),
+			},
+		};
 		assert!(
-			evaluate_adr588_pairs(&rows, &control, &control)
+			evaluate_adr588_pairs(&rows, &same, &adr588_dataset())
 				.unwrap_err()
 				.contains("same source tree")
 		);
+	}
+
+	// The one validator runs on every row, so a phase-0 or warmup row that fails parity or
+	// identity is refused the moment it returns, not only when the pairs are evaluated.
+	#[test]
+	fn adr588_validator_refuses_any_row_on_parity_identity_launch_or_dataset() {
+		let (rows, expected) = adr588_rows([900.0; 5]);
+		let dataset = adr588_dataset();
+		let good = rows[0].clone();
+		adr588_validate_row(&good, &expected.control, &dataset).expect("a control row passes");
+		let cases: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>, &str)> = vec![
+			(
+				"digest",
+				Box::new(|row| row["digest"] = serde_json::json!("ArrowIpcDigest([0])")),
+				"digest parity failed on a control row",
+			),
+			(
+				"warmup row without a pair still fails parity",
+				Box::new(|row| {
+					row["digest"] = serde_json::json!("ArrowIpcDigest([1])");
+					row.as_object_mut().unwrap().remove("adr588_pair");
+					row["adr588_phase"] = serde_json::json!("pairs_warmup");
+				}),
+				"digest parity failed on a control row",
+			),
+			(
+				"swapped manifest",
+				Box::new(|row| {
+					row["adr588_launched_manifest"] =
+						serde_json::json!("/manifests/treatment.manifest")
+				}),
+				"launched with manifest",
+			),
+			(
+				"swapped executable",
+				Box::new(|row| {
+					row["adr588_launched_executable_sha256"] = serde_json::json!("d".repeat(64))
+				}),
+				"other arm's executable",
+			),
+			(
+				"identity",
+				Box::new(|row| {
+					row["evidence_identity"]["source_tree_id"] = serde_json::json!("9".repeat(40))
+				}),
+				"not its manifest's",
+			),
+			(
+				"dataset fingerprint",
+				Box::new(|row| {
+					row["dataset_manifest_fingerprint"] = serde_json::json!("fnv1a64:deadbeef")
+				}),
+				"names dataset",
+			),
+			(
+				"dataset verification",
+				Box::new(|row| row["dataset_verification"] = serde_json::json!("skipped")),
+				"fully verified dataset",
+			),
+			(
+				"data source",
+				Box::new(|row| row["data_source"] = serde_json::json!("memory")),
+				"names data source",
+			),
+			(
+				"diagnostics",
+				Box::new(|row| row["diagnostics_disabled"] = serde_json::json!(false)),
+				"diagnostics disabled",
+			),
+			(
+				"coordinate",
+				Box::new(|row| row["memory_per_task"] = serde_json::json!(1_073_741_824u64)),
+				"sealed coordinate",
+			),
+		];
+		for (label, mutate, expected_error) in cases {
+			let mut row = good.clone();
+			mutate(&mut row);
+			let error = adr588_validate_row(&row, &expected.control, &dataset).expect_err(label);
+			assert!(error.contains(expected_error), "{label}: {error}");
+		}
+		// A treatment row validated against the control expectation is refused on identity.
+		let error = adr588_validate_row(&rows[1], &expected.control, &dataset).unwrap_err();
+		assert!(error.contains("not its manifest's"), "{error}");
 	}
 
 	#[test]

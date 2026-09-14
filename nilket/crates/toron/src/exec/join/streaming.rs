@@ -1646,8 +1646,7 @@ impl NeqExistenceSummary {
 			self.walk_count += 1;
 		}
 		let mut steps = 0u64;
-		let probe = self.probe_with::<INSTRUMENTED>(key, &mut steps);
-		if let Some(entry_index) = probe.and_then(|probe| probe.entry_index) {
+		if let Some(entry_index) = self.lookup_entry_index_with::<INSTRUMENTED>(key, &mut steps) {
 			if INSTRUMENTED {
 				instrument.counters.lookup_found += 1;
 				instrument.counters.probe_steps += steps;
@@ -1659,10 +1658,6 @@ impl NeqExistenceSummary {
 			return Ok(());
 		}
 
-		// A miss. The probe's bucket is the empty slot the append needs, and it stays valid
-		// only while the bucket array it names exists: growth rebuilds that array at twice the
-		// size with every entry rehashed, so after growth the key is probed again, and the
-		// first insert into an empty table (no probe at all) is probed after its allocation.
 		let grew = self.entries.len() == self.entry_limit;
 		if grew {
 			if INSTRUMENTED {
@@ -1680,32 +1675,28 @@ impl NeqExistenceSummary {
 				message: "recognized Neq existence summary exceeds u32 entry range".to_string(),
 			})?;
 
-		let bucket = match probe {
-			Some(probe) if !grew => probe.bucket,
-			_ => {
-				#[cfg(test)]
-				{
-					self.walk_count += 1;
-				}
-				let mut reprobe_steps = 0u64;
-				let bucket = Self::find_bucket_in_with::<INSTRUMENTED>(
-					&self.hasher,
-					&self.buckets,
-					&self.entries,
-					key,
-					&mut reprobe_steps,
-				)?;
-				if INSTRUMENTED {
-					instrument.counters.growth_reprobes += 1;
-					steps += reprobe_steps;
-				}
-				bucket
-			}
-		};
-		if INSTRUMENTED {
-			instrument.counters.appended += 1;
-			instrument.counters.probe_steps += steps;
+		#[cfg(test)]
+		{
+			self.walk_count += 1;
 		}
+		let bucket = if INSTRUMENTED {
+			let mut append_steps = 0u64;
+			let bucket = Self::find_bucket_in_with::<true>(
+				&self.hasher,
+				&self.buckets,
+				&self.entries,
+				key,
+				&mut append_steps,
+			)?;
+			instrument.counters.appended += 1;
+			instrument.counters.probe_steps += steps + append_steps;
+			if grew {
+				instrument.counters.growth_reprobes += 1;
+			}
+			bucket
+		} else {
+			self.find_bucket(key)?
+		};
 
 		let capacity_before = self.entries.capacity();
 
@@ -2048,15 +2039,14 @@ impl NeqExistenceSummary {
 	}
 
 	fn lookup_entry_index(&self, key: i64) -> Option<usize> {
-		self.probe_with::<false>(key, &mut 0)
-			.and_then(|probe| probe.entry_index)
+		self.lookup_entry_index_with::<false>(key, &mut 0)
 	}
 
-	/// One walk of the bucket array for `key`: the bucket the walk stopped at, and the entry
-	/// there if the key is present. `None` only when the table has no buckets yet. The bucket
-	/// is valid until the next growth operation and no longer; a caller that grows must probe
-	/// again.
-	fn probe_with<const COUNT_STEPS: bool>(&self, key: i64, steps: &mut u64) -> Option<Probe> {
+	fn lookup_entry_index_with<const COUNT_STEPS: bool>(
+		&self,
+		key: i64,
+		steps: &mut u64,
+	) -> Option<usize> {
 		if self.buckets.is_empty() {
 			return None;
 		}
@@ -2072,15 +2062,9 @@ impl NeqExistenceSummary {
 
 		let entry_index = self.buckets[bucket];
 
-		Some(Probe {
-			bucket,
-			entry_index: (entry_index != EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET)
-				.then_some(entry_index as usize),
-		})
+		(entry_index != EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET).then_some(entry_index as usize)
 	}
 
-	/// The bucket a fresh walk lands on; the tests' oracle for where an insert put its entry.
-	#[cfg(test)]
 	fn find_bucket(&self, key: i64) -> Result<usize, ExecutionError> {
 		Self::find_bucket_in(&self.hasher, &self.buckets, &self.entries, key)
 	}
@@ -3264,14 +3248,6 @@ pub(in crate::exec) struct InsertCounters {
 	pub(in crate::exec) empty_table_lookups: u64,
 	/// Probes of a fresh bucket array after a growth operation, the first allocation included.
 	pub(in crate::exec) growth_reprobes: u64,
-}
-
-/// What one walk of the existence summary's bucket array found: the bucket it stopped at, and
-/// the entry there if the key was present. Valid only until the next growth operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Probe {
-	bucket: usize,
-	entry_index: Option<usize>,
 }
 
 /// One half-open `[start_ns, end_ns)` window on the thread that opened it.
@@ -32868,15 +32844,15 @@ mod tests {
 		// was the first allocation, and the append's probe of the fresh array is a reprobe.
 		assert_eq!(counters.empty_table_lookups, 1);
 		assert_eq!(counters.growth_reprobes, 1);
-		// Actual walks: every non-empty lookup plus the re-probes after growth, pinned against
-		// the summary's own walk counter.
+		// Actual walks: every non-empty lookup plus every append's walk, pinned against the
+		// summary's own walk counter.
 		assert_eq!(
 			counted.walk_count,
-			counters.lookups - counters.empty_table_lookups + counters.growth_reprobes
+			counters.lookups - counters.empty_table_lookups + counters.appended
 		);
 		assert_eq!(
-			counted.walk_count, 5,
-			"4 non-empty lookups + 1 post-allocation probe"
+			counted.walk_count, 8,
+			"4 non-empty lookups + 4 append walks"
 		);
 		assert_eq!(instrument.rows.len(), 2, "one rows window per batch");
 		assert_eq!(
@@ -32966,7 +32942,7 @@ mod tests {
 		assert_eq!(
 			summary.walk_count,
 			instrument.counters.lookups - instrument.counters.empty_table_lookups
-				+ instrument.counters.growth_reprobes
+				+ instrument.counters.appended
 		);
 		let value = instrument.diagnostic_value(
 			None,
@@ -32982,161 +32958,6 @@ mod tests {
 				.expect("decode");
 		assert_eq!(decoded, instrument.rows, "the encoding is exact");
 		assert_eq!(value["growth_windows"][2][4], 4096);
-	}
-
-	// ADR 588, reuse: on a miss with room in the table exactly one walk runs, the entry lands
-	// in the bucket that walk returned, and a fresh walk agrees.
-	#[test]
-	fn adr588_a_miss_with_room_reuses_the_first_probes_bucket() {
-		let cap = 1024 * 1024;
-		let mut summary = NeqExistenceSummary::new();
-		summary
-			.insert(1, 10, 0, cap)
-			.expect("first insert allocates");
-		let walks_before = summary.walk_count;
-		let probed = summary
-			.probe_with::<false>(2, &mut 0)
-			.expect("table has buckets");
-		assert_eq!(probed.entry_index, None, "2 is absent");
-		summary.insert(2, 20, 0, cap).expect("miss with room");
-		assert_eq!(
-			summary.walk_count - walks_before,
-			1,
-			"one walk for the miss"
-		);
-		let index = summary.buckets[probed.bucket];
-		assert_ne!(index, EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET);
-		assert_eq!(
-			summary.entries[index as usize].key, 2,
-			"entry in the probed bucket"
-		);
-		assert_eq!(
-			summary.find_bucket(2).unwrap(),
-			probed.bucket,
-			"a fresh walk agrees"
-		);
-		assert_eq!(summary.entries.len(), 2);
-	}
-
-	// ADR 588, growth: a key whose bucket moves when the array doubles must not be written to
-	// its pre-growth bucket. The key is chosen so the two buckets differ; a stale reuse would
-	// then fail the post-growth assertions rather than pass by coincidence.
-	#[test]
-	fn adr588_a_growing_miss_reprobes_and_never_reuses_the_stale_bucket() {
-		let cap = 1024 * 1024;
-		let mut summary = NeqExistenceSummary::new();
-		let limit = NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY as i64;
-		for key in 0..limit {
-			summary.insert(key, key, 0, cap).expect("fill to the limit");
-		}
-		assert_eq!(summary.entries.len(), summary.entry_limit, "table is full");
-		let buckets_before = summary.buckets.len();
-		// Find a key whose pre-growth bucket differs from its post-growth bucket, computed on
-		// a twin with the same hasher that has already grown, so the choice never touches the
-		// summary under test.
-		let mut twin = NeqExistenceSummary::new();
-		twin.hasher = summary.hasher.clone();
-		for key in 0..limit {
-			twin.insert(key, key, 0, cap).expect("twin fill");
-		}
-		twin.insert(limit, limit, 0, cap).expect("twin grows");
-		assert_eq!(twin.buckets.len(), buckets_before * 2);
-		let mut chosen = None;
-		for candidate in (limit + 1)..(limit + 100_000) {
-			let before = summary.probe_with::<false>(candidate, &mut 0).unwrap();
-			assert_eq!(before.entry_index, None);
-			let after = twin.find_bucket(candidate).unwrap();
-			if before.bucket != after {
-				chosen = Some((candidate, before.bucket, after));
-				break;
-			}
-		}
-		let (key, stale_bucket, expected_bucket) = chosen.expect("some key moves on doubling");
-		let walks_before = summary.walk_count;
-		summary.insert(key, key, 0, cap).expect("growing miss");
-		assert_eq!(summary.buckets.len(), buckets_before * 2, "grew");
-		assert_eq!(
-			summary.walk_count - walks_before,
-			2,
-			"the probe and the re-probe"
-		);
-		let landed = summary.find_bucket(key).unwrap();
-		assert_eq!(landed, expected_bucket, "entry at its post-growth bucket");
-		assert_ne!(landed, stale_bucket, "not at the stale pre-growth bucket");
-		assert_eq!(summary.entries[summary.buckets[landed] as usize].key, key);
-		// The stale bucket, if it holds anything, holds a different key: nothing was written
-		// through the pre-growth index.
-		let stale = summary.buckets[stale_bucket];
-		assert!(
-			stale == EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET
-				|| summary.entries[stale as usize].key != key
-		);
-		assert!(
-			summary.matches(key, key + 1),
-			"probe finds the key with a differing value"
-		);
-	}
-
-	// ADR 588, empty table: the first insert walks nothing before growth and exactly once after.
-	#[test]
-	fn adr588_the_first_insert_walks_once_after_its_allocation() {
-		let cap = 1024 * 1024;
-		let mut summary = NeqExistenceSummary::new();
-		assert!(
-			summary.probe_with::<false>(7, &mut 0).is_none(),
-			"no buckets, no walk"
-		);
-		summary.insert(7, 70, 0, cap).expect("first insert");
-		assert_eq!(
-			summary.walk_count, 1,
-			"one actual walk: the probe after allocation"
-		);
-		assert_eq!(summary.entries.len(), 1);
-		let bucket = summary.find_bucket(7).unwrap();
-		assert_eq!(summary.entries[summary.buckets[bucket] as usize].key, 7);
-		let mut instrument = InsertInstrument::new();
-		let mut counted = NeqExistenceSummary::new();
-		counted
-			.insert_with::<true>(7, 70, 0, cap, &mut instrument)
-			.expect("instrumented first insert");
-		assert_eq!(instrument.counters.lookups, 1);
-		assert_eq!(instrument.counters.empty_table_lookups, 1);
-		assert_eq!(instrument.counters.growth_reprobes, 1);
-		assert_eq!(instrument.counters.appended, 1);
-		assert_eq!(
-			counted.walk_count,
-			instrument.counters.lookups - instrument.counters.empty_table_lookups
-				+ instrument.counters.growth_reprobes
-		);
-	}
-
-	// ADR 588, existing key: found on the single walk, observed, not appended, and still found
-	// after a later growth.
-	#[test]
-	fn adr588_an_existing_key_is_found_on_one_walk_and_survives_growth() {
-		let cap = 1024 * 1024;
-		let mut summary = NeqExistenceSummary::new();
-		summary.insert(5, 50, 0, cap).expect("insert");
-		summary.insert(6, 60, 0, cap).expect("insert");
-		let walks_before = summary.walk_count;
-		summary
-			.insert(5, 51, 0, cap)
-			.expect("existing key, differing value");
-		assert_eq!(summary.walk_count - walks_before, 1, "one walk for a hit");
-		assert_eq!(summary.entries.len(), 2, "not appended");
-		assert_eq!(summary.multi_keys, 1, "observed as multi-valued");
-		let limit = NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY as i64;
-		for key in 100..(100 + limit) {
-			summary.insert(key, key, 0, cap).expect("force growth");
-		}
-		assert!(summary.buckets.len() > 2 * NEQ_EXISTENCE_SUMMARY_INITIAL_ENTRY_CAPACITY);
-		assert!(summary.matches(5, 52), "still found after growth");
-		assert_eq!(
-			summary
-				.lookup_entry_index(5)
-				.map(|i| summary.entries[i].key),
-			Some(5)
-		);
 	}
 
 	// The compact rows-window encoding is exact, including a thread change and a zero gap.

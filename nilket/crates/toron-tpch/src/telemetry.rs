@@ -356,6 +356,9 @@ pub struct PerfAttempt {
 	/// How the persisted dataset behind this row was verified. `None` means no persisted dataset
 	/// backed the run — an in-memory fixture, or a peer engine row the harness did not load data for.
 	pub dataset_verification: Option<DatasetVerification>,
+	/// The persisted dataset's manifest fingerprint, so a row names the data it ran over and a
+	/// paired driver can bind every arm to one verified dataset. `None` where verification is.
+	pub dataset_manifest_fingerprint: Option<String>,
 }
 
 /// Navigation hint supplied by ADR 581's runtime manifest. Retained for old artifact readers;
@@ -407,6 +410,7 @@ impl PerfAttempt {
 			"join_spill_observations": self.join_spill_observations,
 			"partition_work_concurrency_observations": self.partition_work_concurrency_observations,
 			"dataset_verification": self.dataset_verification.map(DatasetVerification::as_str),
+			"dataset_manifest_fingerprint": self.dataset_manifest_fingerprint,
 		});
 		let object = row.as_object_mut().expect("perf JSON row is an object");
 		let timings = self

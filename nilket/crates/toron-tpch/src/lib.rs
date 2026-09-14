@@ -11998,6 +11998,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 				join_spill_observations: None,
 				partition_work_concurrency_observations: None,
 				dataset_verification: None,
+				dataset_manifest_fingerprint: None,
 			};
 		}
 	};
@@ -12039,6 +12040,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 				join_spill_observations: None,
 				partition_work_concurrency_observations: None,
 				dataset_verification: None,
+				dataset_manifest_fingerprint: None,
 			};
 		}
 	};
@@ -12079,6 +12081,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 			join_spill_observations: None,
 			partition_work_concurrency_observations: None,
 			dataset_verification: None,
+			dataset_manifest_fingerprint: None,
 		};
 	}
 
@@ -12112,6 +12115,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 			join_spill_observations: None,
 			partition_work_concurrency_observations: None,
 			dataset_verification: None,
+			dataset_manifest_fingerprint: None,
 		};
 	}
 
@@ -12144,6 +12148,7 @@ async fn run_rune_q03_perf_query_with_metadata(
 		join_spill_observations: None,
 		partition_work_concurrency_observations: None,
 		dataset_verification: None,
+		dataset_manifest_fingerprint: None,
 	}
 }
 
@@ -12195,6 +12200,7 @@ async fn run_perf_query_with_tables(
 				join_spill_observations: None,
 				partition_work_concurrency_observations: None,
 				dataset_verification: None,
+				dataset_manifest_fingerprint: None,
 			};
 		}
 	};
@@ -12236,6 +12242,7 @@ async fn run_perf_query_with_tables(
 				join_spill_observations: None,
 				partition_work_concurrency_observations: None,
 				dataset_verification: None,
+				dataset_manifest_fingerprint: None,
 			};
 		}
 	};
@@ -12275,6 +12282,7 @@ async fn run_perf_query_with_tables(
 			execution.partition_work_concurrency_observations,
 		),
 		dataset_verification: None,
+		dataset_manifest_fingerprint: None,
 	}
 }
 
@@ -12327,6 +12335,7 @@ async fn run_perf_query_with_metadata(
 				join_spill_observations: None,
 				partition_work_concurrency_observations: None,
 				dataset_verification: None,
+				dataset_manifest_fingerprint: None,
 			};
 		}
 	};
@@ -12368,6 +12377,7 @@ async fn run_perf_query_with_metadata(
 				join_spill_observations: None,
 				partition_work_concurrency_observations: None,
 				dataset_verification: None,
+				dataset_manifest_fingerprint: None,
 			};
 		}
 	};
@@ -12407,6 +12417,7 @@ async fn run_perf_query_with_metadata(
 			execution.partition_work_concurrency_observations,
 		),
 		dataset_verification: None,
+		dataset_manifest_fingerprint: None,
 	}
 }
 
@@ -12447,6 +12458,7 @@ pub async fn run_perf_query_with_data_source(
 		"parquet" | "persisted" => {
 			let spec = build_persisted_perf_query_spec(query, mode, scale_factor, data_root)?;
 			let dataset_verification = spec.dataset_verification;
+			let dataset_manifest_fingerprint = spec.export.manifest_fingerprint.clone();
 			let mut attempt = run_perf_query_with_metadata(
 				spec.query_id,
 				mode,
@@ -12459,6 +12471,7 @@ pub async fn run_perf_query_with_data_source(
 			)
 			.await;
 			attempt.dataset_verification = Some(dataset_verification);
+			attempt.dataset_manifest_fingerprint = Some(dataset_manifest_fingerprint);
 			Ok(attempt)
 		}
 		other => Err(format!("perf --data-source {other:?} is not supported")),
@@ -12497,6 +12510,7 @@ pub async fn run_rune_perf_query_with_data_source(
 		"parquet" | "persisted" => {
 			let spec = build_persisted_perf_query_spec("q03", mode, scale_factor, data_root)?;
 			let dataset_verification = spec.dataset_verification;
+			let dataset_manifest_fingerprint = spec.export.manifest_fingerprint.clone();
 			let mut attempt = run_rune_q03_perf_query_with_metadata(
 				spec.query_id,
 				mode,
@@ -12508,6 +12522,7 @@ pub async fn run_rune_perf_query_with_data_source(
 			)
 			.await;
 			attempt.dataset_verification = Some(dataset_verification);
+			attempt.dataset_manifest_fingerprint = Some(dataset_manifest_fingerprint);
 			Ok(attempt)
 		}
 		other => Err(format!("perf --data-source {other:?} is not supported")),
@@ -22967,6 +22982,7 @@ mod dataset_verification_provenance {
 			join_spill_observations: None,
 			partition_work_concurrency_observations: None,
 			dataset_verification: None,
+			dataset_manifest_fingerprint: None,
 		};
 
 		assert_eq!(attempt.json_value()["dataset_verification"], Value::Null);
