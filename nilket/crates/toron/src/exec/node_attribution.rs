@@ -2524,6 +2524,19 @@ fn inclusive_lifecycle_receipt_value(
 			Err(error) => return failed(&error),
 		}
 	}
+	// ADR 587's fifth band: each summary's insert child split into its rows windows and the
+	// growth windows nested inside them, with the residual (column checks, batch disposal, loop
+	// overhead) by checked subtraction against the unchanged insert child.
+	for summary in ["semi", "anti"] {
+		let insert_micros = write_bands
+			.get(&format!("{summary}_write_insert_micros"))
+			.and_then(serde_json::Value::as_u64)
+			.expect("write band was just built");
+		match insert_decomposition_band(invocation, summary, insert_micros) {
+			Ok(band) => write_bands.extend(band),
+			Err(error) => return failed(&error),
+		}
+	}
 	let mut receipt = serde_json::json!({
 		"status": "reconciled",
 		"invocation_id": invocation.id,
@@ -2549,6 +2562,74 @@ fn inclusive_lifecycle_receipt_value(
 		.expect("receipt is an object")
 		.extend(write_bands);
 	receipt
+}
+
+/// One summary's insert child split into `insert_rows` (one window per `write_batch`) and
+/// `insert_grow` (one window per doubling, nested), `rows_excluding_grow` and the insert
+/// residual by checked subtraction, and the presence of the windows diagnostic the driver bins
+/// profiler samples against. Growth is exclusive: it is reported inside rows and subtracted.
+fn insert_decomposition_band(
+	invocation: &AggregateInvocation,
+	summary: &str,
+	insert_micros: u64,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+	let mut band = serde_json::Map::new();
+	let term = |name: String| -> Result<(u64, u64), String> {
+		let Some(sample) = invocation
+			.inclusive_lifecycle
+			.iter()
+			.find(|sample| sample.name == name)
+		else {
+			return Err(format!("insert term {name} is missing"));
+		};
+		if sample.error.is_some() {
+			return Err(format!("insert term {name} is failed"));
+		}
+		Ok((sample.micros, sample.calls))
+	};
+	let (rows, rows_windows) = term(format!("{summary}_insert_rows"))?;
+	let (grow, grow_events) = term(format!("{summary}_insert_grow"))?;
+	let rows_excluding_grow = rows
+		.checked_sub(grow)
+		.ok_or_else(|| format!("{summary} growth windows exceed their rows windows"))?;
+	let residual = insert_micros
+		.checked_sub(rows)
+		.ok_or_else(|| format!("{summary} rows windows exceed {summary}_write_insert"))?;
+	band.insert(
+		format!("{summary}_insert_rows_micros"),
+		serde_json::json!(rows),
+	);
+	band.insert(
+		format!("{summary}_insert_rows_windows"),
+		serde_json::json!(rows_windows),
+	);
+	band.insert(
+		format!("{summary}_insert_grow_micros"),
+		serde_json::json!(grow),
+	);
+	band.insert(
+		format!("{summary}_insert_grow_events"),
+		serde_json::json!(grow_events),
+	);
+	band.insert(
+		format!("{summary}_insert_rows_excluding_grow_micros"),
+		serde_json::json!(rows_excluding_grow),
+	);
+	band.insert(
+		format!("{summary}_insert_residual_micros"),
+		serde_json::json!(residual),
+	);
+	let windows_name = format!("{summary}_insert_windows");
+	if !invocation
+		.diagnostics
+		.iter()
+		.any(|entry| entry.name == windows_name && entry.value.is_object())
+	{
+		return Err(format!(
+			"insert windows diagnostic {windows_name} is missing"
+		));
+	}
+	Ok(band)
 }
 
 /// The four write children of one summary, their pass counts, the decoded op list, and the
@@ -3400,6 +3481,150 @@ mod tests {
 			name,
 			value: serde_json::json!(ops),
 		});
+		// ADR 587's band is required whenever the fourth is: rows windows inside the insert
+		// child, growth inside rows. Defaults keep every 586 fixture reconciling.
+		let summary = prefix.trim_end_matches("_write");
+		let insert = micros[3];
+		attach_insert_decomposition(
+			invocation,
+			summary,
+			insert.saturating_sub(insert / 10),
+			insert / 20,
+			2,
+		);
+	}
+
+	fn attach_insert_decomposition(
+		invocation: &mut AggregateInvocation,
+		summary: &str,
+		rows: u64,
+		grow: u64,
+		grow_events: u64,
+	) {
+		for (child, micros, calls) in [
+			("insert_rows", rows, 3u64),
+			("insert_grow", grow, grow_events),
+		] {
+			let name: &'static str = Box::leak(format!("{summary}_{child}").into_boxed_str());
+			invocation
+				.inclusive_lifecycle
+				.retain(|term| term.name != name);
+			invocation.inclusive_lifecycle.push(InclusiveLifecycleTerm {
+				name,
+				calls,
+				micros,
+				error: None,
+			});
+		}
+		let name: &'static str = Box::leak(format!("{summary}_insert_windows").into_boxed_str());
+		invocation.diagnostics.retain(|entry| entry.name != name);
+		invocation.diagnostics.push(InvocationDiagnostic {
+			name,
+			value: serde_json::json!({"pid": 1, "tids": [7], "rows_windows": [], "growth_windows": []}),
+		});
+	}
+
+	#[test]
+	fn adr587_receipt_records_the_fifth_band_with_exclusive_growth() {
+		let mut invocation = adr586_invocation();
+		attach_write_decomposition(
+			&mut invocation,
+			"semi_write",
+			[0, 20, 15, 10],
+			&["project", "exchange"],
+		);
+		attach_write_decomposition(
+			&mut invocation,
+			"anti_write",
+			[5, 10, 10, 10],
+			&["filter", "project", "exchange"],
+		);
+		attach_insert_decomposition(&mut invocation, "semi", 8, 3, 2);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "reconciled");
+		assert_eq!(receipt["semi_insert_rows_micros"], 8);
+		assert_eq!(receipt["semi_insert_rows_windows"], 3);
+		assert_eq!(receipt["semi_insert_grow_micros"], 3);
+		assert_eq!(receipt["semi_insert_grow_events"], 2);
+		assert_eq!(receipt["semi_insert_rows_excluding_grow_micros"], 5);
+		assert_eq!(receipt["semi_insert_residual_micros"], 2, "10 - 8");
+		// The fourth band and the three above it are untouched by the fifth.
+		assert_eq!(receipt["semi_write_residual_micros"], 5);
+		assert_eq!(receipt["runtime_prep_residual_micros"], 20);
+	}
+
+	#[test]
+	fn adr587_receipt_reports_windows_exceeding_their_parent_as_a_defect() {
+		let mut invocation = adr586_invocation();
+		attach_write_decomposition(
+			&mut invocation,
+			"semi_write",
+			[0, 20, 15, 10],
+			&["project", "exchange"],
+		);
+		attach_write_decomposition(
+			&mut invocation,
+			"anti_write",
+			[5, 10, 10, 10],
+			&["filter", "project", "exchange"],
+		);
+		attach_insert_decomposition(&mut invocation, "semi", 11, 3, 2);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "instrument_defect");
+		assert!(
+			receipt["error"]
+				.as_str()
+				.unwrap()
+				.contains("semi rows windows exceed semi_write_insert")
+		);
+
+		let mut invocation = adr586_invocation();
+		attach_write_decomposition(
+			&mut invocation,
+			"semi_write",
+			[0, 20, 15, 10],
+			&["project", "exchange"],
+		);
+		attach_write_decomposition(
+			&mut invocation,
+			"anti_write",
+			[5, 10, 10, 10],
+			&["filter", "project", "exchange"],
+		);
+		attach_insert_decomposition(&mut invocation, "semi", 8, 9, 2);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "instrument_defect");
+		assert!(
+			receipt["error"]
+				.as_str()
+				.unwrap()
+				.contains("semi growth windows exceed their rows windows")
+		);
+
+		let mut invocation = adr586_invocation();
+		attach_write_decomposition(
+			&mut invocation,
+			"semi_write",
+			[0, 20, 15, 10],
+			&["project", "exchange"],
+		);
+		attach_write_decomposition(
+			&mut invocation,
+			"anti_write",
+			[5, 10, 10, 10],
+			&["filter", "project", "exchange"],
+		);
+		invocation
+			.diagnostics
+			.retain(|entry| entry.name != "anti_insert_windows");
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "instrument_defect");
+		assert!(
+			receipt["error"]
+				.as_str()
+				.unwrap()
+				.contains("anti_insert_windows is missing")
+		);
 	}
 
 	fn adr586_invocation() -> AggregateInvocation {

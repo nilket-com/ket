@@ -1,12 +1,14 @@
 # ADR 587 - q21 existence-summary insert decomposition
 
-**Status:** PROPOSED. Successor to ADR 586 at the same sealed ADR 583
-coordinate, on the symbol-bearing `profiling` build profile with its own
-paired baseline. Decomposes the owning child, `semi_write_insert`, into
-growth, the row loop, and its residual by exact ledger clocks, counts the row
-loop's paths exactly, and attributes CPU time inside the ledger's windows
-with a time-based sampling profiler. No engine route, admission, or writer
-changes under this record; no attribution-only code shaping.
+**Status:** CLOSED. Implemented and measured on source tree
+`d6dcea3d9365b4e9fa5212c411d019022acb6584`; results, including two retained
+rehearsals, are recorded in
+`plans/impl/0587_q21_summary_insert_decomposition_results.md`. The accepted
+profile resolves `semi_insert_rows_excluding_grow` as the sole owner
+(1,122.8 median-scaled ms, 8.75%); growth closes below the floor at 450.5
+ms gross; the build finds a key in 0.036% of lookups and 93% of its
+row-loop CPU is the hash-and-probe class in every pair. No engine route,
+admission, or writer changed.
 
 
 ## Context
@@ -457,19 +459,20 @@ or per key change. It does not decompose `cleanup` or the replay-1 build.
 
 ## Forward
 
-If `insert_grow` owns and clears the floor as gross removable work, the
-successor is a reservation from a row-count or NDV hint, which must price
-the replacement allocation and its first touch, show net execution
-improvement in paired runs, and carry value parity and peak-memory
-accounting. If `insert_rows_excluding_grow` owns,
-the successor is the cut the counts and classes select: removing the second
-walk on a miss if `lookup_found` is near zero and `hash_and_probe`
-dominates, or an order-aware build if the source order makes the table's
-positive lookups unnecessary during the build, either measured for net
-execution improvement in paired runs beside value parity. The repartition
-candidate from ADR 586 stays open at 636.0 ms gross with net unpriced, and
-the same order question governs it: a build that no longer depends on the
-cache would also change what the Exchange is worth. `cleanup` at 573.1 ms
-and `runtime_prep_inner_1` at 1,711.3 ms stay open as their own candidates.
-The sampler-in-windows method, once it has produced one accepted profile,
-is reusable for the next in-drive owner without a new instrument.
+Measured: the row loop outside growth owns 1,122.8 median-scaled ms of the
+semi insert (8.75% of q21's 12,827.1 ms off median), with 907.6 ms beside it
+on the anti; growth is 450.5 and 440.7 ms, below the floor, 94% of it in
+the last three of fifteen doublings. The counters settle the structural
+question: 12,000,000 appends against 4,370 found lookups on the semi, so
+the build confirms absence twice per miss and almost never uses the table
+positively, with 0.74 extra bucket steps per walk. The sampled classes put
+93% of the row loop in hash-and-probe in every pair. The successor is the
+cut the counts select, measured for net execution improvement in paired
+off/on runs beside value parity: the second walk on a miss (bounded by
+roughly half the walks), or an order-aware build that appends a new key
+without a walk, with the hash and load factor as the remaining question.
+The reservation candidate closes on this evidence at 450.5 ms gross.
+`semi_write_repartition` stays open at 613.2 ms gross with net unpriced,
+governed by the same order question. `cleanup` at 567.3 ms and
+`runtime_prep_inner_1` at 1,654.0 ms stay open as their own candidates. The
+windowed sampler is now an instrument the next in-drive owner can reuse.

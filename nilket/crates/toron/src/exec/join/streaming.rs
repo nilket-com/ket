@@ -1576,6 +1576,7 @@ impl NeqExistenceSummary {
 		}
 	}
 
+	#[cfg(test)]
 	fn insert(
 		&mut self,
 
@@ -1587,17 +1588,54 @@ impl NeqExistenceSummary {
 
 		cap: u64,
 	) -> Result<(), ExecutionError> {
+		self.insert_with::<false>(
+			key,
+			value,
+			baseline_bytes,
+			cap,
+			&mut InsertInstrument::default(),
+		)
+	}
+
+	/// The row path, generic over instrumentation. `INSTRUMENTED = false` is the loop as it
+	/// exists for every unprofiled run: the instrument argument is untouched and folds away.
+	/// `INSTRUMENTED = true` counts each path exactly and brackets growth in a window; it is
+	/// compiled only into the profiled summary build and never reads a clock per row.
+	fn insert_with<const INSTRUMENTED: bool>(
+		&mut self,
+
+		key: i64,
+
+		value: i64,
+
+		baseline_bytes: u64,
+
+		cap: u64,
+
+		instrument: &mut InsertInstrument,
+	) -> Result<(), ExecutionError> {
 		self.input_rows = self.input_rows.saturating_add(1);
 
 		if let Some((last_key, entry_index)) = self.last_entry
 			&& last_key == key
 		{
+			if INSTRUMENTED {
+				instrument.counters.cache_hits += 1;
+			}
 			self.observe_value(entry_index, value);
 
 			return Ok(());
 		}
 
-		if let Some(entry_index) = self.lookup_entry_index(key) {
+		if INSTRUMENTED {
+			instrument.counters.lookups += 1;
+		}
+		let mut steps = 0u64;
+		if let Some(entry_index) = self.lookup_entry_index_with::<INSTRUMENTED>(key, &mut steps) {
+			if INSTRUMENTED {
+				instrument.counters.lookup_found += 1;
+				instrument.counters.probe_steps += steps;
+			}
 			self.observe_value(entry_index, value);
 
 			self.last_entry = Some((key, entry_index));
@@ -1606,7 +1644,14 @@ impl NeqExistenceSummary {
 		}
 
 		if self.entries.len() == self.entry_limit {
-			self.grow(baseline_bytes, cap)?;
+			if INSTRUMENTED {
+				let started = steady_clock_ns();
+				self.grow(baseline_bytes, cap)?;
+				let ended = steady_clock_ns();
+				instrument.record_growth(started, ended, self.entry_limit)?;
+			} else {
+				self.grow(baseline_bytes, cap)?;
+			}
 		}
 
 		let entry_index =
@@ -1614,7 +1659,21 @@ impl NeqExistenceSummary {
 				message: "recognized Neq existence summary exceeds u32 entry range".to_string(),
 			})?;
 
-		let bucket = self.find_bucket(key)?;
+		let bucket = if INSTRUMENTED {
+			let mut append_steps = 0u64;
+			let bucket = Self::find_bucket_in_with::<true>(
+				&self.hasher,
+				&self.buckets,
+				&self.entries,
+				key,
+				&mut append_steps,
+			)?;
+			instrument.counters.appended += 1;
+			instrument.counters.probe_steps += steps + append_steps;
+			bucket
+		} else {
+			self.find_bucket(key)?
+		};
 
 		let capacity_before = self.entries.capacity();
 
@@ -1716,6 +1775,34 @@ impl NeqExistenceSummary {
 
 		cap: u64,
 	) -> Result<(), ExecutionError> {
+		self.write_batch_with::<false>(
+			batch,
+			existence_key,
+			existence_value,
+			baseline_bytes,
+			cap,
+			&mut InsertInstrument::default(),
+		)
+	}
+
+	/// `write_batch`, generic over instrumentation. The instrumented loop opens one rows window
+	/// per call around the row loop only, after the column checks and before the batch is
+	/// dropped by the caller, so the window sits strictly inside the caller's insert clock.
+	fn write_batch_with<const INSTRUMENTED: bool>(
+		&mut self,
+
+		batch: &RecordBatch,
+
+		existence_key: ColumnOrdinal,
+
+		existence_value: ColumnOrdinal,
+
+		baseline_bytes: u64,
+
+		cap: u64,
+
+		instrument: &mut InsertInstrument,
+	) -> Result<(), ExecutionError> {
 		let keys = batch
 			.columns()
 			.get(existence_key.0 as usize)
@@ -1747,8 +1834,30 @@ impl NeqExistenceSummary {
 			});
 		}
 
-		for row in 0..batch.num_rows() {
-			self.insert(keys.value(row), values.value(row), baseline_bytes, cap)?;
+		if INSTRUMENTED {
+			let started = steady_clock_ns();
+			let growth_before = instrument.growth.len();
+			for row in 0..batch.num_rows() {
+				self.insert_with::<true>(
+					keys.value(row),
+					values.value(row),
+					baseline_bytes,
+					cap,
+					instrument,
+				)?;
+			}
+			let ended = steady_clock_ns();
+			instrument.record_rows_window(started, ended, growth_before)?;
+		} else {
+			for row in 0..batch.num_rows() {
+				self.insert_with::<false>(
+					keys.value(row),
+					values.value(row),
+					baseline_bytes,
+					cap,
+					instrument,
+				)?;
+			}
 		}
 
 		Ok(())
@@ -1907,11 +2016,26 @@ impl NeqExistenceSummary {
 	}
 
 	fn lookup_entry_index(&self, key: i64) -> Option<usize> {
+		self.lookup_entry_index_with::<false>(key, &mut 0)
+	}
+
+	fn lookup_entry_index_with<const COUNT_STEPS: bool>(
+		&self,
+		key: i64,
+		steps: &mut u64,
+	) -> Option<usize> {
 		if self.buckets.is_empty() {
 			return None;
 		}
 
-		let bucket = self.find_bucket(key).ok()?;
+		let bucket = Self::find_bucket_in_with::<COUNT_STEPS>(
+			&self.hasher,
+			&self.buckets,
+			&self.entries,
+			key,
+			steps,
+		)
+		.ok()?;
 
 		let entry_index = self.buckets[bucket];
 
@@ -1930,6 +2054,22 @@ impl NeqExistenceSummary {
 		entries: &[NeqExistenceSummaryEntry],
 
 		key: i64,
+	) -> Result<usize, ExecutionError> {
+		Self::find_bucket_in_with::<false>(hasher, buckets, entries, key, &mut 0)
+	}
+
+	/// The linear probe. `COUNT_STEPS = false` is the walk as it exists for every unprofiled
+	/// run; `COUNT_STEPS = true` also counts the bucket steps beyond the home bucket.
+	fn find_bucket_in_with<const COUNT_STEPS: bool>(
+		hasher: &RandomState,
+
+		buckets: &[u32],
+
+		entries: &[NeqExistenceSummaryEntry],
+
+		key: i64,
+
+		steps: &mut u64,
 	) -> Result<usize, ExecutionError> {
 		if buckets.is_empty() || !buckets.len().is_power_of_two() {
 			return Err(ExecutionError::Kernel {
@@ -1950,6 +2090,9 @@ impl NeqExistenceSummary {
 				return Ok(bucket);
 			}
 
+			if COUNT_STEPS {
+				*steps += 1;
+			}
 			bucket = (bucket + 1) & (buckets.len() - 1);
 		}
 
@@ -2984,6 +3127,9 @@ pub(in crate::exec) struct ExistenceSummaryLifecycleTerms {
 	pub(in crate::exec) repartition: &'static str,
 	pub(in crate::exec) insert: &'static str,
 	pub(in crate::exec) ops: &'static str,
+	pub(in crate::exec) insert_rows: &'static str,
+	pub(in crate::exec) insert_grow: &'static str,
+	pub(in crate::exec) insert_windows: &'static str,
 }
 
 impl ExistenceSummaryLifecycleTerms {
@@ -2995,6 +3141,9 @@ impl ExistenceSummaryLifecycleTerms {
 		repartition: "semi_write_repartition",
 		insert: "semi_write_insert",
 		ops: "semi_write_ops",
+		insert_rows: "semi_insert_rows",
+		insert_grow: "semi_insert_grow",
+		insert_windows: "semi_insert_windows",
 	};
 
 	pub(in crate::exec) const ANTI: Self = Self {
@@ -3005,6 +3154,9 @@ impl ExistenceSummaryLifecycleTerms {
 		repartition: "anti_write_repartition",
 		insert: "anti_write_insert",
 		ops: "anti_write_ops",
+		insert_rows: "anti_insert_rows",
+		insert_grow: "anti_insert_grow",
+		insert_windows: "anti_insert_windows",
 	};
 }
 
@@ -3035,6 +3187,268 @@ impl ExistenceWriteChild {
 	}
 }
 
+/// `CLOCK_MONOTONIC` in integer nanoseconds: the clock `Instant` reads on Linux and the clock
+/// the sampling profiler is asked to stamp its samples with, so a window recorded here and a
+/// sample recorded there sit on one axis.
+pub(in crate::exec) fn steady_clock_ns() -> u64 {
+	let mut spec = libc::timespec {
+		tv_sec: 0,
+		tv_nsec: 0,
+	};
+	// SAFETY: `clock_gettime` writes a `timespec` into the pointer it is given; the pointer is
+	// to a live local and CLOCK_MONOTONIC is always available on Linux.
+	let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut spec) };
+	if rc != 0 {
+		return 0;
+	}
+	(spec.tv_sec as u64)
+		.saturating_mul(1_000_000_000)
+		.saturating_add(spec.tv_nsec as u64)
+}
+
+fn current_thread_id() -> u64 {
+	// SAFETY: `gettid` takes no arguments and cannot fail.
+	unsafe { libc::gettid() as u64 }
+}
+
+/// Exact per-row path counts for one summary build, accumulated only by the instrumented loop.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(in crate::exec) struct InsertCounters {
+	pub(in crate::exec) cache_hits: u64,
+	pub(in crate::exec) lookups: u64,
+	pub(in crate::exec) lookup_found: u64,
+	pub(in crate::exec) appended: u64,
+	pub(in crate::exec) probe_steps: u64,
+}
+
+/// One half-open `[start_ns, end_ns)` window on the thread that opened it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::exec) struct InsertWindow {
+	pub(in crate::exec) start_ns: u64,
+	pub(in crate::exec) end_ns: u64,
+	pub(in crate::exec) tid: u64,
+}
+
+/// One growth event: its window, its ordinal, and the entry capacity it reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::exec) struct InsertGrowth {
+	pub(in crate::exec) window: InsertWindow,
+	pub(in crate::exec) ordinal: u64,
+	pub(in crate::exec) entry_capacity: u64,
+}
+
+/// The insert decomposition for one summary: rows windows (one per `write_batch`), growth
+/// windows nested inside them, exact counters, and the micros the windows sum to. Nothing here
+/// is read per row except the counters; the windows are two clock reads per batch and two per
+/// growth event.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub(in crate::exec) struct InsertInstrument {
+	pub(in crate::exec) pid: u64,
+	pub(in crate::exec) rows: Vec<InsertWindow>,
+	pub(in crate::exec) growth: Vec<InsertGrowth>,
+	pub(in crate::exec) counters: InsertCounters,
+	pub(in crate::exec) rows_micros: u64,
+	pub(in crate::exec) grow_micros: u64,
+}
+
+impl InsertInstrument {
+	pub(in crate::exec) fn new() -> Self {
+		Self {
+			pid: std::process::id() as u64,
+			..Self::default()
+		}
+	}
+
+	fn record_rows_window(
+		&mut self,
+		start_ns: u64,
+		end_ns: u64,
+		growth_before: usize,
+	) -> Result<(), ExecutionError> {
+		let tid = current_thread_id();
+		if end_ns < start_ns {
+			return Err(ExecutionError::Kernel {
+				message: "recognized Neq summary rows window ended before it started".to_string(),
+			});
+		}
+		// A growth window opened inside this batch belongs to this rows window and must sit on
+		// the same thread; anything else is an instrument defect, not a measurement.
+		for growth in &self.growth[growth_before..] {
+			if growth.window.tid != tid
+				|| growth.window.start_ns < start_ns
+				|| growth.window.end_ns > end_ns
+			{
+				return Err(ExecutionError::Kernel {
+					message: "recognized Neq summary growth window escaped its rows window"
+						.to_string(),
+				});
+			}
+		}
+		self.rows.push(InsertWindow {
+			start_ns,
+			end_ns,
+			tid,
+		});
+		self.rows_micros = self
+			.rows_micros
+			.checked_add((end_ns - start_ns) / 1_000)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "recognized Neq summary rows window sum overflowed".to_string(),
+			})?;
+		Ok(())
+	}
+
+	fn record_growth(
+		&mut self,
+		start_ns: u64,
+		end_ns: u64,
+		entry_capacity: usize,
+	) -> Result<(), ExecutionError> {
+		if end_ns < start_ns {
+			return Err(ExecutionError::Kernel {
+				message: "recognized Neq summary growth window ended before it started".to_string(),
+			});
+		}
+		let ordinal = self.growth.len() as u64 + 1;
+		self.growth.push(InsertGrowth {
+			window: InsertWindow {
+				start_ns,
+				end_ns,
+				tid: current_thread_id(),
+			},
+			ordinal,
+			entry_capacity: entry_capacity as u64,
+		});
+		self.grow_micros = self
+			.grow_micros
+			.checked_add((end_ns - start_ns) / 1_000)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "recognized Neq summary growth window sum overflowed".to_string(),
+			})?;
+		Ok(())
+	}
+
+	pub(in crate::exec) fn thread_ids(&self) -> Vec<u64> {
+		let mut tids = self
+			.rows
+			.iter()
+			.map(|window| window.tid)
+			.collect::<Vec<_>>();
+		tids.sort_unstable();
+		tids.dedup();
+		tids
+	}
+
+	/// The rows windows as one compact string, because the node profile is written inside the
+	/// perf row's `execute_ms` and tens of thousands of pretty-printed arrays cost more than ADR
+	/// 507's 10 ms outer boundary allows. Format: `<tid>@<start_ns>:<gap>+<duration>;...` where
+	/// each window's `gap` is measured from the previous window's end (the first from `start_ns`)
+	/// and `duration` is `end - start`; a thread change starts a new `<tid>@<start_ns>:` segment
+	/// separated by `|`. Every value is an exact integer; nothing is rounded.
+	pub(in crate::exec) fn encode_rows_windows(windows: &[InsertWindow]) -> String {
+		let mut text = String::with_capacity(windows.len() * 14);
+		let mut previous_end: Option<(u64, u64)> = None;
+		for window in windows {
+			match previous_end {
+				Some((tid, end)) if tid == window.tid => {
+					text.push(';');
+					text.push_str(&window.start_ns.saturating_sub(end).to_string());
+				}
+				Some(_) => {
+					text.push('|');
+					text.push_str(&format!("{}@{}:0", window.tid, window.start_ns));
+				}
+				None => {
+					text.push_str(&format!("{}@{}:0", window.tid, window.start_ns));
+				}
+			}
+			text.push('+');
+			text.push_str(&window.end_ns.saturating_sub(window.start_ns).to_string());
+			previous_end = Some((window.tid, window.end_ns));
+		}
+		text
+	}
+
+	/// The exact inverse of `encode_rows_windows`.
+	pub(in crate::exec) fn decode_rows_windows(text: &str) -> Result<Vec<InsertWindow>, String> {
+		let mut windows = Vec::new();
+		if text.is_empty() {
+			return Ok(windows);
+		}
+		for segment in text.split('|') {
+			let (head, body) = segment
+				.split_once(':')
+				.ok_or_else(|| "rows windows segment lacks ':'".to_string())?;
+			let (tid, start) = head
+				.split_once('@')
+				.ok_or_else(|| "rows windows segment lacks '@'".to_string())?;
+			let tid = tid
+				.parse::<u64>()
+				.map_err(|_| "rows windows tid".to_string())?;
+			let mut cursor = start
+				.parse::<u64>()
+				.map_err(|_| "rows windows start".to_string())?;
+			for item in body.split(';') {
+				let (gap, duration) = item
+					.split_once('+')
+					.ok_or_else(|| "rows windows item lacks '+'".to_string())?;
+				let gap = gap
+					.parse::<u64>()
+					.map_err(|_| "rows windows gap".to_string())?;
+				let duration = duration
+					.parse::<u64>()
+					.map_err(|_| "rows windows duration".to_string())?;
+				let start_ns = cursor
+					.checked_add(gap)
+					.ok_or_else(|| "rows windows overflow".to_string())?;
+				let end_ns = start_ns
+					.checked_add(duration)
+					.ok_or_else(|| "rows windows overflow".to_string())?;
+				windows.push(InsertWindow {
+					start_ns,
+					end_ns,
+					tid,
+				});
+				cursor = end_ns;
+			}
+		}
+		Ok(windows)
+	}
+
+	/// The diagnostic the receipt carries beside the summed terms: every window with its thread,
+	/// every growth event with its capacity, and the exact counters.
+	pub(in crate::exec) fn diagnostic_value(
+		&self,
+		key_count_hint: Option<usize>,
+		entries_final: usize,
+		entry_capacity_final: usize,
+		buckets_final: usize,
+	) -> serde_json::Value {
+		serde_json::json!({
+			"pid": self.pid,
+			"tids": self.thread_ids(),
+			"rows_windows_encoding": "tid@start_ns:gap+duration;... | segments per thread",
+			"rows_windows": Self::encode_rows_windows(&self.rows),
+			"rows_window_count": self.rows.len(),
+			"growth_windows": self.growth.iter().map(|g| serde_json::json!([g.window.start_ns, g.window.end_ns, g.window.tid, g.ordinal, g.entry_capacity])).collect::<Vec<_>>(),
+			"counters": {
+				"cache_hits": self.counters.cache_hits,
+				"lookups": self.counters.lookups,
+				"lookup_found": self.counters.lookup_found,
+				"appended": self.counters.appended,
+				"probe_steps": self.counters.probe_steps,
+				"grow_events": self.growth.len(),
+			},
+			"key_count_hint": key_count_hint,
+			"entries_final": entries_final,
+			"entry_capacity_final": entry_capacity_final,
+			"buckets_final": buckets_final,
+			"rows_micros": self.rows_micros,
+			"grow_micros": self.grow_micros,
+		})
+	}
+}
+
 /// The write half's decomposition, clocked only when a caller asks for it: the off arm of a paired
 /// measurement never constructs one, so its write loop runs exactly as it did before the children
 /// existed. `write_micros` is the unconditional write half copied in at the end so a reader can
@@ -3047,6 +3461,7 @@ pub(in crate::exec) struct ExistenceWriteClocks {
 	pub(in crate::exec) insert: ExistenceWriteChild,
 	pub(in crate::exec) ops: Vec<&'static str>,
 	pub(in crate::exec) write_micros: u64,
+	pub(in crate::exec) insert_instrument: InsertInstrument,
 }
 
 impl ExistenceWriteClocks {
@@ -23033,7 +23448,10 @@ impl Executor {
 
 		// The children are diagnostic-only: an unprofiled arm carries no handle and no caller
 		// clocks, so it never reads a child clock and its loop is the one the off arm measures.
-		let mut handle_clocks = stage_handle.map(|_| ExistenceWriteClocks::default());
+		let mut handle_clocks = stage_handle.map(|_| ExistenceWriteClocks {
+			insert_instrument: InsertInstrument::new(),
+			..ExistenceWriteClocks::default()
+		});
 		let mut clocks = clocks.or(handle_clocks.as_mut());
 		if let Some(clocks) = clocks.as_deref_mut() {
 			clocks.ops = ops.iter().map(StreamingExistenceOp::kind_name).collect();
@@ -23137,14 +23555,30 @@ impl Executor {
 				.as_ref()
 				.filter(|_| !batches.is_empty())
 				.map(|_| Instant::now());
-			for batch in batches {
-				summary.write_batch(
-					&batch,
-					columns.existence_key,
-					columns.existence_value,
-					baseline_bytes,
-					cap,
-				)?;
+			match clocks.as_deref_mut() {
+				Some(clocks) => {
+					for batch in batches {
+						summary.write_batch_with::<true>(
+							&batch,
+							columns.existence_key,
+							columns.existence_value,
+							baseline_bytes,
+							cap,
+							&mut clocks.insert_instrument,
+						)?;
+					}
+				}
+				None => {
+					for batch in batches {
+						summary.write_batch(
+							&batch,
+							columns.existence_key,
+							columns.existence_value,
+							baseline_bytes,
+							cap,
+						)?;
+					}
+				}
 			}
 			if let (Some(clocks), Some(started)) = (clocks.as_deref_mut(), insert_started) {
 				clocks.insert.add(started)?;
@@ -23195,6 +23629,29 @@ impl Executor {
 					handle,
 					terms.ops,
 					serde_json::json!(clocks.ops),
+				);
+				let instrument = &clocks.insert_instrument;
+				node_attribution::record_inclusive_lifecycle_micros(
+					handle,
+					terms.insert_rows,
+					instrument.rows_micros,
+					instrument.rows.len() as u64,
+				)?;
+				node_attribution::record_inclusive_lifecycle_micros(
+					handle,
+					terms.insert_grow,
+					instrument.grow_micros,
+					instrument.growth.len() as u64,
+				)?;
+				node_attribution::record_invocation_diagnostic(
+					handle,
+					terms.insert_windows,
+					instrument.diagnostic_value(
+						columns.key_count_hint,
+						summary.entries.len(),
+						summary.entry_limit,
+						summary.buckets.len(),
+					),
 				);
 			}
 		}
@@ -32255,6 +32712,277 @@ mod tests {
 		assert_eq!(clocks.insert, ExistenceWriteChild::default());
 		assert_eq!(summary.input_rows, 0);
 		assert!(adr586_children_total(&clocks) <= clocks.write_micros);
+	}
+
+	fn adr587_batch(keys: &[i64]) -> RecordBatch {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+		]));
+		RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(keys.to_vec())),
+				Arc::new(Int64Array::from(
+					keys.iter().map(|key| key * 10).collect::<Vec<_>>(),
+				)),
+			],
+		)
+		.expect("batch")
+	}
+
+	fn adr587_summary_facts(
+		summary: &NeqExistenceSummary,
+	) -> (Vec<(i64, i64)>, Vec<u32>, Vec<u64>, u64, u64) {
+		(
+			summary
+				.entries
+				.iter()
+				.map(|entry| (entry.key, entry.representative))
+				.collect(),
+			summary.buckets.clone(),
+			summary.multi.clone(),
+			summary.input_rows,
+			summary.multi_keys,
+		)
+	}
+
+	// The uninstrumented and instrumented loops build the same summary from the same batches;
+	// only the second carries counters and windows.
+	#[test]
+	fn adr587_instrumented_loop_builds_the_same_summary_and_only_it_counts() {
+		let batches = [adr587_batch(&[1, 1, 2, 2, 2, 3, 1]), adr587_batch(&[1, 4])];
+		let cap = 1024 * 1024;
+		let mut plain = NeqExistenceSummary::new();
+		let mut plain_instrument = InsertInstrument::default();
+		let mut counted = NeqExistenceSummary::new();
+		let mut instrument = InsertInstrument::new();
+		for batch in &batches {
+			plain
+				.write_batch_with::<false>(
+					batch,
+					ColumnOrdinal(0),
+					ColumnOrdinal(1),
+					0,
+					cap,
+					&mut plain_instrument,
+				)
+				.expect("plain write");
+			counted
+				.write_batch_with::<true>(
+					batch,
+					ColumnOrdinal(0),
+					ColumnOrdinal(1),
+					0,
+					cap,
+					&mut instrument,
+				)
+				.expect("instrumented write");
+		}
+		// The plain path was handed an instrument too and never touched it.
+		assert_eq!(plain_instrument, InsertInstrument::default());
+		assert_eq!(
+			adr587_summary_facts(&plain).0,
+			adr587_summary_facts(&counted).0,
+			"entries"
+		);
+		assert_eq!(
+			adr587_summary_facts(&plain).3,
+			adr587_summary_facts(&counted).3,
+			"rows"
+		);
+		assert_eq!(
+			adr587_summary_facts(&plain).4,
+			adr587_summary_facts(&counted).4,
+			"multi keys"
+		);
+		assert_eq!(plain.entries.len(), 4);
+
+		// Hand-computed: rows 1,1,2,2,2,3,1 | 1,4. Hits: the second 1, the second and third
+		// 2, and the 1 that opens batch two (last key was 1). Lookups: 1, 2, 3 (new), 1
+		// (found), 4 (new).
+		let counters = instrument.counters;
+		assert_eq!(counters.cache_hits, 4);
+		assert_eq!(counters.lookups, 5);
+		assert_eq!(counters.lookup_found, 1);
+		assert_eq!(counters.appended, 4);
+		assert!(counters.probe_steps < 100, "steps {}", counters.probe_steps);
+		assert_eq!(instrument.rows.len(), 2, "one rows window per batch");
+		assert_eq!(
+			instrument.growth.len(),
+			1,
+			"the first insert grows from empty"
+		);
+		assert_eq!(instrument.growth[0].ordinal, 1);
+		assert_eq!(instrument.growth[0].entry_capacity, 1024);
+		assert_eq!(instrument.pid, std::process::id() as u64);
+		assert_eq!(instrument.thread_ids().len(), 1);
+	}
+
+	// Growth windows are nested inside the rows window of the batch that grew, on the same
+	// thread, with the capacity each doubling reached; rows windows are ordered and disjoint;
+	// the summed terms equal the per-window floors.
+	#[test]
+	fn adr587_growth_windows_nest_in_rows_windows_with_their_capacities() {
+		let cap = 1024 * 1024;
+		let mut summary = NeqExistenceSummary::new();
+		let mut instrument = InsertInstrument::new();
+		let batches = [
+			adr587_batch(&(0..1500).collect::<Vec<i64>>()),
+			adr587_batch(&(1500..2500).collect::<Vec<i64>>()),
+		];
+		for batch in &batches {
+			summary
+				.write_batch_with::<true>(
+					batch,
+					ColumnOrdinal(0),
+					ColumnOrdinal(1),
+					0,
+					cap,
+					&mut instrument,
+				)
+				.expect("instrumented write");
+		}
+		assert_eq!(instrument.rows.len(), 2);
+		assert!(
+			instrument.rows[0].end_ns <= instrument.rows[1].start_ns,
+			"rows windows disjoint and ordered"
+		);
+		let capacities = instrument
+			.growth
+			.iter()
+			.map(|growth| growth.entry_capacity)
+			.collect::<Vec<_>>();
+		assert_eq!(capacities, vec![1024, 2048, 4096]);
+		assert_eq!(
+			instrument
+				.growth
+				.iter()
+				.map(|g| g.ordinal)
+				.collect::<Vec<_>>(),
+			vec![1, 2, 3]
+		);
+		// 1,024 and 2,048 are reached inside batch one; 4,096 inside batch two.
+		let inside = |growth: &InsertGrowth, rows: &InsertWindow| {
+			growth.window.tid == rows.tid
+				&& growth.window.start_ns >= rows.start_ns
+				&& growth.window.end_ns <= rows.end_ns
+		};
+		assert!(inside(&instrument.growth[0], &instrument.rows[0]));
+		assert!(inside(&instrument.growth[1], &instrument.rows[0]));
+		assert!(inside(&instrument.growth[2], &instrument.rows[1]));
+		let rows_sum: u64 = instrument
+			.rows
+			.iter()
+			.map(|w| (w.end_ns - w.start_ns) / 1_000)
+			.sum();
+		let grow_sum: u64 = instrument
+			.growth
+			.iter()
+			.map(|g| (g.window.end_ns - g.window.start_ns) / 1_000)
+			.sum();
+		assert_eq!(instrument.rows_micros, rows_sum);
+		assert_eq!(instrument.grow_micros, grow_sum);
+		assert!(instrument.grow_micros <= instrument.rows_micros);
+		assert_eq!(instrument.counters.appended, 2500);
+		assert_eq!(instrument.counters.cache_hits, 0);
+		assert_eq!(instrument.counters.lookup_found, 0);
+		let value = instrument.diagnostic_value(
+			None,
+			summary.entries.len(),
+			summary.entry_limit,
+			summary.buckets.len(),
+		);
+		assert_eq!(value["counters"]["grow_events"], 3);
+		assert_eq!(value["entry_capacity_final"], 4096);
+		assert_eq!(value["rows_window_count"], 2);
+		let decoded =
+			InsertInstrument::decode_rows_windows(value["rows_windows"].as_str().unwrap())
+				.expect("decode");
+		assert_eq!(decoded, instrument.rows, "the encoding is exact");
+		assert_eq!(value["growth_windows"][2][4], 4096);
+	}
+
+	// The compact rows-window encoding is exact, including a thread change and a zero gap.
+	#[test]
+	fn adr587_rows_windows_encoding_round_trips_exactly() {
+		let windows = vec![
+			InsertWindow {
+				start_ns: 1_000,
+				end_ns: 2_000,
+				tid: 7,
+			},
+			InsertWindow {
+				start_ns: 2_000,
+				end_ns: 2_500,
+				tid: 7,
+			},
+			InsertWindow {
+				start_ns: 9_000,
+				end_ns: 9_001,
+				tid: 7,
+			},
+			InsertWindow {
+				start_ns: 10_000,
+				end_ns: 12_000,
+				tid: 8,
+			},
+			InsertWindow {
+				start_ns: 12_010,
+				end_ns: 12_020,
+				tid: 8,
+			},
+		];
+		let text = InsertInstrument::encode_rows_windows(&windows);
+		assert_eq!(text, "7@1000:0+1000;0+500;6500+1|8@10000:0+2000;10+10");
+		assert_eq!(
+			InsertInstrument::decode_rows_windows(&text).unwrap(),
+			windows
+		);
+		assert_eq!(
+			InsertInstrument::decode_rows_windows("").unwrap(),
+			Vec::<InsertWindow>::new()
+		);
+		assert!(InsertInstrument::decode_rows_windows("7@1000:0-5").is_err());
+	}
+
+	// A rows window that closes before it opens, or a growth window that escapes its rows
+	// window, is an instrument defect rather than a measurement.
+	#[test]
+	fn adr587_windows_refuse_to_escape_their_parent() {
+		let mut instrument = InsertInstrument::new();
+		let error = instrument
+			.record_rows_window(10, 5, 0)
+			.expect_err("reversed window");
+		assert!(error.to_string().contains("ended before it started"));
+		instrument.record_growth(100, 200, 1024).expect("growth");
+		let error = instrument
+			.record_rows_window(150, 300, 0)
+			.expect_err("growth started before the rows window");
+		assert!(error.to_string().contains("escaped its rows window"));
+		instrument
+			.record_rows_window(50, 300, 0)
+			.expect("enclosing rows window");
+		assert_eq!(instrument.rows_micros, 0, "250 ns floors to zero micros");
+	}
+
+	// The write loop hands its instrument to the summary: rows windows appear once per source
+	// batch beside ADR 586's insert pass count.
+	#[tokio::test]
+	async fn adr587_write_loop_publishes_one_rows_window_per_source_batch() {
+		let (source, schema, _filter, project) = adr586_existence_fixture(3, 5, i64::MAX);
+		let scan = test_scan_plan_with_first_field_key(TableId(86), schema.clone(), 86);
+		let plan = ExecutionPlan::Project {
+			input: Box::new(scan),
+			exprs: project,
+			output_schema: schema.clone(),
+		};
+		let (clocks, summary) = adr586_write_with_clocks(source, schema, &plan).await;
+		assert_eq!(clocks.insert.passes, 3);
+		assert_eq!(clocks.insert_instrument.rows.len(), 3);
+		assert_eq!(clocks.insert_instrument.counters.appended, 15);
+		assert_eq!(summary.input_rows, 15);
+		assert!(clocks.insert_instrument.rows_micros <= clocks.insert.micros);
 	}
 
 	// Without a caller's clocks and without a stage handle the loop runs the write half as ADR 585

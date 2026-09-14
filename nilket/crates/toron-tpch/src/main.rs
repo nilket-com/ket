@@ -116,6 +116,8 @@ async fn run() -> ExitCode {
 		"adr584-q21-attribution" => adr584_q21_attribution_command(&args),
 		"adr585-q21-decomposition" => adr585_q21_decomposition_command(&args),
 		"adr586-q21-semi-write" => adr586_q21_semi_write_command(&args),
+		"adr587-q21-insert" => adr587_q21_insert_command(&args),
+		"adr587-selfcheck-spin" => adr587_selfcheck_spin_command(),
 		"adr449-gate-zero" => adr449_gate_zero_command(&args),
 		"adr450-scale-ladder" => adr450_scale_ladder_command(&args),
 		"adr448-capability" => {
@@ -1407,6 +1409,53 @@ const ADR586_ADR585_REFERENCE_MEDIANS: [(&str, f64); 13] = [
 	("outer_residual", 0.2),
 ];
 
+const ADR587_TAGS: LifecyclePairTags = LifecyclePairTags {
+	label: "ADR 587",
+	arm: "adr587_arm",
+	pair: "adr587_pair",
+	position: "adr587_pair_position",
+};
+const ADR587_ADR586_EXECUTABLE: &str =
+	"03daafed26923778cc7011512d18bc0d30a43ac19056de004f1a3611ab571ace";
+const ADR587_ADR586_REFERENCE_OFF_MEDIAN_MS: f64 = 13_128.5;
+const ADR587_ADR586_REFERENCE_OFF_RANGE_MS: f64 = 172.2;
+/// ADR 586's accepted semi-write medians, carried for the cross-profile consistency statement.
+const ADR587_ADR586_REFERENCE_SEMI_WRITE_MEDIANS: [(&str, f64); 5] = [
+	("semi_write_insert", 1_610.7),
+	("semi_write_repartition", 636.0),
+	("semi_write_residual", 3.3),
+	("semi_write_filter", 0.0),
+	("semi_write_key_program", 0.0),
+];
+const ADR587_PERF_FREQUENCY_HZ: u32 = 10_000;
+const ADR587_MAX_PARANOID: i64 = 2;
+
+fn adr587_q21_insert_command(args: &[String]) -> ExitCode {
+	match run_adr587_q21_insert(args) {
+		Ok(summary) => {
+			println!("{summary}");
+			ExitCode::SUCCESS
+		}
+		Err(message) => harness_error(&message),
+	}
+}
+
+/// A one-second busy loop for the profiler self-check: the harness sampling itself, so a
+/// recording that loses samples or produces none is found before any query runs.
+fn adr587_selfcheck_spin_command() -> ExitCode {
+	let started = Instant::now();
+	let mut acc = 0u64;
+	while started.elapsed() < std::time::Duration::from_secs(1) {
+		acc = acc
+			.wrapping_mul(6_364_136_223_846_793_005)
+			.wrapping_add(1_442_695_040_888_963_407);
+	}
+	if acc == 0 {
+		eprintln!("spin");
+	}
+	ExitCode::SUCCESS
+}
+
 fn adr586_q21_semi_write_command(args: &[String]) -> ExitCode {
 	match run_adr586_q21_semi_write(args) {
 		Ok(summary) => {
@@ -1768,6 +1817,1328 @@ fn run_adr586_q21_semi_write(args: &[String]) -> Result<serde_json::Value, Strin
 	Ok(summary)
 }
 
+fn run_adr587_q21_insert(args: &[String]) -> Result<serde_json::Value, String> {
+	let mode = flag_value(args, "--mode").unwrap_or("strict");
+	let sf = resolved_sf(args)?;
+	let data_source = flag_value(args, "--data-source").unwrap_or("parquet");
+	let data_dir = data_dir_from_args(args);
+	let output_dir =
+		PathBuf::from(flag_value(args, "--output-dir").unwrap_or("target/tpch/adr587-q21-insert"));
+	if mode != "strict" || sf != 8.0 || !matches!(data_source, "parquet" | "persisted") {
+		return Err(format!(
+			"ADR 587 requires --mode strict --sf 8 --data-source parquet; got mode={mode:?} sf={sf} data_source={data_source:?}"
+		));
+	}
+	if output_dir.exists() {
+		return Err(format!(
+			"ADR 587 requires a fresh output directory; {} already exists",
+			output_dir.display()
+		));
+	}
+	if std::env::var_os("TORON_NODE_ATTRIBUTION_PROFILE_PATH").is_some() {
+		return Err(
+			"ADR 587 parent environment must not set TORON_NODE_ATTRIBUTION_PROFILE_PATH"
+				.to_string(),
+		);
+	}
+	let reference_off_median_ms = flag_value(args, "--reference-off-median-ms")
+		.ok_or_else(|| {
+			"ADR 587 requires --reference-off-median-ms, the ADR 586 unprofiled off median"
+				.to_string()
+		})?
+		.parse::<f64>()
+		.ok()
+		.filter(|value| value.is_finite() && *value > 0.0)
+		.ok_or_else(|| "ADR 587 reference off median must be a positive number".to_string())?;
+	let budget = GaugeBudget::from_environment()?;
+	if budget.memory_per_task != 2_147_483_648
+		|| budget.memory_per_task_provenance != "explicit"
+		|| budget.spill_bytes_reserved != 2_147_483_648
+		|| budget.spill_bytes_reserved_provenance != "explicit"
+	{
+		return Err("ADR 587 requires explicit 2 GiB task memory and spill reserve".to_string());
+	}
+	let concurrency = gauge_partition_work_concurrency_requested()?;
+	if concurrency != (1, "explicit") {
+		return Err(format!(
+			"ADR 587 requires explicit partition parallelism 1, got {concurrency:?}"
+		));
+	}
+	let identity = runtime_identity()?.ok_or_else(|| {
+		"ADR 587 must run through toron-bench build/run with a staged executable".to_string()
+	})?;
+	if identity.manifest.recipe.profile != "profiling" {
+		return Err(format!(
+			"ADR 587 requires the symbol-bearing profiling build profile, got {:?}",
+			identity.manifest.recipe.profile
+		));
+	}
+	let host_start = observe_host_quiescence();
+	if !host_start.quiescent() {
+		return Err("ADR 587 requires the local deployment and SQL port quiescent".to_string());
+	}
+	let scratch = std::env::var_os("TORON_JOIN_SPILL_DIR")
+		.filter(|value| !value.is_empty())
+		.map(PathBuf::from)
+		.unwrap_or_else(|| std::env::temp_dir().join("toron_join_spill"));
+	if !directory_is_empty(&scratch)? {
+		return Err(format!(
+			"ADR 587 spill scratch {} is not empty before the run",
+			scratch.display()
+		));
+	}
+	let dataset = load_persisted_tpch_dataset(mode, sf, &data_dir)?;
+	if dataset.verification.as_str() != "full_hash" {
+		return Err(format!(
+			"ADR 587 requires full-hash dataset verification, got {}",
+			dataset.verification.as_str()
+		));
+	}
+	let journal = prepare_perf_sample_journal(&output_dir)?;
+	std::fs::create_dir_all(output_dir.join("profiles"))
+		.map_err(|error| format!("create ADR 587 profile directory: {error}"))?;
+
+	// The profiler gates: present, permitted, and able to sample this harness without loss.
+	let perf = adr587_perf_gate(&output_dir)?;
+
+	let mut phase0_warmup = run_adr587_child(
+		0,
+		true,
+		false,
+		mode,
+		sf,
+		data_source,
+		&data_dir,
+		&output_dir,
+	)?;
+	phase0_warmup["adr587_phase"] = serde_json::json!("host_check_warmup");
+	phase0_warmup["adr587_arm"] = serde_json::json!("off");
+	phase0_warmup["adr587_pair"] = serde_json::Value::Null;
+	journal.append(&phase0_warmup)?;
+	let mut phase0_sample = run_adr587_child(
+		1,
+		false,
+		false,
+		mode,
+		sf,
+		data_source,
+		&data_dir,
+		&output_dir,
+	)?;
+	let phase0_execute_ms = required_f64(&phase0_sample, "execute_ms")?;
+	let tripwire = adr586_phase0_tripwire(phase0_execute_ms, reference_off_median_ms);
+	phase0_sample["adr587_phase"] = serde_json::json!("host_check");
+	phase0_sample["adr587_arm"] = serde_json::json!("off");
+	phase0_sample["adr587_pair"] = serde_json::Value::Null;
+	phase0_sample["adr587_phase0_tripwire"] = tripwire.clone();
+	journal.append(&phase0_sample)?;
+	let phase0 = serde_json::json!({
+		"warmup_execute_ms": phase0_warmup.get("execute_ms").cloned().unwrap_or_default(),
+		"sample_execute_ms": phase0_execute_ms,
+		"reference_off_median_ms": reference_off_median_ms,
+		"tripwire": tripwire,
+	});
+	if phase0["tripwire"]["tripped"] == true {
+		let summary = serde_json::json!({
+			"kind": "adr587_q21_insert_decomposition",
+			"outcome": "phase0_tripped",
+			"sealed": false,
+			"candidate_authority": false,
+			"phase0": phase0,
+			"perf": perf,
+			"instrumented_evidence_identity": identity.json_value(),
+			"dataset_manifest_fingerprint": dataset.manifest_fingerprint,
+		});
+		write_json_atomically(&output_dir.join("summary.json"), &summary)?;
+		return Err(format!(
+			"ADR 587 phase 0 tripped: sample {phase0_execute_ms:.1} ms is {:+.2}% from the reference {reference_off_median_ms:.1} ms (threshold {:.0}%); pairs not run, finding retained at {}",
+			phase0["tripwire"]["movement"].as_f64().unwrap_or(f64::NAN) * 100.0,
+			ADR586_PHASE0_THRESHOLD * 100.0,
+			output_dir.display()
+		));
+	}
+
+	let mut warmup = run_adr587_child(
+		2,
+		true,
+		false,
+		mode,
+		sf,
+		data_source,
+		&data_dir,
+		&output_dir,
+	)?;
+	warmup["adr587_phase"] = serde_json::json!("pairs_warmup");
+	warmup["adr587_arm"] = serde_json::json!("off");
+	warmup["adr587_pair"] = serde_json::Value::Null;
+	journal.append(&warmup)?;
+
+	let mut rows = Vec::with_capacity(ADR585_PAIRS * 2);
+	for pair in 0..ADR585_PAIRS {
+		let order = if pair % 2 == 0 {
+			[false, true]
+		} else {
+			[true, false]
+		};
+		for (position, on) in order.into_iter().enumerate() {
+			let mut row = run_adr587_child(
+				pair as u32,
+				false,
+				on,
+				mode,
+				sf,
+				data_source,
+				&data_dir,
+				&output_dir,
+			)?;
+			row["adr587_phase"] = serde_json::json!("pairs");
+			row["adr587_arm"] = serde_json::json!(if on { "on" } else { "off" });
+			row["adr587_pair"] = serde_json::json!(pair);
+			row["adr587_pair_position"] = serde_json::json!(position);
+			if on {
+				// Bin the profiler's samples against this arm's windows now, so the bins ride
+				// the journal row and the evaluator needs nothing outside the rows.
+				let perf_data = adr587_perf_data_path(&output_dir, pair as u32);
+				let (_, receipt) = lifecycle_target_receipt(&row, pair, "ADR 587")?;
+				let windows = adr587_window_sets_from_row(&row)?;
+				let bins = adr587_bin_perf_data(&perf_data, &windows, receipt)?;
+				write_json_atomically(
+					&output_dir
+						.join("profiles")
+						.join(format!("pair-{pair:02}.bins.json")),
+					&bins,
+				)?;
+				row["adr587_bins"] = bins;
+			}
+			journal.append(&row)?;
+			rows.push(row);
+		}
+	}
+	let host_end = observe_host_quiescence();
+	if !host_end.quiescent() || !directory_is_empty(&scratch)? {
+		return Err(
+			"ADR 587 lost host quiescence or left spill scratch after measurement".to_string(),
+		);
+	}
+	let mut summary = evaluate_adr587_pairs(&rows)?;
+	summary["kind"] = serde_json::json!("adr587_q21_insert_decomposition");
+	summary["outcome"] = serde_json::json!("pairs_measured");
+	summary["sealed"] = serde_json::json!(false);
+	summary["candidate_authority"] = serde_json::json!(false);
+	summary["phase0"] = phase0;
+	summary["perf"] = perf;
+	summary["sealed_baseline_executable_sha256"] =
+		serde_json::json!(ADR585_SEALED_BASELINE_EXECUTABLE);
+	summary["adr585_instrumented_executable_sha256"] = serde_json::json!(ADR586_ADR585_EXECUTABLE);
+	summary["adr586_instrumented_executable_sha256"] = serde_json::json!(ADR587_ADR586_EXECUTABLE);
+	summary["instrumented_evidence_identity"] = identity.json_value();
+	summary["build_profile"] = serde_json::json!(identity.manifest.recipe.profile);
+	summary["dataset_manifest_fingerprint"] = serde_json::json!(dataset.manifest_fingerprint);
+	summary["memory_per_task"] = serde_json::json!(budget.memory_per_task);
+	summary["spill_bytes_reserved"] = serde_json::json!(budget.spill_bytes_reserved);
+	summary["partition_work_concurrency_requested"] = serde_json::json!(concurrency.0);
+	summary["warmup_execute_ms"] = warmup.get("execute_ms").cloned().unwrap_or_default();
+	write_json_atomically(&output_dir.join("summary.json"), &summary)?;
+	Ok(summary)
+}
+
+fn adr587_perf_data_path(output_dir: &Path, pair: u32) -> PathBuf {
+	output_dir
+		.join("profiles")
+		.join(format!("pair-{pair:02}.perf.data"))
+}
+
+fn adr587_perf_record_args(frequency_hz: u32, output: &Path) -> Vec<String> {
+	vec![
+		"perf".to_string(),
+		"record".to_string(),
+		"-e".to_string(),
+		"task-clock:u".to_string(),
+		"-F".to_string(),
+		frequency_hz.to_string(),
+		"-k".to_string(),
+		"CLOCK_MONOTONIC".to_string(),
+		"-o".to_string(),
+		output.display().to_string(),
+		"--".to_string(),
+	]
+}
+
+/// The profiler gates: `perf` on the path, `perf_event_paranoid` at most 2, and a one-second
+/// recording of this harness spinning that loses no samples and produces some. Records the
+/// `perf` version and the sampling command the pairs will use.
+fn adr587_perf_gate(output_dir: &Path) -> Result<serde_json::Value, String> {
+	let version = Command::new("perf")
+		.arg("version")
+		.output()
+		.map_err(|error| format!("ADR 587 requires perf on the path: {error}"))?;
+	let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
+	let paranoid = std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
+		.map_err(|error| format!("ADR 587 cannot read perf_event_paranoid: {error}"))?
+		.trim()
+		.parse::<i64>()
+		.map_err(|error| format!("ADR 587 cannot parse perf_event_paranoid: {error}"))?;
+	if paranoid > ADR587_MAX_PARANOID {
+		return Err(format!(
+			"ADR 587 requires kernel.perf_event_paranoid <= {ADR587_MAX_PARANOID}, got {paranoid}"
+		));
+	}
+	let selfcheck = output_dir.join("profiles").join("selfcheck.perf.data");
+	let exe = std::env::current_exe().map_err(|error| format!("current exe: {error}"))?;
+	let mut args = adr587_perf_record_args(ADR587_PERF_FREQUENCY_HZ, &selfcheck);
+	args.push(exe.display().to_string());
+	args.push("adr587-selfcheck-spin".to_string());
+	let status = Command::new(&args[0])
+		.args(&args[1..])
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.status()
+		.map_err(|error| format!("ADR 587 perf self-check failed to start: {error}"))?;
+	if !status.success() {
+		return Err(format!(
+			"ADR 587 perf self-check recording failed: {status}"
+		));
+	}
+	let header = adr587_perf_header(&selfcheck)?;
+	if header.lost_samples != 0 || header.samples == 0 {
+		return Err(format!(
+			"ADR 587 perf self-check lost {} samples of {}",
+			header.lost_samples, header.samples
+		));
+	}
+	Ok(serde_json::json!({
+		"version": version,
+		"perf_event_paranoid": paranoid,
+		"frequency_hz": ADR587_PERF_FREQUENCY_HZ,
+		"record_args": adr587_perf_record_args(ADR587_PERF_FREQUENCY_HZ, Path::new("<profiles/pair-NN.perf.data>")),
+		"script_fields": "--ns -F pid,tid,time,period,ip,sym,srcline",
+		"selfcheck_samples": header.samples,
+		"selfcheck_lost_samples": header.lost_samples,
+	}))
+}
+
+struct Adr587PerfHeader {
+	samples: u64,
+	lost_samples: u64,
+}
+
+/// `perf report` prints "# Total Lost Samples: N" and "# Samples: N of event" in its header;
+/// both are required, and a header without them is refused rather than read as zero.
+fn adr587_perf_header(path: &Path) -> Result<Adr587PerfHeader, String> {
+	let output = Command::new("perf")
+		.args(["report", "-i"])
+		.arg(path)
+		.args(["--stdio", "--sort", "comm", "--percent-limit", "100"])
+		.output()
+		.map_err(|error| format!("ADR 587 perf report failed to start: {error}"))?;
+	let text = String::from_utf8_lossy(&output.stdout).to_string();
+	adr587_parse_perf_header(&text)
+}
+
+fn adr587_parse_perf_header(text: &str) -> Result<Adr587PerfHeader, String> {
+	let mut samples = None;
+	let mut lost = None;
+	for line in text.lines() {
+		let line = line.trim();
+		if let Some(rest) = line.strip_prefix("# Total Lost Samples:") {
+			lost = rest.trim().parse::<u64>().ok();
+		} else if let Some(rest) = line.strip_prefix("# Samples:") {
+			let count = rest.trim().split_whitespace().next().unwrap_or_default();
+			samples = adr587_parse_perf_count(count);
+		}
+	}
+	match (samples, lost) {
+		(Some(samples), Some(lost_samples)) => Ok(Adr587PerfHeader {
+			samples,
+			lost_samples,
+		}),
+		_ => Err("ADR 587 perf report header lacks the sample or lost-sample count".to_string()),
+	}
+}
+
+/// perf abbreviates sample counts ("34K", "1M"); the abbreviation is a floor, which is enough
+/// for the gates that read it (zero, or at least some).
+fn adr587_parse_perf_count(text: &str) -> Option<u64> {
+	let (digits, scale) = match text.chars().last() {
+		Some('K') => (&text[..text.len() - 1], 1_000u64),
+		Some('M') => (&text[..text.len() - 1], 1_000_000u64),
+		Some('G') => (&text[..text.len() - 1], 1_000_000_000u64),
+		_ => (text, 1u64),
+	};
+	digits.parse::<u64>().ok().map(|value| value * scale)
+}
+
+/// One profiler sample as `perf script --ns -F pid,tid,time,period,ip,sym,srcline` prints it:
+/// a header line and a source-line line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Adr587Sample {
+	pid: u64,
+	tid: u64,
+	time_ns: u64,
+	period: u64,
+	symbol: String,
+	source_file: String,
+	line: Option<u32>,
+}
+
+fn adr587_parse_perf_script(text: &str) -> Result<Vec<Adr587Sample>, String> {
+	let mut samples = Vec::new();
+	let mut lines = text.lines().peekable();
+	while let Some(line) = lines.next() {
+		let header = line.trim();
+		if header.is_empty() {
+			continue;
+		}
+		let mut fields = header.split_whitespace();
+		let ids = fields
+			.next()
+			.ok_or_else(|| format!("perf script sample lacks pid/tid: {header:?}"))?;
+		let (pid, tid) = ids
+			.split_once('/')
+			.ok_or_else(|| format!("perf script pid/tid is not pid/tid: {ids:?}"))?;
+		let time = fields
+			.next()
+			.ok_or_else(|| format!("perf script sample lacks time: {header:?}"))?
+			.trim_end_matches(':');
+		let (secs, nanos) = time
+			.split_once('.')
+			.ok_or_else(|| format!("perf script time lacks nanoseconds: {time:?}"))?;
+		if nanos.len() != 9 {
+			return Err(format!("perf script time is not in --ns form: {time:?}"));
+		}
+		let time_ns = secs
+			.parse::<u64>()
+			.ok()
+			.zip(nanos.parse::<u64>().ok())
+			.map(|(s, n)| s * 1_000_000_000 + n)
+			.ok_or_else(|| format!("perf script time is not numeric: {time:?}"))?;
+		let period = fields
+			.next()
+			.and_then(|value| value.parse::<u64>().ok())
+			.ok_or_else(|| format!("perf script sample lacks period: {header:?}"))?;
+		let _ip = fields
+			.next()
+			.ok_or_else(|| format!("perf script sample lacks ip: {header:?}"))?;
+		let symbol = fields.collect::<Vec<_>>().join(" ");
+		let (source_file, line_number) = match lines.peek() {
+			Some(next) if next.starts_with(' ') || next.starts_with('\t') => {
+				let source = lines.next().unwrap_or_default().trim();
+				match source.rsplit_once(':') {
+					Some((file, number)) => {
+						let file = file.rsplit('/').next().unwrap_or(file).to_string();
+						(file, number.parse::<u32>().ok())
+					}
+					None => (source.to_string(), None),
+				}
+			}
+			_ => (String::new(), None),
+		};
+		samples.push(Adr587Sample {
+			pid: pid
+				.parse()
+				.map_err(|_| format!("perf script pid is not numeric: {pid:?}"))?,
+			tid: tid
+				.parse()
+				.map_err(|_| format!("perf script tid is not numeric: {tid:?}"))?,
+			time_ns,
+			period,
+			symbol,
+			source_file,
+			line: line_number,
+		});
+	}
+	Ok(samples)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Adr587Window {
+	start_ns: u64,
+	end_ns: u64,
+	tid: u64,
+}
+
+/// One summary's windows as the engine published them: rows windows (ordered, disjoint) and
+/// growth windows nested inside them, all on the recorded PID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Adr587WindowSet {
+	summary: &'static str,
+	pid: u64,
+	rows: Vec<Adr587Window>,
+	growth: Vec<Adr587Window>,
+}
+
+impl Adr587WindowSet {
+	fn from_diagnostic(summary: &'static str, value: &serde_json::Value) -> Result<Self, String> {
+		let pid = value
+			.get("pid")
+			.and_then(serde_json::Value::as_u64)
+			.ok_or_else(|| format!("{summary} insert windows lack pid"))?;
+		let read = |key: &str| -> Result<Vec<Adr587Window>, String> {
+			let mut windows = value
+				.get(key)
+				.and_then(serde_json::Value::as_array)
+				.ok_or_else(|| format!("{summary} insert windows lack {key}"))?
+				.iter()
+				.map(|entry| {
+					let field = |index: usize| {
+						entry
+							.get(index)
+							.and_then(serde_json::Value::as_u64)
+							.ok_or_else(|| format!("{summary} {key} entry lacks field {index}"))
+					};
+					Ok(Adr587Window {
+						start_ns: field(0)?,
+						end_ns: field(1)?,
+						tid: field(2)?,
+					})
+				})
+				.collect::<Result<Vec<_>, String>>()?;
+			windows.sort_by_key(|window| window.start_ns);
+			for pair in windows.windows(2) {
+				if pair[0].end_ns > pair[1].start_ns {
+					return Err(format!("{summary} {key} overlap"));
+				}
+			}
+			Ok(windows)
+		};
+		let rows_text = value
+			.get("rows_windows")
+			.and_then(serde_json::Value::as_str)
+			.ok_or_else(|| format!("{summary} insert windows lack the rows_windows string"))?;
+		let rows = adr587_decode_rows_windows(rows_text)
+			.map_err(|error| format!("{summary} rows windows: {error}"))?;
+		if let Some(count) = value
+			.get("rows_window_count")
+			.and_then(serde_json::Value::as_u64)
+			&& count != rows.len() as u64
+		{
+			return Err(format!(
+				"{summary} rows window count {count} disagrees with {} decoded windows",
+				rows.len()
+			));
+		}
+		for pair in rows.windows(2) {
+			if pair[0].end_ns > pair[1].start_ns {
+				return Err(format!("{summary} rows_windows overlap"));
+			}
+		}
+		Ok(Self {
+			summary,
+			pid,
+			rows,
+			growth: read("growth_windows")?,
+		})
+	}
+
+	fn tids(&self) -> Vec<u64> {
+		let mut tids = self
+			.rows
+			.iter()
+			.map(|window| window.tid)
+			.collect::<Vec<_>>();
+		tids.sort_unstable();
+		tids.dedup();
+		tids
+	}
+
+	/// Half-open containment on the window's own thread. Windows are sorted and disjoint, so a
+	/// binary search on the start finds the only candidate.
+	fn find(windows: &[Adr587Window], sample: &Adr587Sample) -> bool {
+		let index = windows.partition_point(|window| window.start_ns <= sample.time_ns);
+		index
+			.checked_sub(1)
+			.and_then(|index| windows.get(index))
+			.is_some_and(|window| {
+				window.tid == sample.tid
+					&& sample.time_ns >= window.start_ns
+					&& sample.time_ns < window.end_ns
+			})
+	}
+}
+
+/// The exact inverse of the engine's `encode_rows_windows`: `<tid>@<start_ns>:<gap>+<duration>;...`
+/// with `|` between per-thread segments, gaps measured from the previous window's end.
+fn adr587_decode_rows_windows(text: &str) -> Result<Vec<Adr587Window>, String> {
+	let mut windows = Vec::new();
+	if text.is_empty() {
+		return Ok(windows);
+	}
+	for segment in text.split('|') {
+		let (head, body) = segment
+			.split_once(':')
+			.ok_or_else(|| "segment lacks ':'".to_string())?;
+		let (tid, start) = head
+			.split_once('@')
+			.ok_or_else(|| "segment lacks '@'".to_string())?;
+		let tid = tid
+			.parse::<u64>()
+			.map_err(|_| "tid is not numeric".to_string())?;
+		let mut cursor = start
+			.parse::<u64>()
+			.map_err(|_| "start is not numeric".to_string())?;
+		for item in body.split(';') {
+			let (gap, duration) = item
+				.split_once('+')
+				.ok_or_else(|| "item lacks '+'".to_string())?;
+			let gap = gap
+				.parse::<u64>()
+				.map_err(|_| "gap is not numeric".to_string())?;
+			let duration = duration
+				.parse::<u64>()
+				.map_err(|_| "duration is not numeric".to_string())?;
+			let start_ns = cursor
+				.checked_add(gap)
+				.ok_or_else(|| "overflow".to_string())?;
+			let end_ns = start_ns
+				.checked_add(duration)
+				.ok_or_else(|| "overflow".to_string())?;
+			windows.push(Adr587Window {
+				start_ns,
+				end_ns,
+				tid,
+			});
+			cursor = end_ns;
+		}
+	}
+	Ok(windows)
+}
+
+fn adr587_window_sets_from_row(row: &serde_json::Value) -> Result<[Adr587WindowSet; 2], String> {
+	let invocation = row
+		.get("node_attribution")
+		.and_then(|profile| profile.get("aggregate_invocations"))
+		.and_then(serde_json::Value::as_array)
+		.and_then(|invocations| {
+			invocations.iter().find(|invocation| {
+				invocation.get("route").and_then(serde_json::Value::as_str)
+					== Some("inner_prefix_semi_anti_grouped")
+			})
+		})
+		.ok_or_else(|| "ADR 587 row lacks the target invocation".to_string())?;
+	let diagnostic = |name: &str| {
+		invocation
+			.get("diagnostics")
+			.and_then(serde_json::Value::as_array)
+			.and_then(|entries| {
+				entries.iter().find(|entry| {
+					entry.get("name").and_then(serde_json::Value::as_str) == Some(name)
+				})
+			})
+			.and_then(|entry| entry.get("value"))
+			.ok_or_else(|| format!("ADR 587 row lacks diagnostic {name}"))
+	};
+	Ok([
+		Adr587WindowSet::from_diagnostic("semi", diagnostic("semi_insert_windows")?)?,
+		Adr587WindowSet::from_diagnostic("anti", diagnostic("anti_insert_windows")?)?,
+	])
+}
+
+/// The source-line classes, fixed from the measured tree: inclusive line ranges in
+/// `toron/src/exec/join/streaming.rs`, each anchored on a function whose name the pinning test
+/// checks at the range's first line. Growth is chosen by window before any of these apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Adr587LineRange {
+	class: &'static str,
+	start: u32,
+	end: u32,
+	anchor: &'static str,
+}
+
+const ADR587_SOURCE_FILE: &str = "streaming.rs";
+const ADR587_LINE_CLASSES: [Adr587LineRange; 14] = [
+	// insert_with: entry, row count, last-key compare, cache-hit branch.
+	Adr587LineRange {
+		class: "shared",
+		start: 1604,
+		end: 1629,
+		anchor: "fn insert_with<const INSTRUMENTED: bool>(",
+	},
+	// insert_with: the lookup counter, the lookup, and the found path.
+	Adr587LineRange {
+		class: "hash_and_probe",
+		start: 1630,
+		end: 1645,
+		anchor: "if INSTRUMENTED {",
+	},
+	// insert_with: the capacity check that precedes growth (growth itself is a window).
+	Adr587LineRange {
+		class: "hash_and_probe",
+		start: 1646,
+		end: 1656,
+		anchor: "if self.entries.len() == self.entry_limit {",
+	},
+	// insert_with: the second walk and the append.
+	Adr587LineRange {
+		class: "hash_and_probe",
+		start: 1657,
+		end: 1694,
+		anchor: "let entry_index =",
+	},
+	Adr587LineRange {
+		class: "shared",
+		start: 1695,
+		end: 1704,
+		anchor: "fn observe_value(&mut self, entry_index: usize, value: i64) {",
+	},
+	Adr587LineRange {
+		class: "shared",
+		start: 1791,
+		end: 1865,
+		anchor: "fn write_batch_with<const INSTRUMENTED: bool>(",
+	},
+	Adr587LineRange {
+		class: "growth_other",
+		start: 1866,
+		end: 1902,
+		anchor: "fn grow(&mut self, baseline_bytes: u64, cap: u64) -> Result<(), ExecutionError> {",
+	},
+	Adr587LineRange {
+		class: "growth_other",
+		start: 1903,
+		end: 1995,
+		anchor: "fn resize_capacity(",
+	},
+	Adr587LineRange {
+		class: "rehash",
+		start: 1996,
+		end: 2002,
+		anchor: "for (entry_index, entry) in self.entries.iter().enumerate() {",
+	},
+	Adr587LineRange {
+		class: "growth_other",
+		start: 2003,
+		end: 2017,
+		anchor: "",
+	},
+	Adr587LineRange {
+		class: "hash_and_probe",
+		start: 2018,
+		end: 2044,
+		anchor: "fn lookup_entry_index(&self, key: i64) -> Option<usize> {",
+	},
+	Adr587LineRange {
+		class: "hash_and_probe",
+		start: 2045,
+		end: 2103,
+		anchor: "fn find_bucket(&self, key: i64) -> Result<usize, ExecutionError> {",
+	},
+	Adr587LineRange {
+		class: "shared",
+		start: 2104,
+		end: 2113,
+		anchor: "fn is_multi(&self, entry_index: usize) -> bool {",
+	},
+	Adr587LineRange {
+		class: "shared",
+		start: 2114,
+		end: 2121,
+		anchor: "fn set_multi(&mut self, entry_index: usize) {",
+	},
+];
+/// Lines inside `resize_capacity` that copy or initialise the grown arrays.
+const ADR587_COPY_LINES: [u32; 4] = [1936, 1962, 1964, 1994];
+
+fn adr587_is_copy_symbol(symbol: &str) -> bool {
+	[
+		"__memmove",
+		"__memcpy",
+		"__memset",
+		"memcpy",
+		"memmove",
+		"memset",
+	]
+	.iter()
+	.any(|prefix| symbol.starts_with(prefix))
+}
+
+/// Class of one sample already known to lie inside a rows window, outside every growth window.
+fn adr587_rows_class(sample: &Adr587Sample) -> &'static str {
+	if sample.symbol.contains("find_bucket_in") {
+		return "hash_and_probe";
+	}
+	if sample.source_file != ADR587_SOURCE_FILE {
+		return "other";
+	}
+	let Some(line) = sample.line else {
+		return "other";
+	};
+	ADR587_LINE_CLASSES
+		.iter()
+		.find(|range| line >= range.start && line <= range.end)
+		.map(|range| match range.class {
+			"shared" | "hash_and_probe" => range.class,
+			_ => "other",
+		})
+		.unwrap_or("other")
+}
+
+/// Class of one sample already known to lie inside a growth window.
+fn adr587_growth_class(sample: &Adr587Sample) -> &'static str {
+	if adr587_is_copy_symbol(&sample.symbol) {
+		return "copy";
+	}
+	if sample.symbol.contains("find_bucket_in") {
+		return "rehash";
+	}
+	if sample.source_file == ADR587_SOURCE_FILE
+		&& let Some(line) = sample.line
+	{
+		if ADR587_COPY_LINES.contains(&line) {
+			return "copy";
+		}
+		if let Some(range) = ADR587_LINE_CLASSES
+			.iter()
+			.find(|range| line >= range.start && line <= range.end)
+			&& range.class == "rehash"
+		{
+			return "rehash";
+		}
+	}
+	"growth_other"
+}
+
+const ADR587_ROWS_CLASSES: [&str; 3] = ["hash_and_probe", "shared", "other"];
+const ADR587_GROWTH_CLASSES: [&str; 3] = ["copy", "rehash", "growth_other"];
+
+#[derive(Default, Debug, Clone)]
+struct Adr587ClassBin {
+	samples: u64,
+	period_ns: u64,
+}
+
+/// Bin parsed samples against one summary's windows: exclusive growth first, then rows.
+fn adr587_bin_summary(samples: &[Adr587Sample], windows: &Adr587WindowSet) -> serde_json::Value {
+	let mut classes: BTreeMap<&'static str, Adr587ClassBin> = BTreeMap::new();
+	for class in ADR587_ROWS_CLASSES
+		.iter()
+		.chain(ADR587_GROWTH_CLASSES.iter())
+	{
+		classes.insert(class, Adr587ClassBin::default());
+	}
+	let tids = windows.tids();
+	let mut on_thread_outside = Adr587ClassBin::default();
+	let mut other_threads = Adr587ClassBin::default();
+	let mut growth_total = Adr587ClassBin::default();
+	let mut rows_total = Adr587ClassBin::default();
+	for sample in samples {
+		if sample.pid != windows.pid {
+			continue;
+		}
+		if !tids.contains(&sample.tid) {
+			other_threads.samples += 1;
+			other_threads.period_ns += sample.period;
+			continue;
+		}
+		let class = if Adr587WindowSet::find(&windows.growth, sample) {
+			growth_total.samples += 1;
+			growth_total.period_ns += sample.period;
+			rows_total.samples += 1;
+			rows_total.period_ns += sample.period;
+			adr587_growth_class(sample)
+		} else if Adr587WindowSet::find(&windows.rows, sample) {
+			rows_total.samples += 1;
+			rows_total.period_ns += sample.period;
+			adr587_rows_class(sample)
+		} else {
+			on_thread_outside.samples += 1;
+			on_thread_outside.period_ns += sample.period;
+			continue;
+		};
+		let bin = classes.entry(class).or_default();
+		bin.samples += 1;
+		bin.period_ns += sample.period;
+	}
+	let bin_value = |bin: &Adr587ClassBin| serde_json::json!({"samples": bin.samples, "period_ns": bin.period_ns});
+	// Every thread the windows name must appear in the profile; a summary spanning two threads
+	// with one of them unsampled would otherwise pass with half its windows empty.
+	let sampled_tids = samples
+		.iter()
+		.filter(|sample| sample.pid == windows.pid)
+		.map(|sample| sample.tid)
+		.collect::<BTreeSet<_>>();
+	let missing_tids = tids
+		.iter()
+		.copied()
+		.filter(|tid| !sampled_tids.contains(tid))
+		.collect::<Vec<_>>();
+	serde_json::json!({
+		"summary": windows.summary,
+		"pid": windows.pid,
+		"tids": tids,
+		"missing_tids": missing_tids,
+		"thread_present": !tids.is_empty() && missing_tids.is_empty(),
+		"rows_windows": windows.rows.len(),
+		"growth_windows": windows.growth.len(),
+		"rows_inclusive": bin_value(&rows_total),
+		"growth": bin_value(&growth_total),
+		"classes": classes.iter().map(|(class, bin)| (class.to_string(), bin_value(bin))).collect::<serde_json::Map<_, _>>(),
+		"on_thread_outside_windows": bin_value(&on_thread_outside),
+		"other_threads": bin_value(&other_threads),
+	})
+}
+
+fn adr587_bin_samples(
+	samples: &[Adr587Sample],
+	windows: &[Adr587WindowSet; 2],
+	receipt: &serde_json::Value,
+	header: &Adr587PerfHeader,
+) -> Result<serde_json::Value, String> {
+	let mut summaries = serde_json::Map::new();
+	for set in windows {
+		let mut bin = adr587_bin_summary(samples, set);
+		let rows_micros = receipt_u64(receipt, &format!("{}_insert_rows_micros", set.summary))?;
+		let grow_micros = receipt_u64(receipt, &format!("{}_insert_grow_micros", set.summary))?;
+		let sampled = bin["rows_inclusive"]["period_ns"]
+			.as_u64()
+			.unwrap_or_default();
+		let wall_ns = rows_micros.saturating_mul(1_000);
+		bin["ledger_rows_micros"] = serde_json::json!(rows_micros);
+		bin["ledger_grow_micros"] = serde_json::json!(grow_micros);
+		bin["estimated_coverage_ratio"] = serde_json::json!(if wall_ns == 0 {
+			0.0
+		} else {
+			sampled as f64 / wall_ns as f64
+		});
+		bin["unexplained_discrepancy_ns"] = serde_json::json!(wall_ns as i128 - sampled as i128);
+		summaries.insert(set.summary.to_string(), bin);
+	}
+	Ok(serde_json::json!({
+		"total_samples": header.samples,
+		"lost_samples": header.lost_samples,
+		"parsed_samples": samples.len(),
+		"line_classes": ADR587_LINE_CLASSES.iter().map(|range| serde_json::json!({"class": range.class, "start": range.start, "end": range.end})).collect::<Vec<_>>(),
+		"summaries": summaries,
+	}))
+}
+
+fn adr587_bin_perf_data(
+	perf_data: &Path,
+	windows: &[Adr587WindowSet; 2],
+	receipt: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+	let header = adr587_perf_header(perf_data)?;
+	if header.lost_samples != 0 {
+		return Err(format!(
+			"ADR 587 profile {} lost {} samples",
+			perf_data.display(),
+			header.lost_samples
+		));
+	}
+	let output = Command::new("perf")
+		.args(["script", "-i"])
+		.arg(perf_data)
+		.args(["--ns", "-F", "pid,tid,time,period,ip,sym,srcline"])
+		.output()
+		.map_err(|error| format!("ADR 587 perf script failed to start: {error}"))?;
+	if !output.status.success() {
+		return Err(format!(
+			"ADR 587 perf script failed: {}",
+			String::from_utf8_lossy(&output.stderr)
+		));
+	}
+	let samples = adr587_parse_perf_script(&String::from_utf8_lossy(&output.stdout))?;
+	adr587_bin_samples(&samples, windows, receipt, &header)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_adr587_child(
+	run_index: u32,
+	warmup: bool,
+	on: bool,
+	mode: &str,
+	sf: f64,
+	data_source: &str,
+	data_dir: &Path,
+	output_dir: &Path,
+) -> Result<serde_json::Value, String> {
+	let mut args = vec![
+		"perf-run-one".to_string(),
+		"--engine".to_string(),
+		"toron".to_string(),
+		"--query".to_string(),
+		"q21".to_string(),
+		"--mode".to_string(),
+		mode.to_string(),
+		"--sf".to_string(),
+		sf.to_string(),
+		"--run-index".to_string(),
+		run_index.to_string(),
+		"--data-source".to_string(),
+		data_source.to_string(),
+		"--data-dir".to_string(),
+		data_dir.display().to_string(),
+	];
+	if warmup {
+		args.push("--warmup-run".to_string());
+	}
+	let profile = output_dir
+		.join("profiles")
+		.join(format!("pair-{run_index:02}-on.json"));
+	let profile_text = profile
+		.to_str()
+		.ok_or_else(|| "ADR 587 profile path is not UTF-8".to_string())?;
+	let row = if on {
+		let wrapper = adr587_perf_record_args(
+			ADR587_PERF_FREQUENCY_HZ,
+			&adr587_perf_data_path(output_dir, run_index),
+		);
+		run_perf_child_args_with_envs_wrapped(
+			&args,
+			&[("TORON_NODE_ATTRIBUTION_PROFILE_PATH", profile_text)],
+			Some(&wrapper),
+		)?
+	} else {
+		run_perf_child_args(&args)?
+	};
+	if row.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+		return Err(format!("ADR 587 child did not pass: {row}"));
+	}
+	Ok(row)
+}
+
+const ADR587_EXACT_TERMS: [&str; 3] = [
+	"insert_grow",
+	"insert_rows_excluding_grow",
+	"insert_residual",
+];
+
+/// ADR 587's layer over ADR 586's: the fifth band per summary, its algebra and bound, the
+/// three-term owner rule over the exact wall terms, the sampled classes reported as shares
+/// with a consistent-or-unresolved ranking, coverage as an estimate, and gross pricing.
+fn evaluate_adr587_pairs(rows: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+	let mut base = evaluate_adr586_layer(rows, &ADR587_TAGS)?;
+	let mut pair_bands = Vec::new();
+	let mut samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+	let mut all_insert_residuals_complete = true;
+	let mut class_shares: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+	let mut class_periods: BTreeMap<String, u64> = BTreeMap::new();
+	let mut rankings: BTreeMap<String, Vec<Vec<(String, u64)>>> = BTreeMap::new();
+	let mut coverage: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+	for pair in 0..ADR585_PAIRS {
+		let pair_rows = rows
+			.iter()
+			.filter(|row| {
+				row.get("adr587_pair").and_then(serde_json::Value::as_u64) == Some(pair as u64)
+			})
+			.collect::<Vec<_>>();
+		let off = pair_rows
+			.iter()
+			.find(|row| row.get("adr587_arm").and_then(serde_json::Value::as_str) == Some("off"))
+			.ok_or_else(|| format!("ADR 587 pair {pair} lacks off arm"))?;
+		let on = pair_rows
+			.iter()
+			.find(|row| row.get("adr587_arm").and_then(serde_json::Value::as_str) == Some("on"))
+			.ok_or_else(|| format!("ADR 587 pair {pair} lacks on arm"))?;
+		let execute_off_ms = required_f64(off, "execute_ms")?;
+		let execute_on_ms = required_f64(on, "execute_ms")?;
+		let execute_on_micros = (execute_on_ms * 1000.0).round() as u64;
+		let overhead = (execute_on_ms - execute_off_ms).max(0.0) * 1000.0;
+		let (_, receipt) = lifecycle_target_receipt(on, pair, "ADR 587")?;
+		let bins = on
+			.get("adr587_bins")
+			.ok_or_else(|| format!("ADR 587 pair {pair} on arm lacks profiler bins"))?;
+		if bins.get("lost_samples").and_then(serde_json::Value::as_u64) != Some(0) {
+			return Err(format!(
+				"ADR 587 pair {pair} profile lost samples or lacks the count"
+			));
+		}
+		let mut band = serde_json::json!({"pair": pair});
+		for summary in ["semi", "anti"] {
+			let insert = receipt_u64(receipt, &format!("{summary}_write_insert_micros"))?;
+			let rows_micros = receipt_u64(receipt, &format!("{summary}_insert_rows_micros"))?;
+			let grow = receipt_u64(receipt, &format!("{summary}_insert_grow_micros"))?;
+			let excluding = receipt_u64(
+				receipt,
+				&format!("{summary}_insert_rows_excluding_grow_micros"),
+			)?;
+			let residual = receipt_u64(receipt, &format!("{summary}_insert_residual_micros"))?;
+			let grow_events = receipt_u64(receipt, &format!("{summary}_insert_grow_events"))?;
+			if rows_micros.checked_add(residual) != Some(insert)
+				|| grow.checked_add(excluding) != Some(rows_micros)
+			{
+				return Err(format!(
+					"ADR 587 pair {pair} {summary} insert algebra does not reconcile"
+				));
+			}
+			let residual_bound = overhead + 0.05 * insert as f64;
+			let residual_complete = residual as f64 <= residual_bound;
+			all_insert_residuals_complete &= residual_complete;
+			for (term, micros) in [
+				("insert_grow", grow),
+				("insert_rows_excluding_grow", excluding),
+				("insert_residual", residual),
+			] {
+				samples
+					.entry(format!("{summary}_{term}"))
+					.or_default()
+					.push(micros as f64 / execute_on_micros as f64 * execute_off_ms);
+			}
+			let bin = bins
+				.pointer(&format!("/summaries/{summary}"))
+				.ok_or_else(|| format!("ADR 587 pair {pair} bins lack {summary}"))?;
+			if bin.get("thread_present") != Some(&serde_json::Value::Bool(true)) {
+				return Err(format!(
+					"ADR 587 pair {pair} {summary} window thread is absent from the profile (missing TIDs {})",
+					bin.get("missing_tids").cloned().unwrap_or_default()
+				));
+			}
+			let rows_sampled = bin["rows_inclusive"]["period_ns"]
+				.as_u64()
+				.unwrap_or_default();
+			let growth_sampled = bin["growth"]["period_ns"].as_u64().unwrap_or_default();
+			let excluding_sampled = rows_sampled.saturating_sub(growth_sampled);
+			let mut ranking = Vec::new();
+			for class in ADR587_ROWS_CLASSES {
+				let period = bin["classes"][class]["period_ns"]
+					.as_u64()
+					.unwrap_or_default();
+				*class_periods
+					.entry(format!("{summary}_{class}"))
+					.or_default() += period;
+				let share = if excluding_sampled == 0 {
+					0.0
+				} else {
+					period as f64 / excluding_sampled as f64
+				};
+				class_shares
+					.entry(format!("{summary}_{class}"))
+					.or_default()
+					.push(share);
+				ranking.push((class.to_string(), period));
+			}
+			ranking.sort_by(|left, right| right.1.cmp(&left.1));
+			rankings
+				.entry(summary.to_string())
+				.or_default()
+				.push(ranking);
+			for class in ADR587_GROWTH_CLASSES {
+				let period = bin["classes"][class]["period_ns"]
+					.as_u64()
+					.unwrap_or_default();
+				*class_periods
+					.entry(format!("{summary}_{class}"))
+					.or_default() += period;
+				let share = if growth_sampled == 0 {
+					0.0
+				} else {
+					period as f64 / growth_sampled as f64
+				};
+				class_shares
+					.entry(format!("{summary}_{class}"))
+					.or_default()
+					.push(share);
+			}
+			let ratio = required_f64(bin, "estimated_coverage_ratio")?;
+			coverage.entry(summary.to_string()).or_default().push(ratio);
+			band[format!("{summary}_write_insert_micros")] = serde_json::json!(insert);
+			band[format!("{summary}_insert_rows_micros")] = serde_json::json!(rows_micros);
+			band[format!("{summary}_insert_grow_micros")] = serde_json::json!(grow);
+			band[format!("{summary}_insert_grow_events")] = serde_json::json!(grow_events);
+			band[format!("{summary}_insert_rows_excluding_grow_micros")] =
+				serde_json::json!(excluding);
+			band[format!("{summary}_insert_residual_micros")] = serde_json::json!(residual);
+			band[format!("{summary}_insert_residual_bound_micros")] =
+				serde_json::json!(residual_bound);
+			band[format!("{summary}_insert_residual_complete")] =
+				serde_json::json!(residual_complete);
+			band[format!("{summary}_sampled")] = bin.clone();
+		}
+		pair_bands.push(band);
+	}
+	let off_range = required_f64(&base, "off_execute_range_ms")?;
+	let off_median = required_f64(&base, "off_execute_median_ms")?;
+	let owner_floor = required_f64(&base, "owner_floor_ms")?;
+	let perturbation_accepted = base["perturbation_gate"] == "accepted";
+	let base_profiles_complete =
+		base["all_profiles_complete"] == true && base["all_write_residuals_complete"] == true;
+	let medians_for = |summary: &str| {
+		let mut medians = ADR587_EXACT_TERMS
+			.iter()
+			.map(|term| {
+				let name = format!("{summary}_{term}");
+				let mut values = samples.get(&name).cloned().unwrap_or_default();
+				(name, median(&mut values))
+			})
+			.collect::<Vec<_>>();
+		medians.sort_by(|left, right| right.1.total_cmp(&left.1));
+		medians
+	};
+	let semi_medians = medians_for("semi");
+	let anti_medians = medians_for("anti");
+	let owner = adr586_owner(
+		&semi_medians,
+		owner_floor,
+		off_range,
+		off_median,
+		perturbation_accepted,
+		base_profiles_complete && all_insert_residuals_complete,
+	);
+	let pricing = adr587_removable_pricing(&owner, owner_floor);
+	let terms_value = |medians: &[(String, f64)]| {
+		medians
+			.iter()
+			.map(|(term, value)| {
+				serde_json::json!({
+					"term": term,
+					"median_scaled_ms": value,
+					"share_of_off_execute": value / off_median,
+					"clears_floor": *value > owner_floor,
+				})
+			})
+			.collect::<Vec<_>>()
+	};
+	let classes_value = |summary: &str, classes: &[&str]| {
+		classes
+			.iter()
+			.map(|class| {
+				let name = format!("{summary}_{class}");
+				let shares = class_shares.get(&name).cloned().unwrap_or_default();
+				let period = class_periods.get(&name).copied().unwrap_or_default();
+				let total: u64 = classes
+					.iter()
+					.map(|other| {
+						class_periods
+							.get(&format!("{summary}_{other}"))
+							.copied()
+							.unwrap_or_default()
+					})
+					.sum();
+				let share_all_pairs = if total == 0 {
+					0.0
+				} else {
+					period as f64 / total as f64
+				};
+				serde_json::json!({
+					"class": class,
+					"period_ns_all_pairs": period,
+					"share_per_pair": shares,
+					"share_all_pairs": share_all_pairs,
+				})
+			})
+			.collect::<Vec<_>>()
+	};
+	let ranking_value = |summary: &str| {
+		adr587_ranking_value(rankings.get(summary).map(Vec::as_slice).unwrap_or(&[]))
+	};
+	let coverage_value = |summary: &str| {
+		let mut values = coverage.get(summary).cloned().unwrap_or_default();
+		serde_json::json!({
+			"estimated_coverage_ratio_per_pair": values.clone(),
+			"estimated_coverage_ratio_median": median(&mut values),
+			"reading": "estimate: periods straddle window edges, sampling has phase, the kernel may throttle; the discrepancy is unexplained, not attributed",
+		})
+	};
+	base["adr587_pair_bands"] = serde_json::json!(pair_bands);
+	base["all_insert_residuals_complete"] = serde_json::json!(all_insert_residuals_complete);
+	base["semi_insert_terms_scaled_ms"] = serde_json::json!(terms_value(&semi_medians));
+	base["anti_insert_terms_scaled_ms"] = serde_json::json!(terms_value(&anti_medians));
+	base["semi_rows_classes"] = serde_json::json!(classes_value("semi", &ADR587_ROWS_CLASSES));
+	base["semi_growth_classes"] = serde_json::json!(classes_value("semi", &ADR587_GROWTH_CLASSES));
+	base["anti_rows_classes"] = serde_json::json!(classes_value("anti", &ADR587_ROWS_CLASSES));
+	base["anti_growth_classes"] = serde_json::json!(classes_value("anti", &ADR587_GROWTH_CLASSES));
+	base["semi_rows_ranking"] = ranking_value("semi");
+	base["anti_rows_ranking"] = ranking_value("anti");
+	base["semi_coverage"] = coverage_value("semi");
+	base["anti_coverage"] = coverage_value("anti");
+	base["adr586_five_term_owner"] = base["owner"].clone();
+	base["adr586_reference_semi_write_medians_scaled_ms"] = serde_json::json!(
+		ADR587_ADR586_REFERENCE_SEMI_WRITE_MEDIANS
+			.iter()
+			.map(|(term, value)| serde_json::json!({"term": term, "median_scaled_ms": value}))
+			.collect::<Vec<_>>()
+	);
+	base["adr586_reference_off_execute_median_ms"] =
+		serde_json::json!(ADR587_ADR586_REFERENCE_OFF_MEDIAN_MS);
+	base["adr586_reference_off_execute_range_ms"] =
+		serde_json::json!(ADR587_ADR586_REFERENCE_OFF_RANGE_MS);
+	base["owner"] = owner;
+	base["owner_removable_pricing"] = pricing;
+	Ok(base)
+}
+
+/// The consistent-or-unresolved ranking of the row-loop classes across pairs. A pair with no
+/// sampled period in any class, or a tie at the top, has no ranking; declaration order must
+/// never be read as one. A ranking is consistent only when every pair has a strict leader and
+/// the same order.
+fn adr587_ranking_value(orders: &[Vec<(String, u64)>]) -> serde_json::Value {
+	let order_names = orders
+		.iter()
+		.map(|order| {
+			order
+				.iter()
+				.map(|(class, _)| class.clone())
+				.collect::<Vec<_>>()
+		})
+		.collect::<Vec<_>>();
+	let mut status = "consistent_observation";
+	if orders.is_empty() {
+		status = "unresolved_no_pairs";
+	}
+	for order in orders {
+		let top = order.first().map(|(_, period)| *period).unwrap_or(0);
+		let second = order.get(1).map(|(_, period)| *period).unwrap_or(0);
+		if top == 0 {
+			status = "unresolved_no_samples";
+			break;
+		}
+		if top == second {
+			status = "unresolved_tie_at_the_top";
+			break;
+		}
+	}
+	if status == "consistent_observation" {
+		if !order_names.windows(2).all(|pair| pair[0] == pair[1]) {
+			status = "unresolved_ranking_changes_between_pairs";
+		} else if order_names
+			.first()
+			.and_then(|order| order.first())
+			.map(String::as_str)
+			== Some("other")
+		{
+			status = "unresolved_other_leads";
+		}
+	}
+	let leader = if status == "consistent_observation" {
+		serde_json::json!(order_names[0][0])
+	} else {
+		serde_json::Value::Null
+	};
+	serde_json::json!({
+		"status": status,
+		"order_per_pair": order_names,
+		"period_ns_per_pair": orders.iter().map(|order| order.iter().map(|(_, period)| *period).collect::<Vec<_>>()).collect::<Vec<_>>(),
+		"leading_class": leader,
+		"significance": "none claimed: frequency-mode periods vary, samples are correlated in time, skid is systematic",
+	})
+}
+
+/// Growth is gross removable work (a reservation still allocates, initialises, and first-touches
+/// the final table); the row loop is not removable as such; the residual is not a mechanism.
+fn adr587_removable_pricing(owner: &serde_json::Value, owner_floor: f64) -> serde_json::Value {
+	if owner["status"] != "resolved" {
+		return serde_json::json!({"status": "no_owner"});
+	}
+	let term = owner["term"].as_str().unwrap_or_default();
+	let median = owner["median_scaled_ms"].as_f64().unwrap_or(f64::NAN);
+	match term {
+		"semi_insert_grow" => serde_json::json!({
+			"status": "gross_removable",
+			"removable_subterm": term,
+			"median_scaled_ms": median,
+			"clears_floor": median > owner_floor,
+			"net_improvement": "unpriced: a reservation still allocates, initialises and first-touches the final table; successor measures paired off/on with the cut beside value parity and peak-memory accounting",
+		}),
+		"semi_insert_rows_excluding_grow" => serde_json::json!({
+			"status": "not_removable",
+			"successor": "chosen from the counts and sampled classes: the second walk on a miss, an order-aware build, or the hash and load factor",
+		}),
+		_ => serde_json::json!({
+			"status": "not_a_mechanism",
+			"successor": "an incomplete instrument is not an owner",
+		}),
+	}
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_adr586_child(
 	run_index: u32,
@@ -1839,7 +3210,16 @@ const ADR586_WRITE_CHILDREN: [&str; 4] = ["filter", "key_program", "repartition"
 /// algebra and completeness bound, the five-term owner rule over the semi write with its three
 /// outcomes, the anti write reported beside it, and the owning child's removable pricing.
 fn evaluate_adr586_pairs(rows: &[serde_json::Value]) -> Result<serde_json::Value, String> {
-	let mut base = evaluate_lifecycle_pairs(rows, &ADR586_TAGS)?;
+	evaluate_adr586_layer(rows, &ADR586_TAGS)
+}
+
+/// ADR 586's fourth-band layer over the shared three-band evaluation, reused by ADR 587 under
+/// its own tags: the write children, their algebra and bounds, the five-term rule, the pricing.
+fn evaluate_adr586_layer(
+	rows: &[serde_json::Value],
+	tags: &LifecyclePairTags,
+) -> Result<serde_json::Value, String> {
+	let mut base = evaluate_lifecycle_pairs(rows, tags)?;
 	let mut pair_bands = Vec::new();
 	let mut samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
 	let mut all_write_residuals_complete = true;
@@ -1847,22 +3227,22 @@ fn evaluate_adr586_pairs(rows: &[serde_json::Value]) -> Result<serde_json::Value
 		let pair_rows = rows
 			.iter()
 			.filter(|row| {
-				row.get("adr586_pair").and_then(serde_json::Value::as_u64) == Some(pair as u64)
+				row.get(tags.pair).and_then(serde_json::Value::as_u64) == Some(pair as u64)
 			})
 			.collect::<Vec<_>>();
 		let off = pair_rows
 			.iter()
-			.find(|row| row.get("adr586_arm").and_then(serde_json::Value::as_str) == Some("off"))
+			.find(|row| row.get(tags.arm).and_then(serde_json::Value::as_str) == Some("off"))
 			.ok_or_else(|| format!("ADR 586 pair {pair} lacks off arm"))?;
 		let on = pair_rows
 			.iter()
-			.find(|row| row.get("adr586_arm").and_then(serde_json::Value::as_str) == Some("on"))
+			.find(|row| row.get(tags.arm).and_then(serde_json::Value::as_str) == Some("on"))
 			.ok_or_else(|| format!("ADR 586 pair {pair} lacks on arm"))?;
 		let execute_off_ms = required_f64(off, "execute_ms")?;
 		let execute_on_ms = required_f64(on, "execute_ms")?;
 		let execute_on_micros = (execute_on_ms * 1000.0).round() as u64;
 		let overhead = (execute_on_ms - execute_off_ms).max(0.0) * 1000.0;
-		let (_, receipt) = lifecycle_target_receipt(on, pair, "ADR 586")?;
+		let (_, receipt) = lifecycle_target_receipt(on, pair, tags.label)?;
 		let mut band = serde_json::json!({"pair": pair});
 		for prefix in ["semi_write", "anti_write"] {
 			let write = receipt_u64(receipt, &format!("runtime_prep_{prefix}_micros"))?;
@@ -6076,9 +7456,29 @@ fn run_perf_child_args_with_envs(
 	args: &[String],
 	envs: &[(&str, &str)],
 ) -> Result<serde_json::Value, String> {
+	run_perf_child_args_with_envs_wrapped(args, envs, None)
+}
+
+/// Run the perf child, optionally under a wrapper command (`perf record ... --`) that receives
+/// the child's executable and arguments after its own. The wrapper's exit status is the
+/// child's, its stderr is its own, and the child's JSON row still arrives on stdout.
+#[cfg(unix)]
+fn run_perf_child_args_with_envs_wrapped(
+	args: &[String],
+	envs: &[(&str, &str)],
+	wrapper: Option<&[String]>,
+) -> Result<serde_json::Value, String> {
 	let exe = toron_binary()?;
 	let start = Instant::now();
-	let mut command = Command::new(exe);
+	let mut command = match wrapper {
+		Some(wrapper) if !wrapper.is_empty() => {
+			let mut command = Command::new(&wrapper[0]);
+			command.args(&wrapper[1..]);
+			command.arg(&exe);
+			command
+		}
+		_ => Command::new(exe),
+	};
 	command.args(args);
 	for (key, value) in envs {
 		command.env(key, value);
@@ -7551,7 +8951,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|adr584-q21-attribution|adr585-q21-decomposition|adr586-q21-semi-write|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|adr584-q21-attribution|adr585-q21-decomposition|adr586-q21-semi-write|adr587-q21-insert|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -8762,6 +10162,559 @@ mod tests {
 			error.contains("semi_write algebra does not reconcile"),
 			"{error}"
 		);
+	}
+
+	/// The engine source the line classes are pinned to. Test-only: the measured tree and the
+	/// class table must agree, and this is what makes a shifted line a failing test rather than
+	/// a silently misbinned profile.
+	const ADR587_STREAMING_SOURCE: &str = include_str!("../../toron/src/exec/join/streaming.rs");
+
+	#[test]
+	fn adr587_line_classes_match_the_measured_tree() {
+		let lines = ADR587_STREAMING_SOURCE.lines().collect::<Vec<_>>();
+		let mut previous_end = 0u32;
+		for range in ADR587_LINE_CLASSES {
+			assert!(
+				range.start > previous_end,
+				"{:?} overlaps or is unsorted",
+				range
+			);
+			assert!(range.end >= range.start, "{:?} is empty", range);
+			let first = lines[(range.start - 1) as usize].trim();
+			assert!(
+				first.starts_with(range.anchor),
+				"line {} is {first:?}, expected anchor {:?}",
+				range.start,
+				range.anchor
+			);
+			previous_end = range.end;
+		}
+		for (line, expected) in ADR587_COPY_LINES.iter().zip([
+			"entries.extend_from_slice(&self.entries);",
+			"multi.resize(multi_words, 0);",
+			"multi[..self.multi.len()].copy_from_slice(&self.multi);",
+			"buckets.resize(bucket_count, EMPTY_NEQ_EXISTENCE_SUMMARY_BUCKET);",
+		]) {
+			assert_eq!(
+				lines[(*line - 1) as usize].trim(),
+				expected,
+				"copy line {line}"
+			);
+		}
+		// The rehash range is exactly the loop that re-walks every entry, and the growth ranges
+		// end where the function does: the next non-blank line opens the lookup.
+		let rehash = ADR587_LINE_CLASSES
+			.iter()
+			.find(|range| range.class == "rehash")
+			.unwrap();
+		assert_eq!(lines[(rehash.end - 1) as usize].trim(), "}");
+		assert!(lines[(rehash.end - 2) as usize].trim().ends_with("})?;"));
+		let last_growth = ADR587_LINE_CLASSES
+			.iter()
+			.filter(|range| range.class == "growth_other")
+			.last()
+			.unwrap();
+		let after = lines[last_growth.end as usize..]
+			.iter()
+			.find(|line| !line.trim().is_empty())
+			.unwrap()
+			.trim();
+		assert!(after.starts_with("fn lookup_entry_index("), "{after:?}");
+	}
+
+	#[test]
+	fn adr587_perf_script_parser_reads_two_line_samples_in_ns_form() {
+		let text = "\
+ 707479/707479  187967.804049874:     100000      5b0e59d75732 toron::exec::join::streaming::NeqExistenceSummary::find_bucket_in
+  /home/x/streaming.rs:2055
+ 707479/707480  187967.804149627:      99000      72e98caa8a0f [unknown]
+  [vdso][a0f]
+ 707479/707479  187967.804249544:     100000      5b0e59d75767 write_batch+0x2f44 (inlined)
+  streaming.rs:1800
+";
+		let samples = adr587_parse_perf_script(text).expect("parse");
+		assert_eq!(samples.len(), 3);
+		assert_eq!(samples[0].pid, 707479);
+		assert_eq!(samples[0].tid, 707479);
+		assert_eq!(samples[0].time_ns, 187_967_804_049_874);
+		assert_eq!(samples[0].period, 100_000);
+		assert_eq!(samples[0].source_file, "streaming.rs");
+		assert_eq!(samples[0].line, Some(2055));
+		assert!(samples[0].symbol.ends_with("find_bucket_in"));
+		assert_eq!(samples[1].tid, 707480);
+		assert_eq!(samples[1].line, None);
+		assert_eq!(samples[2].line, Some(1800));
+		let error =
+			adr587_parse_perf_script(" 1/1  187967.804049:  100000  5b0e59d75732 sym\n  a.rs:1\n")
+				.expect_err("microsecond time refused");
+		assert!(error.contains("--ns"), "{error}");
+	}
+
+	#[test]
+	fn adr587_perf_header_parser_requires_both_counts() {
+		let header = adr587_parse_perf_header(
+			"# Total Lost Samples: 0\n#\n# Samples: 34K of event 'task-clock:u'\n",
+		)
+		.unwrap();
+		assert_eq!(header.samples, 34_000);
+		assert_eq!(header.lost_samples, 0);
+		let header =
+			adr587_parse_perf_header("# Total Lost Samples: 12\n# Samples: 512  of event 'x'\n")
+				.unwrap();
+		assert_eq!((header.samples, header.lost_samples), (512, 12));
+		assert!(adr587_parse_perf_header("# Samples: 3 of event\n").is_err());
+	}
+
+	fn adr587_sample(tid: u64, time_ns: u64, symbol: &str, line: Option<u32>) -> Adr587Sample {
+		Adr587Sample {
+			pid: 42,
+			tid,
+			time_ns,
+			period: 100,
+			symbol: symbol.to_string(),
+			source_file: "streaming.rs".to_string(),
+			line,
+		}
+	}
+
+	fn adr587_test_windows() -> Adr587WindowSet {
+		Adr587WindowSet {
+			summary: "semi",
+			pid: 42,
+			rows: vec![
+				Adr587Window {
+					start_ns: 1_000,
+					end_ns: 2_000,
+					tid: 7,
+				},
+				Adr587Window {
+					start_ns: 3_000,
+					end_ns: 4_000,
+					tid: 7,
+				},
+			],
+			growth: vec![Adr587Window {
+				start_ns: 1_200,
+				end_ns: 1_400,
+				tid: 7,
+			}],
+		}
+	}
+
+	// Half-open edges, thread binding, nested precedence, class placement, and exact identities.
+	#[test]
+	fn adr587_binner_places_samples_by_thread_window_and_class() {
+		let windows = adr587_test_windows();
+		let samples = vec![
+			adr587_sample(7, 1_000, "poll", Some(1_610)), // start edge: inside, shared
+			adr587_sample(7, 2_000, "poll", Some(1_610)), // end edge: outside
+			adr587_sample(9, 1_500, "poll", Some(1_610)), // other thread: outside every window
+			adr587_sample(7, 1_250, "poll", Some(1_610)), // inside growth: growth, not shared
+			adr587_sample(7, 1_300, "__memmove_avx_unaligned_erms", None), // growth copy
+			adr587_sample(7, 1_350, "NeqExistenceSummary::find_bucket_in", Some(2_075)), // rehash
+			adr587_sample(7, 1_500, "NeqExistenceSummary::find_bucket_in", Some(2_075)), // rows: probe
+			adr587_sample(7, 1_600, "poll", Some(1_660)), // append lines: probe
+			adr587_sample(7, 1_700, "poll", Some(1_710)), // matches(): unclassified line: other
+			adr587_sample(7, 1_800, "poll", None),        // unresolved line: other
+			adr587_sample(7, 3_500, "poll", Some(1_695)), // observe_value: shared
+			adr587_sample(7, 2_500, "poll", Some(1_610)), // between windows: on-thread outside
+		];
+		let bin = adr587_bin_summary(&samples, &windows);
+		assert_eq!(bin["thread_present"], true);
+		assert_eq!(bin["tids"], serde_json::json!([7]));
+		assert_eq!(bin["rows_inclusive"]["samples"], 9);
+		assert_eq!(bin["growth"]["samples"], 3);
+		assert_eq!(bin["classes"]["shared"]["samples"], 2);
+		assert_eq!(bin["classes"]["hash_and_probe"]["samples"], 2);
+		assert_eq!(bin["classes"]["other"]["samples"], 2);
+		assert_eq!(bin["classes"]["copy"]["samples"], 1);
+		assert_eq!(bin["classes"]["rehash"]["samples"], 1);
+		assert_eq!(bin["classes"]["growth_other"]["samples"], 1);
+		assert_eq!(
+			bin["on_thread_outside_windows"]["samples"], 2,
+			"end edge and the gap"
+		);
+		assert_eq!(bin["other_threads"]["samples"], 1);
+		// rows_inclusive = rows_excluding_growth + growth, exactly, in periods.
+		let rows = bin["rows_inclusive"]["period_ns"].as_u64().unwrap();
+		let growth = bin["growth"]["period_ns"].as_u64().unwrap();
+		let excluding: u64 = ADR587_ROWS_CLASSES
+			.iter()
+			.map(|c| bin["classes"][*c]["period_ns"].as_u64().unwrap())
+			.sum();
+		let growth_classes: u64 = ADR587_GROWTH_CLASSES
+			.iter()
+			.map(|c| bin["classes"][*c]["period_ns"].as_u64().unwrap())
+			.sum();
+		assert_eq!(rows, excluding + growth);
+		assert_eq!(growth, growth_classes);
+	}
+
+	#[test]
+	fn adr587_rows_windows_decoder_matches_the_engine_encoding() {
+		let windows =
+			adr587_decode_rows_windows("7@1000:0+1000;0+500;6500+1|8@10000:0+2000;10+10").unwrap();
+		assert_eq!(
+			windows,
+			vec![
+				Adr587Window {
+					start_ns: 1_000,
+					end_ns: 2_000,
+					tid: 7
+				},
+				Adr587Window {
+					start_ns: 2_000,
+					end_ns: 2_500,
+					tid: 7
+				},
+				Adr587Window {
+					start_ns: 9_000,
+					end_ns: 9_001,
+					tid: 7
+				},
+				Adr587Window {
+					start_ns: 10_000,
+					end_ns: 12_000,
+					tid: 8
+				},
+				Adr587Window {
+					start_ns: 12_010,
+					end_ns: 12_020,
+					tid: 8
+				},
+			]
+		);
+		assert!(adr587_decode_rows_windows("").unwrap().is_empty());
+		assert!(adr587_decode_rows_windows("7@1000:0-5").is_err());
+		let set = Adr587WindowSet::from_diagnostic(
+			"semi",
+			&serde_json::json!({"pid": 1, "rows_windows": "7@1000:0+10;0+10", "rows_window_count": 2, "growth_windows": [[1002, 1004, 7, 1, 1024]]}),
+		)
+		.unwrap();
+		assert_eq!(set.rows.len(), 2);
+		assert_eq!(set.growth[0].tid, 7);
+		let error = Adr587WindowSet::from_diagnostic(
+			"semi",
+			&serde_json::json!({"pid": 1, "rows_windows": "7@1000:0+10", "rows_window_count": 2, "growth_windows": []}),
+		)
+		.unwrap_err();
+		assert!(error.contains("disagrees"), "{error}");
+	}
+
+	// A summary whose windows span two threads needs both sampled; one absent is reported by id.
+	#[test]
+	fn adr587_binner_requires_every_window_thread_to_be_sampled() {
+		let mut windows = adr587_test_windows();
+		windows.rows.push(Adr587Window {
+			start_ns: 5_000,
+			end_ns: 6_000,
+			tid: 8,
+		});
+		let samples = vec![
+			adr587_sample(7, 1_500, "poll", Some(1_615)),
+			adr587_sample(7, 3_500, "poll", Some(1_615)),
+		];
+		let bin = adr587_bin_summary(&samples, &windows);
+		assert_eq!(bin["tids"], serde_json::json!([7, 8]));
+		assert_eq!(bin["thread_present"], false);
+		assert_eq!(bin["missing_tids"], serde_json::json!([8]));
+		let samples = vec![
+			adr587_sample(7, 1_500, "poll", Some(1_615)),
+			adr587_sample(8, 5_500, "poll", Some(1_615)),
+		];
+		let bin = adr587_bin_summary(&samples, &windows);
+		assert_eq!(bin["thread_present"], true);
+		assert_eq!(bin["missing_tids"], serde_json::json!([]));
+		assert_eq!(bin["rows_inclusive"]["samples"], 2);
+	}
+
+	// Empty bins and ties carry no ranking: declaration order is never a leader.
+	#[test]
+	fn adr587_ranking_is_unresolved_for_empty_bins_and_ties() {
+		let order = |values: [u64; 3]| {
+			let mut order = vec![
+				("hash_and_probe".to_string(), values[0]),
+				("shared".to_string(), values[1]),
+				("other".to_string(), values[2]),
+			];
+			order.sort_by(|left, right| right.1.cmp(&left.1));
+			order
+		};
+		let zero = vec![order([0, 0, 0]); 5];
+		assert_eq!(
+			adr587_ranking_value(&zero)["status"],
+			"unresolved_no_samples"
+		);
+		assert!(adr587_ranking_value(&zero)["leading_class"].is_null());
+		let mut tied = vec![order([500, 100, 20]); 5];
+		tied[3] = order([500, 500, 20]);
+		assert_eq!(
+			adr587_ranking_value(&tied)["status"],
+			"unresolved_tie_at_the_top"
+		);
+		let mut one_empty = vec![order([500, 100, 20]); 5];
+		one_empty[4] = order([0, 0, 0]);
+		assert_eq!(
+			adr587_ranking_value(&one_empty)["status"],
+			"unresolved_no_samples"
+		);
+		let consistent = vec![order([500, 100, 20]); 5];
+		let value = adr587_ranking_value(&consistent);
+		assert_eq!(value["status"], "consistent_observation");
+		assert_eq!(value["leading_class"], "hash_and_probe");
+		assert_eq!(
+			value["period_ns_per_pair"][0],
+			serde_json::json!([500, 100, 20])
+		);
+		assert_eq!(adr587_ranking_value(&[])["status"], "unresolved_no_pairs");
+	}
+
+	#[test]
+	fn adr587_binner_reports_an_absent_thread() {
+		let windows = adr587_test_windows();
+		let samples = vec![adr587_sample(9, 1_500, "poll", Some(1_615))];
+		let bin = adr587_bin_summary(&samples, &windows);
+		assert_eq!(bin["thread_present"], false);
+		assert_eq!(bin["rows_inclusive"]["samples"], 0);
+	}
+
+	/// An ADR 587 row: the ADR 586 fixture under 587's tags with the fifth band and profiler
+	/// bins. `grow`/`excluding` are the semi insert's exact terms in micros; the residual is
+	/// whatever the 1,700,000 µs insert child leaves. `rows_class_periods` are the semi's
+	/// sampled periods for hash_and_probe, shared, other.
+	fn adr587_fixture_row(
+		pair: usize,
+		on: bool,
+		grow: u64,
+		excluding: u64,
+		rows_class_periods: [u64; 3],
+	) -> serde_json::Value {
+		let mut row = adr586_fixture_row(
+			pair,
+			on,
+			[0, 0, 500_000, 1_700_000],
+			[200_000, 0, 400_000, 1_100_000],
+		);
+		for (from, to) in [
+			("adr586_pair", "adr587_pair"),
+			("adr586_arm", "adr587_arm"),
+			("adr586_pair_position", "adr587_pair_position"),
+		] {
+			let value = row[from].take();
+			row[to] = value;
+			row.as_object_mut().unwrap().remove(from);
+		}
+		if on {
+			let receipt = row
+				.pointer_mut(
+					"/node_attribution/aggregate_invocations/0/inclusive_lifecycle_receipt",
+				)
+				.expect("fixture receipt");
+			for (summary, insert, grow, excluding) in [
+				("semi", 1_700_000u64, grow, excluding),
+				("anti", 1_100_000u64, 100_000, 950_000),
+			] {
+				let rows = grow + excluding;
+				receipt[format!("{summary}_insert_rows_micros")] = serde_json::json!(rows);
+				receipt[format!("{summary}_insert_rows_windows")] = serde_json::json!(5_859);
+				receipt[format!("{summary}_insert_grow_micros")] = serde_json::json!(grow);
+				receipt[format!("{summary}_insert_grow_events")] = serde_json::json!(14);
+				receipt[format!("{summary}_insert_rows_excluding_grow_micros")] =
+					serde_json::json!(excluding);
+				receipt[format!("{summary}_insert_residual_micros")] =
+					serde_json::json!(insert - rows);
+			}
+			let mut summaries = serde_json::Map::new();
+			for (summary, grow, periods) in [
+				("semi", grow, rows_class_periods),
+				("anti", 100_000u64, [500_000u64, 300_000, 50_000]),
+			] {
+				let growth_ns = grow * 1_000;
+				let rows_ns = periods.iter().sum::<u64>() + growth_ns;
+				summaries.insert(
+					summary.to_string(),
+					serde_json::json!({
+						"summary": summary,
+						"pid": 42,
+						"tids": [7],
+						"thread_present": true,
+						"rows_inclusive": {"samples": rows_ns / 100_000, "period_ns": rows_ns},
+						"growth": {"samples": growth_ns / 100_000, "period_ns": growth_ns},
+						"classes": {
+							"hash_and_probe": {"samples": periods[0] / 100_000, "period_ns": periods[0]},
+							"shared": {"samples": periods[1] / 100_000, "period_ns": periods[1]},
+							"other": {"samples": periods[2] / 100_000, "period_ns": periods[2]},
+							"copy": {"samples": 1, "period_ns": growth_ns / 2},
+							"rehash": {"samples": 1, "period_ns": growth_ns / 2},
+							"growth_other": {"samples": 0, "period_ns": 0},
+						},
+						"on_thread_outside_windows": {"samples": 10, "period_ns": 1_000_000},
+						"other_threads": {"samples": 0, "period_ns": 0},
+						"estimated_coverage_ratio": 0.97,
+						"unexplained_discrepancy_ns": 30_000,
+					}),
+				);
+			}
+			row["adr587_bins"] = serde_json::json!({
+				"total_samples": 130_000,
+				"lost_samples": 0,
+				"parsed_samples": 130_000,
+				"summaries": summaries,
+			});
+		}
+		row
+	}
+
+	fn adr587_rows(grow: u64, excluding: u64, periods: [u64; 3]) -> Vec<serde_json::Value> {
+		(0..ADR585_PAIRS)
+			.flat_map(|pair| {
+				[
+					adr587_fixture_row(pair, false, grow, excluding, periods),
+					adr587_fixture_row(pair, true, grow, excluding, periods),
+				]
+			})
+			.collect()
+	}
+
+	// Fixture off arms run 10,000..10,400 ms: off range 400, floor 800, a lead must beat 400.
+	#[test]
+	fn adr587_growth_owner_is_priced_gross_and_the_row_ranking_is_an_observation() {
+		let rows = adr587_rows(1_100_000, 550_000, [400_000_000, 100_000_000, 20_000_000]);
+		let summary = evaluate_adr587_pairs(&rows).expect("complete fixture");
+		assert_eq!(summary["owner_floor_ms"], 800.0);
+		assert_eq!(summary["owner"]["status"], "resolved");
+		assert_eq!(summary["owner"]["term"], "semi_insert_grow");
+		assert_eq!(
+			summary["owner_removable_pricing"]["status"],
+			"gross_removable"
+		);
+		assert_eq!(
+			summary["semi_rows_ranking"]["status"],
+			"consistent_observation"
+		);
+		assert_eq!(
+			summary["semi_rows_ranking"]["leading_class"],
+			"hash_and_probe"
+		);
+		let classes = summary["semi_rows_classes"].as_array().unwrap();
+		assert_eq!(classes[0]["class"], "hash_and_probe");
+		assert!((classes[0]["share_all_pairs"].as_f64().unwrap() - 400.0 / 520.0).abs() < 1e-9);
+		assert_eq!(
+			summary["adr586_five_term_owner"]["term"],
+			"semi_write_insert"
+		);
+		let band = &summary["adr587_pair_bands"][0];
+		assert_eq!(band["semi_insert_residual_micros"], 50_000);
+		assert_eq!(band["semi_insert_residual_complete"], true);
+		assert_eq!(band["semi_insert_grow_events"], 14);
+		assert!(
+			(summary["semi_coverage"]["estimated_coverage_ratio_median"]
+				.as_f64()
+				.unwrap() - 0.97)
+				.abs() < 1e-9
+		);
+	}
+
+	#[test]
+	fn adr587_row_loop_owner_is_not_removable() {
+		let rows = adr587_rows(200_000, 1_450_000, [400_000_000, 100_000_000, 20_000_000]);
+		let summary = evaluate_adr587_pairs(&rows).expect("row loop fixture");
+		assert_eq!(summary["owner"]["term"], "semi_insert_rows_excluding_grow");
+		assert_eq!(
+			summary["owner_removable_pricing"]["status"],
+			"not_removable"
+		);
+	}
+
+	#[test]
+	fn adr587_reports_ties_and_below_floor() {
+		let rows = adr587_rows(850_000, 800_000, [400_000_000, 100_000_000, 20_000_000]);
+		let summary = evaluate_adr587_pairs(&rows).expect("tie fixture");
+		assert_eq!(
+			summary["owner"]["status"],
+			"unresolved_tie_within_off_range"
+		);
+		let rows = adr587_rows(780_000, 780_000, [400_000_000, 100_000_000, 20_000_000]);
+		let summary = evaluate_adr587_pairs(&rows).expect("below-floor fixture");
+		assert_eq!(summary["owner"]["status"], "below_floor_no_mechanism");
+		assert_eq!(summary["owner_removable_pricing"]["status"], "no_owner");
+	}
+
+	#[test]
+	fn adr587_ranking_is_unresolved_when_it_changes_or_other_leads() {
+		let mut rows = adr587_rows(1_100_000, 550_000, [400_000_000, 100_000_000, 20_000_000]);
+		let bins = rows[1]
+			.pointer_mut("/adr587_bins/summaries/semi/classes")
+			.unwrap();
+		bins["shared"]["period_ns"] = serde_json::json!(450_000_000);
+		let summary = evaluate_adr587_pairs(&rows).expect("changed ranking");
+		assert_eq!(
+			summary["semi_rows_ranking"]["status"],
+			"unresolved_ranking_changes_between_pairs"
+		);
+		assert!(summary["semi_rows_ranking"]["leading_class"].is_null());
+		// The owner rule is unaffected: it reads wall terms only.
+		assert_eq!(summary["owner"]["term"], "semi_insert_grow");
+
+		let rows = adr587_rows(1_100_000, 550_000, [100_000_000, 100_000_000, 400_000_000]);
+		let summary = evaluate_adr587_pairs(&rows).expect("other leads");
+		assert_eq!(
+			summary["semi_rows_ranking"]["status"],
+			"unresolved_other_leads"
+		);
+	}
+
+	#[test]
+	fn adr587_refuses_lost_samples_absent_threads_and_broken_algebra() {
+		let mut rows = adr587_rows(1_100_000, 550_000, [400_000_000, 100_000_000, 20_000_000]);
+		rows[1]["adr587_bins"]["lost_samples"] = serde_json::json!(3);
+		assert!(
+			evaluate_adr587_pairs(&rows)
+				.unwrap_err()
+				.contains("lost samples")
+		);
+
+		let mut rows = adr587_rows(1_100_000, 550_000, [400_000_000, 100_000_000, 20_000_000]);
+		rows[1]["adr587_bins"]["summaries"]["anti"]["thread_present"] = serde_json::json!(false);
+		rows[1]["adr587_bins"]["summaries"]["anti"]["missing_tids"] = serde_json::json!([9]);
+		let error = evaluate_adr587_pairs(&rows).unwrap_err();
+		assert!(
+			error.contains("window thread is absent") && error.contains("[9]"),
+			"{error}"
+		);
+
+		// Five all-zero profiles are unresolved, never a leader in declaration order.
+		let mut rows = adr587_rows(1_100_000, 550_000, [0, 0, 0]);
+		for row in rows.iter_mut().filter(|row| row["adr587_arm"] == "on") {
+			row["adr587_bins"]["summaries"]["semi"]["rows_inclusive"]["period_ns"] =
+				serde_json::json!(1_100_000_000u64);
+		}
+		let summary = evaluate_adr587_pairs(&rows).expect("empty bins remain reportable");
+		assert_eq!(
+			summary["semi_rows_ranking"]["status"],
+			"unresolved_no_samples"
+		);
+		assert!(summary["semi_rows_ranking"]["leading_class"].is_null());
+
+		let mut rows = adr587_rows(1_100_000, 550_000, [400_000_000, 100_000_000, 20_000_000]);
+		let receipt = rows[1]
+			.pointer_mut("/node_attribution/aggregate_invocations/0/inclusive_lifecycle_receipt")
+			.unwrap();
+		receipt["semi_insert_grow_micros"] = serde_json::json!(1);
+		assert!(
+			evaluate_adr587_pairs(&rows)
+				.unwrap_err()
+				.contains("insert algebra does not reconcile")
+		);
+	}
+
+	#[test]
+	fn adr587_an_incomplete_insert_residual_withholds_the_owner() {
+		// A 300 ms insert residual exceeds overhead (100 ms) + 5% of a 1.7 s insert (85 ms).
+		let rows = adr587_rows(1_100_000, 300_000, [400_000_000, 100_000_000, 20_000_000]);
+		let summary = evaluate_adr587_pairs(&rows).expect("incomplete samples remain reportable");
+		assert_eq!(summary["all_insert_residuals_complete"], false);
+		assert_eq!(summary["owner"]["status"], "withheld_incomplete_profiles");
 	}
 
 	#[test]

@@ -12,6 +12,7 @@ otlp-grpc = ["telemetry", "observability/otlp-grpc"]
 test-support = ["wendelon/test-support"]
 
 [dependencies]
+libc = "0.2"
 arrow.workspace = true
 arrow-cast = { version = "58.3.0", features = ["prettyprint"] }
 arrow-schema.workspace = true
