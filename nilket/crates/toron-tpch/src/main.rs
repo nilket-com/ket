@@ -2472,90 +2472,91 @@ const ADR587_LINE_CLASSES: [Adr587LineRange; 14] = [
 		end: 1637,
 		anchor: "fn insert_with<const INSTRUMENTED: bool>(",
 	},
-	// insert_with: the lookup counters, the lookup, and the found path.
+	// insert_with: the lookup counters, the single probe, and the found path.
 	Adr587LineRange {
 		class: "hash_and_probe",
 		start: 1638,
-		end: 1660,
+		end: 1665,
 		anchor: "if INSTRUMENTED {",
 	},
 	// insert_with: the capacity check that precedes growth (growth itself is a window).
 	Adr587LineRange {
 		class: "hash_and_probe",
-		start: 1661,
-		end: 1672,
+		start: 1666,
+		end: 1677,
 		anchor: "let grew = self.entries.len() == self.entry_limit;",
 	},
-	// insert_with: the second walk and the append.
+	// insert_with: bucket reuse or the post-growth re-probe, and the append.
 	Adr587LineRange {
 		class: "hash_and_probe",
-		start: 1673,
-		end: 1717,
+		start: 1678,
+		end: 1726,
 		anchor: "let entry_index =",
 	},
 	Adr587LineRange {
 		class: "shared",
-		start: 1718,
-		end: 1727,
+		start: 1727,
+		end: 1736,
 		anchor: "fn observe_value(&mut self, entry_index: usize, value: i64) {",
 	},
 	Adr587LineRange {
 		class: "shared",
-		start: 1814,
-		end: 1888,
+		start: 1823,
+		end: 1897,
 		anchor: "fn write_batch_with<const INSTRUMENTED: bool>(",
 	},
 	Adr587LineRange {
 		class: "growth_other",
-		start: 1889,
-		end: 1925,
+		start: 1898,
+		end: 1934,
 		anchor: "fn grow(&mut self, baseline_bytes: u64, cap: u64) -> Result<(), ExecutionError> {",
 	},
 	Adr587LineRange {
 		class: "growth_other",
-		start: 1926,
-		end: 2018,
+		start: 1935,
+		end: 2027,
 		anchor: "fn resize_capacity(",
 	},
 	Adr587LineRange {
 		class: "rehash",
-		start: 2019,
-		end: 2025,
+		start: 2028,
+		end: 2034,
 		anchor: "for (entry_index, entry) in self.entries.iter().enumerate() {",
 	},
 	Adr587LineRange {
 		class: "growth_other",
-		start: 2026,
-		end: 2040,
+		start: 2035,
+		end: 2049,
 		anchor: "",
 	},
+	// lookup_entry_index, probe_with, find_bucket (test-only), find_bucket_in.
 	Adr587LineRange {
 		class: "hash_and_probe",
-		start: 2041,
-		end: 2067,
+		start: 2050,
+		end: 2087,
 		anchor: "fn lookup_entry_index(&self, key: i64) -> Option<usize> {",
 	},
 	Adr587LineRange {
 		class: "hash_and_probe",
-		start: 2068,
-		end: 2126,
-		anchor: "fn find_bucket(&self, key: i64) -> Result<usize, ExecutionError> {",
+		start: 2088,
+		end: 2142,
+		anchor: "fn find_bucket_in(",
 	},
 	Adr587LineRange {
 		class: "shared",
-		start: 2127,
-		end: 2136,
+		start: 2143,
+		end: 2152,
 		anchor: "fn is_multi(&self, entry_index: usize) -> bool {",
 	},
 	Adr587LineRange {
 		class: "shared",
-		start: 2137,
-		end: 2144,
+		start: 2153,
+		end: 2160,
 		anchor: "fn set_multi(&mut self, entry_index: usize) {",
 	},
 ];
 /// Lines inside `resize_capacity` that copy or initialise the grown arrays.
-const ADR587_COPY_LINES: [u32; 4] = [1959, 1985, 1987, 2017];
+const ADR587_COPY_LINES: [u32; 4] = [1968, 1994, 1996, 2026];
 
 fn adr587_is_copy_symbol(symbol: &str) -> bool {
 	[
@@ -10950,18 +10951,18 @@ mod tests {
 	fn adr587_binner_places_samples_by_thread_window_and_class() {
 		let windows = adr587_test_windows();
 		let samples = vec![
-			adr587_sample(7, 1_000, "poll", Some(1_625)), // start edge: inside, shared
-			adr587_sample(7, 2_000, "poll", Some(1_625)), // end edge: outside
-			adr587_sample(9, 1_500, "poll", Some(1_625)), // other thread: outside every window
-			adr587_sample(7, 1_250, "poll", Some(1_625)), // inside growth: growth, not shared
+			adr587_sample(7, 1_000, "poll", Some(1_620)), // start edge: inside, shared
+			adr587_sample(7, 2_000, "poll", Some(1_620)), // end edge: outside
+			adr587_sample(9, 1_500, "poll", Some(1_620)), // other thread: outside every window
+			adr587_sample(7, 1_250, "poll", Some(1_620)), // inside growth: growth, not shared
 			adr587_sample(7, 1_300, "__memmove_avx_unaligned_erms", None), // growth copy
-			adr587_sample(7, 1_350, "NeqExistenceSummary::find_bucket_in", Some(2_100)), // rehash
-			adr587_sample(7, 1_500, "NeqExistenceSummary::find_bucket_in", Some(2_100)), // rows: probe
-			adr587_sample(7, 1_600, "poll", Some(1_690)), // append lines: probe
-			adr587_sample(7, 1_700, "poll", Some(1_745)), // matches(): unclassified line: other
+			adr587_sample(7, 1_350, "NeqExistenceSummary::find_bucket_in", Some(2_110)), // rehash
+			adr587_sample(7, 1_500, "NeqExistenceSummary::find_bucket_in", Some(2_110)), // rows: probe
+			adr587_sample(7, 1_600, "poll", Some(1_700)), // append lines: probe
+			adr587_sample(7, 1_700, "poll", Some(1_760)), // matches(): unclassified line: other
 			adr587_sample(7, 1_800, "poll", None),        // unresolved line: other
-			adr587_sample(7, 3_500, "poll", Some(1_722)), // observe_value: shared
-			adr587_sample(7, 2_500, "poll", Some(1_625)), // between windows: on-thread outside
+			adr587_sample(7, 3_500, "poll", Some(1_730)), // observe_value: shared
+			adr587_sample(7, 2_500, "poll", Some(1_620)), // between windows: on-thread outside
 		];
 		// The fixture lines must sit in the classes the comments claim, under the current table.
 		let class_of = |line: u32| {
@@ -10970,11 +10971,11 @@ mod tests {
 				.find(|range| line >= range.start && line <= range.end)
 				.map(|range| range.class)
 		};
-		assert_eq!(class_of(1_625), Some("shared"));
-		assert_eq!(class_of(1_690), Some("hash_and_probe"));
-		assert_eq!(class_of(1_722), Some("shared"));
-		assert_eq!(class_of(1_745), None, "matches() is unclassified");
-		assert_eq!(class_of(2_100), Some("hash_and_probe"));
+		assert_eq!(class_of(1_620), Some("shared"));
+		assert_eq!(class_of(1_700), Some("hash_and_probe"));
+		assert_eq!(class_of(1_730), Some("shared"));
+		assert_eq!(class_of(1_760), None, "matches() is unclassified");
+		assert_eq!(class_of(2_110), Some("hash_and_probe"));
 		let bin = adr587_bin_summary(&samples, &windows);
 		assert_eq!(bin["thread_present"], true);
 		assert_eq!(bin["tids"], serde_json::json!([7]));
@@ -11067,16 +11068,16 @@ mod tests {
 			tid: 8,
 		});
 		let samples = vec![
-			adr587_sample(7, 1_500, "poll", Some(1_625)),
-			adr587_sample(7, 3_500, "poll", Some(1_625)),
+			adr587_sample(7, 1_500, "poll", Some(1_620)),
+			adr587_sample(7, 3_500, "poll", Some(1_620)),
 		];
 		let bin = adr587_bin_summary(&samples, &windows);
 		assert_eq!(bin["tids"], serde_json::json!([7, 8]));
 		assert_eq!(bin["thread_present"], false);
 		assert_eq!(bin["missing_tids"], serde_json::json!([8]));
 		let samples = vec![
-			adr587_sample(7, 1_500, "poll", Some(1_625)),
-			adr587_sample(8, 5_500, "poll", Some(1_625)),
+			adr587_sample(7, 1_500, "poll", Some(1_620)),
+			adr587_sample(8, 5_500, "poll", Some(1_620)),
 		];
 		let bin = adr587_bin_summary(&samples, &windows);
 		assert_eq!(bin["thread_present"], true);
@@ -11128,7 +11129,7 @@ mod tests {
 	#[test]
 	fn adr587_binner_reports_an_absent_thread() {
 		let windows = adr587_test_windows();
-		let samples = vec![adr587_sample(9, 1_500, "poll", Some(1_625))];
+		let samples = vec![adr587_sample(9, 1_500, "poll", Some(1_620))];
 		let bin = adr587_bin_summary(&samples, &windows);
 		assert_eq!(bin["thread_present"], false);
 		assert_eq!(bin["rows_inclusive"]["samples"], 0);
