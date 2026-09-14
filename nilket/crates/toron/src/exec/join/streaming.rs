@@ -1788,6 +1788,8 @@ impl NeqExistenceSummary {
 	fn write_batch(
 		&mut self,
 
+		partition: usize,
+
 		batch: &RecordBatch,
 
 		existence_key: ColumnOrdinal,
@@ -1798,13 +1800,15 @@ impl NeqExistenceSummary {
 
 		cap: u64,
 	) -> Result<(), ExecutionError> {
+		let mut instrument = InsertInstrument::default();
+		instrument.partition = partition;
 		self.write_batch_with::<false>(
 			batch,
 			existence_key,
 			existence_value,
 			baseline_bytes,
 			cap,
-			&mut InsertInstrument::default(),
+			&mut instrument,
 		)
 	}
 
@@ -3188,6 +3192,122 @@ pub(in crate::exec) enum StreamingExistenceOp<'a> {
 	},
 }
 
+/// ADR 589's admission of the order-aware build for one existence summary: whether the Exchange
+/// routes rows by a pure function of the summary's existence key, proved from the decoded op
+/// chain by tracing both ordinals to the scan. The chain is scan-first; the Exchange's key is a
+/// column of its input, traced through only the Projects before the Exchange; the existence key
+/// is a column of the chain's output, traced through every Project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::exec) enum OrderAwareAdmission {
+	Admitted {
+		exchange_index: usize,
+		scan_column: ColumnOrdinal,
+	},
+	Refused {
+		reason: &'static str,
+	},
+}
+
+impl OrderAwareAdmission {
+	// Consumed by the order-aware build; the hashed build records admission without acting on it.
+	#[allow(dead_code)]
+	pub(in crate::exec) fn is_admitted(&self) -> bool {
+		matches!(self, Self::Admitted { .. })
+	}
+
+	pub(in crate::exec) fn json_value(&self) -> serde_json::Value {
+		match self {
+			Self::Admitted {
+				exchange_index,
+				scan_column,
+			} => serde_json::json!({
+				"admitted": true,
+				"exchange_op_index": exchange_index,
+				"scan_column": scan_column.0,
+			}),
+			Self::Refused { reason } => serde_json::json!({
+				"admitted": false,
+				"reason": reason,
+			}),
+		}
+	}
+}
+
+/// Trace an output ordinal of `ops[..upto]` back to a scan column through the Projects in that
+/// prefix, last Project first. A Project whose root at the ordinal is not a plain column ends
+/// the trace.
+fn trace_ordinal_to_scan(
+	ops: &[StreamingExistenceOp<'_>],
+	upto: usize,
+	ordinal: ColumnOrdinal,
+) -> Option<ColumnOrdinal> {
+	let mut current = ordinal;
+	for op in ops[..upto].iter().rev() {
+		if let StreamingExistenceOp::Project { exprs, .. } = op {
+			let roots = exprs.root_columns()?;
+			current = roots.get(current.0 as usize)?.ordinal;
+		}
+	}
+	Some(current)
+}
+
+pub(in crate::exec) fn order_aware_admission(
+	ops: &[StreamingExistenceOp<'_>],
+	existence_key: ColumnOrdinal,
+) -> OrderAwareAdmission {
+	let exchanges = ops
+		.iter()
+		.enumerate()
+		.filter(|(_, op)| matches!(op, StreamingExistenceOp::Exchange { .. }))
+		.map(|(index, _)| index)
+		.collect::<Vec<_>>();
+	let exchange_index = match exchanges.as_slice() {
+		[index] => *index,
+		[] => {
+			return OrderAwareAdmission::Refused {
+				reason: "no exchange op",
+			};
+		}
+		_ => {
+			return OrderAwareAdmission::Refused {
+				reason: "more than one exchange op",
+			};
+		}
+	};
+	let StreamingExistenceOp::Exchange { key, .. } = &ops[exchange_index] else {
+		unreachable!("index selected as an exchange")
+	};
+	let Some(root) = key.single_root() else {
+		return OrderAwareAdmission::Refused {
+			reason: "exchange key is not a single root",
+		};
+	};
+	let Some(BoundExprNode::Column(column)) = key.node(root) else {
+		return OrderAwareAdmission::Refused {
+			reason: "exchange key is not a plain column",
+		};
+	};
+	let Some(exchange_scan) = trace_ordinal_to_scan(ops, exchange_index, column.ordinal) else {
+		return OrderAwareAdmission::Refused {
+			reason: "exchange key does not trace to a scan column",
+		};
+	};
+	let Some(existence_scan) = trace_ordinal_to_scan(ops, ops.len(), existence_key) else {
+		return OrderAwareAdmission::Refused {
+			reason: "existence key does not trace to a scan column",
+		};
+	};
+	if exchange_scan != existence_scan {
+		return OrderAwareAdmission::Refused {
+			reason: "exchange key and existence key are different scan columns",
+		};
+	}
+	OrderAwareAdmission::Admitted {
+		exchange_index,
+		scan_column: exchange_scan,
+	}
+}
+
 /// The inclusive lifecycle terms one recognized existence summary publishes: the read half at the
 /// scan stream boundary, the write half after it, and the write half's four activities beside the
 /// diagnostic that lists which plan-decoded ops the summary actually carried.
@@ -3203,6 +3323,9 @@ pub(in crate::exec) struct ExistenceSummaryLifecycleTerms {
 	pub(in crate::exec) insert_rows: &'static str,
 	pub(in crate::exec) insert_grow: &'static str,
 	pub(in crate::exec) insert_windows: &'static str,
+	/// ADR 589: work the build does after its last batch, a runtime-prep child of its own.
+	pub(in crate::exec) finish: &'static str,
+	pub(in crate::exec) admission: &'static str,
 }
 
 impl ExistenceSummaryLifecycleTerms {
@@ -3217,6 +3340,8 @@ impl ExistenceSummaryLifecycleTerms {
 		insert_rows: "semi_insert_rows",
 		insert_grow: "semi_insert_grow",
 		insert_windows: "semi_insert_windows",
+		finish: "runtime_prep_semi_finish",
+		admission: "semi_write_admission",
 	};
 
 	pub(in crate::exec) const ANTI: Self = Self {
@@ -3230,6 +3355,8 @@ impl ExistenceSummaryLifecycleTerms {
 		insert_rows: "anti_insert_rows",
 		insert_grow: "anti_insert_grow",
 		insert_windows: "anti_insert_windows",
+		finish: "runtime_prep_anti_finish",
+		admission: "anti_write_admission",
 	};
 }
 
@@ -3354,6 +3481,10 @@ pub(in crate::exec) struct InsertInstrument {
 	pub(in crate::exec) boundary_straddles: u64,
 	pub(in crate::exec) found_at_straddle: u64,
 	pub(in crate::exec) found_elsewhere: u64,
+	/// ADR 589: the phases a build runs after its last batch, each its own window, in order.
+	/// Empty for a build that finishes nothing after ingestion.
+	pub(in crate::exec) finish: Vec<(&'static str, InsertWindow)>,
+	pub(in crate::exec) finish_micros: u64,
 	pub(in crate::exec) rows: Vec<InsertWindow>,
 	pub(in crate::exec) growth: Vec<InsertGrowth>,
 	pub(in crate::exec) counters: InsertCounters,
@@ -3434,6 +3565,49 @@ impl InsertInstrument {
 			.checked_add((end_ns - start_ns) / 1_000)
 			.ok_or_else(|| ExecutionError::Kernel {
 				message: "recognized Neq summary growth window sum overflowed".to_string(),
+			})?;
+		Ok(())
+	}
+
+	/// Record one finish phase's window; phases must be recorded in the order they ran.
+	// Recorded by the order-aware build's finish; the hashed build finishes nothing after its
+	// last batch and publishes the finish term at zero.
+	#[allow(dead_code)]
+	pub(in crate::exec) fn record_finish_window(
+		&mut self,
+		name: &'static str,
+		start_ns: u64,
+		end_ns: u64,
+	) -> Result<(), ExecutionError> {
+		if end_ns < start_ns {
+			return Err(ExecutionError::Kernel {
+				message: format!(
+					"recognized Neq summary finish window {name} ended before it started"
+				),
+			});
+		}
+		if let Some((_, previous)) = self.finish.last()
+			&& start_ns < previous.end_ns
+		{
+			return Err(ExecutionError::Kernel {
+				message: format!(
+					"recognized Neq summary finish window {name} overlaps its predecessor"
+				),
+			});
+		}
+		self.finish.push((
+			name,
+			InsertWindow {
+				start_ns,
+				end_ns,
+				tid: current_thread_id(),
+			},
+		));
+		self.finish_micros = self
+			.finish_micros
+			.checked_add((end_ns - start_ns) / 1_000)
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: "recognized Neq summary finish sum overflowed".to_string(),
 			})?;
 		Ok(())
 	}
@@ -3645,6 +3819,8 @@ impl InsertInstrument {
 			"buckets_final": buckets_final,
 			"rows_micros": self.rows_micros,
 			"grow_micros": self.grow_micros,
+			"finish_micros": self.finish_micros,
+			"finish_windows": self.finish.iter().map(|(name, w)| serde_json::json!([name, w.start_ns, w.end_ns, w.tid])).collect::<Vec<_>>(),
 			"order_census": {
 				"partitions": self.census.iter().enumerate().map(|(partition, census)| serde_json::json!({
 					"partition": partition,
@@ -23792,8 +23968,9 @@ impl Executor {
 					}
 				}
 				None => {
-					for (_partition, batch) in batches {
+					for (partition, batch) in batches {
 						summary.write_batch(
+							partition,
 							&batch,
 							columns.existence_key,
 							columns.existence_value,
@@ -23866,6 +24043,12 @@ impl Executor {
 					instrument.grow_micros,
 					instrument.growth.len() as u64,
 				)?;
+				node_attribution::record_inclusive_lifecycle_micros(
+					handle,
+					terms.finish,
+					instrument.finish_micros,
+					instrument.finish.len() as u64,
+				)?;
 				node_attribution::record_invocation_diagnostic(
 					handle,
 					terms.insert_windows,
@@ -23875,6 +24058,11 @@ impl Executor {
 						summary.entry_limit,
 						summary.buckets.len(),
 					),
+				);
+				node_attribution::record_invocation_diagnostic(
+					handle,
+					terms.admission,
+					order_aware_admission(&ops, columns.existence_key).json_value(),
 				);
 			}
 		}
@@ -32596,6 +32784,7 @@ mod tests {
 
 			summary
 				.write_batch(
+					0,
 					&existence,
 					ColumnOrdinal(0),
 					ColumnOrdinal(1),
@@ -33323,6 +33512,139 @@ mod tests {
 		assert_eq!(instrument.consumed.len(), instrument.rows.len());
 		assert!(instrument.consumed.iter().all(|batch| batch.partition < 2));
 		assert_eq!(summary.input_rows, 15);
+	}
+
+	/// A Project that reorders a two-column `(orderkey, suppkey)` frame to `(suppkey, orderkey)`.
+	fn adr589_swap_project() -> (BoundExprProgram, SchemaRef) {
+		let mut builder = BoundExprProgramBuilder::new();
+		for (name, ordinal) in [("suppkey", 1), ("orderkey", 0)] {
+			let column = builder.append_column(ResolvedColumn {
+				name: ColumnName(name.to_string()),
+				ordinal: ColumnOrdinal(ordinal),
+				data_type: DataType::Int64,
+				nullable: false,
+				pbc_eligible: false,
+			});
+			builder.push_root(column);
+		}
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("suppkey", DataType::Int64, false),
+			Field::new("orderkey", DataType::Int64, false),
+		]));
+		(builder.build(), schema)
+	}
+
+	fn adr589_admission_of(plan: &ExecutionPlan, existence_key: u32) -> OrderAwareAdmission {
+		let (_, ops) = decompose_streaming_existence_plan(plan).expect("decomposes");
+		order_aware_admission(&ops, ColumnOrdinal(existence_key))
+	}
+
+	// ADR 589's admission traces ordinals to the scan, on both sides of the Exchange. Scan
+	// columns are (orderkey, suppkey) = (0, 1). A raw comparison of ordinals would wrongly
+	// refuse (a) and (b), whose ordinals differ, and wrongly admit (c), whose coincide.
+	#[test]
+	fn adr589_admission_traces_ordinals_through_projects_on_both_sides_of_the_exchange() {
+		let scan_schema = Arc::new(Schema::new(vec![
+			Field::new("orderkey", DataType::Int64, false),
+			Field::new("suppkey", DataType::Int64, false),
+		]));
+		let scan = || test_scan_plan_with_first_field_key(TableId(86), scan_schema.clone(), 86);
+		let key =
+			|ordinal: u32| bound_column_root("key", ColumnOrdinal(ordinal), DataType::Int64, false);
+
+		// (a) Exchange on input ordinal 0 (orderkey), then a swap: the existence key is output
+		// ordinal 1, which traces through the swap to scan column 0. Admitted, ordinals 1 vs 0.
+		let (swap, swapped) = adr589_swap_project();
+		let plan_a = ExecutionPlan::Project {
+			input: Box::new(exchange_plan(scan(), key(0), 4)),
+			exprs: swap,
+			output_schema: swapped.clone(),
+		};
+		assert_eq!(
+			adr589_admission_of(&plan_a, 1),
+			OrderAwareAdmission::Admitted {
+				exchange_index: 0,
+				scan_column: ColumnOrdinal(0)
+			}
+		);
+
+		// (b) Swap, Exchange on input ordinal 1 (orderkey after the first swap), swap again: the
+		// existence key is output ordinal 0, tracing 0 -> 1 -> 0 to scan column 0; the Exchange
+		// key traces 1 -> 0 through the first swap only. Admitted, ordinals 0 vs 1.
+		let (swap1, swapped1) = adr589_swap_project();
+		let (swap2, swapped2) = adr589_swap_project();
+		let plan_b = ExecutionPlan::Project {
+			input: Box::new(exchange_plan(
+				ExecutionPlan::Project {
+					input: Box::new(scan()),
+					exprs: swap1,
+					output_schema: swapped1,
+				},
+				key(1),
+				4,
+			)),
+			exprs: swap2,
+			output_schema: swapped2,
+		};
+		assert_eq!(
+			adr589_admission_of(&plan_b, 0),
+			OrderAwareAdmission::Admitted {
+				exchange_index: 1,
+				scan_column: ColumnOrdinal(0)
+			}
+		);
+
+		// (c) The decoy: Exchange on input ordinal 0 (orderkey), then a swap, existence key at
+		// output ordinal 0, which is suppkey after the swap. Ordinals coincide, columns differ.
+		let (swap, swapped) = adr589_swap_project();
+		let plan_c = ExecutionPlan::Project {
+			input: Box::new(exchange_plan(scan(), key(0), 4)),
+			exprs: swap,
+			output_schema: swapped,
+		};
+		assert_eq!(
+			adr589_admission_of(&plan_c, 0),
+			OrderAwareAdmission::Refused {
+				reason: "exchange key and existence key are different scan columns"
+			}
+		);
+
+		// (d) A computed Exchange key is not a plain column.
+		let mut computed = BoundExprProgramBuilder::new();
+		let column = computed.append_column(ResolvedColumn {
+			name: ColumnName("orderkey".to_string()),
+			ordinal: ColumnOrdinal(0),
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: false,
+		});
+		let one = computed.append_literal(ScalarValue::Int64(Some(1)));
+		let sum = computed.append_binary(BoundBinaryOp::Add, column, one, DataType::Int64);
+		computed.push_root(sum);
+		let plan_d = exchange_plan(scan(), computed.build(), 4);
+		assert_eq!(
+			adr589_admission_of(&plan_d, 0),
+			OrderAwareAdmission::Refused {
+				reason: "exchange key is not a plain column"
+			}
+		);
+
+		// (e) No Exchange at all.
+		assert_eq!(
+			adr589_admission_of(&scan(), 0),
+			OrderAwareAdmission::Refused {
+				reason: "no exchange op"
+			}
+		);
+
+		// A second Exchange is refused too.
+		let plan_f = exchange_plan(exchange_plan(scan(), key(0), 4), key(0), 2);
+		assert_eq!(
+			adr589_admission_of(&plan_f, 0),
+			OrderAwareAdmission::Refused {
+				reason: "more than one exchange op"
+			}
+		);
 	}
 
 	// The compact rows-window encoding is exact, including a thread change and a zero gap.

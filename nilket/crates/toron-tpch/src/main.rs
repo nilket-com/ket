@@ -121,6 +121,7 @@ async fn run() -> ExitCode {
 		"adr586-q21-semi-write" => adr586_q21_semi_write_command(&args),
 		"adr587-q21-insert" => adr587_q21_insert_command(&args),
 		"adr588-q21-second-walk" => adr588_q21_second_walk_command(&args),
+		"adr589-q21-order-aware" => adr589_q21_order_aware_command(&args),
 		"adr587-selfcheck-spin" => adr587_selfcheck_spin_command(),
 		"adr449-gate-zero" => adr449_gate_zero_command(&args),
 		"adr450-scale-ladder" => adr450_scale_ladder_command(&args),
@@ -1377,13 +1378,23 @@ const ADR585_SEALED_BASELINE_EXECUTABLE: &str =
 	"b436a843b107b2f385d5e7c2486c41b1d1f89acfdb4af75f8a4793c823a05ee4";
 const ADR585_ADR584_EXECUTABLE: &str =
 	"a173e8252a3f37839166a98adad8005f22d590f858121c1fb6ff3f3f6a58ec3f";
-const ADR585_TERM_FIELDS: [(&str, &str); 13] = [
+/// ADR 585's thirteen terms plus ADR 589's two finish terms, zero on a build that finishes
+/// nothing after its last batch and candidates like any other when it does not.
+const ADR585_TERM_FIELDS: [(&str, &str); 15] = [
 	("runtime_prep_inner_1", "runtime_prep_inner_1_micros"),
 	("runtime_prep_inner_2", "runtime_prep_inner_2_micros"),
 	("runtime_prep_semi_read", "runtime_prep_semi_read_micros"),
 	("runtime_prep_semi_write", "runtime_prep_semi_write_micros"),
+	(
+		"runtime_prep_semi_finish",
+		"runtime_prep_semi_finish_micros",
+	),
 	("runtime_prep_anti_read", "runtime_prep_anti_read_micros"),
 	("runtime_prep_anti_write", "runtime_prep_anti_write_micros"),
+	(
+		"runtime_prep_anti_finish",
+		"runtime_prep_anti_finish_micros",
+	),
 	("runtime_prep_residual", "runtime_prep_residual_micros"),
 	("base_prep", "base_prep_inclusive_micros"),
 	("finalize", "finalize_inclusive_micros"),
@@ -1440,6 +1451,17 @@ const ADR587_MAX_PARANOID: i64 = 2;
 const ADR588_SEALED_Q21_DIGEST: &str = "ArrowIpcDigest([253, 211, 102, 221, 152, 120, 53, 233, 227, 131, 103, 248, 201, 39, 69, 110, 137, 182, 55, 137, 86, 129, 82, 251, 87, 153, 11, 247, 152, 140, 107, 240])";
 const ADR588_ADR587_EXECUTABLE: &str =
 	"3f3a5e2c786d18a8142f4cb8477fd1360566b62bbb23e65eb5fd177620e59c36";
+
+/// ADR 589 phase 2 reuses ADR 588's paired-executable driver unchanged, under its own kind.
+fn adr589_q21_order_aware_command(args: &[String]) -> ExitCode {
+	match run_paired_executables(args, "adr589_q21_order_aware_build", "ADR 589") {
+		Ok(summary) => {
+			println!("{summary}");
+			ExitCode::SUCCESS
+		}
+		Err(message) => harness_error(&message),
+	}
+}
 
 fn adr588_q21_second_walk_command(args: &[String]) -> ExitCode {
 	match run_adr588_q21_second_walk(args) {
@@ -2504,61 +2526,61 @@ const ADR587_LINE_CLASSES: [Adr587LineRange; 14] = [
 	// write_batch_with: the column checks, the row loop, and the ADR 589 census around it.
 	Adr587LineRange {
 		class: "shared",
-		start: 1814,
-		end: 1938,
+		start: 1818,
+		end: 1942,
 		anchor: "fn write_batch_with<const INSTRUMENTED: bool>(",
 	},
 	Adr587LineRange {
 		class: "growth_other",
-		start: 1939,
-		end: 1975,
+		start: 1943,
+		end: 1979,
 		anchor: "fn grow(&mut self, baseline_bytes: u64, cap: u64) -> Result<(), ExecutionError> {",
 	},
 	Adr587LineRange {
 		class: "growth_other",
-		start: 1976,
-		end: 2068,
+		start: 1980,
+		end: 2072,
 		anchor: "fn resize_capacity(",
 	},
 	Adr587LineRange {
 		class: "rehash",
-		start: 2069,
-		end: 2075,
+		start: 2073,
+		end: 2079,
 		anchor: "for (entry_index, entry) in self.entries.iter().enumerate() {",
 	},
 	Adr587LineRange {
 		class: "growth_other",
-		start: 2076,
-		end: 2090,
+		start: 2080,
+		end: 2094,
 		anchor: "",
 	},
 	Adr587LineRange {
 		class: "hash_and_probe",
-		start: 2091,
-		end: 2117,
+		start: 2095,
+		end: 2121,
 		anchor: "fn lookup_entry_index(&self, key: i64) -> Option<usize> {",
 	},
 	Adr587LineRange {
 		class: "hash_and_probe",
-		start: 2118,
-		end: 2176,
+		start: 2122,
+		end: 2180,
 		anchor: "fn find_bucket(&self, key: i64) -> Result<usize, ExecutionError> {",
 	},
 	Adr587LineRange {
 		class: "shared",
-		start: 2177,
-		end: 2186,
+		start: 2181,
+		end: 2190,
 		anchor: "fn is_multi(&self, entry_index: usize) -> bool {",
 	},
 	Adr587LineRange {
 		class: "shared",
-		start: 2187,
-		end: 2194,
+		start: 2191,
+		end: 2198,
 		anchor: "fn set_multi(&mut self, entry_index: usize) {",
 	},
 ];
 /// Lines inside `resize_capacity` that copy or initialise the grown arrays.
-const ADR587_COPY_LINES: [u32; 4] = [2009, 2035, 2037, 2067];
+const ADR587_COPY_LINES: [u32; 4] = [2013, 2039, 2041, 2071];
 
 fn adr587_is_copy_symbol(symbol: &str) -> bool {
 	[
@@ -2847,13 +2869,24 @@ fn adr588_manifest_gate(control: &BuildManifest, treatment: &BuildManifest) -> R
 }
 
 fn run_adr588_q21_second_walk(args: &[String]) -> Result<serde_json::Value, String> {
+	run_paired_executables(args, "adr588_q21_second_walk", "ADR 588")
+}
+
+/// The paired-executable measurement ADR 588 defined: control and treatment on one recipe,
+/// phase 0 on the control, warmups, five alternating unprofiled pairs, one validator on every
+/// child, and the predeclared retention rule. `kind` names the record in the summary; the
+/// refusals keep ADR 588's wording, since the contract is ADR 588's.
+fn run_paired_executables(
+	args: &[String],
+	kind: &str,
+	label: &str,
+) -> Result<serde_json::Value, String> {
 	let mode = flag_value(args, "--mode").unwrap_or("strict");
 	let sf = resolved_sf(args)?;
 	let data_source = flag_value(args, "--data-source").unwrap_or("parquet");
 	let data_dir = data_dir_from_args(args);
-	let output_dir = PathBuf::from(
-		flag_value(args, "--output-dir").unwrap_or("target/tpch/adr588-q21-second-walk"),
-	);
+	let output_dir =
+		PathBuf::from(flag_value(args, "--output-dir").unwrap_or("target/tpch/paired-executables"));
 	if mode != "strict" || sf != 8.0 || !matches!(data_source, "parquet" | "persisted") {
 		return Err(format!(
 			"ADR 588 requires --mode strict --sf 8 --data-source parquet; got mode={mode:?} sf={sf} data_source={data_source:?}"
@@ -2998,7 +3031,7 @@ fn run_adr588_q21_second_walk(args: &[String]) -> Result<serde_json::Value, Stri
 	});
 	if phase0["tripwire"]["tripped"] == true {
 		let summary = serde_json::json!({
-			"kind": "adr588_q21_second_walk",
+			"kind": kind,
 			"outcome": "phase0_tripped",
 			"sealed": false,
 			"candidate_authority": false,
@@ -3048,7 +3081,8 @@ fn run_adr588_q21_second_walk(args: &[String]) -> Result<serde_json::Value, Stri
 		);
 	}
 	let mut summary = evaluate_adr588_pairs(&rows, &expected, &expected_dataset)?;
-	summary["kind"] = serde_json::json!("adr588_q21_second_walk");
+	summary["kind"] = serde_json::json!(kind);
+	summary["label"] = serde_json::json!(label);
 	summary["outcome"] = serde_json::json!("pairs_measured");
 	summary["sealed"] = serde_json::json!(false);
 	summary["candidate_authority"] = serde_json::json!(false);
@@ -3575,6 +3609,14 @@ fn evaluate_adr587_pairs(rows: &[serde_json::Value]) -> Result<serde_json::Value
 				serde_json::json!(residual_bound);
 			band[format!("{summary}_insert_residual_complete")] =
 				serde_json::json!(residual_complete);
+			band[format!("{summary}_insert_finish_micros")] = serde_json::json!(receipt_u64(
+				receipt,
+				&format!("{summary}_insert_finish_micros")
+			)?);
+			band[format!("{summary}_insert_total_micros")] = serde_json::json!(receipt_u64(
+				receipt,
+				&format!("{summary}_insert_total_micros")
+			)?);
 			band[format!("{summary}_sampled")] = bin.clone();
 			band[format!("{summary}_walks")] = adr587_walks_value(on, summary)?;
 			band[format!("{summary}_order_census")] = adr589_census_value(on, summary)?;
@@ -4705,8 +4747,10 @@ fn evaluate_lifecycle_pairs(
 			"runtime_prep_inner_2_micros",
 			"runtime_prep_semi_read_micros",
 			"runtime_prep_semi_write_micros",
+			"runtime_prep_semi_finish_micros",
 			"runtime_prep_anti_read_micros",
 			"runtime_prep_anti_write_micros",
+			"runtime_prep_anti_finish_micros",
 		]
 		.into_iter()
 		.try_fold(0u64, |total, field| {
@@ -4774,6 +4818,8 @@ fn evaluate_lifecycle_pairs(
 			"runtime_prep_semi_write_micros": receipt_u64(receipt, "runtime_prep_semi_write_micros")?,
 			"runtime_prep_anti_read_micros": receipt_u64(receipt, "runtime_prep_anti_read_micros")?,
 			"runtime_prep_anti_write_micros": receipt_u64(receipt, "runtime_prep_anti_write_micros")?,
+			"runtime_prep_semi_finish_micros": receipt_u64(receipt, "runtime_prep_semi_finish_micros")?,
+			"runtime_prep_anti_finish_micros": receipt_u64(receipt, "runtime_prep_anti_finish_micros")?,
 			"runtime_prep_residual_micros": runtime_residual,
 			"base_prep_inclusive_micros": base,
 			"drive_inclusive_micros": drive,
@@ -9954,7 +10000,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|adr584-q21-attribution|adr585-q21-decomposition|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|adr584-q21-attribution|adr585-q21-decomposition|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -10874,6 +10920,8 @@ mod tests {
 						"runtime_prep_semi_write_micros": 200_000,
 						"runtime_prep_anti_read_micros": 400_000,
 						"runtime_prep_anti_write_micros": 300_000,
+						"runtime_prep_semi_finish_micros": 0,
+						"runtime_prep_anti_finish_micros": 0,
 						"runtime_prep_residual_micros": 200_000,
 						"base_prep_inclusive_micros": 500_000,
 						"drive_inclusive_micros": 1_500_000,
@@ -10900,8 +10948,10 @@ mod tests {
 			"runtime_prep_inner_2_micros",
 			"runtime_prep_semi_read_micros",
 			"runtime_prep_semi_write_micros",
+			"runtime_prep_semi_finish_micros",
 			"runtime_prep_anti_read_micros",
 			"runtime_prep_anti_write_micros",
+			"runtime_prep_anti_finish_micros",
 		]
 		.into_iter()
 		.map(|field| receipt[field].as_u64().expect("fixture micros"))
@@ -11538,6 +11588,8 @@ mod tests {
 					serde_json::json!(excluding);
 				receipt[format!("{summary}_insert_residual_micros")] =
 					serde_json::json!(insert - rows);
+				receipt[format!("{summary}_insert_finish_micros")] = serde_json::json!(0);
+				receipt[format!("{summary}_insert_total_micros")] = serde_json::json!(insert);
 			}
 			let mut summaries = serde_json::Map::new();
 			for (summary, grow, periods) in [
@@ -12269,9 +12321,10 @@ mod tests {
 		assert_eq!(summary["perturbation_gate"], "accepted");
 		assert_eq!(summary["all_profiles_complete"], true);
 		assert_eq!(summary["owner_floor_ms"], 800.0);
+		// ADR 585's thirteen terms plus ADR 589's two finish terms, zero on this fixture.
 		assert_eq!(
 			summary["term_medians_scaled_ms"].as_array().unwrap().len(),
-			13
+			15
 		);
 		assert_eq!(summary["owner"]["status"], "resolved");
 		assert_eq!(summary["owner"]["term"], "runtime_prep_inner_1");

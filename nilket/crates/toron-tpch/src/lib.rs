@@ -2251,6 +2251,9 @@ pub struct PersistedPerfQuerySpec {
 	/// Carried from the dataset this spec was built against, so the row it produces reports the
 	/// verification that actually happened rather than re-reading the environment after the fact.
 	pub dataset_verification: DatasetVerification,
+	/// The persisted dataset's own manifest fingerprint (not the per-query export fingerprint
+	/// derived from it), so a row names the dataset a driver verified.
+	pub dataset_manifest_fingerprint: String,
 }
 
 /// ADR 507 step 4/5: the reader-side outer time reconciliation.
@@ -12458,7 +12461,7 @@ pub async fn run_perf_query_with_data_source(
 		"parquet" | "persisted" => {
 			let spec = build_persisted_perf_query_spec(query, mode, scale_factor, data_root)?;
 			let dataset_verification = spec.dataset_verification;
-			let dataset_manifest_fingerprint = spec.export.manifest_fingerprint.clone();
+			let dataset_manifest_fingerprint = spec.dataset_manifest_fingerprint.clone();
 			let mut attempt = run_perf_query_with_metadata(
 				spec.query_id,
 				mode,
@@ -12510,7 +12513,7 @@ pub async fn run_rune_perf_query_with_data_source(
 		"parquet" | "persisted" => {
 			let spec = build_persisted_perf_query_spec("q03", mode, scale_factor, data_root)?;
 			let dataset_verification = spec.dataset_verification;
-			let dataset_manifest_fingerprint = spec.export.manifest_fingerprint.clone();
+			let dataset_manifest_fingerprint = spec.dataset_manifest_fingerprint.clone();
 			let mut attempt = run_rune_q03_perf_query_with_metadata(
 				spec.query_id,
 				mode,
@@ -12839,6 +12842,7 @@ pub fn build_persisted_perf_query_spec(
 		}),
 		export,
 		dataset_verification: dataset.verification,
+		dataset_manifest_fingerprint: dataset.manifest_fingerprint.clone(),
 	})
 }
 
