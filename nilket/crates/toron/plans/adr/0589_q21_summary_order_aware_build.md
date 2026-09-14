@@ -1,14 +1,15 @@
 # ADR 589 - q21 existence-summary build: ordering census, then an order-aware build
 
-**Status:** PROPOSED. Successor to ADR 588. Two phases under one record.
-Phase 1 measures the order of the batches the existence summary actually
-consumes, per partition stream, and attributes every recurrence; it opens
-or closes phase 2 on that evidence alone. Phase 2, if opened, is a build
-that appends under a per-partition monotone precondition checked on every
-row, with an exact fallback that preserves all prior summary state, and
-that builds the hash index once at the end instead of probing and
-regrowing it during the build. Phase 2 is retained only on digest parity
-and the ADR 588 release-pair rule; otherwise it is reverted and closed.
+**Status:** PHASE 1 MEASURED, PHASE 2 OPEN. The ordering census ran
+2026-09-14 on tree `e4d3d0f9…` and is recorded in
+`plans/impl/0589_q21_summary_ordering_census_results.md`: `below_max` is
+zero on every partition of both summaries in every pair, `found_elsewhere`
+is zero, and every found lookup (4,370 semi, 3,155 anti) is a boundary
+straddle under the Exchange's four-way traversal, which restarts the
+consumed key range three times per source batch and never within a
+partition. The opening rule opens phase 2, whose contracts below are
+unchanged and whose retention rests on digest parity and the ADR 588
+release-pair rule. Successor to ADR 588.
 
 
 ## Context

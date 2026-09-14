@@ -1860,14 +1860,64 @@ impl NeqExistenceSummary {
 		if INSTRUMENTED {
 			let started = steady_clock_ns();
 			let growth_before = instrument.growth.len();
-			for row in 0..batch.num_rows() {
-				self.insert_with::<true>(
-					keys.value(row),
-					values.value(row),
-					baseline_bytes,
-					cap,
-					instrument,
-				)?;
+			let partition = instrument.partition;
+			if instrument.census.len() <= partition {
+				instrument
+					.census
+					.resize(partition + 1, PartitionOrderCensus::default());
+			}
+			let rows = batch.num_rows();
+			for row in 0..rows {
+				let key = keys.value(row);
+				// Classify against the partition's running maximum before the insert moves it,
+				// for every row the consecutive-key cache would not absorb.
+				let cache_hit = self.last_entry.is_some_and(|(last, _)| last == key);
+				let found_before = instrument.counters.lookup_found;
+				self.insert_with::<true>(key, values.value(row), baseline_bytes, cap, instrument)?;
+				if cache_hit {
+					continue;
+				}
+				let census = &mut instrument.census[partition];
+				let straddle = row == 0 && census.previous_batch_last == Some(key);
+				match census.max {
+					Some(max) if key < max => census.below_max += 1,
+					Some(max) if key == max => {
+						census.equal_max += 1;
+						if straddle {
+							instrument.boundary_straddles += 1;
+						}
+					}
+					_ => {
+						census.above_max += 1;
+						census.max = Some(key);
+					}
+				}
+				if instrument.counters.lookup_found > found_before {
+					if straddle {
+						instrument.found_at_straddle += 1;
+					} else {
+						instrument.found_elsewhere += 1;
+					}
+				}
+			}
+			if rows > 0 {
+				let first_key = keys.value(0);
+				let last_key = keys.value(rows - 1);
+				let census = &mut instrument.census[partition];
+				let restart = census
+					.previous_batch_last
+					.is_some_and(|previous| first_key < previous);
+				census.batches += 1;
+				if restart {
+					census.restarts += 1;
+				}
+				census.previous_batch_last = Some(last_key);
+				instrument.consumed.push(ConsumedBatch {
+					partition,
+					first_key,
+					last_key,
+					restart,
+				});
 			}
 			let ended = steady_clock_ns();
 			instrument.record_rows_window(started, ended, growth_before)?;
@@ -3270,9 +3320,40 @@ pub(in crate::exec) struct InsertGrowth {
 /// windows nested inside them, exact counters, and the micros the windows sum to. Nothing here
 /// is read per row except the counters; the windows are two clock reads per batch and two per
 /// growth event.
+/// ADR 589's ordering census for one partition stream of one summary build. `max` is the
+/// running maximum of every key delivered on the stream, `None` until its first key, so a
+/// first key of `i64::MIN` is above it rather than equal to a sentinel.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(in crate::exec) struct PartitionOrderCensus {
+	pub(in crate::exec) max: Option<i64>,
+	pub(in crate::exec) previous_batch_last: Option<i64>,
+	pub(in crate::exec) above_max: u64,
+	pub(in crate::exec) equal_max: u64,
+	pub(in crate::exec) below_max: u64,
+	pub(in crate::exec) batches: u64,
+	pub(in crate::exec) restarts: u64,
+}
+
+/// One consumed partition batch as the census records it: its partition, first key, last key,
+/// and whether its first key was below the previous batch's last key on the same partition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::exec) struct ConsumedBatch {
+	pub(in crate::exec) partition: usize,
+	pub(in crate::exec) first_key: i64,
+	pub(in crate::exec) last_key: i64,
+	pub(in crate::exec) restart: bool,
+}
+
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub(in crate::exec) struct InsertInstrument {
 	pub(in crate::exec) pid: u64,
+	/// The Exchange partition of the batch being written; set by the writer before each call.
+	pub(in crate::exec) partition: usize,
+	pub(in crate::exec) census: Vec<PartitionOrderCensus>,
+	pub(in crate::exec) consumed: Vec<ConsumedBatch>,
+	pub(in crate::exec) boundary_straddles: u64,
+	pub(in crate::exec) found_at_straddle: u64,
+	pub(in crate::exec) found_elsewhere: u64,
 	pub(in crate::exec) rows: Vec<InsertWindow>,
 	pub(in crate::exec) growth: Vec<InsertGrowth>,
 	pub(in crate::exec) counters: InsertCounters,
@@ -3446,6 +3527,92 @@ impl InsertInstrument {
 		Ok(windows)
 	}
 
+	/// The consumed batches as one compact string: `p:first:last:r;...` with `first` written as
+	/// a delta from the previous batch's last key on the same partition (absolute for the first
+	/// batch on a partition, prefixed `=`), `last` as a delta from `first`, and `r` as `!` for a
+	/// restart or empty. Exact integers; the driver decodes it.
+	pub(in crate::exec) fn encode_consumed(consumed: &[ConsumedBatch]) -> String {
+		let mut text = String::with_capacity(consumed.len() * 12);
+		let mut previous_last: Vec<Option<i64>> = Vec::new();
+		for batch in consumed {
+			if previous_last.len() <= batch.partition {
+				previous_last.resize(batch.partition + 1, None);
+			}
+			if !text.is_empty() {
+				text.push(';');
+			}
+			text.push_str(&batch.partition.to_string());
+			text.push(':');
+			match previous_last[batch.partition] {
+				Some(previous) => {
+					text.push_str(&(batch.first_key.wrapping_sub(previous)).to_string())
+				}
+				None => {
+					text.push('=');
+					text.push_str(&batch.first_key.to_string());
+				}
+			}
+			text.push(':');
+			text.push_str(&(batch.last_key.wrapping_sub(batch.first_key)).to_string());
+			text.push(':');
+			if batch.restart {
+				text.push('!');
+			}
+			previous_last[batch.partition] = Some(batch.last_key);
+		}
+		text
+	}
+
+	/// The exact inverse of `encode_consumed`.
+	#[cfg(test)]
+	pub(in crate::exec) fn decode_consumed(text: &str) -> Result<Vec<ConsumedBatch>, String> {
+		let mut consumed = Vec::new();
+		if text.is_empty() {
+			return Ok(consumed);
+		}
+		let mut previous_last: Vec<Option<i64>> = Vec::new();
+		for item in text.split(';') {
+			let mut parts = item.split(':');
+			let partition = parts
+				.next()
+				.and_then(|value| value.parse::<usize>().ok())
+				.ok_or_else(|| "consumed batch lacks partition".to_string())?;
+			let first = parts
+				.next()
+				.ok_or_else(|| "consumed batch lacks first".to_string())?;
+			let last_delta = parts
+				.next()
+				.and_then(|value| value.parse::<i64>().ok())
+				.ok_or_else(|| "consumed batch lacks last".to_string())?;
+			let restart = parts.next() == Some("!");
+			if previous_last.len() <= partition {
+				previous_last.resize(partition + 1, None);
+			}
+			let first_key = match first.strip_prefix('=') {
+				Some(absolute) => absolute
+					.parse::<i64>()
+					.map_err(|_| "consumed batch first key".to_string())?,
+				None => {
+					let delta = first
+						.parse::<i64>()
+						.map_err(|_| "consumed batch first delta".to_string())?;
+					previous_last[partition]
+						.ok_or_else(|| "consumed batch delta without a previous batch".to_string())?
+						.wrapping_add(delta)
+				}
+			};
+			let last_key = first_key.wrapping_add(last_delta);
+			previous_last[partition] = Some(last_key);
+			consumed.push(ConsumedBatch {
+				partition,
+				first_key,
+				last_key,
+				restart,
+			});
+		}
+		Ok(consumed)
+	}
+
 	/// The diagnostic the receipt carries beside the summed terms: every window with its thread,
 	/// every growth event with its capacity, and the exact counters.
 	pub(in crate::exec) fn diagnostic_value(
@@ -3478,6 +3645,23 @@ impl InsertInstrument {
 			"buckets_final": buckets_final,
 			"rows_micros": self.rows_micros,
 			"grow_micros": self.grow_micros,
+			"order_census": {
+				"partitions": self.census.iter().enumerate().map(|(partition, census)| serde_json::json!({
+					"partition": partition,
+					"max": census.max,
+					"above_max": census.above_max,
+					"equal_max": census.equal_max,
+					"below_max": census.below_max,
+					"batches": census.batches,
+					"restarts": census.restarts,
+				})).collect::<Vec<_>>(),
+				"boundary_straddles": self.boundary_straddles,
+				"found_at_straddle": self.found_at_straddle,
+				"found_elsewhere": self.found_elsewhere,
+				"consumed_encoding": "p:first:last:r; first is a delta from the previous batch's last on p (=absolute for the first), last a delta from first, r is ! on a restart",
+				"consumed_batches": self.consumed.len(),
+				"consumed": Self::encode_consumed(&self.consumed),
+			},
 		})
 	}
 }
@@ -23519,13 +23703,15 @@ impl Executor {
 				*limit = (*limit).saturating_sub(batch.num_rows());
 			}
 
-			let mut batches = vec![batch];
+			// Each batch carries the Exchange partition it was routed to (0 until an Exchange op
+			// assigns one), so the summary can attribute what it consumes per partition stream.
+			let mut batches = vec![(0usize, batch)];
 
 			for op in &ops {
 				let pass_started = clocks.as_ref().map(|_| Instant::now());
 				let mut next = Vec::new();
 
-				for batch in batches {
+				for (partition, batch) in batches {
 					match op {
 						StreamingExistenceOp::Filter(predicate) => {
 							let batch = self.filter_batch_with_bound_predicate(
@@ -23535,7 +23721,7 @@ impl Executor {
 							)?;
 
 							if batch.num_rows() > 0 {
-								next.push(batch);
+								next.push((partition, batch));
 							}
 						}
 
@@ -23546,7 +23732,10 @@ impl Executor {
 						} => {
 							let columns = self.evaluate_bound_program(exprs, &batch)?;
 
-							next.push(RecordBatch::try_new(output_schema.clone(), columns)?);
+							next.push((
+								partition,
+								RecordBatch::try_new(output_schema.clone(), columns)?,
+							));
 						}
 
 						StreamingExistenceOp::Exchange {
@@ -23561,11 +23750,11 @@ impl Executor {
 								});
 							}
 
-							for (_partition, partitioned) in
+							for (routed, partitioned) in
 								self.repartition_exchange_batch(&batch, *partition_count, key)?
 							{
 								if partitioned.num_rows() > 0 {
-									next.push(partitioned);
+									next.push((routed, partitioned));
 								}
 							}
 						}
@@ -23590,7 +23779,8 @@ impl Executor {
 				.map(|_| Instant::now());
 			match clocks.as_deref_mut() {
 				Some(clocks) => {
-					for batch in batches {
+					for (partition, batch) in batches {
+						clocks.insert_instrument.partition = partition;
 						summary.write_batch_with::<true>(
 							&batch,
 							columns.existence_key,
@@ -23602,7 +23792,7 @@ impl Executor {
 					}
 				}
 				None => {
-					for batch in batches {
+					for (_partition, batch) in batches {
 						summary.write_batch(
 							&batch,
 							columns.existence_key,
@@ -32757,7 +32947,9 @@ mod tests {
 			vec![
 				Arc::new(Int64Array::from(keys.to_vec())),
 				Arc::new(Int64Array::from(
-					keys.iter().map(|key| key * 10).collect::<Vec<_>>(),
+					keys.iter()
+						.map(|key| key.wrapping_mul(10))
+						.collect::<Vec<_>>(),
 				)),
 			],
 		)
@@ -32958,6 +33150,179 @@ mod tests {
 				.expect("decode");
 		assert_eq!(decoded, instrument.rows, "the encoding is exact");
 		assert_eq!(value["growth_windows"][2][4], 4096);
+	}
+
+	fn adr589_write(
+		summary: &mut NeqExistenceSummary,
+		instrument: &mut InsertInstrument,
+		partition: usize,
+		keys: &[i64],
+	) {
+		instrument.partition = partition;
+		summary
+			.write_batch_with::<true>(
+				&adr587_batch(keys),
+				ColumnOrdinal(0),
+				ColumnOrdinal(1),
+				0,
+				1024 * 1024,
+				instrument,
+			)
+			.expect("instrumented write");
+	}
+
+	// ADR 589: a key that ends one batch and opens the next on the same partition is a
+	// boundary straddle, counted as equal_max and as a found lookup at a straddle.
+	#[test]
+	fn adr589_census_counts_a_boundary_straddle_as_equal_max_and_found_at_straddle() {
+		let mut summary = NeqExistenceSummary::new();
+		let mut instrument = InsertInstrument::new();
+		adr589_write(&mut summary, &mut instrument, 0, &[1, 1, 2, 3]);
+		// Another partition's batch in between loses the consecutive-key cache for key 3.
+		adr589_write(&mut summary, &mut instrument, 1, &[10, 11]);
+		adr589_write(&mut summary, &mut instrument, 0, &[3, 4]);
+		let p0 = instrument.census[0];
+		assert_eq!(p0.above_max, 4, "1, 2, 3, 4");
+		assert_eq!(p0.equal_max, 1, "the 3 that reopened the third batch");
+		assert_eq!(p0.below_max, 0);
+		assert_eq!(p0.max, Some(4));
+		assert_eq!(p0.batches, 2);
+		assert_eq!(p0.restarts, 0);
+		assert_eq!(instrument.boundary_straddles, 1);
+		assert_eq!(instrument.found_at_straddle, 1);
+		assert_eq!(instrument.found_elsewhere, 0);
+		assert_eq!(instrument.counters.lookup_found, 1);
+		assert_eq!(instrument.counters.cache_hits, 1, "the second 1");
+		let p1 = instrument.census[1];
+		assert_eq!(
+			(p1.above_max, p1.max),
+			(2, Some(11)),
+			"partition 1 has its own maximum"
+		);
+	}
+
+	// ADR 589: a key below the partition's running maximum is a violation; a repeat of an
+	// earlier key that is not at a batch boundary is a found lookup elsewhere.
+	#[test]
+	fn adr589_census_counts_descending_keys_and_recurrences_elsewhere() {
+		let mut summary = NeqExistenceSummary::new();
+		let mut instrument = InsertInstrument::new();
+		adr589_write(&mut summary, &mut instrument, 0, &[5, 6, 7]);
+		adr589_write(&mut summary, &mut instrument, 0, &[9, 6, 8]);
+		let p0 = instrument.census[0];
+		assert_eq!(p0.above_max, 4, "5, 6, 7, 9");
+		assert_eq!(p0.below_max, 2, "6 and 8 below the running maximum 9");
+		assert_eq!(p0.equal_max, 0);
+		assert_eq!(p0.max, Some(9), "a below-max row leaves the maximum alone");
+		assert_eq!(
+			p0.restarts, 0,
+			"the second batch opened above the first's last key"
+		);
+		assert_eq!(instrument.found_elsewhere, 1, "the 6");
+		assert_eq!(instrument.found_at_straddle, 0);
+		adr589_write(&mut summary, &mut instrument, 0, &[2]);
+		assert_eq!(
+			instrument.census[0].restarts, 1,
+			"2 below the previous batch's last key 8"
+		);
+		assert_eq!(instrument.census[0].below_max, 3);
+	}
+
+	// ADR 589: an unseen partition is `None`, so i64::MIN counts as above it, and per-batch
+	// first/last keys and restart flags are exact through the compact encoding.
+	#[test]
+	fn adr589_census_handles_i64_min_and_records_consumed_batches_exactly() {
+		let mut summary = NeqExistenceSummary::new();
+		let mut instrument = InsertInstrument::new();
+		adr589_write(&mut summary, &mut instrument, 2, &[i64::MIN, i64::MIN + 1]);
+		let p2 = instrument.census[2];
+		assert_eq!(p2.above_max, 2);
+		assert_eq!(p2.max, Some(i64::MIN + 1));
+		assert_eq!(
+			instrument.census[0],
+			PartitionOrderCensus::default(),
+			"partition 0 unseen"
+		);
+		adr589_write(&mut summary, &mut instrument, 2, &[i64::MIN + 5]);
+		adr589_write(&mut summary, &mut instrument, 0, &[100, 101]);
+		adr589_write(&mut summary, &mut instrument, 2, &[i64::MIN + 3]);
+		assert_eq!(
+			instrument.consumed,
+			vec![
+				ConsumedBatch {
+					partition: 2,
+					first_key: i64::MIN,
+					last_key: i64::MIN + 1,
+					restart: false
+				},
+				ConsumedBatch {
+					partition: 2,
+					first_key: i64::MIN + 5,
+					last_key: i64::MIN + 5,
+					restart: false
+				},
+				ConsumedBatch {
+					partition: 0,
+					first_key: 100,
+					last_key: 101,
+					restart: false
+				},
+				ConsumedBatch {
+					partition: 2,
+					first_key: i64::MIN + 3,
+					last_key: i64::MIN + 3,
+					restart: true
+				},
+			]
+		);
+		let text = InsertInstrument::encode_consumed(&instrument.consumed);
+		assert_eq!(
+			InsertInstrument::decode_consumed(&text).expect("decode"),
+			instrument.consumed,
+			"the encoding is exact: {text}"
+		);
+		assert_eq!(
+			text,
+			format!("2:={}:1:;2:4:0:;0:=100:1:;2:-2:0:!", i64::MIN)
+		);
+		let value = instrument.diagnostic_value(
+			None,
+			summary.entries.len(),
+			summary.entry_limit,
+			summary.buckets.len(),
+		);
+		assert_eq!(value["order_census"]["consumed_batches"], 4);
+		assert_eq!(value["order_census"]["partitions"][2]["restarts"], 1);
+		assert_eq!(value["order_census"]["partitions"][2]["below_max"], 1);
+	}
+
+	// ADR 589: the write loop hands each batch's Exchange partition to the summary, so the
+	// census sees the stream the summary consumes, partition by partition.
+	#[tokio::test]
+	async fn adr589_write_loop_attributes_batches_to_their_exchange_partition() {
+		let (source, schema, _filter, project) = adr586_existence_fixture(3, 5, i64::MAX);
+		let scan = test_scan_plan_with_first_field_key(TableId(86), schema.clone(), 86);
+		let plan = exchange_plan(
+			ExecutionPlan::Project {
+				input: Box::new(scan),
+				exprs: project,
+				output_schema: schema.clone(),
+			},
+			bound_column_root("orderkey", ColumnOrdinal(0), DataType::Int64, false),
+			2,
+		);
+		let (clocks, summary) = adr586_write_with_clocks(source, schema, &plan).await;
+		let instrument = &clocks.insert_instrument;
+		assert_eq!(instrument.census.len(), 2, "two partitions were consumed");
+		let above: u64 = instrument.census.iter().map(|c| c.above_max).sum();
+		assert_eq!(above, 15, "every key is new and rises on its own partition");
+		assert_eq!(
+			instrument.census.iter().map(|c| c.below_max).sum::<u64>(),
+			0
+		);
+		assert_eq!(instrument.consumed.len(), instrument.rows.len());
+		assert!(instrument.consumed.iter().all(|batch| batch.partition < 2));
+		assert_eq!(summary.input_rows, 15);
 	}
 
 	// The compact rows-window encoding is exact, including a thread change and a zero gap.

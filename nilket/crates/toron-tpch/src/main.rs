@@ -2501,63 +2501,64 @@ const ADR587_LINE_CLASSES: [Adr587LineRange; 14] = [
 		end: 1727,
 		anchor: "fn observe_value(&mut self, entry_index: usize, value: i64) {",
 	},
+	// write_batch_with: the column checks, the row loop, and the ADR 589 census around it.
 	Adr587LineRange {
 		class: "shared",
 		start: 1814,
-		end: 1888,
+		end: 1938,
 		anchor: "fn write_batch_with<const INSTRUMENTED: bool>(",
 	},
 	Adr587LineRange {
 		class: "growth_other",
-		start: 1889,
-		end: 1925,
+		start: 1939,
+		end: 1975,
 		anchor: "fn grow(&mut self, baseline_bytes: u64, cap: u64) -> Result<(), ExecutionError> {",
 	},
 	Adr587LineRange {
 		class: "growth_other",
-		start: 1926,
-		end: 2018,
+		start: 1976,
+		end: 2068,
 		anchor: "fn resize_capacity(",
 	},
 	Adr587LineRange {
 		class: "rehash",
-		start: 2019,
-		end: 2025,
+		start: 2069,
+		end: 2075,
 		anchor: "for (entry_index, entry) in self.entries.iter().enumerate() {",
 	},
 	Adr587LineRange {
 		class: "growth_other",
-		start: 2026,
-		end: 2040,
+		start: 2076,
+		end: 2090,
 		anchor: "",
 	},
 	Adr587LineRange {
 		class: "hash_and_probe",
-		start: 2041,
-		end: 2067,
+		start: 2091,
+		end: 2117,
 		anchor: "fn lookup_entry_index(&self, key: i64) -> Option<usize> {",
 	},
 	Adr587LineRange {
 		class: "hash_and_probe",
-		start: 2068,
-		end: 2126,
+		start: 2118,
+		end: 2176,
 		anchor: "fn find_bucket(&self, key: i64) -> Result<usize, ExecutionError> {",
 	},
 	Adr587LineRange {
 		class: "shared",
-		start: 2127,
-		end: 2136,
+		start: 2177,
+		end: 2186,
 		anchor: "fn is_multi(&self, entry_index: usize) -> bool {",
 	},
 	Adr587LineRange {
 		class: "shared",
-		start: 2137,
-		end: 2144,
+		start: 2187,
+		end: 2194,
 		anchor: "fn set_multi(&mut self, entry_index: usize) {",
 	},
 ];
 /// Lines inside `resize_capacity` that copy or initialise the grown arrays.
-const ADR587_COPY_LINES: [u32; 4] = [1959, 1985, 1987, 2017];
+const ADR587_COPY_LINES: [u32; 4] = [2009, 2035, 2037, 2067];
 
 fn adr587_is_copy_symbol(symbol: &str) -> bool {
 	[
@@ -3576,6 +3577,7 @@ fn evaluate_adr587_pairs(rows: &[serde_json::Value]) -> Result<serde_json::Value
 				serde_json::json!(residual_complete);
 			band[format!("{summary}_sampled")] = bin.clone();
 			band[format!("{summary}_walks")] = adr587_walks_value(on, summary)?;
+			band[format!("{summary}_order_census")] = adr589_census_value(on, summary)?;
 		}
 		pair_bands.push(band);
 	}
@@ -3687,6 +3689,7 @@ fn evaluate_adr587_pairs(rows: &[serde_json::Value]) -> Result<serde_json::Value
 		serde_json::json!(ADR587_ADR586_REFERENCE_OFF_RANGE_MS);
 	base["owner"] = owner;
 	base["owner_removable_pricing"] = pricing;
+	base["adr589_opening_rule"] = adr589_opening_rule(&pair_bands);
 	Ok(base)
 }
 
@@ -3805,6 +3808,278 @@ fn adr587_ranking_value(orders: &[Vec<(String, u64)>]) -> serde_json::Value {
 		"period_ns_per_pair": orders.iter().map(|order| order.iter().map(|(_, period)| *period).collect::<Vec<_>>()).collect::<Vec<_>>(),
 		"leading_class": leader,
 		"significance": "none claimed: frequency-mode periods vary, samples are correlated in time, skid is systematic",
+	})
+}
+
+/// ADR 589's ordering census for one summary of one on-arm row, read from the windows
+/// diagnostic: per-partition counts and running maxima, the straddle attribution of found
+/// lookups, and the consumed-batch summary. Absent on executables older than the census.
+fn adr589_census_value(
+	row: &serde_json::Value,
+	summary: &str,
+) -> Result<serde_json::Value, String> {
+	let diagnostic = row
+		.get("node_attribution")
+		.and_then(|profile| profile.get("aggregate_invocations"))
+		.and_then(serde_json::Value::as_array)
+		.and_then(|invocations| {
+			invocations.iter().find(|invocation| {
+				invocation.get("route").and_then(serde_json::Value::as_str)
+					== Some("inner_prefix_semi_anti_grouped")
+			})
+		})
+		.and_then(|invocation| invocation.get("diagnostics"))
+		.and_then(serde_json::Value::as_array)
+		.and_then(|entries| {
+			entries.iter().find(|entry| {
+				entry.get("name").and_then(serde_json::Value::as_str)
+					== Some(&format!("{summary}_insert_windows"))
+			})
+		})
+		.and_then(|entry| entry.get("value"))
+		.ok_or_else(|| format!("ADR 589 row lacks the {summary} insert windows"))?;
+	let census = diagnostic
+		.get("order_census")
+		.ok_or_else(|| format!("ADR 589 row lacks the {summary} order census"))?;
+	let counters = diagnostic
+		.get("counters")
+		.ok_or_else(|| format!("ADR 589 {summary} windows lack counters"))?;
+	let partitions = census
+		.get("partitions")
+		.and_then(serde_json::Value::as_array)
+		.ok_or_else(|| format!("ADR 589 {summary} census lacks partitions"))?;
+	if partitions.is_empty() {
+		return Err(format!("ADR 589 {summary} census has no partitions"));
+	}
+	let sum = |field: &str| -> Result<u64, String> {
+		partitions.iter().try_fold(0u64, |total, partition| {
+			receipt_u64(partition, field).map(|value| total + value)
+		})
+	};
+	let below_max_per_partition = partitions
+		.iter()
+		.map(|partition| receipt_u64(partition, "below_max"))
+		.collect::<Result<Vec<_>, _>>()?;
+	// Coverage: the consumed-batch record must name exactly the census's partitions, and the
+	// batch totals must agree with each other and with the rows windows.
+	let consumed_text = census
+		.get("consumed")
+		.and_then(serde_json::Value::as_str)
+		.ok_or_else(|| format!("ADR 589 {summary} census lacks the consumed string"))?;
+	let consumed = adr589_decode_consumed(consumed_text)
+		.map_err(|error| format!("ADR 589 {summary} consumed batches: {error}"))?;
+	let consumed_batches = receipt_u64(census, "consumed_batches")?;
+	if consumed.len() as u64 != consumed_batches {
+		return Err(format!(
+			"ADR 589 {summary} consumed string decodes to {} batches, census says {consumed_batches}",
+			consumed.len()
+		));
+	}
+	let mut seen = vec![0u64; partitions.len()];
+	for batch in &consumed {
+		let Some(count) = seen.get_mut(batch.partition) else {
+			return Err(format!(
+				"ADR 589 {summary} consumed a batch on partition {} the census does not cover",
+				batch.partition
+			));
+		};
+		*count += 1;
+	}
+	for (partition, count) in seen.iter().enumerate() {
+		let census_batches = receipt_u64(&partitions[partition], "batches")?;
+		if *count != census_batches {
+			return Err(format!(
+				"ADR 589 {summary} partition {partition} has {census_batches} census batches but {count} consumed"
+			));
+		}
+		if *count == 0 {
+			return Err(format!(
+				"ADR 589 {summary} partition {partition} consumed no batches"
+			));
+		}
+	}
+	let rows_windows = receipt_u64(diagnostic, "rows_window_count")?;
+	let batches = sum("batches")?;
+	if batches != consumed_batches || rows_windows != consumed_batches {
+		return Err(format!(
+			"ADR 589 {summary} batch totals disagree: census {batches}, consumed {consumed_batches}, rows windows {rows_windows}"
+		));
+	}
+	let decoded_restarts = consumed.iter().filter(|batch| batch.restart).count() as u64;
+	let restarts = sum("restarts")?;
+	if decoded_restarts != restarts {
+		return Err(format!(
+			"ADR 589 {summary} restarts disagree: census {restarts}, consumed {decoded_restarts}"
+		));
+	}
+	// Accounting: every non-cache-hit row was classified exactly once, and every found lookup
+	// was attributed exactly once.
+	let above = sum("above_max")?;
+	let equal = sum("equal_max")?;
+	let below = sum("below_max")?;
+	let lookups = receipt_u64(counters, "lookups")?;
+	if above + equal + below != lookups {
+		return Err(format!(
+			"ADR 589 {summary} classes {above} + {equal} + {below} do not sum to lookups {lookups}"
+		));
+	}
+	let found_at_straddle = receipt_u64(census, "found_at_straddle")?;
+	let found_elsewhere = receipt_u64(census, "found_elsewhere")?;
+	let lookup_found = receipt_u64(counters, "lookup_found")?;
+	if found_at_straddle + found_elsewhere != lookup_found {
+		return Err(format!(
+			"ADR 589 {summary} found {found_at_straddle} + {found_elsewhere} do not sum to lookup_found {lookup_found}"
+		));
+	}
+	let boundary_straddles = receipt_u64(census, "boundary_straddles")?;
+	if found_at_straddle > boundary_straddles {
+		return Err(format!(
+			"ADR 589 {summary} found_at_straddle {found_at_straddle} exceeds boundary_straddles {boundary_straddles}"
+		));
+	}
+	Ok(serde_json::json!({
+		"partitions": partitions,
+		"partition_count": partitions.len(),
+		"above_max": above,
+		"equal_max": equal,
+		"below_max": below,
+		"below_max_per_partition": below_max_per_partition,
+		"batches": batches,
+		"restarts": restarts,
+		"boundary_straddles": boundary_straddles,
+		"found_at_straddle": found_at_straddle,
+		"found_elsewhere": found_elsewhere,
+		"lookups": lookups,
+		"lookup_found": lookup_found,
+		"consumed_batches": consumed_batches,
+		"consumed_batches_per_partition": seen,
+		"global_restarts": adr589_global_restarts(&consumed),
+	}))
+}
+
+/// One decoded consumed batch, as the engine recorded it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Adr589ConsumedBatch {
+	partition: usize,
+	first_key: i64,
+	last_key: i64,
+	restart: bool,
+}
+
+/// The exact inverse of the engine's `encode_consumed`: `p:first:last:r;...`, `first` a delta
+/// from the previous batch's last key on `p` (`=` prefix for an absolute first), `last` a delta
+/// from `first`, `r` `!` on a restart.
+fn adr589_decode_consumed(text: &str) -> Result<Vec<Adr589ConsumedBatch>, String> {
+	let mut consumed = Vec::new();
+	if text.is_empty() {
+		return Ok(consumed);
+	}
+	let mut previous_last: Vec<Option<i64>> = Vec::new();
+	for item in text.split(';') {
+		let mut parts = item.split(':');
+		let partition = parts
+			.next()
+			.and_then(|value| value.parse::<usize>().ok())
+			.ok_or_else(|| "batch lacks a partition".to_string())?;
+		let first = parts
+			.next()
+			.ok_or_else(|| "batch lacks a first key".to_string())?;
+		let last_delta = parts
+			.next()
+			.and_then(|value| value.parse::<i64>().ok())
+			.ok_or_else(|| "batch lacks a last key".to_string())?;
+		let restart = parts.next() == Some("!");
+		if previous_last.len() <= partition {
+			previous_last.resize(partition + 1, None);
+		}
+		let first_key = match first.strip_prefix('=') {
+			Some(absolute) => absolute
+				.parse::<i64>()
+				.map_err(|_| "first key is not numeric".to_string())?,
+			None => {
+				let delta = first
+					.parse::<i64>()
+					.map_err(|_| "first delta is not numeric".to_string())?;
+				previous_last[partition]
+					.ok_or_else(|| "delta without a previous batch on the partition".to_string())?
+					.wrapping_add(delta)
+			}
+		};
+		let last_key = first_key.wrapping_add(last_delta);
+		previous_last[partition] = Some(last_key);
+		consumed.push(Adr589ConsumedBatch {
+			partition,
+			first_key,
+			last_key,
+			restart,
+		});
+	}
+	Ok(consumed)
+}
+
+/// How many consumed batches opened below the last key of the batch consumed just before
+/// them, on any partition: the restarts of the stream as a whole, as opposed to within one
+/// partition.
+fn adr589_global_restarts(consumed: &[Adr589ConsumedBatch]) -> u64 {
+	consumed
+		.windows(2)
+		.filter(|pair| pair[1].first_key < pair[0].last_key)
+		.count() as u64
+}
+
+/// ADR 589's opening rule, as the record states it: phase 2 opens only if, on both summaries
+/// and in every pair, `below_max` is zero on every partition and `found_elsewhere` is zero.
+/// Anything else, including a missing census, closes phase 2.
+fn adr589_opening_rule(pair_bands: &[serde_json::Value]) -> serde_json::Value {
+	let mut violations = Vec::new();
+	let mut checked = 0usize;
+	for band in pair_bands {
+		let pair = band.get("pair").cloned().unwrap_or_default();
+		for summary in ["semi", "anti"] {
+			let Some(census) = band.get(format!("{summary}_order_census")) else {
+				violations.push(
+					serde_json::json!({"pair": pair, "summary": summary, "reason": "census missing"}),
+				);
+				continue;
+			};
+			checked += 1;
+			let below = census
+				.get("below_max_per_partition")
+				.and_then(serde_json::Value::as_array)
+				.cloned()
+				.unwrap_or_default();
+			if below
+				.iter()
+				.any(|value| value.as_u64().unwrap_or(u64::MAX) != 0)
+			{
+				violations.push(serde_json::json!({"pair": pair, "summary": summary, "reason": "below_max non-zero", "below_max_per_partition": below}));
+			}
+			let elsewhere = census
+				.get("found_elsewhere")
+				.and_then(serde_json::Value::as_u64)
+				.unwrap_or(u64::MAX);
+			if elsewhere != 0 {
+				violations.push(serde_json::json!({"pair": pair, "summary": summary, "reason": "found_elsewhere non-zero", "found_elsewhere": elsewhere}));
+			}
+			let found = census
+				.get("found_at_straddle")
+				.and_then(serde_json::Value::as_u64)
+				.unwrap_or(0);
+			let straddles = census
+				.get("boundary_straddles")
+				.and_then(serde_json::Value::as_u64)
+				.unwrap_or(0);
+			if found > straddles {
+				violations.push(serde_json::json!({"pair": pair, "summary": summary, "reason": "found_at_straddle exceeds boundary_straddles"}));
+			}
+		}
+	}
+	let opens = violations.is_empty() && checked == pair_bands.len() * 2 && checked > 0;
+	serde_json::json!({
+		"phase_2": if opens { "opens" } else { "closed" },
+		"rule": "below_max == 0 on every partition and found_elsewhere == 0, on both summaries, in every pair",
+		"censuses_checked": checked,
+		"violations": violations,
 	})
 }
 
@@ -11307,9 +11582,19 @@ mod tests {
 				"appended": 12_000_000, "probe_steps": 17_864_353, "empty_table_lookups": 1,
 				"growth_reprobes": 15, "grow_events": 15,
 			});
+			let census = serde_json::json!({
+				"partitions": [
+					{"partition": 0, "max": 5_999_000, "above_max": 3_000_000, "equal_max": 1_100, "below_max": 0, "batches": 5_859, "restarts": 0},
+					{"partition": 1, "max": 5_999_500, "above_max": 3_000_000, "equal_max": 1_090, "below_max": 0, "batches": 5_859, "restarts": 0},
+					{"partition": 2, "max": 5_999_900, "above_max": 3_000_000, "equal_max": 1_080, "below_max": 0, "batches": 5_859, "restarts": 0},
+					{"partition": 3, "max": 5_999_990, "above_max": 3_000_000, "equal_max": 1_100, "below_max": 0, "batches": 5_859, "restarts": 0},
+				],
+				"boundary_straddles": 4_370, "found_at_straddle": 4_370, "found_elsewhere": 0,
+				"consumed_batches": 23_436, "consumed": adr589_fixture_consumed(),
+			});
 			row["node_attribution"]["aggregate_invocations"][0]["diagnostics"] = serde_json::json!([
-				{"name": "semi_insert_windows", "value": {"pid": 42, "tids": [7], "rows_windows": "", "rows_window_count": 0, "growth_windows": [], "counters": counters}},
-				{"name": "anti_insert_windows", "value": {"pid": 42, "tids": [7], "rows_windows": "", "rows_window_count": 0, "growth_windows": [], "counters": counters}},
+				{"name": "semi_insert_windows", "value": {"pid": 42, "tids": [7], "rows_windows": "", "rows_window_count": 23_436, "growth_windows": [], "counters": counters, "order_census": census}},
+				{"name": "anti_insert_windows", "value": {"pid": 42, "tids": [7], "rows_windows": "", "rows_window_count": 23_436, "growth_windows": [], "counters": counters, "order_census": census}},
 			]);
 		}
 		row
@@ -11781,6 +12066,172 @@ mod tests {
 		// A treatment row validated against the control expectation is refused on identity.
 		let error = adr588_validate_row(&rows[1], &expected.control, &dataset).unwrap_err();
 		assert!(error.contains("not its manifest's"), "{error}");
+	}
+
+	/// 23,436 consumed batches cycling partitions 0..3, 5,859 per partition, keys rising on
+	/// each partition with no restarts within one: consistent with the fixture census.
+	fn adr589_fixture_consumed() -> String {
+		let mut text = String::new();
+		let mut previous_last = [None::<i64>; 4];
+		for batch in 0..23_436usize {
+			// Source batch n spans keys [10n, 10n + 9]; each partition's slice of it opens at
+			// 10n + p and ends at 10n + 5 + p, so partitions 1..3 open below partition 0's end.
+			let partition = batch % 4;
+			let source = (batch / 4) as i64;
+			let first = source * 10 + partition as i64;
+			let last = first + 5;
+			if !text.is_empty() {
+				text.push(';');
+			}
+			match previous_last[partition] {
+				Some(previous) => text.push_str(&format!(
+					"{partition}:{}:{}:",
+					first - previous,
+					last - first
+				)),
+				None => text.push_str(&format!("{partition}:={first}:{}:", last - first)),
+			}
+			previous_last[partition] = Some(last);
+		}
+		text
+	}
+
+	fn adr589_census_mut(row: &mut serde_json::Value, index: usize) -> &mut serde_json::Value {
+		&mut row["node_attribution"]["aggregate_invocations"][0]["diagnostics"][index]["value"]
+	}
+
+	// The census evaluator refuses incomplete or inconsistent evidence: no partitions, a
+	// partition dropped from the census while the consumed batches name it, batch totals that
+	// disagree with the rows windows, classes that do not sum to the lookups, and found
+	// attributions that do not sum to the found lookups.
+	#[test]
+	fn adr589_census_refuses_empty_dropped_and_inconsistent_partitions() {
+		let good = adr587_fixture_row(0, true, 1_100_000, 550_000, [1, 1, 1]);
+		let census = adr589_census_value(&good, "semi").expect("a consistent census");
+		assert_eq!(census["partition_count"], 4);
+		assert_eq!(
+			census["consumed_batches_per_partition"],
+			serde_json::json!([5_859, 5_859, 5_859, 5_859])
+		);
+		assert_eq!(
+			census["global_restarts"], 17_577,
+			"three of every four transitions"
+		);
+
+		let mut row = good.clone();
+		adr589_census_mut(&mut row, 0)["order_census"]["partitions"] = serde_json::json!([]);
+		assert!(
+			adr589_census_value(&row, "semi")
+				.unwrap_err()
+				.contains("has no partitions")
+		);
+
+		let mut row = good.clone();
+		adr589_census_mut(&mut row, 0)["order_census"]["partitions"]
+			.as_array_mut()
+			.unwrap()
+			.pop();
+		assert!(
+			adr589_census_value(&row, "semi")
+				.unwrap_err()
+				.contains("partition 3 the census does not cover")
+		);
+
+		let mut row = good.clone();
+		adr589_census_mut(&mut row, 0)["rows_window_count"] = serde_json::json!(23_435);
+		assert!(
+			adr589_census_value(&row, "semi")
+				.unwrap_err()
+				.contains("batch totals disagree")
+		);
+
+		let mut row = good.clone();
+		adr589_census_mut(&mut row, 0)["order_census"]["partitions"][1]["above_max"] =
+			serde_json::json!(2_999_999);
+		assert!(
+			adr589_census_value(&row, "semi")
+				.unwrap_err()
+				.contains("do not sum to lookups")
+		);
+
+		let mut row = good.clone();
+		adr589_census_mut(&mut row, 0)["order_census"]["found_elsewhere"] = serde_json::json!(1);
+		assert!(
+			adr589_census_value(&row, "semi")
+				.unwrap_err()
+				.contains("do not sum to lookup_found")
+		);
+
+		let mut row = good.clone();
+		adr589_census_mut(&mut row, 0)["order_census"]["partitions"][2]["batches"] =
+			serde_json::json!(5_858);
+		assert!(
+			adr589_census_value(&row, "semi")
+				.unwrap_err()
+				.contains("partition 2 has 5858 census batches but 5859 consumed")
+		);
+
+		let mut row = good.clone();
+		adr589_census_mut(&mut row, 0)["order_census"]["consumed"] =
+			serde_json::json!("0:=1:0:;1:=2:0:");
+		assert!(
+			adr589_census_value(&row, "semi")
+				.unwrap_err()
+				.contains("decodes to 2 batches")
+		);
+	}
+
+	// ADR 589's opening rule: opens only on zero below_max everywhere and zero found_elsewhere
+	// on both summaries in every pair; one violation anywhere, or a missing census, closes it.
+	#[test]
+	fn adr589_opening_rule_opens_only_on_a_clean_census_everywhere() {
+		let rows = adr587_rows(1_100_000, 550_000, [400_000_000, 100_000_000, 20_000_000]);
+		let summary = evaluate_adr587_pairs(&rows).expect("fixture");
+		assert_eq!(summary["adr589_opening_rule"]["phase_2"], "opens");
+		assert_eq!(summary["adr589_opening_rule"]["censuses_checked"], 10);
+		let census = &summary["adr587_pair_bands"][0]["semi_order_census"];
+		assert_eq!(census["below_max"], 0);
+		assert_eq!(census["found_at_straddle"], 4_370);
+		assert_eq!(census["partition_count"], 4);
+
+		let mut rows = adr587_rows(1_100_000, 550_000, [400_000_000, 100_000_000, 20_000_000]);
+		{
+			let partition = &mut rows[7]["node_attribution"]["aggregate_invocations"][0]["diagnostics"]
+				[1]["value"]["order_census"]["partitions"][2];
+			partition["below_max"] = serde_json::json!(1);
+			partition["above_max"] = serde_json::json!(2_999_999);
+		}
+		let summary = evaluate_adr587_pairs(&rows).expect("fixture");
+		assert_eq!(summary["adr589_opening_rule"]["phase_2"], "closed");
+		let violations = summary["adr589_opening_rule"]["violations"]
+			.as_array()
+			.unwrap();
+		assert_eq!(violations.len(), 1);
+		assert_eq!(violations[0]["summary"], "anti");
+		assert_eq!(violations[0]["reason"], "below_max non-zero");
+
+		let mut rows = adr587_rows(1_100_000, 550_000, [400_000_000, 100_000_000, 20_000_000]);
+		{
+			let census = &mut rows[1]["node_attribution"]["aggregate_invocations"][0]["diagnostics"]
+				[0]["value"]["order_census"];
+			census["found_elsewhere"] = serde_json::json!(3);
+			census["found_at_straddle"] = serde_json::json!(4_367);
+		}
+		let summary = evaluate_adr587_pairs(&rows).expect("fixture");
+		assert_eq!(summary["adr589_opening_rule"]["phase_2"], "closed");
+		assert_eq!(
+			summary["adr589_opening_rule"]["violations"][0]["reason"],
+			"found_elsewhere non-zero"
+		);
+
+		let mut rows = adr587_rows(1_100_000, 550_000, [400_000_000, 100_000_000, 20_000_000]);
+		let value =
+			rows[1]["node_attribution"]["aggregate_invocations"][0]["diagnostics"][0]["value"]
+				.as_object_mut()
+				.unwrap();
+		value.remove("order_census");
+		let error = evaluate_adr587_pairs(&rows).unwrap_err();
+		assert!(error.contains("lacks the semi order census"), "{error}");
 	}
 
 	#[test]
