@@ -91,6 +91,23 @@ pub fn evaluate_perf_board(
 		"explicit",
 		&mut reasons,
 	);
+	// ADR 591: an explicit affinity, honoured by the header's own thread; rows are bound to it
+	// below, so a row cannot vouch for itself with a matching pair of foreign values.
+	require_header_string(
+		header,
+		"cpu_affinity_requested_provenance",
+		"explicit",
+		&mut reasons,
+	);
+	let affinity_requested = header
+		.get("cpu_affinity_requested")
+		.and_then(serde_json::Value::as_str)
+		.filter(|list| !list.is_empty());
+	if affinity_requested.is_none() {
+		reasons.push("coordinate_missing:cpu_affinity_requested".to_string());
+	} else if header.get("cpu_affinity_observed") != header.get("cpu_affinity_requested") {
+		reasons.push("cpu_affinity_mismatch:header:observed".to_string());
+	}
 	require_header_u64(header, "runs", PERF_BOARD_RUNS as u64, &mut reasons);
 	require_header_u64(header, "warmup", PERF_BOARD_WARMUP as u64, &mut reasons);
 	require_header_u64(
@@ -309,6 +326,29 @@ pub fn evaluate_perf_board(
 				expected.0, expected.1
 			));
 		}
+		let row_requested = row
+			.get("cpu_affinity_requested")
+			.and_then(serde_json::Value::as_str);
+		if row_requested.is_none() || row_requested != affinity_requested {
+			reasons.push(format!(
+				"cpu_affinity_mismatch:{}:{}:requested",
+				expected.0, expected.1
+			));
+		}
+		if row.get("cpu_affinity_observed") != row.get("cpu_affinity_requested") {
+			reasons.push(format!(
+				"cpu_affinity_mismatch:{}:{}:observed",
+				expected.0, expected.1
+			));
+		}
+		if row.get("cpu_affinity_requested_provenance")
+			!= header.get("cpu_affinity_requested_provenance")
+		{
+			reasons.push(format!(
+				"cpu_affinity_mismatch:{}:{}:provenance",
+				expected.0, expected.1
+			));
+		}
 		if expected.1 == "duckdb" {
 			if row
 				.get("duckdb_threads")
@@ -472,9 +512,24 @@ pub fn compare_perf_board_headers(
 		"duckdb_threads",
 		"duckdb_threads_provenance",
 		"duckdb_version",
+		"cpu_affinity_requested",
+		"cpu_affinity_requested_provenance",
 	] {
 		if baseline.get(field) != candidate.get(field) {
 			reasons.push(format!("board_coordinate_mismatch:{field}"));
+		}
+	}
+	// ADR 591: a board from before the affinity coordinate has no field at all; it is named as
+	// absent rather than folded into a mismatch, since nothing was requested on it.
+	for (side, header) in [("baseline", baseline), ("candidate", candidate)] {
+		if header
+			.get("cpu_affinity_requested")
+			.and_then(serde_json::Value::as_str)
+			.is_none_or(str::is_empty)
+		{
+			reasons.push(format!(
+				"board_coordinate_absent:cpu_affinity_requested:{side}"
+			));
 		}
 	}
 	if baseline.get("duckdb_executable_sha256") != candidate.get("duckdb_executable_sha256") {
@@ -547,6 +602,9 @@ mod tests {
 			"duckdb_threads_provenance": "explicit",
 			"duckdb_version": "v1.5.4",
 			"duckdb_executable_sha256": "duckdb",
+			"cpu_affinity_requested": "0-15",
+			"cpu_affinity_requested_provenance": "explicit",
+			"cpu_affinity_observed": "0-15",
 			"diagnostics_disabled": true,
 			"host_start_quiescent": true,
 			"host_end_quiescent": true,
@@ -574,6 +632,9 @@ mod tests {
 						"partition_work_concurrency_requested": 1,
 						"partition_work_concurrency_requested_provenance": "explicit",
 						"partition_work_concurrency_observations": [],
+						"cpu_affinity_requested": "0-15",
+						"cpu_affinity_requested_provenance": "explicit",
+						"cpu_affinity_observed": "0-15",
 						"evidence_identity": header["evidence_identity"],
 						"duckdb_threads": (engine == "duckdb").then_some("1"),
 						"duckdb_executable_sha256": (engine == "duckdb").then_some("duckdb"),
@@ -718,6 +779,8 @@ mod tests {
 			"duckdb_threads",
 			"duckdb_threads_provenance",
 			"duckdb_version",
+			"cpu_affinity_requested",
+			"cpu_affinity_requested_provenance",
 		] {
 			let mut candidate = baseline.clone();
 			candidate[field] = serde_json::json!("different");
@@ -746,5 +809,159 @@ mod tests {
 				.iter()
 				.any(|reason| reason == "content_identity_manifest_absent")
 		);
+	}
+
+	#[test]
+	fn adr591_affinity_must_be_explicit_and_honoured_by_the_header() {
+		let (mut header, samples, summaries) = fixture();
+		header["cpu_affinity_requested_provenance"] = serde_json::json!("default");
+		let decision = evaluate_perf_board(&header, &samples, &summaries);
+		assert!(decision.reasons.iter().any(|reason| {
+			reason == "coordinate_mismatch:cpu_affinity_requested_provenance:expected_explicit"
+		}));
+		let (mut header, samples, summaries) = fixture();
+		header["cpu_affinity_observed"] = serde_json::json!("0-31");
+		let decision = evaluate_perf_board(&header, &samples, &summaries);
+		assert!(
+			decision
+				.reasons
+				.iter()
+				.any(|reason| reason == "cpu_affinity_mismatch:header:observed"),
+			"{:?}",
+			decision.reasons
+		);
+		let (mut header, samples, summaries) = fixture();
+		header
+			.as_object_mut()
+			.unwrap()
+			.retain(|key, _| !key.starts_with("cpu_affinity"));
+		let decision = evaluate_perf_board(&header, &samples, &summaries);
+		for expected in [
+			"coordinate_mismatch:cpu_affinity_requested_provenance:expected_explicit",
+			"coordinate_missing:cpu_affinity_requested",
+		] {
+			assert!(
+				decision.reasons.iter().any(|reason| reason == expected),
+				"{expected}: {:?}",
+				decision.reasons
+			);
+		}
+	}
+
+	#[test]
+	fn adr591_every_row_is_bound_to_the_header_request_not_only_to_itself() {
+		// One row observed on another mask: named by its observed field.
+		let (header, mut samples, summaries) = fixture();
+		let target = samples
+			.iter()
+			.position(|row| {
+				row["query"] == "q05" && row["engine"] == "duckdb" && row["warmup"] == false
+			})
+			.unwrap();
+		samples[target]["cpu_affinity_observed"] = serde_json::json!("0-31");
+		let decision = evaluate_perf_board(&header, &samples, &summaries);
+		assert!(!decision.candidate_authority);
+		assert_eq!(
+			decision
+				.reasons
+				.iter()
+				.filter(|reason| reason.starts_with("cpu_affinity_mismatch"))
+				.collect::<Vec<_>>(),
+			vec!["cpu_affinity_mismatch:q05:duckdb:observed"]
+		);
+		// One row with BOTH fields moved to another mask agrees with itself and is still refused,
+		// named by its requested field, because the request is bound to the header's.
+		let (header, mut samples, summaries) = fixture();
+		samples[target]["cpu_affinity_requested"] = serde_json::json!("16-31");
+		samples[target]["cpu_affinity_observed"] = serde_json::json!("16-31");
+		let decision = evaluate_perf_board(&header, &samples, &summaries);
+		assert!(!decision.candidate_authority);
+		assert_eq!(
+			decision
+				.reasons
+				.iter()
+				.filter(|reason| reason.starts_with("cpu_affinity_mismatch"))
+				.collect::<Vec<_>>(),
+			vec!["cpu_affinity_mismatch:q05:duckdb:requested"]
+		);
+		// One row whose provenance alone is `default`: its masks agree with the header, and the
+		// row is still refused, because the row's own claim of how the mask arose must match.
+		let (header, mut samples, summaries) = fixture();
+		samples[target]["cpu_affinity_requested_provenance"] = serde_json::json!("default");
+		let decision = evaluate_perf_board(&header, &samples, &summaries);
+		assert!(!decision.candidate_authority);
+		assert_eq!(
+			decision
+				.reasons
+				.iter()
+				.filter(|reason| reason.starts_with("cpu_affinity_mismatch"))
+				.collect::<Vec<_>>(),
+			vec!["cpu_affinity_mismatch:q05:duckdb:provenance"]
+		);
+		// One row without a provenance field at all.
+		let (header, mut samples, summaries) = fixture();
+		samples[target]
+			.as_object_mut()
+			.unwrap()
+			.remove("cpu_affinity_requested_provenance");
+		let decision = evaluate_perf_board(&header, &samples, &summaries);
+		assert_eq!(
+			decision
+				.reasons
+				.iter()
+				.filter(|reason| reason.starts_with("cpu_affinity_mismatch"))
+				.collect::<Vec<_>>(),
+			vec!["cpu_affinity_mismatch:q05:duckdb:provenance"]
+		);
+		// A row without any of the fields is refused on every count.
+		let (header, mut samples, summaries) = fixture();
+		samples[target]
+			.as_object_mut()
+			.unwrap()
+			.retain(|key, _| !key.starts_with("cpu_affinity"));
+		let decision = evaluate_perf_board(&header, &samples, &summaries);
+		for expected in [
+			"cpu_affinity_mismatch:q05:duckdb:requested",
+			"cpu_affinity_mismatch:q05:duckdb:provenance",
+		] {
+			assert!(
+				decision.reasons.iter().any(|reason| reason == expected),
+				"{expected}: {:?}",
+				decision.reasons
+			);
+		}
+	}
+
+	#[test]
+	fn adr591_boards_compare_only_on_equal_affinity_and_an_absent_one_is_named() {
+		let (baseline, _, _) = fixture();
+		let mut candidate = baseline.clone();
+		candidate["cpu_affinity_requested"] = serde_json::json!("0-7");
+		candidate["cpu_affinity_observed"] = serde_json::json!("0-7");
+		let comparison = compare_perf_board_headers(&baseline, &candidate);
+		assert!(!comparison.comparable);
+		assert!(
+			comparison
+				.reasons
+				.iter()
+				.any(|reason| reason == "board_coordinate_mismatch:cpu_affinity_requested")
+		);
+		let mut old_board = baseline.clone();
+		old_board
+			.as_object_mut()
+			.unwrap()
+			.retain(|key, _| !key.starts_with("cpu_affinity"));
+		let comparison = compare_perf_board_headers(&old_board, &baseline);
+		assert!(!comparison.comparable);
+		assert!(
+			comparison
+				.reasons
+				.iter()
+				.any(|reason| reason == "board_coordinate_absent:cpu_affinity_requested:baseline"),
+			"{:?}",
+			comparison.reasons
+		);
+		let comparison = compare_perf_board_headers(&baseline, &baseline);
+		assert!(comparison.comparable, "{:?}", comparison.reasons);
 	}
 }

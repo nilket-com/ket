@@ -57,6 +57,12 @@ const DEFAULT_SF: f64 = 0.01;
 // every cell in one process. The runtime is built explicitly so the worker stacks are
 // large enough for every command; `#[tokio::main]` cannot express this.
 fn main() -> ExitCode {
+	// ADR 591: affinity is per thread on Linux and inherited by threads and children created
+	// afterwards, so it is applied here, before the runtime's workers exist.
+	if let Err(error) = toron_tpch::affinity::apply_from_environment() {
+		eprintln!("{error}");
+		return ExitCode::from(2);
+	}
 	tokio::runtime::Builder::new_multi_thread()
 		.worker_threads(4)
 		.thread_stack_size(64 * 1024 * 1024)
@@ -116,6 +122,7 @@ async fn run() -> ExitCode {
 		"run" => run_command(&args).await,
 		"perf" => perf_command(&args).await,
 		"perf-run-one" => perf_run_one_command(&args).await,
+		"perf-board-replay" => perf_board_replay_command(&args),
 		"adr584-q21-attribution" => adr584_q21_attribution_command(&args),
 		"adr585-q21-decomposition" => adr585_q21_decomposition_command(&args),
 		"adr586-q21-semi-write" => adr586_q21_semi_write_command(&args),
@@ -5681,6 +5688,7 @@ impl PerfBoardRunContext {
 		let host_end = observe_host_quiescence();
 		let join_spill_scratch_empty_after = directory_is_empty(&self.join_spill_scratch)?;
 		let identity_gate = runtime_identity_gate();
+		let affinity = toron_tpch::affinity::affinity_coordinate();
 		let mut observed_queries = Vec::<String>::new();
 		let mut observed_engines = Vec::<String>::new();
 		for row in samples {
@@ -5720,6 +5728,9 @@ impl PerfBoardRunContext {
 			"duckdb_threads_provenance": reference_thread_pin_provenance(&duckdb_thread_setting()),
 			"duckdb_version": self.duckdb_version,
 			"duckdb_executable_sha256": self.duckdb_executable_sha256,
+			"cpu_affinity_requested": affinity.requested,
+			"cpu_affinity_requested_provenance": affinity.provenance,
+			"cpu_affinity_observed": toron_tpch::affinity::observed_cpulist(),
 			"diagnostics_disabled": join_diagnostics_disabled(),
 			"host_start_service_inactive": self.host_start.service_inactive,
 			"host_start_sql_port_free": self.host_start.sql_port_free,
@@ -5796,6 +5807,55 @@ fn ordered_perf_summaries(summaries: &[serde_json::Value]) -> Vec<serde_json::Va
 	}
 	ordered.extend(by_key.into_values());
 	ordered
+}
+
+/// ADR 591: re-evaluate a published board under the gate this executable carries and say whether
+/// the artifact's own claim still holds. A later, tighter gate can thereby verify an earlier
+/// board's retained rows without rerunning them; a disagreement is printed, never hidden.
+fn perf_board_replay_command(args: &[String]) -> ExitCode {
+	let Some(artifact) = flag_value(args, "--artifact") else {
+		eprintln!("perf-board-replay requires --artifact PATH");
+		return ExitCode::from(2);
+	};
+	match perf_board_replay(&PathBuf::from(artifact)) {
+		Ok((report, agrees)) => {
+			println!("{report}");
+			if agrees {
+				ExitCode::SUCCESS
+			} else {
+				ExitCode::from(1)
+			}
+		}
+		Err(error) => {
+			eprintln!("{error}");
+			ExitCode::from(2)
+		}
+	}
+}
+
+fn perf_board_replay(artifact: &Path) -> Result<(serde_json::Value, bool), String> {
+	let (header, samples, summaries) = read_perf_board_artifact(artifact)?;
+	let decision = evaluate_perf_board(&header, &samples, &ordered_perf_summaries(&summaries));
+	let claimed_authority = header
+		.get("candidate_authority")
+		.and_then(serde_json::Value::as_bool);
+	let claimed_reasons = header.get("authority_reasons").cloned();
+	let agrees = claimed_authority == Some(decision.candidate_authority)
+		&& claimed_reasons == Some(serde_json::json!(decision.reasons));
+	Ok((
+		serde_json::json!({
+			"artifact": artifact.display().to_string(),
+			"samples": samples.len(),
+			"summaries": summaries.len(),
+			"replayed_candidate_authority": decision.candidate_authority,
+			"replayed_reasons": decision.reasons,
+			"claimed_candidate_authority": claimed_authority,
+			"claimed_reasons": claimed_reasons,
+			"claim_agrees_with_replay": agrees,
+			"replaying_evidence_identity": runtime_identity_json(),
+		}),
+		agrees,
+	))
 }
 
 fn read_perf_board_artifact(
@@ -10023,7 +10083,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|adr584-q21-attribution|adr585-q21-decomposition|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|perf-board-replay|adr584-q21-attribution|adr585-q21-decomposition|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -12876,6 +12936,15 @@ mod tests {
 		assert_eq!(row["reason"], "polars_sql_unsupported_correlated_subquery");
 		assert_eq!(row["engine_version"], "0.54.4");
 		assert_eq!(row["duckdb_version"], serde_json::Value::Null);
+		// ADR 591: every perf row carries the affinity coordinate; with nothing applied in this
+		// test process the request is null and default, and the observed mask is still read.
+		assert_eq!(row["cpu_affinity_requested"], serde_json::Value::Null);
+		assert_eq!(row["cpu_affinity_requested_provenance"], "default");
+		assert!(
+			row["cpu_affinity_observed"]
+				.as_str()
+				.is_some_and(|list| { toron_tpch::affinity::parse_cpulist(list).is_ok() })
+		);
 
 		let attempt = polars_unsupported_attempt(
 			&export,
@@ -13387,4 +13456,39 @@ async fn ladder_command(args: &[String]) -> ExitCode {
 		);
 	}
 	ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod adr591_tests {
+	use super::*;
+
+	#[test]
+	fn adr591_a_replay_reports_a_claim_the_current_gate_no_longer_supports() {
+		let dir = std::env::temp_dir().join(format!("adr591-replay-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let artifact = dir.join(PERF_BOARD_ARTIFACT);
+		// A header claiming authority over an empty board: the gate refuses it on sample count
+		// and coordinate grounds, so the claim disagrees with the replay and the reasons are named.
+		let header = serde_json::json!({
+			"kind": "artifact_header",
+			"suite": PERF_BOARD_SUITE,
+			"candidate_authority": true,
+			"authority_reasons": [],
+		});
+		write_perf_board_artifact(&artifact, &header, &[], &[]).unwrap();
+		let (report, agrees) = perf_board_replay(&artifact).unwrap();
+		assert!(!agrees);
+		assert_eq!(report["claimed_candidate_authority"], true);
+		assert_eq!(report["replayed_candidate_authority"], false);
+		assert!(
+			report["replayed_reasons"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.any(|reason| reason
+					== "coordinate_mismatch:cpu_affinity_requested_provenance:expected_explicit")
+		);
+		assert!(perf_board_replay(&dir.join("absent.jsonl")).is_err());
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
 }

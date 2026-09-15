@@ -1,7 +1,13 @@
 # ADR 591 - CPU affinity as a recorded coordinate item, and strix's sealed baseline
 
-**Status:** PROPOSED. Successor to ADR 590, which closed without a sealed
-board and with the finding this record acts on.
+**Status:** CLOSED, SEALED. The harness applies and records
+`TORON_TPCH_CPU_AFFINITY` and the board gate requires it; strix's board
+under ADR 590's freeze plus the P-core set `0-15` sealed with final
+authority on tree `a962f3d8…` (tag `evidence/a962f3d80f63-d03935eb49cc`,
+results in `plans/impl/0591_cpu_affinity_coordinate_and_strix_baseline_results.md`):
+264 samples, every gate, DuckDB q11 at 107-108 ms. Next owner on strix by
+absolute gap: q21 (6,916.9 ms). Successor to ADR 590, which closed
+without a sealed board and with the finding this record acts on.
 
 
 ## Context
@@ -57,8 +63,11 @@ cpuset), and a request that was silently narrowed is refused before any
 query runs, with both cpulists named, as is an unparseable request. The
 harness records three fields in the `perf` artifact header and on every
 row: `cpu_affinity_requested` (the normalized cpulist), its provenance
-(`explicit` when the variable was set, `default` otherwise, in which case
-the requested value is null and nothing is applied), and
+(`explicit` when the variable was present, `default` only when it was
+absent, in which case the requested value is null and nothing is applied;
+a present value that is empty, malformed, or not Unicode is refused
+before the runtime starts, since a coordinate that was named and could
+not be honoured must not fall through to "nothing requested"), and
 `cpu_affinity_observed` (the sampling thread's mask from
 `sched_getaffinity`, read again at each sample, as a cpulist). The DuckDB
 row's observed value is the launching thread's mask at that sample;
@@ -69,8 +78,9 @@ so rather than claiming a measurement inside DuckDB.
 the header.** The gate adds to ADR 583's conditions:
 `cpu_affinity_requested_provenance = explicit` in the header; and on
 every row, `row.cpu_affinity_requested = header.cpu_affinity_requested =
-row.cpu_affinity_observed`, else `cpu_affinity_mismatch:<engine>:<query>`
-naming which of the three disagreed. Row-local equality alone would let a
+row.cpu_affinity_observed` and `row.cpu_affinity_requested_provenance =
+header.cpu_affinity_requested_provenance`, else
+`cpu_affinity_mismatch:<engine>:<query>` naming which field disagreed. Row-local equality alone would let a
 row whose requested and observed fields were both changed to another
 mask pass; the binding to the header is what makes the row's claim
 checkable. Two
@@ -121,15 +131,20 @@ coordinate item rather than a strix habit.
   CPU not in it, or an offline id) is refused with both cpulists named,
   even though `sched_setaffinity` itself may succeed.
 - The `perf` header and every row carry the three fields; with the
-  variable unset the requested value is null, the provenance `default`,
-  the observed value the inherited mask, and nothing is applied.
+  variable absent the requested value is null, the provenance `default`,
+  the observed value the inherited mask, and nothing is applied; a present
+  empty, whitespace, malformed, or non-Unicode value is refused, tested on
+  the environment-handling path itself, not only the parser.
 - The board gate refuses a header whose provenance is not `explicit`
-  (`authority_condition_false:cpu_affinity_requested_provenance`); a row
+  (`coordinate_mismatch:cpu_affinity_requested_provenance:expected_explicit`,
+  the harness's form for every provenance field); a row
   whose observed value differs from its request; and a row whose
   requested and observed values agree with each other but not with the
-  header (`cpu_affinity_mismatch:<engine>:<query>` in both cases, naming
-  the disagreeing field); the discriminating fixtures alter exactly one
-  row each, the second altering both of its fields to another mask.
+  header, and a row whose provenance is `default` or absent while its
+  masks agree (`cpu_affinity_mismatch:<engine>:<query>:<field>` naming the
+  disagreeing field); the discriminating fixtures alter exactly one row
+  each, one altering both of its masks to another mask, one only its
+  provenance, one removing only its provenance.
 - Two artifacts with different requested affinities are refused as
   incomparable with the item named; one without the field is refused with
   the field named as absent.

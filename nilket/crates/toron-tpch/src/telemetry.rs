@@ -381,6 +381,7 @@ pub fn binary_modified_unix() -> Option<u64> {
 
 impl PerfAttempt {
 	pub fn json_value(&self) -> serde_json::Value {
+		let affinity = crate::affinity::affinity_coordinate();
 		let mut row = serde_json::json!({
 			"suite": "tpch_perf",
 			"engine": self.engine,
@@ -411,6 +412,11 @@ impl PerfAttempt {
 			"partition_work_concurrency_observations": self.partition_work_concurrency_observations,
 			"dataset_verification": self.dataset_verification.map(DatasetVerification::as_str),
 			"dataset_manifest_fingerprint": self.dataset_manifest_fingerprint,
+			// ADR 591: the request fixed at startup and the serializing thread's mask now. Rows are
+			// serialized on the thread that ran or launched the sample, right after it.
+			"cpu_affinity_requested": affinity.requested,
+			"cpu_affinity_requested_provenance": affinity.provenance,
+			"cpu_affinity_observed": crate::affinity::observed_cpulist(),
 		});
 		let object = row.as_object_mut().expect("perf JSON row is an object");
 		let timings = self

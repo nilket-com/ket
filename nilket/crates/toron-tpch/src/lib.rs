@@ -13,6 +13,7 @@
 //! correctness — dev data is synthetic and explicitly NOT a TPC-H result.
 
 mod adr444_profile_eval;
+pub mod affinity;
 pub mod evidence;
 pub mod perf_board;
 pub mod telemetry;
