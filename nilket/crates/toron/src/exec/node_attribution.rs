@@ -2444,6 +2444,20 @@ fn inclusive_lifecycle_receipt_value(
 		}
 		Ok(sample.micros)
 	};
+	// A finish term legitimately has zero calls: the hashed build finishes nothing.
+	let finish_term = |name: &'static str| -> Result<u64, &'static str> {
+		let Some(sample) = invocation
+			.inclusive_lifecycle
+			.iter()
+			.find(|sample| sample.name == name)
+		else {
+			return Err("inclusive lifecycle term is missing");
+		};
+		if sample.error.is_some() {
+			return Err("inclusive lifecycle term is failed");
+		}
+		Ok(sample.micros)
+	};
 	let values = [
 		("runtime_prep", term("runtime_prep")),
 		("runtime_prep_inner_1", term("runtime_prep_inner_1")),
@@ -2452,6 +2466,16 @@ fn inclusive_lifecycle_receipt_value(
 		("runtime_prep_semi_write", term("runtime_prep_semi_write")),
 		("runtime_prep_anti_read", term("runtime_prep_anti_read")),
 		("runtime_prep_anti_write", term("runtime_prep_anti_write")),
+		// ADR 589: what each summary's build does after its last batch, zero for a build that
+		// finishes nothing; a runtime-prep child so the band stays exact when work moves there.
+		(
+			"runtime_prep_semi_finish",
+			finish_term("runtime_prep_semi_finish"),
+		),
+		(
+			"runtime_prep_anti_finish",
+			finish_term("runtime_prep_anti_finish"),
+		),
 		("base_prep", term("base_prep")),
 		("drive", term("drive")),
 		("finalize", term("finalize")),
@@ -2475,8 +2499,10 @@ fn inclusive_lifecycle_receipt_value(
 		get("runtime_prep_inner_2"),
 		get("runtime_prep_semi_read"),
 		get("runtime_prep_semi_write"),
+		get("runtime_prep_semi_finish"),
 		get("runtime_prep_anti_read"),
 		get("runtime_prep_anti_write"),
+		get("runtime_prep_anti_finish"),
 	];
 	let Some(runtime_children_total) = runtime_children
 		.into_iter()
@@ -2548,6 +2574,8 @@ fn inclusive_lifecycle_receipt_value(
 		"runtime_prep_semi_write_micros": get("runtime_prep_semi_write"),
 		"runtime_prep_anti_read_micros": get("runtime_prep_anti_read"),
 		"runtime_prep_anti_write_micros": get("runtime_prep_anti_write"),
+		"runtime_prep_semi_finish_micros": get("runtime_prep_semi_finish"),
+		"runtime_prep_anti_finish_micros": get("runtime_prep_anti_finish"),
 		"runtime_prep_residual_micros": runtime_prep_residual,
 		"base_prep_inclusive_micros": base_prep_inclusive,
 		"drive_inclusive_micros": drive_inclusive,
@@ -2618,6 +2646,21 @@ fn insert_decomposition_band(
 	band.insert(
 		format!("{summary}_insert_residual_micros"),
 		serde_json::json!(residual),
+	);
+	// ADR 589: the named total of the per-batch insert accumulation and the post-ingestion finish.
+	let finish = invocation
+		.inclusive_lifecycle
+		.iter()
+		.find(|sample| sample.name == format!("runtime_prep_{summary}_finish"))
+		.map(|sample| sample.micros)
+		.unwrap_or(0);
+	band.insert(
+		format!("{summary}_insert_finish_micros"),
+		serde_json::json!(finish),
+	);
+	band.insert(
+		format!("{summary}_insert_total_micros"),
+		serde_json::json!(insert_micros.saturating_add(finish)),
 	);
 	let windows_name = format!("{summary}_insert_windows");
 	if !invocation
@@ -3438,6 +3481,7 @@ mod tests {
 			error: None,
 		})
 		.collect();
+		attach_finish_terms(&mut invocation, 0, 0);
 		attach_write_decomposition(
 			&mut invocation,
 			"semi_write",
@@ -3456,6 +3500,24 @@ mod tests {
 		assert_eq!(receipt["runtime_prep_residual_micros"], 20);
 		assert_eq!(receipt["lifecycle_residual_micros"], 100);
 		assert_eq!(receipt["outside_handler_span_micros"], 200);
+	}
+
+	/// ADR 589's finish terms, zero calls when a build finishes nothing after its last batch.
+	fn attach_finish_terms(invocation: &mut AggregateInvocation, semi: u64, anti: u64) {
+		for (name, micros) in [
+			("runtime_prep_semi_finish", semi),
+			("runtime_prep_anti_finish", anti),
+		] {
+			invocation
+				.inclusive_lifecycle
+				.retain(|term| term.name != name);
+			invocation.inclusive_lifecycle.push(InclusiveLifecycleTerm {
+				name,
+				calls: if micros == 0 { 0 } else { 5 },
+				micros,
+				error: None,
+			});
+		}
 	}
 
 	fn attach_write_decomposition(
@@ -3656,7 +3718,71 @@ mod tests {
 			error: None,
 		})
 		.collect();
+		attach_finish_terms(&mut invocation, 0, 0);
 		invocation
+	}
+
+	fn adr589_write_bands(invocation: &mut AggregateInvocation) {
+		attach_write_decomposition(
+			invocation,
+			"semi_write",
+			[0, 20, 15, 10],
+			&["project", "exchange"],
+		);
+		attach_write_decomposition(
+			invocation,
+			"anti_write",
+			[5, 10, 10, 10],
+			&["filter", "project", "exchange"],
+		);
+	}
+
+	// ADR 589: a finish that moved work after the last batch is a runtime-prep child of its own;
+	// the band reconciles with it, insert_total names the sum, and a zero finish is a fact.
+	#[test]
+	fn adr589_finish_terms_join_the_runtime_prep_band_and_name_insert_total() {
+		let mut invocation = adr586_invocation();
+		// runtime_prep 400 = inner 100 + 100 + semi 50 + 50 + anti 40 + 40 = 380, residual 20;
+		// move 12 of the residual into the two finishes: the residual becomes 8.
+		attach_finish_terms(&mut invocation, 7, 5);
+		adr589_write_bands(&mut invocation);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "reconciled");
+		assert_eq!(receipt["runtime_prep_semi_finish_micros"], 7);
+		assert_eq!(receipt["runtime_prep_anti_finish_micros"], 5);
+		assert_eq!(receipt["runtime_prep_residual_micros"], 8);
+		assert_eq!(receipt["semi_insert_finish_micros"], 7);
+		assert_eq!(
+			receipt["semi_insert_total_micros"], 17,
+			"insert 10 + finish 7"
+		);
+		assert_eq!(receipt["anti_insert_total_micros"], 15);
+		// A finish exceeding the residual is an underflow, a defect.
+		let mut invocation = adr586_invocation();
+		attach_finish_terms(&mut invocation, 30, 0);
+		adr589_write_bands(&mut invocation);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "instrument_defect");
+		assert!(
+			receipt["error"]
+				.as_str()
+				.unwrap()
+				.contains("runtime-prep children exceed")
+		);
+		// A missing finish term is a defect, not a zero.
+		let mut invocation = adr586_invocation();
+		invocation
+			.inclusive_lifecycle
+			.retain(|term| term.name != "runtime_prep_anti_finish");
+		adr589_write_bands(&mut invocation);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "instrument_defect");
+		assert!(
+			receipt["error"]
+				.as_str()
+				.unwrap()
+				.contains("runtime_prep_anti_finish is missing")
+		);
 	}
 
 	// A zero child is a fact with a pass count beside it, never a failed term: the semi summary

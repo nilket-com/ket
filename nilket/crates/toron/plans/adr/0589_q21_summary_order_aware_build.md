@@ -1,14 +1,20 @@
 # ADR 589 - q21 existence-summary build: ordering census, then an order-aware build
 
-**Status:** PROPOSED. Successor to ADR 588. Two phases under one record.
-Phase 1 measures the order of the batches the existence summary actually
-consumes, per partition stream, and attributes every recurrence; it opens
-or closes phase 2 on that evidence alone. Phase 2, if opened, is a build
-that appends under a per-partition monotone precondition checked on every
-row, with an exact fallback that preserves all prior summary state, and
-that builds the hash index once at the end instead of probing and
-regrowing it during the build. Phase 2 is retained only on digest parity
-and the ADR 588 release-pair rule; otherwise it is reverted and closed.
+**Status:** CLOSED, RETAINED. Phase 1's census (tree `e4d3d0f9…`,
+`plans/impl/0589_q21_summary_ordering_census_results.md`) opened phase 2:
+`below_max` zero on every partition, every found lookup a boundary
+straddle under the Exchange's traversal. Phase 2 (control tree `19563355…`,
+treatment tree `737c54cd…`, results in
+`plans/impl/0589_q21_summary_order_aware_build_results.md`) is retained
+under the ADR 588 rule: digest parity on every row, median paired gain
+1,753.4 ms (13.7% of q21) against a 172.5 ms bar, every pair positive; the
+closing tree `8d752ee0…`, with both review rounds folded, measured again
+against the same control on 2026-09-15: 1,733.0 ms (13.9%) against a
+372.8 ms bar, every pair positive, digest parity on every row. The
+mechanism check confirmed twelve million fast-path appends with zero probe
+steps and zero growth, every recurrence found in its sorted list, and a
+302 ms finish in place of the probes and the rehashes. The runtime-prep
+owner is now `runtime_prep_inner_1`. Successor to ADR 588.
 
 
 ## Context
@@ -63,14 +69,15 @@ have delivered it through the same partition. That is the whole
 precondition, and it is checked with one comparison per row against a
 running maximum, not assumed.
 
-Two facts bound the design. The writer today discards the partition index
-the Exchange produced; phase 2 needs it and the writer will pass it. And
-ADR 586's repartition candidate (613 ms gross, net unpriced) interacts with
-this record: removing the Exchange would make the consumed stream the
-source stream, globally non-decreasing with no boundary straddles at all;
-phase 1's census is also the measurement of what the Exchange does to
-order, and the record reports it so that a later decision on the Exchange
-is made on counts. This record does not remove the Exchange.
+Two facts bound the design. The writer, at the time this record was
+drafted, discarded the partition index the Exchange produced; phase 1's
+census made the writer carry it, and phase 2 consumes it. And ADR 586's
+repartition candidate (613 ms gross, net unpriced) interacts with this
+record: what the consumed stream would look like without the Exchange is
+an unmeasured counterfactual, and phase 1's census is the measurement of
+what the Exchange does to order as it stands; the record reports it so
+that a later decision on the Exchange is made on counts. This record does
+not remove the Exchange.
 
 
 ## Decision
@@ -446,12 +453,17 @@ census. It does not retain a gain the rule does not establish.
 
 ## Forward
 
-If phase 1 finds the consumed stream monotone per partition and every
-recurrence a boundary straddle, the Exchange's only effect on the build is
-to create those straddles, and ADR 586's repartition candidate becomes a
-question of whether a single-partition order-aware build is cheaper still;
-that is a later record. If phase 2 retains, the row loop's remaining cost
-is the sort-based index build and the anti's date filter, and the next
-owner is chosen from ADR 587's terms again. If phase 2 is not established,
-the row loop closes as measured and the arc's next owner is
-`runtime_prep_inner_1` at 1,654 ms or `cleanup` at 567 ms.
+Retained. q21's insert no longer probes or grows during the build; what
+remains of the row loop (329 ms) is below the floor and is not an owner.
+ADR 585's rule on the treatment names `runtime_prep_inner_1`, the
+partitioned `orders` build for replay 1, at 1,671 ms (15.3%) as the next
+owner, ahead of `runtime_prep_semi_write` at 953 ms; inside the semi write
+the Exchange (`semi_write_repartition`, 606 ms gross, net unpriced) now
+costs more than the insert it feeds, and phase 1 measured it as the sole
+source of the straddles the fallback exists for, so ADR 586's repartition
+candidate is the natural next cut on this path, priced the same way. The
+finish's sort (220 ms of 302) is the order-aware build's own remaining
+cost if a later record wants it. `cleanup` at 561 ms stays open. The
+paired-executable driver, the row validator with its dataset binding, the
+census, and the finish accounting are all reusable for whichever cut comes
+next.
