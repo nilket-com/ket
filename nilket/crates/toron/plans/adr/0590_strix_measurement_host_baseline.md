@@ -1,7 +1,19 @@
 # ADR 590 - strix as the Toron measurement host: configuration freeze and sealed baseline board
 
-**Status:** PROPOSED. Successor coordinate to ADR 583; that board stays sealed
-as history and is not re-derived.
+**Status:** CLOSED, NOT SEALED. The freeze was verified and recorded, three
+full boards ran on strix (results in
+`plans/impl/0590_strix_measurement_host_baseline_results.md`), and none is
+a candidate: one refused for a non-fresh output directory, two for the
+stability gate on DuckDB q11, whose single high sample per board a
+forty-sample diagnosis examined under placement restrictions on the
+hybrid i9-14900K (P-core restricted: repeats to 2.8%; E-core restricted:
+1.78x slower; unrestricted: 106-132 ms). Finding: the cell repeats under
+the P-core restriction and not reliably without it, so thread placement
+is a coordinate item on this host; scheduling across core kinds is the
+supported hypothesis, not a demonstrated cause. No tuning was applied under this record. Successor: ADR
+591, which records affinity in the artifact and pins the P-core set.
+Successor coordinate to ADR 583; that board stays sealed as history and is
+not re-derived.
 
 
 ## Context
