@@ -1,8 +1,20 @@
 # ADR 593 - q21's envelope on strix: host readings on every child, then one decomposition
 
-**Status:** PROPOSED. Successor to ADR 592, which left q21's owner on strix
-unresolved between `runtime_prep_inner_1` and `runtime_prep_semi_write`
-under a 609.0 ms off range.
+**Status:** CLOSED, OWNER RESOLVED. One decomposition run on strix as a
+transient user service through the start gate (results in
+`plans/impl/0593_q21_envelope_telemetry_first_results.md`): off range
+118.9 ms, 1.31% of the median, inside the 4% bound; ADR 585's rule
+returns `runtime_prep_inner_1` resolved (1,345.0 ms, 14.84%, 491.5 ms
+ahead of `runtime_prep_semi_write`). q21's owner on strix is
+`runtime_prep_inner_1`. Every child carries its host readings; the
+journal was collected once and joined; four protocol deviations are
+recorded (two gate refusals, one interrupted attempt with an admitted
+warmup, and login-session churn from the launcher's polling), and they
+changed the gate's placement, the launch method (`loginctl
+enable-linger`), and the polling procedure. Successor to
+ADR 592, which left q21's owner on strix unresolved between
+`runtime_prep_inner_1` and `runtime_prep_semi_write` under a 609.0 ms off
+range.
 
 
 ## Context
@@ -104,17 +116,26 @@ child returns it waits at least two seconds, then reads the system
 journal once for `[first launch − 1 s, last return + 1 s]` with
 `journalctl --system -o json --since --until`, under a bounded duration
 (30 s) and a bounded output (entries capped at 2,000 and the cap
-stated). Each entry keeps its realtime timestamp, its monotonic timestamp
-and boot id where the journal provides them, its unit or syslog
-identifier, and its message's first 200 characters. The summary joins the
+stated). Output is read line by line while the command runs, with the entry
+cap, a byte cap, and the duration bound applied as it arrives, stderr
+drained on its own thread, and the command's whole process group
+terminated and reaped when a bound is hit or a read fails. Each entry
+keeps its realtime timestamp, its monotonic timestamp and boot id where
+the journal provides them, its unit or syslog identifier, and its
+message's first 200 characters. The summary joins the
 entries to each child's `[launch − 1 s, return + 1 s]` window and reports
 per child the count and the entries; a child's window can be joined
 only from a collection that covers it, so the collection's own bounds
-are recorded beside the joins. Three states are distinguished and
-recorded: `collected` (the query returned within its bounds),
-`truncated` (the entry cap or the duration bound was hit, with which and
-how far), and `unavailable` (the command failed or the journal was not
-readable, with the reason). Inter-child gaps are reported from the launch
+are recorded beside the joins. Four states are distinguished and
+recorded: `collected` (the command ran to completion inside every bound
+and every record parsed), `truncated` (a cap or the duration bound was
+hit, with which and how far; the entries kept are a prefix), `degraded`
+(a read failure, malformed records, or a failure after output; the
+entries are incomplete in an unknown way), and `unavailable` (the
+command could not run or failed, with the reason). A child's window is
+covered completely only under a `collected` collection; under a
+truncated one its count is a lower bound, and under a degraded or
+unavailable one its count is unknown, whatever the requested bounds say. Inter-child gaps are reported from the launch
 and return stamps and contain no journal query.
 
 **The driver runs as a transient user service, outside any login
@@ -124,7 +145,9 @@ that launched it, and that scope's teardown fell inside the window.
 scope, and leaves the process in the login cgroup. The driver is started
 with `systemd-run --user --unit adr593-decomposition …`, a transient
 service under `user@<uid>.service`, managed independently of the SSH
-session; before the warmup the driver reads its own cgroup from
+session, with lingering enabled for the user (`loginctl enable-linger`)
+so the user manager itself outlives the session that launched the unit;
+before the warmup the driver reads its own cgroup from
 `/proc/self/cgroup` and refuses to run if the path contains a
 `session-*.scope`, and it records the cgroup path, the Unix session id from
 `getsid(0)` and, under its own label, the audit session id from
@@ -153,8 +176,9 @@ tie, and that is the rule's verdict, not this bound's.
 
 **A start gate, predeclared.** The run starts only with package
 temperature at or below 45 °C, load below 0.3, the spill scratch empty,
-the output directory absent, and ADR 590's freeze re-verified; the gate
-readings are the snapshot's. A temperature that cannot be read does not
+the output directory absent, and ADR 590's freeze re-verified; the driver
+reads the gate itself as the first thing it does, before any work of its
+own, since its own dataset verification warms a core. A temperature that cannot be read does not
 satisfy the gate: the gate needs the reading, and the run waits until it
 has one, whereas a missing reading on a child's row afterwards is
 diagnostic and non-refusing. This is a start condition, not a control:

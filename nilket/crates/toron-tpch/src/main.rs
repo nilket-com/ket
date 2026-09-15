@@ -124,6 +124,7 @@ async fn run() -> ExitCode {
 		"perf-run-one" => perf_run_one_command(&args).await,
 		"perf-board-replay" => perf_board_replay_command(&args),
 		"adr592-revalidate" => adr592_revalidate_command(&args),
+		"adr593-journal-recheck" => adr593_journal_recheck_command(&args),
 		"adr584-q21-attribution" => adr584_q21_attribution_command(&args),
 		"adr585-q21-decomposition" => adr585_q21_decomposition_command(&args),
 		"adr586-q21-semi-write" => adr586_q21_semi_write_command(&args),
@@ -585,6 +586,8 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 			}
 		}
 	}
+	// ADR 593: every perf child brackets its execute with host readings and puts them on the row.
+	toron_tpch::host_readings::enable();
 	let attempt_result = match engine {
 		PerfEngine::Toron => {
 			run_perf_query_with_data_source(
@@ -635,6 +638,10 @@ async fn perf_run_one_command(args: &[String]) -> ExitCode {
 	row["memory_per_task_provenance"] = serde_json::json!(memory_provenance);
 	row["spill_bytes_reserved"] = serde_json::json!(spill_bytes_reserved);
 	row["spill_bytes_reserved_provenance"] = serde_json::json!(spill_provenance);
+	row["host_readings"] = match toron_tpch::host_readings::take_last() {
+		Some(pair) => pair.json_value(),
+		None => serde_json::Value::Null,
+	};
 	row["hash_smaller_build"] = serde_json::json!(hash_smaller_build);
 	row["hash_smaller_build_provenance"] = serde_json::json!(hash_smaller_build_provenance);
 	row["filtered_build_side_swap"] = serde_json::json!(filtered_build_side_swap);
@@ -1519,6 +1526,11 @@ fn adr585_q21_decomposition_command(args: &[String]) -> ExitCode {
 }
 
 fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, String> {
+	// ADR 593: the driver runs as a transient service outside any login session's scope, and
+	// starts only through the gate, read before the driver does any work of its own (the
+	// dataset's full-hash verification alone warms a P-core by ten degrees or more).
+	let driver_scope = toron_tpch::host_readings::observe_driver_scope()?;
+	let start_gate = adr593_start_gate()?;
 	let mode = flag_value(args, "--mode").unwrap_or("strict");
 	let sf = resolved_sf(args)?;
 	let data_source = flag_value(args, "--data-source").unwrap_or("parquet");
@@ -1624,7 +1636,31 @@ fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, St
 			"ADR 585 lost host quiescence or left spill scratch after measurement".to_string(),
 		);
 	}
+	// ADR 593: the journal is collected once, after every child and a settle, then joined.
+	let all_rows: Vec<&serde_json::Value> = std::iter::once(&warmup).chain(rows.iter()).collect();
+	let first_launch = all_rows
+		.iter()
+		.filter_map(|row| {
+			row.get("driver_launch_unix_ms")
+				.and_then(serde_json::Value::as_f64)
+		})
+		.fold(f64::INFINITY, f64::min);
+	let last_return = all_rows
+		.iter()
+		.filter_map(|row| {
+			row.get("driver_return_unix_ms")
+				.and_then(serde_json::Value::as_f64)
+		})
+		.fold(f64::NEG_INFINITY, f64::max);
+	std::thread::sleep(std::time::Duration::from_secs(2));
+	let collection =
+		toron_tpch::host_readings::collect_journal(first_launch - 1000.0, last_return + 1000.0);
+	let host_journal = adr593_join_journal_and_gaps(&all_rows, &collection);
 	let mut summary = evaluate_adr585_pairs(&rows)?;
+	adr593_apply_variability_bound(&mut summary)?;
+	summary["driver_scope"] = serde_json::json!(driver_scope);
+	summary["start_gate"] = start_gate;
+	summary["host_journal"] = host_journal;
 	summary["kind"] = serde_json::json!("adr585_q21_outside_drive_decomposition");
 	summary["sealed"] = serde_json::json!(false);
 	summary["candidate_authority"] = serde_json::json!(false);
@@ -3564,6 +3600,252 @@ fn adr592_admit_child_row(
 	Ok(())
 }
 
+fn adr593_unix_ms() -> f64 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_secs_f64() * 1000.0)
+		.unwrap_or(f64::NAN)
+}
+
+/// ADR 593's predeclared operational cutoff on the off arm's range, as a fraction of its median.
+const ADR593_VARIABILITY_BOUND: f64 = 0.04;
+/// ADR 593's start gate: package temperature at or below this, load below the other.
+const ADR593_START_GATE_TEMP_MILLIC: i64 = 45_000;
+const ADR593_START_GATE_LOAD: f64 = 0.3;
+
+/// Apply the cutoff to an evaluated lifecycle summary: over the bound, the record closes on the
+/// variability finding and no term is the owner; the leading term stays named as such.
+fn adr593_apply_variability_bound(summary: &mut serde_json::Value) -> Result<(), String> {
+	let range = required_f64(summary, "off_execute_range_ms")?;
+	let median = required_f64(summary, "off_execute_median_ms")?;
+	let ratio = range / median;
+	let exceeded = ratio > ADR593_VARIABILITY_BOUND;
+	summary["variability"] = serde_json::json!({
+		"range_off_ms": range,
+		"median_off_ms": median,
+		"bound": ADR593_VARIABILITY_BOUND,
+		"ratio": ratio,
+		"verdict": if exceeded { "exceeded" } else { "within_bound" },
+	});
+	if exceeded {
+		let leading = summary
+			.pointer("/owner/leading_term")
+			.cloned()
+			.or_else(|| summary.pointer("/owner/term").cloned())
+			.unwrap_or_default();
+		let leading_ms = summary
+			.pointer("/owner/median_scaled_ms")
+			.cloned()
+			.unwrap_or_default();
+		summary["owner"] = serde_json::json!({
+			"status": "closed_on_variability",
+			"leading_term": leading,
+			"median_scaled_ms": leading_ms,
+			"reason": format!(
+				"off range {range:.1} ms is {ratio:.4} of the off median, above the predeclared bound {ADR593_VARIABILITY_BOUND}"
+			),
+		});
+	}
+	Ok(())
+}
+
+/// ADR 593's start gate, read from the host at driver start: a temperature that cannot be read
+/// does not satisfy it.
+fn adr593_start_gate() -> Result<serde_json::Value, String> {
+	let reading = toron_tpch::host_readings::take_reading(
+		&toron_tpch::host_readings::HostReadingRoots::system(),
+		&toron_tpch::affinity::current_affinity().unwrap_or_default(),
+	);
+	let load = std::fs::read_to_string("/proc/loadavg")
+		.ok()
+		.and_then(|text| {
+			text.split_whitespace()
+				.next()
+				.and_then(|v| v.parse::<f64>().ok())
+		});
+	let gate = serde_json::json!({
+		"package_temp_millic": reading.package_temp_millic,
+		"load_1m": load,
+		"temp_bound_millic": ADR593_START_GATE_TEMP_MILLIC,
+		"load_bound": ADR593_START_GATE_LOAD,
+		"reading": reading,
+	});
+	match (reading.package_temp_millic, load) {
+		(None, _) => Err(format!(
+			"ADR 593 start gate needs a package temperature and none could be read: {:?}",
+			reading.missing
+		)),
+		(Some(temp), _) if temp > ADR593_START_GATE_TEMP_MILLIC => Err(format!(
+			"ADR 593 start gate: package temperature {temp} millic is above {ADR593_START_GATE_TEMP_MILLIC}"
+		)),
+		(_, None) => {
+			Err("ADR 593 start gate needs a load average and none could be read".to_string())
+		}
+		(_, Some(load)) if load >= ADR593_START_GATE_LOAD => Err(format!(
+			"ADR 593 start gate: load {load} is not below {ADR593_START_GATE_LOAD}"
+		)),
+		_ => Ok(gate),
+	}
+}
+
+/// ADR 593: re-collect a retained summary's journal window with the current collector and
+/// re-classify every child's coverage, so a collection made under an earlier collector can be
+/// checked without another performance run. The journal itself must still hold the window.
+fn adr593_journal_recheck_command(args: &[String]) -> ExitCode {
+	match adr593_journal_recheck(args) {
+		Ok(report) => {
+			println!("{report}");
+			ExitCode::SUCCESS
+		}
+		Err(error) => {
+			eprintln!("{error}");
+			ExitCode::from(2)
+		}
+	}
+}
+
+fn adr593_journal_recheck(args: &[String]) -> Result<serde_json::Value, String> {
+	let summary_path = flag_value(args, "--summary")
+		.ok_or_else(|| "adr593-journal-recheck requires --summary PATH".to_string())?;
+	let samples_path = flag_value(args, "--samples")
+		.ok_or_else(|| "adr593-journal-recheck requires --samples PATH".to_string())?;
+	let read =
+		|path: &str| std::fs::read_to_string(path).map_err(|error| format!("read {path}: {error}"));
+	let summary: serde_json::Value = serde_json::from_str(&read(summary_path)?)
+		.map_err(|error| format!("parse {summary_path}: {error}"))?;
+	let rows: Vec<serde_json::Value> = read(samples_path)?
+		.lines()
+		.filter(|line| !line.trim().is_empty())
+		.map(|line| {
+			serde_json::from_str(line).map_err(|error| format!("parse {samples_path}: {error}"))
+		})
+		.collect::<Result<_, _>>()?;
+	let retained = &summary["host_journal"]["collection"];
+	let (Some(since), Some(until)) = (
+		retained
+			.get("since_unix_ms")
+			.and_then(serde_json::Value::as_f64),
+		retained
+			.get("until_unix_ms")
+			.and_then(serde_json::Value::as_f64),
+	) else {
+		return Err("retained summary has no journal collection window".to_string());
+	};
+	let collection = toron_tpch::host_readings::collect_journal(since, until);
+	let row_refs: Vec<&serde_json::Value> = rows.iter().collect();
+	let joined = adr593_join_journal_and_gaps(&row_refs, &collection);
+	let keys = |entries: &[serde_json::Value]| -> BTreeSet<(u64, String)> {
+		entries
+			.iter()
+			.filter_map(|entry| {
+				Some((
+					entry.get("realtime_us")?.as_u64()?,
+					entry.get("message")?.as_str()?.to_string(),
+				))
+			})
+			.collect()
+	};
+	let retained_entries = retained
+		.get("entries")
+		.and_then(serde_json::Value::as_array)
+		.cloned()
+		.unwrap_or_default();
+	let retained_keys = keys(&retained_entries);
+	let current_keys: BTreeSet<(u64, String)> = collection
+		.entries
+		.iter()
+		.map(|entry| (entry.realtime_us, entry.message.clone()))
+		.collect();
+	Ok(serde_json::json!({
+		"summary": summary_path,
+		"retained_state": retained.get("state"),
+		"retained_entries": retained_entries.len(),
+		"recheck_state": collection.state,
+		"recheck_entries": collection.entries.len(),
+		"recheck_malformed_records": collection.malformed_records,
+		"recheck_bytes_read": collection.bytes_read,
+		"entries_agree": retained_keys == current_keys,
+		"only_in_retained": retained_keys.difference(&current_keys).count(),
+		"only_in_recheck": current_keys.difference(&retained_keys).count(),
+		"per_child_coverage": joined["per_child"].as_array().map(|children| {
+			children
+				.iter()
+				.map(|child| {
+					serde_json::json!({
+						"run_index": child["run_index"], "warmup": child["warmup"],
+						"coverage": child["journal_coverage"], "count": child["journal_count"],
+					})
+				})
+				.collect::<Vec<_>>()
+		}),
+		"rechecking_evidence_identity": runtime_identity_json(),
+	}))
+}
+
+/// Join the run's single journal collection to every row's window and summarize the gaps.
+fn adr593_join_journal_and_gaps(
+	rows: &[&serde_json::Value],
+	collection: &toron_tpch::host_readings::JournalCollection,
+) -> serde_json::Value {
+	let mut per_child = Vec::new();
+	let mut previous_return: Option<f64> = None;
+	for row in rows {
+		let launch = row
+			.get("driver_launch_unix_ms")
+			.and_then(serde_json::Value::as_f64);
+		let returned = row
+			.get("driver_return_unix_ms")
+			.and_then(serde_json::Value::as_f64);
+		// "Inside the requested bounds" and "completely covered" are different claims: a
+		// truncated collection covers a window only partially and an unavailable or degraded one
+		// not at all, whatever the bounds say. Counts follow the coverage: exact, partial (a lower
+		// bound), or unknown.
+		let (joined, inside_bounds) = match (launch, returned) {
+			(Some(launch), Some(returned)) => {
+				let since = launch - 1000.0;
+				let until = returned + 1000.0;
+				let inside = since >= collection.since_unix_ms && until <= collection.until_unix_ms;
+				(
+					toron_tpch::host_readings::join_window(collection, since, until),
+					inside,
+				)
+			}
+			_ => (Vec::new(), false),
+		};
+		use toron_tpch::host_readings::JournalState;
+		let coverage = match &collection.state {
+			_ if !inside_bounds => "outside_collection_bounds",
+			JournalState::Collected => "complete",
+			JournalState::Truncated(_) => "partial",
+			JournalState::Degraded(_) | JournalState::Unavailable(_) => "unknown",
+		};
+		let journal_count = match coverage {
+			"complete" => serde_json::json!(joined.len()),
+			"partial" => serde_json::json!({"at_least": joined.len()}),
+			_ => serde_json::Value::Null,
+		};
+		per_child.push(serde_json::json!({
+			"run_index": row.get("run_index"),
+			"warmup": row.get("warmup"),
+			"launch_unix_ms": launch,
+			"return_unix_ms": returned,
+			"gap_since_previous_return_ms": match (previous_return, launch) {
+				(Some(prev), Some(launch)) => serde_json::json!(launch - prev),
+				_ => serde_json::Value::Null,
+			},
+			"journal_window_inside_collection_bounds": inside_bounds,
+			"journal_coverage": coverage,
+			"journal_count": journal_count,
+			"journal_entries": joined,
+		}));
+		previous_return = returned;
+	}
+	serde_json::json!({
+		"collection": collection,
+		"per_child": per_child,
+	})
+}
+
 /// The paired-children loop both drivers share: one unprofiled warmup, then `pairs` adjacent
 /// pairs alternating off-on and on-off, every child (the warmup included) admitted by the
 /// validator the moment it returns and journaled, a refused child stopping the loop before
@@ -3577,7 +3859,12 @@ fn adr592_run_paired_children(
 	mut run_child: impl FnMut(u32, bool, bool) -> Result<serde_json::Value, String>,
 ) -> Result<(serde_json::Value, Vec<serde_json::Value>), String> {
 	let (arm_tag, pair_tag, position_tag) = tags;
+	// ADR 593: launch and return stamps on every row, so inter-child gaps are derivable and the
+	// journal, collected once afterwards, can be joined to each child's window.
+	let launched = adr593_unix_ms();
 	let mut warmup = run_child(0, true, false)?;
+	warmup["driver_launch_unix_ms"] = serde_json::json!(launched);
+	warmup["driver_return_unix_ms"] = serde_json::json!(adr593_unix_ms());
 	warmup[arm_tag] = serde_json::json!("off");
 	warmup[pair_tag] = serde_json::Value::Null;
 	adr592_admit_child_row(&mut warmup, coordinate, true, journal)?;
@@ -3590,7 +3877,10 @@ fn adr592_run_paired_children(
 			[true, false]
 		};
 		for (position, on) in order.into_iter().enumerate() {
+			let launched = adr593_unix_ms();
 			let mut row = run_child(pair as u32, false, on)?;
+			row["driver_launch_unix_ms"] = serde_json::json!(launched);
+			row["driver_return_unix_ms"] = serde_json::json!(adr593_unix_ms());
 			row[arm_tag] = serde_json::json!(if on { "on" } else { "off" });
 			row[pair_tag] = serde_json::json!(pair);
 			row[position_tag] = serde_json::json!(position);
@@ -10670,7 +10960,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|perf-board-replay|adr592-revalidate|adr584-q21-attribution|adr585-q21-decomposition|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|perf-board-replay|adr592-revalidate|adr593-journal-recheck|adr584-q21-attribution|adr585-q21-decomposition|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -14690,5 +14980,156 @@ mod adr592_tests {
 		let error =
 			adr592_validate_child_row(&child_row(&expected, true), &expected, false).unwrap_err();
 		assert!(error.contains("the arm expects false"), "{error}");
+	}
+}
+
+#[cfg(test)]
+mod adr593_tests {
+	use super::*;
+	use toron_tpch::host_readings::{JournalCollection, JournalEntry, JournalState};
+
+	fn lifecycle_summary(range: f64, median: f64) -> serde_json::Value {
+		serde_json::json!({
+			"off_execute_range_ms": range,
+			"off_execute_median_ms": median,
+			"owner": {"status": "unresolved_tie_within_off_range", "leading_term": "runtime_prep_inner_1", "median_scaled_ms": 1334.5},
+		})
+	}
+
+	#[test]
+	fn adr593_the_bound_closes_on_variability_above_four_percent_and_not_below() {
+		let mut over = lifecycle_summary(609.0, 9023.8);
+		adr593_apply_variability_bound(&mut over).unwrap();
+		assert_eq!(over["variability"]["verdict"], "exceeded");
+		assert_eq!(over["owner"]["status"], "closed_on_variability");
+		assert_eq!(over["owner"]["leading_term"], "runtime_prep_inner_1");
+		assert!(over["owner"].get("term").is_none());
+		let mut under = lifecycle_summary(300.0, 9023.8);
+		adr593_apply_variability_bound(&mut under).unwrap();
+		assert_eq!(under["variability"]["verdict"], "within_bound");
+		assert_eq!(under["owner"]["status"], "unresolved_tie_within_off_range");
+		let mut at = lifecycle_summary(0.04 * 9000.0, 9000.0);
+		adr593_apply_variability_bound(&mut at).unwrap();
+		assert_eq!(
+			at["variability"]["verdict"], "within_bound",
+			"the bound is inclusive"
+		);
+	}
+
+	#[test]
+	fn adr593_the_journal_is_joined_per_child_and_gaps_come_from_the_stamps() {
+		let entry = |ms: f64, msg: &str| JournalEntry {
+			realtime_us: (ms * 1000.0) as u64,
+			monotonic_us: None,
+			boot_id: Some("b".to_string()),
+			source: Some("anacron.service".to_string()),
+			message: msg.to_string(),
+		};
+		let collection = JournalCollection {
+			since_unix_ms: 9_000.0,
+			until_unix_ms: 40_000.0,
+			state: JournalState::Collected,
+			entries: vec![
+				entry(10_500.0, "inside the warmup"),
+				entry(25_000.0, "between children"),
+				entry(31_000.0, "inside pair 0 on"),
+			],
+			malformed_records: 0,
+			bytes_read: 0,
+			entry_cap: 2000,
+			byte_cap: 1 << 24,
+			duration_bound_ms: 30_000,
+			command: String::new(),
+		};
+		let warmup = serde_json::json!({"run_index": 0, "warmup": true, "driver_launch_unix_ms": 10_000.0, "driver_return_unix_ms": 20_000.0});
+		let off = serde_json::json!({"run_index": 0, "warmup": false, "driver_launch_unix_ms": 20_500.0, "driver_return_unix_ms": 23_000.0});
+		let on = serde_json::json!({"run_index": 0, "warmup": false, "driver_launch_unix_ms": 30_000.0, "driver_return_unix_ms": 35_000.0});
+		let joined = adr593_join_journal_and_gaps(&[&warmup, &off, &on], &collection);
+		let per_child = joined["per_child"].as_array().unwrap();
+		assert_eq!(per_child[0]["journal_count"], 1);
+		assert_eq!(per_child[1]["journal_count"], 0);
+		assert_eq!(per_child[2]["journal_count"], 1);
+		assert_eq!(per_child[1]["gap_since_previous_return_ms"], 500.0);
+		assert_eq!(per_child[2]["gap_since_previous_return_ms"], 7000.0);
+		assert_eq!(
+			per_child[0]["gap_since_previous_return_ms"],
+			serde_json::Value::Null
+		);
+		assert_eq!(
+			per_child[0]["journal_window_inside_collection_bounds"],
+			true
+		);
+		assert_eq!(per_child[0]["journal_coverage"], "complete");
+		// A window outside the collection's bounds is said so, not silently empty.
+		let late = serde_json::json!({"run_index": 1, "warmup": false, "driver_launch_unix_ms": 39_500.0, "driver_return_unix_ms": 41_000.0});
+		let joined = adr593_join_journal_and_gaps(&[&late], &collection);
+		assert_eq!(
+			joined["per_child"][0]["journal_window_inside_collection_bounds"],
+			false
+		);
+		assert_eq!(
+			joined["per_child"][0]["journal_coverage"],
+			"outside_collection_bounds"
+		);
+		assert_eq!(
+			joined["per_child"][0]["journal_count"],
+			serde_json::Value::Null
+		);
+	}
+
+	// Inside the requested bounds is not coverage: a truncated collection covers a window only
+	// partially and its count is a lower bound; an unavailable or degraded one covers nothing and
+	// its count is unknown, however many entries happen to lie in the window.
+	#[test]
+	fn adr593_truncated_and_unavailable_collections_never_report_complete_coverage() {
+		let entry = JournalEntry {
+			realtime_us: 10_500_000,
+			monotonic_us: None,
+			boot_id: None,
+			source: Some("x".to_string()),
+			message: "m".to_string(),
+		};
+		let warmup = serde_json::json!({"run_index": 0, "warmup": true, "driver_launch_unix_ms": 10_000.0, "driver_return_unix_ms": 20_000.0});
+		let base = JournalCollection {
+			since_unix_ms: 9_000.0,
+			until_unix_ms: 40_000.0,
+			state: JournalState::Collected,
+			entries: vec![entry],
+			malformed_records: 0,
+			bytes_read: 100,
+			entry_cap: 2000,
+			byte_cap: 1 << 24,
+			duration_bound_ms: 30_000,
+			command: String::new(),
+		};
+		let truncated = JournalCollection {
+			state: JournalState::Truncated("entry cap 2000 hit; 2000 entries kept".to_string()),
+			..base.clone()
+		};
+		let child = &adr593_join_journal_and_gaps(&[&warmup], &truncated)["per_child"][0];
+		assert_eq!(child["journal_window_inside_collection_bounds"], true);
+		assert_eq!(child["journal_coverage"], "partial");
+		assert_eq!(child["journal_count"]["at_least"], 1);
+		for state in [
+			JournalState::Unavailable("journalctl exited 1".to_string()),
+			JournalState::Degraded("3 malformed records skipped".to_string()),
+		] {
+			let collection = JournalCollection {
+				state,
+				..base.clone()
+			};
+			let child = &adr593_join_journal_and_gaps(&[&warmup], &collection)["per_child"][0];
+			assert_eq!(child["journal_window_inside_collection_bounds"], true);
+			assert_eq!(child["journal_coverage"], "unknown");
+			assert_eq!(child["journal_count"], serde_json::Value::Null);
+			assert_eq!(
+				child["journal_entries"].as_array().unwrap().len(),
+				1,
+				"entries still shown"
+			);
+		}
+		let complete = &adr593_join_journal_and_gaps(&[&warmup], &base)["per_child"][0];
+		assert_eq!(complete["journal_coverage"], "complete");
+		assert_eq!(complete["journal_count"], 1);
 	}
 }

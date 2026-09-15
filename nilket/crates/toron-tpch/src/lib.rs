@@ -15,6 +15,7 @@
 mod adr444_profile_eval;
 pub mod affinity;
 pub mod evidence;
+pub mod host_readings;
 pub mod perf_board;
 pub mod telemetry;
 
@@ -4427,6 +4428,9 @@ async fn execute_logical_with_catalog_timed(
 		|| tpch_execution_context(task_telemetry.clone()),
 		|budget| tpch_execution_context_with_budget(task_telemetry.clone(), budget),
 	);
+	// ADR 593: the host reading before the execute clock starts, and the one after it stops,
+	// bracket the span and are never inside it; armed only by the perf child.
+	let host_reading_start = crate::host_readings::begin();
 	let execute_start = Instant::now();
 	let batches = match Executor::with_context(storage, context)
 		.execute_bound(&bound, None)
@@ -4435,6 +4439,7 @@ async fn execute_logical_with_catalog_timed(
 		Ok(batches) => batches,
 		Err(error) => {
 			timings.execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
+			crate::host_readings::finish(host_reading_start);
 			timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
 			spill_bytes = task_telemetry
 				.lock()
@@ -4449,6 +4454,7 @@ async fn execute_logical_with_catalog_timed(
 		}
 	};
 	timings.execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
+	crate::host_readings::finish(host_reading_start);
 	timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
 	let telemetry = task_telemetry.lock().expect("task telemetry lock");
 	spill_bytes = telemetry.counters.spill_bytes;
