@@ -1548,6 +1548,11 @@ pub(in crate::exec) struct NeqExistenceSummary {
 
 	#[cfg(test)]
 	growth_count: u64,
+
+	/// Actual walks of the bucket array by this summary's insert path (test-only): the pin for
+	/// the driver's walk denominator, counted independently of the instrument's counters.
+	#[cfg(test)]
+	walk_count: u64,
 }
 
 impl NeqExistenceSummary {
@@ -1573,6 +1578,9 @@ impl NeqExistenceSummary {
 
 			#[cfg(test)]
 			growth_count: 0,
+
+			#[cfg(test)]
+			walk_count: 0,
 		}
 	}
 
@@ -1629,6 +1637,13 @@ impl NeqExistenceSummary {
 
 		if INSTRUMENTED {
 			instrument.counters.lookups += 1;
+			if self.buckets.is_empty() {
+				instrument.counters.empty_table_lookups += 1;
+			}
+		}
+		#[cfg(test)]
+		if !self.buckets.is_empty() {
+			self.walk_count += 1;
 		}
 		let mut steps = 0u64;
 		if let Some(entry_index) = self.lookup_entry_index_with::<INSTRUMENTED>(key, &mut steps) {
@@ -1643,7 +1658,8 @@ impl NeqExistenceSummary {
 			return Ok(());
 		}
 
-		if self.entries.len() == self.entry_limit {
+		let grew = self.entries.len() == self.entry_limit;
+		if grew {
 			if INSTRUMENTED {
 				let started = steady_clock_ns();
 				self.grow(baseline_bytes, cap)?;
@@ -1659,6 +1675,10 @@ impl NeqExistenceSummary {
 				message: "recognized Neq existence summary exceeds u32 entry range".to_string(),
 			})?;
 
+		#[cfg(test)]
+		{
+			self.walk_count += 1;
+		}
 		let bucket = if INSTRUMENTED {
 			let mut append_steps = 0u64;
 			let bucket = Self::find_bucket_in_with::<true>(
@@ -1670,6 +1690,9 @@ impl NeqExistenceSummary {
 			)?;
 			instrument.counters.appended += 1;
 			instrument.counters.probe_steps += steps + append_steps;
+			if grew {
+				instrument.counters.growth_reprobes += 1;
+			}
 			bucket
 		} else {
 			self.find_bucket(key)?
@@ -3215,10 +3238,16 @@ fn current_thread_id() -> u64 {
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(in crate::exec) struct InsertCounters {
 	pub(in crate::exec) cache_hits: u64,
+	/// Every row that was not a cache hit, counted before its lookup runs; includes the one
+	/// attempt per summary against an empty table, which returns without walking.
 	pub(in crate::exec) lookups: u64,
 	pub(in crate::exec) lookup_found: u64,
 	pub(in crate::exec) appended: u64,
 	pub(in crate::exec) probe_steps: u64,
+	/// Lookups that met an empty table and walked nothing.
+	pub(in crate::exec) empty_table_lookups: u64,
+	/// Probes of a fresh bucket array after a growth operation, the first allocation included.
+	pub(in crate::exec) growth_reprobes: u64,
 }
 
 /// One half-open `[start_ns, end_ns)` window on the thread that opened it.
@@ -3369,7 +3398,9 @@ impl InsertInstrument {
 		text
 	}
 
-	/// The exact inverse of `encode_rows_windows`.
+	/// The exact inverse of `encode_rows_windows`; the driver carries its own copy, this one pins
+	/// the encoding in the engine's tests.
+	#[cfg(test)]
 	pub(in crate::exec) fn decode_rows_windows(text: &str) -> Result<Vec<InsertWindow>, String> {
 		let mut windows = Vec::new();
 		if text.is_empty() {
@@ -3437,6 +3468,8 @@ impl InsertInstrument {
 				"lookup_found": self.counters.lookup_found,
 				"appended": self.counters.appended,
 				"probe_steps": self.counters.probe_steps,
+				"empty_table_lookups": self.counters.empty_table_lookups,
+				"growth_reprobes": self.counters.growth_reprobes,
 				"grow_events": self.growth.len(),
 			},
 			"key_count_hint": key_count_hint,
@@ -32807,6 +32840,20 @@ mod tests {
 		assert_eq!(counters.lookup_found, 1);
 		assert_eq!(counters.appended, 4);
 		assert!(counters.probe_steps < 100, "steps {}", counters.probe_steps);
+		// The first lookup met an empty table and walked nothing; the growth that followed it
+		// was the first allocation, and the append's probe of the fresh array is a reprobe.
+		assert_eq!(counters.empty_table_lookups, 1);
+		assert_eq!(counters.growth_reprobes, 1);
+		// Actual walks: every non-empty lookup plus every append's walk, pinned against the
+		// summary's own walk counter.
+		assert_eq!(
+			counted.walk_count,
+			counters.lookups - counters.empty_table_lookups + counters.appended
+		);
+		assert_eq!(
+			counted.walk_count, 8,
+			"4 non-empty lookups + 4 append walks"
+		);
 		assert_eq!(instrument.rows.len(), 2, "one rows window per batch");
 		assert_eq!(
 			instrument.growth.len(),
@@ -32887,6 +32934,16 @@ mod tests {
 		assert_eq!(instrument.counters.appended, 2500);
 		assert_eq!(instrument.counters.cache_hits, 0);
 		assert_eq!(instrument.counters.lookup_found, 0);
+		assert_eq!(instrument.counters.empty_table_lookups, 1);
+		assert_eq!(
+			instrument.counters.growth_reprobes, 3,
+			"one per growth event"
+		);
+		assert_eq!(
+			summary.walk_count,
+			instrument.counters.lookups - instrument.counters.empty_table_lookups
+				+ instrument.counters.appended
+		);
 		let value = instrument.diagnostic_value(
 			None,
 			summary.entries.len(),

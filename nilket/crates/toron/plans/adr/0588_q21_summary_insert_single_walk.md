@@ -1,12 +1,15 @@
 # ADR 588 - q21 existence-summary insert: one walk per miss
 
-**Status:** PROPOSED. Successor to ADR 587. The first behaviour-changing cut
-of the q21 arc since ADR 580: on a miss, the existence summary reuses the
-bucket its first probe already found instead of hashing and walking a
-second time, unless a growth operation ran in between, in which case it
-re-probes. Accepted only on digest parity and a paired net execution gain
-at the sealed coordinate; otherwise reverted and closed. The order-aware
-build stays a separate candidate and is not part of this record.
+**Status:** CLOSED, not established. Measured 2026-09-14 as two `release`
+executables on one recipe (control tree `e0cc2ff6`, treatment tree
+`3d6709a1`); results, the rejected rehearsal, and the mechanism check are
+recorded in `plans/impl/0588_q21_summary_insert_single_walk_results.md`.
+Digest parity held on every row; every pair was faster with the cut, median
+182.2 ms (1.41%); the predeclared rule required 353.0 ms, twice the control
+range, and the gain did not clear it. The cut is reverted in the closing
+commit and the candidate is closed. The mechanism check confirmed the cut
+halved the probe steps and left growth untouched; the row loop stays the
+owner after it. The order-aware build remains a separate candidate.
 
 
 ## Context
@@ -294,12 +297,18 @@ whose gain is not established, however plausible.
 
 ## Forward
 
-If retained, q21's row loop is shorter by the established gain and the
-next cut on this path is the order-aware build, which the counts already
-justify examining (12,000,000 appends, 4,370 found) and which would
-subsume the single walk; the repartition candidate from ADR 586 is
-governed by the same order question. If not established, the candidate
-closes and the order-aware build is the successor directly. Either way,
-`cleanup` at 567.3 ms and `runtime_prep_inner_1` at 1,654.0 ms stay open
-as their own candidates, and the ADR 587 instrument stays available for
-pricing whichever cut comes next.
+Not established: the second walk on a miss is worth about 1.4% of q21 at
+this coordinate, consistently in direction across five pairs and twice as
+large as the accidental A/A's median, but half the size the rule demanded
+against a 176.5 ms control range. It is reverted and closed. The row loop
+outside growth remains the owner (1,056 ms on the treatment, 1,123 ms
+before it), and its next candidate is the order-aware build, which the
+counts already justify examining (12,000,000 appends against 4,370 found
+lookups on an order-key-sorted source) and which subsumes the single walk:
+a build that appends a new key without any walk removes both walks, and
+its gain must be measured the same way, two `release` executables, digest
+parity, the same rule. `semi_write_repartition` at 613 ms gross stays open
+with net unpriced and is governed by the same order question. `cleanup`
+at 567 ms and `runtime_prep_inner_1` at 1,654 ms stay open as their own
+candidates. The paired-executable driver, its identity gate, and the
+accidental A/A's noise figure are reusable for whichever cut comes next.
