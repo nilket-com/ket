@@ -1,7 +1,16 @@
 # ADR 592 - q21 attribution on strix's sealed coordinate
 
-**Status:** PROPOSED. Successor to ADR 591, whose sealed board names q21 the
-next owner on strix by absolute gap.
+**Status:** CLOSED, OWNER UNRESOLVED. Measured on strix under ADR 591's
+coordinate with both drivers bound to the sealed baseline (results in
+`plans/impl/0592_q21_attribution_on_strix_results.md`). Phase 1 resolves
+`outside_drive` as q21's owner (4,416.3 ms, 48.93%, accepted profile,
+35.7 ms off range). Phase 2 leaves the envelope unresolved:
+`runtime_prep_inner_1` leads at 1,334.5 ms and clears the floor, but
+`runtime_prep_semi_write` (849.6 ms) lies within the 609.0 ms off range
+of it and the rule reports the tie. Nothing promoted; slim's
+`runtime_prep_inner_1` stays a hypothesis with a named rival. Successor to
+ADR 591, whose sealed board names q21 the next owner on strix by absolute
+gap.
 
 
 ## Context
@@ -58,8 +67,9 @@ coordinate fields (mode, scale, budgets, parallelism); diagnostics
 disabled on the off arm; and the identity of the executable that actually
 ran, the manifest it was launched from, and the launched executable hash,
 each equal to the current instrumented executable's manifest, not to the
-sealed one, which is the historical reference. A failing row is journaled
-with its refusal and the run stops there; ADR 588's validator is
+sealed one, which is the historical reference. A child that did not pass
+is returned to the validator as it is, never swallowed by the launcher;
+a failing row is journaled with its refusal and the run stops there; ADR 588's validator is
 generalized so both drivers share it, and the driver records the
 coordinate in its summary. That is the plumbing this record adds, with a
 discriminating fixture per refusal.
@@ -68,11 +78,15 @@ discriminating fixture per refusal.
 drivers accept `--sealed-manifest PATH` and this record requires it. The
 driver reads the sealed run manifest, requires `seal_state = sealed` and
 `final_authority = true`, resolves the artifact it names, hashes it, and
-refuses unless the hash equals the manifest's `artifact_sha256`. From the
-verified artifact it reads the header's dataset fingerprint and affinity
-(`cpu_affinity_requested`, explicit) and the q21 Toron cell summary
-(present, passing, its median and its digest), and binds the driver's
-coordinate to them: the process affinity must equal the baseline's, every
+refuses unless the hash equals the manifest's `artifact_sha256`. It requires
+the artifact's header to be this record's coordinate (strict mode,
+parquet, scale 8, both 2 GiB budgets and the parallelism pin with
+explicit provenance) and its own executable and tree identity to be the
+manifest's, since the manifest's labels are what the summary reports.
+From the verified artifact it reads the header's dataset fingerprint and
+affinity (`cpu_affinity_requested`, explicit) and the q21 Toron cell
+summary (present, passing, its median and its digest), and binds the
+driver's coordinate to them: the process affinity must equal the baseline's, every
 child's dataset fingerprint and digest must equal the baseline's, and the
 baseline median is the reference the off-arm distance is stated against.
 The summary records the baseline's source tree, executable, DuckDB, and
@@ -145,17 +159,22 @@ record first.
   fingerprint or not `parquet`, is off the sealed coordinate, or names an
   executable, manifest, or launched hash other than the current
   instrumented executable's; each names the row and the field, the
-  failing row is journaled, and no further child is launched. The driver
-  refuses to start under a default affinity coordinate or one differing
-  from the baseline's. Each refusal has a fixture that changes one thing,
-  the warmup row included.
+  failing row is journaled with its refusal, and no further child is
+  launched; a driver-path test with an injected launcher proves a failed
+  warmup is journaled and no second child launches. The driver refuses to
+  start under a default affinity coordinate or one differing from the
+  baseline's. Each refusal has a fixture that changes one thing, the
+  warmup row included.
 - `--sealed-manifest` is required; the driver refuses an unreadable,
   unsealed, or non-final manifest, an artifact whose hash differs from
   the manifest's, an artifact without a passing q21 Toron cell, a dataset
-  fingerprint or a digest differing from the children's, and an affinity
-  differing from the process's, each with the reason named; fixtures
-  cover a mismatched artifact hash, a mismatched dataset fingerprint, and
-  a mismatched affinity. The summary records the bound values.
+  fingerprint or a digest differing from the children's, an affinity
+  differing from the process's, a header at another coordinate (mode,
+  source, scale, budgets, parallelism, each with its provenance), and a
+  header whose identity is not the manifest's, each with the reason
+  named; fixtures cover a mismatched artifact hash, a mismatched dataset
+  fingerprint, a mismatched affinity, every coordinate field other and
+  absent, and the identity. The summary records the bound values.
 - Phase 1 journals eleven rows (one warmup, five pairs) on one instrumented
   executable, every row validated, the perturbation and completeness
   gates reported as ADR 584 defined them, and the nine-term table with its

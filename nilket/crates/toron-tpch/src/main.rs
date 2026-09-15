@@ -123,6 +123,7 @@ async fn run() -> ExitCode {
 		"perf" => perf_command(&args).await,
 		"perf-run-one" => perf_run_one_command(&args).await,
 		"perf-board-replay" => perf_board_replay_command(&args),
+		"adr592-revalidate" => adr592_revalidate_command(&args),
 		"adr584-q21-attribution" => adr584_q21_attribution_command(&args),
 		"adr585-q21-decomposition" => adr585_q21_decomposition_command(&args),
 		"adr586-q21-semi-write" => adr586_q21_semi_write_command(&args),
@@ -979,49 +980,37 @@ fn run_adr584_q21_attribution(args: &[String]) -> Result<serde_json::Value, Stri
 			dataset.verification.as_str()
 		));
 	}
+	// ADR 592: the coordinate is fixed, and bound to the sealed baseline when one is named,
+	// before the first child; every child, the warmup included, is validated as it returns.
+	let coordinate = adr592_driver_coordinate(
+		"ADR 584",
+		args,
+		&identity,
+		&dataset.manifest_fingerprint,
+		data_source,
+	)?;
 	let journal = prepare_perf_sample_journal(&output_dir)?;
 	std::fs::create_dir_all(output_dir.join("profiles"))
 		.map_err(|error| format!("create ADR 584 profile directory: {error}"))?;
 
-	let mut warmup = run_adr584_child(
-		0,
-		true,
-		false,
-		mode,
-		sf,
-		data_source,
-		&data_dir,
-		&output_dir,
-	)?;
-	warmup["adr584_arm"] = serde_json::json!("off");
-	warmup["adr584_pair"] = serde_json::Value::Null;
-	journal.append(&warmup)?;
-
-	let mut rows = Vec::with_capacity(ADR584_PAIRS * 2);
-	for pair in 0..ADR584_PAIRS {
-		let order = if pair % 2 == 0 {
-			[false, true]
-		} else {
-			[true, false]
-		};
-		for (position, on) in order.into_iter().enumerate() {
-			let mut row = run_adr584_child(
-				pair as u32,
-				false,
+	let (warmup, rows) = adr592_run_paired_children(
+		("adr584_arm", "adr584_pair", "adr584_pair_position"),
+		ADR584_PAIRS,
+		&coordinate,
+		&journal,
+		|run_index, warmup, on| {
+			run_adr584_child(
+				run_index,
+				warmup,
 				on,
 				mode,
 				sf,
 				data_source,
 				&data_dir,
 				&output_dir,
-			)?;
-			row["adr584_arm"] = serde_json::json!(if on { "on" } else { "off" });
-			row["adr584_pair"] = serde_json::json!(pair);
-			row["adr584_pair_position"] = serde_json::json!(position);
-			journal.append(&row)?;
-			rows.push(row);
-		}
-	}
+			)
+		},
+	)?;
 	let host_end = observe_host_quiescence();
 	if !host_end.quiescent() || !directory_is_empty(&scratch)? {
 		return Err(
@@ -1033,6 +1022,10 @@ fn run_adr584_q21_attribution(args: &[String]) -> Result<serde_json::Value, Stri
 	summary["sealed"] = serde_json::json!(false);
 	summary["candidate_authority"] = serde_json::json!(false);
 	summary["sealed_baseline_executable_sha256"] = serde_json::json!(ADR584_BASELINE_EXECUTABLE);
+	let off_median = summary
+		.get("off_execute_median_ms")
+		.and_then(serde_json::Value::as_f64);
+	adr592_stamp_summary(&mut summary, &coordinate, off_median);
 	summary["instrumented_evidence_identity"] = identity.json_value();
 	summary["dataset_manifest_fingerprint"] = serde_json::json!(dataset.manifest_fingerprint);
 	summary["memory_per_task"] = serde_json::json!(budget.memory_per_task);
@@ -1091,9 +1084,8 @@ fn run_adr584_child(
 	} else {
 		run_perf_child_args(&args)?
 	};
-	if row.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
-		return Err(format!("ADR 584 child did not pass: {row}"));
-	}
+	// ADR 592: a non-passing row is returned as it is; the shared validator refuses it and the
+	// driver journals the refusal beside the row before stopping.
 	Ok(row)
 }
 
@@ -1595,49 +1587,37 @@ fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, St
 			dataset.verification.as_str()
 		));
 	}
+	// ADR 592: as in the ADR 584 driver, the coordinate is fixed and bound before the first
+	// child and every child is validated as it returns.
+	let coordinate = adr592_driver_coordinate(
+		"ADR 585",
+		args,
+		&identity,
+		&dataset.manifest_fingerprint,
+		data_source,
+	)?;
 	let journal = prepare_perf_sample_journal(&output_dir)?;
 	std::fs::create_dir_all(output_dir.join("profiles"))
 		.map_err(|error| format!("create ADR 585 profile directory: {error}"))?;
 
-	let mut warmup = run_adr585_child(
-		0,
-		true,
-		false,
-		mode,
-		sf,
-		data_source,
-		&data_dir,
-		&output_dir,
-	)?;
-	warmup["adr585_arm"] = serde_json::json!("off");
-	warmup["adr585_pair"] = serde_json::Value::Null;
-	journal.append(&warmup)?;
-
-	let mut rows = Vec::with_capacity(ADR585_PAIRS * 2);
-	for pair in 0..ADR585_PAIRS {
-		let order = if pair % 2 == 0 {
-			[false, true]
-		} else {
-			[true, false]
-		};
-		for (position, on) in order.into_iter().enumerate() {
-			let mut row = run_adr585_child(
-				pair as u32,
-				false,
+	let (warmup, rows) = adr592_run_paired_children(
+		("adr585_arm", "adr585_pair", "adr585_pair_position"),
+		ADR585_PAIRS,
+		&coordinate,
+		&journal,
+		|run_index, warmup, on| {
+			run_adr585_child(
+				run_index,
+				warmup,
 				on,
 				mode,
 				sf,
 				data_source,
 				&data_dir,
 				&output_dir,
-			)?;
-			row["adr585_arm"] = serde_json::json!(if on { "on" } else { "off" });
-			row["adr585_pair"] = serde_json::json!(pair);
-			row["adr585_pair_position"] = serde_json::json!(position);
-			journal.append(&row)?;
-			rows.push(row);
-		}
-	}
+			)
+		},
+	)?;
 	let host_end = observe_host_quiescence();
 	if !host_end.quiescent() || !directory_is_empty(&scratch)? {
 		return Err(
@@ -1651,6 +1631,10 @@ fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, St
 	summary["sealed_baseline_executable_sha256"] =
 		serde_json::json!(ADR585_SEALED_BASELINE_EXECUTABLE);
 	summary["adr584_instrumented_executable_sha256"] = serde_json::json!(ADR585_ADR584_EXECUTABLE);
+	let off_median = summary
+		.get("off_execute_median_ms")
+		.and_then(serde_json::Value::as_f64);
+	adr592_stamp_summary(&mut summary, &coordinate, off_median);
 	summary["instrumented_evidence_identity"] = identity.json_value();
 	summary["dataset_manifest_fingerprint"] = serde_json::json!(dataset.manifest_fingerprint);
 	summary["memory_per_task"] = serde_json::json!(budget.memory_per_task);
@@ -3159,6 +3143,610 @@ struct Adr588Dataset {
 /// moment the child returns and again in the evaluator: a passing q21 Toron row at the sealed
 /// coordinate, unprofiled, carrying the pinned digest byte for byte, reporting the identity of
 /// its arm's manifest, launched with that manifest and executable, over the verified dataset.
+// ---------------------------------------------------------------------------------------------
+// ADR 592: the sealed baseline bound by its contents, and one child validator for the
+// attribution drivers.
+// ---------------------------------------------------------------------------------------------
+
+/// What a driver binds itself to when `--sealed-manifest` names a sealed board: not the
+/// manifest's labels but the artifact they name, re-hashed, and the values read out of it.
+#[derive(Debug, Clone, PartialEq)]
+struct Adr592SealedBaseline {
+	manifest_path: String,
+	source_tree_id: String,
+	executable_sha256: String,
+	duckdb_sha256: Option<String>,
+	artifact_path: String,
+	artifact_sha256: String,
+	dataset_manifest_fingerprint: String,
+	cpu_affinity_requested: String,
+	q21_toron_execute_ms_median: f64,
+	q21_toron_digest: String,
+}
+
+impl Adr592SealedBaseline {
+	fn json_value(&self) -> serde_json::Value {
+		serde_json::json!({
+			"manifest_path": self.manifest_path,
+			"source_tree_id": self.source_tree_id,
+			"executable_sha256": self.executable_sha256,
+			"duckdb_sha256": self.duckdb_sha256,
+			"artifact_path": self.artifact_path,
+			"artifact_sha256": self.artifact_sha256,
+			"dataset_manifest_fingerprint": self.dataset_manifest_fingerprint,
+			"cpu_affinity_requested": self.cpu_affinity_requested,
+			"q21_toron_execute_ms_median": self.q21_toron_execute_ms_median,
+			"q21_toron_digest": self.q21_toron_digest,
+		})
+	}
+}
+
+/// Read and verify the sealed manifest at `path`: sealed with final authority, its artifact
+/// present and hashing to what the manifest claims, and carrying a passing q21 Toron cell.
+fn adr592_load_sealed_baseline(path: &Path) -> Result<Adr592SealedBaseline, String> {
+	let manifest = toron_tpch::evidence::RunEvidenceManifest::read(path)
+		.map_err(|error| format!("ADR 592 sealed manifest {}: {error}", path.display()))?;
+	let artifact_sha256 = toron_tpch::evidence::sha256_file(&manifest.artifact_path)
+		.map_err(|error| format!("ADR 592 sealed artifact: {error}"))?;
+	let (header, _samples, summaries) = read_perf_board_artifact(&manifest.artifact_path)
+		.map_err(|error| format!("ADR 592 sealed artifact: {error}"))?;
+	adr592_bind_sealed_baseline(
+		&path.display().to_string(),
+		&manifest,
+		&artifact_sha256,
+		&header,
+		&summaries,
+	)
+}
+
+fn adr592_bind_sealed_baseline(
+	manifest_path: &str,
+	manifest: &toron_tpch::evidence::RunEvidenceManifest,
+	artifact_sha256_observed: &str,
+	header: &serde_json::Value,
+	summaries: &[serde_json::Value],
+) -> Result<Adr592SealedBaseline, String> {
+	if manifest.seal_state != toron_tpch::evidence::SealState::Sealed || !manifest.final_authority {
+		return Err(format!(
+			"ADR 592 baseline {manifest_path} is not a sealed manifest with final authority (seal_state={:?}, final_authority={})",
+			manifest.seal_state, manifest.final_authority
+		));
+	}
+	if artifact_sha256_observed != manifest.artifact_sha256 {
+		return Err(format!(
+			"ADR 592 baseline artifact {} hashes to {artifact_sha256_observed}, manifest claims {}",
+			manifest.artifact_path.display(),
+			manifest.artifact_sha256
+		));
+	}
+	let header_text = |field: &str| {
+		header
+			.get(field)
+			.and_then(serde_json::Value::as_str)
+			.filter(|value| !value.is_empty())
+			.map(str::to_string)
+			.ok_or_else(|| format!("ADR 592 baseline artifact header lacks {field}"))
+	};
+	if header.get("candidate_authority") != Some(&serde_json::Value::Bool(true)) {
+		return Err(
+			"ADR 592 baseline artifact header does not claim candidate authority".to_string(),
+		);
+	}
+	// The artifact must be this record's coordinate, not merely a sealed board: a valid board
+	// under other budgets or another scale would otherwise become the reference.
+	for (field, expected) in [
+		("mode", serde_json::json!("strict")),
+		("data_source", serde_json::json!("parquet")),
+		("scale_factor", serde_json::json!(8.0)),
+		("memory_per_task", serde_json::json!(2_147_483_648u64)),
+		("memory_per_task_provenance", serde_json::json!("explicit")),
+		("spill_bytes_reserved", serde_json::json!(2_147_483_648u64)),
+		(
+			"spill_bytes_reserved_provenance",
+			serde_json::json!("explicit"),
+		),
+		("partition_work_concurrency_requested", serde_json::json!(1)),
+		(
+			"partition_work_concurrency_requested_provenance",
+			serde_json::json!("explicit"),
+		),
+	] {
+		if header.get(field) != Some(&expected) {
+			return Err(format!(
+				"ADR 592 baseline artifact {field} is {:?}, this record's coordinate is {expected}",
+				header.get(field).cloned().unwrap_or_default()
+			));
+		}
+	}
+	// The artifact's own identity must be the manifest's, since the manifest's labels are what
+	// the summary reports.
+	let header_identity = |field: &str| {
+		header
+			.pointer(&format!("/evidence_identity/{field}"))
+			.and_then(serde_json::Value::as_str)
+	};
+	if header_identity("executable_sha256") != Some(manifest.build.toron.sha256.as_str())
+		|| header_identity("source_tree_id") != Some(manifest.build.source_tree_id.as_str())
+	{
+		return Err(format!(
+			"ADR 592 baseline artifact reports identity {} but the manifest names executable {} on tree {}",
+			header.get("evidence_identity").cloned().unwrap_or_default(),
+			manifest.build.toron.sha256,
+			manifest.build.source_tree_id
+		));
+	}
+	let dataset_manifest_fingerprint = header_text("dataset_manifest_fingerprint")?;
+	let cpu_affinity_requested = header_text("cpu_affinity_requested")?;
+	if header_text("cpu_affinity_requested_provenance")? != "explicit" {
+		return Err("ADR 592 baseline artifact affinity provenance is not explicit".to_string());
+	}
+	let cell = summaries
+		.iter()
+		.find(|row| {
+			row.get("engine").and_then(serde_json::Value::as_str) == Some("toron")
+				&& row.get("query").and_then(serde_json::Value::as_str) == Some("q21")
+		})
+		.ok_or_else(|| "ADR 592 baseline artifact has no q21 Toron cell".to_string())?;
+	if cell.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+		return Err("ADR 592 baseline q21 Toron cell did not pass".to_string());
+	}
+	let q21_toron_execute_ms_median = cell
+		.get("execute_ms_median")
+		.and_then(serde_json::Value::as_f64)
+		.filter(|value| value.is_finite() && *value > 0.0)
+		.ok_or_else(|| "ADR 592 baseline q21 Toron cell lacks a finite median".to_string())?;
+	let q21_toron_digest = cell
+		.get("digest")
+		.and_then(serde_json::Value::as_str)
+		.filter(|value| !value.is_empty())
+		.map(str::to_string)
+		.ok_or_else(|| "ADR 592 baseline q21 Toron cell lacks a digest".to_string())?;
+	Ok(Adr592SealedBaseline {
+		manifest_path: manifest_path.to_string(),
+		source_tree_id: manifest.build.source_tree_id.clone(),
+		executable_sha256: manifest.build.toron.sha256.clone(),
+		duckdb_sha256: manifest
+			.build
+			.duckdb
+			.as_ref()
+			.map(|duckdb| duckdb.sha256.clone()),
+		artifact_path: manifest.artifact_path.display().to_string(),
+		artifact_sha256: manifest.artifact_sha256.clone(),
+		dataset_manifest_fingerprint,
+		cpu_affinity_requested,
+		q21_toron_execute_ms_median,
+		q21_toron_digest,
+	})
+}
+
+/// The coordinate a driver's children must reproduce, fixed before the first child runs.
+#[derive(Debug, Clone, PartialEq)]
+struct Adr592ChildExpectation {
+	label: &'static str,
+	/// The current instrumented executable's manifest: every child must have run from it.
+	instrumented: BuildManifest,
+	instrumented_manifest_path: String,
+	dataset_manifest_fingerprint: String,
+	data_source: String,
+	digest: String,
+	cpu_affinity_requested: String,
+}
+
+/// Bind the driver's own coordinate to the verified baseline: the process affinity must be
+/// explicit and the baseline's, and the loaded dataset must be the baseline's.
+fn adr592_bind_driver_coordinate(
+	label: &str,
+	baseline: &Adr592SealedBaseline,
+	affinity: &toron_tpch::affinity::AffinityCoordinate,
+	dataset_manifest_fingerprint: &str,
+) -> Result<(), String> {
+	match (affinity.provenance, affinity.requested.as_deref()) {
+		("explicit", Some(requested)) if requested == baseline.cpu_affinity_requested => {}
+		("explicit", Some(requested)) => {
+			return Err(format!(
+				"{label} runs under affinity {requested}, the sealed baseline was measured under {}",
+				baseline.cpu_affinity_requested
+			));
+		}
+		_ => {
+			return Err(format!(
+				"{label} requires an explicit CPU affinity coordinate ({}); found provenance {:?}",
+				toron_tpch::affinity::CPU_AFFINITY_ENV,
+				affinity.provenance
+			));
+		}
+	}
+	if dataset_manifest_fingerprint != baseline.dataset_manifest_fingerprint {
+		return Err(format!(
+			"{label} loaded dataset {dataset_manifest_fingerprint}, the sealed baseline ran over {}",
+			baseline.dataset_manifest_fingerprint
+		));
+	}
+	Ok(())
+}
+
+/// One validator for every child of the ADR 584 and ADR 585 drivers, warmup included, applied
+/// the moment the child returns. `diagnostics_disabled` is what the arm expects: the off arm
+/// runs with every diagnostic disabled, the on arm with them enabled.
+fn adr592_validate_child_row(
+	row: &serde_json::Value,
+	expected: &Adr592ChildExpectation,
+	diagnostics_disabled: bool,
+) -> Result<(), String> {
+	let label = expected.label;
+	let text = |field: &str| row.get(field).and_then(serde_json::Value::as_str);
+	if text("status") != Some("pass") {
+		return Err(format!("{label} child row did not pass: {row}"));
+	}
+	if text("query") != Some("q21") || text("engine") != Some("toron") {
+		return Err(format!("{label} child row is not a q21 Toron row"));
+	}
+	if text("mode") != Some("strict")
+		|| row.get("scale_factor").and_then(serde_json::Value::as_f64) != Some(8.0)
+		|| row
+			.get("memory_per_task")
+			.and_then(serde_json::Value::as_u64)
+			!= Some(2_147_483_648)
+		|| row
+			.get("spill_bytes_reserved")
+			.and_then(serde_json::Value::as_u64)
+			!= Some(2_147_483_648)
+		|| row
+			.get("partition_work_concurrency_requested")
+			.and_then(serde_json::Value::as_u64)
+			!= Some(1)
+	{
+		return Err(format!(
+			"{label} child row is not at the sealed coordinate (mode/sf/memory/spill/parallelism)"
+		));
+	}
+	if row.get("diagnostics_disabled") != Some(&serde_json::Value::Bool(diagnostics_disabled)) {
+		return Err(format!(
+			"{label} child row reports diagnostics_disabled {:?}, the arm expects {diagnostics_disabled}",
+			row.get("diagnostics_disabled")
+		));
+	}
+	for (field, value) in [
+		(
+			"cpu_affinity_requested",
+			expected.cpu_affinity_requested.as_str(),
+		),
+		("cpu_affinity_requested_provenance", "explicit"),
+		(
+			"cpu_affinity_observed",
+			expected.cpu_affinity_requested.as_str(),
+		),
+	] {
+		if text(field) != Some(value) {
+			return Err(format!(
+				"{label} child row {field} is {:?}, expected {value:?}",
+				text(field)
+			));
+		}
+	}
+	match text("digest") {
+		Some(digest) if digest == expected.digest => {}
+		Some(digest) => {
+			return Err(format!(
+				"{label} digest parity failed on a child row: {digest}"
+			));
+		}
+		None => return Err(format!("{label} child row lacks a digest")),
+	}
+	if text("dataset_verification") != Some("full_hash") {
+		return Err(format!(
+			"{label} child row was not run over a fully verified dataset"
+		));
+	}
+	if text("dataset_manifest_fingerprint") != Some(expected.dataset_manifest_fingerprint.as_str())
+	{
+		return Err(format!(
+			"{label} child row names dataset {:?}, expected {}",
+			text("dataset_manifest_fingerprint"),
+			expected.dataset_manifest_fingerprint
+		));
+	}
+	if text("data_source") != Some(expected.data_source.as_str()) {
+		return Err(format!(
+			"{label} child row names data source {:?}, expected {}",
+			text("data_source"),
+			expected.data_source
+		));
+	}
+	let identity = |field: &str| {
+		row.pointer(&format!("/evidence_identity/{field}"))
+			.and_then(serde_json::Value::as_str)
+	};
+	if identity("executable_sha256") != Some(expected.instrumented.toron.sha256.as_str())
+		|| identity("source_tree_id") != Some(expected.instrumented.source_tree_id.as_str())
+		|| identity("recipe_sha256") != Some(expected.instrumented.recipe_digest.as_str())
+	{
+		return Err(format!(
+			"{label} child row reports an identity that is not the instrumented manifest's: {}",
+			row.get("evidence_identity").cloned().unwrap_or_default()
+		));
+	}
+	if text("adr592_launched_manifest") != Some(expected.instrumented_manifest_path.as_str()) {
+		return Err(format!(
+			"{label} child row was launched with manifest {:?}, expected {}",
+			text("adr592_launched_manifest"),
+			expected.instrumented_manifest_path
+		));
+	}
+	if text("adr592_launched_executable_sha256")
+		!= Some(expected.instrumented.toron.sha256.as_str())
+	{
+		return Err(format!(
+			"{label} child row was launched from an executable other than the instrumented one"
+		));
+	}
+	Ok(())
+}
+
+/// The coordinate both drivers fix before their first child: the sealed baseline when
+/// `--sealed-manifest` is given (required by ADR 592), else ADR 584's slim constant and ADR
+/// 588's digest, the pre-592 default. Either way the affinity must be explicit.
+struct Adr592DriverCoordinate {
+	baseline: Option<Adr592SealedBaseline>,
+	expectation: Adr592ChildExpectation,
+	launched_manifest: String,
+}
+
+fn adr592_driver_coordinate(
+	label: &'static str,
+	args: &[String],
+	identity: &toron_tpch::evidence::RuntimeIdentity,
+	dataset_manifest_fingerprint: &str,
+	data_source: &str,
+) -> Result<Adr592DriverCoordinate, String> {
+	let affinity = toron_tpch::affinity::affinity_coordinate();
+	let launched_manifest = std::env::var(toron_tpch::evidence::BUILD_MANIFEST_ENV)
+		.map_err(|_| format!("{label} must run through toron-bench run with a build manifest"))?;
+	let baseline = match flag_value(args, "--sealed-manifest") {
+		Some(path) => {
+			let baseline = adr592_load_sealed_baseline(Path::new(path))?;
+			adr592_bind_driver_coordinate(
+				label,
+				&baseline,
+				&affinity,
+				dataset_manifest_fingerprint,
+			)?;
+			Some(baseline)
+		}
+		None => {
+			if affinity.provenance != "explicit" || affinity.requested.is_none() {
+				return Err(format!(
+					"{label} requires an explicit CPU affinity coordinate ({}); found provenance {:?}",
+					toron_tpch::affinity::CPU_AFFINITY_ENV,
+					affinity.provenance
+				));
+			}
+			None
+		}
+	};
+	let digest = baseline
+		.as_ref()
+		.map(|baseline| baseline.q21_toron_digest.clone())
+		.unwrap_or_else(|| ADR588_SEALED_Q21_DIGEST.to_string());
+	Ok(Adr592DriverCoordinate {
+		expectation: Adr592ChildExpectation {
+			label,
+			instrumented: identity.manifest.clone(),
+			instrumented_manifest_path: launched_manifest.clone(),
+			dataset_manifest_fingerprint: dataset_manifest_fingerprint.to_string(),
+			data_source: data_source.to_string(),
+			digest,
+			cpu_affinity_requested: affinity.requested.clone().unwrap_or_default(),
+		},
+		baseline,
+		launched_manifest,
+	})
+}
+
+/// Stamp the launch identity on a returned child row and validate it; a failing row is
+/// journaled and the error stops the driver before another child is launched.
+fn adr592_admit_child_row(
+	row: &mut serde_json::Value,
+	coordinate: &Adr592DriverCoordinate,
+	diagnostics_disabled: bool,
+	journal: &PerfSampleJournal,
+) -> Result<(), String> {
+	row["adr592_launched_manifest"] = serde_json::json!(coordinate.launched_manifest);
+	row["adr592_launched_executable_sha256"] =
+		serde_json::json!(coordinate.expectation.instrumented.toron.sha256);
+	if let Err(error) =
+		adr592_validate_child_row(row, &coordinate.expectation, diagnostics_disabled)
+	{
+		row["adr592_refusal"] = serde_json::json!(error);
+		journal.append(row)?;
+		return Err(format!("{error}; run stopped, row retained"));
+	}
+	Ok(())
+}
+
+/// The paired-children loop both drivers share: one unprofiled warmup, then `pairs` adjacent
+/// pairs alternating off-on and on-off, every child (the warmup included) admitted by the
+/// validator the moment it returns and journaled, a refused child stopping the loop before
+/// another is launched. `run_child(run_index, warmup, on)` is the launcher, injectable so the
+/// stop-on-refusal contract is testable without a child process.
+fn adr592_run_paired_children(
+	tags: (&str, &str, &str),
+	pairs: usize,
+	coordinate: &Adr592DriverCoordinate,
+	journal: &PerfSampleJournal,
+	mut run_child: impl FnMut(u32, bool, bool) -> Result<serde_json::Value, String>,
+) -> Result<(serde_json::Value, Vec<serde_json::Value>), String> {
+	let (arm_tag, pair_tag, position_tag) = tags;
+	let mut warmup = run_child(0, true, false)?;
+	warmup[arm_tag] = serde_json::json!("off");
+	warmup[pair_tag] = serde_json::Value::Null;
+	adr592_admit_child_row(&mut warmup, coordinate, true, journal)?;
+	journal.append(&warmup)?;
+	let mut rows = Vec::with_capacity(pairs * 2);
+	for pair in 0..pairs {
+		let order = if pair % 2 == 0 {
+			[false, true]
+		} else {
+			[true, false]
+		};
+		for (position, on) in order.into_iter().enumerate() {
+			let mut row = run_child(pair as u32, false, on)?;
+			row[arm_tag] = serde_json::json!(if on { "on" } else { "off" });
+			row[pair_tag] = serde_json::json!(pair);
+			row[position_tag] = serde_json::json!(position);
+			adr592_admit_child_row(&mut row, coordinate, !on, journal)?;
+			journal.append(&row)?;
+			rows.push(row);
+		}
+	}
+	Ok((warmup, rows))
+}
+
+/// ADR 592: re-run the child validator over a retained driver journal under the gate this
+/// executable carries, bound to a sealed baseline and to the instrumented manifest the journal
+/// was launched from. A tightened validator can thereby re-examine retained rows without
+/// another performance run; every row's verdict is printed, none is hidden.
+fn adr592_revalidate_command(args: &[String]) -> ExitCode {
+	match adr592_revalidate(args) {
+		Ok((report, all_admitted)) => {
+			println!("{report}");
+			if all_admitted {
+				ExitCode::SUCCESS
+			} else {
+				ExitCode::from(1)
+			}
+		}
+		Err(error) => {
+			eprintln!("{error}");
+			ExitCode::from(2)
+		}
+	}
+}
+
+fn adr592_revalidate(args: &[String]) -> Result<(serde_json::Value, bool), String> {
+	let samples = flag_value(args, "--samples")
+		.ok_or_else(|| "adr592-revalidate requires --samples PATH".to_string())?;
+	let sealed = flag_value(args, "--sealed-manifest")
+		.ok_or_else(|| "adr592-revalidate requires --sealed-manifest PATH".to_string())?;
+	let instrumented_path = flag_value(args, "--instrumented-manifest")
+		.ok_or_else(|| "adr592-revalidate requires --instrumented-manifest PATH".to_string())?;
+	let arm_tag = flag_value(args, "--arm-tag")
+		.ok_or_else(|| "adr592-revalidate requires --arm-tag adr584_arm|adr585_arm".to_string())?;
+	let launched_manifest = flag_value(args, "--launched-manifest").unwrap_or(instrumented_path);
+	let baseline = adr592_load_sealed_baseline(Path::new(sealed))?;
+	let instrumented = BuildManifest::read(Path::new(instrumented_path))?;
+	let text =
+		std::fs::read_to_string(samples).map_err(|error| format!("read {samples}: {error}"))?;
+	let rows = text
+		.lines()
+		.filter(|line| !line.trim().is_empty())
+		.map(|line| {
+			serde_json::from_str::<serde_json::Value>(line)
+				.map_err(|error| format!("parse {samples}: {error}"))
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	let first_affinity = rows
+		.first()
+		.and_then(|row| row.get("cpu_affinity_requested"))
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or_default()
+		.to_string();
+	let affinity = toron_tpch::affinity::AffinityCoordinate {
+		requested: Some(first_affinity),
+		provenance: "explicit",
+	};
+	adr592_bind_driver_coordinate(
+		"adr592-revalidate",
+		&baseline,
+		&affinity,
+		rows.first()
+			.and_then(|row| row.get("dataset_manifest_fingerprint"))
+			.and_then(serde_json::Value::as_str)
+			.unwrap_or_default(),
+	)?;
+	let expected = Adr592ChildExpectation {
+		label: "adr592-revalidate",
+		instrumented: instrumented.clone(),
+		instrumented_manifest_path: launched_manifest.to_string(),
+		dataset_manifest_fingerprint: baseline.dataset_manifest_fingerprint.clone(),
+		data_source: "parquet".to_string(),
+		digest: baseline.q21_toron_digest.clone(),
+		cpu_affinity_requested: baseline.cpu_affinity_requested.clone(),
+	};
+	let mut verdicts = Vec::new();
+	let mut all_admitted = true;
+	for (index, row) in rows.iter().enumerate() {
+		let arm = row.get(arm_tag).and_then(serde_json::Value::as_str);
+		let diagnostics_disabled = match arm {
+			Some("off") => true,
+			Some("on") => false,
+			other => {
+				all_admitted = false;
+				verdicts.push(serde_json::json!({
+					"row": index, "arm": other, "admitted": false,
+					"refusal": format!("row lacks a recognised {arm_tag}"),
+				}));
+				continue;
+			}
+		};
+		let mut row = row.clone();
+		// Rows journaled by a driver already carry the launch stamps; a row from before the
+		// stamps existed is refused on them, which is the point.
+		if row.get("adr592_launched_manifest").is_none() {
+			row["adr592_launched_manifest"] = serde_json::Value::Null;
+		}
+		match adr592_validate_child_row(&row, &expected, diagnostics_disabled) {
+			Ok(()) => {
+				verdicts.push(serde_json::json!({"row": index, "arm": arm, "admitted": true}))
+			}
+			Err(refusal) => {
+				all_admitted = false;
+				verdicts.push(serde_json::json!({
+					"row": index, "arm": arm, "admitted": false, "refusal": refusal,
+				}));
+			}
+		}
+	}
+	Ok((
+		serde_json::json!({
+			"samples": samples,
+			"rows": rows.len(),
+			"all_admitted": all_admitted,
+			"sealed_baseline": baseline.json_value(),
+			"instrumented_executable_sha256": instrumented.toron.sha256,
+			"instrumented_source_tree_id": instrumented.source_tree_id,
+			"verdicts": verdicts,
+			"revalidating_evidence_identity": runtime_identity_json(),
+		}),
+		all_admitted,
+	))
+}
+
+/// The baseline fields every driver summary carries under ADR 592.
+fn adr592_stamp_summary(
+	summary: &mut serde_json::Value,
+	coordinate: &Adr592DriverCoordinate,
+	off_execute_ms_median: Option<f64>,
+) {
+	summary["cpu_affinity_requested"] =
+		serde_json::json!(coordinate.expectation.cpu_affinity_requested);
+	summary["adr592_launched_manifest"] = serde_json::json!(coordinate.launched_manifest);
+	match &coordinate.baseline {
+		Some(baseline) => {
+			summary["sealed_baseline"] = baseline.json_value();
+			summary["sealed_baseline_executable_sha256"] =
+				serde_json::json!(baseline.executable_sha256);
+			if let Some(off) = off_execute_ms_median {
+				let distance = off - baseline.q21_toron_execute_ms_median;
+				summary["off_arm_distance_from_sealed_ms"] = serde_json::json!(distance);
+				summary["off_arm_distance_from_sealed_fraction"] =
+					serde_json::json!(distance / baseline.q21_toron_execute_ms_median);
+			}
+		}
+		None => summary["sealed_baseline"] = serde_json::Value::Null,
+	}
+}
+
 fn adr588_validate_row(
 	row: &serde_json::Value,
 	arm: &Adr588ArmExpectation,
@@ -4519,9 +5107,8 @@ fn run_adr585_child(
 	} else {
 		run_perf_child_args(&args)?
 	};
-	if row.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
-		return Err(format!("ADR 585 child did not pass: {row}"));
-	}
+	// ADR 592: a non-passing row is returned as it is; the shared validator refuses it and the
+	// driver journals the refusal beside the row before stopping.
 	Ok(row)
 }
 
@@ -10083,7 +10670,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|perf-board-replay|adr584-q21-attribution|adr585-q21-decomposition|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|perf-board-replay|adr592-revalidate|adr584-q21-attribution|adr585-q21-decomposition|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -13490,5 +14077,618 @@ mod adr591_tests {
 		);
 		assert!(perf_board_replay(&dir.join("absent.jsonl")).is_err());
 		std::fs::remove_dir_all(&dir).unwrap();
+	}
+}
+
+#[cfg(test)]
+mod adr592_tests {
+	use super::*;
+	use toron_tpch::affinity::AffinityCoordinate;
+	use toron_tpch::evidence::{BuildRecipe, ExecutableIdentity, RunEvidenceManifest, SealState};
+
+	fn manifest(tree: &str, exe: &str) -> BuildManifest {
+		let recipe = BuildRecipe::new(
+			"release",
+			Vec::<String>::new(),
+			"x86_64-unknown-linux-gnu",
+			"rustc 1.95.0",
+			"a".repeat(64),
+			"b".repeat(64),
+		)
+		.unwrap();
+		let identity = ExecutableIdentity {
+			sha256: exe.repeat(64),
+			staged_path: PathBuf::from(format!("/staged/{}", exe.repeat(64))),
+		};
+		BuildManifest::new(
+			tree.repeat(40),
+			tree.repeat(40),
+			recipe,
+			identity.clone(),
+			identity,
+			Some(ExecutableIdentity {
+				sha256: "d".repeat(64),
+				staged_path: PathBuf::from("/staged/duckdb"),
+			}),
+			Vec::new(),
+		)
+		.unwrap()
+	}
+
+	fn sealed_manifest() -> RunEvidenceManifest {
+		RunEvidenceManifest {
+			build: manifest("9", "5"),
+			suite: PERF_BOARD_SUITE.to_string(),
+			artifact_path: PathBuf::from("/boards/perf_board.jsonl"),
+			artifact_sha256: "f".repeat(64),
+			candidate_authority: true,
+			seal_state: SealState::Sealed,
+			final_authority: true,
+			archived_harness: None,
+			archived_toron: None,
+			archived_duckdb: None,
+			source_tree_tag: Some("evidence/tag".to_string()),
+		}
+	}
+
+	fn sealed_header() -> serde_json::Value {
+		let build = manifest("9", "5");
+		serde_json::json!({
+			"kind": "artifact_header",
+			"candidate_authority": true,
+			"mode": "strict",
+			"data_source": "parquet",
+			"scale_factor": 8.0,
+			"memory_per_task": 2_147_483_648u64,
+			"memory_per_task_provenance": "explicit",
+			"spill_bytes_reserved": 2_147_483_648u64,
+			"spill_bytes_reserved_provenance": "explicit",
+			"partition_work_concurrency_requested": 1,
+			"partition_work_concurrency_requested_provenance": "explicit",
+			"dataset_manifest_fingerprint": "fnv1a64:0fc5c06d19c5ed23",
+			"cpu_affinity_requested": "0-15",
+			"cpu_affinity_requested_provenance": "explicit",
+			"cpu_affinity_observed": "0-15",
+			"evidence_identity": {
+				"executable_sha256": build.toron.sha256,
+				"source_tree_id": build.source_tree_id,
+			},
+		})
+	}
+
+	fn sealed_summaries() -> Vec<serde_json::Value> {
+		vec![
+			serde_json::json!({"engine": "duckdb", "query": "q21", "status": "pass",
+				"execute_ms_median": 2210.0, "digest": null}),
+			serde_json::json!({"engine": "toron", "query": "q21", "status": "pass",
+				"execute_ms_median": 9126.9, "digest": ADR588_SEALED_Q21_DIGEST}),
+		]
+	}
+
+	fn bind(
+		manifest: &RunEvidenceManifest,
+		observed: &str,
+		header: &serde_json::Value,
+		summaries: &[serde_json::Value],
+	) -> Result<Adr592SealedBaseline, String> {
+		adr592_bind_sealed_baseline("/boards/sealed", manifest, observed, header, summaries)
+	}
+
+	#[test]
+	fn adr592_the_baseline_is_bound_by_content_and_every_mismatch_is_named() {
+		let manifest = sealed_manifest();
+		let hash = "f".repeat(64);
+		let baseline = bind(&manifest, &hash, &sealed_header(), &sealed_summaries()).unwrap();
+		assert_eq!(baseline.q21_toron_execute_ms_median, 9126.9);
+		assert_eq!(baseline.q21_toron_digest, ADR588_SEALED_Q21_DIGEST);
+		assert_eq!(baseline.cpu_affinity_requested, "0-15");
+		assert_eq!(
+			baseline.dataset_manifest_fingerprint,
+			"fnv1a64:0fc5c06d19c5ed23"
+		);
+		assert_eq!(
+			baseline.duckdb_sha256.as_deref(),
+			Some("d".repeat(64).as_str())
+		);
+		assert_eq!(baseline.source_tree_id, "9".repeat(40));
+
+		// The artifact's bytes are not what the manifest claims.
+		let error = bind(
+			&manifest,
+			&"e".repeat(64),
+			&sealed_header(),
+			&sealed_summaries(),
+		)
+		.unwrap_err();
+		assert!(
+			error.contains("hashes to") && error.contains(&"e".repeat(64)),
+			"{error}"
+		);
+
+		// Unsealed, or sealed without final authority.
+		let mut unsealed = sealed_manifest();
+		unsealed.seal_state = SealState::Unsealed;
+		assert!(
+			bind(&unsealed, &hash, &sealed_header(), &sealed_summaries())
+				.unwrap_err()
+				.contains("not a sealed manifest")
+		);
+		let mut not_final = sealed_manifest();
+		not_final.final_authority = false;
+		assert!(
+			bind(&not_final, &hash, &sealed_header(), &sealed_summaries())
+				.unwrap_err()
+				.contains("final_authority=false")
+		);
+
+		// The artifact lacks a passing q21 Toron cell, or the cell lacks its digest.
+		let only_duckdb = sealed_summaries()[..1].to_vec();
+		assert!(
+			bind(&manifest, &hash, &sealed_header(), &only_duckdb)
+				.unwrap_err()
+				.contains("no q21 Toron cell")
+		);
+		let mut failing = sealed_summaries();
+		failing[1]["status"] = serde_json::json!("fail");
+		assert!(
+			bind(&manifest, &hash, &sealed_header(), &failing)
+				.unwrap_err()
+				.contains("did not pass")
+		);
+		let mut undigested = sealed_summaries();
+		undigested[1]["digest"] = serde_json::Value::Null;
+		assert!(
+			bind(&manifest, &hash, &sealed_header(), &undigested)
+				.unwrap_err()
+				.contains("lacks a digest")
+		);
+
+		// The header lacks the affinity coordinate or claims it by default.
+		let mut no_affinity = sealed_header();
+		no_affinity["cpu_affinity_requested"] = serde_json::Value::Null;
+		assert!(
+			bind(&manifest, &hash, &no_affinity, &sealed_summaries())
+				.unwrap_err()
+				.contains("lacks cpu_affinity_requested")
+		);
+		let mut default_affinity = sealed_header();
+		default_affinity["cpu_affinity_requested_provenance"] = serde_json::json!("default");
+		assert!(
+			bind(&manifest, &hash, &default_affinity, &sealed_summaries())
+				.unwrap_err()
+				.contains("not explicit")
+		);
+		let mut unauthoritative = sealed_header();
+		unauthoritative["candidate_authority"] = serde_json::json!(false);
+		assert!(
+			bind(&manifest, &hash, &unauthoritative, &sealed_summaries())
+				.unwrap_err()
+				.contains("candidate authority")
+		);
+
+		// A sealed board at another coordinate is not this record's reference: every
+		// coordinate field is checked, one at a time.
+		for (field, other) in [
+			("mode", serde_json::json!("dev")),
+			("data_source", serde_json::json!("memory")),
+			("scale_factor", serde_json::json!(10.0)),
+			("memory_per_task", serde_json::json!(1_073_741_824u64)),
+			("memory_per_task_provenance", serde_json::json!("default")),
+			("spill_bytes_reserved", serde_json::json!(1_073_741_824u64)),
+			(
+				"spill_bytes_reserved_provenance",
+				serde_json::json!("default"),
+			),
+			("partition_work_concurrency_requested", serde_json::json!(2)),
+			(
+				"partition_work_concurrency_requested_provenance",
+				serde_json::json!("default"),
+			),
+		] {
+			let mut header = sealed_header();
+			header[field] = other;
+			let error = bind(&manifest, &hash, &header, &sealed_summaries()).unwrap_err();
+			assert!(
+				error.contains(&format!("artifact {field} is")),
+				"{field}: {error}"
+			);
+			let mut header = sealed_header();
+			header.as_object_mut().unwrap().remove(field);
+			let error = bind(&manifest, &hash, &header, &sealed_summaries()).unwrap_err();
+			assert!(
+				error.contains(&format!("artifact {field} is")),
+				"{field} absent: {error}"
+			);
+		}
+
+		// The artifact's own identity must be the manifest's.
+		let mut other_exe = sealed_header();
+		other_exe["evidence_identity"]["executable_sha256"] = serde_json::json!("6".repeat(64));
+		let error = bind(&manifest, &hash, &other_exe, &sealed_summaries()).unwrap_err();
+		assert!(
+			error.contains("but the manifest names executable"),
+			"{error}"
+		);
+		let mut other_tree = sealed_header();
+		other_tree["evidence_identity"]["source_tree_id"] = serde_json::json!("8".repeat(40));
+		assert!(
+			bind(&manifest, &hash, &other_tree, &sealed_summaries())
+				.unwrap_err()
+				.contains("but the manifest names")
+		);
+		let mut no_identity = sealed_header();
+		no_identity
+			.as_object_mut()
+			.unwrap()
+			.remove("evidence_identity");
+		assert!(
+			bind(&manifest, &hash, &no_identity, &sealed_summaries())
+				.unwrap_err()
+				.contains("but the manifest names")
+		);
+	}
+
+	fn driver_coordinate(expected: &Adr592ChildExpectation) -> Adr592DriverCoordinate {
+		Adr592DriverCoordinate {
+			baseline: None,
+			expectation: expected.clone(),
+			launched_manifest: expected.instrumented_manifest_path.clone(),
+		}
+	}
+
+	fn journal_in_temp(name: &str) -> (PathBuf, PerfSampleJournal) {
+		let dir = std::env::temp_dir().join(format!("adr592-{name}-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		(dir.clone(), prepare_perf_sample_journal(&dir).unwrap())
+	}
+
+	fn journaled(dir: &Path) -> Vec<serde_json::Value> {
+		std::fs::read_to_string(dir.join(PERF_SAMPLE_JOURNAL))
+			.unwrap()
+			.lines()
+			.map(|line| serde_json::from_str(line).unwrap())
+			.collect()
+	}
+
+	// A child that fails is not an error the driver swallows before validation: the row reaches
+	// the validator, is journaled with its refusal, and no further child is launched.
+	#[test]
+	fn adr592_a_failed_warmup_is_journaled_with_its_refusal_and_stops_the_driver() {
+		let expected = expectation();
+		let coordinate = driver_coordinate(&expected);
+		let (dir, journal) = journal_in_temp("failed-warmup");
+		let mut launches = 0;
+		let error = adr592_run_paired_children(
+			("adr584_arm", "adr584_pair", "adr584_pair_position"),
+			5,
+			&coordinate,
+			&journal,
+			|_, _, _| {
+				launches += 1;
+				let mut row = child_row(&expected, true);
+				row["status"] = serde_json::json!("fail");
+				row["reason"] = serde_json::json!("out_of_memory");
+				Ok(row)
+			},
+		)
+		.unwrap_err();
+		assert!(
+			error.contains("did not pass") && error.contains("row retained"),
+			"{error}"
+		);
+		assert_eq!(launches, 1, "no child after the refused warmup");
+		let rows = journaled(&dir);
+		assert_eq!(rows.len(), 1);
+		assert_eq!(rows[0]["status"], "fail");
+		assert_eq!(rows[0]["adr584_arm"], "off");
+		assert!(
+			rows[0]["adr592_refusal"]
+				.as_str()
+				.unwrap()
+				.contains("did not pass")
+		);
+		assert_eq!(
+			rows[0]["adr592_launched_executable_sha256"],
+			expected.instrumented.toron.sha256
+		);
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn adr592_a_refused_pair_row_stops_after_the_rows_before_it() {
+		let expected = expectation();
+		let coordinate = driver_coordinate(&expected);
+		let (dir, journal) = journal_in_temp("refused-pair");
+		let mut launches = 0;
+		let error = adr592_run_paired_children(
+			("adr585_arm", "adr585_pair", "adr585_pair_position"),
+			5,
+			&coordinate,
+			&journal,
+			|run_index, warmup, on| {
+				launches += 1;
+				let mut row = child_row(&expected, !on);
+				// Pair 1's first child (the on arm) comes back observed on another mask.
+				if !warmup && run_index == 1 && on {
+					row["cpu_affinity_observed"] = serde_json::json!("0-31");
+				}
+				Ok(row)
+			},
+		)
+		.unwrap_err();
+		assert!(error.contains("cpu_affinity_observed is"), "{error}");
+		assert_eq!(launches, 4, "warmup, pair 0 off, pair 0 on, pair 1 on");
+		let rows = journaled(&dir);
+		assert_eq!(rows.len(), 4);
+		assert!(
+			rows[..3]
+				.iter()
+				.all(|row| row.get("adr592_refusal").is_none())
+		);
+		assert_eq!(rows[3]["adr585_pair"], 1);
+		assert_eq!(rows[3]["adr585_arm"], "on");
+		assert!(
+			rows[3]["adr592_refusal"]
+				.as_str()
+				.unwrap()
+				.contains("cpu_affinity_observed")
+		);
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn adr592_a_complete_run_journals_eleven_admitted_rows_in_order() {
+		let expected = expectation();
+		let coordinate = driver_coordinate(&expected);
+		let (dir, journal) = journal_in_temp("complete");
+		let (warmup, rows) = adr592_run_paired_children(
+			("adr584_arm", "adr584_pair", "adr584_pair_position"),
+			5,
+			&coordinate,
+			&journal,
+			|_, _, on| Ok(child_row(&expected, !on)),
+		)
+		.unwrap();
+		assert_eq!(warmup["adr584_arm"], "off");
+		assert_eq!(rows.len(), 10);
+		let arms: Vec<_> = rows
+			.iter()
+			.map(|row| row["adr584_arm"].as_str().unwrap())
+			.collect();
+		assert_eq!(
+			arms,
+			[
+				"off", "on", "on", "off", "off", "on", "on", "off", "off", "on"
+			]
+		);
+		assert_eq!(journaled(&dir).len(), 11);
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn adr592_the_driver_coordinate_must_match_the_baseline_affinity_and_dataset() {
+		let baseline = bind(
+			&sealed_manifest(),
+			&"f".repeat(64),
+			&sealed_header(),
+			&sealed_summaries(),
+		)
+		.unwrap();
+		let explicit = AffinityCoordinate {
+			requested: Some("0-15".to_string()),
+			provenance: "explicit",
+		};
+		adr592_bind_driver_coordinate("ADR 584", &baseline, &explicit, "fnv1a64:0fc5c06d19c5ed23")
+			.unwrap();
+		let other = AffinityCoordinate {
+			requested: Some("0-7".to_string()),
+			provenance: "explicit",
+		};
+		let error =
+			adr592_bind_driver_coordinate("ADR 584", &baseline, &other, "fnv1a64:0fc5c06d19c5ed23")
+				.unwrap_err();
+		assert!(
+			error.contains("affinity 0-7") && error.contains("under 0-15"),
+			"{error}"
+		);
+		let default = AffinityCoordinate {
+			requested: None,
+			provenance: "default",
+		};
+		let error = adr592_bind_driver_coordinate(
+			"ADR 584",
+			&baseline,
+			&default,
+			"fnv1a64:0fc5c06d19c5ed23",
+		)
+		.unwrap_err();
+		assert!(error.contains("explicit CPU affinity"), "{error}");
+		let error =
+			adr592_bind_driver_coordinate("ADR 585", &baseline, &explicit, "fnv1a64:57c8f4f5")
+				.unwrap_err();
+		assert!(
+			error.contains("loaded dataset fnv1a64:57c8f4f5") && error.contains("0fc5c06d19c5ed23"),
+			"{error}"
+		);
+	}
+
+	fn expectation() -> Adr592ChildExpectation {
+		Adr592ChildExpectation {
+			label: "ADR 584",
+			instrumented: manifest("3", "7"),
+			instrumented_manifest_path: "/manifests/instrumented.manifest".to_string(),
+			dataset_manifest_fingerprint: "fnv1a64:0fc5c06d19c5ed23".to_string(),
+			data_source: "parquet".to_string(),
+			digest: ADR588_SEALED_Q21_DIGEST.to_string(),
+			cpu_affinity_requested: "0-15".to_string(),
+		}
+	}
+
+	fn child_row(
+		expected: &Adr592ChildExpectation,
+		diagnostics_disabled: bool,
+	) -> serde_json::Value {
+		serde_json::json!({
+			"query": "q21",
+			"engine": "toron",
+			"status": "pass",
+			"mode": "strict",
+			"scale_factor": 8.0,
+			"memory_per_task": 2_147_483_648u64,
+			"spill_bytes_reserved": 2_147_483_648u64,
+			"partition_work_concurrency_requested": 1,
+			"diagnostics_disabled": diagnostics_disabled,
+			"digest": ADR588_SEALED_Q21_DIGEST,
+			"dataset_verification": "full_hash",
+			"dataset_manifest_fingerprint": "fnv1a64:0fc5c06d19c5ed23",
+			"data_source": "parquet",
+			"cpu_affinity_requested": "0-15",
+			"cpu_affinity_requested_provenance": "explicit",
+			"cpu_affinity_observed": "0-15",
+			"execute_ms": 9000.0,
+			"adr592_launched_manifest": expected.instrumented_manifest_path,
+			"adr592_launched_executable_sha256": expected.instrumented.toron.sha256,
+			"evidence_identity": {
+				"executable_sha256": expected.instrumented.toron.sha256,
+				"source_tree_id": expected.instrumented.source_tree_id,
+				"recipe_sha256": expected.instrumented.recipe_digest,
+			},
+		})
+	}
+
+	// The one validator runs on every child, the warmup included, and each refusal changes
+	// exactly one thing on an otherwise admissible row.
+	#[test]
+	fn adr592_the_child_validator_refuses_each_defect_by_name() {
+		let expected = expectation();
+		adr592_validate_child_row(&child_row(&expected, true), &expected, true)
+			.expect("an off row passes");
+		adr592_validate_child_row(&child_row(&expected, false), &expected, false)
+			.expect("an on row passes");
+		let cases: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>, &str)> = vec![
+			(
+				"status",
+				Box::new(|row| row["status"] = serde_json::json!("fail")),
+				"did not pass",
+			),
+			(
+				"query",
+				Box::new(|row| row["query"] = serde_json::json!("q09")),
+				"not a q21 Toron row",
+			),
+			(
+				"engine",
+				Box::new(|row| row["engine"] = serde_json::json!("duckdb")),
+				"not a q21 Toron row",
+			),
+			(
+				"memory",
+				Box::new(|row| row["memory_per_task"] = serde_json::json!(1_073_741_824u64)),
+				"sealed coordinate",
+			),
+			(
+				"parallelism",
+				Box::new(|row| row["partition_work_concurrency_requested"] = serde_json::json!(2)),
+				"sealed coordinate",
+			),
+			(
+				"diagnostics on the off arm",
+				Box::new(|row| row["diagnostics_disabled"] = serde_json::json!(false)),
+				"diagnostics_disabled",
+			),
+			(
+				"affinity requested",
+				Box::new(|row| row["cpu_affinity_requested"] = serde_json::json!("0-31")),
+				"cpu_affinity_requested is",
+			),
+			(
+				"affinity provenance",
+				Box::new(|row| {
+					row["cpu_affinity_requested_provenance"] = serde_json::json!("default")
+				}),
+				"cpu_affinity_requested_provenance is",
+			),
+			(
+				"affinity observed",
+				Box::new(|row| row["cpu_affinity_observed"] = serde_json::json!("0-31")),
+				"cpu_affinity_observed is",
+			),
+			(
+				"affinity absent",
+				Box::new(|row| {
+					row.as_object_mut()
+						.unwrap()
+						.retain(|key, _| !key.starts_with("cpu_affinity"));
+				}),
+				"cpu_affinity_requested is None",
+			),
+			(
+				"digest other",
+				Box::new(|row| row["digest"] = serde_json::json!("ArrowIpcDigest([0])")),
+				"digest parity failed",
+			),
+			(
+				"digest absent",
+				Box::new(|row| row["digest"] = serde_json::Value::Null),
+				"lacks a digest",
+			),
+			(
+				"verification",
+				Box::new(|row| row["dataset_verification"] = serde_json::json!("declared")),
+				"fully verified",
+			),
+			(
+				"fingerprint",
+				Box::new(|row| {
+					row["dataset_manifest_fingerprint"] = serde_json::json!("fnv1a64:57c8f4f5")
+				}),
+				"names dataset",
+			),
+			(
+				"data source",
+				Box::new(|row| row["data_source"] = serde_json::json!("memory")),
+				"data source",
+			),
+			(
+				"identity",
+				Box::new(|row| {
+					row["evidence_identity"]["executable_sha256"] =
+						serde_json::json!("5".repeat(64))
+				}),
+				"not the instrumented manifest's",
+			),
+			(
+				"tree",
+				Box::new(|row| {
+					row["evidence_identity"]["source_tree_id"] = serde_json::json!("9".repeat(40))
+				}),
+				"not the instrumented manifest's",
+			),
+			(
+				"launched manifest",
+				Box::new(|row| {
+					row["adr592_launched_manifest"] =
+						serde_json::json!("/manifests/sealed.manifest")
+				}),
+				"launched with manifest",
+			),
+			(
+				"launched executable",
+				Box::new(|row| {
+					row["adr592_launched_executable_sha256"] = serde_json::json!("5".repeat(64))
+				}),
+				"executable other than the instrumented",
+			),
+		];
+		for (label, mutate, needle) in cases {
+			let mut row = child_row(&expected, true);
+			mutate(&mut row);
+			let error = adr592_validate_child_row(&row, &expected, true).expect_err(label);
+			assert!(error.contains(needle), "{label}: {error}");
+		}
+		// An on row that ran with diagnostics disabled is refused too: the arm expects them on.
+		let error =
+			adr592_validate_child_row(&child_row(&expected, true), &expected, false).unwrap_err();
+		assert!(error.contains("the arm expects false"), "{error}");
 	}
 }
