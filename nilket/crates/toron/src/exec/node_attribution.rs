@@ -2563,6 +2563,15 @@ fn inclusive_lifecycle_receipt_value(
 			Err(error) => return failed(&error),
 		}
 	}
+	// ADR 594's sixth band: replay 1's preparation split into its sizing scan, its partition
+	// sizing, and the spilled branch's build write, with the residual by checked subtraction and
+	// the branch facts beside them. Absent on a profile that never armed it; present with its
+	// consistency stated when it is.
+	match inner_1_decomposition_band(invocation, get("runtime_prep_inner_1")) {
+		Ok(Some(band)) => write_bands.extend(band),
+		Ok(None) => {}
+		Err(error) => return failed(&error),
+	}
 	let mut receipt = serde_json::json!({
 		"status": "reconciled",
 		"invocation_id": invocation.id,
@@ -2590,6 +2599,203 @@ fn inclusive_lifecycle_receipt_value(
 		.expect("receipt is an object")
 		.extend(write_bands);
 	receipt
+}
+
+/// ADR 594: the three children of replay 1's preparation, the residual, and the facts. `None`
+/// when the band was never armed (no child term and no facts); an `unsupported` branch carries
+/// the fact alone; a partial band is a defect. The consistency of the facts with the branch is
+/// reported as `inner_1_facts_consistent` with the first inconsistency named, so a driver can
+/// refuse an incomplete instrument even where the residual bound would pass.
+fn inner_1_decomposition_band(
+	invocation: &AggregateInvocation,
+	inner_1_micros: u64,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
+	const CHILDREN: [&str; 3] = [
+		"inner_1_sizing_scan",
+		"inner_1_partition_sizing",
+		"inner_1_build_write",
+	];
+	let facts = invocation
+		.diagnostics
+		.iter()
+		.find(|entry| entry.name == "inner_1_facts")
+		.map(|entry| entry.value.clone());
+	let present: Vec<&InclusiveLifecycleTerm> = CHILDREN
+		.iter()
+		.filter_map(|name| {
+			invocation
+				.inclusive_lifecycle
+				.iter()
+				.find(|sample| sample.name == *name)
+		})
+		.collect();
+	if facts.is_none() && present.is_empty() {
+		return Ok(None);
+	}
+	let mut band = serde_json::Map::new();
+	let Some(facts) = facts else {
+		return Err("inner_1 band has child terms but no facts".to_string());
+	};
+	let branch = facts
+		.get("branch")
+		.and_then(serde_json::Value::as_str)
+		.ok_or_else(|| "inner_1 facts lack a branch".to_string())?
+		.to_string();
+	band.insert("inner_1_branch".to_string(), serde_json::json!(branch));
+	if branch == "unsupported" {
+		if !present.is_empty() {
+			return Err("inner_1 band is unsupported yet carries child terms".to_string());
+		}
+		band.insert(
+			"inner_1_facts_consistent".to_string(),
+			serde_json::json!(false),
+		);
+		band.insert(
+			"inner_1_inconsistency".to_string(),
+			serde_json::json!("branch is unsupported: the non-streaming fallback ran"),
+		);
+		return Ok(Some(band));
+	}
+	if present.len() != CHILDREN.len() {
+		let missing: Vec<&str> = CHILDREN
+			.iter()
+			.copied()
+			.filter(|name| !present.iter().any(|sample| sample.name == *name))
+			.collect();
+		return Err(format!("inner_1 band is missing {}", missing.join(", ")));
+	}
+	let mut children_total = 0u64;
+	for sample in &present {
+		if sample.error.is_some() {
+			return Err(format!("inner_1 child {} is failed", sample.name));
+		}
+		children_total = children_total
+			.checked_add(sample.micros)
+			.ok_or_else(|| "inner_1 child sum overflowed".to_string())?;
+		band.insert(
+			format!("{}_micros", sample.name),
+			serde_json::json!(sample.micros),
+		);
+		band.insert(
+			format!("{}_calls", sample.name),
+			serde_json::json!(sample.calls),
+		);
+	}
+	let residual = inner_1_micros
+		.checked_sub(children_total)
+		.ok_or_else(|| "inner_1 children exceed runtime_prep_inner_1".to_string())?;
+	band.insert(
+		"inner_1_residual_micros".to_string(),
+		serde_json::json!(residual),
+	);
+	let fact_u64 = |name: &str| facts.get(name).and_then(serde_json::Value::as_u64);
+	for name in [
+		"partition_count",
+		"group_count",
+		"partition_sizing_passes",
+		"estimated_build_bytes",
+		"sizing_rows",
+		"sizing_scan_calls",
+		"partition_sizing_calls",
+		"build_write_calls",
+	] {
+		band.insert(
+			format!("inner_1_{name}"),
+			facts.get(name).cloned().unwrap_or(serde_json::Value::Null),
+		);
+	}
+	band.insert(
+		"inner_1_build_rows".to_string(),
+		facts
+			.get("build_rows")
+			.cloned()
+			.unwrap_or(serde_json::Value::Null),
+	);
+	band.insert(
+		"inner_1_build_spill_bytes".to_string(),
+		facts
+			.get("build_spill_bytes")
+			.cloned()
+			.unwrap_or(serde_json::Value::Null),
+	);
+	let term_calls = |name: &str| {
+		present
+			.iter()
+			.find(|sample| sample.name == name)
+			.map(|sample| sample.calls)
+			.unwrap_or(0)
+	};
+	// Consistency: every required fact present, and the counts agreeing with the branch.
+	let inconsistency: Option<String> = (|| {
+		for name in [
+			"partition_count",
+			"group_count",
+			"partition_sizing_passes",
+			"estimated_build_bytes",
+			"sizing_rows",
+			"sizing_scan_calls",
+			"partition_sizing_calls",
+			"build_write_calls",
+		] {
+			if fact_u64(name).is_none() {
+				return Some(format!("fact {name} is missing"));
+			}
+		}
+		if fact_u64("sizing_scan_calls") != Some(1) || term_calls("inner_1_sizing_scan") != 1 {
+			return Some("sizing_scan_calls is not 1".to_string());
+		}
+		if fact_u64("partition_sizing_calls") != Some(1)
+			|| term_calls("inner_1_partition_sizing") != 1
+		{
+			return Some("partition_sizing_calls is not 1".to_string());
+		}
+		if fact_u64("partition_sizing_passes").is_none_or(|passes| passes < 1) {
+			return Some("partition_sizing_passes is below 1".to_string());
+		}
+		let partition_count = fact_u64("partition_count").unwrap_or(0);
+		let build_write_calls = fact_u64("build_write_calls").unwrap_or(0);
+		match branch.as_str() {
+			"partitioned" => {
+				if partition_count <= 1 {
+					return Some("partitioned branch with partition_count <= 1".to_string());
+				}
+				if build_write_calls != 0 || term_calls("inner_1_build_write") != 0 {
+					return Some("partitioned branch with a build-write call".to_string());
+				}
+				if present
+					.iter()
+					.find(|sample| sample.name == "inner_1_build_write")
+					.is_some_and(|sample| sample.micros != 0)
+				{
+					return Some("partitioned branch with build-write time".to_string());
+				}
+			}
+			"spilled" => {
+				if partition_count != 1 {
+					return Some("spilled branch with partition_count != 1".to_string());
+				}
+				if build_write_calls != 1 || term_calls("inner_1_build_write") != 1 {
+					return Some("spilled branch without exactly one build-write call".to_string());
+				}
+				if fact_u64("build_rows").is_none() || fact_u64("build_spill_bytes").is_none() {
+					return Some("spilled branch without a completed build write".to_string());
+				}
+			}
+			other => return Some(format!("unknown branch {other}")),
+		}
+		None
+	})();
+	band.insert(
+		"inner_1_facts_consistent".to_string(),
+		serde_json::json!(inconsistency.is_none()),
+	);
+	band.insert(
+		"inner_1_inconsistency".to_string(),
+		inconsistency
+			.map(serde_json::Value::String)
+			.unwrap_or(serde_json::Value::Null),
+	);
+	Ok(Some(band))
 }
 
 /// One summary's insert child split into `insert_rows` (one window per `write_batch`) and
@@ -3783,6 +3989,252 @@ mod tests {
 				.unwrap()
 				.contains("runtime_prep_anti_finish is missing")
 		);
+	}
+
+	fn attach_inner_1_band(
+		invocation: &mut AggregateInvocation,
+		micros: [u64; 3],
+		calls: [u64; 3],
+		facts: serde_json::Value,
+	) {
+		for ((name, micros), calls) in [
+			"inner_1_sizing_scan",
+			"inner_1_partition_sizing",
+			"inner_1_build_write",
+		]
+		.into_iter()
+		.zip(micros)
+		.zip(calls)
+		{
+			invocation.inclusive_lifecycle.push(InclusiveLifecycleTerm {
+				name,
+				calls,
+				micros,
+				error: None,
+			});
+		}
+		invocation.diagnostics.push(InvocationDiagnostic {
+			name: "inner_1_facts",
+			value: facts,
+		});
+	}
+
+	fn partitioned_facts() -> serde_json::Value {
+		serde_json::json!({
+			"branch": "partitioned", "partition_count": 4, "group_count": 2,
+			"partition_sizing_passes": 2, "estimated_build_bytes": 1_000_000, "sizing_rows": 5000,
+			"sizing_scan_calls": 1, "partition_sizing_calls": 1, "build_write_calls": 0,
+			"build_rows": null, "build_spill_bytes": null,
+		})
+	}
+
+	fn spilled_facts() -> serde_json::Value {
+		serde_json::json!({
+			"branch": "spilled", "partition_count": 1, "group_count": 1,
+			"partition_sizing_passes": 1, "estimated_build_bytes": 1_000, "sizing_rows": 50,
+			"sizing_scan_calls": 1, "partition_sizing_calls": 1, "build_write_calls": 1,
+			"build_rows": 50, "build_spill_bytes": 4096,
+		})
+	}
+
+	// ADR 594: the sixth band reconciles against ADR 585's unchanged inner_1 term, records the
+	// branch facts, accepts a zero build write on the partitioned branch, and is absent when the
+	// instrument was never armed.
+	#[test]
+	fn adr594_receipt_records_the_sixth_band_and_its_facts() {
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		// inner_1 = 100: sizing 40 + partition sizing 50 + build write 0, residual 10.
+		attach_inner_1_band(&mut invocation, [40, 50, 0], [1, 1, 0], partitioned_facts());
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "reconciled", "{receipt}");
+		assert_eq!(receipt["inner_1_branch"], "partitioned");
+		assert_eq!(receipt["inner_1_sizing_scan_micros"], 40);
+		assert_eq!(receipt["inner_1_partition_sizing_micros"], 50);
+		assert_eq!(receipt["inner_1_build_write_micros"], 0);
+		assert_eq!(receipt["inner_1_build_write_calls"], 0);
+		assert_eq!(receipt["inner_1_residual_micros"], 10);
+		assert_eq!(receipt["inner_1_partition_count"], 4);
+		assert_eq!(receipt["inner_1_partition_sizing_passes"], 2);
+		assert_eq!(receipt["inner_1_facts_consistent"], true);
+		assert_eq!(
+			receipt["runtime_prep_inner_1_micros"], 100,
+			"ADR 585's term unchanged"
+		);
+		// The spilled branch with its completed write.
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["inner_1_branch"], "spilled");
+		assert_eq!(receipt["inner_1_residual_micros"], 5);
+		assert_eq!(receipt["inner_1_build_rows"], 50);
+		assert_eq!(receipt["inner_1_facts_consistent"], true);
+		// Never armed: no band, and the receipt is the one ADR 585-589 readers know.
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "reconciled");
+		assert!(receipt.get("inner_1_branch").is_none());
+		// Children exceeding the term are a defect.
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [60, 50, 0], [1, 1, 0], partitioned_facts());
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "instrument_defect");
+		assert!(
+			receipt["error"]
+				.as_str()
+				.unwrap()
+				.contains("children exceed runtime_prep_inner_1")
+		);
+		// A partial band is a defect, not a smaller band.
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [40, 50, 0], [1, 1, 0], partitioned_facts());
+		invocation
+			.inclusive_lifecycle
+			.retain(|term| term.name != "inner_1_partition_sizing");
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "instrument_defect");
+		assert!(
+			receipt["error"]
+				.as_str()
+				.unwrap()
+				.contains("missing inner_1_partition_sizing")
+		);
+	}
+
+	// ADR 594: the facts must agree with the branch; each contradiction is named and the band is
+	// marked inconsistent even though its algebra reconciles, so a driver refuses it.
+	#[test]
+	fn adr594_receipt_names_every_fact_inconsistency_and_the_unsupported_path() {
+		let cases: Vec<(&str, [u64; 3], [u64; 3], serde_json::Value, &str)> = vec![
+			(
+				"partitioned with a build write",
+				[40, 50, 5],
+				[1, 1, 1],
+				{
+					let mut f = partitioned_facts();
+					f["build_write_calls"] = serde_json::json!(1);
+					f
+				},
+				"partitioned branch with a build-write call",
+			),
+			// Zero calls with time on the clock: the algebra reconciles (residual 5 instead of
+			// 10) and the counts agree, but time without a call is not a partitioned branch.
+			(
+				"partitioned with build-write time and no call",
+				[40, 50, 5],
+				[1, 1, 0],
+				partitioned_facts(),
+				"partitioned branch with build-write time",
+			),
+			(
+				"partitioned with one partition",
+				[40, 50, 0],
+				[1, 1, 0],
+				{
+					let mut f = partitioned_facts();
+					f["partition_count"] = serde_json::json!(1);
+					f
+				},
+				"partition_count <= 1",
+			),
+			(
+				"spilled with two partitions",
+				[20, 20, 55],
+				[1, 1, 1],
+				{
+					let mut f = spilled_facts();
+					f["partition_count"] = serde_json::json!(2);
+					f
+				},
+				"partition_count != 1",
+			),
+			(
+				"spilled without a completed write",
+				[20, 20, 55],
+				[1, 1, 1],
+				{
+					let mut f = spilled_facts();
+					f["build_rows"] = serde_json::Value::Null;
+					f
+				},
+				"without a completed build write",
+			),
+			(
+				"spilled without a build-write call",
+				[20, 20, 0],
+				[1, 1, 0],
+				spilled_facts(),
+				"without exactly one build-write call",
+			),
+			(
+				"two sizing scans",
+				[40, 50, 0],
+				[2, 1, 0],
+				partitioned_facts(),
+				"sizing_scan_calls is not 1",
+			),
+			(
+				"partition sizing counted twice",
+				[40, 50, 0],
+				[1, 2, 0],
+				partitioned_facts(),
+				"partition_sizing_calls is not 1",
+			),
+			(
+				"no sizing pass",
+				[40, 50, 0],
+				[1, 1, 0],
+				{
+					let mut f = partitioned_facts();
+					f["partition_sizing_passes"] = serde_json::json!(0);
+					f
+				},
+				"partition_sizing_passes is below 1",
+			),
+			(
+				"missing fact",
+				[40, 50, 0],
+				[1, 1, 0],
+				{
+					let mut f = partitioned_facts();
+					f.as_object_mut().unwrap().remove("estimated_build_bytes");
+					f
+				},
+				"fact estimated_build_bytes is missing",
+			),
+		];
+		for (label, micros, calls, facts, needle) in cases {
+			let mut invocation = adr586_invocation();
+			adr589_write_bands(&mut invocation);
+			attach_inner_1_band(&mut invocation, micros, calls, facts);
+			let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+			assert_eq!(receipt["status"], "reconciled", "{label}: {receipt}");
+			assert_eq!(receipt["inner_1_facts_consistent"], false, "{label}");
+			assert!(
+				receipt["inner_1_inconsistency"]
+					.as_str()
+					.unwrap()
+					.contains(needle),
+				"{label}: {}",
+				receipt["inner_1_inconsistency"]
+			);
+		}
+		// The non-streaming fallback: the branch alone, marked as not this band's.
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		invocation.diagnostics.push(InvocationDiagnostic {
+			name: "inner_1_facts",
+			value: serde_json::json!({"branch": "unsupported"}),
+		});
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "reconciled");
+		assert_eq!(receipt["inner_1_branch"], "unsupported");
+		assert_eq!(receipt["inner_1_facts_consistent"], false);
+		assert!(receipt.get("inner_1_sizing_scan_micros").is_none());
 	}
 
 	// A zero child is a fact with a pass count beside it, never a failed term: the semi summary

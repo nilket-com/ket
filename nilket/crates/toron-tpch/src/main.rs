@@ -127,6 +127,8 @@ async fn run() -> ExitCode {
 		"adr593-journal-recheck" => adr593_journal_recheck_command(&args),
 		"adr584-q21-attribution" => adr584_q21_attribution_command(&args),
 		"adr585-q21-decomposition" => adr585_q21_decomposition_command(&args),
+		"adr594-q21-inner-1" => adr594_q21_inner_1_command(&args),
+		"adr594-reevaluate" => adr594_reevaluate_command(&args),
 		"adr586-q21-semi-write" => adr586_q21_semi_write_command(&args),
 		"adr587-q21-insert" => adr587_q21_insert_command(&args),
 		"adr588-q21-second-walk" => adr588_q21_second_walk_command(&args),
@@ -1525,7 +1527,42 @@ fn adr585_q21_decomposition_command(args: &[String]) -> ExitCode {
 	}
 }
 
+/// One lifecycle-decomposition driver shared by ADR 585 and ADR 594 (ADR 593's scope, gate,
+/// stamps, journal collection, and variability cutoff included): the label, tags, kind,
+/// evaluator, and summary stamps are the spec's; everything else is one path.
+struct LifecycleDriverSpec {
+	label: &'static str,
+	default_output_dir: &'static str,
+	tags: (&'static str, &'static str, &'static str),
+	kind: &'static str,
+	evaluate: fn(&[serde_json::Value]) -> Result<serde_json::Value, String>,
+	stamp: fn(&mut serde_json::Value),
+}
+
+fn adr585_stamp(summary: &mut serde_json::Value) {
+	summary["sealed_baseline_executable_sha256"] =
+		serde_json::json!(ADR585_SEALED_BASELINE_EXECUTABLE);
+	summary["adr584_instrumented_executable_sha256"] = serde_json::json!(ADR585_ADR584_EXECUTABLE);
+}
+
+const ADR585_DRIVER: LifecycleDriverSpec = LifecycleDriverSpec {
+	label: "ADR 585",
+	default_output_dir: "target/tpch/adr585-q21-decomposition",
+	tags: ("adr585_arm", "adr585_pair", "adr585_pair_position"),
+	kind: "adr585_q21_outside_drive_decomposition",
+	evaluate: evaluate_adr585_pairs,
+	stamp: adr585_stamp,
+};
+
 fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, String> {
+	run_lifecycle_decomposition_driver(args, &ADR585_DRIVER)
+}
+
+fn run_lifecycle_decomposition_driver(
+	args: &[String],
+	spec: &LifecycleDriverSpec,
+) -> Result<serde_json::Value, String> {
+	let label = spec.label;
 	// ADR 593: the driver runs as a transient service outside any login session's scope, and
 	// starts only through the gate, read before the driver does any work of its own (the
 	// dataset's full-hash verification alone warms a P-core by ten degrees or more).
@@ -1535,23 +1572,22 @@ fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, St
 	let sf = resolved_sf(args)?;
 	let data_source = flag_value(args, "--data-source").unwrap_or("parquet");
 	let data_dir = data_dir_from_args(args);
-	let output_dir = PathBuf::from(
-		flag_value(args, "--output-dir").unwrap_or("target/tpch/adr585-q21-decomposition"),
-	);
+	let output_dir =
+		PathBuf::from(flag_value(args, "--output-dir").unwrap_or(spec.default_output_dir));
 	if mode != "strict" || sf != 8.0 || !matches!(data_source, "parquet" | "persisted") {
 		return Err(format!(
-			"ADR 585 requires --mode strict --sf 8 --data-source parquet; got mode={mode:?} sf={sf} data_source={data_source:?}"
+			"{label} requires --mode strict --sf 8 --data-source parquet; got mode={mode:?} sf={sf} data_source={data_source:?}"
 		));
 	}
 	if output_dir.exists() {
 		return Err(format!(
-			"ADR 585 requires a fresh output directory; {} already exists",
+			"{label} requires a fresh output directory; {} already exists",
 			output_dir.display()
 		));
 	}
 	if std::env::var_os("TORON_NODE_ATTRIBUTION_PROFILE_PATH").is_some() {
 		return Err(
-			"ADR 585 parent environment must not set TORON_NODE_ATTRIBUTION_PROFILE_PATH"
+			"{label} parent environment must not set TORON_NODE_ATTRIBUTION_PROFILE_PATH"
 				.to_string(),
 		);
 	}
@@ -1561,26 +1597,30 @@ fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, St
 		|| budget.spill_bytes_reserved != 2_147_483_648
 		|| budget.spill_bytes_reserved_provenance != "explicit"
 	{
-		return Err("ADR 585 requires explicit 2 GiB task memory and spill reserve".to_string());
+		return Err(format!(
+			"{label} requires explicit 2 GiB task memory and spill reserve"
+		));
 	}
 	let concurrency = gauge_partition_work_concurrency_requested()?;
 	if concurrency != (1, "explicit") {
 		return Err(format!(
-			"ADR 585 requires explicit partition parallelism 1, got {concurrency:?}"
+			"{label} requires explicit partition parallelism 1, got {concurrency:?}"
 		));
 	}
 	let identity = runtime_identity()?.ok_or_else(|| {
-		"ADR 585 must run through toron-bench build/run with a staged executable".to_string()
+		format!("{label} must run through toron-bench build/run with a staged executable")
 	})?;
 	if identity.manifest.recipe.profile != "release" {
 		return Err(format!(
-			"ADR 585 requires a release build, got {:?}",
+			"{label} requires a release build, got {:?}",
 			identity.manifest.recipe.profile
 		));
 	}
 	let host_start = observe_host_quiescence();
 	if !host_start.quiescent() {
-		return Err("ADR 585 requires the local deployment and SQL port quiescent".to_string());
+		return Err(format!(
+			"{label} requires the local deployment and SQL port quiescent"
+		));
 	}
 	let scratch = std::env::var_os("TORON_JOIN_SPILL_DIR")
 		.filter(|value| !value.is_empty())
@@ -1588,21 +1628,21 @@ fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, St
 		.unwrap_or_else(|| std::env::temp_dir().join("toron_join_spill"));
 	if !directory_is_empty(&scratch)? {
 		return Err(format!(
-			"ADR 585 spill scratch {} is not empty before the run",
+			"{label} spill scratch {} is not empty before the run",
 			scratch.display()
 		));
 	}
 	let dataset = load_persisted_tpch_dataset(mode, sf, &data_dir)?;
 	if dataset.verification.as_str() != "full_hash" {
 		return Err(format!(
-			"ADR 585 requires full-hash dataset verification, got {}",
+			"{label} requires full-hash dataset verification, got {}",
 			dataset.verification.as_str()
 		));
 	}
 	// ADR 592: as in the ADR 584 driver, the coordinate is fixed and bound before the first
 	// child and every child is validated as it returns.
 	let coordinate = adr592_driver_coordinate(
-		"ADR 585",
+		label,
 		args,
 		&identity,
 		&dataset.manifest_fingerprint,
@@ -1610,10 +1650,10 @@ fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, St
 	)?;
 	let journal = prepare_perf_sample_journal(&output_dir)?;
 	std::fs::create_dir_all(output_dir.join("profiles"))
-		.map_err(|error| format!("create ADR 585 profile directory: {error}"))?;
+		.map_err(|error| format!("create {label} profile directory: {error}"))?;
 
 	let (warmup, rows) = adr592_run_paired_children(
-		("adr585_arm", "adr585_pair", "adr585_pair_position"),
+		spec.tags,
 		ADR585_PAIRS,
 		&coordinate,
 		&journal,
@@ -1632,9 +1672,9 @@ fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, St
 	)?;
 	let host_end = observe_host_quiescence();
 	if !host_end.quiescent() || !directory_is_empty(&scratch)? {
-		return Err(
-			"ADR 585 lost host quiescence or left spill scratch after measurement".to_string(),
-		);
+		return Err(format!(
+			"{label} lost host quiescence or left spill scratch after measurement"
+		));
 	}
 	// ADR 593: the journal is collected once, after every child and a settle, then joined.
 	let all_rows: Vec<&serde_json::Value> = std::iter::once(&warmup).chain(rows.iter()).collect();
@@ -1656,17 +1696,15 @@ fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, St
 	let collection =
 		toron_tpch::host_readings::collect_journal(first_launch - 1000.0, last_return + 1000.0);
 	let host_journal = adr593_join_journal_and_gaps(&all_rows, &collection);
-	let mut summary = evaluate_adr585_pairs(&rows)?;
+	let mut summary = (spec.evaluate)(&rows)?;
 	adr593_apply_variability_bound(&mut summary)?;
 	summary["driver_scope"] = serde_json::json!(driver_scope);
 	summary["start_gate"] = start_gate;
 	summary["host_journal"] = host_journal;
-	summary["kind"] = serde_json::json!("adr585_q21_outside_drive_decomposition");
+	summary["kind"] = serde_json::json!(spec.kind);
 	summary["sealed"] = serde_json::json!(false);
 	summary["candidate_authority"] = serde_json::json!(false);
-	summary["sealed_baseline_executable_sha256"] =
-		serde_json::json!(ADR585_SEALED_BASELINE_EXECUTABLE);
-	summary["adr584_instrumented_executable_sha256"] = serde_json::json!(ADR585_ADR584_EXECUTABLE);
+	(spec.stamp)(&mut summary);
 	let off_median = summary
 		.get("off_execute_median_ms")
 		.and_then(serde_json::Value::as_f64);
@@ -1679,6 +1717,311 @@ fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, St
 	summary["warmup_execute_ms"] = warmup.get("execute_ms").cloned().unwrap_or_default();
 	write_json_atomically(&output_dir.join("summary.json"), &summary)?;
 	Ok(summary)
+}
+
+// ---------------------------------------------------------------------------------------------
+// ADR 594: replay 1's preparation decomposed through the sixth band.
+// ---------------------------------------------------------------------------------------------
+
+const ADR594_TAGS: LifecyclePairTags = LifecyclePairTags {
+	label: "ADR 594",
+	arm: "adr594_arm",
+	pair: "adr594_pair",
+	position: "adr594_pair_position",
+};
+
+const ADR594_CHILDREN: [&str; 3] = [
+	"inner_1_sizing_scan",
+	"inner_1_partition_sizing",
+	"inner_1_build_write",
+];
+
+/// Historical readings of the term this record decomposes: context beside the new reading,
+/// never netted against it. ADR 593's off median and its `runtime_prep_inner_1`; ADR 591's
+/// sealed q21 median is bound by content through `--sealed-manifest`.
+const ADR594_ADR593_REFERENCE_OFF_MEDIAN_MS: f64 = 9064.673146;
+const ADR594_ADR593_REFERENCE_INNER_1_MS: f64 = 1345.0028301315272;
+
+fn adr594_stamp(summary: &mut serde_json::Value) {
+	summary["adr593_reference_off_execute_median_ms"] =
+		serde_json::json!(ADR594_ADR593_REFERENCE_OFF_MEDIAN_MS);
+	summary["adr593_reference_runtime_prep_inner_1_ms"] =
+		serde_json::json!(ADR594_ADR593_REFERENCE_INNER_1_MS);
+	if let Some(off) = summary
+		.get("off_execute_median_ms")
+		.and_then(serde_json::Value::as_f64)
+	{
+		summary["off_arm_distance_from_adr593_ms"] =
+			serde_json::json!(off - ADR594_ADR593_REFERENCE_OFF_MEDIAN_MS);
+	}
+}
+
+const ADR594_DRIVER: LifecycleDriverSpec = LifecycleDriverSpec {
+	label: "ADR 594",
+	default_output_dir: "target/tpch/adr594-q21-inner-1",
+	tags: ("adr594_arm", "adr594_pair", "adr594_pair_position"),
+	kind: "adr594_q21_inner_1_decomposition",
+	evaluate: evaluate_adr594_pairs,
+	stamp: adr594_stamp,
+};
+
+fn adr594_q21_inner_1_command(args: &[String]) -> ExitCode {
+	match run_lifecycle_decomposition_driver(args, &ADR594_DRIVER) {
+		Ok(summary) => {
+			println!("{summary}");
+			ExitCode::SUCCESS
+		}
+		Err(message) => harness_error(&message),
+	}
+}
+
+/// The sixth-band layer over the shared lifecycle evaluation: per pair the four terms, the
+/// facts, the identity, the consistency, and the residual bound; then the four-term rule with
+/// its named outcomes. An unsupported branch on any pair withholds the owner as an
+/// unsupported path; an inconsistent band withholds it as an incomplete instrument.
+fn evaluate_adr594_pairs(rows: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+	let tags = &ADR594_TAGS;
+	let mut base = evaluate_lifecycle_pairs(rows, tags)?;
+	let mut pair_bands = Vec::new();
+	let mut samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+	let mut all_residuals_complete = true;
+	let mut all_facts_consistent = true;
+	let mut unsupported_pairs = Vec::new();
+	let mut incompleteness = Vec::new();
+	for pair in 0..ADR585_PAIRS {
+		let pair_rows = rows
+			.iter()
+			.filter(|row| {
+				row.get(tags.pair).and_then(serde_json::Value::as_u64) == Some(pair as u64)
+			})
+			.collect::<Vec<_>>();
+		let off = pair_rows
+			.iter()
+			.find(|row| row.get(tags.arm).and_then(serde_json::Value::as_str) == Some("off"))
+			.ok_or_else(|| format!("ADR 594 pair {pair} lacks off arm"))?;
+		let on = pair_rows
+			.iter()
+			.find(|row| row.get(tags.arm).and_then(serde_json::Value::as_str) == Some("on"))
+			.ok_or_else(|| format!("ADR 594 pair {pair} lacks on arm"))?;
+		let execute_off_ms = required_f64(off, "execute_ms")?;
+		let execute_on_ms = required_f64(on, "execute_ms")?;
+		let execute_on_micros = (execute_on_ms * 1000.0).round() as u64;
+		let overhead = (execute_on_ms - execute_off_ms).max(0.0) * 1000.0;
+		let (_, receipt) = lifecycle_target_receipt(on, pair, tags.label)?;
+		let inner_1 = receipt_u64(receipt, "runtime_prep_inner_1_micros")?;
+		let mut band = serde_json::json!({"pair": pair, "runtime_prep_inner_1_micros": inner_1});
+		let branch = receipt
+			.get("inner_1_branch")
+			.and_then(serde_json::Value::as_str)
+			.map(str::to_string);
+		band["inner_1_branch"] = serde_json::json!(branch);
+		match branch.as_deref() {
+			None => {
+				all_facts_consistent = false;
+				incompleteness.push(format!("pair {pair}: the band is absent"));
+				pair_bands.push(band);
+				continue;
+			}
+			Some("unsupported") => {
+				unsupported_pairs.push(pair);
+				pair_bands.push(band);
+				continue;
+			}
+			Some(_) => {}
+		}
+		let mut children_total = 0u64;
+		for child in ADR594_CHILDREN {
+			let micros = receipt_u64(receipt, &format!("{child}_micros"))?;
+			let calls = receipt_u64(receipt, &format!("{child}_calls"))?;
+			children_total = children_total
+				.checked_add(micros)
+				.ok_or_else(|| format!("ADR 594 pair {pair} child sum overflowed"))?;
+			band[format!("{child}_micros")] = serde_json::json!(micros);
+			band[format!("{child}_calls")] = serde_json::json!(calls);
+			samples
+				.entry(child.to_string())
+				.or_default()
+				.push(micros as f64 / execute_on_micros as f64 * execute_off_ms);
+		}
+		let residual = receipt_u64(receipt, "inner_1_residual_micros")?;
+		if children_total.checked_add(residual) != Some(inner_1) {
+			return Err(format!(
+				"ADR 594 pair {pair} inner_1 algebra does not reconcile"
+			));
+		}
+		samples
+			.entry("inner_1_residual".to_string())
+			.or_default()
+			.push(residual as f64 / execute_on_micros as f64 * execute_off_ms);
+		let residual_bound = overhead + 0.05 * inner_1 as f64;
+		let residual_complete = residual as f64 <= residual_bound;
+		all_residuals_complete &= residual_complete;
+		let consistent = receipt.get("inner_1_facts_consistent") == Some(&serde_json::json!(true));
+		if !consistent {
+			all_facts_consistent = false;
+			incompleteness.push(format!(
+				"pair {pair}: {}",
+				receipt
+					.get("inner_1_inconsistency")
+					.and_then(serde_json::Value::as_str)
+					.unwrap_or("facts inconsistent")
+			));
+		}
+		for fact in [
+			"inner_1_partition_count",
+			"inner_1_group_count",
+			"inner_1_partition_sizing_passes",
+			"inner_1_estimated_build_bytes",
+			"inner_1_sizing_rows",
+			"inner_1_build_rows",
+			"inner_1_build_spill_bytes",
+		] {
+			band[fact] = receipt.get(fact).cloned().unwrap_or_default();
+		}
+		band["inner_1_residual_micros"] = serde_json::json!(residual);
+		band["inner_1_residual_bound_micros"] = serde_json::json!(residual_bound);
+		band["inner_1_residual_complete"] = serde_json::json!(residual_complete);
+		band["inner_1_facts_consistent"] = serde_json::json!(consistent);
+		pair_bands.push(band);
+	}
+	let off_range = required_f64(&base, "off_execute_range_ms")?;
+	let off_median = required_f64(&base, "off_execute_median_ms")?;
+	let owner_floor = required_f64(&base, "owner_floor_ms")?;
+	let perturbation_accepted = base["perturbation_gate"] == "accepted";
+	let base_profiles_complete = base["all_profiles_complete"] == true;
+	let mut medians = ADR594_CHILDREN
+		.iter()
+		.map(|child| child.to_string())
+		.chain(std::iter::once("inner_1_residual".to_string()))
+		.map(|term| {
+			let mut values = samples.get(&term).cloned().unwrap_or_default();
+			(term, median(&mut values))
+		})
+		.collect::<Vec<_>>();
+	medians.sort_by(|left, right| right.1.total_cmp(&left.1));
+	let owner = if !unsupported_pairs.is_empty() {
+		serde_json::json!({
+			"status": "withheld_unsupported_path",
+			"pairs": unsupported_pairs,
+		})
+	} else if !all_facts_consistent {
+		serde_json::json!({
+			"status": "withheld_instrument_incomplete",
+			"incompleteness": incompleteness,
+		})
+	} else {
+		adr594_owner(
+			&medians,
+			owner_floor,
+			off_range,
+			off_median,
+			perturbation_accepted,
+			base_profiles_complete && all_residuals_complete,
+		)
+	};
+	let branches: BTreeSet<String> = pair_bands
+		.iter()
+		.filter_map(|band| {
+			band.get("inner_1_branch")
+				.and_then(serde_json::Value::as_str)
+		})
+		.map(str::to_string)
+		.collect();
+	base["adr594_pair_bands"] = serde_json::json!(pair_bands);
+	base["all_inner_1_residuals_complete"] = serde_json::json!(all_residuals_complete);
+	base["all_inner_1_facts_consistent"] = serde_json::json!(all_facts_consistent);
+	base["inner_1_branches"] = serde_json::json!(branches);
+	base["inner_1_terms_scaled_ms"] = serde_json::json!(
+		medians
+			.iter()
+			.map(|(term, value)| {
+				serde_json::json!({
+					"term": term,
+					"median_scaled_ms": value,
+					"share_of_off_execute": value / off_median,
+					"clears_floor": *value > owner_floor,
+				})
+			})
+			.collect::<Vec<_>>()
+	);
+	base["adr585_fifteen_term_owner"] = base["owner"].clone();
+	base["owner"] = owner;
+	Ok(base)
+}
+
+/// ADR 594's rule: ADR 586's outcomes, except that a residual that leads is an incomplete
+/// instrument at any size, not only above the floor. The children are supposed to name the
+/// term; a residual ahead of every child says they do not, whatever the floor.
+fn adr594_owner(
+	medians: &[(String, f64)],
+	owner_floor: f64,
+	off_range: f64,
+	off_median: f64,
+	perturbation_accepted: bool,
+	profiles_complete: bool,
+) -> serde_json::Value {
+	if perturbation_accepted
+		&& profiles_complete
+		&& let Some((name, value)) = medians.first()
+		&& name.ends_with("_residual")
+	{
+		return serde_json::json!({
+			"status": "withheld_instrument_incomplete",
+			"leading_residual": name,
+			"median_scaled_ms": value,
+			"reason": "a residual leads the children at any size",
+		});
+	}
+	adr586_owner(
+		medians,
+		owner_floor,
+		off_range,
+		off_median,
+		perturbation_accepted,
+		profiles_complete,
+	)
+}
+
+/// ADR 594: re-run the evaluator and the cutoff over a retained journal, so a tightened rule
+/// can be applied to retained rows without another run.
+fn adr594_reevaluate_command(args: &[String]) -> ExitCode {
+	let Some(samples) = flag_value(args, "--samples") else {
+		eprintln!("adr594-reevaluate requires --samples PATH");
+		return ExitCode::from(2);
+	};
+	let rows: Result<Vec<serde_json::Value>, String> = std::fs::read_to_string(samples)
+		.map_err(|error| format!("read {samples}: {error}"))
+		.and_then(|text| {
+			text.lines()
+				.filter(|line| !line.trim().is_empty())
+				.map(|line| {
+					serde_json::from_str(line).map_err(|error| format!("parse {samples}: {error}"))
+				})
+				.collect()
+		});
+	let summary = rows.and_then(|rows| {
+		// The evaluator sees the pair rows only, as the driver hands them to it; the warmup is
+		// journaled but never evaluated.
+		let rows: Vec<serde_json::Value> = rows
+			.into_iter()
+			.filter(|row| row.get("warmup") != Some(&serde_json::Value::Bool(true)))
+			.collect();
+		let mut summary = evaluate_adr594_pairs(&rows)?;
+		adr593_apply_variability_bound(&mut summary)?;
+		summary["reevaluated_samples"] = serde_json::json!(samples);
+		summary["reevaluating_evidence_identity"] = runtime_identity_json();
+		Ok(summary)
+	});
+	match summary {
+		Ok(summary) => {
+			println!("{summary}");
+			ExitCode::SUCCESS
+		}
+		Err(error) => {
+			eprintln!("{error}");
+			ExitCode::from(2)
+		}
+	}
 }
 
 fn run_adr586_q21_semi_write(args: &[String]) -> Result<serde_json::Value, String> {
@@ -10960,7 +11303,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|perf-board-replay|adr592-revalidate|adr593-journal-recheck|adr584-q21-attribution|adr585-q21-decomposition|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|perf-board-replay|adr592-revalidate|adr593-journal-recheck|adr584-q21-attribution|adr585-q21-decomposition|adr594-q21-inner-1|adr594-reevaluate|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -11984,6 +12327,250 @@ mod tests {
 			reconcile_adr585_fixture(&mut row);
 		}
 		row
+	}
+
+	// ADR 594: an on row whose receipt carries the sixth band. `micros` are the three children;
+	// the residual is whatever of inner_1 (1,000,000 µs in the ADR 585 fixture) they leave.
+	fn adr594_fixture_row(
+		pair: usize,
+		on: bool,
+		micros: [u64; 3],
+		facts: serde_json::Value,
+	) -> serde_json::Value {
+		adr594_fixture_row_with_term(pair, on, micros, facts, 1_700_000)
+	}
+
+	fn adr594_fixture_row_with_term(
+		pair: usize,
+		on: bool,
+		micros: [u64; 3],
+		facts: serde_json::Value,
+		inner_1: u64,
+	) -> serde_json::Value {
+		let mut row = adr585_fixture_row(pair, on);
+		for (from, to) in [
+			("adr585_pair", "adr594_pair"),
+			("adr585_arm", "adr594_arm"),
+			("adr585_pair_position", "adr594_pair_position"),
+		] {
+			let value = row[from].take();
+			row[to] = value;
+			row.as_object_mut().unwrap().remove(from);
+		}
+		if on {
+			let receipt = row
+				.pointer_mut(
+					"/node_attribution/aggregate_invocations/0/inclusive_lifecycle_receipt",
+				)
+				.expect("fixture receipt");
+			// A 1,700,000 µs term (the ADR 585 fixture's own is 3,000,000; the reconcile below
+			// rebalances the band): the residual bound is 185,000 µs and the floor 800 ms.
+			receipt["runtime_prep_inner_1_micros"] = serde_json::json!(inner_1);
+			if let Some(branch) = facts.get("branch") {
+				receipt["inner_1_branch"] = branch.clone();
+			}
+			if facts.get("branch") != Some(&serde_json::json!("unsupported"))
+				&& facts.get("branch").is_some()
+			{
+				for (child, value) in ADR594_CHILDREN.iter().zip(micros) {
+					receipt[format!("{child}_micros")] = serde_json::json!(value);
+					receipt[format!("{child}_calls")] =
+						serde_json::json!(if *child == "inner_1_build_write" && value == 0 {
+							0
+						} else {
+							1
+						});
+				}
+				receipt["inner_1_residual_micros"] =
+					serde_json::json!(inner_1 - micros.iter().sum::<u64>());
+				for (name, value) in facts.as_object().unwrap() {
+					if name != "branch" {
+						receipt[format!("inner_1_{name}")] = value.clone();
+					}
+				}
+				receipt["inner_1_facts_consistent"] = facts
+					.get("consistent")
+					.cloned()
+					.unwrap_or(serde_json::json!(true));
+				receipt["inner_1_inconsistency"] = facts
+					.get("inconsistency")
+					.cloned()
+					.unwrap_or(serde_json::Value::Null);
+			}
+			reconcile_adr585_fixture(&mut row);
+		}
+		row
+	}
+
+	fn adr594_rows(micros: [u64; 3], facts: serde_json::Value) -> Vec<serde_json::Value> {
+		(0..ADR585_PAIRS)
+			.flat_map(|pair| {
+				[
+					adr594_fixture_row(pair, false, micros, facts.clone()),
+					adr594_fixture_row(pair, true, micros, facts.clone()),
+				]
+			})
+			.collect()
+	}
+
+	fn adr594_partitioned_facts() -> serde_json::Value {
+		serde_json::json!({
+			"branch": "partitioned", "partition_count": 4, "group_count": 2,
+			"partition_sizing_passes": 2, "estimated_build_bytes": 300_000_000,
+			"sizing_rows": 7_300_000, "build_rows": null, "build_spill_bytes": null,
+		})
+	}
+
+	// The fixture's off arms span 400 ms, so the floor is 800 ms and a lead must exceed 400 ms.
+	#[test]
+	fn adr594_the_four_term_rule_returns_each_named_outcome() {
+		// Resolved: the sizing scan leads by more than the range.
+		let rows = adr594_rows([1_300_000, 280_000, 0], adr594_partitioned_facts());
+		let summary = evaluate_adr594_pairs(&rows).expect("complete fixture");
+		assert_eq!(
+			summary["owner"]["status"], "resolved",
+			"{}",
+			summary["owner"]
+		);
+		assert_eq!(
+			summary["owner"]["status"],
+			"resolved",
+			"{} / complete={} residuals={} facts={} pair0={}",
+			summary["owner"],
+			summary["all_profiles_complete"],
+			summary["all_inner_1_residuals_complete"],
+			summary["all_inner_1_facts_consistent"],
+			summary["pairs"][0]
+		);
+		assert_eq!(
+			summary["owner"]["status"], "resolved",
+			"{}",
+			summary["owner"]
+		);
+		assert_eq!(summary["owner"]["term"], "inner_1_sizing_scan");
+		assert_eq!(
+			summary["inner_1_branches"],
+			serde_json::json!(["partitioned"])
+		);
+		assert_eq!(summary["all_inner_1_facts_consistent"], true);
+		let band = &summary["adr594_pair_bands"][0];
+		assert_eq!(band["inner_1_build_write_calls"], 0);
+		assert_eq!(band["inner_1_residual_micros"], 120_000);
+		assert_eq!(band["inner_1_partition_sizing_passes"], 2);
+		let terms = summary["inner_1_terms_scaled_ms"].as_array().unwrap();
+		assert_eq!(terms.len(), 4, "three children and the residual");
+		// Unresolved tie: two terms clear the floor inside the range of each other.
+		let rows = adr594_rows([850_000, 730_000, 0], adr594_partitioned_facts());
+		let summary = evaluate_adr594_pairs(&rows).unwrap();
+		assert_eq!(
+			summary["owner"]["status"],
+			"unresolved_tie_within_off_range"
+		);
+		// Below floor: no term clears 800 ms of a 1 s term scaled by ~1.
+		let rows = adr594_rows([790_000, 790_000, 0], adr594_partitioned_facts());
+		let summary = evaluate_adr594_pairs(&rows).unwrap();
+		assert_eq!(summary["owner"]["status"], "below_floor_no_mechanism");
+		// Incomplete: a residual that leads.
+		let rows = adr594_rows([100_000, 100_000, 0], adr594_partitioned_facts());
+		let summary = evaluate_adr594_pairs(&rows).unwrap();
+		assert_eq!(summary["owner"]["status"], "withheld_incomplete_profiles");
+		assert_eq!(summary["all_inner_1_residuals_complete"], false);
+		assert_eq!(
+			summary["adr594_pair_bands"][0]["inner_1_residual_complete"],
+			false
+		);
+		// Incomplete: inconsistent facts, even though the residual bound passes.
+		let mut facts = adr594_partitioned_facts();
+		facts["consistent"] = serde_json::json!(false);
+		facts["inconsistency"] = serde_json::json!("partitioned branch with a build-write call");
+		let rows = adr594_rows([1_300_000, 280_000, 0], facts);
+		let summary = evaluate_adr594_pairs(&rows).unwrap();
+		assert_eq!(summary["owner"]["status"], "withheld_instrument_incomplete");
+		assert!(
+			summary["owner"]["incompleteness"][0]
+				.as_str()
+				.unwrap()
+				.contains("build-write call")
+		);
+		// Unsupported path: the fallback ran on a pair.
+		let rows = adr594_rows([0, 0, 0], serde_json::json!({"branch": "unsupported"}));
+		let summary = evaluate_adr594_pairs(&rows).unwrap();
+		assert_eq!(summary["owner"]["status"], "withheld_unsupported_path");
+		// Absent band on a non-zero term: incomplete, the pair named.
+		let rows = adr594_rows([0, 0, 0], serde_json::json!({}));
+		let summary = evaluate_adr594_pairs(&rows).unwrap();
+		assert_eq!(summary["owner"]["status"], "withheld_instrument_incomplete");
+		assert!(
+			summary["owner"]["incompleteness"][0]
+				.as_str()
+				.unwrap()
+				.contains("band is absent")
+		);
+		// Closed on variability, applied after the rule as ADR 593 fixed.
+		let rows = adr594_rows([1_300_000, 280_000, 0], adr594_partitioned_facts());
+		let mut summary = evaluate_adr594_pairs(&rows).unwrap();
+		summary["off_execute_range_ms"] = serde_json::json!(700.0);
+		adr593_apply_variability_bound(&mut summary).unwrap();
+		assert_eq!(summary["owner"]["status"], "closed_on_variability");
+		assert_eq!(summary["owner"]["leading_term"], "inner_1_sizing_scan");
+	}
+
+	// A residual that leads is incomplete even below the floor and inside its own bound: a
+	// 300,000 µs term whose children are 95,000 each leaves a 110,000 µs residual, under the
+	// 115,000 µs bound and under the 800 ms floor, and still the children have not named it.
+	#[test]
+	fn adr594_a_leading_residual_is_incomplete_at_any_size() {
+		let rows: Vec<serde_json::Value> = (0..ADR585_PAIRS)
+			.flat_map(|pair| {
+				[
+					adr594_fixture_row_with_term(
+						pair,
+						false,
+						[95_000, 95_000, 0],
+						adr594_partitioned_facts(),
+						300_000,
+					),
+					adr594_fixture_row_with_term(
+						pair,
+						true,
+						[95_000, 95_000, 0],
+						adr594_partitioned_facts(),
+						300_000,
+					),
+				]
+			})
+			.collect();
+		let summary = evaluate_adr594_pairs(&rows).unwrap();
+		assert_eq!(
+			summary["all_inner_1_residuals_complete"], true,
+			"inside its bound"
+		);
+		assert_eq!(
+			summary["owner"]["status"], "withheld_instrument_incomplete",
+			"{}",
+			summary["owner"]
+		);
+		assert_eq!(summary["owner"]["leading_residual"], "inner_1_residual");
+		assert!(summary["owner"]["median_scaled_ms"].as_f64().unwrap() < 500.0);
+	}
+
+	// The spilled branch reads through the band too, with its completed write.
+	#[test]
+	fn adr594_the_spilled_branch_names_the_build_write() {
+		let facts = serde_json::json!({
+			"branch": "spilled", "partition_count": 1, "group_count": 1,
+			"partition_sizing_passes": 1, "estimated_build_bytes": 100_000_000,
+			"sizing_rows": 7_300_000, "build_rows": 7_300_000, "build_spill_bytes": 27_242_808,
+		});
+		let rows = adr594_rows([200_000, 200_000, 1_180_000], facts);
+		let summary = evaluate_adr594_pairs(&rows).unwrap();
+		assert_eq!(summary["owner"]["status"], "resolved");
+		assert_eq!(summary["owner"]["term"], "inner_1_build_write");
+		assert_eq!(summary["inner_1_branches"], serde_json::json!(["spilled"]));
+		assert_eq!(
+			summary["adr594_pair_bands"][0]["inner_1_build_rows"],
+			7_300_000
+		);
 	}
 
 	fn adr586_rows(semi: [u64; 4], anti: [u64; 4]) -> Vec<serde_json::Value> {

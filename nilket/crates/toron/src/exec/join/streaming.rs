@@ -7814,6 +7814,46 @@ fn streamed_inner_build_group_count_for_partition_spill_bytes(
 	}
 }
 
+/// One partition-sizing decision: accept the measured partitions, or name the next count to
+/// try. The retry policy of `choose_streaming_scan_inner_build_partitioning`, factored out so a
+/// refused-then-accepted sequence can be driven without a scan.
+enum PartitioningStep {
+	Accept {
+		group_count: u32,
+		max_group_spill: u64,
+	},
+	Retry {
+		next_partition_count: u32,
+	},
+}
+
+fn streamed_inner_build_partitioning_step(
+	partition_bytes: &[u64],
+	spill_budget: u64,
+	partition_count: u32,
+) -> Result<PartitioningStep, ExecutionError> {
+	match streamed_inner_build_group_count_for_partition_spill_bytes(partition_bytes, spill_budget)
+	{
+		Ok((group_count, max_group_spill)) => Ok(PartitioningStep::Accept {
+			group_count,
+			max_group_spill,
+		}),
+		Err(error) => {
+			let Some(next_partition_count) =
+				next_streamed_inner_build_partition_count(partition_count)
+			else {
+				return Err(error);
+			};
+			if next_partition_count == partition_count {
+				return Err(error);
+			}
+			Ok(PartitioningStep::Retry {
+				next_partition_count,
+			})
+		}
+	}
+}
+
 fn next_streamed_inner_build_partition_count(partition_count: u32) -> Option<u32> {
 	if partition_count >= STREAMED_INNER_BUILD_MAX_PARTITIONS {
 		return None;
@@ -9937,6 +9977,7 @@ impl Executor {
 				build_keys,
 				null_safe_keys,
 				morsel,
+				false,
 			)
 			.await;
 
@@ -9948,7 +9989,7 @@ impl Executor {
 			node_attribution::close_stage(stage, &stage_telemetry);
 		}
 
-		let (partition_count, group_count, _max_group_spill) = partitioning?;
+		let (partition_count, group_count, _max_group_spill, _sizing_passes) = partitioning?;
 
 		if partition_count <= 1 {
 			return Ok(None);
@@ -12145,7 +12186,9 @@ impl Executor {
 		null_safe_keys: bool,
 
 		morsel: Option<(MorselId, u32)>,
-	) -> Result<(u32, u32, u64), ExecutionError> {
+
+		count_passes: bool,
+	) -> Result<(u32, u32, u64, Option<u64>), ExecutionError> {
 		// ADR 514: the sizing mode is read once at this decision and never
 
 		// below it; every ineligible or overflowing shape keeps the legacy
@@ -12157,15 +12200,23 @@ impl Executor {
 		let effective_build_bytes =
 			effective_partition_sizing_bytes(sizing_mode, estimated_build_bytes, compact_facts);
 
-		let mut partition_count = streamed_inner_build_partition_count(
+		let partition_count = streamed_inner_build_partition_count(
 			effective_build_bytes,
 			self.context.task_budget.memory.get(),
 			self.context.task_budget.spill_bytes.get(),
 		)?;
 
-		loop {
-			let partition_bytes = self
-				.estimate_streaming_scan_inner_build_partition_bytes(
+		// ADR 594: every partition-sizing pass is a full scan of the build input; under a
+		// profiling handle the count is a fact of the preparation, returned beside the choice,
+		// and without one nothing is counted. The loop is the production loop, with its
+		// measurement injectable so a refused-then-accepted sequence is testable without a scan.
+		let spill_budget = self.context.task_budget.spill_bytes.get();
+		self.resolve_streamed_inner_build_partitioning(
+			partition_count,
+			spill_budget,
+			count_passes,
+			|partition_count| {
+				self.estimate_streaming_scan_inner_build_partition_bytes(
 					scan_input,
 					retained_columns,
 					partition_build_keys,
@@ -12174,27 +12225,44 @@ impl Executor {
 					null_safe_keys,
 					morsel,
 				)
-				.await?;
+			},
+		)
+		.await
+	}
 
-			match streamed_inner_build_group_count_for_partition_spill_bytes(
+	/// The partition-sizing loop: one measurement per pass, retried at the next count while the
+	/// step refuses; the pass count is kept only when asked for, so the off arm counts nothing.
+	async fn resolve_streamed_inner_build_partitioning<F, Fut>(
+		&self,
+		mut partition_count: u32,
+		spill_budget: u64,
+		count_passes: bool,
+		mut measure: F,
+	) -> Result<(u32, u32, u64, Option<u64>), ExecutionError>
+	where
+		F: FnMut(u32) -> Fut,
+		Fut: std::future::Future<Output = Result<Vec<u64>, ExecutionError>>,
+	{
+		let mut sizing_passes = if count_passes { Some(0u64) } else { None };
+		loop {
+			if let Some(passes) = sizing_passes.as_mut() {
+				*passes += 1;
+			}
+			let partition_bytes = measure(partition_count).await?;
+			match streamed_inner_build_partitioning_step(
 				&partition_bytes,
-				self.context.task_budget.spill_bytes.get(),
-			) {
-				Ok((group_count, max_group_spill)) => {
-					return Ok((partition_count, group_count, max_group_spill));
+				spill_budget,
+				partition_count,
+			)? {
+				PartitioningStep::Accept {
+					group_count,
+					max_group_spill,
+				} => {
+					return Ok((partition_count, group_count, max_group_spill, sizing_passes));
 				}
-
-				Err(error) => {
-					let Some(next_partition_count) =
-						next_streamed_inner_build_partition_count(partition_count)
-					else {
-						return Err(error);
-					};
-
-					if next_partition_count == partition_count {
-						return Err(error);
-					}
-
+				PartitioningStep::Retry {
+					next_partition_count,
+				} => {
 					partition_count = next_partition_count;
 				}
 			}
@@ -19210,6 +19278,7 @@ impl Executor {
 					morsel,
 					false,
 					resident_baseline_bytes,
+					None,
 				)
 				.await?;
 
@@ -21186,8 +21255,19 @@ impl Executor {
 		for stage in chain.inner_stages {
 			let replay_id = stage.replay_id;
 			let lifecycle_started = Instant::now();
+			// ADR 594: replay 1's preparation carries the sixth band under the profiling handle;
+			// without one it is the same call as before.
+			let inner_1_lifecycle = if replay_id == JoinReplayId(1) {
+				stage_handle.as_ref()
+			} else {
+				None
+			};
 			let prepared = self
-				.prepare_reoriented_inner_join_runtime_with_streamed_scan_build(stage, morsel)
+				.prepare_reoriented_inner_join_runtime_with_streamed_scan_build_attributed(
+					stage,
+					morsel,
+					inner_1_lifecycle,
+				)
 				.await;
 			if let (Some(handle), Some(name)) = (
 				stage_handle.as_ref(),
@@ -23559,7 +23639,7 @@ impl Executor {
 
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
-		self.prepare_reoriented_inner_join_runtime_with_scan_build(stage, morsel, false, 0)
+		self.prepare_reoriented_inner_join_runtime_with_scan_build(stage, morsel, false, 0, None)
 			.await
 	}
 
@@ -23572,8 +23652,27 @@ impl Executor {
 
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
-		self.prepare_reoriented_inner_join_runtime_with_scan_build(stage, morsel, true, 0)
+		self.prepare_reoriented_inner_join_runtime_with_scan_build(stage, morsel, true, 0, None)
 			.await
+	}
+
+	/// ADR 594: the streamed-scan preparation with its sixth-band instrument armed by a
+	/// profiling handle. The handle is the whole gate: without one this is the call above.
+	pub(in crate::exec) async fn prepare_reoriented_inner_join_runtime_with_streamed_scan_build_attributed<
+		'a,
+	>(
+		&self,
+
+		stage: ReorientedInnerJoinStage<'a>,
+
+		morsel: Option<(MorselId, u32)>,
+
+		lifecycle: Option<&node_attribution::VocabularyHandle>,
+	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
+		self.prepare_reoriented_inner_join_runtime_with_scan_build(
+			stage, morsel, true, 0, lifecycle,
+		)
+		.await
 	}
 
 	async fn prepare_reoriented_inner_join_runtime_with_streamed_scan_build_baseline<'a>(
@@ -23590,6 +23689,7 @@ impl Executor {
 			morsel,
 			true,
 			resident_baseline_bytes,
+			None,
 		)
 		.await
 	}
@@ -23604,8 +23704,21 @@ impl Executor {
 		stream_scan_build: bool,
 
 		resident_baseline_bytes: u64,
+
+		lifecycle: Option<&node_attribution::VocabularyHandle>,
 	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
-		if stream_scan_build && decompose_streaming_scan_probe_input(stage.build).is_some() {
+		let streamed =
+			stream_scan_build && decompose_streaming_scan_probe_input(stage.build).is_some();
+		// ADR 594: the non-streaming fallback is outside the sixth band's vocabulary; the
+		// receipt says so rather than reading it through the band.
+		if let (Some(handle), false) = (lifecycle, streamed) {
+			node_attribution::record_invocation_diagnostic(
+				handle,
+				"inner_1_facts",
+				serde_json::json!({"branch": "unsupported"}),
+			);
+		}
+		if streamed {
 			let scan_input =
 				decompose_streaming_scan_probe_input(stage.build).expect("checked scan build");
 
@@ -23678,6 +23791,9 @@ impl Executor {
 				stage.output_schema.clone()
 			};
 
+			// ADR 594: one span per child call, taken only under a profiling handle. The
+			// off arm takes none of these reads.
+			let sizing_started = lifecycle.map(|_| Instant::now());
 			let (estimated_build_bytes, compact_facts) = self
 				.estimate_streaming_scan_inner_build_with_facts(
 					scan_input,
@@ -23687,8 +23803,17 @@ impl Executor {
 					morsel,
 				)
 				.await?;
+			if let (Some(handle), Some(started)) = (lifecycle, sizing_started) {
+				node_attribution::record_inclusive_lifecycle_micros(
+					handle,
+					"inner_1_sizing_scan",
+					duration_micros(started),
+					1,
+				)?;
+			}
 
-			let (partition_count, group_count, _max_group_spill) = self
+			let partition_sizing_started = lifecycle.map(|_| Instant::now());
+			let (partition_count, group_count, _max_group_spill, sizing_passes) = self
 				.choose_streaming_scan_inner_build_partitioning(
 					estimated_build_bytes,
 					Some(compact_facts),
@@ -23698,10 +23823,48 @@ impl Executor {
 					write_build_keys,
 					false,
 					morsel,
+					lifecycle.is_some(),
 				)
 				.await?;
+			if let (Some(handle), Some(started)) = (lifecycle, partition_sizing_started) {
+				node_attribution::record_inclusive_lifecycle_micros(
+					handle,
+					"inner_1_partition_sizing",
+					duration_micros(started),
+					1,
+				)?;
+			}
+			let sizing_rows = compact_facts.rows;
+			let facts = move |branch: &str, build: Option<(u64, u64)>| {
+				serde_json::json!({
+					"branch": branch,
+					"partition_count": partition_count,
+					"group_count": group_count,
+					"partition_sizing_passes": sizing_passes.unwrap_or(0),
+					"estimated_build_bytes": estimated_build_bytes,
+					"sizing_rows": sizing_rows,
+					"sizing_scan_calls": 1,
+					"partition_sizing_calls": 1,
+					"build_write_calls": if build.is_some() { 1 } else { 0 },
+					"build_rows": build.map(|(rows, _)| rows),
+					"build_spill_bytes": build.map(|(_, bytes)| bytes),
+				})
+			};
 
 			if partition_count > 1 {
+				if let Some(handle) = lifecycle {
+					node_attribution::record_inclusive_lifecycle_micros(
+						handle,
+						"inner_1_build_write",
+						0,
+						0,
+					)?;
+					node_attribution::record_invocation_diagnostic(
+						handle,
+						"inner_1_facts",
+						facts("partitioned", None),
+					);
+				}
 				let partition_count_usize =
 					usize::try_from(partition_count).map_err(|_| ExecutionError::Kernel {
 						message: "streamed inner build partition count exceeds usize".to_string(),
@@ -23772,6 +23935,7 @@ impl Executor {
 				}));
 			}
 
+			let build_write_started = lifecycle.map(|_| Instant::now());
 			let mut spilled = SpilledInnerJoinBuild::create_with_resident_baseline(
 				self.context.task_budget,
 				self.context.join_spill_file_ops.clone(),
@@ -23827,6 +23991,20 @@ impl Executor {
 			});
 
 			build_scope.commit_after_write();
+
+			if let (Some(handle), Some(started)) = (lifecycle, build_write_started) {
+				node_attribution::record_inclusive_lifecycle_micros(
+					handle,
+					"inner_1_build_write",
+					duration_micros(started),
+					1,
+				)?;
+				node_attribution::record_invocation_diagnostic(
+					handle,
+					"inner_1_facts",
+					facts("spilled", Some((build_rows, spilled.spill_bytes()))),
+				);
+			}
 
 			return Ok(Some(ReorientedInnerJoinRuntime {
 				replay_id: stage.replay_id,
@@ -31835,6 +32013,52 @@ mod tests {
 				"test fixture must force more than one active build partition"
 			);
 
+			// ADR 594: without a profiling handle the attributed entry is the same preparation,
+			// partition for partition; the instrument arms nothing and reads nothing.
+			{
+				let mut ungated_stage = reoriented_scan_build_stage(
+					&build,
+					probe_schema.clone(),
+					output_schema.clone(),
+				);
+				ungated_stage.build_keys = vec![ColumnOrdinal(1)];
+				ungated_stage.retained_build_columns =
+					Some(vec![ColumnOrdinal(1), ColumnOrdinal(2)]);
+				// Its own storage, so the scan count the assertions below check is untouched.
+				let ungated_executor = Executor::with_context(
+					Arc::new(RecordingMultiBatchTableStorageScan {
+						batches: HashMap::from([(TableId(5), build_batches.clone())]),
+						requested_tables: Arc::new(Mutex::new(Vec::new())),
+					}),
+					ExecutionContext::local_test().with_task_budget(TaskBudget {
+						memory: ByteCount::new(64 * 1024),
+						spill_bytes: ByteCount::new(64 * 1024 * 1024),
+						..TaskBudget::from_query_budget(QueryBudget::test_default())
+					}),
+				);
+				let ungated = ungated_executor
+					.prepare_reoriented_inner_join_runtime_with_streamed_scan_build_attributed(
+						ungated_stage,
+						None,
+						None,
+					)
+					.await
+					.expect("ungated runtime")
+					.expect("ungated scan build should prepare");
+				match &ungated.build {
+					ReorientedInnerJoinBuild::PartitionedScan {
+						group_count: ungated_groups,
+						partition_count: ungated_partitions,
+						..
+					} => {
+						assert_eq!(*ungated_partitions, partition_count);
+						assert_eq!(*ungated_groups, group_count);
+					}
+					_ => panic!("the ungated entry must take the same branch"),
+				}
+				ungated.cleanup().await;
+			}
+
 			assert!(
 				group_count >= 1,
 				"partitioned runtime must record at least one live partition group"
@@ -34968,6 +35192,81 @@ mod tests {
 
 	// ADR 589, the finish windows: five, disjoint, ordered, summing to the finish term, and
 	// zero windows on a hashed build.
+	// ADR 594: the production partition-sizing loop, driven with an injected measurement:
+	// one measurement per pass, a refused first count retried at double, the pass count kept
+	// only under the gate. Nothing in the loop is timed per pass, so the single clock around
+	// the whole call cannot count a retry twice.
+	#[tokio::test]
+	async fn adr594_partition_sizing_counts_one_pass_per_measurement_only_under_the_gate() {
+		let executor = Executor::new(Arc::new(RecordingMultiBatchTableStorageScan {
+			batches: HashMap::new(),
+			requested_tables: Arc::new(Mutex::new(Vec::new())),
+		}));
+		let spill_budget = 1_000u64; // group budget 750
+		let measured = std::sync::Mutex::new(Vec::new());
+		let (count, groups, max_group, passes) = executor
+			.resolve_streamed_inner_build_partitioning(2, spill_budget, true, |count: u32| {
+				measured.lock().unwrap().push(count);
+				async move {
+					Ok(match count {
+						2 => vec![900, 100],
+						4 => vec![400, 500, 50, 50],
+						other => panic!("unexpected count {other}"),
+					})
+				}
+			})
+			.await
+			.expect("the second count is accepted");
+		assert_eq!(
+			*measured.lock().unwrap(),
+			vec![2, 4],
+			"one measurement per pass, doubling once"
+		);
+		assert_eq!((count, passes), (4, Some(2)), "one call, two passes");
+		assert!(
+			groups >= 2 && max_group <= 750,
+			"groups {groups} max {max_group}"
+		);
+		// Without the gate the same loop counts nothing, while measuring the same.
+		let measured = std::sync::Mutex::new(Vec::new());
+		let (count, _, _, passes) = executor
+			.resolve_streamed_inner_build_partitioning(2, spill_budget, false, |count: u32| {
+				measured.lock().unwrap().push(count);
+				async move {
+					Ok(match count {
+						2 => vec![900, 100],
+						_ => vec![400, 500, 50, 50],
+					})
+				}
+			})
+			.await
+			.unwrap();
+		assert_eq!((count, passes), (4, None));
+		assert_eq!(*measured.lock().unwrap(), vec![2, 4]);
+		// Accepted at once: one pass.
+		let (_, _, _, passes) = executor
+			.resolve_streamed_inner_build_partitioning(2, spill_budget, true, |_| async {
+				Ok(vec![300, 300])
+			})
+			.await
+			.unwrap();
+		assert_eq!(passes, Some(1));
+		// Refused all the way to the maximum count: the sizing's error, every pass made.
+		let attempts = std::sync::atomic::AtomicU64::new(0);
+		let error = executor
+			.resolve_streamed_inner_build_partitioning(2, spill_budget, true, |count: u32| {
+				attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+				async move { Ok(vec![5_000; count as usize]) }
+			})
+			.await
+			.unwrap_err();
+		assert!(attempts.load(std::sync::atomic::Ordering::SeqCst) > 1);
+		assert!(
+			format!("{error:?}").contains("partition group sizing"),
+			"{error:?}"
+		);
+	}
+
 	#[test]
 	fn adr589_finish_windows_are_five_disjoint_ordered_and_sum_to_the_term() {
 		let mut summary = adr589_ordered();

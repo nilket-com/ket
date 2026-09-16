@@ -1,8 +1,18 @@
 # ADR 594 - q21's replay-1 preparation on strix: lifecycle decomposition of `runtime_prep_inner_1`
 
-**Status:** PROPOSED. Successor to ADR 593, which resolved q21's owner on
-strix to `runtime_prep_inner_1` and named its decomposition as the next
-record.
+**Status:** CLOSED ON VARIABILITY. One run on strix through the gate
+(results in `plans/impl/0594_q21_inner_1_preparation_decomposition_results.md`):
+off range 799.1 ms, 8.90% of the median, above the 4% cutoff, so no
+owner is read. The band reconciled on every pair and established the
+facts: q21's replay-1 preparation at SF=8 under 2 GiB takes the spilled
+branch (one partition, one sizing pass, 5,845,938 rows), and on the two
+steady pairs the term is 1.34 s of which the build write is ~880 ms, the
+partition sizing ~266 ms, and the sizing scan ~200 ms. A login-session
+teardown (the launcher's, ended by the workstation) fell inside the
+window before the slow samples; not attributed. Successor: the same
+decomposition launched with no session event in its window. Successor to
+ADR 593, which resolved q21's owner on strix to `runtime_prep_inner_1`
+and named its decomposition as the next record.
 
 
 ## Context
