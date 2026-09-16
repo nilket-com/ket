@@ -1,9 +1,17 @@
 # ADR 598 - strix's start gate: the launcher's hash verification and the gate's placement
 
-**Status:** PROPOSED. Successor to ADR 597, which closed on ADR 593's
-start gate without a measurement: two launches refused at 47 and 48 °C
-against the 45 °C threshold, on a host reading 39–46 °C idle around
-them.
+**Status:** CLOSED, NOT ESTABLISHED. One probe on strix under the
+separated launch (results in
+`plans/impl/0598_strix_start_gate_placement_and_launcher_hash_verification_results.md`):
+eight valid pairs, four positive, median baseline-adjusted excess at
+the gate's delay 1.75 °C against the declared 6-of-8 and 2 °C; the gate
+stays at the driver's start and the successor attempt declares no
+settle from this record. On the record as observation: both kinds of
+trial read 4–8 °C over their baseline about 8 ms after the work,
+back within the band by +2 s. Successor to ADR 597, which closed on
+ADR 593's start gate without a measurement: two launches refused at 47
+and 48 °C against the 45 °C threshold, on a host reading 39–46 °C idle
+around them.
 
 
 ## Context

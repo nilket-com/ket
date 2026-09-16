@@ -129,6 +129,8 @@ async fn run() -> ExitCode {
 		"adr585-q21-decomposition" => adr585_q21_decomposition_command(&args),
 		"adr594-q21-inner-1" => adr594_q21_inner_1_command(&args),
 		"adr595-q21-inner-1" => adr595_q21_inner_1_command(&args),
+		"adr598-gate-probe" => adr598_gate_probe_command(&args),
+		"adr598-disposition" => adr598_disposition_command(&args),
 		"adr597-q21-exchange-skip" => adr597_q21_exchange_skip_command(&args),
 		"adr597-reevaluate" => adr597_reevaluate_command(&args),
 		"adr596-q21-build-write" => adr596_q21_build_write_command(&args),
@@ -1586,37 +1588,233 @@ fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, St
 	run_lifecycle_decomposition_driver(args, &ADR585_DRIVER)
 }
 
+/// ADR 598: the driver's host probes — the scope and the gate — as functions, so a refusal
+/// at either can be exercised by a fixture; production passes the real ones.
+struct LifecycleHostProbes {
+	scope: fn() -> Result<toron_tpch::host_readings::DriverScope, String>,
+	gate: fn() -> Adr593GateOutcome,
+}
+
+const LIFECYCLE_HOST_PROBES: LifecycleHostProbes = LifecycleHostProbes {
+	scope: toron_tpch::host_readings::observe_driver_scope,
+	gate: adr593_start_gate,
+};
+
 fn run_lifecycle_decomposition_driver(
 	args: &[String],
 	spec: &LifecycleDriverSpec,
 ) -> Result<serde_json::Value, String> {
+	run_lifecycle_decomposition_driver_with(args, spec, &LIFECYCLE_HOST_PROBES)
+}
+
+fn run_lifecycle_decomposition_driver_with(
+	args: &[String],
+	spec: &LifecycleDriverSpec,
+	probes: &LifecycleHostProbes,
+) -> Result<serde_json::Value, String> {
 	let label = spec.label;
+	// ADR 598: the driver's first act is a reading, before the scope and the launch
+	// environment are read; the launcher's verification stamps are read beside it.
+	let at_entry = adr598_take_reading();
+	let launcher_verification = adr598_launcher_verification_from_environment();
+	// ADR 598: the output directory's freshness is decided before anything else can refuse,
+	// and the directory is created here, so a refusal has a place of its own to be written
+	// that held no prior evidence; an existing directory is refused with nothing written.
+	let output_dir =
+		PathBuf::from(flag_value(args, "--output-dir").unwrap_or(spec.default_output_dir));
+	if output_dir.exists() {
+		return Err(format!(
+			"{label} requires a fresh output directory; {} already exists",
+			output_dir.display()
+		));
+	}
+	std::fs::create_dir_all(&output_dir)
+		.map_err(|error| format!("create {}: {error}", output_dir.display()))?;
+	let stamps = Adr598DriverStamps {
+		at_entry,
+		launcher_verification,
+	};
+	// The gate's evidence, filled in when the gate is read, so a refusal at or after the gate
+	// keeps the reading it was judged on, and a refusal before it says the gate was not read.
+	let mut gate_evidence: Option<serde_json::Value> = None;
+	let result = run_lifecycle_decomposition_driver_in(
+		args,
+		spec,
+		&output_dir,
+		&stamps,
+		probes,
+		&mut gate_evidence,
+	);
+	if let Err(error) = &result {
+		adr598_write_refusal(&output_dir, label, error, &stamps, gate_evidence.as_ref());
+	}
+	result
+}
+
+/// ADR 598: what the driver stamps on its summary and on a refusal — the reading it took
+/// first and the launcher's verification as the environment carried it.
+struct Adr598DriverStamps {
+	at_entry: toron_tpch::host_readings::HostReading,
+	launcher_verification: serde_json::Value,
+}
+
+fn adr598_take_reading() -> toron_tpch::host_readings::HostReading {
+	toron_tpch::host_readings::take_reading(
+		&toron_tpch::host_readings::HostReadingRoots::system(),
+		&toron_tpch::affinity::current_affinity().unwrap_or_default(),
+	)
+}
+
+/// The launcher's verification stamps: `recorded` (all four present and parsed), `absent`
+/// (none present: not launched through `toron-bench run`, or by a `run` older than ADR 598 —
+/// absence is not zero work), or `malformed` (some present, or unparsable), the raw values
+/// beside it in the last two cases.
+fn adr598_launcher_verification_from_environment() -> serde_json::Value {
+	const NAMES: [&str; 4] = [
+		"TORON_BENCH_VERIFY_BYTES",
+		"TORON_BENCH_VERIFY_MICROS",
+		"TORON_BENCH_VERIFY_UNIX_MS_END",
+		"TORON_BENCH_LAUNCHER_CPU_MASK",
+	];
+	let raw: Vec<Option<String>> = NAMES.iter().map(|name| std::env::var(name).ok()).collect();
+	adr598_launcher_verification(&raw)
+}
+
+fn adr598_launcher_verification(raw: &[Option<String>]) -> serde_json::Value {
+	let names = [
+		"TORON_BENCH_VERIFY_BYTES",
+		"TORON_BENCH_VERIFY_MICROS",
+		"TORON_BENCH_VERIFY_UNIX_MS_END",
+		"TORON_BENCH_LAUNCHER_CPU_MASK",
+	];
+	let raw_json = serde_json::json!(
+		names
+			.iter()
+			.zip(raw)
+			.map(|(name, value)| (name.to_string(), serde_json::json!(value)))
+			.collect::<serde_json::Map<_, _>>()
+	);
+	if raw.iter().all(Option::is_none) {
+		return serde_json::json!({"state": "absent"});
+	}
+	let parsed = (|| {
+		let bytes = raw[0].as_deref()?.parse::<u64>().ok()?;
+		let micros = raw[1].as_deref()?.parse::<u64>().ok()?;
+		let end = raw[2].as_deref()?.parse::<f64>().ok()?;
+		let mask = raw[3].as_deref()?;
+		let cpus = toron_tpch::affinity::parse_cpulist(mask).ok()?;
+		if !end.is_finite() || cpus.is_empty() {
+			return None;
+		}
+		Some(serde_json::json!({
+			"state": "recorded",
+			"verify_bytes": bytes,
+			"verify_micros": micros,
+			"verify_end_unix_ms": end,
+			"launcher_cpu_mask": toron_tpch::affinity::format_cpulist(&cpus),
+		}))
+	})();
+	parsed.unwrap_or_else(|| serde_json::json!({"state": "malformed", "raw": raw_json}))
+}
+
+/// The delay from the launcher's hash to the gate's read, when both are recorded.
+fn adr598_hash_end_to_gate_ms(
+	launcher_verification: &serde_json::Value,
+	at_gate_unix_ms: f64,
+) -> serde_json::Value {
+	match launcher_verification
+		.get("verify_end_unix_ms")
+		.and_then(serde_json::Value::as_f64)
+	{
+		Some(end) => serde_json::json!(at_gate_unix_ms - end),
+		None => serde_json::Value::Null,
+	}
+}
+
+/// A refusal's record, written only into the directory this driver created: the entry
+/// reading, the launcher's verification, and — when the gate was read — the gate's reading,
+/// load, and its distance from the launcher's hash; a refusal before the gate says so.
+fn adr598_write_refusal(
+	output_dir: &Path,
+	label: &str,
+	error: &str,
+	stamps: &Adr598DriverStamps,
+	gate: Option<&serde_json::Value>,
+) {
+	let refusal = serde_json::json!({
+		"label": label,
+		"refusal": error,
+		"refused_unix_ms": adr593_unix_ms(),
+		"readings": adr598_readings_value(&stamps.at_entry, gate),
+		"launcher_verification": stamps.launcher_verification,
+		"start_gate": gate.cloned().unwrap_or(serde_json::Value::Null),
+		"gate_evidence": if gate.is_some() { "recorded" } else { "absent: refused before the gate was read" },
+		"hash_end_to_gate_ms": adr598_hash_end_to_gate_from_gate(&stamps.launcher_verification, gate),
+	});
+	if let Err(write_error) = write_json_atomically(&output_dir.join("refusal.json"), &refusal) {
+		eprintln!("{label}: refusal.json could not be written: {write_error}");
+	}
+}
+
+/// The `readings` value shared by the summary and a refusal: `at_gate` is the gate's own
+/// reading when the gate was read, else explicitly `null`.
+fn adr598_readings_value(
+	at_entry: &toron_tpch::host_readings::HostReading,
+	gate: Option<&serde_json::Value>,
+) -> serde_json::Value {
+	serde_json::json!({
+		"at_entry": at_entry,
+		"at_gate": gate.and_then(|gate| gate.get("reading")).cloned().unwrap_or(serde_json::Value::Null),
+		"load_1m_at_gate": gate.and_then(|gate| gate.get("load_1m")).cloned().unwrap_or(serde_json::Value::Null),
+	})
+}
+
+fn adr598_hash_end_to_gate_from_gate(
+	launcher_verification: &serde_json::Value,
+	gate: Option<&serde_json::Value>,
+) -> serde_json::Value {
+	match gate
+		.and_then(|gate| gate.pointer("/reading/unix_ms_first"))
+		.and_then(serde_json::Value::as_f64)
+	{
+		Some(at_gate) => adr598_hash_end_to_gate_ms(launcher_verification, at_gate),
+		None => serde_json::Value::Null,
+	}
+}
+
+fn run_lifecycle_decomposition_driver_in(
+	args: &[String],
+	spec: &LifecycleDriverSpec,
+	output_dir: &Path,
+	stamps: &Adr598DriverStamps,
+	probes: &LifecycleHostProbes,
+	gate_evidence: &mut Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+	let label = spec.label;
+	let output_dir = output_dir.to_path_buf();
 	// ADR 593: the driver runs as a transient service outside any login session's scope, and
 	// starts only through the gate, read before the driver does any work of its own (the
 	// dataset's full-hash verification alone warms a P-core by ten degrees or more).
-	let driver_scope = toron_tpch::host_readings::observe_driver_scope()?;
+	let driver_scope = (probes.scope)()?;
 	// ADR 595: the launch's identity and instants, checked before the gate is read.
 	let launch = if spec.separated_launch {
 		Some(adr595_launch_from_environment(label, &driver_scope)?)
 	} else {
 		None
 	};
-	let start_gate = adr593_start_gate()?;
+	let gate_outcome = (probes.gate)();
+	*gate_evidence = Some(gate_outcome.gate.clone());
+	if let Some(refusal) = gate_outcome.refusal {
+		return Err(refusal);
+	}
+	let start_gate = gate_outcome.gate;
 	let mode = flag_value(args, "--mode").unwrap_or("strict");
 	let sf = resolved_sf(args)?;
 	let data_source = flag_value(args, "--data-source").unwrap_or("parquet");
 	let data_dir = data_dir_from_args(args);
-	let output_dir =
-		PathBuf::from(flag_value(args, "--output-dir").unwrap_or(spec.default_output_dir));
 	if mode != "strict" || sf != 8.0 || !matches!(data_source, "parquet" | "persisted") {
 		return Err(format!(
 			"{label} requires --mode strict --sf 8 --data-source parquet; got mode={mode:?} sf={sf} data_source={data_source:?}"
-		));
-	}
-	if output_dir.exists() {
-		return Err(format!(
-			"{label} requires a fresh output directory; {} already exists",
-			output_dir.display()
 		));
 	}
 	if std::env::var_os("TORON_NODE_ATTRIBUTION_PROFILE_PATH").is_some() {
@@ -1774,6 +1972,11 @@ fn run_lifecycle_decomposition_driver(
 		});
 	}
 	summary["driver_scope"] = serde_json::json!(driver_scope);
+	// ADR 598: the gate's reading is `at_gate`, the one reading the gate was judged on.
+	summary["readings"] = adr598_readings_value(&stamps.at_entry, Some(&start_gate));
+	summary["launcher_verification"] = stamps.launcher_verification.clone();
+	summary["hash_end_to_gate_ms"] =
+		adr598_hash_end_to_gate_from_gate(&stamps.launcher_verification, Some(&start_gate));
 	summary["start_gate"] = start_gate;
 	summary["host_journal"] = host_journal;
 	summary["kind"] = serde_json::json!(spec.kind);
@@ -1804,6 +2007,676 @@ fn run_lifecycle_decomposition_driver(
 	}
 	write_json_atomically(&output_dir.join("summary.json"), &summary)?;
 	Ok(summary)
+}
+
+// ---------------------------------------------------------------------------------------------
+// ADR 598: the paired gate probe — does the launcher's hash lift the sensor at the gate's read?
+// ---------------------------------------------------------------------------------------------
+
+/// The fixed recovery schedule, nominal seconds after the work's end.
+const ADR598_SCHEDULE_S: [u64; 10] = [0, 1, 2, 3, 5, 10, 20, 30, 45, 60];
+const ADR598_BASELINE_READINGS: usize = 10;
+const ADR598_GAP_S: u64 = 60;
+const ADR598_PAIRS: usize = 8;
+const ADR598_CALIBRATION_TRIALS: usize = 3;
+/// A scheduled reading more than this past its nominal offset is `late`.
+const ADR598_LATE_MS: f64 = 500.0;
+/// Recovery: three consecutive readings within this of the baseline's median.
+const ADR598_RECOVERY_BAND_MILLIC: i64 = 1_000;
+/// The decision: this many positive pairs of eight, and this median adjusted excess.
+const ADR598_REQUIRED_POSITIVE_PAIRS: usize = 6;
+const ADR598_REQUIRED_MEDIAN_EXCESS_MILLIC: f64 = 2_000.0;
+const ADR598_SETTLE_CAP_S: u64 = 30;
+
+/// One reading of the probe: its nominal offset (seconds from the work's end; negative for the
+/// baseline), its actual offset in milliseconds, the package temperature, and its state.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Adr598Reading {
+	nominal_s: i64,
+	actual_offset_ms: f64,
+	package_temp_millic: Option<i64>,
+	late: bool,
+	missing: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Adr598Trial {
+	/// `calibration`, `hash`, or `no_hash`.
+	kind: String,
+	index: usize,
+	baseline: Vec<Adr598Reading>,
+	work_kind: String,
+	work_mask: String,
+	work_micros: u64,
+	pre_gate_micros: u64,
+	at_gate_delay: Adr598Reading,
+	schedule: Vec<Adr598Reading>,
+	started_unix_ms: f64,
+}
+
+/// What a trial's readings say, derived once from the readings alone.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+struct Adr598Derived {
+	baseline_median_millic: Option<i64>,
+	peak_millic: Option<i64>,
+	peak_offset_ms: Option<f64>,
+	/// The actual offset of the third of three consecutive scheduled readings after the peak
+	/// within the band of the baseline's median; `None` is `unresolved`.
+	recovery_ms: Option<f64>,
+	unresolved_reason: Option<String>,
+	valid: bool,
+	invalid_reason: Option<String>,
+}
+
+fn adr598_median_i64(values: &mut [i64]) -> Option<i64> {
+	if values.is_empty() {
+		return None;
+	}
+	values.sort_unstable();
+	let n = values.len();
+	Some(if n % 2 == 1 {
+		values[n / 2]
+	} else {
+		(values[n / 2 - 1] + values[n / 2]) / 2
+	})
+}
+
+fn adr598_derive(trial: &Adr598Trial) -> Adr598Derived {
+	let mut baseline: Vec<i64> = trial
+		.baseline
+		.iter()
+		.filter_map(|reading| reading.package_temp_millic)
+		.collect();
+	let baseline_median = if trial.baseline.len() == ADR598_BASELINE_READINGS
+		&& baseline.len() == ADR598_BASELINE_READINGS
+	{
+		adr598_median_i64(&mut baseline)
+	} else {
+		None
+	};
+	let mut invalid_reason = None;
+	if baseline_median.is_none() {
+		invalid_reason = Some("baseline is not ten readings".to_string());
+	} else if trial.at_gate_delay.missing || trial.at_gate_delay.package_temp_millic.is_none() {
+		invalid_reason = Some("at_gate_delay reading is missing".to_string());
+	} else if trial.schedule.len() != ADR598_SCHEDULE_S.len() {
+		invalid_reason = Some("schedule is not ten readings".to_string());
+	} else if let Some(reading) = trial
+		.schedule
+		.iter()
+		.find(|reading| reading.missing || reading.package_temp_millic.is_none())
+	{
+		invalid_reason = Some(format!(
+			"scheduled reading +{} s is missing",
+			reading.nominal_s
+		));
+	} else if let Some(reading) = trial.schedule.iter().find(|reading| reading.late) {
+		invalid_reason = Some(format!(
+			"scheduled reading +{} s is late",
+			reading.nominal_s
+		));
+	}
+	let (peak_millic, peak_offset_ms, peak_index) = trial
+		.schedule
+		.iter()
+		.enumerate()
+		.filter_map(|(index, reading)| {
+			reading
+				.package_temp_millic
+				.map(|temp| (temp, reading.actual_offset_ms, index))
+		})
+		.max_by(|a, b| a.0.cmp(&b.0).then(b.2.cmp(&a.2)))
+		.map(|(temp, offset, index)| (Some(temp), Some(offset), Some(index)))
+		.unwrap_or((None, None, None));
+	let mut recovery_ms = None;
+	let mut unresolved_reason = None;
+	match (baseline_median, peak_index, &invalid_reason) {
+		(Some(median), Some(peak_index), None) => {
+			let within = |reading: &Adr598Reading| {
+				reading
+					.package_temp_millic
+					.is_some_and(|temp| (temp - median).abs() <= ADR598_RECOVERY_BAND_MILLIC)
+			};
+			let after = &trial.schedule[peak_index + 1..];
+			let found = after
+				.windows(3)
+				.find(|window| window.iter().all(|reading| within(reading)))
+				.map(|window| window[2].actual_offset_ms);
+			match found {
+				Some(offset) => recovery_ms = Some(offset),
+				None => {
+					unresolved_reason = Some(
+						"no three consecutive readings within the band after the peak by +60 s"
+							.to_string(),
+					)
+				}
+			}
+		}
+		(_, _, Some(reason)) => unresolved_reason = Some(reason.clone()),
+		_ => unresolved_reason = Some("no peak".to_string()),
+	}
+	Adr598Derived {
+		baseline_median_millic: baseline_median,
+		peak_millic,
+		peak_offset_ms,
+		recovery_ms,
+		unresolved_reason,
+		valid: invalid_reason.is_none(),
+		invalid_reason,
+	}
+}
+
+/// One pair's record: both trials' derived values, the raw temperatures at every point, and
+/// the baseline-adjusted excesses, the primary quantity.
+fn adr598_pair(pair: usize, hash: &Adr598Trial, no_hash: &Adr598Trial) -> serde_json::Value {
+	let h = adr598_derive(hash);
+	let n = adr598_derive(no_hash);
+	let valid = h.valid && n.valid;
+	let adjusted = |hash_temp: Option<i64>, no_hash_temp: Option<i64>| -> Option<i64> {
+		Some((hash_temp? - h.baseline_median_millic?) - (no_hash_temp? - n.baseline_median_millic?))
+	};
+	let excess_at_gate = adjusted(
+		hash.at_gate_delay.package_temp_millic,
+		no_hash.at_gate_delay.package_temp_millic,
+	);
+	let excess_at_peak = adjusted(h.peak_millic, n.peak_millic);
+	let excess_by_offset: Vec<serde_json::Value> = ADR598_SCHEDULE_S
+		.iter()
+		.enumerate()
+		.map(|(index, nominal)| {
+			let hash_temp = hash.schedule.get(index).and_then(|r| r.package_temp_millic);
+			let no_hash_temp = no_hash
+				.schedule
+				.get(index)
+				.and_then(|r| r.package_temp_millic);
+			serde_json::json!({
+				"nominal_s": nominal,
+				"hash_millic": hash_temp,
+				"no_hash_millic": no_hash_temp,
+				"adjusted_excess_millic": adjusted(hash_temp, no_hash_temp),
+			})
+		})
+		.collect();
+	serde_json::json!({
+		"pair": pair,
+		"valid": valid,
+		"invalid_reason": if valid { serde_json::Value::Null } else {
+			serde_json::json!(format!(
+				"hash: {}; no_hash: {}",
+				h.invalid_reason.clone().unwrap_or_else(|| "valid".to_string()),
+				n.invalid_reason.clone().unwrap_or_else(|| "valid".to_string())
+			))
+		},
+		"hash": {"index": hash.index, "derived": h, "at_gate_delay": hash.at_gate_delay, "work_micros": hash.work_micros, "work_mask": hash.work_mask, "pre_gate_micros": hash.pre_gate_micros},
+		"no_hash": {"index": no_hash.index, "derived": n, "at_gate_delay": no_hash.at_gate_delay, "work_micros": no_hash.work_micros, "work_mask": no_hash.work_mask, "pre_gate_micros": no_hash.pre_gate_micros},
+		"excess_at_gate_millic": excess_at_gate,
+		"excess_at_peak_millic": excess_at_peak,
+		"excess_by_offset": excess_by_offset,
+	})
+}
+
+/// The run's disposition from the report's state and the completion hook's marker: a report
+/// that says `complete` is complete; one that says `failed` failed; one still `running` was
+/// stopped at the unit's runtime limit only when the marker's `SERVICE_RESULT` says
+/// `timeout`, and is otherwise `incomplete_unknown` — never assumed.
+fn adr598_run_disposition(
+	report: &serde_json::Value,
+	completion_marker: Option<&str>,
+) -> &'static str {
+	let complete = report.get("complete") == Some(&serde_json::Value::Bool(true));
+	match report.get("state").and_then(serde_json::Value::as_str) {
+		Some("complete") => "complete",
+		// A report from before the state field carries `complete` alone.
+		_ if complete => "complete",
+		Some("failed") => "failed",
+		_ => {
+			let result = completion_marker.and_then(|marker| {
+				marker
+					.split_whitespace()
+					.find_map(|field| field.strip_prefix("result="))
+			});
+			match result {
+				Some("timeout") => "stopped_at_runtime_limit",
+				_ => "incomplete_unknown",
+			}
+		}
+	}
+}
+
+/// The decision over the pairs: complete evidence (eight valid pairs, the run not stopped),
+/// then the counts and the median adjusted excess; the settle interval, if established, from
+/// the hash trials' recoveries aggregated explicitly.
+fn adr598_decide(pairs: &[serde_json::Value], complete: bool) -> serde_json::Value {
+	let valid: Vec<&serde_json::Value> = pairs.iter().filter(|p| p["valid"] == true).collect();
+	let positives = valid
+		.iter()
+		.filter(|p| p["excess_at_gate_millic"].as_i64().is_some_and(|e| e > 0))
+		.count();
+	let mut excesses: Vec<i64> = valid
+		.iter()
+		.filter_map(|p| p["excess_at_gate_millic"].as_i64())
+		.collect();
+	let median_excess = adr598_median_i64(&mut excesses);
+	let recoveries: Vec<serde_json::Value> = valid
+		.iter()
+		.map(|p| p["hash"]["derived"]["recovery_ms"].clone())
+		.collect();
+	let unresolved = recoveries.iter().filter(|r| r.is_null()).count();
+	let mut resolved: Vec<i64> = recoveries
+		.iter()
+		.filter_map(|r| r.as_f64())
+		.map(|ms| ms.round() as i64)
+		.collect();
+	let median_recovery_ms = if unresolved == 0 && !resolved.is_empty() {
+		adr598_median_i64(&mut resolved)
+	} else {
+		None
+	};
+	let status = if !complete {
+		"undecided_incomplete"
+	} else if valid.len() != ADR598_PAIRS {
+		"undecided_incomplete_pairs"
+	} else if positives >= ADR598_REQUIRED_POSITIVE_PAIRS
+		&& median_excess.is_some_and(|m| m as f64 >= ADR598_REQUIRED_MEDIAN_EXCESS_MILLIC)
+	{
+		"established"
+	} else {
+		"not_established"
+	};
+	let settle_seconds = if status == "established" {
+		median_recovery_ms.and_then(|ms| {
+			let seconds = (ms as f64 / 1000.0 / 5.0).ceil() as u64 * 5;
+			(seconds <= ADR598_SETTLE_CAP_S).then_some(seconds)
+		})
+	} else {
+		None
+	};
+	serde_json::json!({
+		"status": status,
+		"scope": "this probe's measured temperature effect at the gate's read; not the cause of ADR 597's refusals",
+		"valid_pairs": valid.len(),
+		"positive_pairs": positives,
+		"required_positive_pairs": ADR598_REQUIRED_POSITIVE_PAIRS,
+		"median_excess_at_gate_millic": median_excess,
+		"required_median_excess_millic": ADR598_REQUIRED_MEDIAN_EXCESS_MILLIC,
+		"hash_recoveries_ms": recoveries,
+		"unresolved_recoveries": unresolved,
+		"median_recovery_ms": median_recovery_ms,
+		"median_recovery": if unresolved > 0 { serde_json::json!("unresolved") } else { serde_json::json!(median_recovery_ms) },
+		"settle_seconds": settle_seconds,
+		"settle_note": "an operational choice for the successor attempt, declared in its plan; not a guarantee",
+	})
+}
+
+/// The probe's host: the launcher's mask, the driver's mask, the manifest to hash, and the
+/// scope for the pre-gate operations.
+struct Adr598Host {
+	launcher_mask: BTreeSet<usize>,
+	driver_mask: BTreeSet<usize>,
+	manifest: BuildManifest,
+	scope: toron_tpch::host_readings::DriverScope,
+}
+
+fn adr598_host(label: &str) -> Result<Adr598Host, String> {
+	let launcher_mask = std::env::var("TORON_BENCH_LAUNCHER_CPU_MASK")
+		.map_err(|_| format!("{label} requires TORON_BENCH_LAUNCHER_CPU_MASK from toron-bench run: the launcher's mask is read back, never inferred"))
+		.and_then(|text| toron_tpch::affinity::parse_cpulist(&text))?;
+	let driver_mask = toron_tpch::affinity::current_affinity()?;
+	let manifest_path = std::env::var(BUILD_MANIFEST_ENV)
+		.map_err(|_| format!("{label} must run through toron-bench run with a build manifest"))?;
+	let manifest = BuildManifest::read(Path::new(&manifest_path))?;
+	let scope = toron_tpch::host_readings::observe_driver_scope()?;
+	Ok(Adr598Host {
+		launcher_mask,
+		driver_mask,
+		manifest,
+		scope,
+	})
+}
+
+/// The hash exactly as `toron-bench run` performs it: the same function on the same files.
+fn adr598_hash_as_launcher(manifest: &BuildManifest) -> Result<u64, String> {
+	let mut bytes = 0u64;
+	let root = |identity: &toron_tpch::evidence::ExecutableIdentity| {
+		identity
+			.staged_path
+			.parent()
+			.map(Path::to_path_buf)
+			.ok_or_else(|| "staged executable has no parent".to_string())
+	};
+	toron_tpch::evidence::verify_staged_executable(&manifest.harness, &root(&manifest.harness)?)?;
+	bytes += std::fs::metadata(&manifest.harness.staged_path)
+		.map(|m| m.len())
+		.unwrap_or(0);
+	if manifest.toron != manifest.harness {
+		toron_tpch::evidence::verify_staged_executable(&manifest.toron, &root(&manifest.toron)?)?;
+		bytes += std::fs::metadata(&manifest.toron.staged_path)
+			.map(|m| m.len())
+			.unwrap_or(0);
+	}
+	if let Some(duckdb) = &manifest.duckdb {
+		toron_tpch::evidence::verify_staged_executable(duckdb, &root(duckdb)?)?;
+		bytes += std::fs::metadata(&duckdb.staged_path)
+			.map(|m| m.len())
+			.unwrap_or(0);
+	}
+	Ok(bytes)
+}
+
+/// A signed offset in milliseconds from `origin` to `instant`.
+fn adr598_offset_ms(instant: Instant, origin: Instant) -> f64 {
+	if instant >= origin {
+		instant.duration_since(origin).as_secs_f64() * 1000.0
+	} else {
+		-(origin.duration_since(instant).as_secs_f64() * 1000.0)
+	}
+}
+
+/// One reading, with the instant it was actually taken at; the offset is against the work's
+/// end when that is known, and against nothing (NaN, to be converted) when it is not yet.
+fn adr598_reading_now(nominal_s: i64, work_end: Option<Instant>) -> (Adr598Reading, Instant) {
+	let taken = Instant::now();
+	let reading = adr598_take_reading();
+	let actual_offset_ms = work_end.map_or(f64::NAN, |end| adr598_offset_ms(taken, end));
+	let late = work_end.is_some()
+		&& nominal_s >= 0
+		&& actual_offset_ms - nominal_s as f64 * 1000.0 > ADR598_LATE_MS;
+	(
+		Adr598Reading {
+			nominal_s,
+			actual_offset_ms,
+			missing: reading.package_temp_millic.is_none(),
+			package_temp_millic: reading.package_temp_millic,
+			late,
+		},
+		taken,
+	)
+}
+
+fn adr598_reading_at(nominal_s: i64, work_end: Option<Instant>) -> Adr598Reading {
+	adr598_reading_now(nominal_s, work_end).0
+}
+
+/// The baseline's actual offsets from the work's end, from the instants each reading was
+/// actually taken at — never from the nominal schedule.
+fn adr598_baseline_offsets(taken: &[Instant], work_end: Instant) -> Vec<f64> {
+	taken
+		.iter()
+		.map(|instant| adr598_offset_ms(*instant, work_end))
+		.collect()
+}
+
+fn adr598_sleep_until(instant: Instant) {
+	let now = Instant::now();
+	if instant > now {
+		std::thread::sleep(instant - now);
+	}
+}
+
+/// One trial: the gap, the baseline, the work under the launcher's mask (a hash, or a sleep of
+/// the control duration — the same affinity transitions either way), the driver's
+/// observational pre-gate operations, the dedicated gate reading, then the fixed schedule.
+fn adr598_run_trial(
+	host: &Adr598Host,
+	kind: &str,
+	index: usize,
+	control_micros: Option<u64>,
+	gap: bool,
+) -> Result<Adr598Trial, String> {
+	if gap {
+		std::thread::sleep(std::time::Duration::from_secs(ADR598_GAP_S));
+	}
+	let started_unix_ms = adr593_unix_ms();
+	let started = Instant::now();
+	let mut baseline = Vec::with_capacity(ADR598_BASELINE_READINGS);
+	let mut baseline_taken = Vec::with_capacity(ADR598_BASELINE_READINGS);
+	for tick in 0..ADR598_BASELINE_READINGS {
+		adr598_sleep_until(started + std::time::Duration::from_secs(tick as u64));
+		let nominal = tick as i64 - ADR598_BASELINE_READINGS as i64;
+		let (reading, taken) = adr598_reading_now(nominal, None);
+		baseline.push(reading);
+		baseline_taken.push(taken);
+	}
+	adr598_sleep_until(started + std::time::Duration::from_secs(ADR598_BASELINE_READINGS as u64));
+	// The same affinity transitions on both kinds of trial.
+	toron_tpch::affinity::apply_affinity(&host.launcher_mask)?;
+	let work_mask = toron_tpch::affinity::format_cpulist(
+		&toron_tpch::affinity::current_affinity().unwrap_or_default(),
+	);
+	let work_started = Instant::now();
+	let work_kind = if kind == "no_hash" {
+		let micros =
+			control_micros.ok_or_else(|| "no-hash trial without a control duration".to_string())?;
+		std::thread::sleep(std::time::Duration::from_micros(micros));
+		"sleep".to_string()
+	} else {
+		adr598_hash_as_launcher(&host.manifest)?;
+		"hash".to_string()
+	};
+	let work_end = Instant::now();
+	let work_micros =
+		u64::try_from(work_end.duration_since(work_started).as_micros()).unwrap_or(u64::MAX);
+	toron_tpch::affinity::apply_affinity(&host.driver_mask)?;
+	// The driver's observational pre-gate operations, then the gate's own reading.
+	let pre_gate_started = Instant::now();
+	let _scope = toron_tpch::host_readings::observe_driver_scope()?;
+	let _ = adr595_read_timer_last_trigger(&host.scope);
+	let pre_gate_micros = u64::try_from(pre_gate_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+	let at_gate_delay = adr598_reading_at(0, Some(work_end));
+	let mut schedule = Vec::with_capacity(ADR598_SCHEDULE_S.len());
+	for nominal in ADR598_SCHEDULE_S {
+		adr598_sleep_until(work_end + std::time::Duration::from_secs(nominal));
+		schedule.push(adr598_reading_at(nominal as i64, Some(work_end)));
+	}
+	// The baseline's actual offsets from the work's end, from the instants the readings were
+	// actually taken at, now that the end is known.
+	for (reading, offset) in baseline
+		.iter_mut()
+		.zip(adr598_baseline_offsets(&baseline_taken, work_end))
+	{
+		reading.actual_offset_ms = offset;
+	}
+	Ok(Adr598Trial {
+		kind: kind.to_string(),
+		index,
+		baseline,
+		work_kind,
+		work_mask,
+		work_micros,
+		pre_gate_micros,
+		at_gate_delay,
+		schedule,
+		started_unix_ms,
+	})
+}
+
+/// ADR 598: the retained report's disposition from the completion evidence, and its decision
+/// recomputed from the retained pairs.
+fn adr598_disposition_command(args: &[String]) -> ExitCode {
+	let result = (|| -> Result<serde_json::Value, String> {
+		let report_path = flag_value(args, "--report")
+			.ok_or_else(|| "adr598-disposition requires --report PATH".to_string())?;
+		let report: serde_json::Value = serde_json::from_str(
+			&std::fs::read_to_string(report_path)
+				.map_err(|error| format!("read {report_path}: {error}"))?,
+		)
+		.map_err(|error| format!("parse {report_path}: {error}"))?;
+		let marker = match flag_value(args, "--completion-marker") {
+			Some(path) => Some(
+				std::fs::read_to_string(path).map_err(|error| format!("read {path}: {error}"))?,
+			),
+			None => None,
+		};
+		let pairs = report
+			.get("pairs")
+			.and_then(serde_json::Value::as_array)
+			.cloned()
+			.unwrap_or_default();
+		let complete = report.get("complete") == Some(&serde_json::Value::Bool(true));
+		Ok(serde_json::json!({
+			"report": report_path,
+			"disposition": adr598_run_disposition(&report, marker.as_deref()),
+			"decision": adr598_decide(&pairs, complete),
+			"retained_decision": report.get("decision").cloned(),
+			"reevaluating_evidence_identity": runtime_identity_json(),
+		}))
+	})();
+	match result {
+		Ok(value) => {
+			println!("{value}");
+			ExitCode::SUCCESS
+		}
+		Err(error) => {
+			eprintln!("{error}");
+			ExitCode::from(2)
+		}
+	}
+}
+
+fn adr598_gate_probe_command(args: &[String]) -> ExitCode {
+	match adr598_gate_probe(args) {
+		Ok(report) => {
+			println!("{report}");
+			ExitCode::SUCCESS
+		}
+		Err(message) => harness_error(&message),
+	}
+}
+
+/// The probe: calibration, then eight alternating pairs, the report rewritten after every
+/// trial so a stop at the unit's runtime limit leaves what completed, marked incomplete.
+fn adr598_gate_probe(args: &[String]) -> Result<serde_json::Value, String> {
+	let label = "ADR 598";
+	let at_entry = adr598_take_reading();
+	let launcher_verification = adr598_launcher_verification_from_environment();
+	let output_dir =
+		PathBuf::from(flag_value(args, "--output-dir").unwrap_or("target/tpch/adr598-gate-probe"));
+	if output_dir.exists() {
+		return Err(format!(
+			"{label} requires a fresh output directory; {} already exists",
+			output_dir.display()
+		));
+	}
+	std::fs::create_dir_all(&output_dir)
+		.map_err(|error| format!("create {}: {error}", output_dir.display()))?;
+	let stamps = Adr598DriverStamps {
+		at_entry,
+		launcher_verification,
+	};
+	let result = adr598_gate_probe_in(label, &output_dir, &stamps);
+	if let Err(error) = &result {
+		adr598_write_refusal(&output_dir, label, error, &stamps, None);
+	}
+	result
+}
+
+fn adr598_gate_probe_in(
+	label: &str,
+	output_dir: &Path,
+	stamps: &Adr598DriverStamps,
+) -> Result<serde_json::Value, String> {
+	let host = adr598_host(label)?;
+	let launch = adr595_launch_from_environment(label, &host.scope)?;
+	let identity = runtime_identity()?.ok_or_else(|| {
+		format!("{label} must run through toron-bench run with a staged executable")
+	})?;
+	let mut calibration: Vec<Adr598Trial> = Vec::new();
+	let mut trials: Vec<Adr598Trial> = Vec::new();
+	let mut control_micros: Option<u64> = None;
+	let write = |calibration: &[Adr598Trial],
+	             trials: &[Adr598Trial],
+	             control_micros: Option<u64>,
+	             state: &str,
+	             error: Option<&str>|
+	 -> Result<serde_json::Value, String> {
+		let complete = state == "complete";
+		let pairs: Vec<serde_json::Value> = trials
+			.chunks(2)
+			.enumerate()
+			.filter(|(_, chunk)| chunk.len() == 2)
+			.map(|(pair, chunk)| {
+				let (hash, no_hash) = if chunk[0].kind == "hash" {
+					(&chunk[0], &chunk[1])
+				} else {
+					(&chunk[1], &chunk[0])
+				};
+				adr598_pair(pair, hash, no_hash)
+			})
+			.collect();
+		let report = serde_json::json!({
+			"kind": "adr598_gate_probe",
+			"complete": complete,
+			// The run's own state; whether an incomplete run was stopped at the unit's runtime
+			// limit is not the probe's to say — `adr598_run_disposition` reads it from the
+			// completion evidence.
+			"state": state,
+			"error": error,
+			"decision": adr598_decide(&pairs, complete),
+			"pairs": pairs,
+			"trials": trials,
+			"calibration": {
+				"trials": calibration,
+				"hash_micros": calibration.iter().map(|t| t.work_micros).collect::<Vec<_>>(),
+				"control_micros": control_micros,
+			},
+			"schedule_s": ADR598_SCHEDULE_S,
+			"gap_s": ADR598_GAP_S,
+			"launcher_cpu_mask": toron_tpch::affinity::format_cpulist(&host.launcher_mask),
+			"driver_cpu_mask": toron_tpch::affinity::format_cpulist(&host.driver_mask),
+			"readings": {"at_entry": stamps.at_entry},
+			"launcher_verification": stamps.launcher_verification,
+			"separated_launch": launch,
+			"driver_scope": host.scope,
+			"evidence_identity": identity.json_value(),
+			"sealed": false,
+			"candidate_authority": false,
+		});
+		write_json_atomically(&output_dir.join("probe.json"), &report)?;
+		Ok(report)
+	};
+	let run = |calibration: &mut Vec<Adr598Trial>,
+	           trials: &mut Vec<Adr598Trial>,
+	           control_micros: &mut Option<u64>|
+	 -> Result<(), String> {
+		for index in 0..ADR598_CALIBRATION_TRIALS {
+			let trial = adr598_run_trial(&host, "calibration", index, None, index > 0)?;
+			calibration.push(trial);
+			write(calibration, trials, *control_micros, "running", None)?;
+		}
+		let mut hash_micros: Vec<i64> = calibration
+			.iter()
+			.map(|trial| trial.work_micros as i64)
+			.collect();
+		*control_micros = adr598_median_i64(&mut hash_micros).map(|micros| micros as u64);
+		for pair in 0..ADR598_PAIRS {
+			let order: [&str; 2] = if pair % 2 == 0 {
+				["hash", "no_hash"]
+			} else {
+				["no_hash", "hash"]
+			};
+			for kind in order {
+				let index = trials.len();
+				let trial = adr598_run_trial(&host, kind, index, *control_micros, true)?;
+				trials.push(trial);
+				write(calibration, trials, *control_micros, "running", None)?;
+			}
+		}
+		Ok(())
+	};
+	match run(&mut calibration, &mut trials, &mut control_micros) {
+		Ok(()) => write(&calibration, &trials, control_micros, "complete", None),
+		Err(error) => {
+			// An ordinary failure: the report says so, with what completed, and the error.
+			let _ = write(
+				&calibration,
+				&trials,
+				control_micros,
+				"failed",
+				Some(&error),
+			);
+			Err(error)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2200,19 +3073,7 @@ fn adr595_launch_from_environment(
 			"{label} launched on boot {boot_id} but runs on boot {host_boot_id}"
 		));
 	}
-	let timer_unit = scope
-		.unit
-		.as_ref()
-		.and_then(|unit| unit.strip_suffix(".service"))
-		.map(|stem| format!("{stem}.timer"));
-	let timer_last_trigger_unix_ms = timer_unit.as_ref().and_then(|timer| {
-		let output = std::process::Command::new("systemctl")
-			.args(["--user", "show", timer, "-p", "LastTriggerUSec", "--value"])
-			.output()
-			.ok()?;
-		let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-		adr595_parse_systemd_timestamp(&text)
-	});
+	let (timer_unit, timer_last_trigger_unix_ms) = adr595_read_timer_last_trigger(scope);
 	let driver_start_unix_ms = adr593_unix_ms();
 	let launch = Adr595Launch {
 		launcher_session_id,
@@ -2226,6 +3087,28 @@ fn adr595_launch_from_environment(
 	};
 	adr595_check_late_start(label, &launch)?;
 	Ok(launch)
+}
+
+/// The observational read of the launch environment: the driver's timer unit and its last
+/// trigger, through `systemctl --user show`. ADR 598's probe repeats this read per trial; the
+/// admission check around it is the driver's alone.
+fn adr595_read_timer_last_trigger(
+	scope: &toron_tpch::host_readings::DriverScope,
+) -> (Option<String>, Option<f64>) {
+	let timer_unit = scope
+		.unit
+		.as_ref()
+		.and_then(|unit| unit.strip_suffix(".service"))
+		.map(|stem| format!("{stem}.timer"));
+	let timer_last_trigger_unix_ms = timer_unit.as_ref().and_then(|timer| {
+		let output = std::process::Command::new("systemctl")
+			.args(["--user", "show", timer, "-p", "LastTriggerUSec", "--value"])
+			.output()
+			.ok()?;
+		let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+		adr595_parse_systemd_timestamp(&text)
+	});
+	(timer_unit, timer_last_trigger_unix_ms)
 }
 
 /// `systemctl show` prints a timer's trigger as a local timestamp (`Tue 2026-09-16 07:25:08 CDT`);
@@ -5572,11 +6455,15 @@ fn adr593_apply_variability_bound_on(
 
 /// ADR 593's start gate, read from the host at driver start: a temperature that cannot be read
 /// does not satisfy it.
-fn adr593_start_gate() -> Result<serde_json::Value, String> {
-	let reading = toron_tpch::host_readings::take_reading(
-		&toron_tpch::host_readings::HostReadingRoots::system(),
-		&toron_tpch::affinity::current_affinity().unwrap_or_default(),
-	);
+/// ADR 598: the gate's outcome carries its structured reading whether it admits or refuses,
+/// so a refusal keeps the evidence it was judged on.
+struct Adr593GateOutcome {
+	gate: serde_json::Value,
+	refusal: Option<String>,
+}
+
+fn adr593_start_gate() -> Adr593GateOutcome {
+	let reading = adr598_take_reading();
 	let load = std::fs::read_to_string("/proc/loadavg")
 		.ok()
 		.and_then(|text| {
@@ -5584,29 +6471,39 @@ fn adr593_start_gate() -> Result<serde_json::Value, String> {
 				.next()
 				.and_then(|v| v.parse::<f64>().ok())
 		});
+	adr593_judge_gate(reading, load)
+}
+
+fn adr593_judge_gate(
+	reading: toron_tpch::host_readings::HostReading,
+	load: Option<f64>,
+) -> Adr593GateOutcome {
+	let refusal = match (reading.package_temp_millic, load) {
+		(None, _) => Some(format!(
+			"ADR 593 start gate needs a package temperature and none could be read: {:?}",
+			reading.missing
+		)),
+		(Some(temp), _) if temp > ADR593_START_GATE_TEMP_MILLIC => Some(format!(
+			"ADR 593 start gate: package temperature {temp} millic is above {ADR593_START_GATE_TEMP_MILLIC}"
+		)),
+		(_, None) => {
+			Some("ADR 593 start gate needs a load average and none could be read".to_string())
+		}
+		(_, Some(load)) if load >= ADR593_START_GATE_LOAD => Some(format!(
+			"ADR 593 start gate: load {load} is not below {ADR593_START_GATE_LOAD}"
+		)),
+		_ => None,
+	};
 	let gate = serde_json::json!({
 		"package_temp_millic": reading.package_temp_millic,
 		"load_1m": load,
 		"temp_bound_millic": ADR593_START_GATE_TEMP_MILLIC,
 		"load_bound": ADR593_START_GATE_LOAD,
+		"admitted": refusal.is_none(),
+		"refusal": refusal,
 		"reading": reading,
 	});
-	match (reading.package_temp_millic, load) {
-		(None, _) => Err(format!(
-			"ADR 593 start gate needs a package temperature and none could be read: {:?}",
-			reading.missing
-		)),
-		(Some(temp), _) if temp > ADR593_START_GATE_TEMP_MILLIC => Err(format!(
-			"ADR 593 start gate: package temperature {temp} millic is above {ADR593_START_GATE_TEMP_MILLIC}"
-		)),
-		(_, None) => {
-			Err("ADR 593 start gate needs a load average and none could be read".to_string())
-		}
-		(_, Some(load)) if load >= ADR593_START_GATE_LOAD => Err(format!(
-			"ADR 593 start gate: load {load} is not below {ADR593_START_GATE_LOAD}"
-		)),
-		_ => Ok(gate),
-	}
+	Adr593GateOutcome { gate, refusal }
 }
 
 /// ADR 593: re-collect a retained summary's journal window with the current collector and
@@ -12881,7 +13778,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|perf-board-replay|adr592-revalidate|adr593-journal-recheck|adr584-q21-attribution|adr585-q21-decomposition|adr594-q21-inner-1|adr595-q21-inner-1|adr596-q21-build-write|adr596-reevaluate|adr597-q21-exchange-skip|adr597-reevaluate|adr595-reevaluate|adr594-reevaluate|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|perf-board-replay|adr592-revalidate|adr593-journal-recheck|adr584-q21-attribution|adr585-q21-decomposition|adr594-q21-inner-1|adr595-q21-inner-1|adr596-q21-build-write|adr596-reevaluate|adr597-q21-exchange-skip|adr597-reevaluate|adr598-gate-probe|adr598-disposition|adr595-reevaluate|adr594-reevaluate|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -15341,6 +16238,489 @@ mod tests {
 				.unwrap_err()
 				.contains("row 11 lacks")
 		);
+	}
+
+	// -----------------------------------------------------------------------------------------
+	// ADR 598: the launcher's stamps, the refusal file, and the probe's derivation and decision.
+	// -----------------------------------------------------------------------------------------
+
+	fn adr598_synthetic_reading(nominal_s: i64, temp: Option<i64>, late: bool) -> Adr598Reading {
+		Adr598Reading {
+			nominal_s,
+			actual_offset_ms: nominal_s as f64 * 1000.0 + if late { 800.0 } else { 20.0 },
+			package_temp_millic: temp,
+			late,
+			missing: temp.is_none(),
+		}
+	}
+
+	/// A trial with a flat baseline, a gate reading, and ten scheduled temperatures.
+	fn adr598_synthetic_trial(
+		kind: &str,
+		index: usize,
+		baseline_millic: i64,
+		gate_millic: i64,
+		schedule_millic: [i64; 10],
+	) -> Adr598Trial {
+		Adr598Trial {
+			kind: kind.to_string(),
+			index,
+			baseline: (0..10)
+				.map(|tick| adr598_synthetic_reading(tick - 10, Some(baseline_millic), false))
+				.collect(),
+			work_kind: if kind == "no_hash" { "sleep" } else { "hash" }.to_string(),
+			work_mask: "0-31".to_string(),
+			work_micros: 60_000,
+			pre_gate_micros: 30_000,
+			at_gate_delay: Adr598Reading {
+				nominal_s: 0,
+				actual_offset_ms: 31.0,
+				package_temp_millic: Some(gate_millic),
+				late: false,
+				missing: false,
+			},
+			schedule: ADR598_SCHEDULE_S
+				.iter()
+				.zip(schedule_millic)
+				.map(|(nominal, temp)| adr598_synthetic_reading(*nominal as i64, Some(temp), false))
+				.collect(),
+			started_unix_ms: 1.0,
+		}
+	}
+
+	/// A hash trial that peaks 4 °C over a 42 °C baseline at +1 s and recovers by +10 s, and a
+	/// no-hash trial that stays flat.
+	fn adr598_hash_trial(index: usize) -> Adr598Trial {
+		adr598_synthetic_trial(
+			"hash",
+			index,
+			42_000,
+			45_000,
+			[
+				45_000, 46_000, 45_000, 44_000, 43_000, 42_000, 42_000, 42_000, 42_000, 42_000,
+			],
+		)
+	}
+
+	fn adr598_no_hash_trial(index: usize) -> Adr598Trial {
+		adr598_synthetic_trial("no_hash", index, 42_000, 42_000, [42_000; 10])
+	}
+
+	fn adr598_pairs(count: usize) -> Vec<serde_json::Value> {
+		(0..count)
+			.map(|pair| {
+				adr598_pair(
+					pair,
+					&adr598_hash_trial(pair * 2),
+					&adr598_no_hash_trial(pair * 2 + 1),
+				)
+			})
+			.collect()
+	}
+
+	#[test]
+	fn adr598_the_launcher_verification_is_recorded_absent_or_malformed() {
+		let recorded = adr598_launcher_verification(&[
+			Some("99336904".to_string()),
+			Some("61234".to_string()),
+			Some("1789588860000.500".to_string()),
+			Some("0-31".to_string()),
+		]);
+		assert_eq!(recorded["state"], "recorded");
+		assert_eq!(recorded["verify_bytes"], 99_336_904);
+		assert_eq!(recorded["launcher_cpu_mask"], "0-31");
+		assert_eq!(
+			adr598_hash_end_to_gate_ms(&recorded, 1789588860020.5),
+			serde_json::json!(20.0)
+		);
+		let absent = adr598_launcher_verification(&[None, None, None, None]);
+		assert_eq!(absent["state"], "absent");
+		assert_eq!(
+			adr598_hash_end_to_gate_ms(&absent, 1.0),
+			serde_json::Value::Null
+		);
+		// Some present: malformed, never zero work; unparsable likewise; an empty mask likewise.
+		for raw in [
+			vec![Some("1".to_string()), None, None, None],
+			vec![
+				Some("x".to_string()),
+				Some("1".to_string()),
+				Some("1.0".to_string()),
+				Some("0-3".to_string()),
+			],
+			vec![
+				Some("1".to_string()),
+				Some("1".to_string()),
+				Some("1.0".to_string()),
+				Some("".to_string()),
+			],
+		] {
+			let malformed = adr598_launcher_verification(&raw);
+			assert_eq!(malformed["state"], "malformed", "{raw:?}");
+			assert!(malformed["raw"].is_object());
+			assert!(malformed.get("verify_bytes").is_none());
+		}
+	}
+
+	fn adr598_test_scope() -> Result<toron_tpch::host_readings::DriverScope, String> {
+		Ok(toron_tpch::host_readings::DriverScope {
+			cgroup: "/user.slice/user-1002.slice/user@1002.service/app.slice/adr598-test.service"
+				.to_string(),
+			unit: Some("adr598-test.service".to_string()),
+			unix_session_id: 1,
+			audit_session_id: None,
+			unit_settings: None,
+			unit_settings_unavailable: None,
+		})
+	}
+
+	fn adr598_test_reading(
+		package_temp_millic: Option<i64>,
+	) -> toron_tpch::host_readings::HostReading {
+		toron_tpch::host_readings::HostReading {
+			unix_ms_first: 1789588860020.5,
+			monotonic_ns_first: 1,
+			unix_ms_last: 1789588860020.9,
+			monotonic_ns_last: 2,
+			pid: 1,
+			tid: 1,
+			package_temp_millic,
+			cpu_freq_khz: None,
+			ctxt_switches: None,
+			elapsed_us: 400,
+			missing: Vec::new(),
+		}
+	}
+
+	fn adr598_gate_at_47() -> Adr593GateOutcome {
+		adr593_judge_gate(adr598_test_reading(Some(47_000)), Some(0.02))
+	}
+
+	fn adr598_scope_refused() -> Result<toron_tpch::host_readings::DriverScope, String> {
+		Err("driver scope is a login session's (session-1.scope)".to_string())
+	}
+
+	// ADR 598: a temperature refusal keeps the gate's reading, its load, and its distance from
+	// the launcher's hash on the refusal file; a refusal before the gate says the gate was not
+	// read, with the gate fields explicitly null.
+	#[test]
+	fn adr598_a_gate_refusal_keeps_the_gate_reading_and_an_earlier_refusal_says_it_was_not_read() {
+		let dir = std::env::temp_dir().join(format!("adr598-gate-refusal-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		let args = vec!["--output-dir".to_string(), dir.display().to_string()];
+		let probes = LifecycleHostProbes {
+			scope: adr598_test_scope,
+			gate: adr598_gate_at_47,
+		};
+		let error =
+			run_lifecycle_decomposition_driver_with(&args, &ADR594_DRIVER, &probes).unwrap_err();
+		assert!(error.contains("47000 millic is above 45000"), "{error}");
+		let refusal: serde_json::Value =
+			serde_json::from_str(&std::fs::read_to_string(dir.join("refusal.json")).unwrap())
+				.unwrap();
+		assert_eq!(refusal["refusal"], error);
+		assert_eq!(refusal["gate_evidence"], "recorded");
+		assert_eq!(
+			refusal["readings"]["at_gate"]["package_temp_millic"],
+			47_000
+		);
+		assert_eq!(refusal["readings"]["load_1m_at_gate"], 0.02);
+		assert_eq!(refusal["start_gate"]["admitted"], false);
+		assert_eq!(refusal["start_gate"]["refusal"], error);
+		assert_eq!(refusal["start_gate"]["package_temp_millic"], 47_000);
+		// Not launched through toron-bench run here: the launcher's verification is absent and
+		// the distance is null, never zero.
+		assert_eq!(refusal["launcher_verification"]["state"], "absent");
+		assert_eq!(refusal["hash_end_to_gate_ms"], serde_json::Value::Null);
+		std::fs::remove_dir_all(&dir).unwrap();
+
+		let dir = std::env::temp_dir().join(format!("adr598-scope-refusal-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		let args = vec!["--output-dir".to_string(), dir.display().to_string()];
+		let probes = LifecycleHostProbes {
+			scope: adr598_scope_refused,
+			gate: adr598_gate_at_47,
+		};
+		let error =
+			run_lifecycle_decomposition_driver_with(&args, &ADR594_DRIVER, &probes).unwrap_err();
+		assert!(error.contains("login session"), "{error}");
+		let refusal: serde_json::Value =
+			serde_json::from_str(&std::fs::read_to_string(dir.join("refusal.json")).unwrap())
+				.unwrap();
+		assert_eq!(
+			refusal["gate_evidence"],
+			"absent: refused before the gate was read"
+		);
+		assert_eq!(refusal["readings"]["at_gate"], serde_json::Value::Null);
+		assert_eq!(
+			refusal["readings"]["load_1m_at_gate"],
+			serde_json::Value::Null
+		);
+		assert_eq!(refusal["start_gate"], serde_json::Value::Null);
+		assert_eq!(refusal["hash_end_to_gate_ms"], serde_json::Value::Null);
+		assert!(
+			refusal["readings"]["at_entry"]["unix_ms_first"]
+				.as_f64()
+				.unwrap() > 0.0
+		);
+		std::fs::remove_dir_all(&dir).unwrap();
+
+		// The distance from the hash, when the launcher's stamps are recorded.
+		let recorded = adr598_launcher_verification(&[
+			Some("99388424".to_string()),
+			Some("45785".to_string()),
+			Some("1789588860000.000".to_string()),
+			Some("0-31".to_string()),
+		]);
+		let gate = adr598_gate_at_47().gate;
+		assert_eq!(
+			adr598_hash_end_to_gate_from_gate(&recorded, Some(&gate)),
+			serde_json::json!(20.5)
+		);
+		assert_eq!(
+			adr598_hash_end_to_gate_from_gate(&recorded, None),
+			serde_json::Value::Null
+		);
+	}
+
+	// ADR 598: the baseline's actual offsets come from the instants the readings were taken at;
+	// a delayed read shows its delay, and is not reconstructed from the nominal schedule.
+	#[test]
+	fn adr598_baseline_offsets_come_from_the_actual_instants() {
+		let origin = Instant::now();
+		let second = std::time::Duration::from_secs(1);
+		let taken = vec![
+			origin,
+			origin + second,
+			origin + 2 * second + std::time::Duration::from_millis(750),
+		];
+		let work_end = origin + 10 * second;
+		let offsets = adr598_baseline_offsets(&taken, work_end);
+		assert!((offsets[0] + 10_000.0).abs() < 1e-6, "{offsets:?}");
+		assert!((offsets[1] + 9_000.0).abs() < 1e-6, "{offsets:?}");
+		assert!(
+			(offsets[2] + 7_250.0).abs() < 1e-6,
+			"the delayed read keeps its delay: {offsets:?}"
+		);
+		assert_eq!(adr598_offset_ms(work_end, origin), 10_000.0);
+	}
+
+	// ADR 598: an incomplete report is `running` or `failed`; a stop at the unit's runtime
+	// limit is asserted only from the completion marker's result.
+	#[test]
+	fn adr598_the_disposition_is_read_from_the_state_and_the_completion_evidence() {
+		let running = serde_json::json!({"state": "running", "complete": false});
+		let failed =
+			serde_json::json!({"state": "failed", "complete": false, "error": "hash: open failed"});
+		let complete = serde_json::json!({"state": "complete", "complete": true});
+		let timeout = "adr595 token=t result=timeout exit_code=killed exit_status=TERM unix_ms=1";
+		let success = "adr595 token=t result=success exit_code=exited exit_status=0 unix_ms=1";
+		assert_eq!(
+			adr598_run_disposition(&running, Some(timeout)),
+			"stopped_at_runtime_limit"
+		);
+		assert_eq!(
+			adr598_run_disposition(&running, Some(success)),
+			"incomplete_unknown"
+		);
+		assert_eq!(adr598_run_disposition(&running, None), "incomplete_unknown");
+		assert_eq!(adr598_run_disposition(&failed, Some(timeout)), "failed");
+		assert_eq!(adr598_run_disposition(&complete, None), "complete");
+		// A report from before the state field: complete when it says so, else incomplete and
+		// never runtime-limited on its own.
+		let stateless = serde_json::json!({"complete": false});
+		assert_eq!(
+			adr598_run_disposition(&stateless, None),
+			"incomplete_unknown"
+		);
+		assert_eq!(
+			adr598_run_disposition(&serde_json::json!({"complete": true}), Some(timeout)),
+			"complete"
+		);
+	}
+
+	#[test]
+	fn adr598_a_refusal_is_written_only_into_a_directory_the_driver_created() {
+		let dir = std::env::temp_dir().join(format!("adr598-refusal-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		let args = vec![
+			"--output-dir".to_string(),
+			dir.display().to_string(),
+			"--mode".to_string(),
+			"strict".to_string(),
+		];
+		// A fresh directory: the driver creates it, refuses (under cargo test the scope is a
+		// login session's, which ADR 593 refuses), and writes the refusal beside its readings.
+		let error = run_lifecycle_decomposition_driver(&args, &ADR596_DRIVER).unwrap_err();
+		let refusal: serde_json::Value =
+			serde_json::from_str(&std::fs::read_to_string(dir.join("refusal.json")).unwrap())
+				.unwrap();
+		assert_eq!(refusal["refusal"], error);
+		assert!(
+			refusal["readings"]["at_entry"]["unix_ms_first"]
+				.as_f64()
+				.unwrap() > 0.0
+		);
+		assert_eq!(refusal["launcher_verification"]["state"], "absent");
+		// The directory now exists: refused before anything is written, the file untouched.
+		let before = std::fs::read_to_string(dir.join("refusal.json")).unwrap();
+		let error = run_lifecycle_decomposition_driver(&args, &ADR596_DRIVER).unwrap_err();
+		assert!(error.contains("fresh output directory"), "{error}");
+		assert_eq!(
+			std::fs::read_to_string(dir.join("refusal.json")).unwrap(),
+			before
+		);
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn adr598_a_trial_derives_its_peak_and_its_sustained_recovery_or_says_why_not() {
+		let derived = adr598_derive(&adr598_hash_trial(0));
+		assert!(derived.valid);
+		assert_eq!(derived.baseline_median_millic, Some(42_000));
+		assert_eq!(derived.peak_millic, Some(46_000));
+		assert_eq!(derived.peak_offset_ms, Some(1_020.0));
+		// After the peak at +1 s: +2 (45) out, +3 (44) out, +5 (43) in, +10, +20 in: the third
+		// confirming reading is +20 s.
+		assert_eq!(derived.recovery_ms, Some(20_020.0));
+		// No recovery by +60 s: unresolved, the reason named.
+		let hot = adr598_synthetic_trial("hash", 0, 42_000, 46_000, [46_000; 10]);
+		let derived = adr598_derive(&hot);
+		assert!(derived.valid);
+		assert_eq!(derived.recovery_ms, None);
+		assert!(derived.unresolved_reason.unwrap().contains("by +60 s"));
+		// A late reading invalidates the trial; so does a missing one; so does a short baseline.
+		let mut late = adr598_hash_trial(0);
+		late.schedule[4] = adr598_synthetic_reading(5, Some(43_000), true);
+		let derived = adr598_derive(&late);
+		assert!(!derived.valid);
+		assert!(derived.invalid_reason.unwrap().contains("+5 s is late"));
+		let mut missing = adr598_hash_trial(0);
+		missing.schedule[7] = adr598_synthetic_reading(30, None, false);
+		let derived = adr598_derive(&missing);
+		assert!(derived.invalid_reason.unwrap().contains("+30 s is missing"));
+		let mut short = adr598_hash_trial(0);
+		short.baseline.pop();
+		assert!(
+			adr598_derive(&short)
+				.invalid_reason
+				.unwrap()
+				.contains("ten readings")
+		);
+		let mut no_gate = adr598_hash_trial(0);
+		no_gate.at_gate_delay.package_temp_millic = None;
+		no_gate.at_gate_delay.missing = true;
+		assert!(
+			adr598_derive(&no_gate)
+				.invalid_reason
+				.unwrap()
+				.contains("at_gate_delay")
+		);
+	}
+
+	#[test]
+	fn adr598_a_pair_reports_the_baseline_adjusted_excess_beside_the_raw_temperatures() {
+		// Hash trial starts 1 °C warmer: raw gate difference 4 °C, adjusted 3 °C.
+		let hash = adr598_synthetic_trial(
+			"hash",
+			0,
+			43_000,
+			46_000,
+			[
+				46_000, 46_000, 45_000, 44_000, 43_000, 43_000, 43_000, 43_000, 43_000, 43_000,
+			],
+		);
+		let no_hash = adr598_no_hash_trial(1);
+		let pair = adr598_pair(0, &hash, &no_hash);
+		assert_eq!(pair["valid"], true);
+		assert_eq!(pair["excess_at_gate_millic"], 3_000);
+		assert_eq!(pair["hash"]["at_gate_delay"]["package_temp_millic"], 46_000);
+		assert_eq!(
+			pair["no_hash"]["at_gate_delay"]["package_temp_millic"],
+			42_000
+		);
+		assert_eq!(pair["excess_by_offset"][0]["hash_millic"], 46_000);
+		assert_eq!(pair["excess_by_offset"][0]["adjusted_excess_millic"], 3_000);
+		assert_eq!(pair["excess_by_offset"][9]["adjusted_excess_millic"], 0);
+		// An invalid trial makes the pair invalid, reason named, excess null.
+		let mut late = no_hash.clone();
+		late.schedule[0] = adr598_synthetic_reading(0, Some(42_000), true);
+		let pair = adr598_pair(0, &hash, &late);
+		assert_eq!(pair["valid"], false);
+		assert!(
+			pair["invalid_reason"]
+				.as_str()
+				.unwrap()
+				.contains("no_hash: scheduled reading +0 s is late")
+		);
+	}
+
+	#[test]
+	fn adr598_the_decision_needs_eight_valid_pairs_and_names_the_settle_or_none() {
+		let decision = adr598_decide(&adr598_pairs(8), true);
+		assert_eq!(decision["status"], "established", "{decision}");
+		assert_eq!(decision["positive_pairs"], 8);
+		assert_eq!(decision["median_excess_at_gate_millic"], 3_000);
+		assert_eq!(decision["unresolved_recoveries"], 0);
+		assert_eq!(decision["median_recovery_ms"], 20_020);
+		assert_eq!(
+			decision["settle_seconds"], 25,
+			"20.02 s rounded up to the next 5 s"
+		);
+		// Seven valid pairs: undecided; a stopped run: undecided, whatever the pairs.
+		assert_eq!(
+			adr598_decide(&adr598_pairs(7), true)["status"],
+			"undecided_incomplete_pairs"
+		);
+		assert_eq!(
+			adr598_decide(&adr598_pairs(8), false)["status"],
+			"undecided_incomplete"
+		);
+		assert_eq!(
+			adr598_decide(&adr598_pairs(8), false)["settle_seconds"],
+			serde_json::Value::Null
+		);
+		// Five positive pairs of eight: not established.
+		let mut pairs = adr598_pairs(8);
+		for pair in pairs.iter_mut().take(3) {
+			pair["excess_at_gate_millic"] = serde_json::json!(-500);
+		}
+		let decision = adr598_decide(&pairs, true);
+		assert_eq!(decision["status"], "not_established");
+		assert_eq!(decision["positive_pairs"], 5);
+		// Six positive but a median under 2 °C: not established.
+		let mut pairs = adr598_pairs(8);
+		for pair in pairs.iter_mut() {
+			pair["excess_at_gate_millic"] = serde_json::json!(1_500);
+		}
+		pairs[0]["excess_at_gate_millic"] = serde_json::json!(-100);
+		pairs[1]["excess_at_gate_millic"] = serde_json::json!(-100);
+		let decision = adr598_decide(&pairs, true);
+		assert_eq!(decision["status"], "not_established");
+		assert_eq!(decision["positive_pairs"], 6);
+		// An unresolved hash recovery: the median is unresolved, the resolved values listed,
+		// and no settle even though established.
+		let mut pairs = adr598_pairs(8);
+		pairs[3]["hash"]["derived"]["recovery_ms"] = serde_json::Value::Null;
+		let decision = adr598_decide(&pairs, true);
+		assert_eq!(decision["status"], "established");
+		assert_eq!(decision["unresolved_recoveries"], 1);
+		assert_eq!(decision["median_recovery"], "unresolved");
+		assert_eq!(decision["hash_recoveries_ms"].as_array().unwrap().len(), 8);
+		assert_eq!(decision["settle_seconds"], serde_json::Value::Null);
+		// A recovery past 30 s: established, but no settle.
+		let mut pairs = adr598_pairs(8);
+		for pair in pairs.iter_mut() {
+			pair["hash"]["derived"]["recovery_ms"] = serde_json::json!(45_020.0);
+		}
+		let decision = adr598_decide(&pairs, true);
+		assert_eq!(decision["status"], "established");
+		assert_eq!(decision["settle_seconds"], serde_json::Value::Null);
+		// Exactly 30 s rounds to 30 and is admitted.
+		for pair in pairs.iter_mut() {
+			pair["hash"]["derived"]["recovery_ms"] = serde_json::json!(26_000.0);
+		}
+		assert_eq!(adr598_decide(&pairs, true)["settle_seconds"], 30);
 	}
 
 	fn adr586_rows(semi: [u64; 4], anti: [u64; 4]) -> Vec<serde_json::Value> {

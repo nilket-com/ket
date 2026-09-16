@@ -237,9 +237,26 @@ fn run_staged(args: &[OsString]) -> Result<ExitCode, String> {
 		.staged_path
 		.parent()
 		.ok_or_else(|| "staged Toron has no parent".to_string())?;
+	// ADR 598: the verification's bytes, wall duration, end instant, and the mask this
+	// launcher hashed under are handed to the harness, so a driver can say how far its gate's
+	// read lies from the hash and a probe can hash under the same placement.
+	let launcher_cpu_mask = toron_tpch::affinity::current_affinity()
+		.map(|cpus| toron_tpch::affinity::format_cpulist(&cpus))
+		.map_err(|error| format!("launcher affinity: {error}"))?;
+	let verify_started = std::time::Instant::now();
+	let mut verify_bytes = 0u64;
+	let mut count = |identity: &toron_tpch::evidence::ExecutableIdentity| {
+		verify_bytes = verify_bytes.saturating_add(
+			std::fs::metadata(&identity.staged_path)
+				.map(|metadata| metadata.len())
+				.unwrap_or(0),
+		);
+	};
 	verify_staged_executable(&manifest.harness, harness_root)?;
+	count(&manifest.harness);
 	if manifest.toron != manifest.harness {
 		verify_staged_executable(&manifest.toron, toron_root)?;
+		count(&manifest.toron);
 	}
 	if let Some(duckdb) = &manifest.duckdb {
 		let duckdb_root = duckdb
@@ -247,12 +264,25 @@ fn run_staged(args: &[OsString]) -> Result<ExitCode, String> {
 			.parent()
 			.ok_or_else(|| "staged DuckDB has no parent".to_string())?;
 		verify_staged_executable(duckdb, duckdb_root)?;
+		count(duckdb);
 	}
+	let verify_micros = u64::try_from(verify_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+	let verify_end_unix_ms = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_secs_f64() * 1000.0)
+		.unwrap_or(f64::NAN);
 	let mut command = Command::new(&manifest.harness.staged_path);
 	command
 		.args(&args[separator + 1..])
 		.env(BUILD_MANIFEST_ENV, &manifest_path)
-		.env("TORON_TPCH_TORON_BIN", &manifest.toron.staged_path);
+		.env("TORON_TPCH_TORON_BIN", &manifest.toron.staged_path)
+		.env("TORON_BENCH_VERIFY_BYTES", verify_bytes.to_string())
+		.env("TORON_BENCH_VERIFY_MICROS", verify_micros.to_string())
+		.env(
+			"TORON_BENCH_VERIFY_UNIX_MS_END",
+			format!("{verify_end_unix_ms:.3}"),
+		)
+		.env("TORON_BENCH_LAUNCHER_CPU_MASK", launcher_cpu_mask);
 	if let Some(duckdb) = &manifest.duckdb {
 		command.env("TORON_TPCH_DUCKDB_BIN", &duckdb.staged_path);
 	}
