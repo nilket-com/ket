@@ -128,6 +128,8 @@ async fn run() -> ExitCode {
 		"adr584-q21-attribution" => adr584_q21_attribution_command(&args),
 		"adr585-q21-decomposition" => adr585_q21_decomposition_command(&args),
 		"adr594-q21-inner-1" => adr594_q21_inner_1_command(&args),
+		"adr595-q21-inner-1" => adr595_q21_inner_1_command(&args),
+		"adr595-reevaluate" => adr595_reevaluate_command(&args),
 		"adr594-reevaluate" => adr594_reevaluate_command(&args),
 		"adr586-q21-semi-write" => adr586_q21_semi_write_command(&args),
 		"adr587-q21-insert" => adr587_q21_insert_command(&args),
@@ -1537,6 +1539,10 @@ struct LifecycleDriverSpec {
 	kind: &'static str,
 	evaluate: fn(&[serde_json::Value]) -> Result<serde_json::Value, String>,
 	stamp: fn(&mut serde_json::Value),
+	/// ADR 595: the driver requires the separated-launch environment, refuses a differing boot
+	/// id or a late start, collects the journal from the launch instant, and withholds the
+	/// owner unless both the separation interval and the measurement window are verified.
+	separated_launch: bool,
 }
 
 fn adr585_stamp(summary: &mut serde_json::Value) {
@@ -1552,6 +1558,7 @@ const ADR585_DRIVER: LifecycleDriverSpec = LifecycleDriverSpec {
 	kind: "adr585_q21_outside_drive_decomposition",
 	evaluate: evaluate_adr585_pairs,
 	stamp: adr585_stamp,
+	separated_launch: false,
 };
 
 fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, String> {
@@ -1567,6 +1574,12 @@ fn run_lifecycle_decomposition_driver(
 	// starts only through the gate, read before the driver does any work of its own (the
 	// dataset's full-hash verification alone warms a P-core by ten degrees or more).
 	let driver_scope = toron_tpch::host_readings::observe_driver_scope()?;
+	// ADR 595: the launch's identity and instants, checked before the gate is read.
+	let launch = if spec.separated_launch {
+		Some(adr595_launch_from_environment(label, &driver_scope)?)
+	} else {
+		None
+	};
 	let start_gate = adr593_start_gate()?;
 	let mode = flag_value(args, "--mode").unwrap_or("strict");
 	let sf = resolved_sf(args)?;
@@ -1693,11 +1706,24 @@ fn run_lifecycle_decomposition_driver(
 		})
 		.fold(f64::NEG_INFINITY, f64::max);
 	std::thread::sleep(std::time::Duration::from_secs(2));
+	// ADR 595: the collection reaches back to the launch instant so the launcher's logout, in
+	// the delay before the first child, is inside it.
+	let collection_since = match &launch {
+		Some(launch) => launch.launch_unix_ms - 1000.0,
+		None => first_launch - 1000.0,
+	};
 	let collection =
-		toron_tpch::host_readings::collect_journal(first_launch - 1000.0, last_return + 1000.0);
+		toron_tpch::host_readings::collect_journal(collection_since, last_return + 1000.0);
 	let host_journal = adr593_join_journal_and_gaps(&all_rows, &collection);
 	let mut summary = (spec.evaluate)(&rows)?;
 	adr593_apply_variability_bound(&mut summary)?;
+	if let Some(launch) = &launch {
+		let verdicts = adr595_launch_verdicts(launch, &collection, first_launch, last_return);
+		adr595_apply_launch_precedence(&mut summary, &verdicts);
+		summary["separated_launch"] = serde_json::json!(launch);
+		summary["launch_separation"] = verdicts.separation;
+		summary["measurement_window"] = verdicts.window;
+	}
 	summary["driver_scope"] = serde_json::json!(driver_scope);
 	summary["start_gate"] = start_gate;
 	summary["host_journal"] = host_journal;
@@ -1717,6 +1743,445 @@ fn run_lifecycle_decomposition_driver(
 	summary["warmup_execute_ms"] = warmup.get("execute_ms").cloned().unwrap_or_default();
 	write_json_atomically(&output_dir.join("summary.json"), &summary)?;
 	Ok(summary)
+}
+
+// ---------------------------------------------------------------------------------------------
+// ADR 595: the separated launch, verified from the driver's own journal collection.
+// ---------------------------------------------------------------------------------------------
+
+/// Late-start tolerance: the driver's start against the timer's trigger, and the trigger
+/// against the launch instant plus the delay.
+const ADR595_LATE_START_TOLERANCE_MS: f64 = 30_000.0;
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Adr595Launch {
+	launcher_session_id: String,
+	boot_id: String,
+	attempt_token: String,
+	launch_unix_ms: f64,
+	delay_seconds: f64,
+	timer_unit: Option<String>,
+	timer_last_trigger_unix_ms: Option<f64>,
+	driver_start_unix_ms: f64,
+}
+
+fn adr595_env(name: &str, label: &str) -> Result<String, String> {
+	std::env::var(name)
+		.ok()
+		.filter(|value| !value.trim().is_empty())
+		.ok_or_else(|| format!("{label} requires {name} from the separated launch"))
+}
+
+/// Read the launch environment, bind it to this boot, read the timer's actual trigger, and
+/// refuse a late start. Every instant is recorded on the summary whatever the verdict.
+fn adr595_launch_from_environment(
+	label: &str,
+	scope: &toron_tpch::host_readings::DriverScope,
+) -> Result<Adr595Launch, String> {
+	let launcher_session_id = adr595_env("ADR595_LAUNCHER_SESSION_ID", label)?;
+	let boot_id = adr595_env("ADR595_BOOT_ID", label)?;
+	let attempt_token = adr595_env("ADR595_ATTEMPT_TOKEN", label)?;
+	let launch_unix_ms = adr595_env("ADR595_LAUNCH_UNIX_MS", label)?
+		.parse::<f64>()
+		.map_err(|error| format!("{label} ADR595_LAUNCH_UNIX_MS: {error}"))?;
+	let delay_seconds = adr595_env("ADR595_DELAY_SECONDS", label)?
+		.parse::<f64>()
+		.map_err(|error| format!("{label} ADR595_DELAY_SECONDS: {error}"))?;
+	let host_boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+		.map(|text| text.trim().to_string())
+		.map_err(|error| format!("{label} boot id: {error}"))?;
+	if host_boot_id != boot_id {
+		return Err(format!(
+			"{label} launched on boot {boot_id} but runs on boot {host_boot_id}"
+		));
+	}
+	let timer_unit = scope
+		.unit
+		.as_ref()
+		.and_then(|unit| unit.strip_suffix(".service"))
+		.map(|stem| format!("{stem}.timer"));
+	let timer_last_trigger_unix_ms = timer_unit.as_ref().and_then(|timer| {
+		let output = std::process::Command::new("systemctl")
+			.args(["--user", "show", timer, "-p", "LastTriggerUSec", "--value"])
+			.output()
+			.ok()?;
+		let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+		adr595_parse_systemd_timestamp(&text)
+	});
+	let driver_start_unix_ms = adr593_unix_ms();
+	let launch = Adr595Launch {
+		launcher_session_id,
+		boot_id,
+		attempt_token,
+		launch_unix_ms,
+		delay_seconds,
+		timer_unit,
+		timer_last_trigger_unix_ms,
+		driver_start_unix_ms,
+	};
+	adr595_check_late_start(label, &launch)?;
+	Ok(launch)
+}
+
+/// `systemctl show` prints a timer's trigger as a local timestamp (`Tue 2026-09-16 07:25:08 CDT`);
+/// parsed through `date`, which knows the zone the manager printed.
+fn adr595_parse_systemd_timestamp(text: &str) -> Option<f64> {
+	if text.is_empty() || text == "n/a" {
+		return None;
+	}
+	let output = std::process::Command::new("date")
+		.args(["-d", text, "+%s%N"])
+		.output()
+		.ok()?;
+	let nanos = String::from_utf8_lossy(&output.stdout)
+		.trim()
+		.parse::<u128>()
+		.ok()?;
+	Some(nanos as f64 / 1_000_000.0)
+}
+
+/// A late timer trigger or a late driver start is a finding, not a longer window.
+fn adr595_check_late_start(label: &str, launch: &Adr595Launch) -> Result<(), String> {
+	let Some(trigger) = launch.timer_last_trigger_unix_ms else {
+		return Err(format!(
+			"{label} cannot read the timer's last trigger ({:?}); the late-start check needs it",
+			launch.timer_unit
+		));
+	};
+	let expected = launch.launch_unix_ms + launch.delay_seconds * 1000.0;
+	if trigger - expected > ADR595_LATE_START_TOLERANCE_MS {
+		return Err(format!(
+			"{label} timer triggered {:.0} ms after the launch instant plus the delay",
+			trigger - expected
+		));
+	}
+	if launch.driver_start_unix_ms - trigger > ADR595_LATE_START_TOLERANCE_MS {
+		return Err(format!(
+			"{label} driver started {:.0} ms after the timer's trigger",
+			launch.driver_start_unix_ms - trigger
+		));
+	}
+	Ok(())
+}
+
+/// A boot id is 32 hex digits, spelled by the kernel as 8-4-4-4-12 with dashes and by the
+/// journal without; anything else is malformed, not "close enough".
+fn adr595_parse_boot_id(text: &str) -> Option<String> {
+	let trimmed = text.trim();
+	let dashed = trimmed.len() == 36
+		&& trimmed.char_indices().all(|(i, c)| {
+			if matches!(i, 8 | 13 | 18 | 23) {
+				c == '-'
+			} else {
+				c.is_ascii_hexdigit()
+			}
+		});
+	let plain = trimmed.len() == 32 && trimmed.chars().all(|c| c.is_ascii_hexdigit());
+	if !dashed && !plain {
+		return None;
+	}
+	Some(
+		trimmed
+			.chars()
+			.filter(|c| *c != '-')
+			.map(|c| c.to_ascii_lowercase())
+			.collect(),
+	)
+}
+
+struct Adr595Verdicts {
+	separation: serde_json::Value,
+	window: serde_json::Value,
+}
+
+fn adr595_is_session_source(entry: &toron_tpch::host_readings::JournalEntry) -> bool {
+	let source = entry.source.as_deref().unwrap_or("");
+	source == "ssh.service"
+		|| source == "sshd.service"
+		|| source == "sshd"
+		|| source == "sshd-session"
+		|| source == "systemd-logind.service"
+		|| (source.starts_with("session-") && source.ends_with(".scope"))
+		|| (source == "init.scope" && entry.message.contains("session-"))
+}
+
+/// The two verdicts from the driver's own collection: separation (the launcher's logout, on
+/// this boot, before the first child) and cleanliness (no session entry in the window), each
+/// `verified` only under a `collected` collection whose bounds cover the interval.
+fn adr595_launch_verdicts(
+	launch: &Adr595Launch,
+	collection: &toron_tpch::host_readings::JournalCollection,
+	first_launch_unix_ms: f64,
+	last_return_unix_ms: f64,
+) -> Adr595Verdicts {
+	use toron_tpch::host_readings::JournalState;
+	let collected = collection.state == JournalState::Collected;
+	let state = serde_json::json!(collection.state);
+	let covers = |since: f64, until: f64| {
+		collected && collection.since_unix_ms <= since && collection.until_unix_ms >= until
+	};
+	// Separation: [launch − 1 s, first launch).
+	let separation_since = launch.launch_unix_ms - 1000.0;
+	let logout_needle = format!("Session {} logged out", launch.launcher_session_id);
+	// The launcher's boot id must be well formed; a malformed one verifies nothing.
+	let launch_boot = adr595_parse_boot_id(&launch.boot_id);
+	// The logout is evidence only as logind's own entry, on this boot, with a boot id present.
+	let logouts: Vec<f64> = collection
+		.entries
+		.iter()
+		.filter(|entry| {
+			entry.message.contains(&logout_needle)
+				&& entry.source.as_deref() == Some("systemd-logind.service")
+				&& match (
+					&launch_boot,
+					entry.boot_id.as_deref().and_then(adr595_parse_boot_id),
+				) {
+					(Some(launch_boot), Some(entry_boot)) => &entry_boot == launch_boot,
+					_ => false,
+				}
+		})
+		.map(|entry| entry.realtime_us as f64 / 1000.0)
+		.collect();
+	let separation_covered = covers(separation_since, first_launch_unix_ms);
+	let inside_interval = |ms: f64| ms >= separation_since && ms < first_launch_unix_ms;
+	let inside_bounds = |ms: f64| ms >= collection.since_unix_ms && ms <= collection.until_unix_ms;
+	let separation = if launch_boot.is_none() {
+		serde_json::json!({
+			"verdict": "unknown",
+			"reason": format!("the launcher's boot id {:?} is malformed", launch.boot_id),
+			"collection_state": state,
+			"first_child_launch_unix_ms": first_launch_unix_ms,
+		})
+	} else if !separation_covered {
+		serde_json::json!({
+			"verdict": "unknown",
+			"reason": "the collection does not cover the separation interval completely",
+			"collection_state": state,
+			"launcher_logout_unix_ms": logouts.first(),
+			"first_child_launch_unix_ms": first_launch_unix_ms,
+		})
+	} else if let Some(logout_ms) = logouts
+		.iter()
+		.copied()
+		.find(|ms| inside_interval(*ms) && inside_bounds(*ms))
+	{
+		serde_json::json!({
+			"verdict": "verified",
+			"collection_state": state,
+			"launcher_logout_unix_ms": logout_ms,
+			"first_child_launch_unix_ms": first_launch_unix_ms,
+			"margin_ms": first_launch_unix_ms - logout_ms,
+		})
+	} else if let Some(logout_ms) = logouts.first().copied() {
+		serde_json::json!({
+			"verdict": "failed",
+			"reason": if logout_ms < separation_since {
+				"the launcher's logout precedes the separation interval: it is not this launch's"
+			} else {
+				"the launcher's logout is inside or after the measurement window"
+			},
+			"collection_state": state,
+			"launcher_logout_unix_ms": logout_ms,
+			"first_child_launch_unix_ms": first_launch_unix_ms,
+		})
+	} else {
+		serde_json::json!({
+			"verdict": "failed",
+			"reason": format!(
+				"no logind '{logout_needle}' entry on boot {} inside the collection",
+				launch.boot_id
+			),
+			"collection_state": state,
+			"launcher_logout_unix_ms": serde_json::Value::Null,
+			"first_child_launch_unix_ms": first_launch_unix_ms,
+		})
+	};
+	// Cleanliness: [first launch − 1 s, last return + 1 s].
+	let window_since = first_launch_unix_ms - 1000.0;
+	let window_until = last_return_unix_ms + 1000.0;
+	let events: Vec<serde_json::Value> = collection
+		.entries
+		.iter()
+		.filter(|entry| {
+			let ms = entry.realtime_us as f64 / 1000.0;
+			ms >= window_since && ms <= window_until && adr595_is_session_source(entry)
+		})
+		.map(|entry| serde_json::json!(entry))
+		.collect();
+	let window = if !covers(window_since, window_until) {
+		serde_json::json!({
+			"verdict": "unknown",
+			"reason": "the collection does not cover the measurement window completely",
+			"collection_state": state,
+			"session_events": events,
+		})
+	} else if events.is_empty() {
+		serde_json::json!({
+			"verdict": "verified",
+			"collection_state": state,
+			"session_events": [],
+		})
+	} else {
+		serde_json::json!({
+			"verdict": "failed",
+			"reason": format!("{} session entries inside the measurement window", events.len()),
+			"collection_state": state,
+			"session_events": events,
+		})
+	};
+	Adr595Verdicts { separation, window }
+}
+
+/// Precedence: a separation or window verdict other than `verified` withholds the owner with
+/// the named status; the tables, facts, readings, and cutoff verdict stay as evidence.
+fn adr595_apply_launch_precedence(summary: &mut serde_json::Value, verdicts: &Adr595Verdicts) {
+	let status = |verdict: &serde_json::Value, prefix: &str| -> Option<String> {
+		match verdict.get("verdict").and_then(serde_json::Value::as_str) {
+			Some("verified") => None,
+			Some(other) => Some(format!("{prefix}_{other}")),
+			None => Some(format!("{prefix}_unknown")),
+		}
+	};
+	let withheld = status(&verdicts.separation, "withheld_launch_separation")
+		.or_else(|| status(&verdicts.window, "withheld_window_not_clean"));
+	if let Some(status) = withheld {
+		let previous = summary["owner"].take();
+		summary["owner"] = serde_json::json!({
+			"status": status,
+			"rule_outcome_withheld": previous,
+		});
+	}
+}
+
+/// ADR 595: recompute the launch verdicts and the precedence from a retained summary's own
+/// collection and launch record, and re-run the evaluator and the cutoff over the retained
+/// rows, so a corrected verdict can be applied to retained evidence without another run.
+fn adr595_reevaluate_command(args: &[String]) -> ExitCode {
+	match adr595_reevaluate(args) {
+		Ok(summary) => {
+			println!("{summary}");
+			ExitCode::SUCCESS
+		}
+		Err(error) => {
+			eprintln!("{error}");
+			ExitCode::from(2)
+		}
+	}
+}
+
+fn adr595_reevaluate(args: &[String]) -> Result<serde_json::Value, String> {
+	let summary_path = flag_value(args, "--summary")
+		.ok_or_else(|| "adr595-reevaluate requires --summary PATH".to_string())?;
+	let samples_path = flag_value(args, "--samples")
+		.ok_or_else(|| "adr595-reevaluate requires --samples PATH".to_string())?;
+	let read =
+		|path: &str| std::fs::read_to_string(path).map_err(|error| format!("read {path}: {error}"));
+	let retained: serde_json::Value = serde_json::from_str(&read(summary_path)?)
+		.map_err(|error| format!("parse {summary_path}: {error}"))?;
+	let rows: Vec<serde_json::Value> = read(samples_path)?
+		.lines()
+		.filter(|line| !line.trim().is_empty())
+		.map(|line| {
+			serde_json::from_str(line).map_err(|error| format!("parse {samples_path}: {error}"))
+		})
+		.collect::<Result<_, _>>()?;
+	let launch: Adr595Launch = serde_json::from_value(retained["separated_launch"].clone())
+		.map_err(|error| format!("retained summary lacks a separated launch record: {error}"))?;
+	let collection: toron_tpch::host_readings::JournalCollection =
+		serde_json::from_value(retained["host_journal"]["collection"].clone())
+			.map_err(|error| format!("retained summary lacks a journal collection: {error}"))?;
+	let (first_launch, last_return) = adr595_window_from_rows(&rows)?;
+	let pair_rows: Vec<serde_json::Value> = rows
+		.iter()
+		.filter(|row| row.get("warmup") != Some(&serde_json::Value::Bool(true)))
+		.cloned()
+		.collect();
+	let mut summary = evaluate_adr594_pairs(&pair_rows)?;
+	adr593_apply_variability_bound(&mut summary)?;
+	let verdicts = adr595_launch_verdicts(&launch, &collection, first_launch, last_return);
+	adr595_apply_launch_precedence(&mut summary, &verdicts);
+	summary["separated_launch"] = serde_json::json!(launch);
+	summary["launch_separation"] = verdicts.separation;
+	summary["measurement_window"] = verdicts.window;
+	summary["retained_owner"] = retained["owner"].clone();
+	summary["retained_launch_separation"] = retained["launch_separation"].clone();
+	summary["retained_measurement_window"] = retained["measurement_window"].clone();
+	summary["reevaluated_summary"] = serde_json::json!(summary_path);
+	summary["reevaluating_evidence_identity"] = runtime_identity_json();
+	Ok(summary)
+}
+
+/// The measurement window from retained rows: every one of the eleven rows (the warmup
+/// included) must carry a finite launch and return with launch < return, and the rows must
+/// not overlap; a missing or malformed stamp is refused rather than narrowing the window.
+fn adr595_window_from_rows(rows: &[serde_json::Value]) -> Result<(f64, f64), String> {
+	if rows.len() != ADR585_PAIRS * 2 + 1 {
+		return Err(format!(
+			"ADR 595 re-evaluation requires {} rows (warmup and five pairs), found {}",
+			ADR585_PAIRS * 2 + 1,
+			rows.len()
+		));
+	}
+	let mut intervals = Vec::with_capacity(rows.len());
+	for (index, row) in rows.iter().enumerate() {
+		let launch = row
+			.get("driver_launch_unix_ms")
+			.and_then(serde_json::Value::as_f64)
+			.filter(|value| value.is_finite());
+		let returned = row
+			.get("driver_return_unix_ms")
+			.and_then(serde_json::Value::as_f64)
+			.filter(|value| value.is_finite());
+		match (launch, returned) {
+			(Some(launch), Some(returned)) if launch < returned => {
+				intervals.push((launch, returned))
+			}
+			(Some(_), Some(_)) => {
+				return Err(format!("ADR 595 row {index} returns before it launches"));
+			}
+			_ => {
+				return Err(format!(
+					"ADR 595 row {index} lacks a finite driver_launch_unix_ms or driver_return_unix_ms"
+				));
+			}
+		}
+	}
+	let mut ordered = intervals.clone();
+	ordered.sort_by(|a, b| a.0.total_cmp(&b.0));
+	if ordered.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+		return Err("ADR 595 child intervals overlap".to_string());
+	}
+	Ok((ordered[0].0, ordered.last().expect("eleven rows").1))
+}
+
+fn adr595_stamp(summary: &mut serde_json::Value) {
+	adr594_stamp(summary);
+	summary["adr594_reference_steady_pair_band_ms"] = serde_json::json!({
+		"inner_1_sizing_scan": 200.0,
+		"inner_1_partition_sizing": 266.0,
+		"inner_1_build_write": 880.0,
+		"runtime_prep_inner_1": 1345.0,
+	});
+}
+
+const ADR595_DRIVER: LifecycleDriverSpec = LifecycleDriverSpec {
+	label: "ADR 595",
+	default_output_dir: "target/tpch/adr595-q21-inner-1",
+	tags: ("adr594_arm", "adr594_pair", "adr594_pair_position"),
+	kind: "adr595_q21_inner_1_decomposition_separated_launch",
+	evaluate: evaluate_adr594_pairs,
+	stamp: adr595_stamp,
+	separated_launch: true,
+};
+
+fn adr595_q21_inner_1_command(args: &[String]) -> ExitCode {
+	match run_lifecycle_decomposition_driver(args, &ADR595_DRIVER) {
+		Ok(summary) => {
+			println!("{summary}");
+			ExitCode::SUCCESS
+		}
+		Err(message) => harness_error(&message),
+	}
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1763,6 +2228,7 @@ const ADR594_DRIVER: LifecycleDriverSpec = LifecycleDriverSpec {
 	kind: "adr594_q21_inner_1_decomposition",
 	evaluate: evaluate_adr594_pairs,
 	stamp: adr594_stamp,
+	separated_launch: false,
 };
 
 fn adr594_q21_inner_1_command(args: &[String]) -> ExitCode {
@@ -11303,7 +11769,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|perf-board-replay|adr592-revalidate|adr593-journal-recheck|adr584-q21-attribution|adr585-q21-decomposition|adr594-q21-inner-1|adr594-reevaluate|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|perf-board-replay|adr592-revalidate|adr593-journal-recheck|adr584-q21-attribution|adr585-q21-decomposition|adr594-q21-inner-1|adr595-q21-inner-1|adr595-reevaluate|adr594-reevaluate|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -12552,6 +13018,450 @@ mod tests {
 		);
 		assert_eq!(summary["owner"]["leading_residual"], "inner_1_residual");
 		assert!(summary["owner"]["median_scaled_ms"].as_f64().unwrap() < 500.0);
+	}
+
+	use toron_tpch::host_readings::{JournalCollection, JournalEntry, JournalState};
+
+	fn adr595_launch() -> Adr595Launch {
+		Adr595Launch {
+			launcher_session_id: "2300".to_string(),
+			boot_id: "882b9409-f9d4-4b4e-b2ca-bffc1de1f891".to_string(),
+			attempt_token: "t0k3n".to_string(),
+			launch_unix_ms: 100_000.0,
+			delay_seconds: 120.0,
+			timer_unit: Some("adr595-inner-1.timer".to_string()),
+			timer_last_trigger_unix_ms: Some(220_000.0),
+			driver_start_unix_ms: 220_500.0,
+		}
+	}
+
+	fn adr595_entry(ms: f64, source: &str, message: &str, boot: &str) -> JournalEntry {
+		JournalEntry {
+			realtime_us: (ms * 1000.0) as u64,
+			monotonic_us: None,
+			boot_id: Some(boot.to_string()),
+			source: Some(source.to_string()),
+			message: message.to_string(),
+		}
+	}
+
+	fn adr595_collection(
+		state: JournalState,
+		since: f64,
+		until: f64,
+		entries: Vec<JournalEntry>,
+	) -> JournalCollection {
+		JournalCollection {
+			since_unix_ms: since,
+			until_unix_ms: until,
+			state,
+			entries,
+			malformed_records: 0,
+			bytes_read: 0,
+			entry_cap: 2000,
+			byte_cap: 1 << 24,
+			duration_bound_ms: 30_000,
+			command: String::new(),
+		}
+	}
+
+	// ADR 595: separation is verified only from a collected collection covering the interval,
+	// with the launcher's logout on this boot before the first child; every other case is
+	// failed or unknown, and a logout outside the collected bounds is unknown, not verified.
+	#[test]
+	fn adr595_separation_verdicts_cover_every_placement_and_collection_state() {
+		let launch = adr595_launch();
+		let first = 221_000.0;
+		let last = 360_000.0;
+		let logout = |ms: f64| {
+			adr595_entry(
+				ms,
+				"systemd-logind.service",
+				"Session 2300 logged out. Waiting for processes to exit.",
+				"882b9409f9d44b4eb2cabffc1de1f891",
+			)
+		};
+		let verdict = |collection: &JournalCollection| {
+			adr595_launch_verdicts(&launch, collection, first, last).separation["verdict"].clone()
+		};
+		let full = |entries: Vec<JournalEntry>| {
+			adr595_collection(JournalState::Collected, 99_000.0, 361_000.0, entries)
+		};
+		assert_eq!(verdict(&full(vec![logout(100_500.0)])), "verified");
+		assert_eq!(
+			verdict(&full(vec![logout(250_000.0)])),
+			"failed",
+			"inside the window"
+		);
+		assert_eq!(
+			verdict(&full(vec![logout(370_000.0)])),
+			"failed",
+			"after the window"
+		);
+		assert_eq!(
+			verdict(&full(vec![])),
+			"failed",
+			"absent from a collected collection"
+		);
+		// The entry must be logind's own: the same text from another source is not evidence.
+		let sshd_text = adr595_entry(
+			100_500.0,
+			"ssh.service",
+			"Session 2300 logged out. Waiting for processes to exit.",
+			"882b9409f9d44b4eb2cabffc1de1f891",
+		);
+		assert_eq!(verdict(&full(vec![sshd_text])), "failed", "wrong source");
+		// An entry without a boot id is not evidence either.
+		let mut no_boot = logout(100_500.0);
+		no_boot.boot_id = None;
+		assert_eq!(verdict(&full(vec![no_boot])), "failed", "missing boot id");
+		// A logout before the separation interval is another launch's, not this one's.
+		assert_eq!(
+			verdict(&full(vec![logout(50_000.0)])),
+			"failed",
+			"too early"
+		);
+		// A malformed launcher boot id verifies nothing.
+		let mut malformed = adr595_launch();
+		malformed.boot_id = "not-a-boot-id".to_string();
+		let verdicts =
+			adr595_launch_verdicts(&malformed, &full(vec![logout(100_500.0)]), first, last);
+		assert_eq!(verdicts.separation["verdict"], "unknown");
+		assert!(
+			verdicts.separation["reason"]
+				.as_str()
+				.unwrap()
+				.contains("malformed")
+		);
+		// The kernel's dashed spelling and the journal's undashed one are the same boot.
+		let mut dashed = adr595_launch();
+		dashed.boot_id = "882b9409-f9d4-4b4e-b2ca-bffc1de1f891".to_string();
+		let undashed = adr595_entry(
+			100_500.0,
+			"systemd-logind.service",
+			"Session 2300 logged out. Waiting for processes to exit.",
+			"882b9409f9d44b4eb2cabffc1de1f891",
+		);
+		let verdicts = adr595_launch_verdicts(&dashed, &full(vec![undashed]), first, last);
+		assert_eq!(
+			verdicts.separation["verdict"], "verified",
+			"{}",
+			verdicts.separation
+		);
+		// The logout entry from another boot does not count.
+		let other_boot = adr595_entry(
+			100_500.0,
+			"systemd-logind.service",
+			"Session 2300 logged out. Waiting for processes to exit.",
+			"11111111222233334444555555555555",
+		);
+		assert_eq!(verdict(&full(vec![other_boot])), "failed");
+		// Bounds that start after the launch instant leave the logout outside them: unknown.
+		let late_bounds = adr595_collection(
+			JournalState::Collected,
+			220_000.0,
+			361_000.0,
+			vec![logout(100_500.0)],
+		);
+		assert_eq!(verdict(&late_bounds), "unknown");
+		for state in [
+			JournalState::Truncated("entry cap".to_string()),
+			JournalState::Degraded("1 malformed".to_string()),
+			JournalState::Unavailable("journalctl exited 1".to_string()),
+		] {
+			let collection =
+				adr595_collection(state.clone(), 99_000.0, 361_000.0, vec![logout(100_500.0)]);
+			assert_eq!(verdict(&collection), "unknown", "{state:?}");
+		}
+	}
+
+	#[test]
+	fn adr595_window_verdicts_name_session_events_and_need_complete_coverage() {
+		let launch = adr595_launch();
+		let first = 221_000.0;
+		let last = 360_000.0;
+		let logout = adr595_entry(
+			100_500.0,
+			"systemd-logind.service",
+			"Session 2300 logged out.",
+			"882b9409f9d44b4eb2cabffc1de1f891",
+		);
+		let clean = adr595_collection(
+			JournalState::Collected,
+			99_000.0,
+			361_000.0,
+			vec![
+				logout.clone(),
+				adr595_entry(
+					300_000.0,
+					"kernel",
+					"[UFW BLOCK] ...",
+					"882b9409f9d44b4eb2cabffc1de1f891",
+				),
+			],
+		);
+		let verdicts = adr595_launch_verdicts(&launch, &clean, first, last);
+		assert_eq!(verdicts.window["verdict"], "verified");
+		assert_eq!(
+			verdicts.window["session_events"].as_array().unwrap().len(),
+			0
+		);
+		let churn = adr595_collection(
+			JournalState::Collected,
+			99_000.0,
+			361_000.0,
+			vec![
+				logout.clone(),
+				adr595_entry(
+					300_000.0,
+					"ssh.service",
+					"Accepted publickey for me from 192.168.0.5",
+					"882b9409f9d44b4eb2cabffc1de1f891",
+				),
+			],
+		);
+		let verdicts = adr595_launch_verdicts(&launch, &churn, first, last);
+		assert_eq!(verdicts.window["verdict"], "failed");
+		assert_eq!(
+			verdicts.window["session_events"].as_array().unwrap().len(),
+			1
+		);
+		for state in [
+			JournalState::Truncated("entry cap".to_string()),
+			JournalState::Degraded("1 malformed".to_string()),
+			JournalState::Unavailable("journalctl exited 1".to_string()),
+		] {
+			let collection =
+				adr595_collection(state.clone(), 99_000.0, 361_000.0, vec![logout.clone()]);
+			let verdicts = adr595_launch_verdicts(&launch, &collection, first, last);
+			assert_eq!(verdicts.window["verdict"], "unknown", "{state:?}");
+		}
+		// Bounds ending before the last return: unknown even with no events.
+		let short = adr595_collection(JournalState::Collected, 99_000.0, 350_000.0, vec![logout]);
+		let verdicts = adr595_launch_verdicts(&launch, &short, first, last);
+		assert_eq!(verdicts.window["verdict"], "unknown");
+	}
+
+	// ADR 595: precedence withholds the owner with the named status and keeps the rule's
+	// outcome beside it; a verified pair leaves the owner alone.
+	#[test]
+	fn adr595_precedence_withholds_the_owner_unless_both_intervals_are_verified() {
+		let resolved =
+			|| serde_json::json!({"owner": {"status": "resolved", "term": "inner_1_build_write"}});
+		let v = |sep: &str, win: &str| Adr595Verdicts {
+			separation: serde_json::json!({"verdict": sep}),
+			window: serde_json::json!({"verdict": win}),
+		};
+		let mut summary = resolved();
+		adr595_apply_launch_precedence(&mut summary, &v("verified", "verified"));
+		assert_eq!(summary["owner"]["status"], "resolved");
+		for (sep, win, expected) in [
+			("failed", "verified", "withheld_launch_separation_failed"),
+			("unknown", "verified", "withheld_launch_separation_unknown"),
+			("verified", "failed", "withheld_window_not_clean_failed"),
+			("verified", "unknown", "withheld_window_not_clean_unknown"),
+			("failed", "failed", "withheld_launch_separation_failed"),
+		] {
+			let mut summary = resolved();
+			adr595_apply_launch_precedence(&mut summary, &v(sep, win));
+			assert_eq!(summary["owner"]["status"], expected, "{sep}/{win}");
+			assert_eq!(
+				summary["owner"]["rule_outcome_withheld"]["term"],
+				"inner_1_build_write"
+			);
+		}
+	}
+
+	// ADR 595: a late trigger or a late driver start is refused; a missing trigger is refused.
+	#[test]
+	fn adr595_late_starts_are_refused_and_the_boot_is_bound() {
+		let launch = adr595_launch();
+		adr595_check_late_start("ADR 595", &launch).expect("on time");
+		let mut late_trigger = adr595_launch();
+		late_trigger.timer_last_trigger_unix_ms = Some(260_000.0);
+		let error = adr595_check_late_start("ADR 595", &late_trigger).unwrap_err();
+		assert!(error.contains("timer triggered"), "{error}");
+		let mut late_driver = adr595_launch();
+		late_driver.driver_start_unix_ms = 260_000.0;
+		let error = adr595_check_late_start("ADR 595", &late_driver).unwrap_err();
+		assert!(error.contains("driver started"), "{error}");
+		let mut no_trigger = adr595_launch();
+		no_trigger.timer_last_trigger_unix_ms = None;
+		assert!(
+			adr595_check_late_start("ADR 595", &no_trigger)
+				.unwrap_err()
+				.contains("last trigger")
+		);
+		assert_eq!(adr595_parse_systemd_timestamp("n/a"), None);
+		assert_eq!(adr595_parse_systemd_timestamp(""), None);
+		let parsed = adr595_parse_systemd_timestamp("@1789561508").unwrap();
+		assert!((parsed - 1_789_561_508_000.0).abs() < 1.0, "{parsed}");
+	}
+
+	// ADR 595: the workstation's wait accepts only this attempt's token; a probe, a stale
+	// record, and a foreign token are ignored, and the deadline ends the wait with nothing.
+	#[test]
+	fn adr595_the_completion_wait_accepts_only_this_attempts_token() {
+		use std::net::UdpSocket;
+		let script = concat!(
+			env!("CARGO_MANIFEST_DIR"),
+			"/scripts/adr595_wait_completion.py"
+		);
+		let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+		let port = probe.local_addr().unwrap().port();
+		drop(probe);
+		let deadline = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_millis() as f64
+			+ 8_000.0;
+		let mut child = std::process::Command::new("python3")
+			.args([
+				script,
+				"--bind",
+				"127.0.0.1",
+				"--port",
+				&port.to_string(),
+				"--token",
+				"attempt-42",
+				"--deadline-unix-ms",
+				&format!("{deadline}"),
+			])
+			.stdout(std::process::Stdio::piped())
+			.stderr(std::process::Stdio::piped())
+			.spawn()
+			.expect("python3 runs the wait");
+		std::thread::sleep(std::time::Duration::from_millis(400));
+		let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+		let target = format!("127.0.0.1:{port}");
+		sender
+			.send_to(b"adr595 token=probe result=probe\n", &target)
+			.unwrap();
+		sender
+			.send_to(
+				b"adr595 token=attempt-41 result=success exit_code=exited\n",
+				&target,
+			)
+			.unwrap();
+		std::thread::sleep(std::time::Duration::from_millis(200));
+		assert!(
+			child.try_wait().unwrap().is_none(),
+			"foreign tokens do not end the wait"
+		);
+		sender
+			.send_to(
+				b"adr595 token=attempt-42 result=success exit_code=exited exit_status=0\n",
+				&target,
+			)
+			.unwrap();
+		let output = child.wait_with_output().unwrap();
+		assert!(output.status.success(), "{:?}", output);
+		let stdout = String::from_utf8_lossy(&output.stdout);
+		assert!(
+			stdout.contains("token=attempt-42") && stdout.contains("received_unix_ms="),
+			"{stdout}"
+		);
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		assert_eq!(stderr.matches("ignored datagram").count(), 2, "{stderr}");
+		// The deadline: no datagram, exit 1, nothing on stdout.
+		let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+		let port = probe.local_addr().unwrap().port();
+		drop(probe);
+		let soon = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_millis() as f64
+			+ 600.0;
+		let output = std::process::Command::new("python3")
+			.args([
+				script,
+				"--bind",
+				"127.0.0.1",
+				"--port",
+				&port.to_string(),
+				"--token",
+				"attempt-43",
+				"--deadline-unix-ms",
+				&format!("{soon}"),
+			])
+			.output()
+			.unwrap();
+		assert_eq!(output.status.code(), Some(1));
+		assert!(output.stdout.is_empty());
+	}
+
+	// ADR 595: the re-evaluation's window comes from all eleven rows' stamps, ordered and
+	// complete; a missing first launch or last return is refused, never a narrower window.
+	#[test]
+	fn adr595_the_reevaluation_window_requires_every_stamp() {
+		let rows = |n: usize| -> Vec<serde_json::Value> {
+			(0..n)
+				.map(|i| {
+					serde_json::json!({
+						"warmup": i == 0,
+						"driver_launch_unix_ms": 1000.0 + i as f64 * 100.0,
+						"driver_return_unix_ms": 1050.0 + i as f64 * 100.0,
+					})
+				})
+				.collect()
+		};
+		assert_eq!(
+			adr595_window_from_rows(&rows(11)).unwrap(),
+			(1000.0, 2050.0)
+		);
+		assert!(
+			adr595_window_from_rows(&rows(10))
+				.unwrap_err()
+				.contains("requires 11 rows")
+		);
+		let mut missing_first = rows(11);
+		missing_first[0]
+			.as_object_mut()
+			.unwrap()
+			.remove("driver_launch_unix_ms");
+		assert!(
+			adr595_window_from_rows(&missing_first)
+				.unwrap_err()
+				.contains("row 0 lacks")
+		);
+		let mut missing_last = rows(11);
+		missing_last[10]["driver_return_unix_ms"] = serde_json::Value::Null;
+		assert!(
+			adr595_window_from_rows(&missing_last)
+				.unwrap_err()
+				.contains("row 10 lacks")
+		);
+		let mut inverted = rows(11);
+		inverted[3]["driver_return_unix_ms"] = serde_json::json!(1200.0);
+		assert!(
+			adr595_window_from_rows(&inverted)
+				.unwrap_err()
+				.contains("returns before")
+		);
+		let mut overlapping = rows(11);
+		overlapping[4]["driver_launch_unix_ms"] = serde_json::json!(1340.0);
+		assert!(
+			adr595_window_from_rows(&overlapping)
+				.unwrap_err()
+				.contains("overlap")
+		);
+		assert_eq!(
+			adr595_parse_boot_id("882b9409-f9d4-4b4e-b2ca-bffc1de1f891").as_deref(),
+			Some("882b9409f9d44b4eb2cabffc1de1f891")
+		);
+		assert_eq!(
+			adr595_parse_boot_id("882B9409F9D44B4EB2CABFFC1DE1F891").as_deref(),
+			Some("882b9409f9d44b4eb2cabffc1de1f891")
+		);
+		for bad in [
+			"",
+			"882b9409",
+			"882b9409-f9d4-4b4e-b2ca-bffc1de1f89",
+			"zz2b9409-f9d4-4b4e-b2ca-bffc1de1f891",
+			"882b9409f9d44b4eb2cabffc1de1f891x",
+		] {
+			assert_eq!(adr595_parse_boot_id(bad), None, "{bad:?}");
+		}
 	}
 
 	// The spilled branch reads through the band too, with its completed write.

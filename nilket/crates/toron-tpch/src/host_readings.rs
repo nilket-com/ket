@@ -294,7 +294,7 @@ pub const JOURNAL_MESSAGE_CHARS: usize = 200;
 /// Bytes of journal output read before the collection is cut off, independent of the entry cap.
 pub const JOURNAL_BYTE_CAP: usize = 16 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct JournalEntry {
 	pub realtime_us: u64,
 	pub monotonic_us: Option<u64>,
@@ -305,7 +305,7 @@ pub struct JournalEntry {
 
 /// What happened to the collection. `Collected` is claimed only when the command ran to
 /// completion inside every bound and every record parsed; anything less is named.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state", content = "detail")]
 pub enum JournalState {
 	Collected,
@@ -318,7 +318,7 @@ pub enum JournalState {
 	Unavailable(String),
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct JournalCollection {
 	pub since_unix_ms: f64,
 	pub until_unix_ms: f64,

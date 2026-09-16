@@ -1,6 +1,16 @@
 # ADR 595 - q21's replay-1 preparation on strix, again: the same decomposition under a verifiably separated launch
 
-**Status:** PROPOSED. Successor to ADR 594, which closed on the variability
+**Status:** CLOSED, OWNER RESOLVED. One run on strix under the separated
+launch (results in
+`plans/impl/0595_q21_inner_1_decomposition_separated_launch_results.md`):
+the launcher's logout 123.3 s before the first child, zero session events
+in the window, off range 45.6 ms (0.51%) inside the cutoff, and ADR 594's
+rule resolving `inner_1_build_write` at 876.4 ms (9.73%), 613 ms ahead of
+the partition sizing. The driver's recorded separation verdict was
+`failed` by an instrument defect (the boot id compared in two spellings),
+fixed in the closing commit and re-evaluated to `verified` on the
+retained collection; both are recorded. Successor: the build write's
+decomposition. Successor to ADR 594, which closed on the variability
 cutoff with the band reconciled and the branch facts established.
 
 
@@ -54,15 +64,20 @@ record, beside the delay; the driver reads the timer's actual trigger
 (`LastTriggerUSec`) at its own start for the late-start check, so the
 coverage instant and the activation instant are two records, not one.
 The driver stamps them all on the summary, refuses to run if its own
-boot id differs from the launcher's, and collects the journal not from
+boot id differs from the launcher's (the ids compared as hex digits,
+since the kernel spells the id with dashes and the journal without),
+and collects the journal not from
 the first child's launch but from `ADR595_LAUNCH_UNIX_MS − 1 s` through
 the last child's return `+ 1 s`, so the launcher's logout, which falls
 in the delay before the first child, is inside the collection. Two intervals are then checked
 separately, each on its own coverage: the **separation interval**
-`[scheduled − 1 s, first child's launch)`, in which the logind "Session
-N logged out" entry for the launcher's id, on the same boot id, must
-appear and its timestamp must precede the first child's
-`driver_launch_unix_ms` (both quoted); and the **measurement window**
+`[launch − 1 s, first child's launch)`, in which logind's own "Session
+N logged out" entry for the launcher's id (source
+`systemd-logind.service`, with a well-formed boot id equal to the
+launcher's) must appear inside the interval and inside the collection's
+bounds, its timestamp preceding the first child's `driver_launch_unix_ms`
+(both quoted); an entry from another source, without a boot id, or
+before the interval is not this launch's evidence; and the **measurement window**
 `[first launch − 1 s, last return + 1 s]`, in which no login-session
 entry — `sshd`, `systemd-logind`, a `session-*.scope`, or `init.scope`
 session start or stop — may appear. Each interval's verdict is `verified`,
