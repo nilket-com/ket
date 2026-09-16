@@ -2,7 +2,7 @@ use super::*;
 use ahash::RandomState;
 use twox_hash::XxHash3_64;
 
-const JOIN_SPILL_PAGE_SIZE: usize = 64 * 1024;
+pub(in crate::exec) const JOIN_SPILL_PAGE_SIZE: usize = 64 * 1024;
 const JOIN_SPILL_CACHE_TARGET_BYTES: u64 = 8 * 1024 * 1024;
 const COMPACT_SPILL_INDEX_MAX_RETAINED_CAP_OVERSHOOT_BYTES: u64 = 1024 * 1024;
 const COMPACT_SPILL_INDEX_MAX_INPUT_ROWS: u64 = 20_000_000;
@@ -1427,6 +1427,26 @@ impl BuildWriteTermination {
 	}
 }
 
+/// ADR 597: how the spilled build's writer treats an Exchange on its scan input. `Split` is
+/// today's loop — `repartition_exchange_batch` per batch, each non-empty piece to the chunk
+/// writer, the partition index discarded. `PassThrough` hands each batch to the chunk writer
+/// whole; it is taken only under the admission the writer checks, and falls back to `Split`
+/// with the refusal recorded otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::exec) enum ExchangeHandling {
+	Split,
+	PassThrough,
+}
+
+impl ExchangeHandling {
+	pub(in crate::exec) const fn name(self) -> &'static str {
+		match self {
+			Self::Split => "split",
+			Self::PassThrough => "pass_through",
+		}
+	}
+}
+
 /// ADR 596: a local accumulator for the spilled build's write, threaded as `Option<&mut>`
 /// through the writer on replay 1's streamed-scan path only and `None` everywhere else. The
 /// ledger is never locked; the caller publishes it once when the branch completes. Facts follow
@@ -1459,6 +1479,21 @@ pub(in crate::exec) struct BuildWriteLedger {
 	pub(in crate::exec) ciphertext_bytes: u64,
 	pub(in crate::exec) index_entries: u64,
 	pub(in crate::exec) index_compactions: u64,
+	/// ADR 597: how the Exchange was handled (`None` when the input carries none), whether
+	/// pass-through was requested, and why it was refused when it was.
+	pub(in crate::exec) exchange_handling: Option<ExchangeHandling>,
+	pub(in crate::exec) pass_through_requested: bool,
+	pub(in crate::exec) pass_through_refusal: Option<&'static str>,
+	/// ADR 597: the writer's transient peaks, recorded and not guarded — the obtained
+	/// capacities of the two scratch buffers, the plaintext high-water mark the guard reads,
+	/// and the largest resident-state total seen at a guard site.
+	pub(in crate::exec) scratch_plaintext_capacity_peak: u64,
+	pub(in crate::exec) scratch_refs_capacity_peak: u64,
+	pub(in crate::exec) writer_peak_bytes: u64,
+	pub(in crate::exec) resident_state_peak_bytes: u64,
+	/// ADR 597: the write guard's scratch releases — the guard's answer to a resident total
+	/// over the cap is to drop the scratch and re-check, not to refuse on the page's size.
+	pub(in crate::exec) scratch_releases: u64,
 }
 
 impl BuildWriteLedger {
@@ -1512,7 +1547,50 @@ impl BuildWriteLedger {
 			"ciphertext_bytes": self.ciphertext_bytes,
 			"index_entries": self.index_entries,
 			"index_compactions": self.index_compactions,
+			"exchange_handling": self.exchange_handling.map_or("none", ExchangeHandling::name),
+			"pass_through_requested": self.pass_through_requested,
+			"pass_through_refusal": self.pass_through_refusal,
+			"scratch_plaintext_capacity_peak": self.scratch_plaintext_capacity_peak,
+			"scratch_refs_capacity_peak": self.scratch_refs_capacity_peak,
+			"writer_peak_bytes": self.writer_peak_bytes,
+			"resident_state_peak_bytes": self.resident_state_peak_bytes,
+			"scratch_releases": self.scratch_releases,
 		})
+	}
+
+	/// The same observation after `finish`, from the build's accessors.
+	pub(in crate::exec) fn observe_peaks_after_finish(
+		&mut self,
+		plaintext_capacity: usize,
+		refs_capacity: usize,
+		writer_peak: u64,
+		resident_total: u64,
+	) {
+		self.observe_peaks(
+			plaintext_capacity,
+			refs_capacity,
+			writer_peak,
+			resident_total,
+		);
+	}
+
+	/// Record the writer's transient peaks after a page: capacities as obtained, the plaintext
+	/// high-water mark, and the resident total the guard just read.
+	fn observe_peaks(
+		&mut self,
+		plaintext_capacity: usize,
+		refs_capacity: usize,
+		writer_peak: u64,
+		resident_total: u64,
+	) {
+		self.scratch_plaintext_capacity_peak = self
+			.scratch_plaintext_capacity_peak
+			.max(u64::try_from(plaintext_capacity).unwrap_or(u64::MAX));
+		self.scratch_refs_capacity_peak = self
+			.scratch_refs_capacity_peak
+			.max(u64::try_from(refs_capacity).unwrap_or(u64::MAX));
+		self.writer_peak_bytes = self.writer_peak_bytes.max(writer_peak);
+		self.resident_state_peak_bytes = self.resident_state_peak_bytes.max(resident_total);
 	}
 }
 
@@ -1564,6 +1642,8 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	next_offset: u64,
 	scratch_plaintext: Vec<u8>,
 	scratch_refs: Vec<(JoinKey, u32)>,
+	/// ADR 597: how many times the write guard released the scratch instead of refusing.
+	write_scratch_releases: u64,
 	resident_baseline_bytes: u64,
 	throughput_profile: Option<Box<StreamedSpilledLeftOuterProfile>>,
 }
@@ -1727,6 +1807,7 @@ impl SpilledInnerJoinBuild {
 			compact_index_rescue_enabled: false,
 			next_offset: 0,
 			scratch_plaintext: Vec::new(),
+			write_scratch_releases: 0,
 			scratch_refs: Vec::new(),
 			resident_baseline_bytes,
 			throughput_profile,
@@ -2460,6 +2541,21 @@ impl SpilledInnerJoinBuild {
 						message: "coalesced indexed-flush page count overflowed".to_string(),
 					})?;
 		}
+		// ADR 597: the transient peaks as the guard is about to read them — the capacities the
+		// scratch obtained, the plaintext high-water mark, the resident total — before the guard
+		// may release the scratch; a release is counted.
+		if let Some(ledger) = ledger.as_deref_mut() {
+			let refs_capacity = self.scratch_refs.capacity();
+			let plaintext_capacity = self.scratch_plaintext.capacity();
+			let resident_total = self.resident_state().total();
+			ledger.observe_peaks(
+				plaintext_capacity,
+				refs_capacity,
+				self.writer_peak,
+				resident_total,
+			);
+		}
+		let releases_before = self.write_scratch_releases;
 		self.guard_resident_state_after_write(task_budget.memory.get())?;
 		if index_rows {
 			self.indexed_flush_guard_checks = self
@@ -2471,6 +2567,9 @@ impl SpilledInnerJoinBuild {
 		}
 		BuildWriteLedger::finish(&mut ledger, BuildWriteChild::Index, index_started);
 		if let Some(ledger) = ledger {
+			ledger.scratch_releases = ledger
+				.scratch_releases
+				.saturating_add(self.write_scratch_releases.saturating_sub(releases_before));
 			if index_rows {
 				ledger.index_entries = ledger.index_entries.saturating_add(keyed_rows);
 			}
@@ -2818,6 +2917,7 @@ impl SpilledInnerJoinBuild {
 		self.scratch_plaintext = Vec::new();
 		self.scratch_refs = Vec::new();
 		self.writer_peak = 0;
+		self.write_scratch_releases = self.write_scratch_releases.saturating_add(1);
 	}
 
 	/// Proves that every keyed row accepted by the coalesced writer is represented in the resident
@@ -2957,6 +3057,24 @@ impl SpilledInnerJoinBuild {
 			self.release_write_scratch();
 		}
 		self.guard_resident_state(memory_cap, SpillResidentGuardSite::Write)
+	}
+
+	/// ADR 597: the resident total the guards read, for the ledger's peak after `finish`.
+	pub(in crate::exec) fn resident_state_total(&self) -> u64 {
+		self.resident_state().total()
+	}
+
+	/// ADR 597: the writer's scratch capacities as obtained, for the ledger after `finish`.
+	pub(in crate::exec) fn write_scratch_capacities(&self) -> (usize, usize) {
+		(
+			self.scratch_plaintext.capacity(),
+			self.scratch_refs.capacity(),
+		)
+	}
+
+	#[cfg(test)]
+	pub(in crate::exec) fn spill_path(&self) -> &std::path::Path {
+		&self.path
 	}
 
 	fn resident_state(&self) -> SpillResidentState {

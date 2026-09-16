@@ -129,6 +129,8 @@ async fn run() -> ExitCode {
 		"adr585-q21-decomposition" => adr585_q21_decomposition_command(&args),
 		"adr594-q21-inner-1" => adr594_q21_inner_1_command(&args),
 		"adr595-q21-inner-1" => adr595_q21_inner_1_command(&args),
+		"adr597-q21-exchange-skip" => adr597_q21_exchange_skip_command(&args),
+		"adr597-reevaluate" => adr597_reevaluate_command(&args),
 		"adr596-q21-build-write" => adr596_q21_build_write_command(&args),
 		"adr596-reevaluate" => adr596_reevaluate_command(&args),
 		"adr595-reevaluate" => adr595_reevaluate_command(&args),
@@ -1545,6 +1547,21 @@ struct LifecycleDriverSpec {
 	/// id or a late start, collects the journal from the launch instant, and withholds the
 	/// owner unless both the separation interval and the measurement window are verified.
 	separated_launch: bool,
+	/// ADR 597: what the two arms are — one executable profiled off/on, or two executables
+	/// (control and treatment) both unprofiled — and the summary field the cutoff and the
+	/// launch precedence act on (`owner` for an attribution, `verdict` for a retention).
+	arms: LifecycleArms,
+	outcome_field: &'static str,
+}
+
+/// ADR 597: the arms of a lifecycle driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecycleArms {
+	/// One executable, the on arm profiled (ADR 585's pattern); one warmup, five pairs.
+	ProfilingOnOff,
+	/// Two executables from one recipe, both unprofiled (ADR 588's pattern); one warmup per
+	/// executable, control first, then five alternating pairs — twelve rows.
+	TwoExecutables,
 }
 
 fn adr585_stamp(summary: &mut serde_json::Value) {
@@ -1561,6 +1578,8 @@ const ADR585_DRIVER: LifecycleDriverSpec = LifecycleDriverSpec {
 	evaluate: evaluate_adr585_pairs,
 	stamp: adr585_stamp,
 	separated_launch: false,
+	arms: LifecycleArms::ProfilingOnOff,
+	outcome_field: "owner",
 };
 
 fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, String> {
@@ -1667,24 +1686,44 @@ fn run_lifecycle_decomposition_driver(
 	std::fs::create_dir_all(output_dir.join("profiles"))
 		.map_err(|error| format!("create {label} profile directory: {error}"))?;
 
-	let (warmup, rows) = adr592_run_paired_children(
-		spec.tags,
-		ADR585_PAIRS,
-		&coordinate,
-		&journal,
-		|run_index, warmup, on| {
-			run_adr585_child(
-				run_index,
-				warmup,
-				on,
-				mode,
-				sf,
-				data_source,
-				&data_dir,
-				&output_dir,
-			)
-		},
-	)?;
+	// ADR 597: two executables, both unprofiled, or one executable profiled off/on.
+	let two_executables = match spec.arms {
+		LifecycleArms::TwoExecutables => Some(adr597_load_arms(label, args, &identity)?),
+		LifecycleArms::ProfilingOnOff => None,
+	};
+	let (warmups, rows) = match &two_executables {
+		Some(arms) => adr597_run_children(
+			spec.tags,
+			ADR585_PAIRS,
+			&coordinate,
+			arms,
+			&journal,
+			|run_index, warmup, arm| {
+				run_adr597_child(arm, run_index, warmup, mode, sf, data_source, &data_dir)
+			},
+		)?,
+		None => {
+			let (warmup, rows) = adr592_run_paired_children(
+				spec.tags,
+				ADR585_PAIRS,
+				&coordinate,
+				&journal,
+				|run_index, warmup, on| {
+					run_adr585_child(
+						run_index,
+						warmup,
+						on,
+						mode,
+						sf,
+						data_source,
+						&data_dir,
+						&output_dir,
+					)
+				},
+			)?;
+			(vec![warmup], rows)
+		}
+	};
 	let host_end = observe_host_quiescence();
 	if !host_end.quiescent() || !directory_is_empty(&scratch)? {
 		return Err(format!(
@@ -1692,7 +1731,7 @@ fn run_lifecycle_decomposition_driver(
 		));
 	}
 	// ADR 593: the journal is collected once, after every child and a settle, then joined.
-	let all_rows: Vec<&serde_json::Value> = std::iter::once(&warmup).chain(rows.iter()).collect();
+	let all_rows: Vec<&serde_json::Value> = warmups.iter().chain(rows.iter()).collect();
 	let first_launch = all_rows
 		.iter()
 		.filter_map(|row| {
@@ -1718,13 +1757,21 @@ fn run_lifecycle_decomposition_driver(
 		toron_tpch::host_readings::collect_journal(collection_since, last_return + 1000.0);
 	let host_journal = adr593_join_journal_and_gaps(&all_rows, &collection);
 	let mut summary = (spec.evaluate)(&rows)?;
-	adr593_apply_variability_bound(&mut summary)?;
+	adr593_apply_variability_bound_on(&mut summary, spec.outcome_field)?;
 	if let Some(launch) = &launch {
 		let verdicts = adr595_launch_verdicts(launch, &collection, first_launch, last_return);
-		adr595_apply_launch_precedence(&mut summary, &verdicts);
+		adr595_apply_launch_precedence_on(&mut summary, &verdicts, spec.outcome_field);
 		summary["separated_launch"] = serde_json::json!(launch);
 		summary["launch_separation"] = verdicts.separation;
 		summary["measurement_window"] = verdicts.window;
+	}
+	if let Some(arms) = &two_executables {
+		summary["identities"] = serde_json::json!({
+			"control": arms.control.manifest.json_value_for_executable(&arms.control.manifest.toron),
+			"treatment": arms.treatment.manifest.json_value_for_executable(&arms.treatment.manifest.toron),
+			"control_manifest": arms.control.manifest_path.display().to_string(),
+			"treatment_manifest": arms.treatment.manifest_path.display().to_string(),
+		});
 	}
 	summary["driver_scope"] = serde_json::json!(driver_scope);
 	summary["start_gate"] = start_gate;
@@ -1742,9 +1789,365 @@ fn run_lifecycle_decomposition_driver(
 	summary["memory_per_task"] = serde_json::json!(budget.memory_per_task);
 	summary["spill_bytes_reserved"] = serde_json::json!(budget.spill_bytes_reserved);
 	summary["partition_work_concurrency_requested"] = serde_json::json!(concurrency.0);
-	summary["warmup_execute_ms"] = warmup.get("execute_ms").cloned().unwrap_or_default();
+	summary["warmup_execute_ms"] = warmups
+		.first()
+		.and_then(|warmup| warmup.get("execute_ms"))
+		.cloned()
+		.unwrap_or_default();
+	if warmups.len() > 1 {
+		summary["warmups_execute_ms"] = serde_json::json!(
+			warmups
+				.iter()
+				.map(|warmup| warmup.get("execute_ms").cloned().unwrap_or_default())
+				.collect::<Vec<_>>()
+		);
+	}
 	write_json_atomically(&output_dir.join("summary.json"), &summary)?;
 	Ok(summary)
+}
+
+// ---------------------------------------------------------------------------------------------
+// ADR 597: two executables under the lifecycle driver, twelve rows, ADR 588's retention rule.
+// ---------------------------------------------------------------------------------------------
+
+/// The two arms of a paired-executable run: loaded, hash-verified, gated as ADR 588 gates them.
+struct Adr597Arms {
+	control: Adr588Arm,
+	treatment: Adr588Arm,
+	control_expectation: Adr592ChildExpectation,
+	treatment_expectation: Adr592ChildExpectation,
+}
+
+fn adr597_load_arms(
+	label: &'static str,
+	args: &[String],
+	identity: &toron_tpch::evidence::RuntimeIdentity,
+) -> Result<Adr597Arms, String> {
+	let control_manifest = flag_value(args, "--control-manifest")
+		.ok_or_else(|| format!("{label} requires --control-manifest"))?;
+	let treatment_manifest_path = std::env::var_os(BUILD_MANIFEST_ENV)
+		.map(PathBuf::from)
+		.ok_or_else(|| format!("{label} lacks the treatment manifest path"))?;
+	let treatment = Adr588Arm::load("treatment", &treatment_manifest_path)?;
+	let control = Adr588Arm::load("control", Path::new(control_manifest))?;
+	if treatment.manifest.toron.sha256 != identity.executable.sha256 {
+		return Err(format!(
+			"{label} must be launched from the treatment executable"
+		));
+	}
+	adr588_manifest_gate(&control.manifest, &treatment.manifest)?;
+	let expectation = |arm: &Adr588Arm| Adr592ChildExpectation {
+		label,
+		instrumented: arm.manifest.clone(),
+		instrumented_manifest_path: arm.manifest_path.display().to_string(),
+		dataset_manifest_fingerprint: String::new(),
+		data_source: String::new(),
+		digest: String::new(),
+		cpu_affinity_requested: String::new(),
+	};
+	Ok(Adr597Arms {
+		control_expectation: expectation(&control),
+		treatment_expectation: expectation(&treatment),
+		control,
+		treatment,
+	})
+}
+
+/// One child from the arm's executable, unprofiled.
+fn run_adr597_child(
+	arm: &Adr588Arm,
+	run_index: u32,
+	warmup: bool,
+	mode: &str,
+	sf: f64,
+	data_source: &str,
+	data_dir: &Path,
+) -> Result<serde_json::Value, String> {
+	let mut args = vec![
+		"perf-run-one".to_string(),
+		"--engine".to_string(),
+		"toron".to_string(),
+		"--query".to_string(),
+		"q21".to_string(),
+		"--mode".to_string(),
+		mode.to_string(),
+		"--sf".to_string(),
+		sf.to_string(),
+		"--run-index".to_string(),
+		run_index.to_string(),
+		"--data-source".to_string(),
+		data_source.to_string(),
+		"--data-dir".to_string(),
+		data_dir.display().to_string(),
+	];
+	if warmup {
+		args.push("--warmup-run".to_string());
+	}
+	// The arm's own manifest and executable in the child's environment, as ADR 588's child
+	// carries them, so the row's evidence identity is the arm's and not the launcher's.
+	let envs = arm.envs();
+	let env_refs = envs
+		.iter()
+		.map(|(name, value)| (name.as_str(), value.as_str()))
+		.collect::<Vec<_>>();
+	run_perf_child_with_executable(&arm.executable, &args, &env_refs, None)
+}
+
+/// The arm's expectation for a row: the driver's coordinate (dataset, source, digest,
+/// affinity) with the arm's executable and manifest in place of the launching one.
+fn adr597_arm_expectation(
+	coordinate: &Adr592DriverCoordinate,
+	arm: &Adr592ChildExpectation,
+) -> Adr592ChildExpectation {
+	Adr592ChildExpectation {
+		label: coordinate.expectation.label,
+		instrumented: arm.instrumented.clone(),
+		instrumented_manifest_path: arm.instrumented_manifest_path.clone(),
+		dataset_manifest_fingerprint: coordinate.expectation.dataset_manifest_fingerprint.clone(),
+		data_source: coordinate.expectation.data_source.clone(),
+		digest: coordinate.expectation.digest.clone(),
+		cpu_affinity_requested: coordinate.expectation.cpu_affinity_requested.clone(),
+	}
+}
+
+/// ADR 597's twelve rows: the control's warmup, the treatment's warmup, then five pairs
+/// alternating control-treatment, treatment-control. Every row, the warmups included, is
+/// stamped with its arm's executable and validated as it returns; a failing row is journaled
+/// with its refusal and the run stops before another child is launched.
+fn adr597_run_children(
+	tags: (&str, &str, &str),
+	pairs: usize,
+	coordinate: &Adr592DriverCoordinate,
+	arms: &Adr597Arms,
+	journal: &PerfSampleJournal,
+	mut run_child: impl FnMut(u32, bool, &Adr588Arm) -> Result<serde_json::Value, String>,
+) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), String> {
+	let (arm_tag, pair_tag, position_tag) = tags;
+	let admit = |row: &mut serde_json::Value,
+	             arm: &Adr588Arm,
+	             expectation: &Adr592ChildExpectation|
+	 -> Result<(), String> {
+		let expected = adr597_arm_expectation(coordinate, expectation);
+		row["adr592_launched_manifest"] = serde_json::json!(expected.instrumented_manifest_path);
+		row["adr592_launched_executable_sha256"] = serde_json::json!(arm.manifest.toron.sha256);
+		if let Err(error) = adr592_validate_child_row(row, &expected, true) {
+			row["adr592_refusal"] = serde_json::json!(error);
+			journal.append(row)?;
+			return Err(format!("{error}; run stopped, row retained"));
+		}
+		Ok(())
+	};
+	let mut warmups = Vec::with_capacity(2);
+	for (arm, expectation, name) in [
+		(&arms.control, &arms.control_expectation, "control"),
+		(&arms.treatment, &arms.treatment_expectation, "treatment"),
+	] {
+		let launched = adr593_unix_ms();
+		let mut warmup = run_child(0, true, arm)?;
+		warmup["driver_launch_unix_ms"] = serde_json::json!(launched);
+		warmup["driver_return_unix_ms"] = serde_json::json!(adr593_unix_ms());
+		warmup[arm_tag] = serde_json::json!(name);
+		warmup[pair_tag] = serde_json::Value::Null;
+		warmup["adr597_phase"] = serde_json::json!("warmup");
+		warmup["warmup"] = serde_json::json!(true);
+		admit(&mut warmup, arm, expectation)?;
+		journal.append(&warmup)?;
+		warmups.push(warmup);
+	}
+	let mut rows = Vec::with_capacity(pairs * 2);
+	for pair in 0..pairs {
+		let order: [(&Adr588Arm, &Adr592ChildExpectation, &str); 2] = if pair % 2 == 0 {
+			[
+				(&arms.control, &arms.control_expectation, "control"),
+				(&arms.treatment, &arms.treatment_expectation, "treatment"),
+			]
+		} else {
+			[
+				(&arms.treatment, &arms.treatment_expectation, "treatment"),
+				(&arms.control, &arms.control_expectation, "control"),
+			]
+		};
+		for (position, (arm, expectation, name)) in order.into_iter().enumerate() {
+			let launched = adr593_unix_ms();
+			let mut row = run_child(pair as u32, false, arm)?;
+			row["driver_launch_unix_ms"] = serde_json::json!(launched);
+			row["driver_return_unix_ms"] = serde_json::json!(adr593_unix_ms());
+			row[arm_tag] = serde_json::json!(name);
+			row[pair_tag] = serde_json::json!(pair);
+			row[position_tag] = serde_json::json!(position);
+			row["adr597_phase"] = serde_json::json!("pairs");
+			admit(&mut row, arm, expectation)?;
+			journal.append(&row)?;
+			rows.push(row);
+		}
+	}
+	Ok((warmups, rows))
+}
+
+const ADR597_TAGS: LifecyclePairTags = LifecyclePairTags {
+	label: "ADR 597",
+	arm: "adr597_arm",
+	pair: "adr597_pair",
+	position: "adr597_pair_position",
+};
+
+/// ADR 596's off median as context for the control arm, never netted.
+const ADR597_ADR596_REFERENCE_OFF_MEDIAN_MS: f64 = 8986.78692;
+
+fn adr597_stamp(summary: &mut serde_json::Value) {
+	summary["adr596_reference_off_execute_median_ms"] =
+		serde_json::json!(ADR597_ADR596_REFERENCE_OFF_MEDIAN_MS);
+	if let Some(control) = summary
+		.get("control_execute_median_ms")
+		.and_then(serde_json::Value::as_f64)
+	{
+		summary["control_distance_from_adr596_ms"] =
+			serde_json::json!(control - ADR597_ADR596_REFERENCE_OFF_MEDIAN_MS);
+	}
+}
+
+const ADR597_DRIVER: LifecycleDriverSpec = LifecycleDriverSpec {
+	label: "ADR 597",
+	default_output_dir: "target/tpch/adr597-q21-exchange-skip",
+	tags: ("adr597_arm", "adr597_pair", "adr597_pair_position"),
+	kind: "adr597_q21_exchange_skip_paired_cut_separated_launch",
+	evaluate: evaluate_adr597_pairs,
+	stamp: adr597_stamp,
+	separated_launch: true,
+	arms: LifecycleArms::TwoExecutables,
+	outcome_field: "verdict",
+};
+
+fn adr597_q21_exchange_skip_command(args: &[String]) -> ExitCode {
+	match run_lifecycle_decomposition_driver(args, &ADR597_DRIVER) {
+		Ok(summary) => {
+			println!("{summary}");
+			ExitCode::SUCCESS
+		}
+		Err(message) => harness_error(&message),
+	}
+}
+
+/// ADR 588's pairs evaluation under ADR 597's tags: per pair the control and treatment
+/// execute times and the gain, the control median and range, the bar `2 × range_control`,
+/// every-pair positivity, and the predeclared verdict. The control's median and range are
+/// also published under the lifecycle names (`off_execute_*`) the cutoff and the stamp read.
+fn evaluate_adr597_pairs(rows: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+	let tags = &ADR597_TAGS;
+	if rows.len() != ADR585_PAIRS * 2 {
+		return Err(format!(
+			"ADR 597 requires {} pair rows, found {}",
+			ADR585_PAIRS * 2,
+			rows.len()
+		));
+	}
+	let mut pair_records = Vec::new();
+	let mut gains = Vec::new();
+	let mut controls = Vec::new();
+	let mut treatments = Vec::new();
+	for pair in 0..ADR585_PAIRS {
+		let pair_rows = rows
+			.iter()
+			.filter(|row| {
+				row.get(tags.pair).and_then(serde_json::Value::as_u64) == Some(pair as u64)
+			})
+			.collect::<Vec<_>>();
+		let find = |arm: &str| {
+			pair_rows
+				.iter()
+				.find(|row| row.get(tags.arm).and_then(serde_json::Value::as_str) == Some(arm))
+				.copied()
+				.ok_or_else(|| format!("ADR 597 pair {pair} lacks {arm} arm"))
+		};
+		let control_row = find("control")?;
+		let treatment_row = find("treatment")?;
+		let expected_order = if pair % 2 == 0 {
+			[("control", 0), ("treatment", 1)]
+		} else {
+			[("treatment", 0), ("control", 1)]
+		};
+		for (arm, position) in expected_order {
+			if find(arm)?
+				.get(tags.position)
+				.and_then(serde_json::Value::as_u64)
+				!= Some(position)
+			{
+				return Err(format!(
+					"ADR 597 pair {pair} does not use its declared alternating order"
+				));
+			}
+		}
+		for row in [control_row, treatment_row] {
+			if row.get("status").and_then(serde_json::Value::as_str) != Some("pass")
+				|| row.get("warmup") == Some(&serde_json::Value::Bool(true))
+			{
+				return Err(format!(
+					"ADR 597 pair {pair} carries a non-passing or warmup row"
+				));
+			}
+		}
+		let control_ms = required_f64(control_row, "execute_ms")?;
+		let treatment_ms = required_f64(treatment_row, "execute_ms")?;
+		if control_ms <= 0.0 || treatment_ms <= 0.0 {
+			return Err(format!("ADR 597 pair {pair} has non-positive execute time"));
+		}
+		let gain = control_ms - treatment_ms;
+		gains.push(gain);
+		controls.push(control_ms);
+		treatments.push(treatment_ms);
+		pair_records.push(serde_json::json!({
+			"pair": pair,
+			"execute_control_ms": control_ms,
+			"execute_treatment_ms": treatment_ms,
+			"gain_ms": gain,
+			"gain_fraction": gain / control_ms,
+			"control_digest": control_row.get("digest"),
+			"treatment_digest": treatment_row.get("digest"),
+		}));
+	}
+	let control_min = controls.iter().copied().fold(f64::INFINITY, f64::min);
+	let control_max = controls.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+	let control_range = control_max - control_min;
+	let control_median = median(&mut controls.clone());
+	let treatment_median = median(&mut treatments.clone());
+	let gain_median = median(&mut gains.clone());
+	let verdict = adr588_verdict(&gains, control_range);
+	Ok(serde_json::json!({
+		"pair_count": ADR585_PAIRS,
+		"pairs": pair_records,
+		"control_execute_median_ms": control_median,
+		"control_execute_range_ms": control_range,
+		"treatment_execute_median_ms": treatment_median,
+		"off_execute_median_ms": control_median,
+		"off_execute_range_ms": control_range,
+		"on_execute_median_ms": treatment_median,
+		"gain_median_ms": gain_median,
+		"gain_median_fraction_of_control": gain_median / control_median,
+		"required_gain_ms": 2.0 * control_range,
+		"every_pair_positive": gains.iter().all(|gain| *gain > 0.0),
+		"verdict": verdict,
+	}))
+}
+
+/// ADR 597: the twelve-row re-evaluation over a retained journal, with the receipt-free
+/// evaluator, the cutoff, and ADR 595's verdicts on the `verdict` field.
+fn adr597_reevaluate_command(args: &[String]) -> ExitCode {
+	match adr595_reevaluate_with_contract(
+		args,
+		"adr597-reevaluate",
+		evaluate_adr597_pairs,
+		&adr597_row_contract(),
+		"verdict",
+	) {
+		Ok(summary) => {
+			println!("{summary}");
+			ExitCode::SUCCESS
+		}
+		Err(error) => {
+			eprintln!("{error}");
+			ExitCode::from(2)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2036,7 +2439,16 @@ fn adr595_launch_verdicts(
 
 /// Precedence: a separation or window verdict other than `verified` withholds the owner with
 /// the named status; the tables, facts, readings, and cutoff verdict stay as evidence.
+#[cfg(test)]
 fn adr595_apply_launch_precedence(summary: &mut serde_json::Value, verdicts: &Adr595Verdicts) {
+	adr595_apply_launch_precedence_on(summary, verdicts, "owner")
+}
+
+fn adr595_apply_launch_precedence_on(
+	summary: &mut serde_json::Value,
+	verdicts: &Adr595Verdicts,
+	field: &str,
+) {
 	let status = |verdict: &serde_json::Value, prefix: &str| -> Option<String> {
 		match verdict.get("verdict").and_then(serde_json::Value::as_str) {
 			Some("verified") => None,
@@ -2047,8 +2459,8 @@ fn adr595_apply_launch_precedence(summary: &mut serde_json::Value, verdicts: &Ad
 	let withheld = status(&verdicts.separation, "withheld_launch_separation")
 		.or_else(|| status(&verdicts.window, "withheld_window_not_clean"));
 	if let Some(status) = withheld {
-		let previous = summary["owner"].take();
-		summary["owner"] = serde_json::json!({
+		let previous = summary[field].take();
+		summary[field] = serde_json::json!({
 			"status": status,
 			"rule_outcome_withheld": previous,
 		});
@@ -2109,6 +2521,88 @@ fn adr595_reevaluate(
 	verb: &str,
 	evaluate: fn(&[serde_json::Value]) -> Result<serde_json::Value, String>,
 ) -> Result<serde_json::Value, String> {
+	adr595_reevaluate_with_contract(args, verb, evaluate, &adr595_row_contract(), "owner")
+}
+
+/// One expected row of a retained journal: its arm (when the contract names arms), whether
+/// it is a warmup, and its pair and position.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpectedRow {
+	arm_tag: &'static str,
+	arm: Option<&'static str>,
+	warmup: bool,
+	pair: Option<u64>,
+	position: Option<u64>,
+}
+
+/// ADR 595's eleven rows: one warmup, then ten pair rows; the arms, pairs, and positions are
+/// not named (the retained journals predate the contract's checks and are read as they were,
+/// the stamps and the warmup flag alone).
+fn adr595_row_contract() -> Vec<ExpectedRow> {
+	let mut rows = vec![ExpectedRow {
+		arm_tag: "adr594_arm",
+		arm: None,
+		warmup: true,
+		pair: None,
+		position: None,
+	}];
+	for _ in 0..ADR585_PAIRS * 2 {
+		rows.push(ExpectedRow {
+			arm_tag: "adr594_arm",
+			arm: None,
+			warmup: false,
+			pair: None,
+			position: None,
+		});
+	}
+	rows
+}
+
+/// ADR 597's twelve rows: the control's warmup, the treatment's warmup, then five pairs
+/// alternating control-treatment, treatment-control.
+fn adr597_row_contract() -> Vec<ExpectedRow> {
+	let mut rows = vec![
+		ExpectedRow {
+			arm_tag: "adr597_arm",
+			arm: Some("control"),
+			warmup: true,
+			pair: None,
+			position: None,
+		},
+		ExpectedRow {
+			arm_tag: "adr597_arm",
+			arm: Some("treatment"),
+			warmup: true,
+			pair: None,
+			position: None,
+		},
+	];
+	for pair in 0..ADR585_PAIRS as u64 {
+		let order = if pair % 2 == 0 {
+			["control", "treatment"]
+		} else {
+			["treatment", "control"]
+		};
+		for (position, arm) in order.into_iter().enumerate() {
+			rows.push(ExpectedRow {
+				arm_tag: "adr597_arm",
+				arm: Some(arm),
+				warmup: false,
+				pair: Some(pair),
+				position: Some(position as u64),
+			});
+		}
+	}
+	rows
+}
+
+fn adr595_reevaluate_with_contract(
+	args: &[String],
+	verb: &str,
+	evaluate: fn(&[serde_json::Value]) -> Result<serde_json::Value, String>,
+	contract: &[ExpectedRow],
+	outcome_field: &str,
+) -> Result<serde_json::Value, String> {
 	let summary_path =
 		flag_value(args, "--summary").ok_or_else(|| format!("{verb} requires --summary PATH"))?;
 	let samples_path =
@@ -2129,20 +2623,20 @@ fn adr595_reevaluate(
 	let collection: toron_tpch::host_readings::JournalCollection =
 		serde_json::from_value(retained["host_journal"]["collection"].clone())
 			.map_err(|error| format!("retained summary lacks a journal collection: {error}"))?;
-	let (first_launch, last_return) = adr595_window_from_rows(&rows)?;
+	let (first_launch, last_return) = lifecycle_window_from_rows(&rows, contract)?;
 	let pair_rows: Vec<serde_json::Value> = rows
 		.iter()
 		.filter(|row| row.get("warmup") != Some(&serde_json::Value::Bool(true)))
 		.cloned()
 		.collect();
 	let mut summary = evaluate(&pair_rows)?;
-	adr593_apply_variability_bound(&mut summary)?;
+	adr593_apply_variability_bound_on(&mut summary, outcome_field)?;
 	let verdicts = adr595_launch_verdicts(&launch, &collection, first_launch, last_return);
-	adr595_apply_launch_precedence(&mut summary, &verdicts);
+	adr595_apply_launch_precedence_on(&mut summary, &verdicts, outcome_field);
 	summary["separated_launch"] = serde_json::json!(launch);
 	summary["launch_separation"] = verdicts.separation;
 	summary["measurement_window"] = verdicts.window;
-	summary["retained_owner"] = retained["owner"].clone();
+	summary["retained_owner"] = retained[outcome_field].clone();
 	summary["retained_launch_separation"] = retained["launch_separation"].clone();
 	summary["retained_measurement_window"] = retained["measurement_window"].clone();
 	summary["reevaluated_summary"] = serde_json::json!(summary_path);
@@ -2153,13 +2647,61 @@ fn adr595_reevaluate(
 /// The measurement window from retained rows: every one of the eleven rows (the warmup
 /// included) must carry a finite launch and return with launch < return, and the rows must
 /// not overlap; a missing or malformed stamp is refused rather than narrowing the window.
+#[cfg(test)]
 fn adr595_window_from_rows(rows: &[serde_json::Value]) -> Result<(f64, f64), String> {
-	if rows.len() != ADR585_PAIRS * 2 + 1 {
+	lifecycle_window_from_rows(rows, &adr595_row_contract())
+}
+
+/// The measurement window from retained rows under a row contract: exactly the contract's
+/// rows in its order (arm, warmup, pair, position where the contract names them), every row
+/// with a finite launch and return, launch before return, no overlap; a missing or malformed
+/// stamp on any row — the first and last included — is refused rather than narrowed around.
+fn lifecycle_window_from_rows(
+	rows: &[serde_json::Value],
+	contract: &[ExpectedRow],
+) -> Result<(f64, f64), String> {
+	if rows.len() != contract.len() {
 		return Err(format!(
-			"ADR 595 re-evaluation requires {} rows (warmup and five pairs), found {}",
-			ADR585_PAIRS * 2 + 1,
+			"ADR 595 re-evaluation requires {} rows, found {}",
+			contract.len(),
 			rows.len()
 		));
+	}
+	for (index, (row, expected)) in rows.iter().zip(contract).enumerate() {
+		let warmup = row.get("warmup") == Some(&serde_json::Value::Bool(true));
+		if warmup != expected.warmup {
+			return Err(format!(
+				"ADR 595 row {index} is {} where the contract expects {}",
+				if warmup { "a warmup" } else { "a pair row" },
+				if expected.warmup {
+					"a warmup"
+				} else {
+					"a pair row"
+				}
+			));
+		}
+		if let Some(arm) = expected.arm
+			&& row
+				.get(expected.arm_tag)
+				.and_then(serde_json::Value::as_str)
+				!= Some(arm)
+		{
+			return Err(format!(
+				"ADR 595 row {index} carries arm {:?} where the contract expects {arm:?}",
+				row.get(expected.arm_tag)
+			));
+		}
+		let pair_tag = expected.arm_tag.replace("_arm", "_pair");
+		let position_tag = expected.arm_tag.replace("_arm", "_pair_position");
+		if expected.pair.is_some()
+			&& (row.get(&pair_tag).and_then(serde_json::Value::as_u64) != expected.pair
+				|| row.get(&position_tag).and_then(serde_json::Value::as_u64) != expected.position)
+		{
+			return Err(format!(
+				"ADR 595 row {index} is not pair {:?} position {:?}",
+				expected.pair, expected.position
+			));
+		}
 	}
 	let mut intervals = Vec::with_capacity(rows.len());
 	for (index, row) in rows.iter().enumerate() {
@@ -2190,7 +2732,7 @@ fn adr595_window_from_rows(rows: &[serde_json::Value]) -> Result<(f64, f64), Str
 	if ordered.windows(2).any(|pair| pair[1].0 < pair[0].1) {
 		return Err("ADR 595 child intervals overlap".to_string());
 	}
-	Ok((ordered[0].0, ordered.last().expect("eleven rows").1))
+	Ok((ordered[0].0, ordered.last().expect("contract rows").1))
 }
 
 fn adr595_stamp(summary: &mut serde_json::Value) {
@@ -2211,6 +2753,8 @@ const ADR595_DRIVER: LifecycleDriverSpec = LifecycleDriverSpec {
 	evaluate: evaluate_adr594_pairs,
 	stamp: adr595_stamp,
 	separated_launch: true,
+	arms: LifecycleArms::ProfilingOnOff,
+	outcome_field: "owner",
 };
 
 fn adr595_q21_inner_1_command(args: &[String]) -> ExitCode {
@@ -2266,7 +2810,16 @@ const ADR596_RULE_TERMS: [&str; 11] = [
 	"build_write_residual",
 ];
 
-const ADR596_FACTS: [&str; 21] = [
+const ADR596_FACTS: [&str; 30] = [
+	"build_write_facts_vintage",
+	"build_write_exchange_handling",
+	"build_write_pass_through_requested",
+	"build_write_pass_through_refusal",
+	"build_write_scratch_plaintext_capacity_peak",
+	"build_write_scratch_refs_capacity_peak",
+	"build_write_writer_peak_bytes",
+	"build_write_resident_state_peak_bytes",
+	"build_write_scratch_releases",
 	"build_write_filter_present",
 	"build_write_exchange",
 	"build_write_exchange_partitions",
@@ -2318,6 +2871,8 @@ const ADR596_DRIVER: LifecycleDriverSpec = LifecycleDriverSpec {
 	evaluate: evaluate_adr596_pairs,
 	stamp: adr596_stamp,
 	separated_launch: true,
+	arms: LifecycleArms::ProfilingOnOff,
+	outcome_field: "owner",
 };
 
 fn adr596_q21_build_write_command(args: &[String]) -> ExitCode {
@@ -2762,6 +3317,8 @@ const ADR594_DRIVER: LifecycleDriverSpec = LifecycleDriverSpec {
 	evaluate: evaluate_adr594_pairs,
 	stamp: adr594_stamp,
 	separated_launch: false,
+	arms: LifecycleArms::ProfilingOnOff,
+	outcome_field: "owner",
 };
 
 fn adr594_q21_inner_1_command(args: &[String]) -> ExitCode {
@@ -4965,6 +5522,16 @@ const ADR593_START_GATE_LOAD: f64 = 0.3;
 /// Apply the cutoff to an evaluated lifecycle summary: over the bound, the record closes on the
 /// variability finding and no term is the owner; the leading term stays named as such.
 fn adr593_apply_variability_bound(summary: &mut serde_json::Value) -> Result<(), String> {
+	adr593_apply_variability_bound_on(summary, "owner")
+}
+
+/// The cutoff on the named outcome field (`owner` for an attribution, `verdict` for a
+/// retention): over the bound the outcome becomes `closed_on_variability` with the rule's
+/// outcome kept beside it.
+fn adr593_apply_variability_bound_on(
+	summary: &mut serde_json::Value,
+	field: &str,
+) -> Result<(), String> {
 	let range = required_f64(summary, "off_execute_range_ms")?;
 	let median = required_f64(summary, "off_execute_median_ms")?;
 	let ratio = range / median;
@@ -4977,16 +5544,17 @@ fn adr593_apply_variability_bound(summary: &mut serde_json::Value) -> Result<(),
 		"verdict": if exceeded { "exceeded" } else { "within_bound" },
 	});
 	if exceeded {
-		let leading = summary
-			.pointer("/owner/leading_term")
+		let previous = summary[field].take();
+		let leading = previous
+			.get("leading_term")
 			.cloned()
-			.or_else(|| summary.pointer("/owner/term").cloned())
+			.or_else(|| previous.get("term").cloned())
 			.unwrap_or_default();
-		let leading_ms = summary
-			.pointer("/owner/median_scaled_ms")
+		let leading_ms = previous
+			.get("median_scaled_ms")
 			.cloned()
 			.unwrap_or_default();
-		summary["owner"] = serde_json::json!({
+		let mut closed = serde_json::json!({
 			"status": "closed_on_variability",
 			"leading_term": leading,
 			"median_scaled_ms": leading_ms,
@@ -4994,6 +5562,10 @@ fn adr593_apply_variability_bound(summary: &mut serde_json::Value) -> Result<(),
 				"off range {range:.1} ms is {ratio:.4} of the off median, above the predeclared bound {ADR593_VARIABILITY_BOUND}"
 			),
 		});
+		if field != "owner" {
+			closed["rule_outcome_withheld"] = previous;
+		}
+		summary[field] = closed;
 	}
 	Ok(())
 }
@@ -12309,7 +12881,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|perf-board-replay|adr592-revalidate|adr593-journal-recheck|adr584-q21-attribution|adr585-q21-decomposition|adr594-q21-inner-1|adr595-q21-inner-1|adr596-q21-build-write|adr596-reevaluate|adr595-reevaluate|adr594-reevaluate|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|perf-board-replay|adr592-revalidate|adr593-journal-recheck|adr584-q21-attribution|adr585-q21-decomposition|adr594-q21-inner-1|adr595-q21-inner-1|adr596-q21-build-write|adr596-reevaluate|adr597-q21-exchange-skip|adr597-reevaluate|adr595-reevaluate|adr594-reevaluate|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -14565,6 +15137,209 @@ mod tests {
 		assert_eq!(
 			report["pairs"][0]["with_derived_limit_facts"]["derived_fields"],
 			serde_json::json!(["batches_limit_discarded"])
+		);
+	}
+
+	// -----------------------------------------------------------------------------------------
+	// ADR 597: the paired-executable evaluation, the retention rule on the verdict field, the
+	// cutoff and the precedence on that field, and the twelve-row contract.
+	// -----------------------------------------------------------------------------------------
+
+	/// Twelve rows as the driver journals them: control warmup, treatment warmup, then pairs
+	/// alternating control-treatment / treatment-control, with the given per-pair gains over a
+	/// control that spans `control_spread` ms.
+	fn adr597_rows(gains: [f64; 5], control_spread: f64) -> Vec<serde_json::Value> {
+		let row =
+			|arm: &str, warmup: bool, pair: Option<usize>, position: Option<usize>, ms: f64| {
+				let mut row = serde_json::json!({
+					"query": "q21",
+					"status": "pass",
+					"execute_ms": ms,
+					"adr597_arm": arm,
+					"adr597_phase": if warmup { "warmup" } else { "pairs" },
+					"adr597_pair": pair,
+					"adr597_pair_position": position,
+					"diagnostics_disabled": true,
+					"digest": ADR588_SEALED_Q21_DIGEST,
+					"driver_launch_unix_ms": 0.0,
+					"driver_return_unix_ms": 0.0,
+				});
+				if warmup {
+					row["warmup"] = serde_json::json!(true);
+				}
+				row
+			};
+		let mut rows = vec![
+			row("control", true, None, None, 9_100.0),
+			row("treatment", true, None, None, 9_050.0),
+		];
+		let mut stamp = 1_000.0;
+		for (pair, gain) in gains.into_iter().enumerate() {
+			let control_ms = 9_000.0 + pair as f64 * control_spread / 4.0;
+			let treatment_ms = control_ms - gain;
+			let (first, second) = if pair % 2 == 0 {
+				(("control", control_ms), ("treatment", treatment_ms))
+			} else {
+				(("treatment", treatment_ms), ("control", control_ms))
+			};
+			for (position, (arm, ms)) in [first, second].into_iter().enumerate() {
+				rows.push(row(arm, false, Some(pair), Some(position), ms));
+			}
+		}
+		for row in &mut rows {
+			row["driver_launch_unix_ms"] = serde_json::json!(stamp);
+			row["driver_return_unix_ms"] = serde_json::json!(stamp + 50.0);
+			stamp += 100.0;
+		}
+		rows
+	}
+
+	fn adr597_pair_rows(gains: [f64; 5], control_spread: f64) -> Vec<serde_json::Value> {
+		adr597_rows(gains, control_spread)
+			.into_iter()
+			.filter(|row| row.get("warmup") != Some(&serde_json::Value::Bool(true)))
+			.collect()
+	}
+
+	// The retention rule is ADR 588's, fixed: retained only above 2 × the control range with
+	// every pair strictly positive; a zero pair or a median under the bar is not established.
+	#[test]
+	fn adr597_the_retention_rule_is_adr588s_on_the_verdict_field() {
+		// Control spread 40 ms → bar 80 ms; gains median 120: retained.
+		let summary =
+			evaluate_adr597_pairs(&adr597_pair_rows([100.0, 130.0, 120.0, 110.0, 140.0], 40.0))
+				.unwrap();
+		assert_eq!(
+			summary["verdict"]["status"], "retained",
+			"{}",
+			summary["verdict"]
+		);
+		assert_eq!(summary["required_gain_ms"], 80.0);
+		assert_eq!(summary["gain_median_ms"], 120.0);
+		assert_eq!(summary["every_pair_positive"], true);
+		assert_eq!(summary["control_execute_range_ms"], 40.0);
+		assert_eq!(
+			summary["off_execute_range_ms"], 40.0,
+			"the control range under the lifecycle name"
+		);
+		assert_eq!(summary["pairs"][1]["execute_treatment_ms"], 9_010.0 - 130.0);
+		// A zero pair: not established, whatever the median.
+		let summary =
+			evaluate_adr597_pairs(&adr597_pair_rows([100.0, 130.0, 0.0, 110.0, 140.0], 40.0))
+				.unwrap();
+		assert_eq!(summary["verdict"]["status"], "not_established");
+		assert_eq!(summary["every_pair_positive"], false);
+		// A median under the bar: not established.
+		let summary =
+			evaluate_adr597_pairs(&adr597_pair_rows([60.0, 70.0, 65.0, 62.0, 75.0], 40.0)).unwrap();
+		assert_eq!(summary["verdict"]["status"], "not_established");
+		assert_eq!(summary["every_pair_positive"], true);
+		// A wrong alternating order is refused.
+		let mut rows = adr597_pair_rows([100.0, 130.0, 120.0, 110.0, 140.0], 40.0);
+		rows[0]["adr597_pair_position"] = serde_json::json!(1);
+		rows[1]["adr597_pair_position"] = serde_json::json!(0);
+		assert!(
+			evaluate_adr597_pairs(&rows)
+				.unwrap_err()
+				.contains("alternating order")
+		);
+		// A warmup among the pair rows is refused.
+		let mut rows = adr597_pair_rows([100.0, 130.0, 120.0, 110.0, 140.0], 40.0);
+		rows[2]["warmup"] = serde_json::json!(true);
+		assert!(evaluate_adr597_pairs(&rows).unwrap_err().contains("warmup"));
+
+		// The cutoff on the verdict field: a control range over 4% closes on variability with
+		// the rule's outcome kept beside it.
+		let mut summary = evaluate_adr597_pairs(&adr597_pair_rows(
+			[1_000.0, 1_100.0, 1_050.0, 1_020.0, 1_080.0],
+			400.0,
+		))
+		.unwrap();
+		assert_eq!(summary["verdict"]["status"], "retained");
+		adr593_apply_variability_bound_on(&mut summary, "verdict").unwrap();
+		assert_eq!(
+			summary["verdict"]["status"], "closed_on_variability",
+			"{}",
+			summary["verdict"]
+		);
+		assert_eq!(
+			summary["verdict"]["rule_outcome_withheld"]["status"],
+			"retained"
+		);
+		assert_eq!(summary["variability"]["verdict"], "exceeded");
+		// The precedence on the verdict field.
+		let mut summary =
+			evaluate_adr597_pairs(&adr597_pair_rows([100.0, 130.0, 120.0, 110.0, 140.0], 40.0))
+				.unwrap();
+		adr595_apply_launch_precedence_on(
+			&mut summary,
+			&Adr595Verdicts {
+				separation: serde_json::json!({"verdict": "failed"}),
+				window: serde_json::json!({"verdict": "verified"}),
+			},
+			"verdict",
+		);
+		assert_eq!(
+			summary["verdict"]["status"],
+			"withheld_launch_separation_failed"
+		);
+		assert_eq!(
+			summary["verdict"]["rule_outcome_withheld"]["status"],
+			"retained"
+		);
+	}
+
+	// The twelve-row contract: arms and order, warmups, pairs and positions, every stamp.
+	#[test]
+	fn adr597_the_twelve_row_contract_refuses_each_departure() {
+		let rows = adr597_rows([100.0; 5], 40.0);
+		assert_eq!(
+			lifecycle_window_from_rows(&rows, &adr597_row_contract()).unwrap(),
+			(1_000.0, 2_150.0)
+		);
+		let contract = adr597_row_contract();
+		assert!(
+			lifecycle_window_from_rows(&rows[..11], &contract)
+				.unwrap_err()
+				.contains("requires 12 rows")
+		);
+		let mut swapped_warmups = rows.clone();
+		swapped_warmups.swap(0, 1);
+		assert!(
+			lifecycle_window_from_rows(&swapped_warmups, &contract)
+				.unwrap_err()
+				.contains("carries arm")
+		);
+		let mut wrong_position = rows.clone();
+		wrong_position[2]["adr597_pair_position"] = serde_json::json!(1);
+		assert!(
+			lifecycle_window_from_rows(&wrong_position, &contract)
+				.unwrap_err()
+				.contains("is not pair")
+		);
+		let mut warmup_late = rows.clone();
+		warmup_late[5]["warmup"] = serde_json::json!(true);
+		assert!(
+			lifecycle_window_from_rows(&warmup_late, &contract)
+				.unwrap_err()
+				.contains("is a warmup where")
+		);
+		let mut missing_first = rows.clone();
+		missing_first[0]
+			.as_object_mut()
+			.unwrap()
+			.remove("driver_launch_unix_ms");
+		assert!(
+			lifecycle_window_from_rows(&missing_first, &contract)
+				.unwrap_err()
+				.contains("row 0 lacks")
+		);
+		let mut missing_last = rows.clone();
+		missing_last[11]["driver_return_unix_ms"] = serde_json::Value::Null;
+		assert!(
+			lifecycle_window_from_rows(&missing_last, &contract)
+				.unwrap_err()
+				.contains("row 11 lacks")
 		);
 	}
 
@@ -17305,6 +18080,201 @@ mod adr592_tests {
 				.unwrap()
 				.contains("cpu_affinity_observed")
 		);
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	fn adr597_arms() -> Adr597Arms {
+		let arm = |name: &'static str, tree: &str, exe: &str| {
+			let manifest = manifest(tree, exe);
+			let manifest_path = PathBuf::from(format!("/manifests/{name}.manifest"));
+			let expectation = Adr592ChildExpectation {
+				label: "ADR 597",
+				instrumented: manifest.clone(),
+				instrumented_manifest_path: manifest_path.display().to_string(),
+				dataset_manifest_fingerprint: String::new(),
+				data_source: String::new(),
+				digest: String::new(),
+				cpu_affinity_requested: String::new(),
+			};
+			(
+				Adr588Arm {
+					name,
+					manifest_path,
+					executable: PathBuf::from(format!("/staged/{name}")),
+					manifest,
+				},
+				expectation,
+			)
+		};
+		let (control, control_expectation) = arm("control", "3", "7");
+		let (treatment, treatment_expectation) = arm("treatment", "4", "8");
+		Adr597Arms {
+			control,
+			treatment,
+			control_expectation,
+			treatment_expectation,
+		}
+	}
+
+	/// A passing row from the arm named by its executable.
+	fn adr597_child_row(
+		coordinate: &Adr592DriverCoordinate,
+		arms: &Adr597Arms,
+		arm: &Adr588Arm,
+	) -> serde_json::Value {
+		let expectation = if arm.name == "control" {
+			&arms.control_expectation
+		} else {
+			&arms.treatment_expectation
+		};
+		child_row(&adr597_arm_expectation(coordinate, expectation), true)
+	}
+
+	// ADR 597: the twelve-row contract — the control's warmup, the treatment's warmup, then five
+	// alternating pairs — every row stamped with its arm's executable and validated as it
+	// returns; a failing warmup on either arm stops the run with the refusal journaled.
+	#[test]
+	fn adr597_a_complete_run_journals_twelve_admitted_rows_in_order() {
+		let expected = expectation();
+		let coordinate = driver_coordinate(&expected);
+		let arms = adr597_arms();
+		let (dir, journal) = journal_in_temp("adr597-complete");
+		let mut launched = Vec::new();
+		let (warmups, rows) = adr597_run_children(
+			("adr597_arm", "adr597_pair", "adr597_pair_position"),
+			5,
+			&coordinate,
+			&arms,
+			&journal,
+			|_, warmup, arm| {
+				launched.push((arm.name, warmup));
+				Ok(adr597_child_row(&coordinate, &arms, arm))
+			},
+		)
+		.unwrap();
+		assert_eq!(warmups.len(), 2);
+		assert_eq!(rows.len(), 10);
+		assert_eq!(
+			launched[..2],
+			[("control", true), ("treatment", true)],
+			"the control's warmup first, then the treatment's"
+		);
+		let arms_in_order: Vec<_> = rows
+			.iter()
+			.map(|row| row["adr597_arm"].as_str().unwrap())
+			.collect();
+		assert_eq!(
+			arms_in_order,
+			[
+				"control",
+				"treatment",
+				"treatment",
+				"control",
+				"control",
+				"treatment",
+				"treatment",
+				"control",
+				"control",
+				"treatment"
+			]
+		);
+		for row in warmups.iter().chain(rows.iter()) {
+			let arm = row["adr597_arm"].as_str().unwrap();
+			let expected_exe = if arm == "control" {
+				&arms.control.manifest.toron.sha256
+			} else {
+				&arms.treatment.manifest.toron.sha256
+			};
+			assert_eq!(
+				&row["adr592_launched_executable_sha256"], expected_exe,
+				"{row}"
+			);
+			assert!(row["driver_launch_unix_ms"].as_f64().unwrap() > 0.0);
+			assert!(row["driver_return_unix_ms"].as_f64().unwrap() > 0.0);
+			assert!(row.get("adr592_refusal").is_none());
+		}
+		assert_eq!(warmups[0]["adr597_phase"], "warmup");
+		assert_eq!(rows[0]["adr597_phase"], "pairs");
+		assert_eq!(rows[0]["adr597_pair_position"], 0);
+		assert_eq!(rows[3]["adr597_pair"], 1);
+		assert_eq!(rows[3]["adr597_pair_position"], 1);
+		let journaled_rows = journaled(&dir);
+		assert_eq!(journaled_rows.len(), 12);
+		// The retained journal satisfies the re-evaluation's twelve-row contract.
+		lifecycle_window_from_rows(&journaled_rows, &adr597_row_contract()).unwrap();
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn adr597_a_failing_warmup_on_either_arm_stops_the_run_with_its_refusal_journaled() {
+		let expected = expectation();
+		let coordinate = driver_coordinate(&expected);
+		let arms = adr597_arms();
+		for (failing, expected_launches) in [("control", 1), ("treatment", 2)] {
+			let (dir, journal) = journal_in_temp(&format!("adr597-failing-{failing}"));
+			let mut launches = 0;
+			let error = adr597_run_children(
+				("adr597_arm", "adr597_pair", "adr597_pair_position"),
+				5,
+				&coordinate,
+				&arms,
+				&journal,
+				|_, _, arm| {
+					launches += 1;
+					let mut row = adr597_child_row(&coordinate, &arms, arm);
+					if arm.name == failing {
+						row["status"] = serde_json::json!("fail");
+						row["reason"] = serde_json::json!("out_of_memory");
+					}
+					Ok(row)
+				},
+			)
+			.unwrap_err();
+			assert!(
+				error.contains("did not pass") && error.contains("row retained"),
+				"{failing}: {error}"
+			);
+			assert_eq!(launches, expected_launches, "{failing}");
+			let rows = journaled(&dir);
+			assert_eq!(rows.len(), expected_launches);
+			let last = rows.last().unwrap();
+			assert_eq!(last["adr597_arm"], failing);
+			assert_eq!(last["warmup"], true);
+			assert!(
+				last["adr592_refusal"]
+					.as_str()
+					.unwrap()
+					.contains("did not pass")
+			);
+			std::fs::remove_dir_all(&dir).unwrap();
+		}
+		// A pair row from the wrong executable is refused where it returns.
+		let (dir, journal) = journal_in_temp("adr597-wrong-exe");
+		let error = adr597_run_children(
+			("adr597_arm", "adr597_pair", "adr597_pair_position"),
+			5,
+			&coordinate,
+			&arms,
+			&journal,
+			|run_index, warmup, arm| {
+				let mut row = adr597_child_row(&coordinate, &arms, arm);
+				if !warmup && run_index == 1 && arm.name == "treatment" {
+					row["evidence_identity"]["executable_sha256"] =
+						serde_json::json!(arms.control.manifest.toron.sha256);
+				}
+				Ok(row)
+			},
+		)
+		.unwrap_err();
+		assert!(error.contains("row retained"), "{error}");
+		let rows = journaled(&dir);
+		assert_eq!(
+			rows.len(),
+			5,
+			"two warmups, pair 0, then pair 1's first row refused"
+		);
+		assert_eq!(rows[4]["adr597_arm"], "treatment");
+		assert!(rows[4].get("adr592_refusal").is_some());
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 

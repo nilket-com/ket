@@ -1,6 +1,17 @@
 # ADR 597 - q21's replay-1 build write: the Exchange feeding the single-partition build
 
-**Status:** PROPOSED. Successor to ADR 596, which decomposed
+**Status:** CLOSED, NOT MEASURED — GATE REFUSAL. Built, validated, and
+launched once on strix under the separated launch; ADR 593's start gate
+refused the driver at 47 °C before any child ran (results in
+`plans/impl/0597_q21_build_exchange_on_the_single_partition_build_results.md`;
+a second launch, refused at 48 °C, is recorded there as a protocol
+deviation). A gate refusal is a non-retained outcome under one attempt:
+the treatment call site is reverted, the parameter, admission, facts,
+fixtures, and driver stay, and no performance evidence was obtained —
+the candidate is unpriced. Successor: a record on the launcher's hash
+verification and the gate's placement, with any settle interval
+declared before its attempt and the threshold unchanged. Successor to
+ADR 596, which decomposed
 `inner_1_build_write` below the floor and named two shapes for a
 successor: the legacy index (kept separate, its own record, not
 preferred here — its 482.4 ms child is below the floor too and a

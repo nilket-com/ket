@@ -82,8 +82,8 @@ pub(in crate::exec) use self::membership_chain_profile::{
 };
 
 pub(in crate::exec) use self::spill::{
-	BuildWriteChild, BuildWriteLedger, BuildWriteTermination, PinnedSpilledInnerBuildStats,
-	SpilledBatchRowRef, SpilledInnerJoinBuild, SpilledInnerJoinMatch,
+	BuildWriteChild, BuildWriteLedger, BuildWriteTermination, ExchangeHandling,
+	PinnedSpilledInnerBuildStats, SpilledBatchRowRef, SpilledInnerJoinBuild, SpilledInnerJoinMatch,
 	SpilledInnerJoinResidencySnapshot, SpilledJoinBuild, SpilledSemiAntiExistenceBuild,
 	partition_bucket_if_non_null_with_scratch,
 };

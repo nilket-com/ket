@@ -2953,7 +2953,15 @@ fn build_write_band_from_parts(
 		"build_write_residual_micros".to_string(),
 		serde_json::json!(residual),
 	);
-	const FACTS: [&str; 21] = [
+	const FACTS: [&str; 29] = [
+		"scratch_releases",
+		"exchange_handling",
+		"pass_through_requested",
+		"pass_through_refusal",
+		"scratch_plaintext_capacity_peak",
+		"scratch_refs_capacity_peak",
+		"writer_peak_bytes",
+		"resident_state_peak_bytes",
 		"filter_present",
 		"exchange",
 		"exchange_partitions",
@@ -2986,6 +2994,13 @@ fn build_write_band_from_parts(
 		.get("unsupported")
 		.and_then(serde_json::Value::as_str)
 		.map(str::to_string);
+	// ADR 597: a receipt that carries `exchange_handling` answers the Exchange and peak rules;
+	// one recorded before the fact existed is read under ADR 596's rules alone, and says so.
+	let adr597_facts = facts.get("exchange_handling").is_some();
+	band.insert(
+		"build_write_facts_vintage".to_string(),
+		serde_json::json!(if adr597_facts { "adr597" } else { "adr596" }),
+	);
 	band.insert(
 		"build_write_shape".to_string(),
 		serde_json::json!(if unsupported.is_some() {
@@ -3106,29 +3121,101 @@ fn build_write_band_from_parts(
 		if !filter_present && count("batches_filtered_empty") != 0 {
 			return Some("batches filtered empty without a filter".to_string());
 		}
-		if exchange {
-			if fact_u64("exchange_partitions").is_none_or(|partitions| partitions < 1) {
-				return Some("exchange without a partition count".to_string());
+		// ADR 597: how the Exchange was handled decides which repartition rule applies.
+		let handling = if adr597_facts {
+			match facts
+				.get("exchange_handling")
+				.and_then(serde_json::Value::as_str)
+			{
+				Some(name @ ("split" | "pass_through" | "none")) => name,
+				_ => {
+					return Some(
+						"fact exchange_handling is not split, pass_through, or none".to_string(),
+					);
+				}
 			}
-			let expected = admitted.saturating_sub(count("batches_filtered_empty"));
-			if term_calls("build_write_repartition") != expected {
-				return Some(
-					"repartition calls disagree with batches_admitted less batches_filtered_empty"
-						.to_string(),
-				);
+		} else if exchange {
+			"split"
+		} else {
+			"none"
+		};
+		if (handling == "none") != !exchange {
+			return Some("exchange_handling disagrees with the exchange fact".to_string());
+		}
+		if adr597_facts {
+			let Some(requested) = fact_bool("pass_through_requested") else {
+				return Some("fact pass_through_requested is missing".to_string());
+			};
+			let refusal = facts.get("pass_through_refusal");
+			let refused = refusal.is_some_and(|value| !value.is_null());
+			match handling {
+				"pass_through" if !requested => {
+					return Some("pass_through without a request".to_string());
+				}
+				"pass_through" if refused => {
+					return Some("pass_through with a refusal".to_string());
+				}
+				"split" if requested && !refused => {
+					return Some(
+						"split after a pass_through request without a refusal".to_string(),
+					);
+				}
+				_ if !requested && refused => {
+					return Some("refusal without a request".to_string());
+				}
+				_ => {}
 			}
-		} else if term_calls("build_write_repartition") != 0
-			|| term_micros("build_write_repartition") != 0
-		{
-			return Some("repartition call without an exchange".to_string());
+			for name in [
+				"scratch_plaintext_capacity_peak",
+				"scratch_refs_capacity_peak",
+				"writer_peak_bytes",
+				"resident_state_peak_bytes",
+				"scratch_releases",
+			] {
+				if fact_u64(name).is_none() {
+					return Some(format!("fact {name} is missing"));
+				}
+			}
+			if count("pages") > 0 {
+				if count("writer_peak_bytes") == 0 {
+					return Some("pages without a writer peak".to_string());
+				}
+				if count("scratch_plaintext_capacity_peak") < count("writer_peak_bytes") {
+					return Some("plaintext capacity below the writer peak".to_string());
+				}
+			}
 		}
 		let batches_kept = admitted.saturating_sub(count("batches_filtered_empty"));
-		let written_bound = if exchange {
+		match handling {
+			"split" => {
+				if fact_u64("exchange_partitions").is_none_or(|partitions| partitions < 1) {
+					return Some("exchange without a partition count".to_string());
+				}
+				if term_calls("build_write_repartition") != batches_kept {
+					return Some(
+						"repartition calls disagree with batches_admitted less batches_filtered_empty"
+							.to_string(),
+					);
+				}
+			}
+			_ => {
+				if term_calls("build_write_repartition") != 0
+					|| term_micros("build_write_repartition") != 0
+				{
+					return Some(if handling == "pass_through" {
+						"repartition call under pass_through".to_string()
+					} else {
+						"repartition call without an exchange".to_string()
+					});
+				}
+			}
+		}
+		let written_bound = if handling == "split" {
 			batches_kept.saturating_mul(fact_u64("exchange_partitions").unwrap_or(1))
 		} else {
 			batches_kept
 		};
-		if (!exchange && count("batches_written") != batches_kept)
+		if (handling != "split" && count("batches_written") != batches_kept)
 			|| count("batches_written") > written_bound
 		{
 			return Some("batches_written disagree with the batches kept".to_string());
@@ -4696,6 +4783,31 @@ mod tests {
 		facts
 	}
 
+	/// The same facts as an ADR 597 receipt records them: the Exchange split, pass-through
+	/// not requested, the writer's peaks.
+	fn adr597_write_facts(
+		handling: &str,
+		requested: bool,
+		refusal: Option<&str>,
+	) -> serde_json::Value {
+		let mut facts = build_write_facts();
+		facts["exchange"] = serde_json::json!(handling != "none");
+		facts["exchange_partitions"] = if handling == "none" {
+			serde_json::Value::Null
+		} else {
+			serde_json::json!(4)
+		};
+		facts["exchange_handling"] = serde_json::json!(handling);
+		facts["pass_through_requested"] = serde_json::json!(requested);
+		facts["pass_through_refusal"] = serde_json::json!(refusal);
+		facts["scratch_plaintext_capacity_peak"] = serde_json::json!(9_000);
+		facts["scratch_refs_capacity_peak"] = serde_json::json!(600);
+		facts["writer_peak_bytes"] = serde_json::json!(8_000);
+		facts["resident_state_peak_bytes"] = serde_json::json!(80_000);
+		facts["scratch_releases"] = serde_json::json!(0);
+		facts
+	}
+
 	/// Children summing to 53 of the 55 µs build write: residual 2.
 	const ADR596_MICROS: [u64; 11] = [2, 3, 10, 5, 0, 4, 5, 6, 10, 6, 2];
 	const ADR596_CALLS: [u64; 11] = [1, 1, 5, 4, 0, 3, 3, 3, 3, 3, 1];
@@ -4826,6 +4938,207 @@ mod tests {
 				.unwrap()
 				.contains("branch other than spilled")
 		);
+	}
+
+	// ADR 597: the Exchange-handling facts decide the repartition rule; a receipt without them
+	// is read under ADR 596's rules and says so; each new rule has a case that breaks it.
+	#[test]
+	fn adr597_receipt_reads_the_exchange_handling_and_the_writer_peaks() {
+		// Pass-through taken: three repartition calls become none, the batches written equal
+		// the batches kept, the peaks are carried.
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+		let mut micros = ADR596_MICROS;
+		micros[4] = 0;
+		attach_build_write_band(
+			&mut invocation,
+			micros,
+			ADR596_CALLS,
+			adr597_write_facts("pass_through", true, None),
+		);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "reconciled", "{receipt}");
+		assert_eq!(receipt["build_write_facts_vintage"], "adr597");
+		assert_eq!(receipt["build_write_facts_consistent"], true, "{receipt}");
+		assert_eq!(receipt["build_write_exchange_handling"], "pass_through");
+		assert_eq!(receipt["build_write_writer_peak_bytes"], 8_000);
+		assert_eq!(receipt["build_write_scratch_releases"], 0);
+		// The split under an ADR 597 receipt, not requested: ADR 596's rule with the exchange.
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+		let mut calls = ADR596_CALLS;
+		calls[4] = 3;
+		attach_build_write_band(
+			&mut invocation,
+			ADR596_MICROS,
+			calls,
+			adr597_write_facts("split", false, None),
+		);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["build_write_facts_consistent"], true, "{receipt}");
+		// A receipt recorded before ADR 597: read under ADR 596's rules, vintage named.
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+		attach_build_write_band(
+			&mut invocation,
+			ADR596_MICROS,
+			ADR596_CALLS,
+			build_write_facts(),
+		);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["build_write_facts_vintage"], "adr596");
+		assert_eq!(receipt["build_write_facts_consistent"], true);
+		let cases: Vec<(&str, [u64; 11], [u64; 11], serde_json::Value, &str)> = vec![
+			(
+				"pass_through with a repartition call",
+				ADR596_MICROS,
+				{
+					let mut c = ADR596_CALLS;
+					c[4] = 3;
+					c
+				},
+				adr597_write_facts("pass_through", true, None),
+				"repartition call under pass_through",
+			),
+			(
+				"pass_through with batches written above the kept",
+				{
+					let mut m = ADR596_MICROS;
+					m[4] = 0;
+					m
+				},
+				ADR596_CALLS,
+				{
+					let mut f = adr597_write_facts("pass_through", true, None);
+					f["batches_written"] = serde_json::json!(4);
+					f
+				},
+				"batches_written disagree with the batches kept",
+			),
+			(
+				"pass_through without a request",
+				{
+					let mut m = ADR596_MICROS;
+					m[4] = 0;
+					m
+				},
+				ADR596_CALLS,
+				adr597_write_facts("pass_through", false, None),
+				"pass_through without a request",
+			),
+			(
+				"pass_through with a refusal",
+				{
+					let mut m = ADR596_MICROS;
+					m[4] = 0;
+					m
+				},
+				ADR596_CALLS,
+				adr597_write_facts("pass_through", true, Some("computed_key")),
+				"pass_through with a refusal",
+			),
+			(
+				"split after a request without a refusal",
+				ADR596_MICROS,
+				{
+					let mut c = ADR596_CALLS;
+					c[4] = 3;
+					c
+				},
+				adr597_write_facts("split", true, None),
+				"split after a pass_through request without a refusal",
+			),
+			(
+				"a refusal without a request",
+				ADR596_MICROS,
+				{
+					let mut c = ADR596_CALLS;
+					c[4] = 3;
+					c
+				},
+				adr597_write_facts("split", false, Some("computed_key")),
+				"refusal without a request",
+			),
+			(
+				"handling disagreeing with the exchange fact",
+				ADR596_MICROS,
+				ADR596_CALLS,
+				{
+					let mut f = adr597_write_facts("none", false, None);
+					f["exchange"] = serde_json::json!(true);
+					f["exchange_partitions"] = serde_json::json!(4);
+					f
+				},
+				"exchange_handling disagrees with the exchange fact",
+			),
+			(
+				"pages without a writer peak",
+				ADR596_MICROS,
+				{
+					let mut c = ADR596_CALLS;
+					c[4] = 3;
+					c
+				},
+				{
+					let mut f = adr597_write_facts("split", false, None);
+					f["writer_peak_bytes"] = serde_json::json!(0);
+					f
+				},
+				"pages without a writer peak",
+			),
+			(
+				"plaintext capacity below the writer peak",
+				ADR596_MICROS,
+				{
+					let mut c = ADR596_CALLS;
+					c[4] = 3;
+					c
+				},
+				{
+					let mut f = adr597_write_facts("split", false, None);
+					f["scratch_plaintext_capacity_peak"] = serde_json::json!(7_000);
+					f
+				},
+				"plaintext capacity below the writer peak",
+			),
+			(
+				"a missing peak fact",
+				ADR596_MICROS,
+				{
+					let mut c = ADR596_CALLS;
+					c[4] = 3;
+					c
+				},
+				{
+					let mut f = adr597_write_facts("split", false, None);
+					f.as_object_mut()
+						.unwrap()
+						.remove("resident_state_peak_bytes");
+					f
+				},
+				"fact resident_state_peak_bytes is missing",
+			),
+		];
+		for (label, micros, calls, facts, needle) in cases {
+			let mut invocation = adr586_invocation();
+			adr589_write_bands(&mut invocation);
+			attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+			attach_build_write_band(&mut invocation, micros, calls, facts);
+			let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+			assert_eq!(receipt["status"], "reconciled", "{label}: {receipt}");
+			assert_eq!(receipt["build_write_facts_consistent"], false, "{label}");
+			assert!(
+				receipt["build_write_inconsistency"]
+					.as_str()
+					.unwrap()
+					.contains(needle),
+				"{label}: {}",
+				receipt["build_write_inconsistency"]
+			);
+		}
 	}
 
 	// ADR 596: each consistency rule is conditional on the facts it depends on and has a case

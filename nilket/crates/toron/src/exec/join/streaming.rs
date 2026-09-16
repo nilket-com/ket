@@ -7493,6 +7493,39 @@ fn decompose_join_or_filtered_join(
 	}
 }
 
+/// ADR 597: why the spilled write may not pass an Exchange's batches through whole. Skipping
+/// the split also skips the key program's evaluation and the partition hash, both of which can
+/// fail under the split; pass-through is admitted only for a shape whose evaluation cannot —
+/// a single plain-column key of a fixed-width integer type inside the scan's schema, a count of
+/// at least one — on the single-file branch, and refused with the reason otherwise.
+pub(in crate::exec) fn exchange_pass_through_refusal(
+	scan_input: StreamingScanProbeInput<'_>,
+	retain_unkeyed_rows: bool,
+	join_partition: bool,
+) -> Option<&'static str> {
+	if retain_unkeyed_rows || join_partition {
+		return Some("branch_not_admitted");
+	}
+	let exchange = scan_input.exchange?;
+	if exchange.partition_count == 0 {
+		return Some("zero_partition_count");
+	}
+	let Some(root) = exchange.key.single_root() else {
+		return Some("multi_root_key");
+	};
+	let Some(BoundExprNode::Column(column)) = exchange.key.node(root) else {
+		return Some("computed_key");
+	};
+	let schema = scan_input.scan.schema();
+	let Some(field) = schema.fields().get(column.ordinal.0 as usize) else {
+		return Some("key_ordinal_out_of_schema");
+	};
+	if !matches!(field.data_type(), DataType::Int32 | DataType::Int64) {
+		return Some("key_type_not_fixed_width");
+	}
+	None
+}
+
 fn limit_streaming_scan_batch(
 	batch: RecordBatch,
 
@@ -11249,6 +11282,7 @@ impl Executor {
 			false,
 			None,
 			morsel,
+			ExchangeHandling::Split,
 			None,
 		)
 		.await?;
@@ -11281,8 +11315,27 @@ impl Executor {
 
 		morsel: Option<(MorselId, u32)>,
 
+		exchange_handling: ExchangeHandling,
+
 		mut ledger: Option<&mut BuildWriteLedger>,
 	) -> Result<(), ExecutionError> {
+		// ADR 597: pass-through is taken only under the admission, else today's split with the
+		// refusal named; the decision is made once, before the first poll.
+		let refusal = match exchange_handling {
+			ExchangeHandling::PassThrough => exchange_pass_through_refusal(
+				scan_input,
+				retain_unkeyed_rows,
+				join_partition.is_some(),
+			),
+			ExchangeHandling::Split => None,
+		};
+
+		let handling = match (exchange_handling, refusal, scan_input.exchange) {
+			(_, _, None) => None,
+			(ExchangeHandling::PassThrough, None, Some(_)) => Some(ExchangeHandling::PassThrough),
+			_ => Some(ExchangeHandling::Split),
+		};
+
 		// ADR 596: the path facts, recorded before the first poll. The ledger's shape vocabulary
 		// is filter × projection × exchange under either termination; a preserved-rows write or
 		// a join-partition selection is outside it and is reported, not read through the band.
@@ -11291,12 +11344,20 @@ impl Executor {
 			ledger.exchange_partitions =
 				scan_input.exchange.map(|exchange| exchange.partition_count);
 			ledger.projected = retained_columns.is_some();
+			ledger.exchange_handling = handling;
+			ledger.pass_through_requested = exchange_handling == ExchangeHandling::PassThrough;
+			ledger.pass_through_refusal = refusal;
 			if retain_unkeyed_rows {
 				ledger.unsupported = Some("preserved_rows");
 			} else if join_partition.is_some() {
 				ledger.unsupported = Some("join_partition");
 			}
 		}
+
+		let split_exchange = match handling {
+			Some(ExchangeHandling::Split) => scan_input.exchange,
+			_ => None,
+		};
 
 		let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
 			return Err(ExecutionError::InvalidExpression {
@@ -11365,7 +11426,7 @@ impl Executor {
 				}
 			}
 
-			if let Some(exchange) = scan_input.exchange {
+			if let Some(exchange) = split_exchange {
 				let repartition_started = BuildWriteLedger::begin(&ledger);
 
 				let partitioned = self.repartition_exchange_batch(
@@ -14202,6 +14263,7 @@ impl Executor {
 							true,
 							None,
 							morsel,
+							ExchangeHandling::Split,
 							None,
 						)
 						.await
@@ -24020,6 +24082,11 @@ impl Executor {
 					false,
 					None,
 					morsel,
+					// ADR 597: the one call site that may request pass-through; the writer admits
+					// it or falls back to the split with the refusal on the ledger. The record
+					// closed without a measurement, so the split is requested here (the
+					// treatment tree, `1917d0d6…`, requested pass-through and was never run).
+					ExchangeHandling::Split,
 					build_write_ledger.as_mut(),
 				)
 				.await?;
@@ -24033,6 +24100,17 @@ impl Executor {
 					BuildWriteChild::Finish,
 					finish_started,
 				);
+
+				// ADR 597: the resident total after the finish guard, and the scratch as it stands.
+				if let Some(ledger) = build_write_ledger.as_mut() {
+					let (plaintext, refs) = spilled.write_scratch_capacities();
+					ledger.observe_peaks_after_finish(
+						plaintext,
+						refs,
+						spilled.writer_peak_bytes(),
+						spilled.resident_state_total(),
+					);
+				}
 
 				finished
 			}
@@ -35290,14 +35368,50 @@ mod tests {
 		exchange: Option<u32>,
 		retained: Option<Vec<ColumnOrdinal>>,
 		row_limit: Option<usize>,
+		/// ADR 597: the Exchange key program when not the plain `k` column, the plan's
+		/// null-safety, and a task budget other than the high test budget.
+		exchange_key: Option<BoundExprProgram>,
+		null_safe_keys: bool,
+		budget: Option<TaskBudget>,
+	}
+
+	impl Adr596Fixture {
+		fn plain(
+			batches: Vec<RecordBatch>,
+			filter: bool,
+			exchange: Option<u32>,
+			retained: Option<Vec<ColumnOrdinal>>,
+			row_limit: Option<usize>,
+		) -> Self {
+			Self {
+				batches,
+				filter,
+				exchange,
+				retained,
+				row_limit,
+				exchange_key: None,
+				null_safe_keys: false,
+				budget: None,
+			}
+		}
 	}
 
 	fn adr596_batch(rows: &[(Option<i64>, i64, i64)]) -> RecordBatch {
+		adr597_batch_with_payload(rows, |id| format!("row-{id}"))
+	}
+
+	/// ADR 597: the fixture batch with a variable-width `s` column at ordinal 4, its content
+	/// chosen per row, so a page's size is a function of the rows it holds.
+	fn adr597_batch_with_payload(
+		rows: &[(Option<i64>, i64, i64)],
+		payload: impl Fn(i64) -> String,
+	) -> RecordBatch {
 		let schema = Arc::new(Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
 			Field::new("k", DataType::Int64, true),
 			Field::new("v", DataType::Int64, false),
 			Field::new("f", DataType::Int64, false),
+			Field::new("s", DataType::Utf8, false),
 		]));
 		RecordBatch::try_new(
 			schema,
@@ -35312,15 +35426,32 @@ mod tests {
 				Arc::new(Int64Array::from(
 					rows.iter().map(|(_, _, f)| *f).collect::<Vec<_>>(),
 				)),
+				Arc::new(StringArray::from(
+					(0..rows.len() as i64).map(payload).collect::<Vec<_>>(),
+				)),
 			],
 		)
-		.expect("adr596 batch")
+		.expect("adr597 batch")
 	}
 
 	async fn adr596_write(
 		fixture: &Adr596Fixture,
-		mut ledger: Option<&mut BuildWriteLedger>,
+		ledger: Option<&mut BuildWriteLedger>,
 	) -> (u64, u64, u64) {
+		let (rows, pages, bytes, _) = adr596_write_with(fixture, ExchangeHandling::Split, ledger)
+			.await
+			.expect("write through the real path");
+		(rows, pages, bytes)
+	}
+
+	/// ADR 597: the same write under a requested `ExchangeHandling`, returning the finished
+	/// build's rows, pages, spill bytes, and the build itself for lookups; an error from the
+	/// writer is returned after the build is cleaned up, as the spilled branch does.
+	async fn adr596_write_with(
+		fixture: &Adr596Fixture,
+		exchange_handling: ExchangeHandling,
+		mut ledger: Option<&mut BuildWriteLedger>,
+	) -> Result<(u64, u64, u64, SpilledInnerJoinBuild), (ExecutionError, u64, PathBuf)> {
 		let schema = fixture.batches[0].schema();
 		let mut scan = test_scan_plan_with_first_field_key(TableId(96), schema.clone(), 96);
 		if let ExecutionPlan::Scan { row_limit, .. } = &mut scan {
@@ -35347,7 +35478,9 @@ mod tests {
 			Some(partition_count) => ExecutionPlan::Exchange {
 				input: Box::new(plan),
 				partition_count,
-				key: bound_column_root("k", ColumnOrdinal(1), DataType::Int64, true),
+				key: fixture.exchange_key.clone().unwrap_or_else(|| {
+					bound_column_root("k", ColumnOrdinal(1), DataType::Int64, true)
+				}),
 			},
 			None => plan,
 		};
@@ -35366,7 +35499,7 @@ mod tests {
 						&projected_keys,
 						&probe_schema,
 						&[ColumnOrdinal(0)],
-						false,
+						fixture.null_safe_keys,
 					)
 					.expect("projected key plan"),
 					projected_keys,
@@ -35378,7 +35511,7 @@ mod tests {
 					&build_keys,
 					&probe_schema,
 					&[ColumnOrdinal(0)],
-					false,
+					fixture.null_safe_keys,
 				)
 				.expect("key plan"),
 				build_keys.clone(),
@@ -35389,7 +35522,8 @@ mod tests {
 				batches: HashMap::from([(TableId(96), fixture.batches.clone())]),
 				requested_tables: Arc::new(Mutex::new(Vec::new())),
 			}),
-			ExecutionContext::local_test().with_task_budget(high_test_budget()),
+			ExecutionContext::local_test()
+				.with_task_budget(fixture.budget.unwrap_or_else(high_test_budget)),
 		);
 		// Create and finish are clocked as the spilled branch clocks them, around the writer.
 		let create_started = BuildWriteLedger::begin(&ledger);
@@ -35402,34 +35536,52 @@ mod tests {
 		.await
 		.expect("spilled build");
 		BuildWriteLedger::finish(&mut ledger, BuildWriteChild::Create, create_started);
-		executor
+		let written = executor
 			.write_streaming_scan_inner_build_batches(
 				&mut spilled,
 				scan_input,
 				fixture.retained.as_deref(),
 				&write_keys,
 				key_plan,
-				false,
+				fixture.null_safe_keys,
 				false,
 				None,
 				None,
+				exchange_handling,
 				ledger.as_deref_mut(),
 			)
-			.await
-			.expect("write through the real path");
+			.await;
+		if let Err(error) = written {
+			// As the spilled branch does on an error: the pages written so far are on record,
+			// the build is cleaned up, no runtime is returned.
+			let pages = spilled.page_count() as u64;
+			let path = spilled.spill_path().to_path_buf();
+			spilled.cleanup().await;
+			return Err((error, pages, path));
+		}
 		let finish_started = BuildWriteLedger::begin(&ledger);
-		spilled
-			.finish(executor.context.task_budget)
-			.await
-			.expect("finish");
+		if let Err(error) = spilled.finish(executor.context.task_budget).await {
+			let pages = spilled.page_count() as u64;
+			let path = spilled.spill_path().to_path_buf();
+			spilled.cleanup().await;
+			return Err((error, pages, path));
+		}
 		BuildWriteLedger::finish(&mut ledger, BuildWriteChild::Finish, finish_started);
-		let result = (
+		if let Some(ledger) = ledger.as_deref_mut() {
+			let (plaintext, refs) = spilled.write_scratch_capacities();
+			ledger.observe_peaks_after_finish(
+				plaintext,
+				refs,
+				spilled.writer_peak_bytes(),
+				spilled.resident_state_total(),
+			);
+		}
+		Ok((
 			spilled.input_row_count(),
 			spilled.page_count() as u64,
 			spilled.spill_bytes(),
-		);
-		spilled.cleanup().await;
-		result
+			spilled,
+		))
 	}
 
 	async fn adr596_ledgered(fixture: Adr596Fixture) -> BuildWriteLedger {
@@ -35507,8 +35659,8 @@ mod tests {
 	async fn adr596_ledger_counts_follow_the_branches_the_writer_takes() {
 		// Projected, filtered, to the stream's end: three batches, the middle one filtered
 		// empty, 10 + 5 rows kept in two chunks (one per batch), two pages.
-		let ledger = adr596_ledgered(Adr596Fixture {
-			batches: vec![
+		let ledger = adr596_ledgered(Adr596Fixture::plain(
+			vec![
 				adr596_batch(
 					&(0..12)
 						.map(|i| (Some(i), i, if i < 10 { i } else { -1 }))
@@ -35517,11 +35669,11 @@ mod tests {
 				adr596_batch(&[(Some(20), 1, 2), (Some(21), 3, 4)]),
 				adr596_batch(&(0..5).map(|i| (Some(30 + i), i, i)).collect::<Vec<_>>()),
 			],
-			filter: true,
-			exchange: None,
-			retained: Some(vec![ColumnOrdinal(1), ColumnOrdinal(2)]),
-			row_limit: None,
-		})
+			true,
+			None,
+			Some(vec![ColumnOrdinal(1), ColumnOrdinal(2)]),
+			None,
+		))
 		.await;
 		assert!(ledger.filter_present && ledger.projected && ledger.exchange_partitions.is_none());
 		assert_eq!(ledger.termination, Some(BuildWriteTermination::StreamEnd));
@@ -35560,16 +35712,16 @@ mod tests {
 
 		// Unprojected, no filter, an Exchange of one partition: every row kept whole, the
 		// repartition counted per batch, no project call.
-		let ledger = adr596_ledgered(Adr596Fixture {
-			batches: vec![
+		let ledger = adr596_ledgered(Adr596Fixture::plain(
+			vec![
 				adr596_batch(&(0..7).map(|i| (Some(i), 0, 1)).collect::<Vec<_>>()),
 				adr596_batch(&(0..3).map(|i| (Some(10 + i), 0, 1)).collect::<Vec<_>>()),
 			],
-			filter: false,
-			exchange: Some(1),
-			retained: None,
-			row_limit: None,
-		})
+			false,
+			Some(1),
+			None,
+			None,
+		))
 		.await;
 		assert!(!ledger.filter_present && !ledger.projected);
 		assert_eq!(ledger.exchange_partitions, Some(1));
@@ -35607,16 +35759,16 @@ mod tests {
 		assert_eq!(ledger.micros(BuildWriteChild::Project), 0);
 
 		// An all-unkeyed chunk: key extraction counted, no page emitted, no index mode.
-		let ledger = adr596_ledgered(Adr596Fixture {
-			batches: vec![
+		let ledger = adr596_ledgered(Adr596Fixture::plain(
+			vec![
 				adr596_batch(&[(None, 0, 0), (None, 1, 1), (None, 2, 2)]),
 				adr596_batch(&[(Some(1), 0, 0), (None, 1, 1)]),
 			],
-			filter: false,
-			exchange: None,
-			retained: None,
-			row_limit: None,
-		})
+			false,
+			None,
+			None,
+			None,
+		))
 		.await;
 		assert_eq!((ledger.batches_read, ledger.batches_written), (2, 2));
 		assert_eq!((ledger.rows_read, ledger.rows_kept), (5, 5));
@@ -35629,13 +35781,13 @@ mod tests {
 		assert_eq!(ledger.calls(BuildWriteChild::Encode), 1);
 		assert_eq!(ledger.calls(BuildWriteChild::PageWrite), 1);
 		assert_eq!(ledger.calls(BuildWriteChild::Index), 1);
-		let ledger = adr596_ledgered(Adr596Fixture {
-			batches: vec![adr596_batch(&[(None, 0, 0), (None, 1, 1)])],
-			filter: false,
-			exchange: None,
-			retained: None,
-			row_limit: None,
-		})
+		let ledger = adr596_ledgered(Adr596Fixture::plain(
+			vec![adr596_batch(&[(None, 0, 0), (None, 1, 1)])],
+			false,
+			None,
+			None,
+			None,
+		))
 		.await;
 		assert_eq!(
 			(ledger.chunks, ledger.chunks_unkeyed, ledger.pages),
@@ -35646,17 +35798,17 @@ mod tests {
 
 		// A row limit filled by the second batch: the third poll returns a batch the limit
 		// discards whole (read, never admitted), the loop ends there, and no final poll is made.
-		let ledger = adr596_ledgered(Adr596Fixture {
-			batches: vec![
+		let ledger = adr596_ledgered(Adr596Fixture::plain(
+			vec![
 				adr596_batch(&(0..4).map(|i| (Some(i), 0, 0)).collect::<Vec<_>>()),
 				adr596_batch(&(0..4).map(|i| (Some(10 + i), 0, 0)).collect::<Vec<_>>()),
 				adr596_batch(&(0..4).map(|i| (Some(20 + i), 0, 0)).collect::<Vec<_>>()),
 			],
-			filter: false,
-			exchange: None,
-			retained: Some(vec![ColumnOrdinal(1)]),
-			row_limit: Some(6),
-		})
+			false,
+			None,
+			Some(vec![ColumnOrdinal(1)]),
+			Some(6),
+		))
 		.await;
 		assert_eq!(ledger.termination, Some(BuildWriteTermination::RowLimit));
 		assert_eq!(
@@ -35678,33 +35830,537 @@ mod tests {
 		assert_eq!(ledger.facts()["termination"], "row_limit");
 	}
 
+	// -----------------------------------------------------------------------------------------
+	// ADR 597: the write-only pass-through of the Exchange, its admission, parity, and memory.
+	// -----------------------------------------------------------------------------------------
+
+	/// The complete rows a build returns for `key`, as strings, sorted: every column of every
+	/// matched row, read through `lookup` and the page reader as the probe reads them.
+	async fn adr597_rows_for_key(
+		spilled: &mut SpilledInnerJoinBuild,
+		key: &JoinKey,
+	) -> Vec<String> {
+		let matches = spilled
+			.lookup(key)
+			.await
+			.expect("lookup")
+			.into_iter()
+			.map(|build| SpilledInnerJoinMatch { build, probe: 0 })
+			.collect::<Vec<_>>();
+		let pages = load_streamed_inner_match_pages(spilled, &matches, None)
+			.await
+			.expect("pages");
+		let mut rows = matches
+			.iter()
+			.map(|m| {
+				let page = &pages[&m.build.page_index];
+				let row = m.build.row as usize;
+				page.columns()
+					.iter()
+					.map(|column| format!("{:?}", column.slice(row, 1)))
+					.collect::<Vec<_>>()
+					.join("|")
+			})
+			.collect::<Vec<_>>();
+		rows.sort();
+		rows
+	}
+
+	/// The distinct join keys of the fixture's batches under `key_plan`, nulls included when
+	/// the plan is null-safe.
+	fn adr597_distinct_keys(
+		batches: &[RecordBatch],
+		key_plan: JoinKeyPlan,
+		null_safe_keys: bool,
+	) -> Vec<JoinKey> {
+		let mut keys = Vec::new();
+		for batch in batches {
+			let arrays = key_arrays(batch, &[ColumnOrdinal(1)]).expect("key arrays");
+			for row in 0..batch.num_rows() {
+				if let Some(key) = join_key_at(key_plan, &arrays, row, null_safe_keys).expect("key")
+					&& !keys.contains(&key)
+				{
+					keys.push(key);
+				}
+			}
+		}
+		keys
+	}
+
+	/// Unique keys, duplicates within a batch and across batches, nulls, three batches.
+	fn adr597_parity_batches() -> Vec<RecordBatch> {
+		vec![
+			adr596_batch(&[
+				(Some(1), 10, 0),
+				(Some(2), 20, 0),
+				(Some(2), 21, 0),
+				(Some(3), 30, 0),
+				(None, 40, 0),
+				(Some(4), 50, 0),
+				(Some(11), 60, 0),
+				(Some(12), 70, 0),
+			]),
+			adr596_batch(&[
+				(Some(2), 22, 1),
+				(Some(5), 80, 1),
+				(None, 90, 1),
+				(Some(3), 31, 1),
+				(Some(13), 100, 1),
+				(Some(14), 110, 1),
+			]),
+			adr596_batch(&[
+				(Some(6), 120, 2),
+				(Some(3), 32, 2),
+				(Some(15), 130, 2),
+				(Some(16), 140, 2),
+				(Some(17), 150, 2),
+			]),
+		]
+	}
+
+	// ADR 597: the same batches written under the split and under pass-through return the
+	// same complete rows for every key through the build's own lookup — unique keys, keys
+	// repeated within and across batches, null keys under both null-safety settings, and an
+	// absent key — while the page counts differ, so the two paths are not the same path.
+	#[tokio::test]
+	async fn adr597_pass_through_returns_the_same_rows_for_every_key_as_the_split() {
+		for null_safe_keys in [false, true] {
+			let fixture = |handling_batches: Vec<RecordBatch>| Adr596Fixture {
+				batches: handling_batches,
+				filter: false,
+				exchange: Some(4),
+				retained: None,
+				row_limit: None,
+				exchange_key: None,
+				null_safe_keys,
+				budget: None,
+			};
+			let batches = adr597_parity_batches();
+			let mut split_ledger = BuildWriteLedger::default();
+			let (split_rows, split_pages, _, mut split) = adr596_write_with(
+				&fixture(batches.clone()),
+				ExchangeHandling::Split,
+				Some(&mut split_ledger),
+			)
+			.await
+			.expect("split write");
+			let mut pass_ledger = BuildWriteLedger::default();
+			let (pass_rows, pass_pages, _, mut pass) = adr596_write_with(
+				&fixture(batches.clone()),
+				ExchangeHandling::PassThrough,
+				Some(&mut pass_ledger),
+			)
+			.await
+			.expect("pass-through write");
+			assert_eq!(
+				split_ledger.exchange_handling,
+				Some(ExchangeHandling::Split)
+			);
+			assert_eq!(
+				pass_ledger.exchange_handling,
+				Some(ExchangeHandling::PassThrough)
+			);
+			assert_eq!(pass_ledger.pass_through_refusal, None);
+			assert!(pass_ledger.pass_through_requested && !split_ledger.pass_through_requested);
+			assert_eq!(pass_ledger.calls(BuildWriteChild::Repartition), 0);
+			assert_eq!(split_ledger.calls(BuildWriteChild::Repartition), 3);
+			assert_eq!(split_rows, pass_rows, "null_safe={null_safe_keys}");
+			assert_eq!(
+				split_ledger.index_entries, pass_ledger.index_entries,
+				"null_safe={null_safe_keys}"
+			);
+			assert_eq!(pass_pages, 3, "one page per batch under pass-through");
+			assert!(
+				split_pages > pass_pages,
+				"the split writes more pages ({split_pages}) than pass-through ({pass_pages})"
+			);
+			let key_plan = if null_safe_keys {
+				JoinKeyPlan::Generic
+			} else {
+				JoinKeyPlan::Int64
+			};
+			let keys = adr597_distinct_keys(&batches, key_plan, null_safe_keys);
+			assert_eq!(keys.len(), if null_safe_keys { 14 } else { 13 });
+			for key in &keys {
+				let split_rows = adr597_rows_for_key(&mut split, key).await;
+				let pass_rows = adr597_rows_for_key(&mut pass, key).await;
+				assert!(!split_rows.is_empty(), "{key:?} present on the split build");
+				assert_eq!(split_rows, pass_rows, "{key:?} null_safe={null_safe_keys}");
+			}
+			// Keys 2 and 3 recur: three rows each, from two and three batches.
+			let three = adr597_rows_for_key(&mut pass, &keys[2]).await;
+			assert_eq!(three.len(), 3, "key 3 has three rows across three batches");
+			// An absent key returns nothing on both.
+			let absent = if null_safe_keys {
+				let probe = adr596_batch(&[(Some(99), 0, 0)]);
+				let arrays = key_arrays(&probe, &[ColumnOrdinal(1)]).unwrap();
+				join_key_at(JoinKeyPlan::Generic, &arrays, 0, true)
+					.unwrap()
+					.unwrap()
+			} else {
+				JoinKey::Int64(99)
+			};
+			assert!(adr597_rows_for_key(&mut split, &absent).await.is_empty());
+			assert!(adr597_rows_for_key(&mut pass, &absent).await.is_empty());
+			// Under a non-null-safe plan the null rows are written but not indexed on either.
+			if !null_safe_keys {
+				assert_eq!(split_ledger.index_entries, split_rows - 2);
+			}
+			split.cleanup().await;
+			pass.cleanup().await;
+		}
+	}
+
+	fn adr597_two_root_key() -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		for (name, ordinal) in [("k", ColumnOrdinal(1)), ("v", ColumnOrdinal(2))] {
+			let column = builder.append_column(ResolvedColumn {
+				name: ColumnName(name.to_string()),
+				ordinal,
+				data_type: DataType::Int64,
+				nullable: false,
+				pbc_eligible: false,
+			});
+			builder.push_root(column);
+		}
+		builder.build()
+	}
+
+	// ADR 597: outside the admitted shape the writer takes the split — errors included — and
+	// records why; inside it, a null-carrying Int64 key is admitted.
+	#[tokio::test]
+	async fn adr597_pass_through_is_refused_outside_the_admitted_shape_and_takes_the_split() {
+		let batches = vec![adr596_batch(&[
+			(Some(1), 10, 0),
+			(None, 11, 0),
+			(Some(2), 12, 0),
+		])];
+		let cases: Vec<(&str, Option<BoundExprProgram>, u32, &str)> = vec![
+			(
+				"computed key",
+				Some(binary_residual_program(
+					BoundBinaryOp::Add,
+					ColumnOrdinal(1),
+					DataType::Int64,
+					true,
+					ColumnOrdinal(2),
+					DataType::Int64,
+					false,
+				)),
+				4,
+				"computed_key",
+			),
+			(
+				"two-root key",
+				Some(adr597_two_root_key()),
+				4,
+				"multi_root_key",
+			),
+			(
+				"ordinal past the schema",
+				Some(bound_column_root(
+					"x",
+					ColumnOrdinal(9),
+					DataType::Int64,
+					false,
+				)),
+				4,
+				"key_ordinal_out_of_schema",
+			),
+			(
+				"utf8 key",
+				Some(bound_column_root(
+					"s",
+					ColumnOrdinal(4),
+					DataType::Utf8,
+					false,
+				)),
+				4,
+				"key_type_not_fixed_width",
+			),
+			("zero partition count", None, 0, "zero_partition_count"),
+		];
+		for (label, key, partition_count, refusal) in cases {
+			let fixture = |exchange_key: Option<BoundExprProgram>| Adr596Fixture {
+				batches: batches.clone(),
+				filter: false,
+				exchange: Some(partition_count),
+				retained: None,
+				row_limit: None,
+				exchange_key,
+				null_safe_keys: false,
+				budget: None,
+			};
+			let mut control_ledger = BuildWriteLedger::default();
+			let control = adr596_write_with(
+				&fixture(key.clone()),
+				ExchangeHandling::Split,
+				Some(&mut control_ledger),
+			)
+			.await;
+			let mut ledger = BuildWriteLedger::default();
+			let treatment = adr596_write_with(
+				&fixture(key.clone()),
+				ExchangeHandling::PassThrough,
+				Some(&mut ledger),
+			)
+			.await;
+			assert_eq!(
+				ledger.exchange_handling,
+				Some(ExchangeHandling::Split),
+				"{label}"
+			);
+			assert!(ledger.pass_through_requested, "{label}");
+			assert_eq!(ledger.pass_through_refusal, Some(refusal), "{label}");
+			assert_eq!(
+				control_ledger.pass_through_refusal, None,
+				"{label}: no request"
+			);
+			// The same behaviour as the control: the same outcome, rows, and pages, or the same
+			// error where the split's evaluation fails.
+			match (control, treatment) {
+				(Ok((c_rows, c_pages, c_bytes, c)), Ok((t_rows, t_pages, t_bytes, t))) => {
+					assert_eq!(
+						(c_rows, c_pages, c_bytes),
+						(t_rows, t_pages, t_bytes),
+						"{label}"
+					);
+					assert_eq!(
+						ledger.calls(BuildWriteChild::Repartition),
+						control_ledger.calls(BuildWriteChild::Repartition),
+						"{label}"
+					);
+					c.cleanup().await;
+					t.cleanup().await;
+				}
+				(Err((c_error, ..)), Err((t_error, ..))) => {
+					assert_eq!(c_error.to_string(), t_error.to_string(), "{label}");
+					assert!(
+						matches!(
+							refusal,
+							"zero_partition_count" | "key_ordinal_out_of_schema"
+						),
+						"{label}: only the count and the ordinal fail under the split"
+					);
+				}
+				(control, treatment) => panic!(
+					"{label}: control {:?} treatment {:?}",
+					control
+						.as_ref()
+						.map(|_| ())
+						.map_err(|(e, ..)| e.to_string()),
+					treatment
+						.as_ref()
+						.map(|_| ())
+						.map_err(|(e, ..)| e.to_string())
+				),
+			}
+		}
+		// Inside the shape: a null-carrying Int64 key is admitted.
+		let mut ledger = BuildWriteLedger::default();
+		let (rows, pages, _, build) = adr596_write_with(
+			&Adr596Fixture::plain(batches.clone(), false, Some(4), None, None),
+			ExchangeHandling::PassThrough,
+			Some(&mut ledger),
+		)
+		.await
+		.expect("admitted");
+		assert_eq!(
+			ledger.exchange_handling,
+			Some(ExchangeHandling::PassThrough)
+		);
+		assert_eq!(ledger.pass_through_refusal, None);
+		assert_eq!((rows, pages), (3, 1));
+		build.cleanup().await;
+		// Not admitted on the preserved-rows branch, whatever the key.
+		let refusal = exchange_pass_through_refusal(
+			decompose_streaming_scan_probe_input(&ExecutionPlan::Exchange {
+				input: Box::new(test_scan_plan_with_first_field_key(
+					TableId(98),
+					batches[0].schema(),
+					98,
+				)),
+				partition_count: 4,
+				key: bound_column_root("k", ColumnOrdinal(1), DataType::Int64, true),
+			})
+			.unwrap(),
+			true,
+			false,
+		);
+		assert_eq!(refusal, Some("branch_not_admitted"));
+	}
+
+	// ADR 597: what the write guard does with a whole-batch page of variable-width rows that
+	// the split's pages fit under: it does not refuse on the page's size — it releases the
+	// scratch (dropping both buffers, resetting the plaintext high-water mark) and re-checks the
+	// retained state alone; the ledger records the transient peak the guard read before that
+	// release. A refusal comes only when the retained state without the scratch — the index,
+	// the reserve — is over the cap, and then identically on both paths, after the page was
+	// written and pushed; the branch's cleanup removes the file.
+	#[tokio::test]
+	async fn adr597_the_write_guard_releases_the_scratch_for_a_larger_page_and_refuses_only_on_retained_state()
+	 {
+		let rows = (0..2_000i64).map(|i| (Some(i), i, 0)).collect::<Vec<_>>();
+		// Incompressible content, since the page encoding compresses: a linear congruential
+		// stream of letters, 380–398 bytes per row.
+		let batches = vec![adr597_batch_with_payload(&rows, |id| {
+			let mut state =
+				0x9E37_79B9_7F4A_7C15u64 ^ (id as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+			(0..380 + (id % 7) as usize * 3)
+				.map(|_| {
+					state = state
+						.wrapping_mul(6_364_136_223_846_793_005)
+						.wrapping_add(1_442_695_040_888_963_407);
+					(b'a' + ((state >> 33) % 26) as u8) as char
+				})
+				.collect::<String>()
+		})];
+		// The split's four pieces make pages of about 200 KB; the whole batch about 800 KB.
+		// The retained-footprint cap is 16 × the task memory: 32 KB of memory admits 512 KB of
+		// resident state, between the two.
+		let budget_of = |memory: u64| TaskBudget {
+			memory: ByteCount::new(memory),
+			spill_bytes: ByteCount::new(64 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let fixture = |memory: u64| Adr596Fixture {
+			batches: batches.clone(),
+			filter: false,
+			exchange: Some(4),
+			retained: None,
+			row_limit: None,
+			exchange_key: None,
+			null_safe_keys: false,
+			budget: Some(budget_of(memory)),
+		};
+		let memory = 32 * 1024u64;
+		let cap = join_spill_retained_footprint_memory_cap(memory);
+		let mut split_ledger = BuildWriteLedger::default();
+		let (_, split_pages, _, split) = adr596_write_with(
+			&fixture(memory),
+			ExchangeHandling::Split,
+			Some(&mut split_ledger),
+		)
+		.await
+		.expect("the split's pages are admitted");
+		assert!(split_pages >= 2);
+		assert!(split_ledger.writer_peak_bytes > 100 * 1024);
+		assert!(split_ledger.writer_peak_bytes < 400 * 1024);
+		assert!(split_ledger.scratch_plaintext_capacity_peak >= split_ledger.writer_peak_bytes);
+		assert!(split_ledger.scratch_refs_capacity_peak > 0);
+		assert!(
+			split_ledger.resident_state_peak_bytes
+				> split_ledger.writer_peak_bytes + super::spill::JOIN_SPILL_PAGE_SIZE as u64
+		);
+		assert!(split_ledger.resident_state_peak_bytes <= cap);
+		assert_eq!(
+			split_ledger.scratch_releases, 0,
+			"the split's pages never trip a release"
+		);
+		let (plaintext, refs) = split.write_scratch_capacities();
+		assert!(plaintext > 0 && refs > 0, "the split's scratch is retained");
+		split.cleanup().await;
+
+		let mut ledger = BuildWriteLedger::default();
+		let (rows_kept, pages, _, pass) = adr596_write_with(
+			&fixture(memory),
+			ExchangeHandling::PassThrough,
+			Some(&mut ledger),
+		)
+		.await
+		.expect("the whole-batch page is admitted: the guard releases the scratch");
+		assert_eq!((rows_kept, pages), (2_000, 1));
+		assert_eq!(
+			ledger.exchange_handling,
+			Some(ExchangeHandling::PassThrough)
+		);
+		assert!(
+			ledger.writer_peak_bytes > 600 * 1024,
+			"the transient peak is recorded before the release: {}",
+			ledger.writer_peak_bytes
+		);
+		assert!(
+			ledger.resident_state_peak_bytes > cap,
+			"the guard read a total over the cap"
+		);
+		assert_eq!(ledger.scratch_releases, 1, "one release, no refusal");
+		assert_eq!(
+			pass.write_scratch_capacities(),
+			(0, 0),
+			"the scratch was dropped by the release"
+		);
+		assert_eq!(pass.writer_peak_bytes(), 0);
+		pass.cleanup().await;
+
+		// The retained state alone over the cap: 2 KB of memory admits 32 KB, under the 64 KB
+		// reserve, so the first page is refused at the write guard on both paths alike.
+		let memory = 2 * 1024u64;
+		for handling in [ExchangeHandling::Split, ExchangeHandling::PassThrough] {
+			let mut ledger = BuildWriteLedger::default();
+			let (error, pages_at_refusal, path) =
+				match adr596_write_with(&fixture(memory), handling, Some(&mut ledger)).await {
+					Err(refused) => refused,
+					Ok((rows, pages, ..)) => {
+						panic!("{handling:?} admitted the page: {rows} rows, {pages} pages")
+					}
+				};
+			let ExecutionError::BudgetExhausted {
+				dimension,
+				producer,
+				detail,
+				..
+			} = &error
+			else {
+				panic!("expected a budget error, got {error}");
+			};
+			assert_eq!(*dimension, BudgetDimension::Memory);
+			assert_eq!(*producer, "streamed inner join build spill resident state");
+			assert!(detail.to_string().contains("site=write"), "{detail}");
+			assert!(
+				detail.to_string().contains("writer_peak_bytes=0"),
+				"the scratch was released before the refusal: {detail}"
+			);
+			assert_eq!(
+				pages_at_refusal, 1,
+				"the page was written and pushed before the guard"
+			);
+			assert!(
+				!path.exists(),
+				"the branch's cleanup removed the spill file"
+			);
+			// The ledger is published only by a write that returns; the release before this
+			// refusal is on the error's detail, not on the ledger.
+			assert_eq!(ledger.scratch_releases, 0);
+		}
+	}
+
 	// ADR 596: the loop with a limit exactly filled by the stream's last batch still observes a
 	// final `None`, and the writer reports the shapes outside the band's vocabulary.
 	#[tokio::test]
 	async fn adr596_ledger_names_the_stream_end_under_an_exact_limit_and_unsupported_shapes() {
-		let ledger = adr596_ledgered(Adr596Fixture {
-			batches: vec![
+		let ledger = adr596_ledgered(Adr596Fixture::plain(
+			vec![
 				adr596_batch(&(0..4).map(|i| (Some(i), 0, 0)).collect::<Vec<_>>()),
 				adr596_batch(&(0..4).map(|i| (Some(10 + i), 0, 0)).collect::<Vec<_>>()),
 			],
-			filter: false,
-			exchange: None,
-			retained: None,
-			row_limit: Some(8),
-		})
+			false,
+			None,
+			None,
+			Some(8),
+		))
 		.await;
 		assert_eq!(ledger.termination, Some(BuildWriteTermination::StreamEnd));
 		assert_eq!(ledger.calls(BuildWriteChild::ScanPoll), 3);
 		assert_eq!(ledger.rows_kept, 8);
 		assert_eq!(ledger.batches_limit_discarded, 0);
 
-		let fixture = Adr596Fixture {
-			batches: vec![adr596_batch(&[(Some(1), 0, 0)])],
-			filter: false,
-			exchange: None,
-			retained: None,
-			row_limit: None,
-		};
+		let fixture = Adr596Fixture::plain(
+			vec![adr596_batch(&[(Some(1), 0, 0)])],
+			false,
+			None,
+			None,
+			None,
+		);
 		let schema = fixture.batches[0].schema();
 		let scan = test_scan_plan_with_first_field_key(TableId(97), schema.clone(), 97);
 		let scan_input = decompose_streaming_scan_probe_input(&scan).expect("scan input");
@@ -35735,6 +36391,7 @@ mod tests {
 				true,
 				None,
 				None,
+				ExchangeHandling::Split,
 				Some(&mut ledger),
 			)
 			.await
