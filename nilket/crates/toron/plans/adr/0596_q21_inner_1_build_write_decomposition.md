@@ -1,8 +1,18 @@
 # ADR 596 - q21's replay-1 build write on strix: lifecycle decomposition of `inner_1_build_write`
 
-**Status:** PROPOSED. Successor to ADR 595, which resolved the replay-1
-preparation's owner to `inner_1_build_write` under a verified separated
-launch.
+**Status:** CLOSED, BELOW FLOOR. One run on strix under the separated
+launch (results in
+`plans/impl/0596_q21_inner_1_build_write_decomposition_results.md`):
+separation and window verified, off range 324.1 ms (3.61%) inside the
+cutoff, the seventh band reconciled and consistent on every pair, and
+no child clearing the 648.2 ms floor (nor 500 ms): the leader is
+`build_write_index` at 482.4 median-scaled ms (54.9% of the write,
+5.37% of q21), then `build_write_scan_wait` at 179.0. Facts: the build's
+scan input is an Exchange of four partitions with no filter, rows
+written whole, 5,860 pages of about a thousand rows, legacy index. No
+owner, no cut; the successor is chosen from the shape. Successor to ADR
+595, which resolved the replay-1 preparation's owner to
+`inner_1_build_write` under a verified separated launch.
 
 
 ## Context

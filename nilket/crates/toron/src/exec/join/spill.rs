@@ -1354,6 +1354,168 @@ impl CoalescedPageIndexMode {
 	}
 }
 
+/// ADR 596: the eleven children of the spilled inner build's write, in the order the writer
+/// runs them. Each is one span per call of the code it names; the caller's awaits are
+/// sequential, so the spans are disjoint and their sum is bounded by `inner_1_build_write`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::exec) enum BuildWriteChild {
+	Create,
+	ScanOpen,
+	ScanPoll,
+	Filter,
+	Repartition,
+	Project,
+	KeyExtract,
+	Encode,
+	PageWrite,
+	Index,
+	Finish,
+}
+
+impl BuildWriteChild {
+	pub(in crate::exec) const ALL: [Self; 11] = [
+		Self::Create,
+		Self::ScanOpen,
+		Self::ScanPoll,
+		Self::Filter,
+		Self::Repartition,
+		Self::Project,
+		Self::KeyExtract,
+		Self::Encode,
+		Self::PageWrite,
+		Self::Index,
+		Self::Finish,
+	];
+
+	/// The receipt's term name; `build_write_scan_open` and `build_write_scan_poll` are reported
+	/// beside each other and summed as `scan_wait` by the rule, never ranked beside it.
+	pub(in crate::exec) const fn name(self) -> &'static str {
+		match self {
+			Self::Create => "build_write_create",
+			Self::ScanOpen => "build_write_scan_open",
+			Self::ScanPoll => "build_write_scan_poll",
+			Self::Filter => "build_write_filter",
+			Self::Repartition => "build_write_repartition",
+			Self::Project => "build_write_project",
+			Self::KeyExtract => "build_write_key_extract",
+			Self::Encode => "build_write_encode",
+			Self::PageWrite => "build_write_page_write",
+			Self::Index => "build_write_index",
+			Self::Finish => "build_write_finish",
+		}
+	}
+
+	const fn slot(self) -> usize {
+		self as usize
+	}
+}
+
+/// How the writer's batch loop ended: a final `None` from the stream, or the row limit reached
+/// with no final poll. The poll count depends on which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::exec) enum BuildWriteTermination {
+	StreamEnd,
+	RowLimit,
+}
+
+impl BuildWriteTermination {
+	const fn name(self) -> &'static str {
+		match self {
+			Self::StreamEnd => "stream_end",
+			Self::RowLimit => "row_limit",
+		}
+	}
+}
+
+/// ADR 596: a local accumulator for the spilled build's write, threaded as `Option<&mut>`
+/// through the writer on replay 1's streamed-scan path only and `None` everywhere else. The
+/// ledger is never locked; the caller publishes it once when the branch completes. Facts follow
+/// the branches the writer actually took: a child that did not run has zero calls and zero
+/// time, and the counts say which rules apply.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(in crate::exec) struct BuildWriteLedger {
+	micros: [u64; 11],
+	calls: [u64; 11],
+	pub(in crate::exec) filter_present: bool,
+	pub(in crate::exec) exchange_partitions: Option<u32>,
+	pub(in crate::exec) projected: bool,
+	pub(in crate::exec) termination: Option<BuildWriteTermination>,
+	pub(in crate::exec) index_mode: Option<&'static str>,
+	/// A shape outside the band's vocabulary (a preserved-rows write, a join-partition
+	/// selection); the receipt reports it rather than reading the terms through the band.
+	pub(in crate::exec) unsupported: Option<&'static str>,
+	pub(in crate::exec) batches_read: u64,
+	/// Batches a poll returned that the row limit discarded whole (the limit already met);
+	/// read but never admitted to the filter, the Exchange, or the writer.
+	pub(in crate::exec) batches_limit_discarded: u64,
+	pub(in crate::exec) batches_filtered_empty: u64,
+	pub(in crate::exec) batches_written: u64,
+	pub(in crate::exec) rows_read: u64,
+	pub(in crate::exec) rows_kept: u64,
+	pub(in crate::exec) chunks: u64,
+	pub(in crate::exec) chunks_unkeyed: u64,
+	pub(in crate::exec) pages: u64,
+	pub(in crate::exec) plaintext_bytes: u64,
+	pub(in crate::exec) ciphertext_bytes: u64,
+	pub(in crate::exec) index_entries: u64,
+	pub(in crate::exec) index_compactions: u64,
+}
+
+impl BuildWriteLedger {
+	/// Take the clock only when a ledger is armed; the off arm reads nothing.
+	pub(in crate::exec) fn begin(ledger: &Option<&mut Self>) -> Option<Instant> {
+		ledger.as_ref().map(|_| Instant::now())
+	}
+
+	/// Close one span into its child; a `None` start (no ledger) records nothing.
+	pub(in crate::exec) fn finish(
+		ledger: &mut Option<&mut Self>,
+		child: BuildWriteChild,
+		started: Option<Instant>,
+	) {
+		if let (Some(ledger), Some(started)) = (ledger.as_deref_mut(), started) {
+			ledger.micros[child.slot()] = ledger.micros[child.slot()]
+				.saturating_add(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+			ledger.calls[child.slot()] = ledger.calls[child.slot()].saturating_add(1);
+		}
+	}
+
+	pub(in crate::exec) fn micros(&self, child: BuildWriteChild) -> u64 {
+		self.micros[child.slot()]
+	}
+
+	pub(in crate::exec) fn calls(&self, child: BuildWriteChild) -> u64 {
+		self.calls[child.slot()]
+	}
+
+	/// The path facts and counts as the receipt carries them.
+	pub(in crate::exec) fn facts(&self) -> serde_json::Value {
+		serde_json::json!({
+			"filter_present": self.filter_present,
+			"exchange": self.exchange_partitions.is_some(),
+			"exchange_partitions": self.exchange_partitions,
+			"projected": self.projected,
+			"termination": self.termination.map(BuildWriteTermination::name),
+			"index_mode": self.index_mode.unwrap_or("none"),
+			"unsupported": self.unsupported,
+			"batches_read": self.batches_read,
+			"batches_limit_discarded": self.batches_limit_discarded,
+			"batches_admitted": self.batches_read.saturating_sub(self.batches_limit_discarded),
+			"batches_filtered_empty": self.batches_filtered_empty,
+			"batches_written": self.batches_written,
+			"rows_read": self.rows_read,
+			"rows_kept": self.rows_kept,
+			"chunks": self.chunks,
+			"chunks_unkeyed": self.chunks_unkeyed,
+			"pages": self.pages,
+			"plaintext_bytes": self.plaintext_bytes,
+			"ciphertext_bytes": self.ciphertext_bytes,
+			"index_entries": self.index_entries,
+			"index_compactions": self.index_compactions,
+		})
+	}
+}
+
 pub(in crate::exec) struct SpilledInnerJoinBuild {
 	spill_id: u64,
 	path: PathBuf,
@@ -1624,30 +1786,31 @@ impl SpilledInnerJoinBuild {
 		self.compact_index_rescue_enabled = true;
 	}
 
+	/// `Ok(true)` when the legacy index was compacted here; `Ok(false)` when nothing applied.
 	fn try_compact_near_cap_resident_index(
 		&mut self,
 		key_plan: JoinKeyPlan,
 		null_safe_keys: bool,
 		memory_cap: u64,
-	) -> Result<(), ExecutionError> {
+	) -> Result<bool, ExecutionError> {
 		if !self.compact_index_rescue_enabled {
-			return Ok(());
+			return Ok(false);
 		}
 		if null_safe_keys || !matches!(key_plan, JoinKeyPlan::Int32 | JoinKeyPlan::Int64) {
-			return Ok(());
+			return Ok(false);
 		}
 		if self.compact_index.is_some() {
-			return Ok(());
+			return Ok(false);
 		}
 		if self.input_rows > COMPACT_SPILL_INDEX_MAX_INPUT_ROWS {
-			return Ok(());
+			return Ok(false);
 		}
 		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
 		let resident = self.resident_state().total();
 		if resident <= cap
 			|| resident > cap.saturating_add(COMPACT_SPILL_INDEX_MAX_RETAINED_CAP_OVERSHOOT_BYTES)
 		{
-			return Ok(());
+			return Ok(false);
 		}
 		let index = std::mem::take(&mut self.index);
 		let mut compact = SpilledBatchIndex::for_key_plan(key_plan, null_safe_keys);
@@ -1662,7 +1825,7 @@ impl SpilledInnerJoinBuild {
 			.compact_index
 			.as_ref()
 			.map_or(0, SpilledBatchIndex::accounted_bytes);
-		Ok(())
+		Ok(true)
 	}
 
 	pub(in crate::exec) async fn write_batch_chunks(
@@ -1673,21 +1836,49 @@ impl SpilledInnerJoinBuild {
 		null_safe_keys: bool,
 		task_budget: TaskBudget,
 	) -> Result<(), ExecutionError> {
+		self.write_batch_chunks_ledgered(
+			batch,
+			key_plan,
+			build_keys,
+			null_safe_keys,
+			task_budget,
+			None,
+		)
+		.await
+	}
+
+	/// ADR 596: the whole-row chunk loop with an optional ledger; `None` is `write_batch_chunks`.
+	pub(in crate::exec) async fn write_batch_chunks_ledgered(
+		&mut self,
+		batch: &RecordBatch,
+		key_plan: JoinKeyPlan,
+		build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		task_budget: TaskBudget,
+		mut ledger: Option<&mut BuildWriteLedger>,
+	) -> Result<(), ExecutionError> {
 		if batch.num_rows() == 0 {
 			return Ok(());
 		}
 		self.input_batches_written = self.input_batches_written.saturating_add(1);
 		self.input_rows = self.input_rows.saturating_add(batch.num_rows() as u64);
+		if let Some(ledger) = ledger.as_deref_mut() {
+			ledger.batches_written = ledger.batches_written.saturating_add(1);
+			ledger.rows_kept = ledger.rows_kept.saturating_add(batch.num_rows() as u64);
+		}
 		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
 			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
 			let chunk = batch.slice(offset, len);
-			self.write_page_batch(
+			self.write_page_batch_inner(
 				&chunk,
 				key_plan,
 				build_keys,
 				null_safe_keys,
 				false,
+				true,
 				task_budget,
+				None,
+				ledger.as_deref_mut(),
 			)
 			.await?;
 		}
@@ -1811,22 +2002,56 @@ impl SpilledInnerJoinBuild {
 		null_safe_keys: bool,
 		task_budget: TaskBudget,
 	) -> Result<(), ExecutionError> {
+		self.write_projected_batch_chunks_ledgered(
+			batch,
+			retained_columns,
+			key_plan,
+			projected_build_keys,
+			null_safe_keys,
+			task_budget,
+			None,
+		)
+		.await
+	}
+
+	/// ADR 596: the projected chunk loop with an optional ledger; `None` is
+	/// `write_projected_batch_chunks`. The projection is its own span per chunk.
+	#[allow(clippy::too_many_arguments)]
+	pub(in crate::exec) async fn write_projected_batch_chunks_ledgered(
+		&mut self,
+		batch: &RecordBatch,
+		retained_columns: &[ColumnOrdinal],
+		key_plan: JoinKeyPlan,
+		projected_build_keys: &[crate::ir::ColumnOrdinal],
+		null_safe_keys: bool,
+		task_budget: TaskBudget,
+		mut ledger: Option<&mut BuildWriteLedger>,
+	) -> Result<(), ExecutionError> {
 		if batch.num_rows() == 0 {
 			return Ok(());
 		}
 		self.input_batches_written = self.input_batches_written.saturating_add(1);
 		self.input_rows = self.input_rows.saturating_add(batch.num_rows() as u64);
+		if let Some(ledger) = ledger.as_deref_mut() {
+			ledger.batches_written = ledger.batches_written.saturating_add(1);
+			ledger.rows_kept = ledger.rows_kept.saturating_add(batch.num_rows() as u64);
+		}
 		for offset in (0..batch.num_rows()).step_by(CROSS_JOIN_OUTPUT_CHUNK_ROWS) {
 			let len = CROSS_JOIN_OUTPUT_CHUNK_ROWS.min(batch.num_rows() - offset);
 			let chunk = batch.slice(offset, len);
+			let project_started = BuildWriteLedger::begin(&ledger);
 			let projected = project_batch_columns(&chunk, retained_columns)?;
-			self.write_page_batch(
+			BuildWriteLedger::finish(&mut ledger, BuildWriteChild::Project, project_started);
+			self.write_page_batch_inner(
 				&projected,
 				key_plan,
 				projected_build_keys,
 				null_safe_keys,
 				false,
+				true,
 				task_budget,
+				None,
+				ledger.as_deref_mut(),
 			)
 			.await?;
 		}
@@ -1915,6 +2140,7 @@ impl SpilledInnerJoinBuild {
 					index_mode.indexes_at_flush(),
 					task_budget,
 					observer,
+					None,
 				)
 				.await;
 		}
@@ -1994,6 +2220,7 @@ impl SpilledInnerJoinBuild {
 			index_mode.indexes_at_flush(),
 			task_budget,
 			observer,
+			None,
 		)
 		.await
 	}
@@ -2047,10 +2274,12 @@ impl SpilledInnerJoinBuild {
 			true,
 			task_budget,
 			None,
+			None,
 		)
 		.await
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	async fn write_page_batch_inner(
 		&mut self,
 		batch: &RecordBatch,
@@ -2061,10 +2290,17 @@ impl SpilledInnerJoinBuild {
 		index_rows: bool,
 		task_budget: TaskBudget,
 		observer: Option<&GroupedChainSpillObserver<'_>>,
+		mut ledger: Option<&mut BuildWriteLedger>,
 	) -> Result<(), ExecutionError> {
 		if batch.num_rows() == 0 {
 			return Ok(());
 		}
+		// ADR 596: one chunk; key extraction is counted for every chunk, the page children only
+		// for a chunk that yields a keyed row.
+		if let Some(ledger) = ledger.as_deref_mut() {
+			ledger.chunks = ledger.chunks.saturating_add(1);
+		}
+		let key_started = BuildWriteLedger::begin(&ledger);
 		let key_timer = observer
 			.map(|observer| {
 				observer.begin_node_named(
@@ -2083,9 +2319,14 @@ impl SpilledInnerJoinBuild {
 			};
 			refs.push((key, join_build_row_index(row)?));
 		}
+		let keyed_rows = refs.len() as u64;
+		BuildWriteLedger::finish(&mut ledger, BuildWriteChild::KeyExtract, key_started);
 		if refs.is_empty() && !retain_unkeyed_rows {
 			if let Some(timer) = key_timer {
 				timer.finish_with(batch.num_rows() as u64, 0, 0)?;
+			}
+			if let Some(ledger) = ledger.as_deref_mut() {
+				ledger.chunks_unkeyed = ledger.chunks_unkeyed.saturating_add(1);
 			}
 			self.scratch_refs = refs;
 			return Ok(());
@@ -2099,7 +2340,9 @@ impl SpilledInnerJoinBuild {
 		let encode_timer = observer
 			.map(|observer| observer.begin(GroupedChainSubLeaf::WriteIpcEncode))
 			.transpose()?;
+		let encode_started = BuildWriteLedger::begin(&ledger);
 		encode_record_batch_ipc_into(&mut self.scratch_plaintext, batch)?;
+		BuildWriteLedger::finish(&mut ledger, BuildWriteChild::Encode, encode_started);
 		if let Some(timer) = encode_timer {
 			timer.finish_with(
 				batch.num_rows() as u64,
@@ -2108,6 +2351,7 @@ impl SpilledInnerJoinBuild {
 			)?;
 		}
 		let plaintext = std::mem::take(&mut self.scratch_plaintext);
+		let page_started = BuildWriteLedger::begin(&ledger);
 		let (page, mut plaintext) = write_join_spill_plaintext_page_returning_buffer(
 			self.file_ops.as_ref(),
 			&self.file,
@@ -2119,6 +2363,16 @@ impl SpilledInnerJoinBuild {
 			observer,
 		)
 		.await?;
+		BuildWriteLedger::finish(&mut ledger, BuildWriteChild::PageWrite, page_started);
+		if let Some(ledger) = ledger.as_deref_mut() {
+			ledger.pages = ledger.pages.saturating_add(1);
+			ledger.plaintext_bytes = ledger
+				.plaintext_bytes
+				.saturating_add(page.plaintext_len as u64);
+			ledger.ciphertext_bytes = ledger
+				.ciphertext_bytes
+				.saturating_add(page.ciphertext_len as u64);
+		}
 		plaintext.clear();
 		self.scratch_plaintext = plaintext;
 		self.spill_bytes = self.spill_bytes.saturating_add(page.ciphertext_len as u64);
@@ -2133,6 +2387,8 @@ impl SpilledInnerJoinBuild {
 				task_budget.spill_bytes.get(),
 			));
 		}
+		let index_started = BuildWriteLedger::begin(&ledger);
+		let mut compacted = false;
 		if index_rows {
 			if self.rows == 0 {
 				if self.compact_index_enabled {
@@ -2180,7 +2436,7 @@ impl SpilledInnerJoinBuild {
 			if let Some(index) = &self.compact_index {
 				self.resident_index_bytes = index.accounted_bytes();
 			}
-			self.try_compact_near_cap_resident_index(
+			compacted = self.try_compact_near_cap_resident_index(
 				key_plan,
 				null_safe_keys,
 				task_budget.memory.get(),
@@ -2212,6 +2468,21 @@ impl SpilledInnerJoinBuild {
 				.ok_or_else(|| ExecutionError::Kernel {
 					message: "coalesced indexed-flush guard count overflowed".to_string(),
 				})?;
+		}
+		BuildWriteLedger::finish(&mut ledger, BuildWriteChild::Index, index_started);
+		if let Some(ledger) = ledger {
+			if index_rows {
+				ledger.index_entries = ledger.index_entries.saturating_add(keyed_rows);
+			}
+			// The mode the index is in after this page; a near-cap compaction is counted.
+			ledger.index_mode = Some(if self.compact_index.is_some() {
+				"compact"
+			} else {
+				"legacy"
+			});
+			if compacted {
+				ledger.index_compactions = ledger.index_compactions.saturating_add(1);
+			}
 		}
 		Ok(())
 	}
@@ -6945,9 +7216,10 @@ mod tests {
 		let trigger_memory = trigger_cap / JOIN_SPILL_RETAINED_FOOTPRINT_MEMORY_CAP_MULTIPLIER;
 
 		build.enable_compact_resident_index_rescue();
-		build
+		let compacted = build
 			.try_compact_near_cap_resident_index(JoinKeyPlan::Int64, false, trigger_memory)
 			.expect("near-cap hash index compacts");
+		assert!(compacted, "the near-cap rescue reports that it compacted");
 		assert!(build.uses_compact_int64_index());
 		assert_eq!(build.resident_index_bytes(), build.computed_index_bytes());
 		assert!(

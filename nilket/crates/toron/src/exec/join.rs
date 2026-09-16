@@ -81,12 +81,10 @@ pub(in crate::exec) use self::membership_chain_profile::{
 	MembershipChainOperation, MembershipChainPhase, MembershipChainProfile, MembershipSpillRole,
 };
 
-pub(in crate::exec) use self::spill::SpilledInnerJoinResidencySnapshot;
-
-pub(in crate::exec) use self::spill::{PinnedSpilledInnerBuildStats, SpilledInnerJoinBuild};
-
 pub(in crate::exec) use self::spill::{
-	SpilledBatchRowRef, SpilledInnerJoinMatch, SpilledJoinBuild, SpilledSemiAntiExistenceBuild,
+	BuildWriteChild, BuildWriteLedger, BuildWriteTermination, PinnedSpilledInnerBuildStats,
+	SpilledBatchRowRef, SpilledInnerJoinBuild, SpilledInnerJoinMatch,
+	SpilledInnerJoinResidencySnapshot, SpilledJoinBuild, SpilledSemiAntiExistenceBuild,
 	partition_bucket_if_non_null_with_scratch,
 };
 

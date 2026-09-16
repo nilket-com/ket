@@ -2567,7 +2567,18 @@ fn inclusive_lifecycle_receipt_value(
 	// sizing, and the spilled branch's build write, with the residual by checked subtraction and
 	// the branch facts beside them. Absent on a profile that never armed it; present with its
 	// consistency stated when it is.
-	match inner_1_decomposition_band(invocation, get("runtime_prep_inner_1")) {
+	let inner_1_band = match inner_1_decomposition_band(invocation, get("runtime_prep_inner_1")) {
+		Ok(Some(band)) => {
+			write_bands.extend(band.clone());
+			Some(band)
+		}
+		Ok(None) => None,
+		Err(error) => return failed(&error),
+	};
+	// ADR 596's seventh band: the spilled branch's build write split into its eleven children
+	// with the residual by checked subtraction and the writer's path facts beside them. Absent
+	// when the ledger was never armed; a band on a branch other than `spilled` is a defect.
+	match build_write_decomposition_band(invocation, inner_1_band.as_ref()) {
 		Ok(Some(band)) => write_bands.extend(band),
 		Ok(None) => {}
 		Err(error) => return failed(&error),
@@ -2791,6 +2802,390 @@ fn inner_1_decomposition_band(
 	);
 	band.insert(
 		"inner_1_inconsistency".to_string(),
+		inconsistency
+			.map(serde_json::Value::String)
+			.unwrap_or(serde_json::Value::Null),
+	);
+	Ok(Some(band))
+}
+
+/// ADR 596: the eleven children of `inner_1_build_write`, the residual, and the writer's path
+/// facts. `None` when the ledger was never armed (no child term and no facts); a partial band,
+/// a band without the sixth band's spilled branch, or children exceeding the term is a defect.
+/// The consistency rules follow the branches the writer took — each is conditional on the fact
+/// it depends on — and are reported as `build_write_facts_consistent` with the first failure
+/// named; a shape outside the vocabulary is reported as `build_write_shape` = `unsupported`.
+fn build_write_decomposition_band(
+	invocation: &AggregateInvocation,
+	inner_1_band: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
+	let facts = invocation
+		.diagnostics
+		.iter()
+		.find(|entry| entry.name == "build_write_facts")
+		.map(|entry| entry.value.clone());
+	build_write_band_from_parts(&invocation.inclusive_lifecycle, facts, inner_1_band)
+}
+
+/// The receipt's names for ADR 596's eleven children, in writer order.
+pub const BUILD_WRITE_CHILDREN: [&str; 11] = [
+	"build_write_create",
+	"build_write_scan_open",
+	"build_write_scan_poll",
+	"build_write_filter",
+	"build_write_repartition",
+	"build_write_project",
+	"build_write_key_extract",
+	"build_write_encode",
+	"build_write_page_write",
+	"build_write_index",
+	"build_write_finish",
+];
+
+/// ADR 596: re-run the seventh band's reconciliation and consistency rules over a retained
+/// invocation as the profile stores it — the `build_write_*` terms from its
+/// `inclusive_lifecycle_receipt`, the facts from its `diagnostics`, the sixth band's branch,
+/// term, rows, and spill bytes from the same receipt — so a tightened rule can be applied to
+/// retained evidence without a run. Returns the band as the receipt would carry it, or the
+/// defect the receipt would report.
+pub fn revalidate_build_write_band(invocation: &serde_json::Value) -> serde_json::Value {
+	let receipt = &invocation["inclusive_lifecycle_receipt"];
+	let terms: Vec<InclusiveLifecycleTerm> = BUILD_WRITE_CHILDREN
+		.iter()
+		.filter_map(|name| {
+			let micros = receipt.get(format!("{name}_micros"))?.as_u64()?;
+			let calls = receipt.get(format!("{name}_calls"))?.as_u64()?;
+			Some(InclusiveLifecycleTerm {
+				name,
+				calls,
+				micros,
+				error: None,
+			})
+		})
+		.collect();
+	let facts = invocation
+		.get("diagnostics")
+		.and_then(serde_json::Value::as_array)
+		.and_then(|entries| {
+			entries
+				.iter()
+				.find(|entry| entry.get("name") == Some(&serde_json::json!("build_write_facts")))
+		})
+		.and_then(|entry| entry.get("value").cloned());
+	let mut inner_1_band = serde_json::Map::new();
+	for name in [
+		"inner_1_branch",
+		"inner_1_build_write_micros",
+		"inner_1_build_rows",
+		"inner_1_build_spill_bytes",
+	] {
+		if let Some(value) = receipt.get(name) {
+			inner_1_band.insert(name.to_string(), value.clone());
+		}
+	}
+	match build_write_band_from_parts(&terms, facts, Some(&inner_1_band)) {
+		Ok(Some(band)) => serde_json::Value::Object(band),
+		Ok(None) => serde_json::json!({"status": "absent"}),
+		Err(error) => serde_json::json!({"status": "instrument_defect", "error": error}),
+	}
+}
+
+/// The seventh band from its parts: the child terms, the facts diagnostic, and the sixth band.
+fn build_write_band_from_parts(
+	terms: &[InclusiveLifecycleTerm],
+	facts: Option<serde_json::Value>,
+	inner_1_band: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
+	const CHILDREN: [&str; 11] = BUILD_WRITE_CHILDREN;
+	let present: Vec<&InclusiveLifecycleTerm> = CHILDREN
+		.iter()
+		.filter_map(|name| terms.iter().find(|sample| sample.name == *name))
+		.collect();
+	if facts.is_none() && present.is_empty() {
+		return Ok(None);
+	}
+	let Some(facts) = facts else {
+		return Err("build_write band has child terms but no facts".to_string());
+	};
+	let Some(inner_1_band) = inner_1_band else {
+		return Err("build_write band without the inner_1 band".to_string());
+	};
+	if inner_1_band.get("inner_1_branch") != Some(&serde_json::json!("spilled")) {
+		return Err("build_write band on a branch other than spilled".to_string());
+	}
+	let build_write_micros = inner_1_band
+		.get("inner_1_build_write_micros")
+		.and_then(serde_json::Value::as_u64)
+		.ok_or_else(|| "build_write band without inner_1_build_write_micros".to_string())?;
+	if present.len() != CHILDREN.len() {
+		let missing: Vec<&str> = CHILDREN
+			.iter()
+			.copied()
+			.filter(|name| !present.iter().any(|sample| sample.name == *name))
+			.collect();
+		return Err(format!(
+			"build_write band is missing {}",
+			missing.join(", ")
+		));
+	}
+	let mut band = serde_json::Map::new();
+	let mut children_total = 0u64;
+	for sample in &present {
+		if sample.error.is_some() {
+			return Err(format!("build_write child {} is failed", sample.name));
+		}
+		children_total = children_total
+			.checked_add(sample.micros)
+			.ok_or_else(|| "build_write child sum overflowed".to_string())?;
+		band.insert(
+			format!("{}_micros", sample.name),
+			serde_json::json!(sample.micros),
+		);
+		band.insert(
+			format!("{}_calls", sample.name),
+			serde_json::json!(sample.calls),
+		);
+	}
+	let residual = build_write_micros
+		.checked_sub(children_total)
+		.ok_or_else(|| "build_write children exceed inner_1_build_write".to_string())?;
+	band.insert(
+		"build_write_residual_micros".to_string(),
+		serde_json::json!(residual),
+	);
+	const FACTS: [&str; 21] = [
+		"filter_present",
+		"exchange",
+		"exchange_partitions",
+		"projected",
+		"termination",
+		"index_mode",
+		"unsupported",
+		"batches_read",
+		"batches_limit_discarded",
+		"batches_admitted",
+		"batches_filtered_empty",
+		"batches_written",
+		"rows_read",
+		"rows_kept",
+		"chunks",
+		"chunks_unkeyed",
+		"pages",
+		"plaintext_bytes",
+		"ciphertext_bytes",
+		"index_entries",
+		"index_compactions",
+	];
+	for name in FACTS {
+		band.insert(
+			format!("build_write_{name}"),
+			facts.get(name).cloned().unwrap_or(serde_json::Value::Null),
+		);
+	}
+	let unsupported = facts
+		.get("unsupported")
+		.and_then(serde_json::Value::as_str)
+		.map(str::to_string);
+	band.insert(
+		"build_write_shape".to_string(),
+		serde_json::json!(if unsupported.is_some() {
+			"unsupported"
+		} else {
+			"supported"
+		}),
+	);
+	let fact_u64 = |name: &str| facts.get(name).and_then(serde_json::Value::as_u64);
+	let fact_bool = |name: &str| facts.get(name).and_then(serde_json::Value::as_bool);
+	let term_calls = |name: &str| {
+		present
+			.iter()
+			.find(|sample| sample.name == name)
+			.map(|sample| sample.calls)
+			.unwrap_or(0)
+	};
+	let term_micros = |name: &str| {
+		present
+			.iter()
+			.find(|sample| sample.name == name)
+			.map(|sample| sample.micros)
+			.unwrap_or(0)
+	};
+	// Consistency: every fact present, and each count agreeing with the path the facts name.
+	let inconsistency: Option<String> = (|| {
+		if let Some(shape) = unsupported {
+			return Some(format!("unsupported shape: {shape}"));
+		}
+		for name in [
+			"batches_read",
+			"batches_limit_discarded",
+			"batches_admitted",
+			"batches_filtered_empty",
+			"batches_written",
+			"rows_read",
+			"rows_kept",
+			"chunks",
+			"chunks_unkeyed",
+			"pages",
+			"plaintext_bytes",
+			"ciphertext_bytes",
+			"index_entries",
+			"index_compactions",
+		] {
+			if fact_u64(name).is_none() {
+				return Some(format!("fact {name} is missing"));
+			}
+		}
+		let Some(filter_present) = fact_bool("filter_present") else {
+			return Some("fact filter_present is missing".to_string());
+		};
+		let Some(exchange) = fact_bool("exchange") else {
+			return Some("fact exchange is missing".to_string());
+		};
+		let Some(projected) = fact_bool("projected") else {
+			return Some("fact projected is missing".to_string());
+		};
+		let termination = facts.get("termination").and_then(serde_json::Value::as_str);
+		let index_mode = facts.get("index_mode").and_then(serde_json::Value::as_str);
+		if !matches!(index_mode, Some("compact" | "legacy" | "none")) {
+			return Some("fact index_mode is not compact, legacy, or none".to_string());
+		}
+		let count = |name: &str| fact_u64(name).unwrap_or(0);
+		// A child that did not run carries no time; a child that ran may round to zero.
+		for name in CHILDREN {
+			if term_calls(name) == 0 && term_micros(name) != 0 {
+				return Some(format!("{name} has time without a call"));
+			}
+		}
+		for name in [
+			"build_write_create",
+			"build_write_scan_open",
+			"build_write_finish",
+		] {
+			if term_calls(name) != 1 {
+				return Some(format!("{name} calls is not 1"));
+			}
+		}
+		// A batch the row limit discarded whole was read (polled) but never admitted to the
+		// filter, the Exchange, or the writer; every downstream count is against the admitted.
+		let discarded = count("batches_limit_discarded");
+		let admitted = count("batches_admitted");
+		if discarded > count("batches_read") || admitted != count("batches_read") - discarded {
+			return Some("batches_admitted disagree with batches_read less discarded".to_string());
+		}
+		let expected_polls = match termination {
+			Some("stream_end") => {
+				if discarded != 0 {
+					return Some("stream_end with a batch discarded by the limit".to_string());
+				}
+				count("batches_read") + 1
+			}
+			Some("row_limit") => {
+				if discarded != 1 {
+					return Some(
+						"row_limit without exactly one batch discarded by the limit".to_string(),
+					);
+				}
+				count("batches_read")
+			}
+			_ => return Some("fact termination is not stream_end or row_limit".to_string()),
+		};
+		if term_calls("build_write_scan_poll") != expected_polls {
+			return Some(format!(
+				"scan_poll calls disagree with batches_read under {}",
+				termination.unwrap_or_default()
+			));
+		}
+		let expected_filter = if filter_present { admitted } else { 0 };
+		if term_calls("build_write_filter") != expected_filter {
+			return Some(if filter_present {
+				"filter calls disagree with batches_admitted".to_string()
+			} else {
+				"filter call without a filter".to_string()
+			});
+		}
+		if !filter_present && count("batches_filtered_empty") != 0 {
+			return Some("batches filtered empty without a filter".to_string());
+		}
+		if exchange {
+			if fact_u64("exchange_partitions").is_none_or(|partitions| partitions < 1) {
+				return Some("exchange without a partition count".to_string());
+			}
+			let expected = admitted.saturating_sub(count("batches_filtered_empty"));
+			if term_calls("build_write_repartition") != expected {
+				return Some(
+					"repartition calls disagree with batches_admitted less batches_filtered_empty"
+						.to_string(),
+				);
+			}
+		} else if term_calls("build_write_repartition") != 0
+			|| term_micros("build_write_repartition") != 0
+		{
+			return Some("repartition call without an exchange".to_string());
+		}
+		let batches_kept = admitted.saturating_sub(count("batches_filtered_empty"));
+		let written_bound = if exchange {
+			batches_kept.saturating_mul(fact_u64("exchange_partitions").unwrap_or(1))
+		} else {
+			batches_kept
+		};
+		if (!exchange && count("batches_written") != batches_kept)
+			|| count("batches_written") > written_bound
+		{
+			return Some("batches_written disagree with the batches kept".to_string());
+		}
+		let expected_project = if projected { count("chunks") } else { 0 };
+		if term_calls("build_write_project") != expected_project {
+			return Some(if projected {
+				"project calls disagree with chunks".to_string()
+			} else {
+				"project call on the unprojected path".to_string()
+			});
+		}
+		if term_calls("build_write_key_extract") != count("chunks") {
+			return Some("key_extract calls disagree with chunks".to_string());
+		}
+		if count("chunks_unkeyed") > count("chunks") {
+			return Some("chunks_unkeyed exceeds chunks".to_string());
+		}
+		if count("pages") != count("chunks") - count("chunks_unkeyed") {
+			return Some("pages disagree with chunks less chunks_unkeyed".to_string());
+		}
+		for name in [
+			"build_write_encode",
+			"build_write_page_write",
+			"build_write_index",
+		] {
+			if term_calls(name) != count("pages") {
+				return Some(format!("{name} calls disagree with pages"));
+			}
+		}
+		if count("pages") == 0 && index_mode != Some("none") {
+			return Some("index_mode without a page".to_string());
+		}
+		if count("pages") > 0 && index_mode == Some("none") {
+			return Some("pages without an index_mode".to_string());
+		}
+		if count("rows_kept") > count("rows_read") {
+			return Some("rows_kept exceeds rows_read".to_string());
+		}
+		if count("index_entries") > count("rows_kept") {
+			return Some("index_entries exceed rows_kept".to_string());
+		}
+		let inner_1_u64 = |name: &str| inner_1_band.get(name).and_then(serde_json::Value::as_u64);
+		if inner_1_u64("inner_1_build_rows") != Some(count("rows_kept")) {
+			return Some("rows_kept disagrees with inner_1_build_rows".to_string());
+		}
+		if inner_1_u64("inner_1_build_spill_bytes") != Some(count("ciphertext_bytes")) {
+			return Some("ciphertext_bytes disagree with inner_1_build_spill_bytes".to_string());
+		}
+		None
+	})();
+	band.insert(
+		"build_write_facts_consistent".to_string(),
+		serde_json::json!(inconsistency.is_none()),
+	);
+	band.insert(
+		"build_write_inconsistency".to_string(),
 		inconsistency
 			.map(serde_json::Value::String)
 			.unwrap_or(serde_json::Value::Null),
@@ -4235,6 +4630,473 @@ mod tests {
 		assert_eq!(receipt["inner_1_branch"], "unsupported");
 		assert_eq!(receipt["inner_1_facts_consistent"], false);
 		assert!(receipt.get("inner_1_sizing_scan_micros").is_none());
+	}
+
+	const ADR596_CHILDREN: [&str; 11] = [
+		"build_write_create",
+		"build_write_scan_open",
+		"build_write_scan_poll",
+		"build_write_filter",
+		"build_write_repartition",
+		"build_write_project",
+		"build_write_key_extract",
+		"build_write_encode",
+		"build_write_page_write",
+		"build_write_index",
+		"build_write_finish",
+	];
+
+	fn attach_build_write_band(
+		invocation: &mut AggregateInvocation,
+		micros: [u64; 11],
+		calls: [u64; 11],
+		facts: serde_json::Value,
+	) {
+		for ((name, micros), calls) in ADR596_CHILDREN.into_iter().zip(micros).zip(calls) {
+			invocation.inclusive_lifecycle.push(InclusiveLifecycleTerm {
+				name,
+				calls,
+				micros,
+				error: None,
+			});
+		}
+		invocation.diagnostics.push(InvocationDiagnostic {
+			name: "build_write_facts",
+			value: facts,
+		});
+	}
+
+	/// A projected, filtered, unexchanged write to the stream's end: four batches read, one
+	/// filtered empty, three written in three chunks, every chunk keyed, on ADR 594's spilled
+	/// facts (50 rows, 4,096 spill bytes).
+	fn build_write_facts() -> serde_json::Value {
+		serde_json::json!({
+			"filter_present": true, "exchange": false, "exchange_partitions": null,
+			"projected": true, "termination": "stream_end", "index_mode": "compact",
+			"unsupported": null,
+			"batches_read": 4, "batches_limit_discarded": 0, "batches_admitted": 4,
+			"batches_filtered_empty": 1, "batches_written": 3,
+			"rows_read": 60, "rows_kept": 50, "chunks": 3, "chunks_unkeyed": 0, "pages": 3,
+			"plaintext_bytes": 8000, "ciphertext_bytes": 4096, "index_entries": 50,
+			"index_compactions": 0,
+		})
+	}
+
+	/// The same write ended by the row limit: the fourth poll's batch discarded whole, three
+	/// admitted, one filtered empty, two written in two chunks and pages; 4 polls, no final one.
+	fn row_limit_facts() -> serde_json::Value {
+		let mut facts = build_write_facts();
+		facts["termination"] = serde_json::json!("row_limit");
+		facts["batches_limit_discarded"] = serde_json::json!(1);
+		facts["batches_admitted"] = serde_json::json!(3);
+		facts["batches_written"] = serde_json::json!(2);
+		facts["chunks"] = serde_json::json!(2);
+		facts["pages"] = serde_json::json!(2);
+		facts["rows_read"] = serde_json::json!(80);
+		facts
+	}
+
+	/// Children summing to 53 of the 55 µs build write: residual 2.
+	const ADR596_MICROS: [u64; 11] = [2, 3, 10, 5, 0, 4, 5, 6, 10, 6, 2];
+	const ADR596_CALLS: [u64; 11] = [1, 1, 5, 4, 0, 3, 3, 3, 3, 3, 1];
+
+	// ADR 596: the seventh band reconciles against the sixth band's unchanged build-write term,
+	// carries the path facts and every call count, and is absent when the ledger was never armed.
+	#[test]
+	fn adr596_receipt_records_the_seventh_band_and_its_facts() {
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+		attach_build_write_band(
+			&mut invocation,
+			ADR596_MICROS,
+			ADR596_CALLS,
+			build_write_facts(),
+		);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "reconciled", "{receipt}");
+		assert_eq!(receipt["inner_1_build_write_micros"], 55);
+		assert_eq!(receipt["build_write_residual_micros"], 2);
+		assert_eq!(receipt["build_write_scan_open_micros"], 3);
+		assert_eq!(receipt["build_write_scan_poll_micros"], 10);
+		assert_eq!(receipt["build_write_scan_poll_calls"], 5);
+		assert_eq!(receipt["build_write_repartition_calls"], 0);
+		assert_eq!(receipt["build_write_repartition_micros"], 0);
+		assert_eq!(receipt["build_write_page_write_calls"], 3);
+		assert_eq!(receipt["build_write_filter_present"], true);
+		assert_eq!(receipt["build_write_exchange"], false);
+		assert_eq!(receipt["build_write_projected"], true);
+		assert_eq!(receipt["build_write_termination"], "stream_end");
+		assert_eq!(receipt["build_write_index_mode"], "compact");
+		assert_eq!(receipt["build_write_rows_kept"], 50);
+		assert_eq!(receipt["build_write_ciphertext_bytes"], 4096);
+		assert_eq!(receipt["build_write_shape"], "supported");
+		assert_eq!(receipt["build_write_facts_consistent"], true, "{receipt}");
+		assert_eq!(
+			receipt["build_write_inconsistency"],
+			serde_json::Value::Null
+		);
+
+		// The converse holds: a child whose calls' durations round to zero is consistent.
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+		let mut micros = ADR596_MICROS;
+		micros[7] = 0;
+		attach_build_write_band(&mut invocation, micros, ADR596_CALLS, build_write_facts());
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["build_write_facts_consistent"], true, "{receipt}");
+		assert_eq!(receipt["build_write_encode_calls"], 3);
+		assert_eq!(receipt["build_write_residual_micros"], 8);
+
+		// A row-limit termination: four polls, the fourth's batch discarded by the limit, three
+		// admitted, one of those filtered empty, two written; no final poll.
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+		attach_build_write_band(
+			&mut invocation,
+			[2, 3, 10, 5, 0, 4, 5, 6, 10, 6, 2],
+			[1, 1, 4, 3, 0, 2, 2, 2, 2, 2, 1],
+			row_limit_facts(),
+		);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["build_write_facts_consistent"], true, "{receipt}");
+		assert_eq!(receipt["build_write_termination"], "row_limit");
+		assert_eq!(receipt["build_write_batches_limit_discarded"], 1);
+		assert_eq!(receipt["build_write_batches_admitted"], 3);
+
+		// Never armed: the sixth band alone, no seventh.
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "reconciled");
+		assert!(receipt.get("build_write_residual_micros").is_none());
+		assert!(receipt.get("build_write_shape").is_none());
+
+		// Children exceeding the term: a defect, not a negative residual.
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+		let mut micros = ADR596_MICROS;
+		micros[8] = 20;
+		attach_build_write_band(&mut invocation, micros, ADR596_CALLS, build_write_facts());
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "instrument_defect");
+		assert!(
+			receipt["error"]
+				.as_str()
+				.unwrap()
+				.contains("children exceed inner_1_build_write")
+		);
+
+		// A partial band: a defect naming the missing child.
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+		attach_build_write_band(
+			&mut invocation,
+			ADR596_MICROS,
+			ADR596_CALLS,
+			build_write_facts(),
+		);
+		invocation
+			.inclusive_lifecycle
+			.retain(|term| term.name != "build_write_page_write");
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "instrument_defect");
+		assert!(
+			receipt["error"]
+				.as_str()
+				.unwrap()
+				.contains("missing build_write_page_write")
+		);
+
+		// The band on the partitioned branch: a defect; the ledger is armed on spilled only.
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [40, 50, 0], [1, 1, 0], partitioned_facts());
+		attach_build_write_band(&mut invocation, [0; 11], [0; 11], build_write_facts());
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "instrument_defect");
+		assert!(
+			receipt["error"]
+				.as_str()
+				.unwrap()
+				.contains("branch other than spilled")
+		);
+	}
+
+	// ADR 596: each consistency rule is conditional on the facts it depends on and has a case
+	// that breaks exactly it; an unsupported shape is named and never read through the band.
+	#[test]
+	fn adr596_receipt_names_every_fact_inconsistency_and_the_unsupported_shape() {
+		let with = |edit: fn(&mut serde_json::Value)| {
+			let mut facts = build_write_facts();
+			edit(&mut facts);
+			facts
+		};
+		let calls_with = |slot: usize, value: u64| {
+			let mut calls = ADR596_CALLS;
+			calls[slot] = value;
+			calls
+		};
+		let cases: Vec<(&str, [u64; 11], [u64; 11], serde_json::Value, &str)> = vec![
+			(
+				"two creates",
+				ADR596_MICROS,
+				calls_with(0, 2),
+				build_write_facts(),
+				"build_write_create calls is not 1",
+			),
+			(
+				"scan opened twice",
+				ADR596_MICROS,
+				calls_with(1, 2),
+				build_write_facts(),
+				"build_write_scan_open calls is not 1",
+			),
+			(
+				"stream_end with one poll too few",
+				ADR596_MICROS,
+				calls_with(2, 4),
+				build_write_facts(),
+				"scan_poll calls disagree with batches_read under stream_end",
+			),
+			(
+				"row_limit with a final poll counted",
+				ADR596_MICROS,
+				[1, 1, 5, 3, 0, 2, 2, 2, 2, 2, 1],
+				row_limit_facts(),
+				"scan_poll calls disagree with batches_read under row_limit",
+			),
+			(
+				"a filter call without a filter",
+				ADR596_MICROS,
+				ADR596_CALLS,
+				with(|f| {
+					f["filter_present"] = serde_json::json!(false);
+					f["batches_filtered_empty"] = serde_json::json!(0);
+					f["batches_written"] = serde_json::json!(4);
+				}),
+				"filter call without a filter",
+			),
+			(
+				"filter calls short of the batches read",
+				ADR596_MICROS,
+				calls_with(3, 3),
+				build_write_facts(),
+				"filter calls disagree with batches_admitted",
+			),
+			(
+				"a repartition call without an exchange",
+				ADR596_MICROS,
+				calls_with(4, 3),
+				build_write_facts(),
+				"repartition call without an exchange",
+			),
+			(
+				"an exchange with repartition calls short of the batches kept",
+				ADR596_MICROS,
+				ADR596_CALLS,
+				with(|f| {
+					f["exchange"] = serde_json::json!(true);
+					f["exchange_partitions"] = serde_json::json!(1);
+				}),
+				"repartition calls disagree with batches_admitted less batches_filtered_empty",
+			),
+			(
+				"more batches written than kept",
+				ADR596_MICROS,
+				ADR596_CALLS,
+				with(|f| f["batches_written"] = serde_json::json!(4)),
+				"batches_written disagree with the batches kept",
+			),
+			(
+				"a project call on the unprojected path",
+				ADR596_MICROS,
+				ADR596_CALLS,
+				with(|f| f["projected"] = serde_json::json!(false)),
+				"project call on the unprojected path",
+			),
+			(
+				"project calls short of the chunks",
+				ADR596_MICROS,
+				calls_with(5, 2),
+				build_write_facts(),
+				"project calls disagree with chunks",
+			),
+			(
+				"key extraction short of the chunks",
+				ADR596_MICROS,
+				calls_with(6, 2),
+				build_write_facts(),
+				"key_extract calls disagree with chunks",
+			),
+			(
+				"pages above chunks less unkeyed",
+				ADR596_MICROS,
+				ADR596_CALLS,
+				with(|f| f["chunks_unkeyed"] = serde_json::json!(1)),
+				"pages disagree with chunks less chunks_unkeyed",
+			),
+			(
+				"encode calls disagreeing with pages",
+				ADR596_MICROS,
+				calls_with(7, 2),
+				build_write_facts(),
+				"build_write_encode calls disagree with pages",
+			),
+			(
+				"rows kept disagreeing with the sixth band",
+				ADR596_MICROS,
+				ADR596_CALLS,
+				with(|f| {
+					f["rows_kept"] = serde_json::json!(49);
+					f["index_entries"] = serde_json::json!(49);
+				}),
+				"rows_kept disagrees with inner_1_build_rows",
+			),
+			(
+				"spill bytes disagreeing with the sixth band",
+				ADR596_MICROS,
+				ADR596_CALLS,
+				with(|f| f["ciphertext_bytes"] = serde_json::json!(4095)),
+				"ciphertext_bytes disagree with inner_1_build_spill_bytes",
+			),
+			(
+				"an index mode without a page",
+				[2, 3, 10, 5, 0, 0, 0, 0, 0, 0, 2],
+				[1, 1, 5, 4, 0, 0, 0, 0, 0, 0, 1],
+				with(|f| {
+					f["chunks"] = serde_json::json!(0);
+					f["pages"] = serde_json::json!(0);
+					f["batches_written"] = serde_json::json!(0);
+					f["batches_filtered_empty"] = serde_json::json!(4);
+					f["rows_kept"] = serde_json::json!(0);
+					f["index_entries"] = serde_json::json!(0);
+				}),
+				"index_mode without a page",
+			),
+			(
+				"a missing fact",
+				ADR596_MICROS,
+				ADR596_CALLS,
+				with(|f| {
+					f.as_object_mut().unwrap().remove("plaintext_bytes");
+				}),
+				"fact plaintext_bytes is missing",
+			),
+			// Residual time moved into a child that did not run: the algebra reconciles, the
+			// counts agree, and the band is still inconsistent.
+			(
+				"time in the absent filter",
+				[2, 3, 10, 2, 0, 4, 5, 6, 10, 6, 2],
+				[1, 1, 5, 0, 0, 3, 3, 3, 3, 3, 1],
+				with(|f| {
+					f["filter_present"] = serde_json::json!(false);
+					f["batches_filtered_empty"] = serde_json::json!(0);
+					f["batches_written"] = serde_json::json!(4);
+				}),
+				"build_write_filter has time without a call",
+			),
+			(
+				"time in the absent projection",
+				[2, 3, 10, 5, 0, 2, 5, 6, 10, 6, 2],
+				[1, 1, 5, 4, 0, 0, 3, 3, 3, 3, 1],
+				with(|f| f["projected"] = serde_json::json!(false)),
+				"build_write_project has time without a call",
+			),
+			(
+				"time in the absent repartition",
+				[2, 3, 10, 5, 2, 4, 5, 6, 10, 6, 2],
+				ADR596_CALLS,
+				build_write_facts(),
+				"build_write_repartition has time without a call",
+			),
+			(
+				"time in a page child with no page",
+				[2, 3, 10, 5, 0, 0, 0, 2, 0, 0, 2],
+				[1, 1, 5, 4, 0, 0, 0, 0, 0, 0, 1],
+				with(|f| {
+					f["chunks"] = serde_json::json!(0);
+					f["pages"] = serde_json::json!(0);
+					f["batches_written"] = serde_json::json!(0);
+					f["batches_filtered_empty"] = serde_json::json!(4);
+					f["rows_kept"] = serde_json::json!(0);
+					f["index_entries"] = serde_json::json!(0);
+					f["index_mode"] = serde_json::json!("none");
+				}),
+				"build_write_encode has time without a call",
+			),
+			// The row limit's discarded batch: read, never admitted.
+			(
+				"stream_end with a discarded batch",
+				ADR596_MICROS,
+				ADR596_CALLS,
+				with(|f| {
+					f["batches_limit_discarded"] = serde_json::json!(1);
+					f["batches_admitted"] = serde_json::json!(3);
+				}),
+				"stream_end with a batch discarded by the limit",
+			),
+			(
+				"row_limit without a discarded batch",
+				ADR596_MICROS,
+				calls_with(2, 4),
+				with(|f| f["termination"] = serde_json::json!("row_limit")),
+				"row_limit without exactly one batch discarded by the limit",
+			),
+			(
+				"admitted disagreeing with read less discarded",
+				ADR596_MICROS,
+				ADR596_CALLS,
+				with(|f| f["batches_admitted"] = serde_json::json!(3)),
+				"batches_admitted disagree with batches_read less discarded",
+			),
+			(
+				"row_limit with the discarded batch filtered",
+				[2, 3, 10, 5, 0, 4, 5, 6, 10, 6, 2],
+				[1, 1, 4, 4, 0, 2, 2, 2, 2, 2, 1],
+				row_limit_facts(),
+				"filter calls disagree with batches_admitted",
+			),
+			(
+				"a preserved-rows write",
+				ADR596_MICROS,
+				ADR596_CALLS,
+				with(|f| f["unsupported"] = serde_json::json!("preserved_rows")),
+				"unsupported shape: preserved_rows",
+			),
+		];
+		for (label, micros, calls, facts, needle) in cases {
+			let mut invocation = adr586_invocation();
+			adr589_write_bands(&mut invocation);
+			attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+			let unsupported = facts.get("unsupported").is_some_and(|v| !v.is_null());
+			attach_build_write_band(&mut invocation, micros, calls, facts);
+			let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+			assert_eq!(receipt["status"], "reconciled", "{label}: {receipt}");
+			assert_eq!(receipt["build_write_facts_consistent"], false, "{label}");
+			assert_eq!(
+				receipt["build_write_shape"],
+				if unsupported {
+					"unsupported"
+				} else {
+					"supported"
+				},
+				"{label}"
+			);
+			assert!(
+				receipt["build_write_inconsistency"]
+					.as_str()
+					.unwrap()
+					.contains(needle),
+				"{label}: {}",
+				receipt["build_write_inconsistency"]
+			);
+		}
 	}
 
 	// A zero child is a fact with a pass count beside it, never a failed term: the semi summary

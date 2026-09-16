@@ -11249,6 +11249,7 @@ impl Executor {
 			false,
 			None,
 			morsel,
+			None,
 		)
 		.await?;
 
@@ -11279,38 +11280,107 @@ impl Executor {
 		join_partition: Option<StreamingScanJoinPartition<'_>>,
 
 		morsel: Option<(MorselId, u32)>,
+
+		mut ledger: Option<&mut BuildWriteLedger>,
 	) -> Result<(), ExecutionError> {
-		if let Some(exchange) = scan_input.exchange {
-			let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
-				return Err(ExecutionError::InvalidExpression {
-					message: "streaming scan build expected a scan input".to_string(),
-				});
-			};
+		// ADR 596: the path facts, recorded before the first poll. The ledger's shape vocabulary
+		// is filter × projection × exchange under either termination; a preserved-rows write or
+		// a join-partition selection is outside it and is reported, not read through the band.
+		if let Some(ledger) = ledger.as_deref_mut() {
+			ledger.filter_present = scan_input.filter_predicate.is_some();
+			ledger.exchange_partitions =
+				scan_input.exchange.map(|exchange| exchange.partition_count);
+			ledger.projected = retained_columns.is_some();
+			if retain_unkeyed_rows {
+				ledger.unsupported = Some("preserved_rows");
+			} else if join_partition.is_some() {
+				ledger.unsupported = Some("join_partition");
+			}
+		}
 
-			let mut remaining = req.row_limit;
+		let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
+			return Err(ExecutionError::InvalidExpression {
+				message: "streaming scan build expected a scan input".to_string(),
+			});
+		};
 
-			let mut stream = self.open_scan(req).await?;
+		let mut remaining = req.row_limit;
 
-			while let Some(batch) = stream.next().await {
-				let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
-					break;
-				};
+		let open_started = BuildWriteLedger::begin(&ledger);
 
-				if let Some(predicate) = scan_input.filter_predicate {
-					batch = self.filter_batch_with_bound_predicate(
-						predicate,
-						batch,
-						"filter predicate",
-					)?;
+		let mut stream = self.open_scan(req).await?;
 
-					if batch.num_rows() == 0 {
-						continue;
-					}
+		BuildWriteLedger::finish(&mut ledger, BuildWriteChild::ScanOpen, open_started);
+
+		loop {
+			// ADR 596: each poll is one span of the caller's wait; a final `None` is a poll too.
+			let poll_started = BuildWriteLedger::begin(&ledger);
+
+			let next = stream.next().await;
+
+			BuildWriteLedger::finish(&mut ledger, BuildWriteChild::ScanPoll, poll_started);
+
+			let Some(batch) = next else {
+				if let Some(ledger) = ledger.as_deref_mut() {
+					ledger.termination = Some(BuildWriteTermination::StreamEnd);
 				}
 
-				for (_, partitioned) in
-					self.repartition_exchange_batch(&batch, exchange.partition_count, exchange.key)?
-				{
+				break;
+			};
+
+			let batch = batch?;
+
+			if let Some(ledger) = ledger.as_deref_mut() {
+				ledger.batches_read = ledger.batches_read.saturating_add(1);
+
+				ledger.rows_read = ledger.rows_read.saturating_add(batch.num_rows() as u64);
+			}
+
+			let Some(mut batch) = limit_streaming_scan_batch(batch, &mut remaining) else {
+				if let Some(ledger) = ledger.as_deref_mut() {
+					ledger.termination = Some(BuildWriteTermination::RowLimit);
+
+					ledger.batches_limit_discarded =
+						ledger.batches_limit_discarded.saturating_add(1);
+				}
+
+				break;
+			};
+
+			if let Some(predicate) = scan_input.filter_predicate {
+				let filter_started = BuildWriteLedger::begin(&ledger);
+
+				batch =
+					self.filter_batch_with_bound_predicate(predicate, batch, "filter predicate")?;
+
+				BuildWriteLedger::finish(&mut ledger, BuildWriteChild::Filter, filter_started);
+
+				if batch.num_rows() == 0 {
+					if let Some(ledger) = ledger.as_deref_mut() {
+						ledger.batches_filtered_empty =
+							ledger.batches_filtered_empty.saturating_add(1);
+					}
+
+					continue;
+				}
+			}
+
+			if let Some(exchange) = scan_input.exchange {
+				let repartition_started = BuildWriteLedger::begin(&ledger);
+
+				let partitioned = self.repartition_exchange_batch(
+					&batch,
+					exchange.partition_count,
+					exchange.key,
+				)?;
+
+				BuildWriteLedger::finish(
+					&mut ledger,
+					BuildWriteChild::Repartition,
+					repartition_started,
+				);
+
+				for (_, partitioned) in partitioned {
 					let partitioned = if let Some(join_partition) = join_partition {
 						select_join_partition_batch(
 							&partitioned,
@@ -11336,38 +11406,11 @@ impl Executor {
 						build_keys,
 						null_safe_keys,
 						retain_unkeyed_rows,
+						ledger.as_deref_mut(),
 					)
 					.await?;
 				}
-			}
-		} else {
-			let Some(req) = self.bound_scan_request(scan_input.scan, morsel) else {
-				return Err(ExecutionError::InvalidExpression {
-					message: "streaming scan build expected a scan input".to_string(),
-				});
-			};
-
-			let mut remaining = req.row_limit;
-
-			let mut stream = self.open_scan(req).await?;
-
-			while let Some(batch) = stream.next().await {
-				let Some(mut batch) = limit_streaming_scan_batch(batch?, &mut remaining) else {
-					break;
-				};
-
-				if let Some(predicate) = scan_input.filter_predicate {
-					batch = self.filter_batch_with_bound_predicate(
-						predicate,
-						batch,
-						"filter predicate",
-					)?;
-
-					if batch.num_rows() == 0 {
-						continue;
-					}
-				}
-
+			} else {
 				let batch = if let Some(join_partition) = join_partition {
 					select_join_partition_batch(
 						&batch,
@@ -11393,6 +11436,7 @@ impl Executor {
 					build_keys,
 					null_safe_keys,
 					retain_unkeyed_rows,
+					ledger.as_deref_mut(),
 				)
 				.await?;
 			}
@@ -12424,6 +12468,8 @@ impl Executor {
 		null_safe_keys: bool,
 
 		retain_unkeyed_rows: bool,
+
+		ledger: Option<&mut BuildWriteLedger>,
 	) -> Result<(), ExecutionError> {
 		if let Some(retained_columns) = retained_columns {
 			if retain_unkeyed_rows {
@@ -12439,13 +12485,14 @@ impl Executor {
 					.await
 			} else {
 				spilled
-					.write_projected_batch_chunks(
+					.write_projected_batch_chunks_ledgered(
 						batch,
 						retained_columns,
 						key_plan,
 						build_keys,
 						null_safe_keys,
 						self.context.task_budget,
+						ledger,
 					)
 					.await
 			}
@@ -12462,12 +12509,13 @@ impl Executor {
 					.await
 			} else {
 				spilled
-					.write_batch_chunks(
+					.write_batch_chunks_ledgered(
 						batch,
 						key_plan,
 						build_keys,
 						null_safe_keys,
 						self.context.task_budget,
+						ledger,
 					)
 					.await
 			}
@@ -14154,6 +14202,7 @@ impl Executor {
 							true,
 							None,
 							morsel,
+							None,
 						)
 						.await
 					{
@@ -23936,6 +23985,10 @@ impl Executor {
 			}
 
 			let build_write_started = lifecycle.map(|_| Instant::now());
+			// ADR 596: the seventh band's ledger, armed by the same handle and published once
+			// when the branch completes; the off arm carries `None` through the writer.
+			let mut build_write_ledger = lifecycle.map(|_| BuildWriteLedger::default());
+			let create_started = BuildWriteLedger::begin(&build_write_ledger.as_mut());
 			let mut spilled = SpilledInnerJoinBuild::create_with_resident_baseline(
 				self.context.task_budget,
 				self.context.join_spill_file_ops.clone(),
@@ -23943,6 +23996,11 @@ impl Executor {
 				resident_baseline_bytes,
 			)
 			.await?;
+			BuildWriteLedger::finish(
+				&mut build_write_ledger.as_mut(),
+				BuildWriteChild::Create,
+				create_started,
+			);
 
 			// ADR0551-SITE: streaming/prepare_reoriented_inner_join_runtime_with_scan_build/Build/1
 
@@ -23962,10 +24020,21 @@ impl Executor {
 					false,
 					None,
 					morsel,
+					build_write_ledger.as_mut(),
 				)
 				.await?;
 
-				spilled.finish(self.context.task_budget).await
+				let finish_started = BuildWriteLedger::begin(&build_write_ledger.as_mut());
+
+				let finished = spilled.finish(self.context.task_budget).await;
+
+				BuildWriteLedger::finish(
+					&mut build_write_ledger.as_mut(),
+					BuildWriteChild::Finish,
+					finish_started,
+				);
+
+				finished
 			}
 			.await;
 
@@ -24004,6 +24073,21 @@ impl Executor {
 					"inner_1_facts",
 					facts("spilled", Some((build_rows, spilled.spill_bytes()))),
 				);
+				if let Some(ledger) = &build_write_ledger {
+					for child in BuildWriteChild::ALL {
+						node_attribution::record_inclusive_lifecycle_micros(
+							handle,
+							child.name(),
+							ledger.micros(child),
+							ledger.calls(child),
+						)?;
+					}
+					node_attribution::record_invocation_diagnostic(
+						handle,
+						"build_write_facts",
+						ledger.facts(),
+					);
+				}
 			}
 
 			return Ok(Some(ReorientedInnerJoinRuntime {
@@ -35194,6 +35278,494 @@ mod tests {
 	// zero windows on a hashed build.
 	// ADR 594: the production partition-sizing loop, driven with an injected measurement:
 	// one measurement per pass, a refused first count retried at double, the pass count kept
+	/// ADR 596: one build-write fixture. `id` is the descriptor's primary key, `k` (nullable
+	/// Int64) is the join key, `v` and `f` are Int64 payloads; the optional filter keeps rows
+	/// with `v = f`. Rows are written through the real
+	/// path — `write_streaming_scan_inner_build_batches` on a scan plan over `batches` — once
+	/// with a ledger and once without, and both builds' rows, pages, and spill bytes are
+	/// returned beside the ledger.
+	struct Adr596Fixture {
+		batches: Vec<RecordBatch>,
+		filter: bool,
+		exchange: Option<u32>,
+		retained: Option<Vec<ColumnOrdinal>>,
+		row_limit: Option<usize>,
+	}
+
+	fn adr596_batch(rows: &[(Option<i64>, i64, i64)]) -> RecordBatch {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("k", DataType::Int64, true),
+			Field::new("v", DataType::Int64, false),
+			Field::new("f", DataType::Int64, false),
+		]));
+		RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from((0..rows.len() as i64).collect::<Vec<_>>())),
+				Arc::new(Int64Array::from(
+					rows.iter().map(|(k, _, _)| *k).collect::<Vec<_>>(),
+				)),
+				Arc::new(Int64Array::from(
+					rows.iter().map(|(_, v, _)| *v).collect::<Vec<_>>(),
+				)),
+				Arc::new(Int64Array::from(
+					rows.iter().map(|(_, _, f)| *f).collect::<Vec<_>>(),
+				)),
+			],
+		)
+		.expect("adr596 batch")
+	}
+
+	async fn adr596_write(
+		fixture: &Adr596Fixture,
+		mut ledger: Option<&mut BuildWriteLedger>,
+	) -> (u64, u64, u64) {
+		let schema = fixture.batches[0].schema();
+		let mut scan = test_scan_plan_with_first_field_key(TableId(96), schema.clone(), 96);
+		if let ExecutionPlan::Scan { row_limit, .. } = &mut scan {
+			*row_limit = fixture.row_limit;
+		}
+		let plan = if fixture.filter {
+			ExecutionPlan::Filter {
+				input: Box::new(scan),
+				predicate: binary_residual_program(
+					BoundBinaryOp::Eq,
+					ColumnOrdinal(2),
+					DataType::Int64,
+					false,
+					ColumnOrdinal(3),
+					DataType::Int64,
+					false,
+				),
+				disposition: FilterDisposition::EvaluateInToron,
+			}
+		} else {
+			scan
+		};
+		let plan = match fixture.exchange {
+			Some(partition_count) => ExecutionPlan::Exchange {
+				input: Box::new(plan),
+				partition_count,
+				key: bound_column_root("k", ColumnOrdinal(1), DataType::Int64, true),
+			},
+			None => plan,
+		};
+		let scan_input = decompose_streaming_scan_probe_input(&plan).expect("scan input");
+		let probe_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+		let build_keys = vec![ColumnOrdinal(1)];
+		let (key_plan, write_keys) = match &fixture.retained {
+			Some(retained) => {
+				let projected_schema =
+					projected_schema_for_columns(&schema, retained).expect("projected schema");
+				let projected_keys =
+					remap_column_ordinals(retained, &build_keys).expect("projected keys");
+				(
+					JoinKeyPlan::from_build_schema_and_probe_schema(
+						&projected_schema,
+						&projected_keys,
+						&probe_schema,
+						&[ColumnOrdinal(0)],
+						false,
+					)
+					.expect("projected key plan"),
+					projected_keys,
+				)
+			}
+			None => (
+				JoinKeyPlan::from_build_schema_and_probe_schema(
+					&schema,
+					&build_keys,
+					&probe_schema,
+					&[ColumnOrdinal(0)],
+					false,
+				)
+				.expect("key plan"),
+				build_keys.clone(),
+			),
+		};
+		let executor = Executor::with_context(
+			Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::from([(TableId(96), fixture.batches.clone())]),
+				requested_tables: Arc::new(Mutex::new(Vec::new())),
+			}),
+			ExecutionContext::local_test().with_task_budget(high_test_budget()),
+		);
+		// Create and finish are clocked as the spilled branch clocks them, around the writer.
+		let create_started = BuildWriteLedger::begin(&ledger);
+		let mut spilled = SpilledInnerJoinBuild::create_with_resident_baseline(
+			executor.context.task_budget,
+			executor.context.join_spill_file_ops.clone(),
+			executor.context.join_spill_dir.clone(),
+			0,
+		)
+		.await
+		.expect("spilled build");
+		BuildWriteLedger::finish(&mut ledger, BuildWriteChild::Create, create_started);
+		executor
+			.write_streaming_scan_inner_build_batches(
+				&mut spilled,
+				scan_input,
+				fixture.retained.as_deref(),
+				&write_keys,
+				key_plan,
+				false,
+				false,
+				None,
+				None,
+				ledger.as_deref_mut(),
+			)
+			.await
+			.expect("write through the real path");
+		let finish_started = BuildWriteLedger::begin(&ledger);
+		spilled
+			.finish(executor.context.task_budget)
+			.await
+			.expect("finish");
+		BuildWriteLedger::finish(&mut ledger, BuildWriteChild::Finish, finish_started);
+		let result = (
+			spilled.input_row_count(),
+			spilled.page_count() as u64,
+			spilled.spill_bytes(),
+		);
+		spilled.cleanup().await;
+		result
+	}
+
+	async fn adr596_ledgered(fixture: Adr596Fixture) -> BuildWriteLedger {
+		let mut ledger = BuildWriteLedger::default();
+		let with = adr596_write(&fixture, Some(&mut ledger)).await;
+		let without = adr596_write(&fixture, None).await;
+		assert_eq!(
+			with, without,
+			"the ledger changes nothing about the build: rows, pages, spill bytes"
+		);
+		assert_eq!(
+			ledger.rows_kept, with.0,
+			"rows_kept is the build's row count"
+		);
+		assert_eq!(ledger.pages, with.1, "pages is the build's page count");
+		assert_eq!(
+			ledger.ciphertext_bytes, with.2,
+			"ciphertext_bytes is the build's spill bytes"
+		);
+		assert_eq!(ledger.unsupported, None);
+		assert_eq!(ledger.calls(BuildWriteChild::Create), 1);
+		assert_eq!(ledger.calls(BuildWriteChild::Finish), 1);
+		// The real ledger through the receipt's validator: the band reconciles against a term
+		// ten microseconds above the children's sum, the facts are consistent, the shape is
+		// supported, and every count the rules read is the ledger's.
+		let band = adr596_receipt_band(&ledger, with.0, with.2);
+		assert_eq!(band["build_write_facts_consistent"], true, "{band}");
+		assert_eq!(band["build_write_shape"], "supported", "{band}");
+		assert_eq!(band["build_write_residual_micros"], 10, "{band}");
+		assert_eq!(band["build_write_batches_read"], ledger.batches_read);
+		assert_eq!(band["build_write_pages"], ledger.pages);
+		ledger
+	}
+
+	/// ADR 596: the ledger as a retained invocation would carry it — its terms on the receipt,
+	/// its facts in the diagnostics, the sixth band's spilled facts beside them — through the
+	/// same reconciliation and rules the receipt applies.
+	fn adr596_receipt_band(
+		ledger: &BuildWriteLedger,
+		build_rows: u64,
+		spill_bytes: u64,
+	) -> serde_json::Value {
+		let children_total: u64 = BuildWriteChild::ALL
+			.into_iter()
+			.map(|child| ledger.micros(child))
+			.sum();
+		let mut receipt = serde_json::json!({
+			"inner_1_branch": "spilled",
+			"inner_1_build_write_micros": children_total + 10,
+			"inner_1_build_rows": build_rows,
+			"inner_1_build_spill_bytes": spill_bytes,
+		});
+		for child in BuildWriteChild::ALL {
+			receipt[format!("{}_micros", child.name())] = serde_json::json!(ledger.micros(child));
+			receipt[format!("{}_calls", child.name())] = serde_json::json!(ledger.calls(child));
+		}
+		node_attribution::revalidate_build_write_band(&serde_json::json!({
+			"inclusive_lifecycle_receipt": receipt,
+			"diagnostics": [{"name": "build_write_facts", "value": ledger.facts()}],
+		}))
+	}
+
+	fn adr596_calls(ledger: &BuildWriteLedger) -> Vec<(&'static str, u64)> {
+		BuildWriteChild::ALL
+			.into_iter()
+			.map(|child| (child.name(), ledger.calls(child)))
+			.collect()
+	}
+
+	// ADR 596: the ledger's counts follow the branches the writer takes. Four shapes through the
+	// real path — projected with a filter, unprojected without one, an all-unkeyed chunk, and a
+	// row-limit termination — each yielding the facts and counts the receipt's rules expect,
+	// and the path without a ledger preparing the same build while recording nothing.
+	#[tokio::test]
+	async fn adr596_ledger_counts_follow_the_branches_the_writer_takes() {
+		// Projected, filtered, to the stream's end: three batches, the middle one filtered
+		// empty, 10 + 5 rows kept in two chunks (one per batch), two pages.
+		let ledger = adr596_ledgered(Adr596Fixture {
+			batches: vec![
+				adr596_batch(
+					&(0..12)
+						.map(|i| (Some(i), i, if i < 10 { i } else { -1 }))
+						.collect::<Vec<_>>(),
+				),
+				adr596_batch(&[(Some(20), 1, 2), (Some(21), 3, 4)]),
+				adr596_batch(&(0..5).map(|i| (Some(30 + i), i, i)).collect::<Vec<_>>()),
+			],
+			filter: true,
+			exchange: None,
+			retained: Some(vec![ColumnOrdinal(1), ColumnOrdinal(2)]),
+			row_limit: None,
+		})
+		.await;
+		assert!(ledger.filter_present && ledger.projected && ledger.exchange_partitions.is_none());
+		assert_eq!(ledger.termination, Some(BuildWriteTermination::StreamEnd));
+		assert_eq!(
+			(
+				ledger.batches_read,
+				ledger.batches_filtered_empty,
+				ledger.batches_written
+			),
+			(3, 1, 2)
+		);
+		assert_eq!((ledger.rows_read, ledger.rows_kept), (19, 15));
+		assert_eq!(
+			(ledger.chunks, ledger.chunks_unkeyed, ledger.pages),
+			(2, 0, 2)
+		);
+		assert_eq!(ledger.index_entries, 15);
+		assert_eq!(ledger.index_mode, Some("legacy"));
+		assert_eq!(
+			adr596_calls(&ledger),
+			vec![
+				("build_write_create", 1),
+				("build_write_scan_open", 1),
+				("build_write_scan_poll", 4),
+				("build_write_filter", 3),
+				("build_write_repartition", 0),
+				("build_write_project", 2),
+				("build_write_key_extract", 2),
+				("build_write_encode", 2),
+				("build_write_page_write", 2),
+				("build_write_index", 2),
+				("build_write_finish", 1),
+			]
+		);
+		assert!(ledger.plaintext_bytes > 0 && ledger.ciphertext_bytes > ledger.plaintext_bytes);
+
+		// Unprojected, no filter, an Exchange of one partition: every row kept whole, the
+		// repartition counted per batch, no project call.
+		let ledger = adr596_ledgered(Adr596Fixture {
+			batches: vec![
+				adr596_batch(&(0..7).map(|i| (Some(i), 0, 1)).collect::<Vec<_>>()),
+				adr596_batch(&(0..3).map(|i| (Some(10 + i), 0, 1)).collect::<Vec<_>>()),
+			],
+			filter: false,
+			exchange: Some(1),
+			retained: None,
+			row_limit: None,
+		})
+		.await;
+		assert!(!ledger.filter_present && !ledger.projected);
+		assert_eq!(ledger.exchange_partitions, Some(1));
+		assert_eq!(ledger.termination, Some(BuildWriteTermination::StreamEnd));
+		assert_eq!(
+			(
+				ledger.batches_read,
+				ledger.batches_filtered_empty,
+				ledger.batches_written
+			),
+			(2, 0, 2)
+		);
+		assert_eq!((ledger.rows_read, ledger.rows_kept), (10, 10));
+		assert_eq!(
+			(ledger.chunks, ledger.chunks_unkeyed, ledger.pages),
+			(2, 0, 2)
+		);
+		assert_eq!(
+			adr596_calls(&ledger),
+			vec![
+				("build_write_create", 1),
+				("build_write_scan_open", 1),
+				("build_write_scan_poll", 3),
+				("build_write_filter", 0),
+				("build_write_repartition", 2),
+				("build_write_project", 0),
+				("build_write_key_extract", 2),
+				("build_write_encode", 2),
+				("build_write_page_write", 2),
+				("build_write_index", 2),
+				("build_write_finish", 1),
+			]
+		);
+		assert_eq!(ledger.micros(BuildWriteChild::Filter), 0);
+		assert_eq!(ledger.micros(BuildWriteChild::Project), 0);
+
+		// An all-unkeyed chunk: key extraction counted, no page emitted, no index mode.
+		let ledger = adr596_ledgered(Adr596Fixture {
+			batches: vec![
+				adr596_batch(&[(None, 0, 0), (None, 1, 1), (None, 2, 2)]),
+				adr596_batch(&[(Some(1), 0, 0), (None, 1, 1)]),
+			],
+			filter: false,
+			exchange: None,
+			retained: None,
+			row_limit: None,
+		})
+		.await;
+		assert_eq!((ledger.batches_read, ledger.batches_written), (2, 2));
+		assert_eq!((ledger.rows_read, ledger.rows_kept), (5, 5));
+		assert_eq!(
+			(ledger.chunks, ledger.chunks_unkeyed, ledger.pages),
+			(2, 1, 1)
+		);
+		assert_eq!(ledger.index_entries, 1);
+		assert_eq!(ledger.calls(BuildWriteChild::KeyExtract), 2);
+		assert_eq!(ledger.calls(BuildWriteChild::Encode), 1);
+		assert_eq!(ledger.calls(BuildWriteChild::PageWrite), 1);
+		assert_eq!(ledger.calls(BuildWriteChild::Index), 1);
+		let ledger = adr596_ledgered(Adr596Fixture {
+			batches: vec![adr596_batch(&[(None, 0, 0), (None, 1, 1)])],
+			filter: false,
+			exchange: None,
+			retained: None,
+			row_limit: None,
+		})
+		.await;
+		assert_eq!(
+			(ledger.chunks, ledger.chunks_unkeyed, ledger.pages),
+			(1, 1, 0)
+		);
+		assert_eq!(ledger.index_mode, None, "no page, no index mode");
+		assert_eq!(ledger.facts()["index_mode"], "none");
+
+		// A row limit filled by the second batch: the third poll returns a batch the limit
+		// discards whole (read, never admitted), the loop ends there, and no final poll is made.
+		let ledger = adr596_ledgered(Adr596Fixture {
+			batches: vec![
+				adr596_batch(&(0..4).map(|i| (Some(i), 0, 0)).collect::<Vec<_>>()),
+				adr596_batch(&(0..4).map(|i| (Some(10 + i), 0, 0)).collect::<Vec<_>>()),
+				adr596_batch(&(0..4).map(|i| (Some(20 + i), 0, 0)).collect::<Vec<_>>()),
+			],
+			filter: false,
+			exchange: None,
+			retained: Some(vec![ColumnOrdinal(1)]),
+			row_limit: Some(6),
+		})
+		.await;
+		assert_eq!(ledger.termination, Some(BuildWriteTermination::RowLimit));
+		assert_eq!(
+			ledger.batches_read, 3,
+			"the limit is found on the poll after it fills"
+		);
+		assert_eq!(
+			ledger.batches_limit_discarded, 1,
+			"that poll's batch is discarded whole"
+		);
+		assert_eq!(ledger.facts()["batches_admitted"], 2);
+		assert_eq!(ledger.calls(BuildWriteChild::ScanPoll), 3, "no final poll");
+		assert_eq!((ledger.rows_read, ledger.rows_kept), (12, 6));
+		assert_eq!(
+			(ledger.batches_written, ledger.chunks, ledger.pages),
+			(2, 2, 2)
+		);
+		assert_eq!(ledger.calls(BuildWriteChild::Project), 2);
+		assert_eq!(ledger.facts()["termination"], "row_limit");
+	}
+
+	// ADR 596: the loop with a limit exactly filled by the stream's last batch still observes a
+	// final `None`, and the writer reports the shapes outside the band's vocabulary.
+	#[tokio::test]
+	async fn adr596_ledger_names_the_stream_end_under_an_exact_limit_and_unsupported_shapes() {
+		let ledger = adr596_ledgered(Adr596Fixture {
+			batches: vec![
+				adr596_batch(&(0..4).map(|i| (Some(i), 0, 0)).collect::<Vec<_>>()),
+				adr596_batch(&(0..4).map(|i| (Some(10 + i), 0, 0)).collect::<Vec<_>>()),
+			],
+			filter: false,
+			exchange: None,
+			retained: None,
+			row_limit: Some(8),
+		})
+		.await;
+		assert_eq!(ledger.termination, Some(BuildWriteTermination::StreamEnd));
+		assert_eq!(ledger.calls(BuildWriteChild::ScanPoll), 3);
+		assert_eq!(ledger.rows_kept, 8);
+		assert_eq!(ledger.batches_limit_discarded, 0);
+
+		let fixture = Adr596Fixture {
+			batches: vec![adr596_batch(&[(Some(1), 0, 0)])],
+			filter: false,
+			exchange: None,
+			retained: None,
+			row_limit: None,
+		};
+		let schema = fixture.batches[0].schema();
+		let scan = test_scan_plan_with_first_field_key(TableId(97), schema.clone(), 97);
+		let scan_input = decompose_streaming_scan_probe_input(&scan).expect("scan input");
+		let executor = Executor::with_context(
+			Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::from([(TableId(97), fixture.batches.clone())]),
+				requested_tables: Arc::new(Mutex::new(Vec::new())),
+			}),
+			ExecutionContext::local_test().with_task_budget(high_test_budget()),
+		);
+		let mut spilled = SpilledInnerJoinBuild::create_with_resident_baseline(
+			executor.context.task_budget,
+			executor.context.join_spill_file_ops.clone(),
+			executor.context.join_spill_dir.clone(),
+			0,
+		)
+		.await
+		.expect("spilled build");
+		let mut ledger = BuildWriteLedger::default();
+		executor
+			.write_streaming_scan_inner_build_batches(
+				&mut spilled,
+				scan_input,
+				None,
+				&[ColumnOrdinal(1)],
+				JoinKeyPlan::Int64,
+				false,
+				true,
+				None,
+				None,
+				Some(&mut ledger),
+			)
+			.await
+			.expect("preserved-rows write");
+		spilled
+			.finish(executor.context.task_budget)
+			.await
+			.expect("finish");
+		let (spilled_rows, spilled_bytes) = (spilled.input_row_count(), spilled.spill_bytes());
+		spilled.cleanup().await;
+		assert_eq!(ledger.unsupported, Some("preserved_rows"));
+		assert_eq!(ledger.facts()["unsupported"], "preserved_rows");
+		let band = adr596_receipt_band(&ledger, spilled_rows, spilled_bytes);
+		assert_eq!(band["build_write_shape"], "unsupported", "{band}");
+		assert_eq!(band["build_write_facts_consistent"], false);
+		assert_eq!(
+			band["build_write_inconsistency"],
+			"unsupported shape: preserved_rows"
+		);
+		assert_eq!(
+			ledger.calls(BuildWriteChild::KeyExtract),
+			0,
+			"the preserved-rows chunk writer carries no ledger"
+		);
+		assert_eq!(
+			ledger.calls(BuildWriteChild::ScanPoll),
+			2,
+			"the loop is still counted"
+		);
+	}
+
 	// only under the gate. Nothing in the loop is timed per pass, so the single clock around
 	// the whole call cannot count a retry twice.
 	#[tokio::test]

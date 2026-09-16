@@ -129,6 +129,8 @@ async fn run() -> ExitCode {
 		"adr585-q21-decomposition" => adr585_q21_decomposition_command(&args),
 		"adr594-q21-inner-1" => adr594_q21_inner_1_command(&args),
 		"adr595-q21-inner-1" => adr595_q21_inner_1_command(&args),
+		"adr596-q21-build-write" => adr596_q21_build_write_command(&args),
+		"adr596-reevaluate" => adr596_reevaluate_command(&args),
 		"adr595-reevaluate" => adr595_reevaluate_command(&args),
 		"adr594-reevaluate" => adr594_reevaluate_command(&args),
 		"adr586-q21-semi-write" => adr586_q21_semi_write_command(&args),
@@ -2057,7 +2059,7 @@ fn adr595_apply_launch_precedence(summary: &mut serde_json::Value, verdicts: &Ad
 /// collection and launch record, and re-run the evaluator and the cutoff over the retained
 /// rows, so a corrected verdict can be applied to retained evidence without another run.
 fn adr595_reevaluate_command(args: &[String]) -> ExitCode {
-	match adr595_reevaluate(args) {
+	match adr595_reevaluate(args, "adr595-reevaluate", evaluate_adr594_pairs) {
 		Ok(summary) => {
 			println!("{summary}");
 			ExitCode::SUCCESS
@@ -2069,11 +2071,48 @@ fn adr595_reevaluate_command(args: &[String]) -> ExitCode {
 	}
 }
 
-fn adr595_reevaluate(args: &[String]) -> Result<serde_json::Value, String> {
-	let summary_path = flag_value(args, "--summary")
-		.ok_or_else(|| "adr595-reevaluate requires --summary PATH".to_string())?;
-	let samples_path = flag_value(args, "--samples")
-		.ok_or_else(|| "adr595-reevaluate requires --samples PATH".to_string())?;
+/// ADR 596: the same re-evaluation over a retained ADR 596 journal, through the seventh-band
+/// evaluator, with every retained on-row receipt re-run through the band's current rules.
+fn adr596_reevaluate_command(args: &[String]) -> ExitCode {
+	let result = adr595_reevaluate(args, "adr596-reevaluate", evaluate_adr596_pairs).and_then(
+		|mut summary| {
+			let samples_path = flag_value(args, "--samples").unwrap_or_default();
+			let rows: Vec<serde_json::Value> = std::fs::read_to_string(samples_path)
+				.map_err(|error| format!("read {samples_path}: {error}"))?
+				.lines()
+				.filter(|line| !line.trim().is_empty())
+				.map(|line| {
+					serde_json::from_str(line)
+						.map_err(|error| format!("parse {samples_path}: {error}"))
+				})
+				.collect::<Result<_, _>>()?;
+			summary["receipt_revalidation"] = adr596_revalidate_receipts(&rows)?;
+			Ok(summary)
+		},
+	);
+	match result {
+		Ok(summary) => {
+			println!("{summary}");
+			ExitCode::SUCCESS
+		}
+		Err(error) => {
+			eprintln!("{error}");
+			ExitCode::from(2)
+		}
+	}
+}
+
+/// Re-run an evaluator, the cutoff, and ADR 595's launch verdicts over a retained summary and
+/// journal, so a corrected rule can be applied to retained rows without another run.
+fn adr595_reevaluate(
+	args: &[String],
+	verb: &str,
+	evaluate: fn(&[serde_json::Value]) -> Result<serde_json::Value, String>,
+) -> Result<serde_json::Value, String> {
+	let summary_path =
+		flag_value(args, "--summary").ok_or_else(|| format!("{verb} requires --summary PATH"))?;
+	let samples_path =
+		flag_value(args, "--samples").ok_or_else(|| format!("{verb} requires --samples PATH"))?;
 	let read =
 		|path: &str| std::fs::read_to_string(path).map_err(|error| format!("read {path}: {error}"));
 	let retained: serde_json::Value = serde_json::from_str(&read(summary_path)?)
@@ -2096,7 +2135,7 @@ fn adr595_reevaluate(args: &[String]) -> Result<serde_json::Value, String> {
 		.filter(|row| row.get("warmup") != Some(&serde_json::Value::Bool(true)))
 		.cloned()
 		.collect();
-	let mut summary = evaluate_adr594_pairs(&pair_rows)?;
+	let mut summary = evaluate(&pair_rows)?;
 	adr593_apply_variability_bound(&mut summary)?;
 	let verdicts = adr595_launch_verdicts(&launch, &collection, first_launch, last_return);
 	adr595_apply_launch_precedence(&mut summary, &verdicts);
@@ -2185,6 +2224,500 @@ fn adr595_q21_inner_1_command(args: &[String]) -> ExitCode {
 }
 
 // ---------------------------------------------------------------------------------------------
+// ADR 596: the spilled build write decomposed through the seventh band.
+// ---------------------------------------------------------------------------------------------
+
+const ADR596_TAGS: LifecyclePairTags = LifecyclePairTags {
+	label: "ADR 596",
+	arm: "adr596_arm",
+	pair: "adr596_pair",
+	position: "adr596_pair_position",
+};
+
+/// The eleven children of `inner_1_build_write` as the receipt names them. `scan_open` and
+/// `scan_poll` are read from the receipt and reported beside each other; the rule sees their
+/// sum as `build_write_scan_wait` and never ranks the sum beside its parts.
+const ADR596_CHILDREN: [&str; 11] = [
+	"build_write_create",
+	"build_write_scan_open",
+	"build_write_scan_poll",
+	"build_write_filter",
+	"build_write_repartition",
+	"build_write_project",
+	"build_write_key_extract",
+	"build_write_encode",
+	"build_write_page_write",
+	"build_write_index",
+	"build_write_finish",
+];
+
+/// The rule's eleven terms: the scan wait, the nine other children, and the residual.
+const ADR596_RULE_TERMS: [&str; 11] = [
+	"build_write_create",
+	"build_write_scan_wait",
+	"build_write_filter",
+	"build_write_repartition",
+	"build_write_project",
+	"build_write_key_extract",
+	"build_write_encode",
+	"build_write_page_write",
+	"build_write_index",
+	"build_write_finish",
+	"build_write_residual",
+];
+
+const ADR596_FACTS: [&str; 21] = [
+	"build_write_filter_present",
+	"build_write_exchange",
+	"build_write_exchange_partitions",
+	"build_write_projected",
+	"build_write_termination",
+	"build_write_index_mode",
+	"build_write_unsupported",
+	"build_write_batches_read",
+	"build_write_batches_limit_discarded",
+	"build_write_batches_admitted",
+	"build_write_batches_filtered_empty",
+	"build_write_batches_written",
+	"build_write_rows_read",
+	"build_write_rows_kept",
+	"build_write_chunks",
+	"build_write_chunks_unkeyed",
+	"build_write_pages",
+	"build_write_plaintext_bytes",
+	"build_write_ciphertext_bytes",
+	"build_write_index_entries",
+	"build_write_index_compactions",
+];
+
+/// Historical readings of the term this record decomposes: ADR 595's off median and its
+/// `inner_1_build_write`, context beside the new reading and never netted against it.
+const ADR596_ADR595_REFERENCE_OFF_MEDIAN_MS: f64 = 9005.848683;
+const ADR596_ADR595_REFERENCE_BUILD_WRITE_MS: f64 = 876.3799093750869;
+
+fn adr596_stamp(summary: &mut serde_json::Value) {
+	adr595_stamp(summary);
+	summary["adr595_reference_off_execute_median_ms"] =
+		serde_json::json!(ADR596_ADR595_REFERENCE_OFF_MEDIAN_MS);
+	summary["adr595_reference_inner_1_build_write_ms"] =
+		serde_json::json!(ADR596_ADR595_REFERENCE_BUILD_WRITE_MS);
+	if let Some(off) = summary
+		.get("off_execute_median_ms")
+		.and_then(serde_json::Value::as_f64)
+	{
+		summary["off_arm_distance_from_adr595_ms"] =
+			serde_json::json!(off - ADR596_ADR595_REFERENCE_OFF_MEDIAN_MS);
+	}
+}
+
+const ADR596_DRIVER: LifecycleDriverSpec = LifecycleDriverSpec {
+	label: "ADR 596",
+	default_output_dir: "target/tpch/adr596-q21-build-write",
+	tags: ("adr596_arm", "adr596_pair", "adr596_pair_position"),
+	kind: "adr596_q21_build_write_decomposition_separated_launch",
+	evaluate: evaluate_adr596_pairs,
+	stamp: adr596_stamp,
+	separated_launch: true,
+};
+
+fn adr596_q21_build_write_command(args: &[String]) -> ExitCode {
+	match run_lifecycle_decomposition_driver(args, &ADR596_DRIVER) {
+		Ok(summary) => {
+			println!("{summary}");
+			ExitCode::SUCCESS
+		}
+		Err(message) => harness_error(&message),
+	}
+}
+
+/// The seventh-band layer over ADR 594's sixth-band evaluation (run first, under this record's
+/// tags): per pair the eleven children, the residual and its bound, the path facts, the shape,
+/// and the consistency; then ADR 594's rule over the eleven rule terms. The partitioned branch,
+/// an unsupported branch, or an unsupported writer shape on any pair withholds the owner as an
+/// unsupported path; an inconsistent or absent band withholds it as an incomplete instrument.
+fn evaluate_adr596_pairs(rows: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+	let tags = &ADR596_TAGS;
+	let mut base = evaluate_adr594_pairs_tagged(rows, tags)?;
+	let mut pair_bands = Vec::new();
+	let mut samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+	let mut all_residuals_complete = true;
+	let mut all_facts_consistent = true;
+	let mut unsupported_pairs = Vec::new();
+	let mut incompleteness = Vec::new();
+	for pair in 0..ADR585_PAIRS {
+		let pair_rows = rows
+			.iter()
+			.filter(|row| {
+				row.get(tags.pair).and_then(serde_json::Value::as_u64) == Some(pair as u64)
+			})
+			.collect::<Vec<_>>();
+		let off = pair_rows
+			.iter()
+			.find(|row| row.get(tags.arm).and_then(serde_json::Value::as_str) == Some("off"))
+			.ok_or_else(|| format!("ADR 596 pair {pair} lacks off arm"))?;
+		let on = pair_rows
+			.iter()
+			.find(|row| row.get(tags.arm).and_then(serde_json::Value::as_str) == Some("on"))
+			.ok_or_else(|| format!("ADR 596 pair {pair} lacks on arm"))?;
+		let execute_off_ms = required_f64(off, "execute_ms")?;
+		let execute_on_ms = required_f64(on, "execute_ms")?;
+		let execute_on_micros = (execute_on_ms * 1000.0).round() as u64;
+		let overhead = (execute_on_ms - execute_off_ms).max(0.0) * 1000.0;
+		let (_, receipt) = lifecycle_target_receipt(on, pair, tags.label)?;
+		let branch = receipt
+			.get("inner_1_branch")
+			.and_then(serde_json::Value::as_str)
+			.map(str::to_string);
+		let mut band = serde_json::json!({"pair": pair, "inner_1_branch": branch});
+		match branch.as_deref() {
+			Some("spilled") => {}
+			Some(other) => {
+				// The partitioned branch and the non-streaming fallback carry no build write to
+				// decompose; the band is not read through.
+				band["build_write_shape"] = serde_json::json!("unsupported");
+				band["build_write_unsupported"] = serde_json::json!(format!("branch {other}"));
+				unsupported_pairs.push(pair);
+				pair_bands.push(band);
+				continue;
+			}
+			None => {
+				all_facts_consistent = false;
+				incompleteness.push(format!("pair {pair}: the sixth band is absent"));
+				pair_bands.push(band);
+				continue;
+			}
+		}
+		let build_write = receipt_u64(receipt, "inner_1_build_write_micros")?;
+		band["inner_1_build_write_micros"] = serde_json::json!(build_write);
+		let shape = receipt
+			.get("build_write_shape")
+			.and_then(serde_json::Value::as_str)
+			.map(str::to_string);
+		let Some(shape) = shape else {
+			all_facts_consistent = false;
+			incompleteness.push(format!("pair {pair}: the seventh band is absent"));
+			pair_bands.push(band);
+			continue;
+		};
+		for fact in ADR596_FACTS {
+			band[fact] = receipt.get(fact).cloned().unwrap_or_default();
+		}
+		band["build_write_shape"] = serde_json::json!(shape);
+		if shape != "supported" {
+			unsupported_pairs.push(pair);
+		}
+		let scale = |micros: u64| micros as f64 / execute_on_micros as f64 * execute_off_ms;
+		let mut children_total = 0u64;
+		let mut scan_wait = 0u64;
+		for child in ADR596_CHILDREN {
+			let micros = receipt_u64(receipt, &format!("{child}_micros"))?;
+			let calls = receipt_u64(receipt, &format!("{child}_calls"))?;
+			children_total = children_total
+				.checked_add(micros)
+				.ok_or_else(|| format!("ADR 596 pair {pair} child sum overflowed"))?;
+			band[format!("{child}_micros")] = serde_json::json!(micros);
+			band[format!("{child}_calls")] = serde_json::json!(calls);
+			if matches!(child, "build_write_scan_open" | "build_write_scan_poll") {
+				scan_wait = scan_wait.saturating_add(micros);
+			}
+			samples
+				.entry(child.to_string())
+				.or_default()
+				.push(scale(micros));
+		}
+		band["build_write_scan_wait_micros"] = serde_json::json!(scan_wait);
+		samples
+			.entry("build_write_scan_wait".to_string())
+			.or_default()
+			.push(scale(scan_wait));
+		let residual = receipt_u64(receipt, "build_write_residual_micros")?;
+		if children_total.checked_add(residual) != Some(build_write) {
+			return Err(format!(
+				"ADR 596 pair {pair} build_write algebra does not reconcile"
+			));
+		}
+		samples
+			.entry("build_write_residual".to_string())
+			.or_default()
+			.push(scale(residual));
+		let residual_bound = overhead + 0.05 * build_write as f64;
+		let residual_complete = residual as f64 <= residual_bound;
+		all_residuals_complete &= residual_complete;
+		let consistent =
+			receipt.get("build_write_facts_consistent") == Some(&serde_json::json!(true));
+		if !consistent && shape == "supported" {
+			all_facts_consistent = false;
+			incompleteness.push(format!(
+				"pair {pair}: {}",
+				receipt
+					.get("build_write_inconsistency")
+					.and_then(serde_json::Value::as_str)
+					.unwrap_or("facts inconsistent")
+			));
+		}
+		band["build_write_residual_micros"] = serde_json::json!(residual);
+		band["build_write_residual_bound_micros"] = serde_json::json!(residual_bound);
+		band["build_write_residual_complete"] = serde_json::json!(residual_complete);
+		band["build_write_facts_consistent"] = serde_json::json!(consistent);
+		band["build_write_inconsistency"] = receipt
+			.get("build_write_inconsistency")
+			.cloned()
+			.unwrap_or_default();
+		pair_bands.push(band);
+	}
+	let off_range = required_f64(&base, "off_execute_range_ms")?;
+	let off_median = required_f64(&base, "off_execute_median_ms")?;
+	let owner_floor = required_f64(&base, "owner_floor_ms")?;
+	let perturbation_accepted = base["perturbation_gate"] == "accepted";
+	let base_profiles_complete = base["all_profiles_complete"] == true;
+	let median_of = |term: &str| {
+		let mut values = samples.get(term).cloned().unwrap_or_default();
+		median(&mut values)
+	};
+	let mut medians = ADR596_RULE_TERMS
+		.iter()
+		.map(|term| (term.to_string(), median_of(term)))
+		.collect::<Vec<_>>();
+	medians.sort_by(|left, right| right.1.total_cmp(&left.1));
+	// The sixth band's own preconditions: its facts consistent and its branch spilled on every
+	// pair, checked above per pair; its rule's outcome is carried as context.
+	let sixth_band_consistent = base["all_inner_1_facts_consistent"] == true;
+	let sixth_band_residuals_complete = base["all_inner_1_residuals_complete"] == true;
+	if !sixth_band_consistent {
+		all_facts_consistent = false;
+		incompleteness.push("the sixth band is inconsistent".to_string());
+	}
+	let owner = if !unsupported_pairs.is_empty() {
+		serde_json::json!({
+			"status": "withheld_unsupported_path",
+			"pairs": unsupported_pairs,
+		})
+	} else if !all_facts_consistent {
+		serde_json::json!({
+			"status": "withheld_instrument_incomplete",
+			"incompleteness": incompleteness,
+		})
+	} else {
+		adr594_owner(
+			&medians,
+			owner_floor,
+			off_range,
+			off_median,
+			perturbation_accepted,
+			base_profiles_complete && sixth_band_residuals_complete && all_residuals_complete,
+		)
+	};
+	let pricing = adr596_removable_pricing(&owner, owner_floor);
+	base["adr596_pair_bands"] = serde_json::json!(pair_bands);
+	base["all_build_write_residuals_complete"] = serde_json::json!(all_residuals_complete);
+	base["all_build_write_facts_consistent"] = serde_json::json!(all_facts_consistent);
+	base["build_write_terms_scaled_ms"] = serde_json::json!(
+		medians
+			.iter()
+			.map(|(term, value)| {
+				serde_json::json!({
+					"term": term,
+					"median_scaled_ms": value,
+					"share_of_off_execute": value / off_median,
+					"share_of_build_write": if let Some(build_write) = medians_build_write(&base) { value / build_write } else { f64::NAN },
+					"clears_floor": *value > owner_floor,
+				})
+			})
+			.collect::<Vec<_>>()
+	);
+	// The scan wait's two components, beside the rule's table and never ranked in it.
+	base["build_write_scan_wait_components_scaled_ms"] = serde_json::json!({
+		"build_write_scan_open": median_of("build_write_scan_open"),
+		"build_write_scan_poll": median_of("build_write_scan_poll"),
+		"build_write_scan_wait": median_of("build_write_scan_wait"),
+	});
+	base["adr594_four_term_owner"] = base["owner"].clone();
+	base["owner"] = owner;
+	base["owner_removable_pricing"] = pricing;
+	Ok(base)
+}
+
+/// ADR 596: every retained on-row receipt re-run through the seventh band's current rules,
+/// as `toron::exec::node_attribution::revalidate_build_write_band` applies them to the terms
+/// and facts the profile stores. Two passes per pair: the receipt as retained, and — only when
+/// the retained facts predate a fact the rules now require and the writer's termination is
+/// `stream_end` — a second pass with `batches_limit_discarded = 0` and `batches_admitted =
+/// batches_read`, which the measured code's path implies (the discard counter is incremented
+/// only on the branch that sets `row_limit`); the derivation is named, never silent.
+fn adr596_revalidate_receipts(rows: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+	let tags = &ADR596_TAGS;
+	let mut pairs = Vec::new();
+	let mut all_consistent_as_retained = true;
+	let mut all_consistent_with_derivation = true;
+	for row in rows {
+		if row.get(tags.arm).and_then(serde_json::Value::as_str) != Some("on")
+			|| row.get("warmup") == Some(&serde_json::Value::Bool(true))
+		{
+			continue;
+		}
+		let pair = row
+			.get(tags.pair)
+			.and_then(serde_json::Value::as_u64)
+			.ok_or_else(|| "ADR 596 on row lacks a pair".to_string())?;
+		let (profile, retained) = lifecycle_target_receipt(row, pair as usize, tags.label)?;
+		let invocation = profile["aggregate_invocations"]
+			.as_array()
+			.and_then(|invocations| {
+				invocations.iter().find(|invocation| {
+					invocation.get("inclusive_lifecycle_receipt") == Some(retained)
+				})
+			})
+			.ok_or_else(|| format!("ADR 596 pair {pair} target invocation not found"))?;
+		let as_retained = toron::exec::node_attribution::revalidate_build_write_band(invocation);
+		let retained_consistent =
+			retained.get("build_write_facts_consistent") == Some(&serde_json::json!(true));
+		let revalidated_consistent =
+			as_retained.get("build_write_facts_consistent") == Some(&serde_json::json!(true));
+		all_consistent_as_retained &= revalidated_consistent;
+		// Fields the retained receipt carries that the re-run band disagrees on.
+		let differences: Vec<String> = as_retained
+			.as_object()
+			.into_iter()
+			.flat_map(|band| band.iter())
+			.filter(|(name, value)| {
+				retained
+					.get(name.as_str())
+					.is_some_and(|kept| kept != *value)
+			})
+			.map(|(name, value)| {
+				format!(
+					"{name}: retained {} vs revalidated {value}",
+					retained[name.as_str()]
+				)
+			})
+			.collect();
+		let facts = invocation
+			.get("diagnostics")
+			.and_then(serde_json::Value::as_array)
+			.and_then(|entries| {
+				entries.iter().find(|entry| {
+					entry.get("name") == Some(&serde_json::json!("build_write_facts"))
+				})
+			})
+			.and_then(|entry| entry.get("value").cloned())
+			.unwrap_or_default();
+		let predating: Vec<&str> = ["batches_limit_discarded", "batches_admitted"]
+			.into_iter()
+			.filter(|name| facts.get(name).is_none())
+			.collect();
+		let with_derivation = if !predating.is_empty()
+			&& facts.get("termination") == Some(&serde_json::json!("stream_end"))
+		{
+			let mut derived = invocation.clone();
+			if let Some(entry) = derived
+				.get_mut("diagnostics")
+				.and_then(serde_json::Value::as_array_mut)
+				.and_then(|entries| {
+					entries.iter_mut().find(|entry| {
+						entry.get("name") == Some(&serde_json::json!("build_write_facts"))
+					})
+				}) {
+				// Only a missing field is derived; a recorded value is kept and validated as
+				// recorded, so a receipt that recorded a discard is never rewritten clean.
+				if facts.get("batches_limit_discarded").is_none() {
+					entry["value"]["batches_limit_discarded"] = serde_json::json!(0);
+				}
+				if facts.get("batches_admitted").is_none() {
+					entry["value"]["batches_admitted"] = facts["batches_read"].clone();
+				}
+			}
+			let band = toron::exec::node_attribution::revalidate_build_write_band(&derived);
+			all_consistent_with_derivation &=
+				band.get("build_write_facts_consistent") == Some(&serde_json::json!(true));
+			Some(serde_json::json!({
+				"derivation": "stream_end implies batches_limit_discarded = 0 and batches_admitted = batches_read on the measured code path; applied to the missing fields only",
+				"derived_fields": predating,
+				"build_write_facts_consistent": band.get("build_write_facts_consistent").cloned(),
+				"build_write_inconsistency": band.get("build_write_inconsistency").cloned(),
+				"build_write_shape": band.get("build_write_shape").cloned(),
+			}))
+		} else {
+			all_consistent_with_derivation &= revalidated_consistent;
+			None
+		};
+		pairs.push(serde_json::json!({
+			"pair": pair,
+			"retained_facts_consistent": retained_consistent,
+			"revalidated_facts_consistent": revalidated_consistent,
+			"revalidated_inconsistency": as_retained.get("build_write_inconsistency").cloned(),
+			"revalidated_shape": as_retained.get("build_write_shape").cloned(),
+			"revalidated_residual_micros": as_retained.get("build_write_residual_micros").cloned(),
+			"differences_from_retained": differences,
+			"facts_predating_the_rules": predating,
+			"with_derived_limit_facts": with_derivation,
+		}));
+	}
+	Ok(serde_json::json!({
+		"pairs": pairs,
+		"all_facts_consistent_as_retained": all_consistent_as_retained,
+		"all_facts_consistent_with_derivation": all_consistent_with_derivation,
+	}))
+}
+
+/// The sixth band's `inner_1_build_write` median-scaled ms from the base evaluation, the
+/// denominator for each child's share of the term it decomposes.
+fn medians_build_write(base: &serde_json::Value) -> Option<f64> {
+	base.get("inner_1_terms_scaled_ms")?
+		.as_array()?
+		.iter()
+		.find(|term| term.get("term") == Some(&serde_json::json!("inner_1_build_write")))?
+		.get("median_scaled_ms")?
+		.as_f64()
+}
+
+/// ADR 596: what a mechanism would stop doing in the owning child, priced gross as the record
+/// wrote it. A gross figure is the work the candidate would not repeat, not a saving: a carried
+/// or resident input still has to be allocated, accounted against the memory budget, and paid
+/// for on the drive side, and only a paired net-gain measurement under its own record says
+/// whether any of it is a gain. No cut opens under this record.
+fn adr596_removable_pricing(owner: &serde_json::Value, owner_floor: f64) -> serde_json::Value {
+	if owner["status"] != "resolved" {
+		return serde_json::json!({"status": "no_owner"});
+	}
+	let term = owner["term"].as_str().unwrap_or_default();
+	let median = owner["median_scaled_ms"].as_f64().unwrap_or(f64::NAN);
+	let gross = |candidate: &str, net: &str| {
+		serde_json::json!({
+			"status": "gross_candidate_work",
+			"removable_subterm": term,
+			"median_scaled_ms": median,
+			"clears_floor": median > owner_floor,
+			"candidate": candidate,
+			"net_improvement": net,
+		})
+	};
+	match term {
+		"build_write_scan_wait" => gross(
+			"a carried or cached input: the polls the sizing scan and the partition-sizing pass already paid for would not be repeated",
+			"unpriced: a carried input is allocated and accounted against the memory budget; successor measures paired off/on with the cut beside value parity and peak-memory accounting",
+		),
+		"build_write_encode" | "build_write_page_write" => gross(
+			"a resident build under the budget: the pages would not be encoded and written",
+			"unpriced: a resident build is allocated and accounted against the memory budget and read differently on the drive side; successor measures paired off/on with the cut beside value parity and peak-memory accounting",
+		),
+		"build_write_index" => gross(
+			"a once-built index (ADR 589's pattern): the per-page inserts would be replaced by one build",
+			"unpriced: the once-built index still sorts or hashes every entry; successor measures paired off/on with the cut beside value parity",
+		),
+		"build_write_residual" => serde_json::json!({
+			"status": "not_removable",
+			"successor": "the residual is not a mechanism; deepen the instrument",
+		}),
+		_ => serde_json::json!({
+			"status": "unpriced",
+			"removable_subterm": term,
+			"median_scaled_ms": median,
+			"successor": "name the subterm a mechanism would stop doing, then price it gross under its own record",
+		}),
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
 // ADR 594: replay 1's preparation decomposed through the sixth band.
 // ---------------------------------------------------------------------------------------------
 
@@ -2246,7 +2779,14 @@ fn adr594_q21_inner_1_command(args: &[String]) -> ExitCode {
 /// its named outcomes. An unsupported branch on any pair withholds the owner as an
 /// unsupported path; an inconsistent band withholds it as an incomplete instrument.
 fn evaluate_adr594_pairs(rows: &[serde_json::Value]) -> Result<serde_json::Value, String> {
-	let tags = &ADR594_TAGS;
+	evaluate_adr594_pairs_tagged(rows, &ADR594_TAGS)
+}
+
+/// The sixth-band evaluation under a successor record's tags (ADR 596 runs it first).
+fn evaluate_adr594_pairs_tagged(
+	rows: &[serde_json::Value],
+	tags: &LifecyclePairTags,
+) -> Result<serde_json::Value, String> {
 	let mut base = evaluate_lifecycle_pairs(rows, tags)?;
 	let mut pair_bands = Vec::new();
 	let mut samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
@@ -11769,7 +12309,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|perf-board-replay|adr592-revalidate|adr593-journal-recheck|adr584-q21-attribution|adr585-q21-decomposition|adr594-q21-inner-1|adr595-q21-inner-1|adr595-reevaluate|adr594-reevaluate|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|perf-board-replay|adr592-revalidate|adr593-journal-recheck|adr584-q21-attribution|adr585-q21-decomposition|adr594-q21-inner-1|adr595-q21-inner-1|adr596-q21-build-write|adr596-reevaluate|adr595-reevaluate|adr594-reevaluate|adr586-q21-semi-write|adr587-q21-insert|adr588-q21-second-walk|adr589-q21-order-aware|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }
@@ -13480,6 +14020,551 @@ mod tests {
 		assert_eq!(
 			summary["adr594_pair_bands"][0]["inner_1_build_rows"],
 			7_300_000
+		);
+	}
+
+	// -----------------------------------------------------------------------------------------
+	// ADR 596 fixtures: the seventh band over the sixth band's spilled branch.
+	// -----------------------------------------------------------------------------------------
+
+	fn adr596_spilled_facts() -> serde_json::Value {
+		serde_json::json!({
+			"branch": "spilled", "partition_count": 1, "group_count": 1,
+			"partition_sizing_passes": 1, "estimated_build_bytes": 100_000_000,
+			"sizing_rows": 7_300_000, "build_rows": 5_845_938, "build_spill_bytes": 27_242_808,
+		})
+	}
+
+	/// The writer's facts for a projected, filtered, unexchanged write to the stream's end.
+	fn adr596_write_facts() -> serde_json::Value {
+		serde_json::json!({
+			"filter_present": true, "exchange": false, "exchange_partitions": null,
+			"projected": true, "termination": "stream_end", "index_mode": "compact",
+			"unsupported": null, "batches_read": 120, "batches_limit_discarded": 0,
+			"batches_admitted": 120, "batches_filtered_empty": 0,
+			"batches_written": 120, "rows_read": 12_000_000, "rows_kept": 5_845_938,
+			"chunks": 720, "chunks_unkeyed": 0, "pages": 720, "plaintext_bytes": 60_000_000,
+			"ciphertext_bytes": 27_242_808, "index_entries": 5_845_938, "index_compactions": 0,
+			"shape": "supported", "consistent": true, "inconsistency": null,
+		})
+	}
+
+	/// One ADR 596 row: ADR 594's spilled band (sizing 200 ms, partition sizing 200 ms, build
+	/// write 1,180 ms of a 1,700 ms term) with the eleven children of the build write and the
+	/// writer's facts on the receipt, under this record's tags.
+	fn adr596_fixture_row(
+		pair: usize,
+		on: bool,
+		children: [u64; 11],
+		write_facts: serde_json::Value,
+		inner_1_facts: serde_json::Value,
+	) -> serde_json::Value {
+		let mut row = adr594_fixture_row_with_term(
+			pair,
+			on,
+			[200_000, 200_000, 1_180_000],
+			inner_1_facts.clone(),
+			1_700_000,
+		);
+		for (from, to) in [
+			("adr594_pair", "adr596_pair"),
+			("adr594_arm", "adr596_arm"),
+			("adr594_pair_position", "adr596_pair_position"),
+		] {
+			let value = row[from].take();
+			row[to] = value;
+			row.as_object_mut().unwrap().remove(from);
+		}
+		if on && inner_1_facts.get("branch") == Some(&serde_json::json!("spilled")) {
+			let receipt = row
+				.pointer_mut(
+					"/node_attribution/aggregate_invocations/0/inclusive_lifecycle_receipt",
+				)
+				.expect("fixture receipt");
+			// Calls as the ledger would count them on the facts' path.
+			let fact = |name: &str| write_facts[name].as_u64().unwrap_or(0);
+			let flag = |name: &str| write_facts[name].as_bool().unwrap_or(false);
+			let admitted = fact("batches_admitted");
+			let calls = |child: &str| match child {
+				"build_write_create" | "build_write_scan_open" | "build_write_finish" => 1,
+				"build_write_scan_poll" => {
+					if write_facts["termination"] == "row_limit" {
+						fact("batches_read")
+					} else {
+						fact("batches_read") + 1
+					}
+				}
+				"build_write_filter" => {
+					if flag("filter_present") {
+						admitted
+					} else {
+						0
+					}
+				}
+				"build_write_repartition" => {
+					if flag("exchange") {
+						admitted - fact("batches_filtered_empty")
+					} else {
+						0
+					}
+				}
+				"build_write_project" => {
+					if flag("projected") {
+						fact("chunks")
+					} else {
+						0
+					}
+				}
+				"build_write_key_extract" => fact("chunks"),
+				_ => fact("pages"),
+			};
+			for (child, value) in ADR596_CHILDREN.iter().zip(children) {
+				receipt[format!("{child}_micros")] = serde_json::json!(value);
+				receipt[format!("{child}_calls")] = serde_json::json!(calls(child));
+			}
+			receipt["build_write_residual_micros"] =
+				serde_json::json!(1_180_000 - children.iter().sum::<u64>());
+			for (name, value) in write_facts.as_object().unwrap() {
+				match name.as_str() {
+					"shape" => receipt["build_write_shape"] = value.clone(),
+					"consistent" => receipt["build_write_facts_consistent"] = value.clone(),
+					"inconsistency" => receipt["build_write_inconsistency"] = value.clone(),
+					_ => receipt[format!("build_write_{name}")] = value.clone(),
+				}
+			}
+		}
+		row
+	}
+
+	fn adr596_rows(children: [u64; 11], write_facts: serde_json::Value) -> Vec<serde_json::Value> {
+		adr596_rows_on(children, write_facts, adr596_spilled_facts())
+	}
+
+	fn adr596_rows_on(
+		children: [u64; 11],
+		write_facts: serde_json::Value,
+		inner_1_facts: serde_json::Value,
+	) -> Vec<serde_json::Value> {
+		(0..ADR585_PAIRS)
+			.flat_map(|pair| {
+				[
+					adr596_fixture_row(
+						pair,
+						false,
+						children,
+						write_facts.clone(),
+						inner_1_facts.clone(),
+					),
+					adr596_fixture_row(
+						pair,
+						true,
+						children,
+						write_facts.clone(),
+						inner_1_facts.clone(),
+					),
+				]
+			})
+			.collect()
+	}
+
+	/// Children in receipt order: create, scan_open, scan_poll, filter, repartition, project,
+	/// key_extract, encode, page_write, index, finish.
+	const ADR596_BELOW_FLOOR: [u64; 11] = [
+		1_000, 20_000, 300_000, 100_000, 0, 60_000, 90_000, 150_000, 250_000, 150_000, 5_000,
+	];
+
+	// The fixture's off arms span 400 ms, so the floor is 800 ms and a lead must exceed 400 ms.
+	// The rule ranks the scan wait once (open plus poll), never its components beside it.
+	#[test]
+	fn adr596_the_eleven_term_rule_returns_each_named_outcome() {
+		// Resolved: the page write leads by more than the range and clears the floor.
+		let children = [
+			1_000, 20_000, 30_000, 20_000, 0, 10_000, 20_000, 40_000, 950_000, 60_000, 5_000,
+		];
+		let summary = evaluate_adr596_pairs(&adr596_rows(children, adr596_write_facts())).unwrap();
+		assert_eq!(
+			summary["owner"]["status"], "resolved",
+			"{}",
+			summary["owner"]
+		);
+		assert_eq!(summary["owner"]["term"], "build_write_page_write");
+		assert_eq!(
+			summary["adr594_four_term_owner"]["term"],
+			"inner_1_build_write"
+		);
+		assert_eq!(summary["all_build_write_facts_consistent"], true);
+		assert_eq!(summary["all_build_write_residuals_complete"], true);
+		let band = &summary["adr596_pair_bands"][0];
+		assert_eq!(band["build_write_scan_wait_micros"], 50_000);
+		assert_eq!(band["build_write_residual_micros"], 24_000);
+		assert_eq!(band["build_write_pages"], 720);
+		assert_eq!(band["build_write_termination"], "stream_end");
+		assert_eq!(band["build_write_repartition_calls"], 0);
+		let terms = summary["build_write_terms_scaled_ms"].as_array().unwrap();
+		assert_eq!(
+			terms.len(),
+			11,
+			"ten rule children (scan wait once) and the residual"
+		);
+		let names: Vec<&str> = terms.iter().map(|t| t["term"].as_str().unwrap()).collect();
+		assert!(names.contains(&"build_write_scan_wait"));
+		assert!(
+			!names.contains(&"build_write_scan_open") && !names.contains(&"build_write_scan_poll")
+		);
+		assert_eq!(names[0], "build_write_page_write");
+		assert!(terms[0]["share_of_build_write"].as_f64().unwrap() > 0.8);
+		let components = &summary["build_write_scan_wait_components_scaled_ms"];
+		assert!(components["build_write_scan_open"].as_f64().unwrap() > 0.0);
+		assert!(components["build_write_scan_poll"].as_f64().unwrap() > 0.0);
+		let pricing = &summary["owner_removable_pricing"];
+		assert_eq!(pricing["status"], "gross_candidate_work");
+		assert_eq!(pricing["clears_floor"], true);
+		assert!(
+			pricing["candidate"]
+				.as_str()
+				.unwrap()
+				.contains("resident build")
+		);
+		assert!(
+			pricing["net_improvement"]
+				.as_str()
+				.unwrap()
+				.contains("unpriced")
+		);
+
+		// Resolved on the scan wait: open and poll sum past the floor though neither alone does.
+		let children = [
+			1_000, 400_000, 600_000, 20_000, 0, 10_000, 20_000, 40_000, 30_000, 20_000, 5_000,
+		];
+		let summary = evaluate_adr596_pairs(&adr596_rows(children, adr596_write_facts())).unwrap();
+		assert_eq!(
+			summary["owner"]["status"], "resolved",
+			"{}",
+			summary["owner"]
+		);
+		assert_eq!(summary["owner"]["term"], "build_write_scan_wait");
+		assert!(
+			summary["owner_removable_pricing"]["candidate"]
+				.as_str()
+				.unwrap()
+				.contains("carried")
+		);
+
+		// Below floor: no child above 800 ms; the finding is the shape, not a failure.
+		let summary =
+			evaluate_adr596_pairs(&adr596_rows(ADR596_BELOW_FLOOR, adr596_write_facts())).unwrap();
+		assert_eq!(
+			summary["owner"]["status"], "below_floor_no_mechanism",
+			"{}",
+			summary["owner"]
+		);
+		assert_eq!(summary["owner"]["leading_term"], "build_write_scan_wait");
+		assert_eq!(summary["owner_removable_pricing"]["status"], "no_owner");
+
+		// Two children splitting the term evenly: neither clears the floor, so the outcome is
+		// below floor, not a tie (a tie needs two terms above 800 ms inside a 1,180 ms term,
+		// which this fixture cannot hold; the tie outcome is ADR 586's, tested there).
+		let children = [
+			1_000, 20_000, 30_000, 20_000, 0, 10_000, 20_000, 40_000, 500_000, 500_000, 5_000,
+		];
+		let summary = evaluate_adr596_pairs(&adr596_rows(children, adr596_write_facts())).unwrap();
+		assert_eq!(summary["owner"]["status"], "below_floor_no_mechanism");
+	}
+
+	// A leading residual is an incomplete instrument at any size; inconsistent facts, an
+	// absent band, the partitioned branch, and an unsupported writer shape each withhold.
+	#[test]
+	fn adr596_withholds_on_a_leading_residual_inconsistent_facts_and_unsupported_shapes() {
+		// The children sum to 1,030 ms of the 1,180 ms term, none above 145 ms: the residual
+		// (150 ms) is inside its bound (overhead 100 ms + 5% of the term) yet leads.
+		let children = [
+			5_000, 5_000, 140_000, 140_000, 0, 130_000, 145_000, 145_000, 145_000, 145_000, 30_000,
+		];
+		let summary = evaluate_adr596_pairs(&adr596_rows(children, adr596_write_facts())).unwrap();
+		assert_eq!(summary["all_build_write_residuals_complete"], true);
+		assert_eq!(
+			summary["owner"]["status"], "withheld_instrument_incomplete",
+			"{}",
+			summary["owner"]
+		);
+		assert_eq!(summary["owner"]["leading_residual"], "build_write_residual");
+
+		// A residual past its bound: incomplete profiles, whatever leads.
+		let children = [
+			1_000, 20_000, 30_000, 20_000, 0, 10_000, 20_000, 40_000, 150_000, 84_000, 5_000,
+		];
+		let summary = evaluate_adr596_pairs(&adr596_rows(children, adr596_write_facts())).unwrap();
+		assert_eq!(
+			summary["owner"]["status"], "withheld_incomplete_profiles",
+			"{}",
+			summary["owner"]
+		);
+		assert_eq!(summary["all_build_write_residuals_complete"], false);
+
+		// Inconsistent facts on one pair.
+		let mut facts = adr596_write_facts();
+		facts["consistent"] = serde_json::json!(false);
+		facts["inconsistency"] =
+			serde_json::json!("pages disagree with chunks less chunks_unkeyed");
+		let summary = evaluate_adr596_pairs(&adr596_rows(ADR596_BELOW_FLOOR, facts)).unwrap();
+		assert_eq!(summary["owner"]["status"], "withheld_instrument_incomplete");
+		assert!(
+			summary["owner"]["incompleteness"][0]
+				.as_str()
+				.unwrap()
+				.contains("pages disagree")
+		);
+
+		// The seventh band absent while the sixth is present: incomplete.
+		let rows = adr596_rows(ADR596_BELOW_FLOOR, adr596_write_facts())
+			.into_iter()
+			.map(|mut row| {
+				if let Some(receipt) = row.pointer_mut(
+					"/node_attribution/aggregate_invocations/0/inclusive_lifecycle_receipt",
+				) {
+					let object = receipt.as_object_mut().unwrap();
+					object.retain(|key, _| !key.starts_with("build_write_"));
+				}
+				row
+			})
+			.collect::<Vec<_>>();
+		let summary = evaluate_adr596_pairs(&rows).unwrap();
+		assert_eq!(summary["owner"]["status"], "withheld_instrument_incomplete");
+		assert!(
+			summary["owner"]["incompleteness"][0]
+				.as_str()
+				.unwrap()
+				.contains("seventh band is absent")
+		);
+
+		// The partitioned branch: no build write to decompose.
+		let summary = evaluate_adr596_pairs(&adr596_rows_on(
+			[0; 11],
+			adr596_write_facts(),
+			adr594_partitioned_facts(),
+		))
+		.unwrap();
+		assert_eq!(
+			summary["owner"]["status"], "withheld_unsupported_path",
+			"{}",
+			summary["owner"]
+		);
+		assert_eq!(
+			summary["adr596_pair_bands"][0]["build_write_unsupported"],
+			"branch partitioned"
+		);
+
+		// An unsupported writer shape, reported by the receipt.
+		let mut facts = adr596_write_facts();
+		facts["shape"] = serde_json::json!("unsupported");
+		facts["unsupported"] = serde_json::json!("preserved_rows");
+		facts["consistent"] = serde_json::json!(false);
+		facts["inconsistency"] = serde_json::json!("unsupported shape: preserved_rows");
+		let summary = evaluate_adr596_pairs(&adr596_rows(ADR596_BELOW_FLOOR, facts)).unwrap();
+		assert_eq!(summary["owner"]["status"], "withheld_unsupported_path");
+		assert_eq!(
+			summary["owner"]["pairs"],
+			serde_json::json!([0, 1, 2, 3, 4])
+		);
+
+		// ADR 595's precedence still applies over this record's outcome.
+		let summary =
+			evaluate_adr596_pairs(&adr596_rows(ADR596_BELOW_FLOOR, adr596_write_facts())).unwrap();
+		let mut withheld = summary.clone();
+		adr595_apply_launch_precedence(
+			&mut withheld,
+			&Adr595Verdicts {
+				separation: serde_json::json!({"verdict": "unknown"}),
+				window: serde_json::json!({"verdict": "verified"}),
+			},
+		);
+		assert_eq!(
+			withheld["owner"]["status"],
+			"withheld_launch_separation_unknown"
+		);
+		assert_eq!(
+			withheld["owner"]["rule_outcome_withheld"]["status"],
+			"below_floor_no_mechanism"
+		);
+	}
+
+	/// The fixture rows with the writer's facts also stored as the profile's diagnostic, as a
+	/// real profile carries them; `strip` removes facts from the diagnostic to stand in for a
+	/// receipt recorded before a rule required them.
+	fn adr596_rows_with_diagnostics(strip: &[&str]) -> Vec<serde_json::Value> {
+		adr596_rows(ADR596_BELOW_FLOOR, adr596_write_facts())
+			.into_iter()
+			.map(|mut row| {
+				if let Some(invocation) =
+					row.pointer_mut("/node_attribution/aggregate_invocations/0")
+				{
+					let mut facts = adr596_write_facts();
+					for name in ["shape", "consistent", "inconsistency"] {
+						facts.as_object_mut().unwrap().remove(name);
+					}
+					for name in strip {
+						facts.as_object_mut().unwrap().remove(*name);
+					}
+					invocation["diagnostics"] =
+						serde_json::json!([{"name": "build_write_facts", "value": facts}]);
+				}
+				row
+			})
+			.collect()
+	}
+
+	// ADR 596: the retained receipts re-run through the band's current rules, as retained and,
+	// where the retained facts predate a rule, with the stream-end derivation named.
+	#[test]
+	fn adr596_receipt_revalidation_reruns_the_band_and_names_a_derivation() {
+		let report = adr596_revalidate_receipts(&adr596_rows_with_diagnostics(&[])).unwrap();
+		assert_eq!(report["all_facts_consistent_as_retained"], true, "{report}");
+		assert_eq!(report["all_facts_consistent_with_derivation"], true);
+		let pairs = report["pairs"].as_array().unwrap();
+		assert_eq!(pairs.len(), ADR585_PAIRS);
+		assert_eq!(pairs[0]["revalidated_facts_consistent"], true);
+		assert_eq!(pairs[0]["differences_from_retained"], serde_json::json!([]));
+		assert_eq!(pairs[0]["facts_predating_the_rules"], serde_json::json!([]));
+		assert_eq!(
+			pairs[0]["with_derived_limit_facts"],
+			serde_json::Value::Null
+		);
+		assert_eq!(
+			pairs[0]["revalidated_residual_micros"],
+			1_180_000 - ADR596_BELOW_FLOOR.iter().sum::<u64>()
+		);
+
+		// Facts recorded before the discarded-batch rule: inconsistent as retained, named, and
+		// consistent under the derivation the measured path implies.
+		let report = adr596_revalidate_receipts(&adr596_rows_with_diagnostics(&[
+			"batches_limit_discarded",
+			"batches_admitted",
+		]))
+		.unwrap();
+		assert_eq!(report["all_facts_consistent_as_retained"], false);
+		assert_eq!(
+			report["all_facts_consistent_with_derivation"], true,
+			"{report}"
+		);
+		let pair = &report["pairs"][0];
+		assert_eq!(pair["revalidated_facts_consistent"], false);
+		assert!(
+			pair["revalidated_inconsistency"]
+				.as_str()
+				.unwrap()
+				.contains("fact batches_limit_discarded is missing")
+		);
+		assert_eq!(
+			pair["facts_predating_the_rules"],
+			serde_json::json!(["batches_limit_discarded", "batches_admitted"])
+		);
+		assert_eq!(
+			pair["with_derived_limit_facts"]["build_write_facts_consistent"],
+			true
+		);
+		assert_eq!(
+			pair["with_derived_limit_facts"]["derived_fields"],
+			serde_json::json!(["batches_limit_discarded", "batches_admitted"])
+		);
+		assert!(
+			pair["differences_from_retained"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.any(|d| d
+					.as_str()
+					.unwrap()
+					.starts_with("build_write_facts_consistent"))
+		);
+
+		// Partially missing facts: only the missing field is derived, and a recorded value that
+		// contradicts the stream end survives into the rules and fails them.
+		let with_recorded = |kept: &str, value: u64, strip: &str| {
+			let mut rows = adr596_rows_with_diagnostics(&[strip]);
+			for row in &mut rows {
+				if let Some(facts) =
+					row.pointer_mut("/node_attribution/aggregate_invocations/0/diagnostics/0/value")
+				{
+					facts[kept] = serde_json::json!(value);
+				}
+			}
+			rows
+		};
+		// A recorded discard of one with the admitted count missing: the derivation supplies
+		// admitted = read, the recorded discard stays, and the counts disagree.
+		let report = adr596_revalidate_receipts(&with_recorded(
+			"batches_limit_discarded",
+			1,
+			"batches_admitted",
+		))
+		.unwrap();
+		assert_eq!(
+			report["all_facts_consistent_with_derivation"], false,
+			"{report}"
+		);
+		let pair = &report["pairs"][0];
+		assert_eq!(
+			pair["facts_predating_the_rules"],
+			serde_json::json!(["batches_admitted"])
+		);
+		assert_eq!(
+			pair["with_derived_limit_facts"]["derived_fields"],
+			serde_json::json!(["batches_admitted"])
+		);
+		assert_eq!(
+			pair["with_derived_limit_facts"]["build_write_facts_consistent"],
+			false
+		);
+		assert!(
+			pair["with_derived_limit_facts"]["build_write_inconsistency"]
+				.as_str()
+				.unwrap()
+				.contains("batches_admitted disagree with batches_read less discarded"),
+			"{pair}"
+		);
+		// A recorded admitted count short of the read count with the discard missing: the
+		// derivation supplies discarded = 0, the recorded 119 stays, and the counts disagree.
+		let report = adr596_revalidate_receipts(&with_recorded(
+			"batches_admitted",
+			119,
+			"batches_limit_discarded",
+		))
+		.unwrap();
+		assert_eq!(
+			report["all_facts_consistent_with_derivation"], false,
+			"{report}"
+		);
+		let pair = &report["pairs"][0];
+		assert_eq!(
+			pair["facts_predating_the_rules"],
+			serde_json::json!(["batches_limit_discarded"])
+		);
+		assert_eq!(
+			pair["with_derived_limit_facts"]["derived_fields"],
+			serde_json::json!(["batches_limit_discarded"])
+		);
+		assert!(
+			pair["with_derived_limit_facts"]["build_write_inconsistency"]
+				.as_str()
+				.unwrap()
+				.contains("batches_admitted disagree with batches_read less discarded"),
+			"{pair}"
+		);
+		// A recorded admitted count equal to the read count with the discard missing: the one
+		// field is derived and the pair is consistent.
+		let report = adr596_revalidate_receipts(&with_recorded(
+			"batches_admitted",
+			120,
+			"batches_limit_discarded",
+		))
+		.unwrap();
+		assert_eq!(
+			report["all_facts_consistent_with_derivation"], true,
+			"{report}"
+		);
+		assert_eq!(
+			report["pairs"][0]["with_derived_limit_facts"]["derived_fields"],
+			serde_json::json!(["batches_limit_discarded"])
 		);
 	}
 
