@@ -163,6 +163,9 @@ pub(in crate::exec) enum SpillResidentGuardSite {
 	RebuildIndex,
 	PinDecodedPages,
 	Finish,
+	/// ADR 601: the finish-built index's reservation and finalization, guarded before allocating.
+	Reserve,
+	FinishIndex,
 }
 
 impl SpillResidentGuardSite {
@@ -171,6 +174,8 @@ impl SpillResidentGuardSite {
 			Self::Write => "write",
 			Self::RebuildIndex => "rebuild_index",
 			Self::PinDecodedPages => "pin_decoded_pages",
+			Self::Reserve => "reserve",
+			Self::FinishIndex => "finish_index",
 			Self::Finish => "finish",
 		}
 	}
@@ -1009,6 +1014,69 @@ impl SpilledBatchIndex {
 		Self::Hash(HashMap::new())
 	}
 
+	fn finish_built_admitted(key_plan: JoinKeyPlan, null_safe_keys: bool) -> bool {
+		finish_built_index_admitted(key_plan, null_safe_keys)
+	}
+
+	/// ADR 601: the collecting form for an admitted plan, reserved at `expected_rows`.
+	fn reserved(key_plan: JoinKeyPlan, expected_rows: usize) -> Result<Self, ExecutionError> {
+		match key_plan {
+			JoinKeyPlan::Int32 => Ok(Self::Int32(PrimitiveSpilledBatchIndex::reserved(
+				expected_rows,
+			))),
+			JoinKeyPlan::Int64 => Ok(Self::Int64(PrimitiveSpilledBatchIndex::reserved(
+				expected_rows,
+			))),
+			JoinKeyPlan::Generic => Err(ExecutionError::Kernel {
+				message: "finish-built spill index reserved for a generic key plan".to_string(),
+			}),
+		}
+	}
+
+	fn is_collecting(&self) -> bool {
+		match self {
+			Self::Int32(index) => index.is_collecting(),
+			Self::Int64(index) => index.is_collecting(),
+			Self::Hash(_) => false,
+		}
+	}
+
+	fn finalize(&mut self) -> Result<FinishIndexStats, ExecutionError> {
+		match self {
+			Self::Int32(index) => index.finalize(),
+			Self::Int64(index) => index.finalize(),
+			Self::Hash(_) => Err(ExecutionError::Kernel {
+				message: "finish-built spill index finalized on the hash variant".to_string(),
+			}),
+		}
+	}
+
+	fn finish_stats(&self) -> Option<FinishIndexStats> {
+		match self {
+			Self::Int32(index) => index.finish_stats(),
+			Self::Int64(index) => index.finish_stats(),
+			Self::Hash(_) => None,
+		}
+	}
+
+	fn capacity_growths(&self) -> u64 {
+		match self {
+			Self::Int32(index) => index.capacity_growths(),
+			Self::Int64(index) => index.capacity_growths(),
+			Self::Hash(_) => 0,
+		}
+	}
+
+	/// ADR 601: the bucket bytes a finalization would obtain, from the entries collected.
+	fn planned_finish_bucket_bytes(&self) -> Result<u64, ExecutionError> {
+		let entry_count = match self {
+			Self::Int32(index) => index.entries.len(),
+			Self::Int64(index) => index.entries.len(),
+			Self::Hash(_) => 0,
+		};
+		finish_index_plan(entry_count).map(|(_, bytes)| bytes)
+	}
+
 	fn insert(&mut self, key: JoinKey, row_ref: SpilledBatchRowRef) -> Result<(), ExecutionError> {
 		match (self, key) {
 			(Self::Int32(index), JoinKey::Int32(key)) => {
@@ -1094,6 +1162,87 @@ struct PrimitiveSpilledBatchIndex<K> {
 	entries: Vec<PrimitiveSpilledBatchIndexEntry<K>>,
 	hasher: RandomState,
 	accounted_bytes: u64,
+	build: PrimitiveIndexBuild,
+}
+
+/// ADR 601: how the primitive index is built. `Incremental` hashes every insert into buckets
+/// that double as they fill; `Collecting` appends entries without hashing until `finalize`
+/// builds the buckets once, after which the index is `Finalized` and takes no more inserts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimitiveIndexBuild {
+	Incremental,
+	Collecting { growths: u64 },
+	Finalized(FinishIndexStats),
+}
+
+/// ADR 601: what the finalization pass produced — the distinct keys kept, the repeated rows
+/// moved onto overflow lists, the bucket count obtained, and the entry-vector growths the
+/// collecting phase needed past its reservation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::exec) struct FinishIndexStats {
+	pub(in crate::exec) entries: u64,
+	pub(in crate::exec) duplicates: u64,
+	pub(in crate::exec) buckets: u64,
+	pub(in crate::exec) growths: u64,
+}
+
+/// ADR 601: whether a plan takes the finish-built form — the primitive variants' admission,
+/// exactly `for_key_plan`'s. A `Generic` or null-safe plan takes the `Hash` variant, incremental,
+/// with neither of the finish-built clocks.
+pub(in crate::exec) fn finish_built_index_admitted(
+	key_plan: JoinKeyPlan,
+	null_safe_keys: bool,
+) -> bool {
+	!null_safe_keys && matches!(key_plan, JoinKeyPlan::Int32 | JoinKeyPlan::Int64)
+}
+
+/// ADR 601: the bucket array a finalization needs for `entry_count` entries — the smallest
+/// power of two at or above twice the count, and its bytes — refused by name when the count
+/// cannot be indexed by the `u32` buckets or the array cannot be represented. Pure: nothing is
+/// allocated here.
+pub(in crate::exec) fn finish_index_plan(
+	entry_count: usize,
+) -> Result<(usize, u64), ExecutionError> {
+	let representable = u32::try_from(entry_count)
+		.ok()
+		.is_some_and(|count| count < EMPTY_SPILLED_BATCH_BUCKET);
+	if !representable {
+		return Err(ExecutionError::Kernel {
+			message: format!(
+				"finish-built spill index entry count {entry_count} exceeds the u32 bucket range"
+			),
+		});
+	}
+	let bucket_count = entry_count
+		.checked_mul(2)
+		.and_then(usize::checked_next_power_of_two)
+		.map(|count| count.max(1))
+		.ok_or_else(|| ExecutionError::Kernel {
+			message: format!(
+				"finish-built spill index bucket count for {entry_count} entries is not representable"
+			),
+		})?;
+	let bucket_bytes = bucket_count
+		.checked_mul(std::mem::size_of::<u32>())
+		.and_then(|bytes| u64::try_from(bytes).ok())
+		.ok_or_else(|| ExecutionError::Kernel {
+			message: format!(
+				"finish-built spill index bucket bytes for {bucket_count} buckets overflowed"
+			),
+		})?;
+	Ok((bucket_count, bucket_bytes))
+}
+
+/// ADR 601: the entry vector a reservation of `expected_rows` needs, in bytes, checked.
+fn reserved_entry_bytes<K>(expected_rows: usize) -> Result<u64, ExecutionError> {
+	expected_rows
+		.checked_mul(std::mem::size_of::<PrimitiveSpilledBatchIndexEntry<K>>())
+		.and_then(|bytes| u64::try_from(bytes).ok())
+		.ok_or_else(|| ExecutionError::Kernel {
+			message: format!(
+				"finish-built spill index reservation for {expected_rows} rows overflowed"
+			),
+		})
 }
 
 struct PrimitiveSpilledBatchIndexEntry<K> {
@@ -1117,10 +1266,156 @@ where
 			entries,
 			hasher: RandomState::new(),
 			accounted_bytes,
+			build: PrimitiveIndexBuild::Incremental,
 		}
 	}
 
+	/// ADR 601: a collecting index — the entry vector obtained at `expected_rows` capacity and
+	/// accounted at the capacity obtained; no buckets until `finalize`.
+	fn reserved(expected_rows: usize) -> Self {
+		let entries: Vec<PrimitiveSpilledBatchIndexEntry<K>> = Vec::with_capacity(expected_rows);
+		let accounted_bytes = spilled_primitive_index_base_bytes::<K>(&[], &entries, 0);
+		Self {
+			buckets: Vec::new(),
+			entries,
+			hasher: RandomState::new(),
+			accounted_bytes,
+			build: PrimitiveIndexBuild::Collecting { growths: 0 },
+		}
+	}
+
+	#[cfg(test)]
+	fn seed_hasher(&mut self, seeds: (u64, u64, u64, u64)) {
+		self.hasher = RandomState::with_seeds(seeds.0, seeds.1, seeds.2, seeds.3);
+	}
+
+	fn is_collecting(&self) -> bool {
+		matches!(self.build, PrimitiveIndexBuild::Collecting { .. })
+	}
+
+	fn finish_stats(&self) -> Option<FinishIndexStats> {
+		match self.build {
+			PrimitiveIndexBuild::Finalized(stats) => Some(stats),
+			_ => None,
+		}
+	}
+
+	fn capacity_growths(&self) -> u64 {
+		match self.build {
+			PrimitiveIndexBuild::Incremental => 0,
+			PrimitiveIndexBuild::Collecting { growths } => growths,
+			PrimitiveIndexBuild::Finalized(stats) => stats.growths,
+		}
+	}
+
+	/// ADR 601: the collecting append — no bucket, no hash, no probe; a push past the obtained
+	/// capacity grows the vector as `Vec` grows it, the delta accounted after and counted.
+	fn collect(
+		&mut self,
+		key: K,
+		row_ref: CompactSpilledBatchRowRef,
+	) -> Result<(), ExecutionError> {
+		let PrimitiveIndexBuild::Collecting { growths } = &mut self.build else {
+			return Err(ExecutionError::Kernel {
+				message: "finish-built spill index took an insert after finalization".to_string(),
+			});
+		};
+		if self.entries.len() == self.entries.capacity() {
+			*growths = growths.saturating_add(1);
+		}
+		let before_capacity = self.entries.capacity();
+		self.entries.push(PrimitiveSpilledBatchIndexEntry {
+			key,
+			refs: SpilledBatchRefList::new(row_ref),
+		});
+		let capacity_delta = self
+			.entries
+			.capacity()
+			.saturating_sub(before_capacity)
+			.saturating_mul(std::mem::size_of::<PrimitiveSpilledBatchIndexEntry<K>>());
+		self.accounted_bytes = self
+			.accounted_bytes
+			.saturating_add(capacity_delta.try_into().unwrap_or(u64::MAX));
+		Ok(())
+	}
+
+	/// ADR 601: the finalization pass. The buckets are obtained at the planned count (the caller
+	/// guarded the planned bytes) and accounted; then one pass in insertion order with a write
+	/// cursor: a new key takes the cursor's slot (the entry moved down to it, the bucket pointing
+	/// at it); a repeated key pushes its ref onto the earlier entry's overflow list, accounted as
+	/// obtained, and is dropped, its slot free for a later move. Refs stay in insertion order.
+	/// The vector is truncated to the cursor; its capacity is kept and stays accounted.
+	fn finalize(&mut self) -> Result<FinishIndexStats, ExecutionError> {
+		let PrimitiveIndexBuild::Collecting { growths } = self.build else {
+			return Err(ExecutionError::Kernel {
+				message: "finish-built spill index finalized twice".to_string(),
+			});
+		};
+		let (bucket_count, bucket_bytes) = finish_index_plan(self.entries.len())?;
+		let mut buckets = vec![EMPTY_SPILLED_BATCH_BUCKET; bucket_count];
+		self.accounted_bytes = self.accounted_bytes.saturating_add(bucket_bytes);
+		let mut write = 0usize;
+		let mut duplicates = 0u64;
+		for read in 0..self.entries.len() {
+			let key = self.entries[read].key;
+			let mut bucket = Self::bucket_for_key(&self.hasher, buckets.len(), key);
+			loop {
+				let slot = buckets[bucket];
+				if slot == EMPTY_SPILLED_BATCH_BUCKET {
+					// A new key: the buckets only ever point below the cursor, so the move
+					// downward (write <= read) never disturbs an entry a bucket references.
+					let entry = std::mem::replace(
+						&mut self.entries[read].refs,
+						SpilledBatchRefList::new(CompactSpilledBatchRowRef {
+							page_index: 0,
+							row: 0,
+						}),
+					);
+					self.entries[write] = PrimitiveSpilledBatchIndexEntry { key, refs: entry };
+					buckets[bucket] = u32::try_from(write).map_err(|_| ExecutionError::Kernel {
+						message: "finish-built spill index cursor exceeds u32".to_string(),
+					})?;
+					write += 1;
+					break;
+				}
+				let slot = usize::try_from(slot).map_err(|_| ExecutionError::Kernel {
+					message: "finish-built spill index bucket entry does not fit usize".to_string(),
+				})?;
+				if self.entries[slot].key == key {
+					// A repeated key: the earlier entry (below the cursor) takes the ref, in
+					// insertion order; this slot is dropped and free for a later move.
+					let row_ref = self.entries[read].refs.first;
+					let delta = self.entries[slot].refs.push(row_ref);
+					self.accounted_bytes = self.accounted_bytes.saturating_add(delta);
+					duplicates = duplicates.saturating_add(1);
+					break;
+				}
+				bucket = (bucket + 1) & (buckets.len() - 1);
+			}
+		}
+		self.entries.truncate(write);
+		self.buckets = buckets;
+		let stats = FinishIndexStats {
+			entries: u64::try_from(write).unwrap_or(u64::MAX),
+			duplicates,
+			buckets: u64::try_from(bucket_count).unwrap_or(u64::MAX),
+			growths,
+		};
+		self.build = PrimitiveIndexBuild::Finalized(stats);
+		Ok(stats)
+	}
+
 	fn insert(&mut self, key: K, row_ref: CompactSpilledBatchRowRef) -> Result<(), ExecutionError> {
+		match self.build {
+			PrimitiveIndexBuild::Incremental => {}
+			PrimitiveIndexBuild::Collecting { .. } => return self.collect(key, row_ref),
+			PrimitiveIndexBuild::Finalized(_) => {
+				return Err(ExecutionError::Kernel {
+					message: "finish-built spill index took an insert after finalization"
+						.to_string(),
+				});
+			}
+		}
 		let mut bucket = self.find_bucket(key);
 		let entry_index = self.buckets[bucket];
 		if entry_index == EMPTY_SPILLED_BATCH_BUCKET {
@@ -1379,10 +1674,14 @@ pub(in crate::exec) enum BuildWriteChild {
 	PageWrite,
 	Index,
 	Finish,
+	/// ADR 601: the finish-built index's reservation, around the admitted activation call.
+	Reserve,
+	/// ADR 601: the finish-built index's finalization pass, before `finish`.
+	FinishIndex,
 }
 
 impl BuildWriteChild {
-	pub(in crate::exec) const ALL: [Self; 11] = [
+	pub(in crate::exec) const ALL: [Self; 13] = [
 		Self::Create,
 		Self::ScanOpen,
 		Self::ScanPoll,
@@ -1394,6 +1693,8 @@ impl BuildWriteChild {
 		Self::PageWrite,
 		Self::Index,
 		Self::Finish,
+		Self::Reserve,
+		Self::FinishIndex,
 	];
 
 	/// The receipt's term name; `build_write_scan_open` and `build_write_scan_poll` are reported
@@ -1411,6 +1712,8 @@ impl BuildWriteChild {
 			Self::PageWrite => "build_write_page_write",
 			Self::Index => "build_write_index",
 			Self::Finish => "build_write_finish",
+			Self::Reserve => "build_write_reserve",
+			Self::FinishIndex => "build_write_finish_index",
 		}
 	}
 
@@ -1463,8 +1766,8 @@ impl ExchangeHandling {
 /// time, and the counts say which rules apply.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in crate::exec) struct BuildWriteLedger {
-	micros: [u64; 11],
-	calls: [u64; 11],
+	micros: [u64; 13],
+	calls: [u64; 13],
 	pub(in crate::exec) filter_present: bool,
 	pub(in crate::exec) exchange_partitions: Option<u32>,
 	pub(in crate::exec) projected: bool,
@@ -1491,6 +1794,12 @@ pub(in crate::exec) struct BuildWriteLedger {
 	/// ADR 600: the index's variant (`hash`, `int32`, `int64`) as the build reports it after a
 	/// page, distinct from `index_mode` (whether the compact wrapper was enabled).
 	pub(in crate::exec) index_variant: Option<&'static str>,
+	/// ADR 601: how the index was built (`incremental` / `finish`), the rows the reservation
+	/// expected, the vector's growths past it, and what the finalization pass produced.
+	pub(in crate::exec) index_build: Option<&'static str>,
+	pub(in crate::exec) index_expected_rows: Option<u64>,
+	pub(in crate::exec) index_capacity_growths: u64,
+	pub(in crate::exec) finish_index: Option<FinishIndexStats>,
 	/// ADR 597: how the Exchange was handled (`None` when the input carries none), whether
 	/// pass-through was requested, and why it was refused when it was.
 	pub(in crate::exec) exchange_handling: Option<ExchangeHandling>,
@@ -1560,6 +1869,12 @@ impl BuildWriteLedger {
 			"index_entries": self.index_entries,
 			"index_compactions": self.index_compactions,
 			"index_variant": self.index_variant.unwrap_or("none"),
+			"index_build": self.index_build.unwrap_or("none"),
+			"index_expected_rows": self.index_expected_rows,
+			"index_capacity_growths": self.index_capacity_growths,
+			"finish_index_entries": self.finish_index.map(|stats| stats.entries),
+			"finish_index_duplicates": self.finish_index.map(|stats| stats.duplicates),
+			"finish_index_buckets": self.finish_index.map(|stats| stats.buckets),
 			"exchange_handling": self.exchange_handling.map_or("none", ExchangeHandling::name),
 			"pass_through_requested": self.pass_through_requested,
 			"pass_through_refusal": self.pass_through_refusal,
@@ -1572,6 +1887,24 @@ impl BuildWriteLedger {
 	}
 
 	/// The same observation after `finish`, from the build's accessors.
+	/// ADR 601: the finish-built index's facts as it stands after finalization — the form, the
+	/// mode and variant (settled even when no page carried a keyed row), the reservation's
+	/// rows, the growths, and the pass's counts. The incremental form keeps its per-page facts.
+	pub(in crate::exec) fn observe_finish_built_index(&mut self, build: &SpilledInnerJoinBuild) {
+		if build.index_build_name() != "finish" {
+			return;
+		}
+		self.index_build = Some("finish");
+		self.index_mode = Some("compact");
+		self.index_variant = Some(build.index_variant_name());
+		self.index_expected_rows = build.finish_built_expected_rows();
+		self.index_capacity_growths = build
+			.compact_index
+			.as_ref()
+			.map_or(0, SpilledBatchIndex::capacity_growths);
+		self.finish_index = build.finish_index_stats();
+	}
+
 	pub(in crate::exec) fn observe_peaks_after_finish(
 		&mut self,
 		plaintext_capacity: usize,
@@ -1657,6 +1990,8 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	scratch_refs: Vec<(JoinKey, u32)>,
 	/// ADR 597: how many times the write guard released the scratch instead of refusing.
 	write_scratch_releases: u64,
+	/// ADR 601: the rows the finish-built reservation expected, when that form was taken.
+	finish_built_expected_rows: Option<u64>,
 	/// ADR 600: lookup counting, enabled on the profiled arm only.
 	count_lookups: bool,
 	lookup_hits: u64,
@@ -1825,6 +2160,7 @@ impl SpilledInnerJoinBuild {
 			next_offset: 0,
 			scratch_plaintext: Vec::new(),
 			write_scratch_releases: 0,
+			finish_built_expected_rows: None,
 			count_lookups: false,
 			lookup_hits: 0,
 			lookup_misses: 0,
@@ -1839,6 +2175,141 @@ impl SpilledInnerJoinBuild {
 		self.index.clear();
 		self.compact_index = None;
 		self.resident_index_bytes = 0;
+	}
+
+	/// ADR 601: the finish-built form — admitted plans only (`finish_built_admitted`); the entry
+	/// vector obtained at `expected_rows` capacity after a guard on the planned bytes against
+	/// the retained cap, accounted at the capacity obtained. The index collects until
+	/// `finalize_index`; a lookup before that is refused.
+	pub(in crate::exec) fn use_compact_resident_index_built_at_finish(
+		&mut self,
+		key_plan: JoinKeyPlan,
+		null_safe_keys: bool,
+		expected_rows: u64,
+		task_budget: TaskBudget,
+	) -> Result<(), ExecutionError> {
+		if !SpilledBatchIndex::finish_built_admitted(key_plan, null_safe_keys) {
+			return Err(ExecutionError::Kernel {
+				message: format!(
+					"finish-built spill index requested for {key_plan:?} null_safe={null_safe_keys}"
+				),
+			});
+		}
+		if self.rows != 0 || !self.pages.is_empty() {
+			return Err(ExecutionError::Kernel {
+				message: "finish-built spill index requested after the first page".to_string(),
+			});
+		}
+		let expected = usize::try_from(expected_rows).map_err(|_| ExecutionError::Kernel {
+			message: format!(
+				"finish-built spill index reservation of {expected_rows} rows does not fit usize"
+			),
+		})?;
+		let planned = match key_plan {
+			JoinKeyPlan::Int32 => reserved_entry_bytes::<i32>(expected)?,
+			_ => reserved_entry_bytes::<i64>(expected)?,
+		};
+		self.index.clear();
+		self.compact_index = None;
+		self.resident_index_bytes = 0;
+		self.guard_planned_resident_bytes(
+			planned,
+			task_budget.memory.get(),
+			SpillResidentGuardSite::Reserve,
+		)?;
+		let index = SpilledBatchIndex::reserved(key_plan, expected)?;
+		self.resident_index_bytes = index.accounted_bytes();
+		self.compact_index = Some(index);
+		self.compact_index_enabled = true;
+		self.finish_built_expected_rows = Some(expected_rows);
+		Ok(())
+	}
+
+	/// ADR 601: the finalization pass, once, before `finish`: the bucket bytes are planned from
+	/// the entries collected and guarded against the retained cap before the allocation — a
+	/// refusal leaves the build cleanable with the vector still accounted — then the index is
+	/// built and the accounting moves to what was obtained.
+	pub(in crate::exec) fn finalize_index(
+		&mut self,
+		task_budget: TaskBudget,
+	) -> Result<FinishIndexStats, ExecutionError> {
+		let Some(index) = self.compact_index.as_ref() else {
+			return Err(ExecutionError::Kernel {
+				message: "finalize_index on a build without a compact index".to_string(),
+			});
+		};
+		if !index.is_collecting() {
+			return Err(ExecutionError::Kernel {
+				message: "finalize_index on an index that is not collecting".to_string(),
+			});
+		}
+		let planned = index.planned_finish_bucket_bytes()?;
+		self.guard_planned_resident_bytes(
+			planned,
+			task_budget.memory.get(),
+			SpillResidentGuardSite::FinishIndex,
+		)?;
+		let index = self.compact_index.as_mut().expect("checked above");
+		let stats = index.finalize()?;
+		self.resident_index_bytes = index.accounted_bytes();
+		Ok(stats)
+	}
+
+	/// ADR 601: the writer's boundary — a finalized index takes no more rows; every writer
+	/// entry refuses here, before any page I/O or early return, and leaves the build as it was.
+	fn refuse_write_after_finalization(&self) -> Result<(), ExecutionError> {
+		if self
+			.compact_index
+			.as_ref()
+			.is_some_and(|index| index.finish_stats().is_some())
+		{
+			return Err(ExecutionError::Kernel {
+				message: "inner join spill write after the finish-built index was finalized"
+					.to_string(),
+			});
+		}
+		Ok(())
+	}
+
+	/// ADR 601: the ledger's `index_build` fact — `finish` while collecting or finalized, else
+	/// `incremental`.
+	pub(in crate::exec) fn index_build_name(&self) -> &'static str {
+		match self.compact_index.as_ref() {
+			Some(index) if index.is_collecting() || index.finish_stats().is_some() => "finish",
+			_ => "incremental",
+		}
+	}
+
+	pub(in crate::exec) fn finish_index_stats(&self) -> Option<FinishIndexStats> {
+		self.compact_index
+			.as_ref()
+			.and_then(SpilledBatchIndex::finish_stats)
+	}
+
+	pub(in crate::exec) fn finish_built_expected_rows(&self) -> Option<u64> {
+		self.finish_built_expected_rows
+	}
+
+	/// The retained-cap guard on a planned allocation: refused before the bytes are obtained.
+	fn guard_planned_resident_bytes(
+		&self,
+		planned: u64,
+		memory_cap: u64,
+		site: SpillResidentGuardSite,
+	) -> Result<(), ExecutionError> {
+		let state = self.resident_state();
+		let resident = state.total().saturating_add(planned);
+		let cap = join_spill_retained_footprint_memory_cap(memory_cap);
+		if resident > cap {
+			return Err(budget_exhausted_with_detail(
+				BudgetDimension::Memory,
+				"streamed inner join build spill resident state",
+				resident,
+				cap,
+				state.detail(site),
+			));
+		}
+		Ok(())
 	}
 
 	fn prepare_coalesced_index(
@@ -1958,6 +2429,7 @@ impl SpilledInnerJoinBuild {
 		task_budget: TaskBudget,
 		mut ledger: Option<&mut BuildWriteLedger>,
 	) -> Result<(), ExecutionError> {
+		self.refuse_write_after_finalization()?;
 		if batch.num_rows() == 0 {
 			return Ok(());
 		}
@@ -2042,6 +2514,7 @@ impl SpilledInnerJoinBuild {
 		task_budget: TaskBudget,
 		observer: Option<&GroupedChainSpillObserver<'_>>,
 	) -> Result<(), ExecutionError> {
+		self.refuse_write_after_finalization()?;
 		if batch.num_rows() == 0 {
 			return Ok(());
 		}
@@ -2073,6 +2546,7 @@ impl SpilledInnerJoinBuild {
 		null_safe_keys: bool,
 		task_budget: TaskBudget,
 	) -> Result<(), ExecutionError> {
+		self.refuse_write_after_finalization()?;
 		if batch.num_rows() == 0 {
 			return Ok(());
 		}
@@ -2128,6 +2602,7 @@ impl SpilledInnerJoinBuild {
 		task_budget: TaskBudget,
 		mut ledger: Option<&mut BuildWriteLedger>,
 	) -> Result<(), ExecutionError> {
+		self.refuse_write_after_finalization()?;
 		if batch.num_rows() == 0 {
 			return Ok(());
 		}
@@ -2171,6 +2646,7 @@ impl SpilledInnerJoinBuild {
 		task_budget: TaskBudget,
 		observer: Option<&GroupedChainSpillObserver<'_>>,
 	) -> Result<(), ExecutionError> {
+		self.refuse_write_after_finalization()?;
 		if batch.num_rows() == 0 {
 			return Ok(());
 		}
@@ -2494,8 +2970,15 @@ impl SpilledInnerJoinBuild {
 			if self.rows == 0 {
 				if self.compact_index_enabled {
 					self.index.clear();
-					self.compact_index =
-						Some(SpilledBatchIndex::for_key_plan(key_plan, null_safe_keys));
+					// ADR 601: a finish-built index (collecting, or finalized — though the writer's
+					// boundary refuses before this point) is kept; the incremental one is
+					// constructed here, on the first page.
+					if !self.compact_index.as_ref().is_some_and(|index| {
+						index.is_collecting() || index.finish_stats().is_some()
+					}) {
+						self.compact_index =
+							Some(SpilledBatchIndex::for_key_plan(key_plan, null_safe_keys));
+					}
 				} else {
 					self.index.clear();
 					self.compact_index = None;
@@ -2601,6 +3084,11 @@ impl SpilledInnerJoinBuild {
 				"legacy"
 			});
 			ledger.index_variant = Some(self.index_variant_name());
+			ledger.index_build = Some(self.index_build_name());
+			ledger.index_capacity_growths = self
+				.compact_index
+				.as_ref()
+				.map_or(0, SpilledBatchIndex::capacity_growths);
 			if compacted {
 				ledger.index_compactions = ledger.index_compactions.saturating_add(1);
 			}
@@ -3042,6 +3530,17 @@ impl SpilledInnerJoinBuild {
 					.to_string(),
 			});
 		}
+		if self
+			.compact_index
+			.as_ref()
+			.is_some_and(SpilledBatchIndex::is_collecting)
+		{
+			return Err(ExecutionError::Kernel {
+				message:
+					"inner join spill finish reached with a finish-built index still collecting"
+						.to_string(),
+			});
+		}
 		self.file_ops
 			.set_len(&self.file, self.next_offset)
 			.await
@@ -3141,6 +3640,14 @@ impl SpilledInnerJoinBuild {
 		}
 	}
 
+	/// ADR 601: the compact index's bytes recomputed from its parts, for the accounting fixtures.
+	#[cfg(test)]
+	pub(in crate::exec) fn compact_index_computed_bytes(&self) -> Option<u64> {
+		self.compact_index
+			.as_ref()
+			.map(SpilledBatchIndex::computed_bytes)
+	}
+
 	#[cfg(test)]
 	pub(in crate::exec) fn compact_int64_entry_size() -> usize {
 		std::mem::size_of::<PrimitiveSpilledBatchIndexEntry<i64>>()
@@ -3161,6 +3668,12 @@ impl SpilledInnerJoinBuild {
 		join_key: &JoinKey,
 	) -> Result<Vec<SpilledBatchRowRef>, ExecutionError> {
 		let matches = if let Some(index) = &self.compact_index {
+			if index.is_collecting() {
+				return Err(ExecutionError::Kernel {
+					message: "lookup on a finish-built spill index that is still collecting"
+						.to_string(),
+				});
+			}
 			index.lookup(join_key)
 		} else {
 			self.index.get(join_key).cloned().unwrap_or_default()
@@ -4793,6 +5306,186 @@ mod tests {
 	use std::path::Path;
 	use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 	use wendelon::storage::{AlignedBuf, DirectoryEntry};
+
+	// -----------------------------------------------------------------------------------------
+	// ADR 601: the finish-built primitive index — its states, its pass, and its arithmetic.
+	// -----------------------------------------------------------------------------------------
+
+	fn adr601_ref(page_index: u32, row: u32) -> CompactSpilledBatchRowRef {
+		CompactSpilledBatchRowRef { page_index, row }
+	}
+
+	fn adr601_refs(index: &PrimitiveSpilledBatchIndex<i64>, key: i64) -> Vec<(usize, u32)> {
+		index
+			.lookup(key)
+			.into_iter()
+			.map(|row_ref| (row_ref.page_index, row_ref.row))
+			.collect()
+	}
+
+	/// Keys whose buckets, under the seeded hasher and `bucket_count` buckets, are the ones
+	/// asked for — found by search, so a fixture can force collisions and wraparound.
+	fn adr601_keys_at_buckets(
+		hasher: &RandomState,
+		bucket_count: usize,
+		wanted: &[usize],
+		exclude: &[i64],
+	) -> Vec<i64> {
+		let mut keys = Vec::with_capacity(wanted.len());
+		let mut candidate = 1_000i64;
+		for bucket in wanted {
+			loop {
+				candidate += 1;
+				if !exclude.contains(&candidate)
+					&& !keys.contains(&candidate)
+					&& PrimitiveSpilledBatchIndex::<i64>::bucket_for_key(
+						hasher,
+						bucket_count,
+						candidate,
+					) == *bucket
+				{
+					keys.push(candidate);
+					break;
+				}
+			}
+		}
+		keys
+	}
+
+	#[test]
+	fn adr601_the_pass_keeps_refs_in_order_through_collisions_wraparound_and_moved_slots() {
+		// Seven distinct keys and five repeats: 12 entries, so the pass plans 32 buckets.
+		let seeds = (11, 22, 33, 44);
+		let hasher = RandomState::with_seeds(seeds.0, seeds.1, seeds.2, seeds.3);
+		let (bucket_count, _) = finish_index_plan(12).expect("plan");
+		assert_eq!(bucket_count, 32);
+		// a, b collide on the last bucket, so b probes past the end and wraps to bucket 0;
+		// c sits on bucket 0 and is pushed to 1 by the wrapped b; d, e, f, g elsewhere.
+		let last = bucket_count - 1;
+		let keys =
+			adr601_keys_at_buckets(&hasher, bucket_count, &[last, last, 0, 5, 9, 9, 17], &[]);
+		let [a, b, c, d, e, f, g] = keys[..] else {
+			panic!("seven keys");
+		};
+		// Insertion order: a, d, a(rep), b, c, e, d(rep), f, b(rep), g, a(rep), g(rep).
+		// After a, d, and the repeat, b's slot moves down over the dropped repeat's slot; the
+		// later repeats of b and a land on entries that were moved.
+		let order = [
+			(a, 0, 0),
+			(d, 0, 1),
+			(a, 0, 2),
+			(b, 1, 0),
+			(c, 1, 1),
+			(e, 1, 2),
+			(d, 2, 0),
+			(f, 2, 1),
+			(b, 2, 2),
+			(g, 3, 0),
+			(a, 3, 1),
+			(g, 3, 2),
+		];
+		let mut index = PrimitiveSpilledBatchIndex::<i64>::reserved(12);
+		index.seed_hasher(seeds);
+		assert!(index.is_collecting());
+		assert!(index.buckets.is_empty(), "no buckets while collecting");
+		for (key, page, row) in order {
+			index.insert(key, adr601_ref(page, row)).expect("collect");
+		}
+		assert_eq!(index.entries.len(), 12);
+		let stats = index.finalize().expect("finalize");
+		assert_eq!(
+			(
+				stats.entries,
+				stats.duplicates,
+				stats.buckets,
+				stats.growths
+			),
+			(7, 5, 32, 0)
+		);
+		assert_eq!(index.entries.len(), 7, "truncated to the distinct keys");
+		assert!(index.entries.capacity() >= 12, "capacity kept");
+		// Every bucket points below the cursor, and every entry is reachable.
+		for slot in &index.buckets {
+			assert!(*slot == EMPTY_SPILLED_BATCH_BUCKET || (*slot as usize) < 7);
+		}
+		assert_eq!(index.buckets[last], 0, "a took the last bucket, entry 0");
+		assert_eq!(adr601_refs(&index, a), vec![(0, 0), (0, 2), (3, 1)]);
+		assert_eq!(adr601_refs(&index, b), vec![(1, 0), (2, 2)]);
+		assert_eq!(adr601_refs(&index, c), vec![(1, 1)]);
+		assert_eq!(adr601_refs(&index, d), vec![(0, 1), (2, 0)]);
+		assert_eq!(adr601_refs(&index, e), vec![(1, 2)]);
+		assert_eq!(adr601_refs(&index, f), vec![(2, 1)]);
+		assert_eq!(adr601_refs(&index, g), vec![(3, 0), (3, 2)]);
+		assert!(adr601_refs(&index, 7).is_empty(), "an absent key misses");
+		// The same rows through the incremental index, for parity of the refs and their order.
+		let mut incremental = PrimitiveSpilledBatchIndex::<i64>::with_capacity(0);
+		incremental.seed_hasher(seeds);
+		for (key, page, row) in order {
+			incremental
+				.insert(key, adr601_ref(page, row))
+				.expect("insert");
+		}
+		for key in [a, b, c, d, e, f, g] {
+			assert_eq!(adr601_refs(&index, key), adr601_refs(&incremental, key));
+		}
+		assert_eq!(index.row_ref_count(), 12);
+		assert_eq!(
+			index.accounted_bytes(),
+			index.computed_bytes(),
+			"accounted from the obtained capacities and the overflow heap"
+		);
+	}
+
+	#[test]
+	fn adr601_the_states_refuse_what_they_must() {
+		let mut index = PrimitiveSpilledBatchIndex::<i64>::reserved(2);
+		index.insert(1, adr601_ref(0, 0)).expect("collect");
+		index.finalize().expect("finalize");
+		assert!(!index.is_collecting());
+		let again = index.finalize().expect_err("a second finalization");
+		assert!(again.to_string().contains("finalized twice"), "{again}");
+		let write = index
+			.insert(2, adr601_ref(0, 1))
+			.expect_err("a write after finalization");
+		assert!(write.to_string().contains("after finalization"), "{write}");
+		assert_eq!(adr601_refs(&index, 1), vec![(0, 0)]);
+		// An empty collection finalizes to one bucket and misses everything.
+		let mut empty = PrimitiveSpilledBatchIndex::<i64>::reserved(0);
+		let stats = empty.finalize().expect("finalize empty");
+		assert_eq!((stats.entries, stats.duplicates, stats.buckets), (0, 0, 1));
+		assert!(adr601_refs(&empty, 1).is_empty());
+		// A short reservation grows, counted; the accounting follows the obtained capacity.
+		let mut short = PrimitiveSpilledBatchIndex::<i64>::reserved(1);
+		for key in 0..5 {
+			short
+				.insert(key, adr601_ref(0, key as u32))
+				.expect("collect");
+		}
+		let stats = short.finalize().expect("finalize");
+		assert!(stats.growths >= 1, "{stats:?}");
+		assert_eq!(stats.entries, 5);
+		assert_eq!(short.accounted_bytes(), short.computed_bytes());
+	}
+
+	#[test]
+	fn adr601_the_plan_refuses_unrepresentable_counts_without_allocating() {
+		assert_eq!(finish_index_plan(0).expect("zero"), (1, 4));
+		assert_eq!(finish_index_plan(1).expect("one"), (2, 8));
+		assert_eq!(
+			finish_index_plan(5_845_938).expect("the measured build"),
+			(1 << 24, 4 << 24)
+		);
+		let at_sentinel = finish_index_plan(EMPTY_SPILLED_BATCH_BUCKET as usize)
+			.expect_err("the sentinel is not an entry index");
+		assert!(
+			at_sentinel.to_string().contains("u32 bucket range"),
+			"{at_sentinel}"
+		);
+		assert!(finish_index_plan((EMPTY_SPILLED_BATCH_BUCKET as usize) - 1).is_ok());
+		assert!(finish_index_plan(usize::MAX).is_err());
+		assert!(reserved_entry_bytes::<i64>(usize::MAX).is_err());
+		assert_eq!(reserved_entry_bytes::<i64>(10).expect("ten"), 240);
+	}
 
 	#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 	enum CoalescedFileFault {

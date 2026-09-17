@@ -2946,6 +2946,19 @@ pub(in crate::exec) struct ReorientedInnerJoinRuntime<'a> {
 	output_rows: u64,
 }
 
+/// ADR 601: which form of the compact resident index the spilled branch builds —
+/// `Incremental` (ADR 600's: hashed per page into buckets that double as they fill) or
+/// `FinishBuilt` (entries appended without hashing, the buckets built once at finish) — chosen
+/// at the branch's one call site; an unadmitted plan takes the incremental form under either.
+/// One form is named at that site and the other is not constructed in a given tree; both stay
+/// so that the paired cut and its revert are the one token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(in crate::exec) enum SpilledIndexForm {
+	Incremental,
+	FinishBuilt,
+}
+
 pub(in crate::exec) struct PartitionWorkConcurrencyTracker {
 	telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
 
@@ -24122,8 +24135,34 @@ impl Executor {
 			}
 			// The spilled branch builds the compact resident index (ADR 600, retained on a median
 			// paired gain of 559.7 ms); the wrapper picks the variant from the key plan and the
-			// receipt names it.
-			spilled.use_compact_resident_index();
+			// receipt names it. The form is chosen here (ADR 601, retained on a median paired
+			// gain of 148.2 ms): under `FinishBuilt`, an admitted plan (a primitive key, not
+			// null-safe) is reserved under its own clock from the sizing pass's rows and
+			// finalized once before `finish`; any other plan, and the `Incremental` form, take
+			// ADR 600's call with neither clock.
+			let index_form = SpilledIndexForm::FinishBuilt;
+			let finish_built = index_form == SpilledIndexForm::FinishBuilt
+				&& finish_built_index_admitted(key_plan, false);
+			if finish_built {
+				let reserve_started = BuildWriteLedger::begin(&build_write_ledger.as_mut());
+				let reserved = spilled.use_compact_resident_index_built_at_finish(
+					key_plan,
+					false,
+					sizing_rows,
+					self.context.task_budget,
+				);
+				BuildWriteLedger::finish(
+					&mut build_write_ledger.as_mut(),
+					BuildWriteChild::Reserve,
+					reserve_started,
+				);
+				if let Err(error) = reserved {
+					spilled.cleanup().await;
+					return Err(error);
+				}
+			} else {
+				spilled.use_compact_resident_index();
+			}
 
 			// ADR0551-SITE: streaming/prepare_reoriented_inner_join_runtime_with_scan_build/Build/1
 
@@ -24153,6 +24192,19 @@ impl Executor {
 				)
 				.await?;
 
+				// ADR 601: the finalization pass, in its own term, closed before finish opens.
+				if finish_built {
+					let finish_index_started =
+						BuildWriteLedger::begin(&build_write_ledger.as_mut());
+					let finalized = spilled.finalize_index(self.context.task_budget);
+					BuildWriteLedger::finish(
+						&mut build_write_ledger.as_mut(),
+						BuildWriteChild::FinishIndex,
+						finish_index_started,
+					);
+					finalized?;
+				}
+
 				let finish_started = BuildWriteLedger::begin(&build_write_ledger.as_mut());
 
 				let finished = spilled.finish(self.context.task_budget).await;
@@ -24165,6 +24217,7 @@ impl Executor {
 
 				// ADR 597: the resident total after the finish guard, and the scratch as it stands.
 				if let Some(ledger) = build_write_ledger.as_mut() {
+					ledger.observe_finish_built_index(&spilled);
 					let (plaintext, refs) = spilled.write_scratch_capacities();
 					ledger.observe_peaks_after_finish(
 						plaintext,
@@ -35439,6 +35492,9 @@ mod tests {
 		/// treatment's one call), and the key column's type (`k` at ordinal 1).
 		compact_index: bool,
 		key_type: DataType,
+		/// ADR 601: the finish-built form, reserved at these expected rows (the treatment's
+		/// call), finalized before finish; `None` takes ADR 600's incremental call.
+		finish_built_rows: Option<u64>,
 	}
 
 	impl Adr596Fixture {
@@ -35460,6 +35516,7 @@ mod tests {
 				budget: None,
 				compact_index: false,
 				key_type: DataType::Int64,
+				finish_built_rows: None,
 			}
 		}
 	}
@@ -35635,10 +35692,28 @@ mod tests {
 		)
 		.await
 		.expect("spilled build");
-		if fixture.compact_index {
+		BuildWriteLedger::finish(&mut ledger, BuildWriteChild::Create, create_started);
+		// ADR 601: the branch's admission ahead of every clock — the finish-built form under
+		// its reserve clock on an admitted plan, ADR 600's call with neither clock otherwise.
+		let finish_built = fixture.finish_built_rows.is_some()
+			&& finish_built_index_admitted(key_plan, fixture.null_safe_keys);
+		if let (true, Some(rows)) = (finish_built, fixture.finish_built_rows) {
+			let reserve_started = BuildWriteLedger::begin(&ledger);
+			let reserved = spilled.use_compact_resident_index_built_at_finish(
+				key_plan,
+				fixture.null_safe_keys,
+				rows,
+				executor.context.task_budget,
+			);
+			BuildWriteLedger::finish(&mut ledger, BuildWriteChild::Reserve, reserve_started);
+			if let Err(error) = reserved {
+				let path = spilled.spill_path().to_path_buf();
+				spilled.cleanup().await;
+				return Err((error, 0, path));
+			}
+		} else if fixture.compact_index || fixture.finish_built_rows.is_some() {
 			spilled.use_compact_resident_index();
 		}
-		BuildWriteLedger::finish(&mut ledger, BuildWriteChild::Create, create_started);
 		let written = executor
 			.write_streaming_scan_inner_build_batches(
 				&mut spilled,
@@ -35662,6 +35737,21 @@ mod tests {
 			spilled.cleanup().await;
 			return Err((error, pages, path));
 		}
+		if finish_built {
+			let finish_index_started = BuildWriteLedger::begin(&ledger);
+			let finalized = spilled.finalize_index(executor.context.task_budget);
+			BuildWriteLedger::finish(
+				&mut ledger,
+				BuildWriteChild::FinishIndex,
+				finish_index_started,
+			);
+			if let Err(error) = finalized {
+				let pages = spilled.page_count() as u64;
+				let path = spilled.spill_path().to_path_buf();
+				spilled.cleanup().await;
+				return Err((error, pages, path));
+			}
+		}
 		let finish_started = BuildWriteLedger::begin(&ledger);
 		if let Err(error) = spilled.finish(executor.context.task_budget).await {
 			let pages = spilled.page_count() as u64;
@@ -35671,6 +35761,7 @@ mod tests {
 		}
 		BuildWriteLedger::finish(&mut ledger, BuildWriteChild::Finish, finish_started);
 		if let Some(ledger) = ledger.as_deref_mut() {
+			ledger.observe_finish_built_index(&spilled);
 			let (plaintext, refs) = spilled.write_scratch_capacities();
 			ledger.observe_peaks_after_finish(
 				plaintext,
@@ -35809,6 +35900,8 @@ mod tests {
 				("build_write_page_write", 2),
 				("build_write_index", 2),
 				("build_write_finish", 1),
+				("build_write_reserve", 0),
+				("build_write_finish_index", 0),
 			]
 		);
 		assert!(ledger.plaintext_bytes > 0 && ledger.ciphertext_bytes > ledger.plaintext_bytes);
@@ -35856,6 +35949,8 @@ mod tests {
 				("build_write_page_write", 2),
 				("build_write_index", 2),
 				("build_write_finish", 1),
+				("build_write_reserve", 0),
+				("build_write_finish_index", 0),
 			]
 		);
 		assert_eq!(ledger.micros(BuildWriteChild::Filter), 0);
@@ -36039,6 +36134,7 @@ mod tests {
 				budget: None,
 				compact_index: false,
 				key_type: DataType::Int64,
+				finish_built_rows: None,
 			};
 			let batches = adr597_parity_batches();
 			let mut split_ledger = BuildWriteLedger::default();
@@ -36197,6 +36293,7 @@ mod tests {
 				budget: None,
 				compact_index: false,
 				key_type: DataType::Int64,
+				finish_built_rows: None,
 			};
 			let mut control_ledger = BuildWriteLedger::default();
 			let control = adr596_write_with(
@@ -36341,6 +36438,7 @@ mod tests {
 			budget: Some(budget_of(memory)),
 			compact_index: false,
 			key_type: DataType::Int64,
+			finish_built_rows: None,
 		};
 		let memory = 32 * 1024u64;
 		let cap = join_spill_retained_footprint_memory_cap(memory);
@@ -36513,6 +36611,7 @@ mod tests {
 				budget: None,
 				compact_index,
 				key_type: key_type.clone(),
+				finish_built_rows: None,
 			};
 			let mut legacy_ledger = BuildWriteLedger::default();
 			let (legacy_rows, legacy_pages, _, mut legacy) = adr596_write_with(
@@ -36597,6 +36696,565 @@ mod tests {
 		}
 	}
 
+	// -----------------------------------------------------------------------------------------
+	// ADR 601: the finish-built index through the real write path.
+	// -----------------------------------------------------------------------------------------
+
+	fn adr601_fixture(
+		batches: Vec<RecordBatch>,
+		key_type: DataType,
+		null_safe_keys: bool,
+		finish_built_rows: Option<u64>,
+		budget: Option<TaskBudget>,
+	) -> Adr596Fixture {
+		Adr596Fixture {
+			batches,
+			filter: false,
+			exchange: Some(4),
+			retained: None,
+			row_limit: None,
+			exchange_key: None,
+			null_safe_keys,
+			budget,
+			compact_index: true,
+			key_type,
+			finish_built_rows,
+		}
+	}
+
+	fn adr601_calls_and_micros(ledger: &BuildWriteLedger) -> [(u64, u64); 2] {
+		[
+			(
+				ledger.calls(BuildWriteChild::Reserve),
+				ledger.micros(BuildWriteChild::Reserve),
+			),
+			(
+				ledger.calls(BuildWriteChild::FinishIndex),
+				ledger.micros(BuildWriteChild::FinishIndex),
+			),
+		]
+	}
+
+	/// ADR 601: the finish-built index returns the same refs, in the same order, as the
+	/// incremental one for every key of every admitted variant — repeats within and across
+	/// batches, nulls never indexed, an absent key, growth across pages — with the ledger
+	/// naming the form, the pass's counts, and both clocks once.
+	#[tokio::test]
+	async fn adr601_the_finish_built_index_matches_the_incremental_one_on_every_admitted_variant() {
+		for (key_type, expected_variant, plan) in [
+			(DataType::Int64, "int64", JoinKeyPlan::Int64),
+			(DataType::Int32, "int32", JoinKeyPlan::Int32),
+		] {
+			let label = format!("{key_type:?}");
+			let batches = adr600_growth_batches(&key_type);
+			let mut incremental_ledger = BuildWriteLedger::default();
+			let (rows, pages, _, mut incremental) = adr596_write_with(
+				&adr601_fixture(batches.clone(), key_type.clone(), false, None, None),
+				ExchangeHandling::Split,
+				Some(&mut incremental_ledger),
+			)
+			.await
+			.expect("incremental write");
+			// The estimate is the exact keyed row count, as the sizing pass reports it.
+			let expected_rows = incremental_ledger.index_entries;
+			let mut finish_ledger = BuildWriteLedger::default();
+			let (finish_rows, finish_pages, _, mut finish_built) = adr596_write_with(
+				&adr601_fixture(
+					batches.clone(),
+					key_type.clone(),
+					false,
+					Some(expected_rows),
+					None,
+				),
+				ExchangeHandling::Split,
+				Some(&mut finish_ledger),
+			)
+			.await
+			.expect("finish-built write");
+			assert_eq!((rows, pages), (finish_rows, finish_pages), "{label}");
+			assert!(pages >= 3, "{label}: growth across pages");
+			assert_eq!(
+				incremental_ledger.index_build,
+				Some("incremental"),
+				"{label}"
+			);
+			assert_eq!(finish_ledger.index_build, Some("finish"), "{label}");
+			assert_eq!(finish_ledger.index_mode, Some("compact"), "{label}");
+			assert_eq!(
+				finish_ledger.index_variant,
+				Some(expected_variant),
+				"{label}"
+			);
+			assert_eq!(finish_ledger.index_entries, expected_rows, "{label}");
+			assert_eq!(finish_ledger.index_expected_rows, Some(expected_rows));
+			assert_eq!(
+				finish_ledger.index_capacity_growths, 0,
+				"{label}: an exact estimate"
+			);
+			let stats = finish_ledger.finish_index.expect("finish stats");
+			assert_eq!(stats.entries + stats.duplicates, expected_rows, "{label}");
+			assert!(
+				stats.duplicates >= 50,
+				"{label}: {} repeats",
+				stats.duplicates
+			);
+			assert!(stats.buckets.is_power_of_two() && stats.buckets >= 2 * stats.entries);
+			assert_eq!(incremental_ledger.finish_index, None, "{label}");
+			let [reserve, finish_index] = adr601_calls_and_micros(&finish_ledger);
+			assert_eq!(
+				(reserve.0, finish_index.0),
+				(1, 1),
+				"{label}: both clocks once"
+			);
+			assert_eq!(
+				adr601_calls_and_micros(&incremental_ledger),
+				[(0, 0), (0, 0)],
+				"{label}: neither clock on the incremental form"
+			);
+			let keys = adr597_distinct_keys(&batches, plan, false);
+			assert!(keys.len() > 17_000, "{label}");
+			let mut repeated = 0usize;
+			for key in &keys {
+				let expected = incremental.lookup(key).await.expect("lookup");
+				let actual = finish_built.lookup(key).await.expect("lookup");
+				assert!(!expected.is_empty(), "{label}: {key:?}");
+				assert_eq!(expected, actual, "{label}: {key:?} refs and their order");
+				if expected.len() > 1 {
+					repeated += 1;
+				}
+			}
+			assert!(repeated >= 50, "{label}: {repeated} repeated keys compared");
+			let absent = adr600_absent_key(&key_type, false);
+			assert!(
+				finish_built
+					.lookup(&absent)
+					.await
+					.expect("lookup")
+					.is_empty()
+			);
+			assert_eq!(
+				finish_ledger.index_entries,
+				rows - 36,
+				"{label}: nulls never indexed"
+			);
+			assert_eq!(
+				finish_built.resident_index_bytes(),
+				finish_built
+					.compact_index_computed_bytes()
+					.expect("compact"),
+				"{label}: accounted from the obtained capacities"
+			);
+			incremental.cleanup().await;
+			finish_built.cleanup().await;
+		}
+	}
+
+	/// ADR 601: a plan the primitive index does not admit — a generic key, or a null-safe
+	/// one — takes ADR 600's call and the incremental hash index, with neither of the
+	/// finish-built clocks: zero calls, zero time, no finalization facts.
+	#[tokio::test]
+	async fn adr601_an_unadmitted_plan_takes_the_incremental_hash_index_with_neither_clock() {
+		for (key_type, null_safe_keys) in [
+			(DataType::Utf8, false),
+			(DataType::Utf8, true),
+			(DataType::Int64, true),
+		] {
+			let label = format!("{key_type:?} null_safe={null_safe_keys}");
+			let batches = adr600_growth_batches(&key_type);
+			let mut ledger = BuildWriteLedger::default();
+			let (_, _, _, mut build) = adr596_write_with(
+				&adr601_fixture(
+					batches.clone(),
+					key_type.clone(),
+					null_safe_keys,
+					Some(20_000),
+					None,
+				),
+				ExchangeHandling::Split,
+				Some(&mut ledger),
+			)
+			.await
+			.expect("write");
+			assert_eq!(ledger.index_build, Some("incremental"), "{label}");
+			assert_eq!(ledger.index_mode, Some("compact"), "{label}");
+			assert_eq!(ledger.index_variant, Some("hash"), "{label}");
+			assert_eq!(ledger.finish_index, None, "{label}");
+			assert_eq!(ledger.index_expected_rows, None, "{label}");
+			assert_eq!(ledger.index_capacity_growths, 0, "{label}");
+			assert_eq!(
+				adr601_calls_and_micros(&ledger),
+				[(0, 0), (0, 0)],
+				"{label}: neither clock, no time"
+			);
+			let facts = ledger.facts();
+			assert_eq!(facts["index_build"], "incremental", "{label}");
+			assert_eq!(
+				facts["finish_index_entries"],
+				serde_json::Value::Null,
+				"{label}"
+			);
+			let plan = JoinKeyPlan::Generic;
+			let keys = adr597_distinct_keys(&batches, plan, null_safe_keys);
+			assert!(
+				!build.lookup(&keys[0]).await.expect("lookup").is_empty(),
+				"{label}"
+			);
+			build.cleanup().await;
+		}
+	}
+
+	/// ADR 601: the accounting on every allocation path — a short estimate growing the vector
+	/// with the growth counted, a long one leaving its capacity accounted, a duplicate-heavy
+	/// input truncated to the distinct keys, an all-null input finalizing to one bucket — and
+	/// the refusals: the bucket allocation refused on a budget the guard rejects with the
+	/// build cleaned up, and the states before finalization.
+	#[tokio::test]
+	async fn adr601_the_finish_built_index_is_accounted_on_every_path_and_refused_by_the_guard() {
+		let batches = adr600_growth_batches(&DataType::Int64);
+		let rows_kept: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+		let keyed = rows_kept - 36;
+		// Short: half the rows expected; the vector grows, the growth is counted, the
+		// accounting is from what was obtained.
+		let mut short_ledger = BuildWriteLedger::default();
+		let (_, _, _, short) = adr596_write_with(
+			&adr601_fixture(
+				batches.clone(),
+				DataType::Int64,
+				false,
+				Some(keyed / 2),
+				None,
+			),
+			ExchangeHandling::Split,
+			Some(&mut short_ledger),
+		)
+		.await
+		.expect("short write");
+		assert!(short_ledger.index_capacity_growths >= 1, "{short_ledger:?}");
+		assert_eq!(short_ledger.index_expected_rows, Some(keyed / 2));
+		assert_eq!(
+			short.resident_index_bytes(),
+			short.compact_index_computed_bytes().expect("compact")
+		);
+		short.cleanup().await;
+		// Long: twice the rows expected; no growth, the capacity kept and accounted.
+		let mut long_ledger = BuildWriteLedger::default();
+		let (_, _, _, long) = adr596_write_with(
+			&adr601_fixture(
+				batches.clone(),
+				DataType::Int64,
+				false,
+				Some(keyed * 2),
+				None,
+			),
+			ExchangeHandling::Split,
+			Some(&mut long_ledger),
+		)
+		.await
+		.expect("long write");
+		assert_eq!(long_ledger.index_capacity_growths, 0);
+		let (_, entries_capacity, _, _) = long.compact_index_accounting_parts().expect("compact");
+		assert!(
+			entries_capacity as u64 >= keyed * 2,
+			"the reservation's capacity kept"
+		);
+		assert_eq!(
+			long.resident_index_bytes(),
+			long.compact_index_computed_bytes().expect("compact")
+		);
+		long.cleanup().await;
+		// Duplicate-heavy: every row one of 10 keys; the vector truncates to 10.
+		let heavy: Vec<RecordBatch> = (0..2i64)
+			.map(|batch| {
+				let rows: Vec<(Option<i64>, i64, i64)> =
+					(0..3_000i64).map(|i| (Some(i % 10), i, batch)).collect();
+				adr596_batch(&rows)
+			})
+			.collect();
+		let mut heavy_ledger = BuildWriteLedger::default();
+		let (_, _, _, mut heavy_build) = adr596_write_with(
+			&adr601_fixture(heavy, DataType::Int64, false, Some(6_000), None),
+			ExchangeHandling::Split,
+			Some(&mut heavy_ledger),
+		)
+		.await
+		.expect("heavy write");
+		let stats = heavy_ledger.finish_index.expect("stats");
+		// The buckets are planned from the rows collected (6,000), before the pass knows the
+		// distinct keys; the rule asks only for a power of two at or above twice the entries.
+		assert_eq!(
+			(stats.entries, stats.duplicates, stats.buckets),
+			(10, 5_990, 16_384)
+		);
+		for key in 0..10 {
+			assert_eq!(
+				heavy_build
+					.lookup(&JoinKey::Int64(key))
+					.await
+					.expect("lookup")
+					.len(),
+				600
+			);
+		}
+		assert_eq!(
+			heavy_build.resident_index_bytes(),
+			heavy_build.compact_index_computed_bytes().expect("compact")
+		);
+		heavy_build.cleanup().await;
+		// All-null keys: written, never indexed; one bucket; every lookup misses.
+		let nulls: Vec<RecordBatch> = vec![adr596_batch(
+			&(0..100i64).map(|i| (None, i, 0)).collect::<Vec<_>>(),
+		)];
+		let mut null_ledger = BuildWriteLedger::default();
+		let (null_rows, _, _, mut null_build) = adr596_write_with(
+			&adr601_fixture(nulls, DataType::Int64, false, Some(0), None),
+			ExchangeHandling::Split,
+			Some(&mut null_ledger),
+		)
+		.await
+		.expect("null write");
+		assert_eq!(null_rows, 100);
+		assert_eq!(null_ledger.index_entries, 0);
+		let stats = null_ledger.finish_index.expect("stats");
+		assert_eq!((stats.entries, stats.duplicates, stats.buckets), (0, 0, 1));
+		assert_eq!(null_ledger.index_build, Some("finish"));
+		assert!(
+			null_build
+				.lookup(&JoinKey::Int64(1))
+				.await
+				.expect("lookup")
+				.is_empty()
+		);
+		null_build.cleanup().await;
+		// The bucket allocation refused: a cap the reservation and the pages fit under and the
+		// buckets do not. 16 × 40 KB = 640 KB; the reservation is ~408 KB and the buckets ~262 KB.
+		let tight = TaskBudget {
+			memory: ByteCount::new(40 * 1024),
+			spill_bytes: ByteCount::new(64 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let mut refused_ledger = BuildWriteLedger::default();
+		let Err((error, pages, path)) = adr596_write_with(
+			&adr601_fixture(
+				batches.clone(),
+				DataType::Int64,
+				false,
+				Some(keyed),
+				Some(tight),
+			),
+			ExchangeHandling::Split,
+			Some(&mut refused_ledger),
+		)
+		.await
+		else {
+			panic!("the bucket allocation was admitted");
+		};
+		let ExecutionError::BudgetExhausted {
+			dimension, detail, ..
+		} = &error
+		else {
+			panic!("expected a budget error, got {error}");
+		};
+		assert_eq!(*dimension, BudgetDimension::Memory);
+		assert!(
+			detail.to_string().contains("site=finish_index"),
+			"refused at the finalization's guard: {detail}"
+		);
+		assert!(pages >= 3, "the pages were written before the refusal");
+		assert!(
+			!path.exists(),
+			"the build was cleaned up: {}",
+			path.display()
+		);
+		assert_eq!(
+			adr601_calls_and_micros(&refused_ledger).map(|(calls, _)| calls),
+			[1, 1],
+			"the reserve ran and the finalization was clocked to its refusal"
+		);
+		// The reservation itself refused, before any allocation, on a cap it does not fit.
+		let tighter = TaskBudget {
+			memory: ByteCount::new(8 * 1024),
+			spill_bytes: ByteCount::new(64 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		let Err((error, pages, path)) = adr596_write_with(
+			&adr601_fixture(
+				batches.clone(),
+				DataType::Int64,
+				false,
+				Some(keyed),
+				Some(tighter),
+			),
+			ExchangeHandling::Split,
+			None,
+		)
+		.await
+		else {
+			panic!("the reservation was admitted");
+		};
+		let ExecutionError::BudgetExhausted { detail, .. } = &error else {
+			panic!("expected a budget error, got {error}");
+		};
+		assert!(detail.to_string().contains("site=reserve"), "{detail}");
+		assert_eq!(pages, 0);
+		assert!(!path.exists());
+	}
+
+	/// ADR 601: the writer's boundary — a finalized build, whether empty, all-null, or
+	/// populated, refuses a further write before any page I/O, keeps its state (rows, pages,
+	/// entries, accounting, the finalized form), still answers lookups, and cleans up.
+	#[tokio::test]
+	async fn adr601_a_finalized_build_refuses_writes_at_the_writer_boundary() {
+		let budget = high_test_budget();
+		let keyed_batch = adr596_batch(&(0..50i64).map(|i| (Some(i), i, 0)).collect::<Vec<_>>());
+		let cases: Vec<(&str, Vec<RecordBatch>, u64)> = vec![
+			("empty", vec![adr596_batch(&[])], 0),
+			(
+				"all-null",
+				vec![adr596_batch(
+					&(0..40i64).map(|i| (None, i, 0)).collect::<Vec<_>>(),
+				)],
+				0,
+			),
+			(
+				"populated",
+				adr600_growth_batches(&DataType::Int64),
+				18_000 - 36,
+			),
+		];
+		for (label, batches, expected_rows) in cases {
+			let mut ledger = BuildWriteLedger::default();
+			let (rows, pages, spill_bytes, mut build) = adr596_write_with(
+				&adr601_fixture(batches, DataType::Int64, false, Some(expected_rows), None),
+				ExchangeHandling::Split,
+				Some(&mut ledger),
+			)
+			.await
+			.expect("finish-built write");
+			assert_eq!(ledger.index_build, Some("finish"), "{label}");
+			let stats = ledger.finish_index.expect("finalized");
+			let accounted = build.resident_index_bytes();
+			let lookup_before = build.lookup(&JoinKey::Int64(1)).await.expect("lookup");
+			// The keyed write, the empty write, and the projected write are all refused at
+			// the boundary, before the page writer.
+			for (what, batch) in [
+				("keyed", keyed_batch.clone()),
+				("empty", keyed_batch.slice(0, 0)),
+			] {
+				let error = build
+					.write_batch_chunks(
+						&batch,
+						JoinKeyPlan::Int64,
+						&[ColumnOrdinal(1)],
+						false,
+						budget,
+					)
+					.await
+					.expect_err("a write after finalization");
+				assert!(
+					error
+						.to_string()
+						.contains("after the finish-built index was finalized"),
+					"{label}/{what}: {error}"
+				);
+			}
+			let error = build
+				.write_projected_batch_chunks(
+					&keyed_batch,
+					&[ColumnOrdinal(1), ColumnOrdinal(2)],
+					JoinKeyPlan::Int64,
+					&[ColumnOrdinal(0)],
+					false,
+					budget,
+				)
+				.await
+				.expect_err("a projected write after finalization");
+			assert!(error.to_string().contains("finalized"), "{label}: {error}");
+			// Unchanged: rows, pages, spill bytes, the form, the entries, the accounting.
+			assert_eq!(
+				(
+					build.input_row_count(),
+					build.page_count() as u64,
+					build.spill_bytes()
+				),
+				(rows, pages, spill_bytes),
+				"{label}"
+			);
+			assert_eq!(build.index_build_name(), "finish", "{label}");
+			assert_eq!(build.finish_index_stats(), Some(stats), "{label}");
+			assert_eq!(build.resident_index_bytes(), accounted, "{label}");
+			assert_eq!(
+				build.lookup(&JoinKey::Int64(1)).await.expect("lookup"),
+				lookup_before,
+				"{label}"
+			);
+			let path = build.spill_path().to_path_buf();
+			build.cleanup().await;
+			assert!(!path.exists(), "{label}: cleaned up");
+		}
+	}
+
+	/// ADR 601: a lookup while collecting and a finish before finalization are refused by name.
+	#[tokio::test]
+	async fn adr601_a_collecting_index_refuses_lookups_and_finish() {
+		let executor = Executor::with_context(
+			Arc::new(RecordingMultiBatchTableStorageScan {
+				batches: HashMap::new(),
+				requested_tables: Arc::new(Mutex::new(Vec::new())),
+			}),
+			ExecutionContext::local_test().with_task_budget(high_test_budget()),
+		);
+		let mut spilled = SpilledInnerJoinBuild::create_with_resident_baseline(
+			executor.context.task_budget,
+			executor.context.join_spill_file_ops.clone(),
+			executor.context.join_spill_dir.clone(),
+			0,
+		)
+		.await
+		.expect("spilled build");
+		spilled
+			.use_compact_resident_index_built_at_finish(
+				JoinKeyPlan::Int64,
+				false,
+				10,
+				executor.context.task_budget,
+			)
+			.expect("reserved");
+		assert_eq!(spilled.index_build_name(), "finish");
+		let lookup = spilled
+			.lookup(&JoinKey::Int64(1))
+			.await
+			.expect_err("a lookup while collecting");
+		assert!(lookup.to_string().contains("still collecting"), "{lookup}");
+		let finish = spilled
+			.finish(executor.context.task_budget)
+			.await
+			.expect_err("finish before finalization");
+		assert!(finish.to_string().contains("still collecting"), "{finish}");
+		let unadmitted = spilled
+			.use_compact_resident_index_built_at_finish(
+				JoinKeyPlan::Generic,
+				false,
+				10,
+				executor.context.task_budget,
+			)
+			.expect_err("a generic plan is not admitted");
+		assert!(unadmitted.to_string().contains("Generic"), "{unadmitted}");
+		spilled
+			.finalize_index(executor.context.task_budget)
+			.expect("finalize");
+		assert!(
+			spilled
+				.lookup(&JoinKey::Int64(1))
+				.await
+				.expect("lookup")
+				.is_empty()
+		);
+		spilled
+			.finalize_index(executor.context.task_budget)
+			.expect_err("a second finalization");
+		spilled.cleanup().await;
+	}
+
 	// ADR 600: the compact index's accounted bytes are its obtained capacities times the
 	// sizes of its parts; a build whose accounted index crosses the cap is refused at the
 	// page's guard on the compact path as on the legacy one, its file removed by the branch's
@@ -36615,6 +37273,7 @@ mod tests {
 			budget,
 			compact_index,
 			key_type: DataType::Int64,
+			finish_built_rows: None,
 		};
 		let (_, _, _, compact) =
 			adr596_write_with(&fixture(true, None), ExchangeHandling::Split, None)

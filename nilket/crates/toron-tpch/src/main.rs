@@ -3757,10 +3757,12 @@ const ADR596_TAGS: LifecyclePairTags = LifecyclePairTags {
 	position: "adr596_pair_position",
 };
 
-/// The eleven children of `inner_1_build_write` as the receipt names them. `scan_open` and
-/// `scan_poll` are read from the receipt and reported beside each other; the rule sees their
-/// sum as `build_write_scan_wait` and never ranks the sum beside its parts.
-const ADR596_CHILDREN: [&str; 11] = [
+/// The children of `inner_1_build_write` as the receipt names them: the writer's eleven and, on
+/// a receipt of the `index_build` facts vintage, the finish-built index's reserve and
+/// finalization.
+/// `scan_open` and `scan_poll` are read from the receipt and reported beside each other; the
+/// rule sees their sum as `build_write_scan_wait` and never ranks the sum beside its parts.
+const ADR596_CHILDREN: [&str; 13] = [
 	"build_write_create",
 	"build_write_scan_open",
 	"build_write_scan_poll",
@@ -3772,10 +3774,17 @@ const ADR596_CHILDREN: [&str; 11] = [
 	"build_write_page_write",
 	"build_write_index",
 	"build_write_finish",
+	"build_write_reserve",
+	"build_write_finish_index",
 ];
 
-/// The rule's eleven terms: the scan wait, the nine other children, and the residual.
-const ADR596_RULE_TERMS: [&str; 11] = [
+/// The two children a receipt carries only under the `index_build` facts vintage; an earlier
+/// receipt neither carries them nor is asked for them, and they enter no band.
+const FINISH_BUILT_CHILDREN: [&str; 2] = ["build_write_reserve", "build_write_finish_index"];
+
+/// The rule's terms: the scan wait, the other children, and the residual; the two ADR 601
+/// terms rank only when a receipt carried them.
+const ADR596_RULE_TERMS: [&str; 13] = [
 	"build_write_create",
 	"build_write_scan_wait",
 	"build_write_filter",
@@ -3786,10 +3795,12 @@ const ADR596_RULE_TERMS: [&str; 11] = [
 	"build_write_page_write",
 	"build_write_index",
 	"build_write_finish",
+	"build_write_reserve",
+	"build_write_finish_index",
 	"build_write_residual",
 ];
 
-const ADR596_FACTS: [&str; 31] = [
+const ADR596_FACTS: [&str; 37] = [
 	"build_write_facts_vintage",
 	"build_write_exchange_handling",
 	"build_write_pass_through_requested",
@@ -3806,6 +3817,12 @@ const ADR596_FACTS: [&str; 31] = [
 	"build_write_termination",
 	"build_write_index_mode",
 	"build_write_index_variant",
+	"build_write_index_build",
+	"build_write_index_expected_rows",
+	"build_write_index_capacity_growths",
+	"build_write_finish_index_entries",
+	"build_write_finish_index_duplicates",
+	"build_write_finish_index_buckets",
 	"build_write_unsupported",
 	"build_write_batches_read",
 	"build_write_batches_limit_discarded",
@@ -3944,7 +3961,15 @@ fn evaluate_adr596_pairs(rows: &[serde_json::Value]) -> Result<serde_json::Value
 		let scale = |micros: u64| micros as f64 / execute_on_micros as f64 * execute_off_ms;
 		let mut children_total = 0u64;
 		let mut scan_wait = 0u64;
+		// The receipt names its form when its facts carry `index_build`; that fact, not the
+		// vintage label, is what says the two finish-built terms are on it.
+		let finish_built_vintage = receipt
+			.get("build_write_index_build")
+			.is_some_and(|value| !value.is_null());
 		for child in ADR596_CHILDREN {
+			if !finish_built_vintage && FINISH_BUILT_CHILDREN.contains(&child) {
+				continue;
+			}
 			let micros = receipt_u64(receipt, &format!("{child}_micros"))?;
 			let calls = receipt_u64(receipt, &format!("{child}_calls"))?;
 			children_total = children_total
@@ -4011,6 +4036,7 @@ fn evaluate_adr596_pairs(rows: &[serde_json::Value]) -> Result<serde_json::Value
 	};
 	let mut medians = ADR596_RULE_TERMS
 		.iter()
+		.filter(|term| samples.contains_key(**term))
 		.map(|term| (term.to_string(), median_of(term)))
 		.collect::<Vec<_>>();
 	medians.sort_by(|left, right| right.1.total_cmp(&left.1));
@@ -15773,6 +15799,82 @@ mod tests {
 		let sixth = &summary["adr594_pair_bands"][0];
 		assert_eq!(sixth["inner_1_lookups_counted"], serde_json::Value::Null);
 		assert_eq!(sixth["inner_1_lookup_hits"], serde_json::Value::Null);
+	}
+
+	/// ADR 601: a receipt of the `index_build` facts vintage carries the reserve and finalization terms
+	/// into the band, the rule, and the residual's algebra; an earlier vintage is neither
+	/// asked for them nor shows them, and the rule ranks eleven terms as before.
+	#[test]
+	fn adr601_the_bands_carry_the_finish_built_terms_by_vintage() {
+		let children = [
+			1_000, 20_000, 30_000, 20_000, 0, 10_000, 20_000, 40_000, 700_000, 60_000, 5_000,
+		];
+		let mut write_facts = adr596_write_facts();
+		write_facts["index_build"] = serde_json::json!("finish");
+		write_facts["index_expected_rows"] = serde_json::json!(5_845_938);
+		write_facts["index_capacity_growths"] = serde_json::json!(0);
+		write_facts["finish_index_entries"] = serde_json::json!(5_845_938);
+		write_facts["finish_index_duplicates"] = serde_json::json!(0);
+		write_facts["finish_index_buckets"] = serde_json::json!(16_777_216);
+		let mut rows = adr596_rows(children, write_facts);
+		let eleven: u64 = children.iter().sum();
+		for row in &mut rows {
+			let Some(receipt) = row.pointer_mut(
+				"/node_attribution/aggregate_invocations/0/inclusive_lifecycle_receipt",
+			) else {
+				continue;
+			};
+			if receipt.get("build_write_facts_vintage").is_none()
+				&& receipt.get("build_write_index_build").is_none()
+			{
+				continue;
+			}
+			receipt["build_write_facts_vintage"] = serde_json::json!("index_build");
+			receipt["build_write_index_build"] = serde_json::json!("finish");
+			receipt["build_write_reserve_micros"] = serde_json::json!(2_000);
+			receipt["build_write_reserve_calls"] = serde_json::json!(1);
+			receipt["build_write_finish_index_micros"] = serde_json::json!(250_000);
+			receipt["build_write_finish_index_calls"] = serde_json::json!(1);
+			receipt["build_write_residual_micros"] =
+				serde_json::json!(1_180_000 - eleven - 2_000 - 250_000);
+		}
+		let summary = evaluate_adr596_pairs(&rows).unwrap();
+		assert_eq!(
+			summary["all_build_write_facts_consistent"], true,
+			"{}",
+			summary["adr596_pair_bands"][0]
+		);
+		let band = &summary["adr596_pair_bands"][0];
+		assert_eq!(band["build_write_reserve_micros"], 2_000);
+		assert_eq!(band["build_write_finish_index_micros"], 250_000);
+		assert_eq!(band["build_write_finish_index_calls"], 1);
+		assert_eq!(band["build_write_index_build"], "finish");
+		assert_eq!(band["build_write_finish_index_entries"], 5_845_938);
+		assert_eq!(band["build_write_finish_index_buckets"], 16_777_216);
+		assert_eq!(
+			band["build_write_residual_micros"],
+			1_180_000 - eleven - 252_000
+		);
+		let terms = summary["build_write_terms_scaled_ms"].as_array().unwrap();
+		assert_eq!(terms.len(), 13, "twelve rule children and the residual");
+		let names: Vec<&str> = terms.iter().map(|t| t["term"].as_str().unwrap()).collect();
+		assert!(
+			names.contains(&"build_write_finish_index") && names.contains(&"build_write_reserve")
+		);
+		assert_eq!(names[0], "build_write_page_write");
+		assert_eq!(names[1], "build_write_finish_index");
+
+		// An earlier vintage: no such terms in the band, eleven rule terms.
+		let summary = evaluate_adr596_pairs(&adr596_rows(children, adr596_write_facts())).unwrap();
+		let band = &summary["adr596_pair_bands"][0];
+		assert!(band.get("build_write_reserve_micros").is_none());
+		assert_eq!(
+			summary["build_write_terms_scaled_ms"]
+				.as_array()
+				.unwrap()
+				.len(),
+			11
+		);
 	}
 
 	// The fixture's off arms span 400 ms, so the floor is 800 ms and a lead must exceed 400 ms.

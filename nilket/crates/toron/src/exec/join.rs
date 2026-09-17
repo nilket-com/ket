@@ -85,7 +85,7 @@ pub(in crate::exec) use self::spill::{
 	BuildWriteChild, BuildWriteLedger, BuildWriteTermination, ExchangeHandling,
 	PinnedSpilledInnerBuildStats, SpilledBatchRowRef, SpilledInnerJoinBuild, SpilledInnerJoinMatch,
 	SpilledInnerJoinResidencySnapshot, SpilledJoinBuild, SpilledSemiAntiExistenceBuild,
-	partition_bucket_if_non_null_with_scratch,
+	finish_built_index_admitted, partition_bucket_if_non_null_with_scratch,
 };
 
 pub(crate) use self::spill::{partition_bucket, partition_bucket_with_scratch};
