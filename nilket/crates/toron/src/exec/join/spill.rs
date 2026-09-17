@@ -1054,6 +1054,15 @@ impl SpilledBatchIndex {
 		}
 	}
 
+	/// ADR 600: the variant `for_key_plan` chose — a fact distinct from the wrapper being enabled.
+	fn variant_name(&self) -> &'static str {
+		match self {
+			Self::Int32(_) => "int32",
+			Self::Int64(_) => "int64",
+			Self::Hash(_) => "hash",
+		}
+	}
+
 	fn row_ref_count(&self) -> u64 {
 		match self {
 			Self::Int32(index) => index.row_ref_count(),
@@ -1479,6 +1488,9 @@ pub(in crate::exec) struct BuildWriteLedger {
 	pub(in crate::exec) ciphertext_bytes: u64,
 	pub(in crate::exec) index_entries: u64,
 	pub(in crate::exec) index_compactions: u64,
+	/// ADR 600: the index's variant (`hash`, `int32`, `int64`) as the build reports it after a
+	/// page, distinct from `index_mode` (whether the compact wrapper was enabled).
+	pub(in crate::exec) index_variant: Option<&'static str>,
 	/// ADR 597: how the Exchange was handled (`None` when the input carries none), whether
 	/// pass-through was requested, and why it was refused when it was.
 	pub(in crate::exec) exchange_handling: Option<ExchangeHandling>,
@@ -1547,6 +1559,7 @@ impl BuildWriteLedger {
 			"ciphertext_bytes": self.ciphertext_bytes,
 			"index_entries": self.index_entries,
 			"index_compactions": self.index_compactions,
+			"index_variant": self.index_variant.unwrap_or("none"),
 			"exchange_handling": self.exchange_handling.map_or("none", ExchangeHandling::name),
 			"pass_through_requested": self.pass_through_requested,
 			"pass_through_refusal": self.pass_through_refusal,
@@ -1644,6 +1657,10 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	scratch_refs: Vec<(JoinKey, u32)>,
 	/// ADR 597: how many times the write guard released the scratch instead of refusing.
 	write_scratch_releases: u64,
+	/// ADR 600: lookup counting, enabled on the profiled arm only.
+	count_lookups: bool,
+	lookup_hits: u64,
+	lookup_misses: u64,
 	resident_baseline_bytes: u64,
 	throughput_profile: Option<Box<StreamedSpilledLeftOuterProfile>>,
 }
@@ -1808,6 +1825,9 @@ impl SpilledInnerJoinBuild {
 			next_offset: 0,
 			scratch_plaintext: Vec::new(),
 			write_scratch_releases: 0,
+			count_lookups: false,
+			lookup_hits: 0,
+			lookup_misses: 0,
 			scratch_refs: Vec::new(),
 			resident_baseline_bytes,
 			throughput_profile,
@@ -2573,12 +2593,14 @@ impl SpilledInnerJoinBuild {
 			if index_rows {
 				ledger.index_entries = ledger.index_entries.saturating_add(keyed_rows);
 			}
-			// The mode the index is in after this page; a near-cap compaction is counted.
+			// The mode the index is in after this page; a near-cap compaction is counted; the
+			// variant is the build's own answer.
 			ledger.index_mode = Some(if self.compact_index.is_some() {
 				"compact"
 			} else {
 				"legacy"
 			});
+			ledger.index_variant = Some(self.index_variant_name());
 			if compacted {
 				ledger.index_compactions = ledger.index_compactions.saturating_add(1);
 			}
@@ -3059,6 +3081,25 @@ impl SpilledInnerJoinBuild {
 		self.guard_resident_state(memory_cap, SpillResidentGuardSite::Write)
 	}
 
+	/// ADR 600: the index's variant — the compact wrapper's choice, or `hash` for the legacy map.
+	pub(in crate::exec) fn index_variant_name(&self) -> &'static str {
+		self.compact_index
+			.as_ref()
+			.map_or("hash", SpilledBatchIndex::variant_name)
+	}
+
+	/// ADR 600: count lookups on this build — hits and misses — for the profiled arm only; the
+	/// counts are published by the chain's cleanup, after the whole drive.
+	pub(in crate::exec) fn enable_lookup_counting(&mut self) {
+		self.count_lookups = true;
+	}
+
+	/// `None` when counting was never enabled; else `(hits, misses)` so far.
+	pub(in crate::exec) fn lookup_counts(&self) -> Option<(u64, u64)> {
+		self.count_lookups
+			.then_some((self.lookup_hits, self.lookup_misses))
+	}
+
 	/// ADR 597: the resident total the guards read, for the ledger's peak after `finish`.
 	pub(in crate::exec) fn resident_state_total(&self) -> u64 {
 		self.resident_state().total()
@@ -3075,6 +3116,34 @@ impl SpilledInnerJoinBuild {
 	#[cfg(test)]
 	pub(in crate::exec) fn spill_path(&self) -> &std::path::Path {
 		&self.path
+	}
+
+	/// ADR 600: the compact index's obtained bucket length, entry capacity, and accounted
+	/// bytes, for the accounting fixture; `None` on the legacy index.
+	#[cfg(test)]
+	pub(in crate::exec) fn compact_index_accounting_parts(
+		&self,
+	) -> Option<(usize, usize, u64, u64)> {
+		match self.compact_index.as_ref()? {
+			SpilledBatchIndex::Int64(index) => Some((
+				index.buckets.len(),
+				index.entries.capacity(),
+				index.overflow_heap_bytes(),
+				index.accounted_bytes(),
+			)),
+			SpilledBatchIndex::Int32(index) => Some((
+				index.buckets.len(),
+				index.entries.capacity(),
+				index.overflow_heap_bytes(),
+				index.accounted_bytes(),
+			)),
+			SpilledBatchIndex::Hash(_) => None,
+		}
+	}
+
+	#[cfg(test)]
+	pub(in crate::exec) fn compact_int64_entry_size() -> usize {
+		std::mem::size_of::<PrimitiveSpilledBatchIndexEntry<i64>>()
 	}
 
 	fn resident_state(&self) -> SpillResidentState {
@@ -3098,6 +3167,13 @@ impl SpilledInnerJoinBuild {
 		};
 		if let Some(profile) = &mut self.throughput_profile {
 			profile.record_lookup(matches.len());
+		}
+		if self.count_lookups {
+			if matches.is_empty() {
+				self.lookup_misses = self.lookup_misses.saturating_add(1);
+			} else {
+				self.lookup_hits = self.lookup_hits.saturating_add(1);
+			}
 		}
 		Ok(matches)
 	}
