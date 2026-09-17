@@ -58,6 +58,12 @@ fn unix_ms_now() -> f64 {
 		.unwrap_or(f64::NAN)
 }
 
+/// The monotonic clock in nanoseconds, as the readings stamp it; ADR 599's driver stamps its
+/// settle wait with it.
+pub fn monotonic_ns() -> u64 {
+	monotonic_ns_now()
+}
+
 fn monotonic_ns_now() -> u64 {
 	let mut ts = libc::timespec {
 		tv_sec: 0,

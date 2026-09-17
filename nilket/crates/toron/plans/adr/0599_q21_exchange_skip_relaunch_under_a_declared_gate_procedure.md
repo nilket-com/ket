@@ -1,6 +1,16 @@
 # ADR 599 - q21's replay-1 build write: the Exchange-skip experiment relaunched under a declared gate procedure
 
-**Status:** PROPOSED. Successor to ADR 597, which built and validated
+**Status:** CLOSED, NOT ESTABLISHED. One paired attempt on strix under
+the declared gate procedure (results in
+`plans/impl/0599_q21_exchange_skip_relaunch_under_a_declared_gate_procedure_results.md`):
+the gate admitted after the 5 s wait (entry 50 °C, gate 38 °C, load
+0.29, causality unestablished), separation and window verified, digest
+parity on all twelve rows, every pair positive — median gain 139.6 ms
+(1.54%) — against a bar of 467.4 ms (2 × the 233.7 ms control range):
+`not_established` under ADR 588's rule; the treatment call site is
+reverted. The mechanism check on the treatment showed pass-through on
+every pair, no repartition, 1,465 pages, `inner_1_build_write` 778.5
+ms against ADR 596's 879.6. Successor to ADR 597, which built and validated
 the write-only Exchange-skip experiment and closed on ADR 593's start
 gate without a measurement (candidate unpriced), and to ADR 598, which
 probed the gate's read and established nothing about the launcher's

@@ -24082,10 +24082,11 @@ impl Executor {
 					false,
 					None,
 					morsel,
-					// ADR 597: the one call site that may request pass-through; the writer admits
-					// it or falls back to the split with the refusal on the ledger. The record
-					// closed without a measurement, so the split is requested here (the
-					// treatment tree, `1917d0d6…`, requested pass-through and was never run).
+					// ADR 597/599: the one call site that may request pass-through; the writer
+					// admits it or falls back to the split with the refusal on the ledger. ADR 597
+					// closed without a measurement and ADR 599 closed `not_established` (every
+					// pair positive, median 139.6 ms against a 467.4 ms bar; treatment tree
+					// `38d4f266…`), so the split is requested here.
 					ExchangeHandling::Split,
 					build_write_ledger.as_mut(),
 				)

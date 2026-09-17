@@ -1592,13 +1592,77 @@ fn run_adr585_q21_decomposition(args: &[String]) -> Result<serde_json::Value, St
 /// at either can be exercised by a fixture; production passes the real ones.
 struct LifecycleHostProbes {
 	scope: fn() -> Result<toron_tpch::host_readings::DriverScope, String>,
+	/// ADR 599: the launch environment's admission (ADR 595), so a fixture can exercise the
+	/// separated path's order — admission, then the wait, then the gate — and its refusal.
+	launch: fn(&str, &toron_tpch::host_readings::DriverScope) -> Result<Adr595Launch, String>,
 	gate: fn() -> Adr593GateOutcome,
+	/// ADR 599: the settle wait's sleep, so a fixture can record the order without waiting.
+	sleep: fn(std::time::Duration),
 }
 
 const LIFECYCLE_HOST_PROBES: LifecycleHostProbes = LifecycleHostProbes {
 	scope: toron_tpch::host_readings::observe_driver_scope,
+	launch: adr595_launch_from_environment,
 	gate: adr593_start_gate,
+	sleep: std::thread::sleep,
 };
+
+/// ADR 599: the declared gate procedure's setting — how long the driver waits, doing nothing
+/// of its own, between the launch environment's admission and the gate's reading. Default 0
+/// is today's placement; a malformed, negative, valueless, or over-limit value is a refusal,
+/// never a default.
+const ADR599_GATE_SETTLE_MAX_SECONDS: u64 = 600;
+
+fn adr599_parse_gate_settle(args: &[String]) -> Result<u64, String> {
+	let Some(position) = args.iter().position(|arg| arg == "--gate-settle-seconds") else {
+		return Ok(0);
+	};
+	let Some(raw) = args.get(position + 1) else {
+		return Err("--gate-settle-seconds is missing its value".to_string());
+	};
+	if raw.starts_with("--") {
+		return Err("--gate-settle-seconds is missing its value".to_string());
+	}
+	let seconds = raw
+		.parse::<i128>()
+		.map_err(|_| format!("--gate-settle-seconds {raw:?} is not a whole number of seconds"))?;
+	if seconds < 0 {
+		return Err(format!("--gate-settle-seconds {raw:?} is negative"));
+	}
+	if seconds > i128::from(ADR599_GATE_SETTLE_MAX_SECONDS) {
+		return Err(format!(
+			"--gate-settle-seconds {raw:?} is over the {ADR599_GATE_SETTLE_MAX_SECONDS} s limit"
+		));
+	}
+	Ok(seconds as u64)
+}
+
+/// ADR 599: what the driver records about the wait and the gate, filled in as they happen so
+/// a refusal at any point carries exactly what had been done.
+#[derive(Default)]
+struct LifecycleGateTrace {
+	/// The requested setting as parsed, or the raw text when it was refused.
+	requested: serde_json::Value,
+	/// The wait as performed: monotonic start and end, elapsed; absent until it runs.
+	settle: Option<serde_json::Value>,
+	gate: Option<serde_json::Value>,
+}
+
+impl LifecycleGateTrace {
+	fn settle_value(&self) -> serde_json::Value {
+		match &self.settle {
+			Some(settle) => {
+				let mut value = settle.clone();
+				value["requested_seconds"] = self.requested.clone();
+				value
+			}
+			None => serde_json::json!({
+				"requested_seconds": self.requested,
+				"wait_performed": false,
+			}),
+		}
+	}
+}
 
 fn run_lifecycle_decomposition_driver(
 	args: &[String],
@@ -1634,19 +1698,13 @@ fn run_lifecycle_decomposition_driver_with(
 		at_entry,
 		launcher_verification,
 	};
-	// The gate's evidence, filled in when the gate is read, so a refusal at or after the gate
-	// keeps the reading it was judged on, and a refusal before it says the gate was not read.
-	let mut gate_evidence: Option<serde_json::Value> = None;
-	let result = run_lifecycle_decomposition_driver_in(
-		args,
-		spec,
-		&output_dir,
-		&stamps,
-		probes,
-		&mut gate_evidence,
-	);
+	// The wait's and the gate's evidence, filled in as each happens, so a refusal at any point
+	// carries the requested setting, whether the wait ran, and the gate's reading if read.
+	let mut trace = LifecycleGateTrace::default();
+	let result =
+		run_lifecycle_decomposition_driver_in(args, spec, &output_dir, &stamps, probes, &mut trace);
 	if let Err(error) = &result {
-		adr598_write_refusal(&output_dir, label, error, &stamps, gate_evidence.as_ref());
+		adr598_write_refusal(&output_dir, label, error, &stamps, &trace);
 	}
 	result
 }
@@ -1739,8 +1797,9 @@ fn adr598_write_refusal(
 	label: &str,
 	error: &str,
 	stamps: &Adr598DriverStamps,
-	gate: Option<&serde_json::Value>,
+	trace: &LifecycleGateTrace,
 ) {
+	let gate = trace.gate.as_ref();
 	let refusal = serde_json::json!({
 		"label": label,
 		"refusal": error,
@@ -1750,6 +1809,7 @@ fn adr598_write_refusal(
 		"start_gate": gate.cloned().unwrap_or(serde_json::Value::Null),
 		"gate_evidence": if gate.is_some() { "recorded" } else { "absent: refused before the gate was read" },
 		"hash_end_to_gate_ms": adr598_hash_end_to_gate_from_gate(&stamps.launcher_verification, gate),
+		"gate_settle": trace.settle_value(),
 	});
 	if let Err(write_error) = write_json_atomically(&output_dir.join("refusal.json"), &refusal) {
 		eprintln!("{label}: refusal.json could not be written: {write_error}");
@@ -1788,22 +1848,51 @@ fn run_lifecycle_decomposition_driver_in(
 	output_dir: &Path,
 	stamps: &Adr598DriverStamps,
 	probes: &LifecycleHostProbes,
-	gate_evidence: &mut Option<serde_json::Value>,
+	trace: &mut LifecycleGateTrace,
 ) -> Result<serde_json::Value, String> {
 	let label = spec.label;
 	let output_dir = output_dir.to_path_buf();
+	// ADR 599: the gate procedure's setting, parsed before anything else can refuse, refused
+	// rather than defaulted when it is malformed.
+	let settle_seconds = match adr599_parse_gate_settle(args) {
+		Ok(seconds) => {
+			trace.requested = serde_json::json!(seconds);
+			seconds
+		}
+		Err(error) => {
+			trace.requested = serde_json::json!(flag_value(args, "--gate-settle-seconds"));
+			return Err(format!("{label}: {error}"));
+		}
+	};
 	// ADR 593: the driver runs as a transient service outside any login session's scope, and
 	// starts only through the gate, read before the driver does any work of its own (the
 	// dataset's full-hash verification alone warms a P-core by ten degrees or more).
 	let driver_scope = (probes.scope)()?;
 	// ADR 595: the launch's identity and instants, checked before the gate is read.
 	let launch = if spec.separated_launch {
-		Some(adr595_launch_from_environment(label, &driver_scope)?)
+		Some((probes.launch)(label, &driver_scope)?)
 	} else {
 		None
 	};
+	// ADR 599: the wait, after the launch environment's admission and before the gate's
+	// reading, doing nothing of the driver's own; its start, end, and elapsed are recorded on
+	// the monotonic clock so a skipped or cut-short wait is visible.
+	let wait_started = Instant::now();
+	let wait_started_ns = toron_tpch::host_readings::monotonic_ns();
+	if settle_seconds > 0 {
+		(probes.sleep)(std::time::Duration::from_secs(settle_seconds));
+	}
+	let wait_elapsed = wait_started.elapsed();
+	// Zero requested is no wait: recorded as not performed, with its (zero) elapsed.
+	trace.settle = Some(serde_json::json!({
+		"wait_performed": settle_seconds > 0,
+		"started_monotonic_ns": wait_started_ns,
+		"ended_monotonic_ns": toron_tpch::host_readings::monotonic_ns(),
+		"elapsed_ms": wait_elapsed.as_secs_f64() * 1000.0,
+	}));
+	// The gate's reading is the first act after the wait ends.
 	let gate_outcome = (probes.gate)();
-	*gate_evidence = Some(gate_outcome.gate.clone());
+	trace.gate = Some(gate_outcome.gate.clone());
 	if let Some(refusal) = gate_outcome.refusal {
 		return Err(refusal);
 	}
@@ -1977,6 +2066,7 @@ fn run_lifecycle_decomposition_driver_in(
 	summary["launcher_verification"] = stamps.launcher_verification.clone();
 	summary["hash_end_to_gate_ms"] =
 		adr598_hash_end_to_gate_from_gate(&stamps.launcher_verification, Some(&start_gate));
+	summary["gate_settle"] = trace.settle_value();
 	summary["start_gate"] = start_gate;
 	summary["host_journal"] = host_journal;
 	summary["kind"] = serde_json::json!(spec.kind);
@@ -2565,7 +2655,13 @@ fn adr598_gate_probe(args: &[String]) -> Result<serde_json::Value, String> {
 	};
 	let result = adr598_gate_probe_in(label, &output_dir, &stamps);
 	if let Err(error) = &result {
-		adr598_write_refusal(&output_dir, label, error, &stamps, None);
+		adr598_write_refusal(
+			&output_dir,
+			label,
+			error,
+			&stamps,
+			&LifecycleGateTrace::default(),
+		);
 	}
 	result
 }
@@ -16410,7 +16506,9 @@ mod tests {
 		let args = vec!["--output-dir".to_string(), dir.display().to_string()];
 		let probes = LifecycleHostProbes {
 			scope: adr598_test_scope,
+			launch: adr595_launch_from_environment,
 			gate: adr598_gate_at_47,
+			sleep: std::thread::sleep,
 		};
 		let error =
 			run_lifecycle_decomposition_driver_with(&args, &ADR594_DRIVER, &probes).unwrap_err();
@@ -16439,7 +16537,9 @@ mod tests {
 		let args = vec!["--output-dir".to_string(), dir.display().to_string()];
 		let probes = LifecycleHostProbes {
 			scope: adr598_scope_refused,
+			launch: adr595_launch_from_environment,
 			gate: adr598_gate_at_47,
+			sleep: std::thread::sleep,
 		};
 		let error =
 			run_lifecycle_decomposition_driver_with(&args, &ADR594_DRIVER, &probes).unwrap_err();
@@ -16537,6 +16637,244 @@ mod tests {
 			adr598_run_disposition(&serde_json::json!({"complete": true}), Some(timeout)),
 			"complete"
 		);
+	}
+
+	// -----------------------------------------------------------------------------------------
+	// ADR 599: the declared gate procedure — the wait between the launch admission and the gate.
+	// -----------------------------------------------------------------------------------------
+
+	/// The order of the driver's pre-gate acts, recorded by injected probes.
+	static ADR599_SEQUENCE: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+
+	fn adr599_scope_recording() -> Result<toron_tpch::host_readings::DriverScope, String> {
+		ADR599_SEQUENCE.lock().unwrap().push("scope");
+		adr598_test_scope()
+	}
+
+	fn adr599_sleep_recording(duration: std::time::Duration) {
+		ADR599_SEQUENCE
+			.lock()
+			.unwrap()
+			.push(if duration.as_secs() == 5 {
+				"wait_5s"
+			} else {
+				"wait"
+			});
+		// A real but short sleep, so the measured elapsed is visibly the wait and nothing else.
+		std::thread::sleep(std::time::Duration::from_millis(20));
+	}
+
+	fn adr599_launch_recording_admit(
+		_label: &str,
+		_scope: &toron_tpch::host_readings::DriverScope,
+	) -> Result<Adr595Launch, String> {
+		ADR599_SEQUENCE.lock().unwrap().push("launch_admission");
+		Ok(adr595_launch())
+	}
+
+	fn adr599_launch_recording_refuse(
+		_label: &str,
+		_scope: &toron_tpch::host_readings::DriverScope,
+	) -> Result<Adr595Launch, String> {
+		ADR599_SEQUENCE.lock().unwrap().push("launch_admission");
+		Err("ADR 599 launched on boot a but runs on boot b".to_string())
+	}
+
+	fn adr599_gate_recording_admit() -> Adr593GateOutcome {
+		ADR599_SEQUENCE.lock().unwrap().push("gate");
+		adr593_judge_gate(adr598_test_reading(Some(41_000)), Some(0.01))
+	}
+
+	fn adr599_gate_recording_refuse() -> Adr593GateOutcome {
+		ADR599_SEQUENCE.lock().unwrap().push("gate");
+		adr593_judge_gate(adr598_test_reading(Some(47_000)), Some(0.01))
+	}
+
+	fn adr599_refusal_in(dir: &Path) -> serde_json::Value {
+		serde_json::from_str(&std::fs::read_to_string(dir.join("refusal.json")).unwrap()).unwrap()
+	}
+
+	#[test]
+	fn adr599_the_flag_is_parsed_strictly_and_never_defaults_on_a_bad_value() {
+		let args = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+		assert_eq!(
+			adr599_parse_gate_settle(&args(&["--mode", "strict"])).unwrap(),
+			0
+		);
+		assert_eq!(
+			adr599_parse_gate_settle(&args(&["--gate-settle-seconds", "5"])).unwrap(),
+			5
+		);
+		assert_eq!(
+			adr599_parse_gate_settle(&args(&["--gate-settle-seconds", "600"])).unwrap(),
+			600
+		);
+		for (values, needle) in [
+			(vec!["--gate-settle-seconds"], "missing its value"),
+			(vec!["--gate-settle-seconds", "--mode"], "missing its value"),
+			(vec!["--gate-settle-seconds", "five"], "not a whole number"),
+			(vec!["--gate-settle-seconds", "5.0"], "not a whole number"),
+			(vec!["--gate-settle-seconds", "-5"], "is negative"),
+			(vec!["--gate-settle-seconds", "601"], "over the 600 s limit"),
+			(
+				vec![
+					"--gate-settle-seconds",
+					"99999999999999999999999999999999999999999",
+				],
+				"not a whole number",
+			),
+		] {
+			let error = adr599_parse_gate_settle(&args(&values)).unwrap_err();
+			assert!(error.contains(needle), "{values:?}: {error}");
+		}
+	}
+
+	// ADR 599: launch admission, then the wait, then the gate — the gate's reading the first
+	// act after the wait; the wait recorded as performed with its measured duration; the
+	// default performing no wait; a bad value refused before the wait with the setting, the
+	// wait not performed, and the gate evidence absent on the refusal file.
+	#[test]
+	fn adr599_the_wait_sits_between_the_launch_admission_and_the_gate_and_is_recorded() {
+		ADR599_SEQUENCE.lock().unwrap().clear();
+		let dir = std::env::temp_dir().join(format!("adr599-order-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		let probes = LifecycleHostProbes {
+			scope: adr599_scope_recording,
+			launch: adr599_launch_recording_admit,
+			gate: adr599_gate_recording_refuse,
+			sleep: adr599_sleep_recording,
+		};
+		// A refusing gate after a 5 s setting: the sequence is scope, wait, gate; the refusal
+		// carries the performed wait beside the gate's reading.
+		let args = vec![
+			"--output-dir".to_string(),
+			dir.display().to_string(),
+			"--gate-settle-seconds".to_string(),
+			"5".to_string(),
+		];
+		let error =
+			run_lifecycle_decomposition_driver_with(&args, &ADR596_DRIVER, &probes).unwrap_err();
+		assert!(error.contains("47000 millic"), "{error}");
+		assert_eq!(
+			*ADR599_SEQUENCE.lock().unwrap(),
+			vec!["scope", "launch_admission", "wait_5s", "gate"],
+			"the separated path: scope, the launch environment's admission, the wait, the gate"
+		);
+		let refusal = adr599_refusal_in(&dir);
+		assert_eq!(refusal["gate_settle"]["requested_seconds"], 5);
+		assert_eq!(refusal["gate_settle"]["wait_performed"], true);
+		let elapsed = refusal["gate_settle"]["elapsed_ms"].as_f64().unwrap();
+		assert!((20.0..1_000.0).contains(&elapsed), "{elapsed}");
+		assert!(
+			refusal["gate_settle"]["ended_monotonic_ns"]
+				.as_u64()
+				.unwrap() >= refusal["gate_settle"]["started_monotonic_ns"]
+				.as_u64()
+				.unwrap()
+		);
+		assert_eq!(refusal["gate_evidence"], "recorded");
+		assert_eq!(
+			refusal["readings"]["at_gate"]["package_temp_millic"],
+			47_000
+		);
+		std::fs::remove_dir_all(&dir).unwrap();
+
+		// The default: no wait is performed and recorded as none, the gate is read at once.
+		ADR599_SEQUENCE.lock().unwrap().clear();
+		let args = vec!["--output-dir".to_string(), dir.display().to_string()];
+		let error =
+			run_lifecycle_decomposition_driver_with(&args, &ADR596_DRIVER, &probes).unwrap_err();
+		assert!(error.contains("47000 millic"), "{error}");
+		assert_eq!(
+			*ADR599_SEQUENCE.lock().unwrap(),
+			vec!["scope", "launch_admission", "gate"]
+		);
+		let refusal = adr599_refusal_in(&dir);
+		assert_eq!(refusal["gate_settle"]["requested_seconds"], 0);
+		assert_eq!(refusal["gate_settle"]["wait_performed"], false);
+		assert!(refusal["gate_settle"]["elapsed_ms"].as_f64().unwrap() < 20.0);
+		std::fs::remove_dir_all(&dir).unwrap();
+
+		// A failed launch admission: neither the wait nor the gate runs; the refusal records
+		// the setting, the wait not performed, and the gate evidence absent.
+		ADR599_SEQUENCE.lock().unwrap().clear();
+		let probes = LifecycleHostProbes {
+			scope: adr599_scope_recording,
+			launch: adr599_launch_recording_refuse,
+			gate: adr599_gate_recording_admit,
+			sleep: adr599_sleep_recording,
+		};
+		let args = vec![
+			"--output-dir".to_string(),
+			dir.display().to_string(),
+			"--gate-settle-seconds".to_string(),
+			"5".to_string(),
+		];
+		let error =
+			run_lifecycle_decomposition_driver_with(&args, &ADR596_DRIVER, &probes).unwrap_err();
+		assert!(error.contains("runs on boot"), "{error}");
+		assert_eq!(
+			*ADR599_SEQUENCE.lock().unwrap(),
+			vec!["scope", "launch_admission"],
+			"no wait and no gate after a failed launch admission"
+		);
+		let refusal = adr599_refusal_in(&dir);
+		assert_eq!(refusal["gate_settle"]["requested_seconds"], 5);
+		assert_eq!(refusal["gate_settle"]["wait_performed"], false);
+		assert_eq!(
+			refusal["gate_evidence"],
+			"absent: refused before the gate was read"
+		);
+		std::fs::remove_dir_all(&dir).unwrap();
+
+		// A bad value: refused before the scope, the wait, or the gate; the refusal records
+		// the raw setting, the wait not performed, and absent gate evidence.
+		ADR599_SEQUENCE.lock().unwrap().clear();
+		let args = vec![
+			"--output-dir".to_string(),
+			dir.display().to_string(),
+			"--gate-settle-seconds".to_string(),
+			"-5".to_string(),
+		];
+		let error =
+			run_lifecycle_decomposition_driver_with(&args, &ADR596_DRIVER, &probes).unwrap_err();
+		assert!(error.contains("is negative"), "{error}");
+		assert!(ADR599_SEQUENCE.lock().unwrap().is_empty());
+		let refusal = adr599_refusal_in(&dir);
+		assert_eq!(refusal["gate_settle"]["requested_seconds"], "-5");
+		assert_eq!(refusal["gate_settle"]["wait_performed"], false);
+		assert_eq!(
+			refusal["gate_evidence"],
+			"absent: refused before the gate was read"
+		);
+		std::fs::remove_dir_all(&dir).unwrap();
+
+		// A refusal before the wait (the scope): the setting recorded, the wait not performed.
+		ADR599_SEQUENCE.lock().unwrap().clear();
+		let probes = LifecycleHostProbes {
+			scope: adr598_scope_refused,
+			launch: adr599_launch_recording_admit,
+			gate: adr599_gate_recording_admit,
+			sleep: adr599_sleep_recording,
+		};
+		let args = vec![
+			"--output-dir".to_string(),
+			dir.display().to_string(),
+			"--gate-settle-seconds".to_string(),
+			"5".to_string(),
+		];
+		let error =
+			run_lifecycle_decomposition_driver_with(&args, &ADR596_DRIVER, &probes).unwrap_err();
+		assert!(error.contains("login session"), "{error}");
+		assert!(ADR599_SEQUENCE.lock().unwrap().is_empty());
+		let refusal = adr599_refusal_in(&dir);
+		assert_eq!(refusal["gate_settle"]["requested_seconds"], 5);
+		assert_eq!(refusal["gate_settle"]["wait_performed"], false);
+		assert_eq!(
+			refusal["gate_evidence"],
+			"absent: refused before the gate was read"
+		);
+		std::fs::remove_dir_all(&dir).unwrap();
 	}
 
 	#[test]
