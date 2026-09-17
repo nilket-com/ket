@@ -1,6 +1,22 @@
 # ADR 600 - q21's replay-1 build write: the index child, grounded, and the resident index the spilled branch never enables
 
-**Status:** PROPOSED. Successor to ADR 596, which decomposed
+**Status:** CLOSED, RETAINED. One paired attempt on strix under the
+declared gate procedure (results in
+`plans/impl/0600_q21_build_write_index_on_the_spilled_branch_results.md`):
+the gate admitted after the 5 s wait (entry 46 °C, gate 38 °C, load
+0.00), separation and window verified, digest parity on all twelve
+rows, every pair positive — median gain 559.7 ms (6.23%) — against a
+bar of 191.8 ms (2 × the 95.9 ms control range): `retained` under ADR
+588's rule; the one call stays. The mechanism check on the treatment
+read `index_mode = compact`, `index_variant = int64`, 5,845,938
+entries, a resident peak of 268,506,120 bytes, the index child at
+303.9 median-scaled ms and `inner_1_build_write` at 688.7; replay 1's
+lookup counts were absent on that check — the publication sat on a
+handler the measured chain does not route through, and the receipt
+read the absence as disabled — and the closing tree carries the fix
+(one collection per chain, a three-valued reading, fixtures through
+the real path); the counts stay unmeasured under this record.
+Successor to ADR 596, which decomposed
 `inner_1_build_write` and left `build_write_index` as its leading child
 (482.4 median-scaled ms, below the floor), and to ADR 599, which closed
 the Exchange-skip candidate `not_established` and measured the index

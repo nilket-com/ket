@@ -2729,6 +2729,42 @@ fn inner_1_decomposition_band(
 			.cloned()
 			.unwrap_or(serde_json::Value::Null),
 	);
+	// ADR 600: replay 1's lookup counts, published once at the chain's cleanup as a collection
+	// over the spilled replays. `inner_1_lookups_counted` is three-valued: `true` (counted, the
+	// counts follow), `false` (the build reported counting disabled), `null` (no publication
+	// carried replay 1 — unknown, which is not disabled); the counts are null unless counted.
+	let lookups = invocation
+		.diagnostics
+		.iter()
+		.find(|entry| entry.name == "inner_replay_lookups")
+		.and_then(|entry| entry.value.get("replays"))
+		.and_then(serde_json::Value::as_array)
+		.and_then(|replays| {
+			replays
+				.iter()
+				.find(|value| value.get("replay_id") == Some(&serde_json::json!(1)))
+		});
+	band.insert(
+		"inner_1_lookups_counted".to_string(),
+		lookups
+			.and_then(|value| value.get("counted"))
+			.cloned()
+			.unwrap_or(serde_json::Value::Null),
+	);
+	band.insert(
+		"inner_1_lookup_hits".to_string(),
+		lookups
+			.and_then(|value| value.get("hits"))
+			.cloned()
+			.unwrap_or(serde_json::Value::Null),
+	);
+	band.insert(
+		"inner_1_lookup_misses".to_string(),
+		lookups
+			.and_then(|value| value.get("misses"))
+			.cloned()
+			.unwrap_or(serde_json::Value::Null),
+	);
 	let term_calls = |name: &str| {
 		present
 			.iter()
@@ -2953,7 +2989,8 @@ fn build_write_band_from_parts(
 		"build_write_residual_micros".to_string(),
 		serde_json::json!(residual),
 	);
-	const FACTS: [&str; 29] = [
+	const FACTS: [&str; 30] = [
+		"index_variant",
 		"scratch_releases",
 		"exchange_handling",
 		"pass_through_requested",
@@ -3063,6 +3100,21 @@ fn build_write_band_from_parts(
 		let index_mode = facts.get("index_mode").and_then(serde_json::Value::as_str);
 		if !matches!(index_mode, Some("compact" | "legacy" | "none")) {
 			return Some("fact index_mode is not compact, legacy, or none".to_string());
+		}
+		// ADR 600: the variant is a separate fact from the mode, present on receipts that carry
+		// it; a legacy index is always the hash variant, a compact one names its own.
+		if let Some(variant) = facts.get("index_variant") {
+			match (index_mode, variant.as_str()) {
+				(Some("none"), Some("none")) => {}
+				(Some("legacy"), Some("hash")) => {}
+				(Some("compact"), Some("hash" | "int32" | "int64")) => {}
+				_ => {
+					return Some(format!(
+						"index_variant {variant} disagrees with index_mode {}",
+						index_mode.unwrap_or_default()
+					));
+				}
+			}
 		}
 		let count = |name: &str| fact_u64(name).unwrap_or(0);
 		// A child that did not run carries no time; a child that ran may round to zero.
@@ -3631,9 +3683,33 @@ fn write_profile(accounting: &NodeAccounting) -> Result<(), ExecutionError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::exec) mod tests {
 	use super::*;
 	use crate::exec::join::stage_attribution::FlowByteDomain;
+
+	/// ADR 600: the sixth band's lookup fields after the given diagnostics have been published
+	/// onto a spilled inner-1 invocation through the ledger's own `attach_diagnostic` — the
+	/// path `record_invocation_diagnostic` takes, with its one-value-per-name replacement — read
+	/// back through the real receipt.
+	pub(in crate::exec) fn adr600_lookup_fields_after_publications(
+		publications: Vec<(&'static str, serde_json::Value)>,
+	) -> (serde_json::Value, serde_json::Value, serde_json::Value) {
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+		let id = invocation.id;
+		let mut acc = NodeAccounting::default();
+		acc.aggregate_invocations.push(invocation);
+		for (name, value) in publications {
+			acc.attach_diagnostic(id, name, value);
+		}
+		let receipt = inclusive_lifecycle_receipt_value(&acc.aggregate_invocations[0], 1_200);
+		(
+			receipt["inner_1_lookups_counted"].clone(),
+			receipt["inner_1_lookup_hits"].clone(),
+			receipt["inner_1_lookup_misses"].clone(),
+		)
+	}
 
 	fn spill_parts(accounting: &NodeAccounting) -> Vec<(&'static str, u64)> {
 		NodeKind::ALL
@@ -4805,6 +4881,7 @@ mod tests {
 		facts["writer_peak_bytes"] = serde_json::json!(8_000);
 		facts["resident_state_peak_bytes"] = serde_json::json!(80_000);
 		facts["scratch_releases"] = serde_json::json!(0);
+		facts["index_variant"] = serde_json::json!("hash");
 		facts
 	}
 
@@ -5136,6 +5213,109 @@ mod tests {
 					.unwrap()
 					.contains(needle),
 				"{label}: {}",
+				receipt["build_write_inconsistency"]
+			);
+		}
+	}
+
+	// ADR 600: the index's variant is its own fact, checked against the mode; replay 1's lookup
+	// counts are read from the cleanup's diagnostic, absent when never counted.
+	#[test]
+	fn adr600_receipt_names_the_index_variant_and_replay_1s_lookups() {
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+		let mut facts = adr597_write_facts("split", false, None);
+		facts["index_mode"] = serde_json::json!("compact");
+		facts["index_variant"] = serde_json::json!("int64");
+		let mut calls = ADR596_CALLS;
+		calls[4] = 3;
+		attach_build_write_band(&mut invocation, ADR596_MICROS, calls, facts);
+		invocation.diagnostics.push(InvocationDiagnostic {
+			name: "inner_replay_lookups",
+			value: serde_json::json!({"replays": [
+				{"replay_id": 0, "counted": true, "hits": 5, "misses": 1},
+				{"replay_id": 1, "counted": true, "hits": 400, "misses": 12},
+			]}),
+		});
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["build_write_facts_consistent"], true, "{receipt}");
+		assert_eq!(receipt["build_write_index_variant"], "int64");
+		assert_eq!(receipt["inner_1_lookups_counted"], true);
+		assert_eq!(
+			receipt["inner_1_lookup_hits"], 400,
+			"replay 1's, not replay 0's"
+		);
+		assert_eq!(receipt["inner_1_lookup_misses"], 12);
+		// Three states, told apart: counted with zero lookups, disabled, and unpublished.
+		let read = |entry: Option<serde_json::Value>| {
+			let mut invocation = adr586_invocation();
+			adr589_write_bands(&mut invocation);
+			attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+			if let Some(entry) = entry {
+				invocation.diagnostics.push(InvocationDiagnostic {
+					name: "inner_replay_lookups",
+					value: serde_json::json!({"replays": [entry]}),
+				});
+			}
+			let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+			(
+				receipt["inner_1_lookups_counted"].clone(),
+				receipt["inner_1_lookup_hits"].clone(),
+				receipt["inner_1_lookup_misses"].clone(),
+			)
+		};
+		let null = serde_json::Value::Null;
+		assert_eq!(
+			read(Some(
+				serde_json::json!({"replay_id": 1, "counted": true, "hits": 0, "misses": 0})
+			)),
+			(
+				serde_json::json!(true),
+				serde_json::json!(0),
+				serde_json::json!(0)
+			),
+			"enabled with no lookups: counted, zero, zero"
+		);
+		assert_eq!(
+			read(Some(
+				serde_json::json!({"replay_id": 1, "counted": false, "hits": null, "misses": null})
+			)),
+			(serde_json::json!(false), null.clone(), null.clone()),
+			"disabled: the build said so; the counts are null"
+		);
+		assert_eq!(
+			read(None),
+			(null.clone(), null.clone(), null.clone()),
+			"no publication: unknown, which is not disabled"
+		);
+		assert_eq!(
+			read(Some(
+				serde_json::json!({"replay_id": 2, "counted": true, "hits": 7, "misses": 0})
+			)),
+			(null.clone(), null.clone(), null),
+			"a publication without replay 1 is absence for replay 1"
+		);
+		// The variant against the mode.
+		for (mode, variant, ok) in [
+			("legacy", "hash", true),
+			("legacy", "int64", false),
+			("compact", "int32", true),
+			("compact", "none", false),
+		] {
+			let mut invocation = adr586_invocation();
+			adr589_write_bands(&mut invocation);
+			attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+			let mut facts = adr597_write_facts("split", false, None);
+			facts["index_mode"] = serde_json::json!(mode);
+			facts["index_variant"] = serde_json::json!(variant);
+			let mut calls = ADR596_CALLS;
+			calls[4] = 3;
+			attach_build_write_band(&mut invocation, ADR596_MICROS, calls, facts);
+			let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+			assert_eq!(
+				receipt["build_write_facts_consistent"], ok,
+				"{mode}/{variant}: {}",
 				receipt["build_write_inconsistency"]
 			);
 		}
