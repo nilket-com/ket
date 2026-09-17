@@ -24139,7 +24139,7 @@ impl Executor {
 			// admitted plan (a primitive key, not null-safe) is reserved under its own clock from
 			// the sizing pass's rows and finalized once before `finish`; any other plan, and the
 			// `Incremental` form, take ADR 600's call with neither clock.
-			let index_form = SpilledIndexForm::Incremental;
+			let index_form = SpilledIndexForm::FinishBuilt;
 			let finish_built = index_form == SpilledIndexForm::FinishBuilt
 				&& finish_built_index_admitted(key_plan, false);
 			if finish_built {
