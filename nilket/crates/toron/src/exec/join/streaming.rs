@@ -24086,6 +24086,8 @@ impl Executor {
 			if lifecycle.is_some() {
 				spilled.enable_lookup_counting();
 			}
+			// ADR 600 treatment: the spilled branch builds the compact resident index.
+			spilled.use_compact_resident_index();
 
 			// ADR0551-SITE: streaming/prepare_reoriented_inner_join_runtime_with_scan_build/Build/1
 
