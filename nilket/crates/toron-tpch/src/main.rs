@@ -3789,7 +3789,7 @@ const ADR596_RULE_TERMS: [&str; 11] = [
 	"build_write_residual",
 ];
 
-const ADR596_FACTS: [&str; 30] = [
+const ADR596_FACTS: [&str; 31] = [
 	"build_write_facts_vintage",
 	"build_write_exchange_handling",
 	"build_write_pass_through_requested",
@@ -3805,6 +3805,7 @@ const ADR596_FACTS: [&str; 30] = [
 	"build_write_projected",
 	"build_write_termination",
 	"build_write_index_mode",
+	"build_write_index_variant",
 	"build_write_unsupported",
 	"build_write_batches_read",
 	"build_write_batches_limit_discarded",
@@ -4417,6 +4418,9 @@ fn evaluate_adr594_pairs_tagged(
 			"inner_1_sizing_rows",
 			"inner_1_build_rows",
 			"inner_1_build_spill_bytes",
+			"inner_1_lookups_counted",
+			"inner_1_lookup_hits",
+			"inner_1_lookup_misses",
 		] {
 			band[fact] = receipt.get(fact).cloned().unwrap_or_default();
 		}
@@ -15605,6 +15609,7 @@ mod tests {
 		serde_json::json!({
 			"filter_present": true, "exchange": false, "exchange_partitions": null,
 			"projected": true, "termination": "stream_end", "index_mode": "compact",
+			"index_variant": "int64",
 			"unsupported": null, "batches_read": 120, "batches_limit_discarded": 0,
 			"batches_admitted": 120, "batches_filtered_empty": 0,
 			"batches_written": 120, "rows_read": 12_000_000, "rows_kept": 5_845_938,
@@ -15737,6 +15742,38 @@ mod tests {
 	const ADR596_BELOW_FLOOR: [u64; 11] = [
 		1_000, 20_000, 300_000, 100_000, 0, 60_000, 90_000, 150_000, 250_000, 150_000, 5_000,
 	];
+
+	/// ADR 600: the seventh band carries the writer's index variant beside its mode, and the
+	/// sixth band carries replay 1's lookup counts as the receipt names them (absent stays
+	/// null, never zero).
+	#[test]
+	fn adr600_the_bands_carry_the_index_variant_and_the_lookup_counts() {
+		let children = [
+			1_000, 20_000, 30_000, 20_000, 0, 10_000, 20_000, 40_000, 950_000, 60_000, 5_000,
+		];
+		let mut inner_1_facts = adr596_spilled_facts();
+		inner_1_facts["lookups_counted"] = serde_json::json!(true);
+		inner_1_facts["lookup_hits"] = serde_json::json!(400);
+		inner_1_facts["lookup_misses"] = serde_json::json!(12);
+		let summary = evaluate_adr596_pairs(&adr596_rows_on(
+			children,
+			adr596_write_facts(),
+			inner_1_facts,
+		))
+		.unwrap();
+		let band = &summary["adr596_pair_bands"][0];
+		assert_eq!(band["build_write_index_mode"], "compact");
+		assert_eq!(band["build_write_index_variant"], "int64");
+		let sixth = &summary["adr594_pair_bands"][0];
+		assert_eq!(sixth["inner_1_lookups_counted"], true);
+		assert_eq!(sixth["inner_1_lookup_hits"], 400);
+		assert_eq!(sixth["inner_1_lookup_misses"], 12);
+
+		let summary = evaluate_adr596_pairs(&adr596_rows(children, adr596_write_facts())).unwrap();
+		let sixth = &summary["adr594_pair_bands"][0];
+		assert_eq!(sixth["inner_1_lookups_counted"], serde_json::Value::Null);
+		assert_eq!(sixth["inner_1_lookup_hits"], serde_json::Value::Null);
+	}
 
 	// The fixture's off arms span 400 ms, so the floor is 800 ms and a lead must exceed 400 ms.
 	// The rule ranks the scan wait once (open plus poll), never its components beside it.

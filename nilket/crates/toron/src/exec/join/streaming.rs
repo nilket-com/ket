@@ -4631,6 +4631,30 @@ impl ReorientedInnerJoinRuntime<'_> {
 			build.cleanup().await;
 		}
 	}
+
+	/// ADR 600: publish the spilled build's lookup counts — the whole drive's — as the
+	/// `inner_replay_lookups` diagnostic keyed by this replay. Every handler that reaches its
+	/// cleanup stage with a spilled runtime calls this before `cleanup`; a build that never
+	/// counted publishes `counted: false` with absent counts, never zeros.
+	pub(in crate::exec) fn publish_lookup_counts(
+		&self,
+		handle: &node_attribution::VocabularyHandle,
+	) {
+		let ReorientedInnerJoinBuild::Spilled { build, .. } = &self.build else {
+			return;
+		};
+		let counts = build.lookup_counts();
+		node_attribution::record_invocation_diagnostic(
+			handle,
+			"inner_replay_lookups",
+			serde_json::json!({
+				"replay_id": u64::from(self.replay_id.0),
+				"counted": counts.is_some(),
+				"hits": counts.map(|(hits, _)| hits),
+				"misses": counts.map(|(_, misses)| misses),
+			}),
+		);
+	}
 }
 
 pub(in crate::exec) struct StreamingSemiAntiChain<'a> {
@@ -17599,6 +17623,10 @@ impl Executor {
 				facts.push((replay_id, runtime.cached_lifecycle_facts()));
 			}
 
+			if let Some(handle) = stage_handle.as_ref() {
+				runtime.publish_lookup_counts(handle);
+			}
+
 			let cleanup_build_stage = stage_handle.as_ref().and_then(|handle| {
 				node_attribution::open_replay_substage(
 					handle,
@@ -21887,6 +21915,10 @@ impl Executor {
 		});
 
 		for runtime in inner_runtimes {
+			if let Some(handle) = stage_handle.as_ref() {
+				runtime.publish_lookup_counts(handle);
+			}
+
 			runtime.cleanup().await;
 		}
 
@@ -24063,6 +24095,15 @@ impl Executor {
 				BuildWriteChild::Create,
 				create_started,
 			);
+
+			// ADR 600: lookups are counted on the profiled arm only, published at cleanup.
+			if lifecycle.is_some() {
+				spilled.enable_lookup_counting();
+			}
+			// The spilled branch builds the compact resident index (ADR 600, retained on a median
+			// paired gain of 559.7 ms); the wrapper picks the variant from the key plan and the
+			// receipt names it.
+			spilled.use_compact_resident_index();
 
 			// ADR0551-SITE: streaming/prepare_reoriented_inner_join_runtime_with_scan_build/Build/1
 
@@ -35374,6 +35415,10 @@ mod tests {
 		exchange_key: Option<BoundExprProgram>,
 		null_safe_keys: bool,
 		budget: Option<TaskBudget>,
+		/// ADR 600: the compact resident index enabled on the build after its creation (the
+		/// treatment's one call), and the key column's type (`k` at ordinal 1).
+		compact_index: bool,
+		key_type: DataType,
 	}
 
 	impl Adr596Fixture {
@@ -35393,12 +35438,42 @@ mod tests {
 				exchange_key: None,
 				null_safe_keys: false,
 				budget: None,
+				compact_index: false,
+				key_type: DataType::Int64,
 			}
 		}
 	}
 
 	fn adr596_batch(rows: &[(Option<i64>, i64, i64)]) -> RecordBatch {
 		adr597_batch_with_payload(rows, |id| format!("row-{id}"))
+	}
+
+	/// ADR 600: the fixture batch with the key column `k` in a chosen type — `Int64`, `Int32`,
+	/// or `Utf8` (the key value spelled as `k<value>`) — nulls preserved.
+	fn adr600_batch_with_key_type(
+		rows: &[(Option<i64>, i64, i64)],
+		key_type: &DataType,
+	) -> RecordBatch {
+		let batch = adr596_batch(rows);
+		let key: ArrayRef = match key_type {
+			DataType::Int64 => return batch,
+			DataType::Int32 => Arc::new(arrow::array::Int32Array::from(
+				rows.iter()
+					.map(|(k, _, _)| k.map(|k| k as i32))
+					.collect::<Vec<_>>(),
+			)),
+			DataType::Utf8 => Arc::new(StringArray::from(
+				rows.iter()
+					.map(|(k, _, _)| k.map(|k| format!("k{k}")))
+					.collect::<Vec<_>>(),
+			)),
+			other => panic!("unsupported fixture key type {other:?}"),
+		};
+		let mut fields = batch.schema().fields().to_vec();
+		fields[1] = Arc::new(Field::new("k", key_type.clone(), true));
+		let mut columns = batch.columns().to_vec();
+		columns[1] = key;
+		RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("adr600 batch")
 	}
 
 	/// ADR 597: the fixture batch with a variable-width `s` column at ordinal 4, its content
@@ -35480,13 +35555,17 @@ mod tests {
 				input: Box::new(plan),
 				partition_count,
 				key: fixture.exchange_key.clone().unwrap_or_else(|| {
-					bound_column_root("k", ColumnOrdinal(1), DataType::Int64, true)
+					bound_column_root("k", ColumnOrdinal(1), fixture.key_type.clone(), true)
 				}),
 			},
 			None => plan,
 		};
 		let scan_input = decompose_streaming_scan_probe_input(&plan).expect("scan input");
-		let probe_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+		let probe_schema = Arc::new(Schema::new(vec![Field::new(
+			"k",
+			fixture.key_type.clone(),
+			false,
+		)]));
 		let build_keys = vec![ColumnOrdinal(1)];
 		let (key_plan, write_keys) = match &fixture.retained {
 			Some(retained) => {
@@ -35536,6 +35615,9 @@ mod tests {
 		)
 		.await
 		.expect("spilled build");
+		if fixture.compact_index {
+			spilled.use_compact_resident_index();
+		}
 		BuildWriteLedger::finish(&mut ledger, BuildWriteChild::Create, create_started);
 		let written = executor
 			.write_streaming_scan_inner_build_batches(
@@ -35935,6 +36017,8 @@ mod tests {
 				exchange_key: None,
 				null_safe_keys,
 				budget: None,
+				compact_index: false,
+				key_type: DataType::Int64,
 			};
 			let batches = adr597_parity_batches();
 			let mut split_ledger = BuildWriteLedger::default();
@@ -36091,6 +36175,8 @@ mod tests {
 				exchange_key,
 				null_safe_keys: false,
 				budget: None,
+				compact_index: false,
+				key_type: DataType::Int64,
 			};
 			let mut control_ledger = BuildWriteLedger::default();
 			let control = adr596_write_with(
@@ -36233,6 +36319,8 @@ mod tests {
 			exchange_key: None,
 			null_safe_keys: false,
 			budget: Some(budget_of(memory)),
+			compact_index: false,
+			key_type: DataType::Int64,
 		};
 		let memory = 32 * 1024u64;
 		let cap = join_spill_retained_footprint_memory_cap(memory);
@@ -36333,6 +36421,265 @@ mod tests {
 			// refusal is on the error's detail, not on the ledger.
 			assert_eq!(ledger.scratch_releases, 0);
 		}
+	}
+
+	// -----------------------------------------------------------------------------------------
+	// ADR 600: the compact resident index on the spilled branch — parity, accounting, lookups.
+	// -----------------------------------------------------------------------------------------
+
+	/// Three batches of 6,000 rows with duplicates within and across batches and nulls: enough
+	/// entries (about 18,000) to force sixteen bucket resizes and the entry vector's growth
+	/// across pages.
+	fn adr600_growth_batches(key_type: &DataType) -> Vec<RecordBatch> {
+		(0..3i64)
+			.map(|batch| {
+				let rows: Vec<(Option<i64>, i64, i64)> = (0..6_000i64)
+					.map(|i| {
+						let k = if i % 500 == 7 {
+							None
+						} else if i % 97 == 0 {
+							Some(i % 300) // repeated within the batch and across batches
+						} else {
+							Some(batch * 10_000 + i)
+						};
+						(k, batch * 100_000 + i, batch)
+					})
+					.collect();
+				adr600_batch_with_key_type(&rows, key_type)
+			})
+			.collect()
+	}
+
+	fn adr600_absent_key(key_type: &DataType, null_safe_keys: bool) -> JoinKey {
+		let probe = adr600_batch_with_key_type(&[(Some(99_999_999), 0, 0)], key_type);
+		let plan = if null_safe_keys || *key_type == DataType::Utf8 {
+			JoinKeyPlan::Generic
+		} else if *key_type == DataType::Int32 {
+			JoinKeyPlan::Int32
+		} else {
+			JoinKeyPlan::Int64
+		};
+		let arrays = key_arrays(&probe, &[ColumnOrdinal(1)]).unwrap();
+		join_key_at(plan, &arrays, 0, null_safe_keys)
+			.unwrap()
+			.unwrap()
+	}
+
+	// ADR 600: over every variant the call activates — Int64, Int32, and a generic key, each
+	// under both null-safety settings — the legacy index and the compact wrapper return the
+	// same complete rows for every key (duplicates, nulls, an absent key) with growth across
+	// pages; each build reports its mode and variant as separate facts.
+	#[tokio::test]
+	async fn adr600_the_compact_wrapper_returns_the_same_rows_as_the_legacy_index_on_every_variant()
+	{
+		for (key_type, null_safe_keys, expected_variant) in [
+			(DataType::Int64, false, "int64"),
+			(DataType::Int64, true, "hash"),
+			(DataType::Int32, false, "int32"),
+			(DataType::Int32, true, "hash"),
+			(DataType::Utf8, false, "hash"),
+			(DataType::Utf8, true, "hash"),
+		] {
+			let label = format!("{key_type:?} null_safe={null_safe_keys}");
+			let batches = adr600_growth_batches(&key_type);
+			let fixture = |compact_index: bool| Adr596Fixture {
+				batches: batches.clone(),
+				filter: false,
+				exchange: Some(4),
+				retained: None,
+				row_limit: None,
+				exchange_key: None,
+				null_safe_keys,
+				budget: None,
+				compact_index,
+				key_type: key_type.clone(),
+			};
+			let mut legacy_ledger = BuildWriteLedger::default();
+			let (legacy_rows, legacy_pages, _, mut legacy) = adr596_write_with(
+				&fixture(false),
+				ExchangeHandling::Split,
+				Some(&mut legacy_ledger),
+			)
+			.await
+			.expect("legacy write");
+			let mut compact_ledger = BuildWriteLedger::default();
+			let (compact_rows, compact_pages, _, mut compact) = adr596_write_with(
+				&fixture(true),
+				ExchangeHandling::Split,
+				Some(&mut compact_ledger),
+			)
+			.await
+			.expect("compact write");
+			assert_eq!(
+				(legacy_rows, legacy_pages),
+				(compact_rows, compact_pages),
+				"{label}"
+			);
+			assert_eq!(
+				legacy_ledger.index_entries, compact_ledger.index_entries,
+				"{label}"
+			);
+			assert_eq!(legacy_ledger.index_mode, Some("legacy"), "{label}");
+			assert_eq!(legacy_ledger.index_variant, Some("hash"), "{label}");
+			assert_eq!(compact_ledger.index_mode, Some("compact"), "{label}");
+			assert_eq!(
+				compact_ledger.index_variant,
+				Some(expected_variant),
+				"{label}"
+			);
+			assert!(
+				legacy_pages >= 3,
+				"{label}: growth across pages ({legacy_pages} pages)"
+			);
+			assert!(
+				compact_ledger.index_entries > 17_000,
+				"{label}: {} entries, enough for sixteen resizes",
+				compact_ledger.index_entries
+			);
+			let plan = if null_safe_keys || key_type == DataType::Utf8 {
+				JoinKeyPlan::Generic
+			} else if key_type == DataType::Int32 {
+				JoinKeyPlan::Int32
+			} else {
+				JoinKeyPlan::Int64
+			};
+			let keys = adr597_distinct_keys(&batches, plan, null_safe_keys);
+			assert!(keys.len() > 17_000, "{label}: {} distinct keys", keys.len());
+			let mut repeated = 0usize;
+			for key in &keys {
+				let legacy_rows = adr597_rows_for_key(&mut legacy, key).await;
+				let compact_rows = adr597_rows_for_key(&mut compact, key).await;
+				assert!(
+					!legacy_rows.is_empty(),
+					"{label}: {key:?} on the legacy build"
+				);
+				assert_eq!(legacy_rows, compact_rows, "{label}: {key:?}");
+				if legacy_rows.len() > 1 {
+					repeated += 1;
+				}
+			}
+			assert!(repeated >= 50, "{label}: {repeated} repeated keys compared");
+			let absent = adr600_absent_key(&key_type, null_safe_keys);
+			assert!(
+				adr597_rows_for_key(&mut legacy, &absent).await.is_empty(),
+				"{label}"
+			);
+			assert!(
+				adr597_rows_for_key(&mut compact, &absent).await.is_empty(),
+				"{label}"
+			);
+			if !null_safe_keys {
+				// The null rows are written but not indexed on either build.
+				assert_eq!(legacy_ledger.index_entries, legacy_rows - 36, "{label}");
+			}
+			legacy.cleanup().await;
+			compact.cleanup().await;
+		}
+	}
+
+	// ADR 600: the compact index's accounted bytes are its obtained capacities times the
+	// sizes of its parts; a build whose accounted index crosses the cap is refused at the
+	// page's guard on the compact path as on the legacy one, its file removed by the branch's
+	// cleanup and no runtime returned.
+	#[tokio::test]
+	async fn adr600_the_compact_index_is_accounted_from_obtained_capacities_and_guarded() {
+		let batches = adr600_growth_batches(&DataType::Int64);
+		let fixture = |compact_index: bool, budget: Option<TaskBudget>| Adr596Fixture {
+			batches: batches.clone(),
+			filter: false,
+			exchange: Some(4),
+			retained: None,
+			row_limit: None,
+			exchange_key: None,
+			null_safe_keys: false,
+			budget,
+			compact_index,
+			key_type: DataType::Int64,
+		};
+		let (_, _, _, compact) =
+			adr596_write_with(&fixture(true, None), ExchangeHandling::Split, None)
+				.await
+				.expect("compact write");
+		let (bucket_len, entries_capacity, overflow_heap_bytes, accounted) = compact
+			.compact_index_accounting_parts()
+			.expect("the compact index is in use");
+		assert_eq!(
+			accounted,
+			(bucket_len * std::mem::size_of::<u32>()
+				+ entries_capacity * SpilledInnerJoinBuild::compact_int64_entry_size()) as u64
+				+ overflow_heap_bytes,
+			"accounted bytes are the obtained bucket length and entry capacity times their sizes, plus the repeated keys' overflow heap"
+		);
+		assert!(overflow_heap_bytes > 0, "repeated keys carry overflow refs");
+		assert!(bucket_len.is_power_of_two() && bucket_len >= 2 * 17_000);
+		assert_eq!(compact.resident_index_bytes(), accounted);
+		compact.cleanup().await;
+		// A cap the growing index crosses: 16 × the task memory is the retained cap; 8 KB of
+		// memory admits 128 KB, which the index passes on its first pages.
+		let tight = TaskBudget {
+			memory: ByteCount::new(8 * 1024),
+			spill_bytes: ByteCount::new(64 * 1024 * 1024),
+			..TaskBudget::from_query_budget(QueryBudget::test_default())
+		};
+		for compact_index in [true, false] {
+			let (error, pages_at_refusal, path) = match adr596_write_with(
+				&fixture(compact_index, Some(tight)),
+				ExchangeHandling::Split,
+				None,
+			)
+			.await
+			{
+				Err(refused) => refused,
+				Ok((rows, pages, ..)) => {
+					panic!("compact={compact_index}: admitted {rows} rows over {pages} pages")
+				}
+			};
+			let ExecutionError::BudgetExhausted {
+				dimension, detail, ..
+			} = &error
+			else {
+				panic!("expected a budget error, got {error}");
+			};
+			assert_eq!(*dimension, BudgetDimension::Memory);
+			assert!(detail.to_string().contains("site=write"), "{detail}");
+			assert!(
+				pages_at_refusal >= 1,
+				"compact={compact_index}: refused at page {pages_at_refusal}"
+			);
+			assert!(
+				!path.exists(),
+				"compact={compact_index}: the spill file is gone"
+			);
+		}
+	}
+
+	// ADR 600: lookups are counted only when enabled — hits and misses apart, through the real
+	// lookup path — and a build that never enabled counting reports none.
+	#[tokio::test]
+	async fn adr600_lookups_are_counted_only_when_enabled_through_the_real_lookup_path() {
+		let batches = adr597_parity_batches();
+		let fixture = Adr596Fixture::plain(batches.clone(), false, Some(4), None, None);
+		let (_, _, _, mut counted) = adr596_write_with(&fixture, ExchangeHandling::Split, None)
+			.await
+			.expect("write");
+		assert_eq!(counted.lookup_counts(), None, "not enabled: no counts");
+		counted.enable_lookup_counting();
+		let keys = adr597_distinct_keys(&batches, JoinKeyPlan::Int64, false);
+		for key in &keys {
+			let _ = adr597_rows_for_key(&mut counted, key).await;
+		}
+		let _ = adr597_rows_for_key(&mut counted, &JoinKey::Int64(99)).await;
+		let _ = adr597_rows_for_key(&mut counted, &JoinKey::Int64(98)).await;
+		assert_eq!(counted.lookup_counts(), Some((keys.len() as u64, 2)));
+		counted.cleanup().await;
+		let (_, _, _, mut uncounted) = adr596_write_with(&fixture, ExchangeHandling::Split, None)
+			.await
+			.expect("write");
+		for key in &keys {
+			let _ = adr597_rows_for_key(&mut uncounted, key).await;
+		}
+		assert_eq!(uncounted.lookup_counts(), None);
+		uncounted.cleanup().await;
 	}
 
 	// ADR 596: the loop with a limit exactly filled by the stream's last batch still observes a
@@ -37222,6 +37569,47 @@ mod tests {
 		assert!(!drain.contains("read_all_batch_pages"));
 
 		assert!(!drain.contains("concat_or_empty"));
+	}
+
+	/// ADR 600: every handler that opens a `cleanup` stage publishes each inner runtime's lookup
+	/// counts before cleaning it up — the reporting half of the counter lives on every route the
+	/// receipt can take, not on one of them (the first mechanism check found it on the reoriented
+	/// chain only, and the measured chain routes through the inner-prefix semi/anti handler).
+	#[test]
+	fn adr600_every_cleanup_stage_publishes_the_lookup_counts_before_cleanup() {
+		let source = include_str!("streaming.rs");
+		let opener = "\"cleanup\", &attribution_telemetry";
+		let mut handlers = 0;
+		let mut from = 0;
+		while let Some(at) = source[from..].find(opener) {
+			let stage_at = from + at;
+			// The final cleanup loop follows the stage's opening; the publication precedes the
+			// runtime's cleanup inside it.
+			let tail = &source[stage_at..];
+			let loop_end = tail
+				.find("runtime.cleanup().await;")
+				.expect("a cleanup loop follows the cleanup stage");
+			let loop_body = &tail[..loop_end];
+			assert!(
+				loop_body.contains("runtime.publish_lookup_counts(handle);"),
+				"the cleanup stage at byte {stage_at} cleans a runtime without publishing its lookup counts"
+			);
+			handlers += 1;
+			from = stage_at + opener.len();
+		}
+		assert_eq!(
+			handlers, 2,
+			"the reoriented chain and the inner-prefix semi/anti handlers"
+		);
+		let prefix = source
+			.find("async fn try_streaming_inner_prefix_semi_anti_grouped_aggregate(")
+			.expect("the inner-prefix semi/anti handler");
+		let prefix_end = source[prefix..]
+			.find("fn partition_at_a_time_replay_spec<")
+			.expect("the next function");
+		assert!(
+			source[prefix..prefix + prefix_end].contains("runtime.publish_lookup_counts(handle);")
+		);
 	}
 
 	/// The file is JSONL, so a reader takes the newest record rather than parsing
