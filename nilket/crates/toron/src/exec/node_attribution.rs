@@ -2863,8 +2863,9 @@ fn build_write_decomposition_band(
 	build_write_band_from_parts(&invocation.inclusive_lifecycle, facts, inner_1_band)
 }
 
-/// The receipt's names for ADR 596's eleven children, in writer order.
-pub const BUILD_WRITE_CHILDREN: [&str; 11] = [
+/// The receipt's names for the build write's children, in writer order: ADR 596's eleven and,
+/// under the `adr601` facts vintage, the finish-built index's reserve and finalization terms.
+pub const BUILD_WRITE_CHILDREN: [&str; 13] = [
 	"build_write_create",
 	"build_write_scan_open",
 	"build_write_scan_poll",
@@ -2876,7 +2877,13 @@ pub const BUILD_WRITE_CHILDREN: [&str; 11] = [
 	"build_write_page_write",
 	"build_write_index",
 	"build_write_finish",
+	"build_write_reserve",
+	"build_write_finish_index",
 ];
+
+/// ADR 601: the two children a receipt carries only when its facts name `index_build`.
+pub const BUILD_WRITE_ADR601_CHILDREN: [&str; 2] =
+	["build_write_reserve", "build_write_finish_index"];
 
 /// ADR 596: re-run the seventh band's reconciliation and consistency rules over a retained
 /// invocation as the profile stores it — the `build_write_*` terms from its
@@ -2932,7 +2939,7 @@ fn build_write_band_from_parts(
 	facts: Option<serde_json::Value>,
 	inner_1_band: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
-	const CHILDREN: [&str; 11] = BUILD_WRITE_CHILDREN;
+	const CHILDREN: [&str; 13] = BUILD_WRITE_CHILDREN;
 	let present: Vec<&InclusiveLifecycleTerm> = CHILDREN
 		.iter()
 		.filter_map(|name| terms.iter().find(|sample| sample.name == *name))
@@ -2943,6 +2950,14 @@ fn build_write_band_from_parts(
 	let Some(facts) = facts else {
 		return Err("build_write band has child terms but no facts".to_string());
 	};
+	// ADR 601: the reserve and finalization terms belong to the vintage whose facts name
+	// `index_build`; an earlier receipt neither carries nor is asked for them.
+	let adr601_facts = facts.get("index_build").is_some();
+	let required: Vec<&str> = CHILDREN
+		.iter()
+		.copied()
+		.filter(|name| adr601_facts || !BUILD_WRITE_ADR601_CHILDREN.contains(name))
+		.collect();
 	let Some(inner_1_band) = inner_1_band else {
 		return Err("build_write band without the inner_1 band".to_string());
 	};
@@ -2953,12 +2968,17 @@ fn build_write_band_from_parts(
 		.get("inner_1_build_write_micros")
 		.and_then(serde_json::Value::as_u64)
 		.ok_or_else(|| "build_write band without inner_1_build_write_micros".to_string())?;
-	if present.len() != CHILDREN.len() {
-		let missing: Vec<&str> = CHILDREN
+	if present.len() != required.len() || present.iter().any(|s| !required.contains(&s.name)) {
+		let missing: Vec<&str> = required
 			.iter()
 			.copied()
 			.filter(|name| !present.iter().any(|sample| sample.name == *name))
 			.collect();
+		if missing.is_empty() {
+			return Err(
+				"build_write band carries the finish-built terms without index_build".to_string(),
+			);
+		}
 		return Err(format!(
 			"build_write band is missing {}",
 			missing.join(", ")
@@ -2989,8 +3009,14 @@ fn build_write_band_from_parts(
 		"build_write_residual_micros".to_string(),
 		serde_json::json!(residual),
 	);
-	const FACTS: [&str; 30] = [
+	const FACTS: [&str; 36] = [
 		"index_variant",
+		"index_build",
+		"index_expected_rows",
+		"index_capacity_growths",
+		"finish_index_entries",
+		"finish_index_duplicates",
+		"finish_index_buckets",
 		"scratch_releases",
 		"exchange_handling",
 		"pass_through_requested",
@@ -3036,7 +3062,13 @@ fn build_write_band_from_parts(
 	let adr597_facts = facts.get("exchange_handling").is_some();
 	band.insert(
 		"build_write_facts_vintage".to_string(),
-		serde_json::json!(if adr597_facts { "adr597" } else { "adr596" }),
+		serde_json::json!(if adr601_facts {
+			"adr601"
+		} else if adr597_facts {
+			"adr597"
+		} else {
+			"adr596"
+		}),
 	);
 	band.insert(
 		"build_write_shape".to_string(),
@@ -3121,6 +3153,65 @@ fn build_write_band_from_parts(
 		for name in CHILDREN {
 			if term_calls(name) == 0 && term_micros(name) != 0 {
 				return Some(format!("{name} has time without a call"));
+			}
+		}
+		// ADR 601: the finish-built form reserves once and finalizes once; the incremental form
+		// takes neither clock. The pass's counts and buckets follow the entries.
+		if adr601_facts {
+			let index_build = facts.get("index_build").and_then(serde_json::Value::as_str);
+			let finish_built = match index_build {
+				Some("finish") => true,
+				Some("incremental" | "none") => false,
+				_ => {
+					return Some(
+						"fact index_build is not finish, incremental, or none".to_string(),
+					);
+				}
+			};
+			let expected_calls = u64::from(finish_built);
+			for name in BUILD_WRITE_ADR601_CHILDREN {
+				if term_calls(name) != expected_calls {
+					return Some(format!(
+						"{name} calls is not {expected_calls} under index_build {}",
+						index_build.unwrap_or_default()
+					));
+				}
+			}
+			let variant = facts
+				.get("index_variant")
+				.and_then(serde_json::Value::as_str);
+			if finish_built {
+				if index_mode != Some("compact") || !matches!(variant, Some("int32" | "int64")) {
+					return Some(format!(
+						"index_build finish under index_mode {} and index_variant {}",
+						index_mode.unwrap_or_default(),
+						variant.unwrap_or_default()
+					));
+				}
+				let (Some(entries), Some(duplicates), Some(buckets)) = (
+					fact_u64("finish_index_entries"),
+					fact_u64("finish_index_duplicates"),
+					fact_u64("finish_index_buckets"),
+				) else {
+					return Some("index_build finish without the finish_index facts".to_string());
+				};
+				if entries.checked_add(duplicates) != Some(count("index_entries")) {
+					return Some(
+						"finish_index_entries plus duplicates disagree with index_entries"
+							.to_string(),
+					);
+				}
+				if buckets == 0 || !buckets.is_power_of_two() || buckets < entries.saturating_mul(2)
+				{
+					return Some(format!(
+						"finish_index_buckets {buckets} is not a power of two at or above twice {entries} entries"
+					));
+				}
+			} else if facts
+				.get("finish_index_entries")
+				.is_some_and(|value| !value.is_null())
+			{
+				return Some("finish_index facts on an incremental index".to_string());
 			}
 		}
 		for name in [
@@ -5319,6 +5410,228 @@ pub(in crate::exec) mod tests {
 				receipt["build_write_inconsistency"]
 			);
 		}
+	}
+
+	/// ADR 601: the two finish-built terms attached beside ADR 596's eleven.
+	fn attach_adr601_terms(
+		invocation: &mut AggregateInvocation,
+		reserve: (u64, u64),
+		finish_index: (u64, u64),
+	) {
+		for (name, (micros, calls)) in BUILD_WRITE_ADR601_CHILDREN
+			.into_iter()
+			.zip([reserve, finish_index])
+		{
+			invocation.inclusive_lifecycle.push(InclusiveLifecycleTerm {
+				name,
+				calls,
+				micros,
+				error: None,
+			});
+		}
+	}
+
+	/// ADR 601: the facts of a finish-built write over ADR 597's split facts.
+	fn adr601_write_facts(index_build: &str) -> serde_json::Value {
+		let mut facts = adr597_write_facts("split", false, None);
+		facts["index_mode"] = serde_json::json!("compact");
+		facts["index_variant"] = serde_json::json!("int64");
+		facts["index_build"] = serde_json::json!(index_build);
+		facts["index_expected_rows"] = serde_json::json!(if index_build == "finish" {
+			Some(50)
+		} else {
+			None
+		});
+		facts["index_capacity_growths"] = serde_json::json!(0);
+		if index_build == "finish" {
+			facts["finish_index_entries"] = serde_json::json!(48);
+			facts["finish_index_duplicates"] = serde_json::json!(2);
+			facts["finish_index_buckets"] = serde_json::json!(128);
+		} else {
+			facts["finish_index_entries"] = serde_json::Value::Null;
+			facts["finish_index_duplicates"] = serde_json::Value::Null;
+			facts["finish_index_buckets"] = serde_json::Value::Null;
+		}
+		facts
+	}
+
+	// ADR 601: the seventh band under the adr601 vintage — thirteen children, the finish-built
+	// form reserving once and finalizing once, the incremental form taking neither clock, the
+	// pass's facts under their rules, and an earlier vintage neither carrying nor asked for
+	// the two terms.
+	#[test]
+	fn adr601_receipt_reads_the_finish_built_terms_and_facts_under_their_rules() {
+		let band_for = |index_build: &str,
+		                reserve: (u64, u64),
+		                finish_index: (u64, u64),
+		                edit: &dyn Fn(&mut serde_json::Value)| {
+			let mut invocation = adr586_invocation();
+			adr589_write_bands(&mut invocation);
+			attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+			let mut facts = adr601_write_facts(index_build);
+			edit(&mut facts);
+			let mut calls = ADR596_CALLS;
+			calls[4] = 3;
+			attach_build_write_band(&mut invocation, ADR596_MICROS, calls, facts);
+			attach_adr601_terms(&mut invocation, reserve, finish_index);
+			inclusive_lifecycle_receipt_value(&invocation, 1_200)
+		};
+		let none = |_: &mut serde_json::Value| {};
+		// The finish-built form: both clocks once, the facts consistent, the residual over
+		// thirteen children.
+		let receipt = band_for("finish", (1, 1), (1, 1), &none);
+		assert_eq!(receipt["build_write_facts_consistent"], true, "{receipt}");
+		assert_eq!(receipt["build_write_facts_vintage"], "adr601");
+		assert_eq!(receipt["build_write_index_build"], "finish");
+		assert_eq!(receipt["build_write_finish_index_entries"], 48);
+		assert_eq!(receipt["build_write_finish_index_duplicates"], 2);
+		assert_eq!(receipt["build_write_finish_index_buckets"], 128);
+		assert_eq!(receipt["build_write_reserve_calls"], 1);
+		assert_eq!(receipt["build_write_finish_index_calls"], 1);
+		assert_eq!(receipt["build_write_finish_index_micros"], 1);
+		let eleven: u64 = ADR596_MICROS.iter().sum();
+		assert_eq!(
+			receipt["build_write_residual_micros"],
+			55 - eleven - 1 - 1,
+			"the residual is the parent less all thirteen children"
+		);
+		// The incremental form: neither clock, no time, no finalization facts.
+		let receipt = band_for("incremental", (0, 0), (0, 0), &none);
+		assert_eq!(receipt["build_write_facts_consistent"], true, "{receipt}");
+		assert_eq!(receipt["build_write_index_build"], "incremental");
+		assert_eq!(
+			receipt["build_write_finish_index_entries"],
+			serde_json::Value::Null
+		);
+		assert_eq!(receipt["build_write_reserve_calls"], 0);
+		// Each rule has the case that breaks exactly it.
+		for (label, index_build, reserve, finish_index, edit, expected) in [
+			(
+				"a clock on the incremental form",
+				"incremental",
+				(1u64, 1u64),
+				(0u64, 0u64),
+				Box::new(none) as Box<dyn Fn(&mut serde_json::Value)>,
+				"build_write_reserve calls is not 0",
+			),
+			(
+				"time without a call",
+				"incremental",
+				(1, 0),
+				(0, 0),
+				Box::new(none),
+				"build_write_reserve has time without a call",
+			),
+			(
+				"a finish-built form without its finalization",
+				"finish",
+				(1, 1),
+				(0, 0),
+				Box::new(none),
+				"build_write_finish_index calls is not 1",
+			),
+			(
+				"finish under the legacy mode",
+				"finish",
+				(1, 1),
+				(1, 1),
+				Box::new(|facts: &mut serde_json::Value| {
+					facts["index_mode"] = serde_json::json!("legacy");
+					facts["index_variant"] = serde_json::json!("hash");
+				}),
+				"index_build finish under index_mode legacy",
+			),
+			(
+				"entries and duplicates against the entries",
+				"finish",
+				(1, 1),
+				(1, 1),
+				Box::new(|facts: &mut serde_json::Value| {
+					facts["finish_index_duplicates"] = serde_json::json!(3);
+				}),
+				"finish_index_entries plus duplicates disagree",
+			),
+			(
+				"buckets below twice the entries",
+				"finish",
+				(1, 1),
+				(1, 1),
+				Box::new(|facts: &mut serde_json::Value| {
+					facts["finish_index_buckets"] = serde_json::json!(64);
+				}),
+				"not a power of two at or above twice",
+			),
+			(
+				"buckets not a power of two",
+				"finish",
+				(1, 1),
+				(1, 1),
+				Box::new(|facts: &mut serde_json::Value| {
+					facts["finish_index_buckets"] = serde_json::json!(100);
+				}),
+				"not a power of two",
+			),
+			(
+				"finish facts on the incremental form",
+				"incremental",
+				(0, 0),
+				(0, 0),
+				Box::new(|facts: &mut serde_json::Value| {
+					facts["finish_index_entries"] = serde_json::json!(5);
+				}),
+				"finish_index facts on an incremental index",
+			),
+			(
+				"an unknown form",
+				"sometime",
+				(0, 0),
+				(0, 0),
+				Box::new(none),
+				"fact index_build is not finish, incremental, or none",
+			),
+		] {
+			let receipt = band_for(index_build, reserve, finish_index, edit.as_ref());
+			assert_eq!(
+				receipt["build_write_facts_consistent"], false,
+				"{label}: {receipt}"
+			);
+			assert!(
+				receipt["build_write_inconsistency"]
+					.as_str()
+					.unwrap_or_default()
+					.contains(expected),
+				"{label}: {}",
+				receipt["build_write_inconsistency"]
+			);
+		}
+		// An earlier vintage: eleven children, the two terms neither present nor required;
+		// carrying them without `index_build` is a defect.
+		let mut invocation = adr586_invocation();
+		adr589_write_bands(&mut invocation);
+		attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+		let mut calls = ADR596_CALLS;
+		calls[4] = 3;
+		attach_build_write_band(
+			&mut invocation,
+			ADR596_MICROS,
+			calls,
+			adr597_write_facts("split", false, None),
+		);
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["build_write_facts_vintage"], "adr597");
+		assert_eq!(receipt["build_write_facts_consistent"], true, "{receipt}");
+		assert_eq!(receipt["build_write_residual_micros"], 55 - eleven);
+		assert!(receipt.get("build_write_reserve_calls").is_none());
+		attach_adr601_terms(&mut invocation, (0, 0), (0, 0));
+		let receipt = inclusive_lifecycle_receipt_value(&invocation, 1_200);
+		assert_eq!(receipt["status"], "instrument_defect", "{receipt}");
+		assert!(
+			receipt["error"]
+				.as_str()
+				.unwrap_or_default()
+				.contains("without index_build"),
+			"{receipt}"
+		);
 	}
 
 	// ADR 596: each consistency rule is conditional on the facts it depends on and has a case

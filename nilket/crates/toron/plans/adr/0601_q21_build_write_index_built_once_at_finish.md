@@ -1,6 +1,20 @@
 # ADR 601 - q21's replay-1 build write: the compact index built once, at finish
 
-**Status:** PROPOSED. Successor to ADR 600, which retained the compact
+**Status:** CLOSED, RETAINED. One paired attempt on strix under the
+declared gate procedure (results in
+`plans/impl/0601_q21_build_write_index_built_once_at_finish_results.md`):
+the gate admitted after the 5 s wait (entry 50 °C, gate 37 °C, load
+0.16), separation and window verified, digest parity on all twelve
+rows, every pair positive — median gain 148.2 ms (1.84%) — against a
+bar of 59.3 ms (2 × the 29.7 ms control range): `retained` under ADR
+588's rule; the one token stays. The mechanism check on the treatment
+read `index_build = finish`, 5,845,938 entries, no duplicate, 2²⁴
+buckets, no growth, a resident peak of 207,482,040 bytes,
+`build_write_finish_index` at 110.9 median-scaled ms, the index child
+at 37.9, `inner_1_build_write` at 535.9, and replay 1's lookups —
+14,656,608 hits, 15,686,933 misses — under an off range of 8.54% that
+closed ADR 596's owner rule on variability; the terms are readings.
+Successor to ADR 600, which retained the compact
 resident index on the spilled branch (median paired gain 559.7 ms,
 6.23% of q21) and measured its index child at 303.9 median-scaled ms on
 the treatment's mechanism check, with `inner_1_build_write` at 688.7.
