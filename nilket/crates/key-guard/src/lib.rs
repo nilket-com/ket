@@ -797,9 +797,9 @@ mod directory {
 }
 
 /// Windows-only helpers for a same-user named pipe (ADR 0166 §4): a
-/// self-relative security descriptor whose DACL admits the running user,
-/// `SYSTEM`, and `BUILTIN\Administrators`, and a check that a connected
-/// pipe client's token belongs to the running user.
+/// self-relative security descriptor owned by and admitting the running user
+/// alone, and a check that a connected pipe client's token belongs to the
+/// running user.
 #[cfg(windows)]
 pub mod windows {
 	use super::KeyAccessError;
@@ -858,13 +858,16 @@ pub mod windows {
 		})
 	}
 
-	/// A protected DACL admitting the running user alone, for creating the
-	/// agent pipe. The descriptor bytes; keep them alive for as long as the
-	/// `SECURITY_ATTRIBUTES` that points at them.
+	/// Returns the bytes of a descriptor for creating the agent pipe: owned by
+	/// the running user, with a protected DACL admitting that user alone. The
+	/// owner is explicit because, left unset, an elevated administrator's
+	/// token makes `BUILTIN\Administrators` the pipe's ordinary owner. Keep
+	/// the bytes alive for as long as the `SECURITY_ATTRIBUTES` that points at
+	/// them.
 	pub fn current_user_only_security_descriptor() -> Result<Vec<u8>, KeyAccessError> {
 		let principals = current_principals()?;
 		let user = sid_string(&principals.user)?;
-		let sddl = format!("D:P(A;;GA;;;{user})");
+		let sddl = format!("O:{user}D:P(A;;GA;;;{user})");
 		let mut wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
 		let mut descriptor: *mut core::ffi::c_void = ptr::null_mut();
 		let mut size = 0_u32;
