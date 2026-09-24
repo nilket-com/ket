@@ -226,18 +226,19 @@ fn ensure_supported_schema(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)] // PRODUCT-0098 names the three family-admission policies explicitly.
 enum FamilyAdmissionPolicy {
-	InitialClosed,
-	AreaClosed,
-	Extensible,
+	InitialClosedFamilies,
+	AreaClosedFamilies,
+	ExtensibleFamilies,
 }
 
 impl FamilyAdmissionPolicy {
 	fn for_schema(schema_version: u32) -> Result<Self, SessionPersistenceError> {
 		match schema_version {
-			INITIAL_CLOSED_SCHEMA => Ok(Self::InitialClosed),
-			AREA_CLOSED_SCHEMA => Ok(Self::AreaClosed),
-			3..=SCHEMA_VERSION => Ok(Self::Extensible),
+			INITIAL_CLOSED_SCHEMA => Ok(Self::InitialClosedFamilies),
+			AREA_CLOSED_SCHEMA => Ok(Self::AreaClosedFamilies),
+			3..=SCHEMA_VERSION => Ok(Self::ExtensibleFamilies),
 			other => Err(SessionPersistenceError::refused(format!(
 				"unsupported schema version {other}"
 			))),
@@ -246,11 +247,11 @@ impl FamilyAdmissionPolicy {
 
 	fn admits(self, family: &AuthoredFamilyId) -> bool {
 		match self {
-			Self::InitialClosed => matches!(family.as_str(), "scatter" | "bar" | "line"),
-			Self::AreaClosed => {
+			Self::InitialClosedFamilies => matches!(family.as_str(), "scatter" | "bar" | "line"),
+			Self::AreaClosedFamilies => {
 				matches!(family.as_str(), "scatter" | "bar" | "line" | "area")
 			}
-			Self::Extensible => true,
+			Self::ExtensibleFamilies => true,
 		}
 	}
 }

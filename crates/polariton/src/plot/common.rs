@@ -1117,6 +1117,7 @@ impl TickPlacement {
 		}
 	}
 
+	#[allow(clippy::manual_saturating_arithmetic)] // PRODUCT-0039 pins checked capacity arithmetic and its overflow result.
 	pub fn minor_positions(
 		self,
 		major: &[f64],
@@ -1127,8 +1128,10 @@ impl TickPlacement {
 		}
 		let major_count = major.len();
 		let interval_count = major_count.saturating_sub(1);
-		let minor_count = interval_count.saturating_mul(minor_intervals as usize);
-		let total = major_count.saturating_add(minor_count);
+		let minor_count = interval_count
+			.checked_mul(minor_intervals as usize)
+			.unwrap_or(usize::MAX);
+		let total = major_count.checked_add(minor_count).unwrap_or(usize::MAX);
 		if total > MAX_GENERATED_TICK_POSITIONS {
 			return Err(TickPlacementError::MinorCapacity {
 				placement: self,
