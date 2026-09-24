@@ -25,6 +25,13 @@ pub enum PlotPaneMsg {
 	RasterCompleted(crate::plot::raster::RasterCompletion),
 	ToggleSettingsInspector,
 	SettingChanged(SettingKey, String),
+	#[cfg_attr(
+		not(feature = "toron"),
+		allow(
+			dead_code,
+			reason = "only the Toron source write-back reads the submission"
+		)
+	)]
 	SettingSubmitted(SettingKey, Option<String>),
 	SettingReset(SettingKey),
 	CancelSettingPreview,
@@ -52,9 +59,10 @@ impl PlotPaneMsg {
 }
 
 fn default_application_plot_settings() -> PlotSettingsLayer {
-	let mut settings = PlotSettingsLayer::default();
-	settings.theme = Override::Set(PlotThemeSpec::default());
-	settings
+	PlotSettingsLayer {
+		theme: Override::Set(PlotThemeSpec::default()),
+		..PlotSettingsLayer::default()
+	}
 }
 
 fn host_plot_settings_model(
@@ -102,6 +110,13 @@ pub struct HostPlotState {
 }
 
 #[derive(Clone)]
+#[cfg_attr(
+	not(feature = "toron"),
+	allow(
+		dead_code,
+		reason = "only the Toron source write-back reads the snapshot"
+	)
+)]
 struct PlotStateSnapshot {
 	display_label: String,
 	kernel: Arc<dyn PlotKernel + Send + Sync>,
@@ -114,6 +129,7 @@ struct PlotStateSnapshot {
 }
 
 impl HostPlotState {
+	#[cfg(any(test, feature = "toron"))]
 	pub(crate) fn writeback_attachment(&self) -> Option<&PlotSourceAttachment> {
 		self.authoritative_before_preview
 			.as_ref()
@@ -121,6 +137,7 @@ impl HostPlotState {
 			.or(self.source_attachment.as_ref())
 	}
 
+	#[cfg(feature = "toron")]
 	pub(crate) fn writeback_settings_model(&self) -> &PlotSettings {
 		self.authoritative_before_preview
 			.as_ref()
@@ -168,6 +185,7 @@ impl HostPlotState {
 		}
 	}
 
+	#[cfg(any(test, feature = "toron"))]
 	pub(crate) fn new_with_source(
 		display_label: String,
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
@@ -299,6 +317,7 @@ impl HostPlotState {
 		Ok(true)
 	}
 
+	#[cfg(any(test, feature = "toron"))]
 	pub(crate) fn show_source_preview(
 		&mut self,
 		display_label: String,
@@ -333,6 +352,7 @@ impl HostPlotState {
 		self.writeback_status = Some("preview".to_owned());
 	}
 
+	#[cfg(any(test, feature = "toron"))]
 	pub(crate) fn discard_source_preview(&mut self) {
 		let Some(authoritative) = self.authoritative_before_preview.take() else {
 			self.setting_drafts.clear();
@@ -357,6 +377,7 @@ impl HostPlotState {
 		self.writeback_status = None;
 	}
 
+	#[cfg(any(test, feature = "toron"))]
 	pub(crate) fn promote_source_preview(
 		&mut self,
 		new_generation: libaryon::core::StateId,
@@ -388,6 +409,7 @@ impl HostPlotState {
 		true
 	}
 
+	#[cfg(any(test, feature = "toron"))]
 	pub(crate) fn replace_with_source(
 		&mut self,
 		display_label: String,

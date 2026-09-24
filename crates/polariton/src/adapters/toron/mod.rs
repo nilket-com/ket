@@ -6,7 +6,7 @@ use crate::result_artifact::{ArrowNullabilityPolicy, ResultArtifact};
 use async_trait::async_trait;
 
 mod target;
-pub use target::{ToronTarget, ToronTls, describe_connect_error, target_from_fields};
+pub use target::{ToronTarget, describe_connect_error, target_from_fields};
 
 const fn text(key: &'static str, placeholder: &'static str, optional: bool) -> AdapterField {
 	AdapterField {
@@ -95,6 +95,9 @@ pub struct ToronAdapter {
 }
 
 impl ToronAdapter {
+	/// The loopback connection local supervision makes; remote desktops
+	/// connect through `AdapterState::connect` instead.
+	#[cfg(any(test, toron_local))]
 	pub async fn connect(endpoint: &str) -> Result<Self, toron_client::ClientError> {
 		let client = toron_client::ToronClient::loopback(endpoint)?;
 		client.health().await?;
@@ -857,7 +860,9 @@ mod tests {
 		assert_eq!(receipt.rows_written, ROWS as u64);
 
 		println!("\narm,fixture,path,projected_cols,bound,median_ms,rows_per_second");
-		let arms: &[(&str, &str, &str, usize, &str, Option<String>)] = &[
+		// arm, fixture, path, projected columns, bound, optional source override
+		type Arm<'a> = (&'a str, &'a str, &'a str, usize, &'a str, Option<String>);
+		let arms: &[Arm] = &[
 			("A", "2xFloat64", "rune", 2, "none", None),
 			(
 				"B",

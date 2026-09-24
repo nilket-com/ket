@@ -726,255 +726,6 @@ pub fn styled_text_input<'a, Message: Clone + 'a>(
 		})
 }
 
-#[cfg(test)]
-mod tests {
-	use super::{app_status_bar, build_menu_roots};
-	use crate::adapters::driver::AdapterState;
-	use crate::gui::menu::MenuItem;
-
-	fn action_ids(saved_session: bool, close_without_checkpoint: bool) -> Vec<String> {
-		build_menu_roots(saved_session, close_without_checkpoint, None)
-			.into_iter()
-			.flat_map(|root| root.items)
-			.filter_map(|item| match item {
-				MenuItem::Action { id, .. } => Some(id),
-				MenuItem::Submenu { .. } | MenuItem::Separator => None,
-			})
-			.collect()
-	}
-
-	#[test]
-	fn product_0063_session_menu_exists_only_for_saved_authority() {
-		let ephemeral = action_ids(false, false);
-		assert!(!ephemeral.iter().any(|id| id.starts_with("session:")));
-
-		let saved = action_ids(true, false);
-		assert!(saved.contains(&"session:checkpoint".to_owned()));
-		assert!(saved.contains(&"session:copy-id".to_owned()));
-		assert!(!saved.contains(&"session:close-without-checkpoint".to_owned()));
-
-		let failed_close = action_ids(true, true);
-		assert!(failed_close.contains(&"session:close-without-checkpoint".to_owned()));
-	}
-
-	/// PRODUCT-0135 stage 3: the Code menu gained exactly the cancel action —
-	/// the stage 0 census pinned the pre-arc pair this stage deliberately
-	/// extends.
-	#[test]
-	fn product_0135_code_menu_offers_the_run_and_cancel_actions() {
-		let roots = build_menu_roots(false, false, None);
-		let code = roots
-			.iter()
-			.find(|root| root.id == "code")
-			.expect("Code menu exists");
-		let ids: Vec<&str> = code
-			.items
-			.iter()
-			.filter_map(|item| match item {
-				MenuItem::Action { id, .. } => Some(id.as_str()),
-				MenuItem::Submenu { .. } | MenuItem::Separator => None,
-			})
-			.collect();
-		assert_eq!(ids, ["code:run", "code:run-snippet", "code:cancel"]);
-	}
-
-	/// PRODUCT-0135 §6: the Cancel affordance exists only while a run is in
-	/// flight, rendered in the right lane beside the timer.
-	#[test]
-	fn product_0135_cancel_affordance_is_bound_to_an_in_flight_run() {
-		use crate::gui::statusbar::Segment;
-		let adapter = AdapterState::default();
-		let idle = app_status_bar("", "", None, None, None, &adapter, false, false);
-		let (_, right) = idle.lanes_for_tests();
-		assert!(
-			!right
-				.iter()
-				.any(|segment| matches!(segment, Segment::Action { .. })),
-			"no affordance while nothing runs"
-		);
-		let running = app_status_bar("", "", None, None, Some(1), &adapter, false, true);
-		let (_, right) = running.lanes_for_tests();
-		assert!(
-			right
-				.iter()
-				.any(|segment| matches!(segment, Segment::Action { id, .. } if id == "sql:cancel")),
-			"the affordance renders while a run is in flight"
-		);
-	}
-
-	/// PRODUCT-0134 stage 4: the Connect menu's saved-profile surface. Locked,
-	/// the store cannot list names (they live inside the ciphertext), so one
-	/// action requests access. Unlocked, every profile is addressable for
-	/// connect, edit, and delete — and `connect:new` stays first, an unsaved
-	/// session-scoped connection.
-	#[test]
-	fn product_0134_connect_menu_offers_the_saved_profile_surface() {
-		fn connect_root(profile_names: Option<Vec<String>>) -> super::MenuRoot {
-			build_menu_roots(false, false, profile_names)
-				.into_iter()
-				.find(|root| root.id == "connect")
-				.expect("Connect menu exists")
-		}
-		fn all_ids(items: &[MenuItem], ids: &mut Vec<String>) {
-			for item in items {
-				match item {
-					MenuItem::Action { id, .. } => ids.push(id.clone()),
-					MenuItem::Submenu { id, items, .. } => {
-						ids.push(id.clone());
-						all_ids(items, ids);
-					}
-					MenuItem::Separator => {}
-				}
-			}
-		}
-
-		let locked = connect_root(None);
-		let mut ids = Vec::new();
-		all_ids(&locked.items, &mut ids);
-		assert_eq!(
-			ids,
-			[
-				"connect:new",
-				"connect:save-profile",
-				"connect:disconnect",
-				"connect:profiles"
-			],
-			"a locked store offers exactly one access-requesting action; disconnect is the human form of the disconnect command (ADR 0166)"
-		);
-
-		let empty = connect_root(Some(Vec::new()));
-		let mut ids = Vec::new();
-		all_ids(&empty.items, &mut ids);
-		assert!(ids.contains(&"connect:profiles-none".to_owned()));
-
-		let listed = connect_root(Some(vec!["prod".to_owned()]));
-		let mut ids = Vec::new();
-		all_ids(&listed.items, &mut ids);
-		assert_eq!(ids[0], "connect:new");
-		for expected in [
-			"connect:profile-connect:prod",
-			"connect:profile-edit:prod",
-			"connect:profile-delete:prod",
-		] {
-			assert!(ids.contains(&expected.to_owned()), "{expected} missing");
-		}
-	}
-
-	#[test]
-	fn product_0154_plot_menu_is_publish_and_the_three_export_actions() {
-		fn collect(items: &[MenuItem], ids: &mut Vec<String>) {
-			for item in items {
-				match item {
-					MenuItem::Action { id, .. } => ids.push(id.clone()),
-					MenuItem::Submenu { items, .. } => collect(items, ids),
-					MenuItem::Separator => {}
-				}
-			}
-		}
-
-		let roots = build_menu_roots(false, false, None);
-		let plot = roots
-			.iter()
-			.find(|root| root.id == "plot")
-			.expect("Plot menu remains as the export surface");
-		let mut ids = Vec::new();
-		collect(&plot.items, &mut ids);
-		assert_eq!(
-			ids,
-			[
-				"plot:agents",
-				"plot:publish",
-				"plot:export:SVG",
-				"plot:export:PNG",
-				"plot:export:AVIF"
-			]
-		);
-		assert!(ids.iter().all(|id| !id.starts_with("plot:new:")));
-	}
-
-	#[test]
-	fn product_0071_durable_session_segment_names_attachment_not_freshness() {
-		let adapter = AdapterState::default();
-		let ephemeral = app_status_bar("", "", None, None, None, &adapter, false, false);
-		let durable = app_status_bar("", "", None, None, None, &adapter, true, false);
-		let checkpointed = app_status_bar(
-			"Session checkpointed",
-			"",
-			None,
-			None,
-			None,
-			&adapter,
-			true,
-			false,
-		);
-		let failed = app_status_bar(
-			"",
-			"checkpoint failed",
-			None,
-			None,
-			None,
-			&adapter,
-			true,
-			false,
-		);
-
-		let durable_segment = ("left", "durable session");
-		assert!(
-			!ephemeral
-				.product_0071_text_segments()
-				.contains(&durable_segment),
-			"ephemeral authority must not render the durable attachment segment"
-		);
-		for (label, bar) in [
-			("ordinary", durable),
-			("checkpointed", checkpointed),
-			("failed", failed),
-		] {
-			let segments = bar.product_0071_text_segments();
-			assert_eq!(
-				segments
-					.iter()
-					.filter(|segment| **segment == durable_segment)
-					.count(),
-				1,
-				"{label} durable authority must expose exactly one attachment segment"
-			);
-			assert!(
-				segments
-					.iter()
-					.filter(|(lane, _)| *lane == "left")
-					.map(|(_, text)| text.to_ascii_lowercase())
-					.all(|text| ["saved", "clean", "dirty"]
-						.iter()
-						.all(|claim| !text.contains(claim))),
-				"persistent attachment chrome must not claim publication freshness"
-			);
-		}
-	}
-
-	#[test]
-	fn product_0071_session_menu_keeps_identity_behind_the_copy_action() {
-		let roots = build_menu_roots(true, false, None);
-		let session = roots
-			.iter()
-			.find(|root| root.id == "session")
-			.expect("saved authority has one Session menu");
-		let labels = session
-			.items
-			.iter()
-			.map(|item| match item {
-				MenuItem::Action { label, .. } | MenuItem::Submenu { label, .. } => label.as_str(),
-				MenuItem::Separator => "<separator>",
-			})
-			.collect::<Vec<_>>();
-		assert_eq!(labels, ["Checkpoint", "Copy session ID"]);
-		assert!(
-			labels.iter().all(|label| !label.contains("12345678")),
-			"the menu names the exact-copy action without displaying identity bytes"
-		);
-	}
-}
-
 fn styled_resize_area<'a, WT: Into<Length>, HT: Into<Length>>(
 	width: WT,
 	height: HT,
@@ -1406,4 +1157,253 @@ pub fn adapter_configuration_view(adapter_state: &AdapterState) -> Element<'stat
 		space::vertical().height(FillPortion((100 - MODAL_FILL_PORTION_V) / 2)),
 	]
 	.into()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{app_status_bar, build_menu_roots};
+	use crate::adapters::driver::AdapterState;
+	use crate::gui::menu::MenuItem;
+
+	fn action_ids(saved_session: bool, close_without_checkpoint: bool) -> Vec<String> {
+		build_menu_roots(saved_session, close_without_checkpoint, None)
+			.into_iter()
+			.flat_map(|root| root.items)
+			.filter_map(|item| match item {
+				MenuItem::Action { id, .. } => Some(id),
+				MenuItem::Submenu { .. } | MenuItem::Separator => None,
+			})
+			.collect()
+	}
+
+	#[test]
+	fn product_0063_session_menu_exists_only_for_saved_authority() {
+		let ephemeral = action_ids(false, false);
+		assert!(!ephemeral.iter().any(|id| id.starts_with("session:")));
+
+		let saved = action_ids(true, false);
+		assert!(saved.contains(&"session:checkpoint".to_owned()));
+		assert!(saved.contains(&"session:copy-id".to_owned()));
+		assert!(!saved.contains(&"session:close-without-checkpoint".to_owned()));
+
+		let failed_close = action_ids(true, true);
+		assert!(failed_close.contains(&"session:close-without-checkpoint".to_owned()));
+	}
+
+	/// PRODUCT-0135 stage 3: the Code menu gained exactly the cancel action —
+	/// the stage 0 census pinned the pre-arc pair this stage deliberately
+	/// extends.
+	#[test]
+	fn product_0135_code_menu_offers_the_run_and_cancel_actions() {
+		let roots = build_menu_roots(false, false, None);
+		let code = roots
+			.iter()
+			.find(|root| root.id == "code")
+			.expect("Code menu exists");
+		let ids: Vec<&str> = code
+			.items
+			.iter()
+			.filter_map(|item| match item {
+				MenuItem::Action { id, .. } => Some(id.as_str()),
+				MenuItem::Submenu { .. } | MenuItem::Separator => None,
+			})
+			.collect();
+		assert_eq!(ids, ["code:run", "code:run-snippet", "code:cancel"]);
+	}
+
+	/// PRODUCT-0135 §6: the Cancel affordance exists only while a run is in
+	/// flight, rendered in the right lane beside the timer.
+	#[test]
+	fn product_0135_cancel_affordance_is_bound_to_an_in_flight_run() {
+		use crate::gui::statusbar::Segment;
+		let adapter = AdapterState::default();
+		let idle = app_status_bar("", "", None, None, None, &adapter, false, false);
+		let (_, right) = idle.lanes_for_tests();
+		assert!(
+			!right
+				.iter()
+				.any(|segment| matches!(segment, Segment::Action { .. })),
+			"no affordance while nothing runs"
+		);
+		let running = app_status_bar("", "", None, None, Some(1), &adapter, false, true);
+		let (_, right) = running.lanes_for_tests();
+		assert!(
+			right
+				.iter()
+				.any(|segment| matches!(segment, Segment::Action { id, .. } if id == "sql:cancel")),
+			"the affordance renders while a run is in flight"
+		);
+	}
+
+	/// PRODUCT-0134 stage 4: the Connect menu's saved-profile surface. Locked,
+	/// the store cannot list names (they live inside the ciphertext), so one
+	/// action requests access. Unlocked, every profile is addressable for
+	/// connect, edit, and delete — and `connect:new` stays first, an unsaved
+	/// session-scoped connection.
+	#[test]
+	fn product_0134_connect_menu_offers_the_saved_profile_surface() {
+		fn connect_root(profile_names: Option<Vec<String>>) -> super::MenuRoot {
+			build_menu_roots(false, false, profile_names)
+				.into_iter()
+				.find(|root| root.id == "connect")
+				.expect("Connect menu exists")
+		}
+		fn all_ids(items: &[MenuItem], ids: &mut Vec<String>) {
+			for item in items {
+				match item {
+					MenuItem::Action { id, .. } => ids.push(id.clone()),
+					MenuItem::Submenu { id, items, .. } => {
+						ids.push(id.clone());
+						all_ids(items, ids);
+					}
+					MenuItem::Separator => {}
+				}
+			}
+		}
+
+		let locked = connect_root(None);
+		let mut ids = Vec::new();
+		all_ids(&locked.items, &mut ids);
+		assert_eq!(
+			ids,
+			[
+				"connect:new",
+				"connect:save-profile",
+				"connect:disconnect",
+				"connect:profiles"
+			],
+			"a locked store offers exactly one access-requesting action; disconnect is the human form of the disconnect command (ADR 0166)"
+		);
+
+		let empty = connect_root(Some(Vec::new()));
+		let mut ids = Vec::new();
+		all_ids(&empty.items, &mut ids);
+		assert!(ids.contains(&"connect:profiles-none".to_owned()));
+
+		let listed = connect_root(Some(vec!["prod".to_owned()]));
+		let mut ids = Vec::new();
+		all_ids(&listed.items, &mut ids);
+		assert_eq!(ids[0], "connect:new");
+		for expected in [
+			"connect:profile-connect:prod",
+			"connect:profile-edit:prod",
+			"connect:profile-delete:prod",
+		] {
+			assert!(ids.contains(&expected.to_owned()), "{expected} missing");
+		}
+	}
+
+	#[test]
+	fn product_0154_plot_menu_is_publish_and_the_three_export_actions() {
+		fn collect(items: &[MenuItem], ids: &mut Vec<String>) {
+			for item in items {
+				match item {
+					MenuItem::Action { id, .. } => ids.push(id.clone()),
+					MenuItem::Submenu { items, .. } => collect(items, ids),
+					MenuItem::Separator => {}
+				}
+			}
+		}
+
+		let roots = build_menu_roots(false, false, None);
+		let plot = roots
+			.iter()
+			.find(|root| root.id == "plot")
+			.expect("Plot menu remains as the export surface");
+		let mut ids = Vec::new();
+		collect(&plot.items, &mut ids);
+		assert_eq!(
+			ids,
+			[
+				"plot:agents",
+				"plot:publish",
+				"plot:export:SVG",
+				"plot:export:PNG",
+				"plot:export:AVIF"
+			]
+		);
+		assert!(ids.iter().all(|id| !id.starts_with("plot:new:")));
+	}
+
+	#[test]
+	fn product_0071_durable_session_segment_names_attachment_not_freshness() {
+		let adapter = AdapterState::default();
+		let ephemeral = app_status_bar("", "", None, None, None, &adapter, false, false);
+		let durable = app_status_bar("", "", None, None, None, &adapter, true, false);
+		let checkpointed = app_status_bar(
+			"Session checkpointed",
+			"",
+			None,
+			None,
+			None,
+			&adapter,
+			true,
+			false,
+		);
+		let failed = app_status_bar(
+			"",
+			"checkpoint failed",
+			None,
+			None,
+			None,
+			&adapter,
+			true,
+			false,
+		);
+
+		let durable_segment = ("left", "durable session");
+		assert!(
+			!ephemeral
+				.product_0071_text_segments()
+				.contains(&durable_segment),
+			"ephemeral authority must not render the durable attachment segment"
+		);
+		for (label, bar) in [
+			("ordinary", durable),
+			("checkpointed", checkpointed),
+			("failed", failed),
+		] {
+			let segments = bar.product_0071_text_segments();
+			assert_eq!(
+				segments
+					.iter()
+					.filter(|segment| **segment == durable_segment)
+					.count(),
+				1,
+				"{label} durable authority must expose exactly one attachment segment"
+			);
+			assert!(
+				segments
+					.iter()
+					.filter(|(lane, _)| *lane == "left")
+					.map(|(_, text)| text.to_ascii_lowercase())
+					.all(|text| ["saved", "clean", "dirty"]
+						.iter()
+						.all(|claim| !text.contains(claim))),
+				"persistent attachment chrome must not claim publication freshness"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0071_session_menu_keeps_identity_behind_the_copy_action() {
+		let roots = build_menu_roots(true, false, None);
+		let session = roots
+			.iter()
+			.find(|root| root.id == "session")
+			.expect("saved authority has one Session menu");
+		let labels = session
+			.items
+			.iter()
+			.map(|item| match item {
+				MenuItem::Action { label, .. } | MenuItem::Submenu { label, .. } => label.as_str(),
+				MenuItem::Separator => "<separator>",
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(labels, ["Checkpoint", "Copy session ID"]);
+		assert!(
+			labels.iter().all(|label| !label.contains("12345678")),
+			"the menu names the exact-copy action without displaying identity bytes"
+		);
+	}
 }

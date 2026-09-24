@@ -105,7 +105,7 @@ impl JumpHistory {
 	}
 
 	pub(crate) fn clear_forward(&mut self) -> Vec<JumpEntry> {
-		self.forward.drain(..).collect()
+		std::mem::take(&mut self.forward)
 	}
 
 	pub(crate) fn pop_back(&mut self) -> Option<JumpEntry> {

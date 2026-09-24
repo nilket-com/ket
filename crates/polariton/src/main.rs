@@ -366,6 +366,119 @@ fn encode_cli_hex(bytes: &[u8]) -> String {
 	output
 }
 
+/// `serve <package-directory> [--bind host:port]`, localhost by default and
+/// never anything but a read-only package server.
+fn serve_action<I>(mut args: I) -> Result<ApplicationAction, String>
+where
+	I: Iterator<Item = String>,
+{
+	let mut root = None;
+	let mut bind: std::net::SocketAddr = ([127, 0, 0, 1], 7743).into();
+	while let Some(arg) = args.next() {
+		if arg == "--bind" {
+			let value = args
+				.next()
+				.ok_or_else(|| "--bind requires host:port".to_owned())?;
+			bind = value
+				.parse()
+				.map_err(|error| format!("invalid --bind value {value:?}: {error}"))?;
+		} else if root.is_none() {
+			root = Some(std::path::PathBuf::from(arg));
+		} else {
+			return Err(format!("unexpected argument {arg:?}"));
+		}
+	}
+	let root = root.ok_or_else(|| "serve requires a package directory".to_owned())?;
+	Ok(ApplicationAction::Serve { root, bind })
+}
+
+/// PRODUCT-0158 §6: `drive <source.rn> --commands <file> --receipt <file>`,
+/// every part required, no other option.
+fn drive_action<I>(mut args: I) -> Result<ApplicationAction, String>
+where
+	I: Iterator<Item = String>,
+{
+	let mut source = None;
+	let mut commands = None;
+	let mut receipt = None;
+	let mut execution = None;
+	while let Some(arg) = args.next() {
+		match arg.as_str() {
+			"--execute" => {
+				let value = args
+					.next()
+					.ok_or_else(|| "--execute requires on-open or by-command".to_owned())?;
+				let mode = match value.as_str() {
+					"on-open" => driver::ExecutionMode::OnOpen,
+					"by-command" => driver::ExecutionMode::ByCommand,
+					other => {
+						return Err(format!(
+							"--execute must be on-open or by-command, not {other:?}"
+						));
+					}
+				};
+				if execution.replace(mode).is_some() {
+					return Err("--execute may occur at most once".to_owned());
+				}
+			}
+			"--commands" => {
+				let value = args
+					.next()
+					.ok_or_else(|| "--commands requires a file path".to_owned())?;
+				if commands.replace(std::path::PathBuf::from(value)).is_some() {
+					return Err("--commands may occur at most once".to_owned());
+				}
+			}
+			"--receipt" => {
+				let value = args
+					.next()
+					.ok_or_else(|| "--receipt requires a file path".to_owned())?;
+				if receipt.replace(std::path::PathBuf::from(value)).is_some() {
+					return Err("--receipt may occur at most once".to_owned());
+				}
+			}
+			other if other.starts_with('-') => {
+				return Err(format!("unknown drive option {other:?}"));
+			}
+			other => {
+				if source.replace(std::path::PathBuf::from(other)).is_some() {
+					return Err("drive takes exactly one source file".to_owned());
+				}
+			}
+		}
+	}
+	Ok(ApplicationAction::Drive {
+		source: source.ok_or_else(|| "drive requires a source file".to_owned())?,
+		commands: commands.ok_or_else(|| "drive requires --commands <file>".to_owned())?,
+		receipt: receipt.ok_or_else(|| "drive requires --receipt <file>".to_owned())?,
+		execution: execution.unwrap_or(driver::ExecutionMode::OnOpen),
+	})
+}
+
+/// PRODUCT-0158 §2: `describe <source.rn>` or `describe --session <id>`.
+fn describe_action<I>(mut args: I) -> Result<ApplicationAction, String>
+where
+	I: Iterator<Item = String>,
+{
+	let first = args
+		.next()
+		.ok_or_else(|| "describe requires a source file or --session <id>".to_owned())?;
+	let target = if first == "--session" {
+		let id = args
+			.next()
+			.ok_or_else(|| "--session requires a session id".to_owned())?;
+		driver::Target::Session(id)
+	} else if first.starts_with('-') {
+		return Err(format!("unknown describe option {first:?}"));
+	} else {
+		driver::Target::Source(std::path::PathBuf::from(first))
+	};
+	if args.next().is_some() {
+		return Err("describe takes exactly one source file or one --session id".to_owned());
+	}
+	Ok(ApplicationAction::Describe { target })
+}
+
 #[cfg(test)]
 mod tests {
 	use super::{ApplicationAction, action_from_args, gui::StartupTarget};
@@ -560,8 +673,6 @@ mod tests {
 		);
 	}
 
-	/// PRODUCT-0158 §6: `drive` takes a source and both files, nothing else.
-
 	/// ADR 0169 §2: the execution mode is the invocation's choice, defaulting
 	/// to PRODUCT-0158's on-open order, and is never inferred from the script.
 	#[test]
@@ -727,117 +838,4 @@ mod tests {
 			"describe takes exactly one source file or one --session id"
 		);
 	}
-}
-
-/// `serve <package-directory> [--bind host:port]`, localhost by default and
-/// never anything but a read-only package server.
-fn serve_action<I>(mut args: I) -> Result<ApplicationAction, String>
-where
-	I: Iterator<Item = String>,
-{
-	let mut root = None;
-	let mut bind: std::net::SocketAddr = ([127, 0, 0, 1], 7743).into();
-	while let Some(arg) = args.next() {
-		if arg == "--bind" {
-			let value = args
-				.next()
-				.ok_or_else(|| "--bind requires host:port".to_owned())?;
-			bind = value
-				.parse()
-				.map_err(|error| format!("invalid --bind value {value:?}: {error}"))?;
-		} else if root.is_none() {
-			root = Some(std::path::PathBuf::from(arg));
-		} else {
-			return Err(format!("unexpected argument {arg:?}"));
-		}
-	}
-	let root = root.ok_or_else(|| "serve requires a package directory".to_owned())?;
-	Ok(ApplicationAction::Serve { root, bind })
-}
-
-/// PRODUCT-0158 §6: `drive <source.rn> --commands <file> --receipt <file>`,
-/// every part required, no other option.
-fn drive_action<I>(mut args: I) -> Result<ApplicationAction, String>
-where
-	I: Iterator<Item = String>,
-{
-	let mut source = None;
-	let mut commands = None;
-	let mut receipt = None;
-	let mut execution = None;
-	while let Some(arg) = args.next() {
-		match arg.as_str() {
-			"--execute" => {
-				let value = args
-					.next()
-					.ok_or_else(|| "--execute requires on-open or by-command".to_owned())?;
-				let mode = match value.as_str() {
-					"on-open" => driver::ExecutionMode::OnOpen,
-					"by-command" => driver::ExecutionMode::ByCommand,
-					other => {
-						return Err(format!(
-							"--execute must be on-open or by-command, not {other:?}"
-						));
-					}
-				};
-				if execution.replace(mode).is_some() {
-					return Err("--execute may occur at most once".to_owned());
-				}
-			}
-			"--commands" => {
-				let value = args
-					.next()
-					.ok_or_else(|| "--commands requires a file path".to_owned())?;
-				if commands.replace(std::path::PathBuf::from(value)).is_some() {
-					return Err("--commands may occur at most once".to_owned());
-				}
-			}
-			"--receipt" => {
-				let value = args
-					.next()
-					.ok_or_else(|| "--receipt requires a file path".to_owned())?;
-				if receipt.replace(std::path::PathBuf::from(value)).is_some() {
-					return Err("--receipt may occur at most once".to_owned());
-				}
-			}
-			other if other.starts_with('-') => {
-				return Err(format!("unknown drive option {other:?}"));
-			}
-			other => {
-				if source.replace(std::path::PathBuf::from(other)).is_some() {
-					return Err("drive takes exactly one source file".to_owned());
-				}
-			}
-		}
-	}
-	Ok(ApplicationAction::Drive {
-		source: source.ok_or_else(|| "drive requires a source file".to_owned())?,
-		commands: commands.ok_or_else(|| "drive requires --commands <file>".to_owned())?,
-		receipt: receipt.ok_or_else(|| "drive requires --receipt <file>".to_owned())?,
-		execution: execution.unwrap_or(driver::ExecutionMode::OnOpen),
-	})
-}
-
-/// PRODUCT-0158 §2: `describe <source.rn>` or `describe --session <id>`.
-fn describe_action<I>(mut args: I) -> Result<ApplicationAction, String>
-where
-	I: Iterator<Item = String>,
-{
-	let first = args
-		.next()
-		.ok_or_else(|| "describe requires a source file or --session <id>".to_owned())?;
-	let target = if first == "--session" {
-		let id = args
-			.next()
-			.ok_or_else(|| "--session requires a session id".to_owned())?;
-		driver::Target::Session(id)
-	} else if first.starts_with('-') {
-		return Err(format!("unknown describe option {first:?}"));
-	} else {
-		driver::Target::Source(std::path::PathBuf::from(first))
-	};
-	if args.next().is_some() {
-		return Err("describe takes exactly one source file or one --session id".to_owned());
-	}
-	Ok(ApplicationAction::Describe { target })
 }

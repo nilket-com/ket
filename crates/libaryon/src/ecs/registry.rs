@@ -1044,7 +1044,7 @@ impl UastRegistry {
 					"nonempty saved leaf requires a physical span"
 				);
 				if !preserve_resident {
-					*(&mut *self.virtual_data[idx].get()) = Some(Vec::new());
+					*self.virtual_data[idx].get() = Some(Vec::new());
 				}
 			}
 		}

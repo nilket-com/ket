@@ -10,16 +10,24 @@
 
 use super::{AppState, Message, StartupTarget, new_with_discovery, resolve_startup, update};
 use crate::configuration::StartupData;
-use crate::editor::{EditorMsg, HostPlotExport};
+use crate::editor::EditorMsg;
+#[cfg(any(all(test, feature = "toron"), feature = "product-0057-render-evidence"))]
+use crate::editor::HostPlotExport;
 use iced::Task;
 use iced::futures::StreamExt;
 use iced_runtime::Action;
+#[cfg(any(all(test, feature = "toron"), feature = "product-0057-render-evidence"))]
 use libaryon::engine::HostPanelId;
 use std::time::{Duration, Instant};
 
 /// How long the engine and the tasks may stay quiet before a settle reports
 /// the application has stopped changing.
+#[cfg(any(toron_local, feature = "product-0057-render-evidence"))]
 const QUIET_PERIOD: Duration = Duration::from_millis(250);
+
+/// The exports and their revisions, the status line, and the pane layout.
+#[cfg(any(toron_local, feature = "product-0057-render-evidence"))]
+type Fingerprint = (Vec<(u64, u64, u32, u32)>, String, String, usize);
 
 pub(crate) struct HeadlessApplication {
 	state: AppState,
@@ -66,7 +74,7 @@ impl HeadlessApplication {
 
 	/// PRODUCT-0158 §3: resize one host pane through the engine's own divider
 	/// drag and wait for the projection to carry the new size.
-	#[cfg(test)]
+	#[cfg(all(test, feature = "toron"))]
 	pub(crate) fn resize_pane(
 		&mut self,
 		panel_id: HostPanelId,
@@ -165,7 +173,7 @@ impl HeadlessApplication {
 	/// tasks it returns, exactly as the window's runtime would.
 	/// Wrap an application a test built with the same startup the window uses,
 	/// so the driver can be exercised on host panels the test filled itself.
-	#[cfg(test)]
+	#[cfg(all(test, feature = "toron"))]
 	pub(crate) fn from_state(mut state: AppState) -> Result<Self, String> {
 		state.capture_surface_baselines();
 		let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -345,6 +353,7 @@ impl HeadlessApplication {
 	/// Like `settle_until`, then keep ticking until nothing has changed for a
 	/// quiet period, so a condition that becomes true mid-flight - the first
 	/// export of several - does not end the wait early.
+	#[cfg(any(toron_local, feature = "product-0057-render-evidence"))]
 	pub(crate) fn settle_quiet(
 		&mut self,
 		deadline: Duration,
@@ -369,6 +378,7 @@ impl HeadlessApplication {
 		Ok(())
 	}
 
+	#[cfg(any(all(test, feature = "toron"), feature = "product-0057-render-evidence"))]
 	pub(crate) fn exports_with_identity(
 		&self,
 	) -> Vec<(
@@ -387,7 +397,8 @@ impl HeadlessApplication {
 
 	/// Something that changes when the application does: the exports and
 	/// their revisions, the status line, and the pane layout.
-	fn fingerprint(&self) -> (Vec<(u64, u64, u32, u32)>, String, String, usize) {
+	#[cfg(any(toron_local, feature = "product-0057-render-evidence"))]
+	fn fingerprint(&self) -> Fingerprint {
 		(
 			self.state
 				.code_editor

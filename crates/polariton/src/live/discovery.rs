@@ -96,7 +96,7 @@ pub(crate) fn secure_directory(root: &Path) -> io::Result<()> {
 
 /// A manifest file is trusted only when it is the running user's own and
 /// nobody else can read it: the runtime directory's contract, per file.
-fn owned_manifest(path: &Path, metadata: &fs::Metadata) -> bool {
+fn owned_manifest(_path: &Path, metadata: &fs::Metadata) -> bool {
 	#[cfg(unix)]
 	{
 		// SAFETY: geteuid has no preconditions and cannot fail.

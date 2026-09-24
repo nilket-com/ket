@@ -4238,7 +4238,7 @@ fn product_0105_variadic_multivariate_surface_has_one_transport_admission_and_co
 	let authored_blocks = spec.matches("let authored_categories = matches!(").count();
 	assert_eq!(authored_blocks, 2);
 	for plot_type in ["PlotType::Radar", "PlotType::Parallel"] {
-		assert_eq!(spec.matches(plot_type).filter(|_| true).count() > 0, true);
+		assert!(spec.matches(plot_type).filter(|_| true).count() > 0);
 		for block in spec.split("let authored_categories = matches!(").skip(1) {
 			let block = block.split(';').next().expect("authored category block");
 			assert!(

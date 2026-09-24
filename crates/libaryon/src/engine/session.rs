@@ -5735,9 +5735,11 @@ impl EditorSession {
 		}
 
 		for member in &group.current_members {
-			if !current_panes_by_panel.contains_key(&member.panel_id) {
+			if let std::collections::hash_map::Entry::Vacant(slot) =
+				current_panes_by_panel.entry(member.panel_id)
+			{
 				let (pane_id, pane, _) = self.make_group_member_pane(member, dimensions);
-				current_panes_by_panel.insert(member.panel_id, (pane_id, pane));
+				slot.insert((pane_id, pane));
 			}
 		}
 		let tiled = group

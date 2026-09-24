@@ -84,7 +84,7 @@ impl Drop for Agents {
 }
 
 impl AppState {
-	#[cfg(test)]
+	#[cfg(all(test, feature = "toron"))]
 	pub(super) fn enable_agents_for_test(&mut self) -> std::path::PathBuf {
 		let root = crate::live::discovery::test_runtime_root("actions");
 		self.agents.window = Some(Window::create(root.clone(), None, vec![]).unwrap());

@@ -50,10 +50,10 @@ impl PublishJob {
 			&self.request,
 			&self.root,
 		)?;
-		if let Some((reporter, kind, kept)) = self.kept {
-			if !kept.swap(true, std::sync::atomic::Ordering::Relaxed) {
-				reporter.emit(crate::reporting::Step::FirstAnalysisKept, Some(kind), false);
-			}
+		if let Some((reporter, kind, kept)) = self.kept
+			&& !kept.swap(true, std::sync::atomic::Ordering::Relaxed)
+		{
+			reporter.emit(crate::reporting::Step::FirstAnalysisKept, Some(kind), false);
 		}
 		Ok(package)
 	}

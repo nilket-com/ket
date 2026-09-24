@@ -1438,18 +1438,16 @@ mod tests {
 	fn wait_for_pidfile(path: &PathBuf, expected: usize) -> Vec<i32> {
 		let ready_by = Instant::now() + Duration::from_secs(2);
 		loop {
-			if let Ok(contents) = std::fs::read_to_string(path) {
-				if contents.ends_with('\n') {
-					let pids = contents
-						.split_whitespace()
-						.map(str::parse::<i32>)
-						.collect::<Result<Vec<_>, _>>();
-					if let Ok(pids) = pids {
-						if pids.len() == expected && pids.iter().all(|pid| *pid > 0) {
-							return pids;
-						}
-					}
-				}
+			if let Ok(contents) = std::fs::read_to_string(path)
+				&& contents.ends_with('\n')
+				&& let Ok(pids) = contents
+					.split_whitespace()
+					.map(str::parse::<i32>)
+					.collect::<Result<Vec<_>, _>>()
+				&& pids.len() == expected
+				&& pids.iter().all(|pid| *pid > 0)
+			{
+				return pids;
 			}
 			assert!(
 				Instant::now() < ready_by,

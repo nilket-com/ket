@@ -231,6 +231,7 @@ pub(crate) enum TruncationReason {
 }
 
 impl Command {
+	#[cfg(test)]
 	fn figure(&self) -> Option<&FigureRef> {
 		match self {
 			Command::Describe {}
@@ -662,12 +663,12 @@ impl Session {
 		&self.loaded
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, feature = "toron"))]
 	pub(crate) fn into_application(self) -> HeadlessApplication {
 		self.application
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, feature = "toron"))]
 	pub(crate) fn application_mut(&mut self) -> &mut HeadlessApplication {
 		&mut self.application
 	}

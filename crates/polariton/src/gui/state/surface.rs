@@ -52,7 +52,7 @@ impl AppState {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "toron"))]
 impl AppState {
 	/// Break the baseline invariant on purpose, to prove a describe survives it.
 	pub(super) fn forget_baseline_for_test(&mut self, token: u64) -> bool {

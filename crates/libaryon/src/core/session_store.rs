@@ -46,9 +46,9 @@ impl SessionId {
 		}
 
 		let mut bytes = [0_u8; 16];
-		for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-			bytes[index] = (decode_hex_nibble(pair[0]).ok_or(ParseSessionIdError)? << 4)
-				| decode_hex_nibble(pair[1]).ok_or(ParseSessionIdError)?;
+		for (index, [high, low]) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+			bytes[index] = (decode_hex_nibble(*high).ok_or(ParseSessionIdError)? << 4)
+				| decode_hex_nibble(*low).ok_or(ParseSessionIdError)?;
 		}
 		Self::from_random_bytes(bytes).ok_or(ParseSessionIdError)
 	}
@@ -555,10 +555,12 @@ fn decode_hex(value: &str, subject: &str) -> Result<Vec<u8>, SessionStoreError> 
 
 	value
 		.as_bytes()
-		.chunks_exact(2)
-		.map(|pair| {
-			Ok((decode_hex_nibble(pair[0]).expect("validated hex") << 4)
-				| decode_hex_nibble(pair[1]).expect("validated hex"))
+		.as_chunks::<2>()
+		.0
+		.iter()
+		.map(|[high, low]| {
+			Ok((decode_hex_nibble(*high).expect("validated hex") << 4)
+				| decode_hex_nibble(*low).expect("validated hex"))
 		})
 		.collect()
 }

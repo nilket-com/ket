@@ -259,17 +259,15 @@ impl AppState {
 					.document_snapshot(buffer)
 					.ok_or_else(|| refuse("the source text is not yet projected".into()))?;
 				#[cfg(not(feature = "toron"))]
-				{
-					let _ = (buffer, generation);
-					return Err(refuse(
-						"running a source requires Polariton's toron feature".into(),
-					));
-				}
+				let refused = Some("running a source requires Polariton's toron feature");
 				#[cfg(feature = "toron")]
-				if self.adapter_state.rune_connection().is_none() {
-					return Err(refuse(
-						"no Rune connection: connect to a Toron before run_source".into(),
-					));
+				let refused = self
+					.adapter_state
+					.rune_connection()
+					.is_none()
+					.then_some("no Rune connection: connect to a Toron before run_source");
+				if let Some(reason) = refused {
+					return Err(refuse(reason.into()));
 				}
 				guard = Some((buffer, generation, vec![]));
 				Kind::RunSource {
@@ -461,12 +459,12 @@ impl AppState {
 			return self.fail_execution(format!("execution {revision} failed: {message}"));
 		}
 		if let Some(outcome) = plain {
-			return match outcome {
+			match outcome {
 				Ok(()) => self.complete_execution(),
 				Err(message) => {
 					self.fail_execution(format!("execution {revision} failed: {message}"))
 				}
-			};
+			}
 		}
 		#[cfg(feature = "toron")]
 		{

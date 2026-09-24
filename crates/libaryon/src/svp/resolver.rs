@@ -527,6 +527,8 @@ pub(super) struct CompletionMeta {
 	pub(super) node_id: NodeId,
 	pub(super) was_viewport: bool,
 	pub(super) extent_offset: u32,
+	/// Read only by the io_uring backend's short-read check.
+	#[cfg(target_os = "linux")]
 	pub(super) request_length: u32,
 	pub(super) whole_node: bool,
 	pub(super) scan_root: Option<NodeId>,
@@ -546,6 +548,7 @@ impl CompletionMeta {
 			node_id: req.node_id,
 			was_viewport: req.priority == RequestPriority::High,
 			extent_offset: req.extent_offset,
+			#[cfg(target_os = "linux")]
 			request_length: req.request_length,
 			whole_node: req.extent_offset == 0 && req.request_length == req.pointer.byte_length,
 			scan_root: req.scan_root,

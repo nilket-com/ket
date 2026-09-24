@@ -160,6 +160,7 @@ pub struct TableSkinSpec {
 }
 
 impl TableSkinSpec {
+	#[cfg(any(test, feature = "toron"))]
 	pub fn new(identity: impl Into<String>, projection: TableSkinProjection) -> Self {
 		Self {
 			identity: identity.into(),
@@ -228,7 +229,7 @@ impl TableSkinCascade {
 		})
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, toron_local))]
 	pub fn resolve_through_authored_with(
 		&self,
 		mut resolve: impl FnMut(&TableSkinSpec) -> Result<TableSkin, TableSkinProjectionError>,

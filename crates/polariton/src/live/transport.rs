@@ -341,6 +341,164 @@ async fn connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
 		.await;
 }
 
+// ============================================================
+// ADR 0166 §4: one framed protocol over the platform's same-user transport.
+// ============================================================
+
+/// What an accept produced: a same-user peer, a foreign peer to ignore, or
+/// the end of the listener.
+enum Accepted {
+	Peer(PlatformStream),
+	Foreign,
+	Closed,
+}
+
+#[cfg(unix)]
+pub(crate) type PlatformStream = tokio::net::UnixStream;
+
+#[cfg(unix)]
+pub(crate) struct PlatformListener(std::os::unix::net::UnixListener);
+
+#[cfg(unix)]
+struct AsyncListener(tokio::net::UnixListener);
+
+#[cfg(unix)]
+impl PlatformListener {
+	pub(crate) fn bind(path: &Path) -> io::Result<Self> {
+		let listener = std::os::unix::net::UnixListener::bind(path)?;
+		std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+		listener.set_nonblocking(true)?;
+		Ok(Self(listener))
+	}
+	fn into_async(self) -> io::Result<AsyncListener> {
+		tokio::net::UnixListener::from_std(self.0).map(AsyncListener)
+	}
+}
+
+#[cfg(unix)]
+impl AsyncListener {
+	async fn accept(&mut self) -> Accepted {
+		let Ok((socket, _)) = self.0.accept().await else {
+			return Accepted::Closed;
+		};
+		// SAFETY: geteuid has no preconditions and cannot fail.
+		let uid = unsafe { libc::geteuid() };
+		if socket.peer_cred().is_ok_and(|peer| peer.uid() == uid) {
+			Accepted::Peer(socket)
+		} else {
+			Accepted::Foreign
+		}
+	}
+}
+
+#[cfg(windows)]
+pub(crate) type PlatformStream = tokio::net::windows::named_pipe::NamedPipeServer;
+
+/// A named pipe whose DACL admits the running user alone; the DACL is the
+/// same-user check, applied by the kernel before `connect` completes.
+#[cfg(windows)]
+pub(crate) struct PlatformListener {
+	name: String,
+}
+
+#[cfg(windows)]
+struct AsyncListener {
+	name: String,
+	waiting: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
+}
+
+#[cfg(windows)]
+impl PlatformListener {
+	/// Binding records the name; the first pipe instance is created inside the
+	/// subscription's runtime, which tokio's named pipes require.
+	pub(crate) fn bind(path: &Path) -> io::Result<Self> {
+		Ok(Self {
+			name: path.to_string_lossy().into_owned(),
+		})
+	}
+	fn into_async(self) -> io::Result<AsyncListener> {
+		let first = windows_pipe::create(&self.name, true)?;
+		Ok(AsyncListener {
+			name: self.name,
+			waiting: Some(first),
+		})
+	}
+}
+
+#[cfg(windows)]
+impl AsyncListener {
+	/// Cancel-safe: the waiting instance is taken only once a client has
+	/// connected, so a select that abandons a pending accept loses no
+	/// instance and the name stays served.
+	async fn accept(&mut self) -> Accepted {
+		let Some(waiting) = self.waiting.as_ref() else {
+			return Accepted::Closed;
+		};
+		if waiting.connect().await.is_err() {
+			return Accepted::Closed;
+		}
+		let Some(server) = self.waiting.take() else {
+			return Accepted::Closed;
+		};
+		// The next instance must exist before this one is handed out, or a
+		// client arriving in between finds no pipe and reports "not found".
+		match windows_pipe::create(&self.name, false) {
+			Ok(next) => self.waiting = Some(next),
+			Err(_) => return Accepted::Closed,
+		}
+		if windows_pipe::client_is_same_user(&server) {
+			Accepted::Peer(server)
+		} else {
+			// Never reached with the owner-only DACL in place; belt and braces.
+			let _ = server.disconnect();
+			Accepted::Foreign
+		}
+	}
+}
+
+#[cfg(windows)]
+mod windows_pipe {
+	use std::io;
+	use std::os::windows::io::AsRawHandle;
+	use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+
+	/// Create one pipe instance with an owner-only DACL. `first` reserves the
+	/// name: a second creator of the same name fails instead of hijacking it.
+	pub(super) fn create(name: &str, first: bool) -> io::Result<NamedPipeServer> {
+		let descriptor = key_guard::windows::current_user_only_security_descriptor()
+			.map_err(io::Error::other)?;
+		let mut attributes = SecurityAttributes {
+			length: std::mem::size_of::<SecurityAttributes>() as u32,
+			descriptor: descriptor.as_ptr() as *mut _,
+			inherit: 0,
+		};
+		// SAFETY: `attributes` outlives the call and points at a valid
+		// self-relative security descriptor held by `descriptor`.
+		unsafe {
+			ServerOptions::new()
+				.first_pipe_instance(first)
+				.reject_remote_clients(true)
+				.create_with_security_attributes_raw(name, &mut attributes as *mut _ as *mut _)
+		}
+	}
+
+	#[repr(C)]
+	struct SecurityAttributes {
+		length: u32,
+		descriptor: *mut core::ffi::c_void,
+		inherit: i32,
+	}
+
+	/// The kernel already enforced the DACL; this confirms the client's
+	/// process token belongs to the same user, so a misconfigured pipe cannot
+	/// silently admit anyone.
+	pub(super) fn client_is_same_user(server: &NamedPipeServer) -> bool {
+		// SAFETY: `server` is a connected instance and outlives the call.
+		unsafe { key_guard::windows::pipe_client_is_current_user(server.as_raw_handle() as _) }
+			.unwrap_or(false)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -717,163 +875,5 @@ mod tests {
 			read_line(&mut &b"{}\nnext"[..], MAX_LINE).await.unwrap(),
 			Some(b"{}\n".to_vec())
 		);
-	}
-}
-
-// ============================================================
-// ADR 0166 §4: one framed protocol over the platform's same-user transport.
-// ============================================================
-
-/// What an accept produced: a same-user peer, a foreign peer to ignore, or
-/// the end of the listener.
-enum Accepted {
-	Peer(PlatformStream),
-	Foreign,
-	Closed,
-}
-
-#[cfg(unix)]
-pub(crate) type PlatformStream = tokio::net::UnixStream;
-
-#[cfg(unix)]
-pub(crate) struct PlatformListener(std::os::unix::net::UnixListener);
-
-#[cfg(unix)]
-struct AsyncListener(tokio::net::UnixListener);
-
-#[cfg(unix)]
-impl PlatformListener {
-	pub(crate) fn bind(path: &Path) -> io::Result<Self> {
-		let listener = std::os::unix::net::UnixListener::bind(path)?;
-		std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-		listener.set_nonblocking(true)?;
-		Ok(Self(listener))
-	}
-	fn into_async(self) -> io::Result<AsyncListener> {
-		tokio::net::UnixListener::from_std(self.0).map(AsyncListener)
-	}
-}
-
-#[cfg(unix)]
-impl AsyncListener {
-	async fn accept(&mut self) -> Accepted {
-		let Ok((socket, _)) = self.0.accept().await else {
-			return Accepted::Closed;
-		};
-		// SAFETY: geteuid has no preconditions and cannot fail.
-		let uid = unsafe { libc::geteuid() };
-		if socket.peer_cred().is_ok_and(|peer| peer.uid() == uid) {
-			Accepted::Peer(socket)
-		} else {
-			Accepted::Foreign
-		}
-	}
-}
-
-#[cfg(windows)]
-pub(crate) type PlatformStream = tokio::net::windows::named_pipe::NamedPipeServer;
-
-/// A named pipe whose DACL admits the running user alone; the DACL is the
-/// same-user check, applied by the kernel before `connect` completes.
-#[cfg(windows)]
-pub(crate) struct PlatformListener {
-	name: String,
-}
-
-#[cfg(windows)]
-struct AsyncListener {
-	name: String,
-	waiting: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
-}
-
-#[cfg(windows)]
-impl PlatformListener {
-	/// Binding records the name; the first pipe instance is created inside the
-	/// subscription's runtime, which tokio's named pipes require.
-	pub(crate) fn bind(path: &Path) -> io::Result<Self> {
-		Ok(Self {
-			name: path.to_string_lossy().into_owned(),
-		})
-	}
-	fn into_async(self) -> io::Result<AsyncListener> {
-		let first = windows_pipe::create(&self.name, true)?;
-		Ok(AsyncListener {
-			name: self.name,
-			waiting: Some(first),
-		})
-	}
-}
-
-#[cfg(windows)]
-impl AsyncListener {
-	/// Cancel-safe: the waiting instance is taken only once a client has
-	/// connected, so a select that abandons a pending accept loses no
-	/// instance and the name stays served.
-	async fn accept(&mut self) -> Accepted {
-		let Some(waiting) = self.waiting.as_ref() else {
-			return Accepted::Closed;
-		};
-		if waiting.connect().await.is_err() {
-			return Accepted::Closed;
-		}
-		let Some(server) = self.waiting.take() else {
-			return Accepted::Closed;
-		};
-		// The next instance must exist before this one is handed out, or a
-		// client arriving in between finds no pipe and reports "not found".
-		match windows_pipe::create(&self.name, false) {
-			Ok(next) => self.waiting = Some(next),
-			Err(_) => return Accepted::Closed,
-		}
-		if windows_pipe::client_is_same_user(&server) {
-			Accepted::Peer(server)
-		} else {
-			// Never reached with the owner-only DACL in place; belt and braces.
-			let _ = server.disconnect();
-			Accepted::Foreign
-		}
-	}
-}
-
-#[cfg(windows)]
-mod windows_pipe {
-	use std::io;
-	use std::os::windows::io::AsRawHandle;
-	use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-
-	/// Create one pipe instance with an owner-only DACL. `first` reserves the
-	/// name: a second creator of the same name fails instead of hijacking it.
-	pub(super) fn create(name: &str, first: bool) -> io::Result<NamedPipeServer> {
-		let descriptor = key_guard::windows::current_user_only_security_descriptor()
-			.map_err(io::Error::other)?;
-		let mut attributes = SecurityAttributes {
-			length: std::mem::size_of::<SecurityAttributes>() as u32,
-			descriptor: descriptor.as_ptr() as *mut _,
-			inherit: 0,
-		};
-		// SAFETY: `attributes` outlives the call and points at a valid
-		// self-relative security descriptor held by `descriptor`.
-		unsafe {
-			ServerOptions::new()
-				.first_pipe_instance(first)
-				.reject_remote_clients(true)
-				.create_with_security_attributes_raw(name, &mut attributes as *mut _ as *mut _)
-		}
-	}
-
-	#[repr(C)]
-	struct SecurityAttributes {
-		length: u32,
-		descriptor: *mut core::ffi::c_void,
-		inherit: i32,
-	}
-
-	/// The kernel already enforced the DACL; this confirms the client's
-	/// process token belongs to the same user, so a misconfigured pipe cannot
-	/// silently admit anyone.
-	pub(super) fn client_is_same_user(server: &NamedPipeServer) -> bool {
-		// SAFETY: `server` is a connected instance and outlives the call.
-		unsafe { key_guard::windows::pipe_client_is_current_user(server.as_raw_handle() as _) }
-			.unwrap_or(false)
 	}
 }

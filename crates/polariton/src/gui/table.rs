@@ -236,16 +236,17 @@ impl<'a, Message> Table<'a, Message> {
 			.map(|row| self.cell_str(col_idx, row).len())
 			.max()
 			.unwrap_or(0);
-		let type_label_chars = self
-			.show_column_types
-			.then(|| {
+		let type_label_chars = if self.show_column_types {
+			{
 				self.data_frame
 					.columns()
 					.get(col_idx)
 					.map(|column| column.dtype().to_string().len())
 					.unwrap_or(0)
-			})
-			.unwrap_or(0);
+			}
+		} else {
+			0
+		};
 		let max_chars = max_content_chars.max(col_name.len()).max(type_label_chars);
 		let text_width = max_chars as f32 * FONT_SIZE * CHAR_ADVANCE;
 		(text_width + CELL_PADDING_X * 2.0).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH)

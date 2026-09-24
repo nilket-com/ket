@@ -37,6 +37,7 @@ pub enum ToronTarget {
 }
 
 impl ToronTarget {
+	#[cfg(test)]
 	pub fn endpoint(&self) -> &str {
 		match self {
 			Self::Loopback { endpoint } | Self::Authenticated { endpoint, .. } => endpoint,

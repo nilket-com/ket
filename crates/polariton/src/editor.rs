@@ -523,6 +523,7 @@ pub(crate) enum PolaritonCheckpointError {
 
 #[cfg(feature = "toron")]
 impl PolaritonCheckpointError {
+	#[cfg(toron_local)]
 	pub(crate) fn is_stale(&self) -> bool {
 		matches!(
 			self,
@@ -708,10 +709,7 @@ impl NotebookPlotSurface {
 			}
 			crate::gui::messages::PlotMessage::SelectionRebuilt(completion) => {
 				let expected = crate::selection::RebuildStamp {
-					publication: match self.publication {
-						Some(value) => value,
-						None => return None,
-					},
+					publication: self.publication?,
 					surface_incarnation: self.surface_incarnation,
 					selection_revision: self.selection_revision,
 				};
@@ -1373,7 +1371,7 @@ impl CodeEditor {
 		self.send(EditorCommand::MarkdownPreview { serif: false });
 		self.request_content();
 	}
-	#[cfg(feature = "toron")]
+	#[cfg(toron_local)]
 	pub(crate) fn open_welcome_rune(&mut self, source: &str) {
 		self.send(EditorCommand::NewPane {
 			direction: SplitDirection::Vertical,
@@ -1489,9 +1487,7 @@ impl CodeEditor {
 
 		// A focused source buffer owns its own Run action. Only native
 		// output panes may borrow the notebook's execution context.
-		if focused.host_panel.is_none() {
-			return None;
-		}
+		focused.host_panel.as_ref()?;
 		// Native output panes have no document identity. The Markdown source
 		// remains the execution context even when its preview is closed.
 		viewport
@@ -1621,6 +1617,7 @@ impl CodeEditor {
 			.insert(identity, NotebookCellOutput::Failed(message));
 	}
 
+	#[cfg(test)]
 	pub fn set_markdown_cell_plot(
 		&mut self,
 		identity: MarkdownCellIdentity,
@@ -1858,7 +1855,7 @@ impl CodeEditor {
 			.copied()
 	}
 
-	#[cfg(all(test, feature = "toron"))]
+	#[cfg(all(test, toron_local))]
 	pub(crate) fn rune_view_producer_for_panel(
 		&self,
 		panel_id: HostPanelId,
@@ -1886,7 +1883,7 @@ impl CodeEditor {
 		self.set_rune_view_table_with_presentation(panel_id, frame, skin, Override::Inherit);
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(all(test, feature = "toron"))]
 	pub fn set_rune_view_table_with_presentation(
 		&mut self,
 		panel_id: HostPanelId,
@@ -1936,6 +1933,7 @@ impl CodeEditor {
 		}
 	}
 
+	#[cfg(all(test, toron_local))]
 	pub fn set_rune_view_plot(
 		&mut self,
 		panel_id: HostPanelId,
@@ -2122,7 +2120,7 @@ impl CodeEditor {
 		Some(backend.finish())
 	}
 
-	#[cfg(all(test, feature = "toron"))]
+	#[cfg(all(test, toron_local))]
 	pub(crate) fn rune_view_panel_plot_hover(
 		&self,
 		producer: libaryon::core::BufferId,
@@ -2179,7 +2177,7 @@ impl CodeEditor {
 		))
 	}
 
-	#[cfg(all(test, feature = "toron"))]
+	#[cfg(all(test, toron_local))]
 	pub(crate) fn rune_view_panel_persistence_signature(
 		&self,
 		producer: libaryon::core::BufferId,
@@ -2210,7 +2208,7 @@ impl CodeEditor {
 			.count()
 	}
 
-	#[cfg(all(test, feature = "toron"))]
+	#[cfg(all(test, toron_local))]
 	pub(crate) fn rune_view_panel_is_failed(
 		&self,
 		producer: libaryon::core::BufferId,
@@ -2312,6 +2310,7 @@ impl CodeEditor {
 	}
 
 	/// Attach a completed result set to the panel.
+	#[cfg(test)]
 	pub fn set_query_result(&mut self, frame: DataFrame) {
 		self.set_query_result_with_skin(frame, TableSkinCascade::library_floor());
 	}
@@ -2328,6 +2327,7 @@ impl CodeEditor {
 		);
 	}
 
+	#[cfg(test)]
 	pub fn set_query_plot(
 		&mut self,
 		display_label: String,
@@ -2370,6 +2370,7 @@ impl CodeEditor {
 		);
 	}
 
+	#[cfg(test)]
 	fn set_query_result_with_skin(&mut self, frame: DataFrame, skin: TableSkin) {
 		let artifact = ResultArtifact::from_polars(Arc::new(frame.clone()));
 		self.bind_result_panel_artifact(&artifact);
@@ -2493,23 +2494,23 @@ impl CodeEditor {
 			.ceil()
 			.max(1.0) as u32;
 		let rect = pane.rect;
-		let left = rect.screen_col.get() as u32;
-		let top = rect.screen_row.get() as u32;
-		let right = left + rect.width.get() as u32;
-		let bottom = top + rect.height.get() as u32;
+		let left = rect.screen_col.get();
+		let top = rect.screen_row.get();
+		let right = left + rect.width.get();
+		let bottom = top + rect.height.get();
 		let mut commands = Vec::new();
-		if rect.width.get() as u32 != columns {
+		if rect.width.get() != columns {
 			let at_right = viewport.panes.iter().find(|other| {
 				other.pane_id != pane.pane_id
-					&& other.rect.screen_col.get() as u32 == right
-					&& (other.rect.screen_row.get() as u32) < bottom
-					&& other.rect.screen_row.get() as u32 + other.rect.height.get() as u32 > top
+					&& other.rect.screen_col.get() == right
+					&& other.rect.screen_row.get() < bottom
+					&& other.rect.screen_row.get() + other.rect.height.get() > top
 			});
 			let at_left = viewport.panes.iter().find(|other| {
 				other.pane_id != pane.pane_id
-					&& other.rect.screen_col.get() as u32 + other.rect.width.get() as u32 == left
-					&& (other.rect.screen_row.get() as u32) < bottom
-					&& other.rect.screen_row.get() as u32 + other.rect.height.get() as u32 > top
+					&& other.rect.screen_col.get() + other.rect.width.get() == left
+					&& other.rect.screen_row.get() < bottom
+					&& other.rect.screen_row.get() + other.rect.height.get() > top
 			});
 			commands.push(match (at_right, at_left) {
 				(Some(other), _) => EditorCommand::ResizePaneBoundary {
@@ -2529,18 +2530,18 @@ impl CodeEditor {
 				}
 			});
 		}
-		if rect.height.get() as u32 != rows {
+		if rect.height.get() != rows {
 			let below = viewport.panes.iter().find(|other| {
 				other.pane_id != pane.pane_id
-					&& other.rect.screen_row.get() as u32 == bottom
-					&& (other.rect.screen_col.get() as u32) < right
-					&& other.rect.screen_col.get() as u32 + other.rect.width.get() as u32 > left
+					&& other.rect.screen_row.get() == bottom
+					&& other.rect.screen_col.get() < right
+					&& other.rect.screen_col.get() + other.rect.width.get() > left
 			});
 			let above = viewport.panes.iter().find(|other| {
 				other.pane_id != pane.pane_id
-					&& other.rect.screen_row.get() as u32 + other.rect.height.get() as u32 == top
-					&& (other.rect.screen_col.get() as u32) < right
-					&& other.rect.screen_col.get() as u32 + other.rect.width.get() as u32 > left
+					&& other.rect.screen_row.get() + other.rect.height.get() == top
+					&& other.rect.screen_col.get() < right
+					&& other.rect.screen_col.get() + other.rect.width.get() > left
 			});
 			commands.push(match (below, above) {
 				(Some(other), _) => EditorCommand::ResizePaneBoundary {
@@ -2627,10 +2628,10 @@ impl CodeEditor {
 								.unwrap_or(crate::selection::SelectionRevision::ZERO),
 							displayed_selection_revision: plot.displayed_selection_revision,
 							layout: crate::publication::GridRect {
-								col: rect.screen_col.get() as u32,
-								row: rect.screen_row.get() as u32,
-								width: rect.width.get() as u32,
-								height: rect.height.get() as u32,
+								col: rect.screen_col.get(),
+								row: rect.screen_row.get(),
+								width: rect.width.get(),
+								height: rect.height.get(),
 							},
 							view_name: plot.source_attachment.as_ref().and_then(|attachment| {
 								match &attachment.identity {
@@ -2680,6 +2681,7 @@ impl CodeEditor {
 
 	/// PRODUCT-0158 §2: host panels the run has prepared but not yet filled.
 	/// A headless run is finished only when this is zero.
+	#[cfg(feature = "toron")]
 	pub(crate) fn host_panels_running(&self) -> usize {
 		self.panels
 			.panels
@@ -4610,6 +4612,7 @@ struct TableArtifact {
 }
 
 impl TableArtifact {
+	#[cfg(test)]
 	fn with_authored_column_types(
 		frame: DataFrame,
 		skin: TableSkin,
@@ -4690,7 +4693,7 @@ impl TableArtifact {
 		let Ok(frame) = completion.result else {
 			return false;
 		};
-		self.frame = Box::new(frame);
+		*self.frame = frame;
 		self.displayed_filter_predicate = completion.predicate;
 		self.content_revision = self.content_revision.wrapping_add(1);
 		true
@@ -4891,12 +4894,12 @@ impl PanelRegistry {
 			.unwrap_or(baked)
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, feature = "toron"))]
 	fn set_test_pane_table_skin(&mut self, panel_id: HostPanelId, skin: TableSkinSpec) {
 		self.pane_table_skins.insert(panel_id, skin);
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, feature = "toron"))]
 	fn clear_test_pane_table_skin(&mut self, panel_id: HostPanelId) {
 		self.pane_table_skins.remove(&panel_id);
 	}
@@ -7765,8 +7768,7 @@ mod tests {
 		assert_eq!(
 			layers
 				.iter()
-				.filter(|layer| layer.bounds.contains(intersection))
-				.next_back()
+				.rfind(|layer| layer.bounds.contains(intersection))
 				.map(|layer| layer.tone),
 			Some(MinimapOverlayTone::Cursor),
 			"the cursor must own the final pixel where it meets the frame"

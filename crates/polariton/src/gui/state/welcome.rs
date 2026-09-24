@@ -33,10 +33,10 @@ impl AppState {
 		if self.welcome_action.is_some() {
 			return self.advance_welcome_action();
 		}
-		if let Some(detail) = self.reporting.detail() {
-			if self.status_error.is_empty() {
-				self.status_detail = Some(StatusDetail::new(self.status_msg.clone(), detail));
-			}
+		if let Some(detail) = self.reporting.detail()
+			&& self.status_error.is_empty()
+		{
+			self.status_detail = Some(StatusDetail::new(self.status_msg.clone(), detail));
 		}
 		if !self.welcome.active || self.adapter_state.sql_connection().is_none() {
 			return Task::none();
@@ -103,11 +103,10 @@ impl AppState {
 					.named_notebook_cell_data()
 					.iter()
 					.any(|(name, _)| name == "first-data")
+					&& let Some(cell) = self.code_editor.welcome_cell("first-plot")
 				{
-					if let Some(cell) = self.code_editor.welcome_cell("first-plot") {
-						self.welcome.stage = 2;
-						return run_markdown_cell(self, cell);
-					}
+					self.welcome.stage = 2;
+					return run_markdown_cell(self, cell);
 				}
 			}
 			_ => (),
@@ -348,6 +347,13 @@ pub(super) fn view<'a>(state: &'a AppState, screen: Element<'a, Message>) -> Ele
 	column![screen, container(controls).padding(10)].into()
 }
 
+#[cfg(feature = "toron")]
+pub(super) const WORKSPACE_SOURCE: &str = r#"// The example table is polariton_first_run. Remove it with DROP TABLE polariton_first_run.
+workspace.table("polariton_first_run").views([view("first-run", figure([
+    title("Your local workspace"), line("x", "y").stroke_width(2),
+]))]);
+"#;
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -466,10 +472,3 @@ mod tests {
 		assert_eq!(before, after);
 	}
 }
-
-#[cfg(feature = "toron")]
-pub(super) const WORKSPACE_SOURCE: &str = r#"// The example table is polariton_first_run. Remove it with DROP TABLE polariton_first_run.
-workspace.table("polariton_first_run").views([view("first-run", figure([
-    title("Your local workspace"), line("x", "y").stroke_width(2),
-]))]);
-"#;

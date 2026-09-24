@@ -17,9 +17,9 @@ use crate::adapters::{
 use crate::configuration::{self, StartupData};
 use crate::editor::{CodeEditor, MarkdownCellExecution};
 use crate::fonts::{DEJAVU_SANS_MONO, POLARITON_PLOT_SANS_REGULAR};
-#[cfg(all(test, feature = "toron"))]
+#[cfg(all(test, toron_local))]
 use crate::gui::table_skin::TableSkin;
-#[cfg(all(test, feature = "toron"))]
+#[cfg(all(test, toron_local))]
 use crate::gui::table_skin::TableSkinProjectionError;
 #[cfg(feature = "toron")]
 use crate::gui::table_skin::{TableSkinCascade, TableSkinProjection, TableSkinSpec};
@@ -660,10 +660,10 @@ impl LoopLatencyProbe {
 	}
 
 	fn tick(&mut self, scheduled: Instant) {
-		if let Some(unserviced) = self.observe(scheduled, Instant::now()) {
-			if unserviced == self.max_unserviced {
-				self.report("new maximum");
-			}
+		if let Some(unserviced) = self.observe(scheduled, Instant::now())
+			&& unserviced == self.max_unserviced
+		{
+			self.report("new maximum");
 		}
 	}
 
@@ -1286,7 +1286,7 @@ fn run_language_code(
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "toron"))]
 fn run_rune_code(app_state: &mut AppState, source_buffer: BufferId, code: String) -> Task<Message> {
 	run_rune_code_at_generation(
 		app_state,
@@ -1324,10 +1324,14 @@ fn run_rune_code_at_generation(
 			app_state.status_msg = "Rune presentation queued newest revision…".into();
 			return Task::none();
 		};
-		return start_rune_presentation_task(app_state, work);
+		start_rune_presentation_task(app_state, work)
 	}
 	#[cfg(not(feature = "toron"))]
-	return run_plain_rune_code(app_state, source_buffer, revision, code);
+	{
+		// Only the Toron presentation path pins the document generation.
+		let _ = document_generation;
+		run_plain_rune_code(app_state, source_buffer, revision, code)
+	}
 }
 
 fn run_plain_rune_code(
@@ -2614,45 +2618,45 @@ fn validate_rune_numeric_domain_applicability(
 		));
 	}
 	let numeric = |scale| matches!(scale, ScaleFamily::Linear | ScaleFamily::Log);
-	if let Some(span) = domain_spans.x.as_ref() {
-		if !numeric(x_scale) {
-			return Err((
-				span.clone(),
-				format!(
-					"x_axis().bounds(...) requires a numeric x axis; this figure resolves x as {x_scale:?}"
-				),
-			));
-		}
+	if let Some(span) = domain_spans.x.as_ref()
+		&& !numeric(x_scale)
+	{
+		return Err((
+			span.clone(),
+			format!(
+				"x_axis().bounds(...) requires a numeric x axis; this figure resolves x as {x_scale:?}"
+			),
+		));
 	}
-	if let Some(span) = tick_step_spans.x.as_ref() {
-		if !matches!(x_scale, ScaleFamily::Linear) {
-			return Err((
-				span.clone(),
-				format!(
-					"x_axis().tick_step(...) requires a linear numeric x axis; this figure resolves x as {x_scale:?}"
-				),
-			));
-		}
+	if let Some(span) = tick_step_spans.x.as_ref()
+		&& !matches!(x_scale, ScaleFamily::Linear)
+	{
+		return Err((
+			span.clone(),
+			format!(
+				"x_axis().tick_step(...) requires a linear numeric x axis; this figure resolves x as {x_scale:?}"
+			),
+		));
 	}
-	if let Some(span) = domain_spans.y.as_ref() {
-		if !numeric(y_scale) {
-			return Err((
-				span.clone(),
-				format!(
-					"y_axis().bounds(...) requires a numeric y axis; this figure resolves y as {y_scale:?}"
-				),
-			));
-		}
+	if let Some(span) = domain_spans.y.as_ref()
+		&& !numeric(y_scale)
+	{
+		return Err((
+			span.clone(),
+			format!(
+				"y_axis().bounds(...) requires a numeric y axis; this figure resolves y as {y_scale:?}"
+			),
+		));
 	}
-	if let Some(span) = tick_step_spans.y.as_ref() {
-		if !matches!(y_scale, ScaleFamily::Linear) {
-			return Err((
-				span.clone(),
-				format!(
-					"y_axis().tick_step(...) requires a linear numeric y axis; this figure resolves y as {y_scale:?}"
-				),
-			));
-		}
+	if let Some(span) = tick_step_spans.y.as_ref()
+		&& !matches!(y_scale, ScaleFamily::Linear)
+	{
+		return Err((
+			span.clone(),
+			format!(
+				"y_axis().tick_step(...) requires a linear numeric y axis; this figure resolves y as {y_scale:?}"
+			),
+		));
 	}
 	if tick_every_spans.x.is_some() || tick_every_spans.y.is_some() {
 		let Ok((x_type, y_type)) = resolved_rune_axis_data_types(body, schema) else {
@@ -2711,25 +2715,25 @@ fn validate_rune_numeric_domain_applicability(
 		validate("x", &tick_every_spans.x, &x_type, guides.x_tick_placement)?;
 		validate("y", &tick_every_spans.y, &y_type, guides.y_tick_placement)?;
 	}
-	if let Some(span) = minor_tick_spans.x.as_ref() {
-		if !matches!(x_scale, ScaleFamily::Linear) {
-			return Err((
-				span.clone(),
-				format!(
-					"x_axis().minor_ticks(...) requires a linear numeric x axis; this figure resolves x as {x_scale:?}"
-				),
-			));
-		}
+	if let Some(span) = minor_tick_spans.x.as_ref()
+		&& !matches!(x_scale, ScaleFamily::Linear)
+	{
+		return Err((
+			span.clone(),
+			format!(
+				"x_axis().minor_ticks(...) requires a linear numeric x axis; this figure resolves x as {x_scale:?}"
+			),
+		));
 	}
-	if let Some(span) = minor_tick_spans.y.as_ref() {
-		if !matches!(y_scale, ScaleFamily::Linear) {
-			return Err((
-				span.clone(),
-				format!(
-					"y_axis().minor_ticks(...) requires a linear numeric y axis; this figure resolves y as {y_scale:?}"
-				),
-			));
-		}
+	if let Some(span) = minor_tick_spans.y.as_ref()
+		&& !matches!(y_scale, ScaleFamily::Linear)
+	{
+		return Err((
+			span.clone(),
+			format!(
+				"y_axis().minor_ticks(...) requires a linear numeric y axis; this figure resolves y as {y_scale:?}"
+			),
+		));
 	}
 	Ok(())
 }
@@ -3034,7 +3038,7 @@ async fn dispatch_rune_relation_with_palettes(
 	}
 }
 
-#[cfg(all(test, feature = "toron"))]
+#[cfg(all(test, toron_local))]
 async fn dispatch_rune_relation(
 	connection: Arc<RwLock<dyn DatabaseAdapter>>,
 	view: TransformedRuneRelation,
@@ -3081,7 +3085,7 @@ fn resolve_rune_table(
 	})
 }
 
-#[cfg(all(test, feature = "toron"))]
+#[cfg(all(test, toron_local))]
 fn resolve_rune_table_skin_with(
 	intent: RuneTableSkinIntent,
 	mut resolve: impl FnMut(
@@ -3629,7 +3633,7 @@ fn rune_view_outcome_with_palettes(
 	Ok(RuneRelationViewSetOutcome { result, sinks })
 }
 
-#[cfg(all(test, feature = "toron"))]
+#[cfg(all(test, toron_local))]
 fn rune_view_outcome(
 	frame: DataFrame,
 	views: Vec<SpannedRuneViewIntent>,
@@ -6054,10 +6058,10 @@ fn publish_request(app_state: &AppState) -> crate::publication::PublishRequest {
 	let selection = &app_state.adapter_state.selection;
 	let mut secrets = Vec::new();
 	for descriptor in crate::adapters::driver::fields_for(selection) {
-		if descriptor.is_secure {
-			if let Some(value) = app_state.adapter_state.fields.get(descriptor.key) {
-				secrets.push(value.clone());
-			}
+		if descriptor.is_secure
+			&& let Some(value) = app_state.adapter_state.fields.get(descriptor.key)
+		{
+			secrets.push(value.clone());
 		}
 	}
 	secrets.push(app_state.adapter_state.ad_hoc_connection_string.clone());
@@ -6073,10 +6077,10 @@ fn publish_request(app_state: &AppState) -> crate::publication::PublishRequest {
 				continue;
 			};
 			for descriptor in crate::adapters::driver::fields_for(&kind) {
-				if descriptor.is_secure {
-					if let Some(value) = profile.fields.get(descriptor.key) {
-						secrets.push(value.clone());
-					}
+				if descriptor.is_secure
+					&& let Some(value) = profile.fields.get(descriptor.key)
+				{
+					secrets.push(value.clone());
 				}
 			}
 		}
@@ -6124,6 +6128,8 @@ fn sync_workspace_viewport(app_state: &mut AppState) {
 
 #[cfg(test)]
 mod tests {
+	#[cfg(any(not(feature = "toron"), toron_local))]
+	use super::resolve_startup;
 	#[cfg(toron_local)]
 	use super::{AdapterState, view};
 	#[cfg(toron_local)]
@@ -6133,8 +6139,8 @@ mod tests {
 	};
 	use super::{
 		clear_transient_execution_status_on_editor_activity, compact_rune_diagnostic,
-		compact_sql_diagnostic, new, resolve_notebook_rune_execution, resolve_startup,
-		session_identity_text, set_rune_error, set_sql_error, update,
+		compact_sql_diagnostic, new, resolve_notebook_rune_execution, session_identity_text,
+		set_rune_error, set_sql_error, update,
 	};
 	use crate::adapters::common::ExecutionResult;
 	#[cfg(toron_local)]
@@ -6145,26 +6151,33 @@ mod tests {
 	use crate::gui::messages::{Message, NotebookRuneFailure, NotebookRuneOutcome};
 	#[cfg(feature = "toron")]
 	use crate::gui::table_skin::{TableSkin, TableSkinProjection, TableSkinSpec};
-	#[cfg(feature = "toron")]
+	#[cfg(toron_local)]
+	use crate::plot::common::PlotLayout;
+	#[cfg(toron_local)]
 	use crate::plot::core::PlotType;
+	#[cfg(toron_local)]
+	use crate::plot::factory::{create_layered_plot, create_styled_plot};
 	#[cfg(feature = "toron")]
 	use crate::plot::factory::{
-		create_layered_plot, create_layered_plot_from_artifact, create_plot,
-		create_plot_from_artifact, create_styled_plot, create_styled_plot_from_artifact,
+		create_layered_plot_from_artifact, create_plot, create_plot_from_artifact,
+		create_styled_plot_from_artifact,
 	};
-	#[cfg(feature = "toron")]
+	#[cfg(toron_local)]
 	use crate::plot::grid::PlotGrid;
-	#[cfg(feature = "toron")]
+	#[cfg(toron_local)]
 	use crate::plot::{
-		common::{CoordinateTransformer, PlotKernel, PlotLayout, ResolvedPlotSettings},
+		common::{CoordinateTransformer, PlotKernel, ResolvedPlotSettings},
 		export::SvgBackend,
 	};
 	use crate::rune_host::ExportReceipt;
 	#[cfg(feature = "toron")]
 	use crate::rune_relation_envelope::{
-		LocalViewIdentity, PendingRuneView, RuneTableSkinIntent, RuneTableSkinProjection,
-		RuneViewForm, TransformedRuneRelation, TransformedRuneView,
+		LocalViewIdentity, PendingRuneView, RuneViewForm, TransformedRuneRelation,
 		transform as transform_rune_view,
+	};
+	#[cfg(toron_local)]
+	use crate::rune_relation_envelope::{
+		RuneTableSkinIntent, RuneTableSkinProjection, TransformedRuneView,
 	};
 	#[cfg(feature = "toron")]
 	use libaryon::core::BufferId;
@@ -6176,8 +6189,10 @@ mod tests {
 	#[cfg(feature = "toron")]
 	use std::collections::HashMap;
 	#[cfg(feature = "toron")]
-	use std::sync::{Arc, Mutex};
-	#[cfg(feature = "toron")]
+	use std::sync::Arc;
+	#[cfg(toron_local)]
+	use std::sync::Mutex;
+	#[cfg(toron_local)]
 	use tokio::sync::RwLock;
 
 	#[cfg(feature = "toron")]
@@ -6201,7 +6216,7 @@ mod tests {
 		)
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(toron_local)]
 	fn render_marks(kernel: &dyn PlotKernel) -> String {
 		render_marks_with_settings(kernel, ResolvedPlotSettings::default())
 	}
@@ -6244,7 +6259,7 @@ mod tests {
 		let id = "1234567890abcdef1234567890abcdef".parse().unwrap();
 		state.session_id = Some(id);
 		let copied = session_identity_text(id);
-		assert_eq!(copied.as_bytes().len(), 32);
+		assert_eq!(copied.len(), 32);
 		assert_eq!(copied, "1234567890abcdef1234567890abcdef");
 		assert_eq!(
 			copied.parse(),
@@ -6917,7 +6932,7 @@ mod tests {
 		assert_eq!(exported.receipts.len(), 1);
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(toron_local)]
 	fn render_marks_with_settings(
 		kernel: &dyn PlotKernel,
 		settings: ResolvedPlotSettings,
@@ -6946,7 +6961,7 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(toron_local)]
 	struct RecordingRuneAdapter {
 		calls: Arc<Mutex<Vec<String>>>,
 		fail_table: Option<&'static str>,
@@ -7092,7 +7107,7 @@ mod tests {
 	}
 	/// PRODUCT-0137: tests that expect a view set say so; production
 	/// consumers match both completion variants explicitly.
-	#[cfg(feature = "toron")]
+	#[cfg(toron_local)]
 	fn expect_views(
 		completion: crate::gui::messages::RuneRelationCompletion,
 	) -> crate::gui::messages::RuneRelationViewSetOutcome {
@@ -7122,9 +7137,10 @@ mod tests {
 		let transport: crate::adapters::common::RuneDispatchResult = Ok(
 			crate::adapters::common::RuneDispatchSuccess::Relation(Arc::clone(&artifact)),
 		);
-		let transported = transport
-			.expect("Rune transport accepts the artifact")
-			.expect_relation();
+		let Ok(transported) = transport else {
+			panic!("Rune transport accepts the artifact");
+		};
+		let transported = transported.expect_relation();
 		assert!(Arc::ptr_eq(&artifact, &transported));
 		let palettes = super::default_rune_categorical_palettes(&relation.views);
 		let outcome = super::rune_view_outcome_with_palettes(transported, relation.views, palettes)
@@ -7436,10 +7452,7 @@ mod tests {
 		polars::frame::DataFrame::new(
 			categories.len(),
 			vec![
-				polars::prelude::Column::new(
-					"cat".into(),
-					categories.iter().copied().collect::<Vec<_>>(),
-				),
+				polars::prelude::Column::new("cat".into(), categories.to_vec()),
 				polars::prelude::Column::new(
 					"val".into(),
 					(1..=categories.len() as i64).collect::<Vec<_>>(),
@@ -12927,7 +12940,6 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 				.collect::<Vec<_>>(),
 			[0, 19]
 		);
-		drop(run);
 		assert_eq!(
 			state
 				.rune_categorical_identities

@@ -107,6 +107,8 @@ impl ResolvedCategoricalPalette {
 		Self::from_non_empty_iter(first, colors.into_iter().skip(1))
 	}
 
+	// A palette always holds `first`, so an `is_empty` could only answer false.
+	#[allow(clippy::len_without_is_empty)]
 	pub fn len(&self) -> usize {
 		1 + self.rest.len()
 	}

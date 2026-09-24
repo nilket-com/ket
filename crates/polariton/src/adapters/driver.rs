@@ -746,8 +746,10 @@ mod tests {
 
 		// The scratch fallback: no external connection means Stopped waiting,
 		// whatever capability a previous connection left behind.
-		let mut state = AdapterState::default();
-		state.cancellation = CancelCapability::Refuse;
+		let state = AdapterState {
+			cancellation: CancelCapability::Refuse,
+			..AdapterState::default()
+		};
 		assert!(matches!(
 			state.active_cancel_capability(),
 			CancelCapability::StopWaiting
@@ -757,8 +759,10 @@ mod tests {
 	#[test]
 	fn provenance_identity_distinguishes_scratch_named_and_typed_connections() {
 		let runtime = tokio::runtime::Runtime::new().expect("runtime");
-		let mut state = AdapterState::default();
-		state.scratch = runtime.block_on(AdapterState::open_scratch());
+		let mut state = AdapterState {
+			scratch: runtime.block_on(AdapterState::open_scratch()),
+			..AdapterState::default()
+		};
 		assert_eq!(state.connection_identity(), "scratch");
 
 		state.connection = Some(

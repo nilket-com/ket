@@ -59,6 +59,14 @@ impl std::fmt::Display for ExportFormat {
 }
 
 #[derive(Clone)]
+#[cfg_attr(
+	not(feature = "toron"),
+	allow(
+		clippy::large_enum_variant,
+		reason = "the reduced head drops the Toron variants that balance the size; boxing \
+		          would change every constructor for a message moved once per update"
+	)
+)]
 pub enum Message {
 	NotebookTask {
 		id: libaryon::core::RequestId,

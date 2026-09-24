@@ -328,9 +328,29 @@ fn non_empty_path(value: Option<OsString>) -> Option<PathBuf> {
 	value.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
+fn config_reporting(
+	config: &RuneConfig,
+	enabled: bool,
+	endpoint: String,
+	pki: String,
+) -> Result<(), String> {
+	if !enabled {
+		return with_startup(config, |s| s.reporting = None);
+	}
+	let destination = crate::reporting::Destination {
+		endpoint,
+		pki: PathBuf::from(pki),
+	};
+	destination.validate()?;
+	with_startup(config, |s| s.reporting = Some(destination))
+}
+
 #[cfg(test)]
 mod tests {
-	use super::{PaneDividerReservation, SettingsPathEnv, StartupData, config_dir, load_from_path};
+	use super::{PaneDividerReservation, StartupData, load_from_path};
+	#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+	use super::{SettingsPathEnv, config_dir};
+	#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 	use std::ffi::OsString;
 	use std::path::PathBuf;
 	use std::sync::atomic::{AtomicU64, Ordering};
@@ -552,21 +572,4 @@ pub fn main(config) {
 		);
 		let _ = std::fs::remove_file(path);
 	}
-}
-
-fn config_reporting(
-	config: &RuneConfig,
-	enabled: bool,
-	endpoint: String,
-	pki: String,
-) -> Result<(), String> {
-	if !enabled {
-		return with_startup(config, |s| s.reporting = None);
-	}
-	let destination = crate::reporting::Destination {
-		endpoint,
-		pki: PathBuf::from(pki),
-	};
-	destination.validate()?;
-	with_startup(config, |s| s.reporting = Some(destination))
 }
