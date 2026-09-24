@@ -19,7 +19,8 @@ run() {
 
 run cargo fmt --check
 # Per-package runs include each crate's architecture test. A workspace-wide
-# run would build Polariton's default `toron-local`, which is Linux-only.
+# run would also build Nilket's Linux-only member crates.
 run cargo test --locked -p libaryon -p baryon -p ket
-run cargo test --locked -p polariton --no-default-features --features toron
+# Polariton's default features: local Toron supervision compiles out here.
+run cargo test --locked -p polariton
 run cargo check --locked -p polariton --no-default-features

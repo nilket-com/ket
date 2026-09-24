@@ -823,10 +823,23 @@ fn product_0006_creation_authority_stays_feature_gated_and_out_of_discovery() {
 	assert!(manifest.contains("optional = true"));
 	assert!(manifest.contains("\"dep:nix\""));
 
+	assert!(
+		manifest.contains("[target.'cfg(target_os = \"linux\")'.dependencies]\nnilket-local = {"),
+		"local Toron supervision dependencies must stay Linux-only (ADR 0165)"
+	);
+	let build = std::fs::read_to_string(manifest_dir.join("build.rs"))
+		.expect("read Polariton build script");
+	assert!(
+		build.contains("CARGO_FEATURE_TORON_LOCAL")
+			&& build.contains("os == \"linux\"")
+			&& build.contains("cargo::rustc-cfg=toron_local"),
+		"`toron_local` must mean the local Toron workspace feature on Linux"
+	);
+
 	let main =
 		std::fs::read_to_string(manifest_dir.join("src/main.rs")).expect("read Polariton main");
 	assert!(
-		main.contains("#[cfg(feature = \"toron-local\")]\nmod local_workspace;"),
+		main.contains("#[cfg(toron_local)]\nmod local_workspace;"),
 		"PRODUCT-0006 process authority must disappear without the local Toron workspace feature"
 	);
 	let owner = std::fs::read_to_string(manifest_dir.join("src/local_workspace.rs"))

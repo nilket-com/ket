@@ -8904,7 +8904,7 @@ mod tests {
 		);
 	}
 
-	#[cfg(feature = "toron-local")]
+	#[cfg(toron_local)]
 	#[test]
 	fn product_0070_saved_restart_preserves_product_0062_views_groups_and_colours_before_rerun() {
 		const CHILD: &str = "POLARITON_PRODUCT_0062_0070_RESTART_CHILD";

@@ -236,7 +236,7 @@ pub fn main_screen<'a>(
 	} else {
 		container(text("")).into()
 	};
-	#[cfg(feature = "toron-local")]
+	#[cfg(toron_local)]
 	let local_workspace_overlay: Element<Message> = local_workspace_offer.map_or_else(
 		|| container(text("")).into(),
 		|profile_root| {
@@ -267,7 +267,7 @@ pub fn main_screen<'a>(
 			.into()
 		},
 	);
-	#[cfg(not(feature = "toron-local"))]
+	#[cfg(not(toron_local))]
 	let local_workspace_overlay: Element<Message> = {
 		let _ = local_workspace_offer;
 		container(text("")).into()

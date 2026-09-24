@@ -46,11 +46,11 @@ impl AppState {
 		{
 			return Task::none();
 		}
-		#[cfg(feature = "toron-local")]
+		#[cfg(toron_local)]
 		if self.welcome.workspace_requested && self.local_creation.offer().is_some() {
 			return update_inner(self, Message::StartLocalWorkspace);
 		}
-		#[cfg(feature = "toron-local")]
+		#[cfg(toron_local)]
 		if self.welcome.workspace_requested
 			&& !self.welcome.workspace_seeded
 			&& matches!(
@@ -131,7 +131,7 @@ impl AppState {
 			return;
 		}
 		match message {
-			#[cfg(feature = "toron-local")]
+			#[cfg(toron_local)]
 			Message::LocalWorkspaceStartupSettled(Err(_)) => {
 				self.welcome.workspace_requested = false;
 				self.reporting.emit(
@@ -342,7 +342,7 @@ pub(super) fn view<'a>(state: &'a AppState, screen: Element<'a, Message>) -> Ele
 		.spacing(8)
 	]
 	.spacing(6);
-	#[cfg(feature = "toron-local")]
+	#[cfg(toron_local)]
 	let controls =
 		controls.push(button("Start workspace (optional)").on_press(Message::WelcomeWorkspace));
 	column![screen, container(controls).padding(10)].into()
@@ -360,7 +360,7 @@ mod tests {
 		.expect("offline notebook produces plot");
 		assert!(app.state_mut().welcome.rendered);
 		assert!(app.state_mut().reporting.detail().is_none());
-		#[cfg(feature = "toron-local")]
+		#[cfg(toron_local)]
 		assert!(app.state_mut().adapter_state.local_workspace.is_none());
 		let scratch =
 			std::env::temp_dir().join(format!("polariton-first-run-{}", uuid::Uuid::new_v4()));
@@ -402,7 +402,7 @@ mod tests {
 		assert!(published.publish.is_some());
 		std::fs::remove_dir_all(scratch).unwrap();
 	}
-	#[cfg(feature = "toron-local")]
+	#[cfg(toron_local)]
 	#[test]
 	fn product_0161_workspace_source_preserves_the_notebook_buffer() {
 		let mut app = super::super::headless::HeadlessApplication::open_welcome().unwrap();
@@ -427,7 +427,7 @@ mod tests {
 			.unwrap();
 		assert_eq!(before, after);
 	}
-	#[cfg(feature = "toron-local")]
+	#[cfg(toron_local)]
 	#[test]
 	#[ignore = "requires an isolated XDG profile; set POLARITON_0161_WORKSPACE_EXPECT to ready or missing"]
 	fn product_0161_workspace_path_against_an_isolated_profile() {

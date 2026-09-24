@@ -182,7 +182,7 @@ pub struct AdapterState {
 	/// PRODUCT-0135 §2: the external connection's cancellation capability,
 	/// held beside the connection, never behind its lock.
 	pub cancellation: CancelCapability,
-	#[cfg(feature = "toron-local")]
+	#[cfg(toron_local)]
 	pub local_workspace: Option<nilket_local::LocalWorkspace>,
 	/// Session-local in-memory SQLite scratch database. Always the SQL target
 	/// when no external adapter is connected, so SQL panes and notebook cells
@@ -242,7 +242,7 @@ impl AdapterState {
 			.and(self.connection.as_ref())
 	}
 
-	#[cfg(feature = "toron-local")]
+	#[cfg(toron_local)]
 	pub fn local_workspace_unavailable(&self) -> String {
 		self.local_workspace.as_ref().map_or_else(
 			|| "Local workspace discovery has not completed.".to_owned(),

@@ -42,8 +42,8 @@ not only the XDG ones.
 ## Mechanisms in this cut
 
 These may be replaced without revisiting the decision:
-`--no-default-features --features toron` as the macOS Polariton head while
-`toron-local` pulls in Linux-only Nilket crates; one recursive FSEvents
+Linux-only target dependencies for `toron-local`, with a `toron_local` build
+cfg, so Polariton's default features build on macOS; one recursive FSEvents
 watch per outermost directory for the Git observer, filtered back to the
 directories a non-recursive watch would cover; a catch-up Git refresh after
 watch setup on every platform; `cfg(unix)` for the job supervisor's
@@ -72,14 +72,14 @@ passes in the interactive one.
 
 ## Limits and follow-up
 
-A plain `cargo build` of Polariton on macOS fails until `toron-local`'s
-dependencies become Linux-only target dependencies, the same follow-up ADR
-0163 records for Windows. There is no `.app` bundle, signing, or
-notarization yet. Native per-platform gates replace the Linux gate's
-cross-target step: `ci/check-macos.sh` on macOS and `ci/check-windows.ps1`
-on Windows, each run on the same commit as `ci/check.sh`. The invalid-UTF-8
-file-name fixtures fail to create on the APFS volume used for bring-up
-(`EILSEQ`), so the tests that need them are gated off macOS; the product
-behavior is unchanged. Neither Baryon's interactive smoke, a Polariton GUI
-session, nor a live remote Toron connection has been walked on macOS; those
-are validation still to do.
+A root-level `cargo build` of the whole workspace still compiles Nilket's
+Linux-only crates, which the workspace takes in as path members; building
+Polariton itself works with its default features. There is no `.app` bundle,
+signing, or notarization yet. Native per-platform gates replace the Linux
+gate's cross-target step: `ci/check-macos.sh` on macOS and
+`ci/check-windows.ps1` on Windows, each run on the same commit as
+`ci/check.sh`. The invalid-UTF-8 file-name fixtures fail to create on the
+APFS volume used for bring-up (`EILSEQ`), so the tests that need them are
+gated off macOS; the product behavior is unchanged. Neither Baryon's
+interactive smoke, a Polariton GUI session, nor a live remote Toron
+connection has been walked on macOS; those are validation still to do.

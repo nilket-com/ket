@@ -880,7 +880,7 @@ mod tests {
 	#[test]
 	fn product_0162_headless_file_edit_run_and_publish_share_the_application() {
 		let mut f = Fixture::new();
-		#[cfg(feature = "toron-local")]
+		#[cfg(toron_local)]
 		assert!(f.app.state().adapter_state.local_workspace.is_none());
 		let csv = f.root.join("own.csv");
 		std::fs::write(&csv, "x,y\n1,3\n2,6\n3,4\n").unwrap();

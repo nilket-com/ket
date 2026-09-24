@@ -8,7 +8,7 @@ mod first_run;
 mod fonts;
 mod gui;
 mod live;
-#[cfg(feature = "toron-local")]
+#[cfg(toron_local)]
 mod local_workspace;
 mod plot;
 mod presentation_registry;

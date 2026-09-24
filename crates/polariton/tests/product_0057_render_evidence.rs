@@ -20,7 +20,7 @@ mod fonts;
 mod gui;
 #[path = "../src/live/mod.rs"]
 mod live;
-#[cfg(feature = "toron-local")]
+#[cfg(toron_local)]
 #[path = "../src/local_workspace.rs"]
 mod local_workspace;
 #[path = "../src/plot/mod.rs"]

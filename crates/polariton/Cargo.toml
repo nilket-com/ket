@@ -75,6 +75,12 @@ unicode-segmentation = "1.13.2"
 zeroize.workspace = true
 unicode-width = "0.2.2"
 toron-client = { path = "../../nilket/crates/toron-client", optional = true }
+
+# Local Toron supervision is Linux-only (ADR 0165). As target dependencies,
+# `toron-local` enables them on Linux only; elsewhere local supervision
+# compiles out and the default feature set builds on every desktop. build.rs
+# sets `toron_local` to match.
+[target.'cfg(target_os = "linux")'.dependencies]
 nilket-local = { path = "../../nilket/crates/nilket-local", optional = true }
 nix = { version = "0.29", features = ["process", "signal"], optional = true }
 

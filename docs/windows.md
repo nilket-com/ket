@@ -41,10 +41,12 @@ clipboard paste in your terminal.
 .\target\x86_64-pc-windows-msvc\debug\polariton.exe
 ```
 
-This selects `cargo build -p polariton --no-default-features` with the locked
-dependencies and native target. The default `toron` feature includes Unix-only
-local process supervision, so leave it disabled for this Windows build path.
-This does not establish Windows support for remote Toron connections.
+This selects the reduced head, `cargo build -p polariton --no-default-features`,
+with the locked dependencies and native target. A plain `cargo build -p
+polariton` also works: the default `toron-local` feature's local process
+supervision is Linux-only and compiles out here, leaving the remote `toron`
+client. Neither establishes Windows support for remote Toron
+connections.
 
 For a plotting example that works without Toron, open
 `uat/native_plot_showcase.md` and run the cells in order on the scratch SQLite

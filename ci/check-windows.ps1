@@ -23,10 +23,11 @@ Push-Location (Split-Path -Parent $PSScriptRoot)
 try {
     Invoke-Step @('fmt', '--check')
     # Per-package runs include each crate's architecture test. A workspace-wide
-    # run would build Polariton's default `toron-local`, which is Linux-only.
+    # run would also build Nilket's Linux-only member crates.
     # Serial, because some engine tests depend on uncontended timing.
     Invoke-Step @('test', '--locked', '-p', 'libaryon', '-p', 'baryon', '-p', 'ket', '--', '--test-threads=1')
-    Invoke-Step @('test', '--locked', '-p', 'polariton', '--no-default-features', '--features', 'toron', '--', '--test-threads=1')
+    # Polariton's default features: local Toron supervision compiles out here.
+    Invoke-Step @('test', '--locked', '-p', 'polariton', '--', '--test-threads=1')
     Invoke-Step @('check', '--locked', '-p', 'polariton', '--no-default-features')
 } finally {
     Pop-Location

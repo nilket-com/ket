@@ -1122,7 +1122,7 @@ mod tests {
 	/// workspace, on-open cannot execute a Rune source and refuses the
 	/// invocation as before; by-command opens it and applies the script,
 	/// with nothing executed and the receipt naming the mode.
-	#[cfg(not(feature = "toron-local"))]
+	#[cfg(not(toron_local))]
 	#[test]
 	fn adr0169_by_command_opens_without_executing_and_on_open_keeps_its_refusal() {
 		let dir = std::env::temp_dir().join(format!(

@@ -254,12 +254,12 @@ mod tests {
 	static LIVE_TORON_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 	fn live_endpoint() -> String {
-		#[cfg(feature = "toron-local")]
+		#[cfg(toron_local)]
 		{
 			std::env::var("TORON_SQL_ENDPOINT")
 				.unwrap_or_else(|_| nilket_local::SQL_ENDPOINT.to_owned())
 		}
-		#[cfg(not(feature = "toron-local"))]
+		#[cfg(not(toron_local))]
 		{
 			// The portable head knows no local workspace; the live gates name
 			// their Toron explicitly.

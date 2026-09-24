@@ -93,20 +93,20 @@ pub enum Message {
 	CancelRun,
 	/// The engine-side signal settled; report the outcome in the routine lane.
 	CancelSignalSettled(Result<(), String>),
-	#[cfg(feature = "toron-local")]
+	#[cfg(toron_local)]
 	LocalWorkspaceDiscovered(nilket_local::LocalWorkspace),
-	#[cfg(feature = "toron-local")]
+	#[cfg(toron_local)]
 	LocalWorkspaceAttached {
 		workspace: nilket_local::ReadyWorkspace,
 		connection: Result<(Arc<RwLock<dyn DatabaseAdapter>>, CancelCapability), String>,
 	},
-	#[cfg(feature = "toron-local")]
+	#[cfg(toron_local)]
 	StartLocalWorkspace,
-	#[cfg(feature = "toron-local")]
+	#[cfg(toron_local)]
 	LocalWorkspaceStartupSettled(
 		std::result::Result<nilket_local::ReadyWorkspace, (nilket_local::LocalWorkspace, String)>,
 	),
-	#[cfg(feature = "toron-local")]
+	#[cfg(toron_local)]
 	LocalWorkspaceStopped(String),
 	/// The session's in-memory scratch database finished opening at startup.
 	ScratchReady(Option<Arc<RwLock<dyn DatabaseAdapter>>>),
@@ -154,9 +154,9 @@ pub enum Message {
 	Run,
 	WelcomePath(String),
 	WelcomeOpen,
-	#[cfg(feature = "toron-local")]
+	#[cfg(toron_local)]
 	WelcomeWorkspace,
-	#[cfg(feature = "toron-local")]
+	#[cfg(toron_local)]
 	WelcomeSeeded(Result<(), String>),
 	RunSnippet,
 	RunResult {
