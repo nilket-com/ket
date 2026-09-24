@@ -281,7 +281,7 @@ impl EngineHandle {
 		)
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, unix))]
 	fn checkpoint_with_fault(
 		&self,
 		fault: super::session_checkpoint::CheckpointFault,
@@ -289,7 +289,7 @@ impl EngineHandle {
 		super::request::checkpoint_with_fault(&self.commands, fault)
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, unix))]
 	fn checkpoint_with_application_owner_and_fault(
 		&self,
 		fault: super::session_checkpoint::CheckpointFault,
@@ -587,6 +587,7 @@ mod tests {
 		handle.shutdown().expect("engine thread");
 	}
 	use crate::core::DocLine;
+	#[cfg(unix)]
 	use crate::core::SessionStore;
 	use crate::engine::shadow::{discard_shadow_session, load_shadow_session, shadow_dir_for_path};
 	use crate::engine::{

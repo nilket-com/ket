@@ -6513,6 +6513,8 @@ mod tests {
 		ViewId,
 	};
 	use crate::ecs::UastRegistry;
+	#[cfg(unix)]
+	use crate::engine::PaneResizeDirection;
 	use crate::engine::event_bus::EngineEvent;
 	use crate::engine::event_subscribers::BaselineBuilder;
 	use crate::engine::file_browser::{create_file_browser_buffer, initialize_file_browser};
@@ -6523,7 +6525,6 @@ mod tests {
 	use crate::engine::{
 		HostPanelDescriptor, HostPanelGroupId, HostPanelGroupLayout, HostPanelGroupMember,
 		HostPanelGroupShape, HostPanelId, PaneDividerReservation, PaneDropEdge,
-		PaneResizeDirection,
 	};
 	use crate::engine::{SplitDirection, UiColorOverrides, VisualKind};
 	use crate::uast::UastMutation;

@@ -15,6 +15,13 @@ pub(crate) enum EngineRequest {
 		mpsc::Sender<Result<(), super::session_checkpoint::SessionCheckpointError>>,
 	),
 	#[cfg(test)]
+	#[cfg_attr(
+		not(unix),
+		allow(
+			dead_code,
+			reason = "fault injection drives the Unix-only saved-session tests"
+		)
+	)]
 	CheckpointWithFault(
 		super::session_checkpoint::CheckpointFault,
 		Option<super::session_checkpoint::ApplicationCheckpoint>,
@@ -204,7 +211,7 @@ pub(crate) fn checkpoint_with_application_owner(
 		.map_err(|_| super::session_checkpoint::SessionCheckpointError::EngineStopped)?
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn checkpoint_with_fault(
 	commands: &CommandSender,
 	fault: super::session_checkpoint::CheckpointFault,
@@ -219,7 +226,7 @@ pub(crate) fn checkpoint_with_fault(
 		.map_err(|_| super::session_checkpoint::SessionCheckpointError::EngineStopped)?
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn checkpoint_with_application_owner_and_fault(
 	commands: &CommandSender,
 	fault: super::session_checkpoint::CheckpointFault,

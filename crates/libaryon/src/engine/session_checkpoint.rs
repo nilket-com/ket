@@ -562,6 +562,13 @@ fn checkpoint_documents_with_commit(
 }
 
 #[cfg(test)]
+#[cfg_attr(
+	not(unix),
+	allow(
+		dead_code,
+		reason = "fault injection drives the Unix-only saved-session tests"
+	)
+)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CheckpointFault {
 	BeforeCurrent,
@@ -865,12 +872,19 @@ fn corrupt<T>(reason: impl Into<String>) -> Result<T, SessionStoreError> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[cfg(unix)]
 	use crate::core::SessionStore;
+	#[cfg(unix)]
 	use crate::engine::UiColorOverrides;
+	#[cfg(unix)]
 	use crate::engine::session::{EditorSession, LayoutNode};
+	#[cfg(unix)]
 	use crate::engine::settings::SaveDurability;
+	#[cfg(unix)]
 	use crate::engine::undo::HistoryDirection;
+	#[cfg(unix)]
 	use std::collections::BTreeMap;
+	#[cfg(unix)]
 	use std::path::PathBuf;
 	fn identity(id: u64) -> DocumentIdentity {
 		DocumentIdentity::new(DocumentId::new(id).unwrap(), None)
@@ -912,6 +926,7 @@ mod tests {
 		})
 	}
 
+	#[cfg(unix)]
 	fn saved_editor(registry: &crate::ecs::UastRegistry) -> (EditorSession, PathBuf) {
 		let root = std::env::temp_dir().join(format!(
 			"libaryon-document-checkpoint-{}-{}",
@@ -941,6 +956,7 @@ mod tests {
 		(editor, root)
 	}
 
+	#[cfg(unix)]
 	fn temp_root(name: &str) -> PathBuf {
 		std::env::temp_dir().join(format!(
 			"libaryon-{name}-{}-{}",
@@ -949,10 +965,12 @@ mod tests {
 		))
 	}
 
+	#[cfg(unix)]
 	fn stamp(path: &Path) -> FileStamp {
 		FileStamp::from_metadata(&std::fs::metadata(path).expect("file metadata"))
 	}
 
+	#[cfg(unix)]
 	fn checkpoint_for(
 		id: DocumentId,
 		bytes: &[u8],

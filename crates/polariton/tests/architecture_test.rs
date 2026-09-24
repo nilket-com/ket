@@ -6240,7 +6240,7 @@ fn product_0151_identity_grid_and_in_process_boundaries_are_pinned() {
 		"facet redraws only reproject anchors retained at selection time"
 	);
 	let selection_gesture = common
-		.split("if self.selection_axis_fields.is_some()")
+		.split("if let Some(axis_fields) = self.selection_axis_fields {")
 		.nth(1)
 		.and_then(|rest| {
 			rest.split("if let Some(stamp) = self.viewport_stamp")

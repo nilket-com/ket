@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AtomicWriteOptions {
+	#[cfg_attr(not(unix), allow(dead_code, reason = "only Unix has mode bits"))]
 	unix_mode: Option<u32>,
 	preserve_existing_permissions: bool,
 	require_existing_writable: bool,

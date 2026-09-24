@@ -4,6 +4,7 @@
 //! create, or restore a session; callers must explicitly create or open one. The production
 //! editor remains ephemeral until a later consumer chooses a saved session.
 
+#[cfg(unix)]
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -15,8 +16,10 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::SystemTime;
 
+#[cfg(unix)]
 const STORE_VERSION: u32 = 1;
 const SESSION_ID_HEX_LEN: usize = 32;
+#[cfg(unix)]
 const GENERATION_HEX_LEN: usize = 16;
 
 /// Opaque identity for one continuing saved session.
@@ -28,6 +31,7 @@ impl SessionId {
 		(bytes != [0; 16]).then_some(Self(bytes))
 	}
 
+	#[cfg(unix)]
 	fn mint() -> Self {
 		loop {
 			if let Some(id) = Self::from_random_bytes(rand::random()) {
@@ -142,6 +146,7 @@ impl OwnerId {
 		&self.0
 	}
 
+	#[cfg(unix)]
 	fn payload_name(&self) -> String {
 		format!("{}.payload", self.0)
 	}
@@ -293,6 +298,13 @@ struct OwnerPayload {
 /// A durable-session store rooted below the head-neutral platform state path.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
+	#[cfg_attr(
+		not(unix),
+		allow(
+			dead_code,
+			reason = "saved sessions need flock; other platforms refuse first"
+		)
+	)]
 	root: PathBuf,
 }
 
@@ -307,7 +319,7 @@ impl SessionStore {
 			.ok_or(SessionStoreError::StateRootUnavailable)
 	}
 
-	#[cfg(test)]
+	#[cfg(all(test, unix))]
 	pub(crate) fn at(root: PathBuf) -> Self {
 		Self { root }
 	}
@@ -351,6 +363,13 @@ pub struct SavedSession<Mode: sealed::AccessMode> {
 	session_dir: std::fs::File,
 	#[cfg(unix)]
 	_lock: std::fs::File,
+	#[cfg_attr(
+		not(unix),
+		allow(
+			dead_code,
+			reason = "saved sessions need flock; other platforms refuse first"
+		)
+	)]
 	publication_uncertain: bool,
 	_mode: PhantomData<Mode>,
 }
@@ -498,6 +517,7 @@ impl From<io::Error> for SessionStoreError {
 	}
 }
 
+#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DiskSnapshot {
@@ -509,6 +529,7 @@ struct DiskSnapshot {
 	owners: Vec<DiskOwner>,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DiskDocument {
@@ -516,6 +537,7 @@ struct DiskDocument {
 	path_hex: Option<String>,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DiskOwner {
@@ -542,6 +564,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 	encoded
 }
 
+#[cfg(unix)]
 fn decode_hex(value: &str, subject: &str) -> Result<Vec<u8>, SessionStoreError> {
 	if !value.len().is_multiple_of(2)
 		|| !value

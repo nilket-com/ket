@@ -277,6 +277,30 @@ async fn drive_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpi
 	}
 }
 
+/// Open a named pipe, waiting briefly while the server is between instances
+/// (`ERROR_PIPE_BUSY`) or has not created the next one yet (`NotFound`),
+/// which are the two transient states a live server passes through.
+#[cfg(windows)]
+pub(crate) async fn windows_open(
+	name: &std::ffi::OsStr,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+	const ERROR_PIPE_BUSY: i32 = 231;
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+	loop {
+		match tokio::net::windows::named_pipe::ClientOptions::new().open(name) {
+			Ok(pipe) => return Ok(pipe),
+			Err(error)
+				if (error.raw_os_error() == Some(ERROR_PIPE_BUSY)
+					|| error.kind() == std::io::ErrorKind::NotFound)
+					&& std::time::Instant::now() < deadline =>
+			{
+				tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+			}
+			Err(error) => return Err(error),
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -513,30 +537,6 @@ mod tests {
 			vec!["--session", "s", "--source", "f"],
 		] {
 			assert!(parse(&args).is_err());
-		}
-	}
-}
-
-/// Open a named pipe, waiting briefly while the server is between instances
-/// (`ERROR_PIPE_BUSY`) or has not created the next one yet (`NotFound`),
-/// which are the two transient states a live server passes through.
-#[cfg(windows)]
-pub(crate) async fn windows_open(
-	name: &std::ffi::OsStr,
-) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
-	const ERROR_PIPE_BUSY: i32 = 231;
-	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-	loop {
-		match tokio::net::windows::named_pipe::ClientOptions::new().open(name) {
-			Ok(pipe) => return Ok(pipe),
-			Err(error)
-				if (error.raw_os_error() == Some(ERROR_PIPE_BUSY)
-					|| error.kind() == std::io::ErrorKind::NotFound)
-					&& std::time::Instant::now() < deadline =>
-			{
-				tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-			}
-			Err(error) => return Err(error),
 		}
 	}
 }

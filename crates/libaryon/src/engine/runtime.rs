@@ -6233,6 +6233,7 @@ mod event_bus_integration_tests {
 	};
 	use crate::engine::settings::SaveDurability;
 	use crate::engine::ui_colors::UiColorOverrides;
+	#[cfg(unix)]
 	use crate::engine::{InputEvent, KeyCode, Modifiers};
 	use std::collections::BTreeMap;
 	use std::fs;
