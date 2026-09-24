@@ -495,11 +495,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn product_0160_socket_ids_are_connection_scoped_and_busy_does_not_queue() {
-		let root = std::env::temp_dir().join(format!(
-			"p16-wire-{}-{}",
-			std::process::id(),
-			crate::selection::SurfaceIncarnation::mint().token()
-		));
+		let root = super::super::discovery::test_runtime_root("wire");
 		let window = super::super::discovery::Window::create(root.clone(), None, vec![]).unwrap();
 		let server = Server::bind(
 			&window.advertisement.socket,

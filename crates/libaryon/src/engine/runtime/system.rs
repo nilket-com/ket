@@ -5018,6 +5018,10 @@ mod tests {
 	fn git_status_opens_a_reusable_styled_output_panel_and_shows_porcelain_entries() {
 		let repo = temp_test_path("git-status-panel");
 		fs::create_dir_all(&repo).expect("create git fixture");
+		// Git reports the resolved root; macOS temp dirs sit behind `/var` → `/private/var`.
+		// Windows canonical paths carry a `\\?\` prefix Git never prints, so resolve on Unix only.
+		#[cfg(unix)]
+		let repo = fs::canonicalize(&repo).expect("resolve git fixture");
 		let initialized = Command::new("git")
 			.args(["init", "--quiet"])
 			.current_dir(&repo)
@@ -5143,6 +5147,13 @@ mod tests {
 			assert!(initialized.success(), "git init failed");
 			fs::write(repo.join("main.rs"), "fn main() {}\n").expect("write source");
 		}
+		// Git reports resolved roots; macOS temp dirs sit behind `/var` → `/private/var`.
+		// Windows canonical paths carry a `\\?\` prefix Git never prints, so resolve on Unix only.
+		#[cfg(unix)]
+		let (repo_a, repo_b) = (
+			fs::canonicalize(&repo_a).expect("resolve repo A"),
+			fs::canonicalize(&repo_b).expect("resolve repo B"),
+		);
 		fs::write(repo_a.join("only-a.txt"), "a\n").expect("write repo A marker");
 		fs::write(repo_b.join("only-b.txt"), "b\n").expect("write repo B marker");
 

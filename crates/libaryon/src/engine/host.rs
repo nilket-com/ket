@@ -38,6 +38,10 @@ pub struct EngineConfig {
 	/// init-script or initial-file render never exposes the engine's fallback
 	/// 80-column geometry.
 	pub initial_viewport: Option<(u16, u16)>,
+	/// Load and append the user's command and search history. Hosts running
+	/// disposable engines, such as tests, turn this off so they never read or
+	/// write the real history file.
+	pub persistent_history: bool,
 	/// Optional Rune startup script. Library embedders must opt in explicitly.
 	pub init_script: Option<PathBuf>,
 	/// Function within `init_script` that configures the editor host.
@@ -60,6 +64,7 @@ impl From<EngineSettings> for EngineConfig {
 			divider_reservation: super::PaneDividerReservation::default(),
 			initial_file: None,
 			initial_viewport: None,
+			persistent_history: true,
 			init_script: None,
 			init_entrypoint: "main".to_string(),
 		}
@@ -186,6 +191,7 @@ impl EngineHandle {
 			divider_reservation,
 			initial_file,
 			initial_viewport,
+			persistent_history,
 			init_script,
 			init_entrypoint,
 		} = config;
@@ -214,6 +220,7 @@ impl EngineHandle {
 			)
 			.with_initial_file(initial_file)
 			.with_initial_viewport(initial_viewport)
+			.with_persistent_history(persistent_history)
 			.with_divider_reservation(divider_reservation)
 			.with_host_events(tx_host_events)
 			.with_rune_host_config(init_script.map(|path| {
@@ -1523,7 +1530,8 @@ mod tests {
 		let _ = fs::remove_dir_all(post_root);
 	}
 
-	#[cfg(unix)]
+	// APFS rejects file names that are not UTF-8 (EILSEQ), so the fixture cannot exist on macOS.
+	#[cfg(all(unix, not(target_os = "macos")))]
 	#[test]
 	fn product_0060_saved_engine_restores_and_saves_exact_non_utf8_paths() {
 		use crate::engine::session::{FileStamp, LanguageSelection};
@@ -4105,7 +4113,7 @@ pub fn main(editor) {
 			r#"
 pub fn main(editor) {
     baryon::command(editor, "runejoberror", |editor, args, bang| {
-        let spec = match baryon::JobSpec::new("/bin/true", []) {
+        let spec = match baryon::JobSpec::new("/usr/bin/true", []) {
             Ok(spec) => spec,
             Err(_) => panic("job spec"),
         };

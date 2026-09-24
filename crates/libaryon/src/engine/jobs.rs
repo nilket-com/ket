@@ -1015,11 +1015,11 @@ fn supervise(
 	control: mpsc::Receiver<SupervisorControl>,
 	budget: Arc<JobBufferBudget>,
 ) -> SupervisorReport {
-	#[cfg(target_os = "linux")]
+	#[cfg(unix)]
 	{
-		supervise_linux(prepared, control, budget)
+		supervise_unix(prepared, control, budget)
 	}
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(not(unix))]
 	{
 		supervise_portable(prepared, control, budget)
 	}
@@ -1044,8 +1044,8 @@ fn command_for(prepared: &PreparedJob) -> Command {
 	command
 }
 
-#[cfg(target_os = "linux")]
-fn supervise_linux(
+#[cfg(unix)]
+fn supervise_unix(
 	mut prepared: PreparedJob,
 	control: mpsc::Receiver<SupervisorControl>,
 	budget: Arc<JobBufferBudget>,
@@ -1207,7 +1207,7 @@ fn supervise_linux(
 	}
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn set_nonblocking(fd: std::os::fd::RawFd) {
 	// SAFETY: fcntl only observes/updates flags for a live fd owned by this supervisor.
 	let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -1217,20 +1217,20 @@ fn set_nonblocking(fd: std::os::fd::RawFd) {
 	}
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn signal_group(pgid: i32, signal: i32) {
 	// SAFETY: negative pgid targets the child-owned process group, never an arbitrary pid.
 	let _ = unsafe { libc::kill(-pgid, signal) };
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 enum NonblockingWrite {
 	Progress(usize),
 	Pending,
 	Closed,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn write_fd(fd: std::os::fd::RawFd, bytes: &[u8]) -> NonblockingWrite {
 	loop {
 		// SAFETY: bytes is valid for its length and fd is a live nonblocking child stdin.
@@ -1246,7 +1246,7 @@ fn write_fd(fd: std::os::fd::RawFd, bytes: &[u8]) -> NonblockingWrite {
 	}
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn read_fd<T: std::os::fd::AsRawFd>(
 	handle: &mut Option<T>,
 	budget: &Arc<JobBufferBudget>,
@@ -1279,7 +1279,7 @@ fn read_fd<T: std::os::fd::AsRawFd>(
 	}
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn poll_fds(stdin: Option<i32>, stdout: Option<i32>, stderr: Option<i32>) {
 	let mut fds = Vec::with_capacity(3);
 	if let Some(fd) = stdin {
@@ -1300,7 +1300,7 @@ fn poll_fds(stdin: Option<i32>, stdout: Option<i32>, stderr: Option<i32>) {
 	let _ = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 10) };
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn supervise_portable(
 	mut prepared: PreparedJob,
 	control: mpsc::Receiver<SupervisorControl>,
@@ -1420,7 +1420,7 @@ fn supervise_portable(
 	}
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn status_candidate(status: std::process::ExitStatus) -> CandidateOutcome {
 	status
 		.code()
@@ -1434,12 +1434,38 @@ mod tests {
 	use super::super::request::EngineRequest;
 	use super::*;
 
+	#[cfg(unix)]
+	fn wait_for_pidfile(path: &PathBuf, expected: usize) -> Vec<i32> {
+		let ready_by = Instant::now() + Duration::from_secs(2);
+		loop {
+			if let Ok(contents) = std::fs::read_to_string(path) {
+				if contents.ends_with('\n') {
+					let pids = contents
+						.split_whitespace()
+						.map(str::parse::<i32>)
+						.collect::<Result<Vec<_>, _>>();
+					if let Ok(pids) = pids {
+						if pids.len() == expected && pids.iter().all(|pid| *pid > 0) {
+							return pids;
+						}
+					}
+				}
+			}
+			assert!(
+				Instant::now() < ready_by,
+				"pidfile {} was not ready",
+				path.display()
+			);
+			thread::sleep(Duration::from_millis(2));
+		}
+	}
+
 	#[derive(Debug, Clone)]
 	struct FakeAction;
 
 	fn spec(owner: RegistryOwnerId) -> JobSpec {
 		JobSpec {
-			program: PathBuf::from("/bin/true"),
+			program: PathBuf::from("/usr/bin/true"),
 			args: Vec::new(),
 			cwd: None,
 			stdin: None,
@@ -2032,7 +2058,7 @@ mod tests {
 		);
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(unix)]
 	#[test]
 	fn shutdown_kills_the_supervisors_process_group() {
 		let (_, _, internal, _requests) = super::super::request::channel();
@@ -2057,15 +2083,7 @@ mod tests {
 			)),
 		];
 		runtime.spawn(owner, true, job).expect("spawn process tree");
-		let ready_by = Instant::now() + Duration::from_secs(2);
-		while !pidfile.exists() && Instant::now() < ready_by {
-			thread::sleep(Duration::from_millis(2));
-		}
-		let pid: i32 = std::fs::read_to_string(&pidfile)
-			.expect("grandchild pidfile")
-			.trim()
-			.parse()
-			.expect("grandchild pid");
+		let pid = wait_for_pidfile(&pidfile, 1)[0];
 		runtime.shutdown();
 
 		let gone_by = Instant::now() + Duration::from_millis(500);
@@ -2083,7 +2101,7 @@ mod tests {
 		let _ = std::fs::remove_file(pidfile);
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(unix)]
 	#[test]
 	fn timeout_escalates_and_reaps_the_whole_process_group() {
 		let (_, _, internal, requests) = super::super::request::channel();
@@ -2110,16 +2128,7 @@ mod tests {
 		job.timeout = Duration::from_millis(20);
 		let started = Instant::now();
 		let id = runtime.spawn(owner, true, job).expect("spawn timeout tree");
-		let ready_by = Instant::now() + Duration::from_secs(2);
-		while !pidfile.exists() && Instant::now() < ready_by {
-			thread::sleep(Duration::from_millis(2));
-		}
-		let pids: Vec<i32> = std::fs::read_to_string(&pidfile)
-			.expect("process-tree pidfile")
-			.split_whitespace()
-			.map(|pid| pid.parse().expect("process-tree pid"))
-			.collect();
-		assert_eq!(pids.len(), 2);
+		let pids = wait_for_pidfile(&pidfile, 2);
 
 		receive_completion(&mut runtime, &requests, id, true);
 		assert!(started.elapsed() >= JOB_KILL_GRACE);

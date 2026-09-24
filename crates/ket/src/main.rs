@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn main() -> ExitCode {
 	match ket::run(std::env::args_os()) {
 		Ok(()) => ExitCode::SUCCESS,
@@ -11,8 +11,10 @@ fn main() -> ExitCode {
 	}
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn main() -> ExitCode {
-	eprintln!("ket: PRODUCT-0004 supports transparent process replacement on Linux only in v1");
+	eprintln!(
+		"ket: PRODUCT-0004 supports transparent process replacement on Unix (Linux and macOS) only in v1"
+	);
 	ExitCode::from(2)
 }

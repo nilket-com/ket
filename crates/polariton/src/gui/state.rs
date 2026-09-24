@@ -6284,6 +6284,7 @@ mod tests {
 				])
 				.env(CHILD, "1")
 				.env("XDG_STATE_HOME", &state_home)
+				.env("HOME", &state_home)
 				.status()
 				.expect("spawn isolated session-surface fixture");
 			let _ = std::fs::remove_dir_all(&state_home);
@@ -6497,7 +6498,7 @@ mod tests {
 		assert_eq!(state.pending_runs.len(), 1, "run waits on its snapshot");
 
 		let owner = crate::local_workspace::LocalWorkspaceOwner::launch_command(
-			std::process::Command::new("/bin/true"),
+			std::process::Command::new("/usr/bin/true"),
 			nix::sys::signal::Signal::SIGINT,
 		);
 		state.local_workspace_owner = Some(owner);
@@ -6802,6 +6803,7 @@ mod tests {
 					.env(MODE, "holder")
 					.env(SESSION_FILE, &session_file)
 					.env("XDG_STATE_HOME", &root)
+					.env("HOME", &root)
 					.spawn()
 					.unwrap();
 				let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -6826,6 +6828,7 @@ mod tests {
 					.env(MODE, "verify")
 					.env(SESSION_ID, session_id.trim())
 					.env("XDG_STATE_HOME", &root)
+					.env("HOME", &root)
 					.status()
 					.unwrap();
 				let _ = std::fs::remove_dir_all(&root);
@@ -7696,7 +7699,7 @@ mod tests {
 	#[cfg(feature = "toron-local")]
 	#[test]
 	fn close_with_an_owned_workspace_enters_visible_bounded_shutdown() {
-		let command = std::process::Command::new("/bin/true");
+		let command = std::process::Command::new("/usr/bin/true");
 		let owner = crate::local_workspace::LocalWorkspaceOwner::launch_command(
 			command,
 			nix::sys::signal::Signal::SIGINT,
@@ -16001,6 +16004,7 @@ rows.views([
 				])
 				.env(CHILD, "1")
 				.env("XDG_STATE_HOME", &state_home)
+				.env("HOME", &state_home)
 				.status()
 				.expect("spawn the isolated saved-session fixture");
 			let _ = std::fs::remove_dir_all(&state_home);

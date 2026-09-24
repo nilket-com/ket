@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "toron"))]
 
 use libaryon::core::{OwnerId, SessionStore};
 use std::ffi::OsString;
@@ -23,7 +23,12 @@ impl TempState {
 	}
 
 	fn session_root(&self) -> PathBuf {
-		self.0.join("libaryon").join("sessions")
+		if cfg!(target_os = "macos") {
+			self.0
+				.join("Library/Application Support/libaryon/state/sessions")
+		} else {
+			self.0.join("libaryon").join("sessions")
+		}
 	}
 }
 
@@ -37,6 +42,8 @@ fn run_list(state: &Path) -> std::process::Output {
 	Command::new(env!("CARGO_BIN_EXE_polariton"))
 		.args(["--session", "list"])
 		.env("XDG_STATE_HOME", state)
+		// macOS roots saved sessions under HOME, not XDG_STATE_HOME.
+		.env("HOME", state)
 		.output()
 		.expect("run terminal discovery")
 }
@@ -58,6 +65,7 @@ fn product_0073_terminal_list_is_non_mutating_discriminating_and_head_neutral() 
 
 	let state = TempState::new("report");
 	unsafe { std::env::set_var("XDG_STATE_HOME", &state.0) };
+	unsafe { std::env::set_var("HOME", &state.0) };
 	let store = SessionStore::platform_default().unwrap();
 
 	let mut active = store.create().unwrap();

@@ -40,20 +40,20 @@ pub(crate) fn runtime_directory() -> io::Result<PathBuf> {
 	if let Some(root) = std::env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
 		return Ok(PathBuf::from(root).join("polariton"));
 	}
-	let root = std::env::var_os("XDG_STATE_HOME")
+	if let Some(root) = std::env::var_os("XDG_STATE_HOME").filter(|s| !s.is_empty()) {
+		return Ok(PathBuf::from(root).join("polariton/run"));
+	}
+	let home = std::env::var_os("HOME")
 		.filter(|s| !s.is_empty())
 		.map(PathBuf::from)
-		.or_else(|| {
-			std::env::var_os("HOME").map(|home| {
-				if cfg!(target_os = "macos") {
-					PathBuf::from(home).join("Library/Application Support")
-				} else {
-					PathBuf::from(home).join(".local/state")
-				}
-			})
-		})
 		.ok_or_else(|| io::Error::other("no user runtime or state directory"))?;
-	Ok(root.join("polariton/run"))
+	// macOS caps socket paths at 104 bytes; under `Library/Application Support`
+	// a long user name leaves no room for `<window>.sock`.
+	Ok(if cfg!(target_os = "macos") {
+		home.join(".polariton/run")
+	} else {
+		home.join(".local/state/polariton/run")
+	})
 }
 
 #[cfg(windows)]
@@ -63,6 +63,18 @@ pub(crate) fn runtime_directory() -> io::Result<PathBuf> {
 		.map(PathBuf::from)
 		.ok_or_else(|| io::Error::other("no LOCALAPPDATA directory"))?;
 	Ok(root.join("polariton").join("run"))
+}
+
+/// A fresh runtime root for tests. macOS caps socket paths at 104 bytes and
+/// its per-user temp directory alone takes about half, so tests use `/tmp`.
+#[cfg(test)]
+pub(crate) fn test_runtime_root(label: &str) -> PathBuf {
+	let base = if cfg!(target_os = "macos") {
+		PathBuf::from("/tmp")
+	} else {
+		std::env::temp_dir()
+	};
+	base.join(format!("p16-{label}-{}", &mint_id()[..12]))
 }
 
 /// The transport endpoint a window with this id advertises under `root`.
@@ -267,7 +279,7 @@ mod tests {
 	use super::*;
 	#[test]
 	fn product_0160_discovery_is_unique_and_prunes_reused_pids() {
-		let root = std::env::temp_dir().join(format!("p16-{}", mint_id()));
+		let root = test_runtime_root("discovery");
 		let a = Window::create(
 			root.clone(),
 			None,

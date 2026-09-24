@@ -31,7 +31,12 @@ fn type_quit(handle: &EngineHandle) {
 #[test]
 fn typed_quit_stops_a_production_configured_engine_promptly() {
 	let state_home = temp_state_home();
-	let history_dir = state_home.join("baryon");
+	// macOS roots engine state under HOME, not XDG_STATE_HOME.
+	let history_dir = if cfg!(target_os = "macos") {
+		state_home.join("Library/Application Support/baryon/state")
+	} else {
+		state_home.join("baryon")
+	};
 	fs::create_dir_all(&history_dir).expect("create state directory");
 	let history = (0..1_000)
 		.map(|index| format!("command-{index:04}\n"))
@@ -41,6 +46,8 @@ fn typed_quit_stops_a_production_configured_engine_promptly() {
 	// This integration-test process owns the environment for the duration of
 	// its sole test, so no concurrently running Rust code can observe the swap.
 	unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+	let home = std::env::var_os("HOME");
+	unsafe { std::env::set_var("HOME", &state_home) };
 
 	let mut samples = Vec::new();
 	for _ in 0..7 {
@@ -59,5 +66,8 @@ fn typed_quit_stops_a_production_configured_engine_promptly() {
 	);
 
 	unsafe { std::env::remove_var("XDG_STATE_HOME") };
+	if let Some(home) = home {
+		unsafe { std::env::set_var("HOME", home) };
+	}
 	let _ = fs::remove_dir_all(state_home);
 }

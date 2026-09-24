@@ -86,11 +86,7 @@ impl Drop for Agents {
 impl AppState {
 	#[cfg(test)]
 	pub(super) fn enable_agents_for_test(&mut self) -> std::path::PathBuf {
-		let root = std::env::temp_dir().join(format!(
-			"p16-actions-{}-{}",
-			std::process::id(),
-			crate::selection::SurfaceIncarnation::mint().token()
-		));
+		let root = crate::live::discovery::test_runtime_root("actions");
 		self.agents.window = Some(Window::create(root.clone(), None, vec![]).unwrap());
 		self.toggle_agents().unwrap();
 		root
@@ -405,11 +401,7 @@ mod tests {
 		let (mut state, task) =
 			super::super::new(crate::configuration::StartupData::default(), None);
 		drop(task);
-		let root = std::env::temp_dir().join(format!(
-			"p16-gate-{}-{}",
-			std::process::id(),
-			crate::selection::SurfaceIncarnation::mint().token()
-		));
+		let root = crate::live::discovery::test_runtime_root("gate");
 		state.agents.window = Some(Window::create(root.clone(), None, vec![]).unwrap());
 		let socket = state
 			.agents

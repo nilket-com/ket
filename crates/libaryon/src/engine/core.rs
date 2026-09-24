@@ -232,6 +232,7 @@ pub(crate) struct Engine {
 	pub(super) initial_session: Option<EditorSession>,
 	pub(super) initial_file: Option<String>,
 	pub(super) initial_viewport: Option<(u16, u16)>,
+	pub(super) persistent_history: bool,
 	pub(super) divider_reservation: super::PaneDividerReservation,
 	pub(super) rune_host: Option<super::rune_host::RuneHostConfig>,
 	pub(super) terminate: Arc<AtomicBool>,
@@ -287,6 +288,7 @@ impl Engine {
 			initial_session: None,
 			initial_file: None,
 			initial_viewport: None,
+			persistent_history: true,
 			divider_reservation: super::PaneDividerReservation::default(),
 			rune_host: None,
 			terminate: Arc::new(AtomicBool::new(false)),
@@ -330,6 +332,11 @@ impl Engine {
 
 	pub(crate) fn with_initial_viewport(mut self, initial_viewport: Option<(u16, u16)>) -> Self {
 		self.initial_viewport = initial_viewport;
+		self
+	}
+
+	pub(crate) fn with_persistent_history(mut self, persistent_history: bool) -> Self {
+		self.persistent_history = persistent_history;
 		self
 	}
 

@@ -5731,6 +5731,7 @@ pub(crate) fn run_engine(engine: Engine) {
 	let initial_session = engine.initial_session;
 	let initial_file = engine.initial_file;
 	let initial_viewport = engine.initial_viewport;
+	let persistent_history = engine.persistent_history;
 	let divider_reservation = engine.divider_reservation;
 	let rune_host_config = engine.rune_host;
 	let configured_init_path = rune_host_config
@@ -5801,7 +5802,11 @@ pub(crate) fn run_engine(engine: Engine) {
 	}
 	session.set_language_registry(lang_registry.clone());
 	#[cfg(not(test))]
-	session.input.load_persistent_history();
+	if persistent_history {
+		session.input.load_persistent_history();
+	}
+	#[cfg(test)]
+	let _ = persistent_history;
 	session.input.attach_internal_sender(tx_internal.clone());
 	#[cfg(not(test))]
 	session.jobs.attach_internal_sender(tx_internal.clone());
@@ -8309,7 +8314,7 @@ pub fn main(editor) {
 					.spawn_job(
 						invocation.owner(),
 						super::super::jobs::JobSpec {
-							program: PathBuf::from("/bin/printf"),
+							program: PathBuf::from("/usr/bin/printf"),
 							args: vec!["followup".into()],
 							cwd: None,
 							stdin: None,
@@ -8371,7 +8376,7 @@ pub fn main(editor) {
 				.commit_owner_batch(RegistrationBatch::new(owner))
 				.expect("publish job owner");
 			let spec = super::super::jobs::JobSpec {
-				program: PathBuf::from("/bin/printf"),
+				program: PathBuf::from("/usr/bin/printf"),
 				args: vec!["job-ok".into()],
 				cwd: None,
 				stdin: None,
@@ -8468,7 +8473,7 @@ pub fn main(editor) {
 				.spawn_job(
 					owner,
 					super::super::jobs::JobSpec {
-						program: PathBuf::from("/bin/true"),
+						program: PathBuf::from("/usr/bin/true"),
 						args: Vec::new(),
 						cwd: None,
 						stdin: None,
@@ -8500,7 +8505,7 @@ pub fn main(editor) {
 		thread.join().expect("engine thread");
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(unix)]
 	#[test]
 	fn typed_quit_stays_prompt_with_a_live_stubborn_process_tree() {
 		let mut samples = Vec::new();
@@ -8636,7 +8641,7 @@ pub fn main(editor) {
 					.spawn_job(
 						invocation.owner(),
 						super::super::jobs::JobSpec {
-							program: PathBuf::from("/bin/true"),
+							program: PathBuf::from("/usr/bin/true"),
 							args: Vec::new(),
 							cwd: None,
 							stdin: None,

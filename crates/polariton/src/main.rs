@@ -208,7 +208,7 @@ where
 	}
 }
 
-#[cfg(feature = "toron-local")]
+#[cfg(feature = "toron")]
 fn list_saved_sessions() -> gui::Result {
 	use libaryon::core::SessionStore;
 
@@ -217,12 +217,12 @@ fn list_saved_sessions() -> gui::Result {
 	Ok(())
 }
 
-#[cfg(not(feature = "toron-local"))]
+#[cfg(not(feature = "toron"))]
 fn list_saved_sessions() -> gui::Result {
 	Err("saved sessions require Polariton's `toron` feature".into())
 }
 
-#[cfg(feature = "toron-local")]
+#[cfg(feature = "toron")]
 fn render_session_discovery(report: &libaryon::core::SessionDiscoveryReport) -> String {
 	use chrono::{DateTime, SecondsFormat, Utc};
 	use libaryon::core::SessionDiscoveryEntry;
@@ -320,7 +320,7 @@ fn render_session_discovery(report: &libaryon::core::SessionDiscoveryReport) -> 
 	output
 }
 
-#[cfg(feature = "toron-local")]
+#[cfg(feature = "toron")]
 fn compare_committed_entries(
 	left: &libaryon::core::SessionDiscoveryEntry,
 	right: &libaryon::core::SessionDiscoveryEntry,
@@ -349,7 +349,7 @@ fn compare_committed_entries(
 	}
 }
 
-#[cfg(feature = "toron-local")]
+#[cfg(feature = "toron")]
 fn encode_cli_hex(bytes: &[u8]) -> String {
 	const DIGITS: &[u8; 16] = b"0123456789abcdef";
 	let mut output = String::with_capacity(bytes.len() * 2);
@@ -497,7 +497,7 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "toron-local")]
+	#[cfg(feature = "toron")]
 	#[test]
 	fn committed_session_order_is_newest_then_generation_then_identity() {
 		use libaryon::core::SessionDiscoveryEntry;
@@ -545,7 +545,7 @@ mod tests {
 		);
 	}
 
-	#[cfg(not(feature = "toron-local"))]
+	#[cfg(not(feature = "toron"))]
 	#[test]
 	fn listing_refuses_explicitly_without_saved_session_support() {
 		assert_eq!(

@@ -42,5 +42,7 @@ missing target is an honest refusal with an install hint. The router does not
 search Cargo target directories, auto-start Nilket for Polariton, or remain as
 a supervising process.
 
-V1 supports Linux, where ket uses process replacement so the target inherits
-the same PID, signals, working directory, environment, and standard streams.
+V1 supports Linux and macOS, where ket uses process replacement so the target
+inherits the same PID, signals, working directory, environment, and standard
+streams. Siblings are found beside the resolved ket executable, so a symlinked
+install finds the leaves installed next to the real binary.

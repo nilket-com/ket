@@ -1217,7 +1217,7 @@ mod unix {
 				parent.as_raw_fd(),
 				name.as_ptr(),
 				flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-				mode as libc::mode_t,
+				mode as libc::c_uint,
 			)
 		};
 		file_from_fd(fd)
@@ -2089,8 +2089,12 @@ mod unix {
 
 			let foreign_utf8 = root.0.join("notes");
 			fs::write(&foreign_utf8, b"foreign").unwrap();
-			let foreign_bytes = OsString::from_vec(vec![b'n', 0xff]);
-			fs::write(root.0.join(&foreign_bytes), b"foreign").unwrap();
+			// APFS rejects file names that are not UTF-8 (EILSEQ).
+			let non_utf8_names = !cfg!(target_os = "macos");
+			if non_utf8_names {
+				let foreign_bytes = OsString::from_vec(vec![b'n', 0xff]);
+				fs::write(root.0.join(&foreign_bytes), b"foreign").unwrap();
+			}
 			let unreferenced = session_path(&root, session_id)
 				.join("generations")
 				.join("000000000000ffff");
@@ -2129,13 +2133,17 @@ mod unix {
 				}
 				other => panic!("expected committed discovery, got {other:?}"),
 			}
+			let mut expected_foreign = vec![b"notes".as_slice()];
+			if non_utf8_names {
+				expected_foreign.push(&[b'n', 0xff]);
+			}
 			assert_eq!(
 				report
 					.foreign_entries()
 					.iter()
 					.map(ForeignSessionEntry::name_bytes)
 					.collect::<Vec<_>>(),
-				vec![b"notes".as_slice(), &[b'n', 0xff]],
+				expected_foreign,
 				"foreign names retain exact bytes and stable byte order"
 			);
 		}

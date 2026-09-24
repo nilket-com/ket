@@ -1023,6 +1023,8 @@ impl CodeEditor {
 		config
 			.initial_viewport
 			.get_or_insert((INITIAL_COLUMNS, INITIAL_ROWS));
+		// Test engines must never touch the user's real command history.
+		config.persistent_history &= !cfg!(test);
 		let engine = EngineHandle::spawn(config);
 		Self::from_engine(engine, replacement, None)
 	}
@@ -4147,6 +4149,8 @@ fn polariton_engine_config(
 		init_script,
 		init_entrypoint: "editor".to_string(),
 		divider_reservation,
+		// Test engines must never touch the user's real command history.
+		persistent_history: !cfg!(test),
 		..EngineConfig::default()
 	}
 }
@@ -7577,7 +7581,12 @@ mod tests {
 			.duration_since(std::time::UNIX_EPOCH)
 			.expect("time should move forward")
 			.as_nanos();
-		std::env::temp_dir().join(format!(
+		// Git reports resolved paths; macOS temp dirs sit behind `/var` → `/private/var`.
+		// Windows canonical paths carry a `\\?\` prefix Git never prints, so resolve on Unix only.
+		let temp = std::env::temp_dir();
+		#[cfg(unix)]
+		let temp = temp.canonicalize().unwrap_or(temp);
+		temp.join(format!(
 			"polariton-file-browser-{label}-{}-{nonce}",
 			std::process::id()
 		))
@@ -8916,6 +8925,7 @@ mod tests {
 				])
 				.env(CHILD, "1")
 				.env("XDG_STATE_HOME", &state_home)
+				.env("HOME", &state_home)
 				.status()
 				.expect("spawn isolated saved-session fixture");
 			let _ = std::fs::remove_dir_all(&state_home);

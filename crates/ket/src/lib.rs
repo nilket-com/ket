@@ -1,6 +1,6 @@
 //! Transparent product routing for ket (PRODUCT-0004).
 
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(target_os = "linux")]
-use std::os::linux::fs::MetadataExt;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 const CONFIG_DIRECTORY: &str = "ket";
@@ -472,12 +472,17 @@ fn path_error(action: &str, path: &Path, error: io::Error) -> RouterError {
 	RouterError::new(format!("cannot {action} {}: {error}", path.display()))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn execute_route(route: Route, args: Vec<OsString>) -> Result<(), RouterError> {
 	let spec = route.spec();
-	let current_exe = std::env::current_exe().map_err(|error| {
-		RouterError::new(format!("cannot resolve running ket executable: {error}"))
-	})?;
+	// Linux reports the resolved `/proc/self/exe`; macOS reports the path as
+	// invoked, so a symlinked install would otherwise seek siblings beside
+	// the link rather than beside ket itself.
+	let current_exe = std::env::current_exe()
+		.and_then(fs::canonicalize)
+		.map_err(|error| {
+			RouterError::new(format!("cannot resolve running ket executable: {error}"))
+		})?;
 	let program = resolve_leaf(spec, &current_exe, std::env::var_os("PATH"))?;
 	let invocation = Invocation {
 		route,
@@ -493,10 +498,10 @@ fn execute_route(route: Route, args: Vec<OsString>) -> Result<(), RouterError> {
 	)))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn execute_route(_route: Route, _args: Vec<OsString>) -> Result<(), RouterError> {
 	Err(RouterError::new(
-		"PRODUCT-0004 supports transparent process replacement on Linux only in v1",
+		"PRODUCT-0004 supports transparent process replacement on Unix (Linux and macOS) only in v1",
 	))
 }
 
@@ -508,7 +513,7 @@ fn build_command(invocation: &Invocation) -> Command {
 	command
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn resolve_leaf(
 	spec: &RouteSpec,
 	current_exe: &Path,
@@ -577,7 +582,7 @@ fn resolve_leaf(
 	)))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 enum Candidate {
 	Absent,
 	Valid,
@@ -585,7 +590,7 @@ enum Candidate {
 	Invalid(String),
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn inspect_candidate(path: &Path, current: &fs::Metadata) -> Candidate {
 	match fs::symlink_metadata(path) {
 		Ok(_) => {}
@@ -599,7 +604,7 @@ fn inspect_candidate(path: &Path, current: &fs::Metadata) -> Candidate {
 	if !metadata.is_file() {
 		return Candidate::Invalid("not a regular file".to_owned());
 	}
-	if metadata.st_dev() == current.st_dev() && metadata.st_ino() == current.st_ino() {
+	if metadata.dev() == current.dev() && metadata.ino() == current.ino() {
 		return Candidate::SelfCycle;
 	}
 	if metadata.permissions().mode() & 0o111 == 0 {
@@ -608,7 +613,7 @@ fn inspect_candidate(path: &Path, current: &fs::Metadata) -> Candidate {
 	Candidate::Valid
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 mod tests {
 	use super::*;
 	use std::os::unix::ffi::{OsStrExt, OsStringExt};

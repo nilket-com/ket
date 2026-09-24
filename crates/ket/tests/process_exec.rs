@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,8 @@ fn temp_dir() -> PathBuf {
 		std::process::id()
 	));
 	fs::create_dir(&path).expect("create process test directory");
-	path
+	// getcwd reports the resolved path; macOS temp dirs sit behind `/var` → `/private/var`.
+	fs::canonicalize(&path).expect("resolve process test directory")
 }
 
 fn copy_executable(source: &Path, target: &Path) {
@@ -87,6 +88,41 @@ fn router_process_is_replaced_and_process_context_survives() {
 	);
 	assert!(stdout.contains("LEAF_ENV=preserved"), "{stdout}");
 	assert!(stderr.contains("LEAF_STDERR=visible"), "{stderr}");
+	fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn symlinked_ket_resolves_siblings_beside_its_target() {
+	let _serial = PROCESS_TEST_LOCK.lock().unwrap();
+	let root = temp_dir();
+	let install = root.join("install");
+	let links = root.join("links");
+	fs::create_dir(&install).expect("create install directory");
+	fs::create_dir(&links).expect("create link directory");
+	let ket = install.join("ket");
+	copy_executable(Path::new(env!("CARGO_BIN_EXE_ket")), &ket);
+	copy_executable(&std::env::current_exe().unwrap(), &install.join("baryon"));
+	let link = links.join("ket");
+	std::os::unix::fs::symlink(&ket, &link).expect("link ket");
+
+	let output = Command::new(&link)
+		.args(["baryon", "--exact", "leaf_helper", "--nocapture"])
+		.current_dir(&root)
+		.env("KET_LEAF_HELPER", "1")
+		.env("KET_LEAF_VALUE", "preserved")
+		.env("PATH", "")
+		.output()
+		.expect("launch ket through its symlink");
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert!(
+		String::from_utf8_lossy(&output.stdout).contains("LEAF_ENV=preserved"),
+		"{}",
+		String::from_utf8_lossy(&output.stdout)
+	);
 	fs::remove_dir_all(root).unwrap();
 }
 
