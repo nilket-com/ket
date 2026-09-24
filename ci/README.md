@@ -30,10 +30,15 @@ Linux machine controlled by the project, not for a hosted provider workflow.
 There are deliberately no `.github` workflows or provider-specific control
 files.
 
-The script installs missing Rust std targets with `rustup`, then uses
-`scripts/cargo-ctrl` for the local Linux test gate and forced blocking-resolver
-gate, followed by the architecture test and Windows/macOS cross-target
-`cargo check`.
+The script uses `scripts/cargo-ctrl` for the local Linux test gate and forced
+blocking-resolver gate, followed by the architecture test and the reduced
+Polariton head.
+
+Each desktop is gated natively (ADR 0170). Linux cannot cross-check the
+desktop crates: `ring`, `aws-lc-sys`, `psm`, and `stacker` compile C for
+their target, which needs that platform's toolchain and SDK. On macOS, run
+`ci/check-macos.sh`; on Windows, run `ci/check-windows.ps1`. The Windows
+build script above remains the quicker smoke entrypoint.
 
 `cargo-ctrl` divides the CPUs available to its process into two concurrent
 lanes. The general lane receives 80% and uses that many libtest workers. The
@@ -73,9 +78,6 @@ scripts/bigfoot-ci --full
 The bootstrap is opt-in and installs a minimal stable Rust toolchain in the
 remote user's home. Source transport is `rsync` over SSH; Bigfoot never needs a
 GitHub checkout, token, runner agent, or webhook.
-
-Set `BARYON_CI_SKIP_TARGET_INSTALL=1` when the runner image already has the
-required Rust targets installed and should not mutate its toolchain.
 
 `ci/check.sh` runs the normal generated-store huge-address tests without creating
 large files. On Linux, `ci/huge-file-check.sh` creates a verified sparse 200 GiB

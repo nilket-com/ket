@@ -75,9 +75,11 @@ passes in the interactive one.
 A plain `cargo build` of Polariton on macOS fails until `toron-local`'s
 dependencies become Linux-only target dependencies, the same follow-up ADR
 0163 records for Windows. There is no `.app` bundle, signing, or
-notarization yet. The gate's cross-target step needs replacing with native
-per-platform checks, or with C-free cross checks. The invalid-UTF-8 file-name fixtures fail to create on
-the APFS volume used for bring-up (`EILSEQ`), so the tests that need them
-are gated off macOS; the product behavior is unchanged. Neither Baryon's
-interactive smoke, a Polariton GUI session, nor a live remote Toron
-connection has been walked on macOS; those are validation still to do.
+notarization yet. Native per-platform gates replace the Linux gate's
+cross-target step: `ci/check-macos.sh` on macOS and `ci/check-windows.ps1`
+on Windows, each run on the same commit as `ci/check.sh`. The invalid-UTF-8
+file-name fixtures fail to create on the APFS volume used for bring-up
+(`EILSEQ`), so the tests that need them are gated off macOS; the product
+behavior is unchanged. Neither Baryon's interactive smoke, a Polariton GUI
+session, nor a live remote Toron connection has been walked on macOS; those
+are validation still to do.
