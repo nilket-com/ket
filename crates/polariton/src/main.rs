@@ -226,7 +226,6 @@ fn list_saved_sessions() -> gui::Result {
 fn render_session_discovery(report: &libaryon::core::SessionDiscoveryReport) -> String {
 	use chrono::{DateTime, SecondsFormat, Utc};
 	use libaryon::core::SessionDiscoveryEntry;
-	use std::os::unix::ffi::OsStrExt;
 
 	if report.is_empty() {
 		return "No saved sessions.\n".to_owned();
@@ -275,7 +274,14 @@ fn render_session_discovery(report: &libaryon::core::SessionDiscoveryReport) -> 
 					let path = match document.path() {
 						None => "<scratch>".to_owned(),
 						Some(path) => {
-							let bytes = path.as_os_str().as_bytes();
+							// ADR 0073 §4: the exact bytes on Unix.
+							#[cfg(unix)]
+							let bytes = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str());
+							// On non-Unix targets there is no exact byte spelling; this
+							// encoding is unspecified, so the hex is opaque and
+							// display-only.
+							#[cfg(not(unix))]
+							let bytes = path.as_os_str().as_encoded_bytes();
 							match path.to_str() {
 								Some(value)
 									if value != "<scratch>"
