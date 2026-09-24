@@ -1808,10 +1808,10 @@ impl PlotComposite for PlotGridKernel {
 				settings,
 			);
 			return hit.map(|mut hit| {
-				if let Some((field, value)) = &cell.partition_candidate {
-					if let Some(candidate) = &mut hit.candidate {
-						candidate.constraints.push((field.clone(), value.clone()));
-					}
+				if let Some((field, value)) = &cell.partition_candidate
+					&& let Some(candidate) = &mut hit.candidate
+				{
+					candidate.constraints.push((field.clone(), value.clone()));
 				}
 				match (&self.partition_field, &cell.cell.label) {
 					(Some(field), Some(value)) => hit.with_facet(crate::plot::common::HitFacet {
@@ -2305,7 +2305,7 @@ mod tests {
 		}
 
 		fn translate(&mut self, translation: iced::Vector) {
-			self.translation = self.translation + translation;
+			self.translation += translation;
 		}
 
 		fn rotate(&mut self, _angle: f32) {}
@@ -3494,7 +3494,7 @@ mod tests {
 	}
 
 	fn rendered_tick_paths(svg: &str, clip_id: usize, origin: Point) -> Vec<[f32; 4]> {
-		let marker = format!(r#"<g clip-path="url(#{})">"#, format!("clip_{clip_id}"));
+		let marker = format!(r#"<g clip-path="url(#clip_{clip_id})">"#);
 		let body = svg
 			.split_once(&marker)
 			.and_then(|(_, rest)| rest.split_once("</g>"))
@@ -5789,9 +5789,12 @@ mod tests {
 	fn product_0066_global_heading_band_separates_first_row_facet_labels() {
 		for height in [300.0_f32, 900.0] {
 			let (kernel, _) = rendered_facet(4, GridArrangement::new(2, 2).unwrap(), 800.0, height);
-			let mut resolved = ResolvedPlotSettings::default();
-			resolved.title =
-				crate::plot::spec::ResolvedPresence::Show(Arc::new("Figure heading".to_owned()));
+			let resolved = ResolvedPlotSettings {
+				title: crate::plot::spec::ResolvedPresence::Show(Arc::new(
+					"Figure heading".to_owned(),
+				)),
+				..Default::default()
+			};
 			let model = PlotSettings::from_resolved(resolved.clone());
 			let mut backend = SvgBackend::new(800.0, height);
 			let widget = PlotWidget::new(
@@ -5846,10 +5849,11 @@ mod tests {
 			}));
 		}
 
-		let mut subtitle = ResolvedPlotSettings::default();
-		subtitle.title = crate::plot::spec::ResolvedPresence::Hide;
-		subtitle.subtitle =
-			crate::plot::spec::ResolvedPresence::Show(Arc::new("Subtitle".to_owned()));
+		let mut subtitle = ResolvedPlotSettings {
+			title: crate::plot::spec::ResolvedPresence::Hide,
+			subtitle: crate::plot::spec::ResolvedPresence::Show(Arc::new("Subtitle".to_owned())),
+			..Default::default()
+		};
 		assert_eq!(
 			VerticalGuideBands::resolve("", None, &subtitle).heading_height(),
 			subtitle.subtitle_offset + subtitle.subtitle_size.pixels()
@@ -5938,9 +5942,11 @@ mod tests {
 			800.0,
 			600.0,
 		);
-		let mut resolved = ResolvedPlotSettings::default();
-		resolved.x_label = ResolvedPresence::Show(Arc::new("Authored X".to_owned()));
-		resolved.y_label = ResolvedPresence::Show(Arc::new("Authored Y".to_owned()));
+		let resolved = ResolvedPlotSettings {
+			x_label: ResolvedPresence::Show(Arc::new("Authored X".to_owned())),
+			y_label: ResolvedPresence::Show(Arc::new("Authored Y".to_owned())),
+			..Default::default()
+		};
 		let model = PlotSettings::from_resolved(resolved.clone());
 		let mut backend = SvgBackend::new(800.0, 600.0);
 		PlotWidget::new(

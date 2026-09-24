@@ -106,6 +106,7 @@ pub fn plan(request: PlotRequest) -> Result<ResolvedPlot, String> {
 
 /// Resolve one request through an explicit categorical palette and a snapshot
 /// of its live continuation state. This substrate owns no Rune default.
+#[cfg_attr(not(any(feature = "toron", test)), allow(dead_code))] // Reduced-head tests exercise the portable palette planner.
 pub fn plan_with_categorical_palette(
 	request: PlotRequest,
 	selection: &CategoricalPaletteSelection,

@@ -38,7 +38,9 @@ and random identifiers to group runs. They never contain your paths, data or que
 #[derive(Default)]
 pub(crate) struct Welcome {
 	pub active: bool,
+	#[cfg(toron_local)]
 	pub workspace_requested: bool,
+	#[cfg(toron_local)]
 	pub workspace_seeded: bool,
 	pub path: String,
 	pub stage: u8,

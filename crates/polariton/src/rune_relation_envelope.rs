@@ -39,6 +39,7 @@ const KET_ENTRYPOINT_PREFIX: &str = "pub fn main(ket) {\n";
 const ENTRYPOINT_SUFFIX: &str = "\n}\n";
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Boxing a sink would change the intent ownership and matching API.
 pub(crate) enum RuneViewIntent {
 	Table(RuneTableSink),
 	Plot(RunePlotIntent),
@@ -150,6 +151,7 @@ pub(crate) struct StyledRunePlotSink {
 }
 
 impl StyledRunePlotSink {
+	#[allow(clippy::result_large_err)] // The refused sink returns intact to its caller for recovery.
 	pub(crate) fn into_layer(self) -> Result<LayerSpec, Self> {
 		if self.sink.category.is_some() {
 			return Err(self);
@@ -958,12 +960,10 @@ impl RuneViewScheduler {
 			.or_insert_with(|| Arc::new(AtomicU64::new(work.revision)));
 		latest.store(work.revision, Ordering::Release);
 		work.freshness = Some(Arc::clone(latest));
-		if !self
-			.presentation_in_flight
-			.contains_key(&work.source_buffer)
+		if let std::collections::hash_map::Entry::Vacant(e) =
+			self.presentation_in_flight.entry(work.source_buffer)
 		{
-			self.presentation_in_flight
-				.insert(work.source_buffer, work.revision);
+			e.insert(work.revision);
 			self.presentation_executed = self.presentation_executed.saturating_add(1);
 			return Some(work);
 		}
@@ -2066,9 +2066,11 @@ workspace.table("t").views([table()])
 				.collect::<Vec<_>>(),
 			[LayerMark::Line, LayerMark::Scatter]
 		);
-		let mut expected = PlotSettingsLayer::default();
-		expected.title = Presence::Show(Arc::new("Revenue".to_owned()));
-		expected.subtitle = Presence::Show(Arc::new("Trailing twelve months".to_owned()));
+		let expected = PlotSettingsLayer {
+			title: Presence::Show(Arc::new("Revenue".to_owned())),
+			subtitle: Presence::Show(Arc::new("Trailing twelve months".to_owned())),
+			..Default::default()
+		};
 		assert_eq!(plot.authored_settings, expected);
 		assert_eq!(view.intent.presentation().display_label, "Line + Scatter");
 		assert_eq!(view.intent.presentation().authored_title, expected.title);

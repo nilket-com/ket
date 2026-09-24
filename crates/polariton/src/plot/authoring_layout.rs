@@ -371,11 +371,13 @@ mod tests {
 	/// Default settings and a pane viewport override on every axis, so the
 	/// override arm of each family is exercised alongside the resolved one.
 	fn settings_cases() -> [ResolvedPlotSettings; 2] {
-		let mut overridden = ResolvedPlotSettings::default();
-		overridden.x_min = Some(-3.5);
-		overridden.x_max = Some(12.25);
-		overridden.y_min = Some(0.75);
-		overridden.y_max = Some(9.5);
+		let overridden = ResolvedPlotSettings {
+			x_min: Some(-3.5),
+			x_max: Some(12.25),
+			y_min: Some(0.75),
+			y_max: Some(9.5),
+			..Default::default()
+		};
 		[ResolvedPlotSettings::default(), overridden]
 	}
 

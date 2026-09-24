@@ -89,6 +89,7 @@ impl ColorTheme {
 
 	/// PRODUCT-0091's stable authored ramp-token namespace. These tokens are a
 	/// public language contract; they must survive retirement of this enum.
+	#[cfg(any(feature = "toron", test))]
 	pub const fn ramp_token(self) -> &'static str {
 		match self {
 			Self::Black => "black",
@@ -131,6 +132,7 @@ impl ColorTheme {
 		}
 	}
 
+	#[cfg(any(feature = "toron", test))]
 	pub fn from_ramp_token(token: &str) -> Option<Self> {
 		Self::ALL
 			.into_iter()

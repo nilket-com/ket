@@ -112,7 +112,7 @@ impl MarkRenderer for LineMarkRenderer {
 								}
 							}
 						},
-						stroke.clone(),
+						stroke,
 					)
 				},
 			);
@@ -638,8 +638,10 @@ mod product_0054_tests {
 		let prepared = Arc::new(prepare_line_data(&frame, "series", "x", "y"));
 		let kernel = LinePlotKernel::new(Arc::clone(&prepared));
 		let renderer = LineMarkRenderer::new(Arc::clone(&prepared));
-		let mut settings = ResolvedPlotSettings::default();
-		settings.series_registry = SeriesRegistry::new(kernel.series_identities());
+		let mut settings = ResolvedPlotSettings {
+			series_registry: SeriesRegistry::new(kernel.series_identities()),
+			..Default::default()
+		};
 		let identities = settings.series_registry.identities().to_vec();
 		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 100.0));
 		let layout = kernel.layout(settings.clone());

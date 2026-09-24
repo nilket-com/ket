@@ -18,12 +18,14 @@ use std::collections::HashSet;
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg(any(feature = "toron", test))]
 pub(crate) enum CallPosition {
 	Free,
 	Method,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg(any(feature = "toron", test))]
 pub(crate) enum RegistrationRoute {
 	Free,
 	FigureElement,
@@ -43,10 +45,12 @@ pub(crate) enum SemanticReceiver {
 	Padding,
 	Skin,
 	Mark,
+	#[cfg(any(feature = "toron", test))]
 	Table,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "toron", test))]
 pub(crate) enum ArgumentKind {
 	Text,
 	Number,
@@ -55,6 +59,7 @@ pub(crate) enum ArgumentKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "toron", test))]
 pub(crate) struct ArgumentSignature {
 	pub(crate) min: u8,
 	pub(crate) max: Option<u8>,
@@ -63,6 +68,7 @@ pub(crate) struct ArgumentSignature {
 
 /// Stable reference from metadata to a handwritten evaluator handler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(not(any(feature = "toron", test)), allow(dead_code))] // Callable handlers are constructed only by the Rune registry.
 pub(crate) enum HandlerId {
 	Bar,
 	Line,
@@ -128,6 +134,7 @@ pub(crate) enum HandlerId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "toron", test))]
 pub(crate) struct CallableSpec {
 	pub(crate) name: &'static str,
 	pub(crate) rune_name: &'static str,
@@ -139,31 +146,47 @@ pub(crate) struct CallableSpec {
 	pub(crate) doc: &'static str,
 }
 
+#[cfg(any(feature = "toron", test))]
 const FREE: &[RegistrationRoute] = &[RegistrationRoute::Free];
+#[cfg(any(feature = "toron", test))]
 const FIGURE_AND_SKIN: &[RegistrationRoute] =
 	&[RegistrationRoute::FigureElement, RegistrationRoute::Skin];
+#[cfg(any(feature = "toron", test))]
 const MARK: &[RegistrationRoute] = &[RegistrationRoute::Mark];
+#[cfg(any(feature = "toron", test))]
 const SKIN_ROUTE: &[RegistrationRoute] = &[RegistrationRoute::Skin];
+#[cfg(any(feature = "toron", test))]
 const TABLE_ROUTE: &[RegistrationRoute] = &[RegistrationRoute::Table];
+#[cfg(any(feature = "toron", test))]
 const NONE: &[SemanticReceiver] = &[];
+#[cfg(any(feature = "toron", test))]
 const FIGURE_TEXT: &[SemanticReceiver] = &[
 	SemanticReceiver::Title,
 	SemanticReceiver::Subtitle,
 	SemanticReceiver::Legend,
 ];
+#[cfg(any(feature = "toron", test))]
 const AXES: &[SemanticReceiver] = &[SemanticReceiver::XAxis, SemanticReceiver::YAxis];
+#[cfg(any(feature = "toron", test))]
 const X_AXIS: &[SemanticReceiver] = &[SemanticReceiver::XAxis];
+#[cfg(any(feature = "toron", test))]
 const LABELLED: &[SemanticReceiver] = &[
 	SemanticReceiver::XAxis,
 	SemanticReceiver::YAxis,
 	SemanticReceiver::Facet,
 ];
+#[cfg(any(feature = "toron", test))]
 const PADDING: &[SemanticReceiver] = &[SemanticReceiver::Padding];
+#[cfg(any(feature = "toron", test))]
 const LEGEND: &[SemanticReceiver] = &[SemanticReceiver::Legend];
+#[cfg(any(feature = "toron", test))]
 const SKIN: &[SemanticReceiver] = &[SemanticReceiver::Skin];
+#[cfg(any(feature = "toron", test))]
 const MARK_RECEIVER: &[SemanticReceiver] = &[SemanticReceiver::Mark];
+#[cfg(any(feature = "toron", test))]
 const TABLE_RECEIVER: &[SemanticReceiver] = &[SemanticReceiver::Table];
 
+#[cfg(any(feature = "toron", test))]
 macro_rules! callable {
 	($name:literal, $position:ident, $min:literal $(..= $max:literal)?, $kind:ident,
 	 $handler:ident, $routes:expr, $receivers:expr, $doc:literal) => {
@@ -188,6 +211,7 @@ macro_rules! callable {
 
 /// The sole authored inventory of presentation callables. Duplicate spellings
 /// are intentional where distinct receiver routes have distinct handlers.
+#[cfg(any(feature = "toron", test))]
 pub(crate) const CALLABLES: &[CallableSpec] = &[
 	callable!(
 		"bar",
@@ -803,6 +827,7 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 	),
 ];
 
+#[cfg(feature = "toron")]
 pub(crate) fn is_presentation_callable(name: &str, position: CallPosition) -> bool {
 	CALLABLES
 		.iter()
@@ -969,7 +994,11 @@ pub(crate) struct SettingSpec {
 	pub(crate) label: &'static str,
 	pub(crate) section: InspectorSection,
 	pub(crate) target: LogicalTarget,
+	#[cfg_attr(not(any(feature = "toron", test)), allow(dead_code))]
+	// Rune writeback reads these callable metadata fields.
 	pub(crate) callable: HandlerId,
+	#[cfg_attr(not(any(feature = "toron", test)), allow(dead_code))]
+	// Rune writeback reads these callable metadata fields.
 	pub(crate) receiver: Option<SemanticReceiver>,
 	#[allow(dead_code)] // ADR 0142 consumes widget and writeback constraints.
 	pub(crate) shape: ValueShape,
@@ -1785,6 +1814,7 @@ pub(crate) fn setting_spec(key: SettingKey) -> &'static SettingSpec {
 		.expect("every stable SettingKey has one SettingSpec")
 }
 
+#[cfg(any(feature = "toron", test))]
 pub(crate) fn setting_for_call(
 	handler: HandlerId,
 	receiver: Option<SemanticReceiver>,
@@ -1796,6 +1826,7 @@ pub(crate) fn setting_for_call(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExpressionShape {
+	#[cfg(feature = "toron")]
 	DirectLiteral,
 	ExpressionOrBinding,
 }
@@ -1814,7 +1845,9 @@ pub(crate) struct SettingOccurrence {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ContainerKind {
+	#[cfg(feature = "toron")]
 	Figure,
+	#[cfg(feature = "toron")]
 	Layers,
 }
 
@@ -2160,7 +2193,7 @@ mod tests {
 			key: SettingKey::XAxisLabel,
 			target: LogicalTarget::XAxis,
 			call_span: 10..24,
-			argument_spans: vec![16..23],
+			argument_spans: std::iter::once(16..23).collect(),
 			argument_text: vec!["column_name".to_owned()],
 			expression_shape: ExpressionShape::ExpressionOrBinding,
 			owners: HashSet::from([

@@ -595,9 +595,11 @@ mod tests {
 		let data = frame(&["A", "B"], &[10.0, 5.0]);
 		let kernel = kernel(&data);
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
-		let mut settings = ResolvedPlotSettings::default();
-		settings.title_size = crate::plot::spec::TitleTextSize::new(96.0).unwrap();
-		settings.subtitle_size = crate::plot::spec::SubtitleTextSize::new(96.0).unwrap();
+		let settings = ResolvedPlotSettings {
+			title_size: crate::plot::spec::TitleTextSize::new(96.0).unwrap(),
+			subtitle_size: crate::plot::spec::SubtitleTextSize::new(96.0).unwrap(),
+			..Default::default()
+		};
 		let layout = kernel.layout(settings.clone());
 		let transform = CoordinateTransformer::new(&layout, bounds);
 		let mut backend = FunnelBackend::default();

@@ -2090,6 +2090,7 @@ fn raw_legend(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Outpu
 	store(out, stack, RuneFigureElement::new(value, origin))
 }
 
+#[allow(clippy::result_large_err)] // A refused receiver returns the original figure element intact.
 fn legend_receiver(
 	values: &[Value],
 	origin: Origin,
@@ -2338,6 +2339,7 @@ fn raw_figure_padding_edge(
 	store(out, stack, element)
 }
 
+#[allow(clippy::result_large_err)] // A refused receiver returns the original figure element intact.
 fn axis_receiver(
 	values: &[Value],
 	origin: Origin,
@@ -4448,23 +4450,25 @@ impl FigureParts {
 			|| self.x_minor_ticks.is_some()
 			|| self.y_minor_ticks.is_some()
 		{
-			let mut guides = PlotGuideSettings::default();
-			guides.x_tick_placement = self
-				.x_tick_step
-				.map(|(step, _)| TickPlacement::step(step).expect("validated tick step"))
-				.or_else(|| {
-					self.x_tick_every
-						.map(|(interval, _)| TickPlacement::Temporal(interval))
-				})
-				.unwrap_or(TickPlacement::DEFAULT);
-			guides.y_tick_placement = self
-				.y_tick_step
-				.map(|(step, _)| TickPlacement::step(step).expect("validated tick step"))
-				.or_else(|| {
-					self.y_tick_every
-						.map(|(interval, _)| TickPlacement::Temporal(interval))
-				})
-				.unwrap_or(TickPlacement::DEFAULT);
+			let mut guides = PlotGuideSettings {
+				x_tick_placement: self
+					.x_tick_step
+					.map(|(step, _)| TickPlacement::step(step).expect("validated tick step"))
+					.or_else(|| {
+						self.x_tick_every
+							.map(|(interval, _)| TickPlacement::Temporal(interval))
+					})
+					.unwrap_or(TickPlacement::DEFAULT),
+				y_tick_placement: self
+					.y_tick_step
+					.map(|(step, _)| TickPlacement::step(step).expect("validated tick step"))
+					.or_else(|| {
+						self.y_tick_every
+							.map(|(interval, _)| TickPlacement::Temporal(interval))
+					})
+					.unwrap_or(TickPlacement::DEFAULT),
+				..Default::default()
+			};
 			if let Some((count, _)) = self.x_minor_ticks {
 				guides.x_minor_ticks = count;
 			}
@@ -4608,7 +4612,8 @@ fn elements() {
 }
 pub fn main() { [polariton_presentation::__figure(elements(), 0, 120)] }
 "#;
-		let views = execute(source, &[0..120]).expect("typed presentation executes");
+		let views =
+			execute(source, std::slice::from_ref(&(0..120))).expect("typed presentation executes");
 		let RuneViewIntent::Plot(plot) = &views[0] else {
 			panic!("expected plot");
 		};
@@ -4640,7 +4645,7 @@ polariton_presentation::__title("second", 30, 41),
 polariton_presentation::__line("x", "y", 50, 62)
 ], 0, 80)] }"#;
 		assert_eq!(
-			execute(duplicate, &[0..80]),
+			execute(duplicate, std::slice::from_ref(&(0..80))),
 			Err(PresentationFailure {
 				span: 30..41,
 				message: "a figure has at most one title".to_owned(),
@@ -4649,7 +4654,7 @@ polariton_presentation::__line("x", "y", 50, 62)
 
 		let wrong_register = r#"pub fn main() { [polariton_presentation::__line("x", "y", 0, 14).__stacked(15, 25)] }"#;
 		assert_eq!(
-			execute(wrong_register, &[0..25]),
+			execute(wrong_register, std::slice::from_ref(&(0..25))),
 			Err(PresentationFailure {
 				span: 15..25,
 				message: "stacked() is available on bar marks, not line, scatter, or area marks"
@@ -4664,7 +4669,7 @@ polariton_presentation::__line("x", "y", 50, 62)
 polariton_presentation::__facet("region", 10, 25).__gutter(24, 26, 41),
 polariton_presentation::__bar("quarter", "sales", 42, 66)
 ], 0, 67)] }"#;
-		let views = execute(valid, &[0..67]).expect("faceted gutter figure");
+		let views = execute(valid, std::slice::from_ref(&(0..67))).expect("faceted gutter figure");
 		let RuneViewIntent::Plot(plot) = &views[0] else {
 			panic!("expected plot");
 		};
@@ -4683,7 +4688,7 @@ polariton_presentation::__bar("quarter", "sales", 42, 66)
 ], 0, 67)] }"#,
 		] {
 			assert_eq!(
-				execute(wrong_receiver, &[0..67]),
+				execute(wrong_receiver, std::slice::from_ref(&(0..67))),
 				Err(PresentationFailure {
 					span: 26..41,
 					message: "gutter(...) requires a facet(...) receiver".to_owned(),
@@ -4696,7 +4701,7 @@ polariton_presentation::__facet("region", 10, 25).__gutter(12, 26, 41).__gutter(
 polariton_presentation::__bar("quarter", "sales", 58, 82)
 ], 0, 83)] }"#;
 		assert_eq!(
-			execute(duplicate, &[0..83]),
+			execute(duplicate, std::slice::from_ref(&(0..83))),
 			Err(PresentationFailure {
 				span: 42..57,
 				message: "facet(...).gutter(...) may appear at most once".to_owned(),
@@ -4710,7 +4715,8 @@ polariton_presentation::__bar("quarter", "sales", 58, 82)
 polariton_presentation::__facet("region", 10, 25).__gutter(24, 26, 41).__label_size(18, 42, 57),
 polariton_presentation::__bar("quarter", "sales", 58, 82)
 ], 0, 83)] }"#;
-		let views = execute(valid, &[0..83]).expect("faceted label-size figure");
+		let views =
+			execute(valid, std::slice::from_ref(&(0..83))).expect("faceted label-size figure");
 		let RuneViewIntent::Plot(plot) = &views[0] else {
 			panic!("expected plot");
 		};
@@ -4732,7 +4738,7 @@ polariton_presentation::__bar("quarter", "sales", 42, 66)
 ], 0, 67)] }"#,
 		] {
 			assert_eq!(
-				execute(source, &[0..67]),
+				execute(source, std::slice::from_ref(&(0..67))),
 				Err(PresentationFailure {
 					span: 26..41,
 					message:
@@ -4747,7 +4753,7 @@ polariton_presentation::__facet("region", 10, 25).__label_size(12, 26, 41).__lab
 polariton_presentation::__bar("quarter", "sales", 58, 82)
 ], 0, 83)] }"#;
 		assert_eq!(
-			execute(duplicate, &[0..83]),
+			execute(duplicate, std::slice::from_ref(&(0..83))),
 			Err(PresentationFailure {
 				span: 42..57,
 				message: "facet(...).label_size(...) may appear at most once".to_owned(),
@@ -4760,7 +4766,7 @@ polariton_presentation::__bar("quarter", "sales", 58, 82)
 		let source = "pub fn main() { loop {} }";
 		let error = execute_generated(
 			source,
-			&[0..25],
+			std::slice::from_ref(&(0..25)),
 			&PresentationSourceMap::identity(source, 0..25),
 			PresentationLimits {
 				instructions: 100,
@@ -4782,7 +4788,7 @@ polariton_presentation::__bar("quarter", "sales", 58, 82)
 		assert_eq!(
 			execute_generated(
 				source,
-				&[slot.clone()],
+				std::slice::from_ref(&slot),
 				&PresentationSourceMap::identity(source, slot.clone()),
 				PresentationLimits::default(),
 			),

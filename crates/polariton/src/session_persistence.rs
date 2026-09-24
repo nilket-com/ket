@@ -227,17 +227,17 @@ fn ensure_supported_schema(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FamilyAdmissionPolicy {
-	InitialClosedFamilies,
-	AreaClosedFamilies,
-	ExtensibleFamilies,
+	InitialClosed,
+	AreaClosed,
+	Extensible,
 }
 
 impl FamilyAdmissionPolicy {
 	fn for_schema(schema_version: u32) -> Result<Self, SessionPersistenceError> {
 		match schema_version {
-			INITIAL_CLOSED_SCHEMA => Ok(Self::InitialClosedFamilies),
-			AREA_CLOSED_SCHEMA => Ok(Self::AreaClosedFamilies),
-			3..=SCHEMA_VERSION => Ok(Self::ExtensibleFamilies),
+			INITIAL_CLOSED_SCHEMA => Ok(Self::InitialClosed),
+			AREA_CLOSED_SCHEMA => Ok(Self::AreaClosed),
+			3..=SCHEMA_VERSION => Ok(Self::Extensible),
 			other => Err(SessionPersistenceError::refused(format!(
 				"unsupported schema version {other}"
 			))),
@@ -246,11 +246,11 @@ impl FamilyAdmissionPolicy {
 
 	fn admits(self, family: &AuthoredFamilyId) -> bool {
 		match self {
-			Self::InitialClosedFamilies => matches!(family.as_str(), "scatter" | "bar" | "line"),
-			Self::AreaClosedFamilies => {
+			Self::InitialClosed => matches!(family.as_str(), "scatter" | "bar" | "line"),
+			Self::AreaClosed => {
 				matches!(family.as_str(), "scatter" | "bar" | "line" | "area")
 			}
-			Self::ExtensibleFamilies => true,
+			Self::Extensible => true,
 		}
 	}
 }

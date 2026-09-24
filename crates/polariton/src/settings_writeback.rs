@@ -531,7 +531,7 @@ fn plan_insertion(
 			CallPosition::Free
 		},
 	);
-	if setting.receiver.is_some() {
+	if let Some(setting_receiver) = setting.receiver {
 		let receiver = if setting.target == LogicalTarget::Mark {
 			let mark_handlers = [
 				HandlerId::Bar,
@@ -553,8 +553,8 @@ fn plan_insertion(
 				mark_handlers.contains(&boundary.handler)
 			})?
 		} else {
-			let handler = receiver_handler(setting.receiver.expect("method setting has receiver"))
-				.ok_or(WritebackRefusal::AmbiguousInsertion)?;
+			let handler =
+				receiver_handler(setting_receiver).ok_or(WritebackRefusal::AmbiguousInsertion)?;
 			let candidates = model
 				.syntax
 				.iter()

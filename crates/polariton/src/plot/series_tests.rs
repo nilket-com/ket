@@ -238,8 +238,10 @@ fn product_0156_area_keeps_lower_band_gap_and_percent_totals() {
 			series_colors: vec![],
 			normalization,
 		};
-		let mut settings = ResolvedPlotSettings::default();
-		settings.series_registry = SeriesRegistry::new(kernel.series_identities());
+		let mut settings = ResolvedPlotSettings {
+			series_registry: SeriesRegistry::new(kernel.series_identities()),
+			..Default::default()
+		};
 		let universe = settings.series_registry.identities().to_vec();
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 100.0));
 		let layout = kernel.layout(settings.clone());
@@ -545,7 +547,7 @@ fn product_0156_viewport_and_visibility_preserve_one_another() {
 	};
 	host.update(PlotPaneMsg::ViewportChanged {
 		stamp: host.viewport_stamp.next(),
-		domains: domains.clone(),
+		domains,
 		quiet_settle: false,
 	});
 	host.update(PlotPaneMsg::SeriesVisibility(SeriesVisibilityAction::Hide(

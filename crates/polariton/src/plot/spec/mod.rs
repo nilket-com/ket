@@ -4373,10 +4373,11 @@ fn resolve_plot_domain(
 	channel: &BoundChannel,
 ) -> Result<ScaleDomain, DomainError> {
 	let mut domain = resolve_domain(column, channel)?;
-	if plot_type == PlotType::Violin && channel.channel == Channel::X {
-		if let ScaleDomain::Categorical(categories) = &mut domain {
-			categories.sort_unstable();
-		}
+	if plot_type == PlotType::Violin
+		&& channel.channel == Channel::X
+		&& let ScaleDomain::Categorical(categories) = &mut domain
+	{
+		categories.sort_unstable();
 	}
 	Ok(domain)
 }
@@ -4517,15 +4518,15 @@ fn resolve_explicit_positions(
 	let selected_space = ColorAllocationSpace::CategoricalPalette {
 		len: selection.len(),
 	};
-	if let Some(existing) = identity.spaces.get(&lineage) {
-		if *existing != selected_space {
-			return Err(CategoricalResolutionError::IncompatibleAllocationSpace {
-				field: channel.field.clone(),
-				layer: channel.layer.clone(),
-				existing_len: existing.len(),
-				selected_len: selection.len(),
-			});
-		}
+	if let Some(existing) = identity.spaces.get(&lineage)
+		&& *existing != selected_space
+	{
+		return Err(CategoricalResolutionError::IncompatibleAllocationSpace {
+			field: channel.field.clone(),
+			layer: channel.layer.clone(),
+			existing_len: existing.len(),
+			selected_len: selection.len(),
+		});
 	}
 
 	let retained = identity
@@ -4586,11 +4587,13 @@ fn resolve_explicit_positions(
 				layer: color_layer.clone(),
 				category: category.clone(),
 			};
-			if !identity.assignments.contains_key(&key) {
+			if let std::collections::hash_map::Entry::Vacant(entry) =
+				identity.assignments.entry(key)
+			{
 				let position = maximin_position(&occupied, selection.len())
 					.expect("capacity validation guarantees an unoccupied position");
 				occupied.insert(position);
-				identity.assignments.insert(key, position);
+				entry.insert(position);
 			}
 		}
 	}

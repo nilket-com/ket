@@ -34,6 +34,7 @@ impl Default for ContinuousRamps {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(not(any(feature = "toron", test)), allow(dead_code))] // Remote Rune constructs these anchors; substrate tests exercise them without Toron.
 pub enum ContinuousAnchor {
 	None,
 	DefaultZero,

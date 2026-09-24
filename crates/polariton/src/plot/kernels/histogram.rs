@@ -325,12 +325,13 @@ mod tests {
 	use crate::plot::common::{PathBuilder, PlotBackend};
 	use crate::plot::kernels::histogram_bins::{HistogramBin, HistogramBins, HistogramBinsError};
 	use iced::{Color, Point, Size, Vector};
+	type StrokeRecord = (Color, f32, Vec<(Point, Size)>);
 
 	#[derive(Default)]
 	struct RectangleBackend {
 		rectangles: Vec<(Point, Size)>,
 		colors: Vec<Color>,
-		strokes: Vec<(Color, f32, Vec<(Point, Size)>)>,
+		strokes: Vec<StrokeRecord>,
 		clips: Vec<Rectangle>,
 	}
 
@@ -600,7 +601,7 @@ mod tests {
 		for (kernel, expected_x) in [(&empty, (0.0, 1.0)), (&zero, (4.0, 9.0))] {
 			let settings = ResolvedPlotSettings::default();
 			assert_eq!(
-				render_rectangles(&kernel, settings.clone()).rectangles,
+				render_rectangles(kernel, settings.clone()).rectangles,
 				Vec::new()
 			);
 			assert_eq!(kernel.legend_content(&settings), None);

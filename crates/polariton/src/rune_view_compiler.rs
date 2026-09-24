@@ -2008,10 +2008,10 @@ fn lex(source: &str, offset: usize) -> Vec<LexToken> {
 				index += 2;
 				let mut depth = 1usize;
 				while index < bytes.len() && depth > 0 {
-					if bytes.get(index..index + 2) == Some(&[b'/', b'*']) {
+					if bytes.get(index..index + 2) == Some(b"/*") {
 						depth += 1;
 						index += 2;
-					} else if bytes.get(index..index + 2) == Some(&[b'*', b'/']) {
+					} else if bytes.get(index..index + 2) == Some(b"*/") {
 						depth -= 1;
 						index += 2;
 					} else {
@@ -2506,7 +2506,7 @@ mod tests {
 				.as_ref()
 				.and_then(|fields| fields.multivariate())
 				.expect("multivariate fields and origins");
-			assert_eq!(plot_type.to_string().to_lowercase().contains(word), true);
+			assert!(plot_type.to_string().to_lowercase().contains(word));
 			assert_eq!(fields.dimensions().len(), dimensions);
 			for (field, span) in fields.dimensions().iter().zip(&origins.dimensions) {
 				assert_eq!(

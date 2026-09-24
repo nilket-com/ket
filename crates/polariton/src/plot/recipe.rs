@@ -14,6 +14,7 @@ use crate::selection::{Predicate, Publication};
 use std::sync::Arc;
 
 #[derive(Clone)]
+#[cfg_attr(not(feature = "toron"), allow(dead_code))] // The shared recipe type retains Rune variants in reduced builds.
 pub enum PlotConstruction {
 	Single {
 		spec: ResolvedPlotSpec,
@@ -62,6 +63,7 @@ impl PlotRecipe {
 		}
 	}
 
+	#[cfg_attr(not(feature = "toron"), allow(dead_code))] // The shared constructor is used when Rune is enabled.
 	pub fn facet(
 		artifact: Arc<ResultArtifact>,
 		spec: Arc<ResolvedPlotSpec>,
@@ -85,6 +87,7 @@ impl PlotRecipe {
 		}
 	}
 
+	#[cfg_attr(not(feature = "toron"), allow(dead_code))] // The shared constructor is used when Rune is enabled.
 	pub fn layered(
 		artifact: Arc<ResultArtifact>,
 		specification: LayeredPlotSpec,

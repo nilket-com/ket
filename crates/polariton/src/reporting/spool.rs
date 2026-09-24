@@ -488,7 +488,7 @@ mod tests {
 		let root = Scratch::new();
 		let mut spool = Spool::open(root.0.clone(), destination()).unwrap();
 		let row = report(&spool, 0);
-		spool.persist("run", 0, &[row.clone()]).unwrap();
+		spool.persist("run", 0, std::slice::from_ref(&row)).unwrap();
 		let mut rows = std::collections::HashMap::new();
 		assert!(
 			spool

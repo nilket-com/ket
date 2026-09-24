@@ -1127,10 +1127,8 @@ impl TickPlacement {
 		}
 		let major_count = major.len();
 		let interval_count = major_count.saturating_sub(1);
-		let minor_count = interval_count
-			.checked_mul(minor_intervals as usize)
-			.unwrap_or(usize::MAX);
-		let total = major_count.checked_add(minor_count).unwrap_or(usize::MAX);
+		let minor_count = interval_count.saturating_mul(minor_intervals as usize);
+		let total = major_count.saturating_add(minor_count);
 		if total > MAX_GENERATED_TICK_POSITIONS {
 			return Err(TickPlacementError::MinorCapacity {
 				placement: self,
@@ -1154,7 +1152,7 @@ impl TickPlacement {
 						(1..=minor_intervals).filter_map(move |minor| {
 							let t = (index as f64 + minor as f64 / (minor_intervals + 1) as f64)
 								/ intervals.get() as f64;
-							(t <= 1.0).then(|| range.0 + (range.1 - range.0) * t)
+							(t <= 1.0).then_some(range.0 + (range.1 - range.0) * t)
 						})
 					})
 					.collect())
@@ -3336,6 +3334,8 @@ pub enum RasterReusePolicy {
 	Refused,
 }
 
+type AxisRange = Option<(f64, f64)>;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ViewportGeometry {
 	pub plot_area: Rect<Widget>,
@@ -3369,7 +3369,7 @@ impl ViewportGeometry {
 		})
 	}
 
-	fn ranges(layout: &PlotLayout) -> Option<(Option<(f64, f64)>, Option<(f64, f64)>)> {
+	fn ranges(layout: &PlotLayout) -> Option<(AxisRange, AxisRange)> {
 		match layout {
 			PlotLayout::Cartesian {
 				x_range, y_range, ..
@@ -5422,9 +5422,7 @@ impl<'a> PlotWidget<'a> {
 				let domain = match layout {
 					PlotLayout::Cartesian {
 						x_range,
-						y_range: _,
 						x_temporal_domain,
-						y_temporal_domain: _,
 						..
 					} if placement == self.settings.x_tick_placement && range == x_range => x_temporal_domain,
 					PlotLayout::Cartesian {
@@ -6175,7 +6173,7 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 				SettingsGesture::None => {}
 			}
 		}
-		if self.selection_axis_fields.is_some() {
+		if let Some(axis_fields) = self.selection_axis_fields {
 			let widget_position = || {
 				let position = cursor.position_over(bounds)?;
 				Some(Pt::<Widget>::from_window(
@@ -6202,9 +6200,7 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 				Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left))
 					if state.modifiers.shift() =>
 				{
-					let Some(position) = widget_position() else {
-						return None;
-					};
+					let position = widget_position()?;
 					let Some(geometry) = self.selection_geometry(bounds, cursor) else {
 						return Some(
 							canvas::Action::publish(PlotMessage::SelectionRefused(
@@ -6332,11 +6328,7 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 							.and_capture(),
 						);
 					}
-					let Some(predicate) = brush_predicate(
-						&drag,
-						self.selection_axis_fields
-							.expect("selection fields checked"),
-					) else {
+					let Some(predicate) = brush_predicate(&drag, axis_fields) else {
 						return Some(
 							canvas::Action::publish(PlotMessage::SelectionRefused(
 								"Selection · the brushed axes cannot be represented exactly"
@@ -6377,9 +6369,7 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 						state.viewport_click = None;
 						return None;
 					};
-					let Some(widget_position) = widget_position() else {
-						return None;
-					};
+					let widget_position = widget_position()?;
 					let Some(geometry) = state
 						.chained_viewport_geometry(chain_stamp)
 						.or_else(|| self.viewport_geometry(bounds, cursor))
@@ -6428,9 +6418,7 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 						return None;
 					}
 					if let (Some(drag), Some(position)) = (state.viewport_drag, widget_position()) {
-						let Some(domains) = pan_viewport(drag, position) else {
-							return None;
-						};
+						let domains = pan_viewport(drag, position)?;
 						let next = drag.stamp.next();
 						if let Some(drag) = &mut state.viewport_drag {
 							drag.stamp = next;
@@ -6468,18 +6456,11 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 						iced::mouse::ScrollDelta::Lines { y, .. } => *y as f64,
 						iced::mouse::ScrollDelta::Pixels { y, .. } => *y as f64 / 53.0,
 					};
-					let Some(position) = widget_position() else {
-						return None;
-					};
-					let Some(geometry) = state
+					let position = widget_position()?;
+					let geometry = state
 						.chained_viewport_geometry(chain_stamp)
-						.or_else(|| self.viewport_geometry(bounds, cursor))
-					else {
-						return None;
-					};
-					let Some(domains) = zoom_viewport(geometry, position, steps) else {
-						return None;
-					};
+						.or_else(|| self.viewport_geometry(bounds, cursor))?;
+					let domains = zoom_viewport(geometry, position, steps)?;
 					state.last_hover = None;
 					state.last_hit = None;
 					let next = chain_stamp.next();
@@ -8679,18 +8660,24 @@ mod product_0031_pre_extraction_oracle {
 		let fallback = oracle_svg_with_legend(ResolvedPlotSettings::default(), false);
 		assert!(fallback.contains(">fallback title</text>"));
 
-		let mut shown = ResolvedPlotSettings::default();
-		shown.title = ResolvedPresence::Show(Arc::new("shown title".to_owned()));
+		let shown = ResolvedPlotSettings {
+			title: ResolvedPresence::Show(Arc::new("shown title".to_owned())),
+			..Default::default()
+		};
 		let shown = oracle_svg_with_legend(shown, false);
 		assert!(shown.contains(">shown title</text>"));
 		assert!(!shown.contains(">fallback title</text>"));
 
-		let mut hidden = ResolvedPlotSettings::default();
-		hidden.title = ResolvedPresence::Hide;
-		hidden.legend = ResolvedPresence::Hide;
+		let hidden = ResolvedPlotSettings {
+			title: ResolvedPresence::Hide,
+			legend: ResolvedPresence::Hide,
+			..Default::default()
+		};
 		let hidden_with_content = oracle_svg_with_legend(hidden, true);
-		let mut hidden_without_content = ResolvedPlotSettings::default();
-		hidden_without_content.title = ResolvedPresence::Hide;
+		let hidden_without_content = ResolvedPlotSettings {
+			title: ResolvedPresence::Hide,
+			..Default::default()
+		};
 		let no_content = oracle_svg_with_legend(hidden_without_content, false);
 		assert!(!hidden_with_content.contains(">fallback title</text>"));
 		assert_eq!(hidden_with_content, no_content);
@@ -8714,13 +8701,17 @@ mod product_0031_pre_extraction_oracle {
 
 	#[test]
 	fn product_0051_default_legend_tracks_the_plot_top_across_headings_and_large_resizes() {
-		let mut title_only = ResolvedPlotSettings::default();
-		title_only.title = ResolvedPresence::Show(Arc::new("title".to_owned()));
+		let title_only = ResolvedPlotSettings {
+			title: ResolvedPresence::Show(Arc::new("title".to_owned())),
+			..Default::default()
+		};
 		let mut title_and_subtitle = title_only.clone();
 		title_and_subtitle.subtitle = ResolvedPresence::Show(Arc::new("subtitle".to_owned()));
-		let mut neither = ResolvedPlotSettings::default();
-		neither.title = ResolvedPresence::Hide;
-		neither.subtitle = ResolvedPresence::Hide;
+		let neither = ResolvedPlotSettings {
+			title: ResolvedPresence::Hide,
+			subtitle: ResolvedPresence::Hide,
+			..Default::default()
+		};
 
 		for (width, height) in [(400.0, 300.0), (1200.0, 900.0)] {
 			for settings in [
@@ -9308,11 +9299,12 @@ mod product_0067_0068_strata_oracles {
 	fn product_0113_heading_band_is_the_maximum_of_typed_title_and_subtitle_contributions() {
 		let title = |pixels| TitleTextSize::new(pixels).unwrap();
 		let subtitle = |pixels| SubtitleTextSize::new(pixels).unwrap();
-		let mut settings = ResolvedPlotSettings::default();
-
-		settings.title = ResolvedPresence::Show(Arc::new("title".to_owned()));
-		settings.subtitle = ResolvedPresence::Hide;
-		settings.title_size = title(48.0);
+		let mut settings = ResolvedPlotSettings {
+			title: ResolvedPresence::Show(Arc::new("title".to_owned())),
+			subtitle: ResolvedPresence::Hide,
+			title_size: title(48.0),
+			..Default::default()
+		};
 		assert_eq!(
 			VerticalGuideBands::resolve("", None, &settings).heading_height(),
 			settings.title_offset + title(48.0).pixels()
@@ -9815,7 +9807,7 @@ mod product_0037_count_position_oracle {
 			.flat_map(|i| {
 				(1..=minor).filter_map(move |j| {
 					let t = (i as f64 + j as f64 / (minor + 1) as f64) / intervals as f64;
-					(t <= 1.0).then(|| range.0 + (range.1 - range.0) * t)
+					(t <= 1.0).then_some(range.0 + (range.1 - range.0) * t)
 				})
 			})
 			.collect()
@@ -10129,11 +10121,13 @@ mod product_0056_categorical_y_oracles {
 		let default_settings = ResolvedPlotSettings::default();
 		assert_eq!(default_settings.title_size, TitleTextSize::DEFAULT);
 		assert_eq!(default_settings.subtitle_size, SubtitleTextSize::DEFAULT);
-		let mut settings = ResolvedPlotSettings::default();
-		settings.title = ResolvedPresence::Show(Arc::new("Title".to_owned()));
-		settings.subtitle = ResolvedPresence::Show(Arc::new("Subtitle".to_owned()));
-		settings.title_size = TitleTextSize::new(48.0).unwrap();
-		settings.subtitle_size = SubtitleTextSize::new(36.0).unwrap();
+		let settings = ResolvedPlotSettings {
+			title: ResolvedPresence::Show(Arc::new("Title".to_owned())),
+			subtitle: ResolvedPresence::Show(Arc::new("Subtitle".to_owned())),
+			title_size: TitleTextSize::new(48.0).unwrap(),
+			subtitle_size: SubtitleTextSize::new(36.0).unwrap(),
+			..Default::default()
+		};
 		let settings_model = PlotSettings::from_resolved(settings.clone());
 		let widget = PlotWidget::new(
 			&kernel,
@@ -10172,8 +10166,10 @@ mod product_0056_categorical_y_oracles {
 		};
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(240.0, 160.0));
 		let header = |size| {
-			let mut settings = ResolvedPlotSettings::default();
-			settings.x_label_size = size;
+			let settings = ResolvedPlotSettings {
+				x_label_size: size,
+				..Default::default()
+			};
 			let settings_model = PlotSettings::from_resolved(settings.clone());
 			let widget = PlotWidget::new(
 				&kernel,
@@ -10207,9 +10203,11 @@ mod product_0056_categorical_y_oracles {
 		assert_eq!(enlarged.size, iced::Pixels(24.0));
 		assert_eq!(default.position.y - enlarged.position.y, 4.0);
 
-		let mut titled = ResolvedPlotSettings::default();
-		titled.title = ResolvedPresence::Show(Arc::new("Title".to_owned()));
-		titled.title_size = TitleTextSize::new(48.0).unwrap();
+		let titled = ResolvedPlotSettings {
+			title: ResolvedPresence::Show(Arc::new("Title".to_owned())),
+			title_size: TitleTextSize::new(48.0).unwrap(),
+			..Default::default()
+		};
 		let bands = VerticalGuideBands::resolve("", None, &titled);
 		let plot_top = bands.plot_top(&titled);
 		let header_top = plot_top - 2.0 * enlarged.size.0;

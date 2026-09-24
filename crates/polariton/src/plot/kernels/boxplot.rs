@@ -779,6 +779,14 @@ fn outlier_points(
 		.collect()
 }
 
+/// A category band's closed edges, exactly as the hit test compares them.
+struct BandEdges {
+	left: f32,
+	right: f32,
+	top: f32,
+	bottom: f32,
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1355,12 +1363,4 @@ mod tests {
 		);
 		assert_eq!(kernel.legend_content(&settings), None);
 	}
-}
-
-/// A category band's closed edges, exactly as the hit test compares them.
-struct BandEdges {
-	left: f32,
-	right: f32,
-	top: f32,
-	bottom: f32,
 }

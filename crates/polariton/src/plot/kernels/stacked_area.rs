@@ -458,6 +458,8 @@ fn prepare_stacked_area_data_inner(
 	// may print the same label and must still accumulate independently.
 	let source = df.column(cat_col).ok();
 	let mut partitions = Vec::new();
+	#[allow(clippy::mutable_key_type)]
+	// into_static owns the Polars scalar before it becomes a hash key.
 	let mut seen = std::collections::HashSet::new();
 	for row in 0..df.height() {
 		let value = source
@@ -536,6 +538,8 @@ fn prepare_stacked_area_data_inner(
 	}
 	let mut category_values = vec![vec![0.0f64; num_xs]; num_cats];
 	let mut assigned = vec![vec![false; num_xs]; num_cats];
+	#[allow(clippy::mutable_key_type)]
+	// Partitions hold owned static Polars scalars with stable hashes.
 	let cat_to_idx: HashMap<AnyValue<'static>, usize> = partitions
 		.iter()
 		.enumerate()
@@ -576,11 +580,11 @@ fn prepare_stacked_area_data_inner(
 			.unwrap_or(AnyValue::Null)
 			.into_static();
 		let y = p_y.get(i).unwrap_or(0.0);
-		if let (Some(&xi), Some(&ci)) = (x_to_idx.get(&x.to_bits()), cat_to_idx.get(&cat_value)) {
-			if !assigned[ci][xi] {
-				category_values[ci][xi] = if y.is_finite() && y > 0.0 { y } else { 0.0 };
-				assigned[ci][xi] = true;
-			}
+		if let (Some(&xi), Some(&ci)) = (x_to_idx.get(&x.to_bits()), cat_to_idx.get(&cat_value))
+			&& !assigned[ci][xi]
+		{
+			category_values[ci][xi] = if y.is_finite() && y > 0.0 { y } else { 0.0 };
+			assigned[ci][xi] = true;
 		}
 	}
 	let mut totals = vec![0.0f64; num_xs];

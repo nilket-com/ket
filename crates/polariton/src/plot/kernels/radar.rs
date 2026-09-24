@@ -204,7 +204,9 @@ impl PlotKernel for RadarPlotKernel {
 				..Default::default()
 			});
 			if i == 0 && num_circles > 0 {
-				let range = display_ranges[i];
+				let range = display_ranges
+					.first()
+					.expect("a radar dimension has a display range");
 				for c in 1..=num_circles {
 					let radius = max_radius * (c as f32 / num_circles as f32);
 					let val = range.0 + (range.1 - range.0) * (c as f64 / num_circles as f64);
@@ -337,8 +339,10 @@ mod tests {
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(300.0, 300.0));
 		let layout = PlotLayout::Radial;
 		let transform = CoordinateTransformer::new(&layout, bounds);
-		let mut settings = ResolvedPlotSettings::default();
-		settings.x_tick_placement = TickPlacement::count(1).expect("one radar interval");
+		let settings = ResolvedPlotSettings {
+			x_tick_placement: TickPlacement::count(1).expect("one radar interval"),
+			..Default::default()
+		};
 		let mut backend = SvgBackend::new(300.0, 300.0);
 		kernel.plot(
 			&mut backend,
@@ -390,8 +394,10 @@ mod tests {
 			let bounds = Rectangle::new(Point::ORIGIN, Size::new(300.0, 300.0));
 			let layout = PlotLayout::Radial;
 			let transform = CoordinateTransformer::new(&layout, bounds);
-			let mut settings = ResolvedPlotSettings::default();
-			settings.x_tick_placement = TickPlacement::count(1).expect("one radar interval");
+			let settings = ResolvedPlotSettings {
+				x_tick_placement: TickPlacement::count(1).expect("one radar interval"),
+				..Default::default()
+			};
 			let mut backend = SvgBackend::new(300.0, 300.0);
 			kernel.plot(
 				&mut backend,
@@ -429,8 +435,10 @@ mod tests {
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(300.0, 300.0));
 		let layout = PlotLayout::Radial;
 		let transform = CoordinateTransformer::new(&layout, bounds);
-		let mut settings = ResolvedPlotSettings::default();
-		settings.x_tick_placement = TickPlacement::count(1).expect("one radar interval");
+		let settings = ResolvedPlotSettings {
+			x_tick_placement: TickPlacement::count(1).expect("one radar interval"),
+			..Default::default()
+		};
 		let mut backend = SvgBackend::new(300.0, 300.0);
 		kernel.plot(
 			&mut backend,

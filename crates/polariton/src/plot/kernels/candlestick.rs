@@ -1300,11 +1300,11 @@ mod tests {
 			constant_bank
 				.operations
 				.iter()
-				.map(|operation| std::mem::discriminant(operation))
+				.map(std::mem::discriminant)
 				.collect::<Vec<_>>(),
 			bank.operations
 				.iter()
-				.map(|operation| std::mem::discriminant(operation))
+				.map(std::mem::discriminant)
 				.collect::<Vec<_>>()
 		);
 		for operation in &constant_bank.operations {
@@ -1322,9 +1322,11 @@ mod tests {
 			"low" => [0.0_f64], "close" => [14.0_f64]
 		)
 		.unwrap();
-		let mut settings = ResolvedPlotSettings::default();
-		settings.y_min = Some(0.0);
-		settings.y_max = Some(100.0);
+		let settings = ResolvedPlotSettings {
+			y_min: Some(0.0),
+			y_max: Some(100.0),
+			..Default::default()
+		};
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 100.0));
 		let (bank, _) = paint(prepare(&frame).unwrap(), settings, bounds);
 		let Operation::Stroke { verbs, width, .. } = &bank.operations[1] else {
@@ -1360,9 +1362,11 @@ mod tests {
 		let kernel = CandlestickPlotKernel {
 			prepared_data: Arc::new(prepared),
 		};
-		let mut settings = ResolvedPlotSettings::default();
-		settings.x_min = Some(0.0);
-		settings.x_max = Some(20.0);
+		let settings = ResolvedPlotSettings {
+			x_min: Some(0.0),
+			x_max: Some(20.0),
+			..Default::default()
+		};
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 100.0));
 		let layout = kernel.layout(settings);
 		let transform = CoordinateTransformer::new(&layout, bounds);
@@ -1400,9 +1404,11 @@ mod tests {
 		let kernel = CandlestickPlotKernel {
 			prepared_data: Arc::new(prepared),
 		};
-		let mut settings = ResolvedPlotSettings::default();
-		settings.x_min = Some((first as f64).next_down());
-		settings.x_max = Some((first as f64).next_up());
+		let settings = ResolvedPlotSettings {
+			x_min: Some((first as f64).next_down()),
+			x_max: Some((first as f64).next_up()),
+			..Default::default()
+		};
 		let layout = kernel.layout(settings);
 		let transform = CoordinateTransformer::new(&layout, bounds);
 		assert_eq!(kernel.body_width(&transform), 140.0);

@@ -3587,7 +3587,7 @@ mod tests {
 		use crate::plot::factory::create_authored_plot;
 
 		fn frame(series: usize, y_scale: f64) -> DataFrame {
-			let xs: Vec<f64> = (0..64).map(|i| f64::from(i)).collect();
+			let xs: Vec<f64> = (0..64).map(f64::from).collect();
 			let ys: Vec<f64> = (0..64).map(|i| f64::from(i) * y_scale).collect();
 			if series <= 1 {
 				df!("x" => xs, "y" => ys).expect("frame")
@@ -3639,7 +3639,8 @@ mod tests {
 			"
 configuration,widget_px,inner_px,inner_share,effective_gate,naive_gate"
 		);
-		let cases: [(&str, usize, f64, Option<&str>, (f32, f32)); 7] = [
+		type RasterCase = (&'static str, usize, f64, Option<&'static str>, (f32, f32));
+		let cases: [RasterCase; 7] = [
 			("baseline 1200x720", 1, 1.0, None, (1200.0, 720.0)),
 			("with title", 1, 1.0, Some("A title"), (1200.0, 720.0)),
 			("8 series (legend)", 8, 1.0, None, (1200.0, 720.0)),
@@ -3937,8 +3938,10 @@ configuration,widget_px,inner_px,inner_share,effective_gate,naive_gate"
 
 	fn changed_pixels(rgba: &[u8], background: Color) -> usize {
 		let background = color_to_rgba8(background);
-		rgba.chunks_exact(4)
-			.filter(|pixel| *pixel != background)
+		rgba.as_chunks::<4>()
+			.0
+			.iter()
+			.filter(|pixel| **pixel != background)
 			.count()
 	}
 

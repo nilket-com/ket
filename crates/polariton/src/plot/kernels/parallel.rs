@@ -153,7 +153,7 @@ impl PlotKernel for ParallelPlotKernel {
 								}
 							}
 						},
-						stroke.clone(),
+						stroke,
 					)
 				},
 			);

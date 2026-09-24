@@ -702,6 +702,7 @@ impl SurfaceIncarnation {
 		self.0
 	}
 
+	#[cfg(test)]
 	pub fn from_token(token: u64) -> Self {
 		Self(token)
 	}
@@ -1328,7 +1329,7 @@ mod product_0151_selection_tests {
 		assert!(values(x.clone(), [ExactScalar::Int(3)]).matches_candidate(&candidate));
 		assert!(!values(x, [ExactScalar::Int(4)]).matches_candidate(&candidate));
 		assert!(
-			Predicate::default().matches_candidate(&candidate) == false,
+			!Predicate::default().matches_candidate(&candidate),
 			"an empty predicate is not an emphasis request"
 		);
 	}

@@ -1775,8 +1775,10 @@ mod product_0013_baseline_tests {
 		.expect("scatter kernel");
 		let render = |point_size| {
 			let mut backend = SvgBackend::new(100.0, 100.0);
-			let mut settings = ResolvedPlotSettings::default();
-			settings.point_size = PointSize::new(point_size).unwrap();
+			let settings = ResolvedPlotSettings {
+				point_size: PointSize::new(point_size).unwrap(),
+				..Default::default()
+			};
 			if let Some(content) = kernel.legend_content(&settings) {
 				crate::plot::legend::render_legend(
 					&mut backend,
@@ -1890,8 +1892,10 @@ mod product_0013_baseline_tests {
 		.expect("line kernel");
 		let render = |factor| {
 			let mut backend = SvgBackend::new(100.0, 100.0);
-			let mut settings = ResolvedPlotSettings::default();
-			settings.stroke_width = crate::plot::spec::StrokeWidth::new(factor).unwrap();
+			let settings = ResolvedPlotSettings {
+				stroke_width: crate::plot::spec::StrokeWidth::new(factor).unwrap(),
+				..Default::default()
+			};
 			if let Some(content) = kernel.legend_content(&settings) {
 				crate::plot::legend::render_legend(
 					&mut backend,

@@ -178,7 +178,9 @@ fn decode_subject_attribute_value(tag: u8, value: &[u8]) -> Result<String, PkiEr
 				});
 			}
 			let code_units = value
-				.chunks_exact(2)
+				.as_chunks::<2>()
+				.0
+				.iter()
 				.map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
 				.collect::<Vec<_>>();
 			String::from_utf16(&code_units).map_err(|error| PkiError::DerParse {

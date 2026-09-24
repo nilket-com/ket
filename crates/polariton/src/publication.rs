@@ -658,10 +658,11 @@ pub(crate) fn looks_like_path_or_endpoint(value: &str) -> bool {
 		return true;
 	}
 	let mut chars = trimmed.chars();
-	if let (Some(drive), Some(':'), Some(sep)) = (chars.next(), chars.next(), chars.next()) {
-		if drive.is_ascii_alphabetic() && (sep == '\\' || sep == '/') {
-			return true;
-		}
+	if let (Some(drive), Some(':'), Some(sep)) = (chars.next(), chars.next(), chars.next())
+		&& drive.is_ascii_alphabetic()
+		&& (sep == '\\' || sep == '/')
+	{
+		return true;
 	}
 	trimmed.contains("://")
 }
@@ -3831,7 +3832,7 @@ mod product_0157_tests {
 			}
 		}
 		let step = 17;
-		for i in 0..(1000 - vectors.len()).max(0) {
+		for i in 0..(1000 - vectors.len()) {
 			let x = ((i * step) % 320) as f64 + 0.5;
 			let y = ((i * step * 7) % 220) as f64 + 0.5;
 			vectors.push((x, y));
@@ -4239,10 +4240,11 @@ function __pointer(x, y, mods) {
 	fn js_string(text: &str) -> String {
 		serde_json::to_string(text).unwrap()
 	}
+	type FigureStub<'a> = (Option<&'a [u8]>, Option<&'a [u8]>, f32, f32);
 
 	/// Install the asset over stub figures, then run `script` and return its
 	/// value as JSON text.
-	fn installed(figures: &[(Option<&[u8]>, Option<&[u8]>, f32, f32)], script: &str) -> String {
+	fn installed(figures: &[FigureStub<'_>], script: &str) -> String {
 		let mut context = Context::default();
 		context
 			.eval(Source::from_bytes(DOM_STUB))
