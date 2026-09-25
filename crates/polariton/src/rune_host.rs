@@ -43,7 +43,42 @@ impl ExportReceipt {
 pub struct RuneExecution {
 	pub display: Option<String>,
 	pub requests: Vec<PlotRequest>,
+	/// Each request's place in the run's output sequence, shared with
+	/// `views` sets, so a local batch keeps the order the source produced.
+	pub request_order: Vec<usize>,
 	pub receipts: Vec<ExportReceipt>,
+	/// A local run's `frame.views([...])` sets, in call order.
+	#[cfg(feature = "toron")]
+	pub views: Vec<LocalViewSet>,
+}
+
+/// One `frame.views([...])` call: the frame and its named views, decoded
+/// through the shared presentation vocabulary.
+#[cfg(feature = "toron")]
+#[derive(Debug)]
+pub struct LocalViewSet {
+	/// Its place in the run's output sequence (see `request_order`).
+	pub order: usize,
+	pub artifact: Arc<ResultArtifact>,
+	pub views: Vec<crate::rune_relation_envelope::SpannedRuneViewIntent>,
+	/// The source's name and original text, to locate resolution errors.
+	pub source_name: String,
+	pub source: Arc<str>,
+}
+
+/// Where a local run's views are queued. Present only in a local run: a
+/// buffer or notebook cell has no queue, and `views` refuses there.
+#[cfg_attr(not(feature = "toron"), allow(dead_code))]
+pub(crate) struct ViewQueue {
+	/// The original source text, for locating a view's diagnostics.
+	pub(crate) source: Arc<str>,
+	pub(crate) name: String,
+	/// Every name used so far in this run; a view name is unique per run.
+	pub(crate) names: std::collections::HashSet<String>,
+	/// The run's output sequence, shared with plot requests.
+	pub(crate) sequence: Arc<std::sync::atomic::AtomicUsize>,
+	#[cfg(feature = "toron")]
+	pub(crate) sets: Vec<LocalViewSet>,
 }
 
 /// The owned snapshots one execution may read, cloned before the VM runs.
@@ -63,6 +98,8 @@ pub struct RuneCapabilities {
 struct RequestQueue {
 	active: bool,
 	requests: Vec<PlotRequest>,
+	order: Vec<usize>,
+	sequence: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RequestQueue {
@@ -71,17 +108,24 @@ impl RequestQueue {
 			return Err("Plot handle expired".to_owned());
 		}
 		self.requests.push(request);
+		self.order.push(
+			self.sequence
+				.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+		);
 		Ok(())
 	}
 
-	fn finish(&mut self) -> Vec<PlotRequest> {
+	fn finish(&mut self) -> (Vec<PlotRequest>, Vec<usize>) {
 		self.active = false;
-		std::mem::take(&mut self.requests)
+		(
+			std::mem::take(&mut self.requests),
+			std::mem::take(&mut self.order),
+		)
 	}
 }
 
 #[derive(Default)]
-struct ExportQueue {
+pub(crate) struct ExportQueue {
 	active: bool,
 	receipts: Vec<ExportReceipt>,
 }
@@ -103,24 +147,28 @@ impl ExportQueue {
 
 #[derive(Any, Clone)]
 #[rune(item = ::polariton, name = Workspace)]
-struct RuneWorkspace {
+pub(crate) struct RuneWorkspace {
 	cells: Arc<HashMap<String, Arc<ResultArtifact>>>,
 	results: Arc<HashMap<String, Arc<ResultArtifact>>>,
 	receipts: Arc<Mutex<ExportQueue>>,
+	views: Option<Arc<Mutex<ViewQueue>>>,
 }
 
 #[derive(Any, Clone)]
 #[rune(item = ::polariton, name = Cell)]
-struct RuneCell {
-	name: String,
-	artifact: Arc<ResultArtifact>,
-	receipts: Arc<Mutex<ExportQueue>>,
+pub(crate) struct RuneCell {
+	pub(crate) name: String,
+	pub(crate) artifact: Arc<ResultArtifact>,
+	pub(crate) receipts: Arc<Mutex<ExportQueue>>,
+	pub(crate) views: Option<Arc<Mutex<ViewQueue>>>,
 }
 
 #[derive(Any, Clone)]
 #[rune(item = ::polariton, name = Viz)]
-struct RuneViz {
+pub(crate) struct RuneViz {
 	queue: Arc<Mutex<RequestQueue>>,
+	pub(crate) receipts: Arc<Mutex<ExportQueue>>,
+	pub(crate) views: Option<Arc<Mutex<ViewQueue>>>,
 }
 
 #[derive(Any, Clone)]
@@ -129,6 +177,8 @@ struct RunePlot {
 	cell: RuneCell,
 	composition: PlotComposition,
 	projection: Option<(String, String)>,
+	/// A column whose values name the series each row belongs to.
+	series: Option<String>,
 	queue: Arc<Mutex<RequestQueue>>,
 }
 
@@ -138,22 +188,7 @@ struct RunePlot {
 /// caller owns the returned execution and decides where its display and
 /// requests render.
 pub fn execute(source: &str, capabilities: RuneCapabilities) -> Result<RuneExecution, String> {
-	let queue = Arc::new(Mutex::new(RequestQueue {
-		active: true,
-		requests: Vec::new(),
-	}));
-	let receipts = Arc::new(Mutex::new(ExportQueue {
-		active: true,
-		receipts: Vec::new(),
-	}));
-	let workspace = RuneWorkspace {
-		cells: Arc::new(capabilities.cells),
-		results: Arc::new(capabilities.results),
-		receipts: Arc::clone(&receipts),
-	};
-	let viz = RuneViz {
-		queue: queue.clone(),
-	};
+	let surface = Surface::new(capabilities);
 	let context = build_context()?;
 	let runtime = Arc::new(
 		context
@@ -187,23 +222,113 @@ pub fn execute(source: &str, capabilities: RuneCapabilities) -> Result<RuneExecu
 		})?;
 	let mut vm = Vm::new(runtime, Arc::new(unit));
 	let result = vm
-		.call(["main"], (workspace, viz))
+		.call(["main"], (surface.workspace.clone(), surface.viz.clone()))
 		.map_err(|error| format!("Rune runtime error: {error}"))
 		.and_then(decode_return);
 	drop(vm);
-	let requests = queue
-		.lock()
-		.map_err(|_| "Plot request queue was poisoned".to_owned())?
-		.finish();
-	let receipts = receipts
-		.lock()
-		.map_err(|_| "Export receipt queue was poisoned".to_owned())?
-		.finish();
-	result.map(|display| RuneExecution {
-		display,
-		requests,
-		receipts,
-	})
+	surface.finish(result)
+}
+
+/// The `workspace` and `viz` values one execution receives, and the queues
+/// they fill. Owned per execution; `finish` drains what the script published.
+pub(crate) struct Surface {
+	pub(crate) workspace: RuneWorkspace,
+	pub(crate) viz: RuneViz,
+	queue: Arc<Mutex<RequestQueue>>,
+	receipts: Arc<Mutex<ExportQueue>>,
+	#[cfg_attr(not(feature = "toron"), allow(dead_code))]
+	views: Option<Arc<Mutex<ViewQueue>>>,
+}
+
+impl Surface {
+	pub(crate) fn new(capabilities: RuneCapabilities) -> Self {
+		Self::with_views(capabilities, None, Arc::default())
+	}
+
+	/// A local run's surface: frames it builds can queue views.
+	pub(crate) fn local(capabilities: RuneCapabilities, name: &str, source: &str) -> Self {
+		let sequence = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		Self::with_views(
+			capabilities,
+			Some(Arc::new(Mutex::new(ViewQueue {
+				source: Arc::from(source),
+				name: name.to_owned(),
+				names: std::collections::HashSet::new(),
+				sequence: Arc::clone(&sequence),
+				#[cfg(feature = "toron")]
+				sets: Vec::new(),
+			}))),
+			sequence,
+		)
+	}
+
+	fn with_views(
+		capabilities: RuneCapabilities,
+		views: Option<Arc<Mutex<ViewQueue>>>,
+		sequence: Arc<std::sync::atomic::AtomicUsize>,
+	) -> Self {
+		let queue = Arc::new(Mutex::new(RequestQueue {
+			active: true,
+			requests: Vec::new(),
+			order: Vec::new(),
+			sequence,
+		}));
+		let receipts = Arc::new(Mutex::new(ExportQueue {
+			active: true,
+			receipts: Vec::new(),
+		}));
+		Self {
+			workspace: RuneWorkspace {
+				cells: Arc::new(capabilities.cells),
+				results: Arc::new(capabilities.results),
+				receipts: Arc::clone(&receipts),
+				views: views.clone(),
+			},
+			viz: RuneViz {
+				queue: Arc::clone(&queue),
+				receipts: Arc::clone(&receipts),
+				views: views.clone(),
+			},
+			queue,
+			receipts,
+			views,
+		}
+	}
+
+	/// Close both queues and pair what they hold with the script's outcome.
+	pub(crate) fn finish(
+		self,
+		display: Result<Option<String>, String>,
+	) -> Result<RuneExecution, String> {
+		let (requests, request_order) = self
+			.queue
+			.lock()
+			.map_err(|_| "Plot request queue was poisoned".to_owned())?
+			.finish();
+		let receipts = self
+			.receipts
+			.lock()
+			.map_err(|_| "Export receipt queue was poisoned".to_owned())?
+			.finish();
+		#[cfg(feature = "toron")]
+		let views = match &self.views {
+			Some(queue) => std::mem::take(
+				&mut queue
+					.lock()
+					.map_err(|_| "View queue was poisoned".to_owned())?
+					.sets,
+			),
+			None => Vec::new(),
+		};
+		display.map(|display| RuneExecution {
+			display,
+			requests,
+			request_order,
+			receipts,
+			#[cfg(feature = "toron")]
+			views,
+		})
+	}
 }
 
 /// Execute the body of a Rune buffer or fenced notebook cell.
@@ -244,7 +369,7 @@ fn format_value(value: Value) -> Result<String, String> {
 /// Map the VM's return value onto the display channel. A script-level
 /// `Err(message)` — usually from a `?` on a missing snapshot — fails the
 /// execution; unit is silent; anything else must be displayable.
-fn decode_return(value: Value) -> Result<Option<String>, String> {
+pub(crate) fn decode_return(value: Value) -> Result<Option<String>, String> {
 	let original = value.clone();
 	match value.downcast::<Result<Value, Value>>() {
 		Ok(Ok(value)) => display_value(value),
@@ -289,6 +414,17 @@ fn build_context() -> Result<Context, String> {
 		.map_err(|error| format!("Rune context error: {error}"))?;
 	let mut module =
 		Module::with_crate("polariton").map_err(|error| format!("Rune module error: {error}"))?;
+	register(&mut module)?;
+	context
+		.install(module)
+		.map_err(|error| format!("Rune context error: {error}"))?;
+	Ok(context)
+}
+
+/// Register the `polariton` crate's types and functions on `module`. Shared
+/// by the plain context above and the rnx-hosted local context
+/// (`rune_local`), so both sources see one capability surface.
+pub(crate) fn register(module: &mut Module) -> Result<(), String> {
 	module
 		.ty::<RuneWorkspace>()
 		.map_err(|error| format!("Rune module error: {error}"))?;
@@ -325,10 +461,16 @@ fn build_context() -> Result<Context, String> {
 	module
 		.associated_function("export_csv", cell_export_csv)
 		.map_err(|error| format!("Rune module error: {error}"))?;
-	context
-		.install(module)
-		.map_err(|error| format!("Rune context error: {error}"))?;
-	Ok(context)
+	module
+		.associated_function("frame", crate::rune_local::viz_frame)
+		.map_err(|error| format!("Rune module error: {error}"))?;
+	module
+		.associated_function("frame_typed", crate::rune_local::viz_frame_typed)
+		.map_err(|error| format!("Rune module error: {error}"))?;
+	module
+		.associated_function("views", crate::rune_local::cell_views)
+		.map_err(|error| format!("Rune module error: {error}"))?;
+	Ok(())
 }
 
 fn rune_number(value: Value) -> VmResult<f64> {
@@ -367,6 +509,7 @@ fn workspace_cell(workspace: &RuneWorkspace, name: &str) -> VmResult<Result<Rune
 		name: name.to_owned(),
 		artifact: data.clone(),
 		receipts: Arc::clone(&workspace.receipts),
+		views: workspace.views.clone(),
 	}))
 }
 
@@ -380,6 +523,7 @@ fn workspace_result(workspace: &RuneWorkspace, name: &str) -> VmResult<Result<Ru
 		name: name.to_owned(),
 		artifact: data.clone(),
 		receipts: Arc::clone(&workspace.receipts),
+		views: workspace.views.clone(),
 	}))
 }
 
@@ -388,6 +532,7 @@ fn viz_plot(viz: &RuneViz, cell: RuneCell) -> RunePlot {
 		cell,
 		composition: PlotComposition::single(PlotType::Scatter),
 		projection: None,
+		series: None,
 		queue: viz.queue.clone(),
 	}
 }
@@ -415,9 +560,20 @@ fn plot_scatter(
 			};
 			plot.projection = Some((x, y));
 		}
+		[_, x, y, series] => {
+			let (Ok(x), Ok(y), Ok(series)) = (
+				rune::from_value::<String>(x.clone()),
+				rune::from_value::<String>(y.clone()),
+				rune::from_value::<String>(series.clone()),
+			) else {
+				return VmResult::panic("scatter column names must be strings");
+			};
+			plot.projection = Some((x, y));
+			plot.series = Some(series);
+		}
 		_ => {
 			return VmResult::panic(
-				"scatter takes no arguments or two column names: .scatter() or .scatter(\"x\", \"y\")",
+				"scatter takes no arguments, two column names, or three: .scatter(), .scatter(\"x\", \"y\") or .scatter(\"x\", \"y\", \"series\")",
 			);
 		}
 	}
@@ -432,7 +588,7 @@ fn plot_line(mut plot: RunePlot) -> RunePlot {
 
 fn plot_show(plot: RunePlot) -> VmResult<Result<(), String>> {
 	let authored_spec = match plot.projection {
-		Some((x, y)) => AuthoredPlotSpec::xy(plot.composition, x, y),
+		Some((x, y)) => AuthoredPlotSpec::xy_color(plot.composition, x, y, plot.series),
 		None => AuthoredPlotSpec::automatic(plot.composition),
 	};
 	let data = match plot.cell.artifact.projection() {

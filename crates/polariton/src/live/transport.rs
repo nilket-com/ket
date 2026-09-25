@@ -567,6 +567,7 @@ mod tests {
 	fn picture(title: &str) -> Event {
 		Event::Changed {
 			figures: vec![crate::driver::FigureDescription {
+				status: "fresh".into(),
 				figure: "1".into(),
 				pane: 1,
 				title: title.into(),

@@ -24,7 +24,7 @@ use crate::plot::core::PlotType;
 use crate::plot::factory::{create_plot, create_styled_plot};
 use crate::plot::kernels::bar::bar_column_extent;
 use crate::plot::kernels::line::line_column_extent;
-use crate::plot::kernels::scatter::axis_type_from_scale;
+use crate::plot::kernels::scatter::axis_type_for;
 use crate::plot::spec::{
 	Channel, LayerMark, LayerSettings, LayeredPlotSpec, PlotProvenance, ResolvedKernelFields,
 	ResolvedLayout, ResolvedPlotSpec, ScaleDomain, ScaleFamily, StampedResult,
@@ -211,8 +211,8 @@ fn scatter_extent(spec: &ResolvedPlotSpec, df: &DataFrame) -> ScatterExtent {
 		.channel(Channel::Y)
 		.expect("resolved scatter y channel");
 	let layout = ResolvedLayout::from_spec(spec, AUTHORING_VIEWPORT.0, AUTHORING_VIEWPORT.1);
-	let x_axis_type = axis_type_from_scale(x.binding.scale);
-	let y_axis_type = axis_type_from_scale(y.binding.scale);
+	let x_axis_type = axis_type_for(x.binding.scale, df, &x.binding.field);
+	let y_axis_type = axis_type_for(y.binding.scale, df, &y.binding.field);
 	if matches!(x.binding.scale, ScaleFamily::Point | ScaleFamily::Band) {
 		let categories = match &x.domain {
 			ScaleDomain::Categorical(categories) => categories.clone(),

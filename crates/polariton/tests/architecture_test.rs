@@ -28,6 +28,21 @@ fn registry_callable<'a>(
 	})
 }
 
+/// The injected-origin table lives on each mark's registry entry, and the
+/// static rewrite reads it through the registry.
+fn assert_registry_origins(root: &Path, name: &str, handler: &str, origins: &str) {
+	let registry = presentation_registry(root);
+	let callable = registry_callable(&registry, name, "Free", handler)
+		.unwrap_or_else(|| panic!("registry is missing Free {name} -> {handler}"));
+	assert!(
+		callable.contains(&format!("ArgumentOrigins::{origins}")),
+		"{name} declares ArgumentOrigins::{origins}"
+	);
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
+	assert!(compiler.contains("presentation_registry::argument_origins(name)"));
+}
+
 fn registry_has(registry: &str, name: &str, position: &str) -> bool {
 	registry.split("callable!(").skip(1).any(|block| {
 		let block = block.split("\n\t),").next().unwrap_or(block);
@@ -623,7 +638,7 @@ fn product_0092_heatmap_surface_keeps_one_explicit_three_role_pipeline() {
 	assert_registered_handler(&root, "heatmap", "Free", "Heatmap", "raw_heatmap");
 	assert!(presentation.contains("fn raw_heatmap("));
 	assert!(compiler.contains("\"heatmap\","));
-	assert!(compiler.contains("\"heatmap\" => Some(&[3])"));
+	assert_registry_origins(&root, "heatmap", "Heatmap", "Fixed(&[3])");
 	assert!(envelope.contains("pub(crate) mark_fields: Option<SpannedMarkFields>"));
 	assert!(envelope.contains("Self::Heatmap { fields, origins }"));
 	assert!(host.contains("fn heatmap_failure_span("));
@@ -3446,8 +3461,6 @@ fn product_0098_funnel_surface_has_one_durable_assignment_and_transport_path() {
 		std::fs::read_to_string(root.join("plot/kernels/funnel.rs")).expect("read funnel kernel");
 	let presentation =
 		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation");
-	let compiler =
-		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
 	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
 		.expect("read relation envelope");
 	let host = std::fs::read_to_string(root.join("gui/state.rs")).expect("read host");
@@ -3478,7 +3491,7 @@ fn product_0098_funnel_surface_has_one_durable_assignment_and_transport_path() {
 
 	assert_registered_handler(&root, "funnel", "Free", "Funnel", "raw_funnel");
 	assert_eq!(presentation.matches("SpannedMarkFields::Funnel").count(), 1);
-	assert!(compiler.contains("\"funnel\" => Some(&[2])"));
+	assert_registry_origins(&root, "funnel", "Funnel", "Fixed(&[2])");
 	assert!(envelope.contains("Self::Funnel { fields, origins }"));
 	assert!(host.contains("fn funnel_failure_span("));
 	assert!(host.contains("funnel_output_span"));
@@ -3763,8 +3776,6 @@ fn product_0100_radial_dial_surface_reuses_transport_identity_and_one_colour_aut
 		.expect("read radial-dial readings");
 	let presentation =
 		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation");
-	let compiler =
-		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
 	let envelope =
 		std::fs::read_to_string(root.join("rune_relation_envelope.rs")).expect("read envelope");
 	let host = std::fs::read_to_string(root.join("gui/state.rs")).expect("read host");
@@ -3825,7 +3836,7 @@ fn product_0100_radial_dial_surface_reuses_transport_identity_and_one_colour_aut
 			.count(),
 		1
 	);
-	assert!(compiler.contains("\"radial_dial\" => Some(&[2, 3])"));
+	assert_registry_origins(&root, "radial_dial", "RadialDial", "Fixed(&[2, 3])");
 	assert!(envelope.contains("Self::RadialDial { fields, origins }"));
 	assert!(host.contains("fn radial_dial_failure_span("));
 	assert!(host.contains("radial_dial_output_span"));
@@ -3984,8 +3995,6 @@ fn product_0103_pie_surface_reuses_transport_and_has_one_colour_and_guide_author
 	let pie = std::fs::read_to_string(root.join("plot/kernels/pie.rs")).expect("read pie kernel");
 	let presentation =
 		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation");
-	let compiler =
-		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
 	let envelope =
 		std::fs::read_to_string(root.join("rune_relation_envelope.rs")).expect("read envelope");
 	let host = std::fs::read_to_string(root.join("gui/state.rs")).expect("read host");
@@ -4040,7 +4049,7 @@ fn product_0103_pie_surface_reuses_transport_and_has_one_colour_and_guide_author
 
 	assert_registered_handler(&root, "pie", "Free", "Pie", "raw_pie");
 	assert_eq!(presentation.matches("SpannedMarkFields::Pie").count(), 1);
-	assert!(compiler.contains("\"pie\" => Some(&[2])"));
+	assert_registry_origins(&root, "pie", "Pie", "Fixed(&[2])");
 	assert!(envelope.contains("Self::Pie { fields, origins }"));
 	assert!(host.contains("fn pie_failure_span("));
 	assert!(host.contains("pie_output_span"));
@@ -4055,8 +4064,6 @@ fn product_0108_violin_surface_consumes_one_relation_side_density_authority() {
 		std::fs::read_to_string(root.join("plot/kernels/violin.rs")).expect("read violin kernel");
 	let density = std::fs::read_to_string(root.join("plot/kernels/violin_density.rs"))
 		.expect("read violin density substrate");
-	let compiler =
-		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
 	let envelope =
 		std::fs::read_to_string(root.join("rune_relation_envelope.rs")).expect("read envelope");
 	let host = std::fs::read_to_string(root.join("gui/state.rs")).expect("read host");
@@ -4068,7 +4075,7 @@ fn product_0108_violin_surface_consumes_one_relation_side_density_authority() {
 	assert!(spec.contains("kernel_density(...) joined to grouped approx_quantile(...)"));
 	assert!(spec.contains("a text or boolean (Nominal) dtype"));
 	assert_registered_handler(&root, "violin", "Free", "Violin", "raw_violin");
-	assert!(compiler.contains("\"violin\" => Some(&[4])"));
+	assert_registry_origins(&root, "violin", "Violin", "Fixed(&[4])");
 	assert!(envelope.contains("Self::Violin { fields, origins }"));
 	assert!(host.contains("fn violin_failure_span("));
 
@@ -4179,8 +4186,6 @@ fn product_0105_variadic_multivariate_surface_has_one_transport_admission_and_co
 		.expect("read parallel kernel");
 	let presentation =
 		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation");
-	let compiler =
-		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
 	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read factory");
 
 	assert!(spec.contains("pub struct MarkFieldIter<'a>"));
@@ -4217,7 +4222,8 @@ fn product_0105_variadic_multivariate_surface_has_one_transport_admission_and_co
 	assert!(category.contains("SpannedMarkFields::Radar"));
 	assert!(category.contains("SpannedMarkFields::Parallel"));
 	assert!(!category.contains("mark.modified = true"));
-	assert!(compiler.contains("matches!(name.as_str(), \"radar\" | \"parallel\")"));
+	assert_registry_origins(&root, "radar", "Radar", "Variadic");
+	assert_registry_origins(&root, "parallel", "Parallel", "Variadic");
 
 	assert_eq!(
 		spec.matches("validate_multivariate_dimension_count(")
@@ -5756,7 +5762,7 @@ fn product_0146_fill_between_surface_has_one_transport_and_no_colour_or_layer_wi
 	);
 	let compiler = std::fs::read_to_string(root.join("rune_view_compiler.rs"))
 		.expect("read Rune view compiler");
-	assert!(compiler.contains("\"fill_between\" => Some(&[3, 4])"));
+	assert_registry_origins(&root, "fill_between", "FillBetween", "Fixed(&[3, 4])");
 	assert!(compiler.contains("| \"fill_between\""));
 	assert!(compiler.contains("HandlerId::FillBetween"));
 
@@ -5951,7 +5957,7 @@ fn product_0148_candlestick_surface_has_one_transport_and_no_colour_or_layer_wid
 	}
 	assert!(presentation.contains("HandlerId::Candlestick => raw_candlestick"));
 	assert!(presentation.contains("PlotType::Candlestick => \"candlestick\""));
-	assert!(compiler.contains("\"candlestick\" => Some(&[5])"));
+	assert_registry_origins(&root, "candlestick", "Candlestick", "Fixed(&[5])");
 	assert!(compiler.contains("| HandlerId::Candlestick"));
 	assert!(envelope.contains("PlotType::Candlestick => \"plot.candlestick\".to_owned()"));
 	assert_eq!(
@@ -6654,7 +6660,9 @@ fn rune_authoring_resolves_layouts_without_building_kernels() {
 	for shared in [
 		"line_column_extent(",
 		"bar_column_extent(",
-		"axis_type_from_scale(",
+		// The scatter axis type derives from the scale and the column's own
+		// temporal type together, in the same one helper the kernel uses.
+		"axis_type_for(",
 	] {
 		assert!(
 			production.contains(shared),
@@ -6673,6 +6681,10 @@ fn rune_authoring_resolves_layouts_without_building_kernels() {
 		(
 			"plot/kernels/scatter.rs",
 			"scatter_column_extent(df, x_col, y_col)",
+		),
+		(
+			"plot/kernels/scatter.rs",
+			"axis_type_for(x.binding.scale, df, x_field)",
 		),
 	] {
 		let source = std::fs::read_to_string(root.join(kernel)).expect("read kernel");

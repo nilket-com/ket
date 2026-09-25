@@ -211,7 +211,8 @@ impl HeadlessApplication {
 
 	/// ADR 0169 §1: opening a source loads it and describes it; nothing runs.
 	/// A markdown notebook is open once its cells project; a Rune source once
-	/// its language is known.
+	/// its language is known and its text is projected, which `run_source`
+	/// reads (without it a first command can be refused as not projected).
 	pub(crate) fn open_source(&mut self, deadline: Duration) -> Result<(), String> {
 		self.settle_until(deadline, |s| s.code_editor.active_language_id().is_some())?;
 		if self
@@ -224,7 +225,11 @@ impl HeadlessApplication {
 				s.code_editor.notebook_description(None).is_ok()
 			});
 		}
-		Ok(())
+		self.settle_until(deadline, |s| {
+			s.code_editor
+				.active_buffer_id()
+				.is_some_and(|buffer| s.code_editor.document_snapshot(buffer).is_some())
+		})
 	}
 
 	/// PRODUCT-0158 §2: run the focused buffer as the Run action does, then

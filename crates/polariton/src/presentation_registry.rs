@@ -144,6 +144,8 @@ pub(crate) struct CallableSpec {
 	pub(crate) registration_routes: &'static [RegistrationRoute],
 	pub(crate) accepted_receivers: &'static [SemanticReceiver],
 	pub(crate) doc: &'static str,
+	/// The argument spans a mark receives as injected origins.
+	pub(crate) argument_origins: ArgumentOrigins,
 }
 
 #[cfg(any(feature = "toron", test))]
@@ -189,7 +191,14 @@ const TABLE_RECEIVER: &[SemanticReceiver] = &[SemanticReceiver::Table];
 #[cfg(any(feature = "toron", test))]
 macro_rules! callable {
 	($name:literal, $position:ident, $min:literal $(..= $max:literal)?, $kind:ident,
-	 $handler:ident, $routes:expr, $receivers:expr, $doc:literal) => {
+	 $handler:ident, $routes:expr, $receivers:expr, $doc:literal $(,)?) => {
+		callable!(
+			$name, $position, $min $(..= $max)?, $kind, $handler, $routes, $receivers, $doc,
+			ArgumentOrigins::None
+		)
+	};
+	($name:literal, $position:ident, $min:literal $(..= $max:literal)?, $kind:ident,
+	 $handler:ident, $routes:expr, $receivers:expr, $doc:literal, $origins:expr $(,)?) => {
 		CallableSpec {
 			name: $name,
 			rune_name: concat!("__", $name),
@@ -203,6 +212,7 @@ macro_rules! callable {
 			registration_routes: $routes,
 			accepted_receivers: $receivers,
 			doc: $doc,
+			argument_origins: $origins,
 		}
 	};
 	(@max $max:literal) => { Some($max) };
@@ -271,7 +281,8 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		Box,
 		FREE,
 		NONE,
-		"Construct a box mark."
+		"Construct a box mark.",
+		ArgumentOrigins::Fixed(&[7]),
 	),
 	callable!(
 		"bubble",
@@ -281,7 +292,8 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		Bubble,
 		FREE,
 		NONE,
-		"Construct a bubble mark."
+		"Construct a bubble mark.",
+		ArgumentOrigins::Fixed(&[4, 5]),
 	),
 	callable!(
 		"heatmap",
@@ -291,7 +303,8 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		Heatmap,
 		FREE,
 		NONE,
-		"Construct a heatmap mark."
+		"Construct a heatmap mark.",
+		ArgumentOrigins::Fixed(&[3]),
 	),
 	callable!(
 		"hexbin",
@@ -301,7 +314,8 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		Hexbin,
 		FREE,
 		NONE,
-		"Construct a hexbin mark."
+		"Construct a hexbin mark.",
+		ArgumentOrigins::Fixed(&[2]),
 	),
 	callable!(
 		"fill_between",
@@ -311,7 +325,8 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		FillBetween,
 		FREE,
 		NONE,
-		"Construct a fill-between mark."
+		"Construct a fill-between mark.",
+		ArgumentOrigins::Fixed(&[3, 4]),
 	),
 	callable!(
 		"candlestick",
@@ -321,7 +336,8 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		Candlestick,
 		FREE,
 		NONE,
-		"Construct a candlestick mark."
+		"Construct a candlestick mark.",
+		ArgumentOrigins::Fixed(&[5]),
 	),
 	callable!(
 		"funnel",
@@ -331,7 +347,8 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		Funnel,
 		FREE,
 		NONE,
-		"Construct a funnel mark."
+		"Construct a funnel mark.",
+		ArgumentOrigins::Fixed(&[2]),
 	),
 	callable!(
 		"radial_dial",
@@ -341,7 +358,8 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		RadialDial,
 		FREE,
 		NONE,
-		"Construct a radial dial mark."
+		"Construct a radial dial mark.",
+		ArgumentOrigins::Fixed(&[2, 3]),
 	),
 	callable!(
 		"pie",
@@ -351,7 +369,8 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		Pie,
 		FREE,
 		NONE,
-		"Construct a pie mark."
+		"Construct a pie mark.",
+		ArgumentOrigins::Fixed(&[2]),
 	),
 	callable!(
 		"violin",
@@ -361,7 +380,8 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		Violin,
 		FREE,
 		NONE,
-		"Construct a violin mark."
+		"Construct a violin mark.",
+		ArgumentOrigins::Fixed(&[4]),
 	),
 	callable!(
 		"radar",
@@ -371,7 +391,8 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		Radar,
 		FREE,
 		NONE,
-		"Construct a radar mark from one or more fields."
+		"Construct a radar mark from one or more fields.",
+		ArgumentOrigins::Variadic,
 	),
 	callable!(
 		"parallel",
@@ -381,7 +402,8 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		Parallel,
 		FREE,
 		NONE,
-		"Construct a parallel-coordinate mark from one or more fields."
+		"Construct a parallel-coordinate mark from one or more fields.",
+		ArgumentOrigins::Variadic,
 	),
 	callable!(
 		"title",
@@ -826,6 +848,50 @@ pub(crate) const CALLABLES: &[CallableSpec] = &[
 		"Show table column types."
 	),
 ];
+
+/// Which argument spans a mark constructor receives as injected origins,
+/// before the call's own origin. The one table both the static rewrite and
+/// local-source instrumentation read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "toron", test))]
+pub(crate) enum ArgumentOrigins {
+	/// No per-argument origins.
+	None,
+	/// One `start, end` pair per argument, when called with one of these
+	/// argument counts; any other count gets none.
+	Fixed(&'static [usize]),
+	/// One `start, end` pair per argument, at any count.
+	Variadic,
+}
+
+#[cfg(any(feature = "toron", test))]
+impl ArgumentOrigins {
+	/// The flattened `start, end` pairs for a free call with `arguments`.
+	pub(crate) fn for_call(self, arguments: &[Range<usize>]) -> Vec<usize> {
+		let applies = match self {
+			ArgumentOrigins::None => false,
+			ArgumentOrigins::Fixed(arities) => arities.contains(&arguments.len()),
+			ArgumentOrigins::Variadic => true,
+		};
+		if !applies {
+			return Vec::new();
+		}
+		arguments
+			.iter()
+			.flat_map(|argument| [argument.start, argument.end])
+			.collect()
+	}
+}
+
+/// The per-argument origins a free presentation constructor receives, from
+/// its registry entry.
+#[cfg(any(feature = "toron", test))]
+pub(crate) fn argument_origins(name: &str) -> ArgumentOrigins {
+	CALLABLES
+		.iter()
+		.find(|spec| spec.name == name && spec.position == CallPosition::Free)
+		.map_or(ArgumentOrigins::None, |spec| spec.argument_origins)
+}
 
 #[cfg(feature = "toron")]
 pub(crate) fn is_presentation_callable(name: &str, position: CallPosition) -> bool {
@@ -2055,6 +2121,26 @@ fn special_effective_value(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn mark_argument_origins_come_from_their_callable_entries() {
+		assert_eq!(argument_origins("pie"), ArgumentOrigins::Fixed(&[2]));
+		assert_eq!(argument_origins("radar"), ArgumentOrigins::Variadic);
+		assert_eq!(argument_origins("line"), ArgumentOrigins::None);
+		assert_eq!(argument_origins("no_such_mark"), ArgumentOrigins::None);
+		let arguments = [3..6, 8..11];
+		assert_eq!(
+			argument_origins("pie").for_call(&arguments),
+			vec![3, 6, 8, 11]
+		);
+		// A count the mark does not list gets no per-argument origins.
+		assert!(argument_origins("pie").for_call(&[1..2]).is_empty());
+		assert_eq!(
+			argument_origins("radar").for_call(&arguments[..1]),
+			vec![3, 6]
+		);
+		assert!(argument_origins("line").for_call(&arguments).is_empty());
+	}
 	use std::collections::HashSet;
 
 	#[test]

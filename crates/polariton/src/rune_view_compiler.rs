@@ -1842,39 +1842,22 @@ fn rewrite_calls_mapped(
 			replacement,
 			owner: u32_range(&(origin_start..origin_end), "presentation call origin")?,
 		});
-		let origin_arities: Option<&[usize]> = match name.as_str() {
-			"box" => Some(&[7]),
-			"bubble" => Some(&[4, 5]),
-			"heatmap" => Some(&[3]),
-			"hexbin" => Some(&[2]),
-			"fill_between" => Some(&[3, 4]),
-			"candlestick" => Some(&[5]),
-			"funnel" => Some(&[2]),
-			"radial_dial" => Some(&[2, 3]),
-			"pie" => Some(&[2]),
-			"violin" => Some(&[4]),
-			_ => None,
+		let origins = if is_method {
+			presentation_registry::ArgumentOrigins::None
+		} else {
+			presentation_registry::argument_origins(name)
 		};
-		let variadic_origins = !is_method && matches!(name.as_str(), "radar" | "parallel");
-		let injected_origins = if !is_method && (origin_arities.is_some() || variadic_origins) {
+		let injected_origins = if origins == presentation_registry::ArgumentOrigins::None {
+			String::new()
+		} else {
 			let arguments =
 				call_argument_ranges(fragment, original_start, &tokens, open_index, close_index)?;
-			if !variadic_origins
-				&& !origin_arities
-					.expect("fixed origin arities are present")
-					.contains(&arguments.len())
-			{
-				String::new()
-			} else {
-				arguments
-					.into_iter()
-					.flat_map(|span| [span.start, span.end])
-					.map(|value| value.to_string())
-					.collect::<Vec<_>>()
-					.join(", ")
-			}
-		} else {
-			String::new()
+			origins
+				.for_call(&arguments)
+				.into_iter()
+				.map(|value| value.to_string())
+				.collect::<Vec<_>>()
+				.join(", ")
 		};
 		let mut injected = injected_origins;
 		if !injected.is_empty() {
@@ -2256,6 +2239,39 @@ fn is_keyword(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+	/// The static rewrite and local-source instrumentation read one origin
+	/// table, so a call gets the same injected origins through either.
+	#[test]
+	fn static_and_local_rewrites_inject_the_same_origins() {
+		fn call(generated: &str, name: &str) -> String {
+			let start = generated
+				.find(&format!("__{name}("))
+				.unwrap_or_else(|| panic!("{name} rewritten in {generated}"));
+			let end = start + generated[start..].find(')').unwrap() + 1;
+			generated[start..end].to_owned()
+		}
+		let vocabulary = crate::rune_instrument::Vocabulary::from_registry(&["view"]);
+		for (name, call_text, per_argument) in [
+			("pie", r#"pie("k", "v")"#, true),
+			("pie", r#"pie("k", "v", "w")"#, false),
+			("radar", r#"radar("a", "b", "c")"#, true),
+			("line", r#"line("x", "y")"#, false),
+		] {
+			let source = format!("pub fn main(workspace, viz) {{ let p = {call_text}; }}");
+			let static_text = rewrite_calls_mapped(&source, 0).unwrap().source;
+			let local_text = crate::rune_instrument::instrument(&source, &vocabulary)
+				.unwrap()
+				.source;
+			let (static_call, local_call) = (call(&static_text, name), call(&local_text, name));
+			assert_eq!(static_call, local_call, "{call_text}");
+			// Each injected integer adds one comma to the authored call.
+			let integers = static_call.matches(',').count() - call_text.matches(',').count();
+			let arguments = call_text.matches(',').count() + 1;
+			let expected = 2 + if per_argument { 2 * arguments } else { 0 };
+			assert_eq!(integers, expected, "{call_text}: {static_call}");
+		}
+	}
+
 	use super::*;
 	use crate::plot::colors::ColorTheme;
 	use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};

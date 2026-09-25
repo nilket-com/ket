@@ -50,6 +50,8 @@ kurbo = "0.13.0"
 png = "0.18.1"
 polars = { version = "0.53.0", features = ["lazy", "parquet", "sql", "ipc_streaming"] }
 rand_distr = "0.6.0"
+# Local Rune sources run on rnx's embedding API (records 0056, 0107).
+rnx.workspace = true
 ravif = { version = "0.13.0", default-features = false, features = ["threading"] }
 regex = "1.12.3"
 resvg = "0.47.0"

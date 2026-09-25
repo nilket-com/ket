@@ -129,6 +129,23 @@ impl RetainedRelationGeneration {
 	}
 }
 
+/// A local Rune run in flight: the revision it settles as, the document
+/// generation it read, and its cancellation. Sending or dropping `cancel`
+/// (rerun, buffer close, window close) abandons the run on its worker.
+struct LocalRun {
+	revision: u64,
+	generation: libaryon::core::StateId,
+	cancel: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl LocalRun {
+	fn cancel(mut self) {
+		if let Some(cancel) = self.cancel.take() {
+			let _ = cancel.send(());
+		}
+	}
+}
+
 pub(crate) struct AppState {
 	welcome: crate::first_run::Welcome,
 	welcome_action: Option<welcome::Pending>,
@@ -157,6 +174,13 @@ pub(crate) struct AppState {
 	window_size: Size,
 	result_registry: ResultRegistry,
 	rune_buffer_revisions: HashMap<BufferId, u64>,
+	/// The local Rune run each buffer has in flight (`rune_local`).
+	local_rune_runs: HashMap<BufferId, LocalRun>,
+	/// Each buffer's last committed local batch: its revision and the
+	/// (panel, plot incarnation) of every pane, so a `run_source` settles
+	/// once exactly these figures, not earlier ones in the same panels, are
+	/// on the surface.
+	local_rune_commits: HashMap<BufferId, (u64, Vec<(libaryon::engine::HostPanelId, u64)>)>,
 	#[cfg(feature = "toron")]
 	rune_document_generations: HashMap<(BufferId, u64), libaryon::core::StateId>,
 	#[cfg(feature = "toron")]
@@ -467,51 +491,65 @@ fn build_facet_resolved_plot_task(
 	);
 	Task::perform(
 		async move {
-			let frame = match source.projection() {
-				Ok(frame) => frame,
-				Err(error) => return (resolved, Err(error.to_string()), recipe),
-			};
-			let stamped = crate::plot::spec::StampedResult {
-				data: source,
-				provenance: resolved.resolved_spec.provenance.clone(),
-			};
-			let spec = Arc::new(resolved.resolved_spec.clone());
+			let building = resolved.clone();
 			let result = tokio::task::spawn_blocking(move || {
-				let grid = match facet {
-					Some(facet) => PlotGrid::value_facet_derived(spec, &stamped, facet)
-						.map_err(|error| error.to_string())?,
-					None => PlotGrid::single(spec, frame),
-				};
-				match layer_settings {
-					Some(settings) => {
-						PlotGridKernel::from_styled_grid_with_figure_grid_from_artifact(
-							grid,
-							figure_grid,
-							settings,
-							stamped.data.as_ref(),
-							1200,
-							720,
-						)
-					}
-					None => Ok(PlotGridKernel::from_grid_with_figure_grid_from_artifact(
-						grid,
-						figure_grid,
-						stamped.data.as_ref(),
-						1200,
-						720,
-					)),
-				}
+				build_facet_resolved_plot_kernel(
+					&building,
+					source,
+					facet,
+					figure_grid,
+					layer_settings,
+				)
 			})
 			.await
 			.map_err(|error| format!("facet plot build task panicked: {error}"))
-			.and_then(|result| result)
-			.map(|kernel| {
-				Arc::new(kernel) as Arc<dyn crate::plot::common::PlotKernel + Send + Sync>
-			});
+			.and_then(|result| result);
 			(resolved, result, recipe)
 		},
 		move |(resolved, result, recipe)| on_ready(resolved, result, recipe),
 	)
+}
+
+/// The kernel a resolved (optionally faceted, optionally styled) plot builds
+/// over `source`. Blocking; the Toron path runs it on a worker task and a
+/// local batch runs it in its own worker before committing.
+#[cfg(feature = "toron")]
+fn build_facet_resolved_plot_kernel(
+	resolved: &ResolvedPlot,
+	source: Arc<crate::result_artifact::ResultArtifact>,
+	facet: Option<String>,
+	figure_grid: crate::plot::grid::FigureGridLayoutSettings,
+	layer_settings: Option<crate::plot::spec::LayerSettings>,
+) -> std::result::Result<Arc<dyn crate::plot::common::PlotKernel + Send + Sync>, String> {
+	let frame = source.projection().map_err(|error| error.to_string())?;
+	let stamped = crate::plot::spec::StampedResult {
+		data: source,
+		provenance: resolved.resolved_spec.provenance.clone(),
+	};
+	let spec = Arc::new(resolved.resolved_spec.clone());
+	let grid = match facet {
+		Some(facet) => PlotGrid::value_facet_derived(spec, &stamped, facet)
+			.map_err(|error| error.to_string())?,
+		None => PlotGrid::single(spec, frame),
+	};
+	match layer_settings {
+		Some(settings) => PlotGridKernel::from_styled_grid_with_figure_grid_from_artifact(
+			grid,
+			figure_grid,
+			settings,
+			stamped.data.as_ref(),
+			1200,
+			720,
+		),
+		None => Ok(PlotGridKernel::from_grid_with_figure_grid_from_artifact(
+			grid,
+			figure_grid,
+			stamped.data.as_ref(),
+			1200,
+			720,
+		)),
+	}
+	.map(|kernel| Arc::new(kernel) as Arc<dyn crate::plot::common::PlotKernel + Send + Sync>)
 }
 
 #[cfg(feature = "toron")]
@@ -537,46 +575,8 @@ fn build_facet_layered_plot_task(
 	);
 	Task::perform(
 		async move {
-			let frame = match source.projection() {
-				Ok(frame) => frame,
-				Err(error) => return Err(error.to_string()),
-			};
 			tokio::task::spawn_blocking(move || {
-				let stamped = crate::plot::spec::StampedResult {
-					data: source,
-					provenance: crate::plot::spec::PlotProvenance {
-						source_name: "workspace relation".to_owned(),
-						revision: None,
-					},
-				};
-				let binding = resolve_layered_channels(&specification, frame.schema().as_ref())
-					.map_err(|error| error.to_string())?;
-				let resolved = crate::plot::spec::resolve_layered_domains(binding, &stamped)
-					.map_err(|error| error.to_string())?;
-				let body = Arc::new(resolved.layers.first().spec.clone());
-				let grid = match facet {
-					Some(facet) => PlotGrid::value_facet_derived(body, &stamped, facet)
-						.map_err(|error| error.to_string())?,
-					None => PlotGrid::single(body, Arc::clone(&frame)),
-				};
-				PlotGridKernel::from_grid_with_factory_and_figure_grid(
-					grid,
-					figure_grid,
-					1200,
-					720,
-					|_, data| {
-						create_layered_plot_from_artifact(
-							&specification,
-							data,
-							stamped.data.as_ref(),
-							1200,
-							720,
-						)
-					},
-				)
-				.map(|kernel| {
-					Arc::new(kernel) as Arc<dyn crate::plot::common::PlotKernel + Send + Sync>
-				})
+				build_facet_layered_plot_kernel(&specification, source, facet, figure_grid)
 			})
 			.await
 			.map_err(|error| format!("facet layered plot build task panicked: {error}"))
@@ -584,6 +584,45 @@ fn build_facet_layered_plot_task(
 		},
 		move |result| on_ready(result, recipe),
 	)
+}
+
+/// The kernel a layered plot builds over `source`; blocking, like
+/// `build_facet_resolved_plot_kernel`.
+#[cfg(feature = "toron")]
+fn build_facet_layered_plot_kernel(
+	specification: &crate::plot::spec::LayeredPlotSpec,
+	source: Arc<crate::result_artifact::ResultArtifact>,
+	facet: Option<String>,
+	figure_grid: crate::plot::grid::FigureGridLayoutSettings,
+) -> std::result::Result<Arc<dyn crate::plot::common::PlotKernel + Send + Sync>, String> {
+	let frame = source.projection().map_err(|error| error.to_string())?;
+	let stamped = crate::plot::spec::StampedResult {
+		data: source,
+		provenance: crate::plot::spec::PlotProvenance {
+			source_name: "workspace relation".to_owned(),
+			revision: None,
+		},
+	};
+	let binding = resolve_layered_channels(specification, frame.schema().as_ref())
+		.map_err(|error| error.to_string())?;
+	let resolved = crate::plot::spec::resolve_layered_domains(binding, &stamped)
+		.map_err(|error| error.to_string())?;
+	let body = Arc::new(resolved.layers.first().spec.clone());
+	let grid = match facet {
+		Some(facet) => PlotGrid::value_facet_derived(body, &stamped, facet)
+			.map_err(|error| error.to_string())?,
+		None => PlotGrid::single(body, Arc::clone(&frame)),
+	};
+	PlotGridKernel::from_grid_with_factory_and_figure_grid(
+		grid,
+		figure_grid,
+		1200,
+		720,
+		|_, data| {
+			create_layered_plot_from_artifact(specification, data, stamped.data.as_ref(), 1200, 720)
+		},
+	)
+	.map(|kernel| Arc::new(kernel) as Arc<dyn crate::plot::common::PlotKernel + Send + Sync>)
 }
 
 fn subscription(state: &AppState) -> Subscription<Message> {
@@ -899,6 +938,8 @@ fn new_with_options(
 		window_size,
 		result_registry: ResultRegistry::default(),
 		rune_buffer_revisions: HashMap::new(),
+		local_rune_runs: HashMap::new(),
+		local_rune_commits: HashMap::new(),
 		#[cfg(feature = "toron")]
 		rune_document_generations: HashMap::new(),
 		#[cfg(feature = "toron")]
@@ -1302,15 +1343,24 @@ fn run_rune_code_at_generation(
 	code: String,
 	document_generation: libaryon::core::StateId,
 ) -> Task<Message> {
-	if code.trim().is_empty() {
-		app_state.status_msg = "Nothing to run in the current Rune buffer.".into();
-		return Task::none();
+	// Any new run of the buffer, even of empty text, supersedes the previous
+	// one: cancel a local run in flight, and advance the revision so a result
+	// already queued (which cancellation cannot retract) fails its check.
+	if let Some(run) = app_state.local_rune_runs.remove(&source_buffer) {
+		run.cancel();
 	}
 	let revision = *app_state
 		.rune_buffer_revisions
 		.entry(source_buffer)
 		.and_modify(|revision| *revision = revision.saturating_add(1))
 		.or_insert(1);
+	if code.trim().is_empty() {
+		app_state.status_msg = "Nothing to run in the current Rune buffer.".into();
+		return Task::none();
+	}
+	if crate::rune_local::mode(&code).is_local() {
+		return run_local_rune_code(app_state, source_buffer, revision, code, document_generation);
+	}
 	#[cfg(feature = "toron")]
 	{
 		app_state
@@ -1332,6 +1382,367 @@ fn run_rune_code_at_generation(
 		let _ = document_generation;
 		run_plain_rune_code(app_state, source_buffer, revision, code)
 	}
+}
+
+/// A source with its own `main` runs here on rnx, never through Toron. Its
+/// outcome settles through the same message as a plain buffer, so the one-plot
+/// rule, stale-revision checks and `run_source` completion are shared.
+fn run_local_rune_code(
+	app_state: &mut AppState,
+	source_buffer: BufferId,
+	revision: u64,
+	code: String,
+	document_generation: libaryon::core::StateId,
+) -> Task<Message> {
+	// The generation this run reads: the caller's, or the buffer's current one
+	// when the caller did not pin it. Its output is published only while the
+	// buffer is still open at that generation.
+	let generation = if document_generation == libaryon::core::StateId::ZERO {
+		match app_state.code_editor.document_snapshot(source_buffer) {
+			Some((_, generation)) => generation,
+			None => {
+				set_rune_error(app_state, "the source text is not yet projected".to_owned());
+				return Task::none();
+			}
+		}
+	} else {
+		document_generation
+	};
+	let capabilities = RuneCapabilities {
+		results: match app_state.result_registry.snapshot() {
+			Ok(results) => results,
+			Err(error) => {
+				app_state.status_error = error.to_string();
+				return Task::none();
+			}
+		},
+		..RuneCapabilities::default()
+	};
+	let (cancel, cancelled) = tokio::sync::oneshot::channel();
+	app_state.local_rune_runs.insert(
+		source_buffer,
+		LocalRun {
+			revision,
+			generation,
+			cancel: Some(cancel),
+		},
+	);
+	// The colour identities this buffer's views retained, snapshotted for the
+	// worker; the commit writes back what the batch continued.
+	#[cfg(feature = "toron")]
+	let colours: HashMap<(LocalViewIdentity, usize), ColorIdentity> = app_state
+		.rune_categorical_identities
+		.iter()
+		.filter(|((buffer, _, _), _)| *buffer == source_buffer)
+		.map(|((_, identity, len), colour)| ((identity.clone(), *len), colour.clone()))
+		.collect();
+	app_state.status_msg = "Rune running…".into();
+	app_state.status_error.clear();
+	app_state.status_time_elapsed = None;
+	app_state.code_started = Instant::now();
+	let name = format!("<buffer {}>", source_buffer.get());
+	Task::perform(
+		async move {
+			tokio::task::spawn_blocking(move || {
+				let execution = crate::rune_local::execute(&name, &code, capabilities, cancelled)?;
+				// Stage the whole batch here, off the update loop: a plan or
+				// kernel that fails fails the batch before any pane changes.
+				// Plot requests and views sets build in the order the source
+				// produced them, which is the order their panes take.
+				enum Output {
+					Request(usize, crate::plot::request::PlotRequest),
+					#[cfg(feature = "toron")]
+					Views(crate::rune_host::LocalViewSet),
+				}
+				let mut outputs: Vec<(usize, Output)> = execution
+					.requests
+					.into_iter()
+					.enumerate()
+					.zip(execution.request_order)
+					.map(|((index, request), order)| (order, Output::Request(index, request)))
+					.collect();
+				#[cfg(feature = "toron")]
+				outputs.extend(execution.views.into_iter().map(|set| (set.order, Output::Views(set))));
+				outputs.sort_by_key(|(order, _)| *order);
+				let mut panes = Vec::with_capacity(outputs.len());
+				for (_, output) in outputs {
+					match output {
+						Output::Request(index, request) => {
+							let resolved = plan(request)?;
+							let kernel = crate::plot::factory::create_plot_from_artifact(
+								&resolved.resolved_spec,
+								&resolved.data,
+								&resolved.artifact,
+								1200,
+								1200,
+							);
+							let recipe = crate::plot::recipe::PlotRecipe::single(
+								Arc::clone(&resolved.artifact),
+								resolved.resolved_spec.clone(),
+								1200,
+								720,
+							);
+							panes.push(crate::gui::messages::BuiltPane {
+								identity: LocalViewIdentity::Anonymous(index),
+								presentation: ViewPresentation {
+									content_kind: ViewContentKind::Plot,
+									display_label: resolved.source_name.clone(),
+									authored_title: crate::plot::spec::Presence::Inherit,
+								},
+								settings: PlotSettingsLayer::default(),
+								kernel,
+								recipe,
+								#[cfg(feature = "toron")]
+								continuation: None,
+							});
+						}
+						#[cfg(feature = "toron")]
+						Output::Views(set) => panes.extend(build_local_views(set, &colours)?),
+					}
+				}
+				Ok(crate::gui::messages::RuneBufferOutcome {
+					display: execution.display,
+					plot: None,
+					panes: Some(panes),
+				})
+			})
+			.await
+			.map_err(|error| format!("Rune task panicked: {error}"))?
+		},
+		move |result| Message::RunRuneBufferResult {
+			source_buffer,
+			revision,
+			result,
+		},
+	)
+}
+
+/// Whether a local run's output may still be published. `None` when the
+/// revision is not a local run. A run whose buffer closed or changed since
+/// it read the text is removed and reported, and its output is discarded
+/// before any pane is prepared or attached.
+fn local_run_is_current(
+	app_state: &mut AppState,
+	source_buffer: BufferId,
+	revision: u64,
+) -> Option<bool> {
+	let run = app_state
+		.local_rune_runs
+		.get(&source_buffer)
+		.filter(|run| run.revision == revision)?;
+	let current = app_state
+		.code_editor
+		.document_snapshot(source_buffer)
+		.is_some_and(|(_, generation)| generation == run.generation);
+	if !current {
+		if let Some(run) = app_state.local_rune_runs.remove(&source_buffer) {
+			run.cancel();
+		}
+		app_state.status_msg =
+			"The source changed while Rune ran; its output was discarded.".to_owned();
+		app_state
+			.code_editor
+			.mark_rune_view_producer_stale(source_buffer);
+	}
+	Some(current)
+}
+
+/// Cancel local runs whose buffer is no longer open, and invalidate their
+/// pending results, which are then dropped by the revision check.
+fn reap_closed_local_runs(app_state: &mut AppState) {
+	let closed: Vec<BufferId> = app_state
+		.local_rune_runs
+		.keys()
+		.filter(|buffer| app_state.code_editor.document_snapshot(**buffer).is_none())
+		.copied()
+		.collect();
+	for buffer in closed {
+		if let Some(run) = app_state.local_rune_runs.remove(&buffer) {
+			run.cancel();
+		}
+		app_state.rune_buffer_revisions.remove(&buffer);
+		app_state.local_rune_commits.remove(&buffer);
+	}
+}
+
+/// Resolve one `frame.views([...])` set through the same planner a view
+/// source's relation uses, and build every kernel. Blocking; any failure,
+/// including a table view (not supported locally yet), fails the batch.
+#[cfg(feature = "toron")]
+fn build_local_views(
+	set: crate::rune_host::LocalViewSet,
+	colours: &HashMap<(LocalViewIdentity, usize), ColorIdentity>,
+) -> std::result::Result<Vec<crate::gui::messages::BuiltPane>, String> {
+	use crate::gui::messages::RuneRelationSinkOutput;
+	let palettes = categorical_palettes_for(&set.views, |identity, len| {
+		colours.get(&(identity.clone(), len)).cloned()
+	});
+	// Resolution errors (an unknown skin, a missing column) are located at the
+	// `view(...)` call that declared the failing view.
+	let (source_name, source) = (set.source_name, set.source);
+	let spans: HashMap<LocalViewIdentity, usize> = set
+		.views
+		.iter()
+		.map(|view| (view.identity.clone(), view.span.start as usize))
+		.collect();
+	let at = |identity: &LocalViewIdentity, message: String| {
+		crate::rune_local::locate(
+			&source_name,
+			&source,
+			spans.get(identity).copied().unwrap_or(0),
+			&message,
+		)
+	};
+	let outcome = rune_view_outcome_with_palettes(set.artifact, set.views, palettes)?;
+	let mut panes = Vec::with_capacity(outcome.sinks.len());
+	for sink in outcome.sinks {
+		let name = match &sink.identity {
+			LocalViewIdentity::Named(name) => name.clone(),
+			LocalViewIdentity::Anonymous(index) => index.to_string(),
+		};
+		let output = sink
+			.output
+			.map_err(|error| at(&sink.identity, format!("view \"{name}\": {error}")))?;
+		let (settings, kernel, recipe, continuation) = match output {
+			RuneRelationSinkOutput::Table(_) => {
+				return Err(format!(
+					"view \"{name}\" is a table; a local source publishes plot views only for now"
+				));
+			}
+			RuneRelationSinkOutput::Plot(resolved, settings, continuation) => {
+				let recipe = crate::plot::recipe::PlotRecipe::facet(
+					Arc::clone(&sink.source),
+					Arc::new(resolved.resolved_spec.clone()),
+					sink.facet.clone(),
+					sink.figure_grid,
+					None,
+					1200,
+					720,
+				);
+				let kernel = build_facet_resolved_plot_kernel(
+					&resolved,
+					Arc::clone(&sink.source),
+					sink.facet.clone(),
+					sink.figure_grid,
+					None,
+				)
+				.map_err(|error| format!("view \"{name}\": {error}"))?;
+				(settings, kernel, recipe, Some(continuation))
+			}
+			RuneRelationSinkOutput::StyledPlot(resolved, layer, settings, continuation) => {
+				let recipe = crate::plot::recipe::PlotRecipe::facet(
+					Arc::clone(&sink.source),
+					Arc::new(resolved.resolved_spec.clone()),
+					sink.facet.clone(),
+					sink.figure_grid,
+					Some(layer.clone()),
+					1200,
+					720,
+				);
+				let kernel = build_facet_resolved_plot_kernel(
+					&resolved,
+					Arc::clone(&sink.source),
+					sink.facet.clone(),
+					sink.figure_grid,
+					Some(layer),
+				)
+				.map_err(|error| format!("view \"{name}\": {error}"))?;
+				(settings, kernel, recipe, Some(continuation))
+			}
+			RuneRelationSinkOutput::LayeredPlot(specification, settings) => {
+				let recipe = crate::plot::recipe::PlotRecipe::layered(
+					Arc::clone(&sink.source),
+					specification.clone(),
+					sink.facet.clone(),
+					sink.figure_grid,
+					1200,
+					720,
+				);
+				let kernel = build_facet_layered_plot_kernel(
+					&specification,
+					Arc::clone(&sink.source),
+					sink.facet.clone(),
+					sink.figure_grid,
+				)
+				.map_err(|error| format!("view \"{name}\": {error}"))?;
+				(settings, kernel, recipe, None)
+			}
+		};
+		panes.push(crate::gui::messages::BuiltPane {
+			identity: sink.identity,
+			presentation: sink.presentation,
+			settings,
+			kernel,
+			recipe,
+			continuation,
+		});
+	}
+	Ok(panes)
+}
+
+/// Why a local source's plot settings cannot be edited from the pane.
+#[cfg(feature = "toron")]
+const LOCAL_WRITEBACK_REFUSAL: &str =
+	"settings of a local source are edited in its source; rerun it to apply them";
+
+/// Replace the buffer's panes with a local run's batch in one step: exactly
+/// these panes, in publication order, titled by their frames. Panes the
+/// previous batch had beyond these are retired.
+fn commit_local_panes(
+	app_state: &mut AppState,
+	source_buffer: BufferId,
+	revision: u64,
+	panes: Vec<crate::gui::messages::BuiltPane>,
+) {
+	let views = panes
+		.iter()
+		.map(|pane| (pane.identity.clone(), pane.presentation.clone()))
+		.collect::<Vec<_>>();
+	app_state
+		.code_editor
+		.prepare_rune_view_panels(source_buffer, &views, revision);
+	let count = panes.len();
+	let mut committed = Vec::with_capacity(count);
+	for pane in panes {
+		let panel_id = app_state
+			.code_editor
+			.rune_view_panel_id(source_buffer, &pane.identity)
+			.expect("a committed local pane was prepared above");
+		app_state.code_editor.set_rune_view_plot_with_recipe(
+			panel_id,
+			pane.presentation.display_label,
+			pane.kernel,
+			pane.settings,
+			pane.recipe,
+		);
+		// A local source's figures are not source-attached: its presentation
+		// may be computed from fetched data, and a preview could not rerun
+		// `main` without fetching again. Settings stay read-only, and say why.
+		#[cfg(feature = "toron")]
+		if matches!(pane.identity, LocalViewIdentity::Named(_)) {
+			app_state
+				.code_editor
+				.set_plot_writeback_status(panel_id, Some(LOCAL_WRITEBACK_REFUSAL.to_owned()));
+		}
+		#[cfg(feature = "toron")]
+		if let Some(continuation) = pane.continuation {
+			app_state.rune_categorical_identities.insert(
+				(source_buffer, pane.identity.clone(), continuation.palette_len),
+				continuation.identity,
+			);
+		}
+		if let Some(incarnation) = app_state.code_editor.host_plot_incarnation(panel_id) {
+			committed.push((panel_id, incarnation));
+		}
+	}
+	app_state
+		.local_rune_commits
+		.insert(source_buffer, (revision, committed));
+	app_state.status_msg = match count {
+		0 => "Rune finished.".to_owned(),
+		1 => "Plotted 1 pane.".to_owned(),
+		count => format!("Plotted {count} panes."),
+	};
 }
 
 fn run_plain_rune_code(
@@ -1370,6 +1781,7 @@ fn run_plain_rune_code(
 				Ok(crate::gui::messages::RuneBufferOutcome {
 					display: execution.display,
 					plot,
+					panes: None,
 				})
 			})
 			.await
@@ -2946,24 +3358,32 @@ fn prepare_rune_categorical_palettes(
 	source_buffer: BufferId,
 	view: &TransformedRuneRelation,
 ) -> HashMap<LocalViewIdentity, PreparedRuneCategoricalPalette> {
-	view.views
+	categorical_palettes_for(&view.views, |identity, len| {
+		app_state
+			.rune_categorical_identities
+			.get(&(source_buffer, identity.clone(), len))
+			.cloned()
+	})
+}
+
+/// Each plot view's categorical palette, with the colour identity retained
+/// for it (by view identity and palette length) or a fresh one.
+#[cfg(feature = "toron")]
+fn categorical_palettes_for(
+	views: &[SpannedRuneViewIntent],
+	retained: impl Fn(&LocalViewIdentity, usize) -> Option<ColorIdentity>,
+) -> HashMap<LocalViewIdentity, PreparedRuneCategoricalPalette> {
+	views
 		.iter()
 		.filter_map(|view| {
 			let RuneViewIntent::Plot(plot) = &view.intent else {
 				return None;
 			};
 			let prepared = match resolved_rune_categorical_selection(&plot.authored_settings) {
-				Ok(selection) => {
-					let identity = app_state
-						.rune_categorical_identities
-						.get(&(source_buffer, view.identity.clone(), selection.len()))
-						.cloned()
-						.unwrap_or_default();
-					PreparedRuneCategoricalPalette::Ready {
-						selection,
-						identity,
-					}
-				}
+				Ok(selection) => PreparedRuneCategoricalPalette::Ready {
+					identity: retained(&view.identity, selection.len()).unwrap_or_default(),
+					selection,
+				},
 				Err(error) => PreparedRuneCategoricalPalette::Failed(error),
 			};
 			Some((view.identity.clone(), prepared))
@@ -3916,6 +4336,8 @@ fn begin_window_shutdown(_app_state: &mut AppState) -> Task<Message> {
 fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 	app_state.observe_welcome_message(&message);
 	let task = update_inner(app_state, message);
+	reap_closed_local_runs(app_state);
+	app_state.settle_local_batch();
 	app_state.expire_notebook_action();
 	let welcome_task = app_state.advance_welcome();
 	app_state.capture_surface_baselines();
@@ -4682,6 +5104,14 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
 				return Task::none();
 			}
+			match local_run_is_current(app_state, source_buffer, revision) {
+				Some(false) => return Task::none(),
+				// Settled: a local batch arrives with every kernel built.
+				Some(true) => {
+					app_state.local_rune_runs.remove(&source_buffer);
+				}
+				None => {}
+			}
 			app_state.status_time_elapsed = Some(app_state.code_started.elapsed());
 			match result {
 				Ok(outcome) => {
@@ -4692,6 +5122,13 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 							.display
 							.unwrap_or_else(|| "Rune finished.".to_owned()),
 					);
+					if let Some(panes) = outcome.panes {
+						commit_local_panes(app_state, source_buffer, revision, panes);
+						return app_state
+							.code_editor
+							.take_selection_tasks()
+							.map(Message::CodeEditEvent);
+					}
 					if let Some(resolved) = outcome.plot {
 						let (panel_id, display_label) = {
 							let identity = LocalViewIdentity::Anonymous(0);
@@ -5158,6 +5595,13 @@ fn update_inner(app_state: &mut AppState, message: Message) -> Task<Message> {
 		} => {
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
 				return Task::none();
+			}
+			match local_run_is_current(app_state, source_buffer, revision) {
+				Some(false) => return Task::none(),
+				Some(true) => {
+					app_state.local_rune_runs.remove(&source_buffer);
+				}
+				None => {}
 			}
 			let recipe = crate::plot::recipe::PlotRecipe::single(
 				Arc::clone(&resolved.artifact),
@@ -6908,6 +7352,9 @@ mod tests {
 	#[test]
 	fn product_0136_notebook_refuses_only_when_it_produces_nothing() {
 		let empty = resolve_notebook_rune_execution(crate::rune_host::RuneExecution {
+			request_order: Vec::new(),
+			#[cfg(feature = "toron")]
+			views: Vec::new(),
 			display: None,
 			requests: Vec::new(),
 			receipts: Vec::new(),
@@ -6920,6 +7367,9 @@ mod tests {
 		assert!(empty.receipts.is_empty());
 
 		let exported = resolve_notebook_rune_execution(crate::rune_host::RuneExecution {
+			request_order: Vec::new(),
+			#[cfg(feature = "toron")]
+			views: Vec::new(),
 			display: None,
 			requests: Vec::new(),
 			receipts: vec![ExportReceipt {
@@ -10472,6 +10922,7 @@ workspace.table("bad").views([view("bad", table())]);
 					source_buffer,
 					revision: 1,
 					result: Ok(RuneBufferOutcome {
+						panes: None,
 						display: None,
 						plot: Some(resolved),
 					}),
@@ -10528,6 +10979,7 @@ workspace.table("bad").views([view("bad", table())]);
 				source_buffer,
 				revision: 2,
 				result: Ok(RuneBufferOutcome {
+					panes: None,
 					display: Some("plain value".to_owned()),
 					plot: None,
 				}),
@@ -10843,6 +11295,7 @@ workspace.table("bad").views([view("bad", table())]);
 		let revision = SelectionRevision::ZERO.next();
 		let snapshot =
 			|kernel, predicate, displayed_selection_revision| crate::editor::HostPlotExport {
+				status: "fresh",
 				title: "selection export".into(),
 				kernel,
 				settings_model: crate::plot::theme::PlotSettings::default(),
@@ -15358,6 +15811,47 @@ rows.views([
 		(Session::new(application), source_buffer)
 	}
 
+	/// Orphan exclusion is shared, not local-only: a Toron view pane its
+	/// source stopped publishing is described as orphaned and not published.
+	#[test]
+	fn a_toron_view_orphaned_by_its_source_is_labelled_and_not_published() {
+		use crate::rune_view::{LocalViewIdentity, ViewPresentation};
+		let (mut session, buffer) = session();
+		let fresh = session.apply(&Command::Describe {}).figures.unwrap();
+		assert_eq!(fresh.len(), 1);
+		assert_eq!(fresh[0].status, "fresh");
+
+		// A rerun whose program no longer declares the view orphans its pane.
+		let application = session.application_mut();
+		application
+			.state_mut()
+			.code_editor
+			.prepare_rune_view_panels(buffer, &[] as &[(LocalViewIdentity, ViewPresentation)], 2);
+		application
+			.settle_until(Duration::from_secs(20), |state| {
+				state
+					.code_editor
+					.host_plot_exports()
+					.iter()
+					.all(|export| export.status == "orphaned")
+			})
+			.unwrap();
+		let orphaned = session.apply(&Command::Describe {}).figures.unwrap();
+		assert_eq!(orphaned.len(), 1, "the orphan stays on screen");
+		assert_eq!(orphaned[0].status, "orphaned");
+
+		let directory = std::env::temp_dir().join(format!(
+			"polariton-toron-orphan-{}-{}",
+			std::process::id(),
+			crate::selection::SurfaceIncarnation::mint().token()
+		));
+		let receipt = session.apply(&Command::Publish {
+			directory: directory.display().to_string(),
+		});
+		assert_eq!(receipt.outcome, Outcome::Refused, "{receipt:?}");
+		assert!(!directory.exists());
+	}
+
 	#[test]
 	fn product_0160_baseline_precedes_client_and_is_replaced_on_rerun() {
 		let (mut first, buffer) = session();
@@ -16225,3 +16719,6 @@ rows.views([
 		files
 	}
 }
+
+#[cfg(test)]
+mod local_rune_tests;

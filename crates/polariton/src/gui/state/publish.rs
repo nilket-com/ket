@@ -21,7 +21,16 @@ pub(super) struct PublishJob {
 impl AppState {
 	pub(super) fn prepare_publish(&self, root: &Path) -> Result<PublishJob, PublishError> {
 		let witness = self.code_editor.host_plot_publications();
-		let exports = self.code_editor.host_plot_exports();
+		// An orphaned pane is kept on screen, but its source no longer
+		// publishes it, so it is left out of the package. Stale and running
+		// panes keep their established eligibility; every figure's status is
+		// reported by describe and the receipts.
+		let exports = self
+			.code_editor
+			.host_plot_exports()
+			.into_iter()
+			.filter(|export| export.status != "orphaned")
+			.collect::<Vec<_>>();
 		if exports.is_empty() {
 			return Err(PublishError::NoFigures);
 		}

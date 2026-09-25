@@ -2054,6 +2054,7 @@ mod tests {
 			220,
 		);
 		Some(HostPlotExport {
+			status: "fresh",
 			title: title.to_owned(),
 			kernel,
 			settings_model: PlotSettings::default(),
@@ -3295,6 +3296,7 @@ mod product_0157_tests {
 
 	fn hand_export(kernel: Arc<dyn PlotKernel + Send + Sync>) -> HostPlotExport {
 		HostPlotExport {
+			status: "fresh",
 			title: "hand".to_owned(),
 			kernel,
 			settings_model: PlotSettings::default(),

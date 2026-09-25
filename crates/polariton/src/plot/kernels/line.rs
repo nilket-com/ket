@@ -434,8 +434,12 @@ fn prepare_line_data_inner(
 			0.5
 		};
 		let mut points = Vec::with_capacity(group_df.height());
+		// A null x or y is a missing observation: it contributes no vertex,
+		// and is never read as zero. Adjacent observations join across it.
 		for j in 0..group_df.height() {
-			points.push([xs.get(j).unwrap(), ys.get(j).unwrap()]);
+			if let (Some(x), Some(y)) = (xs.get(j), ys.get(j)) {
+				points.push([x, y]);
+			}
 		}
 		let resolved_color = colors.map(|colors| {
 			iced_color(
@@ -629,6 +633,18 @@ mod product_0054_tests {
 				.iter()
 				.all(|series| series.points.len() == 3)
 		);
+	}
+
+	#[test]
+	fn null_observations_are_skipped_never_zero() {
+		let frame = df!(
+			"series" => ["a", "a", "a", "a"],
+			"x" => [Some(1.0), Some(2.0), None, Some(4.0)],
+			"y" => [Some(4.96), None, Some(5.0), Some(5.11)]
+		)
+		.expect("line frame with gaps");
+		let prepared = prepare_line_data(&frame, "series", "x", "y");
+		assert_eq!(prepared.series[0].points, vec![[1.0, 4.96], [4.0, 5.11]]);
 	}
 
 	#[test]

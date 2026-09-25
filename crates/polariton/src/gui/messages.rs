@@ -298,6 +298,24 @@ pub enum Message {
 pub struct RuneBufferOutcome {
 	pub display: Option<String>,
 	pub plot: Option<ResolvedPlot>,
+	/// A local run's whole batch, every kernel already built, committed at
+	/// once in publication order; `Some(vec![])` removes the buffer's panes.
+	/// `None` for a plain run, which builds its one plot afterwards.
+	pub panes: Option<Vec<BuiltPane>>,
+}
+
+/// One pane of a local run's batch, its kernel already built, ready to
+/// attach under `identity`.
+#[derive(Clone)]
+pub struct BuiltPane {
+	pub identity: crate::rune_view::LocalViewIdentity,
+	pub presentation: crate::rune_view::ViewPresentation,
+	pub settings: crate::plot::theme::PlotSettingsLayer,
+	pub kernel: std::sync::Arc<dyn crate::plot::common::PlotKernel + Send + Sync>,
+	pub recipe: crate::plot::recipe::PlotRecipe,
+	/// The view's categorical colour identity to retain on commit.
+	#[cfg(feature = "toron")]
+	pub continuation: Option<RuneCategoricalContinuation>,
 }
 
 /// PRODUCT-0137: a Rune relation program completes as a view set or as a

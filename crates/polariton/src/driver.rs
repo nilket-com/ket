@@ -477,6 +477,9 @@ pub(crate) struct FigureDescription {
 	pub(crate) figure: String,
 	pub(crate) pane: u64,
 	pub(crate) title: String,
+	/// The pane's status. An `orphaned` figure is retained on screen but no
+	/// longer published by its source, so it is not current output.
+	pub(crate) status: String,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub(crate) view: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -821,6 +824,7 @@ pub(crate) fn describe_export(
 		figure: incarnation.token().to_string(),
 		pane: panel.get(),
 		title: export.title.clone(),
+		status: export.status.to_owned(),
 		view: export.view_name.clone(),
 		family: export.plot_type.map(crate::publication::family_name),
 		size: Size {

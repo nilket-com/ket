@@ -1307,8 +1307,8 @@ pub fn prepare_scatter_data_resolved_with_subject(
 				color: (!color_field.is_empty()).then(|| color_field.to_owned()),
 			},
 		};
-		prepared.x_axis_type = axis_type_from_scale(x.binding.scale);
-		prepared.y_axis_type = axis_type_from_scale(y.binding.scale);
+		prepared.x_axis_type = axis_type_for(x.binding.scale, df, x_field);
+		prepared.y_axis_type = axis_type_for(y.binding.scale, df, y_field);
 		prepared.x_range = layout.x_range;
 		prepared.y_range = layout.y_range;
 		apply_resolved_series_colors(&mut prepared.series, color);
@@ -1497,6 +1497,18 @@ fn order_series_by_display_domain(series: &mut [ScatterSeries], df: &DataFrame, 
 		} else {
 			0.5
 		};
+	}
+}
+
+/// The axis type of a scatter axis: a time scale over a temporal column takes
+/// that column's own type, so a `Date` axis counts days and a `Datetime` keeps
+/// its unit and zone. Without a temporal column, the scale family decides.
+pub(crate) fn axis_type_for(scale: ScaleFamily, df: &DataFrame, field: &str) -> AxisType {
+	match df.column(field).map(|column| column.dtype()) {
+		Ok(dtype) if matches!(scale, ScaleFamily::Time) && dtype.is_temporal() => {
+			crate::plot::common::polars_type_to_axis_type(dtype)
+		}
+		_ => axis_type_from_scale(scale),
 	}
 }
 
@@ -4400,5 +4412,48 @@ mod product_0159_tests {
 				}
 			);
 		}
+	}
+}
+
+#[cfg(test)]
+mod axis_type_tests {
+	use super::*;
+	use crate::plot::common::TimeUnit;
+	use polars::prelude::{DataType, IntoColumn, NamedFrom, Series, TimeUnit as PolarsTimeUnit};
+
+	fn frame(dtype: DataType) -> DataFrame {
+		let column = Series::new("t".into(), &[20_719_i64, 20_720])
+			.cast(&dtype)
+			.unwrap()
+			.into_column();
+		DataFrame::new(2, vec![column]).unwrap()
+	}
+
+	#[test]
+	fn a_time_scale_takes_the_temporal_columns_own_type() {
+		assert_eq!(
+			axis_type_for(ScaleFamily::Time, &frame(DataType::Date), "t"),
+			AxisType::Date
+		);
+		assert_eq!(
+			axis_type_for(
+				ScaleFamily::Time,
+				&frame(DataType::Datetime(PolarsTimeUnit::Microseconds, None)),
+				"t"
+			),
+			AxisType::Datetime {
+				unit: TimeUnit::Microseconds,
+				zone: None
+			}
+		);
+		// No temporal column: the scale family still decides.
+		assert_eq!(
+			axis_type_for(ScaleFamily::Time, &frame(DataType::Float64), "t"),
+			axis_type_from_scale(ScaleFamily::Time)
+		);
+		assert_eq!(
+			axis_type_for(ScaleFamily::Linear, &frame(DataType::Date), "t"),
+			AxisType::Linear
+		);
 	}
 }

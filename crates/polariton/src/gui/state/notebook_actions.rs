@@ -258,15 +258,26 @@ impl AppState {
 					.code_editor
 					.document_snapshot(buffer)
 					.ok_or_else(|| refuse("the source text is not yet projected".into()))?;
+				// A source with its own `main` runs locally and needs no Toron.
+				let mode = self
+					.code_editor
+					.document_snapshot(buffer)
+					.map(|(text, _)| crate::rune_local::mode(text));
+				let local = mode.as_ref().is_some_and(crate::rune_local::Mode::is_local);
 				#[cfg(not(feature = "toron"))]
-				let refused = Some("running a source requires Polariton's toron feature");
+				let unavailable = !local;
 				#[cfg(feature = "toron")]
-				let refused = self
-					.adapter_state
-					.rune_connection()
-					.is_none()
-					.then_some("no Rune connection: connect to a Toron before run_source");
-				if let Some(reason) = refused {
+				let unavailable = !local && self.adapter_state.rune_connection().is_none();
+				if unavailable {
+					// A source that does not parse is refused for that, not for a
+					// connection it may never have needed.
+					if let Some(crate::rune_local::Mode::Unparsed(error)) = mode {
+						return Err(refuse(format!("the source does not parse: {error}")));
+					}
+					#[cfg(not(feature = "toron"))]
+					let reason = "running a source requires Polariton's toron feature";
+					#[cfg(feature = "toron")]
+					let reason = "no Rune connection: connect to a Toron before run_source";
 					return Err(refuse(reason.into()));
 				}
 				guard = Some((buffer, generation, vec![]));
@@ -480,6 +491,36 @@ impl AppState {
 			{
 				self.complete_execution();
 			}
+		}
+	}
+	/// Settle a `run_source` whose local batch has committed, once every one
+	/// of its panes is exported: a receipt then describes all its figures.
+	pub(super) fn settle_local_batch(&mut self) {
+		let Some(Work {
+			kind: Kind::RunSource {
+				buffer, revision, ..
+			},
+			..
+		}) = &self.notebook_actions.work
+		else {
+			return;
+		};
+		let (buffer, revision) = (*buffer, *revision);
+		let Some((committed, figures)) = self.local_rune_commits.get(&buffer) else {
+			return;
+		};
+		if *committed != revision || figures.is_empty() {
+			return;
+		}
+		let exported = self
+			.code_editor
+			.host_plot_exports_with_identity()
+			.into_iter()
+			.map(|(panel, incarnation, _)| (panel, incarnation.token()))
+			.collect::<std::collections::HashSet<_>>();
+		let visible = figures.iter().all(|figure| exported.contains(figure));
+		if visible {
+			self.settle_execution(buffer, revision, Some(Ok(())));
 		}
 	}
 	fn complete_execution(&mut self) {
@@ -712,15 +753,25 @@ impl AppState {
 		} = &work.kind
 		{
 			let (buffer, revision) = (*buffer, *revision);
-			// Without the `toron` feature a Rune buffer settles in one message.
+			// A plain or local Rune buffer settles in one message, or, when it
+			// published a plot, once that pane is committed: a receipt must
+			// not report an execution whose figure does not exist yet.
 			let plain = match &message {
 				Message::RunRuneBufferResult {
 					source_buffer,
 					revision: settled,
 					result,
-				} if *source_buffer == buffer && *settled == revision => {
-					Some(result.as_ref().map(|_| ()).map_err(Clone::clone))
-				}
+				} if *source_buffer == buffer && *settled == revision => match result {
+					Ok(outcome) if outcome.plot.is_some() => None,
+					// A local batch settles once its panes are on the surface.
+					Ok(outcome) if outcome.panes.as_ref().is_some_and(|p| !p.is_empty()) => None,
+					result => Some(result.as_ref().map(|_| ()).map_err(Clone::clone)),
+				},
+				Message::RuneBufferPlotReady {
+					source_buffer,
+					revision: settled,
+					..
+				} if *source_buffer == buffer && *settled == revision => Some(Ok(())),
 				_ => None,
 			};
 			let task = update_inner(self, message);
@@ -1264,11 +1315,15 @@ mod tests {
 				crate::configuration::StartupData::default(),
 			)
 			.unwrap();
+			// run_source reads the projected text, so wait for it as well.
 			app.settle_until(Duration::from_secs(10), |s| {
 				s.code_editor
 					.active_language_id()
 					.is_some_and(|l| l.as_str() == "rune")
 					&& s.adapter_state.scratch.is_some()
+					&& s.code_editor
+						.active_buffer_id()
+						.is_some_and(|buffer| s.code_editor.document_snapshot(buffer).is_some())
 			})
 			.unwrap();
 			Self {

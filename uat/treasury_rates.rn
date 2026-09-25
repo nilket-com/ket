@@ -1,0 +1,251 @@
+// Treasury yields from FRED, fetched and plotted by this one source.
+//
+// A top-level `main` makes this a local source: it runs in the window on
+// rnx, with `http`, `json` and `text` beside `workspace` and `viz`, and needs
+// no Toron connection. Its panes are declared with the same
+// `views([view(..., figure([...]))])` vocabulary a view source uses, on
+// frames built from the fetched rows; the run replaces the source's panes
+// as a batch. Observations are H.15 daily closes (constant maturity), not
+// intraday prints. A holiday row has a date and no value: it is null in the
+// frame, never zero, and a line joins the closes on either side of it,
+// since the market was shut rather than a close going missing.
+
+const FRED = "https://fred.stlouisfed.org/graph/fredgraph.csv";
+const SINCE = "2020-01-01";
+const DATES = #{date: "date"};
+const PALETTE = "terrain_c";
+const MATURITIES = 9;
+const SKIN = "greys_rs1";
+
+// Series id, label, and maturity in years (0 when it is not a yield point).
+// Four panes: in a 2×2 grid each chart keeps room for its legend.
+const SERIES = [
+	["DGS1MO", "1M", 0.083], ["DGS3MO", "3M", 0.25], ["DGS6MO", "6M", 0.5],
+	["DGS1", "1Y", 1.0], ["DGS2", "2Y", 2.0], ["DGS5", "5Y", 5.0],
+	["DGS10", "10Y", 10.0], ["DGS20", "20Y", 20.0], ["DGS30", "30Y", 30.0],
+	["DFII10", "10Y real (TIPS)", 0.0], ["T10YIE", "10Y breakeven", 0.0],
+];
+
+// FRED's CDN stalls requests without a User-Agent and rejects browser ones.
+async fn observations(id) {
+	let response = http::request(
+		"GET",
+		`${FRED}?id=${id}&cosd=${SINCE}`,
+		#{headers: #{"user-agent": "curl/8.5"}},
+	).await?;
+	if response.status != 200 {
+		return Err(`FRED ${id}: HTTP ${response.status}`);
+	}
+	let rows = [];
+	let header = true;
+	for line in response.body.split("\n") {
+		if header {
+			header = false;
+			continue;
+		}
+		let parts = [];
+		for part in line.split(",") {
+			parts.push(part);
+		}
+		if parts.len() != 2 {
+			continue;
+		}
+		let value = if parts[1] == "" || parts[1] == "." { () } else { std::f64::parse(parts[1])? };
+		rows.push([parts[0], value]);
+	}
+	Ok(rows)
+}
+
+// Long rows for one frame: one row per date per labelled series.
+fn long(fetched, labels, scale) {
+	let rows = [];
+	for label in labels {
+		for observation in fetched[label] {
+			let value = observation[1];
+			let value = if value is f64 { value * scale } else { () };
+			rows.push(#{date: observation[0], value: value, series: label});
+		}
+	}
+	rows
+}
+
+fn ymd(date) {
+	let parts = [];
+	for part in date.split("-") {
+		parts.push(std::i64::parse(part)?);
+	}
+	Ok(parts)
+}
+
+fn iso(year, month, day) {
+	let pad = |n| if n < 10 { `0${n}` } else { `${n}` };
+	`${year}-${pad(month)}-${pad(day)}`
+}
+
+// The close on or before `date`, and the date it was observed.
+fn close_on_or_before(observations, date) {
+	let found = ();
+	for observation in observations {
+		if observation[0] <= date && observation[1] is f64 {
+			found = observation;
+		}
+	}
+	found
+}
+
+// The close observed on exactly `date`, or ().
+fn close_on(observations, date) {
+	for observation in observations {
+		if observation[0] == date {
+			return observation[1];
+		}
+	}
+	()
+}
+
+// One snapshot of the curve: the latest date on or before `requested` on
+// which every maturity closed, so a curve is never stitched from different
+// days. Its series is named for the snapshot and the date actually used.
+fn curve(fetched, name, requested) {
+	let dates = [];
+	for observation in fetched["10Y"] {
+		if observation[0] <= requested {
+			dates.push(observation[0]);
+		}
+	}
+	let index = dates.len();
+	while index > 0 {
+		index -= 1;
+		let date = dates[index];
+		let points = [];
+		for series in SERIES {
+			if series[2] > 0.0 {
+				let close = close_on(fetched[series[1]], date);
+				if close is f64 {
+					points.push(#{maturity_years: series[2], percent: close, curve: `${name}, ${date}`, observed: date});
+				}
+			}
+		}
+		if points.len() == MATURITIES {
+			return Ok(points);
+		}
+	}
+	Err(`no complete yield curve on or before ${requested} for "${name}"`)
+}
+
+// The three snapshots the curve pane promises, all or an error.
+fn curves(fetched) {
+	let last = close_on_or_before(fetched["10Y"], "9999-12-31");
+	if !(last is Vec) {
+		return Err("FRED returned no 10-year close to anchor the curves");
+	}
+	let [year, month, day] = ymd(last[0])?;
+	let quarter = if month > 3 { iso(year, month - 3, day) } else { iso(year - 1, month + 9, day) };
+	let rows = [];
+	for snapshot in [["Latest", last[0]], ["-3M", quarter], ["-1Y", iso(year - 1, month, day)]] {
+		for point in curve(fetched, snapshot[0], snapshot[1])? {
+			rows.push(point);
+		}
+	}
+	Ok(rows)
+}
+
+pub async fn main(workspace, viz) {
+	let requests = [];
+	for series in SERIES {
+		requests.push(observations(series[0]));
+	}
+	let responses = std::future::join(requests).await;
+	let fetched = #{};
+	for (index, series) in SERIES.iter().enumerate() {
+		fetched[series[1]] = responses[index]?;
+	}
+
+	// The as-of date and the latest 10-year move, shown on every pane.
+	let last = close_on_or_before(fetched["10Y"], "9999-12-31");
+	if !(last is Vec) {
+		return Err("FRED returned no 10-year close");
+	}
+	let prior = ();
+	for observation in fetched["10Y"] {
+		if observation[0] < last[0] && observation[1] is f64 {
+			prior = observation;
+		}
+	}
+	// With no earlier close there is no daily move to report; say so.
+	let change = if prior is Vec {
+		let move_bp = ((last[1] - prior[1]) * 100.0).round() as i64;
+		`${if move_bp >= 0 { "+" } else { "" }}${move_bp} bp on ${last[0]}`
+	} else {
+		`change unavailable on ${last[0]}`
+	};
+	let source = `FRED H.15 daily closes, as of ${last[0]}`;
+	let headline = `10Y ${last[1]}%, ${change} · FRED H.15`;
+
+	// 10Y comes third in both series lists, so it keeps one colour.
+	let yields = viz.frame_typed("yields", long(fetched, ["3M", "2Y", "10Y", "30Y"], 1.0), DATES)?;
+	yields.views([
+		view("Yields by maturity", figure([
+			title("Yields by maturity, %"),
+			subtitle(headline),
+			skin(SKIN),
+			palette(PALETTE),
+			x_axis().label("Date").tick_every("3 months").tick_rotation(30),
+			y_axis().label("Yield, %"),
+			line("date", "value", "series"),
+		])),
+	])?;
+
+	let ten = viz.frame_typed("decomposition", long(fetched, ["10Y real (TIPS)", "10Y breakeven", "10Y"], 1.0), DATES)?;
+	ten.views([
+		view("10Y decomposition", figure([
+			title("10Y = real + breakeven, %"),
+			subtitle(source),
+			skin(SKIN),
+			palette(PALETTE),
+			x_axis().label("Date").tick_every("3 months").tick_rotation(30),
+			y_axis().label("Percent"),
+			line("date", "value", "series"),
+		])),
+	])?;
+
+	// The whole curve on three dates: the latest complete one, and the latest
+	// complete ones on or before the same day three months and a year earlier.
+	let curve = viz.frame_typed("curve", curves(fetched)?, #{observed: "date"})?;
+	curve.views([
+		view("Yield curve", figure([
+			title("Yield curve, %"),
+			subtitle(source),
+			skin(SKIN),
+			palette(PALETTE),
+			x_axis().label("Maturity, years"),
+			y_axis().label("Yield, %"),
+			line("maturity_years", "percent", "curve"),
+		])),
+	])?;
+
+	// Close-to-close daily change of the 10-year, in basis points.
+	let changes = [];
+	let before = ();
+	for observation in fetched["10Y"] {
+		if observation[1] is f64 {
+			if before is f64 {
+				changes.push(#{date: observation[0], change_bp: (observation[1] - before) * 100.0});
+			}
+			before = observation[1];
+		}
+	}
+	let daily = viz.frame_typed("daily", changes, DATES)?;
+	daily.views([
+		view("10Y daily change", figure([
+			title("10Y daily change, bp"),
+			subtitle(source),
+			skin(SKIN),
+			palette(PALETTE),
+			x_axis().label("Date").tick_every("3 months").tick_rotation(30),
+			y_axis().label("Change, basis points"),
+			scatter("date", "change_bp"),
+		])),
+	])?;
+	Ok("")
+}

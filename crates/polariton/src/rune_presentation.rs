@@ -527,12 +527,51 @@ fn build_context() -> Result<Context, String> {
 		Context::with_config(false).map_err(|error| format!("Rune context error: {error}"))?;
 	let mut module =
 		Module::with_crate(MODULE).map_err(|error| format!("Rune module error: {error}"))?;
-	module.ty::<RuneFigureElement>().map_err(module_error)?;
-	module.ty::<RuneSkin>().map_err(module_error)?;
-	module.ty::<RuneMark>().map_err(module_error)?;
-	module.ty::<RuneLayers>().map_err(module_error)?;
-	module.ty::<RuneTable>().map_err(module_error)?;
-	module.ty::<RunePresentation>().map_err(module_error)?;
+	install_vocabulary(&mut module)?;
+	context.install(module).map_err(module_error)?;
+	Ok(context)
+}
+
+/// The presentation value types, listed once. Registration and the local
+/// method guard both expand from this list, so they cannot drift apart.
+macro_rules! presentation_types {
+	($apply:ident) => {
+		$apply!(
+			RuneFigureElement,
+			RuneSkin,
+			RuneMark,
+			RuneLayers,
+			RuneTable,
+			RunePresentation
+		)
+	};
+}
+
+fn presentation_type_hashes() -> &'static [rune::Hash] {
+	use rune::TypeHash;
+	macro_rules! hashes {
+		($($ty:ty),*) => {
+			&[$(<$ty as TypeHash>::HASH),*]
+		};
+	}
+	presentation_types!(hashes)
+}
+
+/// Whether a value is one of the presentation types, without borrowing it.
+pub(crate) fn is_presentation_value(value: &Value) -> bool {
+	presentation_type_hashes().contains(&value.type_hash())
+}
+
+/// The presentation vocabulary: its types and every registry callable, free
+/// or associated. The Toron evaluator installs it into its sandboxed context;
+/// a local source installs the same module beside rnx's batteries.
+pub(crate) fn install_vocabulary(module: &mut Module) -> Result<(), String> {
+	macro_rules! register {
+		($($ty:ty),*) => {
+			$(module.ty::<$ty>().map_err(module_error)?;)*
+		};
+	}
+	presentation_types!(register);
 
 	for callable in CALLABLES {
 		let function = raw_handler(callable.handler);
@@ -561,9 +600,62 @@ fn build_context() -> Result<Context, String> {
 			};
 		}
 	}
+	Ok(())
+}
 
-	context.install(module).map_err(module_error)?;
-	Ok(context)
+/// A local source's `view(name, body)`: the name is any nonempty string
+/// value (it may be computed), the body any presentation value. In a view
+/// source the compiler reads `view(...)` statically; a local source builds
+/// views at run time, so it carries them as values instead.
+#[derive(Any, Clone)]
+#[rune(item = ::polariton_presentation, name = LocalView)]
+pub(crate) struct LocalView {
+	name: Result<String, PresentationFailure>,
+	body: Value,
+	origin: Origin,
+}
+
+/// Register the local-only `__view` carrier and the method guard.
+pub(crate) fn install_local_views(module: &mut Module) -> Result<(), String> {
+	module.ty::<LocalView>().map_err(module_error)?;
+	module
+		.function("__view", local_view)
+		.build()
+		.map_err(module_error)?;
+	module
+		.function("__is_presentation", |value: Value| is_presentation_value(&value))
+		.build()
+		.map_err(module_error)?;
+	Ok(())
+}
+
+fn local_view(name: Value, body: Value, start: i64, end: i64) -> LocalView {
+	let origin = Origin::decode(start, end).unwrap_or(Origin { start: 0, end: 0 });
+	let name = match name.borrow_string_ref() {
+		Ok(name) if !name.trim().is_empty() => Ok(name.to_string()),
+		_ => Err(PresentationFailure::new(
+			origin,
+			"view(...) requires a nonempty string name",
+		)),
+	};
+	LocalView { name, body, origin }
+}
+
+/// Decode one entry of a local `views([...])` list into its name, origin and
+/// intent, through the same slot decoding a view source uses.
+pub(crate) fn decode_local_view(
+	value: &Value,
+) -> Result<(String, Range<u32>, RuneViewIntent), PresentationFailure> {
+	let Ok(view) = value.borrow_ref::<LocalView>() else {
+		return Err(PresentationFailure {
+			span: 0..0,
+			message: "views([...]) takes view(\"name\", figure([...])) entries".to_owned(),
+		});
+	};
+	let span = view.origin.range();
+	let name = view.name.clone()?;
+	let intent = decode_slot(&view.body, span.clone())?;
+	Ok((name, span, intent))
 }
 
 fn module_error(error: impl std::fmt::Display) -> String {
@@ -4583,6 +4675,34 @@ fn decode_slot(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn the_method_guard_recognises_every_presentation_value_family() {
+		// One constructor from each family: element, skin, mark, layers,
+		// table and figure. Their values are what the guard must accept.
+		let source = "pub fn main() { [\
+			polariton_presentation::__x_axis(0, 1), \
+			polariton_presentation::__skin(\"greys_rs2\", 0, 1), \
+			polariton_presentation::__line(\"x\", \"y\", 0, 1), \
+			polariton_presentation::__layers([polariton_presentation::__line(\"x\", \"y\", 0, 1)], 0, 1), \
+			polariton_presentation::__table(0, 1), \
+			polariton_presentation::__figure([], 0, 1), \
+			7, \"text\", \
+		] }";
+		let context = build_context().unwrap();
+		let mut sources = Sources::new();
+		sources.insert(Source::new("guard", source).unwrap()).unwrap();
+		let unit = rune::prepare(&mut sources).with_context(&context).build().unwrap();
+		let mut vm = Vm::new(Arc::new(context.runtime().unwrap()), Arc::new(unit));
+		let values = vm.call(["main"], ()).unwrap();
+		let values = values.borrow_ref::<rune::runtime::Vec>().unwrap();
+		let recognised: Vec<bool> = values.iter().map(is_presentation_value).collect();
+		assert_eq!(recognised, [true, true, true, true, true, true, false, false]);
+		// Every family seen above is a distinct registered type.
+		let families: HashSet<rune::Hash> =
+			values.iter().take(6).map(|value| value.type_hash()).collect();
+		assert_eq!(families.len(), presentation_type_hashes().len());
+	}
 
 	fn execute(
 		source: &str,

@@ -2435,6 +2435,14 @@ impl CodeEditor {
 		paths
 	}
 
+	/// The incarnation of the plot a host panel holds now, if it holds one.
+	pub(crate) fn host_plot_incarnation(&self, panel_id: HostPanelId) -> Option<u64> {
+		match &self.panels.panels.get(&panel_id)?.content {
+			PanelContent::Plot(plot) => Some(plot.surface_incarnation.token()),
+			_ => None,
+		}
+	}
+
 	pub(crate) fn host_plot_incarnations(&self) -> std::collections::HashSet<u64> {
 		self.panels
 			.panels
@@ -2603,6 +2611,12 @@ impl CodeEditor {
 						panel_id,
 						plot.surface_incarnation,
 						HostPlotExport {
+							status: match entry.status {
+								PanelStatus::Fresh => "fresh",
+								PanelStatus::Running => "running",
+								PanelStatus::Stale => "stale",
+								PanelStatus::Orphaned => "orphaned",
+							},
 							title: plot.display_label.clone(),
 							kernel: Arc::clone(&plot.kernel),
 							settings_model: plot.plot_settings_model.clone(),
@@ -2633,14 +2647,25 @@ impl CodeEditor {
 								width: rect.width.get(),
 								height: rect.height.get(),
 							},
-							view_name: plot.source_attachment.as_ref().and_then(|attachment| {
-								match &attachment.identity {
+							// The authored view name: from the source attachment, or, for
+							// a view with none (a local source's), from the identity its
+							// panel is registered under.
+							view_name: plot
+								.source_attachment
+								.as_ref()
+								.map(|attachment| &attachment.identity)
+								.or_else(|| {
+									self.view_panel_ids
+										.iter()
+										.find(|(_, candidate)| **candidate == panel_id)
+										.map(|((_, identity), _)| identity)
+								})
+								.and_then(|identity| match identity {
 									crate::rune_view::LocalViewIdentity::Named(name) => {
 										Some(name.clone())
 									}
 									crate::rune_view::LocalViewIdentity::Anonymous(_) => None,
-								}
-							}),
+								}),
 							plot_type: plot.plot_type,
 							publication: plot.publication,
 							authored_expression: plot
@@ -2758,6 +2783,35 @@ impl CodeEditor {
 		))
 	}
 
+	/// Split a new empty pane beside the focused one, as the pane menu does.
+	#[cfg(test)]
+	pub(crate) fn split_new_pane(&mut self) {
+		self.send(EditorCommand::NewPane {
+			direction: SplitDirection::Vertical,
+			language: None,
+		});
+		self.request_content();
+	}
+
+	/// Close every tab showing `buffer_id`, as the tab close action does.
+	#[cfg(test)]
+	pub(crate) fn close_buffer_tabs(&self, buffer_id: libaryon::core::BufferId) {
+		let tabs: Vec<_> = self
+			.viewport
+			.iter()
+			.flat_map(|viewport| viewport.panes.iter())
+			.flat_map(|pane| {
+				pane.tabs
+					.iter()
+					.filter(|tab| tab.buffer_id == buffer_id)
+					.map(move |tab| (pane.pane_id, tab.view_id))
+			})
+			.collect();
+		for (pane_id, view_id) in tabs {
+			self.send(EditorCommand::CloseDocTab { pane_id, view_id });
+		}
+	}
+
 	pub(crate) fn apply_document_edits(
 		&self,
 		request_id: libaryon::core::RequestId,
@@ -2872,6 +2926,15 @@ impl CodeEditor {
 			return true;
 		}
 		false
+	}
+
+	/// The note a plot panel's settings inspector shows, if any.
+	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn plot_writeback_status(&self, panel_id: HostPanelId) -> Option<String> {
+		match &self.panels.panels.get(&panel_id)?.content {
+			PanelContent::Plot(plot) => plot.writeback_status.clone(),
+			_ => None,
+		}
 	}
 
 	#[cfg(feature = "toron")]
@@ -4576,6 +4639,9 @@ pub(crate) struct HostPlotExport {
 	/// token is the assembly witness. None of these is placement authority.
 	pub(crate) layout: crate::publication::GridRect,
 	pub(crate) view_name: Option<String>,
+	/// The panel's status: `fresh`, `running`, `stale`, or `orphaned` (kept
+	/// on screen after its producer stopped publishing it).
+	pub(crate) status: &'static str,
 	pub(crate) plot_type: Option<crate::plot::core::PlotType>,
 	pub(crate) publication: Option<crate::selection::Publication>,
 	/// PRODUCT-0154 §5: the view expression as authored, and the durable
