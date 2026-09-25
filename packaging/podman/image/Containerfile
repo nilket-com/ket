@@ -1,0 +1,37 @@
+# The Nilket development container (ADR 0172). Build it with ./build, which
+# passes the ket checkout as the context and containerignore as its filter.
+
+FROM registry.fedoraproject.org/fedora:44 AS build
+RUN dnf -y install gcc gcc-c++ make cmake clang perl-core pkgconf-pkg-config \
+	&& dnf clean all
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+	| sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH=/root/.cargo/bin:$PATH
+# nilket's workspace takes shared/boson as a path dependency.
+COPY nilket /src/nilket
+COPY shared /src/shared
+WORKDIR /src/nilket
+# The shipping release profile links with fat LTO and one codegen unit, which
+# needed more than 5 GiB in a 6 GiB machine and was killed. A development image
+# trades that last optimization for a build a desktop VM can hold.
+ENV CARGO_PROFILE_RELEASE_LTO=thin \
+	CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+RUN --mount=type=cache,target=/root/.cargo/registry \
+	--mount=type=cache,target=/src/nilket/target \
+	cargo build --locked --release -p nilket \
+	&& install -D -m 0755 target/release/nilket /out/nilket
+
+FROM registry.fedoraproject.org/fedora-minimal:44
+RUN dnf -y install openssl shadow-utils diffutils \
+	&& dnf clean all \
+	&& groupadd --gid 1000 nilket \
+	&& useradd --uid 1000 --gid 1000 --home-dir /var/lib/nilket --no-create-home \
+		--shell /sbin/nologin nilket \
+	&& install -d -m 0700 -o nilket -g nilket /var/lib/nilket
+COPY --from=build /out/nilket /usr/local/bin/nilket
+COPY packaging/podman/image/nilket-container /usr/local/bin/nilket-container
+USER nilket
+VOLUME /var/lib/nilket
+EXPOSE 7742/udp
+ENTRYPOINT ["/usr/local/bin/nilket-container"]
+CMD ["run"]

@@ -1,0 +1,6 @@
+# Build context filter for ./build: only what the image compiles or copies.
+*
+!nilket
+!shared
+!packaging/podman/image/nilket-container
+**/target

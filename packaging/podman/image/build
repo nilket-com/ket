@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Build the Nilket development image (ADR 0172) from a ket checkout.
+#
+#   packaging/podman/image/build [TAG]
+#
+# TAG defaults to localhost/nilket:dev. Compiling nilket needs several GiB of
+# memory in the Podman machine.
+set -euo pipefail
+
+readonly HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly ROOT="$(cd "$HERE/../../.." && pwd)"
+readonly TAG="${1:-localhost/nilket:dev}"
+
+exec podman build \
+	--file "$HERE/Containerfile" \
+	--ignorefile "$HERE/containerignore" \
+	--tag "$TAG" \
+	"$ROOT"

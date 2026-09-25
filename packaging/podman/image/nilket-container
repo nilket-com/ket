@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# Entrypoint for the Nilket development container (ADR 0172).
+#
+#   nilket-container init                  write every artifact; start nothing
+#   nilket-container run                   init, then supervise Wendelon and Toron
+#   nilket-container sign-client --tenant N  CSR on stdin, client certificate on stdout
+#   nilket-container ca                    the SQL listener's CA certificate on stdout
+#   nilket-container sql --tenant N        SQL statements on stdin, run as tenant N
+#   nilket-container status                key=value lines for the host scripts
+#
+# Everything lives under $NILKET_ROOT, the container's named volume:
+#   profile/     the `nilket local` profile: Wendelon's config and data, the node
+#                and operator PKI, and the retained Toron config adjusted below
+#   deployment/  what this deployment adds: the worker id, the SQL listener's CA
+#                and identity, the tenant's storage identity, and the container's
+#                own SQL client identity for loading fixtures
+# Nothing here is regenerated once it exists. Replacing identities means a new
+# volume.
+set -euo pipefail
+
+readonly ROOT="${NILKET_ROOT:-/var/lib/nilket}"
+readonly NILKET="${NILKET_BIN:-nilket}"
+readonly TENANT=1
+readonly SQL_PORT=7742
+readonly CLUSTER_DOMAIN=cluster.local
+readonly WENDELON_BOOTSTRAP=1@127.0.0.1:7001
+readonly STARTUP_TIMEOUT_SECONDS=300
+readonly DRAIN_TIMEOUT_SECONDS=35
+readonly MAX_CSR_BYTES=65536
+# Toron's max_statement_bytes in the local profile.
+readonly MAX_SQL_BYTES=4194304
+
+readonly PROFILE="$ROOT/profile"
+readonly PROFILE_PKI="$PROFILE/pki"
+readonly TORON_CONFIG="$PROFILE/config/toron.toml"
+readonly WENDELON_CONFIG="$PROFILE/config/wendelon.toml"
+readonly DEPLOYMENT="$ROOT/deployment"
+readonly WORKER_ID_FILE="$DEPLOYMENT/worker-id"
+readonly SQL_PKI="$DEPLOYMENT/sql-pki"
+readonly STORAGE="$DEPLOYMENT/storage"
+readonly CLIENT="$DEPLOYMENT/sql-client"
+
+log() { printf 'nilket-container: %s\n' "$*" >&2; }
+die() {
+	log "$*"
+	exit 1
+}
+
+usage() {
+	sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//' >&2
+	exit 2
+}
+
+# Succeed when every file exists, fail when none does, and refuse a partial set:
+# regenerating half an identity would silently replace what the other half trusts.
+all_or_none() {
+	local present=0 file
+	for file in "$@"; do
+		[[ -e $file ]] && present=$((present + 1))
+	done
+	((present == $#)) && return 0
+	((present == 0)) && return 1
+	die "partial identity: expected all or none of: $*; restore them or use a new volume"
+}
+
+worker_id() {
+	local id
+	id=$(<"$WORKER_ID_FILE")
+	[[ $id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] ||
+		die "malformed worker id in $WORKER_ID_FILE"
+	printf '%s' "$id"
+}
+
+server_name() { printf 'toron-%s.%s' "$(worker_id)" "$CLUSTER_DOMAIN"; }
+
+# The one uncommented occurrence of KEY in FILE; the config edits below rely on it.
+require_single_key() {
+	local file=$1 key=$2 count
+	count=$(grep -c "^$key = " "$file" || true)
+	((count == 1)) || die "expected exactly one '$key' in $file, found $count"
+}
+
+require_tenant_argument() {
+	[[ $# -eq 2 && $1 == --tenant ]] || die "usage: $VERB --tenant $TENANT"
+	[[ $2 == "$TENANT" ]] || die "this deployment serves tenant $TENANT, not tenant $2"
+}
+
+# Copy standard input to FILE, refusing more than LIMIT bytes.
+read_bounded_stdin() {
+	local file=$1 limit=$2
+	head -c "$((limit + 1))" >"$file"
+	(($(wc -c <"$file") <= limit)) || die "input exceeds $limit bytes"
+	[[ -s $file ]] || die "no input on standard input"
+}
+
+ensure_worker_id() {
+	if [[ ! -e $WORKER_ID_FILE ]]; then
+		cat /proc/sys/kernel/random/uuid >"$WORKER_ID_FILE.new"
+		mv "$WORKER_ID_FILE.new" "$WORKER_ID_FILE"
+	fi
+	worker_id >/dev/null
+}
+
+ensure_sql_pki() {
+	mkdir -p "$SQL_PKI"
+	if ! all_or_none "$SQL_PKI/ca.crt" "$SQL_PKI/ca.key"; then
+		"$NILKET" toron pki init-ca --dir "$SQL_PKI" >&2
+	fi
+	if ! all_or_none "$SQL_PKI/listener.crt" "$SQL_PKI/listener.key"; then
+		"$NILKET" toron pki issue-listener --dir "$SQL_PKI" --worker-id "$(worker_id)" \
+			--cluster-domain "$CLUSTER_DOMAIN" >&2
+	fi
+}
+
+ensure_storage_identity() {
+	if ! all_or_none "$STORAGE/toron-storage.crt" "$STORAGE/toron-storage.key"; then
+		mkdir -p "$STORAGE"
+		"$NILKET" toron pki issue-storage --ca-cert "$PROFILE_PKI/node-ca.crt" \
+			--ca-key "$PROFILE_PKI/node-ca.key" --tenant "$TENANT" --out-dir "$STORAGE" \
+			--cluster-domain "$CLUSTER_DOMAIN" >&2
+	fi
+}
+
+# The container's own tenant client, for the `sql` verb. The whole directory is
+# built beside its destination and published with one rename, so an interrupted
+# run leaves either no identity or a complete one.
+ensure_client_identity() {
+	all_or_none "$CLIENT/client.crt" "$CLIENT/client.key" && return 0
+	# Neither file exists; an empty directory left behind is safe to replace, and
+	# rmdir refuses anything else.
+	[[ ! -d $CLIENT ]] || rmdir "$CLIENT" || die "unexpected files in $CLIENT"
+	local scratch
+	scratch=$(mktemp -d "$DEPLOYMENT/.sql-client.XXXXXX")
+	openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$scratch/client.key" 2>/dev/null
+	openssl req -new -key "$scratch/client.key" -subj "/CN=nilket-container-sql" \
+		-out "$scratch/client.csr"
+	"$NILKET" toron pki sign-client --dir "$SQL_PKI" --csr "$scratch/client.csr" \
+		--tenant "$TENANT" --out "$scratch/client.crt" --cluster-domain "$CLUSTER_DOMAIN" >&2
+	rm "$scratch/client.csr"
+	mv -T "$scratch" "$CLIENT"
+}
+
+# Point the retained Toron config at this deployment: its worker id and tenant,
+# the tenant's storage identity, and the authenticated SQL listener on every
+# interface of the container. Re-running it yields the same file.
+adjust_toron_config() {
+	local key
+	for key in worker_id tenant_id tls_cert_path tls_key_path listener_bind; do
+		require_single_key "$TORON_CONFIG" "$key"
+	done
+	local draft="$TORON_CONFIG.new"
+	sed \
+		-e "s|^worker_id = .*|worker_id = \"$(worker_id)\"|" \
+		-e "s|^tenant_id = .*|tenant_id = $TENANT|" \
+		-e "s|^tls_cert_path = .*|tls_cert_path = \"$STORAGE/toron-storage.crt\"|" \
+		-e "s|^tls_key_path = .*|tls_key_path = \"$STORAGE/toron-storage.key\"|" \
+		-e "s|^listener_bind = .*|listener_bind = \"0.0.0.0:$SQL_PORT\"|" \
+		"$TORON_CONFIG" >"$draft"
+	if ! grep -q '^\[tls\]' "$draft"; then
+		cat >>"$draft" <<-EOF
+
+			[tls]
+			listener_cert = "$SQL_PKI/listener.crt"
+			listener_key = "$SQL_PKI/listener.key"
+			peer_ca = "$SQL_PKI/ca.crt"
+			cluster_domain = "$CLUSTER_DOMAIN"
+		EOF
+	fi
+	# An initialized volume is verified, not rewritten (ADR 0172 §6).
+	if cmp -s "$draft" "$TORON_CONFIG"; then
+		rm "$draft"
+		return 0
+	fi
+	chmod 600 "$draft"
+	mv "$draft" "$TORON_CONFIG"
+}
+
+init() {
+	umask 077
+	mkdir -p "$ROOT"
+	"$NILKET" local init --data-dir "$PROFILE"
+	mkdir -p "$DEPLOYMENT"
+	ensure_worker_id
+	ensure_sql_pki
+	ensure_storage_identity
+	ensure_client_identity
+	adjust_toron_config
+	# `nilket local init` validates the retained configs it did not write.
+	"$NILKET" local init --data-dir "$PROFILE" 2>/dev/null ||
+		die "the adjusted Toron config does not validate: $TORON_CONFIG"
+}
+
+operator_flags=(
+	--bootstrap "$WENDELON_BOOTSTRAP"
+	--cert "$PROFILE_PKI/local-operator.crt"
+	--key "$PROFILE_PKI/local-operator.key"
+	--ca "$PROFILE_PKI/node-ca.crt"
+)
+
+sql_client_flags() {
+	printf '%s\n' --endpoint "127.0.0.1:$SQL_PORT" --server-name "$(server_name)" \
+		--cert "$CLIENT/client.crt" --key "$CLIENT/client.key" --ca "$SQL_PKI/ca.crt"
+}
+
+wendelon_answers() { "$NILKET" wendelon tenant list "${operator_flags[@]}" >/dev/null 2>&1; }
+
+# Toron has answered an authenticated tenant query. Its planner rejects every
+# table-free statement, and a fresh tenant has no table, so a typed planner error
+# counts: getting one takes QUIC, mutual TLS, the tenant identity, and the planner.
+# A refused or unauthenticated connection surfaces as "connection timed out".
+toron_answers() {
+	local flags answer
+	mapfile -t flags < <(sql_client_flags)
+	answer=$("$NILKET" toron sql "${flags[@]}" "SELECT 1" 2>&1) && return 0
+	grep -qE 'request failed: Toron [A-Za-z]+Error:' <<<"$answer"
+}
+
+# Poll PROBE until it succeeds, CHILD exits, or the startup timeout passes.
+wait_until() {
+	local label=$1 child=$2 probe=$3 deadline=$((SECONDS + STARTUP_TIMEOUT_SECONDS))
+	until "$probe"; do
+		kill -0 "$child" 2>/dev/null || die "$label exited during startup"
+		((SECONDS < deadline)) || die "$label not ready after ${STARTUP_TIMEOUT_SECONDS}s"
+		((STOPPING == 0)) || return 1
+		sleep 0.5
+	done
+}
+
+# Tenant state from `tenant get --json`: active, absent, or the raw answer.
+tenant_state() {
+	local answer
+	if answer=$("$NILKET" wendelon tenant get "${operator_flags[@]}" --tenant "$TENANT" --json 2>&1); then
+		if grep -qi '"state"[[:space:]]*:[[:space:]]*"active"' <<<"$answer"; then
+			echo active
+		else
+			printf '%s\n' "$answer"
+		fi
+	elif grep -q "tenant $TENANT does not exist" <<<"$answer"; then
+		echo absent
+	else
+		printf '%s\n' "$answer"
+	fi
+}
+
+ensure_tenant() {
+	local state
+	state=$(tenant_state)
+	if [[ $state == absent ]]; then
+		log "creating tenant $TENANT"
+		"$NILKET" wendelon tenant create "${operator_flags[@]}" --tenant "$TENANT" >&2 ||
+			die "tenant $TENANT could not be created"
+		state=$(tenant_state)
+	fi
+	[[ $state == active ]] || die "tenant $TENANT is not active: $state"
+}
+
+WENDELON_PID=
+TORON_PID=
+STOPPING=0
+
+# Ask one role to drain with the Ctrl-C it listens for, and wait for it.
+drain() {
+	local label=$1 pid=$2 deadline=$((SECONDS + DRAIN_TIMEOUT_SECONDS))
+	[[ -n $pid ]] && kill -0 "$pid" 2>/dev/null || return 0
+	kill -INT "$pid" 2>/dev/null || true
+	while kill -0 "$pid" 2>/dev/null; do
+		if ((SECONDS >= deadline)); then
+			log "$label did not drain in ${DRAIN_TIMEOUT_SECONDS}s; killing it"
+			kill -KILL "$pid" 2>/dev/null || true
+			break
+		fi
+		sleep 0.2
+	done
+	wait "$pid" 2>/dev/null || true
+}
+
+# Toron first: it is Wendelon's client.
+stop_roles() {
+	drain toron "$TORON_PID"
+	drain wendelon "$WENDELON_PID"
+}
+
+on_stop_signal() {
+	STOPPING=1
+	log "stopping"
+	stop_roles
+	exit 0
+}
+
+# Standard output carries only the ready line; the roles log to standard error.
+run() {
+	init
+	trap on_stop_signal TERM INT
+	# Every way out of `run`, including `die`, drains whatever it started.
+	trap stop_roles EXIT
+	"$NILKET" wendelon "$WENDELON_CONFIG" >&2 &
+	WENDELON_PID=$!
+	wait_until wendelon "$WENDELON_PID" wendelon_answers || exit 0
+	ensure_tenant
+	"$NILKET" toron start "$TORON_CONFIG" >&2 &
+	TORON_PID=$!
+	wait_until toron "$TORON_PID" toron_answers || exit 0
+	printf 'NILKET_CONTAINER_READY sql=0.0.0.0:%s server_name=%s tenant=%s\n' \
+		"$SQL_PORT" "$(server_name)" "$TENANT"
+	# Either role exiting ends the deployment; a stop signal interrupts the wait.
+	local status=0
+	wait -n "$WENDELON_PID" "$TORON_PID" || status=$?
+	((STOPPING == 0)) || exit 0
+	log "a role exited unexpectedly (status $status); stopping the other"
+	stop_roles
+	exit 1
+}
+
+status() {
+	local ready=no
+	[[ -e $WORKER_ID_FILE && -e $CLIENT/client.crt ]] && toron_answers && ready=yes
+	printf 'worker_id=%s\n' "$( [[ -e $WORKER_ID_FILE ]] && worker_id)"
+	printf 'server_name=%s\n' "$( [[ -e $WORKER_ID_FILE ]] && server_name)"
+	printf 'tenant=%s\n' "$TENANT"
+	printf 'sql_port=%s\n' "$SQL_PORT"
+	printf 'sql_ready=%s\n' "$ready"
+}
+
+sign_client() {
+	require_tenant_argument "$@"
+	[[ -e $SQL_PKI/ca.key ]] || die "not initialized; start the container first"
+	SCRATCH=$(mktemp -d)
+	trap 'rm -rf "$SCRATCH"' EXIT
+	read_bounded_stdin "$SCRATCH/request.csr" "$MAX_CSR_BYTES"
+	"$NILKET" toron pki sign-client --dir "$SQL_PKI" --csr "$SCRATCH/request.csr" \
+		--tenant "$TENANT" --out "$SCRATCH/client.crt" --cluster-domain "$CLUSTER_DOMAIN" >&2
+	cat "$SCRATCH/client.crt"
+}
+
+ca() {
+	[[ -e $SQL_PKI/ca.crt ]] || die "not initialized; start the container first"
+	cat "$SQL_PKI/ca.crt"
+}
+
+# `nilket toron sql` reads a statement argument or `--file PATH`, never stdin.
+sql() {
+	require_tenant_argument "$@"
+	[[ -e $CLIENT/client.crt ]] || die "not initialized; start the container first"
+	SCRATCH=$(mktemp -d)
+	trap 'rm -rf "$SCRATCH"' EXIT
+	read_bounded_stdin "$SCRATCH/statements.sql" "$MAX_SQL_BYTES"
+	local flags
+	mapfile -t flags < <(sql_client_flags)
+	"$NILKET" toron sql "${flags[@]}" --file "$SCRATCH/statements.sql"
+}
+
+VERB=${1:-run}
+if (($# > 0)); then
+	shift
+fi
+case $VERB in
+sign-client) sign_client "$@" ;;
+sql) sql "$@" ;;
+init | run | ca | status)
+	if (($# > 0)); then
+		usage
+	fi
+	"$VERB"
+	;;
+*) usage ;;
+esac
