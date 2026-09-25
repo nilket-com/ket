@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use nilket::local::{LocalOptions, run as run_local};
+use nilket::local::{LocalInitOptions, LocalOptions, init as init_local, run as run_local};
 
 fn main() -> ExitCode {
 	let mut args = std::env::args();
@@ -17,13 +17,26 @@ fn main() -> ExitCode {
 		}
 		Some("wendelon") => wendelon::cli::run("nilket wendelon", args),
 		Some("toron") => toron::cli::run("nilket toron", args),
-		Some("local") => match parse_local_options(args) {
-			Ok(options) => run_local(options),
-			Err(message) => {
-				eprintln!("{message}");
-				ExitCode::from(2)
+		Some("local") => {
+			let args: Vec<String> = args.collect();
+			if args.first().map(String::as_str) == Some("init") {
+				match parse_local_init_options(args.into_iter().skip(1)) {
+					Ok(options) => init_local(options),
+					Err(message) => {
+						eprintln!("{message}");
+						ExitCode::from(2)
+					}
+				}
+			} else {
+				match parse_local_options(args) {
+					Ok(options) => run_local(options),
+					Err(message) => {
+						eprintln!("{message}");
+						ExitCode::from(2)
+					}
+				}
 			}
-		},
+		}
 		Some(other) => {
 			eprintln!("unknown nilket command: {other}");
 			print_root_usage(&program);
@@ -74,9 +87,43 @@ where
 	Ok(LocalOptions { data_dir, reset })
 }
 
+fn parse_local_init_options<I>(args: I) -> Result<LocalInitOptions, String>
+where
+	I: IntoIterator<Item = String>,
+{
+	let args: Vec<_> = args.into_iter().collect();
+	let mut data_dir = None;
+	let mut index = 0;
+	while let Some(argument) = args.get(index) {
+		match argument.as_str() {
+			"--data-dir" => {
+				if data_dir.is_some() {
+					return Err(
+						"nilket local init --data-dir may be specified only once".to_owned()
+					);
+				}
+				let value = args
+					.get(index + 1)
+					.ok_or_else(|| "nilket local init --data-dir requires PATH".to_owned())?;
+				data_dir = Some(value.into());
+				index += 2;
+			}
+			flag if flag.starts_with('-') => {
+				return Err(format!("unknown nilket local init option: {flag}"));
+			}
+			other => {
+				return Err(format!(
+					"nilket local init does not accept positional argument: {other}"
+				));
+			}
+		}
+	}
+	Ok(LocalInitOptions { data_dir })
+}
+
 fn print_root_usage(program: &str) {
 	eprintln!(
-		"Usage: {program} [COMMAND]\n\nWith no arguments, start the foreground local Nilket deployment.\n\nCommands:\n  local       Start the local Wendelon + Toron deployment\n  wendelon    Start or manage a storage node\n  toron       Start or manage a compute node"
+		"Usage: {program} [COMMAND]\n\nWith no arguments, start the foreground local Nilket deployment.\n\nCommands:\n  local       Start the local Wendelon + Toron deployment\n  local init  Write the local profile's configs and development PKI, start nothing\n  wendelon    Start or manage a storage node\n  toron       Start or manage a compute node"
 	);
 }
 
@@ -100,5 +147,32 @@ mod tests {
 		);
 		assert!(parse_local_options(["--data-dir".to_owned()]).is_err());
 		assert!(parse_local_options(["toron".to_owned()]).is_err());
+	}
+
+	#[test]
+	fn local_init_options_take_only_a_data_dir() {
+		assert_eq!(
+			parse_local_init_options(["--data-dir".to_owned(), "/tmp/x".to_owned()]).unwrap(),
+			LocalInitOptions {
+				data_dir: Some("/tmp/x".into()),
+			}
+		);
+		assert_eq!(
+			parse_local_init_options(Vec::<String>::new()).unwrap(),
+			LocalInitOptions { data_dir: None }
+		);
+		// Replacing identities is `nilket local --reset`, never a side effect of init.
+		assert!(parse_local_init_options(["--reset".to_owned()]).is_err());
+		assert!(parse_local_init_options(["--data-dir".to_owned()]).is_err());
+		assert!(
+			parse_local_init_options([
+				"--data-dir".to_owned(),
+				"/a".to_owned(),
+				"--data-dir".to_owned(),
+				"/b".to_owned()
+			])
+			.is_err()
+		);
+		assert!(parse_local_init_options(["extra".to_owned()]).is_err());
 	}
 }

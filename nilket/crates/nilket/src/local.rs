@@ -44,6 +44,11 @@ pub struct LocalOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalInitOptions {
+	pub data_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalReady {
 	pub sql_endpoint: SocketAddr,
 	pub session_nonce: Uuid,
@@ -132,9 +137,7 @@ fn run_owned_with_requirements(
 		reset_locked_profile(&paths)?;
 	}
 	preflight_requirements(requirements).map_err(|conflict| conflict.to_string())?;
-	let marker = ensure_profile(&paths)?;
-	let pki = ensure_artifacts(&paths)?;
-	validate_artifacts(&paths)?;
+	let (marker, pki) = prepare_profile(&paths)?;
 	refuse_non_regular_artifact_if_present(&paths.runtime, "runtime manifest")?;
 	if paths.runtime.exists() {
 		fs::remove_file(&paths.runtime).map_err(|error| {
@@ -216,6 +219,54 @@ fn run_owned_with_requirements(
 	let _ = fs::remove_file(&paths.runtime);
 	drop(lock_file);
 	Ok(exit_code)
+}
+
+/// Write the profile's configuration and development PKI exactly as [`run`] does
+/// before it starts anything, then return without starting a role (ADR 0172).
+pub fn init(options: LocalInitOptions) -> ExitCode {
+	match init_owned(options) {
+		Ok(root) => {
+			eprintln!("nilket local init: profile {}", root.display());
+			eprintln!("nilket local init: development-only PKI; not production custody");
+			ExitCode::SUCCESS
+		}
+		Err(message) => {
+			eprintln!("nilket local init: {message}");
+			ExitCode::from(1)
+		}
+	}
+}
+
+fn init_owned(options: LocalInitOptions) -> Result<PathBuf, String> {
+	if !cfg!(target_os = "linux") {
+		return Err("the local profile currently supports Linux only".to_owned());
+	}
+	let paths = ProfilePaths::new(resolve_profile_root(options.data_dir.as_deref())?);
+	validate_profile_root_candidate(&paths)?;
+	prepare_root_for_lock(&paths.root)?;
+	let lock_file = open_lock(&paths.lock)?;
+	match lock_file.try_lock_exclusive() {
+		Ok(()) => {}
+		Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+			return Err(format!(
+				"profile {} is in use by a running deployment",
+				paths.root.display()
+			));
+		}
+		Err(error) => return Err(format!("failed to lock {}: {error}", paths.lock.display())),
+	}
+	prepare_profile(&paths)?;
+	drop(lock_file);
+	Ok(paths.root)
+}
+
+/// The profile artifacts both [`run`] and [`init`] require: marker, development
+/// PKI, and role configs, generated when absent and validated when retained.
+fn prepare_profile(paths: &ProfilePaths) -> Result<(ProfileMarker, DevelopmentPki), String> {
+	let marker = ensure_profile(paths)?;
+	let pki = ensure_artifacts(paths)?;
+	validate_artifacts(paths)?;
+	Ok((marker, pki))
 }
 
 fn prepare_root_for_lock(root: &Path) -> Result<(), String> {
@@ -930,6 +981,64 @@ mod tests {
 		assert_eq!(fs::read(&paths.toron_config).unwrap(), retained);
 		assert_eq!(marker.format_version, FORMAT_VERSION);
 		drop(lock);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn init_writes_the_profile_starts_nothing_and_retains_adjusted_configs() {
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
+		let root = fresh_root("init");
+		let paths = ProfilePaths::new(root.clone());
+		let options = LocalInitOptions {
+			data_dir: Some(root.clone()),
+		};
+		assert_eq!(init_owned(options.clone()).unwrap(), root);
+		validate_artifacts(&paths).unwrap();
+		assert!(paths.marker.exists());
+		assert!(
+			!paths.runtime.exists(),
+			"init must not publish a runtime manifest"
+		);
+		let lock = open_lock(&paths.lock).unwrap();
+		lock.try_lock_exclusive()
+			.expect("init releases the profile lock before returning");
+		drop(lock);
+
+		// A deployment derived from the profile (ADR 0172) adjusts the retained
+		// Toron config; re-running init validates it and changes nothing.
+		let generated = fs::read_to_string(&paths.toron_config).unwrap();
+		assert!(generated.contains("tenant_id = 0"));
+		let adjusted = generated.replacen("tenant_id = 0", "tenant_id = 1", 1);
+		fs::write(&paths.toron_config, &adjusted).unwrap();
+		let marker = fs::read(&paths.marker).unwrap();
+		let pki = fs::read(paths.pki_dir.join("node-ca.crt")).unwrap();
+		init_owned(options).unwrap();
+		assert_eq!(fs::read_to_string(&paths.toron_config).unwrap(), adjusted);
+		assert_eq!(fs::read(&paths.marker).unwrap(), marker);
+		assert_eq!(fs::read(paths.pki_dir.join("node-ca.crt")).unwrap(), pki);
+		let toron = toron::config::load_toron_bootstrap_config(&paths.toron_config).unwrap();
+		assert_eq!(toron.node.tenant_id.0, 1);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn init_refuses_a_profile_held_by_a_running_deployment() {
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
+		let root = fresh_root("init-held");
+		let paths = ProfilePaths::new(root.clone());
+		prepare_root_for_lock(&root).unwrap();
+		let holder = open_lock(&paths.lock).unwrap();
+		holder.lock_exclusive().unwrap();
+		let error = init_owned(LocalInitOptions {
+			data_dir: Some(root.clone()),
+		})
+		.unwrap_err();
+		assert!(error.contains("in use by a running deployment"), "{error}");
+		assert!(
+			!paths.marker.exists(),
+			"a refused init must not write the profile"
+		);
+		drop(holder);
 		fs::remove_dir_all(root).unwrap();
 	}
 
