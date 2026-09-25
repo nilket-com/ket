@@ -1,8 +1,9 @@
 # ADR 0172 implementation evidence
 
-Status: implemented on Apple silicon macOS on 2026-09-25, with the human
-Polariton connection-form check still **PENDING**. The Fedora CoreOS update
-check remains due when an update arrives, as the ADR's Limits require.
+Status: implemented and accepted on Apple silicon macOS on 2026-09-25,
+including the operator's connection through Polariton's form (acceptance 2).
+The Fedora CoreOS update check remains due when an update arrives, as the
+ADR's Limits require.
 
 The implementation is split across the Nilket offline-init commit
 `6892a9c0`, the arm64 `O_DIRECT` correction `76e284c7`, the Podman image
@@ -14,11 +15,12 @@ The latter is Bash and jq, with no Python tooling.
 1. **Established:** the Nilket SELinux domain and VM-derived seccomp profile
    passed the io_uring, direct-I/O, and fsync probes; each default-policy
    negative probe failed as expected.
-2. **Automated part established; human form check PENDING (operator):** a
-   fresh volume loaded 24 tenant-1 rows and returned all eight expected
-   sums. Native macOS Polariton `act` returned those sums through the same
-   connection operation the form uses. The operator still needs to enter
-   the five fields in the form and inspect the grid.
+2. **Established:** a fresh volume loaded 24 tenant-1 rows and returned
+   all eight expected sums. Native macOS Polariton `act` returned those sums
+   through the same connection operation the form uses. The operator then
+   typed the five fields into Polariton's Toron connection form on the Mac,
+   in a window with agents off, ran the cell, and confirmed the eight sums
+   in the rendered preview.
 3. **Established:** an untrusted client certificate and a wrong server name
    produced distinct authenticated-connection failures.
 4. **Established:** partial TLS fields and a mode-0644 client key were
@@ -102,9 +104,16 @@ notebook with `--agents`. `polariton act` connected to
 `127.0.0.1:7742` using the five values printed by the client script,
 then ran the notebook's SQL cell. The completed receipt had columns
 `period` (`i64`) and `value` (`f64`), eight rows with the sums above, and
-`truncated: false`. This is the automated repeatability proof. The
-operator must still enter the same five fields through Polariton's form
-and inspect the grid to complete ADR 0172 acceptance 2.
+`truncated: false`. This is the automated repeatability proof.
+
+The operator check followed on 2026-09-25. A first look used a window with
+`--agents`, where agent `connect` entered the values; that confirmed the
+displayed result but not the form. The operator then opened a window with
+agents off on a scratch copy of the same notebook, typed the five values
+into Polariton's Toron connection form, ran the cell, and viewed the result
+in the Markdown preview (`:mdpreview`). The sums matched. A cell's default
+`output=inline` renders only in that preview, not in the raw source view,
+which at first looked like a missing result.
 
 The same native connect operation gave distinct failure receipts: a bad
 server name said the listener certificate did not cover that name; a
