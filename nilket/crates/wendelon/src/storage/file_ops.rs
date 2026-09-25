@@ -12,9 +12,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Linux `O_DIRECT` flag. Shared across production storage paths so
-/// callers can request direct I/O without reaching into `libc`.
-pub const O_DIRECT: i32 = 0o0040000;
+/// Linux `O_DIRECT` flag for the target architecture. Shared across production
+/// storage paths so callers can request direct I/O without reaching into `libc`.
+/// Its value differs by architecture: x86_64's `0o40000` is `O_DIRECTORY` on
+/// aarch64, where opening a slab with it fails with `EINVAL`.
+pub const O_DIRECT: i32 = libc::O_DIRECT;
 
 #[derive(Clone)]
 pub struct FileHandle {
@@ -1094,6 +1096,14 @@ mod tests {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::sync::{Arc, Barrier};
 	use std::time::Duration;
+
+	#[test]
+	fn direct_io_flag_is_never_another_architectures_value() {
+		// x86_64's O_DIRECT is aarch64's O_DIRECTORY; a hard-coded value opened
+		// every slab as a directory on arm64 Linux.
+		assert_ne!(super::O_DIRECT, libc::O_DIRECTORY);
+		assert_ne!(super::O_DIRECT, 0);
+	}
 
 	#[tokio::test]
 	async fn isolated_blocking_executor_runs_tasks_in_parallel() {
