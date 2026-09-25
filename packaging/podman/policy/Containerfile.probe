@@ -1,0 +1,3 @@
+FROM registry.fedoraproject.org/fedora:44
+RUN dnf -y install fio nmap-ncat && dnf clean all
+USER 1000:1000

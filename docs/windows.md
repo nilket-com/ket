@@ -45,8 +45,10 @@ This selects the reduced head, `cargo build -p polariton --no-default-features`,
 with the locked dependencies and native target. A plain `cargo build -p
 polariton` also works: the default `toron-local` feature's local process
 supervision is Linux-only and compiles out here, leaving the remote `toron`
-client. Neither establishes Windows support for remote Toron
-connections.
+client. ADR 0165 later established authenticated remote Toron queries from
+native Windows Polariton against a Linux Toron on Bigfoot, with tenant-1 rows
+checked. Its separate human connection-form check remains pending; see
+[the implementation evidence](../plans/product/impl/0165_native_polariton_authenticates_to_a_linux_toron_evidence.md).
 
 For a plotting example that works without Toron, open
 `uat/native_plot_showcase.md` and run the cells in order on the scratch SQLite

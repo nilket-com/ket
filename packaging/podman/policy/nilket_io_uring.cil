@@ -1,0 +1,10 @@
+; Inherit the ordinary container and network rules from this host's udica
+; base and network templates.
+; Only the Nilket process type receives the io_uring permission. fio with
+; io_uring plus O_DIRECT on a named XFS volume needs all four permissions;
+; removing any of map, read, or write made the probe fail on Fedora CoreOS 44.
+(block nilket_container
+    (blockinherit container)
+    (blockinherit net_container)
+    (allow process io_uring_t (anon_inode (create map read write)))
+)
