@@ -1,0 +1,221 @@
+// Language popularity from the TIOBE index, fetched and plotted by this one
+// source.
+//
+// A top-level `main` makes this a local source: it runs in the window on
+// rnx and needs no Toron connection. TIOBE's index page embeds its long-term
+// chart as Highcharts series, one `{name : '...', data : [...]}` per
+// language with points `[Date.UTC(year, month, day), percent]`; JavaScript
+// months count from 0. The script reads those points and fails, naming what
+// it could not find, if the page changes shape.
+//
+// TIOBE rates languages by search-engine hits, not by use. The panes say
+// so, and name the month.
+
+const INDEX = "https://www.tiobe.com/tiobe-index/";
+const DATES = #{date: "date"};
+const PALETTE = "reds_rC";
+const SKIN = "greys_rs1";
+// Rust first everywhere: the palette samples by position, so it keeps one colour.
+const SHARE = ["Rust", "Python", "Java", "C", "C++"];
+const GROWTH = ["Rust", "Python", "Java"];
+
+fn ymd(date) {
+	let parts = [];
+	for part in date.split("-") {
+		parts.push(std::i64::parse(part)?);
+	}
+	Ok(parts)
+}
+
+fn pad(n) {
+	if n < 10 { `0${n}` } else { `${n}` }
+}
+
+fn iso(year, month, day) {
+	`${year}-${pad(month)}-${pad(day)}`
+}
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// "2026-09-03" -> "Sep 2026".
+fn month_name(date) {
+	let parts = [];
+	for part in date.split("-") {
+		parts.push(part);
+	}
+	Ok(`${MONTHS[std::i64::parse(parts[1])? - 1]} ${parts[0]}`)
+}
+
+// The text after the first occurrence of `marker`, or an error naming it.
+fn after(text, marker, what) {
+	match text.split_once(marker) {
+		Some((_, rest)) => Ok(rest),
+		None => Err(`TIOBE page has no ${what} (looked for "${marker}")`),
+	}
+}
+
+// One series' points, [[iso date, percent], ...] in page order, from text
+// such as `[Date.UTC(2001, 5, 30), 1.25], [Date.UTC(2001, 6, 30), 1.13]`.
+fn points(data) {
+	let out = [];
+	let first = true;
+	for chunk in data.split("[Date.UTC(") {
+		if first {
+			first = false;
+			continue;
+		}
+		let (date, rest) = match chunk.split_once(")") {
+			Some(pair) => pair,
+			None => return Err(`TIOBE point without a closing parenthesis: ${chunk}`),
+		};
+		let ymd = [];
+		for part in date.split(",") {
+			ymd.push(std::i64::parse(part.trim())?);
+		}
+		// rest: ", 1.25], " — the value sits between the comma and the bracket.
+		let value = match rest.split_once(",") {
+			Some((_, tail)) => tail.split("]").next().unwrap().trim(),
+			None => return Err(`TIOBE point without a value: ${chunk}`),
+		};
+		// JavaScript months count from 0.
+		out.push([iso(ymd[0], ymd[1] + 1, ymd[2]), std::f64::parse(value)?]);
+	}
+	Ok(out)
+}
+
+// Every language in the page's long-term chart: #{name: [[date, percent]]}.
+async fn fetch_index() {
+	let response = http::request("GET", INDEX, #{headers: #{"user-agent": "curl/8.5"}}).await?;
+	if response.status != 200 {
+		return Err(`TIOBE index: HTTP ${response.status}`);
+	}
+	let series = after(response.body, "series: [", "long-term chart series")?;
+	let languages = #{};
+	let first = true;
+	for block in series.split("{name : '") {
+		if first {
+			first = false;
+			continue;
+		}
+		let name = block.split("'").next().unwrap();
+		let data = after(block, "data : [", `data for ${name}`)?;
+		let data = data.split("]}").next().unwrap();
+		languages[name] = points(data)?;
+	}
+	Ok(languages)
+}
+
+fn series_of(languages, name) {
+	match languages.get(name) {
+		Some(points) if points.len() > 0 => Ok(points),
+		_ => Err(`TIOBE's long-term chart has no series for ${name}`),
+	}
+}
+
+// The value on or before `date`, or ().
+fn value_on_or_before(points, date) {
+	let found = ();
+	for point in points {
+		if point[0] <= date {
+			found = point[1];
+		}
+	}
+	found
+}
+
+// Long rows for one frame, optionally divided by each series' value at `base`.
+fn rows(languages, names, since, base) {
+	let out = [];
+	for name in names {
+		let points = series_of(languages, name)?;
+		let divisor = if base is String { value_on_or_before(points, base) } else { 1.0 };
+		if !(divisor is f64) || divisor <= 0.0 {
+			return Err(`${name} has no TIOBE value on or before ${base}`);
+		}
+		for point in points {
+			if point[0] >= since {
+				out.push(#{date: point[0], value: point[1] / divisor, language: name});
+			}
+		}
+	}
+	Ok(out)
+}
+
+pub async fn main(workspace, viz) {
+	let languages = fetch_index().await?;
+
+	let python = series_of(languages, "Python")?;
+	let latest = python[python.len() - 1][0];
+	let [year, month, day] = ymd(latest)?;
+	let as_of = month_name(latest)?;
+	let source = `TIOBE Programming Community Index (search-engine ratings), ${as_of}`;
+
+	// Python's peak, stated rather than implied.
+	let peak = python[0];
+	for point in python {
+		if point[1] > peak[1] {
+			peak = point;
+		}
+	}
+	let last = |name| {
+		let points = series_of(languages, name)?;
+		Ok(points[points.len() - 1][1])
+	};
+	let headline = `Python ${last("Python")?}% (peak ${peak[1]}%, ${month_name(peak[0])?}) · Java ${last("Java")?}% · Rust ${last("Rust")?}%`;
+
+	let share = viz.frame_typed("share", rows(languages, SHARE, "0000", ())?, DATES)?;
+	share.views([
+		view("Share of the index", figure([
+			title("Share of the TIOBE index, %"),
+			subtitle(headline),
+			skin(SKIN),
+			palette(PALETTE),
+			x_axis().label("Month").tick_every("5 years"),
+			y_axis().label("Rating, %").tick_step(5),
+			line("date", "value", "language"),
+		])),
+	])?;
+
+	let ten_years = iso(year - 10, month, day);
+	let growth = viz.frame_typed("growth", rows(languages, GROWTH, ten_years, ten_years)?, DATES)?;
+	growth.views([
+		view("Growth over ten years", figure([
+			title(`Growth since ${month_name(ten_years)?} (= 1×)`),
+			subtitle(source),
+			skin(SKIN),
+			palette(PALETTE),
+			x_axis().label("Month").tick_every("2 years"),
+			y_axis().label("Rating relative to start").tick_step(1),
+			line("date", "value", "language"),
+		])),
+	])?;
+
+	let rust = viz.frame_typed("rust", rows(languages, ["Rust"], "0000", ())?, DATES)?;
+	rust.views([
+		view("Rust", figure([
+			title("Rust, % of the index"),
+			subtitle(source),
+			skin(SKIN),
+			palette(PALETTE),
+			x_axis().label("Month").tick_every("4 years"),
+			y_axis().label("Rating, %").tick_step(0.2),
+			line("date", "value", "language"),
+		])),
+	])?;
+
+	let two_years = iso(year - 2, month, day);
+	let recent = viz.frame_typed("recent", rows(languages, GROWTH, two_years, two_years)?, DATES)?;
+	recent.views([
+		view("The last two years", figure([
+			title(`Since ${month_name(two_years)?} (= 1×)`),
+			subtitle(source),
+			skin(SKIN),
+			palette(PALETTE),
+			x_axis().label("Month").tick_every("6 months"),
+			y_axis().label("Rating relative to start").tick_step(0.1),
+			line("date", "value", "language"),
+		])),
+	])?;
+
+	Ok(`${languages.len()} TIOBE series through ${as_of}`)
+}

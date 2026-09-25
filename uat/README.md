@@ -51,6 +51,27 @@ so the faceted panels can expose a quarter-assignment defect.
 input. Keep this repository copy authoritative; files in a neighboring `uat`
 directory are local conveniences and are not build inputs.
 
+Two local sources (ADR 0171) fetch their own data over HTTP and need no seed
+and no Toron connection; each declares `pub async fn main(workspace, viz)`
+and draws its panes with `frame.views([view(..., figure([...]))])`. Open one
+and run it, or drive it:
+
+```sh
+cargo run -p polariton -- uat/treasury_rates.rn
+polariton drive --execute by-command uat/treasury_rates.rn --commands <run_source, describe, publish> --receipt <file>
+```
+
+`treasury_rates.rn` reads daily Treasury closes from FRED (H.15) and plots
+yields by maturity, the 10-year split into real yield and breakeven, the
+curve now against three and twelve months earlier, and the 10-year's daily
+change. `tiobe_languages.rn` reads the long-term chart embedded in the TIOBE
+index page and plots each language's share since 2001, growth over ten
+years and over two years indexed to their start, and Rust on its own scale.
+TIOBE rates languages by search-engine hits, not by use, and the panes say
+so. Both need network access; the TIOBE script depends on the page's
+embedded chart format and stops with an error naming what it could not find
+if that changes.
+
 Open the semantic Trends & relationships showcase with its purpose-built seed:
 
 ```sh
