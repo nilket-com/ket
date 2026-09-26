@@ -23,6 +23,8 @@ mod live;
 #[cfg(toron_local)]
 #[path = "../src/local_workspace.rs"]
 mod local_workspace;
+#[path = "../src/mcp/mod.rs"]
+mod mcp;
 #[path = "../src/plot/mod.rs"]
 mod plot;
 #[path = "../src/presentation_registry.rs"]

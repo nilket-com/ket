@@ -101,7 +101,22 @@ async fn connect(
 	let windows =
 		discover(&runtime_directory().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
 	let window = select(&windows, selector)?;
-	let socket = open_stream(&window).await?;
+	connect_window(&window, false).await
+}
+
+/// Connect to an already selected identity. MCP pins this advertisement once;
+/// it must never repeat discovery and accidentally target another window.
+async fn connect_window(
+	window: &super::discovery::Advertisement,
+	bounded_connect: bool,
+) -> Result<(tokio::io::BufReader<ClientStream>, Event), String> {
+	let socket = if bounded_connect {
+		tokio::time::timeout(std::time::Duration::from_secs(5), open_stream(window))
+			.await
+			.map_err(|_| "window connection timed out")??
+	} else {
+		open_stream(window).await?
+	};
 	let mut reader = tokio::io::BufReader::new(socket);
 	let first = tokio::time::timeout(
 		std::time::Duration::from_secs(5),
@@ -120,6 +135,46 @@ async fn connect(
 		_ => return Err("window identity changed during connection; discover again".into()),
 	}
 	Ok((reader, welcome))
+}
+
+/// Shared asynchronous client used by the MCP binding, with no application
+/// ownership. All command framing and terminal/unknown handling is the CLI's.
+pub(crate) struct Connection {
+	reader: tokio::io::BufReader<ClientStream>,
+}
+
+impl Connection {
+	pub(crate) async fn open(window: &super::discovery::Advertisement) -> Result<Self, String> {
+		let (reader, _) = connect_window(window, true).await?;
+		Ok(Self { reader })
+	}
+
+	pub(crate) async fn command(&mut self, bytes: Vec<u8>) -> Event {
+		let mut answer = None;
+		let _ = drive_connection_with_write_bound(
+			&mut self.reader,
+			&[bytes],
+			Some(std::time::Duration::from_secs(5)),
+			|event| {
+				if event.is_final() || matches!(event, Event::Unknown { .. }) {
+					answer = Some(event.clone());
+				}
+				Ok(())
+			},
+		)
+		.await;
+		// One command and an infallible output callback: the shared driver emits
+		// either its terminal event or Unknown carrying the observed applied bit.
+		answer.expect("the command driver always emits a terminal event or unknown")
+	}
+
+	pub(crate) async fn next(&mut self) -> Result<Option<Event>, String> {
+		super::transport::read_line(&mut self.reader, usize::MAX)
+			.await
+			.map_err(|error| error.to_string())?
+			.map(|line| super::decode(&line))
+			.transpose()
+	}
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime, String> {
@@ -215,6 +270,18 @@ pub(crate) fn act(selector: &Selector, commands: &std::path::Path) -> Result<(),
 async fn drive_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 	reader: &mut tokio::io::BufReader<S>,
 	lines: &[Vec<u8>],
+	output: impl FnMut(&Event) -> Result<(), String>,
+) -> Result<(), String> {
+	// Preserve the CLI's write behaviour; only the MCP client adds a bound.
+	drive_connection_with_write_bound(reader, lines, None, output).await
+}
+
+async fn drive_connection_with_write_bound<
+	S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+>(
+	reader: &mut tokio::io::BufReader<S>,
+	lines: &[Vec<u8>],
+	write_bound: Option<std::time::Duration>,
 	mut output: impl FnMut(&Event) -> Result<(), String>,
 ) -> Result<(), String> {
 	use tokio::io::AsyncWriteExt;
@@ -223,11 +290,14 @@ async fn drive_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpi
 		let id = i as u64 + 1;
 		let mut applied = false;
 		let result: Result<(), String> = async {
-			reader
-				.get_mut()
-				.write_all(bytes)
-				.await
-				.map_err(|e| e.to_string())?;
+			let write = reader.get_mut().write_all(bytes);
+			match write_bound {
+				Some(bound) => tokio::time::timeout(bound, write)
+					.await
+					.map_err(|_| "window command write timed out".to_owned())?,
+				None => write.await,
+			}
+			.map_err(|e| e.to_string())?;
 			loop {
 				let line = super::transport::read_line(reader, usize::MAX)
 					.await
@@ -306,6 +376,39 @@ mod tests {
 	use super::*;
 	use crate::driver::{Command, CommandReceipt, FigureRef};
 	use tokio::io::{AsyncWriteExt, BufReader};
+
+	#[tokio::test]
+	async fn adr_0173_partial_write_timeout_is_unknown_and_not_replayed() {
+		use tokio::io::AsyncReadExt;
+		let (client, mut server) = tokio::io::duplex(8);
+		let bytes = super::super::encode(&super::super::Request {
+			id: 1,
+			command: Command::Describe {},
+		})
+		.unwrap();
+		assert!(bytes.len() > 8);
+		let mut reader = BufReader::new(client);
+		let mut events = Vec::new();
+		let result = drive_connection_with_write_bound(
+			&mut reader,
+			&[bytes.clone()],
+			Some(std::time::Duration::from_millis(20)),
+			|event| {
+				events.push(event.clone());
+				Ok(())
+			},
+		)
+		.await;
+		assert!(result.is_err());
+		assert!(
+			matches!(&events[..], [Event::Unknown { id: 1, applied: false, reason }]
+			if reason == "window command write timed out")
+		);
+		drop(reader);
+		let mut delivered = Vec::new();
+		server.read_to_end(&mut delivered).await.unwrap();
+		assert_eq!(delivered, bytes[..8]);
+	}
 
 	/// ADR 0166 §4, acceptance 4: a client refuses a pipe whose server is
 	/// not the advertised process, before sending a byte; the advertised

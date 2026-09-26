@@ -1,0 +1,95 @@
+{
+  "binaries": {
+    "Running unittests src/main.rs (target/debug/deps/polariton-c7681fbceefcbf14)": [
+      1399,
+      0,
+      26
+    ],
+    "Running tests/architecture_test.rs (target/debug/deps/architecture_test-6ca6849e767fea15)": [
+      129,
+      0,
+      0
+    ],
+    "Running tests/boxplot_tukey_ui.rs (target/debug/deps/boxplot_tukey_ui-dcf7423ccbbb2865)": [
+      1,
+      0,
+      0
+    ],
+    "Running tests/bubble_observations_ui.rs (target/debug/deps/bubble_observations_ui-42227b62f6e594f6)": [
+      1,
+      0,
+      0
+    ],
+    "Running tests/coordinate_spaces_ui.rs (target/debug/deps/coordinate_spaces_ui-d723d404824f7292)": [
+      1,
+      0,
+      0
+    ],
+    "Running tests/funnel_stages_ui.rs (target/debug/deps/funnel_stages_ui-a32bef7eedf9360e)": [
+      1,
+      0,
+      0
+    ],
+    "Running tests/gradient_stops_ui.rs (target/debug/deps/gradient_stops_ui-95e3ae57c0010bc3)": [
+      1,
+      0,
+      0
+    ],
+    "Running tests/heatmap_cells_ui.rs (target/debug/deps/heatmap_cells_ui-b485758815bfed74)": [
+      1,
+      0,
+      0
+    ],
+    "Running tests/hexbin_observations_ui.rs (target/debug/deps/hexbin_observations_ui-d48cb4acab8894a8)": [
+      1,
+      0,
+      0
+    ],
+    "Running tests/histogram_bins_ui.rs (target/debug/deps/histogram_bins_ui-b601f106b16c200b)": [
+      1,
+      0,
+      0
+    ],
+    "Running tests/multivariate_rows_ui.rs (target/debug/deps/multivariate_rows_ui-bd094768ef74fd96)": [
+      1,
+      0,
+      0
+    ],
+    "Running tests/pie_slices_ui.rs (target/debug/deps/pie_slices_ui-06de48ecb933c386)": [
+      1,
+      0,
+      0
+    ],
+    "Running tests/product_0073_session_discovery.rs (target/debug/deps/product_0073_session_discovery-87f32e2b26a20198)": [
+      1,
+      0,
+      0
+    ],
+    "Running tests/product_0152_temporal_literal.rs (target/debug/deps/product_0152_temporal_literal-db6241cff3aa535a)": [
+      1,
+      0,
+      0
+    ],
+    "Running tests/product_0155_boa_probe.rs (target/debug/deps/product_0155_boa_probe-c9b05d62d781bd2f)": [
+      1,
+      0,
+      0
+    ],
+    "Running tests/radial_dial_readings_ui.rs (target/debug/deps/radial_dial_readings_ui-a2d35a286543ac9e)": [
+      1,
+      0,
+      0
+    ],
+    "Running tests/result_artifact_ui.rs (target/debug/deps/result_artifact_ui-380f69424c3f95fa)": [
+      1,
+      0,
+      0
+    ]
+  },
+  "totals": [
+    1543,
+    0,
+    26
+  ],
+  "note": "Nested helper subprocess summaries are excluded; the final summary for each binary is counted."
+}

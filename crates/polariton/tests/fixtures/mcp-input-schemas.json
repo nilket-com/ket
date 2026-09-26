@@ -1,0 +1,1031 @@
+{
+  "connect": {
+    "additionalProperties": false,
+    "properties": {
+      "adapter": {
+        "description": "Adapter identifier from the connection form, such as sqlite.",
+        "type": "string"
+      },
+      "fields": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "default": {},
+        "description": "Connection form field names and values for this adapter; defaults to an empty object.",
+        "type": "object"
+      },
+      "name": {
+        "default": "",
+        "description": "Connection display name; defaults to empty.",
+        "type": "string"
+      },
+      "window": {
+        "description": "Advertised 32-character window ID from windows. Omit only when exactly one window is advertised; it is resolved once, never retargeted.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "adapter"
+    ],
+    "type": "object"
+  },
+  "connection_status": {
+    "additionalProperties": false,
+    "properties": {
+      "window": {
+        "description": "Advertised 32-character window ID from windows. Omit only when exactly one window is advertised; it is resolved once, never retargeted.",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "describe": {
+    "additionalProperties": false,
+    "properties": {
+      "window": {
+        "description": "Advertised 32-character window ID from windows. Omit only when exactly one window is advertised; it is resolved once, never retargeted.",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "describe_notebook": {
+    "additionalProperties": false,
+    "properties": {
+      "buffer": {
+        "default": null,
+        "description": "Optional notebook buffer ID from describe_notebook; omission selects the active notebook.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "window": {
+        "description": "Advertised 32-character window ID from windows. Omit only when exactly one window is advertised; it is resolved once, never retargeted.",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "disconnect": {
+    "additionalProperties": false,
+    "properties": {
+      "generation": {
+        "description": "Exact connection generation from connection_status; prevents disconnecting a replacement connection.",
+        "format": "uint64",
+        "maximum": 18446744073709551615,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "window": {
+        "description": "Advertised 32-character window ID from windows. Omit only when exactly one window is advertised; it is resolved once, never retargeted.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "generation"
+    ],
+    "type": "object"
+  },
+  "drive": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "commands": {
+        "description": "Existing wire commands, e.g. [{\"run_source\":{}},{\"describe\":{}}]. Paths inside commands also resolve against the server cwd.",
+        "items": {
+          "description": "PRODUCT-0158 §3 and §4: the verbs. Each is the GUI's own action.",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "describe": {
+                  "additionalProperties": false,
+                  "type": "object"
+                }
+              },
+              "required": [
+                "describe"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "describe_notebook": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "buffer": {
+                      "default": null,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "required": [
+                "describe_notebook"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "open_data": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "open_data"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "replace_cell": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "source": {
+                      "type": "string"
+                    },
+                    "target": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "buffer": {
+                          "description": "Notebook buffer ID returned by describe_notebook.",
+                          "type": "string"
+                        },
+                        "cell": {
+                          "description": "Cell ordinal returned by describe_notebook.",
+                          "format": "uint32",
+                          "maximum": 4294967295,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "generation": {
+                          "description": "Exact document generation returned by describe_notebook.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "buffer",
+                        "generation",
+                        "cell"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "target",
+                    "source"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "replace_cell"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "run_cell": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "target": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "buffer": {
+                          "description": "Notebook buffer ID returned by describe_notebook.",
+                          "type": "string"
+                        },
+                        "cell": {
+                          "description": "Cell ordinal returned by describe_notebook.",
+                          "format": "uint32",
+                          "maximum": 4294967295,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "generation": {
+                          "description": "Exact document generation returned by describe_notebook.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "buffer",
+                        "generation",
+                        "cell"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "target"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "run_cell"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "hide": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "figure": {
+                      "description": "PRODUCT-0158 §3: how a command names a figure. An incarnation token is\nwhat a describe reported and is refused once the figure is replaced; a\nview name is the authored identity, resolved to whatever incarnation\nstands in its pane when the command runs, so a script written before the\napplication ran can still address its figures. Either way the receipt\nnames the incarnation acted on.",
+                      "oneOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "incarnation": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "incarnation"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "view": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "view"
+                          ],
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    "series": {
+                      "format": "uint32",
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "figure",
+                    "series"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "hide"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "show": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "figure": {
+                      "description": "PRODUCT-0158 §3: how a command names a figure. An incarnation token is\nwhat a describe reported and is refused once the figure is replaced; a\nview name is the authored identity, resolved to whatever incarnation\nstands in its pane when the command runs, so a script written before the\napplication ran can still address its figures. Either way the receipt\nnames the incarnation acted on.",
+                      "oneOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "incarnation": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "incarnation"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "view": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "view"
+                          ],
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    "series": {
+                      "format": "uint32",
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "figure",
+                    "series"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "show"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "isolate": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "figure": {
+                      "description": "PRODUCT-0158 §3: how a command names a figure. An incarnation token is\nwhat a describe reported and is refused once the figure is replaced; a\nview name is the authored identity, resolved to whatever incarnation\nstands in its pane when the command runs, so a script written before the\napplication ran can still address its figures. Either way the receipt\nnames the incarnation acted on.",
+                      "oneOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "incarnation": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "incarnation"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "view": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "view"
+                          ],
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    "series": {
+                      "format": "uint32",
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "figure",
+                    "series"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "isolate"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "restore": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "figure": {
+                      "description": "PRODUCT-0158 §3: how a command names a figure. An incarnation token is\nwhat a describe reported and is refused once the figure is replaced; a\nview name is the authored identity, resolved to whatever incarnation\nstands in its pane when the command runs, so a script written before the\napplication ran can still address its figures. Either way the receipt\nnames the incarnation acted on.",
+                      "oneOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "incarnation": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "incarnation"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "view": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "view"
+                          ],
+                          "type": "object"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "figure"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "restore"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "resize": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "figure": {
+                      "description": "PRODUCT-0158 §3: how a command names a figure. An incarnation token is\nwhat a describe reported and is refused once the figure is replaced; a\nview name is the authored identity, resolved to whatever incarnation\nstands in its pane when the command runs, so a script written before the\napplication ran can still address its figures. Either way the receipt\nnames the incarnation acted on.",
+                      "oneOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "incarnation": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "incarnation"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "view": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "view"
+                          ],
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    "height": {
+                      "format": "float",
+                      "type": "number"
+                    },
+                    "width": {
+                      "format": "float",
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "figure",
+                    "width",
+                    "height"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "resize"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "publish": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "directory": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "directory"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "publish"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "ADR 0166: connect the window's external adapter through the same\noperation the connection form uses. `fields` are the form's fields.",
+              "properties": {
+                "connect": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "adapter": {
+                      "type": "string"
+                    },
+                    "fields": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "default": {},
+                      "type": "object"
+                    },
+                    "name": {
+                      "default": "",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "adapter"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "connect"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "Tear down the external adapter connection named by `generation`; a\nsuperseded generation is refused, never applied to its replacement.",
+              "properties": {
+                "disconnect": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "generation": {
+                      "format": "uint64",
+                      "maximum": 18446744073709551615,
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "generation"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "disconnect"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "connection_status": {
+                  "additionalProperties": false,
+                  "type": "object"
+                }
+              },
+              "required": [
+                "connection_status"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "ADR 0169: execute the open Rune source against the window's current\nconnection; one execution, identified and completed on its own terms.",
+              "properties": {
+                "run_source": {
+                  "additionalProperties": false,
+                  "type": "object"
+                }
+              },
+              "required": [
+                "run_source"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "type": "array"
+      },
+      "execution": {
+        "description": "Explicit execution mode: by-command runs only at run_source; on-open runs the source before commands.",
+        "oneOf": [
+          {
+            "const": "on-open",
+            "description": "PRODUCT-0158's documented behavior: run after opening, before the\nfirst command.",
+            "type": "string"
+          },
+          {
+            "const": "by-command",
+            "description": "Open only; the source runs where the script says `run_source`.",
+            "type": "string"
+          }
+        ]
+      },
+      "source": {
+        "description": "Rune source file. Relative paths resolve against the MCP server cwd.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "source",
+      "commands",
+      "execution"
+    ],
+    "title": "DriveArgs",
+    "type": "object"
+  },
+  "hide": {
+    "additionalProperties": false,
+    "properties": {
+      "figure": {
+        "description": "A stable authored view name, e.g. {\"view\":\"Yields by maturity\"}, or an exact token returned by describe, e.g. {\"incarnation\":\"42\"}.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "incarnation": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "incarnation"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "view": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "view"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "series": {
+        "description": "Series ordinal from describe's series table.",
+        "format": "uint32",
+        "maximum": 4294967295,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "window": {
+        "description": "Advertised 32-character window ID from windows. Omit only when exactly one window is advertised; it is resolved once, never retargeted.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "figure",
+      "series"
+    ],
+    "type": "object"
+  },
+  "isolate": {
+    "additionalProperties": false,
+    "properties": {
+      "figure": {
+        "description": "A stable authored view name, e.g. {\"view\":\"Yields by maturity\"}, or an exact token returned by describe, e.g. {\"incarnation\":\"42\"}.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "incarnation": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "incarnation"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "view": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "view"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "series": {
+        "description": "Series ordinal from describe's series table.",
+        "format": "uint32",
+        "maximum": 4294967295,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "window": {
+        "description": "Advertised 32-character window ID from windows. Omit only when exactly one window is advertised; it is resolved once, never retargeted.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "figure",
+      "series"
+    ],
+    "type": "object"
+  },
+  "open_data": {
+    "additionalProperties": false,
+    "properties": {
+      "path": {
+        "description": "Data file path; relative to the window process working directory.",
+        "type": "string"
+      },
+      "window": {
+        "description": "Advertised 32-character window ID from windows. Omit only when exactly one window is advertised; it is resolved once, never retargeted.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "path"
+    ],
+    "type": "object"
+  },
+  "publish": {
+    "additionalProperties": false,
+    "properties": {
+      "directory": {
+        "description": "Output package directory; relative to the window process working directory.",
+        "type": "string"
+      },
+      "window": {
+        "description": "Advertised 32-character window ID from windows. Omit only when exactly one window is advertised; it is resolved once, never retargeted.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "directory"
+    ],
+    "type": "object"
+  },
+  "replace_cell": {
+    "additionalProperties": false,
+    "properties": {
+      "source": {
+        "description": "Replacement cell source text.",
+        "type": "string"
+      },
+      "target": {
+        "additionalProperties": false,
+        "description": "Cell address from describe_notebook: buffer, document generation, and cell ordinal.",
+        "properties": {
+          "buffer": {
+            "description": "Notebook buffer ID returned by describe_notebook.",
+            "type": "string"
+          },
+          "cell": {
+            "description": "Cell ordinal returned by describe_notebook.",
+            "format": "uint32",
+            "maximum": 4294967295,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "generation": {
+            "description": "Exact document generation returned by describe_notebook.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "buffer",
+          "generation",
+          "cell"
+        ],
+        "type": "object"
+      },
+      "window": {
+        "description": "Advertised 32-character window ID from windows. Omit only when exactly one window is advertised; it is resolved once, never retargeted.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "target",
+      "source"
+    ],
+    "type": "object"
+  },
+  "resize": {
+    "additionalProperties": false,
+    "properties": {
+      "figure": {
+        "description": "A stable authored view name, e.g. {\"view\":\"Yields by maturity\"}, or an exact token returned by describe, e.g. {\"incarnation\":\"42\"}.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "incarnation": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "incarnation"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "view": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "view"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "height": {
+        "description": "Requested plot area height in pixels.",
+        "format": "float",
+        "type": "number"
+      },
+      "width": {
+        "description": "Requested plot area width in pixels.",
+        "format": "float",
+        "type": "number"
+      },
+      "window": {
+        "description": "Advertised 32-character window ID from windows. Omit only when exactly one window is advertised; it is resolved once, never retargeted.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "figure",
+      "width",
+      "height"
+    ],
+    "type": "object"
+  },
+  "restore": {
+    "additionalProperties": false,
+    "properties": {
+      "figure": {
+        "description": "A stable authored view name, e.g. {\"view\":\"Yields by maturity\"}, or an exact token returned by describe, e.g. {\"incarnation\":\"42\"}.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "incarnation": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "incarnation"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "view": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "view"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "window": {
+        "description": "Advertised 32-character window ID from windows. Omit only when exactly one window is advertised; it is resolved once, never retargeted.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "figure"
+    ],
+    "type": "object"
+  },
+  "run_cell": {
+    "additionalProperties": false,
+    "properties": {
+      "target": {
+        "additionalProperties": false,
+        "description": "Cell address from describe_notebook: buffer, document generation, and cell ordinal.",
+        "properties": {
+          "buffer": {
+            "description": "Notebook buffer ID returned by describe_notebook.",
+            "type": "string"
+          },
+          "cell": {
+            "description": "Cell ordinal returned by describe_notebook.",
+            "format": "uint32",
+            "maximum": 4294967295,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "generation": {
+            "description": "Exact document generation returned by describe_notebook.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "buffer",
+          "generation",
+          "cell"
+        ],
+        "type": "object"
+      },
+      "window": {
+        "description": "Advertised 32-character window ID from windows. Omit only when exactly one window is advertised; it is resolved once, never retargeted.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "target"
+    ],
+    "type": "object"
+  },
+  "run_source": {
+    "additionalProperties": false,
+    "properties": {
+      "window": {
+        "description": "Advertised 32-character window ID from windows. Omit only when exactly one window is advertised; it is resolved once, never retargeted.",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "show": {
+    "additionalProperties": false,
+    "properties": {
+      "figure": {
+        "description": "A stable authored view name, e.g. {\"view\":\"Yields by maturity\"}, or an exact token returned by describe, e.g. {\"incarnation\":\"42\"}.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "incarnation": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "incarnation"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "view": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "view"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "series": {
+        "description": "Series ordinal from describe's series table.",
+        "format": "uint32",
+        "maximum": 4294967295,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "window": {
+        "description": "Advertised 32-character window ID from windows. Omit only when exactly one window is advertised; it is resolved once, never retargeted.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "figure",
+      "series"
+    ],
+    "type": "object"
+  },
+  "windows": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  }
+}

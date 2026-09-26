@@ -59,6 +59,12 @@ rune.workspace = true
 rustls = { version = "0.23.37", default-features = false, features = ["ring", "std", "tls12"] }
 serde.workspace = true
 serde_json = { workspace = true, features = ["float_roundtrip"] }
+# ADR 0173: stdio MCP protocol and schemas; no HTTP/auth transports.
+rmcp = { version = "=3.4.1", default-features = false, features = ["server", "transport-io"] }
+schemars = "1.2.1"
+jsonschema = { version = "0.58.0", default-features = false }
+tokio-util = { version = "0.7", features = ["rt"] }
+tempfile = "3"
 sha2.workspace = true
 hyper = { version = "1.10.1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }

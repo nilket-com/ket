@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "polariton": {
+      "type": "stdio",
+      "command": "/home/me/work/ket/target/debug/polariton",
+      "args": ["mcp"],
+      "env": { "XDG_RUNTIME_DIR": "/run/user/1003" }
+    }
+  }
+}

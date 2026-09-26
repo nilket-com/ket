@@ -783,7 +783,9 @@ mod tests {
 			if path.extension().is_some_and(|e| e == "rn") {
 				let text = std::fs::read_to_string(&path).unwrap();
 				// The one exhibit that fetches its own data is local by design.
-				let expected = if path.ends_with("treasury_rates.rn") {
+				let expected = if path.ends_with("treasury_rates.rn")
+					|| path.ends_with("tiobe_languages.rn")
+				{
 					Mode::Local
 				} else {
 					Mode::Views

@@ -1,0 +1,3204 @@
+{
+  "commands": [
+    {
+      "command": {
+        "run_source": {}
+      },
+      "execution": {
+        "buffer": "2",
+        "connection_generation": 0,
+        "generation": "1",
+        "id": 1
+      },
+      "figures": [
+        {
+          "figure": "1",
+          "live": {
+            "hidden": [],
+            "size": {
+              "height": 190.0,
+              "width": 462.40002
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "height": 190.0,
+              "width": 462.40002
+            }
+          },
+          "pane": 9223372036854775808,
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 150.0,
+                    "y1": 175.0
+                  },
+                  {
+                    "series": 1,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 175.0,
+                    "y1": 200.0
+                  },
+                  {
+                    "series": 2,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 200.0,
+                    "y1": 225.0
+                  },
+                  {
+                    "series": 3,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 225.0,
+                    "y1": 250.0
+                  }
+                ],
+                "x0": 292.4000244140625,
+                "x1": 462.4000244140625,
+                "y0": 140.0,
+                "y1": 260.0
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "3M",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "3M"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "2Y",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "2Y"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "10Y",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "10Y"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "30Y",
+                  "ordinal": 3,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "30Y"
+                  }
+                }
+              ],
+              "viewbox": [
+                462.4000244140625,
+                190.0
+              ]
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 80.0
+            },
+            "Categorical palette": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Diverging ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "BlueWhiteRed"
+            },
+            "Duotone skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": false
+            },
+            "Facet label size": {
+              "provenance": "default",
+              "section": "Facet",
+              "value": 16.0
+            },
+            "Hover text size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 16.0
+            },
+            "Left": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 100.0
+            },
+            "Position": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "Right": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 20.0
+            },
+            "Sequential ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "greys_rs1"
+            },
+            "Subtitle": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "10Y 5.18%, +7 bp on 2026-09-24 \u00b7 FRED H.15"
+            },
+            "Subtitle size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 20.0
+            },
+            "Text size": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": 14.0
+            },
+            "Title": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Yields by maturity, %"
+            },
+            "Title size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 28.0
+            },
+            "Top": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 50.0
+            },
+            "Visible": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "X bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "X label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Date"
+            },
+            "X label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "X minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "X tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "X tick rotation": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 30.0
+            },
+            "X tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "X tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "Y bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "Y label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Yield, %"
+            },
+            "Y label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "Y minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "Y tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "Y tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "Y tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            }
+          },
+          "size": {
+            "height": 190.0,
+            "width": 462.40002
+          },
+          "status": "fresh",
+          "title": "plot.line",
+          "view": "Yields by maturity"
+        },
+        {
+          "figure": "2",
+          "live": {
+            "hidden": [],
+            "size": {
+              "height": 190.0,
+              "width": 472.00003
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "height": 190.0,
+              "width": 472.00003
+            }
+          },
+          "pane": 9223372036854775809,
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 312.0000305175781,
+                    "x1": 462.0000305175781,
+                    "y0": 150.0,
+                    "y1": 175.0
+                  },
+                  {
+                    "series": 1,
+                    "x0": 312.0000305175781,
+                    "x1": 462.0000305175781,
+                    "y0": 175.0,
+                    "y1": 200.0
+                  },
+                  {
+                    "series": 2,
+                    "x0": 312.0000305175781,
+                    "x1": 462.0000305175781,
+                    "y0": 200.0,
+                    "y1": 225.0
+                  }
+                ],
+                "x0": 302.0000305175781,
+                "x1": 472.0000305175781,
+                "y0": 140.0,
+                "y1": 235.0
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "10Y real (TIPS)",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "10Y real (TIPS)"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "10Y breakeven",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "10Y breakeven"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "10Y",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "10Y"
+                  }
+                }
+              ],
+              "viewbox": [
+                472.0000305175781,
+                190.0
+              ]
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 80.0
+            },
+            "Categorical palette": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Diverging ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "BlueWhiteRed"
+            },
+            "Duotone skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": false
+            },
+            "Facet label size": {
+              "provenance": "default",
+              "section": "Facet",
+              "value": 16.0
+            },
+            "Hover text size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 16.0
+            },
+            "Left": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 100.0
+            },
+            "Position": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "Right": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 20.0
+            },
+            "Sequential ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "greys_rs1"
+            },
+            "Subtitle": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "FRED H.15 daily closes, as of 2026-09-24"
+            },
+            "Subtitle size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 20.0
+            },
+            "Text size": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": 14.0
+            },
+            "Title": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "10Y = real + breakeven, %"
+            },
+            "Title size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 28.0
+            },
+            "Top": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 50.0
+            },
+            "Visible": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "X bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "X label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Date"
+            },
+            "X label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "X minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "X tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "X tick rotation": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 30.0
+            },
+            "X tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "X tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "Y bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "Y label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Percent"
+            },
+            "Y label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "Y minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "Y tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "Y tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "Y tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            }
+          },
+          "size": {
+            "height": 190.0,
+            "width": 472.00003
+          },
+          "status": "fresh",
+          "title": "plot.line",
+          "view": "10Y decomposition"
+        },
+        {
+          "figure": "3",
+          "live": {
+            "hidden": [],
+            "size": {
+              "height": 212.0,
+              "width": 462.40002
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "height": 212.0,
+              "width": 462.40002
+            }
+          },
+          "pane": 9223372036854775810,
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 150.0,
+                    "y1": 175.0
+                  },
+                  {
+                    "series": 1,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 175.0,
+                    "y1": 200.0
+                  },
+                  {
+                    "series": 2,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 200.0,
+                    "y1": 225.0
+                  }
+                ],
+                "x0": 292.4000244140625,
+                "x1": 462.4000244140625,
+                "y0": 140.0,
+                "y1": 235.0
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "curve",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Latest, 2026-09-24",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Latest, 2026-09-24"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "curve",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "-3M, 2026-06-24",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "-3M, 2026-06-24"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "curve",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "-1Y, 2025-09-24",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "-1Y, 2025-09-24"
+                  }
+                }
+              ],
+              "viewbox": [
+                462.4000244140625,
+                212.0
+              ]
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 80.0
+            },
+            "Categorical palette": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Diverging ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "BlueWhiteRed"
+            },
+            "Duotone skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": false
+            },
+            "Facet label size": {
+              "provenance": "default",
+              "section": "Facet",
+              "value": 16.0
+            },
+            "Hover text size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 16.0
+            },
+            "Left": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 100.0
+            },
+            "Position": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "Right": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 20.0
+            },
+            "Sequential ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "greys_rs1"
+            },
+            "Subtitle": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "FRED H.15 daily closes, as of 2026-09-24"
+            },
+            "Subtitle size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 20.0
+            },
+            "Text size": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": 14.0
+            },
+            "Title": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Yield curve, %"
+            },
+            "Title size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 28.0
+            },
+            "Top": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 50.0
+            },
+            "Visible": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "X bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "X label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Maturity, years"
+            },
+            "X label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "X minor ticks": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 4
+            },
+            "X tick interval": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "X tick rotation": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 0.0
+            },
+            "X tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "X tick step": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "Y bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "Y label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Yield, %"
+            },
+            "Y label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "Y minor ticks": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 4
+            },
+            "Y tick interval": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "Y tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "Y tick step": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": "Count(8)"
+            }
+          },
+          "size": {
+            "height": 212.0,
+            "width": 462.40002
+          },
+          "status": "fresh",
+          "title": "plot.line",
+          "view": "Yield curve"
+        },
+        {
+          "figure": "4",
+          "live": {
+            "hidden": [],
+            "size": {
+              "height": 212.0,
+              "width": 472.00003
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "height": 212.0,
+              "width": 472.00003
+            }
+          },
+          "pane": 9223372036854775811,
+          "render_mode": "vector",
+          "series": {
+            "reason": "the figure identifies no series",
+            "status": "absent"
+          },
+          "settings": {
+            "Bottom": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 80.0
+            },
+            "Categorical palette": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Diverging ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "BlueWhiteRed"
+            },
+            "Duotone skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": false
+            },
+            "Facet label size": {
+              "provenance": "default",
+              "section": "Facet",
+              "value": 16.0
+            },
+            "Hover text size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 16.0
+            },
+            "Left": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 100.0
+            },
+            "Position": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "Right": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 20.0
+            },
+            "Sequential ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "greys_rs1"
+            },
+            "Subtitle": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "FRED H.15 daily closes, as of 2026-09-24"
+            },
+            "Subtitle size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 20.0
+            },
+            "Text size": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": 14.0
+            },
+            "Title": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "10Y daily change, bp"
+            },
+            "Title size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 28.0
+            },
+            "Top": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 50.0
+            },
+            "Visible": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "X bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "X label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Date"
+            },
+            "X label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "X minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "X tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "X tick rotation": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 30.0
+            },
+            "X tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "X tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "Y bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "Y label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Change, basis points"
+            },
+            "Y label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "Y minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "Y tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "Y tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "Y tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            }
+          },
+          "size": {
+            "height": 212.0,
+            "width": 472.00003
+          },
+          "status": "fresh",
+          "title": "plot.scatter",
+          "view": "10Y daily change"
+        }
+      ],
+      "outcome": "applied"
+    },
+    {
+      "command": {
+        "describe": {}
+      },
+      "figures": [
+        {
+          "figure": "1",
+          "live": {
+            "hidden": [],
+            "size": {
+              "height": 190.0,
+              "width": 462.40002
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "height": 190.0,
+              "width": 462.40002
+            }
+          },
+          "pane": 9223372036854775808,
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 150.0,
+                    "y1": 175.0
+                  },
+                  {
+                    "series": 1,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 175.0,
+                    "y1": 200.0
+                  },
+                  {
+                    "series": 2,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 200.0,
+                    "y1": 225.0
+                  },
+                  {
+                    "series": 3,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 225.0,
+                    "y1": 250.0
+                  }
+                ],
+                "x0": 292.4000244140625,
+                "x1": 462.4000244140625,
+                "y0": 140.0,
+                "y1": 260.0
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "3M",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "3M"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "2Y",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "2Y"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "10Y",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "10Y"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "30Y",
+                  "ordinal": 3,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "30Y"
+                  }
+                }
+              ],
+              "viewbox": [
+                462.4000244140625,
+                190.0
+              ]
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 80.0
+            },
+            "Categorical palette": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Diverging ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "BlueWhiteRed"
+            },
+            "Duotone skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": false
+            },
+            "Facet label size": {
+              "provenance": "default",
+              "section": "Facet",
+              "value": 16.0
+            },
+            "Hover text size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 16.0
+            },
+            "Left": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 100.0
+            },
+            "Position": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "Right": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 20.0
+            },
+            "Sequential ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "greys_rs1"
+            },
+            "Subtitle": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "10Y 5.18%, +7 bp on 2026-09-24 \u00b7 FRED H.15"
+            },
+            "Subtitle size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 20.0
+            },
+            "Text size": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": 14.0
+            },
+            "Title": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Yields by maturity, %"
+            },
+            "Title size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 28.0
+            },
+            "Top": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 50.0
+            },
+            "Visible": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "X bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "X label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Date"
+            },
+            "X label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "X minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "X tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "X tick rotation": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 30.0
+            },
+            "X tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "X tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "Y bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "Y label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Yield, %"
+            },
+            "Y label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "Y minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "Y tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "Y tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "Y tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            }
+          },
+          "size": {
+            "height": 190.0,
+            "width": 462.40002
+          },
+          "status": "fresh",
+          "title": "plot.line",
+          "view": "Yields by maturity"
+        },
+        {
+          "figure": "2",
+          "live": {
+            "hidden": [],
+            "size": {
+              "height": 190.0,
+              "width": 472.00003
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "height": 190.0,
+              "width": 472.00003
+            }
+          },
+          "pane": 9223372036854775809,
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 312.0000305175781,
+                    "x1": 462.0000305175781,
+                    "y0": 150.0,
+                    "y1": 175.0
+                  },
+                  {
+                    "series": 1,
+                    "x0": 312.0000305175781,
+                    "x1": 462.0000305175781,
+                    "y0": 175.0,
+                    "y1": 200.0
+                  },
+                  {
+                    "series": 2,
+                    "x0": 312.0000305175781,
+                    "x1": 462.0000305175781,
+                    "y0": 200.0,
+                    "y1": 225.0
+                  }
+                ],
+                "x0": 302.0000305175781,
+                "x1": 472.0000305175781,
+                "y0": 140.0,
+                "y1": 235.0
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "10Y real (TIPS)",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "10Y real (TIPS)"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "10Y breakeven",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "10Y breakeven"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "10Y",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "10Y"
+                  }
+                }
+              ],
+              "viewbox": [
+                472.0000305175781,
+                190.0
+              ]
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 80.0
+            },
+            "Categorical palette": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Diverging ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "BlueWhiteRed"
+            },
+            "Duotone skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": false
+            },
+            "Facet label size": {
+              "provenance": "default",
+              "section": "Facet",
+              "value": 16.0
+            },
+            "Hover text size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 16.0
+            },
+            "Left": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 100.0
+            },
+            "Position": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "Right": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 20.0
+            },
+            "Sequential ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "greys_rs1"
+            },
+            "Subtitle": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "FRED H.15 daily closes, as of 2026-09-24"
+            },
+            "Subtitle size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 20.0
+            },
+            "Text size": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": 14.0
+            },
+            "Title": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "10Y = real + breakeven, %"
+            },
+            "Title size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 28.0
+            },
+            "Top": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 50.0
+            },
+            "Visible": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "X bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "X label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Date"
+            },
+            "X label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "X minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "X tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "X tick rotation": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 30.0
+            },
+            "X tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "X tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "Y bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "Y label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Percent"
+            },
+            "Y label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "Y minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "Y tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "Y tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "Y tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            }
+          },
+          "size": {
+            "height": 190.0,
+            "width": 472.00003
+          },
+          "status": "fresh",
+          "title": "plot.line",
+          "view": "10Y decomposition"
+        },
+        {
+          "figure": "3",
+          "live": {
+            "hidden": [],
+            "size": {
+              "height": 212.0,
+              "width": 462.40002
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "height": 212.0,
+              "width": 462.40002
+            }
+          },
+          "pane": 9223372036854775810,
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 150.0,
+                    "y1": 175.0
+                  },
+                  {
+                    "series": 1,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 175.0,
+                    "y1": 200.0
+                  },
+                  {
+                    "series": 2,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 200.0,
+                    "y1": 225.0
+                  }
+                ],
+                "x0": 292.4000244140625,
+                "x1": 462.4000244140625,
+                "y0": 140.0,
+                "y1": 235.0
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "curve",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Latest, 2026-09-24",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Latest, 2026-09-24"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "curve",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "-3M, 2026-06-24",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "-3M, 2026-06-24"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "curve",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "-1Y, 2025-09-24",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "-1Y, 2025-09-24"
+                  }
+                }
+              ],
+              "viewbox": [
+                462.4000244140625,
+                212.0
+              ]
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 80.0
+            },
+            "Categorical palette": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Diverging ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "BlueWhiteRed"
+            },
+            "Duotone skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": false
+            },
+            "Facet label size": {
+              "provenance": "default",
+              "section": "Facet",
+              "value": 16.0
+            },
+            "Hover text size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 16.0
+            },
+            "Left": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 100.0
+            },
+            "Position": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "Right": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 20.0
+            },
+            "Sequential ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "greys_rs1"
+            },
+            "Subtitle": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "FRED H.15 daily closes, as of 2026-09-24"
+            },
+            "Subtitle size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 20.0
+            },
+            "Text size": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": 14.0
+            },
+            "Title": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Yield curve, %"
+            },
+            "Title size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 28.0
+            },
+            "Top": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 50.0
+            },
+            "Visible": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "X bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "X label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Maturity, years"
+            },
+            "X label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "X minor ticks": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 4
+            },
+            "X tick interval": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "X tick rotation": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 0.0
+            },
+            "X tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "X tick step": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "Y bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "Y label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Yield, %"
+            },
+            "Y label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "Y minor ticks": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 4
+            },
+            "Y tick interval": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "Y tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "Y tick step": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": "Count(8)"
+            }
+          },
+          "size": {
+            "height": 212.0,
+            "width": 462.40002
+          },
+          "status": "fresh",
+          "title": "plot.line",
+          "view": "Yield curve"
+        },
+        {
+          "figure": "4",
+          "live": {
+            "hidden": [],
+            "size": {
+              "height": 212.0,
+              "width": 472.00003
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "height": 212.0,
+              "width": 472.00003
+            }
+          },
+          "pane": 9223372036854775811,
+          "render_mode": "vector",
+          "series": {
+            "reason": "the figure identifies no series",
+            "status": "absent"
+          },
+          "settings": {
+            "Bottom": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 80.0
+            },
+            "Categorical palette": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Diverging ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "BlueWhiteRed"
+            },
+            "Duotone skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": false
+            },
+            "Facet label size": {
+              "provenance": "default",
+              "section": "Facet",
+              "value": 16.0
+            },
+            "Hover text size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 16.0
+            },
+            "Left": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 100.0
+            },
+            "Position": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "Right": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 20.0
+            },
+            "Sequential ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "greys_rs1"
+            },
+            "Subtitle": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "FRED H.15 daily closes, as of 2026-09-24"
+            },
+            "Subtitle size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 20.0
+            },
+            "Text size": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": 14.0
+            },
+            "Title": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "10Y daily change, bp"
+            },
+            "Title size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 28.0
+            },
+            "Top": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 50.0
+            },
+            "Visible": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "X bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "X label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Date"
+            },
+            "X label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "X minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "X tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "X tick rotation": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 30.0
+            },
+            "X tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "X tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "Y bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "Y label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Change, basis points"
+            },
+            "Y label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "Y minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "Y tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "Y tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "Y tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            }
+          },
+          "size": {
+            "height": 212.0,
+            "width": 472.00003
+          },
+          "status": "fresh",
+          "title": "plot.scatter",
+          "view": "10Y daily change"
+        }
+      ],
+      "outcome": "applied"
+    },
+    {
+      "command": {
+        "publish": {
+          "directory": "/home/me/work/.agent-bridge/adr0173-hosts/drive-package-final"
+        }
+      },
+      "figures": [
+        {
+          "figure": "1",
+          "live": {
+            "hidden": [],
+            "size": {
+              "height": 190.0,
+              "width": 462.40002
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "height": 190.0,
+              "width": 462.40002
+            }
+          },
+          "pane": 9223372036854775808,
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 150.0,
+                    "y1": 175.0
+                  },
+                  {
+                    "series": 1,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 175.0,
+                    "y1": 200.0
+                  },
+                  {
+                    "series": 2,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 200.0,
+                    "y1": 225.0
+                  },
+                  {
+                    "series": 3,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 225.0,
+                    "y1": 250.0
+                  }
+                ],
+                "x0": 292.4000244140625,
+                "x1": 462.4000244140625,
+                "y0": 140.0,
+                "y1": 260.0
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "3M",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "3M"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "2Y",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "2Y"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "10Y",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "10Y"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "30Y",
+                  "ordinal": 3,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "30Y"
+                  }
+                }
+              ],
+              "viewbox": [
+                462.4000244140625,
+                190.0
+              ]
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 80.0
+            },
+            "Categorical palette": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Diverging ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "BlueWhiteRed"
+            },
+            "Duotone skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": false
+            },
+            "Facet label size": {
+              "provenance": "default",
+              "section": "Facet",
+              "value": 16.0
+            },
+            "Hover text size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 16.0
+            },
+            "Left": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 100.0
+            },
+            "Position": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "Right": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 20.0
+            },
+            "Sequential ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "greys_rs1"
+            },
+            "Subtitle": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "10Y 5.18%, +7 bp on 2026-09-24 \u00b7 FRED H.15"
+            },
+            "Subtitle size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 20.0
+            },
+            "Text size": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": 14.0
+            },
+            "Title": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Yields by maturity, %"
+            },
+            "Title size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 28.0
+            },
+            "Top": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 50.0
+            },
+            "Visible": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "X bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "X label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Date"
+            },
+            "X label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "X minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "X tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "X tick rotation": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 30.0
+            },
+            "X tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "X tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "Y bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "Y label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Yield, %"
+            },
+            "Y label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "Y minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "Y tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "Y tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "Y tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            }
+          },
+          "size": {
+            "height": 190.0,
+            "width": 462.40002
+          },
+          "status": "fresh",
+          "title": "plot.line",
+          "view": "Yields by maturity"
+        },
+        {
+          "figure": "2",
+          "live": {
+            "hidden": [],
+            "size": {
+              "height": 190.0,
+              "width": 472.00003
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "height": 190.0,
+              "width": 472.00003
+            }
+          },
+          "pane": 9223372036854775809,
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 312.0000305175781,
+                    "x1": 462.0000305175781,
+                    "y0": 150.0,
+                    "y1": 175.0
+                  },
+                  {
+                    "series": 1,
+                    "x0": 312.0000305175781,
+                    "x1": 462.0000305175781,
+                    "y0": 175.0,
+                    "y1": 200.0
+                  },
+                  {
+                    "series": 2,
+                    "x0": 312.0000305175781,
+                    "x1": 462.0000305175781,
+                    "y0": 200.0,
+                    "y1": 225.0
+                  }
+                ],
+                "x0": 302.0000305175781,
+                "x1": 472.0000305175781,
+                "y0": 140.0,
+                "y1": 235.0
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "10Y real (TIPS)",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "10Y real (TIPS)"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "10Y breakeven",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "10Y breakeven"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "series",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "10Y",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "10Y"
+                  }
+                }
+              ],
+              "viewbox": [
+                472.0000305175781,
+                190.0
+              ]
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 80.0
+            },
+            "Categorical palette": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Diverging ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "BlueWhiteRed"
+            },
+            "Duotone skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": false
+            },
+            "Facet label size": {
+              "provenance": "default",
+              "section": "Facet",
+              "value": 16.0
+            },
+            "Hover text size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 16.0
+            },
+            "Left": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 100.0
+            },
+            "Position": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "Right": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 20.0
+            },
+            "Sequential ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "greys_rs1"
+            },
+            "Subtitle": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "FRED H.15 daily closes, as of 2026-09-24"
+            },
+            "Subtitle size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 20.0
+            },
+            "Text size": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": 14.0
+            },
+            "Title": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "10Y = real + breakeven, %"
+            },
+            "Title size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 28.0
+            },
+            "Top": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 50.0
+            },
+            "Visible": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "X bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "X label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Date"
+            },
+            "X label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "X minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "X tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "X tick rotation": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 30.0
+            },
+            "X tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "X tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "Y bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "Y label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Percent"
+            },
+            "Y label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "Y minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "Y tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "Y tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "Y tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            }
+          },
+          "size": {
+            "height": 190.0,
+            "width": 472.00003
+          },
+          "status": "fresh",
+          "title": "plot.line",
+          "view": "10Y decomposition"
+        },
+        {
+          "figure": "3",
+          "live": {
+            "hidden": [],
+            "size": {
+              "height": 212.0,
+              "width": 462.40002
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "height": 212.0,
+              "width": 462.40002
+            }
+          },
+          "pane": 9223372036854775810,
+          "series": {
+            "status": "table",
+            "table": {
+              "actions": {
+                "kind": "available"
+              },
+              "initially_hidden": [],
+              "legend": {
+                "entries": [
+                  {
+                    "series": 0,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 150.0,
+                    "y1": 175.0
+                  },
+                  {
+                    "series": 1,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 175.0,
+                    "y1": 200.0
+                  },
+                  {
+                    "series": 2,
+                    "x0": 302.4000244140625,
+                    "x1": 452.4000244140625,
+                    "y0": 200.0,
+                    "y1": 225.0
+                  }
+                ],
+                "x0": 292.4000244140625,
+                "x1": 462.4000244140625,
+                "y0": 140.0,
+                "y1": 235.0
+              },
+              "schema_version": 1,
+              "series": [
+                {
+                  "field": {
+                    "label": "curve",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "Latest, 2026-09-24",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "Latest, 2026-09-24"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "curve",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "-3M, 2026-06-24",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "-3M, 2026-06-24"
+                  }
+                },
+                {
+                  "field": {
+                    "label": "curve",
+                    "semantic_type": "nominal"
+                  },
+                  "label": "-1Y, 2025-09-24",
+                  "ordinal": 2,
+                  "value": {
+                    "kind": "nominal",
+                    "value": "-1Y, 2025-09-24"
+                  }
+                }
+              ],
+              "viewbox": [
+                462.4000244140625,
+                212.0
+              ]
+            }
+          },
+          "settings": {
+            "Bottom": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 80.0
+            },
+            "Categorical palette": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Diverging ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "BlueWhiteRed"
+            },
+            "Duotone skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": false
+            },
+            "Facet label size": {
+              "provenance": "default",
+              "section": "Facet",
+              "value": 16.0
+            },
+            "Hover text size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 16.0
+            },
+            "Left": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 100.0
+            },
+            "Position": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "Right": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 20.0
+            },
+            "Sequential ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "greys_rs1"
+            },
+            "Subtitle": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "FRED H.15 daily closes, as of 2026-09-24"
+            },
+            "Subtitle size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 20.0
+            },
+            "Text size": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": 14.0
+            },
+            "Title": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Yield curve, %"
+            },
+            "Title size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 28.0
+            },
+            "Top": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 50.0
+            },
+            "Visible": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "X bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "X label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Maturity, years"
+            },
+            "X label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "X minor ticks": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 4
+            },
+            "X tick interval": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "X tick rotation": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 0.0
+            },
+            "X tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "X tick step": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "Y bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "Y label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Yield, %"
+            },
+            "Y label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "Y minor ticks": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 4
+            },
+            "Y tick interval": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "Y tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "Y tick step": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": "Count(8)"
+            }
+          },
+          "size": {
+            "height": 212.0,
+            "width": 462.40002
+          },
+          "status": "fresh",
+          "title": "plot.line",
+          "view": "Yield curve"
+        },
+        {
+          "figure": "4",
+          "live": {
+            "hidden": [],
+            "size": {
+              "height": 212.0,
+              "width": 472.00003
+            }
+          },
+          "loaded": {
+            "hidden": [],
+            "size": {
+              "height": 212.0,
+              "width": 472.00003
+            }
+          },
+          "pane": 9223372036854775811,
+          "render_mode": "vector",
+          "series": {
+            "reason": "the figure identifies no series",
+            "status": "absent"
+          },
+          "settings": {
+            "Bottom": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 80.0
+            },
+            "Categorical palette": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Diverging ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "BlueWhiteRed"
+            },
+            "Duotone skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": false
+            },
+            "Facet label size": {
+              "provenance": "default",
+              "section": "Facet",
+              "value": 16.0
+            },
+            "Hover text size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 16.0
+            },
+            "Left": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 100.0
+            },
+            "Position": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "Right": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 20.0
+            },
+            "Sequential ramp": {
+              "provenance": "theme",
+              "section": "Figure",
+              "value": "Viridis"
+            },
+            "Skin": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "greys_rs1"
+            },
+            "Subtitle": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "FRED H.15 daily closes, as of 2026-09-24"
+            },
+            "Subtitle size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 20.0
+            },
+            "Text size": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": 14.0
+            },
+            "Title": {
+              "provenance": "authored",
+              "section": "Figure",
+              "value": "10Y daily change, bp"
+            },
+            "Title size": {
+              "provenance": "default",
+              "section": "Figure",
+              "value": 28.0
+            },
+            "Top": {
+              "provenance": "default",
+              "section": "Padding",
+              "value": 50.0
+            },
+            "Visible": {
+              "provenance": "default",
+              "section": "Legend",
+              "value": "default"
+            },
+            "X bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "X label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Date"
+            },
+            "X label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "X minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "X tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "X tick rotation": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 30.0
+            },
+            "X tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "X tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Temporal(PositiveTemporalInterval(CalendarMonths(3)))"
+            },
+            "Y bounds": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": null
+            },
+            "Y label": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Change, basis points"
+            },
+            "Y label size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 20.0
+            },
+            "Y minor ticks": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": 4
+            },
+            "Y tick interval": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            },
+            "Y tick size": {
+              "provenance": "default",
+              "section": "Axes",
+              "value": 18.0
+            },
+            "Y tick step": {
+              "provenance": "authored",
+              "section": "Axes",
+              "value": "Count(8)"
+            }
+          },
+          "size": {
+            "height": 212.0,
+            "width": 472.00003
+          },
+          "status": "fresh",
+          "title": "plot.scatter",
+          "view": "10Y daily change"
+        }
+      ],
+      "outcome": "applied",
+      "publish": {
+        "digest": "765e9575e77ebddc012c91d64cb43726f3d3eadaf1724e75e6e457671283d68a",
+        "figures": [
+          {
+            "id": "yields-by-maturity",
+            "inspection": {
+              "kind": "omitted",
+              "observed": null,
+              "reason": "no-regions"
+            },
+            "title": "plot.line",
+            "visibility": {
+              "kind": "actionable",
+              "series": 4
+            }
+          },
+          {
+            "id": "10y-decomposition",
+            "inspection": {
+              "kind": "omitted",
+              "observed": null,
+              "reason": "no-regions"
+            },
+            "title": "plot.line",
+            "visibility": {
+              "kind": "actionable",
+              "series": 3
+            }
+          },
+          {
+            "id": "yield-curve",
+            "inspection": {
+              "kind": "omitted",
+              "observed": null,
+              "reason": "no-regions"
+            },
+            "title": "plot.line",
+            "visibility": {
+              "kind": "actionable",
+              "series": 3
+            }
+          },
+          {
+            "id": "10y-daily-change",
+            "inspection": {
+              "bytes": 733086,
+              "kind": "projected",
+              "regions": 1683
+            },
+            "title": "plot.scatter",
+            "visibility": {
+              "kind": "absent",
+              "observed": null,
+              "reason": "no-identified-series"
+            }
+          }
+        ],
+        "root": "/home/me/work/.agent-bridge/adr0173-hosts/drive-package-final"
+      }
+    }
+  ],
+  "execution": "by-command",
+  "loaded": [],
+  "schema_version": 1,
+  "source": "uat/treasury_rates.rn"
+}

@@ -1,0 +1,8 @@
+{
+  "manifest_sha256": "89422b77847ba37513e32a72ca0e0bab7b11f28ebdae934923516cfc60856581",
+  "figures": 4,
+  "package_path": "/home/me/work/.agent-bridge/adr0173-hosts/capped-claude-package",
+  "receipt_digests": [
+    "204595c34a86b00f33e2f1834c59f504f81cd040181659a8bce70322c94ba05c"
+  ]
+}

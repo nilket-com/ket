@@ -1,0 +1,19 @@
+{
+  "cwd": "/home/me/work/.agent-bridge/adr0173-hosts/claude-run",
+  "argv": [
+    "claude",
+    "-p",
+    "--tools",
+    "",
+    "--strict-mcp-config",
+    "--mcp-config",
+    "/home/me/work/.agent-bridge/adr0173-hosts/capped-claude-mcp-config.json",
+    "--allowedTools",
+    "mcp__polariton__*",
+    "--output-format",
+    "stream-json",
+    "--verbose"
+  ],
+  "stdin": "/home/me/work/.agent-bridge/adr0173-hosts/capped-claude-prompt.txt",
+  "invocation_source": "claude/run-host.sh with label capped-claude"
+}

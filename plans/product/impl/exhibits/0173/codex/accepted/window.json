@@ -1,0 +1,12 @@
+{
+  "window": "2973537cf86c40d086159991e50bcb7f",
+  "socket": "/tmp/polariton-0173-codex-capped-dbpyukay/polariton/2973537cf86c40d086159991e50bcb7f.sock",
+  "pid": 845408,
+  "process_start": "10286568",
+  "session": null,
+  "sources": [
+    "/home/me/work/ket/uat/treasury_rates.rn"
+  ],
+  "started_at": 1790386311,
+  "accepting": true
+}

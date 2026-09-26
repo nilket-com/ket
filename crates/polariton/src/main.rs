@@ -10,6 +10,7 @@ mod gui;
 mod live;
 #[cfg(toron_local)]
 mod local_workspace;
+mod mcp;
 mod plot;
 mod presentation_registry;
 mod process_identity;
@@ -48,6 +49,7 @@ fn main() -> gui::Result {
 	let action = action_from_args(std::env::args())
 		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
 	match action {
+		ApplicationAction::Mcp => mcp::run().map_err(Into::into),
 		ApplicationAction::ListSessions => list_saved_sessions(),
 		ApplicationAction::Report => {
 			ensure_rustls_provider();
@@ -90,6 +92,7 @@ fn main() -> gui::Result {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ApplicationAction {
+	Mcp,
 	Report,
 	Gui(gui::StartupTarget),
 	GuiAgents(gui::StartupTarget),
@@ -129,6 +132,13 @@ where
 {
 	let mut args = args.into_iter().peekable();
 	let _program = args.next();
+	if args.peek().is_some_and(|arg| arg == "mcp") {
+		args.next();
+		if args.next().is_some() {
+			return Err("mcp takes no arguments".into());
+		}
+		return Ok(ApplicationAction::Mcp);
+	}
 	if args.peek().is_some_and(|arg| arg == "report") {
 		args.next();
 		if args.next().is_some() {

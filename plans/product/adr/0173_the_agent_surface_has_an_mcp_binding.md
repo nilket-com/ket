@@ -1,6 +1,6 @@
 # ADR 0173: the agent surface has an MCP binding
 
-Status: proposed 2026-09-25. Application lane. Decides the protocol-binding
+Status: accepted 2026-09-25. Application lane. Decides the protocol-binding
 part of what ADR 0158 §8 left open ("an MCP or any protocol binding") and
 extends ADR 0166: every operation an agent can perform through Polariton's
 command surface is also available as a Model Context Protocol tool, through

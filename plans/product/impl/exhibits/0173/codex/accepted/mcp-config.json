@@ -1,0 +1,18 @@
+{
+  "mcp_servers": {
+    "polariton": {
+      "command": "/home/me/work/ket/target/debug/polariton",
+      "args": [
+        "mcp"
+      ],
+      "cwd": "/home/me/work/ket",
+      "required": true,
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 650,
+      "default_tools_approval_mode": "approve",
+      "env": {
+        "XDG_RUNTIME_DIR": "/tmp/polariton-0173-codex-capped-dbpyukay"
+      }
+    }
+  }
+}

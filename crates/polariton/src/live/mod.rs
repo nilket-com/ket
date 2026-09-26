@@ -11,14 +11,14 @@ pub(crate) const MAX_LINE: usize = 64 * 1024;
 pub(crate) const MAX_OUTSTANDING: usize = 16;
 pub(crate) const MAX_ANSWERS: usize = 256;
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Request {
 	pub(crate) id: u64,
 	pub(crate) command: Command,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum Event {
 	/// Client-only report. Never a server acknowledgement or replay record.

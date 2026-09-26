@@ -1,0 +1,1795 @@
+   Compiling polariton v0.1.0 (/home/me/work/ket/crates/polariton)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.40s
+     Running unittests src/main.rs (target/debug/deps/polariton-c7681fbceefcbf14)
+
+running 1425 tests
+test adapters::common::tests::adapter_without_rune_capability_refuses_locally ... ok
+test adapters::driver::tests::placeholder_examples_do_not_become_connection_values ... ok
+test adapters::driver::tests::postgres_tls_connector_constructs_with_the_production_provider ... ok
+test adapters::driver::tests::product_0135_capabilities_match_the_accepted_table ... ok
+test adapters::driver::tests::provenance_identity_distinguishes_scratch_named_and_typed_connections ... ok
+test adapters::driver::tests::saved_configuration_keeps_adapter_specific_field_names ... ok
+test adapters::driver::tests::selecting_toron_does_not_guess_a_local_endpoint ... ok
+test adapters::driver::tests::sql_connection_prefers_external_and_falls_back_to_scratch ... ok
+test adapters::product_0134_baseline::product_0134_baseline_configure_assembles_each_configuration_from_fields ... ok
+test adapters::product_0134_baseline::product_0134_baseline_mysql_assembly_from_a_typed_string ... ok
+test adapters::product_0134_baseline::product_0134_baseline_parquet_connects_a_fixture_file ... ok
+test adapters::product_0134_baseline::product_0134_baseline_postgres_assembly_from_a_typed_string ... ok
+test adapters::product_0134_baseline::product_0134_baseline_sqlite_connects_memory_and_file ... ok
+test adapters::product_0134_baseline::product_0134_census_connection_identity_trims_the_name ... ok
+test adapters::product_0134_baseline::product_0134_configure_routes_input_kinds_and_debug_redacts ... ok
+test adapters::product_0134_baseline::product_0134_fields_decompose_only_the_credentialed_adapters ... ok
+test adapters::product_0134_baseline::product_0134_input_kinds_refuse_when_mixed ... ok
+test adapters::product_0134_baseline::product_0134_mysql_fields_match_the_typed_string_oracle ... ok
+test adapters::product_0134_baseline::product_0134_port_refuses_non_numeric_and_optionals_default ... ok
+test adapters::product_0134_baseline::product_0134_postgres_fields_match_the_typed_string_oracle ... ok
+test adapters::sql_compound::tests::a_cte_belongs_to_the_tail_query ... ok
+test adapters::sql_compound::tests::an_empty_source_has_no_tail ... ok
+test adapters::sql_compound::tests::command_tail_keeps_the_whole_compound ... ok
+test adapters::sql_compound::tests::leading_comments_and_repeated_terminal_delimiters_do_not_change_the_query ... ok
+test adapters::sql_compound::tests::query_tail_preserves_exact_prefix_and_query_source ... ok
+test adapters::sqlite::tests::command_tail_returns_no_artifact ... ok
+test adapters::sqlite::tests::compound_query_returns_the_tail_table_after_ordered_prefix_effects ... ok
+test adapters::sqlite::tests::prefix_failure_short_circuits_the_tail_product ... ok
+test adapters::toron::target::tests::a_lost_authenticated_connection_keeps_its_uncertainty ... ok
+test adapters::toron::target::tests::a_partial_configuration_is_refused_naming_the_missing_fields ... ok
+test adapters::toron::target::tests::a_peer_rejection_is_reported_without_an_invented_cause ... ok
+test adapters::toron::target::tests::a_refused_key_is_reported_as_refused_before_connecting ... ok
+test adapters::toron::target::tests::a_server_name_mismatch_is_reported_precisely ... ok
+test adapters::toron::target::tests::all_four_fields_select_the_authenticated_transport ... ok
+test adapters::toron::target::tests::an_empty_endpoint_is_refused_first ... ok
+test adapters::toron::target::tests::display_form_certificate_errors_are_classified_distinctly ... ok
+test adapters::toron::target::tests::no_tls_field_selects_loopback ... ok
+test adapters::toron::target::tests::the_two_certificate_reports_are_distinct ... ok
+test adapters::toron::tests::live_absolute_rate_factor_isolation ... ignored, requires an isolated live Toron workspace at TORON_SQL_ENDPOINT
+test adapters::toron::tests::live_post_packing_scan_attribution ... ignored, requires an isolated live Toron workspace at TORON_SQL_ENDPOINT
+test adapters::toron::tests::live_product_0008_view_surface_preserves_axis_identity ... ignored, requires the dogfood test2 relation on a live local Toron
+test adapters::toron::tests::live_product_0012_line_view_reaches_the_existing_kernel ... ignored, requires the dogfood test1 relation on a live local Toron
+test adapters::toron::tests::live_product_0084_nullable_schema_survives_the_toron_transport ... ignored, requires a live Toron SQL endpoint
+test adapters::toron::tests::live_product_0103_aggregate_and_raw_handles_remain_distinct ... ignored, requires the PRODUCT-0103 pie_probe relation on a live local Toron
+test adapters::toron::tests::live_product_0108_relation_side_violin_renders_without_the_lonely_group ... ignored, requires the PRODUCT-0108 violin_probe relation on a live local Toron
+test adapters::toron::tests::live_rune_relation_reaches_table_bar_and_scatter_surfaces ... ignored, requires the dogfood test2 relation on a live local Toron
+test adapters::toron::tests::live_scan_cost_without_text_formatting ... ignored, requires a live local Toron workspace with ctrl_plain
+test adapters::toron::tests::live_scatter_threshold_evidence ... ignored, requires a live local Toron workspace
+test adapters::toron::tests::live_toron_preserves_errors_and_accepts_cancel_frames ... ignored, requires a live Toron SQL endpoint
+test adapters::toron::tests::live_toron_query_reaches_the_existing_plot_kernel ... ignored, requires a live Toron SQL endpoint
+test adapters::toron::tests::product_0135_query_stamp_fills_and_clears_the_shared_slot ... ok
+test configuration::tests::app_configuration_ignores_the_embedded_editor_entrypoint ... ok
+test configuration::tests::compile_error_is_reported_without_losing_defaults ... ok
+test configuration::tests::editor_only_init_is_a_clean_no_op ... ok
+test configuration::tests::init_configures_the_first_window_and_table_presentation ... ok
+test configuration::tests::missing_init_uses_compiled_defaults_without_creating_a_file ... ok
+test configuration::tests::pane_divider_gutter_accepts_zero_and_refuses_non_cell_values ... ok
+test configuration::tests::product_0161_reporting_requires_an_explicit_destination ... ok
+test configuration::tests::runtime_error_keeps_operations_that_already_completed ... ok
+test configuration::tests::xdg_config_home_owns_the_linux_init_location ... ok
+test coordinate::tests::the_space_vocabulary_is_exactly_the_census ... ok
+test driver::tests::product_0158_commands_and_refusals_are_structured ... ok
+test driver::tests::product_0158_describe_is_the_inspector_and_the_series_table ... ok
+test driver::tests::product_0158_describe_reports_absence_and_render_mode ... ok
+test driver::tests::product_0158_unreadable_commands_refuse_before_any_action ... ok
+test driver::tests::product_0160_failed_outcome_leaves_applied_and_refused_receipts_unchanged ... ok
+test editor::product_0156_notebook_tests::product_0156_notebook_actions_are_pane_only_and_idempotent ... ok
+test editor::tests::a_block_straddling_the_window_start_is_drawn ... ok
+test editor::tests::a_capturing_widget_would_hide_workspace_keys_from_baryon ... ok
+test editor::tests::a_rerun_during_pending_disposal_reopens_rather_than_refreshing ... ok
+test editor::tests::backspacing_an_in_memory_document_to_empty_keeps_it_editable ... ok
+test editor::tests::busy_spinner_advances_at_baryons_cadence_and_restarts ... ok
+test editor::tests::cached_content_converges_via_engine_wake_alone ... ok
+test editor::tests::cached_content_stays_attributed_when_focus_changes_between_languages ... ok
+test editor::tests::cached_content_tracks_typing_in_new_independent_pane ... ok
+test editor::tests::cell_extraction_is_exact_across_implicit_and_explicit_fences ... ok
+test editor::tests::clicking_a_host_panel_moves_workspace_focus_to_its_pane ... ok
+test editor::tests::columns_scrolled_off_above_the_viewport_are_dropped_not_prepended ... ok
+test editor::tests::command_bar_cursor_marks_unicode_and_preserves_end_width_while_blinking ... ok
+test editor::tests::committed_emoji_survive_the_full_render_pipeline ... ok
+test editor::tests::committed_unicode_text_uses_the_modal_safe_paste_path ... ok
+test editor::tests::ctrl_v_keeps_normal_mode_visual_block_binding_while_insert_paste_is_separate ... ok
+test editor::tests::cursor_blink_stays_solid_after_activity_and_while_unfocused ... ok
+test editor::tests::declined_keys_scroll_the_focused_result_table ... ok
+test editor::tests::disposal_releases_only_after_the_projection_agrees ... ok
+test editor::tests::divider_drag_uses_engine_published_hit_rects ... ok
+test editor::tests::double_clicking_file_browser_row_opens_the_file ... ok
+test editor::tests::empty_document_still_renders_a_cursor_block ... ok
+test editor::tests::engine_status_messages_surface_and_clear_on_the_next_input ... ok
+test editor::tests::engine_visual_rows_split_wrapped_text_without_repeating_the_gutter ... ok
+test editor::tests::execution_snapshot_crosses_edits_still_waiting_on_the_display_cache ... ok
+test editor::tests::execution_text_uses_the_current_line_or_visual_selection ... ok
+test editor::tests::fence_bodies_start_after_their_info_line ... ok
+test editor::tests::file_browser_omits_editor_gutter_and_minimap ... ok
+test editor::tests::focused_pane_frame_is_a_single_accent_pixel ... ok
+test editor::tests::git_observer_updates_an_open_status_pane ... ok
+test editor::tests::git_status_omits_editor_chrome_and_double_click_opens_the_file ... ok
+test editor::tests::highlight_lookup_preserves_nested_span_priority ... ok
+test editor::tests::horizontal_divider_grab_band_keeps_one_preceding_row_at_zero_reservation ... ok
+test editor::tests::host_panels_render_as_unresolved_until_content_arrives ... ok
+test editor::tests::immediate_typing_after_replacing_an_in_memory_document_never_waits_for_extent ... ok
+test editor::tests::in_memory_content_round_trips_through_the_engine ... ok
+test editor::tests::initial_file_keeps_real_path_content_and_detected_language ... ok
+test editor::tests::inline_plot_hover_is_scoped_to_its_cell_identity ... ok
+test editor::tests::insert_mode_paste_uses_the_engine_paste_protocol ... ok
+test editor::tests::large_extent_projects_only_the_viewports_lines ... ok
+test editor::tests::local_mouse_coordinates_become_engine_cursor_positions ... ok
+test editor::tests::markdown_cells_remain_runnable_without_a_preview_pane ... ok
+test editor::tests::markdown_fence_fragments_resolve_engine_categories_through_its_palette ... ok
+test editor::tests::markdown_sql_fence_runs_as_one_cell ... ok
+test editor::tests::minimap_click_centers_the_hit_with_leading_context ... ok
+test editor::tests::minimap_dense_ink_preserves_short_line_widths ... ok
+test editor::tests::minimap_ink_handle_is_cached_until_content_changes ... ok
+test editor::tests::minimap_ink_uses_per_column_token_colors ... ok
+test editor::tests::minimap_live_images_finish_with_cursor_over_viewport_frame ... ok
+test editor::tests::minimap_realistic_dense_raster_reuses_its_handle ... ok
+test editor::tests::modal_sql_editing_preserves_operator_undo_and_linewise_put_behavior ... ok
+test editor::tests::notebook_run_keeps_the_source_context_when_an_output_pane_is_focused ... ok
+test editor::tests::opening_query_results_keeps_workspace_focus_in_the_source_pane ... ok
+test editor::tests::pane_drop_edges_make_center_a_swap_and_edges_a_split_intent ... ok
+test editor::tests::preview_blocks_are_parsed_when_the_projection_arrives ... ok
+test editor::tests::preview_colors_come_from_the_panes_own_theme_categories ... ok
+test editor::tests::preview_colors_fall_back_to_the_default_foreground ... ok
+test editor::tests::preview_colors_match_the_source_highlighter_category_for_category ... ok
+test editor::tests::preview_row_budget_covers_more_than_the_source_window ... ok
+test editor::tests::preview_row_gaps_never_consume_the_pane_height ... ok
+test editor::tests::process_exit_detach_never_joins_the_engine ... ok
+test editor::tests::product_0023_completed_table_artifacts_replace_and_stale_as_atomic_pairs ... ok
+test editor::tests::product_0023_skin_only_replacement_does_not_mutate_host_panel_layout ... ok
+test editor::tests::product_0050_canvas_hide_keeps_anonymous_and_named_panel_chrome_identifiable ... ok
+test editor::tests::product_0052_completed_tables_preserve_the_live_application_authority ... ok
+test editor::tests::product_0061_rune_semantic_panel_identity_is_append_only ... ok
+test editor::tests::product_0070_saved_restart_preserves_product_0062_views_groups_and_colours_before_rerun ...
+running 1 test
+test editor::tests::product_0070_saved_restart_preserves_product_0062_views_groups_and_colours_before_rerun ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1424 filtered out; finished in 0.05s
+
+ok
+test editor::tests::product_0074_default_overlap_release_places_cursor_without_resizing ... ok
+test editor::tests::product_0074_proximity_and_activation_deadband_are_independent ... ok
+test editor::tests::product_0074_rendered_host_canvas_separation_is_eight_by_thirty_pixels ... ok
+test editor::tests::product_0074_zero_reservation_keeps_both_axes_grabbable_and_headers_first ... ok
+test editor::tests::product_0075_export_order_deduplicates_identity_not_titles ... ok
+test editor::tests::product_0075_export_reads_visible_plot_geometry_and_keeps_stale_last_good ... ok
+test editor::tests::product_0075_results_replace_table_plot_and_message_under_one_panel ... ok
+test editor::tests::product_0075_retired_dashboard_role_closes_once_without_touching_results ... ok
+test editor::tests::product_0111_columns_and_rows_remain_independent ... ok
+test editor::tests::product_0111_configured_reservation_couples_panes_visuals_and_hits ... ok
+test editor::tests::product_0141_attachment_requires_live_generation_and_current_view_identity ... ok
+test editor::tests::product_0141_settings_inspector_is_collapsed_and_toggles_per_pane ... ok
+test editor::tests::product_0142_preview_discards_or_promotes_without_a_durable_override ... ok
+test editor::tests::product_0150_captured_plot_pan_press_still_focuses_its_host_pane ... ok
+test editor::tests::product_0150_product_0151_notebook_surface_owns_a_model_and_dedupes_ready_selection ... ok
+test editor::tests::product_0151_logical_bindings_keep_input_identity_and_republish_tokens ... ok
+test editor::tests::product_0151_ready_table_dedupes_an_unchanged_filter_predicate ... ok
+test editor::tests::projected_tab_controls_activate_and_close_exact_views ... ok
+test editor::tests::projected_tabs_keep_compact_labels_and_distinct_active_style ... ok
+test editor::tests::prompt_line_orders_prompt_above_status_above_mode ... ok
+test editor::tests::quit_request_is_observable_once_and_stops_editor_input ... ok
+test editor::tests::rapid_input_still_converges_the_cached_content ... ok
+test editor::tests::repeated_runs_reuse_one_result_panel_and_replace_its_contents ... ok
+test editor::tests::run_targets_the_cell_at_the_cursor_even_mid_selection ... ok
+test editor::tests::rune_cells_dispatch_and_named_sql_results_ignore_presentation ... ok
+test editor::tests::rune_view_collection_tiles_one_forward_producer_group_without_tabs ... ok
+test editor::tests::rune_view_groups_are_distinct_and_one_producer_does_not_retile_another ... ok
+test editor::tests::running_again_after_closing_the_result_pane_recreates_it ... ok
+test editor::tests::startup_viewport_uses_the_actual_workspace_pixels ... ok
+test editor::tests::subscription_window_coords_convert_to_editor_local ... ok
+test editor::tests::text_pane_title_tracks_the_active_language ... ok
+test editor::tests::the_visible_window_follows_the_source_anchor ... ok
+test editor::tests::typed_text_survives_the_full_render_pipeline ... ok
+test editor::tests::viewport_scroll_and_minimap_navigation_stay_engine_owned ... ok
+test editor::tests::viz_and_noviz_project_distinct_whitespace_without_changing_text ... ok
+test editor::tests::wrapped_text_keeps_emoji_sequences_atomic_and_uses_their_width ... ok
+test first_run::tests::product_0161_marker_suppresses_only_empty_starts_after_showing ... ok
+test first_run::tests::product_0161_sql_column_names_are_quoted ... ok
+test gui::components::tests::product_0063_session_menu_exists_only_for_saved_authority ... ok
+test gui::components::tests::product_0071_durable_session_segment_names_attachment_not_freshness ... ok
+test gui::components::tests::product_0071_session_menu_keeps_identity_behind_the_copy_action ... ok
+test gui::components::tests::product_0134_connect_menu_offers_the_saved_profile_surface ... ok
+test gui::components::tests::product_0135_cancel_affordance_is_bound_to_an_in_flight_run ... ok
+test gui::components::tests::product_0135_code_menu_offers_the_run_and_cancel_actions ... ok
+test gui::components::tests::product_0154_plot_menu_is_publish_and_the_three_export_actions ... ok
+test gui::menu::core::tests::invoking_an_action_closes_the_menu ... ok
+test gui::menu::core::tests::toggling_a_root_reopens_cleanly ... ok
+test gui::menu::core::tests::trimming_a_path_keeps_parent_panels_open ... ok
+test gui::plot_pane::state::product_0150_state_tests::product_0150_matching_settle_consumes_generation_while_stale_settle_is_inert ... ok
+test gui::plot_pane::state::product_0150_state_tests::product_0150_only_the_newest_of_many_wheel_settles_is_consumed ... ok
+test gui::plot_pane::state::product_0150_state_tests::product_0150_viewport_mutates_only_the_pane_tier_and_replacement_resets_it ... ok
+test gui::plot_pane::state::product_0150_state_tests::product_0150_wheel_quiet_settle_is_newest_wins_and_press_invalidates_it ... ok
+test gui::plot_pane::state::product_0150_state_tests::product_0151_ready_plot_dedupes_an_unchanged_filter_predicate ... ok
+test gui::plot_pane::state::product_0150_state_tests::product_0151_selection_completion_is_newest_wins_and_preserves_the_viewport ... ok
+test gui::plot_pane::view::product_0150_promote_tests::product_0150_only_untouched_pane_bounds_seed_the_displayed_submit_value ... ok
+test gui::plot_pane::view::tests::product_0112_hover_overlay_uses_the_resolved_size_once ... ok
+test gui::state::agents::tests::product_0160_update_rejects_queued_requests_across_gate_generations ... ok
+test gui::state::connection::tests::a_connect_result_delayed_past_a_newer_choice_does_not_install ... ok
+test gui::state::connection::tests::a_partial_toron_tls_configuration_is_refused_before_any_transport ... ok
+test gui::state::connection::tests::a_refused_connect_leaves_the_established_connection_and_its_report ... ok
+test gui::state::connection::tests::connection_status_and_a_stale_disconnect_are_generation_gated ... ok
+test gui::state::connection::tests::the_form_and_the_command_enter_the_same_connection_operation ... ok
+test gui::state::local_rune_tests::a_bad_view_fails_the_whole_batch_and_keeps_prior_panes ... ok
+test gui::state::local_rune_tests::a_batch_replaces_the_panes_whole ... ok
+test gui::state::local_rune_tests::a_views_batch_commits_named_panes_that_refuse_writeback ... ok
+test gui::state::local_rune_tests::agent_api::a_same_count_rerun_reports_the_new_figures ... ok
+test gui::state::local_rune_tests::agent_api::receipts_describe_and_publish_only_current_output_as_current ... ok
+test gui::state::local_rune_tests::an_edit_before_the_batch_commits_discards_it ... ok
+test gui::state::local_rune_tests::an_edit_during_the_fetch_discards_its_output ... ok
+test gui::state::local_rune_tests::an_empty_run_retracts_a_queued_batch ... ok
+test gui::state::local_rune_tests::an_empty_run_retracts_an_already_built_plain_plot ... ok
+test gui::state::local_rune_tests::an_unedited_batch_commits ... ok
+test gui::state::local_rune_tests::an_unedited_fetch_publishes_its_pane ... ok
+test gui::state::local_rune_tests::an_unknown_skin_fails_the_batch_at_its_view ... ok
+test gui::state::local_rune_tests::closing_the_source_cancels_its_fetch_and_publishes_nothing ... ok
+test gui::state::local_rune_tests::run_source_settles_after_the_whole_batch ... ok
+test gui::state::local_rune_tests::show_and_views_keep_source_order ... ok
+test gui::state::notebook_actions::tests::adr0168_a_sql_cells_receipt_carries_its_answer ... ok
+test gui::state::notebook_actions::tests::adr0168_a_wide_answer_keeps_the_live_event_under_its_line_limit ... ok
+test gui::state::notebook_actions::tests::adr0168_an_earlier_answer_is_never_reported ... ok
+test gui::state::notebook_actions::tests::adr0169_a_failed_execution_reports_its_error_and_no_figures ... ok
+test gui::state::notebook_actions::tests::adr0169_a_timed_out_execution_says_its_late_outcome_is_dropped ... ok
+test gui::state::notebook_actions::tests::adr0169_run_source_is_refused_without_a_rune_connection_or_on_a_notebook ... ok
+test gui::state::notebook_actions::tests::adr0169_stale_executions_are_named_and_never_report_figures ... ok
+test gui::state::notebook_actions::tests::probe_a_single_long_line_cell_is_still_editable ... ok
+test gui::state::notebook_actions::tests::product_0162_busy_and_connection_replacement_do_not_clobber_new_state ... ok
+test gui::state::notebook_actions::tests::product_0162_deadline_has_unknown_outcome_and_late_load_cannot_install ... ok
+test gui::state::notebook_actions::tests::product_0162_duplicate_cell_names_and_oversized_notebooks_refuse_inspection ... ok
+test gui::state::notebook_actions::tests::product_0162_failures_and_preflight_refusals_are_distinct ... ok
+test gui::state::notebook_actions::tests::product_0162_headless_file_edit_run_and_publish_share_the_application ... ok
+test gui::state::notebook_actions::tests::product_0162_invalid_targets_and_body_bounds_refuse_without_edits ... ok
+test gui::state::notebook_actions::tests::product_0162_queued_typing_wins_over_a_stale_agent_edit_at_the_engine ... ok
+test gui::state::notebook_actions::tests::product_0162_unsupported_language_refuses_execution ... ok
+test gui::state::product_0158_driver_tests::a_toron_view_orphaned_by_its_source_is_labelled_and_not_published ... ok
+test gui::state::product_0158_driver_tests::product_0158_actions_are_the_legends_and_loaded_is_not_live ... ok
+test gui::state::product_0158_driver_tests::product_0158_describe_opens_a_saved_session ...
+running 1 test
+test gui::state::product_0158_driver_tests::product_0158_describe_opens_a_saved_session ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1424 filtered out; finished in 0.01s
+
+ok
+test gui::state::product_0158_driver_tests::product_0158_loaded_is_the_initial_live_state_and_survives_commands ... ok
+test gui::state::product_0158_driver_tests::product_0158_publish_is_the_menus ... ok
+test gui::state::product_0158_driver_tests::product_0158_resize_to_the_current_size_is_complete ... ok
+test gui::state::product_0158_driver_tests::product_0158_stale_incarnations_are_refused_with_the_current_one ... ok
+test gui::state::product_0158_driver_tests::product_0160_applied_and_refused_receipts_are_unchanged_by_failed ... ok
+test gui::state::product_0158_driver_tests::product_0160_baseline_precedes_client_and_is_replaced_on_rerun ... ok
+test gui::state::product_0158_driver_tests::product_0160_batch_publish_write_failure_is_a_failure_with_the_root ... ok
+test gui::state::product_0158_driver_tests::product_0160_batch_resize_deadline_is_a_failure_with_the_observed_size ... ok
+test gui::state::product_0158_driver_tests::product_0160_human_and_agent_hide_commute_on_the_legend_path ... ok
+test gui::state::product_0158_driver_tests::product_0160_live_actions_and_publish_share_batch_receipts ... ok
+test gui::state::product_0158_driver_tests::product_0160_missing_baseline_is_reported_absent_not_fabricated ... ok
+test gui::state::product_0158_driver_tests::product_0160_resize_deadline_reports_observed_size_without_rollback ... ok
+test gui::state::product_0158_driver_tests::product_0160_resize_finishes_supersedes_and_survives_disconnect ... ok
+test gui::state::product_0158_driver_tests::product_0160_same_view_name_in_two_sources_requires_an_incarnation ... ok
+test gui::state::product_0159_probe_tests::product_0159_probe_first_tick_counts_startup_delay ... ok
+test gui::state::product_0159_probe_tests::product_0159_probe_measures_a_stall_once_under_either_tick_convention ... ok
+test gui::state::publish::tests::product_0160_partial_publish_failure_keeps_files_and_reports_the_root ... ok
+test gui::state::tests::bad_plot_field_fails_only_its_spanned_sink_while_table_survives ... ok
+test gui::state::tests::bound_view_set_stops_without_dispatch_while_view_free_rune_still_runs_locally ... ok
+test gui::state::tests::close_with_an_owned_workspace_enters_visible_bounded_shutdown ... ok
+test gui::state::tests::diagnostic_popover_content_is_selectable_but_read_only ... ok
+test gui::state::tests::dogfood_multi_origin_views_populate_four_host_panels_without_a_dashboard ... ok
+test gui::state::tests::duplicate_view_names_refuse_through_the_head_with_both_spans ... ok
+test gui::state::tests::editor_activity_retires_transient_execution_feedback ... ok
+test gui::state::tests::execution_grouping_cannot_reorder_interleaved_host_panels ... ok
+test gui::state::tests::failed_origin_keeps_prior_content_stale_while_its_sibling_refreshes ... ok
+test gui::state::tests::fenced_sql_diagnostics_report_document_coordinates ... ok
+test gui::state::tests::first_frame_does_not_wait_for_local_discovery ... ok
+test gui::state::tests::local_discovery_attaches_only_ready_workspaces ... ok
+test gui::state::tests::matching_ready_observation_without_a_handle_confers_no_stop_authority ... ok
+test gui::state::tests::multi_origin_dispatch_is_independent_while_each_origin_keeps_shared_identity ... ok
+test gui::state::tests::non_tabular_sql_completion_stays_out_of_result_surfaces ... ok
+test gui::state::tests::one_origin_failure_does_not_cancel_its_sibling_dispatch ... ok
+test gui::state::tests::product_0014_compatibility_crosses_the_factory_and_returns_to_the_outer_span ... ok
+test gui::state::tests::product_0014_layered_view_completes_in_a_label_only_host_panel ... ok
+test gui::state::tests::product_0014_named_layer_edits_refresh_one_identity_and_destination ... ok
+test gui::state::tests::product_0014_one_layer_spelling_keeps_anonymous_identity_and_svg ... ok
+test gui::state::tests::product_0016_figure_headings_reach_canvas_and_source_only_chrome ... ok
+test gui::state::tests::product_0016_heading_lifecycle_keeps_destination_layout_and_atomic_canvas ... ok
+test gui::state::tests::product_0018_point_size_reaches_every_host_path_and_preserves_the_view ... ok
+test gui::state::tests::product_0020_stroke_width_reaches_host_and_combines_with_point_size ... ok
+test gui::state::tests::product_0022_bar_width_reaches_the_shared_result_and_real_host_panel ... ok
+test gui::state::tests::product_0027_focused_high_density_shape_parses_and_completes_every_sink ... ok
+test gui::state::tests::product_0030_live_identity_commits_with_content_and_retargets_by_length ... ok
+test gui::state::tests::product_0030_origins_and_views_keep_independent_banks_across_completion_order ... ok
+test gui::state::tests::product_0030_rune_default_authored_palette_and_unused_settings_are_exact ... ok
+test gui::state::tests::product_0032_skin_failures_are_destination_local ... ok
+test gui::state::tests::product_0032_skin_lifecycle_reuses_and_atomically_stales_one_host_panel ... ok
+test gui::state::tests::product_0035_authored_projection_resolves_once_without_advice_or_fallback ... ok
+test gui::state::tests::product_0035_authored_table_skin_resolution_is_per_sink_and_keeps_shared_identity ... ok
+test gui::state::tests::product_0035_projection_changes_reuse_panels_and_below_threshold_skin_replaces_stale ... ok
+test gui::state::tests::product_0036_exclusion_and_arbitrarily_small_positive_spans_render_exactly ... ok
+test gui::state::tests::product_0036_layered_bounds_reach_one_shared_cartesian_domain ... ok
+test gui::state::tests::product_0036_numeric_bounds_apply_per_axis_and_discrete_bounds_never_disappear ... ok
+test gui::state::tests::product_0038_tick_step_reaches_the_existing_renderer_with_and_without_bounds ... ok
+test gui::state::tests::product_0038_tick_step_refuses_discrete_and_dense_requests_at_their_spans ... ok
+test gui::state::tests::product_0039_minor_ticks_toggle_and_combined_capacity_are_attributed ... ok
+test gui::state::tests::product_0042_facet_reaches_the_head_as_structural_intent ... ok
+test gui::state::tests::product_0045_pane_table_skin_restyles_only_the_completed_draw ... ok
+test gui::state::tests::product_0046_category_scatter_point_size_uses_the_standalone_carrier ... ok
+test gui::state::tests::product_0052_completion_retains_authored_type_intent_without_resolving_application_state ... ok
+test gui::state::tests::product_0055_horizontal_bar_keeps_physical_axes_and_family_label_through_completion ... ok
+test gui::state::tests::product_0055_horizontal_pair_reaches_every_bar_spelling_and_its_register ... ok
+test gui::state::tests::product_0055_pair_refusal_is_attributed_to_the_complete_bar_sink ... ok
+test gui::state::tests::product_0058_bound_fields_resolve_before_bar_pair_and_channel_resolution ... ok
+test gui::state::tests::product_0058_bound_third_fields_share_inline_color_resolution_for_every_mark ... ok
+test gui::state::tests::product_0063_saved_startup_checkpoint_close_and_reopen_use_production_authority ...
+running 1 test
+test gui::state::tests::product_0063_saved_startup_checkpoint_close_and_reopen_use_production_authority ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1424 filtered out; finished in 0.85s
+
+ok
+test gui::state::tests::product_0063_sigkill_is_not_a_close_checkpoint ...
+running 1 test
+
+running 1 test
+test gui::state::tests::product_0063_sigkill_is_not_a_close_checkpoint ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1424 filtered out; finished in 0.02s
+
+ok
+test gui::state::tests::product_0064_stacked_members_keep_family_label_and_physical_axis_rules ... ok
+test gui::state::tests::product_0070_area_reaches_completion_with_cartesian_guides_and_fixed_orientation ... ok
+test gui::state::tests::product_0071_copied_identity_remains_the_exact_cli_authority ... ok
+test gui::state::tests::product_0071_joined_toron_workspace_chrome_omits_the_nonce ... ok
+test gui::state::tests::product_0072_percent_completion_fixes_value_domain_and_refuses_bounds ... ok
+test gui::state::tests::product_0075_plain_plot_owns_anonymous_zero_and_orphans_when_removed ... ok
+test gui::state::tests::product_0075_product_0149_markdown_plot_exports_exact_raster_data ... ok
+test gui::state::tests::product_0079_histogram_resolves_values_spans_order_and_skin_without_color_identity ... ok
+test gui::state::tests::product_0080_product_0033_ordered_skin_installs_chrome_and_mark_style_atomically ... ok
+test gui::state::tests::product_0082_box_resolves_aliases_values_and_failure_scope ... ok
+test gui::state::tests::product_0084_rune_transport_preserves_one_artifact_allocation ... ok
+test gui::state::tests::product_0091_rune_continuous_intent_reaches_planning_and_modifier_diagnostics ... ok
+test gui::state::tests::product_0092_heatmap_resolves_and_attributes_binding_and_cell_refusals ... ok
+test gui::state::tests::product_0095_bubble_resolves_and_attributes_all_five_roles ... ok
+test gui::state::tests::product_0098_funnel_resolves_identity_and_attributes_every_refusal ... ok
+test gui::state::tests::product_0100_radial_dial_resolves_identity_and_attributes_every_refusal ... ok
+test gui::state::tests::product_0103_pie_resolves_identity_and_attributes_slice_refusals ... ok
+test gui::state::tests::product_0105_multivariate_resolution_keeps_dimension_and_modifier_attribution ... ok
+test gui::state::tests::product_0130_tick_every_reaches_a_styled_single_temporal_layer ... ok
+test gui::state::tests::product_0130_tick_every_reaches_temporal_axes_and_refuses_invalid_destinations ... ok
+test gui::state::tests::product_0134_creation_double_entry_mismatch_writes_no_file ... ok
+test gui::state::tests::product_0134_edit_with_a_changed_name_renames_the_profile ... ok
+test gui::state::tests::product_0134_profile_saved_in_one_process_connects_in_the_next ... ok
+test gui::state::tests::product_0134_save_refusals_and_delete_follow_the_identity_rules ... ok
+test gui::state::tests::product_0134_unlock_prompts_only_on_request_and_cancel_is_routine ... ok
+test gui::state::tests::product_0134_wrong_passphrase_retries_and_the_store_survives ... ok
+test gui::state::tests::product_0135_cancel_advances_generation_and_drains_the_queue ... ok
+test gui::state::tests::product_0135_cancel_outcomes_follow_the_capability ... ok
+test gui::state::tests::product_0135_late_results_from_a_cancelled_generation_change_nothing ... ok
+test gui::state::tests::product_0135_stale_generation_task_never_dispatches ... ok
+test gui::state::tests::product_0136_notebook_receipts_survive_without_a_plot_and_beside_plot_errors ... ok
+test gui::state::tests::product_0136_notebook_refuses_only_when_it_produces_nothing ... ok
+test gui::state::tests::product_0137_materialization_renders_a_routine_receipt ... ok
+test gui::state::tests::product_0137_terminal_relation_with_rows_refuses_rather_than_dropping ... ok
+test gui::state::tests::product_0144_checked_in_probe_has_repeated_but_not_total_cell_occupancy ... ok
+test gui::state::tests::product_0144_hexbin_resolves_without_identity_and_attributes_both_failure_stations ... ok
+test gui::state::tests::product_0146_checked_in_probe_is_idempotent_and_crosses_at_row_two ... ok
+test gui::state::tests::product_0146_fill_between_attributes_resolution_preparation_and_structure ... ok
+test gui::state::tests::product_0148_candlestick_attributes_resolution_preparation_and_structure ... ok
+test gui::state::tests::product_0148_checked_in_probe_is_idempotent_and_tears_high_at_row_two ... ok
+test gui::state::tests::product_0150_commit_revalidates_the_current_pane_provenance ... ok
+test gui::state::tests::product_0151_pending_export_rebuilds_the_dispatch_revision_exactly ... ok
+test gui::state::tests::rune_configuration_failure_is_projected_without_blocking_startup ... ok
+test gui::state::tests::rune_diagnostics_compact_the_toolbar_and_keep_full_hover_detail ... ok
+test gui::state::tests::rune_execution_error_uses_toolbar_without_manufacturing_a_result_pane ... ok
+test gui::state::tests::rune_relation_results_feed_the_existing_table_and_plot_surfaces ... ok
+test gui::state::tests::spent_creation_failure_does_not_reoffer_or_retry ... ok
+test gui::state::tests::sql_error_keeps_full_detail_without_manufacturing_a_result_pane ... ok
+test gui::state::tests::startup_success_enters_the_existing_attach_path_only_after_ready ... ok
+test gui::state::tests::tabular_sql_completion_claims_the_result_surface ... ok
+test gui::state::tests::unavailable_workspace_keeps_scratch_explicitly_attributed ... ok
+test gui::state::tests::view_identity_reuses_retargets_or_orphans_one_panel_as_declared ... ok
+test gui::state::welcome::tests::product_0161_offline_welcome_runs_real_cells_and_own_file_publishes ... ok
+test gui::state::welcome::tests::product_0161_workspace_path_against_an_isolated_profile ... ignored, requires an isolated XDG profile; set POLARITON_0161_WORKSPACE_EXPECT to ready or missing
+test gui::state::welcome::tests::product_0161_workspace_source_preserves_the_notebook_buffer ... ok
+test gui::statusbar::core::tests::elapsed_time_changes_units_at_exact_boundaries ... ok
+test gui::statusbar::core::tests::elapsed_time_uses_the_largest_human_scale_with_three_significant_digits ... ok
+test gui::table::tests::click_shift_drag_copy_and_escape_cover_the_selection_contract ... ok
+test gui::table::tests::content_widths_are_independent_of_viewport_width ... ok
+test gui::table::tests::headers_and_cells_share_schema_driven_alignment ... ok
+test gui::table::tests::horizontal_scroll_refits_when_the_viewport_grows ... ok
+test gui::table::tests::measured_widths_include_symmetric_padding_and_stay_bounded ... ok
+test gui::table::tests::product_0023_pre_extraction_draw_operation_oracle ... ok
+test gui::table::tests::product_0023_skin_changes_every_color_role_and_nothing_else ... ok
+test gui::table::tests::product_0023_table_artifact_draw_is_clipped_to_its_content_bounds ... ok
+test gui::table::tests::product_0052_type_visibility_uses_the_existing_draw_path_and_keeps_default_pixels ... ok
+test gui::table::tests::product_0151_release_and_escape_are_the_only_table_selection_publications ... ok
+test gui::table::tests::text_padding_is_symmetric_inside_the_column ... ok
+test gui::table::tests::the_selection_contract_holds_at_a_nonzero_panel_origin ... ok
+test gui::table_skin::tests::product_0023_every_builtin_meets_text_contrast_after_declared_alpha_compositing ... ok
+test gui::table_skin::tests::product_0023_selection_compositing_consumes_the_skin_declared_alpha ... ok
+test gui::table_skin::tests::product_0024_fractional_composites_retain_product_0023_ratios_without_quantization ... ok
+test gui::table_skin::tests::product_0025_order_permutations_remain_visible_in_table_roles ... ok
+test gui::table_skin::tests::product_0025_terrain_rs10_projects_every_role_and_passes_visible_contrast ... ok
+test gui::table_skin::tests::product_0026_complete_pre_refactor_duotone_oracle ... ok
+test gui::table_skin::tests::product_0026_neutral_selection_is_maximin_and_ties_choose_near_black ... ok
+test gui::table_skin::tests::product_0026_palette_forward_observes_final_role_order ... ok
+test gui::table_skin::tests::product_0026_pre_refactor_named_duotone_anchors_are_readable ... ok
+test gui::table_skin::tests::product_0026_split_polarity_palette_fails_both_mechanisms_with_distinct_facts ... ok
+test gui::table_skin::tests::product_0026_yellows_separates_duotone_from_palette_forward ... ok
+test gui::table_skin::tests::product_0035_every_canonical_projection_completes_and_retains_its_measurement ... ok
+test gui::table_skin::tests::product_0035_every_registered_sample_projects_even_below_visible_contrast ... ok
+test gui::table_skin::tests::product_0035_projection_distinguishes_unknown_from_defined_degenerate_theme ... ok
+test gui::table_skin::tests::product_0045_bad_application_falls_to_the_floor_but_bad_authored_refuses ... ok
+test gui::table_skin::tests::product_0045_table_skin_cascade_bakes_through_authored_and_flattens_pane ... ok
+test live::client::tests::adr_0173_partial_write_timeout_is_unknown_and_not_replayed ... ok
+test live::client::tests::product_0160_act_accepts_one_selector_and_one_script ... ok
+test live::client::tests::product_0160_script_advances_after_completion_or_satisfied_resize ... ok
+test live::client::tests::product_0160_script_waits_for_final_answers_and_does_not_replay_unknowns ... ok
+test live::client::tests::product_0160_window_selection_is_explicit ... ok
+test live::discovery::tests::product_0160_discovery_is_unique_and_prunes_reused_pids ... ok
+test live::transport::tests::product_0160_oversized_and_partial_lines_cannot_be_requests ... ok
+test live::transport::tests::product_0160_reply_bounds_and_latest_snapshot_never_wait ... ok
+test live::transport::tests::product_0160_slow_socket_gets_latest_picture_and_full_answers_disconnect ... ok
+test live::transport::tests::product_0160_socket_ids_are_connection_scoped_and_busy_does_not_queue ... ok
+test local_workspace::tests::absent_offers_exactly_one_creation_grant ... ok
+test local_workspace::tests::dedicated_owner_survives_worker_reaping_while_the_control_dies ... ok
+test local_workspace::tests::diagnostics_are_attributed_and_truncated_on_a_utf8_boundary ... ok
+test local_workspace::tests::executable_candidates_must_be_regular_and_executable ... ok
+test local_workspace::tests::graceful_stop_waits_and_the_deadline_is_bounded ... ok
+test local_workspace::tests::initiator_process_helper ... ok
+test local_workspace::tests::killing_the_initiator_leaves_no_supervisor_or_role ... ok
+test local_workspace::tests::parent_death_uses_sigint_and_preserves_drain_order ... ok
+test local_workspace::tests::readiness_requires_discovery_and_times_out_while_absent ... ok
+test local_workspace::tests::supervisor_process_helper ... ok
+test mcp::tests::absent_window_is_a_structured_bridge_error_and_bad_arguments_are_protocol_errors ... ok
+test mcp::tests::batch_tests::drive_receipts_determine_outcome_and_invalid_receipts_report_unknown ... ok
+test mcp::tests::batch_tests::external_kill_before_and_after_receipt_and_cancellation_reap_the_child ... ok
+test mcp::tests::every_command_has_a_valid_schema ... ok
+test mcp::tests::integral_float_spelling_is_refused_by_wire_decoder_as_invalid_params ... ok
+test mcp::tests::lifecycle_negotiates_and_gates_without_replying_to_notifications ... ok
+test mcp::tests::live_output_schema_accepts_only_settling_events_and_bridge_errors ... ok
+test mcp::tests::malformed_json_reports_protocol_error_and_notifications_get_no_answer ... ok
+test mcp::tests::mcp_drive_cancel_and_eof_send_no_answer_and_reap_the_child ... ok
+test mcp::tests::resources_tests::ambiguous_gone_and_no_welcome_windows_are_not_sent_and_not_refused ... ok
+test mcp::tests::resources_tests::closing_and_reopening_a_window_does_not_retarget_a_dispatched_call ... ok
+test mcp::tests::resources_tests::resource_subscribe_read_unsubscribe_and_window_list_changes ... ok
+test mcp::tests::schemas_and_wire_decode_agree_including_defaults ... ok
+test mcp::tests::tool_input_schemas_match_the_reviewed_snapshot ... ok
+test mcp::tests::unix::concurrent_ping_discovery_and_call_complete_while_run_waits_and_cancel_releases_it ... ok
+test mcp::tests::unix::exact_same_dispatch_events_and_unknown_are_returned_without_replay ... ok
+test mcp::tests::unsigned_wire_bounds_are_schema_assertions_not_only_format_annotations ... ok
+test mcp::transport::tests::framing_accepts_the_limit_and_closes_before_oversized_input_is_dispatched ... ok
+test plot::authoring_layout::tests::bar_layouts_match_the_kernel_in_both_orientations ... ok
+test plot::authoring_layout::tests::kernel_building_families_match_the_kernel ... ok
+test plot::authoring_layout::tests::layered_layouts_match_the_kernel ... ok
+test plot::authoring_layout::tests::line_layout_matches_the_kernel ... ok
+test plot::authoring_layout::tests::line_layout_over_a_temporal_x_matches_the_kernel ... ok
+test plot::authoring_layout::tests::probe_resolved_plot_layout_at_the_raster_fixture_size ... ignored
+test plot::authoring_layout::tests::scatter_layout_matches_the_kernel ... ok
+test plot::authoring_layout::tests::scatter_layout_over_a_categorical_x_matches_the_kernel ... ok
+test plot::authoring_layout::tests::scatter_layout_over_a_temporal_x_matches_the_kernel ... ok
+test plot::authoring_layout::tests::scatter_with_line_overlay_layout_matches_the_kernel ... ok
+test plot::authoring_layout::tests::stacked_area_layouts_match_the_kernel_for_both_normalizations ... ok
+test plot::chrome::tests::product_0031_rgba_rejects_invalid_channels_without_clamping ... ok
+test plot::chrome::tests::product_0031_thresholds_are_assigned_by_semantic_role ... ok
+test plot::chrome::tests::product_0032_nord_is_complete_and_validated ... ok
+test plot::chrome::tests::product_0033_ordered_modifiers_remain_visible_and_duotone_collapses_explicitly ... ok
+test plot::chrome::tests::product_0034_tab20c_s9_renders_and_reports_its_title_fact ... ok
+test plot::chrome::tests::product_0034_theme_grammar_census_always_completes_and_retains_facts ... ok
+test plot::chrome::tests::product_0034_unknown_refuses_but_low_range_remains_observable ... ok
+test plot::chrome::tests::product_0067_defaults_pass_while_the_retired_grid_remains_a_falsifiable_control ... ok
+test plot::chrome::tests::product_0067_only_grid_alpha_supersedes_the_omitted_skin_compatibility_bank ... ok
+test plot::chrome::tests::product_0083_all_mark_roles_map_at_every_entry_point_and_remain_opaque ... ok
+test plot::chrome::tests::product_0083_product_0080_default_mark_pairs_pass_but_authored_low_contrast_is_exact ... ok
+test plot::chrome::tests::product_0145_fill_detail_tracks_anchor_distinctness_across_plot_skins ... ok
+test plot::colors::tests::product_0087_canonical_midpoints_and_constant_ramps_are_explicit ... ok
+test plot::colors::tests::product_0087_every_theme_is_bit_exact_against_the_stage_zero_bank ... ok
+test plot::colors::tests::product_0091_ramp_tokens_and_categorical_palette_identities_do_not_cross_resolve ... ok
+test plot::colors::tests::product_0091_ramp_tokens_are_complete_injective_and_round_trip ... ok
+test plot::common::product_0031_pre_extraction_oracle::product_0031_banks_the_two_field_renderer_before_extraction ... ok
+test plot::common::product_0031_pre_extraction_oracle::product_0050_canvas_presence_keeps_all_three_pixel_states_distinct ... ok
+test plot::common::product_0031_pre_extraction_oracle::product_0051_default_legend_tracks_the_plot_top_across_headings_and_large_resizes ... ok
+test plot::common::product_0037_count_position_oracle::product_0037_banks_count_eight_major_and_minor_positions_before_refactor ... ok
+test plot::common::product_0037_count_position_oracle::product_0037_count_generator_matches_the_banked_oracle ... ok
+test plot::common::product_0037_count_position_oracle::product_0037_step_is_zero_anchored_and_bounded ... ok
+test plot::common::product_0037_count_position_oracle::product_0037_step_rejects_invalid_values_and_capacity_without_truncation ... ok
+test plot::common::product_0037_count_position_oracle::product_0039_minor_subdivision_is_counted_and_capacity_checked ... ok
+test plot::common::product_0056_categorical_y_oracles::product_0056_categorical_frames_and_x_axes_ignore_domain_order_and_count ... ok
+test plot::common::product_0056_categorical_y_oracles::product_0056_transformers_map_every_categorical_y_index_top_down ... ok
+test plot::common::product_0056_categorical_y_oracles::product_0113_parallel_header_uses_x_label_size_for_its_size_and_clearance ... ok
+test plot::common::product_0056_categorical_y_oracles::product_0113_typed_title_and_subtitle_sizes_reach_canvas_text ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0067_marks_free_render_changes_only_the_default_grid_alpha ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0068_disabling_every_grid_is_byte_identical_to_the_retired_strata ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0068_guides_precede_marks_and_furniture_follows_for_every_gridded_layout ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0072_percent_axis_formats_percentage_points_and_admits_steps ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0079_plot_area_clip_keeps_background_below_grid_and_marks ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0085_axis_title_derivation_is_semantic_and_presence_still_wins ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0112_hover_size_leaves_the_canvas_draw_list_unchanged ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0113_heading_band_is_the_maximum_of_typed_title_and_subtitle_contributions ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0127_banks_each_temporal_variant_by_placement_policy ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0127_empty_selections_change_only_the_requirement ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0127_selected_requirement_matches_the_emitted_tick_text ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0128_temporal_domain_retains_exact_nanosecond_endpoints_before_float ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0128_zoned_datetime_keeps_its_declared_display_frame ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0129_temporal_selector_preserves_fixed_calendar_matrix_and_boundaries ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0129_temporal_stride_is_positive_only_after_shared_literal_parsing ... ok
+test plot::common::product_0067_0068_strata_oracles::product_0130_temporal_tick_placement_drives_the_same_render_and_band_selection ... ok
+test plot::common::product_0067_0068_strata_oracles::radial_layouts_never_attempt_to_draw_cartesian_axis_titles ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0106_reserved_bounds_keep_the_data_mapping_proportional ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0106_title_subtitle_and_facet_reservations_are_resolved_once ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0106_zero_title_and_facet_cases_preserve_the_previous_plot_area ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0114_band_requirements_are_layout_derived_and_move_only_their_bands ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0114_bottom_band_tracks_direct_rotation_without_a_surface ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0114_grid_cells_do_not_apply_a_second_shared_edge_inset ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0115_bottom_guides_sequence_the_title_after_rotated_ticks ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0116_estimation_never_moves_rotated_tick_ink ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0117_class_budget_moves_only_the_derived_category_band_delta ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0119_estimation_never_moves_x_tick_ink ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0120_padding_edges_floor_guides_and_move_only_their_boundaries ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0122_each_axis_and_tick_size_moves_only_its_reserved_band ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0124_facet_label_reservation_tracks_its_own_typed_size ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0126_left_guides_sequence_the_title_after_a_long_tick_run ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0126_reservation_and_placement_read_one_left_guide ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0126_stage_0_banks_a_gap_the_legacy_short_label_geometry_affords ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0126_the_y_tick_estimate_reserves_the_band_without_placing_ink ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0127_banks_the_complete_selected_label_matrix ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0127_empty_selected_ticks_reserve_no_left_clearance ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0127_requirements_carry_placement_and_measure_selected_labels ... ok
+test plot::common::product_0106_vertical_guide_band_oracles::product_0131_allocation_preserves_the_minimum_share_and_leads_first ... ok
+test plot::common::product_0133_structured_hit_tests::axis_hit_value_is_temporal_only_for_temporal_axes ... ok
+test plot::common::product_0133_structured_hit_tests::typed_hit_preserves_dimension_order_and_temporal_values ... ok
+test plot::common::product_0139_settings_authority::product_0139_plot_widget_derives_geometry_from_the_kernels_resolution ... ok
+test plot::common::product_0139_settings_authority::product_0139_the_geometry_the_widget_lays_out_follows_the_authority ... ok
+test plot::common::product_0139_settings_authority::product_0139_the_two_resolutions_disagree_for_this_fixture ... ok
+test plot::common::product_0150_gesture_tests::product_0150_active_rectangle_layout_scope_and_arbitration_refuse_without_publish ... ok
+test plot::common::product_0150_gesture_tests::product_0150_hover_is_suppressed_while_moving_and_resumes_when_settled ... ok
+test plot::common::product_0150_gesture_tests::product_0150_one_widget_chains_a_batched_drag_and_wheel_burst ... ok
+test plot::common::product_0150_gesture_tests::product_0150_press_move_release_uses_the_press_geometry_and_settle_stamp ... ok
+test plot::common::product_0150_gesture_tests::product_0150_press_transform_is_repeatable_and_zoom_reflow_drift_is_affine ... ok
+test plot::common::product_0150_gesture_tests::product_0150_wheel_is_quiet_stamped_and_bare_double_click_resets ... ok
+test plot::common::product_0150_gesture_tests::product_0150_zoom_is_cursor_anchored_and_refuses_below_both_floors ... ok
+test plot::common::product_0151_selection_geometry_tests::product_0151_between_ticks_is_an_empty_interval_that_still_reprojects ... ok
+test plot::common::product_0151_selection_geometry_tests::product_0151_brush_rounds_integral_and_temporal_edges_inward ... ok
+test plot::common::product_0151_selection_geometry_tests::product_0151_facet_brush_carries_the_exact_partition_constraint ... ok
+test plot::common::product_0151_selection_geometry_tests::product_0151_interval_emphasis_reprojects_after_viewport_reflow_and_rebuild ... ok
+test plot::common::product_0151_selection_gesture_tests::product_0151_escape_clears_only_an_active_selection_under_the_cursor ... ok
+test plot::common::product_0151_selection_gesture_tests::product_0151_shift_alt_toggles_while_bare_alt_still_pans ... ok
+test plot::common::product_0151_selection_gesture_tests::product_0151_shift_click_is_reachable_and_default_projection_refuses ... ok
+test plot::common::settings_gesture_tests::ctrl_double_click_activates_plot_settings_gesture ... ok
+test plot::common::settings_gesture_tests::ordinary_double_click_does_not_activate_plot_settings ... ok
+test plot::common::settings_gesture_tests::releasing_ctrl_cancels_an_incomplete_settings_gesture ... ok
+test plot::continuous_color::tests::product_0089_jobs_anchor_provenance_and_degenerate_domains_are_total ... ok
+test plot::continuous_color::tests::product_0089_outside_values_clamp_and_nonfinite_values_panic ... ok
+test plot::continuous_color::tests::product_0089_piecewise_scale_uses_both_arms_and_round_trips ... ok
+test plot::durable::tests::live_plot_re_resolves_an_integer_x_to_a_string_point_scale ... ok
+test plot::durable::tests::pinned_plot_keeps_spec_across_viewports_current_revision_and_resolver_drift ... ok
+test plot::durable::tests::pinned_revision_failure_keeps_last_result_and_is_explicitly_attributed ... ok
+test plot::durable::tests::store_is_session_scoped_and_owns_no_persistence_surface ... ok
+test plot::exact_numeric::tests::product_0096_exact_f64_distinguishes_the_integer_boundary ... ok
+test plot::export::product_0101_tests::product_0101_both_adapters_emit_one_connected_annulus_with_radial_caps ... ok
+test plot::export::product_0101_tests::product_0101_pie_connection_lone_arc_and_current_endpoint_are_distinct ... ok
+test plot::export::product_0159_tests::product_0159_opaque_batch_is_byte_identical_to_the_compound_path ... ok
+test plot::export::product_0159_tests::product_0159_showcase_and_fixture_exports_are_byte_identical_to_the_compound_path ... ok
+test plot::export::product_0159_tests::product_0159_translucent_batch_composites_per_mark_in_svg_and_png ... ok
+test plot::factory::product_0013_baseline_tests::product_0013_layered_svg_paints_scatter_after_line ... ok
+test plot::factory::product_0013_baseline_tests::product_0013_one_layer_line_keeps_existing_svg ... ok
+test plot::factory::product_0013_baseline_tests::product_0013_one_layer_scatter_keeps_existing_svg ... ok
+test plot::factory::product_0013_baseline_tests::product_0013_pre_extraction_line_svg_baseline ... ok
+test plot::factory::product_0013_baseline_tests::product_0013_pre_extraction_scatter_svg_baseline ... ok
+test plot::factory::product_0013_baseline_tests::product_0013_shared_domain_comes_from_common_source_columns ... ok
+test plot::factory::product_0013_baseline_tests::product_0017_layered_vector_and_downsampled_use_each_resolved_point_size ... ok
+test plot::factory::product_0013_baseline_tests::product_0017_point_size_does_not_acquire_guide_behavior ... ok
+test plot::factory::product_0013_baseline_tests::product_0017_styled_hit_uses_the_layer_resolved_radius ... ok
+test plot::factory::product_0013_baseline_tests::product_0019_default_and_doubled_line_widths_keep_one_drawing_body ... ok
+test plot::factory::product_0013_baseline_tests::product_0019_line_layers_paint_independent_resolved_widths ... ok
+test plot::factory::product_0013_baseline_tests::product_0019_stroke_width_does_not_acquire_guide_behavior ... ok
+test plot::factory::product_0013_baseline_tests::product_0019_styled_hit_follows_half_stroke_plus_fixed_tolerance ... ok
+test plot::factory::product_0013_baseline_tests::product_0021_bar_hit_uses_the_same_visible_rectangle_as_paint ... ok
+test plot::factory::product_0013_baseline_tests::product_0021_bar_width_changes_no_layout_preparation_or_guide ... ok
+test plot::factory::product_0013_baseline_tests::product_0021_bar_width_occupies_the_full_band_slot_in_both_orientations ... ok
+test plot::factory::product_0013_baseline_tests::product_0021_full_band_default_retires_the_legacy_inset ... ok
+test plot::factory::product_0013_baseline_tests::product_0029_bar_draw_consumes_exact_band_fills_in_category_order ... ok
+test plot::factory::product_0013_baseline_tests::product_0043_composite_corpus_sections_cover_both_delegations ... ok
+test plot::factory::product_0013_baseline_tests::product_0043_corpus_is_historical_and_renderer_is_byte_stable_for_fixed_content ... ok
+test plot::factory::product_0013_baseline_tests::product_0043_gradient_and_dual_legends_keep_their_structural_geometry ... ok
+test plot::factory::product_0013_baseline_tests::product_0044_band_fill_bars_omit_legends_but_authored_series_keep_them ... ok
+test plot::factory::product_0013_baseline_tests::product_0044_layered_legend_unions_paint_order_without_flattening_samples ... ok
+test plot::factory::product_0013_baseline_tests::product_0047_series_bar_earns_the_legend_the_two_field_form_declines ... ok
+test plot::factory::product_0013_baseline_tests::product_0047_series_bar_groups_by_channel_and_suppresses_band_fills ... ok
+test plot::factory::product_0013_baseline_tests::product_0047_single_valued_series_still_suppresses_band_fills ... ok
+test plot::factory::product_0013_baseline_tests::product_0054_factory_routes_resolved_colors_to_line_paint_and_legend ... ok
+test plot::factory::product_0013_baseline_tests::product_0054_filter_and_restore_keep_line_identity_at_the_renderer_boundary ... ok
+test plot::factory::product_0013_baseline_tests::product_0054_scatter_line_overlay_shares_each_resolved_series_color ... ok
+test plot::factory::product_0013_baseline_tests::product_0054_standalone_styled_factory_admits_the_series_line ... ok
+test plot::factory::product_0013_baseline_tests::product_0055_real_resolution_drives_grouped_horizontal_geometry_color_hit_and_hover ... ok
+test plot::factory::product_0013_baseline_tests::product_0064_degenerate_stack_matches_grouped_geometry_and_band_fill ... ok
+test plot::factory::product_0013_baseline_tests::product_0064_real_surface_joins_geometry_hit_color_legend_and_orientation ... ok
+test plot::factory::product_0013_baseline_tests::product_0070_factory_routes_resolved_area_colors_to_fills_and_named_swatches ... ok
+test plot::factory::product_0013_baseline_tests::product_0130_styled_single_temporal_layer_retains_exact_domains ... ok
+test plot::factory::product_0013_baseline_tests::product_0133_overlay_composites_apply_the_same_hit_priority ... ok
+test plot::factory::product_0013_baseline_tests::product_0133_structured_hit_prefers_point_over_line_regardless_of_paint_order ... ok
+test plot::factory::product_0013_baseline_tests::product_0139_the_plot_area_clip_follows_the_mark_not_the_kernel ... ok
+test plot::gradient_stops::tests::product_0087_stop_validation_is_total_and_constant_ramps_survive ... ok
+test plot::grid::tests::bank_unfaceted_one_cell_parity_oracle ... ok
+test plot::grid::tests::empty_relation_is_the_degenerate_one_cell_grid ... ok
+test plot::grid::tests::faceted_cartesian_cells_share_their_domain ... ok
+test plot::grid::tests::faceting_by_the_authored_color_field_renders_sticky_colors ... ok
+test plot::grid::tests::four_cell_value_facet_renders_four_regions ... ok
+test plot::grid::tests::grid_hover_hits_cells_under_nonzero_bounds_origin ... ok
+test plot::grid::tests::grid_regions_are_disjoint_and_multi_cell_rendering_is_composite ... ok
+test plot::grid::tests::grid_rejects_mixed_groups_bodies_and_positions ... ok
+test plot::grid::tests::grid_rendering_is_invariant_to_bounds_origin ... ok
+test plot::grid::tests::multi_cell_layers_draw_nothing_outside_clip_groups ... ok
+test plot::grid::tests::one_cell_grid_matches_the_ordinary_svg_path ... ok
+test plot::grid::tests::product_0042_facet_arrangement_is_wide_and_row_major ... ok
+test plot::grid::tests::product_0042_faceted_bars_retain_their_values ... ok
+test plot::grid::tests::product_0044_grid_renders_one_figure_legend_from_cell_union ... ok
+test plot::grid::tests::product_0047_faceted_series_cells_keep_their_own_stable_colors ... ok
+test plot::grid::tests::product_0048_group_comparison_restores_text_for_differing_groups ... ok
+test plot::grid::tests::product_0048_gutter_geometry_is_congruent_and_reclaims_space ... ok
+test plot::grid::tests::product_0048_partial_row_text_lands_directly_in_the_empty_below_slot ... ok
+test plot::grid::tests::product_0048_shared_edges_suppress_only_repeated_tick_text ... ok
+test plot::grid::tests::product_0054_faceted_series_lines_keep_panel_blind_colors_and_one_union_legend ... ok
+test plot::grid::tests::product_0055_faceted_horizontal_bars_keep_shared_domains_colors_and_one_legend ... ok
+test plot::grid::tests::product_0056_faceted_horizontal_labels_payloads_and_colors_flip_together ... ok
+test plot::grid::tests::product_0064_faceted_stacks_keep_shared_domains_panel_blind_colors_and_one_legend ... ok
+test plot::grid::tests::product_0065_box_and_violin_address_shared_slots_by_category_identity ... ok
+test plot::grid::tests::product_0065_categorical_scatter_already_uses_the_resolved_domain ... ok
+test plot::grid::tests::product_0065_categorical_x_shares_ragged_domain_and_payload_slots ... ok
+test plot::grid::tests::product_0065_categorical_y_shares_ragged_domain_and_payload_slots ... ok
+test plot::grid::tests::product_0066_global_heading_band_separates_first_row_facet_labels ... ok
+test plot::grid::tests::product_0068_each_facet_cell_clips_grid_then_mark_before_shared_furniture ... ok
+test plot::grid::tests::product_0070_faceted_areas_share_domains_panel_blind_colors_and_one_legend ... ok
+test plot::grid::tests::product_0072_faceted_percent_stacks_share_axis_type_and_fixed_domain ... ok
+test plot::grid::tests::product_0077_all_numeric_layouts_emit_inward_endpoints_and_keep_categories_centred ... ok
+test plot::grid::tests::product_0077_bound_coincidence_is_shared_and_does_not_mean_last_tick ... ok
+test plot::grid::tests::product_0077_categorical_xy_ignores_numeric_boundary_anchors ... ok
+test plot::grid::tests::product_0077_grid_geometry_remains_twelve_pixel_congruent ... ok
+test plot::grid::tests::product_0077_occupied_neighbors_choose_only_inward_bound_anchors ... ok
+test plot::grid::tests::product_0085_authored_axis_titles_remain_one_per_shared_side ... ok
+test plot::grid::tests::product_0097_funnel_hover_uses_the_drawn_geometry_in_both_facet_cells ... ok
+test plot::grid::tests::product_0097_radial_hover_uses_the_drawn_geometry_in_both_facet_cells ... ok
+test plot::grid::tests::product_0098_authored_funnel_hover_uses_the_non_origin_facet_geometry ... ok
+test plot::grid::tests::product_0100_authored_radial_dial_hover_uses_the_non_origin_facet_geometry ... ok
+test plot::grid::tests::product_0103_authored_pie_hover_uses_the_non_origin_facet_geometry ... ok
+test plot::grid::tests::product_0106_title_facet_and_parallel_header_bands_do_not_overlap ... ok
+test plot::grid::tests::product_0110_facet_gutter_is_one_shared_boundary_and_clamps_only_geometry ... ok
+test plot::grid::tests::product_0119_grid_tick_labels_remain_attached_at_two_widths ... ok
+test plot::grid::tests::product_0127_unequal_domains_share_one_selected_requirement_before_tiling ... ok
+test plot::grid::tests::product_0139_a_facet_cannot_reuse_and_an_unfaceted_plot_can ... ok
+test plot::grid::tests::product_0139_cell_geometry_resolves_through_the_cell_kernel ... ok
+test plot::grid::tests::product_0139_per_cell_conditions_for_reuse_hold_across_a_viewport_move ... ok
+test plot::grid::tests::product_0140_facet_cell_gate_input_evidence ... ignored, PRODUCT-0140 gate-input evidence
+test plot::grid::tests::product_0140_facet_cold_raster_evidence ... ignored, PRODUCT-0140 gate pricing; allocates multi-million-point frames
+test plot::grid::tests::product_0149_facets_request_and_draw_through_stable_cell_slots ... ok
+test plot::grid::tests::product_0150_facet_gesture_selects_the_cursor_cell_and_shared_domain_not_the_gutter ... ok
+test plot::grid::tests::product_0150_faceted_hexbin_defers_motion_and_rebins_once_per_cell_at_settle ... ok
+test plot::grid::tests::product_0151_facet_projection_scans_once_then_reprojects_without_scanning ... ok
+test plot::grid::tests::product_0156_grid_shares_identity_and_keeps_legend_geometry ... ok
+test plot::grid::tests::value_facet_capacity_is_a_work_bound_with_no_truncation ... ok
+test plot::grid::tests::value_facet_preserves_partition_order_and_exact_slices ... ok
+test plot::grid::tests::value_facet_rederives_order_after_sort_or_filter ... ok
+test plot::kernels::bar::tests::product_0053_clusters_follow_transform_centers_and_gap_equations_when_resized ... ok
+test plot::kernels::bar::tests::product_0053_full_width_isolates_the_centered_category_reserve ... ok
+test plot::kernels::bar::tests::product_0053_paint_and_hit_share_visible_fill_and_category_reserve ... ok
+test plot::kernels::bar::tests::product_0053_single_series_composition_is_exactly_redundant ... ok
+test plot::kernels::bar::tests::product_0056_horizontal_labels_payloads_and_legend_share_top_down_order ... ok
+test plot::kernels::bar::tests::product_0151_bar_candidate_names_category_and_bound_group ... ok
+test plot::kernels::bar::tests::product_0151_duplicate_bar_pairs_keep_painting_first_but_refuse_click_selection ... ok
+test plot::kernels::bar::tests::values_follow_both_category_and_group_identity ... ok
+test plot::kernels::bar::tests::values_follow_category_identity_after_labels_are_sorted ... ok
+test plot::kernels::boxplot::tests::product_0081_box_probe_covers_all_five_traced_groups_end_to_end ... ok
+test plot::kernels::boxplot::tests::product_0081_coincident_offsets_preserve_values_and_contain_outlined_footprints ... ok
+test plot::kernels::boxplot::tests::product_0081_flat_and_single_boxes_keep_the_one_pixel_floor ... ok
+test plot::kernels::boxplot::tests::product_0081_hover_diff_changes_only_the_two_whisker_labels ... ok
+test plot::kernels::boxplot::tests::product_0081_outlier_points_use_resolved_mark_style_and_pinned_geometry ... ok
+test plot::kernels::boxplot::tests::product_0081_point_hover_wins_and_gaps_do_not_report_a_box ... ok
+test plot::kernels::boxplot::tests::product_0082_box_fill_is_one_resolved_role_and_legend_is_absent ... ok
+test plot::kernels::boxplot::tests::product_0082_lossless_integer_boundary_is_representability_not_magnitude ... ok
+test plot::kernels::boxplot::tests::product_0082_positional_ingestion_accepts_both_outlier_shapes_and_mixed_dtypes ... ok
+test plot::kernels::boxplot::tests::product_0083_box_elements_route_through_distinct_semantic_roles ... ok
+test plot::kernels::boxplot::tests::product_0151_box_and_outlier_candidates_have_the_closed_field_sets ... ok
+test plot::kernels::boxplot_tukey::tests::product_0081_domain_includes_outliers_padding_and_empty_fallback ... ok
+test plot::kernels::boxplot_tukey::tests::product_0081_duplicates_and_first_seen_orders_survive_ingestion ... ok
+test plot::kernels::boxplot_tukey::tests::product_0081_summary_equality_is_bitwise_but_outlier_clusters_are_numeric ... ok
+test plot::kernels::boxplot_tukey::tests::product_0081_validation_names_each_invalid_relation_shape ... ok
+test plot::kernels::bubble::tests::product_0087_bubble_omits_only_degenerate_colour_guides ... ok
+test plot::kernels::bubble::tests::product_0089_bubble_diverging_neutral_moves_from_twenty_five_to_zero ... ok
+test plot::kernels::bubble::tests::product_0090_empty_schema_is_validated_and_invented_guides_are_omitted ... ok
+test plot::kernels::bubble::tests::product_0090_missing_numeric_column_now_refuses_the_banked_panic ... ok
+test plot::kernels::bubble::tests::product_0090_null_and_failed_conversion_now_refuse_the_banked_fabrications ... ok
+test plot::kernels::bubble::tests::product_0090_null_label_is_absent_and_hover_keeps_quantitative_lines ... ok
+test plot::kernels::bubble::tests::product_0090_only_unselected_labels_generate_placeholders ... ok
+test plot::kernels::bubble::tests::product_0090_preparation_is_per_field_and_wraps_observation_errors_unchanged ... ok
+test plot::kernels::bubble::tests::product_0090_stage_zero_banks_well_formed_draw_list_and_hover ... ok
+test plot::kernels::bubble_observations::tests::product_0090_all_required_nulls_name_channel_field_and_one_based_row ... ok
+test plot::kernels::bubble_observations::tests::product_0090_domains_come_from_the_same_validated_observations ... ok
+test plot::kernels::bubble_observations::tests::product_0090_empty_observations_keep_only_axis_fallbacks ... ok
+test plot::kernels::bubble_observations::tests::product_0090_nonfinite_refusals_are_channel_ordered_with_a_finite_twin ... ok
+test plot::kernels::bubble_observations::tests::product_0090_null_precedes_nonfinite_within_a_row ... ok
+test plot::kernels::candlestick::tests::product_0147_column_and_numeric_faults_are_role_attributed ... ok
+test plot::kernels::candlestick::tests::product_0147_direction_is_geometry_with_resolved_colour_and_split_wicks ... ok
+test plot::kernels::candlestick::tests::product_0147_four_pixel_hollow_body_has_a_canvas_interior ... ok
+test plot::kernels::candlestick::tests::product_0147_hit_is_a_wide_column_with_axis_type_direction_and_first_collapse ... ok
+test plot::kernels::candlestick::tests::product_0147_structure_refuses_order_and_attributes_each_ohlc_bound ... ok
+test plot::kernels::candlestick::tests::product_0147_temporal_order_empty_identity_and_representable_domain_are_honest ... ok
+test plot::kernels::candlestick::tests::product_0147_validation_precedes_structure_and_parallel_vectors_are_unrepresentable ... ok
+test plot::kernels::candlestick::tests::product_0147_width_uses_minimum_delta_active_layout_and_plot_space_fallback ... ok
+test plot::kernels::candlestick::tests::product_0151_candlestick_candidate_uses_x_and_projects_one_column ... ok
+test plot::kernels::fill_between::tests::product_0145_column_and_numeric_cell_faults_are_role_attributed ... ok
+test plot::kernels::fill_between::tests::product_0145_hit_and_legend_are_middle_honest ... ok
+test plot::kernels::fill_between::tests::product_0145_optional_middle_empty_and_axis_identity_are_honest ... ok
+test plot::kernels::fill_between::tests::product_0145_paint_uses_resolved_opaque_roles_and_optional_stroke ... ok
+test plot::kernels::fill_between::tests::product_0145_structure_refuses_order_crossing_and_escape_but_allows_edges ... ok
+test plot::kernels::fill_between::tests::product_0145_temporal_order_uses_typed_values_and_collapsed_hit_is_first ... ok
+test plot::kernels::fill_between::tests::product_0145_validation_precedes_structure_and_carries_typed_roles ... ok
+test plot::kernels::fill_between::tests::product_0151_fill_between_candidate_is_the_source_x_column ... ok
+test plot::kernels::funnel::tests::product_0096_empty_schema_valid_frame_has_no_marks_or_legend ... ok
+test plot::kernels::funnel::tests::product_0096_exact_conversion_accepts_both_representable_boundary_values ... ok
+test plot::kernels::funnel::tests::product_0096_f64_geometry_change_and_shared_label_format_are_explicit ... ok
+test plot::kernels::funnel::tests::product_0096_preparation_is_field_first_and_admits_boolean_stages ... ok
+test plot::kernels::funnel::tests::product_0096_subunit_widths_match_equivalent_whole_values ... ok
+test plot::kernels::funnel::tests::product_0096_zero_predecessor_changes_only_the_stage_conversion ... ok
+test plot::kernels::funnel::tests::product_0098_authored_stage_colour_is_one_shared_paint_and_legend_authority ... ok
+test plot::kernels::funnel::tests::product_0098_binding_and_preparation_admit_the_same_role_dtypes ... ok
+test plot::kernels::funnel::tests::product_0098_funnel_uses_separator_fill_detail_and_label_text_distinctly ... ok
+test plot::kernels::funnel::tests::product_0098_unassigned_fallback_remains_positional_not_label_keyed ... ok
+test plot::kernels::funnel::tests::product_0113_funnel_value_labels_ignore_figure_heading_sizes ... ok
+test plot::kernels::funnel_stages::tests::product_0096_duplicates_precede_ordering_and_name_both_rows ... ok
+test plot::kernels::funnel_stages::tests::product_0096_empty_stage_collection_is_valid ... ok
+test plot::kernels::funnel_stages::tests::product_0096_first_positive_and_nonincreasing_rules_distinguish_plateaus ... ok
+test plot::kernels::funnel_stages::tests::product_0096_null_inexact_nonfinite_and_negative_values_refuse_at_their_rows ... ok
+test plot::kernels::funnel_stages::tests::product_0096_null_stage_refuses_while_literal_null_constructs ... ok
+test plot::kernels::funnel_stages::tests::product_0096_row_local_precedence_is_stage_then_value ... ok
+test plot::kernels::heatmap::tests::product_0056_asymmetric_heatmap_rows_join_labels_cells_colors_and_hover ... ok
+test plot::kernels::heatmap::tests::product_0088_absence_survives_axes_paint_outline_hover_and_domain ... ok
+test plot::kernels::heatmap::tests::product_0088_constant_and_no_data_share_only_gradient_omission ... ok
+test plot::kernels::heatmap::tests::product_0088_duplicate_order_bank_now_has_one_typed_refusal ... ok
+test plot::kernels::heatmap::tests::product_0088_null_keys_nonfinite_values_and_literal_null_are_distinct ... ok
+test plot::kernels::heatmap::tests::product_0088_signed_domains_use_both_ramp_ends ... ok
+test plot::kernels::heatmap::tests::product_0089_heatmap_diverging_neutral_moves_from_twenty_five_to_zero ... ok
+test plot::kernels::heatmap::tests::product_0092_integer_and_float_authored_values_keep_identical_operations ... ok
+test plot::kernels::heatmap::tests::product_0151_heatmap_candidate_and_anchor_use_both_categories ... ok
+test plot::kernels::heatmap_cells::tests::product_0088_sparse_null_and_signed_cells_derive_one_grid_and_domain ... ok
+test plot::kernels::heatmap_cells::tests::product_0088_validation_is_two_phase_and_key_uniqueness_is_total ... ok
+test plot::kernels::hexbin::tests::product_0143_authority_survives_product_0150_first_motion_deferral ... ok
+test plot::kernels::hexbin::tests::product_0143_delayed_executor_publication_is_newest_wins ... ok
+test plot::kernels::hexbin::tests::product_0143_hit_reports_bin_center_for_every_cursor_in_the_cell ... ok
+test plot::kernels::hexbin::tests::product_0143_kernel_prepares_exact_settled_lattice_and_disables_stale_hits ... ok
+test plot::kernels::hexbin::tests::product_0143_reservation_uses_source_count_and_display_uses_actual_maximum ... ok
+test plot::kernels::hexbin_viewport::tests::product_0143_all_temporal_dtypes_refuse_in_both_channels ... ok
+test plot::kernels::hexbin_viewport::tests::product_0143_artifacts_refuse_other_sources_and_lattices ... ok
+test plot::kernels::hexbin_viewport::tests::product_0143_column_and_row_fault_precedence_is_deterministic ... ok
+test plot::kernels::hexbin_viewport::tests::product_0143_empty_source_is_honest_and_missing_schema_still_refuses ... ok
+test plot::kernels::hexbin_viewport::tests::product_0143_materialized_counts_are_sparse_and_conserved ... ok
+test plot::kernels::hexbin_viewport::tests::product_0143_non_finite_and_inexact_rows_refuse_with_channel_and_row ... ok
+test plot::kernels::hexbin_viewport::tests::product_0143_radius_and_lattice_bounds_refuse_invalid_values ... ok
+test plot::kernels::hexbin_viewport::tests::product_0143_radius_stays_screen_space_while_data_extent_changes ... ok
+test plot::kernels::hexbin_viewport::tests::product_0143_regular_pixel_hex_has_six_equal_radii ... ok
+test plot::kernels::hexbin_viewport::tests::product_0143_resize_and_domain_changes_rebin ... ok
+test plot::kernels::hexbin_viewport::tests::product_0143_shared_rounding_is_ties_to_even_with_q_priority ... ok
+test plot::kernels::hexbin_viewport::tests::product_0143_temporal_columns_refuse_explicitly ... ok
+test plot::kernels::hexbin_viewport::tests::product_0143_validation_precedes_viewport_filtering ... ok
+test plot::kernels::histogram::tests::product_0078_domain_is_derived_and_counts_keep_database_width ... ok
+test plot::kernels::histogram::tests::product_0078_empty_and_zero_sequences_have_pinned_domains_and_no_legend ... ok
+test plot::kernels::histogram::tests::product_0078_explicit_unequal_intervals_drive_paint_and_preserve_gaps ... ok
+test plot::kernels::histogram::tests::product_0078_hover_obeys_gaps_edges_and_half_open_intervals ... ok
+test plot::kernels::histogram::tests::product_0078_true_zero_geometry_is_distinct_from_realized_clipping ... ok
+test plot::kernels::histogram::tests::product_0078_validation_names_six_distinct_invalid_shapes ... ok
+test plot::kernels::histogram::tests::product_0079_ingestion_refuses_nulls_and_negatives_and_keeps_integer_extremes ... ok
+test plot::kernels::histogram::tests::product_0080_product_0083_product_0079_count_is_height_only_and_mark_style_is_exact ... ok
+test plot::kernels::histogram::tests::product_0151_histogram_candidate_and_anchor_use_both_authored_bin_fields ... ok
+test plot::kernels::layered::product_0151_tests::product_0151_line_layer_refuses_click_projection ... ok
+test plot::kernels::line::product_0054_tests::authored_series_never_falls_back_when_a_resolved_assignment_is_missing - should panic ... ok
+test plot::kernels::line::product_0054_tests::interleaved_rows_partition_without_crossing_or_implicit_sorting ... ok
+test plot::kernels::line::product_0054_tests::named_single_series_keeps_one_entry_while_synthetic_control_is_omitted ... ok
+test plot::kernels::line::product_0054_tests::native_series_modifier_controls_stroke_and_keeps_coordinate_only_hover ... ok
+test plot::kernels::line::product_0054_tests::null_observations_are_skipped_never_zero ... ok
+test plot::kernels::line::product_0054_tests::paint_and_named_legend_consume_the_same_exact_resolved_assignments ... ok
+test plot::kernels::line::product_0054_tests::product_0156_line_visibility_preserves_geometry_and_hit_ordinals ... ok
+test plot::kernels::multivariate_rows::tests::product_0104_bad_cells_refuse_with_dimension_and_one_based_row ... ok
+test plot::kernels::multivariate_rows::tests::product_0104_category_absence_null_and_literal_all_data_are_distinct ... ok
+test plot::kernels::multivariate_rows::tests::product_0104_empty_is_honest_but_schema_is_still_validated ... ok
+test plot::kernels::multivariate_rows::tests::product_0104_exactness_uses_the_shared_f64_boundary ... ok
+test plot::kernels::multivariate_rows::tests::product_0104_many_rows_per_category_survive_without_aggregation ... ok
+test plot::kernels::multivariate_rows::tests::product_0104_missing_and_incompatible_fields_refuse_per_role ... ok
+test plot::kernels::multivariate_rows::tests::product_0104_precedence_is_field_first_then_row_local ... ok
+test plot::kernels::multivariate_rows::tests::product_0104_preserves_dimension_and_global_row_order_with_lexical_catalog ... ok
+test plot::kernels::parallel::tests::product_0104_parallel_empty_keeps_axis_ranges_without_series ... ok
+test plot::kernels::parallel::tests::product_0104_parallel_renders_every_row_in_a_repeated_category ... ok
+test plot::kernels::parallel::tests::product_0104_parallel_valid_nonempty_render_matches_the_stage_zero_oracle ... ok
+test plot::kernels::parallel::tests::product_0105_parallel_hover_uses_non_origin_widget_bounds ... ok
+test plot::kernels::pie::tests::product_0102_category_dtype_matrix_is_explicit ... ok
+test plot::kernels::pie::tests::product_0102_empty_and_zero_total_have_distinct_outcomes ... ok
+test plot::kernels::pie::tests::product_0102_hover_uses_the_same_local_geometry_as_paint ... ok
+test plot::kernels::pie::tests::product_0102_null_literal_null_exactness_and_numeric_refusals_are_distinct ... ok
+test plot::kernels::pie::tests::product_0102_preaggregated_toron_shape_keeps_product_0101_origin_parity ... ok
+test plot::kernels::pie::tests::product_0102_preparation_is_field_first_and_relation_order_is_preserved ... ok
+test plot::kernels::pie::tests::product_0102_ungrouped_repeated_rows_render_as_independent_slices ... ok
+test plot::kernels::pie::tests::product_0102_zero_slice_draws_nothing_stays_in_legend_and_never_hovers ... ok
+test plot::kernels::pie::tests::product_0103_authored_category_colour_is_one_paint_and_legend_authority ... ok
+test plot::kernels::pie::tests::product_0103_opposite_relation_sorts_reverse_the_rendered_slice_order ... ok
+test plot::kernels::pie::tests::product_0103_synthetic_rows_are_emitted_then_shared_policy_decides_omission ... ok
+test plot::kernels::pie_slices::tests::product_0102_grouped_duplicates_refuse_but_ungrouped_repetitions_construct ... ok
+test plot::kernels::pie_slices::tests::product_0102_row_validation_is_category_then_value_and_precedes_duplicates ... ok
+test plot::kernels::pie_slices::tests::product_0102_total_is_last_and_empty_precedes_total_validation ... ok
+test plot::kernels::pie_slices::tests::product_0102_zero_slice_has_zero_sweep_and_terminal_boundary_is_exact_tau ... ok
+test plot::kernels::radar::tests::product_0104_radar_empty_keeps_padded_axis_substrate_without_series ... ok
+test plot::kernels::radar::tests::product_0104_radar_valid_nonempty_render_matches_the_stage_zero_oracle ... ok
+test plot::kernels::radar::tests::product_0105_radar_hover_remains_absent_in_a_non_origin_cell ... ok
+test plot::kernels::radar::tests::product_0106_radar_tick_ladder_follows_the_first_authored_dimension ... ok
+test plot::kernels::radial_dial::tests::product_0099_category_dtype_matrix_is_explicit ... ok
+test plot::kernels::radial_dial::tests::product_0099_empty_and_ungrouped_presentation_remain_distinct ... ok
+test plot::kernels::radial_dial::tests::product_0099_empty_relations_validate_every_required_field_first ... ok
+test plot::kernels::radial_dial::tests::product_0099_exactness_is_shared_for_value_and_maximum ... ok
+test plot::kernels::radial_dial::tests::product_0099_null_nonfinite_and_range_refusals_name_each_field ... ok
+test plot::kernels::radial_dial::tests::product_0099_precedence_crosses_preparation_row_and_relation_phases ... ok
+test plot::kernels::radial_dial::tests::product_0099_preparation_validates_fields_before_rows_in_field_order ... ok
+test plot::kernels::radial_dial::tests::product_0099_valid_grouped_render_operations_match_the_legacy_oracle ... ok
+test plot::kernels::radial_dial::tests::product_0100_authored_category_colour_is_one_paint_and_legend_authority ... ok
+test plot::kernels::radial_dial::tests::product_0100_binding_and_preparation_admit_and_refuse_the_same_role_dtypes ... ok
+test plot::kernels::radial_dial::tests::product_0100_unassigned_radial_dial_fallback_remains_positional ... ok
+test plot::kernels::radial_dial_readings::tests::product_0099_duplicate_categories_refuse_independent_of_values ... ok
+test plot::kernels::radial_dial_readings::tests::product_0099_grouped_order_and_ungrouped_shape_are_distinct ... ok
+test plot::kernels::radial_dial_readings::tests::product_0099_quantitative_constraints_are_field_specific ... ok
+test plot::kernels::radial_dial_readings::tests::product_0099_row_local_faults_precede_cross_row_faults ... ok
+test plot::kernels::radial_dial_readings::tests::product_0099_row_validation_is_row_first_and_field_ordered ... ok
+test plot::kernels::scatter::axis_type_tests::a_time_scale_takes_the_temporal_columns_own_type ... ok
+test plot::kernels::scatter::preparation_timing_probe::probe_draw_frame_at_the_raster_fixture_size ... ignored
+test plot::kernels::scatter::preparation_timing_probe::probe_prepare_scatter_data_at_the_raster_fixture_size ... ignored
+test plot::kernels::scatter::preparation_timing_probe::probe_tessellate_downsampled_marks_at_the_raster_fixture_size ... ignored
+test plot::kernels::scatter::product_0159_tests::probe_batch_through_the_trait_on_the_iced_tessellator ... ignored
+test plot::kernels::scatter::product_0159_tests::product_0159_both_arms_fill_one_mark_per_call_and_never_a_compound_path ... ok
+test plot::kernels::scatter::tests::automatic_render_mode_preserves_every_threshold_boundary ... ok
+test plot::kernels::scatter::tests::categorical_x_uses_the_requested_field_and_point_scale ... ok
+test plot::kernels::scatter::tests::downsample_grid_output_size_preserves_the_current_cell_budget ... ok
+test plot::kernels::scatter::tests::explicit_render_modes_and_raster_fallback_ignore_auto_thresholds ... ok
+test plot::kernels::scatter::tests::product_0017_raster_draws_clipped_discs_and_keys_the_resolved_size ... ok
+test plot::kernels::scatter::tests::product_0044_series_order_follows_the_display_domain ... ok
+test plot::kernels::scatter::tests::product_0138_raster_cache_and_gate_evidence ... ignored, raster policy evidence; allocates multi-million-point frames
+test plot::kernels::scatter::tests::product_0138_scatter_render_matrix_evidence ... ignored, render matrix evidence; minutes, and allocates a large frame
+test plot::kernels::scatter::tests::product_0139_a_reused_frame_is_placed_not_redrawn_and_never_chains ... ok
+test plot::kernels::scatter::tests::product_0139_motion_reuses_and_settling_rasterizes_exactly_once ... ok
+test plot::kernels::scatter::tests::product_0139_reuse_placement_carries_old_pixels_onto_the_new_viewport ... ok
+test plot::kernels::scatter::tests::product_0139_reuse_refuses_every_non_domain_change_individually ... ok
+test plot::kernels::scatter::tests::product_0139_scatter_resolves_geometry_through_its_own_layer_settings ... ok
+test plot::kernels::scatter::tests::product_0140_gate_input_evidence ... ignored, PRODUCT-0140 gate-input evidence
+test plot::kernels::scatter::tests::product_0140_gate_pricing_evidence ... ignored, PRODUCT-0140 gate pricing; allocates multi-million-point frames
+test plot::kernels::scatter::tests::product_0149_identical_twin_layers_paint_their_slot_handles_in_authored_order ... ok
+test plot::kernels::scatter::tests::product_0149_interactive_first_contact_is_a_fast_honest_preparing_frame ... ok
+test plot::kernels::scatter::tests::product_0149_pending_scatter_suppresses_only_itself_and_marks_once ... ok
+test plot::kernels::scatter::tests::product_0149_redraw_publishes_only_for_a_novel_raster_want ... ok
+test plot::kernels::scatter::tests::product_0150_categorical_x_raster_reuse_fails_closed_then_settles_exactly ... ok
+test plot::kernels::scatter::tests::product_0150_large_scatter_single_hover_cost_evidence ... ignored, PRODUCT-0150 stage-0 hover-cost evidence; allocates up to seven million points
+test plot::kernels::scatter::tests::product_0150_seven_million_point_motion_reuses_then_settles_once ... ok
+test plot::kernels::scatter::tests::product_0150_vector_and_downsampled_motion_match_the_settled_baseline ... ok
+test plot::kernels::scatter::tests::product_0151_adjacent_nanoseconds_hit_as_distinct_exact_candidates ... ok
+test plot::kernels::scatter::tests::product_0151_scatter_candidate_keeps_every_bound_source_field ... ok
+test plot::kernels::scatter::tests::product_0156_raster_visibility_rebuilds_desktop_and_exports_one_ungrouped_image ... ok
+test plot::kernels::scatter::tests::product_0156_scatter_visibility_invalidates_raster_and_removes_hits_and_regions ... ok
+test plot::kernels::scatter::tests::resolved_category_colors_survive_filtering_and_reach_the_kernel ... ok
+test plot::kernels::stacked_area::product_0068_tests::stacked_area_boundaries_use_resolved_mark_decoration_at_the_existing_width ... ok
+test plot::kernels::stacked_area::product_0069_tests::product_0069_coincident_fallback_keeps_the_banked_ramp_and_headroom ... ok
+test plot::kernels::stacked_area::product_0069_tests::product_0069_first_row_and_clamped_matrix_own_every_consumer ... ok
+test plot::kernels::stacked_area::product_0069_tests::product_0069_resolved_and_automatic_orders_are_both_semantic ... ok
+test plot::kernels::stacked_area::product_0069_tests::product_0070_resolved_colors_reach_fills_and_legend_while_two_field_is_synthetic ... ok
+test plot::kernels::stacked_area::product_0069_tests::product_0072_area_invalid_samples_pinch_zero_total_without_inventing_share ... ok
+test plot::kernels::stacked_area::product_0069_tests::product_0085_0072_percent_area_uses_local_totals_and_transform_title_provenance ... ok
+test plot::kernels::stacked_bar::tests::product_0056_horizontal_stacks_join_top_down_labels_to_asymmetric_segments ... ok
+test plot::kernels::stacked_bar::tests::product_0064_positive_sequence_owns_domain_rectangles_hit_and_hover ... ok
+test plot::kernels::stacked_bar::tests::product_0064_stacks_start_at_zero_under_nonzero_bounds_in_both_orientations ... ok
+test plot::kernels::stacked_bar::tests::product_0064_substrate_consumes_resolved_colors_in_marks_and_legend ... ok
+test plot::kernels::stacked_bar::tests::product_0072_invalid_samples_are_zero_and_zero_totals_invent_no_share ... ok
+test plot::kernels::stacked_bar::tests::product_0085_0072_percent_uses_one_geometry_and_a_truthful_oriented_title ... ok
+test plot::kernels::stacked_bar::tests::stacks_follow_category_and_group_identity ... ok
+test plot::kernels::violin::tests::product_0108_authored_palette_is_the_one_violin_and_legend_authority ... ok
+test plot::kernels::violin::tests::product_0151_violin_candidate_is_the_exact_group_field ... ok
+test plot::kernels::violin_density::tests::a_declined_group_contributes_no_width_and_does_not_rescale_the_rest ... ok
+test plot::kernels::violin_density::tests::a_group_that_never_arrived_is_distinguishable_from_one_that_was_declined ... ok
+test plot::kernels::violin_density::tests::a_non_finite_group_is_declined_whole_and_recorded ... ok
+test plot::kernels::violin_density::tests::a_null_group_is_refused_rather_than_rendered_under_a_placeholder ... ok
+test plot::kernels::violin_density::tests::a_single_point_group_cannot_form_a_curve ... ok
+test plot::kernels::violin_density::tests::an_all_zero_figure_renders_flat_rather_than_dividing_by_zero ... ok
+test plot::kernels::violin_density::tests::an_empty_relation_prepares_nothing_rather_than_failing ... ok
+test plot::kernels::violin_density::tests::category_order_is_declared_not_taken_from_row_order ... ok
+test plot::kernels::violin_density::tests::figure_normalization_keeps_group_widths_comparable ... ok
+test plot::kernels::violin_density::tests::groups_that_disagree_about_the_grid_are_refused ... ok
+test plot::kernels::violin_density::tests::normalization_preserves_a_group_s_shape_whichever_mode_is_selected ... ok
+test plot::kernels::violin_density::tests::null_and_inexact_cells_name_their_field_and_row ... ok
+test plot::kernels::violin_density::tests::peak_density_is_the_figure_wide_maximum_not_a_per_group_one ... ok
+test plot::kernels::violin_density::tests::per_violin_normalization_is_reachable_and_does_the_opposite ... ok
+test plot::kernels::violin_density::tests::prepared_curves_carry_one_shared_grid_and_their_own_medians ... ok
+test plot::kernels::violin_density::tests::two_medians_in_one_group_are_refused_as_a_bad_join ... ok
+test plot::legend::tests::product_0044_policy_omits_only_lone_synthetic_entries ... ok
+test plot::legend::tests::product_0044_union_deduplicates_the_printed_triple_and_named_wins ... ok
+test plot::legend::tests::product_0050_layout_distinguishes_gutter_overlay_and_hide ... ok
+test plot::legend::tests::product_0051_tall_legends_keep_the_existing_row_budget_and_may_outlive_the_plot_extent ... ok
+test plot::legend::tests::product_0087_both_render_paths_use_the_same_fifty_stop_samples ... ok
+test plot::legend::tests::product_0087_every_theme_matches_marks_across_the_realized_non_unit_domain ... ok
+test plot::legend::tests::product_0087_gradient_constructor_distinguishes_omission_from_invariant_failure ... ok
+test plot::legend::tests::product_0087_stops_are_data_values_and_midpoint_sampling_restores_the_ramp ... ok
+test plot::legend::tests::product_0089_anchored_guide_uses_the_inverse_and_matches_marks_on_both_paths ... ok
+test plot::legend::tests::product_0093_estimator_honours_legend_size_and_the_declared_advance ... ok
+test plot::legend::tests::product_0093_fixed_precision_endpoints_bound_every_mixed_domain_label ... ok
+test plot::legend::tests::product_0093_gradient_widths_follow_negative_large_and_short_content_on_both_paths ... ok
+test plot::legend::tests::product_0093_measurement_and_rendering_share_geometry_on_both_paths ... ok
+test plot::legend::tests::product_0143_count_envelope_bounds_power_of_ten_and_widest_digit_traps ... ok
+test plot::legend::tests::product_0143_count_guide_renders_only_closed_integer_endpoints ... ok
+test plot::legend::tests::product_0156_printed_union_preserves_ambiguity_in_every_order ... ok
+test plot::mark_style_oracles::product_0080_0082_0083_default_operation_bank_tracks_the_box_role_split ... ok
+test plot::raster::tests::product_0149_cancellation_is_slot_scoped_and_checkpointed ... ok
+test plot::raster::tests::product_0149_forced_single_seat_makes_progress_for_two_surfaces ... ok
+test plot::raster::tests::product_0149_identical_redraws_deduplicate_before_request_id_minting ... ok
+test plot::raster::tests::product_0149_identical_twin_layers_keep_independent_slots ... ok
+test plot::raster::tests::product_0149_kernel_replacement_rejects_an_apparently_identical_old_completion ... ok
+test plot::raster::tests::product_0149_many_supersessions_publish_one_final_settled_identity ... ok
+test plot::raster::tests::product_0149_newest_pending_want_is_the_only_one_that_starts ... ok
+test plot::raster::tests::product_0149_production_admission_is_half_parallelism_with_one_fallback ... ok
+test plot::raster::tests::product_0149_publication_matches_slot_subject_key_and_lifetime_id ... ok
+test plot::raster::tests::product_0149_reversed_completion_order_cannot_replace_the_newest_pixels ... ok
+test plot::recipe::tests::product_0151_exhibit_one_million_scatter_filter_rebuild_and_projection ... ignored, PRODUCT-0151 stage-0 cost exhibit; run in debug and release profiles
+test plot::recipe::tests::product_0151_recipe_fields_always_name_projected_columns ... ok
+test plot::recipe::tests::product_0151_recipe_rebuilds_each_revision_from_the_unfiltered_artifact ... ok
+test plot::request::tests::plan_applies_an_explicit_projection_in_order ... ok
+test plot::request::tests::plan_reports_a_missing_projection_column ... ok
+test plot::request::tests::plan_without_projection_keeps_the_full_frame ... ok
+test plot::request::tests::product_0030_banks_the_pre_switch_legacy_request_boundary ... ok
+test plot::request::tests::product_0030_explicit_request_consumes_the_complete_categorical_selection ... ok
+test plot::request::tests::product_0079_histogram_keeps_a_continuous_color_identity_empty ... ok
+test plot::request::tests::product_0082_box_keeps_identity_and_projects_all_seven_fields ... ok
+test plot::request::tests::product_0088_planning_surfaces_heatmap_refusals_before_factory_reconstruction ... ok
+test plot::request::tests::product_0089_scale_refusals_stop_before_render_and_continuous_marks_keep_identity ... ok
+test plot::request::tests::product_0090_planning_surfaces_bubble_refusals_before_factory_reconstruction ... ok
+test plot::request::tests::product_0092_authored_duplicate_cells_refuse_before_render ... ok
+test plot::request::tests::product_0092_authored_heatmap_projects_all_roles_renders_and_keeps_identity ... ok
+test plot::request::tests::product_0095_authored_bubble_projection_carries_exactly_four_or_five_roles ... ok
+test plot::request::tests::product_0096_planning_surfaces_funnel_refusals_before_factory_reconstruction ... ok
+test plot::request::tests::product_0099_planning_surfaces_radial_dial_refusals_before_factory_reconstruction ... ok
+test plot::request::tests::product_0102_planning_surfaces_pie_refusals_before_factory_reconstruction ... ok
+test plot::request::tests::product_0105_eight_dimensions_and_category_project_without_a_transport_ceiling ... ok
+test plot::request::tests::product_0108_planning_validates_the_delivered_density_relation_before_factory ... ok
+test plot::request::tests::product_0145_planning_validates_fill_between_before_factory_reconstruction ... ok
+test plot::request::tests::product_0147_planning_validates_candlestick_before_factory_reconstruction ... ok
+test plot::series::tests::product_0156_exact_identity_and_visibility_transitions ... ok
+test plot::series_tests::product_0156_area_keeps_lower_band_gap_and_percent_totals ... ok
+test plot::series_tests::product_0156_export_registry_includes_hidden_series_and_pane_reset ... ok
+test plot::series_tests::product_0156_formatted_temporal_labels_do_not_address_series ... ok
+test plot::series_tests::product_0156_layers_share_identity_across_distinct_legend_samples ... ok
+test plot::series_tests::product_0156_legend_background_and_modifiers_never_start_plot_gestures ... ok
+test plot::series_tests::product_0156_legend_cancel_and_hidden_legend ... ok
+test plot::series_tests::product_0156_legend_gestures_and_direct_actions_agree ... ok
+test plot::series_tests::product_0156_multivariate_label_collisions_are_inert_in_both_orders ... ok
+test plot::series_tests::product_0156_multivariate_rows_group_by_exact_boolean ... ok
+test plot::series_tests::product_0156_png_grouping_is_pixel_identical ... ok
+test plot::series_tests::product_0156_viewport_and_visibility_preserve_one_another ... ok
+test plot::spec::tests::auto_never_reuses_a_field_already_named_by_another_channel ... ok
+test plot::spec::tests::auto_scatter_chooses_a_complete_matching_instead_of_greedy_reuse ... ok
+test plot::spec::tests::cascade_algebras_are_associative_with_inherit_as_identity ... ok
+test plot::spec::tests::categorical_capacity_refuses_without_reassignment_or_cycling ... ok
+test plot::spec::tests::changed_color_field_starts_a_new_lineage ... ok
+test plot::spec::tests::color_identity_survives_filtering_and_resolved_spec_is_self_sufficient ... ok
+test plot::spec::tests::color_job_mismatch_refuses_and_matching_job_names_its_scale ... ok
+test plot::spec::tests::named_channels_never_substitute_and_deliberate_repetition_works ... ok
+test plot::spec::tests::named_line_preserves_exact_xy_and_projects_the_existing_line_contract ... ok
+test plot::spec::tests::named_scatter_preserves_categorical_x_and_quantitative_y ... ok
+test plot::spec::tests::only_auto_authorizes_inference_and_optional_absent_stays_absent ... ok
+test plot::spec::tests::product_0013_layer_channel_failure_is_atomic_and_attributed ... ok
+test plot::spec::tests::product_0013_layer_color_refuses_named_and_auto_with_absent_control ... ok
+test plot::spec::tests::product_0013_layer_compatibility_names_both_field_identities ... ok
+test plot::spec::tests::product_0013_layer_scale_families_must_match ... ok
+test plot::spec::tests::product_0013_layered_spec_is_non_empty_ordered_and_mark_bounded ... ok
+test plot::spec::tests::product_0013_resolution_preserves_authored_layer_order ... ok
+test plot::spec::tests::product_0017_point_size_is_bounded_and_layer_constructors_inherit ... ok
+test plot::spec::tests::product_0019_stroke_width_is_bounded_and_layer_constructors_inherit ... ok
+test plot::spec::tests::product_0021_bar_width_is_normalized_and_layer_constructors_inherit ... ok
+test plot::spec::tests::product_0029_allocation_spaces_do_not_mix_silently ... ok
+test plot::spec::tests::product_0029_authored_bar_color_is_authoritative_and_other_marks_stay_unstyled ... ok
+test plot::spec::tests::product_0029_bar_band_capacity_is_attributed_to_styling ... ok
+test plot::spec::tests::product_0029_filtering_reserves_positions_and_returning_color ... ok
+test plot::spec::tests::product_0029_fresh_spread_covers_admitted_sizes_and_beats_greedy_control ... ok
+test plot::spec::tests::product_0029_fresh_tab20c_spreads_complete_mapping_and_observes_modifiers ... ok
+test plot::spec::tests::product_0029_live_growth_uses_returned_identity_and_fresh_control_differs ... ok
+test plot::spec::tests::product_0029_palette_positions_are_validated_continuation_identity ... ok
+test plot::spec::tests::product_0029_pre_refactor_legacy_categorical_oracle ... ok
+test plot::spec::tests::product_0029_selection_and_capacity_failures_remain_distinct_and_atomic ... ok
+test plot::spec::tests::product_0029_two_field_bar_resolves_band_fill_without_a_color_channel ... ok
+test plot::spec::tests::product_0053_category_gap_is_a_bounded_zero_default_and_constructors_inherit ... ok
+test plot::spec::tests::product_0054_line_series_is_categorical_bounded_and_exactly_attributed ... ok
+test plot::spec::tests::product_0055_bar_channel_pair_is_a_strict_orientation_widening ... ok
+test plot::spec::tests::product_0055_canonical_horizontal_output_does_not_create_authoring_authority ... ok
+test plot::spec::tests::product_0055_rotation_preserves_color_lineage_while_a_series_field_change_does_not ... ok
+test plot::spec::tests::product_0064_stacking_preserves_lineage_and_canonical_members_gain_no_authority ... ok
+test plot::spec::tests::product_0064_stacking_selects_members_after_the_bar_pair_rule ... ok
+test plot::spec::tests::product_0070_area_channels_resolve_to_one_fixed_member_and_family_identity ... ok
+test plot::spec::tests::product_0070_area_compatibility_is_line_x_quantitative_y_and_categorical_series ... ok
+test plot::spec::tests::product_0070_automatic_dashboard_area_keeps_its_assignment_free_projection ... ok
+test plot::spec::tests::product_0078_automatic_histogram_resolution_names_the_missing_producer ... ok
+test plot::spec::tests::product_0081_automatic_box_plot_resolution_names_the_missing_producer ... ok
+test plot::spec::tests::product_0086_authored_family_is_a_discriminating_colour_lineage_dimension ... ok
+test plot::spec::tests::product_0086_family_tokens_are_bounded_canonical_and_open_for_preservation ... ok
+test plot::spec::tests::product_0086_forbidden_members_hit_the_authored_family_invariant ... ok
+test plot::spec::tests::product_0086_live_family_catalog_is_unique_complete_and_member_normalized ... ok
+test plot::spec::tests::product_0092_heatmap_binds_nominal_bands_and_quantitative_value ... ok
+test plot::spec::tests::product_0092_heatmap_compatibility_refuses_axes_values_and_ordinal_precisely ... ok
+test plot::spec::tests::product_0092_heatmap_surface_emits_only_inherited_semantic_types ... ok
+test plot::spec::tests::product_0092_heatmap_unsupported_dtype_refuses_before_preparation ... ok
+test plot::spec::tests::product_0095_bubble_binds_four_or_five_roles_without_categorical_identity ... ok
+test plot::spec::tests::product_0095_bubble_compatibility_is_quantitative_numeric_and_nominal_label ... ok
+test plot::spec::tests::product_0095_bubble_resolution_does_not_allocate_colour_identity ... ok
+test plot::spec::tests::product_0095_field_attribution_preserves_channels_and_distinguishes_roles ... ok
+test plot::spec::tests::product_0098_funnel_binding_refuses_roles_before_preparation_with_role_attribution ... ok
+test plot::spec::tests::product_0098_funnel_binds_roles_and_allocates_one_complete_stage_assignment ... ok
+test plot::spec::tests::product_0098_plateau_reorder_preserves_label_assignments ... ok
+test plot::spec::tests::product_0100_asymmetric_radial_dial_lineage_retains_shared_categories ... ok
+test plot::spec::tests::product_0100_radial_dial_binding_owns_the_surface_dtype_matrix ... ok
+test plot::spec::tests::product_0100_radial_dial_binds_both_arities_and_allocates_complete_categories ... ok
+test plot::spec::tests::product_0103_pie_binding_owns_roles_and_asymmetric_lineage ... ok
+test plot::spec::tests::product_0103_pie_binds_grouped_roles_and_allocates_complete_categories ... ok
+test plot::spec::tests::product_0105_automatic_minimums_and_surface_dtype_matrix_are_closed ... ok
+test plot::spec::tests::product_0105_grouped_ungrouped_and_automatic_colour_origins_are_distinct ... ok
+test plot::spec::tests::product_0105_multivariate_surfaces_share_admission_and_preserve_authored_dimensions ... ok
+test plot::spec::tests::product_0108_violin_group_is_text_or_boolean_not_lexically_rendered_numbers ... ok
+test plot::spec::tests::product_0108_violin_requires_the_relation_side_density_contract ... ok
+test plot::spec::tests::product_0109_continuous_palettes_recompute_and_leave_no_durable_lineage ... ok
+test plot::spec::tests::product_0109_curated_continuation_survives_while_continuous_to_curated_is_fresh ... ok
+test plot::spec::tests::product_0109_selection_carries_theme_kind_without_identity_matching ... ok
+test plot::spec::tests::product_0109_violin_allocates_continuous_swatches_in_its_visible_lexical_order ... ok
+test plot::spec::tests::product_0112_hover_text_size_pins_inclusive_work_bounds ... ok
+test plot::spec::tests::product_0113_title_and_subtitle_text_sizes_pin_inclusive_work_bounds ... ok
+test plot::spec::tests::product_0115_tick_rotation_pins_inclusive_degree_bounds ... ok
+test plot::spec::tests::product_0122_axis_and_tick_text_sizes_pin_inclusive_work_bounds ... ok
+test plot::spec::tests::product_0144_hexbin_refuses_nominal_unsupported_and_all_temporal_dtypes_by_channel ... ok
+test plot::spec::tests::product_0144_hexbin_resolves_only_two_quantitative_channels_without_colour_job ... ok
+test plot::spec::tests::product_0145_automatic_fill_between_admits_temporal_x_without_reusing_y ... ok
+test plot::spec::tests::product_0145_automatic_fill_between_consumes_each_quantitative_field_once ... ok
+test plot::spec::tests::product_0146_authored_fill_between_resolves_temporal_x_and_attributes_y_roles ... ok
+test plot::spec::tests::product_0147_automatic_candlestick_admits_temporal_x_without_reusing_it ... ok
+test plot::spec::tests::product_0147_automatic_candlestick_consumes_each_quantitative_field_once ... ok
+test plot::spec::tests::product_0148_authored_candlestick_resolves_temporal_x_and_attributes_ohlc_roles ... ok
+test plot::text_estimate::tests::product_0117_ascii_basic_shaping_does_not_escape_the_class_sum ... ok
+test plot::text_estimate::tests::product_0117_ascii_partition_is_exhaustive_and_censused_against_its_face ... ok
+test plot::text_estimate::tests::product_0117_partition_reduces_ascii_and_keeps_non_ascii_on_the_named_fallback ... ok
+test plot::text_estimate::tests::product_0117_pinned_primary_face_preserves_cjk_fallback ... ok
+test plot::theme::tests::default_theme_passes_contrast_ordering_and_keeps_ramps_plot_local ... ok
+test plot::theme::tests::five_layer_precedence_is_right_biased_and_hide_is_not_a_value_override ... ok
+test plot::theme::tests::product_0017_point_size_selects_each_layer_before_pane_override ... ok
+test plot::theme::tests::product_0019_stroke_width_selects_each_layer_before_pane_override ... ok
+test plot::theme::tests::product_0021_bar_width_selects_each_layer_before_pane_override ... ok
+test plot::theme::tests::product_0030_categorical_palette_has_one_explicit_figure_wide_cascade ... ok
+test plot::theme::tests::product_0053_category_gap_selects_each_layer_before_pane_override ... ok
+test plot::theme::tests::product_0080_product_0032_plot_skin_identity_and_prepared_skin_follow_the_cascade ... ok
+test plot::theme::tests::product_0089_continuous_ramps_follow_the_same_theme_tiers_atomically ... ok
+test plot::theme::tests::product_0091_continuous_slot_overrides_are_partial_and_follow_figure_tiers ... ok
+test plot::theme::tests::product_0112_hover_size_is_partial_and_follows_all_five_tiers ... ok
+test plot::theme::tests::product_0113_title_and_subtitle_slots_are_typed_partial_and_follow_all_five_tiers ... ok
+test plot::theme::tests::product_0115_tick_rotation_is_partial_and_follows_all_five_tiers ... ok
+test plot::theme::tests::product_0120_padding_edges_are_partial_across_the_cascade ... ok
+test plot::theme::tests::product_0122_axis_and_tick_sizes_are_typed_partial_and_follow_all_five_tiers ... ok
+test plot::theme::tests::product_0124_facet_label_size_is_typed_partial_and_follows_all_five_tiers ... ok
+test plot::theme::tests::product_0125_legend_size_is_typed_partial_and_follows_all_five_tiers ... ok
+test plot::theme::tests::ui_palette_bridge_changes_only_chrome ... ok
+test presentation_registry::tests::authored_projection_survives_an_incomplete_source_model ... ok
+test presentation_registry::tests::horizontal_renderers_inspect_as_their_authored_family ... ok
+test presentation_registry::tests::inspector_badges_expression_and_shared_source_per_logical_target ... ok
+test presentation_registry::tests::inspector_provenance_obeys_the_five_layer_order ... ok
+test presentation_registry::tests::mark_argument_origins_come_from_their_callable_entries ... ok
+test presentation_registry::tests::numeric_domains_use_the_plot_spec_validators ... ok
+test presentation_registry::tests::product_0144_hexbin_inspector_is_heatmap_without_colour_job_controls ... ok
+test presentation_registry::tests::product_0146_fill_between_inspector_is_exactly_hexbin ... ok
+test presentation_registry::tests::product_0148_candlestick_inspector_is_exactly_hexbin ... ok
+test presentation_registry::tests::registration_and_acceptance_are_distinct_facts ... ok
+test presentation_registry::tests::registry_has_no_duplicate_handler_routes ... ok
+test presentation_registry::tests::settings_are_unique_and_project_only_registered_semantics ... ok
+test presentation_registry::tests::temporal_ticks_and_minor_ticks_conflict_symmetrically ... ok
+test process_identity::tests::the_running_process_has_a_stable_token_and_a_dead_pid_has_none ... ok
+test profile_store::tests::product_0134_locked_store_errors_use_polariton_wording ... ok
+test profile_store::tests::product_0134_profile_session_is_independent_of_other_secret_sessions ... ok
+test profile_store::tests::product_0134_store_failed_open_changes_nothing_and_stays_locked ... ok
+test profile_store::tests::product_0134_store_file_is_private ... ok
+test profile_store::tests::product_0134_store_initialize_refuses_an_existing_file_and_locked_refuses_writes ... ok
+test profile_store::tests::product_0134_store_names_are_exact_after_trimming ... ok
+test profile_store::tests::product_0134_store_refuses_create_rename_collisions_and_empty_names ... ok
+test profile_store::tests::product_0134_store_round_trips_a_profile_across_instances ... ok
+test profile_store::tests::product_0134_store_sealed_bytes_disclose_no_names_or_credentials ... ok
+test publication::layout_tests::product_0154_layout_is_rebased_to_the_published_bounding_box ... ok
+test publication::product_0155_tests::product_0155_bounds_omit_the_projection_and_publish_the_rest ... ok
+test publication::product_0155_tests::product_0155_box_parity_through_the_shipped_asset ... ok
+test publication::product_0155_tests::product_0155_bubble_parity_through_the_shipped_asset ... ok
+test publication::product_0155_tests::product_0155_facet_metadata_and_displays_are_guarded_with_a_control ... ok
+test publication::product_0155_tests::product_0155_heatmap_parity_through_the_shipped_asset ... ok
+test publication::product_0155_tests::product_0155_projection_is_deterministic_and_prose_moves_without_regions ... ok
+test publication::product_0155_tests::product_0155_scatter_parity_through_the_shipped_asset ... ok
+test publication::product_0155_tests::product_0155_shell_is_a_polyglot_with_one_pinned_script_and_reversible_data ... ok
+test publication::product_0157_lifecycle_tests::product_0157_installed_handlers_own_the_sequence_through_a_document_stub ... ok
+test publication::product_0157_lifecycle_tests::product_0157_resolver_at_the_bound_with_the_maximum_hidden_set ... ok
+test publication::product_0157_tests::product_0157_actionable_figures_publish_complete_with_a_snapshot ... ok
+test publication::product_0157_tests::product_0157_coverage_decides_and_mixed_figures_are_inert ... ok
+test publication::product_0157_tests::product_0157_gesture_parity_through_the_shipped_asset ... ok
+test publication::product_0157_tests::product_0157_hits_obey_visibility_through_the_shipped_asset ... ok
+test publication::product_0157_tests::product_0157_ink_changes_by_class_alone ... ok
+test publication::product_0157_tests::product_0157_series_table_is_a_handle_not_a_disclosure ... ok
+test publication::product_0157_tests::product_0157_table_is_deterministic_and_legend_is_the_desktop_geometry ... ok
+test publication::product_0159_shell_tests::product_0159_shell_scopes_mark_definitions_and_references ... ok
+test publication::shell_id_scope_tests::shell_scopes_svg_ids_per_figure_and_every_reference_resolves_within_its_figure ... ok
+test publication::tests::product_0154_a_selected_figure_publishes_the_authored_figure_over_its_full_data ... ok
+test publication::tests::product_0154_duplicate_view_names_reserve_every_id ... ok
+test publication::tests::product_0154_guard_refuses_secrets_paths_and_endpoints_with_controls ... ok
+test publication::tests::product_0154_identity_is_content_and_moves_only_with_ink ... ok
+test publication::tests::product_0154_labels_round_trip_through_an_xml_parser ... ok
+test publication::tests::product_0154_package_font_reproduces_the_png_export_for_every_admitted_family ... ok
+test publication::tests::product_0154_provenance_travels_with_each_artifact_and_shares_content ... ok
+test publication::tests::product_0154_server_pins_verified_bytes_and_refuses_everything_else ... ok
+test publication::tests::product_0154_shell_is_a_document_on_the_grid_with_one_pinned_script ... ok
+test publication::tests::product_0154_witness_and_recipe_refusals_name_the_figure ... ok
+test reporting::spool::tests::closed_report_schema_does_not_carry_error_text ... ok
+test reporting::spool::tests::dead_active_recovery_at_cap_counts_only_unacknowledged_evictions_and_torn_tail ... ok
+test reporting::spool::tests::durable_revocation_before_cleanup_prevents_recovery_after_reenable ... ok
+test reporting::spool::tests::live_active_is_not_read_and_revoked_body_is_not_decoded ... ok
+test reporting::spool::tests::off_cleanup_keeps_stable_lock_and_does_not_repeat_final_report ... ok
+test reporting::spool::tests::product_0161_crash_child ... ok
+test reporting::spool::tests::product_0161_failed_append_discards_the_unsynced_batch ... ok
+test reporting::spool::tests::product_0161_killed_writer_progress_and_revocation_recover_without_skips ... ok
+test reporting::spool::tests::progress_is_bound_and_in_range_corruption_replays ... ok
+test reporting::spool::tests::two_drainers_cannot_own_one_directory ... ok
+test reporting::spool::tests::unknown_ack_retries_identical_values_and_then_retires ... ok
+test reporting::spool::tests::unpublished_progress_temporary_does_not_skip_a_report ... ok
+test reporting::tests::product_0161_source_reason_wire_names_are_stable ... ok
+test reporting::tests::product_0161_submission_is_bounded_and_off_is_silent ... ok
+test result_artifact::product_0154_tests::product_0154_canonical_ipc_ignores_producer_batching_and_refuses_maps ... ok
+test result_artifact::product_0154_tests::product_0154_canonical_ipc_is_equal_across_backings_and_strips_metadata ... ok
+test result_artifact::tests::artifact_tokens_are_unique_and_stable_across_arc_sharing ... ok
+test result_artifact::tests::derived_polars_artifacts_inherit_publication_identity ... ok
+test result_artifact::tests::product_0084_arrow_policy_preserves_or_withholds_schema_knowledge ... ok
+test result_artifact::tests::product_0084_arrow_projection_is_lazy_cached_and_value_equivalent ... ok
+test result_artifact::tests::product_0084_arrow_stream_schemas_must_agree_in_dtype ... ok
+test result_artifact::tests::product_0084_empty_arrow_result_keeps_width_and_publishes_without_projection ... ok
+test result_artifact::tests::product_0084_logical_nullness_is_owned_without_materializing_polars ... ok
+test result_artifact::tests::product_0084_polars_backing_is_unknown_and_projection_is_the_same_allocation ... ok
+test result_artifact::tests::product_0084_validity_segments_cover_all_valid_physical_sliced_and_batch_boundaries ... ok
+test result_artifact::tests::product_0136_arrow_csv_is_canonical_and_keeps_the_projection_lazy ... ok
+test result_artifact::tests::product_0136_polars_compatibility_projection_matches_arrow_csv_bytes ... ok
+test result_artifact::tests::product_0151_derived_artifacts_inherit_the_complete_publication ... ok
+test result_registry::tests::an_older_dispatch_cannot_overwrite_a_newer_one ... ok
+test result_registry::tests::annotation_ignores_lookalike_words ... ok
+test result_registry::tests::annotation_parses_a_single_name ... ok
+test result_registry::tests::annotation_rejects_missing_and_conflicting_names ... ok
+test result_registry::tests::dispatch_retires_the_previous_binding_immediately ... ok
+test result_registry::tests::failure_leaves_the_name_unbound ... ok
+test result_registry::tests::product_0151_named_binding_keeps_input_identity_and_republishes_token ... ok
+test result_registry::tests::publication_artifact_token_is_exposed_by_provenance ... ok
+test result_registry::tests::publish_binds_data_and_provenance ... ok
+test result_summary::tests::a_small_result_is_whole_and_nullness_is_data ... ok
+test result_summary::tests::every_bound_keeps_the_encoding_under_budget ... ok
+test result_summary::tests::the_length_rule_matches_the_live_encoder ... ok
+test result_summary::tests::the_row_bound_names_itself_and_an_empty_relation_keeps_its_columns ... ok
+test rune_host::tests::body_needs_no_main_boilerplate ... ok
+test rune_host::tests::cell_publishes_a_layered_plot_request ... ok
+test rune_host::tests::compile_failure_reports_the_unresolved_plot_function ... ok
+test rune_host::tests::display_and_requests_are_independent_channels ... ok
+test rune_host::tests::explicit_scatter_columns_become_the_projection ... ok
+test rune_host::tests::missing_result_names_the_publishing_annotation ... ok
+test rune_host::tests::one_argument_scatter_is_a_precise_error ... ok
+test rune_host::tests::plain_body_has_trigonometry_in_std_f64 ... ok
+test rune_host::tests::plain_body_reports_its_trailing_expression ... ok
+test rune_host::tests::product_0136_existing_file_refuses_without_clobbering ... ok
+test rune_host::tests::product_0136_missing_result_keeps_the_existing_name_diagnostic ... ok
+test rune_host::tests::product_0136_named_cell_exports_csv_and_reports_a_receipt ... ok
+test rune_host::tests::product_0136_named_result_exports_csv ... ok
+test rune_host::tests::product_0136_write_failures_surface_through_the_rune_error_path ... ok
+test rune_host::tests::published_results_resolve_through_workspace_result ... ok
+test rune_host::tests::unit_return_displays_nothing ... ok
+test rune_host::tests::unknown_cell_reports_at_the_rune_call_site ... ok
+test rune_host::tests::zero_argument_scatter_keeps_column_inference ... ok
+test rune_instrument::tests::a_call_without_arguments_has_no_leading_comma ... ok
+test rune_instrument::tests::a_fetch_loop_named_line_does_not_block_plotting ... ok
+test rune_instrument::tests::a_free_call_carries_its_original_origin ... ok
+test rune_instrument::tests::a_method_becomes_a_type_guarded_block ... ok
+test rune_instrument::tests::a_method_keeps_its_ordinary_branch_byte_identical ... ok
+test rune_instrument::tests::a_trailing_comma_gets_no_second_comma ... ok
+test rune_instrument::tests::a_visible_glob_import_refuses_a_bare_constructor_call ... ok
+test rune_instrument::tests::an_empty_call_with_a_comment_gets_origins_after_its_paren ... ok
+test rune_instrument::tests::every_binding_form_shadows_within_its_scope ... ok
+test rune_instrument::tests::keys_fields_methods_and_strings_are_not_bindings ... ok
+test rune_instrument::tests::macros_are_opaque ... ok
+test rune_instrument::tests::marks_carry_per_argument_origins_where_the_static_rewrite_does ... ok
+test rune_instrument::tests::nested_chains_render_inner_rewrites_in_both_branches ... ok
+test rune_instrument::tests::offsets_map_back_through_length_changing_rewrites ... ok
+test rune_instrument::tests::origins_go_before_comments_after_a_trailing_comma ... ok
+test rune_instrument::tests::qualified_calls_are_never_rewritten ... ok
+test rune_instrument::tests::receiver_and_arguments_appear_once_per_branch ... ok
+test rune_instrument::tests::the_internal_prefix_is_reserved ... ok
+test rune_instrument::tests::the_legacy_plot_chain_keeps_its_ordinary_calls ... ok
+test rune_instrument::tests::the_same_call_outside_the_scope_is_the_constructor ... ok
+test rune_local::tests::a_cpu_loop_is_bounded_by_the_budget ... ok
+test rune_local::tests::a_curve_uses_one_complete_day_and_names_it ... ok
+test rune_local::tests::a_declared_column_may_be_entirely_null ... ok
+test rune_local::tests::a_declared_date_column_becomes_a_date ... ok
+test rune_local::tests::a_declared_date_refuses_anything_but_strict_iso ... ok
+test rune_local::tests::a_declared_main_selects_the_local_path ... ok
+test rune_local::tests::a_dropped_sender_cancels_like_a_rerun ... ok
+test rune_local::tests::a_failed_cleanup_outranks_cancellation ... ok
+test rune_local::tests::a_promised_curve_without_data_fails_by_name ... ok
+test rune_local::tests::a_rerun_cancels_a_pending_request_promptly ... ok
+test rune_local::tests::a_schema_must_name_real_columns_with_known_types ... ok
+test rune_local::tests::all_null_columns_and_non_objects_are_refused ... ok
+test rune_local::tests::compile_errors_name_the_buffer_line_and_text ... ok
+test rune_local::tests::dates_are_never_inferred_from_text ... ok
+test rune_local::tests::existing_view_sources_keep_the_view_path ... ok
+test rune_local::tests::integers_and_floats_widen_to_float ... ok
+test rune_local::tests::loopback_http_becomes_a_typed_frame_and_one_plot ... ok
+test rune_local::tests::missing_keys_and_unit_are_null_never_zero ... ok
+test rune_local::tests::other_mixes_are_refused_with_rows_named ... ok
+test rune_local::tests::views::a_duplicate_view_name_is_refused_where_it_is_written ... ok
+test rune_local::tests::views::a_helper_builds_a_figure_and_a_loop_names_views ... ok
+test rune_local::tests::views::a_method_receiver_is_evaluated_once_in_either_branch ... ok
+test rune_local::tests::views::a_script_binding_line_keeps_it_and_the_constructor_still_works ... ok
+test rune_local::tests::views::a_subtitle_computed_from_fetched_data ... ok
+test rune_local::tests::views::a_view_not_taken_is_not_queued ... ok
+test rune_local::tests::views::presentation_errors_point_at_the_original_source ... ok
+test rune_local::tests::views::the_basic_plot_chain_still_runs_in_a_local_source ... ok
+test rune_local::tests::views::views_are_refused_outside_a_local_run ... ok
+test rune_local::tests::wrong_main_arity_is_refused_by_name ... ok
+test rune_presentation::tests::product_0076_allocation_budget_and_wrong_slot_are_bounded_and_attributed ... ok
+test rune_presentation::tests::product_0076_duplicate_and_applicability_fail_at_injected_origins ... ok
+test rune_presentation::tests::product_0076_instruction_budget_stops_a_presentation_loop ... ok
+test rune_presentation::tests::product_0076_source_map_distinguishes_copied_and_synthetic_text ... ok
+test rune_presentation::tests::product_0076_typed_values_execute_helpers_arrays_and_real_modifiers ... ok
+test rune_presentation::tests::product_0121_facet_gutter_is_a_facet_member_with_local_refusals ... ok
+test rune_presentation::tests::product_0124_facet_label_size_is_typed_and_owned_by_the_facet_member ... ok
+test rune_presentation::tests::the_method_guard_recognises_every_presentation_value_family ... ok
+test rune_relation_envelope::tests::a_shadowed_ket_is_ordinary_rune_without_shadowing_workspace ... ok
+test rune_relation_envelope::tests::a_view_before_a_non_view_statement_is_now_an_output_root ... ok
+test rune_relation_envelope::tests::inline_and_bound_relations_have_equal_semantics_not_equal_envelopes ... ok
+test rune_relation_envelope::tests::interleaved_roots_are_removed_and_retained_segments_stay_mapped ... ok
+test rune_relation_envelope::tests::ket_is_an_exact_workspace_alias_for_relation_provenance ... ok
+test rune_relation_envelope::tests::named_views_are_optional_unique_and_do_not_change_sink_form ... ok
+test rune_relation_envelope::tests::non_root_presentation_is_partitioned_and_wrong_arity_refuses ... ok
+test rune_relation_envelope::tests::origin_resolved_identity_groups_multiple_origins_and_repeated_inline_text ... ok
+test rune_relation_envelope::tests::plot_forms_retain_only_view_intent ... ok
+test rune_relation_envelope::tests::product_0003_analysis_never_interprets_relation_verbs ... ok
+test rune_relation_envelope::tests::product_0008_bound_but_unused_view_set_is_a_distinct_no_output_outcome ... ok
+test rune_relation_envelope::tests::product_0008_context_is_total_atomic_and_span_attributed ... ok
+test rune_relation_envelope::tests::product_0008_direct_factored_and_legacy_forms_share_one_semantics ... ok
+test rune_relation_envelope::tests::product_0008_orders_within_sets_then_by_emission_position ... ok
+test rune_relation_envelope::tests::product_0008_single_view_sugars_are_exact_canonical_projections ... ok
+test rune_relation_envelope::tests::product_0012_line_recognition_is_contextual_shadowed_and_atomic ... ok
+test rune_relation_envelope::tests::product_0012_line_spellings_are_exact_canonical_projections ... ok
+test rune_relation_envelope::tests::product_0014_layer_depth_and_admissible_marks_refuse_at_the_inner_span ... ok
+test rune_relation_envelope::tests::product_0014_layers_lower_in_authored_order ... ok
+test rune_relation_envelope::tests::product_0014_layers_recognition_is_outer_attributed_and_atomic ... ok
+test rune_relation_envelope::tests::product_0014_scatter_arity_is_contextual ... ok
+test rune_relation_envelope::tests::product_0016_figure_lowers_body_and_headings_independently ... ok
+test rune_relation_envelope::tests::product_0016_figure_refusals_are_inner_attributed_and_atomic ... ok
+test rune_relation_envelope::tests::product_0016_one_body_figure_is_the_same_view_as_its_bare_mark ... ok
+test rune_relation_envelope::tests::product_0016_subtitle_only_is_legal_and_figure_is_contextual ... ok
+test rune_relation_envelope::tests::product_0018_modifier_is_ordinary_rune_outside_proven_positions ... ok
+test rune_relation_envelope::tests::product_0018_modifier_register_is_closed_duplicate_free_and_atomic ... ok
+test rune_relation_envelope::tests::product_0018_point_size_flattens_in_every_proven_mark_position ... ok
+test rune_relation_envelope::tests::product_0018_point_size_uses_the_substrate_domain_without_clamping ... ok
+test rune_relation_envelope::tests::product_0018_styled_single_keeps_structural_presentation ... ok
+test rune_relation_envelope::tests::product_0020_modifier_compatibility_is_closed_and_order_independent ... ok
+test rune_relation_envelope::tests::product_0020_stroke_width_flattens_in_every_proven_mark_position ... ok
+test rune_relation_envelope::tests::product_0020_stroke_width_inherits_bounds_and_refuses_atomically ... ok
+test rune_relation_envelope::tests::product_0020_stroke_width_is_ordinary_rune_outside_proven_positions ... ok
+test rune_relation_envelope::tests::product_0020_styled_single_line_keeps_structural_presentation ... ok
+test rune_relation_envelope::tests::product_0022_bar_width_flattens_in_direct_and_figure_positions ... ok
+test rune_relation_envelope::tests::product_0022_bar_width_is_ordinary_rune_outside_proven_positions ... ok
+test rune_relation_envelope::tests::product_0022_bar_width_uses_substrate_bounds_and_atomic_refusals ... ok
+test rune_relation_envelope::tests::product_0022_receiver_rules_keep_bar_out_of_ordered_layers ... ok
+test rune_relation_envelope::tests::product_0027_table_modifier_register_is_closed_bounded_and_atomic ... ok
+test rune_relation_envelope::tests::product_0027_table_projection_calls_are_ordinary_rune_outside_proven_positions ... ok
+test rune_relation_envelope::tests::product_0027_table_skin_projection_flattens_in_every_order_and_identity_position ... ok
+test rune_relation_envelope::tests::product_0030_palette_is_unordered_figure_metadata_and_identity_stays_structural ... ok
+test rune_relation_envelope::tests::product_0030_palette_refusals_are_contextual_attributed_and_atomic ... ok
+test rune_relation_envelope::tests::product_0032_skin_is_unordered_direct_figure_metadata ... ok
+test rune_relation_envelope::tests::product_0032_skin_refusals_are_contextual_and_attributed ... ok
+test rune_relation_envelope::tests::product_0036_figure_bounds_lower_once_as_one_domain_override ... ok
+test rune_relation_envelope::tests::product_0036_negative_bounds_and_omission_are_exact ... ok
+test rune_relation_envelope::tests::product_0036_undefined_bounds_refuse_at_the_exact_constructor ... ok
+test rune_relation_envelope::tests::product_0038_tick_step_refusals_are_value_and_span_attributed ... ok
+test rune_relation_envelope::tests::product_0038_tick_steps_lower_once_and_keep_axes_independent ... ok
+test rune_relation_envelope::tests::product_0039_minor_tick_value_refusals_are_attributed ... ok
+test rune_relation_envelope::tests::product_0039_minor_ticks_lower_as_independent_counts ... ok
+test rune_relation_envelope::tests::product_0040_static_literal_bindings_feed_every_figure_element ... ok
+test rune_relation_envelope::tests::product_0040_table_skin_register_refuses_bad_bindings_atomically ... ok
+test rune_relation_envelope::tests::product_0040_table_skin_register_resolves_bindings_in_every_member_order ... ok
+test rune_relation_envelope::tests::product_0042_facet_is_structural_figure_metadata_and_resolves_bindings ... ok
+test rune_relation_envelope::tests::product_0046_category_scatter_keeps_its_encoding_and_point_size ... ok
+test rune_relation_envelope::tests::product_0047_series_bar_inherits_the_bar_width_register ... ok
+test rune_relation_envelope::tests::product_0047_series_bar_refusals_are_inherited_unchanged ... ok
+test rune_relation_envelope::tests::product_0047_three_field_bar_normalizes_across_all_three_spellings ... ok
+test rune_relation_envelope::tests::product_0047_two_field_bar_is_unchanged_at_every_spelling ... ok
+test rune_relation_envelope::tests::product_0052_show_types_has_no_skin_dependency_and_the_register_remains_a_set ... ok
+test rune_relation_envelope::tests::product_0052_show_types_refusals_are_atomic_and_duotone_owns_its_dependency ... ok
+test rune_relation_envelope::tests::product_0053_category_gap_bounds_receivers_and_context_are_closed ... ok
+test rune_relation_envelope::tests::product_0053_category_gap_flattens_across_bar_forms_and_modifier_order ... ok
+test rune_relation_envelope::tests::product_0054_series_line_reaches_named_figure_and_native_modifier_positions ... ok
+test rune_relation_envelope::tests::product_0054_series_line_refusals_keep_layers_closed_and_rune_contextual ... ok
+test rune_relation_envelope::tests::product_0054_series_line_spellings_project_one_named_color_channel ... ok
+test rune_relation_envelope::tests::product_0058_bound_fields_equal_inline_in_every_standalone_position ... ok
+test rune_relation_envelope::tests::product_0058_bound_layer_fields_preserve_the_closed_layer_surface ... ok
+test rune_relation_envelope::tests::product_0058_lookup_and_argument_refusals_survive_product_0076_partitioning ... ok
+test rune_relation_envelope::tests::product_0064_stacked_is_a_zero_argument_order_independent_bar_member ... ok
+test rune_relation_envelope::tests::product_0064_stacked_refusals_are_atomic_and_receiver_scoped ... ok
+test rune_relation_envelope::tests::product_0070_area_refusals_keep_layers_and_registers_closed ... ok
+test rune_relation_envelope::tests::product_0070_area_spellings_and_static_bindings_share_one_standalone_intent ... ok
+test rune_relation_envelope::tests::product_0072_percent_is_an_order_independent_stacked_register_member ... ok
+test rune_relation_envelope::tests::product_0076_in_flight_presentation_completion_cannot_publish_after_supersession ... ok
+test rune_relation_envelope::tests::product_0076_layers_outside_a_slot_cannot_leak_to_toron ... ok
+test rune_relation_envelope::tests::product_0076_presentation_scheduler_coalesces_before_invocation ... ok
+test rune_relation_envelope::tests::product_0076_stage0_computed_figure_element_is_the_banked_red_boundary ... ok
+test rune_relation_envelope::tests::product_0094_sink_equality_ignores_origins_but_not_semantic_fields ... ok
+test rune_relation_envelope::tests::product_0094_variants_keep_accessors_and_variable_arity ... ok
+test rune_relation_envelope::tests::product_0125_legend_member_is_ordinary_rune_outside_a_figure_member ... ok
+test rune_relation_envelope::tests::product_0125_legend_member_preserves_presence_and_composes_with_size ... ok
+test rune_relation_envelope::tests::product_0125_legend_members_refuse_ambiguity_and_undefined_values_at_source ... ok
+test rune_relation_envelope::tests::product_0142_relation_plan_key_ignores_presentation_and_source_offsets ... ok
+test rune_relation_envelope::tests::product_0142_relation_plan_key_refuses_changed_relation_work_or_stale_artifact ... ok
+test rune_relation_envelope::tests::product_0144_direct_styled_hexbin_is_defensively_labelled_and_refuses_layering ... ok
+test rune_relation_envelope::tests::product_0146_bound_fill_between_fields_equal_inline_in_both_arities ... ok
+test rune_relation_envelope::tests::product_0146_direct_styled_fill_between_is_defensively_labelled_and_refuses_layering ... ok
+test rune_relation_envelope::tests::product_0148_bound_candlestick_fields_equal_inline ... ok
+test rune_relation_envelope::tests::product_0148_direct_styled_candlestick_is_defensively_labelled_and_refuses_layering ... ok
+test rune_relation_envelope::tests::retained_trailing_expression_is_terminated_before_the_relation_return ... ok
+test rune_relation_envelope::tests::scheduler_completion_without_in_flight_work_is_a_hard_invariant - should panic ... ok
+test rune_relation_envelope::tests::scheduler_executes_in_flight_then_only_the_newest_pending_view ... ok
+test rune_relation_envelope::tests::semantic_equality_ignores_ordinary_order_but_preserves_root_order ... ok
+test rune_relation_envelope::tests::semicolon_terminated_view_still_returns_the_relation ... ok
+test rune_relation_envelope::tests::shadowed_binding_and_direct_call_collisions_remain_ordinary_rune ... ok
+test rune_relation_envelope::tests::shadowing_is_per_form_and_collected_before_root_classification ... ok
+test rune_relation_envelope::tests::terminal_table_is_substituted_and_mapped ... ok
+test rune_relation_envelope::tests::trailing_three_view_block_strips_once_and_retains_each_span ... ok
+test rune_relation_envelope::tests::zero_roots_produce_no_envelope_and_no_scheduled_execution ... ok
+test rune_view_compiler::tests::product_0076_compile_diagnostics_map_copied_text_to_the_exact_argument ... ok
+test rune_view_compiler::tests::product_0076_compiler_executes_computed_presentation_with_static_topology ... ok
+test rune_view_compiler::tests::product_0076_computed_dual_use_and_mixed_helpers_refuse_before_execution ... ok
+test rune_view_compiler::tests::product_0076_context_divergence_executes_locally_but_never_dual_replays ... ok
+test rune_view_compiler::tests::product_0076_helper_failures_keep_the_helper_body_origin ... ok
+test rune_view_compiler::tests::product_0076_helpers_cover_the_complete_presentation_vocabulary ... ok
+test rune_view_compiler::tests::product_0076_lexer_does_not_rewrite_strings_or_comments ... ok
+test rune_view_compiler::tests::product_0076_partition_separates_vocabularies_and_keeps_literal_dual_use ... ok
+test rune_view_compiler::tests::product_0076_partition_tracks_shadowed_occurrences_by_position ... ok
+test rune_view_compiler::tests::product_0076_rewriter_injects_nested_constructor_and_modifier_origins ... ok
+test rune_view_compiler::tests::product_0076_test21_computed_bounds_compile_as_twelve_static_views ... ok
+test rune_view_compiler::tests::product_0076_topology_remains_literal_and_names_remain_static ... ok
+test rune_view_compiler::tests::product_0076_unclaimed_effects_stay_relation_side_but_presentation_does_not_leak ... ok
+test rune_view_compiler::tests::product_0079_histogram_is_one_static_three_field_mark_with_empty_register ... ok
+test rune_view_compiler::tests::product_0082_box_rewriter_retains_seven_argument_origins ... ok
+test rune_view_compiler::tests::product_0082_box_surface_positions_are_closed_and_originated ... ok
+test rune_view_compiler::tests::product_0085_0082_0083_test26_is_the_real_box_and_axis_title_exhibit ... ok
+test rune_view_compiler::tests::product_0085_axis_labels_execute_helpers_preserve_text_and_refuse_precisely ... ok
+test rune_view_compiler::tests::product_0091_continuous_surface_refuses_unknowns_and_second_spellings_precisely ... ok
+test rune_view_compiler::tests::product_0091_continuous_words_rewrite_and_retain_modifier_intent_origin ... ok
+test rune_view_compiler::tests::product_0091_modifier_provenance_does_not_change_figure_identity ... ok
+test rune_view_compiler::tests::product_0091_test29_separates_ramp_slots_jobs_and_anchors ... ok
+test rune_view_compiler::tests::product_0092_heatmap_rewriter_retains_three_argument_origins ... ok
+test rune_view_compiler::tests::product_0092_heatmap_surface_positions_are_closed_and_originated ... ok
+test rune_view_compiler::tests::product_0092_test27_is_the_sparse_and_duplicate_heatmap_exhibit ... ok
+test rune_view_compiler::tests::product_0095_bubble_rewriter_retains_four_or_five_argument_origins ... ok
+test rune_view_compiler::tests::product_0095_bubble_surface_positions_arities_and_origins_are_closed ... ok
+test rune_view_compiler::tests::product_0095_test28_is_the_labelled_and_unlabelled_bubble_exhibit ... ok
+test rune_view_compiler::tests::product_0098_funnel_rewriter_retains_two_argument_origins ... ok
+test rune_view_compiler::tests::product_0098_funnel_surface_positions_arity_and_origins_are_closed ... ok
+test rune_view_compiler::tests::product_0098_test30_is_the_valid_and_refusing_funnel_exhibit ... ok
+test rune_view_compiler::tests::product_0100_radial_dial_surface_positions_arities_and_origins_are_closed ... ok
+test rune_view_compiler::tests::product_0100_test31_is_the_grouped_and_ungrouped_radial_dial_exhibit ... ok
+test rune_view_compiler::tests::product_0103_each_exhibit_execution_contains_only_its_relation_branch ... ok
+test rune_view_compiler::tests::product_0103_pie_surface_positions_arity_and_origins_are_closed ... ok
+test rune_view_compiler::tests::product_0103_test32_is_the_aggregated_and_refusing_pie_exhibit ... ok
+test rune_view_compiler::tests::product_0105_test33_is_the_variadic_radar_and_parallel_exhibit ... ok
+test rune_view_compiler::tests::product_0105_variadic_multivariate_words_retain_origins_and_single_routing ... ok
+test rune_view_compiler::tests::product_0107_test34_composes_density_and_median_in_one_invocation ... ok
+test rune_view_compiler::tests::product_0108_violin_surface_has_four_fields_and_refuses_raw_arity ... ok
+test rune_view_compiler::tests::product_0112_hover_size_is_a_generated_text_word_with_precise_refusals ... ok
+test rune_view_compiler::tests::product_0113_title_and_subtitle_font_size_are_member_modifiers ... ok
+test rune_view_compiler::tests::product_0115_x_tick_rotation_is_a_typed_generated_text_word ... ok
+test rune_view_compiler::tests::product_0120_padding_edges_are_typed_partial_members_with_precise_refusals ... ok
+test rune_view_compiler::tests::product_0121_test36_is_the_authored_facet_gutter_member_exhibit ... ok
+test rune_view_compiler::tests::product_0123_axis_members_preserve_axis_authority_and_compose ... ok
+test rune_view_compiler::tests::product_0123_test38_is_the_axis_member_reference_exhibit ... ok
+test rune_view_compiler::tests::product_0124_test39_is_the_facet_label_typography_reference_exhibit ... ok
+test rune_view_compiler::tests::product_0125_test40_is_the_legend_member_reference_exhibit ... ok
+test rune_view_compiler::tests::product_0130_temporal_tick_interval_exhibit_compiles_calendar_surface ... ok
+test rune_view_compiler::tests::product_0137_evidence_exhibit_source_routes_as_a_terminal_relation ... ok
+test rune_view_compiler::tests::product_0137_terminal_ket_relation_compiles_with_no_views ... ok
+test rune_view_compiler::tests::product_0137_terminal_route_is_structural_and_names_no_relation_verb ... ok
+test rune_view_compiler::tests::product_0137_terminal_workspace_relation_is_not_stolen_from_the_local_host ... ok
+test rune_view_compiler::tests::product_0141_expression_shape_requires_one_complete_literal ... ok
+test rune_view_compiler::tests::product_0141_shared_helper_occurrence_has_plural_owners ... ok
+test rune_view_compiler::tests::product_0141_source_model_retains_arguments_shape_and_container_facts ... ok
+test rune_view_compiler::tests::product_0144_hexbin_rewriter_retains_two_argument_origins ... ok
+test rune_view_compiler::tests::product_0144_hexbin_surface_is_closed_originated_and_honestly_labelled ... ok
+test rune_view_compiler::tests::product_0144_test41_is_the_authored_hexbin_and_temporal_refusal_exhibit ... ok
+test rune_view_compiler::tests::product_0146_fill_between_rewriter_retains_three_or_four_argument_origins ... ok
+test rune_view_compiler::tests::product_0146_fill_between_surface_is_variable_originated_and_closed ... ok
+test rune_view_compiler::tests::product_0146_test42_is_the_temporal_fill_between_and_crossing_exhibit ... ok
+test rune_view_compiler::tests::product_0148_candlestick_rewriter_retains_five_argument_origins ... ok
+test rune_view_compiler::tests::product_0148_candlestick_surface_is_fixed_originated_and_closed ... ok
+test rune_view_compiler::tests::product_0148_test43_is_the_sorted_temporal_candlestick_and_containment_exhibit ... ok
+test rune_view_compiler::tests::product_0151_relation_lineage_is_structural_and_root_normalized ... ok
+test rune_view_compiler::tests::semantic_composition_showcase_compiles_all_three_radial_marks ... ok
+test rune_view_compiler::tests::semantic_distribution_showcase_compiles_relation_native_mark_inputs ... ok
+test rune_view_compiler::tests::semantic_multivariate_showcase_compiles_long_and_wide_mark_inputs ... ok
+test rune_view_compiler::tests::semantic_trends_showcase_compiles_all_four_cartesian_marks ... ok
+test rune_view_compiler::tests::static_and_local_rewrites_inject_the_same_origins ... ok
+test selection::product_0151_selection_tests::product_0151_algebra_is_or_within_and_across_and_semantic_for_subtract ... ok
+test selection::product_0151_selection_tests::product_0151_candidate_without_source_provenance_refuses_atomically ... ok
+test selection::product_0151_selection_tests::product_0151_clear_without_a_bound_predicate_is_a_true_no_op ... ok
+test selection::product_0151_selection_tests::product_0151_context_predicates_exclude_self_and_preflight_every_sibling ... ok
+test selection::product_0151_selection_tests::product_0151_exact_scalars_preserve_physical_identity ... ok
+test selection::product_0151_selection_tests::product_0151_or_within_and_across_filters_from_the_unfiltered_frame ... ok
+test selection::product_0151_selection_tests::product_0151_preflight_is_total_and_units_are_part_of_type ... ok
+test selection::product_0151_selection_tests::product_0151_projection_matches_the_predicate_subset_of_a_candidate ... ok
+test selection::product_0151_selection_tests::product_0151_refused_algebra_is_atomic_and_prefixed ... ok
+test selection::product_0151_selection_tests::product_0151_retirement_rebuild_predicate_contains_only_surviving_intents ... ok
+test selection::product_0151_selection_tests::product_0151_stale_publications_refuse_and_retirement_rebuilds_survivors ... ok
+test selection::product_0151_selection_tests::product_0151_table_emits_only_exact_single_column_values ... ok
+test selection::product_0151_selection_tests::product_0151_table_emphasis_follows_values_after_reordering ... ok
+test session_persistence::tests::product_0062_allocator_marks_are_structural_state ... ok
+test session_persistence::tests::product_0062_capture_filters_shared_identity_not_colour_lifetime ... ok
+test session_persistence::tests::product_0062_codec_is_strict_bounded_and_deterministic ... ok
+test session_persistence::tests::product_0062_colour_family_is_authored_and_rotation_independent ... ok
+test session_persistence::tests::product_0062_palette_positions_are_revalidated_against_their_space ... ok
+test session_persistence::tests::product_0062_post_spawn_join_is_total ... ok
+test session_persistence::tests::product_0062_rekeying_uses_document_identity_not_open_order_or_path ... ok
+test session_persistence::tests::product_0062_schema_has_no_placement_or_renderer_vocabulary ... ok
+test session_persistence::tests::product_0070_area_closed_policy_adds_area_without_weakening_initial_policy ... ok
+test session_persistence::tests::product_0075_plain_anonymous_zero_uses_the_existing_owner_vocabulary ... ok
+test session_persistence::tests::product_0079_histogram_panel_has_owner_meaning_and_no_colour_footprint ... ok
+test session_persistence::tests::product_0082_box_panel_has_owner_meaning_and_no_colour_footprint ... ok
+test session_persistence::tests::product_0085_axis_title_stays_in_source_and_not_owner_meanings ... ok
+test session_persistence::tests::product_0086_extensible_policy_preserves_unknown_family_through_runtime_capture ... ok
+test session_persistence::tests::product_0086_family_admission_policies_and_token_validation_are_exact ... ok
+test session_persistence::tests::product_0092_heatmap_panel_has_owner_meaning_and_no_colour_footprint ... ok
+test session_persistence::tests::product_0095_bubble_panel_has_owner_meaning_and_no_colour_footprint ... ok
+test session_persistence::tests::product_0098_funnel_family_round_trips_only_under_the_extensible_policy ... ok
+test session_persistence::tests::product_0100_existing_session_without_radial_dial_is_byte_identical ... ok
+test session_persistence::tests::product_0100_radial_dial_family_round_trips_only_under_the_extensible_policy ... ok
+test session_persistence::tests::product_0103_pie_family_round_trips_only_under_the_extensible_policy ... ok
+test session_persistence::tests::product_0105_multivariate_families_round_trip_only_under_the_extensible_policy ... ok
+test session_persistence::tests::product_0144_hexbin_panel_reopens_without_a_colour_footprint ... ok
+test session_persistence::tests::product_0146_fill_between_panel_reopens_without_a_colour_footprint ... ok
+test session_persistence::tests::product_0148_candlestick_panel_reopens_without_a_colour_footprint ... ok
+test settings_writeback::tests::product_0142_absent_mark_setting_appends_to_a_bare_inline_slot ... ok
+test settings_writeback::tests::product_0142_absent_setting_refuses_helper_built_furniture ... ok
+test settings_writeback::tests::product_0142_candidate_source_compile_is_the_reuse_gate ... ok
+test settings_writeback::tests::product_0142_capability_set_covers_every_setting_exactly ... ok
+test settings_writeback::tests::product_0142_expression_and_shared_occurrences_refuse ... ok
+test settings_writeback::tests::product_0142_insertion_and_last_modifier_reset_use_syntax_boundaries ... ok
+test settings_writeback::tests::product_0142_literal_replacement_changes_only_argument_bytes ... ok
+test tests::adr0169_drive_execution_mode_is_explicit_and_defaults_to_on_open ... ok
+test tests::committed_session_order_is_newest_then_generation_then_identity ... ok
+test tests::double_dash_allows_a_dash_prefixed_path ... ok
+test tests::first_positional_argument_is_the_initial_file ... ok
+test tests::product_0158_describe_takes_one_source ... ok
+test tests::product_0158_drive_requires_source_commands_and_receipt ... ok
+test tests::saved_session_selector_is_exact_and_exclusive ... ok
+
+test result: ok. 1399 passed; 0 failed; 26 ignored; 0 measured; 0 filtered out; finished in 147.34s
+
+     Running tests/architecture_test.rs (target/debug/deps/architecture_test-6ca6849e767fea15)
+
+running 129 tests
+test coordinate::tests::the_space_vocabulary_is_exactly_the_census ... ok
+test manifest_dependency_guard::tests::baryon_may_consume_the_shared_analytics_crate_but_libaryon_may_not ... ok
+test manifest_dependency_guard::tests::boson_rejects_all_engine_editor_and_codec_dependencies ... ok
+test manifest_dependency_guard::tests::catches_inline_package_rename_and_ignores_comments ... ok
+test manifest_dependency_guard::tests::catches_workspace_inherited_package_rename ... ok
+test manifest_dependency_guard::tests::editor_heads_cannot_reach_nilket_engines_directly ... ok
+test manifest_dependency_guard::tests::existing_and_planned_product_connectors_are_forbidden ... ok
+test manifest_dependency_guard::tests::nilket_engines_cannot_reach_editor_crates_but_may_consume_boson ... ok
+test manifest_dependency_guard::tests::ordinary_editor_dependencies_are_allowed ... ok
+test manifest_dependency_guard::tests::scans_all_dependency_kinds_and_target_specific_tables ... ok
+test product_0001_polariton_reaches_nilket_only_through_the_public_client ... ok
+test product_0003_terminal_envelope_is_the_only_relation_view_transformation_site ... ok
+test product_0005_polariton_uses_only_public_local_workspace_discovery ... ok
+test product_0006_creation_authority_stays_feature_gated_and_out_of_discovery ... ok
+test product_0007_plot_spec_stays_product_side_and_cannot_execute_relations ... ok
+test product_0007_rendering_consumes_resolved_fields_without_inference ... ok
+test product_0007_stage_three_stays_session_scoped_and_keeps_ui_out_of_data_color ... ok
+test product_0010_relation_views_complete_without_dashboard_routing ... ok
+test product_0018_rune_surface_keeps_point_size_out_of_prepared_data ... ok
+test product_0019_stroke_width_is_render_state_not_prepared_line_data ... ok
+test product_0020_extends_the_closed_typed_modifier_register ... ok
+test product_0021_bar_width_is_render_state_without_bar_layer_admission ... ok
+test product_0022_bar_width_extends_only_the_closed_styled_single_register ... ok
+test product_0023_table_artifact_is_the_atomic_host_and_markdown_boundary ... ok
+test product_0023_table_draw_reads_only_its_required_resolved_skin ... ok
+test product_0023_table_skin_is_closed_complete_and_separate_from_other_color_models ... ok
+test product_0025_theme_projection_and_table_register_keep_their_authority_boundaries ... ok
+test product_0026_projection_choice_stays_explicit_and_outside_rune_and_editor_chrome ... ok
+test product_0027_surface_keeps_projection_intent_bounded_and_plot_registers_closed ... ok
+test product_0028_categorical_palettes_reach_only_the_product_0029_spec_consumer ... ok
+test product_0029_positions_and_exact_band_fills_stay_inside_the_plot_boundary ... ok
+test product_0030_surface_default_and_continuation_stay_at_the_rune_head_boundary ... ok
+test product_0033_plot_skin_projection_choice_is_bounded_and_renderer_free ... ok
+test product_0035_authored_table_contrast_is_observable_but_never_an_admission_gate ... ok
+test product_0036_numeric_bounds_have_one_figure_producer_and_no_magnitude_gate ... ok
+test product_0037_tick_positions_have_one_closed_generator_and_no_surface_caller ... ok
+test product_0038_tick_step_is_the_only_surface_producer_of_step_placement ... ok
+test product_0039_minor_ticks_have_one_surface_producer_and_checked_total_capacity ... ok
+test product_0040_static_literal_bindings_resolve_only_at_the_envelope_boundary ... ok
+test product_0049_coordinate_vocabulary_stays_closed_and_opaque ... ok
+test product_0053_category_gap_stays_in_the_closed_bar_register ... ok
+test product_0057_render_evidence_mirrors_the_binary_module_graph ... ok
+test product_0057_rendering_oracle_licenses_are_schema_bound ... ok
+test product_0062_persistence_schema_has_no_placement_or_renderer_authority ... ok
+test product_0071_chrome_consumes_the_guarded_title_status_and_menu_models ... ok
+test product_0072_percent_is_scale_intent_not_cascade_or_durable_identity ... ok
+test product_0073_discovery_is_a_terminal_read_only_store_census ... ok
+test product_0074_polariton_selects_zero_divider_reservation ... ok
+test product_0075_nested_dashboard_is_absent_and_renderer_catalog_is_exact ... ok
+test product_0076_presentation_has_one_typed_semantic_authority ... ok
+test product_0076_showcase_and_seed_are_repository_owned ... ok
+test product_0077_facet_tick_containment_does_not_measure_or_resize_layout ... ok
+test product_0078_histogram_keeps_one_interval_authority_after_the_0079_surface ... ok
+test product_0080_product_0083_plot_chrome_and_mark_style_are_separate_closed_tiers ... ok
+test product_0082_box_plot_keeps_one_tukey_authority_and_explicit_producer ... ok
+test product_0084_keeps_dataframe_at_the_kernel_boundary_only ... ok
+test product_0084_result_artifact_is_the_single_truth_boundary ... ok
+test product_0085_keeps_one_semantic_axis_title_derivation_authority ... ok
+test product_0086_live_family_catalog_is_source_complete_and_renderer_free ... ok
+test product_0086_wire_numbers_do_not_become_session_code_vocabulary ... ok
+test product_0087_gradient_guides_have_one_stop_and_construction_authority ... ok
+test product_0088_heatmap_keeps_one_validated_sparse_cell_authority ... ok
+test product_0089_continuous_colour_has_one_scale_and_no_decomposed_guide_path ... ok
+test product_0090_bubble_keeps_one_validated_observation_authority ... ok
+test product_0091_continuous_authoring_has_only_the_two_recorded_origins_and_no_status_surface ... ok
+test product_0092_heatmap_surface_keeps_one_explicit_three_role_pipeline ... ok
+test product_0093_legend_geometry_has_one_authority_without_backend_measurement ... ok
+test product_0094_mark_field_transport_is_exhaustive_coupled_and_identity_neutral ... ok
+test product_0095_bubble_surface_keeps_roles_projection_and_kernel_boundaries_structural ... ok
+test product_0096_funnel_has_one_exact_numeric_authority_and_no_legacy_fallbacks ... ok
+test product_0097_widget_hit_geometry_has_closed_typed_trust_boundaries ... ok
+test product_0098_funnel_surface_has_one_durable_assignment_and_transport_path ... ok
+test product_0099_radial_dial_reads_once_through_one_validated_collection ... ok
+test product_0100_radial_dial_surface_reuses_transport_identity_and_one_colour_authority ... ok
+test product_0101_path_builder_has_one_connected_arc_contract_and_two_live_callers ... ok
+test product_0102_pie_has_one_validated_slice_and_geometry_authority ... ok
+test product_0103_pie_surface_reuses_transport_and_has_one_colour_and_guide_authority ... ok
+test product_0104_radar_and_parallel_share_one_honest_multivariate_row_authority ... ok
+test product_0105_variadic_multivariate_surface_has_one_transport_admission_and_colour_path ... ok
+test product_0106_vertical_guides_have_one_reservation_authority_and_no_measurement_seam ... ok
+test product_0108_violin_surface_consumes_one_relation_side_density_authority ... ok
+test product_0109_palette_kind_is_carried_and_continuous_allocation_is_stateless ... ok
+test product_0112_hover_typography_stays_typed_and_off_canvas ... ok
+test product_0114_band_requirements_precede_and_feed_shared_geometry ... ok
+test product_0114_estimates_are_declared_without_measurement ... ok
+test product_0115_rotation_is_typed_and_axis_overlays_share_one_policy ... ok
+test product_0117_declares_one_plot_text_face_and_a_total_static_ascii_budget ... ok
+test product_0119_estimates_reserve_space_without_moving_x_tick_ink ... ok
+test product_0119_x_tick_labels_follow_their_ticks_and_keep_figure_clips ... ok
+test product_0121_facet_gutter_member_reuses_the_existing_figure_grid_authority ... ok
+test product_0122_axis_and_tick_typography_is_typed_partial_and_keeps_legend_blocked ... ok
+test product_0123_axis_members_are_the_only_axis_surface_and_merge_fieldwise ... ok
+test product_0124_facet_label_typography_is_typed_member_owned_and_independent_from_legend ... ok
+test product_0125_legend_member_owns_typed_legend_text_without_measurement ... ok
+test product_0126_the_y_axis_title_draw_path_reads_only_the_shared_left_guide ... ok
+test product_0127_formatted_requirements_carry_selected_pre_layout_ticks ... ok
+test product_0135_sql_results_reach_the_host_through_exactly_two_paths ... ok
+test product_0136_csv_export_keeps_arrow_canonical_and_polars_csv_unadmitted ... ok
+test product_0141_registry_is_the_only_surface_inventory_and_the_inspector_is_read_only ... ok
+test product_0143_authority_survives_product_0144_precise_surface_inversions ... ok
+test product_0143_count_guide_contract_is_closed_and_reservation_precedes_preparation ... ok
+test product_0143_hexbin_renderer_consumes_only_tagged_viewport_artifacts ... ok
+test product_0144_diagnostics_reuse_the_retained_artifact_token ... ok
+test product_0144_keeps_hexbin_out_of_layers_and_colour_job_words ... ok
+test product_0145_authority_survives_product_0146_precise_surface_inversions ... ok
+test product_0145_fill_between_substrate_has_one_validated_colour_and_hit_authority ... ok
+test product_0146_fill_between_surface_has_one_transport_and_no_colour_or_layer_widening ... ok
+test product_0147_authority_survives_product_0148_precise_surface_inversions ... ok
+test product_0147_candlestick_substrate_has_one_validated_geometric_colour_authority ... ok
+test product_0148_candlestick_surface_has_one_transport_and_no_colour_or_layer_widening ... ok
+test product_0149_coordinators_own_identity_admission_and_exact_export_boundaries ... ok
+test product_0149_interactive_rasters_request_in_update_and_only_draw_published_pixels ... ok
+test product_0150_gestures_only_author_the_pane_tier_and_thresholds_remain_unpriced ... ok
+test product_0150_viewport_identity_motion_and_composite_policy_are_production_wired ... ok
+test product_0151_click_selection_admission_is_a_closed_kernel_table ... ok
+test product_0151_identity_grid_and_in_process_boundaries_are_pinned ... ok
+test product_0152_plot_and_presentation_sources_never_name_the_toron_client ... ok
+test product_0154_browser_plot_authority_is_refused_with_a_positive_control ... ok
+test product_0154_package_dtos_stay_free_of_placement_token_and_renderer_authority ... ok
+test product_0154_shell_emitter_inlines_one_pinned_script ... ok
+test product_0155_inspection_asset_is_glue_with_a_positive_control ... ok
+test product_0155_javascript_engine_is_boa_dev_only_without_default_features ... ok
+test product_0157_series_table_dtos_carry_no_exact_identity_with_a_positive_control ... ok
+test product_0158_driver_and_headless_application_hold_no_authority ... ok
+test product_0159_gate_constants_and_render_mode_are_retained_and_the_batch_is_scatters ... ok
+test product_0160_observation_enters_update_and_uses_application_baselines ... ok
+test product_0161_reporting_has_an_explicit_destination_and_no_authoring_data ... ok
+test product_0162_notebook_actions_share_admission_and_engine_generation_guards ... ok
+test rune_authoring_resolves_layouts_without_building_kernels ... ok
+
+test result: ok. 129 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running tests/boxplot_tukey_ui.rs (target/debug/deps/boxplot_tukey_ui-dcf7423ccbbb2865)
+
+running 1 test
+test product_0081_tukey_boxes_exclude_unvalidated_mutation ...    Compiling polariton-tests v0.0.0 (/home/me/work/ket/target/tests/trybuild/polariton)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.41s
+
+
+test tests/ui/boxplot_tukey_construct.rs [should pass] ... ok
+test tests/ui/boxplot_tukey_private.rs [should fail to compile] ... ok
+
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.70s
+
+     Running tests/bubble_observations_ui.rs (target/debug/deps/bubble_observations_ui-42227b62f6e594f6)
+
+running 1 test
+test product_0090_bubble_observations_excludes_unvalidated_external_construction ...    Compiling polariton-tests v0.0.0 (/home/me/work/ket/target/tests/trybuild/polariton)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.40s
+
+
+test tests/ui/bubble_observations_construct.rs [should pass] ... ok
+test tests/ui/bubble_observations_private.rs [should fail to compile] ... ok
+
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.54s
+
+     Running tests/coordinate_spaces_ui.rs (target/debug/deps/coordinate_spaces_ui-d723d404824f7292)
+
+running 1 test
+test coordinate_spaces_reject_cross_space_geometry ...    Compiling polariton-tests v0.0.0 (/home/me/work/ket/target/tests/trybuild/polariton)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.40s
+
+
+test tests/ui/coordinate_same_space.rs [should pass] ... ok
+test tests/ui/coordinate_cross_space.rs [should fail to compile] ... ok
+
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.20s
+
+     Running tests/funnel_stages_ui.rs (target/debug/deps/funnel_stages_ui-a32bef7eedf9360e)
+
+running 1 test
+test product_0096_funnel_stages_excludes_unvalidated_external_construction ...    Compiling polariton-tests v0.0.0 (/home/me/work/ket/target/tests/trybuild/polariton)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.40s
+
+
+test tests/ui/funnel_stages_construct.rs [should pass] ... ok
+test tests/ui/funnel_stages_private.rs [should fail to compile] ... ok
+
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.61s
+
+     Running tests/gradient_stops_ui.rs (target/debug/deps/gradient_stops_ui-95e3ae57c0010bc3)
+
+running 1 test
+test product_0087_gradient_stops_exclude_unvalidated_external_access ...    Compiling polariton-tests v0.0.0 (/home/me/work/ket/target/tests/trybuild/polariton)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.40s
+
+
+test tests/ui/gradient_stops_construct.rs [should pass] ... ok
+test tests/ui/gradient_stops_private_literal.rs [should fail to compile] ... ok
+test tests/ui/gradient_stops_private_read.rs [should fail to compile] ... ok
+
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.62s
+
+     Running tests/heatmap_cells_ui.rs (target/debug/deps/heatmap_cells_ui-b485758815bfed74)
+
+running 1 test
+test product_0088_heatmap_cells_excludes_unvalidated_external_construction ...    Compiling polariton-tests v0.0.0 (/home/me/work/ket/target/tests/trybuild/polariton)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.41s
+
+
+test tests/ui/heatmap_cells_construct.rs [should pass] ... ok
+test tests/ui/heatmap_cells_private.rs [should fail to compile] ... ok
+
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.74s
+
+     Running tests/hexbin_observations_ui.rs (target/debug/deps/hexbin_observations_ui-d48cb4acab8894a8)
+
+running 1 test
+test product_0143_hexbin_observations_excludes_unvalidated_external_construction ...    Compiling polariton-tests v0.0.0 (/home/me/work/ket/target/tests/trybuild/polariton)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.41s
+
+
+test tests/ui/hexbin_observations_construct.rs [should pass] ... ok
+test tests/ui/hexbin_observations_private.rs [should fail to compile] ... ok
+
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.33s
+
+     Running tests/histogram_bins_ui.rs (target/debug/deps/histogram_bins_ui-b601f106b16c200b)
+
+running 1 test
+test product_0078_histogram_bins_excludes_unvalidated_mutation ...    Compiling polariton-tests v0.0.0 (/home/me/work/ket/target/tests/trybuild/polariton)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.41s
+
+
+test tests/ui/histogram_bins_construct.rs [should pass] ... ok
+test tests/ui/histogram_bins_private.rs [should fail to compile] ... ok
+
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.60s
+
+     Running tests/multivariate_rows_ui.rs (target/debug/deps/multivariate_rows_ui-bd094768ef74fd96)
+
+running 1 test
+test product_0104_multivariate_rows_exclude_unvalidated_external_construction ...    Compiling polariton-tests v0.0.0 (/home/me/work/ket/target/tests/trybuild/polariton)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.41s
+
+
+test tests/ui/multivariate_rows_construct.rs [should pass] ... ok
+test tests/ui/multivariate_rows_private.rs [should fail to compile] ... ok
+
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.41s
+
+     Running tests/pie_slices_ui.rs (target/debug/deps/pie_slices_ui-06de48ecb933c386)
+
+running 1 test
+test product_0102_pie_slices_exclude_unvalidated_external_construction ...    Compiling polariton-tests v0.0.0 (/home/me/work/ket/target/tests/trybuild/polariton)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.42s
+
+
+test tests/ui/pie_slices_construct.rs [should pass] ... ok
+test tests/ui/pie_slices_private.rs [should fail to compile] ... ok
+
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.80s
+
+     Running tests/product_0073_session_discovery.rs (target/debug/deps/product_0073_session_discovery-87f32e2b26a20198)
+
+running 1 test
+test product_0073_terminal_list_is_non_mutating_discriminating_and_head_neutral ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/product_0152_temporal_literal.rs (target/debug/deps/product_0152_temporal_literal-db6241cff3aa535a)
+
+running 1 test
+test product_0152_exhibit_intervals_keep_their_variants ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/product_0155_boa_probe.rs (target/debug/deps/product_0155_boa_probe-c9b05d62d781bd2f)
+
+running 1 test
+test product_0155_boa_runs_plain_ecmascript_without_default_features ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/radial_dial_readings_ui.rs (target/debug/deps/radial_dial_readings_ui-a2d35a286543ac9e)
+
+running 1 test
+test product_0099_radial_dial_readings_exclude_unvalidated_external_construction ...    Compiling polariton-tests v0.0.0 (/home/me/work/ket/target/tests/trybuild/polariton)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.41s
+
+
+test tests/ui/radial_dial_readings_construct.rs [should pass] ... ok
+test tests/ui/radial_dial_readings_private.rs [should fail to compile] ... ok
+
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.69s
+
+     Running tests/result_artifact_ui.rs (target/debug/deps/result_artifact_ui-380f69424c3f95fa)
+
+running 1 test
+test product_0084_arrow_backing_has_one_complete_ipc_authority ...    Compiling polariton-tests v0.0.0 (/home/me/work/ket/target/tests/trybuild/polariton)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.41s
+
+
+test tests/ui/result_artifact_construct.rs [should pass] ... ok
+test tests/ui/result_artifact_private.rs [should fail to compile] ... ok
+
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.42s

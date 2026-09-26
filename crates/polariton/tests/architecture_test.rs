@@ -221,6 +221,13 @@ fn product_0062_persistence_schema_has_no_placement_or_renderer_authority() {
 		// PRODUCT-0160 owns its wire protocol and window advertisement.
 		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/live/mod.rs"),
 		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/live/discovery.rs"),
+		// ADR 0173 binds those wire DTOs to MCP; these files own protocol
+		// envelopes/schema generation, not a new durable application model.
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/mod.rs"),
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/schema.rs"),
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/transport.rs"),
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/batch.rs"),
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/tests.rs"),
 		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/profile_store.rs"),
 		// PRODUCT-0154 §2: the published dashboard package owns its own DTOs.
 		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/publication.rs"),
@@ -229,9 +236,8 @@ fn product_0062_persistence_schema_has_no_placement_or_renderer_authority() {
 	expected.sort();
 	assert_eq!(
 		serialization_sites, expected,
-		"serde belongs only to Polariton's declared durable-schema owners: the \
-		 opaque session owner (PRODUCT-0062) and the encrypted profile store \
-		 (PRODUCT-0134)"
+		"serde belongs only to the declared durable-schema, publication, reporting, \
+		 and agent protocol boundaries listed above"
 	);
 }
 

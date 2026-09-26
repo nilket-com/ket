@@ -280,7 +280,7 @@ pub(crate) struct FigurePresentation {
 	pub(crate) settings: BTreeMap<String, PresentationSetting>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PresentationSetting {
 	pub(crate) section: String,

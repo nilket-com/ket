@@ -69,6 +69,39 @@ listing never reads a live writer's snapshot without the store lock. The
 `UPDATED_UTC` column describes the current committed generation, not whether an
 open window has uncheckpointed changes.
 
+#### MCP agent binding:
+
+Configure an MCP host to start the Polariton executable with the single
+argument `mcp`. The server uses stdio and MCP revision 2025-06-18. Open a live
+window separately:
+
+```bash
+polariton --agents uat/treasury_rates.rn
+```
+
+The host can then use `windows`, pin the returned `window` identity, and call
+`run_source`, `describe`, `resize` and `publish`. For example, `resize` takes
+`{"window":"<advertised id>","figure":{"view":"Yields by maturity"},"width":900,"height":600}`.
+Receipts report the actual resulting pane size. All existing live command
+verbs are discoverable tools, with generated input/output schemas. Window
+resources at `polariton://window/<id>` support reads and subscriptions.
+Input frames are limited to 8 MiB including the newline; an oversized frame
+closes the MCP session without dispatching that frame.
+
+The server and window must use the same user runtime directory. On Linux,
+forward the desktop's `XDG_RUNTIME_DIR` explicitly if the MCP host filters
+its child environment. Set the server working directory deliberately:
+`drive` resolves relative paths there. It takes `source`, `commands` (the
+existing wire command array), and an explicit `execution` of `by-command`
+or `on-open`, and runs the driver in its own child process.
+
+Tool results preserve the command surface's exact terminal event and receipt.
+An `unknown` outcome is not safe to replay automatically. Cancelling a live
+tool abandons its wait without undoing the window's command; cancelling
+`drive` terminates and reaps its driver, without rolling back source effects.
+Local Rune executes with the user's filesystem, process and network authority
+(ADR 0171). MCP adds no sandbox or authorization layer.
+
 #### Static presentation bindings:
 
 Repeated field names can be factored into top-level string bindings. The

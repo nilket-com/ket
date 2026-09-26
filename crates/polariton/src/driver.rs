@@ -66,7 +66,7 @@ impl Target {
 const RUN_DEADLINE: Duration = Duration::from_secs(600);
 
 /// The commands file: one script, applied in order in one application.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Commands {
 	pub(crate) commands: Vec<Command>,
@@ -78,7 +78,7 @@ pub(crate) struct Commands {
 /// stands in its pane when the command runs, so a script written before the
 /// application ran can still address its figures. Either way the receipt
 /// names the incarnation acted on.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum FigureRef {
 	Incarnation(String),
@@ -86,7 +86,7 @@ pub(crate) enum FigureRef {
 }
 
 /// PRODUCT-0158 §3 and §4: the verbs. Each is the GUI's own action.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Command {
 	Describe {},
@@ -147,14 +147,17 @@ pub(crate) enum Command {
 	RunSource {},
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CellRef {
+	/// Notebook buffer ID returned by describe_notebook.
 	pub buffer: String,
+	/// Exact document generation returned by describe_notebook.
 	pub generation: String,
+	/// Cell ordinal returned by describe_notebook.
 	pub cell: u32,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub(crate) struct NotebookCell {
 	pub cell: u32,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -162,13 +165,13 @@ pub(crate) struct NotebookCell {
 	pub language: String,
 	pub source: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub(crate) struct NotebookDescription {
 	pub buffer: String,
 	pub generation: String,
 	pub cells: Vec<NotebookCell>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub(crate) struct DataDescription {
 	pub table: String,
 	pub columns: Vec<(String, String)>,
@@ -176,7 +179,7 @@ pub(crate) struct DataDescription {
 
 /// ADR 0169 §2: when the batch driver executes the source. Chosen by the
 /// invocation, never inferred from the script, and stated in the receipt.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ExecutionMode {
 	/// PRODUCT-0158's documented behavior: run after opening, before the
@@ -188,7 +191,7 @@ pub(crate) enum ExecutionMode {
 
 /// ADR 0169 §3: the execution a `run_source` started, as the window
 /// identified it. A receipt reports this execution's outcome and no other's.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub(crate) struct ExecutionDescription {
 	/// The source buffer, as `describe_notebook` names buffers.
 	pub buffer: String,
@@ -204,7 +207,7 @@ pub(crate) struct ExecutionDescription {
 /// rows as the grid shows them, each cell null or text; `rows` is the whole
 /// relation's height. When a bound cut the preview, `truncated` is true and
 /// `truncation_reasons` names every bound that applied.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub(crate) struct ResultSummary {
 	pub columns: Vec<ResultColumn>,
 	pub rows: u64,
@@ -212,12 +215,12 @@ pub(crate) struct ResultSummary {
 	pub truncated: bool,
 	pub truncation_reasons: Vec<TruncationReason>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub(crate) struct ResultColumn {
 	pub name: String,
 	pub dtype: String,
 }
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TruncationReason {
 	/// More rows exist than the preview holds.
@@ -256,7 +259,7 @@ impl Command {
 /// PRODUCT-0158 §5: the receipt. Every command appears with its outcome; a
 /// refusal of the whole invocation names its reason and lists no commands as
 /// applied.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub(crate) struct Receipt {
 	pub(crate) schema_version: u32,
 	pub(crate) source: String,
@@ -269,7 +272,7 @@ pub(crate) struct Receipt {
 	pub(crate) refusal: Option<Refusal>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub(crate) struct CommandReceipt {
 	pub(crate) command: Command,
 	pub(crate) outcome: Outcome,
@@ -307,7 +310,7 @@ pub(crate) struct CommandReceipt {
 /// The adapter owner's view of the external connection: what is selected,
 /// whether it is connected, and the database connection generation that
 /// `disconnect` must name. `error` is the last connection failure, verbatim.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub(crate) struct ConnectionDescription {
 	pub adapter: String,
 	pub name: String,
@@ -317,7 +320,7 @@ pub(crate) struct ConnectionDescription {
 	pub error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Outcome {
 	Applied,
@@ -330,7 +333,7 @@ pub(crate) enum Outcome {
 }
 
 /// Why a command that ran did not finish as asked.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(crate) enum Failure {
 	Notebook {
@@ -362,7 +365,7 @@ pub(crate) enum Failure {
 }
 
 /// Structured, never prose alone.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(crate) enum Refusal {
 	Notebook {
@@ -420,7 +423,7 @@ pub(crate) enum Refusal {
 }
 
 /// `PublishError`, one variant per refusal, so a receipt can be matched on.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "reason")]
 pub(crate) enum PublishRefusal {
 	NoFigures,
@@ -471,7 +474,7 @@ impl From<&PublishError> for PublishRefusal {
 
 /// PRODUCT-0158 §2: one pane's figure as the inspector, the series table,
 /// and the renderer see it.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub(crate) struct FigureDescription {
 	/// The incarnation token commands address.
 	pub(crate) figure: String,
@@ -507,13 +510,13 @@ pub(crate) struct FigureDescription {
 	pub(crate) settings: BTreeMap<String, PresentationSetting>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub(crate) struct Size {
 	pub(crate) width: f32,
 	pub(crate) height: f32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "status")]
 pub(crate) enum SeriesReport {
 	/// The table the publisher would write, verbatim.
@@ -522,7 +525,7 @@ pub(crate) enum SeriesReport {
 	Absent { reason: String },
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub(crate) struct LiveState {
 	/// Hidden series by ordinal, in ordinal order.
 	pub(crate) hidden: Vec<u32>,
@@ -530,14 +533,14 @@ pub(crate) struct LiveState {
 	pub(crate) size: Size,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub(crate) struct PublishReceipt {
 	pub(crate) root: String,
 	pub(crate) digest: String,
 	pub(crate) figures: Vec<PublishedFigure>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub(crate) struct PublishedFigure {
 	pub(crate) id: String,
 	pub(crate) title: String,
