@@ -3651,7 +3651,7 @@ pub(in crate::exec) enum WrappedCapCheckBatches {
 }
 
 /// ADR 606: the one token. Both of the wrapped arm's call sites read it.
-const WRAPPED_CAP_CHECK_BATCHES: WrappedCapCheckBatches = WrappedCapCheckBatches::Discard;
+const WRAPPED_CAP_CHECK_BATCHES: WrappedCapCheckBatches = WrappedCapCheckBatches::Reuse;
 
 /// ADR 606: how control would execute a stage's build once the cap check has decided, which
 /// decides whether the check's batches can stand in for it.
