@@ -4447,6 +4447,8 @@ fn evaluate_adr594_pairs_tagged(
 			"inner_1_lookups_counted",
 			"inner_1_lookup_hits",
 			"inner_1_lookup_misses",
+			"inner_1_lookup_form",
+			"inner_1_lookup_inline_hits",
 		] {
 			band[fact] = receipt.get(fact).cloned().unwrap_or_default();
 		}
@@ -15781,6 +15783,8 @@ mod tests {
 		inner_1_facts["lookups_counted"] = serde_json::json!(true);
 		inner_1_facts["lookup_hits"] = serde_json::json!(400);
 		inner_1_facts["lookup_misses"] = serde_json::json!(12);
+		inner_1_facts["lookup_form"] = serde_json::json!("inline");
+		inner_1_facts["lookup_inline_hits"] = serde_json::json!(390);
 		let summary = evaluate_adr596_pairs(&adr596_rows_on(
 			children,
 			adr596_write_facts(),
@@ -15794,11 +15798,16 @@ mod tests {
 		assert_eq!(sixth["inner_1_lookups_counted"], true);
 		assert_eq!(sixth["inner_1_lookup_hits"], 400);
 		assert_eq!(sixth["inner_1_lookup_misses"], 12);
+		// ADR 602: the lookup form and the inline hits ride the same band.
+		assert_eq!(sixth["inner_1_lookup_form"], "inline");
+		assert_eq!(sixth["inner_1_lookup_inline_hits"], 390);
 
 		let summary = evaluate_adr596_pairs(&adr596_rows(children, adr596_write_facts())).unwrap();
 		let sixth = &summary["adr594_pair_bands"][0];
 		assert_eq!(sixth["inner_1_lookups_counted"], serde_json::Value::Null);
 		assert_eq!(sixth["inner_1_lookup_hits"], serde_json::Value::Null);
+		assert_eq!(sixth["inner_1_lookup_form"], serde_json::Value::Null);
+		assert_eq!(sixth["inner_1_lookup_inline_hits"], serde_json::Value::Null);
 	}
 
 	/// ADR 601: a receipt of the `index_build` facts vintage carries the reserve and finalization terms

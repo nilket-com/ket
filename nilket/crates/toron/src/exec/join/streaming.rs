@@ -4658,6 +4658,8 @@ impl ReorientedInnerJoinRuntime<'_> {
 			"counted": counts.is_some(),
 			"hits": counts.map(|(hits, _)| hits),
 			"misses": counts.map(|(_, misses)| misses),
+			"form": build.lookup_form().name(),
+			"inline_hits": build.lookup_inline_hits(),
 		}))
 	}
 }
@@ -24163,6 +24165,15 @@ impl Executor {
 			} else {
 				spilled.use_compact_resident_index();
 			}
+			// ADR 602: the lookup form. Under `Inline` a hit with one ref returns it without an
+			// allocation; `Collected` gathers every hit's refs into a `Vec`. `Inline` was measured
+			// against this form and not established (every pair positive, median 55.3 ms under a
+			// bar of 75.4 ms), so `Collected` stays.
+			let lookup_form = SpilledLookupForm::Collected;
+			if let Err(error) = spilled.use_lookup_form(lookup_form) {
+				spilled.cleanup().await;
+				return Err(error);
+			}
 
 			// ADR0551-SITE: streaming/prepare_reoriented_inner_join_runtime_with_scan_build/Build/1
 
@@ -37407,7 +37418,8 @@ mod tests {
 		assert_eq!(replays.len(), 2);
 		assert_eq!(
 			replays[1],
-			serde_json::json!({"replay_id": 2, "counted": false, "hits": null, "misses": null})
+			serde_json::json!({"replay_id": 2, "counted": false, "hits": null, "misses": null,
+				"form": "collected", "inline_hits": null})
 		);
 		let published = node_attribution::tests::adr600_lookup_fields_after_publications(vec![(
 			"inner_replay_lookups",

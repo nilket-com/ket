@@ -1,6 +1,17 @@
 # ADR 602 - q21's replay-1 probe: a hit's refs without an allocation
 
-**Status:** PROPOSED. Successor to ADR 601, which retained the
+**Status:** CLOSED, NOT ESTABLISHED. One paired attempt on strix under
+the declared gate procedure (results in
+`plans/impl/0602_q21_replay1_probe_hit_refs_without_allocation_results.md`):
+the gate admitted after the 5 s wait (37 °C, load 0.27), separation and
+window verified, digest parity on all twelve rows. Every pair was
+positive, with a median gain of 55.3 ms (0.70%), but that is under a
+bar of 75.4 ms (2 × the 37.7 ms control range). Under ADR 588's rule
+the verdict is `not_established`, and the token reverts to `Collected`;
+the implementation stays. The mechanism check on the treatment read
+`lookup_form = inline` with all 14,656,608 of replay 1's hits returned
+inline: the allocation was removed on every hit, and the observed
+median paired difference did not clear the bar. Successor to ADR 601, which retained the
 finish-built compact index on the spilled branch (median paired gain
 148.2 ms, 1.84% of q21) and, on its mechanism check, read replay 1's
 lookups for the first time: 30,343,541 lookups, 14,656,608 hits,
