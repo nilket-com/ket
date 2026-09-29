@@ -14,6 +14,7 @@
 
 mod adr444_profile_eval;
 pub mod affinity;
+pub mod duckdb_memory;
 pub mod evidence;
 pub mod host_readings;
 pub mod perf_board;

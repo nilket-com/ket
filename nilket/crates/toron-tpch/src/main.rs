@@ -132,6 +132,9 @@ async fn run() -> ExitCode {
 		"adr598-gate-probe" => adr598_gate_probe_command(&args),
 		"adr598-disposition" => adr598_disposition_command(&args),
 		"adr597-q21-exchange-skip" => adr597_q21_exchange_skip_command(&args),
+		// ADR 603: profiled DuckDB children, one per cell, after a timed artifact is complete.
+		"duckdb-profile-sweep" => duckdb_profile_sweep_command(&args),
+		"memory-panels-summary" => memory_panels_summary_command(&args),
 		"adr597-reevaluate" => adr597_reevaluate_command(&args),
 		"adr596-q21-build-write" => adr596_q21_build_write_command(&args),
 		"adr596-reevaluate" => adr596_reevaluate_command(&args),
@@ -8920,6 +8923,10 @@ async fn perf_command(args: &[String]) -> ExitCode {
 		Ok(queries) => queries,
 		Err(message) => return harness_error(&message),
 	};
+	// ADR 603: a named DuckDB memory limit that cannot be honoured is refused before any query.
+	if let Err(message) = toron_tpch::duckdb_memory::memory_limit_coordinate() {
+		return harness_error(&message);
+	}
 	let board_context =
 		match PerfBoardRunContext::prepare(&output_dir, mode, sf, data_source, &data_dir, &engines)
 		{
@@ -9497,6 +9504,9 @@ impl PerfBoardRunContext {
 				row["duckdb_threads"] = serde_json::json!(duckdb_thread_setting());
 				row["duckdb_threads_provenance"] =
 					serde_json::json!(reference_thread_pin_provenance(&duckdb_thread_setting()));
+				let (limit, provenance) = duckdb_memory_limit_fields();
+				row["duckdb_memory_limit"] = limit;
+				row["duckdb_memory_limit_provenance"] = provenance;
 				row["duckdb_executable_sha256"] = serde_json::json!(self.duckdb_executable_sha256);
 			}
 		}
@@ -9549,6 +9559,8 @@ impl PerfBoardRunContext {
 			"partition_work_concurrency_requested_provenance": self.partition_work_concurrency_requested.1,
 			"duckdb_threads": duckdb_thread_setting(),
 			"duckdb_threads_provenance": reference_thread_pin_provenance(&duckdb_thread_setting()),
+			"duckdb_memory_limit": duckdb_memory_limit_fields().0,
+			"duckdb_memory_limit_provenance": duckdb_memory_limit_fields().1,
 			"duckdb_version": self.duckdb_version,
 			"duckdb_executable_sha256": self.duckdb_executable_sha256,
 			"cpu_affinity_requested": affinity.requested,
@@ -11177,6 +11189,19 @@ fn duckdb_thread_setting() -> Option<String> {
 	reference_thread_setting(std::env::var("TORON_TPCH_DUCKDB_THREADS"))
 }
 
+/// ADR 603: the DuckDB memory-limit coordinate as the header and DuckDB rows record it: the
+/// normalized request (null when none) and its provenance. A malformed request was refused at
+/// start, so an unreadable coordinate here records nothing rather than a default.
+fn duckdb_memory_limit_fields() -> (serde_json::Value, serde_json::Value) {
+	match toron_tpch::duckdb_memory::memory_limit_coordinate() {
+		Ok(coordinate) => (
+			serde_json::json!(coordinate.requested.map(|limit| limit.normalized)),
+			serde_json::json!(coordinate.provenance),
+		),
+		Err(_) => (serde_json::Value::Null, serde_json::Value::Null),
+	}
+}
+
 fn polars_max_threads_setting() -> Option<String> {
 	reference_thread_setting(std::env::var("POLARS_MAX_THREADS"))
 }
@@ -11223,6 +11248,12 @@ fn duckdb_setup_sql(export: &toron_tpch::TpchParquetExport) -> String {
 	let threads = duckdb_thread_setting()
 		.map(|threads| format!("SET threads={threads};\n"))
 		.unwrap_or_default();
+	// ADR 603: an explicit memory limit follows the thread pin; absent, DuckDB keeps its default.
+	let memory_limit = toron_tpch::duckdb_memory::memory_limit_coordinate()
+		.ok()
+		.and_then(|coordinate| coordinate.requested)
+		.map(|limit| format!("SET memory_limit='{}';\n", limit.normalized))
+		.unwrap_or_default();
 	let views = export
 		.tables
 		.iter()
@@ -11235,7 +11266,7 @@ fn duckdb_setup_sql(export: &toron_tpch::TpchParquetExport) -> String {
 		})
 		.collect::<Vec<_>>()
 		.join("\n");
-	format!("{threads}{views}")
+	format!("{threads}{memory_limit}{views}")
 }
 
 fn duckdb_query_statement(sql: &str) -> String {
@@ -12008,16 +12039,133 @@ fn run_duckdb_perf_child(
 	run_index: u32,
 	warmup: bool,
 ) -> Result<serde_json::Value, String> {
+	// ADR 603: under an explicit memory limit each child gets its own fresh temp directory, so no
+	// cell can see another's files; the read-back runs before the timer, outside the timed query.
+	let memory = toron_tpch::duckdb_memory::memory_limit_coordinate()?;
+	let temp_directory = match &memory.requested {
+		Some(_) => Some(fresh_duckdb_temp_directory()?),
+		None => None,
+	};
 	let script = format!(
-		".mode json\n{}\n.timer on\n{}\n",
+		".mode json\n{}{}\n{DUCKDB_MEMORY_LIMIT_READ_BACK}\n.timer on\n{}\n",
 		duckdb_setup_sql(export),
+		temp_directory
+			.as_deref()
+			.map(duckdb_temp_directory_sql)
+			.unwrap_or_default(),
 		duckdb_query_statement(&export.sql)
 	);
-	let output = run_duckdb_script(duckdb_bin, &script)?;
-	if !output.status_success {
+	let output = run_duckdb_script(duckdb_bin, &script);
+	if let Some(directory) = &temp_directory {
+		let _ = std::fs::remove_dir_all(directory);
+	}
+	let output = output?;
+	let arrays = extract_json_arrays(&output.stdout);
+	let read_back = duckdb_memory_limit_read_back(&arrays);
+	// A successful child always read the setting back, under the default limit too: the anchor
+	// reports the default DuckDB actually applied.
+	let read_back_mismatch = match (&memory.requested, &read_back) {
+		(Some(requested), Some(observed)) => {
+			!toron_tpch::duckdb_memory::read_back_agrees(requested, observed)
+		}
+		(_, None) => output.status_success,
+		(None, Some(_)) => false,
+	};
+	let annotate = |mut row: serde_json::Value| {
+		row["duckdb_memory_limit_observed"] = serde_json::json!(read_back);
+		row["duckdb_memory_limit_observed_bytes_display_derived"] = serde_json::json!(
+			read_back
+				.as_deref()
+				.and_then(toron_tpch::duckdb_memory::parse_display)
+		);
+		row["duckdb_temp_directory_isolated"] = serde_json::json!(temp_directory.is_some());
+		row["parent_peak_rss_kib_at_spawn"] =
+			serde_json::json!(output.parent_peak_rss_kib_at_spawn);
+		row["peak_rss_label"] = serde_json::json!(toron_tpch::perf_board::peak_rss_label(
+			output.peak_rss_kib,
+			output.parent_peak_rss_kib_at_spawn
+		));
+		row
+	};
+	let failure = if !output.status_success {
+		Some(("duckdb_query_failed", format!("stderr={:?}", output.stderr)))
+	} else if read_back_mismatch {
+		Some((
+			"duckdb_memory_limit_read_back_mismatch",
+			format!(
+				"requested={:?} expected_display={:?} observed={read_back:?}",
+				memory.requested.as_ref().map(|limit| &limit.normalized),
+				memory
+					.requested
+					.as_ref()
+					.map(|limit| toron_tpch::duckdb_memory::duckdb_display(limit.bytes)),
+			),
+		))
+	} else {
+		None
+	};
+	if let Some((reason, message)) = failure {
 		let mut timings = PerfPhaseTimings::default();
 		timings.total_ms = output.parent_wall_ms;
-		return Ok(PerfAttempt {
+		return Ok(annotate(
+			PerfAttempt {
+				engine: "duckdb".to_string(),
+				query: export.query_id.clone(),
+				scale_factor: export.scale_factor,
+				mode: export.mode.clone(),
+				run_index,
+				warmup,
+				phase: Phase::Execute,
+				status: Status::Fail,
+				reason: Some(reason.to_string()),
+				diagnostic_message: Some(message),
+				timings,
+				parent_wall_ms: Some(output.parent_wall_ms),
+				peak_rss_kib: output.peak_rss_kib,
+				spill_bytes: 0,
+				plan_fingerprint: Some(plan_fingerprint.to_string()),
+				digest: None,
+				output_row_count: None,
+				output_schema_fingerprint: Some(output_schema_fingerprint.to_string()),
+				engine_version: Some(duckdb_version.to_string()),
+				duckdb_version: Some(duckdb_version.to_string()),
+				debug_build: false,
+				local_join_admissions: None,
+				targeted_local_join_admissions: None,
+				join_input_replay_ledger: None,
+				join_input_total_concats: None,
+				join_spill_observations: None,
+				partition_work_concurrency_observations: None,
+				dataset_verification: export.dataset_verification,
+				dataset_manifest_fingerprint: export
+					.dataset_verification
+					.map(|_| export.manifest_fingerprint.clone()),
+			}
+			.json_value(),
+		));
+	}
+	let combined = format!("{}\n{}", output.stdout, output.stderr);
+	let execute_ms = parse_duckdb_timer_ms(&combined)
+		.ok_or_else(|| format!("DuckDB timer output missing from {:?}", combined))?;
+	let result = duckdb_query_result(&arrays)
+		.ok_or_else(|| "DuckDB query emitted no JSON result".to_string())?;
+	let row_count = result
+		.as_array()
+		.map(|rows| rows.len() as u64)
+		.ok_or_else(|| "DuckDB query JSON result was not an array".to_string())?;
+	// ADR 603: the captured result's digest, taken after the child has exited, so the timed
+	// interval is untouched; the diagnostic sweep's result is checked against it.
+	let result_sha256 = duckdb_result_sha256(result)?;
+	let mut timings = PerfPhaseTimings::default();
+	timings.execute_ms = execute_ms;
+	timings.total_ms = execute_ms;
+	let annotate = |row: serde_json::Value| {
+		let mut row = annotate(row);
+		row["duckdb_result_sha256"] = serde_json::json!(result_sha256);
+		row
+	};
+	Ok(annotate(
+		PerfAttempt {
 			engine: "duckdb".to_string(),
 			query: export.query_id.clone(),
 			scale_factor: export.scale_factor,
@@ -12025,16 +12173,16 @@ fn run_duckdb_perf_child(
 			run_index,
 			warmup,
 			phase: Phase::Execute,
-			status: Status::Fail,
-			reason: Some("duckdb_query_failed".to_string()),
-			diagnostic_message: Some(format!("stderr={:?}", output.stderr)),
+			status: Status::Pass,
+			reason: None,
+			diagnostic_message: None,
 			timings,
 			parent_wall_ms: Some(output.parent_wall_ms),
 			peak_rss_kib: output.peak_rss_kib,
 			spill_bytes: 0,
 			plan_fingerprint: Some(plan_fingerprint.to_string()),
 			digest: None,
-			output_row_count: None,
+			output_row_count: Some(row_count),
 			output_schema_fingerprint: Some(output_schema_fingerprint.to_string()),
 			engine_version: Some(duckdb_version.to_string()),
 			duckdb_version: Some(duckdb_version.to_string()),
@@ -12050,56 +12198,267 @@ fn run_duckdb_perf_child(
 				.dataset_verification
 				.map(|_| export.manifest_fingerprint.clone()),
 		}
-		.json_value());
+		.json_value(),
+	))
+}
+
+/// ADR 603: the DuckDB diagnostic sweep. One profiled DuckDB child per cell, run only after a
+/// timed artifact is complete: same staged executable, query, data, thread pin, and memory
+/// setting, a fresh temp directory and profile file per child. Its readings are diagnostic
+/// observations under the sweep's own run identity, never facts about the timed runs.
+fn duckdb_profile_sweep_command(args: &[String]) -> ExitCode {
+	match duckdb_profile_sweep(args) {
+		Ok(()) => ExitCode::SUCCESS,
+		Err(message) => harness_error(&message),
 	}
-	let combined = format!("{}\n{}", output.stdout, output.stderr);
-	let execute_ms = parse_duckdb_timer_ms(&combined)
-		.ok_or_else(|| format!("DuckDB timer output missing from {:?}", combined))?;
-	let arrays = extract_json_arrays(&output.stdout);
-	let result = arrays
-		.last()
-		.ok_or_else(|| "DuckDB query emitted no JSON result".to_string())?;
-	let row_count = result
+}
+
+fn duckdb_profile_sweep(args: &[String]) -> Result<(), String> {
+	let query = flag_value(args, "--query").unwrap_or("all");
+	let mode = flag_value(args, "--mode").unwrap_or("strict");
+	let data_source = flag_value(args, "--data-source").unwrap_or("parquet");
+	if !matches!(data_source, "parquet" | "persisted") {
+		return Err(format!(
+			"duckdb-profile-sweep --data-source {data_source:?}: persisted parquet only"
+		));
+	}
+	let data_dir = data_dir_from_args(args);
+	let sf = explicit_sf(args)?.ok_or_else(|| "duckdb-profile-sweep requires --sf".to_string())?;
+	let output_dir = PathBuf::from(
+		flag_value(args, "--output-dir")
+			.ok_or_else(|| "duckdb-profile-sweep requires --output-dir".to_string())?,
+	);
+	if output_dir.exists() {
+		return Err(format!(
+			"duckdb-profile-sweep output directory {} must be fresh",
+			output_dir.display()
+		));
+	}
+	let memory = toron_tpch::duckdb_memory::memory_limit_coordinate()?;
+	let queries = perf_query_list(query)?;
+	let duckdb_bin = duckdb_binary();
+	let duckdb_version = duckdb_cli_version(&duckdb_bin)?
+		.ok_or_else(|| format!("DuckDB executable {duckdb_bin:?} is absent"))?;
+	let duckdb_sha256 = toron_tpch::evidence::sha256_file(Path::new(&duckdb_bin))?;
+	let profiles = output_dir.join("profiles");
+	std::fs::create_dir_all(&profiles)
+		.map_err(|error| format!("create {}: {error}", profiles.display()))?;
+	let sweep_run_id = format!(
+		"duckdb-profile-sweep-{}-{}",
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|elapsed| elapsed.as_millis())
+			.unwrap_or(0),
+		std::process::id()
+	);
+	let (memory_limit, memory_limit_provenance) = duckdb_memory_limit_fields();
+	let mut lines = vec![serde_json::json!({
+		"kind": "duckdb_profile_sweep_header",
+		"sweep_run_id": sweep_run_id,
+		"label": "diagnostic observations of each cell's query at this setting; not timed-run facts",
+		"scale_factor": sf,
+		"mode": mode,
+		"data_source": data_source,
+		"queries": queries,
+		"duckdb_version": duckdb_version,
+		"duckdb_executable_sha256": duckdb_sha256,
+		"duckdb_threads": duckdb_thread_setting(),
+		"duckdb_threads_provenance": reference_thread_pin_provenance(&duckdb_thread_setting()),
+		"duckdb_memory_limit": memory_limit,
+		"duckdb_memory_limit_provenance": memory_limit_provenance,
+		"cpu_affinity_requested": toron_tpch::affinity::affinity_coordinate().requested,
+		"cpu_affinity_observed": toron_tpch::affinity::observed_cpulist(),
+		"profile_settings": toron_tpch::duckdb_memory::PROFILE_SETTINGS,
+	})];
+	for query_id in &queries {
+		let export = export_persisted_perf_query_parquet(query_id, mode, sf, &data_dir)?;
+		let temp_directory = fresh_duckdb_temp_directory()?;
+		let profile_path = profiles.join(format!("{query_id}.json"));
+		let script = format!(
+			".mode json\n{}{}{DUCKDB_MEMORY_LIMIT_READ_BACK}\nSET custom_profiling_settings={};\n\
+			 SET enable_profiling='json';\nSET profiling_output={};\n{}\n",
+			duckdb_setup_sql(&export),
+			duckdb_temp_directory_sql(&temp_directory),
+			sql_string_literal(toron_tpch::duckdb_memory::PROFILE_SETTINGS),
+			sql_string_literal(&profile_path.display().to_string()),
+			duckdb_query_statement(&export.sql)
+		);
+		let output = run_duckdb_script(&duckdb_bin, &script);
+		let _ = std::fs::remove_dir_all(&temp_directory);
+		let output = output?;
+		if !output.status_success {
+			return Err(format!(
+				"duckdb-profile-sweep {query_id}: DuckDB failed: {:?}",
+				output.stderr
+			));
+		}
+		let arrays = extract_json_arrays(&output.stdout);
+		let read_back = duckdb_memory_limit_read_back(&arrays);
+		if let Some(requested) = &memory.requested
+			&& !read_back.as_deref().is_some_and(|observed| {
+				toron_tpch::duckdb_memory::read_back_agrees(requested, observed)
+			}) {
+			return Err(format!(
+				"duckdb-profile-sweep {query_id}: memory_limit read-back {read_back:?} is not {:?}",
+				toron_tpch::duckdb_memory::duckdb_display(requested.bytes)
+			));
+		}
+		let result = duckdb_query_result(&arrays)
+			.ok_or_else(|| format!("duckdb-profile-sweep {query_id}: no JSON result"))?;
+		let row_count = result
+			.as_array()
+			.map(|rows| rows.len() as u64)
+			.ok_or_else(|| format!("duckdb-profile-sweep {query_id}: result is not an array"))?;
+		let result_sha256 = duckdb_result_sha256(result)
+			.map_err(|error| format!("duckdb-profile-sweep {query_id}: {error}"))?;
+		let profile_text = std::fs::read_to_string(&profile_path)
+			.map_err(|error| format!("read {}: {error}", profile_path.display()))?;
+		let profile: serde_json::Value = serde_json::from_str(&profile_text)
+			.map_err(|error| format!("parse {}: {error}", profile_path.display()))?;
+		let readings = toron_tpch::duckdb_memory::parse_profile(&profile)
+			.map_err(|error| format!("duckdb-profile-sweep {query_id}: {error}"))?;
+		lines.push(serde_json::json!({
+			"kind": "duckdb_profile_sweep_cell",
+			"sweep_run_id": sweep_run_id,
+			"query": query_id,
+			"duckdb_memory_limit_observed": read_back,
+			"duckdb_temp_directory_isolated": true,
+			"peak_temp_dir_bytes": readings.peak_temp_dir_bytes,
+			"peak_buffer_bytes": readings.peak_buffer_bytes,
+			"profile_latency_seconds": readings.latency_seconds,
+			"output_row_count": row_count,
+			"duckdb_result_sha256": result_sha256,
+			"profile_sha256": toron_tpch::evidence::sha256_bytes(profile_text.as_bytes()),
+			"dataset_manifest_fingerprint": export
+				.dataset_verification
+				.map(|_| export.manifest_fingerprint.clone()),
+		}));
+	}
+	let artifact = output_dir.join("duckdb_profile_sweep.jsonl");
+	let text = lines
+		.iter()
+		.map(|line| line.to_string() + "\n")
+		.collect::<String>();
+	std::fs::write(&artifact, text)
+		.map_err(|error| format!("write {}: {error}", artifact.display()))?;
+	println!("{}", artifact.display());
+	Ok(())
+}
+
+/// ADR 603: the anchor and both memory panels compared, from their `samples.jsonl` files.
+fn memory_panels_summary_command(args: &[String]) -> ExitCode {
+	let read = |flag: &str| -> Result<Vec<serde_json::Value>, String> {
+		let path = flag_value(args, flag)
+			.ok_or_else(|| format!("memory-panels-summary requires {flag} <jsonl>"))?;
+		std::fs::read_to_string(path)
+			.map_err(|error| format!("read {path}: {error}"))?
+			.lines()
+			.filter(|line| !line.trim().is_empty())
+			.map(|line| {
+				serde_json::from_str(line).map_err(|error| format!("parse {path}: {error}"))
+			})
+			.collect()
+	};
+	let inputs = [
+		"--anchor",
+		"--panel-a",
+		"--panel-b",
+		"--sweep-anchor",
+		"--sweep-panel-a",
+	]
+	.map(read);
+	match inputs {
+		[
+			Ok(anchor),
+			Ok(panel_a),
+			Ok(panel_b),
+			Ok(sweep_anchor),
+			Ok(sweep_panel_a),
+		] => {
+			println!(
+				"{}",
+				toron_tpch::perf_board::memory_panels_summary(
+					&anchor,
+					&panel_a,
+					&panel_b,
+					&sweep_anchor,
+					&sweep_panel_a
+				)
+			);
+			ExitCode::SUCCESS
+		}
+		inputs => harness_error(
+			&inputs
+				.into_iter()
+				.filter_map(Result::err)
+				.collect::<Vec<_>>()
+				.join("; "),
+		),
+	}
+}
+
+/// ADR 603: one digest path for a DuckDB result, shared by timed children and the sweep: the
+/// parsed JSON result re-serialized with `serde_json::to_vec`, then SHA-256.
+fn duckdb_result_sha256(result: &serde_json::Value) -> Result<String, String> {
+	serde_json::to_vec(result)
+		.map(|bytes| toron_tpch::evidence::sha256_bytes(&bytes))
+		.map_err(|error| format!("serialize DuckDB result: {error}"))
+}
+
+/// ADR 603: the read-back statement; its one-row JSON array precedes the query's result.
+const DUCKDB_MEMORY_LIMIT_READ_BACK: &str =
+	"SELECT current_setting('memory_limit') AS duckdb_memory_limit_observed;";
+
+/// The read-back's value: the first JSON array whose first row names the read-back column.
+fn duckdb_memory_limit_read_back(arrays: &[serde_json::Value]) -> Option<String> {
+	arrays.iter().find_map(|array| {
+		array
+			.as_array()?
+			.first()?
+			.get("duckdb_memory_limit_observed")?
+			.as_str()
+			.map(str::to_string)
+	})
+}
+
+/// The query's result: the last JSON array, provided it is not the read-back's.
+fn duckdb_query_result(arrays: &[serde_json::Value]) -> Option<&serde_json::Value> {
+	let last = arrays.last()?;
+	let is_read_back = last
 		.as_array()
-		.map(|rows| rows.len() as u64)
-		.ok_or_else(|| "DuckDB query JSON result was not an array".to_string())?;
-	let mut timings = PerfPhaseTimings::default();
-	timings.execute_ms = execute_ms;
-	timings.total_ms = execute_ms;
-	Ok(PerfAttempt {
-		engine: "duckdb".to_string(),
-		query: export.query_id.clone(),
-		scale_factor: export.scale_factor,
-		mode: export.mode.clone(),
-		run_index,
-		warmup,
-		phase: Phase::Execute,
-		status: Status::Pass,
-		reason: None,
-		diagnostic_message: None,
-		timings,
-		parent_wall_ms: Some(output.parent_wall_ms),
-		peak_rss_kib: output.peak_rss_kib,
-		spill_bytes: 0,
-		plan_fingerprint: Some(plan_fingerprint.to_string()),
-		digest: None,
-		output_row_count: Some(row_count),
-		output_schema_fingerprint: Some(output_schema_fingerprint.to_string()),
-		engine_version: Some(duckdb_version.to_string()),
-		duckdb_version: Some(duckdb_version.to_string()),
-		debug_build: false,
-		local_join_admissions: None,
-		targeted_local_join_admissions: None,
-		join_input_replay_ledger: None,
-		join_input_total_concats: None,
-		join_spill_observations: None,
-		partition_work_concurrency_observations: None,
-		dataset_verification: export.dataset_verification,
-		dataset_manifest_fingerprint: export
-			.dataset_verification
-			.map(|_| export.manifest_fingerprint.clone()),
+		.and_then(|rows| rows.first())
+		.is_some_and(|row| row.get("duckdb_memory_limit_observed").is_some());
+	(!is_read_back).then_some(last)
+}
+
+/// ADR 603: a fresh, empty directory for one DuckDB child's temporary files.
+fn fresh_duckdb_temp_directory() -> Result<PathBuf, String> {
+	static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+	let directory = std::env::temp_dir().join(format!(
+		"toron-duckdb-{}-{}",
+		std::process::id(),
+		NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+	));
+	if directory.exists() {
+		return Err(format!(
+			"DuckDB temp directory {} already exists",
+			directory.display()
+		));
 	}
-	.json_value())
+	std::fs::create_dir_all(&directory).map_err(|error| {
+		format!(
+			"create DuckDB temp directory {}: {error}",
+			directory.display()
+		)
+	})?;
+	Ok(directory)
+}
+
+fn duckdb_temp_directory_sql(directory: &Path) -> String {
+	format!(
+		"SET temp_directory={};\n",
+		sql_string_literal(&directory.display().to_string())
+	)
 }
 
 #[derive(Debug)]
@@ -12108,11 +12467,14 @@ struct DuckDbCommandOutput {
 	stderr: String,
 	parent_wall_ms: f64,
 	peak_rss_kib: Option<u64>,
+	/// ADR 603: the harness's own `ru_maxrss` read just before the child was spawned.
+	parent_peak_rss_kib_at_spawn: Option<u64>,
 	status_success: bool,
 }
 
 #[cfg(unix)]
 fn run_duckdb_script(duckdb_bin: &str, script: &str) -> Result<DuckDbCommandOutput, String> {
+	let parent_peak_rss_kib_at_spawn = toron_tpch::perf_board::self_peak_rss_kib();
 	let start = Instant::now();
 	let mut child = Command::new(duckdb_bin)
 		.arg(":memory:")
@@ -12164,6 +12526,7 @@ fn run_duckdb_script(duckdb_bin: &str, script: &str) -> Result<DuckDbCommandOutp
 		stderr,
 		parent_wall_ms: start.elapsed().as_secs_f64() * 1000.0,
 		peak_rss_kib: Some(usage.ru_maxrss.max(0) as u64),
+		parent_peak_rss_kib_at_spawn,
 		status_success: libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
 	})
 }
@@ -12192,6 +12555,7 @@ fn run_duckdb_script(duckdb_bin: &str, script: &str) -> Result<DuckDbCommandOutp
 		stderr: String::from_utf8_lossy(&output.stderr).to_string(),
 		parent_wall_ms: start.elapsed().as_secs_f64() * 1000.0,
 		peak_rss_kib: None,
+		parent_peak_rss_kib_at_spawn: None,
 		status_success: output.status.success(),
 	})
 }
@@ -12424,6 +12788,7 @@ fn run_perf_child_with_executable(
 	envs: &[(&str, &str)],
 	wrapper: Option<&[String]>,
 ) -> Result<serde_json::Value, String> {
+	let parent_peak_rss_kib = toron_tpch::perf_board::self_peak_rss_kib();
 	let start = Instant::now();
 	let mut command = match wrapper {
 		Some(wrapper) if !wrapper.is_empty() => {
@@ -12499,9 +12864,19 @@ fn run_perf_child_with_executable(
 		"parent_wall_ms".to_string(),
 		serde_json::json!(parent_wall_ms),
 	);
+	let peak_rss_kib = usage.ru_maxrss.max(0) as u64;
+	object.insert("peak_rss_kib".to_string(), serde_json::json!(peak_rss_kib));
+	// ADR 603: the harness's own high-water at spawn, and the child's reading labelled against it.
 	object.insert(
-		"peak_rss_kib".to_string(),
-		serde_json::json!(usage.ru_maxrss.max(0) as u64),
+		"parent_peak_rss_kib_at_spawn".to_string(),
+		serde_json::json!(parent_peak_rss_kib),
+	);
+	object.insert(
+		"peak_rss_label".to_string(),
+		serde_json::json!(toron_tpch::perf_board::peak_rss_label(
+			Some(peak_rss_kib),
+			parent_peak_rss_kib
+		)),
 	);
 	Ok(row)
 }

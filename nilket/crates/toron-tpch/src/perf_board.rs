@@ -91,6 +91,17 @@ pub fn evaluate_perf_board(
 		"explicit",
 		&mut reasons,
 	);
+	// ADR 603: the anchor runs DuckDB under its own default memory limit; a capped artifact is a
+	// labelled panel, never the anchor.
+	require_header_string(
+		header,
+		"duckdb_memory_limit_provenance",
+		"default",
+		&mut reasons,
+	);
+	if header.get("duckdb_memory_limit") != Some(&serde_json::Value::Null) {
+		reasons.push("coordinate_mismatch:duckdb_memory_limit:expected_null".to_string());
+	}
 	// ADR 591: an explicit affinity, honoured by the header's own thread; rows are bound to it
 	// below, so a row cannot vouch for itself with a matching pair of foreign values.
 	require_header_string(
@@ -367,6 +378,15 @@ pub fn evaluate_perf_board(
 			if row.get("duckdb_version") != header.get("duckdb_version") {
 				reasons.push(format!("duckdb_version_mismatch:{}", expected.0));
 			}
+			// ADR 603: a DuckDB row is bound to the header's memory coordinate.
+			for field in ["duckdb_memory_limit", "duckdb_memory_limit_provenance"] {
+				if header.get(field).is_none() || row.get(field) != header.get(field) {
+					reasons.push(format!(
+						"row_coordinate_mismatch:{}:duckdb:{field}",
+						expected.0
+					));
+				}
+			}
 		} else if let Some(observations) = row
 			.get("partition_work_concurrency_observations")
 			.and_then(serde_json::Value::as_array)
@@ -514,6 +534,8 @@ pub fn compare_perf_board_headers(
 		"duckdb_version",
 		"cpu_affinity_requested",
 		"cpu_affinity_requested_provenance",
+		"duckdb_memory_limit",
+		"duckdb_memory_limit_provenance",
 	] {
 		if baseline.get(field) != candidate.get(field) {
 			reasons.push(format!("board_coordinate_mismatch:{field}"));
@@ -530,6 +552,12 @@ pub fn compare_perf_board_headers(
 			reasons.push(format!(
 				"board_coordinate_absent:cpu_affinity_requested:{side}"
 			));
+		}
+		// ADR 603: a board from before the DuckDB memory coordinate carries neither field.
+		for field in ["duckdb_memory_limit", "duckdb_memory_limit_provenance"] {
+			if header.get(field).is_none() {
+				reasons.push(format!("board_coordinate_absent:{field}:{side}"));
+			}
 		}
 	}
 	if baseline.get("duckdb_executable_sha256") != candidate.get("duckdb_executable_sha256") {
@@ -569,6 +597,264 @@ pub fn compare_perf_board_headers(
 	}
 }
 
+/// ADR 603: this process's own `ru_maxrss` in KiB, read just before a child is spawned. A child's
+/// `ru_maxrss` can carry the forked parent's high-water across `exec`, so the child's reading is
+/// labelled against this value rather than taken as its own peak.
+pub fn self_peak_rss_kib() -> Option<u64> {
+	#[cfg(unix)]
+	{
+		let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+		let read = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+		if read != 0 {
+			return None;
+		}
+		let usage = unsafe { usage.assume_init() };
+		Some(usage.ru_maxrss.max(0) as u64)
+	}
+	#[cfg(not(unix))]
+	{
+		None
+	}
+}
+
+/// ADR 603: `above_parent_high_water` when the child's reading exceeds the parent's high-water at
+/// spawn, the best available reading of the child's own peak; `ambiguous` otherwise, including
+/// equal, below, and unknown. An ambiguous value is never presented as the cell's consumption.
+pub fn peak_rss_label(child_kib: Option<u64>, parent_kib: Option<u64>) -> &'static str {
+	match (child_kib, parent_kib) {
+		(Some(child), Some(parent)) if child > parent => "above_parent_high_water",
+		_ => "ambiguous",
+	}
+}
+
+/// ADR 603: a Toron cell's spill status over its samples. `NoSpill` only when every sample reads
+/// `spill_bytes = 0` and every join-spill observation present reports zero bytes and no spilled
+/// path; an empty observation list is evidence of nothing either way (ADR 591's q21 spilled with
+/// an empty list; its q11, q14, and q19 carried zero-byte `in_memory` observations).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CellSpillStatus {
+	NoSpill,
+	Spilling,
+	/// A sample without a numeric `spill_bytes`, or no samples: the status cannot be read.
+	Unreadable,
+}
+
+pub fn cell_spill_status(samples: &[&serde_json::Value]) -> CellSpillStatus {
+	if samples.is_empty() {
+		return CellSpillStatus::Unreadable;
+	}
+	let mut spilled = false;
+	for sample in samples {
+		let Some(bytes) = sample
+			.get("spill_bytes")
+			.and_then(serde_json::Value::as_u64)
+		else {
+			return CellSpillStatus::Unreadable;
+		};
+		spilled |= bytes != 0;
+		for observation in sample
+			.get("join_spill_observations")
+			.and_then(serde_json::Value::as_array)
+			.into_iter()
+			.flatten()
+		{
+			let observed_bytes = observation
+				.get("spill_bytes")
+				.and_then(serde_json::Value::as_u64);
+			let path = observation.get("path").and_then(serde_json::Value::as_str);
+			match (observed_bytes, path) {
+				(Some(0), Some("in_memory")) => {}
+				(None, _) | (_, None) => return CellSpillStatus::Unreadable,
+				_ => spilled = true,
+			}
+		}
+	}
+	if spilled {
+		CellSpillStatus::Spilling
+	} else {
+		CellSpillStatus::NoSpill
+	}
+}
+
+/// The median `execute_ms` of a cell's measured, passing samples.
+fn cell_median_execute_ms(samples: &[serde_json::Value], query: &str, engine: &str) -> Option<f64> {
+	let mut values = samples
+		.iter()
+		.filter(|row| {
+			row.get("query").and_then(serde_json::Value::as_str) == Some(query)
+				&& row.get("engine").and_then(serde_json::Value::as_str) == Some(engine)
+				&& row.get("warmup").and_then(serde_json::Value::as_bool) == Some(false)
+				&& row.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+		})
+		.filter_map(|row| row.get("execute_ms").and_then(serde_json::Value::as_f64))
+		.collect::<Vec<_>>();
+	if values.is_empty() {
+		return None;
+	}
+	values.sort_by(f64::total_cmp);
+	let middle = values.len() / 2;
+	Some(if values.len() % 2 == 1 {
+		values[middle]
+	} else {
+		(values[middle - 1] + values[middle]) / 2.0
+	})
+}
+
+fn measured_samples<'a>(
+	samples: &'a [serde_json::Value],
+	query: &str,
+	engine: &str,
+) -> Vec<&'a serde_json::Value> {
+	samples
+		.iter()
+		.filter(|row| {
+			row.get("query").and_then(serde_json::Value::as_str) == Some(query)
+				&& row.get("engine").and_then(serde_json::Value::as_str) == Some(engine)
+				&& row.get("warmup").and_then(serde_json::Value::as_bool) == Some(false)
+		})
+		.collect()
+}
+
+/// ADR 603: the anchor and the two memory panels side by side, per cell and in aggregate. Panel A
+/// is DuckDB under a nominally matched cap; Panel B is Toron at a larger budget, whose no-spill
+/// status is read per cell and never inferred. Panel B's full aggregate always covers every cell,
+/// with spilling or unreadable cells named; a no-spill subset aggregate states its coverage.
+/// ADR 603: a sweep cell's readings and its result checked against the timed cell's digests.
+/// `timed_digests_vary` is an identity limitation of the timed rows themselves, reported as such;
+/// row counts are never taken as identity.
+fn sweep_cell(
+	sweep: &[serde_json::Value],
+	timed: &[serde_json::Value],
+	query: &str,
+) -> serde_json::Value {
+	let Some(cell) = sweep.iter().find(|row| {
+		row.get("kind").and_then(serde_json::Value::as_str) == Some("duckdb_profile_sweep_cell")
+			&& row.get("query").and_then(serde_json::Value::as_str) == Some(query)
+	}) else {
+		return serde_json::json!({"result_identity": "sweep_absent"});
+	};
+	let timed_digests = measured_samples(timed, query, "duckdb")
+		.iter()
+		.filter_map(|row| {
+			row.get("duckdb_result_sha256")
+				.and_then(serde_json::Value::as_str)
+		})
+		.collect::<BTreeSet<_>>();
+	let sweep_digest = cell
+		.get("duckdb_result_sha256")
+		.and_then(serde_json::Value::as_str);
+	let identity = match (sweep_digest, timed_digests.len()) {
+		(None, _) => "sweep_digest_absent",
+		(_, 0) => "timed_digest_absent",
+		(Some(digest), 1) if timed_digests.contains(digest) => "matches_timed",
+		(Some(_), 1) => "differs_from_timed",
+		(Some(_), _) => "timed_digests_vary",
+	};
+	serde_json::json!({
+		"sweep_run_id": cell.get("sweep_run_id"),
+		"peak_temp_dir_bytes": cell.get("peak_temp_dir_bytes"),
+		"peak_buffer_bytes": cell.get("peak_buffer_bytes"),
+		"result_identity": identity,
+		"sweep_digest_among_timed": sweep_digest.is_some_and(|digest| timed_digests.contains(digest)),
+	})
+}
+
+pub fn memory_panels_summary(
+	anchor: &[serde_json::Value],
+	panel_a: &[serde_json::Value],
+	panel_b: &[serde_json::Value],
+	sweep_anchor: &[serde_json::Value],
+	sweep_panel_a: &[serde_json::Value],
+) -> serde_json::Value {
+	let ratio = |toron: Option<f64>, duckdb: Option<f64>| match (toron, duckdb) {
+		(Some(toron), Some(duckdb)) if duckdb > 0.0 => Some(toron / duckdb),
+		_ => None,
+	};
+	let mut cells = Vec::new();
+	let mut sums = [0.0f64; 4];
+	let mut complete = true;
+	let mut subset = (0.0f64, 0.0f64, Vec::new());
+	let mut panel_b_not_no_spill = Vec::new();
+	for query in ALL_QUERY_IDS {
+		let anchor_toron = cell_median_execute_ms(anchor, query, "toron");
+		let anchor_duckdb = cell_median_execute_ms(anchor, query, "duckdb");
+		let capped_duckdb = cell_median_execute_ms(panel_a, query, "duckdb");
+		let unspilled_toron = cell_median_execute_ms(panel_b, query, "toron");
+		let panel_b_status = cell_spill_status(&measured_samples(panel_b, query, "toron"));
+		let anchor_status = cell_spill_status(&measured_samples(anchor, query, "toron"));
+		match [anchor_toron, anchor_duckdb, capped_duckdb, unspilled_toron] {
+			[Some(a), Some(b), Some(c), Some(d)] => {
+				for (sum, value) in sums.iter_mut().zip([a, b, c, d]) {
+					*sum += value;
+				}
+				if panel_b_status == CellSpillStatus::NoSpill {
+					subset.0 += d;
+					subset.1 += b;
+					subset.2.push(query);
+				}
+			}
+			_ => complete = false,
+		}
+		if panel_b_status != CellSpillStatus::NoSpill {
+			panel_b_not_no_spill
+				.push(serde_json::json!({"query": query, "status": panel_b_status}));
+		}
+		cells.push(serde_json::json!({
+			"query": query,
+			"anchor_toron_ms": anchor_toron,
+			"anchor_duckdb_ms": anchor_duckdb,
+			"anchor_ratio": ratio(anchor_toron, anchor_duckdb),
+			"anchor_gap_ms": anchor_toron.zip(anchor_duckdb).map(|(t, d)| t - d),
+			"anchor_toron_spill": anchor_status,
+			"panel_a_duckdb_ms": capped_duckdb,
+			"panel_a_ratio_anchor_toron": ratio(anchor_toron, capped_duckdb),
+			"panel_a_over_anchor_duckdb": ratio(capped_duckdb, anchor_duckdb),
+			"panel_b_toron_ms": unspilled_toron,
+			"panel_b_toron_spill": panel_b_status,
+			"panel_b_ratio_anchor_duckdb": ratio(unspilled_toron, anchor_duckdb),
+			"panel_b_over_anchor_toron": ratio(unspilled_toron, anchor_toron),
+			"anchor_duckdb_sweep": sweep_cell(sweep_anchor, anchor, query),
+			"panel_a_duckdb_sweep": sweep_cell(sweep_panel_a, panel_a, query),
+		}));
+	}
+	let [anchor_toron, anchor_duckdb, capped_duckdb, unspilled_toron] = sums;
+	// An incomplete summary publishes no aggregate: a partial sum is not the 22-cell total.
+	let aggregate = |value: f64| complete.then_some(value);
+	serde_json::json!({
+		"cells": cells,
+		"complete": complete,
+		"anchor": {
+			"toron_sum_ms": aggregate(anchor_toron),
+			"duckdb_sum_ms": aggregate(anchor_duckdb),
+			"ratio_of_sums": aggregate(anchor_toron / anchor_duckdb),
+		},
+		"panel_a": {
+			"label": "DuckDB under a nominally matched cap: process-wide against Toron's per-task budget",
+			"duckdb_sum_ms": aggregate(capped_duckdb),
+			"ratio_of_sums_anchor_toron": aggregate(anchor_toron / capped_duckdb),
+		},
+		"panel_b": {
+			"label": "Toron at a larger budget; no-spill read per cell, never from the budget",
+			"toron_sum_ms": aggregate(unspilled_toron),
+			"ratio_of_sums_anchor_duckdb": aggregate(unspilled_toron / anchor_duckdb),
+			"cells_not_no_spill": panel_b_not_no_spill,
+			"no_spill_subset": {
+				"cells": subset.2.len(),
+				"of": ALL_QUERY_IDS.len(),
+				"queries": subset.2,
+				"toron_sum_ms": aggregate(subset.0),
+				"anchor_duckdb_sum_ms": aggregate(subset.1),
+				"ratio_of_sums": if complete && subset.1 > 0.0 {
+					Some(subset.0 / subset.1)
+				} else {
+					None
+				},
+			},
+		},
+	})
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -602,6 +888,8 @@ mod tests {
 			"duckdb_threads_provenance": "explicit",
 			"duckdb_version": "v1.5.4",
 			"duckdb_executable_sha256": "duckdb",
+			"duckdb_memory_limit": null,
+			"duckdb_memory_limit_provenance": "default",
 			"cpu_affinity_requested": "0-15",
 			"cpu_affinity_requested_provenance": "explicit",
 			"cpu_affinity_observed": "0-15",
@@ -639,6 +927,8 @@ mod tests {
 						"duckdb_threads": (engine == "duckdb").then_some("1"),
 						"duckdb_executable_sha256": (engine == "duckdb").then_some("duckdb"),
 						"duckdb_version": (engine == "duckdb").then_some("v1.5.4"),
+						"duckdb_memory_limit": null,
+						"duckdb_memory_limit_provenance": (engine == "duckdb").then_some("default"),
 					}));
 				}
 				summaries.push(serde_json::json!({
@@ -963,5 +1253,294 @@ mod tests {
 		);
 		let comparison = compare_perf_board_headers(&baseline, &baseline);
 		assert!(comparison.comparable, "{:?}", comparison.reasons);
+	}
+
+	#[test]
+	fn a_capped_duckdb_artifact_cannot_seal_as_the_anchor() {
+		let (mut header, mut samples, summaries) = fixture();
+		header["duckdb_memory_limit"] = serde_json::json!("2GiB");
+		header["duckdb_memory_limit_provenance"] = serde_json::json!("explicit");
+		for row in samples.iter_mut().filter(|row| row["engine"] == "duckdb") {
+			row["duckdb_memory_limit"] = serde_json::json!("2GiB");
+			row["duckdb_memory_limit_provenance"] = serde_json::json!("explicit");
+		}
+		let decision = evaluate_perf_board(&header, &samples, &summaries);
+		assert!(!decision.candidate_authority);
+		assert!(
+			decision.reasons.iter().any(|reason| reason
+				== "coordinate_mismatch:duckdb_memory_limit_provenance:expected_default"),
+			"{:?}",
+			decision.reasons
+		);
+		assert!(
+			decision
+				.reasons
+				.iter()
+				.any(|reason| reason == "coordinate_mismatch:duckdb_memory_limit:expected_null"),
+			"{:?}",
+			decision.reasons
+		);
+		// A default provenance with the limit field missing is not the anchor either.
+		let (mut header, samples, summaries) = fixture();
+		header
+			.as_object_mut()
+			.unwrap()
+			.remove("duckdb_memory_limit");
+		let decision = evaluate_perf_board(&header, &samples, &summaries);
+		assert!(!decision.candidate_authority);
+		assert!(
+			decision
+				.reasons
+				.iter()
+				.any(|reason| reason == "coordinate_mismatch:duckdb_memory_limit:expected_null")
+		);
+	}
+
+	#[test]
+	fn a_board_without_the_memory_coordinate_is_named_absent() {
+		let (header, _, _) = fixture();
+		let mut older = header.clone();
+		let object = older.as_object_mut().unwrap();
+		object.remove("duckdb_memory_limit");
+		object.remove("duckdb_memory_limit_provenance");
+		let comparison = compare_perf_board_headers(&older, &header);
+		assert!(!comparison.comparable);
+		for field in ["duckdb_memory_limit", "duckdb_memory_limit_provenance"] {
+			assert!(
+				comparison
+					.reasons
+					.iter()
+					.any(|reason| reason == &format!("board_coordinate_absent:{field}:baseline")),
+				"{field}: {:?}",
+				comparison.reasons
+			);
+		}
+	}
+
+	#[test]
+	fn a_duckdb_row_is_bound_to_the_headers_memory_coordinate() {
+		for field in ["duckdb_memory_limit", "duckdb_memory_limit_provenance"] {
+			let (header, mut samples, summaries) = fixture();
+			let row = samples
+				.iter_mut()
+				.find(|row| row["engine"] == "duckdb" && row["query"] == "q05")
+				.unwrap();
+			row[field] = serde_json::json!("2GiB");
+			let decision = evaluate_perf_board(&header, &samples, &summaries);
+			assert!(!decision.candidate_authority, "{field}");
+			assert!(
+				decision
+					.reasons
+					.iter()
+					.any(|reason| reason == &format!("row_coordinate_mismatch:q05:duckdb:{field}")),
+				"{field}: {:?}",
+				decision.reasons
+			);
+		}
+		let (header, mut samples, summaries) = fixture();
+		samples
+			.iter_mut()
+			.find(|row| row["engine"] == "duckdb" && row["query"] == "q05")
+			.unwrap()
+			.as_object_mut()
+			.unwrap()
+			.remove("duckdb_memory_limit_provenance");
+		let decision = evaluate_perf_board(&header, &samples, &summaries);
+		assert!(
+			decision.reasons.iter().any(|reason| reason
+				== "row_coordinate_mismatch:q05:duckdb:duckdb_memory_limit_provenance")
+		);
+	}
+
+	#[test]
+	fn peak_rss_is_labelled_against_the_parents_high_water() {
+		assert_eq!(
+			peak_rss_label(Some(900), Some(633)),
+			"above_parent_high_water"
+		);
+		assert_eq!(peak_rss_label(Some(633), Some(633)), "ambiguous", "equal");
+		assert_eq!(peak_rss_label(Some(500), Some(633)), "ambiguous", "below");
+		assert_eq!(peak_rss_label(None, Some(633)), "ambiguous");
+		assert_eq!(peak_rss_label(Some(900), None), "ambiguous");
+		assert!(self_peak_rss_kib().is_some_and(|kib| kib > 0));
+	}
+
+	#[test]
+	fn a_cell_is_no_spill_only_on_zero_bytes_and_no_spilled_path() {
+		let in_memory = serde_json::json!({"spill_bytes": 0, "join_spill_observations": [
+			{"replay_id": 3, "path": "in_memory", "spill_bytes": 0}]});
+		let empty = serde_json::json!({"spill_bytes": 0, "join_spill_observations": []});
+		let absent = serde_json::json!({"spill_bytes": 0});
+		assert_eq!(
+			cell_spill_status(&[&in_memory, &empty, &absent]),
+			CellSpillStatus::NoSpill
+		);
+		// ADR 591's q21: bytes spilled, an empty list.
+		let spilled_empty_list =
+			serde_json::json!({"spill_bytes": 27_242_808, "join_spill_observations": []});
+		assert_eq!(
+			cell_spill_status(&[&in_memory, &spilled_empty_list]),
+			CellSpillStatus::Spilling
+		);
+		// An observation that reports spilled bytes, and one on a spilled path at zero bytes.
+		let observed_bytes = serde_json::json!({"spill_bytes": 0, "join_spill_observations": [
+			{"replay_id": 1, "path": "streaming_scan_build", "spill_bytes": 4096}]});
+		assert_eq!(
+			cell_spill_status(&[&observed_bytes]),
+			CellSpillStatus::Spilling
+		);
+		let spilled_path = serde_json::json!({"spill_bytes": 0, "join_spill_observations": [
+			{"replay_id": 1, "path": "streamed_spilled_build", "spill_bytes": 0}]});
+		assert_eq!(
+			cell_spill_status(&[&spilled_path]),
+			CellSpillStatus::Spilling
+		);
+		let in_memory_with_bytes = serde_json::json!({"spill_bytes": 0, "join_spill_observations": [
+			{"replay_id": 1, "path": "in_memory", "spill_bytes": 8}]});
+		assert_eq!(
+			cell_spill_status(&[&in_memory_with_bytes]),
+			CellSpillStatus::Spilling
+		);
+		// Unreadable: no samples, a missing count, an observation without its fields.
+		assert_eq!(cell_spill_status(&[]), CellSpillStatus::Unreadable);
+		assert_eq!(
+			cell_spill_status(&[&serde_json::json!({"spill_bytes": null})]),
+			CellSpillStatus::Unreadable
+		);
+		let malformed = serde_json::json!({"spill_bytes": 0, "join_spill_observations": [
+			{"replay_id": 1}]});
+		assert_eq!(
+			cell_spill_status(&[&malformed]),
+			CellSpillStatus::Unreadable
+		);
+	}
+
+	fn panel_rows(engine: &str, ms: f64, spill_bytes: u64) -> Vec<serde_json::Value> {
+		ALL_QUERY_IDS
+			.iter()
+			.flat_map(|query| {
+				(0..3).map(move |run| {
+					serde_json::json!({"query": query, "engine": engine, "warmup": false,
+						"status": "pass", "run_index": run, "execute_ms": ms + run as f64,
+						"spill_bytes": spill_bytes, "join_spill_observations": []})
+				})
+			})
+			.collect()
+	}
+
+	#[test]
+	fn the_panels_report_full_aggregates_and_a_stated_no_spill_subset() {
+		let mut anchor = panel_rows("toron", 400.0, 0);
+		anchor.extend(panel_rows("duckdb", 100.0, 0));
+		let panel_a = panel_rows("duckdb", 110.0, 0);
+		let mut panel_b = panel_rows("toron", 300.0, 0);
+		// One Panel B cell still spills: it stays in the full aggregate and leaves the subset.
+		for row in panel_b.iter_mut().filter(|row| row["query"] == "q21") {
+			row["spill_bytes"] = serde_json::json!(4096);
+		}
+		let summary = memory_panels_summary(&anchor, &panel_a, &panel_b, &[], &[]);
+		assert_eq!(summary["complete"], true);
+		let n = ALL_QUERY_IDS.len() as f64;
+		assert_eq!(summary["anchor"]["toron_sum_ms"], 401.0 * n);
+		assert_eq!(summary["anchor"]["ratio_of_sums"], 401.0 / 101.0);
+		assert_eq!(summary["panel_a"]["duckdb_sum_ms"], 111.0 * n);
+		assert_eq!(
+			summary["panel_b"]["toron_sum_ms"],
+			301.0 * n,
+			"the spilling cell stays in"
+		);
+		assert_eq!(summary["panel_b"]["cells_not_no_spill"][0]["query"], "q21");
+		assert_eq!(
+			summary["panel_b"]["cells_not_no_spill"][0]["status"],
+			"spilling"
+		);
+		let subset = &summary["panel_b"]["no_spill_subset"];
+		assert_eq!(subset["cells"], ALL_QUERY_IDS.len() - 1);
+		assert_eq!(subset["of"], ALL_QUERY_IDS.len());
+		assert!(
+			!subset["queries"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.any(|q| q == "q21")
+		);
+		assert_eq!(subset["toron_sum_ms"], 301.0 * (n - 1.0));
+		let q21 = summary["cells"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|cell| cell["query"] == "q21")
+			.unwrap();
+		assert_eq!(q21["panel_b_toron_spill"], "spilling");
+		assert_eq!(q21["anchor_gap_ms"], 300.0);
+		assert_eq!(
+			q21["anchor_duckdb_sweep"]["result_identity"],
+			"sweep_absent"
+		);
+		// One missing cell: the summary is incomplete and publishes no aggregate.
+		let summary = memory_panels_summary(&anchor, &panel_a[3..], &panel_b, &[], &[]);
+		assert_eq!(summary["complete"], false);
+		for aggregate in [
+			&summary["anchor"]["toron_sum_ms"],
+			&summary["anchor"]["ratio_of_sums"],
+			&summary["panel_a"]["duckdb_sum_ms"],
+			&summary["panel_a"]["ratio_of_sums_anchor_toron"],
+			&summary["panel_b"]["toron_sum_ms"],
+			&summary["panel_b"]["ratio_of_sums_anchor_duckdb"],
+			&summary["panel_b"]["no_spill_subset"]["toron_sum_ms"],
+			&summary["panel_b"]["no_spill_subset"]["ratio_of_sums"],
+		] {
+			assert_eq!(aggregate, &serde_json::Value::Null);
+		}
+	}
+
+	#[test]
+	fn a_sweep_result_is_checked_against_the_timed_digests() {
+		let timed = |digests: &[&str]| -> Vec<serde_json::Value> {
+			digests
+				.iter()
+				.enumerate()
+				.map(|(run, digest)| {
+					serde_json::json!({"query": "q05", "engine": "duckdb", "warmup": false,
+						"status": "pass", "run_index": run, "execute_ms": 100.0,
+						"duckdb_result_sha256": digest})
+				})
+				.collect()
+		};
+		let sweep = |digest: Option<&str>| {
+			vec![
+				serde_json::json!({"kind": "duckdb_profile_sweep_cell", "query": "q05",
+				"sweep_run_id": "s", "peak_temp_dir_bytes": 0, "peak_buffer_bytes": 9,
+				"duckdb_result_sha256": digest}),
+			]
+		};
+		let identity = |sweep_rows: &[serde_json::Value], timed_rows: &[serde_json::Value]| {
+			sweep_cell(sweep_rows, timed_rows, "q05")["result_identity"].clone()
+		};
+		assert_eq!(
+			identity(&sweep(Some("a")), &timed(&["a", "a"])),
+			"matches_timed"
+		);
+		assert_eq!(
+			identity(&sweep(Some("b")), &timed(&["a", "a"])),
+			"differs_from_timed"
+		);
+		assert_eq!(
+			identity(&sweep(Some("a")), &timed(&["a", "b"])),
+			"timed_digests_vary"
+		);
+		assert_eq!(
+			identity(&sweep(None), &timed(&["a"])),
+			"sweep_digest_absent"
+		);
+		assert_eq!(
+			identity(&sweep(Some("a")), &timed(&[])),
+			"timed_digest_absent"
+		);
+		assert_eq!(identity(&[], &timed(&["a"])), "sweep_absent");
+		assert_eq!(
+			sweep_cell(&sweep(Some("a")), &timed(&["a"]), "q05")["peak_buffer_bytes"],
+			9
+		);
 	}
 }

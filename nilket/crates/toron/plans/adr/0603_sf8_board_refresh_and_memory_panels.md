@@ -1,6 +1,14 @@
 # ADR 603 - the SF8 board refreshed on strix, with two labelled memory panels
 
-**Status:** PROPOSED. Successor to ADR 591, whose sealed strix board is
+**Status:** CLOSED. The anchor is sealed with final authority on
+strix (results in
+`plans/impl/0603_sf8_board_refresh_and_memory_panels_results.md`,
+evidence tag `evidence/96097b3ee59d-d4044c40cfe5`): Toron 63.430 s
+against DuckDB 15.650 s, 4.053×, 32.064 s above the 31.366 s target.
+Panel A (DuckDB at a nominally matched 2 GiB) reads 4.062×. Panel B
+(Toron at 32 GiB) reads 4.037× over all 22 cells, with q21 still
+spilling, and 4.107× over its 21-cell no-spill subset. No target is
+chosen here. Successor to ADR 591, whose sealed strix board is
 the campaign's anchor: Toron 64.836 s against DuckDB 15.683 s summed
 over q01–q22 at SF 8, one thread, 2 GiB per task. ADRs 600 and 601
 retained two q21 cuts since then, and ADR 602 closed `not_established`.
@@ -71,10 +79,17 @@ carry `duckdb_memory_limit` (the normalized value, or null) and its
 provenance (`explicit` when set, `default` when absent). DuckDB is asked
 back, in the same process, `SELECT current_setting('memory_limit')`,
 and the answer is recorded as `duckdb_memory_limit_observed` on DuckDB
-rows. The two are compared after both are normalized to bytes, not by
-spelling, since DuckDB may report an equivalent value in another unit.
-An explicit request whose observed bytes disagree is refused on the row
-by name. The board gate adds `duckdb_memory_limit_provenance =
+rows. (Amended before implementation.) DuckDB 1.5.4 reports the setting
+rounded for display, one decimal of the largest binary unit, truncated:
+on bigfoot the default read `98.5 GiB`, `2GiB` read `2.0 GiB`, and `2GB`
+read `1.8 GiB`. So the read-back is compared with the request's expected
+display at that precision, as strings, and never as exact bytes. Any byte
+value parsed from it is labelled display-derived. An explicit request
+whose read-back differs from its expected display is refused on the row
+by name. A successful `SET` with a matching read-back supports the
+requested setting only to display precision. On the anchor, the value
+DuckDB returns for its default is reported as observed; the Context's
+~98 GiB is an estimate until then. The board gate adds `duckdb_memory_limit_provenance =
 default` to the anchor's coordinate, so a capped artifact cannot seal
 as the anchor, and adds both fields to the fields two boards must share.
 An older board without them, such as ADR 591's, is named as absent, as
@@ -104,13 +119,17 @@ process-wide and Toron's is per task, so equal numbers are not proven
 equal effective budgets. The gate refuses it sealing authority by
 construction (`coordinate_mismatch:duckdb_memory_limit_provenance`, and
 the engine list); it is a diagnostic with its own directory and hashes.
-Whether DuckDB spilled is observed, not assumed. The implementation's
-first step establishes, on a forced-spill smoke query under a tiny
-limit, which DuckDB 1.5.4 signal is reliable here (a file in that
-child's own `temp_directory` during or after the query, or
-`duckdb_temporary_files()` read inside the query's process). The panel
-uses that signal per cell. If no signal is reliable, the panel reports
-DuckDB's spilling as unobserved, by name.
+Whether DuckDB spilled is observed, not assumed. (Amended before
+implementation.) A probe on bigfoot ruled out a file check: a 40M-row
+sort under a 100 MiB limit spilled, yet DuckDB had removed its files and
+the temporary directory it created before exit, and
+`duckdb_temporary_files()` read zero after the query. DuckDB's JSON
+profiler does observe it. With `SYSTEM_PEAK_TEMP_DIR_SIZE` and
+`SYSTEM_PEAK_BUFFER_MEMORY` enabled, the same sort reported 198,410,240
+temp-directory bytes and a 135,622,656-byte buffer peak under 100 MiB,
+and 0 and 1,086,291,968 under 8 GiB. Profiling perturbs timing, so it is
+kept out of every timed child, warmups included. See the diagnostic
+sweep below.
 
 *Panel B, Toron at a verified no-spill budget.* Toron only (`--engines
 toron`), with the anchor's coordinate except
@@ -157,10 +176,32 @@ procedure. The anchor runs first; each panel's attempt starts only after
 the previous one's completion is received and its marker, logs, and
 after-snapshot have been moved into that attempt's directory. One
 attempt each: a refused board is retained and reported, and the record
-closes on it, as ADRs 590 and 591 did. Before the full runs, a smoke
+closes on it, as ADRs 590 and 591 did.
+
+*The DuckDB diagnostic sweep (amended before implementation).* After a
+DuckDB-bearing timed artifact (the anchor, then Panel A) is complete and
+its after-snapshot and, for the anchor, its seal are captured, a
+separate sweep runs one profiled DuckDB child per cell. It uses the same
+staged executable, query, data, thread setting, and memory setting as
+that artifact, a fresh isolated `temp_directory` per child, and a
+per-child profile file. It records `system_peak_temp_dir_size` and
+`system_peak_buffer_memory` with the sweep's own run identity and the
+child's result digest, checked against the cell's result. These are
+labelled separate diagnostic observations of the cell's query at that
+setting, not facts about the timed runs, whose spilling is not directly
+observed. No profiled child runs during a timed artifact, including its
+warmups, or between its cells; Panel A starts only after its own ADR 595
+gate, which follows the anchor's sweep. Profile-derived spill and buffer
+peaks are attached to the sweep's run identities, never to timed rows. A
+cell
+whose sweep child spills is reported as spilling at that setting in the
+diagnostic, and the timed rows are left as measured.
+
+Before the full runs, a smoke
 cell pair (q09 and q18, one run, no warmup) under Panel A's setting
 verifies the harness wiring, including the observed-limit read-back and
-the spill signal. It does not stand in for the panel.
+a profiled sweep child for each of the two cells. It does not stand in
+for the panel.
 
 *What the record reports, and does not decide.* For each coordinate:
 the per-cell table, both aggregates, the ratio to the matching DuckDB
@@ -177,9 +218,11 @@ names no owner beyond reporting the ranking.
   normalization; empty, malformed, and unit-less values are refused
   before any query, on the environment-handling path itself. `SET
   memory_limit` is emitted only when the value is explicit, and the
-  observed read-back is recorded on DuckDB rows. `2GiB` round-trips
-  through `current_setting` to the same bytes; a disagreement in bytes is
-  refused on the row by name. Both are fixtured.
+  observed read-back is recorded on DuckDB rows. The read-back is
+  compared with the expected display at DuckDB's precision: `2GiB`
+  against `2.0 GiB` agrees, `2GB` against `1.8 GiB` agrees, and a
+  disagreement is refused on the row by name. All three are fixtured,
+  and parsed byte values are labelled display-derived.
 - The no-spill rule: fixtures for a cell with `spill_bytes = 0` and an
   in-memory observation (no-spill, observation kept), a cell with spill
   bytes and an empty list (spilling), and a cell with an observation
@@ -192,8 +235,13 @@ names no owner beyond reporting the ranking.
   named; the comparability check includes both new fields; a board
   without them is named as absent. Each has a fixture altering exactly
   one field.
-- The spill signal for DuckDB established on a forced-spill smoke query
-  and used per cell in Panel A, or reported as unobserved by name.
+- The DuckDB diagnostic sweep after the anchor and after Panel A, each
+  after its artifact is complete and snapshotted (and, for the anchor,
+  sealed): one profiled child per cell with a fresh temp directory,
+  recording peak temp-directory bytes and peak buffer memory with its
+  own run identity and a result digest that matches the cell's. A
+  forced-spill fixture on the profile parser, and the probe's readings
+  quoted.
 - The anchor sealed with final authority: 264 samples, 44 stable
   summaries, `full_hash` with the dataset fingerprint on every row,
   DuckDB at one thread with no memory limit by staged hash, parallelism
