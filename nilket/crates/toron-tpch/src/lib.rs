@@ -14,6 +14,7 @@
 
 mod adr444_profile_eval;
 pub mod affinity;
+pub mod census;
 pub mod duckdb_memory;
 pub mod evidence;
 pub mod host_readings;
@@ -12861,6 +12862,99 @@ pub fn export_persisted_perf_query_parquet(
 	root: &Path,
 ) -> Result<TpchParquetExport, String> {
 	build_persisted_perf_query_spec(query, mode, scale_factor, root).map(|spec| spec.export)
+}
+
+/// ADR 604: the census's Toron plan and its T1 execution, for one persisted-parquet query.
+///
+/// The plan comes from binding the query with the explain binder under the harness's planner
+/// configuration, with no execution: its fingerprint, compact shape, serialized tree, and the
+/// binder's join decisions and join order with estimated rows. T1 is one local `EXPLAIN ANALYZE`
+/// execution through `QueryCoordinator` (the distributed variant plans differently); it reports
+/// estimated and actual rows only for the join orders it recognizes, and nothing for the others.
+pub async fn structural_census_toron_plan(
+	query: &str,
+	mode: &str,
+	scale_factor: f64,
+	root: &Path,
+) -> Result<serde_json::Value, String> {
+	let spec = build_persisted_perf_query_spec(query, mode, scale_factor, root)?;
+	let mut timings = PerfPhaseTimings::default();
+	let catalog = load_catalog_from_metadata(spec.tables.clone(), &mut timings, Instant::now())
+		.map_err(|error| format!("census {query}: load catalog: {error:?}"))?;
+	let planner = SqlPlanner::new();
+	let logical = planner
+		.plan(&spec.sql)
+		.map_err(|error| format!("census {query}: plan: {error}"))?;
+	let (bound, join_decisions, join_order_edges) =
+		bind_with_explain_summary(&logical, &catalog, &gauge_planner_config())
+			.await
+			.map_err(|error| format!("census {query}: bind: {error:?}"))?;
+	let plan_tree = serde_json::to_value(&bound)
+		.map_err(|error| format!("census {query}: serialize plan: {error}"))?;
+	let analyze_logical = planner
+		.plan(&format!("EXPLAIN ANALYZE {}", spec.sql))
+		.map_err(|error| format!("census {query}: plan EXPLAIN ANALYZE: {error}"))?;
+	let coordinator = toron::coordinator::QueryCoordinator::new(
+		Arc::new(catalog),
+		Executor::with_context(
+			spec.storage.clone(),
+			tpch_execution_context(Arc::new(Mutex::new(TaskTelemetry::default()))),
+		),
+		gauge_planner_config(),
+	);
+	let t1_start = Instant::now();
+	let batches = coordinator
+		.execute_query(&analyze_logical, None)
+		.await
+		.map_err(|error| format!("census {query}: EXPLAIN ANALYZE: {error:?}"))?;
+	let t1_wall_ms = t1_start.elapsed().as_secs_f64() * 1000.0;
+	let mut analyze_rows = Vec::new();
+	for batch in &batches {
+		let schema = batch.schema();
+		for row in 0..batch.num_rows() {
+			let mut object = serde_json::Map::new();
+			for (index, field) in schema.fields().iter().enumerate() {
+				let column = batch.column(index);
+				let value = if column.is_null(row) {
+					serde_json::Value::Null
+				} else {
+					let text = arrow::util::display::array_value_to_string(column, row)
+						.map_err(|error| format!("census {query}: analyze value: {error}"))?;
+					match field.data_type() {
+						DataType::Int64 => text
+							.parse::<i64>()
+							.map(serde_json::Value::from)
+							.unwrap_or(serde_json::Value::String(text)),
+						DataType::Float64 => text
+							.parse::<f64>()
+							.ok()
+							.and_then(|value| serde_json::Number::from_f64(value).map(Into::into))
+							.unwrap_or(serde_json::Value::String(text)),
+						_ => serde_json::Value::String(text),
+					}
+				};
+				object.insert(field.name().clone(), value);
+			}
+			analyze_rows.push(serde_json::Value::Object(object));
+		}
+	}
+	Ok(serde_json::json!({
+		"plan": {
+			"source": "explain binder (bind_with_explain_summary), no execution",
+			"plan_fingerprint": physical_plan_fingerprint(&bound),
+			"compact_shape": compact_execution_plan_shape(&bound),
+			"tree": plan_tree,
+			"join_decisions_estimated": join_decisions,
+			"join_order_edges_estimated": join_order_edges,
+		},
+		"t1": {
+			"execution": "local QueryCoordinator EXPLAIN ANALYZE; result discarded",
+			"wall_ms": t1_wall_ms,
+			"analyze_rows": analyze_rows,
+			"emitted": !analyze_rows.is_empty(),
+		},
+		"sql": spec.sql,
+	}))
 }
 
 pub fn build_perf_query_spec(
