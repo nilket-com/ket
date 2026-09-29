@@ -894,6 +894,99 @@ pub(in crate::exec) struct SpilledBatchRowRef {
 	pub(super) row: u32,
 }
 
+/// ADR 602: how a compact-index hit returns its refs. `Collected` gathers them into a `Vec`
+/// even when there is one; `Inline` returns a lone ref as `One`, with no allocation. A hit
+/// with overflow refs is `Many` under either form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::exec) enum SpilledLookupForm {
+	Collected,
+	Inline,
+}
+
+impl SpilledLookupForm {
+	pub(in crate::exec) fn name(self) -> &'static str {
+		match self {
+			Self::Collected => "collected",
+			Self::Inline => "inline",
+		}
+	}
+}
+
+/// ADR 602: a lookup's refs, owned, so a caller may use the build again while it consumes
+/// them. Refs keep insertion order in every shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::exec) enum SpilledLookupMatches {
+	Miss,
+	One(SpilledBatchRowRef),
+	Many(Vec<SpilledBatchRowRef>),
+}
+
+impl SpilledLookupMatches {
+	fn from_vec(refs: Vec<SpilledBatchRowRef>) -> Self {
+		if refs.is_empty() {
+			Self::Miss
+		} else {
+			Self::Many(refs)
+		}
+	}
+
+	pub(in crate::exec) fn len(&self) -> usize {
+		match self {
+			Self::Miss => 0,
+			Self::One(_) => 1,
+			Self::Many(refs) => refs.len(),
+		}
+	}
+
+	#[cfg(test)]
+	pub(in crate::exec) fn is_empty(&self) -> bool {
+		self.len() == 0
+	}
+}
+
+impl IntoIterator for SpilledLookupMatches {
+	type Item = SpilledBatchRowRef;
+	type IntoIter = SpilledLookupMatchesIter;
+
+	fn into_iter(self) -> Self::IntoIter {
+		match self {
+			Self::Miss => SpilledLookupMatchesIter::One(None),
+			Self::One(row_ref) => SpilledLookupMatchesIter::One(Some(row_ref)),
+			Self::Many(refs) => SpilledLookupMatchesIter::Many(refs.into_iter()),
+		}
+	}
+}
+
+pub(in crate::exec) enum SpilledLookupMatchesIter {
+	One(Option<SpilledBatchRowRef>),
+	Many(std::vec::IntoIter<SpilledBatchRowRef>),
+}
+
+impl Iterator for SpilledLookupMatchesIter {
+	type Item = SpilledBatchRowRef;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		match self {
+			Self::One(row_ref) => row_ref.take(),
+			Self::Many(refs) => refs.next(),
+		}
+	}
+
+	fn size_hint(&self) -> (usize, Option<usize>) {
+		match self {
+			Self::One(row_ref) => {
+				let len = usize::from(row_ref.is_some());
+				(len, Some(len))
+			}
+			Self::Many(refs) => refs.size_hint(),
+		}
+	}
+}
+
+impl ExactSizeIterator for SpilledLookupMatchesIter {}
+
+impl std::iter::FusedIterator for SpilledLookupMatchesIter {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CompactSpilledBatchRowRef {
 	page_index: u32,
@@ -969,6 +1062,16 @@ impl SpilledBatchRefList {
 			refs.extend(rows.iter().map(|row| row.unpack()));
 		}
 		refs
+	}
+
+	/// ADR 602: the refs as a lookup returns them — a lone ref inline under `Inline`, else the
+	/// collected `Vec` as `refs` builds it.
+	fn matches(&self, form: SpilledLookupForm) -> SpilledLookupMatches {
+		if form == SpilledLookupForm::Inline && self.overflow.is_none() {
+			SpilledLookupMatches::One(self.first.unpack())
+		} else {
+			SpilledLookupMatches::Many(self.refs())
+		}
 	}
 
 	fn len(&self) -> usize {
@@ -1105,12 +1208,14 @@ impl SpilledBatchIndex {
 		}
 	}
 
-	fn lookup(&self, join_key: &JoinKey) -> Vec<SpilledBatchRowRef> {
+	fn lookup(&self, join_key: &JoinKey, form: SpilledLookupForm) -> SpilledLookupMatches {
 		match (self, join_key) {
-			(Self::Int32(index), JoinKey::Int32(key)) => index.lookup(*key),
-			(Self::Int64(index), JoinKey::Int64(key)) => index.lookup(*key),
-			(Self::Hash(index), key) => index.get(key).cloned().unwrap_or_default(),
-			(Self::Int32(_) | Self::Int64(_), _) => Vec::new(),
+			(Self::Int32(index), JoinKey::Int32(key)) => index.lookup(*key, form),
+			(Self::Int64(index), JoinKey::Int64(key)) => index.lookup(*key, form),
+			(Self::Hash(index), key) => {
+				SpilledLookupMatches::from_vec(index.get(key).cloned().unwrap_or_default())
+			}
+			(Self::Int32(_) | Self::Int64(_), _) => SpilledLookupMatches::Miss,
 		}
 	}
 
@@ -1450,13 +1555,13 @@ where
 		Ok(())
 	}
 
-	fn lookup(&self, key: K) -> Vec<SpilledBatchRowRef> {
+	fn lookup(&self, key: K, form: SpilledLookupForm) -> SpilledLookupMatches {
 		let bucket = self.find_bucket(key);
 		let entry_index = self.buckets[bucket];
 		if entry_index == EMPTY_SPILLED_BATCH_BUCKET {
-			Vec::new()
+			SpilledLookupMatches::Miss
 		} else {
-			self.entries[entry_index as usize].refs.refs()
+			self.entries[entry_index as usize].refs.matches(form)
 		}
 	}
 
@@ -1996,6 +2101,10 @@ pub(in crate::exec) struct SpilledInnerJoinBuild {
 	count_lookups: bool,
 	lookup_hits: u64,
 	lookup_misses: u64,
+	/// ADR 602: how a compact-index hit returns its refs, and, under counting, how many hits
+	/// came back as `One`.
+	lookup_form: SpilledLookupForm,
+	lookup_inline_hits: u64,
 	resident_baseline_bytes: u64,
 	throughput_profile: Option<Box<StreamedSpilledLeftOuterProfile>>,
 }
@@ -2164,10 +2273,36 @@ impl SpilledInnerJoinBuild {
 			count_lookups: false,
 			lookup_hits: 0,
 			lookup_misses: 0,
+			lookup_form: SpilledLookupForm::Collected,
+			lookup_inline_hits: 0,
 			scratch_refs: Vec::new(),
 			resident_baseline_bytes,
 			throughput_profile,
 		})
+	}
+
+	/// ADR 602: the lookup form for this build's compact index. `Inline` without the compact
+	/// index is refused: the legacy index has no inline shape to return.
+	pub(in crate::exec) fn use_lookup_form(
+		&mut self,
+		form: SpilledLookupForm,
+	) -> Result<(), ExecutionError> {
+		if form == SpilledLookupForm::Inline && !self.compact_index_enabled {
+			return Err(ExecutionError::Kernel {
+				message: "inline lookup form requested without the compact spill index".to_string(),
+			});
+		}
+		self.lookup_form = form;
+		Ok(())
+	}
+
+	pub(in crate::exec) fn lookup_form(&self) -> SpilledLookupForm {
+		self.lookup_form
+	}
+
+	/// ADR 602: `None` when counting was never enabled; else the hits returned as `One`.
+	pub(in crate::exec) fn lookup_inline_hits(&self) -> Option<u64> {
+		self.count_lookups.then_some(self.lookup_inline_hits)
 	}
 
 	pub(in crate::exec) fn use_compact_resident_index(&mut self) {
@@ -3666,7 +3801,7 @@ impl SpilledInnerJoinBuild {
 	pub(in crate::exec) async fn lookup(
 		&mut self,
 		join_key: &JoinKey,
-	) -> Result<Vec<SpilledBatchRowRef>, ExecutionError> {
+	) -> Result<SpilledLookupMatches, ExecutionError> {
 		let matches = if let Some(index) = &self.compact_index {
 			if index.is_collecting() {
 				return Err(ExecutionError::Kernel {
@@ -3674,18 +3809,25 @@ impl SpilledInnerJoinBuild {
 						.to_string(),
 				});
 			}
-			index.lookup(join_key)
+			index.lookup(join_key, self.lookup_form)
 		} else {
-			self.index.get(join_key).cloned().unwrap_or_default()
+			SpilledLookupMatches::from_vec(self.index.get(join_key).cloned().unwrap_or_default())
 		};
 		if let Some(profile) = &mut self.throughput_profile {
 			profile.record_lookup(matches.len());
 		}
 		if self.count_lookups {
-			if matches.is_empty() {
-				self.lookup_misses = self.lookup_misses.saturating_add(1);
-			} else {
-				self.lookup_hits = self.lookup_hits.saturating_add(1);
+			match &matches {
+				SpilledLookupMatches::Miss => {
+					self.lookup_misses = self.lookup_misses.saturating_add(1);
+				}
+				SpilledLookupMatches::One(_) => {
+					self.lookup_hits = self.lookup_hits.saturating_add(1);
+					self.lookup_inline_hits = self.lookup_inline_hits.saturating_add(1);
+				}
+				SpilledLookupMatches::Many(_) => {
+					self.lookup_hits = self.lookup_hits.saturating_add(1);
+				}
 			}
 		}
 		Ok(matches)
@@ -5317,7 +5459,7 @@ mod tests {
 
 	fn adr601_refs(index: &PrimitiveSpilledBatchIndex<i64>, key: i64) -> Vec<(usize, u32)> {
 		index
-			.lookup(key)
+			.lookup(key, SpilledLookupForm::Collected)
 			.into_iter()
 			.map(|row_ref| (row_ref.page_index, row_ref.row))
 			.collect()
@@ -7399,7 +7541,7 @@ mod tests {
 				.lookup(&JoinKey::Int64(2))
 				.await
 				.expect("lookup key 2"),
-			vec![
+			SpilledLookupMatches::Many(vec![
 				SpilledBatchRowRef {
 					page_index: 0,
 					row: 1
@@ -7408,17 +7550,17 @@ mod tests {
 					page_index: 0,
 					row: 2
 				}
-			]
+			])
 		);
 		assert_eq!(
 			build
 				.lookup(&JoinKey::Int64(5))
 				.await
 				.expect("lookup key 5"),
-			vec![SpilledBatchRowRef {
+			SpilledLookupMatches::Many(vec![SpilledBatchRowRef {
 				page_index: 1,
 				row: 1
-			}]
+			}])
 		);
 
 		build.cleanup().await;
@@ -7787,7 +7929,7 @@ mod tests {
 				.lookup(&JoinKey::Int64(1))
 				.await
 				.expect("lookup duplicate key"),
-			vec![
+			SpilledLookupMatches::Many(vec![
 				SpilledBatchRowRef {
 					page_index: 0,
 					row: 0
@@ -7796,7 +7938,7 @@ mod tests {
 					page_index: 1,
 					row: 0
 				}
-			],
+			]),
 			"compact spill index must preserve duplicate ref insertion order"
 		);
 
@@ -7817,7 +7959,7 @@ mod tests {
 				.lookup(&JoinKey::Int64(3))
 				.await
 				.expect("lookup duplicate key"),
-			vec![
+			SpilledLookupMatches::Many(vec![
 				SpilledBatchRowRef {
 					page_index: 2,
 					row: 1
@@ -7826,11 +7968,236 @@ mod tests {
 					page_index: 2,
 					row: 2
 				}
-			]
+			])
 		);
 
 		build.cleanup().await;
 		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	// -----------------------------------------------------------------------------------------
+	// ADR 602: a hit's refs without an allocation — the lookup forms, their shapes, and counts.
+	// -----------------------------------------------------------------------------------------
+
+	fn adr602_ref(page_index: usize, row: u32) -> SpilledBatchRowRef {
+		SpilledBatchRowRef { page_index, row }
+	}
+
+	fn adr602_key(plan: JoinKeyPlan, key: i64) -> JoinKey {
+		match plan {
+			JoinKeyPlan::Int32 => JoinKey::Int32(key as i32),
+			_ => JoinKey::Int64(key),
+		}
+	}
+
+	fn adr602_batch(plan: JoinKeyPlan, keys: &[i64]) -> RecordBatch {
+		match plan {
+			JoinKeyPlan::Int32 => {
+				batch_with_int32_keys(&keys.iter().map(|key| Some(*key as i32)).collect::<Vec<_>>())
+			}
+			_ => batch_with_keys(keys),
+		}
+	}
+
+	#[tokio::test]
+	async fn adr602_lookup_forms_return_the_same_refs_in_order() {
+		let budget = test_task_budget();
+		let keys = [ColumnOrdinal(0)];
+		for plan in [JoinKeyPlan::Int64, JoinKeyPlan::Int32] {
+			for form in [SpilledLookupForm::Collected, SpilledLookupForm::Inline] {
+				let label = format!("{plan:?} {}", form.name());
+				let spill_dir = test_spill_dir("adr602_forms");
+				let mut build = SpilledInnerJoinBuild::create(
+					budget,
+					Arc::new(BlockingFileOps),
+					spill_dir.clone(),
+				)
+				.await
+				.expect("create inner spill");
+				assert_eq!(build.lookup_form(), SpilledLookupForm::Collected, "{label}");
+				build.use_compact_resident_index();
+				build
+					.use_lookup_form(form)
+					.expect("compact index admits either form");
+				build.enable_lookup_counting();
+				for page in [[1, 2], [2, 3]] {
+					build
+						.write_batch_chunks(&adr602_batch(plan, &page), plan, &keys, false, budget)
+						.await
+						.expect("write keys");
+				}
+				assert!(!build.uses_hash_index(), "{label}");
+
+				// A unique key: `One` under `Inline`, the one-element `Vec` under `Collected`.
+				let unique = build.lookup(&adr602_key(plan, 1)).await.expect("lookup");
+				let expected_unique = match form {
+					SpilledLookupForm::Inline => SpilledLookupMatches::One(adr602_ref(0, 0)),
+					SpilledLookupForm::Collected => {
+						SpilledLookupMatches::Many(vec![adr602_ref(0, 0)])
+					}
+				};
+				assert_eq!(unique, expected_unique, "{label}: unique key's shape");
+				assert_eq!(unique.len(), 1, "{label}");
+				assert!(!unique.is_empty(), "{label}");
+				assert_eq!(
+					unique.into_iter().collect::<Vec<_>>(),
+					vec![adr602_ref(0, 0)],
+					"{label}"
+				);
+
+				// A repeated key across pages: `Many` in insertion order under either form.
+				let repeated = build.lookup(&adr602_key(plan, 2)).await.expect("lookup");
+				assert_eq!(
+					repeated,
+					SpilledLookupMatches::Many(vec![adr602_ref(0, 1), adr602_ref(1, 0)]),
+					"{label}: repeated key's refs and their order"
+				);
+				assert_eq!(repeated.len(), 2, "{label}");
+
+				let last = build.lookup(&adr602_key(plan, 3)).await.expect("lookup");
+				assert_eq!(
+					last.into_iter().collect::<Vec<_>>(),
+					vec![adr602_ref(1, 1)],
+					"{label}"
+				);
+
+				// An absent key, and a key of the other primitive variant: `Miss`.
+				let absent = build.lookup(&adr602_key(plan, 9)).await.expect("lookup");
+				assert_eq!(absent, SpilledLookupMatches::Miss, "{label}: absent key");
+				assert!(absent.is_empty(), "{label}");
+				let mismatched = match plan {
+					JoinKeyPlan::Int32 => JoinKey::Int64(1),
+					_ => JoinKey::Int32(1),
+				};
+				assert_eq!(
+					build.lookup(&mismatched).await.expect("lookup"),
+					SpilledLookupMatches::Miss,
+					"{label}: mismatched variant"
+				);
+
+				// Three hits, two misses; the unique keys 1 and 3 return inline under `Inline`.
+				assert_eq!(build.lookup_counts(), Some((3, 2)), "{label}");
+				let inline_hits = match form {
+					SpilledLookupForm::Inline => 2,
+					SpilledLookupForm::Collected => 0,
+				};
+				assert_eq!(build.lookup_inline_hits(), Some(inline_hits), "{label}");
+
+				build.cleanup().await;
+				let _ = std::fs::remove_dir_all(spill_dir);
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn adr602_inline_form_needs_the_compact_index_and_hash_paths_are_unchanged() {
+		let budget = test_task_budget();
+		let keys = [ColumnOrdinal(0)];
+
+		// The legacy index: `Inline` refused, the form left `Collected`, lookups as before.
+		let spill_dir = test_spill_dir("adr602_legacy");
+		let mut legacy =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+		assert!(legacy.use_lookup_form(SpilledLookupForm::Inline).is_err());
+		assert_eq!(legacy.lookup_form(), SpilledLookupForm::Collected);
+		assert_eq!(legacy.lookup_inline_hits(), None, "counting not enabled");
+		legacy.enable_lookup_counting();
+		legacy
+			.write_batch_chunks(
+				&batch_with_keys(&[1, 2, 2]),
+				JoinKeyPlan::Int64,
+				&keys,
+				false,
+				budget,
+			)
+			.await
+			.expect("write keys");
+		assert!(legacy.uses_hash_index());
+		assert_eq!(
+			legacy.lookup(&JoinKey::Int64(1)).await.expect("lookup"),
+			SpilledLookupMatches::Many(vec![adr602_ref(0, 0)])
+		);
+		assert_eq!(
+			legacy.lookup(&JoinKey::Int64(2)).await.expect("lookup"),
+			SpilledLookupMatches::Many(vec![adr602_ref(0, 1), adr602_ref(0, 2)])
+		);
+		assert_eq!(
+			legacy.lookup(&JoinKey::Int64(9)).await.expect("lookup"),
+			SpilledLookupMatches::Miss
+		);
+		assert_eq!(legacy.lookup_counts(), Some((2, 1)));
+		assert_eq!(legacy.lookup_inline_hits(), Some(0));
+		legacy.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+
+		// The compact wrapper's `Hash` variant (null-safe keys): `Inline` admitted, every hit
+		// still the cloned `Vec`.
+		let spill_dir = test_spill_dir("adr602_compact_hash");
+		let mut hashed =
+			SpilledInnerJoinBuild::create(budget, Arc::new(BlockingFileOps), spill_dir.clone())
+				.await
+				.expect("create inner spill");
+		hashed.use_compact_resident_index();
+		hashed
+			.use_lookup_form(SpilledLookupForm::Inline)
+			.expect("compact index admits inline");
+		hashed.enable_lookup_counting();
+		hashed
+			.write_batch_chunks(
+				&batch_with_keys(&[1, 2]),
+				JoinKeyPlan::Int64,
+				&keys,
+				true,
+				budget,
+			)
+			.await
+			.expect("write null-safe keys");
+		let arrays = key_arrays(&batch_with_keys(&[1]), &keys).expect("key arrays");
+		let key = join_key_at(JoinKeyPlan::Int64, &arrays, 0, true)
+			.expect("encode null-safe key")
+			.expect("non-null key");
+		assert_eq!(
+			hashed.lookup(&key).await.expect("lookup"),
+			SpilledLookupMatches::Many(vec![adr602_ref(0, 0)])
+		);
+		assert_eq!(hashed.lookup_counts(), Some((1, 0)));
+		assert_eq!(hashed.lookup_inline_hits(), Some(0));
+		hashed.cleanup().await;
+		let _ = std::fs::remove_dir_all(spill_dir);
+	}
+
+	#[test]
+	fn adr602_matches_iterate_exactly_and_stay_fused() {
+		let shapes = [
+			(SpilledLookupMatches::Miss, vec![]),
+			(
+				SpilledLookupMatches::One(adr602_ref(4, 7)),
+				vec![adr602_ref(4, 7)],
+			),
+			(
+				SpilledLookupMatches::Many(vec![adr602_ref(0, 1), adr602_ref(2, 3)]),
+				vec![adr602_ref(0, 1), adr602_ref(2, 3)],
+			),
+		];
+		for (matches, expected) in shapes {
+			assert_eq!(matches.len(), expected.len());
+			assert_eq!(matches.is_empty(), expected.is_empty());
+			let mut iter = matches.into_iter();
+			for (taken, row_ref) in expected.iter().enumerate() {
+				let remaining = expected.len() - taken;
+				assert_eq!(iter.size_hint(), (remaining, Some(remaining)));
+				assert_eq!(iter.next(), Some(*row_ref));
+			}
+			assert_eq!(iter.size_hint(), (0, Some(0)));
+			assert_eq!(iter.next(), None);
+			assert_eq!(iter.next(), None, "fused after exhaustion");
+		}
+		assert_eq!(
+			SpilledLookupMatches::from_vec(Vec::new()),
+			SpilledLookupMatches::Miss
+		);
 	}
 
 	#[tokio::test]
@@ -7978,10 +8345,10 @@ mod tests {
 			.expect("null-safe null key");
 		assert_eq!(
 			null_safe.lookup(&null_key).await.expect("lookup null key"),
-			vec![SpilledBatchRowRef {
+			SpilledLookupMatches::Many(vec![SpilledBatchRowRef {
 				page_index: 0,
 				row: 1,
-			}]
+			}])
 		);
 		null_safe.cleanup().await;
 		let _ = std::fs::remove_dir_all(spill_dir);
@@ -8062,7 +8429,7 @@ mod tests {
 				.lookup(&JoinKey::Int64(2))
 				.await
 				.expect("lookup duplicate key"),
-			vec![
+			SpilledLookupMatches::Many(vec![
 				SpilledBatchRowRef {
 					page_index: 0,
 					row: 1
@@ -8071,7 +8438,7 @@ mod tests {
 					page_index: 0,
 					row: 2
 				}
-			]
+			])
 		);
 		build.cleanup().await;
 		let _ = std::fs::remove_dir_all(spill_dir);

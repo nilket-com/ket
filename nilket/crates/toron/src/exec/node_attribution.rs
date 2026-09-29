@@ -2765,6 +2765,21 @@ fn inner_1_decomposition_band(
 			.cloned()
 			.unwrap_or(serde_json::Value::Null),
 	);
+	// ADR 602: replay 1's lookup form, and under counting the hits returned inline.
+	band.insert(
+		"inner_1_lookup_form".to_string(),
+		lookups
+			.and_then(|value| value.get("form"))
+			.cloned()
+			.unwrap_or(serde_json::Value::Null),
+	);
+	band.insert(
+		"inner_1_lookup_inline_hits".to_string(),
+		lookups
+			.and_then(|value| value.get("inline_hits"))
+			.cloned()
+			.unwrap_or(serde_json::Value::Null),
+	);
 	let term_calls = |name: &str| {
 		present
 			.iter()
@@ -3428,6 +3443,55 @@ fn build_write_band_from_parts(
 		}
 		if inner_1_u64("inner_1_build_spill_bytes") != Some(count("ciphertext_bytes")) {
 			return Some("ciphertext_bytes disagree with inner_1_build_spill_bytes".to_string());
+		}
+		// ADR 602: replay 1's lookup form. Absent (a receipt from before the form) carries no
+		// inline count either. Present, it is `collected` or `inline`, `inline` only on the
+		// compact index; counted, both counts are numeric, the inline hits zero under
+		// `collected` and at most the hits under `inline`; not counted, the inline hits are null.
+		let null = serde_json::Value::Null;
+		let inner_1_value = |name: &str| inner_1_band.get(name).unwrap_or(&null);
+		let inline_hits = inner_1_value("inner_1_lookup_inline_hits");
+		match inner_1_value("inner_1_lookup_form") {
+			serde_json::Value::Null => {
+				if !inline_hits.is_null() {
+					return Some("inline hits without a lookup form".to_string());
+				}
+			}
+			serde_json::Value::String(form) => {
+				let inline = match form.as_str() {
+					"collected" => false,
+					"inline" => true,
+					_ => {
+						return Some(format!("lookup_form {form} is not collected or inline"));
+					}
+				};
+				if inline && index_mode != Some("compact") {
+					return Some(format!(
+						"lookup_form inline with index_mode {}",
+						index_mode.unwrap_or_default()
+					));
+				}
+				if inner_1_value("inner_1_lookups_counted") == &serde_json::json!(true) {
+					let (Some(inline_hits), Some(hits)) =
+						(inline_hits.as_u64(), inner_1_u64("inner_1_lookup_hits"))
+					else {
+						return Some(
+							"counted lookups without numeric hits and inline hits".to_string(),
+						);
+					};
+					if !inline && inline_hits != 0 {
+						return Some("inline hits under the collected lookup form".to_string());
+					}
+					if inline_hits > hits {
+						return Some("inline hits exceed replay 1's hits".to_string());
+					}
+				} else if !inline_hits.is_null() {
+					return Some("inline hits on lookups that were not counted".to_string());
+				}
+			}
+			other => {
+				return Some(format!("lookup_form {other} is not collected or inline"));
+			}
 		}
 		None
 	})();
@@ -5325,6 +5389,122 @@ pub(in crate::exec) mod tests {
 					.unwrap()
 					.contains(needle),
 				"{label}: {}",
+				receipt["build_write_inconsistency"]
+			);
+		}
+	}
+
+	// ADR 602: replay 1's lookup form and inline hits ride the lookup diagnostic onto the
+	// receipt; the form is checked against the index mode and the inline hits against the hits.
+	#[test]
+	fn adr602_receipt_names_the_lookup_form_and_checks_it() {
+		let receipt_for = |mode: &str, entry: serde_json::Value| {
+			let mut invocation = adr586_invocation();
+			adr589_write_bands(&mut invocation);
+			attach_inner_1_band(&mut invocation, [20, 20, 55], [1, 1, 1], spilled_facts());
+			let mut facts = adr597_write_facts("split", false, None);
+			facts["index_mode"] = serde_json::json!(mode);
+			facts["index_variant"] =
+				serde_json::json!(if mode == "compact" { "int64" } else { "hash" });
+			let mut calls = ADR596_CALLS;
+			calls[4] = 3;
+			attach_build_write_band(&mut invocation, ADR596_MICROS, calls, facts);
+			invocation.diagnostics.push(InvocationDiagnostic {
+				name: "inner_replay_lookups",
+				value: serde_json::json!({"replays": [entry]}),
+			});
+			inclusive_lifecycle_receipt_value(&invocation, 1_200)
+		};
+		let receipt = receipt_for(
+			"compact",
+			serde_json::json!({"replay_id": 1, "counted": true, "hits": 400, "misses": 12,
+				"form": "inline", "inline_hits": 390}),
+		);
+		assert_eq!(receipt["build_write_facts_consistent"], true, "{receipt}");
+		assert_eq!(receipt["inner_1_lookup_form"], "inline");
+		assert_eq!(receipt["inner_1_lookup_inline_hits"], 390);
+		let receipt = receipt_for(
+			"compact",
+			serde_json::json!({"replay_id": 1, "counted": false, "hits": null, "misses": null,
+				"form": "collected", "inline_hits": null}),
+		);
+		assert_eq!(receipt["build_write_facts_consistent"], true, "{receipt}");
+		assert_eq!(receipt["inner_1_lookup_form"], "collected");
+		assert_eq!(
+			receipt["inner_1_lookup_inline_hits"],
+			serde_json::Value::Null
+		);
+		// A receipt from before the form: neither the form nor the inline count, consistent.
+		let receipt = receipt_for(
+			"compact",
+			serde_json::json!({"replay_id": 1, "counted": true, "hits": 400, "misses": 12}),
+		);
+		assert_eq!(receipt["build_write_facts_consistent"], true, "{receipt}");
+		assert_eq!(receipt["inner_1_lookup_form"], serde_json::Value::Null);
+		for (mode, entry, needle) in [
+			(
+				"compact",
+				serde_json::json!({"replay_id": 1, "counted": true, "hits": 4, "misses": 0,
+					"form": 7, "inline_hits": 0}),
+				"lookup_form 7 is not collected or inline",
+			),
+			(
+				"compact",
+				serde_json::json!({"replay_id": 1, "counted": true, "hits": 4, "misses": 0,
+					"form": "inline"}),
+				"counted lookups without numeric hits and inline hits",
+			),
+			(
+				"compact",
+				serde_json::json!({"replay_id": 1, "counted": true, "hits": 4, "misses": 0,
+					"form": "inline", "inline_hits": "4"}),
+				"counted lookups without numeric hits and inline hits",
+			),
+			(
+				"compact",
+				serde_json::json!({"replay_id": 1, "counted": false, "hits": null,
+					"misses": null, "form": "inline", "inline_hits": 0}),
+				"inline hits on lookups that were not counted",
+			),
+			(
+				"compact",
+				serde_json::json!({"replay_id": 1, "counted": true, "hits": 4, "misses": 0,
+					"inline_hits": 4}),
+				"inline hits without a lookup form",
+			),
+			(
+				"legacy",
+				serde_json::json!({"replay_id": 1, "counted": true, "hits": 4, "misses": 0,
+					"form": "inline", "inline_hits": 0}),
+				"lookup_form inline with index_mode legacy",
+			),
+			(
+				"compact",
+				serde_json::json!({"replay_id": 1, "counted": true, "hits": 4, "misses": 0,
+					"form": "collected", "inline_hits": 1}),
+				"inline hits under the collected lookup form",
+			),
+			(
+				"compact",
+				serde_json::json!({"replay_id": 1, "counted": true, "hits": 4, "misses": 0,
+					"form": "inline", "inline_hits": 5}),
+				"inline hits exceed replay 1's hits",
+			),
+			(
+				"compact",
+				serde_json::json!({"replay_id": 1, "counted": true, "hits": 4, "misses": 0,
+					"form": "borrowed", "inline_hits": 0}),
+				"lookup_form borrowed is not collected or inline",
+			),
+		] {
+			let receipt = receipt_for(mode, entry);
+			assert_eq!(receipt["build_write_facts_consistent"], false, "{needle}");
+			assert!(
+				receipt["build_write_inconsistency"]
+					.as_str()
+					.unwrap()
+					.contains(needle),
+				"{needle}: {}",
 				receipt["build_write_inconsistency"]
 			);
 		}
