@@ -24167,7 +24167,7 @@ impl Executor {
 			}
 			// ADR 602: the lookup form. Under `Inline` a hit with one ref returns it without an
 			// allocation; `Collected` gathers every hit's refs into a `Vec`.
-			let lookup_form = SpilledLookupForm::Collected;
+			let lookup_form = SpilledLookupForm::Inline;
 			if let Err(error) = spilled.use_lookup_form(lookup_form) {
 				spilled.cleanup().await;
 				return Err(error);
