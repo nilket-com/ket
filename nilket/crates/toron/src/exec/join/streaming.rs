@@ -3640,6 +3640,213 @@ fn reoriented_stage_scan_build_decision_for_materialized_batches(
 	}
 }
 
+/// ADR 606: what the reoriented chain's wrapped arm does with a cap check's batches. `Discard`
+/// keeps only whether the check said `Stream` and re-reads an under-cap stage to build it;
+/// `Reuse` builds an under-cap stage from the check's own batches, through the stage's exchange,
+/// where control would run that exchange through `bound_exchange`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::exec) enum WrappedCapCheckBatches {
+	Discard,
+	Reuse,
+}
+
+/// ADR 606: the one token. Both of the wrapped arm's call sites read it.
+const WRAPPED_CAP_CHECK_BATCHES: WrappedCapCheckBatches = WrappedCapCheckBatches::Discard;
+
+/// ADR 606: how control would execute a stage's build once the cap check has decided, which
+/// decides whether the check's batches can stand in for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::exec) enum WrappedStageBuildPath {
+	/// `Scan` or `Filter(Scan)` with no exchange: the check's batches are the build input.
+	NoExchange,
+	/// An `Exchange` around a `Scan`, or around a `Filter` fully pushed into the scan:
+	/// `execute_bound_node` runs it through `bound_exchange`.
+	BoundExchange { partition_count: u32 },
+	/// An `Exchange` around a `Filter` evaluated in Toron: the executor first attempts the
+	/// streamed join-0 filter exchange. Left on control under `Reuse`.
+	StreamedFilterExchangeAttempt,
+	/// Anything else: the cap check does not scan it.
+	NotDecomposable,
+}
+
+impl WrappedStageBuildPath {
+	pub(in crate::exec) fn of(build: &ExecutionPlan) -> Self {
+		match build {
+			ExecutionPlan::Scan { .. } => Self::NoExchange,
+			ExecutionPlan::Filter { input, .. }
+				if matches!(input.as_ref(), ExecutionPlan::Scan { .. }) =>
+			{
+				Self::NoExchange
+			}
+			ExecutionPlan::Exchange {
+				input,
+				partition_count,
+				..
+			} => match input.as_ref() {
+				ExecutionPlan::Scan { .. } => Self::BoundExchange {
+					partition_count: *partition_count,
+				},
+				ExecutionPlan::Filter {
+					input: filter_input,
+					disposition,
+					..
+				} if matches!(filter_input.as_ref(), ExecutionPlan::Scan { .. }) => match disposition {
+					FilterDisposition::FullyPushed => Self::BoundExchange {
+						partition_count: *partition_count,
+					},
+					FilterDisposition::EvaluateInToron => Self::StreamedFilterExchangeAttempt,
+				},
+				_ => Self::NotDecomposable,
+			},
+			_ => Self::NotDecomposable,
+		}
+	}
+
+	fn name(self) -> &'static str {
+		match self {
+			Self::NoExchange => "no_exchange",
+			Self::BoundExchange { .. } => "bound_exchange",
+			Self::StreamedFilterExchangeAttempt => "streamed_filter_exchange_attempt",
+			Self::NotDecomposable => "not_decomposable",
+		}
+	}
+}
+
+impl ReorientedStageScanBuildDecision {
+	fn name(&self) -> &'static str {
+		match self {
+			Self::Stream => "stream",
+			Self::StreamMaterializedBatches(_) => "stream_materialized_batches",
+			Self::Materialized => "materialized",
+			Self::MaterializedBatches(_) => "materialized_batches",
+		}
+	}
+}
+
+/// ADR 606: the diagnostic per-stage receipt, one JSON line per wrapped-arm stage, when
+/// `TORON_REORIENTED_CAP_CHECK_RECEIPT_PATH` names a file. Diagnostic only: it adds an equivalence
+/// check that re-executes the stage's build, so a receipt run is never a timed run.
+const REORIENTED_CAP_CHECK_RECEIPT_ENV: &str = "TORON_REORIENTED_CAP_CHECK_RECEIPT_PATH";
+
+fn reoriented_cap_check_receipt_path() -> Option<std::path::PathBuf> {
+	std::env::var_os(REORIENTED_CAP_CHECK_RECEIPT_ENV).map(std::path::PathBuf::from)
+}
+
+/// A receipt that cannot be written fails the run: with the receipt requested, a missing line
+/// must never read as evidence.
+fn append_reoriented_cap_check_receipt(
+	path: &std::path::Path,
+	record: &serde_json::Value,
+) -> Result<(), ExecutionError> {
+	use std::io::Write;
+	let mut file = std::fs::OpenOptions::new()
+		.create(true)
+		.append(true)
+		.open(path)
+		.map_err(|error| ExecutionError::InvalidExpression {
+			message: format!("open cap-check receipt {}: {error}", path.display()),
+		})?;
+	writeln!(file, "{record}").map_err(|error| ExecutionError::InvalidExpression {
+		message: format!("write cap-check receipt {}: {error}", path.display()),
+	})
+}
+
+/// ADR 606: the receipt's description of a stage's build, for auditing it against the sealed
+/// plan: the exchange's partition count and key, and the child (scan, or filter and its
+/// disposition) with its table.
+fn reoriented_cap_check_stage_shape(build: &ExecutionPlan) -> serde_json::Value {
+	fn child(plan: &ExecutionPlan) -> serde_json::Value {
+		match plan {
+			ExecutionPlan::Scan { local_table_id, .. } => {
+				serde_json::json!({"node": "scan", "table": format!("{local_table_id:?}")})
+			}
+			ExecutionPlan::Filter {
+				input, disposition, ..
+			} => serde_json::json!({
+				"node": "filter",
+				"disposition": format!("{disposition:?}"),
+				"input": child(input),
+			}),
+			other => serde_json::json!({"node": format!("{:?}", std::mem::discriminant(other))}),
+		}
+	}
+	match build {
+		ExecutionPlan::Exchange {
+			input,
+			partition_count,
+			key,
+		} => {
+			let key_text = format!("{key:?}");
+			serde_json::json!({
+				"node": "exchange",
+				"partition_count": partition_count,
+				"key_fingerprint": format!("{:016x}", {
+					let mut hash = 0xcbf2_9ce4_8422_2325u64;
+					for byte in key_text.as_bytes() {
+						hash ^= u64::from(*byte);
+						hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+					}
+					hash
+				}),
+				"key": key_text.chars().take(400).collect::<String>(),
+				"input": child(input),
+			})
+		}
+		other => child(other),
+	}
+}
+
+/// ADR 606: reused against control, as one verdict: equal batch counts, and for every
+/// corresponding batch the same schema, row count, and canonical digest.
+fn reoriented_cap_check_equivalence(
+	reused: &[RecordBatch],
+	control: &[RecordBatch],
+) -> Result<serde_json::Value, ExecutionError> {
+	let counts_equal = reused.len() == control.len();
+	let schemas_equal = counts_equal
+		&& reused
+			.iter()
+			.zip(control)
+			.all(|(left, right)| left.schema() == right.schema());
+	let reused_signature = exchange_output_signature(reused)?;
+	let control_signature = exchange_output_signature(control)?;
+	let rows_equal = reused_signature.0 == control_signature.0;
+	let digests_equal = reused_signature.1 == control_signature.1;
+	Ok(serde_json::json!({
+		"checked": true,
+		"equivalence_passed": counts_equal && schemas_equal && rows_equal && digests_equal,
+		"batch_counts_equal": counts_equal,
+		"schemas_equal": schemas_equal,
+		"partition_rows_equal": rows_equal,
+		"partition_digests_equal": digests_equal,
+		"batch_counts": [reused.len(), control.len()],
+		"reused_partition_rows": reused_signature.0,
+		"control_partition_rows": control_signature.0,
+	}))
+}
+
+/// Per-partition row counts and canonical digests, for the receipt's equivalence check.
+fn exchange_output_signature(
+	batches: &[RecordBatch],
+) -> Result<(Vec<usize>, Vec<String>), ExecutionError> {
+	let mut rows = Vec::with_capacity(batches.len());
+	let mut digests = Vec::with_capacity(batches.len());
+	for batch in batches {
+		rows.push(batch.num_rows());
+		digests.push(format!(
+			"{:?}",
+			crate::distributed::determinism::canonical_arrow_ipc_digest(
+				std::slice::from_ref(batch),
+				crate::distributed::determinism::SortPolicy::FullRowLex,
+			)
+			.map_err(|error| ExecutionError::InvalidExpression {
+				message: format!("receipt digest: {error:?}"),
+			})?
+		));
+	}
+	Ok((rows, digests))
+}
+
 pub(in crate::exec) enum ReorientedInnerJoinBuild<'a> {
 	InMemory {
 		batch: RecordBatch,
@@ -12512,6 +12719,97 @@ impl Executor {
 		)
 	}
 
+	/// ADR 606: the wrapped arm's decision under `form`. Every outcome but an under-cap
+	/// `MaterializedBatches` on a `bound_exchange` or exchange-free stage keeps control's
+	/// behavior; that one builds from the check's batches through the stage's exchange.
+	async fn reoriented_inner_wrapped_stage_scan_build_decision(
+		&self,
+
+		stage: &ReorientedInnerJoinStage<'_>,
+
+		morsel: Option<(MorselId, u32)>,
+
+		form: WrappedCapCheckBatches,
+	) -> Result<ReorientedStageScanBuildDecision, ExecutionError> {
+		let receipt = reoriented_cap_check_receipt_path();
+		if form == WrappedCapCheckBatches::Discard && receipt.is_none() {
+			return Ok(
+				if self
+					.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(stage, morsel)
+					.await?
+				{
+					ReorientedStageScanBuildDecision::Stream
+				} else {
+					ReorientedStageScanBuildDecision::Materialized
+				},
+			);
+		}
+		let path = WrappedStageBuildPath::of(stage.build);
+		let decision = self
+			.reoriented_inner_stage_scan_build_decision(stage, morsel)
+			.await?;
+		let decision_name = decision.name();
+		let exchange = match stage.build {
+			ExecutionPlan::Exchange {
+				input,
+				partition_count,
+				key,
+			} => Some((*partition_count, key, input.schema())),
+			_ => None,
+		};
+		let reusable = matches!(
+			path,
+			WrappedStageBuildPath::NoExchange | WrappedStageBuildPath::BoundExchange { .. }
+		);
+		let reused_batches = match (&decision, reusable) {
+			(ReorientedStageScanBuildDecision::MaterializedBatches(batches), true) => {
+				Some(match &exchange {
+					Some((partition_count, key, schema)) => self.exchange_input_batches(
+						batches.clone(),
+						schema.clone(),
+						*partition_count,
+						key,
+					)?,
+					None => batches.clone(),
+				})
+			}
+			_ => None,
+		};
+		if let Some(receipt) = receipt {
+			// The equivalence check re-executes the build as control would, diagnostic only.
+			let equivalence = match &reused_batches {
+				Some(reused) => {
+					let control = self.execute_bound_node(stage.build, morsel).await?;
+					reoriented_cap_check_equivalence(reused, &control)?
+				}
+				None => serde_json::json!({"checked": false, "equivalence_passed": null}),
+			};
+			append_reoriented_cap_check_receipt(
+				&receipt,
+				&serde_json::json!({
+					"kind": "reoriented_cap_check_stage",
+					"form": format!("{form:?}"),
+					"replay_id": stage.replay_id.0,
+					"decision": decision_name,
+					"control_path": path.name(),
+					"shape": reoriented_cap_check_stage_shape(stage.build),
+					"partition_count": exchange.as_ref().map(|(count, _, _)| *count),
+					"reused": form == WrappedCapCheckBatches::Reuse && reused_batches.is_some(),
+					"equivalence": equivalence,
+				}),
+			)?;
+		}
+		Ok(match (form, decision, reused_batches) {
+			(_, ReorientedStageScanBuildDecision::Stream, _) => {
+				ReorientedStageScanBuildDecision::Stream
+			}
+			(WrappedCapCheckBatches::Reuse, _, Some(reused)) => {
+				ReorientedStageScanBuildDecision::MaterializedBatches(reused)
+			}
+			_ => ReorientedStageScanBuildDecision::Materialized,
+		})
+	}
+
 	async fn reoriented_inner_stage_scan_build_exceeds_scan_output_cap(
 		&self,
 
@@ -17235,14 +17533,12 @@ impl Executor {
 				) {
 				ReorientedStageScanBuildDecision::Stream
 			} else if aggregate_input_wrapped {
-				if self
-					.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(&stage, morsel)
-					.await?
-				{
-					ReorientedStageScanBuildDecision::Stream
-				} else {
-					ReorientedStageScanBuildDecision::Materialized
-				}
+				self.reoriented_inner_wrapped_stage_scan_build_decision(
+					&stage,
+					morsel,
+					WRAPPED_CAP_CHECK_BATCHES,
+				)
+				.await?
 			} else {
 				self.reoriented_inner_stage_scan_build_decision(&stage, morsel)
 					.await?
@@ -17413,16 +17709,12 @@ impl Executor {
 						) {
 						ReorientedStageScanBuildDecision::Stream
 					} else if aggregate_input_wrapped {
-						if self
-							.reoriented_inner_stage_scan_build_exceeds_scan_output_cap(
-								&stage, morsel,
-							)
-							.await?
-						{
-							ReorientedStageScanBuildDecision::Stream
-						} else {
-							ReorientedStageScanBuildDecision::Materialized
-						}
+						self.reoriented_inner_wrapped_stage_scan_build_decision(
+							&stage,
+							morsel,
+							WRAPPED_CAP_CHECK_BATCHES,
+						)
+						.await?
 					} else {
 						self.reoriented_inner_stage_scan_build_decision(&stage, morsel)
 							.await?
@@ -37999,6 +38291,368 @@ mod tests {
 			.expect("finish spill");
 
 		spilled
+	}
+
+	// ADR 606: the wrapped arm's cap-check batches reused for the build, through the stage's own
+	// exchange where control would run it through `bound_exchange`.
+
+	fn adr606_executor(batches: Vec<RecordBatch>) -> Executor {
+		let storage = Arc::new(RecordingMultiBatchTableStorageScan {
+			batches: HashMap::from([(TableId(6), batches)]),
+
+			requested_tables: Arc::new(Mutex::new(Vec::new())),
+		});
+		Executor::with_context(
+			storage,
+			ExecutionContext::local_test().with_task_budget(TaskBudget {
+				memory: ByteCount::new(256 * 1024 * 1024),
+
+				spill_bytes: ByteCount::new(256 * 1024 * 1024),
+
+				..TaskBudget::from_query_budget(QueryBudget::test_default())
+			}),
+		)
+	}
+
+	fn adr606_schema() -> SchemaRef {
+		Arc::new(Schema::new(vec![
+			Field::new("build_key", DataType::Int64, false),
+			Field::new("build_value", DataType::Int64, false),
+			Field::new("keep", DataType::Boolean, false),
+		]))
+	}
+
+	fn adr606_batch(keys: &[i64]) -> RecordBatch {
+		RecordBatch::try_new(
+			adr606_schema(),
+			vec![
+				Arc::new(Int64Array::from(keys.to_vec())),
+				Arc::new(Int64Array::from(
+					keys.iter().map(|key| key * 10).collect::<Vec<_>>(),
+				)),
+				Arc::new(arrow::array::BooleanArray::from(
+					keys.iter().map(|key| key % 2 == 0).collect::<Vec<_>>(),
+				)),
+			],
+		)
+		.expect("adr606 batch")
+	}
+
+	fn adr606_exchange(input: ExecutionPlan, partition_count: u32) -> ExecutionPlan {
+		ExecutionPlan::Exchange {
+			input: Box::new(input),
+
+			partition_count,
+
+			key: bound_column_root("build_key", ColumnOrdinal(0), DataType::Int64, false),
+		}
+	}
+
+	fn adr606_filter(disposition: FilterDisposition) -> ExecutionPlan {
+		ExecutionPlan::Filter {
+			input: Box::new(test_scan_plan_with_first_field_key(
+				TableId(6),
+				adr606_schema(),
+				6,
+			)),
+
+			predicate: bound_column_root("keep", ColumnOrdinal(2), DataType::Boolean, false),
+
+			disposition,
+		}
+	}
+
+	#[test]
+	fn adr606_the_build_path_is_classified_by_what_control_would_execute() {
+		let scan = || test_scan_plan_with_first_field_key(TableId(6), adr606_schema(), 6);
+		assert_eq!(
+			WrappedStageBuildPath::of(&scan()),
+			WrappedStageBuildPath::NoExchange
+		);
+		assert_eq!(
+			WrappedStageBuildPath::of(&adr606_filter(FilterDisposition::EvaluateInToron)),
+			WrappedStageBuildPath::NoExchange
+		);
+		assert_eq!(
+			WrappedStageBuildPath::of(&adr606_exchange(scan(), 4)),
+			WrappedStageBuildPath::BoundExchange { partition_count: 4 }
+		);
+		assert_eq!(
+			WrappedStageBuildPath::of(&adr606_exchange(
+				adr606_filter(FilterDisposition::FullyPushed),
+				4
+			)),
+			WrappedStageBuildPath::BoundExchange { partition_count: 4 },
+			"a fully pushed filter falls through to bound_exchange"
+		);
+		assert_eq!(
+			WrappedStageBuildPath::of(&adr606_exchange(
+				adr606_filter(FilterDisposition::EvaluateInToron),
+				4
+			)),
+			WrappedStageBuildPath::StreamedFilterExchangeAttempt
+		);
+		assert_eq!(
+			WrappedStageBuildPath::of(&adr606_exchange(adr606_exchange(scan(), 2), 4)),
+			WrappedStageBuildPath::NotDecomposable
+		);
+	}
+
+	#[tokio::test]
+	async fn adr606_reuse_builds_what_bound_exchange_would_build() {
+		let probe_schema = Arc::new(Schema::new(vec![Field::new(
+			"probe_key",
+			DataType::Int64,
+			false,
+		)]));
+		let output_schema = concat_test_schema(&probe_schema, &adr606_schema());
+		// Two rows across four partitions leave at least two partitions empty.
+		for (label, batches) in [
+			("rows", vec![adr606_batch(&[1]), adr606_batch(&[2])]),
+			("empty input", Vec::new()),
+		] {
+			for build in [
+				adr606_exchange(
+					test_scan_plan_with_first_field_key(TableId(6), adr606_schema(), 6),
+					4,
+				),
+				adr606_exchange(adr606_filter(FilterDisposition::FullyPushed), 4),
+			] {
+				let executor = adr606_executor(batches.clone());
+				let stage = reoriented_scan_build_stage(
+					&build,
+					probe_schema.clone(),
+					output_schema.clone(),
+				);
+				let reused = match executor
+					.reoriented_inner_wrapped_stage_scan_build_decision(
+						&stage,
+						None,
+						WrappedCapCheckBatches::Reuse,
+					)
+					.await
+					.expect("reuse decision")
+				{
+					ReorientedStageScanBuildDecision::MaterializedBatches(reused) => reused,
+					other => panic!("{label}: expected reused batches, got {}", other.name()),
+				};
+				let control = executor
+					.execute_bound_node(&build, None)
+					.await
+					.expect("control build");
+				assert_eq!(reused.len(), 4, "{label}: one batch per partition");
+				assert_eq!(control.len(), 4, "{label}");
+				assert!(
+					reused
+						.iter()
+						.zip(&control)
+						.all(|(left, right)| left.schema() == right.schema())
+				);
+				assert_eq!(
+					exchange_output_signature(&reused).unwrap(),
+					exchange_output_signature(&control).unwrap(),
+					"{label}: per-partition rows and digests"
+				);
+				if label == "rows" {
+					assert!(
+						reused.iter().any(|batch| batch.num_rows() == 0),
+						"an empty partition"
+					);
+					assert_eq!(reused.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+				}
+				// Discard keeps control's behavior: the stage is re-read.
+				assert!(matches!(
+					executor
+						.reoriented_inner_wrapped_stage_scan_build_decision(
+							&stage,
+							None,
+							WrappedCapCheckBatches::Discard,
+						)
+						.await
+						.expect("discard decision"),
+					ReorientedStageScanBuildDecision::Materialized
+				));
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn adr606_a_streamed_filter_exchange_stage_stays_on_control() {
+		let probe_schema = Arc::new(Schema::new(vec![Field::new(
+			"probe_key",
+			DataType::Int64,
+			false,
+		)]));
+		let output_schema = concat_test_schema(&probe_schema, &adr606_schema());
+		let executor = adr606_executor(vec![adr606_batch(&[1, 2, 3, 4])]);
+		let build = adr606_exchange(adr606_filter(FilterDisposition::EvaluateInToron), 4);
+		let stage = reoriented_scan_build_stage(&build, probe_schema, output_schema);
+		for form in [
+			WrappedCapCheckBatches::Discard,
+			WrappedCapCheckBatches::Reuse,
+		] {
+			assert!(
+				matches!(
+					executor
+						.reoriented_inner_wrapped_stage_scan_build_decision(&stage, None, form)
+						.await
+						.expect("decision"),
+					ReorientedStageScanBuildDecision::Materialized
+				),
+				"{form:?}"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn adr606_a_reused_stage_builds_the_join_state_control_builds() {
+		let probe_schema = Arc::new(Schema::new(vec![Field::new(
+			"probe_key",
+			DataType::Int64,
+			false,
+		)]));
+		let output_schema = concat_test_schema(&probe_schema, &adr606_schema());
+		let probe = RecordBatch::try_new(
+			probe_schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![3, 1, 9, 2, 3]))],
+		)
+		.expect("probe batch");
+		let executor = adr606_executor(vec![adr606_batch(&[1, 2, 3]), adr606_batch(&[3, 4])]);
+		for build in [
+			adr606_exchange(
+				test_scan_plan_with_first_field_key(TableId(6), adr606_schema(), 6),
+				4,
+			),
+			adr606_exchange(adr606_filter(FilterDisposition::FullyPushed), 4),
+		] {
+			let stage =
+				|| reoriented_scan_build_stage(&build, probe_schema.clone(), output_schema.clone());
+			let ReorientedStageScanBuildDecision::MaterializedBatches(reused) = executor
+				.reoriented_inner_wrapped_stage_scan_build_decision(
+					&stage(),
+					None,
+					WrappedCapCheckBatches::Reuse,
+				)
+				.await
+				.expect("reuse decision")
+			else {
+				panic!("expected reused batches");
+			};
+			let mut reused_runtime = executor
+				.prepare_reoriented_inner_join_runtime_from_build_batches(stage(), reused)
+				.await
+				.expect("reused runtime")
+				.expect("reused build prepares");
+			let mut control_runtime = executor
+				.prepare_reoriented_inner_join_runtime(stage(), None)
+				.await
+				.expect("control runtime")
+				.expect("control build prepares");
+			assert_eq!(
+				reused_runtime.key_plan, control_runtime.key_plan,
+				"key plan"
+			);
+			let reused_output = executor
+				.probe_reoriented_inner_join_streaming(&mut reused_runtime, &probe)
+				.await
+				.expect("reused probe");
+			let control_output = executor
+				.probe_reoriented_inner_join_streaming(&mut control_runtime, &probe)
+				.await
+				.expect("control probe");
+			let rows =
+				|batches: &[RecordBatch]| batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+			assert_eq!(rows(&reused_output), rows(&control_output));
+			assert_eq!(
+				rows(&reused_output),
+				6,
+				"probe 3 (twice) meets build 3 (twice): 4; probe 1 and 2: 1 each; probe 9: none"
+			);
+			assert_eq!(
+				canonical_arrow_ipc_digest(&reused_output, SortPolicy::FullRowLex).expect("digest"),
+				canonical_arrow_ipc_digest(&control_output, SortPolicy::FullRowLex)
+					.expect("digest"),
+				"the same join output from the same build state"
+			);
+		}
+	}
+
+	#[test]
+	fn adr606_the_equivalence_verdict_fails_on_any_component() {
+		let partitions = vec![adr606_batch(&[1]), adr606_batch(&[2])];
+		let verdict = |left: &[RecordBatch], right: &[RecordBatch]| {
+			reoriented_cap_check_equivalence(left, right).expect("equivalence")["equivalence_passed"]
+				.clone()
+		};
+		assert_eq!(verdict(&partitions, &partitions), true);
+		assert_eq!(
+			verdict(&partitions, &partitions[..1]),
+			false,
+			"batch counts"
+		);
+		assert_eq!(verdict(&partitions, &[]), false, "one side empty");
+		let swapped = vec![adr606_batch(&[2]), adr606_batch(&[1])];
+		assert_eq!(
+			verdict(&partitions, &swapped),
+			false,
+			"per-partition digests"
+		);
+		let other_schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+		let other = vec![
+			RecordBatch::try_new(
+				other_schema.clone(),
+				vec![Arc::new(Int64Array::from(vec![1]))],
+			)
+			.unwrap(),
+			RecordBatch::try_new(other_schema, vec![Arc::new(Int64Array::from(vec![2]))]).unwrap(),
+		];
+		assert_eq!(verdict(&partitions, &other), false, "schemas");
+	}
+
+	#[test]
+	fn adr606_the_receipt_names_the_shape_and_fails_when_unwritable() {
+		let build = adr606_exchange(adr606_filter(FilterDisposition::FullyPushed), 4);
+		let shape = reoriented_cap_check_stage_shape(&build);
+		assert_eq!(shape["node"], "exchange");
+		assert_eq!(shape["partition_count"], 4);
+		assert!(
+			shape["key_fingerprint"]
+				.as_str()
+				.is_some_and(|value| value.len() == 16)
+		);
+		assert_eq!(shape["input"]["node"], "filter");
+		assert_eq!(shape["input"]["disposition"], "FullyPushed");
+		assert_eq!(shape["input"]["input"]["node"], "scan");
+		let missing = std::path::Path::new("/nonexistent-adr606-dir/receipt.jsonl");
+		assert!(append_reoriented_cap_check_receipt(missing, &serde_json::json!({})).is_err());
+	}
+
+	#[test]
+	fn adr606_only_an_under_cap_decision_on_a_reusable_path_is_reused() {
+		// The decision thresholds themselves are unchanged.
+		let batches = vec![adr606_batch(&[1])];
+		assert!(matches!(
+			reoriented_stage_scan_build_decision_for_materialized_batches(
+				10,
+				5,
+				8,
+				batches.clone()
+			),
+			ReorientedStageScanBuildDecision::Stream
+		));
+		assert!(matches!(
+			reoriented_stage_scan_build_decision_for_materialized_batches(
+				5,
+				10,
+				8,
+				batches.clone()
+			),
+			ReorientedStageScanBuildDecision::StreamMaterializedBatches(_)
+		));
+		assert!(matches!(
+			reoriented_stage_scan_build_decision_for_materialized_batches(5, 5, 8, batches),
+			ReorientedStageScanBuildDecision::MaterializedBatches(_)
+		));
 	}
 
 	fn reoriented_scan_build_stage(

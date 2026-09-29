@@ -110,6 +110,7 @@ impl StatementClock for SystemStatementClock {
 
 mod aggregate;
 mod density;
+mod exchange;
 mod expr;
 mod input_processing;
 mod join;
@@ -1260,30 +1261,7 @@ impl Executor {
 		}
 
 		let input_batches = self.execute_bound_node(input, morsel).await?;
-		let schema = input.schema();
-		let partition_count_usize =
-			usize::try_from(partition_count).expect("partition count fits usize");
-		let mut partition_batches: Vec<Vec<RecordBatch>> =
-			(0..partition_count_usize).map(|_| Vec::new()).collect();
-
-		// Accumulated in a local, then recorded once: no per-batch locking or allocation
-		// inside the timed path.
-		let repartition_started = Instant::now();
-		for batch in input_batches {
-			for (partition, partitioned) in
-				self.repartition_exchange_batch(&batch, partition_count, key)?
-			{
-				partition_batches[partition].push(partitioned);
-			}
-		}
-		let finalized = finalize_exchange_partitions(schema, partition_batches);
-		join::record_task_telemetry(&self.context.task_telemetry, |task| {
-			task.phases.exchange_repartition_micros = task
-				.phases
-				.exchange_repartition_micros
-				.saturating_add(join::duration_micros(repartition_started));
-		});
-		finalized
+		self.exchange_input_batches(input_batches, input.schema(), partition_count, key)
 	}
 
 	fn repartition_exchange_batch(

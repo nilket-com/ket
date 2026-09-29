@@ -1993,7 +1993,16 @@ fn run_lifecycle_decomposition_driver_in(
 			arms,
 			&journal,
 			|run_index, warmup, arm| {
-				run_adr597_child(arm, run_index, warmup, mode, sf, data_source, &data_dir)
+				run_adr597_child(
+					arm,
+					run_index,
+					warmup,
+					&coordinate.expectation.query,
+					mode,
+					sf,
+					data_source,
+					&data_dir,
+				)
 			},
 		)?,
 		None => {
@@ -2814,6 +2823,7 @@ fn adr597_load_arms(
 	adr588_manifest_gate(&control.manifest, &treatment.manifest)?;
 	let expectation = |arm: &Adr588Arm| Adr592ChildExpectation {
 		label,
+		query: String::new(),
 		instrumented: arm.manifest.clone(),
 		instrumented_manifest_path: arm.manifest_path.display().to_string(),
 		dataset_manifest_fingerprint: String::new(),
@@ -2834,6 +2844,7 @@ fn run_adr597_child(
 	arm: &Adr588Arm,
 	run_index: u32,
 	warmup: bool,
+	query: &str,
 	mode: &str,
 	sf: f64,
 	data_source: &str,
@@ -2844,7 +2855,7 @@ fn run_adr597_child(
 		"--engine".to_string(),
 		"toron".to_string(),
 		"--query".to_string(),
-		"q21".to_string(),
+		query.to_string(),
 		"--mode".to_string(),
 		mode.to_string(),
 		"--sf".to_string(),
@@ -2877,6 +2888,7 @@ fn adr597_arm_expectation(
 ) -> Adr592ChildExpectation {
 	Adr592ChildExpectation {
 		label: coordinate.expectation.label,
+		query: coordinate.expectation.query.clone(),
 		instrumented: arm.instrumented.clone(),
 		instrumented_manifest_path: arm.instrumented_manifest_path.clone(),
 		dataset_manifest_fingerprint: coordinate.expectation.dataset_manifest_fingerprint.clone(),
@@ -6120,6 +6132,9 @@ struct Adr592SealedBaseline {
 	artifact_sha256: String,
 	dataset_manifest_fingerprint: String,
 	cpu_affinity_requested: String,
+	/// ADR 606: the query whose sealed cell this is. The two fields below keep their q21 names
+	/// from ADR 592 (retained receipts carry them); for another query they hold that query's cell.
+	query: String,
 	q21_toron_execute_ms_median: f64,
 	q21_toron_digest: String,
 }
@@ -6135,6 +6150,7 @@ impl Adr592SealedBaseline {
 			"artifact_sha256": self.artifact_sha256,
 			"dataset_manifest_fingerprint": self.dataset_manifest_fingerprint,
 			"cpu_affinity_requested": self.cpu_affinity_requested,
+			"query": self.query,
 			"q21_toron_execute_ms_median": self.q21_toron_execute_ms_median,
 			"q21_toron_digest": self.q21_toron_digest,
 		})
@@ -6143,7 +6159,7 @@ impl Adr592SealedBaseline {
 
 /// Read and verify the sealed manifest at `path`: sealed with final authority, its artifact
 /// present and hashing to what the manifest claims, and carrying a passing q21 Toron cell.
-fn adr592_load_sealed_baseline(path: &Path) -> Result<Adr592SealedBaseline, String> {
+fn adr592_load_sealed_baseline(path: &Path, query: &str) -> Result<Adr592SealedBaseline, String> {
 	let manifest = toron_tpch::evidence::RunEvidenceManifest::read(path)
 		.map_err(|error| format!("ADR 592 sealed manifest {}: {error}", path.display()))?;
 	let artifact_sha256 = toron_tpch::evidence::sha256_file(&manifest.artifact_path)
@@ -6156,6 +6172,7 @@ fn adr592_load_sealed_baseline(path: &Path) -> Result<Adr592SealedBaseline, Stri
 		&artifact_sha256,
 		&header,
 		&summaries,
+		query,
 	)
 }
 
@@ -6165,6 +6182,7 @@ fn adr592_bind_sealed_baseline(
 	artifact_sha256_observed: &str,
 	header: &serde_json::Value,
 	summaries: &[serde_json::Value],
+	query: &str,
 ) -> Result<Adr592SealedBaseline, String> {
 	if manifest.seal_state != toron_tpch::evidence::SealState::Sealed || !manifest.final_authority {
 		return Err(format!(
@@ -6244,24 +6262,25 @@ fn adr592_bind_sealed_baseline(
 		.iter()
 		.find(|row| {
 			row.get("engine").and_then(serde_json::Value::as_str) == Some("toron")
-				&& row.get("query").and_then(serde_json::Value::as_str) == Some("q21")
+				&& row.get("query").and_then(serde_json::Value::as_str) == Some(query)
 		})
-		.ok_or_else(|| "ADR 592 baseline artifact has no q21 Toron cell".to_string())?;
+		.ok_or_else(|| format!("ADR 592 baseline artifact has no {query} Toron cell"))?;
 	if cell.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
-		return Err("ADR 592 baseline q21 Toron cell did not pass".to_string());
+		return Err(format!("ADR 592 baseline {query} Toron cell did not pass"));
 	}
 	let q21_toron_execute_ms_median = cell
 		.get("execute_ms_median")
 		.and_then(serde_json::Value::as_f64)
 		.filter(|value| value.is_finite() && *value > 0.0)
-		.ok_or_else(|| "ADR 592 baseline q21 Toron cell lacks a finite median".to_string())?;
+		.ok_or_else(|| format!("ADR 592 baseline {query} Toron cell lacks a finite median"))?;
 	let q21_toron_digest = cell
 		.get("digest")
 		.and_then(serde_json::Value::as_str)
 		.filter(|value| !value.is_empty())
 		.map(str::to_string)
-		.ok_or_else(|| "ADR 592 baseline q21 Toron cell lacks a digest".to_string())?;
+		.ok_or_else(|| format!("ADR 592 baseline {query} Toron cell lacks a digest"))?;
 	Ok(Adr592SealedBaseline {
+		query: query.to_string(),
 		manifest_path: manifest_path.to_string(),
 		source_tree_id: manifest.build.source_tree_id.clone(),
 		executable_sha256: manifest.build.toron.sha256.clone(),
@@ -6283,6 +6302,8 @@ fn adr592_bind_sealed_baseline(
 #[derive(Debug, Clone, PartialEq)]
 struct Adr592ChildExpectation {
 	label: &'static str,
+	/// ADR 606: the query every child row must be; q21 unless the driver was given `--query`.
+	query: String,
 	/// The current instrumented executable's manifest: every child must have run from it.
 	instrumented: BuildManifest,
 	instrumented_manifest_path: String,
@@ -6338,8 +6359,11 @@ fn adr592_validate_child_row(
 	if text("status") != Some("pass") {
 		return Err(format!("{label} child row did not pass: {row}"));
 	}
-	if text("query") != Some("q21") || text("engine") != Some("toron") {
-		return Err(format!("{label} child row is not a q21 Toron row"));
+	if text("query") != Some(expected.query.as_str()) || text("engine") != Some("toron") {
+		return Err(format!(
+			"{label} child row is not a {} Toron row",
+			expected.query
+		));
 	}
 	if text("mode") != Some("strict")
 		|| row.get("scale_factor").and_then(serde_json::Value::as_f64) != Some(8.0)
@@ -6462,9 +6486,17 @@ fn adr592_driver_coordinate(
 	let affinity = toron_tpch::affinity::affinity_coordinate();
 	let launched_manifest = std::env::var(toron_tpch::evidence::BUILD_MANIFEST_ENV)
 		.map_err(|_| format!("{label} must run through toron-bench run with a build manifest"))?;
+	// ADR 606: the query the pair runs, q21 unless named. Another query needs a sealed board
+	// whose cell it is, since the pre-592 fallback digest is q21's.
+	let query = flag_value(args, "--query").unwrap_or("q21");
+	if query != "q21" && flag_value(args, "--sealed-manifest").is_none() {
+		return Err(format!(
+			"{label} --query {query} requires --sealed-manifest with a sealed {query} cell"
+		));
+	}
 	let baseline = match flag_value(args, "--sealed-manifest") {
 		Some(path) => {
-			let baseline = adr592_load_sealed_baseline(Path::new(path))?;
+			let baseline = adr592_load_sealed_baseline(Path::new(path), query)?;
 			adr592_bind_driver_coordinate(
 				label,
 				&baseline,
@@ -6491,6 +6523,7 @@ fn adr592_driver_coordinate(
 	Ok(Adr592DriverCoordinate {
 		expectation: Adr592ChildExpectation {
 			label,
+			query: query.to_string(),
 			instrumented: identity.manifest.clone(),
 			instrumented_manifest_path: launched_manifest.clone(),
 			dataset_manifest_fingerprint: dataset_manifest_fingerprint.to_string(),
@@ -6876,7 +6909,7 @@ fn adr592_revalidate(args: &[String]) -> Result<(serde_json::Value, bool), Strin
 	let arm_tag = flag_value(args, "--arm-tag")
 		.ok_or_else(|| "adr592-revalidate requires --arm-tag adr584_arm|adr585_arm".to_string())?;
 	let launched_manifest = flag_value(args, "--launched-manifest").unwrap_or(instrumented_path);
-	let baseline = adr592_load_sealed_baseline(Path::new(sealed))?;
+	let baseline = adr592_load_sealed_baseline(Path::new(sealed), "q21")?;
 	let instrumented = BuildManifest::read(Path::new(instrumented_path))?;
 	let text =
 		std::fs::read_to_string(samples).map_err(|error| format!("read {samples}: {error}"))?;
@@ -6909,6 +6942,7 @@ fn adr592_revalidate(args: &[String]) -> Result<(serde_json::Value, bool), Strin
 	)?;
 	let expected = Adr592ChildExpectation {
 		label: "adr592-revalidate",
+		query: baseline.query.clone(),
 		instrumented: instrumented.clone(),
 		instrumented_manifest_path: launched_manifest.to_string(),
 		dataset_manifest_fingerprint: baseline.dataset_manifest_fingerprint.clone(),
@@ -20740,7 +20774,14 @@ mod adr592_tests {
 		header: &serde_json::Value,
 		summaries: &[serde_json::Value],
 	) -> Result<Adr592SealedBaseline, String> {
-		adr592_bind_sealed_baseline("/boards/sealed", manifest, observed, header, summaries)
+		adr592_bind_sealed_baseline(
+			"/boards/sealed",
+			manifest,
+			observed,
+			header,
+			summaries,
+			"q21",
+		)
 	}
 
 	#[test]
@@ -21011,6 +21052,7 @@ mod adr592_tests {
 			let manifest_path = PathBuf::from(format!("/manifests/{name}.manifest"));
 			let expectation = Adr592ChildExpectation {
 				label: "ADR 597",
+				query: "q21".to_string(),
 				instrumented: manifest.clone(),
 				instrumented_manifest_path: manifest_path.display().to_string(),
 				dataset_manifest_fingerprint: String::new(),
@@ -21279,6 +21321,7 @@ mod adr592_tests {
 	fn expectation() -> Adr592ChildExpectation {
 		Adr592ChildExpectation {
 			label: "ADR 584",
+			query: "q21".to_string(),
 			instrumented: manifest("3", "7"),
 			instrumented_manifest_path: "/manifests/instrumented.manifest".to_string(),
 			dataset_manifest_fingerprint: "fnv1a64:0fc5c06d19c5ed23".to_string(),
@@ -21318,6 +21361,51 @@ mod adr592_tests {
 				"recipe_sha256": expected.instrumented.recipe_digest,
 			},
 		})
+	}
+
+	// ADR 606: `--query` names which sealed cell binds, and the validator holds every child
+	// to that query, so a q05 pair can neither bind q21's cell nor accept a q21 row.
+	#[test]
+	fn adr606_the_named_query_binds_its_own_cell_and_refuses_other_rows() {
+		let manifest = sealed_manifest();
+		let hash = "f".repeat(64);
+		let mut summaries = sealed_summaries();
+		summaries.push(
+			serde_json::json!({"engine": "toron", "query": "q05", "status": "pass",
+			"execute_ms_median": 4321.5, "digest": "q05-digest"}),
+		);
+		let baseline = adr592_bind_sealed_baseline(
+			"/boards/sealed",
+			&manifest,
+			&hash,
+			&sealed_header(),
+			&summaries,
+			"q05",
+		)
+		.unwrap();
+		assert_eq!(baseline.query, "q05");
+		assert_eq!(baseline.q21_toron_execute_ms_median, 4321.5);
+		assert_eq!(baseline.q21_toron_digest, "q05-digest");
+		assert_eq!(baseline.json_value()["query"], "q05");
+		let error = adr592_bind_sealed_baseline(
+			"/boards/sealed",
+			&manifest,
+			&hash,
+			&sealed_header(),
+			&sealed_summaries(),
+			"q05",
+		)
+		.unwrap_err();
+		assert!(error.contains("no q05 Toron cell"), "{error}");
+
+		let mut expected = expectation();
+		expected.query = "q05".to_string();
+		let error =
+			adr592_validate_child_row(&child_row(&expected, true), &expected, true).unwrap_err();
+		assert!(error.contains("is not a q05 Toron row"), "{error}");
+		let mut row = child_row(&expected, true);
+		row["query"] = serde_json::json!("q05");
+		adr592_validate_child_row(&row, &expected, true).expect("a q05 row passes");
 	}
 
 	// The one validator runs on every child, the warmup included, and each refusal changes
