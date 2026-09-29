@@ -137,6 +137,8 @@ async fn run() -> ExitCode {
 		"memory-panels-summary" => memory_panels_summary_command(&args),
 		// ADR 604: Toron's plan and costs beside DuckDB's profiled operator tree, one cell.
 		"structural-census" => structural_census_command(&args).await,
+		// ADR 605: scan work per table on both engines, and the local bridge's ablation effect.
+		"scan-work-census" => scan_work_census_command(&args),
 		"adr597-reevaluate" => adr597_reevaluate_command(&args),
 		"adr596-q21-build-write" => adr596_q21_build_write_command(&args),
 		"adr596-reevaluate" => adr596_reevaluate_command(&args),
@@ -12361,43 +12363,378 @@ async fn structural_census_command(args: &[String]) -> ExitCode {
 	}
 }
 
-async fn structural_census(args: &[String]) -> Result<PathBuf, String> {
+/// ADR 605: scan work on both engines for one cell, at the sealed anchor's coordinate. T2 is a
+/// profiled Toron execution with the scan progress file, node attribution, and the reservoir
+/// residency profile; T3 is the same with the local runtime-filter bridge ablated; D2 is DuckDB
+/// with `OPERATOR_ROWS_SCANNED`. All diagnostic; nothing is compared with a board median.
+fn scan_work_census_command(args: &[String]) -> ExitCode {
+	match scan_work_census(args) {
+		Ok(path) => {
+			println!("{}", path.display());
+			ExitCode::SUCCESS
+		}
+		Err(message) => harness_error(&message),
+	}
+}
+
+fn scan_work_census(args: &[String]) -> Result<PathBuf, String> {
+	let CensusPrelude {
+		query_id,
+		mode,
+		data_source,
+		data_dir,
+		sf,
+		output_dir,
+		anchor_path,
+		anchor_sha256,
+		anchor_rows,
+		coordinate,
+		export,
+		duckdb_bin,
+	} = census_prelude("scan-work-census", args)?;
+	let anchor_cell = |engine: &str| -> Vec<&serde_json::Value> {
+		anchor_rows
+			.iter()
+			.filter(|row| {
+				row.get("query").and_then(serde_json::Value::as_str) == Some(query_id)
+					&& row.get("engine").and_then(serde_json::Value::as_str) == Some(engine)
+					&& row.get("warmup").and_then(serde_json::Value::as_bool) == Some(false)
+			})
+			.collect()
+	};
+	let distinct = |rows: &[&serde_json::Value], field: &str| -> BTreeSet<String> {
+		rows.iter()
+			.filter_map(|row| row.get(field))
+			.map(|value| {
+				value
+					.as_str()
+					.map_or_else(|| value.to_string(), str::to_string)
+			})
+			.collect()
+	};
+	let anchor_toron = anchor_cell("toron");
+	let anchor_duckdb = anchor_cell("duckdb");
+	let anchor_toron_digests = distinct(&anchor_toron, "digest");
+	let anchor_toron_fingerprints = distinct(&anchor_toron, "plan_fingerprint");
+	let anchor_duckdb_digests = distinct(&anchor_duckdb, "duckdb_result_sha256");
+	let anchor_memory_observed = distinct(&anchor_duckdb, "duckdb_memory_limit_observed");
+
+	// T2 and T3: the same profiled Toron execution, with and without the local bridge. Each carries
+	// the progress stream, the ledger (to reconcile the stream with), node attribution, and the
+	// reservoir residency profile.
+	let toron_run = |label: &str, ablate: bool| -> Result<serde_json::Value, String> {
+		let progress = output_dir.join(format!("{label}_scan_progress.jsonl"));
+		let attribution = output_dir.join(format!("{label}_node_attribution.json"));
+		let residency = output_dir.join(format!("{label}_reservoir_residency.json"));
+		let (progress_text, attribution_text, residency_text) = (
+			progress.display().to_string(),
+			attribution.display().to_string(),
+			residency.display().to_string(),
+		);
+		let mut envs = vec![
+			("TORON_TPCH_PARQUET_SCAN_LEDGER", "1"),
+			(
+				"TORON_TPCH_PARQUET_SCAN_PROGRESS_PATH",
+				progress_text.as_str(),
+			),
+			(
+				"TORON_NODE_ATTRIBUTION_PROFILE_PATH",
+				attribution_text.as_str(),
+			),
+			(
+				"TORON_GROUPED_RESERVOIR_RESIDENCY_PROFILE_PATH",
+				residency_text.as_str(),
+			),
+		];
+		if ablate {
+			envs.push(("TORON_ABLATE_LOCAL_RUNTIME_FILTER", "1"));
+		}
+		let row = run_perf_child_with_envs(query_id, &mode, sf, 0, &data_source, &data_dir, &envs)?;
+		// The progress stream, folded fail-closed and reconciled with the ledger's receipt. A
+		// failure is kept and named, and the run's scan work is withheld.
+		let progress_fold = std::fs::read_to_string(&progress)
+			.map_err(|error| format!("read {}: {error}", progress.display()))
+			.and_then(|jsonl| toron_tpch::census::fold_scan_progress(&jsonl))
+			.and_then(|scans| {
+				toron_tpch::census::reconcile_progress_with_receipt(
+					&scans,
+					row.get("parquet_scan_receipt"),
+				)
+				.map(|()| scans)
+			});
+		let (scans, scan_work_error) = match progress_fold {
+			Ok(scans) => (Some(scans), None),
+			Err(error) => (None, Some(error)),
+		};
+		let tables = scans.as_deref().map(toron_tpch::census::toron_table_work);
+		let residency_profile = match std::fs::read_to_string(&residency) {
+			Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+				.unwrap_or_else(|error| serde_json::json!({"unparsed": error.to_string()})),
+			Err(_) => {
+				serde_json::json!({"absent": "no residency profile was written for this run"})
+			}
+		};
+		let digest = row.get("digest").map(|value| {
+			value
+				.as_str()
+				.map_or_else(|| value.to_string(), str::to_string)
+		});
+		Ok(serde_json::json!({
+			"execution": if ablate {
+				"Toron perf-run-one child, TORON_ABLATE_LOCAL_RUNTIME_FILTER=1"
+			} else {
+				"Toron perf-run-one child, local runtime-filter bridge as by default"
+			},
+			"status": row.get("status"),
+			"digest": digest,
+			"digest_matches_anchor": digest.as_ref().is_some_and(|digest| {
+				anchor_toron_digests.len() == 1 && anchor_toron_digests.contains(digest)
+			}),
+			"plan_fingerprint": row.get("plan_fingerprint"),
+			"route": row
+				.get("node_attribution")
+				.and_then(|profile| profile.get("aggregate_invocations"))
+				.and_then(serde_json::Value::as_array)
+				.map(|invocations| {
+					invocations
+						.iter()
+						.filter_map(|invocation| invocation.get("route"))
+						.cloned()
+						.collect::<Vec<_>>()
+				}),
+			"node_attribution_present": row
+				.get("node_attribution")
+				.is_some_and(serde_json::Value::is_object),
+			"parquet_scan_receipt": row.get("parquet_scan_receipt"),
+			"scan_work_valid": scan_work_error.is_none(),
+			"scan_work_error": scan_work_error,
+			"scans": scans,
+			"tables": tables,
+			"reservoir_residency": residency_profile,
+		}))
+	};
+	let t2 = toron_run("t2", false)?;
+	let t3 = toron_run("t3", true)?;
+
+	// D2: DuckDB with the scan-work counter.
+	let temp_directory = fresh_duckdb_temp_directory()?;
+	let d2_profile_path = output_dir.join("d2_profile.json");
+	let d2 = run_duckdb_script(
+		&duckdb_bin,
+		&format!(
+			".mode json\n{}{}{DUCKDB_MEMORY_LIMIT_READ_BACK}\nSET custom_profiling_settings={};\n\
+			 SET enable_profiling='json';\nSET profiling_output={};\n{}\n",
+			duckdb_setup_sql(&export),
+			duckdb_temp_directory_sql(&temp_directory),
+			sql_string_literal(toron_tpch::census::DUCKDB_SCAN_WORK_PROFILE_SETTINGS),
+			sql_string_literal(&d2_profile_path.display().to_string()),
+			duckdb_query_statement(&export.sql)
+		),
+	);
+	let _ = std::fs::remove_dir_all(&temp_directory);
+	let d2 = d2?;
+	if !d2.status_success {
+		return Err(format!(
+			"scan-work-census {query_id}: D2 failed: {:?}",
+			d2.stderr
+		));
+	}
+	let d2_arrays = extract_json_arrays(&d2.stdout);
+	let d2_result = duckdb_query_result(&d2_arrays)
+		.ok_or_else(|| format!("scan-work-census {query_id}: D2 returned no result"))?;
+	let d2_digest = duckdb_result_sha256(d2_result)?;
+	let d2_profile = toron_tpch::census::parse_duckdb_operator_profile(
+		&serde_json::from_str(
+			&std::fs::read_to_string(&d2_profile_path)
+				.map_err(|error| format!("read {}: {error}", d2_profile_path.display()))?,
+		)
+		.map_err(|error| format!("parse {}: {error}", d2_profile_path.display()))?,
+	)?;
+	let (duckdb_tables, duckdb_unpaired, d2_scan_work_error) =
+		match toron_tpch::census::duckdb_table_work(&d2_profile) {
+			Ok((tables, unpaired)) => (tables, unpaired, None),
+			Err(error) => (BTreeMap::new(), Vec::new(), Some(error)),
+		};
+	let d2_memory_observed = duckdb_memory_limit_read_back(&d2_arrays);
+
+	// Identity, the per-table comparison, and the ablation reading.
+	let run_tables =
+		|run: &serde_json::Value| -> BTreeMap<String, toron_tpch::census::TableScanWork> {
+			serde_json::from_value(run["tables"].clone()).unwrap_or_default()
+		};
+	let t2_tables = run_tables(&t2);
+	let t3_tables = run_tables(&t3);
+	let fingerprint =
+		|run: &serde_json::Value| run["plan_fingerprint"].as_str().map(str::to_string);
+	let t2_fingerprint = fingerprint(&t2);
+	let fingerprints_agree = t2_fingerprint.is_some()
+		&& t2_fingerprint == fingerprint(&t3)
+		&& anchor_toron_fingerprints.len() == 1
+		&& anchor_toron_fingerprints.contains(t2_fingerprint.as_deref().unwrap_or_default());
+	let run_ok = |run: &serde_json::Value| {
+		run["status"].as_str() == Some("pass")
+			&& run["digest_matches_anchor"] == true
+			&& run["scan_work_valid"] == true
+			&& run["node_attribution_present"] == true
+	};
+	let t2_ok = run_ok(&t2);
+	let t3_ok = run_ok(&t3);
+	let d2_digest_matches =
+		anchor_duckdb_digests.len() == 1 && anchor_duckdb_digests.contains(&d2_digest);
+	let d2_memory_matches = d2_memory_observed.as_ref().is_some_and(|observed| {
+		anchor_memory_observed.len() == 1 && anchor_memory_observed.contains(observed)
+	});
+	let d2_ok = d2_digest_matches && d2_memory_matches && d2_scan_work_error.is_none();
+	let mut excluded = Vec::new();
+	for (failed, reason) in [
+		(!t2_ok, "t2_failed_digest_scan_work_or_attribution"),
+		(!t3_ok, "t3_failed_digest_scan_work_or_attribution"),
+		(!d2_digest_matches, "d2_digest_differs_from_anchor_duckdb"),
+		(
+			!d2_memory_matches,
+			"d2_memory_limit_read_back_differs_from_anchor",
+		),
+		(d2_scan_work_error.is_some(), "d2_scan_work_refused"),
+	] {
+		if failed {
+			excluded.push(reason);
+		}
+	}
+	let ablation = toron_tpch::census::ablation_readings(
+		t2_ok && t3_ok && fingerprints_agree,
+		&t2_tables,
+		&t3_tables,
+	);
+	let tables = t2_tables
+		.keys()
+		.chain(duckdb_tables.keys())
+		.cloned()
+		.collect::<BTreeSet<_>>()
+		.into_iter()
+		.map(|table| {
+			let toron = t2_tables.get(&table);
+			let duckdb = duckdb_tables.get(&table);
+			let (reading, visited_ratio) =
+				toron_tpch::census::visited_comparison(t2_ok && d2_ok, toron, duckdb);
+			let fraction = |work: Option<&toron_tpch::census::TableScanWork>| {
+				work.and_then(|work| {
+					(work.rows_visited > 0)
+						.then(|| work.rows_emitted as f64 / work.rows_visited as f64)
+				})
+			};
+			serde_json::json!({
+				"table": table,
+				"toron_t2": toron,
+				"toron_t3": t3_tables.get(&table),
+				"duckdb_d2": duckdb,
+				"visited_ratio_toron_over_duckdb": visited_ratio,
+				"visited_reading": reading,
+				"toron_emitted_fraction": fraction(toron),
+				"duckdb_emitted_fraction": fraction(duckdb),
+				"ablation": ablation.get(&table),
+			})
+		})
+		.collect::<Vec<_>>();
+	let artifact = serde_json::json!({
+		"kind": "scan_work_census_cell",
+		"query": query_id,
+		"coordinate": coordinate,
+		"sealed_anchor": {"path": anchor_path, "sha256": anchor_sha256},
+		// The visited-rows comparison needs T2 and D2; the planned cell is complete only with T3.
+		"scan_comparison_valid": t2_ok && d2_ok,
+		"cell_complete": excluded.is_empty(),
+		"excluded_reasons": excluded,
+		"d2_scan_work_error": d2_scan_work_error,
+		"ablation_identity": {
+			"t2_ok": t2_ok,
+			"t3_ok": t3_ok,
+			"fingerprints_agree_t2_t3_anchor": fingerprints_agree,
+		},
+		"measures": {
+			"rows_visited": "Toron raw_rows (decoded parquet batches before Toron's row mask) / \
+				DuckDB OPERATOR_ROWS_SCANNED: the closest visited-row counters, compared \
+				operationally; their accounting is not proven identical",
+			"rows_emitted": "Toron output_rows / DuckDB OPERATOR_CARDINALITY: each engine's own \
+				reduction only, never cross-engine scan work",
+			"decoded_bytes": "Toron only (decoded Arrow bytes, not file bytes)",
+			"file_bytes_per_scan": "unavailable on both engines",
+			"duckdb_total_bytes_read": "query-level only",
+			"progress_end_rule": "the lazy scan path emits no scan_end; a scan without one is \
+				marked end_not_emitted_by_lazy_path, and completeness rests on reconciling the \
+				progress fold with the ledger's receipt, both describing the batches consumed",
+		},
+		"tables": tables,
+		"duckdb_unpaired_scans": duckdb_unpaired,
+		"duckdb_total_bytes_read": d2_profile.total_bytes_read,
+		"toron": {"t2": t2, "t3": t3},
+		"duckdb": {
+			"d2_result_sha256": d2_digest,
+			"d2_memory_limit_observed": d2_memory_observed,
+			"d2": d2_profile,
+		},
+	});
+	let path = output_dir.join("scan_work_census.json");
+	std::fs::write(
+		&path,
+		serde_json::to_string_pretty(&artifact).map_err(|error| error.to_string())?,
+	)
+	.map_err(|error| format!("write {}: {error}", path.display()))?;
+	Ok(path)
+}
+
+/// ADR 604/605: what every census command establishes before it executes anything: one query,
+/// a fresh output directory, the sealed anchor bound by its SHA-256, and the selected coordinate
+/// checked field by field against the anchor's header.
+struct CensusPrelude {
+	query_id: &'static str,
+	mode: String,
+	data_source: String,
+	data_dir: PathBuf,
+	sf: f64,
+	output_dir: PathBuf,
+	anchor_path: String,
+	anchor_sha256: String,
+	anchor_rows: Vec<serde_json::Value>,
+	coordinate: serde_json::Value,
+	export: toron_tpch::TpchParquetExport,
+	duckdb_bin: String,
+}
+
+fn census_prelude(command: &str, args: &[String]) -> Result<CensusPrelude, String> {
 	let query_id = perf_query_list(
-		flag_value(args, "--query")
-			.ok_or_else(|| "structural-census requires --query".to_string())?,
+		flag_value(args, "--query").ok_or_else(|| format!("{command} requires --query"))?,
 	)?;
 	let [query_id] = query_id.as_slice() else {
-		return Err("structural-census takes one query".to_string());
+		return Err(format!("{command} takes one query"));
 	};
 	let query_id = *query_id;
 	let mode = flag_value(args, "--mode").unwrap_or("strict");
 	let data_source = flag_value(args, "--data-source").unwrap_or("parquet");
 	if !matches!(data_source, "parquet" | "persisted") {
-		return Err("structural-census: persisted parquet only".to_string());
+		return Err(format!("{command}: persisted parquet only"));
 	}
 	let data_dir = data_dir_from_args(args);
-	let sf = explicit_sf(args)?.ok_or_else(|| "structural-census requires --sf".to_string())?;
+	let sf = explicit_sf(args)?.ok_or_else(|| format!("{command} requires --sf"))?;
 	let output_dir = PathBuf::from(
 		flag_value(args, "--output-dir")
-			.ok_or_else(|| "structural-census requires --output-dir".to_string())?,
+			.ok_or_else(|| format!("{command} requires --output-dir"))?,
 	);
-	let anchor_path = flag_value(args, "--anchor").ok_or_else(|| {
-		"structural-census requires --anchor <sealed perf_board.jsonl>".to_string()
-	})?;
+	let anchor_path = flag_value(args, "--anchor")
+		.ok_or_else(|| format!("{command} requires --anchor <sealed perf_board.jsonl>"))?;
 	// The anchor is bound to the sealed artifact by content, before any of it is used.
 	let anchor_sha256_expected = flag_value(args, "--anchor-sha256").ok_or_else(|| {
-		"structural-census requires --anchor-sha256 <the sealed artifact's sha256>".to_string()
+		format!("{command} requires --anchor-sha256 <the sealed artifact's sha256>")
 	})?;
 	let anchor_sha256 = toron_tpch::evidence::sha256_file(Path::new(anchor_path))?;
 	if anchor_sha256 != anchor_sha256_expected {
 		return Err(format!(
-			"structural-census: anchor {anchor_path} has sha256 {anchor_sha256}, not the sealed \
+			"{command}: anchor {anchor_path} has sha256 {anchor_sha256}, not the sealed \
 			 {anchor_sha256_expected}"
 		));
 	}
 	if output_dir.exists() {
 		return Err(format!(
-			"structural-census output {} must be fresh",
+			"{command} output {} must be fresh",
 			output_dir.display()
 		));
 	}
@@ -12451,10 +12788,44 @@ async fn structural_census(args: &[String]) -> Result<PathBuf, String> {
 	let mismatches = toron_tpch::census::coordinate_mismatches(&coordinate, sealed_header);
 	if !mismatches.is_empty() {
 		return Err(format!(
-			"structural-census {query_id}: coordinate differs from the sealed header: {}",
+			"{command} {query_id}: coordinate differs from the sealed header: {}",
 			mismatches.join(", ")
 		));
 	}
+
+	Ok(CensusPrelude {
+		query_id,
+		mode: mode.to_string(),
+		data_source: data_source.to_string(),
+		data_dir,
+		sf,
+		output_dir,
+		anchor_path: anchor_path.to_string(),
+		anchor_sha256,
+		anchor_rows,
+		coordinate,
+		export,
+		duckdb_bin,
+	})
+}
+
+async fn structural_census(args: &[String]) -> Result<PathBuf, String> {
+	let CensusPrelude {
+		query_id,
+		mode,
+		data_source,
+		data_dir,
+		sf,
+		output_dir,
+		anchor_path,
+		anchor_sha256,
+		anchor_rows,
+		coordinate,
+		export,
+		duckdb_bin,
+	} = census_prelude("structural-census", args)?;
+	let (mode, data_source, anchor_path) =
+		(mode.as_str(), data_source.as_str(), anchor_path.as_str());
 
 	// The plan (no execution) and T1.
 	let toron_plan =

@@ -65,12 +65,22 @@ code trace):
   filtered stage. Whether another stage can be is not decidable from the
   code.
 
-**Pairing scans by table.** Toron's ledger names each scan's table.
-DuckDB's scan operators do not. For TPC-H they are identified by their
-projected columns, whose prefixes are unique to a table (`l_` lineitem,
-`o_` orders, `c_` customer, `s_` supplier, `n_` nation, `r_` region, `p_`
-part, `ps_` partsupp). A DuckDB scan whose columns do not resolve to one
-table is reported as unpaired.
+**Pairing scans by table.** Toron's scan records name each scan's
+table. A DuckDB scan is assigned to a table by its single file
+(`Filename(s)` in its extra info, for example `…/lineitem.parquet`), when
+that file's stem is a TPC-H table and its projected columns, if any,
+carry the same table's prefix. Otherwise it is assigned by its projected
+columns alone, when every prefix names one table (`l_` lineitem, `o_`
+orders, `c_` customer, `s_` supplier, `n_` nation, `r_` region, `p_`
+part, `ps_` partsupp). A scan that resolves to no table, or whose file
+and columns disagree, is reported unpaired. (Amended before
+implementation closure: the file key was found in DuckDB's extra info.)
+
+**Completeness.** A missing `OPERATOR_ROWS_SCANNED` on any DuckDB scan,
+or a profile with no scan operator, refuses DuckDB's table work rather
+than reading zero. T3's failure is its own named exclusion. The
+visited-rows comparison is labelled valid when T2 and D2 pass, and the
+cell is labelled complete only when T3 passes too.
 
 
 ## Decision
@@ -84,14 +94,24 @@ ablated, to see what the bridge itself changes.**
 604's binding: the sealed anchor by SHA-256, the selected coordinate
 field by field, and the digest checks. Executions, each named:
 
-- **T2: the Toron profiled execution,** a `perf-run-one` child with the
-  parquet scan ledger in its lazy mode (the timed path's scan model
-  unchanged), node attribution, and the grouped reservoir residency
-  profile. The child row gains a per-table breakdown of the ledger when
-  the ledger is enabled: for each table, rows visited (`raw_rows`), rows
-  emitted (`output_rows`), decoded bytes, batches, and whether a pushed
-  predicate was present. That field is diagnostic-only and appears only
-  when the ledger is on.
+- **T2: the Toron profiled execution,** a `perf-run-one` child with node
+  attribution, the grouped reservoir residency profile, and two scan
+  records, both diagnostic-only and both leaving the timed path's scan
+  model unchanged. (Amended before implementation closure: the per-table
+  and per-scan work comes from the scan progress stream,
+  `TORON_TPCH_PARQUET_SCAN_PROGRESS_PATH`, rather than a new ledger
+  field.)
+  - The progress stream carries `scan_start` (table, pushed predicate,
+    and now whether a runtime filter was present), one `batch` per batch
+    (rows visited, rows emitted, decoded bytes), and `scan_end` on the
+    eager path. It is folded fail-closed: numeric batch fields, one start
+    per scan, no batch or end after an end, no batch before a start. The
+    lazy path emits no `scan_end`, so a scan without one is marked
+    `end_not_emitted_by_lazy_path`, not refused.
+  - The lazy parquet scan ledger (`TORON_TPCH_PARQUET_SCAN_LEDGER`) runs
+    alongside, and its receipt is reconciled with the fold on batches,
+    raw rows, and raw bytes. Both describe the batches the execution
+    consumed. A disagreement withholds the cell's visited-row reading.
 - **T3: the same execution with `TORON_ABLATE_LOCAL_RUNTIME_FILTER=1`.**
   Same measures. T3's digest must also match the anchor's, or the cell
   is reported and left out.

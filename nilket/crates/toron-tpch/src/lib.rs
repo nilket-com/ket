@@ -1868,6 +1868,8 @@ impl StorageScan for ParquetHarnessScan {
 			"pbc_predicate_bytes": pbc.as_ref().map(Vec::len),
 			"pbc_referenced_columns": pbc_referenced_columns.clone(),
 			"parquet_read_columns": parquet_read_columns,
+			// ADR 605: whether the request carried a runtime filter (applied after decode).
+			"runtime_filter_present": runtime_filter_present,
 			"output_column_count": output_schema.fields().len(),
 			"inflated_to_full_schema": pbc.is_some()
 				&& pbc_projection

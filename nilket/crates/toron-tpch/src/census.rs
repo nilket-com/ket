@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The profiler settings for D1: operator metrics plus the query's latency and CPU time.
 pub const DUCKDB_OPERATOR_PROFILE_SETTINGS: &str = r#"{"OPERATOR_TIMING": "true", "OPERATOR_CARDINALITY": "true", "OPERATOR_TYPE": "true", "OPERATOR_NAME": "true", "CPU_TIME": "true", "LATENCY": "true", "ROWS_RETURNED": "true", "EXTRA_INFO": "true"}"#;
@@ -71,6 +71,8 @@ pub struct DuckDbOperator {
 	pub kind: Option<&'static str>,
 	pub operator_timing_seconds: f64,
 	pub operator_cardinality: u64,
+	/// ADR 605: `OPERATOR_ROWS_SCANNED`, when the profile was asked for it.
+	pub operator_rows_scanned: Option<u64>,
 	pub extra_info: serde_json::Value,
 }
 
@@ -80,6 +82,8 @@ pub struct DuckDbOperatorProfile {
 	pub latency_seconds: f64,
 	pub root_cpu_time_seconds: f64,
 	pub rows_returned: u64,
+	/// ADR 605: `TOTAL_BYTES_READ`, query-level only, when the profile was asked for it.
+	pub total_bytes_read: Option<u64>,
 	pub operators: Vec<DuckDbOperator>,
 	/// `operator_timing` summed per Toron kind; unmapped types are kept apart, by name.
 	pub timing_by_kind_seconds: BTreeMap<&'static str, f64>,
@@ -132,6 +136,9 @@ pub fn parse_duckdb_operator_profile(
 				.get("operator_cardinality")
 				.and_then(serde_json::Value::as_u64)
 				.ok_or_else(|| "DuckDB operator has no operator_cardinality".to_string())?,
+			operator_rows_scanned: node
+				.get("operator_rows_scanned")
+				.and_then(serde_json::Value::as_u64),
 			extra_info: node.get("extra_info").cloned().unwrap_or_default(),
 		});
 		for child in node
@@ -170,6 +177,9 @@ pub fn parse_duckdb_operator_profile(
 		latency_seconds,
 		root_cpu_time_seconds,
 		rows_returned,
+		total_bytes_read: profile
+			.get("total_bytes_read")
+			.and_then(serde_json::Value::as_u64),
 		operators,
 		timing_by_kind_seconds,
 		unmapped_timing_seconds,
@@ -376,6 +386,361 @@ pub fn toron_join_table(join_order_edges: &str, t1_rows_emitted: usize) -> Vec<T
 				},
 				raw: edge.to_string(),
 			}
+		})
+		.collect()
+}
+
+/// ADR 605: D2's profiler settings: ADR 604's operator metrics plus the scan-work counter and the
+/// query-level bytes read (DuckDB 1.5.4 has no per-operator bytes metric).
+pub const DUCKDB_SCAN_WORK_PROFILE_SETTINGS: &str = r#"{"OPERATOR_TIMING": "true", "OPERATOR_CARDINALITY": "true", "OPERATOR_ROWS_SCANNED": "true", "OPERATOR_TYPE": "true", "OPERATOR_NAME": "true", "CPU_TIME": "true", "LATENCY": "true", "ROWS_RETURNED": "true", "TOTAL_BYTES_READ": "true", "EXTRA_INFO": "true"}"#;
+
+/// TPC-H column prefixes, each unique to one table.
+const TPCH_COLUMN_PREFIXES: [(&str, &str); 8] = [
+	("ps_", "partsupp"),
+	("l_", "lineitem"),
+	("o_", "orders"),
+	("c_", "customer"),
+	("s_", "supplier"),
+	("n_", "nation"),
+	("r_", "region"),
+	("p_", "part"),
+];
+
+/// The table a scan's projected columns name: `Some(Some(t))` when every column carries table
+/// `t`'s TPC-H prefix, `Some(None)` when they do not agree, `None` when there are no projections.
+fn projected_table(extra_info: &serde_json::Value) -> Option<Option<&'static str>> {
+	let columns: Vec<&str> = match extra_info.get("Projections")? {
+		serde_json::Value::String(column) => vec![column.as_str()],
+		serde_json::Value::Array(columns) => columns
+			.iter()
+			.filter_map(serde_json::Value::as_str)
+			.collect(),
+		_ => return Some(None),
+	};
+	let mut tables = columns.iter().map(|column| {
+		TPCH_COLUMN_PREFIXES
+			.iter()
+			.find(|(prefix, _)| column.starts_with(prefix))
+			.map(|(_, table)| *table)
+	});
+	let Some(Some(first)) = tables.next() else {
+		return Some(None);
+	};
+	Some(tables.all(|table| table == Some(first)).then_some(first))
+}
+
+/// ADR 605: the table a DuckDB scan reads. Its single file's stem, when that stem is a TPC-H table
+/// and its projected columns, if any, name the same table; else the projected columns alone, when
+/// they name one table; otherwise `None`, and the scan is reported unpaired.
+pub fn duckdb_scan_table(extra_info: &serde_json::Value) -> Option<String> {
+	let projected = projected_table(extra_info);
+	if let Some(file) = extra_info
+		.get("Filename(s)")
+		.and_then(serde_json::Value::as_str)
+	{
+		if file.contains(',') {
+			return None;
+		}
+		let stem = std::path::Path::new(file.trim())
+			.file_stem()
+			.and_then(|stem| stem.to_str())?;
+		let known = TPCH_COLUMN_PREFIXES
+			.iter()
+			.find(|(_, table)| *table == stem)
+			.map(|(_, table)| *table)?;
+		return match projected {
+			None => Some(known.to_string()),
+			Some(Some(table)) if table == known => Some(known.to_string()),
+			Some(_) => None,
+		};
+	}
+	projected.flatten().map(str::to_string)
+}
+
+/// One Toron scan, folded from the parquet scan progress events of one execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ToronScan {
+	pub scan_id: u64,
+	pub table: String,
+	pub runtime_filter_present: Option<bool>,
+	pub pushed_predicate: bool,
+	pub batches: u64,
+	pub raw_rows: u64,
+	pub output_rows: u64,
+	pub raw_bytes: u64,
+	/// `ended` when the scan emitted `scan_end`; `end_not_emitted_by_lazy_path` otherwise.
+	pub end: &'static str,
+}
+
+/// Fold `TORON_TPCH_PARQUET_SCAN_PROGRESS_PATH` events (`scan_start`, `batch`, `scan_end`) into
+/// scans by `scan_id`, failing closed: every batch carries numeric `raw_rows`, `output_rows`, and
+/// `raw_bytes`; a scan starts once and ends at most once; no batch follows its end, or precedes its
+/// start. The lazy scan path emits no `scan_end` (only the eager path does), so a scan without one
+/// is marked `end_not_emitted_by_lazy_path`, not refused; its completeness is checked instead by
+/// reconciling the fold with the parquet scan ledger's totals.
+pub fn fold_scan_progress(jsonl: &str) -> Result<Vec<ToronScan>, String> {
+	let mut scans = BTreeMap::<u64, ToronScan>::new();
+	for (line_number, line) in jsonl.lines().enumerate() {
+		if line.trim().is_empty() {
+			continue;
+		}
+		let at = line_number + 1;
+		let event: serde_json::Value = serde_json::from_str(line)
+			.map_err(|error| format!("scan progress line {at}: {error}"))?;
+		let scan_id = event
+			.get("scan_id")
+			.and_then(serde_json::Value::as_u64)
+			.ok_or_else(|| format!("scan progress line {at} has no scan_id"))?;
+		let number = |name: &str| {
+			event
+				.get(name)
+				.and_then(serde_json::Value::as_u64)
+				.ok_or_else(|| format!("scan progress line {at}: batch without a numeric {name}"))
+		};
+		match event.get("event").and_then(serde_json::Value::as_str) {
+			Some("scan_start") => {
+				if scans.contains_key(&scan_id) {
+					return Err(format!(
+						"scan progress line {at}: scan {scan_id} started twice"
+					));
+				}
+				let table = event
+					.get("table_name")
+					.and_then(serde_json::Value::as_str)
+					.ok_or_else(|| format!("scan progress line {at}: start without a table"))?
+					.to_string();
+				scans.insert(
+					scan_id,
+					ToronScan {
+						scan_id,
+						table,
+						runtime_filter_present: event
+							.get("runtime_filter_present")
+							.and_then(serde_json::Value::as_bool),
+						pushed_predicate: event
+							.get("pbc_predicate_bytes")
+							.is_some_and(|bytes| !bytes.is_null()),
+						end: "end_not_emitted_by_lazy_path",
+						..ToronScan::default()
+					},
+				);
+			}
+			Some(kind @ ("batch" | "scan_end")) => {
+				let scan = scans.get_mut(&scan_id).ok_or_else(|| {
+					format!("scan progress line {at}: {kind} for scan {scan_id} that never started")
+				})?;
+				if scan.end == "ended" {
+					return Err(format!(
+						"scan progress line {at}: {kind} after scan {scan_id} ended"
+					));
+				}
+				if kind == "batch" {
+					scan.batches += 1;
+					scan.raw_rows += number("raw_rows")?;
+					scan.output_rows += number("output_rows")?;
+					scan.raw_bytes += number("raw_bytes")?;
+				} else {
+					scan.end = "ended";
+				}
+			}
+			other => return Err(format!("scan progress line {at}: unknown event {other:?}")),
+		}
+	}
+	Ok(scans.into_values().collect())
+}
+
+/// ADR 605: the progress fold against the parquet scan ledger's receipt from the same execution.
+/// Both count the batches the execution consumed (a stream stopped early is described by both at
+/// that boundary); any disagreement in batches, raw rows, or raw bytes withholds the cell's
+/// visited-row reading.
+pub fn reconcile_progress_with_receipt(
+	scans: &[ToronScan],
+	receipt: Option<&serde_json::Value>,
+) -> Result<(), String> {
+	let receipt = receipt.ok_or_else(|| "no parquet scan receipt to reconcile with".to_string())?;
+	let field = |name: &str| {
+		receipt
+			.get(name)
+			.and_then(serde_json::Value::as_u64)
+			.ok_or_else(|| format!("parquet scan receipt has no numeric {name}"))
+	};
+	for (name, progress) in [
+		(
+			"batches",
+			scans.iter().map(|scan| scan.batches).sum::<u64>(),
+		),
+		("rows", scans.iter().map(|scan| scan.raw_rows).sum::<u64>()),
+		(
+			"raw_bytes",
+			scans.iter().map(|scan| scan.raw_bytes).sum::<u64>(),
+		),
+	] {
+		let ledger = field(name)?;
+		if ledger != progress {
+			return Err(format!(
+				"scan progress and ledger disagree on {name}: progress {progress}, ledger {ledger}"
+			));
+		}
+	}
+	Ok(())
+}
+
+/// One table's scan work on one engine, summed over its scans.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableScanWork {
+	pub scans: u64,
+	/// Toron `raw_rows` / DuckDB `OPERATOR_ROWS_SCANNED`: the closest visited-row counters.
+	pub rows_visited: u64,
+	/// Toron `output_rows` / DuckDB `OPERATOR_CARDINALITY`: rows the scans emitted.
+	pub rows_emitted: u64,
+	/// Toron's decoded bytes; none for DuckDB, which reports bytes read only per query.
+	pub decoded_bytes: Option<u64>,
+	pub scans_with_runtime_filter: Option<u64>,
+}
+
+pub fn toron_table_work(scans: &[ToronScan]) -> BTreeMap<String, TableScanWork> {
+	let mut tables = BTreeMap::<String, TableScanWork>::new();
+	for scan in scans {
+		let work = tables.entry(scan.table.clone()).or_default();
+		work.scans += 1;
+		work.rows_visited += scan.raw_rows;
+		work.rows_emitted += scan.output_rows;
+		*work.decoded_bytes.get_or_insert(0) += scan.raw_bytes;
+		if let Some(present) = scan.runtime_filter_present {
+			*work.scans_with_runtime_filter.get_or_insert(0) += u64::from(present);
+		}
+	}
+	tables
+}
+
+/// DuckDB's scans summed per table, with the scans that resolve to no table kept apart. Refused
+/// when the profile has no scan operator, or when any scan lacks `OPERATOR_ROWS_SCANNED`: a missing
+/// counter is never read as zero rows visited.
+pub fn duckdb_table_work(
+	profile: &DuckDbOperatorProfile,
+) -> Result<(BTreeMap<String, TableScanWork>, Vec<DuckDbOperator>), String> {
+	let scans = profile
+		.operators
+		.iter()
+		.filter(|operator| {
+			matches!(
+				operator.operator_type.as_str(),
+				"TABLE_SCAN" | "READ_PARQUET"
+			)
+		})
+		.collect::<Vec<_>>();
+	if scans.is_empty() {
+		return Err("DuckDB profile has no scan operator".to_string());
+	}
+	let mut tables = BTreeMap::<String, TableScanWork>::new();
+	let mut unpaired = Vec::new();
+	for operator in scans {
+		let rows_scanned = operator.operator_rows_scanned.ok_or_else(|| {
+			format!(
+				"DuckDB scan {} has no operator_rows_scanned",
+				operator.operator_name
+			)
+		})?;
+		match duckdb_scan_table(&operator.extra_info) {
+			Some(table) => {
+				let work = tables.entry(table).or_default();
+				work.scans += 1;
+				work.rows_visited += rows_scanned;
+				work.rows_emitted += operator.operator_cardinality;
+			}
+			None => unpaired.push(operator.clone()),
+		}
+	}
+	Ok((tables, unpaired))
+}
+
+/// ADR 605's predeclared triage flag on per-table visited rows: a ratio above 2× in either
+/// direction is flagged, a smaller difference is not. It names where to look; it is not a cause
+/// and has no savings interpretation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisitedReading {
+	DuckDbFewerFlagged,
+	ToronFewerFlagged,
+	Unflagged,
+	/// One side visited no rows where the other did: no finite ratio.
+	OneSideZero,
+}
+
+pub fn visited_reading(toron_visited: u64, duckdb_visited: u64) -> VisitedReading {
+	match (toron_visited, duckdb_visited) {
+		(0, 0) => VisitedReading::Unflagged,
+		(0, _) | (_, 0) => VisitedReading::OneSideZero,
+		(toron, duckdb) if toron > duckdb.saturating_mul(2) => VisitedReading::DuckDbFewerFlagged,
+		(toron, duckdb) if duckdb > toron.saturating_mul(2) => VisitedReading::ToronFewerFlagged,
+		_ => VisitedReading::Unflagged,
+	}
+}
+
+/// ADR 605: one table's visited-row comparison. Both the reading and the ratio are withheld unless
+/// the cell's scan comparison is valid (T2 and D2 both passed); a table only one engine scanned is
+/// `unpaired_table`. The raw per-engine work is kept elsewhere for diagnosis either way.
+pub fn visited_comparison(
+	scan_comparison_valid: bool,
+	toron: Option<&TableScanWork>,
+	duckdb: Option<&TableScanWork>,
+) -> (serde_json::Value, Option<f64>) {
+	match (scan_comparison_valid, toron, duckdb) {
+		(false, _, _) => (serde_json::json!("withheld"), None),
+		(true, Some(toron), Some(duckdb)) => (
+			serde_json::json!(visited_reading(toron.rows_visited, duckdb.rows_visited)),
+			(duckdb.rows_visited > 0)
+				.then(|| toron.rows_visited as f64 / duckdb.rows_visited as f64),
+		),
+		_ => (serde_json::json!("unpaired_table"), None),
+	}
+}
+
+/// ADR 605: the bridge's ablation effect per table, from T2 (bridge on) against T3 (ablated). Read
+/// only under identity: the same plan fingerprint, both digests matching the anchor's, and the
+/// same scan multiplicity and visited rows per table. It is an ablation effect, not a counter of
+/// the bridge being applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AblationReading {
+	AblationEffect,
+	NoObservedEffect,
+	Unresolved,
+}
+
+pub fn ablation_readings(
+	identity_holds: bool,
+	with_bridge: &BTreeMap<String, TableScanWork>,
+	ablated: &BTreeMap<String, TableScanWork>,
+) -> BTreeMap<String, AblationReading> {
+	let tables = with_bridge
+		.keys()
+		.chain(ablated.keys())
+		.cloned()
+		.collect::<std::collections::BTreeSet<_>>();
+	let same_scans = with_bridge.len() == ablated.len()
+		&& with_bridge.iter().all(|(table, work)| {
+			ablated.get(table).is_some_and(|other| {
+				other.scans == work.scans && other.rows_visited == work.rows_visited
+			})
+		});
+	tables
+		.into_iter()
+		.map(|table| {
+			let reading = match (
+				identity_holds && same_scans,
+				with_bridge.get(&table),
+				ablated.get(&table),
+			) {
+				(true, Some(on), Some(off)) if on.rows_emitted < off.rows_emitted => {
+					AblationReading::AblationEffect
+				}
+				(true, Some(on), Some(off)) if on.rows_emitted == off.rows_emitted => {
+					AblationReading::NoObservedEffect
+				}
+				_ => AblationReading::Unresolved,
+			};
+			(table, reading)
 		})
 		.collect()
 }
@@ -776,5 +1141,242 @@ mod tests {
 		let empty = serde_json::json!({"latency": 1.0, "cpu_time": 1.0, "rows_returned": 0,
 			"children": []});
 		assert!(parse_duckdb_operator_profile(&empty).is_err());
+	}
+
+	#[test]
+	fn a_duckdb_scan_resolves_to_its_table_by_file_then_by_column_prefix() {
+		let by_file = serde_json::json!({"Function": "READ_PARQUET",
+			"Projections": ["l_orderkey"],
+			"Filename(s)": "/data/strict/sf8/lineitem.parquet"});
+		assert_eq!(duckdb_scan_table(&by_file).as_deref(), Some("lineitem"));
+		let by_prefix = serde_json::json!({"Projections": ["ps_partkey", "ps_suppkey"]});
+		assert_eq!(duckdb_scan_table(&by_prefix).as_deref(), Some("partsupp"));
+		let single = serde_json::json!({"Projections": "r_regionkey"});
+		assert_eq!(duckdb_scan_table(&single).as_deref(), Some("region"));
+		let mixed = serde_json::json!({"Projections": ["l_orderkey", "o_orderkey"]});
+		assert_eq!(duckdb_scan_table(&mixed), None, "unpaired");
+		let unknown = serde_json::json!({"Projections": ["k", "g"]});
+		assert_eq!(duckdb_scan_table(&unknown), None, "unpaired");
+		let many_files =
+			serde_json::json!({"Filename(s)": "a.parquet, b.parquet", "Projections": ["x"]});
+		assert_eq!(duckdb_scan_table(&many_files), None);
+		// A file that is not a TPC-H table, or whose columns name another table, stays unpaired.
+		let unknown_file =
+			serde_json::json!({"Filename(s)": "/d/fact.parquet", "Projections": ["l_orderkey"]});
+		assert_eq!(duckdb_scan_table(&unknown_file), None);
+		let conflicting =
+			serde_json::json!({"Filename(s)": "/d/orders.parquet", "Projections": ["l_orderkey"]});
+		assert_eq!(duckdb_scan_table(&conflicting), None);
+		let file_only = serde_json::json!({"Filename(s)": "/d/nation.parquet"});
+		assert_eq!(duckdb_scan_table(&file_only).as_deref(), Some("nation"));
+	}
+
+	#[test]
+	fn scan_progress_folds_by_scan_and_by_table() {
+		let jsonl = r#"{"event":"scan_start","scan_id":1,"table_name":"lineitem","pbc_predicate_bytes":null,"runtime_filter_present":true}
+{"event":"batch","scan_id":1,"raw_rows":100,"output_rows":40,"raw_bytes":1000}
+{"event":"batch","scan_id":1,"raw_rows":50,"output_rows":10,"raw_bytes":500}
+{"event":"scan_start","scan_id":2,"table_name":"lineitem","pbc_predicate_bytes":12,"runtime_filter_present":false}
+{"event":"batch","scan_id":2,"raw_rows":150,"output_rows":150,"raw_bytes":1500}
+{"event":"scan_end","scan_id":2}
+{"event":"scan_start","scan_id":3,"table_name":"orders","pbc_predicate_bytes":8}
+{"event":"batch","scan_id":3,"raw_rows":30,"output_rows":20,"raw_bytes":300}
+"#;
+		let scans = fold_scan_progress(jsonl).unwrap();
+		assert_eq!(scans.len(), 3);
+		assert_eq!(scans[0].raw_rows, 150);
+		assert_eq!(scans[0].output_rows, 50);
+		assert_eq!(scans[0].runtime_filter_present, Some(true));
+		assert!(!scans[0].pushed_predicate);
+		assert!(scans[1].pushed_predicate);
+		assert_eq!(scans[1].end, "ended");
+		assert_eq!(
+			scans[0].end, "end_not_emitted_by_lazy_path",
+			"a lazy scan, not refused"
+		);
+		assert_eq!(scans[2].runtime_filter_present, None);
+		let tables = toron_table_work(&scans);
+		assert_eq!(tables["lineitem"].scans, 2);
+		assert_eq!(tables["lineitem"].rows_visited, 300);
+		assert_eq!(tables["lineitem"].rows_emitted, 200);
+		assert_eq!(tables["lineitem"].decoded_bytes, Some(3000));
+		assert_eq!(tables["lineitem"].scans_with_runtime_filter, Some(1));
+		assert_eq!(tables["orders"].scans_with_runtime_filter, None);
+		// The fold reconciles with the ledger's receipt from the same execution.
+		let receipt = serde_json::json!({"scans": 4, "batches": 4, "rows": 330,
+			"decode_micros": 9, "raw_bytes": 3300});
+		assert!(reconcile_progress_with_receipt(&scans, Some(&receipt)).is_ok());
+		let mut short = receipt.clone();
+		short["rows"] = serde_json::json!(329);
+		assert!(
+			reconcile_progress_with_receipt(&scans, Some(&short))
+				.unwrap_err()
+				.contains("disagree on rows")
+		);
+		assert!(reconcile_progress_with_receipt(&scans, None).is_err());
+		let start = r#"{"event":"scan_start","scan_id":1,"table_name":"lineitem"}"#;
+		let batch = r#"{"event":"batch","scan_id":1,"raw_rows":1,"output_rows":1,"raw_bytes":1}"#;
+		let end = r#"{"event":"scan_end","scan_id":1}"#;
+		for (label, text, needle) in [
+			("orphan batch", batch.to_string(), "never started"),
+			(
+				"unknown event",
+				r#"{"event":"mystery","scan_id":1}"#.to_string(),
+				"unknown event",
+			),
+			(
+				"duplicate start",
+				format!("{start}\n{start}"),
+				"started twice",
+			),
+			(
+				"batch after end",
+				format!("{start}\n{end}\n{batch}"),
+				"after scan 1 ended",
+			),
+			(
+				"second end",
+				format!("{start}\n{end}\n{end}"),
+				"after scan 1 ended",
+			),
+			(
+				"batch without rows",
+				format!(
+					"{start}\n{}",
+					r#"{"event":"batch","scan_id":1,"output_rows":1,"raw_bytes":1}"#
+				),
+				"numeric raw_rows",
+			),
+			(
+				"non-numeric bytes",
+				format!(
+					"{start}\n{}",
+					r#"{"event":"batch","scan_id":1,"raw_rows":1,"output_rows":1,"raw_bytes":"1"}"#
+				),
+				"numeric raw_bytes",
+			),
+		] {
+			let error = fold_scan_progress(&text).unwrap_err();
+			assert!(error.contains(needle), "{label}: {error}");
+		}
+	}
+
+	#[test]
+	fn duckdb_scans_sum_per_table_with_unresolved_scans_kept_apart() {
+		let profile = serde_json::json!({"latency": 1.0, "cpu_time": 1.0, "rows_returned": 1,
+			"total_bytes_read": 4096,
+			"children": [{"operator_type": "HASH_JOIN", "operator_name": "HASH_JOIN",
+				"operator_timing": 0.1, "operator_cardinality": 5, "children": [
+				{"operator_type": "TABLE_SCAN", "operator_name": "READ_PARQUET",
+				 "operator_timing": 0.2, "operator_cardinality": 10, "operator_rows_scanned": 100,
+				 "extra_info": {"Filename(s)": "/d/lineitem.parquet"}, "children": []},
+				{"operator_type": "TABLE_SCAN", "operator_name": "READ_PARQUET",
+				 "operator_timing": 0.2, "operator_cardinality": 7, "operator_rows_scanned": 70,
+				 "extra_info": {"Projections": ["l_orderkey"]}, "children": []},
+				{"operator_type": "TABLE_SCAN", "operator_name": "READ_PARQUET",
+				 "operator_timing": 0.1, "operator_cardinality": 3, "operator_rows_scanned": 3,
+				 "extra_info": {"Projections": ["x"]}, "children": []}]}]});
+		let parsed = parse_duckdb_operator_profile(&profile).unwrap();
+		assert_eq!(parsed.total_bytes_read, Some(4096));
+		let (tables, unpaired) = duckdb_table_work(&parsed).unwrap();
+		assert_eq!(tables["lineitem"].scans, 2);
+		assert_eq!(tables["lineitem"].rows_visited, 170);
+		assert_eq!(tables["lineitem"].rows_emitted, 17);
+		assert_eq!(tables["lineitem"].decoded_bytes, None);
+		assert_eq!(unpaired.len(), 1);
+		// A scan without the counter refuses the table work rather than reading zero.
+		let mut missing = profile.clone();
+		missing["children"][0]["children"][1]
+			.as_object_mut()
+			.unwrap()
+			.remove("operator_rows_scanned");
+		let parsed = parse_duckdb_operator_profile(&missing).unwrap();
+		assert!(
+			duckdb_table_work(&parsed)
+				.unwrap_err()
+				.contains("operator_rows_scanned")
+		);
+		// A profile with no scan operator is refused too.
+		let no_scan = serde_json::json!({"latency": 1.0, "cpu_time": 1.0, "rows_returned": 1,
+			"children": [{"operator_type": "PROJECTION", "operator_name": "PROJECTION",
+				"operator_timing": 0.1, "operator_cardinality": 1, "children": []}]});
+		let parsed = parse_duckdb_operator_profile(&no_scan).unwrap();
+		assert!(duckdb_table_work(&parsed).is_err());
+	}
+
+	#[test]
+	fn the_visited_rows_flag_is_symmetric_and_names_the_direction() {
+		assert_eq!(
+			visited_reading(1_000, 499),
+			VisitedReading::DuckDbFewerFlagged
+		);
+		assert_eq!(visited_reading(1_000, 500), VisitedReading::Unflagged);
+		assert_eq!(
+			visited_reading(499, 1_000),
+			VisitedReading::ToronFewerFlagged
+		);
+		assert_eq!(visited_reading(900, 1_000), VisitedReading::Unflagged);
+		assert_eq!(visited_reading(5, 0), VisitedReading::OneSideZero);
+		assert_eq!(visited_reading(0, 0), VisitedReading::Unflagged);
+	}
+
+	#[test]
+	fn the_ablation_effect_is_read_only_under_identity() {
+		let work = |scans, visited, emitted| TableScanWork {
+			scans,
+			rows_visited: visited,
+			rows_emitted: emitted,
+			..TableScanWork::default()
+		};
+		let on = BTreeMap::from([
+			("lineitem".to_string(), work(1, 1_000, 300)),
+			("orders".to_string(), work(1, 200, 200)),
+		]);
+		let off = BTreeMap::from([
+			("lineitem".to_string(), work(1, 1_000, 1_000)),
+			("orders".to_string(), work(1, 200, 200)),
+		]);
+		let readings = ablation_readings(true, &on, &off);
+		assert_eq!(readings["lineitem"], AblationReading::AblationEffect);
+		assert_eq!(readings["orders"], AblationReading::NoObservedEffect);
+		// Any identity failure leaves every table unresolved.
+		assert!(
+			ablation_readings(false, &on, &off)
+				.values()
+				.all(|reading| *reading == AblationReading::Unresolved)
+		);
+		let mut more_scans = off.clone();
+		more_scans.get_mut("orders").unwrap().scans = 2;
+		assert!(
+			ablation_readings(true, &on, &more_scans)
+				.values()
+				.all(|reading| *reading == AblationReading::Unresolved)
+		);
+		let mut other_visited = off.clone();
+		other_visited.get_mut("lineitem").unwrap().rows_visited = 999;
+		assert!(
+			ablation_readings(true, &on, &other_visited)
+				.values()
+				.all(|reading| *reading == AblationReading::Unresolved)
+		);
+	}
+
+	#[test]
+	fn an_invalid_scan_comparison_withholds_both_the_reading_and_the_ratio() {
+		let work = |visited| TableScanWork {
+			scans: 1,
+			rows_visited: visited,
+			..TableScanWork::default()
+		};
+		let (toron, duckdb) = (work(3_000), work(1_000));
+		let (reading, ratio) = visited_comparison(true, Some(&toron), Some(&duckdb));
+		assert_eq!(reading, "duck_db_fewer_flagged");
+		assert_eq!(ratio, Some(3.0));
+		let (reading, ratio) = visited_comparison(false, Some(&toron), Some(&duckdb));
+		assert_eq!(reading, "withheld");
+		assert_eq!(ratio, None, "no ratio from invalid work");
+		let (reading, ratio) = visited_comparison(true, Some(&toron), None);
+		assert_eq!(reading, "unpaired_table");
+		assert_eq!(ratio, None);
 	}
 }
