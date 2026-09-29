@@ -1,6 +1,13 @@
 # ADR 606 - q05's reoriented chain: the cap check's batches reused for the build
 
-**Status:** PROPOSED. Successor to ADR 605. On the sealed anchor (ADR 603:
+**Status:** CLOSED, RETAINED. One paired attempt on strix (results in
+`plans/impl/0606_q05_reoriented_chain_cap_check_batches_reused_results.md`):
+q05 median 5,170.6 ms control, 4,735.0 ms treatment, a median paired
+gain of 444.7 ms (8.6%) against a required 249.6 ms, every pair
+positive, digest parity on all twelve rows. The mechanism check shows
+lineitem, supplier, nation, and region scanned once instead of twice.
+Peak RSS is 1.14 GiB (15%) higher on the treatment, an observed
+tradeoff. The token stays `Reuse`. Successor to ADR 605. On the sealed anchor (ADR 603:
 Toron 63.430 s against DuckDB 15.650 s), q05's gap is 4,689 ms. ADR 605
 found Toron scanning each of q05's build-side tables twice in immediate
 succession, with identical rows and batches: lineitem, supplier, nation,
