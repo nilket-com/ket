@@ -135,6 +135,8 @@ async fn run() -> ExitCode {
 		// ADR 603: profiled DuckDB children, one per cell, after a timed artifact is complete.
 		"duckdb-profile-sweep" => duckdb_profile_sweep_command(&args),
 		"memory-panels-summary" => memory_panels_summary_command(&args),
+		// ADR 604: Toron's plan and costs beside DuckDB's profiled operator tree, one cell.
+		"structural-census" => structural_census_command(&args).await,
 		"adr597-reevaluate" => adr597_reevaluate_command(&args),
 		"adr596-q21-build-write" => adr596_q21_build_write_command(&args),
 		"adr596-reevaluate" => adr596_reevaluate_command(&args),
@@ -12343,6 +12345,314 @@ fn duckdb_profile_sweep(args: &[String]) -> Result<(), String> {
 		.map_err(|error| format!("write {}: {error}", artifact.display()))?;
 	println!("{}", artifact.display());
 	Ok(())
+}
+
+/// ADR 604: one cell's structural census at the sealed anchor's coordinate. Every execution is
+/// named: the plan (no execution), T1 (Toron `EXPLAIN ANALYZE`), T2 (Toron, profiled with node
+/// attribution and the scan ledger), D0 (DuckDB plain `EXPLAIN`, no execution), and D1 (DuckDB,
+/// profiled with operator metrics). All are diagnostic; nothing is compared with a board median.
+async fn structural_census_command(args: &[String]) -> ExitCode {
+	match structural_census(args).await {
+		Ok(path) => {
+			println!("{}", path.display());
+			ExitCode::SUCCESS
+		}
+		Err(message) => harness_error(&message),
+	}
+}
+
+async fn structural_census(args: &[String]) -> Result<PathBuf, String> {
+	let query_id = perf_query_list(
+		flag_value(args, "--query")
+			.ok_or_else(|| "structural-census requires --query".to_string())?,
+	)?;
+	let [query_id] = query_id.as_slice() else {
+		return Err("structural-census takes one query".to_string());
+	};
+	let query_id = *query_id;
+	let mode = flag_value(args, "--mode").unwrap_or("strict");
+	let data_source = flag_value(args, "--data-source").unwrap_or("parquet");
+	if !matches!(data_source, "parquet" | "persisted") {
+		return Err("structural-census: persisted parquet only".to_string());
+	}
+	let data_dir = data_dir_from_args(args);
+	let sf = explicit_sf(args)?.ok_or_else(|| "structural-census requires --sf".to_string())?;
+	let output_dir = PathBuf::from(
+		flag_value(args, "--output-dir")
+			.ok_or_else(|| "structural-census requires --output-dir".to_string())?,
+	);
+	let anchor_path = flag_value(args, "--anchor").ok_or_else(|| {
+		"structural-census requires --anchor <sealed perf_board.jsonl>".to_string()
+	})?;
+	// The anchor is bound to the sealed artifact by content, before any of it is used.
+	let anchor_sha256_expected = flag_value(args, "--anchor-sha256").ok_or_else(|| {
+		"structural-census requires --anchor-sha256 <the sealed artifact's sha256>".to_string()
+	})?;
+	let anchor_sha256 = toron_tpch::evidence::sha256_file(Path::new(anchor_path))?;
+	if anchor_sha256 != anchor_sha256_expected {
+		return Err(format!(
+			"structural-census: anchor {anchor_path} has sha256 {anchor_sha256}, not the sealed \
+			 {anchor_sha256_expected}"
+		));
+	}
+	if output_dir.exists() {
+		return Err(format!(
+			"structural-census output {} must be fresh",
+			output_dir.display()
+		));
+	}
+	std::fs::create_dir_all(&output_dir)
+		.map_err(|error| format!("create {}: {error}", output_dir.display()))?;
+	let anchor_rows = std::fs::read_to_string(anchor_path)
+		.map_err(|error| format!("read {anchor_path}: {error}"))?
+		.lines()
+		.filter(|line| !line.trim().is_empty())
+		.map(|line| serde_json::from_str::<serde_json::Value>(line).map_err(|e| e.to_string()))
+		.collect::<Result<Vec<_>, _>>()?;
+	let sealed_header = anchor_rows
+		.first()
+		.filter(|row| {
+			row.get("kind").and_then(serde_json::Value::as_str) == Some("artifact_header")
+		})
+		.ok_or_else(|| format!("{anchor_path} has no artifact header"))?;
+
+	// The census's own coordinate, checked against the sealed header before anything runs. The
+	// dataset fingerprint is the persisted dataset's, as the board header records it.
+	let export = export_persisted_perf_query_parquet(query_id, mode, sf, &data_dir)?;
+	let dataset_manifest_fingerprint =
+		load_persisted_tpch_dataset(mode, sf, &data_dir)?.manifest_fingerprint;
+	let (memory_per_task, memory_provenance) = gauge_memory_per_task()?;
+	let (spill_bytes_reserved, spill_provenance) = gauge_spill_bytes_reserved()?;
+	let (concurrency, concurrency_provenance) = gauge_partition_work_concurrency_requested()?;
+	let (duckdb_memory_limit, duckdb_memory_limit_provenance) = duckdb_memory_limit_fields();
+	let duckdb_bin = duckdb_binary();
+	let coordinate = serde_json::json!({
+		"scale_factor": sf,
+		"mode": mode,
+		"data_source": data_source,
+		"dataset_manifest_fingerprint": dataset_manifest_fingerprint,
+		"memory_per_task": memory_per_task,
+		"memory_per_task_provenance": memory_provenance,
+		"spill_bytes_reserved": spill_bytes_reserved,
+		"spill_bytes_reserved_provenance": spill_provenance,
+		"partition_work_concurrency_requested": concurrency,
+		"partition_work_concurrency_requested_provenance": concurrency_provenance,
+		"duckdb_threads": duckdb_thread_setting(),
+		"duckdb_threads_provenance": reference_thread_pin_provenance(&duckdb_thread_setting()),
+		"duckdb_memory_limit": duckdb_memory_limit,
+		"duckdb_memory_limit_provenance": duckdb_memory_limit_provenance,
+		"duckdb_executable_sha256": toron_tpch::evidence::sha256_file(Path::new(&duckdb_bin))?,
+		"cpu_affinity_requested": toron_tpch::affinity::affinity_coordinate().requested,
+		"cpu_affinity_observed": toron_tpch::affinity::observed_cpulist(),
+		"dataset_verification": export
+			.dataset_verification
+			.map(toron_tpch::telemetry::DatasetVerification::as_str),
+	});
+	let mismatches = toron_tpch::census::coordinate_mismatches(&coordinate, sealed_header);
+	if !mismatches.is_empty() {
+		return Err(format!(
+			"structural-census {query_id}: coordinate differs from the sealed header: {}",
+			mismatches.join(", ")
+		));
+	}
+
+	// The plan (no execution) and T1.
+	let toron_plan =
+		toron_tpch::structural_census_toron_plan(query_id, mode, sf, &data_dir).await?;
+
+	// T2: one profiled Toron execution with node attribution and the scan ledger.
+	let profile_path = output_dir.join("t2_node_attribution.json");
+	let profile_text = profile_path.display().to_string();
+	let t2 = run_perf_child_with_envs(
+		query_id,
+		mode,
+		sf,
+		0,
+		data_source,
+		&data_dir,
+		&[
+			("TORON_NODE_ATTRIBUTION_PROFILE_PATH", profile_text.as_str()),
+			("TORON_TPCH_PARQUET_SCAN_LEDGER", "1"),
+		],
+	)?;
+
+	// D0 and D1.
+	let duckdb_version = duckdb_cli_version(&duckdb_bin)?
+		.ok_or_else(|| format!("DuckDB executable {duckdb_bin:?} is absent"))?;
+	let d0 = run_duckdb_script(
+		&duckdb_bin,
+		&format!(
+			".mode json\n{}EXPLAIN (FORMAT JSON) {}\n",
+			duckdb_setup_sql(&export),
+			duckdb_query_statement(&export.sql)
+		),
+	)?;
+	let d0_names = toron_tpch::census::duckdb_explain_names(&d0.stdout);
+	let temp_directory = fresh_duckdb_temp_directory()?;
+	let d1_profile_path = output_dir.join("d1_profile.json");
+	let d1 = run_duckdb_script(
+		&duckdb_bin,
+		&format!(
+			".mode json\n{}{}{DUCKDB_MEMORY_LIMIT_READ_BACK}\nSET custom_profiling_settings={};\n\
+			 SET enable_profiling='json';\nSET profiling_output={};\n{}\n",
+			duckdb_setup_sql(&export),
+			duckdb_temp_directory_sql(&temp_directory),
+			sql_string_literal(toron_tpch::census::DUCKDB_OPERATOR_PROFILE_SETTINGS),
+			sql_string_literal(&d1_profile_path.display().to_string()),
+			duckdb_query_statement(&export.sql)
+		),
+	);
+	let _ = std::fs::remove_dir_all(&temp_directory);
+	let d1 = d1?;
+	if !d1.status_success {
+		return Err(format!(
+			"structural-census {query_id}: D1 failed: {:?}",
+			d1.stderr
+		));
+	}
+	let d1_arrays = extract_json_arrays(&d1.stdout);
+	let d1_result = duckdb_query_result(&d1_arrays)
+		.ok_or_else(|| format!("structural-census {query_id}: D1 returned no result"))?;
+	let d1_digest = duckdb_result_sha256(d1_result)?;
+	let d1_row_count = d1_result.as_array().map(Vec::len);
+	let d1_profile: serde_json::Value = serde_json::from_str(
+		&std::fs::read_to_string(&d1_profile_path)
+			.map_err(|error| format!("read {}: {error}", d1_profile_path.display()))?,
+	)
+	.map_err(|error| format!("parse {}: {error}", d1_profile_path.display()))?;
+	let d1_operators = toron_tpch::census::parse_duckdb_operator_profile(&d1_profile)?;
+	let d0_correspondence =
+		toron_tpch::census::duckdb_plan_correspondence(&d0_names, &d1_operators);
+
+	// Identity and plan correspondence against the sealed anchor's timed rows.
+	let anchor_cell = |engine: &str| -> Vec<&serde_json::Value> {
+		anchor_rows
+			.iter()
+			.filter(|row| {
+				row.get("query").and_then(serde_json::Value::as_str) == Some(query_id)
+					&& row.get("engine").and_then(serde_json::Value::as_str) == Some(engine)
+					&& row.get("warmup").and_then(serde_json::Value::as_bool) == Some(false)
+			})
+			.collect()
+	};
+	let distinct = |rows: &[&serde_json::Value], field: &str| -> BTreeSet<String> {
+		rows.iter()
+			.filter_map(|row| row.get(field))
+			.map(|value| {
+				value
+					.as_str()
+					.map_or_else(|| value.to_string(), str::to_string)
+			})
+			.collect()
+	};
+	let anchor_toron = anchor_cell("toron");
+	let anchor_duckdb = anchor_cell("duckdb");
+	let anchor_toron_digests = distinct(&anchor_toron, "digest");
+	let anchor_toron_fingerprints = distinct(&anchor_toron, "plan_fingerprint");
+	let anchor_duckdb_digests = distinct(&anchor_duckdb, "duckdb_result_sha256");
+	let t2_digest = t2.get("digest").map(|value| {
+		value
+			.as_str()
+			.map_or_else(|| value.to_string(), str::to_string)
+	});
+	let t2_fingerprint = t2
+		.get("plan_fingerprint")
+		.and_then(serde_json::Value::as_str);
+	let binder_fingerprint = toron_plan["plan"]["plan_fingerprint"].as_str();
+	let toron_correspondence = toron_tpch::census::toron_plan_correspondence(
+		binder_fingerprint,
+		t2_fingerprint,
+		&anchor_toron_fingerprints,
+	);
+	let t1_rows_emitted = toron_plan["t1"]["analyze_rows"]
+		.as_array()
+		.map_or(0, Vec::len);
+	let toron_joins = toron_tpch::census::toron_join_table(
+		toron_plan["plan"]["join_order_edges_estimated"]
+			.as_str()
+			.unwrap_or_default(),
+		t1_rows_emitted,
+	);
+	let t2_digest_matches = t2_digest.as_ref().is_some_and(|digest| {
+		anchor_toron_digests.len() == 1 && anchor_toron_digests.contains(digest)
+	});
+	let d1_digest_matches =
+		anchor_duckdb_digests.len() == 1 && anchor_duckdb_digests.contains(&d1_digest);
+	// The default memory limit D1 ran under, against the one the anchor's timed DuckDB rows read.
+	let d1_memory_observed = duckdb_memory_limit_read_back(&d1_arrays);
+	let anchor_memory_observed = distinct(&anchor_duckdb, "duckdb_memory_limit_observed");
+	let d1_memory_matches = d1_memory_observed.as_ref().is_some_and(|observed| {
+		anchor_memory_observed.len() == 1 && anchor_memory_observed.contains(observed)
+	});
+	let t2_passed = t2.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+	let excluded = toron_tpch::census::census_exclusions(
+		&t2,
+		t2_digest_matches,
+		d1_digest_matches,
+		d1_memory_matches,
+	);
+	let identity = serde_json::json!({
+		"t2_passed": t2_passed,
+		"t2_digest_matches_anchor_toron": t2_digest_matches,
+		"d1_digest_matches_anchor_duckdb": d1_digest_matches,
+		"d1_memory_limit_observed": d1_memory_observed,
+		"anchor_duckdb_memory_limit_observed": anchor_memory_observed,
+		"d1_memory_limit_matches_anchor": d1_memory_matches,
+		"anchor_toron_digests": anchor_toron_digests,
+		"anchor_duckdb_digests": anchor_duckdb_digests,
+		"cross_engine_equivalence": "not proved by this record",
+		"toron_output_row_count": t2.get("output_row_count"),
+		"duckdb_output_row_count": d1_row_count,
+	});
+	let correspondence = serde_json::json!({
+		"toron": toron_correspondence,
+		"toron_note": "explain-binder fingerprint against T2 and the anchor; T1 returns no plan of its own",
+		"binder_fingerprint": binder_fingerprint,
+		"t2_fingerprint": t2_fingerprint,
+		"anchor_toron_fingerprints": anchor_toron_fingerprints,
+		"duckdb": d0_correspondence,
+		"duckdb_note": "D0 against D1 by (depth, operator name): a shape-name match, weaker than \
+			exact plan correspondence; D1 takes precedence",
+	});
+	let artifact = serde_json::json!({
+		"kind": "structural_census_cell",
+		"query": query_id,
+		"coordinate": coordinate,
+		"sealed_anchor": {"path": anchor_path, "sha256": anchor_sha256},
+		"comparable_for_classification": excluded.is_empty(),
+		"excluded_reasons": excluded,
+		"executions": {
+			"plan": "explain binder, no execution",
+			"t1": "Toron EXPLAIN ANALYZE, local QueryCoordinator, result discarded",
+			"t2": "Toron perf-run-one child, node attribution and parquet scan ledger",
+			"d0": "DuckDB EXPLAIN (FORMAT JSON), no execution",
+			"d1": "DuckDB profiled execution, operator metrics",
+		},
+		"profiling_caveat": "every execution here is diagnostic and profiled; absolute times carry \
+			profiling overhead and are not comparable with board medians",
+		"correspondence": correspondence,
+		"identity": identity,
+		"toron": {
+			"joins": toron_joins,
+			"plan": toron_plan["plan"],
+			"t1": toron_plan["t1"],
+			"t2": t2,
+		},
+		"duckdb": {
+			"version": duckdb_version,
+			"d0_names": d0_names.as_ref().ok(),
+			"d0_raw": d0.stdout,
+			"d1_result_sha256": d1_digest,
+			"d1": d1_operators,
+		},
+	});
+	let path = output_dir.join("structural_census.json");
+	std::fs::write(
+		&path,
+		serde_json::to_string_pretty(&artifact).map_err(|error| error.to_string())?,
+	)
+	.map_err(|error| format!("write {}: {error}", path.display()))?;
+	Ok(path)
 }
 
 /// ADR 603: the anchor and both memory panels compared, from their `samples.jsonl` files.

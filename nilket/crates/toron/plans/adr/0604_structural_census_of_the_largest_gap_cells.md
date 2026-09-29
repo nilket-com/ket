@@ -1,6 +1,19 @@
 # ADR 604 - a structural census of the largest gap cells, Toron beside DuckDB
 
-**Status:** PROPOSED. Successor to ADR 603, whose sealed anchor on strix
+**Status:** CLOSED. All five cells passed the coordinate, identity, and
+receipt checks and were read (results in
+`plans/impl/0604_structural_census_of_the_largest_gap_cells_results.md`).
+On q05 and q09, 10.2 s of the anchor's gap, DuckDB's scans carry
+dynamic join filters and return far fewer rows than Toron's scans take
+in. The census compared DuckDB's scan output with Toron's raw scan input,
+two different measures, so it does not establish that DuckDB reads less;
+these are filter-placement and scan-output candidates, and the next
+record measures scan work. q01 is a join-free core-path throughput
+candidate on its 4.87× sealed gap. Toron's kind-level attribution cannot
+separate work fused into its aggregation chains, and exchange at
+partition parallelism 1 is visible on q05 and q18.
+
+Successor to ADR 603, whose sealed anchor on strix
 reads Toron 63.430 s against DuckDB 15.650 s (4.053×), 32.064 s above the
 campaign's 31.366 s target. ADR 603's two memory panels did not
 materially narrow the aggregate gap: 4.062× with DuckDB at a nominally
@@ -69,11 +82,24 @@ DuckDB at one thread with its default limit) and writes one JSON
 artifact. Every execution is named, and each fact is attributed to the
 execution that produced it.
 
-- **Toron, T1: the `EXPLAIN ANALYZE` execution.** It supplies the join
-  decisions and the join order, with estimated and actual rows per join.
-  It executes the query. The implementation reuses T2's execution for
-  it if the binder path allows that, and otherwise states that T1 is a
-  separate execution.
+- **Toron, T1: the `EXPLAIN ANALYZE` execution,** run locally through
+  `QueryCoordinator` on `EXPLAIN ANALYZE <sql>` under the harness's
+  planner configuration (the distributed variant plans differently and
+  is not used). It executes the query, as a separate execution, and
+  discards the result. It supplies estimated and actual rows **only for
+  the joins it recognizes as a star, snowflake, galaxy, or bridge
+  order**; every other join in the cell is reported by name as
+  `not_emitted`. (Amended before implementation: a code read found that
+  the analyze rows cover only those join orders, and a non-star join
+  yields none.)
+- **The plan, without an execution of its own:** the same logical plan
+  bound by the explain binder (`bind_with_explain_summary`) under the
+  same configuration. It supplies the plan's fingerprint, compact shape,
+  and serialized tree, and the binder's join decisions and join order,
+  with **estimated** rows where the binder has them and
+  `estimate_unknown` otherwise. (Amended before implementation: an
+  SF 0.01 smoke found the binder's join-order edges carrying no
+  estimate.)
 - **Toron, T2: the profiled execution,** with node attribution and the
   scan ledger. It supplies the per-kind exclusive time, calls, spill
   bytes, the outer reconciliation against its own `execute_ms`, the
@@ -89,15 +115,35 @@ execution that produced it.
 T1, T2, and D1 are diagnostic executions (D0 does not execute), run in
 a separated window with no timed artifact in it.
 
-*Plan correspondence.* T1 supplies the join cardinalities, and T2
-supplies the plan tree. Before their facts are combined, the plan shape
-and fingerprint of T1's plan must agree with T2's. If they differ, the
-mismatch is named, and the join comparison for that cell is left
-unresolved. Likewise, D0's plain `EXPLAIN` is descriptive and D1's
+*Plan correspondence.* Neither T1 nor T2 returns its bound plan. The
+explain binder's fingerprint must equal T2's `plan_fingerprint` and the
+ADR 603 anchor's Toron `plan_fingerprint` for the cell before T1's rows
+are combined with T2's costs. If they differ, the mismatch is named and
+the join comparison for that cell is left unresolved. This
+correspondence is indirect: it rests on the explain binder and T2
+agreeing, not on T1's own plan, and no exact T1–T2 plan identity is
+claimed. Likewise, D0's plain `EXPLAIN` is descriptive and D1's
 operator tree is the executed plan. Their correspondence is checked, D1
 takes precedence, and a D0 that does not correspond is labelled
-unmatched. None is compared with a board
-median, and nothing here touches the sealed anchor's timing.
+unmatched. D0 and D1 are compared by `(depth, operator name)` in
+pre-order. A match there is a shape-and-name match, weaker than exact
+plan correspondence, since sources and predicates are not compared, and
+it is labelled so. None is compared with a board median, and nothing
+here touches the sealed anchor's timing.
+
+*The anchor, bound by content.* The census reads the sealed anchor only
+after verifying its `perf_board.jsonl` against the sealed SHA-256
+(`d4044c40cfe517085ec5754b4de76ef647bdbaf29cd3294c325496a9249c3273`),
+and records that identity. The coordinate compared with the sealed
+header is a declared selection of its fields (the board's coordinate,
+plus observed affinity and dataset verification), not every header
+field.
+
+*Comparability.* A cell enters the reading only if T2 passed, T2's
+digest matches the anchor's Toron digest, D1's digest matches the
+anchor's DuckDB digest, and D1 read back the same default memory limit
+as the anchor's DuckDB rows. A cell that fails any of these is retained
+in the record with its reasons named, and left out of the reading.
 
 *Identity.* Each engine's diagnostic result is tied to its own timed
 result on the sealed anchor. T2's digest is compared with ADR 603's
@@ -111,10 +157,19 @@ not presented as agreement in result.
 
 *The census tables, per cell.* Only buckets the instrumentation
 observes, with anything else named as unsplit or residual:
-- **(a) Join structure.** Each engine's join order, and the rows
-  entering and leaving each join where the engine reports them: T1's
-  estimates and actuals for Toron, and D1's per-operator cardinalities
-  for DuckDB.
+- **(a) Join structure.** Each engine's join order, as a per-join table
+  from the binder's join edges. For Toron, the binder's estimated rows
+  where present (`estimate_unknown` otherwise), and T1's actual rows only
+  where a stable join identity ties an analyze row to a join; a join is
+  `not_emitted` when T1 emitted nothing, and T1 rows that cannot be tied
+  to a join are `unassigned`, never attached by position; for DuckDB, D1's
+  per-operator cardinalities. Toron's rows at joins T1 does not cover are
+  unknown in this record. (Amended before implementation: the
+  join-input replay ledger is not used for join row flow. It records
+  input concatenations, and ADR 584 found none for four of q21's five
+  replays although those joins ran. A separate execution to collect
+  it for materialization shapes was judged of too little value for
+  this census and is not run.)
 - **(b) Materialization and volume.** Rows scanned per table from each
   engine, Toron's spill from T2, and rows carried between operators where
   both engines report them.
@@ -142,7 +197,9 @@ observes, with anything else named as unsplit or residual:
 comparable only when they represent the same logical boundary: the same
 set of input relations and the same predicate or grouping. At a
 comparable boundary, Toron carrying at least 2× DuckDB's rows is raised
-as a **triage flag**. Row counts at unmatched intermediate nodes are
+as a **triage flag**. Where DuckDB reports no rows and Toron reports
+some, there is no finite ratio, and the case is named apart from the
+flag. Row counts at unmatched intermediate nodes are
 reported as non-comparable, and never used to classify.
 
 *Reading, declared before the runs.* Each cell is read into one of:
