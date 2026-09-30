@@ -1,6 +1,27 @@
 # ADR 619 - q09's per-access cost growth: a diagnostic
 
-**Status:** PROPOSED. Successor to ADR 618. **A diagnostic record: no
+**Status:** CLOSED (results in
+`plans/impl/0619_q09_per_access_cost_growth_diagnostic_results.md`).
+
+**The counters** (process-scoped) are consistent with the hypothesis.
+Toron's instructions and dTLB-load events per visited row are
+approximately flat, while its LLC loads rise about 9% per step. Its
+cycles per instruction rise, its cycles per row rise ×1.12 and ×1.14,
+and its LLC and dTLB load misses per row rise ×1.29 to ×1.57 per
+doubling. DuckDB's misses stay within ×1.12. No stall event was
+measured.
+
+**The table-size benchmark** (restricted scope) gives mixed results:
+- the synthetic generic build shows per-row growth of a similar order to
+  replay 2's (×1.20 and ×1.27, against ×1.12 and ×1.27): a candidate,
+  not an isolated cause;
+- q09's larger Int64 lookup growth was not reproduced, and the reason is
+  unresolved;
+- the synthetic Int64 tables' mean probe slots are approximately
+  unchanged across sizes.
+
+The replay-2 table is synthetic, with accounting parity to the receipts.
+Successor to ADR 618. **A diagnostic record: no
 token, no pair, no cut, no saving projected.**
 
 ADR 618 found q09 the one pilot cell whose gap to DuckDB widens at both

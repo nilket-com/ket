@@ -853,6 +853,9 @@ impl Iterator for BuildRowListRows<'_> {
 }
 
 #[cfg(test)]
+mod join_table_size_scaling;
+
+#[cfg(test)]
 mod tests {
 	use std::sync::Arc;
 
