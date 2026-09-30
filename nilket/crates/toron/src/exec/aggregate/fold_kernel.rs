@@ -17,7 +17,7 @@ pub(in crate::exec) enum GroupedFoldShape {
 	TwoPhase,
 }
 
-pub(in crate::exec) const GROUPED_FOLD_SHAPE: GroupedFoldShape = GroupedFoldShape::RowAtATime;
+pub(in crate::exec) const GROUPED_FOLD_SHAPE: GroupedFoldShape = GroupedFoldShape::TwoPhase;
 
 /// ADR 610: diagnostic, one JSON line per aggregate instance at finalize; absent, nothing counts.
 pub(in crate::exec) const GROUPED_FOLD_KERNEL_RECEIPT_ENV: &str =
