@@ -1,9 +1,14 @@
 # ADR 621 - inline fixed-width keys for generic in-memory join builds
 
-**Status:** PROPOSED. Successor to ADR 620. One token, measured by a
+**Status:** CLOSED, RETAINED (results in
+`plans/impl/0621_inline_fixed_width_generic_build_keys_results.md`).
+`GENERIC_BUILD_KEY_STORAGE = Inline`. q09's median paired gain is
+1,053.4 ms (15.6%) against a bar of 118.8 ms, with every pair
+positive, digests matching and no spill. The q01 no-change control is
+reported, not interpreted. q05 and q20 change representation without
+paired latency coverage. Successor to ADR 620. One token, measured by a
 controlled pair. **No saving is projected, no new board total is
-claimed, and no general claim is made for all fixed-width keys before
-the breadth evidence.**
+claimed, and no general claim is made for all fixed-width keys.**
 
 ADR 620 audited the scaling cell's replay-2 join (TPC-H query nine's
 composite-key build of `partsupp`) at SF8:

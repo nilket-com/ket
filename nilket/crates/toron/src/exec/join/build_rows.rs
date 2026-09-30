@@ -13,6 +13,94 @@ pub(in crate::exec) struct BuildRowList {
 	overflow: BuildRowOverflow,
 }
 
+/// ADR 621: how a `Generic` in-memory build stores its keys. `Owned` keeps one heap `Vec<u8>` per
+/// entry (`JoinKey::Generic`); `Inline` stores an eligible build's keys in a fixed 32-byte array
+/// (Generic, not null-safe, every key column fixed-width, at most 32 encoded bytes). The probe is
+/// unchanged under both, and the hash input is the same.
+// A `const` token builds with one variant constructed; the other is the measured alternative.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::exec) enum GenericBuildKeyStorage {
+	Owned,
+	Inline,
+}
+
+pub(in crate::exec) const GENERIC_BUILD_KEY_STORAGE: GenericBuildKeyStorage =
+	GenericBuildKeyStorage::Inline;
+
+/// The widest encoded key stored inline.
+pub(in crate::exec) const INLINE_JOIN_KEY_BYTES: usize = 32;
+
+/// An encoded `Generic` key stored inline. Equality compares only `len` and `bytes[..len]`; every
+/// constructor zero-fills the unused tail. `Hash` feeds exactly what `JoinKey::Generic`'s derived
+/// `Hash` feeds: the `Generic` discriminant, then the byte slice as a `Vec<u8>` hashes it.
+#[derive(Clone, Copy)]
+pub(in crate::exec) struct InlineJoinKey {
+	len: u8,
+	bytes: [u8; INLINE_JOIN_KEY_BYTES],
+}
+
+impl InlineJoinKey {
+	pub(in crate::exec) fn from_slice(encoded: &[u8]) -> Option<Self> {
+		if encoded.len() > INLINE_JOIN_KEY_BYTES {
+			return None;
+		}
+		let mut bytes = [0u8; INLINE_JOIN_KEY_BYTES];
+		bytes[..encoded.len()].copy_from_slice(encoded);
+		Some(Self {
+			len: encoded.len() as u8,
+			bytes,
+		})
+	}
+
+	pub(in crate::exec) fn as_slice(&self) -> &[u8] {
+		&self.bytes[..usize::from(self.len)]
+	}
+}
+
+impl PartialEq for InlineJoinKey {
+	fn eq(&self, other: &Self) -> bool {
+		self.len == other.len && self.as_slice() == other.as_slice()
+	}
+}
+
+impl Eq for InlineJoinKey {}
+
+impl std::hash::Hash for InlineJoinKey {
+	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+		std::mem::discriminant(&JoinKey::Generic(Vec::new())).hash(state);
+		<[u8] as std::hash::Hash>::hash(self.as_slice(), state);
+	}
+}
+
+impl std::fmt::Debug for InlineJoinKey {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_tuple("InlineJoinKey")
+			.field(&self.as_slice())
+			.finish()
+	}
+}
+
+/// Whether a build's keys qualify for inline storage: not null-safe, every key column fixed-width
+/// under the encoder, and a total encoded width of at most [`INLINE_JOIN_KEY_BYTES`].
+pub(in crate::exec) fn generic_inline_eligible(
+	key_arrays: &[ArrayRef],
+	null_safe_keys: bool,
+) -> bool {
+	if null_safe_keys || key_arrays.is_empty() {
+		return false;
+	}
+	let mut total = 0usize;
+	for array in key_arrays {
+		let Some(width) = crate::exec::encoded_join_key_width(array.data_type()) else {
+			return false;
+		};
+		total = total.saturating_add(width);
+	}
+	total <= INLINE_JOIN_KEY_BYTES
+}
+
 pub(in crate::exec) fn new_join_build_rows(capacity: usize) -> JoinBuildRows {
 	JoinBuildRows::new_hash(capacity)
 }
@@ -31,6 +119,7 @@ pub(in crate::exec) fn new_int32_join_build_rows(capacity: usize) -> JoinBuildRo
 
 pub(in crate::exec) struct JoinBuildRows {
 	inner: JoinBuildRowsInner,
+	inline_eligible: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +133,7 @@ pub(super) struct JoinBuildProfileShape {
 
 enum JoinBuildRowsInner {
 	Hash(HashMap<JoinKey, BuildRowList, RandomState>),
+	InlineGeneric(HashMap<InlineJoinKey, BuildRowList, RandomState>),
 	Int32(PrimitiveBuildTable<i32>),
 	Int64(PrimitiveBuildTable<i64>),
 }
@@ -224,11 +314,38 @@ pub(in crate::exec) fn build_in_memory_join_rows_with_insert_mode(
 	null_safe_keys: bool,
 	insert_mode: BuildInsertMode,
 ) -> Result<Option<JoinBuildRows>, ExecutionError> {
+	build_in_memory_join_rows_with_storage(
+		join_key_plan,
+		left_key_arrays,
+		rows,
+		memory_cap,
+		null_safe_keys,
+		insert_mode,
+		GENERIC_BUILD_KEY_STORAGE,
+	)
+}
+
+/// ADR 621: the build with the `Generic` key storage named by the caller, so a test can build both
+/// forms in one process. Production goes through the latched token above.
+pub(in crate::exec) fn build_in_memory_join_rows_with_storage(
+	join_key_plan: JoinKeyPlan,
+	left_key_arrays: &[ArrayRef],
+	rows: usize,
+	memory_cap: u64,
+	null_safe_keys: bool,
+	insert_mode: BuildInsertMode,
+	storage: GenericBuildKeyStorage,
+) -> Result<Option<JoinBuildRows>, ExecutionError> {
+	let inline_eligible = matches!(join_key_plan, JoinKeyPlan::Generic)
+		&& generic_inline_eligible(left_key_arrays, null_safe_keys);
+	let inline = inline_eligible && storage == GenericBuildKeyStorage::Inline;
 	let mut build_rows = match (join_key_plan, null_safe_keys) {
 		(JoinKeyPlan::Int32, false) => new_int32_join_build_rows(rows),
 		(JoinKeyPlan::Int64, false) => new_int64_join_build_rows(rows),
+		_ if inline => JoinBuildRows::new_inline_generic(rows),
 		_ => new_join_build_rows(rows),
 	};
+	build_rows.inline_eligible = inline_eligible;
 	let mut inserted_rows = 0usize;
 
 	match join_key_plan {
@@ -272,6 +389,37 @@ pub(in crate::exec) fn build_in_memory_join_rows_with_insert_mode(
 				return Ok(None);
 			}
 		}
+		JoinKeyPlan::Generic if inline => {
+			// The production per-column encoding into one reused buffer, then copied inline. A null
+			// key column skips the row, exactly as `join_key_bytes` does for a non-null-safe build.
+			let mut scratch = Vec::with_capacity(INLINE_JOIN_KEY_BYTES);
+			'rows: for row in 0..rows {
+				scratch.clear();
+				for array in left_key_arrays {
+					if array.is_null(row) {
+						continue 'rows;
+					}
+					crate::exec::encode_partition_key_value(array.as_ref(), row, &mut scratch)?;
+				}
+				let Some(key) = InlineJoinKey::from_slice(&scratch) else {
+					return Err(ExecutionError::Kernel {
+						message: format!(
+							"inline join key of {} bytes exceeds {INLINE_JOIN_KEY_BYTES}",
+							scratch.len()
+						),
+					});
+				};
+				if !super::join_build_memory_fits(
+					left_key_arrays,
+					inserted_rows.saturating_add(1),
+					memory_cap,
+				) {
+					return Ok(None);
+				}
+				build_rows.insert_inline(key, super::join_build_row_index(row)?);
+				inserted_rows = inserted_rows.saturating_add(1);
+			}
+		}
 		JoinKeyPlan::Generic => {
 			for row in 0..rows {
 				let key = if null_safe_keys {
@@ -309,18 +457,50 @@ impl JoinBuildRows {
 				capacity,
 				RandomState::new(),
 			)),
+			inline_eligible: false,
+		}
+	}
+
+	fn new_inline_generic(capacity: usize) -> Self {
+		Self {
+			inner: JoinBuildRowsInner::InlineGeneric(HashMap::with_capacity_and_hasher(
+				capacity,
+				RandomState::new(),
+			)),
+			inline_eligible: true,
 		}
 	}
 
 	fn new_int32(capacity: usize) -> Self {
 		Self {
 			inner: JoinBuildRowsInner::Int32(PrimitiveBuildTable::with_capacity(capacity)),
+			inline_eligible: false,
 		}
 	}
 
 	fn new_int64(capacity: usize) -> Self {
 		Self {
 			inner: JoinBuildRowsInner::Int64(PrimitiveBuildTable::with_capacity(capacity)),
+			inline_eligible: false,
+		}
+	}
+
+	/// ADR 621: whether this build's keys qualified for inline storage (reported by the profile).
+	pub(in crate::exec) fn inline_eligible(&self) -> bool {
+		self.inline_eligible
+	}
+
+	fn insert_inline(&mut self, key: InlineJoinKey, row: u32) {
+		match &mut self.inner {
+			JoinBuildRowsInner::InlineGeneric(rows) => match rows.entry(key) {
+				std::collections::hash_map::Entry::Occupied(mut entry) => {
+					entry.get_mut().push(row);
+				}
+				std::collections::hash_map::Entry::Vacant(entry) => {
+					entry.insert(BuildRowList::new(row));
+				}
+			},
+			_ => panic!("inline key inserted into a non-inline join build table"),
 		}
 	}
 
@@ -346,6 +526,14 @@ impl JoinBuildRows {
 			(JoinBuildRowsInner::Int64(_), key) => {
 				panic!("non-Int64 key inserted into Int64 join build table: {key:?}");
 			}
+			(JoinBuildRowsInner::InlineGeneric(_), JoinKey::Generic(bytes)) => {
+				let key = InlineJoinKey::from_slice(&bytes)
+					.expect("an inline join build table holds keys of at most 32 bytes");
+				self.insert_inline(key, row);
+			}
+			(JoinBuildRowsInner::InlineGeneric(_), key) => {
+				panic!("non-Generic key inserted into inline Generic join build table: {key:?}");
+			}
 		}
 	}
 
@@ -354,7 +542,16 @@ impl JoinBuildRows {
 			(JoinBuildRowsInner::Int32(table), JoinKey::Int32(key)) => table.get(*key),
 			(JoinBuildRowsInner::Int64(table), JoinKey::Int64(key)) => table.get(*key),
 			(JoinBuildRowsInner::Hash(rows), key) => rows.get(key),
-			(JoinBuildRowsInner::Int32(_) | JoinBuildRowsInner::Int64(_), _) => None,
+			// The probe's key bytes are already allocated; a stack key adapts them to the table.
+			(JoinBuildRowsInner::InlineGeneric(rows), JoinKey::Generic(bytes)) => {
+				InlineJoinKey::from_slice(bytes).and_then(|key| rows.get(&key))
+			}
+			(
+				JoinBuildRowsInner::Int32(_)
+				| JoinBuildRowsInner::Int64(_)
+				| JoinBuildRowsInner::InlineGeneric(_),
+				_,
+			) => None,
 		}
 	}
 
@@ -362,7 +559,7 @@ impl JoinBuildRows {
 		match &self.inner {
 			JoinBuildRowsInner::Int32(table) => table.get(key),
 			JoinBuildRowsInner::Hash(rows) => rows.get(&JoinKey::Int32(key)),
-			JoinBuildRowsInner::Int64(_) => None,
+			JoinBuildRowsInner::Int64(_) | JoinBuildRowsInner::InlineGeneric(_) => None,
 		}
 	}
 
@@ -370,7 +567,7 @@ impl JoinBuildRows {
 		match &self.inner {
 			JoinBuildRowsInner::Int64(table) => table.get(key),
 			JoinBuildRowsInner::Hash(rows) => rows.get(&JoinKey::Int64(key)),
-			JoinBuildRowsInner::Int32(_) => None,
+			JoinBuildRowsInner::Int32(_) | JoinBuildRowsInner::InlineGeneric(_) => None,
 		}
 	}
 
@@ -430,6 +627,7 @@ impl JoinBuildRows {
 	pub(in crate::exec) fn values(&self) -> Box<dyn Iterator<Item = &BuildRowList> + '_> {
 		match &self.inner {
 			JoinBuildRowsInner::Hash(rows) => Box::new(rows.values()),
+			JoinBuildRowsInner::InlineGeneric(rows) => Box::new(rows.values()),
 			JoinBuildRowsInner::Int32(table) => Box::new(table.values()),
 			JoinBuildRowsInner::Int64(table) => Box::new(table.values()),
 		}
@@ -438,6 +636,7 @@ impl JoinBuildRows {
 	pub(in crate::exec) fn len(&self) -> usize {
 		match &self.inner {
 			JoinBuildRowsInner::Hash(rows) => rows.len(),
+			JoinBuildRowsInner::InlineGeneric(rows) => rows.len(),
 			JoinBuildRowsInner::Int32(table) => table.len(),
 			JoinBuildRowsInner::Int64(table) => table.len(),
 		}
@@ -469,6 +668,26 @@ impl JoinBuildRows {
 					},
 				)
 			}
+			// ADR 621: engine accounting, as the owned formula but with the key inline in the entry
+			// and no per-entry key buffer.
+			JoinBuildRowsInner::InlineGeneric(rows) => {
+				let buckets = rows.capacity().saturating_mul(
+					std::mem::size_of::<(InlineJoinKey, BuildRowList)>().saturating_add(16),
+				);
+				rows.values().fold(
+					u64::try_from(buckets).unwrap_or(u64::MAX),
+					|total, row_list| {
+						total.saturating_add(
+							u64::try_from(
+								row_list
+									.heap_capacity_rows()
+									.saturating_mul(std::mem::size_of::<u32>()),
+							)
+							.unwrap_or(u64::MAX),
+						)
+					},
+				)
+			}
 			JoinBuildRowsInner::Int32(table) => table.accounted_bytes(),
 			JoinBuildRowsInner::Int64(table) => table.accounted_bytes(),
 		}
@@ -477,19 +696,31 @@ impl JoinBuildRows {
 	pub(super) fn capacity(&self) -> usize {
 		match &self.inner {
 			JoinBuildRowsInner::Hash(rows) => rows.capacity(),
+			JoinBuildRowsInner::InlineGeneric(rows) => rows.capacity(),
 			JoinBuildRowsInner::Int32(table) => table.capacity(),
 			JoinBuildRowsInner::Int64(table) => table.capacity(),
 		}
 	}
 
+	/// The table's representation label, in O(1) (no walk of the table).
+	pub(in crate::exec) fn representation(&self) -> &'static str {
+		match &self.inner {
+			JoinBuildRowsInner::Hash(_) => "generic_hash",
+			JoinBuildRowsInner::InlineGeneric(_) => "generic_inline",
+			JoinBuildRowsInner::Int32(_) => "int32_primitive",
+			JoinBuildRowsInner::Int64(_) => "int64_primitive",
+		}
+	}
+
 	pub(super) fn profile_shape(&self) -> JoinBuildProfileShape {
-		let (representation, bucket_capacity) = match &self.inner {
-			JoinBuildRowsInner::Hash(rows) => ("generic_hash", rows.capacity()),
-			JoinBuildRowsInner::Int32(table) => ("int32_primitive", table.bucket_capacity()),
-			JoinBuildRowsInner::Int64(table) => ("int64_primitive", table.bucket_capacity()),
+		let bucket_capacity = match &self.inner {
+			JoinBuildRowsInner::Hash(rows) => rows.capacity(),
+			JoinBuildRowsInner::InlineGeneric(rows) => rows.capacity(),
+			JoinBuildRowsInner::Int32(table) => table.bucket_capacity(),
+			JoinBuildRowsInner::Int64(table) => table.bucket_capacity(),
 		};
 		JoinBuildProfileShape {
-			representation,
+			representation: self.representation(),
 			distinct_keys: u64::try_from(self.len()).unwrap_or(u64::MAX),
 			entry_capacity: u64::try_from(self.capacity()).unwrap_or(u64::MAX),
 			bucket_capacity: u64::try_from(bucket_capacity).unwrap_or(u64::MAX),
@@ -511,7 +742,9 @@ impl JoinBuildRows {
 	pub(super) fn int32_bucket_capacity(&self) -> Option<usize> {
 		match &self.inner {
 			JoinBuildRowsInner::Int32(table) => Some(table.bucket_capacity()),
-			JoinBuildRowsInner::Hash(_) | JoinBuildRowsInner::Int64(_) => None,
+			JoinBuildRowsInner::Hash(_)
+			| JoinBuildRowsInner::InlineGeneric(_)
+			| JoinBuildRowsInner::Int64(_) => None,
 		}
 	}
 
@@ -519,7 +752,9 @@ impl JoinBuildRows {
 	pub(super) fn int64_bucket_capacity(&self) -> Option<usize> {
 		match &self.inner {
 			JoinBuildRowsInner::Int64(table) => Some(table.bucket_capacity()),
-			JoinBuildRowsInner::Hash(_) | JoinBuildRowsInner::Int32(_) => None,
+			JoinBuildRowsInner::Hash(_)
+			| JoinBuildRowsInner::InlineGeneric(_)
+			| JoinBuildRowsInner::Int32(_) => None,
 		}
 	}
 }
@@ -854,6 +1089,9 @@ impl Iterator for BuildRowListRows<'_> {
 
 #[cfg(test)]
 mod join_table_size_scaling;
+
+#[cfg(test)]
+mod inline_generic_keys;
 
 #[cfg(test)]
 mod tests {

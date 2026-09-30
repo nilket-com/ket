@@ -112,6 +112,8 @@ pub(in crate::exec) fn record_join_build_profile(
 			.saturating_mul(std::mem::size_of::<BuildRowList>() as u64),
 		overflow_heap_capacity_bytes,
 		build_micros,
+		representation: build_rows.representation().to_string(),
+		inline_eligible: build_rows.inline_eligible(),
 	};
 	record_join_build_profile_line(&profile);
 	super::record_task_telemetry(telemetry, |task| {

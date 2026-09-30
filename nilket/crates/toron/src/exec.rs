@@ -3192,6 +3192,24 @@ fn encode_partition_key_value(
 	Ok(())
 }
 
+/// ADR 621: the non-null encoded width of one key column under [`encode_partition_key_value`]
+/// (a tag byte and a fixed payload), or `None` for a variable-width or unsupported type. A null
+/// value encodes as a one-byte marker, but a non-null-safe join skips null keys before encoding.
+pub(in crate::exec) fn encoded_join_key_width(data_type: &DataType) -> Option<usize> {
+	match data_type {
+		DataType::Boolean | DataType::Int8 | DataType::UInt8 => Some(2),
+		DataType::Int16 | DataType::UInt16 => Some(3),
+		DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => Some(5),
+		DataType::Int64 | DataType::UInt64 | DataType::Float64 => Some(9),
+		DataType::Timestamp(
+			TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond,
+			Some(timezone),
+		) if timezone.as_ref() == "UTC" => Some(9),
+		DataType::Decimal128(_, _) => Some(17),
+		_ => None,
+	}
+}
+
 // `value` fits a Decimal128 of `precision` iff its magnitude is below 10^precision. precision <= 38, so
 // 10^precision is always representable in i128.
 fn decimal_fits_precision(value: i128, precision: u8) -> bool {
