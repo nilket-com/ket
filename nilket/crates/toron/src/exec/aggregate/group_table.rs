@@ -26,6 +26,9 @@ static NEXT_PROFILE_ID: AtomicU64 = AtomicU64::new(1);
 /// ADR 609: how the grouped fold forms a lookup key for a multi-column key set with a UTF-8
 /// column. `Owned` builds each row's `GroupValue`s (one `String` per UTF-8 key per row);
 /// `Borrowed` hashes and compares the Arrow values in place and owns a key only on insert.
+// A `const` token builds with one variant constructed; the other is the measured alternative, so
+// each arm's build leaves one variant unconstructed by design.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::exec) enum GroupKeyLookup {
 	Owned,
@@ -63,10 +66,12 @@ impl GroupKeyLookupPath {
 			types if types.len() >= 2 && types.iter().any(|t| *t == DataType::Utf8) => {
 				if string_agg {
 					Self::StringAgg
-				} else if form == GroupKeyLookup::Borrowed {
-					Self::BorrowedMulti
 				} else {
-					Self::OwnedGeneric
+					// ADR 610 cleanup: exhaustive, so both forms are named in production code.
+					match form {
+						GroupKeyLookup::Owned => Self::OwnedGeneric,
+						GroupKeyLookup::Borrowed => Self::BorrowedMulti,
+					}
 				}
 			}
 			_ => Self::OwnedGeneric,
@@ -297,6 +302,12 @@ struct BoundGroupedAggregateGroupState {
 	growth_census: Option<Box<GrowthCensus>>,
 	/// ADR 609: present only while the group-key lookup receipt is armed.
 	lookup_receipt: Option<Box<GroupKeyLookupReceipt>>,
+	/// ADR 610: one group id per row of the current two-phase batch, reused across batches. Its
+	/// actual capacity is held in `current_resident_bytes`.
+	group_ids: Vec<u32>,
+	group_ids_peak_capacity_bytes: u64,
+	/// ADR 610: present only while the fold-kernel receipt is armed.
+	fold_kernel_receipt: Option<Box<super::fold_kernel::FoldKernelReceipt>>,
 }
 
 /// Growth is censused, never sampled: it is rare and large enough that row sampling would miss it
@@ -477,7 +488,73 @@ impl BoundGroupedAggregateGroups {
 		if let Some(path) = group_key_lookup_receipt_path() {
 			groups.arm_group_key_lookup_receipt(path);
 		}
+		if let Some(path) = super::fold_kernel::fold_kernel_receipt_path() {
+			groups.arm_fold_kernel_receipt(path);
+		}
 		groups
+	}
+
+	/// ADR 610: record each batch's shape and kernels and write one receipt line at finalize.
+	pub(in crate::exec) fn arm_fold_kernel_receipt(&mut self, path: PathBuf) {
+		self.state.fold_kernel_receipt =
+			Some(Box::new(super::fold_kernel::FoldKernelReceipt::new(path)));
+	}
+
+	pub(in crate::exec) fn fold_kernel_receipt_mut(
+		&mut self,
+	) -> Option<&mut super::fold_kernel::FoldKernelReceipt> {
+		self.state.fold_kernel_receipt.as_deref_mut()
+	}
+
+	/// ADR 610: empty the group-id buffer and make room for `rows` ids. The request is guarded
+	/// before reserving; the actual capacity, which `try_reserve_exact` may exceed, is what the
+	/// resident accounting then holds and guards.
+	pub(in crate::exec) fn prepare_group_ids(&mut self, rows: usize) -> Result<(), ExecutionError> {
+		let state = &mut *self.state;
+		state.group_ids.clear();
+		let before = state.group_ids.capacity();
+		if before >= rows {
+			return Ok(());
+		}
+		let requested = capacity_bytes::<u32>(rows).saturating_sub(capacity_bytes::<u32>(before));
+		state.guard(state.current_resident_bytes().saturating_add(requested))?;
+		state
+			.group_ids
+			.try_reserve_exact(rows)
+			.map_err(|error| table_error(format!("group-id buffer reservation failed: {error}")))?;
+		let after = state.group_ids.capacity();
+		let grown = capacity_bytes::<u32>(after).saturating_sub(capacity_bytes::<u32>(before));
+		state.current_resident_bytes = state.current_resident_bytes.saturating_add(grown);
+		state.observe_peak();
+		state.group_ids_peak_capacity_bytes = state
+			.group_ids_peak_capacity_bytes
+			.max(capacity_bytes::<u32>(after));
+		state.guard(state.current_resident_bytes())
+	}
+
+	/// ADR 610: append a row's group id; `prepare_group_ids` has reserved the batch.
+	pub(in crate::exec) fn push_group_id(&mut self, entry: usize) -> Result<(), ExecutionError> {
+		let id = u32::try_from(entry)
+			.map_err(|_| table_error("group id exceeds the u32 entry domain"))?;
+		if self.state.group_ids.len() == self.state.group_ids.capacity() {
+			return Err(table_error("group-id buffer exceeded its reserved batch"));
+		}
+		self.state.group_ids.push(id);
+		Ok(())
+	}
+
+	/// ADR 610: the batch's group ids beside the aggregate states they address.
+	pub(in crate::exec) fn with_group_ids_and_states<R>(
+		&mut self,
+		update: impl FnOnce(&[u32], &mut [Vec<AggState>]) -> Result<R, ExecutionError>,
+	) -> Result<R, ExecutionError> {
+		let state = &mut *self.state;
+		update(&state.group_ids, &mut state.states)
+	}
+
+	#[cfg(test)]
+	pub(in crate::exec) fn group_ids_peak_capacity_bytes(&self) -> u64 {
+		self.state.group_ids_peak_capacity_bytes
 	}
 
 	/// ADR 609: count this instance's lookup-key constructions and write one receipt line at
@@ -568,6 +645,9 @@ impl BoundGroupedAggregateGroups {
 			profile,
 			growth_census: None,
 			lookup_receipt: None,
+			group_ids: Vec::new(),
+			group_ids_peak_capacity_bytes: 0,
+			fold_kernel_receipt: None,
 		};
 		let mut groups = Self {
 			state: Box::new(state),
@@ -667,12 +747,12 @@ impl BoundGroupedAggregateGroups {
 	/// allocation at all (48M rows finding three groups previously allocated 48M
 	/// vectors). Resident accounting is unchanged: the guard still charges the
 	/// owned key it actually stores.
-	pub(in crate::exec) fn entry_or_init(
+	pub(in crate::exec) fn entry_index_or_init(
 		&mut self,
 		key: &[GroupValue],
 		state_count: usize,
 		init: impl FnOnce() -> Result<Vec<AggState>, ExecutionError>,
-	) -> Result<&mut Vec<AggState>, ExecutionError> {
+	) -> Result<usize, ExecutionError> {
 		let lookup = self.state.lookup_entry(key)?;
 		if let Some(profile) = self.state.profile.as_mut() {
 			profile.record_lookup(lookup.probes, lookup.entry.is_some());
@@ -690,11 +770,7 @@ impl BoundGroupedAggregateGroups {
 			}
 		}
 		if let Some(entry) = lookup.entry {
-			return self
-				.state
-				.states
-				.get_mut(entry)
-				.ok_or_else(|| table_error("hash bucket points past aggregate states"));
+			return Ok(entry);
 		}
 		let requested_quantile_states = self
 			.state
@@ -775,21 +851,39 @@ impl BoundGroupedAggregateGroups {
 			reservation.commit();
 		}
 		self.state.observe_peak();
+		Ok(self.state.states.len() - 1)
+	}
+
+	pub(in crate::exec) fn entry_or_init(
+		&mut self,
+		key: &[GroupValue],
+		state_count: usize,
+		init: impl FnOnce() -> Result<Vec<AggState>, ExecutionError>,
+	) -> Result<&mut Vec<AggState>, ExecutionError> {
+		let entry = self.entry_index_or_init(key, state_count, init)?;
+		self.states_at_mut(entry)
+	}
+
+	/// ADR 610: the aggregate states of the entry an index-returning lookup produced.
+	pub(in crate::exec) fn states_at_mut(
+		&mut self,
+		entry: usize,
+	) -> Result<&mut Vec<AggState>, ExecutionError> {
 		self.state
 			.states
-			.last_mut()
-			.ok_or_else(|| table_error("inserted aggregate state is missing"))
+			.get_mut(entry)
+			.ok_or_else(|| table_error("hash bucket points past aggregate states"))
 	}
 
 	/// Probe a single UTF-8 group key without allocating an owned `String` on
 	/// every row. The cold insertion path delegates to `entry_or_init`, which
 	/// retains the established ownership and resident-accounting contract.
-	pub(in crate::exec) fn entry_or_init_single_utf8(
+	pub(in crate::exec) fn entry_index_or_init_single_utf8(
 		&mut self,
 		value: Option<&str>,
 		state_count: usize,
 		init: impl FnOnce() -> Result<Vec<AggState>, ExecutionError>,
-	) -> Result<&mut Vec<AggState>, ExecutionError> {
+	) -> Result<usize, ExecutionError> {
 		let lookup = self.state.lookup_single_utf8(value)?;
 		if let Some(entry) = lookup.entry {
 			if let Some(profile) = self.state.profile.as_mut() {
@@ -801,11 +895,7 @@ impl BoundGroupedAggregateGroups {
 					self.state.entry_limit,
 				);
 			}
-			return self
-				.state
-				.states
-				.get_mut(entry)
-				.ok_or_else(|| table_error("hash bucket points past aggregate states"));
+			return Ok(entry);
 		}
 
 		let owned = [match value {
@@ -815,19 +905,29 @@ impl BoundGroupedAggregateGroups {
 		if let Some(receipt) = self.state.lookup_receipt.as_mut() {
 			receipt.count_built(1, usize::from(value.is_some()));
 		}
-		self.entry_or_init(&owned, state_count, init)
+		self.entry_index_or_init(&owned, state_count, init)
+	}
+
+	pub(in crate::exec) fn entry_or_init_single_utf8(
+		&mut self,
+		value: Option<&str>,
+		state_count: usize,
+		init: impl FnOnce() -> Result<Vec<AggState>, ExecutionError>,
+	) -> Result<&mut Vec<AggState>, ExecutionError> {
+		let entry = self.entry_index_or_init_single_utf8(value, state_count, init)?;
+		self.states_at_mut(entry)
 	}
 
 	/// ADR 609: probe a multi-column key read in place. A hit records one lookup, as the owned
 	/// path does; a miss records nothing here, owns the key once, and falls through to
 	/// `entry_or_init`, whose own lookup is the one recorded, so the profile counts one logical
 	/// lookup per row either way (two physical lookups per miss).
-	pub(in crate::exec) fn entry_or_init_borrowed(
+	pub(in crate::exec) fn entry_index_or_init_borrowed(
 		&mut self,
 		key: &[GroupKeyRef<'_>],
 		state_count: usize,
 		init: impl FnOnce(&[GroupValue]) -> Result<Vec<AggState>, ExecutionError>,
-	) -> Result<&mut Vec<AggState>, ExecutionError> {
+	) -> Result<usize, ExecutionError> {
 		let lookup = self.state.lookup_borrowed(key)?;
 		if let Some(entry) = lookup.entry {
 			if let Some(profile) = self.state.profile.as_mut() {
@@ -839,11 +939,7 @@ impl BoundGroupedAggregateGroups {
 					self.state.entry_limit,
 				);
 			}
-			return self
-				.state
-				.states
-				.get_mut(entry)
-				.ok_or_else(|| table_error("hash bucket points past aggregate states"));
+			return Ok(entry);
 		}
 
 		let owned = key
@@ -857,13 +953,27 @@ impl BoundGroupedAggregateGroups {
 				.count();
 			receipt.count_built(owned.len(), utf8);
 		}
-		self.entry_or_init(&owned, state_count, || init(&owned))
+		self.entry_index_or_init(&owned, state_count, || init(&owned))
+	}
+
+	pub(in crate::exec) fn entry_or_init_borrowed(
+		&mut self,
+		key: &[GroupKeyRef<'_>],
+		state_count: usize,
+		init: impl FnOnce(&[GroupValue]) -> Result<Vec<AggState>, ExecutionError>,
+	) -> Result<&mut Vec<AggState>, ExecutionError> {
+		let entry = self.entry_index_or_init_borrowed(key, state_count, init)?;
+		self.states_at_mut(entry)
 	}
 
 	pub(in crate::exec) fn finalize_sorted(
 		&mut self,
 	) -> Result<Vec<BoundGroupedAggregateEntry<'_>>, ExecutionError> {
 		self.write_group_key_lookup_receipt()?;
+		let peak = self.state.group_ids_peak_capacity_bytes;
+		if let Some(receipt) = self.state.fold_kernel_receipt.as_mut() {
+			receipt.write(peak)?;
+		}
 		let requested_scratch = capacity_bytes::<BoundGroupedAggregateEntry<'_>>(self.len());
 		let projected = self
 			.current_resident_bytes()
@@ -950,7 +1060,8 @@ impl BoundGroupedAggregateGroups {
 			.saturating_add(self.state.keys.outer_capacity_bytes())
 			.saturating_add(capacity_bytes::<Vec<AggState>>(
 				self.state.states.capacity(),
-			));
+			))
+			.saturating_add(capacity_bytes::<u32>(self.state.group_ids.capacity()));
 		let keys = self.state.keys.inner_resident_bytes();
 		let states = self
 			.state
@@ -2617,5 +2728,153 @@ mod tests {
 			})
 			.expect("insert");
 		assert!(groups.finalize_sorted().is_err());
+	}
+
+	#[test]
+	fn adr610_index_lookups_equal_the_mut_forms_through_growth() {
+		let profile_a = test_directory("adr610_index_a");
+		let profile_b = test_directory("adr610_index_b");
+		let receipt_a = test_directory("adr610_index_a_receipt");
+		let receipt_b = test_directory("adr610_index_b_receipt");
+		let mut by_index = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| {
+			Some(profile_a.clone().into_os_string())
+		});
+		let mut by_mut = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| {
+			Some(profile_b.clone().into_os_string())
+		});
+		by_index.arm_group_key_lookup_receipt(receipt_a.clone());
+		by_mut.arm_group_key_lookup_receipt(receipt_b.clone());
+		let names = (0..300)
+			.map(|i| format!("k{}", i % 120))
+			.collect::<Vec<_>>();
+		for (row, name) in names.iter().enumerate() {
+			let value = (row % 120) as i64;
+			// Borrowed multi-key, single UTF-8, and owned generic, each through growth.
+			let borrowed = [GroupKeyRef::Utf8(name), GroupKeyRef::Int64(value)];
+			let id = by_index
+				.entry_index_or_init_borrowed(&borrowed, 1, |_| Ok(count_state(0)))
+				.expect("index borrowed");
+			if let [AggState::Count(total)] =
+				by_index.states_at_mut(id).expect("state").as_mut_slice()
+			{
+				*total += 1;
+			}
+			if let [AggState::Count(total)] = by_mut
+				.entry_or_init_borrowed(&borrowed, 1, |_| Ok(count_state(0)))
+				.expect("mut borrowed")
+				.as_mut_slice()
+			{
+				*total += 1;
+			}
+		}
+		let lookups = |groups: &BoundGroupedAggregateGroups| {
+			groups
+				.state
+				.profile
+				.as_ref()
+				.expect("profile")
+				.entry_lookups
+		};
+		assert_eq!(lookups(&by_index), 300);
+		assert_eq!(lookups(&by_mut), 300);
+		let entries = |groups: &mut BoundGroupedAggregateGroups| {
+			groups
+				.finalize_sorted()
+				.expect("finalize")
+				.iter()
+				.map(|entry| (entry.key.to_vec(), format!("{:?}", entry.states)))
+				.collect::<Vec<_>>()
+		};
+		let index_entries = entries(&mut by_index);
+		assert_eq!(index_entries.len(), 120);
+		assert_eq!(index_entries, entries(&mut by_mut));
+		let receipt = |path: &PathBuf| std::fs::read_to_string(path).expect("receipt");
+		let (a, b) = (receipt(&receipt_a), receipt(&receipt_b));
+		for path in [&receipt_a, &receipt_b] {
+			let _ = std::fs::remove_file(path);
+		}
+		for directory in [&profile_a, &profile_b] {
+			let _ = std::fs::remove_dir_all(directory);
+		}
+		let a: serde_json::Value = serde_json::from_str(a.trim()).expect("json");
+		let b: serde_json::Value = serde_json::from_str(b.trim()).expect("json");
+		assert_eq!(a["misses"], b["misses"]);
+		assert_eq!(a["lookup_key_values_built"], b["lookup_key_values_built"]);
+		assert_eq!(a["misses"], 120);
+
+		// Single-UTF-8 and single-Int64 paths: index forms address the same entries.
+		let mut groups = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| None);
+		groups.configure_key_storage(&[DataType::Int64]);
+		let ids = (0..500i64)
+			.map(|value| {
+				groups
+					.entry_index_or_init(&[GroupValue::Int64(value % 200)], 1, || {
+						Ok(count_state(value % 200))
+					})
+					.expect("int64 index")
+			})
+			.collect::<Vec<_>>();
+		for (row, id) in ids.iter().enumerate() {
+			assert!(matches!(
+				groups.states_at_mut(*id).expect("state").as_slice(),
+				[AggState::Count(seed)] if *seed == (row as i64) % 200
+			));
+		}
+		let mut groups = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| None);
+		let first = groups
+			.entry_index_or_init_single_utf8(Some("R"), 1, || Ok(count_state(7)))
+			.expect("utf8 insert");
+		for index in 0..100 {
+			groups
+				.entry_index_or_init_single_utf8(Some(&format!("x{index}")), 1, || {
+					Ok(count_state(0))
+				})
+				.expect("growth");
+		}
+		let again = groups
+			.entry_index_or_init_single_utf8(Some("R"), 1, || panic!("hit"))
+			.expect("utf8 hit");
+		assert_eq!(first, again);
+		assert!(matches!(
+			groups.states_at_mut(again).expect("state").as_slice(),
+			[AggState::Count(7)]
+		));
+	}
+
+	#[test]
+	fn adr610_group_id_buffer_accounts_its_actual_capacity() {
+		let mut groups = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| None);
+		let before = groups.current_resident_bytes();
+		groups.prepare_group_ids(1_000).expect("reserve");
+		let capacity = groups.state.group_ids.capacity();
+		assert!(capacity >= 1_000);
+		assert_eq!(
+			groups.current_resident_bytes(),
+			before + capacity_bytes::<u32>(capacity)
+		);
+		assert_eq!(
+			groups.current_resident_bytes(),
+			groups.recomputed_resident_bytes_for_test()
+		);
+		assert_eq!(
+			groups.group_ids_peak_capacity_bytes(),
+			capacity_bytes::<u32>(capacity)
+		);
+		// A smaller batch reuses the buffer without new bytes.
+		groups.prepare_group_ids(10).expect("reuse");
+		assert_eq!(groups.state.group_ids.capacity(), capacity);
+		assert_eq!(
+			groups.current_resident_bytes(),
+			groups.recomputed_resident_bytes_for_test()
+		);
+		for id in 0..10 {
+			groups.push_group_id(id).expect("push");
+		}
+		// A budget below the next request refuses the reservation with the table's budget error.
+		groups.set_growth_budget_bytes(Some(groups.current_resident_bytes()));
+		assert!(matches!(
+			groups.prepare_group_ids(capacity + 1),
+			Err(ExecutionError::BudgetExhausted { .. })
+		));
 	}
 }

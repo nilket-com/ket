@@ -1,14 +1,25 @@
 # ADR 610 - batch group ids and typed aggregate kernels in the grouped fold
 
-**Status:** PROPOSED. Successor to ADR 609, which retained borrowed
+**Status:** CLOSED, RETAINED on q01, with a known q13 regression
+pending ADR 611 (results in
+`plans/impl/0610_batch_group_ids_and_typed_aggregate_kernels_results.md`).
+- **q01:** 4,087.1 ms control against 3,325.1 ms treatment, a median
+  paired gain of 754.9 ms (18.5%) against a bar of 24.7 ms. Every pair
+  was positive, with digest parity and no material RSS difference
+  observed.
+- **q13 breadth pair:** the regression guard fired: a median paired
+  gain of −122.4 ms against a bar of 76.3 ms, with all five pairs
+  negative and RSS about 2.7 MB higher. That opens ADR 611.
+
+The token stays `TwoPhase`. Successor to ADR 609, which retained borrowed
 multi-key lookup: q01 went from 4,524.0 ms to 3,810.5 ms, a median
-paired gain of 713.4 ms. The grouped fold still processes one row at a
-time. For each row it looks up the group, and then for each aggregate
-it:
-- matches the state;
-- reads the input through a per-row type match into a `NumericValue`
+paired gain of 713.4 ms. Before this record, the grouped fold (this
+record's control) processed one row at a time. For each row it looked
+up the group, and then for each aggregate it:
+- matched the state;
+- read the input through a per-row type match into a `NumericValue`
   enum;
-- updates through a second match on the state and value pair.
+- updated through a second match on the state and value pair.
 
 This record splits the fold into two phases per batch, as one token:
 1. assign every row its group id;
