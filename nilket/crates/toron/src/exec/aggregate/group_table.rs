@@ -32,7 +32,7 @@ pub(in crate::exec) enum GroupKeyLookup {
 	Borrowed,
 }
 
-pub(in crate::exec) const GROUP_KEY_LOOKUP: GroupKeyLookup = GroupKeyLookup::Owned;
+pub(in crate::exec) const GROUP_KEY_LOOKUP: GroupKeyLookup = GroupKeyLookup::Borrowed;
 
 /// ADR 609: diagnostic, one JSON line per aggregate instance at finalize; absent, nothing counts.
 pub(in crate::exec) const GROUP_KEY_LOOKUP_RECEIPT_ENV: &str =
