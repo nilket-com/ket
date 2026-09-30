@@ -1,6 +1,13 @@
 # ADR 613 - SF8 board re-seal after the grouped-fold cuts
 
-**Status:** PROPOSED. Successor to ADR 612. Main has changed since ADR
+**Status:** CLOSED, SEALED. One board on strix (results in
+`plans/impl/0613_sf8_board_reseal_after_the_grouped_fold_cuts_results.md`;
+artifact `2f029448…`, evidence tag
+`evidence/906b879e526f-2f02944827b6`). Toron 61.387 s against DuckDB
+15.579 s, 3.940×. Toron is 30.229 s above 2× this board's DuckDB total,
+and 30.021 s above the fixed 31.366 s threshold. Every digest equals
+ADR 608's, and every cell is stable. No cross-board attribution.
+Successor to ADR 612. Main has changed since ADR
 608 sealed the current-tree board (Toron 62.706 s against DuckDB
 15.600 s, 4.020×):
 
