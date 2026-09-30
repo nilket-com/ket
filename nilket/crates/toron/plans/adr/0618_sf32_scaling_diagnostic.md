@@ -1,6 +1,16 @@
 # ADR 618 - SF32 scaling diagnostic
 
-**Status:** PROPOSED. Successor to ADR 617. **A diagnostic record: no
+**Status:** CLOSED (results in
+`plans/impl/0618_sf32_scaling_diagnostic_results.md`). All 210 blocks
+and all 30 timed groups passed, as did every diagnostic gate except one
+withheld profile (q01 at SF16).
+- q21 and q18 show a single step between SF8 and SF16, then
+  approximately double from SF16 to SF32.
+- q09's gap widens at both doublings (4.13× → 4.52× → 4.93×), with its
+  probe, materialize, and preparation stages above ×2 at both steps.
+- q05's gap narrows, and q01's holds.
+
+The amendment armed no additional telemetry. Successor to ADR 617. **A diagnostic record: no
 token, no pair, no cut, no saving projected.** Sealed SF8 at ADR 613's
 coordinate stays the campaign target. SF16 and SF32 artifacts are
 unsealed diagnostics and never enter the SF8 board.
