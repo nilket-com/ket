@@ -130,22 +130,31 @@ aggregate instance, accumulated over all its fold calls. With
 JSON line when it finalizes. Without it, the counters are not
 incremented, and nothing is written. The line holds:
 - the function;
-- the node attribution route, when present;
+- the node attribution route. It is written as `null`: node attribution
+  exposes no route getter, and routes exist only while profiling. This
+  is an implementation amendment, and the function name identifies the
+  loop;
 - the key column types;
 - the UTF-8 key count;
 - the form;
 - the path taken: `borrowed_multi`, `single_utf8`, `single_int64`,
-  `owned_generic`, or `string_agg`;
+  `owned_generic`, or `string_agg`. The last is a fold with a
+  `STRING_AGG` call whose key set would otherwise be `borrowed_multi`.
+  It keeps the owned lookup under both forms, so ADR 609 leaves such
+  folds untouched;
 - `rows_folded`;
 - `groups_final`;
 - `lookup_key_values_built`: the owned `GroupValue`s built to form
-  lookup keys. Under `Owned` on the multi-key path this is
-  rows × key columns. Under `Borrowed` it is misses × key columns.
-  The storage's insert copy is excluded, since it is the same under
-  both forms;
-- `lookup_utf8_strings_built`: the owned UTF-8 `String`s among those.
-  Under `Owned` this is rows × UTF-8 key columns. Under `Borrowed` it
-  is misses × UTF-8 key columns;
+  lookup keys, NULLs included. Under `Owned` on the multi-key path this
+  is exactly rows × key columns. Under `Borrowed` it is exactly
+  misses × key columns. The storage's insert copy is excluded, since it
+  is the same under both forms;
+- `lookup_utf8_strings_built`: the owned UTF-8 `String`s among those,
+  one per **non-null** UTF-8 key value (a NULL builds no `String`).
+  - Under `Owned` it is at most rows × UTF-8 key columns, with equality
+    exactly when no UTF-8 key value is NULL.
+  - Under `Borrowed` it is at most misses × UTF-8 key columns, with
+    equality exactly when no inserted key has a NULL UTF-8 value;
 - `misses`.
 
 These are code-path counters, not allocator readings. q01's ~95 M
@@ -161,16 +170,27 @@ no pair runs, unless all of these hold:
 - q01's aggregate instance reports `borrowed_multi` under `Borrowed`
   and `owned_generic` under `Owned`, with equal `rows_folded` and
   `groups_final` between the forms;
-- under `Owned`, q01's `lookup_utf8_strings_built` equals
+- under `Owned`, q01's `lookup_key_values_built` equals
   `rows_folded` × 2;
 - under `Borrowed`, q01's `misses` equals `groups_final`, and
-  `lookup_utf8_strings_built` equals `groups_final` × 2.
+  `lookup_key_values_built` equals `groups_final` × 2;
+- both of q01's keys are UTF-8, so `lookup_utf8_strings_built` equal to
+  `lookup_key_values_built` establishes that no q01 key value is NULL.
+  Only then is q01's exact `String` product (`rows_folded` × 2 under
+  `Owned`, `groups_final` × 2 under `Borrowed`) stated. Otherwise the
+  gate reports the difference as the NULL count, and states the
+  inequalities above.
 
 For every cell, the gate sums `rows_folded` over all of that cell's
 `borrowed_multi` instances. The **breadth cell** is the non-q01 cell
 with the largest sum, provided that is at least 1 M rows, and provided
-its receipts satisfy the same form relations and both its digests
-pass. Otherwise no breadth pair runs, and the record says so.
+its receipts satisfy the form relations, NULLs allowed. Those are:
+- `rows_folded` and `groups_final` equal between the forms;
+- `lookup_key_values_built` exact: rows × keys under `Owned`, and
+  misses × keys with misses = `groups_final` under `Borrowed`;
+- `lookup_utf8_strings_built` within its bounds.
+
+Both its digests must also pass. Otherwise no breadth pair runs, and the record says so.
 
 *The pairs.* ADR 597's paired driver, as in ADR 606 and ADR 607:
 - control `Owned`, treatment `Borrowed`, differing by the one token;
@@ -211,7 +231,11 @@ follows.
   - inserts only on misses: over a multi-batch fold, `misses` equals
     `groups_final` and `lookup_utf8_strings_built` equals
     `groups_final` × the UTF-8 key count under `Borrowed`, and
-    rows × that count under `Owned`;
+    rows × that count under `Owned`, when no key value is NULL. With
+    NULL keys, the key-value products stay exact and the `String`
+    counts fall below their bounds by the NULL count (a fixture folds
+    two NULL UTF-8 values: 22 values and 20 `String`s owned, 10 and 9
+    borrowed);
   - the probe profile counts one logical lookup per row under both
     forms;
   - growth across a rehash under `Borrowed`, with lookups still hitting
