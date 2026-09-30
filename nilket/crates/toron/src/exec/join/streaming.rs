@@ -3655,8 +3655,7 @@ pub(in crate::exec) enum ReuseBuildExchange {
 	Bypass,
 }
 
-pub(in crate::exec) const REUSE_BUILD_EXCHANGE: ReuseBuildExchange =
-	ReuseBuildExchange::Repartition;
+pub(in crate::exec) const REUSE_BUILD_EXCHANGE: ReuseBuildExchange = ReuseBuildExchange::Bypass;
 
 /// ADR 615: the reoriented chain's attribution handle, passed only from its prep loop so that the
 /// sub-stages of a replay's `prep_build` open only where `prep_build` is itself open. `None`
