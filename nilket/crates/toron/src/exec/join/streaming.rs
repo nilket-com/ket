@@ -3644,6 +3644,19 @@ fn reoriented_stage_scan_build_decision_for_materialized_batches(
 /// keeps only whether the check said `Stream` and re-reads an under-cap stage to build it;
 /// `Reuse` builds an under-cap stage from the check's own batches, through the stage's exchange,
 /// where control would run that exchange through `bound_exchange`.
+/// ADR 616: whether the wrapped arm's reused build batches pass through the build input's
+/// exchange before the build. On this path the exchange's partitions are concatenated again and
+/// built into one table, so `Bypass` hands the batches to the build directly.
+// A `const` token builds with one variant constructed; the other is the measured alternative.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::exec) enum ReuseBuildExchange {
+	Repartition,
+	Bypass,
+}
+
+pub(in crate::exec) const REUSE_BUILD_EXCHANGE: ReuseBuildExchange = ReuseBuildExchange::Bypass;
+
 /// ADR 615: the reoriented chain's attribution handle, passed only from its prep loop so that the
 /// sub-stages of a replay's `prep_build` open only where `prep_build` is itself open. `None`
 /// everywhere else, where no timer code runs.
@@ -3850,6 +3863,88 @@ fn reoriented_cap_check_equivalence(
 		"reused_partition_rows": reused_signature.0,
 		"control_partition_rows": control_signature.0,
 	}))
+}
+
+/// ADR 616: an order-independent multiset sketch of two batch sets: each row encoded with the
+/// Arrow row format (nulls included), hashed to 128 bits (BLAKE3, truncated), and combined by a
+/// wrapping sum and a XOR, beside the exact row count and schema. A probabilistic sketch, not
+/// proof of multiset equality: distinct multisets can share both accumulators. It adds one
+/// encoded batch at a time and constant state; it does not bound the caller's memory.
+fn commutative_row_digest_sketch_equivalence(
+	reused: &[RecordBatch],
+	control: &[RecordBatch],
+) -> Result<serde_json::Value, ExecutionError> {
+	let reused_sketch = commutative_row_digest_sketch(reused)?;
+	let control_sketch = commutative_row_digest_sketch(control)?;
+	let passed = reused_sketch == control_sketch;
+	Ok(serde_json::json!({
+		"checked": true,
+		"mode": "commutative_row_digest_sketch",
+		"qualification": "probabilistic multiset sketch, not proof of multiset equality",
+		"equivalence_passed": passed,
+		"reused": commutative_sketch_json(&reused_sketch),
+		"control": commutative_sketch_json(&control_sketch),
+	}))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CommutativeRowSketch {
+	schema: Option<String>,
+	rows: u64,
+	sum: u128,
+	xor: u128,
+}
+
+fn commutative_sketch_json(sketch: &CommutativeRowSketch) -> serde_json::Value {
+	serde_json::json!({
+		"rows": sketch.rows,
+		"sum": format!("{:032x}", sketch.sum),
+		"xor": format!("{:032x}", sketch.xor),
+	})
+}
+
+fn commutative_row_digest_sketch(
+	batches: &[RecordBatch],
+) -> Result<CommutativeRowSketch, ExecutionError> {
+	let sketch_error = |message: String| ExecutionError::Kernel {
+		message: format!("commutative row digest sketch: {message}"),
+	};
+	let mut sketch = CommutativeRowSketch {
+		schema: None,
+		rows: 0,
+		sum: 0,
+		xor: 0,
+	};
+	let Some(first) = batches.first() else {
+		return Ok(sketch);
+	};
+	let schema = first.schema();
+	sketch.schema = Some(format!("{:?}", schema.fields()));
+	let fields = schema
+		.fields()
+		.iter()
+		.map(|field| arrow::row::SortField::new(field.data_type().clone()))
+		.collect::<Vec<_>>();
+	let converter =
+		arrow::row::RowConverter::new(fields).map_err(|error| sketch_error(error.to_string()))?;
+	for batch in batches {
+		if batch.schema() != schema {
+			return Err(sketch_error("batches disagree on schema".to_string()));
+		}
+		let rows = converter
+			.convert_columns(batch.columns())
+			.map_err(|error| sketch_error(error.to_string()))?;
+		for row in rows.iter() {
+			let hash = blake3::hash(row.as_ref());
+			let mut bytes = [0u8; 16];
+			bytes.copy_from_slice(&hash.as_bytes()[..16]);
+			let value = u128::from_le_bytes(bytes);
+			sketch.sum = sketch.sum.wrapping_add(value);
+			sketch.xor ^= value;
+			sketch.rows += 1;
+		}
+	}
+	Ok(sketch)
 }
 
 /// Per-partition row counts and canonical digests, for the receipt's equivalence check.
@@ -12798,21 +12893,29 @@ impl Executor {
 		);
 		let reused_batches = match (&decision, reusable) {
 			(ReorientedStageScanBuildDecision::MaterializedBatches(batches), true) => {
-				// ADR 615: the reuse branch alone — on an `Exchange`, `exchange_input_batches`.
-				let exchange_timer = prep.and_then(|prep| prep.open("prep_exchange", replay));
-				let reused = match &exchange {
-					Some((partition_count, key, schema)) => self.exchange_input_batches(
-						batches.clone(),
-						schema.clone(),
-						*partition_count,
-						key,
-					)?,
-					None => batches.clone(),
-				};
-				if let Some(prep) = prep {
-					prep.close(exchange_timer);
+				match (&exchange, REUSE_BUILD_EXCHANGE) {
+					// ADR 616: the build concatenates the batches into one table, so they go to it
+					// directly; `prep_exchange` is not opened.
+					(Some(_), ReuseBuildExchange::Bypass) => Some(batches.clone()),
+					_ => {
+						// ADR 615: the reuse branch alone — on an `Exchange`, `exchange_input_batches`.
+						let exchange_timer =
+							prep.and_then(|prep| prep.open("prep_exchange", replay));
+						let reused = match &exchange {
+							Some((partition_count, key, schema)) => self.exchange_input_batches(
+								batches.clone(),
+								schema.clone(),
+								*partition_count,
+								key,
+							)?,
+							None => batches.clone(),
+						};
+						if let Some(prep) = prep {
+							prep.close(exchange_timer);
+						}
+						Some(reused)
+					}
 				}
-				Some(reused)
 			}
 			_ => None,
 		};
@@ -12821,7 +12924,12 @@ impl Executor {
 			let equivalence = match &reused_batches {
 				Some(reused) => {
 					let control = self.execute_bound_node(stage.build, morsel).await?;
-					reoriented_cap_check_equivalence(reused, &control)?
+					if exchange.is_some() && REUSE_BUILD_EXCHANGE == ReuseBuildExchange::Bypass {
+						// ADR 616: no partitions to match; an order-independent sketch instead.
+						commutative_row_digest_sketch_equivalence(reused, &control)?
+					} else {
+						reoriented_cap_check_equivalence(reused, &control)?
+					}
 				}
 				None => serde_json::json!({"checked": false, "equivalence_passed": null}),
 			};
@@ -12836,6 +12944,24 @@ impl Executor {
 					"shape": reoriented_cap_check_stage_shape(stage.build),
 					"partition_count": exchange.as_ref().map(|(count, _, _)| *count),
 					"reused": form == WrappedCapCheckBatches::Reuse && reused_batches.is_some(),
+					"reuse_build_exchange": format!("{REUSE_BUILD_EXCHANGE:?}"),
+					"build_estimate": match &reused_batches {
+						// ADR 616: the estimate and memory cap the prepare step computes from these
+						// same batches, and the path they imply; diagnostic only.
+						Some(reused) => {
+							let estimate =
+								estimated_build_hash_bytes_for_batches(reused, &stage.build_keys)?;
+							let cap = join_output_materialization_memory_cap(
+								self.context.task_budget.memory.get(),
+							);
+							serde_json::json!({
+								"estimated_build_bytes": estimate,
+								"memory_cap_bytes": cap,
+								"path": if estimate > cap { "spilled" } else { "in_memory" },
+							})
+						}
+						None => serde_json::Value::Null,
+					},
 					"equivalence": equivalence,
 				}),
 			)?;
@@ -38512,25 +38638,51 @@ mod tests {
 					.execute_bound_node(&build, None)
 					.await
 					.expect("control build");
-				assert_eq!(reused.len(), 4, "{label}: one batch per partition");
 				assert_eq!(control.len(), 4, "{label}");
-				assert!(
-					reused
-						.iter()
-						.zip(&control)
-						.all(|(left, right)| left.schema() == right.schema())
-				);
-				assert_eq!(
-					exchange_output_signature(&reused).unwrap(),
-					exchange_output_signature(&control).unwrap(),
-					"{label}: per-partition rows and digests"
-				);
+				let rows = |batches: &[RecordBatch]| {
+					batches.iter().map(RecordBatch::num_rows).sum::<usize>()
+				};
+				match REUSE_BUILD_EXCHANGE {
+					// ADR 606: the reused batches pass through the exchange, so they match control's
+					// partitions exactly.
+					ReuseBuildExchange::Repartition => {
+						assert_eq!(reused.len(), 4, "{label}: one batch per partition");
+						assert!(
+							reused
+								.iter()
+								.zip(&control)
+								.all(|(left, right)| left.schema() == right.schema())
+						);
+						assert_eq!(
+							exchange_output_signature(&reused).unwrap(),
+							exchange_output_signature(&control).unwrap(),
+							"{label}: per-partition rows and digests"
+						);
+						if label == "rows" {
+							assert!(
+								reused.iter().any(|batch| batch.num_rows() == 0),
+								"an empty partition"
+							);
+						}
+					}
+					// ADR 616: the reused batches bypass the exchange, so they are the cap check's
+					// own batches: the same rows as control's partitions, not partitioned.
+					ReuseBuildExchange::Bypass => {
+						if rows(&reused) > 0 {
+							assert_eq!(
+								commutative_row_digest_sketch_equivalence(&reused, &control)
+									.expect("sketch")["equivalence_passed"],
+								true,
+								"{label}: the same rows as control"
+							);
+						}
+						// With no input rows the cap check yields no batches, and control four
+						// empty ones: nothing to sketch beyond the row count.
+					}
+				}
+				assert_eq!(rows(&reused), rows(&control), "{label}: row count");
 				if label == "rows" {
-					assert!(
-						reused.iter().any(|batch| batch.num_rows() == 0),
-						"an empty partition"
-					);
-					assert_eq!(reused.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+					assert_eq!(rows(&reused), 2);
 				}
 				// Discard keeps control's behavior: the stage is re-read.
 				assert!(matches!(
@@ -38651,6 +38803,174 @@ mod tests {
 				"the same join output from the same build state"
 			);
 		}
+	}
+
+	// ADR 616: the same materialized build batches, handed to the build directly (`Bypass`) and
+	// through the exchange (`Repartition`), build the same join result and the same estimate,
+	// in memory and when forced to spill.
+	#[tokio::test]
+	async fn adr616_bypassed_and_exchanged_batches_build_the_same_join_result() {
+		let probe_schema = Arc::new(Schema::new(vec![Field::new(
+			"probe_key",
+			DataType::Int64,
+			false,
+		)]));
+		let output_schema = concat_test_schema(&probe_schema, &adr606_schema());
+		let probe = RecordBatch::try_new(
+			probe_schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![3, 1, 99_999, 2, 3, 7]))],
+		)
+		.expect("probe batch");
+		// 40,000 build rows, four per key, across three batches: enough to spill at 128 KiB.
+		let keys = (0..40_000i64).map(|row| row % 10_000).collect::<Vec<_>>();
+		let raw = vec![
+			adr606_batch(&keys[..15_000]),
+			adr606_batch(&keys[15_000..31_000]),
+			adr606_batch(&keys[31_000..]),
+		];
+		let build = adr606_exchange(
+			test_scan_plan_with_first_field_key(TableId(6), adr606_schema(), 6),
+			4,
+		);
+		let key = bound_column_root("build_key", ColumnOrdinal(0), DataType::Int64, false);
+		for memory in [256 * 1024 * 1024u64, 128 * 1024] {
+			let executor = Executor::with_context(
+				Arc::new(RecordingMultiBatchTableStorageScan {
+					batches: HashMap::new(),
+
+					requested_tables: Arc::new(Mutex::new(Vec::new())),
+				}),
+				ExecutionContext::local_test().with_task_budget(TaskBudget {
+					memory: ByteCount::new(memory),
+
+					spill_bytes: ByteCount::new(64 * 1024 * 1024),
+
+					..TaskBudget::from_query_budget(QueryBudget::test_default())
+				}),
+			);
+			let exchanged = executor
+				.exchange_input_batches(raw.clone(), adr606_schema(), 4, &key)
+				.expect("exchange");
+			let stage =
+				|| reoriented_scan_build_stage(&build, probe_schema.clone(), output_schema.clone());
+			let keys = stage().build_keys.clone();
+			assert_eq!(
+				estimated_build_hash_bytes_for_batches(&raw, &keys).expect("estimate"),
+				estimated_build_hash_bytes_for_batches(&exchanged, &keys).expect("estimate"),
+				"the same estimate from the same rows"
+			);
+			let mut bypassed = executor
+				.prepare_reoriented_inner_join_runtime_from_build_batches(
+					stage(),
+					raw.clone(),
+					None,
+				)
+				.await
+				.expect("bypassed runtime")
+				.expect("bypassed build prepares");
+			let mut repartitioned = executor
+				.prepare_reoriented_inner_join_runtime_from_build_batches(stage(), exchanged, None)
+				.await
+				.expect("exchanged runtime")
+				.expect("exchanged build prepares");
+			let spilled = |runtime: &ReorientedInnerJoinRuntime<'_>| {
+				matches!(runtime.build, ReorientedInnerJoinBuild::Spilled { .. })
+			};
+			assert_eq!(
+				spilled(&bypassed),
+				spilled(&repartitioned),
+				"the same build path"
+			);
+			assert_eq!(
+				spilled(&bypassed),
+				memory == 128 * 1024,
+				"the 128 KiB budget forces the spill"
+			);
+			let bypassed_output = executor
+				.probe_reoriented_inner_join_streaming(&mut bypassed, &probe)
+				.await
+				.expect("bypassed probe");
+			let repartitioned_output = executor
+				.probe_reoriented_inner_join_streaming(&mut repartitioned, &probe)
+				.await
+				.expect("exchanged probe");
+			let rows =
+				|batches: &[RecordBatch]| batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+			// Every key has four build rows: probe 3 (twice) = 8; 1, 2, 7 = 4 each; 99,999 = none.
+			assert_eq!(rows(&bypassed_output), 20);
+			assert_eq!(rows(&bypassed_output), rows(&repartitioned_output));
+			assert_eq!(
+				canonical_arrow_ipc_digest(&bypassed_output, SortPolicy::FullRowLex)
+					.expect("digest"),
+				canonical_arrow_ipc_digest(&repartitioned_output, SortPolicy::FullRowLex)
+					.expect("digest"),
+				"the same join result as a multiset (memory {memory})"
+			);
+		}
+	}
+
+	// ADR 616: the commutative row-digest sketch ignores order and notices every tested change.
+	#[test]
+	fn adr616_the_row_digest_sketch_is_order_free_and_change_sensitive() {
+		let nullable = Arc::new(Schema::new(vec![
+			Field::new("key", DataType::Int64, false),
+			Field::new("value", DataType::Int64, true),
+		]));
+		let batch = |keys: Vec<i64>, values: Vec<Option<i64>>| {
+			RecordBatch::try_new(
+				nullable.clone(),
+				vec![
+					Arc::new(Int64Array::from(keys)),
+					Arc::new(Int64Array::from(values)),
+				],
+			)
+			.expect("batch")
+		};
+		let base = vec![
+			batch(vec![1, 2], vec![Some(10), None]),
+			batch(vec![3], vec![Some(30)]),
+		];
+		let passed = |left: &[RecordBatch], right: &[RecordBatch]| {
+			commutative_row_digest_sketch_equivalence(left, right).expect("sketch")["equivalence_passed"]
+				.clone()
+		};
+		// Reordered batches and reordered rows: the same multiset.
+		let reordered = vec![
+			batch(vec![3, 2], vec![Some(30), None]),
+			batch(vec![1], vec![Some(10)]),
+		];
+		assert_eq!(passed(&base, &reordered), true);
+		let verdict = commutative_row_digest_sketch_equivalence(&base, &reordered).expect("sketch");
+		assert_eq!(verdict["mode"], "commutative_row_digest_sketch");
+		assert!(
+			verdict["qualification"]
+				.as_str()
+				.expect("text")
+				.contains("not proof")
+		);
+		// A changed value, a changed null, a duplicated row, a dropped row.
+		for changed in [
+			vec![batch(vec![1, 2, 3], vec![Some(11), None, Some(30)])],
+			vec![batch(vec![1, 2, 3], vec![Some(10), Some(0), Some(30)])],
+			vec![batch(
+				vec![1, 2, 3, 3],
+				vec![Some(10), None, Some(30), Some(30)],
+			)],
+			vec![batch(vec![1, 2], vec![Some(10), None])],
+		] {
+			assert_eq!(passed(&base, &changed), false, "{changed:?}");
+		}
+		// A schema disagreement inside one side is an error, not a verdict.
+		let other = Arc::new(Schema::new(vec![Field::new(
+			"other",
+			DataType::Int64,
+			false,
+		)]));
+		let mixed = vec![
+			base[0].clone(),
+			RecordBatch::try_new(other, vec![Arc::new(Int64Array::from(vec![1]))]).expect("batch"),
+		];
+		assert!(commutative_row_digest_sketch_equivalence(&mixed, &base).is_err());
 	}
 
 	#[test]

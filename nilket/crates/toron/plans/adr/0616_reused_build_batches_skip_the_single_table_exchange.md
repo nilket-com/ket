@@ -1,7 +1,12 @@
 # ADR 616 - reused build batches skip an exchange whose partitions are re-concatenated
 
-**Status:** PROPOSED. Successor to ADR 615. One token, measured by a
-pair. It projects no saving.
+**Status:** CLOSED, RETAINED (results in
+`plans/impl/0616_reused_build_batches_skip_the_single_table_exchange_results.md`).
+`REUSE_BUILD_EXCHANGE = Bypass`. q05's median paired gain is 1,340.7 ms
+(28.3%) against a bar of 121.7 ms, with every pair positive. The q09
+breadth pair gained 260.0 ms, with no regression. Digests matched on
+every row, and peak RSS fell on both cells. Successor to ADR 615. One
+token, measured by a pair. It projects no saving.
 
 ADR 615 divided q05's replay-1 `prep_build` (3,681.7 ms) and found the
 largest sub-stage is **`prep_exchange`, 1,645.5 ms**. That is the
@@ -83,8 +88,10 @@ not assumed**.
 So the plan reports these rather than assuming them. Per gate run and
 per paired row:
 - the build estimate;
-- the admission outcome and the spill path taken (in memory or
-  `SpilledInnerJoinBuild`);
+- the admission outcome, and the spill status: observed no spill,
+  spilling, or unreadable. A per-stage path (in memory or
+  `SpilledInnerJoinBuild`) is named only where an observation or the
+  untimed estimate receipt supplies it; otherwise it is unknown;
 - spill bytes;
 - peak RSS with its label.
 
@@ -95,6 +102,31 @@ paired row is handled explicitly:
 - in the q09 pair, it is a regression under ADR 607's guard.
 
 Each opens a new record, and none is a silent revert.
+
+*Implementation amendment, stated before the build:*
+- **The build estimate is recorded by the cap-check receipt** (the
+  estimated build bytes, the memory cap, and the path they imply) in
+  the untimed q05 preflight, on **both** arms. The paired rows and gate
+  rows carry no per-row estimate: no row field exists for it, and
+  adding one is a harness change this record does not make. The
+  receipt's path is the path its estimate **implies**, not independent
+  proof that the build took it. Per row, the spill status (observed no
+  spill, spilling, or unreadable) and any refusal are read from each
+  row's status, `spill_bytes`, and join-spill observations, beside peak
+  RSS with its label. An empty observation list is evidence of nothing
+  either way, and zero `spill_bytes` supports only "no spill observed".
+  A missing or unreadable spill field fails the gate rather than
+  reading as no spill.
+- **`prep_exchange`'s absence under `Bypass`** is shown by armed
+  attribution runs, as in ADR 615. Attribution cannot be armed inside
+  in-process tests.
+- **ADR 606's fixture** `adr606_reuse_builds_what_bound_exchange_would_build`
+  now asserts by token:
+  - under `Repartition`, today's per-partition match;
+  - under `Bypass`, the same rows as control by the row-digest sketch,
+    with equal row counts.
+
+  Every related fixture passes under both token settings.
 
 *Instrumentation, carried over.* ADR 615's `prep_exchange` stage is not
 opened under `Bypass`. It is recorded as absent, as ADR 615's
