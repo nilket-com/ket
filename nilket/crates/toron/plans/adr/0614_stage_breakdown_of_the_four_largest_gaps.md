@@ -1,6 +1,17 @@
 # ADR 614 - stage breakdown of the four largest gaps
 
-**Status:** PROPOSED. Successor to ADR 613. **A diagnostic record: no
+**Status:** CLOSED (results in
+`plans/impl/0614_stage_breakdown_of_the_four_largest_gaps_results.md`).
+All 20 runs passed their gates, and every profile reconciles at its
+outer boundary. The stages are top-level reconciled for q21, q09, and
+q05; q09 and q05 are strict-incomplete, missing nested sub-stages.
+- **Coverage:** top-level stage coverage was 98.5% for q21, 97.9% for
+  q09, and 99.4% for q05. q18 has none: it has no stage vocabulary.
+- **Owner:** join preparation (`runtime_prep`) is the largest recurring
+  observed owner, 9.2 s across q05, q21, and q09. It is led by q05's
+  replay-1 `prep_build` at 3.8 s.
+
+No cut. Successor to ADR 613. **A diagnostic record: no
 token, no pair, no cut.**
 
 On the current-tree board (ADR 613, sealed: Toron 61.387 s against
@@ -72,11 +83,23 @@ summarized:
 - each reconciled invocation's stages sum to its handler time within
   the stage boundary.
 
-**Coverage** is computed per run from disjoint spans only. An aggregate
-invocation's reconciled stages cover that invocation's exclusive time.
-Node kinds outside every reconciled invocation are counted by their
-exclusive time. Invocations are exclusive of their children in node
-attribution, so they do not overlap. If a run shows an invocation
+**Coverage** is computed per run from disjoint spans only. *Clarified
+before the read-out:* the numerator is only the top-level stage spans of
+reconciled invocations. The uncovered remainder is the sum of:
+- node kinds outside the aggregate invocations;
+- unreconciled invocations' exclusive time;
+- each reconciled invocation's time not in a top-level stage;
+- the outer residual (execution minus node exclusives).
+
+Per run, the numerator plus the uncovered remainder must equal
+execution. The identity gap is reported.
+
+The DuckDB panel's D1 result hash is also checked, read-only, against
+ADR 613's sealed DuckDB cell (`duckdb_result_sha256` of its samples).
+On a mismatch, the panel is labelled historical and unmatched.
+
+Invocations are exclusive of their children in node attribution, so
+they do not overlap. If a run shows an invocation
 nested inside another's reconciled span, or any other overlap, then:
 - that run's combined coverage percentage is not computed;
 - per-invocation coverage is reported instead.
