@@ -1,8 +1,10 @@
 use super::*;
 use ahash::RandomState;
 
+mod fold_kernel;
 mod group_table;
 
+use self::fold_kernel::{GROUPED_FOLD_SHAPE, GroupedFoldShape};
 use self::group_table::BoundGroupedAggregateEntry;
 pub(in crate::exec) use self::group_table::BoundGroupedAggregateGroups;
 use self::group_table::{GROUP_KEY_LOOKUP, GroupKeyLookupPath, GroupKeyRef};
@@ -2329,6 +2331,26 @@ impl Executor {
 		aggr_expr: &[BoundAggregateCall],
 		batch: &RecordBatch,
 	) -> Result<(), ExecutionError> {
+		self.fold_bound_grouped_aggregate_batch_shaped(
+			groups,
+			group_types,
+			group_expr,
+			aggr_expr,
+			batch,
+			GROUPED_FOLD_SHAPE,
+		)
+	}
+
+	/// ADR 610: the fold under an explicit shape; production passes the `GROUPED_FOLD_SHAPE` token.
+	pub(in crate::exec) fn fold_bound_grouped_aggregate_batch_shaped(
+		&self,
+		groups: &mut BoundGroupedAggregateGroups,
+		group_types: &mut Vec<DataType>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		batch: &RecordBatch,
+		shape: GroupedFoldShape,
+	) -> Result<(), ExecutionError> {
 		let (quantile_populations, quantile_bytes) =
 			quantile_populations_and_declared_bytes(aggr_expr)?;
 		groups.configure_quantile_admission(
@@ -2457,136 +2479,237 @@ impl Executor {
 		);
 		let mut key = Vec::with_capacity(group_arrays.len());
 		let mut key_refs = Vec::with_capacity(group_arrays.len());
-		for row in 0..batch.num_rows() {
-			let states = if borrow_single_utf8_group_key
-				&& let [GroupArrayReader::Utf8(array)] = group_readers.as_slice()
-			{
-				groups.entry_or_init_single_utf8(
-					(!array.is_null(row)).then(|| array.value(row)),
-					aggr_expr.len(),
-					|| {
-						let identity = group_identity_bytes(&[match array.is_null(row) {
-							true => GroupValue::Null,
-							false => GroupValue::Utf8(array.value(row).to_owned()),
-						}]);
-						init_bound_states_with_seed(aggr_expr, quantile_seed, &identity)
-					},
-				)?
-			} else if lookup_path == GroupKeyLookupPath::BorrowedMulti {
-				key_refs.clear();
-				for reader in group_readers.iter() {
-					key_refs.push(reader.value_ref(row));
-				}
-				groups.entry_or_init_borrowed(&key_refs, aggr_expr.len(), |owned| {
-					let identity = group_identity_bytes(owned);
-					init_bound_states_with_seed(aggr_expr, quantile_seed, &identity)
-				})?
-			} else {
-				key.clear();
-				for reader in group_readers.iter() {
-					key.push(reader.value(row));
-				}
-				if count_lookup_keys {
-					groups.count_owned_lookup_key(&key);
-				}
-				groups.entry_or_init(&key, aggr_expr.len(), || {
-					let identity = group_identity_bytes(&key);
-					init_bound_states_with_seed(aggr_expr, quantile_seed, &identity)
-				})?
-			};
-			for (agg_idx, ((state, input), reader)) in states
-				.iter_mut()
-				.zip(aggr_arrays.iter())
-				.zip(readers.iter())
+		// ADR 610: typed kernels for every aggregate, or none; a state template names the
+		// variants, since initialization depends on the calls alone.
+		let receipt_armed = groups.fold_kernel_receipt_mut().is_some();
+		// Only a call list whose every function a kernel can hold gets a template; any other list
+		// (quantile, STRING_AGG, MIN, ...) never builds one, receipt or not, so its execution is
+		// today's.
+		let typeable = fold_kernel::functions_may_be_typed(aggr_expr);
+		let template = if typeable && (receipt_armed || shape == GroupedFoldShape::TwoPhase) {
+			Some(init_bound_states_with_seed(aggr_expr, quantile_seed, &[])?)
+		} else {
+			None
+		};
+		let kernels = template.as_deref().and_then(|template| {
+			fold_kernel::select_typed_kernels(aggr_expr, &aggr_arrays, &readers, template)
+		});
+		let two_phase = shape == GroupedFoldShape::TwoPhase && kernels.is_some();
+		if receipt_armed {
+			let noted = aggr_expr
+				.iter()
 				.enumerate()
-			{
-				match input {
-					None => {
-						if let AggState::Count(total) = state {
-							*total += 1;
-						}
+				.map(|(index, call)| {
+					(
+						format!("{:?}", call.function),
+						template
+							.as_deref()
+							.and_then(|template| template.get(index))
+							.map_or("not_selected", fold_kernel::agg_state_kind)
+							.to_string(),
+						aggr_arrays[index].as_ref().map_or_else(
+							|| "none".to_string(),
+							|array| format!("{:?}", array.data_type()),
+						),
+						match (&kernels, two_phase) {
+							(Some(kernels), true) => kernels[index].name(),
+							_ => "per_row".to_string(),
+						},
+					)
+				})
+				.collect::<Vec<_>>();
+			if let Some(receipt) = groups.fold_kernel_receipt_mut() {
+				receipt.note_batch(
+					if two_phase {
+						GroupedFoldShape::TwoPhase
+					} else {
+						GroupedFoldShape::RowAtATime
+					},
+					batch.num_rows(),
+					&noted,
+				);
+			}
+		}
+		if let (true, Some(kernels)) = (two_phase, kernels.as_ref()) {
+			// Phase one: every row's group id, through the unchanged lookup paths.
+			groups.prepare_group_ids(batch.num_rows())?;
+			for row in 0..batch.num_rows() {
+				let entry = if borrow_single_utf8_group_key
+					&& let [GroupArrayReader::Utf8(array)] = group_readers.as_slice()
+				{
+					groups.entry_index_or_init_single_utf8(
+						(!array.is_null(row)).then(|| array.value(row)),
+						aggr_expr.len(),
+						|| {
+							let identity = group_identity_bytes(&[match array.is_null(row) {
+								true => GroupValue::Null,
+								false => GroupValue::Utf8(array.value(row).to_owned()),
+							}]);
+							init_bound_states_with_seed(aggr_expr, quantile_seed, &identity)
+						},
+					)?
+				} else if lookup_path == GroupKeyLookupPath::BorrowedMulti {
+					key_refs.clear();
+					for reader in group_readers.iter() {
+						key_refs.push(reader.value_ref(row));
 					}
-					Some(array) => match state {
-						AggState::StringAgg(string_state) => {
-							let keys = string_agg_keys[agg_idx].as_deref().unwrap_or(&[]);
-							string_agg_accumulate_row(string_state, array, keys, row)?;
-						}
-						AggState::ScalarSubqueryValue { rows, value } => {
-							*rows += 1;
-							if *rows > 1 {
-								return Err(ExecutionError::Kernel {
-									message: "scalar subquery produced more than one row"
-										.to_string(),
-								});
-							}
-							*value = Some(super::scalar_value_from_array(
-								array,
-								row,
-								array.data_type(),
-								"scalar subquery value",
-							)?);
-						}
-						AggState::Count(total) => {
-							if !array.is_null(row) {
+					groups.entry_index_or_init_borrowed(&key_refs, aggr_expr.len(), |owned| {
+						let identity = group_identity_bytes(owned);
+						init_bound_states_with_seed(aggr_expr, quantile_seed, &identity)
+					})?
+				} else {
+					key.clear();
+					for reader in group_readers.iter() {
+						key.push(reader.value(row));
+					}
+					if count_lookup_keys {
+						groups.count_owned_lookup_key(&key);
+					}
+					groups.entry_index_or_init(&key, aggr_expr.len(), || {
+						let identity = group_identity_bytes(&key);
+						init_bound_states_with_seed(aggr_expr, quantile_seed, &identity)
+					})?
+				};
+				groups.push_group_id(entry)?;
+			}
+			// Phase two: each aggregate's typed kernel over the whole batch, in row order.
+			groups.with_group_ids_and_states(|ids, states| {
+				for (index, kernel) in kernels.iter().enumerate() {
+					fold_kernel::apply_typed_kernel(kernel, index, ids, states)?;
+				}
+				Ok(())
+			})?;
+		} else {
+			for row in 0..batch.num_rows() {
+				let states = if borrow_single_utf8_group_key
+					&& let [GroupArrayReader::Utf8(array)] = group_readers.as_slice()
+				{
+					groups.entry_or_init_single_utf8(
+						(!array.is_null(row)).then(|| array.value(row)),
+						aggr_expr.len(),
+						|| {
+							let identity = group_identity_bytes(&[match array.is_null(row) {
+								true => GroupValue::Null,
+								false => GroupValue::Utf8(array.value(row).to_owned()),
+							}]);
+							init_bound_states_with_seed(aggr_expr, quantile_seed, &identity)
+						},
+					)?
+				} else if lookup_path == GroupKeyLookupPath::BorrowedMulti {
+					key_refs.clear();
+					for reader in group_readers.iter() {
+						key_refs.push(reader.value_ref(row));
+					}
+					groups.entry_or_init_borrowed(&key_refs, aggr_expr.len(), |owned| {
+						let identity = group_identity_bytes(owned);
+						init_bound_states_with_seed(aggr_expr, quantile_seed, &identity)
+					})?
+				} else {
+					key.clear();
+					for reader in group_readers.iter() {
+						key.push(reader.value(row));
+					}
+					if count_lookup_keys {
+						groups.count_owned_lookup_key(&key);
+					}
+					groups.entry_or_init(&key, aggr_expr.len(), || {
+						let identity = group_identity_bytes(&key);
+						init_bound_states_with_seed(aggr_expr, quantile_seed, &identity)
+					})?
+				};
+				for (agg_idx, ((state, input), reader)) in states
+					.iter_mut()
+					.zip(aggr_arrays.iter())
+					.zip(readers.iter())
+					.enumerate()
+				{
+					match input {
+						None => {
+							if let AggState::Count(total) = state {
 								*total += 1;
 							}
 						}
-						AggState::SumInt { .. } | AggState::SumFloat { .. } => {
-							let value = match reader {
-								Some(reader) => reader.value(row),
-								None => numeric_value(array, row)?,
-							};
-							if let Some(value) = value {
-								add_sum_value(state, value)?;
+						Some(array) => match state {
+							AggState::StringAgg(string_state) => {
+								let keys = string_agg_keys[agg_idx].as_deref().unwrap_or(&[]);
+								string_agg_accumulate_row(string_state, array, keys, row)?;
 							}
-						}
-						AggState::Spread { count, mean, m2 } => {
-							let value = match reader {
-								Some(reader) => reader.value(row),
-								None => numeric_value(array, row)?,
-							};
-							if let Some(value) = value {
-								spread_accumulate(
-									count,
-									mean,
-									m2,
-									spread_input_value(value, array.data_type()),
-								);
+							AggState::ScalarSubqueryValue { rows, value } => {
+								*rows += 1;
+								if *rows > 1 {
+									return Err(ExecutionError::Kernel {
+										message: "scalar subquery produced more than one row"
+											.to_string(),
+									});
+								}
+								*value = Some(super::scalar_value_from_array(
+									array,
+									row,
+									array.data_type(),
+									"scalar subquery value",
+								)?);
 							}
-						}
-						AggState::AvgInt { .. }
-						| AggState::AvgFloat { .. }
-						| AggState::AvgDecimal { .. } => {
-							let value = match reader {
-								Some(reader) => reader.value(row),
-								None => numeric_value(array, row)?,
-							};
-							if let Some(value) = value {
-								add_avg_value(state, value)?;
+							AggState::Count(total) => {
+								if !array.is_null(row) {
+									*total += 1;
+								}
 							}
-						}
-						AggState::MinInt32 { .. }
-						| AggState::MinInt64 { .. }
-						| AggState::MinFloat32 { .. }
-						| AggState::MinFloat64 { .. }
-						| AggState::MinDecimal128 { .. } => {
-							update_min_state(state, array, row)?;
-						}
-						AggState::MaxInt32 { .. }
-						| AggState::MaxInt64 { .. }
-						| AggState::MaxFloat32 { .. }
-						| AggState::MaxFloat64 { .. }
-						| AggState::MaxDecimal128 { .. } => {
-							update_max_state(state, array, row)?;
-						}
-						AggState::Quantile(_) => {
-							update_quantile_state(state, array, row)?;
-						}
-					},
+							AggState::SumInt { .. } | AggState::SumFloat { .. } => {
+								let value = match reader {
+									Some(reader) => reader.value(row),
+									None => numeric_value(array, row)?,
+								};
+								if let Some(value) = value {
+									add_sum_value(state, value)?;
+								}
+							}
+							AggState::Spread { count, mean, m2 } => {
+								let value = match reader {
+									Some(reader) => reader.value(row),
+									None => numeric_value(array, row)?,
+								};
+								if let Some(value) = value {
+									spread_accumulate(
+										count,
+										mean,
+										m2,
+										spread_input_value(value, array.data_type()),
+									);
+								}
+							}
+							AggState::AvgInt { .. }
+							| AggState::AvgFloat { .. }
+							| AggState::AvgDecimal { .. } => {
+								let value = match reader {
+									Some(reader) => reader.value(row),
+									None => numeric_value(array, row)?,
+								};
+								if let Some(value) = value {
+									add_avg_value(state, value)?;
+								}
+							}
+							AggState::MinInt32 { .. }
+							| AggState::MinInt64 { .. }
+							| AggState::MinFloat32 { .. }
+							| AggState::MinFloat64 { .. }
+							| AggState::MinDecimal128 { .. } => {
+								update_min_state(state, array, row)?;
+							}
+							AggState::MaxInt32 { .. }
+							| AggState::MaxInt64 { .. }
+							| AggState::MaxFloat32 { .. }
+							| AggState::MaxFloat64 { .. }
+							| AggState::MaxDecimal128 { .. } => {
+								update_max_state(state, array, row)?;
+							}
+							AggState::Quantile(_) => {
+								update_quantile_state(state, array, row)?;
+							}
+						},
+					}
 				}
 			}
 		}
-
 		if let Some(stage) = row_stage {
 			node_attribution::close_stage(stage, &telemetry);
 		}
@@ -5904,5 +6027,762 @@ mod adr562_string_agg_tests {
 			&DataType::LargeUtf8,
 			"a LargeUtf8 value must not narrow to Utf8"
 		);
+	}
+}
+
+#[cfg(test)]
+mod adr610_fold_shape_tests {
+	use super::*;
+	use crate::ir::{BoundExprProgramBuilder, ColumnName, ResolvedColumn};
+	use crate::storage::InMemoryStorageScan;
+	use arrow::datatypes::Field;
+
+	fn program(columns: &[(&str, usize, DataType, bool)]) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		for (name, ordinal, data_type, nullable) in columns {
+			let column = builder.append_column(ResolvedColumn {
+				name: ColumnName(name.to_string()),
+				ordinal: ColumnOrdinal(u32::try_from(*ordinal).expect("ordinal")),
+				data_type: data_type.clone(),
+				nullable: *nullable,
+				pbc_eligible: false,
+			});
+			builder.push_root(column);
+		}
+		builder.build()
+	}
+
+	fn call(
+		function: AggregateFunction,
+		column: Option<(&str, usize, DataType)>,
+	) -> BoundAggregateCall {
+		BoundAggregateCall {
+			function,
+			args: match column {
+				Some((name, ordinal, data_type)) => program(&[(name, ordinal, data_type, true)]),
+				None => BoundExprProgram::empty(),
+			},
+		}
+	}
+
+	fn executor() -> Executor {
+		Executor::new(Arc::new(InMemoryStorageScan {
+			table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
+		}))
+	}
+
+	/// Folds `batches` under `shape` and returns each group's key and its states' `Debug` form, in
+	/// sorted key order, plus the table (for its receipt and accounting).
+	fn fold(
+		shape: GroupedFoldShape,
+		batches: &[RecordBatch],
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		configure: impl FnOnce(&mut BoundGroupedAggregateGroups),
+	) -> Result<Vec<(Vec<GroupValue>, String)>, ExecutionError> {
+		fold_with(
+			&executor(),
+			shape,
+			batches,
+			group_expr,
+			aggr_expr,
+			configure,
+		)
+	}
+
+	/// `fold` on a given executor: quantile states are seeded per executor, so a comparison of
+	/// quantile states shares one.
+	fn fold_with(
+		executor: &Executor,
+		shape: GroupedFoldShape,
+		batches: &[RecordBatch],
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		configure: impl FnOnce(&mut BoundGroupedAggregateGroups),
+	) -> Result<Vec<(Vec<GroupValue>, String)>, ExecutionError> {
+		let mut groups = BoundGroupedAggregateGroups::new();
+		configure(&mut groups);
+		let mut group_types = Vec::new();
+		for batch in batches {
+			executor.fold_bound_grouped_aggregate_batch_shaped(
+				&mut groups,
+				&mut group_types,
+				group_expr,
+				aggr_expr,
+				batch,
+				shape,
+			)?;
+		}
+		Ok(groups
+			.finalize_sorted()?
+			.iter()
+			.map(|entry| (entry.key.to_vec(), format!("{:?}", entry.states)))
+			.collect())
+	}
+
+	fn decimal(values: Vec<Option<i128>>) -> ArrayRef {
+		Arc::new(
+			Decimal128Array::from(values)
+				.with_precision_and_scale(38, 2)
+				.expect("decimal type"),
+		)
+	}
+
+	fn kernel_schema() -> SchemaRef {
+		Arc::new(Schema::new(vec![
+			Field::new("flag", DataType::Utf8, true),
+			Field::new("status", DataType::Utf8, true),
+			Field::new("dec", DataType::Decimal128(38, 2), true),
+			Field::new("int", DataType::Int64, true),
+			Field::new("small", DataType::Int32, true),
+			Field::new("float", DataType::Float64, true),
+		]))
+	}
+
+	fn kernel_calls() -> Vec<BoundAggregateCall> {
+		vec![
+			call(
+				AggregateFunction::Sum,
+				Some(("dec", 2, DataType::Decimal128(38, 2))),
+			),
+			call(AggregateFunction::Sum, Some(("int", 3, DataType::Int64))),
+			call(
+				AggregateFunction::Sum,
+				Some(("float", 5, DataType::Float64)),
+			),
+			call(
+				AggregateFunction::Avg,
+				Some(("dec", 2, DataType::Decimal128(38, 2))),
+			),
+			call(AggregateFunction::Avg, Some(("small", 4, DataType::Int32))),
+			call(
+				AggregateFunction::Avg,
+				Some(("float", 5, DataType::Float64)),
+			),
+			call(AggregateFunction::CountAll, None),
+			call(AggregateFunction::Count, Some(("int", 3, DataType::Int64))),
+		]
+	}
+
+	fn kernel_batch(
+		flags: &[&str],
+		statuses: &[Option<&str>],
+		dec: Vec<Option<i128>>,
+		int: Vec<Option<i64>>,
+		small: Vec<Option<i32>>,
+		float: Vec<Option<f64>>,
+	) -> RecordBatch {
+		RecordBatch::try_new(
+			kernel_schema(),
+			vec![
+				Arc::new(StringArray::from(flags.to_vec())),
+				Arc::new(StringArray::from(statuses.to_vec())),
+				decimal(dec),
+				Arc::new(Int64Array::from(int)),
+				Arc::new(Int32Array::from(small)),
+				Arc::new(Float64Array::from(float)),
+			],
+		)
+		.expect("kernel batch")
+	}
+
+	fn two_key_program() -> BoundExprProgram {
+		program(&[
+			("flag", 0, DataType::Utf8, true),
+			("status", 1, DataType::Utf8, true),
+		])
+	}
+
+	#[test]
+	fn adr610_two_phase_matches_row_at_a_time_across_kernels_nulls_and_batches() {
+		// Order-sensitive floats: 1e16 + 1 - 1e16 differs from 1e16 - 1e16 + 1, so a changed
+		// per-group summation order would change the Debug form of the float totals.
+		let batches = vec![
+			kernel_batch(
+				&["A", "N", "A", "R"],
+				&[Some("F"), Some("O"), Some("F"), None],
+				vec![Some(125), Some(-7), Some(990), Some(1)],
+				vec![Some(1), Some(2), Some(3), Some(4)],
+				vec![Some(10), Some(20), Some(30), Some(40)],
+				vec![Some(1e16), Some(0.1), Some(1.0), Some(-0.0)],
+			),
+			// Nulls in every input column.
+			kernel_batch(
+				&["A", "N", "R", "A"],
+				&[Some("F"), Some("O"), None, Some("F")],
+				vec![None, Some(5), Some(6), Some(i64::MAX as i128)],
+				vec![None, Some(-2), None, Some(9)],
+				vec![Some(1), None, Some(3), None],
+				vec![Some(-1e16), None, Some(f64::NAN), Some(0.2)],
+			),
+			kernel_batch(
+				&["A", "Z"],
+				&[Some("F"), Some("Z")],
+				vec![Some(3), Some(4)],
+				vec![Some(5), Some(6)],
+				vec![Some(7), Some(8)],
+				vec![Some(3.5), Some(1e-300)],
+			),
+		];
+		let group_expr = two_key_program();
+		let calls = kernel_calls();
+		let row = fold(
+			GroupedFoldShape::RowAtATime,
+			&batches,
+			&group_expr,
+			&calls,
+			|_| {},
+		)
+		.expect("row-at-a-time fold");
+		let two = fold(
+			GroupedFoldShape::TwoPhase,
+			&batches,
+			&group_expr,
+			&calls,
+			|_| {},
+		)
+		.expect("two-phase fold");
+		assert_eq!(row, two);
+		assert_eq!(row.len(), 4);
+	}
+
+	#[test]
+	fn adr610_two_phase_ids_survive_growth_with_mid_batch_inserts_on_every_lookup_path() {
+		let many = 3_000usize;
+		let calls = vec![
+			call(AggregateFunction::Sum, Some(("value", 1, DataType::Int64))),
+			call(AggregateFunction::CountAll, None),
+		];
+		for (key_type, key_array) in [
+			(
+				DataType::Utf8,
+				Arc::new(StringArray::from(
+					(0..many)
+						.map(|i| format!("k{}", i % 2_500))
+						.collect::<Vec<_>>(),
+				)) as ArrayRef,
+			),
+			(
+				DataType::Int64,
+				Arc::new(Int64Array::from(
+					(0..many).map(|i| (i % 2_500) as i64).collect::<Vec<_>>(),
+				)) as ArrayRef,
+			),
+		] {
+			let schema = Arc::new(Schema::new(vec![
+				Field::new("key", key_type.clone(), false),
+				Field::new("value", DataType::Int64, false),
+			]));
+			let values: ArrayRef = Arc::new(Int64Array::from(
+				(0..many).map(|i| i as i64).collect::<Vec<_>>(),
+			));
+			let batch = RecordBatch::try_new(schema, vec![key_array, values]).expect("batch");
+			let group_expr = program(&[("key", 0, key_type.clone(), false)]);
+			let batches = [batch.clone(), batch];
+			let row = fold(
+				GroupedFoldShape::RowAtATime,
+				&batches,
+				&group_expr,
+				&calls,
+				|_| {},
+			)
+			.expect("row-at-a-time fold");
+			let two = fold(
+				GroupedFoldShape::TwoPhase,
+				&batches,
+				&group_expr,
+				&calls,
+				|_| {},
+			)
+			.expect("two-phase fold");
+			assert_eq!(row.len(), 2_500, "{key_type:?}");
+			assert_eq!(row, two, "{key_type:?}");
+		}
+		// A two-UTF-8-key set, through whichever multi-key lookup this build's ADR 609 token names.
+		{
+			let flags = (0..many)
+				.map(|i| format!("f{}", i % 50))
+				.collect::<Vec<_>>();
+			let statuses = (0..many)
+				.map(|i| Some(format!("s{}", i % 60)))
+				.collect::<Vec<_>>();
+			let batch = RecordBatch::try_new(
+				kernel_schema(),
+				vec![
+					Arc::new(StringArray::from(flags)),
+					Arc::new(StringArray::from(statuses)),
+					decimal((0..many).map(|i| Some(i as i128)).collect()),
+					Arc::new(Int64Array::from(
+						(0..many).map(|i| Some(i as i64)).collect::<Vec<_>>(),
+					)),
+					Arc::new(Int32Array::from(
+						(0..many).map(|i| Some(i as i32)).collect::<Vec<_>>(),
+					)),
+					Arc::new(Float64Array::from(
+						(0..many).map(|i| Some(i as f64)).collect::<Vec<_>>(),
+					)),
+				],
+			)
+			.expect("multi-key batch");
+			let batches = [batch];
+			let row = fold(
+				GroupedFoldShape::RowAtATime,
+				&batches,
+				&two_key_program(),
+				&kernel_calls(),
+				|_| {},
+			)
+			.expect("row-at-a-time fold");
+			let two = fold(
+				GroupedFoldShape::TwoPhase,
+				&batches,
+				&two_key_program(),
+				&kernel_calls(),
+				|_| {},
+			)
+			.expect("two-phase fold");
+			assert_eq!(row.len(), 300);
+			assert_eq!(row, two);
+		}
+	}
+
+	#[test]
+	fn adr610_a_batch_with_any_per_row_aggregate_runs_row_at_a_time_whole() {
+		let directory = std::env::temp_dir().join(format!(
+			"adr610_eligibility_{}_{}.jsonl",
+			std::process::id(),
+			line!()
+		));
+		let _ = std::fs::remove_file(&directory);
+		let batch = kernel_batch(
+			&["A", "N"],
+			&[Some("F"), Some("O")],
+			vec![Some(1), Some(2)],
+			vec![Some(1), Some(2)],
+			vec![Some(1), Some(2)],
+			vec![Some(1.0), Some(2.0)],
+		);
+		let calls = vec![
+			call(AggregateFunction::Sum, Some(("int", 3, DataType::Int64))),
+			call(AggregateFunction::Min, Some(("int", 3, DataType::Int64))),
+		];
+		let path = directory.clone();
+		let row = fold(
+			GroupedFoldShape::RowAtATime,
+			&[batch.clone()],
+			&two_key_program(),
+			&calls,
+			|_| {},
+		)
+		.expect("row-at-a-time");
+		let two = fold(
+			GroupedFoldShape::TwoPhase,
+			&[batch],
+			&two_key_program(),
+			&calls,
+			|groups| groups.arm_fold_kernel_receipt(path),
+		)
+		.expect("two-phase requested");
+		assert_eq!(row, two);
+		let receipt: serde_json::Value =
+			serde_json::from_str(std::fs::read_to_string(&directory).expect("receipt").trim())
+				.expect("json");
+		let _ = std::fs::remove_file(&directory);
+		assert_eq!(receipt["batches_two_phase"], 0);
+		assert_eq!(receipt["batches_row_at_a_time"], 1);
+		assert_eq!(receipt["aggregates"][0]["updates"]["per_row"], 2);
+		assert_eq!(receipt["aggregates"][1]["updates"]["per_row"], 2);
+		assert!(!fold_kernel::functions_may_be_typed(&[call(
+			AggregateFunction::Min,
+			Some(("int", 3, DataType::Int64))
+		)]));
+	}
+
+	#[test]
+	fn adr610_min_max_and_string_agg_each_run_the_batch_row_at_a_time() {
+		let batch = kernel_batch(
+			&["A", "N", "A"],
+			&[Some("F"), Some("O"), Some("F")],
+			vec![Some(1), Some(2), Some(3)],
+			vec![Some(5), None, Some(-4)],
+			vec![Some(1), Some(2), Some(3)],
+			vec![Some(1.0), Some(2.0), Some(3.0)],
+		);
+		let sum = call(AggregateFunction::Sum, Some(("int", 3, DataType::Int64)));
+		let string_agg = BoundAggregateCall {
+			function: AggregateFunction::StringAgg(Box::new(crate::ir::StringAggCall {
+				separator: ",".into(),
+				descending: vec![],
+			})),
+			args: program(&[("status", 1, DataType::Utf8, true)]),
+		};
+		for (label, other) in [
+			(
+				"MIN",
+				call(AggregateFunction::Min, Some(("int", 3, DataType::Int64))),
+			),
+			(
+				"MAX",
+				call(AggregateFunction::Max, Some(("int", 3, DataType::Int64))),
+			),
+			("STRING_AGG", string_agg),
+		] {
+			let calls = vec![sum.clone(), other];
+			assert!(!fold_kernel::functions_may_be_typed(&calls), "{label}");
+			let path = std::env::temp_dir().join(format!(
+				"adr610_exclusion_{label}_{}.jsonl",
+				std::process::id()
+			));
+			let _ = std::fs::remove_file(&path);
+			let executor = executor();
+			let row = fold_with(
+				&executor,
+				GroupedFoldShape::RowAtATime,
+				&[batch.clone()],
+				&two_key_program(),
+				&calls,
+				|_| {},
+			)
+			.expect("row-at-a-time");
+			let receipt_path = path.clone();
+			let two = fold_with(
+				&executor,
+				GroupedFoldShape::TwoPhase,
+				&[batch.clone()],
+				&two_key_program(),
+				&calls,
+				|groups| groups.arm_fold_kernel_receipt(receipt_path),
+			)
+			.expect("two-phase requested");
+			assert_eq!(row, two, "{label}");
+			let receipt: serde_json::Value =
+				serde_json::from_str(std::fs::read_to_string(&path).expect("receipt").trim())
+					.expect("json");
+			let _ = std::fs::remove_file(&path);
+			assert_eq!(receipt["batches_two_phase"], 0, "{label}");
+			assert_eq!(receipt["batches_row_at_a_time"], 1, "{label}");
+			for aggregate in receipt["aggregates"].as_array().expect("aggregates") {
+				assert_eq!(aggregate["state_kind"], "not_selected", "{label}");
+				assert_eq!(aggregate["updates"]["per_row"], 3, "{label}");
+			}
+		}
+	}
+
+	#[test]
+	fn adr610_an_untypeable_call_list_builds_no_template_even_with_a_receipt() {
+		let path = std::env::temp_dir().join(format!(
+			"adr610_quantile_{}_{}.jsonl",
+			std::process::id(),
+			line!()
+		));
+		let _ = std::fs::remove_file(&path);
+		let batch = kernel_batch(
+			&["A", "N", "A"],
+			&[Some("F"), Some("O"), Some("F")],
+			vec![Some(1), Some(2), Some(3)],
+			vec![Some(1), Some(2), Some(3)],
+			vec![Some(1), Some(2), Some(3)],
+			vec![Some(1.0), Some(2.0), Some(3.0)],
+		);
+		let calls = vec![
+			call(AggregateFunction::Sum, Some(("int", 3, DataType::Int64))),
+			call(
+				AggregateFunction::ApproxQuantile(0.5),
+				Some(("float", 5, DataType::Float64)),
+			),
+		];
+		let executor = executor();
+		let plain = fold_with(
+			&executor,
+			GroupedFoldShape::RowAtATime,
+			&[batch.clone()],
+			&two_key_program(),
+			&calls,
+			|_| {},
+		)
+		.expect("row-at-a-time, no receipt");
+		let receipt_path = path.clone();
+		let armed = fold_with(
+			&executor,
+			GroupedFoldShape::TwoPhase,
+			&[batch],
+			&two_key_program(),
+			&calls,
+			|groups| groups.arm_fold_kernel_receipt(receipt_path),
+		)
+		.expect("two-phase requested, receipt armed");
+		assert_eq!(plain, armed, "a quantile call list folds as today");
+		let receipt: serde_json::Value =
+			serde_json::from_str(std::fs::read_to_string(&path).expect("receipt").trim())
+				.expect("json");
+		let _ = std::fs::remove_file(&path);
+		assert_eq!(receipt["batches_two_phase"], 0);
+		assert_eq!(receipt["batches_row_at_a_time"], 1);
+		for aggregate in receipt["aggregates"].as_array().expect("aggregates") {
+			// No template was built: the state kind is not selected, not read from a state.
+			assert_eq!(aggregate["state_kind"], "not_selected");
+			assert_eq!(aggregate["updates"]["per_row"], 3);
+		}
+	}
+
+	#[test]
+	fn adr610_receipt_names_q01_shaped_kernels_and_counts_every_row() {
+		let path = std::env::temp_dir().join(format!(
+			"adr610_receipt_{}_{}.jsonl",
+			std::process::id(),
+			line!()
+		));
+		let _ = std::fs::remove_file(&path);
+		let batch = kernel_batch(
+			&["A", "N", "A"],
+			&[Some("F"), Some("O"), Some("F")],
+			vec![Some(1), Some(2), Some(3)],
+			vec![Some(1), Some(2), Some(3)],
+			vec![Some(1), Some(2), Some(3)],
+			vec![Some(1.0), Some(2.0), Some(3.0)],
+		);
+		let calls = vec![
+			call(
+				AggregateFunction::Sum,
+				Some(("dec", 2, DataType::Decimal128(38, 2))),
+			),
+			call(
+				AggregateFunction::Avg,
+				Some(("dec", 2, DataType::Decimal128(38, 2))),
+			),
+			call(AggregateFunction::CountAll, None),
+		];
+		let receipt_path = path.clone();
+		fold(
+			GroupedFoldShape::TwoPhase,
+			&[batch.clone(), batch],
+			&two_key_program(),
+			&calls,
+			|groups| groups.arm_fold_kernel_receipt(receipt_path),
+		)
+		.expect("two-phase fold");
+		let receipt: serde_json::Value =
+			serde_json::from_str(std::fs::read_to_string(&path).expect("receipt").trim())
+				.expect("json");
+		let _ = std::fs::remove_file(&path);
+		assert_eq!(receipt["kind"], "grouped_fold_kernel_instance");
+		assert_eq!(receipt["rows_folded"], 6);
+		assert_eq!(receipt["batches_two_phase"], 2);
+		assert_eq!(receipt["batches_row_at_a_time"], 0);
+		assert_eq!(receipt["aggregates"][0]["state_kind"], "SumInt");
+		assert_eq!(
+			receipt["aggregates"][0]["updates"]["typed:sum_int_decimal128"],
+			6
+		);
+		assert_eq!(receipt["aggregates"][1]["state_kind"], "AvgDecimal");
+		assert_eq!(
+			receipt["aggregates"][1]["updates"]["typed:avg_decimal_decimal128"],
+			6
+		);
+		assert_eq!(receipt["aggregates"][2]["updates"]["typed:count_star"], 6);
+		assert!(receipt["aggregates"][0]["updates"].get("per_row").is_none());
+		assert_eq!(receipt["group_ids_peak_capacity_bytes"], 12);
+
+		// An unwritable receipt path is a finalize error.
+		let missing = std::env::temp_dir()
+			.join("adr610_no_such_directory")
+			.join("r.jsonl");
+		let batch = kernel_batch(
+			&["A"],
+			&[Some("F")],
+			vec![Some(1)],
+			vec![Some(1)],
+			vec![Some(1)],
+			vec![Some(1.0)],
+		);
+		assert!(
+			fold(
+				GroupedFoldShape::TwoPhase,
+				&[batch],
+				&two_key_program(),
+				&calls,
+				|groups| { groups.arm_fold_kernel_receipt(missing) }
+			)
+			.is_err()
+		);
+	}
+
+	#[test]
+	fn adr610_two_overflowing_aggregates_are_named_by_each_order() {
+		let huge = 9 * 10i128.pow(37);
+		// SUM(a) overflows at row 3, AVG(b) at row 1: row-major meets AVG's overflow first,
+		// aggregate-major meets SUM's.
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("flag", DataType::Utf8, true),
+			Field::new("status", DataType::Utf8, true),
+			Field::new("a", DataType::Decimal128(38, 0), true),
+			Field::new("b", DataType::Decimal128(38, 0), true),
+		]));
+		let column = |values: Vec<i128>| -> ArrayRef {
+			Arc::new(
+				Decimal128Array::from(values)
+					.with_precision_and_scale(38, 0)
+					.expect("decimal"),
+			)
+		};
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(StringArray::from(vec!["A"; 4])),
+				Arc::new(StringArray::from(vec!["F"; 4])),
+				column(vec![1, 1, huge, huge]),
+				column(vec![huge, huge, 1, 1]),
+			],
+		)
+		.expect("batch");
+		let calls = vec![
+			call(
+				AggregateFunction::Sum,
+				Some(("a", 2, DataType::Decimal128(38, 0))),
+			),
+			call(
+				AggregateFunction::Avg,
+				Some(("b", 3, DataType::Decimal128(38, 0))),
+			),
+		];
+		let message =
+			|shape| match fold(shape, &[batch.clone()], &two_key_program(), &calls, |_| {}) {
+				Err(ExecutionError::Kernel { message }) => message,
+				other => panic!("expected an overflow, got {other:?}"),
+			};
+		assert_eq!(
+			message(GroupedFoldShape::RowAtATime),
+			"decimal AVG overflow"
+		);
+		assert_eq!(message(GroupedFoldShape::TwoPhase), "integer SUM overflow");
+	}
+
+	/// The table's resident bytes after folding `batches` under `shape` with no budget.
+	fn resident_after(
+		shape: GroupedFoldShape,
+		batches: &[RecordBatch],
+		calls: &[BoundAggregateCall],
+	) -> u64 {
+		let executor = executor();
+		let mut groups = BoundGroupedAggregateGroups::new();
+		let mut group_types = Vec::new();
+		for batch in batches {
+			executor
+				.fold_bound_grouped_aggregate_batch_shaped(
+					&mut groups,
+					&mut group_types,
+					&two_key_program(),
+					calls,
+					batch,
+					shape,
+				)
+				.expect("unbudgeted fold");
+		}
+		groups.peak_resident_bytes()
+	}
+
+	#[test]
+	fn adr610_a_later_insert_failure_precedes_an_earlier_overflow_only_two_phase() {
+		let huge = 9 * 10i128.pow(37);
+		let calls = vec![call(
+			AggregateFunction::Sum,
+			Some(("dec", 2, DataType::Decimal128(38, 2))),
+		)];
+		// Row 1 overflows group A's SUM; row 2 inserts group B.
+		let failing = kernel_batch(
+			&["A", "A", "B"],
+			&[Some("F"), Some("F"), Some("F")],
+			vec![Some(huge), Some(huge), Some(1)],
+			vec![Some(1); 3],
+			vec![Some(1); 3],
+			vec![Some(1.0); 3],
+		);
+		// The same shape without overflow and without group B: the budget admits exactly this.
+		let admitted = kernel_batch(
+			&["A", "A", "A"],
+			&[Some("F"), Some("F"), Some("F")],
+			vec![Some(1), Some(1), Some(1)],
+			vec![Some(1); 3],
+			vec![Some(1); 3],
+			vec![Some(1.0); 3],
+		);
+		let budget = resident_after(GroupedFoldShape::TwoPhase, &[admitted], &calls);
+		let error = |shape| {
+			fold(
+				shape,
+				&[failing.clone()],
+				&two_key_program(),
+				&calls,
+				|groups| groups.set_growth_budget_bytes(Some(budget)),
+			)
+			.expect_err("fails under both shapes")
+		};
+		assert!(
+			matches!(error(GroupedFoldShape::RowAtATime), ExecutionError::Kernel { ref message } if message == "integer SUM overflow"),
+		);
+		assert!(
+			matches!(
+				error(GroupedFoldShape::TwoPhase),
+				ExecutionError::BudgetExhausted { .. }
+			),
+			"two-phase inserts group B before any update"
+		);
+	}
+
+	#[test]
+	fn adr610_the_group_id_buffer_can_be_refused_where_row_at_a_time_fits() {
+		let calls = vec![call(AggregateFunction::CountAll, None)];
+		let one = kernel_batch(
+			&["A"],
+			&[Some("F")],
+			vec![Some(1)],
+			vec![Some(1)],
+			vec![Some(1)],
+			vec![Some(1.0)],
+		);
+		let wide = kernel_batch(
+			&["A"; 512],
+			&[Some("F"); 512],
+			vec![Some(1); 512],
+			vec![Some(1); 512],
+			vec![Some(1); 512],
+			vec![Some(1.0); 512],
+		);
+		let batches = [one, wide];
+		let with_budget = |shape, budget: u64| {
+			fold(shape, &batches, &two_key_program(), &calls, |groups| {
+				groups.set_growth_budget_bytes(Some(budget))
+			})
+		};
+		// The smallest budget row-at-a-time folds and finalizes under (its guards include projected
+		// requests above the resident peak), found by bisection.
+		let (mut refused, mut admitted) = (0u64, 1u64 << 24);
+		assert!(with_budget(GroupedFoldShape::RowAtATime, admitted).is_ok());
+		while admitted - refused > 1 {
+			let middle = refused + (admitted - refused) / 2;
+			match with_budget(GroupedFoldShape::RowAtATime, middle) {
+				Ok(_) => admitted = middle,
+				Err(_) => refused = middle,
+			}
+		}
+		// Plus the first batch's one-id buffer: two-phase fits its first batch and is refused only
+		// when the 512-row batch grows the buffer.
+		let budget = admitted + std::mem::size_of::<u32>() as u64;
+		with_budget(GroupedFoldShape::RowAtATime, budget).expect("row-at-a-time fits");
+		match with_budget(GroupedFoldShape::TwoPhase, budget) {
+			Err(ExecutionError::BudgetExhausted {
+				producer,
+				requested,
+				available,
+				..
+			}) => {
+				assert_eq!(producer, "generic bound grouped-fold hash table");
+				assert!(
+					requested.get() >= available.get() + 2_000,
+					"the 512-row buffer is refused"
+				);
+			}
+			other => panic!("expected the group-id buffer's budget refusal, got {other:?}"),
+		}
 	}
 }
