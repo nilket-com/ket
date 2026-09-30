@@ -441,6 +441,13 @@ pub struct JoinBuildProfile {
 	pub row_list_value_bytes: u64,
 	pub overflow_heap_capacity_bytes: u64,
 	pub build_micros: u64,
+	/// ADR 621: the table's representation (`generic_hash`, `generic_inline`, or a primitive form).
+	#[serde(default)]
+	pub representation: String,
+	/// ADR 621: whether the build's keys qualify for inline storage (Generic, not null-safe, all
+	/// fixed-width, at most 32 encoded bytes), whichever storage the token selected.
+	#[serde(default)]
+	pub inline_eligible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

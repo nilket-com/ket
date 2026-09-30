@@ -30,8 +30,8 @@ use std::time::Instant;
 use arrow::array::{Array, ArrayRef, Int64Array};
 
 use super::{
-	BuildInsertMode, JoinBuildRowsInner, PROBE_BATCH_WINDOW, PrimitiveBuildTable,
-	build_in_memory_join_rows_with_insert_mode,
+	BuildInsertMode, GenericBuildKeyStorage, JoinBuildRowsInner, PROBE_BATCH_WINDOW,
+	PrimitiveBuildTable, build_in_memory_join_rows_with_storage,
 };
 use crate::exec::join::{JoinBuildRows, JoinKey, JoinKeyPlan, join_key_bytes};
 
@@ -177,13 +177,16 @@ fn build(shape: Shape, arrays: &[ArrayRef], n: usize) -> JoinBuildRows {
 		Shape::Int64 => JoinKeyPlan::Int64,
 		Shape::GenericTwoInt64 => JoinKeyPlan::Generic,
 	};
-	build_in_memory_join_rows_with_insert_mode(
+	// ADR 621: the receipts here describe owned `Generic` storage, so the storage is pinned
+	// whichever the production token selects.
+	build_in_memory_join_rows_with_storage(
 		plan,
 		arrays,
 		n,
 		u64::MAX,
 		false,
 		BuildInsertMode::Windowed,
+		GenericBuildKeyStorage::Owned,
 	)
 	.expect("build")
 	.expect("an uncapped build is admitted")
