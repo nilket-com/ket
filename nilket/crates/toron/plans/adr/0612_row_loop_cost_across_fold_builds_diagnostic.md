@@ -1,6 +1,17 @@
 # ADR 612 - the grouped row loop's cost across fold builds: a diagnostic
 
-**Status:** PROPOSED. Successor to ADR 611. **A diagnostic record: no
+**Status:** CLOSED, LIMITED AND INCOMPLETE (results in
+`plans/impl/0612_row_loop_cost_across_fold_builds_diagnostic_results.md`).
+- **Established:** the ordering check, from node attribution. And
+  `find_bucket_in`'s static machine code is identical across the three
+  builds.
+- **Not delivered:** the planned attribution of CPU samples within
+  `row_lookup_update`. The read-out summed whole-process samples, so
+  the symbol table is reported as whole-process only, and no candidate
+  is ranked.
+
+ADR 610's second-pass reading is unresolved. No cut is proposed.
+Successor to ADR 611. **A diagnostic record: no
 token, no pair, no cut.**
 
 ADR 611 found that q13's row-at-a-time fold costs about 1.1 s more in
