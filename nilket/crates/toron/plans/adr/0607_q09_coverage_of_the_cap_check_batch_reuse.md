@@ -1,6 +1,14 @@
 # ADR 607 - q09 coverage of the cap check's batch reuse
 
-**Status:** PROPOSED. Successor to ADR 606. ADR 606 retained
+**Status:** CLOSED, q09 EFFECT NOT ESTABLISHED; no regression. The
+eligibility gate passed, and there was one paired attempt on strix
+(results in
+`plans/impl/0607_q09_coverage_of_the_cap_check_batch_reuse_results.md`).
+The q09 median went from 7,056.6 ms control to 6,972.9 ms treatment, a
+median paired gain of 72.3 ms against a bar of 74.7 ms. Every pair was
+positive, with digest parity and no spill. Peak RSS rose about 123 MB.
+The census shows partsupp, orders, and nation scanned once, and part
+still twice, as predeclared. The token stays `Reuse`. Successor to ADR 606. ADR 606 retained
 `WRAPPED_CAP_CHECK_BATCHES = Reuse` on q05. q05 went from 5,170.6 ms to
 4,735.0 ms, a median paired gain of 444.7 ms, and peak RSS rose
 1.14 GiB. The token is global: it applies on every query that reaches
