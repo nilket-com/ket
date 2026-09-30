@@ -1,6 +1,18 @@
 # ADR 611 - two-phase fold eligibility by aggregate count
 
-**Status:** PROPOSED. Successor to ADR 610, which retained
+**Status:** CLOSED, NOT ESTABLISHED; the token reverts to `AllTyped`
+(results in
+`plans/impl/0611_two_phase_fold_eligibility_by_aggregate_count_results.md`).
+- **Gate:** the first validation refused on this plan's table, which
+  omitted q16's `COUNT(x)` instance. The table was amended here, and a
+  second read-only validation of the same artifacts passed.
+- **q13:** a median paired gain of −1,042.1 ms against a bar of 59.6 ms,
+  with all five pairs negative. q13's row-at-a-time fold was about
+  1.1 s slower in this build than in ADR 610's, a cause unresolved and
+  diagnosed next in ADR 612.
+- **q01:** a non-regression pair, 10.2 ms against a bar of 94.5 ms.
+
+Successor to ADR 610, which retained
 `GROUPED_FOLD_SHAPE = TwoPhase` on q01, with a median paired gain of
 754.9 ms. Its q13 breadth pair fired the regression guard: a median
 paired gain of −122.4 ms against a bar of 76.3 ms, with all five pairs
@@ -34,12 +46,20 @@ A single aggregate has little dispatch to save.
 
 | stays two-phase (≥2 typed aggregates) | falls back to row-at-a-time (0 or 1 typed aggregate) |
 |---|---|
-| q01 (8), q08 (2), q12 (2), q22 (2) | q03, q04, q05, q07, q09, q10, q11, q13 (both instances), q15 (both), q16 (the zero-aggregate instance), q17, q18, q20, q21 |
+| q01 (8), q08 (2), q12 (2), q22 (2) | q03, q04, q05, q07, q09, q10, q11, q13 (both instances), q15 (both), q16 (both: the zero-aggregate instance and the one-aggregate `COUNT(x)` instance), q17, q18, q20, q21 |
 
 q02, q06, q14, and q19 are unchanged: they are row-at-a-time or have no
-grouped fold. Only q01 and q13 have been paired. The other falling-back
-cells took two-phase unmeasured under ADR 610. ADR 611 returns them to
-the ADR 609 code path, and measures only q13 and q01.
+grouped fold.
+
+*Amendment, before any pair.* The first gate refused on this table. It
+listed q16 only by its zero-aggregate instance and omitted q16's second
+instance: one `COUNT(x)` over 947,557 rows, which also falls back under
+the rule. The table now names both. The corrected instance table is
+checked by a fresh read-only validation of the same gate artifacts; see
+the results. Only q01 and q13 have been paired. The other falling-back
+cells took two-phase unmeasured under ADR 610. The treatment would
+return them to the ADR 609 code path, and it measures only q13 and q01.
+The token reverted, so those changes were not retained.
 
 A group-count threshold is the alternative. It needs a runtime reading
 of group growth, and it is not this record.

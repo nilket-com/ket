@@ -4,7 +4,10 @@ use ahash::RandomState;
 mod fold_kernel;
 mod group_table;
 
-use self::fold_kernel::{GROUPED_FOLD_SHAPE, GroupedFoldShape};
+use self::fold_kernel::{
+	EligibilityReason, GROUPED_FOLD_SHAPE, GroupedFoldShape, TWO_PHASE_ELIGIBILITY,
+	TwoPhaseEligibility,
+};
 use self::group_table::BoundGroupedAggregateEntry;
 pub(in crate::exec) use self::group_table::BoundGroupedAggregateGroups;
 use self::group_table::{GROUP_KEY_LOOKUP, GroupKeyLookupPath, GroupKeyRef};
@@ -2351,6 +2354,29 @@ impl Executor {
 		batch: &RecordBatch,
 		shape: GroupedFoldShape,
 	) -> Result<(), ExecutionError> {
+		self.fold_bound_grouped_aggregate_batch_configured(
+			groups,
+			group_types,
+			group_expr,
+			aggr_expr,
+			batch,
+			shape,
+			TWO_PHASE_ELIGIBILITY,
+		)
+	}
+
+	/// ADR 611: the fold under an explicit shape and eligibility rule.
+	#[allow(clippy::too_many_arguments)]
+	pub(in crate::exec) fn fold_bound_grouped_aggregate_batch_configured(
+		&self,
+		groups: &mut BoundGroupedAggregateGroups,
+		group_types: &mut Vec<DataType>,
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		batch: &RecordBatch,
+		shape: GroupedFoldShape,
+		eligibility: TwoPhaseEligibility,
+	) -> Result<(), ExecutionError> {
 		let (quantile_populations, quantile_bytes) =
 			quantile_populations_and_declared_bytes(aggr_expr)?;
 		groups.configure_quantile_admission(
@@ -2494,7 +2520,10 @@ impl Executor {
 		let kernels = template.as_deref().and_then(|template| {
 			fold_kernel::select_typed_kernels(aggr_expr, &aggr_arrays, &readers, template)
 		});
-		let two_phase = shape == GroupedFoldShape::TwoPhase && kernels.is_some();
+		// ADR 611: the rule in force decides which typed call lists fold two-phase.
+		let reason = EligibilityReason::of(eligibility, kernels.is_some(), aggr_expr.len());
+		let two_phase =
+			shape == GroupedFoldShape::TwoPhase && reason == EligibilityReason::Eligible;
 		if receipt_armed {
 			let noted = aggr_expr
 				.iter()
@@ -2525,6 +2554,8 @@ impl Executor {
 					} else {
 						GroupedFoldShape::RowAtATime
 					},
+					eligibility,
+					reason,
 					batch.num_rows(),
 					&noted,
 				);
@@ -6104,13 +6135,15 @@ mod adr610_fold_shape_tests {
 		configure(&mut groups);
 		let mut group_types = Vec::new();
 		for batch in batches {
-			executor.fold_bound_grouped_aggregate_batch_shaped(
+			executor.fold_bound_grouped_aggregate_batch_configured(
 				&mut groups,
 				&mut group_types,
 				group_expr,
 				aggr_expr,
 				batch,
 				shape,
+				// ADR 610's fixtures test the two-phase mechanics under ADR 610's rule.
+				TwoPhaseEligibility::AllTyped,
 			)?;
 		}
 		Ok(groups
@@ -6668,13 +6701,14 @@ mod adr610_fold_shape_tests {
 		let mut group_types = Vec::new();
 		for batch in batches {
 			executor
-				.fold_bound_grouped_aggregate_batch_shaped(
+				.fold_bound_grouped_aggregate_batch_configured(
 					&mut groups,
 					&mut group_types,
 					&two_key_program(),
 					calls,
 					batch,
 					shape,
+					TwoPhaseEligibility::AllTyped,
 				)
 				.expect("unbudgeted fold");
 		}
@@ -6784,5 +6818,201 @@ mod adr610_fold_shape_tests {
 			}
 			other => panic!("expected the group-id buffer's budget refusal, got {other:?}"),
 		}
+	}
+}
+
+#[cfg(test)]
+mod adr611_eligibility_tests {
+	use super::*;
+	use crate::ir::{BoundExprProgramBuilder, ColumnName, ResolvedColumn};
+	use crate::storage::InMemoryStorageScan;
+	use arrow::datatypes::Field;
+
+	fn column(name: &str, ordinal: u32, data_type: DataType) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let column = builder.append_column(ResolvedColumn {
+			name: ColumnName(name.to_string()),
+			ordinal: ColumnOrdinal(ordinal),
+			data_type,
+			nullable: true,
+			pbc_eligible: false,
+		});
+		builder.push_root(column);
+		builder.build()
+	}
+
+	fn call(function: AggregateFunction) -> BoundAggregateCall {
+		BoundAggregateCall {
+			function,
+			args: column("value", 1, DataType::Int64),
+		}
+	}
+
+	fn batch() -> RecordBatch {
+		RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new("key", DataType::Utf8, true),
+				Field::new("value", DataType::Int64, true),
+			])),
+			vec![
+				Arc::new(StringArray::from(vec!["a", "b", "a", "c"])),
+				Arc::new(Int64Array::from(vec![Some(1), None, Some(3), Some(4)])),
+			],
+		)
+		.expect("batch")
+	}
+
+	/// Folds one batch under `shape` and `rule` with the receipt armed; returns the sorted groups'
+	/// states and the receipt line.
+	fn fold(
+		executor: &Executor,
+		shape: GroupedFoldShape,
+		rule: TwoPhaseEligibility,
+		calls: &[BoundAggregateCall],
+	) -> (Vec<(Vec<GroupValue>, String)>, serde_json::Value) {
+		let path = std::env::temp_dir().join(format!(
+			"adr611_{}_{:?}_{:?}_{}.jsonl",
+			std::process::id(),
+			rule,
+			shape,
+			calls.len()
+		));
+		let _ = std::fs::remove_file(&path);
+		let mut groups = BoundGroupedAggregateGroups::new();
+		groups.arm_fold_kernel_receipt(path.clone());
+		let mut group_types = Vec::new();
+		executor
+			.fold_bound_grouped_aggregate_batch_configured(
+				&mut groups,
+				&mut group_types,
+				&column("key", 0, DataType::Utf8),
+				calls,
+				&batch(),
+				shape,
+				rule,
+			)
+			.expect("fold");
+		let entries = groups
+			.finalize_sorted()
+			.expect("finalize")
+			.iter()
+			.map(|entry| (entry.key.to_vec(), format!("{:?}", entry.states)))
+			.collect();
+		let receipt = serde_json::from_str(std::fs::read_to_string(&path).expect("receipt").trim())
+			.expect("json");
+		let _ = std::fs::remove_file(&path);
+		(entries, receipt)
+	}
+
+	#[test]
+	fn adr611_eligibility_reason_per_rule_and_call_count() {
+		use EligibilityReason::{BelowAggregateMinimum, Eligible, UntypedCallList};
+		use TwoPhaseEligibility::{AllTyped, AtLeastTwoTyped};
+		for calls in [0, 1, 2, 8] {
+			assert_eq!(
+				EligibilityReason::of(AllTyped, true, calls),
+				Eligible,
+				"{calls}"
+			);
+			assert_eq!(
+				EligibilityReason::of(AllTyped, false, calls),
+				UntypedCallList,
+				"{calls}"
+			);
+			assert_eq!(
+				EligibilityReason::of(AtLeastTwoTyped, false, calls),
+				UntypedCallList,
+				"{calls}"
+			);
+			let expected = if calls >= 2 {
+				Eligible
+			} else {
+				BelowAggregateMinimum
+			};
+			assert_eq!(
+				EligibilityReason::of(AtLeastTwoTyped, true, calls),
+				expected,
+				"{calls}"
+			);
+		}
+	}
+
+	#[test]
+	fn adr611_each_reason_is_receipted_and_both_rules_fold_identically() {
+		use TwoPhaseEligibility::{AllTyped, AtLeastTwoTyped};
+		let executor = executor();
+		let one = vec![call(AggregateFunction::Sum)];
+		let two = vec![call(AggregateFunction::Sum), call(AggregateFunction::Count)];
+		let untyped = vec![call(AggregateFunction::Sum), call(AggregateFunction::Min)];
+		let row_at_a_time = |calls: &[BoundAggregateCall]| {
+			fold(&executor, GroupedFoldShape::RowAtATime, AllTyped, calls).0
+		};
+		for (label, calls, rule, reason, two_phase) in [
+			// A typed one-aggregate list is eligible under ADR 610's rule...
+			("one, all_typed", &one, AllTyped, "eligible", true),
+			// ...and below the minimum under ADR 611's.
+			(
+				"one, at_least_two",
+				&one,
+				AtLeastTwoTyped,
+				"below_aggregate_minimum",
+				false,
+			),
+			("two, all_typed", &two, AllTyped, "eligible", true),
+			("two, at_least_two", &two, AtLeastTwoTyped, "eligible", true),
+			// A fallback for an untypeable call (MIN beside SUM) is untyped under either rule,
+			// never the minimum.
+			(
+				"untyped, all_typed",
+				&untyped,
+				AllTyped,
+				"untyped_call_list",
+				false,
+			),
+			(
+				"untyped, at_least_two",
+				&untyped,
+				AtLeastTwoTyped,
+				"untyped_call_list",
+				false,
+			),
+		] {
+			let (entries, receipt) = fold(&executor, GroupedFoldShape::TwoPhase, rule, calls);
+			assert_eq!(
+				entries,
+				row_at_a_time(calls),
+				"{label}: identical groups and states"
+			);
+			let rule_name = match rule {
+				AllTyped => "all_typed",
+				AtLeastTwoTyped => "at_least_two_typed",
+			};
+			assert_eq!(receipt["eligibility_rule"], rule_name, "{label}");
+			assert_eq!(receipt["eligibility_reasons"][reason], 1, "{label}");
+			assert_eq!(
+				receipt["eligibility_reasons"]
+					.as_object()
+					.expect("reasons")
+					.len(),
+				1,
+				"{label}: one reason for the one batch"
+			);
+			assert_eq!(
+				receipt["batches_two_phase"],
+				u64::from(two_phase),
+				"{label}"
+			);
+			assert_eq!(
+				receipt["batches_row_at_a_time"],
+				u64::from(!two_phase),
+				"{label}"
+			);
+		}
+	}
+
+	fn executor() -> Executor {
+		Executor::new(Arc::new(InMemoryStorageScan {
+			table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
+		}))
 	}
 }
