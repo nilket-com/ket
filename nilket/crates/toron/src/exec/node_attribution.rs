@@ -2283,10 +2283,26 @@ fn stages_value(invocation: &AggregateInvocation, orphaned: &[&'static str]) -> 
 		replay_ids.sort_unstable();
 		replay_ids.dedup();
 		for replay in replay_ids {
-			let parent_micros = invocation
+			// ADR 615: a refinement's parent may itself be a refinement (a third level, e.g.
+			// `runtime_prep` → `prep_build` → its sub-stages). The parent is found by name and
+			// replay at any level, and must be unique, so no instance stands in for another.
+			let parents = invocation
 				.stages
 				.iter()
-				.find(|s| s.name == parent && s.parent.is_none() && s.replay == replay)
+				.filter(|s| s.name == parent && s.replay == replay)
+				.collect::<Vec<_>>();
+			if parents.len() > 1 {
+				refinements_reconciled = false;
+				refinements.push(serde_json::json!({
+					"parent": parent,
+					"replay_id": replay,
+					"status": "parent_stage_ambiguous",
+					"passed": false,
+				}));
+				continue;
+			}
+			let parent_micros = parents
+				.first()
 				.and_then(|s| s.outcome.reconciled())
 				.map(|(micros, _)| micros);
 			let child_micros =
@@ -6853,6 +6869,111 @@ pub(in crate::exec) mod tests {
 	// Two-level: refinements reconcile to their PARENT stage, not the handler. Counting them at the
 	// top level would double the parent they sit inside, so the split is what makes the second level
 	// safe to add at all.
+	fn adr615_stage(
+		name: &'static str,
+		parent: Option<&'static str>,
+		replay: Option<u64>,
+		micros: u64,
+	) -> HandlerStage {
+		HandlerStage {
+			name,
+			calls: 1,
+			parent,
+			replay,
+			rows: None,
+			retained_bytes: None,
+			outcome: StageOutcome::Reconciled {
+				micros,
+				spill_bytes: 0,
+			},
+		}
+	}
+
+	// ADR 615: a third level — a refinement of a refinement — reconciles against its own parent,
+	// found by name and replay at any level; the levels above are unaffected.
+	#[test]
+	fn adr615_a_third_level_reconciles_to_its_refinement_parent() {
+		let mut invocation = invocation_with_stages(
+			1_000,
+			0,
+			Some(Vocabulary {
+				invocation_id: 3,
+				name: "adr615_three_level",
+				spill: SpillCounterKind::Flow,
+				required_stages: RequiredStages::Static(&["outer"]),
+				residual_boundary_micros: 100,
+			}),
+			vec![adr615_stage("outer", None, Some(1), 950)],
+		);
+		invocation
+			.stages
+			.push(adr615_stage("mid", Some("outer"), Some(1), 900));
+		invocation
+			.stages
+			.push(adr615_stage("leaf_a", Some("mid"), Some(1), 500));
+		invocation
+			.stages
+			.push(adr615_stage("leaf_b", Some("mid"), Some(1), 350));
+		let value = stages_value(&invocation, &[]);
+		// Only the top level closes against the handler.
+		assert_eq!(value["attributed_micros"], 950);
+		let refinements = value["refinements"].as_array().expect("refinements");
+		let mid = refinements
+			.iter()
+			.find(|r| r["parent"] == "outer")
+			.expect("outer refined");
+		assert_eq!(mid["attributed_micros"], 900);
+		assert_eq!(mid["parent_micros"], 950);
+		assert_eq!(mid["passed"], true);
+		let leaves = refinements
+			.iter()
+			.find(|r| r["parent"] == "mid")
+			.expect("mid refined");
+		assert_eq!(leaves["replay_id"], 1);
+		assert_eq!(leaves["attributed_micros"], 850);
+		assert_eq!(leaves["parent_micros"], 900);
+		assert_eq!(leaves["residual_micros"], 50);
+		assert_eq!(leaves["passed"], true);
+		assert_eq!(value["refinements_reconciled"], true);
+	}
+
+	// ADR 615: a parent name appearing twice for one replay, at different levels, is ambiguous and
+	// fails closed rather than letting either instance stand in for the other.
+	#[test]
+	fn adr615_an_ambiguous_refinement_parent_fails_closed() {
+		let mut invocation = invocation_with_stages(
+			1_000,
+			0,
+			Some(Vocabulary {
+				invocation_id: 3,
+				name: "adr615_ambiguous",
+				spill: SpillCounterKind::Flow,
+				required_stages: RequiredStages::Static(&["outer"]),
+				residual_boundary_micros: 1_000,
+			}),
+			vec![
+				adr615_stage("outer", None, Some(1), 600),
+				adr615_stage("mid", None, Some(1), 300),
+			],
+		);
+		invocation
+			.stages
+			.push(adr615_stage("mid", Some("outer"), Some(1), 200));
+		invocation
+			.stages
+			.push(adr615_stage("leaf", Some("mid"), Some(1), 100));
+		let value = stages_value(&invocation, &[]);
+		let ambiguous = value["refinements"]
+			.as_array()
+			.expect("refinements")
+			.iter()
+			.find(|r| r["parent"] == "mid")
+			.expect("mid refinement");
+		assert_eq!(ambiguous["status"], "parent_stage_ambiguous");
+		assert_eq!(ambiguous["passed"], false);
+		assert_eq!(value["refinements_reconciled"], false);
+	}
+
 	#[test]
 	fn refinements_reconcile_to_their_parent_stage_not_the_handler() {
 		let mut invocation = invocation_with_stages(

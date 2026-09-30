@@ -1,6 +1,18 @@
 # ADR 615 - q05's replay-1 build: a diagnostic
 
-**Status:** PROPOSED. Successor to ADR 614. **A diagnostic record: no
+**Status:** CLOSED (results in
+`plans/impl/0615_q05_replay_one_build_diagnostic_results.md`). The
+instrument landed behaviour-neutral: the 22-cell sweep is identical
+apart from the added refinements. Replay 1's `prep_build`, 3,681.7 ms,
+divides into:
+- `prep_exchange`, 1,645.5 ms;
+- `prep_scan_decision`, 927.0 ms;
+- `prep_table_build`, 776.6 ms (matching `build_micros`);
+- `prep_input_materialize`, 241.5 ms;
+- a residual of 77.9 ms.
+
+The build input is all of `lineitem`: 48.0 M rows under 12 M keys. No
+cut. Successor to ADR 614. **A diagnostic record: no
 token, no pair, no cut, no saving projected.**
 
 ADR 614 found `runtime_prep` to be the largest recurring observed owner,
@@ -115,6 +127,36 @@ The instrument lands in this record's implementation with fixtures:
   without the reuse branch;
 - an unarmed run executes no timer code;
 - every chain route's vocabulary still reconciles.
+
+*Fixture amendment, reviewed before the build.* Node attribution is
+armed by its environment variable at process start, so in-process unit
+tests cannot arm it. No existing test drives a chain route armed, and
+the chain fixture is not known to reach the wrapped Reuse-and-Exchange
+path. The armed-chain fixtures above are therefore replaced as follows:
+- **The reconciliation extension keeps its unit fixtures:**
+  - a third level reconciles to its refinement parent;
+  - an ambiguous parent fails closed.
+- **The five armed q05 runs are the path evidence.** In every run:
+  - all four expected replay IDs have a `prep_build`;
+  - each present sub-stage reconciles to its own `prep_build`, with a
+    non-negative residual;
+  - the per-run identity gap is zero;
+  - `refinements_reconciled` is true;
+  - any path-dependent optional child is reported by name.
+- **A separate 22-cell armed compatibility sweep,** one run per cell,
+  with both ADR 613's executable and the instrumented one. It requires,
+  per cell:
+  - digest and fingerprint parity;
+  - identical invocation routes and topology;
+  - identical strict and top-level reconciliation statuses;
+  - no newly failed, missing, or orphaned stage, apart from the intended
+    added `prep_build` children.
+
+  The sweep is not a timing run, and no latency comparison is made
+  from it.
+- **The unarmed path:** `prep_attribution` derives from the stage
+  handle, which is `None` when attribution is off. The existing unarmed
+  chain test still passes.
 
 *The cap-check receipt, in an untimed preflight only.* Its equivalence
 path re-executes the stage's build (`execute_bound_node`), so it must

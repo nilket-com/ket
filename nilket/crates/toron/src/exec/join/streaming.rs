@@ -3644,6 +3644,33 @@ fn reoriented_stage_scan_build_decision_for_materialized_batches(
 /// keeps only whether the check said `Stream` and re-reads an under-cap stage to build it;
 /// `Reuse` builds an under-cap stage from the check's own batches, through the stage's exchange,
 /// where control would run that exchange through `bound_exchange`.
+/// ADR 615: the reoriented chain's attribution handle, passed only from its prep loop so that the
+/// sub-stages of a replay's `prep_build` open only where `prep_build` is itself open. `None`
+/// everywhere else, where no timer code runs.
+#[derive(Clone)]
+pub(in crate::exec) struct PrepAttribution {
+	pub(in crate::exec) handle: node_attribution::VocabularyHandle,
+	pub(in crate::exec) telemetry: Option<std::sync::Arc<std::sync::Mutex<TaskTelemetry>>>,
+}
+
+impl PrepAttribution {
+	fn open(&self, name: &'static str, replay: u64) -> Option<node_attribution::StageToken> {
+		node_attribution::open_replay_substage(
+			&self.handle,
+			"prep_build",
+			name,
+			replay,
+			&self.telemetry,
+		)
+	}
+
+	fn close(&self, token: Option<node_attribution::StageToken>) {
+		if let Some(token) = token {
+			node_attribution::close_stage(token, &self.telemetry);
+		}
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::exec) enum WrappedCapCheckBatches {
 	Discard,
@@ -12730,8 +12757,11 @@ impl Executor {
 		morsel: Option<(MorselId, u32)>,
 
 		form: WrappedCapCheckBatches,
+
+		prep: Option<&PrepAttribution>,
 	) -> Result<ReorientedStageScanBuildDecision, ExecutionError> {
 		let receipt = reoriented_cap_check_receipt_path();
+		let replay = u64::from(stage.replay_id.0);
 		if form == WrappedCapCheckBatches::Discard && receipt.is_none() {
 			return Ok(
 				if self
@@ -12745,9 +12775,14 @@ impl Executor {
 			);
 		}
 		let path = WrappedStageBuildPath::of(stage.build);
+		// ADR 615: the decision call alone — the cap check's scan and materialization.
+		let decision_timer = prep.and_then(|prep| prep.open("prep_scan_decision", replay));
 		let decision = self
 			.reoriented_inner_stage_scan_build_decision(stage, morsel)
 			.await?;
+		if let Some(prep) = prep {
+			prep.close(decision_timer);
+		}
 		let decision_name = decision.name();
 		let exchange = match stage.build {
 			ExecutionPlan::Exchange {
@@ -12763,7 +12798,9 @@ impl Executor {
 		);
 		let reused_batches = match (&decision, reusable) {
 			(ReorientedStageScanBuildDecision::MaterializedBatches(batches), true) => {
-				Some(match &exchange {
+				// ADR 615: the reuse branch alone — on an `Exchange`, `exchange_input_batches`.
+				let exchange_timer = prep.and_then(|prep| prep.open("prep_exchange", replay));
+				let reused = match &exchange {
 					Some((partition_count, key, schema)) => self.exchange_input_batches(
 						batches.clone(),
 						schema.clone(),
@@ -12771,7 +12808,11 @@ impl Executor {
 						key,
 					)?,
 					None => batches.clone(),
-				})
+				};
+				if let Some(prep) = prep {
+					prep.close(exchange_timer);
+				}
+				Some(reused)
 			}
 			_ => None,
 		};
@@ -17468,6 +17509,12 @@ impl Executor {
 		let stage_handle =
 			node_attribution::predeclare_stage_vocabulary(|| scan_probe_base_variants(&stages));
 
+		// ADR 615: `prep_build`'s sub-stages open only from this prep loop, with its handle.
+		let prep_attribution = stage_handle.map(|handle| PrepAttribution {
+			handle,
+			telemetry: self.context.task_telemetry.clone(),
+		});
+
 		let mut grouped_chain_profile = GroupedChainProfile::from_env(stages.len())?;
 
 		let grouped_chain_root = if let Some(profile) = grouped_chain_profile.as_deref() {
@@ -17537,6 +17584,7 @@ impl Executor {
 					&stage,
 					morsel,
 					WRAPPED_CAP_CHECK_BATCHES,
+					prep_attribution.as_ref(),
 				)
 				.await?
 			} else {
@@ -17590,6 +17638,7 @@ impl Executor {
 					self.prepare_reoriented_inner_join_runtime_from_build_batches(
 						stage,
 						build_batches,
+						prep_attribution.as_ref(),
 					)
 					.await?
 				}
@@ -17713,6 +17762,7 @@ impl Executor {
 							&stage,
 							morsel,
 							WRAPPED_CAP_CHECK_BATCHES,
+							prep_attribution.as_ref(),
 						)
 						.await?
 					} else {
@@ -17738,6 +17788,7 @@ impl Executor {
 							self.prepare_reoriented_inner_join_runtime_from_build_batches(
 								stage,
 								build_batches,
+								prep_attribution.as_ref(),
 							)
 							.await?
 						}
@@ -19522,6 +19573,7 @@ impl Executor {
 					self.prepare_reoriented_inner_join_runtime_from_build_batches(
 						stage,
 						build_batches,
+						None,
 					)
 					.await
 				}
@@ -24623,6 +24675,7 @@ impl Executor {
 			stage,
 			build_batches,
 			resident_baseline_bytes,
+			None,
 		)
 		.await
 	}
@@ -24633,11 +24686,14 @@ impl Executor {
 		stage: ReorientedInnerJoinStage<'a>,
 
 		build_batches: Vec<RecordBatch>,
+
+		prep: Option<&PrepAttribution>,
 	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
 		self.prepare_reoriented_inner_join_runtime_from_build_batches_with_baseline(
 			stage,
 			build_batches,
 			0,
+			prep,
 		)
 		.await
 	}
@@ -24650,7 +24706,10 @@ impl Executor {
 		build_batches: Vec<RecordBatch>,
 
 		resident_baseline_bytes: u64,
+
+		prep: Option<&PrepAttribution>,
 	) -> Result<Option<ReorientedInnerJoinRuntime<'a>>, ExecutionError> {
+		let replay = u64::from(stage.replay_id.0);
 		let build_memory_cap =
 			join_output_materialization_memory_cap(self.context.task_budget.memory.get());
 
@@ -24778,6 +24837,8 @@ impl Executor {
 		} else {
 			JoinInputSide::Left
 		};
+		// ADR 615: the build batch's concatenation and its key arrays.
+		let materialize_timer = prep.and_then(|prep| prep.open("prep_input_materialize", replay));
 		let build_batch = time_join_replay_input_materialization(
 			&self.context.task_telemetry,
 			stage.replay_id,
@@ -24787,7 +24848,12 @@ impl Executor {
 		)?;
 
 		let build_key_arrays = key_arrays(&build_batch, &stage.build_keys)?;
+		if let Some(prep) = prep {
+			prep.close(materialize_timer);
+		}
 
+		// ADR 615: exactly the interval `build_micros` measures.
+		let table_build_timer = prep.and_then(|prep| prep.open("prep_table_build", replay));
 		let build_started = Instant::now();
 
 		// ADR0551-SITE: streaming/prepare_reoriented_inner_join_runtime_from_build_batches_with_baseline/Build/2
@@ -24823,6 +24889,9 @@ impl Executor {
 		};
 
 		let build_micros = duration_micros(build_started);
+		if let Some(prep) = prep {
+			prep.close(table_build_timer);
+		}
 
 		// Hoisted shape: the legacy interval ends here, before the closure, so the
 
@@ -31855,6 +31924,7 @@ mod tests {
 			.prepare_reoriented_inner_join_runtime_from_build_batches(
 				reoriented_scan_build_stage(&build, probe_schema.clone(), output_schema.clone()),
 				vec![build_a.clone(), build_b.clone()],
+				None,
 			)
 			.await
 			.expect("spilled materialized runtime")
@@ -31898,6 +31968,7 @@ mod tests {
 			.prepare_reoriented_inner_join_runtime_from_build_batches(
 				reoriented_scan_build_stage(&build, probe_schema.clone(), output_schema.clone()),
 				vec![build_a, build_b],
+				None,
 			)
 			.await
 			.expect("in-memory materialized runtime")
@@ -38429,6 +38500,7 @@ mod tests {
 						&stage,
 						None,
 						WrappedCapCheckBatches::Reuse,
+						None,
 					)
 					.await
 					.expect("reuse decision")
@@ -38467,6 +38539,7 @@ mod tests {
 							&stage,
 							None,
 							WrappedCapCheckBatches::Discard,
+							None,
 						)
 						.await
 						.expect("discard decision"),
@@ -38494,7 +38567,9 @@ mod tests {
 			assert!(
 				matches!(
 					executor
-						.reoriented_inner_wrapped_stage_scan_build_decision(&stage, None, form)
+						.reoriented_inner_wrapped_stage_scan_build_decision(
+							&stage, None, form, None
+						)
 						.await
 						.expect("decision"),
 					ReorientedStageScanBuildDecision::Materialized
@@ -38532,6 +38607,7 @@ mod tests {
 					&stage(),
 					None,
 					WrappedCapCheckBatches::Reuse,
+					None,
 				)
 				.await
 				.expect("reuse decision")
@@ -38539,7 +38615,7 @@ mod tests {
 				panic!("expected reused batches");
 			};
 			let mut reused_runtime = executor
-				.prepare_reoriented_inner_join_runtime_from_build_batches(stage(), reused)
+				.prepare_reoriented_inner_join_runtime_from_build_batches(stage(), reused, None)
 				.await
 				.expect("reused runtime")
 				.expect("reused build prepares");
