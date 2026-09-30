@@ -30,7 +30,7 @@ pub(in crate::exec) enum TwoPhaseEligibility {
 }
 
 pub(in crate::exec) const TWO_PHASE_ELIGIBILITY: TwoPhaseEligibility =
-	TwoPhaseEligibility::AllTyped;
+	TwoPhaseEligibility::AtLeastTwoTyped;
 
 impl TwoPhaseEligibility {
 	fn name(self) -> &'static str {
