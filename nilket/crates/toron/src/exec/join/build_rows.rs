@@ -26,7 +26,7 @@ pub(in crate::exec) enum GenericBuildKeyStorage {
 }
 
 pub(in crate::exec) const GENERIC_BUILD_KEY_STORAGE: GenericBuildKeyStorage =
-	GenericBuildKeyStorage::Owned;
+	GenericBuildKeyStorage::Inline;
 
 /// The widest encoded key stored inline.
 pub(in crate::exec) const INLINE_JOIN_KEY_BYTES: usize = 32;
