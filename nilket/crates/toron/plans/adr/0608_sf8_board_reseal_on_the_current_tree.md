@@ -1,6 +1,13 @@
 # ADR 608 - SF8 board re-seal on the current tree
 
-**Status:** PROPOSED. Successor to ADR 607. Since the sealed ADR 603
+**Status:** CLOSED, SEALED. One board on strix (results in
+`plans/impl/0608_sf8_board_reseal_on_the_current_tree_results.md`;
+artifact `7662f6f2…`, evidence tag
+`evidence/6c052239b854-7662f6f22943`). Toron 62.706 s against DuckDB
+15.600 s, 4.020×. Toron is 31.506 s above 2× this board's DuckDB total,
+and 31.340 s above the fixed 31.366 s threshold. Every digest equals
+ADR 603's, and every cell is stable. No cross-board change is
+attributed. Successor to ADR 607. Since the sealed ADR 603
 anchor (Toron 63.430 s against DuckDB 15.650 s, 4.053×), main has
 retained one global change: ADR 606's `WRAPPED_CAP_CHECK_BATCHES =
 Reuse`. It was measured by pairs on q05 (retained, 444.7 ms) and q09
