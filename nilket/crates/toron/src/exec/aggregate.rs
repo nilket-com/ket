@@ -5,6 +5,7 @@ mod group_table;
 
 use self::group_table::BoundGroupedAggregateEntry;
 pub(in crate::exec) use self::group_table::BoundGroupedAggregateGroups;
+use self::group_table::{GROUP_KEY_LOOKUP, GroupKeyLookupPath, GroupKeyRef};
 
 const EMPTY_PRIMITIVE_INT64_BUCKET: u32 = u32::MAX;
 const PRIMITIVE_INT64_INITIAL_CAPACITY: usize = 1024;
@@ -2072,7 +2073,24 @@ impl Executor {
 				.map(group_array_reader)
 				.collect::<Result<Vec<_>, _>>()?;
 			let borrow_single_utf8_group_key = borrow_single_utf8_group_key_enabled();
+			// ADR 609: the batch's lookup path, and the diagnostic counters when armed.
+			// This unbound fold refuses STRING_AGG above, so none reaches its lookup.
+			let lookup_path = GroupKeyLookupPath::classify(
+				&group_types,
+				borrow_single_utf8_group_key,
+				GROUP_KEY_LOOKUP,
+				false,
+			);
+			let count_lookup_keys = groups.group_key_lookup_receipt_armed();
+			groups.note_group_key_lookup_batch(
+				"grouped_aggregate",
+				lookup_path,
+				&group_types,
+				GROUP_KEY_LOOKUP,
+				batch.num_rows(),
+			);
 			let mut key = Vec::with_capacity(group_arrays.len());
+			let mut key_refs = Vec::with_capacity(group_arrays.len());
 			for row in 0..batch.num_rows() {
 				let states = if borrow_single_utf8_group_key
 					&& let [GroupArrayReader::Utf8(array)] = group_readers.as_slice()
@@ -2082,10 +2100,21 @@ impl Executor {
 						aggr_expr.len(),
 						|| init_states(aggr_expr, &aggr_arrays),
 					)?
+				} else if lookup_path == GroupKeyLookupPath::BorrowedMulti {
+					key_refs.clear();
+					for reader in group_readers.iter() {
+						key_refs.push(reader.value_ref(row));
+					}
+					groups.entry_or_init_borrowed(&key_refs, aggr_expr.len(), |_| {
+						init_states(aggr_expr, &aggr_arrays)
+					})?
 				} else {
 					key.clear();
 					for reader in group_readers.iter() {
 						key.push(reader.value(row));
+					}
+					if count_lookup_keys {
+						groups.count_owned_lookup_key(&key);
 					}
 					groups.entry_or_init(&key, aggr_expr.len(), || {
 						init_states(aggr_expr, &aggr_arrays)
@@ -2409,7 +2438,25 @@ impl Executor {
 		let row_stage = refine.as_ref().and_then(|h| {
 			node_attribution::open_substage(h, "fold", "row_lookup_update", &telemetry)
 		});
+		// ADR 609: the batch's lookup path, and the diagnostic counters when armed.
+		let lookup_path = GroupKeyLookupPath::classify(
+			group_types,
+			borrow_single_utf8_group_key,
+			GROUP_KEY_LOOKUP,
+			aggr_expr
+				.iter()
+				.any(|call| matches!(call.function, AggregateFunction::StringAgg(_))),
+		);
+		let count_lookup_keys = groups.group_key_lookup_receipt_armed();
+		groups.note_group_key_lookup_batch(
+			"fold_bound_grouped_aggregate_batch",
+			lookup_path,
+			group_types,
+			GROUP_KEY_LOOKUP,
+			batch.num_rows(),
+		);
 		let mut key = Vec::with_capacity(group_arrays.len());
+		let mut key_refs = Vec::with_capacity(group_arrays.len());
 		for row in 0..batch.num_rows() {
 			let states = if borrow_single_utf8_group_key
 				&& let [GroupArrayReader::Utf8(array)] = group_readers.as_slice()
@@ -2425,10 +2472,22 @@ impl Executor {
 						init_bound_states_with_seed(aggr_expr, quantile_seed, &identity)
 					},
 				)?
+			} else if lookup_path == GroupKeyLookupPath::BorrowedMulti {
+				key_refs.clear();
+				for reader in group_readers.iter() {
+					key_refs.push(reader.value_ref(row));
+				}
+				groups.entry_or_init_borrowed(&key_refs, aggr_expr.len(), |owned| {
+					let identity = group_identity_bytes(owned);
+					init_bound_states_with_seed(aggr_expr, quantile_seed, &identity)
+				})?
 			} else {
 				key.clear();
 				for reader in group_readers.iter() {
 					key.push(reader.value(row));
+				}
+				if count_lookup_keys {
+					groups.count_owned_lookup_key(&key);
 				}
 				groups.entry_or_init(&key, aggr_expr.len(), || {
 					let identity = group_identity_bytes(&key);
@@ -3358,7 +3417,7 @@ pub(in crate::exec) enum GroupArrayReader<'a> {
 	Decimal128(&'a Decimal128Array),
 }
 
-impl GroupArrayReader<'_> {
+impl<'a> GroupArrayReader<'a> {
 	pub(in crate::exec) fn value(&self, row: usize) -> GroupValue {
 		let null = match self {
 			Self::Boolean(array) => array.is_null(row),
@@ -3394,6 +3453,52 @@ impl GroupArrayReader<'_> {
 			}
 			Self::Utf8(array) => GroupValue::Utf8(array.value(row).to_string()),
 			Self::Decimal128(array) => GroupValue::Decimal128(array.value(row)),
+		}
+	}
+
+	/// ADR 609: `value` read in place, with the same null test and float canonicalization.
+	pub(in crate::exec) fn value_ref(&self, row: usize) -> GroupKeyRef<'a> {
+		let null = match self {
+			Self::Boolean(array) => array.is_null(row),
+			Self::Int32(array) => array.is_null(row),
+			Self::Int64(array) => array.is_null(row),
+			Self::Float32(array) => array.is_null(row),
+			Self::Float64(array) => array.is_null(row),
+			Self::Date32(array) => array.is_null(row),
+			Self::TimestampMillisecond(array) => array.is_null(row),
+			Self::TimestampMicrosecond(array) => array.is_null(row),
+			Self::TimestampNanosecond(array) => array.is_null(row),
+			Self::Utf8(array) => array.is_null(row),
+			Self::Decimal128(array) => array.is_null(row),
+		};
+		if null {
+			return GroupKeyRef::Null;
+		}
+		match self {
+			Self::Boolean(array) => GroupKeyRef::Boolean(array.value(row)),
+			Self::Int32(array) => GroupKeyRef::Int32(array.value(row)),
+			Self::Int64(array) => GroupKeyRef::Int64(array.value(row)),
+			Self::Float32(array) => {
+				GroupKeyRef::Float32(canonical_group_f32_bits(array.value(row)))
+			}
+			Self::Float64(array) => {
+				GroupKeyRef::Float64(canonical_group_f64_bits(array.value(row)))
+			}
+			Self::Date32(array) => GroupKeyRef::Date32(array.value(row)),
+			Self::TimestampMillisecond(array) => {
+				GroupKeyRef::Timestamp(TimeUnit::Millisecond, array.value(row))
+			}
+			Self::TimestampMicrosecond(array) => {
+				GroupKeyRef::Timestamp(TimeUnit::Microsecond, array.value(row))
+			}
+			Self::TimestampNanosecond(array) => {
+				GroupKeyRef::Timestamp(TimeUnit::Nanosecond, array.value(row))
+			}
+			Self::Utf8(array) => {
+				let array: &'a StringArray = array;
+				GroupKeyRef::Utf8(array.value(row))
+			}
+			Self::Decimal128(array) => GroupKeyRef::Decimal128(array.value(row)),
 		}
 	}
 }

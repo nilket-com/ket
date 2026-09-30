@@ -2,6 +2,7 @@ use super::{AggState, GroupValue, MAX_QUANTILE_STATES_PER_EXECUTION, reserve_qua
 use crate::distributed::budget::BudgetDimension;
 use crate::error::ExecutionError;
 use ahash::RandomState;
+use arrow::datatypes::{DataType, TimeUnit};
 use serde::Serialize;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,248 @@ pub(in crate::exec) const GENERIC_GROUPED_FOLD_PROFILE_ENV: &str =
 	"TORON_GENERIC_GROUPED_FOLD_PROFILE_DIR";
 
 static NEXT_PROFILE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// ADR 609: how the grouped fold forms a lookup key for a multi-column key set with a UTF-8
+/// column. `Owned` builds each row's `GroupValue`s (one `String` per UTF-8 key per row);
+/// `Borrowed` hashes and compares the Arrow values in place and owns a key only on insert.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::exec) enum GroupKeyLookup {
+	Owned,
+	Borrowed,
+}
+
+pub(in crate::exec) const GROUP_KEY_LOOKUP: GroupKeyLookup = GroupKeyLookup::Borrowed;
+
+/// ADR 609: diagnostic, one JSON line per aggregate instance at finalize; absent, nothing counts.
+pub(in crate::exec) const GROUP_KEY_LOOKUP_RECEIPT_ENV: &str =
+	"TORON_GROUP_KEY_LOOKUP_RECEIPT_PATH";
+
+/// ADR 609: the lookup path a batch's key set takes, classified from its column types.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::exec) enum GroupKeyLookupPath {
+	SingleUtf8,
+	SingleInt64,
+	BorrowedMulti,
+	OwnedGeneric,
+	StringAgg,
+}
+
+impl GroupKeyLookupPath {
+	/// `string_agg` names a fold with a `STRING_AGG` call: its multi-column UTF-8 lookup keeps
+	/// the owned path, labelled apart, so ADR 609 leaves such folds untouched.
+	pub(in crate::exec) fn classify(
+		group_types: &[DataType],
+		borrow_single_utf8: bool,
+		form: GroupKeyLookup,
+		string_agg: bool,
+	) -> Self {
+		match group_types {
+			[DataType::Utf8] if borrow_single_utf8 => Self::SingleUtf8,
+			[DataType::Int64] => Self::SingleInt64,
+			types if types.len() >= 2 && types.iter().any(|t| *t == DataType::Utf8) => {
+				if string_agg {
+					Self::StringAgg
+				} else if form == GroupKeyLookup::Borrowed {
+					Self::BorrowedMulti
+				} else {
+					Self::OwnedGeneric
+				}
+			}
+			_ => Self::OwnedGeneric,
+		}
+	}
+
+	fn name(self) -> &'static str {
+		match self {
+			Self::SingleUtf8 => "single_utf8",
+			Self::SingleInt64 => "single_int64",
+			Self::BorrowedMulti => "borrowed_multi",
+			Self::OwnedGeneric => "owned_generic",
+			Self::StringAgg => "string_agg",
+		}
+	}
+}
+
+/// ADR 609: one group-key value read in place from its Arrow array. Mirrors `GroupValue` variant
+/// for variant, with the same null test and float canonicalization, so hashing and equality agree
+/// with the owned key exactly.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::exec) enum GroupKeyRef<'a> {
+	Null,
+	Boolean(bool),
+	Int32(i32),
+	Int64(i64),
+	Float32(u32),
+	Float64(u64),
+	Date32(i32),
+	Timestamp(TimeUnit, i64),
+	Utf8(&'a str),
+	Decimal128(i128),
+}
+
+impl GroupKeyRef<'_> {
+	fn to_owned_value(self) -> GroupValue {
+		match self {
+			Self::Null => GroupValue::Null,
+			Self::Boolean(value) => GroupValue::Boolean(value),
+			Self::Int32(value) => GroupValue::Int32(value),
+			Self::Int64(value) => GroupValue::Int64(value),
+			Self::Float32(bits) => GroupValue::Float32(bits),
+			Self::Float64(bits) => GroupValue::Float64(bits),
+			Self::Date32(value) => GroupValue::Date32(value),
+			Self::Timestamp(unit, value) => GroupValue::Timestamp(unit, value),
+			Self::Utf8(value) => GroupValue::Utf8(value.to_owned()),
+			Self::Decimal128(value) => GroupValue::Decimal128(value),
+		}
+	}
+
+	fn matches(self, stored: &GroupValue) -> bool {
+		match (self, stored) {
+			(Self::Null, GroupValue::Null) => true,
+			(Self::Boolean(left), GroupValue::Boolean(right)) => left == *right,
+			(Self::Int32(left), GroupValue::Int32(right)) => left == *right,
+			(Self::Int64(left), GroupValue::Int64(right)) => left == *right,
+			(Self::Float32(left), GroupValue::Float32(right)) => left == *right,
+			(Self::Float64(left), GroupValue::Float64(right)) => left == *right,
+			(Self::Date32(left), GroupValue::Date32(right)) => left == *right,
+			(Self::Timestamp(left_unit, left), GroupValue::Timestamp(right_unit, right)) => {
+				left_unit == *right_unit && left == *right
+			}
+			(Self::Utf8(left), GroupValue::Utf8(right)) => left == right.as_str(),
+			(Self::Decimal128(left), GroupValue::Decimal128(right)) => left == *right,
+			_ => false,
+		}
+	}
+
+	/// The owned value's derived `Hash`: its `GroupValue` discriminant, then its payload hashed as
+	/// the owned payload hashes (`String` delegates to `str`).
+	fn hash_into<H: std::hash::Hasher>(self, state: &mut H) {
+		use std::hash::Hash;
+		use std::mem::discriminant;
+
+		match self {
+			Self::Null => discriminant(&GroupValue::Null).hash(state),
+			Self::Boolean(value) => {
+				discriminant(&GroupValue::Boolean(value)).hash(state);
+				value.hash(state);
+			}
+			Self::Int32(value) => {
+				discriminant(&GroupValue::Int32(value)).hash(state);
+				value.hash(state);
+			}
+			Self::Int64(value) => {
+				discriminant(&GroupValue::Int64(value)).hash(state);
+				value.hash(state);
+			}
+			Self::Float32(bits) => {
+				discriminant(&GroupValue::Float32(bits)).hash(state);
+				bits.hash(state);
+			}
+			Self::Float64(bits) => {
+				discriminant(&GroupValue::Float64(bits)).hash(state);
+				bits.hash(state);
+			}
+			Self::Date32(value) => {
+				discriminant(&GroupValue::Date32(value)).hash(state);
+				value.hash(state);
+			}
+			Self::Timestamp(unit, value) => {
+				discriminant(&GroupValue::Timestamp(unit, value)).hash(state);
+				unit.hash(state);
+				value.hash(state);
+			}
+			Self::Utf8(value) => {
+				discriminant(&GroupValue::Utf8(String::new())).hash(state);
+				value.hash(state);
+			}
+			Self::Decimal128(value) => {
+				discriminant(&GroupValue::Decimal128(value)).hash(state);
+				value.hash(state);
+			}
+		}
+	}
+}
+
+/// The owned `[GroupValue]` slice's derived `Hash`: its length, then each element.
+fn hash_borrowed_key(hasher: &RandomState, key: &[GroupKeyRef<'_>]) -> u64 {
+	use std::hash::{BuildHasher, Hash, Hasher};
+
+	let mut state = hasher.build_hasher();
+	key.len().hash(&mut state);
+	for value in key {
+		value.hash_into(&mut state);
+	}
+	state.finish()
+}
+
+/// ADR 609: code-path counters for one aggregate instance, not allocator readings.
+#[derive(Debug)]
+struct GroupKeyLookupReceipt {
+	path: PathBuf,
+	function: Option<&'static str>,
+	form: Option<GroupKeyLookup>,
+	lookup_path: Option<GroupKeyLookupPath>,
+	lookup_path_changed: bool,
+	key_types: Vec<String>,
+	utf8_keys: usize,
+	rows_folded: u64,
+	lookup_key_values_built: u64,
+	lookup_utf8_strings_built: u64,
+	misses: u64,
+	written: bool,
+}
+
+impl GroupKeyLookupReceipt {
+	fn new(path: PathBuf) -> Self {
+		Self {
+			path,
+			function: None,
+			form: None,
+			lookup_path: None,
+			lookup_path_changed: false,
+			key_types: Vec::new(),
+			utf8_keys: 0,
+			rows_folded: 0,
+			lookup_key_values_built: 0,
+			lookup_utf8_strings_built: 0,
+			misses: 0,
+			written: false,
+		}
+	}
+
+	fn count_built(&mut self, values: usize, utf8_strings: usize) {
+		self.lookup_key_values_built = self
+			.lookup_key_values_built
+			.saturating_add(u64::try_from(values).unwrap_or(u64::MAX));
+		self.lookup_utf8_strings_built = self
+			.lookup_utf8_strings_built
+			.saturating_add(u64::try_from(utf8_strings).unwrap_or(u64::MAX));
+	}
+
+	fn json(&self, groups_final: usize) -> serde_json::Value {
+		serde_json::json!({
+			"kind": "group_key_lookup_instance",
+			"function": self.function,
+			"route": serde_json::Value::Null,
+			"form": self.form.map(|form| format!("{form:?}")),
+			"lookup_path": self.lookup_path.map(GroupKeyLookupPath::name),
+			"lookup_path_changed": self.lookup_path_changed,
+			"key_types": self.key_types,
+			"utf8_keys": self.utf8_keys,
+			"rows_folded": self.rows_folded,
+			"groups_final": groups_final,
+			"misses": self.misses,
+			"lookup_key_values_built": self.lookup_key_values_built,
+			"lookup_utf8_strings_built": self.lookup_utf8_strings_built,
+		})
+	}
+}
+
+fn group_key_lookup_receipt_path() -> Option<PathBuf> {
+	static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+	PATH.get_or_init(|| std::env::var_os(GROUP_KEY_LOOKUP_RECEIPT_ENV).map(PathBuf::from))
+		.clone()
+}
 
 #[derive(Clone, Copy)]
 pub(in crate::exec) struct BoundGroupedAggregateEntry<'a> {
@@ -52,6 +295,8 @@ struct BoundGroupedAggregateGroupState {
 	profile: Option<Box<GenericGroupedFoldProfile>>,
 	/// Present only while the growth census is armed.
 	growth_census: Option<Box<GrowthCensus>>,
+	/// ADR 609: present only while the group-key lookup receipt is armed.
+	lookup_receipt: Option<Box<GroupKeyLookupReceipt>>,
 }
 
 /// Growth is censused, never sampled: it is rare and large enough that row sampling would miss it
@@ -228,7 +473,74 @@ impl BoundGroupedAggregateGroups {
 	}
 
 	pub(in crate::exec) fn new() -> Self {
-		Self::from_lookup(|name| std::env::var_os(name), INITIAL_ENTRY_CAPACITY)
+		let mut groups = Self::from_lookup(|name| std::env::var_os(name), INITIAL_ENTRY_CAPACITY);
+		if let Some(path) = group_key_lookup_receipt_path() {
+			groups.arm_group_key_lookup_receipt(path);
+		}
+		groups
+	}
+
+	/// ADR 609: count this instance's lookup-key constructions and write one receipt line at
+	/// finalize.
+	pub(in crate::exec) fn arm_group_key_lookup_receipt(&mut self, path: PathBuf) {
+		self.state.lookup_receipt = Some(Box::new(GroupKeyLookupReceipt::new(path)));
+	}
+
+	pub(in crate::exec) fn group_key_lookup_receipt_armed(&self) -> bool {
+		self.state.lookup_receipt.is_some()
+	}
+
+	/// ADR 609: one fold batch's function, path, key types, and rows. No-op unless armed.
+	pub(in crate::exec) fn note_group_key_lookup_batch(
+		&mut self,
+		function: &'static str,
+		path: GroupKeyLookupPath,
+		group_types: &[DataType],
+		form: GroupKeyLookup,
+		rows: usize,
+	) {
+		let Some(receipt) = self.state.lookup_receipt.as_mut() else {
+			return;
+		};
+		receipt.function.get_or_insert(function);
+		receipt.form.get_or_insert(form);
+		match receipt.lookup_path {
+			None => receipt.lookup_path = Some(path),
+			Some(previous) if previous != path => receipt.lookup_path_changed = true,
+			Some(_) => {}
+		}
+		if receipt.key_types.is_empty() {
+			receipt.key_types = group_types.iter().map(|t| format!("{t:?}")).collect();
+			receipt.utf8_keys = group_types.iter().filter(|t| **t == DataType::Utf8).count();
+		}
+		receipt.rows_folded = receipt
+			.rows_folded
+			.saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
+	}
+
+	/// ADR 609: an owned lookup key the row loop built. No-op unless armed.
+	pub(in crate::exec) fn count_owned_lookup_key(&mut self, key: &[GroupValue]) {
+		if let Some(receipt) = self.state.lookup_receipt.as_mut() {
+			let utf8 = key
+				.iter()
+				.filter(|value| matches!(value, GroupValue::Utf8(_)))
+				.count();
+			receipt.count_built(key.len(), utf8);
+		}
+	}
+
+	fn write_group_key_lookup_receipt(&mut self) -> Result<(), ExecutionError> {
+		let groups_final = self.len();
+		let Some(receipt) = self.state.lookup_receipt.as_mut() else {
+			return Ok(());
+		};
+		if receipt.written {
+			return Ok(());
+		}
+		let line = receipt.json(groups_final);
+		append_group_key_lookup_receipt(&receipt.path, &line)?;
+		receipt.written = true;
+		Ok(())
 	}
 
 	fn from_lookup(
@@ -255,6 +567,7 @@ impl BoundGroupedAggregateGroups {
 			quantile_execution_admission: None,
 			profile,
 			growth_census: None,
+			lookup_receipt: None,
 		};
 		let mut groups = Self {
 			state: Box::new(state),
@@ -446,6 +759,9 @@ impl BoundGroupedAggregateGroups {
 		let state_capacity = self.state.states.capacity();
 		self.state.keys.push(key)?;
 		self.state.states.push(states);
+		if let Some(receipt) = self.state.lookup_receipt.as_mut() {
+			receipt.misses = receipt.misses.saturating_add(1);
+		}
 		debug_assert_eq!(self.state.states.capacity(), state_capacity);
 		self.state.buckets[vacant.bucket] = entry;
 		self.state.current_resident_bytes = self
@@ -496,12 +812,58 @@ impl BoundGroupedAggregateGroups {
 			Some(value) => GroupValue::Utf8(value.to_owned()),
 			None => GroupValue::Null,
 		}];
+		if let Some(receipt) = self.state.lookup_receipt.as_mut() {
+			receipt.count_built(1, usize::from(value.is_some()));
+		}
 		self.entry_or_init(&owned, state_count, init)
+	}
+
+	/// ADR 609: probe a multi-column key read in place. A hit records one lookup, as the owned
+	/// path does; a miss records nothing here, owns the key once, and falls through to
+	/// `entry_or_init`, whose own lookup is the one recorded, so the profile counts one logical
+	/// lookup per row either way (two physical lookups per miss).
+	pub(in crate::exec) fn entry_or_init_borrowed(
+		&mut self,
+		key: &[GroupKeyRef<'_>],
+		state_count: usize,
+		init: impl FnOnce(&[GroupValue]) -> Result<Vec<AggState>, ExecutionError>,
+	) -> Result<&mut Vec<AggState>, ExecutionError> {
+		let lookup = self.state.lookup_borrowed(key)?;
+		if let Some(entry) = lookup.entry {
+			if let Some(profile) = self.state.profile.as_mut() {
+				profile.record_lookup(lookup.probes, true);
+				profile.record_probe(
+					ProbePhase::PrimaryOccupied,
+					&lookup,
+					self.state.buckets.len(),
+					self.state.entry_limit,
+				);
+			}
+			return self
+				.state
+				.states
+				.get_mut(entry)
+				.ok_or_else(|| table_error("hash bucket points past aggregate states"));
+		}
+
+		let owned = key
+			.iter()
+			.map(|value| value.to_owned_value())
+			.collect::<Vec<_>>();
+		if let Some(receipt) = self.state.lookup_receipt.as_mut() {
+			let utf8 = key
+				.iter()
+				.filter(|value| matches!(value, GroupKeyRef::Utf8(_)))
+				.count();
+			receipt.count_built(owned.len(), utf8);
+		}
+		self.entry_or_init(&owned, state_count, || init(&owned))
 	}
 
 	pub(in crate::exec) fn finalize_sorted(
 		&mut self,
 	) -> Result<Vec<BoundGroupedAggregateEntry<'_>>, ExecutionError> {
+		self.write_group_key_lookup_receipt()?;
 		let requested_scratch = capacity_bytes::<BoundGroupedAggregateEntry<'_>>(self.len());
 		let projected = self
 			.current_resident_bytes()
@@ -796,6 +1158,17 @@ impl BoundGroupedAggregateGroupState {
 		find_single_utf8_bucket_in(&self.hasher, &self.buckets, &self.keys, value)
 	}
 
+	fn lookup_borrowed(&self, key: &[GroupKeyRef<'_>]) -> Result<HashLookup, ExecutionError> {
+		if self.buckets.is_empty() {
+			return Ok(HashLookup {
+				bucket: 0,
+				entry: None,
+				probes: 0,
+			});
+		}
+		find_borrowed_bucket_in(&self.hasher, &self.buckets, &self.keys, key)
+	}
+
 	/// Census wrapper: every growth event is timed in full, none are sampled.
 	fn grow(&mut self) -> Result<(), ExecutionError> {
 		if self.growth_census.is_none() {
@@ -997,6 +1370,73 @@ fn find_single_utf8_bucket_in(
 	Err(table_error(
 		"generic grouped-fold hash table has no free bucket",
 	))
+}
+
+fn find_borrowed_bucket_in(
+	hasher: &RandomState,
+	buckets: &[u32],
+	keys: &GroupKeyStorage,
+	key: &[GroupKeyRef<'_>],
+) -> Result<HashLookup, ExecutionError> {
+	if buckets.is_empty() || !buckets.len().is_power_of_two() {
+		return Err(table_error(
+			"grouped-fold hash table has invalid bucket capacity",
+		));
+	}
+	let mut bucket = (hash_borrowed_key(hasher, key) as usize) & (buckets.len() - 1);
+	for probes in 1..=buckets.len() {
+		let entry = buckets[bucket];
+		if entry == EMPTY_BUCKET {
+			return Ok(HashLookup {
+				bucket,
+				entry: None,
+				probes,
+			});
+		}
+		let entry = entry as usize;
+		let matches = keys.key_at(entry).is_some_and(|stored| {
+			stored.len() == key.len()
+				&& key
+					.iter()
+					.zip(stored)
+					.all(|(value, stored)| value.matches(stored))
+		});
+		if matches {
+			return Ok(HashLookup {
+				bucket,
+				entry: Some(entry),
+				probes,
+			});
+		}
+		bucket = (bucket + 1) & (buckets.len() - 1);
+	}
+	Err(table_error(
+		"borrowed grouped-fold hash table has no free bucket",
+	))
+}
+
+fn append_group_key_lookup_receipt(
+	path: &Path,
+	line: &serde_json::Value,
+) -> Result<(), ExecutionError> {
+	use std::io::Write;
+
+	let mut file = std::fs::OpenOptions::new()
+		.create(true)
+		.append(true)
+		.open(path)
+		.map_err(|error| {
+			table_error(format!(
+				"group-key lookup receipt {} could not be opened: {error}",
+				path.display()
+			))
+		})?;
+	writeln!(file, "{line}").map_err(|error| {
+		table_error(format!(
+			"group-key lookup receipt {} could not be written: {error}",
+			path.display()
+		))
+	})
 }
 
 fn hash_single_utf8_key(hasher: &RandomState, value: Option<&str>) -> u64 {
@@ -1813,5 +2253,369 @@ mod tests {
 			groups.current_resident_bytes(),
 			groups.recomputed_resident_bytes_for_test()
 		);
+	}
+
+	// ADR 609: one owned/borrowed pair per variant and edge the plan names.
+	fn adr609_key_pairs() -> Vec<(GroupKeyRef<'static>, GroupValue)> {
+		let f32_nan = super::super::canonical_group_f32_bits(f32::NAN);
+		let f32_neg_zero = super::super::canonical_group_f32_bits(-0.0);
+		let f64_nan = super::super::canonical_group_f64_bits(f64::from_bits(0x7ff8_0000_0000_0001));
+		let f64_neg_zero = super::super::canonical_group_f64_bits(-0.0);
+		vec![
+			(GroupKeyRef::Null, GroupValue::Null),
+			(GroupKeyRef::Boolean(false), GroupValue::Boolean(false)),
+			(GroupKeyRef::Boolean(true), GroupValue::Boolean(true)),
+			(GroupKeyRef::Int32(i32::MIN), GroupValue::Int32(i32::MIN)),
+			(GroupKeyRef::Int32(i32::MAX), GroupValue::Int32(i32::MAX)),
+			(GroupKeyRef::Int64(i64::MIN), GroupValue::Int64(i64::MIN)),
+			(GroupKeyRef::Int64(i64::MAX), GroupValue::Int64(i64::MAX)),
+			(GroupKeyRef::Float32(f32_nan), GroupValue::Float32(f32_nan)),
+			(
+				GroupKeyRef::Float32(f32_neg_zero),
+				GroupValue::Float32(f32_neg_zero),
+			),
+			(GroupKeyRef::Float64(f64_nan), GroupValue::Float64(f64_nan)),
+			(
+				GroupKeyRef::Float64(f64_neg_zero),
+				GroupValue::Float64(f64_neg_zero),
+			),
+			(GroupKeyRef::Date32(-1), GroupValue::Date32(-1)),
+			(
+				GroupKeyRef::Timestamp(TimeUnit::Second, 7),
+				GroupValue::Timestamp(TimeUnit::Second, 7),
+			),
+			(
+				GroupKeyRef::Timestamp(TimeUnit::Millisecond, 7),
+				GroupValue::Timestamp(TimeUnit::Millisecond, 7),
+			),
+			(
+				GroupKeyRef::Timestamp(TimeUnit::Microsecond, 7),
+				GroupValue::Timestamp(TimeUnit::Microsecond, 7),
+			),
+			(
+				GroupKeyRef::Timestamp(TimeUnit::Nanosecond, 7),
+				GroupValue::Timestamp(TimeUnit::Nanosecond, 7),
+			),
+			(GroupKeyRef::Utf8(""), GroupValue::Utf8(String::new())),
+			(GroupKeyRef::Utf8("R"), GroupValue::Utf8("R".to_string())),
+			(
+				GroupKeyRef::Utf8("naïve ☃"),
+				GroupValue::Utf8("naïve ☃".to_string()),
+			),
+			(
+				GroupKeyRef::Decimal128(i128::MIN),
+				GroupValue::Decimal128(i128::MIN),
+			),
+			(
+				GroupKeyRef::Decimal128(i128::MAX),
+				GroupValue::Decimal128(i128::MAX),
+			),
+		]
+	}
+
+	#[test]
+	fn adr609_borrowed_key_hash_and_equality_match_the_owned_key() {
+		let groups = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| None);
+		let hasher = &groups.state.hasher;
+		let pairs = adr609_key_pairs();
+		// -0.0 canonicalizes to +0.0, so the owned and borrowed forms must both collapse it.
+		assert_eq!(
+			super::super::canonical_group_f64_bits(-0.0),
+			super::super::canonical_group_f64_bits(0.0)
+		);
+		for (borrowed, owned) in &pairs {
+			assert_eq!(
+				hasher.hash_one([owned.clone()].as_slice()),
+				hash_borrowed_key(hasher, &[*borrowed]),
+				"single-element hash differs for {owned:?}"
+			);
+			assert!(borrowed.matches(owned), "{owned:?} must equal itself");
+			assert_eq!(&borrowed.to_owned_value(), owned);
+		}
+		// Multi-element slices hash as the owned slice does, length prefix included.
+		for window in pairs.windows(3) {
+			let borrowed = window.iter().map(|(b, _)| *b).collect::<Vec<_>>();
+			let owned = window.iter().map(|(_, o)| o.clone()).collect::<Vec<_>>();
+			assert_eq!(
+				hasher.hash_one(owned.as_slice()),
+				hash_borrowed_key(hasher, &borrowed)
+			);
+		}
+		// Mismatched variants and values are unequal, NULL included.
+		for (index, (borrowed, _)) in pairs.iter().enumerate() {
+			for (other, (_, owned)) in pairs.iter().enumerate() {
+				if index != other {
+					assert!(
+						!borrowed.matches(owned),
+						"{borrowed:?} must not equal {owned:?}"
+					);
+				}
+			}
+		}
+		assert!(!GroupKeyRef::Utf8("R").matches(&GroupValue::Utf8("r".to_string())));
+		assert!(!GroupKeyRef::Int32(1).matches(&GroupValue::Int64(1)));
+	}
+
+	#[test]
+	fn adr609_reader_value_ref_agrees_with_value() {
+		use arrow::array::{
+			ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+			Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+			TimestampMillisecondArray, TimestampNanosecondArray,
+		};
+		let arrays: Vec<ArrayRef> = vec![
+			Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
+			Arc::new(Int32Array::from(vec![Some(1), None, Some(i32::MIN)])),
+			Arc::new(Int64Array::from(vec![Some(1), None, Some(i64::MAX)])),
+			Arc::new(Float32Array::from(vec![Some(f32::NAN), None, Some(-0.0)])),
+			Arc::new(Float64Array::from(vec![Some(-0.0), None, Some(f64::NAN)])),
+			Arc::new(Date32Array::from(vec![Some(1), None, Some(-1)])),
+			Arc::new(TimestampMillisecondArray::from(vec![
+				Some(1),
+				None,
+				Some(2),
+			])),
+			Arc::new(TimestampMicrosecondArray::from(vec![
+				Some(1),
+				None,
+				Some(2),
+			])),
+			Arc::new(TimestampNanosecondArray::from(vec![Some(1), None, Some(2)])),
+			Arc::new(StringArray::from(vec![Some("A"), None, Some("")])),
+			Arc::new(
+				Decimal128Array::from(vec![Some(12_345), None, Some(-1)])
+					.with_precision_and_scale(15, 2)
+					.expect("decimal type"),
+			),
+		];
+		let hasher = RandomState::new();
+		for array in &arrays {
+			let reader = super::super::group_array_reader(array).expect("reader");
+			for row in 0..array.len() {
+				let owned = reader.value(row);
+				let borrowed = reader.value_ref(row);
+				assert!(
+					borrowed.matches(&owned),
+					"{:?} row {row}",
+					array.data_type()
+				);
+				assert_eq!(borrowed.to_owned_value(), owned);
+				assert_eq!(
+					hasher.hash_one([owned.clone()].as_slice()),
+					hash_borrowed_key(&hasher, &[borrowed])
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn adr609_lookup_path_classification() {
+		use GroupKeyLookup::{Borrowed, Owned};
+		use GroupKeyLookupPath as P;
+		let multi = [DataType::Utf8, DataType::Utf8];
+		let mixed = [DataType::Int64, DataType::Utf8, DataType::Date32];
+		let numeric = [DataType::Int64, DataType::Int32];
+		assert_eq!(P::classify(&multi, true, Borrowed, false), P::BorrowedMulti);
+		assert_eq!(P::classify(&mixed, true, Borrowed, false), P::BorrowedMulti);
+		assert_eq!(P::classify(&multi, true, Owned, false), P::OwnedGeneric);
+		assert_eq!(
+			P::classify(&numeric, true, Borrowed, false),
+			P::OwnedGeneric
+		);
+		assert_eq!(
+			P::classify(&[DataType::Utf8], true, Borrowed, false),
+			P::SingleUtf8
+		);
+		assert_eq!(
+			P::classify(&[DataType::Utf8], false, Borrowed, false),
+			P::OwnedGeneric
+		);
+		assert_eq!(
+			P::classify(&[DataType::Int64], true, Borrowed, false),
+			P::SingleInt64
+		);
+		assert_eq!(
+			P::classify(&[DataType::Date32], true, Borrowed, false),
+			P::OwnedGeneric
+		);
+		// A STRING_AGG fold keeps the owned lookup under both forms, labelled apart; its
+		// single-key paths are unchanged.
+		assert_eq!(P::classify(&multi, true, Borrowed, true), P::StringAgg);
+		assert_eq!(P::classify(&mixed, true, Owned, true), P::StringAgg);
+		assert_eq!(
+			P::classify(&[DataType::Utf8], true, Borrowed, true),
+			P::SingleUtf8
+		);
+		assert_eq!(P::classify(&numeric, true, Borrowed, true), P::OwnedGeneric);
+	}
+
+	/// A multi-batch, two-UTF-8-key fold folded through one form; returns its sorted
+	/// (key, count) output, group-table resident bytes, profile lookups, and receipt line.
+	fn adr609_fold(
+		form: GroupKeyLookup,
+		label: &str,
+	) -> (Vec<(Vec<GroupValue>, i64)>, u64, u64, serde_json::Value) {
+		let profile_directory = test_directory(label);
+		let receipt = test_directory(&format!("{label}_receipt"));
+		let mut groups = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| {
+			Some(profile_directory.clone().into_os_string())
+		});
+		groups.arm_group_key_lookup_receipt(receipt.clone());
+		let batches: [&[(&str, Option<&str>)]; 3] = [
+			&[
+				("A", Some("F")),
+				("N", Some("O")),
+				("A", Some("F")),
+				("R", None),
+			],
+			&[
+				("N", Some("O")),
+				("N", Some("F")),
+				("R", None),
+				("A", Some("F")),
+			],
+			&[("R", Some("F")), ("A", Some("F")), ("N", Some("O"))],
+		];
+		let types = [DataType::Utf8, DataType::Utf8];
+		let path = GroupKeyLookupPath::classify(&types, true, form, false);
+		for batch in batches {
+			groups.note_group_key_lookup_batch("adr609_fixture", path, &types, form, batch.len());
+			for &(flag, status) in batch {
+				let states = match path {
+					GroupKeyLookupPath::BorrowedMulti => {
+						let key = [
+							GroupKeyRef::Utf8(flag),
+							status.map_or(GroupKeyRef::Null, GroupKeyRef::Utf8),
+						];
+						groups
+							.entry_or_init_borrowed(&key, 1, |_| Ok(count_state(0)))
+							.expect("borrowed lookup")
+					}
+					_ => {
+						let key = [
+							GroupValue::Utf8(flag.to_string()),
+							status.map_or(GroupValue::Null, |s| GroupValue::Utf8(s.to_string())),
+						];
+						groups.count_owned_lookup_key(&key);
+						groups
+							.entry_or_init(&key, 1, || Ok(count_state(0)))
+							.expect("owned lookup")
+					}
+				};
+				if let [AggState::Count(total)] = states.as_mut_slice() {
+					*total += 1;
+				}
+			}
+		}
+		let resident = groups.current_resident_bytes();
+		let lookups = groups
+			.state
+			.profile
+			.as_ref()
+			.expect("profile armed")
+			.entry_lookups;
+		let entries = groups
+			.finalize_sorted()
+			.expect("finalize")
+			.iter()
+			.map(|entry| match entry.states {
+				[AggState::Count(total)] => (entry.key.to_vec(), *total),
+				other => panic!("unexpected states {other:?}"),
+			})
+			.collect::<Vec<_>>();
+		let line = std::fs::read_to_string(&receipt).expect("receipt written at finalize");
+		let _ = std::fs::remove_file(&receipt);
+		let _ = std::fs::remove_dir_all(&profile_directory);
+		let mut lines = line.lines();
+		let json = serde_json::from_str(lines.next().expect("one line")).expect("json line");
+		assert!(lines.next().is_none(), "one line per instance");
+		(entries, resident, lookups, json)
+	}
+
+	#[test]
+	fn adr609_borrowed_and_owned_folds_agree_and_count_constructions() {
+		let (owned, owned_resident, owned_lookups, owned_receipt) =
+			adr609_fold(GroupKeyLookup::Owned, "adr609_owned");
+		let (borrowed, borrowed_resident, borrowed_lookups, borrowed_receipt) =
+			adr609_fold(GroupKeyLookup::Borrowed, "adr609_borrowed");
+		assert_eq!(
+			owned, borrowed,
+			"identical groups, counts, and sorted order"
+		);
+		assert_eq!(owned.len(), 5);
+		// Group-table resident accounting (not process RSS) is identical between forms.
+		assert_eq!(owned_resident, borrowed_resident);
+		// One logical lookup per row under both forms.
+		assert_eq!(owned_lookups, 11);
+		assert_eq!(borrowed_lookups, 11);
+
+		assert_eq!(owned_receipt["lookup_path"], "owned_generic");
+		assert_eq!(borrowed_receipt["lookup_path"], "borrowed_multi");
+		// The receipt names the form that ran, not the build's default token.
+		assert_eq!(owned_receipt["form"], "Owned");
+		assert_eq!(borrowed_receipt["form"], "Borrowed");
+		for receipt in [&owned_receipt, &borrowed_receipt] {
+			assert_eq!(receipt["rows_folded"], 11);
+			assert_eq!(receipt["groups_final"], 5);
+			assert_eq!(receipt["misses"], 5);
+			assert_eq!(receipt["utf8_keys"], 2);
+			assert_eq!(receipt["lookup_path_changed"], false);
+			assert_eq!(receipt["function"], "adr609_fixture");
+		}
+		// Owned builds every row's key: 11 rows x 2 values, of which 20 are UTF-8 strings (the
+		// fixture's two NULL statuses build none: 11 x 2 - 2).
+		assert_eq!(owned_receipt["lookup_key_values_built"], 22);
+		assert_eq!(owned_receipt["lookup_utf8_strings_built"], 20);
+		// Borrowed builds only the five inserted keys; one of them carries a NULL status.
+		assert_eq!(borrowed_receipt["lookup_key_values_built"], 10);
+		assert_eq!(borrowed_receipt["lookup_utf8_strings_built"], 9);
+	}
+
+	#[test]
+	fn adr609_borrowed_lookup_survives_growth_and_rehash() {
+		let mut groups = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| None);
+		let names = (0..200)
+			.map(|index| format!("k{index}"))
+			.collect::<Vec<_>>();
+		for (index, name) in names.iter().enumerate() {
+			let key = [GroupKeyRef::Utf8(name), GroupKeyRef::Int64(index as i64)];
+			groups
+				.entry_or_init_borrowed(&key, 1, |_| Ok(count_state(1)))
+				.expect("insert through growth");
+		}
+		assert_eq!(groups.len(), 200);
+		for (index, name) in names.iter().enumerate() {
+			let key = [GroupKeyRef::Utf8(name), GroupKeyRef::Int64(index as i64)];
+			groups
+				.entry_or_init_borrowed(&key, 1, |_| panic!("a hit after rehash must not insert"))
+				.expect("hit after rehash");
+			// The owned lookup finds the same entry.
+			groups
+				.entry_or_init(
+					&[
+						GroupValue::Utf8(name.clone()),
+						GroupValue::Int64(index as i64),
+					],
+					1,
+					|| panic!("owned lookup must hit the borrowed insert"),
+				)
+				.expect("owned hit");
+		}
+		assert_eq!(groups.len(), 200);
+	}
+
+	#[test]
+	fn adr609_receipt_write_error_is_returned() {
+		let mut groups = BoundGroupedAggregateGroups::with_test_profile_lookup(2, |_| None);
+		let missing = test_directory("adr609_missing")
+			.join("no_such_directory")
+			.join("r.jsonl");
+		groups.arm_group_key_lookup_receipt(missing);
+		groups
+			.entry_or_init_borrowed(&[GroupKeyRef::Utf8("A"), GroupKeyRef::Null], 1, |_| {
+				Ok(count_state(1))
+			})
+			.expect("insert");
+		assert!(groups.finalize_sorted().is_err());
 	}
 }
