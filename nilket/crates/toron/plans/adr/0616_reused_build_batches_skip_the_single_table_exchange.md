@@ -96,6 +96,26 @@ paired row is handled explicitly:
 
 Each opens a new record, and none is a silent revert.
 
+*Implementation amendment, stated before the build:*
+- **The build estimate is recorded by the cap-check receipt** (the
+  estimated build bytes, the memory cap, and the path they imply) in
+  the untimed q05 preflight, on **both** arms. The paired rows and gate
+  rows carry no per-row estimate: no row field exists for it, and
+  adding one is a harness change this record does not make. Per row,
+  the spill path and any refusal are read from each row's status,
+  `spill_bytes`, and join-spill observations, beside peak RSS with its
+  label.
+- **`prep_exchange`'s absence under `Bypass`** is shown by armed
+  attribution runs, as in ADR 615. Attribution cannot be armed inside
+  in-process tests.
+- **ADR 606's fixture** `adr606_reuse_builds_what_bound_exchange_would_build`
+  now asserts by token:
+  - under `Repartition`, today's per-partition match;
+  - under `Bypass`, the same rows as control by the row-digest sketch,
+    with equal row counts.
+
+  Every related fixture passes under both token settings.
+
 *Instrumentation, carried over.* ADR 615's `prep_exchange` stage is not
 opened under `Bypass`. It is recorded as absent, as ADR 615's
 vocabulary already allows.
