@@ -19,6 +19,60 @@ pub(in crate::exec) enum GroupedFoldShape {
 
 pub(in crate::exec) const GROUPED_FOLD_SHAPE: GroupedFoldShape = GroupedFoldShape::TwoPhase;
 
+/// ADR 611: which typed call lists fold two-phase. `AllTyped` is ADR 610's rule; `AtLeastTwoTyped`
+/// also requires two or more aggregates, since a one-aggregate fold has little dispatch to save.
+// A `const` token builds with one variant constructed; the other is the measured alternative.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::exec) enum TwoPhaseEligibility {
+	AllTyped,
+	AtLeastTwoTyped,
+}
+
+pub(in crate::exec) const TWO_PHASE_ELIGIBILITY: TwoPhaseEligibility =
+	TwoPhaseEligibility::AllTyped;
+
+impl TwoPhaseEligibility {
+	fn name(self) -> &'static str {
+		match self {
+			Self::AllTyped => "all_typed",
+			Self::AtLeastTwoTyped => "at_least_two_typed",
+		}
+	}
+}
+
+/// ADR 611: why a batch took the shape it did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::exec) enum EligibilityReason {
+	/// Typed kernels for every call and the rule satisfied: two-phase.
+	Eligible,
+	/// Some call has no typed kernel: row-at-a-time under either rule.
+	UntypedCallList,
+	/// Typed for every call but fewer than two calls, under `AtLeastTwoTyped`: row-at-a-time.
+	BelowAggregateMinimum,
+}
+
+impl EligibilityReason {
+	/// The reason for a call list of `calls` aggregates, `typed` when every call has a kernel.
+	pub(in crate::exec) fn of(rule: TwoPhaseEligibility, typed: bool, calls: usize) -> Self {
+		if !typed {
+			Self::UntypedCallList
+		} else if rule == TwoPhaseEligibility::AtLeastTwoTyped && calls < 2 {
+			Self::BelowAggregateMinimum
+		} else {
+			Self::Eligible
+		}
+	}
+
+	fn name(self) -> &'static str {
+		match self {
+			Self::Eligible => "eligible",
+			Self::UntypedCallList => "untyped_call_list",
+			Self::BelowAggregateMinimum => "below_aggregate_minimum",
+		}
+	}
+}
+
 /// ADR 610: diagnostic, one JSON line per aggregate instance at finalize; absent, nothing counts.
 pub(in crate::exec) const GROUPED_FOLD_KERNEL_RECEIPT_ENV: &str =
 	"TORON_GROUPED_FOLD_KERNEL_RECEIPT_PATH";
@@ -420,6 +474,8 @@ fn slot(
 #[derive(Debug)]
 pub(in crate::exec) struct FoldKernelReceipt {
 	path: PathBuf,
+	eligibility_rule: Option<TwoPhaseEligibility>,
+	eligibility_reasons: BTreeMap<&'static str, u64>,
 	batches_row_at_a_time: u64,
 	batches_two_phase: u64,
 	rows_folded: u64,
@@ -432,6 +488,8 @@ impl FoldKernelReceipt {
 	pub(in crate::exec) fn new(path: PathBuf) -> Self {
 		Self {
 			path,
+			eligibility_rule: None,
+			eligibility_reasons: BTreeMap::new(),
 			batches_row_at_a_time: 0,
 			batches_two_phase: 0,
 			rows_folded: 0,
@@ -445,9 +503,14 @@ impl FoldKernelReceipt {
 	pub(in crate::exec) fn note_batch(
 		&mut self,
 		shape: GroupedFoldShape,
+		rule: TwoPhaseEligibility,
+		reason: EligibilityReason,
 		rows: usize,
 		aggregates: &[(String, String, String, String)],
 	) {
+		self.eligibility_rule.get_or_insert(rule);
+		let batches = self.eligibility_reasons.entry(reason.name()).or_insert(0);
+		*batches = batches.saturating_add(1);
 		let rows = u64::try_from(rows).unwrap_or(u64::MAX);
 		if shape == GroupedFoldShape::TwoPhase {
 			self.batches_two_phase = self.batches_two_phase.saturating_add(1);
@@ -483,6 +546,8 @@ impl FoldKernelReceipt {
 		}
 		let line = serde_json::json!({
 			"kind": "grouped_fold_kernel_instance",
+			"eligibility_rule": self.eligibility_rule.map(TwoPhaseEligibility::name),
+			"eligibility_reasons": self.eligibility_reasons,
 			"batches_row_at_a_time": self.batches_row_at_a_time,
 			"batches_two_phase": self.batches_two_phase,
 			"rows_folded": self.rows_folded,
