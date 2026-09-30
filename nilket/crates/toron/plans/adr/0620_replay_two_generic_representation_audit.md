@@ -1,6 +1,28 @@
 # ADR 620 - replay 2's generic join representation: an audit
 
-**Status:** PROPOSED. Successor to ADR 619. **A diagnostic record: no
+**Status:** CLOSED (results in
+`plans/impl/0620_replay_two_generic_representation_audit_results.md`).
+
+**The representation is verified** from the current bound-plan export:
+it builds `partsupp`, with the keys (`ps_suppkey`, `ps_partkey`), both
+Int64 and non-nullable, not null-safe, and the key plan `Generic`.
+
+**The SF8 envelopes** are medians of five complete runs:
+- table build 789.3 ms;
+- probe 1,228.7 ms;
+- cleanup 556.6 ms.
+
+**The synthetic paired differences** (observed, not amounts of removed
+work):
+- build, owned − inline: 198.3 ms;
+- drop: 461.0 ms;
+- probe, fresh − scratch: 126.9 ms.
+
+Build plus cleanup has a per-run median of 1,345.2 ms, above the probe.
+
+**Provisional candidate: O1, build-key storage only.** Inline
+fixed-width keys; both of the successor's arms keep the per-probe
+fresh-key encoding and allocation. No cut. Successor to ADR 619. **A diagnostic record: no
 token, no pair, no cut, no saving projected.**
 
 It establishes three things:

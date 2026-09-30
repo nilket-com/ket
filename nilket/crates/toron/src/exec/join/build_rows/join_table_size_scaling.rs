@@ -27,7 +27,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{Array, ArrayRef, Int64Array};
 
 use super::{
 	BuildInsertMode, JoinBuildRowsInner, PROBE_BATCH_WINDOW, PrimitiveBuildTable,
@@ -550,6 +550,318 @@ fn measure_join_table_size_scaling() {
 					.expect("write");
 				}
 			}
+		}
+	}
+}
+
+// ADR 620: controlled synthetic comparisons at the SF8 replay-2 shape. Prototype tables keyed by the
+// production two-Int64 key encoding, stored owned (a heap `Vec<u8>` per entry) or inline (`[u8; 18]`).
+// Every form hashes through `<[u8] as Hash>` and borrows as `[u8]`, so owned, inline and borrowed
+// lookups share one hash path; each paired build clones one `RandomState`.
+
+/// Two Int64 columns, each a tag byte and eight little-endian bytes.
+const TWO_INT64_KEY_BYTES: usize = 18;
+
+#[derive(PartialEq, Eq)]
+struct OwnedKey(Vec<u8>);
+
+#[derive(PartialEq, Eq)]
+struct InlineKey([u8; TWO_INT64_KEY_BYTES]);
+
+impl std::hash::Hash for OwnedKey {
+	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+		<[u8] as std::hash::Hash>::hash(self.0.as_slice(), state);
+	}
+}
+
+impl std::hash::Hash for InlineKey {
+	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+		<[u8] as std::hash::Hash>::hash(self.0.as_slice(), state);
+	}
+}
+
+impl std::borrow::Borrow<[u8]> for OwnedKey {
+	fn borrow(&self) -> &[u8] {
+		&self.0
+	}
+}
+
+impl std::borrow::Borrow<[u8]> for InlineKey {
+	fn borrow(&self) -> &[u8] {
+		&self.0
+	}
+}
+
+type OwnedTable = std::collections::HashMap<OwnedKey, u32, ahash::RandomState>;
+type InlineTable = std::collections::HashMap<InlineKey, u32, ahash::RandomState>;
+
+/// The production encoding into a reused buffer: the same per-column encoder `join_key_bytes` uses.
+fn encode_into(arrays: &[ArrayRef], row: usize, scratch: &mut Vec<u8>) -> bool {
+	scratch.clear();
+	for array in arrays {
+		if array.is_null(row) {
+			return false;
+		}
+		crate::exec::encode_partition_key_value(array.as_ref(), row, scratch).expect("encode");
+	}
+	true
+}
+
+fn build_owned(arrays: &[ArrayRef], n: usize, state: &ahash::RandomState) -> OwnedTable {
+	let mut table = OwnedTable::with_capacity_and_hasher(n, state.clone());
+	for row in 0..n {
+		let key = join_key_bytes(arrays, row)
+			.expect("encode")
+			.expect("non-null key");
+		table.insert(OwnedKey(key), row as u32);
+	}
+	table
+}
+
+fn build_inline(arrays: &[ArrayRef], n: usize, state: &ahash::RandomState) -> InlineTable {
+	let mut table = InlineTable::with_capacity_and_hasher(n, state.clone());
+	let mut scratch = Vec::with_capacity(TWO_INT64_KEY_BYTES);
+	for row in 0..n {
+		assert!(encode_into(arrays, row, &mut scratch));
+		let mut key = [0u8; TWO_INT64_KEY_BYTES];
+		key.copy_from_slice(&scratch);
+		table.insert(InlineKey(key), row as u32);
+	}
+	table
+}
+
+/// C3's two probe loops, over the same owned table and the same borrowed `&[u8]` lookup: a fresh
+/// `Vec` per probe (`join_key_bytes`), or one reused scratch buffer.
+fn probe_fresh(table: &OwnedTable, probes: &[ArrayRef], rows: usize) -> LookupOutcome {
+	let (mut hits, mut misses, mut checksum) = (0u64, 0u64, 0u64);
+	let start = Instant::now();
+	for row in 0..rows {
+		let key = join_key_bytes(probes, row)
+			.expect("encode")
+			.expect("non-null key");
+		match table.get(key.as_slice()) {
+			Some(found) => {
+				hits += 1;
+				checksum = checksum.wrapping_add(u64::from(*found));
+			}
+			None => misses += 1,
+		}
+	}
+	let nanos = start.elapsed().as_nanos();
+	LookupOutcome {
+		hits,
+		misses,
+		checksum: black_box(checksum),
+		nanos,
+	}
+}
+
+fn probe_scratch<K: std::borrow::Borrow<[u8]> + std::hash::Hash + Eq>(
+	table: &std::collections::HashMap<K, u32, ahash::RandomState>,
+	probes: &[ArrayRef],
+	rows: usize,
+) -> LookupOutcome {
+	let (mut hits, mut misses, mut checksum) = (0u64, 0u64, 0u64);
+	let mut scratch = Vec::with_capacity(TWO_INT64_KEY_BYTES);
+	let start = Instant::now();
+	for row in 0..rows {
+		assert!(encode_into(probes, row, &mut scratch));
+		match table.get(scratch.as_slice()) {
+			Some(found) => {
+				hits += 1;
+				checksum = checksum.wrapping_add(u64::from(*found));
+			}
+			None => misses += 1,
+		}
+	}
+	let nanos = start.elapsed().as_nanos();
+	LookupOutcome {
+		hits,
+		misses,
+		checksum: black_box(checksum),
+		nanos,
+	}
+}
+
+fn timed_drop<T>(value: T) -> u64 {
+	let start = Instant::now();
+	drop(black_box(value));
+	start.elapsed().as_nanos() as u64
+}
+
+#[test]
+fn owned_inline_and_borrowed_key_forms_share_bytes_hash_and_lookups() {
+	let n = 2_000u64;
+	let arrays = key_arrays(Shape::GenericTwoInt64, n as usize);
+	let state = ahash::RandomState::new();
+	let mut scratch = Vec::new();
+	for row in 0..n as usize {
+		let owned = join_key_bytes(&arrays, row)
+			.expect("encode")
+			.expect("non-null key");
+		assert!(encode_into(&arrays, row, &mut scratch));
+		assert_eq!(owned.len(), TWO_INT64_KEY_BYTES);
+		assert_eq!(owned, scratch);
+		let mut inline = [0u8; TWO_INT64_KEY_BYTES];
+		inline.copy_from_slice(&scratch);
+		let borrowed: &[u8] = &scratch;
+		let (h_owned, h_inline, h_borrowed) = (
+			state.hash_one(&OwnedKey(owned.clone())),
+			state.hash_one(&InlineKey(inline)),
+			state.hash_one(borrowed),
+		);
+		assert_eq!((h_owned, h_inline), (h_borrowed, h_borrowed));
+	}
+	let owned = build_owned(&arrays, n as usize, &state);
+	let inline = build_inline(&arrays, n as usize, &state);
+	for (numerator, denominator) in [(1, 1), (1, 3)] {
+		let indices = probe_indices(n, 3_000, numerator, denominator, 5);
+		let probes = generic_probe_arrays(&indices, n);
+		let want = expected(&indices);
+		for outcome in [
+			probe_fresh(&owned, &probes, indices.len()),
+			probe_scratch(&owned, &probes, indices.len()),
+			probe_scratch(&inline, &probes, indices.len()),
+		] {
+			assert_eq!((outcome.hits, outcome.misses, outcome.checksum), want);
+		}
+	}
+}
+
+/// ADR 620's measurement. Run on strix, pinned, by its full name:
+/// `ADR620_BENCH_OUT=<new file> <test-binary>
+/// exec::join::build_rows::join_table_size_scaling::measure_generic_key_ownership --ignored --exact
+/// --test-threads 1`.
+#[test]
+#[ignore = "ADR 620 measurement; run explicitly on strix"]
+fn measure_generic_key_ownership() {
+	use std::io::Write;
+	let path = std::env::var("ADR620_BENCH_OUT").expect("ADR620_BENCH_OUT names the output file");
+	let mut sink = std::fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(&path)
+		.expect("a fresh output file");
+	let receipt = REPLAY2[0];
+	let n = receipt.distinct_keys;
+	let probes_n = 2_610_723usize;
+	let arrays = key_arrays(Shape::GenericTwoInt64, n as usize);
+	let indices = probe_indices(n, probes_n, 1, 1, 0x0620);
+	let probes = generic_probe_arrays(&indices, n);
+	let want = expected(&indices);
+	const REPS: usize = 5;
+	const PASSES: usize = 5;
+	let emit = |sink: &mut std::fs::File, value: serde_json::Value| {
+		writeln!(sink, "{value}").expect("write")
+	};
+	for rep in 0..REPS {
+		let state = ahash::RandomState::new();
+		// Builds, in an order rotated by the repetition.
+		let mut owned = None;
+		let mut inline = None;
+		let mut production = None;
+		for k in 0..3 {
+			let start = Instant::now();
+			let variant = match (k + rep) % 3 {
+				0 => {
+					owned = Some(build_owned(&arrays, n as usize, &state));
+					"owned"
+				}
+				1 => {
+					inline = Some(build_inline(&arrays, n as usize, &state));
+					"inline"
+				}
+				_ => {
+					production = Some(build(Shape::GenericTwoInt64, &arrays, n as usize));
+					"production"
+				}
+			};
+			let nanos = start.elapsed().as_nanos() as u64;
+			emit(
+				&mut sink,
+				serde_json::json!({"record": "build", "variant": variant, "rep": rep, "keys": n, "nanos": nanos}),
+			);
+		}
+		let (owned, inline, production) = (
+			owned.expect("owned"),
+			inline.expect("inline"),
+			production.expect("production"),
+		);
+		// Production accounting parity is checked against the receipt; the prototypes (u32 values,
+		// different key layouts) are reported by their own length and capacity, never against it.
+		// All three tables coexist during the lookups, unlike a sole production table in a query.
+		let refusal = validate(&production, &receipt).err();
+		let actual = observed(&production);
+		emit(
+			&mut sink,
+			serde_json::json!({
+				"record": "shape", "rep": rep, "refusal": refusal,
+				"production": {
+					"representation": actual.representation, "distinct_keys": actual.distinct_keys,
+					"entry_capacity": actual.entry_capacity, "bucket_capacity": actual.bucket_capacity,
+					"index_accounted_bytes": actual.index_accounted_bytes,
+				},
+				"receipt": {
+					"representation": receipt.representation, "distinct_keys": receipt.distinct_keys,
+					"entry_capacity": receipt.entry_capacity, "bucket_capacity": receipt.bucket_capacity,
+					"index_accounted_bytes": receipt.index_accounted_bytes,
+				},
+				"owned_len": owned.len(), "owned_capacity": owned.capacity(),
+				"inline_len": inline.len(), "inline_capacity": inline.capacity(),
+			}),
+		);
+		if refusal.is_some() {
+			continue;
+		}
+		// Lookups: an untimed warm pass per variant, then rotated measured passes.
+		let variants: [&str; 4] = [
+			"fresh_owned",
+			"scratch_owned",
+			"scratch_inline",
+			"production",
+		];
+		let run = |variant: &str| match variant {
+			"fresh_owned" => probe_fresh(&owned, &probes, probes_n),
+			"scratch_owned" => probe_scratch(&owned, &probes, probes_n),
+			"scratch_inline" => probe_scratch(&inline, &probes, probes_n),
+			_ => lookup_generic(&production, &probes, probes_n),
+		};
+		for variant in variants {
+			let warm = run(variant);
+			assert_eq!((warm.hits, warm.misses, warm.checksum), want, "{variant}");
+		}
+		for pass in 0..PASSES {
+			for k in 0..variants.len() {
+				let variant = variants[(k + pass + rep) % variants.len()];
+				let outcome = run(variant);
+				assert_eq!(
+					(outcome.hits, outcome.misses, outcome.checksum),
+					want,
+					"{variant}"
+				);
+				emit(
+					&mut sink,
+					serde_json::json!({
+						"record": "lookup", "variant": variant, "rep": rep, "pass": pass, "probes": probes_n,
+						"hits": outcome.hits, "misses": outcome.misses, "nanos": outcome.nanos as u64,
+						"checksum": outcome.checksum, "expected_hits": want.0, "expected_misses": want.1,
+						"expected_checksum": want.2,
+					}),
+				);
+			}
+		}
+		// Drops, in an order rotated by the repetition.
+		let mut tables = (Some(owned), Some(inline), Some(production));
+		for k in 0..3 {
+			let (variant, nanos) = match (k + rep) % 3 {
+				0 => ("owned", timed_drop(tables.0.take())),
+				1 => ("inline", timed_drop(tables.1.take())),
+				_ => ("production", timed_drop(tables.2.take())),
+			};
+			emit(
+				&mut sink,
+				serde_json::json!({"record": "drop", "variant": variant, "rep": rep, "keys": n, "nanos": nanos}),
+			);
 		}
 	}
 }
