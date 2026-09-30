@@ -1,6 +1,18 @@
 # ADR 617 - SF16 scaling diagnostic
 
-**Status:** PROPOSED. Successor to ADR 616. **A diagnostic record: no
+**Status:** CLOSED (results in
+`plans/impl/0617_sf16_scaling_diagnostic_results.md`). All 20 timed
+groups and every diagnostic gate passed, except one withheld scan-work
+profile (q01 at SF16). Two transitions were observed:
+- q21's execution-stage topology gains a deferred, reservoir-buffered
+  replay that holds 1.85 GB of spill, and its gap goes from 3.73× to
+  5.44×;
+- q18's join bucket starts spilling, and its gap goes from 4.03× to
+  4.58×.
+
+q09's gap widens (4.11× to 4.51×) without an observed transition,
+unresolved. q01 and q05 approximately double, with similar ratios at
+the two scales. Successor to ADR 616. **A diagnostic record: no
 token, no pair, no cut, no saving projected.** Sealed SF8 at ADR 613's
 coordinate stays the campaign target. Nothing here changes that
 coordinate. SF16 artifacts are unsealed diagnostics.
