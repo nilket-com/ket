@@ -3795,6 +3795,7 @@ fn wait_survey_catalog() -> Arc<MockCatalog> {
 		(7, "payload_16k"),
 		(8, "payload_192k"),
 		(9, "slow"),
+		(10, "long"),
 	] {
 		catalog
 			.register_descriptor(
@@ -4238,7 +4239,16 @@ fn worker_entry_for(worker_id: WorkerId, endpoint: WorkerEndpoint) -> WorkerEntr
 /// The named cases: SQL over the process fixtures, planned and bound the same way for every
 /// attempt and every placement.
 async fn probe_case_plan(case: &str) -> ExecutionPlan {
-	let (catalog, logical) = match case {
+	let (catalog, logical) = probe_case_logical(case);
+	bind(&logical, catalog.as_ref(), &PlannerConfig::default())
+		.await
+		.expect("bind probe case")
+}
+
+/// A named case's catalog and logical plan, unbound: the scheduler path binds it here, and the
+/// ADR 627 coordinator path hands it to the production coordinator, which binds it itself.
+fn probe_case_logical(case: &str) -> (Arc<MockCatalog>, LogicalPlan) {
+	match case {
 		"hash_join" => (join_process_catalog(), hash_join_plan()),
 		"grouped_aggregate" => (
 			test_catalog(),
@@ -4277,11 +4287,24 @@ async fn probe_case_plan(case: &str) -> ExecutionPlan {
 				.plan("SELECT slow.id FROM slow")
 				.expect("plan slow scan"),
 		),
+		// ADR 627: a stage-0 producer that scans the slow table, joined by four consumers.
+		"slow_join" => (
+			wait_survey_catalog(),
+			SqlPlanner::new()
+				.plan("SELECT slow.id, customers.region FROM slow JOIN customers ON slow.id = customers.id")
+				.expect("plan slow join"),
+		),
+		// ADR 627: the long healthy coordinator-path case. Its fast `customers` producer and its 30 s
+		// `long` producer are dispatched together, so two workers are in the lease census through the
+		// long scan (observed on loopback; the third joins with the consumers afterwards).
+		"long_join_last" => (
+			wait_survey_catalog(),
+			SqlPlanner::new()
+				.plan("SELECT customers.region, long.id FROM customers JOIN long ON customers.id = long.id")
+				.expect("plan long join last"),
+		),
 		other => panic!("unknown probe case {other}"),
-	};
-	bind(&logical, catalog.as_ref(), &PlannerConfig::default())
-		.await
-		.expect("bind probe case")
+	}
 }
 
 fn manifest_evidence(manifest: &toron::distributed::task::PartitionManifest) -> serde_json::Value {
@@ -6530,4 +6553,664 @@ async fn decoupled_wrong_ca_arrangements_are_rejected_by_the_intended_side() {
 		}
 	}
 	let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---- ADR 627: mid-task worker loss (diagnosis only; no behaviour change) ----
+
+/// The frozen delay from the victim's `StartTask` payload being written (on this process's clock)
+/// to the signal. It is not measured from the scan's start; whether the scan had entered and not
+/// returned at the signal is settled from the victim's own log.
+const ADR627_SIGNAL_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+/// The frozen observation window after the signal.
+const ADR627_OBSERVATION: std::time::Duration = std::time::Duration::from_secs(360);
+
+/// Which coordinator drives the query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Adr627Path {
+	/// `DistributedScheduler::dispatch_loop` directly, as the ADR 625/626 probes do.
+	Scheduler,
+	/// The production `DistributedQueryCoordinator::execute_query`: admission, active query and
+	/// lease renewal. ADR 626's recovery experiment cannot be attached on this path.
+	Coordinator,
+}
+
+impl Adr627Path {
+	fn parse(text: &str) -> Self {
+		match text {
+			"scheduler" => Self::Scheduler,
+			"coordinator" => Self::Coordinator,
+			other => panic!("unknown ADR 627 path {other}"),
+		}
+	}
+
+	fn name(self) -> &'static str {
+		match self {
+			Self::Scheduler => "scheduler",
+			Self::Coordinator => "coordinator",
+		}
+	}
+}
+
+/// The fault to inject into one running task: the target worker and the signal that acts on it.
+/// The signal returns its own evidence, including whether its effect was confirmed (gone for a
+/// kill, stopped for a stop).
+struct Adr627Fault {
+	target: WorkerId,
+	/// The frozen stage whose task scans the slow table on this path and case, declared before the
+	/// run (from the same-path reference) and verified afterwards; never chosen from what landed.
+	victim_stage: u32,
+	fault: &'static str,
+	signal: Box<dyn FnOnce() -> futures::future::BoxFuture<'static, serde_json::Value> + Send>,
+}
+
+/// ADR 627: the task failure a query error carries, typed by its taxonomy label, with the lost
+/// worker's id when it names one.
+fn adr627_task_failure(kind: &toron::error::TaskFailureKind) -> serde_json::Value {
+	match kind {
+		toron::error::TaskFailureKind::WorkerLost { worker_id } => serde_json::json!({
+			"kind": kind.taxonomy_label(),
+			"worker": worker_id.get().as_u128().to_string(),
+		}),
+		other => serde_json::json!({ "kind": other.taxonomy_label() }),
+	}
+}
+
+/// ADR 627: copies WARN-and-above tracing events (the coordinator's existing "query lease renewal
+/// connect failed", among others) into the probe log, so lease operations can be correlated with
+/// them. Passive: it records, and changes nothing the code does.
+struct Adr627TraceLayer {
+	log: Arc<wait_events::EventLog>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Adr627TraceLayer {
+	fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+		if *event.metadata().level() > tracing::Level::WARN {
+			return;
+		}
+		struct Fields(serde_json::Map<String, serde_json::Value>);
+		impl tracing::field::Visit for Fields {
+			fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+				self.0
+					.insert(field.name().to_string(), format!("{value:?}").into());
+			}
+			fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+				self.0.insert(field.name().to_string(), value.into());
+			}
+		}
+		let mut fields = Fields(serde_json::Map::new());
+		event.record(&mut fields);
+		self.log.emit(
+			"trace_event",
+			"dispatch",
+			serde_json::json!({
+				"level": event.metadata().level().to_string(),
+				"target": event.metadata().target(),
+				"fields": fields.0,
+			}),
+		);
+	}
+}
+
+/// Installs the trace layer as this process's global subscriber (spawned tasks such as the lease
+/// renewal run on other threads, so a thread-local default would miss them). Returns whether it was
+/// installed; a process that already has a global subscriber records that the capture is unavailable.
+fn adr627_capture_traces(log: &Arc<wait_events::EventLog>) -> bool {
+	use tracing_subscriber::layer::SubscriberExt as _;
+	let subscriber = tracing_subscriber::registry().with(Adr627TraceLayer { log: log.clone() });
+	tracing::subscriber::set_global_default(subscriber).is_ok()
+}
+
+/// One mid-task run. Every observation is on this process's clock (the probe log's `now_us`);
+/// nothing here subtracts another host's timestamps. Whether the victim's task had entered
+/// execution is settled later, from the victim's own log.
+async fn adr627_run(
+	path: Adr627Path,
+	case: &str,
+	workers: &[(WorkerId, WorkerEndpoint)],
+	transport: Arc<dyn ToronTransport>,
+	log: Arc<wait_events::EventLog>,
+	recovery: Option<toron::distributed::recovery::RecoveryExperiment>,
+	fault: Option<Adr627Fault>,
+	healthy_bound: std::time::Duration,
+) -> serde_json::Value {
+	let mut events = log.subscribe();
+	let trace_capture = adr627_capture_traces(&log);
+	let mut evidence = serde_json::json!({
+		"trace_capture": if trace_capture { "installed" } else { "unavailable: a global subscriber was already set" },
+		"mode": "mid_task",
+		"path": path.name(),
+		"case": case,
+		"fault": fault.as_ref().map(|fault| fault.fault),
+		"target_worker": fault.as_ref().map(|fault| fault.target.get().as_u128().to_string()),
+		"signal_delay_after_start_task_write_ms": ADR627_SIGNAL_DELAY.as_millis() as u64,
+		"victim_stage": fault.as_ref().map(|fault| fault.victim_stage),
+		"observation_secs": ADR627_OBSERVATION.as_secs(),
+		"recovery_experiment": match (path, recovery) {
+			(Adr627Path::Coordinator, _) => serde_json::json!("off: not configurable on the production coordinator path"),
+			(Adr627Path::Scheduler, Some(experiment)) => serde_json::json!({
+				"establishment_ms": experiment.establishment_deadline_millis(),
+				"confirmation_ms": u64::try_from(experiment.confirmation_deadline().as_millis()).unwrap_or(u64::MAX),
+			}),
+			(Adr627Path::Scheduler, None) => serde_json::json!("off"),
+		},
+		"workers": workers.iter().map(|(worker, endpoint)| serde_json::json!({
+			"worker": worker.get().as_u128().to_string(), "endpoint": endpoint.as_str(),
+		})).collect::<Vec<_>>(),
+		"started_us": log.now_us(),
+		"started_unix_ms": unix_ms() as u64,
+	});
+	let entries = || {
+		workers
+			.iter()
+			.map(|(worker, endpoint)| worker_entry_for(*worker, endpoint.clone()))
+			.collect::<Vec<_>>()
+	};
+	let target_endpoint = fault.as_ref().and_then(|fault| {
+		workers
+			.iter()
+			.find(|(worker, _)| *worker == fault.target)
+			.map(|(_, endpoint)| endpoint.as_str().to_string())
+	});
+	let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
+	let signalled_at: Arc<Mutex<Option<std::time::Instant>>> = Arc::default();
+
+	// The watcher: bind the victim from this process's own transport events, wait the frozen
+	// delay, check nothing has come back on the victim's stream, then signal.
+	let watcher = {
+		let log = log.clone();
+		let signalled_at = signalled_at.clone();
+		async move {
+			let Some(fault) = fault else {
+				return serde_json::json!(null);
+			};
+			let target = fault.target.get().as_u128().to_string();
+			let victim_stage = fault.victim_stage;
+			// Unbounded, installed before dispatch: no event is dropped (no lag); a closed log ends
+			// the watch without a victim.
+			let mut stream_target = HashMap::<u64, String>::new();
+			let victim = loop {
+				let event = tokio::select! {
+					event = events.recv() => match event { Some(event) => event, None => return serde_json::json!({ "outcome": "event log closed" }) },
+					_ = done_rx.changed() => return serde_json::json!({ "outcome": "no_running_victim: the query ended before a StartTask to the target was written" }),
+				};
+				let name = event["event"].as_str().unwrap_or_default();
+				if name == "dial_resolved" {
+					if let (Some(stream), Some(worker)) =
+						(event["stream"].as_u64(), event["target"]["worker"].as_str())
+					{
+						stream_target.insert(stream, worker.to_string());
+					}
+				}
+				if name == "frame_envelope_written"
+					&& event["kind"] == "StartTask"
+					&& event["identity"]["task"]["stage"] == victim_stage
+				{
+					let stream = event["stream"].as_u64().unwrap_or(u64::MAX);
+					let landed = stream_target.get(&stream).cloned();
+					if landed.as_deref() == Some(target.as_str()) {
+						break serde_json::json!({
+							"task": event["identity"]["task"].clone(),
+							"worker": target,
+							"endpoint": target_endpoint,
+							"stream": stream,
+							"start_task_written_us": event["at_us"].clone(),
+						});
+					}
+					// The declared stage's task went elsewhere: no victim on the declared host, never retargeted.
+					return serde_json::json!({
+						"outcome": "no_running_victim_on_declared_host",
+						"landed_on": landed,
+						"task": event["identity"]["task"].clone(),
+					});
+				}
+			};
+			let stream = victim["stream"].as_u64().expect("victim stream");
+			tokio::select! {
+				_ = tokio::time::sleep(ADR627_SIGNAL_DELAY) => {}
+				_ = done_rx.changed() => {
+					return serde_json::json!({ "outcome": "query_returned_before_signal", "victim": victim });
+				}
+			}
+			if log.failed() {
+				return serde_json::json!({ "outcome": "instrument_failure: an event write failed; not signalled", "victim": victim });
+			}
+			// Everything this process has observed on the victim's stream up to now. Task output or
+			// a terminal frame means the task was not demonstrably unresolved at the signal; an
+			// acknowledgement (`TaskStarted`, `Progress`, `Heartbeat`, a lease accept) does not.
+			let mut read_back = Vec::new();
+			let mut output_before_signal = Vec::new();
+			while let Ok(event) = events.try_recv() {
+				if event["stream"].as_u64() == Some(stream)
+					&& event["event"] == "frame_envelope_read"
+				{
+					if matches!(
+						event["kind"].as_str(),
+						Some("TaskBatch" | "TaskComplete" | "TaskFailed" | "TaskCancelled")
+					) {
+						output_before_signal.push(event.clone());
+					}
+					read_back.push(event);
+				}
+			}
+			let started_ack = read_back.iter().any(|event| event["kind"] == "TaskStarted");
+			// Each instant is captured once and both recorded and emitted with that exact value, so the
+			// saved record and the raw event agree to the microsecond.
+			let signal_us = log.now_us();
+			log.emit_at(
+				signal_us,
+				"signal_sent",
+				"dispatch",
+				serde_json::json!({ "worker": target, "fault": fault.fault }),
+			);
+			*signalled_at.lock().expect("signal time") = Some(std::time::Instant::now());
+			let signal = (fault.signal)().await;
+			let returned_us = log.now_us();
+			log.emit_at(
+				returned_us,
+				"signal_returned",
+				"dispatch",
+				serde_json::json!({ "worker": target, "result": signal.clone() }),
+			);
+			serde_json::json!({
+				"outcome": if output_before_signal.is_empty() { "signalled" } else { "signalled_after_task_output" },
+				"victim": victim,
+				"envelopes_read_before_signal": read_back,
+				"task_output_before_signal": output_before_signal,
+				"task_started_ack_before_signal": started_ack,
+				"signal_sent_us": signal_us,
+				"signal_returned_us": returned_us,
+				"signal": signal,
+			})
+		}
+	};
+
+	// The query, raced against the observation window measured from the signal (or the healthy
+	// bound when nothing is signalled).
+	let started = std::time::Instant::now();
+	let window_open = |signalled_at: &Arc<Mutex<Option<std::time::Instant>>>| match *signalled_at
+		.lock()
+		.expect("signal time")
+	{
+		Some(at) => at.elapsed() < ADR627_OBSERVATION,
+		None => started.elapsed() < healthy_bound.max(ADR627_OBSERVATION),
+	};
+	let mut recovery_events = serde_json::json!(null);
+	let outcome = match path {
+		Adr627Path::Scheduler => {
+			let stages = fragment_plan(
+				probe_case_plan(case).await,
+				FragmentPlanConfig::new_for_test(
+					QueryId::new(),
+					TaskBudget::from_query_budget(QueryBudget::test_default()),
+				),
+			)
+			.expect("fragment ADR 627 case");
+			// Evidence only: the stages whose tasks scan the slow or long table, as this path fragments them.
+			evidence["scheduler_scan_stages"] = stages
+				.iter()
+				.filter(|stage| {
+					stage.tasks.iter().any(|task| {
+						let text = format!("{:?}", task.spec);
+						text.contains("TableId(9)") || text.contains("TableId(10)")
+					})
+				})
+				.map(|stage| stage.stage_id.get())
+				.collect::<Vec<_>>()
+				.into();
+			let mut scheduler =
+				DistributedScheduler::new(Arc::new(RoundRobinRegistry::new(entries(), 0)));
+			let mut network = NetworkTaskDispatcher::new(
+				Arc::new(MemoryManager::new(64, 1024 * 1024)),
+				transport.clone(),
+			);
+			if let Some(experiment) = recovery {
+				scheduler = scheduler.with_recovery_experiment(experiment);
+				network = network.with_recovery_experiment(experiment);
+			}
+			let dispatcher = ObservedDispatcher {
+				inner: network,
+				log: Some(log.clone()),
+			};
+			let query = async {
+				let run = scheduler.dispatch_loop(&stages, &dispatcher);
+				tokio::pin!(run);
+				loop {
+					tokio::select! {
+						result = &mut run => {
+							log.emit("query_returned", "dispatch", serde_json::json!({ "ok": result.is_ok() }));
+							break Some(result);
+						}
+						_ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+							if !window_open(&signalled_at) {
+								log.emit("observation_expired", "dispatch", serde_json::json!({}));
+								break None;
+							}
+						}
+					}
+				}
+			};
+			let (signal, result) = {
+				let query = async {
+					let result = query.await;
+					let _ = done_tx.send(true);
+					result
+				};
+				tokio::join!(watcher, query)
+			};
+			evidence["signal"] = signal;
+			recovery_events = recovery_events_evidence(scheduler.recovery_events());
+			match result {
+				Some(Ok(run)) => {
+					serde_json::json!({ "outcome": "completed", "run": run_evidence(&run) })
+				}
+				Some(Err(error)) => serde_json::json!({
+					"outcome": "error", "error": format!("{error:?}"), "error_kind": scheduler_error_kind(&error),
+					"error_task_failure": match &error {
+						toron::distributed::scheduler::SchedulerError::TaskFailed { kind, .. } => adr627_task_failure(kind),
+						_ => serde_json::Value::Null,
+					},
+				}),
+				None => serde_json::json!({ "outcome": "no_terminal_return_within_observation" }),
+			}
+		}
+		Adr627Path::Coordinator => {
+			let (catalog, logical) = probe_case_logical(case);
+			let coordinator = toron::coordinator::DistributedQueryCoordinator::new(
+				catalog,
+				Arc::new(RoundRobinRegistry::new(entries(), 0)),
+				Arc::new(MemoryManager::new(64, 1024 * 1024)),
+				transport.clone(),
+				PlannerConfig::default(),
+				QueryBudget::test_default(),
+			);
+			let query = async {
+				let run = coordinator.execute_query(&logical);
+				tokio::pin!(run);
+				let result = loop {
+					tokio::select! {
+						result = &mut run => {
+							log.emit("query_returned", "dispatch", serde_json::json!({ "ok": result.is_ok() }));
+							break Some(result);
+						}
+						_ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+							if !window_open(&signalled_at) {
+								log.emit("observation_expired", "dispatch", serde_json::json!({}));
+								break None;
+							}
+						}
+					}
+				};
+				let _ = done_tx.send(true);
+				result
+			};
+			let (signal, result) = tokio::join!(watcher, query);
+			evidence["signal"] = signal;
+			match result {
+				Some(Ok(batches)) => {
+					let digest = canonical_arrow_ipc_digest(&batches, SortPolicy::FullRowLex)
+						.expect("digest");
+					let mut rendered = Vec::new();
+					for batch in &batches {
+						for row in 0..batch.num_rows() {
+							rendered.push(
+								batch
+									.columns()
+									.iter()
+									.map(|column| {
+										arrow::util::display::array_value_to_string(
+											column.as_ref(),
+											row,
+										)
+										.unwrap_or_else(|error| format!("<{error}>"))
+									})
+									.collect::<Vec<_>>()
+									.join("|"),
+							);
+						}
+					}
+					rendered.sort();
+					serde_json::json!({ "outcome": "completed", "result": {
+						"digest": format!("{digest:?}"), "row_count": rendered.len(), "rows_rendered": rendered,
+					}})
+				}
+				Some(Err(error)) => serde_json::json!({
+					"outcome": "error",
+					"error": format!("{error:?}"),
+					"error_task_failure": match &error {
+						toron::error::QueryError::Runtime(toron::error::RuntimeError::TaskFailure { kind }) => adr627_task_failure(kind),
+						_ => serde_json::Value::Null,
+					},
+				}),
+				None => serde_json::json!({ "outcome": "no_terminal_return_within_observation" }),
+			}
+		}
+	};
+	let ended_us = log.now_us();
+	log.emit(
+		"observation_end",
+		"dispatch",
+		serde_json::json!({ "outcome": outcome["outcome"].clone() }),
+	);
+	// Terminal timing is read by the reader from the raw `query_returned` / `observation_expired`
+	// and `signal_sent` events on this log's clock, never stamped after the watcher completes.
+	evidence["instrument_failed"] = log.failed().into();
+	evidence["result"] = outcome;
+	evidence["recovery_events"] = recovery_events;
+	evidence["elapsed_ms"] = (started.elapsed().as_millis() as u64).into();
+	evidence["ended_us"] = ended_us.into();
+	evidence["ended_unix_ms"] = (unix_ms() as u64).into();
+	evidence
+}
+
+/// The host-mode mid-task probe: the declared workers, path, case and fault from the spec; the
+/// signal is the harness's own command for exactly the target worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "multinode probe: needs TORON_MULTINODE_SPEC and running host-mode workers"]
+async fn multinode_probe_mid_task() {
+	let spec = load_probe_spec();
+	let log = spec
+		.wait_log
+		.clone()
+		.expect("the mid-task probe needs wait_events");
+	let path = Adr627Path::parse(&spec_str(&spec.raw, "path"));
+	let case = spec_str(&spec.raw, "case");
+	let fault = match spec.raw["fault"].as_str() {
+		None | Some("none") => None,
+		Some(kind) => {
+			let fault: &'static str = match kind {
+				"kill" => "kill",
+				"stop" => "stop",
+				other => panic!("unknown fault {other}"),
+			};
+			let target_text = spec_str(&spec.raw, "target_worker");
+			let target = WorkerId::from_u128(target_text.parse().expect("target_worker"));
+			let argv = spec.raw["signal_commands"][target_text.as_str()]
+				.as_array()
+				.unwrap_or_else(|| panic!("no signal command for {target_text}"))
+				.iter()
+				.map(|arg| arg.as_str().expect("signal arg").to_string())
+				.collect::<Vec<_>>();
+			Some(Adr627Fault {
+				target,
+				victim_stage: u32::try_from(
+					spec.raw["victim_stage"].as_u64().expect("victim_stage"),
+				)
+				.expect("stage"),
+				fault,
+				signal: Box::new(move || {
+					Box::pin(async move {
+						let started = std::time::Instant::now();
+						let child = Command::new(&argv[0])
+							.args(&argv[1..])
+							.stdout(Stdio::piped())
+							.stderr(Stdio::piped())
+							.kill_on_drop(true)
+							.spawn()
+							.expect("spawn signal command");
+						let output = tokio::time::timeout(
+							std::time::Duration::from_secs(20),
+							child.wait_with_output(),
+						)
+						.await;
+						match output {
+							Ok(Ok(output)) => {
+								let line = serde_json::from_slice::<serde_json::Value>(
+									output.stdout.trim_ascii(),
+								)
+								.unwrap_or(serde_json::Value::Null);
+								let marker = if fault == "kill" { "gone" } else { "stopped" };
+								serde_json::json!({
+									"command": argv,
+									"status": output.status.code(),
+									"stdout": String::from_utf8_lossy(&output.stdout),
+									"stderr": String::from_utf8_lossy(&output.stderr),
+									"elapsed_ms": started.elapsed().as_millis() as u64,
+									"confirmed": output.status.success() && line[marker].as_bool() == Some(true),
+								})
+							}
+							Ok(Err(error)) => {
+								serde_json::json!({ "command": argv, "error": error.to_string(), "confirmed": false })
+							}
+							Err(_) => {
+								serde_json::json!({ "command": argv, "error": "signal command exceeded 20 s", "confirmed": false })
+							}
+						}
+					})
+				}),
+			})
+		}
+	};
+	let mut evidence = probe_base_evidence(&spec, "mid_task");
+	let run = adr627_run(
+		path,
+		&case,
+		&spec.workers,
+		spec.transport.clone(),
+		log,
+		spec.recovery,
+		fault,
+		spec.deadline,
+	)
+	.await;
+	if let serde_json::Value::Object(map) = run {
+		for (key, value) in map {
+			evidence[key] = value;
+		}
+	}
+	write_probe_evidence(&spec.attempt_dir, &evidence);
+}
+
+/// The local mid-task reproduction: three QUIC loopback fixture workers that record wait events,
+/// one combination of path, case and fault from the environment, the victim signalled through its
+/// own child process. Its evidence and every log are written to `TORON_ADR627_LOCAL_DIR`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ADR 627 local diagnostic: run explicitly with TORON_ADR627_LOCAL_DIR"]
+async fn mid_task_loss_is_observed_on_loopback() {
+	let dir = std::path::PathBuf::from(
+		std::env::var("TORON_ADR627_LOCAL_DIR").expect("TORON_ADR627_LOCAL_DIR"),
+	);
+	std::fs::create_dir(&dir).expect("a fresh diagnostic directory");
+	let path = Adr627Path::parse(
+		&std::env::var("TORON_ADR627_LOCAL_PATH").expect("TORON_ADR627_LOCAL_PATH"),
+	);
+	let case = std::env::var("TORON_ADR627_LOCAL_CASE").expect("TORON_ADR627_LOCAL_CASE");
+	let fault_kind = std::env::var("TORON_ADR627_LOCAL_FAULT").expect("TORON_ADR627_LOCAL_FAULT");
+	assert!(
+		matches!(case.as_str(), "slow_scan" | "slow_join" | "long_join_last"),
+		"case {case}"
+	);
+	assert!(
+		matches!(fault_kind.as_str(), "kill" | "stop" | "none"),
+		"fault {fault_kind}"
+	);
+	with_quic(async {
+		let mut workers = Vec::new();
+		for id in 62_701..=62_703u128 {
+			workers.push(
+				FixtureWorkerProcess::spawn_recorded(
+					WorkerId::from_u128(id),
+					Some(&dir.join(format!("dials-{id}.txt"))),
+					Some(&dir.join(format!("worker-{id}.jsonl"))),
+				)
+				.await,
+			);
+		}
+		let log = wait_events::EventLog::create(&dir.join("probe_events.jsonl")).expect("fresh probe events");
+		let transport: Arc<dyn ToronTransport> = Arc::new(wait_events::ObservedTransport {
+			inner: process_transport(),
+			log: log.clone(),
+			role: "dispatch",
+		});
+		let declared = workers.iter().map(|worker| (worker.worker_id, worker.endpoint.clone())).collect::<Vec<_>>();
+		// The first registry entry takes the first dispatch: the target is declared, then verified.
+		let target = declared[0].0;
+		let pid = workers[0].child.id().expect("victim pid");
+		let fault: &'static str = if fault_kind == "kill" { "kill" } else { "stop" };
+		let recovery = (path == Adr627Path::Scheduler).then(|| {
+			toron::distributed::recovery::RecoveryExperiment::from_millis(ADR626_DECLARED.0, ADR626_DECLARED.1).expect("declared")
+		});
+		let victim_stage = std::env::var("TORON_ADR627_LOCAL_STAGE")
+			.ok()
+			.map(|stage| stage.parse().expect("stage"))
+			.unwrap_or(0);
+		let signal = (fault_kind != "none").then(|| Adr627Fault {
+			target,
+			victim_stage,
+			fault,
+			signal: Box::new(move || {
+				Box::pin(async move {
+					let signal = if fault == "kill" { "-KILL" } else { "-STOP" };
+					let status = Command::new("kill").arg(signal).arg(pid.to_string()).status().await;
+					// Confirm the effect from /proc: gone for a kill, state T for a stop.
+					let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+					let mut state = None;
+					while std::time::Instant::now() < deadline {
+						state = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|stat| {
+							stat.rsplit_once(") ").and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
+						});
+						let confirmed = match fault {
+							"kill" => state.is_none() || state.as_deref() == Some("Z"),
+							_ => state.as_deref() == Some("T"),
+						};
+						if confirmed {
+							break;
+						}
+						tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+					}
+					let confirmed = match fault {
+						"kill" => state.is_none() || state.as_deref() == Some("Z"),
+						_ => state.as_deref() == Some("T"),
+					};
+					serde_json::json!({
+						"pid": pid,
+						"kill_status": status.map(|status| status.code()).map_err(|error| error.to_string()),
+						"proc_state": state,
+						"confirmed": confirmed,
+					})
+				})
+			}),
+		});
+		let recovery_text = recovery.map(|_| "declared");
+		let mut evidence = adr627_run(path, &case, &declared, transport, log, recovery, signal, std::time::Duration::from_secs(60)).await;
+		evidence["local"] = serde_json::json!({ "recovery": recovery_text, "victim_pid": pid });
+		// Cleanup: a stopped victim is killed after the window; its stream endings from here on are
+		// cleanup-induced, recorded after observation_end.
+		let cleanup_kill = Command::new("kill").arg("-KILL").arg(pid.to_string()).status().await;
+		evidence["cleanup"] = serde_json::json!({
+			"victim_kill_status": cleanup_kill.map(|status| status.code()).map_err(|error| error.to_string()),
+			"after_observation": true,
+		});
+		use std::io::Write as _;
+		std::fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(dir.join("local.json"))
+			.expect("fresh local evidence")
+			.write_all(serde_json::to_string_pretty(&evidence).expect("json").as_bytes())
+			.expect("write local evidence");
+		for worker in &mut workers {
+			worker.shutdown().await;
+		}
+	})
+	.await;
 }

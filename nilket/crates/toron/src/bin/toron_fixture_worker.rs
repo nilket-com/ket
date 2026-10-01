@@ -126,7 +126,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 	let worker = |endpoint: WorkerEndpoint, peer: Arc<dyn ToronTransport>| {
 		Ok::<_, Box<dyn Error>>(Arc::new(
 			ToronWorker::with_partition_store_and_endpoint(
-				Arc::new(FixtureStorageScan::new()?),
+				Arc::new(FixtureStorageScan::new(wait_log.clone())?),
 				Arc::new(MemoryManager::new(32, 1024 * 1024)),
 				Arc::new(InMemoryPartitionStore::new()),
 				worker_id,
@@ -300,11 +300,13 @@ struct FixtureStorageScan {
 	/// ADR 626 Stage A sized payloads (tables 6, 7, 8), built on first scan only, so a run that never
 	/// reads them pays nothing for them.
 	payloads: [std::sync::OnceLock<RecordBatch>; 3],
+	/// ADR 627: where a long scan records its entry and return, tagged with the served stream.
+	wait_log: Option<Arc<wait_events::EventLog>>,
 }
 
 impl FixtureStorageScan {
 	fn table(&self, table_id: TableId) -> Result<RecordBatch, StorageError> {
-		if table_id.0 == SLOW_TABLE {
+		if table_id.0 == SLOW_TABLE || table_id.0 == LONG_TABLE {
 			return Ok(slow_batch());
 		}
 		let rows = match table_id.0 {
@@ -327,7 +329,7 @@ impl FixtureStorageScan {
 }
 
 impl FixtureStorageScan {
-	fn new() -> Result<Self, arrow::error::ArrowError> {
+	fn new(wait_log: Option<Arc<wait_events::EventLog>>) -> Result<Self, arrow::error::ArrowError> {
 		let vals_schema = Arc::new(Schema::new(vec![
 			Field::new("val", DataType::Int32, false),
 			Field::new("float_val", DataType::Float64, true),
@@ -425,6 +427,7 @@ impl FixtureStorageScan {
 				(TableId(5), set_right),
 			]),
 			payloads: std::array::from_fn(|_| std::sync::OnceLock::new()),
+			wait_log,
 		})
 	}
 }
@@ -432,6 +435,9 @@ impl FixtureStorageScan {
 /// ADR 626 Stage C: the slow table and how long its scan stays silent (above the 5 s `H`).
 const SLOW_TABLE: u64 = 9;
 const SLOW_SCAN: std::time::Duration = std::time::Duration::from_secs(8);
+/// ADR 627: a scan long enough to span several 5 s lease-renewal ticks on the coordinator path.
+const LONG_TABLE: u64 = 10;
+const LONG_SCAN: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn slow_batch() -> RecordBatch {
 	RecordBatch::try_new(
@@ -467,10 +473,25 @@ fn payload(rows: i64) -> Result<RecordBatch, arrow::error::ArrowError> {
 #[async_trait::async_trait]
 impl StorageScan for FixtureStorageScan {
 	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
-		if request.table_id.0 == SLOW_TABLE {
+		let silence = match request.table_id.0 {
 			// ADR 626 Stage C: a scan that stays silent longer than the experiment's `H`, so the
 			// long-silence control shows `H` bounds establishment only.
-			tokio::time::sleep(SLOW_SCAN).await;
+			SLOW_TABLE => Some(SLOW_SCAN),
+			LONG_TABLE => Some(LONG_SCAN),
+			_ => None,
+		};
+		if let Some(silence) = silence {
+			// ADR 627: the task's execution entry, on the worker's own clock. The served stream ties
+			// it to that stream's `StartTask`; without the task-local, the binding is unavailable.
+			let stream = wait_events::SERVED_STREAM.try_with(|stream| *stream).ok();
+			let fields = serde_json::json!({ "table": request.table_id.0, "stream": stream });
+			if let Some(log) = &self.wait_log {
+				log.emit("scan_entered", "served", fields.clone());
+			}
+			tokio::time::sleep(silence).await;
+			if let Some(log) = &self.wait_log {
+				log.emit("scan_returned", "served", fields);
+			}
 		}
 		let mut batch = self.table(request.table_id)?;
 		// ADR 238: honor a pushed predicate in the source-column domain (before projection),

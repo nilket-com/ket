@@ -41,6 +41,11 @@ pub struct EventLog {
 	file: Mutex<std::fs::File>,
 	opened: Instant,
 	next_stream: AtomicU64,
+	/// ADR 627: in-process observers of every event after it is written (the probe times its
+	/// signal from them). Passive: a closed observer is dropped, and nothing waits on one.
+	observers: Mutex<Vec<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>>,
+	/// ADR 627: set once any write fails; the log is then incomplete instrumentation.
+	failed: std::sync::atomic::AtomicBool,
 }
 
 impl EventLog {
@@ -54,6 +59,8 @@ impl EventLog {
 			file: Mutex::new(file),
 			opened: Instant::now(),
 			next_stream: AtomicU64::new(1),
+			observers: Mutex::new(Vec::new()),
+			failed: std::sync::atomic::AtomicBool::new(false),
 		}))
 	}
 
@@ -90,7 +97,29 @@ impl EventLog {
 			.and_then(|mut file| file.write_all(line.as_bytes()));
 		if let Err(error) = written {
 			eprintln!("wait event log write failed: {error}");
+			// An event that was not persisted is never delivered to an observer: nothing may act on
+			// an event the record does not contain.
+			self.failed.store(true, Ordering::SeqCst);
+			return;
 		}
+		if let Ok(mut observers) = self.observers.lock() {
+			observers.retain(|observer| observer.send(fields.clone()).is_ok());
+		}
+	}
+
+	/// ADR 627: whether any write to this log has failed.
+	pub fn failed(&self) -> bool {
+		self.failed.load(Ordering::SeqCst)
+	}
+
+	/// ADR 627: every event emitted from now on, after its line is written.
+	pub fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<serde_json::Value> {
+		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+		self.observers
+			.lock()
+			.expect("event log observers poisoned")
+			.push(sender);
+		receiver
 	}
 
 	pub fn emit(&self, event: &str, role: &str, fields: serde_json::Value) {
@@ -183,7 +212,34 @@ impl ObservedTransport {
 		let started = self.log.now_us();
 		self.log
 			.emit_at(started, "dial_start", self.role, fields.clone());
+		// ADR 627: a dial dropped before it resolves (an outer timeout, a cancelled caller) records
+		// `dial_abandoned`; without this, the abandonment would leave no event at all.
+		struct Abandoned<'a> {
+			log: &'a EventLog,
+			role: &'static str,
+			fields: serde_json::Value,
+			started: u64,
+			armed: bool,
+		}
+		impl Drop for Abandoned<'_> {
+			fn drop(&mut self) {
+				if self.armed {
+					let ended = self.log.now_us();
+					let mut fields = self.fields.clone();
+					fields["elapsed_us"] = ended.saturating_sub(self.started).into();
+					self.log.emit_at(ended, "dial_abandoned", self.role, fields);
+				}
+			}
+		}
+		let mut guard = Abandoned {
+			log: &self.log,
+			role: self.role,
+			fields: fields.clone(),
+			started,
+			armed: true,
+		};
 		let outcome = dial.await;
+		guard.armed = false;
 		let ended = self.log.now_us();
 		fields["elapsed_us"] = ended.saturating_sub(started).into();
 		match outcome {
@@ -644,6 +700,55 @@ mod observer_tests {
 		let mut out = (envelope.len() as u32).to_le_bytes().to_vec();
 		out.extend_from_slice(&envelope);
 		out
+	}
+
+	/// A transport whose dials never resolve.
+	struct NeverResolves;
+
+	#[async_trait::async_trait]
+	impl ToronTransport for NeverResolves {
+		async fn connect(&self, _: &str) -> Result<Box<dyn ToronStream>, QueryError> {
+			futures::future::pending().await
+		}
+		async fn connect_peer(
+			&self,
+			_: &WorkerId,
+			_: &WorkerEndpoint,
+		) -> Result<Box<dyn ToronStream>, QueryError> {
+			futures::future::pending().await
+		}
+		async fn connect_worker(
+			&self,
+			_: &WorkerEntry,
+		) -> Result<Box<dyn ToronStream>, QueryError> {
+			futures::future::pending().await
+		}
+	}
+
+	/// ADR 627: a dial dropped by an outer timeout records `dial_abandoned` (with its elapsed time),
+	/// exactly once, and nothing claims it resolved or failed.
+	#[tokio::test]
+	async fn a_dial_dropped_before_it_resolves_is_recorded_as_abandoned() {
+		let (log, path) = fresh_log();
+		let transport = ObservedTransport {
+			inner: Arc::new(NeverResolves),
+			log: log.clone(),
+			role: "dispatch",
+		};
+		let dial = transport.connect("127.0.0.1:9");
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(50), dial)
+				.await
+				.is_err()
+		);
+		let events = read_events(&path);
+		assert_eq!(named(&events, "dial_start").len(), 1);
+		let abandoned = named(&events, "dial_abandoned");
+		assert_eq!(abandoned.len(), 1, "{events:?}");
+		assert!(abandoned[0]["elapsed_us"].as_u64().expect("elapsed") >= 50_000);
+		assert!(
+			named(&events, "dial_resolved").is_empty() && named(&events, "dial_failed").is_empty()
+		);
 	}
 
 	#[tokio::test]
