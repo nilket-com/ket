@@ -1,6 +1,16 @@
 # ADR 622 - SF8 board re-seal after the build-side cuts
 
-**Status:** PROPOSED. Successor to ADR 621. Main has changed since ADR
+**Status:** CLOSED, SEALED. One board on strix (results in
+`plans/impl/0622_sf8_board_reseal_after_the_build_side_cuts_results.md`;
+artifact `54e99bdf…`, evidence tag
+`evidence/f98a142d6c58-54e99bdf3f63`). Toron 58.672 s against DuckDB
+15.635 s, 3.753×. Toron is 27.402 s above 2× this board's DuckDB total,
+and 27.306 s above the fixed 31.366 s threshold. Every cell's result
+identity (Toron digest, DuckDB result SHA-256) equals ADR 613's, and
+every cell is stable. The largest gaps are q21, q18, q09
+and q07. No cross-board attribution.
+
+Successor to ADR 621. Main has changed since ADR
 613 sealed the current-tree board (Toron 61.387 s against DuckDB
 15.579 s, 3.940×). The source-changing commits since then:
 
