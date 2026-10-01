@@ -155,7 +155,7 @@ covering
 It goes to review. If the observations contradict the hypothesis,
 Stage B is re-planned.
 
-*Stage A instrument amendments (for review).*
+*Stage A instrument amendments (reviewed).*
 - **Where the instrument sits.** All events are observed at the transport
   and stream boundary, in the fixture worker and the probe. No library code
   changes.
@@ -217,6 +217,160 @@ Stage B is re-planned.
   - a link campaign before and after.
 
   The readout refuses any other set.
+
+## Stage A results (reviewed)
+
+**Outcome:** an integrity readout of **READ**, with **LIMITED** survey
+coverage. READ means every integrity check passed. It does not mean every
+survey objective was met.
+- **Readout:** `readout-stage-a.json`, sha256 `80da58f44b135cde2207bb838f5406cc10dccb84af7e7145a0a0c88f8396ddbe`.
+- **Frozen schedule:** 11 attempts (`schedule.json` `be61b2ea6cd17412b01eb746841d22e1b0fb6d9992e2ee67310e688ec20c9a0d`),
+  with link campaigns `a` before and `b` after.
+- **Every attempt** finished with verified cleanup and complete evidence. No
+  STOP was written.
+
+**Provenance.**
+- **Source:** `diag: adr 626 passive wait events`
+  `0d9786a1fd6a207166a6e54b174c0aaf0d4e430c`, tree
+  `49aaed874414c47d1629acae72316dd633a1cb88`.
+- **Ladder:** the retained ladder on that tree is at
+  `bigfoot:/home/me/work/toron-evidence/adr626/ladder-diag-2/`:
+  - toron: 46 binaries, 5561 passed, 0 failed, 10 ignored;
+  - toron-tpch: 674 passed, 0 failed, 6 ignored;
+  - fmt clean, and both release builds with 0 warnings. The debug-test
+    `adr589_plain_write` warning belongs to ADR 589.
+- **Executables:** the worker
+  `dcfc1a12b7db1a35ca41fc7db9204a72a2d153c0c9bb58f75884511818081de1` and
+  the probe `47fad2548f66b1a9de540c0daa86dd2bb7bcda1223ccf9f63014a9a4ce2015ca`
+  were staged per host, with `manifests.json`
+  `cb9e2f61c6a78820bbf3823cc5ea605300ddd6458696f069d1c400d2cd9dc059`. Each
+  host's manifest was verified on that host.
+- **Retained evidence:** `bigfoot:/home/me/work/toron-evidence/adr626/campaign/`,
+  holding the copied evidence, the harness, the ADR 625 reader it imports,
+  and the source diff. Its `SHA256SUMS` lists 1,540 files and has sha256
+  `7cd29f9e729892ce7fb0fcfcfc25d3513e4405e66d34f3f4b32b0c1aef730c78`.
+- **Freeze record:** `freeze-stage-a.json`
+  `315a77fb2fe26e7daa5e70dfddfdfeab399840af8f584c1a7adb9a4c7bd32a57`.
+
+**Two reader corrections after the data (disclosed).** The first readout
+was REFUSED (`readout-stage-a-refused-reader-bug.json`
+`d7bf9c80b86795fc3487bb74ccfa8bb8b2615fd07707ab9289ae97171b6fe9cc`, kept).
+The evidence did not change. The corrected readers no longer match the
+frozen hashes:
+
+| File | Frozen | Corrected |
+|---|---|---|
+| `adr626_read.py` | `ab349100…` | `c5cf74d1…` |
+| `adr626_campaign.py` | `8630a7a2…` | `ecf4d7d1…` |
+| `adr626_read_test.py` | `227c8082…` | `a3e3fb4c…` |
+| `adr626_campaign_test.py` | `fb6139e7…` | `e0d397a2…` |
+
+1. **Ended-early workers.** The host primitive records `recorded group
+   absent` after its own SIGTERM as well. So a worker counts as ended early
+   only when the absence is seen before any signal. The fake host's stop
+   output now follows the real sequence.
+2. **Retried tasks.** A completed run may contain retried tasks. Each task's
+   attempts must run from 0 without gaps, with telemetry for the final
+   attempt, earlier attempts equal to `retry_count`, and manifests only on
+   final attempts. Superseded attempts are reported with their own dispatch
+   outcome.
+
+**The located waits.** Loopback and the hosts show the same shape. All
+figures are single-clock:
+1. **A dial to a dead worker fails at about 300 s.** That holds for both the
+   probe's dispatch dial and a consumer's sealed-pull dial. Each stays in
+   establishment (connect and stream open together) and fails with `query IO
+   error: timed out`:
+
+   | Run | Dispatch dial (µs) | Pull dial (µs) |
+   |---|---|---|
+   | local producer | 300,001,753 | 300,000,814 |
+   | host producer 1 | 300,001,784 | 300,001,410 |
+   | host producer 2 | 300,001,791 | 300,001,551 |
+   | local dispatch target | 300,001,970 | not applicable |
+   | host dispatch target | 300,001,421 | not applicable |
+
+   This is consistent with the configured 300 s QUIC idle policy
+   (`TORON_QUIC_MAX_IDLE_TIMEOUT`, ADR 577, `toron_client::liveness`). The
+   wrapper does not observe quinn's timer, and does not separate connect from
+   `open_bi`. Loopback did not end these dials sooner.
+2. **Producer loss ends the query; it does not recover.** The surviving
+   consumer reports its pull timeout as `Internal { "query IO error: timed
+   out" }`, which is not retryable. `dispatch_loop` returns an error 300.0 to
+   300.1 s after the confirmed kill. No producer is invalidated or replayed.
+3. **A dead dispatch target is picked again.**
+   - The dispatch to the dead worker fails at about 300 s as `TaskFailed {
+     retryable: true }`.
+   - Its retry completes on a live worker in 0.02 to 0.03 s.
+   - Round-robin placement then picks the same dead worker for a later task.
+     A second establishment wait was still pending at the 360 s window.
+
+   Nothing excludes a worker after a timed-out dial.
+
+No stall after establishment was observed in these losses. Stage A observed
+the live-worker dispatch path on its own runs. The wait of ADR 625's optiplex
+task remains uninstrumented and unidentified.
+
+**Healthy surveys.** Quantiles use nearest rank; `n` is given.
+- **Handshakes:** 50 per direction, with 0 failures and 0 unavailable
+  timings. Maximum establishment (ms) per direction:
+
+  | Direction | Max establishment (ms) |
+  |---|---|
+  | bigfoot→optiplex | 214.9 |
+  | bigfoot→strix | 125.8 |
+  | strix→bigfoot | 143.1 |
+  | strix→optiplex | 247.7 |
+  | optiplex→bigfoot | 305.4 |
+  | optiplex→strix | 215.0 |
+
+  Establishment plus the application acknowledgement completed within at
+  most 223, 350 and 1,125 ms from the bigfoot, strix and optiplex origins.
+- **Pulls, 16- and 16 Ki-row tables:**
+  - 20 complete pulls per cross-host direction, with 0 failures and 0
+    retries.
+  - Establishment at most 293.3 ms.
+  - Request written to first response byte at most 114.0 ms.
+  - Largest whole-frame read gap 146.9 ms, with no gap of 1 s or more.
+  - 309 KB frames took 54 to 334 ms per whole frame.
+- **Pulls, 192 Ki-row table:** 18 of 30 queries failed, and 8 completed only
+  after a retry. Every failure and retry is the stage-0 producer refusing
+  with `BudgetExhausted { ShuffleBytes, requested 3,729,032, available about
+  3.36 MB }`.
+  - This establishes budget exhaustion. That the partitions retained across
+    survey queries by long-lived fixture workers fill the budget is a
+    code-supported explanation, not a measured allocation path. These
+    refusals are not attributed to Wi-Fi.
+  - Complete pulls by direction:
+    - bigfoot→strix: 16;
+    - strix→bigfoot: 16;
+    - bigfoot→optiplex: 8;
+    - optiplex→bigfoot: 8;
+    - optiplex→strix and strix→optiplex: none.
+  - About 3.7 MB frames took at most 1,086 ms per whole frame, with a largest
+    in-frame read gap of 187.9 ms.
+- **Coverage limits:**
+  - In each two-worker spec the first-listed worker produced the payload,
+    so large partitions crossed only some directions. The reverse directions
+    carried only `customers` partitions under 1 KB.
+  - The reader's per-direction `available` label counts samples. It does not
+    establish payload-size coverage.
+  - Read gaps include the consumer's own pacing and event-write overhead.
+- **Links:** both campaigns validate, and the Wi-Fi moved during the run.
+  - UDP loss from bigfoot to optiplex, at 100 Mbit/s offered, had a median of
+    26.36% in `a` and 63.16% in `b`.
+  - Ping maxima were 624 to 629 ms in `a`, and 1,689 ms from optiplex to
+    bigfoot in `b`, with 0% ping loss.
+
+**What Stage A decides:**
+- **H = 5 s** is approved as a provisional experiment value for
+  establishment at the scoped worker operations. It is about 16 times the
+  305.4 ms worst observed establishment. It is neither a production default
+  nor a bound on future Wi-Fi.
+- **W is not approved.** There was no post-establishment loss, payload
+  coverage was partial, the read gaps include consumer pacing, and the
+  fixture budget interfered. W stays deferred work, needing its own reviewed
+  controls and survey.
 
 ## Stage B: bounds, recovery, fencing (conditional on Stage A review)
 
