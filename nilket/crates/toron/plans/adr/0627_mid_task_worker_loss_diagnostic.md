@@ -245,6 +245,172 @@ A readout, before any behaviour change is proposed:
   lease's 100 ms deadlines, recovery on the coordinator path, and (only
   then) the dispatch-exclusion shortcut.
 
+### Instrument amendment (reviewed)
+
+Recorded before any frozen evidence.
+
+**Lease observation is indirect, by design.** There is no production
+hook and no cargo feature. The probe's `ObservedTransport` records every
+lease operation as dial events, frame events (`QueryLease`,
+`QueryLeaseAccepted`) and stream ends.
+- **Observed:**
+  - the order of renewal dials, per worker;
+  - each dial's outcome and elapsed time;
+  - whether an ACK was read.
+- **Not observable, and never reconstructed from the dial sequence:**
+  - the renewal timer's actual ticks;
+  - complete census snapshots;
+  - the moment `fail_query_lease` fires.
+- **Classification uses the dispatch tag and the complete stream
+  sequence.**
+  - **Issuance:** `QueryLease` then `StartTask` on the same stream.
+  - **Incomplete issuance:** a dispatch-tagged stream with `QueryLease`
+    but no `StartTask`.
+  - **ACKed lease-only stream (renewal candidate):** an untagged stream
+    that wrote only `QueryLease`, read its ACK, and ended without
+    `StartTask`.
+    - This is strong observational evidence of a periodic renewal.
+    - But a dispatch cancelled after its lease ACK and before
+      `StartTask` produces the same sequence on the coordinator path, and
+      the wrapper cannot prove which caller owned the stream. So it is
+      never called a positively identified renewal.
+  - **Ambiguous lease-only:** no ACK.
+  - **Unresolved:** a lease-only stream that has not ended.
+  - **Unclassified dial:** no frame written.
+  - **The frozen operational coverage metric** for the long healthy
+    case is the per-worker count of ACKed lease-only streams in clean,
+    completed runs. It is not direct proof of the timer or the caller.
+- **An ACK observed is not whole-operation success.**
+  `issue_or_renew_query_lease_on_worker` calls
+  `finish_terminal_exchange` after reading it, within the same 100 ms
+  bound, so operation completion stays unavailable. A dropped stream is
+  evidence of cancellation, not of which timeout fired.
+- **The lease-failure inference has two levels,** ordered on the probe
+  clock.
+  - **Consistent with lease failure:** a structurally recorded
+    `WorkerLost` naming the target (from `TaskFailureKind`, never error
+    text), and a failed post-signal lease operation to the target before
+    the victim stream ended and before the terminal stamp. The
+    operation's caller (renewal or issuance) is not proven, so nothing
+    stronger is claimed.
+  - **Unresolved:** anything else, including `Cancelled` alone, another
+    worker, the wrong order, or no terminal return.
+  - `fail_query_lease`'s own timing is always unavailable.
+- **Dials abandoned before resolving** (an outer timeout) are recorded as
+  `dial_abandoned` with their elapsed time, by a drop guard in the
+  observer.
+- **WARN-and-above tracing events** (for example "query lease renewal
+  connect failed") are copied into the probe log by a test subscriber.
+  The renewal loop's timeouts emit no warning.
+
+**The mid-scan binding.** It is settled from the victim's own log, read
+after cleanup.
+- **Test-only events:** the fixture worker's slow and long scans emit
+  `scan_entered` and `scan_returned`, tagged with the served stream
+  through the `SERVED_STREAM` task-local.
+- **"mid_scan" requires all of:**
+  - exactly one served `StartTask` for the victim attempt;
+  - that stream's `scan_entered`;
+  - no `scan_returned` and no task output frame (`TaskBatch`,
+    `TaskComplete`, `TaskFailed`, `TaskCancelled`) written on it;
+  - on the probe: no task output read on the victim stream before the
+    signal;
+  - a confirmed signal: gone for a kill; stopped, every owned member in
+    state T, for a stop.
+- `TaskStarted` is an acknowledgement, recorded but not disqualifying.
+- Anything else is a named coverage-unavailable outcome:
+  - an unbound entry (task-local lost);
+  - a scan that returned (a different work boundary);
+  - a victim that landed elsewhere (never retargeted).
+- **The trigger is fixed:** 3 s after the victim's `StartTask` payload
+  is written, on the probe's clock. It is not "3 s into the scan".
+- **The victim stage is declared, then verified:** stage 0 for
+  `slow_scan` and `slow_join` on both paths. That stage was observed in
+  the same-path loopback references, and is checked after each run
+  against the victim's own `scan_entered`. The subscription is installed
+  before dispatch and is unbounded (no lag); a closed log ends the watch
+  without a victim.
+
+**Every conclusion is recomputed from raw events.**
+- Each event's fields are validated by name, and an unknown event
+  refuses.
+- On the probe:
+  - the victim stream's dial (target and endpoint);
+  - exactly one `StartTask` write for the victim attempt (timed exactly
+    as saved, before the signal, one query);
+  - output before the signal, recomputed from raw frames;
+  - exactly one `signal_sent` and one `signal_returned` for the target
+    and fault;
+  - the confirmation, recomputed from the primitive's raw result: the
+    declared command, exit 0 and the JSON marker on hosts; the `/proc`
+    state locally.
+- On the worker:
+  - stream acceptance, then exactly one `StartTask` read, then exactly
+    one slow-table `scan_entered`;
+  - no return and no output.
+- A saved summary that disagrees with the raw events refuses.
+- Every instant is captured once and both saved and emitted with that
+  value.
+- The raw `signal_returned` result must equal the saved signal result,
+  and both signal times must equal their raw stamps. Exit statuses are
+  exact integers (`False` is not exit 0).
+- Terminal timing (`query_returned` or `observation_expired`) is stamped
+  inside the query future, never after the watcher completes. Its `ok`
+  must match the saved outcome: true for completed, false for an error;
+  `observation_expired` for no terminal return.
+- References receive the same raw-terminal validation before they
+  become parity anchors. A missing or contradictory terminal refuses.
+- The StartTask-to-signal interval is reported against the frozen 3 s;
+  any excess is reported, not hidden.
+- Errors carry a typed `error_task_failure` (taxonomy label, plus the
+  lost worker's id for `WorkerLost`).
+- The scheduler's completed runs pass ADR 626 Stage C's full
+  run-structure and recovery-identity checks.
+- A reference that does not complete cleanly is a named incomplete
+  reference, and no parity is drawn from it.
+
+**Logs.**
+- Each event is one complete line written with `write_all`; a failed
+  write prints `wait event log write failed`, which the readers treat as
+  incomplete instrumentation.
+- An event that was not persisted is never delivered to an observer;
+  the probe does not signal after an instrument failure.
+- Only a final, incomplete line (a process killed mid-write) is dropped
+  and flagged as a truncated tail. Any other malformed line refuses.
+- A truncated tail withholds every absence-based conclusion that depends
+  on that log, such as "mid_scan" (from either the victim's log or the
+  probe's) and the ending and lease conclusions (from the probe's). That
+  is reported as coverage unavailable, naming which log prevented it.
+
+**The long healthy case is `long_join_last`** (`customers JOIN long`,
+with the `long` scan frozen at 30 s).
+- **Observed on loopback:** both producers are dispatched together, so
+  two workers are in the census, and renewed, through the long scan.
+  The third joins with the consumers afterwards.
+- `long` first (`long_join`) dispatched serially and kept one worker in
+  the census; a three-way join gave no more.
+- **Frozen required coverage:** at least 5 renewals observed to each of
+  at least 2 workers. Shorter healthy cases with no renewal are reported
+  as "lease coverage unavailable".
+
+**Paths.**
+- The coordinator path is `DistributedQueryCoordinator::execute_query`
+  (admission, active query, lease renewal), with the result fully
+  consumed.
+- Its dispatcher has no recovery experiment and none can be attached, so
+  it is OFF there and recorded as such. The scheduler path keeps ADR
+  626's H 5000 / C 12000.
+- Same-path references:
+  - **scheduler:** `slow_scan`, `slow_join`;
+  - **coordinator:** `slow_scan`, `slow_join`, `hash_join`,
+    `grouped_aggregate`, `except_all`, `row_number`, `long_join_last`.
+
+**The frozen schedule** has 43 attempts, plus links before and after:
+- 9 references;
+- 8 local combinations (both faults, both roles, both paths);
+- 18 healthy coordinator-path runs (the six cases x3);
+- 8 host losses (the asymmetric matrix).
+
 ## Guardrails
 
 - No behaviour change: no bound, timeout, TLS, lease, cancellation or
