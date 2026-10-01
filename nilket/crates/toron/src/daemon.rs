@@ -251,6 +251,14 @@ impl ToronDaemon {
 				message: error.to_string(),
 			})?,
 		);
+		// ADR 624: one transport, built once from the daemon's TLS policy, dials both the
+		// coordinator's task dispatch and the worker's sealed shuffle pulls.
+		let transport = Arc::new(match &tls_policy {
+			Some(policy) => {
+				QuicTransport::authenticated(policy.client_config(), policy.cluster_domain())?
+			}
+			None => QuicTransport::new()?,
+		});
 		let worker = ToronWorker::with_partition_store_and_endpoint(
 			worker_storage,
 			Arc::clone(&memory),
@@ -258,7 +266,8 @@ impl ToronDaemon {
 			config.node.worker_id,
 			advertised_endpoint.clone(),
 		)
-		.with_downstream_cancellation_metrics(Arc::clone(&downstream_cancellation_metrics));
+		.with_downstream_cancellation_metrics(Arc::clone(&downstream_cancellation_metrics))
+		.with_peer_transport(transport.clone());
 
 		let registry_workers = coordinator_workers(
 			&config,
@@ -267,12 +276,6 @@ impl ToronDaemon {
 			config.worker.memory_budget_bytes,
 		);
 		let worker_registry = Arc::new(StaticWorkerRegistry::new(registry_workers));
-		let transport = Arc::new(match &tls_policy {
-			Some(policy) => {
-				QuicTransport::authenticated(policy.client_config(), policy.cluster_domain())?
-			}
-			None => QuicTransport::new()?,
-		});
 		let coordinator_catalog: Arc<dyn crate::catalog::Catalog> = catalog.clone();
 		let coordinator_writer: Arc<dyn crate::storage::StorageWrite> = writer.clone();
 		let coordinator_deleter: Arc<dyn crate::storage::StorageDeleteRows> = deleter.clone();

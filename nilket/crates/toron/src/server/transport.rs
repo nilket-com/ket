@@ -1,4 +1,5 @@
-use crate::distributed::worker_registry::WorkerEntry;
+use crate::distributed::identity::WorkerId;
+use crate::distributed::worker_registry::{WorkerEndpoint, WorkerEntry};
 use crate::error::QueryError;
 use crate::network::tls::canonical_daemon_dns_name;
 use crate::quic::QuicEndpoint;
@@ -19,12 +20,24 @@ pub trait ToronTransport: Send + Sync {
 	/// Dials a peer and opens a bidirectional stream.
 	async fn connect(&self, address: &str) -> Result<Box<dyn ToronStream>, QueryError>;
 
+	/// Dials a peer worker by its stable identity and endpoint. A transport that authenticates
+	/// peers derives the expected server identity from `worker_id`; one that does not just dials
+	/// the endpoint.
+	async fn connect_peer(
+		&self,
+		worker_id: &WorkerId,
+		endpoint: &WorkerEndpoint,
+	) -> Result<Box<dyn ToronStream>, QueryError> {
+		let _ = worker_id;
+		self.connect(endpoint.as_str()).await
+	}
+
 	/// Dials a worker with access to its stable identity.
 	async fn connect_worker(
 		&self,
 		worker: &WorkerEntry,
 	) -> Result<Box<dyn ToronStream>, QueryError> {
-		self.connect(worker.endpoint.as_str()).await
+		self.connect_peer(&worker.worker_id, &worker.endpoint).await
 	}
 }
 
@@ -35,6 +48,14 @@ where
 {
 	async fn connect(&self, address: &str) -> Result<Box<dyn ToronStream>, QueryError> {
 		self.as_ref().connect(address).await
+	}
+
+	async fn connect_peer(
+		&self,
+		worker_id: &WorkerId,
+		endpoint: &WorkerEndpoint,
+	) -> Result<Box<dyn ToronStream>, QueryError> {
+		self.as_ref().connect_peer(worker_id, endpoint).await
 	}
 
 	async fn connect_worker(
@@ -109,7 +130,15 @@ impl ToronTransport for QuicTransport {
 		&self,
 		worker: &WorkerEntry,
 	) -> Result<Box<dyn ToronStream>, QueryError> {
-		let address = worker.endpoint.as_str();
+		self.connect_peer(&worker.worker_id, &worker.endpoint).await
+	}
+
+	async fn connect_peer(
+		&self,
+		worker_id: &WorkerId,
+		endpoint: &WorkerEndpoint,
+	) -> Result<Box<dyn ToronStream>, QueryError> {
+		let address = endpoint.as_str();
 		let remote: SocketAddr = address.parse().map_err(|error| QueryError::Internal {
 			message: format!("invalid QUIC endpoint {address:?}: {error}"),
 		})?;
@@ -119,7 +148,7 @@ impl ToronTransport for QuicTransport {
 			));
 		}
 		if let Some(cluster_domain) = &self.cluster_domain {
-			let server_name = canonical_daemon_dns_name(&worker.worker_id, cluster_domain);
+			let server_name = canonical_daemon_dns_name(worker_id, cluster_domain);
 			let Some(endpoint) = &self.authenticated_endpoint else {
 				return Err(QueryError::Internal {
 					message: "authenticated QUIC endpoint is not configured".to_string(),

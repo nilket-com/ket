@@ -74,7 +74,10 @@ pub(crate) fn adr044_daemon_selects_authenticated_quic_only_for_non_loopback_tls
 	assert!(daemon.contains("QuicEndpoint::bind_loopback"));
 	assert!(daemon.contains("QuicTransport::authenticated"));
 	assert!(transport.contains("connect_stream_with_server_name(remote, &server_name)"));
-	assert!(transport.contains("canonical_daemon_dns_name(&worker.worker_id, cluster_domain)"));
+	// ADR 624: the SAN is derived from the dialled peer's own identity in `connect_peer`, which
+	// `connect_worker` delegates to with the registry entry's worker id.
+	assert!(transport.contains("canonical_daemon_dns_name(worker_id, cluster_domain)"));
+	assert!(transport.contains("self.connect_peer(&worker.worker_id, &worker.endpoint)"));
 }
 
 #[test]
@@ -1508,9 +1511,13 @@ pub(crate) fn adr044_remote_static_worker_requires_tls_and_san_binding() {
 	assert!(config.contains("NON_LOOPBACK_STATIC_WORKER_DIAGNOSTIC"));
 	assert!(config.contains("!endpoint.ip().is_loopback() && tls.is_none()"));
 	assert!(transport.contains("async fn connect_worker("));
-	assert!(transport.contains("canonical_daemon_dns_name(&worker.worker_id, cluster_domain)"));
+	assert!(transport.contains("async fn connect_peer("));
+	assert!(transport.contains("canonical_daemon_dns_name(worker_id, cluster_domain)"));
+	assert!(transport.contains("self.connect_peer(&worker.worker_id, &worker.endpoint)"));
 	assert!(transport.contains("connect_stream_with_server_name(remote, &server_name)"));
 	assert!(server.contains("transport.connect_worker(worker).await"));
+	// ADR 624: sealed shuffle pulls dial the producer by its identity through the same transport.
+	assert!(server.contains(".connect_peer(&partition.worker_id, &partition.endpoint)"));
 }
 
 #[test]

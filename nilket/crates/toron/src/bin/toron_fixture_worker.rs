@@ -11,38 +11,138 @@ use toron::distributed::partition_store::InMemoryPartitionStore;
 use toron::distributed::worker_registry::WorkerEndpoint;
 use toron::error::StorageError;
 use toron::ir::TableId;
+use toron::quic::QuicEndpoint;
 use toron::server::ToronWorker;
 use toron::server::memory::MemoryManager;
+use toron::server::transport::{QuicTransport, TcpTransport, ToronTransport};
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixtureTransport {
+	Tcp,
+	/// Serves tasks and partition pulls on a loopback QUIC endpoint only — no TCP listener — and
+	/// pulls its own shuffle inputs over QUIC.
+	Quic,
+}
+
+/// Test-only evidence: appends one `<this worker> <producer worker> <producer endpoint>` line per
+/// sealed-pull dial, then dials through the real transport unchanged.
+struct DialRecordingTransport {
+	inner: Arc<dyn ToronTransport>,
+	this_worker: WorkerId,
+	path: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl ToronTransport for DialRecordingTransport {
+	async fn connect(
+		&self,
+		address: &str,
+	) -> Result<Box<dyn toron::server::transport::ToronStream>, toron::error::QueryError> {
+		self.inner.connect(address).await
+	}
+
+	async fn connect_peer(
+		&self,
+		worker_id: &WorkerId,
+		endpoint: &WorkerEndpoint,
+	) -> Result<Box<dyn toron::server::transport::ToronStream>, toron::error::QueryError> {
+		use std::io::Write as _;
+		let line = format!(
+			"{} {} {}\n",
+			self.this_worker.get().as_u128(),
+			worker_id.get().as_u128(),
+			endpoint.as_str()
+		);
+		std::fs::OpenOptions::new()
+			.create(true)
+			.append(true)
+			.open(&self.path)
+			.and_then(|mut file| file.write_all(line.as_bytes()))
+			.map_err(|error| toron::error::QueryError::Internal {
+				message: format!("dial record failed: {error}"),
+			})?;
+		self.inner.connect_peer(worker_id, endpoint).await
+	}
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-	let worker_id = worker_id_from_args()?;
-	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-	let endpoint = WorkerEndpoint::new(listener.local_addr()?.to_string());
-	let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
-		Arc::new(FixtureStorageScan::new()?),
-		Arc::new(MemoryManager::new(32, 1024 * 1024)),
-		Arc::new(InMemoryPartitionStore::new()),
-		worker_id,
-		endpoint.clone(),
-	));
+	let (worker_id, transport, record_peer_dials) = args()?;
+	let peer = |inner: Arc<dyn ToronTransport>| -> Arc<dyn ToronTransport> {
+		match &record_peer_dials {
+			Some(path) => Arc::new(DialRecordingTransport {
+				inner,
+				this_worker: worker_id,
+				path: path.clone(),
+			}),
+			None => inner,
+		}
+	};
+	let worker = |endpoint: WorkerEndpoint, peer: Arc<dyn ToronTransport>| {
+		Ok::<_, Box<dyn Error>>(Arc::new(
+			ToronWorker::with_partition_store_and_endpoint(
+				Arc::new(FixtureStorageScan::new()?),
+				Arc::new(MemoryManager::new(32, 1024 * 1024)),
+				Arc::new(InMemoryPartitionStore::new()),
+				worker_id,
+				endpoint,
+			)
+			.with_peer_transport(peer),
+		))
+	};
+	match transport {
+		FixtureTransport::Tcp => {
+			let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+			let endpoint = WorkerEndpoint::new(listener.local_addr()?.to_string());
+			let worker = worker(endpoint.clone(), peer(Arc::new(TcpTransport::new())))?;
+			announce(&endpoint).await?;
+			loop {
+				let (stream, _) = listener.accept().await?;
+				let worker = worker.clone();
+				tokio::spawn(async move {
+					if let Err(error) = worker.handle_connection(stream).await {
+						eprintln!("fixture worker connection failed: {error}");
+					}
+				});
+			}
+		}
+		FixtureTransport::Quic => {
+			let quic = QuicEndpoint::bind_loopback("127.0.0.1:0".parse()?)?;
+			let endpoint = WorkerEndpoint::new(quic.local_addr()?.to_string());
+			let worker = worker(endpoint.clone(), peer(Arc::new(QuicTransport::new()?)))?;
+			announce(&endpoint).await?;
+			loop {
+				let connection = match quic.accept_connection().await {
+					Ok(connection) => connection,
+					Err(error) => {
+						eprintln!("fixture worker QUIC handshake failed: {error}");
+						continue;
+					}
+				};
+				let worker = worker.clone();
+				tokio::spawn(async move {
+					match QuicEndpoint::accept_stream_on(&connection).await {
+						Ok(stream) => {
+							if let Err(error) = worker.handle_connection(stream).await {
+								eprintln!("fixture worker connection failed: {error}");
+							}
+						}
+						Err(error) => eprintln!("fixture worker QUIC stream failed: {error}"),
+					}
+				});
+			}
+		}
+	}
+}
 
+async fn announce(endpoint: &WorkerEndpoint) -> Result<(), Box<dyn Error>> {
 	let mut stdout = tokio::io::stdout();
 	stdout
 		.write_all(format!("READY {}\n", endpoint.as_str()).as_bytes())
 		.await?;
 	stdout.flush().await?;
-
-	loop {
-		let (stream, _) = listener.accept().await?;
-		let worker = worker.clone();
-		tokio::spawn(async move {
-			if let Err(error) = worker.handle_connection(stream).await {
-				eprintln!("fixture worker connection failed: {error}");
-			}
-		});
-	}
+	Ok(())
 }
 
 struct FixtureStorageScan {
@@ -201,12 +301,29 @@ impl StorageScan for FixtureStorageScan {
 	}
 }
 
-fn worker_id_from_args() -> Result<WorkerId, Box<dyn Error>> {
+type FixtureArgs = (WorkerId, FixtureTransport, Option<std::path::PathBuf>);
+
+fn args() -> Result<FixtureArgs, Box<dyn Error>> {
 	let mut args = std::env::args().skip(1);
 	let mut worker_u128 = None;
+	let mut transport = FixtureTransport::Tcp;
+	let mut record_peer_dials = None;
 	while let Some(arg) = args.next() {
 		if arg == "--worker-u128" {
 			worker_u128 = args.next().map(|value| value.parse::<u128>()).transpose()?;
+		} else if arg == "--record-peer-dials" {
+			record_peer_dials = args.next().map(std::path::PathBuf::from);
+		} else if arg == "--transport" {
+			transport = match args.next().as_deref() {
+				Some("tcp") => FixtureTransport::Tcp,
+				Some("quic") => FixtureTransport::Quic,
+				other => {
+					return Err(Box::new(std::io::Error::new(
+						std::io::ErrorKind::InvalidInput,
+						format!("--transport must be tcp or quic, got {other:?}"),
+					)));
+				}
+			};
 		}
 	}
 	let worker_u128 = worker_u128.ok_or_else(|| {
@@ -215,5 +332,9 @@ fn worker_id_from_args() -> Result<WorkerId, Box<dyn Error>> {
 			"missing required --worker-u128 argument",
 		)
 	})?;
-	Ok(WorkerId::from_u128(worker_u128))
+	Ok((
+		WorkerId::from_u128(worker_u128),
+		transport,
+		record_peer_dials,
+	))
 }

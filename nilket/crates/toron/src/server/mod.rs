@@ -74,6 +74,9 @@ pub struct ToronWorker {
 	/// key value that crosses a shuffle edge, which a production query must not pay for.
 	shuffle_routing_observations: bool,
 	shuffle_routing_log: Arc<std::sync::Mutex<Vec<ShuffleRoutingObservation>>>,
+	/// Dials producer workers for sealed shuffle pulls, by the producer's identity and endpoint.
+	/// TCP unless the owner injects its own transport (a daemon shares its QUIC transport).
+	peer_transport: Arc<dyn ToronTransport>,
 }
 
 /// Order-independent digest of the evaluated join-key values in a batch, defined only for
@@ -212,7 +215,14 @@ impl ToronWorker {
 			audit: ToronAuditEmitter::disabled(),
 			shuffle_routing_observations: false,
 			shuffle_routing_log: Arc::new(std::sync::Mutex::new(Vec::new())),
+			peer_transport: Arc::new(self::transport::TcpTransport::new()),
 		}
+	}
+
+	/// Pull sealed shuffle partitions through `transport` instead of plain TCP.
+	pub fn with_peer_transport(mut self, transport: Arc<dyn ToronTransport>) -> Self {
+		self.peer_transport = transport;
+		self
 	}
 
 	/// Enable observe-only shuffle routing receipts. Diagnostic only: it changes no
@@ -496,7 +506,10 @@ impl ToronWorker {
 						.to_string(),
 				});
 			};
-			let stream = tokio::net::TcpStream::connect(partition.endpoint.as_str()).await?;
+			let stream = self
+				.peer_transport
+				.connect_peer(&partition.worker_id, &partition.endpoint)
+				.await?;
 			let payload = coordinator
 				.pull_partition_from_worker(stream, partition.address, partition.address.attempt_id)
 				.await?;
@@ -1731,6 +1744,84 @@ fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// Records every peer dial and refuses it; an identity-free `connect` is a test failure.
+	struct RecordingPeerTransport {
+		dials: std::sync::Mutex<Vec<(WorkerId, WorkerEndpoint)>>,
+	}
+
+	#[async_trait::async_trait]
+	impl ToronTransport for RecordingPeerTransport {
+		async fn connect(
+			&self,
+			address: &str,
+		) -> Result<Box<dyn self::transport::ToronStream>, QueryError> {
+			panic!("sealed pull dialed {address} without the producer's identity");
+		}
+
+		async fn connect_peer(
+			&self,
+			worker_id: &WorkerId,
+			endpoint: &WorkerEndpoint,
+		) -> Result<Box<dyn self::transport::ToronStream>, QueryError> {
+			self.dials
+				.lock()
+				.expect("dials")
+				.push((*worker_id, endpoint.clone()));
+			Err(QueryError::Internal {
+				message: "injected peer dial failure".to_string(),
+			})
+		}
+	}
+
+	#[tokio::test]
+	async fn sealed_pull_dials_the_producer_identity_through_the_peer_transport() {
+		let transport = Arc::new(RecordingPeerTransport {
+			dials: std::sync::Mutex::new(Vec::new()),
+		});
+		let worker = ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(crate::storage::InMemoryStorageScan {
+				table_data: RecordBatch::new_empty(Arc::new(arrow::datatypes::Schema::empty())),
+			}),
+			Arc::new(MemoryManager::new(2, 1024 * 1024)),
+			Arc::new(InMemoryPartitionStore::new()),
+			WorkerId::from_u128(7),
+			WorkerEndpoint::new("127.0.0.1:1"),
+		)
+		.with_peer_transport(transport.clone());
+		let producer = ProducerPartitionRef {
+			address: PartitionAddress {
+				query_id: QueryId::from_u128(1),
+				exchange_id: ExchangeId::new(0),
+				producer_stage_id: StageId::new(0),
+				producer_task_id: TaskId::new(0),
+				attempt_id: AttemptId::first(),
+				partition_id: PartitionId::new(0),
+			},
+			worker_id: WorkerId::from_u128(42),
+			endpoint: WorkerEndpoint::new("192.0.2.42:7000"),
+			size_bytes: ByteCount::new(8),
+			digest: ArrowIpcDigest::new([0; 32]),
+		};
+
+		let error = worker
+			.pull_shuffle_inputs(&[ShufflePartitionRef::Sealed(producer)])
+			.await
+			.expect_err("the injected dial failure must propagate");
+
+		assert!(
+			error.to_string().contains("injected peer dial failure"),
+			"the transport's error is returned, not replaced: {error}"
+		);
+		assert_eq!(
+			*transport.dials.lock().expect("dials"),
+			vec![(
+				WorkerId::from_u128(42),
+				WorkerEndpoint::new("192.0.2.42:7000")
+			)],
+			"one dial, to the producer's worker id and endpoint, and no retry"
+		);
+	}
 
 	/// ADR 554 Branch A: naming accumulation must shrink the in-task residual by
 	/// exactly the same amount.

@@ -28,7 +28,7 @@ use toron::ir::{
 	JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, SessionId, SortExpr,
 	TableId,
 };
-use toron::server::transport::TcpTransport;
+use toron::server::transport::{QuicTransport, TcpTransport, ToronTransport};
 use toron::server::{NetworkTaskDispatcher, memory::MemoryManager};
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{HlcBound, InMemoryStorageScan, TenantId};
@@ -37,27 +37,77 @@ use wendelon::schema::{
 	TableSchemaDescriptor,
 };
 
+/// Which transport the fixture workers serve and the coordinator dials. TCP unless a test scopes
+/// QUIC: QUIC-only workers have no TCP listener, so a sealed shuffle pull completes only if the
+/// worker pulls through its transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessTransport {
+	Tcp,
+	Quic,
+}
+
+tokio::task_local! {
+	static PROCESS_TRANSPORT: ProcessTransport;
+}
+
+fn current_process_transport() -> ProcessTransport {
+	PROCESS_TRANSPORT
+		.try_with(|transport| *transport)
+		.unwrap_or(ProcessTransport::Tcp)
+}
+
+fn process_transport() -> Arc<dyn ToronTransport> {
+	match current_process_transport() {
+		ProcessTransport::Tcp => Arc::new(TcpTransport::new()),
+		ProcessTransport::Quic => Arc::new(QuicTransport::new().expect("QUIC transport")),
+	}
+}
+
+async fn with_quic<T>(run: impl std::future::Future<Output = T>) -> T {
+	PROCESS_TRANSPORT.scope(ProcessTransport::Quic, run).await
+}
+
 struct FixtureWorkerProcess {
 	child: Child,
 	endpoint: WorkerEndpoint,
 	worker_id: WorkerId,
 }
 
+/// A worker that has not announced readiness within this bound is a failed spawn. The child is
+/// `kill_on_drop`, so a panic before the guard exists still reaps it.
+const FIXTURE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl FixtureWorkerProcess {
 	async fn spawn(worker_id: WorkerId) -> Self {
-		let mut child = Command::new(env!("CARGO_BIN_EXE_toron_fixture_worker"))
+		Self::spawn_with(worker_id, None).await
+	}
+
+	/// `record_peer_dials`: the worker appends one line per sealed-pull dial to this file.
+	async fn spawn_with(worker_id: WorkerId, record_peer_dials: Option<&std::path::Path>) -> Self {
+		let mut command = Command::new(env!("CARGO_BIN_EXE_toron_fixture_worker"));
+		command
 			.arg("--worker-u128")
 			.arg(worker_id.get().as_u128().to_string())
+			.arg("--transport")
+			.arg(match current_process_transport() {
+				ProcessTransport::Tcp => "tcp",
+				ProcessTransport::Quic => "quic",
+			});
+		if let Some(path) = record_peer_dials {
+			command.arg("--record-peer-dials").arg(path);
+		}
+		let mut child = command
 			.stdout(Stdio::piped())
 			.stderr(Stdio::inherit())
+			.kill_on_drop(true)
 			.spawn()
 			.expect("spawn fixture worker");
 		let stdout = child.stdout.take().expect("fixture worker stdout");
 		let mut line = String::new();
 		let mut reader = BufReader::new(stdout);
-		reader
-			.read_line(&mut line)
+		tokio::time::timeout(FIXTURE_READY_TIMEOUT, reader.read_line(&mut line))
 			.await
+			.expect("fixture worker readiness within its bound")
 			.expect("read fixture worker readiness");
 		let endpoint = line
 			.trim()
@@ -393,6 +443,351 @@ async fn hash_join_producer_process_kill_replays_attempt_and_matches_baseline_di
 			.copied()
 			.collect::<HashSet<_>>()
 			.len(),
+		2
+	);
+}
+
+// ---- Sealed shuffle pulls over QUIC-only workers ----
+//
+// A QUIC-only fixture worker serves tasks and partition pulls on a loopback QUIC endpoint and has
+// no TCP listener, so a sealed shuffle completes only if the consumer worker pulls through its
+// transport. Each case runs the identical query, data and worker count over TCP for the parity.
+
+const QUIC_CASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+async fn bounded<T>(run: impl std::future::Future<Output = T>) -> T {
+	tokio::time::timeout(QUIC_CASE_TIMEOUT, run)
+		.await
+		.expect("process case exceeded its bound")
+}
+
+/// Evidence of one scheduled run's sealed pulls: the workers' recorded dials, the accepted sealed
+/// manifests and the per-task telemetry.
+struct SealedPullEvidence {
+	/// `(pulling worker, producer worker, producer endpoint)` per sealed-pull dial.
+	dials: Vec<(u128, u128, String)>,
+	/// `(producer worker, producer endpoint)` of every accepted sealed manifest.
+	sealed_producers: Vec<(u128, String)>,
+	/// Workers whose tasks pulled a nonzero number of sealed bytes.
+	pulling_workers: HashSet<u128>,
+}
+
+/// The number of proven cross-worker sealed pulls: a dial by worker C to a producer P != C, whose
+/// worker id and endpoint match an accepted sealed manifest, where C's tasks pulled sealed bytes.
+fn cross_worker_sealed_pulls(evidence: &SealedPullEvidence) -> Result<usize, String> {
+	let proven = evidence
+		.dials
+		.iter()
+		.filter(|(puller, producer, endpoint)| {
+			puller != producer
+				&& evidence.pulling_workers.contains(puller)
+				&& evidence
+					.sealed_producers
+					.iter()
+					.any(|(worker, sealed_endpoint)| {
+						worker == producer && sealed_endpoint == endpoint
+					})
+		})
+		.count();
+	if proven == 0 {
+		return Err(format!(
+			"no cross-worker sealed pull among {} dial(s)",
+			evidence.dials.len()
+		));
+	}
+	Ok(proven)
+}
+
+#[test]
+fn cross_worker_sealed_pull_proof_refuses_self_pulls_and_unsealed_producers() {
+	let evidence = |dials: Vec<(u128, u128, &str)>, pulling: &[u128]| SealedPullEvidence {
+		dials: dials
+			.into_iter()
+			.map(|(c, p, e)| (c, p, e.to_string()))
+			.collect(),
+		sealed_producers: vec![(1, "a".to_string()), (2, "b".to_string())],
+		pulling_workers: pulling.iter().copied().collect(),
+	};
+	assert_eq!(
+		cross_worker_sealed_pulls(&evidence(vec![(1, 2, "b")], &[1])),
+		Ok(1)
+	);
+	// Both workers pull, but each only from itself: no edge.
+	assert!(cross_worker_sealed_pulls(&evidence(vec![(1, 1, "a"), (2, 2, "b")], &[1, 2])).is_err());
+	// A dial to an endpoint no accepted manifest sealed at: no edge.
+	assert!(cross_worker_sealed_pulls(&evidence(vec![(1, 2, "elsewhere")], &[1])).is_err());
+	// A dial from a worker whose tasks pulled nothing: no edge.
+	assert!(cross_worker_sealed_pulls(&evidence(vec![(1, 2, "b")], &[2])).is_err());
+}
+
+/// The hash join through the scheduler, with every worker recording its sealed-pull dials.
+async fn run_hash_join_scheduled(
+	worker_id_base: u128,
+	worker_count: u128,
+) -> (JoinProcessRun, SealedPullEvidence) {
+	let record_dir = std::env::temp_dir().join(format!(
+		"toron-sealed-dials-{}-{}",
+		std::process::id(),
+		worker_id_base
+	));
+	let _ = std::fs::remove_dir_all(&record_dir);
+	std::fs::create_dir_all(&record_dir).expect("dial record directory");
+	let mut workers = Vec::new();
+	for offset in 0..worker_count {
+		let worker_id = worker_id_base + offset;
+		workers.push(
+			FixtureWorkerProcess::spawn_with(
+				WorkerId::from_u128(worker_id),
+				Some(&record_dir.join(format!("{worker_id}.dials"))),
+			)
+			.await,
+		);
+	}
+	let registry = Arc::new(RoundRobinRegistry::new(workers.iter().map(worker_entry), 0));
+	let bound = bind(
+		&hash_join_plan(),
+		join_process_catalog().as_ref(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind hash join");
+	let stages = fragment_plan(
+		bound,
+		FragmentPlanConfig::new_for_test(
+			QueryId::new(),
+			TaskBudget::from_query_budget(QueryBudget::test_default()),
+		),
+	)
+	.expect("fragment hash join");
+	let mut scheduler = DistributedScheduler::new(registry.clone());
+	let mut dispatcher = NetworkTaskDispatcher::new(
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		process_transport(),
+	);
+	let run = scheduler
+		.dispatch_loop(&stages, &mut dispatcher)
+		.await
+		.expect("hash join");
+	let result = join_process_run(run.final_results, registry.selected_workers());
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+	let mut dials = Vec::new();
+	for entry in std::fs::read_dir(&record_dir).expect("dial records") {
+		let text =
+			std::fs::read_to_string(entry.expect("dial record").path()).expect("dial record");
+		for line in text.lines() {
+			let fields = line.split(' ').collect::<Vec<_>>();
+			assert_eq!(fields.len(), 3, "dial record line {line:?}");
+			dials.push((
+				fields[0].parse().expect("pulling worker"),
+				fields[1].parse().expect("producer worker"),
+				fields[2].to_string(),
+			));
+		}
+	}
+	let _ = std::fs::remove_dir_all(&record_dir);
+	let evidence = SealedPullEvidence {
+		dials,
+		sealed_producers: run
+			.accepted_manifests
+			.values()
+			.map(|manifest| {
+				(
+					manifest.producer_worker_id.get().as_u128(),
+					manifest.producer_endpoint.as_str().to_string(),
+				)
+			})
+			.collect(),
+		pulling_workers: run
+			.telemetry
+			.task_telemetry
+			.iter()
+			.filter(|record| record.telemetry.counters.pulled_shuffle_bytes > 0)
+			.map(|record| record.worker_id.get().as_u128())
+			.collect(),
+	};
+	(result, evidence)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_only_fixture_workers_have_no_tcp_listener() {
+	bounded(async {
+		let mut quic = with_quic(FixtureWorkerProcess::spawn(WorkerId::from_u128(5_000))).await;
+		assert!(
+			tokio::net::TcpStream::connect(quic.endpoint.as_str())
+				.await
+				.is_err(),
+			"a QUIC-only worker must not accept TCP at its announced endpoint"
+		);
+		quic.shutdown().await;
+		let mut tcp = FixtureWorkerProcess::spawn(WorkerId::from_u128(5_001)).await;
+		assert!(
+			tokio::net::TcpStream::connect(tcp.endpoint.as_str())
+				.await
+				.is_ok(),
+			"control: a TCP worker accepts TCP at its announced endpoint"
+		);
+		tcp.shutdown().await;
+	})
+	.await;
+}
+
+/// The failure path before a worker guard exists: a worker that cannot start exits without
+/// announcing readiness, and the spawned child is reaped (`kill_on_drop`) rather than left running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixture_worker_that_cannot_start_exits_without_readiness() {
+	bounded(async {
+		let mut child = Command::new(env!("CARGO_BIN_EXE_toron_fixture_worker"))
+			.arg("--worker-u128")
+			.arg("5002")
+			.arg("--transport")
+			.arg("carrier-pigeon")
+			.stdout(Stdio::piped())
+			.stderr(Stdio::null())
+			.kill_on_drop(true)
+			.spawn()
+			.expect("spawn fixture worker");
+		let mut stdout = String::new();
+		tokio::io::AsyncReadExt::read_to_string(
+			child.stdout.as_mut().expect("fixture worker stdout"),
+			&mut stdout,
+		)
+		.await
+		.expect("read fixture worker stdout");
+		let status = child.wait().await.expect("fixture worker exit");
+		assert!(!status.success(), "an unstartable worker must fail");
+		assert!(
+			!stdout.contains("READY"),
+			"an unstartable worker must not announce readiness"
+		);
+	})
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sealed_shuffle_pulls_cross_quic_only_workers_with_tcp_digest_parity() {
+	for worker_count in [2u128, 3] {
+		let (tcp, tcp_evidence) = bounded(run_hash_join_scheduled(
+			5_100 + worker_count * 10,
+			worker_count,
+		))
+		.await;
+		let (quic, quic_evidence) = bounded(with_quic(run_hash_join_scheduled(
+			5_200 + worker_count * 10,
+			worker_count,
+		)))
+		.await;
+		let tcp_edges =
+			cross_worker_sealed_pulls(&tcp_evidence).expect("TCP cross-worker sealed pull");
+		let quic_edges =
+			cross_worker_sealed_pulls(&quic_evidence).expect("QUIC cross-worker sealed pull");
+		println!(
+			"{worker_count} workers: cross-worker sealed pulls tcp={tcp_edges} quic={quic_edges}"
+		);
+		assert_eq!(tcp.row_count, 3, "{worker_count} workers");
+		assert_eq!(quic.row_count, 3, "{worker_count} workers");
+		assert_eq!(
+			quic.digest, tcp.digest,
+			"{worker_count} workers: QUIC result equals TCP"
+		);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordered_grouped_aggregate_over_quic_only_workers_matches_tcp() {
+	for worker_count in [2usize, 3] {
+		let base = 5_300 + (worker_count as u128) * 10;
+		let tcp = bounded(run_ordered_grouped_aggregate_process_query(
+			base,
+			worker_count,
+			0,
+		))
+		.await;
+		let quic = bounded(with_quic(run_ordered_grouped_aggregate_process_query(
+			base + 100,
+			worker_count,
+			0,
+		)))
+		.await;
+		assert_eq!(tcp.row_count, 5);
+		assert_eq!(quic.row_count, 5);
+		assert_eq!(
+			quic.digest, tcp.digest,
+			"{worker_count} workers: QUIC result equals TCP"
+		);
+		assert_eq!(
+			unique_selected_worker_count(&quic.selected_workers),
+			worker_count
+		);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_op_and_window_over_quic_only_workers_match_tcp() {
+	let except_all =
+		"SELECT set_left.set_key FROM set_left EXCEPT ALL SELECT set_right.set_key FROM set_right";
+	let row_number = "SELECT set_left.set_key, \
+	        ROW_NUMBER() OVER (PARTITION BY set_left.set_key ORDER BY set_left.id) AS rn \
+	 FROM set_left";
+	for worker_count in [2u128, 3] {
+		let base = 5_500 + worker_count * 100;
+		let tcp = bounded(run_set_op_process_query_on(
+			base,
+			0,
+			except_all,
+			worker_count,
+		))
+		.await;
+		let quic = bounded(with_quic(run_set_op_process_query_on(
+			base + 10,
+			0,
+			except_all,
+			worker_count,
+		)))
+		.await;
+		assert_eq!(tcp.rows, vec![None, Some(7)], "{worker_count} workers");
+		assert_eq!(quic.rows, tcp.rows, "{worker_count} workers");
+		assert!(unique_selected_worker_count(&quic.selected_workers) >= 2);
+
+		let tcp = bounded(run_window_process_query_on(
+			base + 20,
+			0,
+			row_number,
+			worker_count,
+		))
+		.await;
+		let quic = bounded(with_quic(run_window_process_query_on(
+			base + 30,
+			0,
+			row_number,
+			worker_count,
+		)))
+		.await;
+		assert_eq!(
+			tcp.rows,
+			vec![(None, 1), (None, 2), (Some(7), 1), (Some(9), 1)],
+			"{worker_count} workers"
+		);
+		assert_eq!(quic.rows, tcp.rows, "{worker_count} workers");
+		assert!(unique_selected_worker_count(&quic.selected_workers) >= 2);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hash_join_producer_kill_over_quic_only_workers_replays_and_matches_baseline() {
+	let baseline = bounded(run_hash_join_process_query(5_600, 0)).await;
+	let left_killed = bounded(with_quic(run_hash_join_producer_kill_query(5_610, 0))).await;
+	let right_killed = bounded(with_quic(run_hash_join_producer_kill_query(5_620, 1))).await;
+	assert_eq!(baseline.row_count, 3);
+	assert_eq!(left_killed.digest, baseline.digest);
+	assert_eq!(right_killed.digest, baseline.digest);
+	assert_eq!(
+		unique_selected_worker_count(&left_killed.selected_workers),
+		2
+	);
+	assert_eq!(
+		unique_selected_worker_count(&right_killed.selected_workers),
 		2
 	);
 }
@@ -1122,7 +1517,7 @@ async fn multiple_ordered_top_k_process_query_preserves_inner_barrier() {
 		test_catalog(),
 		registry,
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -1162,7 +1557,7 @@ async fn execute_query_stream_yields_bare_limit_first_rows() {
 		test_catalog(),
 		registry,
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -1193,7 +1588,7 @@ async fn collecting_execute_query_remains_behavior_compatible_for_bare_limit() {
 		test_catalog(),
 		registry,
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -1654,7 +2049,7 @@ async fn run_floor_process_query(worker_id_base: u128, start_offset: usize) -> F
 		test_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -1702,7 +2097,7 @@ async fn run_test_logical_process_query(
 		test_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -1740,7 +2135,7 @@ async fn run_ordered_grouped_aggregate_process_query(
 		test_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -1785,7 +2180,7 @@ async fn run_quantile_process_query(
 		test_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -1862,7 +2257,7 @@ async fn run_tukey_process_query(
 		test_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -1910,7 +2305,7 @@ async fn run_ordered_grouped_min_max_process_query(
 		test_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -1957,7 +2352,7 @@ async fn run_ordered_grouped_float_min_max_process_query(
 		test_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -2004,7 +2399,7 @@ async fn run_ordered_grouped_avg_process_query(
 		test_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -2051,7 +2446,7 @@ async fn run_having_grouped_aggregate_process_query(
 		test_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -2095,7 +2490,7 @@ async fn run_ordered_having_grouped_aggregate_process_query(
 		test_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -2142,7 +2537,7 @@ async fn run_adr023_composition_process_query(
 		test_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -2189,7 +2584,7 @@ async fn run_ordered_scalar_aggregate_process_query(
 		test_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -2233,7 +2628,7 @@ async fn run_ordered_having_scalar_aggregate_process_query(
 		test_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -2283,7 +2678,7 @@ async fn run_hash_join_kind_process_query(
 		join_process_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -2319,7 +2714,7 @@ async fn run_hash_join_logical_process_query(
 		join_process_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -2340,10 +2735,20 @@ async fn run_window_process_query(
 	start_offset: usize,
 	sql: &str,
 ) -> WindowProcessRun {
-	let mut workers = vec![
-		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
-		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
-	];
+	run_window_process_query_on(worker_id_base, start_offset, sql, 2).await
+}
+
+async fn run_window_process_query_on(
+	worker_id_base: u128,
+	start_offset: usize,
+	sql: &str,
+	worker_count: u128,
+) -> WindowProcessRun {
+	let mut workers = Vec::new();
+	for offset in 0..worker_count {
+		workers
+			.push(FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + offset)).await);
+	}
 	let registry = Arc::new(RoundRobinRegistry::new(
 		workers.iter().map(worker_entry),
 		start_offset,
@@ -2352,7 +2757,7 @@ async fn run_window_process_query(
 		join_process_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -2379,10 +2784,20 @@ async fn run_set_op_process_query(
 	start_offset: usize,
 	sql: &str,
 ) -> SetOpProcessRun {
-	let mut workers = vec![
-		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
-		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
-	];
+	run_set_op_process_query_on(worker_id_base, start_offset, sql, 2).await
+}
+
+async fn run_set_op_process_query_on(
+	worker_id_base: u128,
+	start_offset: usize,
+	sql: &str,
+	worker_count: u128,
+) -> SetOpProcessRun {
+	let mut workers = Vec::new();
+	for offset in 0..worker_count {
+		workers
+			.push(FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + offset)).await);
+	}
 	let registry = Arc::new(RoundRobinRegistry::new(
 		workers.iter().map(worker_entry),
 		start_offset,
@@ -2391,7 +2806,7 @@ async fn run_set_op_process_query(
 		join_process_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -2430,7 +2845,7 @@ async fn run_cross_join_process_query(
 		cross_join_process_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		auto_broadcast_config(1024 * 1024),
 		QueryBudget::test_default(),
 	);
@@ -2468,7 +2883,7 @@ async fn run_multi_dedup_distinct_join_process_query(
 		join_process_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -2512,7 +2927,7 @@ async fn run_global_join_aggregate_process_query(
 		join_process_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -2555,7 +2970,7 @@ async fn run_group_by_join_real_aggregate_process_query(
 		join_process_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -2599,7 +3014,7 @@ async fn run_count_distinct_join_process_query(
 		join_process_catalog(),
 		registry.clone(),
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		Arc::new(TcpTransport::new()),
+		process_transport(),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
 	);
@@ -2653,9 +3068,9 @@ async fn run_hash_join_producer_kill_query(
 	)
 	.expect("fragment hash join");
 	let mut scheduler = DistributedScheduler::new(registry.clone());
-	let mut dispatcher = NetworkTaskDispatcher::new(memory, TcpTransport::new());
+	let mut dispatcher = NetworkTaskDispatcher::new(memory, process_transport());
 
-	scheduler
+	let producers_run = scheduler
 		.dispatch_loop(&stages[..=killed_stage_index], &mut dispatcher)
 		.await
 		.expect("producer stages");
@@ -2678,10 +3093,29 @@ async fn run_hash_join_producer_kill_query(
 		AttemptId::new(1)
 	);
 
+	// The invalidated producer had sealed its output on the killed worker before the kill.
+	let lost = &invalidated.producers[0];
+	let sealed = producers_run
+		.accepted_manifests
+		.get(&lost.key)
+		.expect("the invalidated producer's manifest was accepted before the kill");
+	assert_eq!(sealed.attempt_id, lost.invalidated_attempt);
+	assert_eq!(sealed.producer_worker_id, killed_worker_id);
+
 	let run = scheduler
 		.dispatch_loop(&stages, &mut dispatcher)
 		.await
 		.expect("replacement dispatch");
+	assert!(
+		run.dispatched
+			.contains(&toron::distributed::identity::TaskIdentity::new(
+				lost.key.query_id,
+				lost.key.stage_id,
+				lost.key.task_id,
+				lost.replacement_attempt,
+			)),
+		"the invalidated producer itself must be re-dispatched at its replacement attempt"
+	);
 	let result = join_process_run(run.final_results, registry.selected_workers());
 	for worker in &mut workers {
 		if worker.worker_id != killed_worker_id {
@@ -2701,7 +3135,7 @@ async fn run_broadcast_join_process_query(worker_id_base: u128) -> JoinProcessRu
 	let mut scheduler = DistributedScheduler::new(registry.clone());
 	let mut dispatcher = NetworkTaskDispatcher::new(
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		TcpTransport::new(),
+		process_transport(),
 	);
 
 	let run = scheduler
@@ -2725,7 +3159,7 @@ async fn run_broadcast_join_build_kill_query(worker_id_base: u128) -> JoinProces
 	let mut scheduler = DistributedScheduler::new(registry.clone());
 	let mut dispatcher = NetworkTaskDispatcher::new(
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		TcpTransport::new(),
+		process_transport(),
 	);
 
 	scheduler
@@ -2773,7 +3207,7 @@ async fn run_hash_join_single_partition_process_query(worker_id_base: u128) -> J
 	let mut scheduler = DistributedScheduler::new(registry.clone());
 	let mut dispatcher = NetworkTaskDispatcher::new(
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		TcpTransport::new(),
+		process_transport(),
 	);
 
 	let run = scheduler
@@ -2798,7 +3232,7 @@ async fn run_hash_join_worker_loss_query(worker_id_base: u128) -> JoinProcessRun
 	let mut scheduler = DistributedScheduler::new(registry.clone());
 	let mut dispatcher = NetworkTaskDispatcher::new(
 		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		TcpTransport::new(),
+		process_transport(),
 	);
 
 	scheduler
@@ -2874,7 +3308,7 @@ async fn run_producer_kill_query(worker_id_base: u128) -> ProcessRun {
 	)
 	.expect("fragment");
 	let mut scheduler = DistributedScheduler::new(registry.clone());
-	let mut dispatcher = NetworkTaskDispatcher::new(memory, TcpTransport::new());
+	let mut dispatcher = NetworkTaskDispatcher::new(memory, process_transport());
 
 	scheduler
 		.dispatch_loop(&stages[..1], &mut dispatcher)

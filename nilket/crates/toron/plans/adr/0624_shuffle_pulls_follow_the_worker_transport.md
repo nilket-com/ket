@@ -1,8 +1,15 @@
 # ADR 624 - shuffle pulls follow the worker transport
 
-**Status:** PROPOSED. The first step toward multinode testing on
-bigfoot, strix and optiplex. **A correctness record: one host, no
-latency claim.**
+**Status:** CLOSED (results in
+`plans/impl/0624_shuffle_pulls_follow_the_worker_transport_results.md`).
+Sealed shuffle pulls dial through the worker's transport, by the
+producer's identity, via the reviewed `ToronTransport::connect_peer`.
+With QUIC-only workers, the hash join, grouped aggregate, `EXCEPT ALL`
+and `ROW_NUMBER` match TCP at 2 and 3 workers, and the producer-kill
+replay matches. A cross-worker sealed pull is proven per run. With only
+the old TCP pull restored, the same QUIC queries fail at the consumer's
+sealed pull. The first step toward multinode testing on bigfoot, strix
+and optiplex. **A correctness record: one host, no latency claim.**
 
 ## Context
 
