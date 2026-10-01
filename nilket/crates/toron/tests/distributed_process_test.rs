@@ -37,6 +37,10 @@ use wendelon::schema::{
 	TableSchemaDescriptor,
 };
 
+/// ADR 626 Stage A: passive wait events, shared with the fixture worker binary.
+#[path = "support/wait_events.rs"]
+mod wait_events;
+
 /// Which transport the fixture workers serve and the coordinator dials. TCP unless a test scopes
 /// QUIC: QUIC-only workers have no TCP listener, so a sealed shuffle pull completes only if the
 /// worker pulls through its transport.
@@ -84,7 +88,21 @@ impl FixtureWorkerProcess {
 
 	/// `record_peer_dials`: the worker appends one line per sealed-pull dial to this file.
 	async fn spawn_with(worker_id: WorkerId, record_peer_dials: Option<&std::path::Path>) -> Self {
-		let mut command = Command::new(env!("CARGO_BIN_EXE_toron_fixture_worker"));
+		Self::spawn_recorded(worker_id, record_peer_dials, None).await
+	}
+
+	/// ADR 626 Stage A: `record_wait_events` makes the worker write passive wait events there.
+	async fn spawn_recorded(
+		worker_id: WorkerId,
+		record_peer_dials: Option<&std::path::Path>,
+		record_wait_events: Option<&std::path::Path>,
+	) -> Self {
+		// ADR 626 Stage A: a diagnostic run may name a staged, hashed fixture worker instead of
+		// this build's; unset, every test uses the build's own binary as before.
+		let exe = std::env::var_os("TORON_ADR626_FIXTURE_WORKER_EXE")
+			.map(std::path::PathBuf::from)
+			.unwrap_or_else(|| env!("CARGO_BIN_EXE_toron_fixture_worker").into());
+		let mut command = Command::new(exe);
 		command
 			.arg("--worker-u128")
 			.arg(worker_id.get().as_u128().to_string())
@@ -95,6 +113,9 @@ impl FixtureWorkerProcess {
 			});
 		if let Some(path) = record_peer_dials {
 			command.arg("--record-peer-dials").arg(path);
+		}
+		if let Some(path) = record_wait_events {
+			command.arg("--record-wait-events").arg(path);
 		}
 		let mut child = command
 			.stdout(Stdio::piped())
@@ -3725,6 +3746,27 @@ fn join_process_catalog() -> Arc<MockCatalog> {
 	Arc::new(join_process_catalog_owned())
 }
 
+/// ADR 626 Stage A: the join catalog plus the fixture worker's sized payload tables (ids 6–8).
+fn wait_survey_catalog() -> Arc<MockCatalog> {
+	let mut catalog = join_process_catalog_owned();
+	for (id, name) in [(6u8, "payload_16"), (7, "payload_16k"), (8, "payload_192k")] {
+		catalog
+			.register_descriptor(
+				TableId(u64::from(id)),
+				named_descriptor(
+					id,
+					name,
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("pad", DataType::Utf8, false),
+					]),
+				),
+			)
+			.expect("register sized payload");
+	}
+	Arc::new(catalog)
+}
+
 // ADR 239: a CROSS join is broadcast-only, so the distributed gate needs a broadcast-eligible build
 // side and an auto-broadcast config. `set_right` (the deterministic SQL right-build) is seeded small;
 // `customers` (the scan-shared probe) is seeded large so it never becomes the build.
@@ -4000,6 +4042,8 @@ struct ProbeSpec {
 	workers: Vec<(WorkerId, WorkerEndpoint)>,
 	transport: Arc<dyn ToronTransport>,
 	deadline: std::time::Duration,
+	/// ADR 626 Stage A: `probe_events.jsonl` in the attempt directory when the spec asks for it.
+	wait_log: Option<Arc<wait_events::EventLog>>,
 }
 
 fn unix_ms() -> u128 {
@@ -4060,13 +4104,27 @@ fn load_probe_spec() -> ProbeSpec {
 		QuicTransport::authenticated(client, spec_str(&raw, "cluster_domain"))
 			.expect("authenticated transport"),
 	);
+	let attempt_dir = std::path::PathBuf::from(spec_str(&raw, "attempt_dir"));
+	let wait_log = (raw["wait_events"].as_bool() == Some(true)).then(|| {
+		wait_events::EventLog::create(&attempt_dir.join("probe_events.jsonl"))
+			.expect("probe wait events must be a fresh file")
+	});
+	let transport: Arc<dyn ToronTransport> = match &wait_log {
+		Some(log) => Arc::new(wait_events::ObservedTransport {
+			inner: transport,
+			log: log.clone(),
+			role: "dispatch",
+		}),
+		None => transport,
+	};
 	ProbeSpec {
-		attempt_dir: std::path::PathBuf::from(spec_str(&raw, "attempt_dir")),
+		attempt_dir,
 		workers,
 		transport,
 		deadline: std::time::Duration::from_secs(
 			raw["deadline_secs"].as_u64().expect("deadline_secs"),
 		),
+		wait_log,
 		raw,
 	}
 }
@@ -4142,6 +4200,17 @@ async fn probe_case_plan(case: &str) -> ExecutionPlan {
 				)
 				.expect("plan row number"),
 		),
+		"sized_16" | "sized_16k" | "sized_192k" => {
+			let table = format!("payload_{}", case.trim_start_matches("sized_"));
+			(
+				wait_survey_catalog(),
+				SqlPlanner::new()
+					.plan(&format!(
+						"SELECT {table}.pad, customers.region FROM {table} JOIN customers ON {table}.id = customers.id"
+					))
+					.expect("plan sized payload join"),
+			)
+		}
 		other => panic!("unknown probe case {other}"),
 	};
 	bind(&logical, catalog.as_ref(), &PlannerConfig::default())
@@ -4213,19 +4282,83 @@ fn probe_base_evidence(spec: &ProbeSpec, mode: &str) -> serde_json::Value {
 	})
 }
 
+/// ADR 626 Stage A: records each dispatch's start and return per task attempt, and tags the
+/// transport's dial events with the dispatch they belong to. Passive: the inner dispatcher's
+/// outcome is returned unchanged.
+struct ObservedDispatcher<D> {
+	inner: D,
+	log: Option<Arc<wait_events::EventLog>>,
+}
+
+fn dispatch_outcome_text(outcome: &toron::distributed::scheduler::DispatchOutcome) -> String {
+	use toron::distributed::scheduler::DispatchOutcome;
+	match outcome {
+		DispatchOutcome::Completed(_)
+		| DispatchOutcome::CompletedWithBatches { .. }
+		| DispatchOutcome::CompletedWithTelemetry { .. } => "completed".to_string(),
+		DispatchOutcome::Failed(kind) | DispatchOutcome::FailedWithTelemetry { kind, .. } => {
+			format!("failed: {kind:?}")
+		}
+	}
+}
+
+#[async_trait::async_trait]
+impl<D> toron::distributed::scheduler::TaskDispatcher for ObservedDispatcher<D>
+where
+	D: toron::distributed::scheduler::TaskDispatcher + Send + Sync,
+{
+	async fn dispatch(
+		&self,
+		worker: &WorkerEntry,
+		spec: &toron::distributed::task::TaskSpec,
+	) -> toron::distributed::scheduler::DispatchOutcome {
+		let Some(log) = &self.log else {
+			return self.inner.dispatch(worker, spec).await;
+		};
+		let identity = spec.identity;
+		let label = format!(
+			"{}/{}/{}/{}",
+			identity.query_id.get(),
+			identity.stage_id.get(),
+			identity.task_id.get(),
+			identity.attempt_id.get()
+		);
+		let mut fields = serde_json::json!({
+			"task": label,
+			"identity": task_fields(identity.query_id, identity.stage_id.get(), identity.task_id.get(), identity.attempt_id),
+			"worker": worker.worker_id.get().as_u128().to_string(),
+			"endpoint": worker.endpoint.as_str(),
+		});
+		// Captured instants on the log's clock, so `elapsed_us` is exactly the interval the events span.
+		let started = log.now_us();
+		log.emit_at(started, "dispatch_start", "dispatch", fields.clone());
+		let outcome = wait_events::DISPATCH_TASK
+			.scope(label, self.inner.dispatch(worker, spec))
+			.await;
+		let ended = log.now_us();
+		fields["elapsed_us"] = ended.saturating_sub(started).into();
+		fields["outcome"] = dispatch_outcome_text(&outcome).into();
+		log.emit_at(ended, "dispatch_return", "dispatch", fields);
+		outcome
+	}
+}
+
 fn fresh_scheduler(
 	spec: &ProbeSpec,
 ) -> (
 	Arc<RoundRobinRegistry>,
 	DistributedScheduler<Arc<RoundRobinRegistry>>,
-	NetworkTaskDispatcher<Arc<dyn ToronTransport>>,
+	ObservedDispatcher<NetworkTaskDispatcher<Arc<dyn ToronTransport>>>,
 ) {
 	let registry = probe_registry(spec);
 	let scheduler = DistributedScheduler::new(registry.clone());
-	let dispatcher = NetworkTaskDispatcher::new(
-		Arc::new(MemoryManager::new(64, 1024 * 1024)),
-		spec.transport.clone(),
-	);
+	let dispatcher = ObservedDispatcher {
+		inner: NetworkTaskDispatcher::new(
+			Arc::new(MemoryManager::new(64, 1024 * 1024)),
+			spec.transport.clone(),
+		),
+		log: spec.wait_log.clone(),
+	};
 	(registry, scheduler, dispatcher)
 }
 
@@ -4258,6 +4391,8 @@ async fn multinode_probe_handshake() {
 		let server_name = toron::network::tls::canonical_daemon_dns_name(worker_id, &domain);
 		let window_start = unix_ms() as u64;
 		let started = std::time::Instant::now();
+		// ADR 626 Stage A: establishment (connect plus stream open) timed apart from the answer.
+		let mut connect_elapsed_us: Option<u64> = None;
 		let address = toron::distributed::task::PartitionAddress {
 			query_id: QueryId::new(),
 			exchange_id: toron::distributed::identity::ExchangeId::new(0),
@@ -4275,6 +4410,7 @@ async fn multinode_probe_handshake() {
 				.connect_stream_with_server_name(remote, &server_name)
 				.await
 				.map_err(|error| ("handshake_error", format!("dial: {error}")))?;
+			connect_elapsed_us = Some(started.elapsed().as_micros() as u64);
 			match coordinator
 				.pull_partition_from_worker(stream, address, AttemptId::first())
 				.await
@@ -4298,6 +4434,7 @@ async fn multinode_probe_handshake() {
 			"status": status,
 			"detail": detail,
 			"elapsed_ms": started.elapsed().as_millis() as u64,
+			"connect_elapsed_us": connect_elapsed_us,
 			"client_port": client_port,
 			"window_start_unix_ms": window_start,
 			"ended_unix_ms": unix_ms() as u64,
@@ -4359,15 +4496,20 @@ async fn multinode_probe_query() {
 async fn multinode_probe_worker_loss() {
 	let spec = load_probe_spec();
 	let attempt_started = std::time::Instant::now();
-	let announced = match spec_str(&spec.raw, "loss").as_str() {
-		"announced" => true,
-		"unannounced" => false,
+	// ADR 626 Stage A adds `unannounced_dispatch_target`: the victim is a remote worker holding no
+	// accepted sealed manifest, killed before the remaining stages are dispatched.
+	let (announced, dispatch_target) = match spec_str(&spec.raw, "loss").as_str() {
+		"announced" => (true, false),
+		"unannounced" => (false, false),
+		"unannounced_dispatch_target" => (false, true),
 		other => panic!("unknown loss mode {other}"),
 	};
 	let mut evidence = probe_base_evidence(
 		&spec,
 		if announced {
 			"announced_loss"
+		} else if dispatch_target {
+			"unannounced_dispatch_target_loss"
 		} else {
 			"unannounced_loss"
 		},
@@ -4390,6 +4532,13 @@ async fn multinode_probe_worker_loss() {
 	.expect("fragment probe case");
 	let (_registry, mut scheduler, mut dispatcher) = fresh_scheduler(&spec);
 	let finish = |evidence: &mut serde_json::Value, outcome: &str| {
+		if let Some(log) = &spec.wait_log {
+			log.emit(
+				"observation_end",
+				"dispatch",
+				serde_json::json!({ "outcome": outcome }),
+			);
+		}
 		evidence["outcome"] = outcome.into();
 		evidence["attempt_elapsed_ms"] = (attempt_started.elapsed().as_millis() as u64).into();
 		evidence["ended_unix_ms"] = (unix_ms() as u64).into();
@@ -4419,6 +4568,37 @@ async fn multinode_probe_worker_loss() {
 		.collect::<Vec<_>>()
 		.into();
 
+	// 2b. ADR 626 Stage A: a dispatch-target victim, bound before the kill.
+	let dispatch_victim = if dispatch_target {
+		let producers = producers_run
+			.accepted_manifests
+			.values()
+			.map(|manifest| manifest.producer_worker_id)
+			.collect::<HashSet<_>>();
+		let mut idle_remote = spec
+			.workers
+			.iter()
+			.filter(|(worker_id, _)| {
+				remote.contains(&worker_id.get().as_u128().to_string())
+					&& !producers.contains(worker_id)
+			})
+			.cloned()
+			.collect::<Vec<_>>();
+		idle_remote.sort_by_key(|(worker_id, _)| worker_id.get().as_u128());
+		let Some((worker_id, endpoint)) = idle_remote.first().cloned() else {
+			return finish(&mut evidence, "no_remote_idle_worker");
+		};
+		evidence["victim"] = serde_json::json!({
+			"role": "dispatch_target",
+			"worker": worker_id.get().as_u128().to_string(),
+			"endpoint": endpoint.as_str(),
+			"accepted_manifests_held": 0,
+		});
+		Some(worker_id)
+	} else {
+		None
+	};
+
 	// 2. Bind the victim: one accepted sealed manifest from a remote worker.
 	let mut candidates = producers_run
 		.accepted_manifests
@@ -4428,18 +4608,21 @@ async fn multinode_probe_worker_loss() {
 		})
 		.collect::<Vec<_>>();
 	candidates.sort_by_key(|(key, _)| format!("{key:?}"));
-	let Some((victim_key, victim_manifest)) = candidates
+	let producer_victim = candidates
 		.first()
-		.map(|(key, manifest)| ((*key).clone(), (*manifest).clone()))
-	else {
-		return finish(&mut evidence, "no_remote_sealed_producer");
+		.map(|(key, manifest)| ((*key).clone(), (*manifest).clone()));
+	let victim_worker = match (dispatch_victim, &producer_victim) {
+		(Some(worker_id), _) => worker_id,
+		(None, Some((victim_key, victim_manifest))) => {
+			evidence["victim"] = serde_json::json!({
+				"task": task_fields(victim_key.query_id, victim_key.stage_id.get(), victim_key.task_id.get(), victim_manifest.attempt_id),
+				"worker": victim_manifest.producer_worker_id.get().as_u128().to_string(),
+				"endpoint": victim_manifest.producer_endpoint.as_str(),
+			});
+			victim_manifest.producer_worker_id
+		}
+		(None, None) => return finish(&mut evidence, "no_remote_sealed_producer"),
 	};
-	let victim_worker = victim_manifest.producer_worker_id;
-	evidence["victim"] = serde_json::json!({
-		"task": task_fields(victim_key.query_id, victim_key.stage_id.get(), victim_key.task_id.get(), victim_manifest.attempt_id),
-		"worker": victim_worker.get().as_u128().to_string(),
-		"endpoint": victim_manifest.producer_endpoint.as_str(),
-	});
 
 	// 3. The bounded kill: the harness's command for exactly this worker, output preserved.
 	let victim_name = victim_worker.get().as_u128().to_string();
@@ -4483,6 +4666,13 @@ async fn multinode_probe_worker_loss() {
 	}
 	let confirmed = std::time::Instant::now();
 	evidence["kill_confirmed_unix_ms"] = (unix_ms() as u64).into();
+	if let Some(log) = &spec.wait_log {
+		log.emit(
+			"victim_killed",
+			"dispatch",
+			serde_json::json!({ "worker": victim_worker.get().as_u128().to_string() }),
+		);
+	}
 
 	// 4. Recovery.
 	let bound = if announced {
@@ -4495,6 +4685,9 @@ async fn multinode_probe_worker_loss() {
 		)
 	};
 	if announced {
+		let Some((victim_key, victim_manifest)) = producer_victim else {
+			return finish(&mut evidence, "no_remote_sealed_producer");
+		};
 		let invalidated = scheduler.mark_worker_lost(victim_worker);
 		let bound_task = invalidated.producers.iter().find(|task| {
 			task.key == victim_key && task.invalidated_attempt == victim_manifest.attempt_id
@@ -4561,6 +4754,236 @@ async fn multinode_probe_worker_loss() {
 			Err(_) => finish(&mut evidence, "no_terminal_return_within_bound"),
 		}
 	}
+}
+
+// ---- ADR 626 Stage A: sized-payload shuffle and the local loss-wait diagnostic ----
+
+/// The sized payload join moves the payload across QUIC workers (at least its raw `pad` bytes are
+/// pulled) while matching nothing, so a survey pull measures transfer, not result volume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sized_payload_join_shuffles_the_payload_over_quic() {
+	with_quic(async {
+		let mut workers = Vec::new();
+		for id in 62_611..=62_613u128 {
+			workers.push(FixtureWorkerProcess::spawn(WorkerId::from_u128(id)).await);
+		}
+		let registry = Arc::new(RoundRobinRegistry::new(
+			workers
+				.iter()
+				.map(|worker| worker_entry_for(worker.worker_id, worker.endpoint.clone())),
+			0,
+		));
+		let mut scheduler = DistributedScheduler::new(registry);
+		let dispatcher = NetworkTaskDispatcher::new(
+			Arc::new(MemoryManager::new(64, 1024 * 1024)),
+			process_transport(),
+		);
+		let stages = fragment_plan(
+			probe_case_plan("sized_16k").await,
+			FragmentPlanConfig::new_for_test(
+				QueryId::new(),
+				TaskBudget::from_query_budget(QueryBudget::test_default()),
+			),
+		)
+		.expect("fragment sized payload join");
+		let run = bounded(scheduler.dispatch_loop(&stages, &dispatcher))
+			.await
+			.expect("sized payload join completes");
+		let rows = run
+			.final_results
+			.iter()
+			.map(RecordBatch::num_rows)
+			.sum::<usize>();
+		assert_eq!(rows, 0, "payload keys never match a customer");
+		let pulled = run
+			.telemetry
+			.task_telemetry
+			.iter()
+			.map(|record| record.telemetry.counters.pulled_shuffle_bytes)
+			.sum::<u64>();
+		assert!(
+			pulled >= 16 * 1024 * 64,
+			"the payload's pad bytes must cross the shuffle: pulled {pulled}"
+		);
+		for worker in &mut workers {
+			worker.shutdown().await;
+		}
+	})
+	.await;
+}
+
+/// Unannounced loss on loopback, observed passively: three QUIC fixture workers write wait events,
+/// stage 0 seals, the victim is bound and `SIGKILL`ed, and the full plan is then dispatched for at
+/// most the declared window. Nothing is asserted about recovery: the evidence (`local.json`, the
+/// probe's and each worker's events) is the result. `TORON_ADR626_LOCAL_DIR` must not exist yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ADR 626 Stage A diagnostic: needs TORON_ADR626_LOCAL_DIR; observes for up to its window"]
+async fn unannounced_loss_waits_are_observed_on_loopback() {
+	let dir = std::path::PathBuf::from(
+		std::env::var("TORON_ADR626_LOCAL_DIR").expect("TORON_ADR626_LOCAL_DIR"),
+	);
+	std::fs::create_dir(&dir).expect("a fresh diagnostic directory");
+	let mode = std::env::var("TORON_ADR626_LOCAL_MODE").unwrap_or_else(|_| "producer".to_string());
+	assert!(
+		mode == "producer" || mode == "dispatch_target",
+		"TORON_ADR626_LOCAL_MODE must be producer or dispatch_target, got {mode}"
+	);
+	let window = std::time::Duration::from_secs(
+		std::env::var("TORON_ADR626_LOCAL_WINDOW_SECS")
+			.map(|value| value.parse().expect("window seconds"))
+			.unwrap_or(360),
+	);
+	with_quic(async {
+		let mut workers = Vec::new();
+		for id in 62_601..=62_603u128 {
+			workers.push(
+				FixtureWorkerProcess::spawn_recorded(
+					WorkerId::from_u128(id),
+					Some(&dir.join(format!("dials-{id}.txt"))),
+					Some(&dir.join(format!("worker-{id}.jsonl"))),
+				)
+				.await,
+			);
+		}
+		let log = wait_events::EventLog::create(&dir.join("probe_events.jsonl"))
+			.expect("fresh probe events");
+		let transport: Arc<dyn ToronTransport> = Arc::new(wait_events::ObservedTransport {
+			inner: process_transport(),
+			log: log.clone(),
+			role: "dispatch",
+		});
+		let dispatcher = ObservedDispatcher {
+			inner: NetworkTaskDispatcher::new(
+				Arc::new(MemoryManager::new(64, 1024 * 1024)),
+				transport,
+			),
+			log: Some(log.clone()),
+		};
+		let registry = Arc::new(RoundRobinRegistry::new(
+			workers
+				.iter()
+				.map(|worker| worker_entry_for(worker.worker_id, worker.endpoint.clone())),
+			0,
+		));
+		let mut scheduler = DistributedScheduler::new(registry);
+		let stages = fragment_plan(
+			probe_case_plan("hash_join").await,
+			FragmentPlanConfig::new_for_test(
+				QueryId::new(),
+				TaskBudget::from_query_budget(QueryBudget::test_default()),
+			),
+		)
+		.expect("fragment hash join");
+		let mut evidence = serde_json::json!({
+			"mode": mode,
+			"window_secs": window.as_secs(),
+			"workers": workers.iter().map(|worker| serde_json::json!({
+				"worker": worker.worker_id.get().as_u128().to_string(),
+				"endpoint": worker.endpoint.as_str(),
+			})).collect::<Vec<_>>(),
+			"started_unix_ms": unix_ms() as u64,
+		});
+		let write = |evidence: &serde_json::Value| {
+			use std::io::Write as _;
+			std::fs::OpenOptions::new()
+				.write(true)
+				.create_new(true)
+				.open(dir.join("local.json"))
+				.expect("fresh local evidence")
+				.write_all(
+					serde_json::to_string_pretty(evidence)
+						.expect("json")
+						.as_bytes(),
+				)
+				.expect("write local evidence");
+		};
+
+		let producers_run = match tokio::time::timeout(
+			std::time::Duration::from_secs(60),
+			scheduler.dispatch_loop(&stages[..1], &dispatcher),
+		)
+		.await
+		{
+			Ok(Ok(run)) => run,
+			other => {
+				evidence["outcome"] = "producer_stage_failed".into();
+				evidence["detail"] = format!("{:?}", other.map(|result| result.map(|_| ()))).into();
+				return write(&evidence);
+			}
+		};
+		let producers = producers_run
+			.accepted_manifests
+			.values()
+			.map(|manifest| manifest.producer_worker_id)
+			.collect::<HashSet<_>>();
+		evidence["producer_manifests_before_kill"] = producers_run
+			.accepted_manifests
+			.values()
+			.map(manifest_evidence)
+			.collect::<Vec<_>>()
+			.into();
+		let mut candidates = workers
+			.iter()
+			.map(|worker| worker.worker_id)
+			.filter(|worker_id| producers.contains(worker_id) == (mode == "producer"))
+			.collect::<Vec<_>>();
+		candidates.sort_by_key(|worker_id| worker_id.get().as_u128());
+		let Some(victim) = candidates.first().copied() else {
+			evidence["outcome"] = "no_victim_for_mode".into();
+			return write(&evidence);
+		};
+		evidence["victim"] = victim.get().as_u128().to_string().into();
+		let victim_process = workers
+			.iter_mut()
+			.find(|worker| worker.worker_id == victim)
+			.expect("victim process");
+		evidence["victim_endpoint"] = victim_process.endpoint.as_str().into();
+		// `Child::kill` sends SIGKILL and waits; the exit status confirms the process is gone.
+		let kill = victim_process.child.kill().await;
+		let status = victim_process.child.try_wait();
+		evidence["kill"] = serde_json::json!({
+			"result": match &kill { Ok(()) => "ok".to_string(), Err(error) => error.to_string() },
+			"exit_status": match &status { Ok(Some(status)) => format!("{status}"), other => format!("{other:?}") },
+			"confirmed": kill.is_ok() && matches!(status, Ok(Some(_))),
+		});
+		if !(kill.is_ok() && matches!(status, Ok(Some(_)))) {
+			evidence["outcome"] = "kill_not_confirmed".into();
+			return write(&evidence);
+		}
+		let killed = std::time::Instant::now();
+		evidence["kill_confirmed_unix_ms"] = (unix_ms() as u64).into();
+		log.emit(
+			"victim_killed",
+			"dispatch",
+			serde_json::json!({ "worker": victim.get().as_u128().to_string() }),
+		);
+
+		let outcome =
+			tokio::time::timeout(window, scheduler.dispatch_loop(&stages, &dispatcher)).await;
+		evidence["since_kill_ms"] = (killed.elapsed().as_millis() as u64).into();
+		match outcome {
+			Ok(Ok(run)) => {
+				evidence["outcome"] = "completed".into();
+				evidence["run"] = run_evidence(&run);
+			}
+			Ok(Err(error)) => {
+				evidence["outcome"] = "error".into();
+				evidence["error"] = format!("{error:?}").into();
+			}
+			Err(_) => evidence["outcome"] = "window_elapsed".into(),
+		}
+		log.emit(
+			"observation_end",
+			"dispatch",
+			serde_json::json!({ "outcome": evidence["outcome"].clone() }),
+		);
+		evidence["ended_unix_ms"] = (unix_ms() as u64).into();
+		for worker in &mut workers {
+			worker.shutdown().await;
+		}
+		write(&evidence);
+	})
+	.await;
 }
 
 // ---- ADR 625: host-mode fixtures (local, no network peers) ----

@@ -17,6 +17,10 @@ use toron::server::memory::MemoryManager;
 use toron::server::transport::{QuicTransport, TcpTransport, ToronTransport};
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 
+/// ADR 626 Stage A: passive wait events, shared with the process tests.
+#[path = "../../tests/support/wait_events.rs"]
+mod wait_events;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FixtureTransport {
 	Tcp,
@@ -88,15 +92,27 @@ impl ToronTransport for DialRecordingTransport {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-	let (worker_id, transport, record_peer_dials, host_mode) = args()?;
+	let (worker_id, transport, record_peer_dials, host_mode, record_wait_events) = args()?;
+	let wait_log = record_wait_events
+		.as_deref()
+		.map(wait_events::EventLog::create)
+		.transpose()?;
 	let peer = |inner: Arc<dyn ToronTransport>| -> Arc<dyn ToronTransport> {
-		match &record_peer_dials {
+		let recorded: Arc<dyn ToronTransport> = match &record_peer_dials {
 			Some(path) => Arc::new(DialRecordingTransport {
 				inner,
 				this_worker: worker_id,
 				path: path.clone(),
 			}),
 			None => inner,
+		};
+		match &wait_log {
+			Some(log) => Arc::new(wait_events::ObservedTransport {
+				inner: recorded,
+				log: log.clone(),
+				role: "pull",
+			}),
+			None => recorded,
 		}
 	};
 	let worker = |endpoint: WorkerEndpoint, peer: Arc<dyn ToronTransport>| {
@@ -152,11 +168,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
 			};
 			let remote = connection.remote_address();
 			let worker = worker.clone();
+			let wait_log = wait_log.clone();
 			tokio::spawn(async move {
 				match QuicEndpoint::accept_stream_on(&connection).await {
 					Ok(stream) => {
 						host_event("STREAM_ACCEPTED", format!("remote={remote}"));
-						if let Err(error) = worker.handle_connection(stream).await {
+						let served = match wait_log {
+							Some(log) => {
+								{
+									let observed = wait_events::ObservedStream::served(
+										stream,
+										log,
+										serde_json::json!({ "remote": remote.to_string() }),
+									);
+									// Pull dials made while handling this stream name it, when the work stays on this task.
+									wait_events::SERVED_STREAM
+										.scope(
+											observed.stream_id(),
+											worker.handle_connection(observed),
+										)
+										.await
+								}
+							}
+							None => worker.handle_connection(stream).await,
+						};
+						if let Err(error) = served {
 							host_event(
 								"CONNECTION_FAILED",
 								format!("remote={remote} error={error}"),
@@ -199,11 +235,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
 						continue;
 					}
 				};
+				let remote = connection.remote_address();
 				let worker = worker.clone();
+				let wait_log = wait_log.clone();
 				tokio::spawn(async move {
 					match QuicEndpoint::accept_stream_on(&connection).await {
 						Ok(stream) => {
-							if let Err(error) = worker.handle_connection(stream).await {
+							let served = match wait_log {
+								Some(log) => {
+									{
+										let observed = wait_events::ObservedStream::served(
+											stream,
+											log,
+											serde_json::json!({ "remote": remote.to_string() }),
+										);
+										// Pull dials made while handling this stream name it, when the work stays on this task.
+										wait_events::SERVED_STREAM
+											.scope(
+												observed.stream_id(),
+												worker.handle_connection(observed),
+											)
+											.await
+									}
+								}
+								None => worker.handle_connection(stream).await,
+							};
+							if let Err(error) = served {
 								eprintln!("fixture worker connection failed: {error}");
 							}
 						}
@@ -226,6 +283,30 @@ async fn announce(endpoint: &WorkerEndpoint) -> Result<(), Box<dyn Error>> {
 
 struct FixtureStorageScan {
 	tables: HashMap<TableId, RecordBatch>,
+	/// ADR 626 Stage A sized payloads (tables 6, 7, 8), built on first scan only, so a run that never
+	/// reads them pays nothing for them.
+	payloads: [std::sync::OnceLock<RecordBatch>; 3],
+}
+
+impl FixtureStorageScan {
+	fn table(&self, table_id: TableId) -> Result<RecordBatch, StorageError> {
+		let rows = match table_id.0 {
+			6 => Some((0, 16)),
+			7 => Some((1, 16 * 1024)),
+			8 => Some((2, 192 * 1024)),
+			_ => None,
+		};
+		match rows {
+			Some((slot, rows)) => Ok(self.payloads[slot]
+				.get_or_init(|| payload(rows).expect("sized payload batch"))
+				.clone()),
+			None => self
+				.tables
+				.get(&table_id)
+				.cloned()
+				.ok_or(StorageError::TableNotFound { table: table_id }),
+		}
+	}
 }
 
 impl FixtureStorageScan {
@@ -326,20 +407,38 @@ impl FixtureStorageScan {
 				(TableId(4), set_left),
 				(TableId(5), set_right),
 			]),
+			payloads: std::array::from_fn(|_| std::sync::OnceLock::new()),
 		})
 	}
+}
+
+/// ADR 626 Stage A sized fixtures: `rows` rows of a unique `id` (never 2 or 3, so a join with
+/// `customers` matches nothing) and a 64-byte `pad`, so a shuffle on `id` carries the whole table
+/// while the final result stays empty. Partition sizes are measured, not assumed.
+fn payload(rows: i64) -> Result<RecordBatch, arrow::error::ArrowError> {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("pad", DataType::Utf8, false),
+	]));
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(
+				(0..rows).map(|row| 1_000 + row).collect::<Vec<_>>(),
+			)),
+			Arc::new(StringArray::from(
+				(0..rows)
+					.map(|row| format!("{row:064}"))
+					.collect::<Vec<_>>(),
+			)),
+		],
+	)
 }
 
 #[async_trait::async_trait]
 impl StorageScan for FixtureStorageScan {
 	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
-		let mut batch =
-			self.tables
-				.get(&request.table_id)
-				.cloned()
-				.ok_or(StorageError::TableNotFound {
-					table: request.table_id,
-				})?;
+		let mut batch = self.table(request.table_id)?;
 		// ADR 238: honor a pushed predicate in the source-column domain (before projection),
 		// reusing the production PBC evaluator — the same `wendelon::schema::pbc::execute` the real
 		// in-memory scan uses (storage.rs). Fail loud on an unevaluable program; never return
@@ -385,6 +484,7 @@ type FixtureArgs = (
 	FixtureTransport,
 	Option<std::path::PathBuf>,
 	Option<HostMode>,
+	Option<std::path::PathBuf>,
 );
 
 fn invalid(message: String) -> Box<dyn Error> {
@@ -399,6 +499,7 @@ fn args() -> Result<FixtureArgs, Box<dyn Error>> {
 	let mut worker_u128 = None;
 	let mut transport = FixtureTransport::Tcp;
 	let mut record_peer_dials = None;
+	let mut record_wait_events = None;
 	let mut bind: Option<std::net::SocketAddr> = None;
 	let mut advertise: Option<std::net::SocketAddr> = None;
 	let mut tls_cert = None;
@@ -422,6 +523,8 @@ fn args() -> Result<FixtureArgs, Box<dyn Error>> {
 			cluster_domain = args.next();
 		} else if arg == "--record-peer-dials" {
 			record_peer_dials = args.next().map(std::path::PathBuf::from);
+		} else if arg == "--record-wait-events" {
+			record_wait_events = args.next().map(std::path::PathBuf::from);
 		} else if arg == "--transport" {
 			transport = match args.next().as_deref() {
 				Some("tcp") => FixtureTransport::Tcp,
@@ -447,6 +550,7 @@ fn args() -> Result<FixtureArgs, Box<dyn Error>> {
 		transport,
 		record_peer_dials,
 		host_mode,
+		record_wait_events,
 	))
 }
 

@@ -155,6 +155,69 @@ covering
 It goes to review. If the observations contradict the hypothesis,
 Stage B is re-planned.
 
+*Stage A instrument amendments (for review).*
+- **Where the instrument sits.** All events are observed at the transport
+  and stream boundary, in the fixture worker and the probe. No library code
+  changes.
+  - The observer forwards every byte and error unchanged.
+  - A failed event write is reported on stderr as `wait event log write
+    failed`, and the readers treat it as incomplete instrumentation.
+  - Every event carries the instant it captured (`at_us`). Each interval
+    field is an exact difference of two such instants, on one process's
+    clock.
+- **What is observable, and under which name:**
+  - **Establishment:** QUIC connect and stream open, as one combined
+    interval. They are not separable here.
+  - **Frames:** each frame's header and payload, in both directions. Each
+    frame's envelope prefix (protocol version, kind, identity) is decoded
+    from its first bytes with the library's own wire types.
+  - **Request to first response byte:** from the end of the request frame
+    to the first response byte.
+  - **Read gaps within a frame:** these include the consumer's own read
+    pacing and event-write overhead. They are reported as observed read
+    gaps, and they cannot by themselves justify a producer-progress `W`.
+  - **Worker task timing:** taken from served-stream boundaries. The
+    consuming task of a pull is the served stream's `StartTask`, tagged
+    through a task-local where the work stays on that task, and reported as
+    unavailable otherwise.
+  - **Not observable:** per-pull decode, and task execution itself.
+- **Sized fixtures.** The tables have 16, 16 Ki and 192 Ki rows (about
+  1.2 KiB, 1.2 MiB and 14.3 MiB raw), each a unique `id` and a 64-byte pad,
+  built on first scan only.
+  - The test budget caps a frame at 16 MiB, so partition bytes are measured,
+    not set to nominal sizes.
+  - A join on keys that never match carries the payload across the shuffle
+    and returns no rows.
+- **Pull-survey coverage.** Each unordered host pair runs 10 queries with a
+  two-worker spec. Each pull is tied to its run by:
+  - its decoded `PullPartition` address;
+  - that run's accepted producer;
+  - its `PartitionData` response;
+  - its consuming task;
+  - byte totals that must cover the task telemetry.
+
+  Complete pulls are reported separately for each of the six directions,
+  with `n`. A direction or size with fewer than ten, or a local pull, gives
+  no input to a bound.
+- **The dispatch-target diagnostic** observes whether a dispatch actually
+  targeted the dead worker. If none did, that coverage is reported as
+  unavailable.
+- **The local diagnostic** runs the staged, hashed release worker and probe.
+  Its kill is confirmed by the victim's exit status.
+- **Survey lifetimes.** Each survey has a declared budget: every run at its
+  own timeout. Worker lifetime covers the budget plus a margin, and a survey
+  stops, recorded, before a run could outlast it. A worker that ends on its
+  own before cleanup refuses the attempt; only the loss diagnostic's bound
+  victim is exempt.
+- **The frozen Stage A schedule:**
+  - two local diagnostics: producer and dispatch target;
+  - three host diagnostics: producer twice, dispatch target once;
+  - a handshake survey from each of the three origins;
+  - a pull survey at each of the three sizes;
+  - a link campaign before and after.
+
+  The readout refuses any other set.
+
 ## Stage B: bounds, recovery, fencing (conditional on Stage A review)
 
 These are constraints the Stage B design must meet. They are not yet an
