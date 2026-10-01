@@ -1,6 +1,9 @@
 # ADR 627 - mid-task worker loss diagnostic
 
-**Status:** PROPOSED. Diagnosis only. Successor to ADR 626, which closed
+**Status:** CLOSED. Diagnosis delivered, WITH LIMITED lease coverage
+(see [Results](#results-reviewed)). The frozen long healthy coverage
+was **not met** in any long attempt. That is a reported diagnostic
+result, not a robustness acceptance. Successor to ADR 626, which closed
 scoped to its declared campaign.
 
 **This plan authorizes no behaviour change.** It authorizes one
@@ -410,6 +413,131 @@ with the `long` scan frozen at 30 s).
 - 8 local combinations (both faults, both roles, both paths);
 - 18 healthy coordinator-path runs (the six cases x3);
 - 8 host losses (the asymmetric matrix).
+
+## Results (reviewed)
+
+Accepted on review as a scoped diagnostic. Every figure below was read
+from the campaign's evidence. No tuning, recovery or behaviour change
+follows from this closure.
+
+**Identities.**
+- **Source:** baseline `5b86af4a` (tree `9237e4d6`), tag
+  `adr627-baseline`. It differs from the laddered `4096e788` (tree
+  `6965ef5e`) only in this document.
+- **Ladder:** `ladder-3` (toolchain 1.95.0, all rc 0).
+  - Retained: `ladder-1` with its tpch rerun (its first tpch run
+    failed on a cold-generated fixture file, an inferred cause);
+    `ladder-2`, superseded by the signal-stamp fix.
+  - Development runs are kept separately and are not evidence.
+- **Artifacts:** worker `8bc5d5b7…`, probe `dc5a7077…`, identical on
+  all three hosts.
+- **Freeze and evidence:**
+  - `FREEZE.json` `b0779ec6…`;
+  - schedule `a3e2bfd9…` (43 attempts);
+  - readout `b5583a5f…`;
+  - archive of 1534 files with `SHA256SUMS` `b7eed565…`, retained on
+    bigfoot under `~/work/toron-evidence/adr627/campaign`, together with
+    the raw per-attempt evidence.
+
+**Run.**
+- Links before, then the 43 attempts in frozen order, then links after.
+- Every attempt returned rc 0, and there was no STOP. Both link
+  campaigns measured 48 of 48 runs.
+- The readout, recomputed from raw evidence, is READ with no reasons.
+  All 9 references completed cleanly.
+
+**Clocks.** Intervals are on the probe's own clock, starting at
+`signal_sent`, which is not the confirmed remote signal; the
+confirmation latency is separate. The signal landed 3000.936–3002.109
+ms after the victim's `StartTask` write. All 16 fault attempts bound as
+mid-scan from raw events.
+
+**Scheduler path** (ADR 626's experiment on; 10 attempts):
+- **Local:** kill and stop, final-stage and producer.
+- **Hosts:** kill of the final-stage task, kill of the producer, and
+  stop of the final-stage task, each on strix and on optiplex.
+- **The ending:** in every attempt, the victim's dispatch stream ended
+  in `read_error` at 302025.194–302146.419 ms. The dispatch returned a
+  retryable `TaskFailed` ("query IO error: connection lost") at the
+  same moment.
+- **The result:** the query then completed at parity, at
+  310069.041–310702.278 ms for the final-stage task and
+  315116.209–316157.451 ms for the producer.
+- **This is far beyond 30 s.** `R` = 30 s belonged to ADR 626's
+  between-stage fixture, so it is reported only as a contrast, not as
+  this ADR's threshold.
+- The endings near 302 s are consistent with ADR 577's 300 s idle
+  policy, which is not proof that its timer caused them.
+- `SIGSTOP` (suspended execution, socket retained; not an ordinary slow
+  task and not a packet-loss test) gave the same shape as `SIGKILL`.
+- In the producer cases, a later dial to the victim was abandoned after
+  about 5001 ms. That is ADR 626's 5 s establishment bound during the
+  replay.
+
+**Coordinator path** (production `DistributedQueryCoordinator`,
+experiment off; 6 attempts):
+- **Local:** kill and stop, final-stage and producer.
+- **Hosts:** kill of the final-stage task, on strix and on optiplex.
+- **The ending:** a post-signal dial to the target started at
+  1933.387–1997.967 ms and was abandoned at 100807–101978 µs, before
+  any frame was written. The victim stream dropped, and the query
+  returned a typed `WorkerLost` naming the victim at
+  2035.517–2100.112 ms. There was no recovery.
+- **The lease reading** is "consistent with lease failure". The
+  caller, renewal or issuance, is not proven, and `fail_query_lease`'s
+  timing is unavailable.
+- **These roughly two-second terminal failures depend on the 5 s
+  cadence's phase.** They are not a general end-to-end bound.
+- **The host matrix is asymmetric:** producer and `SIGSTOP` coverage on
+  this path is local-only, with no cross-host conclusion.
+
+**Healthy coordinator-path controls** (18 attempts, no fault
+injected): the central finding.
+- **Short cases:** all 12 attempts of `hash_join`,
+  `grouped_aggregate`, `except_all` and `row_number` completed at
+  parity. They finish before the first 5 s tick, so they do not test
+  periodic renewal reliability.
+- **Five of the six attempts that outlived one tick returned
+  `WorkerLost` with no injected fault:**
+  - `slow_scan`-1 and -2;
+  - `long_join_last`-1, -2 and -3.
+
+  Their terminals fell at 5.121–5.223 s from the probe log's start,
+  around the first expected renewal opportunity. Just before each, the
+  observed operations were:
+  - a dial to the lost worker abandoned at about 101 ms;
+  - or a lease-only stream with no ACK (dial 90060 µs and 99664 µs);
+  - or, in `long_join_last`-3, an ACKed renewal candidate to one
+    worker, then a dial to the other abandoned at 101501 µs.
+- **`slow_scan`-3** completed at parity, with ACKed lease-only streams.
+- **The frozen long coverage (at least 5 ACKed lease-only streams to
+  each of at least 2 workers) was not met in any long attempt.**
+- **For context,** an ordinary issuance dial in `long_join_last`-1 took
+  275539 µs on this link.
+- **What these runs support:** the observed operations and the code are
+  consistent with the current renewal deadlines causing these failures
+  on this setup.
+  - Those deadlines are 100 ms to connect a fresh connection, then a
+    separate 100 ms for the whole `issue_or_renew` operation,
+    including its terminal exchange, not only the ACK wait.
+  - The caller is not proven, and `fail_query_lease`'s timing is
+    unavailable.
+  - No general failure rate follows from six attempts.
+  - No injected fault is not proof that the network and hosts were
+    healthy.
+
+**Successors, in priority order:**
+1. **Production lease reliability under slow or transient
+   connectivity.** It must consider ownership and namespace expiry, and
+   distinguish transient renewal failure from task or worker death.
+   Larger deadlines or connection reuse are candidates, not selected
+   fixes. No-fault long controls and bounded failure behaviour stay in
+   its acceptance contract.
+2. **The established-task stall and a watchdog `W`.** It must not turn
+   long, silent, healthy execution into worker death without a progress
+   contract.
+3. **Recovery on the coordinator path.**
+4. **ADR 626's deferred dispatch-exclusion shortcut.**
 
 ## Guardrails
 
