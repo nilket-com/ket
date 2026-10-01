@@ -52,6 +52,8 @@ enum ProcessTransport {
 
 tokio::task_local! {
 	static PROCESS_TRANSPORT: ProcessTransport;
+	/// ADR 626 Stage C: a relayed worker's loopback bind and advertised addresses.
+	static LOOPBACK_ADDRESSES: (std::net::SocketAddr, std::net::SocketAddr);
 }
 
 fn current_process_transport() -> ProcessTransport {
@@ -97,6 +99,31 @@ impl FixtureWorkerProcess {
 		record_peer_dials: Option<&std::path::Path>,
 		record_wait_events: Option<&std::path::Path>,
 	) -> Self {
+		Self::spawn_configured(worker_id, record_peer_dials, record_wait_events, None).await
+	}
+
+	/// ADR 626 Stage C: a QUIC loopback worker bound at `bind` and advertising `advertise` (a relay).
+	async fn spawn_loopback_relayed(
+		worker_id: WorkerId,
+		bind: std::net::SocketAddr,
+		advertise: std::net::SocketAddr,
+		recovery: (u64, u64),
+	) -> Self {
+		LOOPBACK_ADDRESSES
+			.scope(
+				(bind, advertise),
+				Self::spawn_configured(worker_id, None, None, Some(recovery)),
+			)
+			.await
+	}
+
+	/// ADR 626 Stage B: `recovery` (`H` and `C` in ms) enables the recovery experiment.
+	async fn spawn_configured(
+		worker_id: WorkerId,
+		record_peer_dials: Option<&std::path::Path>,
+		record_wait_events: Option<&std::path::Path>,
+		recovery: Option<(u64, u64)>,
+	) -> Self {
 		// ADR 626 Stage A: a diagnostic run may name a staged, hashed fixture worker instead of
 		// this build's; unset, every test uses the build's own binary as before.
 		let exe = std::env::var_os("TORON_ADR626_FIXTURE_WORKER_EXE")
@@ -116,6 +143,20 @@ impl FixtureWorkerProcess {
 		}
 		if let Some(path) = record_wait_events {
 			command.arg("--record-wait-events").arg(path);
+		}
+		if let Ok((bind, advertise)) = LOOPBACK_ADDRESSES.try_with(|addresses| *addresses) {
+			command
+				.arg("--loopback-bind")
+				.arg(bind.to_string())
+				.arg("--loopback-advertise")
+				.arg(advertise.to_string());
+		}
+		if let Some((establishment, confirmation)) = recovery {
+			command
+				.arg("--recovery-establishment-ms")
+				.arg(establishment.to_string())
+				.arg("--recovery-confirmation-ms")
+				.arg(confirmation.to_string());
 		}
 		let mut child = command
 			.stdout(Stdio::piped())
@@ -3749,7 +3790,12 @@ fn join_process_catalog() -> Arc<MockCatalog> {
 /// ADR 626 Stage A: the join catalog plus the fixture worker's sized payload tables (ids 6–8).
 fn wait_survey_catalog() -> Arc<MockCatalog> {
 	let mut catalog = join_process_catalog_owned();
-	for (id, name) in [(6u8, "payload_16"), (7, "payload_16k"), (8, "payload_192k")] {
+	for (id, name) in [
+		(6u8, "payload_16"),
+		(7, "payload_16k"),
+		(8, "payload_192k"),
+		(9, "slow"),
+	] {
 		catalog
 			.register_descriptor(
 				TableId(u64::from(id)),
@@ -4044,6 +4090,8 @@ struct ProbeSpec {
 	deadline: std::time::Duration,
 	/// ADR 626 Stage A: `probe_events.jsonl` in the attempt directory when the spec asks for it.
 	wait_log: Option<Arc<wait_events::EventLog>>,
+	/// ADR 626 Stage B: the recovery experiment, when the spec declares one.
+	recovery: Option<toron::distributed::recovery::RecoveryExperiment>,
 }
 
 fn unix_ms() -> u128 {
@@ -4117,6 +4165,17 @@ fn load_probe_spec() -> ProbeSpec {
 		}),
 		None => transport,
 	};
+	let recovery = raw.get("recovery").map(|recovery| {
+		toron::distributed::recovery::RecoveryExperiment::from_millis(
+			recovery["establishment_ms"]
+				.as_u64()
+				.expect("recovery.establishment_ms"),
+			recovery["confirmation_ms"]
+				.as_u64()
+				.expect("recovery.confirmation_ms"),
+		)
+		.expect("a valid recovery experiment")
+	});
 	ProbeSpec {
 		attempt_dir,
 		workers,
@@ -4125,6 +4184,7 @@ fn load_probe_spec() -> ProbeSpec {
 			raw["deadline_secs"].as_u64().expect("deadline_secs"),
 		),
 		wait_log,
+		recovery,
 		raw,
 	}
 }
@@ -4211,6 +4271,12 @@ async fn probe_case_plan(case: &str) -> ExecutionPlan {
 					.expect("plan sized payload join"),
 			)
 		}
+		"slow_scan" => (
+			wait_survey_catalog(),
+			SqlPlanner::new()
+				.plan("SELECT slow.id FROM slow")
+				.expect("plan slow scan"),
+		),
 		other => panic!("unknown probe case {other}"),
 	};
 	bind(&logical, catalog.as_ref(), &PlannerConfig::default())
@@ -4259,6 +4325,7 @@ fn run_evidence(run: &SchedulerRun) -> serde_json::Value {
 		"retry_count": run.telemetry.retry_count,
 		"dispatched": run.dispatched.iter().map(|identity| task_fields(identity.query_id, identity.stage_id.get(), identity.task_id.get(), identity.attempt_id)).collect::<Vec<_>>(),
 		"sealed_manifests": run.accepted_manifests.values().map(manifest_evidence).collect::<Vec<_>>(),
+		"recovery_events": recovery_events_evidence(&run.telemetry.recovery_events),
 		"task_telemetry": run.telemetry.task_telemetry.iter().map(|record| serde_json::json!({
 			"task": task_fields(record.identity.query_id, record.identity.stage_id.get(), record.identity.task_id.get(), record.identity.attempt_id),
 			"worker": record.worker_id.get().as_u128().to_string(),
@@ -4266,6 +4333,111 @@ fn run_evidence(run: &SchedulerRun) -> serde_json::Value {
 			"published_shuffle_bytes": record.telemetry.counters.published_shuffle_bytes,
 		})).collect::<Vec<_>>(),
 	})
+}
+
+/// ADR 626 Stage B: the scheduler's recovery events as typed evidence (its own clock).
+fn recovery_events_evidence(
+	events: &[toron::distributed::scheduler::RecoveryEvent],
+) -> serde_json::Value {
+	use toron::distributed::scheduler::RecoveryEventKind as K;
+	let id = |identity: &toron::distributed::identity::TaskIdentity| {
+		task_fields(
+			identity.query_id,
+			identity.stage_id.get(),
+			identity.task_id.get(),
+			identity.attempt_id,
+		)
+	};
+	let worker = |worker: &WorkerId| worker.get().as_u128().to_string();
+	events
+		.iter()
+		.map(|event| {
+			let (name, fields) = match &event.kind {
+				K::EstablishmentTimedOut {
+					worker: w,
+					task,
+					failure,
+				} => (
+					"establishment_timed_out",
+					serde_json::json!({ "worker": worker(w), "task": id(task), "failure": failure.to_string() }),
+				),
+				K::ReportAccepted {
+					consumer,
+					producer,
+					worker: w,
+				} => (
+					"report_accepted",
+					serde_json::json!({ "consumer": id(consumer), "producer": id(producer), "worker": worker(w) }),
+				),
+				K::ConfirmationStarted { query, worker: w } => (
+					"confirmation_started",
+					serde_json::json!({ "query": query.get().to_string(), "worker": worker(w) }),
+				),
+				K::ConfirmationEnded {
+					query,
+					worker: w,
+					outcome,
+				} => (
+					"confirmation_ended",
+					serde_json::json!({ "query": query.get().to_string(), "worker": worker(w), "outcome": confirmation_outcome_evidence(outcome) }),
+				),
+				K::ConfirmationDiscarded { query, worker: w } => (
+					"confirmation_discarded",
+					serde_json::json!({ "query": query.get().to_string(), "worker": worker(w) }),
+				),
+				K::Excluded { query, worker: w } => (
+					"excluded",
+					serde_json::json!({ "query": query.get().to_string(), "worker": worker(w) }),
+				),
+				K::LinkRetry { consumer, avoided } => (
+					"link_retry",
+					serde_json::json!({ "consumer": id(consumer), "avoided": worker(avoided) }),
+				),
+				K::Superseded { task } => ("superseded", serde_json::json!({ "task": id(task) })),
+				K::ReplayDispatched { task, worker: w } => (
+					"replay_dispatched",
+					serde_json::json!({ "task": id(task), "worker": worker(w) }),
+				),
+				K::StaleOutcome { task } => {
+					("stale_outcome", serde_json::json!({ "task": id(task) }))
+				}
+			};
+			serde_json::json!({ "event": name, "at_micros": event.at_micros, "fields": fields })
+		})
+		.collect::<Vec<_>>()
+		.into()
+}
+
+/// ADR 626 Stage C: a confirmation outcome as a typed kind plus its debug text.
+fn confirmation_outcome_evidence(
+	outcome: &toron::distributed::scheduler::ConfirmationOutcome,
+) -> serde_json::Value {
+	use toron::distributed::scheduler::ConfirmationOutcome as O;
+	let kind = match outcome {
+		O::Acknowledged { .. } => "acknowledged",
+		O::Liveness { .. } => "liveness",
+		O::Refused { .. } => "refused",
+		O::Unsupported => "unsupported",
+	};
+	serde_json::json!({ "kind": kind, "debug": format!("{outcome:?}") })
+}
+
+/// ADR 626 Stage C: a scheduler error's variant, so a terminal failure is typed by the record, not
+/// by parsing its debug text. Exhaustive: a new variant must be named here.
+fn scheduler_error_kind(error: &toron::distributed::scheduler::SchedulerError) -> &'static str {
+	use toron::distributed::scheduler::SchedulerError;
+	match error {
+		SchedulerError::NoLiveWorker => "no_live_worker",
+		SchedulerError::TaskFailed { .. } => "task_failed",
+		SchedulerError::NoProgress { .. } => "no_progress",
+		SchedulerError::PartitionManifestMismatch { .. } => "partition_manifest_mismatch",
+		SchedulerError::Acceptance(_) => "acceptance",
+		SchedulerError::ProtocolViolation { .. } => "protocol_violation",
+		SchedulerError::NoEligibleWorker { .. } => "no_eligible_worker",
+		SchedulerError::ReplacementLimit { .. } => "replacement_limit",
+		SchedulerError::ExclusionLimit { .. } => "exclusion_limit",
+		SchedulerError::ConfirmationRefused { .. } => "confirmation_refused",
+	}
 }
 
 fn probe_base_evidence(spec: &ProbeSpec, mode: &str) -> serde_json::Value {
@@ -4299,6 +4471,10 @@ fn dispatch_outcome_text(outcome: &toron::distributed::scheduler::DispatchOutcom
 		DispatchOutcome::Failed(kind) | DispatchOutcome::FailedWithTelemetry { kind, .. } => {
 			format!("failed: {kind:?}")
 		}
+		DispatchOutcome::WorkerUnreachable {
+			failure,
+			elapsed_micros,
+		} => format!("worker unreachable after {elapsed_micros} us: {failure}"),
 	}
 }
 
@@ -4341,6 +4517,30 @@ where
 		log.emit_at(ended, "dispatch_return", "dispatch", fields);
 		outcome
 	}
+
+	/// ADR 626: forwarded (never the default), so confirmations reach the real dispatcher.
+	async fn confirm_worker(
+		&self,
+		worker: &WorkerEntry,
+		deadline: std::time::Duration,
+	) -> toron::distributed::scheduler::ConfirmationOutcome {
+		let Some(log) = &self.log else {
+			return self.inner.confirm_worker(worker, deadline).await;
+		};
+		let fields = serde_json::json!({
+			"task": format!("confirm/{}", worker.worker_id.get().as_u128()),
+			"worker": worker.worker_id.get().as_u128().to_string(),
+		});
+		let started = log.now_us();
+		log.emit_at(started, "dispatch_start", "dispatch", fields.clone());
+		let outcome = self.inner.confirm_worker(worker, deadline).await;
+		let ended = log.now_us();
+		let mut fields = fields;
+		fields["elapsed_us"] = ended.saturating_sub(started).into();
+		fields["outcome"] = format!("{outcome:?}").into();
+		log.emit_at(ended, "dispatch_return", "dispatch", fields);
+		outcome
+	}
 }
 
 fn fresh_scheduler(
@@ -4351,12 +4551,17 @@ fn fresh_scheduler(
 	ObservedDispatcher<NetworkTaskDispatcher<Arc<dyn ToronTransport>>>,
 ) {
 	let registry = probe_registry(spec);
-	let scheduler = DistributedScheduler::new(registry.clone());
+	let mut scheduler = DistributedScheduler::new(registry.clone());
+	let mut network = NetworkTaskDispatcher::new(
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		spec.transport.clone(),
+	);
+	if let Some(experiment) = spec.recovery {
+		scheduler = scheduler.with_recovery_experiment(experiment);
+		network = network.with_recovery_experiment(experiment);
+	}
 	let dispatcher = ObservedDispatcher {
-		inner: NetworkTaskDispatcher::new(
-			Arc::new(MemoryManager::new(64, 1024 * 1024)),
-			spec.transport.clone(),
-		),
+		inner: network,
 		log: spec.wait_log.clone(),
 	};
 	(registry, scheduler, dispatcher)
@@ -4468,6 +4673,8 @@ async fn multinode_probe_query() {
 	)
 	.await;
 	evidence["dispatch_elapsed_ms"] = (started.elapsed().as_millis() as u64).into();
+	// ADR 626 Stage C: the scheduler's recovery events, whatever the outcome.
+	evidence["recovery_events"] = recovery_events_evidence(scheduler.recovery_events());
 	match outcome {
 		Ok(Ok(run)) => {
 			evidence["outcome"] = "completed".into();
@@ -4532,6 +4739,9 @@ async fn multinode_probe_worker_loss() {
 	.expect("fragment probe case");
 	let (_registry, mut scheduler, mut dispatcher) = fresh_scheduler(&spec);
 	let finish = |evidence: &mut serde_json::Value, outcome: &str| {
+		if spec.recovery.is_some() {
+			evidence["recovery_experiment"] = spec.raw["recovery"].clone();
+		}
 		if let Some(log) = &spec.wait_log {
 			log.emit(
 				"observation_end",
@@ -4666,6 +4876,9 @@ async fn multinode_probe_worker_loss() {
 	}
 	let confirmed = std::time::Instant::now();
 	evidence["kill_confirmed_unix_ms"] = (unix_ms() as u64).into();
+	// ADR 626 Stage C: the scheduler clock at the confirmed kill, so recovery events can be stated
+	// relative to it on one clock.
+	evidence["scheduler_clock_at_kill_micros"] = scheduler.recovery_clock_micros().into();
 	if let Some(log) = &spec.wait_log {
 		log.emit(
 			"victim_killed",
@@ -4706,7 +4919,11 @@ async fn multinode_probe_worker_loss() {
 			return finish(&mut evidence, "invalidation_does_not_name_the_victim");
 		};
 		evidence["replacement_attempt"] = bound_task.replacement_attempt.get().into();
-		match tokio::time::timeout(bound, scheduler.dispatch_loop(&stages, &mut dispatcher)).await {
+		let outcome =
+			tokio::time::timeout(bound, scheduler.dispatch_loop(&stages, &mut dispatcher)).await;
+		// ADR 626 Stage C: the scheduler's recovery events, whatever the outcome.
+		evidence["recovery_events"] = recovery_events_evidence(scheduler.recovery_events());
+		match outcome {
 			Ok(Ok(run)) => {
 				evidence["since_confirmed_kill_ms"] =
 					(confirmed.elapsed().as_millis() as u64).into();
@@ -4738,7 +4955,11 @@ async fn multinode_probe_worker_loss() {
 			Err(_) => finish(&mut evidence, "deadline"),
 		}
 	} else {
-		match tokio::time::timeout(bound, scheduler.dispatch_loop(&stages, &mut dispatcher)).await {
+		let outcome =
+			tokio::time::timeout(bound, scheduler.dispatch_loop(&stages, &mut dispatcher)).await;
+		// ADR 626 Stage C: the scheduler's recovery events, whatever the outcome.
+		evidence["recovery_events"] = recovery_events_evidence(scheduler.recovery_events());
+		match outcome {
 			Ok(Ok(run)) => {
 				evidence["since_confirmed_kill_ms"] =
 					(confirmed.elapsed().as_millis() as u64).into();
@@ -4749,6 +4970,7 @@ async fn multinode_probe_worker_loss() {
 				evidence["since_confirmed_kill_ms"] =
 					(confirmed.elapsed().as_millis() as u64).into();
 				evidence["error"] = format!("{error:?}").into();
+				evidence["error_kind"] = scheduler_error_kind(&error).into();
 				finish(&mut evidence, "error_within_bound");
 			}
 			Err(_) => finish(&mut evidence, "no_terminal_return_within_bound"),
@@ -4982,6 +5204,912 @@ async fn unannounced_loss_waits_are_observed_on_loopback() {
 			worker.shutdown().await;
 		}
 		write(&evidence);
+	})
+	.await;
+}
+
+// ---- ADR 626 Stage B: query-local recovery over loopback QUIC ----
+
+/// Fast experiment values for the local tests (the campaign uses the declared 5 s and 12 s).
+const ADR626_LOCAL_RECOVERY: (u64, u64) = (1_000, 3_000);
+/// The fixture's outcome deadline from the confirmed kill.
+const ADR626_R: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn adr626_workers(first_id: u128, recovery: Option<(u64, u64)>) -> Vec<FixtureWorkerProcess> {
+	let mut workers = Vec::new();
+	for id in first_id..first_id + 3 {
+		workers.push(
+			FixtureWorkerProcess::spawn_configured(WorkerId::from_u128(id), None, None, recovery)
+				.await,
+		);
+	}
+	workers
+}
+
+fn adr626_registry(workers: &[FixtureWorkerProcess]) -> Arc<RoundRobinRegistry> {
+	Arc::new(RoundRobinRegistry::new(
+		workers
+			.iter()
+			.map(|worker| worker_entry_for(worker.worker_id, worker.endpoint.clone())),
+		0,
+	))
+}
+
+async fn adr626_hash_join_stages() -> Vec<toron::distributed::scheduler::StagePlan> {
+	fragment_plan(
+		probe_case_plan("hash_join").await,
+		FragmentPlanConfig::new_for_test(
+			QueryId::new(),
+			TaskBudget::from_query_budget(QueryBudget::test_default()),
+		),
+	)
+	.expect("fragment hash join")
+}
+
+fn adr626_digest(run: &SchedulerRun) -> String {
+	format!(
+		"{:?}",
+		canonical_arrow_ipc_digest(&run.final_results, SortPolicy::FullRowLex).expect("digest")
+	)
+}
+
+/// The healthy reference digest for the hash-join fixture, on its own fresh workers.
+async fn adr626_reference_digest() -> String {
+	let mut workers = adr626_workers(62_650, None).await;
+	let mut scheduler = DistributedScheduler::new(adr626_registry(&workers));
+	let dispatcher = NetworkTaskDispatcher::new(
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		process_transport(),
+	);
+	let run = bounded(scheduler.dispatch_loop(&adr626_hash_join_stages().await, &dispatcher))
+		.await
+		.expect("reference");
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+	adr626_digest(&run)
+}
+
+fn adr626_event_names(run: &SchedulerRun) -> Vec<String> {
+	recovery_events_evidence(&run.telemetry.recovery_events)
+		.as_array()
+		.expect("events")
+		.iter()
+		.map(|event| event["event"].as_str().expect("name").to_string())
+		.collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unannounced_producer_loss_recovers_on_loopback() {
+	with_quic(async {
+		let reference = adr626_reference_digest().await;
+		let (establishment, confirmation) = ADR626_LOCAL_RECOVERY;
+		let experiment = toron::distributed::recovery::RecoveryExperiment::from_millis(
+			establishment,
+			confirmation,
+		)
+		.expect("experiment");
+		let mut workers = adr626_workers(62_660, Some(ADR626_LOCAL_RECOVERY)).await;
+		let mut scheduler = DistributedScheduler::new(adr626_registry(&workers))
+			.with_recovery_experiment(experiment);
+		let dispatcher = NetworkTaskDispatcher::new(
+			Arc::new(MemoryManager::new(64, 1024 * 1024)),
+			process_transport(),
+		)
+		.with_recovery_experiment(experiment);
+		let stages = adr626_hash_join_stages().await;
+		let producers = bounded(scheduler.dispatch_loop(&stages[..1], &dispatcher))
+			.await
+			.expect("producer stage");
+		let victim = producers
+			.accepted_manifests
+			.values()
+			.map(|manifest| manifest.producer_worker_id)
+			.min_by_key(|worker| worker.get().as_u128())
+			.expect("a sealed producer");
+		let victim_process = workers
+			.iter_mut()
+			.find(|worker| worker.worker_id == victim)
+			.expect("victim");
+		victim_process.child.kill().await.expect("SIGKILL");
+		let killed = std::time::Instant::now();
+		let run = tokio::time::timeout(ADR626_R, scheduler.dispatch_loop(&stages, &dispatcher))
+			.await
+			.expect("a terminal return within R")
+			.expect("recovered");
+		let elapsed = killed.elapsed();
+		assert_eq!(adr626_digest(&run), reference, "recovery is correct");
+		let events = adr626_event_names(&run);
+		for expected in [
+			"report_accepted",
+			"confirmation_started",
+			"confirmation_ended",
+			"excluded",
+			"replay_dispatched",
+		] {
+			assert!(
+				events.iter().any(|event| event == expected),
+				"{expected} missing: {events:?}"
+			);
+		}
+		assert!(
+			run.accepted_manifests
+				.values()
+				.all(|manifest| manifest.producer_worker_id != victim),
+			"no accepted output remains on the excluded worker"
+		);
+		assert!(elapsed < ADR626_R, "recovered in {elapsed:?}");
+		for worker in &mut workers {
+			worker.shutdown().await;
+		}
+	})
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_dispatch_target_is_excluded_on_loopback() {
+	with_quic(async {
+		let reference = adr626_reference_digest().await;
+		let (establishment, confirmation) = ADR626_LOCAL_RECOVERY;
+		let experiment = toron::distributed::recovery::RecoveryExperiment::from_millis(
+			establishment,
+			confirmation,
+		)
+		.expect("experiment");
+		let mut workers = adr626_workers(62_670, Some(ADR626_LOCAL_RECOVERY)).await;
+		let mut scheduler = DistributedScheduler::new(adr626_registry(&workers))
+			.with_recovery_experiment(experiment);
+		let dispatcher = NetworkTaskDispatcher::new(
+			Arc::new(MemoryManager::new(64, 1024 * 1024)),
+			process_transport(),
+		)
+		.with_recovery_experiment(experiment);
+		let stages = adr626_hash_join_stages().await;
+		let producers = bounded(scheduler.dispatch_loop(&stages[..1], &dispatcher))
+			.await
+			.expect("producer stage");
+		let holders = producers
+			.accepted_manifests
+			.values()
+			.map(|manifest| manifest.producer_worker_id)
+			.collect::<HashSet<_>>();
+		let victim = workers
+			.iter()
+			.map(|worker| worker.worker_id)
+			.filter(|worker| !holders.contains(worker))
+			.min_by_key(|worker| worker.get().as_u128())
+			.expect("a worker holding no manifest");
+		let victim_process = workers
+			.iter_mut()
+			.find(|worker| worker.worker_id == victim)
+			.expect("victim");
+		victim_process.child.kill().await.expect("SIGKILL");
+		let run = tokio::time::timeout(ADR626_R, scheduler.dispatch_loop(&stages, &dispatcher))
+			.await
+			.expect("a terminal return within R")
+			.expect("completed elsewhere");
+		assert_eq!(adr626_digest(&run), reference);
+		let events = adr626_event_names(&run);
+		assert!(
+			events
+				.iter()
+				.any(|event| event == "establishment_timed_out"),
+			"{events:?}"
+		);
+		assert!(events.iter().any(|event| event == "excluded"), "{events:?}");
+		assert!(
+			!events.iter().any(|event| event == "confirmation_started"),
+			"the dispatch path never confirms: {events:?}"
+		);
+		for worker in &mut workers {
+			worker.shutdown().await;
+		}
+	})
+	.await;
+}
+
+#[tokio::test]
+async fn an_invalid_recovery_experiment_refuses_to_start() {
+	for flags in [
+		[
+			"--recovery-establishment-ms",
+			"0",
+			"--recovery-confirmation-ms",
+			"100",
+		],
+		[
+			"--recovery-establishment-ms",
+			"500",
+			"--recovery-confirmation-ms",
+			"100",
+		],
+		[
+			"--recovery-establishment-ms",
+			"500",
+			"--recovery-confirmation-ms",
+			"300000",
+		],
+	] {
+		let mut args = vec!["--worker-u128", "62690", "--transport", "quic"];
+		args.extend(flags);
+		let (ok, stdout, _) = fixture_worker_exit(&args).await;
+		assert!(
+			!ok && !stdout.contains("READY"),
+			"{flags:?} must refuse to start"
+		);
+	}
+	let (ok, _, _) = fixture_worker_exit(&[
+		"--worker-u128",
+		"62691",
+		"--transport",
+		"quic",
+		"--recovery-establishment-ms",
+		"500",
+	])
+	.await;
+	assert!(!ok, "the two values go together");
+}
+
+// ---- ADR 626 Stage C: local controls (relay, long silence) ----
+
+/// The declared experiment values the controls run at.
+const ADR626_DECLARED: (u64, u64) = (5_000, 12_000);
+
+/// A test-only, unprivileged UDP relay in front of one worker. Every datagram in either
+/// direction is delayed by `delay` and dropped with probability `loss_per_mille / 1000` from a
+/// seeded generator; `blackhole` drops everything. The seed fixes the generator, not a packet-by-
+/// packet schedule (arrival order is concurrent), so the realized counts per direction are kept.
+///
+/// Every task the relay runs (the listener loop, one reader per client, one delayed sender per
+/// direction) is owned by one supervisor's `JoinSet`. `shutdown` aborts and drains all of them,
+/// so no forwarding outlives it and its sockets, the listener's port included, are released;
+/// `live` counts the tasks still running, for the lifecycle fixture.
+struct UdpRelay {
+	addr: std::net::SocketAddr,
+	blackhole: Arc<std::sync::atomic::AtomicBool>,
+	counts: Arc<RelayCounts>,
+	live: Arc<std::sync::atomic::AtomicUsize>,
+	stop: Option<tokio::sync::oneshot::Sender<()>>,
+	supervisor: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Per direction: `admitted` datagrams passed the loss draw and entered the delay queue; `dropped`
+/// did not; `sent` left the relay's socket (`send` returned Ok). Queued work aborted at shutdown is
+/// admitted but never sent. A send is not proof of delivery.
+#[derive(Default)]
+struct RelayCounts {
+	to_worker_admitted: std::sync::atomic::AtomicU64,
+	to_worker_dropped: std::sync::atomic::AtomicU64,
+	to_worker_sent: std::sync::atomic::AtomicU64,
+	to_client_admitted: std::sync::atomic::AtomicU64,
+	to_client_dropped: std::sync::atomic::AtomicU64,
+	to_client_sent: std::sync::atomic::AtomicU64,
+}
+
+impl RelayCounts {
+	fn evidence(&self) -> serde_json::Value {
+		use std::sync::atomic::Ordering::SeqCst;
+		serde_json::json!({
+			"to_worker": { "admitted": self.to_worker_admitted.load(SeqCst), "dropped": self.to_worker_dropped.load(SeqCst), "sent": self.to_worker_sent.load(SeqCst) },
+			"to_client": { "admitted": self.to_client_admitted.load(SeqCst), "dropped": self.to_client_dropped.load(SeqCst), "sent": self.to_client_sent.load(SeqCst) },
+		})
+	}
+}
+
+/// Decrements the relay's live-task count when its task ends or is aborted.
+struct LiveTask(Arc<std::sync::atomic::AtomicUsize>);
+
+impl LiveTask {
+	fn enter(live: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+		live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		Self(live.clone())
+	}
+}
+
+impl Drop for LiveTask {
+	fn drop(&mut self) {
+		self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+	}
+}
+
+impl UdpRelay {
+	async fn start(
+		target: std::net::SocketAddr,
+		delay: std::time::Duration,
+		loss_per_mille: u64,
+		seed: u64,
+	) -> Self {
+		use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+		let listener = Arc::new(
+			tokio::net::UdpSocket::bind("127.0.0.1:0")
+				.await
+				.expect("relay bind"),
+		);
+		let addr = listener.local_addr().expect("relay addr");
+		let blackhole = Arc::new(AtomicBool::new(false));
+		let counts = Arc::new(RelayCounts::default());
+		let live = Arc::new(AtomicUsize::new(0));
+		let rng = Arc::new(Mutex::new(seed.max(1)));
+		let pass = {
+			let (blackhole, rng) = (blackhole.clone(), rng.clone());
+			move |admitted: &AtomicU64, dropped: &AtomicU64| {
+				if blackhole.load(Ordering::SeqCst) {
+					dropped.fetch_add(1, Ordering::SeqCst);
+					return false;
+				}
+				// xorshift64: deterministic for a seed.
+				let mut state = rng.lock().expect("rng");
+				*state ^= *state << 13;
+				*state ^= *state >> 7;
+				*state ^= *state << 17;
+				if *state % 1000 < loss_per_mille {
+					dropped.fetch_add(1, Ordering::SeqCst);
+					false
+				} else {
+					admitted.fetch_add(1, Ordering::SeqCst);
+					true
+				}
+			}
+		};
+		let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+		let supervisor = {
+			let (counts, live) = (counts.clone(), live.clone());
+			tokio::spawn(async move {
+				let _live = LiveTask::enter(&live);
+				let mut tasks = tokio::task::JoinSet::new();
+				// One delayed sender per direction; the delay is constant, so FIFO keeps deadlines.
+				let (to_worker, mut to_worker_queue) = tokio::sync::mpsc::unbounded_channel::<(
+					tokio::time::Instant,
+					Vec<u8>,
+					Arc<tokio::net::UdpSocket>,
+				)>();
+				let (to_client, mut to_client_queue) = tokio::sync::mpsc::unbounded_channel::<(
+					tokio::time::Instant,
+					Vec<u8>,
+					std::net::SocketAddr,
+				)>();
+				{
+					let (live, counts) = (live.clone(), counts.clone());
+					tasks.spawn(async move {
+						let _live = LiveTask::enter(&live);
+						while let Some((due, bytes, upstream)) = to_worker_queue.recv().await {
+							tokio::time::sleep_until(due).await;
+							if upstream.send(&bytes).await.is_ok() {
+								counts
+									.to_worker_sent
+									.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+							}
+						}
+					});
+				}
+				{
+					let (live, listener, counts) = (live.clone(), listener.clone(), counts.clone());
+					tasks.spawn(async move {
+						let _live = LiveTask::enter(&live);
+						while let Some((due, bytes, client)) = to_client_queue.recv().await {
+							tokio::time::sleep_until(due).await;
+							if listener.send_to(&bytes, client).await.is_ok() {
+								counts
+									.to_client_sent
+									.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+							}
+						}
+					});
+				}
+				let mut upstreams =
+					HashMap::<std::net::SocketAddr, Arc<tokio::net::UdpSocket>>::new();
+				let mut buf = vec![0u8; 65_535];
+				loop {
+					let (len, client) = tokio::select! {
+						_ = &mut stopped => break,
+						received = listener.recv_from(&mut buf) => match received {
+							Ok(received) => received,
+							Err(_) => break,
+						},
+					};
+					let upstream = match upstreams.get(&client) {
+						Some(upstream) => upstream.clone(),
+						None => {
+							let upstream = Arc::new(
+								tokio::net::UdpSocket::bind("127.0.0.1:0")
+									.await
+									.expect("upstream bind"),
+							);
+							upstream.connect(target).await.expect("upstream connect");
+							upstreams.insert(client, upstream.clone());
+							let (live, reader, to_client, counts, pass) = (
+								live.clone(),
+								upstream.clone(),
+								to_client.clone(),
+								counts.clone(),
+								pass.clone(),
+							);
+							tasks.spawn(async move {
+								let _live = LiveTask::enter(&live);
+								let mut reply = vec![0u8; 65_535];
+								while let Ok(len) = reader.recv(&mut reply).await {
+									if pass(&counts.to_client_admitted, &counts.to_client_dropped) {
+										let _ = to_client.send((
+											tokio::time::Instant::now() + delay,
+											reply[..len].to_vec(),
+											client,
+										));
+									}
+								}
+							});
+							upstream
+						}
+					};
+					if pass(&counts.to_worker_admitted, &counts.to_worker_dropped) {
+						let _ = to_worker.send((
+							tokio::time::Instant::now() + delay,
+							buf[..len].to_vec(),
+							upstream,
+						));
+					}
+				}
+				// Retire every child before returning; their sockets drop with them.
+				tasks.abort_all();
+				while tasks.join_next().await.is_some() {}
+			})
+		};
+		Self {
+			addr,
+			blackhole,
+			counts,
+			live,
+			stop: Some(stop),
+			supervisor: Some(supervisor),
+		}
+	}
+
+	fn blackhole(&self) {
+		self.blackhole
+			.store(true, std::sync::atomic::Ordering::SeqCst);
+	}
+
+	/// Stops the relay and waits until every task it owns has ended; returns the realized counts.
+	async fn shutdown(mut self) -> serde_json::Value {
+		if let Some(stop) = self.stop.take() {
+			let _ = stop.send(());
+		}
+		if let Some(supervisor) = self.supervisor.take() {
+			supervisor.await.expect("relay supervisor");
+		}
+		self.counts.evidence()
+	}
+}
+
+impl Drop for UdpRelay {
+	/// A relay dropped without `shutdown` (a failed assertion) is still aborted: the supervisor's
+	/// `JoinSet` aborts every child when it drops.
+	fn drop(&mut self) {
+		if let Some(supervisor) = self.supervisor.take() {
+			supervisor.abort();
+		}
+	}
+}
+
+/// Test-support lifecycle: after `shutdown`, no relay task remains, nothing queued is delivered
+/// late, the listener's port can be bound again, and the test's own endpoints stay open. Repeated
+/// to catch accumulation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shut_down_relay_retires_every_task_and_releases_its_port() {
+	for round in 0..3 {
+		let target = tokio::net::UdpSocket::bind("127.0.0.1:0")
+			.await
+			.expect("target");
+		let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
+			.await
+			.expect("client");
+		let relay = UdpRelay::start(
+			target.local_addr().expect("target addr"),
+			std::time::Duration::from_millis(200),
+			0,
+			626,
+		)
+		.await;
+		let (addr, live) = (relay.addr, relay.live.clone());
+		client.send_to(b"first", addr).await.expect("send");
+		let mut buf = [0u8; 64];
+		let (len, relay_side) = tokio::time::timeout(
+			std::time::Duration::from_secs(5),
+			target.recv_from(&mut buf),
+		)
+		.await
+		.expect("forwarded within 5 s")
+		.expect("recv");
+		assert_eq!(&buf[..len], b"first");
+		target.send_to(b"reply", relay_side).await.expect("reply");
+		let (len, _) = tokio::time::timeout(
+			std::time::Duration::from_secs(5),
+			client.recv_from(&mut buf),
+		)
+		.await
+		.expect("reply within 5 s")
+		.expect("recv");
+		assert_eq!(&buf[..len], b"reply");
+		// Queue work that is still delayed when the relay stops, in both directions.
+		client.send_to(b"late", addr).await.expect("send late");
+		target
+			.send_to(b"late reply", relay_side)
+			.await
+			.expect("late reply");
+		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		assert!(
+			live.load(std::sync::atomic::Ordering::SeqCst) >= 4,
+			"round {round}: supervisor, two senders, one reader"
+		);
+		let counts = relay.shutdown().await;
+		assert_eq!(
+			live.load(std::sync::atomic::Ordering::SeqCst),
+			0,
+			"round {round}: a relay task outlived shutdown"
+		);
+		// Two admitted per direction; only the first was sent, the queued one was retired unsent.
+		for direction in ["to_worker", "to_client"] {
+			assert_eq!(counts[direction]["admitted"], 2, "{counts}");
+			assert_eq!(counts[direction]["sent"], 1, "{counts}");
+		}
+		let quiet = std::time::Duration::from_millis(500);
+		assert!(
+			tokio::time::timeout(quiet, target.recv_from(&mut buf))
+				.await
+				.is_err(),
+			"round {round}: a queued datagram reached the worker after shutdown"
+		);
+		assert!(
+			tokio::time::timeout(quiet, client.recv_from(&mut buf))
+				.await
+				.is_err(),
+			"round {round}: a queued reply reached the client after shutdown"
+		);
+		drop(std::net::UdpSocket::bind(addr).expect("the relay's port is released"));
+		// The test's own endpoints were not closed by the relay.
+		client
+			.send_to(b"still open", target.local_addr().expect("addr"))
+			.await
+			.expect("client open");
+		let (len, _) = target.recv_from(&mut buf).await.expect("target open");
+		assert_eq!(&buf[..len], b"still open");
+	}
+}
+
+fn free_loopback_port() -> std::net::SocketAddr {
+	let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe a free port");
+	socket.local_addr().expect("free port")
+}
+
+/// Three QUIC loopback workers with the declared experiment; the first sits behind `relay`.
+async fn relayed_cluster(
+	first_id: u128,
+	delay: std::time::Duration,
+	loss_per_mille: u64,
+	seed: u64,
+) -> (Vec<FixtureWorkerProcess>, UdpRelay, Vec<WorkerEntry>) {
+	let behind = free_loopback_port();
+	let relay = UdpRelay::start(behind, delay, loss_per_mille, seed).await;
+	let mut workers = vec![
+		FixtureWorkerProcess::spawn_loopback_relayed(
+			WorkerId::from_u128(first_id),
+			behind,
+			relay.addr,
+			ADR626_DECLARED,
+		)
+		.await,
+	];
+	for id in first_id + 1..first_id + 3 {
+		workers.push(
+			FixtureWorkerProcess::spawn_configured(
+				WorkerId::from_u128(id),
+				None,
+				None,
+				Some(ADR626_DECLARED),
+			)
+			.await,
+		);
+	}
+	let entries = workers
+		.iter()
+		.map(|worker| worker_entry_for(worker.worker_id, worker.endpoint.clone()))
+		.collect();
+	(workers, relay, entries)
+}
+
+fn declared_experiment() -> toron::distributed::recovery::RecoveryExperiment {
+	toron::distributed::recovery::RecoveryExperiment::from_millis(
+		ADR626_DECLARED.0,
+		ADR626_DECLARED.1,
+	)
+	.expect("declared")
+}
+
+fn write_control_evidence(name: &str, evidence: &serde_json::Value) {
+	let Ok(dir) = std::env::var("TORON_ADR626_CONTROL_DIR") else {
+		return;
+	};
+	use std::io::Write as _;
+	std::fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(std::path::Path::new(&dir).join(format!("{name}.json")))
+		.expect("fresh control evidence")
+		.write_all(
+			serde_json::to_string_pretty(evidence)
+				.expect("json")
+				.as_bytes(),
+		)
+		.expect("write control evidence");
+}
+
+/// Confirmation intervals per (query, worker), from the scheduler's ordered events: each
+/// `confirmation_started` opens one, its `confirmation_ended` closes it. A start while one is open
+/// for the same pair is an overlap. Each interval lists the distinct consumer reports bound to it:
+/// `report_accepted` naming its worker since the previous interval closed. A coordinator dispatch
+/// timeout (`establishment_timed_out`) excludes its target directly, without a confirmation, so it
+/// never binds to one. Coalescing is "observed" only if an interval has two reports.
+fn confirmation_intervals(events: &serde_json::Value) -> serde_json::Value {
+	let mut open = HashMap::<(String, String), serde_json::Value>::new();
+	let mut pending = HashMap::<(String, String), Vec<serde_json::Value>>::new();
+	let (mut closed, mut overlapping, mut unclosed) = (Vec::new(), Vec::new(), Vec::new());
+	for (index, event) in events.as_array().expect("events").iter().enumerate() {
+		let fields = &event["fields"];
+		let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_string();
+		match event["event"].as_str().unwrap_or_default() {
+			"report_accepted" => pending
+				.entry((text(&fields["consumer"]["query"]), text(&fields["worker"])))
+				.or_default()
+				.push(serde_json::json!({ "index": index, "kind": "report_accepted", "consumer": fields["consumer"], "producer": fields["producer"] })),
+			"confirmation_started" => {
+				let pair = (text(&fields["query"]), text(&fields["worker"]));
+				if open.contains_key(&pair) {
+					overlapping.push(serde_json::json!({ "query": pair.0, "worker": pair.1, "index": index }));
+				} else {
+					open.insert(pair, serde_json::json!({ "started_index": index, "started_at_micros": event["at_micros"] }));
+				}
+			}
+			"confirmation_ended" => {
+				let pair = (text(&fields["query"]), text(&fields["worker"]));
+				if let Some(mut interval) = open.remove(&pair) {
+					let reports = pending.remove(&pair).unwrap_or_default();
+					interval["query"] = pair.0.into();
+					interval["worker"] = pair.1.into();
+					interval["ended_index"] = index.into();
+					interval["ended_at_micros"] = event["at_micros"].clone();
+					interval["outcome"] = fields["outcome"].clone();
+					interval["report_count"] = reports.len().into();
+					interval["reports"] = reports.into();
+					closed.push(interval);
+				}
+			}
+			_ => {}
+		}
+	}
+	for ((query, worker), interval) in open {
+		unclosed
+			.push(serde_json::json!({ "query": query, "worker": worker, "interval": interval }));
+	}
+	let coalescing = if closed
+		.iter()
+		.any(|interval| interval["report_count"].as_u64() >= Some(2))
+	{
+		"observed"
+	} else {
+		"single-report coverage; coalescing rests on the unit fixture simultaneous_reports_of_one_worker_share_one_confirmation"
+	};
+	serde_json::json!({ "intervals": closed, "overlapping": overlapping, "unclosed": unclosed, "coalescing": coalescing })
+}
+
+/// Below `H`: a relay adding 300 ms each way and 5% seeded loss in front of one worker. Every
+/// establishment and pull through it is slower but healthy: no suspicion, parity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ADR 626 Stage C control: run explicitly; TORON_ADR626_CONTROL_DIR keeps its evidence"]
+async fn relay_control_below_h_raises_no_suspicion() {
+	with_quic(async {
+		let reference = adr626_reference_digest().await;
+		let (delay, loss, seed) = (std::time::Duration::from_millis(300), 50, 626);
+		let (mut workers, relay, entries) = relayed_cluster(62_700, delay, loss, seed).await;
+		let relayed = entries[0].worker_id;
+		let entry_ids = entries
+			.iter()
+			.map(|entry| entry.worker_id.get().as_u128().to_string())
+			.collect::<Vec<_>>();
+		// The actual establishment through the relay, measured.
+		let probe = toron::quic::QuicEndpoint::client_loopback().expect("client");
+		let started = std::time::Instant::now();
+		let established = tokio::time::timeout(
+			std::time::Duration::from_secs(5),
+			probe.connect_stream(relay.addr),
+		)
+		.await;
+		let establishment_ms = started.elapsed().as_millis() as u64;
+		assert!(
+			matches!(established, Ok(Ok(_))),
+			"establishment through the relay below H"
+		);
+		let registry = Arc::new(RoundRobinRegistry::new(entries, 0));
+		let mut scheduler =
+			DistributedScheduler::new(registry).with_recovery_experiment(declared_experiment());
+		let dispatcher = NetworkTaskDispatcher::new(
+			Arc::new(MemoryManager::new(64, 1024 * 1024)),
+			process_transport(),
+		)
+		.with_recovery_experiment(declared_experiment());
+		let started = std::time::Instant::now();
+		let run = tokio::time::timeout(
+			ADR626_R,
+			scheduler.dispatch_loop(&adr626_hash_join_stages().await, &dispatcher),
+		)
+		.await
+		.expect("within R")
+		.expect("healthy through the relay");
+		let elapsed_ms = started.elapsed().as_millis() as u64;
+		let counts = relay.shutdown().await;
+		write_control_evidence(
+			"relay-below-h",
+			&serde_json::json!({
+				"relay": {"delay_ms_each_way": 300, "loss_per_mille": loss, "seed": seed, "realized": counts},
+				"relayed_worker": relayed.get().as_u128().to_string(),
+				"workers": entry_ids,
+				"experiment": {"establishment_ms": ADR626_DECLARED.0, "confirmation_ms": ADR626_DECLARED.1},
+				"establishment_through_relay_ms": establishment_ms,
+				"query_elapsed_ms": elapsed_ms,
+				"digest_equals_reference": adr626_digest(&run) == reference,
+				"recovery_events": recovery_events_evidence(&run.telemetry.recovery_events),
+			}),
+		);
+		assert_eq!(adr626_digest(&run), reference);
+		assert!(
+			run.telemetry.recovery_events.is_empty(),
+			"no suspicion below H: {:?}",
+			run.telemetry.recovery_events
+		);
+		let realized =
+			|direction: &str, what: &str| counts[direction][what].as_u64().expect("count");
+		assert!(
+			["to_worker", "to_client"]
+				.iter()
+				.all(|d| realized(d, "sent") > 0)
+				&& realized("to_worker", "dropped") + realized("to_client", "dropped") > 0,
+			"the relay delayed and dropped: {counts}"
+		);
+		for worker in &mut workers {
+			worker.shutdown().await;
+		}
+	})
+	.await;
+}
+
+/// Past `H` on both paths: once the producer stage has sealed on the relayed worker, the relay
+/// drops everything. Consumers' pulls and the coordinator's confirmation both go through it.
+/// The one declared outcome: the query recovers within `R` at parity with the reference, every
+/// suspicion and the one exclusion name the relayed worker, and no two confirmations of one
+/// (query, worker) overlap. Coalescing is claimed only if two reports actually joined one
+/// confirmation; otherwise the evidence says single-report coverage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ADR 626 Stage C control: run explicitly; TORON_ADR626_CONTROL_DIR keeps its evidence"]
+async fn relay_control_past_h_on_both_paths_excludes_only_the_relayed_worker() {
+	with_quic(async {
+		let reference = adr626_reference_digest().await;
+		let (delay, loss, seed) = (std::time::Duration::from_millis(50), 0, 626);
+		let (mut workers, relay, entries) = relayed_cluster(62_710, delay, loss, seed).await;
+		let relayed = entries[0].worker_id;
+		let entry_ids = entries.iter().map(|entry| entry.worker_id.get().as_u128().to_string()).collect::<Vec<_>>();
+		let registry = Arc::new(RoundRobinRegistry::new(entries, 0));
+		let mut scheduler = DistributedScheduler::new(registry).with_recovery_experiment(declared_experiment());
+		let dispatcher = NetworkTaskDispatcher::new(Arc::new(MemoryManager::new(64, 1024 * 1024)), process_transport())
+			.with_recovery_experiment(declared_experiment());
+		let stages = adr626_hash_join_stages().await;
+		let producers = bounded(scheduler.dispatch_loop(&stages[..1], &dispatcher)).await.expect("producer stage");
+		assert!(
+			producers.accepted_manifests.values().any(|manifest| manifest.producer_worker_id == relayed),
+			"a producer sealed behind the relay"
+		);
+		relay.blackhole();
+		let cut = scheduler.recovery_clock_micros();
+		let started = std::time::Instant::now();
+		let outcome = tokio::time::timeout(ADR626_R, scheduler.dispatch_loop(&stages, &dispatcher)).await;
+		let elapsed_ms = started.elapsed().as_millis() as u64;
+		let events = recovery_events_evidence(scheduler.recovery_events());
+		let names = events.as_array().expect("events").iter().map(|e| e["event"].as_str().expect("name").to_string()).collect::<Vec<_>>();
+		let counts = relay.shutdown().await;
+		let intervals = confirmation_intervals(&events);
+		let digest_matches = matches!(&outcome, Ok(Ok(run)) if adr626_digest(run) == reference);
+		write_control_evidence("relay-past-h", &serde_json::json!({
+			"relay": {"delay_ms_each_way": 50, "loss_per_mille": loss, "seed": seed, "blackholed_after_producer_stage": true, "realized": counts},
+			"relayed_worker": relayed.get().as_u128().to_string(),
+			"workers": entry_ids,
+			"experiment": {"establishment_ms": ADR626_DECLARED.0, "confirmation_ms": ADR626_DECLARED.1},
+			"declared_outcome": "recovered within R at reference parity",
+			"outcome": match &outcome { Ok(Ok(_)) => "recovered".to_string(), Ok(Err(error)) => format!("error: {error:?}"), Err(_) => "no terminal return within R".to_string() },
+			"scheduler_clock_at_cut_micros": cut,
+			"elapsed_from_cut_ms": elapsed_ms,
+			"digest_equals_reference": digest_matches,
+			"confirmation_intervals": intervals,
+			"recovery_events": events,
+		}));
+		assert!(digest_matches, "the declared outcome: recovered within R at parity: {:?}", outcome.as_ref().map(|r| r.as_ref().err()));
+		assert_eq!(intervals["overlapping"], serde_json::json!([]), "{intervals}");
+		// Part 5: "exactly one suspicion" is not asserted under retransmission and concurrency.
+		// Every suspicion and the one exclusion name the relayed worker.
+		let relayed_name = relayed.get().as_u128().to_string();
+		let named = |event: &str| {
+			events.as_array().expect("events").iter().filter(|e| e["event"] == event).map(|e| e["fields"]["worker"].as_str().expect("worker").to_string()).collect::<Vec<_>>()
+		};
+		let started_for = named("confirmation_started");
+		assert!(!started_for.is_empty() && started_for.iter().all(|w| *w == relayed_name), "{names:?}");
+		assert_eq!(named("excluded"), vec![relayed_name.clone()], "only the relayed worker is excluded: {names:?}");
+		for expected in ["report_accepted", "confirmation_ended", "excluded", "replay_dispatched"] {
+			assert!(names.iter().any(|name| name == expected), "{expected}: {names:?}");
+		}
+		assert!(elapsed_ms < ADR626_R.as_millis() as u64);
+		for worker in &mut workers {
+			worker.shutdown().await;
+		}
+	})
+	.await;
+}
+
+/// A healthy execution that stays silent longer than `H`: `H` bounds establishment only, so the
+/// query completes with no suspicion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_silent_healthy_execution_outlasts_h() {
+	with_quic(async {
+		let mut workers = adr626_workers(62_720, Some(ADR626_LOCAL_RECOVERY)).await;
+		let experiment = toron::distributed::recovery::RecoveryExperiment::from_millis(
+			ADR626_LOCAL_RECOVERY.0,
+			ADR626_LOCAL_RECOVERY.1,
+		)
+		.expect("experiment");
+		let mut scheduler = DistributedScheduler::new(adr626_registry(&workers))
+			.with_recovery_experiment(experiment);
+		let dispatcher = NetworkTaskDispatcher::new(
+			Arc::new(MemoryManager::new(64, 1024 * 1024)),
+			process_transport(),
+		)
+		.with_recovery_experiment(experiment);
+		let stages = fragment_plan(
+			probe_case_plan("slow_scan").await,
+			FragmentPlanConfig::new_for_test(
+				QueryId::new(),
+				TaskBudget::from_query_budget(QueryBudget::test_default()),
+			),
+		)
+		.expect("fragment slow scan");
+		let started = std::time::Instant::now();
+		let run = tokio::time::timeout(ADR626_R, scheduler.dispatch_loop(&stages, &dispatcher))
+			.await
+			.expect("within R")
+			.expect("completes");
+		let elapsed = started.elapsed();
+		let rows = run
+			.final_results
+			.iter()
+			.map(RecordBatch::num_rows)
+			.sum::<usize>();
+		write_control_evidence(
+			"long-silence",
+			&serde_json::json!({
+				"experiment": {"establishment_ms": ADR626_LOCAL_RECOVERY.0, "confirmation_ms": ADR626_LOCAL_RECOVERY.1},
+				"case": "slow_scan",
+				"query_elapsed_ms": elapsed.as_millis() as u64,
+				"row_count": rows,
+				"recovery_events": recovery_events_evidence(&run.telemetry.recovery_events),
+			}),
+		);
+		assert!(
+			elapsed > std::time::Duration::from_millis(ADR626_LOCAL_RECOVERY.0),
+			"silent for longer than H: {elapsed:?}"
+		);
+		assert!(
+			run.telemetry.recovery_events.is_empty(),
+			"{:?}",
+			run.telemetry.recovery_events
+		);
+		assert!(rows > 0);
+		for worker in &mut workers {
+			worker.shutdown().await;
+		}
 	})
 	.await;
 }

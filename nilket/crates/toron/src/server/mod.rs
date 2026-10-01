@@ -3,7 +3,7 @@ pub mod spill;
 pub mod transport;
 
 use self::memory::MemoryManager;
-use self::transport::ToronTransport;
+use self::transport::{ToronStream, ToronTransport};
 use crate::audit::{
 	ToronAuditEmitter, ToronAuditEvent, WorkerTaskAuditFields, worker_task_error_class,
 };
@@ -20,7 +20,7 @@ use crate::distributed::partition_store::{
 	DEFAULT_WORKER_LOST_AFTER, InMemoryPartitionStore, PartitionPayload, PartitionStore,
 	PartitionStoreError,
 };
-use crate::distributed::scheduler::{DispatchOutcome, TaskDispatcher};
+use crate::distributed::scheduler::{ConfirmationOutcome, DispatchOutcome, TaskDispatcher};
 use crate::distributed::task::{
 	ArrowIpcDigest, LiveProducerPartitionRef, PartitionAddress, PartitionBackend, PartitionCount,
 	PartitionEntry, PartitionManifest, RowCount, ShufflePartitionRef, ShuffleRoutingObservation,
@@ -77,6 +77,9 @@ pub struct ToronWorker {
 	/// Dials producer workers for sealed shuffle pulls, by the producer's identity and endpoint.
 	/// TCP unless the owner injects its own transport (a daemon shares its QUIC transport).
 	peer_transport: Arc<dyn ToronTransport>,
+	/// ADR 626: the recovery experiment's establishment deadline for sealed pulls. `None` (the
+	/// default) leaves the pull path exactly as before.
+	recovery: Option<crate::distributed::recovery::RecoveryExperiment>,
 }
 
 /// Order-independent digest of the evaluated join-key values in a batch, defined only for
@@ -216,6 +219,7 @@ impl ToronWorker {
 			shuffle_routing_observations: false,
 			shuffle_routing_log: Arc::new(std::sync::Mutex::new(Vec::new())),
 			peer_transport: Arc::new(self::transport::TcpTransport::new()),
+			recovery: None,
 		}
 	}
 
@@ -223,6 +227,65 @@ impl ToronWorker {
 	pub fn with_peer_transport(mut self, transport: Arc<dyn ToronTransport>) -> Self {
 		self.peer_transport = transport;
 		self
+	}
+
+	/// ADR 626: enable the unannounced-loss recovery experiment. A sealed pull's establishment is
+	/// then bounded by `H`; a liveness failure is reported as `ProducerUnreachable` for the
+	/// scheduler to bind and confirm, and a refusal as `PeerRefused`.
+	pub fn with_recovery_experiment(
+		mut self,
+		experiment: crate::distributed::recovery::RecoveryExperiment,
+	) -> Self {
+		self.recovery = Some(experiment);
+		self
+	}
+
+	/// Dials a sealed partition's producer. With the recovery experiment, establishment is bounded
+	/// by `H` and its failure is typed; without it, the dial is exactly as before.
+	async fn dial_sealed_producer(
+		&self,
+		partition: &crate::distributed::task::ProducerPartitionRef,
+	) -> Result<Box<dyn ToronStream>, QueryError> {
+		let Some(experiment) = self.recovery else {
+			return self
+				.peer_transport
+				.connect_peer(&partition.worker_id, &partition.endpoint)
+				.await;
+		};
+		let started = Instant::now();
+		let failure = match tokio::time::timeout(
+			experiment.establishment_deadline(),
+			self.peer_transport
+				.connect_peer(&partition.worker_id, &partition.endpoint),
+		)
+		.await
+		{
+			Ok(Ok(stream)) => return Ok(stream),
+			Ok(Err(error)) => match crate::quic::establishment_failure(&error) {
+				Some(failure) => failure.clone(),
+				// Not an establishment failure (for example a TCP or loopback error): unchanged.
+				None => return Err(error),
+			},
+			Err(_) => crate::error::EstablishmentFailure::DeadlineExpired {
+				deadline_millis: experiment.establishment_deadline_millis(),
+			},
+		};
+		let kind = if failure.is_liveness() {
+			TaskFailureKind::ProducerUnreachable {
+				producer_worker: partition.worker_id,
+				producer_endpoint: partition.endpoint.as_str().to_string(),
+				address: partition.address,
+				failure,
+				elapsed_micros: duration_micros(started),
+			}
+		} else {
+			TaskFailureKind::PeerRefused {
+				peer_worker: partition.worker_id,
+				peer_endpoint: partition.endpoint.as_str().to_string(),
+				failure,
+			}
+		};
+		Err(QueryError::Runtime(RuntimeError::TaskFailure { kind }))
 	}
 
 	/// Enable observe-only shuffle routing receipts. Diagnostic only: it changes no
@@ -506,10 +569,7 @@ impl ToronWorker {
 						.to_string(),
 				});
 			};
-			let stream = self
-				.peer_transport
-				.connect_peer(&partition.worker_id, &partition.endpoint)
-				.await?;
+			let stream = self.dial_sealed_producer(partition).await?;
 			let payload = coordinator
 				.pull_partition_from_worker(stream, partition.address, partition.address.attempt_id)
 				.await?;
@@ -1821,6 +1881,403 @@ mod tests {
 			)],
 			"one dial, to the producer's worker id and endpoint, and no retry"
 		);
+	}
+
+	// ---- ADR 626 Stage B: the bounded, typed sealed pull and the confirmation exchange ----
+
+	/// A peer transport whose dial is scripted: never resolves, or fails with a given error.
+	struct ScriptedPeerTransport {
+		failure: Option<fn() -> QueryError>,
+	}
+
+	#[async_trait::async_trait]
+	impl ToronTransport for ScriptedPeerTransport {
+		async fn connect(
+			&self,
+			address: &str,
+		) -> Result<Box<dyn self::transport::ToronStream>, QueryError> {
+			panic!("sealed pull dialed {address} without the producer's identity");
+		}
+
+		async fn connect_peer(
+			&self,
+			_worker_id: &WorkerId,
+			_endpoint: &WorkerEndpoint,
+		) -> Result<Box<dyn self::transport::ToronStream>, QueryError> {
+			match self.failure {
+				Some(failure) => Err(failure()),
+				None => std::future::pending().await,
+			}
+		}
+	}
+
+	fn adr626_producer() -> ProducerPartitionRef {
+		ProducerPartitionRef {
+			address: PartitionAddress {
+				query_id: QueryId::from_u128(1),
+				exchange_id: ExchangeId::new(0),
+				producer_stage_id: StageId::new(0),
+				producer_task_id: TaskId::new(3),
+				attempt_id: AttemptId::new(1),
+				partition_id: PartitionId::new(2),
+			},
+			worker_id: WorkerId::from_u128(42),
+			endpoint: WorkerEndpoint::new("192.0.2.42:7000"),
+			size_bytes: ByteCount::new(8),
+			digest: ArrowIpcDigest::new([0; 32]),
+		}
+	}
+
+	fn adr626_worker(
+		failure: Option<fn() -> QueryError>,
+		experiment: Option<crate::distributed::recovery::RecoveryExperiment>,
+	) -> ToronWorker {
+		let worker = ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(crate::storage::InMemoryStorageScan {
+				table_data: RecordBatch::new_empty(Arc::new(arrow::datatypes::Schema::empty())),
+			}),
+			Arc::new(MemoryManager::new(2, 1024 * 1024)),
+			Arc::new(InMemoryPartitionStore::new()),
+			WorkerId::from_u128(7),
+			WorkerEndpoint::new("127.0.0.1:1"),
+		)
+		.with_peer_transport(Arc::new(ScriptedPeerTransport { failure }));
+		match experiment {
+			Some(experiment) => worker.with_recovery_experiment(experiment),
+			None => worker,
+		}
+	}
+
+	fn adr626_experiment() -> crate::distributed::recovery::RecoveryExperiment {
+		crate::distributed::recovery::RecoveryExperiment::from_millis(50, 100).expect("experiment")
+	}
+
+	#[tokio::test]
+	async fn adr626_a_sealed_pull_past_h_reports_its_exact_producer_and_address() {
+		let worker = adr626_worker(None, Some(adr626_experiment()));
+		let error = worker
+			.pull_shuffle_inputs(&[ShufflePartitionRef::Sealed(adr626_producer())])
+			.await
+			.expect_err("a dial that never resolves");
+		let QueryError::Runtime(RuntimeError::TaskFailure {
+			kind:
+				TaskFailureKind::ProducerUnreachable {
+					producer_worker,
+					producer_endpoint,
+					address,
+					failure,
+					..
+				},
+		}) = error
+		else {
+			panic!("expected ProducerUnreachable, got {error:?}");
+		};
+		assert_eq!(producer_worker, WorkerId::from_u128(42));
+		assert_eq!(producer_endpoint, "192.0.2.42:7000");
+		assert_eq!(address, adr626_producer().address);
+		assert_eq!(
+			failure,
+			crate::error::EstablishmentFailure::DeadlineExpired {
+				deadline_millis: 50
+			}
+		);
+	}
+
+	#[tokio::test]
+	async fn adr626_typed_liveness_and_refusal_causes_stay_distinct() {
+		let liveness = adr626_worker(
+			Some(|| {
+				QueryError::Io(crate::quic::establishment_error(
+					std::io::ErrorKind::ConnectionRefused,
+					crate::error::EstablishmentFailure::IdleTimedOut,
+				))
+			}),
+			Some(adr626_experiment()),
+		);
+		let error = liveness
+			.pull_shuffle_inputs(&[ShufflePartitionRef::Sealed(adr626_producer())])
+			.await
+			.expect_err("idle timeout");
+		assert!(
+			matches!(
+				error,
+				QueryError::Runtime(RuntimeError::TaskFailure {
+					kind: TaskFailureKind::ProducerUnreachable {
+						failure: crate::error::EstablishmentFailure::IdleTimedOut,
+						..
+					}
+				})
+			),
+			"{error:?}"
+		);
+		let refusal = adr626_worker(
+			Some(|| {
+				QueryError::Io(crate::quic::establishment_error(
+					std::io::ErrorKind::ConnectionRefused,
+					crate::error::EstablishmentFailure::Tls {
+						alert: 42,
+						reason: "bad certificate".to_string(),
+					},
+				))
+			}),
+			Some(adr626_experiment()),
+		);
+		let error = refusal
+			.pull_shuffle_inputs(&[ShufflePartitionRef::Sealed(adr626_producer())])
+			.await
+			.expect_err("a TLS refusal");
+		assert!(
+			matches!(
+				error,
+				QueryError::Runtime(RuntimeError::TaskFailure {
+					kind: TaskFailureKind::PeerRefused {
+						failure: crate::error::EstablishmentFailure::Tls { alert: 42, .. },
+						..
+					}
+				})
+			),
+			"{error:?}"
+		);
+		// An error with no typed establishment cause passes through unchanged.
+		let untyped = adr626_worker(
+			Some(|| QueryError::Internal {
+				message: "injected peer dial failure".to_string(),
+			}),
+			Some(adr626_experiment()),
+		);
+		let error = untyped
+			.pull_shuffle_inputs(&[ShufflePartitionRef::Sealed(adr626_producer())])
+			.await
+			.expect_err("untyped");
+		assert!(
+			error.to_string().contains("injected peer dial failure"),
+			"{error}"
+		);
+	}
+
+	#[tokio::test]
+	async fn adr626_without_the_experiment_the_sealed_pull_is_unchanged() {
+		let worker = adr626_worker(
+			Some(|| {
+				QueryError::Io(crate::quic::establishment_error(
+					std::io::ErrorKind::ConnectionRefused,
+					crate::error::EstablishmentFailure::IdleTimedOut,
+				))
+			}),
+			None,
+		);
+		let error = worker
+			.pull_shuffle_inputs(&[ShufflePartitionRef::Sealed(adr626_producer())])
+			.await
+			.expect_err("idle timeout");
+		assert!(
+			matches!(error, QueryError::Io(_)),
+			"unchanged without the experiment: {error:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn adr626_a_live_worker_acknowledges_a_fresh_confirmation_address() {
+		let worker = adr626_worker(None, None);
+		let memory = Arc::new(MemoryManager::new(2, 1024 * 1024));
+		let (client, server) = test_duplex(1024 * 1024);
+		let worker_handle = tokio::spawn(async move { worker.handle_connection(server).await });
+		let address = PartitionAddress {
+			query_id: QueryId::new(),
+			exchange_id: ExchangeId::new(0),
+			producer_stage_id: StageId::new(0),
+			producer_task_id: TaskId::new(0),
+			attempt_id: AttemptId::first(),
+			partition_id: PartitionId::new(0),
+		};
+		let reason = ToronCoordinator::new(memory)
+			.confirm_partition_missing(client, address)
+			.await
+			.expect("a live worker answers");
+		assert!(
+			CONFIRMATION_ACCEPTED_REASONS.contains(&reason),
+			"{reason:?}"
+		);
+		worker_handle
+			.await
+			.expect("worker task")
+			.expect("worker ok");
+	}
+
+	#[tokio::test]
+	async fn adr626_a_confirmation_answer_for_another_address_is_refused() {
+		let memory = Arc::new(MemoryManager::new(2, 1024 * 1024));
+		let (client, mut server) = test_duplex(1024 * 1024);
+		let address = PartitionAddress {
+			query_id: QueryId::from_u128(5),
+			exchange_id: ExchangeId::new(0),
+			producer_stage_id: StageId::new(0),
+			producer_task_id: TaskId::new(0),
+			attempt_id: AttemptId::first(),
+			partition_id: PartitionId::new(0),
+		};
+		let fake_memory = memory.clone();
+		let fake = tokio::spawn(async move {
+			let _request = read_envelope(&mut server, fake_memory.as_ref())
+				.await
+				.expect("request");
+			let mut other = address;
+			other.partition_id = PartitionId::new(9);
+			send_payload(
+				&mut server,
+				MessageKind::PartitionMissing,
+				EnvelopeIdentity::partition(other),
+				None,
+				&PartitionMissingPayload {
+					address: other,
+					reason: PartitionMissingReason::StoreEvicted,
+				},
+			)
+			.await
+			.expect("answer");
+		});
+		let error = ToronCoordinator::new(memory)
+			.confirm_partition_missing(client, address)
+			.await
+			.expect_err("a mismatched acknowledgement");
+		assert!(
+			matches!(error, QueryError::UnexpectedMessage { .. }),
+			"{error:?}"
+		);
+		fake.await.expect("fake");
+	}
+
+	#[tokio::test]
+	async fn adr626_a_confirmation_answer_under_another_envelope_identity_is_refused() {
+		let memory = Arc::new(MemoryManager::new(2, 1024 * 1024));
+		let (client, mut server) = test_duplex(1024 * 1024);
+		let address = PartitionAddress {
+			query_id: QueryId::from_u128(6),
+			exchange_id: ExchangeId::new(0),
+			producer_stage_id: StageId::new(0),
+			producer_task_id: TaskId::new(0),
+			attempt_id: AttemptId::first(),
+			partition_id: PartitionId::new(0),
+		};
+		let fake_memory = memory.clone();
+		let fake = tokio::spawn(async move {
+			let _request = read_envelope(&mut server, fake_memory.as_ref())
+				.await
+				.expect("request");
+			let mut other = address;
+			other.producer_task_id = TaskId::new(4);
+			// The payload names the right address; the envelope names another partition.
+			send_payload(
+				&mut server,
+				MessageKind::PartitionMissing,
+				EnvelopeIdentity::partition(other),
+				None,
+				&PartitionMissingPayload {
+					address,
+					reason: PartitionMissingReason::StoreEvicted,
+				},
+			)
+			.await
+			.expect("answer");
+		});
+		let error = ToronCoordinator::new(memory)
+			.confirm_partition_missing(client, address)
+			.await
+			.expect_err("a mismatched envelope identity");
+		assert!(
+			matches!(error, QueryError::UnexpectedMessage { .. }),
+			"{error:?}"
+		);
+		fake.await.expect("fake");
+	}
+
+	#[tokio::test]
+	async fn adr626_a_worker_cannot_send_a_coordinator_verdict_or_another_task_failure() {
+		for (kind, other_task) in [
+			(
+				TaskFailureKind::WorkerLost {
+					worker_id: WorkerId::from_u128(3),
+				},
+				false,
+			),
+			(TaskFailureKind::Cancelled, true),
+		] {
+			let memory = Arc::new(MemoryManager::new(4, 1024 * 1024));
+			let (client, mut server) = test_duplex(1024 * 1024);
+			let identity = TaskIdentity::new(
+				QueryId::from_u128(80),
+				StageId::new(1),
+				TaskId::new(2),
+				AttemptId::first(),
+			);
+			let spec = TaskSpec {
+				identity,
+				partition: None,
+				context: crate::distributed::context::TaskExecutionContext::local_test(),
+				join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
+				plan: scan(TableId(1), 1),
+				inputs: vec![TaskInputBinding::Scan {
+					share: None,
+					runtime_filter: None,
+				}],
+				output: TaskOutputBinding::FinalResult,
+				budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+				trace: None,
+			};
+			let fake_memory = memory.clone();
+			let fake = tokio::spawn(async move {
+				let lease = read_envelope(&mut server, fake_memory.as_ref())
+					.await
+					.expect("lease");
+				assert_eq!(lease.kind, MessageKind::QueryLease);
+				send_payload(
+					&mut server,
+					MessageKind::QueryLeaseAccepted,
+					EnvelopeIdentity::task(identity),
+					None,
+					&crate::wire::QueryLeaseAcceptedPayload {
+						query_id: identity.query_id,
+					},
+				)
+				.await
+				.expect("lease accepted");
+				let _start = read_envelope(&mut server, fake_memory.as_ref())
+					.await
+					.expect("start");
+				let reported = if other_task {
+					TaskIdentity::new(
+						identity.query_id,
+						identity.stage_id,
+						TaskId::new(9),
+						identity.attempt_id,
+					)
+				} else {
+					identity
+				};
+				// Written directly, bypassing the worker-side emittable check.
+				send_payload(
+					&mut server,
+					MessageKind::TaskFailed,
+					EnvelopeIdentity::task(reported),
+					None,
+					&TaskFailedPayload {
+						identity: reported,
+						kind,
+					},
+				)
+				.await
+				.expect("failed");
+			});
+			let error = ToronCoordinator::new(memory)
+				.execute_task_on_worker_with_completion(client, spec)
+				.await
+				.expect_err("refused");
+			assert!(
+				matches!(error, QueryError::UnexpectedMessage { .. }),
+				"{error:?}"
+			);
+			fake.await.expect("fake");
+		}
 	}
 
 	/// ADR 554 Branch A: naming accumulation must shrink the in-task residual by
@@ -5139,6 +5596,8 @@ pub struct NetworkTaskDispatcher<Transport> {
 	active_query: Option<ActiveQueryHandle>,
 	final_result_sender: Option<mpsc::Sender<Result<RecordBatch, QueryError>>>,
 	final_result_batch_sent: Option<Arc<AtomicBool>>,
+	/// ADR 626: the recovery experiment. `None` (the default) leaves dispatch dials unbounded.
+	recovery: Option<crate::distributed::recovery::RecoveryExperiment>,
 }
 
 impl<Transport> NetworkTaskDispatcher<Transport> {
@@ -5149,7 +5608,18 @@ impl<Transport> NetworkTaskDispatcher<Transport> {
 			active_query: None,
 			final_result_sender: None,
 			final_result_batch_sent: None,
+			recovery: None,
 		}
+	}
+
+	/// ADR 626: bound the coordinator's dispatch dial by `H` and make liveness failures a typed,
+	/// coordinator-local `WorkerUnreachable`.
+	pub fn with_recovery_experiment(
+		mut self,
+		experiment: crate::distributed::recovery::RecoveryExperiment,
+	) -> Self {
+		self.recovery = Some(experiment);
+		self
 	}
 
 	pub fn with_active_query(mut self, active_query: Option<ActiveQueryHandle>) -> Self {
@@ -5185,9 +5655,9 @@ where
 		{
 			return DispatchOutcome::Failed(TaskFailureKind::Cancelled);
 		}
-		let stream = match self.transport.connect_worker(worker).await {
+		let stream = match self.dial_worker(worker).await {
 			Ok(stream) => stream,
-			Err(error) => return DispatchOutcome::Failed(dispatch_failure_kind(error)),
+			Err(outcome) => return outcome,
 		};
 		if let Some(active_query) = &self.active_query {
 			active_query.record_remote_task(worker.clone(), spec.identity);
@@ -5228,6 +5698,152 @@ where
 			},
 			Err(error) => DispatchOutcome::Failed(dispatch_failure_kind(error)),
 		}
+	}
+
+	async fn confirm_worker(
+		&self,
+		worker: &crate::distributed::worker_registry::WorkerEntry,
+		deadline: std::time::Duration,
+	) -> ConfirmationOutcome {
+		let started = Instant::now();
+		let deadline_millis = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
+		// A fresh query: this address cannot name a live partition on any worker.
+		let address = crate::distributed::task::PartitionAddress {
+			query_id: crate::distributed::identity::QueryId::new(),
+			exchange_id: crate::distributed::identity::ExchangeId::new(0),
+			producer_stage_id: crate::distributed::identity::StageId::new(0),
+			producer_task_id: crate::distributed::identity::TaskId::new(0),
+			attempt_id: crate::distributed::identity::AttemptId::first(),
+			partition_id: crate::distributed::identity::PartitionId::new(0),
+		};
+		let exchange = async {
+			let stream = self.transport.connect_worker(worker).await?;
+			self.coordinator
+				.confirm_partition_missing(stream, address)
+				.await
+		};
+		match tokio::time::timeout(deadline, exchange).await {
+			Err(_) => ConfirmationOutcome::Liveness {
+				failure: crate::error::EstablishmentFailure::DeadlineExpired { deadline_millis },
+				elapsed_micros: duration_micros(started),
+			},
+			Ok(Ok(reason)) if CONFIRMATION_ACCEPTED_REASONS.contains(&reason) => {
+				ConfirmationOutcome::Acknowledged {
+					elapsed_micros: duration_micros(started),
+				}
+			}
+			Ok(Ok(reason)) => ConfirmationOutcome::Refused {
+				reason: format!("unexpected PartitionMissing reason {reason:?}"),
+			},
+			Ok(Err(error)) => match crate::quic::establishment_failure(&error) {
+				Some(failure) if failure.is_liveness() => ConfirmationOutcome::Liveness {
+					failure: failure.clone(),
+					elapsed_micros: duration_micros(started),
+				},
+				// A typed refusal, or any error without a typed establishment cause, is never
+				// read as liveness.
+				_ => ConfirmationOutcome::Refused {
+					reason: error.to_string(),
+				},
+			},
+		}
+	}
+}
+
+/// ADR 626: the reasons a live worker gives for an address of a query it has never seen.
+const CONFIRMATION_ACCEPTED_REASONS: [PartitionMissingReason; 2] = [
+	PartitionMissingReason::StoreEvicted,
+	PartitionMissingReason::NamespaceUnknown,
+];
+
+impl<Transport> NetworkTaskDispatcher<Transport>
+where
+	Transport: ToronTransport + Send + Sync,
+{
+	/// Dials the dispatch target. With the recovery experiment, establishment is bounded by `H`: a
+	/// liveness failure is the coordinator-local `WorkerUnreachable`, a typed refusal is
+	/// `PeerRefused`. Without it, the dial is exactly as before.
+	async fn dial_worker(
+		&self,
+		worker: &crate::distributed::worker_registry::WorkerEntry,
+	) -> Result<Box<dyn ToronStream>, DispatchOutcome> {
+		let Some(experiment) = self.recovery else {
+			return self
+				.transport
+				.connect_worker(worker)
+				.await
+				.map_err(|error| DispatchOutcome::Failed(dispatch_failure_kind(error)));
+		};
+		let started = Instant::now();
+		let failure = match tokio::time::timeout(
+			experiment.establishment_deadline(),
+			self.transport.connect_worker(worker),
+		)
+		.await
+		{
+			Ok(Ok(stream)) => return Ok(stream),
+			Ok(Err(error)) => match crate::quic::establishment_failure(&error) {
+				Some(failure) => failure.clone(),
+				None => return Err(DispatchOutcome::Failed(dispatch_failure_kind(error))),
+			},
+			Err(_) => crate::error::EstablishmentFailure::DeadlineExpired {
+				deadline_millis: experiment.establishment_deadline_millis(),
+			},
+		};
+		if failure.is_liveness() {
+			Err(DispatchOutcome::WorkerUnreachable {
+				failure,
+				elapsed_micros: duration_micros(started),
+			})
+		} else {
+			Err(DispatchOutcome::Failed(TaskFailureKind::PeerRefused {
+				peer_worker: worker.worker_id,
+				peer_endpoint: worker.endpoint.as_str().to_string(),
+				failure,
+			}))
+		}
+	}
+}
+
+impl ToronCoordinator {
+	/// ADR 626: one confirmation exchange. Sends `PullPartition` for `address` (which no live
+	/// partition can match) and returns the `PartitionMissing` reason, after checking the response
+	/// names exactly that address. Any other answer is a protocol error.
+	pub async fn confirm_partition_missing<Stream>(
+		&self,
+		mut stream: Stream,
+		address: crate::distributed::task::PartitionAddress,
+	) -> Result<PartitionMissingReason, QueryError>
+	where
+		Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	{
+		send_payload(
+			&mut stream,
+			MessageKind::PullPartition,
+			EnvelopeIdentity::partition(address),
+			None,
+			&PullPartitionPayload {
+				address,
+				expected_attempt: address.attempt_id,
+			},
+		)
+		.await?;
+		let response = read_envelope(&mut stream, self.memory.as_ref()).await?;
+		response.validate_runtime(ProtocolVersion::CURRENT, FrameByteLen::from_u32(u32::MAX))?;
+		if response.kind != MessageKind::PartitionMissing
+			|| response.identity != EnvelopeIdentity::partition(address)
+		{
+			return Err(QueryError::UnexpectedMessage {
+				expected: "PartitionMissing for the confirmation address",
+			});
+		}
+		let payload: PartitionMissingPayload = decode_payload(&response.payload)?;
+		if payload.address != address {
+			return Err(QueryError::UnexpectedMessage {
+				expected: "PartitionMissing naming the confirmation address",
+			});
+		}
+		Ok(payload.reason)
 	}
 }
 
@@ -5443,6 +6059,19 @@ impl ToronCoordinator {
 				}
 				MessageKind::TaskFailed => {
 					let payload: TaskFailedPayload = decode_payload(&response.payload)?;
+					// ADR 626: a worker may only report its own task, and only kinds a worker may
+					// emit; anything else (for example a coordinator-side verdict) is a protocol
+					// violation, never a failure the scheduler acts on.
+					if payload.identity != identity {
+						return Err(QueryError::UnexpectedMessage {
+							expected: "TaskFailed for requested task",
+						});
+					}
+					if !payload.kind.worker_emittable() {
+						return Err(QueryError::UnexpectedMessage {
+							expected: "TaskFailed with a worker-emittable kind",
+						});
+					}
 					break Err(QueryError::Runtime(RuntimeError::TaskFailure {
 						kind: payload.kind,
 					}));

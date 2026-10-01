@@ -15,6 +15,8 @@ pub use client::{
 	ClientError, ClientOperation, QueryResult, RuneQueryResult, ToronClient, ToronClientTls,
 	blocking_health_loopback,
 };
+/// ADR 626: the idle timeout under a brand-neutral name, for bounds that must stay below it.
+pub use liveness::TORON_QUIC_MAX_IDLE_TIMEOUT as QUIC_MAX_IDLE_TIMEOUT;
 pub use liveness::{
 	TORON_QUIC_KEEP_ALIVE_INTERVAL, TORON_QUIC_MAX_IDLE_TIMEOUT, apply_toron_quic_liveness_client,
 	apply_toron_quic_liveness_server, toron_quic_transport_config,

@@ -12,6 +12,8 @@ use rustls::{
 use rustls::{client::danger::HandshakeSignatureValid, crypto::ring};
 use rustls::{client::danger::ServerCertVerified, client::danger::ServerCertVerifier};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use crate::error::EstablishmentFailure;
 use wendelon::network::quic_transport::QuicTransportStream;
 use wendelon::network::transport::TransportStream;
 
@@ -125,6 +127,9 @@ impl QuicEndpoint {
 			.await
 	}
 
+	/// Connects and opens one bidirectional stream. ADR 626: a failure carries its typed cause
+	/// ([`EstablishmentFailure`]) inside the `std::io::Error`, so callers classify it from quinn's
+	/// own error, never from message text; the message stays quinn's.
 	pub async fn connect_stream_with_server_name(
 		&self,
 		remote: SocketAddr,
@@ -133,14 +138,28 @@ impl QuicEndpoint {
 		let connection = self
 			.inner
 			.connect(remote, server_name)
-			.map_err(|error| Error::new(ErrorKind::InvalidInput, error))?
+			.map_err(|error| {
+				establishment_error(ErrorKind::InvalidInput, classify_connect_error(&error))
+			})?
 			.await
-			.map_err(|error| Error::new(ErrorKind::ConnectionRefused, error))?;
-		let (send, recv) = connection
-			.open_bi()
-			.await
-			.map_err(|error| Error::new(ErrorKind::ConnectionRefused, error))?;
+			.map_err(|error| {
+				establishment_error(
+					ErrorKind::ConnectionRefused,
+					classify_connection_error(&error),
+				)
+			})?;
+		let (send, recv) = connection.open_bi().await.map_err(|error| {
+			establishment_error(
+				ErrorKind::ConnectionRefused,
+				classify_connection_error(&error),
+			)
+		})?;
 		Ok(QuicStream::new(connection, send, recv))
+	}
+
+	/// Connections this endpoint still tracks (ADR 626 resource fixtures).
+	pub fn open_connections(&self) -> usize {
+		self.inner.open_connections()
 	}
 
 	pub fn close(&self) {
@@ -299,6 +318,77 @@ impl ServerCertVerifier for LoopbackServerVerifier {
 	}
 }
 
+/// ADR 626: an establishment `std::io::Error` carrying its typed cause. A liveness failure keeps the
+/// `TimedOut` kind; a refusal keeps the kind the call site used before.
+pub(crate) fn establishment_error(refusal_kind: ErrorKind, failure: EstablishmentFailure) -> Error {
+	let kind = if failure.is_liveness() {
+		ErrorKind::TimedOut
+	} else {
+		refusal_kind
+	};
+	Error::new(kind, failure)
+}
+
+/// ADR 626: every `quinn::ConnectionError` variant, classified explicitly. There is deliberately
+/// no wildcard arm: a variant added by a future quinn fails to compile here instead of being
+/// guessed at.
+pub fn classify_connection_error(error: &quinn::ConnectionError) -> EstablishmentFailure {
+	match error {
+		quinn::ConnectionError::VersionMismatch => EstablishmentFailure::VersionMismatch,
+		quinn::ConnectionError::TransportError(error) => {
+			let code = u64::from(error.code);
+			if (0x100..0x200).contains(&code) {
+				EstablishmentFailure::Tls {
+					alert: (code & 0xff) as u8,
+					reason: error.reason.clone(),
+				}
+			} else {
+				EstablishmentFailure::Transport {
+					code,
+					reason: error.reason.clone(),
+				}
+			}
+		}
+		quinn::ConnectionError::ConnectionClosed(close) => EstablishmentFailure::PeerClosed {
+			code: u64::from(close.error_code),
+			reason: String::from_utf8_lossy(&close.reason).into_owned(),
+		},
+		quinn::ConnectionError::ApplicationClosed(close) => {
+			EstablishmentFailure::PeerApplicationClosed {
+				code: close.error_code.into_inner(),
+				reason: String::from_utf8_lossy(&close.reason).into_owned(),
+			}
+		}
+		quinn::ConnectionError::Reset => EstablishmentFailure::PeerReset,
+		quinn::ConnectionError::TimedOut => EstablishmentFailure::IdleTimedOut,
+		quinn::ConnectionError::LocallyClosed => EstablishmentFailure::LocallyClosed,
+		quinn::ConnectionError::CidsExhausted => EstablishmentFailure::CidsExhausted,
+	}
+}
+
+/// ADR 626: every `quinn::ConnectError` variant, classified explicitly (all are refusals: none
+/// reached the peer).
+pub fn classify_connect_error(error: &quinn::ConnectError) -> EstablishmentFailure {
+	let reason = error.to_string();
+	match error {
+		quinn::ConnectError::EndpointStopping
+		| quinn::ConnectError::CidsExhausted
+		| quinn::ConnectError::InvalidServerName(_)
+		| quinn::ConnectError::InvalidRemoteAddress(_)
+		| quinn::ConnectError::NoDefaultClientConfig
+		| quinn::ConnectError::UnsupportedVersion => EstablishmentFailure::Connect { reason },
+	}
+}
+
+/// ADR 626: the typed establishment cause a query error carries, if any. Only an `Io` error built
+/// by [`QuicEndpoint::connect_stream_with_server_name`] carries one; nothing is inferred from text.
+pub fn establishment_failure(error: &crate::error::QueryError) -> Option<&EstablishmentFailure> {
+	match error {
+		crate::error::QueryError::Io(io) => io.get_ref()?.downcast_ref::<EstablishmentFailure>(),
+		_ => None,
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -378,5 +468,177 @@ mod tests {
 			matches!(error, quinn::ConnectionError::TimedOut),
 			"the loss is an idle timeout, not another transport fault: {error:?}"
 		);
+	}
+	// ---- ADR 626: typed establishment failures and their resources ----
+
+	#[test]
+	fn adr626_every_quinn_establishment_error_is_classified_explicitly() {
+		use crate::error::EstablishmentFailure as F;
+		assert_eq!(
+			classify_connection_error(&quinn::ConnectionError::TimedOut),
+			F::IdleTimedOut
+		);
+		assert!(F::IdleTimedOut.is_liveness());
+		assert!(F::DeadlineExpired { deadline_millis: 5 }.is_liveness());
+		// quinn does not re-export the transport error struct; a code converts into one.
+		assert_eq!(
+			classify_connection_error(&quinn::ConnectionError::TransportError(
+				quinn::TransportErrorCode::crypto(42).into()
+			)),
+			F::Tls {
+				alert: 42,
+				reason: String::new()
+			}
+		);
+		assert!(matches!(
+			classify_connection_error(&quinn::ConnectionError::TransportError(
+				quinn::TransportErrorCode::PROTOCOL_VIOLATION.into()
+			)),
+			F::Transport { .. }
+		));
+		let closed = quinn::ConnectionClose {
+			error_code: quinn::TransportErrorCode::CONNECTION_REFUSED,
+			frame_type: None,
+			reason: b"refused".to_vec().into(),
+		};
+		assert!(matches!(
+			classify_connection_error(&quinn::ConnectionError::ConnectionClosed(closed)),
+			F::PeerClosed { .. }
+		));
+		let application = quinn::ApplicationClose {
+			error_code: quinn::VarInt::from_u32(7),
+			reason: b"bye".to_vec().into(),
+		};
+		assert_eq!(
+			classify_connection_error(&quinn::ConnectionError::ApplicationClosed(application)),
+			F::PeerApplicationClosed {
+				code: 7,
+				reason: "bye".to_string()
+			}
+		);
+		for (error, expected) in [
+			(quinn::ConnectionError::VersionMismatch, F::VersionMismatch),
+			(quinn::ConnectionError::Reset, F::PeerReset),
+			(quinn::ConnectionError::LocallyClosed, F::LocallyClosed),
+			(quinn::ConnectionError::CidsExhausted, F::CidsExhausted),
+		] {
+			let failure = classify_connection_error(&error);
+			assert_eq!(failure, expected);
+			assert!(
+				!failure.is_liveness(),
+				"{failure:?} must never be read as liveness"
+			);
+		}
+		for error in [
+			quinn::ConnectError::EndpointStopping,
+			quinn::ConnectError::CidsExhausted,
+			quinn::ConnectError::InvalidServerName("x".to_string()),
+			quinn::ConnectError::NoDefaultClientConfig,
+			quinn::ConnectError::UnsupportedVersion,
+		] {
+			assert!(matches!(classify_connect_error(&error), F::Connect { .. }));
+		}
+	}
+
+	#[test]
+	fn adr626_the_typed_cause_survives_io_and_query_error_conversion() {
+		let failure = crate::error::EstablishmentFailure::IdleTimedOut;
+		let io = establishment_error(ErrorKind::ConnectionRefused, failure.clone());
+		assert_eq!(
+			io.kind(),
+			ErrorKind::TimedOut,
+			"liveness keeps the TimedOut kind"
+		);
+		assert_eq!(io.to_string(), "timed out", "the message stays quinn's");
+		let query = crate::error::QueryError::from(io);
+		assert_eq!(establishment_failure(&query), Some(&failure));
+		let refusal = establishment_error(
+			ErrorKind::ConnectionRefused,
+			crate::error::EstablishmentFailure::PeerReset,
+		);
+		assert_eq!(refusal.kind(), ErrorKind::ConnectionRefused);
+		// An io error without a typed cause carries none: nothing is inferred from its text.
+		let untyped = crate::error::QueryError::from(Error::new(ErrorKind::TimedOut, "timed out"));
+		assert_eq!(establishment_failure(&untyped), None);
+	}
+
+	/// A peer that never answers: a plain UDP socket that swallows every datagram.
+	fn silent_peer() -> (std::net::UdpSocket, SocketAddr) {
+		let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent socket");
+		let addr = socket.local_addr().expect("silent addr");
+		(socket, addr)
+	}
+
+	#[tokio::test]
+	async fn adr626_timed_out_handshakes_do_not_accumulate_and_others_keep_working() {
+		let (_silent, silent_addr) = silent_peer();
+		let server =
+			QuicEndpoint::bind_loopback("127.0.0.1:0".parse().expect("addr")).expect("server");
+		let server_addr = server.local_addr().expect("server addr");
+		let accept = tokio::spawn(async move {
+			let mut served = 0u32;
+			while let Ok(mut stream) = server.accept_stream().await {
+				use tokio::io::{AsyncReadExt, AsyncWriteExt};
+				let mut byte = [0u8; 1];
+				if stream.read_exact(&mut byte).await.is_ok() {
+					let _ = stream.write_all(&byte).await;
+					let _ = stream.flush().await;
+					// Hold the connection until the client has read and closed its side.
+					let _ = stream.read(&mut byte).await;
+				}
+				served += 1;
+				if served == 2 {
+					break;
+				}
+			}
+		});
+		let client = QuicEndpoint::client_loopback().expect("client");
+		let baseline = client.open_connections();
+		for _ in 0..16 {
+			let attempt = tokio::time::timeout(
+				Duration::from_millis(50),
+				client.connect_stream(silent_addr),
+			)
+			.await;
+			assert!(
+				attempt.is_err(),
+				"a silent peer never completes establishment"
+			);
+		}
+		// While those timed-out handshakes wind down, an unrelated connection works.
+		let echo = |client: &QuicEndpoint| {
+			let client = client.clone();
+			async move {
+				use tokio::io::{AsyncReadExt, AsyncWriteExt};
+				let mut stream = client
+					.connect_stream(server_addr)
+					.await
+					.expect("live connect");
+				stream.write_all(&[7]).await.expect("write");
+				let mut byte = [0u8; 1];
+				stream.read_exact(&mut byte).await.expect("echo");
+				byte[0]
+			}
+		};
+		assert_eq!(echo(&client).await, 7);
+		// The dropped handshakes are abandoned by the endpoint, not kept alive.
+		let settled = async {
+			loop {
+				if client.open_connections() <= baseline + 1 {
+					break;
+				}
+				tokio::time::sleep(Duration::from_millis(50)).await;
+			}
+		};
+		tokio::time::timeout(Duration::from_secs(10), settled)
+			.await
+			.unwrap_or_else(|_| {
+				panic!(
+					"timed-out handshakes still open: {}",
+					client.open_connections()
+				)
+			});
+		assert_eq!(echo(&client).await, 7, "the endpoint still serves new work");
+		accept.await.expect("server");
 	}
 }

@@ -683,6 +683,8 @@ fn task_failure_class(kind: &TaskFailureKind) -> &'static str {
 		TaskFailureKind::QueryLeaseMissing => "query_lease_missing",
 		TaskFailureKind::QueryLeaseExpired => "query_lease_expired",
 		TaskFailureKind::Internal { .. } => "internal",
+		TaskFailureKind::ProducerUnreachable { .. } => "producer_unreachable",
+		TaskFailureKind::PeerRefused { .. } => "establishment_refused",
 	}
 }
 

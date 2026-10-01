@@ -3,7 +3,9 @@ pub mod distributed;
 use crate::distributed::fragment::FragmentError;
 use crate::ir::TableId;
 use crate::rune_engine::RuneSandboxViolation;
-pub use distributed::{PartitionMissingReason, RuntimeError, TaskFailureKind};
+pub use distributed::{
+	EstablishmentFailure, PartitionMissingReason, RuntimeError, TaskFailureKind,
+};
 
 use thiserror::Error;
 use wendelon::schema::PbcRejectCode;

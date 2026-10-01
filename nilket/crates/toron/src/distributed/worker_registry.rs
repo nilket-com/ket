@@ -186,6 +186,27 @@ pub trait WorkerRegistry: Send + Sync {
 	/// compile error is what forces the decision.
 	fn select_and_reserve(&self, hints: &PlacementHints) -> Option<WorkerReservation>;
 
+	/// ADR 626: select and reserve a live worker outside `excluded` (one query's exclusions).
+	/// Never returns an excluded worker. The default retries this registry's own selection a
+	/// bounded number of times, releasing each excluded pick, which suits a rotating registry; a
+	/// registry whose selection is deterministic must override it to filter in place.
+	fn select_and_reserve_excluding(
+		&self,
+		hints: &PlacementHints,
+		excluded: &std::collections::BTreeSet<WorkerId>,
+	) -> Option<WorkerReservation> {
+		if excluded.is_empty() {
+			return self.select_and_reserve(hints);
+		}
+		for _ in 0..=self.list().len() {
+			let reservation = self.select_and_reserve(hints)?;
+			if !excluded.contains(&reservation.worker_id()) {
+				return Some(reservation);
+			}
+		}
+		None
+	}
+
 	/// Reserve a specific worker chosen by shuffle affinity. Returns `None` when
 	/// that worker is no longer live, so the caller falls back to selection.
 	///
@@ -219,6 +240,14 @@ where
 
 	fn select_and_reserve(&self, hints: &PlacementHints) -> Option<WorkerReservation> {
 		self.as_ref().select_and_reserve(hints)
+	}
+
+	fn select_and_reserve_excluding(
+		&self,
+		hints: &PlacementHints,
+		excluded: &std::collections::BTreeSet<WorkerId>,
+	) -> Option<WorkerReservation> {
+		self.as_ref().select_and_reserve_excluding(hints, excluded)
 	}
 
 	fn reserve(&self, worker_id: WorkerId) -> Option<WorkerReservation> {
@@ -379,14 +408,24 @@ impl WorkerRegistry for StaticWorkerRegistry {
 			.map(|worker| worker.worker_id)
 	}
 
-	fn select_and_reserve(&self, _hints: &PlacementHints) -> Option<WorkerReservation> {
+	fn select_and_reserve(&self, hints: &PlacementHints) -> Option<WorkerReservation> {
+		self.select_and_reserve_excluding(hints, &std::collections::BTreeSet::new())
+	}
+
+	/// ADR 626: this selection is deterministic (minimum load or worker id), so a retry would pick
+	/// the same excluded worker again; excluded workers are filtered in place instead.
+	fn select_and_reserve_excluding(
+		&self,
+		_hints: &PlacementHints,
+		excluded: &std::collections::BTreeSet<WorkerId>,
+	) -> Option<WorkerReservation> {
 		// Selection and reservation share one write lock: the increment must be
 		// visible to the next selector, or two selectors observe identical load
 		// and recreate the tie this record exists to remove (ADR 555 §3).
 		let mut workers = self.workers.write().expect("worker registry poisoned");
-		let live = workers
-			.values()
-			.filter(|worker| worker.status == WorkerStatus::Live);
+		let live = workers.values().filter(|worker| {
+			worker.status == WorkerStatus::Live && !excluded.contains(&worker.worker_id)
+		});
 		// Both arms reserve, so the token lifecycle is identical and the only
 		// difference between them is the ordering key.
 		let worker_id = match self.fallback {

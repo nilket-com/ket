@@ -2191,6 +2191,23 @@ fn scheduler_error(error: SchedulerError) -> QueryError {
 		},
 		SchedulerError::PartitionManifestMismatch { message } => QueryError::Internal { message },
 		SchedulerError::Acceptance(message) => QueryError::Internal { message },
+		SchedulerError::ProtocolViolation { key, reason } => QueryError::Internal {
+			message: format!("protocol violation for task {key:?}: {reason}"),
+		},
+		SchedulerError::NoEligibleWorker { query_id, excluded } => QueryError::Internal {
+			message: format!("no eligible worker for query {query_id:?}; excluded {excluded:?}"),
+		},
+		SchedulerError::ReplacementLimit { key } => QueryError::Internal {
+			message: format!("task {key:?} exhausted its replacement attempts"),
+		},
+		SchedulerError::ExclusionLimit { query_id, worker } => QueryError::Internal {
+			message: format!(
+				"excluding worker {worker:?} would leave query {query_id:?} no worker"
+			),
+		},
+		SchedulerError::ConfirmationRefused { worker, reason } => QueryError::Internal {
+			message: format!("confirmation of worker {worker:?} refused: {reason}"),
+		},
 	}
 }
 

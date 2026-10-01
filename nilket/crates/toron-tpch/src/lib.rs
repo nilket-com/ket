@@ -10801,6 +10801,8 @@ fn task_failure_reason(kind: &TaskFailureKind) -> String {
 		TaskFailureKind::Cancelled => "task_cancelled".to_string(),
 		TaskFailureKind::QueryLeaseMissing => "task_query_lease_missing".to_string(),
 		TaskFailureKind::QueryLeaseExpired => "task_query_lease_expired".to_string(),
+		TaskFailureKind::ProducerUnreachable { .. } => "task_producer_unreachable".to_string(),
+		TaskFailureKind::PeerRefused { .. } => "task_establishment_refused".to_string(),
 		TaskFailureKind::Internal { .. } => "task_internal".to_string(),
 	}
 }

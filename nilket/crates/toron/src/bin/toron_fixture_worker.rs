@@ -92,7 +92,15 @@ impl ToronTransport for DialRecordingTransport {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-	let (worker_id, transport, record_peer_dials, host_mode, record_wait_events) = args()?;
+	let (
+		worker_id,
+		transport,
+		record_peer_dials,
+		host_mode,
+		record_wait_events,
+		recovery,
+		loopback,
+	) = args()?;
 	let wait_log = record_wait_events
 		.as_deref()
 		.map(wait_events::EventLog::create)
@@ -124,7 +132,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 				worker_id,
 				endpoint,
 			)
-			.with_peer_transport(peer),
+			.with_peer_transport(peer)
+			.with_recovery_experiment_if(recovery),
 		))
 	};
 	if let Some(host) = host_mode {
@@ -223,8 +232,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 			}
 		}
 		FixtureTransport::Quic => {
-			let quic = QuicEndpoint::bind_loopback("127.0.0.1:0".parse()?)?;
-			let endpoint = WorkerEndpoint::new(quic.local_addr()?.to_string());
+			// ADR 626 Stage C: a relay control binds a known loopback port and advertises the
+			// relay in front of it, so consumers and the coordinator both reach it through the
+			// relay. Unset, the worker binds an ephemeral port and advertises it, as before.
+			let bind = loopback.bind.unwrap_or("127.0.0.1:0".parse()?);
+			let quic = QuicEndpoint::bind_loopback(bind)?;
+			let endpoint =
+				WorkerEndpoint::new(loopback.advertise.unwrap_or(quic.local_addr()?).to_string());
 			let worker = worker(endpoint.clone(), peer(Arc::new(QuicTransport::new()?)))?;
 			announce(&endpoint).await?;
 			loop {
@@ -290,6 +304,9 @@ struct FixtureStorageScan {
 
 impl FixtureStorageScan {
 	fn table(&self, table_id: TableId) -> Result<RecordBatch, StorageError> {
+		if table_id.0 == SLOW_TABLE {
+			return Ok(slow_batch());
+		}
 		let rows = match table_id.0 {
 			6 => Some((0, 16)),
 			7 => Some((1, 16 * 1024)),
@@ -412,6 +429,18 @@ impl FixtureStorageScan {
 	}
 }
 
+/// ADR 626 Stage C: the slow table and how long its scan stays silent (above the 5 s `H`).
+const SLOW_TABLE: u64 = 9;
+const SLOW_SCAN: std::time::Duration = std::time::Duration::from_secs(8);
+
+fn slow_batch() -> RecordBatch {
+	RecordBatch::try_new(
+		Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+		vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+	)
+	.expect("slow batch")
+}
+
 /// ADR 626 Stage A sized fixtures: `rows` rows of a unique `id` (never 2 or 3, so a join with
 /// `customers` matches nothing) and a 64-byte `pad`, so a shuffle on `id` carries the whole table
 /// while the final result stays empty. Partition sizes are measured, not assumed.
@@ -438,6 +467,11 @@ fn payload(rows: i64) -> Result<RecordBatch, arrow::error::ArrowError> {
 #[async_trait::async_trait]
 impl StorageScan for FixtureStorageScan {
 	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+		if request.table_id.0 == SLOW_TABLE {
+			// ADR 626 Stage C: a scan that stays silent longer than the experiment's `H`, so the
+			// long-silence control shows `H` bounds establishment only.
+			tokio::time::sleep(SLOW_SCAN).await;
+		}
 		let mut batch = self.table(request.table_id)?;
 		// ADR 238: honor a pushed predicate in the source-column domain (before projection),
 		// reusing the production PBC evaluator — the same `wendelon::schema::pbc::execute` the real
@@ -485,7 +519,36 @@ type FixtureArgs = (
 	Option<std::path::PathBuf>,
 	Option<HostMode>,
 	Option<std::path::PathBuf>,
+	Option<toron::distributed::recovery::RecoveryExperiment>,
+	LoopbackAddresses,
 );
+
+/// ADR 626 Stage C: test-only loopback bind and advertised addresses (QUIC loopback mode only).
+#[derive(Default)]
+struct LoopbackAddresses {
+	bind: Option<std::net::SocketAddr>,
+	advertise: Option<std::net::SocketAddr>,
+}
+
+/// ADR 626: the recovery experiment, only when asked for.
+trait WithRecoveryIf {
+	fn with_recovery_experiment_if(
+		self,
+		experiment: Option<toron::distributed::recovery::RecoveryExperiment>,
+	) -> Self;
+}
+
+impl WithRecoveryIf for ToronWorker {
+	fn with_recovery_experiment_if(
+		self,
+		experiment: Option<toron::distributed::recovery::RecoveryExperiment>,
+	) -> Self {
+		match experiment {
+			Some(experiment) => self.with_recovery_experiment(experiment),
+			None => self,
+		}
+	}
+}
 
 fn invalid(message: String) -> Box<dyn Error> {
 	Box::new(std::io::Error::new(
@@ -500,6 +563,9 @@ fn args() -> Result<FixtureArgs, Box<dyn Error>> {
 	let mut transport = FixtureTransport::Tcp;
 	let mut record_peer_dials = None;
 	let mut record_wait_events = None;
+	let mut recovery_establishment_ms: Option<u64> = None;
+	let mut loopback = LoopbackAddresses::default();
+	let mut recovery_confirmation_ms: Option<u64> = None;
 	let mut bind: Option<std::net::SocketAddr> = None;
 	let mut advertise: Option<std::net::SocketAddr> = None;
 	let mut tls_cert = None;
@@ -525,6 +591,14 @@ fn args() -> Result<FixtureArgs, Box<dyn Error>> {
 			record_peer_dials = args.next().map(std::path::PathBuf::from);
 		} else if arg == "--record-wait-events" {
 			record_wait_events = args.next().map(std::path::PathBuf::from);
+		} else if arg == "--loopback-bind" {
+			loopback.bind = args.next().map(|value| value.parse()).transpose()?;
+		} else if arg == "--loopback-advertise" {
+			loopback.advertise = args.next().map(|value| value.parse()).transpose()?;
+		} else if arg == "--recovery-establishment-ms" {
+			recovery_establishment_ms = args.next().map(|value| value.parse()).transpose()?;
+		} else if arg == "--recovery-confirmation-ms" {
+			recovery_confirmation_ms = args.next().map(|value| value.parse()).transpose()?;
 		} else if arg == "--transport" {
 			transport = match args.next().as_deref() {
 				Some("tcp") => FixtureTransport::Tcp,
@@ -545,12 +619,39 @@ fn args() -> Result<FixtureArgs, Box<dyn Error>> {
 		)
 	})?;
 	let host_mode = host_mode(bind, advertise, tls_cert, tls_key, tls_ca, cluster_domain)?;
+	// ADR 626: both values or neither; invalid values refuse to start.
+	let recovery = match (recovery_establishment_ms, recovery_confirmation_ms) {
+		(None, None) => None,
+		(Some(establishment), Some(confirmation)) => Some(
+			toron::distributed::recovery::RecoveryExperiment::from_millis(
+				establishment,
+				confirmation,
+			)
+			.map_err(|error| invalid(format!("recovery experiment: {error}")))?,
+		),
+		_ => {
+			return Err(invalid(
+				"--recovery-establishment-ms and --recovery-confirmation-ms go together"
+					.to_string(),
+			));
+		}
+	};
+	for address in [loopback.bind, loopback.advertise].into_iter().flatten() {
+		if !address.ip().is_loopback() || transport != FixtureTransport::Quic || host_mode.is_some()
+		{
+			return Err(invalid(format!(
+				"--loopback-bind/--loopback-advertise take loopback addresses in QUIC loopback mode, got {address}"
+			)));
+		}
+	}
 	Ok((
 		WorkerId::from_u128(worker_u128),
 		transport,
 		record_peer_dials,
 		host_mode,
 		record_wait_events,
+		recovery,
+		loopback,
 	))
 }
 

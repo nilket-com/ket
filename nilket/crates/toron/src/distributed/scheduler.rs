@@ -5,11 +5,13 @@ use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use tracing::Instrument;
 
 use crate::distributed::budget::DurationMillis;
 use crate::distributed::identity::{AttemptId, QueryId, StageId, TaskIdentity, WorkerId};
+use crate::distributed::recovery::{REPLACEMENT_LIMIT, RecoveryExperiment};
 use crate::distributed::task::{
 	LiveProducerPartitionRef, PartitionAddress, PartitionManifest, ProducerPartitionRef,
 	RetryPolicy, ShufflePartitionRef, ShufflePublishMode, TaskCompletionOutput, TaskInputBinding,
@@ -17,7 +19,8 @@ use crate::distributed::task::{
 	is_streamable_exchange_producer, is_streamable_shuffle_consumer,
 };
 use crate::distributed::task_state::{
-	AcceptanceState, AttemptState, CancelledTaskCount, InvalidatedTask, TaskKey, TaskStateStore,
+	AcceptanceState, AttemptState, CancelledTaskCount, InvalidatedTask, OutcomeDisposition,
+	TaskKey, TaskStateStore,
 };
 use crate::distributed::worker_registry::{
 	PlacementHints, UnixMillis, WorkerEntry, WorkerRegistry, WorkerReservation,
@@ -55,6 +58,35 @@ impl TaskPlan {
 #[async_trait]
 pub trait TaskDispatcher {
 	async fn dispatch(&self, worker: &WorkerEntry, spec: &TaskSpec) -> DispatchOutcome;
+
+	/// ADR 626: the coordinator's own confirmation of a suspected worker, bounded by one outer
+	/// `deadline`. A dispatcher that cannot confirm says so; the scheduler then treats a report as
+	/// unconfirmable (terminal), never as a liveness failure.
+	async fn confirm_worker(
+		&self,
+		_worker: &WorkerEntry,
+		_deadline: std::time::Duration,
+	) -> ConfirmationOutcome {
+		ConfirmationOutcome::Unsupported
+	}
+}
+
+/// ADR 626: the three-way outcome of a confirmation (plus a dispatcher that cannot confirm).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmationOutcome {
+	/// The worker answered the impossible-partition pull with an accepted `PartitionMissing`.
+	Acknowledged { elapsed_micros: u64 },
+	/// The worker did not answer within the deadline, or failed establishment with a liveness
+	/// error. The only outcome that permits exclusion and replay.
+	Liveness {
+		failure: crate::error::EstablishmentFailure,
+		elapsed_micros: u64,
+	},
+	/// A refusal or protocol error: a TLS, certificate or version refusal, a wrong response, or a
+	/// malformed or mismatched acknowledgement. Terminal.
+	Refused { reason: String },
+	/// This dispatcher has no confirmation path.
+	Unsupported,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +105,13 @@ pub enum DispatchOutcome {
 	FailedWithTelemetry {
 		kind: TaskFailureKind,
 		telemetry: TaskTelemetry,
+	},
+	/// ADR 626: the coordinator's own bounded dial of the target worker failed establishment with a
+	/// liveness failure. Produced only by the local dispatcher, never decoded from a worker, so its
+	/// provenance is this coordinator's dial.
+	WorkerUnreachable {
+		failure: crate::error::EstablishmentFailure,
+		elapsed_micros: u64,
 	},
 }
 
@@ -107,6 +146,67 @@ pub struct SchedulerTelemetry {
 	pub retry_count: u64,
 	pub stale_rejection_count: u64,
 	pub cancellation_cleanup_count: u64,
+	/// ADR 626: every recovery step, in order, on the scheduler's own clock.
+	pub recovery_events: Vec<RecoveryEvent>,
+}
+
+/// ADR 626: one recovery step, at `at_micros` since the scheduler was created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryEvent {
+	pub at_micros: u64,
+	pub kind: RecoveryEventKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryEventKind {
+	/// The coordinator's own dispatch dial failed establishment with a liveness failure.
+	EstablishmentTimedOut {
+		worker: WorkerId,
+		task: TaskIdentity,
+		failure: crate::error::EstablishmentFailure,
+	},
+	/// A consumer's `ProducerUnreachable` report was bound to the accepted producer it names.
+	ReportAccepted {
+		consumer: TaskIdentity,
+		producer: TaskIdentity,
+		worker: WorkerId,
+	},
+	ConfirmationStarted {
+		query: QueryId,
+		worker: WorkerId,
+	},
+	ConfirmationEnded {
+		query: QueryId,
+		worker: WorkerId,
+		outcome: ConfirmationOutcome,
+	},
+	/// A liveness confirmation arrived after another path had already resolved the suspicion.
+	ConfirmationDiscarded {
+		query: QueryId,
+		worker: WorkerId,
+	},
+	Excluded {
+		query: QueryId,
+		worker: WorkerId,
+	},
+	/// A consumer's failure was link-specific; its one retry avoids this worker.
+	LinkRetry {
+		consumer: TaskIdentity,
+		avoided: WorkerId,
+	},
+	/// A running attempt whose inputs were invalidated was superseded.
+	Superseded {
+		task: TaskIdentity,
+	},
+	/// A task attempt after the first was dispatched.
+	ReplayDispatched {
+		task: TaskIdentity,
+		worker: WorkerId,
+	},
+	/// A stale outcome (invalidated, superseded, duplicate or closed) was ignored.
+	StaleOutcome {
+		task: TaskIdentity,
+	},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,10 +218,43 @@ pub struct WorkerLossInvalidation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchedulerError {
 	NoLiveWorker,
-	TaskFailed { key: TaskKey, kind: TaskFailureKind },
-	NoProgress { blocked_stages: Vec<StageId> },
-	PartitionManifestMismatch { message: String },
+	TaskFailed {
+		key: TaskKey,
+		kind: TaskFailureKind,
+	},
+	NoProgress {
+		blocked_stages: Vec<StageId>,
+	},
+	PartitionManifestMismatch {
+		message: String,
+	},
 	Acceptance(String),
+	/// ADR 626: an outcome or report that cannot belong to this query's state (never dispatched,
+	/// from the wrong worker, or naming a producer that was not accepted). Raised before any state
+	/// changes.
+	ProtocolViolation {
+		key: TaskKey,
+		reason: String,
+	},
+	/// ADR 626: every live worker is excluded for this query.
+	NoEligibleWorker {
+		query_id: QueryId,
+		excluded: Vec<WorkerId>,
+	},
+	/// ADR 626: a task exhausted its replacement attempts (all causes).
+	ReplacementLimit {
+		key: TaskKey,
+	},
+	/// ADR 626: excluding another worker would leave this query none.
+	ExclusionLimit {
+		query_id: QueryId,
+		worker: WorkerId,
+	},
+	/// ADR 626: a confirmation was refused (or could not be made): terminal, never replay.
+	ConfirmationRefused {
+		worker: WorkerId,
+		reason: String,
+	},
 }
 
 struct TaskAttemptCompletion {
@@ -137,7 +270,53 @@ struct TaskAttemptCompletion {
 	outcome: DispatchOutcome,
 }
 
-type TaskAttemptFuture<'a> = Pin<Box<dyn Future<Output = TaskAttemptCompletion> + Send + 'a>>;
+/// `None` when the attempt was retired (superseded) before it returned: its future was aborted,
+/// which dropped its reservation and its local stream. Work already running on the peer is not
+/// cancelled by this; its outcome, had it arrived, would have been fenced as stale.
+type TaskAttemptFuture<'a> =
+	Pin<Box<dyn Future<Output = Option<TaskAttemptCompletion>> + Send + 'a>>;
+/// What the dispatch loop woke for.
+enum LoopEvent {
+	Completion(Option<TaskAttemptCompletion>),
+	Confirmation((QueryId, WorkerId, ConfirmationOutcome)),
+}
+
+type ConfirmationFuture<'a> =
+	Pin<Box<dyn Future<Output = (QueryId, WorkerId, ConfirmationOutcome)> + Send + 'a>>;
+
+/// ADR 626: one query's recovery state. Query-local: it never touches another query or the
+/// registry's membership, and it ends with the query.
+#[derive(Debug, Default)]
+struct QueryRecovery {
+	excluded: BTreeSet<WorkerId>,
+	/// Attempts dispatched per task, across every `dispatch_loop` call and every cause.
+	attempts: HashMap<TaskKey, u32>,
+	/// A consumer's one link-specific retry, and the worker that retry avoids.
+	link_retried: HashMap<TaskKey, WorkerId>,
+	/// Coalesced suspicions, one per suspected worker, held until their decision is applied.
+	suspicions: HashMap<WorkerId, Suspicion>,
+	/// Consumers whose report awaits a confirmation: not dispatched again until it is decided.
+	parked: HashSet<TaskKey>,
+}
+
+#[derive(Debug, Default)]
+struct Suspicion {
+	started: bool,
+	/// Every waiter, with the exact report association that justified it.
+	consumers: Vec<ParkedConsumer>,
+}
+
+/// One consumer waiting on a confirmation, and the association its report was bound to.
+#[derive(Debug)]
+struct ParkedConsumer {
+	identity: TaskIdentity,
+	worker: WorkerId,
+	kind: TaskFailureKind,
+	producer: TaskKey,
+	producer_attempt: AttemptId,
+	producer_worker: WorkerId,
+	producer_endpoint: String,
+}
 
 pub struct DistributedScheduler<Registry> {
 	registry: Registry,
@@ -147,6 +326,12 @@ pub struct DistributedScheduler<Registry> {
 	runtime_filter_merges: HashMap<(QueryId, StageId), RuntimeFilterMerge>,
 	telemetry: SchedulerTelemetry,
 	max_in_flight_tasks: Option<usize>,
+	/// ADR 626: the inputs of each running attempt, so an invalidation can supersede dependents.
+	running_dependencies: HashMap<TaskIdentity, Vec<PartitionAddress>>,
+	/// ADR 626: the recovery experiment; `None` keeps every recovery path off.
+	recovery: Option<RecoveryExperiment>,
+	query_recovery: HashMap<QueryId, QueryRecovery>,
+	clock: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,7 +353,34 @@ where
 			runtime_filter_merges: HashMap::new(),
 			telemetry: SchedulerTelemetry::default(),
 			max_in_flight_tasks: None,
+			running_dependencies: HashMap::new(),
+			recovery: None,
+			query_recovery: HashMap::new(),
+			clock: Instant::now(),
 		}
+	}
+
+	/// ADR 626: enable bounded recovery from unannounced worker loss for this scheduler's queries.
+	pub fn with_recovery_experiment(mut self, experiment: RecoveryExperiment) -> Self {
+		self.recovery = Some(experiment);
+		self
+	}
+
+	/// ADR 626: the scheduler clock that `RecoveryEvent::at_micros` is measured on, read now. A
+	/// caller records it at an instant of its own (a confirmed kill) so recovery events can be
+	/// stated relative to that instant on one clock.
+	pub fn recovery_clock_micros(&self) -> u64 {
+		u64::try_from(self.clock.elapsed().as_micros()).unwrap_or(u64::MAX)
+	}
+
+	/// ADR 626: the recovery events so far, available whatever `dispatch_loop` returned.
+	pub fn recovery_events(&self) -> &[RecoveryEvent] {
+		&self.telemetry.recovery_events
+	}
+
+	/// ADR 626: drop a finished query's recovery state.
+	pub fn finish_query(&mut self, query_id: QueryId) {
+		self.query_recovery.remove(&query_id);
 	}
 
 	pub fn with_max_in_flight_tasks(mut self, max_in_flight_tasks: Option<usize>) -> Self {
@@ -215,6 +427,9 @@ where
 	}
 
 	pub fn cancel_query(&mut self, query_id: QueryId) -> CancelledTaskCount {
+		self.query_recovery.remove(&query_id);
+		self.running_dependencies
+			.retain(|identity, _| identity.query_id != query_id);
 		self.accepted_manifests
 			.retain(|key, _| key.query_id != query_id);
 		self.task_dependencies
@@ -238,10 +453,19 @@ where
 		D: TaskDispatcher + Send + Sync,
 	{
 		let mut dispatched = Vec::new();
-		let mut final_results = Vec::new();
+		// ADR 626: final batches are owned by the task that produced them, in acceptance order;
+		// an invalidated final task's batches are dropped before the run is returned.
+		let mut final_results: Vec<(TaskKey, Vec<RecordBatch>)> = Vec::new();
 		let mut completed_tasks = BTreeSet::new();
-		let mut in_flight_keys = BTreeSet::new();
+		// The current in-flight attempt of each task. A superseded attempt's future may still be
+		// running; its outcome is fenced when it returns.
+		let mut in_flight_keys: HashMap<TaskKey, TaskIdentity> = HashMap::new();
 		let mut in_flight: FuturesUnordered<TaskAttemptFuture<'_>> = FuturesUnordered::new();
+		// ADR 626: confirmations owned by this loop; dropped with it, nothing detached.
+		let mut confirming: FuturesUnordered<ConfirmationFuture<'_>> = FuturesUnordered::new();
+		// ADR 626: one abort handle per in-flight attempt, so a superseded attempt is retired:
+		// its slot and reservation are released instead of occupying the frontier indefinitely.
+		let mut retirements: HashMap<TaskIdentity, futures::future::AbortHandle> = HashMap::new();
 		let mut attempts_spawned = HashMap::<TaskKey, u32>::new();
 		let retry_limits = stages
 			.iter()
@@ -276,7 +500,10 @@ where
 						break 'stage_scan;
 					}
 					let key = TaskKey::from_identity(task.spec.identity);
-					if completed_tasks.contains(&key) || in_flight_keys.contains(&key) {
+					if completed_tasks.contains(&key)
+						|| in_flight_keys.contains_key(&key)
+						|| self.is_parked(key)
+					{
 						continue;
 					}
 					match self.state.acceptance_state(key) {
@@ -308,12 +535,9 @@ where
 					// ADR 555 §3: acquisition yields an owned reservation, and the
 					// increment happens under the registry's write lock so the next
 					// selector sees it. Affinity still wins when its worker is live
-					// (§5); only the fallback consults load.
-					let reservation = self
-						.preferred_live_consumer_worker(stage, task, stages)
-						.and_then(|worker_id| self.registry.reserve(worker_id))
-						.or_else(|| self.registry.select_and_reserve(&PlacementHints))
-						.ok_or(SchedulerError::NoLiveWorker)?;
+					// (§5); only the fallback consults load. ADR 626: both honour the
+					// query's exclusions.
+					let reservation = self.place(stage, task, stages, key)?;
 					let worker_id = reservation.worker_id();
 					let worker = self
 						.registry
@@ -324,6 +548,7 @@ where
 						.pending_attempt(key)
 						.map(|identity| identity.attempt_id)
 						.unwrap_or_else(AttemptId::first);
+					self.count_recovery_attempt(key.attempt(attempt_id), worker_id)?;
 					let mut spec = self.materialize_task_spec(task.spec.clone(), stages)?;
 					spec.identity = TaskIdentity::new(
 						spec.identity.query_id,
@@ -336,8 +561,10 @@ where
 						.set_attempt_state(spec.identity, AttemptState::Dispatched { worker_id });
 					self.state
 						.set_attempt_state(spec.identity, AttemptState::Running { worker_id });
+					self.running_dependencies
+						.insert(spec.identity, task_dependencies(&spec));
 					dispatched.push(spec.identity);
-					in_flight_keys.insert(key);
+					in_flight_keys.insert(key, spec.identity);
 					*attempts_spawned.entry(key).or_default() += 1;
 					admitted = true;
 
@@ -345,7 +572,9 @@ where
 					if let Some(trace_context) = crate::telemetry::dispatch_trace_context(&spec) {
 						spec.context.trace_context = Some(trace_context);
 					}
-					in_flight.push(Box::pin(async move {
+					let (retire, registration) = futures::future::AbortHandle::new_pair();
+					retirements.insert(spec.identity, retire);
+					let attempt = async move {
 						// The future is the reservation's single owner. An early `?`
 						// from this loop drops `in_flight`, dropping pending futures
 						// and releasing their reservations — no manual path needed.
@@ -367,14 +596,17 @@ where
 							dispatch_wait_micros: duration_micros(dispatch_started),
 							outcome,
 						}
-					}));
+					};
+					in_flight.push(Box::pin(
+						futures::future::Abortable::new(attempt, registration).map(Result::ok),
+					));
 				}
 			}
 
 			if completed_tasks.len() >= expected_task_count {
 				break;
 			}
-			if in_flight.is_empty() {
+			if in_flight.is_empty() && confirming.is_empty() {
 				if admitted {
 					continue;
 				}
@@ -383,24 +615,68 @@ where
 				});
 			}
 
-			let Some(completion) = in_flight.next().await else {
-				continue;
+			// With no confirmation pending this is the plain in-flight frontier. While one is
+			// pending, `biased` applies ready task outcomes before confirmation results, so every
+			// report that is already in has joined its suspicion before that suspicion is decided.
+			let next = if confirming.is_empty() {
+				match in_flight.next().await {
+					Some(completion) => LoopEvent::Completion(completion),
+					None => continue,
+				}
+			} else {
+				tokio::select! {
+					biased;
+					Some(completion) = in_flight.next(), if !in_flight.is_empty() => {
+						LoopEvent::Completion(completion)
+					}
+					Some(decided) = confirming.next() => LoopEvent::Confirmation(decided),
+				}
 			};
-			in_flight_keys.remove(&completion.key);
-			self.accept_dispatch_outcome(
-				completion,
-				stages,
-				&mut completed_tasks,
-				&attempts_spawned,
-				&retry_limits,
-				&mut final_results,
-			)?;
+			match next {
+				// A retired attempt: nothing to apply; its slot is already free.
+				LoopEvent::Completion(None) => {}
+				LoopEvent::Completion(Some(completion)) => {
+					retirements.remove(&completion.identity);
+					if in_flight_keys.get(&completion.key) == Some(&completion.identity) {
+						in_flight_keys.remove(&completion.key);
+					}
+					let suspected = self.accept_dispatch_outcome(
+						completion,
+						stages,
+						&mut completed_tasks,
+						&attempts_spawned,
+						&retry_limits,
+						&mut final_results,
+					)?;
+					for (query_id, worker_id) in suspected {
+						confirming.push(self.start_confirmation(dispatcher, query_id, worker_id));
+					}
+				}
+				LoopEvent::Confirmation((query_id, worker_id, outcome)) => {
+					let superseded = self.apply_confirmation(
+						query_id,
+						worker_id,
+						outcome,
+						&mut completed_tasks,
+						&mut final_results,
+						&mut in_flight_keys,
+					)?;
+					for identity in superseded {
+						if let Some(retire) = retirements.remove(&identity) {
+							retire.abort();
+						}
+					}
+				}
+			}
 		}
 
 		Ok(SchedulerRun {
 			dispatched,
 			accepted_manifests: self.accepted_manifests.clone(),
-			final_results,
+			final_results: final_results
+				.into_iter()
+				.flat_map(|(_, batches)| batches)
+				.collect(),
 			telemetry: self.telemetry.clone(),
 		})
 	}
@@ -457,9 +733,43 @@ where
 		completed_tasks: &mut BTreeSet<TaskKey>,
 		attempts_spawned: &HashMap<TaskKey, u32>,
 		retry_limits: &HashMap<TaskKey, u32>,
-		final_results: &mut Vec<RecordBatch>,
-	) -> Result<(), SchedulerError> {
+		final_results: &mut Vec<(TaskKey, Vec<RecordBatch>)>,
+	) -> Result<Vec<(QueryId, WorkerId)>, SchedulerError> {
 		let key = completion.key;
+		let identity = completion.identity;
+		self.running_dependencies.remove(&identity);
+		// ADR 626: one validated transition. The outcome is classified before anything changes:
+		// a stale outcome is ignored, a violation is raised, only the current attempt applies.
+		match self
+			.state
+			.outcome_disposition(identity, completion.worker_id)
+		{
+			OutcomeDisposition::Current => {}
+			OutcomeDisposition::Stale => {
+				self.telemetry.stale_rejection_count =
+					self.telemetry.stale_rejection_count.saturating_add(1);
+				self.record_event(RecoveryEventKind::StaleOutcome { task: identity });
+				return Ok(Vec::new());
+			}
+			OutcomeDisposition::Unknown => {
+				return Err(SchedulerError::ProtocolViolation {
+					key,
+					reason: format!(
+						"an outcome for attempt {} that was never dispatched",
+						identity.attempt_id.get()
+					),
+				});
+			}
+			OutcomeDisposition::WrongWorker => {
+				return Err(SchedulerError::ProtocolViolation {
+					key,
+					reason: format!(
+						"an outcome for attempt {} from a worker it was not dispatched to",
+						identity.attempt_id.get()
+					),
+				});
+			}
+		}
 		let spec = completion.spec;
 		let dispatch_span = crate::telemetry::dispatch_span(&spec);
 		match completion.outcome {
@@ -475,6 +785,7 @@ where
 				)?;
 				self.refresh_drained_producers(stages);
 				completed_tasks.insert(key);
+				Ok(Vec::new())
 			}
 			DispatchOutcome::CompletedWithBatches { output, batches } => {
 				self.accept_dispatch_completion(
@@ -488,6 +799,7 @@ where
 				)?;
 				self.refresh_drained_producers(stages);
 				completed_tasks.insert(key);
+				Ok(Vec::new())
 			}
 			DispatchOutcome::CompletedWithTelemetry {
 				output,
@@ -514,17 +826,18 @@ where
 				)?;
 				self.refresh_drained_producers(stages);
 				completed_tasks.insert(key);
+				Ok(Vec::new())
 			}
-			DispatchOutcome::Failed(kind) => {
-				self.accept_dispatch_failure(
-					key,
-					completion.identity,
-					attempts_spawned,
-					retry_limits,
-					&dispatch_span,
-					kind,
-				)?;
-			}
+			DispatchOutcome::Failed(kind) => self.accept_failure(
+				key,
+				identity,
+				completion.worker_id,
+				&spec,
+				attempts_spawned,
+				retry_limits,
+				&dispatch_span,
+				kind,
+			),
 			DispatchOutcome::FailedWithTelemetry {
 				kind,
 				mut telemetry,
@@ -538,17 +851,529 @@ where
 					worker_id: completion.worker_id,
 					telemetry,
 				});
-				self.accept_dispatch_failure(
+				self.accept_failure(
 					key,
-					completion.identity,
+					identity,
+					completion.worker_id,
+					&spec,
 					attempts_spawned,
 					retry_limits,
 					&dispatch_span,
 					kind,
+				)
+			}
+			DispatchOutcome::WorkerUnreachable { failure, .. } => {
+				self.handle_worker_unreachable(
+					key,
+					identity,
+					completion.worker_id,
+					failure,
+					attempts_spawned,
+					retry_limits,
+					&dispatch_span,
 				)?;
+				Ok(Vec::new())
 			}
 		}
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn accept_failure(
+		&mut self,
+		key: TaskKey,
+		identity: TaskIdentity,
+		worker_id: WorkerId,
+		spec: &TaskSpec,
+		attempts_spawned: &HashMap<TaskKey, u32>,
+		retry_limits: &HashMap<TaskKey, u32>,
+		dispatch_span: &tracing::Span,
+		kind: TaskFailureKind,
+	) -> Result<Vec<(QueryId, WorkerId)>, SchedulerError> {
+		if self.recovery.is_some() && matches!(kind, TaskFailureKind::ProducerUnreachable { .. }) {
+			crate::telemetry::record_task_failure(dispatch_span, &kind);
+			return self.handle_producer_unreachable(key, identity, worker_id, spec, kind);
+		}
+		self.accept_dispatch_failure(
+			key,
+			identity,
+			attempts_spawned,
+			retry_limits,
+			dispatch_span,
+			kind,
+		)?;
+		Ok(Vec::new())
+	}
+
+	fn is_parked(&self, key: TaskKey) -> bool {
+		self.query_recovery
+			.get(&key.query_id)
+			.is_some_and(|recovery| recovery.parked.contains(&key))
+	}
+
+	fn record_event(&mut self, kind: RecoveryEventKind) {
+		let at_micros = u64::try_from(self.clock.elapsed().as_micros()).unwrap_or(u64::MAX);
+		self.telemetry
+			.recovery_events
+			.push(RecoveryEvent { at_micros, kind });
+	}
+
+	/// ADR 626: the workers a task must not be placed on: the query's exclusions, plus the worker
+	/// a link-specific retry avoids.
+	fn excluded_for(&self, key: TaskKey) -> BTreeSet<WorkerId> {
+		let Some(recovery) = self.query_recovery.get(&key.query_id) else {
+			return BTreeSet::new();
+		};
+		let mut excluded = recovery.excluded.clone();
+		if let Some(worker) = recovery.link_retried.get(&key) {
+			excluded.insert(*worker);
+		}
+		excluded
+	}
+
+	/// Placement for one task: affinity first, then the registry's fallback, both outside the
+	/// task's exclusions. An excluded worker is never used, whatever a registry returns.
+	fn place(
+		&self,
+		stage: &StagePlan,
+		task: &TaskPlan,
+		stages: &[StagePlan],
+		key: TaskKey,
+	) -> Result<WorkerReservation, SchedulerError> {
+		let excluded = self.excluded_for(key);
+		if let Some(reservation) = self
+			.preferred_live_consumer_worker(stage, task, stages)
+			.filter(|worker_id| !excluded.contains(worker_id))
+			.and_then(|worker_id| self.registry.reserve(worker_id))
+		{
+			return Ok(reservation);
+		}
+		if let Some(reservation) = self
+			.registry
+			.select_and_reserve_excluding(&PlacementHints, &excluded)
+			.filter(|reservation| !excluded.contains(&reservation.worker_id()))
+		{
+			return Ok(reservation);
+		}
+		if excluded.is_empty() {
+			Err(SchedulerError::NoLiveWorker)
+		} else {
+			Err(SchedulerError::NoEligibleWorker {
+				query_id: key.query_id,
+				excluded: excluded.into_iter().collect(),
+			})
+		}
+	}
+
+	/// ADR 626: counts a dispatch against the task's replacement limit (all causes) and records a
+	/// replay. Off without the recovery experiment.
+	fn count_recovery_attempt(
+		&mut self,
+		identity: TaskIdentity,
+		worker_id: WorkerId,
+	) -> Result<(), SchedulerError> {
+		if self.recovery.is_none() {
+			return Ok(());
+		}
+		let key = TaskKey::from_identity(identity);
+		let attempts = self
+			.query_recovery
+			.entry(key.query_id)
+			.or_default()
+			.attempts
+			.entry(key)
+			.or_insert(0);
+		if *attempts > REPLACEMENT_LIMIT {
+			return Err(SchedulerError::ReplacementLimit { key });
+		}
+		*attempts += 1;
+		if *attempts > 1 {
+			self.record_event(RecoveryEventKind::ReplayDispatched {
+				task: identity,
+				worker: worker_id,
+			});
+		}
 		Ok(())
+	}
+
+	fn start_confirmation<'a, D>(
+		&mut self,
+		dispatcher: &'a D,
+		query_id: QueryId,
+		worker_id: WorkerId,
+	) -> ConfirmationFuture<'a>
+	where
+		D: TaskDispatcher + Send + Sync,
+	{
+		self.record_event(RecoveryEventKind::ConfirmationStarted {
+			query: query_id,
+			worker: worker_id,
+		});
+		let deadline = self
+			.recovery
+			.map(|experiment| experiment.confirmation_deadline())
+			.expect("a confirmation starts only under the recovery experiment");
+		let entry = self.registry.resolve(worker_id);
+		Box::pin(async move {
+			let outcome = match entry {
+				Some(entry) => dispatcher.confirm_worker(&entry, deadline).await,
+				None => ConfirmationOutcome::Refused {
+					reason: "the suspected worker is not in the registry".to_string(),
+				},
+			};
+			(query_id, worker_id, outcome)
+		})
+	}
+
+	/// ADR 626: excludes a worker from one query's placement (never from the registry).
+	fn exclude_worker(
+		&mut self,
+		query_id: QueryId,
+		worker_id: WorkerId,
+	) -> Result<(), SchedulerError> {
+		let workers = self.registry.list().len();
+		let recovery = self.query_recovery.entry(query_id).or_default();
+		if recovery.excluded.contains(&worker_id) {
+			return Ok(());
+		}
+		if recovery.excluded.len() + 1 > workers.saturating_sub(1) {
+			return Err(SchedulerError::ExclusionLimit {
+				query_id,
+				worker: worker_id,
+			});
+		}
+		recovery.excluded.insert(worker_id);
+		self.record_event(RecoveryEventKind::Excluded {
+			query: query_id,
+			worker: worker_id,
+		});
+		Ok(())
+	}
+
+	/// Marks a failed attempt retryable and opens the task's next attempt (counted at dispatch).
+	fn respawn_failed(&mut self, identity: TaskIdentity, kind: TaskFailureKind) {
+		self.telemetry.retry_count = self.telemetry.retry_count.saturating_add(1);
+		self.state
+			.set_attempt_state(identity, AttemptState::FailedRetryable { kind });
+		let key = TaskKey::from_identity(identity);
+		if self.state.pending_attempt(key).is_none() {
+			self.state
+				.spawn_attempt(key.attempt(identity.attempt_id.next()));
+		}
+	}
+
+	/// ADR 626, the dispatch-target path: the coordinator's own dial timed out. The worker is
+	/// excluded from this query's placement only; its accepted manifests are not touched.
+	#[allow(clippy::too_many_arguments)]
+	fn handle_worker_unreachable(
+		&mut self,
+		key: TaskKey,
+		identity: TaskIdentity,
+		worker_id: WorkerId,
+		failure: crate::error::EstablishmentFailure,
+		attempts_spawned: &HashMap<TaskKey, u32>,
+		retry_limits: &HashMap<TaskKey, u32>,
+		dispatch_span: &tracing::Span,
+	) -> Result<(), SchedulerError> {
+		let kind = TaskFailureKind::TaskFailed {
+			reason: format!("worker unreachable: {failure}"),
+			retryable: true,
+		};
+		if self.recovery.is_none() {
+			return self.accept_dispatch_failure(
+				key,
+				identity,
+				attempts_spawned,
+				retry_limits,
+				dispatch_span,
+				kind,
+			);
+		}
+		crate::telemetry::record_task_failure(dispatch_span, &kind);
+		self.record_event(RecoveryEventKind::EstablishmentTimedOut {
+			worker: worker_id,
+			task: identity,
+			failure,
+		});
+		self.exclude_worker(key.query_id, worker_id)?;
+		self.respawn_failed(identity, kind);
+		Ok(())
+	}
+
+	/// ADR 626, the consumer-report path: bind the report to the accepted producer it names, park
+	/// the consumer, and coalesce one confirmation per suspected worker.
+	fn handle_producer_unreachable(
+		&mut self,
+		key: TaskKey,
+		identity: TaskIdentity,
+		worker_id: WorkerId,
+		spec: &TaskSpec,
+		kind: TaskFailureKind,
+	) -> Result<Vec<(QueryId, WorkerId)>, SchedulerError> {
+		let TaskFailureKind::ProducerUnreachable {
+			producer_worker,
+			producer_endpoint,
+			address,
+			failure,
+			..
+		} = &kind
+		else {
+			unreachable!("called only for ProducerUnreachable");
+		};
+		let violation = |reason: &str| {
+			Err(SchedulerError::ProtocolViolation {
+				key,
+				reason: reason.to_string(),
+			})
+		};
+		if !failure.is_liveness() {
+			return violation("a ProducerUnreachable report must carry a liveness failure");
+		}
+		if address.query_id != key.query_id {
+			return violation("the report names another query's partition");
+		}
+		if !task_dependencies(spec).contains(address) {
+			return violation("the report names a partition its consumer attempt was not given");
+		}
+		let producer_key = TaskKey::new(
+			address.query_id,
+			address.producer_stage_id,
+			address.producer_task_id,
+		);
+		let waiter = ParkedConsumer {
+			identity,
+			worker: worker_id,
+			kind: kind.clone(),
+			producer: producer_key,
+			producer_attempt: address.attempt_id,
+			producer_worker: *producer_worker,
+			producer_endpoint: producer_endpoint.clone(),
+		};
+		if !self.association_current(&waiter) {
+			return violation("the report does not name the currently accepted producer");
+		}
+		let producer_worker = *producer_worker;
+		self.record_event(RecoveryEventKind::ReportAccepted {
+			consumer: identity,
+			producer: producer_key.attempt(address.attempt_id),
+			worker: producer_worker,
+		});
+		// Parked: failed, but not reopened until the confirmation decides.
+		self.state
+			.set_attempt_state(identity, AttemptState::FailedRetryable { kind });
+		let recovery = self.query_recovery.entry(key.query_id).or_default();
+		recovery.parked.insert(key);
+		let suspicion = recovery.suspicions.entry(producer_worker).or_default();
+		suspicion.consumers.push(waiter);
+		if suspicion.started {
+			return Ok(Vec::new());
+		}
+		suspicion.started = true;
+		Ok(vec![(key.query_id, producer_worker)])
+	}
+
+	/// The producer a waiter's report named is still the accepted one, on the same worker and
+	/// endpoint.
+	fn association_current(&self, waiter: &ParkedConsumer) -> bool {
+		let manifest_bound =
+			self.accepted_manifests
+				.get(&waiter.producer)
+				.is_some_and(|manifest| {
+					manifest.attempt_id == waiter.producer_attempt
+						&& manifest.producer_worker_id == waiter.producer_worker
+						&& manifest.producer_endpoint.as_str() == waiter.producer_endpoint
+				});
+		manifest_bound
+			&& matches!(
+				self.state.acceptance_state(waiter.producer),
+				AcceptanceState::LiveAccepted { attempt_id, worker_id: accepted_on, .. }
+					if attempt_id == waiter.producer_attempt && accepted_on == waiter.producer_worker
+			)
+	}
+
+	/// A parked consumer is still current: its failed attempt is the task's newest and the task
+	/// is still open.
+	fn parked_still_current(&self, identity: TaskIdentity) -> bool {
+		let key = TaskKey::from_identity(identity);
+		matches!(
+			self.state.attempt_state(identity),
+			Some(AttemptState::FailedRetryable { .. })
+		) && self.state.pending_attempt(key).is_none()
+			&& self.state.running_attempt(key).is_none()
+			&& matches!(self.state.acceptance_state(key), AcceptanceState::Open)
+	}
+
+	/// ADR 626: apply a confirmation, fenced. Every waiter's consumer and report association is
+	/// checked again against the current state before ANY outcome acts; only current waiters
+	/// count. A confirmation with none left is discarded: no exclusion, retry or refusal.
+	/// Returns the running attempts it superseded, for the loop to retire.
+	#[allow(clippy::too_many_arguments)]
+	fn apply_confirmation(
+		&mut self,
+		query_id: QueryId,
+		worker_id: WorkerId,
+		outcome: ConfirmationOutcome,
+		completed_tasks: &mut BTreeSet<TaskKey>,
+		final_results: &mut Vec<(TaskKey, Vec<RecordBatch>)>,
+		in_flight_keys: &mut HashMap<TaskKey, TaskIdentity>,
+	) -> Result<Vec<TaskIdentity>, SchedulerError> {
+		self.record_event(RecoveryEventKind::ConfirmationEnded {
+			query: query_id,
+			worker: worker_id,
+			outcome: outcome.clone(),
+		});
+		let Some(suspicion) = self
+			.query_recovery
+			.get_mut(&query_id)
+			.and_then(|recovery| recovery.suspicions.remove(&worker_id))
+		else {
+			return Ok(Vec::new());
+		};
+		// The decision releases every consumer it held, whatever it is.
+		if let Some(recovery) = self.query_recovery.get_mut(&query_id) {
+			for consumer in &suspicion.consumers {
+				recovery
+					.parked
+					.remove(&TaskKey::from_identity(consumer.identity));
+			}
+		}
+		let mut current = Vec::new();
+		for waiter in suspicion.consumers {
+			let consumer_current = self.parked_still_current(waiter.identity);
+			if consumer_current && self.association_current(&waiter) {
+				current.push(waiter);
+			} else if consumer_current {
+				// Its producer was replaced by another path: the replacement owns its progress.
+				self.respawn_failed(waiter.identity, waiter.kind);
+			}
+		}
+		if current.is_empty() {
+			self.record_event(RecoveryEventKind::ConfirmationDiscarded {
+				query: query_id,
+				worker: worker_id,
+			});
+			return Ok(Vec::new());
+		}
+		match outcome {
+			ConfirmationOutcome::Refused { reason } => Err(SchedulerError::ConfirmationRefused {
+				worker: worker_id,
+				reason,
+			}),
+			ConfirmationOutcome::Unsupported => Err(SchedulerError::ConfirmationRefused {
+				worker: worker_id,
+				reason: "this dispatcher cannot confirm".to_string(),
+			}),
+			ConfirmationOutcome::Acknowledged { .. } => {
+				// Link-specific: each consumer gets one retry on another worker, then terminal.
+				for waiter in current {
+					let key = TaskKey::from_identity(waiter.identity);
+					let recovery = self.query_recovery.entry(query_id).or_default();
+					if recovery.link_retried.contains_key(&key) {
+						self.state.set_attempt_state(
+							waiter.identity,
+							AttemptState::FailedTerminal {
+								kind: waiter.kind.clone(),
+							},
+						);
+						self.state.fail_task(key, waiter.kind.clone());
+						return Err(SchedulerError::TaskFailed {
+							key,
+							kind: waiter.kind,
+						});
+					}
+					recovery.link_retried.insert(key, waiter.worker);
+					self.record_event(RecoveryEventKind::LinkRetry {
+						consumer: waiter.identity,
+						avoided: waiter.worker,
+					});
+					self.respawn_failed(waiter.identity, waiter.kind);
+				}
+				Ok(Vec::new())
+			}
+			ConfirmationOutcome::Liveness { .. } => {
+				self.exclude_worker(query_id, worker_id)?;
+				let superseded = self.invalidate_query_worker(
+					query_id,
+					worker_id,
+					completed_tasks,
+					final_results,
+					in_flight_keys,
+				);
+				for waiter in current {
+					self.respawn_failed(waiter.identity, waiter.kind);
+				}
+				Ok(superseded)
+			}
+		}
+	}
+
+	/// ADR 626: invalidate everything this query has accepted on `worker_id` (query-scoped, never
+	/// `mark_worker_lost`), then its whole dependency closure with ONE worklist: every newly
+	/// invalidated accepted attempt and every newly superseded running attempt is fed back into
+	/// both accepted-dependent discovery (`task_dependencies`) and running-dependent discovery
+	/// (`running_dependencies`, which covers live inputs) until nothing grows. Every invalidated
+	/// task's manifest, recorded inputs, completion and final batches are retired. Returns every
+	/// superseded running attempt, for the loop to retire. Unrelated tasks are untouched.
+	fn invalidate_query_worker(
+		&mut self,
+		query_id: QueryId,
+		worker_id: WorkerId,
+		completed_tasks: &mut BTreeSet<TaskKey>,
+		final_results: &mut Vec<(TaskKey, Vec<RecordBatch>)>,
+		in_flight_keys: &mut HashMap<TaskKey, TaskIdentity>,
+	) -> Vec<TaskIdentity> {
+		let mut invalidated = self.state.invalidate_worker_in_query(query_id, worker_id);
+		let mut frontier = invalidated
+			.iter()
+			.map(|task| (task.key, task.invalidated_attempt))
+			.collect::<HashSet<_>>();
+		let mut superseded = Vec::new();
+		while !frontier.is_empty() {
+			let mut next = HashSet::new();
+			// Accepted tasks that read the frontier.
+			for task in self.invalidate_accepted_dependents(&frontier) {
+				next.insert((task.key, task.invalidated_attempt));
+				invalidated.push(task);
+			}
+			// Running attempts that read the frontier.
+			let running = self
+				.running_dependencies
+				.iter()
+				.filter(|(identity, dependencies)| {
+					identity.query_id == query_id
+						&& dependencies.iter().any(|dependency| {
+							frontier.contains(&(
+								TaskKey::new(
+									dependency.query_id,
+									dependency.producer_stage_id,
+									dependency.producer_task_id,
+								),
+								dependency.attempt_id,
+							))
+						})
+				})
+				.map(|(identity, _)| *identity)
+				.collect::<Vec<_>>();
+			for identity in running {
+				self.running_dependencies.remove(&identity);
+				if self.state.supersede_attempt(identity).is_some() {
+					let key = TaskKey::from_identity(identity);
+					if in_flight_keys.get(&key) == Some(&identity) {
+						in_flight_keys.remove(&key);
+					}
+					next.insert((key, identity.attempt_id));
+					superseded.push(identity);
+					self.record_event(RecoveryEventKind::Superseded { task: identity });
+				}
+			}
+			frontier = next;
+		}
+		for task in &invalidated {
+			self.accepted_manifests.remove(&task.key);
+			self.task_dependencies.remove(&task.key);
+			completed_tasks.remove(&task.key);
+			final_results.retain(|(key, _)| *key != task.key);
+		}
+		superseded
 	}
 
 	fn accept_dispatch_failure(
@@ -599,7 +1424,7 @@ where
 		key: TaskKey,
 		output: TaskCompletionOutput,
 		result_batches: Vec<RecordBatch>,
-		final_results: &mut Vec<RecordBatch>,
+		final_results: &mut Vec<(TaskKey, Vec<RecordBatch>)>,
 	) -> Result<(), SchedulerError> {
 		let identity = spec.identity;
 		self.state
@@ -609,7 +1434,7 @@ where
 			.map_err(|err| SchedulerError::Acceptance(format!("{err:?}")))?;
 		match output {
 			TaskCompletionOutput::FinalResult { .. } => {
-				final_results.extend(result_batches);
+				final_results.push((key, result_batches));
 			}
 			TaskCompletionOutput::ShuffleProducer { mut manifest } => {
 				self.maybe_attach_runtime_filter_fragment(
@@ -638,6 +1463,14 @@ where
 			.iter()
 			.map(|producer| (producer.key, producer.invalidated_attempt))
 			.collect::<HashSet<_>>();
+		self.invalidate_accepted_dependents(&invalidated_producers)
+	}
+
+	/// Invalidates every accepted task whose recorded inputs read one of these attempts.
+	fn invalidate_accepted_dependents(
+		&mut self,
+		invalidated_producers: &HashSet<(TaskKey, AttemptId)>,
+	) -> Vec<InvalidatedTask> {
 		if invalidated_producers.is_empty() {
 			return Vec::new();
 		}
@@ -3737,5 +4570,1485 @@ mod tests {
 			}
 		);
 		assert!(dispatcher.seen().is_empty());
+	}
+	// ---- ADR 626 Stage B: query-local recovery from unannounced loss ----
+
+	const DEAD_DEADLINE: crate::error::EstablishmentFailure =
+		crate::error::EstablishmentFailure::DeadlineExpired {
+			deadline_millis: 5_000,
+		};
+
+	fn recovery_registry(count: u128) -> StaticWorkerRegistry {
+		StaticWorkerRegistry::new((1..=count).map(|id| {
+			let mut entry = worker_entry(WorkerId::from_u128(id), ActiveTaskCount::default());
+			entry.endpoint = WorkerEndpoint::new(format!("127.0.0.1:{}", 9100 + id));
+			entry
+		}))
+	}
+
+	fn experiment() -> RecoveryExperiment {
+		RecoveryExperiment::from_millis(5_000, 12_000).expect("experiment")
+	}
+
+	/// One sealed producer (stage 0) and `consumers` final-stage consumers (stage 1) of it.
+	fn sealed_shuffle(query: u128, consumers: u32) -> Vec<StagePlan> {
+		let exchange_id = ExchangeId::new(7);
+		let mut producer = task(StageId::new(0), TaskId::new(0));
+		producer.spec.identity.query_id = QueryId::from_u128(query);
+		producer.spec.output = TaskOutputBinding::ShuffleProducer {
+			exchange_id,
+			partition_count: crate::distributed::task::PartitionCount::new(1),
+			partition_key: BoundExprProgram::empty(),
+			publish_mode: crate::distributed::task::ShufflePublishMode::Sealed,
+			runtime_filter_probe_target: None,
+		};
+		let consumer_tasks = (0..consumers)
+			.map(|index| {
+				let mut consumer = task(StageId::new(1), TaskId::new(index));
+				consumer.spec.identity.query_id = QueryId::from_u128(query);
+				consumer.spec.inputs = vec![TaskInputBinding::ShuffleConsumer {
+					exchange_id,
+					producer_stage_id: StageId::new(0),
+					partition_id: PartitionId::new(0),
+					producer_partitions: Vec::new(),
+				}];
+				consumer
+			})
+			.collect();
+		vec![
+			StagePlan {
+				stage_id: StageId::new(0),
+				upstream_stages: vec![],
+				tasks: vec![producer],
+			},
+			StagePlan {
+				stage_id: StageId::new(1),
+				upstream_stages: vec![StageId::new(0)],
+				tasks: consumer_tasks,
+			},
+		]
+	}
+
+	/// Workers in `dead_dispatch` time out the coordinator's dial (optionally only for stage 1);
+	/// a consumer whose sealed input lives on a worker in `unreachable_producers` reports
+	/// `ProducerUnreachable`; confirmations follow the script.
+	#[derive(Default)]
+	struct RecoveryDispatcher {
+		dead_dispatch: HashSet<WorkerId>,
+		dead_only_for_consumers: bool,
+		unreachable_producers: HashSet<WorkerId>,
+		/// Overrides the reported attempt (to make an unbound report).
+		reported_attempt: Option<AttemptId>,
+		/// Overrides the reported failure (to make a non-liveness report).
+		reported_failure: Option<crate::error::EstablishmentFailure>,
+		/// When set, only these consumer tasks report an unreachable producer.
+		reporting_tasks: Option<HashSet<TaskId>>,
+		/// Consumer tasks that hang forever while reading from an unreachable producer.
+		hanging_tasks: HashSet<TaskId>,
+		/// Completed consumers return one row each, so duplicated results are countable.
+		rows: bool,
+		confirmations: Mutex<VecDeque<ConfirmationOutcome>>,
+		confirmed: Mutex<Vec<WorkerId>>,
+		seen: Mutex<Vec<(WorkerId, TaskIdentity)>>,
+	}
+
+	impl RecoveryDispatcher {
+		fn confirming(mut self, outcomes: impl IntoIterator<Item = ConfirmationOutcome>) -> Self {
+			self.confirmations = Mutex::new(outcomes.into_iter().collect());
+			self
+		}
+		fn seen(&self) -> Vec<(WorkerId, TaskIdentity)> {
+			self.seen.lock().expect("seen").clone()
+		}
+		fn confirmed(&self) -> Vec<WorkerId> {
+			self.confirmed.lock().expect("confirmed").clone()
+		}
+	}
+
+	#[async_trait]
+	impl TaskDispatcher for RecoveryDispatcher {
+		async fn dispatch(&self, worker: &WorkerEntry, spec: &TaskSpec) -> DispatchOutcome {
+			self.seen
+				.lock()
+				.expect("seen")
+				.push((worker.worker_id, spec.identity));
+			let consumer = spec.identity.stage_id == StageId::new(1);
+			if self.dead_dispatch.contains(&worker.worker_id)
+				&& (consumer || !self.dead_only_for_consumers)
+			{
+				return DispatchOutcome::WorkerUnreachable {
+					failure: DEAD_DEADLINE,
+					elapsed_micros: 5_000_000,
+				};
+			}
+			if let TaskOutputBinding::ShuffleProducer { exchange_id, .. } = spec.output {
+				let mut manifest = manifest_for_spec(spec, exchange_id);
+				manifest.producer_worker_id = worker.worker_id;
+				manifest.producer_endpoint = worker.endpoint.clone();
+				return DispatchOutcome::Completed(TaskCompletionOutput::ShuffleProducer {
+					manifest,
+				});
+			}
+			for input in &spec.inputs {
+				if let TaskInputBinding::ShuffleConsumer {
+					producer_partitions,
+					..
+				} = input
+				{
+					for partition in producer_partitions
+						.iter()
+						.filter_map(ShufflePartitionRef::as_sealed)
+					{
+						if self.unreachable_producers.contains(&partition.worker_id) {
+							let task_id = spec.identity.task_id;
+							if self.hanging_tasks.contains(&task_id) {
+								std::future::pending::<()>().await;
+							}
+							if self
+								.reporting_tasks
+								.as_ref()
+								.is_some_and(|reporting| !reporting.contains(&task_id))
+							{
+								continue;
+							}
+							let mut address = partition.address;
+							if let Some(attempt) = self.reported_attempt {
+								address.attempt_id = attempt;
+							}
+							return DispatchOutcome::Failed(TaskFailureKind::ProducerUnreachable {
+								producer_worker: partition.worker_id,
+								producer_endpoint: partition.endpoint.as_str().to_string(),
+								address,
+								failure: self.reported_failure.clone().unwrap_or(DEAD_DEADLINE),
+								elapsed_micros: 5_000_000,
+							});
+						}
+					}
+				}
+			}
+			if self.rows {
+				let schema = Arc::new(Schema::new(vec![Field::new(
+					"task",
+					DataType::Int64,
+					false,
+				)]));
+				let batch = RecordBatch::try_new(
+					schema,
+					vec![Arc::new(Int64Array::from(vec![i64::from(
+						spec.identity.task_id.get(),
+					)])) as ArrayRef],
+				)
+				.expect("batch");
+				return DispatchOutcome::CompletedWithBatches {
+					output: TaskCompletionOutput::FinalResult {
+						output_digest: None,
+					},
+					batches: vec![batch],
+				};
+			}
+			completed()
+		}
+
+		async fn confirm_worker(
+			&self,
+			worker: &WorkerEntry,
+			_deadline: std::time::Duration,
+		) -> ConfirmationOutcome {
+			self.confirmed
+				.lock()
+				.expect("confirmed")
+				.push(worker.worker_id);
+			self.confirmations
+				.lock()
+				.expect("confirmations")
+				.pop_front()
+				.expect("scripted confirmation")
+		}
+	}
+
+	fn liveness() -> ConfirmationOutcome {
+		ConfirmationOutcome::Liveness {
+			failure: crate::error::EstablishmentFailure::DeadlineExpired {
+				deadline_millis: 12_000,
+			},
+			elapsed_micros: 12_000_000,
+		}
+	}
+
+	fn event_names(scheduler: &DistributedScheduler<StaticWorkerRegistry>) -> Vec<&'static str> {
+		scheduler
+			.telemetry
+			.recovery_events
+			.iter()
+			.map(|event| match event.kind {
+				RecoveryEventKind::EstablishmentTimedOut { .. } => "establishment_timed_out",
+				RecoveryEventKind::ReportAccepted { .. } => "report_accepted",
+				RecoveryEventKind::ConfirmationStarted { .. } => "confirmation_started",
+				RecoveryEventKind::ConfirmationEnded { .. } => "confirmation_ended",
+				RecoveryEventKind::ConfirmationDiscarded { .. } => "confirmation_discarded",
+				RecoveryEventKind::Excluded { .. } => "excluded",
+				RecoveryEventKind::LinkRetry { .. } => "link_retry",
+				RecoveryEventKind::Superseded { .. } => "superseded",
+				RecoveryEventKind::ReplayDispatched { .. } => "replay_dispatched",
+				RecoveryEventKind::StaleOutcome { .. } => "stale_outcome",
+			})
+			.collect()
+	}
+
+	#[tokio::test]
+	async fn a_confirmed_liveness_failure_replays_the_lost_producer_query_locally() {
+		let stages = sealed_shuffle(10, 1);
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		let dispatcher = RecoveryDispatcher {
+			unreachable_producers: HashSet::from([WorkerId::from_u128(1)]),
+			..Default::default()
+		}
+		.confirming([liveness()]);
+		let run = scheduler
+			.dispatch_loop(&stages, &dispatcher)
+			.await
+			.expect("recovers");
+		assert_eq!(dispatcher.confirmed(), vec![WorkerId::from_u128(1)]);
+		let seen = dispatcher.seen();
+		let producer_key = TaskKey::from_identity(stages[0].tasks[0].spec.identity);
+		// The replacement producer and consumer ran, never on the excluded worker.
+		assert!(seen.contains(&(
+			WorkerId::from_u128(2),
+			producer_key.attempt(AttemptId::new(1))
+		)));
+		assert!(
+			seen.iter()
+				.filter(|(_, identity)| identity.attempt_id.get() > 0)
+				.all(|(worker, _)| *worker != WorkerId::from_u128(1)),
+			"{seen:?}"
+		);
+		assert_eq!(
+			run.accepted_manifests[&producer_key].producer_worker_id,
+			WorkerId::from_u128(2)
+		);
+		let events = event_names(&scheduler);
+		for expected in [
+			"report_accepted",
+			"confirmation_started",
+			"confirmation_ended",
+			"excluded",
+			"replay_dispatched",
+		] {
+			assert!(
+				events.contains(&expected),
+				"{expected} missing from {events:?}"
+			);
+		}
+		// Query-local: the registry still lists the worker as live.
+		assert_eq!(
+			scheduler
+				.registry
+				.resolve(WorkerId::from_u128(1))
+				.expect("worker")
+				.status,
+			WorkerStatus::Live
+		);
+		// Scheduler-scope reservations were released exactly once, through every failure,
+		// park and replay (remote work on a peer is a separate property, fenced on return).
+		for id in 1..=3 {
+			assert_eq!(
+				scheduler
+					.registry
+					.resolve(WorkerId::from_u128(id))
+					.expect("worker")
+					.resources
+					.active_tasks,
+				ActiveTaskCount::default(),
+				"worker {id} still holds a reservation"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn a_dispatch_timeout_excludes_the_target_without_invalidating_its_manifests() {
+		let stages = sealed_shuffle(10, 1);
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		let dispatcher = RecoveryDispatcher {
+			dead_dispatch: HashSet::from([WorkerId::from_u128(1)]),
+			dead_only_for_consumers: true,
+			..Default::default()
+		};
+		let run = scheduler
+			.dispatch_loop(&stages, &dispatcher)
+			.await
+			.expect("completes elsewhere");
+		let producer_key = TaskKey::from_identity(stages[0].tasks[0].spec.identity);
+		// The producer accepted on worker 1 stays accepted: the dispatch path invalidates nothing.
+		assert_eq!(
+			run.accepted_manifests[&producer_key].producer_worker_id,
+			WorkerId::from_u128(1)
+		);
+		assert_eq!(
+			run.accepted_manifests[&producer_key].attempt_id,
+			AttemptId::first()
+		);
+		assert!(dispatcher.confirmed().is_empty());
+		let events = event_names(&scheduler);
+		assert!(events.contains(&"establishment_timed_out") && events.contains(&"excluded"));
+		assert!(!events.contains(&"confirmation_started") && !events.contains(&"superseded"));
+		let consumer_key = TaskKey::from_identity(stages[1].tasks[0].spec.identity);
+		assert!(dispatcher.seen().contains(&(
+			WorkerId::from_u128(2),
+			consumer_key.attempt(AttemptId::new(1))
+		)));
+	}
+
+	#[tokio::test]
+	async fn a_link_specific_failure_retries_once_on_another_worker_then_fails() {
+		let stages = sealed_shuffle(10, 1);
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		let dispatcher = RecoveryDispatcher {
+			unreachable_producers: HashSet::from([WorkerId::from_u128(1)]),
+			..Default::default()
+		}
+		.confirming([
+			ConfirmationOutcome::Acknowledged {
+				elapsed_micros: 900,
+			},
+			ConfirmationOutcome::Acknowledged {
+				elapsed_micros: 900,
+			},
+		]);
+		let error = scheduler
+			.dispatch_loop(&stages, &dispatcher)
+			.await
+			.expect_err("a second link-specific failure is terminal");
+		assert!(
+			matches!(
+				error,
+				SchedulerError::TaskFailed {
+					kind: TaskFailureKind::ProducerUnreachable { .. },
+					..
+				}
+			),
+			"{error:?}"
+		);
+		let events = event_names(&scheduler);
+		assert_eq!(
+			events
+				.iter()
+				.filter(|event| **event == "link_retry")
+				.count(),
+			1
+		);
+		assert!(!events.contains(&"excluded"), "{events:?}");
+		let consumer_key = TaskKey::from_identity(stages[1].tasks[0].spec.identity);
+		let consumer_workers = dispatcher
+			.seen()
+			.into_iter()
+			.filter(|(_, identity)| TaskKey::from_identity(*identity) == consumer_key)
+			.map(|(worker, _)| worker)
+			.collect::<Vec<_>>();
+		assert_eq!(consumer_workers.len(), 2);
+		assert_ne!(
+			consumer_workers[0], consumer_workers[1],
+			"the retry avoids the failed worker"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_refused_confirmation_is_terminal_and_replays_nothing() {
+		let stages = sealed_shuffle(10, 1);
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		let dispatcher = RecoveryDispatcher {
+			unreachable_producers: HashSet::from([WorkerId::from_u128(1)]),
+			..Default::default()
+		}
+		.confirming([ConfirmationOutcome::Refused {
+			reason: "TLS alert 42".to_string(),
+		}]);
+		let error = scheduler
+			.dispatch_loop(&stages, &dispatcher)
+			.await
+			.expect_err("refusal is terminal");
+		assert!(
+			matches!(error, SchedulerError::ConfirmationRefused { .. }),
+			"{error:?}"
+		);
+		let events = event_names(&scheduler);
+		assert!(
+			!events.contains(&"excluded") && !events.contains(&"replay_dispatched"),
+			"{events:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_dispatcher_that_cannot_confirm_never_turns_a_report_into_replay() {
+		let stages = sealed_shuffle(10, 1);
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		// ScriptedDispatcher keeps the default `confirm_worker` (Unsupported).
+		let producer_spec = stages[0].tasks[0].spec.clone();
+		let mut manifest = manifest_for_spec(&producer_spec, ExchangeId::new(7));
+		manifest.producer_endpoint = WorkerEndpoint::new("127.0.0.1:9101");
+		let address = PartitionAddress {
+			query_id: producer_spec.identity.query_id,
+			exchange_id: ExchangeId::new(7),
+			producer_stage_id: StageId::new(0),
+			producer_task_id: TaskId::new(0),
+			attempt_id: AttemptId::first(),
+			partition_id: PartitionId::new(0),
+		};
+		let dispatcher = ScriptedDispatcher::new([
+			DispatchOutcome::Completed(TaskCompletionOutput::ShuffleProducer { manifest }),
+			DispatchOutcome::Failed(TaskFailureKind::ProducerUnreachable {
+				producer_worker: WorkerId::from_u128(1),
+				producer_endpoint: "127.0.0.1:9101".to_string(),
+				address,
+				failure: DEAD_DEADLINE,
+				elapsed_micros: 1,
+			}),
+		]);
+		let error = scheduler
+			.dispatch_loop(&stages, &dispatcher)
+			.await
+			.expect_err("unconfirmable");
+		assert!(
+			matches!(error, SchedulerError::ConfirmationRefused { .. }),
+			"{error:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn an_unbound_report_is_a_protocol_violation_before_any_change() {
+		let stages = sealed_shuffle(10, 1);
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		let dispatcher = RecoveryDispatcher {
+			unreachable_producers: HashSet::from([WorkerId::from_u128(1)]),
+			reported_attempt: Some(AttemptId::new(7)),
+			..Default::default()
+		};
+		let error = scheduler
+			.dispatch_loop(&stages, &dispatcher)
+			.await
+			.expect_err("an unbound report");
+		assert!(
+			matches!(error, SchedulerError::ProtocolViolation { .. }),
+			"{error:?}"
+		);
+		assert!(dispatcher.confirmed().is_empty());
+		assert!(scheduler.telemetry.recovery_events.is_empty());
+	}
+
+	#[tokio::test]
+	async fn simultaneous_reports_of_one_worker_share_one_confirmation() {
+		let stages = sealed_shuffle(10, 2);
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		let dispatcher = RecoveryDispatcher {
+			unreachable_producers: HashSet::from([WorkerId::from_u128(1)]),
+			..Default::default()
+		}
+		.confirming([liveness()]);
+		scheduler
+			.dispatch_loop(&stages, &dispatcher)
+			.await
+			.expect("recovers");
+		assert_eq!(
+			dispatcher.confirmed(),
+			vec![WorkerId::from_u128(1)],
+			"coalesced"
+		);
+		let events = event_names(&scheduler);
+		assert_eq!(
+			events
+				.iter()
+				.filter(|event| **event == "report_accepted")
+				.count(),
+			2
+		);
+		assert_eq!(
+			events.iter().filter(|event| **event == "excluded").count(),
+			1
+		);
+	}
+
+	#[tokio::test]
+	async fn a_late_liveness_confirmation_is_discarded_without_a_second_replay() {
+		let stages = sealed_shuffle(10, 1);
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		let producer = stages[0].tasks[0].spec.identity;
+		let key = TaskKey::from_identity(producer);
+		// The producer was accepted on worker 1, suspected, then replaced and re-accepted on
+		// worker 2 by another path before the confirmation came back.
+		scheduler.state.spawn_attempt(producer);
+		scheduler.state.set_attempt_state(
+			producer,
+			AttemptState::Completed {
+				worker_id: WorkerId::from_u128(1),
+			},
+		);
+		scheduler
+			.state
+			.accept_completed(producer, WorkerId::from_u128(1))
+			.expect("accept");
+		let suspicion = scheduler
+			.query_recovery
+			.entry(key.query_id)
+			.or_default()
+			.suspicions
+			.entry(WorkerId::from_u128(1))
+			.or_default();
+		suspicion.started = true;
+		suspicion.consumers.push(ParkedConsumer {
+			identity: TaskKey::from_identity(stages[1].tasks[0].spec.identity)
+				.attempt(AttemptId::first()),
+			worker: WorkerId::from_u128(3),
+			kind: TaskFailureKind::Cancelled,
+			producer: key,
+			producer_attempt: AttemptId::first(),
+			producer_worker: WorkerId::from_u128(1),
+			producer_endpoint: "127.0.0.1:9101".to_string(),
+		});
+		scheduler.state.invalidate_task(key).expect("invalidate");
+		scheduler.state.reopen_invalidated(key).expect("reopen");
+		let replacement = key.attempt(AttemptId::new(1));
+		scheduler.state.set_attempt_state(
+			replacement,
+			AttemptState::Completed {
+				worker_id: WorkerId::from_u128(2),
+			},
+		);
+		scheduler
+			.state
+			.accept_completed(replacement, WorkerId::from_u128(2))
+			.expect("accept replacement");
+		let (mut completed, mut finals, mut in_flight) =
+			(BTreeSet::new(), Vec::new(), HashMap::new());
+		scheduler
+			.apply_confirmation(
+				key.query_id,
+				WorkerId::from_u128(1),
+				liveness(),
+				&mut completed,
+				&mut finals,
+				&mut in_flight,
+			)
+			.expect("applied");
+		assert_eq!(
+			event_names(&scheduler),
+			vec!["confirmation_ended", "confirmation_discarded"]
+		);
+		assert_eq!(
+			scheduler.state.acceptance_state(key),
+			AcceptanceState::LiveAccepted {
+				attempt_id: AttemptId::new(1),
+				worker_id: WorkerId::from_u128(2),
+				drained: false
+			}
+		);
+	}
+
+	#[tokio::test]
+	async fn stale_and_unknown_outcomes_are_fenced_before_any_change() {
+		let stages = sealed_shuffle(10, 1);
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		let consumer = stages[1].tasks[0].spec.clone();
+		let worker = WorkerId::from_u128(2);
+		scheduler.state.spawn_attempt(consumer.identity);
+		scheduler.state.set_attempt_state(
+			consumer.identity,
+			AttemptState::Running { worker_id: worker },
+		);
+		scheduler
+			.state
+			.supersede_attempt(consumer.identity)
+			.expect("superseded");
+		let completion = |identity: TaskIdentity, worker_id: WorkerId| TaskAttemptCompletion {
+			key: TaskKey::from_identity(identity),
+			identity,
+			worker_id,
+			reservation: WorkerReservation::unreserved(worker_id),
+			spec: TaskSpec {
+				identity,
+				..consumer.clone()
+			},
+			dispatch_wait_micros: 0,
+			outcome: DispatchOutcome::CompletedWithBatches {
+				output: TaskCompletionOutput::FinalResult {
+					output_digest: None,
+				},
+				batches: vec![RecordBatch::new_empty(Arc::new(Schema::empty()))],
+			},
+		};
+		let (mut completed, mut finals) = (BTreeSet::new(), Vec::new());
+		let suspected = scheduler
+			.accept_dispatch_outcome(
+				completion(consumer.identity, worker),
+				&stages,
+				&mut completed,
+				&HashMap::new(),
+				&HashMap::new(),
+				&mut finals,
+			)
+			.expect("a stale outcome is ignored");
+		assert!(suspected.is_empty() && completed.is_empty() && finals.is_empty());
+		assert_eq!(scheduler.telemetry.stale_rejection_count, 1);
+		assert_eq!(
+			scheduler
+				.state
+				.acceptance_state(TaskKey::from_identity(consumer.identity)),
+			AcceptanceState::Open
+		);
+		let never = TaskKey::from_identity(consumer.identity).attempt(AttemptId::new(5));
+		let error = scheduler
+			.accept_dispatch_outcome(
+				completion(never, worker),
+				&stages,
+				&mut completed,
+				&HashMap::new(),
+				&HashMap::new(),
+				&mut finals,
+			)
+			.expect_err("never dispatched");
+		assert!(matches!(error, SchedulerError::ProtocolViolation { .. }));
+		let replacement = TaskKey::from_identity(consumer.identity).attempt(AttemptId::new(1));
+		scheduler
+			.state
+			.set_attempt_state(replacement, AttemptState::Running { worker_id: worker });
+		let error = scheduler
+			.accept_dispatch_outcome(
+				completion(replacement, WorkerId::from_u128(3)),
+				&stages,
+				&mut completed,
+				&HashMap::new(),
+				&HashMap::new(),
+				&mut finals,
+			)
+			.expect_err("wrong worker");
+		assert!(matches!(error, SchedulerError::ProtocolViolation { .. }));
+		assert!(finals.is_empty());
+	}
+
+	/// Stage C coverage: a superseded attempt's sealed manifest, failure, liveness report and task
+	/// telemetry are each fenced by the disposition alone. Unit-only: in `dispatch_loop` a superseded
+	/// attempt is retired before it can return.
+	#[tokio::test]
+	async fn stale_manifests_failures_reports_and_telemetry_change_nothing() {
+		let stages = sealed_shuffle(10, 1);
+		let producer = stages[0].tasks[0].spec.clone();
+		let consumer = stages[1].tasks[0].spec.clone();
+		let mut telemetry = TaskTelemetry::default();
+		telemetry.counters.pulled_shuffle_bytes = 128;
+		let superseded = |scheduler: &mut DistributedScheduler<StaticWorkerRegistry>,
+		                  identity: TaskIdentity,
+		                  worker: u128| {
+			scheduler.state.spawn_attempt(identity);
+			scheduler.state.set_attempt_state(
+				identity,
+				AttemptState::Running {
+					worker_id: WorkerId::from_u128(worker),
+				},
+			);
+			scheduler
+				.state
+				.supersede_attempt(identity)
+				.expect("superseded");
+		};
+		let completion =
+			|spec: &TaskSpec, worker: u128, outcome: DispatchOutcome| TaskAttemptCompletion {
+				key: TaskKey::from_identity(spec.identity),
+				identity: spec.identity,
+				worker_id: WorkerId::from_u128(worker),
+				reservation: WorkerReservation::unreserved(WorkerId::from_u128(worker)),
+				spec: spec.clone(),
+				dispatch_wait_micros: 0,
+				outcome,
+			};
+
+		// A superseded producer's sealed manifest, with telemetry.
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		superseded(&mut scheduler, producer.identity, 1);
+		// A superseded consumer's failure and its liveness report against an accepted producer.
+		let mut reporting =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		accept_directly(&mut reporting, producer.identity, 1, true);
+		superseded(&mut reporting, consumer.identity, 2);
+		let outcomes = [
+			(
+				&mut scheduler,
+				completion(
+					&producer,
+					1,
+					DispatchOutcome::CompletedWithTelemetry {
+						output: TaskCompletionOutput::ShuffleProducer {
+							manifest: manifest_for_spec(&producer, ExchangeId::new(7)),
+						},
+						batches: Vec::new(),
+						telemetry: telemetry.clone(),
+					},
+				),
+			),
+			(
+				&mut reporting,
+				completion(
+					&consumer,
+					2,
+					DispatchOutcome::FailedWithTelemetry {
+						kind: TaskFailureKind::TaskFailed {
+							reason: "late".to_string(),
+							retryable: true,
+						},
+						telemetry: telemetry.clone(),
+					},
+				),
+			),
+		];
+		for (scheduler, completion) in outcomes {
+			let (mut completed, mut finals) = (BTreeSet::new(), Vec::new());
+			let suspected = scheduler
+				.accept_dispatch_outcome(
+					completion,
+					&stages,
+					&mut completed,
+					&HashMap::new(),
+					&HashMap::new(),
+					&mut finals,
+				)
+				.expect("a stale outcome is ignored");
+			assert!(suspected.is_empty() && completed.is_empty() && finals.is_empty());
+		}
+		let manifests_before = reporting.accepted_manifests.clone();
+		let address = address_of(producer.identity);
+		let report = completion(
+			&consumer,
+			2,
+			DispatchOutcome::Failed(TaskFailureKind::ProducerUnreachable {
+				producer_worker: WorkerId::from_u128(1),
+				producer_endpoint: "127.0.0.1:9101".to_string(),
+				address,
+				failure: DEAD_DEADLINE,
+				elapsed_micros: 5_000_000,
+			}),
+		);
+		let (mut completed, mut finals) = (BTreeSet::new(), Vec::new());
+		let suspected = reporting
+			.accept_dispatch_outcome(
+				report,
+				&stages,
+				&mut completed,
+				&HashMap::new(),
+				&HashMap::new(),
+				&mut finals,
+			)
+			.expect("a stale report is ignored");
+		assert!(suspected.is_empty(), "a stale report raises no suspicion");
+
+		assert!(
+			scheduler.accepted_manifests.is_empty(),
+			"no stale manifest is accepted"
+		);
+		assert_eq!(
+			scheduler
+				.state
+				.acceptance_state(TaskKey::from_identity(producer.identity)),
+			AcceptanceState::Open
+		);
+		assert_eq!(reporting.accepted_manifests, manifests_before);
+		assert_eq!(
+			reporting
+				.state
+				.acceptance_state(TaskKey::from_identity(consumer.identity)),
+			AcceptanceState::Open
+		);
+		for (scheduler, stale) in [(&scheduler, 1), (&reporting, 2)] {
+			assert!(
+				scheduler.telemetry.task_telemetry.is_empty(),
+				"no stale telemetry is recorded"
+			);
+			assert_eq!(scheduler.telemetry.retry_count, 0);
+			assert_eq!(scheduler.telemetry.stale_rejection_count, stale);
+			assert_eq!(
+				event_names(scheduler),
+				vec!["stale_outcome"; stale as usize]
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn the_replacement_limit_and_the_exclusion_limit_end_in_typed_errors() {
+		let stages = sealed_shuffle(10, 1);
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(5)).with_recovery_experiment(experiment());
+		let dispatcher = RecoveryDispatcher {
+			dead_dispatch: (1..=4).map(WorkerId::from_u128).collect(),
+			..Default::default()
+		};
+		let error = scheduler
+			.dispatch_loop(&stages, &dispatcher)
+			.await
+			.expect_err("limit");
+		assert!(
+			matches!(error, SchedulerError::ReplacementLimit { .. }),
+			"{error:?}"
+		);
+
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		let dispatcher = RecoveryDispatcher {
+			dead_dispatch: (1..=3).map(WorkerId::from_u128).collect(),
+			..Default::default()
+		};
+		let error = scheduler
+			.dispatch_loop(&stages, &dispatcher)
+			.await
+			.expect_err("limit");
+		assert!(
+			matches!(error, SchedulerError::ExclusionLimit { .. }),
+			"{error:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn exclusions_survive_dispatch_loop_calls_and_stay_with_their_query() {
+		let stages = sealed_shuffle(10, 1);
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		let dispatcher = RecoveryDispatcher {
+			dead_dispatch: HashSet::from([WorkerId::from_u128(1)]),
+			..Default::default()
+		};
+		scheduler
+			.dispatch_loop(&stages[..1], &dispatcher)
+			.await
+			.expect("producer stage");
+		let healthy = RecoveryDispatcher::default();
+		scheduler
+			.dispatch_loop(&stages, &healthy)
+			.await
+			.expect("consumer stage");
+		assert!(
+			healthy
+				.seen()
+				.iter()
+				.all(|(worker, _)| *worker != WorkerId::from_u128(1)),
+			"{:?}",
+			healthy.seen()
+		);
+		// Another query on the same scheduler may use worker 1.
+		let other = sealed_shuffle(11, 1);
+		let fresh = RecoveryDispatcher::default();
+		scheduler
+			.dispatch_loop(&other, &fresh)
+			.await
+			.expect("other query");
+		assert!(
+			fresh
+				.seen()
+				.iter()
+				.any(|(worker, _)| *worker == WorkerId::from_u128(1)),
+			"{:?}",
+			fresh.seen()
+		);
+		scheduler.finish_query(QueryId::from_u128(10));
+		assert!(
+			!scheduler
+				.query_recovery
+				.contains_key(&QueryId::from_u128(10))
+		);
+	}
+
+	#[tokio::test]
+	async fn without_the_experiment_nothing_recovers_or_excludes() {
+		let stages = sealed_shuffle(10, 1);
+		let mut scheduler = DistributedScheduler::new(recovery_registry(3));
+		let dispatcher = RecoveryDispatcher {
+			dead_dispatch: HashSet::from([WorkerId::from_u128(1)]),
+			..Default::default()
+		};
+		let error = scheduler
+			.dispatch_loop(&stages, &dispatcher)
+			.await
+			.expect_err("the default retry policy gives up");
+		assert!(
+			matches!(error, SchedulerError::TaskFailed { .. }),
+			"{error:?}"
+		);
+		assert!(scheduler.telemetry.recovery_events.is_empty());
+		assert!(scheduler.query_recovery.is_empty());
+	}
+	// ---- ADR 626 Stage B review fixes: closure, retirement, fenced confirmation ----
+
+	/// Put an accepted task with its manifest (if a producer) straight into scheduler state.
+	fn accept_directly(
+		scheduler: &mut DistributedScheduler<StaticWorkerRegistry>,
+		identity: TaskIdentity,
+		worker: u128,
+		producer: bool,
+	) {
+		let worker_id = WorkerId::from_u128(worker);
+		scheduler.state.spawn_attempt(identity);
+		scheduler
+			.state
+			.set_attempt_state(identity, AttemptState::Completed { worker_id });
+		scheduler
+			.state
+			.accept_completed(identity, worker_id)
+			.expect("accept");
+		if producer {
+			let key = TaskKey::from_identity(identity);
+			scheduler.accepted_manifests.insert(
+				key,
+				PartitionManifest {
+					query_id: key.query_id,
+					stage_id: key.stage_id,
+					task_id: key.task_id,
+					attempt_id: identity.attempt_id,
+					exchange_id: ExchangeId::new(7),
+					producer_worker_id: worker_id,
+					producer_endpoint: WorkerEndpoint::new(format!("127.0.0.1:{}", 9100 + worker)),
+					partitions: Vec::new(),
+					runtime_filter_fragment: None,
+					backend: PartitionBackend::InMemory,
+				},
+			);
+		}
+	}
+
+	fn address_of(identity: TaskIdentity) -> PartitionAddress {
+		PartitionAddress {
+			query_id: identity.query_id,
+			exchange_id: ExchangeId::new(7),
+			producer_stage_id: identity.stage_id,
+			producer_task_id: identity.task_id,
+			attempt_id: identity.attempt_id,
+			partition_id: PartitionId::new(0),
+		}
+	}
+
+	fn tid(stage: u32, task: u32) -> TaskIdentity {
+		TaskIdentity::new(
+			QueryId::from_u128(10),
+			StageId::new(stage),
+			TaskId::new(task),
+			AttemptId::first(),
+		)
+	}
+
+	#[tokio::test]
+	async fn invalidation_retires_the_whole_dependency_closure_and_nothing_else() {
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		let (p, i, f, u) = (tid(0, 0), tid(1, 0), tid(2, 0), tid(1, 1));
+		let (g, h) = (tid(2, 1), tid(1, 2));
+		accept_directly(&mut scheduler, p, 1, true); // the lost worker's producer
+		accept_directly(&mut scheduler, i, 2, true); // reads P, publishes for F and G
+		scheduler
+			.task_dependencies
+			.insert(TaskKey::from_identity(i), vec![address_of(p)]);
+		accept_directly(&mut scheduler, f, 3, false); // a final task reading I (two hops)
+		scheduler
+			.task_dependencies
+			.insert(TaskKey::from_identity(f), vec![address_of(i)]);
+		accept_directly(&mut scheduler, u, 2, true); // unrelated
+		for (running, input, worker) in [(g, i, 3), (h, p, 2)] {
+			scheduler.state.spawn_attempt(running);
+			scheduler.state.set_attempt_state(
+				running,
+				AttemptState::Running {
+					worker_id: WorkerId::from_u128(worker),
+				},
+			);
+			scheduler
+				.running_dependencies
+				.insert(running, vec![address_of(input)]);
+		}
+		let mut finals = vec![(
+			TaskKey::from_identity(f),
+			vec![RecordBatch::new_empty(Arc::new(Schema::empty()))],
+		)];
+		let mut completed = [p, i, f, u]
+			.iter()
+			.map(|t| TaskKey::from_identity(*t))
+			.collect::<BTreeSet<_>>();
+		let mut in_flight = HashMap::from([
+			(TaskKey::from_identity(g), g),
+			(TaskKey::from_identity(h), h),
+		]);
+		let superseded = scheduler.invalidate_query_worker(
+			QueryId::from_u128(10),
+			WorkerId::from_u128(1),
+			&mut completed,
+			&mut finals,
+			&mut in_flight,
+		);
+		for invalidated in [p, i, f] {
+			assert!(
+				matches!(
+					scheduler
+						.state
+						.acceptance_state(TaskKey::from_identity(invalidated)),
+					AcceptanceState::Invalidated { .. }
+				),
+				"{invalidated:?}"
+			);
+			assert!(!completed.contains(&TaskKey::from_identity(invalidated)));
+		}
+		assert!(
+			!scheduler
+				.accepted_manifests
+				.contains_key(&TaskKey::from_identity(p))
+		);
+		assert!(
+			!scheduler
+				.accepted_manifests
+				.contains_key(&TaskKey::from_identity(i))
+		);
+		assert!(finals.is_empty(), "the final task's batches are retired");
+		let order = |identity: &TaskIdentity| (identity.stage_id.get(), identity.task_id.get());
+		let mut superseded = superseded;
+		superseded.sort_by_key(order);
+		let mut expected = vec![g, h];
+		expected.sort_by_key(order);
+		assert_eq!(superseded, expected);
+		assert!(in_flight.is_empty());
+		for running in [g, h] {
+			assert_eq!(
+				scheduler
+					.state
+					.running_attempt(TaskKey::from_identity(running)),
+				None
+			);
+		}
+		// Unrelated: still accepted, manifest kept.
+		assert!(matches!(
+			scheduler.state.acceptance_state(TaskKey::from_identity(u)),
+			AcceptanceState::LiveAccepted { .. }
+		));
+		assert!(
+			scheduler
+				.accepted_manifests
+				.contains_key(&TaskKey::from_identity(u))
+		);
+		assert!(completed.contains(&TaskKey::from_identity(u)));
+	}
+
+	#[tokio::test]
+	async fn an_accepted_final_task_on_the_lost_worker_replays_without_duplicate_rows() {
+		let stages = sealed_shuffle(10, 2);
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		let dispatcher = RecoveryDispatcher {
+			unreachable_producers: HashSet::from([WorkerId::from_u128(1)]),
+			reporting_tasks: Some(HashSet::from([TaskId::new(1)])),
+			rows: true,
+			..Default::default()
+		}
+		.confirming([liveness()]);
+		let run = scheduler
+			.dispatch_loop(&stages, &dispatcher)
+			.await
+			.expect("recovers");
+		let rows = run
+			.final_results
+			.iter()
+			.map(RecordBatch::num_rows)
+			.sum::<usize>();
+		assert_eq!(rows, 2, "exactly one result row per final task");
+		let consumer0 = TaskKey::from_identity(stages[1].tasks[0].spec.identity);
+		let seen = dispatcher.seen();
+		// The case under test: final task 0 was accepted on the lost worker...
+		assert!(
+			seen.contains(&(
+				WorkerId::from_u128(1),
+				consumer0.attempt(AttemptId::first())
+			)),
+			"final task 0 must first run on worker 1: {seen:?}"
+		);
+		// ...and is replayed elsewhere, once.
+		let replays = seen
+			.iter()
+			.filter(|(_, identity)| *identity == consumer0.attempt(AttemptId::new(1)))
+			.collect::<Vec<_>>();
+		assert_eq!(replays.len(), 1, "{seen:?}");
+		assert_ne!(replays[0].0, WorkerId::from_u128(1));
+	}
+
+	#[tokio::test]
+	async fn superseded_attempts_that_never_return_cannot_fill_a_bounded_frontier() {
+		let stages = sealed_shuffle(10, 4);
+		let registry = recovery_registry(3);
+		let mut scheduler = DistributedScheduler::new(registry)
+			.with_recovery_experiment(experiment())
+			.with_max_in_flight_tasks(Some(2));
+		let dispatcher = RecoveryDispatcher {
+			unreachable_producers: HashSet::from([WorkerId::from_u128(1)]),
+			reporting_tasks: Some(HashSet::from([TaskId::new(0)])),
+			hanging_tasks: HashSet::from([TaskId::new(1), TaskId::new(2), TaskId::new(3)]),
+			..Default::default()
+		}
+		.confirming([liveness()]);
+		// The hanging old attempts are never released; only retirement can free their slots.
+		let run = tokio::time::timeout(
+			std::time::Duration::from_secs(5),
+			scheduler.dispatch_loop(&stages, &dispatcher),
+		)
+		.await
+		.expect("the replacements complete without the old attempts returning")
+		.expect("recovers");
+		assert!(run.dispatched.len() > 5);
+		let events = event_names(&scheduler);
+		assert!(events.contains(&"superseded"), "{events:?}");
+		for id in 1..=3 {
+			assert_eq!(
+				scheduler
+					.registry
+					.resolve(WorkerId::from_u128(id))
+					.expect("worker")
+					.resources
+					.active_tasks,
+				ActiveTaskCount::default(),
+				"worker {id} still holds a reservation"
+			);
+		}
+		for task in &stages[1].tasks {
+			let key = TaskKey::from_identity(task.spec.identity);
+			assert!(scheduler.state.running_attempt(key).is_none());
+		}
+	}
+
+	/// A parked consumer whose report named producer attempt 0 on worker 1, while the producer is
+	/// now accepted at attempt 1 on worker 2 (another path resolved it).
+	fn obsolete_waiter(
+		scheduler: &mut DistributedScheduler<StaticWorkerRegistry>,
+		consumer: TaskIdentity,
+	) {
+		let producer = tid(0, 0);
+		let key = TaskKey::from_identity(producer);
+		accept_directly(scheduler, producer, 1, true);
+		scheduler.state.invalidate_task(key).expect("invalidate");
+		scheduler.state.reopen_invalidated(key).expect("reopen");
+		accept_directly(scheduler, key.attempt(AttemptId::new(1)), 2, true);
+		park(scheduler, consumer, key, AttemptId::first(), 1);
+	}
+
+	fn park(
+		scheduler: &mut DistributedScheduler<StaticWorkerRegistry>,
+		consumer: TaskIdentity,
+		producer: TaskKey,
+		producer_attempt: AttemptId,
+		producer_worker: u128,
+	) {
+		scheduler.state.spawn_attempt(consumer);
+		scheduler.state.set_attempt_state(
+			consumer,
+			AttemptState::FailedRetryable {
+				kind: TaskFailureKind::Cancelled,
+			},
+		);
+		let recovery = scheduler
+			.query_recovery
+			.entry(consumer.query_id)
+			.or_default();
+		recovery.parked.insert(TaskKey::from_identity(consumer));
+		let suspicion = recovery
+			.suspicions
+			.entry(WorkerId::from_u128(1))
+			.or_default();
+		suspicion.started = true;
+		suspicion.consumers.push(ParkedConsumer {
+			identity: consumer,
+			worker: WorkerId::from_u128(3),
+			kind: TaskFailureKind::Cancelled,
+			producer,
+			producer_attempt,
+			producer_worker: WorkerId::from_u128(producer_worker),
+			producer_endpoint: format!("127.0.0.1:{}", 9100 + producer_worker),
+		});
+	}
+
+	#[tokio::test]
+	async fn late_refused_and_acknowledged_confirmations_with_only_obsolete_waiters_are_discarded()
+	{
+		for outcome in [
+			ConfirmationOutcome::Refused {
+				reason: "TLS alert 42".to_string(),
+			},
+			ConfirmationOutcome::Acknowledged {
+				elapsed_micros: 900,
+			},
+			liveness(),
+		] {
+			let mut scheduler = DistributedScheduler::new(recovery_registry(3))
+				.with_recovery_experiment(experiment());
+			let consumer = tid(1, 0);
+			obsolete_waiter(&mut scheduler, consumer);
+			let (mut completed, mut finals, mut in_flight) =
+				(BTreeSet::new(), Vec::new(), HashMap::new());
+			scheduler
+				.apply_confirmation(
+					QueryId::from_u128(10),
+					WorkerId::from_u128(1),
+					outcome.clone(),
+					&mut completed,
+					&mut finals,
+					&mut in_flight,
+				)
+				.unwrap_or_else(|error| {
+					panic!("{outcome:?} with only obsolete waiters must be discarded: {error:?}")
+				});
+			let events = event_names(&scheduler);
+			assert!(events.contains(&"confirmation_discarded"), "{events:?}");
+			assert!(
+				!events.contains(&"excluded") && !events.contains(&"link_retry"),
+				"{events:?}"
+			);
+			// The consumer is not stranded: its replacement attempt is open.
+			assert!(
+				scheduler
+					.state
+					.pending_attempt(TaskKey::from_identity(consumer))
+					.is_some()
+			);
+			assert!(!scheduler.is_parked(TaskKey::from_identity(consumer)));
+		}
+	}
+
+	#[tokio::test]
+	async fn a_coalesced_confirmation_acts_only_for_its_current_waiters() {
+		// One obsolete waiter (its producer was replaced) and one current waiter (bound to the
+		// producer still accepted on worker 1).
+		let build = || {
+			let mut scheduler = DistributedScheduler::new(recovery_registry(3))
+				.with_recovery_experiment(experiment());
+			obsolete_waiter(&mut scheduler, tid(1, 0));
+			let current_producer = tid(0, 1);
+			accept_directly(&mut scheduler, current_producer, 1, true);
+			park(
+				&mut scheduler,
+				tid(1, 1),
+				TaskKey::from_identity(current_producer),
+				AttemptId::first(),
+				1,
+			);
+			scheduler
+		};
+		let (mut completed, mut finals, mut in_flight) =
+			(BTreeSet::new(), Vec::new(), HashMap::new());
+		let mut refused = build();
+		let error = refused
+			.apply_confirmation(
+				QueryId::from_u128(10),
+				WorkerId::from_u128(1),
+				ConfirmationOutcome::Refused {
+					reason: "TLS".into(),
+				},
+				&mut completed,
+				&mut finals,
+				&mut in_flight,
+			)
+			.expect_err("a refusal for a current association stays terminal");
+		assert!(matches!(error, SchedulerError::ConfirmationRefused { .. }));
+		let mut acknowledged = build();
+		acknowledged
+			.apply_confirmation(
+				QueryId::from_u128(10),
+				WorkerId::from_u128(1),
+				ConfirmationOutcome::Acknowledged { elapsed_micros: 1 },
+				&mut completed,
+				&mut finals,
+				&mut in_flight,
+			)
+			.expect("applied");
+		let link_retries = acknowledged
+			.telemetry
+			.recovery_events
+			.iter()
+			.filter_map(|event| match event.kind {
+				RecoveryEventKind::LinkRetry { consumer, .. } => Some(consumer),
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			link_retries,
+			vec![tid(1, 1)],
+			"only the current waiter is link-retried"
+		);
+		assert!(
+			acknowledged
+				.state
+				.pending_attempt(TaskKey::from_identity(tid(1, 0)))
+				.is_some(),
+			"the obsolete one is not stranded"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_report_with_a_refusal_cause_never_enters_liveness_recovery() {
+		let stages = sealed_shuffle(10, 1);
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		let dispatcher = RecoveryDispatcher {
+			unreachable_producers: HashSet::from([WorkerId::from_u128(1)]),
+			reported_failure: Some(crate::error::EstablishmentFailure::Tls {
+				alert: 42,
+				reason: "bad certificate".into(),
+			}),
+			..Default::default()
+		};
+		let error = scheduler
+			.dispatch_loop(&stages, &dispatcher)
+			.await
+			.expect_err("violation");
+		assert!(
+			matches!(error, SchedulerError::ProtocolViolation { .. }),
+			"{error:?}"
+		);
+		assert!(dispatcher.confirmed().is_empty());
+	}
+	#[tokio::test]
+	async fn a_running_live_intermediate_carries_invalidation_to_its_accepted_reader() {
+		// Accepted P on the lost worker -> RUNNING intermediate I (it already streamed live input) ->
+		// ACCEPTED final F, which recorded I's attempt. The two dependency maps must be crossed.
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		let (p, i, f, u) = (tid(0, 0), tid(1, 0), tid(2, 0), tid(1, 1));
+		accept_directly(&mut scheduler, p, 1, true);
+		scheduler.state.spawn_attempt(i);
+		scheduler.state.set_attempt_state(
+			i,
+			AttemptState::Running {
+				worker_id: WorkerId::from_u128(2),
+			},
+		);
+		scheduler
+			.running_dependencies
+			.insert(i, vec![address_of(p)]);
+		accept_directly(&mut scheduler, f, 3, false);
+		scheduler
+			.task_dependencies
+			.insert(TaskKey::from_identity(f), vec![address_of(i)]);
+		accept_directly(&mut scheduler, u, 2, true);
+		let mut finals = vec![
+			(
+				TaskKey::from_identity(f),
+				vec![RecordBatch::new_empty(Arc::new(Schema::empty()))],
+			),
+			(
+				TaskKey::from_identity(u),
+				vec![RecordBatch::new_empty(Arc::new(Schema::empty()))],
+			),
+		];
+		let mut completed = [p, f, u]
+			.iter()
+			.map(|t| TaskKey::from_identity(*t))
+			.collect::<BTreeSet<_>>();
+		let mut in_flight = HashMap::from([(TaskKey::from_identity(i), i)]);
+		let superseded = scheduler.invalidate_query_worker(
+			QueryId::from_u128(10),
+			WorkerId::from_u128(1),
+			&mut completed,
+			&mut finals,
+			&mut in_flight,
+		);
+		assert_eq!(superseded, vec![i]);
+		assert!(
+			matches!(
+				scheduler.state.acceptance_state(TaskKey::from_identity(f)),
+				AcceptanceState::Invalidated { .. }
+			),
+			"the accepted reader of a superseded running attempt is invalidated"
+		);
+		assert_eq!(finals.len(), 1, "only the unrelated task's batches remain");
+		assert_eq!(finals[0].0, TaskKey::from_identity(u));
+		assert!(
+			!completed.contains(&TaskKey::from_identity(f))
+				&& completed.contains(&TaskKey::from_identity(u))
+		);
+		assert!(
+			scheduler
+				.accepted_manifests
+				.contains_key(&TaskKey::from_identity(u))
+		);
+	}
+
+	#[tokio::test]
+	async fn the_closure_alternates_running_accepted_running() {
+		// Accepted P on the lost worker -> RUNNING R -> ACCEPTED intermediate shuffle S (read R's live
+		// output) -> RUNNING descendant T; unrelated V preserved.
+		let mut scheduler =
+			DistributedScheduler::new(recovery_registry(3)).with_recovery_experiment(experiment());
+		let (p, r, s_, t, v) = (tid(0, 0), tid(1, 0), tid(2, 0), tid(3, 0), tid(1, 1));
+		accept_directly(&mut scheduler, p, 1, true);
+		scheduler.state.spawn_attempt(r);
+		scheduler.state.set_attempt_state(
+			r,
+			AttemptState::Running {
+				worker_id: WorkerId::from_u128(2),
+			},
+		);
+		scheduler
+			.running_dependencies
+			.insert(r, vec![address_of(p)]);
+		accept_directly(&mut scheduler, s_, 3, true);
+		scheduler
+			.task_dependencies
+			.insert(TaskKey::from_identity(s_), vec![address_of(r)]);
+		scheduler.state.spawn_attempt(t);
+		scheduler.state.set_attempt_state(
+			t,
+			AttemptState::Running {
+				worker_id: WorkerId::from_u128(2),
+			},
+		);
+		scheduler
+			.running_dependencies
+			.insert(t, vec![address_of(s_)]);
+		accept_directly(&mut scheduler, v, 3, true);
+		let (mut completed, mut finals) = (
+			[p, s_, v]
+				.iter()
+				.map(|x| TaskKey::from_identity(*x))
+				.collect::<BTreeSet<_>>(),
+			Vec::new(),
+		);
+		let mut in_flight = HashMap::from([
+			(TaskKey::from_identity(r), r),
+			(TaskKey::from_identity(t), t),
+		]);
+		let superseded = scheduler.invalidate_query_worker(
+			QueryId::from_u128(10),
+			WorkerId::from_u128(1),
+			&mut completed,
+			&mut finals,
+			&mut in_flight,
+		);
+		let order = |identity: &TaskIdentity| (identity.stage_id.get(), identity.task_id.get());
+		let mut superseded = superseded;
+		superseded.sort_by_key(order);
+		assert_eq!(superseded, vec![r, t]);
+		assert!(matches!(
+			scheduler.state.acceptance_state(TaskKey::from_identity(s_)),
+			AcceptanceState::Invalidated { .. }
+		));
+		assert!(
+			!scheduler
+				.accepted_manifests
+				.contains_key(&TaskKey::from_identity(s_))
+		);
+		assert!(in_flight.is_empty());
+		assert!(matches!(
+			scheduler.state.acceptance_state(TaskKey::from_identity(v)),
+			AcceptanceState::LiveAccepted { .. }
+		));
+		assert!(
+			scheduler
+				.accepted_manifests
+				.contains_key(&TaskKey::from_identity(v))
+				&& completed.contains(&TaskKey::from_identity(v))
+		);
 	}
 }
