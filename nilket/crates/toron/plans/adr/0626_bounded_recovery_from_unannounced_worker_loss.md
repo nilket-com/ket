@@ -377,6 +377,202 @@ task remains uninstrumented and unidentified.
 These are constraints the Stage B design must meet. They are not yet an
 authorization.
 
+*Stage B amendment after the Stage A review (reviewed; supersedes Parts 2
+and 3 where they differ, and Part 4's disposition of unknown or wrong-worker
+completions).*
+
+**Scope.** This amendment covers four things only:
+- deadlines on establishment;
+- typed failure propagation;
+- recovery local to the query;
+- fencing.
+
+`W` is deferred. Stage A observed no post-establishment loss, and its read
+gaps cannot separate producer progress from consumer pacing. A progress
+deadline needs its own reviewed controls and survey.
+
+**Declared budgets.** These are provisional experiment values, not production
+defaults. Each comes from the declared rule (the larger of a floor and 10
+times the worst observed healthy value) over the Stage A survey.
+
+| Name | Bounds | Value | Basis |
+|---|---|---|---|
+| `H` | establishment (connect plus stream open) | 5 s | max 305.4 ms handshake, max 293.3 ms pull, over 300 handshakes and 240 cross-host pulls (16 and 16 Ki rows) |
+| `C` | one confirmation, in total: establishment and the application acknowledgement | 12 s | max 1,125 ms (optiplex origin); 10 times that is 11.25 s, rounded up to 12 s |
+
+`C` is one outer deadline, from the start of the confirmation through its
+acknowledgement. If the confirmation's own establishment is also bounded by
+`H`, that sits inside `C`. A fresh `C` never starts after `H`.
+
+**Activation.** `H` and `C` are not production defaults. They take effect
+only through an explicit, validated experimental configuration:
+- it is enabled consistently on the coordinator and on every worker in a
+  fixture;
+- it is recorded in each attempt's evidence;
+- zero, invalid or overflowing values refuse.
+
+Unset, behaviour is unchanged. Keeping or dropping these values is a
+declared decision after Stage C.
+
+**The two paths, with their bounds stated separately:**
+1. **The dispatch-target path** (the coordinator's own dial):
+   - When a task dispatch's establishment exceeds `H`, the result is a typed,
+     coordinator-side `WorkerUnreachable { worker, phase: Establishment,
+     elapsed }`. The task's attempt fails retryably.
+   - The worker is **excluded from this query's placement only**. It is not
+     marked lost in the registry, and its accepted manifests are not
+     invalidated by this alone.
+   - The task is placed again on another worker within its replacement
+     limit.
+   - Detection is bounded by `H`.
+2. **The consumer-report path** (two vantage points):
+   - When a consumer's sealed-pull establishment exceeds `H`, the consumer
+     reports a typed `ProducerUnreachable`. The report carries the producer
+     worker and endpoint, the exact partition address (query, producer stage,
+     task and attempt) and the elapsed time.
+   - The scheduler then runs **one** confirmation, coalesced per (query,
+     worker), bounded by `C`: its own authenticated dial plus a
+     `PullPartition` for an impossible partition, which must come back
+     `PartitionMissing`.
+     - **Acknowledged:** the failure is link-specific. The consumer is retried
+       once, on a worker other than the one it failed on. A second such
+       failure ends the query with a typed terminal error.
+     - **A liveness failure** (the `C` deadline, or a typed liveness error):
+       the worker is excluded from the query. Its accepted manifests for
+       **this query** are invalidated, query-scoped and without
+       `mark_worker_lost`. Their producers replay at their next attempt on
+       surviving workers, and their consumers are invalidated and dispatched
+       again with the replacement references.
+     - **A refusal or protocol error** (a TLS, certificate or version
+       refusal, a wrong response, or a malformed or mismatched
+       acknowledgement): terminal, with its typed cause. It never leads to
+       exclusion or replay.
+   - **The confirmation request** uses a fresh query identity and address
+     that cannot collide with a live partition. It validates the response's
+     identity and accepts only the expected `PartitionMissing` reason.
+   - **The confirmation is fenced when it completes, not only when the
+     report is accepted.** It carries the accepted producer task, attempt,
+     worker and endpoint, and the current consumer identity that justified
+     it.
+     - Before its outcome is applied, those associations are checked again
+       against the query's current state.
+     - A late confirmation cannot invalidate replacements, or start a second
+       replay wave once another path has resolved the suspicion.
+     - Coalescing lasts until its decision is applied, and waiter and
+       reservation ownership is released exactly once.
+   - Detection is bounded by `H + C` (17 s), plus the consumer's report
+     latency.
+   - Replayed execution is not bounded: established execution keeps ADR
+     577's policy. `R = 30 s` remains this fixture experiment's outcome
+     deadline, not a production recovery guarantee.
+
+**Typed classification.**
+- **Establishment failures** are typed from quinn's own errors, replacing
+  the current blanket `ConnectionRefused` mapping in
+  `QuicEndpoint::connect_stream_with_server_name`.
+  - The typed cause survives every `std::io::Error` and `QueryError`
+    conversion. There is no string matching, and no blanket mapping of an
+    unknown error to liveness.
+  - Every quinn establishment variant in the pinned version is classified
+    explicitly, including a local close or reset versus a peer refusal. An
+    unknown variant fails conservatively, as a refusal.
+  - Our `H` expiry, or an idle timeout, is **liveness**.
+  - A TLS or certificate alert, a version mismatch, or a refused connection
+    is a **refusal** (`PeerRefused`).
+- **The dispatch-target path's provenance is the coordinator's own bounded
+  dial.** A remote wire failure is never taken for a coordinator-generated
+  `WorkerUnreachable`.
+- **A refusal is never a liveness signal.** It ends the operation with a
+  typed terminal error, and never leads to exclusion or replay.
+- **Wire compatibility.** The new `TaskFailureKind` variants are appended
+  last, and every host runs one build.
+
+**Report binding.** A `ProducerUnreachable` report is accepted only when
+both of these hold:
+- it is the outcome of the consumer task's **current** attempt, from the
+  worker that attempt was dispatched to;
+- its address names a **currently accepted** manifest: the same task and
+  attempt, the same producer worker, and the same endpoint.
+
+Anything else is handled as follows:
+- **A report naming a superseded attempt** is expected and stale. It is
+  counted and discarded without mutation, and it spawns nothing. The
+  existing invalidation and replacement own the consumer's progress. A
+  consumer that is still current is retried only through the validated
+  link-specific path, under its one-alternate-worker rule and within the
+  limit across all causes.
+- **An unknown task or attempt, the wrong worker, or a mismatched producer**
+  is a typed `ProtocolViolation`, terminal for the query.
+
+**Query-local exclusion** constrains both the preferred-affinity selection
+and the fallback selection. It survives every `dispatch_loop` call for that
+query, never affects another query or global registry membership, and is
+cleared, with all other query-owned state, when the query is torn down.
+
+**Limits.**
+- At most 2 replacement attempts per task, counted across every cause
+  (retries and replays).
+- At most `workers - 1` workers excluded per query.
+- Exceeding either limit, or running out of eligible workers, is a typed
+  terminal error. It never hangs.
+
+**Cancellation and ownership.**
+- **Every bounded operation is a `tokio::time::timeout` over a future its
+  caller owns.** On expiry the future is dropped.
+  - Dropping it does not mean the endpoint keeps nothing. In the locked
+    quinn 0.11.9, a spawned `ConnectionDriver` continues, and
+    `ConnectionRef::drop` starts an implicit close, so protocol teardown may
+    go on.
+  - Fixtures must show that timed-out connect and open-stream operations
+    close or abandon what they own, without accumulating live handshakes or
+    streams, while unrelated connections keep working.
+  - A shared endpoint is never closed to enforce `H`.
+- **Confirmations** are futures in a second `FuturesUnordered` owned by
+  `dispatch_loop`. They are dropped when the loop exits, and nothing is
+  detached.
+- **In-flight dispatches** to an excluded worker end at `H` as their own
+  failures, or are abandoned, and their late outcomes are fenced (Part 4).
+- **Two properties are proved separately:** that reservations are released
+  at scheduler scope, and that remote work on the peer is cancelled or
+  fenced. Dropping a local future proves neither.
+- **`H` stops at stream open.** An established, healthy, silent execution
+  is never bounded by `H`; Stage C's long-silence control checks this.
+
+**Fencing.** Part 4 stands, except that this text supersedes its
+disposition of protocol violations:
+- one validated transition for completions and failures;
+- expected stale or duplicate outcomes are harmless: ignored, with no
+  mutation;
+- an unknown task or attempt, or a wrong worker, is a typed
+  `ProtocolViolation`, raised before any state changes;
+- final results owned by attempt;
+- every affected consumer fenced, and reservations released exactly once.
+
+**Reported outcomes** stay separate:
+- a typed terminal failure;
+- bounded detection;
+- successful completion within the fixture's `R = 30 s`.
+
+Report latency and replay execution are not bounded by `H + C`.
+
+**Telemetry**, per worker and task:
+- `establishment_timed_out_at`;
+- `report_accepted_at`;
+- `confirmation_started_at` and `confirmation_ended_at` (with the outcome);
+- `excluded_at`;
+- `replay_dispatched_at`.
+
+**Code scope** (the whole Stage B diff):
+- `quic.rs`: typed establishment errors;
+- the worker's sealed-pull path: `H` and `ProducerUnreachable`;
+- `NetworkTaskDispatcher`: `H` on the dispatch dial, and
+  `WorkerUnreachable`;
+- the scheduler: query-local exclusion, confirmation, report binding,
+  limits, fencing and telemetry;
+- `error/distributed.rs`: the new failure kinds.
+
+No TLS change, no change to the ADR 577 policy, and no heartbeat work.
+
 ### Part 2: bounded detection
 
 - **Scope.** Bounds apply at the worker-operation boundary: sealed pull,
