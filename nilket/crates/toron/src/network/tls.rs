@@ -230,29 +230,42 @@ pub struct ListenerPolicy {
 
 impl ListenerPolicy {
 	pub fn load(config: &TlsConfig, worker_id: &WorkerId) -> Result<Self, TlsError> {
-		validate_cluster_domain(&config.cluster_domain)?;
-		for path in [&config.listener_cert, &config.listener_key, &config.peer_ca] {
+		Self::load_from_paths(
+			&config.listener_cert,
+			&config.listener_key,
+			&config.peer_ca,
+			&config.cluster_domain,
+			worker_id,
+		)
+	}
+
+	/// The same policy as [`Self::load`], from the material's paths directly, for callers that
+	/// hold no daemon configuration (the multinode fixture worker).
+	pub fn load_from_paths(
+		listener_cert: &Path,
+		listener_key: &Path,
+		peer_ca: &Path,
+		cluster_domain: &str,
+		worker_id: &WorkerId,
+	) -> Result<Self, TlsError> {
+		validate_cluster_domain(cluster_domain)?;
+		for path in [listener_cert, listener_key, peer_ca] {
 			reject_env_interpolation(path)?;
 		}
-		let material =
-			TlsMaterial::load(&config.listener_cert, &config.listener_key, &config.peer_ca)?;
-		validate_listener_cert_identity(&material, worker_id, &config.cluster_domain)?;
+		let material = TlsMaterial::load(listener_cert, listener_key, peer_ca)?;
+		validate_listener_cert_identity(&material, worker_id, cluster_domain)?;
 		Ok(Self {
-			cluster_domain: config.cluster_domain.clone(),
+			cluster_domain: cluster_domain.to_string(),
 			server_config_worker_task: server_config_for(
 				&material,
 				ListenerRole::WorkerTask,
-				&config.cluster_domain,
+				cluster_domain,
 			)?,
-			server_config_sql: server_config_for(
-				&material,
-				ListenerRole::Sql,
-				&config.cluster_domain,
-			)?,
+			server_config_sql: server_config_for(&material, ListenerRole::Sql, cluster_domain)?,
 			server_config_observability: Arc::new(build_rustls_server_config(
 				&material,
 				ListenerRole::Observability,
-				&config.cluster_domain,
+				cluster_domain,
 				OBSERVABILITY_HTTP_ALPN,
 			)?),
 			client_config: client_config(&material)?,

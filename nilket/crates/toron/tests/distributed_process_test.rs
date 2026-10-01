@@ -3985,3 +3985,998 @@ async fn a_join_shuffle_producer_repartitions_through_an_exchange() {
 		 test proves nothing"
 	);
 }
+
+// ---- ADR 625: the multinode probe ----
+//
+// Ignored tests driven by a spec file (`TORON_MULTINODE_SPEC`): they dial already-running host-mode
+// fixture workers over authenticated QUIC and write one evidence JSON per attempt into the spec's
+// attempt directory, never overwriting. Intervals are measured on this process's steady (`Instant`) clock;
+// wall times are provenance only. Evidence is written on every outcome, including errors and
+// deadlines; the harness's readers, not these tests' exit codes, decide acceptance.
+
+struct ProbeSpec {
+	raw: serde_json::Value,
+	attempt_dir: std::path::PathBuf,
+	workers: Vec<(WorkerId, WorkerEndpoint)>,
+	transport: Arc<dyn ToronTransport>,
+	deadline: std::time::Duration,
+}
+
+fn unix_ms() -> u128 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|elapsed| elapsed.as_millis())
+		.unwrap_or(0)
+}
+
+/// A task identity as exact typed fields (never a debug rendering), so readers compare identities.
+fn task_fields(query: QueryId, stage: u32, task: u32, attempt: AttemptId) -> serde_json::Value {
+	serde_json::json!({
+		"query": query.get().to_string(),
+		"stage": stage,
+		"task": task,
+		"attempt": attempt.get(),
+	})
+}
+
+fn spec_str(raw: &serde_json::Value, name: &str) -> String {
+	raw[name]
+		.as_str()
+		.unwrap_or_else(|| panic!("spec field {name}"))
+		.to_string()
+}
+
+fn load_probe_spec() -> ProbeSpec {
+	let path = std::env::var("TORON_MULTINODE_SPEC").expect("TORON_MULTINODE_SPEC");
+	let raw: serde_json::Value =
+		serde_json::from_str(&std::fs::read_to_string(&path).expect("read spec"))
+			.expect("parse spec");
+	let workers = raw["workers"]
+		.as_array()
+		.expect("spec workers")
+		.iter()
+		.map(|worker| {
+			(
+				WorkerId::from_u128(
+					spec_str(worker, "worker_u128")
+						.parse()
+						.expect("worker_u128"),
+				),
+				WorkerEndpoint::new(spec_str(worker, "endpoint")),
+			)
+		})
+		.collect::<Vec<_>>();
+	assert!(
+		!workers.is_empty(),
+		"a probe spec must name at least one worker"
+	);
+	let client = toron::network::tls::client_config_from_paths(
+		std::path::Path::new(&spec_str(&raw, "tls_cert")),
+		std::path::Path::new(&spec_str(&raw, "tls_key")),
+		std::path::Path::new(&spec_str(&raw, "tls_ca")),
+	)
+	.expect("probe client TLS material");
+	let transport: Arc<dyn ToronTransport> = Arc::new(
+		QuicTransport::authenticated(client, spec_str(&raw, "cluster_domain"))
+			.expect("authenticated transport"),
+	);
+	ProbeSpec {
+		attempt_dir: std::path::PathBuf::from(spec_str(&raw, "attempt_dir")),
+		workers,
+		transport,
+		deadline: std::time::Duration::from_secs(
+			raw["deadline_secs"].as_u64().expect("deadline_secs"),
+		),
+		raw,
+	}
+}
+
+/// Write the attempt's evidence exactly once; an existing file refuses.
+fn write_probe_evidence(dir: &std::path::Path, evidence: &serde_json::Value) {
+	use std::io::Write as _;
+	let mut file = std::fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(dir.join("probe.json"))
+		.expect("probe evidence must be a fresh file");
+	file.write_all(
+		serde_json::to_string_pretty(evidence)
+			.expect("evidence json")
+			.as_bytes(),
+	)
+	.expect("write probe evidence");
+}
+
+fn probe_registry(spec: &ProbeSpec) -> Arc<RoundRobinRegistry> {
+	Arc::new(RoundRobinRegistry::new(
+		spec.workers
+			.iter()
+			.map(|(worker_id, endpoint)| worker_entry_for(*worker_id, endpoint.clone())),
+		0,
+	))
+}
+
+fn worker_entry_for(worker_id: WorkerId, endpoint: WorkerEndpoint) -> WorkerEntry {
+	WorkerEntry {
+		worker_id,
+		endpoint,
+		lease: WorkerLease {
+			last_heartbeat: UnixMillis::new(1),
+			epoch: LeaseEpoch::new(1),
+		},
+		capabilities: WorkerCapabilities {
+			advertised_memory: ByteCount::new(1024 * 1024),
+			simd_width: SimdLaneCount::new(8),
+			spill_capacity_reserved: ByteCount::new(1024 * 1024),
+		},
+		resources: WorkerResourceState {
+			in_flight: ByteCount::ZERO,
+			active_tasks: ActiveTaskCount::default(),
+		},
+		status: WorkerStatus::Live,
+	}
+}
+
+/// The named cases: SQL over the process fixtures, planned and bound the same way for every
+/// attempt and every placement.
+async fn probe_case_plan(case: &str) -> ExecutionPlan {
+	let (catalog, logical) = match case {
+		"hash_join" => (join_process_catalog(), hash_join_plan()),
+		"grouped_aggregate" => (
+			test_catalog(),
+			SqlPlanner::new()
+				.plan("SELECT val, SUM(val) FROM fixture GROUP BY val ORDER BY SUM(val) DESC LIMIT 5")
+				.expect("plan grouped aggregate"),
+		),
+		"except_all" => (
+			join_process_catalog(),
+			SqlPlanner::new()
+				.plan("SELECT set_left.set_key FROM set_left EXCEPT ALL SELECT set_right.set_key FROM set_right")
+				.expect("plan except all"),
+		),
+		"row_number" => (
+			join_process_catalog(),
+			SqlPlanner::new()
+				.plan(
+					"SELECT set_left.set_key, ROW_NUMBER() OVER (PARTITION BY set_left.set_key ORDER BY set_left.id) AS rn FROM set_left",
+				)
+				.expect("plan row number"),
+		),
+		other => panic!("unknown probe case {other}"),
+	};
+	bind(&logical, catalog.as_ref(), &PlannerConfig::default())
+		.await
+		.expect("bind probe case")
+}
+
+fn manifest_evidence(manifest: &toron::distributed::task::PartitionManifest) -> serde_json::Value {
+	serde_json::json!({
+		"task": task_fields(manifest.query_id, manifest.stage_id.get(), manifest.task_id.get(), manifest.attempt_id),
+		"producer_worker": manifest.producer_worker_id.get().as_u128().to_string(),
+		"producer_endpoint": manifest.producer_endpoint.as_str(),
+	})
+}
+
+fn run_evidence(run: &SchedulerRun) -> serde_json::Value {
+	let digest =
+		canonical_arrow_ipc_digest(&run.final_results, SortPolicy::FullRowLex).expect("digest");
+	let rows = run
+		.final_results
+		.iter()
+		.map(RecordBatch::num_rows)
+		.sum::<usize>();
+	// Every row as text, sorted, so equal results render equally regardless of batch order.
+	let mut rendered = Vec::new();
+	for batch in &run.final_results {
+		for row in 0..batch.num_rows() {
+			rendered.push(
+				batch
+					.columns()
+					.iter()
+					.map(|column| {
+						arrow::util::display::array_value_to_string(column.as_ref(), row)
+							.unwrap_or_else(|error| format!("<{error}>"))
+					})
+					.collect::<Vec<_>>()
+					.join("|"),
+			);
+		}
+	}
+	rendered.sort();
+	serde_json::json!({
+		"digest": format!("{digest:?}"),
+		"row_count": rows,
+		"rows_rendered": rendered,
+		"retry_count": run.telemetry.retry_count,
+		"dispatched": run.dispatched.iter().map(|identity| task_fields(identity.query_id, identity.stage_id.get(), identity.task_id.get(), identity.attempt_id)).collect::<Vec<_>>(),
+		"sealed_manifests": run.accepted_manifests.values().map(manifest_evidence).collect::<Vec<_>>(),
+		"task_telemetry": run.telemetry.task_telemetry.iter().map(|record| serde_json::json!({
+			"task": task_fields(record.identity.query_id, record.identity.stage_id.get(), record.identity.task_id.get(), record.identity.attempt_id),
+			"worker": record.worker_id.get().as_u128().to_string(),
+			"pulled_shuffle_bytes": record.telemetry.counters.pulled_shuffle_bytes,
+			"published_shuffle_bytes": record.telemetry.counters.published_shuffle_bytes,
+		})).collect::<Vec<_>>(),
+	})
+}
+
+fn probe_base_evidence(spec: &ProbeSpec, mode: &str) -> serde_json::Value {
+	let toron_env = std::env::vars()
+		.filter(|(name, _)| name.starts_with("TORON_"))
+		.map(|(name, value)| format!("{name}={value}"))
+		.collect::<Vec<_>>();
+	serde_json::json!({
+		"mode": mode,
+		"spec": spec.raw.clone(),
+		"probe_executable": std::env::current_exe().map(|path| path.display().to_string()).unwrap_or_default(),
+		"toron_environment": toron_env,
+		"started_unix_ms": unix_ms() as u64,
+	})
+}
+
+fn fresh_scheduler(
+	spec: &ProbeSpec,
+) -> (
+	Arc<RoundRobinRegistry>,
+	DistributedScheduler<Arc<RoundRobinRegistry>>,
+	NetworkTaskDispatcher<Arc<dyn ToronTransport>>,
+) {
+	let registry = probe_registry(spec);
+	let scheduler = DistributedScheduler::new(registry.clone());
+	let dispatcher = NetworkTaskDispatcher::new(
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		spec.transport.clone(),
+	);
+	(registry, scheduler, dispatcher)
+}
+
+/// Authenticated reachability, per worker independently, with an application-level answer that
+/// runs no task: a pull for a partition that cannot exist must come back `PartitionMissing`, which
+/// only a worker that accepted this client's certificate and served the stream can send.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "multinode probe: needs TORON_MULTINODE_SPEC and running host-mode workers"]
+async fn multinode_probe_handshake() {
+	let spec = load_probe_spec();
+	let mut evidence = probe_base_evidence(&spec, "handshake");
+	let coordinator =
+		toron::server::ToronCoordinator::new(Arc::new(MemoryManager::new(4, 1024 * 1024)));
+	let client = || {
+		toron::network::tls::client_config_from_paths(
+			std::path::Path::new(&spec_str(&spec.raw, "tls_cert")),
+			std::path::Path::new(&spec_str(&spec.raw, "tls_key")),
+			std::path::Path::new(&spec_str(&spec.raw, "tls_ca")),
+		)
+		.expect("probe client TLS material")
+	};
+	let domain = spec_str(&spec.raw, "cluster_domain");
+	let mut endpoints = Vec::new();
+	for (worker_id, endpoint) in &spec.workers {
+		// One client endpoint per worker: the exact local port identifies this connection in the
+		// worker's own log. The same authenticated dial as `QuicTransport::connect_peer`.
+		let client_endpoint =
+			toron::quic::QuicEndpoint::client_authenticated(client()).expect("client endpoint");
+		let client_port = client_endpoint.local_addr().expect("client port").port();
+		let server_name = toron::network::tls::canonical_daemon_dns_name(worker_id, &domain);
+		let window_start = unix_ms() as u64;
+		let started = std::time::Instant::now();
+		let address = toron::distributed::task::PartitionAddress {
+			query_id: QueryId::new(),
+			exchange_id: toron::distributed::identity::ExchangeId::new(0),
+			producer_stage_id: toron::distributed::identity::StageId::new(0),
+			producer_task_id: toron::distributed::identity::TaskId::new(0),
+			attempt_id: AttemptId::first(),
+			partition_id: toron::distributed::identity::PartitionId::new(0),
+		};
+		let outcome = tokio::time::timeout(spec.deadline, async {
+			let remote: std::net::SocketAddr = endpoint
+				.as_str()
+				.parse()
+				.map_err(|error| ("handshake_error", format!("endpoint {endpoint:?}: {error}")))?;
+			let stream = client_endpoint
+				.connect_stream_with_server_name(remote, &server_name)
+				.await
+				.map_err(|error| ("handshake_error", format!("dial: {error}")))?;
+			match coordinator
+				.pull_partition_from_worker(stream, address, AttemptId::first())
+				.await
+			{
+				Err(toron::error::QueryError::Runtime(
+					toron::error::RuntimeError::PartitionStoreMismatch { message },
+				)) => Ok(message),
+				Err(error) => Err(("ack_error", error.to_string())),
+				Ok(_) => Err(("ack_error", "a fabricated partition was served".to_string())),
+			}
+		})
+		.await;
+		let (status, detail) = match outcome {
+			Ok(Ok(missing)) => ("acknowledged", format!("PartitionMissing: {missing}")),
+			Ok(Err((status, detail))) => (status, detail),
+			Err(_) => ("deadline", format!("no outcome within {:?}", spec.deadline)),
+		};
+		endpoints.push(serde_json::json!({
+			"worker": worker_id.get().as_u128().to_string(),
+			"endpoint": endpoint.as_str(),
+			"status": status,
+			"detail": detail,
+			"elapsed_ms": started.elapsed().as_millis() as u64,
+			"client_port": client_port,
+			"window_start_unix_ms": window_start,
+			"ended_unix_ms": unix_ms() as u64,
+		}));
+	}
+	evidence["endpoints"] = serde_json::Value::Array(endpoints);
+	evidence["ended_unix_ms"] = (unix_ms() as u64).into();
+	write_probe_evidence(&spec.attempt_dir, &evidence);
+}
+
+/// One case through the scheduler against the declared workers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "multinode probe: needs TORON_MULTINODE_SPEC and running host-mode workers"]
+async fn multinode_probe_query() {
+	let spec = load_probe_spec();
+	let case = spec_str(&spec.raw, "case");
+	let mut evidence = probe_base_evidence(&spec, "query");
+	let stages = fragment_plan(
+		probe_case_plan(&case).await,
+		FragmentPlanConfig::new_for_test(
+			QueryId::new(),
+			TaskBudget::from_query_budget(QueryBudget::test_default()),
+		),
+	)
+	.expect("fragment probe case");
+	let (_registry, mut scheduler, mut dispatcher) = fresh_scheduler(&spec);
+	let started = std::time::Instant::now();
+	let outcome = tokio::time::timeout(
+		spec.deadline,
+		scheduler.dispatch_loop(&stages, &mut dispatcher),
+	)
+	.await;
+	evidence["dispatch_elapsed_ms"] = (started.elapsed().as_millis() as u64).into();
+	match outcome {
+		Ok(Ok(run)) => {
+			evidence["outcome"] = "completed".into();
+			evidence["run"] = run_evidence(&run);
+		}
+		Ok(Err(error)) => {
+			evidence["outcome"] = "error".into();
+			evidence["error"] = format!("{error:?}").into();
+		}
+		Err(_) => evidence["outcome"] = "deadline".into(),
+	}
+	evidence["ended_unix_ms"] = (unix_ms() as u64).into();
+	write_probe_evidence(&spec.attempt_dir, &evidence);
+}
+
+/// Producer loss after its stage sealed, on a worker remote from this probe. The victim is bound
+/// before the kill: one accepted sealed manifest (task key, attempt, worker) from a remote worker.
+/// `announced` marks it lost and requires the invalidation and the replacement dispatch to name that
+/// exact task (ADR 624's binding), all inside one whole-attempt deadline on the steady clock. `unannounced`
+/// tells the scheduler nothing and gives the final dispatch the declared 30 s bound from the
+/// confirmed kill. `dispatch_loop` exposes no internal events, so the first error or retry inside
+/// it is not observable here: detection timing is reported as unavailable, and the outcome is the
+/// loop's terminal return (or none) within the bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "multinode probe: needs TORON_MULTINODE_SPEC and running host-mode workers"]
+async fn multinode_probe_worker_loss() {
+	let spec = load_probe_spec();
+	let attempt_started = std::time::Instant::now();
+	let announced = match spec_str(&spec.raw, "loss").as_str() {
+		"announced" => true,
+		"unannounced" => false,
+		other => panic!("unknown loss mode {other}"),
+	};
+	let mut evidence = probe_base_evidence(
+		&spec,
+		if announced {
+			"announced_loss"
+		} else {
+			"unannounced_loss"
+		},
+	);
+	evidence["detection_timing"] =
+		"unavailable: dispatch_loop exposes no internal error or retry events; terminal return time is reported".into();
+	let remote = spec.raw["remote_workers"]
+		.as_array()
+		.expect("remote_workers")
+		.iter()
+		.map(|worker| worker.as_str().expect("remote worker").to_string())
+		.collect::<HashSet<_>>();
+	let stages = fragment_plan(
+		probe_case_plan("hash_join").await,
+		FragmentPlanConfig::new_for_test(
+			QueryId::new(),
+			TaskBudget::from_query_budget(QueryBudget::test_default()),
+		),
+	)
+	.expect("fragment probe case");
+	let (_registry, mut scheduler, mut dispatcher) = fresh_scheduler(&spec);
+	let finish = |evidence: &mut serde_json::Value, outcome: &str| {
+		evidence["outcome"] = outcome.into();
+		evidence["attempt_elapsed_ms"] = (attempt_started.elapsed().as_millis() as u64).into();
+		evidence["ended_unix_ms"] = (unix_ms() as u64).into();
+		write_probe_evidence(&spec.attempt_dir, evidence);
+	};
+	let remaining =
+		|deadline: std::time::Duration| deadline.saturating_sub(attempt_started.elapsed());
+
+	// 1. The producer stage, inside the attempt's deadline.
+	let producers_run = match tokio::time::timeout(
+		remaining(spec.deadline),
+		scheduler.dispatch_loop(&stages[..1], &mut dispatcher),
+	)
+	.await
+	{
+		Ok(Ok(run)) => run,
+		Ok(Err(error)) => {
+			evidence["error"] = format!("{error:?}").into();
+			return finish(&mut evidence, "producer_stage_error");
+		}
+		Err(_) => return finish(&mut evidence, "producer_stage_deadline"),
+	};
+	evidence["producer_manifests_before_kill"] = producers_run
+		.accepted_manifests
+		.values()
+		.map(manifest_evidence)
+		.collect::<Vec<_>>()
+		.into();
+
+	// 2. Bind the victim: one accepted sealed manifest from a remote worker.
+	let mut candidates = producers_run
+		.accepted_manifests
+		.iter()
+		.filter(|(_, manifest)| {
+			remote.contains(&manifest.producer_worker_id.get().as_u128().to_string())
+		})
+		.collect::<Vec<_>>();
+	candidates.sort_by_key(|(key, _)| format!("{key:?}"));
+	let Some((victim_key, victim_manifest)) = candidates
+		.first()
+		.map(|(key, manifest)| ((*key).clone(), (*manifest).clone()))
+	else {
+		return finish(&mut evidence, "no_remote_sealed_producer");
+	};
+	let victim_worker = victim_manifest.producer_worker_id;
+	evidence["victim"] = serde_json::json!({
+		"task": task_fields(victim_key.query_id, victim_key.stage_id.get(), victim_key.task_id.get(), victim_manifest.attempt_id),
+		"worker": victim_worker.get().as_u128().to_string(),
+		"endpoint": victim_manifest.producer_endpoint.as_str(),
+	});
+
+	// 3. The bounded kill: the harness's command for exactly this worker, output preserved.
+	let victim_name = victim_worker.get().as_u128().to_string();
+	let kill_args = spec.raw["kill_commands"][victim_name.as_str()]
+		.as_array()
+		.unwrap_or_else(|| panic!("no kill command for victim worker {victim_name}"))
+		.iter()
+		.map(|arg| arg.as_str().expect("kill arg").to_string())
+		.collect::<Vec<_>>();
+	evidence["kill_command"] = kill_args.clone().into();
+	let kill_started = std::time::Instant::now();
+	let kill = Command::new(&kill_args[0])
+		.args(&kill_args[1..])
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.kill_on_drop(true)
+		.spawn()
+		.expect("spawn kill command");
+	let kill_output =
+		tokio::time::timeout(std::time::Duration::from_secs(20), kill.wait_with_output()).await;
+	evidence["kill_elapsed_ms"] = (kill_started.elapsed().as_millis() as u64).into();
+	match kill_output {
+		Ok(Ok(output)) => {
+			evidence["kill_status"] = output.status.code().map(i64::from).into();
+			evidence["kill_stdout"] = String::from_utf8_lossy(&output.stdout).to_string().into();
+			evidence["kill_stderr"] = String::from_utf8_lossy(&output.stderr).to_string().into();
+			// The host primitive exits 0 only once the group is gone, and says so in its JSON line.
+			let confirmed = serde_json::from_slice::<serde_json::Value>(output.stdout.trim_ascii())
+				.ok()
+				.and_then(|line| line["gone"].as_bool())
+				== Some(true);
+			if !output.status.success() || !confirmed {
+				return finish(&mut evidence, "kill_not_confirmed");
+			}
+		}
+		Ok(Err(error)) => {
+			evidence["kill_error"] = error.to_string().into();
+			return finish(&mut evidence, "kill_not_confirmed");
+		}
+		Err(_) => return finish(&mut evidence, "kill_deadline"),
+	}
+	let confirmed = std::time::Instant::now();
+	evidence["kill_confirmed_unix_ms"] = (unix_ms() as u64).into();
+
+	// 4. Recovery.
+	let bound = if announced {
+		remaining(spec.deadline)
+	} else {
+		std::time::Duration::from_secs(
+			spec.raw["unannounced_bound_secs"]
+				.as_u64()
+				.expect("unannounced_bound_secs"),
+		)
+	};
+	if announced {
+		let invalidated = scheduler.mark_worker_lost(victim_worker);
+		let bound_task = invalidated.producers.iter().find(|task| {
+			task.key == victim_key && task.invalidated_attempt == victim_manifest.attempt_id
+		});
+		evidence["invalidated"] = invalidated
+			.producers
+			.iter()
+			.map(|task| serde_json::json!({
+				"task": task_fields(task.key.query_id, task.key.stage_id.get(), task.key.task_id.get(), task.invalidated_attempt),
+				"replacement_attempt": task.replacement_attempt.get(),
+				"worker": task.worker_id.get().as_u128().to_string(),
+			}))
+			.collect::<Vec<_>>()
+			.into();
+		let Some(bound_task) = bound_task.cloned() else {
+			return finish(&mut evidence, "invalidation_does_not_name_the_victim");
+		};
+		evidence["replacement_attempt"] = bound_task.replacement_attempt.get().into();
+		match tokio::time::timeout(bound, scheduler.dispatch_loop(&stages, &mut dispatcher)).await {
+			Ok(Ok(run)) => {
+				evidence["since_confirmed_kill_ms"] =
+					(confirmed.elapsed().as_millis() as u64).into();
+				let replaced =
+					run.dispatched
+						.contains(&toron::distributed::identity::TaskIdentity::new(
+							victim_key.query_id,
+							victim_key.stage_id,
+							victim_key.task_id,
+							bound_task.replacement_attempt,
+						));
+				evidence["replacement_dispatched"] = replaced.into();
+				evidence["run"] = run_evidence(&run);
+				finish(
+					&mut evidence,
+					if replaced {
+						"completed"
+					} else {
+						"completed_without_bound_replacement"
+					},
+				);
+			}
+			Ok(Err(error)) => {
+				evidence["since_confirmed_kill_ms"] =
+					(confirmed.elapsed().as_millis() as u64).into();
+				evidence["error"] = format!("{error:?}").into();
+				finish(&mut evidence, "error");
+			}
+			Err(_) => finish(&mut evidence, "deadline"),
+		}
+	} else {
+		match tokio::time::timeout(bound, scheduler.dispatch_loop(&stages, &mut dispatcher)).await {
+			Ok(Ok(run)) => {
+				evidence["since_confirmed_kill_ms"] =
+					(confirmed.elapsed().as_millis() as u64).into();
+				evidence["run"] = run_evidence(&run);
+				finish(&mut evidence, "completed_within_bound");
+			}
+			Ok(Err(error)) => {
+				evidence["since_confirmed_kill_ms"] =
+					(confirmed.elapsed().as_millis() as u64).into();
+				evidence["error"] = format!("{error:?}").into();
+				finish(&mut evidence, "error_within_bound");
+			}
+			Err(_) => finish(&mut evidence, "no_terminal_return_within_bound"),
+		}
+	}
+}
+
+// ---- ADR 625: host-mode fixtures (local, no network peers) ----
+
+/// Starts the fixture worker with `args` and returns (exit success, stdout, stderr), bounded.
+async fn fixture_worker_exit(args: &[&str]) -> (bool, String, String) {
+	bounded(async {
+		let output = Command::new(env!("CARGO_BIN_EXE_toron_fixture_worker"))
+			.args(args)
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.kill_on_drop(true)
+			.output()
+			.await
+			.expect("run fixture worker");
+		(
+			output.status.success(),
+			String::from_utf8_lossy(&output.stdout).to_string(),
+			String::from_utf8_lossy(&output.stderr).to_string(),
+		)
+	})
+	.await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_mode_requires_every_host_flag_together() {
+	let (ok, stdout, stderr) =
+		fixture_worker_exit(&["--worker-u128", "9000", "--bind", "0.0.0.0:7701"]).await;
+	assert!(
+		!ok && !stdout.contains("READY"),
+		"a partial host mode must not start"
+	);
+	assert!(stderr.contains("host mode needs"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_mode_refuses_a_loopback_or_unspecified_advertised_address() {
+	for advertise in ["127.0.0.1:7701", "0.0.0.0:7701", "192.0.2.1:0"] {
+		let (ok, stdout, stderr) = fixture_worker_exit(&[
+			"--worker-u128",
+			"9000",
+			"--bind",
+			"0.0.0.0:0",
+			"--advertise",
+			advertise,
+			"--tls-cert",
+			"/nonexistent/c",
+			"--tls-key",
+			"/nonexistent/k",
+			"--tls-ca",
+			"/nonexistent/ca",
+			"--cluster-domain",
+			"cluster.local",
+		])
+		.await;
+		assert!(
+			!ok && !stdout.contains("READY"),
+			"{advertise} must be refused"
+		);
+		assert!(
+			stderr.contains("--advertise must be a routable"),
+			"{advertise}: {stderr}"
+		);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_mode_refuses_a_listener_certificate_for_another_worker_id() {
+	let dir = std::env::temp_dir().join(format!("toron-adr625-pki-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).expect("pki dir");
+	let ca = tls_pki::issue::generate_ca("adr625 test ca").expect("ca");
+	let ca_cert =
+		tls_pki::issue::load_ca(&ca.cert, ca.key.as_deref().expect("ca key")).expect("load ca");
+	let other = WorkerId::from_u128(9_001);
+	let leaf = tls_pki::issue::issue_listener(&ca_cert, &other.get().to_string(), "cluster.local")
+		.expect("listener for another worker");
+	write_new_with_mode(&dir.join("ca.crt"), &ca.cert, 0o644);
+	write_new_with_mode(&dir.join("listener.crt"), &leaf.cert, 0o644);
+	write_new_with_mode(
+		&dir.join("listener.key"),
+		leaf.key.as_deref().expect("listener key"),
+		0o600,
+	);
+	let (ok, stdout, stderr) = fixture_worker_exit(&[
+		"--worker-u128",
+		"9002",
+		"--bind",
+		"0.0.0.0:0",
+		"--advertise",
+		"192.0.2.1:7701",
+		"--tls-cert",
+		dir.join("listener.crt").to_str().unwrap(),
+		"--tls-key",
+		dir.join("listener.key").to_str().unwrap(),
+		"--tls-ca",
+		dir.join("ca.crt").to_str().unwrap(),
+		"--cluster-domain",
+		"cluster.local",
+	])
+	.await;
+	let _ = std::fs::remove_dir_all(&dir);
+	assert!(
+		!ok && !stdout.contains("READY"),
+		"the worker must not start or listen"
+	);
+	assert!(stderr.contains("STARTUP_REJECTED"), "{stderr}");
+	assert!(!stderr.contains("LISTENING"), "{stderr}");
+}
+
+#[test]
+#[should_panic(expected = "probe evidence must be a fresh file")]
+fn probe_evidence_is_never_overwritten() {
+	let dir = std::env::temp_dir().join(format!("toron-adr625-evidence-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).expect("evidence dir");
+	write_probe_evidence(&dir, &serde_json::json!({"attempt": 1}));
+	write_probe_evidence(&dir, &serde_json::json!({"attempt": 2}));
+}
+
+/// Create `path` new, with `mode` applied at creation (never widened then narrowed).
+fn write_new_with_mode(path: &std::path::Path, text: &str, mode: u32) {
+	use std::io::Write as _;
+	use std::os::unix::fs::OpenOptionsExt as _;
+	let mut file = std::fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.mode(mode)
+		.open(path)
+		.unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+	file.write_all(text.as_bytes()).expect("write pki file");
+}
+
+fn create_private_dir(path: &std::path::Path) {
+	use std::os::unix::fs::DirBuilderExt as _;
+	std::fs::DirBuilder::new()
+		.mode(0o700)
+		.create(path)
+		.unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+}
+
+/// The campaign's identities: (directory, presenting CA, trusted root CA, worker id in the SAN).
+/// The presented certificate and the trusted root are independent, so a wrong-CA case is rejected
+/// by exactly one side: `probe-b` presents CA-B but trusts CA-A (a wrong client against CA-A
+/// workers); `strix-b` presents CA-B but trusts CA-A (a wrong server that still accepts CA-A
+/// clients).
+const MULTINODE_IDENTITIES: [(&str, usize, usize, u128); 11] = [
+	("ref1", 0, 0, 70_101),
+	("ref2", 0, 0, 70_102),
+	("ref3", 0, 0, 70_103),
+	("bigfoot", 0, 0, 70_201),
+	("strix", 0, 0, 70_202),
+	("optiplex", 0, 0, 70_203),
+	("probe", 0, 0, 70_900),
+	("wrong-id", 0, 0, 70_299),
+	("probe-b", 1, 0, 70_901),
+	("strix-b", 1, 0, 70_202),
+	// The positive control for `strix-b`: presents CA-A (which `strix-b` accepts) and trusts CA-B
+	// (which `strix-b` presents), so `strix-b` must serve it.
+	("probe-trusts-b", 0, 1, 70_902),
+];
+
+/// Issue the campaign's PKI under `root` (which must not exist). Each identity directory (0700)
+/// holds its certificate, its key (created 0600) and exactly one trust root; CA keys stay under
+/// `ca-a/` and `ca-b/`. Returns the SHA-256 of every certificate and root.
+fn issue_multinode_pki(root: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
+	let domain = "cluster.local";
+	create_private_dir(root);
+	let mut fingerprints = serde_json::Map::new();
+	let mut cas = Vec::new();
+	for name in ["ca-a", "ca-b"] {
+		let ca = tls_pki::generate_ca(&format!("adr625 {name}")).expect("ca");
+		create_private_dir(&root.join(name));
+		write_new_with_mode(&root.join(name).join("ca.crt"), &ca.cert, 0o644);
+		write_new_with_mode(
+			&root.join(name).join("ca.key"),
+			ca.key.as_deref().expect("ca key"),
+			0o600,
+		);
+		fingerprints.insert(
+			format!("{name}/ca.crt"),
+			sha256_hex(ca.cert.as_bytes()).into(),
+		);
+		let signer =
+			tls_pki::load_ca(&ca.cert, ca.key.as_deref().expect("ca key")).expect("load ca");
+		cas.push((name, ca.cert, signer));
+	}
+	for (dir, presenting, trusting, worker_u128) in MULTINODE_IDENTITIES {
+		let issued = tls_pki::issue_listener(
+			&cas[presenting].2,
+			&WorkerId::from_u128(worker_u128).get().to_string(),
+			domain,
+		)
+		.expect("listener");
+		create_private_dir(&root.join(dir));
+		write_new_with_mode(&root.join(dir).join("listener.crt"), &issued.cert, 0o644);
+		write_new_with_mode(
+			&root.join(dir).join("listener.key"),
+			issued.key.as_deref().expect("key"),
+			0o600,
+		);
+		write_new_with_mode(&root.join(dir).join("ca.crt"), &cas[trusting].1, 0o644);
+		fingerprints.insert(
+			format!(
+				"{dir}/listener.crt (presents {}, worker {worker_u128})",
+				cas[presenting].0
+			),
+			sha256_hex(issued.cert.as_bytes()).into(),
+		);
+		fingerprints.insert(
+			format!("{dir}/ca.crt (trusts {})", cas[trusting].0),
+			sha256_hex(cas[trusting].1.as_bytes()).into(),
+		);
+	}
+	// A CA-A `client-<tenant>` identity (an SQL client, not `toron-*`) that trusts CA-A.
+	let csr_key = rcgen::Certificate::from_params(rcgen::CertificateParams::new(Vec::new()))
+		.expect("csr key");
+	let csr = csr_key.serialize_request_pem().expect("csr");
+	let client = tls_pki::sign_client_csr(&cas[0].2, &csr, "7", domain).expect("client cert");
+	create_private_dir(&root.join("client-tenant"));
+	write_new_with_mode(
+		&root.join("client-tenant").join("listener.crt"),
+		&client.cert,
+		0o644,
+	);
+	write_new_with_mode(
+		&root.join("client-tenant").join("listener.key"),
+		&csr_key.serialize_private_key_pem(),
+		0o600,
+	);
+	write_new_with_mode(&root.join("client-tenant").join("ca.crt"), &cas[0].1, 0o644);
+	fingerprints.insert(
+		"client-tenant/listener.crt (presents ca-a, client-7)".into(),
+		sha256_hex(client.cert.as_bytes()).into(),
+	);
+	fingerprints.insert(
+		"client-tenant/ca.crt (trusts ca-a)".into(),
+		sha256_hex(cas[0].1.as_bytes()).into(),
+	);
+	write_new_with_mode(
+		&root.join("fingerprints.json"),
+		&serde_json::to_string_pretty(&fingerprints).expect("fingerprints"),
+		0o644,
+	);
+	fingerprints
+}
+
+/// ADR 625: issue the campaign's PKI into `TORON_MULTINODE_PKI_DIR` (which must not exist).
+#[test]
+#[ignore = "multinode PKI issuance: needs TORON_MULTINODE_PKI_DIR"]
+fn multinode_issue_pki() {
+	let root = std::path::PathBuf::from(
+		std::env::var("TORON_MULTINODE_PKI_DIR").expect("TORON_MULTINODE_PKI_DIR"),
+	);
+	issue_multinode_pki(&root);
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+	aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes)
+		.as_ref()
+		.iter()
+		.map(|byte| format!("{byte:02x}"))
+		.collect()
+}
+
+/// ADR 625, before any host use: the decoupled wrong-CA arrangements behave locally as intended.
+/// A host-mode worker binds loopback (advertising a placeholder routable address) and is dialled
+/// through the real mTLS path (an authenticated endpoint with the worker's canonical server name),
+/// not through `QuicTransport`'s unauthenticated loopback shortcut. Each rejection is observed on
+/// its intended side, and a rejected client never reaches an application stream on the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn decoupled_wrong_ca_arrangements_are_rejected_by_the_intended_side() {
+	let root = std::env::temp_dir().join(format!("toron-adr625-mtls-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&root);
+	issue_multinode_pki(&root);
+	let pki = |identity: &str, file: &str| root.join(identity).join(file);
+
+	// (worker identity, worker id, client identity, expected outcome)
+	let cases = [
+		("strix", 70_202u128, "probe", "acknowledged"),
+		("strix", 70_202, "probe-b", "rejected"),
+		("strix-b", 70_202, "probe", "rejected"),
+		("strix", 70_202, "client-tenant", "rejected"),
+		("strix-b", 70_202, "probe-trusts-b", "acknowledged"),
+	];
+	for (worker_identity, worker_u128, client_identity, expected) in cases {
+		let port = std::net::UdpSocket::bind("127.0.0.1:0")
+			.expect("free port")
+			.local_addr()
+			.expect("port")
+			.port();
+		let stderr_path = root.join(format!("{worker_identity}-{client_identity}.stderr"));
+		let mut worker = Command::new(env!("CARGO_BIN_EXE_toron_fixture_worker"))
+			.args(["--worker-u128", &worker_u128.to_string()])
+			.args([
+				"--bind",
+				&format!("127.0.0.1:{port}"),
+				"--advertise",
+				&format!("192.0.2.1:{port}"),
+			])
+			.args([
+				"--tls-cert",
+				pki(worker_identity, "listener.crt").to_str().unwrap(),
+			])
+			.args([
+				"--tls-key",
+				pki(worker_identity, "listener.key").to_str().unwrap(),
+			])
+			.args(["--tls-ca", pki(worker_identity, "ca.crt").to_str().unwrap()])
+			.args(["--cluster-domain", "cluster.local"])
+			.stdout(Stdio::piped())
+			.stderr(std::fs::File::create(&stderr_path).expect("stderr file"))
+			.kill_on_drop(true)
+			.spawn()
+			.expect("spawn host-mode worker");
+		let mut line = String::new();
+		bounded(BufReader::new(worker.stdout.take().unwrap()).read_line(&mut line))
+			.await
+			.expect("readiness");
+		assert!(line.starts_with("READY "), "{worker_identity}: {line}");
+
+		let client = toron::network::tls::client_config_from_paths(
+			&pki(client_identity, "listener.crt"),
+			&pki(client_identity, "listener.key"),
+			&pki(client_identity, "ca.crt"),
+		)
+		.expect("client material");
+		let endpoint =
+			toron::quic::QuicEndpoint::client_authenticated(client).expect("client endpoint");
+		let server_name = toron::network::tls::canonical_daemon_dns_name(
+			&WorkerId::from_u128(worker_u128),
+			"cluster.local",
+		);
+		let address = toron::distributed::task::PartitionAddress {
+			query_id: QueryId::new(),
+			exchange_id: toron::distributed::identity::ExchangeId::new(0),
+			producer_stage_id: toron::distributed::identity::StageId::new(0),
+			producer_task_id: toron::distributed::identity::TaskId::new(0),
+			attempt_id: AttemptId::first(),
+			partition_id: toron::distributed::identity::PartitionId::new(0),
+		};
+		let client_port = endpoint.local_addr().expect("client port").port();
+		let dial_and_pull = |endpoint: toron::quic::QuicEndpoint| {
+			let server_name = server_name.clone();
+			async move {
+				let stream = endpoint
+					.connect_stream_with_server_name(
+						format!("127.0.0.1:{port}").parse().unwrap(),
+						&server_name,
+					)
+					.await
+					.map_err(|error| format!("dial: {error}"))?;
+				toron::server::ToronCoordinator::new(Arc::new(MemoryManager::new(4, 1024 * 1024)))
+					.pull_partition_from_worker(stream, address, AttemptId::first())
+					.await
+					.map(|_| "served".to_string())
+					.map_err(|error| format!("pull: {error}"))
+			}
+		};
+		let outcome = bounded(dial_and_pull(endpoint.clone())).await;
+		// A valid client right after: the worker must still serve (a rejection does not wedge it).
+		let valid = toron::network::tls::client_config_from_paths(
+			&pki("probe", "listener.crt"),
+			&pki("probe", "listener.key"),
+			&pki("probe", "ca.crt"),
+		)
+		.expect("valid client material");
+		let valid_endpoint =
+			toron::quic::QuicEndpoint::client_authenticated(valid).expect("valid endpoint");
+		let valid_port = valid_endpoint.local_addr().expect("valid port").port();
+		let follow_up = bounded(dial_and_pull(valid_endpoint)).await;
+		tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+		let _ = worker.kill().await;
+		let _ = worker.wait().await;
+		let log = std::fs::read_to_string(&stderr_path).expect("worker stderr");
+		let accepted_from = |port: u16| {
+			log.lines().any(|line| {
+				line.starts_with("STREAM_ACCEPTED") && line.ends_with(&format!(":{port}"))
+			})
+		};
+		let partition_missing = |result: &Result<String, String>| matches!(result, Err(error) if error.starts_with("pull: partition store mismatch"));
+		let tag = format!("{worker_identity} <- {client_identity}");
+		if expected == "acknowledged" {
+			assert!(partition_missing(&outcome), "{tag}: {outcome:?}");
+			assert!(
+				accepted_from(client_port),
+				"{tag}: no STREAM_ACCEPTED from :{client_port}\n{log}"
+			);
+		} else {
+			assert!(
+				!partition_missing(&outcome),
+				"{tag} reached the application: {outcome:?}"
+			);
+			assert!(outcome.is_err(), "{tag}: {outcome:?}");
+			assert!(
+				!accepted_from(client_port),
+				"{tag}: the rejected client got a stream\n{log}"
+			);
+			let side = match &outcome {
+				Err(error) if error.starts_with("dial:") => "client refused the server at the dial",
+				_ => "server ended the connection after the client's dial",
+			};
+			println!("{tag}: {side}: {outcome:?}");
+		}
+		// Where the worker itself judged the client (it presents CA-A), a valid client right after must
+		// still be served. A worker presenting CA-B is refused by every CA-A client, by design.
+		if worker_identity != "strix-b" {
+			assert!(
+				partition_missing(&follow_up),
+				"{tag}: the valid follow-up was not served: {follow_up:?}"
+			);
+			assert!(
+				accepted_from(valid_port),
+				"{tag}: no STREAM_ACCEPTED for the valid follow-up\n{log}"
+			);
+		}
+	}
+	let _ = std::fs::remove_dir_all(&root);
+}

@@ -25,6 +25,26 @@ enum FixtureTransport {
 	Quic,
 }
 
+/// Host mode: authenticated QUIC (mTLS) on a host address, for multinode runs. The worker's
+/// listener certificate is both its server identity and its peer-client identity.
+struct HostMode {
+	bind: std::net::SocketAddr,
+	advertise: std::net::SocketAddr,
+	listener_cert: std::path::PathBuf,
+	listener_key: std::path::PathBuf,
+	peer_ca: std::path::PathBuf,
+	cluster_domain: String,
+}
+
+/// One timestamped line on stderr: receiver-side evidence for a multinode attempt.
+fn host_event(event: &str, detail: impl std::fmt::Display) {
+	let unix_ms = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|elapsed| elapsed.as_millis())
+		.unwrap_or(0);
+	eprintln!("{event} unix_ms={unix_ms} {detail}");
+}
+
 /// Test-only evidence: appends one `<this worker> <producer worker> <producer endpoint>` line per
 /// sealed-pull dial, then dials through the real transport unchanged.
 struct DialRecordingTransport {
@@ -68,7 +88,7 @@ impl ToronTransport for DialRecordingTransport {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-	let (worker_id, transport, record_peer_dials) = args()?;
+	let (worker_id, transport, record_peer_dials, host_mode) = args()?;
 	let peer = |inner: Arc<dyn ToronTransport>| -> Arc<dyn ToronTransport> {
 		match &record_peer_dials {
 			Some(path) => Arc::new(DialRecordingTransport {
@@ -91,6 +111,65 @@ async fn main() -> Result<(), Box<dyn Error>> {
 			.with_peer_transport(peer),
 		))
 	};
+	if let Some(host) = host_mode {
+		let policy = match toron::network::tls::ListenerPolicy::load_from_paths(
+			&host.listener_cert,
+			&host.listener_key,
+			&host.peer_ca,
+			&host.cluster_domain,
+			&worker_id,
+		) {
+			Ok(policy) => policy,
+			Err(error) => {
+				host_event("STARTUP_REJECTED", format!("error={error}"));
+				return Err(error.into());
+			}
+		};
+		let quic = QuicEndpoint::bind_authenticated(
+			host.bind,
+			policy.server_config_for(toron::network::tls::ListenerRole::WorkerTask),
+		)?;
+		let endpoint = WorkerEndpoint::new(host.advertise.to_string());
+		let worker = worker(
+			endpoint.clone(),
+			peer(Arc::new(QuicTransport::authenticated(
+				policy.client_config(),
+				policy.cluster_domain(),
+			)?)),
+		)?;
+		host_event(
+			"LISTENING",
+			format!("bind={} advertise={}", host.bind, host.advertise),
+		);
+		announce(&endpoint).await?;
+		loop {
+			let connection = match quic.accept_connection().await {
+				Ok(connection) => connection,
+				Err(error) => {
+					host_event("HANDSHAKE_REJECTED", format!("error={error}"));
+					continue;
+				}
+			};
+			let remote = connection.remote_address();
+			let worker = worker.clone();
+			tokio::spawn(async move {
+				match QuicEndpoint::accept_stream_on(&connection).await {
+					Ok(stream) => {
+						host_event("STREAM_ACCEPTED", format!("remote={remote}"));
+						if let Err(error) = worker.handle_connection(stream).await {
+							host_event(
+								"CONNECTION_FAILED",
+								format!("remote={remote} error={error}"),
+							);
+						}
+					}
+					Err(error) => {
+						host_event("STREAM_FAILED", format!("remote={remote} error={error}"))
+					}
+				}
+			});
+		}
+	}
 	match transport {
 		FixtureTransport::Tcp => {
 			let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -301,16 +380,46 @@ impl StorageScan for FixtureStorageScan {
 	}
 }
 
-type FixtureArgs = (WorkerId, FixtureTransport, Option<std::path::PathBuf>);
+type FixtureArgs = (
+	WorkerId,
+	FixtureTransport,
+	Option<std::path::PathBuf>,
+	Option<HostMode>,
+);
+
+fn invalid(message: String) -> Box<dyn Error> {
+	Box::new(std::io::Error::new(
+		std::io::ErrorKind::InvalidInput,
+		message,
+	))
+}
 
 fn args() -> Result<FixtureArgs, Box<dyn Error>> {
 	let mut args = std::env::args().skip(1);
 	let mut worker_u128 = None;
 	let mut transport = FixtureTransport::Tcp;
 	let mut record_peer_dials = None;
+	let mut bind: Option<std::net::SocketAddr> = None;
+	let mut advertise: Option<std::net::SocketAddr> = None;
+	let mut tls_cert = None;
+	let mut tls_key = None;
+	let mut tls_ca = None;
+	let mut cluster_domain = None;
 	while let Some(arg) = args.next() {
 		if arg == "--worker-u128" {
 			worker_u128 = args.next().map(|value| value.parse::<u128>()).transpose()?;
+		} else if arg == "--bind" {
+			bind = args.next().map(|value| value.parse()).transpose()?;
+		} else if arg == "--advertise" {
+			advertise = args.next().map(|value| value.parse()).transpose()?;
+		} else if arg == "--tls-cert" {
+			tls_cert = args.next().map(std::path::PathBuf::from);
+		} else if arg == "--tls-key" {
+			tls_key = args.next().map(std::path::PathBuf::from);
+		} else if arg == "--tls-ca" {
+			tls_ca = args.next().map(std::path::PathBuf::from);
+		} else if arg == "--cluster-domain" {
+			cluster_domain = args.next();
 		} else if arg == "--record-peer-dials" {
 			record_peer_dials = args.next().map(std::path::PathBuf::from);
 		} else if arg == "--transport" {
@@ -332,9 +441,45 @@ fn args() -> Result<FixtureArgs, Box<dyn Error>> {
 			"missing required --worker-u128 argument",
 		)
 	})?;
+	let host_mode = host_mode(bind, advertise, tls_cert, tls_key, tls_ca, cluster_domain)?;
 	Ok((
 		WorkerId::from_u128(worker_u128),
 		transport,
 		record_peer_dials,
+		host_mode,
 	))
+}
+
+/// Host mode needs every host flag or none. It refuses a loopback or unspecified advertised
+/// address: a loopback endpoint would take the unauthenticated loopback QUIC path silently.
+fn host_mode(
+	bind: Option<std::net::SocketAddr>,
+	advertise: Option<std::net::SocketAddr>,
+	tls_cert: Option<std::path::PathBuf>,
+	tls_key: Option<std::path::PathBuf>,
+	tls_ca: Option<std::path::PathBuf>,
+	cluster_domain: Option<String>,
+) -> Result<Option<HostMode>, Box<dyn Error>> {
+	match (bind, advertise, tls_cert, tls_key, tls_ca, cluster_domain) {
+		(None, None, None, None, None, None) => Ok(None),
+		(Some(bind), Some(advertise), Some(listener_cert), Some(listener_key), Some(peer_ca), Some(cluster_domain)) => {
+			if advertise.ip().is_loopback() || advertise.ip().is_unspecified() || advertise.port() == 0 {
+				return Err(invalid(format!(
+					"--advertise must be a routable host address and port, got {advertise}"
+				)));
+			}
+			Ok(Some(HostMode {
+				bind,
+				advertise,
+				listener_cert,
+				listener_key,
+				peer_ca,
+				cluster_domain,
+			}))
+		}
+		_ => Err(invalid(
+			"host mode needs --bind, --advertise, --tls-cert, --tls-key, --tls-ca and --cluster-domain together"
+				.to_string(),
+		)),
+	}
 }
