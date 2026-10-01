@@ -1,8 +1,13 @@
 # ADR 626 - bounded recovery from unannounced worker loss
 
-**Status:** PROPOSED, staged. Successor to ADR 625, which closed LIMITED.
-After an unannounced worker loss, no terminal return or correct
-completion was observed within 30 s of the confirmed kill.
+**Status:** CLOSED, scoped to the declared Stage C controls and campaign
+(see [Stage C results](#stage-c-results-reviewed)). In that campaign,
+every unannounced loss recovered at reference parity within `R` = 30 s.
+`H` and `C` stay experimental, and `W` stays deferred.
+
+Successor to ADR 625, which closed LIMITED. There, after an unannounced
+worker loss, no terminal return or correct completion was observed
+within 30 s of the confirmed kill.
 
 This plan has three stages, and approval does not carry forward:
 - **Stage A (Part 1), the only part authorized by this plan's commit:**
@@ -781,6 +786,100 @@ What the stale fixtures assert:
   or of late-wire fencing.
 - Retirement is reported as local cancellation.
 - `W` stays deferred.
+
+## Stage C results (reviewed)
+
+Accepted on review, within the declared experiment. Every figure below
+was read from the campaign's evidence.
+
+**Identities.**
+- **Source:** baseline `11f58d8a` (tree `e182e09f`), tag
+  `adr626-stage-c-baseline`, after the plan amendment `3df3d346`. The
+  baseline differs from the laddered `fcf67a40` (tree `00700228`) only
+  in this document.
+- **Ladder:** `ladder-stage-c-4` plus `tpch-full-rerun-2` (toolchain
+  1.95.0), as one composite record.
+  - In that ladder, toron, client, fmt and both release builds returned
+    rc 0. The first toron-tpch run returned 101 (673 passed, 1 failed),
+    and full rerun 2 returned 0 (674 passed).
+  - The failed test read a strict SF1 parquet file that was written
+    during the same step in a fresh worktree. That cause is an
+    inference, not an established fact.
+  - Retained records: `ladder-stage-c-2` is INVALID (its tree was reset
+    mid-run); `ladder-stage-c-3` ran on toolchain 1.98.1 (NOTE); one
+    full tpch rerun ran without agent forwarding (INVALID).
+- **Artifacts:** `toron_fixture_worker` `d699db5d…`, probe `1927db68…`,
+  identical on all three hosts. The per-host manifests were verified on
+  each host.
+- **Freeze and evidence:**
+  - frozen in `FREEZE.json` `f206ae4e…`;
+  - schedule `eb660f88…` (29 attempts);
+  - readout `b9331daf…`;
+  - evidence archive of 1003 files with `SHA256SUMS` `9b7ec000…`,
+    retained on bigfoot under
+    `~/work/toron-evidence/adr626c/campaign`.
+
+**Run.**
+- Links before, then the 29 attempts in frozen order, then links after.
+- Every attempt returned rc 0, and there was no STOP. Both link
+  campaigns measured 48 of 48 runs.
+- The readout, recomputed from the copied raw evidence, is READ with no
+  reasons.
+
+**Controls.**
+- **References:** 5 of 5 completed with zero recovery events.
+- **Healthy controls:** 15 of 15 passed (`hash_join`,
+  `grouped_aggregate`, `except_all`, `row_number` and `slow_scan`,
+  three each, at `H` 5000 ms and `C` 12000 ms). Each was at reference
+  parity, with zero recovery events, every attempt 0 and no retries.
+  There were no false suspicions in these controls; nothing is claimed
+  about Wi-Fi in general.
+- **Local controls** (staged release executables, separate from the
+  preliminary runs):
+  - Relay below `H`: establishment 604 ms, query 7081 ms, zero events.
+  - Relay past `H`: recovered at parity 17072 ms after the cut.
+    Coalescing was observed, recomputed from raw events: one
+    confirmation interval with two reports.
+  - Long silence: 8024 ms, longer than the local `H`, with zero events.
+  - Relay lifecycle: exact test proof.
+- **Announced-loss regression** (experiment off): passed, with zero
+  recovery events.
+
+**Unannounced loss (experiment on).** All four attempts were classified
+as recovered, at reference parity, with event identities bound to the
+final run and no false exclusions.
+- The three producer losses are repetitions: each killed the same worker
+  (strix, 70202). The dispatch-target loss killed optiplex (70203).
+  Losses on every host and in every role were not covered.
+- All times are scheduler-clock deltas from the kill marker on the
+  coordinator (bigfoot), except completion, which is measured from the
+  confirmed kill.
+
+| Attempt | Completion | Dispatch timeout and exclusion | Consumer replay | Liveness decision | Producer replay |
+|---|---|---|---|---|---|
+| producer 1 | 17698 ms | 5097.064 ms | 5097.081 ms | 17101.324 ms | 17101.338 ms |
+| producer 2 | 17302 ms | 5069.221 ms | 5069.236 ms | 17070.864 ms | 17070.883 ms |
+| producer 3 | 17587 ms | 5070.554 ms | 5070.591 ms | 17072.603 ms | 17072.644 ms |
+| dispatch target | 5980 ms | 5000.669 ms | 5000.679 ms | none | none |
+
+- In each producer loss, the coordinator's dispatch to the dead worker
+  timed out near `H`. That excluded the worker and replaced the
+  consumer. A consumer's report against the sealed producer then waited
+  the full `C` before the producer's replacement attempt was replayed.
+- That extra `C` wait is the deferred shortcut recorded in the Stage C
+  amendment. It is a successor-plan candidate: count a dispatch-path
+  exclusion as confirmation for later reports in the same query. This
+  closure changes no behaviour.
+
+**Limits.**
+- The detection deltas are single-host scheduler-clock steps. They do
+  not establish an end-to-end guarantee.
+- This is one campaign on one Wi-Fi setup: three producer-loss
+  repetitions against one worker, one dispatch-target loss, and 15
+  healthy controls.
+- `H` and `C` stay experimental, and `W` stays deferred.
+- Stale coverage is local cancellation or unit-only, per the amendment.
+  No remote cancellation and no wire fencing are claimed.
 
 ## Acceptance
 
