@@ -708,17 +708,11 @@ No TLS change, no change to the ADR 577 policy, and no heartbeat work.
       concurrency.
 - **A long, silent, healthy execution** that outlasts `H` and `W`
   completes, which shows ADR 577 is intact.
-- **Stale delivery on the wire.** Test-only barriers make an old
-  attempt's outcome reach the scheduler *after* invalidation, while the
-  query is still running.
-  - This is covered for a producer and for a final-stage task carrying
-    batches.
-  - The test asserts the rejection event and the reference digest.
-  - Where the abandoned future is dropped and cannot deliver, the record
-    reports cancellation, not on-wire stale fencing.
-  - Where needed, a resumed stale task is injected explicitly
-    (`SIGSTOP` and `SIGCONT` around a barrier, with the query still
-    active).
+- **Stale delivery.** Amended before any Stage C evidence; see
+  [Stage C amendment](#stage-c-amendment-stale-coverage). In the
+  cleared Stage B design, stale delivery on the wire is not reachable
+  through the confirmation path, so this control becomes the coverage
+  table below: local cancellation, and unit-only stale fencing.
 
 ### Part 6: the three-host campaign
 
@@ -728,12 +722,65 @@ attempt:
 - the healthy controls;
 - three unannounced losses of a sealed producer;
 - one unannounced loss of a dispatch target;
-- the stale-delivery attempts;
 - one announced-loss regression.
+
+There are no host stale-delivery attempts: see the Stage C amendment.
 
 Each loss attempt reports the detection telemetry against the confirmed
 kill, and the outcome (correct recovery, or a typed terminal failure)
 against `R`.
+
+### Stage C amendment: stale coverage
+
+Recorded on review, before any Stage C evidence.
+
+**Reachability, stated narrowly.**
+- `apply_confirmation` returns the identities it supersedes.
+  `dispatch_loop` aborts each one's owned dispatch future through its
+  `AbortHandle`, and `Abortable` checks the abort flag before it polls
+  the inner future.
+- So, on this path, a superseded attempt is retired before it can
+  deliver an outcome through the loop.
+- This says nothing about every possible path or API. The
+  unconditional `OutcomeDisposition` guard stays.
+
+**Coverage.**
+
+| Case | Status | Evidence |
+|---|---|---|
+| Stale producer success with a sealed manifest and telemetry | Unit-only | `stale_manifests_failures_reports_and_telemetry_change_nothing`; `task_state` `stale_completed_attempt_rejected_after_invalidation`; `outcome_disposition_separates_current_stale_and_violations` |
+| Stale failure with telemetry | Unit-only | the same scheduler fixture |
+| Stale liveness report | Unit-only: raises no suspicion | the same scheduler fixture |
+| Stale final batch | Unit-only: no batch kept | `stale_and_unknown_outcomes_are_fenced_before_any_change` |
+| Accepted final result on a lost worker | Demonstrated in-process: replaced without duplicate rows | `an_accepted_final_task_on_the_lost_worker_replays_without_duplicate_rows` |
+| Local cancellation and reservation release of superseded attempts | Demonstrated in-process | `superseded_attempts_that_never_return_cannot_fill_a_bounded_frontier` |
+| Remote cancellation | **Not provided** | none; a retired attempt keeps running on its worker until it ends |
+| Late wire activity from a resumed old attempt | **Not demonstrated** | none; the `SIGSTOP`/`SIGCONT` control is dropped from this record |
+
+What the stale fixtures assert:
+- no manifest, final batch, task telemetry, acceptance state, retry or
+  suspicion changes;
+- the only change is the declared `stale_rejection_count` and one
+  `stale_outcome` event.
+
+**Preliminary observation (local relay control; not campaign evidence).**
+- In the past-`H` relay control, the coordinator's own dispatch to the
+  blackholed worker timed out after 5030.4 ms. That excluded the worker
+  directly, without a confirmation, and kept its manifests (the
+  dispatch-target path).
+- A consumer then reported the same worker's sealed producer. That
+  report still waited the full `C` before the confirmation ended at
+  17036.1 ms and the producer was replayed. The control recovered at
+  parity 17077 ms after the cut, within `R`.
+- Treating a dispatch-only exclusion as confirmation for later reports
+  would merge the two paths that Stage B keeps distinct. That shortcut
+  is deferred to a successor plan, and Stage C does not change it.
+
+**Claims.**
+- No claim of remote cancellation, of a resumed old worker's behaviour,
+  or of late-wire fencing.
+- Retirement is reported as local cancellation.
+- `W` stays deferred.
 
 ## Acceptance
 
@@ -749,7 +796,9 @@ against `R`.
   above.
 - **Stage C:**
   - **Controls:** zero false suspicions in the healthy controls, and the
-    declared outcomes in the relay and stale-delivery controls.
+    declared outcomes in the relay controls. Stale fencing is reported
+    per the amendment's coverage table, as cancellation or unit-only
+    and never as wire fencing.
   - **Unannounced loss:** each attempt either recovers correctly within
     `R` at parity, or is reported against `R` and not counted as a pass.
 
