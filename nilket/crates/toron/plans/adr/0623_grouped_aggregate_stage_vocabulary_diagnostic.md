@@ -1,7 +1,15 @@
 # ADR 623 - stage vocabulary for the primitive scan-grouped and fallback grouped folds: a diagnostic
 
-**Status:** PROPOSED. Successor to ADR 622. **A diagnostic record: no
-token, no pair, no cut, no saving projected.**
+**Status:** CLOSED, LIMITED (results in
+`plans/impl/0623_grouped_aggregate_stage_vocabulary_diagnostic_results.md`).
+The instrument landed, and the 22-cell sweep is compatible apart from
+the declared new contracts. q18's inner aggregate (primitive Int64 SUM)
+is attributed: `fold` 1,617.9 ms of a 1,873.3 ms handler, and
+`stream_pull` 241.2 ms. The outer aggregate's breakdown is withheld
+because its bridge fails: the fallback handler takes about 0.37 ms,
+while about 1.64 s of the Aggregate node lies outside it, as dispatch
+residual. Successor to ADR 622. **A diagnostic record: no token, no
+pair, no cut, no saving projected.**
 
 ADR 622's sealed board ranks q18 second by absolute gap: Toron 6,022.0
 ms against DuckDB 1,489.0 ms, a gap of 4,533 ms. ADR 614 found q18's time
@@ -121,8 +129,22 @@ by a call to a new wrapper in `aggregate.rs`. The wrapper:
 - closes the handler span.
 
 The existing fold refinements then publish under `fold`.
-`bound_grouped_aggregate` itself is unchanged, and so are its other
-callers. The input node runs before the handler span opens, and its
+
+*Implementation adjustment (reviewed).* `bound_grouped_aggregate` is
+not left literally unchanged. The production caller audit found the
+executor fallback was its only caller outside tests. So the original
+body is moved, not duplicated, into one shared method,
+`staged_bound_grouped_aggregate(…, Option<&VocabularyHandle>)`:
+- it keeps the same group owner, batch order, fold and finalize;
+- its stages are inert without a vocabulary.
+
+Two methods call that body:
+- the wrapper, `attributed_bound_grouped_aggregate`, which is now the
+  only production caller;
+- `bound_grouped_aggregate`, which becomes a `#[cfg(test)]` delegate
+  passing `None`.
+
+ADR 435's syntactic fold and finalize site counts are unchanged. The input node runs before the handler span opens, and its
 time stays the child's.
 
 **What does not change.** No result, plan or route choice changes:

@@ -882,9 +882,9 @@ impl Executor {
 			return Ok(Some(output));
 		}
 		// ADR 508 step 2: the generic-loop lifecycle. Declared only here — *after* both primitive
-		// admissions declined — because the primitive paths above have their own lifecycles and no
-		// stage instrumentation. A cell that takes one will report missing attribution until it gets
-		// a vocabulary of its own, which is the honest state rather than a borrowed one.
+		// admissions declined — because the primitive paths above have their own lifecycles, each with
+		// its own vocabulary (`scan_grouped_primitive_sum` / `_count`) rather than a borrowed one; the
+		// generic loop's stages would not describe them.
 		//
 		// The required set is applicability-driven, not a fixed list: a shape with no scan-input ops
 		// never performs projection, and letting a phase that does not exist satisfy a required name
@@ -1129,13 +1129,26 @@ impl Executor {
 		output_schema: &SchemaRef,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		let telemetry = &self.context.task_telemetry;
+		let vocabulary = declare_primitive_scan_grouped_vocabulary("scan_grouped_primitive_sum");
+		let scan_open_stage = open_primitive_stage(vocabulary.as_ref(), "scan_open", telemetry);
 		let req = self
 			.bound_scan_request(streaming_input.scan_input.scan, morsel)
 			.ok_or_else(|| ExecutionError::InvalidExpression {
 				message: "primitive Int64 grouped SUM lost its scan request".to_string(),
-			})?;
-		let row_limit = req.row_limit;
-		let mut stream = self.open_scan(req).await?;
+			});
+		let opened = match req {
+			Ok(req) => {
+				let row_limit = req.row_limit;
+				self.open_scan(req)
+					.await
+					.map(|stream| (row_limit, stream))
+					.map_err(ExecutionError::from)
+			}
+			Err(error) => Err(error),
+		};
+		close_primitive_stage(scan_open_stage, telemetry);
+		let (row_limit, mut stream) = opened?;
 		let cap = super::join::join_spill_retained_footprint_memory_cap(
 			self.context.task_budget.memory.get(),
 		);
@@ -1143,10 +1156,14 @@ impl Executor {
 		let mut rows = 0usize;
 		let mut groups = PrimitiveInt64Groups::new();
 		while row_limit.map(|limit| rows < limit).unwrap_or(true) {
-			let Some(batch) = stream.next().await else {
+			let pull_stage = open_primitive_stage(vocabulary.as_ref(), "stream_pull", telemetry);
+			let next = stream.next().await;
+			close_primitive_stage(pull_stage, telemetry);
+			let Some(batch) = next else {
 				break;
 			};
 			let batch = batch?;
+			let input_ops_stage = open_primitive_stage(vocabulary.as_ref(), "input_ops", telemetry);
 			let batch = if let Some(limit) = row_limit {
 				let remaining = limit - rows;
 				if batch.num_rows() > remaining {
@@ -1158,62 +1175,79 @@ impl Executor {
 				batch
 			};
 			rows = rows.saturating_add(batch.num_rows());
-			let batch = self.apply_streaming_scan_input_ops(&streaming_input.scan_input, batch)?;
+			let batch = self.apply_streaming_scan_input_ops(&streaming_input.scan_input, batch);
+			close_primitive_stage(input_ops_stage, telemetry);
+			let batch = batch?;
 			self.accumulate_aggregate_batch(|| {
-				let keys = batch
-					.column(spec.group_column.0 as usize)
-					.as_any()
-					.downcast_ref::<Int64Array>()
-					.ok_or_else(|| ExecutionError::InvalidExpression {
-						message: "primitive grouped SUM key must be Int64".to_string(),
-					})?;
-				if keys.null_count() != 0 {
-					return Err(ExecutionError::InvalidExpression {
-						message: "primitive grouped SUM received a null key".to_string(),
-					});
-				}
-				match spec.input {
-					PrimitiveInt64SumInput::Int64 => {
-						let values = batch
-							.column(spec.value_column.0 as usize)
-							.as_any()
-							.downcast_ref::<Int64Array>()
-							.ok_or_else(|| ExecutionError::InvalidExpression {
-								message: "primitive grouped SUM input must be Int64".to_string(),
-							})?;
-						if values.null_count() != 0 {
-							return Err(ExecutionError::InvalidExpression {
-								message: "primitive grouped SUM received a null input".to_string(),
-							});
+				let fold_stage = open_primitive_stage(vocabulary.as_ref(), "fold", telemetry);
+				let folded = (|| {
+					let keys = batch
+						.column(spec.group_column.0 as usize)
+						.as_any()
+						.downcast_ref::<Int64Array>()
+						.ok_or_else(|| ExecutionError::InvalidExpression {
+							message: "primitive grouped SUM key must be Int64".to_string(),
+						})?;
+					if keys.null_count() != 0 {
+						return Err(ExecutionError::InvalidExpression {
+							message: "primitive grouped SUM received a null key".to_string(),
+						});
+					}
+					match spec.input {
+						PrimitiveInt64SumInput::Int64 => {
+							let values = batch
+								.column(spec.value_column.0 as usize)
+								.as_any()
+								.downcast_ref::<Int64Array>()
+								.ok_or_else(|| ExecutionError::InvalidExpression {
+									message: "primitive grouped SUM input must be Int64"
+										.to_string(),
+								})?;
+							if values.null_count() != 0 {
+								return Err(ExecutionError::InvalidExpression {
+									message: "primitive grouped SUM received a null input"
+										.to_string(),
+								});
+							}
+							for row in 0..batch.num_rows() {
+								groups.insert(
+									keys.value(row),
+									i128::from(values.value(row)),
+									cap,
+								)?;
+							}
 						}
-						for row in 0..batch.num_rows() {
-							groups.insert(keys.value(row), i128::from(values.value(row)), cap)?;
+						PrimitiveInt64SumInput::Decimal128 => {
+							let values = batch
+								.column(spec.value_column.0 as usize)
+								.as_any()
+								.downcast_ref::<Decimal128Array>()
+								.ok_or_else(|| ExecutionError::InvalidExpression {
+									message: "primitive grouped SUM input must be Decimal128"
+										.to_string(),
+								})?;
+							if values.null_count() != 0 {
+								return Err(ExecutionError::InvalidExpression {
+									message: "primitive grouped SUM received a null input"
+										.to_string(),
+								});
+							}
+							for row in 0..batch.num_rows() {
+								groups.insert(keys.value(row), values.value(row), cap)?;
+							}
 						}
 					}
-					PrimitiveInt64SumInput::Decimal128 => {
-						let values = batch
-							.column(spec.value_column.0 as usize)
-							.as_any()
-							.downcast_ref::<Decimal128Array>()
-							.ok_or_else(|| ExecutionError::InvalidExpression {
-								message: "primitive grouped SUM input must be Decimal128"
-									.to_string(),
-							})?;
-						if values.null_count() != 0 {
-							return Err(ExecutionError::InvalidExpression {
-								message: "primitive grouped SUM received a null input".to_string(),
-							});
-						}
-						for row in 0..batch.num_rows() {
-							groups.insert(keys.value(row), values.value(row), cap)?;
-						}
-					}
-				}
-				Ok(())
+					Ok(())
+				})();
+				close_primitive_stage(fold_stage, telemetry);
+				folded
 			})?;
 		}
+		let finalize_stage = open_primitive_stage(vocabulary.as_ref(), "finalize", telemetry);
 		record_primitive_int64_sum_profile(&groups, cap, started.elapsed());
-		groups.finish(output_schema, self.context.task_budget.memory.get())
+		let output = groups.finish(output_schema, self.context.task_budget.memory.get());
+		close_primitive_stage(finalize_stage, telemetry);
+		output
 	}
 
 	async fn execute_primitive_int64_count_grouped_scan(
@@ -1223,22 +1257,39 @@ impl Executor {
 		output_schema: &SchemaRef,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		let telemetry = &self.context.task_telemetry;
+		let vocabulary = declare_primitive_scan_grouped_vocabulary("scan_grouped_primitive_count");
+		let scan_open_stage = open_primitive_stage(vocabulary.as_ref(), "scan_open", telemetry);
 		let req = self
 			.bound_scan_request(streaming_input.scan_input.scan, morsel)
 			.ok_or_else(|| ExecutionError::InvalidExpression {
 				message: "primitive Int64 grouped COUNT lost its scan request".to_string(),
-			})?;
-		let row_limit = req.row_limit;
-		let mut stream = self.open_scan(req).await?;
+			});
+		let opened = match req {
+			Ok(req) => {
+				let row_limit = req.row_limit;
+				self.open_scan(req)
+					.await
+					.map(|stream| (row_limit, stream))
+					.map_err(ExecutionError::from)
+			}
+			Err(error) => Err(error),
+		};
+		close_primitive_stage(scan_open_stage, telemetry);
+		let (row_limit, mut stream) = opened?;
 		let cap = self.context.task_budget.memory.get();
 		let started = Instant::now();
 		let mut rows = 0usize;
 		let mut groups = PrimitiveInt64Groups::new();
 		while row_limit.map(|limit| rows < limit).unwrap_or(true) {
-			let Some(batch) = stream.next().await else {
+			let pull_stage = open_primitive_stage(vocabulary.as_ref(), "stream_pull", telemetry);
+			let next = stream.next().await;
+			close_primitive_stage(pull_stage, telemetry);
+			let Some(batch) = next else {
 				break;
 			};
 			let batch = batch?;
+			let input_ops_stage = open_primitive_stage(vocabulary.as_ref(), "input_ops", telemetry);
 			let batch = if let Some(limit) = row_limit {
 				let remaining = limit - rows;
 				if batch.num_rows() > remaining {
@@ -1250,28 +1301,42 @@ impl Executor {
 				batch
 			};
 			rows = rows.saturating_add(batch.num_rows());
-			let batch = self.apply_streaming_scan_input_ops(&streaming_input.scan_input, batch)?;
+			let batch = self.apply_streaming_scan_input_ops(&streaming_input.scan_input, batch);
+			close_primitive_stage(input_ops_stage, telemetry);
+			let batch = batch?;
 			self.accumulate_aggregate_batch(|| {
-				let keys = batch
-					.column(spec.group_column.0 as usize)
-					.as_any()
-					.downcast_ref::<Int64Array>()
-					.ok_or_else(|| ExecutionError::InvalidExpression {
-						message: "primitive grouped COUNT key must be Int64".to_string(),
-					})?;
-				if keys.null_count() != 0 {
-					return Err(ExecutionError::InvalidExpression {
-						message: "primitive grouped COUNT received a null key".to_string(),
-					});
-				}
-				for row in 0..batch.num_rows() {
-					groups.insert(keys.value(row), 1, cap)?;
-				}
-				Ok(())
+				let fold_stage = open_primitive_stage(vocabulary.as_ref(), "fold", telemetry);
+				let folded = (|| {
+					let keys = batch
+						.column(spec.group_column.0 as usize)
+						.as_any()
+						.downcast_ref::<Int64Array>()
+						.ok_or_else(|| ExecutionError::InvalidExpression {
+							message: "primitive grouped COUNT key must be Int64".to_string(),
+						})?;
+					if keys.null_count() != 0 {
+						return Err(ExecutionError::InvalidExpression {
+							message: "primitive grouped COUNT received a null key".to_string(),
+						});
+					}
+					for row in 0..batch.num_rows() {
+						groups.insert(keys.value(row), 1, cap)?;
+					}
+					Ok(())
+				})();
+				close_primitive_stage(fold_stage, telemetry);
+				folded
 			})?;
 		}
+		let finalize_stage = open_primitive_stage(vocabulary.as_ref(), "finalize", telemetry);
 		record_primitive_int64_sum_profile(&groups, cap, started.elapsed());
-		groups.finish_with_retained_cap(output_schema, self.context.task_budget.memory.get(), cap)
+		let output = groups.finish_with_retained_cap(
+			output_schema,
+			self.context.task_budget.memory.get(),
+			cap,
+		);
+		close_primitive_stage(finalize_stage, telemetry);
+		output
 	}
 
 	fn apply_streaming_scan_input_ops(
@@ -1676,6 +1741,44 @@ fn primitive_int64_count_spec(
 	Some(PrimitiveInt64CountSpec {
 		group_column: group.ordinal,
 	})
+}
+
+/// The primitive Int64 scan-grouped lifecycles' stage contract (ADR 508's vocabulary model): the scan
+/// open, each batch's pull (including its decode), each batch's row-limit slice and scan-input ops,
+/// each batch's fold, and the finish. All batch-level; no per-row timer.
+pub(in crate::exec) const PRIMITIVE_SCAN_GROUPED_STAGES: &[&str] =
+	&["scan_open", "stream_pull", "input_ops", "fold", "finalize"];
+/// The generic scan-grouped loop's boundary, reused rather than derived from this instrument's output.
+pub(in crate::exec) const PRIMITIVE_SCAN_GROUPED_RESIDUAL_BOUNDARY_MICROS: u64 = 500_000;
+/// The executor fallback fold's boundary: the same predeclared value, not derived from its output.
+pub(in crate::exec) const BOUND_GROUPED_FOLD_RESIDUAL_BOUNDARY_MICROS: u64 = 500_000;
+
+fn declare_primitive_scan_grouped_vocabulary(
+	name: &'static str,
+) -> Option<node_attribution::VocabularyHandle> {
+	node_attribution::declare_stage_vocabulary(
+		name,
+		node_attribution::SpillCounterKind::Flow,
+		PRIMITIVE_SCAN_GROUPED_STAGES,
+		PRIMITIVE_SCAN_GROUPED_RESIDUAL_BOUNDARY_MICROS,
+	)
+}
+
+fn open_primitive_stage(
+	vocabulary: Option<&node_attribution::VocabularyHandle>,
+	name: &'static str,
+	telemetry: &Option<std::sync::Arc<std::sync::Mutex<crate::distributed::task::TaskTelemetry>>>,
+) -> Option<node_attribution::StageToken> {
+	vocabulary.and_then(|vocabulary| node_attribution::open_stage(vocabulary, name, telemetry))
+}
+
+fn close_primitive_stage(
+	stage: Option<node_attribution::StageToken>,
+	telemetry: &Option<std::sync::Arc<std::sync::Mutex<crate::distributed::task::TaskTelemetry>>>,
+) {
+	if let Some(stage) = stage {
+		node_attribution::close_stage(stage, telemetry);
+	}
 }
 
 fn record_primitive_int64_sum_profile(
@@ -2303,6 +2406,40 @@ impl Executor {
 		Ok(vec![RecordBatch::try_new(schema, columns)?])
 	}
 
+	/// The executor's fallback grouped fold, attributed. It runs after the input node has executed, so
+	/// the child's time stays the child's: the handler span, the route and the `fold`/`finalize`
+	/// stages cover only this node's own work, and the existing fold refinements publish under `fold`.
+	/// Unarmed, every attribution call is inert and this is `bound_grouped_aggregate`.
+	pub(in crate::exec) fn attributed_bound_grouped_aggregate(
+		&self,
+		input_batches: &[RecordBatch],
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		output_schema: &arrow::datatypes::SchemaRef,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		let telemetry = &self.context.task_telemetry;
+		let handler_span = node_attribution::open_handler_span(telemetry);
+		let vocabulary = node_attribution::declare_stage_vocabulary(
+			"bound_grouped_fold",
+			node_attribution::SpillCounterKind::Flow,
+			&["fold", "finalize"],
+			BOUND_GROUPED_FOLD_RESIDUAL_BOUNDARY_MICROS,
+		);
+		let output = self.staged_bound_grouped_aggregate(
+			input_batches,
+			group_expr,
+			aggr_expr,
+			output_schema,
+			vocabulary.as_ref(),
+		)?;
+		if let Some(handler_span) = handler_span {
+			node_attribution::close_handler_span(handler_span, telemetry);
+		}
+		node_attribution::record_route("bound_grouped_fold");
+		Ok(output)
+	}
+
+	#[cfg(test)]
 	pub(in crate::exec) fn bound_grouped_aggregate(
 		&self,
 		input_batches: &[RecordBatch],
@@ -2310,20 +2447,53 @@ impl Executor {
 		aggr_expr: &[BoundAggregateCall],
 		output_schema: &arrow::datatypes::SchemaRef,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		self.staged_bound_grouped_aggregate(
+			input_batches,
+			group_expr,
+			aggr_expr,
+			output_schema,
+			None,
+		)
+	}
+
+	/// The fold loop and finalize, with `fold` and `finalize` stages opened only under a vocabulary.
+	fn staged_bound_grouped_aggregate(
+		&self,
+		input_batches: &[RecordBatch],
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
+		output_schema: &arrow::datatypes::SchemaRef,
+		vocabulary: Option<&node_attribution::VocabularyHandle>,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		let telemetry = &self.context.task_telemetry;
 		let mut groups = BoundGroupedAggregateGroups::new();
 		let mut group_types = Vec::new();
 
-		for batch in input_batches {
-			self.fold_bound_grouped_aggregate_batch(
-				&mut groups,
-				&mut group_types,
-				group_expr,
-				aggr_expr,
-				batch,
-			)?;
-		}
+		let fold_stage = open_primitive_stage(vocabulary, "fold", telemetry);
+		let folded = (|| {
+			for batch in input_batches {
+				self.fold_bound_grouped_aggregate_batch(
+					&mut groups,
+					&mut group_types,
+					group_expr,
+					aggr_expr,
+					batch,
+				)?;
+			}
+			Ok::<(), ExecutionError>(())
+		})();
+		close_primitive_stage(fold_stage, telemetry);
+		folded?;
 
-		self.finalize_bound_grouped_aggregate(&mut groups, &group_types, aggr_expr, output_schema)
+		let finalize_stage = open_primitive_stage(vocabulary, "finalize", telemetry);
+		let output = self.finalize_bound_grouped_aggregate(
+			&mut groups,
+			&group_types,
+			aggr_expr,
+			output_schema,
+		);
+		close_primitive_stage(finalize_stage, telemetry);
+		output
 	}
 
 	pub(in crate::exec) fn fold_bound_grouped_aggregate_batch(
@@ -4982,9 +5152,36 @@ mod tests {
 		let executor = Executor::new(Arc::new(InMemoryStorageScan {
 			table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
 		}));
+		// The executor's attributed fallback folds exactly as the unattributed fold (unarmed here): the
+		// same output on this batch, and the same error on no batches at all (the fold infers its group
+		// types from the first batch it sees).
+		let attributed = executor
+			.attributed_bound_grouped_aggregate(
+				&[input.clone()],
+				&group_expr,
+				&aggr_expr,
+				&output_schema,
+			)
+			.expect("attributed grouped output");
+		assert_eq!(
+			format!(
+				"{:?}",
+				executor.attributed_bound_grouped_aggregate(
+					&[],
+					&group_expr,
+					&aggr_expr,
+					&output_schema
+				)
+			),
+			format!(
+				"{:?}",
+				executor.bound_grouped_aggregate(&[], &group_expr, &aggr_expr, &output_schema)
+			),
+		);
 		let output = executor
 			.bound_grouped_aggregate(&[input], &group_expr, &aggr_expr, &output_schema)
 			.expect("generic grouped output");
+		assert_eq!(attributed, output);
 		let expected = RecordBatch::try_new(
 			output_schema,
 			vec![
@@ -5283,6 +5480,17 @@ mod tests {
 		let generic = executor
 			.bound_grouped_aggregate(&[batch.clone()], &group_expr, &aggr_expr, &output_schema)
 			.expect("generic grouped fold");
+		assert_eq!(
+			executor
+				.attributed_bound_grouped_aggregate(
+					&[batch.clone()],
+					&group_expr,
+					&aggr_expr,
+					&output_schema,
+				)
+				.expect("attributed grouped fold"),
+			generic,
+		);
 		let mut primitive = PrimitiveInt64Groups::new();
 		let keys = batch
 			.column(0)

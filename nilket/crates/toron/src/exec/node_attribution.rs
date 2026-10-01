@@ -7801,6 +7801,136 @@ pub(in crate::exec) mod tests {
 		assert_eq!(value["passed"], false);
 	}
 
+	// The primitive Int64 scan-grouped lifecycles' declared contract: all five batch-level stages cover
+	// the handler, and a missing finish is incomplete coverage, never a pass.
+	#[test]
+	fn primitive_scan_grouped_vocabulary_reconciles_and_requires_every_stage() {
+		use crate::exec::aggregate::{
+			PRIMITIVE_SCAN_GROUPED_RESIDUAL_BOUNDARY_MICROS, PRIMITIVE_SCAN_GROUPED_STAGES,
+		};
+		assert_eq!(
+			PRIMITIVE_SCAN_GROUPED_STAGES,
+			&["scan_open", "stream_pull", "input_ops", "fold", "finalize"]
+		);
+		assert_eq!(PRIMITIVE_SCAN_GROUPED_RESIDUAL_BOUNDARY_MICROS, 500_000);
+		let vocabulary = |name| Vocabulary {
+			invocation_id: 3,
+			name,
+			spill: SpillCounterKind::Flow,
+			required_stages: RequiredStages::Static(PRIMITIVE_SCAN_GROUPED_STAGES),
+			residual_boundary_micros: PRIMITIVE_SCAN_GROUPED_RESIDUAL_BOUNDARY_MICROS,
+		};
+		let stage = |name: &'static str, calls: u64, micros: u64| HandlerStage {
+			name,
+			calls,
+			parent: None,
+			replay: None,
+			rows: None,
+			retained_bytes: None,
+			outcome: StageOutcome::Reconciled {
+				micros,
+				spill_bytes: 0,
+			},
+		};
+		for name in ["scan_grouped_primitive_sum", "scan_grouped_primitive_count"] {
+			let complete = invocation_with_stages(
+				1_000_000,
+				0,
+				Some(vocabulary(name)),
+				vec![
+					stage("scan_open", 1, 1_000),
+					stage("stream_pull", 40, 300_000),
+					stage("input_ops", 40, 20_000),
+					stage("fold", 40, 600_000),
+					stage("finalize", 1, 70_000),
+				],
+			);
+			let value = stages_value(&complete, &[]);
+			assert_eq!(value["status"], "reconciled", "{name}");
+			assert_eq!(value["attributed_micros"], 991_000);
+			assert_eq!(value["stage_residual_micros"], 9_000);
+			assert_eq!(value["passed"], true);
+			let unfinished = invocation_with_stages(
+				1_000_000,
+				0,
+				Some(vocabulary(name)),
+				vec![
+					stage("scan_open", 1, 1_000),
+					stage("stream_pull", 40, 300_000),
+					stage("input_ops", 40, 20_000),
+					stage("fold", 40, 600_000),
+				],
+			);
+			let value = stages_value(&unfinished, &[]);
+			assert_eq!(
+				value["missing_required_stages"],
+				serde_json::json!(["finalize"])
+			);
+			assert_eq!(value["passed"], false);
+		}
+	}
+
+	// The fallback fold's contract: `fold` and `finalize` cover the handler, the shared fold
+	// refinements reconcile to `fold` and are not summed into the handler's coverage, and a missing
+	// `finalize` fails closed.
+	#[test]
+	fn bound_grouped_fold_vocabulary_carries_the_fold_refinements() {
+		use crate::exec::aggregate::BOUND_GROUPED_FOLD_RESIDUAL_BOUNDARY_MICROS;
+		let required = RequiredStages::Static(&["fold", "finalize"]);
+		assert!(required.contains_unscoped("fold"));
+		let vocabulary = || Vocabulary {
+			invocation_id: 3,
+			name: "bound_grouped_fold",
+			spill: SpillCounterKind::Flow,
+			required_stages: RequiredStages::Static(&["fold", "finalize"]),
+			residual_boundary_micros: BOUND_GROUPED_FOLD_RESIDUAL_BOUNDARY_MICROS,
+		};
+		let stage = |name: &'static str, parent: Option<&'static str>, micros: u64| HandlerStage {
+			name,
+			calls: 1,
+			parent,
+			replay: None,
+			rows: None,
+			retained_bytes: None,
+			outcome: StageOutcome::Reconciled {
+				micros,
+				spill_bytes: 0,
+			},
+		};
+		let staged = invocation_with_stages(
+			1_000_000,
+			0,
+			Some(vocabulary()),
+			vec![
+				stage("fold", None, 800_000),
+				stage("group_expr_eval", Some("fold"), 200_000),
+				stage("arg_eval_and_readers", Some("fold"), 100_000),
+				stage("row_lookup_update", Some("fold"), 450_000),
+				stage("finalize", None, 150_000),
+			],
+		);
+		let value = stages_value(&staged, &[]);
+		assert_eq!(value["status"], "reconciled");
+		assert_eq!(
+			value["attributed_micros"], 950_000,
+			"refinements explain `fold`; they are not added to it"
+		);
+		assert_eq!(value["refinements_reconciled"], true);
+		assert_eq!(value["passed"], true);
+		let unfinished = invocation_with_stages(
+			1_000_000,
+			0,
+			Some(vocabulary()),
+			vec![stage("fold", None, 800_000)],
+		);
+		let value = stages_value(&unfinished, &[]);
+		assert_eq!(
+			value["missing_required_stages"],
+			serde_json::json!(["finalize"])
+		);
+		assert_eq!(value["passed"], false);
+	}
+
 	#[test]
 	fn shared_refinements_require_their_unscoped_parent() {
 		assert!(

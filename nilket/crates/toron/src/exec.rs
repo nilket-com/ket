@@ -1070,7 +1070,7 @@ impl Executor {
 							return Ok(output);
 						}
 						let input_batches = self.execute_bound_node(input, morsel).await?;
-						self.bound_grouped_aggregate(
+						self.attributed_bound_grouped_aggregate(
 							&input_batches,
 							group_expr,
 							aggr_expr,
