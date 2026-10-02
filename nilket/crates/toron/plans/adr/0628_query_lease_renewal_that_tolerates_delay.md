@@ -1,7 +1,10 @@
 # ADR 628 - query-lease renewal that tolerates delay
 
-**Status:** PROPOSED, staged. Successor to ADR 627, which closed with
-limited lease coverage.
+**Status:** STAGE A COMPLETE: diagnosis delivered, with limited Wi-Fi
+renewal coverage (see [Stage A results](#stage-a-results-reviewed)).
+Stage B is not selected or authorized; the ADR is not closed as
+reliability delivered. Successor to ADR 627, which closed with limited
+lease coverage.
 
 Approval does not carry forward:
 - **Stage A (characterization and pinning)** is the only stage this
@@ -585,3 +588,156 @@ including `smoke-*`, `ab-*` and `r3-*`)
 - Retained as is, never cited as frozen evidence.
 - Pre-amendment logs refuse in the reader by construction.
 - Four `r3-*` attempts are copied as the reader's test fixtures.
+
+## Stage A results (reviewed)
+
+Accepted on review as the declared diagnostic evidence. Every figure
+below was read from the campaign's evidence or the accepted ladder. No
+timeout, connection-reuse or worker-lifecycle change follows from these
+results.
+
+### Pins (deterministic, accepted ladder-3)
+
+Ladder-3 ran on bigfoot at the laddered source 137a3d21 (tree 0f2f2e64),
+dirty 0 at start and end, toolchain 1.95.0, all six steps rc 0:
+- toron: 46 binaries, 5621 passed, 0 failed, 17 ignored;
+- toron-tpch: 674/0/6;
+- toron-client: 22/0/0;
+- fmt clean; 0 release warnings.
+
+All 14 ADR 628 pins pass. They fix **current** behaviour; they are not
+invariants.
+- **Lifecycle (6):**
+  - an expired lease renewed before retirement is extended;
+  - race (a): an expired write removes the lease, so the reaper starts
+    no retirement;
+  - race (b): apply-before-retire. A renewal applied between enumeration
+    and retirement is applied, then reclaimed `Abandoned`;
+  - race (c): re-lease after capacity eviction, after the receipt
+    horizon, and after a retirement with no namespace.
+- **Store (2):**
+  - an expired write leaves the published partitions resident and
+    servable after the reaper;
+  - a write after the reaper is `QueryLeaseMissing`.
+- **Coordinator (4):**
+  - a slow connect, or a slow ACK, fails the query at tick + 100 ms;
+  - inside both bounds the query stays alive;
+  - the connect and operation bounds are separate.
+- **Server (2):**
+  - a lease failure ends an in-flight dispatch as `WorkerLost` naming
+    the failed worker, and a later dispatch as `Cancelled`;
+  - a `QueryLease` for a retired, receipt-held query is answered
+    `QueryLeaseAccepted` without being applied, and a later write is
+    `QueryLeaseMissing`. **ACK ≠ application.**
+
+**Defects carried forward.** The expired-write/reaper path (race a) and
+apply-before-retire (race b) are deterministic pin behaviour. The
+ordinary-reclamation campaign below neither exercises nor disproves
+them. This cleanup defect is a prerequisite scope decision before any
+longer-retry mechanism. ACK ≠ application remains relevant to Stage B.
+
+### Campaign (observed incidence)
+
+**Loopback controls.** The coordinator path, `long_join_last`, three
+managed workers, target 62801. Readout READ, reasons [].
+- **Completed, parity equal to the none-1 reference** (each with 2
+  issuances and 6 ACK-observed lease-only streams; operation completion
+  unavailable):
+  - none ×2;
+  - connect, write, read and close at 50 ms, ×2 each;
+  - route_none ×2 and route_delay_40 ×2, route isolation observed;
+  - route_loss_100-2.
+- **Error, `WorkerLost(62801)`:**
+  - connect_150 and write_150, ×2 each: 1 issuance, 8 phases, 7
+    cancelled;
+  - read_150 and close_150, ×2 each: 1 issuance plus 1 ACK-observed
+    lease-only stream, 8 phases, 7 cancelled;
+  - route_loss_100-1;
+  - route_blackout_8s ×2: applied, triggered by the decoded manifest;
+  - route_unreachable ×2: permanent;
+  - census_worker_kill ×2: signal confirmed.
+- **Scope of these findings:**
+  - The 50 ms variants are lower added-delay observations, **not** a
+    guaranteed safe deadline threshold.
+  - The 150 ms controls distinguish failure phases. Phase counts include
+    issuance and retirement, so they are not all renewal attempts.
+  - Cancelled-phase overruns were recorded, never rejected; per attempt
+    the maximum was 1065–2026 µs.
+  - The two seeded-loss attempts had different outcomes. Both are
+    recorded. The seed fixes the generator, not the realized packet
+    schedule, and a relay send is not a delivery.
+  - Short and permanent coordinator-route blackouts show the current
+    terminal failure, not tolerance or recovery.
+  - census_worker_kill is a census loss; its mid-scan coverage was
+    missed.
+  - In every control, workers read `RetireQuery` within the run's span
+    (normal terminal retirement), so no fanout absence is claimed there.
+
+**Owner disappearance.** owner-coordinator-1 and -2 are issuance-only;
+owner-scheduler-1 is separate. In all three:
+- the kill was confirmed (signal 9);
+- the conservative wait (last application-call end + term: a
+  call-completion upper bound) was followed by the first completed pass
+  after it, pass 37;
+- the bound manifest was observed going resident → absent **during** pass
+  window 37, after the wait, with an `abandoned_reclaims` delta of 1
+  consistent with this query. That the reaper performed it is not
+  established;
+- inspection, one `PullPartition` for the exact address, returned the
+  typed `PartitionMissing` reason `Abandoned`;
+- an orphaned post-kill publication (exchange 1, stage 1) appeared on
+  another worker at about 30.05–30.07 s, then went resident → absent in
+  its own pass window 37;
+- no `CancelTask` or `RetireQuery` was read by any declared worker within
+  the finite recorded window [kill, window end] (unix ms, one host).
+
+The issuance-only coordinator controls do not establish behaviour after
+periodic renewal.
+
+**Wi-Fi.** Readout READ over schedule-r2. Links before and after: 48 runs
+each, all rc 0.
+- The reference (bigfoot loopback) completed in 30087 ms.
+- All three healthy coordinator-path `long_join_last` attempts, with no
+  fault injected, returned `WorkerLost` at 5121 ms, naming 70202, 70203
+  and 70203.
+  - The required long coverage was **not met**: 0 workers with ≥ 5
+    ACK-observed lease-only streams.
+  - The observed operations and the current code are consistent with
+    the 100 ms caps causing the failure on this setup. The unclassified
+    dials do not prove the renewal caller, and "no fault injected" does
+    not establish a healthy network.
+  - No parity is available for these errors. No failure rate or
+    uncensored deadline distribution is claimed.
+
+### Provenance
+
+- **Source:**
+  - baseline 5bef11ce (tag `adr628-stage-a-baseline`, tree 3af18f0b);
+  - it differs from the laddered 137a3d21 only in this plan;
+  - plan commits 21cc07ff and f7165866.
+- **Ladders:** ladder-1 failed (a sleep guard in a pin) and ladder-2 was
+  superseded; both are retained with notes.
+- **Artifacts:** probe 01d84f46…, fixture worker bf5f36b2…. Host
+  manifests: bigfoot 961b46ef…, strix b3093516…, optiplex 47336c4a….
+- **Freeze:**
+  - FREEZE.json b4dbbd48…, schedule.json 9226da40…;
+  - FREEZE-r2.json 53df72c8…, schedule-r2.json 3d31d96c…,
+    resumption-r2.json 2673a944….
+- **Readers:** controls.readout reads schedule.json, whose loopback
+  declarations are identical to schedule-r2's. wifi.readout reads
+  schedule-r2.json.
+- **Readouts:** readout.json 2241d5b9…, wifi-readout.json 090c89eb….
+  SHA256SUMS de0cee5b… covers 706 files.
+- **Retained outside the r2 acceptance set:**
+  - the original `ref-coordinator-long-join-last` (setup_failed: the
+    `attempts/` parent was not staged; cleanup_ok=false,
+    evidence_complete=false);
+  - its clock output `1790934475832021200`, from `date +%s%3N` under
+    bigfoot's coreutils, which is not epoch ms; its correlation is
+    unavailable;
+  - STOP-1.txt, NOTE.txt, and the r2 mapping to
+    `ref-coordinator-long-join-last-r2`.
+- **Evidence:** the workstation root
+  `~/work/.agent-bridge/adr628-evidence`; bigfoot originals under
+  `~/work/toron-evidence/adr628`; development runs, never cited, under
+  `adr628-dev`.
