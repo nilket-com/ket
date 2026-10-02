@@ -2,7 +2,9 @@
 
 **Status:** STAGE A COMPLETE: diagnosis delivered, with limited Wi-Fi
 renewal coverage (see [Stage A results](#stage-a-results-reviewed)).
-Stage B is not selected or authorized; the ADR is not closed as
+Stage B part 1 (B0, lifecycle prerequisites) is scoped and authorized
+for implementation (see the [B0 amendment](#stage-b-scope-amendment-part-1-lifecycle-prerequisites-b0-reviewed));
+B1 (delay tolerance) is not selected. The ADR is not closed as
 reliability delivered. Successor to ADR 627, which closed with limited
 lease coverage.
 
@@ -741,3 +743,346 @@ each, all rc 0.
   `~/work/.agent-bridge/adr628-evidence`; bigfoot originals under
   `~/work/toron-evidence/adr628`; development runs, never cited, under
   `adr628-dev`.
+
+### Stage B scope amendment, part 1: lifecycle prerequisites (B0) (reviewed)
+
+Stage A's pins fixed current behaviours that a delay-tolerance mechanism
+cannot be reasoned about on top of. This amendment proposes to correct
+them first, as **B0**: a deterministic lifecycle and wire change. It
+selects no delay-tolerance mechanism; B1 stays unselected. B0 changes
+expiry enforcement and lease-reply outcomes. It does not change the lease
+term, the reaper period, the receipt capacity or horizon, TLS, or ADR
+577's idle policy.
+
+#### The defects (code-established, pinned in Stage A; `main` 796546d5)
+
+`ShuffleNamespaceLifecycle` (`namespace_lifecycle.rs`) is shared by the
+in-memory, encrypted-spill and hybrid stores. The worker's 1 s reaper
+drives it (`server/mod.rs:332` → `reap_expired_queries`).
+
+1. **Expired write, then the reaper (race a).**
+   - `authorize_write` on an expired lease *removes* the lease and returns
+     `Expired`.
+   - The query then has no lease, no retirement and no receipt, so
+     `expired_queries` never selects it.
+   - Stage A established that the published partitions stay resident and
+     servable after that sequence, **until another cleanup event**
+     (coordinator retirement, cancellation or process exit), not
+     universally until the process exits.
+   - Pin: `adr628_expired_write_leaves_published_partitions_resident_after_the_reaper`.
+2. **Apply-before-retire (race b).**
+   - `expired_queries` removes the expired leases under the lifecycle
+     lock. `retire_query` → `begin_retirement` runs afterwards, outside
+     it.
+   - In that gap `issue_or_renew` sees no lease, no retirement and no
+     receipt, and inserts a fresh lease. Writes are authorized again
+     until retirement removes it, and the query is then reclaimed
+     `Abandoned`.
+   - Pin: `adr628_renewal_between_reaper_enumeration_and_retirement_is_applied_then_reclaimed`.
+3. **Replies do not say what happened.**
+   - A renewal for a retiring or receipt-held query is ignored, yet
+     answered `QueryLeaseAccepted`. The coordinator cannot tell applied
+     from ignored.
+   - Separately, a renewal of an elapsed but not-yet-reaped lease extends
+     it.
+   - Pins: `adr628_a_renewal_after_retirement_is_acked_without_being_applied`,
+     `adr628_renewal_of_an_expired_lease_before_retirement_extends_it`.
+4. **Retirement participants are a count, not a set, and are fixed by
+   the first caller.**
+   - `begin_retirement_with_participants` uses `or_insert`. The hybrid
+     store begins with 2; its in-memory and spill children each call
+     `begin_retirement` (1, a no-op once a record exists) and then
+     `finish_removal`, which decrements.
+   - Any path that installs a retirement first, with 1, fixes it at 1.
+     The first child to finish then writes the receipt and ends the
+     retirement while the other backend still holds data.
+   - A repeated retire on an already-removed backend can decrement again.
+   - Today the reaper is the only expiry path and calls the hybrid's
+     `retire_query`, which begins with 2 first. B0 adds expiry
+     observers, so this becomes reachable and must be fixed in B0.
+
+#### B0 semantics
+
+**B0.1 — Logical expiry and physical cleanup are separate, explicit
+states.** Per query, the lifecycle holds exactly one of:
+- `Leased { deadline }`: writes are authorized while `now < deadline`.
+  Expiry is **`now >= deadline`**, and equality is expired.
+- `Retiring { cause, pending: BackendSet, receipt_licensed,
+  cleanup_queued }`: logically terminal, with physical cleanup pending
+  for each backend in `pending`.
+- `Receipt { cause, at }`: cleanup finished and a namespace existed.
+- Nothing: never seen, or the guard has gone (see B0.3).
+
+The **expire** transition is one critical section under the lifecycle
+lock. It applies to a `Leased` entry whose deadline has passed:
+1. remove the lease;
+2. install `Retiring { cause: Abandoned, pending: the lifecycle's
+   declared backend set, receipt_licensed: (namespace seen),
+   cleanup_queued: true }`;
+3. push the query onto a lifecycle-owned **pending-cleanup queue**.
+
+**Every observer takes it:** the reaper (`expired_queries`),
+`authorize_write` (which still returns `Expired` to the writer),
+`issue_or_renew` (which replies `Ignored`), and `has_live_lease`. Pending
+cleanup is therefore discoverable whichever observer saw the expiry
+first.
+
+**An already-terminal cause is preserved, consistently.**
+- Expiry never overwrites an existing `Retiring` or `Receipt`.
+- `begin_retirement(cause)` on an entry that is already retiring keeps
+  the earlier cause and does not reset `pending`.
+- The **effective retained cause**, not the cause carried by a later
+  request, governs everything downstream:
+  - physical cleanup behaviour (for example, cancelling live partitions
+    and their readers for a non-success cause);
+  - the late-pull and wire missing reasons;
+  - the receipt and the reclaim counters.
+- So a later `Abandoned` or `Cancelled` retire request on a `Success`
+  retirement neither records `Success` while applying
+  `Abandoned`/`Cancelled` cleanup, nor the reverse. The retire path reads
+  the retained cause from the lifecycle before acting.
+
+**The reaper drains the queue without holding the lifecycle lock while
+it takes backend locks.** This preserves today's order, store lock then
+lifecycle lock:
+1. take the queued ids under the lifecycle lock, and release it;
+2. for each id, call the store's retire path (`retire_query` →
+   `try_remove_quiescent_*` / `retire_spilled_query`), as today.
+
+The reaper also enumerates `Leased` entries whose deadline has passed
+and expires them through the same transition.
+
+**Pending cleanup stays discoverable until every pending backend
+completes.**
+- The queue is only a fast path. Taking ids off it never erases the only
+  reference to the work.
+- Every reaper pass also re-enumerates every `Retiring` entry whose
+  `pending` set is non-empty, and retries its store cleanup.
+- A pass that is interrupted, or that cannot finish (a pinned reader,
+  spill deletion debt), leaves the entry `Retiring` with its `pending`
+  set intact, and a later pass picks it up again.
+
+**Who wins at the boundary**, defined by state at the lifecycle lock:
+- **A valid renewal before expiry wins:** `now < deadline` extends the
+  deadline. A renewal at the lock after an expiry observer finds
+  `Retiring` and is ignored.
+- **Expiry before a renewal wins:** the renewal finds `Retiring` (or
+  `Leased` with `now >= deadline`, which it expires first) and is
+  ignored.
+- **The reply reason comes from the state the renewal observed:**
+  - `Ignored { Expired }` when that call performed the expiry;
+  - `Ignored { Retiring { cause } }` when it found `Retiring`, including
+    an `Abandoned` retirement from an earlier expiry;
+  - `Ignored { ReceiptHeld { cause } }` when it found a receipt.
+- A renewal racing the reaper's enumeration therefore gets `Expired` or
+  `Retiring(Abandoned)` depending on which observer ran first. Both are
+  ignored, and writes stay denied either way.
+
+**B0.2 — Participants are a set, and completion is idempotent per
+backend.**
+- The lifecycle is constructed with its declared backend set: in-memory
+  `{Memory}`, spill `{Spill}`, hybrid `{Memory, Spill}`. Every
+  retirement, from the reaper, an expiry observer, the coordinator's
+  `RetireQuery` or a cancellation, installs `pending` as that full set.
+- `finish_removal(query, backend)` removes `backend` from `pending`. It
+  is a no-op if the backend was already removed or the query is not
+  retiring. The receipt is written only when `pending` becomes empty.
+  `begin_retirement_with_participants` and its count go away.
+- **Backend completion rules (unchanged in substance):**
+  - in-memory completes only when `try_remove_quiescent` removes the
+    query: no live reader pinned, and the existing reader guard calls
+    `finish_removal(_, Memory)` when the last reader releases;
+  - spill completes only when its deletion debt for that query is empty
+    (`retry_cleanup_debt` calls `finish_removal(_, Spill)` then).
+- **Namespace evidence:** `mark_namespace_present` on a `Retiring` entry
+  sets `receipt_licensed`, as today. A writer authorized before expiry
+  may commit after it; its namespace is still licensed and its data
+  reclaimed.
+- **Lock order** is unchanged: store lock, then lifecycle lock. No path
+  takes a store lock while holding the lifecycle lock.
+
+**B0.3 — Terminality is scoped to the retained guard; the residual
+re-lease cases are documented.**
+- While a `Retiring` or `Receipt` entry exists for a query id, no
+  renewal, issuance or write revives it.
+- **Residual re-lease:** after the guard is gone, a delayed message
+  carrying the **same old id** can install a fresh lease. That happens:
+  - after receipt eviction, by capacity (4096, possibly well before
+    15 minutes) or by the 15-minute horizon;
+  - immediately after cleanup of a retirement that never licensed a
+    receipt (no namespace on that worker).
+  - UUIDv7 avoids accidental collisions between distinct queries; it
+    does not stop a delayed message with the same id.
+- **What B0 claims:** no resurrection while the guard exists. It does
+  **not** claim permanent no-resurrection, and `Applied` does **not**
+  identify the namespace incarnation.
+- B1 must not bridge a lapse or infer continuity from `Applied` alone.
+  Any stronger fencing (incarnation ids, tombstones) is a separate,
+  reviewed design.
+
+**B0.4 — The lease exchange contract (a wire change; protocol v3).**
+- `QueryLeaseAcceptedPayload { query_id, outcome }` with:
+  - `outcome = Applied { term_ms }`, or
+  - `outcome = Ignored { reason: Expired | Retiring { cause } |
+    ReceiptHeld { cause } }`.
+- `ProtocolVersion` goes from 2 to 3. Validation is exact-version: a v2
+  peer is rejected at the envelope, before any lifecycle mutation or
+  task execution.
+- **Both lease paths** (the standalone renewal exchange and issuance on
+  a dispatch stream) validate, in order: the envelope version, the
+  query identity of the envelope, the payload `query_id`, and the
+  outcome. For `Applied`, they also check that `term_ms` equals both the
+  requested term and the worker's term. A malformed or unknown outcome,
+  a wrong query, or a wrong term is a protocol error (fail closed), and
+  is never treated as `Applied`.
+- **Renewal on the coordinator:**
+  - only `Applied` counts as a renewal;
+  - `Ignored` immediately ends the query's reliance on that worker
+    through today's `fail_query_lease(worker)`. In-flight dispatches
+    then surface `WorkerLost` naming that worker, later ones
+    `Cancelled`, as pinned today. The typed reason is recorded in
+    telemetry and audit.
+- **Issuance:** on `Ignored`, the dispatcher sends **no** `StartTask`.
+  - The dispatch fails with an existing non-retryable kind:
+    `QueryLeaseExpired` for `Expired`, and `QueryLeaseMissing` for
+    `Retiring` or `ReceiptHeld`. `failure_retryable` is false for
+    both, so the failure taxonomy is unchanged.
+  - When an `ActiveQueryHandle` is present (coordinator path), it is
+    also failed with `fail_query_lease(worker)`. Scheduler-only callers
+    have none and get only the dispatch outcome.
+  - There is **no** automatic retry from ignored to a fresh issuance.
+- **What `Applied` certifies:** the operation was applied at the
+  worker's linearization point (the lifecycle lock). It does **not**
+  promise that no retirement follows, that a write completes, or that
+  any computation is cancelled.
+- **Reading the ACK** and **completing the whole exchange**
+  (`finish_terminal_exchange`) remain distinct, and both stay within
+  today's bounds.
+
+#### Rationale for terminal expiry
+
+Terminal expiry is an **ownership and lapse policy**: once the worker's
+deadline passes, the worker stops licensing that namespace to anyone.
+Deadline extension alone would not invalidate a conservative lower bound
+on expiry. The reasons for choosing terminal anyway:
+- it makes "lapsed" a fact the worker reports (`Ignored`), instead of a
+  race against reaper timing;
+- it gives B1 a crisp rule: a lapse ends reliance, and is never bridged.
+
+The plan's existing prerequisites for any boundary still hold: the
+renewal was actually applied, on the same valid namespace, under the
+stated clock model, with no earlier retirement, restart or
+invalidation.
+
+#### Not in B0
+
+- Any delay-tolerance mechanism (B1).
+- Timing parameters (the term, the reaper period, the 100 ms bounds).
+- What stops remote running tasks after a lease failure (Open
+  question 2).
+- Incarnation fencing.
+- Coordinator recovery, W, and the dispatch-exclusion shortcut.
+
+#### Evidence and acceptance
+
+**Deterministic tests** (explicit `Instant`s and barriers for every
+critical interleaving):
+- **Deadline equality:** at `now == deadline`, writes are denied, a
+  renewal is `Ignored { Expired }`, and the reaper expires the query.
+- **Valid renewal before expiry wins;** expiry before renewal wins.
+  Reply reasons follow the observed state, including the
+  enumeration-race variants (`Expired` versus `Retiring(Abandoned)`).
+- **An already-terminal cause is preserved:** for example, a `Success`
+  retirement is not turned into `Abandoned` by a later expiry
+  observation. A later retire request with another cause applies the
+  retained cause's cleanup and reports its missing reasons. Pinned for
+  both orders.
+- **Interrupted, partial and repeated cleanup:** after an interrupted or
+  partial pass, the entry stays `Retiring` with its `pending` set intact
+  and a later pass completes it. Repeated passes never complete a
+  backend twice. Pinned together with the spill-debt and pinned-reader
+  cases.
+- **Expired write:** `Expired` to the writer, then `Retiring(Abandoned)`
+  queued; the next reaper pass reclaims; a pull returns the typed
+  reason; and a receipt is written when a namespace existed (replacing
+  the race-(a) pin).
+- **No reaper window** (replacing the race-(b) pin).
+- **An elapsed lease is not renewable** before the reaper (replacing the
+  extend pin).
+- **Hybrid:**
+  - expiry from each observer installs `pending = {Memory, Spill}`;
+  - no receipt and no reopening until **both** backends finish;
+  - repeated reaper passes and repeated retires do not complete a
+    backend twice;
+  - a pinned live reader defers in-memory completion until it releases;
+  - spill deletion debt keeps the retirement until the debt clears;
+  - a pre-expiry-authorized writer's namespace stays licensed.
+- **Spill alone:** the same expiry, debt and receipt cases. Spill was
+  "unavailable" in Stage A, and B0 does not ship without it, because
+  the change is shared.
+- **Wire and transport:**
+  - all three `Ignored` reasons over the wire;
+  - malformed or unknown outcomes, a wrong query, and a wrong term are
+    each rejected;
+  - a v2 to v3 mismatch is rejected before any mutation or task
+    execution;
+  - issuance `Ignored` sends no `StartTask` and fails with the declared
+    kind;
+  - no ignored-to-reissue retry;
+  - coordinator renewal `Ignored` ends reliance on that worker at the
+    reply;
+  - `Applied` keeps the query alive;
+  - over both QUIC and the TCP fixture transport.
+- **Property tests (supplemental; a seeded, bounded interleaving of
+  renew, write, reap, retire and reader pin/unpin):**
+  - every resident namespace has either a discoverable lease entry
+    (possibly elapsed, pending observation) or a `Retiring` / cleanup
+    record;
+  - write authorization never succeeds at or after the **current**
+    deadline at its linearization point; renewals legitimately extend
+    it;
+  - a write authorized before expiry may commit later, and is then
+    retired and licensed correctly. Its authorization is not treated as
+    revoked.
+- **Superseded pins:** removed in the B0 implementation commit, with
+  each one mapped to its replacing invariant test in the record. The
+  original Stage A artifacts and pins remain in history.
+
+**No-regression controls.**
+- A declared rerun of the frozen Stage A loopback schedule on the B0
+  build, under fresh evidence paths and a fresh freeze: the same
+  declarations, with the readers updated only for the new reply
+  outcome.
+- Expected: the no-fault and 50 ms variants complete at parity, and the
+  owner controls still reclaim with typed `Abandoned`.
+- The 50 ms variants are reported as observed outcomes, not as
+  guaranteed inside-bound thresholds.
+- Any difference is reported, never retried.
+- No Wi-Fi campaign is needed for B0.
+
+**Ladder:** pinned, in a dedicated worktree, as in Stage A.
+
+#### After B0: B1 (unselected)
+
+These follow B0, each with its own review, informed by Stage A's Wi-Fi
+result (3/3 healthy long queries returned `WorkerLost` at the first
+renewal interval under the 100 ms caps):
+- a conservative-boundary computation, valid only for `Applied`
+  renewals, from exact send markers;
+- retries within the boundary;
+- an *uncensored* duration diagnostic before choosing any deadline;
+- per-worker independent renewal, with a declared whole-query policy;
+- connection reuse.
+
+None of them may bridge a lapse or infer incarnation continuity from
+`Applied`.
+
+#### Limits carried into B0's record
+
+- Namespace continuity is not established. `Applied` does not identify
+  the incarnation.
+- Issuance outcomes for scheduler-only callers (a dispatch outcome
+  alone) are distinct from coordinator-path behaviour (the dispatch
+  outcome plus `fail_query_lease` on the `ActiveQueryHandle`).
+- No change is cleared to the lease term, the 100 ms bounds, the
+  receipt policy, running-task cancellation, or any B1 mechanism.
