@@ -1537,3 +1537,85 @@ review:
 - Incarnation fencing.
 - Coordinator recovery, W, and the dispatch-exclusion shortcut.
 - Changes to the term, the loss window, receipts or the reaper.
+
+### B1.B survey instrument amendment (reviewed)
+
+Recorded before the survey runs. This is test-only: the source change is
+confined to `tests/distributed_process_test.rs`
+(`diag: adr 628 b1b timing survey instrument`, tagged
+`adr628-b1b-baseline`). It is source-equivalent to the laddered
+242a94bf / 8827e5fc (ladder-b1b-3).
+
+**What it measures.** Each lease exchange is timed as five phases, each
+with an explicit start and exactly one terminal mark (end, budget
+expiry, error, or the whole-bound cut on the active phase):
+- **connect**;
+- **write:** its start is the exact send marker;
+- **ACK read:** length-checked; a frame over 64 KiB is a protocol error;
+- **validate:** decode, `validate_runtime(CURRENT, 64 KiB)`, kind,
+  identity, query, outcome and term;
+- **close.**
+
+The phase budgets are 5000 ms each, and the whole exchange is bounded at
+20000 ms. Every outcome is data, and censored samples and failures are
+counted separately. The survey reports distributions and recommends no
+deadline.
+
+**Synthetic-id lifecycle** (one per-worker state machine, concurrency 3):
+- **Ticks:** fixed schedule (5000 ms) with `MissedTickBehavior::Skip`. Each
+  tick's scheduled and actual instants are recorded, and missed intervals
+  are recorded, including at the end. There are no catch-up bursts.
+- **One action per tick:** issue, renew or retire.
+- **Renewal** happens while age < 14000 ms (the decision policy, not an
+  exact remote lifetime), renewal attempts < 4, and `decision + whole <
+  last accepted send + term`.
+- **The validity boundary is nominal:** `send + term` on the coordinator's
+  steady clock, with ρ = 0, no suspend and no restart. It is diagnostic
+  only, NOT B1.A's reliance boundary.
+- **Refresh.** An `Applied` refreshes only when the whole exchange
+  completed before the old nominal boundary and before its new boundary.
+  Otherwise it is kept as data and the id is retired as "refresh
+  rejected".
+- **Retirement.** Every attempted id is retired exactly once, with a
+  declared reason: age, attempts, invalid, ignored, unknown application,
+  refresh rejected, or survey end. The result is recorded verbatim and is
+  never a reclamation claim.
+- **Counts.** Attempts and refreshes are counted separately (`survey_ledger`).
+
+**Load condition.** `long_join_last` runs back to back on the coordinator
+path and logs into the survey's own log, so there is one clock. Each
+window binds exactly one query and its raw terminal. Samples are tagged by
+observed task activity, invocation without activity, or outside any
+invocation (remote activity not excluded). Failed load queries are kept.
+
+**Readers** (`adr628b1_read.py`, 54 tests). The reader:
+- validates the whole log before grouping;
+- requires full declared-duration coverage, refusing premature finishes
+  and skips recorded early;
+- replays the state machine exactly: actions, reasons, refresh decisions,
+  ledger presence and placement, final retirements;
+- requires strict JSON integer types;
+- binds decoded outcomes in order, one-to-one, to each worker's own lease
+  applications, with Ignored cause and Applied term. Unmatched worker
+  applications are counted, and a missing or truncated worker log makes
+  this cross-check unavailable.
+
+**Driver.**
+- Survey workers get a lifetime covering setup, gates, clock captures,
+  the bounded probe (duration + 600 s) and cleanup.
+- Per-host clock context (sync daemon, configuration hash, chrony
+  estimates) is captured before and after. It is context only, never a ρ
+  bound.
+
+**Frozen parameters:** idle and load ×1 each; 1800 s; links before and
+after; the B1 evidence roots.
+
+**Ladders:**
+- ladder-b1b-1 SUPERSEDED;
+- ladder-b1b-2 FAILED on the same tree: three `sql_listener` timing tests
+  and one tpch parquet read. Retained with NOTE.txt; load sensitivity is
+  a hypothesis, not an established cause;
+- ladder-b1b-3 accepted. Release hashes differ between worktrees, and
+  embedded paths are a hypothesis.
+
+B1.C remains unselected.
