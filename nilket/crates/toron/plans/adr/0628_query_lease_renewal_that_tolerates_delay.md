@@ -2,10 +2,11 @@
 
 **Status:** STAGE A COMPLETE: diagnosis delivered, with limited Wi-Fi
 renewal coverage (see [Stage A results](#stage-a-results-reviewed)).
-Stage B part 1 (B0, lifecycle prerequisites) is scoped and authorized
-for implementation (see the [B0 amendment](#stage-b-scope-amendment-part-1-lifecycle-prerequisites-b0-reviewed));
-B1 (delay tolerance) is not selected. The ADR is not closed as
-reliability delivered. Successor to ADR 627, which closed with limited
+Stage B part 1 (B0, lifecycle prerequisites) is DELIVERED as the
+reviewed lifecycle/wire implementation (see [B0 results](#b0-results-reviewed)).
+B1 (delay tolerance) is not selected and needs its own scope review.
+Stage B as a whole is not delay tolerance delivered, and the ADR is not
+closed as reliability delivered. Successor to ADR 627, which closed with limited
 lease coverage.
 
 Approval does not carry forward:
@@ -1139,3 +1140,144 @@ exception.**
 - `Applied` must carry the declared term, on both sides. On each worker,
   the outcomes it wrote reconcile with its own lease-application
   outcomes.
+
+
+## B0 results (reviewed)
+
+Accepted on review. Every figure below was read from the B0 evidence or
+ladder-b0-3.
+
+**What is delivered.** B0 is delivered as the reviewed lifecycle and wire
+prerequisite implementation:
+- atomic logical expiry at `now >= deadline`, judged at the lifecycle lock;
+- a declared backend set, with completion idempotent per backend;
+- every pending retirement re-enumerated on each reaper pass;
+- the effective (retained) cause governing cleanup, missing reasons and
+  receipts;
+- `QueryLeaseAccepted` outcomes on protocol v3, where an `Ignored` reply
+  ends reliance at the reply and no `StartTask` follows an ignored
+  issuance.
+
+No timeout change, retry mechanism or network-reliability acceptance is
+implied.
+
+### Provenance
+
+- **Source:**
+  - `impl: adr 628 b0 lifecycle prerequisites` dc35f283 (tree 22879ee9),
+    tagged `adr628-b0-baseline`;
+  - plan commits f642d402 and 9883ca7f;
+  - source-equivalent to the laddered bc07aafd (tree a191cbd3); only
+    this plan differs.
+- **Ladder-b0-3:**
+  - bigfoot `~/work/toron-evidence/adr628/ladder-b0-3`, worktree
+    `ket-toron-ladder-628-b0-3`, toolchain 1.95.0;
+  - identity bc07aafd / a191cbd3, dirty 0 at start and end; all six
+    steps rc 0;
+  - toron 5645/0/17, toron-tpch 674/0/6, toron-client 22/0/0;
+  - fmt clean; 0 release warnings;
+  - fixture worker 63597939…, probe 9c8838ec… (`distributed_process_test-6602c3bd8ddbc607`).
+- **Retained ladders:**
+  - ladder-b0-1 FAILED: toron-tpch's exhaustive `RuntimeError` match,
+    and then the unmanaged-fixture reuse test;
+  - ladder-b0-2 SUPERSEDED.
+- **Deviations:** no separate cleanup queue (full `Retiring`
+  re-enumeration); the unmanaged fixture's `Applied` is synthetic. Both
+  are recorded in the B0 implementation amendment.
+
+### Deterministic evidence
+
+These tests cover the refusal paths:
+- **Lifecycle:**
+  - `the_deadline_itself_is_expired_for_every_observer`;
+  - `a_valid_renewal_before_the_deadline_extends_it`;
+  - `an_elapsed_lease_is_not_renewable_before_the_reaper`;
+  - `an_expired_write_retires_the_query_for_the_reaper`;
+  - `no_renewal_window_between_reaper_enumeration_and_retirement`;
+  - `an_existing_terminal_cause_is_retained_in_either_order`;
+  - `completion_waits_for_every_declared_backend_and_counts_each_once`;
+  - `interrupted_cleanup_stays_discoverable_until_complete`;
+  - `a_write_authorized_before_expiry_keeps_its_namespace_licensed`;
+  - `a_retiring_or_receipted_renewal_reports_its_cause`;
+  - `the_unmanaged_fixture_substrate_always_answers_applied`;
+  - `calls_waiting_for_the_lock_across_the_deadline_see_it_expired`
+    (timing-based, not barrier-controlled);
+  - `seeded_serial_sequences_keep_state_discoverable_and_writes_before_the_deadline`
+    (serial).
+- **Store:**
+  - `an_expired_write_is_reclaimed_by_the_next_reaper_pass`;
+  - `hybrid_expiry_waits_for_both_backends_through_spill_debt`;
+  - `standalone_spill_expiry_is_reclaimed_through_deletion_debt`;
+  - `a_pinned_reader_defers_expiry_cleanup_until_it_releases`;
+  - `a_later_retire_request_uses_the_retained_cause`;
+  - `spill_debt_keeps_the_retained_cause_against_a_later_request`;
+  - `a_publisher_authorized_before_expiry_is_retired_and_licensed_after_it`
+    (timing-based).
+- **Server and wire:**
+  - `a_renewal_after_retirement_is_ignored_over_the_wire`;
+  - `lease_outcomes_cross_quic_and_tcp`;
+  - `a_version_two_lease_is_rejected_before_any_mutation`;
+  - `malformed_lease_replies_are_rejected`;
+  - `an_ignored_issuance_sends_no_start_task_and_fails_the_dispatch`;
+  - `an_ignored_renewal_returns_at_the_reply_despite_a_misbehaving_close`.
+- **Coordinator:**
+  - `an_ignored_renewal_ends_reliance_at_the_reply`;
+  - `an_applied_reply_with_another_term_is_not_a_renewal`;
+  - `an_applied_renewal_with_a_stalled_close_fails_at_the_bound`.
+
+The superseded Stage A pins and their replacements are mapped in the B0
+review record. The originals remain in history at 5bef11ce.
+
+### No-regression rerun
+
+**Setup.**
+- Remote root: bigfoot `~/work/toron-evidence/adr628-b0`.
+- Local root: `~/work/.agent-bridge/adr628-b0-evidence`.
+- Schedule: `schedule-b0` 458dbd18…, the same 33 loopback declarations
+  with `lease_outcomes = "required"`, no Wi-Fi.
+- FREEZE.json 2dfb9315…, readout.json a297437f…, SHA256SUMS 35eaffc6…
+  (456 files).
+- Readers: `adr628_read.py` 66e6882d… (80 tests); runner 38 tests.
+- Readout: READ, reasons [].
+
+**Findings.** Compared with Stage A, there is **no observed regression in
+outcome classes and completed-result parity on the declared loopback
+controls**. This is not a latency or performance equivalence claim, nor a
+broader robustness acceptance.
+- **Completed at parity:** none ×2; the 50 ms phase variants ×2 each;
+  route_none ×2; route_delay_40 ×2; route_loss_100-2. Each had 18
+  probe-observed lease replies, each bound to its request and decoded
+  `Applied` (term 35001).
+- **`WorkerLost(62801)`, as in Stage A:**
+  - the 150 ms phase variants ×2 each;
+  - route_loss_100-1;
+  - route_blackout_8s ×2;
+  - route_unreachable ×2;
+  - census_worker_kill ×2.
+  - The seeded-loss pair split again, one error and one completed.
+- **Owner controls** (issuance-only coordinator ×2, scheduler ×1):
+  - kill confirmed;
+  - resident → absent observed during pass window 37, with a delta
+    consistent with the query (pass-window attribution only);
+  - inspection `PartitionMissing(Abandoned)`;
+  - no `CancelTask`/`RetireQuery` within [kill, window end];
+  - 2 owner-log replies bound, `Applied`.
+- **Workers:** every worker's written outcomes reconciled with its lease
+  applications. A worker with zero replies has unavailable lease-reply
+  coverage, not positive renewal coverage.
+- **No `Ignored` refusal was exercised by this campaign.** Every observed
+  reply was `Applied`. The refusal paths rest on the deterministic, wire
+  and coordinator tests named above, not on this readout.
+
+### Limits
+
+- Same-id re-lease after guard eviction, or after a no-namespace
+  retirement, remains possible.
+- `Applied` does not identify the namespace incarnation.
+- The unmanaged fixture's `Applied` is synthetic.
+- The lock tests are timing-based; the seeded test is serial.
+- The owner controls are issuance-only.
+- Stage A evidence is preserved separately
+  (`~/work/.agent-bridge/adr628-evidence`, bigfoot
+  `~/work/toron-evidence/adr628`).
+- B1 is not selected.
