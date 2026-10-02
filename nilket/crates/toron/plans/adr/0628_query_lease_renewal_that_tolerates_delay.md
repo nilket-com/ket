@@ -4,7 +4,10 @@
 renewal coverage (see [Stage A results](#stage-a-results-reviewed)).
 Stage B part 1 (B0, lifecycle prerequisites) is DELIVERED as the
 reviewed lifecycle/wire implementation (see [B0 results](#b0-results-reviewed)).
-B1 (delay tolerance) is not selected and needs its own scope review.
+B1 (delay tolerance) is scoped (see the B1 amendment): its conditional
+reliance contract (B1.A) and test-only timing survey (B1.B) are
+authorized for development; its mechanism (B1.C) is not selected, and no
+production reliance change, deadline or host campaign is cleared.
 Stage B as a whole is not delay tolerance delivered, and the ADR is not
 closed as reliability delivered. Successor to ADR 627, which closed with limited
 lease coverage.
@@ -537,8 +540,8 @@ ACTIVE/STOP with the links and Wi-Fi drivers. Per attempt:
   628's schema for the readers, and the frozen set (the `wifi` section
   of `schedule.json`).
 - **The set:** one coordinator `long_join_last` reference (bigfoot
-  loopback), plus three healthy `long_join_last` coordinator-path
-  attempts on the three hosts.
+  loopback), plus three `long_join_last` coordinator-path attempts with
+  no injected fault on the three hosts.
 - Links are recorded before and after. The network is unchanged.
 
 ### Stage A retention plan (reviewed)
@@ -700,8 +703,8 @@ periodic renewal.
 **Wi-Fi.** Readout READ over schedule-r2. Links before and after: 48 runs
 each, all rc 0.
 - The reference (bigfoot loopback) completed in 30087 ms.
-- All three healthy coordinator-path `long_join_last` attempts, with no
-  fault injected, returned `WorkerLost` at 5121 ms, naming 70202, 70203
+- All three coordinator-path `long_join_last` attempts with no
+  injected fault returned `WorkerLost` at 5121 ms, naming 70202, 70203
   and 70203.
   - The required long coverage was **not met**: 0 workers with ≥ 5
     ACK-observed lease-only streams.
@@ -1066,7 +1069,7 @@ critical interleaving):
 #### After B0: B1 (unselected)
 
 These follow B0, each with its own review, informed by Stage A's Wi-Fi
-result (3/3 healthy long queries returned `WorkerLost` at the first
+result (3/3 long queries with no injected fault returned `WorkerLost` at the first
 renewal interval under the 100 ms caps):
 - a conservative-boundary computation, valid only for `Applied`
   renewals, from exact send markers;
@@ -1281,3 +1284,256 @@ broader robustness acceptance.
   (`~/work/.agent-bridge/adr628-evidence`, bigfoot
   `~/work/toron-evidence/adr628`).
 - B1 is not selected.
+
+### Stage B scope amendment, part 2: delay tolerance (B1) (reviewed)
+
+B1 has three separately reviewed parts:
+- **B1.A — the conditional reliance contract:** the expiry bound, the
+  reliance states, the use gates and the failure policy.
+- **B1.B — an extended-budget timing survey:** a diagnostic with its own
+  instrument, schedule and reader review.
+- **B1.C — waiting or retrying within the boundary:** a mechanism that
+  stays unselected until B1.B's evidence is reviewed. No deadline is
+  chosen here.
+
+**Unchanged:** the lease term, the worker-loss window, B0's receipt
+policy, and remote task cancellation. No campaign is cleared by this
+scope.
+
+**The motivating evidence.** In Stage A's Wi-Fi diagnostic, all three
+coordinator-path `long_join_last` attempts with no injected fault failed.
+Each returned `WorkerLost` at the first renewal interval under today's
+100 ms caps.
+- Those durations were censored by the caps.
+- "No injected fault" does not establish a healthy network.
+- No failure rate is claimed.
+
+#### B1.A.1 — The expiry bound (a conditional contract)
+
+**Assumptions.**
+- The worker's monotonic clock advances at most `(1 + ρ_w)` per real
+  second.
+- The coordinator's lease clock advances at least `(1 − ρ_c)` per real
+  second.
+- `ρ` is fractional, so 500 ppm = 0.0005, with `0 ≤ ρ < 1`.
+
+**The bound.** From the coordinator-clock send marker `t_send` of a
+request whose **whole exchange completed `Applied`**, the worker's lease
+cannot expire before the coordinator-clock duration
+`D = floor(L · (1 − ρ_c) / (1 + ρ_w))`. So:
+
+`B_w = t_send + D − M`
+
+- `L` is the declared term, positive.
+- `M` is a declared margin in coordinator-clock units, positive, with
+  `M < D`.
+- **`floor` is taken in the coordinator's representable duration unit**,
+  named in the implementation (for example whole nanoseconds of
+  `Duration`), with the rounding documented there. Seconds are never
+  floored dimensionlessly.
+- Overflow, an unrepresentable result, or a non-positive `D − M` is
+  rejected: no reliance is granted.
+
+**Each marker is per request,** correlated with:
+- the query and the worker;
+- the requested term and the `Applied` term (which must be equal);
+- the request's own response.
+
+**What it bounds, and what it does not.** `B_w` bounds the expiry of
+**that** lease only. It does **not** certify:
+- that the namespace survives;
+- that the incarnation is the same;
+- the absence of an earlier retirement, restart or invalidation.
+
+Those are explicit preconditions: no worker restart, no earlier
+retirement, and no invalidation since that `Applied`. Any detected
+violation fails reliance. Restart guarantees stronger than detection are
+incarnation fencing, a separate sub-review.
+
+**ρ is a declared operating assumption, not a proven hard bound.**
+- B1 declares a conservative `ρ` (proposed 500 ppm on each host), and the
+  claim is conditional on it.
+- B1.B records each host's synchronization daemon, its configuration and
+  its slew behaviour. `CLOCK_MONOTONIC` is affected by frequency and
+  slew adjustments.
+- B1.B also records `chronyc tracking` (Frequency, Skew) as context. Those
+  are estimates, never proof.
+- A host without chrony has unavailable evidence. `M` is never used to
+  hide an unbounded rate.
+
+**Suspend.**
+- A production proposal for ordinary home machines uses a suspend-aware
+  coordinator lease clock (`CLOCK_BOOTTIME`), or a reviewed divergence
+  check run before every reliance use and refresh.
+- Detection can fail only on resume, before further use. It cannot
+  promise that a timer ran during suspension.
+- The clock's read and sampling uncertainty is specified.
+- A clock read that fails or is missing fails reliance.
+- "No coordinator suspend" is acceptable only as an explicit,
+  limited-campaign assumption, not as general support.
+
+#### B1.A.2 — Reliance states per (query, worker)
+
+`Unissued → Issuing → Reliable(B_w) → Lapsed | Terminal`
+
+- **First issuance.** There is no previous `B_w`. No dependent task or
+  partition use is allowed until a validated `Applied` exchange completes
+  **and** `now_c < B_w` computed from **that** send.
+- **Renewal (preserving B0).** `Applied` refreshes `B_w` only after the
+  whole exchange succeeds, and only if processing finds `now_c` before
+  the **old** boundary. An observed ACK alone is insufficient.
+- **Lapse is irreversible.** A refresh processed at or after the old
+  boundary does not restore reliance, even if a starved timer never
+  recorded the lapse. Equality counts as lapsed.
+- **A refresh must also be usable now.** When a refresh is processed, the
+  bound it would install must be in the future (`now_c` before it), in
+  addition to the old-boundary and state checks.
+- **Out-of-order replies.** An out-of-order `Applied` must never replace
+  a valid bound with an already-elapsed one while the state is labelled
+  `Reliable`. The explicit preserve / reject / monotone-bound rule is
+  defined at the B1.C implementation review.
+- Nothing ever restores `Lapsed` or `Terminal`.
+- **`Ignored`** fails at the decoded reply, as in B0.
+- **No silent reissue after a lapse.**
+- **To pin:**
+  - old-boundary equality;
+  - a late ACK;
+  - a timely ACK with a late or failed close;
+  - out-of-order responses;
+  - a request/send-marker mismatch;
+  - a concurrent lapse versus refresh;
+  - first issuance before any `Applied`.
+
+#### B1.A.3 — Use gates and failure policy
+
+**The claim.** No reliance-dependent action is authorized after the
+boundary is observed at its use gate. Publishing the query's error can
+be late under scheduling stalls, and remote and in-flight work is
+**not** stopped by this claim.
+
+**Gates** (an inventory to complete in implementation review; each gate
+defines its authorization or acceptance linearization point):
+- dispatching a task to `w`;
+- inserting or publishing an accepted manifest into routing state;
+- routing a consumer to `w`'s partitions;
+- replay and re-dispatch paths;
+- accepting a completion whose output lives on `w`;
+- forwarding each buffered final-result batch;
+- terminal success of the result stream;
+- any work resumed after an `await`. A check made before an `await`
+  does not authorize state mutation or output after it.
+
+**Required workers** are bound explicitly. The proposed conservative
+policy: every census worker of the query.
+
+**Streamed results.** `execute_query_stream` returns a
+`DistributedResultStream`, and final batches are forwarded while the
+query runs, so rows can escape before a lapse.
+- After a lapse, every later batch is suppressed and the stream ends
+  with the lapse error. That is partial-result-then-error semantics,
+  stated in the API documentation.
+- Collected `execute_query` returns the error and no result.
+
+**Lapse reason.** A typed internal cause names `w` (with the boundary
+and whether `Ignored` or expiry), mapped to an existing outward failure
+kind (`WorkerLost { w }`) if that is sufficient. A new serialized
+`TaskFailureKind` would need its own wire, version and architecture
+review. It is never an untyped string.
+
+**Enforcement** combines a best-effort timer with gate enforcement.
+Retirement fanout is unchanged. There is no exclude-and-recover.
+
+#### B1.B — Extended-budget timing survey (its own instrument review)
+
+A test-only survey with no production timeout change. Completed samples
+are uncensored within its budget; samples that hit the deadline are
+censored and reported separately.
+
+- **Budgets.** Each phase (connect, write, ACK read, close) has a budget,
+  and the **whole exchange** has a frozen bound below the synthetic
+  lease's remaining validity. Four phase budgets plus the cadence must
+  not exceed `L`.
+- **The synthetic-query lifecycle.**
+  - Fresh synthetic query ids are issued.
+  - Each is renewed only while its last `Applied` is valid.
+  - Each is retired at a declared age.
+  - Nothing is renewed forever on an expired or forgotten id, and a
+    fresh issuance is never classified as a periodic renewal.
+  - The classification never bridges a lapse.
+- **Every outcome is recorded:** `Applied`, `Ignored(reason)`, transport
+  errors, budget expiry, and the per-phase instants with the exact send
+  marker.
+- **Load condition.**
+  - Production `long_join_last` can fail at about 5 s.
+  - The survey records each load query's actual task-activity windows
+    and outcomes, and tags each sample with the load state it overlapped.
+  - A repeated or independently maintained load is declared and bounded.
+  - It never claims "under a running query" for samples after that
+    query ended.
+- **Idle** means no concurrent campaign load or link tests. It does not
+  mean all home traffic is absent.
+- **Concurrency and cadence.** The number of overlapping probes is
+  declared (none, or a stated concurrency). There is no catch-up burst
+  after an overrun: a skipped tick is recorded.
+- **Cleanup.** Synthetic ids are retired, and each host's reaper
+  evidence is retained.
+- **Clock context per host:** the daemon, its configuration, and `chronyc
+  tracking` / `sources` before and after.
+- **Output:** per phase, pair and condition, distributions with censored
+  counts and errors separate. It recommends nothing.
+- **Counts, budgets and conditions** are frozen at B1.B's instrument
+  review. The example values here are not launch authority.
+
+#### B1.C — Waiting or retrying within the boundary (unselected)
+
+These candidates are evaluated against B1.B's evidence in a separate
+review:
+- per-worker independent renewal, instead of the sequential census;
+- per-attempt connect and operation budgets as an operational choice
+  from B1.B's distributions, including censored counts and errors, never
+  from success-only samples. A quantile plus a margin is an operational
+  budget, not a safety proof;
+- retries only while an attempt can complete before the current `B_w`;
+- an earlier renewal cadence, with the term unchanged;
+- connection reuse, as an optional sub-review.
+
+#### Acceptance outline (declared with B1.C; conditional on the selected mechanism)
+
+**Deterministic tests:**
+- the B1.A.2 state pins;
+- every use gate refuses after the boundary even with timers starved;
+- streamed output stops after a lapse;
+- first issuance gates dependent use;
+- `ρ`/`M`/floor arithmetic;
+- the suspend handling as declared;
+- per-worker independence, only if that mechanism is selected.
+
+**Campaign:**
+- Wi-Fi long queries with no injected fault complete at parity over a
+  frozen count. Failures are reported, never retried away.
+- **Blackout survival** is claimed only when a valid `Applied` exchange
+  completes before the old boundary. Remaining slack, scheduling and
+  reconnection consume time, so the blackout duration alone proves
+  nothing.
+- Asymmetric coordinator and consumer routes.
+- An unknown application after an ACK loss.
+- Out-of-order and stale responses.
+- Timer starvation with streamed output.
+- **Permanent unreachability** reports three things separately:
+  - when gates stopped reliance;
+  - when the error was delivered;
+  - when the workers reclaimed.
+- ADR 627's coordinator mid-task cases are rerun. That claims nothing
+  about stopping running tasks.
+
+**Never conflated:**
+- bounded cessation of coordinator reliance at the gates;
+- remote reclamation (B0);
+- running-task cessation, which is reported as observed only.
+
+#### Not in B1
+
+- Stopping remote running tasks after a lapse.
+- Incarnation fencing.
+- Coordinator recovery, W, and the dispatch-exclusion shortcut.
+- Changes to the term, the loss window, receipts or the reaper.
