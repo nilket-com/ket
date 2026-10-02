@@ -100,6 +100,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 		record_wait_events,
 		recovery,
 		loopback,
+		managed_lifecycle,
 	) = args()?;
 	let wait_log = record_wait_events
 		.as_deref()
@@ -123,12 +124,124 @@ async fn main() -> Result<(), Box<dyn Error>> {
 			None => recorded,
 		}
 	};
+	// ADR 628 Stage A: `--managed-lifecycle` gives this fixture the production worker's store
+	// lifecycle: a managed in-memory store with the production lease term and an owned one-second
+	// reaper, as the daemon runs (daemon.rs). Unset, the store is the unmanaged fixture store, as before.
+	let managed_store = if managed_lifecycle {
+		Some(Arc::new(InMemoryPartitionStore::managed(
+			toron::distributed::budget::QueryBudget::test_default(),
+			toron::distributed::partition_store::DEFAULT_WORKER_LOST_AFTER,
+		)?))
+	} else {
+		None
+	};
+	// ADR 628: every manifest this worker published, so each reaper pass can report the exact
+	// manifests' residency (a pure `manifest` lookup) beside the aggregate counters.
+	let published: Arc<std::sync::Mutex<Vec<toron::distributed::partition_store::ManifestKey>>> =
+		Arc::default();
+	let partition_store: Arc<dyn toron::distributed::partition_store::PartitionStore> =
+		match &managed_store {
+			// ADR 628: the managed store is wrapped so every actual lease application is recorded.
+			Some(store) => Arc::new(LeaseApplicationStore {
+				inner: store.clone(),
+				log: wait_log.clone(),
+				published: published.clone(),
+				calls: std::sync::atomic::AtomicU64::new(0),
+			}),
+			None => Arc::new(InMemoryPartitionStore::new()),
+		};
+	if let Some(log) = &wait_log {
+		log.emit(
+			"lifecycle_mode",
+			"served",
+			serde_json::json!({
+				"managed": managed_lifecycle,
+				"worker_lost_after_ms": toron::distributed::partition_store::DEFAULT_WORKER_LOST_AFTER.as_millis() as u64,
+				"reaper_interval_ms": if managed_lifecycle { 1000 } else { 0 },
+			}),
+		);
+	}
+	// ADR 628: this process's identity once its endpoint is known, so a reader can validate the
+	// declared roster (worker id, endpoint, mode and lease term) against each log.
+	let lease_term_ms =
+		toron::distributed::partition_store::PartitionStore::query_lease_term_millis(
+			partition_store.as_ref(),
+		);
+	let identify = |endpoint: &WorkerEndpoint| {
+		if let Some(log) = &wait_log {
+			log.emit(
+				"worker_identity",
+				"served",
+				serde_json::json!({
+					"worker": worker_id.get().as_u128().to_string(),
+					"endpoint": endpoint.as_str(),
+					"pid": std::process::id(),
+					"managed": managed_lifecycle,
+					"lease_term_ms": lease_term_ms,
+				}),
+			);
+		}
+	};
+	// Every reaper invocation is recorded at start and completion, on this worker's clock, with the
+	// lifecycle snapshot before and after. A pass that changes nothing is still recorded: silence is
+	// never evidence of a pass or of cleanup. The task is owned by `main` and aborted when `main`'s
+	// guard drops or the process exits; it is never awaited.
+	let _reaper = managed_store.clone().map(|store| {
+		let log = wait_log.clone();
+		ReaperTask(tokio::spawn(async move {
+			use toron::distributed::partition_store::PartitionStore as _;
+			let snapshot = |store: &InMemoryPartitionStore| {
+				let s = store.lifecycle_snapshot();
+				let keys = published.lock().expect("published manifests").clone();
+				let manifests = keys
+					.into_iter()
+					.map(|key| {
+						let mut entry = manifest_key_json(key);
+						entry["resident"] = store.manifest(key).is_some().into();
+						entry
+					})
+					.collect::<Vec<_>>();
+				serde_json::json!({
+					"published_manifests": manifests,
+					"active_leases": s.active_leases,
+					"retiring_namespaces": s.retiring_namespaces,
+					"receipts": s.receipts,
+					"resident_namespaces": s.resident_namespaces,
+					"abandoned_reclaims": s.abandoned_reclaims,
+					"live_partition_records": s.live_partition_records,
+				})
+			};
+			let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+			let mut pass = 0u64;
+			loop {
+				tick.tick().await;
+				pass += 1;
+				let before = snapshot(&store);
+				if let Some(log) = &log {
+					log.emit(
+						"reaper_pass_start",
+						"served",
+						serde_json::json!({ "pass": pass, "before": before }),
+					);
+				}
+				store.reap_expired_queries();
+				let after = snapshot(&store);
+				if let Some(log) = &log {
+					log.emit(
+						"reaper_pass_end",
+						"served",
+						serde_json::json!({ "pass": pass, "after": after }),
+					);
+				}
+			}
+		}))
+	});
 	let worker = |endpoint: WorkerEndpoint, peer: Arc<dyn ToronTransport>| {
 		Ok::<_, Box<dyn Error>>(Arc::new(
 			ToronWorker::with_partition_store_and_endpoint(
 				Arc::new(FixtureStorageScan::new(wait_log.clone())?),
 				Arc::new(MemoryManager::new(32, 1024 * 1024)),
-				Arc::new(InMemoryPartitionStore::new()),
+				partition_store.clone(),
 				worker_id,
 				endpoint,
 			)
@@ -166,6 +279,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 			"LISTENING",
 			format!("bind={} advertise={}", host.bind, host.advertise),
 		);
+		identify(&endpoint);
 		announce(&endpoint).await?;
 		loop {
 			let connection = match quic.accept_connection().await {
@@ -220,6 +334,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 			let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
 			let endpoint = WorkerEndpoint::new(listener.local_addr()?.to_string());
 			let worker = worker(endpoint.clone(), peer(Arc::new(TcpTransport::new())))?;
+			identify(&endpoint);
 			announce(&endpoint).await?;
 			loop {
 				let (stream, _) = listener.accept().await?;
@@ -240,6 +355,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 			let endpoint =
 				WorkerEndpoint::new(loopback.advertise.unwrap_or(quic.local_addr()?).to_string());
 			let worker = worker(endpoint.clone(), peer(Arc::new(QuicTransport::new()?)))?;
+			identify(&endpoint);
 			announce(&endpoint).await?;
 			loop {
 				let connection = match quic.accept_connection().await {
@@ -283,6 +399,192 @@ async fn main() -> Result<(), Box<dyn Error>> {
 				});
 			}
 		}
+	}
+}
+
+/// ADR 628 Stage A: forwards every `PartitionStore` call to the managed store unchanged, and records
+/// each actual `issue_or_renew_query_lease` application on this worker's clock: `lease_apply_start`
+/// and `lease_apply_end` with the query and the store's active-lease count before and after. The end
+/// marker is an upper bound on when that lease was set (the lease, if applied, expires no earlier
+/// than start + term and no later than end + term). Whether the call applied or was ignored
+/// (retiring, receipt held) is not exposed per query; the counts are reported, not interpreted.
+struct LeaseApplicationStore {
+	inner: Arc<InMemoryPartitionStore>,
+	/// Numbers every application call, so a reader pairs each start with its own end even if calls
+	/// overlap.
+	calls: std::sync::atomic::AtomicU64,
+	log: Option<Arc<wait_events::EventLog>>,
+	/// Every successfully published manifest, recorded by key (`publish_applied`) for the reaper's
+	/// per-manifest residency report.
+	published: Arc<std::sync::Mutex<Vec<toron::distributed::partition_store::ManifestKey>>>,
+}
+
+fn manifest_key_json(key: toron::distributed::partition_store::ManifestKey) -> serde_json::Value {
+	serde_json::json!({
+		"query": key.query_id.get().to_string(),
+		"exchange": key.exchange_id.get(),
+		"stage": key.producer_stage_id.get(),
+		"task": key.producer_task_id.get(),
+		"attempt": key.attempt_id.get(),
+	})
+}
+
+#[async_trait::async_trait]
+impl toron::distributed::partition_store::PartitionStore for LeaseApplicationStore {
+	fn query_lease_term_millis(&self) -> u64 {
+		self.inner.query_lease_term_millis()
+	}
+
+	fn issue_or_renew_query_lease(&self, query_id: toron::distributed::identity::QueryId) {
+		let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		let before = self.inner.lifecycle_snapshot().active_leases;
+		if let Some(log) = &self.log {
+			log.emit(
+				"lease_apply_start",
+				"served",
+				serde_json::json!({ "query": query_id.get().to_string(), "call": call, "active_leases_before": before }),
+			);
+		}
+		self.inner.issue_or_renew_query_lease(query_id);
+		let after = self.inner.lifecycle_snapshot().active_leases;
+		if let Some(log) = &self.log {
+			log.emit(
+				"lease_apply_end",
+				"served",
+				serde_json::json!({ "query": query_id.get().to_string(), "call": call, "active_leases_after": after }),
+			);
+		}
+	}
+
+	fn retire_query(
+		&self,
+		query_id: toron::distributed::identity::QueryId,
+		cause: toron::distributed::namespace_lifecycle::QueryTerminalCause,
+	) {
+		self.inner.retire_query(query_id, cause);
+	}
+
+	fn reap_expired_queries(&self) {
+		self.inner.reap_expired_queries();
+	}
+
+	fn lifecycle_snapshot(
+		&self,
+	) -> toron::distributed::namespace_lifecycle::ShuffleLifecycleSnapshot {
+		self.inner.lifecycle_snapshot()
+	}
+
+	fn publish(
+		&self,
+		manifest: toron::distributed::task::PartitionManifest,
+		payloads: Vec<toron::distributed::partition_store::PartitionPayload>,
+	) -> Result<
+		toron::distributed::task::PartitionManifest,
+		toron::distributed::partition_store::PartitionStoreError,
+	> {
+		let result = self.inner.publish(manifest, payloads);
+		if let Ok(published) = &result {
+			let key = toron::distributed::partition_store::ManifestKey::from_manifest(published);
+			self.published
+				.lock()
+				.expect("published manifests")
+				.push(key);
+			if let Some(log) = &self.log {
+				log.emit("publish_applied", "served", manifest_key_json(key));
+			}
+		}
+		result
+	}
+
+	fn manifest(
+		&self,
+		key: toron::distributed::partition_store::ManifestKey,
+	) -> Option<toron::distributed::task::PartitionManifest> {
+		self.inner.manifest(key)
+	}
+
+	fn pull(
+		&self,
+		address: toron::distributed::task::PartitionAddress,
+		expected_attempt: toron::distributed::identity::AttemptId,
+	) -> Result<
+		toron::distributed::partition_store::PartitionPayload,
+		toron::error::PartitionMissingReason,
+	> {
+		self.inner.pull(address, expected_attempt)
+	}
+
+	fn open_live(
+		&self,
+		address: toron::distributed::task::PartitionAddress,
+		schema: arrow::datatypes::SchemaRef,
+	) -> Result<(), toron::distributed::partition_store::PartitionStoreError> {
+		self.inner.open_live(address, schema)
+	}
+
+	fn open_live_with_downstream_cancellation(
+		&self,
+		address: toron::distributed::task::PartitionAddress,
+		schema: arrow::datatypes::SchemaRef,
+		downstream_cancellation: Option<
+			toron::distributed::cancellation::DownstreamCancellationContext,
+		>,
+	) -> Result<(), toron::distributed::partition_store::PartitionStoreError> {
+		self.inner
+			.open_live_with_downstream_cancellation(address, schema, downstream_cancellation)
+	}
+
+	async fn append_live(
+		&self,
+		payload: toron::distributed::partition_store::PartitionPayload,
+	) -> Result<(), toron::distributed::partition_store::PartitionStoreError> {
+		self.inner.append_live(payload).await
+	}
+
+	fn seal_live(
+		&self,
+		manifest: toron::distributed::task::PartitionManifest,
+	) -> Result<
+		toron::distributed::task::PartitionManifest,
+		toron::distributed::partition_store::PartitionStoreError,
+	> {
+		self.inner.seal_live(manifest)
+	}
+
+	fn cancel_live(
+		&self,
+		address: toron::distributed::task::PartitionAddress,
+		reason: toron::error::PartitionMissingReason,
+	) {
+		self.inner.cancel_live(address, reason);
+	}
+
+	fn pull_live(
+		&self,
+		address: toron::distributed::task::PartitionAddress,
+		expected_attempt: toron::distributed::identity::AttemptId,
+	) -> Result<
+		toron::distributed::partition_store::LivePartitionStream,
+		toron::error::PartitionMissingReason,
+	> {
+		self.inner.pull_live(address, expected_attempt)
+	}
+
+	fn remove_query(&self, query_id: toron::distributed::identity::QueryId) {
+		self.inner.remove_query(query_id);
+	}
+
+	fn cancel_query(&self, query_id: toron::distributed::identity::QueryId) {
+		self.inner.cancel_query(query_id);
+	}
+}
+
+/// ADR 628: the reaper task is owned by `main`; dropping this aborts it.
+struct ReaperTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ReaperTask {
+	fn drop(&mut self) {
+		self.0.abort();
 	}
 }
 
@@ -542,6 +844,7 @@ type FixtureArgs = (
 	Option<std::path::PathBuf>,
 	Option<toron::distributed::recovery::RecoveryExperiment>,
 	LoopbackAddresses,
+	bool,
 );
 
 /// ADR 626 Stage C: test-only loopback bind and advertised addresses (QUIC loopback mode only).
@@ -587,6 +890,7 @@ fn args() -> Result<FixtureArgs, Box<dyn Error>> {
 	let mut recovery_establishment_ms: Option<u64> = None;
 	let mut loopback = LoopbackAddresses::default();
 	let mut recovery_confirmation_ms: Option<u64> = None;
+	let mut managed_lifecycle = false;
 	let mut bind: Option<std::net::SocketAddr> = None;
 	let mut advertise: Option<std::net::SocketAddr> = None;
 	let mut tls_cert = None;
@@ -620,6 +924,8 @@ fn args() -> Result<FixtureArgs, Box<dyn Error>> {
 			recovery_establishment_ms = args.next().map(|value| value.parse()).transpose()?;
 		} else if arg == "--recovery-confirmation-ms" {
 			recovery_confirmation_ms = args.next().map(|value| value.parse()).transpose()?;
+		} else if arg == "--managed-lifecycle" {
+			managed_lifecycle = true;
 		} else if arg == "--transport" {
 			transport = match args.next().as_deref() {
 				Some("tcp") => FixtureTransport::Tcp,
@@ -673,6 +979,7 @@ fn args() -> Result<FixtureArgs, Box<dyn Error>> {
 		record_wait_events,
 		recovery,
 		loopback,
+		managed_lifecycle,
 	))
 }
 

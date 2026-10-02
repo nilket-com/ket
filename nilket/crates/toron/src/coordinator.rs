@@ -4638,6 +4638,75 @@ mod tests {
 		assert_eq!(handle.lease_failure_worker(), Some(worker.worker_id));
 	}
 
+	/// ADR 628 Stage A (current-behaviour pins, paused clock): a single renewal slower than either
+	/// 100 ms bound fails the whole query at exactly the first tick plus that bound; renewals inside
+	/// both bounds keep it alive. `cadence` is 5 ms here; production uses 5 s.
+	async fn adr628_renewal_run(
+		connect_delay: Duration,
+		ack_delay: Duration,
+	) -> (Option<Duration>, usize, bool) {
+		let registry = ActiveQueryRegistry::new();
+		let guard = registry.register(TenantId(7), QueryId::from_u128(1));
+		let handle = guard.handle();
+		let worker = scripted_worker();
+		handle.record_remote_task(worker.clone(), lease_test_identity());
+		let renewals = Arc::new(AtomicUsize::new(0));
+		let started = tokio::time::Instant::now();
+		spawn_query_lease_renewal_task_with_cadence(
+			Arc::new(PhasedLeaseTransport {
+				connect_delay,
+				ack_delay,
+				renewals: renewals.clone(),
+			}),
+			Arc::new(MemoryManager::new(1, 1024 * 1024)),
+			handle.clone(),
+			Duration::from_millis(5),
+		);
+		let stopped = tokio::time::timeout(Duration::from_secs(2), handle.stopped())
+			.await
+			.ok()
+			.map(|()| started.elapsed());
+		let failed = handle.lease_failure_worker() == Some(worker.worker_id);
+		guard.handle().mark_terminal();
+		(stopped, renewals.load(Ordering::SeqCst), failed)
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn adr628_a_renewal_connect_slower_than_the_bound_fails_the_query_at_tick_plus_bound() {
+		let (stopped, renewals, failed) =
+			adr628_renewal_run(Duration::from_millis(150), Duration::ZERO).await;
+		assert!(failed);
+		assert_eq!(renewals, 0);
+		assert_eq!(stopped, Some(Duration::from_millis(5 + 100)));
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn adr628_a_renewal_ack_slower_than_the_bound_fails_the_query_at_tick_plus_bound() {
+		let (stopped, renewals, failed) =
+			adr628_renewal_run(Duration::ZERO, Duration::from_millis(150)).await;
+		assert!(failed);
+		assert_eq!(renewals, 0);
+		assert_eq!(stopped, Some(Duration::from_millis(5 + 100)));
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn adr628_renewals_inside_both_bounds_keep_the_query_alive() {
+		let (stopped, renewals, failed) =
+			adr628_renewal_run(Duration::from_millis(50), Duration::from_millis(50)).await;
+		assert!(!failed);
+		assert_eq!(stopped, None, "no lease failure within 2 s");
+		assert!(renewals >= 5, "{renewals}");
+	}
+
+	/// ADR 628 Stage A: the two bounds are separate, not one shared 100 ms: a connect and an
+	/// operation that each take 90 ms (180 ms in all) still renew.
+	#[tokio::test(start_paused = true)]
+	async fn adr628_connect_and_operation_bounds_are_separate() {
+		let (stopped, _, failed) =
+			adr628_renewal_run(Duration::from_millis(90), Duration::from_millis(90)).await;
+		assert!(!failed && stopped.is_none());
+	}
+
 	#[tokio::test]
 	async fn remote_cancel_fanout_records_error_when_connect_fails() {
 		let metrics = Arc::new(CancellationMetrics::default());
@@ -5434,6 +5503,47 @@ mod tests {
 				)
 				.await
 				.expect("ack query lease renewal");
+			});
+			Ok(Box::new(client))
+		}
+	}
+
+	/// ADR 628 Stage A: a renewal transport whose connect resolves after `connect_delay` and whose
+	/// worker acknowledges each lease after `ack_delay` (both on tokio's clock, paused in the pins).
+	struct PhasedLeaseTransport {
+		connect_delay: Duration,
+		ack_delay: Duration,
+		renewals: Arc<AtomicUsize>,
+	}
+
+	#[async_trait::async_trait]
+	impl ToronTransport for PhasedLeaseTransport {
+		async fn connect(&self, _address: &str) -> Result<Box<dyn ToronStream>, QueryError> {
+			tokio::time::sleep(self.connect_delay).await;
+			let (client, mut server) = test_duplex(1024 * 1024);
+			let (ack_delay, renewals) = (self.ack_delay, self.renewals.clone());
+			tokio::spawn(async move {
+				let Ok(lease) = read_test_envelope(&mut server).await else {
+					return;
+				};
+				assert_eq!(lease.kind, MessageKind::QueryLease);
+				let payload: QueryLeasePayload =
+					decode_payload(&lease.payload).expect("decode query lease renewal");
+				tokio::time::sleep(ack_delay).await;
+				if send_test_payload(
+					&mut server,
+					MessageKind::QueryLeaseAccepted,
+					EnvelopeIdentity::query(payload.query_id),
+					None,
+					&QueryLeaseAcceptedPayload {
+						query_id: payload.query_id,
+					},
+				)
+				.await
+				.is_ok()
+				{
+					renewals.fetch_add(1, Ordering::SeqCst);
+				}
 			});
 			Ok(Box::new(client))
 		}

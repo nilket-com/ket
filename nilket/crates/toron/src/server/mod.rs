@@ -3374,6 +3374,201 @@ mod tests {
 		}
 	}
 
+	/// ADR 628 Stage A (current-behaviour pin, over the wire): a `QueryLease` for a query whose
+	/// namespace was retired and whose receipt is held is still answered `QueryLeaseAccepted`. The
+	/// renewal is a no-op (no active lease appears, the receipt stays), and a later write is denied
+	/// `QueryLeaseMissing`. The ACK therefore does not certify that the lease was applied.
+	#[tokio::test]
+	async fn adr628_a_renewal_after_retirement_is_acked_without_being_applied() {
+		use crate::distributed::namespace_lifecycle::QueryTerminalCause;
+		use crate::distributed::partition_store::{PartitionPayload, PartitionStoreError};
+		use crate::distributed::task::{
+			ArrowIpcDigest, PartitionAddress, PartitionBackend, PartitionManifest, RowCount,
+		};
+		let store = Arc::new(
+			InMemoryPartitionStore::managed(QueryBudget::test_default(), DEFAULT_WORKER_LOST_AFTER)
+				.expect("managed store"),
+		);
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let worker = ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(CancelledStorageScan),
+			Arc::clone(&memory),
+			store.clone(),
+			WorkerId::from_u128(628),
+			WorkerEndpoint::new("local"),
+		);
+		let query_id = QueryId::from_u128(628);
+		let written = |attempt: u32| {
+			let address = PartitionAddress {
+				query_id,
+				exchange_id: crate::distributed::identity::ExchangeId::new(0),
+				producer_stage_id: StageId::new(0),
+				producer_task_id: TaskId::new(0),
+				attempt_id: AttemptId::new(attempt),
+				partition_id: crate::distributed::identity::PartitionId::new(0),
+			};
+			let bytes = vec![1, 2, 3];
+			let digest = ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes));
+			let payload = PartitionPayload::new(address, bytes, RowCount::new(1), digest);
+			let manifest = PartitionManifest {
+				query_id,
+				stage_id: address.producer_stage_id,
+				task_id: address.producer_task_id,
+				attempt_id: address.attempt_id,
+				exchange_id: address.exchange_id,
+				producer_worker_id: WorkerId::from_u128(628),
+				producer_endpoint: WorkerEndpoint::new("local"),
+				partitions: vec![payload.entry()],
+				runtime_filter_fragment: None,
+				backend: PartitionBackend::InMemory,
+			};
+			store.publish(manifest, vec![payload])
+		};
+		store.issue_or_renew_query_lease(query_id);
+		written(0).expect("publish under a live lease");
+		store.retire_query(query_id, QueryTerminalCause::Success);
+		let retired = store.lifecycle_snapshot();
+		assert_eq!((retired.active_leases, retired.receipts), (0, 1));
+
+		let (client, server) = test_duplex(1024 * 1024);
+		let served = tokio::spawn(async move { worker.handle_connection(server).await });
+		ToronCoordinator::new(memory)
+			.issue_or_renew_query_lease_on_worker(client, query_id)
+			.await
+			.expect("current behaviour: QueryLeaseAccepted for a retired query");
+		served.await.expect("worker task").expect("worker ok");
+
+		let after = store.lifecycle_snapshot();
+		assert_eq!(
+			(after.active_leases, after.receipts),
+			(0, 1),
+			"the renewal was a no-op"
+		);
+		let error = written(1).expect_err("a write after the ACKed renewal");
+		assert!(
+			matches!(error, PartitionStoreError::QueryLeaseMissing { query_id: id } if id == query_id),
+			"{error:?}"
+		);
+	}
+
+	/// ADR 628 Stage A: a worker that grants the dispatch's query lease and accepts `StartTask`,
+	/// then holds the stream open and never answers, so the dispatch stays in flight. `started` is
+	/// notified once `StartTask` has been read.
+	struct HoldingWorkerTransport {
+		started: Arc<Notify>,
+	}
+
+	#[async_trait::async_trait]
+	impl ToronTransport for HoldingWorkerTransport {
+		async fn connect(
+			&self,
+			_address: &str,
+		) -> Result<Box<dyn self::transport::ToronStream>, QueryError> {
+			let (client, mut server) = test_duplex(1024 * 1024);
+			let started = Arc::clone(&self.started);
+			tokio::spawn(async move {
+				let memory = MemoryManager::new(1, 1024 * 1024);
+				let lease = read_envelope(&mut server, &memory).await.expect("lease");
+				assert_eq!(lease.kind, MessageKind::QueryLease);
+				let payload: QueryLeasePayload =
+					decode_payload(&lease.payload).expect("lease payload");
+				send_payload(
+					&mut server,
+					MessageKind::QueryLeaseAccepted,
+					EnvelopeIdentity::query(payload.query_id),
+					None,
+					&QueryLeaseAcceptedPayload {
+						query_id: payload.query_id,
+					},
+				)
+				.await
+				.expect("lease accepted");
+				let start = read_envelope(&mut server, &memory).await.expect("start");
+				assert_eq!(start.kind, MessageKind::StartTask);
+				started.notify_one();
+				std::future::pending::<()>().await;
+				drop(server);
+			});
+			Ok(Box::new(client))
+		}
+	}
+
+	fn adr628_worker() -> crate::distributed::worker_registry::WorkerEntry {
+		use crate::distributed::identity::LeaseEpoch;
+		use crate::distributed::worker_registry::{
+			ActiveTaskCount, SimdLaneCount, UnixMillis, WorkerCapabilities, WorkerEntry,
+			WorkerLease, WorkerResourceState, WorkerStatus,
+		};
+		WorkerEntry {
+			worker_id: WorkerId::from_u128(17),
+			endpoint: WorkerEndpoint::new("scripted://holding-worker"),
+			lease: WorkerLease {
+				last_heartbeat: UnixMillis::new(0),
+				epoch: LeaseEpoch::new(1),
+			},
+			capabilities: WorkerCapabilities {
+				advertised_memory: ByteCount::new(1024 * 1024),
+				simd_width: SimdLaneCount::new(1),
+				spill_capacity_reserved: ByteCount::ZERO,
+			},
+			resources: WorkerResourceState {
+				in_flight: ByteCount::ZERO,
+				active_tasks: ActiveTaskCount::new(0),
+			},
+			status: WorkerStatus::Live,
+		}
+	}
+
+	/// ADR 628 Stage A (current-behaviour pin): after a query-lease failure, a dispatch already
+	/// executing (it observes the stop) surfaces `WorkerLost` naming the failed worker, even though
+	/// its own worker is healthy; a dispatch issued afterwards is caught by the early check and
+	/// returns `Cancelled`.
+	#[tokio::test]
+	async fn adr628_a_lease_failure_ends_an_inflight_dispatch_as_worker_lost_and_a_later_one_as_cancelled()
+	 {
+		let registry = crate::distributed::cancellation::ActiveQueryRegistry::new();
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(41));
+		let handle = guard.handle();
+		let started = Arc::new(Notify::new());
+		let dispatcher = NetworkTaskDispatcher::new(
+			Arc::new(MemoryManager::new(4, 1024 * 1024)),
+			Arc::new(HoldingWorkerTransport {
+				started: Arc::clone(&started),
+			}),
+		)
+		.with_active_query(Some(handle.clone()));
+		let worker = adr628_worker();
+		let failed_worker = WorkerId::from_u128(99);
+		let spec = final_result_task_spec(41);
+		let inflight = {
+			let dispatcher = &dispatcher;
+			let worker = &worker;
+			let spec = &spec;
+			async move { dispatcher.dispatch(worker, spec).await }
+		};
+		// The lease fails only once the worker has read `StartTask`: the dispatch is in flight.
+		let failure = async {
+			started.notified().await;
+			assert!(handle.fail_query_lease(failed_worker));
+		};
+		let (outcome, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+			tokio::join!(inflight, failure)
+		})
+		.await
+		.expect("the in-flight dispatch returns once the lease fails");
+		assert!(
+			matches!(&outcome, DispatchOutcome::Failed(TaskFailureKind::WorkerLost { worker_id }) if *worker_id == failed_worker),
+			"{outcome:?}"
+		);
+		let later = dispatcher
+			.dispatch(&worker, &final_result_task_spec(42))
+			.await;
+		assert!(
+			matches!(later, DispatchOutcome::Failed(TaskFailureKind::Cancelled)),
+			"{later:?}"
+		);
+	}
+
 	fn final_result_task_spec(seed: u128) -> TaskSpec {
 		TaskSpec {
 			identity: TaskIdentity::new(

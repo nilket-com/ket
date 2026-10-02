@@ -3441,6 +3441,73 @@ mod tests {
 		);
 	}
 
+	/// ADR 628 Stage A, race candidate (a) on a managed store (current-behaviour pin): a write
+	/// landing after the lease deadline but before the reaper tick is `QueryLeaseExpired` and removes
+	/// the lease, so the reaper no longer finds the query and does not reclaim it as `Abandoned`. The
+	/// earlier published partition stays resident and servable. The 20 ms term and the 60 ms wait give
+	/// a 3x margin; the call order is fixed.
+	#[test]
+	fn adr628_expired_write_leaves_published_partitions_resident_after_the_reaper() {
+		let store =
+			managed_memory_store_with_config(8, Duration::from_secs(1), Duration::from_millis(20));
+		let first = payload(address(AttemptId::first()));
+		let query_id = first.address.query_id;
+		store.issue_or_renew_query_lease(query_id);
+		store
+			.publish(manifest(&first), vec![first.clone()])
+			.expect("publish under a live lease");
+		std::thread::sleep(Duration::from_millis(60));
+		let late = payload_with_bytes(address(AttemptId::first().next()), vec![7, 8, 9]);
+		let error = store
+			.publish(manifest(&late), vec![late.clone()])
+			.expect_err("written after the deadline");
+		assert!(
+			matches!(error, PartitionStoreError::QueryLeaseExpired { query_id: id } if id == query_id),
+			"{error:?}"
+		);
+		store.reap_expired_queries();
+		let snapshot = store.lifecycle_snapshot();
+		assert_eq!(
+			snapshot.abandoned_reclaims, 0,
+			"the reaper did not reclaim it"
+		);
+		assert_eq!(
+			snapshot.resident_namespaces, 1,
+			"the namespace stays resident"
+		);
+		assert_eq!(
+			store
+				.pull(first.address, AttemptId::first())
+				.expect("current behaviour: still servable")
+				.bytes,
+			first.bytes
+		);
+	}
+
+	/// ADR 628 Stage A (current-behaviour pin): once the reaper has removed an expired lease and
+	/// retired the query, a later write is `QueryLeaseMissing`, not `QueryLeaseExpired`.
+	#[test]
+	fn adr628_write_after_the_reaper_is_lease_missing() {
+		let store =
+			managed_memory_store_with_config(8, Duration::from_secs(1), Duration::from_millis(20));
+		let first = payload(address(AttemptId::first()));
+		let query_id = first.address.query_id;
+		store.issue_or_renew_query_lease(query_id);
+		store
+			.publish(manifest(&first), vec![first.clone()])
+			.expect("publish under a live lease");
+		std::thread::sleep(Duration::from_millis(60));
+		store.reap_expired_queries();
+		let late = payload_with_bytes(address(AttemptId::first().next()), vec![7, 8, 9]);
+		let error = store
+			.publish(manifest(&late), vec![late])
+			.expect_err("written after the reaper");
+		assert!(
+			matches!(error, PartitionStoreError::QueryLeaseMissing { query_id: id } if id == query_id),
+			"{error:?}"
+		);
+	}
+
 	#[test]
 	fn superseded_attempt_state_remains_until_query_terminal() {
 		let store = managed_memory_store();

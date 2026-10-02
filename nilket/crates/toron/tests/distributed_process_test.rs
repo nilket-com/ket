@@ -37,6 +37,8 @@ use wendelon::schema::{
 	TableSchemaDescriptor,
 };
 
+#[path = "support/lease_faults.rs"]
+mod lease_faults;
 /// ADR 626 Stage A: passive wait events, shared with the fixture worker binary.
 #[path = "support/wait_events.rs"]
 mod wait_events;
@@ -54,6 +56,9 @@ tokio::task_local! {
 	static PROCESS_TRANSPORT: ProcessTransport;
 	/// ADR 626 Stage C: a relayed worker's loopback bind and advertised addresses.
 	static LOOPBACK_ADDRESSES: (std::net::SocketAddr, std::net::SocketAddr);
+	/// ADR 628: workers spawned in this scope run the managed (production) store lifecycle with
+	/// its one-second reaper.
+	static MANAGED_LIFECYCLE: ();
 }
 
 fn current_process_transport() -> ProcessTransport {
@@ -150,6 +155,9 @@ impl FixtureWorkerProcess {
 				.arg(bind.to_string())
 				.arg("--loopback-advertise")
 				.arg(advertise.to_string());
+		}
+		if MANAGED_LIFECYCLE.try_with(|()| ()).is_ok() {
+			command.arg("--managed-lifecycle");
 		}
 		if let Some((establishment, confirmation)) = recovery {
 			command
@@ -4143,16 +4151,22 @@ fn load_probe_spec() -> ProbeSpec {
 		!workers.is_empty(),
 		"a probe spec must name at least one worker"
 	);
-	let client = toron::network::tls::client_config_from_paths(
-		std::path::Path::new(&spec_str(&raw, "tls_cert")),
-		std::path::Path::new(&spec_str(&raw, "tls_key")),
-		std::path::Path::new(&spec_str(&raw, "tls_ca")),
-	)
-	.expect("probe client TLS material");
-	let transport: Arc<dyn ToronTransport> = Arc::new(
-		QuicTransport::authenticated(client, spec_str(&raw, "cluster_domain"))
-			.expect("authenticated transport"),
-	);
+	// ADR 628 Stage A: a loopback spec drives loopback fixture workers (the child coordinator of the
+	// owner-disappearance control); every host spec stays authenticated.
+	let transport: Arc<dyn ToronTransport> = if raw["loopback"].as_bool() == Some(true) {
+		Arc::new(QuicTransport::new().expect("loopback QUIC transport"))
+	} else {
+		let client = toron::network::tls::client_config_from_paths(
+			std::path::Path::new(&spec_str(&raw, "tls_cert")),
+			std::path::Path::new(&spec_str(&raw, "tls_key")),
+			std::path::Path::new(&spec_str(&raw, "tls_ca")),
+		)
+		.expect("probe client TLS material");
+		Arc::new(
+			QuicTransport::authenticated(client, spec_str(&raw, "cluster_domain"))
+				.expect("authenticated transport"),
+		)
+	};
 	let attempt_dir = std::path::PathBuf::from(spec_str(&raw, "attempt_dir"));
 	let wait_log = (raw["wait_events"].as_bool() == Some(true)).then(|| {
 		wait_events::EventLog::create(&attempt_dir.join("probe_events.jsonl"))
@@ -4538,6 +4552,40 @@ where
 		fields["elapsed_us"] = ended.saturating_sub(started).into();
 		fields["outcome"] = dispatch_outcome_text(&outcome).into();
 		log.emit_at(ended, "dispatch_return", "dispatch", fields);
+		// ADR 628 Stage A: a sealed producer's typed manifest, as this dispatcher received it, so a
+		// later inspection can bind its exact published addresses, worker and digests.
+		use toron::distributed::scheduler::DispatchOutcome as D;
+		use toron::distributed::task::TaskCompletionOutput as O;
+		let produced = match &outcome {
+			D::Completed(O::ShuffleProducer { manifest })
+			| D::CompletedWithBatches {
+				output: O::ShuffleProducer { manifest },
+				..
+			}
+			| D::CompletedWithTelemetry {
+				output: O::ShuffleProducer { manifest },
+				..
+			} => Some(manifest),
+			_ => None,
+		};
+		if let Some(manifest) = produced {
+			log.emit(
+				"manifest_received",
+				"dispatch",
+				serde_json::json!({
+					"task": task_fields(manifest.query_id, manifest.stage_id.get(), manifest.task_id.get(), manifest.attempt_id),
+					"exchange": manifest.exchange_id.get(),
+					"producer_worker": manifest.producer_worker_id.get().as_u128().to_string(),
+					"producer_endpoint": manifest.producer_endpoint.as_str(),
+					"partitions": manifest.partitions.iter().map(|entry| serde_json::json!({
+						"partition": entry.partition_id.get(),
+						"rows": entry.row_count.get(),
+						"bytes": entry.size_bytes.get(),
+						"digest": format!("{:?}", entry.digest),
+					})).collect::<Vec<_>>(),
+				}),
+			);
+		}
 		outcome
 	}
 
@@ -5689,6 +5737,12 @@ impl UdpRelay {
 	fn blackhole(&self) {
 		self.blackhole
 			.store(true, std::sync::atomic::Ordering::SeqCst);
+	}
+
+	/// ADR 628: end a blackout; datagrams are forwarded (subject to the loss draw) again.
+	fn restore(&self) {
+		self.blackhole
+			.store(false, std::sync::atomic::Ordering::SeqCst);
 	}
 
 	/// Stops the relay and waits until every task it owns has ended; returns the realized counts.
@@ -7213,4 +7267,555 @@ async fn mid_task_loss_is_observed_on_loopback() {
 		}
 	})
 	.await;
+}
+
+// ---- ADR 628 Stage A: lease fault controls on loopback (current behaviour; no mechanism change) ----
+
+/// The frozen post-terminal window in which every worker's served-stream log is kept open, so any
+/// `CancelTask` / `RetireQuery` fanout that follows the terminal return is captured.
+const ADR628_POST_TERMINAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+/// ADR 628: workers stay up this long after an absence window ends, so every managed worker's log
+/// records a reaper pass past it (the reader withholds absence otherwise).
+const ADR628_COVERAGE_TAIL: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// One declared lease fault control. `delays` act on the coordinator's dials to the target (synthetic
+/// caller delays); `route` puts a relay on the coordinator's route to the target only (the target
+/// still advertises its direct endpoint, so peer pulls bypass the relay).
+struct Adr628Control {
+	name: &'static str,
+	delays: lease_faults::PhaseDelays,
+	route: Option<Adr628Route>,
+	kill_target: bool,
+}
+
+struct Adr628Route {
+	delay: std::time::Duration,
+	loss_per_mille: u64,
+	seed: u64,
+	/// A blackout starting when the coordinator reads the target's first sealed producer manifest
+	/// (decoded from a whole `TaskComplete` frame, on the owner's clock), lasting `Some(d)` or
+	/// permanently.
+	blackout: Option<Option<std::time::Duration>>,
+}
+
+fn adr628_control(name: &str) -> Adr628Control {
+	use lease_faults::PhaseDelays;
+	use std::time::Duration;
+	let ms = Duration::from_millis;
+	let delays = |connect, write, read, close| PhaseDelays {
+		connect: ms(connect),
+		write: ms(write),
+		read: ms(read),
+		close: ms(close),
+	};
+	let route = |delay, loss_per_mille, blackout| {
+		Some(Adr628Route {
+			delay: ms(delay),
+			loss_per_mille,
+			seed: 628,
+			blackout,
+		})
+	};
+	let (name, delays, route, kill_target): (&'static str, _, _, _) = match name {
+		"none" => ("none", PhaseDelays::default(), None, false),
+		"connect_150" => ("connect_150", delays(150, 0, 0, 0), None, false),
+		"connect_50" => ("connect_50", delays(50, 0, 0, 0), None, false),
+		"write_150" => ("write_150", delays(0, 150, 0, 0), None, false),
+		"read_150" => ("read_150", delays(0, 0, 150, 0), None, false),
+		"close_150" => ("close_150", delays(0, 0, 0, 150), None, false),
+		// Inside-bound twins of the operation-phase delays.
+		"write_50" => ("write_50", delays(0, 50, 0, 0), None, false),
+		"read_50" => ("read_50", delays(0, 0, 50, 0), None, false),
+		"close_50" => ("close_50", delays(0, 0, 0, 50), None, false),
+		"route_none" => (
+			"route_none",
+			PhaseDelays::default(),
+			route(0, 0, None),
+			false,
+		),
+		"route_delay_40" => (
+			"route_delay_40",
+			PhaseDelays::default(),
+			route(40, 0, None),
+			false,
+		),
+		"route_loss_100" => (
+			"route_loss_100",
+			PhaseDelays::default(),
+			route(0, 100, None),
+			false,
+		),
+		"route_blackout_8s" => (
+			"route_blackout_8s",
+			PhaseDelays::default(),
+			route(0, 0, Some(Some(Duration::from_secs(8)))),
+			false,
+		),
+		"route_unreachable" => (
+			"route_unreachable",
+			PhaseDelays::default(),
+			route(0, 0, Some(None)),
+			false,
+		),
+		"census_worker_kill" => ("census_worker_kill", PhaseDelays::default(), None, true),
+		other => panic!("unknown ADR 628 control {other}"),
+	};
+	Adr628Control {
+		name,
+		delays,
+		route,
+		kill_target,
+	}
+}
+
+/// A declared lease fault control on loopback: three recorded fixture workers, the production
+/// coordinator path, `long_join_last` (its 30 s producer scan spans several renewal ticks), the target
+/// being the first registry entry. Evidence and every log go to `TORON_ADR628_DIR`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ADR 628 Stage A control: run explicitly with TORON_ADR628_DIR and TORON_ADR628_CONTROL"]
+async fn lease_fault_control_on_loopback() {
+	let dir =
+		std::path::PathBuf::from(std::env::var("TORON_ADR628_DIR").expect("TORON_ADR628_DIR"));
+	std::fs::create_dir(&dir).expect("a fresh control directory");
+	let control =
+		adr628_control(&std::env::var("TORON_ADR628_CONTROL").expect("TORON_ADR628_CONTROL"));
+	with_quic(async {
+		// ADR 628: lifecycle controls need the managed store and its reaper on every worker.
+		let mut workers = Vec::new();
+		for id in 62_801..=62_803u128 {
+			workers.push(
+				MANAGED_LIFECYCLE
+					.scope(
+						(),
+						FixtureWorkerProcess::spawn_recorded(
+							WorkerId::from_u128(id),
+							Some(&dir.join(format!("dials-{id}.txt"))),
+							Some(&dir.join(format!("worker-{id}.jsonl"))),
+						),
+					)
+					.await,
+			);
+		}
+		let log = wait_events::EventLog::create(&dir.join("probe_events.jsonl")).expect("fresh probe events");
+		let observed: Arc<dyn ToronTransport> = Arc::new(wait_events::ObservedTransport {
+			inner: process_transport(),
+			log: log.clone(),
+			role: "dispatch",
+		});
+		let target = workers[0].worker_id;
+		let transport: Arc<dyn ToronTransport> =
+			Arc::new(lease_faults::PhaseDelayTransport::new(observed, target, control.delays, log.clone()));
+		// The coordinator's route to the target, through a relay when the control declares one.
+		let relay = match &control.route {
+			Some(route) => {
+				let direct: std::net::SocketAddr = workers[0].endpoint.as_str().parse().expect("loopback endpoint");
+				Some(UdpRelay::start(direct, route.delay, route.loss_per_mille, route.seed).await)
+			}
+			None => None,
+		};
+		let mut declared = workers
+			.iter()
+			.map(|worker| (worker.worker_id, worker.endpoint.clone()))
+			.collect::<Vec<_>>();
+		if let Some(relay) = &relay {
+			declared[0].1 = WorkerEndpoint::new(relay.addr.to_string());
+		}
+		let blackout = control.route.as_ref().and_then(|route| route.blackout);
+		let relay_ref = relay.as_ref();
+		// Installed before dispatch, so the trigger event cannot be missed.
+		let mut trigger_events = log.subscribe();
+		let target_text = target.get().as_u128().to_string();
+		let schedule = async {
+			let Some(lasting) = blackout else { return serde_json::json!(null) };
+			let relay = relay_ref.expect("a blackout needs a relay");
+			// Trigger: the coordinator reads the target's first sealed producer manifest, positively
+			// decoded from a whole `TaskComplete` frame (`task_complete_manifest_read`).
+			let trigger = loop {
+				let Some(event) = trigger_events.recv().await else {
+					return serde_json::json!({ "outcome": "event log closed before the trigger" });
+				};
+				if event["event"] == "observation_end" {
+					return serde_json::json!({ "outcome": "the query ended before the trigger; no blackout applied" });
+				}
+				if event["event"] == "task_complete_manifest_read"
+					&& event["producer_worker"] == target_text.as_str()
+				{
+					break event;
+				}
+			};
+			relay.blackhole();
+			let started = log.now_us();
+			log.emit_at(started, "fault_blackout_start", "dispatch", serde_json::json!({ "trigger_task": trigger["task"].clone(), "trigger_exchange": trigger["exchange"].clone(), "trigger_stream": trigger["stream"].clone() }));
+			if let Some(lasting) = lasting {
+				tokio::time::sleep(lasting).await;
+				relay.restore();
+				log.emit("fault_blackout_end", "dispatch", serde_json::json!({ "configured_ms": lasting.as_millis() as u64 }));
+			}
+			serde_json::json!({
+				"trigger": "the coordinator read the target's first sealed producer manifest",
+				"trigger_task": trigger["task"].clone(),
+				"trigger_exchange": trigger["exchange"].clone(),
+				"trigger_stream": trigger["stream"].clone(),
+				"started_us": started,
+				"configured_lasting_ms": lasting.map(|d| d.as_millis() as u64),
+			})
+		};
+		let pid = workers[0].child.id().expect("target pid");
+		// Census worker kill: the SIGKILL fires 3 s after the target's stage-0 `StartTask` is written
+		// (ADR 627's trigger), usually after the fast producer's output, while the target stays in the
+		// lease census. It measures losing a census worker; it is NOT a mid-scan loss, and its
+		// mid-scan binding is recorded as missed coverage.
+		let fault = control.kill_target.then(|| Adr627Fault {
+			target,
+			victim_stage: 0,
+			fault: "kill",
+			signal: Box::new(move || {
+				Box::pin(async move {
+					let status = Command::new("kill").arg("-KILL").arg(pid.to_string()).status().await;
+					tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+					let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|stat| {
+						stat.rsplit_once(") ").and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
+					});
+					serde_json::json!({
+						"pid": pid,
+						"kill_status": status.map(|status| status.code()).map_err(|error| error.to_string()),
+						"proc_state": state,
+						"confirmed": state.is_none() || state.as_deref() == Some("Z"),
+					})
+				})
+			}),
+		});
+		let run = adr627_run(
+			Adr627Path::Coordinator,
+			"long_join_last",
+			&declared,
+			transport,
+			log.clone(),
+			None,
+			fault,
+			std::time::Duration::from_secs(120),
+		);
+		let (mut evidence, blackout_record) = tokio::join!(run, schedule);
+		// The frozen post-terminal window: workers stay up so any fanout lands in their logs.
+		log.emit("post_terminal_window_start", "dispatch", serde_json::json!({ "window_ms": ADR628_POST_TERMINAL_WINDOW.as_millis() as u64 }));
+		tokio::time::sleep(ADR628_POST_TERMINAL_WINDOW).await;
+		log.emit("post_terminal_window_end", "dispatch", serde_json::json!({}));
+		// The coverage tail: each managed worker records at least one reaper pass after the window end.
+		tokio::time::sleep(ADR628_COVERAGE_TAIL).await;
+		evidence["adr628"] = serde_json::json!({
+			"control": control.name,
+			"delays": control.delays.evidence(),
+			"route": control.route.as_ref().map(|route| serde_json::json!({
+				"delay_ms_each_way": route.delay.as_millis() as u64,
+				"loss_per_mille": route.loss_per_mille,
+				"seed": route.seed,
+			})),
+			"blackout": blackout_record,
+			"target": target.get().as_u128().to_string(),
+			"target_direct_endpoint": workers[0].endpoint.as_str(),
+			"coordinator_endpoint_for_target": declared[0].1.as_str(),
+			"post_terminal_window_ms": ADR628_POST_TERMINAL_WINDOW.as_millis() as u64,
+		});
+		if let Some(relay) = relay {
+			evidence["adr628"]["relay_realized"] = relay.shutdown().await;
+		}
+		use std::io::Write as _;
+		std::fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(dir.join("control.json"))
+			.expect("fresh control evidence")
+			.write_all(serde_json::to_string_pretty(&evidence).expect("json").as_bytes())
+			.expect("write control evidence");
+		for worker in &mut workers {
+			worker.shutdown().await;
+		}
+	})
+	.await;
+}
+
+/// ADR 628 Stage A (owner disappearance, primary): the owner is a child process on the production
+/// coordinator path (`DistributedQueryCoordinator::execute_query`: admission, active query, periodic
+/// renewal), running `long_join_last`. It is SIGKILLed once the fast producer's sealed manifest is
+/// observed at the production boundary: decoded from the `TaskComplete` frame the coordinator read
+/// (`task_complete_manifest_read`). See `owner_disappearance_control`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ADR 628 Stage A control: run explicitly with TORON_ADR628_DIR"]
+async fn owner_disappearance_on_coordinator_path() {
+	owner_disappearance_control("coordinator", "task_complete_manifest_read", 62_811).await;
+}
+
+/// ADR 628 Stage A (scheduler owner disappearance, secondary): the same control with the owner on
+/// the scheduler path (per-dispatch lease issuance, no renewals), bound by the scheduler probe's
+/// `manifest_received`. It is not the production-coordinator case and is reported separately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ADR 628 Stage A control: run explicitly with TORON_ADR628_DIR"]
+async fn scheduler_owner_disappearance_on_loopback() {
+	owner_disappearance_control("scheduler", "manifest_received", 62_821).await;
+}
+
+/// The owner (a child test process on `path`) is SIGKILLed after the first sealed producer manifest
+/// (`bind_event`); the managed workers stay alive. On the producer worker's own clock the control
+/// then waits conservatively: the last `lease_apply_end` for the bound query + the term (any later
+/// application refreshes it), then the first completed reaper pass after that. The last `QueryLease`
+/// read + term is recorded only as a candidate lower bound. It issues ONLY `PullPartition` for the
+/// exact received address and records the typed result as observed. Every outcome is recorded;
+/// nothing here forces race (a), which the deterministic store pin covers separately.
+async fn owner_disappearance_control(
+	path: &'static str,
+	bind_event: &'static str,
+	first_worker: u128,
+) {
+	let dir =
+		std::path::PathBuf::from(std::env::var("TORON_ADR628_DIR").expect("TORON_ADR628_DIR"));
+	std::fs::create_dir(&dir).expect("a fresh control directory");
+	let term_us = u64::try_from(
+		toron::distributed::namespace_lifecycle::ShuffleLifecycleConfig::from_worker_loss_window(
+			toron::distributed::partition_store::DEFAULT_WORKER_LOST_AFTER,
+		)
+		.expect("config")
+		.lease_term()
+		.as_micros(),
+	)
+	.expect("term");
+	let harness_limit = std::time::Duration::from_secs(90);
+	with_quic(async {
+		let mut workers = Vec::new();
+		for id in first_worker..=first_worker + 2 {
+			workers.push(
+				MANAGED_LIFECYCLE
+					.scope(
+						(),
+						FixtureWorkerProcess::spawn_recorded(
+							WorkerId::from_u128(id),
+							Some(&dir.join(format!("dials-{id}.txt"))),
+							Some(&dir.join(format!("worker-{id}.jsonl"))),
+						),
+					)
+					.await,
+			);
+		}
+		let owner_dir = dir.join("owner");
+		let spec = serde_json::json!({
+			"workers": workers.iter().map(|w| serde_json::json!({ "worker_u128": w.worker_id.get().as_u128().to_string(), "endpoint": w.endpoint.as_str() })).collect::<Vec<_>>(),
+			"loopback": true,
+			"cluster_domain": "loopback",
+			"deadline_secs": 120,
+			"wait_events": true,
+			"path": path,
+			"case": "long_join_last",
+			"fault": "none",
+			"attempt_dir": owner_dir.display().to_string(),
+		});
+		std::fs::create_dir(&owner_dir).expect("owner dir");
+		let spec_path = dir.join("owner.spec.json");
+		std::fs::write(&spec_path, serde_json::to_string_pretty(&spec).expect("spec")).expect("write spec");
+		let mut evidence = serde_json::json!({
+			"mode": if path == "coordinator" { "owner_disappearance" } else { "scheduler_owner_disappearance" },
+			"bind_event": bind_event,
+			"spec": spec,
+			"term_us": term_us,
+		});
+		// The harness's own raw log: owner lifecycle, the wait it chose, the observed inspection
+		// exchange, and the absence window. `owner.json` is a summary; the reader recomputes it.
+		let harness = wait_events::EventLog::create(&dir.join("harness_events.jsonl")).expect("fresh harness events");
+		let mut owner = Command::new(std::env::current_exe().expect("test executable"))
+			.args(["--ignored", "--exact", "multinode_probe_mid_task", "--nocapture"])
+			.env("TORON_MULTINODE_SPEC", &spec_path)
+			.stdout(std::fs::File::create(dir.join("owner.stdout")).expect("owner stdout"))
+			.stderr(std::fs::File::create(dir.join("owner.stderr")).expect("owner stderr"))
+			.kill_on_drop(true)
+			.spawn()
+			.expect("spawn the owner");
+		let owner_pid = owner.id().expect("owner pid");
+		harness.emit("owner_spawned", "harness", serde_json::json!({ "pid": owner_pid }));
+		let read_log = |path: &std::path::Path| -> Vec<serde_json::Value> {
+			std::fs::read_to_string(path)
+				.unwrap_or_default()
+				.lines()
+				.filter_map(|line| serde_json::from_str(line).ok())
+				.collect()
+		};
+		let finish = |evidence: &mut serde_json::Value, outcome: &str| {
+			evidence["outcome"] = outcome.into();
+			harness.emit("owner_control_end", "harness", serde_json::json!({ "outcome": outcome }));
+		};
+		// 1. Bind the fast producer's exact received manifest before the kill.
+		let started = std::time::Instant::now();
+		let manifest = loop {
+			let events = read_log(&owner_dir.join("probe_events.jsonl"));
+			if let Some(manifest) = events.into_iter().find(|e| e["event"] == bind_event) {
+				break Some(manifest);
+			}
+			if started.elapsed() > std::time::Duration::from_secs(30) {
+				break None;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		};
+		// 2. SIGKILL the owner and confirm, from its reaped exit status, that signal 9 ended it.
+		let kill_owner = async |owner: &mut tokio::process::Child| {
+			use std::os::unix::process::ExitStatusExt as _;
+			harness.emit("owner_kill_sent", "harness", serde_json::json!({ "pid": owner_pid }));
+			let kill_status = Command::new("kill").arg("-KILL").arg(owner_pid.to_string()).status().await;
+			let reaped = tokio::time::timeout(std::time::Duration::from_secs(10), owner.wait()).await;
+			let (signal, code, error) = match &reaped {
+				Ok(Ok(status)) => (status.signal(), status.code(), None),
+				Ok(Err(error)) => (None, None, Some(error.to_string())),
+				Err(_) => (None, None, Some("not reaped within 10 s".to_string())),
+			};
+			harness.emit(
+				"owner_reaped",
+				"harness",
+				serde_json::json!({
+					"pid": owner_pid,
+					"kill_status": kill_status.as_ref().ok().and_then(|status| status.code()),
+					"signal": signal,
+					"code": code,
+					"error": error,
+				}),
+			);
+			signal == Some(9)
+		};
+		let Some(manifest) = manifest else {
+			kill_owner(&mut owner).await;
+			finish(&mut evidence, "no manifest bound within the harness limit; the owner was killed only for cleanup");
+			write_owner_evidence(&dir, &evidence);
+			for worker in &mut workers {
+				worker.shutdown().await;
+			}
+			return;
+		};
+		harness.emit("owner_bound", "harness", serde_json::json!({ "bind_event": bind_event, "manifest": manifest.clone() }));
+		evidence["bound_manifest"] = manifest.clone();
+		if !kill_owner(&mut owner).await {
+			finish(&mut evidence, "owner kill unconfirmed: owner-loss coverage unavailable");
+			write_owner_evidence(&dir, &evidence);
+			for worker in &mut workers {
+				worker.shutdown().await;
+			}
+			return;
+		}
+		// 3. On the producer worker's own clock: the conservative wait from the last completed lease
+		//    application call for the bound query (every call closed; refreshed by any later call),
+		//    and the first completed reaper pass after it.
+		let producer = manifest["producer_worker"].as_str().expect("producer worker").to_string();
+		let producer_log = dir.join(format!("worker-{producer}.jsonl"));
+		let query = manifest["task"]["query"].as_str().expect("query").to_string();
+		let waited = std::time::Instant::now();
+		let observed = loop {
+			let events = read_log(&producer_log);
+			let calls = |name: &str| {
+				events
+					.iter()
+					.filter(|e| e["event"] == name && e["query"].as_str() == Some(query.as_str()))
+					.filter_map(|e| e["call"].as_u64())
+					.collect::<HashSet<_>>()
+			};
+			let closed = calls("lease_apply_start") == calls("lease_apply_end");
+			let last_apply_end = events
+				.iter()
+				.filter(|e| e["event"] == "lease_apply_end" && e["query"].as_str() == Some(query.as_str()))
+				.filter_map(|e| e["at_us"].as_u64())
+				.max();
+			let pass_after = last_apply_end.filter(|_| closed).and_then(|end| {
+				events
+					.iter()
+					.find(|e| e["event"] == "reaper_pass_end" && e["at_us"].as_u64().is_some_and(|at| at > end + term_us))
+					.cloned()
+			});
+			if let (Some(end), Some(pass)) = (last_apply_end, pass_after) {
+				break Some((end, pass));
+			}
+			if waited.elapsed() > harness_limit {
+				break None;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+		};
+		let Some((end, pass)) = observed else {
+			harness.emit("owner_wait_unavailable", "harness", serde_json::json!({ "producer_worker": producer }));
+			evidence["worker_clock"] = serde_json::json!({ "producer_worker": producer });
+			finish(&mut evidence, "no completed reaper pass after the conservative wait within the harness limit");
+			write_owner_evidence(&dir, &evidence);
+			for worker in &mut workers {
+				worker.shutdown().await;
+			}
+			return;
+		};
+		harness.emit(
+			"owner_wait_satisfied",
+			"harness",
+			serde_json::json!({
+				"producer_worker": producer,
+				"last_lease_apply_end_us": end,
+				"conservative_wait_until_us": end + term_us,
+				"pass": pass["pass"].clone(),
+				"pass_end_us": pass["at_us"].clone(),
+			}),
+		);
+		evidence["worker_clock"] = serde_json::json!({
+			"producer_worker": producer,
+			"last_lease_apply_end_us": end,
+			"conservative_wait_until_us": end + term_us,
+			"first_completed_pass_after_wait": pass,
+		});
+		// 4. Inspection: PullPartition ONLY, for the exact received address, on an observed stream:
+		//    the request and the typed reply are raw events in the harness log.
+		let entry = &manifest["partitions"][0];
+		let address = toron::distributed::task::PartitionAddress {
+			query_id: QueryId::from_uuid(uuid::Uuid::parse_str(&query).expect("query uuid")),
+			exchange_id: toron::distributed::identity::ExchangeId::new(
+				u32::try_from(manifest["exchange"].as_u64().expect("exchange")).expect("exchange"),
+			),
+			producer_stage_id: toron::distributed::identity::StageId::new(u32::try_from(manifest["task"]["stage"].as_u64().expect("stage")).expect("stage")),
+			producer_task_id: toron::distributed::identity::TaskId::new(u32::try_from(manifest["task"]["task"].as_u64().expect("task")).expect("task")),
+			attempt_id: AttemptId::new(u32::try_from(manifest["task"]["attempt"].as_u64().expect("attempt")).expect("attempt")),
+			partition_id: toron::distributed::identity::PartitionId::new(
+				u32::try_from(entry["partition"].as_u64().expect("partition")).expect("partition"),
+			),
+		};
+		let endpoint = manifest["producer_endpoint"].as_str().expect("endpoint").to_string();
+		let inspector = wait_events::ObservedTransport {
+			inner: process_transport(),
+			log: harness.clone(),
+			role: "inspection",
+		};
+		harness.emit("inspection_start", "harness", serde_json::json!({ "producer_worker": producer, "endpoint": endpoint }));
+		let inspection = match inspector.connect(&endpoint).await {
+			Ok(stream) => match toron::server::ToronCoordinator::new(Arc::new(MemoryManager::new(4, 1024 * 1024)))
+				.pull_partition_from_worker(stream, address, address.attempt_id)
+				.await
+			{
+				Ok(payload) => serde_json::json!({ "result": "partition data", "bytes": payload.payload.0.len() }),
+				Err(error) => serde_json::json!({ "result": "error", "error": format!("{error:?}") }),
+			},
+			Err(error) => serde_json::json!({ "result": "connect failed", "error": format!("{error:?}") }),
+		};
+		harness.emit("inspection_returned", "harness", inspection.clone());
+		evidence["inspection"] = inspection;
+		// The recorded window for absence claims ends here; every worker stays up through the
+		// coverage tail, so each managed worker records a reaper pass after it.
+		harness.emit("absence_window_end", "harness", serde_json::json!({}));
+		tokio::time::sleep(ADR628_COVERAGE_TAIL).await;
+		finish(&mut evidence, "inspected");
+		write_owner_evidence(&dir, &evidence);
+		for worker in &mut workers {
+			worker.shutdown().await;
+		}
+	})
+	.await;
+}
+
+fn write_owner_evidence(dir: &std::path::Path, evidence: &serde_json::Value) {
+	use std::io::Write as _;
+	std::fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(dir.join("owner.json"))
+		.expect("fresh owner evidence")
+		.write_all(
+			serde_json::to_string_pretty(evidence)
+				.expect("json")
+				.as_bytes(),
+		)
+		.expect("write owner evidence");
 }

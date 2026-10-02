@@ -573,6 +573,140 @@ mod tests {
 		);
 	}
 
+	// ---- ADR 628 Stage A: current-behaviour pins (diagnostic assertions, not invariants) ----
+	// The test config's lease term is 16 s. Every instant is explicit, so each schedule is exact.
+
+	/// Deadline expiry alone is not terminal: a renewal that arrives after the deadline but before
+	/// retirement begins extends the lease again.
+	#[test]
+	fn adr628_renewal_of_an_expired_lease_before_retirement_extends_it() {
+		let lifecycle = ShuffleNamespaceLifecycle::managed(config(2, Duration::from_secs(10)));
+		let t0 = Instant::now();
+		let query_id = QueryId::from_u128(20);
+		lifecycle.issue_or_renew(query_id, t0);
+		let late = t0 + Duration::from_secs(17);
+		assert!(!lifecycle.has_live_lease(query_id, late));
+		lifecycle.issue_or_renew(query_id, late);
+		assert_eq!(lifecycle.authorize_write(query_id, late), Ok(()));
+	}
+
+	/// Race candidate (a): an expired write removes the lease, so the reaper no longer finds the
+	/// query. No retirement starts, no receipt is written, and a later lease reopens writes.
+	#[test]
+	fn adr628_expired_write_then_reaper_starts_no_retirement() {
+		let lifecycle = ShuffleNamespaceLifecycle::managed(config(2, Duration::from_secs(10)));
+		let t0 = Instant::now();
+		let query_id = QueryId::from_u128(21);
+		lifecycle.issue_or_renew(query_id, t0);
+		lifecycle.mark_namespace_present(query_id);
+		let expired = t0 + Duration::from_secs(17);
+		assert_eq!(
+			lifecycle.authorize_write(query_id, expired),
+			Err(WriteLeaseError::Expired)
+		);
+		assert_eq!(lifecycle.expired_queries(expired), Vec::<QueryId>::new());
+		assert_eq!(lifecycle.retirement_cause(query_id), None);
+		let snapshot = lifecycle.snapshot(expired);
+		assert_eq!((snapshot.active_leases, snapshot.receipts), (0, 0));
+		lifecycle.issue_or_renew(query_id, expired + Duration::from_millis(1));
+		assert_eq!(
+			lifecycle.authorize_write(query_id, expired + Duration::from_millis(1)),
+			Ok(()),
+			"current behaviour: the namespace's query id can be leased again"
+		);
+	}
+
+	/// Race candidate (b), lifecycle interleaving only: the reaper enumerates and removes an expired
+	/// lease, a renewal is applied before retirement begins (writes are authorized), then retirement
+	/// reclaims the namespace as abandoned. An applied renewal alone does not prevent an already
+	/// selected abandonment reclamation (apply-before-retire). The server's ACK is not exercised here.
+	#[test]
+	fn adr628_renewal_between_reaper_enumeration_and_retirement_is_applied_then_reclaimed() {
+		let lifecycle = ShuffleNamespaceLifecycle::managed(config(2, Duration::from_secs(10)));
+		let t0 = Instant::now();
+		let query_id = QueryId::from_u128(22);
+		lifecycle.issue_or_renew(query_id, t0);
+		lifecycle.mark_namespace_present(query_id);
+		let reap = t0 + Duration::from_secs(17);
+		assert_eq!(lifecycle.expired_queries(reap), vec![query_id]);
+		lifecycle.issue_or_renew(query_id, reap);
+		assert_eq!(
+			lifecycle.authorize_write(query_id, reap),
+			Ok(()),
+			"the renewal is applied: retirement has not begun"
+		);
+		lifecycle.begin_retirement(query_id, QueryTerminalCause::Abandoned);
+		assert_eq!(
+			lifecycle.authorize_write(query_id, reap),
+			Err(WriteLeaseError::Missing)
+		);
+		lifecycle.finish_removal(query_id, reap);
+		assert_eq!(
+			lifecycle.missing_reason(query_id, reap),
+			PartitionMissingReason::Abandoned
+		);
+	}
+
+	/// Race candidate (c), capacity: once a receipt is evicted, the retired query id can be leased
+	/// and written again.
+	#[test]
+	fn adr628_retired_query_can_be_leased_again_after_capacity_eviction() {
+		let lifecycle = ShuffleNamespaceLifecycle::managed(config(1, Duration::from_secs(600)));
+		let now = Instant::now();
+		let (old, newer) = (QueryId::from_u128(23), QueryId::from_u128(24));
+		for query_id in [old, newer] {
+			lifecycle.issue_or_renew(query_id, now);
+			lifecycle.mark_namespace_present(query_id);
+			lifecycle.begin_retirement(query_id, QueryTerminalCause::Success);
+			lifecycle.finish_removal(query_id, now);
+		}
+		assert_eq!(lifecycle.snapshot(now).receipts, 1);
+		lifecycle.issue_or_renew(old, now);
+		assert_eq!(lifecycle.authorize_write(old, now), Ok(()));
+		lifecycle.issue_or_renew(newer, now);
+		assert_eq!(
+			lifecycle.authorize_write(newer, now),
+			Err(WriteLeaseError::Missing),
+			"the held receipt still guards"
+		);
+	}
+
+	/// Race candidate (c), horizon: past the receipt horizon, the retired query id can be leased
+	/// and written again.
+	#[test]
+	fn adr628_retired_query_can_be_leased_again_after_the_receipt_horizon() {
+		let lifecycle = ShuffleNamespaceLifecycle::managed(config(4, Duration::from_secs(10)));
+		let t0 = Instant::now();
+		let query_id = QueryId::from_u128(25);
+		lifecycle.issue_or_renew(query_id, t0);
+		lifecycle.mark_namespace_present(query_id);
+		lifecycle.begin_retirement(query_id, QueryTerminalCause::Success);
+		lifecycle.finish_removal(query_id, t0);
+		lifecycle.issue_or_renew(query_id, t0 + Duration::from_secs(9));
+		assert_eq!(
+			lifecycle.authorize_write(query_id, t0 + Duration::from_secs(9)),
+			Err(WriteLeaseError::Missing)
+		);
+		let past = t0 + Duration::from_secs(11);
+		lifecycle.issue_or_renew(query_id, past);
+		assert_eq!(lifecycle.authorize_write(query_id, past), Ok(()));
+	}
+
+	/// Race candidate (c), no receipt: a retirement with no namespace licenses no receipt, so the
+	/// same query id can be leased and written again at once.
+	#[test]
+	fn adr628_retirement_without_a_namespace_leaves_the_id_leasable() {
+		let lifecycle = ShuffleNamespaceLifecycle::managed(config(4, Duration::from_secs(600)));
+		let now = Instant::now();
+		let query_id = QueryId::from_u128(26);
+		lifecycle.issue_or_renew(query_id, now);
+		lifecycle.begin_retirement(query_id, QueryTerminalCause::Failed);
+		lifecycle.finish_removal(query_id, now);
+		assert_eq!(lifecycle.snapshot(now).receipts, 0);
+		lifecycle.issue_or_renew(query_id, now);
+		assert_eq!(lifecycle.authorize_write(query_id, now), Ok(()));
+	}
+
 	#[test]
 	fn namespace_commit_racing_retirement_preserves_receipt_evidence() {
 		let lifecycle = ShuffleNamespaceLifecycle::managed(config(2, Duration::from_secs(10)));

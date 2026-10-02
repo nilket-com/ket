@@ -36,6 +36,8 @@ tokio::task_local! {
 const LONG_GAP_US: u64 = 1_000_000;
 /// Bytes of each frame kept for decoding its envelope prefix.
 const PREFIX_BYTES: usize = 512;
+/// ADR 628: frames up to this size are kept whole, so a `TaskComplete` can be decoded passively.
+const WHOLE_FRAME_BYTES: u64 = 256 * 1024;
 
 pub struct EventLog {
 	file: Mutex<std::fs::File>,
@@ -168,6 +170,94 @@ fn identity_json(identity: &EnvelopeIdentity) -> serde_json::Value {
 		}
 		EnvelopeIdentity::Query(query) => serde_json::json!({ "query": query.get().to_string() }),
 	}
+}
+
+fn address_json(address: &toron::distributed::task::PartitionAddress) -> serde_json::Value {
+	serde_json::json!({
+		"query": address.query_id.get().to_string(),
+		"exchange": address.exchange_id.get(),
+		"stage": address.producer_stage_id.get(),
+		"task": address.producer_task_id.get(),
+		"attempt": address.attempt_id.get(),
+		"partition": address.partition_id.get(),
+	})
+}
+
+/// ADR 628: the typed content of a whole frame (up to `WHOLE_FRAME_BYTES`), decoded passively:
+/// a sealed producer's `TaskComplete` manifest, a `PullPartition` request, or its `PartitionMissing`
+/// (typed reason) / `PartitionData` reply. `None` for any other kind, a truncated or larger frame, or
+/// a payload that does not decode.
+fn whole_frame_event(whole: &[u8], len: u64) -> Option<(&'static str, serde_json::Value)> {
+	if len > WHOLE_FRAME_BYTES || whole.len() as u64 != len {
+		return None;
+	}
+	let envelope = toron::wire::WireEnvelope::decode(whole).ok()?;
+	match envelope.kind {
+		MessageKind::TaskComplete => {
+			task_complete_manifest(&envelope.payload).map(|m| ("task_complete_manifest", m))
+		}
+		MessageKind::PullPartition => {
+			let p: toron::wire::PullPartitionPayload =
+				toron::wire::decode_payload(&envelope.payload).ok()?;
+			Some((
+				"pull_partition_request",
+				serde_json::json!({
+					"address": address_json(&p.address),
+					"expected_attempt": p.expected_attempt.get(),
+				}),
+			))
+		}
+		MessageKind::PartitionMissing => {
+			let p: toron::wire::PartitionMissingPayload =
+				toron::wire::decode_payload(&envelope.payload).ok()?;
+			Some((
+				"partition_missing_reply",
+				serde_json::json!({
+					"address": address_json(&p.address),
+					"reason": format!("{:?}", p.reason),
+				}),
+			))
+		}
+		MessageKind::PartitionData => {
+			let p: toron::wire::PartitionDataPayload =
+				toron::wire::decode_payload(&envelope.payload).ok()?;
+			Some((
+				"partition_data_reply",
+				serde_json::json!({
+					"address": address_json(&p.address),
+					"bytes": p.payload.0.len(),
+				}),
+			))
+		}
+		_ => None,
+	}
+}
+
+/// The producer manifest a `TaskComplete` payload carries, or `None` (not a sealed producer).
+fn task_complete_manifest(payload: &[u8]) -> Option<serde_json::Value> {
+	let payload: toron::wire::TaskCompletePayload = toron::wire::decode_payload(payload).ok()?;
+	let toron::distributed::task::TaskCompletionOutput::ShuffleProducer { manifest } =
+		payload.output
+	else {
+		return None;
+	};
+	Some(serde_json::json!({
+		"task": {
+			"query": manifest.query_id.get().to_string(),
+			"stage": manifest.stage_id.get(),
+			"task": manifest.task_id.get(),
+			"attempt": manifest.attempt_id.get(),
+		},
+		"exchange": manifest.exchange_id.get(),
+		"producer_worker": manifest.producer_worker_id.get().as_u128().to_string(),
+		"producer_endpoint": manifest.producer_endpoint.as_str(),
+		"partitions": manifest.partitions.iter().map(|entry| serde_json::json!({
+			"partition": entry.partition_id.get(),
+			"rows": entry.row_count.get(),
+			"bytes": entry.size_bytes.get(),
+			"digest": format!("{:?}", entry.digest),
+		})).collect::<Vec<_>>(),
+	}))
 }
 
 /// The decoded prefix as event fields, or `undecoded` with the reason.
@@ -308,6 +398,8 @@ struct Framing {
 	payload_done: u64,
 	prefix: Vec<u8>,
 	prefix_emitted: bool,
+	/// ADR 628: the whole payload of a small frame (up to `WHOLE_FRAME_BYTES`).
+	whole: Vec<u8>,
 	started_us: u64,
 	header_done_us: u64,
 	transfers: u64,
@@ -442,6 +534,7 @@ impl<S> ObservedStream<S> {
 							framing.payload_done = 0;
 							framing.prefix.clear();
 							framing.prefix_emitted = false;
+							framing.whole.clear();
 							framing.header_done_us = now;
 							events.push((
 								format!("frame_header_{direction}"),
@@ -454,6 +547,9 @@ impl<S> ObservedStream<S> {
 						let take = ((len - framing.payload_done).min(rest.len() as u64)) as usize;
 						let keep = PREFIX_BYTES.saturating_sub(framing.prefix.len()).min(take);
 						framing.prefix.extend_from_slice(&rest[..keep]);
+						if len <= WHOLE_FRAME_BYTES {
+							framing.whole.extend_from_slice(&rest[..take]);
+						}
 						framing.payload_done += take as u64;
 						rest = &rest[take..];
 						if !framing.prefix_emitted
@@ -473,6 +569,13 @@ impl<S> ObservedStream<S> {
 							let mut fields = prefix_json(&framing.prefix);
 							fields["frame"] = framing.frame.into();
 							events.push((format!("frame_envelope_{direction}"), fields));
+						}
+						// ADR 628: typed content decoded passively from a whole frame at the
+						// production observation boundary (a sealed producer's manifest; a
+						// partition pull and its typed reply).
+						if let Some((name, mut fields)) = whole_frame_event(&framing.whole, len) {
+							fields["frame"] = framing.frame.into();
+							events.push((format!("{name}_{direction}"), fields));
 						}
 						events.push((
 							format!("frame_payload_{direction}"),
