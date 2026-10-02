@@ -1086,3 +1086,56 @@ None of them may bridge a lapse or infer incarnation continuity from
   outcome plus `fail_query_lease` on the `ActiveQueryHandle`).
 - No change is cleared to the lease term, the 100 ms bounds, the
   receipt policy, running-task cancellation, or any B1 mechanism.
+
+### B0 implementation amendment (reviewed)
+
+Recorded before the B0 rerun. The implementation is
+`impl: adr 628 b0 lifecycle prerequisites`, tagged `adr628-b0-baseline`.
+It is source-equivalent to the laddered tree bc07aafd / a191cbd3
+(ladder-b0-3).
+
+**Deviation 1: no separate pending-cleanup queue.**
+- `cleanup_work` re-enumerates every `Retiring` entry on each reaper pass.
+  That is the guaranteed discoverability mechanism; the plan's queue was
+  only a fast path.
+- An expiry observed by a write or a renewal, and any interrupted or
+  partial pass, is therefore picked up again by the next pass.
+
+**Deviation 2: the unmanaged fixture substrate is a synthetic
+exception.**
+- `ShuffleNamespaceLifecycle::unmanaged_fixture` has no admission policy
+  by design. It keeps its pre-B0 lease bookkeeping and always answers
+  `Applied`.
+- That `Applied` can represent a no-op and is **not** evidence of managed
+  application.
+- B0's semantics govern every managed lifecycle. Production construction
+  stays guarded by
+  `adr543_production_worker_uses_managed_store_and_periodic_abandonment_reaper`.
+- It is pinned by `the_unmanaged_fixture_substrate_always_answers_applied`.
+
+**Labels of the evidence.**
+- `seeded_serial_sequences_keep_state_discoverable_and_writes_before_the_deadline`
+  is a serial randomized state-machine sequence (one thread, no
+  barriers). It is supplemental, not a concurrency test.
+- The real-clock lock tests
+  (`calls_waiting_for_the_lock_across_the_deadline_see_it_expired`,
+  `a_publisher_authorized_before_expiry_is_retired_and_licensed_after_it`)
+  rely on sleeps and scheduler timing. Nothing in them is a barrier that
+  establishes every thread's pre-deadline entry, so they are not
+  reproducible barrier-controlled interleavings.
+- The code's sampling order is explicit: production time is sampled after
+  acquiring the lifecycle mutex. The store test also establishes that
+  authorization preceded expiry, because the commit succeeds after it.
+
+**Reply and reader contract for the rerun.**
+- An `Ignored` reply ends reliance at the reply: the stream is dropped
+  without awaiting a close. `Applied` still requires the whole exchange.
+- The rerun declarations require decoded lease outcomes
+  (`lease_outcomes = "required"`).
+- Each outcome binds to exactly one `QueryLeaseAccepted` envelope with a
+  unique key on the same stream and frame. That envelope must answer an
+  actual `QueryLease` request for the same query, earlier on the same
+  dialled (probe) or accepted (worker) stream.
+- `Applied` must carry the declared term, on both sides. On each worker,
+  the outcomes it wrote reconcile with its own lease-application
+  outcomes.
