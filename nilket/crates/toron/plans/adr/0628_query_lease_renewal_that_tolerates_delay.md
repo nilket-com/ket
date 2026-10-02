@@ -1619,3 +1619,187 @@ after; the B1 evidence roots.
   embedded paths are a hypothesis.
 
 B1.C remains unselected.
+
+## B1.B results (reviewed)
+
+Accepted on review as the B1.B timing diagnosis. It is complete under an
+explicitly post-run amended accounting contract (below). Every figure was
+read from the B1 evidence. The source is unchanged from
+`adr628-b1b-baseline` (37a3044d); this record changes only this plan.
+
+### Frozen readout: REFUSED
+
+The frozen readout (`readout.out`, 22828414…) is **REFUSED**, with one
+reason: `survey-load-1: 70202: lease outcomes`.
+
+B0's worker reconciliation requires the multiset of lease applications to
+equal the multiset of written outcomes. Under load, the strix worker
+recorded 667 applications and 665 written outcomes.
+
+The two unwritten applications are load-query renewals, not survey samples:
+- call 191, stream 327, query `01a0fd87-9700-…`;
+- call 208, stream 356, query `01a0fd88-4ab2-…`.
+
+In each case:
+- the worker read the `QueryLease` and applied it (`Applied`);
+- the same stream then ended with `write_error` "connection lost", with
+  zero recorded outbound frames and bytes;
+- a `RetireQuery` for the same query followed on a new stream.
+
+Peer receipt and the cause of the connection loss are not established.
+
+The frozen result stands. Its reader, FREEZE and evidence are unchanged.
+
+### Post-run amended accounting contract (`b1b-reconcile-2`)
+
+This was authorized after the run, as an opt-in B1.B reader. B0's function
+and its records are unchanged.
+
+**Written outcomes** still consume applications, with B0's outcome
+normalization. Written without an application still refuses.
+
+**A failed reply** is the only exception. An application without a written
+outcome is accepted only if all of the following hold:
+- its outcome is exactly `Applied`;
+- it is bound to a served stream with exactly one `stream_accepted`, one
+  `QueryLease` envelope read, one payload read for that frame, and one
+  `stream_end`;
+- the order is accepted → envelope → payload → application start →
+  application end → stream end, by log position AND same-worker timestamps;
+- it is the only application inside payload-read → stream-end, and that
+  interval is the only one enclosing it;
+- the stream ended `write_error`, with `frames_written` and `bytes_written`
+  exact integer 0, no partial written frame, and nothing written on it.
+
+**Classification is all or nothing:**
+- every application is consumed once;
+- any candidate failing these checks refuses;
+- a truncated log refuses.
+
+**Classification:** exactly the two cases above, as "application Applied;
+no complete reply recorded; stream ended write_error (zero recorded
+outbound bytes/frames)". They are not deliveries, receipts, refreshes or
+completed exchanges. The other five worker logs reconcile exactly.
+
+**Tests:** 31, all passing.
+- Positives:
+  - the real strix sequences, as a verbatim excerpt that is regenerable
+    from the evidence;
+  - all six retained worker logs;
+  - a matched written `Ignored(Expired)`.
+- Negatives, each also checked through the frozen parser and the amended
+  driver substitution:
+  - counters: frames 1, bytes > 0, partial frame, boolean zero;
+  - stream end: `read_error`;
+  - written evidence: a written frame or outcome;
+  - request binding: wrong query, missing accepted, missing request or
+    payload;
+  - order: accepted or payload out of order;
+  - duplicates: duplicate accepted or payload;
+  - application pairs: missing or reversed;
+  - intervals: application outside the interval, two applications in one
+    interval, two intervals for one application;
+  - truncation;
+  - written without application;
+  - an `Ignored(Expired)` application.
+
+**Amended readout:** READ (36d1aa59…). The frozen REFUSED outcome is
+recorded at the top.
+
+### Survey exchanges
+
+- **Counts:** 810 exchanges per condition, 270 per worker.
+- **Outcomes:** all decoded `Applied` and refresh-accepted. There were no
+  failures, no censored samples and no refresh rejections.
+- **Per worker and condition:** 359 ticks, 0 skipped, 90 ids. 89 ids were
+  retired by age and 1 at survey end; all 90 retirements were "retire
+  acknowledged".
+- **Attempt limit:** age came before the attempt limit, so each id had one
+  issuance and two renewals. The limit of 4 was not exercised.
+- **Largest whole exchange:** idle 1008207 µs (an optiplex issuance); load
+  773868 µs (an optiplex issuance).
+
+Per-phase p50/p99/max (µs), for the remote workers:
+
+| Condition | Worker | Kind | connect | ack | whole |
+| --- | --- | --- | --- | --- | --- |
+| idle | strix | issuance | 158058/321412/321412 | 142584/315905/315905 | 302325/538738/538738 |
+| idle | strix | renewal | 154627/316724/339174 | 116107/381159/510010 | 312062/626002/750303 |
+| idle | optiplex | issuance | 156731/528052/528052 | 132776/480136/480136 | 293300/1008207/1008207 |
+| idle | optiplex | renewal | 163744/369836/435301 | 113415/410996/510637 | 288852/711639/751779 |
+| load (task activity) | strix | renewal | 126038/353886/366351 | 102544/281915/305021 | 238174/556541/576923 |
+| load (task activity) | optiplex | renewal | 132163/329984/366813 | 100674/310182/464283 | 250575/548331/559179 |
+
+- **Other phases:** write, validate and close stayed at or below 237 µs.
+- **Same-host worker** (bigfoot): whole p50 about 1.4–1.5 ms, max 2394 µs.
+- **Above 100 ms:** the remote workers' connect p50 and ack p50 were each
+  above 100 ms in both conditions.
+- **What these are:** extended-budget exchanges on the survey's own
+  connections. They are not the load query's connections and not
+  production per-phase caps. They select no deadline, reuse policy or retry
+  mechanism, and no causal explanation is drawn from them.
+
+### Load windows
+
+**Scope.** These are the declared back-to-back query-invocation windows.
+They are not completed long-query load and not a general reliability rate.
+
+- **All 330 windows returned an error** with `WorkerLost`: 176 named strix
+  (70202) and 154 named optiplex (70203).
+- **Terminal minus start** ranged from 5102006 µs to 10301264 µs (p50
+  5103486 µs).
+- **Completed-load coverage was therefore not obtained.** It remains a
+  finding and a limitation.
+- **Worker context** (separate clocks):
+  - strix served 330 load task streams, with 0 open at log end;
+  - optiplex served 330, with **5 open at log end** (possible orphans, not
+    proven running tasks).
+
+### Context
+
+- **Clock:** chrony tracking was unavailable on bigfoot and strix. On
+  optiplex it read 0.24–0.76 ms slow and 11.58 ppm slow. This is context,
+  not a ρ bound. The survey boundary is nominal (ρ = 0, no suspend, no
+  restart).
+- **Links:** before and after, 48 measurements each, all rc 0.
+- **Run:** both attempts report `ran`, cleanup ok and evidence complete.
+
+### Provenance
+
+- **Source:** `adr628-b1b-baseline` 37a3044d (tree 082baa30); plans
+  ed1742f0 and a4df3888. Source-equivalent to the laddered 242a94bf /
+  8827e5fc.
+- **Ladder-b1b-3:** toron 5649/0/19, toron-tpch 674/0/6, toron-client
+  22/0/0; fixture worker 416ad591…, probe 68e68b99….
+  - ladder-b1b-2 FAILED and is retained;
+  - ladder-b1b-1 SUPERSEDED.
+- **Evidence root:** `~/work/.agent-bridge/adr628-b1-evidence`.
+  - FREEZE 384a1c6e…;
+  - SHA256SUMS bc46daf1… (281 files).
+  - The links runner's root fix and the regenerated pre-notice FREEZE are
+    recorded in `PROVENANCE-freeze.md`.
+  - The remote roots are `~/work/toron-evidence/adr628-b1` on all three
+    hosts.
+- **Amendment bundles:**
+  - `amended-1` (`b1b-reconcile-1`; SHA256SUMS b56c9b89…, 87 files) is
+    SUPERSEDED. It was held for causal order and the `Applied`-only
+    restriction.
+  - `amended-2` (`b1b-reconcile-2`; SHA256SUMS 5421a4e7…, 87 files) is the
+    reviewed contract. It holds the reader, tests, fixture extractor,
+    generating command and readout 36d1aa59….
+  - Its readout differs from amended-1's only in the reader version,
+    the added payload-read instant and the provenance hashes of the
+    three changed reader files. My first statement of the differences
+    omitted those hashes; it was corrected in review.
+- **Diagnostic, not acceptance evidence:**
+  `DIAGNOSTIC-not-frozen-load-readout.json`.
+- **Test-suite gap:** the frozen reader copies lack the schedule files
+  that two older suites need. Those suites pass from the working
+  directory, and the frozen copies are not retrofitted.
+
+### Limits
+
+- No deadline, reuse policy, retry mechanism or causal explanation is
+  selected.
+- No production reliance change is made.
+- B1.C remains unselected, and ADR 628's delay tolerance is not delivered.
