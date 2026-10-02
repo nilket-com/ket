@@ -1803,3 +1803,244 @@ They are not completed long-query load and not a general reliability rate.
   selected.
 - No production reliance change is made.
 - B1.C remains unselected, and ADR 628's delay tolerance is not delivered.
+
+### Stage B scope amendment, part 3: B1.C, delay-tolerant renewal (reviewed)
+
+**Status:** B1.C is selected and scoped. Before any production merge or staging, the implementation,
+the final budgets and the host campaign each need their own source, instrument, reader and
+frozen-schedule review. The implementation package must show:
+- the actual gate sites;
+- the timer and clock-domain conversion, and how budget overruns are treated;
+- query-owner cleanup;
+- the typed first-issuance mappings;
+- negative cases for the acceptance reader.
+
+The lease budget is never put around task execution, and retirement fanout budgets are not
+changed.
+
+#### Baseline (production at 18d4f962; paths relative to `nilket/crates/toron/src/`)
+
+- **Term.** `L` = 30 s worker-loss window + 5 s cadence + 1 ms = 35.001 s
+  (`namespace_lifecycle.rs:24-37`).
+- **Periodic renewal** (`coordinator.rs:1845-1928`):
+  - `interval_at(now + 5 s, 5 s)` with tokio's default Burst;
+  - **sequential** over `remote_workers()`;
+  - a **fresh** QUIC connection per exchange;
+  - 100 ms to connect and 100 ms for the whole exchange (`coordinator.rs:62-63`);
+  - the first failed attempt fails the query (`fail_query_lease`, which surfaces as `WorkerLost`).
+- **Dispatch.** Every dispatch sends `QueryLease` inline before `StartTask`, on the task stream,
+  with no timeout (`server/mod.rs:6676-6700`). Not only the first.
+- **Completion.** When the driver ends, it runs `mark_terminal()` and retirement fanout
+  (`coordinator.rs:587-598`, `893-900`). `DistributedResultStream::poll_next` may still be
+  delivering batches buffered in its channel (`coordinator.rs:176-191`).
+- **Clocks.** Monotonic only; there is no coordinator-side lease deadline.
+
+**Evidence** (B1.B, recorded): remote fresh-connection connect p50 is 124–164 ms (p99 ≤ 528 ms),
+ACK p50 is 100–143 ms (p99 ≤ 480 ms), and the largest whole exchange is 1008207 µs. Nothing was
+censored at the 5 s/20 s budgets. All 330 load windows ended `WorkerLost` at 5.102–10.301 s.
+**Hypothesis (to be tested, not assumed):** the 100 ms renewal caps cause these failures.
+
+#### Assumptions (declared, not proven)
+
+- **Clock rates.** `ρ_w = ρ_c = 500 ppm` is an operating assumption, NOT shown to be conservative.
+  B1.B had no chrony context on bigfoot or strix. Each campaign records every host's sync daemon,
+  its configuration and slew context again.
+- **Safety statements** are conditional on that rate, on namespace survival, and on no restart.
+- **Margin** `M = 1 s`.
+- **Reliance bound.** `D = floor(L · (1 − ρ_c) / (1 + ρ_w))` is computed as checked integer
+  nanoseconds (`u128` intermediates; failure on overflow, an unrepresentable result, or
+  `D − M ≤ 0`). For L = 35.001 s, D = 34.966016… s, so `B_w = t_send + D − M` ≈ `t_send + 33.966 s`.
+- **Budgets and backoff** are PROVISIONAL operational choices frozen at implementation review:
+  connect 2000 ms, ACK 2000 ms, whole 3000 ms; backoff 250 ms, doubling, capped at 2000 ms. They
+  are not certified tail bounds.
+
+#### Selection
+
+**1. Coordinator lease clock.**
+- `CLOCK_BOOTTIME` through `clock_gettime`, behind an injectable clock trait (Linux only). There is
+  no fallback to `Instant`.
+- The `timespec` is validated and converted with checked arithmetic. A read failure, an invalid
+  value, or a regression (a value below the last sample under the reliance lock) is fatal for
+  reliance (see the failure table).
+- `now_c` is sampled AFTER acquiring the reliance-state lock, at each gate's and each refresh's
+  linearization point.
+- BOOTTIME advances during suspend, but tokio timers need not fire then. Every resumed action
+  re-checks the gate before it accepts an outcome or starts another action.
+- Budget overruns are recorded. `now + budget < B` is ADMISSION; it does not guarantee that a
+  starved future ends within its budget.
+
+**2. One ledger per (query, worker), shared by the renewal and dispatch paths.**
+- **Issuing has no old bound.** A first usable `Applied` is checked against its candidate bound
+  only.
+  - A first-handshake failure processed under the lock while the ledger is STILL `Issuing` makes
+    that worker failed-`Terminal` and fails the query. It never stays `Issuing`, and a scheduler
+    `Io` retry can never become a new first issuance.
+  - If another in-flight handshake already reached `Reliable` before that failure is processed,
+    the existing bound is kept and the failed dispatch follows the declared task-dispatch error
+    policy (no refresh from it).
+  - Retrying a task while the worker is already `Reliable` is distinct from retrying a failed first
+    issuance, which is forbidden.
+  - Pinned: both orderings and the scheduler retry guard.
+- **States:** `Unissued → Issuing → Reliable(B_w) → Lapsed | Terminal(cause)`.
+- **Registration is dynamic.** The first dispatch to `w` registers it (`Unissued → Issuing`).
+  Registering does not wait on any global "all workers Reliable" gate, so a newly enrolled worker
+  never deadlocks its own lease setup.
+- **Issuing is coalesced.** Concurrent first dispatches to the same `w` each still send their
+  inline `QueryLease`, because the wire is unchanged. The ledger is Issuing until the FIRST
+  validated `Applied` that satisfies the refresh rule moves it to `Reliable`. A dispatch whose
+  handshake fails while another succeeded follows the failure table for its own attempt.
+- **Every dispatch's inline `Applied`** is processed as a refresh candidate under rule 5
+  (old-boundary check included). A dispatch exchange can NEVER move `Lapsed` or `Terminal` back:
+  the dispatch is refused before `StartTask`.
+- **`StartTask` is authorized at its own gate** after the handshake: `Reliable` and `now_c < B_w`
+  at the gate's linearization point.
+
+**3. Issuance and dispatch on the task stream** (single attempt).
+- **Bounds:** connect (2000 ms), then ONLY the lease request, reply and validation handshake
+  (ACK 2000 ms from the send marker). The whole handshake, connect included, is capped at
+  3000 ms. Task execution is NOT under these budgets.
+- **No close is required here,** because the stream continues to `StartTask`. Reliance comes from
+  the validated handshake reply, correlated with that stream's request and send marker.
+- **No bounded retry of a first issuance in this scope.** A guard (state, not only a comment)
+  ensures that once `(query, w)` is `Terminal`, the scheduler's handling of the dispatch's
+  timeout or `Io` result cannot start a fresh issuance to `w` for that query. Pinned.
+
+**4. Periodic renewal: per worker, independent, owned by the query.**
+- **Renewal exchange bounds:** connect 2000 ms; ACK 2000 ms from the send marker to the validated
+  reply; WHOLE 3000 ms from connect start through `finish_terminal_exchange` (close), as in B0.
+- **Reliance on renewal** needs the whole exchange to succeed. An unknown application, a lost ACK,
+  or a failed or late close grants nothing.
+- **Schedule:**
+  - the first periodic renewal at `t_send(issuance) + 5 s`;
+  - after each successful refresh, the next at that refresh's `t_send + 5 s`;
+  - after a failed attempt, retry after the backoff (250 ms doubling to 2000 ms), reset on
+    success;
+  - each loop uses `sleep_until` its own computed deadline, with no interval and no catch-up
+    bursts.
+- **One periodic exchange in flight per worker.** Inline dispatch exchanges may overlap it, and
+  the ledger lock serializes how their results are processed.
+- **Admission:** an attempt starts only if `now_c + whole_budget < B_w(installed)`.
+  - If none fits, the loop PAUSES attempts. It does not exit.
+  - The ledger reaches `Lapsed` at the installed `B_w` (timer, plus enforcement at the gates)
+    unless an inline dispatch `Applied` extends it first.
+  - The loop wakes and recomputes on every ledger change, and reschedules from the send marker
+    that supports the currently installed (max) bound.
+  - A stale deadline or timer can never lapse a newer valid bound.
+  - An older response that leaves the max unchanged can never move the schedule backward into
+    catch-up bursts.
+  - Exactly one periodic exchange is in flight; inline exchanges stay separately correlated.
+  - Pinned: no fit, then an inline extension, then periodic renewal resumes; and a stale
+    old-bound timer after such an extension.
+- **Ownership and cleanup** (in terms Rust can implement):
+  - The loops are tasks owned by the query's owner, which lives outside them, with no
+    task → handle → `JoinSet` ownership cycle that would prevent drop.
+  - A synchronous handle `Drop` cannot await. It marks the query terminal or cancelled at the
+    gate and aborts or signals the owned tasks. An explicitly owned asynchronous cleanup path joins
+    them, and normal success, failure and cancellation await that completion.
+  - The claim is only that no NEW local exchange or action is authorized after termination.
+    In-flight wire activity may still complete, and remote cancellation stays out of scope.
+  - Pins await the cleanup completion and show every local task and stream retired. They never
+    imply that `Drop` joins synchronously, or that wire activity is cancelled.
+  - No detached task renews a retired query.
+- **Per-worker independence:** one worker's slow or failed attempts never delay or fail another.
+
+**5. Refresh rule** (both paths, at lock time).
+- Accept only a validated, correlated `Applied` (query, worker, term, this request and send
+  marker), and on renewal only after the whole exchange.
+- Require state `Reliable` (or `Issuing` for issuance), `now_c < B_w(old)` (equality is lapsed),
+  and `now_c < B_w(candidate)`.
+- Install `max(B_w(old), B_w(candidate))`, so an older usable reply never moves the boundary back.
+- Nothing revives `Lapsed` or `Terminal`.
+
+**6. Successful completion is one atomic commit gate.** (Amendment A; the gate and Terminal model
+is extended, and Terminal does not imply failure.)
+- **Commit.** When the driver ends with `Ok`, it takes the reliance lock, samples `now_c`, and
+  commits Success only if NO required worker is `Lapsed` or failed-`Terminal` and every required
+  worker is `Reliable` with `now_c < B_w`.
+- **On commit:** final results are fully local (in the stream's channel), and the query's state
+  becomes `Committed(Success)`. Delivery of the remaining buffered batches and of the end of stream
+  then checks only that committed local state, never a retired remote namespace. Retirement fanout
+  and renewal shutdown follow the commit, as today.
+- **A lapse or fatal refusal before commit** marks the query `Failed(cause)`. `poll_next` checks
+  that state: later buffered batches are suppressed (drained and discarded) and the stream ends
+  with the lapse error. This is partial-result-then-error, documented in the API.
+- **The race** between commit and lapse is linearized under the same lock; exactly one wins.
+- **`Committed(Success)` and `Failed(cause)` are mutually exclusive and irreversible.**
+  - Late renewal or inline callbacks after a committed success (including `Ignored` or transport
+    errors) are context only. They can neither turn the success into a failure nor revive
+    reliance.
+  - A failed query cannot become a success when the driver returns `Ok` late.
+  - The query state is sealed first; aborting and joining the tasks happens after that, outside
+    the reliance lock.
+  - Pinned: a late fatal callback after success, and the lapse-before-success race.
+- **Collected `execute_query`** returns the error and no result when the commit fails.
+- **Required workers:** every census worker, while remote reliance is live (until commit).
+
+**7. Failure table.** The typed internal cause is always kept, even when the outward mapping is
+`WorkerLost`.
+
+| Outcome | Class | Effect on (query, w) | Outward |
+| --- | --- | --- | --- |
+| Connect error or timeout; write or read `Io`; ACK or whole budget expired; close failed after `Applied` (renewal) | transient | renewal: retry while admission holds; issuance or dispatch: single attempt, no new reliance | renewal: none until lapse; dispatch: existing mapping, guarded against reissue once Terminal |
+| Boundary passes with no successful refresh | lapse | `Lapsed` | `WorkerLost { w }`, cause `Lapsed { bound }` |
+| Validated `Ignored(reason)` | refusal | `Terminal` at the reply (B0) | dispatch: B0 mapping (`QueryLeaseExpired` / `QueryLeaseMissing`); renewal: `WorkerLost { w }`, cause `Ignored(reason)` |
+| Wrong version, kind, query or term; malformed or oversized frame | fatal protocol | `Terminal` | existing protocol error kind; cause `Protocol(..)` |
+| Authentication or TLS refusal | fatal | `Terminal` | `WorkerLost { w }`, cause `Auth` |
+| Coordinator clock read failure, invalid value or regression; arithmetic overflow; `D − M ≤ 0` | fatal local | `Terminal` (reliance impossible) | the existing internal-error kind, named at implementation review; cause `Clock` / `Arithmetic` |
+| Detected worker restart, retirement or invalidation (B0's typed refusals) | fatal | `Terminal` | as for `Ignored` |
+
+- With an EXISTING valid bound, one transient renewal or dispatch failure never fails the query.
+  A first-issuance failure has no prior reliance to keep: under `Issuing` it is `Terminal` and
+  fails the query (rule 2). One required worker's lapse or fatal outcome fails the query.
+- Late replies and new connections are never evidence of continuity across a worker restart.
+
+**8. Not in scope:**
+- connection reuse or pooling (a deferred follow-up with its own review);
+- retirement fanout budgets;
+- L, the worker-loss window, receipts, remote cancellation;
+- exclude-and-recover;
+- incarnation fencing beyond detection.
+
+#### Acceptance (conditional on this selection; counts frozen at instrument review)
+
+**Deterministic** (loopback, fixture workers with test-only delay, drop and refusal controls):
+- **B1.A.2 pins:** old-boundary equality; a late ACK; a timely ACK with a late or failed close;
+  out-of-order replies (max rule); a send-marker or request mismatch; a concurrent lapse versus
+  refresh; first issuance before `Applied`.
+- **Per-dispatch inline leases:** coalesced Issuing; refresh through dispatch; a dispatch refused
+  after `Lapsed`; no reset of `Lapsed` by a dispatch exchange; no deadlock when a new worker
+  enrolls.
+- **The guard:** no reissue after `Terminal` from a scheduler `Io` retry.
+- **The failure table:** every row, with its typed cause and outward mapping.
+- **Network faults:**
+  - the asymmetric coordinator-only path, where renewal exchanges are delayed and tasks are not;
+  - a lost ACK or unknown application;
+  - permanent unreachability, which lapses at `B_w`;
+  - a delay inside the boundary survives; past it, `WorkerLost` at the gate.
+- **Lifecycle:** cancellation and handle drop join every loop, and no exchange happens after it.
+- **Streaming:**
+  - a slow consumer causes buffering and backpressure;
+  - buffered success held PAST the old bound AFTER commit is still delivered;
+  - a lapse BEFORE commit with batches buffered suppresses them and gives the error;
+  - the commit-versus-lapse race;
+  - collected `execute_query` returns an error on a failed commit.
+- **Starvation:** scheduler starvation (a blocked current-thread runtime) is enforced at the gates.
+- **Clock:** the injected boot clock (suspend jump, read failure, regression) and the
+  checked-arithmetic edges.
+
+**Measured separately:** gate-stop, error publication, remote reclamation (the worker reaper), and
+running-task cessation, which is not claimed.
+
+**Campaign** (Wi-Fi, three hosts, no injected fault):
+- the production coordinator path, with a frozen count;
+- AND a declared production-path long control that spans more than the initial safe horizon
+  (≈ 34 s), preferably several horizons;
+- every attempt is reported, and failures are never retried away;
+- per-attempt renewal records: attempts, retries, budget expiries, slack at refresh, and overruns;
+- links before and after, and clock context per host;
+- a blackout case is reported even when it fails, and survival is counted only with a
+  bound-correlated successful `Applied` before the old boundary;
+- readers: a frozen, strict per-query and per-stream version of B1.B's reviewed zero-written-reply
+  accounting (`b1b-reconcile-2`). Missing replies are never generically acceptable.
+
+No additional B1.B survey; the retained evidence is used as it is.
