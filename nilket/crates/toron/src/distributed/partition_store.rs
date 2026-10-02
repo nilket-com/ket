@@ -21,8 +21,8 @@ use crate::distributed::cancellation::{
 };
 use crate::distributed::identity::{AttemptId, ExchangeId, PartitionId, QueryId, StageId, TaskId};
 use crate::distributed::namespace_lifecycle::{
-	QueryTerminalCause, ShuffleLifecycleConfig, ShuffleLifecycleSnapshot,
-	ShuffleNamespaceLifecycle, WriteLeaseError,
+	LeaseRenewal, QueryTerminalCause, ShuffleBackend, ShuffleBackends, ShuffleLifecycleConfig,
+	ShuffleLifecycleSnapshot, ShuffleNamespaceLifecycle, WriteLeaseError,
 };
 use crate::distributed::task::{
 	ArrowIpcDigest, PartitionAddress, PartitionBackend, PartitionEntry, PartitionManifest, RowCount,
@@ -37,7 +37,8 @@ pub(crate) const LIVE_BACKLOG_DEPTH: usize = 4;
 #[async_trait::async_trait]
 pub trait PartitionStore: Send + Sync {
 	fn query_lease_term_millis(&self) -> u64;
-	fn issue_or_renew_query_lease(&self, query_id: QueryId);
+	/// Issues or renews the query's lease; the outcome is the state observed at the lifecycle lock.
+	fn issue_or_renew_query_lease(&self, query_id: QueryId) -> LeaseRenewal;
 	fn retire_query(&self, query_id: QueryId, cause: QueryTerminalCause);
 	fn reap_expired_queries(&self);
 	fn lifecycle_snapshot(&self) -> ShuffleLifecycleSnapshot;
@@ -252,8 +253,11 @@ impl LivePartitionReaderGuard {
 			}
 		};
 		if removed {
-			self.lifecycle
-				.finish_removal(self.address.query_id, Instant::now());
+			self.lifecycle.finish_removal(
+				self.address.query_id,
+				ShuffleBackend::Memory,
+				Instant::now(),
+			);
 		}
 		if let Some(downstream_cancellation) = downstream_cancellation {
 			downstream_cancellation
@@ -469,7 +473,7 @@ impl InMemoryPartitionStore {
 	}
 
 	fn authorize_write(&self, query_id: QueryId) -> Result<(), PartitionStoreError> {
-		match self.lifecycle.authorize_write(query_id, Instant::now()) {
+		match self.lifecycle.authorize_write_now(query_id) {
 			Ok(()) => Ok(()),
 			Err(WriteLeaseError::Missing) => {
 				Err(PartitionStoreError::QueryLeaseMissing { query_id })
@@ -540,12 +544,13 @@ impl PartitionStore for InMemoryPartitionStore {
 			.expect("query lease term fits wire milliseconds")
 	}
 
-	fn issue_or_renew_query_lease(&self, query_id: QueryId) {
-		self.lifecycle.issue_or_renew(query_id, Instant::now());
+	fn issue_or_renew_query_lease(&self, query_id: QueryId) -> LeaseRenewal {
+		self.lifecycle.issue_or_renew_now(query_id)
 	}
 
 	fn retire_query(&self, query_id: QueryId, cause: QueryTerminalCause) {
-		self.lifecycle.begin_retirement(query_id, cause);
+		// The effective (retained) cause governs cleanup and missing reasons, not the request's.
+		let cause = self.lifecycle.begin_retirement(query_id, cause);
 		let missing_reason = cause.late_pull_reason();
 		let removed = {
 			let mut inner = self.inner.write().expect("partition store poisoned");
@@ -567,13 +572,14 @@ impl PartitionStore for InMemoryPartitionStore {
 			try_remove_quiescent_in_memory_query(&mut inner, query_id, &self.lifecycle)
 		};
 		if removed {
-			self.lifecycle.finish_removal(query_id, Instant::now());
+			self.lifecycle
+				.finish_removal(query_id, ShuffleBackend::Memory, Instant::now());
 		}
 	}
 
 	fn reap_expired_queries(&self) {
-		for query_id in self.lifecycle.expired_queries(Instant::now()) {
-			self.retire_query(query_id, QueryTerminalCause::Abandoned);
+		for (query_id, cause) in self.lifecycle.cleanup_work_now() {
+			self.retire_query(query_id, cause);
 		}
 	}
 
@@ -1114,7 +1120,8 @@ impl EncryptedSpillPartitionStore {
 		Self::with_budget_and_lifecycle(
 			spill_dir,
 			budget,
-			ShuffleNamespaceLifecycle::unmanaged_fixture(config),
+			ShuffleNamespaceLifecycle::unmanaged_fixture(config)
+				.with_backends(ShuffleBackends::SPILL),
 		)
 	}
 
@@ -1128,7 +1135,7 @@ impl EncryptedSpillPartitionStore {
 		Self::with_budget_and_lifecycle(
 			spill_dir,
 			budget,
-			ShuffleNamespaceLifecycle::managed(config),
+			ShuffleNamespaceLifecycle::managed(config).with_backends(ShuffleBackends::SPILL),
 		)
 	}
 
@@ -1209,7 +1216,7 @@ impl EncryptedSpillPartitionStore {
 	}
 
 	fn authorize_write(&self, query_id: QueryId) -> Result<(), PartitionStoreError> {
-		match self.lifecycle.authorize_write(query_id, Instant::now()) {
+		match self.lifecycle.authorize_write_now(query_id) {
 			Ok(()) => Ok(()),
 			Err(WriteLeaseError::Missing) => {
 				Err(PartitionStoreError::QueryLeaseMissing { query_id })
@@ -1221,7 +1228,8 @@ impl EncryptedSpillPartitionStore {
 	}
 
 	fn retire_spilled_query(&self, query_id: QueryId, cause: QueryTerminalCause) {
-		self.lifecycle.begin_retirement(query_id, cause);
+		// The effective (retained) cause governs cleanup, not the request's.
+		let cause = self.lifecycle.begin_retirement(query_id, cause);
 		let removed = {
 			let mut inner = self.inner.write().expect("partition store poisoned");
 			if cause != QueryTerminalCause::Success && !self.lifecycle.enforces_leases() {
@@ -1240,7 +1248,8 @@ impl EncryptedSpillPartitionStore {
 		}
 		if !debt.iter().any(|entry| entry.query_id == query_id) {
 			drop(debt);
-			self.lifecycle.finish_removal(query_id, Instant::now());
+			self.lifecycle
+				.finish_removal(query_id, ShuffleBackend::Spill, Instant::now());
 		}
 	}
 
@@ -1263,7 +1272,8 @@ impl EncryptedSpillPartitionStore {
 		}
 		drop(debt);
 		for query_id in completed {
-			self.lifecycle.finish_removal(query_id, Instant::now());
+			self.lifecycle
+				.finish_removal(query_id, ShuffleBackend::Spill, Instant::now());
 		}
 	}
 
@@ -1320,9 +1330,9 @@ impl PartitionStore for EncryptedSpillPartitionStore {
 			.expect("query lease term fits wire milliseconds")
 	}
 
-	fn issue_or_renew_query_lease(&self, query_id: QueryId) {
+	fn issue_or_renew_query_lease(&self, query_id: QueryId) -> LeaseRenewal {
 		self.retry_cleanup_debt();
-		self.lifecycle.issue_or_renew(query_id, Instant::now());
+		self.lifecycle.issue_or_renew_now(query_id)
 	}
 
 	fn retire_query(&self, query_id: QueryId, cause: QueryTerminalCause) {
@@ -1331,8 +1341,8 @@ impl PartitionStore for EncryptedSpillPartitionStore {
 
 	fn reap_expired_queries(&self) {
 		self.retry_cleanup_debt();
-		for query_id in self.lifecycle.expired_queries(Instant::now()) {
-			self.retire_spilled_query(query_id, QueryTerminalCause::Abandoned);
+		for (query_id, cause) in self.lifecycle.cleanup_work_now() {
+			self.retire_spilled_query(query_id, cause);
 		}
 	}
 
@@ -1512,7 +1522,8 @@ impl HybridPartitionStore {
 			spill_dir,
 			spill_threshold,
 			budget,
-			ShuffleNamespaceLifecycle::unmanaged_fixture(config),
+			ShuffleNamespaceLifecycle::unmanaged_fixture(config)
+				.with_backends(ShuffleBackends::MEMORY_AND_SPILL),
 		)
 	}
 
@@ -1528,7 +1539,8 @@ impl HybridPartitionStore {
 			spill_dir,
 			spill_threshold,
 			budget,
-			ShuffleNamespaceLifecycle::managed(config),
+			ShuffleNamespaceLifecycle::managed(config)
+				.with_backends(ShuffleBackends::MEMORY_AND_SPILL),
 		)
 	}
 
@@ -1565,22 +1577,23 @@ impl PartitionStore for HybridPartitionStore {
 			.expect("query lease term fits wire milliseconds")
 	}
 
-	fn issue_or_renew_query_lease(&self, query_id: QueryId) {
-		self.lifecycle.issue_or_renew(query_id, Instant::now());
+	fn issue_or_renew_query_lease(&self, query_id: QueryId) -> LeaseRenewal {
+		let renewal = self.lifecycle.issue_or_renew_now(query_id);
 		self.encrypted_spill.retry_cleanup_debt();
+		renewal
 	}
 
 	fn retire_query(&self, query_id: QueryId, cause: QueryTerminalCause) {
-		self.lifecycle
-			.begin_retirement_with_participants(query_id, cause, 2);
+		// One retirement pending on both backends; each child completes only its own backend.
+		let cause = self.lifecycle.begin_retirement(query_id, cause);
 		self.in_memory.retire_query(query_id, cause);
 		self.encrypted_spill.retire_query(query_id, cause);
 	}
 
 	fn reap_expired_queries(&self) {
 		self.encrypted_spill.retry_cleanup_debt();
-		for query_id in self.lifecycle.expired_queries(Instant::now()) {
-			self.retire_query(query_id, QueryTerminalCause::Abandoned);
+		for (query_id, cause) in self.lifecycle.cleanup_work_now() {
+			self.retire_query(query_id, cause);
 		}
 	}
 
@@ -3441,13 +3454,12 @@ mod tests {
 		);
 	}
 
-	/// ADR 628 Stage A, race candidate (a) on a managed store (current-behaviour pin): a write
-	/// landing after the lease deadline but before the reaper tick is `QueryLeaseExpired` and removes
-	/// the lease, so the reaper no longer finds the query and does not reclaim it as `Abandoned`. The
-	/// earlier published partition stays resident and servable. The 20 ms term and the 60 ms wait give
-	/// a 3x margin; the call order is fixed.
+	/// ADR 628 B0 (replaces the Stage A pin
+	/// `adr628_expired_write_leaves_published_partitions_resident_after_the_reaper`): a write after
+	/// the deadline is `QueryLeaseExpired` and retires the query as Abandoned, so the next reaper
+	/// pass reclaims it and a pull gets the typed reason. 20 ms term, 60 ms wait.
 	#[test]
-	fn adr628_expired_write_leaves_published_partitions_resident_after_the_reaper() {
+	fn an_expired_write_is_reclaimed_by_the_next_reaper_pass() {
 		let store =
 			managed_memory_store_with_config(8, Duration::from_secs(1), Duration::from_millis(20));
 		let first = payload(address(AttemptId::first()));
@@ -3465,23 +3477,336 @@ mod tests {
 			matches!(error, PartitionStoreError::QueryLeaseExpired { query_id: id } if id == query_id),
 			"{error:?}"
 		);
+		assert_eq!(
+			store.issue_or_renew_query_lease(query_id),
+			LeaseRenewal::Ignored(
+				crate::distributed::namespace_lifecycle::LeaseIgnored::Retiring {
+					cause: QueryTerminalCause::Abandoned
+				}
+			)
+		);
 		store.reap_expired_queries();
 		let snapshot = store.lifecycle_snapshot();
 		assert_eq!(
-			snapshot.abandoned_reclaims, 0,
-			"the reaper did not reclaim it"
+			(snapshot.abandoned_reclaims, snapshot.resident_namespaces),
+			(1, 0)
 		);
 		assert_eq!(
-			snapshot.resident_namespaces, 1,
-			"the namespace stays resident"
+			store.pull(first.address, AttemptId::first()),
+			Err(PartitionMissingReason::Abandoned)
+		);
+	}
+
+	fn managed_hybrid_store_with_term(
+		spill_dir: PathBuf,
+		lease_term: Duration,
+	) -> HybridPartitionStore {
+		let lifecycle = ShuffleNamespaceLifecycle::managed(
+			ShuffleLifecycleConfig::new(
+				std::num::NonZeroUsize::new(8).expect("receipt capacity"),
+				Duration::from_secs(60),
+				Duration::from_millis(5),
+				lease_term,
+				Duration::from_millis(10),
+			)
+			.expect("test lifecycle config"),
+		)
+		.with_backends(ShuffleBackends::MEMORY_AND_SPILL);
+		HybridPartitionStore::with_budget_and_lifecycle(
+			spill_dir,
+			ByteCount::new(4),
+			QueryBudget::test_default(),
+			lifecycle,
+		)
+		.expect("managed hybrid store")
+	}
+
+	/// ADR 628 B0: an expiry observed by a write on the hybrid store waits for BOTH backends. The
+	/// in-memory half is removed on the first pass; spill deletion debt keeps the retirement (no
+	/// receipt, no reopening) until a later pass clears it; repeated passes count the reclaim once.
+	#[test]
+	fn hybrid_expiry_waits_for_both_backends_through_spill_debt() {
+		let spill_dir = temp_spill_dir();
+		let store = managed_hybrid_store_with_term(spill_dir.clone(), Duration::from_millis(20));
+		let small = payload(address(AttemptId::first()));
+		let mut big_address = address(AttemptId::first());
+		big_address.exchange_id = ExchangeId::new(3);
+		let big = payload_with_bytes(big_address, vec![9; 16]);
+		let query_id = small.address.query_id;
+		store.issue_or_renew_query_lease(query_id);
+		store
+			.publish(manifest(&small), vec![small.clone()])
+			.expect("publish in memory");
+		store
+			.publish(manifest(&big), vec![big.clone()])
+			.expect("publish to spill");
+		std::thread::sleep(Duration::from_millis(60));
+		let late = payload_with_bytes(address(AttemptId::first().next()), vec![1]);
+		assert!(matches!(
+			store.publish(manifest(&late), vec![late]),
+			Err(PartitionStoreError::QueryLeaseExpired { .. })
+		));
+		store.encrypted_spill.fail_next_cleanup();
+		store.reap_expired_queries();
+		let snapshot = store.lifecycle_snapshot();
+		assert_eq!(
+			(snapshot.receipts, snapshot.retiring_namespaces),
+			(0, 1),
+			"spill debt holds it"
 		);
 		assert_eq!(
-			store
-				.pull(first.address, AttemptId::first())
-				.expect("current behaviour: still servable")
-				.bytes,
-			first.bytes
+			store.issue_or_renew_query_lease(query_id),
+			LeaseRenewal::Ignored(
+				crate::distributed::namespace_lifecycle::LeaseIgnored::Retiring {
+					cause: QueryTerminalCause::Abandoned
+				}
+			),
+			"no reopening while one backend is pending"
 		);
+		store.reap_expired_queries();
+		store.reap_expired_queries();
+		let snapshot = store.lifecycle_snapshot();
+		assert_eq!(
+			(
+				snapshot.receipts,
+				snapshot.retiring_namespaces,
+				snapshot.abandoned_reclaims
+			),
+			(1, 0, 1)
+		);
+		assert_eq!(store.encrypted_spill.cleanup_debt_len(), 0);
+		assert_eq!(
+			store.pull(big.address, AttemptId::first()),
+			Err(PartitionMissingReason::Abandoned)
+		);
+		std::fs::remove_dir_all(spill_dir).expect("remove spill dir");
+	}
+
+	/// ADR 628 B0: a reader admitted before expiry pins the in-memory namespace; the reaper's
+	/// expiry retires it as Abandoned (the reader is cancelled with that cause) and the receipt is
+	/// written only when the reader releases.
+	#[tokio::test]
+	async fn a_pinned_reader_defers_expiry_cleanup_until_it_releases() {
+		let store =
+			managed_memory_store_with_config(8, Duration::from_secs(60), Duration::from_millis(20));
+		let address = address(AttemptId::first());
+		store.issue_or_renew_query_lease(address.query_id);
+		store
+			.open_live(address, test_schema())
+			.expect("open live partition");
+		let mut reader = store
+			.pull_live(address, AttemptId::first())
+			.expect("admit reader before expiry");
+		std::thread::sleep(Duration::from_millis(60));
+		store.reap_expired_queries();
+		let snapshot = store.lifecycle_snapshot();
+		assert_eq!((snapshot.receipts, snapshot.retiring_namespaces), (0, 1));
+		assert_eq!(
+			reader.next().await,
+			Some(Err(PartitionMissingReason::Abandoned))
+		);
+		drop(reader);
+		store.reap_expired_queries();
+		let snapshot = store.lifecycle_snapshot();
+		assert_eq!(
+			(
+				snapshot.receipts,
+				snapshot.retiring_namespaces,
+				snapshot.abandoned_reclaims
+			),
+			(1, 0, 1)
+		);
+	}
+
+	/// ADR 628 B0: the retained cause governs later requests' cleanup. A Success retirement with an
+	/// admitted reader is not turned into a cancellation by a later Cancelled request: the reader
+	/// still drains, and the receipt and missing reason stay Success's.
+	#[tokio::test]
+	async fn a_later_retire_request_uses_the_retained_cause() {
+		let store = managed_memory_store();
+		let address = address(AttemptId::first());
+		store.issue_or_renew_query_lease(address.query_id);
+		store
+			.open_live(address, test_schema())
+			.expect("open live partition");
+		store
+			.append_live(ipc_payload(address, &[1, 2]))
+			.await
+			.expect("append live partition");
+		let mut admitted = store
+			.pull_live(address, AttemptId::first())
+			.expect("admit reader before retirement");
+		store
+			.seal_live(manifest_for_address(address))
+			.expect("seal live partition");
+		store.retire_query(address.query_id, QueryTerminalCause::Success);
+		store.retire_query(address.query_id, QueryTerminalCause::Cancelled);
+		let payload = expect_live_payload(&mut admitted, "the reader still drains").await;
+		assert_eq!(decoded_i64_values(&payload.bytes), vec![1, 2]);
+		expect_live_eof(&mut admitted, "and reaches eof").await;
+		assert_eq!(
+			store.pull(address, AttemptId::first()),
+			Err(PartitionMissingReason::Reclaimed)
+		);
+		let snapshot = store.lifecycle_snapshot();
+		assert_eq!(
+			(snapshot.quiesced_reclaims, snapshot.cancelled_reclaims),
+			(1, 0)
+		);
+	}
+
+	/// ADR 628 B0, store level: a publisher authorized BEFORE the deadline that reaches the store
+	/// lock only AFTER the expiry still commits; its namespace is licensed on the existing
+	/// Abandoned retirement, and the next reaper pass reclaims it with a receipt. Real clock, 100 ms
+	/// term; the test holds the store lock across the deadline.
+	#[test]
+	fn a_publisher_authorized_before_expiry_is_retired_and_licensed_after_it() {
+		let store = Arc::new(managed_memory_store_with_config(
+			8,
+			Duration::from_secs(60),
+			Duration::from_millis(100),
+		));
+		let payload = payload(address(AttemptId::first()));
+		let query_id = payload.address.query_id;
+		assert_eq!(
+			store.issue_or_renew_query_lease(query_id),
+			LeaseRenewal::Applied
+		);
+		let held = store.inner.write().expect("store lock");
+		let publisher = std::thread::spawn({
+			let store = Arc::clone(&store);
+			let payload = payload.clone();
+			move || store.publish(manifest(&payload), vec![payload])
+		});
+		std::thread::sleep(Duration::from_millis(20));
+		std::thread::sleep(Duration::from_millis(130));
+		assert_eq!(
+			store.lifecycle.cleanup_work_now(),
+			vec![(query_id, QueryTerminalCause::Abandoned)],
+			"expired while the authorized publisher waits on the store lock"
+		);
+		drop(held);
+		publisher
+			.join()
+			.expect("publisher")
+			.expect("authorized before the deadline, it commits");
+		store.reap_expired_queries();
+		let snapshot = store.lifecycle_snapshot();
+		assert_eq!(
+			(
+				snapshot.receipts,
+				snapshot.resident_namespaces,
+				snapshot.abandoned_reclaims
+			),
+			(1, 0, 1)
+		);
+		assert_eq!(
+			store.pull(payload.address, AttemptId::first()),
+			Err(PartitionMissingReason::Abandoned)
+		);
+	}
+
+	/// ADR 628 B0: standalone managed spill (SPILL construction): an expiry observed by a renewal
+	/// is discoverable; cleanup held by deletion debt keeps the retirement (no receipt, no
+	/// reopening); a later pass completes it with one Abandoned receipt.
+	#[test]
+	fn standalone_spill_expiry_is_reclaimed_through_deletion_debt() {
+		let spill_dir = temp_spill_dir();
+		let lifecycle = ShuffleNamespaceLifecycle::managed(
+			ShuffleLifecycleConfig::new(
+				std::num::NonZeroUsize::new(8).expect("receipt capacity"),
+				Duration::from_secs(60),
+				Duration::from_millis(5),
+				Duration::from_millis(20),
+				Duration::from_millis(10),
+			)
+			.expect("test lifecycle config"),
+		)
+		.with_backends(ShuffleBackends::SPILL);
+		let store = EncryptedSpillPartitionStore::with_budget_and_lifecycle(
+			spill_dir.clone(),
+			QueryBudget::test_default(),
+			lifecycle,
+		)
+		.expect("managed spill store");
+		let payload = payload(address(AttemptId::first()));
+		let query_id = payload.address.query_id;
+		store.issue_or_renew_query_lease(query_id);
+		store
+			.publish(manifest(&payload), vec![payload.clone()])
+			.expect("publish spill");
+		std::thread::sleep(Duration::from_millis(60));
+		assert_eq!(
+			store.issue_or_renew_query_lease(query_id),
+			LeaseRenewal::Ignored(crate::distributed::namespace_lifecycle::LeaseIgnored::Expired)
+		);
+		store.fail_next_cleanup();
+		store.reap_expired_queries();
+		let snapshot = store.lifecycle_snapshot();
+		assert_eq!((snapshot.receipts, snapshot.retiring_namespaces), (0, 1));
+		assert_eq!(store.cleanup_debt_len(), 1);
+		// The lifecycle directly: the spill store's own renewal first retries the debt.
+		assert_eq!(
+			store.lifecycle.issue_or_renew_now(query_id),
+			LeaseRenewal::Ignored(
+				crate::distributed::namespace_lifecycle::LeaseIgnored::Retiring {
+					cause: QueryTerminalCause::Abandoned
+				}
+			),
+			"no reopening while the debt holds the retirement"
+		);
+		assert_eq!(store.cleanup_debt_len(), 1);
+		store.reap_expired_queries();
+		let snapshot = store.lifecycle_snapshot();
+		assert_eq!(
+			(
+				snapshot.receipts,
+				snapshot.retiring_namespaces,
+				snapshot.abandoned_reclaims
+			),
+			(1, 0, 1)
+		);
+		assert_eq!(
+			store.pull(payload.address, AttemptId::first()),
+			Err(PartitionMissingReason::Abandoned)
+		);
+		std::fs::remove_dir_all(spill_dir).expect("remove spill dir");
+	}
+
+	/// ADR 628 B0: on the spill backend, a Success retirement held by deletion debt keeps Success
+	/// when an Abandoned request follows (the reaper retrying), and its receipt says so.
+	#[test]
+	fn spill_debt_keeps_the_retained_cause_against_a_later_request() {
+		let spill_dir = temp_spill_dir();
+		let store = EncryptedSpillPartitionStore::managed(
+			spill_dir.clone(),
+			QueryBudget::test_default(),
+			DEFAULT_WORKER_LOST_AFTER,
+		)
+		.expect("managed spill store");
+		let payload = payload(address(AttemptId::first()));
+		store.issue_or_renew_query_lease(payload.address.query_id);
+		store
+			.publish(manifest(&payload), vec![payload.clone()])
+			.expect("publish spill");
+		store.fail_next_cleanup();
+		store.retire_query(payload.address.query_id, QueryTerminalCause::Success);
+		store.retire_query(payload.address.query_id, QueryTerminalCause::Abandoned);
+		store.reap_expired_queries();
+		let snapshot = store.lifecycle_snapshot();
+		assert_eq!(
+			(
+				snapshot.receipts,
+				snapshot.quiesced_reclaims,
+				snapshot.abandoned_reclaims
+			),
+			(1, 1, 0)
+		);
+		assert_eq!(
+			store.pull(payload.address, AttemptId::first()),
+			Err(PartitionMissingReason::Reclaimed)
+		);
+		std::fs::remove_dir_all(spill_dir).expect("remove spill dir");
 	}
 
 	/// ADR 628 Stage A (current-behaviour pin): once the reaper has removed an expired lease and

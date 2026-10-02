@@ -16,6 +16,7 @@ use crate::distributed::cancellation::{
 	DownstreamCancellationMetrics, TaskCancellationSignal,
 };
 use crate::distributed::identity::{FrameByteLen, PartitionId, StreamSeq, TaskIdentity, WorkerId};
+use crate::distributed::namespace_lifecycle::{LeaseIgnored, LeaseRenewal};
 use crate::distributed::partition_store::{
 	DEFAULT_WORKER_LOST_AFTER, InMemoryPartitionStore, PartitionPayload, PartitionStore,
 	PartitionStoreError,
@@ -42,9 +43,9 @@ use crate::storage::{ScanRequest, ScanStream, StorageScan};
 use crate::wire::{
 	ArrowIpcBytes, CancelTaskPayload, EnvelopeIdentity, MessageKind, PartitionDataPayload,
 	PartitionMissingPayload, ProtocolVersion, PullPartitionPayload, QueryLeaseAcceptedPayload,
-	QueryLeasePayload, QueryRetiredPayload, RetireQueryPayload, StartTaskPayload, TaskBatchPayload,
-	TaskCancelledPayload, TaskCompletePayload, TaskFailedPayload, TaskStartedPayload, WireEnvelope,
-	decode_payload, encode_payload,
+	QueryLeaseOutcome, QueryLeasePayload, QueryRetiredPayload, RetireQueryPayload,
+	StartTaskPayload, TaskBatchPayload, TaskCancelledPayload, TaskCompletePayload,
+	TaskFailedPayload, TaskStartedPayload, WireEnvelope, decode_payload, encode_payload,
 };
 use arrow::array::ArrayRef;
 use arrow::datatypes::SchemaRef;
@@ -907,14 +908,20 @@ impl ToronWorker {
 							expected: "QueryLease with the worker lifecycle term",
 						});
 					}
-					self.partition_store.issue_or_renew_query_lease(query_id);
+					// ADR 628 B0: the reply says what the lifecycle did at its lock.
+					let outcome = match self.partition_store.issue_or_renew_query_lease(query_id) {
+						LeaseRenewal::Applied => QueryLeaseOutcome::Applied {
+							term_ms: self.partition_store.query_lease_term_millis(),
+						},
+						LeaseRenewal::Ignored(reason) => QueryLeaseOutcome::Ignored { reason },
+					};
 					send_terminal_payload(
 						&mut stream,
 						&mut phase,
 						MessageKind::QueryLeaseAccepted,
 						EnvelopeIdentity::query(query_id),
 						None,
-						&QueryLeaseAcceptedPayload { query_id },
+						&QueryLeaseAcceptedPayload { query_id, outcome },
 					)
 					.await?;
 				}
@@ -2230,13 +2237,18 @@ mod tests {
 					.await
 					.expect("lease");
 				assert_eq!(lease.kind, MessageKind::QueryLease);
+				let requested: QueryLeasePayload =
+					decode_payload(&lease.payload).expect("lease payload");
 				send_payload(
 					&mut server,
 					MessageKind::QueryLeaseAccepted,
-					EnvelopeIdentity::task(identity),
+					EnvelopeIdentity::query(identity.query_id),
 					None,
 					&crate::wire::QueryLeaseAcceptedPayload {
 						query_id: identity.query_id,
+						outcome: QueryLeaseOutcome::Applied {
+							term_ms: requested.lease_term_millis,
+						},
 					},
 				)
 				.await
@@ -3374,81 +3386,540 @@ mod tests {
 		}
 	}
 
-	/// ADR 628 Stage A (current-behaviour pin, over the wire): a `QueryLease` for a query whose
-	/// namespace was retired and whose receipt is held is still answered `QueryLeaseAccepted`. The
-	/// renewal is a no-op (no active lease appears, the receipt stays), and a later write is denied
-	/// `QueryLeaseMissing`. The ACK therefore does not certify that the lease was applied.
-	#[tokio::test]
-	async fn adr628_a_renewal_after_retirement_is_acked_without_being_applied() {
+	/// ADR 628 B0: a managed store holding `query_id`'s published partition, then retired with a
+	/// receipt (Success), behind a worker; and a writer for later attempts.
+	fn retired_store_worker(
+		query_id: QueryId,
+	) -> (
+		Arc<InMemoryPartitionStore>,
+		Arc<ToronWorker>,
+		Arc<MemoryManager>,
+	) {
 		use crate::distributed::namespace_lifecycle::QueryTerminalCause;
-		use crate::distributed::partition_store::{PartitionPayload, PartitionStoreError};
-		use crate::distributed::task::{
-			ArrowIpcDigest, PartitionAddress, PartitionBackend, PartitionManifest, RowCount,
-		};
 		let store = Arc::new(
 			InMemoryPartitionStore::managed(QueryBudget::test_default(), DEFAULT_WORKER_LOST_AFTER)
 				.expect("managed store"),
 		);
 		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
-		let worker = ToronWorker::with_partition_store_and_endpoint(
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
 			Arc::new(CancelledStorageScan),
 			Arc::clone(&memory),
 			store.clone(),
 			WorkerId::from_u128(628),
 			WorkerEndpoint::new("local"),
+		));
+		assert_eq!(
+			store.issue_or_renew_query_lease(query_id),
+			LeaseRenewal::Applied
 		);
-		let query_id = QueryId::from_u128(628);
-		let written = |attempt: u32| {
-			let address = PartitionAddress {
-				query_id,
-				exchange_id: crate::distributed::identity::ExchangeId::new(0),
-				producer_stage_id: StageId::new(0),
-				producer_task_id: TaskId::new(0),
-				attempt_id: AttemptId::new(attempt),
-				partition_id: crate::distributed::identity::PartitionId::new(0),
-			};
-			let bytes = vec![1, 2, 3];
-			let digest = ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes));
-			let payload = PartitionPayload::new(address, bytes, RowCount::new(1), digest);
-			let manifest = PartitionManifest {
-				query_id,
-				stage_id: address.producer_stage_id,
-				task_id: address.producer_task_id,
-				attempt_id: address.attempt_id,
-				exchange_id: address.exchange_id,
-				producer_worker_id: WorkerId::from_u128(628),
-				producer_endpoint: WorkerEndpoint::new("local"),
-				partitions: vec![payload.entry()],
-				runtime_filter_fragment: None,
-				backend: PartitionBackend::InMemory,
-			};
-			store.publish(manifest, vec![payload])
-		};
-		store.issue_or_renew_query_lease(query_id);
-		written(0).expect("publish under a live lease");
+		lease_test_write(&store, query_id, 0).expect("publish under a live lease");
 		store.retire_query(query_id, QueryTerminalCause::Success);
-		let retired = store.lifecycle_snapshot();
-		assert_eq!((retired.active_leases, retired.receipts), (0, 1));
+		(store, worker, memory)
+	}
 
+	fn lease_test_write(
+		store: &InMemoryPartitionStore,
+		query_id: QueryId,
+		attempt: u32,
+	) -> Result<
+		crate::distributed::task::PartitionManifest,
+		crate::distributed::partition_store::PartitionStoreError,
+	> {
+		use crate::distributed::partition_store::PartitionPayload;
+		use crate::distributed::task::{
+			ArrowIpcDigest, PartitionAddress, PartitionBackend, PartitionManifest, RowCount,
+		};
+		let address = PartitionAddress {
+			query_id,
+			exchange_id: crate::distributed::identity::ExchangeId::new(0),
+			producer_stage_id: StageId::new(0),
+			producer_task_id: TaskId::new(0),
+			attempt_id: AttemptId::new(attempt),
+			partition_id: crate::distributed::identity::PartitionId::new(0),
+		};
+		let bytes = vec![1, 2, 3];
+		let digest = ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes));
+		let payload = PartitionPayload::new(address, bytes, RowCount::new(1), digest);
+		let manifest = PartitionManifest {
+			query_id,
+			stage_id: address.producer_stage_id,
+			task_id: address.producer_task_id,
+			attempt_id: address.attempt_id,
+			exchange_id: address.exchange_id,
+			producer_worker_id: WorkerId::from_u128(628),
+			producer_endpoint: WorkerEndpoint::new("local"),
+			partitions: vec![payload.entry()],
+			runtime_filter_fragment: None,
+			backend: PartitionBackend::InMemory,
+		};
+		store.publish(manifest, vec![payload])
+	}
+
+	fn ignored(result: Result<(), QueryError>) -> Option<LeaseIgnored> {
+		match result {
+			Err(QueryError::Runtime(RuntimeError::QueryLeaseIgnored { reason, .. })) => {
+				Some(reason)
+			}
+			_ => None,
+		}
+	}
+
+	/// ADR 628 B0 (replaces the Stage A pin
+	/// `adr628_a_renewal_after_retirement_is_acked_without_being_applied`): a renewal for a retired,
+	/// receipt-held query is answered `Ignored { ReceiptHeld }` and surfaces as `QueryLeaseIgnored`;
+	/// the store is unchanged and a later write is still `QueryLeaseMissing`.
+	#[tokio::test]
+	async fn a_renewal_after_retirement_is_ignored_over_the_wire() {
+		use crate::distributed::namespace_lifecycle::QueryTerminalCause;
+		use crate::distributed::partition_store::PartitionStoreError;
+		let query_id = QueryId::from_u128(628);
+		let (store, worker, memory) = retired_store_worker(query_id);
 		let (client, server) = test_duplex(1024 * 1024);
 		let served = tokio::spawn(async move { worker.handle_connection(server).await });
-		ToronCoordinator::new(memory)
+		let result = ToronCoordinator::new(memory)
 			.issue_or_renew_query_lease_on_worker(client, query_id)
-			.await
-			.expect("current behaviour: QueryLeaseAccepted for a retired query");
-		served.await.expect("worker task").expect("worker ok");
-
-		let after = store.lifecycle_snapshot();
+			.await;
 		assert_eq!(
-			(after.active_leases, after.receipts),
-			(0, 1),
-			"the renewal was a no-op"
+			ignored(result),
+			Some(LeaseIgnored::ReceiptHeld {
+				cause: QueryTerminalCause::Success
+			})
 		);
-		let error = written(1).expect_err("a write after the ACKed renewal");
+		served.await.expect("worker task").expect("worker ok");
+		let after = store.lifecycle_snapshot();
+		assert_eq!((after.active_leases, after.receipts), (0, 1));
+		assert!(matches!(
+			lease_test_write(&store, query_id, 1),
+			Err(PartitionStoreError::QueryLeaseMissing { query_id: id }) if id == query_id
+		));
+	}
+
+	/// ADR 628 B0: the lease outcome crosses the real transports: `Applied` and `Ignored` over QUIC
+	/// and over TCP.
+	#[tokio::test]
+	async fn lease_outcomes_cross_quic_and_tcp() {
+		use crate::distributed::namespace_lifecycle::QueryTerminalCause;
+		use crate::server::transport::{QuicTransport, TcpTransport};
+		let retired = QueryId::from_u128(631);
+		let fresh = QueryId::from_u128(632);
+		for transport_name in ["quic", "tcp"] {
+			for query_id in [retired, fresh] {
+				let (store, worker, memory) = retired_store_worker(retired);
+				let result = if transport_name == "quic" {
+					let endpoint = QuicEndpoint::bind_loopback("127.0.0.1:0".parse().unwrap())
+						.expect("bind QUIC worker");
+					let address = endpoint.local_addr().expect("worker address");
+					let served = tokio::spawn(spawn_one_quic_worker(endpoint.clone(), worker));
+					let stream = QuicTransport::new()
+						.expect("QUIC transport")
+						.connect(address.to_string().as_str())
+						.await
+						.expect("connect worker");
+					let result = ToronCoordinator::new(memory)
+						.issue_or_renew_query_lease_on_worker(stream, query_id)
+						.await;
+					served.await.expect("worker task").expect("worker ok");
+					endpoint.close();
+					result
+				} else {
+					let bind_listener = tokio::net::TcpListener::bind;
+					let listener = bind_listener("127.0.0.1:0").await.expect("bind listener");
+					let address = listener.local_addr().expect("listener addr");
+					let served = tokio::spawn(async move {
+						let (stream, _) = listener.accept().await.expect("accept");
+						worker.handle_connection(stream).await
+					});
+					let stream = TcpTransport::new()
+						.connect(address.to_string().as_str())
+						.await
+						.expect("connect worker");
+					let result = ToronCoordinator::new(memory)
+						.issue_or_renew_query_lease_on_worker(stream, query_id)
+						.await;
+					served.await.expect("worker task").expect("worker ok");
+					result
+				};
+				if query_id == retired {
+					assert_eq!(
+						ignored(result),
+						Some(LeaseIgnored::ReceiptHeld {
+							cause: QueryTerminalCause::Success
+						}),
+						"{transport_name}"
+					);
+				} else {
+					assert!(result.is_ok(), "{transport_name}: {result:?}");
+					assert_eq!(
+						store.lifecycle_snapshot().active_leases,
+						1,
+						"{transport_name}"
+					);
+				}
+			}
+		}
+	}
+
+	/// ADR 628 B0: a client stream whose shutdown stalls forever or fails.
+	struct ShutdownMisbehaves<S> {
+		inner: S,
+		fail: bool,
+	}
+
+	impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ShutdownMisbehaves<S> {
+		fn poll_read(
+			mut self: std::pin::Pin<&mut Self>,
+			cx: &mut std::task::Context<'_>,
+			buf: &mut tokio::io::ReadBuf<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+		}
+	}
+
+	impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ShutdownMisbehaves<S> {
+		fn poll_write(
+			mut self: std::pin::Pin<&mut Self>,
+			cx: &mut std::task::Context<'_>,
+			buf: &[u8],
+		) -> std::task::Poll<std::io::Result<usize>> {
+			std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+		}
+
+		fn poll_flush(
+			mut self: std::pin::Pin<&mut Self>,
+			cx: &mut std::task::Context<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+		}
+
+		fn poll_shutdown(
+			self: std::pin::Pin<&mut Self>,
+			_cx: &mut std::task::Context<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			if self.fail {
+				std::task::Poll::Ready(Err(std::io::Error::new(
+					std::io::ErrorKind::BrokenPipe,
+					"injected shutdown failure",
+				)))
+			} else {
+				std::task::Poll::Pending
+			}
+		}
+	}
+
+	/// ADR 628 B0: a valid `Ignored` is returned at the reply, typed, whether the close would stall
+	/// or fail; `Applied` still requires the whole exchange (a stalled close holds it, a failing
+	/// close fails it).
+	#[tokio::test]
+	async fn an_ignored_renewal_returns_at_the_reply_despite_a_misbehaving_close() {
+		use crate::distributed::namespace_lifecycle::QueryTerminalCause;
+		let retired = QueryId::from_u128(650);
+		let fresh = QueryId::from_u128(651);
+		for fail in [false, true] {
+			let (_store, worker, memory) = retired_store_worker(retired);
+			let (client, server) = test_duplex(1024 * 1024);
+			tokio::spawn(async move { worker.handle_connection(server).await });
+			let result = tokio::time::timeout(
+				Duration::from_secs(2),
+				ToronCoordinator::new(memory).issue_or_renew_query_lease_on_worker(
+					ShutdownMisbehaves {
+						inner: client,
+						fail,
+					},
+					retired,
+				),
+			)
+			.await
+			.expect("Ignored must not wait for the close");
+			assert_eq!(
+				ignored(result),
+				Some(LeaseIgnored::ReceiptHeld {
+					cause: QueryTerminalCause::Success
+				}),
+				"fail={fail}"
+			);
+
+			let (_store, worker, memory) = retired_store_worker(retired);
+			let (client, server) = test_duplex(1024 * 1024);
+			tokio::spawn(async move { worker.handle_connection(server).await });
+			let applied = tokio::time::timeout(
+				Duration::from_millis(300),
+				ToronCoordinator::new(memory).issue_or_renew_query_lease_on_worker(
+					ShutdownMisbehaves {
+						inner: client,
+						fail,
+					},
+					fresh,
+				),
+			)
+			.await;
+			if fail {
+				assert!(
+					matches!(applied, Ok(Err(QueryError::Io(_)))),
+					"a failing close fails an Applied exchange: {applied:?}"
+				);
+			} else {
+				assert!(
+					applied.is_err(),
+					"a stalled close holds an Applied exchange"
+				);
+			}
+		}
+	}
+
+	/// ADR 628 B0: a version-2 `QueryLease` is rejected at the envelope, before the lifecycle is
+	/// touched.
+	#[tokio::test]
+	async fn a_version_two_lease_is_rejected_before_any_mutation() {
+		let query_id = QueryId::from_u128(633);
+		let (store, worker, _memory) = retired_store_worker(QueryId::from_u128(634));
+		let (mut client, server) = test_duplex(1024 * 1024);
+		let served = tokio::spawn(async move { worker.handle_connection(server).await });
+		let mut envelope = WireEnvelope::try_new(
+			MessageKind::QueryLease,
+			EnvelopeIdentity::query(query_id),
+			None,
+			None,
+			encode_payload(&QueryLeasePayload {
+				query_id,
+				lease_term_millis: store.query_lease_term_millis(),
+			}),
+		)
+		.expect("envelope");
+		envelope.protocol_version = ProtocolVersion::new(2);
+		send_envelope(&mut client, &envelope)
+			.await
+			.expect("send v2 lease");
+		let outcome = served.await.expect("worker task");
 		assert!(
-			matches!(error, PartitionStoreError::QueryLeaseMissing { query_id: id } if id == query_id),
-			"{error:?}"
+			matches!(
+				outcome,
+				Err(QueryError::Runtime(RuntimeError::ProtocolMismatch { .. }))
+			),
+			"{outcome:?}"
 		);
+		assert_eq!(store.lifecycle_snapshot().active_leases, 0);
+	}
+
+	/// ADR 628 B0: a scripted worker answering one renewal with an arbitrary reply envelope.
+	async fn renewal_against_reply(
+		reply: impl FnOnce(QueryLeasePayload) -> WireEnvelope + Send + 'static,
+	) -> Result<(), QueryError> {
+		let (client, mut server) = test_duplex(1024 * 1024);
+		let memory = Arc::new(MemoryManager::new(1, 1024 * 1024));
+		tokio::spawn(async move {
+			let memory = MemoryManager::new(1, 1024 * 1024);
+			let lease = read_envelope(&mut server, &memory).await.expect("lease");
+			let payload: QueryLeasePayload = decode_payload(&lease.payload).expect("lease payload");
+			send_envelope(&mut server, &reply(payload))
+				.await
+				.expect("reply");
+			let _ = read_envelope(&mut server, &memory).await;
+		});
+		ToronCoordinator::new(memory)
+			.issue_or_renew_query_lease_on_worker(client, QueryId::from_u128(640))
+			.await
+	}
+
+	fn lease_reply(identity: EnvelopeIdentity, payload: Vec<u8>) -> WireEnvelope {
+		WireEnvelope::try_new(
+			MessageKind::QueryLeaseAccepted,
+			identity,
+			None,
+			None,
+			payload,
+		)
+		.expect("reply envelope")
+	}
+
+	/// ADR 628 B0: a reply for another envelope identity or query, an `Applied` with another term,
+	/// or an unknown outcome is a protocol error, never a renewal.
+	#[tokio::test]
+	async fn malformed_lease_replies_are_rejected() {
+		let applied = |payload: QueryLeasePayload| QueryLeaseAcceptedPayload {
+			query_id: payload.query_id,
+			outcome: QueryLeaseOutcome::Applied {
+				term_ms: payload.lease_term_millis,
+			},
+		};
+		assert!(
+			renewal_against_reply(move |p| lease_reply(
+				EnvelopeIdentity::query(p.query_id),
+				encode_payload(&applied(p))
+			))
+			.await
+			.is_ok(),
+			"the well-formed reply is a renewal"
+		);
+		let wrong_identity = renewal_against_reply(move |p| {
+			lease_reply(
+				EnvelopeIdentity::query(QueryId::from_u128(9)),
+				encode_payload(&applied(p)),
+			)
+		})
+		.await;
+		assert!(
+			matches!(wrong_identity, Err(QueryError::UnexpectedMessage { .. })),
+			"{wrong_identity:?}"
+		);
+		let wrong_query = renewal_against_reply(move |p| {
+			let mut reply = applied(p);
+			reply.query_id = QueryId::from_u128(9);
+			lease_reply(EnvelopeIdentity::query(p.query_id), encode_payload(&reply))
+		})
+		.await;
+		assert!(
+			matches!(wrong_query, Err(QueryError::UnexpectedMessage { .. })),
+			"{wrong_query:?}"
+		);
+		let wrong_term = renewal_against_reply(move |p| {
+			let reply = QueryLeaseAcceptedPayload {
+				query_id: p.query_id,
+				outcome: QueryLeaseOutcome::Applied {
+					term_ms: p.lease_term_millis + 1,
+				},
+			};
+			lease_reply(EnvelopeIdentity::query(p.query_id), encode_payload(&reply))
+		})
+		.await;
+		assert!(
+			matches!(wrong_term, Err(QueryError::UnexpectedMessage { .. })),
+			"{wrong_term:?}"
+		);
+		let unknown_outcome = renewal_against_reply(move |p| {
+			let reply = QueryLeaseAcceptedPayload {
+				query_id: p.query_id,
+				outcome: QueryLeaseOutcome::Applied { term_ms: 0 },
+			};
+			let mut bytes = encode_payload(&reply);
+			// postcard: the outcome discriminant precedes the one-byte varint term 0.
+			let discriminant = bytes.len() - 2;
+			bytes[discriminant] = 7;
+			lease_reply(EnvelopeIdentity::query(p.query_id), bytes)
+		})
+		.await;
+		assert!(
+			matches!(unknown_outcome, Err(QueryError::Wire(_))),
+			"{unknown_outcome:?}"
+		);
+	}
+
+	/// ADR 628 B0: a worker that answers the dispatch's issuance with `Ignored { reason }` and then
+	/// records whether a `StartTask` ever arrives.
+	struct IgnoringWorkerTransport {
+		reason: LeaseIgnored,
+		saw_start: Arc<std::sync::atomic::AtomicBool>,
+		dials: Arc<std::sync::atomic::AtomicUsize>,
+		served: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+	}
+
+	#[async_trait::async_trait]
+	impl ToronTransport for IgnoringWorkerTransport {
+		async fn connect(
+			&self,
+			_address: &str,
+		) -> Result<Box<dyn self::transport::ToronStream>, QueryError> {
+			self.dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			let (client, mut server) = test_duplex(1024 * 1024);
+			let (reason, saw_start) = (self.reason, self.saw_start.clone());
+			let handle = tokio::spawn(async move {
+				let memory = MemoryManager::new(1, 1024 * 1024);
+				let lease = read_envelope(&mut server, &memory).await.expect("lease");
+				let payload: QueryLeasePayload =
+					decode_payload(&lease.payload).expect("lease payload");
+				send_payload(
+					&mut server,
+					MessageKind::QueryLeaseAccepted,
+					EnvelopeIdentity::query(payload.query_id),
+					None,
+					&QueryLeaseAcceptedPayload {
+						query_id: payload.query_id,
+						outcome: QueryLeaseOutcome::Ignored { reason },
+					},
+				)
+				.await
+				.expect("ignored reply");
+				if let Ok(next) = read_envelope(&mut server, &memory).await {
+					if next.kind == MessageKind::StartTask {
+						saw_start.store(true, std::sync::atomic::Ordering::SeqCst);
+					}
+				}
+			});
+			self.served.lock().expect("served").push(handle);
+			Ok(Box::new(client))
+		}
+	}
+
+	/// ADR 628 B0: an ignored issuance sends NO `StartTask` and is not retried as a fresh issuance.
+	/// Scheduler-only callers (no `ActiveQueryHandle`) get the non-retryable kind alone
+	/// (`QueryLeaseExpired` for `Expired`, `QueryLeaseMissing` otherwise); on the coordinator path
+	/// the handle's lease is also failed, naming the worker.
+	#[tokio::test]
+	async fn an_ignored_issuance_sends_no_start_task_and_fails_the_dispatch() {
+		use crate::distributed::namespace_lifecycle::QueryTerminalCause;
+		let cases = [
+			(LeaseIgnored::Expired, TaskFailureKind::QueryLeaseExpired),
+			(
+				LeaseIgnored::Retiring {
+					cause: QueryTerminalCause::Abandoned,
+				},
+				TaskFailureKind::QueryLeaseMissing,
+			),
+			(
+				LeaseIgnored::ReceiptHeld {
+					cause: QueryTerminalCause::Success,
+				},
+				TaskFailureKind::QueryLeaseMissing,
+			),
+		];
+		for with_handle in [false, true] {
+			for (reason, expected) in cases.clone() {
+				let transport = Arc::new(IgnoringWorkerTransport {
+					reason,
+					saw_start: Arc::default(),
+					dials: Arc::default(),
+					served: Arc::default(),
+				});
+				let registry = crate::distributed::cancellation::ActiveQueryRegistry::new();
+				let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(41));
+				let handle = guard.handle();
+				let mut dispatcher = NetworkTaskDispatcher::new(
+					Arc::new(MemoryManager::new(4, 1024 * 1024)),
+					transport.clone(),
+				);
+				if with_handle {
+					dispatcher = dispatcher.with_active_query(Some(handle.clone()));
+				}
+				let worker = adr628_worker();
+				let outcome = dispatcher
+					.dispatch(&worker, &final_result_task_spec(41))
+					.await;
+				assert!(
+					matches!(&outcome, DispatchOutcome::Failed(kind) if *kind == expected),
+					"{reason:?}: {outcome:?}"
+				);
+				for served in transport.served.lock().expect("served").drain(..) {
+					served.await.expect("scripted worker");
+				}
+				assert!(
+					!transport
+						.saw_start
+						.load(std::sync::atomic::Ordering::SeqCst),
+					"{reason:?}"
+				);
+				assert_eq!(
+					transport.dials.load(std::sync::atomic::Ordering::SeqCst),
+					1,
+					"{reason:?}"
+				);
+				let failed = handle.lease_failure_worker();
+				if with_handle {
+					assert_eq!(failed, Some(worker.worker_id), "{reason:?}");
+				} else {
+					assert_eq!(failed, None, "{reason:?}");
+				}
+				handle.mark_terminal();
+			}
+		}
 	}
 
 	/// ADR 628 Stage A: a worker that grants the dispatch's query lease and accepts `StartTask`,
@@ -3479,6 +3950,9 @@ mod tests {
 					None,
 					&QueryLeaseAcceptedPayload {
 						query_id: payload.query_id,
+						outcome: QueryLeaseOutcome::Applied {
+							term_ms: payload.lease_term_millis,
+						},
 					},
 				)
 				.await
@@ -5885,6 +6359,15 @@ where
 			execution.await
 		};
 
+		if let (
+			Err(QueryError::Runtime(RuntimeError::QueryLeaseIgnored { .. })),
+			Some(active_query),
+		) = (&result, &self.active_query)
+		{
+			// ADR 628 B0: an ignored issuance ends the query's reliance on this worker, as an
+			// ignored renewal does. Scheduler-only callers (no handle) get the dispatch outcome only.
+			active_query.fail_query_lease(worker.worker_id);
+		}
 		match result {
 			Ok(completion) => DispatchOutcome::CompletedWithTelemetry {
 				output: completion.output,
@@ -6082,12 +6565,43 @@ impl ToronCoordinator {
 			});
 		}
 		let payload: QueryLeaseAcceptedPayload = decode_payload(&response.payload)?;
-		if payload.query_id != query_id || response.identity != EnvelopeIdentity::query(query_id) {
+		// ADR 628 B0: a valid `Ignored` ends reliance at the reply. The typed refusal is returned
+		// at once; the stream is dropped without awaiting a close, so a stalled or failing shutdown
+		// can neither delay `fail_query_lease` nor replace the reason. Only `Applied` requires the
+		// whole exchange to complete.
+		self.lease_outcome(&response, &payload, query_id)??;
+		finish_terminal_exchange(&mut stream, Ok(())).await
+	}
+
+	/// ADR 628 B0: validates a lease reply after its version and kind: the envelope's query
+	/// identity, the payload's query, and the outcome. `Applied` must carry exactly the requested
+	/// term; `Ignored` becomes `QueryLeaseIgnored` with its typed reason. Anything else is a protocol
+	/// error, never treated as applied.
+	fn lease_outcome(
+		&self,
+		response: &crate::wire::WireEnvelope,
+		payload: &QueryLeaseAcceptedPayload,
+		query_id: crate::distributed::identity::QueryId,
+	) -> Result<Result<(), QueryError>, QueryError> {
+		if response.identity != EnvelopeIdentity::query(query_id) || payload.query_id != query_id {
 			return Err(QueryError::UnexpectedMessage {
 				expected: "QueryLeaseAccepted for requested query",
 			});
 		}
-		finish_terminal_exchange(&mut stream, Ok(())).await
+		match payload.outcome {
+			QueryLeaseOutcome::Applied { term_ms } if term_ms == self.query_lease_term_millis => {
+				Ok(Ok(()))
+			}
+			QueryLeaseOutcome::Applied { .. } => Err(QueryError::UnexpectedMessage {
+				expected: "QueryLeaseAccepted applied with the requested term",
+			}),
+			QueryLeaseOutcome::Ignored { reason } => {
+				Ok(Err(QueryError::Runtime(RuntimeError::QueryLeaseIgnored {
+					query_id,
+					reason,
+				})))
+			}
+		}
 	}
 
 	pub async fn retire_query_on_worker<Stream>(
@@ -6181,11 +6695,9 @@ impl ToronCoordinator {
 			});
 		}
 		let lease: QueryLeaseAcceptedPayload = decode_payload(&lease_response.payload)?;
-		if lease.query_id != identity.query_id {
-			return Err(QueryError::UnexpectedMessage {
-				expected: "QueryLeaseAccepted for task query",
-			});
-		}
+		// ADR 628 B0: an ignored issuance sends NO StartTask; the dispatch fails with the typed
+		// refusal and is never retried as a fresh issuance.
+		self.lease_outcome(&lease_response, &lease, identity.query_id)??;
 		send_payload(
 			&mut stream,
 			MessageKind::StartTask,
@@ -6649,6 +7161,15 @@ fn dispatch_failure_kind(error: QueryError) -> TaskFailureKind {
 		| QueryError::Storage(StorageError::Cancelled) => TaskFailureKind::Cancelled,
 		QueryError::Runtime(RuntimeError::ProtocolMismatch { .. }) => {
 			TaskFailureKind::ProtocolMismatch
+		}
+		// ADR 628 B0: an ignored issuance is a non-retryable lease refusal (`failure_retryable`
+		// is false for both kinds); the taxonomy is unchanged.
+		QueryError::Runtime(RuntimeError::QueryLeaseIgnored {
+			reason: LeaseIgnored::Expired,
+			..
+		}) => TaskFailureKind::QueryLeaseExpired,
+		QueryError::Runtime(RuntimeError::QueryLeaseIgnored { .. }) => {
+			TaskFailureKind::QueryLeaseMissing
 		}
 		QueryError::Frontend(crate::error::FrontendError::RuneSandbox { kind, .. }) => {
 			rune_sandbox_task_failure_kind(&kind)

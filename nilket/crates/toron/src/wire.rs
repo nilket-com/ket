@@ -2,7 +2,7 @@ use crate::distributed::budget::{BudgetDimension, ByteCount};
 use crate::distributed::identity::{
 	AttemptId, FrameByteLen, LeaseEpoch, QueryId, StreamSeq, TaskIdentity, WorkerId,
 };
-use crate::distributed::namespace_lifecycle::QueryTerminalCause;
+use crate::distributed::namespace_lifecycle::{LeaseIgnored, QueryTerminalCause};
 use crate::distributed::task::{
 	PartitionAddress, RowCount, TaskCompletionOutput, TaskSpec, TaskTelemetry, TraceContext,
 };
@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 pub struct ProtocolVersion(pub u16);
 
 impl ProtocolVersion {
-	pub const CURRENT: Self = Self(2);
+	/// ADR 628 B0: version 3 carries the lease outcome on `QueryLeaseAccepted`.
+	pub const CURRENT: Self = Self(3);
 
 	pub const fn new(value: u16) -> Self {
 		Self(value)
@@ -292,6 +293,16 @@ pub struct QueryLeasePayload {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryLeaseAcceptedPayload {
 	pub query_id: QueryId,
+	pub outcome: QueryLeaseOutcome,
+}
+
+/// ADR 628 B0: what the worker did with an issuance or renewal, at its lifecycle lock. `Applied`
+/// carries the worker's term, which must equal the requested term; it certifies application only,
+/// not the namespace incarnation, later retirement, write completion or task cancellation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueryLeaseOutcome {
+	Applied { term_ms: u64 },
+	Ignored { reason: LeaseIgnored },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -406,7 +417,8 @@ mod tests {
 			Vec::new(),
 		)
 		.expect("envelope");
-		envelope.protocol_version = ProtocolVersion::new(3);
+		let other = ProtocolVersion::new(ProtocolVersion::CURRENT.get() + 1);
+		envelope.protocol_version = other;
 
 		let error = envelope
 			.validate_runtime(ProtocolVersion::CURRENT, FrameByteLen::from_u32(1024))
@@ -416,8 +428,8 @@ mod tests {
 			error,
 			RuntimeError::ProtocolMismatch {
 				expected: ProtocolVersion::CURRENT,
-				observed: ProtocolVersion(3)
-			}
+				observed,
+			} if observed == other
 		));
 	}
 

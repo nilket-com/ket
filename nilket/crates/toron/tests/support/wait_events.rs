@@ -218,6 +218,22 @@ fn whole_frame_event(whole: &[u8], len: u64) -> Option<(&'static str, serde_json
 				}),
 			))
 		}
+		MessageKind::QueryLeaseAccepted => {
+			// ADR 628 B0: the worker's lease outcome (Applied with its term, or Ignored and why).
+			let p: toron::wire::QueryLeaseAcceptedPayload =
+				toron::wire::decode_payload(&envelope.payload).ok()?;
+			let outcome = match p.outcome {
+				toron::wire::QueryLeaseOutcome::Applied { term_ms } => {
+					serde_json::json!({ "outcome": "Applied", "term_ms": term_ms })
+				}
+				toron::wire::QueryLeaseOutcome::Ignored { reason } => {
+					serde_json::json!({ "outcome": "Ignored", "reason": format!("{reason:?}") })
+				}
+			};
+			let mut fields = serde_json::json!({ "query": p.query_id.get().to_string() });
+			fields.as_object_mut()?.extend(outcome.as_object()?.clone());
+			Some(("query_lease_outcome", fields))
+		}
 		MessageKind::PartitionData => {
 			let p: toron::wire::PartitionDataPayload =
 				toron::wire::decode_payload(&envelope.payload).ok()?;

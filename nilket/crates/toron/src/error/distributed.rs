@@ -164,6 +164,12 @@ pub enum RuntimeError {
 	PartitionStoreMismatch { message: String },
 	#[error("task failure: {kind:?}")]
 	TaskFailure { kind: TaskFailureKind },
+	/// ADR 628 B0: the worker answered a lease issuance or renewal with `Ignored`.
+	#[error("query lease ignored by worker for {query_id:?}: {reason:?}")]
+	QueryLeaseIgnored {
+		query_id: crate::distributed::identity::QueryId,
+		reason: crate::distributed::namespace_lifecycle::LeaseIgnored,
+	},
 }
 
 #[cfg(test)]

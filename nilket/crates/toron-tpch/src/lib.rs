@@ -10842,6 +10842,9 @@ fn execution_census_query_error_reason(error: &QueryError) -> String {
 			"runtime_partition_store_mismatch".to_string()
 		}
 		QueryError::Runtime(RuntimeError::TaskFailure { kind }) => task_failure_reason(kind),
+		QueryError::Runtime(RuntimeError::QueryLeaseIgnored { .. }) => {
+			"runtime_query_lease_ignored".to_string()
+		}
 		QueryError::Io(_) => "query_io".to_string(),
 		QueryError::Arrow(_) => "query_arrow".to_string(),
 		QueryError::Remote { .. } => "query_remote".to_string(),

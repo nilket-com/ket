@@ -947,6 +947,7 @@ fn runtime_error_class(error: &RuntimeError) -> &'static str {
 		RuntimeError::ProtocolMismatch { .. } => "protocol_mismatch",
 		RuntimeError::PartitionStoreMismatch { .. } => "partition_store_mismatch",
 		RuntimeError::TaskFailure { kind } => task_failure_error_class(kind),
+		RuntimeError::QueryLeaseIgnored { .. } => "query_lease_ignored",
 	}
 }
 

@@ -1888,7 +1888,26 @@ fn spawn_query_lease_renewal_task_with_cadence<Transport>(
 						),
 					)
 					.await
-					.is_ok_and(|result| result.is_ok()),
+					.is_ok_and(|result| match result {
+						Ok(()) => true,
+						Err(error) => {
+							// ADR 628 B0: an `Ignored` reply ends reliance on this worker at the
+							// reply; its typed reason is recorded.
+							if let QueryError::Runtime(RuntimeError::QueryLeaseIgnored {
+								reason,
+								..
+							}) = &error
+							{
+								tracing::warn!(
+									reason = ?reason,
+									query_id = ?active_query.key().query_id,
+									worker_id = ?worker.worker_id,
+									"query lease renewal ignored by worker"
+								);
+							}
+							false
+						}
+					}),
 					Ok(Err(error)) => {
 						tracing::warn!(
 							error = %error,
@@ -4131,6 +4150,7 @@ mod tests {
 	use crate::distributed::identity::{
 		AttemptId, LeaseEpoch, StageId, StreamSeq, TaskId, TaskIdentity, WorkerId,
 	};
+	use crate::distributed::namespace_lifecycle::LeaseIgnored;
 	use crate::distributed::task::TaskCompletionOutput;
 	use crate::distributed::worker_registry::StaticWorkerRegistry;
 	use crate::distributed::worker_registry::{
@@ -4148,9 +4168,9 @@ mod tests {
 	};
 	use crate::wire::{
 		ArrowIpcBytes, CancelTaskPayload, EnvelopeIdentity, MessageKind, QueryLeaseAcceptedPayload,
-		QueryLeasePayload, QueryRetiredPayload, RetireQueryPayload, StartTaskPayload,
-		TaskBatchPayload, TaskCancelledPayload, TaskCompletePayload, TaskFailedPayload,
-		TaskStartedPayload, WireEnvelope, decode_payload, encode_payload,
+		QueryLeaseOutcome, QueryLeasePayload, QueryRetiredPayload, RetireQueryPayload,
+		StartTaskPayload, TaskBatchPayload, TaskCancelledPayload, TaskCompletePayload,
+		TaskFailedPayload, TaskStartedPayload, WireEnvelope, decode_payload, encode_payload,
 	};
 	use arrow::array::Int64Array;
 	use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -4645,6 +4665,16 @@ mod tests {
 		connect_delay: Duration,
 		ack_delay: Duration,
 	) -> (Option<Duration>, usize, bool) {
+		lease_reply_run(connect_delay, ack_delay, None, None, false).await
+	}
+
+	async fn lease_reply_run(
+		connect_delay: Duration,
+		ack_delay: Duration,
+		ignore: Option<LeaseIgnored>,
+		term_override: Option<u64>,
+		stall_shutdown: bool,
+	) -> (Option<Duration>, usize, bool) {
 		let registry = ActiveQueryRegistry::new();
 		let guard = registry.register(TenantId(7), QueryId::from_u128(1));
 		let handle = guard.handle();
@@ -4657,6 +4687,9 @@ mod tests {
 				connect_delay,
 				ack_delay,
 				renewals: renewals.clone(),
+				ignore,
+				term_override,
+				stall_shutdown,
 			}),
 			Arc::new(MemoryManager::new(1, 1024 * 1024)),
 			handle.clone(),
@@ -4705,6 +4738,55 @@ mod tests {
 		let (stopped, _, failed) =
 			adr628_renewal_run(Duration::from_millis(90), Duration::from_millis(90)).await;
 		assert!(!failed && stopped.is_none());
+	}
+
+	/// ADR 628 B0: an `Ignored` renewal ends the query's reliance on that worker at the reply (the
+	/// first 5 ms tick, not tick + the 100 ms bound), naming it, for every reason.
+	#[tokio::test(start_paused = true)]
+	async fn an_ignored_renewal_ends_reliance_at_the_reply() {
+		for reason in [
+			LeaseIgnored::Expired,
+			LeaseIgnored::Retiring {
+				cause: QueryTerminalCause::Abandoned,
+			},
+			LeaseIgnored::ReceiptHeld {
+				cause: QueryTerminalCause::Success,
+			},
+		] {
+			let (stopped, _, failed) =
+				lease_reply_run(Duration::ZERO, Duration::ZERO, Some(reason), None, false).await;
+			assert!(failed, "{reason:?}");
+			assert_eq!(stopped, Some(Duration::from_millis(5)), "{reason:?}");
+			// A stalled close cannot delay it: the reply alone ends reliance.
+			let (stopped, _, failed) =
+				lease_reply_run(Duration::ZERO, Duration::ZERO, Some(reason), None, true).await;
+			assert!(failed, "{reason:?} with a stalled close");
+			assert_eq!(
+				stopped,
+				Some(Duration::from_millis(5)),
+				"{reason:?} with a stalled close"
+			);
+		}
+	}
+
+	/// ADR 628 B0: an `Applied` reply carrying a term other than the requested one is a protocol
+	/// error, never a renewal.
+	#[tokio::test(start_paused = true)]
+	async fn an_applied_reply_with_another_term_is_not_a_renewal() {
+		let (stopped, _, failed) =
+			lease_reply_run(Duration::ZERO, Duration::ZERO, None, Some(1), false).await;
+		assert!(failed);
+		assert_eq!(stopped, Some(Duration::from_millis(5)));
+	}
+
+	/// ADR 628 B0: `Applied` still requires the whole exchange: with a stalled close it fails at the
+	/// operation bound (tick + 100 ms), as before.
+	#[tokio::test(start_paused = true)]
+	async fn an_applied_renewal_with_a_stalled_close_fails_at_the_bound() {
+		let (stopped, _, failed) =
+			lease_reply_run(Duration::ZERO, Duration::ZERO, None, None, true).await;
+		assert!(failed);
+		assert_eq!(stopped, Some(Duration::from_millis(5 + 100)));
 	}
 
 	#[tokio::test]
@@ -5499,6 +5581,9 @@ mod tests {
 					None,
 					&QueryLeaseAcceptedPayload {
 						query_id: payload.query_id,
+						outcome: QueryLeaseOutcome::Applied {
+							term_ms: payload.lease_term_millis,
+						},
 					},
 				)
 				.await
@@ -5514,6 +5599,49 @@ mod tests {
 		connect_delay: Duration,
 		ack_delay: Duration,
 		renewals: Arc<AtomicUsize>,
+		/// ADR 628 B0: reply `Ignored` with this reason instead of `Applied`.
+		ignore: Option<LeaseIgnored>,
+		/// ADR 628 B0: reply `Applied` with this term instead of the requested one.
+		term_override: Option<u64>,
+		/// ADR 628 B0: the client stream's shutdown stalls forever.
+		stall_shutdown: bool,
+	}
+
+	/// ADR 628 B0: a client stream whose shutdown never completes.
+	struct StallingShutdown(DuplexStream);
+
+	impl tokio::io::AsyncRead for StallingShutdown {
+		fn poll_read(
+			mut self: std::pin::Pin<&mut Self>,
+			cx: &mut std::task::Context<'_>,
+			buf: &mut tokio::io::ReadBuf<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+		}
+	}
+
+	impl tokio::io::AsyncWrite for StallingShutdown {
+		fn poll_write(
+			mut self: std::pin::Pin<&mut Self>,
+			cx: &mut std::task::Context<'_>,
+			buf: &[u8],
+		) -> std::task::Poll<std::io::Result<usize>> {
+			std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+		}
+
+		fn poll_flush(
+			mut self: std::pin::Pin<&mut Self>,
+			cx: &mut std::task::Context<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			std::pin::Pin::new(&mut self.0).poll_flush(cx)
+		}
+
+		fn poll_shutdown(
+			self: std::pin::Pin<&mut Self>,
+			_cx: &mut std::task::Context<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			std::task::Poll::Pending
+		}
 	}
 
 	#[async_trait::async_trait]
@@ -5522,6 +5650,8 @@ mod tests {
 			tokio::time::sleep(self.connect_delay).await;
 			let (client, mut server) = test_duplex(1024 * 1024);
 			let (ack_delay, renewals) = (self.ack_delay, self.renewals.clone());
+			let (ignore, term_override) = (self.ignore, self.term_override);
+			let stall_shutdown = self.stall_shutdown;
 			tokio::spawn(async move {
 				let Ok(lease) = read_test_envelope(&mut server).await else {
 					return;
@@ -5537,6 +5667,12 @@ mod tests {
 					None,
 					&QueryLeaseAcceptedPayload {
 						query_id: payload.query_id,
+						outcome: match ignore {
+							Some(reason) => QueryLeaseOutcome::Ignored { reason },
+							None => QueryLeaseOutcome::Applied {
+								term_ms: term_override.unwrap_or(payload.lease_term_millis),
+							},
+						},
 					},
 				)
 				.await
@@ -5545,6 +5681,9 @@ mod tests {
 					renewals.fetch_add(1, Ordering::SeqCst);
 				}
 			});
+			if stall_shutdown {
+				return Ok(Box::new(StallingShutdown(client)));
+			}
 			Ok(Box::new(client))
 		}
 	}
@@ -5578,6 +5717,9 @@ mod tests {
 					None,
 					&QueryLeaseAcceptedPayload {
 						query_id: lease.query_id,
+						outcome: QueryLeaseOutcome::Applied {
+							term_ms: lease.lease_term_millis,
+						},
 					},
 				)
 				.await?;

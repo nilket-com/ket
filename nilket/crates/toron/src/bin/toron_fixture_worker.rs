@@ -435,7 +435,10 @@ impl toron::distributed::partition_store::PartitionStore for LeaseApplicationSto
 		self.inner.query_lease_term_millis()
 	}
 
-	fn issue_or_renew_query_lease(&self, query_id: toron::distributed::identity::QueryId) {
+	fn issue_or_renew_query_lease(
+		&self,
+		query_id: toron::distributed::identity::QueryId,
+	) -> toron::distributed::namespace_lifecycle::LeaseRenewal {
 		let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 		let before = self.inner.lifecycle_snapshot().active_leases;
 		if let Some(log) = &self.log {
@@ -445,15 +448,25 @@ impl toron::distributed::partition_store::PartitionStore for LeaseApplicationSto
 				serde_json::json!({ "query": query_id.get().to_string(), "call": call, "active_leases_before": before }),
 			);
 		}
-		self.inner.issue_or_renew_query_lease(query_id);
+		let renewal = self.inner.issue_or_renew_query_lease(query_id);
 		let after = self.inner.lifecycle_snapshot().active_leases;
 		if let Some(log) = &self.log {
+			// ADR 628 B0: the call's own outcome, as the lifecycle decided it.
+			let outcome = match renewal {
+				toron::distributed::namespace_lifecycle::LeaseRenewal::Applied => {
+					"Applied".to_string()
+				}
+				toron::distributed::namespace_lifecycle::LeaseRenewal::Ignored(reason) => {
+					format!("Ignored({reason:?})")
+				}
+			};
 			log.emit(
 				"lease_apply_end",
 				"served",
-				serde_json::json!({ "query": query_id.get().to_string(), "call": call, "active_leases_after": after }),
+				serde_json::json!({ "query": query_id.get().to_string(), "call": call, "active_leases_after": after, "outcome": outcome }),
 			);
 		}
+		renewal
 	}
 
 	fn retire_query(
