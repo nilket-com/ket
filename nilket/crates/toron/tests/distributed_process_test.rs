@@ -4127,8 +4127,32 @@ fn spec_str(raw: &serde_json::Value, name: &str) -> String {
 		.to_string()
 }
 
+/// The spec's transport, unobserved: loopback QUIC for a loopback spec, otherwise authenticated QUIC
+/// with the spec's identity. ADR 628 B1.B's survey dials through this directly.
+fn spec_transport(raw: &serde_json::Value) -> Arc<dyn ToronTransport> {
+	// ADR 628 Stage A: a loopback spec drives loopback fixture workers (the child coordinator of the
+	// owner-disappearance control); every host spec stays authenticated.
+	if raw["loopback"].as_bool() == Some(true) {
+		Arc::new(QuicTransport::new().expect("loopback QUIC transport"))
+	} else {
+		let client = toron::network::tls::client_config_from_paths(
+			std::path::Path::new(&spec_str(raw, "tls_cert")),
+			std::path::Path::new(&spec_str(raw, "tls_key")),
+			std::path::Path::new(&spec_str(raw, "tls_ca")),
+		)
+		.expect("probe client TLS material");
+		Arc::new(
+			QuicTransport::authenticated(client, spec_str(raw, "cluster_domain"))
+				.expect("authenticated transport"),
+		)
+	}
+}
+
 fn load_probe_spec() -> ProbeSpec {
-	let path = std::env::var("TORON_MULTINODE_SPEC").expect("TORON_MULTINODE_SPEC");
+	load_probe_spec_from(&std::env::var("TORON_MULTINODE_SPEC").expect("TORON_MULTINODE_SPEC"))
+}
+
+fn load_probe_spec_from(path: &str) -> ProbeSpec {
 	let raw: serde_json::Value =
 		serde_json::from_str(&std::fs::read_to_string(&path).expect("read spec"))
 			.expect("parse spec");
@@ -4151,22 +4175,7 @@ fn load_probe_spec() -> ProbeSpec {
 		!workers.is_empty(),
 		"a probe spec must name at least one worker"
 	);
-	// ADR 628 Stage A: a loopback spec drives loopback fixture workers (the child coordinator of the
-	// owner-disappearance control); every host spec stays authenticated.
-	let transport: Arc<dyn ToronTransport> = if raw["loopback"].as_bool() == Some(true) {
-		Arc::new(QuicTransport::new().expect("loopback QUIC transport"))
-	} else {
-		let client = toron::network::tls::client_config_from_paths(
-			std::path::Path::new(&spec_str(&raw, "tls_cert")),
-			std::path::Path::new(&spec_str(&raw, "tls_key")),
-			std::path::Path::new(&spec_str(&raw, "tls_ca")),
-		)
-		.expect("probe client TLS material");
-		Arc::new(
-			QuicTransport::authenticated(client, spec_str(&raw, "cluster_domain"))
-				.expect("authenticated transport"),
-		)
-	};
+	let transport = spec_transport(&raw);
 	let attempt_dir = std::path::PathBuf::from(spec_str(&raw, "attempt_dir"));
 	let wait_log = (raw["wait_events"].as_bool() == Some(true)).then(|| {
 		wait_events::EventLog::create(&attempt_dir.join("probe_events.jsonl"))
@@ -7818,4 +7827,1348 @@ fn write_owner_evidence(dir: &std::path::Path, evidence: &serde_json::Value) {
 				.as_bytes(),
 		)
 		.expect("write owner evidence");
+}
+
+// ---- ADR 628 B1.B: extended-budget renewal timing survey (test-only; no production change) ----
+//
+// Nominal diagnostic boundary. The survey decides whether a synthetic id may still be renewed with
+// `send + term` on the coordinator's steady clock: ρ = 0, no suspend, no restart. It is a
+// diagnostic schedule rule only. It is NOT B1.A's conservative reliance boundary and certifies nothing.
+
+/// The largest lease reply the survey reads; a longer frame is a protocol failure.
+const SURVEY_MAX_REPLY_BYTES: usize = 64 * 1024;
+
+/// The survey's frozen per-phase budgets and whole-exchange bound.
+#[derive(Clone, Copy, Debug)]
+struct SurveyBudgets {
+	connect: std::time::Duration,
+	write: std::time::Duration,
+	ack: std::time::Duration,
+	close: std::time::Duration,
+	whole: std::time::Duration,
+}
+
+/// The survey's frozen parameters. `term` is the declared lease term (production: the worker's
+/// configured term); tests pass a short one.
+#[derive(Clone, Copy, Debug)]
+struct SurveyParams {
+	cadence: std::time::Duration,
+	duration: std::time::Duration,
+	term: std::time::Duration,
+	budgets: SurveyBudgets,
+	/// Renewal ATTEMPTS per id (any outcome); successful refreshes are counted separately.
+	renewal_attempts_per_id: u64,
+	/// An id is retired once this long has passed since its issuance send marker.
+	id_max_age: std::time::Duration,
+}
+
+impl SurveyParams {
+	fn from_spec(raw: &serde_json::Value, term: std::time::Duration) -> Self {
+		let ms = |v: &serde_json::Value, name: &str| {
+			std::time::Duration::from_millis(v[name].as_u64().unwrap_or_else(|| panic!("{name}")))
+		};
+		let b = &raw["budgets_ms"];
+		Self {
+			cadence: ms(raw, "cadence_ms"),
+			duration: std::time::Duration::from_secs(
+				raw["duration_secs"].as_u64().expect("duration_secs"),
+			),
+			term,
+			budgets: SurveyBudgets {
+				connect: ms(b, "connect"),
+				write: ms(b, "write"),
+				ack: ms(b, "ack"),
+				close: ms(b, "close"),
+				whole: ms(b, "whole"),
+			},
+			renewal_attempts_per_id: raw["renewal_attempts_per_id"]
+				.as_u64()
+				.expect("renewal_attempts_per_id"),
+			id_max_age: ms(raw, "id_max_age_ms"),
+		}
+	}
+
+	/// The frozen consistency rules: phases fit the whole bound; a whole exchange plus the cadence fit
+	/// the term; an id's age limit fits the term.
+	fn check(&self) {
+		let b = self.budgets;
+		assert!(
+			b.connect + b.write + b.ack + b.close <= b.whole,
+			"phase budgets exceed the whole bound"
+		);
+		assert!(
+			b.whole + self.cadence <= self.term,
+			"whole bound plus cadence must fit the term"
+		);
+		assert!(
+			self.id_max_age + b.whole <= self.term,
+			"the id age limit plus a whole exchange must fit the term"
+		);
+		assert!(self.cadence > std::time::Duration::ZERO && self.duration >= self.cadence);
+	}
+
+	fn evidence(&self) -> serde_json::Value {
+		let ms = |d: std::time::Duration| d.as_millis() as u64;
+		serde_json::json!({
+			"cadence_ms": ms(self.cadence),
+			"duration_ms": ms(self.duration),
+			"term_ms": ms(self.term),
+			"renewal_attempts_per_id": self.renewal_attempts_per_id,
+			"id_max_age_ms": ms(self.id_max_age),
+			"budgets_ms": {
+				"connect": ms(self.budgets.connect), "write": ms(self.budgets.write), "ack": ms(self.budgets.ack),
+				"close": ms(self.budgets.close), "whole": ms(self.budgets.whole),
+			},
+			"max_reply_bytes": SURVEY_MAX_REPLY_BYTES,
+			"boundary": "nominal diagnostic: send + term on the coordinator's steady clock (rho = 0, no suspend, no restart); not B1.A's reliance boundary",
+		})
+	}
+}
+
+/// The phases of one exchange, each with an explicit start and exactly one terminal mark; the whole
+/// bound's cut is recorded on the phase that was active.
+#[derive(Default)]
+struct PhaseTrace {
+	phases: Vec<serde_json::Value>,
+}
+
+impl PhaseTrace {
+	fn begin(&mut self, name: &str, at: u64) {
+		self.phases
+			.push(serde_json::json!({ "phase": name, "start_us": at }));
+	}
+
+	fn mark(&mut self, key: &str, at: u64, error: Option<String>) {
+		let last = self.phases.last_mut().expect("an active phase");
+		last[key] = at.into();
+		if let Some(error) = error {
+			last["error"] = error.into();
+		}
+	}
+
+	fn active(&self) -> bool {
+		self.phases.last().is_some_and(|p| {
+			!["end_us", "budget_expired_us", "error_us", "whole_cut_us"]
+				.iter()
+				.any(|k| p.get(*k).is_some())
+		})
+	}
+}
+
+/// Runs one budgeted phase: its start is recorded; it ends, expires its budget (censored) or fails.
+async fn survey_phase<T, F>(
+	trace: &std::sync::Mutex<PhaseTrace>,
+	log: &wait_events::EventLog,
+	name: &str,
+	budget: Option<std::time::Duration>,
+	future: F,
+) -> Result<T, (&'static str, String)>
+where
+	F: std::future::Future<Output = Result<T, (&'static str, String)>>,
+{
+	trace.lock().expect("trace").begin(name, log.now_us());
+	let outcome = match budget {
+		Some(budget) => match tokio::time::timeout(budget, future).await {
+			Ok(result) => result,
+			Err(_) => {
+				trace
+					.lock()
+					.expect("trace")
+					.mark("budget_expired_us", log.now_us(), None);
+				return Err(("budget_expired", format!("{name} budget expired")));
+			}
+		},
+		None => future.await,
+	};
+	match outcome {
+		Ok(value) => {
+			trace
+				.lock()
+				.expect("trace")
+				.mark("end_us", log.now_us(), None);
+			Ok(value)
+		}
+		Err((kind, error)) => {
+			trace
+				.lock()
+				.expect("trace")
+				.mark("error_us", log.now_us(), Some(error.clone()));
+			Err((kind, error))
+		}
+	}
+}
+
+/// One lease exchange (issuance or renewal): connect, write (`send_us` = the exact send marker, the
+/// write phase's start), ACK read (length-checked), validate (decode, protocol version and payload
+/// length via `validate_runtime`, kind, identity, query, outcome, term) and close, each budgeted
+/// except validate (CPU only), all under the whole bound. Every outcome is data: a decoded outcome is
+/// kept even when a later phase fails.
+async fn survey_exchange(
+	transport: &Arc<dyn ToronTransport>,
+	worker: &(WorkerId, WorkerEndpoint),
+	query_id: QueryId,
+	term_ms: u64,
+	budgets: SurveyBudgets,
+	log: &wait_events::EventLog,
+) -> serde_json::Value {
+	use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+	use toron::distributed::identity::FrameByteLen;
+	use toron::wire::{
+		EnvelopeIdentity, MessageKind, ProtocolVersion, QueryLeaseAcceptedPayload,
+		QueryLeaseOutcome, QueryLeasePayload, WireEnvelope, decode_payload, encode_payload,
+	};
+	let trace = Arc::new(std::sync::Mutex::new(PhaseTrace::default()));
+	let decoded: Arc<std::sync::Mutex<serde_json::Value>> = Arc::default();
+	let start_us = log.now_us();
+	let exchange = {
+		let (trace, decoded) = (trace.clone(), decoded.clone());
+		async move {
+			let mut stream = survey_phase(&trace, log, "connect", Some(budgets.connect), async {
+				transport
+					.connect_peer(&worker.0, &worker.1)
+					.await
+					.map_err(|e| ("transport_error", format!("{e:?}")))
+			})
+			.await?;
+			let frame = WireEnvelope::try_new(
+				MessageKind::QueryLease,
+				EnvelopeIdentity::query(query_id),
+				None,
+				None,
+				encode_payload(&QueryLeasePayload {
+					query_id,
+					lease_term_millis: term_ms,
+				}),
+			)
+			.expect("lease envelope")
+			.encode();
+			survey_phase(&trace, log, "write", Some(budgets.write), async {
+				let io = |e: std::io::Error| ("transport_error", e.to_string());
+				stream
+					.write_all(&(frame.len() as u32).to_le_bytes())
+					.await
+					.map_err(io)?;
+				stream.write_all(&frame).await.map_err(io)?;
+				stream.flush().await.map_err(io)
+			})
+			.await?;
+			let reply = survey_phase(&trace, log, "ack", Some(budgets.ack), async {
+				let io = |e: std::io::Error| ("transport_error", e.to_string());
+				let mut len = [0u8; 4];
+				stream.read_exact(&mut len).await.map_err(io)?;
+				let len = u32::from_le_bytes(len) as usize;
+				if len > SURVEY_MAX_REPLY_BYTES {
+					return Err((
+						"protocol_error",
+						format!(
+							"reply frame of {len} bytes over the {SURVEY_MAX_REPLY_BYTES} limit"
+						),
+					));
+				}
+				let mut body = vec![0u8; len];
+				stream.read_exact(&mut body).await.map_err(io)?;
+				Ok(body)
+			})
+			.await?;
+			survey_phase(&trace, log, "validate", None, async {
+				let protocol = |e: String| ("protocol_error", e);
+				let envelope =
+					WireEnvelope::decode(&reply).map_err(|e| protocol(format!("{e:?}")))?;
+				envelope
+					.validate_runtime(
+						ProtocolVersion::CURRENT,
+						FrameByteLen(SURVEY_MAX_REPLY_BYTES as u32),
+					)
+					.map_err(|e| protocol(format!("{e:?}")))?;
+				if envelope.kind != MessageKind::QueryLeaseAccepted
+					|| envelope.identity != EnvelopeIdentity::query(query_id)
+				{
+					return Err(protocol(format!(
+						"reply {:?} for {:?}",
+						envelope.kind, envelope.identity
+					)));
+				}
+				let payload: QueryLeaseAcceptedPayload =
+					decode_payload(&envelope.payload).map_err(|e| protocol(format!("{e:?}")))?;
+				if payload.query_id != query_id {
+					return Err(protocol("reply for another query".to_string()));
+				}
+				let mut out = decoded.lock().expect("decoded");
+				match payload.outcome {
+					QueryLeaseOutcome::Applied { term_ms: applied } if applied == term_ms => {
+						*out = serde_json::json!({ "outcome": "Applied", "term_ms": applied });
+						Ok(())
+					}
+					QueryLeaseOutcome::Applied { term_ms: applied } => {
+						Err(protocol(format!("Applied with term {applied}")))
+					}
+					QueryLeaseOutcome::Ignored { reason } => {
+						*out = serde_json::json!({ "outcome": "Ignored", "reason": format!("{reason:?}") });
+						Ok(())
+					}
+				}
+			})
+			.await?;
+			survey_phase(&trace, log, "close", Some(budgets.close), async {
+				stream
+					.shutdown()
+					.await
+					.map_err(|e| ("transport_error", e.to_string()))
+			})
+			.await?;
+			Ok::<(), (&'static str, String)>(())
+		}
+	};
+	let result = tokio::time::timeout(budgets.whole, exchange).await;
+	let end_us = log.now_us();
+	let mut trace = std::mem::take(&mut *trace.lock().expect("trace"));
+	let mut record = serde_json::json!({ "start_us": start_us });
+	match result {
+		Ok(Ok(())) => {}
+		Ok(Err((kind, error))) => {
+			record["failure"] = kind.into();
+			record["error"] = error.into();
+		}
+		Err(_) => {
+			record["failure"] = "whole_budget_expired".into();
+			if trace.active() {
+				trace.mark("whole_cut_us", end_us, None);
+			}
+		}
+	}
+	if let Some(write) = trace.phases.iter().find(|p| p["phase"] == "write") {
+		record["send_us"] = write["start_us"].clone();
+	}
+	for (key, value) in decoded
+		.lock()
+		.expect("decoded")
+		.as_object()
+		.cloned()
+		.unwrap_or_default()
+	{
+		record[key] = value;
+	}
+	record["phases"] = serde_json::Value::Array(trace.phases);
+	record["end_us"] = end_us.into();
+	record
+}
+
+/// A refresh is accepted only when the whole exchange completed `Applied`, before the OLD nominal
+/// boundary (renewals), with its NEW send-derived boundary still in the future at completion.
+fn survey_refresh_decision(
+	end_us: u64,
+	send_us: u64,
+	old_boundary_us: Option<u64>,
+	term_us: u64,
+) -> Result<(), &'static str> {
+	if old_boundary_us.is_some_and(|old| end_us >= old) {
+		return Err("rejected: completed at or after the old nominal boundary");
+	}
+	if end_us >= send_us + term_us {
+		return Err("rejected: the new nominal boundary was already unusable at completion");
+	}
+	Ok(())
+}
+
+/// One synthetic id in the survey's ledger.
+#[derive(Clone, Copy)]
+struct SurveyId {
+	query: QueryId,
+	generation: u64,
+	issued_send_us: u64,
+	last_applied_send_us: u64,
+	attempts: u64,
+	refreshes: u64,
+}
+
+/// Retires `query_id` once (any outcome is recorded, never relabelled reclamation).
+async fn survey_retire(
+	transport: &Arc<dyn ToronTransport>,
+	worker: &(WorkerId, WorkerEndpoint),
+	query_id: QueryId,
+	budget: std::time::Duration,
+	log: &wait_events::EventLog,
+	reason: &str,
+	at_end: bool,
+) {
+	let start_us = log.now_us();
+	let retired = tokio::time::timeout(budget, async {
+		let stream = transport.connect_peer(&worker.0, &worker.1).await?;
+		toron::server::ToronCoordinator::new(Arc::new(MemoryManager::new(4, 1024 * 1024)))
+			.retire_query_on_worker(
+				stream,
+				query_id,
+				toron::distributed::namespace_lifecycle::QueryTerminalCause::Success,
+			)
+			.await
+	})
+	.await;
+	log.emit("survey_retired", "survey", serde_json::json!({
+		"worker": worker.0.get().as_u128().to_string(),
+		"query": query_id.get().to_string(),
+		"reason": reason,
+		"at_end": at_end,
+		"start_us": start_us,
+		"end_us": log.now_us(),
+		"result": match retired { Ok(Ok(())) => "retire acknowledged".to_string(), Ok(Err(e)) => format!("error: {e:?}"), Err(_) => "budget expired".to_string() },
+	}));
+}
+
+/// The per-worker survey state machine: one action per tick (issue, renew or retire), fixed-schedule
+/// ticks with `MissedTickBehavior::Skip` (a delayed tick fires once, later ones keep their schedule;
+/// missed ticks are recorded, never caught up). Every attempted id enters the ledger and is retired
+/// exactly once with a declared reason: age, attempts, invalid (nominal validity), ignored, unknown
+/// application (a failed issuance the worker may have applied), refresh rejected, or survey end.
+async fn survey_worker_loop(
+	transport: Arc<dyn ToronTransport>,
+	worker: (WorkerId, WorkerEndpoint),
+	params: SurveyParams,
+	log: Arc<wait_events::EventLog>,
+	started: tokio::time::Instant,
+	started_us: u64,
+) {
+	let worker_text = worker.0.get().as_u128().to_string();
+	let (term_us, whole_us) = (
+		params.term.as_micros() as u64,
+		params.budgets.whole.as_micros() as u64,
+	);
+	let term_ms = params.term.as_millis() as u64;
+	let mut ticks = tokio::time::interval_at(started + params.cadence, params.cadence);
+	ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+	let ends_at = started + params.duration;
+	let mut live: Option<SurveyId> = None;
+	let mut to_retire: Option<(QueryId, &'static str)> = None;
+	let mut generation = 0u64;
+	let mut last_tick = 0u64;
+	// The last scheduled tick inside the observation window: k * cadence < duration.
+	let final_tick = ((params.duration.as_nanos() - 1) / params.cadence.as_nanos().max(1)) as u64;
+	loop {
+		let scheduled = ticks.tick().await;
+		if scheduled >= ends_at {
+			// Ticks skipped just before the end are recorded too, so every scheduled tick is
+			// accounted for.
+			if last_tick < final_tick {
+				log.emit("survey_tick_skipped", "survey", serde_json::json!({ "worker": worker_text, "from_tick": last_tick + 1, "to_tick": final_tick, "at_end": true }));
+			}
+			break;
+		}
+		let actual_us = log.now_us();
+		let tick = ((scheduled - started).as_nanos() / params.cadence.as_nanos().max(1)) as u64;
+		let scheduled_us = started_us + (scheduled - started).as_micros() as u64;
+		if tick > last_tick + 1 {
+			log.emit(
+				"survey_tick_skipped",
+				"survey",
+				serde_json::json!({ "worker": worker_text, "from_tick": last_tick + 1, "to_tick": tick - 1 }),
+			);
+		}
+		last_tick = tick;
+		// One decision per tick, made now.
+		let decided_us = log.now_us();
+		let action = if let Some((query, reason)) = to_retire.take() {
+			("retire", Some(query), reason)
+		} else if let Some(id) = live {
+			if decided_us >= id.issued_send_us + params.id_max_age.as_micros() as u64 {
+				("retire", Some(id.query), "age")
+			} else if id.attempts >= params.renewal_attempts_per_id {
+				("retire", Some(id.query), "attempts")
+			} else if decided_us + whole_us >= id.last_applied_send_us + term_us {
+				("retire", Some(id.query), "invalid")
+			} else {
+				("renewal", Some(id.query), "")
+			}
+		} else {
+			("issuance", None, "")
+		};
+		log.emit(
+			"survey_tick",
+			"survey",
+			serde_json::json!({
+				"worker": worker_text, "tick": tick, "scheduled_us": scheduled_us, "actual_us": actual_us,
+				"decided_us": decided_us, "action": action.0, "reason": action.2,
+			}),
+		);
+		match action {
+			("retire", Some(query), reason) => {
+				if live.is_some_and(|id| id.query == query) {
+					live = None;
+				}
+				survey_retire(
+					&transport,
+					&worker,
+					query,
+					params.budgets.whole,
+					&log,
+					reason,
+					false,
+				)
+				.await;
+			}
+			(kind, query, _) => {
+				let query = query.unwrap_or_else(|| {
+					generation += 1;
+					QueryId::new()
+				});
+				let mut record =
+					survey_exchange(&transport, &worker, query, term_ms, params.budgets, &log)
+						.await;
+				record["worker"] = worker_text.clone().into();
+				record["endpoint"] = worker.1.as_str().into();
+				record["query"] = query.get().to_string().into();
+				record["generation"] = generation.into();
+				record["kind"] = kind.into();
+				record["tick"] = tick.into();
+				record["decided_us"] = decided_us.into();
+				let applied = record["outcome"] == "Applied" && record.get("failure").is_none();
+				let ignored = record["outcome"] == "Ignored";
+				let send_us = record["send_us"].as_u64();
+				let end_us = record["end_us"].as_u64().expect("end_us");
+				if kind == "renewal" {
+					let id = live.as_mut().expect("a renewal of the live id");
+					id.attempts += 1;
+				}
+				let old_boundary = live
+					.filter(|_| kind == "renewal")
+					.map(|id| id.last_applied_send_us + term_us);
+				let refresh = match (applied, send_us) {
+					(true, Some(send_us)) => Some(
+						survey_refresh_decision(end_us, send_us, old_boundary, term_us)
+							.map(|()| send_us),
+					),
+					_ => None,
+				};
+				record["refresh"] = match &refresh {
+					Some(Ok(_)) => "accepted".into(),
+					Some(Err(why)) => (*why).into(),
+					None => serde_json::Value::Null,
+				};
+				log.emit("survey_exchange", "survey", record);
+				match (kind, refresh) {
+					("issuance", Some(Ok(send_us))) => {
+						live = Some(SurveyId {
+							query,
+							generation,
+							issued_send_us: send_us,
+							last_applied_send_us: send_us,
+							attempts: 0,
+							refreshes: 0,
+						});
+					}
+					("issuance", _) => {
+						to_retire = Some((
+							query,
+							if ignored {
+								"ignored"
+							} else if refresh.is_some() {
+								"refresh rejected"
+							} else {
+								"unknown application"
+							},
+						));
+					}
+					(_, Some(Ok(send_us))) => {
+						let id = live.as_mut().expect("live id");
+						id.last_applied_send_us = send_us;
+						id.refreshes += 1;
+					}
+					(_, Some(Err(_))) => {
+						live = None;
+						to_retire = Some((query, "refresh rejected"));
+					}
+					_ if ignored => {
+						live = None;
+						to_retire = Some((query, "ignored"));
+					}
+					// Any other renewal failure keeps the id; its validity is checked at the next tick.
+					_ => {}
+				}
+				if let Some(id) = live {
+					log.emit(
+						"survey_ledger",
+						"survey",
+						serde_json::json!({
+							"worker": worker_text, "query": id.query.get().to_string(), "generation": id.generation,
+							"attempts": id.attempts, "refreshes": id.refreshes,
+						}),
+					);
+				}
+			}
+		}
+	}
+	// Survey end: every id still open is retired once.
+	if let Some((query, reason)) = to_retire.take() {
+		survey_retire(
+			&transport,
+			&worker,
+			query,
+			params.budgets.whole,
+			&log,
+			reason,
+			true,
+		)
+		.await;
+	}
+	if let Some(id) = live.take() {
+		survey_retire(
+			&transport,
+			&worker,
+			id.query,
+			params.budgets.whole,
+			&log,
+			"survey end",
+			true,
+		)
+		.await;
+	}
+}
+
+/// ADR 628 B1.B: the extended-budget renewal timing survey (spec via `TORON_MULTINODE_SPEC`; see
+/// `run_renewal_survey`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "ADR 628 B1.B survey: needs TORON_MULTINODE_SPEC and running host-mode workers"]
+async fn renewal_timing_survey() {
+	run_renewal_survey(load_probe_spec()).await;
+}
+
+/// ADR 628 B1.B development smoke: the same survey against three managed loopback fixture workers
+/// (no hosts, no campaign). `TORON_ADR628_DIR` receives the spec, the worker logs and the survey log;
+/// `TORON_ADR628_SURVEY` (optional) is a JSON object overriding spec fields (condition, duration...).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "ADR 628 B1.B development smoke: run explicitly with TORON_ADR628_DIR"]
+async fn renewal_timing_survey_on_loopback() {
+	let dir =
+		std::path::PathBuf::from(std::env::var("TORON_ADR628_DIR").expect("TORON_ADR628_DIR"));
+	std::fs::create_dir(&dir).expect("a fresh survey directory");
+	with_quic(async {
+		let mut workers = Vec::new();
+		for id in 62_831..=62_833u128 {
+			workers.push(
+				MANAGED_LIFECYCLE
+					.scope(
+						(),
+						FixtureWorkerProcess::spawn_recorded(
+							WorkerId::from_u128(id),
+							Some(&dir.join(format!("dials-{id}.txt"))),
+							Some(&dir.join(format!("worker-{id}.jsonl"))),
+						),
+					)
+					.await,
+			);
+		}
+		let mut spec = serde_json::json!({
+			"workers": workers.iter().map(|w| serde_json::json!({ "worker_u128": w.worker_id.get().as_u128().to_string(), "endpoint": w.endpoint.as_str() })).collect::<Vec<_>>(),
+			"loopback": true,
+			"cluster_domain": "loopback",
+			"deadline_secs": 120,
+			"wait_events": false,
+			"attempt_dir": dir.display().to_string(),
+			"condition": "idle",
+			"duration_secs": 30,
+			"cadence_ms": 1000,
+			"renewal_attempts_per_id": 3,
+			"id_max_age_ms": 8000,
+			"budgets_ms": { "connect": 2000, "write": 2000, "ack": 2000, "close": 2000, "whole": 8000 },
+		});
+		if let Ok(overrides) = std::env::var("TORON_ADR628_SURVEY") {
+			let overrides: serde_json::Value = serde_json::from_str(&overrides).expect("survey overrides");
+			for (key, value) in overrides.as_object().expect("an object") {
+				spec[key] = value.clone();
+			}
+		}
+		let path = dir.join("survey.spec.json");
+		std::fs::write(&path, serde_json::to_string_pretty(&spec).expect("spec")).expect("write spec");
+		run_renewal_survey(load_probe_spec_from(path.to_str().expect("utf-8 path"))).await;
+		// The coverage tail: every managed worker records a reaper pass after the survey ends.
+		tokio::time::sleep(ADR628_COVERAGE_TAIL).await;
+		for worker in &mut workers {
+			worker.shutdown().await;
+		}
+	})
+	.await;
+}
+
+/// The survey. Spec: the ADR 627 host fields plus `condition` ("idle" | "load"), `duration_secs`,
+/// `cadence_ms`, `renewal_attempts_per_id`, `id_max_age_ms` and `budgets_ms` {connect, write, ack,
+/// close, whole}. The term is the worker's configured lease term. One state-machine task per worker
+/// (concurrency = the worker count; one exchange at a time per worker). Under "load",
+/// `long_join_last` runs back to back on the coordinator path; its events go to the SAME log as the
+/// survey (one clock), bracketed by `load_window_start` / `load_window_end`.
+async fn run_renewal_survey(spec: ProbeSpec) {
+	let raw = spec.raw.clone();
+	let condition = spec_str(&raw, "condition");
+	assert!(
+		matches!(condition.as_str(), "idle" | "load"),
+		"condition {condition}"
+	);
+	let term =
+		toron::distributed::namespace_lifecycle::ShuffleLifecycleConfig::from_worker_loss_window(
+			toron::distributed::partition_store::DEFAULT_WORKER_LOST_AFTER,
+		)
+		.expect("config")
+		.lease_term();
+	let params = SurveyParams::from_spec(&raw, term);
+	params.check();
+	let log = wait_events::EventLog::create(&spec.attempt_dir.join("survey_events.jsonl"))
+		.expect("fresh survey events");
+	let transport = spec_transport(&raw);
+	let started = tokio::time::Instant::now();
+	let started_us = log.now_us();
+	log.emit_at(
+		started_us,
+		"survey_start",
+		"survey",
+		serde_json::json!({
+			"condition": condition,
+			"started_us": started_us,
+			"params": params.evidence(),
+			"workers": spec.workers.iter().map(|(id, endpoint)| serde_json::json!({ "worker": id.get().as_u128().to_string(), "endpoint": endpoint.as_str() })).collect::<Vec<_>>(),
+		}),
+	);
+	let mut tasks = Vec::new();
+	for worker in spec.workers.clone() {
+		tasks.push(tokio::spawn(survey_worker_loop(
+			transport.clone(),
+			worker,
+			params,
+			log.clone(),
+			started,
+			started_us,
+		)));
+	}
+	let load = (condition == "load").then(|| {
+		let log = log.clone();
+		let workers = spec.workers.clone();
+		let observed: Arc<dyn ToronTransport> = Arc::new(wait_events::ObservedTransport {
+			inner: spec_transport(&raw),
+			log: log.clone(),
+			role: "dispatch",
+		});
+		let ends_at = started + params.duration;
+		tokio::spawn(async move {
+			let mut index = 0u64;
+			while tokio::time::Instant::now() < ends_at {
+				log.emit(
+					"load_window_start",
+					"survey",
+					serde_json::json!({ "index": index }),
+				);
+				let evidence = adr627_run(
+					Adr627Path::Coordinator,
+					"long_join_last",
+					&workers,
+					observed.clone(),
+					log.clone(),
+					None,
+					None,
+					std::time::Duration::from_secs(120),
+				)
+				.await;
+				log.emit(
+					"load_window_end",
+					"survey",
+					serde_json::json!({
+						"index": index,
+						"outcome": evidence["result"]["outcome"].clone(),
+						"error_task_failure": evidence["result"]["error_task_failure"].clone(),
+					}),
+				);
+				index += 1;
+			}
+		})
+	});
+	for task in tasks {
+		task.await.expect("survey worker");
+	}
+	if let Some(load) = load {
+		load.await.expect("load loop");
+	}
+	log.emit(
+		"survey_end",
+		"survey",
+		serde_json::json!({ "instrument_failed": log.failed() }),
+	);
+	assert!(!log.failed(), "the survey log must be complete");
+}
+
+// ---- ADR 628 B1.B instrument controls (scripted workers; no hosts) ----
+
+/// How a scripted lease worker misbehaves on one exchange.
+#[derive(Clone, Copy, Default)]
+struct ScriptedLease {
+	connect_delay_ms: u64,
+	/// The worker never reads, and the client stream's buffer is tiny: the write blocks.
+	block_write: bool,
+	ack_delay_ms: u64,
+	/// Blocks the worker THREAD (not the task) before replying, starving a current-thread runtime.
+	starve_ms: u64,
+	ignore: bool,
+	wrong_version: bool,
+	oversized: bool,
+	wrong_term: bool,
+	stall_close: bool,
+}
+
+struct ScriptedLeaseTransport {
+	script: Arc<std::sync::Mutex<std::collections::VecDeque<ScriptedLease>>>,
+}
+
+#[async_trait::async_trait]
+impl ToronTransport for ScriptedLeaseTransport {
+	async fn connect(
+		&self,
+		_address: &str,
+	) -> Result<Box<dyn toron::server::transport::ToronStream>, toron::error::QueryError> {
+		use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+		use toron::wire::{
+			EnvelopeIdentity, MessageKind, ProtocolVersion, QueryLeaseAcceptedPayload,
+			QueryLeaseOutcome, QueryLeasePayload, WireEnvelope, decode_payload, encode_payload,
+		};
+		let step = self
+			.script
+			.lock()
+			.expect("script")
+			.pop_front()
+			.unwrap_or_default();
+		tokio::time::sleep(std::time::Duration::from_millis(step.connect_delay_ms)).await;
+		let (client, mut server) = tokio::io::duplex(if step.block_write { 4 } else { 1 << 16 });
+		tokio::spawn(async move {
+			if step.block_write {
+				std::future::pending::<()>().await;
+			}
+			let mut len = [0u8; 4];
+			if server.read_exact(&mut len).await.is_err() {
+				return;
+			}
+			let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
+			if server.read_exact(&mut body).await.is_err() {
+				return;
+			}
+			if RetireRequest::is_retire(&body) {
+				return RetireRequest::answer(server, &body).await;
+			}
+			let request: QueryLeasePayload =
+				decode_payload(&WireEnvelope::decode(&body).expect("lease").payload)
+					.expect("payload");
+			tokio::time::sleep(std::time::Duration::from_millis(step.ack_delay_ms)).await;
+			if step.starve_ms > 0 {
+				std::thread::sleep(std::time::Duration::from_millis(step.starve_ms));
+			}
+			if step.oversized {
+				let _ = server.write_all(&(1u32 << 30).to_le_bytes()).await;
+				return;
+			}
+			let outcome = if step.ignore {
+				QueryLeaseOutcome::Ignored {
+					reason: toron::distributed::namespace_lifecycle::LeaseIgnored::Expired,
+				}
+			} else {
+				QueryLeaseOutcome::Applied {
+					term_ms: request.lease_term_millis + u64::from(step.wrong_term),
+				}
+			};
+			let mut envelope = WireEnvelope::try_new(
+				MessageKind::QueryLeaseAccepted,
+				EnvelopeIdentity::query(request.query_id),
+				None,
+				None,
+				encode_payload(&QueryLeaseAcceptedPayload {
+					query_id: request.query_id,
+					outcome,
+				}),
+			)
+			.expect("reply");
+			if step.wrong_version {
+				envelope.protocol_version =
+					ProtocolVersion::new(ProtocolVersion::CURRENT.get() + 1);
+			}
+			let frame = envelope.encode();
+			let _ = server.write_all(&(frame.len() as u32).to_le_bytes()).await;
+			let _ = server.write_all(&frame).await;
+			let _ = server.flush().await;
+			if step.stall_close {
+				std::future::pending::<()>().await;
+			}
+			let mut rest = Vec::new();
+			let _ = server.read_to_end(&mut rest).await;
+		});
+		if step.stall_close {
+			return Ok(Box::new(StallingClose(client)));
+		}
+		Ok(Box::new(client))
+	}
+}
+
+/// Answers a scripted `RetireQuery` with `QueryRetired`.
+struct RetireRequest;
+
+impl RetireRequest {
+	fn is_retire(body: &[u8]) -> bool {
+		toron::wire::WireEnvelope::decode(body)
+			.is_ok_and(|e| e.kind == toron::wire::MessageKind::RetireQuery)
+	}
+
+	async fn answer(mut server: tokio::io::DuplexStream, body: &[u8]) {
+		use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+		let envelope = toron::wire::WireEnvelope::decode(body).expect("retire");
+		let reply = toron::wire::WireEnvelope::try_new(
+			toron::wire::MessageKind::QueryRetired,
+			envelope.identity,
+			None,
+			None,
+			envelope.payload.clone(),
+		)
+		.expect("retired")
+		.encode();
+		let _ = server.write_all(&(reply.len() as u32).to_le_bytes()).await;
+		let _ = server.write_all(&reply).await;
+		let mut rest = Vec::new();
+		let _ = server.read_to_end(&mut rest).await;
+	}
+}
+
+/// A client stream whose shutdown never completes.
+struct StallingClose(tokio::io::DuplexStream);
+
+impl tokio::io::AsyncRead for StallingClose {
+	fn poll_read(
+		mut self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+		buf: &mut tokio::io::ReadBuf<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+	}
+}
+
+impl tokio::io::AsyncWrite for StallingClose {
+	fn poll_write(
+		mut self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+		buf: &[u8],
+	) -> std::task::Poll<std::io::Result<usize>> {
+		std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+	}
+	fn poll_flush(
+		mut self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		std::pin::Pin::new(&mut self.0).poll_flush(cx)
+	}
+	fn poll_shutdown(
+		self: std::pin::Pin<&mut Self>,
+		_cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		std::task::Poll::Pending
+	}
+}
+
+fn scripted(steps: Vec<ScriptedLease>) -> Arc<dyn ToronTransport> {
+	Arc::new(ScriptedLeaseTransport {
+		script: Arc::new(std::sync::Mutex::new(steps.into())),
+	})
+}
+
+fn survey_test_log() -> (tempfile_dir::Dir, Arc<wait_events::EventLog>) {
+	let dir = tempfile_dir::Dir::new();
+	let log = wait_events::EventLog::create(&dir.path().join("survey_events.jsonl")).expect("log");
+	(dir, log)
+}
+
+/// Minimal temp-dir helper for the survey controls.
+mod tempfile_dir {
+	pub struct Dir(std::path::PathBuf);
+
+	impl Dir {
+		pub fn new() -> Self {
+			let path = std::env::temp_dir().join(format!("adr628-survey-{}", uuid::Uuid::now_v7()));
+			std::fs::create_dir(&path).expect("temp dir");
+			Self(path)
+		}
+
+		pub fn path(&self) -> &std::path::Path {
+			&self.0
+		}
+	}
+
+	impl Drop for Dir {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+}
+
+fn test_budgets(ms: u64) -> SurveyBudgets {
+	let d = std::time::Duration::from_millis(ms);
+	SurveyBudgets {
+		connect: d,
+		write: d,
+		ack: d,
+		close: d,
+		whole: d * 3,
+	}
+}
+
+fn test_worker() -> (WorkerId, WorkerEndpoint) {
+	(
+		WorkerId::from_u128(62_899),
+		WorkerEndpoint::new("scripted://survey"),
+	)
+}
+
+/// ADR 628 B1.B control: every failure class is classified and timed. A wrong version or wrong term is
+/// a protocol error in `validate`; an oversized frame a protocol error in `ack` (not transport); the
+/// whole bound cutting the connect, write, ack or close phase marks that phase `whole_cut_us`; an
+/// Ignored reply is an outcome, not a failure.
+#[tokio::test]
+async fn survey_exchange_classifies_every_failure() {
+	let (_dir, log) = survey_test_log();
+	let query = QueryId::new();
+	let run = |step: ScriptedLease, budgets: SurveyBudgets| {
+		let log = log.clone();
+		async move {
+			survey_exchange(
+				&scripted(vec![step]),
+				&test_worker(),
+				query,
+				35_001,
+				budgets,
+				&log,
+			)
+			.await
+		}
+	};
+	let phase = |r: &serde_json::Value, name: &str| {
+		r["phases"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|p| p["phase"] == name)
+			.cloned()
+	};
+	let ok = run(ScriptedLease::default(), test_budgets(500)).await;
+	assert_eq!(
+		(ok["outcome"].as_str(), ok.get("failure")),
+		(Some("Applied"), None),
+		"{ok}"
+	);
+	assert_eq!(
+		ok["phases"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.map(|p| p["phase"].as_str().unwrap())
+			.collect::<Vec<_>>(),
+		["connect", "write", "ack", "validate", "close"]
+	);
+	assert_eq!(
+		ok["send_us"],
+		phase(&ok, "write").unwrap()["start_us"],
+		"the send marker is the write's start"
+	);
+	let ignored = run(
+		ScriptedLease {
+			ignore: true,
+			..Default::default()
+		},
+		test_budgets(500),
+	)
+	.await;
+	assert_eq!(
+		(ignored["outcome"].as_str(), ignored.get("failure")),
+		(Some("Ignored"), None)
+	);
+	let version = run(
+		ScriptedLease {
+			wrong_version: true,
+			..Default::default()
+		},
+		test_budgets(500),
+	)
+	.await;
+	assert_eq!(version["failure"], "protocol_error");
+	assert!(
+		phase(&version, "validate")
+			.unwrap()
+			.get("error_us")
+			.is_some(),
+		"{version}"
+	);
+	let term = run(
+		ScriptedLease {
+			wrong_term: true,
+			..Default::default()
+		},
+		test_budgets(500),
+	)
+	.await;
+	assert_eq!(term["failure"], "protocol_error");
+	let oversized = run(
+		ScriptedLease {
+			oversized: true,
+			..Default::default()
+		},
+		test_budgets(500),
+	)
+	.await;
+	assert_eq!(oversized["failure"], "protocol_error");
+	assert!(
+		phase(&oversized, "ack").unwrap().get("error_us").is_some(),
+		"{oversized}"
+	);
+	// The whole bound (here smaller than one phase budget) cuts each phase in turn.
+	let tight = SurveyBudgets {
+		whole: std::time::Duration::from_millis(100),
+		..test_budgets(1000)
+	};
+	for (step, name) in [
+		(
+			ScriptedLease {
+				connect_delay_ms: 400,
+				..Default::default()
+			},
+			"connect",
+		),
+		(
+			ScriptedLease {
+				block_write: true,
+				..Default::default()
+			},
+			"write",
+		),
+		(
+			ScriptedLease {
+				ack_delay_ms: 400,
+				..Default::default()
+			},
+			"ack",
+		),
+		(
+			ScriptedLease {
+				stall_close: true,
+				..Default::default()
+			},
+			"close",
+		),
+	] {
+		let cut = run(step, tight).await;
+		assert_eq!(cut["failure"], "whole_budget_expired", "{name}: {cut}");
+		let last = cut["phases"].as_array().unwrap().last().unwrap().clone();
+		assert_eq!(
+			(last["phase"].as_str(), last.get("whole_cut_us").is_some()),
+			(Some(name), true),
+			"{cut}"
+		);
+	}
+	// A phase's own budget expiring is censored on that phase.
+	let censored = run(
+		ScriptedLease {
+			ack_delay_ms: 300,
+			..Default::default()
+		},
+		SurveyBudgets {
+			ack: std::time::Duration::from_millis(50),
+			..test_budgets(1000)
+		},
+	)
+	.await;
+	assert_eq!(censored["failure"], "budget_expired");
+	assert!(
+		phase(&censored, "ack")
+			.unwrap()
+			.get("budget_expired_us")
+			.is_some()
+	);
+}
+
+/// ADR 628 B1.B control: the refresh rule rejects completion at/after the old boundary and an
+/// already-unusable new boundary.
+#[test]
+fn survey_refresh_decision_rejects_late_completions() {
+	assert_eq!(
+		survey_refresh_decision(900, 100, Some(1_000), 5_000),
+		Ok(())
+	);
+	assert!(
+		survey_refresh_decision(1_000, 100, Some(1_000), 5_000).is_err(),
+		"at the old boundary"
+	);
+	assert!(
+		survey_refresh_decision(6_000, 900, None, 5_000).is_err(),
+		"new boundary unusable"
+	);
+	assert_eq!(survey_refresh_decision(4_000, 100, None, 5_000), Ok(()));
+}
+
+fn survey_test_params(
+	term_ms: u64,
+	cadence_ms: u64,
+	whole_ms: u64,
+	attempts: u64,
+	age_ms: u64,
+	duration_ms: u64,
+) -> SurveyParams {
+	let ms = std::time::Duration::from_millis;
+	let phase = ms(whole_ms / 4);
+	SurveyParams {
+		cadence: ms(cadence_ms),
+		duration: ms(duration_ms),
+		term: ms(term_ms),
+		budgets: SurveyBudgets {
+			connect: phase,
+			write: phase,
+			ack: phase,
+			close: phase,
+			whole: ms(whole_ms),
+		},
+		renewal_attempts_per_id: attempts,
+		id_max_age: ms(age_ms),
+	}
+}
+
+fn survey_events(log_dir: &std::path::Path) -> Vec<serde_json::Value> {
+	std::fs::read_to_string(log_dir.join("survey_events.jsonl"))
+		.expect("log")
+		.lines()
+		.map(|l| serde_json::from_str(l).expect("json"))
+		.collect()
+}
+
+/// ADR 628 B1.B control: a failed renewal attempt keeps the id and a later attempt refreshes it; a
+/// late close (Applied decoded, close budget expired) does not refresh; an issuance whose ACK is lost
+/// is retired as unknown application; every id is retired exactly once; attempts and refreshes are
+/// counted separately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn survey_loop_accounts_for_retries_late_close_and_unknown_application() {
+	let (dir, log) = survey_test_log();
+	let params = survey_test_params(2_000, 100, 400, 10, 1_500, 1_000);
+	params.check();
+	let steps = vec![
+		ScriptedLease::default(), // issuance Applied
+		ScriptedLease {
+			ack_delay_ms: 300,
+			..Default::default()
+		}, // renewal: ack budget (100) expires
+		ScriptedLease::default(), // renewal Applied (refresh)
+		ScriptedLease {
+			stall_close: true,
+			..Default::default()
+		}, // renewal Applied, close budget expires
+		ScriptedLease::default(), // renewal Applied (refresh)
+	];
+	let started = tokio::time::Instant::now();
+	let started_us = log.now_us();
+	survey_worker_loop(
+		scripted(steps),
+		test_worker(),
+		params,
+		log.clone(),
+		started,
+		started_us,
+	)
+	.await;
+	let events = survey_events(dir.path());
+	let exchanges = events
+		.iter()
+		.filter(|e| e["event"] == "survey_exchange")
+		.collect::<Vec<_>>();
+	assert_eq!(exchanges[0]["refresh"], "accepted");
+	assert_eq!(exchanges[1]["failure"], "budget_expired");
+	assert_eq!(exchanges[2]["refresh"], "accepted");
+	assert_eq!(exchanges[3]["failure"], "budget_expired");
+	assert!(
+		exchanges[3]["refresh"].is_null(),
+		"a late close never refreshes"
+	);
+	assert_eq!(exchanges[4]["refresh"], "accepted");
+	// The ledger after the scripted fifth exchange: four renewal attempts, two accepted refreshes.
+	let ledger = events
+		.iter()
+		.filter(|e| e["event"] == "survey_ledger")
+		.nth(4)
+		.expect("ledger");
+	assert_eq!(
+		(ledger["attempts"].as_u64(), ledger["refreshes"].as_u64()),
+		(Some(4), Some(2))
+	);
+	// Every query that had an exchange is retired exactly once.
+	let queries = exchanges
+		.iter()
+		.map(|e| e["query"].as_str().unwrap())
+		.collect::<std::collections::BTreeSet<_>>();
+	for q in queries {
+		assert_eq!(
+			events
+				.iter()
+				.filter(|e| e["event"] == "survey_retired" && e["query"] == q)
+				.count(),
+			1,
+			"{q}"
+		);
+	}
+	// An issuance whose ACK never arrives is retired as unknown application.
+	let (dir, log) = survey_test_log();
+	let steps = vec![
+		ScriptedLease {
+			ack_delay_ms: 300,
+			..Default::default()
+		},
+		ScriptedLease::default(),
+	];
+	survey_worker_loop(
+		scripted(steps),
+		test_worker(),
+		survey_test_params(2_000, 100, 400, 10, 1_500, 350),
+		log.clone(),
+		tokio::time::Instant::now(),
+		log.now_us(),
+	)
+	.await;
+	let events = survey_events(dir.path());
+	let retired = events
+		.iter()
+		.find(|e| e["event"] == "survey_retired")
+		.expect("retired");
+	assert_eq!(retired["reason"], "unknown application");
+}
+
+/// ADR 628 B1.B control (delayed poll): on a current-thread runtime the scripted worker blocks the
+/// THREAD past the old nominal boundary before replying, so the client's timeout cannot fire first;
+/// the Applied that then completes is rejected as a refresh (kept as data) and the id is retired.
+#[tokio::test(flavor = "current_thread")]
+async fn survey_loop_rejects_a_refresh_completed_after_the_old_boundary() {
+	let (dir, log) = survey_test_log();
+	// term 600 ms, cadence 100, whole 400: the renewal at ~100 ms is valid (100 + 400 < 600); the
+	// worker thread then blocks 700 ms, past the issuance's boundary (~600 ms).
+	let params = survey_test_params(600, 100, 400, 10, 150, 450);
+	params.check();
+	let steps = vec![
+		ScriptedLease::default(),
+		ScriptedLease {
+			starve_ms: 700,
+			..Default::default()
+		},
+	];
+	survey_worker_loop(
+		scripted(steps),
+		test_worker(),
+		params,
+		log.clone(),
+		tokio::time::Instant::now(),
+		log.now_us(),
+	)
+	.await;
+	let events = survey_events(dir.path());
+	let renewal = events
+		.iter()
+		.find(|e| e["event"] == "survey_exchange" && e["kind"] == "renewal")
+		.expect("renewal");
+	assert_eq!(renewal["outcome"], "Applied", "{renewal}");
+	assert_eq!(
+		renewal["refresh"], "rejected: completed at or after the old nominal boundary",
+		"{renewal}"
+	);
+	let retired = events
+		.iter()
+		.find(|e| e["event"] == "survey_retired")
+		.expect("retired");
+	assert_eq!(retired["reason"], "refresh rejected");
 }
