@@ -312,6 +312,18 @@ where
 	/// ADR 628 B1.C (instrument seam S1): the transport query lease RENEWAL exchanges use. `None`
 	/// (production) uses `transport`, as dispatch, retirement and cancellation always do.
 	renewal_transport: Option<Arc<dyn ToronTransport>>,
+	/// Test-only: holds or breaks each query's renewal cleanup, to pin its ordering.
+	#[cfg(test)]
+	renewal_cleanup_hook: RenewalCleanupHook,
+}
+
+/// Test-only control of a renewal owner's shutdown: `hold` blocks it until a permit is added; with
+/// `lose_supervisor` the supervisor is aborted before it is awaited (an unverified cleanup).
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct RenewalCleanupHook {
+	pub(crate) hold: Option<Arc<Semaphore>>,
+	pub(crate) lose_supervisor: bool,
 }
 
 impl<Registry, Transport> DistributedQueryCoordinator<Registry, Transport>
@@ -505,7 +517,15 @@ where
 			admin,
 			task_telemetry_retention: None,
 			renewal_transport: None,
+			#[cfg(test)]
+			renewal_cleanup_hook: RenewalCleanupHook::default(),
 		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn with_renewal_cleanup_hook(mut self, hook: RenewalCleanupHook) -> Self {
+		self.renewal_cleanup_hook = hook;
+		self
 	}
 
 	/// ADR 628 B1.C (instrument seam S1): renewal exchanges use `transport` instead of the dispatch
@@ -699,9 +719,12 @@ where
 			active_query_handle.mark_terminal();
 			drop(_active_query);
 			drop(_admitted);
-			drop(sender);
 			retire_remote(query_id, cause, active_query_handle.remote_workers());
+			// ADR 628 B1.C: renewal admission is sealed and the owned renewal shutdown is awaited and
+			// reported BEFORE the final sender is released, so a normal end of stream follows the cleanup
+			// receipt. A failure was already published above (prompt); its cleanup completes here.
 			report_renewal_cleanup(query_id, renewal.shutdown().await);
+			drop(sender);
 		});
 		Ok(DistributedResultStream::new(
 			receiver,
@@ -1015,9 +1038,12 @@ where
 			active_query_handle.mark_terminal();
 			drop(_active_query);
 			drop(_admitted);
-			drop(sender);
 			retire_remote(query_id, cause, active_query_handle.remote_workers());
+			// ADR 628 B1.C: renewal admission is sealed and the owned renewal shutdown is awaited and
+			// reported BEFORE the final sender is released, so a normal end of stream follows the cleanup
+			// receipt. A failure was already published above (prompt); its cleanup completes here.
 			report_renewal_cleanup(query_id, renewal.shutdown().await);
+			drop(sender);
 		});
 		Ok(DistributedResultStream::new(
 			receiver,
@@ -1051,7 +1077,8 @@ where
 		Transport: 'static,
 	{
 		// The only use of the renewal seam (S1).
-		match &self.renewal_transport {
+		#[allow(unused_mut)]
+		let mut owner = match &self.renewal_transport {
 			Some(renewal) => spawn_query_lease_renewal_task(
 				Arc::clone(renewal),
 				Arc::clone(&self.memory),
@@ -1062,7 +1089,12 @@ where
 				Arc::clone(&self.memory),
 				active_query,
 			),
+		};
+		#[cfg(test)]
+		{
+			owner.hook = self.renewal_cleanup_hook.clone();
 		}
+		owner
 	}
 
 	fn remote_retire_spawner(&self) -> RemoteRetireSpawner
@@ -1985,6 +2017,8 @@ pub(crate) struct RenewalOwner {
 	stop: Option<tokio::sync::watch::Sender<bool>>,
 	task: Option<tokio::task::JoinHandle<()>>,
 	cleanup: RenewalCleanup,
+	#[cfg(test)]
+	hook: RenewalCleanupHook,
 }
 
 /// The renewal supervisor's cleanup receipt. Only the supervisor's explicit `done`, sent AFTER it has
@@ -2033,6 +2067,17 @@ impl RenewalOwner {
 	/// means the cleanup could not be verified.
 	pub(crate) async fn shutdown(mut self) -> Result<(), RenewalCleanupError> {
 		self.close();
+		#[cfg(test)]
+		{
+			if let Some(hold) = self.hook.hold.clone() {
+				let _ = hold.acquire().await.map(|permit| permit.forget());
+			}
+			if self.hook.lose_supervisor
+				&& let Some(task) = self.task.as_ref()
+			{
+				task.abort();
+			}
+		}
 		let result = match self.task.take() {
 			Some(task) => match task.await {
 				Ok(()) => self.cleanup.clone().finished().await,
@@ -2117,6 +2162,8 @@ where
 		stop: Some(stop),
 		task: Some(task),
 		cleanup: RenewalCleanup(cleanup),
+		#[cfg(test)]
+		hook: RenewalCleanupHook::default(),
 	}
 }
 
@@ -5922,6 +5969,343 @@ mod tests {
 				);
 			}
 		}
+	}
+
+	/// ADR 628 B1.C: a scripted worker that grants the lease and reads StartTask, then waits for a
+	/// permit before it sends its one batch and completes. Retirement connections end at once.
+	struct GatedScriptTransport {
+		go: Arc<Semaphore>,
+		batch: RecordBatch,
+	}
+
+	#[async_trait::async_trait]
+	impl ToronTransport for GatedScriptTransport {
+		async fn connect(&self, _address: &str) -> Result<Box<dyn ToronStream>, QueryError> {
+			let (client, mut server) = test_duplex(1024 * 1024);
+			let (go, batch) = (Arc::clone(&self.go), self.batch.clone());
+			tokio::spawn(async move {
+				let Ok(Some(start)) = read_start_after_lifecycle(&mut server).await else {
+					return;
+				};
+				let payload: StartTaskPayload = decode_payload(&start.payload).expect("start");
+				let identity = payload.spec.identity;
+				let _ = go.acquire().await.map(|permit| permit.forget());
+				let seq = StreamSeq::new(0);
+				let _ = send_test_payload(
+					&mut server,
+					MessageKind::TaskStarted,
+					EnvelopeIdentity::task(identity),
+					None,
+					&TaskStartedPayload { identity },
+				)
+				.await;
+				let _ = send_test_payload(
+					&mut server,
+					MessageKind::TaskBatch,
+					EnvelopeIdentity::task(identity),
+					Some(seq),
+					&TaskBatchPayload {
+						identity,
+						stream_seq: seq,
+						payload: ArrowIpcBytes::new(
+							encode_record_batch_for_test(&batch).expect("encode"),
+						),
+					},
+				)
+				.await;
+				let _ = send_test_payload(
+					&mut server,
+					MessageKind::TaskComplete,
+					EnvelopeIdentity::task(identity),
+					None,
+					&TaskCompletePayload {
+						identity,
+						output: TaskCompletionOutput::FinalResult {
+							output_digest: None,
+						},
+						telemetry: None,
+					},
+				)
+				.await;
+				std::future::pending::<()>().await;
+			});
+			Ok(Box::new(client))
+		}
+	}
+
+	/// A transport whose every connect is refused at once.
+	struct RefusingTransport;
+
+	#[async_trait::async_trait]
+	impl ToronTransport for RefusingTransport {
+		async fn connect(&self, _address: &str) -> Result<Box<dyn ToronStream>, QueryError> {
+			Err(QueryError::Io(std::io::Error::new(
+				std::io::ErrorKind::ConnectionRefused,
+				"refused",
+			)))
+		}
+	}
+
+	fn hooked_stream_coordinator(
+		transport: Arc<dyn ToronTransport>,
+		collect: Arc<CollectReliance>,
+		hook: RenewalCleanupHook,
+	) -> DistributedQueryCoordinator<StaticWorkerRegistry, dyn ToronTransport> {
+		DistributedQueryCoordinator::new(
+			Arc::new(RefreshingCatalog::new(
+				descriptor_with_identity(TableId(1), TableObjectId::new([1; 16]), 1),
+				RefreshOutcome::Binding(descriptor_with_identity(
+					TableId(1),
+					TableObjectId::new([1; 16]),
+					1,
+				)),
+			)),
+			Arc::new(StaticWorkerRegistry::new([scripted_worker()])),
+			Arc::new(MemoryManager::new(1, 1024 * 1024)),
+			transport,
+			PlannerConfig::default(),
+			QueryBudget::test_default(),
+		)
+		.with_reliance_observer(collect)
+		.with_renewal_cleanup_hook(hook)
+	}
+
+	async fn open_stream(
+		coordinator: &DistributedQueryCoordinator<StaticWorkerRegistry, dyn ToronTransport>,
+		config_path: bool,
+		query: u128,
+	) -> DistributedResultStream {
+		let context = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(query),
+			TenantId(7),
+			HlcBound(1),
+		);
+		if config_path {
+			coordinator
+				.execute_query_stream_with_context_and_config(
+					&named_scan_plan(),
+					context,
+					PlannerConfig::default(),
+				)
+				.await
+				.expect("the stream starts")
+		} else {
+			coordinator
+				.execute_query_stream_with_context(&named_scan_plan(), context)
+				.await
+				.expect("the stream starts")
+		}
+	}
+
+	fn kinds_of(
+		collect: &CollectReliance,
+		kind: &str,
+	) -> Vec<crate::distributed::query_reliance::RelianceEvent> {
+		let mut events: Vec<_> = collect
+			.0
+			.lock()
+			.unwrap()
+			.iter()
+			.filter(|e| e.kind == kind)
+			.cloned()
+			.collect();
+		events.sort_by_key(|e| e.seq);
+		events
+	}
+
+	/// ADR 628 B1.C: on BOTH streaming entry paths, a committed stream delivers every batch but no normal
+	/// end while its renewal cleanup is held; releasing it records the verified receipt, then the end.
+	#[tokio::test]
+	async fn a_committed_stream_ends_only_after_its_verified_cleanup_receipt() {
+		for config_path in [false, true] {
+			let hold = Arc::new(Semaphore::new(0));
+			let collect = Arc::new(CollectReliance::default());
+			let coordinator = hooked_stream_coordinator(
+				Arc::new(ScriptedDescriptorTransport {
+					attempts: Arc::new(AtomicUsize::new(1)),
+					success_batch: batch(),
+					completion: None,
+				}),
+				Arc::clone(&collect),
+				RenewalCleanupHook {
+					hold: Some(Arc::clone(&hold)),
+					lose_supervisor: false,
+				},
+			);
+			let mut stream = open_stream(&coordinator, config_path, 80).await;
+			let mut batches = 0;
+			loop {
+				match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+					Ok(Some(item)) => {
+						item.expect("a batch");
+						batches += 1;
+					}
+					Ok(None) => {
+						panic!("config_path={config_path}: a normal end while the cleanup is held")
+					}
+					Err(_) => break,
+				}
+			}
+			assert_eq!(batches, 1, "config_path={config_path}");
+			assert_eq!(
+				kinds_of(&collect, "commit").last().unwrap().fields["result"],
+				"committed"
+			);
+			assert!(
+				kinds_of(&collect, "renewal_cleanup").is_empty(),
+				"config_path={config_path}"
+			);
+			hold.add_permits(1);
+			let end = tokio::time::timeout(Duration::from_secs(5), stream.next())
+				.await
+				.expect("the end after release");
+			assert!(end.is_none(), "config_path={config_path}");
+			let cleanup = kinds_of(&collect, "renewal_cleanup");
+			assert_eq!(cleanup.len(), 1, "config_path={config_path}");
+			assert_eq!(
+				cleanup[0].fields["result"], "verified",
+				"config_path={config_path}"
+			);
+		}
+	}
+
+	/// ADR 628 B1.C: a lost supervisor still ends the committed stream, and its receipt is recorded
+	/// unverified (`supervisor_lost`), never as success. The committed result is unchanged.
+	#[tokio::test]
+	async fn a_lost_supervisor_ends_the_stream_with_an_unverified_receipt() {
+		for config_path in [false, true] {
+			let collect = Arc::new(CollectReliance::default());
+			let coordinator = hooked_stream_coordinator(
+				Arc::new(ScriptedDescriptorTransport {
+					attempts: Arc::new(AtomicUsize::new(1)),
+					success_batch: batch(),
+					completion: None,
+				}),
+				Arc::clone(&collect),
+				RenewalCleanupHook {
+					hold: None,
+					lose_supervisor: true,
+				},
+			);
+			let mut stream = open_stream(&coordinator, config_path, 81).await;
+			let mut items = Vec::new();
+			while let Some(item) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+				.await
+				.expect("progress")
+			{
+				items.push(item);
+			}
+			assert_eq!(items.len(), 1);
+			assert!(
+				items[0].is_ok(),
+				"the committed result stands: {:?}",
+				items[0]
+			);
+			let cleanup = kinds_of(&collect, "renewal_cleanup");
+			assert_eq!(cleanup.len(), 1, "config_path={config_path}");
+			assert_eq!(
+				cleanup[0].fields["result"], "supervisor_lost",
+				"config_path={config_path}"
+			);
+		}
+	}
+
+	/// ADR 628 B1.C: a failed query publishes its error promptly, while the cleanup is still held; the
+	/// cleanup completes afterwards (observable as its own record), never before the failure.
+	#[tokio::test]
+	async fn a_failure_is_published_promptly_and_its_cleanup_completes_afterwards() {
+		for config_path in [false, true] {
+			let hold = Arc::new(Semaphore::new(0));
+			let collect = Arc::new(CollectReliance::default());
+			let coordinator = hooked_stream_coordinator(
+				Arc::new(RefusingTransport),
+				Arc::clone(&collect),
+				RenewalCleanupHook {
+					hold: Some(Arc::clone(&hold)),
+					lose_supervisor: false,
+				},
+			);
+			let mut stream = open_stream(&coordinator, config_path, 82).await;
+			let item = tokio::time::timeout(Duration::from_secs(5), stream.next())
+				.await
+				.expect("the failure is published while the cleanup is held")
+				.expect("an item");
+			assert!(item.is_err(), "config_path={config_path}: {item:?}");
+			assert!(
+				kinds_of(&collect, "renewal_cleanup").is_empty(),
+				"config_path={config_path}"
+			);
+			hold.add_permits(1);
+			tokio::time::timeout(Duration::from_secs(5), async {
+				while kinds_of(&collect, "renewal_cleanup").is_empty() {
+					tokio::task::yield_now().await;
+				}
+			})
+			.await
+			.expect("the cleanup completes after the failure");
+			assert_eq!(
+				kinds_of(&collect, "renewal_cleanup")[0].fields["result"],
+				"verified"
+			);
+		}
+	}
+
+	/// ADR 628 B1.C: a renewal attempt in flight when the query ends is aborted (recorded `aborted`)
+	/// and drained before the verified receipt, which precedes the end of stream.
+	#[tokio::test(start_paused = true)]
+	async fn an_in_flight_renewal_is_aborted_and_drained_before_the_end() {
+		let go = Arc::new(Semaphore::new(0));
+		let collect = Arc::new(CollectReliance::default());
+		let connects = Arc::new(AtomicUsize::new(0));
+		let coordinator = hooked_stream_coordinator(
+			Arc::new(GatedScriptTransport {
+				go: Arc::clone(&go),
+				batch: batch(),
+			}),
+			Arc::clone(&collect),
+			RenewalCleanupHook::default(),
+		)
+		.with_reliance(
+			crate::distributed::query_reliance::RelianceParams::production(Duration::from_millis(
+				35_001,
+			)),
+			Arc::new(crate::distributed::query_reliance::TokioRelianceClock::new()),
+		)
+		.with_renewal_transport(Arc::new(PendingConnectTransport {
+			connects: Arc::clone(&connects),
+		}));
+		let mut stream = open_stream(&coordinator, false, 83).await;
+		// The renewal comes due 5 s after the issuance and stays inside its (never completing) connect.
+		tokio::time::timeout(Duration::from_secs(30), async {
+			while connects.load(Ordering::SeqCst) == 0 {
+				tokio::time::sleep(Duration::from_millis(100)).await;
+			}
+		})
+		.await
+		.expect("a renewal attempt is in flight");
+		go.add_permits(1);
+		let mut items = 0;
+		while let Some(item) = tokio::time::timeout(Duration::from_secs(30), stream.next())
+			.await
+			.expect("progress")
+		{
+			item.expect("a batch");
+			items += 1;
+		}
+		assert_eq!(items, 1);
+		let ends = kinds_of(&collect, "renewal_attempt_end");
+		assert!(
+			ends.iter().any(|e| e.fields["outcome"] == "aborted"),
+			"{ends:?}"
+		);
+		let cleanup = kinds_of(&collect, "renewal_cleanup");
+		assert_eq!(cleanup.len(), 1);
+		assert_eq!(cleanup[0].fields["result"], "verified");
+		assert!(
+			ends.iter().all(|e| e.seq < cleanup[0].seq),
+			"every attempt ended before the receipt"
+		);
 	}
 
 	/// A transport whose connects never complete: a renewal loop stays live inside its exchange.

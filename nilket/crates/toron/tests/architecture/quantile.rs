@@ -61,8 +61,10 @@ pub(crate) fn adr083_fragment_plan_construction_requires_real_execution_context(
 
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator source");
+	// ADR 628 B1.C: the boundary is the test module itself; test-only items (a cfg(test) hook field)
+	// may appear earlier in the production source.
 	let production = coordinator
-		.split_once("#[cfg(test)]")
+		.split_once("#[cfg(test)]\nmod tests {")
 		.expect("coordinator test boundary")
 		.0;
 	assert_eq!(production.matches("FragmentPlanConfig::new(").count(), 2);

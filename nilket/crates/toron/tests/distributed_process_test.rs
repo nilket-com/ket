@@ -7026,6 +7026,9 @@ async fn adr627_run(
 				}
 				Err(_) => coordinator,
 			};
+			// ADR 628 B1.C: with the instrument, the query's own renewal cleanup record is awaited (bounded)
+			// AFTER the raw `query_returned` stamp; subscribed now so no record is missed.
+			let cleanup_events = RELIANCE_INSTRUMENT.try_with(|_| log.subscribe()).ok();
 			let query = async {
 				let run = coordinator.execute_query(&logical);
 				tokio::pin!(run);
@@ -7048,6 +7051,34 @@ async fn adr627_run(
 			};
 			let (signal, result) = tokio::join!(watcher, query);
 			evidence["signal"] = signal;
+			if let Some(mut events) = cleanup_events {
+				let waited = tokio::time::timeout(ADR628_CLEANUP_WAIT, async {
+					while let Some(event) = events.recv().await {
+						if event["event"] == "reliance" && event["kind"] == "renewal_cleanup" {
+							return Some(event["result"].clone());
+						}
+					}
+					None
+				})
+				.await;
+				let outcome = match waited {
+					Ok(Some(result)) => serde_json::json!({ "recorded": result }),
+					Ok(None) => {
+						serde_json::json!({ "recorded": null, "reason": "the event log closed" })
+					}
+					Err(_) => {
+						serde_json::json!({ "recorded": null, "reason": "no cleanup record within the bound" })
+					}
+				};
+				log.emit(
+					"renewal_cleanup_wait",
+					"dispatch",
+					serde_json::json!({
+						"bound_ms": ADR628_CLEANUP_WAIT.as_millis() as u64, "outcome": outcome.clone(),
+					}),
+				);
+				evidence["renewal_cleanup_wait"] = outcome;
+			}
 			match result {
 				Some(Ok(batches)) => {
 					let digest = canonical_arrow_ipc_digest(&batches, SortPolicy::FullRowLex)
@@ -7332,6 +7363,9 @@ async fn mid_task_loss_is_observed_on_loopback() {
 /// The frozen post-terminal window in which every worker's served-stream log is kept open, so any
 /// `CancelTask` / `RetireQuery` fanout that follows the terminal return is captured.
 const ADR628_POST_TERMINAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+/// ADR 628 B1.C: the bounded wait, after the raw `query_returned`, for the query's own renewal cleanup
+/// record. A missing or unverified receipt still refuses at the reader.
+const ADR628_CLEANUP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// ADR 628: workers stay up this long after an absence window ends, so every managed worker's log
 /// records a reaper pass past it (the reader withholds absence otherwise).
 const ADR628_COVERAGE_TAIL: std::time::Duration = std::time::Duration::from_millis(1500);
