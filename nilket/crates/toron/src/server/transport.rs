@@ -39,6 +39,18 @@ pub trait ToronTransport: Send + Sync {
 	) -> Result<Box<dyn ToronStream>, QueryError> {
 		self.connect_peer(&worker.worker_id, &worker.endpoint).await
 	}
+
+	/// ADR 628 B1.C: dials a worker for one identified query lease exchange (a renewal attempt or a
+	/// dispatch's inline lease). The tag is for transports that record dials; it never changes what
+	/// is sent. Production transports ignore it.
+	async fn connect_worker_tagged(
+		&self,
+		worker: &WorkerEntry,
+		tag: &crate::distributed::query_reliance::ExchangeTag,
+	) -> Result<Box<dyn ToronStream>, QueryError> {
+		let _ = tag;
+		self.connect_worker(worker).await
+	}
 }
 
 #[async_trait]
@@ -63,6 +75,14 @@ where
 		worker: &WorkerEntry,
 	) -> Result<Box<dyn ToronStream>, QueryError> {
 		self.as_ref().connect_worker(worker).await
+	}
+
+	async fn connect_worker_tagged(
+		&self,
+		worker: &WorkerEntry,
+		tag: &crate::distributed::query_reliance::ExchangeTag,
+	) -> Result<Box<dyn ToronStream>, QueryError> {
+		self.as_ref().connect_worker_tagged(worker, tag).await
 	}
 }
 

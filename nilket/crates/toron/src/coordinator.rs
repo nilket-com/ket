@@ -151,11 +151,46 @@ pub(crate) async fn materialize_scan_stream(
 	stream.try_collect().await
 }
 
+/// ADR 628 B1.C: seals the query's outcome in its reliance ledger, before any error delivery or
+/// cleanup is awaited. Success commits only if every required worker is still relied on; a refusal
+/// (a lapse, a fatal reply, a local fault, or a cancellation that won first) becomes the outward
+/// error. An ordinary failure is sealed with its own cause and keeps its own outward error, unless a
+/// local reliance fault (which names no worker) is what stopped the query.
+fn commit_query_success<T>(
+	active_query: &ActiveQueryHandle,
+	result: Result<T, QueryError>,
+) -> Result<T, QueryError> {
+	use crate::distributed::query_reliance::{QueryEnd, QueryOutcome, Refusal, RelianceCause};
+	let reliance = active_query.reliance();
+	match result {
+		Ok(value) => match reliance.commit_success() {
+			Ok(()) => Ok(value),
+			Err(refusal) => Err(refusal.query_error()),
+		},
+		Err(error) => {
+			reliance.seal_ended(QueryEnd::Error(error.to_string()));
+			match reliance.outcome() {
+				QueryOutcome::Failed {
+					worker: None,
+					cause: cause @ (RelianceCause::Clock(_) | RelianceCause::Arithmetic),
+				} => Err(Refusal {
+					worker: None,
+					cause,
+				}
+				.query_error()),
+				_ => Err(error),
+			}
+		}
+	}
+}
+
 pub struct DistributedResultStream {
 	receiver: mpsc::Receiver<Result<RecordBatch, QueryError>>,
 	active_query: ActiveQueryHandle,
 	cancel_remote: RemoteCancelSpawner,
 	finished: bool,
+	/// Buffered batches offered to the delivery gate so far.
+	offered: u64,
 }
 
 impl DistributedResultStream {
@@ -169,6 +204,7 @@ impl DistributedResultStream {
 			active_query,
 			cancel_remote,
 			finished: false,
+			offered: 0,
 		}
 	}
 }
@@ -177,16 +213,59 @@ impl futures::Stream for DistributedResultStream {
 	type Item = Result<RecordBatch, QueryError>;
 
 	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		match self.receiver.poll_recv(cx) {
-			Poll::Ready(Some(Err(error))) => {
-				self.finished = true;
-				Poll::Ready(Some(Err(error)))
+		use crate::distributed::query_reliance::{QueryEnd, QueryOutcome, Refusal, RelianceCause};
+		if self.finished {
+			return Poll::Ready(None);
+		}
+		loop {
+			match self.receiver.poll_recv(cx) {
+				Poll::Ready(Some(Ok(batch))) => {
+					// ADR 628 B1.C: each buffered batch passes the delivery gate at the moment it is
+					// handed out. Committed: delivered against the committed local state. Open: every
+					// relied-on bound must still hold, sampled now (a starved or late poll sees the
+					// lapse itself). Failed: suppressed (partial-result-then-error).
+					self.offered += 1;
+					let offered = self.offered;
+					match self.active_query.reliance().delivery_gate(offered) {
+						Ok(()) => return Poll::Ready(Some(Ok(batch))),
+						// The query's own error follows from its driver: discard the batch and
+						// report that error, not a substitute.
+						Err(Refusal {
+							cause: RelianceCause::QueryEnded(QueryEnd::Error(_)),
+							..
+						}) => continue,
+						Err(refusal) => {
+							self.finished = true;
+							return Poll::Ready(Some(Err(refusal.query_error())));
+						}
+					}
+				}
+				Poll::Ready(Some(Err(error))) => {
+					self.finished = true;
+					return Poll::Ready(Some(Err(error)));
+				}
+				Poll::Ready(None) => {
+					// End of stream certifies success only once committed. A failure without its
+					// error, or a driver that disappeared while the query was open, is an error.
+					self.finished = true;
+					let reliance = self.active_query.reliance();
+					return match reliance.outcome() {
+						QueryOutcome::Committed => Poll::Ready(None),
+						QueryOutcome::Failed { worker, cause } => {
+							Poll::Ready(Some(Err(Refusal { worker, cause }.query_error())))
+						}
+						QueryOutcome::Open => {
+							reliance.seal_ended(QueryEnd::DriverLost);
+							Poll::Ready(Some(Err(Refusal {
+								worker: None,
+								cause: RelianceCause::QueryEnded(QueryEnd::DriverLost),
+							}
+							.query_error())))
+						}
+					};
+				}
+				Poll::Pending => return Poll::Pending,
 			}
-			Poll::Ready(None) => {
-				self.finished = true;
-				Poll::Ready(None)
-			}
-			other => other,
 		}
 	}
 }
@@ -230,6 +309,9 @@ where
 	deleter: Arc<dyn StorageDeleteRows>,
 	admin: Arc<dyn StorageAdmin>,
 	task_telemetry_retention: Option<TaskTelemetryRetention>,
+	/// ADR 628 B1.C (instrument seam S1): the transport query lease RENEWAL exchanges use. `None`
+	/// (production) uses `transport`, as dispatch, retirement and cancellation always do.
+	renewal_transport: Option<Arc<dyn ToronTransport>>,
 }
 
 impl<Registry, Transport> DistributedQueryCoordinator<Registry, Transport>
@@ -422,7 +504,35 @@ where
 			deleter,
 			admin,
 			task_telemetry_retention: None,
+			renewal_transport: None,
 		}
+	}
+
+	/// ADR 628 B1.C (instrument seam S1): renewal exchanges use `transport` instead of the dispatch
+	/// transport. Dispatch (with its inline leases), retirement, cancellation and peer pulls are
+	/// unchanged. Only renewal-path isolation, never a network partition.
+	pub fn with_renewal_transport(mut self, transport: Arc<dyn ToronTransport>) -> Self {
+		self.renewal_transport = Some(transport);
+		self
+	}
+
+	/// ADR 628 B1.C (instrument seam S2): records every query's reliance events. Observational only.
+	pub fn with_reliance_observer(
+		mut self,
+		observer: Arc<dyn crate::distributed::query_reliance::RelianceObserver>,
+	) -> Self {
+		self.active_queries = self.active_queries.with_reliance_observer(observer);
+		self
+	}
+
+	/// ADR 628 B1.C: the reliance assumptions, budgets and clock (tests and instruments).
+	pub fn with_reliance(
+		mut self,
+		params: crate::distributed::query_reliance::RelianceParams,
+		clock: Arc<dyn crate::distributed::query_reliance::RelianceClock>,
+	) -> Self {
+		self.active_queries = self.active_queries.with_reliance(params, clock);
+		self
 	}
 
 	/// Opt in to retaining each query's per-task telemetry report in `retention`. Reports
@@ -529,7 +639,7 @@ where
 			downstream,
 		);
 		let active_query_handle = active_query.handle();
-		self.spawn_query_lease_renewal(active_query_handle.clone());
+		let renewal = self.spawn_query_lease_renewal(active_query_handle.clone());
 		let retire_remote = self.remote_retire_spawner();
 		let query_id = context.query_id;
 		let context = context.with_downstream_cancellation(Some(
@@ -565,6 +675,8 @@ where
 				telemetry_retention,
 			)
 			.await;
+			// ADR 628 B1.C: the atomic successful-completion gate. Results are fully local now.
+			let result = commit_query_success(&active_query_handle, result);
 			let cause = if active_query_handle.lease_failure_worker().is_some() {
 				QueryTerminalCause::Failed
 			} else if active_query_handle.is_cancelled() {
@@ -589,6 +701,7 @@ where
 			drop(_admitted);
 			drop(sender);
 			retire_remote(query_id, cause, active_query_handle.remote_workers());
+			report_renewal_cleanup(query_id, renewal.shutdown().await);
 		});
 		Ok(DistributedResultStream::new(
 			receiver,
@@ -666,7 +779,7 @@ where
 			downstream,
 		);
 		let active_query_handle = active_query.handle();
-		self.spawn_query_lease_renewal(active_query_handle.clone());
+		let renewal = self.spawn_query_lease_renewal(active_query_handle.clone());
 		let retire_remote = self.remote_retire_spawner();
 		let query_id = context.query_id;
 		let context = context.with_downstream_cancellation(Some(
@@ -681,6 +794,8 @@ where
 				&mut None,
 			)
 			.await;
+		// ADR 628 B1.C: the atomic successful-completion gate.
+		let result = commit_query_success(&active_query_handle, result);
 		let cause = if active_query_handle.lease_failure_worker().is_some() {
 			QueryTerminalCause::Failed
 		} else if active_query_handle.is_cancelled() {
@@ -692,6 +807,7 @@ where
 		};
 		active_query_handle.mark_terminal();
 		retire_remote(query_id, cause, active_query_handle.remote_workers());
+		report_renewal_cleanup(query_id, renewal.shutdown().await);
 		drop(active_query);
 		drop(admitted);
 		result
@@ -776,7 +892,7 @@ where
 			downstream,
 		);
 		let active_query_handle = active_query.handle();
-		self.spawn_query_lease_renewal(active_query_handle.clone());
+		let renewal = self.spawn_query_lease_renewal(active_query_handle.clone());
 		let retire_remote = self.remote_retire_spawner();
 		let query_id = context.query_id;
 		let context = context.with_downstream_cancellation(Some(
@@ -792,6 +908,8 @@ where
 				&mut None,
 			)
 			.await;
+		// ADR 628 B1.C: the atomic successful-completion gate.
+		let result = commit_query_success(&active_query_handle, result);
 		let cause = if active_query_handle.lease_failure_worker().is_some() {
 			QueryTerminalCause::Failed
 		} else if active_query_handle.is_cancelled() {
@@ -803,6 +921,7 @@ where
 		};
 		active_query_handle.mark_terminal();
 		retire_remote(query_id, cause, active_query_handle.remote_workers());
+		report_renewal_cleanup(query_id, renewal.shutdown().await);
 		drop(active_query);
 		drop(admitted);
 		result
@@ -836,7 +955,7 @@ where
 			downstream,
 		);
 		let active_query_handle = active_query.handle();
-		self.spawn_query_lease_renewal(active_query_handle.clone());
+		let renewal = self.spawn_query_lease_renewal(active_query_handle.clone());
 		let retire_remote = self.remote_retire_spawner();
 		let query_id = context.query_id;
 		let context = context.with_downstream_cancellation(Some(
@@ -872,6 +991,8 @@ where
 				telemetry_retention,
 			)
 			.await;
+			// ADR 628 B1.C: the atomic successful-completion gate. Results are fully local now.
+			let result = commit_query_success(&active_query_handle, result);
 			let cause = if active_query_handle.lease_failure_worker().is_some() {
 				QueryTerminalCause::Failed
 			} else if active_query_handle.is_cancelled() {
@@ -896,6 +1017,7 @@ where
 			drop(_admitted);
 			drop(sender);
 			retire_remote(query_id, cause, active_query_handle.remote_workers());
+			report_renewal_cleanup(query_id, renewal.shutdown().await);
 		});
 		Ok(DistributedResultStream::new(
 			receiver,
@@ -924,15 +1046,23 @@ where
 		})
 	}
 
-	fn spawn_query_lease_renewal(&self, active_query: ActiveQueryHandle)
+	fn spawn_query_lease_renewal(&self, active_query: ActiveQueryHandle) -> RenewalOwner
 	where
 		Transport: 'static,
 	{
-		spawn_query_lease_renewal_task(
-			Arc::clone(&self.transport),
-			Arc::clone(&self.memory),
-			active_query,
-		);
+		// The only use of the renewal seam (S1).
+		match &self.renewal_transport {
+			Some(renewal) => spawn_query_lease_renewal_task(
+				Arc::clone(renewal),
+				Arc::clone(&self.memory),
+				active_query,
+			),
+			None => spawn_query_lease_renewal_task(
+				Arc::clone(&self.transport),
+				Arc::clone(&self.memory),
+				active_query,
+			),
+		}
 	}
 
 	fn remote_retire_spawner(&self) -> RemoteRetireSpawner
@@ -1842,93 +1972,429 @@ fn spawn_remote_cancel_fanout_task<Transport>(
 	});
 }
 
+/// ADR 628 B1.C: owns a query's renewal supervisor. The query's owner keeps it outside the renewal
+/// tasks, so there is no task -> handle -> task ownership cycle. `Drop` is the synchronous stop
+/// boundary: it closes renewal admission in the ledger (no renewal lease write is admitted after it
+/// returns, even by a loop that is already runnable), seals a still-open query as dropped, and
+/// signals the supervisor. The supervisor then aborts and joins every per-worker loop and completes
+/// the [`RenewalCleanup`] receipt, which can be awaited after the owner is gone. `shutdown` does the
+/// same and awaits it. This is local cleanup only, not remote cancellation: an exchange already on
+/// the wire may still complete, and its reply refreshes nothing.
+pub(crate) struct RenewalOwner {
+	reliance: Arc<crate::distributed::query_reliance::QueryReliance>,
+	stop: Option<tokio::sync::watch::Sender<bool>>,
+	task: Option<tokio::task::JoinHandle<()>>,
+	cleanup: RenewalCleanup,
+}
+
+/// The renewal supervisor's cleanup receipt. Only the supervisor's explicit `done`, sent AFTER it has
+/// aborted and joined every per-worker loop, certifies cleanup.
+#[derive(Clone)]
+pub(crate) struct RenewalCleanup(tokio::sync::watch::Receiver<bool>);
+
+/// Renewal cleanup could not be verified: the supervisor ended (panicked, was aborted, or its
+/// runtime is shutting down) without joining its loops. Dropping its `JoinSet` requests their abort
+/// but does not await it, so a loop or its stream may still be live. A runtime that is going away
+/// cannot provide an asynchronous cleanup guarantee at all; this reports that limit instead of
+/// confirming.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RenewalCleanupError {
+	SupervisorLost,
+	SupervisorPanicked,
+}
+
+impl RenewalCleanup {
+	pub(crate) async fn finished(mut self) -> Result<(), RenewalCleanupError> {
+		match self.0.wait_for(|done| *done).await {
+			Ok(_) => Ok(()),
+			// The sender closed without `done`: no evidence that the loops were joined.
+			Err(_) => Err(RenewalCleanupError::SupervisorLost),
+		}
+	}
+}
+
+impl RenewalOwner {
+	/// The cleanup receipt, to await after dropping the owner (the owner tests await it).
+	#[cfg(test)]
+	pub(crate) fn cleanup(&self) -> RenewalCleanup {
+		self.cleanup.clone()
+	}
+
+	fn close(&mut self) {
+		self.reliance.close_renewal();
+		self.reliance
+			.seal_ended(crate::distributed::query_reliance::QueryEnd::Dropped);
+		if let Some(stop) = self.stop.take() {
+			let _ = stop.send(true);
+		}
+	}
+
+	/// Closes renewal and awaits its cleanup (every per-worker loop aborted and joined). An error
+	/// means the cleanup could not be verified.
+	pub(crate) async fn shutdown(mut self) -> Result<(), RenewalCleanupError> {
+		self.close();
+		let result = match self.task.take() {
+			Some(task) => match task.await {
+				Ok(()) => self.cleanup.clone().finished().await,
+				Err(error) if error.is_panic() => Err(RenewalCleanupError::SupervisorPanicked),
+				Err(_) => Err(RenewalCleanupError::SupervisorLost),
+			},
+			None => self.cleanup.clone().finished().await,
+		};
+		self.reliance.record_cleanup(match result {
+			Ok(()) => "verified",
+			Err(RenewalCleanupError::SupervisorLost) => "supervisor_lost",
+			Err(RenewalCleanupError::SupervisorPanicked) => "supervisor_panicked",
+		});
+		result
+	}
+}
+
+impl Drop for RenewalOwner {
+	fn drop(&mut self) {
+		self.close();
+	}
+}
+
+/// ADR 628 B1.C: the query's result is already sealed when its renewal is cleaned up, so an
+/// unverified cleanup is reported, never turned into a different query outcome.
+fn report_renewal_cleanup(query_id: QueryId, cleanup: Result<(), RenewalCleanupError>) {
+	if let Err(error) = cleanup {
+		tracing::error!(
+			?query_id,
+			?error,
+			"query lease renewal cleanup could not be verified"
+		);
+	}
+}
+
+/// ADR 628 B1.C: spawns the query's renewal supervisor. Each worker gets its own loop the first time
+/// it becomes `Reliable` (enrolled through the ledger). One worker's slow or failed attempts never
+/// delay or fail another's.
 fn spawn_query_lease_renewal_task<Transport>(
 	transport: Arc<Transport>,
 	memory: Arc<MemoryManager>,
 	active_query: ActiveQueryHandle,
-) where
+) -> RenewalOwner
+where
 	Transport: ToronTransport + ?Sized + 'static,
 {
-	spawn_query_lease_renewal_task_with_cadence(
-		transport,
-		memory,
-		active_query,
-		crate::distributed::namespace_lifecycle::DEFAULT_QUERY_LEASE_RENEW_CADENCE,
-	);
-}
-
-fn spawn_query_lease_renewal_task_with_cadence<Transport>(
-	transport: Arc<Transport>,
-	memory: Arc<MemoryManager>,
-	active_query: ActiveQueryHandle,
-	cadence: Duration,
-) where
-	Transport: ToronTransport + ?Sized + 'static,
-{
-	tokio::spawn(async move {
-		let coordinator = ToronCoordinator::new(memory);
-		let mut renewals = tokio::time::interval_at(tokio::time::Instant::now() + cadence, cadence);
+	let (stop, mut stopped) = tokio::sync::watch::channel(false);
+	let (done, cleanup) = tokio::sync::watch::channel(false);
+	let (enroll, mut enrolled) = mpsc::unbounded_channel();
+	let reliance = Arc::clone(active_query.reliance());
+	reliance.set_enroller(enroll);
+	let supervised = Arc::clone(&reliance);
+	let task = tokio::spawn(async move {
+		let reliance = supervised;
+		let coordinator = Arc::new(ToronCoordinator::new(memory));
+		let query_id = active_query.key().query_id;
+		let mut loops = tokio::task::JoinSet::new();
 		loop {
 			tokio::select! {
-				_ = active_query.stopped() => return,
-				_ = renewals.tick() => {}
-			}
-			for worker in active_query.remote_workers() {
-				let stream = tokio::time::timeout(
-					REMOTE_CANCEL_CONNECT_TIMEOUT,
-					transport.connect_worker(&worker),
-				)
-				.await;
-				let renewed = match stream {
-					Ok(Ok(stream)) => tokio::time::timeout(
-						REMOTE_CANCEL_ACK_TIMEOUT,
-						coordinator.issue_or_renew_query_lease_on_worker(
-							stream,
-							active_query.key().query_id,
-						),
-					)
-					.await
-					.is_ok_and(|result| match result {
-						Ok(()) => true,
-						Err(error) => {
-							// ADR 628 B0: an `Ignored` reply ends reliance on this worker at the
-							// reply; its typed reason is recorded.
-							if let QueryError::Runtime(RuntimeError::QueryLeaseIgnored {
-								reason,
-								..
-							}) = &error
-							{
-								tracing::warn!(
-									reason = ?reason,
-									query_id = ?active_query.key().query_id,
-									worker_id = ?worker.worker_id,
-									"query lease renewal ignored by worker"
-								);
-							}
-							false
-						}
-					}),
-					Ok(Err(error)) => {
-						tracing::warn!(
-							error = %error,
-							query_id = ?active_query.key().query_id,
-							worker_id = ?worker.worker_id,
-							"query lease renewal connect failed"
-						);
-						false
+				_ = stopped.changed() => break,
+				_ = active_query.stopped() => break,
+				worker = enrolled.recv() => match worker {
+					Some(worker) => {
+						loops.spawn(worker_renewal_loop(
+							Arc::clone(&transport),
+							Arc::clone(&coordinator),
+							Arc::clone(&reliance),
+							query_id,
+							worker,
+						));
 					}
-					Err(_) => false,
-				};
-				if !renewed {
-					// Stop every local dispatcher before the worker's lease can expire.
-					// Dispatch retains the worker id and surfaces this as WorkerLost,
-					// never as a client cancellation.
-					active_query.fail_query_lease(worker.worker_id);
-					return;
-				}
+					None => break,
+				},
 			}
 		}
+		loops.abort_all();
+		while loops.join_next().await.is_some() {}
+		let _ = done.send(true);
 	});
+	RenewalOwner {
+		reliance,
+		stop: Some(stop),
+		task: Some(task),
+		cleanup: RenewalCleanup(cleanup),
+	}
+}
+
+/// One renewal attempt's outcome, classified by the B1.C failure table.
+enum RenewalAttempt {
+	/// A validated `Applied` whose whole exchange (close included) completed, with its send marker
+	/// and the whole budget's deadline it must have completed by.
+	Applied {
+		marker: crate::distributed::query_reliance::BootInstant,
+		by: crate::distributed::query_reliance::BootInstant,
+	},
+	/// Transport or budget failure (including a reply or close completed after its budget): retry
+	/// while the admission rule holds.
+	Transient(String),
+	/// Terminal for this worker.
+	Fatal(crate::distributed::query_reliance::RelianceCause),
+	/// A gate refused (the query is sealed, renewal is closed, the worker lapsed, or the clock
+	/// faulted): the ledger already holds the outcome.
+	Refused,
+}
+
+/// ADR 628 B1.C: one renewal exchange with its budgets. The budgets are boot-clock instants; tokio
+/// timers only bound the waiting, and every completion is re-checked against its instant, so a
+/// starved runtime that polls a ready future late cannot turn it into a refresh. Every exit after
+/// the whole budget is recorded as an overrun.
+async fn renewal_attempt<Transport>(
+	transport: &Transport,
+	coordinator: &ToronCoordinator,
+	reliance: &crate::distributed::query_reliance::QueryReliance,
+	query_id: QueryId,
+	worker: &WorkerEntry,
+) -> (Option<u64>, RenewalAttempt)
+where
+	Transport: ToronTransport + ?Sized,
+{
+	use crate::distributed::query_reliance::{ExchangeId, Phase};
+	// The exact start of the exchange (the connect) on the boot clock, its ordinal and its connect
+	// and whole deadlines, admitted by the ledger.
+	let Ok(start) = reliance.begin_renewal_attempt(worker.worker_id) else {
+		return (None, RenewalAttempt::Refused);
+	};
+	let exchange = ExchangeId::Renewal {
+		attempt: start.attempt,
+	};
+	// Records how the attempt ended, including when its future is dropped (renewal cleanup aborts
+	// loops mid-exchange).
+	struct AttemptEnd<'a> {
+		reliance: &'a crate::distributed::query_reliance::QueryReliance,
+		worker: crate::distributed::identity::WorkerId,
+		attempt: u64,
+		recorded: bool,
+	}
+	impl Drop for AttemptEnd<'_> {
+		fn drop(&mut self) {
+			if !self.recorded {
+				self.reliance
+					.end_renewal_attempt(self.worker, self.attempt, "aborted", None);
+			}
+		}
+	}
+	let mut end = AttemptEnd {
+		reliance,
+		worker: worker.worker_id,
+		attempt: start.attempt,
+		recorded: false,
+	};
+	let attempt = renewal_exchange(
+		transport,
+		coordinator,
+		reliance,
+		query_id,
+		worker,
+		exchange,
+		start.connect_by,
+		start.whole_by,
+	)
+	.await;
+	// Admission is not a guarantee: a starved future can finish late. Recorded on every exit.
+	let attempt = match reliance.within(worker.worker_id, exchange, Phase::Whole, start.whole_by) {
+		Ok(_) => attempt,
+		Err(_) => RenewalAttempt::Refused,
+	};
+	let (outcome, reason) = match &attempt {
+		RenewalAttempt::Applied { .. } => ("applied", None),
+		RenewalAttempt::Transient(reason) => ("transient", Some(reason.clone())),
+		RenewalAttempt::Fatal(cause) => ("fatal", Some(cause.to_string())),
+		RenewalAttempt::Refused => ("refused", None),
+	};
+	end.recorded = true;
+	reliance.end_renewal_attempt(worker.worker_id, start.attempt, outcome, reason);
+	(Some(start.attempt), attempt)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn renewal_exchange<Transport>(
+	transport: &Transport,
+	coordinator: &ToronCoordinator,
+	reliance: &crate::distributed::query_reliance::QueryReliance,
+	query_id: QueryId,
+	worker: &WorkerEntry,
+	exchange: crate::distributed::query_reliance::ExchangeId,
+	connect_by: crate::distributed::query_reliance::BootInstant,
+	whole_by: crate::distributed::query_reliance::BootInstant,
+) -> RenewalAttempt
+where
+	Transport: ToronTransport + ?Sized,
+{
+	use crate::distributed::query_reliance::{Phase, RelianceCause};
+	let params = *reliance.params();
+	let started = tokio::time::Instant::now();
+	let whole_deadline = started + params.whole_budget;
+	let connect_deadline = (started + params.connect_budget).min(whole_deadline);
+	let tag = reliance.tag(worker.worker_id, exchange);
+	let mut stream = match tokio::time::timeout_at(
+		connect_deadline,
+		transport.connect_worker_tagged(worker, &tag),
+	)
+	.await
+	{
+		Ok(Ok(stream)) => stream,
+		Ok(Err(error)) => {
+			return match crate::quic::establishment_failure(&error) {
+				Some(failure) if !failure.is_liveness() => {
+					RenewalAttempt::Fatal(RelianceCause::Auth(failure.to_string()))
+				}
+				_ => RenewalAttempt::Transient(format!("connect failed: {error}")),
+			};
+		}
+		Err(_) => return RenewalAttempt::Transient("connect budget expired".to_string()),
+	};
+	// A connect the runtime observed after its budget is late even if tokio returned it: no lease is
+	// written, nothing is refreshed, and the overrun is recorded (even with the whole budget left).
+	match reliance.within(worker.worker_id, exchange, Phase::Connect, connect_by) {
+		Ok(true) => {}
+		Ok(false) => {
+			return RenewalAttempt::Transient("connect completed after its budget".to_string());
+		}
+		Err(_) => return RenewalAttempt::Refused,
+	}
+	// The lease-write gate: no renewal is written after closure, a seal or a lapse.
+	let Ok(marker) = reliance.send_marker(worker.worker_id, exchange) else {
+		return RenewalAttempt::Refused;
+	};
+	let Some(ack_by) = marker.checked_add(params.ack_budget) else {
+		return RenewalAttempt::Fatal(RelianceCause::Arithmetic);
+	};
+	let ack_deadline = (tokio::time::Instant::now() + params.ack_budget).min(whole_deadline);
+	match tokio::time::timeout_at(
+		ack_deadline,
+		coordinator.query_lease_handshake(&mut stream, query_id),
+	)
+	.await
+	{
+		Err(_) => RenewalAttempt::Transient("ACK budget expired".to_string()),
+		Ok(Err(QueryError::Io(error))) => RenewalAttempt::Transient(format!("handshake: {error}")),
+		Ok(Err(QueryError::Runtime(RuntimeError::QueryLeaseIgnored { reason, .. }))) => {
+			// B0: a validated Ignored is terminal at the reply, late or not; the close is not
+			// awaited.
+			RenewalAttempt::Fatal(RelianceCause::Ignored(reason))
+		}
+		Ok(Err(error)) => RenewalAttempt::Fatal(RelianceCause::Protocol(error.to_string())),
+		Ok(Ok(())) => {
+			match reliance.within(worker.worker_id, exchange, Phase::Ack, ack_by.min(whole_by)) {
+				Ok(true) => {}
+				Ok(false) => {
+					return RenewalAttempt::Transient("reply after the ACK budget".to_string());
+				}
+				Err(_) => return RenewalAttempt::Refused,
+			}
+			// B0: a renewal's Applied counts only once the whole exchange, close included, completes.
+			match tokio::time::timeout_at(
+				whole_deadline,
+				ToronCoordinator::finish_lease_exchange(&mut stream),
+			)
+			.await
+			{
+				Ok(Ok(())) => RenewalAttempt::Applied {
+					marker,
+					by: whole_by,
+				},
+				Ok(Err(error)) => RenewalAttempt::Transient(format!("close failed: {error}")),
+				Err(_) => RenewalAttempt::Transient("close: whole budget expired".to_string()),
+			}
+		}
+	}
+}
+
+/// ADR 628 B1.C: one worker's renewal loop. It renews at the supporting marker + cadence, retries
+/// transient failures with backoff while `now + whole_budget < bound`, and PAUSES (never exits)
+/// when no attempt fits. It recomputes whenever the ledger changes (an inline dispatch `Applied`
+/// may extend the bound), and stops when the worker is no longer `Reliable`, renewal is closed, the
+/// query is sealed, or a clock read fails (which fails the query). Exactly one periodic exchange is
+/// in flight at a time.
+async fn worker_renewal_loop<Transport>(
+	transport: Arc<Transport>,
+	coordinator: Arc<ToronCoordinator>,
+	reliance: Arc<crate::distributed::query_reliance::QueryReliance>,
+	query_id: QueryId,
+	worker: WorkerEntry,
+) where
+	Transport: ToronTransport + ?Sized,
+{
+	use crate::distributed::query_reliance::{Applied, ExchangeId, RenewalPlan};
+	let params = *reliance.params();
+	let mut backoff = params.backoff_initial;
+	let mut not_before = None;
+	loop {
+		let changed = reliance.changed_notified();
+		tokio::pin!(changed);
+		changed.as_mut().enable();
+		match reliance.renewal_plan(worker.worker_id, not_before) {
+			RenewalPlan::Stop => return,
+			RenewalPlan::SleepUntil(instant) => {
+				let Ok(wait) = reliance.until(instant) else {
+					return;
+				};
+				tokio::select! {
+					_ = tokio::time::sleep(wait) => {}
+					_ = changed => {}
+				}
+				continue;
+			}
+			RenewalPlan::Attempt => {}
+		}
+		let (attempt, outcome) = renewal_attempt(
+			transport.as_ref(),
+			coordinator.as_ref(),
+			reliance.as_ref(),
+			query_id,
+			&worker,
+		)
+		.await;
+		let Some(attempt) = attempt else {
+			return;
+		};
+		let reason = match outcome {
+			RenewalAttempt::Applied { marker, by } => {
+				match reliance.on_applied(
+					worker.worker_id,
+					marker,
+					ExchangeId::Renewal { attempt },
+					by,
+				) {
+					Ok(Applied::Bound(_)) => {
+						not_before = None;
+						backoff = params.backoff_initial;
+						continue;
+					}
+					Ok(Applied::Late) => "Applied completed after its whole budget".to_string(),
+					// Sealed or lapsed: the next plan stops.
+					Err(_) => continue,
+				}
+			}
+			RenewalAttempt::Transient(reason) => reason,
+			RenewalAttempt::Fatal(cause) => {
+				tracing::warn!(
+					cause = %cause,
+					?query_id,
+					worker_id = ?worker.worker_id,
+					"query lease renewal refused"
+				);
+				reliance.on_fatal(worker.worker_id, cause);
+				return;
+			}
+			RenewalAttempt::Refused => return,
+		};
+		tracing::warn!(
+			reason = %reason,
+			?query_id,
+			worker_id = ?worker.worker_id,
+			"query lease renewal attempt failed; retrying within the reliance bound"
+		);
+		let Ok(next) = reliance.backoff_until(worker.worker_id, attempt, backoff) else {
+			return;
+		};
+		not_before = Some(next);
+		backoff = (backoff * 2).min(params.backoff_max);
+	}
 }
 
 fn spawn_remote_retire_fanout_task<Transport>(
@@ -4599,68 +5065,143 @@ mod tests {
 		assert_eq!(seen.lock().expect("seen lock").as_slice(), &[identity]);
 	}
 
-	#[tokio::test]
+	/// ADR 628 B1.C: the reliance span for L = 35.001 s, ρ 500 ppm each, M = 1 s.
+	const RELIANCE_SPAN: Duration = Duration::from_nanos(33_966_016_491);
+
+	fn reliance_registry() -> ActiveQueryRegistry {
+		ActiveQueryRegistry::new().with_reliance(
+			crate::distributed::query_reliance::RelianceParams::production(Duration::from_millis(
+				35_001,
+			)),
+			Arc::new(crate::distributed::query_reliance::TokioRelianceClock::new()),
+		)
+	}
+
+	/// Issues `worker` in the query's ledger, as a dispatch's validated handshake would, now.
+	fn issue_worker(handle: &ActiveQueryHandle, worker: &WorkerEntry) {
+		let reliance = handle.reliance();
+		let ticket = reliance.begin_dispatch(worker).expect("dispatch");
+		let marker = reliance
+			.send_marker(worker.worker_id, ticket.exchange())
+			.expect("marker");
+		reliance
+			.on_applied(
+				worker.worker_id,
+				marker,
+				ticket.exchange(),
+				crate::distributed::query_reliance::BootInstant::from_nanos(u128::MAX / 2),
+			)
+			.expect("applied");
+		drop(ticket);
+		handle.record_remote_task(worker.clone(), lease_test_identity());
+	}
+
+	/// Asserts a lapse at exactly the bound (tokio timers round up to the millisecond).
+	fn assert_lapsed_at_bound(stopped: Option<Duration>) {
+		let stopped = stopped.expect("reliance must lapse");
+		assert!(
+			stopped >= RELIANCE_SPAN && stopped <= RELIANCE_SPAN + Duration::from_millis(2),
+			"lapsed at {stopped:?}, bound {RELIANCE_SPAN:?}"
+		);
+	}
+
+	#[tokio::test(start_paused = true)]
 	async fn query_lifetime_renews_worker_lease_until_terminal() {
-		let registry = ActiveQueryRegistry::new();
+		let registry = reliance_registry();
 		let guard = registry.register(TenantId(7), QueryId::from_u128(1));
 		let handle = guard.handle();
-		handle.record_remote_task(scripted_worker(), lease_test_identity());
 		let calls = Arc::new(AtomicUsize::new(0));
-		spawn_query_lease_renewal_task_with_cadence(
+		let owner = spawn_query_lease_renewal_task(
 			Arc::new(LeaseRecordingTransport {
 				connect_calls: Arc::clone(&calls),
 				fail_at: None,
+				fail_first: 0,
 			}),
 			Arc::new(MemoryManager::new(1, 1024 * 1024)),
 			handle.clone(),
-			Duration::from_millis(5),
 		);
-
-		let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-		while calls.load(Ordering::SeqCst) < 3 {
-			assert!(
-				tokio::time::Instant::now() < deadline,
-				"live query did not renew its worker lease repeatedly"
-			);
-			tokio::time::sleep(Duration::from_millis(2)).await;
-		}
+		issue_worker(&handle, &scripted_worker());
+		// Far beyond the initial reliance horizon: renewals keep it alive.
+		tokio::time::sleep(Duration::from_secs(120)).await;
 		assert!(!handle.is_cancelled());
 		assert_eq!(handle.lease_failure_worker(), None);
+		let renewed = calls.load(Ordering::SeqCst);
+		assert!(
+			(22..=24).contains(&renewed),
+			"one renewal per 5 s, no bursts: {renewed}"
+		);
 
 		handle.mark_terminal();
-		tokio::time::sleep(Duration::from_millis(15)).await;
+		owner.shutdown().await.expect("renewal cleanup verified");
 		let after_stop = calls.load(Ordering::SeqCst);
-		tokio::time::sleep(Duration::from_millis(15)).await;
-		assert_eq!(calls.load(Ordering::SeqCst), after_stop);
+		tokio::time::sleep(Duration::from_secs(30)).await;
+		assert_eq!(
+			calls.load(Ordering::SeqCst),
+			after_stop,
+			"no exchange after cleanup"
+		);
 	}
 
-	#[tokio::test]
-	async fn failed_query_lease_renewal_stops_reliance_with_worker_identity() {
-		let registry = ActiveQueryRegistry::new();
+	#[tokio::test(start_paused = true)]
+	async fn persistent_renewal_failure_lapses_at_the_bound_with_worker_identity() {
+		let registry = reliance_registry();
 		let guard = registry.register(TenantId(7), QueryId::from_u128(1));
 		let handle = guard.handle();
 		let worker = scripted_worker();
-		handle.record_remote_task(worker.clone(), lease_test_identity());
-		spawn_query_lease_renewal_task_with_cadence(
+		let owner = spawn_query_lease_renewal_task(
 			Arc::new(LeaseRecordingTransport {
 				connect_calls: Arc::new(AtomicUsize::new(0)),
 				fail_at: Some(0),
+				fail_first: 0,
 			}),
 			Arc::new(MemoryManager::new(1, 1024 * 1024)),
 			handle.clone(),
-			Duration::from_millis(5),
 		);
-
-		tokio::time::timeout(Duration::from_secs(1), handle.stopped())
+		let started = tokio::time::Instant::now();
+		issue_worker(&handle, &worker);
+		let stopped = tokio::time::timeout(Duration::from_secs(120), handle.stopped())
 			.await
-			.expect("failed renewal must stop the query before local lease expiry");
+			.ok()
+			.map(|()| started.elapsed());
+		// One transient attempt never fails the query; only the lapse at the bound does.
+		assert_lapsed_at_bound(stopped);
 		assert!(handle.is_cancelled());
 		assert_eq!(handle.lease_failure_worker(), Some(worker.worker_id));
+		assert!(matches!(
+			handle.reliance().state(worker.worker_id),
+			Some(crate::distributed::query_reliance::WorkerReliance::Lapsed { .. })
+		));
+		owner.shutdown().await.expect("renewal cleanup verified");
 	}
 
-	/// ADR 628 Stage A (current-behaviour pins, paused clock): a single renewal slower than either
-	/// 100 ms bound fails the whole query at exactly the first tick plus that bound; renewals inside
-	/// both bounds keep it alive. `cadence` is 5 ms here; production uses 5 s.
+	#[tokio::test(start_paused = true)]
+	async fn transient_failures_inside_the_boundary_are_survived() {
+		let registry = reliance_registry();
+		let guard = registry.register(TenantId(7), QueryId::from_u128(1));
+		let handle = guard.handle();
+		let calls = Arc::new(AtomicUsize::new(0));
+		let owner = spawn_query_lease_renewal_task(
+			Arc::new(LeaseRecordingTransport {
+				connect_calls: Arc::clone(&calls),
+				fail_at: None,
+				fail_first: 6, // several seconds of failed attempts, well inside ~34 s
+			}),
+			Arc::new(MemoryManager::new(1, 1024 * 1024)),
+			handle.clone(),
+		);
+		issue_worker(&handle, &scripted_worker());
+		tokio::time::sleep(Duration::from_secs(120)).await;
+		assert!(
+			!handle.is_cancelled(),
+			"a delay inside the boundary is survived"
+		);
+		assert!(calls.load(Ordering::SeqCst) > 6);
+		handle.mark_terminal();
+		owner.shutdown().await.expect("renewal cleanup verified");
+	}
+
+	/// ADR 628 B1.C: B1.B measured fresh-connection connects at p50 ≈ 125–164 ms. The old 100 ms caps
+	/// failed such renewals; the provisional budgets (2000/2000/3000 ms) do not.
 	async fn adr628_renewal_run(
 		connect_delay: Duration,
 		ack_delay: Duration,
@@ -4675,14 +5216,12 @@ mod tests {
 		term_override: Option<u64>,
 		stall_shutdown: bool,
 	) -> (Option<Duration>, usize, bool) {
-		let registry = ActiveQueryRegistry::new();
+		let registry = reliance_registry();
 		let guard = registry.register(TenantId(7), QueryId::from_u128(1));
 		let handle = guard.handle();
 		let worker = scripted_worker();
-		handle.record_remote_task(worker.clone(), lease_test_identity());
 		let renewals = Arc::new(AtomicUsize::new(0));
-		let started = tokio::time::Instant::now();
-		spawn_query_lease_renewal_task_with_cadence(
+		let owner = spawn_query_lease_renewal_task(
 			Arc::new(PhasedLeaseTransport {
 				connect_delay,
 				ack_delay,
@@ -4693,55 +5232,53 @@ mod tests {
 			}),
 			Arc::new(MemoryManager::new(1, 1024 * 1024)),
 			handle.clone(),
-			Duration::from_millis(5),
 		);
-		let stopped = tokio::time::timeout(Duration::from_secs(2), handle.stopped())
+		let started = tokio::time::Instant::now();
+		issue_worker(&handle, &worker);
+		let stopped = tokio::time::timeout(Duration::from_secs(120), handle.stopped())
 			.await
 			.ok()
 			.map(|()| started.elapsed());
 		let failed = handle.lease_failure_worker() == Some(worker.worker_id);
 		guard.handle().mark_terminal();
+		owner.shutdown().await.expect("renewal cleanup verified");
 		(stopped, renewals.load(Ordering::SeqCst), failed)
 	}
 
 	#[tokio::test(start_paused = true)]
-	async fn adr628_a_renewal_connect_slower_than_the_bound_fails_the_query_at_tick_plus_bound() {
-		let (stopped, renewals, failed) =
-			adr628_renewal_run(Duration::from_millis(150), Duration::ZERO).await;
-		assert!(failed);
-		assert_eq!(renewals, 0);
-		assert_eq!(stopped, Some(Duration::from_millis(5 + 100)));
+	async fn renewals_slower_than_the_old_100ms_caps_keep_the_query_alive() {
+		for (connect, ack) in [
+			(Duration::from_millis(150), Duration::ZERO),
+			(Duration::ZERO, Duration::from_millis(150)),
+			(Duration::from_millis(1500), Duration::from_millis(1400)),
+		] {
+			let (stopped, renewals, failed) = adr628_renewal_run(connect, ack).await;
+			assert!(!failed && stopped.is_none(), "{connect:?}/{ack:?}");
+			// The next renewal is due 5 s after the previous send marker, which follows the connect.
+			let period = Duration::from_secs(5) + connect;
+			let expected = (Duration::from_secs(120).as_millis() / period.as_millis()) as usize;
+			assert!(
+				renewals + 1 >= expected,
+				"{connect:?}/{ack:?}: {renewals} < {expected}"
+			);
+		}
 	}
 
 	#[tokio::test(start_paused = true)]
-	async fn adr628_a_renewal_ack_slower_than_the_bound_fails_the_query_at_tick_plus_bound() {
-		let (stopped, renewals, failed) =
-			adr628_renewal_run(Duration::ZERO, Duration::from_millis(150)).await;
-		assert!(failed);
-		assert_eq!(renewals, 0);
-		assert_eq!(stopped, Some(Duration::from_millis(5 + 100)));
+	async fn renewals_beyond_the_budgets_lapse_at_the_bound() {
+		for (connect, ack) in [
+			(Duration::from_millis(2500), Duration::ZERO),
+			(Duration::ZERO, Duration::from_millis(2500)),
+		] {
+			let (stopped, renewals, failed) = adr628_renewal_run(connect, ack).await;
+			assert!(failed, "{connect:?}/{ack:?}");
+			assert_eq!(renewals, 0, "{connect:?}/{ack:?}");
+			assert_lapsed_at_bound(stopped);
+		}
 	}
 
-	#[tokio::test(start_paused = true)]
-	async fn adr628_renewals_inside_both_bounds_keep_the_query_alive() {
-		let (stopped, renewals, failed) =
-			adr628_renewal_run(Duration::from_millis(50), Duration::from_millis(50)).await;
-		assert!(!failed);
-		assert_eq!(stopped, None, "no lease failure within 2 s");
-		assert!(renewals >= 5, "{renewals}");
-	}
-
-	/// ADR 628 Stage A: the two bounds are separate, not one shared 100 ms: a connect and an
-	/// operation that each take 90 ms (180 ms in all) still renew.
-	#[tokio::test(start_paused = true)]
-	async fn adr628_connect_and_operation_bounds_are_separate() {
-		let (stopped, _, failed) =
-			adr628_renewal_run(Duration::from_millis(90), Duration::from_millis(90)).await;
-		assert!(!failed && stopped.is_none());
-	}
-
-	/// ADR 628 B0: an `Ignored` renewal ends the query's reliance on that worker at the reply (the
-	/// first 5 ms tick, not tick + the 100 ms bound), naming it, for every reason.
+	/// ADR 628 B0 (kept): an `Ignored` renewal ends the query's reliance on that worker at the reply,
+	/// which is the first renewal (issuance + 5 s), naming it, for every reason.
 	#[tokio::test(start_paused = true)]
 	async fn an_ignored_renewal_ends_reliance_at_the_reply() {
 		for reason in [
@@ -4756,37 +5293,772 @@ mod tests {
 			let (stopped, _, failed) =
 				lease_reply_run(Duration::ZERO, Duration::ZERO, Some(reason), None, false).await;
 			assert!(failed, "{reason:?}");
-			assert_eq!(stopped, Some(Duration::from_millis(5)), "{reason:?}");
+			assert_eq!(stopped, Some(Duration::from_secs(5)), "{reason:?}");
 			// A stalled close cannot delay it: the reply alone ends reliance.
 			let (stopped, _, failed) =
 				lease_reply_run(Duration::ZERO, Duration::ZERO, Some(reason), None, true).await;
 			assert!(failed, "{reason:?} with a stalled close");
 			assert_eq!(
 				stopped,
-				Some(Duration::from_millis(5)),
+				Some(Duration::from_secs(5)),
 				"{reason:?} with a stalled close"
 			);
 		}
 	}
 
-	/// ADR 628 B0: an `Applied` reply carrying a term other than the requested one is a protocol
-	/// error, never a renewal.
+	/// ADR 628 B0 (kept): an `Applied` reply carrying a term other than the requested one is a
+	/// protocol error, terminal at the reply, never a renewal.
 	#[tokio::test(start_paused = true)]
 	async fn an_applied_reply_with_another_term_is_not_a_renewal() {
 		let (stopped, _, failed) =
 			lease_reply_run(Duration::ZERO, Duration::ZERO, None, Some(1), false).await;
 		assert!(failed);
-		assert_eq!(stopped, Some(Duration::from_millis(5)));
+		assert_eq!(stopped, Some(Duration::from_secs(5)));
 	}
 
-	/// ADR 628 B0: `Applied` still requires the whole exchange: with a stalled close it fails at the
-	/// operation bound (tick + 100 ms), as before.
+	/// ADR 628 B0/B1.C: `Applied` still requires the whole exchange. A close that never completes
+	/// refreshes nothing; the attempts are transient, and reliance lapses at the bound.
 	#[tokio::test(start_paused = true)]
-	async fn an_applied_renewal_with_a_stalled_close_fails_at_the_bound() {
+	async fn an_applied_renewal_with_a_stalled_close_refreshes_nothing() {
 		let (stopped, _, failed) =
 			lease_reply_run(Duration::ZERO, Duration::ZERO, None, None, true).await;
 		assert!(failed);
-		assert_eq!(stopped, Some(Duration::from_millis(5 + 100)));
+		assert_lapsed_at_bound(stopped);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn one_workers_failures_never_delay_or_fail_another() {
+		let registry = reliance_registry();
+		let guard = registry.register(TenantId(7), QueryId::from_u128(1));
+		let handle = guard.handle();
+		let healthy = scripted_worker();
+		let mut flaky = scripted_worker();
+		flaky.worker_id = WorkerId::from_u128(8);
+		flaky.endpoint = WorkerEndpoint::new("scripted://flaky-worker");
+		let transport = Arc::new(AddressLeaseTransport::new([(
+			"scripted://flaky-worker".to_string(),
+			5usize,
+		)]));
+		let owner = spawn_query_lease_renewal_task(
+			Arc::clone(&transport),
+			Arc::new(MemoryManager::new(1, 1024 * 1024)),
+			handle.clone(),
+		);
+		issue_worker(&handle, &healthy);
+		issue_worker(&handle, &flaky);
+		tokio::time::sleep(Duration::from_secs(60)).await;
+		assert!(!handle.is_cancelled());
+		let healthy_connects = transport.connects("scripted://descriptor-worker");
+		assert!(
+			(11..=12).contains(&healthy_connects),
+			"the healthy worker renews at its own cadence: {healthy_connects}"
+		);
+		assert!(transport.connects("scripted://flaky-worker") > 5);
+		handle.mark_terminal();
+		owner.shutdown().await.expect("renewal cleanup verified");
+	}
+
+	fn one_row_batch() -> RecordBatch {
+		use arrow::array::Int64Array;
+		use arrow::datatypes::{DataType, Field, Schema};
+		RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+			vec![Arc::new(Int64Array::from(vec![1_i64]))],
+		)
+		.expect("batch")
+	}
+
+	/// A query with one issued worker on a hand-set clock; returns the handle, clock and bound.
+	fn settable_query() -> (
+		crate::distributed::cancellation::ActiveQueryGuard,
+		ActiveQueryHandle,
+		Arc<crate::distributed::query_reliance::SettableClock>,
+		u128,
+	) {
+		let clock = Arc::new(crate::distributed::query_reliance::SettableClock::at(
+			1_000_000_000,
+		));
+		let registry = ActiveQueryRegistry::new().with_reliance(
+			crate::distributed::query_reliance::RelianceParams::production(Duration::from_millis(
+				35_001,
+			)),
+			clock.clone(),
+		);
+		let guard = registry.register(TenantId(7), QueryId::from_u128(1));
+		let handle = guard.handle();
+		issue_worker(&handle, &scripted_worker());
+		(
+			guard,
+			handle,
+			clock,
+			1_000_000_000 + RELIANCE_SPAN.as_nanos(),
+		)
+	}
+
+	fn no_remote_cancel() -> RemoteCancelSpawner {
+		Arc::new(|_, _| {})
+	}
+
+	/// ADR 628 B1.C (amendment A): after the success commit, buffered final batches are local
+	/// results. They are delivered even when the consumer reads them after the old bound.
+	#[tokio::test]
+	async fn buffered_results_after_a_committed_success_are_delivered_past_the_old_bound() {
+		let (_guard, handle, clock, bound) = settable_query();
+		let (sender, receiver) = mpsc::channel(4);
+		sender.send(Ok(one_row_batch())).await.unwrap();
+		sender.send(Ok(one_row_batch())).await.unwrap();
+		drop(sender);
+		assert!(commit_query_success(&handle, Ok(())).is_ok());
+		clock.set(bound + 60_000_000_000); // the slow consumer reads long after the bound
+		let mut stream = DistributedResultStream::new(receiver, handle.clone(), no_remote_cancel());
+		assert!(stream.next().await.unwrap().is_ok());
+		assert!(stream.next().await.unwrap().is_ok());
+		assert!(stream.next().await.is_none());
+	}
+
+	/// ADR 628 B1.C: a lapse BEFORE the commit suppresses every later buffered batch. The stream ends
+	/// with the lapse error (partial-result-then-error), and a late Ok cannot commit.
+	#[tokio::test]
+	async fn a_lapse_before_commit_suppresses_buffered_batches() {
+		let (_guard, handle, clock, bound) = settable_query();
+		let (sender, receiver) = mpsc::channel(4);
+		sender.send(Ok(one_row_batch())).await.unwrap();
+		sender.send(Ok(one_row_batch())).await.unwrap();
+		drop(sender);
+		let mut stream = DistributedResultStream::new(receiver, handle.clone(), no_remote_cancel());
+		assert!(
+			stream.next().await.unwrap().is_ok(),
+			"delivered while relied on"
+		);
+		clock.set(bound);
+		let late = commit_query_success(&handle, Ok(()));
+		assert!(
+			matches!(&late, Err(QueryError::Runtime(RuntimeError::TaskFailure { kind: TaskFailureKind::WorkerLost { worker_id } })) if *worker_id == scripted_worker().worker_id),
+			"{late:?}"
+		);
+		let suppressed = stream.next().await.unwrap();
+		assert!(
+			suppressed.is_err(),
+			"the buffered batch after the lapse is suppressed"
+		);
+		assert!(stream.next().await.is_none());
+		assert_eq!(
+			handle.lease_failure_worker(),
+			Some(scripted_worker().worker_id)
+		);
+	}
+
+	/// ADR 628 B1.C: a late fatal callback after the commit is context only.
+	#[tokio::test]
+	async fn a_late_fatal_after_commit_cannot_fail_the_query() {
+		let (_guard, handle, _clock, _) = settable_query();
+		assert!(commit_query_success(&handle, Ok(())).is_ok());
+		handle.reliance().on_fatal(
+			scripted_worker().worker_id,
+			crate::distributed::query_reliance::RelianceCause::Ignored(LeaseIgnored::Expired),
+		);
+		assert_eq!(
+			handle.reliance().outcome(),
+			crate::distributed::query_reliance::QueryOutcome::Committed
+		);
+		assert!(!handle.is_cancelled());
+		assert_eq!(handle.lease_failure_worker(), None);
+	}
+
+	/// ADR 628 B1.C: a coordinator clock fault is a local internal error, not `WorkerLost`.
+	#[tokio::test]
+	async fn a_clock_fault_at_commit_is_an_internal_error() {
+		let (_guard, handle, clock, _) = settable_query();
+		clock.fail(crate::distributed::query_reliance::ClockFault::ReadFailed(
+			5,
+		));
+		let result = commit_query_success(&handle, Ok(()));
+		assert!(
+			matches!(result, Err(QueryError::Internal { .. })),
+			"{result:?}"
+		);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn dropping_the_owner_stops_new_exchanges() {
+		let registry = reliance_registry();
+		let guard = registry.register(TenantId(7), QueryId::from_u128(1));
+		let handle = guard.handle();
+		let calls = Arc::new(AtomicUsize::new(0));
+		let owner = spawn_query_lease_renewal_task(
+			Arc::new(LeaseRecordingTransport {
+				connect_calls: Arc::clone(&calls),
+				fail_at: None,
+				fail_first: 0,
+			}),
+			Arc::new(MemoryManager::new(1, 1024 * 1024)),
+			handle.clone(),
+		);
+		issue_worker(&handle, &scripted_worker());
+		tokio::time::sleep(Duration::from_secs(12)).await;
+		let cleanup = owner.cleanup();
+		drop(owner);
+		let after = calls.load(Ordering::SeqCst);
+		// The cleanup receipt completes once every loop is aborted and joined.
+		cleanup.finished().await.expect("renewal cleanup verified");
+		tokio::time::sleep(Duration::from_secs(30)).await;
+		assert_eq!(calls.load(Ordering::SeqCst), after);
+	}
+
+	/// ADR 628 B1.C: `Drop` is a synchronous stop boundary. A loop that is due and RUNNABLE at the
+	/// drop (woken by the drop itself) admits no exchange. The control shows the same wake-up
+	/// without the drop does start an exchange.
+	#[tokio::test]
+	async fn dropping_the_owner_admits_no_exchange_from_a_runnable_loop() {
+		for drop_owner in [true, false] {
+			let (_guard, handle, clock, _) = settable_query();
+			let transport = Arc::new(AddressLeaseTransport::new([]));
+			let owner = spawn_query_lease_renewal_task(
+				Arc::clone(&transport),
+				Arc::new(MemoryManager::new(1, 1024 * 1024)),
+				handle.clone(),
+			);
+			// The first worker was issued before the owner existed; issue another now so the
+			// supervisor runs its loop. Its renewal is due 5 s after its marker.
+			let mut worker = scripted_worker();
+			worker.worker_id = WorkerId::from_u128(8);
+			worker.endpoint = WorkerEndpoint::new("scripted://runnable-worker");
+			issue_worker(&handle, &worker);
+			tokio::task::yield_now().await;
+			tokio::task::yield_now().await;
+			clock.advance(Duration::from_secs(6)); // due; the loop still sleeps on tokio's timer
+			let cleanup = owner.cleanup();
+			if drop_owner {
+				// Closes admission, then wakes the loop through the ledger's change notification.
+				drop(owner);
+				cleanup.finished().await.expect("renewal cleanup verified");
+				assert_eq!(transport.connects("scripted://runnable-worker"), 0);
+				assert_eq!(
+					handle.reliance().renewal_plan(worker.worker_id, None),
+					crate::distributed::query_reliance::RenewalPlan::Stop
+				);
+			} else {
+				// The same wake-up with admission open: a third issuance notifies the ledger.
+				let mut other = scripted_worker();
+				other.worker_id = WorkerId::from_u128(9);
+				other.endpoint = WorkerEndpoint::new("scripted://other-worker");
+				issue_worker(&handle, &other);
+				tokio::time::timeout(Duration::from_secs(5), async {
+					while transport.connects("scripted://runnable-worker") == 0 {
+						tokio::task::yield_now().await;
+					}
+				})
+				.await
+				.expect("the runnable loop starts an exchange");
+				owner.shutdown().await.expect("renewal cleanup verified");
+			}
+		}
+	}
+
+	/// ADR 628 B1.C: a buffered batch is delivered only through the delivery gate. With the query
+	/// still open and NOTHING else running (no renewal, no commit, no dispatch gate), a poll after
+	/// the bound observes the lapse itself.
+	#[tokio::test]
+	async fn an_open_query_delivers_no_buffered_batch_after_a_bound() {
+		let (_guard, handle, clock, bound) = settable_query();
+		let (sender, receiver) = mpsc::channel(4);
+		sender.send(Ok(one_row_batch())).await.unwrap();
+		sender.send(Ok(one_row_batch())).await.unwrap();
+		let mut stream = DistributedResultStream::new(receiver, handle.clone(), no_remote_cancel());
+		assert!(
+			stream.next().await.unwrap().is_ok(),
+			"delivered while relied on"
+		);
+		clock.set(bound);
+		let suppressed = stream.next().await.unwrap();
+		assert!(
+			matches!(&suppressed, Err(QueryError::Runtime(RuntimeError::TaskFailure { kind: TaskFailureKind::WorkerLost { worker_id } })) if *worker_id == scripted_worker().worker_id),
+			"{suppressed:?}"
+		);
+		assert!(stream.next().await.is_none());
+		assert!(matches!(
+			handle.reliance().outcome(),
+			crate::distributed::query_reliance::QueryOutcome::Failed { .. }
+		));
+		assert!(commit_query_success(&handle, Ok(())).is_err());
+	}
+
+	/// ADR 628 B1.C: a clock fault at delivery fails closed as a local internal error.
+	#[tokio::test]
+	async fn a_clock_fault_at_delivery_is_an_internal_error() {
+		let (_guard, handle, clock, _) = settable_query();
+		let (sender, receiver) = mpsc::channel(4);
+		sender.send(Ok(one_row_batch())).await.unwrap();
+		clock.fail(crate::distributed::query_reliance::ClockFault::ReadFailed(
+			5,
+		));
+		let mut stream = DistributedResultStream::new(receiver, handle.clone(), no_remote_cancel());
+		let item = stream.next().await.unwrap();
+		assert!(matches!(item, Err(QueryError::Internal { .. })), "{item:?}");
+	}
+
+	/// ADR 628 B1.C: a real blocked runtime (not a hand-set clock). The current-thread runtime is
+	/// blocked past the bound between buffering and delivery; the delivery gate sees it.
+	#[tokio::test]
+	async fn a_starved_consumer_receives_no_batch_after_a_bound() {
+		// L = 1.3 s: D − M = 298_700_649 ns.
+		let registry = ActiveQueryRegistry::new().with_reliance(
+			crate::distributed::query_reliance::RelianceParams::production(Duration::from_millis(
+				1_300,
+			)),
+			Arc::new(crate::distributed::query_reliance::BootClock),
+		);
+		let guard = registry.register(TenantId(7), QueryId::from_u128(1));
+		let handle = guard.handle();
+		issue_worker(&handle, &scripted_worker());
+		let (sender, receiver) = mpsc::channel(4);
+		sender.send(Ok(one_row_batch())).await.unwrap();
+		let mut stream = DistributedResultStream::new(receiver, handle.clone(), no_remote_cancel());
+		std::thread::sleep(Duration::from_millis(400));
+		let item = stream.next().await.unwrap();
+		assert!(
+			matches!(
+				&item,
+				Err(QueryError::Runtime(RuntimeError::TaskFailure {
+					kind: TaskFailureKind::WorkerLost { .. }
+				}))
+			),
+			"{item:?}"
+		);
+	}
+
+	/// ADR 628 B1.C: end of stream certifies success only once committed. A driver that disappeared
+	/// while the query was open is an error, and the query is sealed.
+	#[tokio::test]
+	async fn end_of_stream_while_open_is_not_success() {
+		let (_guard, handle, _clock, _) = settable_query();
+		let (sender, receiver) = mpsc::channel::<Result<RecordBatch, QueryError>>(4);
+		drop(sender);
+		let mut stream = DistributedResultStream::new(receiver, handle.clone(), no_remote_cancel());
+		let item = stream.next().await.unwrap();
+		assert!(matches!(item, Err(QueryError::Internal { .. })), "{item:?}");
+		assert!(stream.next().await.is_none());
+		assert!(commit_query_success(&handle, Ok(())).is_err());
+	}
+
+	/// ADR 628 B1.C: an ordinary failure is sealed before its error is delivered. Buffered batches
+	/// behind it are suppressed, and the client receives the ORIGINAL error, not a substitute.
+	#[tokio::test]
+	async fn an_ordinary_failure_suppresses_buffered_batches_and_keeps_its_error() {
+		let (_guard, handle, _clock, _) = settable_query();
+		let (sender, receiver) = mpsc::channel(4);
+		sender.send(Ok(one_row_batch())).await.unwrap();
+		sender.send(Ok(one_row_batch())).await.unwrap();
+		let result = commit_query_success::<()>(
+			&handle,
+			Err(QueryError::Internal {
+				message: "scan failed".to_string(),
+			}),
+		);
+		assert!(
+			matches!(&result, Err(QueryError::Internal { message }) if message == "scan failed"),
+			"{result:?}"
+		);
+		sender.send(Err(result.unwrap_err())).await.unwrap();
+		drop(sender);
+		let mut stream = DistributedResultStream::new(receiver, handle.clone(), no_remote_cancel());
+		let item = stream.next().await.unwrap();
+		assert!(
+			matches!(&item, Err(QueryError::Internal { message }) if message == "scan failed"),
+			"{item:?}"
+		);
+		assert!(stream.next().await.is_none());
+		assert!(matches!(
+			handle.reliance().outcome(),
+			crate::distributed::query_reliance::QueryOutcome::Failed {
+				cause: crate::distributed::query_reliance::RelianceCause::QueryEnded(
+					crate::distributed::query_reliance::QueryEnd::Error(_)
+				),
+				..
+			}
+		));
+		// Nothing after the seal refreshes or authorizes.
+		assert!(
+			handle
+				.reliance()
+				.gate(
+					scripted_worker().worker_id,
+					crate::distributed::query_reliance::UseSite::new("start_task")
+				)
+				.is_err()
+		);
+	}
+
+	/// ADR 628 B1.C: when a cancellation wins, a later success cannot: the late Ok is refused, a late
+	/// Applied refreshes nothing, and no dispatch is authorized. In the other order the commit wins
+	/// and the cancellation is context only.
+	#[tokio::test]
+	async fn a_cancellation_beats_a_late_success_and_a_late_applied() {
+		let (_guard, handle, _clock, _) = settable_query();
+		let worker = scripted_worker();
+		let marker = handle
+			.reliance()
+			.send_marker(
+				worker.worker_id,
+				crate::distributed::query_reliance::ExchangeId::Renewal { attempt: 1 },
+			)
+			.expect("marker");
+		handle.cancel(CancellationTrigger::SqlCancel);
+		let late = commit_query_success(&handle, Ok(()));
+		assert!(
+			matches!(
+				late,
+				Err(QueryError::Runtime(RuntimeError::TaskFailure {
+					kind: TaskFailureKind::Cancelled
+				}))
+			),
+			"{late:?}"
+		);
+		assert!(
+			handle
+				.reliance()
+				.on_applied(
+					worker.worker_id,
+					marker,
+					crate::distributed::query_reliance::ExchangeId::Renewal { attempt: 1 },
+					crate::distributed::query_reliance::BootInstant::from_nanos(u128::MAX / 2),
+				)
+				.is_err()
+		);
+		assert!(handle.reliance().begin_dispatch(&worker).is_err());
+
+		let (_guard, handle, _clock, _) = settable_query();
+		assert!(commit_query_success(&handle, Ok(())).is_ok());
+		handle.cancel(CancellationTrigger::SqlCancel);
+		assert_eq!(
+			handle.reliance().outcome(),
+			crate::distributed::query_reliance::QueryOutcome::Committed
+		);
+	}
+
+	/// ADR 628 B1.C: a renewal transport for real blocked-runtime controls. Its worker's `Applied`
+	/// reply is written before the coordinator even sends its lease, so it is READY when polled; the
+	/// coordinator's runtime thread is then blocked in the chosen phase. Because tokio's timeout
+	/// polls the ready inner future first, only the boot-clock re-check can refuse the refresh.
+	struct StarvingLeaseTransport {
+		phase: &'static str,
+		block: Duration,
+		query_id: QueryId,
+		term_millis: u64,
+	}
+
+	struct StarvedStream {
+		inner: DuplexStream,
+		_worker: DuplexStream,
+		block_read: Option<Duration>,
+		block_close: Option<Duration>,
+	}
+
+	impl tokio::io::AsyncRead for StarvedStream {
+		fn poll_read(
+			mut self: Pin<&mut Self>,
+			cx: &mut Context<'_>,
+			buf: &mut tokio::io::ReadBuf<'_>,
+		) -> Poll<std::io::Result<()>> {
+			if let Some(block) = self.block_read.take() {
+				std::thread::sleep(block);
+			}
+			Pin::new(&mut self.inner).poll_read(cx, buf)
+		}
+	}
+
+	impl tokio::io::AsyncWrite for StarvedStream {
+		fn poll_write(
+			mut self: Pin<&mut Self>,
+			cx: &mut Context<'_>,
+			buf: &[u8],
+		) -> Poll<std::io::Result<usize>> {
+			Pin::new(&mut self.inner).poll_write(cx, buf)
+		}
+
+		fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+			Pin::new(&mut self.inner).poll_flush(cx)
+		}
+
+		fn poll_shutdown(
+			mut self: Pin<&mut Self>,
+			cx: &mut Context<'_>,
+		) -> Poll<std::io::Result<()>> {
+			if let Some(block) = self.block_close.take() {
+				std::thread::sleep(block);
+			}
+			Pin::new(&mut self.inner).poll_shutdown(cx)
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl ToronTransport for StarvingLeaseTransport {
+		async fn connect(&self, _address: &str) -> Result<Box<dyn ToronStream>, QueryError> {
+			if self.phase == "connect" {
+				std::thread::sleep(self.block);
+			}
+			let (client, mut worker) = test_duplex(1024 * 1024);
+			send_test_payload(
+				&mut worker,
+				MessageKind::QueryLeaseAccepted,
+				EnvelopeIdentity::query(self.query_id),
+				None,
+				&QueryLeaseAcceptedPayload {
+					query_id: self.query_id,
+					outcome: QueryLeaseOutcome::Applied {
+						term_ms: self.term_millis,
+					},
+				},
+			)
+			.await
+			.expect("pre-written reply");
+			Ok(Box::new(StarvedStream {
+				inner: client,
+				_worker: worker,
+				block_read: (self.phase == "reply").then_some(self.block),
+				block_close: (self.phase == "close").then_some(self.block),
+			}))
+		}
+	}
+
+	/// ADR 628 B1.C: ACK, close and whole-budget overruns caused by a really blocked runtime, each
+	/// ending long before the old bound: no refresh, an overrun recorded, the query still open, and
+	/// the loop's retry policy (transient) applies within the existing bound. The control (no block)
+	/// refreshes.
+	#[tokio::test]
+	async fn blocked_runtime_overruns_refresh_nothing() {
+		use crate::distributed::query_reliance::{Applied, ExchangeId, QueryOutcome};
+		let term = Duration::from_millis(35_001);
+		let mut params = crate::distributed::query_reliance::RelianceParams::production(term);
+		params.connect_budget = Duration::from_millis(100);
+		params.ack_budget = Duration::from_millis(100);
+		let lease_term_millis = u64::try_from(
+			crate::distributed::namespace_lifecycle::ShuffleLifecycleConfig::from_worker_loss_window(
+				crate::distributed::partition_store::DEFAULT_WORKER_LOST_AFTER,
+			)
+			.expect("default lifecycle")
+			.lease_term()
+			.as_millis(),
+		)
+		.expect("term");
+		// (whole budget, blocked phase, block). The last two are the connect-only counterexample:
+		// connect 150 ms against its 100 ms budget, with the 1000 ms whole budget still left, and its
+		// on-time twin.
+		for (whole_ms, phase, block_ms) in [
+			(150, "connect", 250),
+			(150, "reply", 250),
+			(150, "close", 250),
+			(150, "none", 0),
+			(1000, "connect", 150),
+			(1000, "none", 0),
+		] {
+			params.whole_budget = Duration::from_millis(whole_ms);
+			let label = format!("{phase} (whole {whole_ms} ms)");
+			let registry = ActiveQueryRegistry::new().with_reliance(
+				params,
+				Arc::new(crate::distributed::query_reliance::BootClock),
+			);
+			let query_id = QueryId::from_u128(1);
+			let guard = registry.register(TenantId(7), query_id);
+			let handle = guard.handle();
+			let worker = scripted_worker();
+			issue_worker(&handle, &worker);
+			let reliance = Arc::clone(handle.reliance());
+			let before = match reliance.state(worker.worker_id) {
+				Some(crate::distributed::query_reliance::WorkerReliance::Reliable {
+					bound,
+					..
+				}) => bound,
+				other => panic!("{other:?}"),
+			};
+			let transport = StarvingLeaseTransport {
+				phase,
+				block: Duration::from_millis(block_ms),
+				query_id,
+				term_millis: lease_term_millis,
+			};
+			let coordinator = ToronCoordinator::new(Arc::new(MemoryManager::new(1, 1024 * 1024)));
+			let (attempt_no, attempt) =
+				renewal_attempt(&transport, &coordinator, &reliance, query_id, &worker).await;
+			let attempt_no = attempt_no.expect("admitted");
+			// The loop's handling of the attempt.
+			let refreshed = match attempt {
+				RenewalAttempt::Applied { marker, by } => {
+					match reliance.on_applied(
+						worker.worker_id,
+						marker,
+						ExchangeId::Renewal {
+							attempt: attempt_no,
+						},
+						by,
+					) {
+						Ok(Applied::Bound(bound)) => bound > before,
+						Ok(Applied::Late) => false,
+						Err(refusal) => panic!("{label}: {refusal:?}"),
+					}
+				}
+				RenewalAttempt::Transient(reason) => {
+					if whole_ms == 1000 {
+						assert_eq!(reason, "connect completed after its budget", "{label}");
+					}
+					false
+				}
+				RenewalAttempt::Fatal(cause) => panic!("{label}: fatal {cause}"),
+				RenewalAttempt::Refused => panic!("{label}: refused"),
+			};
+			assert_eq!(reliance.outcome(), QueryOutcome::Open, "{label}");
+			if phase == "none" {
+				assert!(refreshed, "{label}: the control refreshes");
+				assert_eq!(reliance.budget_overruns(), 0, "{label}");
+			} else {
+				assert!(!refreshed, "{label}: an overrun refreshes nothing");
+				assert!(reliance.budget_overruns() >= 1, "{label}: overrun recorded");
+				assert!(
+					matches!(
+						reliance.state(worker.worker_id),
+						Some(crate::distributed::query_reliance::WorkerReliance::Reliable { bound, .. }) if bound == before
+					),
+					"{label}: the existing bound is kept"
+				);
+			}
+		}
+	}
+
+	/// A transport whose connects never complete: a renewal loop stays live inside its exchange.
+	struct PendingConnectTransport {
+		connects: Arc<AtomicUsize>,
+	}
+
+	#[async_trait::async_trait]
+	impl ToronTransport for PendingConnectTransport {
+		async fn connect(&self, _address: &str) -> Result<Box<dyn ToronStream>, QueryError> {
+			self.connects.fetch_add(1, Ordering::SeqCst);
+			std::future::pending().await
+		}
+	}
+
+	#[derive(Default)]
+	struct CollectReliance(StdMutex<Vec<crate::distributed::query_reliance::RelianceEvent>>);
+
+	impl crate::distributed::query_reliance::RelianceObserver for CollectReliance {
+		fn record(&self, event: &crate::distributed::query_reliance::RelianceEvent) {
+			self.0.lock().unwrap().push(event.clone());
+		}
+	}
+
+	/// ADR 628 B1.C (instrument): an attempt aborted by renewal cleanup records an `aborted` end, and
+	/// the cleanup result is recorded: `verified` after a normal shutdown, `supervisor_lost` after
+	/// the supervisor is aborted.
+	#[tokio::test]
+	async fn aborted_attempts_and_cleanup_results_are_recorded() {
+		for lose_supervisor in [false, true] {
+			let clock = Arc::new(crate::distributed::query_reliance::SettableClock::at(
+				1_000_000_000,
+			));
+			let collect = Arc::new(CollectReliance::default());
+			let registry = ActiveQueryRegistry::new()
+				.with_reliance(
+					crate::distributed::query_reliance::RelianceParams::production(
+						Duration::from_millis(35_001),
+					),
+					clock.clone(),
+				)
+				.with_reliance_observer(collect.clone());
+			let guard = registry.register(TenantId(7), QueryId::from_u128(1));
+			let handle = guard.handle();
+			let connects = Arc::new(AtomicUsize::new(0));
+			let owner = spawn_query_lease_renewal_task(
+				Arc::new(PendingConnectTransport {
+					connects: Arc::clone(&connects),
+				}),
+				Arc::new(MemoryManager::new(1, 1024 * 1024)),
+				handle.clone(),
+			);
+			issue_worker(&handle, &scripted_worker());
+			clock.advance(Duration::from_secs(6));
+			let mut other = scripted_worker();
+			other.worker_id = WorkerId::from_u128(9);
+			issue_worker(&handle, &other);
+			tokio::time::timeout(Duration::from_secs(5), async {
+				while connects.load(Ordering::SeqCst) == 0 {
+					tokio::task::yield_now().await;
+				}
+			})
+			.await
+			.expect("a loop is live inside its exchange");
+			if lose_supervisor {
+				owner.task.as_ref().expect("supervisor").abort();
+			}
+			let result = owner.shutdown().await;
+			assert_eq!(result.is_err(), lose_supervisor);
+			let events = collect.0.lock().unwrap().clone();
+			let cleanup: Vec<_> = events
+				.iter()
+				.filter(|e| e.kind == "renewal_cleanup")
+				.collect();
+			assert_eq!(cleanup.len(), 1);
+			assert_eq!(
+				cleanup[0].fields["result"],
+				if lose_supervisor {
+					"supervisor_lost"
+				} else {
+					"verified"
+				}
+			);
+			let ends: Vec<_> = events
+				.iter()
+				.filter(|e| e.kind == "renewal_attempt_end")
+				.collect();
+			assert_eq!(ends.len(), 1, "{ends:?}");
+			assert_eq!(ends[0].fields["outcome"], "aborted");
+			assert_eq!(
+				events.iter().filter(|e| e.kind == "renewal_closed").count(),
+				1,
+				"closure is recorded once"
+			);
+		}
+	}
+
+	/// ADR 628 B1.C: only the supervisor's explicit `done`, sent after it has aborted and joined its
+	/// loops, certifies cleanup. With a loop live inside an exchange, an aborted supervisor (its
+	/// `JoinSet` dropped, its `done` sender closed) cannot make the receipt or `shutdown` report a
+	/// verified cleanup.
+	#[tokio::test]
+	async fn a_lost_supervisor_cannot_certify_cleanup() {
+		let (_guard, handle, clock, _) = settable_query();
+		let connects = Arc::new(AtomicUsize::new(0));
+		let owner = spawn_query_lease_renewal_task(
+			Arc::new(PendingConnectTransport {
+				connects: Arc::clone(&connects),
+			}),
+			Arc::new(MemoryManager::new(1, 1024 * 1024)),
+			handle.clone(),
+		);
+		let mut worker = scripted_worker();
+		worker.worker_id = WorkerId::from_u128(8);
+		issue_worker(&handle, &worker);
+		clock.advance(Duration::from_secs(6));
+		// Wake the due loop: it enters its exchange and stays live in the connect.
+		let mut other = scripted_worker();
+		other.worker_id = WorkerId::from_u128(9);
+		issue_worker(&handle, &other);
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while connects.load(Ordering::SeqCst) == 0 {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.expect("a loop is live inside its exchange");
+		let cleanup = owner.cleanup();
+		owner.task.as_ref().expect("supervisor").abort();
+		assert_eq!(
+			cleanup.finished().await,
+			Err(RenewalCleanupError::SupervisorLost)
+		);
+		assert_eq!(
+			owner.shutdown().await,
+			Err(RenewalCleanupError::SupervisorLost)
+		);
 	}
 
 	#[tokio::test]
@@ -5555,13 +6827,64 @@ mod tests {
 	struct LeaseRecordingTransport {
 		connect_calls: Arc<AtomicUsize>,
 		fail_at: Option<usize>,
+		/// ADR 628 B1.C: the first this many connects fail, then connects succeed.
+		fail_first: usize,
+	}
+
+	/// ADR 628 B1.C: per-endpoint behaviour. The first `fail_first` connects to an endpoint fail; every
+	/// lease is then `Applied`.
+	struct AddressLeaseTransport {
+		fail_first: std::collections::HashMap<String, usize>,
+		connects: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+	}
+
+	impl AddressLeaseTransport {
+		fn new(fail_first: impl IntoIterator<Item = (String, usize)>) -> Self {
+			Self {
+				fail_first: fail_first.into_iter().collect(),
+				connects: std::sync::Mutex::new(std::collections::HashMap::new()),
+			}
+		}
+
+		fn connects(&self, address: &str) -> usize {
+			self.connects
+				.lock()
+				.unwrap()
+				.get(address)
+				.copied()
+				.unwrap_or(0)
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl ToronTransport for AddressLeaseTransport {
+		async fn connect(&self, address: &str) -> Result<Box<dyn ToronStream>, QueryError> {
+			let ordinal = {
+				let mut connects = self.connects.lock().unwrap();
+				let n = connects.entry(address.to_string()).or_insert(0);
+				*n += 1;
+				*n - 1
+			};
+			if ordinal < self.fail_first.get(address).copied().unwrap_or(0) {
+				return Err(QueryError::Internal {
+					message: "injected lease renewal failure".to_string(),
+				});
+			}
+			LeaseRecordingTransport {
+				connect_calls: Arc::new(AtomicUsize::new(0)),
+				fail_at: None,
+				fail_first: 0,
+			}
+			.connect(address)
+			.await
+		}
 	}
 
 	#[async_trait::async_trait]
 	impl ToronTransport for LeaseRecordingTransport {
 		async fn connect(&self, _address: &str) -> Result<Box<dyn ToronStream>, QueryError> {
 			let ordinal = self.connect_calls.fetch_add(1, Ordering::SeqCst);
-			if self.fail_at.is_some_and(|fail_at| ordinal >= fail_at) {
+			if self.fail_at.is_some_and(|fail_at| ordinal >= fail_at) || ordinal < self.fail_first {
 				return Err(QueryError::Internal {
 					message: "injected lease renewal failure".to_string(),
 				});

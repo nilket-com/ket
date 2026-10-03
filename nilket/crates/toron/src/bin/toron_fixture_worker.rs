@@ -106,6 +106,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
 		.as_deref()
 		.map(wait_events::EventLog::create)
 		.transpose()?;
+	// ADR 628 B1.C: the long scan is echoed, so the evidence names the configured duration.
+	let long_scan_ms = u64::try_from(long_scan().as_millis()).unwrap_or(u64::MAX);
+	host_event("long_scan", format!("ms={long_scan_ms}"));
+	if let Some(log) = &wait_log {
+		log.emit(
+			"fixture_config",
+			"worker",
+			serde_json::json!({ "long_scan_ms": long_scan_ms }),
+		);
+	}
 	let peer = |inner: Arc<dyn ToronTransport>| -> Arc<dyn ToronTransport> {
 		let recorded: Arc<dyn ToronTransport> = match &record_peer_dials {
 			Some(path) => Arc::new(DialRecordingTransport {
@@ -753,6 +763,14 @@ const SLOW_SCAN: std::time::Duration = std::time::Duration::from_secs(8);
 /// ADR 627: a scan long enough to span several 5 s lease-renewal ticks on the coordinator path.
 const LONG_TABLE: u64 = 10;
 const LONG_SCAN: std::time::Duration = std::time::Duration::from_secs(30);
+/// ADR 628 B1.C: `--long-scan-ms` sets the long table's scan (bounded; default `LONG_SCAN`), so a
+/// declared control can span several initial reliance horizons.
+static LONG_SCAN_OVERRIDE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+const LONG_SCAN_MS_RANGE: std::ops::RangeInclusive<u64> = 1_000..=600_000;
+
+fn long_scan() -> std::time::Duration {
+	LONG_SCAN_OVERRIDE.get().copied().unwrap_or(LONG_SCAN)
+}
 
 fn slow_batch() -> RecordBatch {
 	RecordBatch::try_new(
@@ -792,7 +810,7 @@ impl StorageScan for FixtureStorageScan {
 			// ADR 626 Stage C: a scan that stays silent longer than the experiment's `H`, so the
 			// long-silence control shows `H` bounds establishment only.
 			SLOW_TABLE => Some(SLOW_SCAN),
-			LONG_TABLE => Some(LONG_SCAN),
+			LONG_TABLE => Some(long_scan()),
 			_ => None,
 		};
 		if let Some(silence) = silence {
@@ -939,6 +957,19 @@ fn args() -> Result<FixtureArgs, Box<dyn Error>> {
 			recovery_confirmation_ms = args.next().map(|value| value.parse()).transpose()?;
 		} else if arg == "--managed-lifecycle" {
 			managed_lifecycle = true;
+		} else if arg == "--long-scan-ms" {
+			let ms: u64 = args
+				.next()
+				.ok_or_else(|| invalid("--long-scan-ms needs a value".to_string()))?
+				.parse()?;
+			if !LONG_SCAN_MS_RANGE.contains(&ms) {
+				return Err(invalid(format!(
+					"--long-scan-ms must be within {LONG_SCAN_MS_RANGE:?}, got {ms}"
+				)));
+			}
+			LONG_SCAN_OVERRIDE
+				.set(std::time::Duration::from_millis(ms))
+				.map_err(|_| invalid("--long-scan-ms given twice".to_string()))?;
 		} else if arg == "--transport" {
 			transport = match args.next().as_deref() {
 				Some("tcp") => FixtureTransport::Tcp,

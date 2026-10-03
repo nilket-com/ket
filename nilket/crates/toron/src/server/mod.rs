@@ -4043,6 +4043,910 @@ mod tests {
 		);
 	}
 
+	/// ADR 628 B1.C: a scripted worker for the dispatch gates. `fail_connect` fails the dial;
+	/// `silent` reads the lease request and never replies; otherwise it grants the lease, reads
+	/// `StartTask`, signals `started`, waits for `go`, then sends one final batch and completes.
+	/// Hooks run on the coordinator's side: in `connect` (after the dial, before the lease write),
+	/// on its first read (the lease reply), and in its close. They model a cancellation, a suspend or
+	/// a starved runtime landing at that point.
+	struct GatedWorkerTransport {
+		fail_connect: bool,
+		silent: bool,
+		started: Arc<Notify>,
+		go: Arc<Notify>,
+		dials: Arc<std::sync::atomic::AtomicUsize>,
+		leases_read: Arc<std::sync::atomic::AtomicUsize>,
+		connect_error: Option<Arc<dyn Fn() -> QueryError + Send + Sync>>,
+		on_connect: Option<Arc<dyn Fn() + Send + Sync>>,
+		on_first_read: Option<Arc<dyn Fn() + Send + Sync>>,
+		on_close: Option<Arc<dyn Fn() + Send + Sync>>,
+	}
+
+	impl GatedWorkerTransport {
+		fn new(fail_connect: bool, silent: bool) -> Self {
+			Self {
+				fail_connect,
+				silent,
+				started: Arc::new(Notify::new()),
+				go: Arc::new(Notify::new()),
+				dials: Arc::default(),
+				leases_read: Arc::default(),
+				connect_error: None,
+				on_connect: None,
+				on_first_read: None,
+				on_close: None,
+			}
+		}
+	}
+
+	/// The coordinator's end of a scripted stream, with the transport's read and close hooks.
+	struct HookedStream {
+		inner: tokio::io::DuplexStream,
+		on_first_read: Option<Arc<dyn Fn() + Send + Sync>>,
+		on_close: Option<Arc<dyn Fn() + Send + Sync>>,
+	}
+
+	impl tokio::io::AsyncRead for HookedStream {
+		fn poll_read(
+			mut self: std::pin::Pin<&mut Self>,
+			cx: &mut std::task::Context<'_>,
+			buf: &mut tokio::io::ReadBuf<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			if let Some(hook) = self.on_first_read.take() {
+				hook();
+			}
+			std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+		}
+	}
+
+	impl tokio::io::AsyncWrite for HookedStream {
+		fn poll_write(
+			mut self: std::pin::Pin<&mut Self>,
+			cx: &mut std::task::Context<'_>,
+			buf: &[u8],
+		) -> std::task::Poll<std::io::Result<usize>> {
+			std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+		}
+
+		fn poll_flush(
+			mut self: std::pin::Pin<&mut Self>,
+			cx: &mut std::task::Context<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+		}
+
+		fn poll_shutdown(
+			mut self: std::pin::Pin<&mut Self>,
+			cx: &mut std::task::Context<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			if let Some(hook) = self.on_close.take() {
+				hook();
+			}
+			std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl ToronTransport for GatedWorkerTransport {
+		async fn connect(
+			&self,
+			_address: &str,
+		) -> Result<Box<dyn self::transport::ToronStream>, QueryError> {
+			self.dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			if self.fail_connect {
+				return Err(QueryError::Io(std::io::Error::new(
+					std::io::ErrorKind::ConnectionRefused,
+					"injected dial failure",
+				)));
+			}
+			if let Some(error) = &self.connect_error {
+				return Err(error());
+			}
+			let (client, mut server) = test_duplex(1024 * 1024);
+			let (started, go, silent) =
+				(Arc::clone(&self.started), Arc::clone(&self.go), self.silent);
+			let leases_read = Arc::clone(&self.leases_read);
+			tokio::spawn(async move {
+				let memory = MemoryManager::new(1, 1024 * 1024);
+				let Ok(lease) = read_envelope(&mut server, &memory).await else {
+					return;
+				};
+				leases_read.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+				let payload: QueryLeasePayload =
+					decode_payload(&lease.payload).expect("lease payload");
+				if silent {
+					std::future::pending::<()>().await;
+				}
+				send_payload(
+					&mut server,
+					MessageKind::QueryLeaseAccepted,
+					EnvelopeIdentity::query(payload.query_id),
+					None,
+					&QueryLeaseAcceptedPayload {
+						query_id: payload.query_id,
+						outcome: QueryLeaseOutcome::Applied {
+							term_ms: payload.lease_term_millis,
+						},
+					},
+				)
+				.await
+				.expect("lease accepted");
+				let Ok(start) = read_envelope(&mut server, &memory).await else {
+					return;
+				};
+				let spec: StartTaskPayload = decode_payload(&start.payload).expect("start");
+				let identity = spec.spec.identity;
+				started.notify_one();
+				go.notified().await;
+				let _ = send_payload(
+					&mut server,
+					MessageKind::TaskStarted,
+					EnvelopeIdentity::task(identity),
+					None,
+					&TaskStartedPayload { identity },
+				)
+				.await;
+				use arrow::array::Int64Array;
+				use arrow::datatypes::{DataType, Field, Schema};
+				let batch = RecordBatch::try_new(
+					Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+					vec![Arc::new(Int64Array::from(vec![1_i64]))],
+				)
+				.expect("batch");
+				let seq = StreamSeq::new(0);
+				let _ = send_payload(
+					&mut server,
+					MessageKind::TaskBatch,
+					EnvelopeIdentity::task(identity),
+					Some(seq),
+					&TaskBatchPayload {
+						identity,
+						stream_seq: seq,
+						payload: ArrowIpcBytes::new(encode_record_batch(&batch).expect("encode")),
+					},
+				)
+				.await;
+				let _ = send_payload(
+					&mut server,
+					MessageKind::TaskComplete,
+					EnvelopeIdentity::task(identity),
+					None,
+					&TaskCompletePayload {
+						identity,
+						output: crate::distributed::task::TaskCompletionOutput::FinalResult {
+							output_digest: None,
+						},
+						telemetry: None,
+					},
+				)
+				.await;
+				std::future::pending::<()>().await;
+			});
+			if let Some(hook) = &self.on_connect {
+				hook();
+			}
+			Ok(Box::new(HookedStream {
+				inner: client,
+				on_first_read: self.on_first_read.clone(),
+				on_close: self.on_close.clone(),
+			}))
+		}
+	}
+
+	fn settable_registry() -> (
+		crate::distributed::cancellation::ActiveQueryRegistry,
+		Arc<crate::distributed::query_reliance::SettableClock>,
+	) {
+		let clock = Arc::new(crate::distributed::query_reliance::SettableClock::at(
+			1_000_000_000,
+		));
+		let registry = crate::distributed::cancellation::ActiveQueryRegistry::new().with_reliance(
+			crate::distributed::query_reliance::RelianceParams::production(Duration::from_millis(
+				35_001,
+			)),
+			clock.clone(),
+		);
+		(registry, clock)
+	}
+
+	/// ADR 628 B1.C: with reliance intact, the dispatch forwards its final batch and completes.
+	/// This is the control for the gate tests below.
+	#[tokio::test]
+	async fn a_relied_on_dispatch_forwards_its_batch_and_completes() {
+		let (registry, _clock) = settable_registry();
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(41));
+		let handle = guard.handle();
+		let transport = Arc::new(GatedWorkerTransport::new(false, false));
+		let (sender, mut receiver) = mpsc::channel(8);
+		let dispatcher = NetworkTaskDispatcher::new(
+			Arc::new(MemoryManager::new(4, 1024 * 1024)),
+			transport.clone(),
+		)
+		.with_active_query(Some(handle.clone()))
+		.with_final_result_sender(Some(sender), None);
+		transport.go.notify_one();
+		let outcome = tokio::time::timeout(
+			Duration::from_secs(5),
+			dispatcher.dispatch(&adr628_worker(), &final_result_task_spec(41)),
+		)
+		.await
+		.expect("dispatch");
+		assert!(
+			matches!(outcome, DispatchOutcome::CompletedWithTelemetry { .. }),
+			"{outcome:?}"
+		);
+		assert!(receiver.try_recv().expect("forwarded batch").is_ok());
+		assert!(matches!(
+			handle.reliance().state(adr628_worker().worker_id),
+			Some(crate::distributed::query_reliance::WorkerReliance::Reliable { .. })
+		));
+	}
+
+	/// ADR 628 B1.C: after the worker's bound passes mid-task, its final batch is NOT forwarded and
+	/// its completion is not accepted. The dispatch fails as `WorkerLost`, naming the worker.
+	#[tokio::test]
+	async fn no_batch_is_forwarded_after_the_workers_reliance_lapses() {
+		let (registry, clock) = settable_registry();
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(41));
+		let handle = guard.handle();
+		let worker = adr628_worker();
+		let transport = Arc::new(GatedWorkerTransport::new(false, false));
+		let (sender, mut receiver) = mpsc::channel(8);
+		let dispatcher = NetworkTaskDispatcher::new(
+			Arc::new(MemoryManager::new(4, 1024 * 1024)),
+			transport.clone(),
+		)
+		.with_active_query(Some(handle.clone()))
+		.with_final_result_sender(Some(sender), None);
+		let lapse = async {
+			transport.started.notified().await;
+			clock.advance(Duration::from_secs(60)); // past the ~34 s bound
+			transport.go.notify_one();
+		};
+		let spec = final_result_task_spec(41);
+		let (outcome, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+			tokio::join!(dispatcher.dispatch(&worker, &spec), lapse)
+		})
+		.await
+		.expect("dispatch");
+		assert!(
+			matches!(&outcome, DispatchOutcome::Failed(TaskFailureKind::WorkerLost { worker_id }) if *worker_id == worker.worker_id),
+			"{outcome:?}"
+		);
+		assert!(
+			receiver.try_recv().is_err(),
+			"no batch forwarded after the lapse"
+		);
+		assert_eq!(handle.lease_failure_worker(), Some(worker.worker_id));
+		assert!(matches!(
+			handle.reliance().state(worker.worker_id),
+			Some(crate::distributed::query_reliance::WorkerReliance::Lapsed { .. })
+		));
+	}
+
+	/// ADR 628 B1.C: a failed first issuance (here the dial) makes the worker Terminal and fails the
+	/// query. The scheduler's retry cannot become a fresh issuance: it is refused without dialling.
+	#[tokio::test]
+	async fn a_failed_first_issuance_fails_the_query_and_is_never_reissued() {
+		let (registry, _clock) = settable_registry();
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(41));
+		let handle = guard.handle();
+		let worker = adr628_worker();
+		let transport = Arc::new(GatedWorkerTransport::new(true, false));
+		let dispatcher = NetworkTaskDispatcher::new(
+			Arc::new(MemoryManager::new(4, 1024 * 1024)),
+			transport.clone(),
+		)
+		.with_active_query(Some(handle.clone()));
+		let outcome = dispatcher
+			.dispatch(&worker, &final_result_task_spec(41))
+			.await;
+		assert!(
+			matches!(&outcome, DispatchOutcome::Failed(TaskFailureKind::WorkerLost { worker_id }) if *worker_id == worker.worker_id),
+			"{outcome:?}"
+		);
+		assert!(matches!(
+			handle.reliance().state(worker.worker_id),
+			Some(
+				crate::distributed::query_reliance::WorkerReliance::Terminal(
+					crate::distributed::query_reliance::RelianceCause::IssuanceFailed(_)
+				)
+			)
+		));
+		assert!(handle.is_cancelled());
+		let retry = dispatcher
+			.dispatch(&worker, &final_result_task_spec(41))
+			.await;
+		assert!(matches!(retry, DispatchOutcome::Failed(_)), "{retry:?}");
+		assert_eq!(
+			transport.dials.load(std::sync::atomic::Ordering::SeqCst),
+			1,
+			"no second dial"
+		);
+	}
+
+	/// ADR 628 B1.C: the inline lease handshake is bounded by the ACK budget (2 s), not task
+	/// execution. A worker that never replies fails the first issuance at the budget.
+	#[tokio::test(start_paused = true)]
+	async fn a_silent_lease_reply_fails_the_dispatch_at_the_ack_budget() {
+		let registry = crate::distributed::cancellation::ActiveQueryRegistry::new().with_reliance(
+			crate::distributed::query_reliance::RelianceParams::production(Duration::from_millis(
+				35_001,
+			)),
+			Arc::new(crate::distributed::query_reliance::TokioRelianceClock::new()),
+		);
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(41));
+		let handle = guard.handle();
+		let worker = adr628_worker();
+		let dispatcher = NetworkTaskDispatcher::new(
+			Arc::new(MemoryManager::new(4, 1024 * 1024)),
+			Arc::new(GatedWorkerTransport::new(false, true)),
+		)
+		.with_active_query(Some(handle.clone()));
+		let started = tokio::time::Instant::now();
+		let outcome = dispatcher
+			.dispatch(&worker, &final_result_task_spec(41))
+			.await;
+		assert_eq!(started.elapsed(), Duration::from_secs(2));
+		assert!(
+			matches!(&outcome, DispatchOutcome::Failed(TaskFailureKind::WorkerLost { worker_id }) if *worker_id == worker.worker_id),
+			"{outcome:?}"
+		);
+	}
+
+	/// ADR 628 B1.C: every dispatch's inline lease shares the per-(query, worker) ledger. A later
+	/// dispatch's Applied refreshes the same worker's bound (max rule).
+	#[tokio::test]
+	async fn each_dispatch_lease_refreshes_the_shared_ledger() {
+		let (registry, clock) = settable_registry();
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(41));
+		let handle = guard.handle();
+		let worker = adr628_worker();
+		let bound_of = || match handle.reliance().state(worker.worker_id) {
+			Some(crate::distributed::query_reliance::WorkerReliance::Reliable {
+				bound, ..
+			}) => bound,
+			other => panic!("{other:?}"),
+		};
+		for (step, seed) in [(0u64, 41u128), (10, 42)] {
+			clock.advance(Duration::from_secs(step));
+			let transport = Arc::new(GatedWorkerTransport::new(false, false));
+			let dispatcher = NetworkTaskDispatcher::new(
+				Arc::new(MemoryManager::new(4, 1024 * 1024)),
+				transport.clone(),
+			)
+			.with_active_query(Some(handle.clone()));
+			transport.go.notify_one();
+			let outcome = tokio::time::timeout(
+				Duration::from_secs(5),
+				dispatcher.dispatch(&worker, &final_result_task_spec(seed)),
+			)
+			.await
+			.expect("dispatch");
+			assert!(
+				matches!(outcome, DispatchOutcome::CompletedWithTelemetry { .. }),
+				"{outcome:?}"
+			);
+			if step == 0 {
+				assert_eq!(bound_of().as_nanos(), 1_000_000_000 + 33_966_016_491);
+			} else {
+				assert_eq!(bound_of().as_nanos(), 11_000_000_000 + 33_966_016_491);
+			}
+		}
+	}
+
+	/// Runs one dispatch to `worker` through `transport` with the worker released at once, and
+	/// returns its outcome.
+	async fn adr628_dispatch(
+		handle: &ActiveQueryHandle,
+		transport: Arc<GatedWorkerTransport>,
+		worker: &crate::distributed::worker_registry::WorkerEntry,
+		seed: u128,
+	) -> DispatchOutcome {
+		let dispatcher = NetworkTaskDispatcher::new(
+			Arc::new(MemoryManager::new(4, 1024 * 1024)),
+			transport.clone(),
+		)
+		.with_active_query(Some(handle.clone()));
+		transport.go.notify_one();
+		tokio::time::timeout(
+			Duration::from_secs(5),
+			dispatcher.dispatch(worker, &final_result_task_spec(seed)),
+		)
+		.await
+		.expect("dispatch")
+	}
+
+	fn reliable_bound(
+		handle: &ActiveQueryHandle,
+		worker: WorkerId,
+	) -> crate::distributed::query_reliance::BootInstant {
+		match handle.reliance().state(worker) {
+			Some(crate::distributed::query_reliance::WorkerReliance::Reliable {
+				bound, ..
+			}) => bound,
+			other => panic!("not relied on: {other:?}"),
+		}
+	}
+
+	fn is_worker_lost(outcome: &DispatchOutcome, worker: WorkerId) -> bool {
+		matches!(outcome, DispatchOutcome::Failed(TaskFailureKind::WorkerLost { worker_id }) if *worker_id == worker)
+	}
+
+	/// ADR 628 B1.C: a close held across the bound cannot return an accepted completion (or a
+	/// manifest the scheduler would route to): the acceptance gate runs after the close.
+	#[tokio::test]
+	async fn a_close_held_across_the_bound_returns_no_completion() {
+		let (registry, clock) = settable_registry();
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(41));
+		let handle = guard.handle();
+		let worker = adr628_worker();
+		let mut transport = GatedWorkerTransport::new(false, false);
+		let held = Arc::clone(&clock);
+		transport.on_close = Some(Arc::new(move || held.advance(Duration::from_secs(60))));
+		let outcome = adr628_dispatch(&handle, Arc::new(transport), &worker, 41).await;
+		assert!(is_worker_lost(&outcome, worker.worker_id), "{outcome:?}");
+		assert!(matches!(
+			handle.reliance().state(worker.worker_id),
+			Some(crate::distributed::query_reliance::WorkerReliance::Lapsed { .. })
+		));
+	}
+
+	/// ADR 628 B1.C: a batch whose channel capacity is held (backpressure) across the bound is not
+	/// published: capacity is reserved first and the publication gate runs after that wait.
+	#[tokio::test]
+	async fn backpressure_held_across_the_bound_publishes_nothing() {
+		let (registry, clock) = settable_registry();
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(41));
+		let handle = guard.handle();
+		let worker = adr628_worker();
+		let transport = Arc::new(GatedWorkerTransport::new(false, false));
+		let (sender, mut receiver) = mpsc::channel(1);
+		sender
+			.send(Err(QueryError::Internal {
+				message: "occupies the only slot".to_string(),
+			}))
+			.await
+			.expect("fill");
+		let dispatcher = NetworkTaskDispatcher::new(
+			Arc::new(MemoryManager::new(4, 1024 * 1024)),
+			transport.clone(),
+		)
+		.with_active_query(Some(handle.clone()))
+		.with_final_result_sender(Some(sender), None);
+		let consumer = async {
+			transport.started.notified().await;
+			transport.go.notify_one();
+			// Let the worker write and the dispatcher read the batch and block on the full
+			// channel (bounded yields on this runtime; no timer).
+			for _ in 0..100 {
+				tokio::task::yield_now().await;
+			}
+			clock.advance(Duration::from_secs(60));
+			assert!(receiver.recv().await.expect("the filler").is_err());
+		};
+		let spec = final_result_task_spec(41);
+		let (outcome, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+			tokio::join!(dispatcher.dispatch(&worker, &spec), consumer)
+		})
+		.await
+		.expect("dispatch");
+		assert!(is_worker_lost(&outcome, worker.worker_id), "{outcome:?}");
+		assert!(
+			receiver.try_recv().is_err(),
+			"nothing published after the lapse"
+		);
+	}
+
+	/// ADR 628 B1.C: the dial gate lapses an expired bound: a worker whose bound has passed is never
+	/// dialed again, even though nothing else observed the lapse.
+	#[tokio::test]
+	async fn an_expired_worker_is_never_dialed() {
+		let (registry, clock) = settable_registry();
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(41));
+		let handle = guard.handle();
+		let worker = adr628_worker();
+		let first = adr628_dispatch(
+			&handle,
+			Arc::new(GatedWorkerTransport::new(false, false)),
+			&worker,
+			41,
+		)
+		.await;
+		assert!(matches!(
+			first,
+			DispatchOutcome::CompletedWithTelemetry { .. }
+		));
+		clock.advance(Duration::from_secs(60));
+		let transport = Arc::new(GatedWorkerTransport::new(false, false));
+		let second = adr628_dispatch(&handle, transport.clone(), &worker, 42).await;
+		assert!(is_worker_lost(&second, worker.worker_id), "{second:?}");
+		assert_eq!(
+			transport.dials.load(std::sync::atomic::Ordering::SeqCst),
+			0,
+			"no dial"
+		);
+	}
+
+	/// ADR 628 B1.C: the lease-write gate. A suspend (the clock passes the bound) or a cancellation
+	/// landing between the dial's completion and the lease write: no lease is written.
+	#[tokio::test]
+	async fn a_suspend_or_cancel_between_dial_and_lease_write_writes_no_lease() {
+		// The lease-write gate in isolation: a connect budget (120 s) longer than the suspend, so the
+		// connect check passes and the suspend is seen first at the lease write.
+		let clock = Arc::new(crate::distributed::query_reliance::SettableClock::at(
+			1_000_000_000,
+		));
+		let mut params = crate::distributed::query_reliance::RelianceParams::production(
+			Duration::from_millis(35_001),
+		);
+		params.connect_budget = Duration::from_secs(120);
+		params.whole_budget = Duration::from_secs(120);
+		let registry = crate::distributed::cancellation::ActiveQueryRegistry::new()
+			.with_reliance(params, clock.clone());
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(41));
+		let handle = guard.handle();
+		let worker = adr628_worker();
+		let suspend_in_connect =
+			|clock: &Arc<crate::distributed::query_reliance::SettableClock>| {
+				let mut transport = GatedWorkerTransport::new(false, false);
+				let suspended = Arc::clone(clock);
+				transport.on_connect =
+					Some(Arc::new(move || suspended.advance(Duration::from_secs(60))));
+				Arc::new(transport)
+			};
+		let first = adr628_dispatch(
+			&handle,
+			Arc::new(GatedWorkerTransport::new(false, false)),
+			&worker,
+			41,
+		)
+		.await;
+		assert!(matches!(
+			first,
+			DispatchOutcome::CompletedWithTelemetry { .. }
+		));
+		let transport = suspend_in_connect(&clock);
+		let second = adr628_dispatch(&handle, transport.clone(), &worker, 42).await;
+		assert!(is_worker_lost(&second, worker.worker_id), "{second:?}");
+		tokio::task::yield_now().await;
+		assert_eq!(
+			transport
+				.leases_read
+				.load(std::sync::atomic::Ordering::SeqCst),
+			0,
+			"no lease written after the suspend"
+		);
+
+		// With the production connect budget the same suspend is caught earlier, by the connect
+		// check: no lease is written either.
+		let (registry, clock) = settable_registry();
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(42));
+		let handle = guard.handle();
+		let first = adr628_dispatch(
+			&handle,
+			Arc::new(GatedWorkerTransport::new(false, false)),
+			&worker,
+			41,
+		)
+		.await;
+		assert!(matches!(
+			first,
+			DispatchOutcome::CompletedWithTelemetry { .. }
+		));
+		let transport = suspend_in_connect(&clock);
+		let second = adr628_dispatch(&handle, transport.clone(), &worker, 42).await;
+		assert!(matches!(second, DispatchOutcome::Failed(_)), "{second:?}");
+		tokio::task::yield_now().await;
+		assert_eq!(
+			transport
+				.leases_read
+				.load(std::sync::atomic::Ordering::SeqCst),
+			0,
+			"no lease written after a suspend inside the connect"
+		);
+
+		let (registry, _clock) = settable_registry();
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(43));
+		let handle = guard.handle();
+		let mut transport = GatedWorkerTransport::new(false, false);
+		let cancelling = handle.clone();
+		transport.on_connect = Some(Arc::new(move || {
+			cancelling.cancel(crate::distributed::cancellation::CancellationTrigger::SqlCancel);
+		}));
+		let transport = Arc::new(transport);
+		let outcome = adr628_dispatch(&handle, transport.clone(), &worker, 43).await;
+		assert!(
+			matches!(outcome, DispatchOutcome::Failed(TaskFailureKind::Cancelled)),
+			"{outcome:?}"
+		);
+		tokio::task::yield_now().await;
+		assert_eq!(
+			transport
+				.leases_read
+				.load(std::sync::atomic::Ordering::SeqCst),
+			0,
+			"no lease written after the cancellation"
+		);
+		assert!(matches!(
+			handle.reliance().outcome(),
+			crate::distributed::query_reliance::QueryOutcome::Failed {
+				cause: crate::distributed::query_reliance::RelianceCause::QueryEnded(
+					crate::distributed::query_reliance::QueryEnd::Cancelled
+				),
+				..
+			}
+		));
+	}
+
+	fn refused_dial(
+		failure: crate::error::EstablishmentFailure,
+	) -> Arc<dyn Fn() -> QueryError + Send + Sync> {
+		Arc::new(move || {
+			QueryError::Io(crate::quic::establishment_error(
+				std::io::ErrorKind::ConnectionRefused,
+				failure.clone(),
+			))
+		})
+	}
+
+	/// ADR 628 B1.C: with the recovery experiment OFF (the production path), a TLS or certificate
+	/// refusal on the dispatch dial to an already relied-on worker is fatal `Auth`: reliance ends at
+	/// once and the query fails naming the worker.
+	#[tokio::test]
+	async fn an_auth_refusal_to_a_relied_on_worker_is_fatal_without_the_recovery_experiment() {
+		let (registry, _clock) = settable_registry();
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(41));
+		let handle = guard.handle();
+		let worker = adr628_worker();
+		let first = adr628_dispatch(
+			&handle,
+			Arc::new(GatedWorkerTransport::new(false, false)),
+			&worker,
+			41,
+		)
+		.await;
+		assert!(matches!(
+			first,
+			DispatchOutcome::CompletedWithTelemetry { .. }
+		));
+		let mut transport = GatedWorkerTransport::new(false, false);
+		transport.connect_error = Some(refused_dial(crate::error::EstablishmentFailure::Tls {
+			alert: 42,
+			reason: "bad certificate".to_string(),
+		}));
+		let outcome = adr628_dispatch(&handle, Arc::new(transport), &worker, 42).await;
+		assert!(is_worker_lost(&outcome, worker.worker_id), "{outcome:?}");
+		assert!(matches!(
+			handle.reliance().state(worker.worker_id),
+			Some(
+				crate::distributed::query_reliance::WorkerReliance::Terminal(
+					crate::distributed::query_reliance::RelianceCause::Auth(_)
+				)
+			)
+		));
+		assert_eq!(handle.lease_failure_worker(), Some(worker.worker_id));
+	}
+
+	/// ADR 628 B1.C (control): a liveness dial failure to a relied-on worker stays transient. The
+	/// bound is kept and the query stays open.
+	#[tokio::test]
+	async fn a_liveness_dial_failure_to_a_relied_on_worker_keeps_its_bound() {
+		let (registry, _clock) = settable_registry();
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(41));
+		let handle = guard.handle();
+		let worker = adr628_worker();
+		let first = adr628_dispatch(
+			&handle,
+			Arc::new(GatedWorkerTransport::new(false, false)),
+			&worker,
+			41,
+		)
+		.await;
+		assert!(matches!(
+			first,
+			DispatchOutcome::CompletedWithTelemetry { .. }
+		));
+		let bound = reliable_bound(&handle, worker.worker_id);
+		let mut transport = GatedWorkerTransport::new(false, false);
+		transport.connect_error = Some(refused_dial(
+			crate::error::EstablishmentFailure::IdleTimedOut,
+		));
+		let outcome = adr628_dispatch(&handle, Arc::new(transport), &worker, 42).await;
+		assert!(
+			matches!(
+				outcome,
+				DispatchOutcome::Failed(TaskFailureKind::TaskFailed {
+					retryable: true,
+					..
+				})
+			),
+			"{outcome:?}"
+		);
+		assert_eq!(reliable_bound(&handle, worker.worker_id), bound);
+		assert_eq!(
+			handle.reliance().outcome(),
+			crate::distributed::query_reliance::QueryOutcome::Open
+		);
+	}
+
+	/// ADR 628 B1.C: a lease reply that is ready but observed after its budget (a delayed poll: the
+	/// boot clock moves 3 s while tokio's timer does not fire) refreshes nothing. For a relied-on
+	/// worker the bound is kept and the dispatch is a retryable failure; for a first issuance it is a
+	/// failed issuance.
+	#[tokio::test]
+	async fn a_lease_reply_observed_after_its_budget_refreshes_nothing() {
+		let (registry, clock) = settable_registry();
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(41));
+		let handle = guard.handle();
+		let worker = adr628_worker();
+		let first = adr628_dispatch(
+			&handle,
+			Arc::new(GatedWorkerTransport::new(false, false)),
+			&worker,
+			41,
+		)
+		.await;
+		assert!(matches!(
+			first,
+			DispatchOutcome::CompletedWithTelemetry { .. }
+		));
+		let bound = reliable_bound(&handle, worker.worker_id);
+		let mut transport = GatedWorkerTransport::new(false, false);
+		let starved = Arc::clone(&clock);
+		transport.on_first_read = Some(Arc::new(move || starved.advance(Duration::from_secs(3))));
+		let outcome = adr628_dispatch(&handle, Arc::new(transport), &worker, 42).await;
+		assert!(
+			matches!(
+				outcome,
+				DispatchOutcome::Failed(TaskFailureKind::TaskFailed {
+					retryable: true,
+					..
+				})
+			),
+			"{outcome:?}"
+		);
+		assert_eq!(
+			reliable_bound(&handle, worker.worker_id),
+			bound,
+			"no refresh"
+		);
+		assert!(handle.reliance().budget_overruns() >= 1);
+		assert_eq!(
+			handle.reliance().outcome(),
+			crate::distributed::query_reliance::QueryOutcome::Open
+		);
+
+		let (registry, clock) = settable_registry();
+		let guard = registry.register(crate::storage::TenantId(7), QueryId::from_u128(42));
+		let handle = guard.handle();
+		let mut transport = GatedWorkerTransport::new(false, false);
+		let starved = Arc::clone(&clock);
+		transport.on_first_read = Some(Arc::new(move || starved.advance(Duration::from_secs(3))));
+		let outcome = adr628_dispatch(&handle, Arc::new(transport), &worker, 42).await;
+		assert!(is_worker_lost(&outcome, worker.worker_id), "{outcome:?}");
+		assert!(matches!(
+			handle.reliance().state(worker.worker_id),
+			Some(
+				crate::distributed::query_reliance::WorkerReliance::Terminal(
+					crate::distributed::query_reliance::RelianceCause::IssuanceFailed(_)
+				)
+			)
+		));
+	}
+
+	/// ADR 628 B1.C: a connect the REAL runtime observes after its budget (the runtime thread is
+	/// blocked 150 ms inside the dial against a 100 ms connect budget, with the 1000 ms whole budget
+	/// still left) writes no lease and refreshes nothing. While Reliable the bound is kept and the
+	/// dispatch is retryable; while Issuing it is a failed first issuance. The on-time twin refreshes.
+	#[tokio::test]
+	async fn a_late_connect_within_the_whole_budget_writes_no_lease() {
+		let mut params = crate::distributed::query_reliance::RelianceParams::production(
+			Duration::from_millis(35_001),
+		);
+		params.connect_budget = Duration::from_millis(100);
+		params.ack_budget = Duration::from_millis(100);
+		params.whole_budget = Duration::from_millis(1000);
+		let registry = || {
+			crate::distributed::cancellation::ActiveQueryRegistry::new().with_reliance(
+				params,
+				Arc::new(crate::distributed::query_reliance::BootClock),
+			)
+		};
+		let blocked = || {
+			let mut transport = GatedWorkerTransport::new(false, false);
+			transport.on_connect = Some(Arc::new(|| {
+				std::thread::sleep(Duration::from_millis(150));
+			}));
+			Arc::new(transport)
+		};
+		let worker = adr628_worker();
+
+		let registry_a = registry();
+		let guard = registry_a.register(crate::storage::TenantId(7), QueryId::from_u128(41));
+		let handle = guard.handle();
+		let first = adr628_dispatch(
+			&handle,
+			Arc::new(GatedWorkerTransport::new(false, false)),
+			&worker,
+			41,
+		)
+		.await;
+		assert!(matches!(
+			first,
+			DispatchOutcome::CompletedWithTelemetry { .. }
+		));
+		let bound = reliable_bound(&handle, worker.worker_id);
+		let overruns = handle.reliance().budget_overruns();
+		let transport = blocked();
+		let late = adr628_dispatch(&handle, transport.clone(), &worker, 42).await;
+		assert!(
+			matches!(
+				&late,
+				DispatchOutcome::Failed(TaskFailureKind::TaskFailed { reason, retryable: true })
+					if reason == "connect completed after its budget"
+			),
+			"{late:?}"
+		);
+		tokio::task::yield_now().await;
+		assert_eq!(
+			transport
+				.leases_read
+				.load(std::sync::atomic::Ordering::SeqCst),
+			0,
+			"no lease written"
+		);
+		assert_eq!(
+			reliable_bound(&handle, worker.worker_id),
+			bound,
+			"no refresh"
+		);
+		assert!(
+			handle.reliance().budget_overruns() > overruns,
+			"overrun recorded"
+		);
+		assert_eq!(
+			handle.reliance().outcome(),
+			crate::distributed::query_reliance::QueryOutcome::Open
+		);
+		// The on-time twin refreshes.
+		let on_time = adr628_dispatch(
+			&handle,
+			Arc::new(GatedWorkerTransport::new(false, false)),
+			&worker,
+			43,
+		)
+		.await;
+		assert!(matches!(
+			on_time,
+			DispatchOutcome::CompletedWithTelemetry { .. }
+		));
+		assert!(reliable_bound(&handle, worker.worker_id) > bound);
+
+		let registry_b = registry();
+		let guard = registry_b.register(crate::storage::TenantId(7), QueryId::from_u128(42));
+		let handle = guard.handle();
+		let transport = blocked();
+		let first = adr628_dispatch(&handle, transport.clone(), &worker, 42).await;
+		assert!(is_worker_lost(&first, worker.worker_id), "{first:?}");
+		assert!(matches!(
+			handle.reliance().state(worker.worker_id),
+			Some(
+				crate::distributed::query_reliance::WorkerReliance::Terminal(
+					crate::distributed::query_reliance::RelianceCause::IssuanceFailed(_)
+				)
+			)
+		));
+		tokio::task::yield_now().await;
+		assert_eq!(
+			transport
+				.leases_read
+				.load(std::sync::atomic::Ordering::SeqCst),
+			0,
+			"no lease written"
+		);
+	}
+
 	fn final_result_task_spec(seed: u128) -> TaskSpec {
 		TaskSpec {
 			identity: TaskIdentity::new(
@@ -6307,6 +7211,87 @@ impl<Transport> NetworkTaskDispatcher<Transport> {
 	}
 }
 
+/// ADR 628 B1.C: one dispatch's view of the query's reliance on its worker. It holds the dispatch's
+/// issuance ticket (released when the dispatch ends, including on cancellation) and the dispatch's
+/// whole-handshake deadline (connect plus lease handshake; never task execution).
+pub struct DispatchLease {
+	pub reliance: Arc<crate::distributed::query_reliance::QueryReliance>,
+	pub worker: crate::distributed::identity::WorkerId,
+	/// The whole-handshake budget as a tokio deadline (bounds the waiting only).
+	pub whole_deadline: tokio::time::Instant,
+	/// The same budget on the boot clock, from the dial gate's sample. Completions are checked
+	/// against it under the ledger lock.
+	pub whole_by: crate::distributed::query_reliance::BootInstant,
+	/// The dispatched task, as `query/stage/task/attempt` (for recorded authorizations).
+	pub task: String,
+	ticket: crate::distributed::query_reliance::DispatchTicket,
+}
+
+impl DispatchLease {
+	/// This dispatch's inline lease exchange.
+	fn exchange(&self) -> crate::distributed::query_reliance::ExchangeId {
+		self.ticket.exchange()
+	}
+
+	/// The worker's use gate at `site`: `Reliable` and `now < bound`, sampled under the ledger lock.
+	fn gate(&self, site: &'static str, batch: Option<u64>) -> Result<(), QueryError> {
+		let mut use_site = crate::distributed::query_reliance::UseSite::new(site);
+		use_site.ticket = Some(self.ticket.ticket());
+		use_site.task = Some(self.task.clone());
+		use_site.batch = batch;
+		self.reliance
+			.gate(self.worker, use_site)
+			.map_err(|refusal| refusal.query_error())
+	}
+
+	/// Records an exit after the whole budget as an overrun (admission is not a guarantee). A clock
+	/// fault here fails the query; the next gate reports it.
+	fn note_exit(&self) {
+		let _ = self.reliance.within(
+			self.worker,
+			self.exchange(),
+			crate::distributed::query_reliance::Phase::Whole,
+			self.whole_by,
+		);
+	}
+
+	/// A transport or budget failure before a validated reply. A first issuance that fails this
+	/// way fails the query (no prior reliance to keep). With an existing bound, the dispatch fails
+	/// as before and the bound is kept.
+	fn transient_failure(&self, error: QueryError) -> QueryError {
+		match self
+			.reliance
+			.on_handshake_failed(self.worker, self.exchange(), &error.to_string())
+		{
+			Some(refusal) => refusal.query_error(),
+			None => error,
+		}
+	}
+
+	/// The failure table for a handshake error: `Io` is transient; a validated `Ignored` is
+	/// terminal at the reply (B0's dispatch mapping is kept); any other error is a protocol
+	/// violation and terminal.
+	fn handshake_error(&self, error: QueryError) -> QueryError {
+		match &error {
+			QueryError::Io(_) => self.transient_failure(error),
+			QueryError::Runtime(RuntimeError::QueryLeaseIgnored { reason, .. }) => {
+				self.reliance.on_fatal(
+					self.worker,
+					crate::distributed::query_reliance::RelianceCause::Ignored(reason.clone()),
+				);
+				error
+			}
+			_ => {
+				self.reliance.on_fatal(
+					self.worker,
+					crate::distributed::query_reliance::RelianceCause::Protocol(error.to_string()),
+				);
+				error
+			}
+		}
+	}
+}
+
 #[async_trait::async_trait]
 impl<Transport> TaskDispatcher for NetworkTaskDispatcher<Transport>
 where
@@ -6324,9 +7309,126 @@ where
 		{
 			return DispatchOutcome::Failed(TaskFailureKind::Cancelled);
 		}
-		let stream = match self.dial_worker(worker).await {
-			Ok(stream) => stream,
-			Err(outcome) => return outcome,
+		// ADR 628 B1.C: the dial gate. It enrolls this worker in the query's ledger after lapsing
+		// every expired bound, so an expired worker is never dialed. A worker that is already Lapsed
+		// or Terminal refuses here, so a scheduler retry can never become a fresh issuance.
+		let lease = match &self.active_query {
+			Some(active_query) => {
+				let reliance = Arc::clone(active_query.reliance());
+				let ticket = match reliance.begin_dispatch(worker) {
+					Ok(ticket) => ticket,
+					Err(refusal) => return DispatchOutcome::Failed(refusal.task_failure_kind()),
+				};
+				let whole_budget = reliance.params().whole_budget;
+				let Some(whole_by) = ticket.started().checked_add(whole_budget) else {
+					let refusal = reliance.on_fatal(
+						worker.worker_id,
+						crate::distributed::query_reliance::RelianceCause::Arithmetic,
+					);
+					return DispatchOutcome::Failed(refusal.task_failure_kind());
+				};
+				Some(DispatchLease {
+					whole_deadline: tokio::time::Instant::now() + whole_budget,
+					whole_by,
+					worker: worker.worker_id,
+					reliance,
+					task: task_text(&spec.identity),
+					ticket,
+				})
+			}
+			None => None,
+		};
+		let stream = match &lease {
+			None => match self.dial_worker(worker, None).await {
+				Ok(stream) => stream,
+				Err(outcome) => return outcome,
+			},
+			Some(lease) => {
+				// The connect budget from the exact connect start on the boot clock, capped by the
+				// whole budget. Tokio's timer only bounds the waiting.
+				let connect_by = match lease.reliance.begin_connect(
+					lease.worker,
+					lease.exchange(),
+					lease.whole_by,
+				) {
+					Ok(connect_by) => connect_by,
+					Err(refusal) => return DispatchOutcome::Failed(refusal.task_failure_kind()),
+				};
+				let connect_deadline = (tokio::time::Instant::now()
+					+ lease.reliance.params().connect_budget)
+					.min(lease.whole_deadline);
+				let tag = lease.reliance.tag(lease.worker, lease.exchange());
+				let dialed =
+					tokio::time::timeout_at(connect_deadline, self.dial_for_lease(worker, &tag))
+						.await;
+				if !matches!(dialed, Ok(LeaseDial::Connected(_))) {
+					lease.note_exit();
+				}
+				match dialed {
+					Ok(LeaseDial::Connected(stream)) => {
+						// A connect the runtime observed after its budget is late even if tokio
+						// returned it: no lease is written and nothing is refreshed. The overrun is
+						// recorded even with the whole budget left. While Issuing this is a failed
+						// first issuance; while Reliable the bound is kept and the dispatch retries.
+						match lease.reliance.within(
+							lease.worker,
+							lease.exchange(),
+							crate::distributed::query_reliance::Phase::Connect,
+							connect_by,
+						) {
+							Ok(true) => stream,
+							Ok(false) => {
+								if let Some(refusal) = lease.reliance.on_handshake_failed(
+									lease.worker,
+									lease.exchange(),
+									"connect completed after its budget",
+								) {
+									return DispatchOutcome::Failed(refusal.task_failure_kind());
+								}
+								return DispatchOutcome::Failed(TaskFailureKind::TaskFailed {
+									reason: "connect completed after its budget".to_string(),
+									retryable: true,
+								});
+							}
+							Err(refusal) => {
+								return DispatchOutcome::Failed(refusal.task_failure_kind());
+							}
+						}
+					}
+					Ok(LeaseDial::Refused(reason)) => {
+						// An authentication, certificate, version or protocol refusal is fatal,
+						// whether or not the worker is already relied on.
+						let refusal = lease.reliance.on_fatal(
+							lease.worker,
+							crate::distributed::query_reliance::RelianceCause::Auth(reason),
+						);
+						return DispatchOutcome::Failed(refusal.task_failure_kind());
+					}
+					Ok(LeaseDial::Failed(outcome)) => {
+						if let Some(refusal) = lease.reliance.on_handshake_failed(
+							lease.worker,
+							lease.exchange(),
+							"dial failed",
+						) {
+							return DispatchOutcome::Failed(refusal.task_failure_kind());
+						}
+						return outcome;
+					}
+					Err(_) => {
+						if let Some(refusal) = lease.reliance.on_handshake_failed(
+							lease.worker,
+							lease.exchange(),
+							"connect budget expired",
+						) {
+							return DispatchOutcome::Failed(refusal.task_failure_kind());
+						}
+						return DispatchOutcome::Failed(TaskFailureKind::TaskFailed {
+							reason: "connect budget expired".to_string(),
+							retryable: true,
+						});
+					}
+				}
+			}
 		};
 		if let Some(active_query) = &self.active_query {
 			active_query.record_remote_task(worker.clone(), spec.identity);
@@ -6335,14 +7437,13 @@ where
 			}
 		}
 
-		let execution = self
-			.coordinator
-			.execute_task_on_worker_with_telemetry_and_batch_sender(
-				stream,
-				spec.clone(),
-				self.final_result_sender.clone(),
-				self.final_result_batch_sent.clone(),
-			);
+		let execution = self.coordinator.execute_task_on_worker_with_lease(
+			stream,
+			spec.clone(),
+			self.final_result_sender.clone(),
+			self.final_result_batch_sent.clone(),
+			lease.as_ref(),
+		);
 		tokio::pin!(execution);
 		let result = if let Some(active_query) = &self.active_query {
 			tokio::select! {
@@ -6428,6 +7529,26 @@ where
 	}
 }
 
+/// ADR 628 B1.C: a task identity as `query/stage/task/attempt`, for recorded authorizations.
+fn task_text(identity: &TaskIdentity) -> String {
+	format!(
+		"{}/{}/{}/{}",
+		identity.query_id.get(),
+		identity.stage_id.get(),
+		identity.task_id.get(),
+		identity.attempt_id.get()
+	)
+}
+
+/// ADR 628 B1.C: a lease-carrying dispatch's dial, classified.
+enum LeaseDial {
+	Connected(Box<dyn ToronStream>),
+	/// A typed non-liveness establishment refusal.
+	Refused(String),
+	/// Any other failure, with the dispatch outcome it had before.
+	Failed(DispatchOutcome),
+}
+
 /// ADR 626: the reasons a live worker gives for an address of a query it has never seen.
 const CONFIRMATION_ACCEPTED_REASONS: [PartitionMissingReason; 2] = [
 	PartitionMissingReason::StoreEvicted,
@@ -6438,27 +7559,54 @@ impl<Transport> NetworkTaskDispatcher<Transport>
 where
 	Transport: ToronTransport + Send + Sync,
 {
+	/// ADR 628 B1.C: dials for a lease-carrying dispatch and classifies the ORIGINAL typed
+	/// establishment error, with or without the ADR 626 recovery experiment: a non-liveness
+	/// establishment failure (TLS, certificate, version or protocol refusal) is a refusal; anything
+	/// else keeps the dispatch outcome it had before.
+	async fn dial_for_lease(
+		&self,
+		worker: &crate::distributed::worker_registry::WorkerEntry,
+		tag: &crate::distributed::query_reliance::ExchangeTag,
+	) -> LeaseDial {
+		if self.recovery.is_some() {
+			return match self.dial_worker(worker, Some(tag)).await {
+				Ok(stream) => LeaseDial::Connected(stream),
+				Err(DispatchOutcome::Failed(TaskFailureKind::PeerRefused { failure, .. })) => {
+					LeaseDial::Refused(failure.to_string())
+				}
+				Err(outcome) => LeaseDial::Failed(outcome),
+			};
+		}
+		match self.transport.connect_worker_tagged(worker, tag).await {
+			Ok(stream) => LeaseDial::Connected(stream),
+			Err(error) => match crate::quic::establishment_failure(&error) {
+				Some(failure) if !failure.is_liveness() => LeaseDial::Refused(failure.to_string()),
+				_ => LeaseDial::Failed(DispatchOutcome::Failed(dispatch_failure_kind(error))),
+			},
+		}
+	}
+
 	/// Dials the dispatch target. With the recovery experiment, establishment is bounded by `H`: a
 	/// liveness failure is the coordinator-local `WorkerUnreachable`, a typed refusal is
 	/// `PeerRefused`. Without it, the dial is exactly as before.
 	async fn dial_worker(
 		&self,
 		worker: &crate::distributed::worker_registry::WorkerEntry,
+		tag: Option<&crate::distributed::query_reliance::ExchangeTag>,
 	) -> Result<Box<dyn ToronStream>, DispatchOutcome> {
+		let dial = async {
+			match tag {
+				Some(tag) => self.transport.connect_worker_tagged(worker, tag).await,
+				None => self.transport.connect_worker(worker).await,
+			}
+		};
 		let Some(experiment) = self.recovery else {
-			return self
-				.transport
-				.connect_worker(worker)
+			return dial
 				.await
 				.map_err(|error| DispatchOutcome::Failed(dispatch_failure_kind(error)));
 		};
 		let started = Instant::now();
-		let failure = match tokio::time::timeout(
-			experiment.establishment_deadline(),
-			self.transport.connect_worker(worker),
-		)
-		.await
-		{
+		let failure = match tokio::time::timeout(experiment.establishment_deadline(), dial).await {
 			Ok(Ok(stream)) => return Ok(stream),
 			Ok(Err(error)) => match crate::quic::establishment_failure(&error) {
 				Some(failure) => failure.clone(),
@@ -6546,8 +7694,27 @@ impl ToronCoordinator {
 	where
 		Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 	{
+		// ADR 628 B0: a valid `Ignored` ends reliance at the reply. The typed refusal is returned
+		// at once; the stream is dropped without awaiting a close, so a stalled or failing shutdown
+		// can neither delay `fail_query_lease` nor replace the reason. Only `Applied` requires the
+		// whole exchange to complete.
+		self.query_lease_handshake(&mut stream, query_id).await?;
+		Self::finish_lease_exchange(&mut stream).await
+	}
+
+	/// ADR 628 B1.C: the lease request and its validated reply only (send, read, validate). `Ok` is
+	/// a validated `Applied` with the requested term. `Err(QueryLeaseIgnored)` is a validated
+	/// refusal. Any other error is transport (`Io`) or a protocol violation.
+	pub async fn query_lease_handshake<Stream>(
+		&self,
+		stream: &mut Stream,
+		query_id: crate::distributed::identity::QueryId,
+	) -> Result<(), QueryError>
+	where
+		Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	{
 		send_payload(
-			&mut stream,
+			stream,
 			MessageKind::QueryLease,
 			EnvelopeIdentity::query(query_id),
 			None,
@@ -6557,7 +7724,7 @@ impl ToronCoordinator {
 			},
 		)
 		.await?;
-		let response = read_envelope(&mut stream, self.memory.as_ref()).await?;
+		let response = read_envelope(stream, self.memory.as_ref()).await?;
 		response.validate_runtime(ProtocolVersion::CURRENT, FrameByteLen::from_u32(u32::MAX))?;
 		if response.kind != MessageKind::QueryLeaseAccepted {
 			return Err(QueryError::UnexpectedMessage {
@@ -6565,12 +7732,15 @@ impl ToronCoordinator {
 			});
 		}
 		let payload: QueryLeaseAcceptedPayload = decode_payload(&response.payload)?;
-		// ADR 628 B0: a valid `Ignored` ends reliance at the reply. The typed refusal is returned
-		// at once; the stream is dropped without awaiting a close, so a stalled or failing shutdown
-		// can neither delay `fail_query_lease` nor replace the reason. Only `Applied` requires the
-		// whole exchange to complete.
-		self.lease_outcome(&response, &payload, query_id)??;
-		finish_terminal_exchange(&mut stream, Ok(())).await
+		self.lease_outcome(&response, &payload, query_id)?
+	}
+
+	/// ADR 628 B0/B1.C: a renewal's `Applied` counts only once its stream has also closed.
+	pub async fn finish_lease_exchange<Stream>(stream: &mut Stream) -> Result<(), QueryError>
+	where
+		Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	{
+		finish_terminal_exchange(stream, Ok(())).await
 	}
 
 	/// ADR 628 B0: validates a lease reply after its version and kind: the envelope's query
@@ -6664,7 +7834,7 @@ impl ToronCoordinator {
 
 	pub async fn execute_task_on_worker_with_telemetry_and_batch_sender<Stream>(
 		&self,
-		mut stream: Stream,
+		stream: Stream,
 		spec: TaskSpec,
 		final_result_sender: Option<mpsc::Sender<Result<RecordBatch, QueryError>>>,
 		final_result_batch_sent: Option<Arc<AtomicBool>>,
@@ -6672,32 +7842,107 @@ impl ToronCoordinator {
 	where
 		Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 	{
+		self.execute_task_on_worker_with_lease(
+			stream,
+			spec,
+			final_result_sender,
+			final_result_batch_sent,
+			None,
+		)
+		.await
+	}
+
+	/// ADR 628 B1.C: as above, with the query's reliance ledger for this worker. The inline lease
+	/// handshake (bounded by the ACK budget and the dispatch's whole deadline; never task
+	/// execution) is a refresh candidate for the shared ledger. `StartTask`, every forwarded
+	/// final batch, and acceptance of the completion each pass the worker's gate first.
+	pub async fn execute_task_on_worker_with_lease<Stream>(
+		&self,
+		mut stream: Stream,
+		spec: TaskSpec,
+		final_result_sender: Option<mpsc::Sender<Result<RecordBatch, QueryError>>>,
+		final_result_batch_sent: Option<Arc<AtomicBool>>,
+		lease: Option<&DispatchLease>,
+	) -> Result<RemoteTaskCompletion, QueryError>
+	where
+		Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	{
 		let identity = spec.identity;
 		let forward_final_batches =
 			matches!(spec.output, TaskOutputBinding::FinalResult) && final_result_sender.is_some();
-		send_payload(
-			&mut stream,
-			MessageKind::QueryLease,
-			EnvelopeIdentity::query(identity.query_id),
-			None,
-			&QueryLeasePayload {
-				query_id: identity.query_id,
-				lease_term_millis: self.query_lease_term_millis,
-			},
-		)
-		.await?;
-		let lease_response = read_envelope(&mut stream, self.memory.as_ref()).await?;
-		lease_response
-			.validate_runtime(ProtocolVersion::CURRENT, FrameByteLen::from_u32(u32::MAX))?;
-		if lease_response.kind != MessageKind::QueryLeaseAccepted {
-			return Err(QueryError::UnexpectedMessage {
-				expected: "QueryLeaseAccepted before StartTask",
-			});
+		match lease {
+			None => {
+				// ADR 628 B0: an ignored issuance sends NO StartTask; the dispatch fails with the typed
+				// refusal and is never retried as a fresh issuance.
+				self.query_lease_handshake(&mut stream, identity.query_id)
+					.await?;
+			}
+			Some(lease) => {
+				// The lease-write gate: after a seal or lapse (including one that happened between
+				// the dial and here, such as a cancellation or a suspend), nothing is written.
+				let marker = lease
+					.reliance
+					.send_marker(lease.worker, lease.exchange())
+					.map_err(|refusal| refusal.query_error())?;
+				let ack_by = marker
+					.checked_add(lease.reliance.params().ack_budget)
+					.map_or(lease.whole_by, |ack_by| ack_by.min(lease.whole_by));
+				let ack_deadline = (tokio::time::Instant::now()
+					+ lease.reliance.params().ack_budget)
+					.min(lease.whole_deadline);
+				let handshake = tokio::time::timeout_at(
+					ack_deadline,
+					self.query_lease_handshake(&mut stream, identity.query_id),
+				)
+				.await;
+				lease.note_exit();
+				match handshake {
+					Ok(Ok(())) => {
+						// A reply the runtime observed after its budget refreshes nothing.
+						let on_time = lease
+							.reliance
+							.within(
+								lease.worker,
+								lease.exchange(),
+								crate::distributed::query_reliance::Phase::Ack,
+								ack_by,
+							)
+							.map_err(|refusal| refusal.query_error())?;
+						if !on_time {
+							return Err(lease.transient_failure(QueryError::Io(
+								std::io::Error::new(
+									std::io::ErrorKind::TimedOut,
+									"lease reply completed past its budget",
+								),
+							)));
+						}
+						match lease
+							.reliance
+							.on_applied(lease.worker, marker, lease.exchange(), ack_by)
+							.map_err(|refusal| refusal.query_error())?
+						{
+							crate::distributed::query_reliance::Applied::Bound(_) => {}
+							crate::distributed::query_reliance::Applied::Late => {
+								return Err(lease.transient_failure(QueryError::Io(
+									std::io::Error::new(
+										std::io::ErrorKind::TimedOut,
+										"lease reply completed past its budget",
+									),
+								)));
+							}
+						}
+					}
+					Ok(Err(error)) => return Err(lease.handshake_error(error)),
+					Err(_) => {
+						return Err(lease.transient_failure(QueryError::Io(std::io::Error::new(
+							std::io::ErrorKind::TimedOut,
+							"lease handshake budget expired",
+						))));
+					}
+				}
+				lease.gate("start_task", None)?;
+			}
 		}
-		let lease: QueryLeaseAcceptedPayload = decode_payload(&lease_response.payload)?;
-		// ADR 628 B0: an ignored issuance sends NO StartTask; the dispatch fails with the typed
-		// refusal and is never retried as a fresh issuance.
-		self.lease_outcome(&lease_response, &lease, identity.query_id)??;
 		send_payload(
 			&mut stream,
 			MessageKind::StartTask,
@@ -6709,6 +7954,8 @@ impl ToronCoordinator {
 
 		let mut results = Vec::new();
 		let mut batch_decode_micros = 0u64;
+		// ADR 628 B1.C: the per-task ordinal of each final batch offered for publication.
+		let mut published = 0u64;
 		let terminal_result = loop {
 			let response = read_envelope(&mut stream, self.memory.as_ref()).await?;
 			response
@@ -6732,15 +7979,23 @@ impl ToronCoordinator {
 					let batch_decode_started = Instant::now();
 					for batch in decode_record_batches(payload.payload.as_slice())? {
 						if forward_final_batches {
-							if let Some(batch_sent) = &final_result_batch_sent {
-								batch_sent.store(true, Ordering::SeqCst);
-							}
 							let sender = final_result_sender
 								.as_ref()
 								.expect("checked final result sender");
-							if sender.send(Ok(batch)).await.is_err() {
+							// ADR 628 B1.C: capacity is reserved first (backpressure may hold it
+							// across a lapse); the publication gate runs after that wait, and the
+							// batch is published synchronously with the permit.
+							let Ok(permit) = sender.reserve().await else {
 								return Err(cancelled_task_error());
+							};
+							published += 1;
+							if let Some(lease) = lease {
+								lease.gate("publish", Some(published))?;
 							}
+							if let Some(batch_sent) = &final_result_batch_sent {
+								batch_sent.store(true, Ordering::SeqCst);
+							}
+							permit.send(Ok(batch));
 						} else {
 							results.push(batch);
 						}
@@ -6762,6 +8017,11 @@ impl ToronCoordinator {
 					telemetry.dispatcher_batch_decode_micros = telemetry
 						.dispatcher_batch_decode_micros
 						.saturating_add(batch_decode_micros);
+					// ADR 628 B1.C: a completion whose output lives on this worker is accepted only
+					// while it is relied on.
+					if let Some(lease) = lease {
+						lease.gate("accept_before_close", None)?;
+					}
 					break Ok((payload.output, telemetry));
 				}
 				MessageKind::TaskFailed => {
@@ -6791,6 +8051,11 @@ impl ToronCoordinator {
 			}
 		};
 		let (output, telemetry) = finish_terminal_exchange(&mut stream, terminal_result).await?;
+		// ADR 628 B1.C: the acceptance gate, after the close. A close held across the bound cannot
+		// return a completion (or a manifest the scheduler would route to).
+		if let Some(lease) = lease {
+			lease.gate("accept_after_close", None)?;
+		}
 
 		Ok(RemoteTaskCompletion {
 			batches: results,

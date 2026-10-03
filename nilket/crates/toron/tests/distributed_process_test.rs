@@ -39,6 +39,8 @@ use wendelon::schema::{
 
 #[path = "support/lease_faults.rs"]
 mod lease_faults;
+#[path = "support/reliance_faults.rs"]
+mod reliance_faults;
 /// ADR 626 Stage A: passive wait events, shared with the fixture worker binary.
 #[path = "support/wait_events.rs"]
 mod wait_events;
@@ -59,6 +61,19 @@ tokio::task_local! {
 	/// ADR 628: workers spawned in this scope run the managed (production) store lifecycle with
 	/// its one-second reaper.
 	static MANAGED_LIFECYCLE: ();
+	/// ADR 628 B1.C: workers spawned in this scope run the long table's scan for this many ms
+	/// (`--long-scan-ms`).
+	static LONG_SCAN_MS: u64;
+	/// ADR 628 B1.C: the instrument installed on the production coordinator path in `adr627_run`.
+	static RELIANCE_INSTRUMENT: RelianceInstrument;
+}
+
+/// ADR 628 B1.C: the coordinator-side instrument: the reliance observer (seam S2) and, for a
+/// renewal-path control, the renewal transport (seam S1).
+#[derive(Clone)]
+struct RelianceInstrument {
+	observer: Arc<dyn toron::distributed::query_reliance::RelianceObserver>,
+	renewal_transport: Option<Arc<dyn ToronTransport>>,
 }
 
 fn current_process_transport() -> ProcessTransport {
@@ -158,6 +173,9 @@ impl FixtureWorkerProcess {
 		}
 		if MANAGED_LIFECYCLE.try_with(|()| ()).is_ok() {
 			command.arg("--managed-lifecycle");
+		}
+		if let Ok(ms) = LONG_SCAN_MS.try_with(|ms| *ms) {
+			command.arg("--long-scan-ms").arg(ms.to_string());
 		}
 		if let Some((establishment, confirmation)) = recovery {
 			command
@@ -4326,6 +4344,13 @@ fn probe_case_logical(case: &str) -> (Arc<MockCatalog>, LogicalPlan) {
 				.plan("SELECT customers.region, long.id FROM customers JOIN long ON customers.id = long.id")
 				.expect("plan long join last"),
 		),
+		// ADR 628 B1.C: the same query; its workers run the long scan at `--long-scan-ms`.
+		"horizon_join_last" => (
+			wait_survey_catalog(),
+			SqlPlanner::new()
+				.plan("SELECT customers.region, long.id FROM customers JOIN long ON customers.id = long.id")
+				.expect("plan horizon join last"),
+		),
 		other => panic!("unknown probe case {other}"),
 	}
 }
@@ -6986,6 +7011,21 @@ async fn adr627_run(
 				PlannerConfig::default(),
 				QueryBudget::test_default(),
 			);
+			// ADR 628 B1.C: the declared instrument, when this run has one.
+			let coordinator = match RELIANCE_INSTRUMENT.try_with(|instrument| instrument.clone()) {
+				Ok(instrument) => {
+					evidence["reliance_instrument"] = serde_json::json!({
+						"observer": "probe_events.jsonl reliance events",
+						"renewal_transport": instrument.renewal_transport.is_some(),
+					});
+					let coordinator = coordinator.with_reliance_observer(instrument.observer);
+					match instrument.renewal_transport {
+						Some(renewal) => coordinator.with_renewal_transport(renewal),
+						None => coordinator,
+					}
+				}
+				Err(_) => coordinator,
+			};
 			let query = async {
 				let run = coordinator.execute_query(&logical);
 				tokio::pin!(run);
@@ -7144,6 +7184,12 @@ async fn multinode_probe_mid_task() {
 		}
 	};
 	let mut evidence = probe_base_evidence(&spec, "mid_task");
+	// ADR 628 B1.C: a spec may declare the reliance observer (Wi-Fi campaign, production path).
+	let instrument =
+		(spec.raw["reliance_observer"].as_bool() == Some(true)).then(|| RelianceInstrument {
+			observer: Arc::new(reliance_faults::EventLogRelianceObserver { log: log.clone() }),
+			renewal_transport: None,
+		});
 	let run = adr627_run(
 		path,
 		&case,
@@ -7153,8 +7199,11 @@ async fn multinode_probe_mid_task() {
 		spec.recovery,
 		fault,
 		spec.deadline,
-	)
-	.await;
+	);
+	let run = match instrument {
+		Some(instrument) => RELIANCE_INSTRUMENT.scope(instrument, run).await,
+		None => run.await,
+	};
 	if let serde_json::Value::Object(map) = run {
 		for (key, value) in map {
 			evidence[key] = value;
@@ -7527,6 +7576,369 @@ async fn lease_fault_control_on_loopback() {
 		});
 		if let Some(relay) = relay {
 			evidence["adr628"]["relay_realized"] = relay.shutdown().await;
+		}
+		use std::io::Write as _;
+		std::fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(dir.join("control.json"))
+			.expect("fresh control evidence")
+			.write_all(serde_json::to_string_pretty(&evidence).expect("json").as_bytes())
+			.expect("write control evidence");
+		for worker in &mut workers {
+			worker.shutdown().await;
+		}
+	})
+	.await;
+}
+
+/// ADR 628 B1.C: one declared reliance control. `case` is `long_join_last` (30 s) or
+/// `horizon_join_last` (the same query with the long scan at `long_scan_ms`).
+struct RelianceControl {
+	name: &'static str,
+	case: &'static str,
+	long_scan_ms: Option<u64>,
+	renewal: Option<(reliance_faults::RenewalFault, reliance_faults::Firing)>,
+	route: Option<Adr628Route>,
+	/// The relay blackout starts at the target's first renewal refresh (a recorded `applied` /
+	/// `installed` reliance event for a renewal exchange of the target), lasting `Some(d)` or
+	/// permanently.
+	kill_target: bool,
+}
+
+/// ADR 628 B1.C: the 110 s horizon case (about 3.2 initial horizons of 33.966 s).
+const RELIANCE_HORIZON_SCAN_MS: u64 = 110_000;
+
+fn reliance_control(name: &str) -> RelianceControl {
+	use lease_faults::PhaseDelays;
+	use reliance_faults::{Firing, RenewalFault};
+	use std::time::Duration;
+	let ms = Duration::from_millis;
+	let delays = |connect, read, close| {
+		RenewalFault::Delays(PhaseDelays {
+			connect: ms(connect),
+			write: ms(0),
+			read: ms(read),
+			close: ms(close),
+		})
+	};
+	let route = |delay, loss_per_mille, blackout| {
+		Some(Adr628Route {
+			delay: ms(delay),
+			loss_per_mille,
+			seed: 628,
+			blackout,
+		})
+	};
+	let short = ("long_join_last", None);
+	let horizon = ("horizon_join_last", Some(RELIANCE_HORIZON_SCAN_MS));
+	let (name, (case, long_scan_ms), renewal, route, kill_target): (&'static str, _, _, _, _) =
+		match name {
+			"none" => ("none", short, None, None, false),
+			"ren_connect_1500" => (
+				"ren_connect_1500",
+				short,
+				Some((delays(1500, 0, 0), Firing::Every)),
+				None,
+				false,
+			),
+			"ren_read_1500" => (
+				"ren_read_1500",
+				short,
+				Some((delays(0, 1500, 0), Firing::Every)),
+				None,
+				false,
+			),
+			"ren_close_1500" => (
+				"ren_close_1500",
+				short,
+				Some((delays(0, 0, 1500), Firing::Every)),
+				None,
+				false,
+			),
+			"ren_connect_2500" => (
+				"ren_connect_2500",
+				horizon,
+				Some((delays(2500, 0, 0), Firing::Every)),
+				None,
+				false,
+			),
+			"ren_read_2500" => (
+				"ren_read_2500",
+				horizon,
+				Some((delays(0, 2500, 0), Firing::Every)),
+				None,
+				false,
+			),
+			"ren_close_3500" => (
+				"ren_close_3500",
+				horizon,
+				Some((delays(0, 0, 3500), Firing::Every)),
+				None,
+				false,
+			),
+			"ren_withhold_once" => (
+				"ren_withhold_once",
+				horizon,
+				Some((RenewalFault::WithholdReply, Firing::Only(2))),
+				None,
+				false,
+			),
+			"ren_withhold_all" => (
+				"ren_withhold_all",
+				horizon,
+				Some((RenewalFault::WithholdReply, Firing::From(2))),
+				None,
+				false,
+			),
+			"ren_refuse" => (
+				"ren_refuse",
+				horizon,
+				Some((RenewalFault::Refuse, Firing::Only(2))),
+				None,
+				false,
+			),
+			"route_delay_40" => ("route_delay_40", short, None, route(40, 0, None), false),
+			"route_loss_100" => ("route_loss_100", short, None, route(0, 100, None), false),
+			"route_blackout_8s" => (
+				"route_blackout_8s",
+				horizon,
+				None,
+				route(0, 0, Some(Some(Duration::from_secs(8)))),
+				false,
+			),
+			"route_blackout_40s" => (
+				"route_blackout_40s",
+				horizon,
+				None,
+				route(0, 0, Some(Some(Duration::from_secs(40)))),
+				false,
+			),
+			"route_unreachable" => (
+				"route_unreachable",
+				horizon,
+				None,
+				route(0, 0, Some(None)),
+				false,
+			),
+			"census_worker_kill" => ("census_worker_kill", short, None, None, true),
+			"horizon_110" => ("horizon_110", horizon, None, None, false),
+			other => panic!("unknown ADR 628 B1.C control {other}"),
+		};
+	RelianceControl {
+		name,
+		case,
+		long_scan_ms,
+		renewal,
+		route,
+		kill_target,
+	}
+}
+
+/// ADR 628 B1.C: a declared reliance control on loopback. Three managed fixture workers (the long
+/// scan configured for every worker when the case declares it), the production coordinator path
+/// with the reliance observer on the probe log (seam S2), and, for a renewal-path control, the
+/// renewal transport carrying the fault (seam S1, renewal dials only). The target is the first
+/// registry entry. Evidence and every log go to `TORON_ADR628_DIR`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ADR 628 B1.C control: run explicitly with TORON_ADR628_DIR and TORON_ADR628_CONTROL"]
+async fn reliance_control_on_loopback() {
+	let dir =
+		std::path::PathBuf::from(std::env::var("TORON_ADR628_DIR").expect("TORON_ADR628_DIR"));
+	std::fs::create_dir(&dir).expect("a fresh control directory");
+	let control =
+		reliance_control(&std::env::var("TORON_ADR628_CONTROL").expect("TORON_ADR628_CONTROL"));
+	with_quic(async {
+		let mut workers = Vec::new();
+		for id in 62_801..=62_803u128 {
+			let dials = dir.join(format!("dials-{id}.txt"));
+			let events = dir.join(format!("worker-{id}.jsonl"));
+			let spawn = MANAGED_LIFECYCLE.scope(
+				(),
+				FixtureWorkerProcess::spawn_recorded(
+					WorkerId::from_u128(id),
+					Some(&dials),
+					Some(&events),
+				),
+			);
+			workers.push(match control.long_scan_ms {
+				Some(ms) => LONG_SCAN_MS.scope(ms, spawn).await,
+				None => spawn.await,
+			});
+		}
+		let log = wait_events::EventLog::create(&dir.join("probe_events.jsonl")).expect("fresh probe events");
+		let observed: Arc<dyn ToronTransport> = Arc::new(wait_events::ObservedTransport {
+			inner: process_transport(),
+			log: log.clone(),
+			role: "dispatch",
+		});
+		let target = workers[0].worker_id;
+		// The renewal transport (S1) records its dials in the same log, through its own observed layer.
+		let renewal = control.renewal.map(|(fault, firing)| {
+			let observed_renewal: Arc<dyn ToronTransport> = Arc::new(wait_events::ObservedTransport {
+				inner: process_transport(),
+				log: log.clone(),
+				role: "renewal",
+			});
+			Arc::new(reliance_faults::RenewalFaultTransport::new(
+				observed_renewal,
+				target,
+				fault,
+				firing,
+				log.clone(),
+			))
+		});
+		let relay = match &control.route {
+			Some(route) => {
+				let direct: std::net::SocketAddr = workers[0].endpoint.as_str().parse().expect("loopback endpoint");
+				Some(UdpRelay::start(direct, route.delay, route.loss_per_mille, route.seed).await)
+			}
+			None => None,
+		};
+		let mut declared = workers
+			.iter()
+			.map(|worker| (worker.worker_id, worker.endpoint.clone()))
+			.collect::<Vec<_>>();
+		if let Some(relay) = &relay {
+			// Coordinator traffic to the target (dispatch, renewal, retirement) takes the relay; peer
+			// pulls use the workers' direct advertised endpoints.
+			declared[0].1 = WorkerEndpoint::new(relay.addr.to_string());
+		}
+		let blackout = control.route.as_ref().and_then(|route| route.blackout);
+		let relay_ref = relay.as_ref();
+		let mut trigger_events = log.subscribe();
+		let target_text = target.get().as_u128().to_string();
+		let schedule = async {
+			let Some(lasting) = blackout else { return serde_json::json!(null) };
+			let relay = relay_ref.expect("a blackout needs a relay");
+			// Trigger: the target's first renewal refresh recorded by the ledger. The cut's installed
+			// bound is that event's `new_bound_ns`.
+			let trigger = loop {
+				let Some(event) = trigger_events.recv().await else {
+					return serde_json::json!({ "outcome": "event log closed before the trigger" });
+				};
+				if event["event"] == "observation_end" {
+					return serde_json::json!({ "outcome": "the query ended before the trigger; no blackout applied" });
+				}
+				if event["event"] == "reliance"
+					&& event["kind"] == "applied"
+					&& event["result"] == "installed"
+					&& event["worker"] == target_text.as_str()
+					&& event["exchange"]["kind"] == "renewal"
+				{
+					break event;
+				}
+			};
+			// The cut and the restoration are sampled on the coordinator's boot clock immediately after
+			// each takes effect (the ledger's clock domain); an unavailable sample is null.
+			let boot_ns = || {
+				use toron::distributed::query_reliance::RelianceClock as _;
+				toron::distributed::query_reliance::BootClock
+					.now()
+					.ok()
+					.and_then(|instant| u64::try_from(instant.as_nanos()).ok())
+			};
+			relay.blackhole();
+			let cut_boot_ns = boot_ns();
+			let started = log.now_us();
+			log.emit_at(started, "fault_blackout_start", "dispatch", serde_json::json!({
+				"trigger_seq": trigger["seq"].clone(), "trigger_attempt": trigger["exchange"]["attempt"].clone(),
+				"bound_at_cut_ns": trigger["new_bound_ns"].clone(), "trigger_at_ns": trigger["at_ns"].clone(),
+				"cut_boot_ns": cut_boot_ns,
+			}));
+			let mut restore_boot_ns = None;
+			if let Some(lasting) = lasting {
+				tokio::time::sleep(lasting).await;
+				relay.restore();
+				restore_boot_ns = boot_ns();
+				log.emit("fault_blackout_end", "dispatch", serde_json::json!({
+					"configured_ms": lasting.as_millis() as u64, "restore_boot_ns": restore_boot_ns,
+				}));
+			}
+			serde_json::json!({
+				"trigger": "the target's first renewal refresh (reliance applied/installed, renewal exchange)",
+				"trigger_seq": trigger["seq"].clone(),
+				"trigger_attempt": trigger["exchange"]["attempt"].clone(),
+				"bound_at_cut_ns": trigger["new_bound_ns"].clone(),
+				"started_us": started,
+				"cut_boot_ns": cut_boot_ns,
+				"restore_boot_ns": restore_boot_ns,
+				"configured_lasting_ms": lasting.map(|d| d.as_millis() as u64),
+			})
+		};
+		let pid = workers[0].child.id().expect("target pid");
+		// Census worker kill: Stage A's trigger (3 s after the target's stage-0 `StartTask` write). It
+		// measures losing a census worker, not a mid-scan loss; permitted failure paths are read from
+		// the actual events.
+		let fault = control.kill_target.then(|| Adr627Fault {
+			target,
+			victim_stage: 0,
+			fault: "kill",
+			signal: Box::new(move || {
+				Box::pin(async move {
+					let status = Command::new("kill").arg("-KILL").arg(pid.to_string()).status().await;
+					tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+					let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|stat| {
+						stat.rsplit_once(") ").and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
+					});
+					serde_json::json!({
+						"pid": pid,
+						"kill_status": status.map(|status| status.code()).map_err(|error| error.to_string()),
+						"proc_state": state,
+						"confirmed": state.is_none() || state.as_deref() == Some("Z"),
+					})
+				})
+			}),
+		});
+		let instrument = RelianceInstrument {
+			observer: Arc::new(reliance_faults::EventLogRelianceObserver { log: log.clone() }),
+			renewal_transport: renewal
+				.clone()
+				.map(|transport| transport as Arc<dyn ToronTransport>),
+		};
+		// The query bound covers the horizon case's 110 s scan.
+		let run = RELIANCE_INSTRUMENT.scope(
+			instrument,
+			adr627_run(
+				Adr627Path::Coordinator,
+				control.case,
+				&declared,
+				observed,
+				log.clone(),
+				None,
+				fault,
+				std::time::Duration::from_secs(240),
+			),
+		);
+		let (mut evidence, blackout_record) = tokio::join!(run, schedule);
+		log.emit("post_terminal_window_start", "dispatch", serde_json::json!({ "window_ms": ADR628_POST_TERMINAL_WINDOW.as_millis() as u64 }));
+		tokio::time::sleep(ADR628_POST_TERMINAL_WINDOW).await;
+		log.emit("post_terminal_window_end", "dispatch", serde_json::json!({}));
+		tokio::time::sleep(ADR628_COVERAGE_TAIL).await;
+		evidence["adr628_b1c"] = serde_json::json!({
+			"control": control.name,
+			"case": control.case,
+			"long_scan_ms": control.long_scan_ms,
+			"renewal_fault": control.renewal.map(|(fault, firing)| serde_json::json!({
+				"fault": fault.evidence(), "firing": firing.evidence(),
+			})),
+			"renewal_dials": renewal.as_ref().map(|t| t.dials.load(std::sync::atomic::Ordering::SeqCst)),
+			"renewal_faults_applied": renewal.as_ref().map(|t| t.applied.load(std::sync::atomic::Ordering::SeqCst)),
+			"route": control.route.as_ref().map(|route| serde_json::json!({
+				"delay_ms_each_way": route.delay.as_millis() as u64,
+				"loss_per_mille_each_direction": route.loss_per_mille,
+				"seed": route.seed,
+				"applies_to": "coordinator traffic to the target (dispatch, renewal, retirement); peer pulls direct",
+			})),
+			"blackout": blackout_record,
+			"target": target_text,
+			"target_direct_endpoint": workers[0].endpoint.as_str(),
+			"coordinator_endpoint_for_target": declared[0].1.as_str(),
+			"post_terminal_window_ms": ADR628_POST_TERMINAL_WINDOW.as_millis() as u64,
+			"instrument_failed": log.failed(),
+		});
+		if let Some(relay) = relay {
+			evidence["adr628_b1c"]["relay_realized"] = relay.shutdown().await;
 		}
 		use std::io::Write as _;
 		std::fs::OpenOptions::new()

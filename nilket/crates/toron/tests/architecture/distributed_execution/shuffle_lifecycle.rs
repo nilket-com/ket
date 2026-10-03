@@ -88,16 +88,23 @@ pub(crate) fn adr543_coordinator_owns_growing_census_query_renewal_and_terminal_
 		"entry(task.worker.worker_id)",
 		"pub fn fail_query_lease",
 		"pub fn mark_terminal",
+		"set_failure_hook",
+		".fail_query_lease(worker_id)",
 	] {
 		assert!(
 			cancellation.contains(required),
 			"missing census state {required}"
 		);
 	}
+	// ADR 628 B1.C: renewal is per worker, driven by the query's reliance ledger (a worker is
+	// enrolled when it first becomes Reliable). A renewal failure reaches the query through the
+	// ledger, whose failure hook calls `fail_query_lease` naming the worker. Retirement still
+	// addresses the growing census.
 	for required in [
 		"spawn_query_lease_renewal_task",
-		"active_query.remote_workers()",
-		"active_query.fail_query_lease(worker.worker_id)",
+		"worker_renewal_loop",
+		"reliance.on_fatal(worker.worker_id, cause)",
+		"active_query_handle.remote_workers()",
 		"spawn_remote_retire_fanout_task",
 		"active_query_handle.mark_terminal()",
 	] {

@@ -7,6 +7,7 @@ pub mod fragment;
 pub mod identity;
 pub mod namespace_lifecycle;
 pub mod partition_store;
+pub mod query_reliance;
 pub mod recovery;
 pub mod scheduler;
 pub mod task;

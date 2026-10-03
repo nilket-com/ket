@@ -481,6 +481,17 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// compare-and-clear command is an operator CLI surface. It owns no
 				// binder decomposition surface.
 				"crates/toron/src/cli/maintenance.rs",
+				// ADR 628 B1.C: the coordinator's per-query lease reliance ledger (bound, gates,
+				// commit). A distributed-execution runtime surface; no binder decomposition surface.
+				"crates/toron/src/distributed/query_reliance.rs",
+				// ADR 628 B1.C instrument: the transport's tagged worker dial (an exchange identity a
+				// recording transport may log; production transports ignore it) and the probe's test
+				// support (recorded dials, phase delays, renewal-path faults, the reliance observer).
+				// No binder decomposition surface.
+				"crates/toron/src/server/transport.rs",
+				"crates/toron/tests/support/lease_faults.rs",
+				"crates/toron/tests/support/wait_events.rs",
+				"crates/toron/tests/support/reliance_faults.rs",
 			];
 			*path != "crates/toron/src/binder.rs"
 				&& !path.starts_with("crates/toron/src/binder/")

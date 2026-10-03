@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use toron::distributed::identity::WorkerId;
+use toron::distributed::query_reliance::ExchangeTag;
 use toron::distributed::worker_registry::{WorkerEndpoint, WorkerEntry};
 use toron::error::QueryError;
 use toron::server::transport::{ToronStream, ToronTransport};
@@ -112,8 +113,38 @@ impl ToronTransport for PhaseDelayTransport {
 		&self,
 		worker: &WorkerEntry,
 	) -> Result<Box<dyn ToronStream>, QueryError> {
+		self.dial(worker, None).await
+	}
+
+	async fn connect_worker_tagged(
+		&self,
+		worker: &WorkerEntry,
+		tag: &ExchangeTag,
+	) -> Result<Box<dyn ToronStream>, QueryError> {
+		self.dial(worker, Some(tag)).await
+	}
+}
+
+/// The inner dial, forwarding an exchange tag when there is one.
+async fn inner_dial(
+	inner: &Arc<dyn ToronTransport>,
+	worker: &WorkerEntry,
+	tag: Option<&ExchangeTag>,
+) -> Result<Box<dyn ToronStream>, QueryError> {
+	match tag {
+		Some(tag) => inner.connect_worker_tagged(worker, tag).await,
+		None => inner.connect_worker(worker).await,
+	}
+}
+
+impl PhaseDelayTransport {
+	async fn dial(
+		&self,
+		worker: &WorkerEntry,
+		tag: Option<&ExchangeTag>,
+	) -> Result<Box<dyn ToronStream>, QueryError> {
 		if worker.worker_id != self.target || self.delays.is_none() {
-			return self.inner.connect_worker(worker).await;
+			return inner_dial(&self.inner, worker, tag).await;
 		}
 		let ordinal = self.ordinal.fetch_add(1, Ordering::SeqCst);
 		let target = worker_text(&self.target);
@@ -150,7 +181,7 @@ impl ToronTransport for PhaseDelayTransport {
 			pending.armed = false;
 			record(&self.log, &target, "connect", ordinal, started);
 		}
-		let stream = self.inner.connect_worker(worker).await?;
+		let stream = inner_dial(&self.inner, worker, tag).await?;
 		Ok(Box::new(PhaseDelayStream::wrap(
 			stream,
 			self.delays,

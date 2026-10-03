@@ -883,7 +883,10 @@ pub(crate) fn adr120_network_dispatcher_forwards_final_taskbatch_immediately() {
 	assert!(server.contains("with_final_result_sender"));
 	assert!(client.contains("forward_final_batches"));
 	assert!(client.contains("MessageKind::TaskBatch"));
-	assert!(client.contains("sender.send(Ok(batch)).await"));
+	// ADR 628 B1.C: capacity is reserved first, then the publication gate, then the batch is
+	// published at once with the permit (still forwarded immediately, never collected).
+	assert!(client.contains("sender.reserve().await"));
+	assert!(client.contains("permit.send(Ok(batch))"));
 	assert!(client.contains("results.push(batch)"));
 }
 

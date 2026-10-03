@@ -402,6 +402,21 @@ impl ToronTransport for ObservedTransport {
 		)
 		.await
 	}
+
+	/// ADR 628 B1.C: the exchange's identity (renewal attempt or dispatch ticket) is recorded on the
+	/// dial, so the stream and its frames bind to the ledger's records.
+	async fn connect_worker_tagged(
+		&self,
+		worker: &WorkerEntry,
+		tag: &toron::distributed::query_reliance::ExchangeTag,
+	) -> Result<Box<dyn ToronStream>, QueryError> {
+		self.observe(
+			"connect_worker",
+			serde_json::json!({ "worker": worker_text(&worker.worker_id), "endpoint": worker.endpoint.as_str(), "exchange_tag": tag.evidence() }),
+			self.inner.connect_worker_tagged(worker, tag),
+		)
+		.await
+	}
 }
 
 /// One direction's framing: header bytes, the current frame's length and progress, and the first

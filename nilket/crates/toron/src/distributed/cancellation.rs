@@ -775,6 +775,8 @@ pub struct ActiveQueryHandle {
 #[derive(Debug)]
 struct ActiveQueryState {
 	key: ActiveQueryKey,
+	/// ADR 628 B1.C: the coordinator's per-worker lease reliance for this query.
+	reliance: Arc<crate::distributed::query_reliance::QueryReliance>,
 	cancelled: AtomicBool,
 	terminal: AtomicBool,
 	notify: Notify,
@@ -786,6 +788,23 @@ struct ActiveQueryState {
 #[derive(Debug, Clone)]
 pub struct ActiveQueryRegistry {
 	inner: Arc<Mutex<HashMap<ActiveQueryKey, ActiveQueryHandle>>>,
+	reliance_params: crate::distributed::query_reliance::RelianceParams,
+	reliance_clock: Arc<dyn crate::distributed::query_reliance::RelianceClock>,
+	reliance_observer: ObserverSlot,
+}
+
+/// ADR 628 B1.C (instrument seam S2): the observer installed on every query registered from now on.
+#[derive(Clone, Default)]
+struct ObserverSlot(Option<Arc<dyn crate::distributed::query_reliance::RelianceObserver>>);
+
+impl std::fmt::Debug for ObserverSlot {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(if self.0.is_some() {
+			"ObserverSlot(installed)"
+		} else {
+			"ObserverSlot(none)"
+		})
+	}
 }
 
 #[derive(Debug)]
@@ -804,9 +823,39 @@ pub struct QueryCancellation {
 
 impl ActiveQueryRegistry {
 	pub fn new() -> Self {
+		let term = crate::distributed::namespace_lifecycle::ShuffleLifecycleConfig::from_worker_loss_window(
+			crate::distributed::partition_store::DEFAULT_WORKER_LOST_AFTER,
+		)
+		.expect("default shuffle lifecycle config")
+		.lease_term();
 		Self {
 			inner: Arc::new(Mutex::new(HashMap::new())),
+			reliance_params: crate::distributed::query_reliance::RelianceParams::production(term),
+			reliance_clock: Arc::new(crate::distributed::query_reliance::BootClock),
+			reliance_observer: ObserverSlot::default(),
 		}
+	}
+
+	/// ADR 628 B1.C: the reliance assumptions, budgets and clock for queries registered from now on.
+	/// Production keeps the defaults (declared values, `CLOCK_BOOTTIME`). Tests inject a clock.
+	pub fn with_reliance(
+		mut self,
+		params: crate::distributed::query_reliance::RelianceParams,
+		clock: Arc<dyn crate::distributed::query_reliance::RelianceClock>,
+	) -> Self {
+		self.reliance_params = params;
+		self.reliance_clock = clock;
+		self
+	}
+
+	/// ADR 628 B1.C (instrument seam S2): records the reliance events of every query registered from
+	/// now on. Production installs none.
+	pub fn with_reliance_observer(
+		mut self,
+		observer: Arc<dyn crate::distributed::query_reliance::RelianceObserver>,
+	) -> Self {
+		self.reliance_observer = ObserverSlot(Some(observer));
+		self
 	}
 
 	pub fn register(&self, tenant_id: TenantId, query_id: QueryId) -> ActiveQueryGuard {
@@ -824,7 +873,15 @@ impl ActiveQueryRegistry {
 		downstream: DownstreamAttemptRegistry,
 	) -> ActiveQueryGuard {
 		let key = ActiveQueryKey::new(tenant_id, query_id);
-		let handle = ActiveQueryHandle::new(key, downstream);
+		let reliance = Arc::new(crate::distributed::query_reliance::QueryReliance::new(
+			self.reliance_params,
+			Arc::clone(&self.reliance_clock),
+		));
+		reliance.set_query(query_id);
+		if let Some(observer) = &self.reliance_observer.0 {
+			reliance.set_observer(Arc::clone(observer));
+		}
+		let handle = ActiveQueryHandle::new(key, downstream, reliance);
 		let mut inner = self.inner.lock().expect("active query registry poisoned");
 		inner.insert(key, handle.clone());
 		ActiveQueryGuard {
@@ -894,15 +951,25 @@ impl ActiveQueryGuard {
 
 impl Drop for ActiveQueryGuard {
 	fn drop(&mut self) {
+		// ADR 628 B1.C: an owner dropped before an outcome ends the query's reliance (no-op after a
+		// commit or failure).
+		self.handle
+			.reliance()
+			.seal_ended(crate::distributed::query_reliance::QueryEnd::Dropped);
 		self.registry.remove_if_same(self.key, &self.handle);
 	}
 }
 
 impl ActiveQueryHandle {
-	fn new(key: ActiveQueryKey, downstream: DownstreamAttemptRegistry) -> Self {
-		Self {
+	fn new(
+		key: ActiveQueryKey,
+		downstream: DownstreamAttemptRegistry,
+		reliance: Arc<crate::distributed::query_reliance::QueryReliance>,
+	) -> Self {
+		let handle = Self {
 			inner: Arc::new(ActiveQueryState {
 				key,
+				reliance,
 				cancelled: AtomicBool::new(false),
 				terminal: AtomicBool::new(false),
 				notify: Notify::new(),
@@ -910,11 +977,35 @@ impl ActiveQueryHandle {
 				remote_tasks: Mutex::new(Vec::new()),
 				downstream,
 			}),
-		}
+		};
+		// A reliance failure (lapse or fatal reply) stops every dispatcher with the worker's
+		// identity; a local clock or arithmetic fault names none. The hook holds only a weak
+		// reference: no state -> ledger -> state cycle.
+		let weak = Arc::downgrade(&handle.inner);
+		handle
+			.inner
+			.reliance
+			.set_failure_hook(Arc::new(move |worker| {
+				if let Some(inner) = weak.upgrade() {
+					let handle = ActiveQueryHandle { inner };
+					match worker {
+						Some(worker_id) => {
+							handle.fail_query_lease(worker_id);
+						}
+						None => handle.stop_dispatchers(),
+					}
+				}
+			}));
+		handle
 	}
 
 	pub fn key(&self) -> ActiveQueryKey {
 		self.inner.key
+	}
+
+	/// ADR 628 B1.C: this query's per-worker lease reliance.
+	pub fn reliance(&self) -> &Arc<crate::distributed::query_reliance::QueryReliance> {
+		&self.inner.reliance
 	}
 
 	pub fn is_cancelled(&self) -> bool {
@@ -934,6 +1025,10 @@ impl ActiveQueryHandle {
 	}
 
 	pub fn mark_terminal(&self) {
+		// ADR 628 B1.C: a backstop seal; the owner seals its outcome before retiring.
+		self.inner
+			.reliance
+			.seal_ended(crate::distributed::query_reliance::QueryEnd::Retired);
 		if !self.inner.terminal.swap(true, Ordering::SeqCst) {
 			self.inner.notify.notify_waiters();
 		}
@@ -968,6 +1063,11 @@ impl ActiveQueryHandle {
 	}
 
 	pub fn cancel(&self, trigger: CancellationTrigger) -> (bool, Vec<RemoteTaskCancellation>) {
+		// ADR 628 B1.C: cancellation is sealed into the reliance ledger first, so a success that
+		// arrives later cannot commit and no new action is authorized.
+		self.inner
+			.reliance
+			.seal_ended(crate::distributed::query_reliance::QueryEnd::Cancelled);
 		let first_request = !self.inner.cancelled.swap(true, Ordering::SeqCst);
 		if first_request {
 			self.inner.notify.notify_waiters();
@@ -1004,6 +1104,18 @@ impl ActiveQueryHandle {
 				.cancel_registered_attempts(DownstreamCancellationTrigger::WorkerCancelTask);
 		}
 		first_request
+	}
+
+	/// ADR 628 B1.C: a local reliance fault (clock or arithmetic) names no worker. The ledger is
+	/// already failed; this stops every dispatcher as a lease failure would, without a worker.
+	fn stop_dispatchers(&self) {
+		let first_request = !self.inner.cancelled.swap(true, Ordering::SeqCst);
+		if first_request {
+			self.inner.notify.notify_waiters();
+			self.inner
+				.downstream
+				.cancel_registered_attempts(DownstreamCancellationTrigger::WorkerCancelTask);
+		}
 	}
 
 	pub fn record_remote_task(&self, worker: WorkerEntry, identity: TaskIdentity) {
