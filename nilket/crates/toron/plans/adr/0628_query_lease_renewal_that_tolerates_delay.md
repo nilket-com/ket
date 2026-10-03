@@ -2144,3 +2144,92 @@ reference 70101 and 70102.
 There is no resampling.
 
 **Not claimed:** running-task cessation, and remote reclamation.
+
+## B1.C campaign 1 results (reviewed as diagnostic, interim)
+
+**Status:** B1.C acceptance is PENDING the cleanup-ordering correction and a fresh campaign on the
+corrected source. Nothing here claims that delay tolerance has been delivered or that B1.C succeeded
+overall. The campaign 1 evidence, freeze, readouts and refusal stay immutable.
+
+**Identity.**
+- Freeze: `FREEZE.json` 577471c6…376e.
+- Source: `refs/tags/adr628-b1c-baseline` (62fe8117), path-equivalent to aca033ba.
+- Artifacts: worker d826cb45…, probe a451d643… (ladder b1c-5).
+- Evidence: `~/work/.agent-bridge/adr628-b1c-evidence`, with SHA256SUMS over 1,564 files (6932e579…9aff),
+  mirrored and verified on bigfoot at `~/work/toron-evidence/adr628-b1c-local-copy`.
+
+**Run.** Every step ran in the frozen order, 2026-10-03 09:36–10:47Z, and returned rc 0. No STOP was
+written; nothing was retried or resampled.
+
+**Disclosed after the freeze:**
+- the hashed fixture copies under `readers/`;
+- `readout-wrapper.py`, which calls the frozen loopback readout unchanged and only converts the wire
+  view's tuple keys for JSON. The frozen driver's own print failed on those keys, and that failure is
+  retained.
+
+### Wi-Fi: one attempt REFUSED (stated first)
+
+`healthy-long-join-last-10`: renewal cleanup not verified.
+
+**What the raw log shows:**
+- the result was committed (completed);
+- renewal closure was recorded at seq 201, and both renewal loops stopped;
+- there is NO `renewal_cleanup` record;
+- `query_returned` falls in the same microsecond as the closure, and the probe's end follows, then the
+  owner-drop event and an abandoned dial.
+
+**Source ordering.** In both streaming entry paths, the driver drops the result sender before it awaits
+`renewal.shutdown()`, so the normal end of stream can come before cleanup.
+
+**Interpretation, not instrumented.** The Wi-Fi probe ended its runtime right after the query returned,
+which cancelled the pending cleanup. The exact task-cancellation cause was not directly recorded.
+
+Under the frozen contract the attempt fails the cleanup requirement; its completed result is reported
+separately. The required correction is source ordering: seal admission and await and report renewal
+shutdown before the normal end of stream. The probe gets a bounded wait for the query's own cleanup
+record. Neither change is applied retroactively.
+
+### Loopback (READ, 36/36)
+
+- **34 meet, 2 reported** (census kill, diagnostic), 0 contradict, 0 coverage unavailable. Renewal
+  cleanup is verified on all 36.
+- **Within-budget faults** (renewal delays of 1500 ms; one withheld reply; route delay 40 ms; loss 10 %;
+  an 8 s blackout): each query completed, with parity equal to its case reference.
+  - In the 8 s blackout, 6 refreshes were installed after the restoration and before the bound at the
+    cut.
+- **Past-budget and persistent faults** (connect or read 2500 ms; close 3500 ms; all replies withheld;
+  a 40 s blackout; an unreachable route): each gave `WorkerLost(62801)`, with the target lapsing at a
+  renewal plan 0.53–1.98 ms after its bound.
+  - No faulted attempt refreshed the bound.
+  - In the 40 s blackout, the lapsed bound is the bound at the cut, and the restoration came 6.04 s after
+    it.
+- **Refused renewal:** terminal `lease exchange refused` at attempt 2, giving `WorkerLost(62801)`.
+- **Horizon runs** (110 s): 62801 and 62802 each crossed 3.24 initial horizons, with 23 refreshes, and
+  were relied on at commit.
+- **Slack at refresh:** n = 602; min 25.704 s, median 28.963 s, max 33.965 s.
+
+### Wi-Fi: the 21 validated attempts (2 references + 19 healthy)
+
+- **Results:** every attempt completed; every healthy attempt had parity equal with its case reference;
+  cleanup was verified on all 21.
+- **Refreshes:** 470 refreshes over THESE 21 attempts, with zero transient, late or fatal renewal
+  outcomes. This is not a failure rate over the 22 attempts.
+- **Horizon runs:** in all five, 70202 and 70203 each crossed 3.245–3.281 initial horizons, with 23
+  refreshes.
+- **Slack at refresh:** min 27.714 s, median 28.796 s, max 33.965 s.
+
+### Context and limits
+
+- **Links before and after:** 48 runs each. Pings show 0–0.99 % loss; RTT averages 77–153 ms, maxima up
+  to 410 ms. Wi-Fi with power saving on, as kept.
+- **Clock context:** timesyncd on bigfoot and strix, chrony on optiplex, all NTP-synchronized. This is
+  not a ρ bound.
+- **Limits:**
+  - the frozen horizon, clock and namespace assumptions;
+  - running-task cessation and remote reclamation are not claimed;
+  - open worker streams on failed queries are withheld completed-chain coverage;
+  - the budgets remain operational declarations.
+
+**Runner note for the next campaign:** `campaign-runner.sh` logged nonzero exit codes but continued
+unless STOP existed. Every actual step was rc 0, so these results are unaffected. The next runner stops on
+either a nonzero step or STOP.
