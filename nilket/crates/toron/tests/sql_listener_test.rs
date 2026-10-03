@@ -2469,6 +2469,25 @@ async fn adr0577_live_long_queries_reach_their_statement_deadline() {
 mod mutation_integrity_pins {
 	use super::*;
 
+	fn raw_stop_reason(reason: MutationStopReason) -> u8 {
+		match reason {
+			MutationStopReason::None => 0,
+			MutationStopReason::Deadline => 1,
+			MutationStopReason::NoProgress => 2,
+			MutationStopReason::AttemptsExhausted => 3,
+			MutationStopReason::Other(code) => code,
+		}
+	}
+	fn raw_commit_knowledge(knowledge: MutationCommitKnowledge) -> u8 {
+		match knowledge {
+			MutationCommitKnowledge::Unspecified => 0,
+			MutationCommitKnowledge::Committed => 1,
+			MutationCommitKnowledge::KnownNotCommitted => 2,
+			MutationCommitKnowledge::Indeterminate => 3,
+			MutationCommitKnowledge::Other(code) => code,
+		}
+	}
+
 	async fn start(node: u32) -> (LiveWendelonFixture, ToronDaemon, ToronClient) {
 		let fixture = LiveWendelonFixture::start(node).await;
 		let descriptor = descriptor();
@@ -2521,9 +2540,13 @@ mod mutation_integrity_pins {
 		println!(
 			"MUTATION_PIN kind={kind} resolution=Present write_status={} stop_reason={} commit_knowledge={} delete_counts={:?}",
 			outcome.write_status,
-			wendelon::schema::MutationStopReason::NONE.0,
-			wendelon::schema::MutationCommitKnowledge::COMMITTED.0,
+			raw_stop_reason(outcome.stop_reason),
+			raw_commit_knowledge(outcome.commit_knowledge),
 			outcome.delete_counts
+		);
+		println!(
+			"RECEIVED_AXES kind={kind} stop_reason={:?} commit_knowledge={:?}",
+			outcome.stop_reason, outcome.commit_knowledge
 		);
 		outcome
 	}
@@ -2695,7 +2718,7 @@ mod mutation_integrity_pins {
 		let (fixture, daemon, client) = start(6295).await;
 		let id = QueryId::new();
 		let sql = "INSERT INTO storage_execution (id, amount, region, ts) VALUES (7, 10, 'restart', 1599998400000)";
-		client.execute_with_query_id(id, sql, "UTC").await.unwrap();
+		let first_response = client.execute_with_query_id(id, sql, "UTC").await.unwrap();
 		committed(&client, id, "before-coordinator-restart").await;
 		daemon.shutdown().await.unwrap();
 		drop(client);
@@ -2708,12 +2731,177 @@ mod mutation_integrity_pins {
 		let client =
 			ToronClient::loopback(restarted.handle().sql_endpoint.unwrap().to_string()).unwrap();
 		committed(&client, id, "after-coordinator-restart").await;
-		client.execute_with_query_id(id, sql, "UTC").await.unwrap();
+		let replay = client.execute_with_query_id(id, sql, "UTC").await.unwrap();
+		assert_eq!(replay.row_count, first_response.row_count);
+		assert_eq!(replay.batches, first_response.batches);
+		println!(
+			"RESTART_REPLAY_PIN first_rows={} replay_rows={} batches_equal=true retained_wendelon_client=true",
+			first_response.row_count, replay.row_count
+		);
 		assert_eq!(
 			visible(&client, 7).await,
 			vec![(7, Some(10), Some("restart".into()))]
 		);
 		restarted.shutdown().await.unwrap();
+		fixture.shutdown();
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_second_coordinator_observes_acknowledged_rows_from_the_same_storage_node() {
+		let (fixture, writer, client) = start(6296).await;
+		let reader = ToronDaemon::start_with_wendelon_client_for_harness(
+			toron_config_with_descriptor(descriptor(), true),
+			Arc::clone(&fixture.client),
+		)
+		.await
+		.unwrap();
+		let reader_client =
+			ToronClient::loopback(reader.handle().sql_endpoint.unwrap().to_string()).unwrap();
+		let id = QueryId::new();
+		client.execute_with_query_id(id, "INSERT INTO storage_execution (id, amount, region, ts) VALUES (8, 10, 'cross-coordinator', 1599998400000)", "UTC").await.unwrap();
+		committed(&client, id, "writer-acknowledged").await;
+		assert_eq!(
+			visible(&reader_client, 8).await,
+			vec![(8, Some(10), Some("cross-coordinator".into()))]
+		);
+		println!("VISIBILITY_PIN coordinators=2 storage_nodes=1 effect=exact_after_ack");
+		reader.shutdown().await.unwrap();
+		writer.shutdown().await.unwrap();
+		fixture.shutdown();
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn configured_tenant_replay_shares_a_cache_key_but_not_a_durable_outcome() {
+		let (fixture, first_daemon, first_client) = start(6297).await;
+		let second_tenant = WendelonTenantId::new(2);
+		create_live_tenant(&fixture.node, second_tenant).await;
+		install_schema(&fixture.node, second_tenant, &descriptor()).await;
+		let mut config =
+			toron_config_with_descriptor_for_tenant(descriptor(), ToronTenantId(2), true);
+		config.node.tenant_id = ToronTenantId(2);
+		let second_daemon = ToronDaemon::start_with_wendelon_client_for_harness(
+			config,
+			Arc::clone(&fixture.client),
+		)
+		.await
+		.unwrap();
+		let second_client =
+			ToronClient::loopback(second_daemon.handle().sql_endpoint.unwrap().to_string())
+				.unwrap();
+		for (order, (original_tenant, replay_tenant, original, replay)) in [
+			(1, 2, &first_client, &second_client),
+			(2, 1, &second_client, &first_client),
+		]
+		.into_iter()
+		.enumerate()
+		{
+			for (case, kind) in [
+				"insert-identical",
+				"insert-changed",
+				"update-identical",
+				"delete-identical",
+			]
+			.into_iter()
+			.enumerate()
+			{
+				let key = 100 + order as i32 * 100 + case as i32 * 10;
+				let id = QueryId::new();
+				let insert = format!(
+					"INSERT INTO storage_execution (id, amount, region, ts) VALUES ({key}, 10, 'original', 1599998400000)"
+				);
+				let (first_sql, second_sql) = match kind {
+					"insert-identical" => (insert.clone(), insert),
+					"insert-changed" => (
+						insert,
+						format!(
+							"INSERT INTO storage_execution (id, amount, region, ts) VALUES ({}, 20, 'changed', 1599998400000)",
+							key + 1
+						),
+					),
+					"update-identical" | "delete-identical" => {
+						original.execute(&insert).await.unwrap();
+						replay.execute(&format!("INSERT INTO storage_execution (id, amount, region, ts) VALUES ({key}, 20, 'replay-tenant', 1599998400000)")).await.unwrap();
+						assert_eq!(visible(original, key).await[0].1, Some(10));
+						assert_eq!(visible(replay, key).await[0].1, Some(20));
+						let sql = if kind == "update-identical" {
+							format!(
+								"UPDATE storage_execution SET amount = amount + 1 WHERE id = {key}"
+							)
+						} else {
+							format!("DELETE FROM storage_execution WHERE id = {key}")
+						};
+						(sql.clone(), sql)
+					}
+					_ => unreachable!(),
+				};
+				let first_response = original
+					.execute_with_query_id(id, &first_sql, "UTC")
+					.await
+					.unwrap();
+				let original_outcome = committed(original, id, "cross-tenant-original").await;
+				let false_success = replay
+					.execute_with_query_id(id, &second_sql, "UTC")
+					.await
+					.unwrap();
+				assert_eq!(first_response.row_count, 1);
+				assert_eq!(false_success.row_count, 1);
+				assert_eq!(false_success.batches, first_response.batches);
+				let own_rows = visible(replay, key).await;
+				match kind {
+					"insert-identical" => assert!(own_rows.is_empty()),
+					"insert-changed" => {
+						assert!(own_rows.is_empty());
+						assert!(visible(replay, key + 1).await.is_empty());
+					}
+					"update-identical" | "delete-identical" => assert_eq!(
+						own_rows,
+						vec![(key as i64, Some(20), Some("replay-tenant".into()))]
+					),
+					_ => unreachable!(),
+				}
+				let original_rows = visible(original, key).await;
+				match kind {
+					"delete-identical" => {
+						assert!(original_rows.is_empty());
+						assert_eq!(original_outcome.delete_counts, Some([1, 0, 0]));
+					}
+					"update-identical" => assert_eq!(
+						original_rows,
+						vec![(key as i64, Some(11), Some("original".into()))]
+					),
+					_ => assert_eq!(
+						original_rows,
+						vec![(key as i64, Some(10), Some("original".into()))]
+					),
+				}
+				let ResolvedOperationOutcome::Mutation(resolved) =
+					replay.resolve_mutation(id).await.unwrap()
+				else {
+					panic!("row mutation")
+				};
+				assert_eq!(resolved.resolution, MutationResolution::Unknown);
+				assert_eq!(
+					resolved.write_status,
+					wendelon::schema::WriteStatus::WRITE_OPERATION_UNKNOWN.0
+				);
+				assert_eq!(resolved.stop_reason, MutationStopReason::None);
+				assert_eq!(
+					resolved.commit_knowledge,
+					MutationCommitKnowledge::Unspecified
+				);
+				println!(
+					"TENANT_REPLAY_PIN original_tenant={original_tenant} replay_tenant={replay_tenant} kind={kind} identical_bytes={} sql_rows={} resolution={:?} write_status={} stop_reason={} commit_knowledge={} expected_own_effect_absent=true authenticated=false",
+					first_sql == second_sql,
+					false_success.row_count,
+					resolved.resolution,
+					resolved.write_status,
+					raw_stop_reason(resolved.stop_reason),
+					raw_commit_knowledge(resolved.commit_knowledge)
+				);
+			}
+		}
+		second_daemon.shutdown().await.unwrap();
+		first_daemon.shutdown().await.unwrap();
 		fixture.shutdown();
 	}
 }

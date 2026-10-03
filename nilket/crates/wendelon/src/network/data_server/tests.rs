@@ -5634,6 +5634,7 @@ async fn final_attempt_exhaustion_is_a_durable_two_axis_outcome() {
 	let node = WendelonNode::bootstrap_single_node(cfg.clone())
 		.await
 		.unwrap();
+	let before_bytes = node.slab.local_l1_bytes().await;
 	let descriptor = typed_table_descriptor();
 	let mut meta = typed_table_meta(&descriptor, 1);
 	meta.set_attempts_remaining(1);
@@ -5657,6 +5658,15 @@ async fn final_attempt_exhaustion_is_a_durable_two_axis_outcome() {
 		MutationCommitKnowledge::KNOWN_NOT_COMMITTED
 	);
 
+	assert_eq!(node.slab.local_l1_bytes().await, before_bytes);
+	println!(
+		"NO_EFFECT_PIN scope=synthetic_backpressure_finalizer write_status={} stop_reason={} commit_knowledge={} data_bytes_before={} data_bytes_after={}",
+		stopped.write.status.0,
+		stopped.write.mutation_stop_reason().0,
+		stopped.write.mutation_commit_knowledge().0,
+		before_bytes,
+		node.slab.local_l1_bytes().await
+	);
 	node.handles.abort();
 	drop(node);
 	let reopened = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
@@ -5668,6 +5678,7 @@ async fn final_attempt_exhaustion_is_a_durable_two_axis_outcome() {
 		})
 		.await
 		.unwrap();
+	assert_eq!(resolved.resolution, MutationResolutionStatus::PRESENT);
 	assert_eq!(resolved.write.status, WriteStatus::WRITE_ATTEMPTS_EXHAUSTED);
 	assert_eq!(
 		resolved.write.mutation_stop_reason(),
@@ -5676,6 +5687,13 @@ async fn final_attempt_exhaustion_is_a_durable_two_axis_outcome() {
 	assert_eq!(
 		resolved.write.mutation_commit_knowledge(),
 		MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+	);
+	println!(
+		"NO_EFFECT_REOPEN_PIN resolution=Present write_status={} stop_reason={} commit_knowledge={} data_bytes={}",
+		resolved.write.status.0,
+		resolved.write.mutation_stop_reason().0,
+		resolved.write.mutation_commit_knowledge().0,
+		reopened.slab.local_l1_bytes().await
 	);
 	reopened.handles.abort();
 }
@@ -17153,4 +17171,199 @@ async fn mutation_dedup_entry_counts_grow_for_new_operations_not_replays() {
 	}
 	println!("CACHE_PIN (distinct_write_delete_pairs, write_entries, delete_entries)={points:?}");
 	node.handles.abort();
+}
+
+#[tokio::test]
+async fn expired_table_outcome_keeps_warm_cache_replay_but_cold_replay_is_indeterminate() {
+	let cfg = NodeBootstrapConfig::dev(
+		6298,
+		bootstrap_tempdir("expired-table-warm-cold-replay"),
+		"127.0.0.1:0".into(),
+	);
+	let node = WendelonNode::bootstrap_single_node(cfg.clone())
+		.await
+		.unwrap();
+	let leader_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+	while node.raft.current_leader().await != Some(node.local_node.id) {
+		assert!(
+			tokio::time::Instant::now() < leader_deadline,
+			"leader timeout"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+	let descriptor = typed_table_descriptor();
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+			&descriptor,
+		)))
+		.await
+		.unwrap();
+	let batch = typed_table_batch(vec![629]);
+	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+	meta.parent_write_id.idempotency_ttl_ms = 1000;
+	let (first, _) = node
+		.data_server
+		.table_write(meta, batch.clone())
+		.await
+		.unwrap();
+	assert_eq!(first.write.status, WriteStatus::OK);
+	assert_eq!(
+		first.write.mutation_commit_knowledge(),
+		MutationCommitKnowledge::COMMITTED
+	);
+	let request = MutationOutcomeRequestMeta {
+		operation_id: meta.parent_write_id,
+		tenant_id: meta.tenant_id,
+	};
+	let initial = node
+		.data_server
+		.resolve_mutation_outcome(request)
+		.await
+		.unwrap();
+	assert_eq!(initial.resolution, MutationResolutionStatus::PRESENT);
+	assert_eq!(
+		initial.write.mutation_commit_knowledge(),
+		MutationCommitKnowledge::COMMITTED
+	);
+	let retained = node.data_server.idempotency.len();
+	let durable_bytes = node.slab.local_l1_bytes().await;
+	// The outcome store uses SystemTime, not Tokio time. Resolve until actual expiry,
+	// with a steady-clock bound: clock movement or a stalled host fails this control.
+	let wait_started = std::time::Instant::now();
+	let expired = loop {
+		let resolved = node
+			.data_server
+			.resolve_mutation_outcome(request)
+			.await
+			.unwrap();
+		if resolved.resolution == MutationResolutionStatus::EXPIRED {
+			break resolved;
+		}
+		assert_eq!(resolved.resolution, MutationResolutionStatus::PRESENT);
+		assert!(
+			wait_started.elapsed() < Duration::from_secs(5),
+			"outcome expiry not observed within 5s"
+		);
+		tokio::time::sleep(Duration::from_millis(25)).await;
+	};
+	assert!(
+		wait_started.elapsed() <= Duration::from_secs(5),
+		"expiry observation exceeded the declared wait"
+	);
+	let wait_ms = wait_started.elapsed().as_millis();
+	assert_eq!(expired.write.status, WriteStatus::WRITE_OPERATION_EXPIRED);
+	assert_eq!(
+		expired.write.mutation_stop_reason(),
+		MutationStopReason::NONE
+	);
+	assert_eq!(
+		expired.write.mutation_commit_knowledge(),
+		MutationCommitKnowledge::INDETERMINATE
+	);
+	assert_eq!(node.data_server.idempotency.len(), retained);
+	let (warm, _) = node
+		.data_server
+		.table_write(meta, batch.clone())
+		.await
+		.unwrap();
+	assert_eq!(warm.write.status, WriteStatus::DUPLICATE);
+	assert_eq!(
+		warm.write.mutation_commit_knowledge(),
+		MutationCommitKnowledge::COMMITTED
+	);
+	assert_eq!(node.data_server.idempotency.len(), retained);
+	assert_eq!(node.slab.local_l1_bytes().await, durable_bytes);
+	let after_warm = node
+		.data_server
+		.resolve_mutation_outcome(request)
+		.await
+		.unwrap();
+	assert_eq!(after_warm.resolution, MutationResolutionStatus::EXPIRED);
+	println!(
+		"TTL_PIN ttl_ms=1000 wait_ms={} retained_entries={} expired_status={} expired_stop={} expired_commit={} warm_status={} warm_stop={} warm_commit={} resolution_after_warm=Expired",
+		wait_ms,
+		retained,
+		expired.write.status.0,
+		expired.write.mutation_stop_reason().0,
+		expired.write.mutation_commit_knowledge().0,
+		warm.write.status.0,
+		warm.write.mutation_stop_reason().0,
+		warm.write.mutation_commit_knowledge().0
+	);
+	node.handles.abort();
+	drop(node);
+	// Object/server reopen, not a power-loss or process-kill experiment. This bounded
+	// handoff matches the existing durable-outcome reopen fixture in this module.
+	tokio::time::sleep(Duration::from_millis(25)).await;
+	let reopened = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+	let leader_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+	while reopened.raft.current_leader().await != Some(reopened.local_node.id) {
+		assert!(
+			tokio::time::Instant::now() < leader_deadline,
+			"reopened leader timeout"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	reopened
+		.data_server
+		.refresh_leases_once(&reopened.ring, &*reopened.clock, 60_000)
+		.await;
+	assert_eq!(reopened.data_server.idempotency.len(), 0);
+	let cold_resolution = reopened
+		.data_server
+		.resolve_mutation_outcome(request)
+		.await
+		.unwrap();
+	assert_eq!(
+		cold_resolution.resolution,
+		MutationResolutionStatus::EXPIRED
+	);
+	let (cold, _) = reopened
+		.data_server
+		.table_write(meta, batch.clone())
+		.await
+		.unwrap();
+	assert_eq!(cold.write.status, WriteStatus::WRITE_OPERATION_EXPIRED);
+	assert_eq!(cold.write.mutation_stop_reason(), MutationStopReason::NONE);
+	assert_eq!(
+		cold.write.mutation_commit_knowledge(),
+		MutationCommitKnowledge::INDETERMINATE
+	);
+	assert_eq!(
+		reopened.slab.local_l1_bytes().await,
+		durable_bytes,
+		"expired replay appends no additional data"
+	);
+	let key = table_row_identity(tenant(), descriptor.table_object_id, &629_i64.to_le_bytes());
+	let location = reopened
+		.slab
+		.lookup(tenant(), key)
+		.expect("previous committed row remains indexed");
+	let stored = decode_batch(&reopened.slab.read(location).await.unwrap()).unwrap();
+	assert_eq!(
+		stored, batch,
+		"exact committed payload survives expiry and server reopen"
+	);
+	assert_eq!(
+		stored
+			.column_by_name("id")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap()
+			.value(0),
+		629
+	);
+	println!(
+		"COLD_TTL_PIN resolution=Expired cache_before=0 replay_status={} replay_stop={} replay_commit={} durable_bytes_before={} durable_bytes_after={} previous_row_readable=true",
+		cold.write.status.0,
+		cold.write.mutation_stop_reason().0,
+		cold.write.mutation_commit_knowledge().0,
+		durable_bytes,
+		reopened.slab.local_l1_bytes().await
+	);
+	reopened.handles.abort();
 }
