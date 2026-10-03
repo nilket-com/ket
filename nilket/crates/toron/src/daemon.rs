@@ -2552,6 +2552,96 @@ mod tests {
 	use arrow::record_batch::RecordBatch;
 	use tokio::task::JoinSet;
 
+	fn retention_config() -> ToronBootstrapConfig {
+		ToronBootstrapConfig {
+			node: crate::config::ToronNodeConfig {
+				worker_id: crate::distributed::identity::WorkerId::from_u128(42),
+				tenant_id: TenantId(1),
+				drain_timeout: Duration::from_secs(1),
+			},
+			worker: crate::config::ToronWorkerConfig {
+				task_listener_bind: "127.0.0.1:0".parse().expect("loopback addr"),
+				advertised_endpoint: None,
+				query_memory_per_task_bytes: None,
+				query_spill_bytes_reserved_bytes: None,
+				memory_budget_bytes: 1024 * 1024,
+			},
+			tenant_budgets: crate::distributed::budget::TenantBudgetPolicy::omitted_config(
+				ByteCount::new(1024 * 1024),
+			),
+			admission: None,
+			storage: crate::config::ToronStorageConfig {
+				wendelon: crate::config::ToronWendelonStorageConfig {
+					bootstrap_peers: vec![crate::config::ToronWendelonBootstrapPeer {
+						node_id: 1,
+						address: "127.0.0.1:7001".to_string(),
+					}],
+					client_bind: "127.0.0.1:0".parse().expect("client bind"),
+					tls: None,
+					cluster_domain: wendelon::network::tls::DEFAULT_CLUSTER_DOMAIN.to_string(),
+					pool_max_retained: 64,
+					pool_max_cap_bytes: 8 * 1024 * 1024,
+				},
+			},
+			catalog: crate::config::ToronCatalogConfig {
+				descriptor_bootstrap_path: None,
+			},
+			sql: None,
+			coordinator: crate::config::CoordinatorConfig {
+				include_self_worker: true,
+				static_workers: Vec::new(),
+			},
+			tls: None,
+			observability: crate::config::ObservabilityConfig {
+				level: "info".to_string(),
+				format: crate::config::TracingFormat::Pretty,
+				listeners: None,
+				telemetry: None,
+			},
+			audit: crate::config::AuditConfig::Disabled,
+		}
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn completed_sql_connections_remain_in_the_daemon_join_set_until_drained() {
+		let mut config = retention_config();
+		config.sql = Some(crate::config::SqlConfig {
+			transport: crate::config::SqlTransport::Quic,
+			listener_bind: "127.0.0.1:0".parse().unwrap(),
+			statement_timeout: Duration::from_secs(1),
+			max_concurrent_connections: None,
+			max_request_frame_bytes: NonZeroU32::new(
+				crate::sql_wire::DEFAULT_SQL_REQUEST_FRAME_BYTES,
+			)
+			.unwrap(),
+			max_statement_bytes: NonZeroU32::new(crate::sql_wire::DEFAULT_SQL_STATEMENT_BYTES)
+				.unwrap(),
+		});
+		let daemon = ToronDaemon::start(config).await.unwrap();
+		let endpoint = daemon.handle().sql_endpoint.unwrap();
+		assert_eq!(daemon.connection_tasks.lock().await.len(), 0);
+		for n in 1..=8 {
+			let client = toron_client::ToronClient::loopback(endpoint.to_string()).unwrap();
+			client.health().await.unwrap();
+			drop(client);
+			assert_eq!(daemon.connection_tasks.lock().await.len(), n);
+		}
+		// Joining, rather than RSS, proves the retained entries have finished. We deliberately
+		// drain only here, after measuring all eight entries; production does this at shutdown.
+		let mut tasks = daemon.connection_tasks.lock().await;
+		for _ in 0..8 {
+			timeout(Duration::from_secs(3), tasks.join_next())
+				.await
+				.unwrap()
+				.unwrap()
+				.unwrap();
+		}
+		assert_eq!(tasks.len(), 0);
+		drop(tasks);
+		println!("CONNECTION_PIN requests=8 retained_entries=8 drained_completed=8");
+		daemon.shutdown().await.unwrap();
+	}
+
 	#[test]
 	fn budget_exhausted_maps_to_resource_exhausted_sql_error() {
 		let (code, message) =

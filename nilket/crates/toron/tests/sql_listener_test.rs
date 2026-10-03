@@ -2463,3 +2463,257 @@ async fn adr0577_live_long_queries_reach_their_statement_deadline() {
 	daemon.shutdown().await.expect("shutdown daemon");
 	fixture.shutdown();
 }
+
+// Characterization through the SQL daemon ingress, not the local coordinator's fresh-id API.
+#[cfg(test)]
+mod mutation_integrity_pins {
+	use super::*;
+
+	async fn start(node: u32) -> (LiveWendelonFixture, ToronDaemon, ToronClient) {
+		let fixture = LiveWendelonFixture::start(node).await;
+		let descriptor = descriptor();
+		install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+		let daemon = ToronDaemon::start_with_wendelon_client_for_harness(
+			toron_config_with_descriptor(descriptor, true),
+			Arc::clone(&fixture.client),
+		)
+		.await
+		.expect("SQL daemon");
+		let client =
+			ToronClient::loopback(daemon.handle().sql_endpoint.unwrap().to_string()).unwrap();
+		(fixture, daemon, client)
+	}
+
+	async fn visible(client: &ToronClient, key: i32) -> Vec<(i64, Option<i32>, Option<String>)> {
+		let response = client
+			.execute(&format!(
+				"SELECT id, amount, region FROM storage_execution WHERE id = {key}"
+			))
+			.await
+			.unwrap();
+		let batches = response
+			.batches
+			.iter()
+			.flat_map(|b| {
+				StreamReader::try_new(b.as_slice(), None)
+					.unwrap()
+					.map(|b| b.unwrap())
+			})
+			.collect::<Vec<_>>();
+		projected_rows(&batches)
+	}
+
+	async fn committed(
+		client: &ToronClient,
+		id: QueryId,
+		kind: &str,
+	) -> toron::sql_wire::MutationOutcomeResponse {
+		let ResolvedOperationOutcome::Mutation(outcome) =
+			client.resolve_mutation(id).await.unwrap()
+		else {
+			panic!("row mutation, not a composite outcome");
+		};
+		assert_eq!(outcome.operation_query_id, id);
+		assert_eq!(outcome.resolution, MutationResolution::Present);
+		assert_eq!(outcome.write_status, wendelon::schema::WriteStatus::OK.0);
+		assert_eq!(outcome.stop_reason, MutationStopReason::None);
+		assert_eq!(outcome.commit_knowledge, MutationCommitKnowledge::Committed);
+		println!(
+			"MUTATION_PIN kind={kind} resolution=Present write_status={} stop_reason={} commit_knowledge={} delete_counts={:?}",
+			outcome.write_status,
+			wendelon::schema::MutationStopReason::NONE.0,
+			wendelon::schema::MutationCommitKnowledge::COMMITTED.0,
+			outcome.delete_counts
+		);
+		outcome
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn duplicate_primary_key_insert_supersedes_instead_of_rejecting() {
+		let (fixture, daemon, client) = start(6291).await;
+		let first = QueryId::new();
+		client
+			.execute_with_query_id(
+				first,
+				"INSERT INTO storage_execution (id, amount, region, ts) VALUES (1, 10, 'first', 1599998400000)",
+				"UTC",
+			)
+			.await
+			.unwrap();
+		committed(&client, first, "insert-first").await;
+		assert_eq!(
+			visible(&client, 1).await,
+			vec![(1, Some(10), Some("first".into()))]
+		);
+		let second = QueryId::new();
+		client.execute_with_query_id(second, "INSERT INTO storage_execution (id, amount, region, ts) VALUES (1, 20, 'second', 1599998400000)", "UTC").await.unwrap();
+		committed(&client, second, "insert-superseding").await;
+		assert_eq!(
+			visible(&client, 1).await,
+			vec![(1, Some(20), Some("second".into()))]
+		);
+		daemon.shutdown().await.unwrap();
+		fixture.shutdown();
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn insert_identity_replay_ignores_changed_request_contents() {
+		let (fixture, daemon, client) = start(6292).await;
+		let id = QueryId::new();
+		let sql = "INSERT INTO storage_execution (id, amount, region, ts) VALUES (2, 10, 'original', 1599998400000)";
+		let first = client.execute_with_query_id(id, sql, "UTC").await.unwrap();
+		let original = committed(&client, id, "insert-original").await;
+		let replay = client.execute_with_query_id(id, sql, "UTC").await.unwrap();
+		assert_eq!(first.row_count, replay.row_count);
+		assert_eq!(
+			committed(&client, id, "insert-identical-replay").await,
+			original
+		);
+		let changed = client.execute_with_query_id(id, "INSERT INTO storage_execution (id, amount, region, ts) VALUES (3, 99, 'changed', 1599998400000)", "UTC").await.unwrap();
+		assert_eq!(first.row_count, changed.row_count);
+		assert_eq!(first.batches, replay.batches);
+		assert_eq!(first.batches, changed.batches);
+		println!(
+			"CLIENT_REPLAY_PIN kind=insert first_rows={} identical_rows={} changed_rows={} batches_equal=true",
+			first.row_count, replay.row_count, changed.row_count
+		);
+		assert_eq!(
+			visible(&client, 2).await,
+			vec![(2, Some(10), Some("original".into()))]
+		);
+		assert!(visible(&client, 3).await.is_empty());
+		assert_eq!(
+			committed(&client, id, "insert-changed-replay").await,
+			original
+		);
+		daemon.shutdown().await.unwrap();
+		fixture.shutdown();
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn update_identity_replay_does_not_repeat_an_increment_or_apply_changed_contents() {
+		let (fixture, daemon, client) = start(6293).await;
+		client.execute("INSERT INTO storage_execution (id, amount, region, ts) VALUES (4, 10, 'initial', 1599998400000)").await.unwrap();
+		let id = QueryId::new();
+		let sql = "UPDATE storage_execution SET amount = amount + 1 WHERE id = 4";
+		let first = client.execute_with_query_id(id, sql, "UTC").await.unwrap();
+		let original = committed(&client, id, "update-original").await;
+		assert_eq!(visible(&client, 4).await[0].1, Some(11));
+		let replay = client.execute_with_query_id(id, sql, "UTC").await.unwrap();
+		assert_eq!(
+			committed(&client, id, "update-identical-replay").await,
+			original
+		);
+		assert_eq!(
+			visible(&client, 4).await[0].1,
+			Some(11),
+			"a second increment would be visible"
+		);
+		let changed = client
+			.execute_with_query_id(
+				id,
+				"UPDATE storage_execution SET amount = 99 WHERE id = 4",
+				"UTC",
+			)
+			.await
+			.unwrap();
+		assert_eq!(
+			(first.row_count, replay.row_count, changed.row_count),
+			(1, 1, 1)
+		);
+		assert_eq!(first.batches, replay.batches);
+		assert_eq!(first.batches, changed.batches);
+		println!(
+			"CLIENT_REPLAY_PIN kind=update first_rows={} identical_rows={} changed_rows={} batches_equal={}",
+			first.row_count,
+			replay.row_count,
+			changed.row_count,
+			first.batches == replay.batches && first.batches == changed.batches
+		);
+		assert_eq!(visible(&client, 4).await[0].1, Some(11));
+		assert_eq!(
+			committed(&client, id, "update-changed-replay").await,
+			original
+		);
+		daemon.shutdown().await.unwrap();
+		fixture.shutdown();
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn delete_identity_replay_returns_original_counts_and_does_not_delete_a_different_key() {
+		let (fixture, daemon, client) = start(6294).await;
+		client.execute("INSERT INTO storage_execution (id, amount, region, ts) VALUES (5, 10, 'one', 1599998400000), (6, 20, 'two', 1599998400000)").await.unwrap();
+		let id = QueryId::new();
+		let sql = "DELETE FROM storage_execution WHERE id = 5";
+		let first_response = client.execute_with_query_id(id, sql, "UTC").await.unwrap();
+		assert_eq!(first_response.row_count, 1);
+		let first = committed(&client, id, "delete-first").await;
+		assert_eq!(first.delete_counts, Some([1, 0, 0]));
+		let replay = client.execute_with_query_id(id, sql, "UTC").await.unwrap();
+		assert_eq!(
+			committed(&client, id, "delete-identical-replay").await,
+			first
+		);
+		let changed = client
+			.execute_with_query_id(id, "DELETE FROM storage_execution WHERE id = 6", "UTC")
+			.await
+			.unwrap();
+		assert_eq!(
+			(
+				first_response.row_count,
+				replay.row_count,
+				changed.row_count
+			),
+			(1, 0, 1)
+		);
+		assert_eq!(first_response.batches, replay.batches);
+		assert_eq!(first_response.batches, changed.batches);
+		println!(
+			"CLIENT_REPLAY_PIN kind=delete first_rows={} identical_rows={} changed_rows={} batches_equal={}",
+			first_response.row_count,
+			replay.row_count,
+			changed.row_count,
+			first_response.batches == replay.batches && first_response.batches == changed.batches
+		);
+		assert!(visible(&client, 5).await.is_empty());
+		assert_eq!(
+			visible(&client, 6).await,
+			vec![(6, Some(20), Some("two".into()))]
+		);
+		assert_eq!(
+			committed(&client, id, "delete-identical-and-changed-replay")
+				.await
+				.delete_counts,
+			first.delete_counts
+		);
+		daemon.shutdown().await.unwrap();
+		fixture.shutdown();
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn mutation_resolution_and_replay_survive_a_coordinator_restart() {
+		let (fixture, daemon, client) = start(6295).await;
+		let id = QueryId::new();
+		let sql = "INSERT INTO storage_execution (id, amount, region, ts) VALUES (7, 10, 'restart', 1599998400000)";
+		client.execute_with_query_id(id, sql, "UTC").await.unwrap();
+		committed(&client, id, "before-coordinator-restart").await;
+		daemon.shutdown().await.unwrap();
+		drop(client);
+		let restarted = ToronDaemon::start_with_wendelon_client_for_harness(
+			toron_config_with_descriptor(descriptor(), true),
+			Arc::clone(&fixture.client),
+		)
+		.await
+		.unwrap();
+		let client =
+			ToronClient::loopback(restarted.handle().sql_endpoint.unwrap().to_string()).unwrap();
+		committed(&client, id, "after-coordinator-restart").await;
+		client.execute_with_query_id(id, sql, "UTC").await.unwrap();
+		assert_eq!(
+			visible(&client, 7).await,
+			vec![(7, Some(10), Some("restart".into()))]
+		);
+		restarted.shutdown().await.unwrap();
+		fixture.shutdown();
+	}
+}

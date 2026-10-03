@@ -17023,3 +17023,134 @@ mod adr0089_scan_coalescing {
 		assert_eq!(emitted, 3);
 	}
 }
+
+#[tokio::test]
+async fn mutation_dedup_entry_counts_grow_for_new_operations_not_replays() {
+	let dir = bootstrap_tempdir("mutation-cache-entry-growth");
+	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		48,
+		dir,
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	loop {
+		if node.raft.current_leader().await == Some(node.local_node.id) {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"timed out waiting for leader"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+
+	let descriptor = append_only_table_descriptor();
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+			&descriptor,
+		)))
+		.await
+		.unwrap();
+
+	let mut points = Vec::new();
+	assert_eq!(node.data_server.idempotency.len(), 0);
+	assert_eq!(node.data_server.table_delete_idempotency.len(), 0);
+	for operation in 0..4 {
+		let batch = typed_table_batch(vec![100 + operation]);
+		let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+		meta.parent_write_id.sequence_no = 62900 + operation as u64;
+		let before = node.data_server.idempotency.len();
+		let (response, _) = node
+			.data_server
+			.table_write(meta, batch.clone())
+			.await
+			.unwrap();
+		assert_eq!(response.write.status, WriteStatus::OK);
+		let after = node.data_server.idempotency.len();
+		assert!(after > before, "new operation retains an entry");
+		let (retry, _) = node
+			.data_server
+			.table_write(meta, batch.clone())
+			.await
+			.unwrap();
+		assert_eq!(retry.write.status, WriteStatus::DUPLICATE);
+		assert_eq!(
+			retry.write.mutation_stop_reason(),
+			response.write.mutation_stop_reason()
+		);
+		assert_eq!(
+			retry.write.mutation_commit_knowledge(),
+			response.write.mutation_commit_knowledge()
+		);
+		println!(
+			"NATIVE_REPLAY_PIN first_status={} replay_status={} stop_reason={} commit_knowledge={}",
+			response.write.status.0,
+			retry.write.status.0,
+			retry.write.mutation_stop_reason().0,
+			retry.write.mutation_commit_knowledge().0
+		);
+		assert_eq!(
+			node.data_server.idempotency.len(),
+			after,
+			"replay adds no entries"
+		);
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::from_node_id(node.local_node),
+			response.write.commit_hlc,
+		)
+		.unwrap();
+		let mut delete_meta: TableDeleteRowsRequestMeta = bytemuck::Zeroable::zeroed();
+		delete_meta.parent_write_id = crate::schema::ClientWriteId {
+			client_uuid: [0x62; 16],
+			sequence_no: operation as u64,
+			idempotency_ttl_ms: 30_000,
+			_pad: 0,
+		};
+		delete_meta.client_hlc = hlc(10, 0, 48);
+		delete_meta.expected_epoch = 1;
+		delete_meta.tenant_id = tenant();
+		delete_meta.table_object_id = descriptor.table_object_id;
+		delete_meta.schema_generation = descriptor.schema_generation;
+		delete_meta.row_count = 1;
+		delete_meta.durability = DurabilityLevel::QUORUM;
+		let key = admission.key_identities[0];
+		let (deleted, _) = node
+			.data_server
+			.table_delete(delete_meta, vec![key])
+			.await
+			.unwrap();
+		assert_eq!(deleted.write.status, WriteStatus::OK);
+		assert_eq!(deleted.deleted_count, 1);
+		assert_eq!(
+			node.data_server.table_delete_idempotency.len(),
+			operation as usize + 1
+		);
+		let retained = node.data_server.idempotency.len();
+		let (retry, _) = node
+			.data_server
+			.table_delete(delete_meta, vec![key])
+			.await
+			.unwrap();
+		assert_eq!(retry.deleted_count, 1);
+		assert_eq!(
+			node.data_server.table_delete_idempotency.len(),
+			operation as usize + 1
+		);
+		assert_eq!(node.data_server.idempotency.len(), retained);
+		points.push((
+			operation + 1,
+			retained,
+			node.data_server.table_delete_idempotency.len(),
+		));
+	}
+	println!("CACHE_PIN (distinct_write_delete_pairs, write_entries, delete_entries)={points:?}");
+	node.handles.abort();
+}

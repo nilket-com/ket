@@ -671,6 +671,43 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn a_complete_frame_is_a_success_response_without_waiting_for_stream_eof() {
+		let id = QueryId::new();
+		let (mut writer, mut reader) = tokio::io::duplex(4096);
+		write_frame(
+			&mut writer,
+			&SqlFrame::response(id, SqlMessage::Complete(Complete { row_count: 1 })),
+		)
+		.await
+		.unwrap();
+		// Keep the sender alive: the collector's success witness is Complete, not EOF.
+		let result = tokio::time::timeout(
+			Duration::from_secs(1),
+			collect_response(&mut reader, id, ExpectedResponse::Query),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		let RuneQueryResult::Batches(result) = result else {
+			panic!("ordinary SQL response");
+		};
+		assert_eq!(result.row_count, 1);
+		assert!(result.batches.is_empty());
+		drop(writer);
+	}
+
+	#[tokio::test]
+	async fn stream_eof_without_a_complete_frame_is_not_a_success_response() {
+		let id = QueryId::new();
+		let mut reader = framed_bytes(&[]).await;
+		assert!(
+			collect_response(&mut reader, id, ExpectedResponse::Query)
+				.await
+				.is_err()
+		);
+	}
+
+	#[tokio::test]
 	async fn collector_preserves_remote_error_code_and_message() {
 		let id = QueryId::from_u128(9);
 		let error = SqlFrame::response(
