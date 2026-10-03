@@ -1,16 +1,23 @@
 # ADR 628 - query-lease renewal that tolerates delay
 
-**Status:** STAGE A COMPLETE: diagnosis delivered, with limited Wi-Fi
-renewal coverage (see [Stage A results](#stage-a-results-reviewed)).
-Stage B part 1 (B0, lifecycle prerequisites) is DELIVERED as the
-reviewed lifecycle/wire implementation (see [B0 results](#b0-results-reviewed)).
-B1 (delay tolerance) is scoped (see the B1 amendment): its conditional
-reliance contract (B1.A) and test-only timing survey (B1.B) are
-authorized for development; its mechanism (B1.C) is not selected, and no
-production reliance change, deadline or host campaign is cleared.
-Stage B as a whole is not delay tolerance delivered, and the ADR is not
-closed as reliability delivered. Successor to ADR 627, which closed with limited
-lease coverage.
+**Status:** B1.C is DELIVERED, scoped: the reviewed conditional reliance contract and the selected
+delay-tolerant renewal mechanism, evidenced by the declared deterministic tests and the r2 campaign
+(see [B1.C results](#b1c-results-reviewed)). Earlier stages:
+- Stage A is complete: a diagnosis, with limited Wi-Fi renewal coverage
+  ([Stage A results](#stage-a-results-reviewed)).
+- B0, the lifecycle prerequisites, is delivered ([B0 results](#b0-results-reviewed)).
+- B1.B, the timing survey, is recorded ([B1.B results](#b1b-results-reviewed)).
+
+The delivery is conditional on the declared clock-rate and margin assumptions, on a suspend-aware
+clock, and on namespace and incarnation continuity. Several things remain outside this result:
+- remote reclamation and stopping remote running tasks;
+- W (the stall watchdog);
+- coordinator recovery;
+- connection reuse;
+- the ADR 626 dispatch-exclusion shortcut.
+
+There is no general Wi-Fi reliability claim. Successor to ADR 627, which closed with limited lease
+coverage.
 
 Approval does not carry forward:
 - **Stage A (characterization and pinning)** is the only stage this
@@ -2275,3 +2282,189 @@ step or STOP.
 changed.
 
 **Campaign 1** (above) and its refusal stay unchanged.
+
+## B1.C results (reviewed)
+
+Accepted on review (Codex 01a101e0). The r2 campaign evidence satisfies the declared B1.C acceptance
+controls, within the scope below. Every figure was read from the r2 evidence. Final source paths equal
+`adr628-b1c-r2-baseline` (513718e4) and the laddered 006d3cd3; this record changes only this plan.
+
+### What is delivered
+
+B1.C delivers the reviewed conditional reliance contract (B1.A) and the selected delay-tolerant renewal
+mechanism:
+- one reliance ledger per query, keyed by worker, with the boundary `B_w = t_send + D − M` on
+  CLOCK_BOOTTIME;
+- renewal loops that retry within that boundary under the provisional budgets (connect 2000 ms, ACK
+  2000 ms, whole 3000 ms; backoff 250 ms, doubling, capped at 2000 ms);
+- the dial, lease-write, use and delivery gates, and the atomic success-commit gate;
+- renewal cleanup awaited and reported before the normal end of stream.
+
+**Evidence:**
+- the declared deterministic tests (ladder-b1c-6, below);
+- the r2 campaign, all of whose attempts read.
+
+**Operating assumptions (declared, not proven):**
+- **Clock rates:** ρ_w = ρ_c = 500 ppm.
+- **Margin:** M = 1 s.
+- **Clock:** a suspend-aware boot clock.
+- **Continuity:** the worker's namespace and incarnation continue (no restart).
+
+Clock-synchronization context is recorded but is not proof of the rate bound.
+
+**Scope of the use-gate claim.** The coordinator gates its own uses of a worker (dispatch, lease writes,
+StartTask, publish, accept, delivery, commit) against its ledger. That is a claim about coordinator
+reliance. It says nothing about what a remote worker does after the coordinator stops relying on it.
+
+### Provenance
+
+**Source.**
+- Tag `adr628-b1c-r2-baseline` = 513718e4 (tree 70683165), on top of the campaign-1 tag
+  `adr628-b1c-baseline` = 62fe8117.
+- `git diff 006d3cd3 513718e4` touches only this plan.
+
+**Ladder.** ladder-b1c-6 at 006d3cd3: clean, all six steps rc 0.
+
+| Crate | Passed | Failed | Ignored |
+| --- | --- | --- | --- |
+| toron | 5711 | 0 | 20 |
+| toron-tpch | 674 | 0 | 6 |
+| toron-client | 22 | 0 | 0 |
+
+**Artifacts:**
+- `toron_fixture_worker` cd2eeb833be620c6317b74ef8405d775134b5f286e086c6fdf6c78775dd8fee0
+- probe dc79f25db3f187fe170379d2a71a5a0585f8a63e8fd8a3030f2feb71ff779001
+
+**Freeze.** `FREEZE.json` 52f7a1db…51a9 (clearance 01a1018b; verified 01a10190).
+- Schedule `adr628-b1c-schedule-2` (d159325a…).
+- Its matrix, parameters and order are campaign 1's; every one of the 58 declarations adds
+  `cleanup_wait_ms = 10000`.
+- The r2 reader adds a causal cleanup-wait check. The r2 runner validates both ID lists first and stops at
+  the first nonzero step or STOP.
+
+**Staging.** Fresh roots `toron-evidence/adr628-b1c-r2` on bigfoot, strix and optiplex, each verified
+against its manifest.
+
+| Host | Manifest sha256 |
+| --- | --- |
+| bigfoot | eeeeb6fa… |
+| strix | 5dae99fe… |
+| optiplex | 1709c47a… |
+
+The first staging attempt to strix and optiplex failed its host-key check and created nothing, yet echoed
+"staged". It was redone and verified; `OPERATIONAL-NOTES.md` records it. An echoed label is not
+verification.
+
+**Run.** 2026-10-03 11:39:30Z–13:02:38Z, in the frozen order. Every step rc 0; no STOP; nothing retried
+or resampled.
+
+**Evidence.**
+- Location: `~/work/.agent-bridge/adr628-b1c-r2-evidence`.
+- Readouts: `loopback-readout.json` 91ffbbcc… (via campaign 1's unchanged serialization wrapper) and
+  `wifi-readout.json` fbbbb355….
+- Archive: `SHA256SUMS` c292aaea… over 1,583 files.
+- Mirror: verified on bigfoot at `~/work/toron-evidence/adr628-b1c-r2-local-copy`.
+
+**Independent review.** Codex recomputed the full loopback readout and all 22 Wi-Fi attempt reports from
+the frozen reader copies; all match.
+
+### Loopback (READ, 36/36)
+
+**Verdicts:** 34 meet and 2 are reported (census kill, diagnostic); 0 contradict and 0 have coverage
+unavailable. Renewal cleanup is verified on all 36.
+
+**Within-budget faults** (each run twice):
+- renewal connect, read or close delayed 1500 ms;
+- one withheld reply;
+- route delay 40 ms each way;
+- route loss 100 per mille each direction;
+- an 8 s blackout.
+
+Every query committed, with parity equal to its case reference. Short-blackout survival means what the
+reader requires: an Applied refresh installed before the old boundary.
+
+**Past-budget and persistent faults:**
+- connect or read 2500 ms, and close 3500 ms;
+- all replies withheld;
+- a 40 s blackout;
+- an unreachable route;
+- a refused renewal.
+
+Each failed the query as declared, with `WorkerLost(62801)`. Across the campaign, including the two
+diagnostic census-kill runs, the 14 observed lapses (the refusals have none) are of 62801 at site `plan`, 0.555–1.977 ms after the bound. These are observed gate timings, not a
+guaranteed deadline for error delivery or cleanup. These controls do not show coordinator recovery.
+
+**Census kill:** both runs gave `WorkerLost(62801)`. They are reported diagnostically and are not
+accepted mid-task recovery coverage.
+
+**Horizon runs** (110 s, 3 runs): committed, with parity equal.
+
+### Wi-Fi (READ, 22/22; no injected fault)
+
+**Runs:**
+- 2 single-host references;
+- 15 cross-host long queries;
+- 5 cross-host horizon queries.
+
+All completed, at parity with their same-case reference, and renewal cleanup is verified on all 22.
+"Healthy" means no injected fault, not a proven healthy network.
+
+**Coverage:**
+- The 15 long queries met the required long lease coverage.
+- The horizon coverage is on the declared workers 70202 and 70203. Over the five runs they crossed
+  3.256–3.279 initial horizons, each with 23 refreshes, and ended reliable.
+- In the reference, 70101 crossed 3.241 horizons and 70102 3.240.
+
+The r2 attempt `healthy-long-join-last-10` reads; it reuses the identifier of campaign 1's refused attempt.
+Campaign 1's artifact remains REFUSED.
+
+### Context
+
+**Links**, 48 runs before and 48 after:
+
+| Measure | Before | After |
+| --- | --- | --- |
+| Ping loss | 0 % | 0–0.99 % |
+| Average RTT | 94–147 ms | 88–135 ms |
+| Maximum RTT | 1207.9 ms | 226.9 ms |
+| iperf3 UDP loss at the declared 100 Mbps offered load | 0.32–48.27 % | 0.29–33.89 % |
+
+Wi-Fi power saving was on, as kept.
+
+**Clocks:** timesyncd on bigfoot and strix; chrony on optiplex (frequency 11.39 ppm slow, skew 0.30
+ppm). All were NTP-synchronized before and after. This is not a ρ bound.
+
+### Cleanup
+
+"Renewal cleanup verified" means renewal closure, abort, drain and supervisor accounting:
+- all 58 raw logs carry exactly one verified cleanup receipt;
+- each has one declared 10000 ms wait, which follows both `query_returned` and that receipt.
+
+Two things stay separate and are not claimed:
+- remote retirement and reclamation;
+- stopping remote running tasks.
+
+### Retained
+
+Campaign 1 stands unchanged. Its Wi-Fi readout was REFUSED (`healthy-long-join-last-10`, renewal cleanup
+not verified), and its source and end-of-stream finding remain the cause of the r2 correction (above).
+
+Retained:
+- both freezes, readouts and archives;
+- the b1c-5 and b1c-6 identities and artifacts;
+- the immutable tags `adr628-b1c-baseline` and `adr628-b1c-r2-baseline`.
+
+r2 meets its declared contract; it does not retroactively change campaign 1.
+
+### Limits
+
+- **Scope of the evidence.** One network and configuration, and one r2 campaign. That supports no
+  general Wi-Fi reliability rate and no universal network guarantee.
+- **Budgets.** They remain operational declarations, not certified tails.
+- **Open streams.** An open worker stream on a failed query is withheld completed-chain coverage.
+- **Outside this result:**
+  - W (the stall watchdog);
+  - remote-task cessation;
+  - coordinator recovery;
+  - connection reuse;
+  - the ADR 626 dispatch-exclusion shortcut.
