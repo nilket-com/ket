@@ -2044,3 +2044,103 @@ running-task cessation, which is not claimed.
   accounting (`b1b-reconcile-2`). Missing replies are never generically acceptable.
 
 No additional B1.B survey; the retained evidence is used as it is.
+
+### B1.C implementation and instrument amendment (reviewed)
+
+**Status:** the implementation passed source and test review. The instrument, readers and frozen
+schedule are cleared for the declared campaign. That clearance covers gathering evidence only; it is not
+acceptance of delay tolerance, and it authorizes no merge to main.
+
+#### Implementation
+
+**The ledger** (`distributed/query_reliance.rs`) keeps one ledger per query, shared by renewal and every
+inline dispatch lease.
+- **States:** `Unissued → Issuing → Reliable{bound, marker} → Lapsed | Terminal(cause)`.
+- **Bound:** `B_w = t_send + D − M`, computed in checked `u128` nanoseconds.
+- **Clock:** CLOCK_BOOTTIME, sampled under the lock. A clock fault fails the query (fail closed).
+- **Outcome:** `Committed` and `Failed{worker?, cause}` are exclusive and irreversible. Ordinary failure,
+  cancellation and owner drop are sealed as `QueryEnded`.
+
+**Gates.** Each gate samples the clock after the wait it follows. Every gate lapses all expired bounds
+first. The gates are:
+- the dial;
+- the lease write;
+- `StartTask`;
+- publication (reserve capacity first, then the gate, then `permit.send`);
+- acceptance before and after the close;
+- delivery of each buffered batch;
+- the commit.
+
+**Budget phases.** Connect, ACK and whole are each re-checked on the boot clock: connect from the exact
+connect start, ACK from the send marker (capped by whole), whole from the exchange start. A completion
+after its budget refreshes nothing, and every overrun is recorded.
+
+**Renewal ownership.** Per-worker loops run under a supervisor. Dropping the owner synchronously closes
+admission and seals the query. Cleanup is certified only by the supervisor's explicit `done`; otherwise it
+is `supervisor_lost` or `supervisor_panicked`.
+
+**Outward mapping:** `Clock` and `Arithmetic` faults are `Internal`; a `QueryEnded` refusal is
+`Cancelled`; every worker cause is `WorkerLost{w}`.
+
+**Budgets** are unchanged operational declarations, not certified tails: connect 2000, ACK 2000 and
+whole 3000 ms; backoff 250 → 2000 ms; cadence 5 s; term 35.001 s; `D − M` = 33,966,016,491 ns.
+
+#### Instrument
+
+The production seams are inert by default.
+- **S1:** `with_renewal_transport` sets a renewal-only transport. Its single use is the renewal spawn.
+  It isolates the renewal path; it does not simulate a network partition.
+- **S2:** `RelianceObserver`. Events get a per-query `seq` under the ledger lock and are delivered
+  after the lock is released. The ledger assigns exchange identities (renewal attempt ordinals and
+  dispatch tickets), and `connect_worker_tagged` passes them to recording transports. Every gate
+  decision is recorded, authorized or refused. Renewal closure is recorded once.
+
+**Test-only pieces:**
+- `RenewalFaultTransport`: delays, withhold reply, refuse, unreachable. A withheld reply is a
+  coordinator-side lost ACK, not an unwritten worker reply.
+- The fixture flag `--long-scan-ms`, bounded and echoed.
+- The probe `reliance_control_on_loopback`. Its blackout cut and restoration carry boot-clock samples.
+- The Wi-Fi probe's `reliance_observer` spec flag.
+
+#### Readers (`adr628b1c_read.py`), shared by the loopback and Wi-Fi acceptance paths
+
+- **R1, replay:** replays the recorded decisions in `seq` order against these rules, from the boot
+  samples:
+  - complete, unique phase evidence;
+  - the per-phase deadlines;
+  - the refresh rule;
+  - the gates, including refusals, which must be explained by the replayed state;
+  - plans, backoff and attempt ordinals;
+  - irreversible outcomes.
+- **R1, wire binding:** every exchange that wrote a lease is bound to its tagged dial and wire frames.
+  Use gates are bound to the actions they authorize: `StartTask`, publication and completion.
+- **R2, `b1c-reconcile-1`:** derived from b1b-reconcile-2. The full causal chain is checked per stream, in
+  both log position and worker-clock samples. Open streams after a failed query are reported, and their
+  completed chain is withheld.
+- **R3, cleanup:** exactly one verified cleanup, after closure and after every attempt end. Otherwise the
+  cleanup requirement fails, whatever the query result.
+
+Results are validated against the raw terminal and the ledger, and compared with the same-path reference
+on rows as well as digest. The query, workers and identities are bound to the declared roster. Blackout
+coverage is read from the boot samples at the cut and the restoration. Horizon coverage is checked per
+declared worker.
+
+#### Frozen schedule (`adr628b1c_schedule.py`)
+
+**Loopback, 36 attempts.**
+- 17 controls, two attempts each, with a third for `none` and `horizon_110`.
+- The case references are `none-1` and `horizon-110-1`.
+- Persistent-lapse controls run on the 110 s horizon case.
+
+**Wi-Fi, 22 attempts.**
+- 15 × `long_join_last` and 5 × `horizon_join_last`.
+- Two authenticated single-host references.
+- Links and clock context before and after.
+
+**Coverage sets** for the horizon cases: loopback 62801 and 62802; Wi-Fi 70202 and 70203; Wi-Fi
+reference 70101 and 70102.
+
+**Verdicts** are meets, contradicts, coverage_unavailable or reported. They are separate from integrity.
+There is no resampling.
+
+**Not claimed:** running-task cessation, and remote reclamation.
