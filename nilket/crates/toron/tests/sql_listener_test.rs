@@ -2904,4 +2904,360 @@ mod mutation_integrity_pins {
 		first_daemon.shutdown().await.unwrap();
 		fixture.shutdown();
 	}
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn certificate_tenant_replay_shares_a_cache_key_but_not_a_durable_outcome() {
+		use std::os::unix::fs::PermissionsExt;
+		let fixture = LiveWendelonFixture::start(6300).await;
+		for tenant in [1, 2] {
+			if tenant == 2 {
+				create_live_tenant(&fixture.node, WendelonTenantId::new(tenant)).await;
+			}
+			install_schema(&fixture.node, WendelonTenantId::new(tenant), &descriptor()).await;
+		}
+		let ca = ca_cert();
+		let make_pki = |worker: WorkerId, tenant: &str| {
+			let dir = fresh_dir("mutation-auth-tenants");
+			let pki = TestPki {
+				ca_cert: dir.join("ca.pem"),
+				daemon_cert: dir.join("daemon.pem"),
+				daemon_key: dir.join("daemon.key"),
+				client_cert: dir.join("client.pem"),
+				client_key: dir.join("client.key"),
+			};
+			std::fs::write(&pki.ca_cert, ca.serialize_pem().unwrap()).unwrap();
+			let daemon = leaf_cert(
+				&canonical_daemon_dns_name(&worker, DEFAULT_CLUSTER_DOMAIN),
+				&[
+					ExtendedKeyUsagePurpose::ServerAuth,
+					ExtendedKeyUsagePurpose::ClientAuth,
+				],
+			);
+			let client = leaf_cert(
+				&canonical_client_dns_name(tenant, DEFAULT_CLUSTER_DOMAIN),
+				&[ExtendedKeyUsagePurpose::ClientAuth],
+			);
+			write_signed_cert(&pki.daemon_cert, &pki.daemon_key, &daemon, &ca);
+			write_signed_cert(&pki.client_cert, &pki.client_key, &client, &ca);
+			std::fs::set_permissions(&pki.client_key, std::fs::Permissions::from_mode(0o600))
+				.unwrap();
+			pki
+		};
+		let first_worker = WorkerId::from_u128(63001);
+		let second_worker = WorkerId::from_u128(63002);
+		let first_pki = make_pki(first_worker, "1");
+		let second_pki = make_pki(second_worker, "2");
+		let first_config = toron_config_with_descriptor_tls_for_tenant(
+			descriptor(),
+			ToronTenantId(1),
+			first_worker,
+			&first_pki,
+		);
+		// The node fallback stays tenant 1: only the client-2 certificate selects tenant 2.
+		let second_config = toron_config_with_descriptor_tls_for_tenant(
+			descriptor(),
+			ToronTenantId(2),
+			second_worker,
+			&second_pki,
+		);
+		assert_eq!(second_config.node.tenant_id, ToronTenantId(1));
+		let first_daemon = ToronDaemon::start_with_wendelon_client_for_harness(
+			first_config,
+			Arc::clone(&fixture.client),
+		)
+		.await
+		.unwrap();
+		let second_daemon = ToronDaemon::start_with_wendelon_client_for_harness(
+			second_config,
+			Arc::clone(&fixture.client),
+		)
+		.await
+		.unwrap();
+		let make_client = |daemon: &ToronDaemon, worker, pki: &TestPki| {
+			let endpoint = connectable_loopback_addr(daemon.handle().sql_endpoint.unwrap());
+			ToronClient::authenticated(
+				endpoint.to_string(),
+				&toron_client::ToronClientTls {
+					server_name: canonical_daemon_dns_name(&worker, DEFAULT_CLUSTER_DOMAIN),
+					cert_path: pki.client_cert.clone(),
+					key_path: pki.client_key.clone(),
+					ca_path: pki.ca_cert.clone(),
+				},
+			)
+			.unwrap()
+		};
+		let first_client = make_client(&first_daemon, first_worker, &first_pki);
+		let second_client = make_client(&second_daemon, second_worker, &second_pki);
+		first_client.health().await.unwrap();
+		second_client.health().await.unwrap();
+		for (order, (original_tenant, replay_tenant, original, replay)) in [
+			(1, 2, &first_client, &second_client),
+			(2, 1, &second_client, &first_client),
+		]
+		.into_iter()
+		.enumerate()
+		{
+			for (case, kind) in [
+				"insert-identical",
+				"insert-changed",
+				"update-identical",
+				"delete-identical",
+			]
+			.into_iter()
+			.enumerate()
+			{
+				let key = 100 + order as i32 * 100 + case as i32 * 10;
+				let id = QueryId::new();
+				let insert = format!(
+					"INSERT INTO storage_execution (id, amount, region, ts) VALUES ({key}, 10, 'original', 1599998400000)"
+				);
+				let (first_sql, second_sql) = match kind {
+					"insert-identical" => (insert.clone(), insert),
+					"insert-changed" => (
+						insert,
+						format!(
+							"INSERT INTO storage_execution (id, amount, region, ts) VALUES ({}, 20, 'changed', 1599998400000)",
+							key + 1
+						),
+					),
+					"update-identical" | "delete-identical" => {
+						original.execute(&insert).await.unwrap();
+						replay.execute(&format!("INSERT INTO storage_execution (id, amount, region, ts) VALUES ({key}, 20, 'replay-tenant', 1599998400000)")).await.unwrap();
+						assert_eq!(visible(original, key).await[0].1, Some(10));
+						assert_eq!(visible(replay, key).await[0].1, Some(20));
+						let sql = if kind == "update-identical" {
+							format!(
+								"UPDATE storage_execution SET amount = amount + 1 WHERE id = {key}"
+							)
+						} else {
+							format!("DELETE FROM storage_execution WHERE id = {key}")
+						};
+						(sql.clone(), sql)
+					}
+					_ => unreachable!(),
+				};
+				let first_response = original
+					.execute_with_query_id(id, &first_sql, "UTC")
+					.await
+					.unwrap();
+				let original_outcome = committed(original, id, "cross-tenant-original").await;
+				let false_success = replay
+					.execute_with_query_id(id, &second_sql, "UTC")
+					.await
+					.unwrap();
+				assert_eq!(first_response.row_count, 1);
+				assert_eq!(false_success.row_count, 1);
+				assert_eq!(false_success.batches, first_response.batches);
+				let own_rows = visible(replay, key).await;
+				match kind {
+					"insert-identical" => assert!(own_rows.is_empty()),
+					"insert-changed" => {
+						assert!(own_rows.is_empty());
+						assert!(visible(replay, key + 1).await.is_empty());
+					}
+					"update-identical" | "delete-identical" => assert_eq!(
+						own_rows,
+						vec![(key as i64, Some(20), Some("replay-tenant".into()))]
+					),
+					_ => unreachable!(),
+				}
+				let original_rows = visible(original, key).await;
+				match kind {
+					"delete-identical" => {
+						assert!(original_rows.is_empty());
+						assert_eq!(original_outcome.delete_counts, Some([1, 0, 0]));
+					}
+					"update-identical" => assert_eq!(
+						original_rows,
+						vec![(key as i64, Some(11), Some("original".into()))]
+					),
+					_ => assert_eq!(
+						original_rows,
+						vec![(key as i64, Some(10), Some("original".into()))]
+					),
+				}
+				let ResolvedOperationOutcome::Mutation(resolved) =
+					replay.resolve_mutation(id).await.unwrap()
+				else {
+					panic!("row mutation")
+				};
+				assert_eq!(resolved.resolution, MutationResolution::Unknown);
+				assert_eq!(
+					resolved.write_status,
+					wendelon::schema::WriteStatus::WRITE_OPERATION_UNKNOWN.0
+				);
+				assert_eq!(resolved.stop_reason, MutationStopReason::None);
+				assert_eq!(
+					resolved.commit_knowledge,
+					MutationCommitKnowledge::Unspecified
+				);
+				println!(
+					"AUTH_TENANT_REPLAY_PIN original_tenant={original_tenant} replay_tenant={replay_tenant} kind={kind} identical_bytes={} sql_rows={} resolution={:?} write_status={} stop_reason={} commit_knowledge={} expected_own_effect_absent=true authenticated=true storage_transport=simulated",
+					first_sql == second_sql,
+					false_success.row_count,
+					resolved.resolution,
+					resolved.write_status,
+					raw_stop_reason(resolved.stop_reason),
+					raw_commit_knowledge(resolved.commit_knowledge)
+				);
+			}
+		}
+		second_daemon.shutdown().await.unwrap();
+		first_daemon.shutdown().await.unwrap();
+		fixture.shutdown();
+	}
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn an_old_v7_first_sql_submission_is_expired_and_creates_no_row() {
+		let (fixture, daemon, client) = start(6301).await;
+		let now_ms = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_millis() as u64;
+		let issued_ms = now_ms.checked_sub(360_000).unwrap();
+		let mut bytes = *uuid::Uuid::now_v7().as_bytes();
+		bytes[..6].copy_from_slice(&issued_ms.to_be_bytes()[2..]);
+		let id = QueryId::from_u128(u128::from_be_bytes(bytes));
+		let error = client.execute_with_query_id(id, "INSERT INTO storage_execution (id, amount, region, ts) VALUES (6301, 10, 'old-v7-first-submission', 1599998400000)", "UTC").await.expect_err("old v7 first submission cannot be a success");
+		assert!(
+			matches!(
+				&error,
+				toron_client::ClientError::Remote {
+					code: SqlErrorCode::StorageError,
+					..
+				}
+			),
+			"actual SQL storage error, not an unrelated transport failure: {error:?}"
+		);
+		let outcome = match client.resolve_mutation(id).await.unwrap() {
+			ResolvedOperationOutcome::Mutation(outcome) => outcome,
+			_ => panic!("mutation outcome"),
+		};
+		assert_eq!(outcome.resolution, MutationResolution::Expired);
+		assert_eq!(
+			outcome.write_status,
+			wendelon::schema::WriteStatus::WRITE_OPERATION_EXPIRED.0
+		);
+		assert_eq!(outcome.stop_reason, MutationStopReason::None);
+		assert_eq!(
+			outcome.commit_knowledge,
+			MutationCommitKnowledge::Unspecified
+		);
+		assert!(visible(&client, 6301).await.is_empty());
+		println!(
+			"OLD_V7_FIRST_PIN id_age_ms=360000 requested_sql_ttl_ms=300000 response={error:?} resolution=Expired write_status={} stop_reason={} commit_knowledge={} row_absent=true admitted_before_expiry=false",
+			outcome.write_status,
+			raw_stop_reason(outcome.stop_reason),
+			raw_commit_knowledge(outcome.commit_knowledge)
+		);
+		daemon.shutdown().await.unwrap();
+		fixture.shutdown();
+	}
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn reusing_a_select_query_id_does_not_hold_a_cross_request_snapshot() {
+		let (fixture, daemon, client) = start(6302).await;
+		client.execute("INSERT INTO storage_execution (id, amount, region, ts) VALUES (6302, 10, 'snapshot-probe', 1599998400000)").await.unwrap();
+		let read_id = QueryId::new();
+		let query = "SELECT id, amount, region FROM storage_execution WHERE id = 6302";
+		let before = client
+			.execute_with_query_id(read_id, query, "UTC")
+			.await
+			.unwrap();
+		assert_eq!(visible(&client, 6302).await[0].1, Some(10));
+		client
+			.execute("UPDATE storage_execution SET amount = amount + 1 WHERE id = 6302")
+			.await
+			.unwrap();
+		let after = client
+			.execute_with_query_id(read_id, query, "UTC")
+			.await
+			.unwrap();
+		assert_eq!(visible(&client, 6302).await[0].1, Some(11));
+		for (response, amount) in [(&before, 10), (&after, 11)] {
+			let batches = response
+				.batches
+				.iter()
+				.flat_map(|bytes| {
+					StreamReader::try_new(bytes.as_slice(), None)
+						.unwrap()
+						.map(|batch| batch.unwrap())
+				})
+				.collect::<Vec<_>>();
+			assert_eq!(
+				projected_rows(&batches),
+				vec![(6302, Some(amount), Some("snapshot-probe".into()))],
+				"the same SELECT id reads current content on each request"
+			);
+		}
+		println!(
+			"SNAPSHOT_PIN scope=cross_request_same_select_id before_amount=10 after_amount=11 held_snapshot=false multi_table_concurrent=unavailable"
+		);
+		daemon.shutdown().await.unwrap();
+		fixture.shutdown();
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	#[ignore = "4097 public SQL mutations; run separately with an emitting bounded capacity control"]
+	async fn sql_capacity_eviction_keeps_a_warm_replay_but_loses_detailed_resolution() {
+		let (fixture, daemon, client) = start(6303).await;
+		let started = std::time::Instant::now();
+		let oldest = QueryId::new();
+		let original = "INSERT INTO storage_execution (id, amount, region, ts) VALUES (6303, 0, 'capacity-probe', 1599998400000)";
+		client
+			.execute_with_query_id(oldest, original, "UTC")
+			.await
+			.unwrap();
+		committed(&client, oldest, "capacity-oldest-before").await;
+		let mut latest = oldest;
+		// OUTCOME_CAPACITY is 4096. Each mutation has a distinct parent id but one
+		// business key, so this also keeps latest-row visibility separate from history.
+		for amount in 1..=4096 {
+			assert!(
+				started.elapsed() < Duration::from_secs(180),
+				"capacity control exceeded its window; no expiry-versus-capacity conclusion"
+			);
+			latest = QueryId::new();
+			let response = client.execute_with_query_id(latest, &format!("INSERT INTO storage_execution (id, amount, region, ts) VALUES (6303, {amount}, 'capacity-probe', 1599998400000)"), "UTC").await.unwrap();
+			assert_eq!(response.row_count, 1);
+		}
+		assert!(
+			started.elapsed() < Duration::from_secs(180),
+			"control must finish well before 300s TTL"
+		);
+		let old = match client.resolve_mutation(oldest).await.unwrap() {
+			ResolvedOperationOutcome::Mutation(outcome) => outcome,
+			_ => panic!("mutation"),
+		};
+		assert_eq!(old.resolution, MutationResolution::Expired);
+		assert_eq!(
+			old.write_status,
+			wendelon::schema::WriteStatus::WRITE_OPERATION_EXPIRED.0
+		);
+		assert_eq!(old.stop_reason, MutationStopReason::None);
+		assert_eq!(old.commit_knowledge, MutationCommitKnowledge::Unspecified);
+		committed(&client, latest, "capacity-latest-after").await;
+		assert_eq!(visible(&client, 6303).await[0].1, Some(4096));
+		let replay = client
+			.execute_with_query_id(oldest, original, "UTC")
+			.await
+			.unwrap();
+		assert_eq!(replay.row_count, 1);
+		assert_eq!(
+			visible(&client, 6303).await[0].1,
+			Some(4096),
+			"oldest cached replay does not restore its obsolete content"
+		);
+		let after = match client.resolve_mutation(oldest).await.unwrap() {
+			ResolvedOperationOutcome::Mutation(outcome) => outcome,
+			_ => panic!("mutation"),
+		};
+		assert_eq!(after, old);
+		println!(
+			"SQL_CAPACITY_PIN operations=4097 elapsed_ms={} oldest_resolution=Expired oldest_status={} oldest_stop={} oldest_commit={} latest_resolution=Present warm_replay_rows=1 latest_amount=4096",
+			started.elapsed().as_millis(),
+			old.write_status,
+			raw_stop_reason(old.stop_reason),
+			raw_commit_knowledge(old.commit_knowledge)
+		);
+		daemon.shutdown().await.unwrap();
+		fixture.shutdown();
+	}
 }
