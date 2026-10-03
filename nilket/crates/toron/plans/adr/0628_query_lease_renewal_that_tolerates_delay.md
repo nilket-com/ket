@@ -2233,3 +2233,45 @@ record. Neither change is applied retroactively.
 **Runner note for the next campaign:** `campaign-runner.sh` logged nonzero exit codes but continued
 unless STOP existed. Every actual step was rc 0, so these results are unaffected. The next runner stops on
 either a nonzero step or STOP.
+
+### B1.C r2 amendment: cleanup before the end of stream (reviewed)
+
+**Status:** reviewed and cleared for a fresh full campaign. This is not acceptance.
+
+**Source.** In both streaming entry paths, the driver now awaits the owned renewal shutdown, and reports its
+receipt, BEFORE it releases the final result sender. A normal end of stream therefore follows the cleanup
+receipt. Otherwise:
+- the committed result is unchanged;
+- a lost or panicked cleanup is recorded separately and never becomes success;
+- an already observed failure is still published at once, and its cleanup completes afterwards as its
+  own record;
+- the collected paths and retirement fanout are unchanged.
+
+**Tests.** The deterministic tests use a test-only hook that holds or breaks the shutdown:
+- a committed stream gives no normal end while the cleanup is held, on both entry paths;
+- a lost supervisor gives an unverified receipt;
+- a failure is published promptly;
+- an in-flight renewal is aborted and drained before the receipt.
+
+A mutation check fails the old ordering.
+
+**Instrument.** With the reliance instrument, the probe waits at most 10 s, after the raw `query_returned`
+stamp, for the query's own cleanup record, and records `renewal_cleanup_wait`. The reader requires
+exactly one wait where it is declared. That wait must:
+- carry the declared bound and a well-formed outcome;
+- follow `query_returned` and the same query's receipt, by position and time;
+- report that receipt's result;
+- match the saved evidence.
+
+A timeout stays a refusal.
+
+**Runner r2.** It validates both declared ID lists before any host step, and halts at the first nonzero
+step or STOP.
+
+**Guard.** The ADR 083 coordinator boundary is now the test module.
+
+**Schedule** `adr628-b1c-schedule-2`. The matrix, parameters and order are unchanged (36 loopback +
+22 Wi-Fi = 58). Every declaration adds `cleanup_wait_ms = 10000`, so the declarations and their hash
+changed.
+
+**Campaign 1** (above) and its refusal stay unchanged.
