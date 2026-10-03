@@ -1,8 +1,9 @@
 # ADR 629 - trust in acknowledged writes: a three-node store soak
 
-**Status:** PLANNED (reviewed; Codex 01a10349). This record authorizes Stage A only: A1 and A2
-development. Within Stage A, host staging and runs wait for their own reviewed package (A3). No Stage B fix is
-selected here. Stage C is reviewed separately.
+**Status:** STAGE A A1 CHARACTERIZED (reviewed parts 1–3; limited diagnostic coverage).
+A2 development remains authorized within Stage A, with its own instrument/topology review before advancement.
+Host staging and runs wait for their reviewed A3 package. No Stage B fix is selected; Stage C is reviewed
+separately. This is not trust, durability or security acceptance for a store.
 
 **A correctness, integrity and security-evidence record. Wi-Fi is a supported target. No performance claim
 is made.**
@@ -392,3 +393,186 @@ identity.
   invariants.
 - Postgres wire, ORMs, connection reuse, indexed point lookups, and performance.
 - The web store application.
+
+
+## A1 findings (reviewed)
+
+A1 characterizes today's behaviour; it delivers no production fix. Claude independently reviewed the three
+parts in chatd: `01a103c5` (part 1), `01a103e0` (part 2), `01a103e2` (F10 correction), and `01a1042b`
+(part 3). The results below are read from retained ladders, with code explanations separated from observations.
+
+### Scope and evidence layers
+
+SQL pins use the real ToronDaemon ingress and public ToronClient. Their Wendelon fixture is one live,
+disk-backed node, RF1, with simulated storage transport, on bigfoot. Parts 1/2 use configured tenants and
+loopback SQL without mTLS. F9's part 3 extension uses authenticated public SQL, a common CA, and client-1 /
+client-2 certificates. The second daemon still has node fallback tenant 1: its client certificate supplies
+tenant 2. Both coordinators share the Wendelon client object and storage process. No three-host placement,
+replicated durability, storage-process crash or power-loss result is established by this fixture.
+
+Native cache, finalizer and object/server-reopen tests are separate layers. The daemon connection pin is
+cfg(test); client completion pins exercise the response collector. Existing Wendelon QUIC/TCP integration
+tests exercise their own real transport fixtures; they do not upgrade the SQL storage fixture to that topology.
+All data are synthetic. A successful test means the observed current behaviour matched its characterization,
+not that the target contract holds.
+
+### F1–F15
+
+| Finding | Observation | Limit / consequence |
+| --- | --- | --- |
+| **F1 (G2): duplicate PK** | Different-id INSERTs for one key both succeed; the latest content supersedes the first. | Latest-row presence cannot count applications or preserve business-event history. |
+| **F2: exact-request binding** | Changed SQL under an existing QueryId is not detected. INSERT/UPDATE return row_count 1/1/1 and equal batch vectors for original/identical/changed requests; changed content is not applied. Resolutions remain equal to the original. | The server response does not certify application of changed bytes. Bind exact request bytes locally before send. |
+| **F3: DELETE response versus effect** | Original/identical/changed replay responses have rows 1/0/1 with equal batch vectors; durable delete_counts remain [1,0,0]. Changed DELETE leaves its new target present. | Empty fresh candidates short-circuit to zero; nonempty candidates can return the cached original deletion count. Affected-rows is not an effect witness. |
+| **F4: isolated UPDATE replay** | Original increment changes 10 to 11; identical retry stays 11; changed assignment to 99 also stays 11. | Positive once-only increment witness for these isolated attempts only, not concurrent-update correctness. |
+| **F5: coordinator restart** | INSERT resolves Present/0/0/1 before/after Toron restart; exact row remains. Strengthened in part 2: first/replay rows 1/1 and batch vectors equal. | The same Wendelon client object and storage process survive; INSERT only. Not independent cold-client or storage restart evidence. |
+| **F6 (G3): cache entries** | Four new write/delete pairs measure write-cache/delete-cache lengths (2,1), (4,2), (6,3), (8,4). Replays add no entries. Native write replay changes OK(0) to DUPLICATE(3), preserving NONE/COMMITTED. | Entry counts only; no RSS, byte cost, long-run slope or cache eviction evidence. |
+| **F7 (G4): connection entries** | Eight SQL health requests leave eight retained JoinSet entries; all eight are joined successfully and the set becomes empty. | Completion is established when drained, not asserted at the preceding count. No memory-cost claim. |
+| **F8: client success** | Collector returns success on Complete while the writer stays open; EOF without Complete errors. | The public client's later bounded terminal-read result is ignored in code; that public fault path is not injected here. |
+| **F9: cross-tenant id collision** | Both tenant orders × INSERT-identical/changed, UPDATE-identical and DELETE-identical produce second-tenant SQL success row_count 1 while its intended effect is absent and its resolution is Unknown/23/0/0. All eight cases also reproduce through certificate-derived authenticated public SQL in part 3. | Tenant-isolation integrity defect on the declared paths. Authentication does not tenant-scope the dedup cache. No row-data disclosure observed; no deployed LAN/security acceptance. A Stage B candidate and precondition for multi-tenant or real data. |
+| **F10: native TTL/reopen split (amended)** | TTL1000ms: resolution becomes Expired/22/0/3, while the populated warm cache returns DUPLICATE/3/0/1. After object/server reopen on the same disk directory, cache is empty; replay returns 22/0/3 without byte growth (4096→4096), and the exact original payload remains readable. | The native pin's id is non-v7 ([0x44;16]); cold refusal is backed by retained expiry evidence. Tombstone eviction is not exercised. Expired remains ambiguous. |
+| **F11: no-effect layer witness** | A synthetic BACKPRESSURED finalizer result becomes Present/21/3/2, retained after object/server reopen; slab bytes stay zero. | KNOWN_NOT_COMMITTED at the finalizer layer only. No public SQL no-effect mutation is driven through this path. |
+| **F12: second coordinator** | A second Toron daemon reads the exact acknowledged row. | Same Wendelon client object and storage process; not independent clients or replicated placement. |
+| **F13: old-v7 first SQL submission** | A v7 id dated 360000ms old on first submission, SQL TTL300000ms, returns Remote StorageError; row absent; resolution Expired/22/0/0. | SQL maps Expired to UNSPECIFIED(0), distinct from native INDETERMINATE(3). Neither is KNOWN_NOT_COMMITTED. No previously admitted work is tested. |
+| **F14: cross-request read** | Reusing one SELECT QueryId returns exact decoded amount 10, then 11 after an acknowledged UPDATE. | No held snapshot on this request path. Does not characterize one multi-table SELECT during concurrent writes. |
+| **F15: SQL outcome capacity** | 4097 distinct public SQL mutations complete in 59573ms, before TTL: oldest resolution changes Present→Expired/22/0/0; latest is Present. Warm oldest replay still succeeds with rows1; latest amount4096 stays intact, and oldest resolution stays Expired. | Detailed resolution can disappear under this workload while replay cache remains effective. No application count is inferred from latest-row state. Capacity is not a universal one-minute lifetime. |
+
+The cache key omits tenant (`data_server.rs::idempotency_key_for`), while the durable outcome store is
+tenant-scoped. That code mechanism is consistent with F9; the pin establishes the acknowledgement/effect/
+resolution discrepancy on its declared path. Preserve all three observations: a received success is `acked`,
+then reconciliation finds unexpected absence. Do not retrospectively relabel that acknowledgement as rejection.
+
+### Typed axes and clock context
+
+Keep resolution classification, write status, stop reason and commit knowledge independent:
+
+| Raw axes (status / stop / knowledge) | Meaning / layer |
+| --- | --- |
+| 0 / 0 / 1 | OK / NONE / COMMITTED; Present SQL resolutions in successful original mutations. |
+| 3 / 0 / 1 | DUPLICATE / NONE / COMMITTED; native cached replay. |
+| 21 / 3 / 2 | WRITE_ATTEMPTS_EXHAUSTED / ATTEMPT_EXHAUSTION / KNOWN_NOT_COMMITTED; synthetic finalizer witness only. |
+| 22 / 0 / 3 | WRITE_OPERATION_EXPIRED / NONE / INDETERMINATE; native expiry response. |
+| 22 / 0 / 0 | WRITE_OPERATION_EXPIRED / NONE / UNSPECIFIED; SQL Expired mapping (`storage.rs:1227–1233`). |
+| 23 / 0 / 0 | WRITE_OPERATION_UNKNOWN / NONE / UNSPECIFIED; SQL Unknown mapping. |
+
+`operation_identity_is_expired` compares a client-chosen UUIDv7 timestamp plus clamped TTL (1000–300000ms)
+against storage wall time. Non-v7 identities do not use that fallback. The native outcome-store v7-age unit
+and F13's first SQL submission are separate from F10's retained expiry evidence. Timestamp bytes are not
+authenticated issuance time. Client/server offset, client-ahead timestamps and clock rollback matter.
+
+Do not claim every submission after 300s is permanently refused: the warm cache is checked before durable
+replay, and retained/pinned outcomes precede timestamp fallback. Nor does refusing a new lookup cancel work
+already admitted. A2/A3 must record the ledger-client to storage clock context and review retry cutoff and
+settlement explicitly; nominal TTL is not a cancellation fence. Unknown/Expired and plain SQL errors remain
+ambiguous unless independent typed evidence establishes no effect.
+
+### Ingress inventory and unavailable coverage
+
+The retained ingress inventory names SQL, WorkerTask, Wendelon data/control/Raft, outbound Wendelon-client
+binds, and observability policies. Toron remote SQL uses tenant certificates; WorkerTask uses toron peer
+identities; ready/metrics use monitor-role HTTPS/mTLS. HTTP health is plaintext and constrained to loopback,
+not mTLS. SQL Health is a separate protocol request. The full Toron suite runs existing policy tests; ladder
+3 also explicitly runs Wendelon's real QUIC join, TCP/TLS fallback, cross-domain-role and operator-peer tests.
+Some existing rejection tests accept error/silence without receiver-observed cause; a timeout is not evidence
+of certificate rejection. A3 still requires named rejection points, receiver corroboration and valid follow-up.
+No encryption-at-rest, all-log-sink, backup confidentiality or compromised-node acceptance follows here.
+
+Coverage unavailable at this A1 identity:
+- **SQL/table-outcome leader change:** the live RF1 fixture has no successor. Existing RF3 chaos
+  control/finalization tests are not SQL mutation/effect witnesses; a bound RF3 instrument is needed.
+- **Bound UPDATE/UPDATE and DELETE/UPDATE:** no causal gate exists after candidate materialization in the
+  live integration harness. Unsynchronized overlap is not substituted for evidence. See C1 below.
+- **Multi-table concurrent snapshot:** F14 is cross-request only; code supplies HlcBound(0), not a held
+  read timestamp. The checked quiescent reconciliation cut remains necessary.
+- **Admitted work across identity expiry:** no pin binds pre-expiry admission to completion afterwards.
+- **Public SQL KNOWN_NOT_COMMITTED:** unavailable, not declared impossible. Present-resolution mapping
+  preserves typed knowledge if observed, but F11 is synthetic-finalizer only; plain SQL errors cannot be
+  classified as no-effect on this evidence.
+- **Public terminal-exchange fault:** collector controls and ignored-terminal-read code fact only.
+- **Storage-process crash, power loss and independent-client restart:** native tests reopen objects/server
+  state on the same directory; they do not establish those stronger failure models.
+
+**C1 — must-close concurrent mutation gap.** Before A3 diagnostic results claim anything about concurrent
+updates, close C1. A lib-internal `#[cfg(test)]` coordinator read-then-write gate is permitted by Stage A;
+its absence in the integration harness does not mean instrumentation is forbidden. Alternatively, the
+A2/A3 instrument can bind actual operation intervals and report observed lost updates. Unbound timing may
+establish an observed failure, never absence of lost updates. Freeze the selected route and permitted
+orderings at A2 review. Marking C1 unavailable here does not discharge it.
+
+### Bindings on A2
+
+- Use one tenant and synthetic data; F9 must be fixed under separately reviewed scope before multi-tenant
+  or real customer data. G1 also remains a precondition for real multi-row invariants.
+- The ledger owns fresh CSPRNG/v7 operation ids, never deterministic/shared generators. Bind each id to
+  exact request bytes/content hash locally and fsync intent before send; refuse changed bytes under one id.
+- Record acknowledgement, raw typed resolution and independent state separately. Preserve durable
+  delete_counts; affected-rows is not substituted for deleted effect. A missing detailed outcome after
+  capacity pressure does not settle ambiguity or authorize a fresh-id retry.
+- Unknown and Expired remain ambiguous. Do not assume a no-effect class is reachable through public SQL;
+  absent a pinned typed no-effect result, a SQL failure cannot enter `rejected` just because it errored.
+- Serialize conflicting writes until C1 closes. Keep the independent ledger and checked quiescent cut;
+  no cross-request/multi-table snapshot is assumed. Record client-to-storage clock context and review
+  retry/settlement boundaries explicitly. Do not infer universal TTL or capacity windows from one pin.
+
+### Stage B candidates (unselected)
+
+1. Tenant-scoped dedup identity / exact-request binding, with F9 first: false success across authenticated
+   tenants is an integrity defect and a precondition for multi-tenant or real-data use.
+2. G3 dedup-cache retention/eviction.
+3. G4 connection-task reaping.
+4. G2 uniqueness or explicit conflict semantics.
+5. G6 RF/topology plumbing and actual placement/quorum evidence.
+6. G8's unresolved acknowledged-but-unreadable acceptance.
+
+No fix is selected or silently included in these test-only commits. The A2 instrument and any A3 campaign
+require their own review; the 24-hour/72-hour target has not run.
+
+### Retained ladders, provenance and corrections
+
+All ladders run on bigfoot in isolated clean worktrees with Rust1.95.0, SSH agent forwarding and
+RUST_MIN_STACK=67108864. They explicitly reuse a warmed target, with development builds stopped; start/end
+source identity matches. Parts 2/3 print an empty porcelain line; part 1 enforces cleanliness in its script.
+All figures below sum retained test-result lines, not inferred additions or development runs.
+
+| Ladder / source commit / tree | Toron passed/failed/ignored | TPC-H | Client | Steps |
+| --- | --- | --- | --- | --- |
+| ladder-a1-1 / 7a2bbfc1 / 8f8fe010 | 5717/0/20 | 674/0/6 | 24/0/0 | 7 rc0, final0; SQL5/0; connection/cache1 each; fmt0. |
+| ladder-a1-2 / 7cdf4c36 / 86aeac00 | 5719/0/20 | 674/0/6 | 24/0/0 | 11 rc0, final0; SQL7/0; native outcome-store6/0; individual native/connection pins1 each; fmt0. |
+| ladder-a1-3 / 3b1adaee / 2b113e5f | 5722/0/21 | 674/0/6 | 24/0/0 | 16 rc0, final0; SQL10/0/1 plus capacity1/0 separately; outcome-store6/0; native/connection pins1 each; four transport/auth tests1 each; fmt0. |
+
+The extra ignored test is the separately executed capacity control, not missing capacity evidence. Native
+TTL emitting wait is1025ms in ladder2 and1018ms in ladder3; F15's59573ms is ladder3, not the58989ms development
+run. Received enum values replace asserted numeric constants in parts2/3. Existing unused adr589_plain_write
+warning remains; there is no zero-warning/full-Wendelon-suite claim. No release artifact or host staging is
+produced by these characterization packages.
+
+Raw ladders and development runs stay on bigfoot at `~/work/toron-evidence/adr629/ladder-a1-{1,2,3}` and
+`dev-a1`. Exact copied remote sets/hashes are checked:27,40,55 ladder files respectively. Workstation packages
+are `~/work/.agent-bridge/adr629-a1`, `adr629-a1-part2` and `adr629-a1-part3`, with raw logs, source bundles,
+signature verification, remote listings and test summaries. Their SHA256SUMS are:
+- part1: `dd49f92e983312b2fd72596004e2e41ece9aa5c3978c6836b674bb63f10447fa`;
+- part2: `a7a28a3d7764d14a83a0e3598fcd340638cf640d6d9e186bf7d238c2a120b7d5`;
+- part3: `132813106d57228e467fc7d437e237accf27fcf7f86cf64e42e24c323f08c60f`.
+
+Part2's original package is unchanged. Its separately hashed ADDENDUM-1
+(`1bf81c983a480b04cb3383947209e0dfae18f2e86ac512fc8f8ede5ae9f82e83`) corrects attribution of cold expiry:
+non-v7 retained evidence, not v7 timestamp fallback. Claude accepted corrected F10 in01a103e2 and disclosed
+that Claude's first checksum claim preceded a successful check (wrong cwd); the subsequent checks passed. The
+disclosure of the failed check and correction stay in chatd; no original evidence is rewritten.
+
+Development failures and operator slips are retained, not cited as passing evidence:
+- mutation-1: reversed helper integer types; cache-growth-1: expected OK instead of native DUPLICATE;
+  cache-growth-2: used packed response accessor methods as fields.
+- ttl-part2-1: expected Unspecified where native Expired response carried Indeterminate; corrected
+  characterization in ttl-part2-2. An accidental duplicate let binding was caught before testing/commit.
+- mutation-part3-1: expected native Indeterminate at SQL resolution, which maps Unspecified; corrected
+  without changing production semantics. Later controls strengthen typed StorageError and exact row decoding.
+- initial part3 bundle fetch named a nonexistent branch in a HEAD-only bundle; checked HEAD→review-ref
+  fetch succeeded, without changing main/source.
+- during ladder3 compilation, SSH status inspection stalled once and a bounded fresh check timed out.
+  Subsequent inspection found the original ladder active, with I/O pressure and available memory/disk;
+  no restart or source change occurred. The retained build-inspection.json records the observation; a
+  particular cause is not established by these data.
+
+A1 is limited characterization delivered. It is not the assertion that acknowledged writes survive all
+faults, apply once under concurrency, or safely hold real customer data. The ledger and subsequent reviewed
+campaign must expose these gaps rather than turn unavailable evidence into a pass.
