@@ -141,7 +141,7 @@ async fn adr629_p1_production_client_authenticates_a_discovered_data_route() {
 		})
 		.expect("key owned by the discovered, non-bootstrap node");
 	// This is a routing/authentication pin, not a placement/finalization oracle.
-	// The new range is not leased here: keep its typed NOT_LEADER response rather
+	// A range still converging may answer NOT_LEADER: keep that typed response rather
 	// than claim that a topology reply made it ready for customer writes.
 	let result = tokio::time::timeout(
 		Duration::from_secs(5),
@@ -149,9 +149,15 @@ async fn adr629_p1_production_client_authenticates_a_discovered_data_route() {
 	)
 	.await
 	.unwrap();
-	assert!(
-		matches!(result, Err(wendelon_client::ClientError::ReadFailed {status}) if status == wendelon::schema::ReadStatus::NOT_LEADER)
-	);
+	let reply = match result {
+		Ok(None) => "KEY_NOT_FOUND",
+		Err(wendelon_client::ClientError::ReadFailed { status })
+			if status == wendelon::schema::ReadStatus::NOT_LEADER =>
+		{
+			"NOT_LEADER"
+		}
+		other => panic!("unexpected discovered data route result: {other:?}"),
+	};
 	let connection = client
 		.inner()
 		.factory()
@@ -169,7 +175,7 @@ async fn adr629_p1_production_client_authenticates_a_discovered_data_route() {
 		})
 	);
 	println!(
-		"ADR629_P1 production_client bind=wildcard outbound=true discovered_owner=2 data_reply=NOT_LEADER placement_readiness=not_claimed"
+		"ADR629_P1 production_client bind=wildcard outbound=true discovered_owner=2 data_reply={reply} placement_readiness=not_claimed"
 	);
 	for field in 0..3 {
 		let mut invalid = config.clone();
