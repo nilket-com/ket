@@ -194,6 +194,7 @@ use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 mod encoding_compute;
+mod observation;
 mod retention_reclaim;
 mod stats_facts;
 use retention_reclaim::{
@@ -1059,35 +1060,6 @@ impl SlabManager {
 		self.key_localities.remove(&(tenant_id, key_identity));
 	}
 
-	/// Append a record and force the destination slab's durability
-	/// barrier before returning. The manager index is published only
-	/// after the coalesced `fdatasync` succeeds, so callers that
-	/// require durable visibility do not leak
-	/// append-complete-but-unflushed writes through the in-memory
-	/// read path.
-	pub(crate) fn finality_observation_registry(
-		&self,
-	) -> Arc<crate::storage::finality_observation::FinalityObservationRegistry> {
-		self.finality_observation.clone()
-	}
-
-	pub async fn append_durable(
-		&self,
-		tenant_id: TenantId,
-		key_identity: Identity,
-		hlc: HybridTimestamp,
-		frame: &[u8],
-	) -> std::io::Result<RecordLocation> {
-		self.append_durable_with_locality(
-			tenant_id,
-			key_identity,
-			Locality::from(key_identity),
-			hlc,
-			frame,
-		)
-		.await
-	}
-
 	/// Append a record whose routing locality is not the identity
 	/// projection. Typed table writes use this to place row-keyed
 	/// records on table-scoped arcs while preserving `key_identity`
@@ -1100,11 +1072,7 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 		frame: &[u8],
 	) -> std::io::Result<RecordLocation> {
-		let observation = self.finality_observation.begin(
-			crate::storage::finality_observation::WorkScope::Tenant(tenant_id),
-			crate::storage::finality_observation::WorkKind::StoragePublication,
-		);
-		crate::storage::finality_observation::with_work(observation, async {
+		self.observe_publication(tenant_id, async {
 			let superseded = self.latest_location_before(tenant_id, key_identity, hlc);
 			let (slab, location) = self
 				.append_on_target(tenant_id, key_identity, hlc, frame)
@@ -1144,11 +1112,7 @@ impl SlabManager {
 		frame: &[u8],
 		entries: &[MultiRowIndexEntry],
 	) -> std::io::Result<RecordLocation> {
-		let observation = self.finality_observation.begin(
-			crate::storage::finality_observation::WorkScope::Tenant(tenant_id),
-			crate::storage::finality_observation::WorkKind::StoragePublication,
-		);
-		crate::storage::finality_observation::with_work(observation, async {
+		self.observe_publication(tenant_id, async {
 			let Some(primary) = entries.first().copied() else {
 				return Err(Error::new(
 					ErrorKind::InvalidInput,

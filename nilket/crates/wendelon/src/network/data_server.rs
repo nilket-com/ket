@@ -206,6 +206,7 @@ use scan_accounting::{
 };
 mod table_query;
 use table_query::{QueryProjectedExecution, RowGroupFetchAuditCounters};
+mod observation;
 mod write_replication;
 use write_replication::{DurableQuorumTracker, PendingFinalizationClaims, WriteOutcome};
 mod descriptor_migration;
@@ -2501,26 +2502,6 @@ impl WendelonDataServer {
 			WriteStatus::INTERNAL_ERROR
 		};
 		self.counted_write_result(error_response(meta, status, leader_hint), None)
-	}
-
-	#[cfg(test)]
-	pub(crate) fn fail_next_local_durable_append_for_test(
-		&self,
-		kind: ErrorKind,
-		message: impl Into<String>,
-	) {
-		*self
-			.fail_next_local_durable_append
-			.lock()
-			.expect("local durable append failpoint poisoned") = Some((kind, message.into()));
-	}
-
-	#[cfg(test)]
-	pub(crate) fn delay_next_local_durable_append_for_test(&self, delay: Duration) {
-		*self
-			.delay_next_local_durable_append
-			.lock()
-			.expect("local durable append delay failpoint poisoned") = Some(delay);
 	}
 
 	#[cfg(test)]
@@ -8509,11 +8490,7 @@ impl WendelonDataServer {
 		meta: WriteRequestMeta,
 		bifurcated: BifurcatedWrite,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
-		let observation = self.slab.finality_observation_registry().begin(
-			crate::storage::finality_observation::WorkScope::Node,
-			crate::storage::finality_observation::WorkKind::Mutation,
-		);
-		crate::storage::finality_observation::with_work(observation, async {
+		self.observe_node_mutation(async {
 
 		let key = Self::idempotency_key_for(meta.write_id);
 
@@ -8634,36 +8611,11 @@ impl WendelonDataServer {
 				let tenant_id = meta.tenant_id;
 				let key_identity = bifurcated.key_identity;
 				#[cfg(test)]
-				let fail_next_local_durable_append = self.fail_next_local_durable_append.clone();
-				#[cfg(test)]
-				let local_observation_gate = self.local_observation_gate.lock().expect("local observation gate poisoned").take();
-				#[cfg(test)]
-				let delay_local_durable_append = self
-					.delay_next_local_durable_append
-					.lock()
-					.expect("local durable append delay failpoint poisoned")
-					.take();
+				let append_hooks = self.local_append_test_hooks();
 				Some(tokio::spawn(crate::storage::finality_observation::carry_work(async move {
 					#[cfg(test)]
-					if let Some((entered, release)) = local_observation_gate {
-						entered.notify_one();
-						release.notified().await;
-					}
-					#[cfg(test)]
-					if let Some(delay) = delay_local_durable_append {
-						tokio::time::sleep(delay).await;
-					}
-					#[cfg(test)]
-					if let Some((kind, message)) = fail_next_local_durable_append
-						.lock()
-						.expect("local durable append failpoint poisoned")
-						.take()
-					{
-						return Err(Error::new(
-							kind,
-							format!("injected local durable append failure: {message}"),
-						));
-					}
+					append_hooks.before_append().await?;
+
 					slab.append_durable(tenant_id, key_identity, commit_hlc, bytes.as_slice())
 						.await
 				})))
@@ -8897,17 +8849,7 @@ impl WendelonDataServer {
 		permit: OwnedSemaphorePermit,
 		mutation_drain: MutationDrainGuard,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
-		let observation = self.slab.finality_observation_registry().begin(
-			crate::storage::finality_observation::WorkScope::Table(
-				crate::storage::finality_observation::TableScope {
-					tenant: meta.tenant_id,
-					object: meta.table_object_id,
-					generation: meta.schema_generation,
-				},
-			),
-			crate::storage::finality_observation::WorkKind::Mutation,
-		);
-		crate::storage::finality_observation::with_work(observation, async {
+		self.observe_table_write(&meta, async {
 
 		let mut synthetic = table_write_synthetic_meta(
 			&meta,
@@ -9081,38 +9023,13 @@ impl WendelonDataServer {
 			let tenant_id = meta.tenant_id;
 			let secondary_index_descriptors = secondary_index_descriptors.clone();
 			#[cfg(test)]
-			let fail_next_local_durable_append = self.fail_next_local_durable_append.clone();
-			#[cfg(test)]
-			let local_observation_gate = self.local_observation_gate.lock().expect("local observation gate poisoned").take();
-			#[cfg(test)]
-			let delay_local_durable_append = self
-				.delay_next_local_durable_append
-				.lock()
-				.expect("local durable append delay failpoint poisoned")
-				.take();
+			let append_hooks = self.local_append_test_hooks();
 			let task = tokio::spawn(crate::storage::finality_observation::carry_work(async move {
 				let _mutation_permit = mutation_permit;
 				let _mutation_drain = local_mutation_drain;
 				#[cfg(test)]
-				if let Some((entered, release)) = local_observation_gate {
-					entered.notify_one();
-					release.notified().await;
-				}
-				#[cfg(test)]
-				if let Some(delay) = delay_local_durable_append {
-					tokio::time::sleep(delay).await;
-				}
-				#[cfg(test)]
-				if let Some((kind, message)) = fail_next_local_durable_append
-					.lock()
-					.expect("local durable append failpoint poisoned")
-					.take()
-				{
-					return Err(Error::new(
-						kind,
-						format!("injected local durable append failure: {message}"),
-					));
-				}
+				append_hooks.before_append().await?;
+
 				for (index, children) in local_groups {
 					append_bifurcated_table_children_durable(
 						&slab,
@@ -9364,17 +9281,7 @@ impl WendelonDataServer {
 		meta: TableWriteRequestMeta,
 		payload: RecordBatch,
 	) -> std::io::Result<(TableWriteResponseMeta, Option<FinalizationMarker>)> {
-		let observation = self.slab.finality_observation_registry().begin(
-			crate::storage::finality_observation::WorkScope::Table(
-				crate::storage::finality_observation::TableScope {
-					tenant: meta.tenant_id,
-					object: meta.table_object_id,
-					generation: meta.schema_generation,
-				},
-			),
-			crate::storage::finality_observation::WorkKind::Mutation,
-		);
-		crate::storage::finality_observation::with_work(observation, async {
+		self.observe_table_write(&meta, async {
 			metrics().data_ring_write_requests_total.inc();
 			if meta.proxy_hop >= 2 {
 				return Ok((
@@ -9868,17 +9775,7 @@ impl WendelonDataServer {
 		meta: TableDeleteRowsRequestMeta,
 		row_key_ids: Vec<Identity>,
 	) -> std::io::Result<(TableDeleteRowsResponseMeta, Option<FinalizationMarker>)> {
-		let observation = self.slab.finality_observation_registry().begin(
-			crate::storage::finality_observation::WorkScope::Table(
-				crate::storage::finality_observation::TableScope {
-					tenant: meta.tenant_id,
-					object: meta.table_object_id,
-					generation: meta.schema_generation,
-				},
-			),
-			crate::storage::finality_observation::WorkKind::Mutation,
-		);
-		crate::storage::finality_observation::with_work(observation, async {
+		self.observe_table_delete(&meta, async {
 			metrics().data_ring_write_requests_total.inc();
 			if row_key_ids.is_empty() || row_key_ids.len() != meta.row_count as usize {
 				return Ok((
@@ -10295,11 +10192,7 @@ impl DataRing for WendelonDataServer {
 		meta: WriteRequestMeta,
 		payload: RecordBatch,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
-		let observation = self.slab.finality_observation_registry().begin(
-			crate::storage::finality_observation::WorkScope::Tenant(meta.tenant_id),
-			crate::storage::finality_observation::WorkKind::Mutation,
-		);
-		crate::storage::finality_observation::with_work(observation, async {
+		self.observe_tenant_mutation(meta.tenant_id, async {
 			metrics().data_ring_write_requests_total.inc();
 			// 1. Proxy-hop guard — two-hop cap per ADR 003 §2.
 			if meta.proxy_hop >= 2 {
@@ -10354,11 +10247,7 @@ impl DataRing for WendelonDataServer {
 		meta: TableDeleteRowsRequestMeta,
 		row_key_ids: Vec<Identity>,
 	) -> std::io::Result<(TableDeleteRowsResponseMeta, Option<FinalizationMarker>)> {
-		let observation = self.slab.finality_observation_registry().begin(
-			crate::storage::finality_observation::WorkScope::Node,
-			crate::storage::finality_observation::WorkKind::Mutation,
-		);
-		crate::storage::finality_observation::with_work(observation, async {
+		self.observe_node_mutation(async {
 			WendelonDataServer::table_delete(self, meta, row_key_ids).await
 		})
 		.await

@@ -8989,6 +8989,8 @@ fn adr077_data_server_source_concatenates_submodules() {
 			// ADR 542's durable outcome/replay wire is one named protocol seam;
 			// keep its framing and resolution state out of the bounded root.
 			"mutation_protocol.rs",
+			// ADR 629 keeps ownership registration and its test barriers out of the root.
+			"observation.rs",
 			// ADR 541's two clocks and its bounded encode quanta: self-contained
 			// mechanisms with their own invariants, carved so the bounded root
 			// keeps ratcheting down rather than absorbing each new one.
@@ -9235,6 +9237,8 @@ fn adr078_manager_source_concatenates_submodules() {
 			"encoding_compute.rs",
 			"lsm_driver.rs",
 			"maintenance_publication.rs",
+			// ADR 629 counted publication helpers preserve the existing entry points.
+			"observation.rs",
 			"retention_reclaim.rs",
 			"secondary_index_segments.rs",
 			"stats_facts.rs",
