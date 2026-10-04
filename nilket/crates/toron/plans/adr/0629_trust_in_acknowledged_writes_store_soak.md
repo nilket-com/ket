@@ -907,3 +907,123 @@ node for diagnosis. D must project node-wide blockers without exposing other ten
 B must include the same-host/profile write-heavy before/after comparison; C must perform the early
 real-daemon sequence-stability measurement. Slice B is now authorized; later slice review gates,
 origin hold and A3 campaign hold remain.
+
+
+## P2 slice B results (reviewed)
+
+Slice B is cleared as **write-path observation ownership**, not P2 delivered or an A3 oracle.
+Review verdict: chatd `01a10830-9163-71d0-89ae-41bc8e0de607`, answering package request
+`01a1082f-cb0b-71b7-a287-a7090620c928`. Final signed source
+`ba2b4d49d1f9d1bda3590e00d068346804979369`, tree
+`15e8bbb3ae6302d7b039aa184623d3ea4235604a`, review base `3e73c9dc`.
+The signed chain is `d0091978` (ownership), `1f56e64e` (helper carve), `ba2b4d49`
+(four helper-header comment lines). Thirteen Wendelon source/test paths, +2078/-1012;
+indentation-ignored +1182/-116. No amend or force rewrite.
+
+A single registry is shared by SlabManager and its pending-finalization store. Primary raw/table,
+bifurcated and follower entries register ownership synchronously; tokens clone before spawning
+local jobs, JoinSet work and both blocking executors. Publication and actual pending redb jobs
+retain ownership after caller cancellation. Independent pending-store ownership begins before
+waiting for its write lock. Successful DB commit hands off to durable observer debt inside the
+blocking job before its active owner releases, independently of the legacy post-await gauge.
+
+Observer revisions are reserved under the existing redb write transaction before commit. Newer
+committed revisions win when cancelled callers allow handoffs to arrive out of order. The actual
+redb delete-then-new-upsert interleaving is pinned by
+`adr629_p2b_actual_redb_late_delete_shadow_cannot_erase_a_newer_commit`; the reverse ordering is
+covered by the controlled core fixture, not a second actual DB fixture. Unknown commits withhold
+observation. Revision history drains when all reserved updates settle; an indefinitely held handoff
+can retain other intervening versions. This is not a bounded-memory proof under starvation.
+Opening the same pending-store path with a different registry marks both UnknownProducer without
+refusing ordinary service.
+
+Queue and in-flight IO owners accompany the existing buffers through CQE processing. The real
+kernel fixture `adr629_p2b_real_kernel_write_keeps_owner_through_cqe_after_waiter_abort` witnesses
+an actual aligned write, CQE and file bytes after waiter cancellation. Synthetic queue/in-flight
+fixtures are labelled separately. An unknown in-flight exit withholds observation rather than
+claiming kernel cessation. Existing public IoRequest, buffers, replies and kernel behavior remain
+unchanged. No authority mutex is held across awaits or external/store/database locks.
+
+All fourteen B proofs and fifteen retained A proofs pass. Actual redb cancellation, both blocking
+executors, real CQE, detached primary and follower jobs are covered. The primary publication fixture
+explicitly disables its cloned fixture's existing lease gate to isolate ownership; the follower fixture
+disables its pending reconciler to avoid unrelated resolution. These are not authenticated ingress,
+production lease-policy or remote-cancellation claims.
+
+The cancelled-upsert gauge discrepancy is a pinned **pre-existing finding**: the authoritative DB
+contains one pending record while the legacy count remains zero after caller cancellation. The
+observer retains its debt. The gauge defect is not repaired here and remains a separate candidate.
+Stored concurrency gaps and sensitive-customer trust are not closed by this slice.
+
+### Pinned ladder and retained failures
+
+Bigfoot `~/work/toron-evidence/adr629/ladder-p2-b-3`: clean, identical start/end source/tree as above,
+Rust 1.95.0, all ten step statuses and final status zero. Counts include libtest/documentation summaries:
+
+| Suite | Passed | Failed | Ignored |
+| --- | ---: | ---: | ---: |
+| Toron | 5729 | 0 | 25 |
+| toron-tpch | 674 | 0 | 6 |
+| toron-client | 24 | 0 | 0 |
+| Wendelon, serialized | 2100 | 0 | 10 |
+| Wendelon-client | 13 | 0 | 0 |
+| A+B focused proofs | 29 | 0 | 0 |
+| Real config pin | 1 | 0 | 0 |
+
+Formatting and both release builds pass; release warnings zero. The dedicated worktree and warm target
+are declared, not a clean-build claim. Release daemon SHA256
+`e82b7513aec0b5897996bfa687a4a427f8a16d70b814b0d3b6cf44513d5f21db`, probe SHA256
+`911bbc8cfe5491c86b6a0100c48035cb0922facd289d023cb3f1c35b64793f3f`.
+No artifacts are deployed by this record.
+
+Both failed pinned ladders remain retained. Ladder 1 failed the unchanged root caps; synchronous
+helpers reduced data_server.rs to 16329/16340 and manager.rs to 4630/4650. Their explicit architecture
+source manifests include both helper modules. Ladder 2 failed two AST source-concatenation checks
+because inner module doc comments appeared mid-file. Exactly four header comment lines in both
+helpers were changed to ordinary comments; no parser guard or cap was weakened. Development 7's
+initial missing source-manifest entries and development 9's corrected architecture/AST/focused results
+remain retained. The whole serialized Wendelon development precheck passed 2100/0/10 before final
+signing, with all thirteen candidate paths matching by hash. All ten development roots and original
+baseline overhead captures, including failures, remain separate from final ladder evidence.
+
+### Matched overhead regression check
+
+Bigfoot `~/work/toron-evidence/adr629/p2b-overhead-interleaved` compares base `3e73c9dc` with final
+source `ba2b4d49`. The existing real-node
+`adr0539_two_ordinary_sampler_sized_ingest_cycles_remain_readable` is used solely as a coarse ingest
+regression check; it remains an ADR 539 smoke test, not that ADR's correctness acceptance or an exhaustive
+hot-path benchmark. Existing codec/packing/crypto benches do not exercise these changed paths.
+Each side/profile has one warm-up and five measured invocations, alternating pair order, on the same
+host/toolchain/target. All four binaries were built and copied before measurements; all 24 invocations
+passed. Wall seconds below are read directly from retained `*.time` files; libtest's independently
+rounded test-duration summaries are preserved separately in the package.
+
+| Profile | Side | Wall seconds median | Wall seconds min–max | Max RSS KiB median | Max RSS KiB min–max |
+| --- | --- | ---: | --- | ---: | --- |
+| Debug | Before | 41.11 | 40.96–41.97 | 151000 | 145540–155796 |
+| Debug | After | 41.83 | 40.79–42.08 | 154644 | 152636–157764 |
+| Release | Before | 7.30 | 6.94–7.36 | 101416 | 96036–108032 |
+| Release | After | 7.36 | 7.05–7.66 | 103332 | 98032–107844 |
+
+Wall-time median differences are about +1.8% debug and +0.8% release, with overlapping ranges:
+no regression signal at this resolution. This does not establish zero CPU/allocation overhead or
+performance under stalled handoffs. Raw samples, per-run load snapshots, build/source identities,
+full binary hashes and memory figures are retained; no failed-source overhead run was used.
+
+### Provenance and next gate
+
+Workstation package `~/work/.agent-bridge/adr629-p2-b-r3/`:
+345-file SHA256SUMS `9ca9aa48495cec0b38dbcc7862489f9a7933c7782628c4badd0a83cb85a5f33d`;
+review.md `0b64bc557a0b4ec6bf82aadd81729ec4810e7807f537c69bdf6e75bdeed1ed94`.
+Exact remote/local file sets and every copied hash verify for final ladder/overhead, both failed
+ladders and all development captures. Four overhead binaries remain on bigfoot, explicitly listed
+as remote-only with hashes; no local retention of those binaries is claimed. The source bundle and
+all three source signatures verify. Source is promoted only to bigfoot main; origin remains held.
+
+Production observation coverage remains unavailable. No observer actor, opcode, endpoint or usable
+cut is enabled. Slice C is now authorized, beginning **first** with the required real-daemon sequence
+stability measurement, synthetic client work stopped and background maintenance running normally.
+Report that diagnostic before the rest of C; unattainable windows return for a scope decision.
+Then cover startup durable initialization, recovery completion scope matching, replay, metadata,
+drop/retention, peer and unmapped producers. The whole serialized Wendelon suite is a pre-signing
+check for C. D/E and A3 remain held behind their separate review gates.
