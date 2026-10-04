@@ -830,13 +830,18 @@ fn normalize_config(
 			endpoint,
 		});
 	}
-	let wendelon_client_bind = normalize_wendelon_client_bind(&raw.storage.wendelon.client_bind)?;
 	let wendelon_tls = normalize_wendelon_tls_config(
 		raw.storage.wendelon.tls_cert_path,
 		raw.storage.wendelon.tls_key_path,
 		raw.storage.wendelon.tls_ca_path,
 		base_dir,
 	)?;
+	if wendelon_tls.is_some() {
+		validate_cluster_domain(&raw.storage.wendelon.cluster_domain)
+			.map_err(|error| invalid(error.to_string()))?;
+	}
+	let wendelon_client_bind =
+		normalize_wendelon_client_bind(&raw.storage.wendelon.client_bind, wendelon_tls.as_ref())?;
 	let observability = normalize_observability_config(raw.observability, tls.is_some(), base_dir)?;
 	let audit = normalize_audit_config(raw.audit, base_dir)?;
 	let listener_addresses = listener_bind_addresses(
@@ -1375,11 +1380,14 @@ fn normalize_sql_nonzero_u32(
 	Ok(NonZeroU32::new(value).expect("validated nonzero SQL byte cap"))
 }
 
-fn normalize_wendelon_client_bind(raw: &str) -> Result<SocketAddr, ToronConfigError> {
+fn normalize_wendelon_client_bind(
+	raw: &str,
+	tls: Option<&WendelonTlsConfig>,
+) -> Result<SocketAddr, ToronConfigError> {
 	let addr = raw
 		.parse::<SocketAddr>()
 		.map_err(|error| invalid(format!("invalid storage.wendelon.client_bind: {error}")))?;
-	if !addr.ip().is_loopback() {
+	if !addr.ip().is_loopback() && tls.is_none() {
 		return Err(invalid(
 			"storage.wendelon.client_bind must remain loopback until authenticated remote transport is configured",
 		));

@@ -1394,3 +1394,101 @@ fn adr463_worker_query_budget_knobs_parse_override_and_reject_zero() {
 	std::fs::write(&path, zeroed).expect("write zero config");
 	assert!(load_toron_bootstrap_config(&path).is_err());
 }
+
+// ADR 629 P1: parser permission is separate from authenticated startup.
+fn adr629_storage_bind_config(bind: &str, tls_mask: u8, domain: &str) -> String {
+	let mut text = render_example_config().replace(
+		"client_bind = \"127.0.0.1:0\"",
+		&format!("client_bind = \"{bind}\""),
+	);
+	for (bit, field, path) in [
+		(1, "tls_cert_path", "certs/client.crt"),
+		(2, "tls_key_path", "certs/client.key"),
+		(4, "tls_ca_path", "certs/ca.crt"),
+	] {
+		if tls_mask & bit != 0 {
+			text = text.replace(&format!("# {field} ="), &format!("{field} ="));
+			assert!(text.contains(&format!("{field} = \"{path}\"")));
+		}
+	}
+	text.replacen(
+		"# cluster_domain = \"cluster.local\"",
+		&format!("cluster_domain = \"{domain}\""),
+		1,
+	)
+}
+
+#[test]
+fn adr629_p1_storage_bind_requires_complete_tls_for_non_loopback() {
+	let dir = fresh_dir("adr629-p1-bind");
+	let path = dir.join("toron.toml");
+	for bind in [
+		"127.0.0.1:0",
+		"[::1]:0",
+		"192.168.0.2:0",
+		"0.0.0.0:0",
+		"[::]:0",
+	] {
+		for mask in 0..8 {
+			std::fs::write(
+				&path,
+				adr629_storage_bind_config(bind, mask, "cluster.local"),
+			)
+			.unwrap();
+			let result = load_toron_bootstrap_config(&path);
+			let loopback = bind
+				.parse::<std::net::SocketAddr>()
+				.unwrap()
+				.ip()
+				.is_loopback();
+			if mask == 7 || (mask == 0 && loopback) {
+				let config = result.expect("permitted config; does not load TLS material");
+				assert_eq!(config.storage.wendelon.client_bind.to_string(), bind);
+				assert_eq!(config.storage.wendelon.tls.is_some(), mask == 7);
+			} else {
+				let error = result
+					.expect_err("partial/missing TLS is not LAN authorization")
+					.to_string();
+				if mask == 0 {
+					assert!(error.contains("must remain loopback"), "{error}");
+				} else {
+					assert!(
+						error.contains(
+							"requires tls_cert_path, tls_key_path, and tls_ca_path together"
+						),
+						"{error}"
+					);
+				}
+			}
+		}
+	}
+	std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn adr629_p1_storage_tls_domain_and_bind_are_validated() {
+	let dir = fresh_dir("adr629-p1-domain");
+	let path = dir.join("toron.toml");
+	for domain in ["", "bad..domain", "bad domain", "-bad.test", "bad-.test"] {
+		std::fs::write(
+			&path,
+			adr629_storage_bind_config("192.168.0.2:0", 7, domain),
+		)
+		.unwrap();
+		assert!(
+			load_toron_bootstrap_config(&path).is_err(),
+			"domain {domain:?}"
+		);
+	}
+	std::fs::write(
+		&path,
+		adr629_storage_bind_config("not-an-address", 7, "cluster.local"),
+	)
+	.unwrap();
+	let error = load_toron_bootstrap_config(&path).unwrap_err().to_string();
+	assert!(
+		error.contains("invalid storage.wendelon.client_bind"),
+		"{error}"
+	);
+	std::fs::remove_dir_all(dir).unwrap();
+}

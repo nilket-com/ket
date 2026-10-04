@@ -247,20 +247,16 @@ fn adr629_response_scalar_encoding_is_exact_and_refuses_unreviewed_types() {
 
 #[test]
 #[ignore = "ADR 629 development-only config parsing; opens no listeners"]
-fn adr629_real_config_loaders_report_the_topology_precondition() {
+fn adr629_p1_real_config_loaders_accept_tls_configured_storage_binds() {
 	let root = PathBuf::from(
 		std::env::var("TORON_ADR629_CONFIGS").expect("isolated config test directory"),
 	);
 	for host in ["bigfoot", "strix", "optiplex"] {
 		let path = root.join(format!("{host}.toron.toml"));
-		let error = toron::config::load_toron_bootstrap_config(&path)
-			.expect_err("current loader refuses direct-LAN client bind");
-		assert!(
-			error
-				.to_string()
-				.contains("storage.wendelon.client_bind must remain loopback"),
-			"{error}"
-		);
+		let direct = toron::config::load_toron_bootstrap_config(&path)
+			.expect("TLS-configured LAN bind is permitted; not startup evidence");
+		assert!(direct.storage.wendelon.tls.is_some());
+		assert!(!direct.storage.wendelon.client_bind.ip().is_loopback());
 		let control = root.join(format!("{host}.toron.loopback-control.toml"));
 		std::fs::write(
 			&control,
@@ -280,7 +276,7 @@ fn adr629_real_config_loaders_report_the_topology_precondition() {
 		.expect("Wendelon config loader");
 		assert_eq!(w.rf, 3);
 		println!(
-			"ADR629_CONFIG host={host} toron_lan_bind_rejected=true loopback_control_parsed=true wendelon_parsed=true requested_rf=3 startup_not_exercised=true placement_observed=false"
+			"ADR629_CONFIG host={host} toron_tls_lan_bind_permitted=true loopback_control_parsed=true wendelon_parsed=true requested_rf=3 startup_not_exercised=true placement_observed=false"
 		);
 	}
 }

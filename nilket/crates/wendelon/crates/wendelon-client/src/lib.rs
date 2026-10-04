@@ -33,7 +33,7 @@ use wendelon::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use wendelon::network::factory::TransportProviderFactory;
 use wendelon::network::pool::BufPool;
 use wendelon::network::quic_transport::{
-	QuicTransportProvider, canonical_server_name_resolver, endpoint_from_tls,
+	QuicTransportProvider, canonical_server_name_resolver, client_endpoint_from_tls,
 };
 use wendelon::network::tls::{DEFAULT_CLUSTER_DOMAIN, TlsMaterial};
 use wendelon::network::transport::{
@@ -630,7 +630,7 @@ impl Client {
 			&config.tls.key_path,
 			&config.tls.ca_path,
 		)?;
-		let endpoint = Arc::new(endpoint_from_tls(&tls, config.bind_addr)?);
+		let endpoint = Arc::new(client_endpoint_from_tls(&tls, config.bind_addr)?);
 		let server_name = canonical_server_name_resolver(config.cluster_domain.clone());
 		let provider: Arc<dyn TransportProvider> =
 			Arc::new(QuicTransportProvider::with_cluster_domain(

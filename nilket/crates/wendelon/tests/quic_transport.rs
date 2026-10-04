@@ -36,9 +36,9 @@ use wendelon::network::{
 	NodeRoleSet, PeerCapabilities, QuicTransportProvider, ServerAdmissionConfig, ServerLifecycle,
 	TcpTlsTransportProvider, TlsMaterial, TransportConnection, TransportProvider,
 	TransportProviderFactory, TransportTier, TransportTierSet, UnroutedService,
-	canonical_node_dns_name, canonical_server_name_resolver, client_config, endpoint_from_tls,
-	read_frame, rustls_client_config, serve_with_admission, server_config, verified_transport_peer,
-	write_frame,
+	canonical_node_dns_name, canonical_server_name_resolver, client_config,
+	client_endpoint_from_tls, endpoint_from_tls, read_frame, rustls_client_config,
+	serve_with_admission, server_config, verified_transport_peer, write_frame,
 };
 use wendelon::node::{
 	ClusterBootstrapConfig, NodeBootstrapConfig, SeedNodeConfig, TransportTlsConfig, WendelonNode,
@@ -1191,4 +1191,166 @@ async fn transport_peer_verification_rejects_operator_client_over_real_quic() {
 	server_endpoint.close(0u32.into(), b"done");
 	operator_endpoint.wait_idle().await;
 	server_endpoint.wait_idle().await;
+}
+
+#[tokio::test]
+async fn adr629_p1_client_endpoint_keeps_peer_streams_without_admitting_unsolicited_connections() {
+	let root = fresh_dir("adr629-p1-client-only");
+	let pki = tls_pki::write_test_pki(&root.join("pki"));
+	let server_material =
+		TlsMaterial::load(&pki.server_cert, &pki.server_key, &pki.ca_cert).unwrap();
+	let client_material =
+		TlsMaterial::load(&pki.data_client_cert, &pki.data_client_key, &pki.ca_cert).unwrap();
+	let server_endpoint =
+		endpoint_from_tls(&server_material, "127.0.0.1:0".parse().unwrap()).unwrap();
+	let client_endpoint =
+		client_endpoint_from_tls(&client_material, "0.0.0.0:0".parse().unwrap()).unwrap();
+	let server = tokio::spawn({
+		let endpoint = server_endpoint.clone();
+		async move {
+			let connection = endpoint.accept().await.unwrap().await.unwrap();
+			assert_eq!(
+				verified_transport_peer(&connection, tls_pki::CLUSTER_DOMAIN)
+					.unwrap()
+					.node_id
+					.id,
+				2
+			);
+			let (mut send, mut recv) = connection.open_bi().await.unwrap();
+			send.write_all(b"peer-opened").await.unwrap();
+			send.finish().unwrap();
+			let body = recv.read_to_end(1024).await.unwrap();
+			assert_eq!(body, b"client-reply");
+			connection
+		}
+	});
+	let connection = tokio::time::timeout(
+		std::time::Duration::from_secs(5),
+		client_endpoint
+			.connect(
+				server_endpoint.local_addr().unwrap(),
+				&canonical_node_dns_name(1, tls_pki::CLUSTER_DOMAIN),
+			)
+			.unwrap(),
+	)
+	.await
+	.expect("outgoing handshake guard")
+	.unwrap();
+	let (mut send, mut recv) =
+		tokio::time::timeout(std::time::Duration::from_secs(5), connection.accept_bi())
+			.await
+			.unwrap()
+			.unwrap();
+	assert_eq!(recv.read_to_end(1024).await.unwrap(), b"peer-opened");
+	send.write_all(b"client-reply").await.unwrap();
+	send.finish().unwrap();
+	let _peer_connection = server.await.unwrap();
+	let client_addr =
+		std::net::SocketAddr::from(([127, 0, 0, 1], client_endpoint.local_addr().unwrap().port()));
+	let incoming = server_endpoint
+		.connect(
+			client_addr,
+			&canonical_node_dns_name(2, tls_pki::CLUSTER_DOMAIN),
+		)
+		.unwrap();
+	// A bounded observation is NOT TLS rejection or LAN reachability evidence.
+	let observation = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+		tokio::select! {
+			incoming = incoming => panic!("unexpected incoming dial completion: {incoming:?}"),
+			accepted = client_endpoint.accept() => panic!("unsolicited incoming accepted: {accepted:?}"),
+		}
+	})
+	.await;
+	assert!(observation.is_err());
+	assert_eq!(client_endpoint.stats().accepted_handshakes, 0);
+	assert_eq!(client_endpoint.stats().outgoing_handshakes, 1);
+	println!(
+		"ADR629_P1 unsolicited_dial=observation_expired accepted_in_window=false peer_stream_positive=true; not TLS rejection evidence"
+	);
+	assert_eq!(
+		client_endpoint.open_connections(),
+		1,
+		"only the outgoing connection exists; no unsolicited handler was created"
+	);
+	client_endpoint.close(0u32.into(), b"done");
+	server_endpoint.close(0u32.into(), b"done");
+	client_endpoint.wait_idle().await;
+	server_endpoint.wait_idle().await;
+}
+
+#[tokio::test]
+async fn adr629_p1_old_server_helper_requires_a_trusted_client_certificate() {
+	let root = fresh_dir("adr629-p1-inbound-mtls");
+	let pki = tls_pki::write_test_pki(&root.join("pki-a"));
+	let other = tls_pki::write_test_pki(&root.join("pki-b"));
+	let server_material =
+		TlsMaterial::load(&pki.server_cert, &pki.server_key, &pki.ca_cert).unwrap();
+	for absent in [false, true] {
+		let server_endpoint =
+			endpoint_from_tls(&server_material, "127.0.0.1:0".parse().unwrap()).unwrap();
+		let client_endpoint = if absent {
+			let mut tls = rustls::ClientConfig::builder()
+				.with_root_certificates(server_material.ca_roots.clone())
+				.with_no_client_auth();
+			tls.alpn_protocols = vec![wendelon::network::tls::HRFT_ALPN.to_vec()];
+			let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+			let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+			endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+			endpoint
+		} else {
+			// Presents a CA-B identity but trusts CA-A: server judges the client.
+			let material = TlsMaterial::load(
+				&other.data_client_cert,
+				&other.data_client_key,
+				&pki.ca_cert,
+			)
+			.unwrap();
+			client_endpoint_from_tls(&material, "127.0.0.1:0".parse().unwrap()).unwrap()
+		};
+		let server = tokio::spawn({
+			let endpoint = server_endpoint.clone();
+			async move {
+				let incoming = endpoint
+					.accept()
+					.await
+					.expect("drive the server accept path");
+				incoming
+					.await
+					.expect_err("server must reject before any stream handler")
+			}
+		});
+		let dial = client_endpoint
+			.connect(
+				server_endpoint.local_addr().unwrap(),
+				&canonical_node_dns_name(1, tls_pki::CLUSTER_DOMAIN),
+			)
+			.unwrap();
+		let (dial_result, server_result) =
+			tokio::time::timeout(std::time::Duration::from_secs(5), async {
+				let result = dial.await;
+				(result, server.await.unwrap())
+			})
+			.await
+			.expect("timeout does not count as a TLS rejection");
+		println!(
+			"ADR629_P1 inbound_client_absent={absent} server_tls_error={server_result:?} client_dial_succeeded={}",
+			dial_result.is_ok()
+		);
+		match server_result {
+			quinn::ConnectionError::TransportError(error) => {
+				let code: u64 = error.code.into();
+				assert!((0x100..=0x1ff).contains(&code), "{error:?}");
+				let reason = error.reason.to_ascii_lowercase();
+				assert!(
+					reason.contains("certificate") || reason.contains("unknownissuer"),
+					"{error:?}"
+				);
+			}
+			other => panic!("not an observed TLS certificate rejection: {other:?}"),
+		}
+		client_endpoint.close(0u32.into(), b"done");
+		server_endpoint.close(0u32.into(), b"done");
+		client_endpoint.wait_idle().await;
+		server_endpoint.wait_idle().await;
+	}
 }

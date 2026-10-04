@@ -195,10 +195,20 @@ impl QuicTransportProvider {
 	}
 }
 
+/// Bind an outgoing-only endpoint. Existing authenticated connections may still
+/// carry peer-opened streams; unsolicited new connections have no server config.
+pub fn client_endpoint_from_tls(
+	material: &TlsMaterial,
+	bind_addr: SocketAddr,
+) -> std::io::Result<quinn::Endpoint> {
+	let mut endpoint = quinn::Endpoint::client(bind_addr)?;
+	endpoint.set_default_client_config(client_config(material)?);
+	Ok(endpoint)
+}
+
 /// Bind a `quinn::Endpoint` with Wendelon's transport mTLS posture:
 ///
-/// * the endpoint presents `material` as both its server and client
-///   identity,
+/// * the endpoint presents `material` as both its server and client identity,
 /// * inbound peers must present a cert chaining to the trusted CA,
 /// * outbound dials always use client-auth as well.
 pub fn endpoint_from_tls(
