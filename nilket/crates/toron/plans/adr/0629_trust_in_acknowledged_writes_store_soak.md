@@ -3,7 +3,8 @@
 **Status:** STAGE A A1 CHARACTERIZED and A2 REVIEWED INSTRUMENT DEVELOPMENT (limited diagnostic coverage).
 A3 is HELD on P1–P4: authenticated reachable storage route, non-destructive finality observation, stored-effect
 concurrency coverage where claimed, and real three-node readiness/placement/ingress checks. Stage B P1/P2
-is selected for plan review; no production implementation is cleared. Stage C remains separately reviewed.
+scope is reviewed; P1 implementation is authorized within that scope, with its package/ladder review before
+staging. P2 coverage inventory may proceed as reading/design; its production work waits for P1 submission. Stage C remains separately reviewed.
 This is not trust, durability or security acceptance for a store.
 
 **A correctness, integrity and security-evidence record. Wi-Fi is a supported target. No performance claim
@@ -598,3 +599,45 @@ The actual Toron loader rejects LAN storage client binds even with TLS, contrary
 Exports can be structurally checked and observed differences reported, but reconcile remains WITHHELD. The proposed 120 s observation budget, quiet intervals, TTL/Expired results, connection closure and metrics are not storage finality. The available MutationDrainRegistry wait is DROP-coupled, so the instrument does not destroy customer tables to manufacture a cut. No durability, exactly-once, transaction or security acceptance follows. Marker/resource/clock helpers cover declared evidence only, with missing or failed collection unavailable; no uncollected sink is certified.
 
 Provenance: original reviewed package /home/me/work/.agent-bridge/adr629-a2 (SHA256SUMS 3a76bf2b...), plus revision /home/me/work/.agent-bridge/adr629-a2-r2, with SHA256SUMS 089a4a895aa273c28a72f5814e715303063d5392cb929ad9dfc100c2978bc229 over 110 files. Complete ladder logs are retained on bigfoot under /home/me/work/toron-evidence/adr629/ladder-a2-1; mirrored review packages and labelled synthetic/adapter development artifacts remain separate from any A3 campaign.
+
+
+## Stage B P1 scope (reviewed)
+
+User order: P1/P2 first to unblock a separately reviewed A3 readiness and diagnostic package. Scope verdict: chatd 01a1065f-fdc4-72c2-98cc-38880ad2477c, reviewing draft c272559ae4a8acf254849f35e3a9287d5e3ed66e0f7fc11fe6b2acf84c411160. Production helper or semantics changes outside this scope return for review. F16/F17, F9, growth and G2 are not bundled. Origin publication remains held.
+
+## P1: permit an authenticated storage client to bind a reachable local address
+
+### Established problem and alternatives
+
+`toron/src/config.rs:833-840` normalizes the client bind before its storage TLS configuration. `normalize_wendelon_client_bind` at :1378 rejects every non-loopback address, although its message says "must remain loopback until authenticated remote transport is configured". P1 fixes this missing condition; the guard is not a deliberate ban on authenticated remote storage.
+
+A2's real-loader refusal and loopback control distinguish config parsing from deployment. Wendelon's client initially bootstrapped locally chooses advertised remote owners after `ControlRingTopologySource` refresh; the new routing pin resolves the remote leader directly. `factory.get_connection(target)` dials that target. Proxy-hop handling does not prove transparent local forwarding. Alternatives are therefore: (a) TLS-conditional reachable bind, proposed here; (b) explicit ingress-pinned proxying, which changes routing/failure semantics and is deferred; (c) relaxing all binds without TLS, rejected; (d) retaining loopback under an unproven forwarding assumption, not readiness evidence.
+
+### Exact semantics proposed
+
+Normalize the complete storage TLS configuration first, preserving its all-or-none requirement. A loopback bind remains accepted with or without storage TLS as today. A wildcard or a concrete non-loopback local bind is accepted only when the storage TLS tuple is complete and its configured cluster domain is valid. Partial TLS, malformed addresses and missing TLS on a non-loopback bind fail closed. Port 0 remains a permitted outgoing client bind; this does not weaken worker/SQL advertised-address checks.
+
+Configuration completeness grants permission to attempt authenticated startup, not proof that the certificate is valid. Real material loading and identity/role validation must succeed before readiness. Wrong certificate, key, CA, domain, node SAN or role must not fall back to plaintext or the static unauthenticated RF1 branch. No membership, owner selection, RF, quorum, storage admission, SQL tenant identity, or mutation-result semantics change.
+
+The authenticated branch remains `wendelon-client::Client::connect_quic`, with dynamic ring refresh. A2's LAN-refusal pin becomes a superseded characterization pin mapped to the TLS-conditional invariant; old evidence stays unchanged. The source should contain the new invariant, not a test that expects the old refusal after the fix.
+
+### Security argument and boundaries
+
+The outbound storage path currently builds QUIC+TLS from certificate/key/root material, dials canonical node names and verifies the peer's DataNode role, cluster domain and exact target node (`quic_transport.rs`, `tls.rs`). The receiving storage service must continue to authenticate/authorize the presenting actor for each data/control/peer operation. Configured paths alone do not bypass those gates. Freeze the actual presenting storage actor and trust roots in the implementation package; do not treat Toron SQL tenant certificates or monitor/operator identities as peer certificates.
+
+`endpoint_from_tls` uses an Endpoint::server and installs a client configuration. Moving that socket to a LAN address therefore also exposes its QUIC handshake surface even though the storage client has no application accept loop. The implementation review must inventory inbound behavior, bound accepted/pending handshake resources and prove no data/control service is accidentally served by that client endpoint. If a safe outbound-only endpoint requires a helper change, bring that change back as a scoped P1 amendment; do not silently change the shared server helper. P1 is not a general authentication/access-control fix, and F9 remains a recorded tenant-isolation limit.
+
+Negative tests: non-loopback without TLS; each partial TLS tuple; missing/unreadable/bad key/material; wrong CA/domain/node SAN; valid certificate of the wrong role; an untrusted inbound connection to the client socket; trusted inbound traffic must not invoke a data/control handler. Positive tests: old loopback behavior; TLS with wildcard/concrete client bind; dynamic refresh to a different storage owner over the real authenticated path. Validate the rejection point and unchanged state, not just a timeout. Config tests do not substitute for real TLS tests.
+
+### Evidence, ladder and rollback
+
+Unit loader invariants and real transport tests come first on loopback/one host; observed client target/address and peer identity are recorded. Then the pinned full Toron/TPC-H/client ladder plus affected Wendelon/TLS tests and release builds in an unchanged worktree, Rust 1.95.0, signed commits, retained failures. Actual three-host startup, joins, RF/quorum/placement and role controls belong to the separately reviewed A3 readiness package.
+
+Rollback: stop affected Toron clients cleanly before reverting code/config. A previous binary rejects the new LAN bind, so code rollback alone cannot leave such config running. Reverting to loopback does not claim a working remote ring; keep multi-node readiness false unless an independently proven route exists. P1 changes no on-disk data format, trust roots or firewall rules. No running storage node is reset to RF1 as a shortcut.
+
+### Reviewed deployment and inbound refinements
+
+Use each host's concrete LAN address with port 0 in the proposed A3 client configuration rather than wildcard binding. Readiness must observe stateful-firewall return traffic to the ephemeral QUIC client port and whether unsolicited inbound traffic is dropped or rejected. Record those observations rather than infer them from prior UDP 7701–7703 or port 5201 openings. No firewall change is authorized; any required change is a user decision at A3.
+
+Inventory whether server_config(material) requires and verifies inbound client certificates. Where it does, pin an untrusted peer's TLS rejection point explicitly; a timeout is not rejection evidence. If it does not, return for the outbound-only client-helper sub-amendment. Also distinguish verifier configuration from whether the client endpoint actually drives inbound TLS; an absent application accept loop is not proof of certificate rejection.
+
