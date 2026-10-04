@@ -798,3 +798,66 @@ No artifacts are installed by this record. A3 must still freeze concrete LAN bin
 ports, successful routes to every required node, placement/readiness and actual return-path/unsolicited
 firewall observations. No firewall change is authorized. Separate candidates are isolation of the flaky
 maintenance metric test and the CLI's existing server-mode client endpoint; neither is changed in P1.
+
+## P2 observation authority selection (reviewed)
+
+User decision and design clearance: chatd `01a10747-ce8c-704f-9852-3900d870bb27`. The user selects
+**option A, the full observation authority**, accepting the additional implementation effort. The reviewed
+inventory is `~/work/.agent-bridge/adr629-p2/review.md` SHA256
+`de6141a957c5897645d041f85323a2a11cc3d1abcd2fb4a251894bcedf00f38e`, with verified package manifest
+`31fc64c0f826886cafc5414333558872c945d24a51553efc3352a3eb0910a76d`.
+Existing DROP-drain and pending-store gauges cannot certify complete coherent finality. The selected design
+extends observation authority; it does not impose a DROP closure, mutation admission fence or new outcome
+semantics. Unmapped work and unavailable evidence withhold observation coverage.
+
+Option B was considered as a cheaper ledger-scoped observed-state diagnostic, not an equivalent stable cut.
+Its assessment and source references remain at `~/work/.agent-bridge/adr629-p2-alternative-b/assessment.md`
+SHA256 `bcd7ddf3fbf644737d748ab8cb24a49a97e49f33a0e85b8225efb42dd370248f`, package manifest
+`1e08af0d84d8345b171b7a550a465412bcbe2f0992941b6cfa44dd7f68c1f190`.
+Final-row equality cannot generally count duplicate applications, certify continuous retention, or exclude
+metadata A→B→A transitions between samples. Blanket SQL-success-to-exact-publication binding is false on
+A1's characterized paths. Those corrections remain in the alternatives record; B is not substituted for P2.
+
+### Selected authority and credential
+
+A short synchronous node-local mutex owns checked activity sequence, fresh process incarnation, owned work
+and durable shadow obligations. It is never held across awaits or while taking storage, Raft or database
+locks. Observation tokens move or clone into detached futures and blocking closures before spawn; persistent
+shadow debt is registered before the active owner releases. Metadata uses a sequence-validated collect,
+not independent zero gauges. Unknown variants, unmapped producers, missing peers, partial startup or
+unreadable state report unavailable. This is an observation-only mechanism; registration must not alter
+mutation admission, acknowledgement, retries, cancellation, retention or durability semantics.
+
+The conservative node-wide sequence and blocking are selected subject to an early practicality check.
+Slice C measures actual idle-client sequence advancement on a real synthetic daemon before A3. If continuous
+maintenance makes stable windows unattainable, return for a scope decision (for example, proving and
+separating physical from logical publication). No such separation is assumed or silently implemented.
+
+The dedicated `FinalityObserver` actor chains to Ops roots, holds only `FinalityObserve`, has no node SAN,
+and carries exact `finality:<object>:<generation>` claims for one tenant. Proposed control pair 0x5E/0x5F,
+wire version 1, at most 16 scopes and 64 KiB metadata. All existing permissions/opcodes and other roles are
+negative tests on both QUIC and TCP; old peers are unsupported, never zero. Indistinguishable deployed
+Ops/Data roots limit the cryptographic trust-domain claim and must be disclosed.
+
+### Implementation and review gates
+
+Proceed A→E, with a separate immutable source/evidence package and pinned ladder reviewed **after each
+slice and before the next**:
+
+1. A: observation core and deterministic barrier fixtures for admission/snapshot, owned release,
+   zero→zero activity, overflow, poison/unavailable, unknown features, metadata collect and incarnation.
+   No DROP or write-outcome change; lock-order proof is included.
+2. B: table/raw primary/follower and detached/blocking-work coverage; zero-gap persistent handoffs and
+   cancellation pins. From B onward, each package includes a before/after existing write-heavy test or
+   benchmark on the same host/profile, read from retained artifacts. This is a regression gate, not a
+   performance claim; a large regression returns for decision.
+3. C: startup/recovery/replay, control metadata and maintenance publication coverage, including the early
+   real-daemon sequence-stability measurement above.
+4. D: narrow actor, bounded wire/client and exhaustive authorization/old-peer negatives.
+5. E: actual stable export bracketing and refusal readers through real daemon/client paths. Host schedule,
+   counts, bounds and readiness remain a later freeze/review.
+
+If B or C cannot retain obligations without changing mutation semantics, stop and request the explicit
+authority/fence amendment. An always-unavailable observer is safe but is not P2 delivered or A3 ready.
+This selection authorizes slice A first; source integration and staging remain independently reviewed.
+Bigfoot fast-forward publication only; origin remains held.
