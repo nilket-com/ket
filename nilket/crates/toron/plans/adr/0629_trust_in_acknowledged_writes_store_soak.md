@@ -861,3 +861,49 @@ If B or C cannot retain obligations without changing mutation semantics, stop an
 authority/fence amendment. An always-unavailable observer is safe but is not P2 delivered or A3 ready.
 This selection authorizes slice A first; source integration and staging remain independently reviewed.
 Bigfoot fast-forward publication only; origin remains held.
+
+## P2 slice A results (reviewed)
+
+Slice A is cleared as a **dormant observation core**, not P2 delivered or an A3 oracle. Review verdict:
+chatd `01a10770-e2cf-71db-9e64-a42c3758c6df`, answering package request
+`01a10770-6a72-73dc-8c9a-963f99515534`. Source commit
+`4dc633caa152263dd6796c7770e2051857ba0cf7`, tree
+`1a05ec61a028baaf3dad278d1d92f12111b6cc70`, parent plan `52d5fc6e`.
+Two files (+655) add the private storage observation module and its declaration. No production node
+constructs it and no writer invokes it yet; no actor, wire, mutation admission, outcome, retry,
+cancellation, DROP, store format or durability policy changes.
+
+The core has a short synchronous mutex, checked node-wide sequence, cloneable work owners, durable
+shadow obligations, a fresh registry-lifetime UUIDv4 incarnation, and unavailable coverage until all
+five components reconcile. Last-owner release advances sequence, including zero-to-zero activity.
+Durable installation overlaps active ownership. External metadata reading holds no authority lock and
+is bracketed by sequence checks. Poison, accounting failure and overflow withhold observation without
+refusing an ordinary mutation. Fifteen named fixtures cover lock ordering, ownership in a running
+blocking job, handoff, accounting and collection refusals. They do not establish production database
+cancellation, startup recovery, real metadata completeness or a real-daemon incarnation. Those remain
+B/C obligations.
+
+Retained package: `~/work/.agent-bridge/adr629-p2-a/review.md`, SHA256
+`290e240e2b13223c1511a959107a6960a576ab0413ff189bd5f7294c3b809438`;
+54-file manifest `72c4aa79ca87ab4a82630230f5218510cdcaf6cf36b827e9a8457462c47c4f7b`.
+Exact remote/local file sets and hashes match for 39 ladder files and four development files.
+Bigfoot `~/work/toron-evidence/adr629/ladder-p2-a-1` has identical clean start/end source identities,
+Rust 1.95.0, all ten step statuses and final status zero: toron 5729/0/25, toron-tpch 674/0/6,
+toron-client 24/0/0, Wendelon serialized 2086/0/10, Wendelon SDK 13/0/0, focused core 15/0/0,
+real config pin 1/0/0, formatting, release daemon and release probe. Counts include libtest/doc-test
+summaries. The warm target and reused pinned worktree are recorded; no clean-build claim. Release
+warnings zero. The expected caught poison-fixture panic and inherited test-only warnings are retained.
+A final-document cwd/path mistake failed before writing, then was rerun with an absolute path; source
+and ladder were unaffected.
+
+Daemon `c6dfb672ed7603834efde2c63e334a1d462926335d391abf15151bdb66e9d092` and probe
+`484e6842b6d149e575802df02d1cca1d4931bc632f70a29a8d72fc637fb835cf` equal P1's release hashes.
+This is consistent with removal of the unreferenced private module, not a stale-build claim; pinned
+source/build logs are retained. No artifacts were staged.
+
+Carried review conditions: C needs explicit startup durable initialization while coverage is unavailable
+and must pin exact versus conservative scope matching on completion. Sticky reasons must be reported per
+node for diagnosis. D must project node-wide blockers without exposing other tenants' identities.
+B must include the same-host/profile write-heavy before/after comparison; C must perform the early
+real-daemon sequence-stability measurement. Slice B is now authorized; later slice review gates,
+origin hold and A3 campaign hold remain.
