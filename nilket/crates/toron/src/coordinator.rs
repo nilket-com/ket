@@ -4611,6 +4611,10 @@ impl StorageDeleteRows for UnsupportedStorageDeleteRows {
 }
 
 #[cfg(test)]
+#[path = "coordinator_adr629_tests.rs"]
+mod adr629_interleaving_tests;
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 

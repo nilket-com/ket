@@ -61,6 +61,72 @@ use wendelon_client::{Client, WriteOptions};
 const LIVE_TENANT: WendelonTenantId = WendelonTenantId::new(1);
 const BASE_TS: i64 = 1_599_998_400_000;
 
+#[path = "adr629_probe_test.rs"]
+mod adr629_adapter;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adr629_adapter_records_authenticated_mutation_resolution_and_exact_rows() {
+	use std::os::unix::fs::PermissionsExt;
+	let fixture = LiveWendelonFixture::start(62920).await;
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor()).await;
+	let worker = WorkerId::from_u128(629201);
+	let pki = TestPki::generate(worker, "1");
+	std::fs::set_permissions(&pki.client_key, std::fs::Permissions::from_mode(0o600)).unwrap();
+	let daemon = ToronDaemon::start_with_wendelon_client_for_harness(
+		toron_config_with_descriptor_tls_for_tenant(descriptor(), ToronTenantId(1), worker, &pki),
+		Arc::clone(&fixture.client),
+	)
+	.await
+	.unwrap();
+	let endpoint = connectable_loopback_addr(daemon.handle().sql_endpoint.unwrap());
+	let id = uuid::Uuid::now_v7();
+	let root = fresh_dir("adr629-adapter-development");
+	let operations = [
+		serde_json::json!({"kind":"execute", "sql":"INSERT INTO storage_execution (id, amount, region, ts) VALUES (1, 17, 'ADR629-synthetic-marker', 1599998400000)", "timezone":"UTC"}),
+		serde_json::json!({"kind":"resolve"}),
+		serde_json::json!({"kind":"execute", "sql":"SELECT id, amount, region FROM storage_execution WHERE id = 1", "timezone":"UTC"}),
+	];
+	for (i, operation) in operations.iter().enumerate() {
+		let evidence = root.join(format!("probe-{i}.json"));
+		let spec = serde_json::json!({"endpoint":endpoint.to_string(),
+			"server_name":canonical_daemon_dns_name(&worker, DEFAULT_CLUSTER_DOMAIN),
+			"cert":pki.client_cert,"key":pki.client_key,"ca":pki.ca_cert,
+			"query_id":id,"operation":operation,"evidence":evidence});
+		adr629_adapter::run_spec(&serde_json::to_vec(&spec).unwrap())
+			.await
+			.unwrap();
+		let r: serde_json::Value =
+			serde_json::from_slice(&std::fs::read(&evidence).unwrap()).unwrap();
+		assert_eq!(r["spec"], spec);
+		if i == 1 {
+			assert_eq!(r["result"]["kind"], "resolution");
+			assert_eq!(r["result"]["resolution"], "Present");
+			assert_eq!(r["result"]["commit_knowledge"], 1);
+		} else {
+			assert_eq!(r["result"]["kind"], "success");
+			assert_eq!(r["result"]["row_count"], 1);
+			if i == 2 {
+				assert_eq!(
+					r["result"]["rows"],
+					serde_json::json!([{"id":1,"amount":17,"region":"ADR629-synthetic-marker"}])
+				);
+			}
+		}
+		assert!(
+			adr629_adapter::run_spec(&serde_json::to_vec(&spec).unwrap())
+				.await
+				.is_err(),
+			"evidence cannot be overwritten"
+		);
+	}
+	println!(
+		"ADR629_ADAPTER_DEVELOPMENT evidence={} authenticated=true storage_transport=simulated RF=1",
+		root.display()
+	);
+	daemon.shutdown().await.unwrap();
+	fixture.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_client_health_probe_reaches_a_live_sql_listener_without_query_state() {
 	let fixture = LiveWendelonFixture::start(142).await;

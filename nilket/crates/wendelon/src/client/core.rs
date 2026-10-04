@@ -4623,6 +4623,32 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn adr629_local_bootstrap_does_not_pin_the_client_to_the_local_ingress() {
+		let mut seed = snapshot(1, Some(1), &[1]);
+		seed.replication_factor = 1;
+		seed.peers[0].address = "127.0.0.1:7001".into();
+		let client = WendelonClient::new(test_config(seed));
+		assert_eq!(client.target_for_locality(Locality::ZERO).unwrap().id, 1);
+		let mut cluster = snapshot(2, Some(2), &[1, 2, 3]);
+		cluster.peers[0].address = "192.168.0.2:7001".into();
+		cluster.peers[1].address = "192.168.0.6:7001".into();
+		cluster.peers[2].address = "192.168.0.8:7001".into();
+		client.apply_snapshot(&cluster);
+		let target = client.target_for_locality(Locality::ZERO).unwrap();
+		assert_eq!(
+			target.id, 2,
+			"table data dispatch chooses the discovered remote leader, not the local bootstrap"
+		);
+		let resolver = EpochCapabilityResolver::new(client.topology_tx.subscribe());
+		let peer = resolver.resolve(target).await.unwrap();
+		assert_eq!(peer.address, "192.168.0.6:7001");
+		println!(
+			"ADR629_ROUTING initial_bootstrap=local refreshed_target=2 refreshed_address={} forwarding_not_assumed=true socket_reachability_not_tested=true",
+			peer.address
+		);
+	}
+
+	#[tokio::test]
 	async fn client_get_table_schema_descriptor_retries_to_leader() {
 		let descriptor = table_query_descriptor(LocalityPolicy::default_table_spread());
 		let descriptor_bytes = encode_table_schema_descriptor_v1(&descriptor).unwrap();
