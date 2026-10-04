@@ -1354,3 +1354,131 @@ async fn adr629_p1_old_server_helper_requires_a_trusted_client_certificate() {
 		server_endpoint.wait_idle().await;
 	}
 }
+
+#[tokio::test]
+async fn adr629_p1_outgoing_client_preserves_server_trust_and_identity_rejection() {
+	let root = fresh_dir("adr629-p1-outgoing-negative");
+	let pki = tls_pki::write_test_pki(&root.join("pki-a"));
+	let other = tls_pki::write_test_pki(&root.join("pki-b"));
+	let server_material =
+		TlsMaterial::load(&pki.server_cert, &pki.server_key, &pki.ca_cert).unwrap();
+	for case in ["wrong_ca", "wrong_dns", "wrong_target", "wrong_domain"] {
+		let material = TlsMaterial::load(
+			&pki.data_client_cert,
+			&pki.data_client_key,
+			if case == "wrong_ca" {
+				&other.ca_cert
+			} else {
+				&pki.ca_cert
+			},
+		)
+		.unwrap();
+		let server_endpoint =
+			endpoint_from_tls(&server_material, "127.0.0.1:0".parse().unwrap()).unwrap();
+		let client_endpoint =
+			client_endpoint_from_tls(&material, "127.0.0.1:0".parse().unwrap()).unwrap();
+		let receiver = tokio::spawn({
+			let endpoint = server_endpoint.clone();
+			async move { endpoint.accept().await.unwrap().await }
+		});
+		let resolver = canonical_server_name_resolver(if case == "wrong_dns" {
+			"other.local"
+		} else {
+			tls_pki::CLUSTER_DOMAIN
+		});
+		let provider = QuicTransportProvider::with_cluster_domain(
+			Arc::new(client_endpoint.clone()),
+			resolver,
+			if case == "wrong_domain" {
+				"other.local"
+			} else {
+				tls_pki::CLUSTER_DOMAIN
+			},
+		);
+		// Keep the wire name correct while asking the provider to bind node 2.
+		let provider = if case == "wrong_target" {
+			QuicTransportProvider::with_cluster_domain(
+				Arc::new(client_endpoint.clone()),
+				Arc::new(|_| canonical_node_dns_name(1, tls_pki::CLUSTER_DOMAIN)),
+				tls_pki::CLUSTER_DOMAIN,
+			)
+		} else {
+			provider
+		};
+		let error = match tokio::time::timeout(
+			std::time::Duration::from_secs(5),
+			provider.connect(
+				node(if case == "wrong_target" { 2 } else { 1 }),
+				&server_endpoint.local_addr().unwrap().to_string(),
+			),
+		)
+		.await
+		.expect("timeout is not server identity rejection")
+		{
+			Ok(_) => panic!("{case} was admitted"),
+			Err(error) => error,
+		};
+		println!(
+			"ADR629_P1 outgoing_negative={case} error_kind={:?} error={error}",
+			error.kind()
+		);
+		match case {
+			"wrong_ca" | "wrong_dns" => {
+				assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused)
+			}
+			_ => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+		}
+		client_endpoint.close(0u32.into(), b"done");
+		server_endpoint.close(0u32.into(), b"done");
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(5), receiver)
+			.await
+			.expect("receiver cleanup guard")
+			.unwrap();
+		client_endpoint.wait_idle().await;
+		server_endpoint.wait_idle().await;
+	}
+	let mismatch = TlsMaterial::load(&pki.data_client_cert, &pki.server_key, &pki.ca_cert).unwrap();
+	assert!(
+		client_endpoint_from_tls(&mismatch, "127.0.0.1:0".parse().unwrap()).is_err(),
+		"a mismatched private key must refuse without fallback"
+	);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		let unreadable = root.join("unreadable.key");
+		std::fs::copy(&pki.data_client_key, &unreadable).unwrap();
+		std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0)).unwrap();
+		let denied = std::fs::read(&unreadable).is_err();
+		let result = TlsMaterial::load(&pki.data_client_cert, &unreadable, &pki.ca_cert);
+		std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).unwrap();
+		if denied {
+			assert!(result.is_err());
+			println!("ADR629_P1 unreadable_key=refused");
+		} else {
+			println!(
+				"ADR629_P1 unreadable_key=coverage_unavailable privileged filesystem bypassed permission bits"
+			);
+		}
+	}
+	for name in ["cert", "key", "ca"] {
+		let broken = root.join(format!("broken-{name}.pem"));
+		std::fs::write(&broken, b"not PEM material").unwrap();
+		let result = TlsMaterial::load(
+			if name == "cert" {
+				&broken
+			} else {
+				&pki.data_client_cert
+			},
+			if name == "key" {
+				&broken
+			} else {
+				&pki.data_client_key
+			},
+			if name == "ca" { &broken } else { &pki.ca_cert },
+		);
+		assert!(
+			result.is_err(),
+			"malformed {name} must refuse before endpoint construction"
+		);
+	}
+}
