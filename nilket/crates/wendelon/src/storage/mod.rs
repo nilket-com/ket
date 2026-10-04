@@ -6,6 +6,7 @@ pub mod core;
 pub mod counter;
 pub mod encoding;
 pub mod file_ops;
+pub(crate) mod finality_observation;
 pub(crate) mod index;
 pub mod io_uring;
 pub mod ipc;
