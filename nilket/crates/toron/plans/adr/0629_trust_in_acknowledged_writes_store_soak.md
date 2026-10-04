@@ -706,3 +706,20 @@ Rollback disables the new observer/client command and returns the reconciler to 
 
 Pin that the observer credential cannot perform data reads/writes, peer/cluster control, administrative mutations or other diagnostic actions; only its reviewed finality-observation action is permitted. Record credential custody and identity hashes at A3 without exposing private keys in evidence. Broad administrative credentials are not the default load-generator identity.
 
+## P1 outgoing client endpoint sub-amendment (reviewed)
+
+Scope verdict: chatd 01a10665-461f-7235-8223-61d53449719c. This addition is authorized within the separate P1 package, with no staging before review.
+
+`server_config(material)` calls `rustls_server_config_with_peer_roots`, which uses `tls_pki::build_client_cert_chain_verifier`; that constructs WebPkiClientVerifier without allow_unauthenticated. Inbound client certificates are therefore required when an incoming handshake is driven. The storage client's endpoint has no application accept loop, so this is not proof that its real unsolicited handshakes reach TLS certificate validation. Do not replace that limitation with a timeout claim.
+
+Proposal: add a dedicated `client_endpoint_from_tls(material, bind_addr)` beside the existing Wendelon QUIC helper. It constructs `quinn::Endpoint::client(bind_addr)`, then installs the unchanged `client_config(material)`. `wendelon-client::Client::connect_quic` uses it. The shared `endpoint_from_tls` / `endpoint_from_tls_with_peer_roots` server constructors stay unchanged; no server node/peer listener loses inbound service.
+
+This makes an outgoing storage client's socket client-only: incoming unsolicited new connection attempts have no server configuration to accept them. Traffic on its authenticated outgoing connections remains served normally. It removes the avoidable inbound handshake surface rather than opening a new application service or relying on firewall state. No certificate, peer name/role/domain/node verification, ALPN, client idle/keepalive policy, routing, membership, wire version, mutation outcome or storage format changes.
+
+Tests: actual outgoing data/control requests through the helper; dynamic remote-owner resolution plus the real production Client::connect_quic path; no new incoming connection accepted or application handler invoked at the client socket; distinguish actual protocol rejection/response from no-response where applicable (a timeout alone never establishes rejection); old server helper's untrusted/absent certificate rejection at the TLS verifier with the accept path driven; valid-peer old-helper positive; unchanged wrong-domain/node/role outbound failures. Reuse finite existing transport policy through client_config. No new dependency is required (quinn is already used inside Wendelon).
+
+A3 still freezes concrete per-host bind: host LAN IP, port 0; return-path and unsolicited-traffic firewall observations; no firewall edit authorization. Deployment/packet behavior is not inferred from constructor or loopback tests.
+
+Rollback reverses only the Client call/helper addition while stopping clients and restoring reviewed bind configs; old server helper behavior is preserved. This proposal contains no code change and no staging.
+
+Conditions: retain or positively test server-initiated streams on client-initiated connections wherever a Wendelon flow needs them; otherwise state the surveyed absence with code references. The helper prevents new incoming connections, not streams on an existing connection. The CLI client at wendelon/src/cli/index.rs:238 uses the old server helper on 0.0.0.0:0; record this as an observed, separate candidate and leave it unchanged. Old server-helper absent/untrusted certificate rejection must drive the accept path and name the TLS rejection, not count a timeout. A3 packet/firewall behavior remains separate.
