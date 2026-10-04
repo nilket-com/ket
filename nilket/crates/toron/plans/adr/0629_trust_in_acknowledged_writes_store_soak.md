@@ -1,9 +1,10 @@
 # ADR 629 - trust in acknowledged writes: a three-node store soak
 
-**Status:** STAGE A A1 CHARACTERIZED (reviewed parts 1–3; limited diagnostic coverage).
-A2 development remains authorized within Stage A, with its own instrument/topology review before advancement.
-Host staging and runs wait for their reviewed A3 package. No Stage B fix is selected; Stage C is reviewed
-separately. This is not trust, durability or security acceptance for a store.
+**Status:** STAGE A A1 CHARACTERIZED and A2 REVIEWED INSTRUMENT DEVELOPMENT (limited diagnostic coverage).
+A3 is HELD on P1–P4: authenticated reachable storage route, non-destructive finality observation, stored-effect
+concurrency coverage where claimed, and real three-node readiness/placement/ingress checks. Stage B P1/P2
+is selected for plan review; no production implementation is cleared. Stage C remains separately reviewed.
+This is not trust, durability or security acceptance for a store.
 
 **A correctness, integrity and security-evidence record. Wi-Fi is a supported target. No performance claim
 is made.**
@@ -576,3 +577,24 @@ Development failures and operator slips are retained, not cited as passing evide
 A1 is limited characterization delivered. It is not the assertion that acknowledged writes survive all
 faults, apply once under concurrency, or safely hold real customer data. The ledger and subsequent reviewed
 campaign must expose these gaps rather than turn unavailable evidence into a pass.
+
+
+## A2 instrument-development record (reviewed)
+
+A2 is a reviewed, bounded instrument-development package, not a runnable trust soak. Claude’s package verdict is chatd 01a10640-428c-741f-a041-29a7f0000bcd; the R1/R2 and record verdict is chatd 01a10656-461a-772c-9a0b-44b0bc26986f. A3 remains held on authenticated storage reachability, a non-destructive pending-publication/finalization observer, stored-effect concurrency coverage where claimed, and real three-node readiness/placement/ingress checks. No production fix, Stage B implementation, host staging or soak campaign is delivered here.
+
+The test-only source is cc739373e860a00076bbb62847932797bea7ebd0 (tree c97f01c2e0d275b3a2091e10aad5557fb9a07b27; parent 9c8e0e22). Five files add 644 lines without production semantics changes. The cfg(test) candidate gates bind real planner/executor materialization before captured mutation requests. The public-client probe invokes authenticated ToronClient with explicit UUIDv7 and records exact request/response bytes and typed outcome axes, with create-new evidence. Its authenticated SQL fixture is disk-backed RF1/simulated storage; it is not three-host replication evidence.
+
+The pinned ladder-a2-1 kept the same clean source identity at both ends under Rust 1.95.0. All nine steps passed: Toron 5727/0 with 25 ignored, TPC-H 674/0 with 6 ignored, toron-client 24/0; explicit C1 two tests/four orderings, authenticated adapter, routing and real-loader pins; initial Python 39 tests; formatting. A separately copied final Python suite passed 42 tests. R1/R2 corrections subsequently passed 46 tests with ResourceWarnings treated as errors, without a Rust change or another Rust ladder. Existing warnings, failed development checks, the warmed-target provenance and raw logs are retained. No release-artifact or zero-warning claim is made.
+
+F16, lost-update payload: two concurrent UPDATE candidates both read amount=10 and each submits amount=11, in both capture-writer orders. F17, delete-resurrection payload: DELETE/UPDATE retains the earlier candidate in both orders, including UPDATE submission after the captured DELETE returned. Stale payload is established; stored lost update/resurrection is inferred and unpinned. The capture writers do not commit to Wendelon. No concurrent-update acceptance or safe personal-data deletion claim follows.
+
+The independent ledger fsyncs exact intent and send records before adapter invocation, uses 74 CSPRNG bits in each UUIDv7, refuses torn tails instead of repairing them and keeps append-only raw acknowledgement/resolution history. No automatic mutation resubmission is permitted; ambiguity reserves the key. R1 preserves class acked while flagging non-committing resolutions, including Unknown, Expired and non-committing Present axes. Later committed evidence does not erase a discrepancy. These flags appear in both reconciliation and run summaries; they are findings, not a no-effect witness. R2 defines sequential client mutation RPCs with per-key gating. Unknown outcomes on distinct keys may coexist. A late resolution cannot release another operation's reservation. The sole-writer assumption spans the whole cluster but is neither enforced nor observable for other clients; client policy does not establish storage-level serialization.
+
+The two-hour workload proposal is startup-scale: 592 planned requests including resolution, exports and analytics, averaging 296/hour; quiet windows and small bursts; one synthetic tenant; customers, orders/payment/license rows, support tickets; scrubbed customer soft-delete without cascades. Typed length-prefixed canonical row hashes bind exact integer, text and null content. The CLI exposes proposal only. Initialization, deployment, thresholds, collectors and a causal settlement observer still require A3 review.
+
+The actual Toron loader rejects LAN storage client binds even with TLS, contrary to its message about allowing authenticated remote transport. The loopback-bind control parses. The real Wendelon loader parses requested RF3 with explicitly dummy parser fixture materials; no TLS validity, startup, placement or quorum is established. The client routing pin begins with a local bootstrap and then resolves an advertised remote leader directly after ring refresh. Proxy-hop support is not proof that all client traffic remains local. A reviewed reachable route is a prerequisite; no guard relaxation is implemented in A2.
+
+Exports can be structurally checked and observed differences reported, but reconcile remains WITHHELD. The proposed 120 s observation budget, quiet intervals, TTL/Expired results, connection closure and metrics are not storage finality. The available MutationDrainRegistry wait is DROP-coupled, so the instrument does not destroy customer tables to manufacture a cut. No durability, exactly-once, transaction or security acceptance follows. Marker/resource/clock helpers cover declared evidence only, with missing or failed collection unavailable; no uncollected sink is certified.
+
+Provenance: original reviewed package /home/me/work/.agent-bridge/adr629-a2 (SHA256SUMS 3a76bf2b...), plus revision /home/me/work/.agent-bridge/adr629-a2-r2, with SHA256SUMS 089a4a895aa273c28a72f5814e715303063d5392cb929ad9dfc100c2978bc229 over 110 files. Complete ladder logs are retained on bigfoot under /home/me/work/toron-evidence/adr629/ladder-a2-1; mirrored review packages and labelled synthetic/adapter development artifacts remain separate from any A3 campaign.
