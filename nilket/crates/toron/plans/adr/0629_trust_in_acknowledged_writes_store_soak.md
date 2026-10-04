@@ -3,8 +3,9 @@
 **Status:** STAGE A A1 CHARACTERIZED and A2 REVIEWED INSTRUMENT DEVELOPMENT (limited diagnostic coverage).
 A3 is HELD on P1–P4: authenticated reachable storage route, non-destructive finality observation, stored-effect
 concurrency coverage where claimed, and real three-node readiness/placement/ingress checks. Stage B P1/P2
-scope is reviewed; P1 implementation is authorized within that scope, with its package/ladder review before
-staging. P2 coverage inventory may proceed as reading/design; its production work waits for P1 submission. Stage C remains separately reviewed.
+scope is reviewed; P1 is delivered as the bounded implementation recorded below, without host readiness
+or staging acceptance. P2 coverage inventory and least-privilege actor design require review before P2
+production code. Stage C remains separately reviewed.
 This is not trust, durability or security acceptance for a store.
 
 **A correctness, integrity and security-evidence record. Wi-Fi is a supported target. No performance claim
@@ -723,3 +724,77 @@ A3 still freezes concrete per-host bind: host LAN IP, port 0; return-path and un
 Rollback reverses only the Client call/helper addition while stopping clients and restoring reviewed bind configs; old server helper behavior is preserved. This proposal contains no code change and no staging.
 
 Conditions: retain or positively test server-initiated streams on client-initiated connections wherever a Wendelon flow needs them; otherwise state the surveyed absence with code references. The helper prevents new incoming connections, not streams on an existing connection. The CLI client at wendelon/src/cli/index.rs:238 uses the old server helper on 0.0.0.0:0; record this as an observed, separate candidate and leave it unchanged. Old server-helper absent/untrusted certificate rejection must drive the accept path and name the TLS rejection, not count a timeout. A3 packet/firewall behavior remains separate.
+
+## Stage B P1 results (reviewed)
+
+Implementation clearance: chatd `01a106af-0986-7463-b38b-f23ae68088d6`, answering package request
+`01a106ae-7be3-7316-9bb1-569876dd9bb6`. Source: `c049cdda73285b29cd128ac3a9cbdafc268a2326`,
+tree `7302440aa374eeaecd7a88b70173ee789c62cdbb`, on the reviewed plan `c4e3ecdd`.
+Production changes are in signed commit `6fb7c801`; `eb49b506` and `c049cdda` add tests only.
+This section records P1 delivery, not three-node readiness or store trust acceptance. P2 and A3 remain held
+on their separate inventory, implementation and readiness reviews. Origin publishing remains held.
+
+### Delivered behaviour and bounded evidence
+
+Toron normalizes the complete storage TLS tuple before checking the storage client bind. A concrete LAN
+or wildcard bind is accepted only with complete TLS and a valid storage cluster domain; without TLS the
+bind remains loopback-only. IPv4/IPv6, all eight TLS-presence combinations, invalid domains and malformed
+addresses are pinned. Parsing does not establish usable key material, packet reachability or startup.
+The former A2 real-loader rejection pin is superseded by
+`adr629_p1_real_config_loaders_accept_tls_configured_storage_binds`; its retained evidence is unchanged.
+
+Only the production SDK `Client::connect_quic` switches to `client_endpoint_from_tls`, which constructs
+Quinn's client-only endpoint and installs the unchanged TLS client configuration. Node listeners and shared
+server helpers remain unchanged. Peer-opened streams on an authenticated outgoing connection exchange
+bytes successfully. An unsolicited new dial expires within the test observation, with zero admitted
+handshakes: this is not called a TLS rejection or a LAN firewall measurement.
+
+Driven old-server-helper tests record receiver-side TLS rejection of absent and untrusted client
+certificates. New-helper outbound tests record wrong CA/name rejection at TLS and wrong target/domain
+rejection at authenticated peer binding; malformed, mismatched and observed unreadable key material
+refuses. No role, trust-domain, ALPN or node-verification rule is relaxed.
+
+The production SDK pin bootstraps through one of two fixture nodes, discovers the other, and establishes
+an authenticated session to it. The bounded SDK read observed `NOT_LEADER`; SDK retries prevent attributing
+the terminal reply to a particular peer. This proves discovered-route authentication and a client-level
+response, not successful placement, read/write readiness, finality or replication. The fixture uses
+runtime-owned teardown; a stalled development graceful-shutdown attempt is retained and no graceful
+daemon-shutdown claim follows.
+
+### Retained ladder and provenance
+
+Final `ladder-p1-2`: Rust 1.95.0, source/tree as above, clean and identical start/end identity, all twelve
+steps and `final.rc` zero. Full summaries including documentation tests:
+
+| Suite | Passed | Failed | Ignored |
+| --- | ---: | ---: | ---: |
+| Toron | 5729 | 0 | 25 |
+| toron-tpch | 674 | 0 | 6 |
+| toron-client | 24 | 0 | 0 |
+| Wendelon | 2071 | 0 | 10 |
+| Wendelon-client | 13 | 0 | 0 |
+
+Focused config, transport, SDK and real-loader pins pass; formatting passes; both release steps have zero
+warnings. Wendelon's full suite ran with `--test-threads=1`. Failed `ladder-p1-1` is retained: its parallel
+quarantine-counter assertion saw delta 2 instead of 1. The package demonstrates the process-global,
+label-keyed metric, the assertion spanning awaits and independent tests incrementing that bucket; both
+metric and maintenance sources are byte-identical to the plan base. This supports serialization but does
+not identify the original competing writer or prove its interleaving. No maintenance fix or base-suite
+reproduction is claimed. The dedicated worktree changed only between completed ladders. Warm target,
+fixture-data reuse and cached production-equivalent release bytes are declared; no clean-build or
+reproducible-build claim is made.
+
+Package: workstation `~/work/.agent-bridge/adr629-p1/`, with 121 files and exact remote/local ladder
+file-set/hash verification; raw ladders on bigfoot `~/work/toron-evidence/adr629/ladder-p1-{1,2}`.
+
+- `SHA256SUMS`: `af0d2a5820e01fa11973afb643d0b26a05db7fbc5e0590fd525f01adeaa19bb7`.
+- `review.md`: `99cf8e21b697301d01731bc12d9f6412303c67ffe15b046e98109e2ff3583387`.
+- `source.diff`: `6007ac29acad4c2f6a8d138a0fa85cd2dc0b87881bfc69cb9120d777ad30e826`.
+- Release daemon: `c6dfb672ed7603834efde2c63e334a1d462926335d391abf15151bdb66e9d092`.
+- Release probe: `484e6842b6d149e575802df02d1cca1d4931bc632f70a29a8d72fc637fb835cf`.
+
+Development failures, owned interruptions, all signatures and the Quinn constructor evidence are retained.
+No artifacts are installed by this record. A3 must still freeze concrete LAN bind addresses with ephemeral
+ports, successful routes to every required node, placement/readiness and actual return-path/unsolicited
+firewall observations. No firewall change is authorized. Separate candidates are isolation of the flaky
+maintenance metric test and the CLI's existing server-mode client endpoint; neither is changed in P1.
