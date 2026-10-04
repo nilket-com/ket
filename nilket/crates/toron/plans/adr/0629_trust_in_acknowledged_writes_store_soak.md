@@ -641,3 +641,68 @@ Use each host's concrete LAN address with port 0 in the proposed A3 client confi
 
 Inventory whether server_config(material) requires and verifies inbound client certificates. Where it does, pin an untrusted peer's TLS rejection point explicitly; a timeout is not rejection evidence. If it does not, return for the outbound-only client-helper sub-amendment. Also distinguish verifier configuration from whether the client endpoint actually drives inbound TLS; an absent application accept loop is not proof of certificate rejection.
 
+
+
+## Stage B P2 scope (reviewed)
+
+Same scope verdict: chatd 01a1065f-fdc4-72c2-98cc-38880ad2477c. P2 authority inventory may proceed in parallel as reading/design; no P2 production code before P1 package submission. If the coverage contract cannot be implemented without a semantics/fence change, return for a separate scope decision.
+
+## P2: a non-destructive observer that can certify a bounded stable export window
+
+### Proposal and excluded shortcut
+
+Propose a **read-only, causally bracketed observer**, not a DROP operation, mutation cancellation, quiet timer or a new transaction API. It reports authoritative work and an activity sequence; the harness brackets every export/analytics call with validated observations. A zero gauge alone never certifies anything. A temporary admission fence is an alternative if observation coverage proves inadequate; that would change write semantics and needs a separate scope review. It is not implicitly authorized by this draft.
+
+The observer proves a stable observation window only when its complete contract holds. It does **not** certify that every previously submitted client intent will never be admitted later, that an Unknown/Expired operation had no effect, or that no future mutation can occur after the window. Ambiguous operations remain ambiguous. It must not bridge a restart or turn a conditional cut into a permanent settlement claim.
+
+### Existing authority and mandatory coverage inventory
+
+`storage/mutation_drain.rs` has the node-local lifecycle mutex, per-(tenant, table object, schema generation) admitted work counts and a startup-reconciliation flag. Its cloneable guards cover spawned local durable append work (`data_server.rs:9044-9058`). Its existing wait requires a committed DROP closure and cannot be used to create a non-destructive cut.
+
+That registry is a starting point, **not yet established as complete finalization coverage**. `data_server.rs` also has durable pending-finalization records, orphan-witness recovery, replica/child paths, retry work and startup recovery. Before implementation review, enumerate every path that can still change logical table visibility or its mutation finalization, including INSERT, UPDATE's write path, DELETE, replicas/forwarding, abandoned caller futures, durable retries/recovery and relevant DDL/retention. Map admission/registration, handoff, terminal publication and release to their owning authority. Metrics, live requests, response writes and in-memory dedup counts are not that authority.
+
+Every registered branch must retain a counted obligation across detached work and transfer to persistent pending state without a zero gap. Persistent work must enter the observation authority before startup is called reconciled. Unknown/uncovered obligations make coverage unavailable, never zero. Missing instrumentation may require extending guard ownership/registration, but must not change the algorithm's acknowledgement, retry, outcome, retention or durability semantics. Any change to those semantics returns for scope review.
+
+### Exact observable contract proposed
+
+A bounded authenticated request identifies node, tenant, immutable table-object IDs and schema generations. A typed response includes:
+
+- the requested scope echoed exactly and whether it exists/is supported;
+- node identity and fresh process incarnation (not just PID or host boot ID);
+- current membership/placement epoch and schema identity;
+- startup reconciliation and named coverage status;
+- an exact checked activity sequence for that scope;
+- outstanding logical-publication/finalization obligations, including durable pending/recovery debt, with a complete breakdown or an explicit unavailable reason.
+
+The activity sequence changes whenever work capable of altering that scope is admitted/registered, and whenever a logical publication, finalization or relevant recovery/metadata change occurs. Counting and sequence updates share the relevant admission/registration linearization authority. A snapshot must be coherent with it; independent reads of registry and durable-store counters cannot be assembled into a false zero. If multiple authorities cannot provide a coherent report, return unavailable until their handoff is explicitly pinned. Sequence overflow, unreadable persistent state, partial startup, unknown work type, unsupported protocol, stale schema/epoch, truncated/partial response or failed authentication all withhold the cut.
+
+The response contains diagnostic identities/counters, not rows, SQL, hashes of customer contents or key material. Use a narrowly scoped read-only diagnostic actor and permission for this action on the authenticated control plane. Its credential must not inherit general Operator/ClusterAdmin privileges; SQL QuerySession, DataNode peer, tenant admin, backup/auditor/monitor and unauthenticated actors do not inherit the observation action. Exact actor encoding and trust-domain policy must be reviewed with the implementation. If a dedicated actor cannot fit, bring that decision back and make Operator custody explicit in A3: credential location/holder, removal after the campaign and no broad credential silently installed on the load generator. Exact permission/action and wire discriminant/version allocation must be listed at implementation review. Unsupported older peers fail closed rather than returning a default zero. Requests/replies are byte/item bounded. No new unauthenticated HTTP endpoint or TLS relaxation.
+
+### Checked-cut protocol
+
+1. The sole producer stops new workload submissions and records its ledger head; every known client attempt has a classified response or remains explicitly ambiguous. Stop/close evidence is checked. This is not assumed to cancel remote work or stop other writers.
+2. Observe every required storage node/scope. Each first observation must be supported, coherent, reconciled and zero outstanding. Save incarnation, activity sequence, membership/placement and schema identities.
+3. Only after **all** first replies arrive, perform the declared exports/analytics reads. Record their actual queries, responses and routing. No DDL/cut-triggered data mutation. Disable table-retention/time-dependent visibility in the synthetic workload and verify this metadata; no row-TTL claim follows.
+4. After **all** reads finish, observe every same node/scope again. Require zero outstanding, identical checked activity sequences, incarnations, membership/placement and schema identities, and complete coverage. The sequence cannot reset/reuse within an incarnation; restarts and rollover invalidate it.
+5. Certify only the export window causally enclosed by these paired replies. Use caller ordering and per-node tokens, never subtract unrelated host clocks. If any node is missing/unsupported/nonzero/changed, the result is WITHHELD; elapsed time or repeated quiet polls cannot rescue it.
+
+This can establish that no covered logical-publication/finalization activity crossed the window, not snapshot isolation for arbitrary concurrent users or equality of every replica. A3 readiness still has to identify all required nodes and routes; an RF3 setting is not a proof of complete scope. A newly admitted request after the second observation is outside this cut. An earlier intent that was not yet admitted remains ambiguous even if it arrives later. A checked cut does not upgrade Unknown/Expired into no-effect or erase R1 discrepancies. Reconciliation may identify an acknowledged row absent during a checked stable window; its scope and outstanding-intent limitations remain explicit.
+
+### Pins and reader negatives
+
+Deterministic gates/barriers, with no sleeps as proof: snapshot versus admission at the lock; detached local append after response/caller drop; guard-to-durable-pending handoff; finalization/recovery across startup; delayed replica publication; DELETE; work that starts and finishes between observations (same zero counts but changed sequence); schema/placement change; unsupported/uncovered work; and observer failure. A held publication is nonzero/unavailable, never a certified zero. Prove stable positive exports through the real daemon/client path without dropping tables or changing rows.
+
+Auth negatives cover every denied role, CA/domain mismatch, tenant/object scope mismatch, malformed and oversized requests, invented/mismatched tokens and old protocol. Observer requests must not mutate user data, cancel tasks, retire namespaces or silently discard finalization debt.
+
+Reader negatives: one node missing, forged zero counter, no persistent coverage, missing first/last observation, equal timestamps without causal bracketing, changed sequence after a zero-to-zero cycle, reset incarnation/epoch, wrong object/generation, an export before all first replies or after a last reply, out-of-order/duplicate replies, ambiguous intents mislabelled no-effect, discrepancy flags discarded, time-dependent retention unverified and a cleanup action used as the cut. A positive cut remains conditional on its exact required scope. No-cut fixtures keep WITHHELD.
+
+### Ladder, bounds and rollback
+
+Source/wire/reader package and the coverage inventory precede any staging. Use the pinned full three-crate ladder, affected Wendelon/control/TLS/store tests and exact protocol/reader negatives; retain failed/superseded runs, binary identities and initial evidence. No host count, deadline, fault matrix or campaign is inferred from this plan: those freeze at the instrument/readiness review. An observer deadline reports unavailable; it neither cancels work nor manufactures terminality.
+
+Rollback disables the new observer/client command and returns the reconciler to unconditional WITHHELD. A read-only observer has no persistent admission gate to reopen and no table data to restore. Old peers' unknown-action handling must be pinned before release. Do not copy an older database over newer writes, drop tables, delete pending records or claim that rollback finished a publication. P1 can remain delivered while P2 is unavailable, but A3 cannot gain an oracle claim.
+
+### Credential least privilege
+
+Pin that the observer credential cannot perform data reads/writes, peer/cluster control, administrative mutations or other diagnostic actions; only its reviewed finality-observation action is permitted. Record credential custody and identity hashes at A3 without exposing private keys in evidence. Broad administrative credentials are not the default load-generator identity.
+
