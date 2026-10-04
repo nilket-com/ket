@@ -553,9 +553,13 @@ where
 	T: Send + 'static,
 	F: FnOnce() -> std::io::Result<T> + Send + 'static,
 {
-	tokio::task::spawn_blocking(f)
-		.await
-		.map_err(|err| Error::other(format!("blocking file op task failed: {err}")))?
+	let observation = crate::storage::finality_observation::current_work();
+	tokio::task::spawn_blocking(move || {
+		let _observation = observation;
+		f()
+	})
+	.await
+	.map_err(|err| Error::other(format!("blocking file op task failed: {err}")))?
 }
 
 type BlockingTask = Box<dyn FnOnce() + Send + 'static>;
@@ -616,7 +620,9 @@ impl BlockingIoExecutor {
 		F: FnOnce() -> std::io::Result<T> + Send + 'static,
 	{
 		let (tx, rx) = tokio::sync::oneshot::channel();
+		let observation = crate::storage::finality_observation::current_work();
 		let task: BlockingTask = Box::new(move || {
+			let _observation = observation;
 			let _ = tx.send(f());
 		});
 		let depth = self.queued_tasks.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1145,5 +1151,72 @@ mod tests {
 			max_active.load(Ordering::SeqCst),
 			ISOLATED_BLOCKING_IO_WORKERS
 		);
+	}
+}
+
+#[cfg(test)]
+mod adr629_p2b_observed_io_tests {
+	use super::*;
+	use crate::storage::finality_observation::{
+		FinalityObservationRegistry, WorkKind, WorkScope, with_work,
+	};
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn adr629_p2b_both_blocking_executors_keep_owners_before_and_after_real_file_write() {
+		for isolated in [false, true] {
+			for after_write in [false, true] {
+				let registry = FinalityObservationRegistry::new();
+				let owner = registry.begin(WorkScope::Node, WorkKind::StoragePublication);
+				let path =
+					std::env::temp_dir().join(format!("adr629-p2b-io-{}", uuid::Uuid::new_v4()));
+				let output = path.clone();
+				let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+				let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+				let work = move || {
+					if after_write {
+						std::fs::write(&output, b"counted publication")?;
+					}
+					ready_tx.send(()).unwrap();
+					release_rx.recv().unwrap();
+					if !after_write {
+						std::fs::write(&output, b"counted publication")?;
+					}
+					Ok(())
+				};
+				let caller = tokio::spawn(with_work(owner, async move {
+					if isolated {
+						let executor = BlockingIoExecutor::spawn(
+							"adr629-p2b-observed",
+							BlockingIoClass::SlabMetadata,
+						)
+						.unwrap();
+						executor.run(work).await
+					} else {
+						spawn_blocking_io(work).await
+					}
+				}));
+				tokio::time::timeout(
+					std::time::Duration::from_secs(10),
+					tokio::task::spawn_blocking(move || ready_rx.recv().unwrap()),
+				)
+				.await
+				.unwrap()
+				.unwrap();
+				assert_eq!(path.exists(), after_write);
+				caller.abort();
+				let _ = caller.await;
+				assert_eq!(registry.test_state(), (1, 0, None));
+				release_tx.send(()).unwrap();
+				tokio::time::timeout(std::time::Duration::from_secs(10), async {
+					while registry.test_state().0 != 0 {
+						tokio::task::yield_now().await;
+					}
+				})
+				.await
+				.unwrap();
+				assert_eq!(std::fs::read(&path).unwrap(), b"counted publication");
+				std::fs::remove_file(path).unwrap();
+			}
+		}
 	}
 }

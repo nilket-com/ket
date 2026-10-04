@@ -140,6 +140,29 @@ pub struct IoRequest {
 	pub reply: oneshot::Sender<IoCompletion>,
 }
 
+// Keep the public request shape unchanged; ownership travels in the private queue.
+struct QueuedIoRequest {
+	request: IoRequest,
+	observation: Option<crate::storage::finality_observation::WorkToken>,
+}
+
+struct InFlightObservation {
+	token: Option<crate::storage::finality_observation::WorkToken>,
+	completed: bool,
+}
+
+impl Drop for InFlightObservation {
+	fn drop(&mut self) {
+		// A fatal engine exit/panic is not proof that kernel work ceased. Refuse
+		// observation instead of introducing a cancellation/IO recovery policy.
+		if !self.completed {
+			if let Some(token) = &self.token {
+				token.uncertain();
+			}
+		}
+	}
+}
+
 /// Result handed back to the waiting tokio task.
 pub struct IoCompletion {
 	/// The buffer originally submitted, returned for reuse.
@@ -150,6 +173,7 @@ pub struct IoCompletion {
 }
 
 struct InFlightRequest {
+	observation: InFlightObservation,
 	op: IoOp,
 	buf: Option<AlignedBuf>,
 	reply: oneshot::Sender<IoCompletion>,
@@ -161,9 +185,21 @@ struct InFlightRequest {
 
 /// Cloneable handle to a dedicated `io_uring` thread. All clones
 /// feed the same SQ.
+#[cfg(test)]
+type ObservationCompletionGate = Arc<
+	std::sync::Mutex<
+		Option<(
+			std::sync::mpsc::SyncSender<()>,
+			std::sync::mpsc::Receiver<()>,
+		)>,
+	>,
+>;
+
 #[derive(Clone)]
 pub struct IoRingHandle {
-	tx: mpsc::Sender<IoRequest>,
+	#[cfg(test)]
+	cqe_gate: ObservationCompletionGate,
+	tx: mpsc::Sender<QueuedIoRequest>,
 	class: IoUringClass,
 	pending_submissions: Arc<AtomicU64>,
 }
@@ -191,6 +227,10 @@ impl IoRingHandle {
 			self.class,
 			self.pending_submissions.load(Ordering::Relaxed),
 		);
+		let req = QueuedIoRequest {
+			request: req,
+			observation: crate::storage::finality_observation::current_work(),
+		};
 		if self.tx.send(req).await.is_err() {
 			decrement_pending_submissions(&self.pending_submissions, self.class);
 			return Err(std::io::Error::new(
@@ -239,6 +279,10 @@ impl IoRingHandle {
 			self.class,
 			self.pending_submissions.load(Ordering::Relaxed),
 		);
+		let req = QueuedIoRequest {
+			request: req,
+			observation: crate::storage::finality_observation::current_work(),
+		};
 		if self.tx.send(req).await.is_err() {
 			decrement_pending_submissions(&self.pending_submissions, self.class);
 			return Err(std::io::Error::new(
@@ -280,16 +324,31 @@ pub fn spawn_io_thread_named_for_class(
 	let ring = IoUring::new(depth)?;
 	// Channel capacity: 2× depth gives slack for bursty submitters
 	// without unbounded memory growth.
-	let (tx, rx) = mpsc::channel::<IoRequest>((depth as usize).saturating_mul(2).max(1));
+	let (tx, rx) = mpsc::channel::<QueuedIoRequest>((depth as usize).saturating_mul(2).max(1));
+	#[cfg(test)]
+	let cqe_gate = Arc::new(std::sync::Mutex::new(None));
 	let pending_submissions = Arc::new(AtomicU64::new(0));
 	let thread_name = thread_name.into();
 	metrics().set_io_uring_submission_queue_depth(class, 0);
 	metrics().set_io_uring_completion_queue_depth(class, 0);
 	thread::Builder::new().name(thread_name).spawn({
 		let pending_submissions = pending_submissions.clone();
-		move || io_thread_loop(ring, rx, class, pending_submissions)
+		#[cfg(test)]
+		let thread_gate = cqe_gate.clone();
+		move || {
+			io_thread_loop(
+				ring,
+				rx,
+				class,
+				pending_submissions,
+				#[cfg(test)]
+				thread_gate,
+			)
+		}
 	})?;
 	Ok(IoRingHandle {
+		#[cfg(test)]
+		cqe_gate,
 		tx,
 		class,
 		pending_submissions,
@@ -318,9 +377,10 @@ pub fn spawn_io_thread_named_for_class(
 // ============================================================
 fn io_thread_loop(
 	mut ring: IoUring,
-	mut rx: mpsc::Receiver<IoRequest>,
+	mut rx: mpsc::Receiver<QueuedIoRequest>,
 	class: IoUringClass,
 	pending_submissions: Arc<AtomicU64>,
+	#[cfg(test)] cqe_gate: ObservationCompletionGate,
 ) {
 	let mut cookie: u64 = 1;
 	let mut in_flight: HashMap<u64, InFlightRequest> = HashMap::new();
@@ -392,7 +452,19 @@ fn io_thread_loop(
 		let mut cq = ring.completion();
 		span.record("cq_ready", cq.len() as i64);
 		while let Some(cqe) = cq.next() {
-			if let Some(request) = in_flight.remove(&cqe.user_data()) {
+			if let Some(mut request) = in_flight.remove(&cqe.user_data()) {
+				#[cfg(test)]
+				{
+					let gate = cqe_gate
+						.lock()
+						.expect("CQE observation test gate poisoned")
+						.take();
+					if let Some((ready, release)) = gate {
+						ready.send(()).unwrap();
+						release.recv().unwrap();
+					}
+				}
+				request.observation.completed = true;
 				if cqe.result() < 0 {
 					let errno = -cqe.result();
 					metrics().observe_io_uring_error(class, request.op.as_str(), errno);
@@ -425,18 +497,22 @@ fn push_request(
 	ring: &mut IoUring,
 	cookie: &mut u64,
 	in_flight: &mut HashMap<u64, InFlightRequest>,
-	req: IoRequest,
+	req: QueuedIoRequest,
 ) {
 	let id = *cookie;
 	*cookie = cookie.wrapping_add(1).max(1); // never let cookie be 0
 
+	let QueuedIoRequest {
+		request,
+		observation,
+	} = req;
 	let IoRequest {
 		op,
 		fd,
 		buf,
 		offset,
 		reply,
-	} = req;
+	} = request;
 
 	let entry = match op {
 		IoOp::Write => {
@@ -464,7 +540,18 @@ fn push_request(
 			.user_data(id),
 	};
 
-	in_flight.insert(id, InFlightRequest { op, buf, reply });
+	in_flight.insert(
+		id,
+		InFlightRequest {
+			op,
+			buf,
+			reply,
+			observation: InFlightObservation {
+				token: observation,
+				completed: false,
+			},
+		},
+	);
 
 	// Safety: the buffer referenced by `entry` is kept alive in
 	// `in_flight` until the matching CQE is reaped.
@@ -522,5 +609,108 @@ impl IoOp {
 			IoOp::Fsync => "fsync",
 			IoOp::Fdatasync => "fdatasync",
 		}
+	}
+}
+
+#[cfg(test)]
+mod adr629_p2b_observed_ring_tests {
+	use super::*;
+	use crate::storage::finality_observation::{
+		FinalityObservationRegistry, Unavailable, WorkKind, WorkScope, with_work,
+	};
+
+	#[tokio::test]
+	async fn adr629_p2b_queue_and_inflight_own_work_after_the_reply_receiver_is_dropped() {
+		let registry = FinalityObservationRegistry::new();
+		let (tx, mut rx) = mpsc::channel(1);
+		let handle = IoRingHandle {
+			cqe_gate: Arc::new(std::sync::Mutex::new(None)),
+			tx,
+			class: IoUringClass::Generic,
+			pending_submissions: Arc::new(AtomicU64::new(0)),
+		};
+		let owner = registry.begin(WorkScope::Node, WorkKind::StoragePublication);
+		// Real submission queue/ownership path, synthetic CQE lifecycle; no kernel claim.
+		let reply = with_work(
+			owner,
+			handle.submit(IoOp::Write, -1, AlignedBuf::new(DIRECT_IO_ALIGN), 0),
+		)
+		.await
+		.unwrap();
+		drop(reply);
+		assert_eq!(registry.test_state(), (1, 0, None));
+		let queued = rx.recv().await.unwrap();
+		decrement_pending_submissions(&handle.pending_submissions, handle.class);
+		let flight = InFlightObservation {
+			token: queued.observation,
+			completed: false,
+		};
+		drop(queued.request);
+		assert_eq!(registry.test_state(), (1, 0, None));
+		let mut flight = flight;
+		flight.completed = true;
+		drop(flight);
+		assert_eq!(registry.test_state(), (0, 0, None));
+	}
+
+	#[test]
+	fn adr629_p2b_unknown_inflight_exit_withholds_instead_of_claiming_kernel_cessation() {
+		let registry = FinalityObservationRegistry::new();
+		let owner = registry.begin(WorkScope::Node, WorkKind::StoragePublication);
+		drop(InFlightObservation {
+			token: Some(owner),
+			completed: false,
+		});
+		assert_eq!(
+			registry.test_state(),
+			(0, 0, Some(Unavailable::UnreadableState))
+		);
+	}
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn adr629_p2b_real_kernel_write_keeps_owner_through_cqe_after_waiter_abort() {
+		use std::os::fd::AsRawFd;
+		let registry = FinalityObservationRegistry::new();
+		let owner = registry.begin(WorkScope::Node, WorkKind::StoragePublication);
+		let handle = spawn_io_thread(8).unwrap();
+		let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+		let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+		*handle.cqe_gate.lock().unwrap() = Some((ready_tx, release_rx));
+		let path = std::env::temp_dir().join(format!("adr629-p2b-ring-{}", uuid::Uuid::new_v4()));
+		let file = std::fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&path)
+			.unwrap();
+		let fd = file.as_raw_fd();
+		let driver = handle.clone();
+		let caller = tokio::spawn(with_work(owner, async move {
+			let mut buf = AlignedBuf::new(DIRECT_IO_ALIGN);
+			buf.as_mut_slice().fill(0x29);
+			let reply = driver.submit(IoOp::Write, fd, buf, 0).await.unwrap();
+			reply.await
+		}));
+		tokio::time::timeout(
+			std::time::Duration::from_secs(10),
+			tokio::task::spawn_blocking(move || ready_rx.recv().unwrap()),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		caller.abort();
+		let _ = caller.await;
+		assert_eq!(registry.test_state(), (1, 0, None));
+		assert_eq!(std::fs::read(&path).unwrap(), vec![0x29; DIRECT_IO_ALIGN]);
+		release_tx.send(()).unwrap();
+		tokio::time::timeout(std::time::Duration::from_secs(10), async {
+			while registry.test_state().0 != 0 {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+		assert_eq!(registry.test_state().2, None);
+		drop(file);
+		drop(handle);
+		std::fs::remove_file(path).unwrap();
 	}
 }

@@ -1,5 +1,8 @@
 use crate::consensus::TenantFinalization;
 use crate::schema::{ClientWriteId, PRE_VERSIONING_FORMAT};
+use crate::storage::finality_observation::{
+	FinalityObservationRegistry, Unavailable, WorkKind, WorkScope,
+};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -101,12 +104,15 @@ impl PendingFinalizationRecord {
 }
 
 pub struct PendingFinalizationStore {
+	observation: Arc<FinalityObservationRegistry>,
 	db: Arc<Database>,
 	/// Shape this store's record values are known to carry.
 	/// [`PRE_VERSIONING_FORMAT`] means unverifiable, not old.
 	format_version: u8,
 	write_lock: Mutex<()>,
 	count: AtomicU64,
+	#[cfg(test)]
+	commit_gate: StdMutex<Option<ObservationCommitGate>>,
 	#[cfg(test)]
 	fail_next_upsert: StdMutex<Option<String>>,
 }
@@ -120,6 +126,28 @@ impl PendingFinalizationStore {
 			.get(&path)
 			.and_then(Weak::upgrade)
 		{
+			return Ok(existing);
+		}
+		Self::open_observed(path, FinalityObservationRegistry::new())
+	}
+
+	pub(crate) fn open_observed(
+		path: impl Into<PathBuf>,
+		observation: Arc<FinalityObservationRegistry>,
+	) -> std::io::Result<Arc<Self>> {
+		let path = path.into();
+		if let Some(existing) = pending_store_registry()
+			.lock()
+			.expect("pending finalization registry poisoned")
+			.get(&path)
+			.and_then(Weak::upgrade)
+		{
+			if !Arc::ptr_eq(&existing.observation, &observation) {
+				existing
+					.observation
+					.unavailable(Unavailable::UnknownProducer);
+				observation.unavailable(Unavailable::UnknownProducer);
+			}
 			return Ok(existing);
 		}
 
@@ -210,10 +238,13 @@ impl PendingFinalizationStore {
 		};
 		write_txn.commit().map_err(redb_to_io)?;
 		let store = Arc::new(Self {
+			observation,
 			db,
 			format_version,
 			write_lock: Mutex::new(()),
 			count: AtomicU64::new(initial_count),
+			#[cfg(test)]
+			commit_gate: StdMutex::new(None),
 			#[cfg(test)]
 			fail_next_upsert: StdMutex::new(None),
 		});
@@ -222,6 +253,24 @@ impl PendingFinalizationStore {
 			.expect("pending finalization registry poisoned")
 			.insert(path, Arc::downgrade(&store));
 		Ok(store)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn test_commit_gate(
+		&self,
+		phase: u8,
+	) -> (
+		std::sync::mpsc::Receiver<()>,
+		std::sync::mpsc::SyncSender<()>,
+	) {
+		let (entered, ready) = std::sync::mpsc::sync_channel(1);
+		let (release, wait) = std::sync::mpsc::sync_channel(1);
+		*self.commit_gate.lock().unwrap() = Some(ObservationCommitGate {
+			phase,
+			entered,
+			release: wait,
+		});
+		(ready, release)
 	}
 
 	pub async fn load_all(&self) -> std::io::Result<Vec<PendingFinalizationRecord>> {
@@ -318,6 +367,10 @@ impl PendingFinalizationStore {
 		record: PendingFinalizationRecord,
 		delete_counts: Option<[u32; 3]>,
 	) -> std::io::Result<()> {
+		let observation = self.observation.begin(
+			WorkScope::Tenant(record.finalization.tenant_id),
+			WorkKind::Persistence,
+		);
 		let _guard = self.write_lock.lock().await;
 		#[cfg(test)]
 		if let Some(message) = self
@@ -331,6 +384,12 @@ impl PendingFinalizationStore {
 			)));
 		}
 		let db = self.db.clone();
+		#[cfg(test)]
+		let mut gate = self
+			.commit_gate
+			.lock()
+			.expect("observation test gate poisoned")
+			.take();
 		let inserted_new = spawn_blocking_io(move || {
 			let encoded = postcard::to_stdvec(&record)
 				.map_err(|err| Error::other(format!("encode pending finalization: {err}")))?;
@@ -364,7 +423,15 @@ impl PendingFinalizationStore {
 				}
 				!existed
 			};
+			let shadow = observation.before_durable_commit(*record.id.as_bytes());
+			#[cfg(test)]
+			observation_commit_gate(&mut gate, 0);
 			write_txn.commit().map_err(redb_to_io)?;
+			#[cfg(test)]
+			observation_commit_gate(&mut gate, 1);
+			shadow.committed(true);
+			#[cfg(test)]
+			observation_commit_gate(&mut gate, 2);
 			Ok(inserted_new)
 		})
 		.await?;
@@ -396,7 +463,17 @@ impl PendingFinalizationStore {
 		let _guard = self.write_lock.lock().await;
 		let db = self.db.clone();
 		let format_version = self.format_version;
+		let observation = self.observation.clone();
+		let owner = observation.begin(WorkScope::Node, WorkKind::Persistence);
+		#[cfg(test)]
+		let mut gate = self
+			.commit_gate
+			.lock()
+			.expect("observation test gate poisoned")
+			.take();
 		let removed = spawn_blocking_io(move || {
+			let _owner = owner;
+			let removed_tenant;
 			let write_txn = db.begin_write().map_err(redb_to_io)?;
 			let removed_any = {
 				let mut table = write_txn
@@ -409,6 +486,9 @@ impl PendingFinalizationStore {
 					)?),
 					None => None,
 				};
+				removed_tenant = removed_record
+					.as_ref()
+					.map(|record| record.finalization.tenant_id);
 				let removed_any = table
 					.remove(&id.as_bytes()[..])
 					.map_err(redb_to_io)?
@@ -459,7 +539,21 @@ impl PendingFinalizationStore {
 				let _ = contexts.remove(&id.as_bytes()[..]).map_err(redb_to_io)?;
 				removed_any
 			};
+			let shadow = removed_tenant.map(|tenant| {
+				observation
+					.begin(WorkScope::Tenant(tenant), WorkKind::Persistence)
+					.before_durable_commit(*id.as_bytes())
+			});
+			#[cfg(test)]
+			observation_commit_gate(&mut gate, 0);
 			write_txn.commit().map_err(redb_to_io)?;
+			#[cfg(test)]
+			observation_commit_gate(&mut gate, 1);
+			if let Some(shadow) = shadow {
+				shadow.committed(false);
+			}
+			#[cfg(test)]
+			observation_commit_gate(&mut gate, 2);
 			Ok(removed_any)
 		})
 		.await?;
@@ -482,6 +576,22 @@ impl PendingFinalizationStore {
 	}
 }
 
+#[cfg(test)]
+struct ObservationCommitGate {
+	phase: u8,
+	entered: std::sync::mpsc::SyncSender<()>,
+	release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+fn observation_commit_gate(gate: &mut Option<ObservationCommitGate>, phase: u8) {
+	if gate.as_ref().is_some_and(|gate| gate.phase == phase) {
+		let gate = gate.take().expect("matched gate");
+		gate.entered.send(()).expect("fixture receiver alive");
+		gate.release.recv().expect("fixture release alive");
+	}
+}
+
 pub fn pending_finalizations_path(dir: &Path) -> PathBuf {
 	dir.join("pending_finalizations.redb")
 }
@@ -492,9 +602,13 @@ async fn spawn_blocking_io<T>(
 where
 	T: Send + 'static,
 {
-	tokio::task::spawn_blocking(f)
-		.await
-		.map_err(|err| Error::other(format!("blocking redb task failed: {err}")))?
+	let observation = crate::storage::finality_observation::current_work();
+	tokio::task::spawn_blocking(move || {
+		let _observation = observation;
+		f()
+	})
+	.await
+	.map_err(|err| Error::other(format!("blocking redb task failed: {err}")))?
 }
 
 fn redb_to_io(err: impl std::fmt::Display) -> std::io::Error {
@@ -561,6 +675,7 @@ fn pending_store_registry() -> &'static StdMutex<HashMap<PathBuf, Weak<PendingFi
 mod tests {
 	use super::*;
 	use crate::consensus::TenantFinalization;
+
 	use crate::schema::{
 		ClientWriteId, DurabilityLevel, FinalizationMarker, HybridTimestamp, Identity, TenantId,
 	};
@@ -875,6 +990,124 @@ mod tests {
 		assert!(
 			!marked.to_string().contains("predate format versioning"),
 			"a marked store must not blame a format it has already declared: {marked}"
+		);
+	}
+	fn p2b_gate(
+		store: &PendingFinalizationStore,
+		phase: u8,
+	) -> (
+		std::sync::mpsc::Receiver<()>,
+		std::sync::mpsc::SyncSender<()>,
+	) {
+		let (entered, ready) = std::sync::mpsc::sync_channel(1);
+		let (release, wait) = std::sync::mpsc::sync_channel(1);
+		*store.commit_gate.lock().unwrap() = Some(ObservationCommitGate {
+			phase,
+			entered,
+			release: wait,
+		});
+		(ready, release)
+	}
+
+	async fn p2b_entered(ready: std::sync::mpsc::Receiver<()>) {
+		tokio::time::timeout(
+			std::time::Duration::from_secs(10),
+			tokio::task::spawn_blocking(move || ready.recv().unwrap()),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	}
+
+	async fn p2b_no_active(store: &PendingFinalizationStore) {
+		tokio::time::timeout(std::time::Duration::from_secs(10), async {
+			while store.observation.test_state().0 != 0 {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn adr629_p2b_cancellation_before_spawn_has_no_durable_effect() {
+		let store = PendingFinalizationStore::open(temp_path("p2b-before-spawn")).unwrap();
+		let lock = store.write_lock.lock().await;
+		let worker = store.clone();
+		let job = tokio::spawn(async move { worker.upsert(record()).await });
+		tokio::time::timeout(std::time::Duration::from_secs(10), async {
+			while store.observation.test_state().0 == 0 {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+		job.abort();
+		let _ = job.await;
+		drop(lock);
+		assert_eq!(store.observation.test_state(), (0, 0, None));
+		assert!(store.load_all().await.unwrap().is_empty());
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn adr629_p2b_cancelled_upsert_job_keeps_shadow_while_legacy_gauge_skips_update() {
+		let store = PendingFinalizationStore::open(temp_path("p2b-commit-cancel")).unwrap();
+		let (ready, release) = p2b_gate(&store, 0);
+		let worker = store.clone();
+		let job = tokio::spawn(async move { worker.upsert(record()).await });
+		p2b_entered(ready).await;
+		assert_eq!(store.observation.test_state(), (1, 0, None));
+		job.abort();
+		let _ = job.await;
+		assert_eq!(store.observation.test_state().0, 1);
+		release.send(()).unwrap();
+		p2b_no_active(&store).await;
+		assert_eq!(store.load_all().await.unwrap(), vec![record()]);
+		assert_eq!(
+			store.count(),
+			0,
+			"characterized pre-existing post-await gauge, not fixed here"
+		);
+		assert_eq!(store.observation.test_state(), (0, 1, None));
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn adr629_p2b_cancelled_after_commit_stays_active_until_shadow_install() {
+		let store = PendingFinalizationStore::open(temp_path("p2b-after-commit")).unwrap();
+		let (ready, release) = p2b_gate(&store, 1);
+		let worker = store.clone();
+		let job = tokio::spawn(async move { worker.upsert(record()).await });
+		p2b_entered(ready).await;
+		job.abort();
+		let _ = job.await;
+		assert_eq!(store.load_all().await.unwrap(), vec![record()]);
+		assert_eq!(store.observation.test_state(), (1, 0, None));
+		release.send(()).unwrap();
+		p2b_no_active(&store).await;
+		assert_eq!(store.observation.test_state(), (0, 1, None));
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn adr629_p2b_actual_redb_late_delete_shadow_cannot_erase_a_newer_commit() {
+		let store = PendingFinalizationStore::open(temp_path("p2b-late-delete")).unwrap();
+		store.upsert(record()).await.unwrap();
+		let (ready, release) = p2b_gate(&store, 1);
+		let worker = store.clone();
+		let id = record().id;
+		let job = tokio::spawn(async move { worker.remove(id).await });
+		p2b_entered(ready).await;
+		job.abort();
+		let _ = job.await;
+		assert!(store.load_all().await.unwrap().is_empty());
+		assert!(store.observation.test_state().0 > 0);
+		store.upsert(record()).await.unwrap();
+		assert_eq!(store.load_all().await.unwrap(), vec![record()]);
+		release.send(()).unwrap();
+		p2b_no_active(&store).await;
+		assert_eq!(store.observation.test_state(), (0, 1, None));
+		assert!(
+			store.observation.collect(&[], || unreachable!()).is_err(),
+			"not an enabled complete observer"
 		);
 	}
 }

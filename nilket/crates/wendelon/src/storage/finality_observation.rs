@@ -1,11 +1,11 @@
 //! ADR 629 P2 slice A: observation authority, not a mutation admission fence.
 //!
-//! This core is deliberately not attached to production mutation/metadata paths
-//! yet. Coverage starts unavailable; later slices must reconcile every component.
+//! Slice B attaches write, IO and pending-store ownership. Metadata and startup
+//! are not reconciled yet: coverage stays unavailable until later slices complete.
 //! The mutex is never held while calling external code, taking another lock or
 //! awaiting. Work owners must keep clones inside detached and blocking jobs.
 //! Nothing here cancels, refuses, retries or changes an ordinary mutation.
-#![allow(dead_code)] // Dormant until the separately reviewed coverage slices.
+#![allow(dead_code)] // Later metadata/observer APIs await their separate reviews.
 
 use crate::schema::{TableObjectId, TenantId};
 use std::collections::{BTreeMap, BTreeSet};
@@ -112,6 +112,10 @@ struct State {
 	coverage: BTreeSet<CoverageComponent>,
 	active: BTreeMap<(WorkScope, WorkKind), u64>,
 	durable: BTreeMap<[u8; 32], WorkScope>,
+	// Commit order is reserved while the caller holds redb's write transaction.
+	// Completed updates may arrive out of order after commit releases that lock.
+	commits_in_flight: BTreeSet<u64>,
+	committed_versions: BTreeMap<[u8; 32], u64>,
 }
 
 impl State {
@@ -163,6 +167,13 @@ impl FinalityObservationRegistry {
 			incarnation: *Uuid::new_v4().as_bytes(),
 			state: Mutex::new(State::default()),
 		})
+	}
+
+	#[cfg(test)]
+	pub(crate) fn test_state(&self) -> (u64, u64, Option<Unavailable>) {
+		let state = self.lock();
+		let (active, durable) = state.totals().expect("fixture counters representable");
+		(active, durable, state.sticky)
 	}
 
 	fn lock(&self) -> MutexGuard<'_, State> {
@@ -272,12 +283,45 @@ impl FinalityObservationRegistry {
 	}
 }
 
+// Request ownership is explicitly carried into spawned futures; Tokio does not
+// inherit task locals. Blocking wrappers capture a clone before enqueue/spawn.
+tokio::task_local! {
+	static OBSERVED_WORK: WorkToken;
+}
+
+pub(crate) fn current_work() -> Option<WorkToken> {
+	OBSERVED_WORK.try_with(Clone::clone).ok()
+}
+
+pub(crate) async fn with_work<F: std::future::Future>(token: WorkToken, future: F) -> F::Output {
+	OBSERVED_WORK.scope(token, future).await
+}
+
+/// This is a normal function: capture happens BEFORE spawn, not on first poll.
+pub(crate) fn carry_work<F: std::future::Future>(
+	future: F,
+) -> impl std::future::Future<Output = F::Output> {
+	let token = current_work();
+	async move {
+		match token {
+			Some(token) => with_work(token, future).await,
+			None => future.await,
+		}
+	}
+}
+
 #[derive(Clone)]
 pub(crate) struct WorkToken {
 	inner: Arc<TokenInner>,
 }
 
 impl WorkToken {
+	pub(crate) fn uncertain(&self) {
+		self.inner
+			.registry
+			.unavailable(Unavailable::UnreadableState);
+	}
+
 	/// Call only after the authoritative pending transaction committed. The
 	/// active owner stays counted throughout, including caller cancellation.
 	pub(crate) fn install_durable(&self, id: [u8; 32]) {
@@ -292,6 +336,27 @@ impl WorkToken {
 		}
 	}
 
+	/// Reserve while holding the authoritative DB write transaction, immediately
+	/// before its commit. This orders actual transactions without adding a DB
+	/// lock or retaining the caller's existing async lock after cancellation.
+	pub(crate) fn before_durable_commit(&self, id: [u8; 32]) -> DurableCommit {
+		let mut state = self.inner.registry.lock();
+		state.advance();
+		let revision = if state.sticky.is_none() {
+			let revision = state.sequence;
+			state.commits_in_flight.insert(revision);
+			Some(revision)
+		} else {
+			None
+		};
+		DurableCommit {
+			token: self.clone(),
+			id,
+			revision,
+			settled: false,
+		}
+	}
+
 	/// Call only after successful authoritative deletion. Missing or foreign
 	/// debt is an instrument defect, never a successful zero observation.
 	pub(crate) fn complete_durable(&self, id: [u8; 32]) {
@@ -302,6 +367,63 @@ impl WorkToken {
 				state.advance();
 			}
 			_ => state.fail(Unavailable::AccountingFailure),
+		}
+	}
+}
+
+/// Owns the post-commit observer handoff even if the awaiting caller disappears.
+/// Only a successful authoritative commit may call committed. An uncertain
+/// completion withholds observation; it never changes the underlying IO result.
+pub(crate) struct DurableCommit {
+	token: WorkToken,
+	id: [u8; 32],
+	revision: Option<u64>,
+	settled: bool,
+}
+
+impl DurableCommit {
+	pub(crate) fn committed(mut self, present: bool) {
+		let mut state = self.token.inner.registry.lock();
+		if let Some(revision) = self.revision {
+			if state
+				.committed_versions
+				.get(&self.id)
+				.is_none_or(|last| revision > *last)
+			{
+				if state
+					.durable
+					.get(&self.id)
+					.is_some_and(|scope| *scope != self.token.inner.scope)
+				{
+					state.fail(Unavailable::AccountingFailure);
+				} else {
+					state.committed_versions.insert(self.id, revision);
+					if present {
+						state.durable.insert(self.id, self.token.inner.scope);
+					} else {
+						state.durable.remove(&self.id);
+					}
+					state.advance();
+				}
+			}
+		}
+		self.settled = true;
+	}
+}
+
+impl Drop for DurableCommit {
+	fn drop(&mut self) {
+		let mut state = self.token.inner.registry.lock();
+		if !self.settled {
+			state.fail(Unavailable::UnreadableState);
+		}
+		if let Some(revision) = self.revision {
+			state.commits_in_flight.remove(&revision);
+		}
+		// No older update can still arrive once every reserved transaction has
+		// settled. Drop tombstones/history then; durable obligations remain.
+		if state.commits_in_flight.is_empty() {
+			state.committed_versions.clear();
 		}
 	}
 }
@@ -650,5 +772,62 @@ mod tests {
 			}),
 			Err(Unavailable::MetadataScopeMismatch)
 		);
+	}
+	#[test]
+	fn adr629_p2b_newer_upsert_survives_an_older_delete_reporting_late() {
+		let registry = ready();
+		let owner = registry.begin(WorkScope::Tenant(scope().tenant), WorkKind::Persistence);
+		owner.install_durable([4; 32]);
+		let older_delete = owner.before_durable_commit([4; 32]);
+		let newer_upsert = owner.before_durable_commit([4; 32]);
+		newer_upsert.committed(true);
+		older_delete.committed(false);
+		assert_eq!(registry.test_state(), (1, 1, None));
+		assert!(registry.lock().committed_versions.is_empty());
+	}
+
+	#[test]
+	fn adr629_p2b_late_upsert_cannot_resurrect_a_newer_deleted_shadow() {
+		let registry = ready();
+		let owner = registry.begin(WorkScope::Tenant(scope().tenant), WorkKind::Persistence);
+		let older_upsert = owner.before_durable_commit([4; 32]);
+		let newer_delete = owner.before_durable_commit([4; 32]);
+		newer_delete.committed(false);
+		older_upsert.committed(true);
+		assert_eq!(registry.test_state(), (1, 0, None));
+		assert!(registry.lock().committed_versions.is_empty());
+	}
+
+	#[test]
+	fn adr629_p2b_unknown_commit_withholds_and_releases_revision_history() {
+		let registry = ready();
+		let owner = registry.begin(WorkScope::Node, WorkKind::Persistence);
+		let pending = owner.before_durable_commit([4; 32]);
+		drop(owner);
+		assert_eq!(registry.test_state().0, 1);
+		drop(pending);
+		assert_eq!(
+			registry.test_state(),
+			(0, 0, Some(Unavailable::UnreadableState))
+		);
+		assert!(registry.lock().commits_in_flight.is_empty());
+	}
+
+	#[tokio::test]
+	async fn adr629_p2b_detached_future_owns_the_pre_spawn_clone() {
+		let registry = ready();
+		let owner = registry.begin(WorkScope::Node, WorkKind::Mutation);
+		let (send, recv) = tokio::sync::oneshot::channel::<()>();
+		let handle = with_work(owner, async {
+			tokio::spawn(carry_work(async move {
+				let _ = recv.await;
+			}))
+		})
+		.await;
+		assert_eq!(registry.test_state().0, 1);
+		handle.abort();
+		let _ = handle.await;
+		assert_eq!(registry.test_state().0, 0);
+		drop(send);
 	}
 }

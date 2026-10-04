@@ -464,9 +464,13 @@ async fn spawn_blocking_io<T>(
 where
 	T: Send + 'static,
 {
-	tokio::task::spawn_blocking(f)
-		.await
-		.map_err(|err| Error::other(format!("blocking mutation outcome task failed: {err}")))?
+	let observation = crate::storage::finality_observation::current_work();
+	tokio::task::spawn_blocking(move || {
+		let _observation = observation;
+		f()
+	})
+	.await
+	.map_err(|err| Error::other(format!("blocking mutation outcome task failed: {err}")))?
 }
 
 fn redb_to_io(error: impl std::fmt::Display) -> std::io::Error {

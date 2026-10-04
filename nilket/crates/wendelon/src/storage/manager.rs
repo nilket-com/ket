@@ -597,6 +597,7 @@ pub(crate) enum PreparedTieredTableDropRewrite {
 
 /// Multi-slab composition of [`StorageEngine`].
 pub struct SlabManager {
+	finality_observation: Arc<crate::storage::finality_observation::FinalityObservationRegistry>,
 	config: SlabManagerConfig,
 	file_ops: Arc<dyn AsyncFileOps>,
 	state: Mutex<ManagerState>,
@@ -1064,6 +1065,12 @@ impl SlabManager {
 	/// require durable visibility do not leak
 	/// append-complete-but-unflushed writes through the in-memory
 	/// read path.
+	pub(crate) fn finality_observation_registry(
+		&self,
+	) -> Arc<crate::storage::finality_observation::FinalityObservationRegistry> {
+		self.finality_observation.clone()
+	}
+
 	pub async fn append_durable(
 		&self,
 		tenant_id: TenantId,
@@ -1093,35 +1100,42 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 		frame: &[u8],
 	) -> std::io::Result<RecordLocation> {
-		let superseded = self.latest_location_before(tenant_id, key_identity, hlc);
-		let (slab, location) = self
-			.append_on_target(tenant_id, key_identity, hlc, frame)
-			.await?;
-		if let Err(err) = slab.wait_durable_commit().await {
-			slab.rollback_index_entry(tenant_id, key_identity, location);
-			self.rollback_indexed_location(tenant_id, key_identity, location);
-			return Err(err);
-		}
-		if let Err(err) = self
-			.persist_record_row_strict(tenant_id, key_identity, routing_locality, location)
-			.await
-		{
-			slab.rollback_index_entry(tenant_id, key_identity, location);
-			self.rollback_indexed_location(tenant_id, key_identity, location);
-			return Err(err);
-		}
-		self.index_appended_location_with_locality(
-			tenant_id,
-			key_identity,
-			routing_locality,
-			location,
+		let observation = self.finality_observation.begin(
+			crate::storage::finality_observation::WorkScope::Tenant(tenant_id),
+			crate::storage::finality_observation::WorkKind::StoragePublication,
 		);
-		if let Some(previous) = superseded {
-			let _ = self
-				.record_supersession_for_slab(previous.slab_id, hlc, None)
+		crate::storage::finality_observation::with_work(observation, async {
+			let superseded = self.latest_location_before(tenant_id, key_identity, hlc);
+			let (slab, location) = self
+				.append_on_target(tenant_id, key_identity, hlc, frame)
 				.await?;
-		}
-		Ok(location)
+			if let Err(err) = slab.wait_durable_commit().await {
+				slab.rollback_index_entry(tenant_id, key_identity, location);
+				self.rollback_indexed_location(tenant_id, key_identity, location);
+				return Err(err);
+			}
+			if let Err(err) = self
+				.persist_record_row_strict(tenant_id, key_identity, routing_locality, location)
+				.await
+			{
+				slab.rollback_index_entry(tenant_id, key_identity, location);
+				self.rollback_indexed_location(tenant_id, key_identity, location);
+				return Err(err);
+			}
+			self.index_appended_location_with_locality(
+				tenant_id,
+				key_identity,
+				routing_locality,
+				location,
+			);
+			if let Some(previous) = superseded {
+				let _ = self
+					.record_supersession_for_slab(previous.slab_id, hlc, None)
+					.await?;
+			}
+			Ok(location)
+		})
+		.await
 	}
 
 	pub(crate) async fn append_durable_multirow_with_locality(
@@ -1130,113 +1144,120 @@ impl SlabManager {
 		frame: &[u8],
 		entries: &[MultiRowIndexEntry],
 	) -> std::io::Result<RecordLocation> {
-		let Some(primary) = entries.first().copied() else {
-			return Err(Error::new(
-				ErrorKind::InvalidInput,
-				"multi-row append requires at least one index entry",
-			));
-		};
-		let batch = decode_record_batch(frame)?;
-		let table_object_ids = entries
-			.iter()
-			.map(|entry| storage_row_table_object_id_at(&batch, entry.record_row_index))
-			.collect::<std::io::Result<BTreeSet<_>>>()?;
-		for table_object_id in table_object_ids.into_iter().flatten() {
-			if let Some(failure) = self.table_integrity_failure(tenant_id, table_object_id) {
-				return Err(table_integrity_error(failure));
-			}
-		}
-		let record_hlc = entries
-			.iter()
-			.map(|entry| entry.row_hlc)
-			.max()
-			.unwrap_or(primary.row_hlc);
-		let mut superseded = Vec::new();
-		let mut tombstoned = Vec::new();
-		for entry in entries {
-			if let Some(previous) =
-				self.latest_location_before(tenant_id, entry.key_identity, entry.row_hlc)
-			{
-				if entry.is_tombstone {
-					tombstoned.push((previous.slab_id, entry.row_hlc));
-				} else {
-					superseded.push((previous.slab_id, entry.row_hlc));
+		let observation = self.finality_observation.begin(
+			crate::storage::finality_observation::WorkScope::Tenant(tenant_id),
+			crate::storage::finality_observation::WorkKind::StoragePublication,
+		);
+		crate::storage::finality_observation::with_work(observation, async {
+			let Some(primary) = entries.first().copied() else {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"multi-row append requires at least one index entry",
+				));
+			};
+			let batch = decode_record_batch(frame)?;
+			let table_object_ids = entries
+				.iter()
+				.map(|entry| storage_row_table_object_id_at(&batch, entry.record_row_index))
+				.collect::<std::io::Result<BTreeSet<_>>>()?;
+			for table_object_id in table_object_ids.into_iter().flatten() {
+				if let Some(failure) = self.table_integrity_failure(tenant_id, table_object_id) {
+					return Err(table_integrity_error(failure));
 				}
 			}
-		}
-		let (slab, base_location) = self
-			.append_on_target(tenant_id, primary.key_identity, record_hlc, frame)
-			.await?;
-		if let Err(err) = slab.wait_durable_commit().await {
-			slab.rollback_index_entry(tenant_id, primary.key_identity, base_location);
-			self.rollback_indexed_location(tenant_id, primary.key_identity, base_location);
-			return Err(err);
-		}
+			let record_hlc = entries
+				.iter()
+				.map(|entry| entry.row_hlc)
+				.max()
+				.unwrap_or(primary.row_hlc);
+			let mut superseded = Vec::new();
+			let mut tombstoned = Vec::new();
+			for entry in entries {
+				if let Some(previous) =
+					self.latest_location_before(tenant_id, entry.key_identity, entry.row_hlc)
+				{
+					if entry.is_tombstone {
+						tombstoned.push((previous.slab_id, entry.row_hlc));
+					} else {
+						superseded.push((previous.slab_id, entry.row_hlc));
+					}
+				}
+			}
+			let (slab, base_location) = self
+				.append_on_target(tenant_id, primary.key_identity, record_hlc, frame)
+				.await?;
+			if let Err(err) = slab.wait_durable_commit().await {
+				slab.rollback_index_entry(tenant_id, primary.key_identity, base_location);
+				self.rollback_indexed_location(tenant_id, primary.key_identity, base_location);
+				return Err(err);
+			}
 
-		let rows = entries
-			.iter()
-			.map(|entry| {
-				// ADR 0090: the row's durable placement travels from the frame's
-				// per-row entry into both the persistent index (V5) and the
-				// in-memory location that route selection consults.
-				let placement = if entry.partition.is_some() {
-					PlacementSemantics::Partitioned
-				} else {
-					PlacementSemantics::RawLocality
-				};
-				Ok(PersistentRecordRow {
-					tenant_id,
-					key_identity: entry.key_identity,
-					routing_locality: entry.routing_locality,
-					table_object_id: storage_row_table_object_id_at(
-						&batch,
-						entry.record_row_index,
-					)?,
-					placement,
-					partition: entry.partition,
-					location: RecordLocation {
-						hlc: entry.row_hlc,
-						record_row_index: entry.record_row_index,
-						is_tombstone: entry.is_tombstone,
+			let rows = entries
+				.iter()
+				.map(|entry| {
+					// ADR 0090: the row's durable placement travels from the frame's
+					// per-row entry into both the persistent index (V5) and the
+					// in-memory location that route selection consults.
+					let placement = if entry.partition.is_some() {
+						PlacementSemantics::Partitioned
+					} else {
+						PlacementSemantics::RawLocality
+					};
+					Ok(PersistentRecordRow {
+						tenant_id,
+						key_identity: entry.key_identity,
+						routing_locality: entry.routing_locality,
+						table_object_id: storage_row_table_object_id_at(
+							&batch,
+							entry.record_row_index,
+						)?,
 						placement,
 						partition: entry.partition,
-						..base_location
-					},
+						location: RecordLocation {
+							hlc: entry.row_hlc,
+							record_row_index: entry.record_row_index,
+							is_tombstone: entry.is_tombstone,
+							placement,
+							partition: entry.partition,
+							..base_location
+						},
+					})
 				})
-			})
-			.collect::<std::io::Result<Vec<_>>>()?;
-		if let Err(err) = self.persist_record_rows_strict(rows.clone()).await {
+				.collect::<std::io::Result<Vec<_>>>()?;
+			if let Err(err) = self.persist_record_rows_strict(rows.clone()).await {
+				slab.rollback_index_entry(tenant_id, primary.key_identity, base_location);
+				for row in &rows {
+					self.rollback_indexed_location(row.tenant_id, row.key_identity, row.location);
+				}
+				return Err(err);
+			}
+
 			slab.rollback_index_entry(tenant_id, primary.key_identity, base_location);
 			for row in &rows {
-				self.rollback_indexed_location(row.tenant_id, row.key_identity, row.location);
+				slab.index_location(row.tenant_id, row.key_identity, row.location);
+				self.index_appended_location_with_locality(
+					row.tenant_id,
+					row.key_identity,
+					row.routing_locality,
+					row.location,
+				);
+				if let Some(table_object_id) = row.table_object_id {
+					self.add_published_table_reference(tenant_id, table_object_id, row.location);
+				}
 			}
-			return Err(err);
-		}
-
-		slab.rollback_index_entry(tenant_id, primary.key_identity, base_location);
-		for row in &rows {
-			slab.index_location(row.tenant_id, row.key_identity, row.location);
-			self.index_appended_location_with_locality(
-				row.tenant_id,
-				row.key_identity,
-				row.routing_locality,
-				row.location,
-			);
-			if let Some(table_object_id) = row.table_object_id {
-				self.add_published_table_reference(tenant_id, table_object_id, row.location);
+			for (slab_id, supersession_hlc) in superseded {
+				let _ = self
+					.record_supersession_for_slab(slab_id, supersession_hlc, None)
+					.await?;
 			}
-		}
-		for (slab_id, supersession_hlc) in superseded {
-			let _ = self
-				.record_supersession_for_slab(slab_id, supersession_hlc, None)
-				.await?;
-		}
-		for (slab_id, tombstone_hlc) in tombstoned {
-			let _ = self
-				.record_row_tombstone_for_slab(slab_id, tombstone_hlc, None)
-				.await?;
-		}
-		Ok(base_location)
+			for (slab_id, tombstone_hlc) in tombstoned {
+				let _ = self
+					.record_row_tombstone_for_slab(slab_id, tombstone_hlc, None)
+					.await?;
+			}
+			Ok(base_location)
+		})
+		.await
 	}
 
 	/// Durability barrier across every local L1 slab currently
@@ -1594,6 +1615,8 @@ impl SlabManager {
 			),
 		};
 		let manager = Self {
+			finality_observation:
+				crate::storage::finality_observation::FinalityObservationRegistry::new(),
 			config,
 			file_ops,
 			state: Mutex::new(ManagerState {

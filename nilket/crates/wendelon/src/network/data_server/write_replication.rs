@@ -254,104 +254,117 @@ impl WendelonDataServer {
 	/// than tearing down the HRFT stream — the sender's ack count
 	/// is the only signal that matters for quorum.
 	pub(super) async fn handle_replicate(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
-		if frame.meta.len() < std::mem::size_of::<ReplicaWriteMeta>() {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				"REPLICATE_REQ meta too small",
-			));
-		}
-		let meta: ReplicaWriteMeta =
-			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<ReplicaWriteMeta>()]);
-		// Peer liveness/drift ingestion (ADR 001, ADR 012). The HLC
-		// originator in `commit_hlc.node_id` is another Data Ring
-		// member, so its physical_ms feeds directly into the
-		// NodeTracker without further validation.
-		if let Some(tracker) = &self.tracker {
-			let peer = NodeId {
-				id: meta.commit_hlc.node_id,
-				_reserved: 0,
-			};
-			tracker.record_hlc(peer, meta.commit_hlc);
-		}
-		let arrow = frame.arrow_payload.as_ref().ok_or_else(|| {
-			Error::new(
-				ErrorKind::InvalidData,
-				"REPLICATE_REQ missing arrow payload",
-			)
-		})?;
-
-		let arrow_bytes: &[u8] = &arrow[..];
-		let (status, ack_level) = if self.degraded_reason().is_some() {
-			(ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE)
-		} else if payload_digest(arrow_bytes) != meta.payload_hash {
-			(ReplicaWriteStatus::HASH_MISMATCH, ReplicaAckLevel::NONE)
-		} else {
-			match self
-				.slab
-				.append_durable(
-					meta.tenant_id,
-					meta.key_identity,
-					meta.commit_hlc,
-					arrow_bytes,
+		let observation = self.slab.finality_observation_registry().begin(
+			crate::storage::finality_observation::WorkScope::Node,
+			crate::storage::finality_observation::WorkKind::Mutation,
+		);
+		crate::storage::finality_observation::with_work(observation, async {
+			if frame.meta.len() < std::mem::size_of::<ReplicaWriteMeta>() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"REPLICATE_REQ meta too small",
+				));
+			}
+			let meta: ReplicaWriteMeta =
+				*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<ReplicaWriteMeta>()]);
+			// Peer liveness/drift ingestion (ADR 001, ADR 012). The HLC
+			// originator in `commit_hlc.node_id` is another Data Ring
+			// member, so its physical_ms feeds directly into the
+			// NodeTracker without further validation.
+			if let Some(tracker) = &self.tracker {
+				let peer = NodeId {
+					id: meta.commit_hlc.node_id,
+					_reserved: 0,
+				};
+				tracker.record_hlc(peer, meta.commit_hlc);
+			}
+			let arrow = frame.arrow_payload.as_ref().ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"REPLICATE_REQ missing arrow payload",
 				)
-				.await
-			{
-				Ok(_) => {
-					let pending = self.pending_finalization_record_from_replica_meta(&meta);
-					match self.pending_finalizations.upsert(pending).await {
-						Ok(()) => {
-							self.refresh_pending_finalization_backlog_metric();
-							(ReplicaWriteStatus::OK, ReplicaAckLevel::DURABLE)
-						}
-						Err(err) => {
-							tracing::error!(
-								write_id = ?meta.write_id,
-								tenant_id = meta.tenant_id.get(),
-								error = %err,
-								"replica failed to persist pending-finalization witness after durable append"
-							);
-							self.trip_local_persistence_distrust(format!(
-								"replica pending finalization witness persistence failed after durable append: {err}"
-							))
-							.await;
-							(ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE)
+			})?;
+
+			let arrow_bytes: &[u8] = &arrow[..];
+			let (status, ack_level) = if self.degraded_reason().is_some() {
+				(ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE)
+			} else if payload_digest(arrow_bytes) != meta.payload_hash {
+				(ReplicaWriteStatus::HASH_MISMATCH, ReplicaAckLevel::NONE)
+			} else {
+				match self
+					.slab
+					.append_durable(
+						meta.tenant_id,
+						meta.key_identity,
+						meta.commit_hlc,
+						arrow_bytes,
+					)
+					.await
+				{
+					Ok(_) => {
+						let pending = self.pending_finalization_record_from_replica_meta(&meta);
+						match self.pending_finalizations.upsert(pending).await {
+							Ok(()) => {
+								self.refresh_pending_finalization_backlog_metric();
+								(ReplicaWriteStatus::OK, ReplicaAckLevel::DURABLE)
+							}
+							Err(err) => {
+								tracing::error!(
+									write_id = ?meta.write_id,
+									tenant_id = meta.tenant_id.get(),
+									error = %err,
+									"replica failed to persist pending-finalization witness after durable append"
+								);
+								self.trip_local_persistence_distrust(format!(
+									"replica pending finalization witness persistence failed after durable append: {err}"
+								))
+								.await;
+								(ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE)
+							}
 						}
 					}
+					Err(_) => (ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE),
 				}
-				Err(_) => (ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE),
-			}
-		};
+			};
 
-		let resp = ReplicaWriteRespMeta {
-			status,
-			ack_level,
-			_pad: [0; 6],
-		};
-		let mut body = self.pool.acquire();
-		body.as_mut_vec()
-			.extend_from_slice(bytemuck::bytes_of(&resp));
-		let header = FrameHeader {
-			magic: HRFT_MAGIC,
-			version: 1,
-			msg_type: MsgType::REPLICATE_RESP.0,
-			flags: 0,
-			stream_id: frame.header.stream_id,
-			meta_len: body.len() as u32,
-			arrow_len: 0,
-			trailing_len: 0,
-		};
-		Ok(HrftFrame {
-			header,
-			meta: body,
-			arrow_payload: None,
-			trailing: None,
+			let resp = ReplicaWriteRespMeta {
+				status,
+				ack_level,
+				_pad: [0; 6],
+			};
+			let mut body = self.pool.acquire();
+			body.as_mut_vec()
+				.extend_from_slice(bytemuck::bytes_of(&resp));
+			let header = FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::REPLICATE_RESP.0,
+				flags: 0,
+				stream_id: frame.header.stream_id,
+				meta_len: body.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			};
+			Ok(HrftFrame {
+				header,
+				meta: body,
+				arrow_payload: None,
+				trailing: None,
+			})
 		})
+		.await
 	}
 
 	pub(super) async fn handle_table_replicate(
 		&self,
 		frame: HrftFrame,
 	) -> std::io::Result<HrftFrame> {
+		let observation = self.slab.finality_observation_registry().begin(
+			crate::storage::finality_observation::WorkScope::Node,
+			crate::storage::finality_observation::WorkKind::Mutation,
+		);
+		crate::storage::finality_observation::with_work(observation, async {
+
 		if frame.meta.len() < std::mem::size_of::<TableReplicaWriteMeta>() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -555,5 +568,7 @@ impl WendelonDataServer {
 			arrow_payload: None,
 			trailing: None,
 		})
+
+		}).await
 	}
 }

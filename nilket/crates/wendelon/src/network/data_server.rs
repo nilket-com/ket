@@ -803,6 +803,8 @@ pub struct WendelonDataServer {
 	#[cfg(test)]
 	delay_next_local_durable_append: Arc<StdMutex<Option<Duration>>>,
 	#[cfg(test)]
+	local_observation_gate: Arc<StdMutex<Option<(Arc<Notify>, Arc<Notify>)>>>,
+	#[cfg(test)]
 	orphan_witness_recovery_leadership_override: Arc<StdMutex<Option<bool>>>,
 	/// Shared node-wide HLC driver. The leader merges client HLCs
 	/// into this monotonic authority before stamping writes.
@@ -1200,6 +1202,8 @@ impl Clone for WendelonDataServer {
 			fail_next_local_durable_append: self.fail_next_local_durable_append.clone(),
 			#[cfg(test)]
 			delay_next_local_durable_append: self.delay_next_local_durable_append.clone(),
+			#[cfg(test)]
+			local_observation_gate: self.local_observation_gate.clone(),
 			#[cfg(test)]
 			orphan_witness_recovery_leadership_override: self
 				.orphan_witness_recovery_leadership_override
@@ -2223,8 +2227,10 @@ impl WendelonDataServer {
 		pool: Arc<BufPool>,
 	) -> std::io::Result<Self> {
 		let hlc = Arc::new(HybridLogicalClockDriver::new(local_node, clock.clone()));
-		let pending_finalizations =
-			PendingFinalizationStore::open(pending_finalizations_path(slab.data_dir()))?;
+		let pending_finalizations = PendingFinalizationStore::open_observed(
+			pending_finalizations_path(slab.data_dir()),
+			slab.finality_observation_registry(),
+		)?;
 		let mutation_outcomes =
 			MutationOutcomeStore::open(mutation_outcomes_path(slab.data_dir()))?;
 		let drop_reclaim_progress =
@@ -2280,6 +2286,8 @@ impl WendelonDataServer {
 			fail_next_local_durable_append: Arc::new(StdMutex::new(None)),
 			#[cfg(test)]
 			delay_next_local_durable_append: Arc::new(StdMutex::new(None)),
+			#[cfg(test)]
+			local_observation_gate: Arc::new(StdMutex::new(None)),
 			#[cfg(test)]
 			orphan_witness_recovery_leadership_override: Arc::new(StdMutex::new(None)),
 			hlc,
@@ -8501,6 +8509,12 @@ impl WendelonDataServer {
 		meta: WriteRequestMeta,
 		bifurcated: BifurcatedWrite,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
+		let observation = self.slab.finality_observation_registry().begin(
+			crate::storage::finality_observation::WorkScope::Node,
+			crate::storage::finality_observation::WorkKind::Mutation,
+		);
+		crate::storage::finality_observation::with_work(observation, async {
+
 		let key = Self::idempotency_key_for(meta.write_id);
 
 		// Non-primary redirect must happen before the fresh-leader
@@ -8622,12 +8636,19 @@ impl WendelonDataServer {
 				#[cfg(test)]
 				let fail_next_local_durable_append = self.fail_next_local_durable_append.clone();
 				#[cfg(test)]
+				let local_observation_gate = self.local_observation_gate.lock().expect("local observation gate poisoned").take();
+				#[cfg(test)]
 				let delay_local_durable_append = self
 					.delay_next_local_durable_append
 					.lock()
 					.expect("local durable append delay failpoint poisoned")
 					.take();
-				Some(tokio::spawn(async move {
+				Some(tokio::spawn(crate::storage::finality_observation::carry_work(async move {
+					#[cfg(test)]
+					if let Some((entered, release)) = local_observation_gate {
+						entered.notify_one();
+						release.notified().await;
+					}
 					#[cfg(test)]
 					if let Some(delay) = delay_local_durable_append {
 						tokio::time::sleep(delay).await;
@@ -8645,7 +8666,7 @@ impl WendelonDataServer {
 					}
 					slab.append_durable(tenant_id, key_identity, commit_hlc, bytes.as_slice())
 						.await
-				}))
+				})))
 			} else {
 				None
 			};
@@ -8669,9 +8690,9 @@ impl WendelonDataServer {
 			let factory = self.factory.clone();
 			let pool = self.pool.clone();
 			let bytes = bifurcated.frame_bytes.clone();
-			join.spawn(async move {
+			join.spawn(crate::storage::finality_observation::carry_work(async move {
 				Self::replicate_to_remote(factory, pool, target, replica_meta, bytes).await
-			});
+			}));
 		}
 
 		while !quorum_tracker.is_satisfied() {
@@ -8795,6 +8816,8 @@ impl WendelonDataServer {
 				Ok(self.counted_write_result(response, None))
 			}
 		}
+
+		}).await
 	}
 
 	fn table_batch_replica_groups(
@@ -8874,6 +8897,18 @@ impl WendelonDataServer {
 		permit: OwnedSemaphorePermit,
 		mutation_drain: MutationDrainGuard,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
+		let observation = self.slab.finality_observation_registry().begin(
+			crate::storage::finality_observation::WorkScope::Table(
+				crate::storage::finality_observation::TableScope {
+					tenant: meta.tenant_id,
+					object: meta.table_object_id,
+					generation: meta.schema_generation,
+				},
+			),
+			crate::storage::finality_observation::WorkKind::Mutation,
+		);
+		crate::storage::finality_observation::with_work(observation, async {
+
 		let mut synthetic = table_write_synthetic_meta(
 			&meta,
 			bifurcated.parent_key_identity,
@@ -9048,14 +9083,21 @@ impl WendelonDataServer {
 			#[cfg(test)]
 			let fail_next_local_durable_append = self.fail_next_local_durable_append.clone();
 			#[cfg(test)]
+			let local_observation_gate = self.local_observation_gate.lock().expect("local observation gate poisoned").take();
+			#[cfg(test)]
 			let delay_local_durable_append = self
 				.delay_next_local_durable_append
 				.lock()
 				.expect("local durable append delay failpoint poisoned")
 				.take();
-			let task = tokio::spawn(async move {
+			let task = tokio::spawn(crate::storage::finality_observation::carry_work(async move {
 				let _mutation_permit = mutation_permit;
 				let _mutation_drain = local_mutation_drain;
+				#[cfg(test)]
+				if let Some((entered, release)) = local_observation_gate {
+					entered.notify_one();
+					release.notified().await;
+				}
 				#[cfg(test)]
 				if let Some(delay) = delay_local_durable_append {
 					tokio::time::sleep(delay).await;
@@ -9083,7 +9125,7 @@ impl WendelonDataServer {
 					let _ = local_progress_tx.send(index);
 				}
 				Ok(())
-			});
+			}));
 			(Some(task), Some(local_progress_rx))
 		};
 		let mut join: JoinSet<std::io::Result<(usize, ReplicaAckLevel)>> = JoinSet::new();
@@ -9097,7 +9139,7 @@ impl WendelonDataServer {
 				let factory = self.factory.clone();
 				let pool = self.pool.clone();
 				let bytes = replica_payload.clone();
-				join.spawn(async move {
+				join.spawn(crate::storage::finality_observation::carry_work(async move {
 					Self::replicate_table_batch_to_remote(
 						factory,
 						pool,
@@ -9107,7 +9149,7 @@ impl WendelonDataServer {
 					)
 					.await
 					.map(|ack| (group_index, ack))
-				});
+				}));
 			}
 		}
 
@@ -9313,6 +9355,8 @@ impl WendelonDataServer {
 				Ok(self.counted_write_result(response, None))
 			}
 		}
+
+		}).await
 	}
 
 	async fn table_write(
@@ -9320,65 +9364,139 @@ impl WendelonDataServer {
 		meta: TableWriteRequestMeta,
 		payload: RecordBatch,
 	) -> std::io::Result<(TableWriteResponseMeta, Option<FinalizationMarker>)> {
-		metrics().data_ring_write_requests_total.inc();
-		if meta.proxy_hop >= 2 {
-			return Ok((
-				self.table_write_error_response(
-					&meta,
-					WriteStatus::PROXY_LIMIT,
-					PbcRejectCode::NONE,
-				),
-				None,
-			));
-		}
+		let observation = self.slab.finality_observation_registry().begin(
+			crate::storage::finality_observation::WorkScope::Table(
+				crate::storage::finality_observation::TableScope {
+					tenant: meta.tenant_id,
+					object: meta.table_object_id,
+					generation: meta.schema_generation,
+				},
+			),
+			crate::storage::finality_observation::WorkKind::Mutation,
+		);
+		crate::storage::finality_observation::with_work(observation, async {
+			metrics().data_ring_write_requests_total.inc();
+			if meta.proxy_hop >= 2 {
+				return Ok((
+					self.table_write_error_response(
+						&meta,
+						WriteStatus::PROXY_LIMIT,
+						PbcRejectCode::NONE,
+					),
+					None,
+				));
+			}
 
-		let admission = self.admission_snapshot();
-		if meta.expected_epoch < admission.current_epoch {
-			return Ok((
-				self.table_write_error_response(
-					&meta,
-					WriteStatus::EPOCH_STALE,
-					PbcRejectCode::NONE,
-				),
-				None,
-			));
-		}
+			let admission = self.admission_snapshot();
+			if meta.expected_epoch < admission.current_epoch {
+				return Ok((
+					self.table_write_error_response(
+						&meta,
+						WriteStatus::EPOCH_STALE,
+						PbcRejectCode::NONE,
+					),
+					None,
+				));
+			}
 
-		let key = Self::idempotency_key_for(meta.parent_write_id);
-		if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
-			let (write, trailing) = self.replay_write_outcome(cached.outcome()).await?;
-			return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
-		}
-		if let Some((write, trailing)) = self.durable_mutation_replay(&meta).await? {
-			return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
-		}
-		let clocks = WriteClocks::from_remaining_millis(meta.deadline_remaining_millis);
-		if let Some(expiry) = clocks.expired() {
-			let synthetic = table_write_synthetic_meta(&meta, Identity::ZERO, 0);
-			let write = mutation_expiry_response(
-				&synthetic,
-				expiry,
-				MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
-			);
-			self.record_mutation_outcome(meta.parent_write_id, meta.tenant_id, write, None, None)
+			let key = Self::idempotency_key_for(meta.parent_write_id);
+			if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
+				let (write, trailing) = self.replay_write_outcome(cached.outcome()).await?;
+				return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
+			}
+			if let Some((write, trailing)) = self.durable_mutation_replay(&meta).await? {
+				return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
+			}
+			let clocks = WriteClocks::from_remaining_millis(meta.deadline_remaining_millis);
+			if let Some(expiry) = clocks.expired() {
+				let synthetic = table_write_synthetic_meta(&meta, Identity::ZERO, 0);
+				let write = mutation_expiry_response(
+					&synthetic,
+					expiry,
+					MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+				);
+				self.record_mutation_outcome(
+					meta.parent_write_id,
+					meta.tenant_id,
+					write,
+					None,
+					None,
+				)
 				.await?;
-			return Ok((table_write_response(write, PbcRejectCode::NONE), None));
-		}
-		// Bound the entire admitted mutation, including synchronous bifurcation and
-		// encoding—not only the later replica phase. A row-capped batch can still be
-		// expensive in bytes, and admitting it outside this pool would recreate the
-		// abandoned-work accumulation Decision 6 forbids.
-		let mutation_permit = match self.acquire_table_mutation_permit(&meta, clocks).await? {
-			Ok(permit) => permit,
-			Err(response) => return Ok(response),
-		};
-		let mutation_drain = match self.mutation_drain.admit(
-			meta.tenant_id,
-			meta.table_object_id,
-			meta.schema_generation,
-		) {
-			Ok(guard) => guard,
-			Err(_) => {
+				return Ok((table_write_response(write, PbcRejectCode::NONE), None));
+			}
+			// Bound the entire admitted mutation, including synchronous bifurcation and
+			// encoding—not only the later replica phase. A row-capped batch can still be
+			// expensive in bytes, and admitting it outside this pool would recreate the
+			// abandoned-work accumulation Decision 6 forbids.
+			let mutation_permit = match self.acquire_table_mutation_permit(&meta, clocks).await? {
+				Ok(permit) => permit,
+				Err(response) => return Ok(response),
+			};
+			let mutation_drain = match self.mutation_drain.admit(
+				meta.tenant_id,
+				meta.table_object_id,
+				meta.schema_generation,
+			) {
+				Ok(guard) => guard,
+				Err(_) => {
+					return Ok((
+						self.table_write_error_response(
+							&meta,
+							WriteStatus::INTERNAL_ERROR,
+							PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
+						),
+						None,
+					));
+				}
+			};
+
+			if self.degraded_reason().is_some() {
+				let synthetic = table_write_synthetic_meta(&meta, Identity::ZERO, 0);
+				let (write, trailing) = self.fenced_write_response(&synthetic).await;
+				return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
+			}
+
+			let _secondary_index_admission =
+				self.slab.acquire_secondary_index_admission_guard().await;
+			let (descriptor, drop_fenced, effective_retention, secondary_index_descriptors) = {
+				let state = self.state_machine.state_snapshot().await;
+				let effective_retention = self.table_effective_retention_from_state(
+					&state,
+					meta.tenant_id,
+					meta.table_object_id,
+				);
+				let drop_fenced =
+					state.table_drop_blocks_admission(meta.tenant_id, meta.table_object_id);
+				let descriptor = state
+					.table_schemas
+					.latest_by_id(meta.tenant_id, meta.table_object_id)
+					.cloned()
+					.or_else(|| {
+						let saga = state
+							.ctas_sagas
+							.operation_for_object(meta.tenant_id, meta.table_object_id)?;
+						saga.contains_row_write_id(meta.parent_write_id)
+							.then(|| saga.descriptor.clone())
+					});
+				let secondary_index_descriptors = descriptor
+					.as_ref()
+					.map(|descriptor| {
+						Self::secondary_index_admission_descriptors(
+							&state.secondary_indexes,
+							meta.tenant_id,
+							descriptor,
+						)
+					})
+					.unwrap_or_default();
+				(
+					descriptor,
+					drop_fenced,
+					effective_retention,
+					secondary_index_descriptors,
+				)
+			};
+			if drop_fenced {
 				return Ok((
 					self.table_write_error_response(
 						&meta,
@@ -9388,256 +9506,208 @@ impl WendelonDataServer {
 					None,
 				));
 			}
-		};
-
-		if self.degraded_reason().is_some() {
-			let synthetic = table_write_synthetic_meta(&meta, Identity::ZERO, 0);
-			let (write, trailing) = self.fenced_write_response(&synthetic).await;
-			return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
-		}
-
-		let _secondary_index_admission = self.slab.acquire_secondary_index_admission_guard().await;
-		let (descriptor, drop_fenced, effective_retention, secondary_index_descriptors) = {
-			let state = self.state_machine.state_snapshot().await;
-			let effective_retention = self.table_effective_retention_from_state(
-				&state,
-				meta.tenant_id,
-				meta.table_object_id,
-			);
-			let drop_fenced =
-				state.table_drop_blocks_admission(meta.tenant_id, meta.table_object_id);
-			let descriptor = state
-				.table_schemas
-				.latest_by_id(meta.tenant_id, meta.table_object_id)
-				.cloned()
-				.or_else(|| {
-					let saga = state
-						.ctas_sagas
-						.operation_for_object(meta.tenant_id, meta.table_object_id)?;
-					saga.contains_row_write_id(meta.parent_write_id)
-						.then(|| saga.descriptor.clone())
-				});
-			let secondary_index_descriptors = descriptor
-				.as_ref()
-				.map(|descriptor| {
-					Self::secondary_index_admission_descriptors(
-						&state.secondary_indexes,
-						meta.tenant_id,
-						descriptor,
-					)
-				})
-				.unwrap_or_default();
-			(
-				descriptor,
-				drop_fenced,
-				effective_retention,
-				secondary_index_descriptors,
-			)
-		};
-		if drop_fenced {
-			return Ok((
-				self.table_write_error_response(
-					&meta,
-					WriteStatus::INTERNAL_ERROR,
-					PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
-				),
-				None,
-			));
-		}
-		let Some(descriptor) = descriptor else {
-			return Ok((
-				self.table_write_error_response(
-					&meta,
-					WriteStatus::INTERNAL_ERROR,
-					PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
-				),
-				None,
-			));
-		};
-		if self
-			.slab
-			.table_integrity_failure(meta.tenant_id, meta.table_object_id)
-			.is_some()
-		{
-			return Ok((
-				self.table_write_error_response(
-					&meta,
-					WriteStatus::TABLE_REFERENCE_INTEGRITY_FAILED,
-					PbcRejectCode::NONE,
-				),
-				None,
-			));
-		}
-
-		// ADR 045: stamp the leader-merged commit HLC *before*
-		// admission. The HLC driver guarantees `merge` returns a
-		// strictly monotonic HLC per leader call, so two batches
-		// from the same admitting node are guaranteed to receive
-		// distinct row HLCs even when the client supplies
-		// identical `client_hlc` values. This HLC then feeds the
-		// append-only identity preimage AND the persisted
-		// `__row_hlc__` column — they must agree.
-		let commit_hlc = self.merge_commit_hlc(meta.client_hlc);
-		// ADR 045 §4 / Phase 8: bind WriterNodeId from the admitting
-		// server's authenticated NodeId (ADR 018 mTLS). Not from
-		// `meta.proxy_source`, which the wire contract zeros on
-		// direct SDK writes.
-		let writer_node_id = WriterNodeId::from_node_id(self.local_node);
-
-		let _content_hash_guard = if matches!(
-			descriptor.row_identity_policy,
-			RowIdentityPolicy::AppendOnlyContentHash
-		) {
-			Some(
-				self.content_hash_admission_guard(meta.tenant_id, meta.table_object_id)
-					.await,
-			)
-		} else {
-			None
-		};
-
-		let mut content_hash_metrics = None;
-		let mut primary_key_metrics = None;
-		let bifurcated = match if matches!(
-			descriptor.row_identity_policy,
-			RowIdentityPolicy::AppendOnlyContentHash
-		) {
-			self.bifurcate_content_hash_table_write(
-				&meta,
-				&payload,
-				&descriptor,
-				&effective_retention,
-				commit_hlc,
-			)
-			.map(|outcome| {
-				content_hash_metrics = Some((outcome.absorbed_rows, outcome.stored_rows));
-				outcome.bifurcated
-			})
-		} else if matches!(
-			descriptor.row_identity_policy,
-			RowIdentityPolicy::PrimaryKey(_)
-		) {
-			self.bifurcate_primary_key_table_write(
-				&meta,
-				&payload,
-				&descriptor,
-				writer_node_id,
-				commit_hlc,
-			)
-			.map(|outcome| {
-				primary_key_metrics =
-					Some((outcome.upsert_no_digest_add_rows, outcome.resurrected_rows));
-				Some(outcome.bifurcated)
-			})
-		} else {
-			bifurcate_table_write_with_row_group_encoding_and_chunk_layout_config(
-				&meta,
-				&payload,
-				&descriptor,
-				writer_node_id,
-				commit_hlc,
-				self.slab.row_group_writer_config(),
-				self.slab.encoding_writer_config(),
-				self.slab.l2_chunk_layout_config(),
-			)
-			.map(Some)
-		} {
-			Ok(bifurcated) => bifurcated,
-			Err(err) => {
+			let Some(descriptor) = descriptor else {
 				return Ok((
 					self.table_write_error_response(
 						&meta,
-						table_write_status_for_reject(err.code),
-						err.code,
+						WriteStatus::INTERNAL_ERROR,
+						PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
+					),
+					None,
+				));
+			};
+			if self
+				.slab
+				.table_integrity_failure(meta.tenant_id, meta.table_object_id)
+				.is_some()
+			{
+				return Ok((
+					self.table_write_error_response(
+						&meta,
+						WriteStatus::TABLE_REFERENCE_INTEGRITY_FAILED,
+						PbcRejectCode::NONE,
 					),
 					None,
 				));
 			}
-		};
-		let Some(bifurcated) = bifurcated else {
-			if let Some((absorbed_rows, stored_rows)) = content_hash_metrics {
-				observe_content_hash_admission_metrics(
+
+			// ADR 045: stamp the leader-merged commit HLC *before*
+			// admission. The HLC driver guarantees `merge` returns a
+			// strictly monotonic HLC per leader call, so two batches
+			// from the same admitting node are guaranteed to receive
+			// distinct row HLCs even when the client supplies
+			// identical `client_hlc` values. This HLC then feeds the
+			// append-only identity preimage AND the persisted
+			// `__row_hlc__` column — they must agree.
+			let commit_hlc = self.merge_commit_hlc(meta.client_hlc);
+			// ADR 045 §4 / Phase 8: bind WriterNodeId from the admitting
+			// server's authenticated NodeId (ADR 018 mTLS). Not from
+			// `meta.proxy_source`, which the wire contract zeros on
+			// direct SDK writes.
+			let writer_node_id = WriterNodeId::from_node_id(self.local_node);
+
+			let _content_hash_guard = if matches!(
+				descriptor.row_identity_policy,
+				RowIdentityPolicy::AppendOnlyContentHash
+			) {
+				Some(
+					self.content_hash_admission_guard(meta.tenant_id, meta.table_object_id)
+						.await,
+				)
+			} else {
+				None
+			};
+
+			let mut content_hash_metrics = None;
+			let mut primary_key_metrics = None;
+			let bifurcated = match if matches!(
+				descriptor.row_identity_policy,
+				RowIdentityPolicy::AppendOnlyContentHash
+			) {
+				self.bifurcate_content_hash_table_write(
+					&meta,
+					&payload,
+					&descriptor,
+					&effective_retention,
+					commit_hlc,
+				)
+				.map(|outcome| {
+					content_hash_metrics = Some((outcome.absorbed_rows, outcome.stored_rows));
+					outcome.bifurcated
+				})
+			} else if matches!(
+				descriptor.row_identity_policy,
+				RowIdentityPolicy::PrimaryKey(_)
+			) {
+				self.bifurcate_primary_key_table_write(
+					&meta,
+					&payload,
+					&descriptor,
+					writer_node_id,
+					commit_hlc,
+				)
+				.map(|outcome| {
+					primary_key_metrics =
+						Some((outcome.upsert_no_digest_add_rows, outcome.resurrected_rows));
+					Some(outcome.bifurcated)
+				})
+			} else {
+				bifurcate_table_write_with_row_group_encoding_and_chunk_layout_config(
+					&meta,
+					&payload,
+					&descriptor,
+					writer_node_id,
+					commit_hlc,
+					self.slab.row_group_writer_config(),
+					self.slab.encoding_writer_config(),
+					self.slab.l2_chunk_layout_config(),
+				)
+				.map(Some)
+			} {
+				Ok(bifurcated) => bifurcated,
+				Err(err) => {
+					return Ok((
+						self.table_write_error_response(
+							&meta,
+							table_write_status_for_reject(err.code),
+							err.code,
+						),
+						None,
+					));
+				}
+			};
+			let Some(bifurcated) = bifurcated else {
+				if let Some((absorbed_rows, stored_rows)) = content_hash_metrics {
+					observe_content_hash_admission_metrics(
+						meta.tenant_id,
+						meta.table_object_id,
+						absorbed_rows,
+						stored_rows,
+					);
+				}
+				let write = self.counted_write_response(table_write_noop_write_response(
+					&meta,
+					commit_hlc,
+					self.local_node,
+				));
+				self.idempotency.insert(
+					key,
+					CachedWriteOutcome::new(WriteOutcome::NoopCommitted { response: write }),
+				);
+				self.record_mutation_outcome(
+					meta.parent_write_id,
 					meta.tenant_id,
-					meta.table_object_id,
+					write,
+					None,
+					None,
+				)
+				.await?;
+				return Ok((table_write_response(write, PbcRejectCode::NONE), None));
+			};
+			let migrations_snapshot = self.state_machine.state_snapshot().await.migrations.clone();
+			let Some(groups) =
+				self.table_batch_replica_groups(&bifurcated.children, &migrations_snapshot)
+			else {
+				return Ok((
+					self.table_write_error_response(
+						&meta,
+						WriteStatus::INTERNAL_ERROR,
+						PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
+					),
+					None,
+				));
+			};
+			let is_append_only = descriptor.is_append_only();
+			let content_hash_metric_tenant = meta.tenant_id;
+			let content_hash_metric_table = meta.table_object_id;
+			let primary_key_metric_tenant = meta.tenant_id;
+			let primary_key_metric_table = meta.table_object_id;
+			let (write, trailing) = self
+				.write_table_bifurcated(
+					meta,
+					bifurcated,
+					groups,
+					&descriptor,
+					commit_hlc,
+					is_append_only,
+					secondary_index_descriptors,
+					None,
+					clocks,
+					mutation_permit,
+					mutation_drain,
+				)
+				.await?;
+			if matches!(
+				write.status,
+				WriteStatus::OK | WriteStatus::FINALIZATION_PENDING
+			) && let Some((absorbed_rows, stored_rows)) = content_hash_metrics
+			{
+				observe_content_hash_admission_metrics(
+					content_hash_metric_tenant,
+					content_hash_metric_table,
 					absorbed_rows,
 					stored_rows,
 				);
 			}
-			let write = self.counted_write_response(table_write_noop_write_response(
-				&meta,
-				commit_hlc,
-				self.local_node,
-			));
-			self.idempotency.insert(
-				key,
-				CachedWriteOutcome::new(WriteOutcome::NoopCommitted { response: write }),
-			);
-			self.record_mutation_outcome(meta.parent_write_id, meta.tenant_id, write, None, None)
-				.await?;
-			return Ok((table_write_response(write, PbcRejectCode::NONE), None));
-		};
-		let migrations_snapshot = self.state_machine.state_snapshot().await.migrations.clone();
-		let Some(groups) =
-			self.table_batch_replica_groups(&bifurcated.children, &migrations_snapshot)
-		else {
-			return Ok((
-				self.table_write_error_response(
-					&meta,
-					WriteStatus::INTERNAL_ERROR,
-					PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
-				),
-				None,
-			));
-		};
-		let is_append_only = descriptor.is_append_only();
-		let content_hash_metric_tenant = meta.tenant_id;
-		let content_hash_metric_table = meta.table_object_id;
-		let primary_key_metric_tenant = meta.tenant_id;
-		let primary_key_metric_table = meta.table_object_id;
-		let (write, trailing) = self
-			.write_table_bifurcated(
-				meta,
-				bifurcated,
-				groups,
-				&descriptor,
-				commit_hlc,
-				is_append_only,
-				secondary_index_descriptors,
-				None,
-				clocks,
-				mutation_permit,
-				mutation_drain,
-			)
-			.await?;
-		if matches!(
-			write.status,
-			WriteStatus::OK | WriteStatus::FINALIZATION_PENDING
-		) && let Some((absorbed_rows, stored_rows)) = content_hash_metrics
-		{
-			observe_content_hash_admission_metrics(
-				content_hash_metric_tenant,
-				content_hash_metric_table,
-				absorbed_rows,
-				stored_rows,
-			);
-		}
-		if matches!(
-			write.status,
-			WriteStatus::OK | WriteStatus::FINALIZATION_PENDING
-		) && let Some((upsert_no_digest_add_rows, resurrected_rows)) = primary_key_metrics
-		{
-			metrics().observe_storage_pk_upsert_no_digest_add(
-				primary_key_metric_tenant,
-				primary_key_metric_table,
-				upsert_no_digest_add_rows,
-			);
-			metrics().observe_storage_pk_delete_resurrections(
-				primary_key_metric_tenant,
-				primary_key_metric_table,
-				resurrected_rows,
-			);
-		}
-		Ok((table_write_response(write, PbcRejectCode::NONE), trailing))
+			if matches!(
+				write.status,
+				WriteStatus::OK | WriteStatus::FINALIZATION_PENDING
+			) && let Some((upsert_no_digest_add_rows, resurrected_rows)) = primary_key_metrics
+			{
+				metrics().observe_storage_pk_upsert_no_digest_add(
+					primary_key_metric_tenant,
+					primary_key_metric_table,
+					upsert_no_digest_add_rows,
+				);
+				metrics().observe_storage_pk_delete_resurrections(
+					primary_key_metric_tenant,
+					primary_key_metric_table,
+					resurrected_rows,
+				);
+			}
+			Ok((table_write_response(write, PbcRejectCode::NONE), trailing))
+		})
+		.await
 	}
 
 	fn bifurcate_primary_key_table_write(
@@ -9798,96 +9868,143 @@ impl WendelonDataServer {
 		meta: TableDeleteRowsRequestMeta,
 		row_key_ids: Vec<Identity>,
 	) -> std::io::Result<(TableDeleteRowsResponseMeta, Option<FinalizationMarker>)> {
-		metrics().data_ring_write_requests_total.inc();
-		if row_key_ids.is_empty() || row_key_ids.len() != meta.row_count as usize {
-			return Ok((
-				self.table_delete_error_response(
-					&meta,
-					WriteStatus::INTERNAL_ERROR,
-					PbcRejectCode::PBC_REJECT_ROW_COUNT_MISMATCH,
-				),
-				None,
-			));
-		}
-		if row_key_ids.len() > TABLE_WRITE_MAX_ROWS {
-			return Ok((
-				self.table_delete_error_response(
-					&meta,
-					WriteStatus::PAYLOAD_TOO_LARGE,
-					PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE,
-				),
-				None,
-			));
-		}
+		let observation = self.slab.finality_observation_registry().begin(
+			crate::storage::finality_observation::WorkScope::Table(
+				crate::storage::finality_observation::TableScope {
+					tenant: meta.tenant_id,
+					object: meta.table_object_id,
+					generation: meta.schema_generation,
+				},
+			),
+			crate::storage::finality_observation::WorkKind::Mutation,
+		);
+		crate::storage::finality_observation::with_work(observation, async {
+			metrics().data_ring_write_requests_total.inc();
+			if row_key_ids.is_empty() || row_key_ids.len() != meta.row_count as usize {
+				return Ok((
+					self.table_delete_error_response(
+						&meta,
+						WriteStatus::INTERNAL_ERROR,
+						PbcRejectCode::PBC_REJECT_ROW_COUNT_MISMATCH,
+					),
+					None,
+				));
+			}
+			if row_key_ids.len() > TABLE_WRITE_MAX_ROWS {
+				return Ok((
+					self.table_delete_error_response(
+						&meta,
+						WriteStatus::PAYLOAD_TOO_LARGE,
+						PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE,
+					),
+					None,
+				));
+			}
 
-		let current_leader = self.raft.current_leader().await;
-		if current_leader != Some(self.local_node.id) {
-			let mut response = self.table_delete_error_response(
-				&meta,
-				WriteStatus::NOT_LEADER,
-				PbcRejectCode::NONE,
-			);
-			response.write.leader_hint = current_leader
-				.map(|id| NodeId { id, _reserved: 0 })
-				.unwrap_or(self.local_node);
-			return Ok((response, None));
-		}
-
-		let admission = self.admission_snapshot();
-		if meta.expected_epoch < admission.current_epoch {
-			return Ok((
-				self.table_delete_error_response(
+			let current_leader = self.raft.current_leader().await;
+			if current_leader != Some(self.local_node.id) {
+				let mut response = self.table_delete_error_response(
 					&meta,
-					WriteStatus::EPOCH_STALE,
-					PbcRejectCode::PBC_REJECT_SCHEMA_STALE,
-				),
-				None,
-			));
-		}
+					WriteStatus::NOT_LEADER,
+					PbcRejectCode::NONE,
+				);
+				response.write.leader_hint = current_leader
+					.map(|id| NodeId { id, _reserved: 0 })
+					.unwrap_or(self.local_node);
+				return Ok((response, None));
+			}
 
-		let key = Self::idempotency_key_for(meta.parent_write_id);
-		if let Some(cached) = self
-			.table_delete_idempotency
-			.get(&key)
-			.map(|entry| *entry.value())
-		{
-			return Ok((cached.response, cached.trailing));
-		}
-		if let Some(replayed) = self.durable_delete_replay(&meta).await? {
-			return Ok(replayed);
-		}
-		let clocks = WriteClocks::from_remaining_millis(meta.deadline_remaining_millis);
-		if let Some(expiry) = clocks.expired() {
-			let synthetic = table_delete_synthetic_write_meta(&meta, Identity::ZERO, 0);
-			let write = mutation_expiry_response(
-				&synthetic,
-				expiry,
-				MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
-			);
-			self.record_mutation_outcome(
-				meta.parent_write_id,
+			let admission = self.admission_snapshot();
+			if meta.expected_epoch < admission.current_epoch {
+				return Ok((
+					self.table_delete_error_response(
+						&meta,
+						WriteStatus::EPOCH_STALE,
+						PbcRejectCode::PBC_REJECT_SCHEMA_STALE,
+					),
+					None,
+				));
+			}
+
+			let key = Self::idempotency_key_for(meta.parent_write_id);
+			if let Some(cached) = self
+				.table_delete_idempotency
+				.get(&key)
+				.map(|entry| *entry.value())
+			{
+				return Ok((cached.response, cached.trailing));
+			}
+			if let Some(replayed) = self.durable_delete_replay(&meta).await? {
+				return Ok(replayed);
+			}
+			let clocks = WriteClocks::from_remaining_millis(meta.deadline_remaining_millis);
+			if let Some(expiry) = clocks.expired() {
+				let synthetic = table_delete_synthetic_write_meta(&meta, Identity::ZERO, 0);
+				let write = mutation_expiry_response(
+					&synthetic,
+					expiry,
+					MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+				);
+				self.record_mutation_outcome(
+					meta.parent_write_id,
+					meta.tenant_id,
+					write,
+					None,
+					Some([0; 3]),
+				)
+				.await?;
+				return Ok((
+					table_delete_rows_response(write, 0, 0, 0, PbcRejectCode::NONE),
+					None,
+				));
+			}
+			let mutation_permit = match self.acquire_delete_mutation_permit(&meta, clocks).await? {
+				Ok(permit) => permit,
+				Err(response) => return Ok(response),
+			};
+			let mutation_drain = match self.mutation_drain.admit(
 				meta.tenant_id,
-				write,
-				None,
-				Some([0; 3]),
-			)
-			.await?;
-			return Ok((
-				table_delete_rows_response(write, 0, 0, 0, PbcRejectCode::NONE),
-				None,
-			));
-		}
-		let mutation_permit = match self.acquire_delete_mutation_permit(&meta, clocks).await? {
-			Ok(permit) => permit,
-			Err(response) => return Ok(response),
-		};
-		let mutation_drain = match self.mutation_drain.admit(
-			meta.tenant_id,
-			meta.table_object_id,
-			meta.schema_generation,
-		) {
-			Ok(guard) => guard,
-			Err(_) => {
+				meta.table_object_id,
+				meta.schema_generation,
+			) {
+				Ok(guard) => guard,
+				Err(_) => {
+					return Ok((
+						self.table_delete_error_response(
+							&meta,
+							WriteStatus::INTERNAL_ERROR,
+							PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
+						),
+						None,
+					));
+				}
+			};
+
+			if self.degraded_reason().is_some() {
+				let synthetic = table_delete_synthetic_write_meta(&meta, Identity::ZERO, 0);
+				let (write, trailing) = self.fenced_write_response(&synthetic).await;
+				return Ok((
+					table_delete_rows_response(write, 0, 0, 0, PbcRejectCode::NONE),
+					trailing,
+				));
+			}
+
+			let (descriptor, drop_fenced, effective_retention) = {
+				let state = self.state_machine.state_snapshot().await;
+				let effective_retention = self.table_effective_retention_from_state(
+					&state,
+					meta.tenant_id,
+					meta.table_object_id,
+				);
+				let drop_fenced =
+					state.table_drop_blocks_admission(meta.tenant_id, meta.table_object_id);
+				let descriptor = state
+					.table_schemas
+					.latest_by_id(meta.tenant_id, meta.table_object_id)
+					.cloned();
+				(descriptor, drop_fenced, effective_retention)
+			};
+			if drop_fenced {
 				return Ok((
 					self.table_delete_error_response(
 						&meta,
@@ -9897,178 +10014,248 @@ impl WendelonDataServer {
 					None,
 				));
 			}
-		};
-
-		if self.degraded_reason().is_some() {
-			let synthetic = table_delete_synthetic_write_meta(&meta, Identity::ZERO, 0);
-			let (write, trailing) = self.fenced_write_response(&synthetic).await;
-			return Ok((
-				table_delete_rows_response(write, 0, 0, 0, PbcRejectCode::NONE),
-				trailing,
-			));
-		}
-
-		let (descriptor, drop_fenced, effective_retention) = {
-			let state = self.state_machine.state_snapshot().await;
-			let effective_retention = self.table_effective_retention_from_state(
-				&state,
-				meta.tenant_id,
-				meta.table_object_id,
-			);
-			let drop_fenced =
-				state.table_drop_blocks_admission(meta.tenant_id, meta.table_object_id);
-			let descriptor = state
-				.table_schemas
-				.latest_by_id(meta.tenant_id, meta.table_object_id)
-				.cloned();
-			(descriptor, drop_fenced, effective_retention)
-		};
-		if drop_fenced {
-			return Ok((
-				self.table_delete_error_response(
-					&meta,
-					WriteStatus::INTERNAL_ERROR,
-					PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
-				),
-				None,
-			));
-		}
-		let Some(descriptor) = descriptor else {
-			return Ok((
-				self.table_delete_error_response(
-					&meta,
-					WriteStatus::INTERNAL_ERROR,
-					PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
-				),
-				None,
-			));
-		};
-		if descriptor.schema_generation != meta.schema_generation {
-			return Ok((
-				self.table_delete_error_response(
-					&meta,
-					WriteStatus::EPOCH_STALE,
-					PbcRejectCode::PBC_REJECT_SCHEMA_STALE,
-				),
-				None,
-			));
-		}
-		let layout = match tombstone_marker_layout(&descriptor) {
-			Ok(layout) => layout,
-			Err(code) => {
+			let Some(descriptor) = descriptor else {
 				return Ok((
-					self.table_delete_error_response(&meta, WriteStatus::INTERNAL_ERROR, code),
+					self.table_delete_error_response(
+						&meta,
+						WriteStatus::INTERNAL_ERROR,
+						PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
+					),
+					None,
+				));
+			};
+			if descriptor.schema_generation != meta.schema_generation {
+				return Ok((
+					self.table_delete_error_response(
+						&meta,
+						WriteStatus::EPOCH_STALE,
+						PbcRejectCode::PBC_REJECT_SCHEMA_STALE,
+					),
 					None,
 				));
 			}
-		};
-		let is_primary_key_table = matches!(
-			descriptor.row_identity_policy,
-			RowIdentityPolicy::PrimaryKey(_)
-		);
-		if is_primary_key_table {
-			metrics().observe_storage_pk_delete_request(meta.tenant_id, meta.table_object_id);
-		}
-
-		let delete_hlc = self.merge_commit_hlc(meta.client_hlc);
-		let mut seen = HashSet::with_capacity(row_key_ids.len());
-		let mut tombstone_rows = Vec::new();
-		let mut already_deleted_count = 0_u32;
-		let mut not_found_count = 0_u32;
-		for row_key_id in row_key_ids {
-			if !seen.insert(row_key_id) {
-				continue;
-			}
-			let outcome = if is_primary_key_table {
-				let started = Instant::now();
-				let outcome = admit_pk_delete_row(
-					&descriptor,
-					meta.tenant_id,
-					row_key_id,
-					delete_hlc,
-					&effective_retention,
-					&self.slab,
-				);
-				metrics().observe_storage_pk_admission_visibility_lookup(
-					meta.tenant_id,
-					meta.table_object_id,
-					started.elapsed(),
-				);
-				outcome
-			} else {
-				let latest = self
-					.slab
-					.lookup_as_of(meta.tenant_id, row_key_id, delete_hlc);
-				crate::storage::pk_delete::pk_delete_outcome_for_latest(latest)
+			let layout = match tombstone_marker_layout(&descriptor) {
+				Ok(layout) => layout,
+				Err(code) => {
+					return Ok((
+						self.table_delete_error_response(&meta, WriteStatus::INTERNAL_ERROR, code),
+						None,
+					));
+				}
 			};
-			match outcome {
-				PkAdmissionOutcome::DeleteAbsorbedNotVisible {
-					latest_was_tombstone: true,
-				} => {
-					already_deleted_count = already_deleted_count.saturating_add(1);
-				}
-				PkAdmissionOutcome::DeletedSupersedingVisible => {
-					let Some(routing_locality) = self
-						.slab
-						.routing_locality_for_existing_key(meta.tenant_id, row_key_id)
-					else {
-						tracing::warn!(
-							tenant_id = meta.tenant_id.get(),
-							row_key_id = %format_bytes_hex(row_key_id.as_bytes()),
-							"append-only row tombstone target is missing cached routing locality"
-						);
-						return Ok((
-							self.table_delete_error_response(
-								&meta,
-								WriteStatus::INTERNAL_ERROR,
-								PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
-							),
-							None,
-						));
-					};
-					let source_row_index = tombstone_rows.len();
-					// ADR 0090: a tombstone is placed with the row it deletes.
-					let Ok(tombstone_partition) = crate::storage::multirow::write_partition_for_row(
-						&descriptor,
-						routing_locality,
-					) else {
-						return Ok((
-							self.table_delete_error_response(
-								&meta,
-								WriteStatus::INTERNAL_ERROR,
-								PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
-							),
-							None,
-						));
-					};
-					tombstone_rows.push(MultiRowSourceRow {
-						source_row_index,
-						key_identity: row_key_id,
-						routing_locality,
-						row_hlc: delete_hlc,
-						is_tombstone: true,
-						partition: tombstone_partition,
-						table_object_id: Some(descriptor.table_object_id),
-					});
-				}
-				PkAdmissionOutcome::DeleteAbsorbedNotVisible {
-					latest_was_tombstone: false,
-				} => {
-					not_found_count = not_found_count.saturating_add(1);
-				}
-				PkAdmissionOutcome::InsertedNewVisible { .. }
-				| PkAdmissionOutcome::UpsertedAlreadyVisible => unreachable!(
-					"write admission outcomes are not produced by delete classification"
-				),
+			let is_primary_key_table = matches!(
+				descriptor.row_identity_policy,
+				RowIdentityPolicy::PrimaryKey(_)
+			);
+			if is_primary_key_table {
+				metrics().observe_storage_pk_delete_request(meta.tenant_id, meta.table_object_id);
 			}
-		}
-		let deleted_count = u32::try_from(tombstone_rows.len()).unwrap_or(u32::MAX);
-		if tombstone_rows.is_empty() {
-			let write = self.counted_write_response(table_delete_noop_write_response(
-				&meta,
-				delete_hlc,
-				self.local_node,
-			));
+
+			let delete_hlc = self.merge_commit_hlc(meta.client_hlc);
+			let mut seen = HashSet::with_capacity(row_key_ids.len());
+			let mut tombstone_rows = Vec::new();
+			let mut already_deleted_count = 0_u32;
+			let mut not_found_count = 0_u32;
+			for row_key_id in row_key_ids {
+				if !seen.insert(row_key_id) {
+					continue;
+				}
+				let outcome = if is_primary_key_table {
+					let started = Instant::now();
+					let outcome = admit_pk_delete_row(
+						&descriptor,
+						meta.tenant_id,
+						row_key_id,
+						delete_hlc,
+						&effective_retention,
+						&self.slab,
+					);
+					metrics().observe_storage_pk_admission_visibility_lookup(
+						meta.tenant_id,
+						meta.table_object_id,
+						started.elapsed(),
+					);
+					outcome
+				} else {
+					let latest = self
+						.slab
+						.lookup_as_of(meta.tenant_id, row_key_id, delete_hlc);
+					crate::storage::pk_delete::pk_delete_outcome_for_latest(latest)
+				};
+				match outcome {
+					PkAdmissionOutcome::DeleteAbsorbedNotVisible {
+						latest_was_tombstone: true,
+					} => {
+						already_deleted_count = already_deleted_count.saturating_add(1);
+					}
+					PkAdmissionOutcome::DeletedSupersedingVisible => {
+						let Some(routing_locality) = self
+							.slab
+							.routing_locality_for_existing_key(meta.tenant_id, row_key_id)
+						else {
+							tracing::warn!(
+								tenant_id = meta.tenant_id.get(),
+								row_key_id = %format_bytes_hex(row_key_id.as_bytes()),
+								"append-only row tombstone target is missing cached routing locality"
+							);
+							return Ok((
+								self.table_delete_error_response(
+									&meta,
+									WriteStatus::INTERNAL_ERROR,
+									PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
+								),
+								None,
+							));
+						};
+						let source_row_index = tombstone_rows.len();
+						// ADR 0090: a tombstone is placed with the row it deletes.
+						let Ok(tombstone_partition) =
+							crate::storage::multirow::write_partition_for_row(
+								&descriptor,
+								routing_locality,
+							)
+						else {
+							return Ok((
+								self.table_delete_error_response(
+									&meta,
+									WriteStatus::INTERNAL_ERROR,
+									PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
+								),
+								None,
+							));
+						};
+						tombstone_rows.push(MultiRowSourceRow {
+							source_row_index,
+							key_identity: row_key_id,
+							routing_locality,
+							row_hlc: delete_hlc,
+							is_tombstone: true,
+							partition: tombstone_partition,
+							table_object_id: Some(descriptor.table_object_id),
+						});
+					}
+					PkAdmissionOutcome::DeleteAbsorbedNotVisible {
+						latest_was_tombstone: false,
+					} => {
+						not_found_count = not_found_count.saturating_add(1);
+					}
+					PkAdmissionOutcome::InsertedNewVisible { .. }
+					| PkAdmissionOutcome::UpsertedAlreadyVisible => unreachable!(
+						"write admission outcomes are not produced by delete classification"
+					),
+				}
+			}
+			let deleted_count = u32::try_from(tombstone_rows.len()).unwrap_or(u32::MAX);
+			if tombstone_rows.is_empty() {
+				let write = self.counted_write_response(table_delete_noop_write_response(
+					&meta,
+					delete_hlc,
+					self.local_node,
+				));
+				let response = table_delete_rows_response(
+					write,
+					deleted_count,
+					already_deleted_count,
+					not_found_count,
+					PbcRejectCode::NONE,
+				);
+				if is_primary_key_table {
+					metrics().observe_storage_pk_delete_outcomes(
+						meta.tenant_id,
+						meta.table_object_id,
+						u64::from(deleted_count),
+						u64::from(already_deleted_count),
+						u64::from(not_found_count),
+					);
+				}
+				self.table_delete_idempotency.insert(
+					key,
+					CachedTableDeleteOutcome {
+						response,
+						trailing: None,
+					},
+				);
+				self.record_mutation_outcome(
+					meta.parent_write_id,
+					meta.tenant_id,
+					write,
+					None,
+					Some([deleted_count, already_deleted_count, not_found_count]),
+				)
+				.await?;
+				return Ok((response, None));
+			}
+
+			let synthetic_meta =
+				table_delete_synthetic_table_write_meta(&meta, tombstone_rows.len())?;
+			let packed = match pack_tombstone_multirow_source_rows_with_policy(
+				layout,
+				&tombstone_rows,
+				descriptor.record_body_compression_policy,
+			) {
+				Ok(packed) => packed,
+				Err(err) => {
+					tracing::warn!(
+						tenant_id = meta.tenant_id.get(),
+						error = %err,
+						"failed to pack append-only row tombstones"
+					);
+					return Ok((
+						self.table_delete_error_response(
+							&meta,
+							WriteStatus::INTERNAL_ERROR,
+							PbcRejectCode::PBC_REJECT_TOMBSTONE_PACKING_FAILED,
+						),
+						None,
+					));
+				}
+			};
+			let bifurcated = match bifurcate_table_delete(&meta, &descriptor, packed) {
+				Ok(bifurcated) => bifurcated,
+				Err(err) => {
+					tracing::warn!(
+						tenant_id = meta.tenant_id.get(),
+						error = %err,
+						"failed to bifurcate append-only row tombstones"
+					);
+					return Ok((
+						self.table_delete_error_response(
+							&meta,
+							WriteStatus::INTERNAL_ERROR,
+							PbcRejectCode::PBC_REJECT_TOMBSTONE_PACKING_FAILED,
+						),
+						None,
+					));
+				}
+			};
+			let migrations_snapshot = self.state_machine.state_snapshot().await.migrations.clone();
+			let Some(groups) =
+				self.table_batch_replica_groups(&bifurcated.children, &migrations_snapshot)
+			else {
+				return Ok((
+					self.table_delete_error_response(
+						&meta,
+						WriteStatus::INTERNAL_ERROR,
+						PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
+					),
+					None,
+				));
+			};
+			let (write, trailing) = self
+				.write_table_bifurcated(
+					synthetic_meta,
+					bifurcated,
+					groups,
+					&descriptor,
+					delete_hlc,
+					false,
+					Vec::new(),
+					Some([deleted_count, already_deleted_count, not_found_count]),
+					clocks,
+					mutation_permit,
+					mutation_drain,
+				)
+				.await?;
 			let response = table_delete_rows_response(
 				write,
 				deleted_count,
@@ -10085,120 +10272,19 @@ impl WendelonDataServer {
 					u64::from(not_found_count),
 				);
 			}
-			self.table_delete_idempotency.insert(
-				key,
-				CachedTableDeleteOutcome {
-					response,
-					trailing: None,
-				},
-			);
+			self.table_delete_idempotency
+				.insert(key, CachedTableDeleteOutcome { response, trailing });
 			self.record_mutation_outcome(
 				meta.parent_write_id,
 				meta.tenant_id,
 				write,
-				None,
+				trailing,
 				Some([deleted_count, already_deleted_count, not_found_count]),
 			)
 			.await?;
-			return Ok((response, None));
-		}
-
-		let synthetic_meta = table_delete_synthetic_table_write_meta(&meta, tombstone_rows.len())?;
-		let packed = match pack_tombstone_multirow_source_rows_with_policy(
-			layout,
-			&tombstone_rows,
-			descriptor.record_body_compression_policy,
-		) {
-			Ok(packed) => packed,
-			Err(err) => {
-				tracing::warn!(
-					tenant_id = meta.tenant_id.get(),
-					error = %err,
-					"failed to pack append-only row tombstones"
-				);
-				return Ok((
-					self.table_delete_error_response(
-						&meta,
-						WriteStatus::INTERNAL_ERROR,
-						PbcRejectCode::PBC_REJECT_TOMBSTONE_PACKING_FAILED,
-					),
-					None,
-				));
-			}
-		};
-		let bifurcated = match bifurcate_table_delete(&meta, &descriptor, packed) {
-			Ok(bifurcated) => bifurcated,
-			Err(err) => {
-				tracing::warn!(
-					tenant_id = meta.tenant_id.get(),
-					error = %err,
-					"failed to bifurcate append-only row tombstones"
-				);
-				return Ok((
-					self.table_delete_error_response(
-						&meta,
-						WriteStatus::INTERNAL_ERROR,
-						PbcRejectCode::PBC_REJECT_TOMBSTONE_PACKING_FAILED,
-					),
-					None,
-				));
-			}
-		};
-		let migrations_snapshot = self.state_machine.state_snapshot().await.migrations.clone();
-		let Some(groups) =
-			self.table_batch_replica_groups(&bifurcated.children, &migrations_snapshot)
-		else {
-			return Ok((
-				self.table_delete_error_response(
-					&meta,
-					WriteStatus::INTERNAL_ERROR,
-					PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
-				),
-				None,
-			));
-		};
-		let (write, trailing) = self
-			.write_table_bifurcated(
-				synthetic_meta,
-				bifurcated,
-				groups,
-				&descriptor,
-				delete_hlc,
-				false,
-				Vec::new(),
-				Some([deleted_count, already_deleted_count, not_found_count]),
-				clocks,
-				mutation_permit,
-				mutation_drain,
-			)
-			.await?;
-		let response = table_delete_rows_response(
-			write,
-			deleted_count,
-			already_deleted_count,
-			not_found_count,
-			PbcRejectCode::NONE,
-		);
-		if is_primary_key_table {
-			metrics().observe_storage_pk_delete_outcomes(
-				meta.tenant_id,
-				meta.table_object_id,
-				u64::from(deleted_count),
-				u64::from(already_deleted_count),
-				u64::from(not_found_count),
-			);
-		}
-		self.table_delete_idempotency
-			.insert(key, CachedTableDeleteOutcome { response, trailing });
-		self.record_mutation_outcome(
-			meta.parent_write_id,
-			meta.tenant_id,
-			write,
-			trailing,
-			Some([deleted_count, already_deleted_count, not_found_count]),
-		)
-		.await?;
-		Ok((response, trailing))
+			Ok((response, trailing))
+		})
+		.await
 	}
 }
 
@@ -10209,51 +10295,58 @@ impl DataRing for WendelonDataServer {
 		meta: WriteRequestMeta,
 		payload: RecordBatch,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
-		metrics().data_ring_write_requests_total.inc();
-		// 1. Proxy-hop guard — two-hop cap per ADR 003 §2.
-		if meta.proxy_hop >= 2 {
-			return Ok(self.counted_write_result(
-				error_response(&meta, WriteStatus::PROXY_LIMIT, self.local_node),
-				None,
-			));
-		}
+		let observation = self.slab.finality_observation_registry().begin(
+			crate::storage::finality_observation::WorkScope::Tenant(meta.tenant_id),
+			crate::storage::finality_observation::WorkKind::Mutation,
+		);
+		crate::storage::finality_observation::with_work(observation, async {
+			metrics().data_ring_write_requests_total.inc();
+			// 1. Proxy-hop guard — two-hop cap per ADR 003 §2.
+			if meta.proxy_hop >= 2 {
+				return Ok(self.counted_write_result(
+					error_response(&meta, WriteStatus::PROXY_LIMIT, self.local_node),
+					None,
+				));
+			}
 
-		// 2. Epoch validation. The authoritative current epoch is
-		// the highest epoch the SM has seen an E_safe advancement
-		// for; a client that believes in an older epoch gets a
-		// redirect, not a silent accept.
-		let admission = self.admission_snapshot();
-		let current_epoch = admission.current_epoch;
-		if meta.expected_epoch < current_epoch {
-			return Ok(self.counted_write_result(
-				error_response(&meta, WriteStatus::EPOCH_STALE, self.local_node),
-				None,
-			));
-		}
+			// 2. Epoch validation. The authoritative current epoch is
+			// the highest epoch the SM has seen an E_safe advancement
+			// for; a client that believes in an older epoch gets a
+			// redirect, not a silent accept.
+			let admission = self.admission_snapshot();
+			let current_epoch = admission.current_epoch;
+			if meta.expected_epoch < current_epoch {
+				return Ok(self.counted_write_result(
+					error_response(&meta, WriteStatus::EPOCH_STALE, self.local_node),
+					None,
+				));
+			}
 
-		// 3. Idempotency fast path.
-		let key = Self::idempotency_key_for(meta.write_id);
-		if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
-			return self.replay_write_outcome(cached.outcome()).await;
-		}
+			// 3. Idempotency fast path.
+			let key = Self::idempotency_key_for(meta.write_id);
+			if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
+				return self.replay_write_outcome(cached.outcome()).await;
+			}
 
-		if self.degraded_reason().is_some() {
-			return Ok(self.fenced_write_response(&meta).await);
-		}
+			if self.degraded_reason().is_some() {
+				return Ok(self.fenced_write_response(&meta).await);
+			}
 
-		// 3a. Decode the payload before cache-miss admission so we can
-		// make non-primary redirect decisions without forcing a fresh
-		// leader to complete orphan-witness recovery for a range this
-		// node does not own.
-		//
-		// This is still pre-bifurcation bookkeeping: no durable write
-		// work has started yet.
-		//
-		// 4. Cross the ADR 003 bifurcation boundary exactly once.
-		// The returned bundle becomes the single source of truth for
-		// both the data branch and the control branch.
-		let bifurcated = bifurcate_client_write(&meta, &payload)?;
-		self.write_bifurcated(meta, bifurcated).await
+			// 3a. Decode the payload before cache-miss admission so we can
+			// make non-primary redirect decisions without forcing a fresh
+			// leader to complete orphan-witness recovery for a range this
+			// node does not own.
+			//
+			// This is still pre-bifurcation bookkeeping: no durable write
+			// work has started yet.
+			//
+			// 4. Cross the ADR 003 bifurcation boundary exactly once.
+			// The returned bundle becomes the single source of truth for
+			// both the data branch and the control branch.
+			let bifurcated = bifurcate_client_write(&meta, &payload)?;
+			self.write_bifurcated(meta, bifurcated).await
+		})
+		.await
 	}
 
 	async fn table_delete(
@@ -10261,7 +10354,14 @@ impl DataRing for WendelonDataServer {
 		meta: TableDeleteRowsRequestMeta,
 		row_key_ids: Vec<Identity>,
 	) -> std::io::Result<(TableDeleteRowsResponseMeta, Option<FinalizationMarker>)> {
-		WendelonDataServer::table_delete(self, meta, row_key_ids).await
+		let observation = self.slab.finality_observation_registry().begin(
+			crate::storage::finality_observation::WorkScope::Node,
+			crate::storage::finality_observation::WorkKind::Mutation,
+		);
+		crate::storage::finality_observation::with_work(observation, async {
+			WendelonDataServer::table_delete(self, meta, row_key_ids).await
+		})
+		.await
 	}
 
 	async fn read(

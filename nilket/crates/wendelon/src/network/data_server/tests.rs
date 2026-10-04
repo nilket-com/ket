@@ -17367,3 +17367,205 @@ async fn expired_table_outcome_keeps_warm_cache_replay_but_cold_replay_is_indete
 	);
 	reopened.handles.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adr629_p2b_raw_and_table_local_jobs_remain_observed_after_caller_abort() {
+	for table in [false, true] {
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			62941,
+			bootstrap_tempdir("p2b-owned-local"),
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while node.raft.current_leader().await != Some(node.local_node.id) {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60000)
+			.await;
+		if table {
+			node.raft
+				.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+					&typed_table_descriptor(),
+				)))
+				.await
+				.unwrap();
+		}
+		let entered = Arc::new(Notify::new());
+		let release = Arc::new(Notify::new());
+		*node.data_server.local_observation_gate.lock().unwrap() =
+			Some((entered.clone(), release.clone()));
+		// Ownership fixture only. A cloned server disables the unrelated lease
+		// precondition; the production node/policy is not changed.
+		let server = Arc::new(node.data_server.as_ref().clone().with_lease_gate(false));
+		let epoch = node.data_server.admission_snapshot().current_epoch;
+		let mut job = tokio::spawn(async move {
+			if table {
+				let batch = typed_table_batch(vec![629]);
+				let mut meta = typed_table_meta(&typed_table_descriptor(), batch.num_rows());
+				meta.expected_epoch = epoch;
+				server
+					.table_write(meta, batch)
+					.await
+					.map(|(reply, _)| reply.write.status)
+			} else {
+				server
+					.write(simple_write_meta(epoch), single_kv_batch())
+					.await
+					.map(|(reply, _)| reply.status)
+			}
+		});
+		tokio::time::timeout(Duration::from_secs(10), async {
+			tokio::select! {
+				_ = entered.notified() => {},
+				result = &mut job => panic!("primary returned before local gate: table={table} result={result:?}"),
+			}
+		}).await.unwrap();
+		let authority = node.slab.finality_observation_registry();
+		assert!(authority.test_state().0 > 0);
+		job.abort();
+		let _ = job.await;
+		assert!(
+			authority.test_state().0 > 0,
+			"detached append owns its clone"
+		);
+		release.notify_one();
+		tokio::time::timeout(Duration::from_secs(10), async {
+			while authority.test_state().0 != 0 {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+		assert!(
+			node.slab.local_l1_bytes().await > 0,
+			"the orphaned job really published local bytes"
+		);
+		assert_eq!(authority.test_state().2, None);
+		node.handles.abort();
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adr629_p2b_raw_and_table_followers_keep_the_actual_pending_commit_after_abort() {
+	for table in [false, true] {
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			62942,
+			bootstrap_tempdir("p2b-follower"),
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while node.raft.current_leader().await != Some(node.local_node.id) {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+		let descriptor = typed_table_descriptor();
+		if table {
+			node.raft
+				.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+					&descriptor,
+				)))
+				.await
+				.unwrap();
+		}
+		node.handles.pending_finalization_reconciler.abort();
+		let (ready, release) = node.data_server.pending_finalizations.test_commit_gate(0);
+		let commit = hlc(6280, 0, node.local_node.id);
+		let (msg_type, meta, arrow) = if table {
+			let batch = typed_table_batch(vec![628]);
+			let meta = typed_table_meta(&descriptor, batch.num_rows());
+			let bifurcated =
+				bifurcate_table_write(&meta, &batch, &descriptor, WriterNodeId::ZERO, commit)
+					.unwrap();
+			let replica = table_replica_meta(&meta, &bifurcated, &bifurcated.children, commit);
+			(
+				MsgType::TABLE_REPLICATE_REQ,
+				bytemuck::bytes_of(&replica).to_vec(),
+				encode_table_replica_children(&bifurcated.children).unwrap(),
+			)
+		} else {
+			let meta = simple_write_meta(node.data_server.admission_snapshot().current_epoch);
+			let bifurcated = bifurcate_client_write(&meta, &single_kv_batch()).unwrap();
+			let replica = ReplicaWriteMeta {
+				commit_hlc: commit,
+				write_id: meta.write_id,
+				epoch: meta.expected_epoch,
+				tenant_id: meta.tenant_id,
+				charged_bytes: bifurcated.charged_bytes,
+				key_identity: bifurcated.key_identity,
+				payload_hash: bifurcated.payload_hash,
+				durability: meta.durability,
+				await_finalization: meta.await_finalization,
+				_pad: [0; 6],
+			};
+			(
+				MsgType::REPLICATE_REQ,
+				bytemuck::bytes_of(&replica).to_vec(),
+				bifurcated.frame_bytes.as_ref().clone(),
+			)
+		};
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: msg_type.0,
+				flags: 0,
+				stream_id: 628,
+				meta_len: meta.len() as u32,
+				arrow_len: arrow.len() as u32,
+				trailing_len: 0,
+			},
+			meta: crate::network::pool::PooledBuf::orphan(meta),
+			arrow_payload: Some(crate::network::pool::PooledBuf::orphan(arrow)),
+			trailing: None,
+		};
+		let server = node.data_server.clone();
+		let job = tokio::spawn(async move {
+			if table {
+				server.handle_table_replicate(frame).await
+			} else {
+				server.handle_replicate(frame).await
+			}
+		});
+		tokio::time::timeout(
+			Duration::from_secs(10),
+			tokio::task::spawn_blocking(move || ready.recv().unwrap()),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		let authority = node.slab.finality_observation_registry();
+		assert!(authority.test_state().0 > 0);
+		job.abort();
+		let _ = job.await;
+		assert!(authority.test_state().0 > 0);
+		release.send(()).unwrap();
+		tokio::time::timeout(Duration::from_secs(10), async {
+			while authority.test_state().0 != 0 {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+		assert_eq!(
+			node.data_server
+				.pending_finalizations
+				.load_all()
+				.await
+				.unwrap()
+				.len(),
+			1
+		);
+		assert_eq!(authority.test_state(), (0, 1, None));
+		node.handles.abort();
+	}
+}
