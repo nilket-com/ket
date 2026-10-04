@@ -1,4 +1,4 @@
-//! Counted storage-publication ownership, adjacent to the delegating entry point.
+// Counted storage-publication ownership, adjacent to the delegating entry point.
 use super::*;
 use crate::storage::finality_observation::{WorkKind, WorkScope, with_work};
 use std::future::Future;

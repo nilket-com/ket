@@ -1,6 +1,6 @@
-//! Registration helpers and test-only barriers for mutation ownership.
-//! These are normal functions: ownership is registered at the caller's original
-//! entry point, before the returned future is polled or any job is spawned.
+// Registration helpers and test-only barriers for mutation ownership.
+// These are normal functions: ownership is registered at the caller's original
+// entry point, before the returned future is polled or any job is spawned.
 use super::*;
 use crate::storage::finality_observation::{TableScope, WorkKind, WorkScope, with_work};
 use std::future::Future;
