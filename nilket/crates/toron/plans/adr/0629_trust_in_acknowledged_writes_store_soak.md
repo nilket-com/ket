@@ -1198,3 +1198,78 @@ C1/F16/F17 remain unchanged must-close gaps. A2 captured lost-update and delete-
 
 Reviewer attention: (a) Stage B P3 destination, (b) TTL/3 upper cadence cap plus expiry reserve, (c) single active node proposal lane and conditional many-range claim, (d) write-only fresh-HLC/BOOT elapsed cap and unchanged read semantics, (e) 64/16 waiter caps and proposed 5%/8MiB resource gates, (f) explicit rejection of too-small configured TTLs and whole-roster nonrolling compatibility. These are concrete draft decisions for review, not hidden implementation choices.
 
+
+---
+
+# Stage B P3 prerequisite: monotone committed range-lease authority
+
+Status: SCOPED AND AUTHORIZED for isolated implementation by chatd01a10d0e (Claude clearance and user approval). Accepted plan SHA256 81271646613836778290071ae5d8cbdc12fe8239501177f999091bc5a56cd8c3. P3 availability remains paused until this prerequisite lands; implementation source, full pinned ladder and mandatory fencing evidence return for review before P3 rebase or staging. Origin, campaign and A3 remain held.
+
+Expected consequences: old-epoch in-flight renewals are refused across a committed membership change; measure the resulting transient write refusals. A nonrolling 6s->3s configuration shrink can refuse renewals until a descriptor covers retained expiry; it cannot shorten signed authority.
+
+## Finding and scope
+
+Base3438b769 (ADR-only plan over source7a08db71). Legacy AcquireLease accepts a same-range/same-holder proposal without requiring nondecreasing epoch, start or expiry, then replaces the record. Direct SM characterization pins already prove expiry and epoch regression. They use unsigned fixtures and do not establish public double admission.
+
+The new pins use real loopback QUIC+mTLS, receiver-derived authenticated identities, production WendelonDataServer::request_remote_lease, the real routed Control Ring handler, Ed25519-verified returned descriptors and real Raft commits. A test-only HrftService wrapper holds one fully parsed, authenticated request before forwarding it into the unchanged handler. It does not bypass the handler's current-epoch, leader or canonical-range checks. Both reordering orders are tested. A waiter timeout does not cancel its spawned RPC; the added cancellation case separately aborts and joins that actual RPC future while the already-received server request is held. Server-constructed replies and caller-observed replies are distinguished.
+
+The controlled path represents delayed request handling followed by another independently submitted grant request. It is not evidence that the existing serial periodic manager automatically retries an unknown proposal, nor of leader change, process restart or packet-level loss. Report exact observed outcomes from the retained run, including failed development attempts. The larger public two-holder question remains limited: in the tested stable one-node canonical ring, a second real mTLS node cannot obtain this range (DENIED_INVALID_TARGET), and its existing final lease predicate is Missing. This is not a two-primary handoff test or a completed authenticated SQL mutation. Leader-change/restart/handoff double admission is coverage unavailable until the required implementation pins below.
+
+The repair only changes lease proposal/apply semantics, fresh-cluster initialization and replay and their necessary compatibility plumbing. No transaction isolation, replay tenant scoping, C1/F16/F17, audit durability, timing priority or P3 stall policy repair is bundled.
+
+## Selected rule: monotone comparison, not expected-prior CAS
+
+Select a deterministic monotone comparison at the committed apply boundary. CAS alone prevents some stale updates but would still allow a matching-prior renewal to shorten a live interval; it adds expected-prior identity to both local/remote proposals and adds unknown-response recovery. Monotonicity directly protects the interval and uses the descriptor's existing epoch/HLC bounds. An expected-prior design is not selected for this prerequisite.
+
+The rule is always on in the prerequisite binary, from its first committed entry. Apply it to AcquireLease; no Legacy policy, activation marker, management-only activation command or separate policy-specific acquire is selected. The implementation review freezes the representation. Existing LeaseDescriptor and its signature preimage remain byte-identical. Never edit or extend a signed descriptor in memory; retain or reject the complete actual descriptor.
+
+Evaluate in this order, without reading host clocks or configuration during apply:
+
+1. Require a valid committed current membership epoch. Incoming epoch must equal the current committed epoch. Older and uncommitted future epochs are LeaseDenied, even if their requested start follows a stored expiry. A missing/contradictory epoch history fails closed. Membership changes retain their existing sequential authority fence.
+2. Reject malformed range, non-positive interval, overflow-inconsistent interval or unsupported grant representation. Proposal-side authorization remains required: authenticated holder, current leader/signer and canonical ownership. The state-machine epoch check closes the proposal-to-apply epoch race; it does not certify that a leader never changes after a response.
+3. Exact byte-identical descriptor replay is Success without mutation. Equal starts/bounds with a different descriptor are not silently relabelled as an identical replay. Existing committed-epoch validation still precedes this replay exception.
+4. For an exact-range, same-holder, same-epoch replacement, require both incoming start >= retained start and incoming expiry >= retained expiry, with at least one strict increase unless it is exact replay. Reject a later-but-shorter grant too. Compare full ordered HLC tuples, not only physical milliseconds. A request with an older start may not replace authority merely because the old record has now expired.
+5. Sweep every overlapping retained interval. An overlapping current-epoch interval of another holder/range blocks a grant when retained expiry > incoming start. Never infer expiry from response latency, a dropped caller, process death or cache invalidation. New-epoch grants may supersede old-epoch intervals only through the existing committed epoch fence. An incoming old epoch never skips a newer record. Reversed/unmapped overlapping state fails closed rather than being erased.
+6. Only after all predicates pass insert the incoming complete signed descriptor. A denied proposal changes no lease, epoch, ownership or response state and cannot cancel an earlier unknown proposal.
+
+Wire result: reuse WendelonResponse::LeaseDenied and existing LEASE_RESP DENIED_OVERLAP for monotonicity refusals; no descriptor accompanies it. Proposal-side stale-epoch rejection remains DENIED_EPOCH_STALE. The local manager observes LeaseDenied; the remote caller observes Denied(status). Neither claims that its earlier unknown grant did not commit. Retain a current valid cache entry; retry/backoff belongs to the separately reviewed P3 policy. Do not report a rejected incoming descriptor as GRANTED while retaining another one: that would give the caller false authority. Exact replay Success returns the exact already-committed descriptor only.
+
+ReleaseLease remains an explicitly authorized release under its existing contract, not a timeout-created release. Pins cover release races and whether a previously authorized pending acquire can reopen after release; any required change to release semantics returns for scope review. This plan makes no irreversible holder-incarnation fencing claim.
+
+## Fresh clusters and format refusal (selected)
+
+There is no existing-cluster upgrade or migration in this scope. Current formats are WAL4 and snapshot5; propose WAL5 and snapshot6, rechecked against the implementation base. Their semantics include the always-on monotone rule. No activation entry, persisted policy switch, existing-cluster E->E+1 fence or legacy semantic replay is needed.
+
+The new binary refuses every older-format WAL or snapshot with a clear unsupported-format error, before replay, state mutation or startup readiness. No upconversion, in-place migration, header rewrite or automatic deletion. Enumerate and test every ingress: startup and recovery, WAL segments and mixed-version tails, snapshot loading/install, and backup restore. An old snapshot paired with a new WAL, or a new snapshot paired with an old WAL, must not bypass refusal. Pre-versioned artifacts are older formats too. Unknown future formats and malformed artifacts fail closed. Failure preserves the source artifacts; tests compare their bytes before and after. Any frozen old decoders retained for cheap offline inspection are isolated from production startup/recovery/install and are optional, not a deliverable.
+
+Pin that an actual pre-prerequisite binary rejects the new WAL and snapshot versions. Pin new-format full replay versus snapshot-plus-tail equality for lease map, membership epoch and response/audit results, including monotonicity denial and exact replay. Snapshot installation cannot change the rule or erase the durable membership history that the rule requires. No historical legacy regression needs to be reproduced except insofar as old-format refusal requires its fixture.
+
+Bootstrap must durably establish the initial membership epoch before the first grant. Missing or contradictory committed epoch history denies the grant; never substitute a host-local default. Pin initialization order and cold restart of a fresh new-format cluster.
+
+Each new cluster has a fresh authority namespace: newly generated lease-signing keys and issuer identity, with a newly declared trust domain. Reusing an empty data directory, epoch1, a node number or a previous signing key is not fresh authority. Readiness binds the complete trusted issuer identities and public-key fingerprints to a retained inventory of EVERY issuer key in the diagnostic and soak roots, and requires the new keys to differ from all of them. Missing/unreadable inventory or an ambiguous reused identity holds readiness. Concrete issuer-identity representation and trust provisioning are frozen at source review; if the current representation cannot distinguish the new authority safely, return for scope review instead of silently reusing it. Deterministic development signing keys are not fresh-cluster production provisioning.
+
+Tests present earlier-cluster signed descriptors to the new verifier, including coincident range, epoch and node numbers, and require rejection. Bind control-peer authentication/trust provisioning separately from lease-descriptor verification; changing a TLS certificate alone does not replace a lease-signing key. No existing directory is wiped or silently reclassified as fresh. Deployment reserves a fresh declared root exclusively and refuses unexpected state.
+
+## Terms, restarts and rollback
+
+3s->6s in the same epoch is accepted only if start and expiry are nondecreasing. 6s->3s (and90s->6s ADR080 profiles) may be refused until a newly requested descriptor covers the retained expiry; it is not silently shortened. An explicit new committed epoch fence can supersede the old epoch, only with the required final-gate, replica and finalization evidence below. The effective signed term is always measured, never inferred from a new default.
+
+Retry: exact descriptor replay is idempotent; a regenerated later request follows the rule. A lost reply remains unknown until separately resolved. A restarted caller cannot revoke pending work; a late old proposal is refused if stale under the current committed epoch or monotone comparison, without reducing state. No global active-proposal or transport-cancellation guarantee is claimed from a local lane.
+
+Leader change: current signer/issuer checks remain independent of monotone interval state. The new descriptor must have current authorized issuance and final gate checks. A late old leader result cannot manufacture current issuer authority. Tests cover proposal before leadership/epoch change and completion afterward; do not assert that the apply rule itself reads a host-local current-leader variable.
+
+Operational rollback means redeploying a tested build that understands the new WAL/snapshot formats and always-on rule. An old binary on new data is refused, not a supported rollback. Pin that refusal; no header downgrade, log truncation, restore over newer state, automatic state deletion or reseeding. Availability policy can be disabled in a compatible tested build without disabling this safety rule. Offline old-format inspection, if retained, is not permission to start production on old state.
+
+## Mandatory implementation evidence (not executed by this planning package)
+
+- Apply: all rules above, both ordering orders, exact replay, equal-bound non-identical descriptors, malformed intervals, lower/future/missing epoch, distinct-holder overlaps and release cases. No mutation on denial. Use deterministic log/epoch barriers and no host-clock-dependent apply.
+- Authenticated control: real mTLS local/remote grant paths, explicit response/descriptor binding, stalled/cancelled caller and late server completion, leader and membership change, and no forged holder. Distinguish server-generated reply from client receipt.
+- Fencing: BOTH holders' actual final write gates and replica/finalization paths across holder handoff and epoch change under the NEW rule. Include writes admitted before the change and resumed after it, as well as late grants and callbacks. Inventory each gate's committed ownership/epoch and issuer checks. An existing gap is HOLD for a scope decision, not a passing prerequisite. A canonical rejection in a stable single-node ring is not this coverage.
+- Formats: new binary refusing each older WAL/snapshot ingress without modifying artifacts; actual old binary refusing new formats; new-format full replay versus snapshot-plus-tail equality; mixed-format, corrupt and inconsistent-history controls. No legacy policy or activation fixtures.
+- Config/readiness: explicit3s/6s/90s, cold restart with cached/unknown authority, initial durable membership before issuance, fresh signing keys and issuer identity versus the complete retained diagnostic/soak inventory, earlier-cluster descriptor rejection and isolated fresh-root provisioning. Report the effective signed term.
+- Whole pinned1.95.0 ladder before promotion: all relevant Wendelon serialized tests, Wendelon-client, Toron/TPCH/client, architecture/format guards and release artifacts with clean same-source identities. Preserve failures. Inventory local/remote committed producers against P2 observation and attribution; register any new producer. Reusing AcquireLease does not excuse an unobserved new path. There is no activation producer in this plan.
+- Source and operational package returns for Claude/user review. No staging or campaign until separately cleared.
+
+## Authorized implementation sequence
+
+Record this signed subject-only ADR-only plan amendment and explicitly fast-forward bigfoot main from3438b769 after checking its head. Origin remains held. Inventory first on an isolated implementation branch. Run the whole serialized Wendelon precheck plus architecture/format guards before signing; use cargo fmt -p only. Bring source, full pinned ladder, apply/format/fresh-authority/fencing pins and producer registration for review before rebasing P3. An existing fencing gap is HOLD for scope review. No staging or campaign is authorized.
