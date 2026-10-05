@@ -8,6 +8,11 @@ or staging acceptance. P2 coverage inventory and least-privilege actor design re
 production code. Stage C remains separately reviewed.
 This is not trust, durability or security acceptance for a store.
 
+Selected-contract prerequisite: [Wendelon ADR 0100 — parent finalization and read visibility](../../../wendelon/plans/adr/0100_parent_finalization_and_read_visibility.md).
+The user selected B (staged versions with accepted-parent decisions), latest-at-K only initially.
+Its stage plans and implementations require separate review; lease-safety, P3, the campaign and A3 remain HELD.
+This prerequisite belongs to Wendelon storage semantics, outside ADR 629 Stage B, and authorizes no code.
+
 **A correctness, integrity and security-evidence record. Wi-Fi is a supported target. No performance claim
 is made.**
 
