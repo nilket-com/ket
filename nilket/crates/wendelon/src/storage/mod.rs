@@ -18,6 +18,7 @@ pub mod manager;
 pub mod manifest;
 pub mod multirow;
 pub(crate) mod mutation_drain;
+pub mod mutation_visibility;
 pub mod pk_delete;
 pub mod retention;
 pub mod row_group;
