@@ -204,3 +204,37 @@ fn s1_private_trust_tokens_and_fake_install_are_test_only() {
 	assert!(!reducer.contains("SystemTime::now"));
 	assert!(!reducer.contains(".await"));
 }
+
+#[test]
+fn r0_assay_and_shared_allocator_are_below_test_only_modules() {
+	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility");
+	for path in [root.join("mod.rs"), root.join("root2/mod.rs")] {
+		let parsed = syn::parse_file(&fs::read_to_string(path).unwrap()).unwrap();
+		let module = parsed
+			.items
+			.iter()
+			.find_map(|i| match i {
+				syn::Item::Mod(m) if m.ident == "tests" => Some(m),
+				_ => None,
+			})
+			.unwrap();
+		assert!(module.attrs.iter().any(|a| matches!(&a.meta, syn::Meta::List(m) if m.path.is_ident("cfg") && m.tokens.to_string() == "test")));
+	}
+	let assay = fs::read_to_string(root.join("root2/tests/r0_assay.rs")).unwrap();
+	let parsed = syn::parse_file(&assay).unwrap();
+	let test = parsed
+		.items
+		.iter()
+		.find_map(|i| match i {
+			syn::Item::Fn(f) if f.sig.ident == "r0_isolated_cost_assay" => Some(f),
+			_ => None,
+		})
+		.unwrap();
+	assert!(test.attrs.iter().any(|a| a.path().is_ident("test")));
+	assert!(test.attrs.iter().any(|a| a.path().is_ident("ignore")));
+	assert!(matches!(test.vis, syn::Visibility::Inherited));
+	assert!(!assay.contains("tokio::spawn") && !assay.contains("thread::spawn"));
+	let allocator = fs::read_to_string(root.join("tests/b1_assay.rs")).unwrap();
+	assert_eq!(allocator.matches("#[global_allocator]").count(), 1);
+	assert!(allocator.contains("r0_counters") && allocator.contains("r0_reset_peak"));
+}

@@ -2,7 +2,7 @@ use super::commitment::TestProofKey;
 use super::*;
 
 mod authority_tests;
-mod b1_assay;
+pub(super) mod b1_assay;
 mod codec_tests;
 mod commitment_tests;
 mod manifest_tests;

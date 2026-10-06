@@ -10,6 +10,7 @@ struct Counter;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+static REQUESTED: AtomicUsize = AtomicUsize::new(0);
 struct AssayKey {
 	inner: TestProofKey,
 	max: AtomicUsize,
@@ -71,6 +72,7 @@ fn allocated(n: usize) {
 	let live = LIVE.fetch_add(n, Ordering::Relaxed) + n;
 	PEAK.fetch_max(live, Ordering::Relaxed);
 	ALLOCS.fetch_add(1, Ordering::Relaxed);
+	REQUESTED.fetch_add(n, Ordering::Relaxed);
 }
 unsafe impl GlobalAlloc for Counter {
 	unsafe fn alloc(&self, l: Layout) -> *mut u8 {
@@ -95,6 +97,18 @@ unsafe impl GlobalAlloc for Counter {
 }
 #[global_allocator]
 static ALLOCATOR: Counter = Counter;
+/// Process-wide requested-allocation counters. R0 uses only in an isolated exact test.
+pub(crate) fn r0_counters() -> [usize; 4] {
+	[
+		LIVE.load(Ordering::Relaxed),
+		PEAK.load(Ordering::Relaxed),
+		ALLOCS.load(Ordering::Relaxed),
+		REQUESTED.load(Ordering::Relaxed),
+	]
+}
+pub(crate) fn r0_reset_peak() {
+	PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+}
 fn measure(name: &str, f: impl FnOnce() -> (usize, usize, usize, usize)) {
 	let base = LIVE.load(Ordering::Relaxed);
 	PEAK.store(base, Ordering::Relaxed);
