@@ -2295,6 +2295,13 @@ pub(crate) fn no_new_v1_suffixed_identifiers() {
 			for token in allowed {
 				scrubbed = scrubbed.replace(token, "");
 			}
+			// ADR0100 B.1 freezes this wire magic, not a Rust identifier. Keep the
+			// exception scoped to the exact byte literal and its codec/golden pin.
+			if path.ends_with("storage/mutation_visibility/provenance.rs")
+				|| path.ends_with("storage/mutation_visibility/tests/provenance_tests.rs")
+			{
+				scrubbed = scrubbed.replace("b\"VISPROV1\"", "");
+			}
 			let bytes: Vec<char> = scrubbed.chars().collect();
 			for i in 0..bytes.len().saturating_sub(1) {
 				if bytes[i] == 'V'

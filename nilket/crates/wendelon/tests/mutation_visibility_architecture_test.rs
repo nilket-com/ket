@@ -27,6 +27,58 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 		}
 	}
 	assert_eq!(providers, 1);
+	// B.1 is still dormant; validate every new non-test module and constructor gate.
+	fn bounded_modules(dir: &std::path::Path) {
+		for entry in fs::read_dir(dir).unwrap() {
+			let p = entry.unwrap().path();
+			if p.file_name()
+				.is_some_and(|n| n == "tests" || n == "fixtures" || n == "tests.rs")
+			{
+				continue;
+			}
+			if p.is_dir() {
+				bounded_modules(&p)
+			} else if p.extension().is_some_and(|e| e == "rs") {
+				let s = fs::read_to_string(&p).unwrap();
+				syn::parse_file(&s).unwrap();
+				assert!(
+					s.lines().count() <= 750,
+					"{}: split bounded modules",
+					p.display()
+				);
+			}
+		}
+	}
+	bounded_modules(&module);
+	let source = fs::read_to_string(module.join("provenance/verification.rs")).unwrap();
+	let ast = syn::parse_file(&source).unwrap();
+	let mut constructors = 0;
+	for item in ast.items {
+		match item {
+			syn::Item::Struct(s) if s.ident == "TrustedFrameRows" => {
+				for f in &s.fields {
+					assert!(matches!(f.vis, syn::Visibility::Inherited))
+				}
+			}
+			syn::Item::Impl(i) => {
+				for member in i.items {
+					if let syn::ImplItem::Fn(f) = member {
+						let name = f.sig.ident.to_string();
+						if name.starts_with("from_") {
+							constructors += 1;
+							assert!(test_only(&f.attrs));
+							assert!(!matches!(f.vis, syn::Visibility::Public(_)));
+						}
+					}
+				}
+			}
+			_ => {}
+		}
+	}
+	assert_eq!(
+		constructors, 2,
+		"all linkage constructors must remain synthetic-only"
+	);
 	for name in [
 		"authority.rs",
 		"codec.rs",

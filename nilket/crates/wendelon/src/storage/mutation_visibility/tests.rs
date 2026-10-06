@@ -2,9 +2,11 @@ use super::commitment::TestProofKey;
 use super::*;
 
 mod authority_tests;
+mod b1_assay;
 mod codec_tests;
 mod commitment_tests;
 mod manifest_tests;
+mod provenance_tests;
 
 fn identity(sequence: u64) -> MutationIdentity {
 	MutationIdentity {
