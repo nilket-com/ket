@@ -270,19 +270,40 @@ fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Res
 	}
 }
 fn apply_grant(s: &mut State2, limits: Limits2, new: OriginalGrant2) -> Result2<ApplyResult2> {
+	// These relations depend on the trusted entry, not the command framing.
+	if new.lease.min_commit_index > new.log.index {
+		return Ok(denied(17, None));
+	}
+	if new
+		.predecessor
+		.is_some_and(|p| p.lineage == new.lineage || p.log.index >= new.log.index)
+	{
+		return Ok(denied(
+			7,
+			s.lineages.get(&new.lineage).map(|g| g.latest.log),
+		));
+	}
 	valid_original(&new)?;
 	let l = &new.lease;
+	if let Some(old) = s.lineages.get(&new.lineage) {
+		if let Some(closure) = old.closure {
+			return Ok(
+				if same_lineage(&old.latest, &new) && old.latest.lease == new.lease {
+					ApplyResult2::Closed {
+						lineage: new.lineage,
+						cause: closure.cause,
+						first: closure.log,
+					}
+				} else {
+					denied(4, Some(closure.log))
+				},
+			);
+		}
+	}
 	if l.epoch != epoch(s) {
 		return Ok(denied(3, None));
 	}
 	if let Some(old) = s.lineages.get(&new.lineage) {
-		if let Some(closure) = old.closure {
-			return Ok(ApplyResult2::Closed {
-				lineage: new.lineage,
-				cause: closure.cause,
-				first: closure.log,
-			});
-		}
 		if same_lineage(&old.latest, &new) && old.latest.lease == new.lease {
 			return Ok(ApplyResult2::Granted(old.clone()));
 		}
@@ -298,6 +319,16 @@ fn apply_grant(s: &mut State2, limits: Limits2, new: OriginalGrant2) -> Result2<
 		};
 		s.lineages.insert(updated.latest.lineage, updated.clone());
 		return Ok(ApplyResult2::Granted(updated));
+	}
+	for g in s.lineages.values() {
+		let p = &g.latest.lease;
+		if p.epoch == l.epoch
+			&& p.range_start <= l.range_end
+			&& l.range_start <= p.range_end
+			&& (p.range_start != l.range_start || p.range_end != l.range_end)
+		{
+			return Ok(denied(6, Some(g.latest.log)));
+		}
 	}
 	// A same-range predecessor, including a closed one, is mandatory when such history exists.
 	let previous = s
@@ -320,16 +351,6 @@ fn apply_grant(s: &mut State2, limits: Limits2, new: OriginalGrant2) -> Result2<
 		}
 	} else if new.predecessor.is_some() {
 		return Ok(denied(7, None));
-	}
-	for g in s.lineages.values() {
-		let p = &g.latest.lease;
-		if g.closure.is_none()
-			&& p.range_start <= l.range_end
-			&& l.range_start <= p.range_end
-			&& (p.range_start != l.range_start || p.range_end != l.range_end)
-		{
-			return Ok(denied(6, Some(g.latest.log)));
-		}
 	}
 	if s.lineages.len() >= limits.lineages
 		|| usage(s)?
@@ -485,14 +506,14 @@ fn apply_terminal(
 		{
 			return Ok(ApplyResult2::RejectedEvidence(2));
 		}
+		if a.children.len() != p.claim.plans.len() {
+			return Ok(ApplyResult2::RejectedEvidence(3));
+		}
 		if v.evidence() == 0 {
 			return Ok(ApplyResult2::PendingEvidence(2));
 		}
 		if v.evidence() != 1 {
 			return Ok(ApplyResult2::RejectedEvidence(1));
-		}
-		if a.children.len() != p.claim.plans.len() {
-			return Ok(ApplyResult2::PendingEvidence(1));
 		}
 		let holder = NodeRef2 {
 			node: p.claim.original.lease.holder,

@@ -4,6 +4,7 @@ mod goldens;
 mod invariants;
 mod refusals;
 mod restoration;
+mod review_regressions;
 mod transitions;
 
 mod support;

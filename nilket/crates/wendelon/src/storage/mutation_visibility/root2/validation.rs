@@ -310,7 +310,7 @@ pub(super) fn validate_state(s: &State2) -> Result2<()> {
 		return Err(RootError2::RootInvariant);
 	}
 	capacity(s, Limits2::default())?;
-	let mut coords = BTreeSet::new();
+	let mut coords = BTreeSet::from([s.bootstrap.index]);
 	let coord = |l: Log2| -> Result2<()> {
 		valid_log(l)?;
 		if l.index < s.bootstrap.index || l.index > s.covered.index {
@@ -359,11 +359,37 @@ pub(super) fn validate_state(s: &State2) -> Result2<()> {
 			}
 		}
 	}
+	// Register latest-grant coordinates before closures: a supersession may share
+	// its successor's original grant entry, irrespective of lineage sort order.
+	for g in s.lineages.values() {
+		coord(g.latest.log)?;
+		if !coords.insert(g.latest.log.index) {
+			return Err(RootError2::RootInvariant);
+		}
+	}
+	let mut ranges = s
+		.lineages
+		.values()
+		.map(|g| {
+			(
+				g.latest.lease.epoch,
+				g.latest.lease.range_start,
+				g.latest.lease.range_end,
+			)
+		})
+		.collect::<Vec<_>>();
+	ranges.sort_unstable();
+	ranges.dedup();
+	for pair in ranges.windows(2) {
+		if pair[0].0 == pair[1].0 && pair[0].2 >= pair[1].1 {
+			return Err(RootError2::RootInvariant);
+		}
+	}
 	for (id, g) in &s.lineages {
 		valid_lineage(g)?;
 		let o = &g.latest;
 		let l = &o.lease;
-		if *id != o.lineage || !coords.insert(o.log.index) {
+		if *id != o.lineage {
 			return Err(RootError2::RootInvariant);
 		}
 		coord(o.log)?;
@@ -397,7 +423,11 @@ pub(super) fn validate_state(s: &State2) -> Result2<()> {
 		if let Some(c) = g.closure {
 			coord(c.log)?;
 			match c.cause {
-				1 => {}
+				1 => {
+					if epoch_at(c.log.index) != l.epoch || !coords.insert(c.log.index) {
+						return Err(RootError2::RootInvariant);
+					}
+				}
 				2 => {
 					let next = s
 						.lineages
@@ -405,7 +435,15 @@ pub(super) fn validate_state(s: &State2) -> Result2<()> {
 						.ok_or(RootError2::RootInvariant)?;
 					if next.latest.predecessor != Some(o.reference()?)
 						|| next.latest.log.index < c.log.index
+						|| epoch_at(c.log.index) != l.epoch
 					{
+						return Err(RootError2::RootInvariant);
+					}
+					if next.latest.log.index == c.log.index {
+						if next.latest.log != c.log {
+							return Err(RootError2::RootInvariant);
+						}
+					} else if !coords.insert(c.log.index) {
 						return Err(RootError2::RootInvariant);
 					}
 				}
@@ -426,6 +464,12 @@ pub(super) fn validate_state(s: &State2) -> Result2<()> {
 	}
 
 	let mut non_grant_coords = BTreeSet::new();
+	non_grant_coords.insert(s.bootstrap.index);
+	for g in s.lineages.values() {
+		if let Some(c) = g.closure.filter(|c| c.cause == 1) {
+			non_grant_coords.insert(c.log.index);
+		}
+	}
 	for a in s.selectors.values() {
 		non_grant_coords.insert(a.enrolled.index);
 	}
