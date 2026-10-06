@@ -9,6 +9,7 @@ mod error;
 mod identity;
 mod manifest;
 pub mod provenance;
+pub mod root2;
 
 pub use authority::*;
 pub use commitment::*;
