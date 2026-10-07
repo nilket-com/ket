@@ -158,8 +158,9 @@ fn s1_restoration_refuses_missing_selector_lineage_and_grant_as_non_grant_entry(
 			0 => s.selectors.clear(),
 			1 => s.lineages.clear(),
 			_ => {
-				let p = s.parents.values_mut().next().unwrap();
-				p.claim.original.log = l(3);
+				let key = *s.parents.iter().next().unwrap().0;
+				let p = s.parents.get_mut(&key).unwrap();
+				std::sync::Arc::make_mut(&mut p.claim).original.log = l(3);
 			}
 		}
 		assert!(validate_state(&s).is_err());

@@ -11,3 +11,6 @@ mod support;
 use support::*;
 
 mod r0_assay;
+
+mod s1c;
+mod s1c_oracle;

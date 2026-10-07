@@ -238,3 +238,53 @@ fn r0_assay_and_shared_allocator_are_below_test_only_modules() {
 	assert_eq!(allocator.matches("#[global_allocator]").count(), 1);
 	assert!(allocator.contains("r0_counters") && allocator.contains("r0_reset_peak"));
 }
+
+#[test]
+fn s1c_incremental_updates_do_not_scan_or_create_authority_and_oracle_is_test_only() {
+	let root =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
+	for name in ["persistent.rs", "stored.rs", "incremental.rs"] {
+		let text = fs::read_to_string(root.join(name)).unwrap();
+		syn::parse_file(&text).unwrap();
+		assert!(text.lines().count() <= 750);
+		assert!(!text.contains("unsafe "));
+	}
+	let file = syn::parse_file(&fs::read_to_string(root.join("incremental.rs")).unwrap()).unwrap();
+	assert!(
+		file.items
+			.iter()
+			.any(|i| matches!(i,syn::Item::Fn(f)if f.sig.ident=="update"))
+	);
+	let text = fs::read_to_string(root.join("incremental.rs")).unwrap();
+	let body = text.split("pub(super) fn update(").nth(1).unwrap();
+	// Parsed module plus conservative identifier check; this is not a transitive call-graph proof.
+	let bytes = body.as_bytes();
+	let mut at = 0;
+	while at < bytes.len() {
+		if bytes[at].is_ascii_alphabetic() || bytes[at] == b'_' {
+			let start = at;
+			while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
+				at += 1;
+			}
+			let token = &body[start..at];
+			let mut next = at;
+			while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+				next += 1;
+			}
+			if next < bytes.len() && bytes[next] == b'(' {
+				assert!(!["validate_state", "usage", "capacity", "build"].contains(&token));
+			}
+		} else {
+			at += 1;
+		}
+	}
+	let tests = fs::read_to_string(root.join("tests/mod.rs")).unwrap();
+	assert!(tests.contains("mod s1c_oracle;"));
+	let modules = fs::read_to_string(root.join("mod.rs")).unwrap();
+	assert!(!modules.contains("mod s1c_oracle"));
+	assert!(
+		fs::read_to_string(root.join("reducer.rs"))
+			.unwrap()
+			.contains("command.digest")
+	);
+}

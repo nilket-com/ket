@@ -1,5 +1,8 @@
 use super::super::{DecisionLogId, ParentManifest, ProofKeyBinding};
-use std::collections::BTreeMap;
+use super::{
+	persistent::Map,
+	stored::{Cuts2, StoredParent2},
+};
 
 pub type Log2 = DecisionLogId;
 pub type Digest2 = [u8; 32];
@@ -204,11 +207,12 @@ pub(super) struct State2 {
 	pub initial_epoch: u64,
 	pub control_digest: Digest2,
 	pub control_len: u64,
-	pub selectors: BTreeMap<[u8; 44], Selector2>,
-	pub authorities: BTreeMap<[u8; 24], AuthorityRegistration2>,
-	pub lineages: BTreeMap<[u8; 16], LineageRecord2>,
-	pub cuts: Vec<EpochCut2>,
-	pub parents: BTreeMap<[u8; 73], ParentRecord2>,
+	pub selectors: Map<[u8; 44], Selector2>,
+	pub authorities: Map<[u8; 24], AuthorityRegistration2>,
+	pub lineages: Map<[u8; 16], LineageRecord2>,
+	pub cuts: Cuts2,
+	pub parents: Map<[u8; 73], StoredParent2>,
+	pub derived: super::incremental::Derived2,
 }
 macro_rules! opaque_debug { ($($t:ty),* $(,)?)=>{$(impl std::fmt::Debug for $t {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str(concat!(stringify!($t)," { redacted }"))}})*}; }
 opaque_debug!(

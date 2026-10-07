@@ -1,5 +1,9 @@
 use super::{codec::*, command::*, state::Root2, trust::*, types::*, validation::*};
-use std::collections::BTreeMap;
+use super::{
+	incremental::{Derived2, cached_capacity, update},
+	persistent::Map,
+	stored::Cuts2,
+};
 fn denied(reason: u16, reference: Option<Log2>) -> ApplyResult2 {
 	ApplyResult2::Denied { reason, reference }
 }
@@ -28,7 +32,7 @@ impl Root2 {
 			if !verified.authorized() {
 				return Err(RootError2::TrustMismatch);
 			}
-			let state = State2 {
+			let mut state = State2 {
 				generation: g,
 				cluster: c,
 				bootstrap: l,
@@ -38,13 +42,14 @@ impl Root2 {
 				initial_epoch: *epoch,
 				control_digest: *control,
 				control_len: *length,
-				selectors: BTreeMap::new(),
-				authorities: BTreeMap::new(),
-				lineages: BTreeMap::new(),
-				cuts: Vec::new(),
-				parents: BTreeMap::new(),
+				selectors: Map::new(),
+				authorities: Map::new(),
+				lineages: Map::new(),
+				cuts: Cuts2::default(),
+				parents: Map::new(),
+				derived: Derived2::default(),
 			};
-			validate_state(&state)?;
+			state.derived = Derived2::build(&state)?;
 			return Ok((
 				Root2 {
 					state,
@@ -66,7 +71,7 @@ impl Root2 {
 		if s.covered.index.checked_add(1) != Some(l.index) {
 			return Err(RootError2::LineageGap);
 		}
-		// Transactional clone: a future measured delta optimization must preserve atomicity.
+		// Immutable path-copy candidate: prior roots and payloads remain unchanged.
 		let mut next = old.clone();
 		let mut result = if verified.authorized() {
 			apply(&mut next, command, l, verified)?
@@ -76,7 +81,7 @@ impl Root2 {
 		next.state.covered = l;
 		next.state.fingerprint = fp;
 		next.state.command_digest = d;
-		match validate_state(&next.state) {
+		match update(s, &mut next.state, command) {
 			Ok(()) => {}
 			Err(RootError2::Limit) => {
 				next = old.clone();
@@ -87,7 +92,7 @@ impl Root2 {
 			}
 			Err(e) => return Err(e),
 		}
-		capacity(&next.state, next.limits)?;
+		cached_capacity(&next.state, next.limits)?;
 		Ok((next, result))
 	}
 }
@@ -106,7 +111,8 @@ fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Res
 				return Ok(ApplyResult2::Registered(x.enrolled));
 			}
 			if s.selectors.len() >= limits.registrations
-				|| usage(s)?
+				|| s.derived
+					.usage
 					.registry
 					.checked_add(68)
 					.ok_or(RootError2::Overflow)?
@@ -137,7 +143,8 @@ fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Res
 				});
 			}
 			if s.authorities.len() >= limits.registrations
-				|| usage(s)?
+				|| s.derived
+					.usage
 					.registry
 					.checked_add(121)
 					.ok_or(RootError2::Overflow)?
@@ -210,7 +217,8 @@ fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Res
 				return Ok(denied(3, None));
 			}
 			if s.cuts.len() >= limits.cuts
-				|| usage(s)?
+				|| s.derived
+					.usage
 					.history
 					.checked_add(72)
 					.ok_or(RootError2::Overflow)?
@@ -224,7 +232,9 @@ fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Res
 				log: l,
 				configuration: *configuration,
 			});
-			for g in s.lineages.values_mut() {
+			let keys = s.lineages.iter().map(|(k, _)| *k).collect::<Vec<_>>();
+			for key in keys {
+				let g = s.lineages.get_mut(&key).ok_or(RootError2::RootInvariant)?;
 				if g.latest.lease.epoch == *expected && g.closure.is_none() {
 					g.closure = Some(Closure2 {
 						cause: 3,
@@ -353,7 +363,8 @@ fn apply_grant(s: &mut State2, limits: Limits2, new: OriginalGrant2) -> Result2<
 		return Ok(denied(7, None));
 	}
 	if s.lineages.len() >= limits.lineages
-		|| usage(s)?
+		|| s.derived
+			.usage
 			.history
 			.checked_add(298)
 			.ok_or(RootError2::Overflow)?
@@ -395,9 +406,9 @@ fn apply_reserve(
 	}
 	let key = id.encode().map_err(|_| RootError2::Codec)?;
 	if let Some(p) = s.parents.get(&key) {
-		return Ok(if p.claim == *c {
+		return Ok(if p.claim.as_ref() == c {
 			ApplyResult2::Parent {
-				record: p.clone(),
+				record: p.record(),
 				new_effect: false,
 			}
 		} else {
@@ -437,7 +448,7 @@ fn apply_reserve(
 		return Ok(denied(9, None));
 	}
 	let held = c.held_bytes()?;
-	let u = usage(s)?;
+	let u = s.derived.usage;
 	if u.parents >= limits.slots
 		|| u.held
 			.checked_add(usize::try_from(held).map_err(|_| RootError2::Overflow)?)
@@ -480,7 +491,7 @@ fn apply_terminal(
 	}
 	if p.terminal.is_some() {
 		return Ok(ApplyResult2::Parent {
-			record: p.clone(),
+			record: p.record(),
 			new_effect: false,
 		});
 	}
@@ -535,7 +546,7 @@ fn apply_terminal(
 	let p = s.parents.get_mut(&key).ok_or(RootError2::RootInvariant)?;
 	p.terminal = Some(terminal);
 	Ok(ApplyResult2::Parent {
-		record: p.clone(),
+		record: p.record(),
 		new_effect: matches!(terminal, Terminal2::Accepted { .. }),
 	})
 }

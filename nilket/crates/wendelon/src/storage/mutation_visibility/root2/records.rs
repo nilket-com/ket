@@ -367,37 +367,41 @@ impl Wire2 for HolderAttestation2 {
 		Ok(v)
 	}
 }
+pub(super) fn write_parent(p: &impl super::stored::ParentView2, b: &mut Vec<u8>) -> Result2<()> {
+	valid_parent(p)?;
+	let (claim, reservation, held_bytes, terminal) = p.parts();
+	blob(b, &claim.bytes()?)?;
+	log(b, reservation)?;
+	b.extend(held_bytes.to_le_bytes());
+	match terminal {
+		None => {
+			b.push(0);
+			b.extend([0; 74]);
+		}
+		Some(Terminal2::Accepted { first, evidence }) => {
+			b.push(1);
+			log(b, first)?;
+			b.extend([1, 0]);
+			b.extend([0; 20]);
+			b.extend(evidence)
+		}
+		Some(Terminal2::Refused {
+			first,
+			cause,
+			anchor,
+		}) => {
+			b.push(1);
+			log(b, first)?;
+			b.extend([2, cause]);
+			log(b, anchor)?;
+			b.extend([0; 32])
+		}
+	}
+	Ok(())
+}
 impl Wire2 for ParentRecord2 {
 	fn write(&self, b: &mut Vec<u8>) -> Result2<()> {
-		valid_parent(self)?;
-		blob(b, &self.claim.bytes()?)?;
-		log(b, self.reservation)?;
-		b.extend(self.held_bytes.to_le_bytes());
-		match self.terminal {
-			None => {
-				b.push(0);
-				b.extend([0; 74]);
-			}
-			Some(Terminal2::Accepted { first, evidence }) => {
-				b.push(1);
-				log(b, first)?;
-				b.extend([1, 0]);
-				b.extend([0; 20]);
-				b.extend(evidence)
-			}
-			Some(Terminal2::Refused {
-				first,
-				cause,
-				anchor,
-			}) => {
-				b.push(1);
-				log(b, first)?;
-				b.extend([2, cause]);
-				log(b, anchor)?;
-				b.extend([0; 32])
-			}
-		}
-		Ok(())
+		write_parent(self, b)
 	}
 	fn read(r: &mut Read2<'_>) -> Result2<Self> {
 		let claim = ClaimProjection2::from_bytes(r.blob(CLAIM_BYTES2)?, CLAIM_BYTES2)?;

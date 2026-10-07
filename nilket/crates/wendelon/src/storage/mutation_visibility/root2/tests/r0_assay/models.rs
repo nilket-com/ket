@@ -88,7 +88,9 @@ fn history(r: &mut Root2, n: usize, cuts: usize) {
 				configuration: id(i as u64 + 1).repeat(2).try_into().unwrap(),
 			});
 		}
-		for g in r.state.lineages.values_mut() {
+		let keys = r.state.lineages.iter().map(|(k, _)| *k).collect::<Vec<_>>();
+		for key in keys {
+			let g = r.state.lineages.get_mut(&key).unwrap();
 			g.closure = Some(Closure2 {
 				cause: 3,
 				log: r.state.cuts[0].log,
@@ -252,6 +254,7 @@ pub(super) fn model(case: &str) -> Root2 {
 	r.state.fingerprint = [0x44; 32];
 	r.state.command_digest = [0x66; 32];
 	validate_state(&r.state).unwrap();
+	r.state.derived = super::super::super::incremental::Derived2::build(&r.state).unwrap();
 	r
 }
 pub(super) struct Arm {
@@ -305,14 +308,14 @@ pub(super) fn arms(r: &Root2) -> Vec<Arm> {
 	replay.same_entry = true;
 	a.push(replay);
 	if let Some(p) = r.state.parents.values().next() {
-		let mut c = p.claim.clone();
+		let mut c = (*p.claim).clone();
 		c.accounting_delta += 1;
 		a.push(arm("conflict", Command2::Reserve(c), "Conflict"));
 	}
 	if let Some(p) = r.state.parents.values().find(|p| p.terminal.is_some()) {
 		a.push(arm(
 			"parent_terminal_replay",
-			Command2::Reserve(p.claim.clone()),
+			Command2::Reserve((*p.claim).clone()),
 			match p.terminal {
 				Some(Terminal2::Accepted { .. }) => "AcceptedReplay",
 				Some(Terminal2::Refused { .. }) => "Refused",

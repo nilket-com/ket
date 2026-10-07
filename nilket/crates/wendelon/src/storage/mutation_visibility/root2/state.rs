@@ -1,6 +1,10 @@
 use super::super::MutationIdentity;
 use super::{codec::*, trust::TrustedView2, types::*, validation::*};
-use std::collections::BTreeMap;
+use super::{
+	incremental::Derived2,
+	persistent::Map,
+	stored::{Cuts2, StoredParent2},
+};
 #[derive(Clone)]
 pub struct Root2 {
 	pub(super) state: State2,
@@ -44,8 +48,11 @@ fn encode_state(s: &State2) -> Result2<Vec<u8>> {
 	write_vec(&mut b, s.parents.values().cloned(), s.parents.len())?;
 	envelope(b"VISAUT02", &b, ROOT_BYTES2)
 }
-fn sorted_map<K: Ord, T>(xs: Vec<T>, key: impl Fn(&T) -> Result2<K>) -> Result2<BTreeMap<K, T>> {
-	let mut result = BTreeMap::new();
+fn sorted_map<K: Ord + Clone, T: Clone>(
+	xs: Vec<T>,
+	key: impl Fn(&T) -> Result2<K>,
+) -> Result2<Map<K, T>> {
+	let mut result = Map::new();
 	for x in xs {
 		let k = key(&x)?;
 		if result.last_key_value().is_some_and(|(p, _)| p >= &k) {
@@ -92,9 +99,9 @@ impl UnverifiedRoot2 {
 		let lineages = sorted_map(read_vec::<LineageRecord2>(&mut r, LINEAGES2, 294)?, |g| {
 			Ok(g.latest.lineage)
 		})?;
-		let cuts = read_vec::<EpochCut2>(&mut r, CUTS2, 68)?;
+		let cuts = Cuts2::from_vec(read_vec::<EpochCut2>(&mut r, CUTS2, 68)?)?;
 		let parents = sorted_map(
-			read_vec::<ParentRecord2>(&mut r, PARENT_SLOTS2, CLAIM_BYTES2 + 107)?,
+			read_vec::<StoredParent2>(&mut r, PARENT_SLOTS2, CLAIM_BYTES2 + 107)?,
 			|p| {
 				p.claim
 					.manifest
@@ -104,7 +111,7 @@ impl UnverifiedRoot2 {
 			},
 		)?;
 		r.end()?;
-		let state = State2 {
+		let mut state = State2 {
 			generation,
 			cluster,
 			bootstrap,
@@ -119,9 +126,11 @@ impl UnverifiedRoot2 {
 			lineages,
 			cuts,
 			parents,
+			derived: Derived2::default(),
 		};
-		validate_state(&state)?;
-		if usage(&state)? != saved {
+		// Build runs the full validator before deriving any trusted summary.
+		state.derived = Derived2::build(&state)?;
+		if state.derived.usage != saved {
 			return Err(RootError2::RootInvariant);
 		}
 		Ok(Self { state })
@@ -160,7 +169,7 @@ impl Root2 {
 		encode_state(&self.state)
 	}
 	pub fn usage(&self) -> Result2<Usage2> {
-		usage(&self.state)
+		Ok(self.state.derived.usage)
 	}
 	pub fn covered(&self) -> Log2 {
 		self.state.covered
@@ -170,7 +179,7 @@ impl Root2 {
 			return Err(RootError2::TrustMismatch);
 		}
 		let k = id.encode().map_err(|_| RootError2::Codec)?;
-		Ok(self.state.parents.get(&k).cloned())
+		Ok(self.state.parents.get(&k).map(StoredParent2::record))
 	}
 	pub fn lookup_at(
 		&self,
@@ -214,9 +223,7 @@ impl Root2 {
 		Ok(self
 			.state
 			.cuts
-			.iter()
-			.filter(|c| c.log.index <= k)
-			.last()
+			.at(k)
 			.map_or(self.state.initial_epoch, |c| c.new))
 	}
 	#[cfg(test)]

@@ -51,7 +51,7 @@ pub(super) fn next(
 	let cluster = root.state.cluster;
 	let e = TrustedEntry2::fixture(g, cluster, l(root.covered().index + 1), c).unwrap();
 	let v = VerifiedCommand2::fixture(g, cluster, c, trace, evidence).unwrap();
-	Root2::reduce(Some(root), &e, &v, c).unwrap()
+	super::s1c::checked_step(root, &e, &v, c).unwrap()
 }
 pub(super) fn finalized(r: &Root2) -> Command2 {
 	let p = r.lookup(&claim().manifest.identity).unwrap().unwrap();

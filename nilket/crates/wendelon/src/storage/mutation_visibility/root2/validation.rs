@@ -174,15 +174,16 @@ pub(super) fn valid_attestation_shape(a: &HolderAttestation2) -> Result2<()> {
 	}
 	Ok(())
 }
-pub(super) fn valid_parent(p: &ParentRecord2) -> Result2<()> {
-	valid_claim(&p.claim)?;
-	valid_log(p.reservation)?;
-	if p.claim.original.log.index >= p.reservation.index || p.held_bytes != p.claim.held_bytes()? {
+pub(super) fn valid_parent(p: &impl super::stored::ParentView2) -> Result2<()> {
+	let (claim, reservation, held_bytes, terminal) = p.parts();
+	valid_claim(claim)?;
+	valid_log(reservation)?;
+	if claim.original.log.index >= reservation.index || held_bytes != claim.held_bytes()? {
 		return Err(RootError2::Codec);
 	}
-	if let Some(t) = p.terminal {
+	if let Some(t) = terminal {
 		valid_log(t.first())?;
-		if t.first().index <= p.reservation.index {
+		if t.first().index <= reservation.index {
 			return Err(RootError2::Codec);
 		}
 		if let Terminal2::Refused {
@@ -274,11 +275,15 @@ pub(super) fn capacity(s: &State2, l: Limits2) -> Result2<()> {
 	}
 	Ok(())
 }
-pub(super) fn trigger(s: &State2, p: &ParentRecord2) -> Result2<Option<(u8, Log2)>> {
+pub(super) fn trigger(
+	s: &State2,
+	p: &impl super::stored::ParentView2,
+) -> Result2<Option<(u8, Log2)>> {
+	let (claim, _, _, _) = p.parts();
 	let mut candidates = Vec::new();
 	let g = s
 		.lineages
-		.get(&p.claim.original.lineage)
+		.get(&claim.original.lineage)
 		.ok_or(RootError2::RootInvariant)?;
 	if let Some(c) = g.closure {
 		candidates.push((
@@ -293,7 +298,7 @@ pub(super) fn trigger(s: &State2, p: &ParentRecord2) -> Result2<Option<(u8, Log2
 	}
 	if let Some(a) = s
 		.authorities
-		.get(&authority_key(p.claim.authority)?)
+		.get(&authority_key(claim.authority)?)
 		.and_then(|a| a.revoked)
 	{
 		candidates.push((4, a))
