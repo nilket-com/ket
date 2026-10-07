@@ -171,3 +171,60 @@ Selected delivery order, each with a review gate:
 4. Performance/capacity gates, then separately reviewed P3 and campaign resumption. Bounds and freeze require a later instrument review.
 
 No stage begins production changes from this selection record alone. Claude reviews each concrete package; GitHub push and main fast-forward beyond this plan record are not authorized. ADR629 layouts 2–4, A3, C1/F16/F17 and F9 remain held alongside lease-safety and P3.
+
+## S1c implementation and R0 cost results (reviewed)
+
+S1c closes the R0 per-entry CPU gate for the measured cases; the snapshot memory gate at X remains failed. This is a dormant reducer implementation and a bounded cost result, not completed read visibility, an operating-ceiling selection or store-trust acceptance. Main fast-forward and push remain held. R2/R3 durable storage and Raft integration, lease-safety, P3 availability work and ADR629 campaign resumption are not authorized by this record.
+
+### Remaining gates
+
+- **X snapshot encode still fails the memory gate:** 523.352 MiB additional requested live allocation exceeds the frozen 512 MiB bound, unchanged from the original R0 assay. This measures allocation above the retained input baseline, not installed-state RSS or total process memory.
+- **Snapshot codec and full validation remain costly, with slower large-state observations:** X encode elapsed median was 1111.710 -> 1459.596 ms; full-validation elapsed maximum was 433.097 -> 790.220 ms. Decode elapsed maximum was 1026.986 -> 1220.124 ms. These are separate seven-process samples, not paired observations or a causal decomposition. The snapshot cadence and memory gates must be reviewed before R3; the reducer result does not waive them.
+- **Complete rate profiles remain unavailable** for E, H, R, P32768, B and X because required semantic arms are absent. Renewal-only arithmetic cannot turn these into profile passes.
+- **No production occupancy ceiling is selected:** frozen `supported_cases` remains empty. All case/profile gates are reported independently.
+- **L1/K1/R7 remains open:** retained closed lineages still consume the bounded lineage inventory. S1c changes neither the encoded capacities nor the retention policy. This is a multi-day availability prerequisite before dogfooding, regardless of the improved CPU cost.
+- The assay contains no NewGrant/Cut latency arm, installed RSS measurement, arbitrary retained-root/last-root-drop measurement or durable I/O/Raft integration measurement.
+
+### Implementation and validation
+
+Dormant source: initial S1c `f8bd00119aa165b2e8e88a98615d52b9d655502d`, followed by signed corrections `b44d017f0b01b993905eab1b0759d715d6d1fd5f`, tree `09f07c7aed5bc9dad4812046ebbd3aebdebcb544`. The implementation retains the existing canonical bytes and public contract while using persistent copy-on-write collections and incremental trusted-state checks. Full validation stays at the untrusted decode boundary.
+
+The follow-up moves immutable Cut/Release/Revoke checks before mutation, pins the Reserve bootstrap bound, preserves multi-defect decoder error precedence and extends legacy/new reducer equivalence and no-full-walk guards. The oracle retains its prior reducer bodies; shared primitive codecs and trust fixtures limit independence. The guard is a source/AST check with artifact corroboration, not a compiler-resolution proof.
+
+Pinned Rust 1.95.0 ladder `s1c-ladder-2`, clean signed source at start/end: Wendelon 2202 passed / 0 failed / 13 ignored; Wendelon-client 13/0/0; Toron 5729/0/25; TPC-H 674/0/6; Toron-client 24/0/0. Visibility debug/release checks each 97/0/3; boundary checks 4/0/0. Formatting and release-library checks passed. Shared warmed target and a separate serial strict TPC-H warmup are disclosed; earlier development failures and source-bound prechecks are retained. Ordinary-library compile-out evidence covers test oracle/assay hooks, with source checks as the primary evidence.
+
+All 108 original construction fixture/arm/omission identities agree in order. The original assay adaptation is fixture/model construction only; the r1-to-r2 instrument interdiff is empty. No timed arm body changed in the corrective follow-up; reducer work remains within its measured call.
+
+### Frozen rerun and comparison
+
+Claude cleared the implementation and launch via chatd `01a1144b-5138-70d5-9335-238c0ac45b45` and accepted the measurement via `01a11454-bd97-76fd-a55e-4dfe5c440273`. Freeze `ae50178f8cd613acae3e8163e4ee09c3542e03273186993917ddbfaaa97062e5` preserves the original R0 cases, arm inputs and omissions, seven repetitions, process order, rate profiles, proposed gates and external watchdogs. Only source/artifact/provenance bindings changed. Exact release executable SHA256: `b390490e44b53561942fcc4490561b7261e0783822ccd9477502a1f4615f669b`.
+
+63/63 fresh sequential processes completed with rc 0. Readout: READ, reasons []; no STOP/ACTIVE, every owned process-group cleanup verified. No replacement, rerun or tuning occurred. The recorded one-second launch inspection gave 97.205% idle CPU and found no build/storage workload process; normal desktop/system services remained. Postflight found no assay/build/storage workload. Evidence was copied back and checked against the remote listing, and the final retained manifest verifies on both hosts.
+
+CPU-time medians below are milliseconds, from the same frozen seven-process distributions:
+
+| Case / arm | Original R0 | S1c |
+| --- | ---: | ---: |
+| P4096 renewal | 9.529150 | 0.003851 |
+| P4096 cover | 10.477740 | 0.003001 |
+| P4096 reserve | 9.675340 | 0.016004 |
+| P4096 finalize | 9.595876 | 0.010727 |
+| P32768 renewal | 78.066727 | 0.007004 |
+| X renewal | 446.800267 | 0.013727 |
+
+At P4096, frozen Deploy-P3 modeled demand is median 0.037752%, maximum 0.049531% of one CPU core; Deploy-current is median 0.074721%, maximum 0.098251%. These are frozen profile arithmetic from process CPU observations, not achieved cluster throughput. The P3 profile uses the approved 2 s target (96 renewals/s at the stated 192-range model); the separate 2.5 s sensitivity assumption selects no policy.
+
+All nine cases meet the unchanged 50 ms measured-reducer and 2 s encode/decode elapsed gates. P1/P256/P4096 have complete coverage for all six frozen profiles and meet the 25% one-core profile gate. Other cases' profile coverage is unavailable as listed above. The allocation gate is met for every case except X. These outcomes do not infer NewGrant/Cut costs or authorize arbitrary full-state occupancy.
+
+### L1 capacity finding and provenance
+
+The unchanged lineage cap is 16,384. In the conditional fixed-roster model of 192 fresh lineage grants per complete generation, 85 complete generations fit (including the initial generation), then 64 slots remain; this permits 84 complete subsequent generations before the next one cannot fill all 192 ranges. Cut itself is not prevented solely by this count. Actual eviction/rejoin adapters may change ranges and grants per epoch; no live authority2 membership campaign established that mapping. These are code-derived arithmetic limits, not a measured lifetime. R7 must resolve the retained-lineage policy before production multi-day use.
+
+Evidence roots:
+
+- Workstation: `~/.agent-bridge/wendelon-adr0100-s1c-implementation-r2/` (source, signature, ladder, equivalence/guard map, immutable construction freeze and disclosures); SHA256SUMS `f3e1078185f81f0840cd5d20c5bf6db43838600187d005c8e8540f45ad1237dd` (151 entries).
+- Workstation: `~/.agent-bridge/wendelon-adr0100-r0-cost-s1c-2/`; bigfoot: `~/work/toron-evidence/adr0100/r0-cost-s1c-2/`. SHA256SUMS `0f38893ca2830e612a1de7a82064a42250ce38d04fa8343576feb7761c3a3ed3` (273 entries).
+- Rerun `readout.json`: `3ef82b7d324fe824ced87d847c0692ab8e523fd856906c330350dd3059d1ce8e`.
+- `comparison.json`: `e99985dda91f84a316c69de82dcb8d11d867a0fb750a85c6b25ba92f0d2f10a6`, retaining each case/arm sample, min/median/max, allocation metric, unavailable arm and profile/gate comparison against original `r0-cost-1`.
+
+Original packages, failed development steps and original R0 evidence remain separate and unchanged. This record selects no new implementation scope, deadline, rate policy, capacity or production activation.
