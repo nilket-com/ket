@@ -91,6 +91,32 @@ impl<K: Ord + Clone, V: Clone> Map<K, V> {
 		found
 	}
 	#[cfg(test)]
+	pub fn shares_root(&self, other: &Self) -> bool {
+		match (&self.0, &other.0) {
+			(Some(a), Some(b)) => Arc::ptr_eq(a, b),
+			(None, None) => true,
+			_ => false,
+		}
+	}
+	#[cfg(test)]
+	pub fn shares_value(&self, other: &Self, key: &K) -> bool {
+		fn find<'a, K: Ord, V>(map: &'a Map<K, V>, key: &K) -> Option<&'a Arc<V>> {
+			let mut at = map.0.as_deref();
+			while let Some(n) = at {
+				match key.cmp(&n.key) {
+					Ordering::Less => at = n.left.as_deref(),
+					Ordering::Greater => at = n.right.as_deref(),
+					Ordering::Equal => return Some(&n.value),
+				}
+			}
+			None
+		}
+		match (find(self, key), find(other, key)) {
+			(Some(a), Some(b)) => Arc::ptr_eq(a, b),
+			_ => false,
+		}
+	}
+	#[cfg(test)]
 	pub fn clear(&mut self) {
 		self.0 = None;
 	}

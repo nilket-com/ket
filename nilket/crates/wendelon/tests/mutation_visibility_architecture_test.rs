@@ -249,35 +249,85 @@ fn s1c_incremental_updates_do_not_scan_or_create_authority_and_oracle_is_test_on
 		assert!(text.lines().count() <= 750);
 		assert!(!text.contains("unsafe "));
 	}
-	let file = syn::parse_file(&fs::read_to_string(root.join("incremental.rs")).unwrap()).unwrap();
-	assert!(
-		file.items
-			.iter()
-			.any(|i| matches!(i,syn::Item::Fn(f)if f.sig.ident=="update"))
-	);
-	let text = fs::read_to_string(root.join("incremental.rs")).unwrap();
-	let body = text.split("pub(super) fn update(").nth(1).unwrap();
-	// Parsed module plus conservative identifier check; this is not a transitive call-graph proof.
-	let bytes = body.as_bytes();
-	let mut at = 0;
-	while at < bytes.len() {
-		if bytes[at].is_ascii_alphabetic() || bytes[at] == b'_' {
-			let start = at;
-			while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
-				at += 1;
+	// Scan every local helper body reachable from fresh reduce, not only update.
+	// Token groups include nested blocks/macros and exclude comments and literals.
+	// This conservative module inventory is not Rust symbol-resolution/devirtualization.
+	fn no_full_scan(tokens: proc_macro2::TokenStream, label: &str) {
+		let ts = tokens.into_iter().collect::<Vec<_>>();
+		for (i, t) in ts.iter().enumerate() {
+			if let proc_macro2::TokenTree::Ident(id) = t {
+				if [
+					"validate_state",
+					"usage",
+					"capacity",
+					"build",
+					"encode_state",
+				]
+				.contains(&id.to_string().as_str())
+					&& matches!(ts.get(i+1),Some(proc_macro2::TokenTree::Group(g)) if g.delimiter()==proc_macro2::Delimiter::Parenthesis)
+				{
+					panic!("full-state call in {label}: {id}");
+				}
 			}
-			let token = &body[start..at];
-			let mut next = at;
-			while next < bytes.len() && bytes[next].is_ascii_whitespace() {
-				next += 1;
+			if let proc_macro2::TokenTree::Group(g) = t {
+				no_full_scan(g.stream(), label);
 			}
-			if next < bytes.len() && bytes[next] == b'(' {
-				assert!(!["validate_state", "usage", "capacity", "build"].contains(&token));
-			}
-		} else {
-			at += 1;
 		}
 	}
+	fn functions(tokens: proc_macro2::TokenStream, module: &str) {
+		let ts = tokens.into_iter().collect::<Vec<_>>();
+		let mut i = 0;
+		while i < ts.len() {
+			if matches!(&ts[i],proc_macro2::TokenTree::Ident(id) if id=="fn") {
+				let Some(proc_macro2::TokenTree::Ident(name)) = ts.get(i + 1) else {
+					panic!("function name")
+				};
+				let mut j = i + 2;
+				while j < ts.len() {
+					if let proc_macro2::TokenTree::Group(body) = &ts[j] {
+						if body.delimiter() == proc_macro2::Delimiter::Brace {
+							let exempt = (module == "reducer.rs" && name == "bootstrap_root")
+								|| (module == "incremental.rs" && name == "build")
+								|| (module == "validation.rs"
+									&& ["validate_state", "usage", "capacity"]
+										.contains(&name.to_string().as_str()));
+							if !exempt {
+								no_full_scan(body.stream(), &format!("{module}::{name}"));
+							}
+							break;
+						}
+					}
+					if matches!(&ts[j],proc_macro2::TokenTree::Punct(p) if p.as_char()==';') {
+						break;
+					}
+					j += 1;
+				}
+				i = j + 1;
+			} else {
+				if let proc_macro2::TokenTree::Group(g) = &ts[i] {
+					functions(g.stream(), module);
+				}
+				i += 1;
+			}
+		}
+	}
+	for module in [
+		"reducer.rs",
+		"incremental.rs",
+		"validation.rs",
+		"persistent.rs",
+		"stored.rs",
+		"command.rs",
+		"records.rs",
+		"codec.rs",
+	] {
+		let source = fs::read_to_string(root.join(module)).unwrap();
+		syn::parse_file(&source).unwrap();
+		functions(source.parse().unwrap(), module);
+	}
+	let reducer = fs::read_to_string(root.join("reducer.rs")).unwrap();
+	assert_eq!(reducer.matches("Derived2::build(").count(), 1);
+	assert_eq!(reducer.matches("return bootstrap_root(").count(), 1);
 	let tests = fs::read_to_string(root.join("tests/mod.rs")).unwrap();
 	assert!(tests.contains("mod s1c_oracle;"));
 	let modules = fs::read_to_string(root.join("mod.rs")).unwrap();

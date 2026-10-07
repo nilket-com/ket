@@ -169,9 +169,9 @@ fn s1_caller_or_envelope_conflict_and_unauthorized_apply_are_atomic() {
 	let v = VerifiedCommand2::fixture(g, cl, &c, &[], 1)
 		.unwrap()
 		.unauthorized();
-	let (n, o) = Root2::reduce(Some(&r), &e, &v, &c).unwrap();
+	let (n, o) = super::s1c::checked_step(&r, &e, &v, &c).unwrap();
 	assert_denied(&o, 8);
 	assert_eq!(n.usage().unwrap(), r.usage().unwrap());
 	let v = VerifiedCommand2::fixture(g, cl, &command("command_cover_blank"), &[], 1).unwrap();
-	assert!(Root2::reduce(Some(&r), &e, &v, &c).is_err());
+	assert!(super::s1c::checked_step(&r, &e, &v, &c).is_err());
 }

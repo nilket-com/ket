@@ -4,6 +4,52 @@ use super::{
 	persistent::Map,
 	stored::Cuts2,
 };
+fn bootstrap_root(
+	g: [u8; 16],
+	c: [u8; 16],
+	l: Log2,
+	fp: Digest2,
+	d: Digest2,
+	command: &Command2,
+	verified: &VerifiedCommand2,
+) -> Result2<(Root2, ApplyResult2)> {
+	let Command2::Bootstrap {
+		epoch,
+		control,
+		length,
+	} = command
+	else {
+		return Err(RootError2::TrustMismatch);
+	};
+	if !verified.authorized() {
+		return Err(RootError2::TrustMismatch);
+	}
+	let mut state = State2 {
+		generation: g,
+		cluster: c,
+		bootstrap: l,
+		covered: l,
+		fingerprint: fp,
+		command_digest: d,
+		initial_epoch: *epoch,
+		control_digest: *control,
+		control_len: *length,
+		selectors: Map::new(),
+		authorities: Map::new(),
+		lineages: Map::new(),
+		cuts: Cuts2::default(),
+		parents: Map::new(),
+		derived: Derived2::default(),
+	};
+	state.derived = Derived2::build(&state)?;
+	return Ok((
+		Root2 {
+			state,
+			limits: Limits2::default(),
+		},
+		ApplyResult2::Registered(l),
+	));
+}
 fn denied(reason: u16, reference: Option<Log2>) -> ApplyResult2 {
 	ApplyResult2::Denied { reason, reference }
 }
@@ -21,42 +67,7 @@ impl Root2 {
 			return Err(RootError2::TrustMismatch);
 		}
 		let Some(old) = root else {
-			let Command2::Bootstrap {
-				epoch,
-				control,
-				length,
-			} = command
-			else {
-				return Err(RootError2::TrustMismatch);
-			};
-			if !verified.authorized() {
-				return Err(RootError2::TrustMismatch);
-			}
-			let mut state = State2 {
-				generation: g,
-				cluster: c,
-				bootstrap: l,
-				covered: l,
-				fingerprint: fp,
-				command_digest: d,
-				initial_epoch: *epoch,
-				control_digest: *control,
-				control_len: *length,
-				selectors: Map::new(),
-				authorities: Map::new(),
-				lineages: Map::new(),
-				cuts: Cuts2::default(),
-				parents: Map::new(),
-				derived: Derived2::default(),
-			};
-			state.derived = Derived2::build(&state)?;
-			return Ok((
-				Root2 {
-					state,
-					limits: Limits2::default(),
-				},
-				ApplyResult2::Registered(l),
-			));
+			return bootstrap_root(g, c, l, fp, d, command, verified);
 		};
 		let s = &old.state;
 		if (g, c) != (s.generation, s.cluster) {
@@ -165,9 +176,17 @@ fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Res
 			Ok(ApplyResult2::Registered(l))
 		}
 		Command2::RevokeAuthority(a) => {
-			let Some(a) = s.authorities.get_mut(&authority_key(*a)?) else {
+			let key = authority_key(*a)?;
+			let Some(a) = s.authorities.get(&key) else {
 				return Ok(denied(9, None));
 			};
+			if let Some(first) = a.revoked {
+				return Ok(ApplyResult2::Registered(first));
+			}
+			let a = s
+				.authorities
+				.get_mut(&key)
+				.ok_or(RootError2::RootInvariant)?;
 			let first = *a.revoked.get_or_insert(l);
 			Ok(ApplyResult2::Registered(first))
 		}
@@ -188,7 +207,7 @@ fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Res
 			},
 		),
 		Command2::Release { lineage, latest } => {
-			let Some(g) = s.lineages.get_mut(lineage) else {
+			let Some(g) = s.lineages.get(lineage) else {
 				return Ok(denied(9, None));
 			};
 			if let Some(closure) = g.closure {
@@ -201,6 +220,10 @@ fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Res
 			if g.latest.reference()? != *latest {
 				return Ok(denied(7, Some(g.latest.log)));
 			}
+			let g = s
+				.lineages
+				.get_mut(lineage)
+				.ok_or(RootError2::RootInvariant)?;
 			g.closure = Some(Closure2 {
 				cause: 1,
 				log: l,
@@ -234,8 +257,9 @@ fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Res
 			});
 			let keys = s.lineages.iter().map(|(k, _)| *k).collect::<Vec<_>>();
 			for key in keys {
-				let g = s.lineages.get_mut(&key).ok_or(RootError2::RootInvariant)?;
+				let g = s.lineages.get(&key).ok_or(RootError2::RootInvariant)?;
 				if g.latest.lease.epoch == *expected && g.closure.is_none() {
+					let g = s.lineages.get_mut(&key).ok_or(RootError2::RootInvariant)?;
 					g.closure = Some(Closure2 {
 						cause: 3,
 						log: l,

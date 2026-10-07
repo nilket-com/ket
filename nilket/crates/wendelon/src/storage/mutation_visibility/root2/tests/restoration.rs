@@ -45,13 +45,13 @@ fn s1_exact_last_entry_replay_and_changed_term_node_fingerprint_gap_refuse() {
 	let (g, cl) = (r.state.generation, r.state.cluster);
 	let e = TrustedEntry2::fixture(g, cl, l(6), &c).unwrap();
 	let v = VerifiedCommand2::fixture(g, cl, &c, &[], 1).unwrap();
-	let (n, _) = Root2::reduce(Some(&r), &e, &v, &c).unwrap();
-	let (n2, o) = Root2::reduce(Some(&n), &e, &v, &c).unwrap();
+	let (n, _) = super::s1c::checked_step(&r, &e, &v, &c).unwrap();
+	let (n2, o) = super::s1c::checked_step(&n, &e, &v, &c).unwrap();
 	assert!(matches!(o, ApplyResult2::AlreadyProcessed));
 	assert_eq!(n2.encode().unwrap(), n.encode().unwrap());
 	let mut altered = TrustedEntry2::fixture(g, cl, l(6), &c).unwrap();
 	altered.change_fingerprint();
-	assert!(Root2::reduce(Some(&n), &altered, &v, &c).is_err());
+	assert!(super::s1c::checked_step(&n, &altered, &v, &c).is_err());
 	for id in [
 		Log2 {
 			term: 2,
@@ -67,7 +67,7 @@ fn s1_exact_last_entry_replay_and_changed_term_node_fingerprint_gap_refuse() {
 		l(4),
 	] {
 		let e = TrustedEntry2::fixture(g, cl, id, &c).unwrap();
-		assert!(Root2::reduce(Some(&n), &e, &v, &c).is_err());
+		assert!(super::s1c::checked_step(&n, &e, &v, &c).is_err());
 	}
 }
 #[test]

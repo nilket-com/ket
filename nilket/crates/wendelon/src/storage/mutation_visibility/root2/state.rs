@@ -99,7 +99,7 @@ impl UnverifiedRoot2 {
 		let lineages = sorted_map(read_vec::<LineageRecord2>(&mut r, LINEAGES2, 294)?, |g| {
 			Ok(g.latest.lineage)
 		})?;
-		let cuts = Cuts2::from_vec(read_vec::<EpochCut2>(&mut r, CUTS2, 68)?)?;
+		let cuts = Cuts2::from_parsed(read_vec::<EpochCut2>(&mut r, CUTS2, 68)?);
 		let parents = sorted_map(
 			read_vec::<StoredParent2>(&mut r, PARENT_SLOTS2, CLAIM_BYTES2 + 107)?,
 			|p| {
@@ -130,6 +130,7 @@ impl UnverifiedRoot2 {
 		};
 		// Build runs the full validator before deriving any trusted summary.
 		state.derived = Derived2::build(&state)?;
+		state.cuts.seal_validated();
 		if state.derived.usage != saved {
 			return Err(RootError2::RootInvariant);
 		}

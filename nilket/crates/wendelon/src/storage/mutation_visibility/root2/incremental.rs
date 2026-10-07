@@ -180,6 +180,9 @@ pub(super) fn update(old: &State2, next: &mut State2, cmd: &Command2) -> Result2
 			if !old.parents.contains_key(&key) {
 				if let Some(p) = next.parents.get(&key) {
 					valid_parent(p)?;
+					if p.claim.original.log.index < next.bootstrap.index {
+						return Err(RootError2::RootInvariant);
+					}
 					d.parent(p)?;
 					d.usage.parents = add(d.usage.parents, 1)?;
 					d.usage.held = add(

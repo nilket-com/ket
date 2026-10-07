@@ -64,45 +64,81 @@ impl std::fmt::Debug for StoredParent2 {
 		f.write_str("StoredParent2 { redacted }")
 	}
 }
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
-pub(super) struct Cuts2(Map<u64, EpochCut2>);
+// Parsed cuts retain original order/duplicates until full validation establishes precedence.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(super) enum Cuts2 {
+	Ordered(Map<u64, EpochCut2>),
+	Parsed(Vec<EpochCut2>),
+}
+impl Default for Cuts2 {
+	fn default() -> Self {
+		Self::Ordered(Map::new())
+	}
+}
+pub(super) enum CutIter<'a> {
+	Ordered(super::persistent::Iter<'a, u64, EpochCut2>),
+	Parsed(std::slice::Iter<'a, EpochCut2>),
+}
+impl<'a> Iterator for CutIter<'a> {
+	type Item = &'a EpochCut2;
+	fn next(&mut self) -> Option<Self::Item> {
+		match self {
+			Self::Ordered(i) => i.next().map(|(_, v)| v),
+			Self::Parsed(i) => i.next(),
+		}
+	}
+}
 impl Cuts2 {
 	pub fn len(&self) -> usize {
-		self.0.len()
+		match self {
+			Self::Ordered(m) => m.len(),
+			Self::Parsed(v) => v.len(),
+		}
 	}
-	pub fn iter(&self) -> impl Iterator<Item = &EpochCut2> {
-		self.0.values()
+	pub fn iter(&self) -> CutIter<'_> {
+		match self {
+			Self::Ordered(m) => CutIter::Ordered(m.iter()),
+			Self::Parsed(v) => CutIter::Parsed(v.iter()),
+		}
 	}
 	pub fn last(&self) -> Option<&EpochCut2> {
-		self.0.last_key_value().map(|(_, v)| v)
+		match self {
+			Self::Ordered(m) => m.last_key_value().map(|(_, v)| v),
+			Self::Parsed(v) => v.last(),
+		}
 	}
 	pub fn at(&self, k: u64) -> Option<&EpochCut2> {
-		self.0.upper_bound(&k).map(|(_, v)| v)
+		match self {
+			Self::Ordered(m) => m.upper_bound(&k).map(|(_, v)| v),
+			Self::Parsed(v) => v.iter().filter(|c| c.log.index <= k).last(),
+		}
 	}
 	pub fn push(&mut self, c: EpochCut2) {
-		self.0.insert(c.log.index, c);
-	}
-	pub fn from_vec(v: Vec<EpochCut2>) -> Result2<Self> {
-		let mut out = Self::default();
-		let mut prev = None;
-		for c in v {
-			if prev.is_some_and(|k| k >= c.log.index) {
-				return Err(RootError2::RootInvariant);
+		match self {
+			Self::Ordered(m) => {
+				m.insert(c.log.index, c);
 			}
-			prev = Some(c.log.index);
-			out.push(c)
+			Self::Parsed(v) => v.push(c),
 		}
-		Ok(out)
+	}
+	pub fn from_parsed(v: Vec<EpochCut2>) -> Self {
+		Self::Parsed(v)
+	}
+	pub fn seal_validated(&mut self) {
+		if let Self::Parsed(v) = self {
+			let mut m = Map::new();
+			for c in std::mem::take(v) {
+				m.insert(c.log.index, c);
+			}
+			*self = Self::Ordered(m);
+		}
 	}
 }
 impl<'a> IntoIterator for &'a Cuts2 {
 	type Item = &'a EpochCut2;
-	type IntoIter = std::iter::Map<
-		super::persistent::Iter<'a, u64, EpochCut2>,
-		fn((&'a u64, &'a EpochCut2)) -> &'a EpochCut2,
-	>;
+	type IntoIter = CutIter<'a>;
 	fn into_iter(self) -> Self::IntoIter {
-		self.0.iter().map(|(_, v)| v)
+		self.iter()
 	}
 }
 #[cfg(test)]
