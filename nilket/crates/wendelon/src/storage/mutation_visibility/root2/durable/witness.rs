@@ -17,6 +17,9 @@ pub struct UnverifiedOutcome2 {
 	pub response: Vec<u8>,
 }
 opaque!(UnverifiedWitness2, UnverifiedOutcome2);
+// Receipt child-binding digests remain opaque/verifier-deferred (including literal golden
+// placeholders). Structural decoding does not recompute child_binding2 or authenticate receipts.
+// Later scoped integration must do both before treating a witness as durable or read-ready.
 impl UnverifiedWitness2 {
 	fn validate(&self) -> Result2<()> {
 		check_claim(&self.claim)?;

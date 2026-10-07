@@ -339,3 +339,69 @@ fn unsigned_receipt_is_only_unverified_and_child_binding_is_opaque_metadata() {
 		"documentation placeholders are not data-durability evidence"
 	);
 }
+
+#[test]
+fn oversized_journal_prefix_is_chain_local_and_preserves_other_parents() {
+	let first = UnverifiedJournal2::decode(&fixture("journal_step_1")).unwrap();
+	let mut other = first.clone();
+	let UnverifiedJournalStep2::Prepared(ref mut c) = other.step else {
+		panic!()
+	};
+	c.manifest.identity.sequence += 1;
+	other.owner.identity = c.manifest.identity;
+	other.owner.claim = c.digest().unwrap();
+	let good = first.encode().unwrap();
+	let mut bad = fixture("journal_step_2");
+	bad[15] = 0x7f;
+	let damaged = [good.clone(), bad.clone()].concat();
+	let objects = [
+		(first.owner.locator().unwrap(), damaged),
+		(other.owner.locator().unwrap(), other.encode().unwrap()),
+	];
+	let r = inspect_journal_objects2(Some(&objects), budget()).unwrap();
+	assert!(r[0].unavailable);
+	assert_eq!(r[0].validated_records, 1);
+	assert_eq!(r[0].damaged_suffix, bad);
+	assert!(!r[1].unavailable);
+	assert_eq!(r[1].validated_records, 1);
+}
+#[test]
+fn duplicate_owner_invalidates_all_copies_but_not_an_independent_parent() {
+	let first = UnverifiedJournal2::decode(&fixture("journal_step_1")).unwrap();
+	let mut other = first.clone();
+	let UnverifiedJournalStep2::Prepared(ref mut c) = other.step else {
+		panic!()
+	};
+	c.manifest.identity.sequence += 1;
+	other.owner.identity = c.manifest.identity;
+	other.owner.claim = c.digest().unwrap();
+	for order in [false, true] {
+		let original = (first.owner.locator().unwrap(), first.encode().unwrap());
+		let duplicate = ("0".repeat(64), first.encode().unwrap());
+		let mut objects = if order {
+			vec![duplicate, original]
+		} else {
+			vec![original, duplicate]
+		};
+		objects.push((other.owner.locator().unwrap(), other.encode().unwrap()));
+		let r = inspect_journal_objects2(Some(&objects), budget()).unwrap();
+		assert!(r[0].unavailable && r[1].unavailable);
+		assert!(!r[2].unavailable);
+		assert_eq!(r[2].validated_records, 1);
+	}
+}
+#[test]
+fn grant_archive_requires_exact_embedded_command_width_at_decode() {
+	let mut b = fixture("grant_original_unverified");
+	// Outer payload: generation16+cluster16+two Log20+entry_context32, then command blob.
+	let offset = 16 + 104;
+	assert_eq!(
+		u32::from_le_bytes(b[offset..offset + 4].try_into().unwrap()),
+		318
+	);
+	b[offset..offset + 4].copy_from_slice(&317u32.to_le_bytes());
+	b.remove(offset + 4 + 317);
+	let len = (b.len() - 48) as u32;
+	b[12..16].copy_from_slice(&len.to_le_bytes());
+	assert!(UnverifiedGrantArchive2::decode(&repaired(b)).is_err());
+}

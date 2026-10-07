@@ -60,6 +60,9 @@ impl std::fmt::Debug for LoadedContent2 {
 }
 // Parse all flatbuffer metadata and body extents before allocating any Arrow arrays.
 fn ipc_preflight(bytes: &[u8]) -> Result2<usize> {
+	ipc_preflight_with(bytes, |_, _| {})
+}
+fn ipc_preflight_with(bytes: &[u8], mut boundary: impl FnMut(usize, usize)) -> Result2<usize> {
 	if bytes.is_empty() || bytes.len() > FRAME_MAX {
 		return Err(RootError2::Limit);
 	}
@@ -71,6 +74,7 @@ fn ipc_preflight(bytes: &[u8]) -> Result2<usize> {
 	let mut ended = false;
 	let mut decoded_bytes = 0usize;
 	while pos < bytes.len() {
+		let message_start = pos;
 		let take = |at: usize, n: usize| -> Result2<&[u8]> {
 			bytes
 				.get(at..at.checked_add(n).ok_or(RootError2::Overflow)?)
@@ -88,15 +92,19 @@ fn ipc_preflight(bytes: &[u8]) -> Result2<usize> {
 		if len == 0 {
 			check(pos == bytes.len())?;
 			ended = true;
+			boundary(message_start, pos);
 			break;
 		}
 		if len > 65536 {
 			return Err(RootError2::Limit);
 		}
+		// Arrow consumes exactly metadata length and bodyLength, with no implicit padding.
+		check(len % 8 == 0)?;
 		let message = root_as_message(take(pos, len)?).map_err(|_| RootError2::Codec)?;
 		pos = pos.checked_add(len).ok_or(RootError2::Overflow)?;
 		check(message.custom_metadata().is_none_or(|m| m.is_empty()))?;
 		let body_len = usize::try_from(message.bodyLength()).map_err(|_| RootError2::Codec)?;
+		check(body_len % 8 == 0)?;
 		let body = take(pos, body_len)?;
 		match message.header_type() {
 			MessageHeader::Schema => {
@@ -186,17 +194,17 @@ fn ipc_preflight(bytes: &[u8]) -> Result2<usize> {
 			}
 			_ => return Err(RootError2::Codec),
 		}
-		pos = pos
-			.checked_add(body_len)
-			.and_then(|x| x.checked_add((8 - body_len % 8) % 8))
-			.ok_or(RootError2::Overflow)?;
+		pos = pos.checked_add(body_len).ok_or(RootError2::Overflow)?;
 		check(pos <= bytes.len())?;
+		boundary(message_start, pos);
 	}
 	check(schema_seen && batch_seen && ended)?;
 	Ok(rows)
 }
-fn decode_batch(bytes: &[u8]) -> Result2<RecordBatch> {
+pub(in crate::storage::mutation_visibility) fn decode_batch(bytes: &[u8]) -> Result2<RecordBatch> {
 	let rows = ipc_preflight(bytes)?;
+	#[cfg(test)]
+	READER_CONSTRUCTIONS.with(|n| n.set(n.get() + 1));
 	let mut reader = arrow::ipc::reader::StreamReader::try_new(Cursor::new(bytes), None)
 		.map_err(|_| RootError2::Codec)?;
 	let batch = reader
@@ -206,6 +214,8 @@ fn decode_batch(bytes: &[u8]) -> Result2<RecordBatch> {
 	check(batch.num_rows() == rows && reader.next().is_none())?;
 	Ok(batch)
 }
+#[cfg(test)]
+thread_local! { static READER_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 fn claim_mac(
 	c: &ClaimProjection2,
 	cluster: [u8; 16],
@@ -249,15 +259,9 @@ pub(super) fn load_content2(
 		)?;
 		check(claim_mac(c, cap.cluster, provider)? == c.claim_commitment)?;
 	}
-	let batch = decode_batch(&data.frame)?;
-	let rows = TrustedFrameRows::from_bounded_rows(
-		cap,
-		data.frame,
-		cap.schema.clone(),
-		batch,
-		cap.table_rows,
-	)
-	.map_err(|_| RootError2::Codec)?;
+	let rows =
+		TrustedFrameRows::from_bounded_rows(cap, data.frame, cap.schema.clone(), cap.table_rows)
+			.map_err(|_| RootError2::Codec)?;
 	let provenance = data
 		.bundle
 		.provenance

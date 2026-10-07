@@ -49,6 +49,8 @@ opaque!(
 impl UnverifiedIndex2 {
 	/// Checks original coordinates against the declared bundle, never a physical header clock.
 	/// This is structural consistency only; the bundle must still pass scoped content verification.
+	/// The opaque child binding is verifier-deferred: this check does not recompute it.
+	/// Later authenticated integration must compare it with child_binding2 before granting trust.
 	pub fn check_original_binding(&self, bundle: &UnverifiedBundle2) -> Result2<()> {
 		self.validate()?;
 		bundle.validate()?;
@@ -282,7 +284,9 @@ impl UnverifiedGrantArchive2 {
 		let bootstrap = r.log()?;
 		let applied = r.log()?;
 		let entry_context = r.array()?;
-		let (g, c, command) = Command2::decode(r.blob(318)?)?;
+		let command_bytes = r.blob(318)?;
+		check(command_bytes.len() == 318)?;
+		let (g, c, command) = Command2::decode(command_bytes)?;
 		check((g, c) == (generation, cluster))?;
 		let v = Self {
 			generation,

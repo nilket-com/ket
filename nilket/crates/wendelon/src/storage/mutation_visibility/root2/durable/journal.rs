@@ -235,8 +235,8 @@ pub fn inspect_journal_objects2(
 		return Err(RootError2::Limit);
 	}
 	let mut seen = BTreeSet::new();
-	let mut owners = BTreeSet::new();
-	let mut out = Vec::new();
+	let mut owners: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+	let mut out: Vec<JournalChainReport2> = Vec::new();
 	for (locator, bytes) in objects {
 		check(
 			locator.len() == 64
@@ -248,14 +248,21 @@ pub fn inspect_journal_objects2(
 		if bytes.len() > budget.total_bytes_per_chain {
 			return Err(RootError2::Limit);
 		}
-		// A duplicate full tuple is a collection conflict even if its second locator is wrong.
+		// Duplicate owners invalidate every copy of that parent, not independent parents.
+		let mut owner_conflict = false;
 		if let Some(prefix) = bytes.get(..16) {
 			let n = u32::from_le_bytes(prefix[12..16].try_into().map_err(|_| RootError2::Codec)?)
 				as usize;
 			if n <= JOURNAL_MAX - 48 {
 				if let Some(raw) = bytes.get(..n + 48) {
 					if let Ok(record) = UnverifiedJournal2::decode(raw) {
-						check(owners.insert(record.owner.bytes()?))?;
+						let key = record.owner.bytes()?;
+						if let Some(&old) = owners.get(&key) {
+							out[old].unavailable = true;
+							owner_conflict = true;
+						} else {
+							owners.insert(key, out.len());
+						}
 					}
 				}
 			}
@@ -338,14 +345,13 @@ pub fn inspect_journal_objects2(
 					pos = end;
 					count += 1;
 				}
-				Err(RootError2::Limit | RootError2::Overflow) => return Err(RootError2::Limit),
 				Err(_) => break,
 			}
 		}
 		out.push(JournalChainReport2 {
 			locator: locator.clone(),
 			validated_records: count,
-			unavailable: pos < bytes.len() || count == 0,
+			unavailable: owner_conflict || pos < bytes.len() || count == 0,
 			damaged_suffix: bytes[pos..].to_vec(),
 		});
 	}

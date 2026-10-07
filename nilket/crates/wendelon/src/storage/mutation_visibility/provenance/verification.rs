@@ -11,7 +11,7 @@ enum TrustedRows {
 	Table(ProofSchema, RecordBatch),
 	KeyValues(Option<ProofSchema>, RecordBatch),
 }
-/// No public constructor. The only linkage constructor is a cfg(test) round-trip adapter.
+/// No public constructor. Bounded linkage requires an unconstructable scoped capability.
 pub struct TrustedFrameRows {
 	bytes: Vec<u8>,
 	rows: TrustedRows,
@@ -23,9 +23,12 @@ impl TrustedFrameRows {
 		_cap: &crate::storage::mutation_visibility::root2::durable::loader::LoaderCapability2,
 		bytes: Vec<u8>,
 		schema: Option<ProofSchema>,
-		batch: RecordBatch,
 		table: bool,
 	) -> Result<Self, AdapterError> {
+		// Decode the owned bytes here: callers cannot supply a separately constructed batch.
+		let batch =
+			crate::storage::mutation_visibility::root2::durable::loader::decode_batch(&bytes)
+				.map_err(|_| AdapterError::InvalidProvenance)?;
 		if table {
 			let schema = schema.ok_or(AdapterError::SchemaMismatch)?;
 			schema.check_batch(&batch)?;

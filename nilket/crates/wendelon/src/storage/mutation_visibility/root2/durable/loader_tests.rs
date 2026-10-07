@@ -481,3 +481,122 @@ fn raw_extra_column_and_nullable_key_refuse_after_valid_ipc_preflight() {
 		assert!(load_content2(d, &cap, &key).is_err());
 	}
 }
+
+fn wire_messages(bytes: &[u8]) -> Vec<(usize, usize, usize, usize)> {
+	let mut out = Vec::new();
+	let mut pos = 0;
+	loop {
+		let start = pos;
+		let marker = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+		pos += 4;
+		let len = if marker == u32::MAX {
+			let n = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+			pos += 4;
+			n
+		} else {
+			marker
+		} as usize;
+		if len == 0 {
+			break;
+		}
+		let meta = pos;
+		let msg = root_as_message(&bytes[meta..meta + len]).unwrap();
+		let body_len = msg.bodyLength() as usize;
+		pos += len + body_len;
+		out.push((start, meta, len, body_len));
+	}
+	out
+}
+#[test]
+fn fake_body_padding_huge_metadata_prefix_refuses_before_arrow_construction() {
+	let (mut d, cap, key) = raw(false);
+	let parts = wire_messages(&d.frame);
+	let (_, meta, len, body_len) = parts[1];
+	assert_eq!(body_len % 8, 0);
+	assert!(body_len >= 8);
+	let body_start = meta + len;
+	let msg = root_as_message(&d.frame[meta..body_start]).unwrap();
+	let batch = msg.header_as_record_batch().unwrap();
+	assert!(
+		batch
+			.buffers()
+			.unwrap()
+			.iter()
+			.all(|b| (b.offset() + b.length()) as usize <= body_len - 4),
+		"fixture's removed bytes are genuine unused body padding"
+	);
+	let table = meta + u32::from_le_bytes(d.frame[meta..meta + 4].try_into().unwrap()) as usize;
+	let vt = (table as i64
+		- i32::from_le_bytes(d.frame[table..table + 4].try_into().unwrap()) as i64) as usize;
+	let field = table + u16::from_le_bytes(d.frame[vt + 10..vt + 12].try_into().unwrap()) as usize;
+	d.frame[field..field + 8].copy_from_slice(&((body_len - 4) as i64).to_le_bytes());
+	d.frame.truncate(body_start + body_len - 4);
+	d.frame.extend(0x7fffffffu32.to_le_bytes()); // old preflight skipped these; Arrow allocated from them
+	d.frame.extend(0u32.to_le_bytes());
+	let before = READER_CONSTRUCTIONS.with(|n| n.get());
+	assert!(decode_batch(&d.frame).is_err());
+	assert_eq!(READER_CONSTRUCTIONS.with(|n| n.get()), before);
+	d.bundle.provenance = UnverifiedFrameProvenance::new(
+		&d.bundle.claims[0].0.manifest.identity,
+		&d.frame,
+		d.bundle.provenance.parents().to_vec(),
+		d.bundle.provenance.references().to_vec(),
+	)
+	.unwrap();
+	assert!(load_content2(d, &cap, &key).is_err());
+	assert_eq!(READER_CONSTRUCTIONS.with(|n| n.get()), before);
+}
+#[test]
+fn accepted_seeded_frames_have_the_exact_arrow_message_boundaries() {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("key", DataType::Binary, false),
+		Field::new("value", DataType::Binary, false),
+	]));
+	let mut seed = 0x9e3779b97f4a7c15u64;
+	for size in 0..128 {
+		let key = vec![b'k'; size + 1];
+		let value = vec![b'v'; size];
+		let batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![
+				Arc::new(BinaryArray::from(vec![key.as_slice()])),
+				Arc::new(BinaryArray::from(vec![value.as_slice()])),
+			],
+		)
+		.unwrap();
+		let original = frame(&batch, false);
+		for mutate in [false, true] {
+			let mut bytes = original.clone();
+			if mutate {
+				let (_, meta, len, body) = wire_messages(&bytes)[1];
+				seed ^= seed << 13;
+				seed ^= seed >> 7;
+				seed ^= seed << 17;
+				bytes[meta + len + (seed as usize % body)] ^= 1;
+			}
+			let mut ends = Vec::new();
+			if ipc_preflight_with(&bytes, |_, end| ends.push(end)).is_err() {
+				continue;
+			}
+			assert_eq!(ends.len(), 3);
+			let mut reader =
+				arrow::ipc::reader::StreamReader::try_new(Cursor::new(bytes.as_slice()), None)
+					.unwrap();
+			assert_eq!(reader.get_ref().position() as usize, ends[0]);
+			assert!(reader.next().is_some()); // may be a bounded content error, boundaries must still agree
+			assert_eq!(reader.get_ref().position() as usize, ends[1]);
+			assert!(reader.next().is_none());
+			assert_eq!(reader.get_ref().position() as usize, ends[2]);
+		}
+	}
+}
+#[test]
+fn unaligned_metadata_length_refuses_before_arrow_construction() {
+	let (d, _, _) = raw(false);
+	let mut bytes = d.frame;
+	let len = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+	bytes[4..8].copy_from_slice(&(len - 4).to_le_bytes());
+	let before = READER_CONSTRUCTIONS.with(|n| n.get());
+	assert!(decode_batch(&bytes).is_err());
+	assert_eq!(READER_CONSTRUCTIONS.with(|n| n.get()), before);
+}

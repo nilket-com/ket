@@ -1,3 +1,41 @@
+fn exact_visibility_scope(vis: &syn::Visibility) -> bool {
+	matches!(vis, syn::Visibility::Restricted(r) if r.in_token.is_some() && exact_path(&r.path, &["crate", "storage", "mutation_visibility"]))
+}
+fn exact_path(path: &syn::Path, expected: &[&str]) -> bool {
+	path.leading_colon.is_none()
+		&& path.segments.len() == expected.len()
+		&& path
+			.segments
+			.iter()
+			.zip(expected)
+			.all(|(s, n)| s.ident == *n && matches!(s.arguments, syn::PathArguments::None))
+}
+// Conservative token guard: explicit capability literals are forbidden even in tests;
+// tests use the reviewed cfg(test) synthetic method. Struct declarations are not literals.
+// This also checks macro token bodies; it is not general Rust name resolution.
+fn no_explicit_capability_literal(tokens: proc_macro2::TokenStream) -> bool {
+	let ts: Vec<_> = tokens.into_iter().collect();
+	for (i, t) in ts.iter().enumerate() {
+		if matches!(t,proc_macro2::TokenTree::Ident(id) if id == "LoaderCapability2")
+			&& matches!(ts.get(i+1),Some(proc_macro2::TokenTree::Ident(id)) if id=="as")
+		{
+			return false;
+		}
+		if matches!(t,proc_macro2::TokenTree::Ident(id) if id == "LoaderCapability2")
+			&& matches!(ts.get(i+1),Some(proc_macro2::TokenTree::Group(g)) if g.delimiter()==proc_macro2::Delimiter::Brace)
+			&& !matches!(i.checked_sub(1).and_then(|n|ts.get(n)),Some(proc_macro2::TokenTree::Ident(id)) if id == "struct" || id == "impl")
+		{
+			return false;
+		}
+		if let proc_macro2::TokenTree::Group(g) = t {
+			if !no_explicit_capability_literal(g.stream()) {
+				return false;
+			}
+		}
+	}
+	true
+}
+
 use std::{fs, path::PathBuf};
 
 #[test]
@@ -67,8 +105,13 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 						let name = f.sig.ident.to_string();
 						if name == "from_bounded_rows" {
 							bounded_loaders += 1;
-							assert!(matches!(f.vis, syn::Visibility::Restricted(_)));
-							assert!(f.sig.inputs.iter().any(|arg| matches!(arg, syn::FnArg::Typed(t) if matches!(&*t.ty, syn::Type::Reference(r) if matches!(&*r.elem, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident=="LoaderCapability2"))))));
+							assert!(exact_visibility_scope(&f.vis));
+							assert_eq!(
+								f.sig.inputs.len(),
+								4,
+								"owned bytes only, no independent batch argument"
+							);
+							assert!(f.sig.inputs.iter().any(|arg| matches!(arg, syn::FnArg::Typed(t) if matches!(&*t.ty, syn::Type::Reference(r) if matches!(&*r.elem, syn::Type::Path(p) if exact_path(&p.path,&["crate","storage","mutation_visibility","root2","durable","loader","LoaderCapability2"]))))));
 						} else if name.starts_with("from_") {
 							constructors += 1;
 							assert!(test_only(&f.attrs));
@@ -352,7 +395,12 @@ fn s1c_incremental_updates_do_not_scan_or_create_authority_and_oracle_is_test_on
 fn r2_loader_capability_has_no_runtime_factory_and_content_is_not_readiness() {
 	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 		.join("src/storage/mutation_visibility/root2/durable");
-	let ast = syn::parse_file(&fs::read_to_string(root.join("loader.rs")).unwrap()).unwrap();
+	let source = fs::read_to_string(root.join("loader.rs")).unwrap();
+	assert!(
+		no_explicit_capability_literal(source.parse().unwrap()),
+		"no free-function or macro capability literal"
+	);
+	let ast = syn::parse_file(&source).unwrap();
 	let mut token = 0;
 	let mut factories = 0;
 	let mut result = 0;
@@ -361,7 +409,7 @@ fn r2_loader_capability_has_no_runtime_factory_and_content_is_not_readiness() {
 			syn::Item::Struct(s)
 				if s.ident == "LoaderCapability2" || s.ident == "LoadedContent2" =>
 			{
-				assert!(matches!(s.vis, syn::Visibility::Restricted(_)));
+				assert!(exact_visibility_scope(&s.vis));
 				assert!(s.attrs.iter().all(|a| !a.path().is_ident("derive")));
 				for field in s.fields {
 					assert!(matches!(field.vis, syn::Visibility::Inherited));
@@ -375,6 +423,10 @@ fn r2_loader_capability_has_no_runtime_factory_and_content_is_not_readiness() {
 			syn::Item::Impl(i) if matches!(&*i.self_ty,syn::Type::Path(p) if p.path.segments.last().is_some_and(|s|s.ident=="LoaderCapability2")) =>
 			{
 				assert!(i.trait_.is_none(), "no default/serde capability factory");
+				assert!(
+					matches!(&*i.self_ty,syn::Type::Path(p) if p.path.is_ident("LoaderCapability2")),
+					"no qualified/aliased capability impl"
+				);
 				for member in i.items {
 					let syn::ImplItem::Fn(f) = member else {
 						panic!("review new capability member")
@@ -388,6 +440,15 @@ fn r2_loader_capability_has_no_runtime_factory_and_content_is_not_readiness() {
 		}
 	}
 	assert_eq!((token, result, factories), (1, 1, 1));
+	let ast = syn::parse_file(&source).unwrap();
+	for item in ast.items {
+		if let syn::Item::Type(t) = item {
+			assert!(
+				!matches!(&*t.ty,syn::Type::Path(p) if p.path.segments.iter().any(|s|s.ident=="LoaderCapability2")),
+				"no capability type alias"
+			);
+		}
+	}
 	for name in ["bundle.rs", "fixed.rs", "journal.rs", "witness.rs"] {
 		let text = fs::read_to_string(root.join(name)).unwrap();
 		for forbidden in [
@@ -404,4 +465,33 @@ fn r2_loader_capability_has_no_runtime_factory_and_content_is_not_readiness() {
 			);
 		}
 	}
+}
+
+#[test]
+fn r2_guard_refuses_broader_scope_foreign_type_and_free_factory_literal() {
+	let vis: syn::Visibility = syn::parse_str("pub(crate)").unwrap();
+	assert!(!exact_visibility_scope(&vis));
+	assert!(exact_visibility_scope(
+		&syn::parse_str("pub(in crate::storage::mutation_visibility)").unwrap()
+	));
+	assert!(!exact_path(
+		&syn::parse_str("other::LoaderCapability2").unwrap(),
+		&[
+			"crate",
+			"storage",
+			"mutation_visibility",
+			"root2",
+			"durable",
+			"loader",
+			"LoaderCapability2"
+		]
+	));
+	assert!(!no_explicit_capability_literal(
+		"fn forged() -> Option<LoaderCapability2> { Some(LoaderCapability2 { scope: panic!() }) }"
+			.parse()
+			.unwrap()
+	));
+	assert!(no_explicit_capability_literal(
+		"struct LoaderCapability2 { scope: () }".parse().unwrap()
+	));
 }
