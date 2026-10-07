@@ -371,7 +371,7 @@ async fn out_of_plan_growth_and_response_expansion_refuse_before_write_and_keep_
 			store.publisher.lock().await.inventory.charged,
 			entry.credit.charge
 		);
-		let physical = store.physical_parent(entry.owner).await.unwrap();
+		let physical = store.physical_parent(entry.owner.clone()).await.unwrap();
 		assert_eq!(
 			physical.records,
 			if response {
@@ -380,7 +380,13 @@ async fn out_of_plan_growth_and_response_expansion_refuse_before_write_and_keep_
 				1
 			}
 		);
-		assert!(physical.fenced);
+		assert!(!physical.fenced);
+		let next = if response {
+			progress[entry.credit.slots as usize + 2].clone()
+		} else {
+			progress[0].clone()
+		};
+		store.append(entry.owner.clone(), next).await.unwrap();
 	}
 }
 #[tokio::test]

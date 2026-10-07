@@ -147,6 +147,7 @@ pub(super) struct OwnedFile {
 	pub(super) _permit: OwnedSemaphorePermit,
 }
 pub(super) struct Io {
+	materialized: std::sync::atomic::AtomicU64,
 	pub(super) files: Arc<dyn AsyncFileOps>,
 	pub(super) adapter: Arc<dyn LocalAdapter>,
 	pub(super) handles: Arc<Semaphore>,
@@ -155,11 +156,42 @@ pub(super) struct Io {
 impl Io {
 	pub(super) fn new(files: Arc<dyn AsyncFileOps>, adapter: Arc<dyn LocalAdapter>) -> Self {
 		Self {
+			materialized: std::sync::atomic::AtomicU64::new(0),
 			files,
 			adapter,
 			handles: Arc::new(Semaphore::new(64)),
 			buffers: Arc::new(Semaphore::new(BUFFER_BYTES as usize)),
 		}
+	}
+	pub(super) fn materialized(&self) -> u64 {
+		self.materialized.load(std::sync::atomic::Ordering::Relaxed)
+	}
+	pub(super) fn set_materialized(&self, n: u64) {
+		self.materialized
+			.store(n, std::sync::atomic::Ordering::Relaxed)
+	}
+	pub(super) fn forget_materialized(&self, n: u64) {
+		let _ = self.materialized.fetch_update(
+			std::sync::atomic::Ordering::Relaxed,
+			std::sync::atomic::Ordering::Relaxed,
+			|v| Some(v.saturating_sub(n)),
+		);
+	}
+	async fn transfer(
+		&self,
+		n: usize,
+	) -> StoreResult<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+		let buffer = self
+			.buffers
+			.clone()
+			.try_acquire_many_owned(u32::try_from(n).map_err(|_| StoreError::Limit)?)
+			.map_err(|_| StoreError::Limit)?;
+		let handle = self
+			.handles
+			.clone()
+			.try_acquire_owned()
+			.map_err(|_| StoreError::Limit)?;
+		Ok((buffer, handle))
 	}
 	pub(super) async fn list(&self, path: &Path, limit: usize) -> StoreResult<Vec<Entry>> {
 		let _directory = self
@@ -191,25 +223,31 @@ impl Io {
 		self.files.fsync_dir(p).await?;
 		Ok(())
 	}
-	pub(super) async fn write(&self, h: &OwnedFile, mut offset: u64, b: &[u8]) -> StoreResult<()> {
+	pub(super) async fn write(&self, h: &OwnedFile, offset: u64, b: &[u8]) -> StoreResult<()> {
 		offset
 			.checked_add(b.len() as u64)
 			.ok_or(StoreError::Limit)?;
+		let _permits = self.transfer(b.len().min(IO_CHUNK)).await?;
+		self.write_reserved(h, offset, b).await
+	}
+	pub(super) async fn write_sync(&self, h: &OwnedFile, offset: u64, b: &[u8]) -> StoreResult<()> {
+		offset
+			.checked_add(b.len() as u64)
+			.ok_or(StoreError::Limit)?;
+		let _permits = self.transfer(b.len().min(IO_CHUNK)).await?;
+		self.write_reserved(h, offset, b).await?;
+		self.files.fsync(&h.handle).await?;
+		Ok(())
+	}
+	async fn write_reserved(&self, h: &OwnedFile, mut offset: u64, b: &[u8]) -> StoreResult<()> {
+		offset
+			.checked_add(b.len() as u64)
+			.ok_or(StoreError::Limit)?;
+		let original = self.adapter.length(&h.handle).await?;
 		let mut pos = 0;
 		while pos < b.len() {
 			let end = (pos + IO_CHUNK).min(b.len());
 			let n = end - pos;
-			let _buffer = self
-				.buffers
-				.clone()
-				.try_acquire_many_owned(n as u32)
-				.map_err(|_| StoreError::Limit)?;
-			// Existing implementations clone the OS descriptor for a blocking plain operation.
-			let _clone = self
-				.handles
-				.clone()
-				.try_acquire_owned()
-				.map_err(|_| StoreError::Limit)?;
 			let result = self
 				.files
 				.write_plain_at(&h.handle, offset, b[pos..end].to_vec())
@@ -233,6 +271,14 @@ impl Io {
 				}
 			}
 		}
+		let growth = offset.saturating_sub(original);
+		self.materialized
+			.fetch_update(
+				std::sync::atomic::Ordering::Relaxed,
+				std::sync::atomic::Ordering::Relaxed,
+				|n| n.checked_add(growth),
+			)
+			.map_err(|_| StoreError::Limit)?;
 		Ok(())
 	}
 	pub(super) async fn read(
@@ -247,22 +293,15 @@ impl Io {
 		if *work > READ_WORK {
 			return Err(StoreError::Limit);
 		}
-		let _buffer = self
-			.buffers
-			.clone()
-			.try_acquire_many_owned(u32::try_from(n).map_err(|_| StoreError::Limit)?)
-			.map_err(|_| StoreError::Limit)?;
+		let _permits = self
+			.transfer(n.checked_add(n.min(IO_CHUNK)).ok_or(StoreError::Limit)?)
+			.await?;
 		let mut out = Vec::with_capacity(n);
 		while out.len() < n {
 			let at = offset
 				.checked_add(out.len() as u64)
 				.ok_or(StoreError::Limit)?;
 			let extent = (n - out.len()).min(IO_CHUNK);
-			let _clone = self
-				.handles
-				.clone()
-				.try_acquire_owned()
-				.map_err(|_| StoreError::Limit)?;
 			match self.files.read_plain_at(&h.handle, at, extent).await {
 				Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
 				Err(e) => return Err(e.into()),
@@ -284,9 +323,10 @@ impl Io {
 		Ok(())
 	}
 	pub(super) async fn immutable(&self, path: &Path, b: &[u8]) -> StoreResult<()> {
+		let _permits = self.transfer(b.len().min(IO_CHUNK)).await?;
 		let h = match self.open(path, true, true).await {
 			Ok(h) => {
-				self.write(&h, 0, b).await?;
+				self.write_reserved(&h, 0, b).await?;
 				h
 			}
 			Err(StoreError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -298,9 +338,11 @@ impl Io {
 			}
 			Err(e) => return Err(e),
 		};
-		self.sync(&h).await?;
-		self.directory_sync(path.parent().ok_or(StoreError::Unavailable)?)
-			.await
+		self.files.fsync(&h.handle).await?;
+		self.files
+			.fsync_dir(path.parent().ok_or(StoreError::Unavailable)?)
+			.await?;
+		Ok(())
 	}
 	pub(super) async fn bounded_file(
 		&self,

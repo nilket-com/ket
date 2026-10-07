@@ -186,7 +186,9 @@ async fn allocation_new_segment_name_is_durable_before_dependents() {
 			.unwrap();
 	assert_eq!(report.inventory.sequence, 4097);
 }
-async fn first_segment_fixture(temp: &Temp) -> (Arc<Model>, Arc<LocalStore>, ParentEntry) {
+pub(super) async fn first_segment_fixture(
+	temp: &Temp,
+) -> (Arc<Model>, Arc<LocalStore>, ParentEntry) {
 	use std::io::Write;
 	let (model, store, entry) = initialized(temp).await;
 	let mut inv = Inventory::default();

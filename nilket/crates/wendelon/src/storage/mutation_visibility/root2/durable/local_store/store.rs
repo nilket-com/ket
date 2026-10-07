@@ -124,6 +124,7 @@ impl LocalStore {
 				.try_acquire_many_owned(160 * 1024 * 1024)
 				.map_err(|_| StoreError::Limit)?;
 			let report = recover(&io, &root, id).await?;
+			io.set_materialized(report.materialized);
 			// A live reopen does not prove earlier name/sync results. Establish shared
 			// metadata durability before exposing a writable instance; create nothing.
 			for name in ["INIT", "CATALOG"] {
@@ -191,7 +192,7 @@ impl LocalStore {
 		};
 		let promised = state.inventory.charged + state.debt_bytes + HEADROOM + pending - replacing;
 		if promised.checked_add(charge).is_none_or(|v| v > QUOTA)
-			|| space.bytes < charge + promised + FREE_FLOOR
+			|| space.bytes < (charge + promised).saturating_sub(self.io.materialized()) + FREE_FLOOR
 			|| space.inodes < 4
 		{
 			return Err(StoreError::Limit);
@@ -235,15 +236,13 @@ impl LocalStore {
 		if segment > 1 && record == 0 {
 			let mut b = segment_header(self.id, segment, seq, state.inventory.digest)?;
 			b.extend(&raw);
-			self.io.write(&h, 0, &b).await?;
-			self.io.sync(&h).await?;
+			self.io.write_sync(&h, 0, &b).await?;
 			self.io
 				.directory_sync(&self.root.join("allocations"))
 				.await?;
 		} else {
 			require(self.io.adapter.length(&h.handle).await? == 144 + record * 512)?;
-			self.io.write(&h, 144 + record * 512, &raw).await?;
-			self.io.sync(&h).await?;
+			self.io.write_sync(&h, 144 + record * 512, &raw).await?;
 		}
 		state.inventory.add(a, seq, sha(&raw))?;
 		state.fenced = false;
@@ -307,20 +306,26 @@ impl LocalStore {
 			drop(snapshot);
 			{
 				let mut s = store.publisher.lock().await;
-				if s.debt_files >= TEMP_FILES {
+				if s.debt_files >= TEMP_FILES || s.inventory.charged + HEADROOM + s.debt_bytes + raw.len() as u64 > QUOTA {
 					return Err(StoreError::Limit);
 				}
 				s.debt_files += 1;
+                s.debt_bytes += raw.len() as u64;
 			}
 			let name = format!("CATALOG.pending.{}", hex(&pending));
 			id_name(&hex(&pending))?;
 			let from = store.root.join(name);
             let result=async {
-                let h=store.io.open(&from,true,true).await?;store.io.write(&h,0,&raw).await?;store.io.sync(&h).await?;
+                let h=store.io.open(&from,true,true).await?;store.io.write_sync(&h,0,&raw).await?;
+                let old=store.io.open(&store.root.join("CATALOG"),false,false).await?;
+                let old_bytes=store.io.adapter.length(&old.handle).await?;
+                // Removing the old catalog before uncertain rename underestimates
+                // materialization on a before-error, preserving conservative growth credit.
+                store.io.forget_materialized(old_bytes);
                 store.io.files.rename(&from,&store.root.join("CATALOG")).await?;store.io.directory_sync(&store.root).await?;Ok(())
             }.await;
             if matches!(&result,Err(StoreError::Io(e)) if matches!(e.raw_os_error(),Some(libc::ENOSPC|libc::EDQUOT))){store.publisher.lock().await.fenced=true;}
-            if result.is_ok(){store.publisher.lock().await.debt_files-=1;}result
+            if result.is_ok(){let mut s=store.publisher.lock().await;s.debt_files-=1;s.debt_bytes-=raw.len() as u64;}result
 		})
 		.await
 		.map_err(|_| StoreError::Unavailable)?
@@ -336,20 +341,67 @@ impl LocalStore {
 		+ Send
 		+ 'static,
 	) -> StoreResult<T> {
-		let store = self.clone();
-		tokio::spawn(async move {
-            let _buffers=store.io.buffers.clone().try_acquire_many_owned(16*1024*1024).map_err(|_|StoreError::Limit)?;
-            let _permit=store.inflight.clone().try_acquire_owned().map_err(|_|StoreError::Limit)?;
-            let key=owner.bytes()?;let entry=store.publisher.lock().await.inventory.parents.get(&sha(&key)).ok_or(StoreError::Unavailable)?.clone();require(entry.owner==owner)?;
-            if entry.observations&FENCED!=0{return Err(StoreError::Fenced)}
-            {
-                let mut owners=store.owners.lock().await;if !owners.insert(key.clone()){return Err(StoreError::Conflict)}
-            }
-            let result=job(store.clone(),entry).await;
-            if result.is_err(){store.observe(sha(&key),FENCED).await?;}
-            if matches!(&result,Err(StoreError::Io(e)) if matches!(e.raw_os_error(),Some(libc::ENOSPC|libc::EDQUOT))){store.publisher.lock().await.fenced=true;}
-            store.owners.lock().await.remove(&key);result
-        }).await.map_err(|_|StoreError::Unavailable)?
+		tokio::spawn(self.clone().run_parent(owner, job))
+			.await
+			.map_err(|_| StoreError::Unavailable)?
+	}
+	async fn run_parent<T: Send + 'static>(
+		self: Arc<Self>,
+		owner: JournalIdentity2,
+		job: impl FnOnce(
+			Arc<Self>,
+			ParentEntry,
+		)
+			-> std::pin::Pin<Box<dyn std::future::Future<Output = StoreResult<T>> + Send>>
+		+ Send
+		+ 'static,
+	) -> StoreResult<T> {
+		let _buffers = self
+			.io
+			.buffers
+			.clone()
+			.try_acquire_many_owned(16 * 1024 * 1024)
+			.map_err(|_| StoreError::Limit)?;
+		let _permit = self
+			.inflight
+			.clone()
+			.try_acquire_owned()
+			.map_err(|_| StoreError::Limit)?;
+		let key = owner.bytes()?;
+		{
+			let mut owners = self.owners.lock().await;
+			if !owners.insert(key.clone()) {
+				return Err(StoreError::Conflict);
+			}
+		}
+		// Ownership precedes the authoritative fence read. A failed predecessor
+		// publishes its fence before releasing ownership under this same ordering.
+		let result = async {
+			let entry = self
+				.publisher
+				.lock()
+				.await
+				.inventory
+				.parents
+				.get(&sha(&key))
+				.ok_or(StoreError::Unavailable)?
+				.clone();
+			require(entry.owner == owner)?;
+			if entry.observations & FENCED != 0 {
+				return Err(StoreError::Fenced);
+			}
+			job(self.clone(), entry).await
+		}
+		.await;
+		if matches!(&result, Err(StoreError::Io(_) | StoreError::Fenced)) {
+			let _ = self.observe(sha(&key), FENCED).await;
+		}
+		if matches!(&result,Err(StoreError::Io(e)) if matches!(e.raw_os_error(),Some(libc::ENOSPC|libc::EDQUOT)))
+		{
+			self.publisher.lock().await.fenced = true;
+		}
+		self.owners.lock().await.remove(&key);
+		result
 	}
 	pub(super) async fn prepared(
 		self: &Arc<Self>,
@@ -489,8 +541,7 @@ impl LocalStore {
 				if chain.endpoint + raw.len() as u64 > entry.credit.journal as u64 {
 					return Err(StoreError::Limit);
 				}
-				store.io.write(&h, chain.endpoint, &raw).await?;
-				store.io.sync(&h).await
+				store.io.write_sync(&h, chain.endpoint, &raw).await
 			})
 		})
 		.await

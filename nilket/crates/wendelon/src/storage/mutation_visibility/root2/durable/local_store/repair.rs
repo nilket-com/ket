@@ -87,6 +87,7 @@ impl LocalStore {
 					state.debt_files += files;
 					state.debt_bytes += extra;
 				}
+				let old_bytes = old.as_ref().map_or(0, |b| b.len() as u64);
 				if let Some(old) = old {
 					store
 						.io
@@ -99,8 +100,9 @@ impl LocalStore {
 					hex(&pending)
 				));
 				let h = store.io.open(&from, true, true).await?;
-				store.io.write(&h, 0, &candidate).await?;
-				store.io.sync(&h).await?;
+				store.io.write_sync(&h, 0, &candidate).await?;
+				// Remove replacement bytes before uncertain rename; underestimation is conservative.
+				store.io.forget_materialized(old_bytes);
 				store.io.files.rename(&from, &index_path).await?;
 				store.io.directory_sync(&store.root.join("index")).await?;
 				let mut state = store.publisher.lock().await;

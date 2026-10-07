@@ -49,7 +49,7 @@ impl LocalStore {
 			let total =
 				s.inventory.charged + s.debt_bytes + HEADROOM + pending + entry.credit.charge;
 			if total > QUOTA
-				|| space.bytes < total + FREE_FLOOR
+				|| space.bytes < total.saturating_sub(store.io.materialized()) + FREE_FLOOR
 				|| space.inodes < 3 * (s.prospective.len() as u64 + 1)
 			{
 				return Err(StoreError::Limit);

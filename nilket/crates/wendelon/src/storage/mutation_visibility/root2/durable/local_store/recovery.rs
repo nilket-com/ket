@@ -3,6 +3,7 @@ use super::*;
 /// Bounded physical report; no recovered record becomes an acceptance/readiness token.
 pub(super) struct Recovered {
 	pub(super) inventory: Inventory,
+	pub(super) materialized: u64,
 	pub(super) tail: Option<(String, u64, u64)>,
 	pub(super) debt_bytes: u64,
 	pub(super) debt_files: usize,
@@ -76,6 +77,7 @@ pub(super) async fn recover(io: &Io, root: &Path, id: ContainerId) -> StoreResul
 		require(checkpoint == empty)?
 	}
 	let mut inventory = Inventory::default();
+	let mut materialized = 136 + checkpoint.len() as u64;
 	let mut tail = None;
 	let mut segments = io.list(&root.join("allocations"), SEGMENTS).await?;
 	segments.sort_by(|a, b| a.name.cmp(&b.name));
@@ -91,7 +93,15 @@ pub(super) async fn recover(io: &Io, root: &Path, id: ContainerId) -> StoreResul
 		if len > 144 + SEGMENT_RECORDS * 512 {
 			return Err(StoreError::Limit);
 		}
-		require(len >= 144)?;
+		materialized = materialized.checked_add(len).ok_or(StoreError::Limit)?;
+		if len < 144 {
+			require(number > 1 && i + 1 == segments.len())?;
+			let partial = io.read(&h, 0, len as usize, &mut work).await?;
+			let expected = segment_header(id, number, inventory.sequence + 1, inventory.digest)?;
+			require(partial == expected[..partial.len()])?;
+			tail = Some((name, 0, len));
+			continue;
+		}
 		let header = io.read(&h, 0, 144, &mut work).await?;
 		check_segment(
 			&header,
@@ -106,7 +116,10 @@ pub(super) async fn recover(io: &Io, root: &Path, id: ContainerId) -> StoreResul
 			require(records == SEGMENT_RECORDS && rest == 0)?
 		}
 		if number > 1 {
-			require(records > 0 || rest > 0)?
+			if records == 0 && rest == 0 {
+				require(i + 1 == segments.len())?;
+				tail = Some((name.clone(), 144, 144));
+			}
 		}
 		for i in 0..records {
 			let raw = io.read(&h, 144 + i * 512, 512, &mut work).await?;
@@ -173,6 +186,7 @@ pub(super) async fn recover(io: &Io, root: &Path, id: ContainerId) -> StoreResul
 				debt_files += 1;
 				let h = io.open(&path, false, false).await?;
 				let n = io.adapter.length(&h.handle).await?;
+				materialized = materialized.checked_add(n).ok_or(StoreError::Limit)?;
 				require(n <= JOURNAL_CAP as u64)?;
 				debt_bytes = debt_bytes.checked_add(n).ok_or(StoreError::Limit)?;
 				continue;
@@ -187,6 +201,7 @@ pub(super) async fn recover(io: &Io, root: &Path, id: ContainerId) -> StoreResul
 				// Full repeated owner comes from its bounded header, not an unbounded name search.
 				let h = io.open(&path, false, false).await?;
 				let n = io.adapter.length(&h.handle).await?;
+				materialized = materialized.checked_add(n).ok_or(StoreError::Limit)?;
 				if n > JOURNAL_CAP as u64 {
 					return Err(StoreError::Limit);
 				}
@@ -251,6 +266,7 @@ pub(super) async fn recover(io: &Io, root: &Path, id: ContainerId) -> StoreResul
 			.ok_or(StoreError::Unavailable)?;
 			let h = io.open(&path, false, false).await?;
 			let n = io.adapter.length(&h.handle).await?;
+			materialized = materialized.checked_add(n).ok_or(StoreError::Limit)?;
 			if n > expected as u64 {
 				return Err(StoreError::Limit);
 			}
@@ -295,7 +311,8 @@ pub(super) async fn recover(io: &Io, root: &Path, id: ContainerId) -> StoreResul
 					Ok(())
 				})();
 				if parsed.is_err() {
-					bad_objects += 1
+					bad_objects += 1;
+					unavailable_owners.push(key)
 				}
 			}
 			if dir == "grants" {
@@ -321,7 +338,9 @@ pub(super) async fn recover(io: &Io, root: &Path, id: ContainerId) -> StoreResul
 	for name in pending {
 		let h = io.open(&root.join(name), false, false).await?;
 		let n = io.adapter.length(&h.handle).await?;
+		materialized = materialized.checked_add(n).ok_or(StoreError::Limit)?;
 		require(n <= CHECKPOINT_CAP as u64)?;
+		debt_bytes = debt_bytes.checked_add(n).ok_or(StoreError::Limit)?;
 	}
 	if debt_files > TEMP_FILES
 		|| names > NAMESPACE
@@ -336,6 +355,7 @@ pub(super) async fn recover(io: &Io, root: &Path, id: ContainerId) -> StoreResul
 	}
 	Ok(Recovered {
 		inventory,
+		materialized,
 		tail,
 		debt_bytes,
 		debt_files,

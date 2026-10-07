@@ -79,3 +79,20 @@ pub(super) fn writes(trace: &[Event]) -> Vec<(u64, usize)> {
 		})
 		.collect()
 }
+
+pub(super) async fn allocation_cut(op: Op) -> usize {
+	let temp = Temp::new();
+	let (model, store, p) = initialized(&temp).await;
+	let start = model.trace().len();
+	store.allocate(p).await.unwrap();
+	let mut calls = 0;
+	for e in &model.trace()[start..] {
+		if let Event::Submitted(kind, _) = e {
+			calls += 1;
+			if *kind == op {
+				return calls;
+			}
+		}
+	}
+	panic!("missing allocation operation")
+}

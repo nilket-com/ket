@@ -34,6 +34,7 @@ pub(super) enum Fault {
 	ListEntry(usize),
 	Gate(Arc<Gate>),
 	GateAfter(Arc<Gate>),
+	GateError(Arc<Gate>, bool),
 	Code(i32),
 	CodeAfter(i32),
 }
@@ -64,6 +65,7 @@ struct State {
 }
 pub(super) struct Model {
 	pub root: PathBuf,
+	space_bytes: StdMutex<Option<u64>>,
 	state: StdMutex<State>,
 	base: BlockingFileOps,
 }
@@ -71,9 +73,13 @@ impl Model {
 	pub fn new(root: PathBuf) -> Arc<Self> {
 		Arc::new(Self {
 			root,
+			space_bytes: StdMutex::new(None),
 			state: StdMutex::new(State::default()),
 			base: BlockingFileOps,
 		})
+	}
+	pub fn space_bytes(&self, n: u64) {
+		*self.space_bytes.lock().unwrap() = Some(n);
 	}
 	pub fn trace(&self) -> Vec<Event> {
 		self.state.lock().unwrap().trace.clone()
@@ -106,6 +112,11 @@ impl Model {
 			Some(Fault::Before) => return Err(injected()),
 			Some(Fault::Code(c)) => return Err(io::Error::from_raw_os_error(*c)),
 			Some(Fault::Interrupted) => return Err(io::Error::from(io::ErrorKind::Interrupted)),
+			Some(Fault::GateError(g, false)) => {
+				g.entered.notify_one();
+				g.release.notified().await;
+				return Err(injected());
+			}
 			Some(Fault::Gate(g)) => {
 				g.entered.notify_one();
 				g.release.notified().await;
@@ -123,6 +134,11 @@ impl Model {
 		match fault {
 			Some(Fault::After) => Err(injected()),
 			Some(Fault::CodeAfter(c)) => Err(io::Error::from_raw_os_error(c)),
+			Some(Fault::GateError(g, true)) => {
+				g.entered.notify_one();
+				g.release.notified().await;
+				Err(injected())
+			}
 			Some(Fault::GateAfter(g)) => {
 				g.entered.notify_one();
 				g.release.notified().await;
@@ -329,7 +345,7 @@ impl LocalAdapter for Model {
 		let f = self.begin(Op::Space, "space".into()).await?;
 		self.end(Op::Space, "space".into(), f).await?;
 		Ok(Space {
-			bytes: 1 << 44,
+			bytes: self.space_bytes.lock().unwrap().unwrap_or(1 << 44),
 			inodes: 1 << 30,
 		})
 	}

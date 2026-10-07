@@ -5,7 +5,10 @@ async fn short_write_loop_is_exact_and_zero_write_refuses() {
 		let temp = Temp::new();
 		let (model, store, entry) = initialized(&temp).await;
 		// Space, open and handle length precede the exact allocation write.
-		model.fault(model.count() + 4, fault.clone());
+		model.fault(
+			model.count() + allocation_cut(Op::Write).await,
+			fault.clone(),
+		);
 		let result = store.allocate(entry.clone()).await;
 		assert_eq!(result.is_err(), matches!(fault, Fault::Zero));
 		if result.is_ok() {
@@ -25,7 +28,8 @@ async fn short_write_loop_is_exact_and_zero_write_refuses() {
 }
 #[tokio::test]
 async fn partial_write_or_fsync_error_is_not_success() {
-	for at in [4, 5] {
+	for op in [Op::Write, Op::FileSync] {
+		let at = allocation_cut(op).await;
 		for fault in [Fault::Before, Fault::After] {
 			let temp = Temp::new();
 			let (model, store, entry) = initialized(&temp).await;
@@ -99,7 +103,10 @@ async fn cancelled_wait_keeps_submitted_io_owned() {
 		entered: tokio::sync::Notify::new(),
 		release: tokio::sync::Notify::new(),
 	});
-	model.fault(model.count() + 4, Fault::Gate(gate.clone()));
+	model.fault(
+		model.count() + allocation_cut(Op::Write).await,
+		Fault::Gate(gate.clone()),
+	);
 	let caller = {
 		let store = store.clone();
 		let entry = entry.clone();
@@ -414,7 +421,10 @@ async fn allowed_early_persistence_keeps_complete_unobserved_or_exact_torn_tail(
 		let temp = Temp::new();
 		let (model, store, entry) = initialized(&temp).await;
 		// A complete write returned, the subsequent file barrier failed before execution.
-		model.fault(model.count() + 5, Fault::Before);
+		model.fault(
+			model.count() + allocation_cut(Op::FileSync).await,
+			Fault::Before,
+		);
 		assert!(store.allocate(entry.clone()).await.is_err());
 		drop(store);
 		model.allow_early_names().unwrap();
