@@ -560,3 +560,144 @@ fn r2_local_store_and_fault_model_remain_private_and_dormant() {
 	let model = fs::read_to_string(root.join("local_store/tests/model.rs")).unwrap();
 	assert!(model.contains("snapshot_file") && model.contains("snapshot_names"));
 }
+
+// Fixed-math subtree cannot mention known trust/capability or signing producers, even
+// through an alias or macro token body. This is conservative syntax, not Rust name resolution.
+fn no_auth_authority(tokens: proc_macro2::TokenStream) -> bool {
+	for token in tokens {
+		match token {
+			proc_macro2::TokenTree::Ident(id) => {
+				let name = id.to_string();
+				if name.starts_with("Trusted")
+					|| name.starts_with("Verified")
+					|| name.starts_with("Authenticated")
+					|| [
+						"LoaderCapability2",
+						"Root2",
+						"UnverifiedRoot2",
+						"ProofKeyProvider",
+						"SigningKey",
+						"Signer",
+						"sign",
+						"sign_strict",
+						"serde",
+						"Serialize",
+						"Deserialize",
+						"Default",
+					]
+					.contains(&name.as_str())
+				{
+					return false;
+				}
+			}
+			proc_macro2::TokenTree::Group(group) if !no_auth_authority(group.stream()) => {
+				return false;
+			}
+			_ => {}
+		}
+	}
+	true
+}
+#[test]
+fn auth_math_stays_private_and_has_no_capability_or_signing_producer() {
+	let root =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
+	let parsed = syn::parse_file(&fs::read_to_string(root.join("mod.rs")).unwrap()).unwrap();
+	let auth = parsed
+		.items
+		.iter()
+		.find_map(|item| match item {
+			syn::Item::Mod(m) if m.ident == "auth" => Some(m),
+			_ => None,
+		})
+		.unwrap();
+	assert!(matches!(auth.vis, syn::Visibility::Inherited));
+	let module = syn::parse_file(&fs::read_to_string(root.join("auth/mod.rs")).unwrap()).unwrap();
+	for item in module.items {
+		match item {
+			syn::Item::Mod(m) if m.ident == "tests" => assert!(m.attrs.iter().any(|a| matches!(&a.meta,syn::Meta::List(m) if m.path.is_ident("cfg") && m.tokens.to_string()=="test"))),
+			syn::Item::Mod(m) => {
+ assert!(["errors", "preimage", "signature"].iter().any(|name| m.ident == *name));
+ assert!(matches!(m.vis, syn::Visibility::Public(_))); // Private auth parent and root2-scoped items prevent escape.
+},
+			syn::Item::Use(u) => assert!(matches!(u.vis,syn::Visibility::Inherited)),
+			_ => panic!("auth mod.rs must be declarative"),
+		}
+	}
+	let mut entrypoints = Vec::new();
+	for name in ["errors.rs", "preimage.rs", "signature.rs"] {
+		let text = fs::read_to_string(root.join("auth").join(name)).unwrap();
+		assert!(
+			no_auth_authority(text.parse().unwrap()),
+			"{name}: no known authority/capability/signing escape"
+		);
+		let ast = syn::parse_file(&text).unwrap();
+		for item in ast.items {
+			match item {
+				syn::Item::Fn(f) => {
+					assert!(!matches!(f.vis, syn::Visibility::Public(_)));
+					if matches!(&f.vis,syn::Visibility::Restricted(r) if r.in_token.is_some()) {
+						assert!(
+							matches!(&f.vis,syn::Visibility::Restricted(r) if exact_path(&r.path,&["crate","storage","mutation_visibility","root2"]))
+						);
+						entrypoints.push(f.sig.ident.to_string());
+					}
+				}
+				syn::Item::Enum(e) => {
+					assert_eq!(e.ident, "AuthError2");
+					let variants = e
+						.variants
+						.iter()
+						.map(|v| v.ident.to_string())
+						.collect::<Vec<_>>();
+					assert_eq!(
+						variants,
+						[
+							"Structural",
+							"Limit",
+							"Overflow",
+							"ScopeMismatch",
+							"CryptoInvalid"
+						]
+					);
+				}
+				syn::Item::Type(t) => assert_eq!(t.ident, "AuthResult2"),
+				syn::Item::Struct(_) | syn::Item::Trait(_) => {
+					panic!("no producer/token/provider types")
+				}
+				_ => {}
+			}
+		}
+	}
+	entrypoints.sort();
+	assert_eq!(
+		entrypoints,
+		[
+			"admission_preimage2",
+			"claim_mac_preimage2",
+			"holder_preimage2",
+			"verify_admission_signature2",
+			"verify_holder_signature2"
+		]
+	);
+}
+#[test]
+fn auth_boundary_negative_examples_reject_known_constructor_escapes() {
+	for text in [
+		"fn promote() -> TrustedEntry2 { todo!() }",
+		"use crate::VerifiedCommand2 as BoolResult;",
+		"type Alias = TrustedView2;",
+		"impl From<bool> for LoaderCapability2 {}",
+		"factory! { AuthenticatedReceipt2 { authorized: true } }",
+		"impl Default for TrustedPublicContext2 {}",
+		"#[derive(serde::Deserialize)] struct VerifiedContext2;",
+		"fn verify() { SigningKey::from_bytes(&key).sign(bytes); }",
+	] {
+		assert!(!no_auth_authority(text.parse().unwrap()), "{text}");
+	}
+	assert!(no_auth_authority(
+		"fn verify(bytes: &[u8]) -> Result<(), AuthError2> { Ok(()) }"
+			.parse()
+			.unwrap()
+	));
+}

@@ -611,3 +611,49 @@ fn unaligned_metadata_length_refuses_before_arrow_construction() {
 	assert!(decode_batch(&bytes).is_err());
 	assert_eq!(READER_CONSTRUCTIONS.with(|n| n.get()), before);
 }
+
+#[test]
+fn auth_preimage_matches_existing_loader_provider_capture() {
+	use std::cell::RefCell;
+	struct Capture(RefCell<Vec<(ProofKeyBinding, Vec<u8>)>>);
+	impl ProofKeyProvider for Capture {
+		fn keyed_digest(
+			&self,
+			binding: &ProofKeyBinding,
+			preimage: &[u8],
+		) -> Result<[u8; 32], ProofKeyUnavailable> {
+			self.0.borrow_mut().push((*binding, preimage.to_vec()));
+			Ok([0x31; 32])
+		}
+	}
+	let values: serde_json::Value =
+		serde_json::from_str(include_str!("../auth/tests/vectors.json")).unwrap();
+	let literal = |name: &str| {
+		let s = values[name].as_str().unwrap();
+		(0..s.len())
+			.step_by(2)
+			.map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+			.collect::<Vec<_>>()
+	};
+	let mut c = ClaimProjection2::decode(&literal("claim_c2")).unwrap();
+	for round in 0..3 {
+		if round == 1 {
+			c.signature = [0xf1; 64];
+			c.claim_commitment = [0xf2; 32];
+		}
+		if round == 2 {
+			c.original.lease.signature = [0xf3; 64];
+		}
+		let capture = Capture(RefCell::new(Vec::new()));
+		assert_eq!(claim_mac(&c, [0x12; 16], &capture), Ok([0x31; 32]));
+		let expected =
+			super::super::super::auth::preimage::claim_mac_preimage2(&c, [0x12; 16]).unwrap();
+		let calls = capture.0.borrow();
+		assert_eq!(calls.len(), 1);
+		assert!(calls[0].0 == c.manifest.binding());
+		assert_eq!(calls[0].1, expected);
+		if round < 2 {
+			assert_eq!(expected, literal("claim_mac_preimage"));
+		}
+	}
+}
