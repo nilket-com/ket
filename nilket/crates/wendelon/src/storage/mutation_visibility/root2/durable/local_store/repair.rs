@@ -16,7 +16,7 @@ impl LocalStore {
 		evidence: [u8; 16],
 		pending: [u8; 16],
 	) -> StoreResult<RepairResult> {
-		self.parent_operation(owner, move |store, entry| {
+		self.index_repair_operation(owner, move |store, entry| {
 			Box::pin(async move {
 				let buffer = store
 					.io
@@ -59,9 +59,7 @@ impl LocalStore {
 					let index_handle = store.io.open(&index_path, false, true).await?;
 					store.io.sync(&index_handle).await?;
 					store.io.directory_sync(&store.root.join("index")).await?;
-					store
-						.observe(sha(&entry.owner.bytes()?), super::store::CONTENT_VERIFIED)
-						.await?;
+					store.index_repaired(&entry).await?;
 					return Ok(RepairResult {
 						candidate,
 						durable: true,
@@ -109,9 +107,7 @@ impl LocalStore {
 				state.debt_files -= 1;
 				state.debt_bytes -= candidate.len() as u64;
 				drop(state);
-				store
-					.observe(sha(&entry.owner.bytes()?), super::store::CONTENT_VERIFIED)
-					.await?;
+				store.index_repaired(&entry).await?;
 				Ok(RepairResult {
 					candidate,
 					durable: true,
@@ -120,6 +116,19 @@ impl LocalStore {
 			})
 		})
 		.await
+	}
+	// Called only after verified data and both index durability barriers succeed,
+	// while the parent remains exclusively owned. Unrelated fences are never cleared.
+	async fn index_repaired(&self, entry: &ParentEntry) -> StoreResult<()> {
+		let mut state = self.publisher.lock().await;
+		let p = state
+			.inventory
+			.parents
+			.get_mut(&sha(&entry.owner.bytes()?))
+			.ok_or(StoreError::Unavailable)?;
+		p.observations =
+			(p.observations & !super::store::INDEX_FENCED) | super::store::CONTENT_VERIFIED;
+		Ok(())
 	}
 	pub(super) async fn unsupported_transform(&self) -> StoreResult<()> {
 		Err(StoreError::Unavailable)

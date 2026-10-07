@@ -312,7 +312,15 @@ pub(super) async fn recover(io: &Io, root: &Path, id: ContainerId) -> StoreResul
 				})();
 				if parsed.is_err() {
 					bad_objects += 1;
-					unavailable_owners.push(key)
+					if dir == "index" {
+						inventory
+							.parents
+							.get_mut(&key)
+							.ok_or(StoreError::Unavailable)?
+							.observations |= super::store::INDEX_FENCED;
+					} else {
+						unavailable_owners.push(key);
+					}
 				}
 			}
 			if dir == "grants" {

@@ -30,7 +30,13 @@ pub(super) struct Prospective {
 }
 const PREPARED_DURABLE: u8 = 1;
 pub(super) const CONTENT_VERIFIED: u8 = 2;
-pub(super) const FENCED: u8 = 4;
+pub(super) const HARD_FENCED: u8 = 4;
+pub(super) const INDEX_FENCED: u8 = 8;
+pub(super) const FENCED: u8 = HARD_FENCED | INDEX_FENCED;
+enum ParentAccess {
+	Append,
+	VerifiedIndexRepair,
+}
 impl LocalStore {
 	pub(super) async fn observed(&self, key: Digest2, flag: u8) -> bool {
 		self.publisher
@@ -143,7 +149,7 @@ impl LocalStore {
 			let mut report = report;
 			for key in &report.unavailable_owners {
 				if let Some(p) = report.inventory.parents.get_mut(key) {
-					p.observations |= FENCED;
+					p.observations |= HARD_FENCED;
 				}
 			}
 			let summary = report.report();
@@ -341,13 +347,34 @@ impl LocalStore {
 		+ Send
 		+ 'static,
 	) -> StoreResult<T> {
-		tokio::spawn(self.clone().run_parent(owner, job))
+		tokio::spawn(self.clone().run_parent(owner, ParentAccess::Append, job))
 			.await
 			.map_err(|_| StoreError::Unavailable)?
+	}
+	/// Exclusively owned index repair may inspect an index-only recovery fence.
+	/// Data/journal/ownership/uncertain-I/O fences still refuse before verification.
+	pub(super) async fn index_repair_operation<T: Send + 'static>(
+		self: &Arc<Self>,
+		owner: JournalIdentity2,
+		job: impl FnOnce(
+			Arc<Self>,
+			ParentEntry,
+		)
+			-> std::pin::Pin<Box<dyn std::future::Future<Output = StoreResult<T>> + Send>>
+		+ Send
+		+ 'static,
+	) -> StoreResult<T> {
+		tokio::spawn(
+			self.clone()
+				.run_parent(owner, ParentAccess::VerifiedIndexRepair, job),
+		)
+		.await
+		.map_err(|_| StoreError::Unavailable)?
 	}
 	async fn run_parent<T: Send + 'static>(
 		self: Arc<Self>,
 		owner: JournalIdentity2,
+		access: ParentAccess,
 		job: impl FnOnce(
 			Arc<Self>,
 			ParentEntry,
@@ -387,19 +414,24 @@ impl LocalStore {
 				.ok_or(StoreError::Unavailable)?
 				.clone();
 			require(entry.owner == owner)?;
-			if entry.observations & FENCED != 0 {
+			let forbidden = match access {
+				ParentAccess::Append => FENCED,
+				ParentAccess::VerifiedIndexRepair => HARD_FENCED,
+			};
+			if entry.observations & forbidden != 0 {
+				// An admission refusal never escalates an index-only fence.
 				return Err(StoreError::Fenced);
 			}
-			job(self.clone(), entry).await
+			let result = job(self.clone(), entry).await;
+			if matches!(&result, Err(StoreError::Io(_) | StoreError::Fenced)) {
+				let _ = self.observe(sha(&key), HARD_FENCED).await;
+			}
+			if matches!(&result,Err(StoreError::Io(e)) if matches!(e.raw_os_error(),Some(libc::ENOSPC|libc::EDQUOT))) {
+				self.publisher.lock().await.fenced = true;
+			}
+			result
 		}
 		.await;
-		if matches!(&result, Err(StoreError::Io(_) | StoreError::Fenced)) {
-			let _ = self.observe(sha(&key), FENCED).await;
-		}
-		if matches!(&result,Err(StoreError::Io(e)) if matches!(e.raw_os_error(),Some(libc::ENOSPC|libc::EDQUOT)))
-		{
-			self.publisher.lock().await.fenced = true;
-		}
 		self.owners.lock().await.remove(&key);
 		result
 	}
