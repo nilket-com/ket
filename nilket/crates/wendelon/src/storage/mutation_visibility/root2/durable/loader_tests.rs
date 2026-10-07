@@ -86,8 +86,19 @@ fn wrap_data(
 		},
 	}
 }
-fn raw(delete: bool) -> (UnverifiedData2, LoaderCapability2, TestProofKey) {
+pub(in crate::storage::mutation_visibility::root2::durable) fn raw(
+	delete: bool,
+) -> (UnverifiedData2, LoaderCapability2, TestProofKey) {
+	raw_variant(delete, None)
+}
+pub(in crate::storage::mutation_visibility::root2::durable) fn raw_variant(
+	delete: bool,
+	sequence: Option<u64>,
+) -> (UnverifiedData2, LoaderCapability2, TestProofKey) {
 	let mut c = template();
+	if let Some(sequence) = sequence {
+		c.manifest.identity.sequence = sequence;
+	}
 	c.manifest.identity.scope = MutationScope::Raw;
 	c.manifest.identity.table = [0; 16];
 	c.manifest.identity.schema_generation = 0;

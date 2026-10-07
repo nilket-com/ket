@@ -59,7 +59,7 @@ impl std::fmt::Debug for LoadedContent2 {
 	}
 }
 // Parse all flatbuffer metadata and body extents before allocating any Arrow arrays.
-fn ipc_preflight(bytes: &[u8]) -> Result2<usize> {
+pub(super) fn ipc_preflight(bytes: &[u8]) -> Result2<usize> {
 	ipc_preflight_with(bytes, |_, _| {})
 }
 fn ipc_preflight_with(bytes: &[u8], mut boundary: impl FnMut(usize, usize)) -> Result2<usize> {
@@ -274,4 +274,4 @@ pub(super) fn load_content2(
 
 #[cfg(test)]
 #[path = "loader_tests.rs"]
-mod tests;
+pub(super) mod tests;

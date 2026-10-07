@@ -1,9 +1,11 @@
 //! Dormant R2 structural codecs. Checksums, receipts and parsed terminal records grant no trust.
-//! No live IO, root-format change or read/admission integration.
+//! No live dispatch, root-format change or read/admission integration.
 mod bundle;
 mod fixed;
 mod journal;
 pub(crate) mod loader;
+#[allow(dead_code)]
+mod local_store;
 mod wire;
 mod witness;
 use super::super::{MutationIdentity, provenance::UnverifiedFrameProvenance};

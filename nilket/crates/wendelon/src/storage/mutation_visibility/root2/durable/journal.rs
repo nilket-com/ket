@@ -27,7 +27,7 @@ pub struct UnverifiedJournal2 {
 }
 opaque!(JournalIdentity2, UnverifiedJournalStep2, UnverifiedJournal2);
 impl JournalIdentity2 {
-	fn bytes(&self) -> Result2<Vec<u8>> {
+	pub(super) fn bytes(&self) -> Result2<Vec<u8>> {
 		nonzero16(self.generation)?;
 		nonzero16(self.cluster)?;
 		check(self.generation == self.identity.generation)?;
@@ -68,7 +68,7 @@ impl JournalIdentity2 {
 	}
 }
 impl UnverifiedJournalStep2 {
-	fn tag(&self) -> u8 {
+	pub(super) fn tag(&self) -> u8 {
 		match self {
 			Self::Prepared(_) => 1,
 			Self::LocalChildDurable(_) => 2,
@@ -79,7 +79,7 @@ impl UnverifiedJournalStep2 {
 			Self::WitnessRetired => 7,
 		}
 	}
-	fn body(&self) -> Result2<Vec<u8>> {
+	pub(super) fn body(&self) -> Result2<Vec<u8>> {
 		let mut b = Vec::new();
 		match self {
 			Self::Prepared(c) => blob(&mut b, &c.encode()?)?,

@@ -495,3 +495,68 @@ fn r2_guard_refuses_broader_scope_foreign_type_and_free_factory_literal() {
 		"struct LoaderCapability2 { scope: () }".parse().unwrap()
 	));
 }
+
+#[test]
+fn r2_local_store_and_fault_model_remain_private_and_dormant() {
+	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+		.join("src/storage/mutation_visibility/root2/durable");
+	let ast = syn::parse_file(&fs::read_to_string(root.join("mod.rs")).unwrap()).unwrap();
+	let module = ast
+		.items
+		.iter()
+		.find_map(|i| match i {
+			syn::Item::Mod(m) if m.ident == "local_store" => Some(m),
+			_ => None,
+		})
+		.unwrap();
+	assert!(matches!(module.vis, syn::Visibility::Inherited));
+	let ast =
+		syn::parse_file(&fs::read_to_string(root.join("local_store/mod.rs")).unwrap()).unwrap();
+	let tests = ast
+		.items
+		.iter()
+		.find_map(|i| match i {
+			syn::Item::Mod(m) if m.ident == "tests" => Some(m),
+			_ => None,
+		})
+		.unwrap();
+	assert!(tests.attrs.iter().any(
+		|a| matches!(&a.meta,syn::Meta::List(m) if m.path.is_ident("cfg")&&m.tokens.to_string()=="test")
+	));
+	for name in [
+		"mod.rs",
+		"adapter.rs",
+		"capacity.rs",
+		"format.rs",
+		"prospective.rs",
+		"store.rs",
+		"scan.rs",
+		"recovery.rs",
+		"repair.rs",
+		"inspection.rs",
+		"types.rs",
+	] {
+		let s = fs::read_to_string(root.join("local_store").join(name)).unwrap();
+		syn::parse_file(&s).unwrap();
+		assert!(no_explicit_capability_literal(s.parse().unwrap()));
+		for forbidden in [
+			"TestProofKey",
+			"impl ProofKeyProvider",
+			"TrustedEntry2::",
+			"VerifiedCommand2::",
+			"TrustedView2::",
+			"AcceptedWrite",
+			"tokio::time::sleep",
+			"std::thread::sleep",
+		] {
+			assert!(
+				!s.contains(forbidden),
+				"{name}: dormant physical IO must not activate authority"
+			);
+		}
+	}
+	let store = fs::read_to_string(root.join("local_store/store.rs")).unwrap();
+	assert!(store.contains("tokio::spawn") && store.contains("parent_operation"));
+	let model = fs::read_to_string(root.join("local_store/tests/model.rs")).unwrap();
+	assert!(model.contains("snapshot_file") && model.contains("snapshot_names"));
+}
