@@ -1,6 +1,7 @@
 //! Dormant S1 authority2. No production adapter can construct its private trust tokens.
 mod codec;
 mod command;
+pub mod durable;
 mod incremental;
 mod persistent;
 mod records;

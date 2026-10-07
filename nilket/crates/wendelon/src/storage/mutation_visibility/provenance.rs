@@ -37,6 +37,16 @@ pub struct UnverifiedFrameProvenance {
 }
 redacted_debug!(UnverifiedFrameProvenance, "UnverifiedFrameProvenance");
 impl UnverifiedFrameProvenance {
+	pub(crate) fn check_companion(&self, bytes: &[u8]) -> Result<(), AdapterError> {
+		if bytes.len() == self.frame_len as usize
+			&& blake3::hash(bytes).as_bytes() == &self.frame_digest
+		{
+			Ok(())
+		} else {
+			Err(AdapterError::InvalidProvenance)
+		}
+	}
+
 	#[cfg(test)]
 	pub(crate) fn owned_metadata_bytes(&self) -> usize {
 		std::mem::size_of::<Self>()

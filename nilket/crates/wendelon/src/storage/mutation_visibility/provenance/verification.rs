@@ -18,6 +18,43 @@ pub struct TrustedFrameRows {
 }
 redacted_debug!(TrustedFrameRows, "TrustedFrameRows");
 impl TrustedFrameRows {
+	#[allow(dead_code)]
+	pub(in crate::storage::mutation_visibility) fn from_bounded_rows(
+		_cap: &crate::storage::mutation_visibility::root2::durable::loader::LoaderCapability2,
+		bytes: Vec<u8>,
+		schema: Option<ProofSchema>,
+		batch: RecordBatch,
+		table: bool,
+	) -> Result<Self, AdapterError> {
+		if table {
+			let schema = schema.ok_or(AdapterError::SchemaMismatch)?;
+			schema.check_batch(&batch)?;
+			Ok(Self {
+				bytes,
+				rows: TrustedRows::Table(schema, batch),
+			})
+		} else {
+			if batch.num_columns() != 2 || !batch.schema().metadata().is_empty() {
+				return Err(AdapterError::SchemaMismatch);
+			}
+			for (i, name) in ["key", "value"].iter().enumerate() {
+				let s = batch.schema();
+				let f = s.field(i);
+				if f.name() != name
+					|| f.data_type() != &arrow::datatypes::DataType::Binary
+					|| f.is_nullable()
+					|| !f.metadata().is_empty()
+				{
+					return Err(AdapterError::SchemaMismatch);
+				}
+			}
+			Ok(Self {
+				bytes,
+				rows: TrustedRows::KeyValues(schema, batch),
+			})
+		}
+	}
+
 	#[cfg(test)]
 	pub(crate) fn from_table_frame(
 		bytes: Vec<u8>,

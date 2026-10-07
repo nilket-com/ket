@@ -53,6 +53,7 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 	let source = fs::read_to_string(module.join("provenance/verification.rs")).unwrap();
 	let ast = syn::parse_file(&source).unwrap();
 	let mut constructors = 0;
+	let mut bounded_loaders = 0;
 	for item in ast.items {
 		match item {
 			syn::Item::Struct(s) if s.ident == "TrustedFrameRows" => {
@@ -64,7 +65,11 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 				for member in i.items {
 					if let syn::ImplItem::Fn(f) = member {
 						let name = f.sig.ident.to_string();
-						if name.starts_with("from_") {
+						if name == "from_bounded_rows" {
+							bounded_loaders += 1;
+							assert!(matches!(f.vis, syn::Visibility::Restricted(_)));
+							assert!(f.sig.inputs.iter().any(|arg| matches!(arg, syn::FnArg::Typed(t) if matches!(&*t.ty, syn::Type::Reference(r) if matches!(&*r.elem, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident=="LoaderCapability2"))))));
+						} else if name.starts_with("from_") {
 							constructors += 1;
 							assert!(test_only(&f.attrs));
 							assert!(!matches!(f.vis, syn::Visibility::Public(_)));
@@ -75,6 +80,10 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 			_ => {}
 		}
 	}
+	assert_eq!(
+		bounded_loaders, 1,
+		"bounded linkage requires an unconstructable scoped capability"
+	);
 	assert_eq!(
 		constructors, 2,
 		"all linkage constructors must remain synthetic-only"
@@ -337,4 +346,62 @@ fn s1c_incremental_updates_do_not_scan_or_create_authority_and_oracle_is_test_on
 			.unwrap()
 			.contains("command.digest")
 	);
+}
+
+#[test]
+fn r2_loader_capability_has_no_runtime_factory_and_content_is_not_readiness() {
+	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+		.join("src/storage/mutation_visibility/root2/durable");
+	let ast = syn::parse_file(&fs::read_to_string(root.join("loader.rs")).unwrap()).unwrap();
+	let mut token = 0;
+	let mut factories = 0;
+	let mut result = 0;
+	for item in ast.items {
+		match item {
+			syn::Item::Struct(s)
+				if s.ident == "LoaderCapability2" || s.ident == "LoadedContent2" =>
+			{
+				assert!(matches!(s.vis, syn::Visibility::Restricted(_)));
+				assert!(s.attrs.iter().all(|a| !a.path().is_ident("derive")));
+				for field in s.fields {
+					assert!(matches!(field.vis, syn::Visibility::Inherited));
+				}
+				if s.ident == "LoaderCapability2" {
+					token += 1
+				} else {
+					result += 1
+				}
+			}
+			syn::Item::Impl(i) if matches!(&*i.self_ty,syn::Type::Path(p) if p.path.segments.last().is_some_and(|s|s.ident=="LoaderCapability2")) =>
+			{
+				assert!(i.trait_.is_none(), "no default/serde capability factory");
+				for member in i.items {
+					let syn::ImplItem::Fn(f) = member else {
+						panic!("review new capability member")
+					};
+					assert_eq!(f.sig.ident, "synthetic");
+					assert!(f.attrs.iter().any(|a|matches!(&a.meta,syn::Meta::List(m) if m.path.is_ident("cfg")&&m.tokens.to_string()=="test")));
+					factories += 1;
+				}
+			}
+			_ => {}
+		}
+	}
+	assert_eq!((token, result, factories), (1, 1, 1));
+	for name in ["bundle.rs", "fixed.rs", "journal.rs", "witness.rs"] {
+		let text = fs::read_to_string(root.join(name)).unwrap();
+		for forbidden in [
+			"TrustedEntry2::",
+			"VerifiedCommand2::",
+			"TrustedView2::",
+			"AcceptedWrite",
+			"std::fs::",
+			"tokio::fs::",
+		] {
+			assert!(
+				!text.contains(forbidden),
+				"no authority constructor or live IO in structural codec"
+			);
+		}
+	}
 }

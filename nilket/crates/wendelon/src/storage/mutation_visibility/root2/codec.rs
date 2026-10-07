@@ -50,6 +50,9 @@ pub(super) struct Read2<'a> {
 	pos: usize,
 }
 impl<'a> Read2<'a> {
+	pub(super) fn remaining(&self) -> &'a [u8] {
+		&self.bytes[self.pos..]
+	}
 	pub fn new(bytes: &'a [u8]) -> Self {
 		Self { bytes, pos: 0 }
 	}
