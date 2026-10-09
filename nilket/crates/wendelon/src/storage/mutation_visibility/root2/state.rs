@@ -63,6 +63,17 @@ fn sorted_map<K: Ord + Clone, T: Clone>(
 	Ok(result)
 }
 impl UnverifiedRoot2 {
+	/// Scalars only (bootstrap, covered, fingerprint, command digest): no root, state or authority.
+	pub(in crate::storage::mutation_visibility::root2) fn origin_anchor_fields2(
+		&self,
+	) -> (Log2, Log2, Digest2, Digest2) {
+		(
+			self.state.bootstrap,
+			self.state.covered,
+			self.state.fingerprint,
+			self.state.command_digest,
+		)
+	}
 	#[cfg(test)]
 	pub(super) fn fixture_fields(&self) -> ([u8; 16], [u8; 16], Log2, Digest2) {
 		(

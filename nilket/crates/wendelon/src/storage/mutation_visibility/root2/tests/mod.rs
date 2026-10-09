@@ -3,6 +3,7 @@ use super::{codec::*, validation::*};
 mod entry_identity;
 mod goldens;
 mod invariants;
+mod origin;
 mod refusals;
 mod restoration;
 mod review_regressions;

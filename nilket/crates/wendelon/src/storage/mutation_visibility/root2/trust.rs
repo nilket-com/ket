@@ -1,5 +1,7 @@
 #[cfg(test)]
 use super::command::Command2;
+use super::entry_identity::EntryPosition2;
+use super::origin::EntryClass2;
 use super::types::*;
 /// No decoder/public constructor: future committed-entry adapter is deliberately absent.
 pub struct TrustedEntry2 {
@@ -24,6 +26,13 @@ pub struct TrustedView2 {
 	cluster: [u8; 16],
 	bootstrap: Log2,
 	index: u64,
+}
+/// Any committed entry, genesis (0,0,0) included, with its version-1 identity and producer
+/// classification. No decoder/public constructor: the committed-entry producer is held.
+pub struct CommittedEntry2 {
+	position: EntryPosition2,
+	identity: Digest2,
+	class: EntryClass2,
 }
 impl TrustedEntry2 {
 	pub(super) fn fields(&self) -> ([u8; 16], [u8; 16], Log2, Digest2, Digest2) {
@@ -110,6 +119,19 @@ impl TrustedView2 {
 			cluster: c,
 			bootstrap,
 			index,
+		}
+	}
+}
+impl CommittedEntry2 {
+	pub(super) fn entry_fields(&self) -> (EntryPosition2, Digest2, EntryClass2) {
+		(self.position, self.identity, self.class)
+	}
+	#[cfg(test)]
+	pub(super) fn fixture(position: EntryPosition2, identity: Digest2, class: EntryClass2) -> Self {
+		Self {
+			position,
+			identity,
+			class,
 		}
 	}
 }

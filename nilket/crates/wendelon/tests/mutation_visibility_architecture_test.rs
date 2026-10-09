@@ -213,7 +213,8 @@ fn s1_private_trust_tokens_and_fake_install_are_test_only() {
 								f.sig.ident == "fields"
 									|| f.sig.ident == "matches" || f.sig.ident == "authorized"
 									|| f.sig.ident == "historical"
-									|| f.sig.ident == "evidence",
+									|| f.sig.ident == "evidence"
+									|| f.sig.ident == "entry_fields",
 								"new factory requires review"
 							);
 						}
@@ -223,8 +224,9 @@ fn s1_private_trust_tokens_and_fake_install_are_test_only() {
 			_ => {}
 		}
 	}
-	assert_eq!(tokens, 3);
-	assert_eq!(factories, 5);
+	// Fourth token: CommittedEntry2 (origin contract r4 E1), whose only factory is a test fixture.
+	assert_eq!(tokens, 4);
+	assert_eq!(factories, 6);
 	let state = syn::parse_file(&fs::read_to_string(root.join("state.rs")).unwrap()).unwrap();
 	let mut installs = 0;
 	for item in state.items {
@@ -989,4 +991,163 @@ fn entry_identity_math_has_no_entry_adapter_trust_or_payload_buffer() {
 			"normal_entry_identity2"
 		]
 	);
+}
+// The origin layer consumes opaque trusted inputs and never builds them, never turns decoded bytes
+// into a root, and does no I/O or clock reads. Syntax over origin.rs and the one state.rs accessor.
+#[test]
+fn origin_layer_builds_no_trusted_input_and_promotes_no_bytes() {
+	let root =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
+	let parsed = syn::parse_file(&fs::read_to_string(root.join("mod.rs")).unwrap()).unwrap();
+	let module = parsed
+		.items
+		.iter()
+		.find_map(|item| match item {
+			syn::Item::Mod(m) if m.ident == "origin" => Some(m),
+			_ => None,
+		})
+		.unwrap();
+	assert!(matches!(module.vis, syn::Visibility::Inherited));
+	let text = fs::read_to_string(root.join("origin.rs")).unwrap();
+	let file = syn::parse_file(&text).unwrap();
+	let test_only = |attrs: &[syn::Attribute]| {
+		attrs.iter().any(|a| matches!(&a.meta, syn::Meta::List(m) if m.path.is_ident("cfg") && m.tokens.to_string() == "test"))
+	};
+	fn forbidden(tokens: proc_macro2::TokenStream) -> bool {
+		let ts: Vec<_> = tokens.into_iter().collect();
+		for (i, t) in ts.iter().enumerate() {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => {
+					let n = id.to_string();
+					if [
+						"fs",
+						"io",
+						"net",
+						"tokio",
+						"Instant",
+						"SystemTime",
+						"await",
+						"fixture_install",
+						"fixture",
+						"unauthorized",
+						"change_fingerprint",
+					]
+					.contains(&n.as_str())
+					{
+						return true;
+					}
+					// `Root2 { .. }`, `TrustedEntry2::..`, `VerifiedCommand2::..`, `CommittedEntry2::..` constructions.
+					let next = ts.get(i + 1);
+					if n == "Root2"
+						&& matches!(next, Some(proc_macro2::TokenTree::Group(g)) if g.delimiter() == proc_macro2::Delimiter::Brace)
+					{
+						return true;
+					}
+					if [
+						"TrustedEntry2",
+						"VerifiedCommand2",
+						"CommittedEntry2",
+						"TrustedView2",
+					]
+					.contains(&n.as_str())
+						&& matches!(next, Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == ':')
+					{
+						return true;
+					}
+				}
+				proc_macro2::TokenTree::Group(g) if forbidden(g.stream()) => return true,
+				_ => {}
+			}
+		}
+		false
+	}
+	assert!(
+		!forbidden(without_test_items(text.parse().unwrap())),
+		"origin.rs: prohibited construction or effect outside cfg(test)"
+	);
+	let mut entrypoints = Vec::new();
+	for item in &file.items {
+		let attrs = match item {
+			syn::Item::Fn(f) => &f.attrs,
+			syn::Item::Impl(i) => &i.attrs,
+			_ => continue,
+		};
+		if test_only(attrs) {
+			continue;
+		}
+		match item {
+			syn::Item::Fn(f) if root2_scoped(&f.vis) => entrypoints.push(f.sig.ident.to_string()),
+			syn::Item::Fn(f) => assert!(matches!(f.vis, syn::Visibility::Inherited)),
+			syn::Item::Impl(i) => {
+				assert!(i.trait_.is_none(), "no trait impls in origin.rs");
+				for it in &i.items {
+					if let syn::ImplItem::Fn(f) = it {
+						if root2_scoped(&f.vis) {
+							entrypoints.push(f.sig.ident.to_string());
+						} else {
+							assert!(matches!(f.vis, syn::Visibility::Inherited));
+						}
+					}
+				}
+			}
+			_ => {}
+		}
+	}
+	for item in &file.items {
+		if let syn::Item::Fn(f) = item {
+			if test_only(&f.attrs) {
+				assert!(!matches!(f.vis, syn::Visibility::Public(_)));
+			}
+		}
+	}
+	entrypoints.sort();
+	assert_eq!(
+		entrypoints,
+		[
+			"advance_pre_root2",
+			"advance_root2",
+			"bootstrap2",
+			"coverage2",
+			"decode",
+			"empty_authority2",
+			"encode",
+			"encode_authority2"
+		]
+	);
+	// The one state.rs accessor returns exactly four scalars.
+	let state = fs::read_to_string(root.join("state.rs")).unwrap();
+	let accessor = state
+		.split("fn origin_anchor_fields2(")
+		.nth(1)
+		.expect("accessor present");
+	let signature: String = accessor
+		.split('{')
+		.next()
+		.unwrap()
+		.split_whitespace()
+		.collect();
+	assert_eq!(signature, "&self,)->(Log2,Log2,Digest2,Digest2)");
+}
+// Top-level tokens of a file with every `#[cfg(test)]` item (through its body group) removed.
+fn without_test_items(tokens: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+	let ts: Vec<_> = tokens.into_iter().collect();
+	let mut out = Vec::new();
+	let mut i = 0;
+	while i < ts.len() {
+		let cfg_test = matches!(&ts[i], proc_macro2::TokenTree::Punct(p) if p.as_char() == '#')
+			&& matches!(ts.get(i + 1), Some(proc_macro2::TokenTree::Group(g)) if g.delimiter() == proc_macro2::Delimiter::Bracket && g.stream().to_string().replace(' ', "") == "cfg(test)");
+		if cfg_test {
+			i += 2;
+			while i < ts.len()
+				&& !matches!(&ts[i], proc_macro2::TokenTree::Group(g) if g.delimiter() == proc_macro2::Delimiter::Brace)
+			{
+				i += 1;
+			}
+			i += 1;
+			continue;
+		}
+		out.push(ts[i].clone());
+		i += 1;
+	}
+	out.into_iter().collect()
 }
