@@ -1151,3 +1151,141 @@ fn without_test_items(tokens: proc_macro2::TokenStream) -> proc_macro2::TokenStr
 	}
 	out.into_iter().collect()
 }
+// Provisioning reader: private dormant module, exactly two SAFETY-commented unsafe blocks in
+// anchored.rs outside cfg(test), a test-only error seam, and no network, trust or root access.
+// Syntax over these files only; not name resolution.
+#[test]
+fn provisioning_reader_has_two_documented_unsafe_blocks_and_no_trust_access() {
+	let root =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
+	let parsed = syn::parse_file(&fs::read_to_string(root.join("mod.rs")).unwrap()).unwrap();
+	let module = parsed
+		.items
+		.iter()
+		.find_map(|item| match item {
+			syn::Item::Mod(m) if m.ident == "provisioning" => Some(m),
+			_ => None,
+		})
+		.unwrap();
+	assert!(matches!(module.vis, syn::Visibility::Inherited));
+	let decl =
+		syn::parse_file(&fs::read_to_string(root.join("provisioning/mod.rs")).unwrap()).unwrap();
+	let mut children = Vec::new();
+	for item in decl.items {
+		match item {
+			syn::Item::Mod(m) if m.ident == "tests" => assert!(m.attrs.iter().any(|a| matches!(&a.meta, syn::Meta::List(l) if l.path.is_ident("cfg") && l.tokens.to_string() == "test"))),
+			syn::Item::Mod(m) if m.content.is_none() => children.push(m.ident.to_string()),
+			_ => panic!("provisioning/mod.rs must be declarative"),
+		}
+	}
+	assert_eq!(children, ["anchored"]);
+	let text = fs::read_to_string(root.join("provisioning/anchored.rs")).unwrap();
+	let production = without_test_items(text.parse().unwrap());
+	fn unsafe_blocks(tokens: proc_macro2::TokenStream) -> usize {
+		tokens
+			.into_iter()
+			.map(|t| match t {
+				proc_macro2::TokenTree::Ident(id) if id == "unsafe" => 1,
+				proc_macro2::TokenTree::Group(g) => unsafe_blocks(g.stream()),
+				_ => 0,
+			})
+			.sum()
+	}
+	assert_eq!(
+		unsafe_blocks(production.clone()),
+		2,
+		"exactly two production unsafe blocks"
+	);
+	let lines: Vec<&str> = text.lines().collect();
+	let mut documented = 0;
+	for (i, line) in lines.iter().enumerate() {
+		if line.contains("unsafe {") {
+			let before = lines[..i]
+				.iter()
+				.rev()
+				.take(6)
+				.any(|l| l.trim_start().starts_with("// SAFETY:"));
+			assert!(before, "unsafe at line {} lacks a SAFETY comment", i + 1);
+			documented += 1;
+		}
+	}
+	assert_eq!(documented, 2);
+	fn banned(tokens: proc_macro2::TokenStream) -> bool {
+		tokens.into_iter().any(|t| match t {
+			proc_macro2::TokenTree::Ident(id) => {
+				let n = id.to_string();
+				n.starts_with("Trusted")
+					|| n.starts_with("Verified")
+					|| [
+						"net",
+						"tokio",
+						"Root2",
+						"CommittedEntry2",
+						"State2",
+						"Command2",
+						"TcpStream",
+						"UdpSocket",
+					]
+					.contains(&n.as_str())
+			}
+			proc_macro2::TokenTree::Group(g) => banned(g.stream()),
+			_ => false,
+		})
+	}
+	assert!(
+		!banned(text.parse().unwrap()),
+		"anchored.rs: network, trust or root access"
+	);
+	// The error seam exists only under cfg(test): its state and function are cfg(test) items, and
+	// the single call site is a cfg(test) statement.
+	assert!(
+		!production.to_string().contains("INJECTED_OPEN_ERRNO"),
+		"test seam state outside cfg(test)"
+	);
+	let calls: Vec<usize> = lines
+		.iter()
+		.enumerate()
+		.filter(|(_, l)| l.contains("injected_open_error()?"))
+		.map(|(i, _)| i)
+		.collect();
+	assert_eq!(calls.len(), 1);
+	assert_eq!(
+		lines[calls[0] - 1].trim(),
+		"#[cfg(test)]",
+		"seam call without cfg(test)"
+	);
+	let file = syn::parse_file(&text).unwrap();
+	let mut entrypoints = Vec::new();
+	for item in &file.items {
+		if let syn::Item::Impl(i) = item {
+			for it in &i.items {
+				if let syn::ImplItem::Fn(f) = it {
+					if root2_scoped(&f.vis) {
+						entrypoints.push(format!("{}::{}", quote_type(&i.self_ty), f.sig.ident));
+					}
+				}
+			}
+		}
+		if let syn::Item::Fn(f) = item {
+			assert!(
+				!root2_scoped(&f.vis) && !matches!(f.vis, syn::Visibility::Public(_)),
+				"free fn exported"
+			);
+		}
+	}
+	entrypoints.sort();
+	assert_eq!(
+		entrypoints,
+		[
+			"AnchorDir2::open",
+			"AnchoredFile2::open",
+			"AnchoredFile2::read_bounded"
+		]
+	);
+}
+fn quote_type(ty: &syn::Type) -> String {
+	match ty {
+		syn::Type::Path(p) => p.path.segments.last().unwrap().ident.to_string(),
+		_ => String::from("?"),
+	}
+}

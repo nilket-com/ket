@@ -12,6 +12,8 @@ mod incremental;
 #[allow(dead_code)] // Dormant origin layer; no production caller until reviewed integration.
 mod origin;
 mod persistent;
+#[allow(dead_code)] // Dormant provisioning reads; no production caller until reviewed integration.
+mod provisioning;
 mod records;
 mod reducer;
 mod state;
