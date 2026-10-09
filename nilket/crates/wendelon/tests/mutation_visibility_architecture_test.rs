@@ -1178,7 +1178,10 @@ fn provisioning_reader_has_two_documented_unsafe_blocks_and_no_trust_access() {
 			_ => panic!("provisioning/mod.rs must be declarative"),
 		}
 	}
-	assert_eq!(children, ["anchored", "inventory", "snapshot"]);
+	assert_eq!(
+		children,
+		["anchored", "inventory", "owner_core", "snapshot"]
+	);
 	let text = fs::read_to_string(root.join("provisioning/anchored.rs")).unwrap();
 	let production = without_test_items(text.parse().unwrap());
 	fn unsafe_blocks(tokens: proc_macro2::TokenStream) -> usize {
@@ -1289,8 +1292,8 @@ fn quote_type(ty: &syn::Type) -> String {
 		_ => String::from("?"),
 	}
 }
-// Pure inventory and snapshot codecs: no I/O, clock, networking, unsafe, trust or root
-// construction; fixed entrypoints. Syntax over these two files only.
+// Pure inventory and snapshot codecs and the pure owner core: no I/O, clock, networking,
+// unsafe, trust or root construction; fixed entrypoints. Syntax over these three files only.
 #[test]
 fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1335,7 +1338,7 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 		None
 	}
 	let mut entrypoints = Vec::new();
-	for name in ["inventory.rs", "snapshot.rs"] {
+	for name in ["inventory.rs", "snapshot.rs", "owner_core.rs"] {
 		let text = fs::read_to_string(root.join(name)).unwrap();
 		assert_eq!(
 			banned(text.parse().unwrap()),
@@ -1373,11 +1376,22 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 	assert_eq!(
 		entrypoints,
 		[
+			"classify2",
+			"decide2",
 			"decode_event2",
+			"decode_evidence2",
 			"decode_snapshot2",
 			"encode_event2",
+			"encode_evidence2",
 			"encode_snapshot2",
-			"fold_events2"
+			"event_request_key2",
+			"evidence_name2",
+			"expected_repair_event2",
+			"fold_events2",
+			"op_id2",
+			"repair_context2",
+			"repair_op_id2",
+			"request_key2"
 		]
 	);
 }
