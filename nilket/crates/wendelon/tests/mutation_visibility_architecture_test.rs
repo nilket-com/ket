@@ -1178,7 +1178,7 @@ fn provisioning_reader_has_two_documented_unsafe_blocks_and_no_trust_access() {
 			_ => panic!("provisioning/mod.rs must be declarative"),
 		}
 	}
-	assert_eq!(children, ["anchored"]);
+	assert_eq!(children, ["anchored", "inventory", "snapshot"]);
 	let text = fs::read_to_string(root.join("provisioning/anchored.rs")).unwrap();
 	let production = without_test_items(text.parse().unwrap());
 	fn unsafe_blocks(tokens: proc_macro2::TokenStream) -> usize {
@@ -1288,4 +1288,96 @@ fn quote_type(ty: &syn::Type) -> String {
 		syn::Type::Path(p) => p.path.segments.last().unwrap().ident.to_string(),
 		_ => String::from("?"),
 	}
+}
+// Pure inventory and snapshot codecs: no I/O, clock, networking, unsafe, trust or root
+// construction; fixed entrypoints. Syntax over these two files only.
+#[test]
+fn provisioning_inventory_and_snapshot_are_pure_codecs() {
+	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+		.join("src/storage/mutation_visibility/root2/provisioning");
+	fn banned(tokens: proc_macro2::TokenStream) -> Option<String> {
+		for t in tokens {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => {
+					let n = id.to_string();
+					if n.starts_with("Trusted")
+						|| n.starts_with("Verified")
+						|| [
+							"fs",
+							"io",
+							"net",
+							"tokio",
+							"Instant",
+							"SystemTime",
+							"unsafe",
+							"Root2",
+							"State2",
+							"Command2",
+							"CommittedEntry2",
+							"File",
+							"OpenOptions",
+							"syscall",
+							"libc",
+						]
+						.contains(&n.as_str())
+					{
+						return Some(n);
+					}
+				}
+				proc_macro2::TokenTree::Group(g) => {
+					if let Some(n) = banned(g.stream()) {
+						return Some(n);
+					}
+				}
+				_ => {}
+			}
+		}
+		None
+	}
+	let mut entrypoints = Vec::new();
+	for name in ["inventory.rs", "snapshot.rs"] {
+		let text = fs::read_to_string(root.join(name)).unwrap();
+		assert_eq!(
+			banned(text.parse().unwrap()),
+			None,
+			"{name}: prohibited token"
+		);
+		for item in syn::parse_file(&text).unwrap().items {
+			match item {
+				syn::Item::Fn(f) if root2_scoped(&f.vis) => {
+					entrypoints.push(f.sig.ident.to_string())
+				}
+				syn::Item::Fn(f) => assert!(
+					matches!(f.vis, syn::Visibility::Inherited),
+					"{name}: {}",
+					f.sig.ident
+				),
+				syn::Item::Impl(i) => {
+					for it in &i.items {
+						if let syn::ImplItem::Fn(f) = it {
+							assert!(
+								matches!(f.vis, syn::Visibility::Inherited) || i.trait_.is_some(),
+								"{name}: impl method exported"
+							);
+						}
+					}
+				}
+				syn::Item::Trait(_) | syn::Item::Static(_) | syn::Item::Mod(_) => {
+					panic!("{name}: no traits, statics or modules")
+				}
+				_ => {}
+			}
+		}
+	}
+	entrypoints.sort();
+	assert_eq!(
+		entrypoints,
+		[
+			"decode_event2",
+			"decode_snapshot2",
+			"encode_event2",
+			"encode_snapshot2",
+			"fold_events2"
+		]
+	);
 }
