@@ -154,6 +154,17 @@ fn local_checks_in_order() {
 	assert_eq!(local(&tail(0)), Some(RepairBounds));
 	assert_eq!(local(&tail(767)), None);
 	assert_eq!(local(&tail(768)), Some(RepairBounds));
+	// Checked boundary arithmetic: seq 0 has no predecessor, and (seq - 1) * 384 overflows.
+	for seq in [0, u64::MAX] {
+		assert_eq!(
+			decode_event2(&rp(12, &seq.to_le_bytes())).err(),
+			Some(LogError2::Corrupt {
+				seq,
+				reason: RepairBounds
+			}),
+			"seq {seq}"
+		);
+	}
 }
 #[test]
 fn semantic_rows() {
@@ -373,6 +384,14 @@ fn root_and_slot_caps() {
 		&encoded(&reserve(extra, 65_001, [0xf7; 16])),
 	]);
 	assert_eq!(fold(&over_slot), corrupt(65_001, OrdinarySlot));
+	// Repairs fill the remaining slots through seq 65,536; one more whole event is too long.
+	for seq in 65_000..=TOTAL_EVENTS2 {
+		pad.extend(encoded(&repair_at(seq, seq)));
+	}
+	assert_eq!(pad.len(), TOTAL_EVENTS2 as usize * EVENT_BYTES2);
+	assert_eq!(fold_events2(&pad).unwrap().last_seq, TOTAL_EVENTS2);
+	pad.extend(encoded(&repair_at(TOTAL_EVENTS2 + 1, TOTAL_EVENTS2 + 1)));
+	assert_eq!(fold(&pad), Err(LogError2::TooLong));
 	assert_eq!(
 		fold_events2(&vec![0u8; MAX_LOG_BYTES2 + 1]).err(),
 		Some(LogError2::TooLong)

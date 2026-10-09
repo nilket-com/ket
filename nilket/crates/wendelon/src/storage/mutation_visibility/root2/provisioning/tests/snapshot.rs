@@ -93,10 +93,23 @@ fn every_invariant_is_refused() {
 	swapped[E0..E1].copy_from_slice(&b);
 	swapped[E1..E1 + 320].copy_from_slice(&a);
 	assert_eq!(decode(&reseal_snapshot(swapped)), Err(Order));
-	// Shared component across entries: second entry reuses the first entry's key.
+	// Shared component across entries: the second entry reuses one of the first entry's. Its
+	// (generation, cluster) still sorts after the first, so Duplicate is the check that refuses.
+	for (at, w) in [(0, 16), (16, 16), (32, 32), (64, 32)] {
+		assert_eq!(
+			decode(&patched(
+				"full",
+				E1 + at,
+				&full[E0 + at..E0 + at + w].to_vec()
+			)),
+			Err(Duplicate),
+			"component at {at}"
+		);
+	}
+	// Repeating the whole (generation, cluster) pair fails the strict order first.
 	assert_eq!(
-		decode(&patched("full", E1 + 64, &full[E0 + 64..E0 + 96].to_vec())),
-		Err(Duplicate)
+		decode(&patched("full", E1, &full[E0..E0 + 32].to_vec())),
+		Err(Order)
 	);
 	// Bound without a record; a record on a non-Bound entry.
 	assert_eq!(
@@ -106,13 +119,31 @@ fn every_invariant_is_refused() {
 	let bound = snapshot_bytes("bound");
 	let record = bound[E0 + 112..E0 + 320].to_vec();
 	assert_eq!(decode(&patched("prepared", E0 + 112, &record)), Err(Record));
-	// Bound record bound to the entry and to last_seq.
-	assert_eq!(
-		decode(&patched("bound", E0 + 32, &[0x55; 32])),
-		Err(Binding)
-	);
+	// A nonzero record that does not decode.
+	assert_eq!(decode(&patched("bound", E0 + 112, &[0xff])), Err(Record));
+	// Bound record bound to the entry's generation, cluster and pin, and to last_seq.
+	for (at, w) in [(0, 16), (16, 16), (32, 32)] {
+		assert_eq!(
+			decode(&patched("bound", E0 + at, &vec![0x55; w])),
+			Err(Binding),
+			"component at {at}"
+		);
+	}
 	let mut later = patched("bound", 14, &3u64.to_le_bytes());
 	later[E0 + 104..E0 + 112].copy_from_slice(&3u64.to_le_bytes());
 	assert_eq!(decode(&reseal_snapshot(later)), Err(Binding));
 	assert!(decode(&snapshot_bytes("empty")).is_ok());
+}
+#[test]
+fn encode_refuses_more_roots_than_the_cap_before_any_entry_check() {
+	let state = fold_events2(&log_bytes()[..384]).unwrap();
+	let mut root = state.roots[0].clone();
+	root.identity.generation = [0; 16];
+	let with = |n: usize| LogState2 {
+		roots: vec![root.clone(); n],
+		last_seq: 1,
+	};
+	// An invalid first entry: over the cap it is never examined.
+	assert_eq!(encode_snapshot2(&with(MAX_ROOTS2 + 1)), Err(Count));
+	assert_eq!(encode_snapshot2(&with(MAX_ROOTS2)), Err(ZeroIdentity));
 }

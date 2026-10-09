@@ -140,6 +140,10 @@ fn encode(s: &InventorySnapshot2) -> Result<Vec<u8>, SnapshotError2> {
 pub(in crate::storage::mutation_visibility::root2) fn encode_snapshot2(
 	state: &LogState2,
 ) -> Result<Vec<u8>, SnapshotError2> {
+	// The cap is settled before any entry is copied.
+	if state.roots.len() > MAX_ROOTS2 {
+		return Err(SnapshotError2::Count);
+	}
 	encode(&InventorySnapshot2 {
 		export_seq: state.last_seq,
 		entries: state
