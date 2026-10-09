@@ -450,3 +450,23 @@ pub(super) fn pre_root_with_malformed_for_test(
 		}),
 	}
 }
+/// Test-only PreRoot already scanned through `scanned`, checked by the runtime validator; exercises
+/// the next-index overflow boundary without u64::MAX transitions.
+#[cfg(test)]
+pub(super) fn pre_root_scanned_through_for_test(
+	scanned: EntryPosition2,
+	last: Digest2,
+	genesis: Digest2,
+) -> MutationAuthorityState2 {
+	let p = PreRoot2 {
+		genesis,
+		scanned_through: scanned,
+		last_scanned: last,
+		malformed: 0,
+		first_malformed: None,
+	};
+	check_pre_root(&p).expect("valid PreRoot fixture");
+	MutationAuthorityState2 {
+		inner: StateInner2::PreRoot(p),
+	}
+}

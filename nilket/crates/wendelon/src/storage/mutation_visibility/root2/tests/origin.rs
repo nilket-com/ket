@@ -142,6 +142,15 @@ fn pre_root_table_rows() {
 		advance_pre_root2(&g, &committed(at(1, 0, 1), 1, EntryClass2::Blank)).err(),
 		Some(RootError2::TrustMismatch)
 	);
+	// Successful scan rows for each scanned class (NonRoot2 is exercised by `scanned`).
+	let (b, step) = advance_pre_root2(&g, &committed(at(1, 1, 1), 1, EntryClass2::Blank)).unwrap();
+	assert_eq!(step, PreRootStep2::Scanned);
+	assert!(coverage2(&b) == Some(at(1, 1, 1)));
+	let (m, step) =
+		advance_pre_root2(&b, &committed(at(1, 1, 2), 2, EntryClass2::Membership)).unwrap();
+	assert_eq!(step, PreRootStep2::Scanned);
+	assert!(coverage2(&m) == Some(at(1, 1, 2)));
+	assert!(m.malformed_for_test() == Some((0, None)));
 	// Non-genesis same-index duplicate (addendum A).
 	let s = scanned(3);
 	let (dup, step) =
@@ -390,4 +399,36 @@ fn wrapper_negatives() {
 	let end = whole.len() - 1;
 	whole[end] ^= 1;
 	assert_eq!(refuse(&whole), RootError2::Codec);
+}
+#[test]
+fn next_index_overflow_is_refused_by_both_routes_without_changing_state() {
+	let top = at(1, 1, u64::MAX);
+	let s = pre_root_scanned_through_for_test(top, [0x33; 32], GENESIS_ID);
+	let before = encoded(&s);
+	assert!(coverage2(&s) == Some(top));
+	// Any index other than the scanned one needs scanned + 1, which overflows.
+	for class in [
+		EntryClass2::Blank,
+		EntryClass2::NonRoot2,
+		EntryClass2::MalformedRoot2,
+	] {
+		assert_eq!(
+			advance_pre_root2(&s, &committed(at(1, 1, 5), 5, class)).err(),
+			Some(RootError2::Overflow)
+		);
+	}
+	// The scanned entry itself is still recognised as a duplicate.
+	let (same, step) = advance_pre_root2(
+		&s,
+		&CommittedEntry2::fixture(top, [0x33; 32], EntryClass2::NonRoot2),
+	)
+	.unwrap();
+	assert_eq!(step, PreRootStep2::AlreadyProcessed);
+	assert_eq!(encoded(&same), before);
+	let (ce, e, v, cmd) = bootstrap_inputs(l(5));
+	assert_eq!(
+		bootstrap2(&s, &ce, &e, &v, &cmd).err(),
+		Some(RootError2::Overflow)
+	);
+	assert_eq!(encoded(&s), before);
 }
