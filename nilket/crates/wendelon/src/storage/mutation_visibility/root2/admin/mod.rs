@@ -1,8 +1,9 @@
-//! Dormant administrator-manifest math only: bytes, digest comparison and key enrollability.
-//! No provenance, pin, record, inventory, signing or trusted output is produced here.
+//! Dormant administrator math only: manifest and bootstrap-record bytes, digest comparison and
+//! key enrollability. No provenance, pin, inventory, readiness, signing or trusted output is produced here.
 pub mod errors;
 pub mod key;
 pub mod manifest;
+pub mod record;
 
 #[cfg(test)]
 mod tests;

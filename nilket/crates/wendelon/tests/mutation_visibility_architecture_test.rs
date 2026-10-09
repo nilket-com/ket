@@ -737,16 +737,38 @@ fn admin_items(file: &syn::File) -> Option<Vec<String>> {
 			{
 				return None;
 			}
-			syn::Item::Type(t) if !(root2_scoped(&t.vis) && t.ident == "AdminResult2") => {
+			syn::Item::Type(t)
+				if !(root2_scoped(&t.vis)
+					&& ["AdminResult2", "BootstrapResult2"]
+						.iter()
+						.any(|n| t.ident == *n)) =>
+			{
 				return None;
 			}
-			syn::Item::Enum(e) if !(root2_scoped(&e.vis) && e.ident == "AdminManifestError2") => {
+			syn::Item::Enum(e)
+				if !(root2_scoped(&e.vis)
+					&& [
+						"AdminManifestError2",
+						"BootstrapRecordError2",
+						"BootstrapField2",
+					]
+					.iter()
+					.any(|n| e.ident == *n)) =>
+			{
 				return None;
 			}
 			// Fields are declared pub inside root2-private types; the type itself bounds their reach.
 			syn::Item::Struct(s)
 				if !(root2_scoped(&s.vis)
-					&& (s.ident == "AdminManifest2" || s.ident == "AdminNamespace2")) =>
+					&& [
+						"AdminManifest2",
+						"AdminNamespace2",
+						"BootstrapIdentity2",
+						"BootstrapRecord2",
+						"BootstrapObservation2",
+					]
+					.iter()
+					.any(|n| s.ident == *n)) =>
 			{
 				return None;
 			}
@@ -811,9 +833,9 @@ fn admin_manifest_math_stays_private_and_has_no_provenance_producer() {
 		}
 	}
 	children.sort();
-	assert_eq!(children, ["errors", "key", "manifest"]);
+	assert_eq!(children, ["errors", "key", "manifest", "record"]);
 	let mut entrypoints = Vec::new();
-	for name in ["errors.rs", "key.rs", "manifest.rs"] {
+	for name in ["errors.rs", "key.rs", "manifest.rs", "record.rs"] {
 		let text = fs::read_to_string(root.join("admin").join(name)).unwrap();
 		assert!(
 			no_admin_authority(text.parse().unwrap()),
@@ -832,7 +854,12 @@ fn admin_manifest_math_stays_private_and_has_no_provenance_producer() {
 			"check_admin_manifest_digest2",
 			"check_enrollable_admin_key2",
 			"decode",
-			"encode"
+			"decode",
+			"decode",
+			"encode",
+			"encode",
+			"encode",
+			"first_mismatch"
 		]
 	);
 }

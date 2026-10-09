@@ -20,3 +20,6 @@ pub(super) fn valid(name: &str) -> serde_json::Value {
 pub(super) fn bytes(name: &str) -> Vec<u8> {
 	hex(valid(name)["bytes"].as_str().unwrap())
 }
+pub(super) fn record_vectors() -> serde_json::Value {
+	serde_json::from_str(include_str!("record_vectors.json")).unwrap()
+}
