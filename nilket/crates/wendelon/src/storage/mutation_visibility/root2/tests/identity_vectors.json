@@ -1,0 +1,48 @@
+{
+ "domain": "VISROOT2-ENTRY\\0",
+ "version": 1,
+ "cases": [
+  {
+   "name": "genesis_membership",
+   "term": 0,
+   "node": 0,
+   "index": 0,
+   "kind": 2,
+   "payload_len": 8,
+   "digest": "0663455cad8137c4f445a46dc586538d7abb23f36ed1c7cb3ca9bd4575b52318",
+   "payload": "0101010101026e31",
+   "preimage": "564953524f4f54322d454e54525900010000000000000000000000000000000000000000000208000000000000000101010101026e31"
+  },
+  {
+   "name": "blank",
+   "term": 1,
+   "node": 3,
+   "index": 1,
+   "kind": 0,
+   "payload_len": 0,
+   "digest": "e1adbe72868d319fc5b9e0a1cb00fa6ba9e4623699f66341beccb031835118c6",
+   "payload": "",
+   "preimage": "564953524f4f54322d454e5452590001000100000000000000030000000100000000000000000000000000000000"
+  },
+  {
+   "name": "normal_schema_update_small",
+   "term": 1,
+   "node": 3,
+   "index": 2,
+   "kind": 1,
+   "payload_len": 5,
+   "digest": "f573e36f3aa8fdf01811d26c535c2068b3e3f04e20efd88b57dd6ed63254407b",
+   "payload": "0403ababab",
+   "preimage": "564953524f4f54322d454e54525900010001000000000000000300000002000000000000000105000000000000000403ababab"
+  },
+  {
+   "name": "normal_schema_update_6mib",
+   "term": 2,
+   "node": 1,
+   "index": 900,
+   "kind": 1,
+   "payload_len": 6291461,
+   "digest": "109225ebbeb7b6d2a20d8c0415c910a39fe88ed5343d86cb9caf8e6eedec5e1c"
+  }
+ ]
+}

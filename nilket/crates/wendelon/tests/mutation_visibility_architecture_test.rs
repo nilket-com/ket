@@ -897,3 +897,96 @@ fn admin_guard_negative_examples_reject_widening_constructors_signing_and_io() {
 		Some(vec!["decode".to_string()])
 	);
 }
+// Entry identity is byte math over caller-supplied decoded values: no openraft entry adapter,
+// no I/O, no trust/state/reducer access and no buffer proportional to the payload.
+// Conservative syntax over this file only; it is not name resolution.
+#[test]
+fn entry_identity_math_has_no_entry_adapter_trust_or_payload_buffer() {
+	let root =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
+	let parsed = syn::parse_file(&fs::read_to_string(root.join("mod.rs")).unwrap()).unwrap();
+	let module = parsed
+		.items
+		.iter()
+		.find_map(|item| match item {
+			syn::Item::Mod(m) if m.ident == "entry_identity" => Some(m),
+			_ => None,
+		})
+		.unwrap();
+	assert!(matches!(module.vis, syn::Visibility::Inherited));
+	let text = fs::read_to_string(root.join("entry_identity.rs")).unwrap();
+	fn walk(tokens: proc_macro2::TokenStream) -> bool {
+		tokens.into_iter().all(|t| match t {
+			proc_macro2::TokenTree::Ident(id) => {
+				let name = id.to_string();
+				!(name.starts_with("Trusted")
+					|| name.starts_with("Verified")
+					|| [
+						"Entry",
+						"EntryPayload",
+						"LogId",
+						"raft_storage",
+						"fs",
+						"io",
+						"net",
+						"tokio",
+						"Command2",
+						"Root2",
+						"State2",
+						"Vec",
+						"to_allocvec",
+						"to_stdvec",
+						"to_io",
+						"SigningKey",
+					]
+					.contains(&name.as_str()))
+			}
+			proc_macro2::TokenTree::Group(g) => walk(g.stream()),
+			_ => true,
+		})
+	}
+	assert!(
+		walk(text.parse().unwrap()),
+		"entry_identity.rs: prohibited token"
+	);
+	let test_only = |attrs: &[syn::Attribute]| {
+		attrs.iter().any(|a| matches!(&a.meta, syn::Meta::List(m) if m.path.is_ident("cfg") && m.tokens.to_string() == "test"))
+	};
+	let mut entrypoints = Vec::new();
+	for item in syn::parse_file(&text).unwrap().items {
+		match item {
+			syn::Item::Fn(f) if root2_scoped(&f.vis) => entrypoints.push(f.sig.ident.to_string()),
+			syn::Item::Fn(f) if test_only(&f.attrs) => {
+				assert!(!matches!(f.vis, syn::Visibility::Public(_)))
+			}
+			syn::Item::Fn(f) => assert!(
+				matches!(f.vis, syn::Visibility::Inherited),
+				"{}",
+				f.sig.ident
+			),
+			syn::Item::Struct(s) => assert!(
+				matches!(s.vis, syn::Visibility::Inherited)
+					|| (root2_scoped(&s.vis) && s.ident == "EntryPosition2")
+			),
+			syn::Item::Enum(e) => assert!(root2_scoped(&e.vis) && e.ident == "EntryIdentityError2"),
+			syn::Item::Impl(i) => assert!(i.items.iter().all(
+				|it| matches!(it, syn::ImplItem::Fn(f) if matches!(f.vis, syn::Visibility::Inherited))
+					|| matches!(it, syn::ImplItem::Type(_))
+			)),
+			syn::Item::Use(u) => assert!(matches!(u.vis, syn::Visibility::Inherited)),
+			syn::Item::Trait(_) | syn::Item::Mod(_) | syn::Item::Static(_) => {
+				panic!("no traits/modules/statics")
+			}
+			_ => {}
+		}
+	}
+	entrypoints.sort();
+	assert_eq!(
+		entrypoints,
+		[
+			"blank_entry_identity2",
+			"membership_entry_identity2",
+			"normal_entry_identity2"
+		]
+	);
+}

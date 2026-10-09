@@ -6,6 +6,8 @@ mod auth;
 mod codec;
 mod command;
 pub mod durable;
+#[allow(dead_code)] // Dormant entry-identity math; no production caller until reviewed integration.
+mod entry_identity;
 mod incremental;
 mod persistent;
 mod records;
