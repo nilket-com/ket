@@ -701,3 +701,172 @@ fn auth_boundary_negative_examples_reject_known_constructor_escapes() {
 			.unwrap()
 	));
 }
+// Administrator-manifest math: the auth prohibitions plus no I/O, command/state or root access.
+// Conservative syntax over these files only; it is neither name resolution nor provenance evidence.
+fn no_admin_authority(tokens: proc_macro2::TokenStream) -> bool {
+	fn walk(tokens: proc_macro2::TokenStream) -> bool {
+		tokens.into_iter().all(|t| match t {
+			proc_macro2::TokenTree::Ident(id) => ![
+				"fs", "io", "net", "tokio", "File", "config", "Config", "Command2", "State2",
+				"Limits2", "Usage2", "envelope", "open",
+			]
+			.contains(&id.to_string().as_str()),
+			proc_macro2::TokenTree::Group(g) => walk(g.stream()),
+			_ => true,
+		})
+	}
+	no_auth_authority(tokens.clone()) && walk(tokens)
+}
+fn root2_scoped(vis: &syn::Visibility) -> bool {
+	matches!(vis, syn::Visibility::Restricted(r) if r.in_token.is_some() && exact_path(&r.path, &["crate", "storage", "mutation_visibility", "root2"]))
+}
+// Returns the root2-scoped entrypoint names, or None if any item widens visibility or adds a producer shape.
+fn admin_items(file: &syn::File) -> Option<Vec<String>> {
+	let mut entrypoints = Vec::new();
+	for item in &file.items {
+		match item {
+			syn::Item::Fn(f) => {
+				if root2_scoped(&f.vis) {
+					entrypoints.push(f.sig.ident.to_string());
+				} else if !matches!(f.vis, syn::Visibility::Inherited) {
+					return None;
+				}
+			}
+			syn::Item::Const(c)
+				if !(root2_scoped(&c.vis) || matches!(c.vis, syn::Visibility::Inherited)) =>
+			{
+				return None;
+			}
+			syn::Item::Type(t) if !(root2_scoped(&t.vis) && t.ident == "AdminResult2") => {
+				return None;
+			}
+			syn::Item::Enum(e) if !(root2_scoped(&e.vis) && e.ident == "AdminManifestError2") => {
+				return None;
+			}
+			// Fields are declared pub inside root2-private types; the type itself bounds their reach.
+			syn::Item::Struct(s)
+				if !(root2_scoped(&s.vis)
+					&& (s.ident == "AdminManifest2" || s.ident == "AdminNamespace2")) =>
+			{
+				return None;
+			}
+			syn::Item::Impl(i) => {
+				if i.trait_.is_some() {
+					return None;
+				}
+				for it in &i.items {
+					match it {
+						syn::ImplItem::Fn(f) if root2_scoped(&f.vis) => {
+							entrypoints.push(f.sig.ident.to_string())
+						}
+						syn::ImplItem::Fn(f) if matches!(f.vis, syn::Visibility::Inherited) => {}
+						_ => return None,
+					}
+				}
+			}
+			syn::Item::Use(u) if !matches!(u.vis, syn::Visibility::Inherited) => return None,
+			syn::Item::Trait(_) | syn::Item::Mod(_) | syn::Item::Static(_) => return None,
+			_ => {}
+		}
+	}
+	Some(entrypoints)
+}
+#[test]
+fn admin_manifest_math_stays_private_and_has_no_provenance_producer() {
+	let root =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
+	let parsed = syn::parse_file(&fs::read_to_string(root.join("mod.rs")).unwrap()).unwrap();
+	let admin = parsed
+		.items
+		.iter()
+		.find_map(|item| match item {
+			syn::Item::Mod(m) if m.ident == "admin" => Some(m),
+			_ => None,
+		})
+		.unwrap();
+	assert!(matches!(admin.vis, syn::Visibility::Inherited));
+	fn mentions(tree: &syn::UseTree, name: &str) -> bool {
+		match tree {
+			syn::UseTree::Path(p) => p.ident == name || mentions(&p.tree, name),
+			syn::UseTree::Name(n) => n.ident == name,
+			syn::UseTree::Rename(r) => r.ident == name,
+			syn::UseTree::Group(g) => g.items.iter().any(|t| mentions(t, name)),
+			syn::UseTree::Glob(_) => false,
+		}
+	}
+	assert!(
+		!parsed
+			.items
+			.iter()
+			.any(|i| matches!(i, syn::Item::Use(u) if mentions(&u.tree, "admin")))
+	);
+	let module = syn::parse_file(&fs::read_to_string(root.join("admin/mod.rs")).unwrap()).unwrap();
+	let mut children = Vec::new();
+	for item in module.items {
+		match item {
+			syn::Item::Mod(m) if m.ident == "tests" => assert!(m.attrs.iter().any(|a| matches!(&a.meta,syn::Meta::List(m) if m.path.is_ident("cfg") && m.tokens.to_string()=="test"))),
+			// Declarative children: pub only within the private admin parent.
+			syn::Item::Mod(m) if m.content.is_none() && matches!(m.vis, syn::Visibility::Public(_)) => children.push(m.ident.to_string()),
+			_ => panic!("admin mod.rs must be declarative"),
+		}
+	}
+	children.sort();
+	assert_eq!(children, ["errors", "key", "manifest"]);
+	let mut entrypoints = Vec::new();
+	for name in ["errors.rs", "key.rs", "manifest.rs"] {
+		let text = fs::read_to_string(root.join("admin").join(name)).unwrap();
+		assert!(
+			no_admin_authority(text.parse().unwrap()),
+			"{name}: prohibited token"
+		);
+		entrypoints.extend(
+			admin_items(&syn::parse_file(&text).unwrap())
+				.unwrap_or_else(|| panic!("{name}: widened or producer item")),
+		);
+	}
+	entrypoints.sort();
+	assert_eq!(
+		entrypoints,
+		[
+			"admin_manifest_digest2",
+			"check_admin_manifest_digest2",
+			"check_enrollable_admin_key2",
+			"decode",
+			"encode"
+		]
+	);
+}
+#[test]
+fn admin_guard_negative_examples_reject_widening_constructors_signing_and_io() {
+	for text in [
+		"fn install() -> TrustedView2 { todo!() }",
+		"fn read(p: &str) { std::fs::read(p).unwrap(); }",
+		"async fn fetch() { tokio::spawn(async {}); }",
+		"fn sign() { SigningKey::from_bytes(&k).sign(b); }",
+		"fn pin(c: &Command2) {}",
+		"#[derive(serde::Serialize)] struct AdminManifest2;",
+	] {
+		assert!(!no_admin_authority(text.parse().unwrap()), "{text}");
+	}
+	for text in [
+		"pub fn decode() {}",
+		"pub(crate) fn decode() {}",
+		"pub(in crate::storage::mutation_visibility) fn decode() {}",
+		"pub(in crate::storage::mutation_visibility::root2) struct AdminPin2;",
+		"impl Default for AdminManifest2 { fn default() -> Self { todo!() } }",
+		"impl AdminManifest2 { pub fn widen() {} }",
+		"pub use super::manifest::AdminManifest2;",
+		"pub(in crate::storage::mutation_visibility::root2) trait Provider {}",
+	] {
+		assert!(
+			admin_items(&syn::parse_file(text).unwrap()).is_none(),
+			"{text}"
+		);
+	}
+	let ok = "pub(in crate::storage::mutation_visibility::root2) fn decode(b: &[u8]) -> AdminResult2<()> { Ok(()) }";
+	assert!(no_admin_authority(ok.parse().unwrap()));
+	assert_eq!(
+		admin_items(&syn::parse_file(ok).unwrap()),
+		Some(vec!["decode".to_string()])
+	);
+}
