@@ -277,6 +277,20 @@ fn caps_refuse_appends_but_not_retries_or_no_ops() {
 		decide2(&log, &op(0x42), &OwnerRequest2::Retire { identity: id2 }),
 		full
 	);
+	// A Bound root at the same cap: the identical approval is still a no-op; Retire is LogFull.
+	let mut bound = events(2);
+	for seq in 3..=ORDINARY_EVENTS2 {
+		bound.extend(encoded(&repair_at(seq, seq)));
+	}
+	assert_eq!(fold_events2(&bound).unwrap().last_seq, ORDINARY_EVENTS2);
+	assert_eq!(
+		decide2(&bound, &op(0x44), &approve(id1, approved_observation())),
+		Decision2::NoOp(RootState2::Bound)
+	);
+	assert_eq!(
+		decide2(&bound, &op(0x44), &OwnerRequest2::Retire { identity: id1 }),
+		full
+	);
 	let mut m = manifest_of("reserve_second");
 	m.generation = [0x51; 16];
 	m.cluster = [0x52; 16];
