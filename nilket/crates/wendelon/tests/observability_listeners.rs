@@ -14,7 +14,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 use uuid::Uuid;
 use wendelon::audit::{AuditEvent, AuditSink, LocalAuditSink};
-use wendelon::consensus::{RevokeActorKey, raft_storage::RevocationSnapshot};
+use wendelon::consensus::{RetentionStatus, RevokeActorKey, raft_storage::RevocationSnapshot};
 use wendelon::metrics::observability::{
 	self, DrainState, ListenerAddresses, ObservabilityHandles, ReadinessReporter, ReadinessSnapshot,
 };
@@ -80,6 +80,7 @@ async fn listeners_enforce_health_ready_and_metrics_posture() {
 				degraded_reason: None,
 				fips_mode: cfg!(feature = "fips"),
 				fips_self_test_last_ts: cfg!(feature = "fips").then_some(1_700_000_000),
+				control_retention: RetentionStatus::compacting(),
 			},
 		}),
 		1,
@@ -223,6 +224,7 @@ async fn observability_rejects_wrong_ca_domains_and_marks_break_glass_audit() {
 				degraded_reason: None,
 				fips_mode: cfg!(feature = "fips"),
 				fips_self_test_last_ts: cfg!(feature = "fips").then_some(1_700_000_000),
+				control_retention: RetentionStatus::compacting(),
 			},
 		}),
 		1,
@@ -330,6 +332,7 @@ async fn observability_rejects_revoked_operator_certificate() {
 				degraded_reason: None,
 				fips_mode: cfg!(feature = "fips"),
 				fips_self_test_last_ts: cfg!(feature = "fips").then_some(1_700_000_000),
+				control_retention: RetentionStatus::compacting(),
 			},
 		}),
 		1,
@@ -393,6 +396,7 @@ async fn readiness_returns_service_unavailable_when_audit_lag_is_non_zero() {
 				degraded_reason: Some("AuditLagExceeded".to_string()),
 				fips_mode: cfg!(feature = "fips"),
 				fips_self_test_last_ts: cfg!(feature = "fips").then_some(1_700_000_000),
+				control_retention: RetentionStatus::compacting(),
 			},
 		}),
 		1,
@@ -476,6 +480,7 @@ async fn observability_metrics_fail_closed_when_local_audit_sink_rejects() {
 				degraded_reason: None,
 				fips_mode: cfg!(feature = "fips"),
 				fips_self_test_last_ts: cfg!(feature = "fips").then_some(1_700_000_000),
+				control_retention: RetentionStatus::compacting(),
 			},
 		}),
 		1,

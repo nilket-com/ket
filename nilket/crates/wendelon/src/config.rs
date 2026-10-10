@@ -180,6 +180,8 @@ struct RawStorageConfig {
 	#[serde(default)]
 	lsm_compaction_paused: bool,
 	#[serde(default)]
+	control_retention: Option<String>,
+	#[serde(default)]
 	mvcc_retention_paused: bool,
 	#[serde(default)]
 	l2_column_fetch: RawL2ColumnFetchConfig,
@@ -907,6 +909,9 @@ impl RawConfig {
 		};
 
 		let slab_max_bytes = self.storage.slab_max_bytes;
+		let control_retention =
+			crate::consensus::ControlRetention::parse(self.storage.control_retention.as_deref())
+				.map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
 		let l2_column_fetch = self.storage.l2_column_fetch.into_runtime_config()?;
 		let row_group_writer = self.storage.row_group_writer.into_runtime_config()?;
 		let l2_row_group_fetch = self.storage.l2_row_group_fetch.into_runtime_config()?;
@@ -935,6 +940,7 @@ impl RawConfig {
 			l2: None,
 			tiering: crate::storage::SweeperConfig::default(),
 			lsm_compaction_paused: self.storage.lsm_compaction_paused,
+			control_retention,
 			mvcc_retention_paused: self.storage.mvcc_retention_paused,
 			rehydration: crate::storage::manager::RehydrationPolicy::default(),
 			l2_column_fetch,

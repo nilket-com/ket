@@ -46,6 +46,7 @@ use crate::consensus::raft_storage::{
 	CheckpointCoordinator, DurableBootstrapMode, RevocationSnapshot, WendelonLogStore,
 	WendelonStateMachine,
 };
+use crate::consensus::retention::{ControlRetention, RetentionGuard};
 use crate::consensus::{AdvanceEpochRecord, WendelonRaft, WendelonRequest, WendelonResponse};
 use crate::crypto::{CryptoCacheConfig, CryptoManager, RootKekProviderConfig};
 use crate::integration::compute::{
@@ -115,7 +116,7 @@ use crate::storage::{
 	RaftCommitter, SlabSweeper, SweeperConfig, TierCommitter,
 };
 use async_trait::async_trait;
-use openraft::{BasicNode, Config as OpenRaftConfig};
+use openraft::BasicNode;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Error, ErrorKind};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -222,6 +223,10 @@ pub struct NodeBootstrapConfig {
 	/// A paused service keeps its task alive but starts no new jobs
 	/// until resumed through the exposed service control.
 	pub lsm_compaction_paused: bool,
+	/// Control log retention. `Compacting` is openraft's default policy;
+	/// `Full` retains the Control log from genesis. See
+	/// [`crate::consensus::retention`].
+	pub control_retention: ControlRetention,
 	/// Node-local maintenance switch for physical MVCC retention reclaim.
 	/// Skips ONLY the reclaim pass inside the migration sweeper: migrations
 	/// and tombstoned-range reclaim still run, and read-floor semantics are
@@ -309,6 +314,7 @@ impl NodeBootstrapConfig {
 			l2: None,
 			tiering: SweeperConfig::default(),
 			lsm_compaction_paused: false,
+			control_retention: ControlRetention::Compacting,
 			mvcc_retention_paused: false,
 			rehydration: RehydrationPolicy::default(),
 			l2_column_fetch: L2ColumnFetchConfig::default(),
@@ -680,6 +686,7 @@ pub struct WendelonNode {
 	pub audit_sink: Arc<dyn AuditSink>,
 	pub audit_materialization: Arc<AuditMaterializationTracker>,
 	restore_validation: watch::Receiver<RestoreValidationStatus>,
+	retention: Arc<RetentionGuard>,
 	clock_drift_events: watch::Receiver<Option<ClockDriftEvent>>,
 	transport_servers: Vec<NodeTransportServer>,
 	pub handles: NodeHandles,
@@ -1443,8 +1450,15 @@ impl WendelonNode {
 
 		// 4. Durable Raft storage + recovered state machine.
 		let (wal_path, vote_path, snapshot_path) = control_artifact_paths(&cfg.data_dir);
-		let log_store =
-			WendelonLogStore::open(&wal_path, &vote_path, &snapshot_path, wal_io.clone()).await?;
+		let retention = RetentionGuard::new(cfg.control_retention);
+		let log_store = WendelonLogStore::open_with_retention(
+			&wal_path,
+			&vote_path,
+			&snapshot_path,
+			wal_io.clone(),
+			retention.clone(),
+		)
+		.await?;
 		let bootstrap_mode = log_store.bootstrap_mode().await;
 		let checkpoint_coordinator = CheckpointCoordinator::new(log_store.clone());
 		let tier_observer = Arc::new(ManagerTierObserver::new(slab.clone()));
@@ -1587,17 +1601,15 @@ impl WendelonNode {
 		// 9. openraft engine. `validate()` pins heartbeat / election
 		//    timeouts against `Config`'s sanity checks.
 		let raft_config = Arc::new(
-			OpenRaftConfig {
-				cluster_name: "wendelon".into(),
-				..Default::default()
-			}
-			.validate()
-			.map_err(|e| {
-				Error::new(
-					ErrorKind::InvalidInput,
-					format!("openraft config invalid: {e}"),
-				)
-			})?,
+			cfg.control_retention
+				.openraft_config("wendelon")
+				.validate()
+				.map_err(|e| {
+					Error::new(
+						ErrorKind::InvalidInput,
+						format!("openraft config invalid: {e}"),
+					)
+				})?,
 		);
 		let raft = WendelonRaft::new(
 			cfg.node_id,
@@ -1657,7 +1669,7 @@ impl WendelonNode {
 			.with_lease_gate(true),
 		);
 		let raft_server = Arc::new(
-			WendelonRaftInternalServer::new(raft.clone(), pool.clone())
+			WendelonRaftInternalServer::new(raft.clone(), pool.clone(), retention.clone())
 				.with_tracker(tracker.clone()),
 		);
 		let control_server = Arc::new(
@@ -1961,6 +1973,7 @@ impl WendelonNode {
 			audit_sink,
 			audit_materialization,
 			restore_validation: restore_validation_rx,
+			retention,
 			clock_drift_events: clock_drift_rx,
 			transport_servers,
 			handles: NodeHandles {
@@ -2101,7 +2114,13 @@ impl WendelonNode {
 			lifecycle: self.lifecycle.clone(),
 			audit_materialization: self.audit_materialization.clone(),
 			restore_validation: self.restore_validation.clone(),
+			retention: self.retention.clone(),
 		}
+	}
+
+	/// This node's Control log retention guard.
+	pub fn retention(&self) -> &Arc<RetentionGuard> {
+		&self.retention
 	}
 }
 
@@ -2114,6 +2133,7 @@ pub struct NodeReadinessView {
 	lifecycle: ServerLifecycle,
 	audit_materialization: Arc<AuditMaterializationTracker>,
 	restore_validation: watch::Receiver<RestoreValidationStatus>,
+	retention: Arc<RetentionGuard>,
 }
 
 #[async_trait]
@@ -2150,6 +2170,7 @@ impl ReadinessReporter for NodeReadinessView {
 			degraded_reason,
 			fips_mode: fips_build_state.fips_mode,
 			fips_self_test_last_ts: fips_build_state.self_test_last_ts,
+			control_retention: self.retention.status(),
 		}
 	}
 }

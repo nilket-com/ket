@@ -3,6 +3,7 @@ use crate::audit::{
 	LocalSecurityStage, LocalSecuritySurface,
 };
 use crate::consensus::raft_storage::RevocationSnapshot;
+use crate::consensus::retention::RetentionStatus;
 use crate::metrics::global;
 use crate::network::tls::{
 	ActorPermission, ActorTrustRoots, authorize_actor,
@@ -59,6 +60,9 @@ pub struct ReadinessSnapshot {
 	pub degraded_reason: Option<String>,
 	pub fips_mode: bool,
 	pub fips_self_test_last_ts: Option<u64>,
+	/// Control log retention: configured mode, startup history check and
+	/// any latched refusal, reported separately.
+	pub control_retention: RetentionStatus,
 }
 
 #[async_trait]
@@ -533,7 +537,9 @@ async fn write_response<S: AsyncWrite + Unpin>(
 
 impl ReadinessSnapshot {
 	pub fn is_ready(&self) -> bool {
-		self.degraded_reason.is_none() && self.audit_materialization_lag_entries == 0
+		self.degraded_reason.is_none()
+			&& self.audit_materialization_lag_entries == 0
+			&& self.control_retention.violation.is_none()
 	}
 
 	pub fn http_status(&self) -> &'static str {
@@ -586,6 +592,7 @@ impl ReadinessSnapshot {
 				.map(Value::String)
 				.unwrap_or(Value::Null),
 		);
+		body.insert("control_retention".into(), self.control_retention.to_json());
 		#[cfg(feature = "fips")]
 		{
 			body.insert("fips_mode".into(), Value::Bool(self.fips_mode));

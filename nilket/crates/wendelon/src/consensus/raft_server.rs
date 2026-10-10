@@ -21,6 +21,7 @@
 //! `Err` inside.
 
 use crate::consensus::monitor::NodeTracker;
+use crate::consensus::retention::{RetentionGuard, RetentionViolation};
 use crate::consensus::{WendelonRaft, WendelonRequest, WendelonTypeConfig};
 use crate::network::core::{HRFT_MAGIC, HrftFrame};
 use crate::network::pool::BufPool;
@@ -54,14 +55,18 @@ pub struct WendelonRaftInternalServer {
 	/// so the drift monitor and eviction watchdog pick up
 	/// Raft-layer signal in addition to the data-ring.
 	tracker: Option<Arc<NodeTracker>>,
+	/// The node's Control retention guard. Under full retention an inbound
+	/// snapshot is refused here, before decode and before openraft sees it.
+	retention: Arc<RetentionGuard>,
 }
 
 impl WendelonRaftInternalServer {
-	pub fn new(raft: WendelonRaft, pool: Arc<BufPool>) -> Self {
+	pub fn new(raft: WendelonRaft, pool: Arc<BufPool>, retention: Arc<RetentionGuard>) -> Self {
 		Self {
 			raft,
 			pool,
 			tracker: None,
+			retention,
 		}
 	}
 
@@ -82,6 +87,14 @@ impl RaftInternalServer for WendelonRaftInternalServer {
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>> {
 		let msg_type = MsgType(frame.header.msg_type);
+		if msg_type == MsgType::INSTALL_SNAPSHOT_REQ
+			&& self.retention.refuses(RetentionViolation::SnapshotRequest)
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				RetentionViolation::SnapshotRequest,
+			));
+		}
 		let (resp_type, body) = match msg_type {
 			MsgType::APPEND_ENTRIES_REQ => {
 				let req: AppendEntriesRequest<WendelonTypeConfig> = wire::decode(&frame.meta)?;

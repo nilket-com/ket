@@ -445,7 +445,8 @@ fn parse_readiness_view(body: &[u8]) -> Result<ReadinessView, InspectError> {
 	let audit_lag = audit_materialization_lag_entries
 		.as_u64()
 		.expect("required_u64_value returns a JSON u64");
-	let ready = degraded_reason.is_null() && audit_lag == 0;
+	let retention_violated = retention_violation_value(object)?;
+	let ready = degraded_reason.is_null() && audit_lag == 0 && !retention_violated;
 	Ok(ReadinessView {
 		node_id,
 		epoch,
@@ -521,6 +522,21 @@ fn required_string_array_value(
 		Err(InspectError::ParseSnapshot(format!(
 			"field {field} must contain only strings"
 		)))
+	}
+}
+
+/// A server that predates Control retention reporting omits the key; that is
+/// not a violation. A present key must carry a null or string `violation`.
+fn retention_violation_value(object: &Map<String, Value>) -> Result<bool, InspectError> {
+	let Some(retention) = object.get("control_retention") else {
+		return Ok(false);
+	};
+	match retention.get("violation") {
+		Some(Value::Null) => Ok(false),
+		Some(Value::String(_)) => Ok(true),
+		_ => Err(InspectError::ParseSnapshot(
+			"field control_retention.violation must be null or a string".to_string(),
+		)),
 	}
 }
 

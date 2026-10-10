@@ -1,3 +1,4 @@
+use crate::consensus::retention::RetentionViolation;
 use crate::schema::{
 	CdcRejectCode, CompactionLevelIndex, IndexObjectId, RecordBodyCompressionPolicy, TableObjectId,
 	TenantId, WriteStatus,
@@ -2235,6 +2236,33 @@ impl MigrationProxyReadCounters {
 }
 
 #[derive(Default)]
+struct ControlRetentionRefusalCounters {
+	paths: [Counter; 5],
+}
+
+impl ControlRetentionRefusalCounters {
+	fn observe(&self, path: RetentionViolation) {
+		self.paths[path as usize - 1].inc();
+	}
+
+	fn render(&self, out: &mut String) {
+		render_counter_family_header(
+			out,
+			"wendelon_control_retention_refusals_total",
+			"Snapshot or purge paths refused by full Control retention, by path.",
+		);
+		for path in RetentionViolation::ALL {
+			render_counter_with_labels(
+				out,
+				"wendelon_control_retention_refusals_total",
+				&[("path", path.as_str())],
+				self.paths[path as usize - 1].get(),
+			);
+		}
+	}
+}
+
+#[derive(Default)]
 struct PendingFinalizationReplayCounters {
 	duplicate_replay: Counter,
 	reconciler: Counter,
@@ -2567,6 +2595,9 @@ pub struct MetricsRegistry {
 	drop_reclaim_debts: Gauge,
 	/// ADR 0096: settlements live-applied by this daemon process.
 	drop_reclaim_settlements_total: Counter,
+	control_retention_full: Gauge,
+	control_retention_violated: Gauge,
+	control_retention_refusals: ControlRetentionRefusalCounters,
 	table_query_cancellations: StaticLabelCounters,
 	/// ADR 0091: execution errors reported as typed terminal frames, by
 	/// outcome ("framed" reached the client typed; "unframed" the transport
@@ -2840,6 +2871,9 @@ impl Default for MetricsRegistry {
 			data_ring_write_outcomes: WriteOutcomeCounters::default(),
 			drop_reclaim_debts: Gauge::default(),
 			drop_reclaim_settlements_total: Counter::default(),
+			control_retention_full: Gauge::default(),
+			control_retention_violated: Gauge::default(),
+			control_retention_refusals: ControlRetentionRefusalCounters::default(),
 			data_ring_lease_refresh_passes_total: Counter::default(),
 			data_ring_lease_grants_total: Counter::default(),
 			data_ring_lease_denials_total: Counter::default(),
@@ -3132,6 +3166,18 @@ impl MetricsRegistry {
 
 	pub fn observe_drop_reclaim_settlement(&self) {
 		self.drop_reclaim_settlements_total.inc();
+	}
+
+	pub fn set_control_retention_full(&self, full: bool) {
+		self.control_retention_full.set(u64::from(full));
+	}
+
+	pub fn set_control_retention_violated(&self, violated: bool) {
+		self.control_retention_violated.set(u64::from(violated));
+	}
+
+	pub fn observe_control_retention_refusal(&self, path: RetentionViolation) {
+		self.control_retention_refusals.observe(path);
 	}
 
 	#[cfg(test)]
@@ -4686,6 +4732,19 @@ impl MetricsRegistry {
 				.get(),
 		);
 		self.data_ring_pending_finalization_replay.render(&mut out);
+		render_gauge(
+			&mut out,
+			"wendelon_control_retention_full",
+			"1 when this process runs full Control log retention.",
+			self.control_retention_full.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_control_retention_violated",
+			"1 once full Control retention has refused a snapshot or purge path.",
+			self.control_retention_violated.get(),
+		);
+		self.control_retention_refusals.render(&mut out);
 		self.data_ring_migration_proxy_reads.render(&mut out);
 		self.table_query_cancellations.render(
 			&mut out,

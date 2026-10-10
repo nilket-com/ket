@@ -51,6 +51,9 @@ use crate::audit::{
 	AuditMaterializationTracker, AuditOperation, AuditOutcome, AuditSchema, AuditSink,
 	DataAccessKind, DataAccessPhase, DataAccessSchema,
 };
+use crate::consensus::retention::{
+	self, HistoryCheck, RetentionGuard, RetentionStartError, RetentionViolation,
+};
 use crate::consensus::{
 	AdvanceEpochRecord, CreateTenant, EpochConfig, MigratedRangeTombstone, MigrationComplete,
 	MigrationLedgerEntry, MigrationState, RevokeActorKey, RevokedActorKeyId, SeedMigration,
@@ -393,6 +396,8 @@ pub struct WendelonLogStore {
 	/// this across an append keeps the "await write → await
 	/// fsync → fire callback" sequence coherent.
 	wal_gate: Arc<Mutex<()>>,
+	/// The node's Control retention guard; `None` is `Compacting`.
+	retention: Option<Arc<RetentionGuard>>,
 }
 
 impl WendelonLogStore {
@@ -420,6 +425,7 @@ impl WendelonLogStore {
 				vote_file: None,
 			})),
 			wal_gate: Arc::new(Mutex::new(())),
+			retention: None,
 		}
 	}
 
@@ -470,12 +476,57 @@ impl WendelonLogStore {
 		.await
 	}
 
+	/// [`Self::open`] under the node's retention guard. Under full retention
+	/// the store refuses to open over a history that is not complete from
+	/// index 0, before any byte of the data directory is modified.
+	pub async fn open_with_retention(
+		wal_path: impl AsRef<Path>,
+		vote_path: impl AsRef<Path>,
+		snapshot_path: impl AsRef<Path>,
+		io: IoRingHandle,
+		retention: Arc<RetentionGuard>,
+	) -> std::io::Result<Self> {
+		let file_ops = Arc::new(IoUringFileOps::with_isolated_blocking(
+			io,
+			"wendelon-fs-meta-wal",
+			crate::storage::BlockingIoClass::WalMetadata,
+		)?);
+		Self::open_with_options_and_retention(
+			wal_path,
+			vote_path,
+			snapshot_path,
+			file_ops,
+			WalOptions::default(),
+			Some(retention),
+		)
+		.await
+	}
+
 	async fn open_with_file_ops_and_options(
 		wal_path: impl AsRef<Path>,
 		vote_path: impl AsRef<Path>,
 		snapshot_path: impl AsRef<Path>,
 		file_ops: Arc<dyn AsyncFileOps>,
 		options: WalOptions,
+	) -> std::io::Result<Self> {
+		Self::open_with_options_and_retention(
+			wal_path,
+			vote_path,
+			snapshot_path,
+			file_ops,
+			options,
+			None,
+		)
+		.await
+	}
+
+	async fn open_with_options_and_retention(
+		wal_path: impl AsRef<Path>,
+		vote_path: impl AsRef<Path>,
+		snapshot_path: impl AsRef<Path>,
+		file_ops: Arc<dyn AsyncFileOps>,
+		options: WalOptions,
+		retention: Option<Arc<RetentionGuard>>,
 	) -> std::io::Result<Self> {
 		let options = options.validate()?;
 		let wal_path = wal_path.as_ref();
@@ -490,11 +541,46 @@ impl WendelonLogStore {
 		let artifacts =
 			inspect_artifacts(file_ops.as_ref(), wal_path, vote_path, snapshot_path).await?;
 		let bootstrap_mode = DurableBootstrapMode::from_artifacts(artifacts.any());
+		let full = retention
+			.as_ref()
+			.is_some_and(|guard| guard.mode() == crate::consensus::ControlRetention::Full);
+		if full {
+			// Phase A: read-only, before replay, so these refusals are typed
+			// even where replay would also have refused.
+			let receive_tmp = SnapshotPaths::from_current(snapshot_path.to_path_buf()).receive_tmp;
+			let segments = discover_all_wal_segments(file_ops.as_ref(), wal_path).await?;
+			retention::check_before_replay(
+				file_ops.file_len(snapshot_path).await?.is_some(),
+				file_ops.file_len(&receive_tmp).await?.is_some(),
+				segments
+					.iter()
+					.map(|segment| (segment.start_index, segment.legacy)),
+			)
+			.map_err(RetentionStartError::into_io)?;
+		}
 		let vote = load_vote_state(file_ops.as_ref(), vote_path).await?;
 		let snapshot = load_snapshot_artifact(file_ops.as_ref(), snapshot_path).await?;
 		let replay = replay_wal(file_ops.as_ref(), wal_path, snapshot.as_ref()).await?;
 		let recovery_committed =
 			resolve_recovered_committed(snapshot.as_ref(), &replay.entries, replay.checkpoint)?;
+		let history = if full {
+			// Phase B: read-only, after replay and the committed-pointer
+			// resolution, and before the first mutation below.
+			retention::check_after_replay(
+				artifacts.any(),
+				replay.last_purged.is_some(),
+				replay.entries.keys().copied(),
+				replay
+					.checkpoint
+					.map_or(0, |checkpoint| checkpoint.commit_index),
+			)
+			.map_err(RetentionStartError::into_io)?
+		} else {
+			HistoryCheck::NotChecked
+		};
+		if let Some(guard) = &retention {
+			guard.record_history(history);
+		}
 		let wal_file = if replay.last_segment_needs_truncate {
 			let last = replay.wal_segments.last().ok_or_else(|| {
 				Error::new(
@@ -541,7 +627,33 @@ impl WendelonLogStore {
 				vote_file: Some(vote_file),
 			})),
 			wal_gate: Arc::new(Mutex::new(())),
+			retention,
 		})
+	}
+
+	/// Test seam for the retention suite: a store over `dir` with blocking
+	/// file I/O and a small segment size, under `retention`.
+	#[cfg(test)]
+	pub(crate) async fn open_for_retention_test(
+		dir: &Path,
+		segment_bytes: u64,
+		retention: Option<Arc<RetentionGuard>>,
+	) -> std::io::Result<Self> {
+		Self::open_with_options_and_retention(
+			dir.join("control.wal"),
+			dir.join("vote.wnd"),
+			dir.join("snapshot.wnd"),
+			Arc::new(crate::storage::BlockingFileOps),
+			WalOptions { segment_bytes },
+			retention,
+		)
+		.await
+	}
+
+	/// The file name a WAL segment starting at `start_index` has in `dir`.
+	#[cfg(test)]
+	pub(crate) fn segment_path_for_retention_test(dir: &Path, start_index: u64) -> PathBuf {
+		wal_segment_path(&dir.join("control.wal"), start_index).unwrap()
 	}
 
 	pub async fn bootstrap_mode(&self) -> DurableBootstrapMode {
@@ -699,7 +811,12 @@ impl WendelonLogStore {
 				snapshot_runtime,
 			)
 		};
-		WendelonStateMachine::from_recovery(snapshot, entries, checkpoint, snapshot_runtime)
+		let state_machine =
+			WendelonStateMachine::from_recovery(snapshot, entries, checkpoint, snapshot_runtime)?;
+		Ok(match &self.retention {
+			Some(guard) => state_machine.with_retention_guard(guard.clone()),
+			None => state_machine,
+		})
 	}
 
 	pub async fn export_backup(
@@ -1269,6 +1386,11 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 	}
 
 	async fn purge(&mut self, log_id: LogId<u32>) -> Result<(), StorageError<u32>> {
+		if retention::refuses(&self.retention, RetentionViolation::Purge) {
+			return Err(
+				StorageIOError::write_logs(AnyError::new(&RetentionViolation::Purge)).into(),
+			);
+		}
 		let _gate = self.wal_gate.lock().await;
 		let (file_ops, mut wal_segments) = {
 			let guard = self.inner.read().await;
@@ -2170,6 +2292,8 @@ pub struct WendelonStateMachine {
 	observability_metrics: &'static MetricsRegistry,
 	/// Non-blocking live feed of committed finalization markers.
 	finalization_events: broadcast::Sender<FinalizationMarker>,
+	/// The node's Control retention guard; `None` is `Compacting`.
+	retention: Option<Arc<RetentionGuard>>,
 }
 
 impl WendelonStateMachine {
@@ -2195,6 +2319,7 @@ impl WendelonStateMachine {
 			observability_node_id: None,
 			observability_metrics,
 			finalization_events,
+			retention: None,
 		}
 	}
 
@@ -2293,6 +2418,7 @@ impl WendelonStateMachine {
 			observability_node_id: None,
 			observability_metrics,
 			finalization_events,
+			retention: None,
 		})
 	}
 
@@ -2340,6 +2466,13 @@ impl WendelonStateMachine {
 
 	pub fn with_observability_node_id(mut self, local_node: SchemaNodeId) -> Self {
 		self.observability_node_id = Some(local_node);
+		self
+	}
+
+	/// Attaches the node's Control retention guard. Without one the state
+	/// machine and its snapshot builder behave as `Compacting`.
+	pub fn with_retention_guard(mut self, retention: Arc<RetentionGuard>) -> Self {
+		self.retention = Some(retention);
 		self
 	}
 
@@ -2715,12 +2848,20 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 			inner: self.inner.clone(),
 			snapshot_runtime: self.snapshot_runtime.clone(),
 			checkpoint_observer: self.checkpoint_observer.clone(),
+			retention: self.retention.clone(),
 		}
 	}
 
 	async fn begin_receiving_snapshot(
 		&mut self,
 	) -> Result<Box<SnapshotDataFile>, StorageError<u32>> {
+		if retention::refuses(&self.retention, RetentionViolation::SnapshotReceive) {
+			return Err(StorageIOError::write_snapshot(
+				None,
+				AnyError::new(&RetentionViolation::SnapshotReceive),
+			)
+			.into());
+		}
 		ensure_snapshot_parent_dir(
 			self.snapshot_runtime.file_ops.as_ref(),
 			&self.snapshot_runtime.paths.receive_tmp,
@@ -2741,6 +2882,13 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		meta: &SnapshotMeta<u32, BasicNode>,
 		mut snapshot: Box<SnapshotDataFile>,
 	) -> Result<(), StorageError<u32>> {
+		if retention::refuses(&self.retention, RetentionViolation::SnapshotInstall) {
+			return Err(StorageIOError::write_snapshot(
+				Some(meta.signature()),
+				AnyError::new(&RetentionViolation::SnapshotInstall),
+			)
+			.into());
+		}
 		let receive_path = if snapshot.path() == self.snapshot_runtime.paths.receive_tmp.as_path() {
 			sync_snapshot_handle(
 				snapshot.file_ops.clone(),
@@ -5783,6 +5931,7 @@ pub struct WendelonSnapshotBuilder {
 	inner: Arc<RwLock<SmInner>>,
 	snapshot_runtime: SnapshotRuntime,
 	checkpoint_observer: Option<Arc<dyn CheckpointObserver>>,
+	retention: Option<Arc<RetentionGuard>>,
 }
 
 impl Default for WendelonSnapshotBuilder {
@@ -5791,6 +5940,7 @@ impl Default for WendelonSnapshotBuilder {
 			inner: Arc::new(RwLock::new(SmInner::default())),
 			snapshot_runtime: SnapshotRuntime::ephemeral(),
 			checkpoint_observer: None,
+			retention: None,
 		}
 	}
 }
@@ -5803,6 +5953,13 @@ impl WendelonSnapshotBuilder {
 
 impl RaftSnapshotBuilder<WendelonTypeConfig> for WendelonSnapshotBuilder {
 	async fn build_snapshot(&mut self) -> Result<Snapshot<WendelonTypeConfig>, StorageError<u32>> {
+		if retention::refuses(&self.retention, RetentionViolation::SnapshotBuild) {
+			return Err(StorageIOError::write_snapshot(
+				None,
+				AnyError::new(&RetentionViolation::SnapshotBuild),
+			)
+			.into());
+		}
 		let (state, meta, pending_checkpoint) = {
 			let mut guard = self.inner.write().await;
 			guard.snapshot_seq += 1;

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 use wendelon::audit::{AuditSink, LocalAuditSink};
+use wendelon::consensus::RetentionStatus;
 use wendelon::metrics::observability::{
 	self, DrainState, ListenerAddresses, ObservabilityHandles, ReadinessReporter, ReadinessSnapshot,
 };
@@ -96,6 +97,7 @@ fn ready_snapshot() -> ReadinessSnapshot {
 		degraded_reason: None,
 		fips_mode: cfg!(feature = "fips"),
 		fips_self_test_last_ts: cfg!(feature = "fips").then_some(1_710_000_000),
+		control_retention: RetentionStatus::compacting(),
 	}
 }
 

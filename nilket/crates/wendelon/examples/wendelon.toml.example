@@ -23,6 +23,10 @@ data_dir = "{{DATA_DIR}}"
 slab_max_bytes = {{SLAB_MAX_BYTES}}
 # Node-local ADR 055 maintenance switch. Leave false for ordinary nodes.
 lsm_compaction_paused = false
+# Control log retention: "compacting" (default) snapshots and purges the
+# Control log; "full" retains it from genesis and refuses to start over a
+# purged history. Every node of a deployment must use the same value.
+# control_retention = "compacting"
 
 # ADR 044 L2 columnar fetch is node-local and disabled by default
 # until stabilization benchmarks pass.
