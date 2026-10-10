@@ -5,6 +5,7 @@ mod admin_statement;
 mod admission_command;
 mod admission_gate;
 mod admission_registry;
+mod admission_reserve;
 mod entry_identity;
 mod g1c_roundtrip;
 mod goldens;

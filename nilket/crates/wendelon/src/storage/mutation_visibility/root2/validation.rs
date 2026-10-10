@@ -1,6 +1,8 @@
+use super::admin::manifest::ADMIN_MANIFEST_BYTES2;
+use super::admin_statement::{AdmissionNamespace2, PermissionKey2};
 use super::admission_registry::{
-	PERMISSION_CHARGE2, PERMISSION_SECTION_BYTES2, RegistryError2, permission_limits2,
-	validate_permissions2,
+	PERMISSION_CHARGE2, PERMISSION_SECTION_BYTES2, RegistryError2, encode_permission_key2,
+	permission_limits2, validate_permissions2,
 };
 use super::{codec::*, persistent::Map, types::*};
 use std::collections::BTreeSet;
@@ -243,6 +245,41 @@ fn permission_error(e: RegistryError2) -> RootError2 {
 		RegistryError2::Overflow => RootError2::Overflow,
 		_ => RootError2::RootInvariant,
 	}
+}
+/// Admission eligibility of a Reserve at entry `at` on an admission-governed root (Bootstrap
+/// commitment length 137, an immutable marker, not proof of a valid administrator). Returns the
+/// denial (18: no permission active before `at`; 19: revoked at or before `at`, with its coordinate)
+/// or None; ungoverned roots have no requirement. Local preconditions only: a canonical claim and an
+/// already-validated permission map and authority relations. It is one keyed lookup, and it is a
+/// part of the parent-admission invariant `validate_state` checks, not an assumption of it.
+pub(super) fn admission_permission(
+	s: &State2,
+	c: &ClaimProjection2,
+	at: u64,
+) -> Result2<Option<(u16, Option<Log2>)>> {
+	if s.control_len != ADMIN_MANIFEST_BYTES2 as u64 {
+		return Ok(None);
+	}
+	let id = c.manifest.identity;
+	let key = PermissionKey2 {
+		authority: c.authority,
+		namespace: AdmissionNamespace2 {
+			generation: id.generation,
+			tenant: id.tenant,
+			scope: id.scope,
+			table: id.table,
+			schema: id.schema_generation,
+		},
+	};
+	let key = encode_permission_key2(&key).map_err(|_| RootError2::Codec)?;
+	Ok(match s.permissions.get(&key) {
+		None => Some((18, None)),
+		Some(p) if p.enrolled.index >= at => Some((18, None)),
+		Some(p) => match p.revoked {
+			Some(r) if r.index <= at => Some((19, Some(r))),
+			_ => None,
+		},
+	})
 }
 pub(super) fn usage(s: &State2) -> Result2<Usage2> {
 	let held = s.parents.values().try_fold(0usize, |n, p| {
@@ -618,6 +655,12 @@ pub(super) fn validate_state(s: &State2) -> Result2<()> {
 			)
 			.ok_or(RootError2::RootInvariant)?;
 		if selector.enrolled.index >= p.reservation.index {
+			return Err(RootError2::RootInvariant);
+		}
+		if admission_permission(s, &p.claim, p.reservation.index)
+			.map_err(|_| RootError2::RootInvariant)?
+			.is_some()
+		{
 			return Err(RootError2::RootInvariant);
 		}
 		for plan in &c.plans {

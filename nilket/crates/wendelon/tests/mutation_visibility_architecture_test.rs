@@ -2136,3 +2136,79 @@ fn admission_gate_call_graph_is_single_and_dormant() {
 	assert!(!reducer.contains("admission_registry") && !reducer.contains("reduce_admission"));
 	assert!(!reducer.contains("check_admin_statement2"));
 }
+// G1d-4: the Reserve permission check has exactly two production callers (apply_reserve and the
+// full validator), the reducer still never names the registry, and trigger's body is unchanged
+// from 57df2290 (a later permission revocation creates no terminal refusal).
+const TRIGGER_BODY_57DF2290: &str = r##"{
+	let (claim, _, _, _) = p.parts();
+	let mut candidates = Vec::new();
+	let g = s
+		.lineages
+		.get(&claim.original.lineage)
+		.ok_or(RootError2::RootInvariant)?;
+	if let Some(c) = g.closure {
+		candidates.push((
+			match c.cause {
+				1 => 2,
+				2 => 3,
+				3 => 1,
+				_ => return Err(RootError2::RootInvariant),
+			},
+			c.log,
+		))
+	}
+	if let Some(a) = s
+		.authorities
+		.get(&authority_key(claim.authority)?)
+		.and_then(|a| a.revoked)
+	{
+		candidates.push((4, a))
+	}
+	candidates.sort_by_key(|(cause, l)| (l.index, *cause));
+	Ok(candidates.first().copied())
+}"##;
+#[test]
+fn admission_reserve_check_is_exactly_twice_and_trigger_is_unchanged() {
+	let root =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
+	let validation = fs::read_to_string(root.join("validation.rs")).unwrap();
+	let reducer = fs::read_to_string(root.join("reducer.rs")).unwrap();
+	assert_eq!(fn_body(&validation, "trigger"), TRIGGER_BODY_57DF2290);
+	assert_eq!(calls(&reducer, "admission_permission"), 1);
+	assert_eq!(
+		calls(fn_body(&reducer, "apply_reserve"), "admission_permission"),
+		1
+	);
+	assert_eq!(calls(&validation, "admission_permission"), 1);
+	assert_eq!(
+		calls(
+			fn_body(&validation, "validate_state"),
+			"admission_permission"
+		),
+		1
+	);
+	assert!(!reducer.contains("admission_registry"));
+	fn walk(dir: PathBuf, tests: &PathBuf, out: &mut Vec<PathBuf>) {
+		for e in fs::read_dir(dir).unwrap() {
+			let p = e.unwrap().path();
+			if p.is_dir() {
+				if p != *tests {
+					walk(p, tests, out)
+				}
+			} else if p.extension().is_some_and(|x| x == "rs") {
+				out.push(p)
+			}
+		}
+	}
+	let mut files = Vec::new();
+	walk(
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+		&root.join("tests"),
+		&mut files,
+	);
+	let total: usize = files
+		.iter()
+		.map(|f| calls(&fs::read_to_string(f).unwrap(), "admission_permission"))
+		.sum();
+	assert_eq!(total, 2, "exactly two production callers");
+}

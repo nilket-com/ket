@@ -339,8 +339,9 @@ fn permission_record(
 	.map_err(|_| RootError2::Codec)?;
 	Ok(())
 }
-// Contextual checks: key generation and the outcome's relation to the processed entry.
-fn permission_relation(v: &ApplyResult2, g: [u8; 16], p: Log2) -> Result2<()> {
+// Contextual checks: a permission's key generation and outcome, and a revoked-permission denial's
+// reference, against the processed entry.
+fn result_relation(v: &ApplyResult2, g: [u8; 16], p: Log2) -> Result2<()> {
 	if let ApplyResult2::Permission {
 		outcome,
 		key,
@@ -360,7 +361,30 @@ fn permission_relation(v: &ApplyResult2, g: [u8; 16], p: Log2) -> Result2<()> {
 			return Err(RootError2::Codec);
 		}
 	}
+	if let ApplyResult2::Denied {
+		reason: 19,
+		reference: Some(r),
+	} = v
+	{
+		if r.index > p.index {
+			return Err(RootError2::Codec);
+		}
+	}
 	Ok(())
+}
+// Denied reasons 1..=19; 18 (no permission) carries no reference, 19 (revoked) carries one.
+fn denied_shape(reason: u16, reference: Option<Log2>) -> Result2<()> {
+	let shaped = match reason {
+		18 => reference.is_none(),
+		19 => reference.is_some(),
+		1..=17 => true,
+		_ => false,
+	};
+	if shaped {
+		Ok(())
+	} else {
+		Err(RootError2::Codec)
+	}
 }
 #[derive(Clone, PartialEq, Eq)]
 pub enum ApplyResult2 {
@@ -400,7 +424,7 @@ impl ApplyResult2 {
 	pub fn encode(&self, g: [u8; 16], c: [u8; 16], processed: Log2) -> Result2<Vec<u8>> {
 		nonzero(g)?;
 		nonzero(c)?;
-		permission_relation(self, g, processed)?;
+		result_relation(self, g, processed)?;
 		let mut b = Vec::new();
 		b.extend(g);
 		b.extend(c);
@@ -417,7 +441,7 @@ impl ApplyResult2 {
 		let l = r.log()?;
 		let v = Self::read(&mut r)?;
 		r.end()?;
-		permission_relation(&v, g, l)?;
+		result_relation(&v, g, l)?;
 		Ok((g, c, l, v))
 	}
 }
@@ -463,9 +487,7 @@ impl Wire2 for ApplyResult2 {
 				}
 			}
 			Self::Denied { reason, reference } => {
-				if !(1..=17).contains(reason) {
-					return Err(RootError2::Codec);
-				}
+				denied_shape(*reason, *reference)?;
 				b.push(6);
 				b.extend(reason.to_le_bytes());
 				optional_log(b, *reference)?
@@ -535,13 +557,12 @@ impl Wire2 for ApplyResult2 {
 			}
 			6 => {
 				let reason = r.u16()?;
-				if !(1..=17).contains(&reason) {
+				if !(1..=19).contains(&reason) {
 					return Err(RootError2::Codec);
 				}
-				Self::Denied {
-					reason,
-					reference: r.optional_log()?,
-				}
+				let reference = r.optional_log()?;
+				denied_shape(reason, reference)?;
+				Self::Denied { reason, reference }
 			}
 			7 => {
 				let n = r.u8()?;

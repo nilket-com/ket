@@ -479,6 +479,9 @@ fn apply_reserve(
 	) {
 		return Ok(denied(9, None));
 	}
+	if let Some((reason, reference)) = admission_permission(s, c, l.index)? {
+		return Ok(denied(reason, reference));
+	}
 	let held = c.held_bytes()?;
 	let u = s.derived.usage;
 	if u.parents >= limits.slots
