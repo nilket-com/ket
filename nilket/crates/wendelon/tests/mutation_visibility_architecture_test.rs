@@ -1111,7 +1111,8 @@ fn origin_layer_builds_no_trusted_input_and_promotes_no_bytes() {
 			"decode",
 			"empty_authority2",
 			"encode",
-			"encode_authority2"
+			"encode_authority2",
+			"root_and_origin2"
 		]
 	);
 	// The one state.rs accessor returns exactly four scalars.
@@ -1568,6 +1569,94 @@ fn provisioning_owner_log_is_std_only_with_eight_methods() {
 			"repair_check",
 			"repair_fresh",
 			"repair_resume"
+		]
+	);
+}
+// Derived administrator view: pure, no I/O, clock or unsafe; it constructs no trusted input, root or
+// authority state and mutates nothing; exactly six root2-private entrypoints. Syntax only.
+#[test]
+fn admin_install_is_a_pure_derivation() {
+	let root =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
+	let text = fs::read_to_string(root.join("admin_install.rs")).unwrap();
+	fn forbidden(tokens: proc_macro2::TokenStream) -> Option<String> {
+		let ts: Vec<_> = tokens.into_iter().collect();
+		for (i, t) in ts.iter().enumerate() {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => {
+					let n = id.to_string();
+					if [
+						"unsafe",
+						"mut",
+						"fs",
+						"io",
+						"net",
+						"tokio",
+						"env",
+						"Instant",
+						"SystemTime",
+						"fixture",
+						"unauthorized",
+						"change_fingerprint",
+					]
+					.contains(&n.as_str())
+					{
+						return Some(n);
+					}
+					let next = ts.get(i + 1);
+					let constructs = matches!(next, Some(proc_macro2::TokenTree::Group(g)) if g.delimiter() == proc_macro2::Delimiter::Brace)
+						|| matches!(next, Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == ':');
+					if [
+						"Root2",
+						"UnverifiedRoot2",
+						"TrustedEntry2",
+						"VerifiedCommand2",
+						"CommittedEntry2",
+						"TrustedView2",
+						"MutationAuthorityState2",
+					]
+					.contains(&n.as_str())
+						&& constructs
+					{
+						return Some(n);
+					}
+				}
+				proc_macro2::TokenTree::Group(g) => {
+					if let Some(n) = forbidden(g.stream()) {
+						return Some(n);
+					}
+				}
+				_ => {}
+			}
+		}
+		None
+	}
+	assert_eq!(
+		forbidden(without_test_items(text.parse().unwrap())),
+		None,
+		"admin_install.rs: prohibited token"
+	);
+	let mut entrypoints = Vec::new();
+	for item in syn::parse_file(&text).unwrap().items {
+		match item {
+			syn::Item::Fn(f) if root2_scoped(&f.vis) => entrypoints.push(f.sig.ident.to_string()),
+			syn::Item::Fn(f) => assert!(matches!(f.vis, syn::Visibility::Inherited)),
+			syn::Item::Impl(_) | syn::Item::Trait(_) | syn::Item::Static(_) | syn::Item::Mod(_) => {
+				panic!("admin_install.rs: no impls, traits, statics or modules")
+			}
+			_ => {}
+		}
+	}
+	entrypoints.sort();
+	assert_eq!(
+		entrypoints,
+		[
+			"admin_context2",
+			"admin_id2",
+			"admin_installed_at2",
+			"admin_key2",
+			"admin_namespace2",
+			"install_admin2"
 		]
 	);
 }

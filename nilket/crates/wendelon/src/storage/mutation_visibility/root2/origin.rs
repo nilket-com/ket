@@ -1,6 +1,7 @@
 //! Dormant pre-root and origin layer over Root2: covers the committed log from its genesis
 //! membership entry through the first Root2 Bootstrap and beyond. Pure transitions over opaque
 //! trusted inputs; decoded bytes never become state (snapshot install is a separate, held step).
+use super::super::redacted_debug;
 use super::codec::{Read2, envelope, open, valid_log};
 use super::command::{ApplyResult2, Command2};
 use super::entry_identity::EntryPosition2;
@@ -115,6 +116,30 @@ fn check_origin(
 	Ok(())
 }
 
+/// Copies of the facts the Bootstrap left in the origin wrapper; they never change afterwards.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) struct OriginFacts2 {
+	pub genesis: Digest2,
+	pub bootstrap_fingerprint: Digest2,
+	pub bootstrap_command: Digest2,
+}
+redacted_debug!(OriginFacts2, "OriginFacts2");
+/// Read-only view of a rooted state: a shared root and copies of its origin facts.
+pub(in crate::storage::mutation_visibility::root2) fn root_and_origin2(
+	state: &MutationAuthorityState2,
+) -> Option<(&Root2, OriginFacts2)> {
+	match &state.inner {
+		StateInner2::Root(root, origin) => Some((
+			root,
+			OriginFacts2 {
+				genesis: origin.genesis,
+				bootstrap_fingerprint: origin.bootstrap_fingerprint,
+				bootstrap_command: origin.bootstrap_command,
+			},
+		)),
+		_ => None,
+	}
+}
 pub(in crate::storage::mutation_visibility::root2) fn empty_authority2() -> MutationAuthorityState2
 {
 	MutationAuthorityState2 {

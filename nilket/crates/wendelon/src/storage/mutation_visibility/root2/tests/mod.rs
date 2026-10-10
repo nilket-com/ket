@@ -1,5 +1,6 @@
 use super::*;
 use super::{codec::*, validation::*};
+mod admin_install;
 mod entry_identity;
 mod goldens;
 mod invariants;
