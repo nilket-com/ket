@@ -1728,3 +1728,99 @@ fn provisioning_replica_read_composes_only_the_accepted_reader() {
 	}
 	assert_eq!(entrypoints, ["read_replica_tuple2"]);
 }
+// Administrator statement authentication: pure std and strict Ed25519 only; zero unsafe, I/O,
+// network, clock or env; no mutation of authority or root state and no trust, root or authority
+// state construction; exactly six root2-private entrypoints. Syntax only, plus source review.
+#[test]
+fn admin_statement_is_pure_authentication() {
+	let text = fs::read_to_string(
+		PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+			.join("src/storage/mutation_visibility/root2/admin_statement.rs"),
+	)
+	.unwrap();
+	fn forbidden(tokens: proc_macro2::TokenStream) -> Option<String> {
+		let ts: Vec<_> = tokens.into_iter().collect();
+		for (i, t) in ts.iter().enumerate() {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => {
+					let n = id.to_string();
+					if [
+						"unsafe",
+						"fs",
+						"io",
+						"net",
+						"tokio",
+						"env",
+						"Instant",
+						"SystemTime",
+						"fixture",
+						"SigningKey",
+					]
+					.contains(&n.as_str())
+					{
+						return Some(n);
+					}
+					let next = ts.get(i + 1);
+					if [
+						"Root2",
+						"UnverifiedRoot2",
+						"TrustedEntry2",
+						"VerifiedCommand2",
+						"CommittedEntry2",
+						"TrustedView2",
+						"MutationAuthorityState2",
+						"State2",
+					]
+					.contains(&n.as_str())
+						&& (matches!(next, Some(proc_macro2::TokenTree::Group(g)) if g.delimiter() == proc_macro2::Delimiter::Brace)
+							|| matches!(next, Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == ':'))
+					{
+						return Some(n);
+					}
+					// `&mut` of authority or root state.
+					if n == "mut"
+						&& i > 0 && matches!(&ts[i - 1], proc_macro2::TokenTree::Punct(p) if p.as_char() == '&')
+						&& matches!(next, Some(proc_macro2::TokenTree::Ident(t)) if ["Root2", "State2", "MutationAuthorityState2"].contains(&t.to_string().as_str()))
+					{
+						return Some("&mut state".into());
+					}
+				}
+				proc_macro2::TokenTree::Group(g) => {
+					if let Some(n) = forbidden(g.stream()) {
+						return Some(n);
+					}
+				}
+				_ => {}
+			}
+		}
+		None
+	}
+	assert_eq!(
+		forbidden(without_test_items(text.parse().unwrap())),
+		None,
+		"admin_statement.rs: prohibited token"
+	);
+	let mut entrypoints = Vec::new();
+	for item in syn::parse_file(&text).unwrap().items {
+		match item {
+			syn::Item::Fn(f) if root2_scoped(&f.vis) => entrypoints.push(f.sig.ident.to_string()),
+			syn::Item::Fn(f) => assert!(matches!(f.vis, syn::Visibility::Inherited)),
+			syn::Item::Impl(_) | syn::Item::Trait(_) | syn::Item::Static(_) | syn::Item::Mod(_) => {
+				panic!("admin_statement.rs: no impls, traits, statics or modules")
+			}
+			_ => {}
+		}
+	}
+	entrypoints.sort();
+	assert_eq!(
+		entrypoints,
+		[
+			"admin_statement_preimage2",
+			"check_admin_statement2",
+			"checked_action2",
+			"checked_context2",
+			"checked_key2",
+			"encode_admin_statement2"
+		]
+	);
+}

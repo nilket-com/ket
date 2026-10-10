@@ -1,6 +1,7 @@
 use super::*;
 use super::{codec::*, validation::*};
 mod admin_install;
+mod admin_statement;
 mod entry_identity;
 mod g1c_roundtrip;
 mod goldens;
