@@ -74,6 +74,11 @@ impl Root2 {
 		if (g, c) != (s.generation, s.cluster) {
 			return Err(RootError2::TrustMismatch);
 		}
+		// Dormant: no issuer gate exists, so an Admission permission command has no result at all,
+		// not even an exact-replay AlreadyProcessed.
+		if let Command2::AdmissionPermission(_) = command {
+			return Err(RootError2::TrustMismatch);
+		}
 		if l.index == s.covered.index {
 			if (l, fp, d) != (s.covered, s.fingerprint, s.command_digest) {
 				return Err(RootError2::TrustMismatch);
@@ -271,6 +276,8 @@ fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Res
 			Ok(ApplyResult2::Registered(l))
 		}
 		Command2::Reserve(claim) => apply_reserve(s, limits, claim, l, v),
+		// Unreachable: `reduce` refuses this command before replay, gap or authorization.
+		Command2::AdmissionPermission(_) => Err(RootError2::TrustMismatch),
 		Command2::Finalize {
 			identity,
 			digest,

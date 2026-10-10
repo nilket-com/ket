@@ -1,4 +1,8 @@
 use super::super::{MutationIdentity, ProofKeyBinding};
+use super::admin_statement::{ADMIN_STATEMENT_BYTES2, inspect_admin_statement2};
+use super::admission_registry::{
+	PermissionRecord2, decode_permission_key2, encode_permission_record2,
+};
 use super::{codec::*, types::*, validation::*};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -48,6 +52,9 @@ pub enum Command2 {
 		cause: u8,
 		anchor: Log2,
 	},
+	/// The exact signed administrator statement. Dormant: `Root2::reduce` refuses it until the
+	/// issuer gate exists.
+	AdmissionPermission([u8; ADMIN_STATEMENT_BYTES2]),
 }
 impl std::fmt::Debug for Command2 {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -65,6 +72,7 @@ impl Command2 {
 		if b.len() > COMMAND_BYTES2 {
 			return Err(RootError2::Limit);
 		}
+		admission_relation(self, generation, cluster)?;
 		Ok(b)
 	}
 	pub fn encode(&self, generation: [u8; 16], cluster: [u8; 16]) -> Result2<Vec<u8>> {
@@ -82,6 +90,7 @@ impl Command2 {
 		nonzero(cluster)?;
 		let command = Self::read(&mut r)?;
 		r.end()?;
+		admission_relation(&command, generation, cluster)?;
 		Ok((generation, cluster, command))
 	}
 	pub fn digest(&self, g: [u8; 16], c: [u8; 16]) -> Result2<Digest2> {
@@ -197,6 +206,11 @@ impl Wire2 for Command2 {
 				b.push(*cause);
 				log(b, *anchor)?
 			}
+			Self::AdmissionPermission(x) => {
+				inspect_admin_statement2(x).map_err(|_| RootError2::Codec)?;
+				b.push(11);
+				b.extend(x)
+			}
 		}
 		Ok(())
 	}
@@ -287,9 +301,66 @@ impl Wire2 for Command2 {
 					anchor: r.log()?,
 				}
 			}
+			11 => {
+				let x: [u8; ADMIN_STATEMENT_BYTES2] = r.array()?;
+				inspect_admin_statement2(&x).map_err(|_| RootError2::Codec)?;
+				Self::AdmissionPermission(x)
+			}
 			_ => return Err(RootError2::Codec),
 		})
 	}
+}
+// The carried statement's context and key namespace must name the envelope's generation/cluster.
+fn admission_relation(c: &Command2, g: [u8; 16], cluster: [u8; 16]) -> Result2<()> {
+	if let Command2::AdmissionPermission(x) = c {
+		let f = inspect_admin_statement2(x).map_err(|_| RootError2::Codec)?;
+		if f.generation != g || f.cluster != cluster || f.key.namespace.generation != g {
+			return Err(RootError2::Codec);
+		}
+	}
+	Ok(())
+}
+// Structural checks of a permission result body: outcome, canonical key and record shape.
+fn permission_record(
+	outcome: u8,
+	key: &[u8; 73],
+	enrolled: Log2,
+	revoked: Option<Log2>,
+) -> Result2<()> {
+	if !(1..=4).contains(&outcome) {
+		return Err(RootError2::Codec);
+	}
+	let key = decode_permission_key2(key).map_err(|_| RootError2::Codec)?;
+	encode_permission_record2(&PermissionRecord2 {
+		key,
+		enrolled,
+		revoked,
+	})
+	.map_err(|_| RootError2::Codec)?;
+	Ok(())
+}
+// Contextual checks: key generation and the outcome's relation to the processed entry.
+fn permission_relation(v: &ApplyResult2, g: [u8; 16], p: Log2) -> Result2<()> {
+	if let ApplyResult2::Permission {
+		outcome,
+		key,
+		enrolled,
+		revoked,
+	} = v
+	{
+		let k = decode_permission_key2(key).map_err(|_| RootError2::Codec)?;
+		let related = match outcome {
+			1 => *enrolled == p && revoked.is_none(),
+			2 => enrolled.index < p.index && revoked.is_none_or(|r| r.index < p.index),
+			3 => *revoked == Some(p) && enrolled.index < p.index,
+			4 => revoked.is_some_and(|r| r.index < p.index),
+			_ => false,
+		};
+		if k.namespace.generation != g || !related {
+			return Err(RootError2::Codec);
+		}
+	}
+	Ok(())
 }
 #[derive(Clone, PartialEq, Eq)]
 pub enum ApplyResult2 {
@@ -312,6 +383,13 @@ pub enum ApplyResult2 {
 	},
 	PendingEvidence(u8),
 	RejectedEvidence(u8),
+	/// Outcome 1-4: Granted, GrantDuplicate, Revoked, RevokeDuplicate; full original coordinates.
+	Permission {
+		outcome: u8,
+		key: [u8; 73],
+		enrolled: Log2,
+		revoked: Option<Log2>,
+	},
 }
 impl std::fmt::Debug for ApplyResult2 {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -322,6 +400,7 @@ impl ApplyResult2 {
 	pub fn encode(&self, g: [u8; 16], c: [u8; 16], processed: Log2) -> Result2<Vec<u8>> {
 		nonzero(g)?;
 		nonzero(c)?;
+		permission_relation(self, g, processed)?;
 		let mut b = Vec::new();
 		b.extend(g);
 		b.extend(c);
@@ -338,6 +417,7 @@ impl ApplyResult2 {
 		let l = r.log()?;
 		let v = Self::read(&mut r)?;
 		r.end()?;
+		permission_relation(&v, g, l)?;
 		Ok((g, c, l, v))
 	}
 }
@@ -402,6 +482,18 @@ impl Wire2 for ApplyResult2 {
 				}
 				b.extend([8, *n])
 			}
+			Self::Permission {
+				outcome,
+				key,
+				enrolled,
+				revoked,
+			} => {
+				permission_record(*outcome, key, *enrolled, *revoked)?;
+				b.extend([9, *outcome]);
+				b.extend(key);
+				log(b, *enrolled)?;
+				optional_log(b, *revoked)?
+			}
 		}
 		Ok(())
 	}
@@ -464,6 +556,19 @@ impl Wire2 for ApplyResult2 {
 					return Err(RootError2::Codec);
 				}
 				Self::RejectedEvidence(n)
+			}
+			9 => {
+				let outcome = r.u8()?;
+				let key: [u8; 73] = r.array()?;
+				let enrolled = r.log()?;
+				let revoked = r.optional_log()?;
+				permission_record(outcome, &key, enrolled, revoked)?;
+				Self::Permission {
+					outcome,
+					key,
+					enrolled,
+					revoked,
+				}
 			}
 			_ => return Err(RootError2::Codec),
 		})

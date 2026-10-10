@@ -236,6 +236,7 @@ fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Res
 			Ok(ApplyResult2::Registered(l))
 		}
 		Command2::Reserve(claim) => apply_reserve(s, limits, claim, l, v),
+		Command2::AdmissionPermission(_) => Err(RootError2::TrustMismatch),
 		Command2::Finalize {
 			identity,
 			digest,

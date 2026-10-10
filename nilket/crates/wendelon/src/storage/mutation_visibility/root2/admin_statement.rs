@@ -68,6 +68,16 @@ pub(in crate::storage::mutation_visibility::root2) struct CheckedStatement2 {
 	context: AdminContext2,
 }
 redacted_debug!(CheckedStatement2, "CheckedStatement2");
+/// Descriptive facts of a structurally valid statement. Not authentication: no context, scope or
+/// signature has been checked, and nothing converts these facts into a `CheckedStatement2`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) struct StatementFacts2 {
+	pub action: AdminAction2,
+	pub key: PermissionKey2,
+	pub generation: [u8; 16],
+	pub cluster: [u8; 16],
+}
+redacted_debug!(StatementFacts2, "StatementFacts2");
 
 struct Parsed {
 	action: AdminAction2,
@@ -272,6 +282,18 @@ pub(in crate::storage::mutation_visibility::root2) fn check_admin_statement2(
 		action: p.action,
 		key: p.key,
 		context: p.context,
+	})
+}
+/// Structural inspection only (steps 1-9); never authorization.
+pub(in crate::storage::mutation_visibility::root2) fn inspect_admin_statement2(
+	bytes: &[u8],
+) -> Result<StatementFacts2, StatementError2> {
+	let p = parse(bytes)?;
+	Ok(StatementFacts2 {
+		action: p.action,
+		key: p.key,
+		generation: p.context.generation,
+		cluster: p.context.cluster,
 	})
 }
 pub(in crate::storage::mutation_visibility::root2) fn checked_action2(

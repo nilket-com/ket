@@ -1820,9 +1820,16 @@ fn admin_statement_is_pure_authentication() {
 			"checked_action2",
 			"checked_context2",
 			"checked_key2",
-			"encode_admin_statement2"
+			"encode_admin_statement2",
+			"inspect_admin_statement2"
 		]
 	);
+	// Inspection facts never become a checked statement: the only literal is the declaration plus
+	// the one inside check_admin_statement2.
+	assert_eq!(text.matches("CheckedStatement2 {").count(), 2);
+	let check = text.split("fn check_admin_statement2(").nth(1).unwrap();
+	let check = check.split("\npub(in").next().unwrap();
+	assert_eq!(check.matches("CheckedStatement2 {").count(), 1);
 }
 // Admission permission registry: pure codecs and semantic transitions only. No impls, traits,
 // statics or modules; no I/O, crypto, trust token, issuer decision or root construction; exactly
@@ -1934,12 +1941,22 @@ fn admission_registry_is_a_pure_registry() {
 	// Root integration (profile 3) may name the registry in state, validation, incremental and
 	// types; the reducer and command codec may not, and no file outside the module calls a
 	// transition (below).
-	for name in ["reducer.rs", "command.rs"] {
+	for name in ["reducer.rs"] {
 		let t = fs::read_to_string(root.join(name)).unwrap();
 		assert!(
 			!t.contains("admission_registry"),
 			"{name} reaches the registry"
 		);
+	}
+	// The command codec may use the key and record codecs only.
+	let command = fs::read_to_string(root.join("command.rs")).unwrap();
+	for f in [
+		"grant_permission2",
+		"revoke_permission2",
+		"validate_permissions2",
+		"apply_permission_delta2",
+	] {
+		assert!(!command.contains(f), "command.rs names {f}");
 	}
 	let state = fs::read_to_string(root.join("state.rs")).unwrap();
 	assert_eq!(state.matches("VISAUT03").count(), 2);
@@ -1992,4 +2009,36 @@ fn admission_registry_is_a_pure_registry() {
 		let v = registry_violation(bad).unwrap_or_else(|| panic!("accepted {bad}"));
 		assert!(v.contains(why), "{bad}: {v}");
 	}
+}
+// Dormant dispatch: the reducer refuses an Admission permission command before covered-entry
+// replay, the gap check and authorization, and its apply arm is the same refusal.
+#[test]
+fn admission_dispatch_fails_closed() {
+	let reducer = fs::read_to_string(
+		PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+			.join("src/storage/mutation_visibility/root2/reducer.rs"),
+	)
+	.unwrap();
+	assert_eq!(reducer.matches("Command2::AdmissionPermission").count(), 2);
+	let gate = reducer
+		.find("if let Command2::AdmissionPermission(_) = command {")
+		.unwrap();
+	let replay = reducer.find("if l.index == s.covered.index {").unwrap();
+	let gap = reducer.find("LineageGap").unwrap();
+	let authorized = reducer
+		.find("let mut result = if verified.authorized()")
+		.unwrap();
+	assert!(gate < replay && gate < gap && gate < authorized);
+	for (at, _) in reducer.match_indices("Command2::AdmissionPermission") {
+		let tail = &reducer[at..(at + 120).min(reducer.len())];
+		assert!(tail.contains("Err(RootError2::TrustMismatch)"), "{tail}");
+	}
+	let incremental = fs::read_to_string(
+		PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+			.join("src/storage/mutation_visibility/root2/incremental.rs"),
+	)
+	.unwrap();
+	assert!(
+		!incremental.contains("grant_permission2") && !incremental.contains("revoke_permission2")
+	);
 }

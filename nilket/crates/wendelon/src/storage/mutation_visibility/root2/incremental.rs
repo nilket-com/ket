@@ -1,5 +1,8 @@
 //! Summaries derived only from fully validated state; never wire authority.
-use super::admission_registry::PERMISSION_SECTION_BYTES2;
+use super::admin_statement::inspect_admin_statement2;
+use super::admission_registry::{
+	PERMISSION_CHARGE2, PERMISSION_SECTION_BYTES2, encode_permission_key2,
+};
 use super::{codec::*, command::Command2, persistent::Map, types::*, validation::*};
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) struct Derived2 {
@@ -211,6 +214,24 @@ pub(super) fn update(old: &State2, next: &mut State2, cmd: &Command2) -> Result2
 						d.non_grants.insert(t.first().index, ());
 					}
 				}
+			}
+		}
+		// Summarizes a semantically valid single-key permission transition from `old` to `next`;
+		// one keyed lookup per map. No production caller reaches it until the issuer gate exists.
+		Command2::AdmissionPermission(bytes) => {
+			let f = inspect_admin_statement2(bytes).map_err(|_| RootError2::Codec)?;
+			let key = encode_permission_key2(&f.key).map_err(|_| RootError2::Codec)?;
+			match (old.permissions.get(&key), next.permissions.get(&key)) {
+				(None, Some(p)) => {
+					d.usage.registry = add(d.usage.registry, PERMISSION_CHARGE2)?;
+					d.non_grants.insert(p.enrolled.index, ());
+				}
+				(Some(o), Some(p)) if o.revoked.is_none() => {
+					if let Some(r) = p.revoked {
+						d.non_grants.insert(r.index, ());
+					}
+				}
+				_ => {}
 			}
 		}
 		Command2::Bootstrap { .. } | Command2::Cover { .. } => {}
