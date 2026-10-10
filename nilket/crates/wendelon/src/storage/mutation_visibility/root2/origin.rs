@@ -15,7 +15,7 @@ const PRE_ROOT: u8 = 1;
 const ROOT: u8 = 2;
 const PRE_ROOT_BYTES: usize = 109;
 const ORIGIN_BYTES: usize = 100;
-// Tag, Origin2, nested length, then the largest nested VISAUT02 envelope.
+// Tag, Origin2, nested length, then the largest nested VISAUT03 envelope.
 const BODY_MAX: usize = 1 + ORIGIN_BYTES + 4 + ROOT_BYTES2 + 48;
 
 /// Classification of one committed entry, supplied by its producer; equality of the class to the

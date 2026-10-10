@@ -7,10 +7,13 @@ fn grant(g: &OriginalGrant2) -> Command2 {
 		predecessor: g.predecessor,
 	}
 }
+// The corrupted profile-3 body goes to production; the oracle receives its bounded projection,
+// which keeps every mutated byte.
 fn compare_decode(bytes: &[u8], expected: RootError2) {
 	assert_eq!(UnverifiedRoot2::decode(bytes).err(), Some(expected));
 	assert_eq!(
-		s1c_oracle::state::UnverifiedRoot2::decode(bytes).err(),
+		s1c_oracle::state::UnverifiedRoot2::decode(&s1c_oracle::legacy_profile2(bytes).unwrap())
+			.err(),
 		Some(expected)
 	);
 }
@@ -155,7 +158,9 @@ fn s1c_multi_defect_decode_keeps_legacy_precedence() {
 	let mut dup = second.clone();
 	dup.log.index = first.log.index;
 	let to = dup.bytes().unwrap();
-	let mut body = open(&encoded, b"VISAUT02", ROOT_BYTES2).unwrap().to_vec();
+	let mut body = open_versioned(&encoded, b"VISAUT03", 3, ROOT_BYTES2)
+		.unwrap()
+		.to_vec();
 	let hits = body
 		.windows(from.len())
 		.enumerate()
@@ -164,13 +169,14 @@ fn s1c_multi_defect_decode_keeps_legacy_precedence() {
 	assert_eq!(hits.len(), 1);
 	body[hits[0]..hits[0] + to.len()].copy_from_slice(&to);
 	compare_decode(
-		&envelope(b"VISAUT02", &body, ROOT_BYTES2).unwrap(),
+		&envelope_versioned(b"VISAUT03", 3, &body, ROOT_BYTES2).unwrap(),
 		RootError2::RootInvariant,
 	);
-	// Parse vector boundaries in the fixed v2 header, then force a later
-	// parent-count Limit while the earlier cuts still have duplicate coordinates.
+	// Parse vector boundaries after the fixed header (selectors, authorities, permissions, lineages,
+	// cuts), then force a later parent-count Limit while the earlier cuts still have duplicate
+	// coordinates.
 	let mut pos = 212usize;
-	for _ in 0..4 {
+	for _ in 0..5 {
 		let count = u32::from_le_bytes(body[pos..pos + 4].try_into().unwrap()) as usize;
 		pos += 4;
 		for _ in 0..count {
@@ -181,25 +187,25 @@ fn s1c_multi_defect_decode_keeps_legacy_precedence() {
 	let mut excessive = body.clone();
 	excessive[pos..pos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
 	compare_decode(
-		&envelope(b"VISAUT02", &excessive, ROOT_BYTES2).unwrap(),
+		&envelope_versioned(b"VISAUT03", 3, &excessive, ROOT_BYTES2).unwrap(),
 		RootError2::Limit,
 	);
 	let mut zero = body.clone();
 	zero[..16].fill(0);
 	compare_decode(
-		&envelope(b"VISAUT02", &zero, ROOT_BYTES2).unwrap(),
+		&envelope_versioned(b"VISAUT03", 3, &zero, ROOT_BYTES2).unwrap(),
 		RootError2::Codec,
 	);
 	let mut trailing = body.clone();
 	trailing.push(0);
 	compare_decode(
-		&envelope(b"VISAUT02", &trailing, ROOT_BYTES2).unwrap(),
+		&envelope_versioned(b"VISAUT03", 3, &trailing, ROOT_BYTES2).unwrap(),
 		RootError2::Codec,
 	);
 	let mut bad_wire = body.clone();
 	bad_wire[16..32].fill(0);
 	compare_decode(
-		&envelope(b"VISAUT02", &bad_wire, ROOT_BYTES2).unwrap(),
+		&envelope_versioned(b"VISAUT03", 3, &bad_wire, ROOT_BYTES2).unwrap(),
 		RootError2::Codec,
 	);
 }
@@ -239,7 +245,8 @@ fn s1c_lookup_at_and_epoch_at_agree_with_legacy_at_every_boundary() {
 		1,
 	)
 	.0;
-	let old = s1c_oracle::install(&r.encode().unwrap()).unwrap();
+	let old =
+		s1c_oracle::install(&s1c_oracle::legacy_profile2(&r.encode().unwrap()).unwrap()).unwrap();
 	for i in 0..=r.covered().index + 1 {
 		for generation in [r.state.generation, [77; 16]] {
 			let v = TrustedView2::fixture(generation, r.state.cluster, r.state.bootstrap, i);

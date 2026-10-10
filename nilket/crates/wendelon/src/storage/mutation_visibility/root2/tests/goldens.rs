@@ -87,13 +87,16 @@ fn s1_declared_counts_and_counters_are_checked_before_trust() {
 	for offset in [184, 188, 196, 204, 212] {
 		let mut payload = b[16..b.len() - 32].to_vec();
 		payload[offset] ^= 1;
-		let b = envelope(b"VISAUT02", &payload, ROOT_BYTES2).unwrap();
+		let b = envelope_versioned(b"VISAUT03", 3, &payload, ROOT_BYTES2).unwrap();
 		assert!(UnverifiedRoot2::decode(&b).is_err(), "{offset}")
 	}
 	let mut payload = b[16..b.len() - 32].to_vec();
 	payload[212..216].copy_from_slice(&u32::MAX.to_le_bytes());
 	assert!(
-		UnverifiedRoot2::decode(&envelope(b"VISAUT02", &payload, ROOT_BYTES2).unwrap()).is_err()
+		UnverifiedRoot2::decode(
+			&envelope_versioned(b"VISAUT03", 3, &payload, ROOT_BYTES2).unwrap()
+		)
+		.is_err()
 	)
 }
 #[test]

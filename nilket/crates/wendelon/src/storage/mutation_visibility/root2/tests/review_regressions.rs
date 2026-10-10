@@ -9,7 +9,9 @@ fn grant_of(g: &OriginalGrant2) -> Command2 {
 }
 fn replace_lineage(root: &Root2, old: &LineageRecord2, new: &LineageRecord2) -> Vec<u8> {
 	let encoded = root.encode().unwrap();
-	let mut body = open(&encoded, b"VISAUT02", ROOT_BYTES2).unwrap().to_vec();
+	let mut body = open_versioned(&encoded, b"VISAUT03", 3, ROOT_BYTES2)
+		.unwrap()
+		.to_vec();
 	let from = old.bytes().unwrap();
 	let to = new.bytes().unwrap();
 	assert_eq!(from.len(), to.len());
@@ -20,7 +22,7 @@ fn replace_lineage(root: &Root2, old: &LineageRecord2, new: &LineageRecord2) -> 
 		.collect::<Vec<_>>();
 	assert_eq!(hits.len(), 1);
 	body[hits[0]..hits[0] + to.len()].copy_from_slice(&to);
-	envelope(b"VISAUT02", &body, ROOT_BYTES2).unwrap()
+	envelope_versioned(b"VISAUT03", 3, &body, ROOT_BYTES2).unwrap()
 }
 #[test]
 fn s1_d1_released_ranges_cannot_bypass_same_epoch_floors_by_widening() {

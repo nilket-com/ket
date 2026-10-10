@@ -1,4 +1,5 @@
 //! Summaries derived only from fully validated state; never wire authority.
+use super::admission_registry::PERMISSION_SECTION_BYTES2;
 use super::{codec::*, command::Command2, persistent::Map, types::*, validation::*};
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) struct Derived2 {
@@ -58,6 +59,12 @@ impl Derived2 {
 		for c in &s.cuts {
 			d.non_grants.insert(c.log.index, ());
 		}
+		for p in s.permissions.values() {
+			d.non_grants.insert(p.enrolled.index, ());
+			if let Some(l) = p.revoked {
+				d.non_grants.insert(l.index, ());
+			}
+		}
 		for p in s.parents.values() {
 			d.parent(p)?;
 			d.non_grants.insert(p.reservation.index, ());
@@ -95,10 +102,12 @@ pub(super) fn cached_capacity(s: &State2, l: Limits2) -> Result2<()> {
 		|| s.cuts.len() > l.cuts
 		|| s.selectors.len() > l.registrations
 		|| s.authorities.len() > l.registrations
+		|| s.permissions.len() > l.permissions
+		|| permission_section_bytes(s.permissions.len())? > PERMISSION_SECTION_BYTES2
 	{
 		return Err(RootError2::Limit);
 	}
-	if add(add(add(232, u.held)?, u.history)?, u.registry)? > ROOT_BYTES2 {
+	if add(add(add(ROOT_BASE2, u.held)?, u.history)?, u.registry)? > ROOT_BYTES2 {
 		return Err(RootError2::Limit);
 	}
 	Ok(())

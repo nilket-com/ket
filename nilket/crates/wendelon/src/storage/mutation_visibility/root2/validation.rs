@@ -1,4 +1,8 @@
-use super::{codec::*, types::*};
+use super::admission_registry::{
+	PERMISSION_CHARGE2, PERMISSION_SECTION_BYTES2, RegistryError2, permission_limits2,
+	validate_permissions2,
+};
+use super::{codec::*, persistent::Map, types::*};
 use std::collections::BTreeSet;
 
 pub(super) fn nonzero<const N: usize>(b: [u8; N]) -> Result2<()> {
@@ -223,6 +227,23 @@ pub(super) fn old_original_fits(old: &OriginalGrant2, latest: &OriginalGrant2) -
 pub(super) fn epoch(s: &State2) -> u64 {
 	s.cuts.last().map_or(s.initial_epoch, |c| c.new)
 }
+/// Fixed header (212) plus six section count words, the permission count included once.
+pub(super) const ROOT_BASE2: usize = 236;
+pub(super) fn permission_section_bytes(count: usize) -> Result2<usize> {
+	count
+		.checked_mul(PERMISSION_CHARGE2)
+		.and_then(|n| n.checked_add(4))
+		.ok_or(RootError2::Overflow)
+}
+// Semantic permission faults: a lowered or absolute bound is a Limit, arithmetic Overflow, else
+// a root invariant.
+fn permission_error(e: RegistryError2) -> RootError2 {
+	match e {
+		RegistryError2::Count => RootError2::Limit,
+		RegistryError2::Overflow => RootError2::Overflow,
+		_ => RootError2::RootInvariant,
+	}
+}
 pub(super) fn usage(s: &State2) -> Result2<Usage2> {
 	let held = s.parents.values().try_fold(0usize, |n, p| {
 		n.checked_add(usize::try_from(p.held_bytes).map_err(|_| RootError2::Overflow)?)
@@ -244,6 +265,12 @@ pub(super) fn usage(s: &State2) -> Result2<Usage2> {
 				.checked_mul(121)
 				.and_then(|m| n.checked_add(m))
 		})
+		.and_then(|n| {
+			s.permissions
+				.len()
+				.checked_mul(PERMISSION_CHARGE2)
+				.and_then(|m| n.checked_add(m))
+		})
 		.ok_or(RootError2::Overflow)?;
 	Ok(Usage2 {
 		parents: s.parents.len(),
@@ -262,10 +289,12 @@ pub(super) fn capacity(s: &State2, l: Limits2) -> Result2<()> {
 		|| s.cuts.len() > l.cuts
 		|| s.selectors.len() > l.registrations
 		|| s.authorities.len() > l.registrations
+		|| s.permissions.len() > l.permissions
+		|| permission_section_bytes(s.permissions.len())? > PERMISSION_SECTION_BYTES2
 	{
 		return Err(RootError2::Limit);
 	}
-	let total = 232usize
+	let total = ROOT_BASE2
 		.checked_add(u.held)
 		.and_then(|n| n.checked_add(u.history))
 		.and_then(|n| n.checked_add(u.registry))
@@ -467,9 +496,27 @@ pub(super) fn validate_state(s: &State2) -> Result2<()> {
 			return Err(RootError2::RootInvariant);
 		}
 	}
+	// Permission coordinates join every coordinate claimed so far, before the parents loop.
+	let existing = coords.iter().map(|i| (*i, ())).collect::<Map<u64, ()>>();
+	let permissions = validate_permissions2(
+		&s.permissions,
+		s.generation,
+		s.bootstrap,
+		s.covered,
+		&s.authorities,
+		&existing,
+		permission_limits2(),
+	)
+	.map_err(permission_error)?;
+	for (i, _) in permissions.coordinates.iter() {
+		coords.insert(*i);
+	}
 
 	let mut non_grant_coords = BTreeSet::new();
 	non_grant_coords.insert(s.bootstrap.index);
+	for (i, _) in permissions.coordinates.iter() {
+		non_grant_coords.insert(*i);
+	}
 	for g in s.lineages.values() {
 		if let Some(c) = g.closure.filter(|c| c.cause == 1) {
 			non_grant_coords.insert(c.log.index);

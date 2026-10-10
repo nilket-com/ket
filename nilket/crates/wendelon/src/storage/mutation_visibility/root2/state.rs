@@ -1,4 +1,8 @@
 use super::super::MutationIdentity;
+use super::admission_registry::{
+	PERMISSION_CHARGE2, PERMISSIONS2, PermissionMap2, RegistryError2, decode_permission_section2,
+	encode_permission_section2, permission_limits2,
+};
 use super::{codec::*, trust::TrustedView2, types::*, validation::*};
 use super::{
 	incremental::Derived2,
@@ -43,10 +47,33 @@ fn encode_state(s: &State2) -> Result2<Vec<u8>> {
 	b.extend((u.registry as u64).to_le_bytes());
 	write_vec(&mut b, s.selectors.values().cloned(), s.selectors.len())?;
 	write_vec(&mut b, s.authorities.values().cloned(), s.authorities.len())?;
+	b.extend(
+		encode_permission_section2(&s.permissions, permission_limits2()).map_err(section_error)?,
+	);
 	write_vec(&mut b, s.lineages.values().cloned(), s.lineages.len())?;
 	write_vec(&mut b, s.cuts.iter().cloned(), s.cuts.len())?;
 	write_vec(&mut b, s.parents.values().cloned(), s.parents.len())?;
-	envelope(b"VISAUT02", &b, ROOT_BYTES2)
+	envelope_versioned(b"VISAUT03", 3, &b, ROOT_BYTES2)
+}
+// Structural section faults: a count above the absolute cap is a Limit, anything else Codec.
+fn section_error(e: RegistryError2) -> RootError2 {
+	match e {
+		RegistryError2::Count => RootError2::Limit,
+		_ => RootError2::Codec,
+	}
+}
+// The exact permission section, count word included, bounded by its declared count first.
+fn read_permissions(r: &mut Read2<'_>) -> Result2<PermissionMap2> {
+	let head = r.remaining().get(..4).ok_or(RootError2::Codec)?;
+	let count = u32::from_le_bytes(head.try_into().map_err(|_| RootError2::Codec)?) as usize;
+	if count > PERMISSIONS2 {
+		return Err(RootError2::Limit);
+	}
+	let n = count
+		.checked_mul(PERMISSION_CHARGE2)
+		.and_then(|n| n.checked_add(4))
+		.ok_or(RootError2::Overflow)?;
+	decode_permission_section2(r.take(n)?, permission_limits2()).map_err(section_error)
 }
 fn sorted_map<K: Ord + Clone, T: Clone>(
 	xs: Vec<T>,
@@ -84,7 +111,7 @@ impl UnverifiedRoot2 {
 		)
 	}
 	pub fn decode(bytes: &[u8]) -> Result2<Self> {
-		let mut r = Read2::new(open(bytes, b"VISAUT02", ROOT_BYTES2)?);
+		let mut r = Read2::new(open_versioned(bytes, b"VISAUT03", 3, ROOT_BYTES2)?);
 		let generation = r.array()?;
 		let cluster = r.array()?;
 		let bootstrap = r.log()?;
@@ -107,6 +134,7 @@ impl UnverifiedRoot2 {
 			read_vec::<AuthorityRegistration2>(&mut r, REGISTRY_COUNT2, 117)?,
 			|a| authority_key(a.authority),
 		)?;
+		let permissions = read_permissions(&mut r)?;
 		let lineages = sorted_map(read_vec::<LineageRecord2>(&mut r, LINEAGES2, 294)?, |g| {
 			Ok(g.latest.lineage)
 		})?;
@@ -134,6 +162,7 @@ impl UnverifiedRoot2 {
 			control_len,
 			selectors,
 			authorities,
+			permissions,
 			lineages,
 			cuts,
 			parents,
@@ -249,6 +278,7 @@ impl Root2 {
 				&& l.lineages <= d.lineages
 				&& l.cuts <= d.cuts
 				&& l.registrations <= d.registrations
+				&& l.permissions <= d.permissions
 		);
 		self.limits = l;
 		self

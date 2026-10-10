@@ -1,5 +1,6 @@
 use super::super::{DecisionLogId, ParentManifest, ProofKeyBinding};
 use super::{
+	admission_registry::{PERMISSIONS2, PermissionMap2},
 	persistent::Map,
 	stored::{Cuts2, StoredParent2},
 };
@@ -182,6 +183,7 @@ pub(super) struct Limits2 {
 	pub lineages: usize,
 	pub cuts: usize,
 	pub registrations: usize,
+	pub permissions: usize,
 }
 impl Default for Limits2 {
 	fn default() -> Self {
@@ -193,6 +195,7 @@ impl Default for Limits2 {
 			lineages: LINEAGES2,
 			cuts: CUTS2,
 			registrations: REGISTRY_COUNT2,
+			permissions: PERMISSIONS2,
 		}
 	}
 }
@@ -209,6 +212,7 @@ pub(super) struct State2 {
 	pub control_len: u64,
 	pub selectors: Map<[u8; 44], Selector2>,
 	pub authorities: Map<[u8; 24], AuthorityRegistration2>,
+	pub permissions: PermissionMap2,
 	pub lineages: Map<[u8; 16], LineageRecord2>,
 	pub cuts: Cuts2,
 	pub parents: Map<[u8; 73], StoredParent2>,

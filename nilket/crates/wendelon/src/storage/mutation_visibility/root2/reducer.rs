@@ -36,6 +36,7 @@ fn bootstrap_root(
 		control_len: *length,
 		selectors: Map::new(),
 		authorities: Map::new(),
+		permissions: Map::new(),
 		lineages: Map::new(),
 		cuts: Cuts2::default(),
 		parents: Map::new(),

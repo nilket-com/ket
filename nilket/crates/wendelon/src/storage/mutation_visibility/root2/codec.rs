@@ -8,12 +8,20 @@ pub(super) fn hash(domain: &[u8], body: &[u8]) -> Digest2 {
 	ctx.finish().as_ref().try_into().expect("sha256 width")
 }
 pub(super) fn envelope(magic: &[u8; 8], body: &[u8], max: usize) -> Result2<Vec<u8>> {
+	envelope_versioned(magic, 2, body, max)
+}
+pub(super) fn envelope_versioned(
+	magic: &[u8; 8],
+	version: u16,
+	body: &[u8],
+	max: usize,
+) -> Result2<Vec<u8>> {
 	if body.len() > max {
 		return Err(RootError2::Limit);
 	}
 	let mut b = Vec::new();
 	b.extend(magic);
-	b.extend(2u16.to_le_bytes());
+	b.extend(version.to_le_bytes());
 	b.extend([1, 0]);
 	b.extend(
 		u32::try_from(body.len())
@@ -26,11 +34,19 @@ pub(super) fn envelope(magic: &[u8; 8], body: &[u8], max: usize) -> Result2<Vec<
 	Ok(b)
 }
 pub(super) fn open<'a>(bytes: &'a [u8], magic: &[u8; 8], max: usize) -> Result2<&'a [u8]> {
+	open_versioned(bytes, magic, 2, max)
+}
+pub(super) fn open_versioned<'a>(
+	bytes: &'a [u8],
+	magic: &[u8; 8],
+	version: u16,
+	max: usize,
+) -> Result2<&'a [u8]> {
 	if bytes.len() > max.checked_add(48).ok_or(RootError2::Overflow)? {
 		return Err(RootError2::Limit);
 	}
 	let mut r = Read2::new(bytes);
-	if r.take(8)? != magic || r.u16()? != 2 || r.u8()? != 1 || r.u8()? != 0 {
+	if r.take(8)? != magic || r.u16()? != version || r.u8()? != 1 || r.u8()? != 0 {
 		return Err(RootError2::Codec);
 	}
 	let n = r.u32()? as usize;

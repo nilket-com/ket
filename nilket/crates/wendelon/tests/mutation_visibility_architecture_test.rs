@@ -1931,19 +1931,22 @@ fn admission_registry_is_a_pure_registry() {
 	let modules = fs::read_to_string(root.join("mod.rs")).unwrap();
 	assert!(modules.contains("#[allow(dead_code)]\n// Dormant Admission permission registry; no production caller until reviewed integration.\nmod admission_registry;\n"));
 	assert!(!modules.contains("pub mod admission_registry"));
-	for name in [
-		"reducer.rs",
-		"command.rs",
-		"state.rs",
-		"incremental.rs",
-		"validation.rs",
-	] {
+	// Root integration (profile 3) may name the registry in state, validation, incremental and
+	// types; the reducer and command codec may not, and no file outside the module calls a
+	// transition (below).
+	for name in ["reducer.rs", "command.rs"] {
 		let t = fs::read_to_string(root.join(name)).unwrap();
 		assert!(
 			!t.contains("admission_registry"),
 			"{name} reaches the registry"
 		);
 	}
+	let state = fs::read_to_string(root.join("state.rs")).unwrap();
+	assert_eq!(state.matches("VISAUT03").count(), 2);
+	assert!(!state.contains("VISAUT02"));
+	let codec = fs::read_to_string(root.join("codec.rs")).unwrap();
+	assert!(codec.contains("\tenvelope_versioned(magic, 2, body, max)\n}"));
+	assert!(codec.contains("\topen_versioned(bytes, magic, 2, max)\n}"));
 	// No production caller of a transition anywhere outside the module itself.
 	fn walk(dir: PathBuf, tests: &PathBuf, out: &mut Vec<PathBuf>) {
 		for e in fs::read_dir(dir).unwrap() {

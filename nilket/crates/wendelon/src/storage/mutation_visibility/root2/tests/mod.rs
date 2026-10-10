@@ -11,6 +11,7 @@ mod origin;
 mod refusals;
 mod restoration;
 mod review_regressions;
+mod root_profile;
 mod transitions;
 
 mod support;

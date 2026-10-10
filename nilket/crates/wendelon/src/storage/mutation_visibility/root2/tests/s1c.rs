@@ -3,7 +3,7 @@ use super::*;
 fn s1c_existing_goldens_equal_legacy_decoder_and_codec() {
 	for name in ["root_reserved", "root_renewed_no_parents"] {
 		let r = root(name);
-		let bytes = r.encode().unwrap();
+		let bytes = super::s1c_oracle::legacy_profile2(&r.encode().unwrap()).unwrap();
 		let legacy = super::s1c_oracle::state::UnverifiedRoot2::decode(&bytes).unwrap();
 		assert_eq!(legacy.encode().unwrap(), bytes);
 		assert!(r.state.derived == super::super::incremental::Derived2::build(&r.state).unwrap());
@@ -20,13 +20,19 @@ pub(super) fn checked_step(
 	let mut sealed = root.clone();
 	sealed.state.derived = super::super::incremental::Derived2::build(&sealed.state)?;
 	let before = sealed.encode()?;
-	let expected = super::s1c_oracle::reduce(&before, sealed.limits, e, v, c);
+	let expected = super::s1c_oracle::reduce(
+		&super::s1c_oracle::legacy_profile2(&before)?,
+		sealed.limits,
+		e,
+		v,
+		c,
+	);
 	let actual = Root2::reduce(Some(&sealed), e, v, c);
 	assert_eq!(sealed.encode()?, before);
 	match (&actual, expected) {
 		(Ok((n, o)), Ok((bytes, old_o))) => {
 			assert!(o == &old_o, "outcome differs from frozen S1 oracle");
-			assert_eq!(n.encode()?, bytes);
+			assert_eq!(super::s1c_oracle::legacy_profile2(&n.encode()?)?, bytes);
 			assert_eq!(
 				o.encode(n.state.generation, n.state.cluster, n.covered())?,
 				old_o.encode(n.state.generation, n.state.cluster, n.covered())?
@@ -308,7 +314,10 @@ fn s1c_bootstrap_and_unauthorized_bootstrap_match_legacy() {
 		let actual = Root2::reduce(None, &e, &v, &c);
 		match (actual, expected) {
 			(Ok((n, o)), Ok((bytes, old_o))) => {
-				assert_eq!(n.encode().unwrap(), bytes);
+				assert_eq!(
+					super::s1c_oracle::legacy_profile2(&n.encode().unwrap()).unwrap(),
+					bytes
+				);
 				assert!(o == old_o);
 				assert!(
 					n.state.derived
@@ -329,14 +338,20 @@ fn s1c_every_root_golden_and_corrupt_envelope_agree_with_legacy() {
 			continue;
 		}
 		let bytes = fixture(name);
-		let old = super::s1c_oracle::state::UnverifiedRoot2::decode(&bytes).unwrap();
+		let legacy = super::s1c_oracle::legacy_profile2(&bytes).unwrap();
+		let old = super::s1c_oracle::state::UnverifiedRoot2::decode(&legacy).unwrap();
 		let n = UnverifiedRoot2::decode(&bytes).unwrap();
-		assert_eq!(old.encode().unwrap(), n.encode().unwrap());
-		let mut bad = bytes.clone();
-		let last = bad.len() - 1;
-		bad[last] ^= 1;
-		let a = UnverifiedRoot2::decode(&bad).err();
-		let b = super::s1c_oracle::state::UnverifiedRoot2::decode(&bad).err();
+		assert_eq!(old.encode().unwrap(), legacy);
+		assert_eq!(n.encode().unwrap(), bytes);
+		// The same checksum mutation, applied to each profile's own bytes.
+		let flip = |b: &[u8]| {
+			let mut b = b.to_vec();
+			let last = b.len() - 1;
+			b[last] ^= 1;
+			b
+		};
+		let a = UnverifiedRoot2::decode(&flip(&bytes)).err();
+		let b = super::s1c_oracle::state::UnverifiedRoot2::decode(&flip(&legacy)).err();
 		assert_eq!(a, b);
 		assert!(a.is_some());
 	}
