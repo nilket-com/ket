@@ -3,6 +3,7 @@ use super::{codec::*, validation::*};
 mod admin_install;
 mod admin_statement;
 mod admission_command;
+mod admission_gate;
 mod admission_registry;
 mod entry_identity;
 mod g1c_roundtrip;

@@ -1,9 +1,11 @@
 //! Dormant pre-root and origin layer over Root2: covers the committed log from its genesis
 //! membership entry through the first Root2 Bootstrap and beyond. Pure transitions over opaque
 //! trusted inputs; decoded bytes never become state (snapshot install is a separate, held step).
+use super::admin_install::install_admin2;
 use super::codec::{Read2, envelope, open, valid_log};
 use super::command::{ApplyResult2, Command2};
 use super::entry_identity::EntryPosition2;
+use super::provisioning::replica_anchor::PinnedBoundTuple2;
 use super::state::{Root2, UnverifiedRoot2};
 use super::trust::{CommittedEntry2, TrustedEntry2, VerifiedCommand2};
 use super::types::*;
@@ -303,6 +305,31 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_root2(
 	))
 }
 
+/// The one gated path for an Admission permission command: install the administrator from this
+/// pre-entry state (a missing or mismatched prerequisite consumes nothing), then reduce under it
+/// and keep the origin unchanged. No production caller until reviewed integration.
+pub(in crate::storage::mutation_visibility::root2) fn advance_admission2(
+	state: &MutationAuthorityState2,
+	tuple: &PinnedBoundTuple2,
+	entry: &TrustedEntry2,
+	verified: &VerifiedCommand2,
+	command: &Command2,
+) -> Result2<(MutationAuthorityState2, ApplyResult2)> {
+	if !matches!(command, Command2::AdmissionPermission(_)) {
+		return Err(RootError2::TrustMismatch);
+	}
+	let StateInner2::Root(_, origin) = &state.inner else {
+		return Err(RootError2::TrustMismatch);
+	};
+	let admin = install_admin2(state, tuple).map_err(|_| RootError2::TrustMismatch)?;
+	let (next, result) = Root2::reduce_admission(state, &admin, entry, verified, command)?;
+	Ok((
+		MutationAuthorityState2 {
+			inner: StateInner2::Root(Box::new(next), *origin),
+		},
+		result,
+	))
+}
 fn position(b: &mut Vec<u8>, p: EntryPosition2) {
 	b.extend(p.term.to_le_bytes());
 	b.extend(p.node.to_le_bytes());
@@ -493,5 +520,18 @@ pub(super) fn pre_root_scanned_through_for_test(
 	check_pre_root(&p).expect("valid PreRoot fixture");
 	MutationAuthorityState2 {
 		inner: StateInner2::PreRoot(p),
+	}
+}
+/// Test-only: the same rooted state with caller-lowered limits on its root.
+#[cfg(test)]
+pub(super) fn lower_limits_for_test(
+	state: &MutationAuthorityState2,
+	limits: Limits2,
+) -> MutationAuthorityState2 {
+	let StateInner2::Root(root, origin) = &state.inner else {
+		panic!("rooted state required")
+	};
+	MutationAuthorityState2 {
+		inner: StateInner2::Root(Box::new((**root).clone().lower_limits(limits)), *origin),
 	}
 }

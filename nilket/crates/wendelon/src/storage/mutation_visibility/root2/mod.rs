@@ -8,6 +8,9 @@ mod admin_install;
 // Dormant administrator statement authentication; no production caller until reviewed integration.
 mod admin_statement;
 #[allow(dead_code)]
+// Dormant Admission issuer gate; no production caller until reviewed integration.
+mod admission_gate;
+#[allow(dead_code)]
 // Dormant Admission permission registry; no production caller until reviewed integration.
 mod admission_registry;
 #[allow(dead_code, unused_imports)] // Deliberately dormant until reviewed authority integration.

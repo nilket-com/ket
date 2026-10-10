@@ -374,6 +374,7 @@ fn s1c_incremental_updates_do_not_scan_or_create_authority_and_oracle_is_test_on
 		"command.rs",
 		"records.rs",
 		"codec.rs",
+		"admission_gate.rs",
 	] {
 		let source = fs::read_to_string(root.join(module)).unwrap();
 		syn::parse_file(&source).unwrap();
@@ -1104,6 +1105,7 @@ fn origin_layer_builds_no_trusted_input_and_promotes_no_bytes() {
 	assert_eq!(
 		entrypoints,
 		[
+			"advance_admission2",
 			"advance_pre_root2",
 			"advance_root2",
 			"bootstrap2",
@@ -1980,11 +1982,18 @@ fn admission_registry_is_a_pure_registry() {
 	let mut files = Vec::new();
 	walk(src, &root.join("tests"), &mut files);
 	assert!(files.len() > 100);
+	// The issuer gate is the one production caller of each transition (call graph pinned in
+	// admission_gate_call_graph_is_single_and_dormant).
 	for f in files {
 		if f.ends_with("root2/admission_registry.rs") {
 			continue;
 		}
 		let t = fs::read_to_string(&f).unwrap();
+		if f.ends_with("root2/admission_gate.rs") {
+			assert_eq!(t.matches("grant_permission2(").count(), 1);
+			assert_eq!(t.matches("revoke_permission2(").count(), 1);
+			continue;
+		}
 		assert!(
 			!t.contains("grant_permission2") && !t.contains("revoke_permission2"),
 			"production caller in {}",
@@ -2041,4 +2050,89 @@ fn admission_dispatch_fails_closed() {
 	assert!(
 		!incremental.contains("grant_permission2") && !incremental.contains("revoke_permission2")
 	);
+}
+// The issuer gate's whole production call graph: one caller of each transition, inside the checked
+// helper; the helper called only from the gated reducer; that reducer called only from the origin
+// wrapper; the wrapper itself uncalled (dormant); authentication before application; no
+// inspection as authority; the legacy reducer untouched. Source text, not name resolution.
+fn fn_body<'a>(text: &'a str, name: &str) -> &'a str {
+	let start = text
+		.find(&format!("fn {name}("))
+		.unwrap_or_else(|| panic!("fn {name}"));
+	let open = start + text[start..].find('{').unwrap();
+	let mut depth = 0;
+	for (i, ch) in text[open..].char_indices() {
+		match ch {
+			'{' => depth += 1,
+			'}' => {
+				depth -= 1;
+				if depth == 0 {
+					return &text[open..open + i + 1];
+				}
+			}
+			_ => {}
+		}
+	}
+	panic!("unbalanced fn {name}")
+}
+fn calls(text: &str, name: &str) -> usize {
+	text.matches(&format!("{name}(")).count() - text.matches(&format!("fn {name}(")).count()
+}
+#[test]
+fn admission_gate_call_graph_is_single_and_dormant() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let root = src.join("storage/mutation_visibility/root2");
+	let gate = fs::read_to_string(root.join("admission_gate.rs")).unwrap();
+	let origin = fs::read_to_string(root.join("origin.rs")).unwrap();
+	let reducer = fs::read_to_string(root.join("reducer.rs")).unwrap();
+	assert!(gate.lines().count() <= 750);
+	// 1. Each transition once, inside apply_admission.
+	let apply = fn_body(&gate, "apply_admission");
+	for t in ["grant_permission2", "revoke_permission2"] {
+		assert_eq!(calls(&gate, t), 1, "{t}");
+		assert_eq!(calls(apply, t), 1, "{t} in apply_admission");
+	}
+	// 2. apply_admission called once, from reduce_admission; 5. after the one authentication.
+	let reduce = fn_body(&gate, "reduce_admission");
+	assert_eq!(calls(&gate, "apply_admission"), 1);
+	assert_eq!(calls(reduce, "apply_admission"), 1);
+	assert_eq!(calls(&gate, "check_admin_statement2"), 1);
+	assert!(
+		reduce.find("check_admin_statement2(").unwrap() < reduce.find("apply_admission(").unwrap()
+	);
+	assert!(!gate.contains("inspect_admin_statement2"));
+	// 3, 4, 6. reduce_admission called once, from advance_admission2, which installs once and is
+	// called nowhere in production.
+	let wrapper = fn_body(&origin, "advance_admission2");
+	assert_eq!(calls(wrapper, "reduce_admission"), 1);
+	assert_eq!(calls(&origin, "install_admin2"), 1);
+	assert_eq!(calls(wrapper, "install_admin2"), 1);
+	fn walk(dir: PathBuf, tests: &PathBuf, out: &mut Vec<PathBuf>) {
+		for e in fs::read_dir(dir).unwrap() {
+			let p = e.unwrap().path();
+			if p.is_dir() {
+				if p != *tests {
+					walk(p, tests, out)
+				}
+			} else if p.extension().is_some_and(|x| x == "rs") {
+				out.push(p)
+			}
+		}
+	}
+	let mut files = Vec::new();
+	walk(src, &root.join("tests"), &mut files);
+	let (mut reduce_calls, mut advance_defs, mut advance_calls) = (0, 0, 0);
+	for f in &files {
+		let t = without_test_items(fs::read_to_string(f).unwrap().parse().unwrap()).to_string();
+		let t = t.replace(' ', "");
+		reduce_calls +=
+			t.matches("reduce_admission(").count() - t.matches("fnreduce_admission(").count();
+		advance_defs += t.matches("fnadvance_admission2(").count();
+		advance_calls +=
+			t.matches("advance_admission2(").count() - t.matches("fnadvance_admission2(").count();
+	}
+	assert_eq!((reduce_calls, advance_defs, advance_calls), (1, 1, 0));
+	// 7. The legacy reducer is untouched by the gate.
+	assert!(!reducer.contains("admission_registry") && !reducer.contains("reduce_admission"));
+	assert!(!reducer.contains("check_admin_statement2"));
 }
