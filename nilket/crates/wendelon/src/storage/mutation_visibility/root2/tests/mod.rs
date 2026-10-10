@@ -2,6 +2,7 @@ use super::*;
 use super::{codec::*, validation::*};
 mod admin_install;
 mod entry_identity;
+mod g1c_roundtrip;
 mod goldens;
 mod invariants;
 mod origin;

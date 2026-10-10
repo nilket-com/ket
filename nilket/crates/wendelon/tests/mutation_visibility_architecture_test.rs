@@ -1187,6 +1187,7 @@ fn provisioning_reader_has_two_documented_unsafe_blocks_and_no_trust_access() {
 			"owner_core",
 			"owner_log",
 			"replica_anchor",
+			"replica_read",
 			"snapshot"
 		]
 	);
@@ -1656,7 +1657,74 @@ fn admin_install_is_a_pure_derivation() {
 			"admin_installed_at2",
 			"admin_key2",
 			"admin_namespace2",
-			"install_admin2"
+			"install_admin2",
+			"observe_bootstrap2"
 		]
 	);
+}
+// Replica tuple read: composes only the accepted anchored reader and the pure tuple validator; no
+// unsafe, direct filesystem or libc use, network, clock, env, trust or root construction; one
+// root2-private entrypoint. Syntax only.
+#[test]
+fn provisioning_replica_read_composes_only_the_accepted_reader() {
+	let text = fs::read_to_string(
+		PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+			.join("src/storage/mutation_visibility/root2/provisioning/replica_read.rs"),
+	)
+	.unwrap();
+	fn banned(tokens: proc_macro2::TokenStream) -> Option<String> {
+		for t in tokens {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => {
+					let n = id.to_string();
+					if n.starts_with("Trusted")
+						|| n.starts_with("Verified")
+						|| [
+							"unsafe",
+							"fs",
+							"File",
+							"OpenOptions",
+							"libc",
+							"syscall",
+							"net",
+							"tokio",
+							"env",
+							"Instant",
+							"SystemTime",
+							"CommittedEntry2",
+							"Root2",
+							"State2",
+						]
+						.contains(&n.as_str())
+					{
+						return Some(n);
+					}
+				}
+				proc_macro2::TokenTree::Group(g) => {
+					if let Some(n) = banned(g.stream()) {
+						return Some(n);
+					}
+				}
+				_ => {}
+			}
+		}
+		None
+	}
+	assert_eq!(
+		banned(text.parse().unwrap()),
+		None,
+		"replica_read.rs: prohibited token"
+	);
+	let mut entrypoints = Vec::new();
+	for item in syn::parse_file(&text).unwrap().items {
+		match item {
+			syn::Item::Fn(f) if root2_scoped(&f.vis) => entrypoints.push(f.sig.ident.to_string()),
+			syn::Item::Fn(f) => assert!(matches!(f.vis, syn::Visibility::Inherited)),
+			syn::Item::Impl(_) | syn::Item::Trait(_) | syn::Item::Static(_) | syn::Item::Mod(_) => {
+				panic!("replica_read.rs: no impls, traits, statics or modules")
+			}
+			_ => {}
+		}
+	}
+	assert_eq!(entrypoints, ["read_replica_tuple2"]);
 }

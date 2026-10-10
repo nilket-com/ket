@@ -5,7 +5,9 @@
 //! A G1d consumer must bind the whole `AdminContext2`; an administrator key or id alone never
 //! authorizes anything in another root.
 use super::super::redacted_debug;
+use super::admin::errors::BootstrapRecordError2;
 use super::admin::manifest::{ADMIN_MANIFEST_BYTES2, AdminNamespace2};
+use super::admin::record::{BootstrapIdentity2, BootstrapObservation2};
 use super::origin::{MutationAuthorityState2, root_and_origin2};
 use super::provisioning::replica_anchor::{
 	PinnedBoundTuple2, tuple_manifest_pin2, tuple_manifest2, tuple_record2,
@@ -48,6 +50,12 @@ pub(in crate::storage::mutation_visibility::root2) enum InstallField2 {
 	Genesis,
 	InitialEpoch,
 	Pin,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) enum ObserveError2 {
+	PrerequisiteUnavailable,
+	ControlLength,
+	Codec(BootstrapRecordError2),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum InstallError2 {
@@ -139,4 +147,34 @@ pub(in crate::storage::mutation_visibility::root2) fn admin_installed_at2(
 	a: &InstalledAdmin2,
 ) -> Log2 {
 	a.context.installed_at
+}
+
+/// The observation a node offers its owner for approval: the original Bootstrap identity of a
+/// rooted state, with the control digest as the candidate manifest pin. Derived data only: the
+/// digest is not thereby a valid manifest, and owner approval, Part A and install still refuse any
+/// inconsistency. The covered tip is never read.
+pub(in crate::storage::mutation_visibility::root2) fn observe_bootstrap2(
+	state: &MutationAuthorityState2,
+) -> Result<BootstrapObservation2, ObserveError2> {
+	let Some((root, origin)) = root_and_origin2(state) else {
+		return Err(ObserveError2::PrerequisiteUnavailable);
+	};
+	let s = &root.state;
+	if s.control_len != ADMIN_MANIFEST_BYTES2 as u64 {
+		return Err(ObserveError2::ControlLength);
+	}
+	let observation = BootstrapObservation2 {
+		identity: BootstrapIdentity2 {
+			generation: s.generation,
+			cluster: s.cluster,
+			pin: s.control_digest,
+			initial_epoch: s.initial_epoch,
+			bootstrap: s.bootstrap,
+			bootstrap_fingerprint: origin.bootstrap_fingerprint,
+			bootstrap_command: origin.bootstrap_command,
+			genesis_fingerprint: origin.genesis,
+		},
+	};
+	observation.encode().map_err(ObserveError2::Codec)?;
+	Ok(observation)
 }

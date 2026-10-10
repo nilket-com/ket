@@ -7,6 +7,7 @@ pub mod inventory;
 pub mod owner_core;
 pub mod owner_log;
 pub mod replica_anchor;
+pub mod replica_read;
 pub mod snapshot;
 
 #[cfg(test)]

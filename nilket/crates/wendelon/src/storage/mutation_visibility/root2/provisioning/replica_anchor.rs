@@ -17,7 +17,8 @@ use super::inventory::{MAX_ROOTS2, RootState2};
 use super::snapshot::{SnapshotError2, decode_snapshot2};
 
 // The replica snapshot layout: 22-byte header, 320-byte entries, 32-byte trailer.
-const MAX_SNAPSHOT_BYTES2: usize = 22 + MAX_ROOTS2 * 320 + 32;
+pub(in crate::storage::mutation_visibility::root2) const MAX_SNAPSHOT_BYTES2: usize =
+	22 + MAX_ROOTS2 * 320 + 32;
 
 #[derive(Clone, Copy)]
 pub(in crate::storage::mutation_visibility::root2) struct ReplicaInputs2<'a> {
