@@ -1284,6 +1284,45 @@ authorityKeyIdentifier=keyid,issuer\n",
 	}
 
 	#[test]
+	fn wendelon_inspect_reads_control_retention_violation() {
+		let with_retention = |violation: &str| {
+			ready_body().replace(
+				"}",
+				&format!(
+					r#","control_retention":{{"configured":"full","history":"fresh","violation":{violation},"refusals":{{}}}}}}"#
+				),
+			)
+		};
+		// A server that predates retention reporting omits the key.
+		let omitted = parse_readiness_view(ready_body().as_bytes()).expect("omitted");
+		assert!(omitted.ready);
+		let null = parse_readiness_view(with_retention("null").as_bytes()).expect("null");
+		assert!(null.ready);
+		let latched = parse_readiness_view(with_retention(r#""snapshot_request""#).as_bytes())
+			.expect("latched");
+		assert!(!latched.ready);
+		// The rendered fields are unchanged; only readiness reflects the latch.
+		assert_eq!(
+			render_readiness_text(&latched),
+			render_readiness_text(&omitted)
+		);
+		for malformed in ["1", "true", "[]", "{}"] {
+			match parse_readiness_view(with_retention(malformed).as_bytes()) {
+				Err(InspectError::ParseSnapshot(message)) => assert_eq!(
+					message,
+					"field control_retention.violation must be null or a string"
+				),
+				_ => panic!("malformed violation {malformed} must not parse"),
+			}
+		}
+		let missing = ready_body().replace("}", r#","control_retention":{}}"#);
+		assert!(matches!(
+			parse_readiness_view(missing.as_bytes()),
+			Err(InspectError::ParseSnapshot(_))
+		));
+	}
+
+	#[test]
 	fn wendelon_inspect_exit_one_on_audit_materialization_lag() {
 		let view = parse_readiness_view(lag_body().as_bytes()).expect("lag view");
 		assert!(!view.ready);

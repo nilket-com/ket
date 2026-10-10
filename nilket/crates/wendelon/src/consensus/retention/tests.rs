@@ -13,8 +13,9 @@ use crate::consensus::retention::{
 	RetentionStatus, RetentionViolation,
 };
 use crate::consensus::{
-	DurableBootstrapMode, WendelonLogStore, WendelonRaft, WendelonRaftInternalServer,
-	WendelonRaftNetworkFactory, WendelonRequest,
+	DurableBootstrapMode, MigrationLedgerEntry, MigrationState, SeedMigration, WendelonLogStore,
+	WendelonRaft, WendelonRaftInternalServer, WendelonRaftNetworkFactory, WendelonRequest,
+	WendelonStateMachine,
 };
 use crate::metrics::observability::{DrainState, ReadinessReporter, ReadinessSnapshot};
 use crate::network::core::{HRFT_MAGIC, HrftFrame};
@@ -23,7 +24,7 @@ use crate::network::router::RaftInternalServer;
 use crate::network::server::{HrftService, RequestContext};
 use crate::network::tls::ActorIdentity;
 use crate::node::NoDialTransportProvider;
-use crate::schema::{FrameHeader, MsgType, NodeId};
+use crate::schema::{FrameHeader, HybridTimestamp, MsgType, NodeId};
 use openraft::storage::{RaftLogReader, RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{BasicNode, Config, LogId, SnapshotMeta, SnapshotPolicy};
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
@@ -129,6 +130,8 @@ struct Single {
 	raft: WendelonRaft,
 	store: WendelonLogStore,
 	guard: Arc<RetentionGuard>,
+	/// A handle on the same state machine Raft applies to, for observation.
+	state_machine: WendelonStateMachine,
 }
 
 async fn start(dir: &Path, mode: ControlRetention) -> std::io::Result<Single> {
@@ -142,6 +145,7 @@ async fn start(dir: &Path, mode: ControlRetention) -> std::io::Result<Single> {
 		BufPool::new(8, 1 << 20),
 	);
 	let config = Arc::new(mode.openraft_config("wendelon").validate().unwrap());
+	let observed = state_machine.clone();
 	let raft = WendelonRaft::new(1, config, network, store.clone(), state_machine)
 		.await
 		.unwrap();
@@ -159,7 +163,12 @@ async fn start(dir: &Path, mode: ControlRetention) -> std::io::Result<Single> {
 		.current_leader(1, "single node leads")
 		.await
 		.unwrap();
-	Ok(Single { raft, store, guard })
+	Ok(Single {
+		raft,
+		store,
+		guard,
+		state_machine: observed,
+	})
 }
 
 /// Commits `count` entries. The payload is a deliberately undecodable schema
@@ -203,6 +212,46 @@ async fn stored_indexes(store: &mut WendelonLogStore) -> Vec<u64> {
 		.into_iter()
 		.map(|entry| entry.log_id.index)
 		.collect()
+}
+
+/// Every stored entry from 0 through `last`, canonically serialized: the log
+/// id and payload exactly as retained.
+async fn entry_bytes(store: &mut WendelonLogStore, last: u64) -> Vec<Vec<u8>> {
+	store
+		.try_get_log_entries(0..=last)
+		.await
+		.unwrap()
+		.iter()
+		.map(|entry| postcard::to_allocvec(entry).unwrap())
+		.collect()
+}
+
+/// A deterministic, successful, state-changing command.
+fn seed(migration_id: u64) -> WendelonRequest {
+	let node = NodeId {
+		id: 1,
+		_reserved: 0,
+	};
+	WendelonRequest::SeedMigration(SeedMigration {
+		entry: MigrationLedgerEntry {
+			migration_id,
+			range_start: migration_id * 10,
+			range_end: migration_id * 10 + 5,
+			from_epoch: 1,
+			to_epoch: 2,
+			logical_owner: node,
+			upstream_migration_id: None,
+			source_replicas: vec![node],
+			migration_hlc_floor: HybridTimestamp {
+				physical_ms: 1_000 + migration_id,
+				logical: 0,
+				node_id: 1,
+			},
+			state: MigrationState::Pending,
+			completed_by: None,
+			completed_at_hlc: None,
+		},
+	})
 }
 
 /// A history with several segments, written under `Compacting` (which purges
@@ -301,7 +350,9 @@ async fn full_startup_refuses_incomplete_history() {
 	// Each fixture: (name, directory, expected Full outcome).
 	enum Expect {
 		Refused(RetentionStartError),
-		ExistingError,
+		/// Replay's or the resolver's own refusal: its existing kind and
+		/// diagnostic, with no retention error.
+		ExistingError(std::io::ErrorKind, &'static str),
 		Opens(HistoryCheck),
 	}
 	let base = written_history("startup-base", 400).await;
@@ -391,7 +442,10 @@ async fn full_startup_refuses_incomplete_history() {
 	fixtures.push((
 		"existing: segment start mismatch",
 		dir,
-		Expect::ExistingError,
+		Expect::ExistingError(
+			std::io::ErrorKind::InvalidData,
+			"does not match first log entry",
+		),
 	));
 	let dir = copy("existing-duplicate");
 	std::fs::copy(
@@ -399,7 +453,37 @@ async fn full_startup_refuses_incomplete_history() {
 		dir.join(segments[0].file_name().unwrap()),
 	)
 	.unwrap();
-	fixtures.push(("existing: duplicate index", dir, Expect::ExistingError));
+	fixtures.push((
+		"existing: duplicate index",
+		dir,
+		Expect::ExistingError(std::io::ErrorKind::InvalidData, "duplicate log index"),
+	));
+
+	// No stored entry and a positive committed checkpoint: the existing
+	// resolver refuses before Phase B, with its own diagnostic.
+	let dir = fresh_dir("checkpoint-only");
+	std::fs::write(
+		WendelonLogStore::segment_path_for_retention_test(&dir, 0),
+		b"",
+	)
+	.unwrap();
+	{
+		let mut store = WendelonLogStore::open_for_retention_test(&dir, SEGMENT_BYTES, None)
+			.await
+			.unwrap();
+		store
+			.save_committed(Some(LogId::new(openraft::CommittedLeaderId::new(1, 1), 5)))
+			.await
+			.unwrap();
+	}
+	fixtures.push((
+		"existing: checkpoint without entries",
+		dir,
+		Expect::ExistingError(
+			std::io::ErrorKind::InvalidData,
+			"recovery checkpoint commit_index 5 is not present in the retained WAL tail",
+		),
+	));
 
 	fixtures.push((
 		"fresh",
@@ -451,8 +535,10 @@ async fn full_startup_refuses_incomplete_history() {
 			(Expect::Refused(want), Err(err)) => {
 				assert_eq!(start_error(err), Some(*want), "{name}: {err}");
 			}
-			(Expect::ExistingError, Err(err)) => {
+			(Expect::ExistingError(kind, diagnostic), Err(err)) => {
 				assert_eq!(start_error(err), None, "{name}: {err}");
+				assert_eq!(err.kind(), *kind, "{name}: {err}");
+				assert!(err.to_string().contains(diagnostic), "{name}: {err}");
 			}
 			(Expect::Opens(want), Ok(_)) => {
 				assert_eq!(guard.status().history, *want, "{name}");
@@ -467,16 +553,44 @@ async fn full_startup_refuses_incomplete_history() {
 				"{name}: a refused open changed the directory"
 			);
 			assert_eq!(guard.status().violation, None, "{name}");
-			// Control: Compacting is unchanged by this slice and never refuses
-			// with a retention error.
+			// Control, after the byte-identity check: Compacting keeps its
+			// baseline outcome for this exact directory.
 			let compacting = WendelonLogStore::open_for_retention_test(
 				&dir,
 				SEGMENT_BYTES,
 				Some(RetentionGuard::new(ControlRetention::Compacting)),
 			)
 			.await;
-			if let Err(err) = &compacting {
-				assert_eq!(start_error(err), None, "{name}: compacting control {err}");
+			let baseline: Option<(std::io::ErrorKind, &str)> = match name {
+				// Zero-length snapshot is no artifact; the receive temp, an
+				// empty legacy file, a relabelled segment 0 and an interior
+				// gap are all accepted by the existing open.
+				"A1 snapshot artifact (empty file counts)"
+				| "A2 receive temp"
+				| "A3 legacy monolithic WAL"
+				| "B2 first stored entry above 0"
+				| "B3 gap" => None,
+				"A4 lowest segment above 0" => Some((
+					std::io::ErrorKind::InvalidData,
+					"no snapshot provides the purged prefix",
+				)),
+				_ => match &expect {
+					Expect::ExistingError(kind, diagnostic) => Some((*kind, *diagnostic)),
+					_ => panic!("{name}: no compacting baseline"),
+				},
+			};
+			match (baseline, &compacting) {
+				(None, Ok(_)) => {}
+				(Some((kind, diagnostic)), Err(err)) => {
+					assert_eq!(start_error(err), None, "{name}: compacting {err}");
+					assert_eq!(err.kind(), kind, "{name}: compacting {err}");
+					assert!(
+						err.to_string().contains(diagnostic),
+						"{name}: compacting {err}"
+					);
+				}
+				(None, Err(err)) => panic!("{name}: compacting baseline opens, got {err}"),
+				(Some(_), Ok(_)) => panic!("{name}: compacting baseline refuses, but opened"),
 			}
 		}
 	}
@@ -487,7 +601,22 @@ async fn full_retains_genesis_history_past_the_default_threshold() {
 	let dir = fresh_dir("full-threshold");
 	let node = start(&dir, ControlRetention::Full).await.unwrap();
 	assert_eq!(node.guard.status().history, HistoryCheck::Fresh);
+	// Successful state transitions at the start and the end of the history,
+	// around the invalid filler entries.
+	node.raft.client_write(seed(41)).await.unwrap();
 	commit(&node.raft, PAST_DEFAULT_THRESHOLD).await;
+	node.raft.client_write(seed(42)).await.unwrap();
+	commit(&node.raft, 0).await;
+	let sm_state = node.state_machine.state_snapshot().await;
+	assert_eq!(sm_state.migrations.len(), 2);
+	assert_eq!(
+		Some(&sm_state.migrations[&42]),
+		match seed(42) {
+			WendelonRequest::SeedMigration(seed) => Some(seed.entry),
+			_ => None,
+		}
+		.as_ref()
+	);
 	let metrics = node.raft.metrics().borrow().clone();
 	assert_eq!(metrics.snapshot, None);
 	assert_eq!(metrics.purged, None);
@@ -498,6 +627,8 @@ async fn full_retains_genesis_history_past_the_default_threshold() {
 	assert!(last > PAST_DEFAULT_THRESHOLD);
 	let before: Vec<u64> = stored_indexes(&mut store).await;
 	assert_eq!(before, (0..=last).collect::<Vec<_>>());
+	let before_entries = entry_bytes(&mut store, last).await;
+	assert_eq!(before_entries.len() as u64, last + 1);
 	assert!(!dir.join("snapshot.wnd").exists());
 	assert!(segment_files(&dir).len() > 1, "rollover expected");
 	assert_eq!(node.guard.status().violation, None);
@@ -514,11 +645,25 @@ async fn full_retains_genesis_history_past_the_default_threshold() {
 	let mut store = node.store.clone();
 	let after = stored_indexes(&mut store).await;
 	assert_eq!(after[..=last as usize], before[..]);
+	// Every entry through the pinned last index, log id and payload, is the
+	// one written before shutdown; a new-term suffix may follow.
+	assert_eq!(entry_bytes(&mut store, last).await, before_entries);
 	node.raft
 		.wait(Some(BOUND))
 		.applied_index_at_least(Some(last), "restart re-applies the retained log")
 		.await
 		.unwrap();
+	// The recovered state machine reached the same meaningful state.
+	let recovered = node.state_machine.state_snapshot().await;
+	assert_eq!(recovered.migrations, sm_state.migrations);
+	assert_eq!(
+		format!("{:?}", recovered.epoch_history),
+		format!("{:?}", sm_state.epoch_history)
+	);
+	assert_eq!(
+		recovered.last_membership.membership(),
+		sm_state.last_membership.membership()
+	);
 	let metrics = node.raft.metrics().borrow().clone();
 	assert_eq!(metrics.snapshot, None);
 	assert_eq!(metrics.purged, None);
@@ -859,8 +1004,9 @@ async fn retention_status_is_additive_and_shared() {
 
 /// Architectural source guard over the non-test library and binary sources.
 ///
-/// It walks `mod` declarations from the crate roots, skips every item behind a
-/// `cfg` attribute that mentions `test`, and matches token shapes, so spacing
+/// It walks `mod` declarations from the crate roots, skips only items whose
+/// `cfg` predicate holds solely under test (`cfg(test)` or
+/// `cfg(all(.., test, ..))`), and matches token shapes, so spacing
 /// and line breaks do not matter. It refuses, outside tests: any call of
 /// `purge_log` or `install_full_snapshot` on any receiver; any use of the
 /// openraft `Trigger` type; any `.trigger()` not immediately followed by
