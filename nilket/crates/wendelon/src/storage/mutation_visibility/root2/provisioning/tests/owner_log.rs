@@ -361,7 +361,12 @@ fn a_failed_sync_latches_the_same_object_and_sets_a_marker() {
 }
 #[test]
 fn marker_failures_still_latch_the_same_object() {
-	for (second, marker_file) in [(MarkerCreate, false), (MarkerSync, true)] {
+	for (second, marker_file) in [
+		(MarkerCreate, false),
+		(MarkerWrite, true),
+		(MarkerSync, true),
+		(MarkerDirSync, true),
+	] {
 		let s = Scratch::new();
 		let mut o = s.open();
 		{
@@ -375,6 +380,12 @@ fn marker_failures_still_latch_the_same_object() {
 			);
 		}
 		assert_eq!(s.at("SYNC_FAILED").exists(), marker_file, "{second:?}");
+		// One non-recursive marker attempt, whatever sub-step failed.
+		assert_eq!(
+			seam::seen().iter().filter(|x| **x == MarkerCreate).count(),
+			1,
+			"{second:?}"
+		);
 		for _ in 0..2 {
 			assert_eq!(
 				o.apply(&op(1), &reserve("reserve")).err(),
@@ -873,4 +884,239 @@ fn repair_uses_the_reserved_slots_and_refuses_when_they_are_exhausted() {
 	);
 	assert_eq!(fs::read(s.at("inventory.log")).unwrap(), full);
 	assert!(!s.at("repairs").exists());
+}
+// A torn log at the third event's boundary whose evidence is already published: `log_tail` is what
+// follows the prefix on disk (all or part of the original tail).
+fn published(log_tail: &[u8]) -> Scratch {
+	let s = Scratch::new();
+	fs::write(
+		s.at("inventory.log"),
+		[&log_bytes()[..B3], log_tail].concat(),
+	)
+	.unwrap();
+	fs::write(
+		s.repairs().join(vector_name("base")),
+		vector("base", "evidence"),
+	)
+	.unwrap();
+	s
+}
+// A repaired owner (valid evidence present) with only a durable marker left by an earlier run.
+fn marked_with_evidence() -> Scratch {
+	let s = torn_owner();
+	let mut o = s.open();
+	o.repair_fresh(&sha(&torn_tail())).unwrap();
+	let _plan = seam::plan(&[(OwnerDirSync, 1)], None);
+	assert_eq!(
+		o.repair_check(),
+		Err(OwnerIoError2::SyncFailed {
+			step: OwnerDirSync,
+			marker: MarkerOutcome2::Durable
+		})
+	);
+	s
+}
+#[test]
+fn clear_latches_evidence_sync_failures_and_refuses_unsafe_evidence() {
+	for step in [EvidenceSync, RepairsDirSync] {
+		let s = marked_with_evidence();
+		let log = fs::read(s.at("inventory.log")).unwrap();
+		let mut o = s.open();
+		assert!(o.inspect().unwrap().poisoned.is_none());
+		{
+			let _plan = seam::plan(&[(step, 1)], None);
+			assert_eq!(
+				o.clear_sync_failure(&sha(&log)),
+				Err(OwnerIoError2::SyncFailed {
+					step,
+					marker: MarkerOutcome2::AlreadyPresent
+				})
+			);
+		}
+		assert!(s.at("SYNC_FAILED").exists(), "{step:?}");
+		assert_eq!(
+			o.repair_check().err(),
+			Some(OwnerIoError2::Poisoned { step })
+		);
+		assert_eq!(o.clear_sync_failure(&sha(&log)), Ok(()));
+		assert!(!s.at("SYNC_FAILED").exists());
+		assert_eq!(o.repair_check(), Ok(RepairOutcome2::NothingToRepair));
+	}
+	// A failed unlink is not a sync failure: no latch, and the marker still blocks.
+	let s = marked_with_evidence();
+	let log = fs::read(s.at("inventory.log")).unwrap();
+	let mut o = s.open();
+	{
+		let _plan = seam::plan(&[(MarkerUnlink, 1)], None);
+		assert_eq!(
+			o.clear_sync_failure(&sha(&log)),
+			Err(OwnerIoError2::Io {
+				step: MarkerUnlink,
+				errno: Some(libc::EIO)
+			})
+		);
+	}
+	assert!(s.at("SYNC_FAILED").exists());
+	assert!(o.inspect().unwrap().poisoned.is_none());
+	assert_eq!(
+		o.repair_check().err(),
+		Some(OwnerIoError2::SyncFailurePending)
+	);
+	// Invalid or conflicting evidence refuses the clear and keeps the marker.
+	fs::write(
+		s.at("repairs").join(format!("{}.rep", "a".repeat(64))),
+		[0x5a; 200],
+	)
+	.unwrap();
+	assert!(matches!(
+		o.clear_sync_failure(&sha(&log)),
+		Err(OwnerIoError2::ClearRefused(ClearRefusal2::Evidence(
+			Classification2::EvidenceInvalid { .. }
+		)))
+	));
+	assert!(s.at("SYNC_FAILED").exists());
+	let prefix = log_bytes()[..B3].to_vec();
+	let tail = torn_tail();
+	let s = Scratch::new();
+	for log in [
+		[prefix.as_slice(), &tail].concat(),
+		[prefix.as_slice(), &tail[..30], &[0x01; 40]].concat(),
+	] {
+		let (name, bytes) = encode_evidence2(&log).unwrap();
+		fs::write(s.repairs().join(name), bytes).unwrap();
+	}
+	let shared = [prefix.as_slice(), &tail[..30]].concat();
+	fs::write(s.at("inventory.log"), &shared).unwrap();
+	fs::write(s.at("SYNC_FAILED"), b"").unwrap();
+	let mut o = s.open();
+	assert_eq!(
+		o.clear_sync_failure(&sha(&shared)),
+		Err(OwnerIoError2::ClearRefused(ClearRefusal2::Evidence(
+			Classification2::Conflicting { count: 2 }
+		)))
+	);
+	assert!(s.at("SYNC_FAILED").exists());
+}
+#[test]
+fn every_operation_sync_failure_latches_without_reporting_success() {
+	let failed = |step| {
+		Some(OwnerIoError2::SyncFailed {
+			step,
+			marker: MarkerOutcome2::Durable,
+		})
+	};
+	// Ordinary append: the owner-directory sync after the log sync.
+	let s = Scratch::new();
+	let mut o = s.open();
+	{
+		let _plan = seam::plan(&[(OwnerDirSync, 1)], None);
+		assert_eq!(
+			o.apply(&op(1), &reserve("reserve")).err(),
+			failed(OwnerDirSync)
+		);
+	}
+	assert!(s.at("SYNC_FAILED").exists());
+	assert_eq!(
+		o.apply(&op(2), &reserve("reserve_second")).err(),
+		Some(OwnerIoError2::Poisoned { step: OwnerDirSync })
+	);
+	// Repair resume from published evidence: the repairs/ sync and the truncate sync.
+	for step in [RepairsDirSync, TruncateSync] {
+		let s = published(&torn_tail());
+		let mut o = s.open();
+		{
+			let _plan = seam::plan(&[(step, 1)], None);
+			assert_eq!(
+				o.repair_resume(&base_context()).err(),
+				failed(step),
+				"{step:?}"
+			);
+		}
+		assert!(s.at("SYNC_FAILED").exists());
+		assert_eq!(
+			o.repair_check().err(),
+			Some(OwnerIoError2::Poisoned { step })
+		);
+	}
+	// Export: the snapshot sync before publication, and the directory sync after it.
+	for step in [ExportSync, ExportDirSync] {
+		let s = Scratch::new();
+		let out = Scratch::new();
+		let mut o = s.open();
+		o.apply(&op(1), &reserve("reserve")).unwrap();
+		{
+			let _plan = seam::plan(&[(step, 1)], None);
+			assert_eq!(o.export(&out.0, "inv").err(), failed(step), "{step:?}");
+		}
+		assert_eq!(out.at("inv").exists(), step == ExportDirSync);
+		assert!(s.at("SYNC_FAILED").exists());
+		assert_eq!(
+			o.export(&out.0, "other").err(),
+			Some(OwnerIoError2::Poisoned { step })
+		);
+	}
+}
+#[test]
+fn resume_resyncs_published_evidence_before_truncating() {
+	let tail = torn_tail();
+	let repaired = [
+		&log_bytes()[..B3],
+		vector("base", "expected_repair").as_slice(),
+	]
+	.concat();
+	let done = Ok(RepairOutcome2::Repaired {
+		context: base_context(),
+		seq: 4,
+	});
+	let s = published(&tail);
+	let mut o = s.open();
+	{
+		let _plan = seam::plan(&[], None);
+		assert_eq!(o.repair_resume(&base_context()), done);
+		assert!(in_order(
+			&seam::seen(),
+			&[
+				EvidenceSync,
+				RepairsDirSync,
+				OwnerDirSync,
+				Truncate,
+				TruncateSync,
+				LogWrite
+			]
+		));
+	}
+	assert_eq!(fs::read(s.at("inventory.log")).unwrap(), repaired);
+	// A failed evidence or repairs/ sync stops before any truncation or write.
+	for step in [EvidenceSync, RepairsDirSync] {
+		let s = published(&tail);
+		let before = fs::read(s.at("inventory.log")).unwrap();
+		let mut o = s.open();
+		let _plan = seam::plan(&[(step, 1)], None);
+		assert!(matches!(
+			o.repair_resume(&base_context()),
+			Err(OwnerIoError2::SyncFailed { step: s, .. }) if s == step
+		));
+		assert!(
+			!seam::seen()
+				.iter()
+				.any(|x| matches!(x, Truncate | TruncateSync | LogWrite))
+		);
+		assert_eq!(fs::read(s.at("inventory.log")).unwrap(), before);
+	}
+	// r7 R6: only part of the original tail persisted (0 < N < tail length).
+	let s = published(&tail[..40]);
+	let mut o = s.open();
+	assert_eq!(
+		o.inspect().unwrap().classification,
+		Classification2::Pending {
+			context: base_context(),
+			stage: RepairStage2::NotTruncated
+		}
+	);
+	assert_eq!(o.repair_resume(&base_context()), done);
+	assert_eq!(fs::read(s.at("inventory.log")).unwrap(), repaired);
+	assert_eq!(
+		fs::read(s.at("repairs").join(vector_name("base"))).unwrap(),
+		vector("base", "evidence")
+	);
 }
