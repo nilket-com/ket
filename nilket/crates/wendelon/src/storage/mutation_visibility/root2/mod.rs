@@ -7,6 +7,9 @@ mod admin_install;
 #[allow(dead_code)]
 // Dormant administrator statement authentication; no production caller until reviewed integration.
 mod admin_statement;
+#[allow(dead_code)]
+// Dormant Admission permission registry; no production caller until reviewed integration.
+mod admission_registry;
 #[allow(dead_code, unused_imports)] // Deliberately dormant until reviewed authority integration.
 mod auth;
 mod codec;

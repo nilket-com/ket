@@ -1824,3 +1824,169 @@ fn admin_statement_is_pure_authentication() {
 		]
 	);
 }
+// Admission permission registry: pure codecs and semantic transitions only. No impls, traits,
+// statics or modules; no I/O, crypto, trust token, issuer decision or root construction; exactly
+// the eleven root2-scoped entrypoints. Syntax over this file only; not name resolution.
+fn registry_violation(text: &str) -> Option<String> {
+	fn forbidden(tokens: proc_macro2::TokenStream) -> Option<String> {
+		for t in tokens {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => {
+					let n = id.to_string();
+					if [
+						"unsafe",
+						"async",
+						"fs",
+						"io",
+						"net",
+						"tokio",
+						"env",
+						"Instant",
+						"SystemTime",
+						"fixture",
+						"ed25519_dalek",
+						"aws_lc_rs",
+						"Signature",
+						"SigningKey",
+						"VerifyingKey",
+						"CheckedStatement2",
+						"check_admin_statement2",
+						"InstalledAdmin2",
+						"VerifiedCommand2",
+						"TrustedEntry2",
+						"TrustedView2",
+						"CommittedEntry2",
+						"MutationAuthorityState2",
+						"Root2",
+						"UnverifiedRoot2",
+						"State2",
+						"Command2",
+					]
+					.contains(&n.as_str())
+					{
+						return Some(n);
+					}
+				}
+				proc_macro2::TokenTree::Group(g) => {
+					if let Some(n) = forbidden(g.stream()) {
+						return Some(n);
+					}
+				}
+				_ => {}
+			}
+		}
+		None
+	}
+	let file = syn::parse_file(text).ok()?;
+	if let Some(n) = forbidden(without_test_items(text.parse().unwrap())) {
+		return Some(format!("prohibited token {n}"));
+	}
+	let mut entrypoints = Vec::new();
+	for item in file.items {
+		let vis = match &item {
+			syn::Item::Fn(f) => {
+				if root2_scoped(&f.vis) {
+					entrypoints.push(f.sig.ident.to_string());
+				}
+				&f.vis
+			}
+			syn::Item::Struct(s) => &s.vis,
+			syn::Item::Enum(e) => &e.vis,
+			syn::Item::Type(t) => &t.vis,
+			syn::Item::Const(c) => &c.vis,
+			syn::Item::Use(u) => &u.vis,
+			syn::Item::Macro(m) if m.mac.path.is_ident("redacted_debug") => continue,
+			_ => return Some("impl, trait, static, module or other item".into()),
+		};
+		if !matches!(vis, syn::Visibility::Inherited) && !root2_scoped(vis) {
+			return Some("export wider than root2".into());
+		}
+	}
+	entrypoints.sort();
+	let expected = [
+		"apply_permission_delta2",
+		"decode_permission_key2",
+		"decode_permission_record2",
+		"decode_permission_section2",
+		"encode_permission_key2",
+		"encode_permission_record2",
+		"encode_permission_section2",
+		"grant_permission2",
+		"permission_limits2",
+		"revoke_permission2",
+		"validate_permissions2",
+	];
+	if entrypoints != expected {
+		return Some(format!("entrypoints {entrypoints:?}"));
+	}
+	None
+}
+#[test]
+fn admission_registry_is_a_pure_registry() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let root = src.join("storage/mutation_visibility/root2");
+	let text = fs::read_to_string(root.join("admission_registry.rs")).unwrap();
+	assert!(text.lines().count() <= 750);
+	assert_eq!(registry_violation(&text), None, "admission_registry.rs");
+	let modules = fs::read_to_string(root.join("mod.rs")).unwrap();
+	assert!(modules.contains("#[allow(dead_code)]\n// Dormant Admission permission registry; no production caller until reviewed integration.\nmod admission_registry;\n"));
+	assert!(!modules.contains("pub mod admission_registry"));
+	for name in [
+		"reducer.rs",
+		"command.rs",
+		"state.rs",
+		"incremental.rs",
+		"validation.rs",
+	] {
+		let t = fs::read_to_string(root.join(name)).unwrap();
+		assert!(
+			!t.contains("admission_registry"),
+			"{name} reaches the registry"
+		);
+	}
+	// No production caller of a transition anywhere outside the module itself.
+	fn walk(dir: PathBuf, tests: &PathBuf, out: &mut Vec<PathBuf>) {
+		for e in fs::read_dir(dir).unwrap() {
+			let p = e.unwrap().path();
+			if p.is_dir() {
+				if p != *tests {
+					walk(p, tests, out)
+				}
+			} else if p.extension().is_some_and(|x| x == "rs") {
+				out.push(p)
+			}
+		}
+	}
+	let mut files = Vec::new();
+	walk(src, &root.join("tests"), &mut files);
+	assert!(files.len() > 100);
+	for f in files {
+		if f.ends_with("root2/admission_registry.rs") {
+			continue;
+		}
+		let t = fs::read_to_string(&f).unwrap();
+		assert!(
+			!t.contains("grant_permission2") && !t.contains("revoke_permission2"),
+			"production caller in {}",
+			f.display()
+		);
+	}
+	for (bad, why) in [
+		(
+			"fn promote() -> CheckedStatement2 { todo!() }",
+			"CheckedStatement2",
+		),
+		("fn admit(v: &VerifiedCommand2) {}", "VerifiedCommand2"),
+		("fn read(p: &str) { std::fs::read(p).unwrap(); }", "fs"),
+		("impl PermissionRecord2 {}", "impl"),
+		("trait Issue {}", "impl"),
+		("static X: u8 = 0;", "impl"),
+		("mod hidden {}", "impl"),
+		("pub fn decode() {}", "export"),
+		("pub(crate) struct Wide;", "export"),
+		("pub(super) const C: u8 = 0;", "export"),
+	] {
+		let v = registry_violation(bad).unwrap_or_else(|| panic!("accepted {bad}"));
+		assert!(v.contains(why), "{bad}: {v}");
+	}
+}
