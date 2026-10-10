@@ -27,6 +27,9 @@ mod persistent;
 #[allow(dead_code)] // Dormant provisioning reads; no production caller until reviewed integration.
 mod provisioning;
 mod records;
+#[allow(dead_code)]
+// Dormant replay progress and recovery mark; no production caller until reviewed integration.
+mod recovery;
 mod reducer;
 mod state;
 mod stored;

@@ -2212,3 +2212,131 @@ fn admission_reserve_check_is_exactly_twice_and_trigger_is_unchanged() {
 		.sum();
 	assert_eq!(total, 2, "exactly two production callers");
 }
+// G1e-1: the replay monitor and recovery mark are pure and dormant. No state construction,
+// decoding or promotion; no trusted token, install, transition or I/O; the one bounded full
+// encoding (state_digest) is called exactly twice; exactly the listed exports; zero production
+// callers outside the module.
+#[test]
+fn recovery_is_pure_and_dormant() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let root = src.join("storage/mutation_visibility/root2");
+	let text = fs::read_to_string(root.join("recovery.rs")).unwrap();
+	assert!(text.lines().count() <= 750);
+	fn forbidden(tokens: proc_macro2::TokenStream) -> Option<String> {
+		for t in tokens {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => {
+					let n = id.to_string();
+					if [
+						"unsafe",
+						"async",
+						"fs",
+						"io",
+						"net",
+						"tokio",
+						"StateInner2",
+						"UnverifiedAuthority2",
+						"UnverifiedRoot2",
+						"TrustedEntry2",
+						"VerifiedCommand2",
+						"CommittedEntry2",
+						"TrustedView2",
+						"install_admin2",
+						"bootstrap2",
+						"advance_root2",
+						"advance_pre_root2",
+						"advance_admission2",
+						"reduce",
+						"reduce_admission",
+						"empty_authority2",
+					]
+					.contains(&n.as_str())
+					{
+						return Some(n);
+					}
+				}
+				proc_macro2::TokenTree::Group(g) => {
+					if let Some(n) = forbidden(g.stream()) {
+						return Some(n);
+					}
+				}
+				_ => {}
+			}
+		}
+		None
+	}
+	assert_eq!(
+		forbidden(without_test_items(text.parse().unwrap())),
+		None,
+		"recovery.rs: prohibited token"
+	);
+	let file = syn::parse_file(&text).unwrap();
+	let mut exports = Vec::new();
+	for item in &file.items {
+		match item {
+			syn::Item::Fn(f) if root2_scoped(&f.vis) => exports.push(f.sig.ident.to_string()),
+			syn::Item::Fn(f) => assert!(
+				matches!(f.vis, syn::Visibility::Inherited)
+					|| matches!(&f.vis, syn::Visibility::Restricted(r) if r.path.is_ident("super"))
+			),
+			syn::Item::Impl(_) | syn::Item::Trait(_) | syn::Item::Static(_) | syn::Item::Mod(_) => {
+				panic!("recovery.rs: no impls, traits, statics or modules")
+			}
+			_ => {}
+		}
+	}
+	exports.sort();
+	assert_eq!(
+		exports,
+		[
+			"decode_recovery_mark2",
+			"encode_recovery_mark2",
+			"mark_of2",
+			"observe2",
+			"replay_monitor2"
+		]
+	);
+	// The single full encoding, called at exactly the two bounded sites.
+	assert_eq!(text.matches("encode_authority2(").count(), 1);
+	assert_eq!(
+		calls(fn_body(&text, "state_digest"), "encode_authority2"),
+		1
+	);
+	assert_eq!(calls(&text, "state_digest"), 2);
+	assert_eq!(calls(fn_body(&text, "mark_of2"), "state_digest"), 1);
+	assert_eq!(calls(fn_body(&text, "observe"), "state_digest"), 1);
+	// Dormant: no production caller of any export outside the module.
+	fn walk(dir: PathBuf, tests: &PathBuf, out: &mut Vec<PathBuf>) {
+		for e in fs::read_dir(dir).unwrap() {
+			let p = e.unwrap().path();
+			if p.is_dir() {
+				if p != *tests {
+					walk(p, tests, out)
+				}
+			} else if p.extension().is_some_and(|x| x == "rs") {
+				out.push(p)
+			}
+		}
+	}
+	let mut files = Vec::new();
+	walk(src, &root.join("tests"), &mut files);
+	for f in files {
+		if f.ends_with("root2/recovery.rs") {
+			continue;
+		}
+		let t = fs::read_to_string(&f).unwrap();
+		for name in [
+			"replay_monitor2",
+			"observe2",
+			"mark_of2",
+			"encode_recovery_mark2",
+			"decode_recovery_mark2",
+		] {
+			assert!(
+				!t.contains(name),
+				"production caller of {name} in {}",
+				f.display()
+			);
+		}
+	}
+}

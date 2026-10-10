@@ -11,6 +11,7 @@ mod g1c_roundtrip;
 mod goldens;
 mod invariants;
 mod origin;
+mod recovery;
 mod refusals;
 mod restoration;
 mod review_regressions;
