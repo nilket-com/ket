@@ -6,6 +6,7 @@ use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::admin_install::*;
+use crate::storage::mutation_visibility::root2::admission_registry::encode_permission_key2;
 use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
 use crate::storage::mutation_visibility::root2::incremental::Derived2;
 use crate::storage::mutation_visibility::root2::origin::*;
@@ -364,10 +365,123 @@ fn gate_order_replay_gap_and_authorization() {
 	assert_eq!(bytes_of(&s), before);
 }
 
+type Inventory = [([u8; 73], u64, Option<u64>)];
+fn k1() -> [u8; 73] {
+	unhex(gv()["key"].as_str().unwrap()).try_into().unwrap()
+}
+fn k2() -> [u8; 73] {
+	unhex(gv()["revision_2_key"].as_str().unwrap())
+		.try_into()
+		.unwrap()
+}
+fn permission_for(key: [u8; 73], outcome: u8, enrolled: u64, revoked: Option<u64>) -> ApplyResult2 {
+	ApplyResult2::Permission {
+		outcome,
+		key,
+		enrolled: l(enrolled),
+		revoked: revoked.map(l),
+	}
+}
+fn denied_with(reason: u16, reference: Option<u64>) -> ApplyResult2 {
+	ApplyResult2::Denied {
+		reason,
+		reference: reference.map(l),
+	}
+}
+fn origin_facts() -> OriginFacts2 {
+	OriginFacts2 {
+		genesis: d32("genesis"),
+		bootstrap_fingerprint: d32("bootstrap_fingerprint_stand_in"),
+		bootstrap_command: d32("bootstrap_command"),
+	}
+}
+// Every consumed step: the explicit result and its envelope round trip at exactly (g, c, i),
+// coverage, the explicit permission inventory, rebuild/validation/profile/authority round trips,
+// preserved origin facts and an untouched source state.
+fn after(
+	prev: &MutationAuthorityState2,
+	prev_bytes: &[u8],
+	next: &MutationAuthorityState2,
+	r: &ApplyResult2,
+	i: u64,
+	expected: &ApplyResult2,
+	inventory: &Inventory,
+) {
+	assert!(r == expected, "result at {i}");
+	let (g, c) = gc();
+	let b = r.encode(g, c, l(i)).unwrap();
+	let (dg, dc, dl, dr) = ApplyResult2::decode(&b).unwrap();
+	assert_eq!((dg, dc, dl), (g, c, l(i)));
+	assert!(dr == *r);
+	assert_eq!(covered(next), l(i));
+	let got = root_of(next)
+		.state
+		.permissions
+		.values()
+		.map(|p| {
+			(
+				encode_permission_key2(&p.key).unwrap(),
+				p.enrolled.index,
+				p.revoked.map(|x| x.index),
+			)
+		})
+		.collect::<Vec<_>>();
+	let mut want = inventory.to_vec();
+	want.sort();
+	assert_eq!(got, want, "inventory at {i}");
+	sound(next);
+	assert!(root_and_origin2(next).unwrap().1 == origin_facts());
+	assert_eq!(bytes_of(prev), prev_bytes, "source state untouched at {i}");
+}
+fn step(
+	prev: &MutationAuthorityState2,
+	c: &Command2,
+	i: u64,
+	expected: ApplyResult2,
+	inventory: &Inventory,
+) -> MutationAuthorityState2 {
+	let before = bytes_of(prev);
+	let (next, r) = admit(prev, c, i).unwrap_or_else(|e| panic!("step {i}: {e:?}"));
+	after(prev, &before, &next, &r, i, &expected, inventory);
+	next
+}
+fn plain_step(
+	prev: &MutationAuthorityState2,
+	c: &Command2,
+	i: u64,
+	inventory: &Inventory,
+) -> MutationAuthorityState2 {
+	let before = bytes_of(prev);
+	let (e, v) = entry(c, i);
+	let (next, r) = advance_root2(prev, &e, &v, c).unwrap();
+	after(
+		prev,
+		&before,
+		&next,
+		&r,
+		i,
+		&ApplyResult2::Registered(l(i)),
+		inventory,
+	);
+	next
+}
+fn enroll_revision(revision: u64) -> Command2 {
+	Command2::EnrollAuthority {
+		authority: AuthorityRef2 {
+			id: [0x41; 16],
+			revision,
+		},
+		node: NodeRef2 {
+			node: 7,
+			incarnation: [0x17; 16],
+		},
+		key: [0x2B; 32],
+	}
+}
+
 #[test]
 fn statement_failures_are_consumed_denials() {
-	let s = enrolled();
-	let before = bytes_of(&s);
+	let s = plain_step(&standard(), &enroll(), 3, &[]);
 	let mut cases = Vec::new();
 	for (name, value) in gv()["context_variants"].as_object().unwrap() {
 		cases.push((name.clone(), variant(value.as_str().unwrap())));
@@ -384,12 +498,8 @@ fn statement_failures_are_consumed_denials() {
 		Command2::AdmissionPermission(bytes337(flipped)),
 	));
 	assert_eq!(cases.len(), 9);
-	for (name, c) in cases {
-		let (next, r) = admit(&s, &c, 4).unwrap_or_else(|e| panic!("{name}: {e:?}"));
-		assert!(is_denied(&r, 8, None), "{name}");
-		assert_eq!(covered(&next), l(4), "{name}");
-		assert_eq!(root_of(&next).state.permissions.len(), 0, "{name}");
-		sound(&next);
+	for (_, c) in cases {
+		step(&s, &c, 4, denied_with(8, None), &[]);
 	}
 	// Structural and relation faults are not consumed: Codec at the digest.
 	let mut magic = unhex(sv()["grant"]["bytes"].as_str().unwrap());
@@ -405,7 +515,6 @@ fn statement_failures_are_consumed_denials() {
 		);
 		assert_eq!(c.digest(g, cl).err(), Some(RootError2::Codec));
 	}
-	assert_eq!(bytes_of(&s), before);
 }
 
 #[test]
@@ -413,11 +522,16 @@ fn grant_and_revoke_apply_through_the_gate() {
 	let (g, c) = gc();
 	let grant = statement("grant");
 	let revoke = statement("revoke");
-	let s = enrolled();
-	let (s4, r) = admit(&s, &grant, 4).unwrap();
-	assert!(r == permission(1, 4, None));
+	let s = plain_step(&standard(), &enroll(), 3, &[]);
+	let s4 = step(
+		&s,
+		&grant,
+		4,
+		permission_for(k1(), 1, 4, None),
+		&[(k1(), 4, None)],
+	);
 	assert_eq!(
-		hex_of(&r.encode(g, c, l(4)).unwrap()),
+		hex_of(&permission_for(k1(), 1, 4, None).encode(g, c, l(4)).unwrap()),
 		gv()["granted"].as_str().unwrap()
 	);
 	// The post-grant root, independently constructed.
@@ -425,32 +539,41 @@ fn grant_and_revoke_apply_through_the_gate() {
 		hex_of(&root_of(&s4).encode().unwrap()),
 		gv()["post_grant_root"]["hex"].as_str().unwrap()
 	);
-	sound(&s4);
-	let (s5, r) = admit(&s4, &revoke, 5).unwrap();
-	assert!(r == permission(3, 4, Some(5)));
+	let s5 = step(
+		&s4,
+		&revoke,
+		5,
+		permission_for(k1(), 3, 4, Some(5)),
+		&[(k1(), 4, Some(5))],
+	);
 	assert_eq!(
-		hex_of(&r.encode(g, c, l(5)).unwrap()),
+		hex_of(
+			&permission_for(k1(), 3, 4, Some(5))
+				.encode(g, c, l(5))
+				.unwrap()
+		),
 		gv()["revoked"].as_str().unwrap()
 	);
-	sound(&s5);
-	let (s6, r) = admit(&s5, &grant, 6).unwrap();
-	assert!(r == permission(2, 4, Some(5)));
-	sound(&s6);
-	let (s7, r) = admit(&s6, &revoke, 7).unwrap();
-	assert!(r == permission(4, 4, Some(5)));
-	sound(&s7);
+	let s6 = step(
+		&s5,
+		&grant,
+		6,
+		permission_for(k1(), 2, 4, Some(5)),
+		&[(k1(), 4, Some(5))],
+	);
+	step(
+		&s6,
+		&revoke,
+		7,
+		permission_for(k1(), 4, 4, Some(5)),
+		&[(k1(), 4, Some(5))],
+	);
 	// Unknown authority and unknown permission.
-	let (x, r) = admit(&standard(), &grant, 3).unwrap();
-	assert!(is_denied(&r, 9, None));
-	sound(&x);
-	let (x, r) = admit(&standard(), &revoke, 3).unwrap();
-	assert!(is_denied(&r, 9, None));
-	sound(&x);
+	step(&standard(), &grant, 3, denied_with(9, None), &[]);
+	step(&standard(), &revoke, 3, denied_with(9, None), &[]);
 	// Revoked authority.
-	let retired = plain(&s, &Command2::RevokeAuthority(authority()), 4);
-	let (x, r) = admit(&retired, &grant, 5).unwrap();
-	assert!(is_denied(&r, 16, Some(l(4))));
-	sound(&x);
+	let retired = plain_step(&s, &Command2::RevokeAuthority(authority()), 4, &[]);
+	step(&retired, &grant, 5, denied_with(16, Some(4)), &[]);
 	// Capacity under a caller-lowered permission limit.
 	let tight = lower_limits_for_test(
 		&s,
@@ -459,49 +582,92 @@ fn grant_and_revoke_apply_through_the_gate() {
 			..Limits2::default()
 		},
 	);
-	let (x, r) = admit(&tight, &grant, 4).unwrap();
-	assert!(is_denied(&r, 11, None));
-	assert_eq!(root_of(&x).state.permissions.len(), 0);
+	step(&tight, &grant, 4, denied_with(11, None), &[]);
 }
 
 #[test]
 fn timelines_t1_to_t6_end_to_end() {
 	let grant = statement("grant");
 	let revoke = statement("revoke");
+	let base = plain_step(&standard(), &enroll(), 3, &[]);
 	// T1-T3 with the same statement bytes in later entries.
-	let (s, r) = admit(&enrolled(), &grant, 4).unwrap();
-	assert!(r == permission(1, 4, None));
-	let (s, r) = admit(&s, &grant, 5).unwrap();
-	assert!(r == permission(2, 4, None), "T1");
-	let (s, r) = admit(&s, &revoke, 6).unwrap();
-	assert!(r == permission(3, 4, Some(6)));
-	let (s, r) = admit(&s, &grant, 7).unwrap();
-	assert!(r == permission(2, 4, Some(6)), "T2: no revival");
-	let (s, r) = admit(&s, &revoke, 8).unwrap();
-	assert!(r == permission(4, 4, Some(6)), "T3");
-	sound(&s);
-	// T4: a revoke before the grant is denied, then the same bytes revoke after the grant.
-	let (s, r) = admit(&enrolled(), &revoke, 4).unwrap();
-	assert!(is_denied(&r, 9, None));
-	let (s, r) = admit(&s, &grant, 5).unwrap();
-	assert!(r == permission(1, 5, None));
-	let (s, r) = admit(&s, &revoke, 6).unwrap();
-	assert!(r == permission(3, 5, Some(6)), "T4");
-	sound(&s);
+	let s = step(
+		&base,
+		&grant,
+		4,
+		permission_for(k1(), 1, 4, None),
+		&[(k1(), 4, None)],
+	);
+	let s = step(
+		&s,
+		&grant,
+		5,
+		permission_for(k1(), 2, 4, None),
+		&[(k1(), 4, None)],
+	);
+	let s = step(
+		&s,
+		&revoke,
+		6,
+		permission_for(k1(), 3, 4, Some(6)),
+		&[(k1(), 4, Some(6))],
+	);
+	let s = step(
+		&s,
+		&grant,
+		7,
+		permission_for(k1(), 2, 4, Some(6)),
+		&[(k1(), 4, Some(6))],
+	);
+	step(
+		&s,
+		&revoke,
+		8,
+		permission_for(k1(), 4, 4, Some(6)),
+		&[(k1(), 4, Some(6))],
+	);
+	// T4: a revoke before the grant is denied; the same bytes revoke after the grant.
+	let s = step(&base, &revoke, 4, denied_with(9, None), &[]);
+	let s = step(
+		&s,
+		&grant,
+		5,
+		permission_for(k1(), 1, 5, None),
+		&[(k1(), 5, None)],
+	);
+	step(
+		&s,
+		&revoke,
+		6,
+		permission_for(k1(), 3, 5, Some(6)),
+		&[(k1(), 5, Some(6))],
+	);
 	// T5: refused for an unknown authority, effective after enrollment.
-	let (s, r) = admit(&standard(), &grant, 3).unwrap();
-	assert!(is_denied(&r, 9, None));
-	let s = plain(&s, &enroll(), 4);
-	let (s, r) = admit(&s, &grant, 5).unwrap();
-	assert!(r == permission(1, 5, None), "T5");
-	sound(&s);
-	// T6: a revoked authority revision is never eligible again.
-	let s = plain(&enrolled(), &Command2::RevokeAuthority(authority()), 4);
-	let (s, r) = admit(&s, &grant, 5).unwrap();
-	assert!(is_denied(&r, 16, Some(l(4))));
-	let (s, r) = admit(&s, &grant, 6).unwrap();
-	assert!(is_denied(&r, 16, Some(l(4))), "T6");
-	sound(&s);
+	let s = step(&standard(), &grant, 3, denied_with(9, None), &[]);
+	let s = plain_step(&s, &enroll(), 4, &[]);
+	step(
+		&s,
+		&grant,
+		5,
+		permission_for(k1(), 1, 5, None),
+		&[(k1(), 5, None)],
+	);
+	// T6: a revoked revision is never eligible again; revision 2 is a distinct, separately
+	// enrolled authority whose independently signed grant passes the gate.
+	let s = plain_step(&base, &Command2::RevokeAuthority(authority()), 4, &[]);
+	let s = step(&s, &grant, 5, denied_with(16, Some(4)), &[]);
+	let s = step(&s, &grant, 6, denied_with(16, Some(4)), &[]);
+	let s = plain_step(&s, &enroll_revision(2), 7, &[]);
+	let rev2 = variant(gv()["revision_2"].as_str().unwrap());
+	let s = step(
+		&s,
+		&rev2,
+		8,
+		permission_for(k2(), 1, 8, None),
+		&[(k2(), 8, None)],
+	);
+	assert_ne!(k1(), k2());
+	step(&s, &grant, 9, denied_with(16, Some(4)), &[(k2(), 8, None)]);
 }
 
 #[test]
