@@ -859,8 +859,40 @@ mod observer_tests {
 		}
 	}
 
-	/// ADR 627: a dial dropped by an outer timeout records `dial_abandoned` (with its elapsed time),
-	/// exactly once, and nothing claims it resolved or failed.
+	// The one `dial_start` and the one `dial_abandoned` of this log: same stream, op, target and role,
+	// the abandonment at or after the start, and its `elapsed_us` exactly the difference of the two
+	// `at_us` samples the observer took. No duration floor: the outer trigger's clock is not the
+	// observer's, and scheduling decides how long after the start the drop runs.
+	fn assert_abandoned_once(log: &EventLog, path: &std::path::Path) {
+		let events = read_events(path);
+		let starts = named(&events, "dial_start");
+		let abandoned = named(&events, "dial_abandoned");
+		assert_eq!(starts.len(), 1, "{events:?}");
+		assert_eq!(abandoned.len(), 1, "{events:?}");
+		let (start, end) = (starts[0], abandoned[0]);
+		// Concrete values first, so two missing fields cannot compare equal.
+		assert!(start["stream"].as_u64().expect("stream") > 0);
+		assert_eq!(start["op"], "connect");
+		assert_eq!(
+			start["target"],
+			serde_json::json!({ "endpoint": "127.0.0.1:9" })
+		);
+		assert_eq!(start["role"], "dispatch");
+		for key in ["stream", "op", "target", "role"] {
+			assert_eq!(start[key], end[key], "{key}");
+		}
+		let started = start["at_us"].as_u64().expect("start at_us");
+		let ended = end["at_us"].as_u64().expect("abandon at_us");
+		assert!(ended >= started);
+		assert_eq!(end["elapsed_us"].as_u64(), Some(ended - started));
+		assert!(
+			named(&events, "dial_resolved").is_empty() && named(&events, "dial_failed").is_empty()
+		);
+		assert!(!log.failed(), "event log write failed");
+	}
+
+	/// ADR 627: a dial dropped by an outer timeout records `dial_abandoned` exactly once, measured
+	/// from its own start, and nothing claims it resolved or failed.
 	#[tokio::test]
 	async fn a_dial_dropped_before_it_resolves_is_recorded_as_abandoned() {
 		let (log, path) = fresh_log();
@@ -875,14 +907,23 @@ mod observer_tests {
 				.await
 				.is_err()
 		);
-		let events = read_events(&path);
-		assert_eq!(named(&events, "dial_start").len(), 1);
-		let abandoned = named(&events, "dial_abandoned");
-		assert_eq!(abandoned.len(), 1, "{events:?}");
-		assert!(abandoned[0]["elapsed_us"].as_u64().expect("elapsed") >= 50_000);
-		assert!(
-			named(&events, "dial_resolved").is_empty() && named(&events, "dial_failed").is_empty()
-		);
+		assert_abandoned_once(&log, &path);
+	}
+
+	/// ADR 627: a known-pending dial, polled once and then dropped, records the same single
+	/// abandonment; no wall-clock trigger is involved.
+	#[tokio::test]
+	async fn a_pending_dial_polled_once_then_dropped_is_recorded_as_abandoned() {
+		let (log, path) = fresh_log();
+		let transport = ObservedTransport {
+			inner: Arc::new(NeverResolves),
+			log: log.clone(),
+			role: "dispatch",
+		};
+		let mut dial = Box::pin(transport.connect("127.0.0.1:9"));
+		assert!(futures::poll!(dial.as_mut()).is_pending());
+		drop(dial);
+		assert_abandoned_once(&log, &path);
 	}
 
 	#[tokio::test]
