@@ -1,6 +1,6 @@
-use super::super::inventory::*;
-use super::super::snapshot::*;
 use super::*;
+use crate::storage::mutation_visibility::root2::provisioning::inventory::*;
+use crate::storage::mutation_visibility::root2::provisioning::snapshot::*;
 use SnapshotError2::*;
 
 fn decode(b: &[u8]) -> Result<(), SnapshotError2> {

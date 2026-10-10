@@ -1,9 +1,9 @@
-use super::super::{DecisionLogId, ParentManifest, ProofKeyBinding};
 use super::{
 	admission_registry::{PERMISSIONS2, PermissionMap2},
 	persistent::Map,
 	stored::{Cuts2, StoredParent2},
 };
+use crate::storage::mutation_visibility::{DecisionLogId, ParentManifest, ProofKeyBinding};
 
 pub type Log2 = DecisionLogId;
 pub type Digest2 = [u8; 32];

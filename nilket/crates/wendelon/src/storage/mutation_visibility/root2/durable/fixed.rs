@@ -96,7 +96,7 @@ impl UnverifiedIndex2 {
 	fn validate(&self) -> Result2<()> {
 		self.identity.validate().map_err(|_| RootError2::Codec)?;
 		self.hlc.bytes()?;
-		super::super::codec::valid_log(self.reservation)?;
+		crate::storage::mutation_visibility::root2::codec::valid_log(self.reservation)?;
 		nonzero16(self.object)?;
 		check(
 			self.child < 256
@@ -241,8 +241,8 @@ impl UnverifiedGrantArchive2 {
 	fn validate(&self) -> Result2<()> {
 		nonzero16(self.generation)?;
 		nonzero16(self.cluster)?;
-		super::super::codec::valid_log(self.bootstrap)?;
-		super::super::codec::valid_log(self.applied)?;
+		crate::storage::mutation_visibility::root2::codec::valid_log(self.bootstrap)?;
+		crate::storage::mutation_visibility::root2::codec::valid_log(self.applied)?;
 		check(self.bootstrap.index <= self.applied.index)?;
 		let Command2::Grant {
 			lineage,

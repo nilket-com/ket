@@ -1,5 +1,5 @@
-use super::super::{adapters::*, provenance::*};
 use super::*;
+use crate::storage::mutation_visibility::{adapters::*, provenance::*};
 use arrow::{array::*, datatypes::*, record_batch::RecordBatch};
 use std::sync::Arc;
 pub(super) fn batch(ids: Vec<i64>) -> RecordBatch {
@@ -384,8 +384,12 @@ fn provenance_structural_golden_and_counts_lengths() {
 	};
 	let payload = bytes("structural_provenance_payload");
 	assert_eq!(payload.len(), 357);
-	let encoded =
-		super::super::encoding::envelope(b"VISPROV1", &payload, MAX_PROVENANCE_BYTES).unwrap();
+	let encoded = crate::storage::mutation_visibility::encoding::envelope(
+		b"VISPROV1",
+		&payload,
+		MAX_PROVENANCE_BYTES,
+	)
+	.unwrap();
 	assert_eq!(&encoded[..14], bytes("structural_envelope_prefix"));
 	assert_eq!(encoded.len(), 403);
 	let decoded = UnverifiedFrameProvenance::decode(&encoded).unwrap();

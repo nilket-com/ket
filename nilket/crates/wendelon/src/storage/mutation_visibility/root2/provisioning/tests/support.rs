@@ -1,4 +1,4 @@
-use super::super::inventory::*;
+use crate::storage::mutation_visibility::root2::provisioning::inventory::*;
 
 pub(super) fn unhex(s: &str) -> Vec<u8> {
 	(0..s.len())
@@ -23,13 +23,13 @@ pub(super) fn event(name: &str) -> Event2 {
 }
 // Recomputes the trailing SHA-256 so a test reaches the check it targets.
 pub(super) fn reseal_event(mut b: Vec<u8>) -> Vec<u8> {
-	let sum = super::super::super::codec::hash(b"", &b[..352]);
+	let sum = crate::storage::mutation_visibility::root2::codec::hash(b"", &b[..352]);
 	b[352..].copy_from_slice(&sum);
 	b
 }
 pub(super) fn reseal_snapshot(mut b: Vec<u8>) -> Vec<u8> {
 	let n = b.len() - 32;
-	let sum = super::super::super::codec::hash(b"", &b[..n]);
+	let sum = crate::storage::mutation_visibility::root2::codec::hash(b"", &b[..n]);
 	b[n..].copy_from_slice(&sum);
 	b
 }

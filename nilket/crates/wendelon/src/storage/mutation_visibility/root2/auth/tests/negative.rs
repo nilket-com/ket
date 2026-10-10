@@ -268,19 +268,29 @@ fn bounds_precede_structural_validation_and_zero_scope_refuses() {
 #[test]
 fn checked_arithmetic_and_structural_errors_are_typed() {
 	assert_eq!(
-		super::super::preimage::checked_size(usize::MAX, 1, 1, usize::MAX),
+		crate::storage::mutation_visibility::root2::auth::preimage::checked_size(
+			usize::MAX,
+			1,
+			1,
+			usize::MAX
+		),
 		Err(AuthError2::Overflow)
 	);
 	assert_eq!(
-		super::super::preimage::checked_size(0, usize::MAX, 2, usize::MAX),
+		crate::storage::mutation_visibility::root2::auth::preimage::checked_size(
+			0,
+			usize::MAX,
+			2,
+			usize::MAX
+		),
 		Err(AuthError2::Overflow)
 	);
 	assert_eq!(
-		super::super::preimage::checked_size(1, 1, 1, 1),
+		crate::storage::mutation_visibility::root2::auth::preimage::checked_size(1, 1, 1, 1),
 		Err(AuthError2::Limit)
 	);
 	assert_eq!(
-		super::super::preimage::length(usize::MAX),
+		crate::storage::mutation_visibility::root2::auth::preimage::length(usize::MAX),
 		Err(AuthError2::Overflow)
 	);
 	let mut c = claim();

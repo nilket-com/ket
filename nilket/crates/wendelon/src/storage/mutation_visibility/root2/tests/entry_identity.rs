@@ -1,6 +1,6 @@
-use super::super::entry_identity::*;
-use super::super::types::Digest2;
 use crate::consensus::WendelonRequest;
+use crate::storage::mutation_visibility::root2::entry_identity::*;
+use crate::storage::mutation_visibility::root2::types::Digest2;
 use aws_lc_rs::digest::{SHA256, digest};
 use openraft::{BasicNode, Membership};
 use std::collections::{BTreeMap, BTreeSet};

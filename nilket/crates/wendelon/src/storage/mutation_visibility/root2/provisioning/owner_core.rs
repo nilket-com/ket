@@ -1,18 +1,20 @@
 //! Pure owner-core decisions and the repair-evidence codec. Nothing here reads files, takes a lock,
 //! syncs, or yields a root, authority state or trust token. A decision is not a durability claim,
 //! and evidence checksums are integrity bindings, not authentication.
-use super::super::super::redacted_debug;
-use super::super::admin::manifest::{
-	ADMIN_MANIFEST_BYTES2, AdminManifest2, admin_manifest_digest2,
-};
-use super::super::admin::record::{BootstrapIdentity2, BootstrapObservation2, BootstrapRecord2};
-use super::super::codec::hash;
-use super::super::types::Digest2;
 use super::inventory::{
 	EVENT_BYTES2, Event2, EventBody2, LogError2, LogState2, MAX_ROOTS2, MAX_TAIL2,
 	ORDINARY_EVENTS2, RootEntry2, RootIdentity2, RootState2, TOTAL_EVENTS2, decode_event2,
 	encode_event2, fold_events2,
 };
+use crate::storage::mutation_visibility::redacted_debug;
+use crate::storage::mutation_visibility::root2::admin::manifest::{
+	ADMIN_MANIFEST_BYTES2, AdminManifest2, admin_manifest_digest2,
+};
+use crate::storage::mutation_visibility::root2::admin::record::{
+	BootstrapIdentity2, BootstrapObservation2, BootstrapRecord2,
+};
+use crate::storage::mutation_visibility::root2::codec::hash;
+use crate::storage::mutation_visibility::root2::types::Digest2;
 
 const MAGIC: &[u8; 8] = b"VISREP03";
 const VERSION: u16 = 1;

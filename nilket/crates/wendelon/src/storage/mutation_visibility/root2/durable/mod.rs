@@ -8,10 +8,12 @@ pub(crate) mod loader;
 mod local_store;
 mod wire;
 mod witness;
-use super::super::{MutationIdentity, provenance::UnverifiedFrameProvenance};
 use super::{
 	codec::{Read2, Wire2, blob, log},
 	*,
+};
+use crate::storage::mutation_visibility::{
+	MutationIdentity, provenance::UnverifiedFrameProvenance,
 };
 pub use bundle::*;
 pub use fixed::*;

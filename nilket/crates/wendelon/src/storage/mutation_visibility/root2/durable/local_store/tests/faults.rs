@@ -371,7 +371,7 @@ async fn index_repair_each_cut_keeps_source_or_durably_preserved_old_evidence() 
 }
 #[tokio::test]
 async fn physical_inventory_reports_missing_and_corrupt_bytes_without_trust() {
-	use super::super::inspection::PhysicalBytes;
+	use crate::storage::mutation_visibility::root2::durable::local_store::inspection::PhysicalBytes;
 	let temp = Temp::new();
 	let (_, store, entry, _) = progress::content(&temp).await;
 	let physical = store.physical_parent(entry.owner.clone()).await.unwrap();
@@ -486,11 +486,11 @@ async fn data_index_and_first_names_all_cut_before_acknowledgement() {
 			if acknowledged {
 				assert_eq!(
 					physical.data,
-					super::super::inspection::PhysicalBytes::Structural
+					crate::storage::mutation_visibility::root2::durable::local_store::inspection::PhysicalBytes::Structural
 				);
 				assert_eq!(
 					physical.index,
-					super::super::inspection::PhysicalBytes::Structural
+					crate::storage::mutation_visibility::root2::durable::local_store::inspection::PhysicalBytes::Structural
 				);
 			}
 			assert_eq!(physical.records, 1); // None of these cuts generates LocalChildDurable.

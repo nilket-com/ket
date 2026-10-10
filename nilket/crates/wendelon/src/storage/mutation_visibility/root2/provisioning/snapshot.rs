@@ -1,10 +1,12 @@
 //! Replica inventory snapshot codec. Codec validity is not provenance (the file pin, delivered
 //! out of band, is) and not readiness.
-use super::super::super::redacted_debug;
-use super::super::admin::key::check_enrollable_admin_key2;
-use super::super::admin::record::{BOOTSTRAP_RECORD_BYTES2, BootstrapRecord2};
-use super::super::codec::hash;
 use super::inventory::{LogState2, MAX_ROOTS2, RootIdentity2, RootState2};
+use crate::storage::mutation_visibility::redacted_debug;
+use crate::storage::mutation_visibility::root2::admin::key::check_enrollable_admin_key2;
+use crate::storage::mutation_visibility::root2::admin::record::{
+	BOOTSTRAP_RECORD_BYTES2, BootstrapRecord2,
+};
+use crate::storage::mutation_visibility::root2::codec::hash;
 
 const MAGIC: &[u8; 8] = b"VISINV02";
 const VERSION: u16 = 1;

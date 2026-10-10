@@ -4,14 +4,14 @@
 //! Supported path model: Linux, a local filesystem, one owner host, and trusted owner and export
 //! parent paths that are not replaced while an operation runs. Nothing here yields a root,
 //! authority state or trust token, and a marker's absence never proves no sync failed.
-use super::super::super::redacted_debug;
-use super::super::types::Digest2;
 use super::inventory::{RootState2, encode_event2, fold_events2};
 use super::owner_core::{
 	Classification2, Decision2, EventRef2, OpId2, OwnerError2, OwnerRequest2, classify2, decide2,
 	decode_evidence2, encode_evidence2, event_request_key2, repair_context2,
 };
 use super::snapshot::encode_snapshot2;
+use crate::storage::mutation_visibility::redacted_debug;
+use crate::storage::mutation_visibility::root2::types::Digest2;
 use std::fs::{self, File, TryLockError};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -463,7 +463,7 @@ pub(super) mod seam {
 		static STOP: RefCell<Option<(IoStep2, u32)>> = const { RefCell::new(None) };
 		static SEEN: RefCell<Vec<IoStep2>> = const { RefCell::new(Vec::new()) };
 	}
-	pub(in super::super) struct Plan;
+	pub(in crate::storage::mutation_visibility::root2::provisioning) struct Plan;
 	impl Drop for Plan {
 		fn drop(&mut self) {
 			FAULTS.with(|f| f.borrow_mut().clear());
@@ -471,14 +471,17 @@ pub(super) mod seam {
 		}
 	}
 	/// Fail the nth (1-based) occurrence of each listed step; stop after the nth of `stop`.
-	pub(in super::super) fn plan(faults: &[(IoStep2, u32)], stop: Option<(IoStep2, u32)>) -> Plan {
+	pub(in crate::storage::mutation_visibility::root2::provisioning) fn plan(
+		faults: &[(IoStep2, u32)],
+		stop: Option<(IoStep2, u32)>,
+	) -> Plan {
 		assert!(faults.len() <= 8, "bounded fault plan");
 		FAULTS.with(|f| *f.borrow_mut() = faults.to_vec());
 		STOP.with(|s| *s.borrow_mut() = stop);
 		SEEN.with(|s| s.borrow_mut().clear());
 		Plan
 	}
-	pub(in super::super) fn seen() -> Vec<IoStep2> {
+	pub(in crate::storage::mutation_visibility::root2::provisioning) fn seen() -> Vec<IoStep2> {
 		SEEN.with(|s| s.borrow().clone())
 	}
 	fn count(step: IoStep2) -> u32 {

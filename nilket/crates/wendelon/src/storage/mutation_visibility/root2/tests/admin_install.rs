@@ -1,19 +1,21 @@
-use super::super::admin::manifest::AdminManifest2;
-use super::super::admin::record::BootstrapRecord2;
-use super::super::admin_install::*;
-use super::super::entry_identity::EntryPosition2;
-use super::super::origin::*;
-use super::super::provisioning::inventory::{LogState2, RootEntry2, RootIdentity2, RootState2};
-use super::super::provisioning::replica_anchor::*;
-use super::super::provisioning::snapshot::encode_snapshot2;
-use super::super::trust::CommittedEntry2;
 use super::*;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
+use crate::storage::mutation_visibility::root2::admin_install::*;
+use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
+use crate::storage::mutation_visibility::root2::origin::*;
+use crate::storage::mutation_visibility::root2::provisioning::inventory::{
+	LogState2, RootEntry2, RootIdentity2, RootState2,
+};
+use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::*;
+use crate::storage::mutation_visibility::root2::provisioning::snapshot::encode_snapshot2;
+use crate::storage::mutation_visibility::root2::trust::CommittedEntry2;
 
 const G: [u8; 16] = [0xa1; 16];
 const C: [u8; 16] = [0xc2; 16];
 
 fn sha(b: &[u8]) -> Digest2 {
-	super::super::codec::hash(b"", b)
+	crate::storage::mutation_visibility::root2::codec::hash(b"", b)
 }
 fn unhex(s: &str) -> Vec<u8> {
 	(0..s.len())

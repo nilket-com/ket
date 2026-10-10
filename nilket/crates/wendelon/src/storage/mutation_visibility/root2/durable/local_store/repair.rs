@@ -1,7 +1,9 @@
-use super::super::loader::{LoaderCapability2, load_content2};
 use super::store::{LocalStore, build_index};
 use super::*;
 use crate::storage::mutation_visibility::ProofKeyProvider;
+use crate::storage::mutation_visibility::root2::durable::loader::{
+	LoaderCapability2, load_content2,
+};
 pub(super) struct RepairResult {
 	pub(super) candidate: Vec<u8>,
 	pub(super) durable: bool,

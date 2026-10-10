@@ -8,10 +8,12 @@ fn s1_generation_tenant_schema_caller_identity_and_selector_are_bound() {
 			0 => c.manifest.identity.generation = [3; 16],
 			1 => c.manifest.identity.tenant = 2,
 			2 => {
-				c.manifest.identity.scope = super::super::super::MutationScope::Table;
+				c.manifest.identity.scope =
+					crate::storage::mutation_visibility::MutationScope::Table;
 				c.manifest.identity.table = [2; 16];
 				c.manifest.identity.schema_generation = 1;
-				c.manifest.operation = super::super::super::MutationOperation::Insert;
+				c.manifest.operation =
+					crate::storage::mutation_visibility::MutationOperation::Insert;
 			}
 			_ => c.manifest.identity.caller = [0; 16],
 		};

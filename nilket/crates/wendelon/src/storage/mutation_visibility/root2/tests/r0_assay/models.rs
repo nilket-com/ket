@@ -254,7 +254,8 @@ pub(super) fn model(case: &str) -> Root2 {
 	r.state.fingerprint = [0x44; 32];
 	r.state.command_digest = [0x66; 32];
 	validate_state(&r.state).unwrap();
-	r.state.derived = super::super::super::incremental::Derived2::build(&r.state).unwrap();
+	r.state.derived =
+		crate::storage::mutation_visibility::root2::incremental::Derived2::build(&r.state).unwrap();
 	r
 }
 pub(super) struct Arm {

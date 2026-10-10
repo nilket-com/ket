@@ -1,4 +1,4 @@
-use super::super::RootError2;
+use crate::storage::mutation_visibility::root2::RootError2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum AuthError2 {

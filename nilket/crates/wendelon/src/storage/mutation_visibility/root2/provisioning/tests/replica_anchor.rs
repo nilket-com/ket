@@ -1,13 +1,17 @@
-use super::super::super::admin::manifest::{AdminManifest2, admin_manifest_digest2};
-use super::super::super::admin::record::BootstrapRecord2;
-use super::super::inventory::*;
-use super::super::replica_anchor::*;
-use super::super::snapshot::{SnapshotError2, encode_snapshot2};
 use super::*;
+use crate::storage::mutation_visibility::root2::admin::manifest::{
+	AdminManifest2, admin_manifest_digest2,
+};
+use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
+use crate::storage::mutation_visibility::root2::provisioning::inventory::*;
+use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::*;
+use crate::storage::mutation_visibility::root2::provisioning::snapshot::{
+	SnapshotError2, encode_snapshot2,
+};
 use ReplicaAnchorError2 as E;
 
 fn sha(b: &[u8]) -> [u8; 32] {
-	super::super::super::codec::hash(b"", b)
+	crate::storage::mutation_visibility::root2::codec::hash(b"", b)
 }
 fn anchor_vectors() -> serde_json::Value {
 	serde_json::from_str(include_str!("anchor_vectors.json")).unwrap()

@@ -310,7 +310,7 @@ mod tests {
 				cascade_index: EncodingCascadeIndex::ZERO,
 				decoded_byte_len: RecordBodyByteLen::new(encoded_len as u64),
 				decoded_value_count: BufferValueCount::new(1024),
-				encoded_range: super::super::EncodedBufferByteRange {
+				encoded_range: crate::storage::encoding::EncodedBufferByteRange {
 					start: EncodingPageByteOffset::ZERO,
 					len: RecordBodyByteLen::new(encoded_len as u64),
 				},

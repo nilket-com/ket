@@ -1,11 +1,11 @@
 //! Private bounded content loader; synthetic capability construction only under cfg(test).
 #![allow(dead_code)]
-use super::super::super::{
+use super::*;
+use crate::storage::mutation_visibility::{
 	ProofKeyProvider,
 	adapters::ProofSchema,
 	provenance::{ContentVerifiedFrameProvenance, TrustedFrameRows},
 };
-use super::*;
 use arrow::{
 	ipc::{MessageHeader, Type, root_as_message},
 	record_batch::RecordBatch,

@@ -1,13 +1,15 @@
-use super::super::super::admin::manifest::{AdminManifest2, admin_manifest_digest2};
-use super::super::super::admin::record::BootstrapObservation2;
-use super::super::inventory::*;
-use super::super::owner_core::*;
 use super::*;
+use crate::storage::mutation_visibility::root2::admin::manifest::{
+	AdminManifest2, admin_manifest_digest2,
+};
+use crate::storage::mutation_visibility::root2::admin::record::BootstrapObservation2;
+use crate::storage::mutation_visibility::root2::provisioning::inventory::*;
+use crate::storage::mutation_visibility::root2::provisioning::owner_core::*;
 
 const B3: usize = 3 * 384;
 
 fn sha(b: &[u8]) -> [u8; 32] {
-	super::super::super::codec::hash(b"", b)
+	crate::storage::mutation_visibility::root2::codec::hash(b"", b)
 }
 fn op(n: u8) -> OpId2 {
 	op_id2([n; 16]).unwrap()

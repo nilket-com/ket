@@ -19,13 +19,15 @@ pub(super) fn wrap(m: &[u8; 8], b: &[u8], cap: usize) -> Result2<Vec<u8>> {
 	if b.len().checked_add(48).ok_or(RootError2::Overflow)? > cap {
 		return Err(RootError2::Limit);
 	}
-	super::super::codec::envelope(m, b, cap - 48)
+	crate::storage::mutation_visibility::root2::codec::envelope(m, b, cap - 48)
 }
 pub(super) fn open<'a>(b: &'a [u8], m: &[u8; 8], cap: usize) -> Result2<Read2<'a>> {
 	if b.len() > cap {
 		return Err(RootError2::Limit);
 	}
-	Ok(Read2::new(super::super::codec::open(b, m, cap - 48)?))
+	Ok(Read2::new(
+		crate::storage::mutation_visibility::root2::codec::open(b, m, cap - 48)?,
+	))
 }
 pub(super) fn identity(r: &mut Read2<'_>) -> Result2<MutationIdentity> {
 	MutationIdentity::decode(r.take(73)?).map_err(|_| RootError2::Codec)

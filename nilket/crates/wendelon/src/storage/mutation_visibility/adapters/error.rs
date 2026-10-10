@@ -1,4 +1,4 @@
-use super::super::{CommitmentError, VisibilityError};
+use crate::storage::mutation_visibility::{CommitmentError, VisibilityError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterError {

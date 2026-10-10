@@ -1,13 +1,13 @@
 //! Dormant pre-root and origin layer over Root2: covers the committed log from its genesis
 //! membership entry through the first Root2 Bootstrap and beyond. Pure transitions over opaque
 //! trusted inputs; decoded bytes never become state (snapshot install is a separate, held step).
-use super::super::redacted_debug;
 use super::codec::{Read2, envelope, open, valid_log};
 use super::command::{ApplyResult2, Command2};
 use super::entry_identity::EntryPosition2;
 use super::state::{Root2, UnverifiedRoot2};
 use super::trust::{CommittedEntry2, TrustedEntry2, VerifiedCommand2};
 use super::types::*;
+use crate::storage::mutation_visibility::redacted_debug;
 
 const MAGIC: &[u8; 8] = b"VISMAS02";
 const EMPTY: u8 = 0;

@@ -215,8 +215,10 @@ pub(super) fn read_vec<T: Wire2>(r: &mut Read2<'_>, count: usize, max: usize) ->
 	Ok(v)
 }
 
-pub(super) fn read_binding2(r: &mut Read2<'_>) -> Result2<super::super::ProofKeyBinding> {
-	let b = super::super::ProofKeyBinding {
+pub(super) fn read_binding2(
+	r: &mut Read2<'_>,
+) -> Result2<crate::storage::mutation_visibility::ProofKeyBinding> {
+	let b = crate::storage::mutation_visibility::ProofKeyBinding {
 		generation: r.array()?,
 		tenant: r.u64()?,
 		key_id: r.array()?,

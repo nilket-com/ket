@@ -1,5 +1,7 @@
-use super::super::store::{FENCED, HARD_FENCED, INDEX_FENCED};
 use super::*;
+use crate::storage::mutation_visibility::root2::durable::local_store::store::{
+	FENCED, HARD_FENCED, INDEX_FENCED,
+};
 
 async fn reopened(
 	temp: &Temp,
@@ -368,7 +370,10 @@ async fn reopened_index_repair_requires_matching_scoped_content_verification() {
 	let temp = Temp::new();
 	let (model, store, p, _, old) = reopened(&temp, "invalid").await;
 	let (_, wrong_cap, wrong_key) =
-		super::super::super::loader::tests::raw_variant(false, Some(908));
+		crate::storage::mutation_visibility::root2::durable::loader::tests::raw_variant(
+			false,
+			Some(908),
+		);
 	assert!(
 		store
 			.repair_index(

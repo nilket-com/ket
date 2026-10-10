@@ -33,7 +33,10 @@ impl Credit {
 			.map(|c| c.versions.len())
 			.sum::<usize>() as u64;
 		require(k > 0 && k <= 256 && v > 0 && v <= 512)?;
-		require(super::super::loader::ipc_preflight(&data.frame)? as u64 == v)?;
+		require(
+			crate::storage::mutation_visibility::root2::durable::loader::ipc_preflight(&data.frame)?
+				as u64 == v,
+		)?;
 		require(local.node != 0 && local.incarnation != [0; 16])?;
 		let n = match role {
 			1 => {

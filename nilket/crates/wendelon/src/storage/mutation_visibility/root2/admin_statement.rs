@@ -3,11 +3,11 @@
 //! issuer authorization, carries no committed-provenance claim, and implements no lifecycle,
 //! registry or replay semantics. Its whole context must be re-bound to the administrator installed
 //! at the pre-entry cut by the later issuer gate. No signing or key custody happens here.
-use super::super::{MutationScope, redacted_debug};
 use super::admin_install::{
 	AdminContext2, InstalledAdmin2, admin_context2, admin_key2, admin_namespace2,
 };
 use super::types::{AuthorityRef2, Log2};
+use crate::storage::mutation_visibility::{MutationScope, redacted_debug};
 use ed25519_dalek::{Signature, VerifyingKey};
 
 const MAGIC: &[u8; 8] = b"VISADS02";

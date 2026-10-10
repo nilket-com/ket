@@ -1,7 +1,7 @@
-use super::super::entry_identity::EntryPosition2;
-use super::super::origin::*;
-use super::super::trust::CommittedEntry2;
 use super::*;
+use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
+use crate::storage::mutation_visibility::root2::origin::*;
+use crate::storage::mutation_visibility::root2::trust::CommittedEntry2;
 
 const G: [u8; 16] = [0xa1; 16];
 const C: [u8; 16] = [0xc2; 16];

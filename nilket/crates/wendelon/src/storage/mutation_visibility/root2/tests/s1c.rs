@@ -6,7 +6,13 @@ fn s1c_existing_goldens_equal_legacy_decoder_and_codec() {
 		let bytes = super::s1c_oracle::legacy_profile2(&r.encode().unwrap()).unwrap();
 		let legacy = super::s1c_oracle::state::UnverifiedRoot2::decode(&bytes).unwrap();
 		assert_eq!(legacy.encode().unwrap(), bytes);
-		assert!(r.state.derived == super::super::incremental::Derived2::build(&r.state).unwrap());
+		assert!(
+			r.state.derived
+				== crate::storage::mutation_visibility::root2::incremental::Derived2::build(
+					&r.state
+				)
+				.unwrap()
+		);
 	}
 }
 
@@ -18,7 +24,8 @@ pub(super) fn checked_step(
 ) -> Result2<(Root2, ApplyResult2)> {
 	// Existing fixtures can edit private DTO-like fields. Re-seal through the full validator first.
 	let mut sealed = root.clone();
-	sealed.state.derived = super::super::incremental::Derived2::build(&sealed.state)?;
+	sealed.state.derived =
+		crate::storage::mutation_visibility::root2::incremental::Derived2::build(&sealed.state)?;
 	let before = sealed.encode()?;
 	let expected = super::s1c_oracle::reduce(
 		&super::s1c_oracle::legacy_profile2(&before)?,
@@ -38,7 +45,12 @@ pub(super) fn checked_step(
 				old_o.encode(n.state.generation, n.state.cluster, n.covered())?
 			);
 			validate_state(&n.state)?;
-			assert!(n.state.derived == super::super::incremental::Derived2::build(&n.state)?);
+			assert!(
+				n.state.derived
+					== crate::storage::mutation_visibility::root2::incremental::Derived2::build(
+						&n.state
+					)?
+			);
 			n.state.parents.audit();
 			n.state.lineages.audit();
 			n.state.selectors.audit();
@@ -166,7 +178,7 @@ fn s1c_trust_gap_and_replay_match_legacy_errors() {
 }
 #[test]
 fn s1c_persistent_map_order_balance_replacement_and_old_versions() {
-	use super::super::persistent::Map;
+	use crate::storage::mutation_visibility::root2::persistent::Map;
 	use std::collections::BTreeMap;
 	for pattern in 0..3 {
 		let mut actual = Map::new();
@@ -206,7 +218,7 @@ fn s1c_persistent_map_order_balance_replacement_and_old_versions() {
 }
 #[test]
 fn s1c_shared_values_are_released_after_all_retained_roots_drop() {
-	use super::super::persistent::Map;
+	use crate::storage::mutation_visibility::root2::persistent::Map;
 	use std::sync::Arc;
 	let payload = Arc::new(vec![9u8; 4096]);
 	let weak = Arc::downgrade(&payload);
@@ -287,7 +299,7 @@ fn s1c_terminal_update_retains_one_shared_claim_and_does_not_modify_old_root() {
 }
 #[test]
 fn s1c_path_copy_mutation_never_changes_a_retained_version() {
-	use super::super::persistent::Map;
+	use crate::storage::mutation_visibility::root2::persistent::Map;
 	let mut m: Map<u64, Vec<u8>> = Map::new();
 	for i in 0..128 {
 		m.insert(i, vec![i as u8]);
@@ -321,7 +333,7 @@ fn s1c_bootstrap_and_unauthorized_bootstrap_match_legacy() {
 				assert!(o == old_o);
 				assert!(
 					n.state.derived
-						== super::super::incremental::Derived2::build(&n.state).unwrap()
+						== crate::storage::mutation_visibility::root2::incremental::Derived2::build(&n.state).unwrap()
 				);
 			}
 			(Err(a), Err(b)) => assert_eq!(a, b),

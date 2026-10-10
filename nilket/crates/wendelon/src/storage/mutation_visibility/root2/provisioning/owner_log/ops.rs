@@ -1,16 +1,16 @@
 //! Owner I/O primitives and the owner directory's private steps. Nothing here is visible outside
 //! `owner_log`; the eight exported methods live in the parent.
-use super::super::super::codec::hash;
-use super::super::super::types::Digest2;
-use super::super::inventory::MAX_LOG_BYTES2;
-use super::super::owner_core::{
-	Classification2, MAX_EVIDENCE_BYTES2, MAX_REPAIR_ENTRIES2, classify2, decode_evidence2,
-	evidence_name2, expected_repair_event2,
-};
 use super::{
 	IoStep2, LOG, MARKER, MARKER_MAGIC, MarkerOutcome2, OwnerDir2, OwnerIoError2, REPAIRS,
 	RepairOutcome2,
 };
+use crate::storage::mutation_visibility::root2::codec::hash;
+use crate::storage::mutation_visibility::root2::provisioning::inventory::MAX_LOG_BYTES2;
+use crate::storage::mutation_visibility::root2::provisioning::owner_core::{
+	Classification2, MAX_EVIDENCE_BYTES2, MAX_REPAIR_ENTRIES2, classify2, decode_evidence2,
+	evidence_name2, expected_repair_event2,
+};
+use crate::storage::mutation_visibility::root2::types::Digest2;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};

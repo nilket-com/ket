@@ -23,7 +23,7 @@ opaque!(UnverifiedWitness2, UnverifiedOutcome2);
 impl UnverifiedWitness2 {
 	fn validate(&self) -> Result2<()> {
 		check_claim(&self.claim)?;
-		super::super::codec::valid_log(self.reservation)?;
+		crate::storage::mutation_visibility::root2::codec::valid_log(self.reservation)?;
 		self.attestation.encode()?;
 		check(!self.receipts.is_empty() && self.receipts.len() <= 256 * 3)?;
 		let digest = self.claim.digest()?;

@@ -1,14 +1,14 @@
 //! Owner inventory event codec and pure fold. Parsed inventory data only: nothing here reads
 //! files, proves provenance, or yields a root, authority state or trust token.
-use super::super::super::redacted_debug;
-use super::super::admin::manifest::{
+use crate::storage::mutation_visibility::redacted_debug;
+use crate::storage::mutation_visibility::root2::admin::manifest::{
 	ADMIN_MANIFEST_BYTES2, AdminManifest2, admin_manifest_digest2,
 };
-use super::super::admin::record::{
+use crate::storage::mutation_visibility::root2::admin::record::{
 	BOOTSTRAP_RECORD_BYTES2, BootstrapObservation2, BootstrapRecord2,
 };
-use super::super::codec::hash;
-use super::super::types::Digest2;
+use crate::storage::mutation_visibility::root2::codec::hash;
+use crate::storage::mutation_visibility::root2::types::Digest2;
 use std::collections::BTreeSet;
 
 pub(in crate::storage::mutation_visibility::root2) const EVENT_BYTES2: usize = 384;

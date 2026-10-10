@@ -1,5 +1,5 @@
-use super::super::{ClaimProjection2, HolderAttestation2};
 use super::{AuthError2, AuthResult2, admission_preimage2, holder_preimage2};
+use crate::storage::mutation_visibility::root2::{ClaimProjection2, HolderAttestation2};
 use ed25519_dalek::{Signature, VerifyingKey};
 
 // Fixed pure Ed25519, exact locked provider acceptance. No signing, algorithm selector,

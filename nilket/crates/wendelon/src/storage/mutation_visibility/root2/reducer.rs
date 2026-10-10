@@ -503,7 +503,7 @@ fn apply_reserve(
 }
 fn apply_terminal(
 	s: &mut State2,
-	id: &super::super::MutationIdentity,
+	id: &crate::storage::mutation_visibility::MutationIdentity,
 	digest: Digest2,
 	reservation: Log2,
 	l: Log2,

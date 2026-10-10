@@ -1,7 +1,7 @@
 //! Isolated cfg(test) allocator assay; never part of the ordinary library.
-use super::super::{adapters::*, provenance::*};
 use super::provenance_tests::{batch, framed, key, parent, schema};
 use super::*;
+use crate::storage::mutation_visibility::{adapters::*, provenance::*};
 use arrow::{array::*, datatypes::*, record_batch::RecordBatch};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;

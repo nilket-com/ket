@@ -1,6 +1,10 @@
 use super::*;
 fn second() -> (UnverifiedData2, ParentEntry) {
-	let (data, _, _) = super::super::super::loader::tests::raw_variant(false, Some(908));
+	let (data, _, _) =
+		crate::storage::mutation_visibility::root2::durable::loader::tests::raw_variant(
+			false,
+			Some(908),
+		);
 	let (id, _, _, _, mut entry) = inputs();
 	let (c, r) = &data.bundle.claims[0];
 	entry.owner.identity = c.manifest.identity;
@@ -104,12 +108,18 @@ async fn duplicate_owner_across_scan_batches_invalidates_all_copies_in_either_or
 		assert_eq!(report.inventory.sequence, 2);
 		assert!(
 			store
-				.observed(sha(&a.owner.bytes().unwrap()), super::super::store::FENCED)
+				.observed(
+					sha(&a.owner.bytes().unwrap()),
+					crate::storage::mutation_visibility::root2::durable::local_store::store::FENCED
+				)
 				.await
 		);
 		assert!(
 			store
-				.observed(sha(&b.owner.bytes().unwrap()), super::super::store::FENCED)
+				.observed(
+					sha(&b.owner.bytes().unwrap()),
+					crate::storage::mutation_visibility::root2::durable::local_store::store::FENCED
+				)
 				.await
 		);
 	}

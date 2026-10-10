@@ -1,11 +1,11 @@
-use super::super::super::admin::manifest::AdminManifest2;
-use super::super::super::admin::record::BootstrapObservation2;
-use super::super::inventory::*;
-use super::super::owner_core::*;
-use super::super::owner_log::seam;
-use super::super::owner_log::*;
-use super::super::snapshot::decode_snapshot2;
 use super::*;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::record::BootstrapObservation2;
+use crate::storage::mutation_visibility::root2::provisioning::inventory::*;
+use crate::storage::mutation_visibility::root2::provisioning::owner_core::*;
+use crate::storage::mutation_visibility::root2::provisioning::owner_log::seam;
+use crate::storage::mutation_visibility::root2::provisioning::owner_log::*;
+use crate::storage::mutation_visibility::root2::provisioning::snapshot::decode_snapshot2;
 use IoStep2::*;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
@@ -50,7 +50,7 @@ impl Drop for Scratch {
 	}
 }
 fn sha(b: &[u8]) -> [u8; 32] {
-	super::super::super::codec::hash(b"", b)
+	crate::storage::mutation_visibility::root2::codec::hash(b"", b)
 }
 fn op(n: u8) -> OpId2 {
 	op_id2([n; 16]).unwrap()

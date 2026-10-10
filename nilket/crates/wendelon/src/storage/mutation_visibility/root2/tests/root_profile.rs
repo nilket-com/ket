@@ -1,12 +1,14 @@
 //! Root profile 3: the permission section, its accounting and the refusal of profile-2 bytes.
 //! States marked "synthetic accounting" exercise arithmetic only and are not authentic roots.
-use super::super::super::MutationScope;
-use super::super::admin_statement::{AdmissionNamespace2, PermissionKey2};
-use super::super::admission_registry::*;
-use super::super::incremental::{Derived2, cached_capacity};
-use super::super::origin::UnverifiedAuthority2;
-use super::super::persistent::Map;
 use super::*;
+use crate::storage::mutation_visibility::MutationScope;
+use crate::storage::mutation_visibility::root2::admin_statement::{
+	AdmissionNamespace2, PermissionKey2,
+};
+use crate::storage::mutation_visibility::root2::admission_registry::*;
+use crate::storage::mutation_visibility::root2::incremental::{Derived2, cached_capacity};
+use crate::storage::mutation_visibility::root2::origin::UnverifiedAuthority2;
+use crate::storage::mutation_visibility::root2::persistent::Map;
 
 fn unhex(s: &str) -> Vec<u8> {
 	(0..s.len())

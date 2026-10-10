@@ -4,7 +4,6 @@
 //! been built through `bootstrap2` from a committed entry, whose production producer is held.
 //! A G1d consumer must bind the whole `AdminContext2`; an administrator key or id alone never
 //! authorizes anything in another root.
-use super::super::redacted_debug;
 use super::admin::errors::BootstrapRecordError2;
 use super::admin::manifest::{ADMIN_MANIFEST_BYTES2, AdminNamespace2};
 use super::admin::record::{BootstrapIdentity2, BootstrapObservation2};
@@ -13,6 +12,7 @@ use super::provisioning::replica_anchor::{
 	PinnedBoundTuple2, tuple_manifest_pin2, tuple_manifest2, tuple_record2,
 };
 use super::types::{Digest2, Log2};
+use crate::storage::mutation_visibility::redacted_debug;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) struct InstalledAdmin2 {

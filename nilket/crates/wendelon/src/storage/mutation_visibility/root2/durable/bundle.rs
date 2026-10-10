@@ -20,7 +20,7 @@ impl UnverifiedBundle2 {
 		self.provenance.encode().map_err(|_| RootError2::Codec)?;
 		for ((c, l), p) in self.claims.iter().zip(self.provenance.parents()) {
 			check_claim(c)?;
-			super::super::codec::valid_log(*l)?;
+			crate::storage::mutation_visibility::root2::codec::valid_log(*l)?;
 			check(c.manifest == p.manifest && c.manifest_commitment == p.commitment)?;
 		}
 		for r in self.provenance.references() {
@@ -59,7 +59,7 @@ impl UnverifiedBundle2 {
 	pub fn decode(bytes: &[u8]) -> Result2<Self> {
 		let mut r = open(bytes, b"VISBND02", BUNDLE_MAX)?;
 		let provenance = UnverifiedFrameProvenance::decode(
-			r.blob(super::super::super::provenance::MAX_PROVENANCE_BYTES)?,
+			r.blob(crate::storage::mutation_visibility::provenance::MAX_PROVENANCE_BYTES)?,
 		)
 		.map_err(|_| RootError2::Codec)?;
 		let n = count16(&mut r, 512, 24)?;

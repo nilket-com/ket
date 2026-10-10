@@ -4,11 +4,11 @@
 //! that is a consistency precondition, not provenance. A section-decoded map is descriptive,
 //! untrusted data. Nothing here authorizes an issuer, proves committed history or builds root
 //! state; the issuer gate and root integration are held.
-use super::super::{MutationScope, redacted_debug};
 use super::admin_statement::{AdmissionNamespace2, PermissionKey2, ZeroField2};
 use super::persistent::Map;
 use super::types::{AuthorityRef2, AuthorityRegistration2, Log2, REGISTRY_BYTES2};
 use super::validation::authority_key;
+use crate::storage::mutation_visibility::{MutationScope, redacted_debug};
 
 pub(in crate::storage::mutation_visibility::root2) const PERMISSION_KEY_BYTES2: usize = 73;
 pub(in crate::storage::mutation_visibility::root2) const PERMISSION_RECORD_BYTES2: usize = 113;

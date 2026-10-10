@@ -1,5 +1,5 @@
-use super::super::ParentManifest;
 use super::{codec::*, types::*, validation::*};
+use crate::storage::mutation_visibility::ParentManifest;
 
 impl Wire2 for Hlc2 {
 	fn write(&self, b: &mut Vec<u8>) -> Result2<()> {

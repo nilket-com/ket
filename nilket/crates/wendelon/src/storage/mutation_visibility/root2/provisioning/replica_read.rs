@@ -3,14 +3,14 @@
 //! any file is opened. Only a missing file is a missing prerequisite; every other reader refusal is
 //! reported as itself. No fallback path, staging or unbounded read; the pins are caller data whose
 //! delivery provenance is not established here.
-use super::super::super::redacted_debug;
-use super::super::admin::manifest::ADMIN_MANIFEST_BYTES2;
-use super::super::types::Digest2;
 use super::anchored::{AnchorDir2, AnchoredError2, AnchoredFile2};
 use super::replica_anchor::{
 	MAX_SNAPSHOT_BYTES2, PinnedBoundTuple2, ReplicaAnchorError2, ReplicaInput2, ReplicaInputs2,
 	validate_replica_tuple2,
 };
+use crate::storage::mutation_visibility::redacted_debug;
+use crate::storage::mutation_visibility::root2::admin::manifest::ADMIN_MANIFEST_BYTES2;
+use crate::storage::mutation_visibility::root2::types::Digest2;
 use std::ffi::CStr;
 
 #[derive(Clone, Copy)]

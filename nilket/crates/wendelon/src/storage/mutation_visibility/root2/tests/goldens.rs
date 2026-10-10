@@ -19,7 +19,7 @@ fn s1_independent_literal_record_root_command_result_goldens() {
 				v.encode(g, c, l).unwrap()
 			}
 			"body" => match name {
-				"identity" => super::super::super::MutationIdentity::decode(&b)
+				"identity" => crate::storage::mutation_visibility::MutationIdentity::decode(&b)
 					.unwrap()
 					.encode()
 					.unwrap()
@@ -29,7 +29,7 @@ fn s1_independent_literal_record_root_command_result_goldens() {
 					.encode()
 					.unwrap()
 					.to_vec(),
-				"manifest1" => super::super::super::ParentManifest::decode(&b)
+				"manifest1" => crate::storage::mutation_visibility::ParentManifest::decode(&b)
 					.unwrap()
 					.encode()
 					.unwrap(),

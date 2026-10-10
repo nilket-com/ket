@@ -1,5 +1,5 @@
-use super::super::anchored::INJECTED_OPEN_ERRNO;
-use super::super::anchored::*;
+use crate::storage::mutation_visibility::root2::provisioning::anchored::INJECTED_OPEN_ERRNO;
+use crate::storage::mutation_visibility::root2::provisioning::anchored::*;
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;

@@ -225,10 +225,15 @@ fn utc_units_have_distinct_descriptors_rows_and_pk_policy() {
 	}
 	for tag in 17..=19 {
 		let mut bytes = vec![tag, tag - 16, b'U', b'T', b'C'];
-		let mut r = super::super::encoding::Reader::new(&bytes);
+		let mut r = crate::storage::mutation_visibility::encoding::Reader::new(&bytes);
 		ProofScalarType::read(&mut r).unwrap();
 		bytes[1] = 0;
-		assert!(ProofScalarType::read(&mut super::super::encoding::Reader::new(&bytes)).is_err());
+		assert!(
+			ProofScalarType::read(
+				&mut crate::storage::mutation_visibility::encoding::Reader::new(&bytes)
+			)
+			.is_err()
+		);
 	}
 }
 #[test]

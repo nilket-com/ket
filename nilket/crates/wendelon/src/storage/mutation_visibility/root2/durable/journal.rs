@@ -129,7 +129,7 @@ impl UnverifiedJournal2 {
 			}
 			UnverifiedJournalStep2::OutcomeDurable(o) => self.owner.matches_outcome(o)?,
 			UnverifiedJournalStep2::ProjectionComplete { decision, .. } => {
-				super::super::codec::valid_log(*decision)?
+				crate::storage::mutation_visibility::root2::codec::valid_log(*decision)?
 			}
 			UnverifiedJournalStep2::WitnessRetired => {}
 		}

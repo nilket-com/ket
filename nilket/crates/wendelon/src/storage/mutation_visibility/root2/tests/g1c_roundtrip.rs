@@ -1,17 +1,25 @@
-use super::super::admin::manifest::AdminManifest2;
-use super::super::admin_install::*;
-use super::super::entry_identity::EntryPosition2;
-use super::super::origin::*;
-use super::super::provisioning::anchored::{AnchorDir2, AnchoredError2};
-use super::super::provisioning::inventory::{RootIdentity2, RootState2};
-use super::super::provisioning::owner_core::{EventOp2, OwnerError2, OwnerRequest2, op_id2};
-use super::super::provisioning::owner_log::{OwnerDir2, OwnerIoError2};
-use super::super::provisioning::replica_anchor::{
+use super::*;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
+use crate::storage::mutation_visibility::root2::admin_install::*;
+use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
+use crate::storage::mutation_visibility::root2::origin::*;
+use crate::storage::mutation_visibility::root2::provisioning::anchored::{
+	AnchorDir2, AnchoredError2,
+};
+use crate::storage::mutation_visibility::root2::provisioning::inventory::{
+	RootIdentity2, RootState2,
+};
+use crate::storage::mutation_visibility::root2::provisioning::owner_core::{
+	EventOp2, OwnerError2, OwnerRequest2, op_id2,
+};
+use crate::storage::mutation_visibility::root2::provisioning::owner_log::{
+	OwnerDir2, OwnerIoError2,
+};
+use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::{
 	MAX_SNAPSHOT_BYTES2, PinnedBoundTuple2, ReplicaAnchorError2, ReplicaInput2,
 };
-use super::super::provisioning::replica_read::*;
-use super::super::trust::CommittedEntry2;
-use super::*;
+use crate::storage::mutation_visibility::root2::provisioning::replica_read::*;
+use crate::storage::mutation_visibility::root2::trust::CommittedEntry2;
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -40,7 +48,7 @@ impl Drop for Scratch {
 	}
 }
 fn sha(b: &[u8]) -> Digest2 {
-	super::super::codec::hash(b"", b)
+	crate::storage::mutation_visibility::root2::codec::hash(b"", b)
 }
 fn unhex(s: &str) -> Vec<u8> {
 	(0..s.len())
@@ -62,7 +70,7 @@ fn canonical_genesis() -> Digest2 {
 fn at(term: u64, node: u32, index: u64) -> EntryPosition2 {
 	EntryPosition2 { term, node, index }
 }
-fn op(n: u8) -> super::super::provisioning::owner_core::OpId2 {
+fn op(n: u8) -> crate::storage::mutation_visibility::root2::provisioning::owner_core::OpId2 {
 	op_id2([n; 16]).unwrap()
 }
 struct Boot {

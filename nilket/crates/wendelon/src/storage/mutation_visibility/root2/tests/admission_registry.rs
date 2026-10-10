@@ -1,11 +1,11 @@
 //! Semantic tests of the dormant permission registry. Calling a transition directly is a test of
 //! lifecycle semantics over consistent inputs, never an authorization: no issuer decision exists.
-use super::super::super::MutationScope;
-use super::super::admin_statement::*;
-use super::super::admission_registry::*;
-use super::super::persistent::Map;
-use super::super::validation::authority_key;
 use super::*;
+use crate::storage::mutation_visibility::MutationScope;
+use crate::storage::mutation_visibility::root2::admin_statement::*;
+use crate::storage::mutation_visibility::root2::admission_registry::*;
+use crate::storage::mutation_visibility::root2::persistent::Map;
+use crate::storage::mutation_visibility::root2::validation::authority_key;
 use std::collections::BTreeMap;
 
 const G: [u8; 16] = [0xA1; 16];

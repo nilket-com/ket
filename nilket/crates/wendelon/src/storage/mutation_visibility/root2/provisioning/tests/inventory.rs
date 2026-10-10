@@ -1,6 +1,6 @@
-use super::super::super::admin::manifest::AdminManifest2;
-use super::super::inventory::*;
 use super::*;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
+use crate::storage::mutation_visibility::root2::provisioning::inventory::*;
 use CorruptReason2::*;
 
 fn corrupt(seq: u64, reason: CorruptReason2) -> Result<(), LogError2> {
@@ -38,7 +38,10 @@ fn reserve(m: AdminManifest2, seq: u64, op: [u8; 16]) -> Event2 {
 		identity: Some(RootIdentity2 {
 			generation: m.generation,
 			cluster: m.cluster,
-			pin: super::super::super::admin::manifest::admin_manifest_digest2(&bytes),
+			pin:
+				crate::storage::mutation_visibility::root2::admin::manifest::admin_manifest_digest2(
+					&bytes,
+				),
 			admin_key: m.admin_key,
 		}),
 		body: EventBody2::Reserve { manifest: m },
@@ -421,7 +424,7 @@ fn error_precedence_never_lets_a_tail_mask_earlier_corruption() {
 		Err(LogError2::Ambiguous {
 			boundary: boundary as u64,
 			tail_len: tail.len() as u32,
-			tail_sha256: super::super::super::codec::hash(b"", tail),
+			tail_sha256: crate::storage::mutation_visibility::root2::codec::hash(b"", tail),
 		})
 	};
 	assert_eq!(fold(&cat(&[e1, e2, &bad_last])), amb(768, &bad_last));

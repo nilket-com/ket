@@ -1,10 +1,12 @@
-use super::super::loader::{LoaderCapability2, load_content2};
 use super::*;
 use super::{
 	recovery::{RecoveryReport, recover},
 	scan::{ChainState, scan_chain},
 };
 use crate::storage::mutation_visibility::ProofKeyProvider;
+use crate::storage::mutation_visibility::root2::durable::loader::{
+	LoaderCapability2, load_content2,
+};
 pub(super) struct Publisher {
 	pub(super) inventory: Inventory,
 	pub(super) fenced: bool,

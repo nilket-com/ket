@@ -1,5 +1,5 @@
-use super::super::store::FENCED;
 use super::*;
+use crate::storage::mutation_visibility::root2::durable::local_store::store::FENCED;
 fn gate() -> Arc<Gate> {
 	Arc::new(Gate {
 		entered: tokio::sync::Notify::new(),
@@ -511,7 +511,11 @@ async fn ownership_wait_rereads_published_fence_before_any_job() {
 async fn rotation_file_and_name_barriers_precede_prepared_dependent_write() {
 	let temp = Temp::new();
 	let (model, store, mut next) = super::isolation::first_segment_fixture(&temp).await;
-	let (data, _, _) = super::super::super::loader::tests::raw_variant(false, Some(4097));
+	let (data, _, _) =
+		crate::storage::mutation_visibility::root2::durable::loader::tests::raw_variant(
+			false,
+			Some(4097),
+		);
 	let (claim, reservation) = &data.bundle.claims[0];
 	next.owner.identity = claim.manifest.identity;
 	next.owner.claim = claim.digest().unwrap();

@@ -38,11 +38,13 @@ fn child(c: &ClaimProjection2) -> ProofChildInput {
 	}
 }
 fn template() -> ClaimProjection2 {
-	UnverifiedBundle2::decode(&super::super::tests::fixture("bundle_one_parent"))
-		.unwrap()
-		.claims
-		.remove(0)
-		.0
+	UnverifiedBundle2::decode(
+		&crate::storage::mutation_visibility::root2::durable::tests::fixture("bundle_one_parent"),
+	)
+	.unwrap()
+	.claims
+	.remove(0)
+	.0
 }
 fn wrap_data(
 	batch: &RecordBatch,
@@ -647,7 +649,10 @@ fn auth_preimage_matches_existing_loader_provider_capture() {
 		let capture = Capture(RefCell::new(Vec::new()));
 		assert_eq!(claim_mac(&c, [0x12; 16], &capture), Ok([0x31; 32]));
 		let expected =
-			super::super::super::auth::preimage::claim_mac_preimage2(&c, [0x12; 16]).unwrap();
+			crate::storage::mutation_visibility::root2::auth::preimage::claim_mac_preimage2(
+				&c, [0x12; 16],
+			)
+			.unwrap();
 		let calls = capture.0.borrow();
 		assert_eq!(calls.len(), 1);
 		assert!(calls[0].0 == c.manifest.binding());

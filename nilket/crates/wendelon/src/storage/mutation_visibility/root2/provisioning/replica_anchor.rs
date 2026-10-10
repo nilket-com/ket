@@ -5,16 +5,16 @@
 //! an unimplemented assumption. The result is a parsed tuple, not proof of a committed Bootstrap
 //! or history, and not production eligibility. An older coherent pinned snapshot is accepted: no
 //! rollback, freshness or current-revocation claim is made here.
-use super::super::super::redacted_debug;
-use super::super::admin::errors::AdminManifestError2;
-use super::super::admin::manifest::{
-	ADMIN_MANIFEST_BYTES2, AdminManifest2, admin_manifest_digest2,
-};
-use super::super::admin::record::BootstrapRecord2;
-use super::super::codec::hash;
-use super::super::types::Digest2;
 use super::inventory::{MAX_ROOTS2, RootState2};
 use super::snapshot::{SnapshotError2, decode_snapshot2};
+use crate::storage::mutation_visibility::redacted_debug;
+use crate::storage::mutation_visibility::root2::admin::errors::AdminManifestError2;
+use crate::storage::mutation_visibility::root2::admin::manifest::{
+	ADMIN_MANIFEST_BYTES2, AdminManifest2, admin_manifest_digest2,
+};
+use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
+use crate::storage::mutation_visibility::root2::codec::hash;
+use crate::storage::mutation_visibility::root2::types::Digest2;
 
 // The replica snapshot layout: 22-byte header, 320-byte entries, 32-byte trailer.
 pub(in crate::storage::mutation_visibility::root2) const MAX_SNAPSHOT_BYTES2: usize =

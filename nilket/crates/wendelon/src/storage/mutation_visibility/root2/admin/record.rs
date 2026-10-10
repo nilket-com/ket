@@ -1,6 +1,6 @@
-use super::super::super::redacted_debug;
-use super::super::types::{Digest2, Log2};
 use super::errors::{BootstrapRecordError2, BootstrapResult2};
+use crate::storage::mutation_visibility::redacted_debug;
+use crate::storage::mutation_visibility::root2::types::{Digest2, Log2};
 
 pub(in crate::storage::mutation_visibility::root2) const BOOTSTRAP_RECORD_BYTES2: usize = 208;
 const RECORD_MAGIC: &[u8; 8] = b"VISADR2\0";

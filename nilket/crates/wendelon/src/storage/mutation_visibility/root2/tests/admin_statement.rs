@@ -1,15 +1,17 @@
-use super::super::super::MutationScope;
-use super::super::admin::manifest::AdminManifest2;
-use super::super::admin::record::BootstrapRecord2;
-use super::super::admin_install::*;
-use super::super::admin_statement::*;
-use super::super::entry_identity::EntryPosition2;
-use super::super::origin::*;
-use super::super::provisioning::inventory::{LogState2, RootEntry2, RootIdentity2, RootState2};
-use super::super::provisioning::replica_anchor::*;
-use super::super::provisioning::snapshot::encode_snapshot2;
-use super::super::trust::CommittedEntry2;
 use super::*;
+use crate::storage::mutation_visibility::MutationScope;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
+use crate::storage::mutation_visibility::root2::admin_install::*;
+use crate::storage::mutation_visibility::root2::admin_statement::*;
+use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
+use crate::storage::mutation_visibility::root2::origin::*;
+use crate::storage::mutation_visibility::root2::provisioning::inventory::{
+	LogState2, RootEntry2, RootIdentity2, RootState2,
+};
+use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::*;
+use crate::storage::mutation_visibility::root2::provisioning::snapshot::encode_snapshot2;
+use crate::storage::mutation_visibility::root2::trust::CommittedEntry2;
 
 fn unhex(s: &str) -> Vec<u8> {
 	(0..s.len())
@@ -62,8 +64,9 @@ fn standard_root() -> MutationAuthorityState2 {
 // A coherent Part A tuple for `manifest` whose Bound record is `record`; Part A must accept it.
 fn tuple(manifest_bytes: &[u8], record: BootstrapRecord2) -> PinnedBoundTuple2 {
 	let manifest = AdminManifest2::decode(manifest_bytes).unwrap();
-	let pin =
-		super::super::admin::manifest::admin_manifest_digest2(manifest_bytes.try_into().unwrap());
+	let pin = crate::storage::mutation_visibility::root2::admin::manifest::admin_manifest_digest2(
+		manifest_bytes.try_into().unwrap(),
+	);
 	let snapshot = encode_snapshot2(&LogState2 {
 		roots: vec![RootEntry2 {
 			identity: RootIdentity2 {
@@ -80,7 +83,7 @@ fn tuple(manifest_bytes: &[u8], record: BootstrapRecord2) -> PinnedBoundTuple2 {
 		last_seq: record.inventory_seq,
 	})
 	.unwrap();
-	let inventory_pin = super::super::codec::hash(b"", &snapshot);
+	let inventory_pin = crate::storage::mutation_visibility::root2::codec::hash(b"", &snapshot);
 	validate_replica_tuple2(&ReplicaInputs2 {
 		manifest: Some(manifest_bytes),
 		manifest_pin: Some(&pin),
@@ -102,7 +105,7 @@ fn admin() -> InstalledAdmin2 {
 fn key() -> PermissionKey2 {
 	let m = manifest_prime();
 	PermissionKey2 {
-		authority: super::super::types::AuthorityRef2 {
+		authority: crate::storage::mutation_visibility::root2::types::AuthorityRef2 {
 			id: [0x41; 16],
 			revision: 1,
 		},

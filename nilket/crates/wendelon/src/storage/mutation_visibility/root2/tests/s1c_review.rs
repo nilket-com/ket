@@ -118,7 +118,8 @@ fn s1c_reserve_original_before_bootstrap_matches_legacy_invariant_error() {
 	for key in r.state.lineages.iter().map(|(k, _)| *k).collect::<Vec<_>>() {
 		r.state.lineages.get_mut(&key).unwrap().latest.log.index += 100;
 	}
-	r.state.derived = super::super::incremental::Derived2::build(&r.state).unwrap();
+	r.state.derived =
+		crate::storage::mutation_visibility::root2::incremental::Derived2::build(&r.state).unwrap();
 	let c = Command2::Reserve(claim());
 	let e = TrustedEntry2::fixture(
 		r.state.generation,

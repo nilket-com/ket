@@ -1,5 +1,7 @@
-use super::super::{ATTESTATION_BYTES2, CLAIM_BYTES2, ClaimProjection2, HolderAttestation2};
 use super::{AuthError2, AuthResult2};
+use crate::storage::mutation_visibility::root2::{
+	ATTESTATION_BYTES2, CLAIM_BYTES2, ClaimProjection2, HolderAttestation2,
+};
 
 // Preflight every caller-owned collection before validation, cloning or serialization.
 // Existing canonical validators may allocate bounded sets; their input is already capped here.

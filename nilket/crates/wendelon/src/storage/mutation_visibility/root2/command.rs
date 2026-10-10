@@ -1,9 +1,9 @@
-use super::super::{MutationIdentity, ProofKeyBinding};
 use super::admin_statement::{ADMIN_STATEMENT_BYTES2, inspect_admin_statement2};
 use super::admission_registry::{
 	PermissionRecord2, decode_permission_key2, encode_permission_record2,
 };
 use super::{codec::*, types::*, validation::*};
+use crate::storage::mutation_visibility::{MutationIdentity, ProofKeyBinding};
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum Command2 {

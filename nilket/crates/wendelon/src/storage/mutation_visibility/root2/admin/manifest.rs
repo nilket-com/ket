@@ -1,7 +1,7 @@
-use super::super::super::{MutationScope, redacted_debug};
-use super::super::{codec::hash, types::Digest2};
 use super::errors::{AdminManifestError2, AdminResult2};
 use super::key::check_enrollable_admin_key2;
+use crate::storage::mutation_visibility::root2::{codec::hash, types::Digest2};
+use crate::storage::mutation_visibility::{MutationScope, redacted_debug};
 
 pub(in crate::storage::mutation_visibility::root2) const ADMIN_MANIFEST_BYTES2: usize = 137;
 pub(in crate::storage::mutation_visibility::root2) const ADMIN_MANIFEST_READ_BOUND2: usize = 4096;

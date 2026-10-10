@@ -28,9 +28,14 @@ fn literal_preimages_and_signatures_match_independent_oracle() {
 	);
 	assert_eq!(c.digest().unwrap().as_slice(), bytes("claim_digest"));
 	assert_eq!(
-		super::super::super::durable::child_binding2(&c, cluster, h.reservation, 0)
-			.unwrap()
-			.as_slice(),
+		crate::storage::mutation_visibility::root2::durable::child_binding2(
+			&c,
+			cluster,
+			h.reservation,
+			0
+		)
+		.unwrap()
+		.as_slice(),
 		bytes("child_binding")
 	);
 }
@@ -115,7 +120,7 @@ fn math_success_is_not_committed_original_or_capability_authorization() {
 
 #[test]
 fn maximum_valid_shapes_remain_bounded() {
-	use super::super::super::{ChildAck2, VersionStamp2};
+	use crate::storage::mutation_visibility::root2::{ChildAck2, VersionStamp2};
 	let mut c = claim();
 	let child = c.manifest.children[0].clone();
 	let plan = c.plans[0].clone();
@@ -162,5 +167,5 @@ fn maximum_valid_shapes_remain_bounded() {
 		holder_preimage2(&c, cluster(), &h).unwrap().len(),
 		body.len() + 129
 	);
-	assert!(body.len() <= super::super::super::ATTESTATION_BYTES2);
+	assert!(body.len() <= crate::storage::mutation_visibility::root2::ATTESTATION_BYTES2);
 }

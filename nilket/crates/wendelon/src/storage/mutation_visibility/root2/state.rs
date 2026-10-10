@@ -1,4 +1,3 @@
-use super::super::MutationIdentity;
 use super::admission_registry::{
 	PERMISSION_CHARGE2, PERMISSIONS2, PermissionMap2, RegistryError2, decode_permission_section2,
 	encode_permission_section2, permission_limits2,
@@ -9,6 +8,7 @@ use super::{
 	persistent::Map,
 	stored::{Cuts2, StoredParent2},
 };
+use crate::storage::mutation_visibility::MutationIdentity;
 #[derive(Clone)]
 pub struct Root2 {
 	pub(super) state: State2,
