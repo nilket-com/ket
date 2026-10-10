@@ -1185,6 +1185,7 @@ fn provisioning_reader_has_two_documented_unsafe_blocks_and_no_trust_access() {
 			"inventory",
 			"owner_core",
 			"owner_log",
+			"replica_anchor",
 			"snapshot"
 		]
 	);
@@ -1298,8 +1299,9 @@ fn quote_type(ty: &syn::Type) -> String {
 		_ => String::from("?"),
 	}
 }
-// Pure inventory and snapshot codecs and the pure owner core: no I/O, clock, networking,
-// unsafe, trust or root construction; fixed entrypoints. Syntax over these three files only.
+// Pure inventory and snapshot codecs, the pure owner core and replica tuple validation: no I/O,
+// clock, networking, unsafe, trust or root construction; fixed entrypoints. Syntax over these
+// four files only.
 #[test]
 fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1344,7 +1346,12 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 		None
 	}
 	let mut entrypoints = Vec::new();
-	for name in ["inventory.rs", "snapshot.rs", "owner_core.rs"] {
+	for name in [
+		"inventory.rs",
+		"snapshot.rs",
+		"owner_core.rs",
+		"replica_anchor.rs",
+	] {
 		let text = fs::read_to_string(root.join(name)).unwrap();
 		assert_eq!(
 			banned(text.parse().unwrap()),
@@ -1397,7 +1404,14 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 			"op_id2",
 			"repair_context2",
 			"repair_op_id2",
-			"request_key2"
+			"request_key2",
+			"tuple_entry_last_seq2",
+			"tuple_export_seq2",
+			"tuple_inventory_pin2",
+			"tuple_manifest2",
+			"tuple_manifest_pin2",
+			"tuple_record2",
+			"validate_replica_tuple2"
 		]
 	);
 }
