@@ -1180,7 +1180,13 @@ fn provisioning_reader_has_two_documented_unsafe_blocks_and_no_trust_access() {
 	}
 	assert_eq!(
 		children,
-		["anchored", "inventory", "owner_core", "snapshot"]
+		[
+			"anchored",
+			"inventory",
+			"owner_core",
+			"owner_log",
+			"snapshot"
+		]
 	);
 	let text = fs::read_to_string(root.join("provisioning/anchored.rs")).unwrap();
 	let production = without_test_items(text.parse().unwrap());
@@ -1392,6 +1398,162 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 			"repair_context2",
 			"repair_op_id2",
 			"request_key2"
+		]
+	);
+}
+// Owner I/O: std only, zero unsafe, libc constants only, no network, clock, env, trust or root
+// construction; exactly eight exported methods on OwnerDir2 and no exported free functions. Its
+// one private child, owner_log/ops.rs, obeys the same bans and exposes nothing beyond owner_log.
+// Syntax only; #[cfg(test)] items are excluded from the production surface.
+#[test]
+fn provisioning_owner_log_is_std_only_with_eight_methods() {
+	let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+		.join("src/storage/mutation_visibility/root2/provisioning");
+	let text = fs::read_to_string(dir.join("owner_log.rs")).unwrap();
+	let ops = fs::read_to_string(dir.join("owner_log/ops.rs")).unwrap();
+	fn walk(tokens: proc_macro2::TokenStream, out: &mut Vec<String>) {
+		let ts: Vec<_> = tokens.into_iter().collect();
+		for (i, t) in ts.iter().enumerate() {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => {
+					let n = id.to_string();
+					if n.starts_with("Trusted")
+						|| n.starts_with("Verified")
+						|| [
+							"unsafe",
+							"net",
+							"tokio",
+							"Instant",
+							"SystemTime",
+							"env",
+							"Root2",
+							"State2",
+							"Command2",
+							"CommittedEntry2",
+						]
+						.contains(&n.as_str())
+					{
+						out.push(n.clone());
+					}
+					if n == "libc" {
+						let name = match (ts.get(i + 1), ts.get(i + 2), ts.get(i + 3)) {
+							(
+								Some(proc_macro2::TokenTree::Punct(a)),
+								Some(proc_macro2::TokenTree::Punct(b)),
+								Some(proc_macro2::TokenTree::Ident(c)),
+							) if a.as_char() == ':' && b.as_char() == ':' => c.to_string(),
+							_ => {
+								out.push("libc path".into());
+								continue;
+							}
+						};
+						if !name
+							.chars()
+							.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+						{
+							out.push(format!("libc::{name}"));
+						}
+						if matches!(ts.get(i + 4), Some(proc_macro2::TokenTree::Group(g)) if g.delimiter() == proc_macro2::Delimiter::Parenthesis)
+						{
+							out.push(format!("libc::{name}()"));
+						}
+					}
+				}
+				proc_macro2::TokenTree::Group(g) => walk(g.stream(), out),
+				_ => {}
+			}
+		}
+	}
+	// Both files, tests included, have no unsafe; the other bans apply to production items.
+	for (name, source) in [("owner_log.rs", &text), ("owner_log/ops.rs", &ops)] {
+		let mut found = Vec::new();
+		walk(source.parse().unwrap(), &mut found);
+		assert!(!found.iter().any(|n| n == "unsafe"), "{name}: unsafe");
+		let mut production = Vec::new();
+		walk(without_test_items(source.parse().unwrap()), &mut production);
+		assert!(production.is_empty(), "{name}: {production:?}");
+	}
+	let cfg_test = |attrs: &[syn::Attribute]| {
+		attrs.iter().any(|a| {
+			a.path().is_ident("cfg")
+				&& matches!(&a.meta, syn::Meta::List(l) if l.tokens.to_string() == "test")
+		})
+	};
+	let mut methods = Vec::new();
+	for item in syn::parse_file(&text).unwrap().items {
+		match item {
+			syn::Item::Fn(f) if !cfg_test(&f.attrs) => assert!(
+				matches!(f.vis, syn::Visibility::Inherited),
+				"owner_log.rs exports fn {}",
+				f.sig.ident
+			),
+			syn::Item::Impl(i) if !cfg_test(&i.attrs) => {
+				for it in &i.items {
+					if let syn::ImplItem::Fn(f) = it
+						&& !matches!(f.vis, syn::Visibility::Inherited)
+					{
+						assert!(i.trait_.is_none(), "trait methods carry no visibility");
+						assert_eq!(quote_type(&i.self_ty), "OwnerDir2");
+						assert!(root2_scoped(&f.vis), "{}", f.sig.ident);
+						methods.push(f.sig.ident.to_string());
+					}
+				}
+			}
+			syn::Item::Trait(t) if !cfg_test(&t.attrs) => panic!("owner_log.rs: trait"),
+			syn::Item::Static(s) if !cfg_test(&s.attrs) => panic!("owner_log.rs: static"),
+			syn::Item::Mod(m) if !cfg_test(&m.attrs) => assert!(
+				m.ident == "ops"
+					&& m.content.is_none()
+					&& matches!(m.vis, syn::Visibility::Inherited),
+				"owner_log.rs: only the private `mod ops;`"
+			),
+			syn::Item::Macro(m) if !cfg_test(&m.attrs) => assert!(
+				m.mac.path.is_ident("redacted_debug"),
+				"owner_log.rs: item macro"
+			),
+			_ => {}
+		}
+	}
+	// ops.rs: private or pub(super) only, no trait impls, traits, statics, modules or macros.
+	let parent_only = |v: &syn::Visibility| {
+		matches!(v, syn::Visibility::Inherited)
+			|| matches!(v, syn::Visibility::Restricted(r) if r.in_token.is_none() && r.path.is_ident("super"))
+	};
+	for item in syn::parse_file(&ops).unwrap().items {
+		match item {
+			syn::Item::Fn(f) => assert!(parent_only(&f.vis), "ops.rs: {}", f.sig.ident),
+			syn::Item::Struct(s) => {
+				assert!(parent_only(&s.vis), "ops.rs: {}", s.ident);
+				for f in &s.fields {
+					assert!(parent_only(&f.vis), "ops.rs: field of {}", s.ident);
+				}
+			}
+			syn::Item::Enum(e) => assert!(parent_only(&e.vis), "ops.rs: {}", e.ident),
+			syn::Item::Type(t) => assert!(parent_only(&t.vis), "ops.rs: {}", t.ident),
+			syn::Item::Impl(i) => {
+				assert!(i.trait_.is_none(), "ops.rs: trait impl");
+				for it in &i.items {
+					if let syn::ImplItem::Fn(f) = it {
+						assert!(parent_only(&f.vis), "ops.rs: {}", f.sig.ident);
+					}
+				}
+			}
+			syn::Item::Use(_) => {}
+			_ => panic!("ops.rs: unexpected item kind"),
+		}
+	}
+	methods.sort();
+	assert_eq!(
+		methods,
+		[
+			"apply",
+			"clear_sync_failure",
+			"export",
+			"inspect",
+			"open",
+			"repair_check",
+			"repair_fresh",
+			"repair_resume"
 		]
 	);
 }
