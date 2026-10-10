@@ -250,6 +250,29 @@ fn id_of(c: &Command2) -> [u8; 73] {
 	claim_of(c).manifest.identity.encode().unwrap()
 }
 // Selector at 3, authority at 4, lineage Grant at 5.
+// The lineage record the generated Grant establishes at `i`, built from the generated command's
+// own fields, never from reducer output.
+fn granted(i: u64) -> ApplyResult2 {
+	let Command2::Grant {
+		lineage,
+		incarnation,
+		lease,
+		predecessor,
+	} = command("grant")
+	else {
+		panic!("grant")
+	};
+	ApplyResult2::Granted(LineageRecord2 {
+		latest: OriginalGrant2 {
+			lineage,
+			incarnation,
+			lease,
+			log: l(i),
+			predecessor,
+		},
+		closure: None,
+	})
+}
 fn prerequisites() -> MutationAuthorityState2 {
 	let s = step(
 		&governed(),
@@ -261,18 +284,7 @@ fn prerequisites() -> MutationAuthorityState2 {
 		&[],
 	);
 	let s = step(&s, &command("authority"), 4, 0, &registered(4), &[], &[]);
-	let grant = command("grant");
-	let Command2::Grant { lineage, .. } = &grant else {
-		panic!()
-	};
-	let lineage = *lineage;
-	let (g, c) = gc();
-	let e = TrustedEntry2::fixture(g, c, l(5), &grant).unwrap();
-	let v = VerifiedCommand2::fixture(g, c, &grant, &[], 0).unwrap();
-	let (s5, r) = advance_root2(&s, &e, &v, &grant).unwrap();
-	assert!(matches!(r, ApplyResult2::Granted(ref x) if x.latest.lineage == lineage));
-	validate_state(&root_of(&s5).state).unwrap();
-	s5
+	step(&s, &command("grant"), 5, 0, &granted(5), &[], &[])
 }
 fn permitted() -> MutationAuthorityState2 {
 	step(
@@ -450,11 +462,7 @@ fn earlier_checks_keep_precedence() {
 		&[],
 	);
 	let s = step(&s, &cover(4), 4, 0, &ApplyResult2::Covered, &[], &[]);
-	let (g, c) = gc();
-	let grant = command("grant");
-	let e = TrustedEntry2::fixture(g, c, l(5), &grant).unwrap();
-	let v = VerifiedCommand2::fixture(g, c, &grant, &[], 0).unwrap();
-	let s = advance_root2(&s, &e, &v, &grant).unwrap().0;
+	let s = step(&s, &command("grant"), 5, 0, &granted(5), &[], &[]);
 	step(&s, &reserve, 6, 0, &denied(9, None), &[], &[]);
 	// Authority revoked (no permission): 16, not 18.
 	let s = step(
@@ -478,7 +486,7 @@ fn earlier_checks_keep_precedence() {
 		&[],
 	);
 	let s = step(&s, &command("authority"), 4, 0, &registered(4), &[], &[]);
-	let s = advance_root2(&s, &e, &v, &grant).unwrap().0;
+	let s = step(&s, &command("grant"), 5, 0, &granted(5), &[], &[]);
 	step(&s, &reserve, 6, 0, &denied(9, None), &[], &[]);
 	// Capacity: with a permission 10; without one the permission check (18) comes first.
 	let no_slots = Limits2 {
@@ -583,17 +591,38 @@ fn historical_validation_and_terminals() {
 	let base = root_of(&r8).state;
 	validate_state(&base).unwrap();
 	let k = k1();
+	let old = *base.permissions.get(&k).unwrap();
+	// Corruptions keep the cached accounting and non-grant summary coherent with the edited records
+	// (validate_state does not read the cached summary, so this states the setup, not the reason
+	// for rejection).
+	let coherent = |s: &mut State2, after: Option<PermissionRecord2>| {
+		s.derived.usage = usage(s).unwrap();
+		for i in [Some(old.enrolled), old.revoked].into_iter().flatten() {
+			s.derived.non_grants.remove(&i.index);
+		}
+		if let Some(p) = after {
+			for i in [Some(p.enrolled), p.revoked].into_iter().flatten() {
+				s.derived.non_grants.insert(i.index, ());
+			}
+		}
+	};
 	let with = |f: &dyn Fn(&mut PermissionRecord2), covered: u64| {
 		let mut s = base.clone();
-		let mut p = *s.permissions.get(&k).unwrap();
+		let mut p = old;
 		f(&mut p);
 		s.permissions.insert(k, p);
 		s.covered = l(covered);
+		coherent(&mut s, Some(p));
 		s
 	};
 	// Missing permission.
 	let mut missing = base.clone();
 	missing.permissions = Map::new();
+	coherent(&mut missing, None);
+	assert_eq!(
+		missing.derived.usage.registry,
+		base.derived.usage.registry - 117
+	);
 	assert_eq!(
 		validate_state(&missing).err(),
 		Some(RootError2::RootInvariant)
@@ -608,8 +637,10 @@ fn historical_validation_and_terminals() {
 		validate_state(&with(&|p| p.revoked = Some(l(7)), 8)).err(),
 		Some(RootError2::RootInvariant)
 	);
-	// Revoked after the reservation: the control is valid.
-	validate_state(&with(&|p| p.revoked = Some(l(9)), 9)).unwrap();
+	// Revoked after the reservation: the control is valid, and its edited summary equals a rebuild.
+	let control = with(&|p| p.revoked = Some(l(9)), 9);
+	validate_state(&control).unwrap();
+	assert!(control.derived == Derived2::build(&control).unwrap());
 	// The helper's own boundaries; full validation rejects these equalities by coordinate collision.
 	let c = claim_of(&reserve);
 	assert_eq!(
@@ -647,16 +678,35 @@ fn historical_validation_and_terminals() {
 		identity: c.manifest.identity,
 		digest: c.digest().unwrap(),
 		reservation: l(8),
-		attestation: a,
+		attestation: a.clone(),
 	};
-	let (g, cl) = gc();
-	let e = TrustedEntry2::fixture(g, cl, l(10), &finalize).unwrap();
-	let v = VerifiedCommand2::fixture(g, cl, &finalize, &[], 1).unwrap();
-	let (_, done) = advance_root2(&t, &e, &v, &finalize).unwrap();
-	assert!(
-		matches!(done, ApplyResult2::Parent { new_effect: true, ref record } if matches!(record.terminal, Some(Terminal2::Accepted { .. })))
+	let a_bytes = a.encode().unwrap();
+	let held = c.held_bytes().unwrap();
+	let parent = |terminal: Terminal2, new_effect: bool| ApplyResult2::Parent {
+		record: ParentRecord2 {
+			claim: c.clone(),
+			reservation: l(8),
+			held_bytes: held,
+			terminal: Some(terminal),
+		},
+		new_effect,
+	};
+	let accepted = Terminal2::Accepted {
+		first: l(10),
+		evidence: hash(b"VISROOT2-EVIDENCE\0", &a_bytes),
+	};
+	let done = step(
+		&t,
+		&finalize,
+		10,
+		1,
+		&parent(accepted, true),
+		&revoked,
+		&[(id, 8)],
 	);
-	// A later authority revocation still triggers cause 4 (existing behaviour).
+	let stored = root_of(&done).state.parents.get(&id).unwrap().record();
+	assert!(stored.terminal == Some(accepted) && stored.held_bytes == held);
+	// A later authority revocation still triggers cause 4, and the actual terminal is Refused.
 	let x = step(
 		&t,
 		&Command2::RevokeAuthority(c.authority),
@@ -670,6 +720,36 @@ fn historical_validation_and_terminals() {
 	assert_eq!(
 		trigger(&rx.state, rx.state.parents.get(&id).unwrap()).unwrap(),
 		Some((4, l(10)))
+	);
+	let resolve = Command2::Resolve {
+		identity: c.manifest.identity,
+		digest: c.digest().unwrap(),
+		reservation: l(8),
+		cause: 4,
+		anchor: l(10),
+	};
+	let refused = Terminal2::Refused {
+		first: l(11),
+		cause: 4,
+		anchor: l(10),
+	};
+	let closed = step(
+		&x,
+		&resolve,
+		11,
+		0,
+		&parent(refused, false),
+		&revoked,
+		&[(id, 8)],
+	);
+	assert!(
+		root_of(&closed)
+			.state
+			.parents
+			.get(&id)
+			.unwrap()
+			.record()
+			.terminal == Some(refused)
 	);
 }
 
