@@ -7399,8 +7399,21 @@ async fn complete_checkpoint_holder_at_open(
 		if z.start_index < tail_next && !explained(z) {
 			return Err(below_tail(z));
 		}
+		// Every byte must be a validated record: replay keeps a holder up to its last good record
+		// even when a torn suffix follows, and that suffix is never carried or trimmed.
+		let z_validated = match held(z) {
+			Some(held) => wholly_validated(file_ops, z, held).await?,
+			None => false,
+		};
 		let record = match held(z) {
-			Some(held) => Some(held.last_record.clone()),
+			Some(held) if z_validated => Some(held.last_record.clone()),
+			Some(_) => {
+				return Err(refuse(format!(
+					"checkpoint-only segment {} off the WAL tail {tail_next} holds bytes past its \
+					 last validated checkpoint record",
+					z.path.display()
+				)));
+			}
 			None if z.start_index < tail_next && exactly_empty(file_ops, z).await? => None,
 			None => {
 				return Err(refuse(format!(
@@ -15503,6 +15516,101 @@ mod recovery_tests {
 				stop.label,
 				stop.after_retry.files
 			);
+		}
+	}
+
+	/// The trailing checkpoint-only shapes open-time completion acts on: past the tail (Z = 8 over
+	/// [1,2,3]) or below it, explained by a snapshot at 3 (Z = 3 over [1,2,3]).
+	fn seed_trailing_holder(below_tail: bool, z: &[AlignedBuf], suffix: &[u8]) -> PathBuf {
+		let dir = tempdir("trailing-holder");
+		let pages: Vec<AlignedBuf> = (1..=3)
+			.map(|i| serialize_entry_page(&finalize_entry(i, 100 * i)).unwrap())
+			.collect();
+		write_wal_pages(&segment_file(&dir, 1), &pages);
+		let z_path = segment_file(&dir, if below_tail { 3 } else { 8 });
+		write_wal_pages(&z_path, z);
+		if !suffix.is_empty() {
+			OpenOptions::new()
+				.append(true)
+				.open(&z_path)
+				.unwrap()
+				.write_all(suffix)
+				.unwrap();
+		}
+		if below_tail {
+			snapshot_at(&dir, 3);
+		}
+		dir
+	}
+
+	/// F1: a trailing holder with a valid checkpoint record followed by bytes replay did not
+	/// validate (a partial header, a zero-filled page, a final record with a bad checksum) is not
+	/// wholly validated: open refuses before any effect, in both off-tail shapes.
+	#[tokio::test]
+	async fn open_refuses_a_trailing_holder_with_an_unvalidated_suffix_without_effect() {
+		let page = serialize_checkpoint_page(2, 1, 2, 1);
+		let mut bad_crc = serialize_checkpoint_page(2, 1, 2, 1);
+		let crc_at =
+			std::mem::size_of::<WALRecordHeader>() + std::mem::size_of::<WALCheckpointBody>();
+		bad_crc.as_mut_slice()[crc_at] ^= 0xFF;
+		let suffixes: [(&str, Vec<u8>); 3] = [
+			("partial header", page.as_slice()[..16].to_vec()),
+			("zero-filled page", vec![0; DIRECT_IO_ALIGN]),
+			("final bad checksum", bad_crc.as_slice().to_vec()),
+		];
+		for below_tail in [false, true] {
+			for (name, suffix) in &suffixes {
+				let label = format!("{name}, below tail {below_tail}");
+				let dir = seed_trailing_holder(
+					below_tail,
+					&[serialize_checkpoint_page(2, 1, 2, 1)],
+					suffix,
+				);
+				let files = artifact_bytes(&dir);
+				let err = try_open_store_with_segment_bytes(&dir, 3 * WAL_PAGE)
+					.await
+					.err()
+					.unwrap_or_else(|| panic!("{label}: an unvalidated suffix refuses open"));
+				assert_eq!(err.kind(), ErrorKind::InvalidData, "{label}: {err}");
+				assert_eq!(artifact_bytes(&dir), files, "{label}: no effect");
+			}
+		}
+	}
+
+	/// A wholly validated trailing holder of several records completes from its last record, in
+	/// both off-tail shapes.
+	#[tokio::test]
+	async fn open_completes_a_wholly_valid_multi_record_trailing_holder() {
+		for below_tail in [false, true] {
+			let (older, latest, expect) = if below_tail {
+				(
+					serialize_checkpoint_page(2, 2, 2, 1),
+					serialize_checkpoint_page(3, 3, 3, 1),
+					RecoveryCheckpoint {
+						commit_index: 3,
+						e_safe_index: 3,
+					},
+				)
+			} else {
+				(
+					serialize_checkpoint_page(1, 0, 1, 1),
+					serialize_checkpoint_page(2, 1, 2, 1),
+					RecoveryCheckpoint {
+						commit_index: 2,
+						e_safe_index: 1,
+					},
+				)
+			};
+			let latest_bytes = latest.as_slice().to_vec();
+			let dir = seed_trailing_holder(below_tail, &[older, latest], &[]);
+			let (_, seen) = reopen(&dir, 3 * WAL_PAGE, "multi-record").await;
+			assert_eq!(
+				seen.files,
+				vec![(1, 3 * WAL_PAGE), (4, WAL_PAGE)],
+				"below tail {below_tail}"
+			);
+			assert_eq!(seen.checkpoint, Some(expect), "below tail {below_tail}");
+			assert_eq!(std::fs::read(segment_file(&dir, 4)).unwrap(), latest_bytes);
 		}
 	}
 }
