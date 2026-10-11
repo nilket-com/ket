@@ -2954,3 +2954,117 @@ fn without_test_items_deep(tokens: proc_macro2::TokenStream) -> proc_macro2::Tok
 	}
 	out.into_iter().collect()
 }
+
+// Committed-prefix shape validation (T-S1): pure over captured values. No store read, no
+// committed-source mint or adaptation, no reducer, origin or authorization; one root2-scoped
+// function and its error type; no impls, traits, statics or modules; no caller outside its own
+// module and the root2 tests. Syntax only; #[cfg(test)] items are excluded from the surface.
+#[test]
+fn committed_prefix_check_is_pure_and_unwired() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let root = src.join("storage/mutation_visibility/root2");
+	let text = fs::read_to_string(root.join("prefix.rs")).unwrap();
+	assert!(text.lines().count() <= 200);
+	fn forbidden(tokens: proc_macro2::TokenStream) -> Option<String> {
+		for t in tokens {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => {
+					let n = id.to_string();
+					if [
+						"unsafe",
+						"async",
+						"await",
+						"fs",
+						"io",
+						"net",
+						"tokio",
+						"Raft",
+						"RaftLogReader",
+						"try_get_log_entries",
+						"get_log_entries",
+						"CommittedSource2",
+						"committed_entry2",
+						"from_source",
+						"CommittedEntry2",
+						"TrustedEntry2",
+						"VerifiedCommand2",
+						"TrustedView2",
+						"MutationAuthorityState2",
+						"StateInner2",
+						"Root2",
+						"bootstrap2",
+						"install_admin2",
+						"advance_root2",
+						"advance_pre_root2",
+						"advance_cover2",
+						"advance_admission2",
+						"reduce",
+						"reduce_admission",
+						"authorized",
+					]
+					.contains(&n.as_str())
+					{
+						return Some(n);
+					}
+				}
+				proc_macro2::TokenTree::Group(g) => {
+					if let Some(n) = forbidden(g.stream()) {
+						return Some(n);
+					}
+				}
+				_ => {}
+			}
+		}
+		None
+	}
+	assert_eq!(
+		forbidden(without_test_items_deep(text.parse().unwrap())),
+		None,
+		"prefix.rs: prohibited token"
+	);
+	let file = syn::parse_file(&text).unwrap();
+	let cfg_test = |attrs: &[syn::Attribute]| {
+		attrs.iter().any(|a| {
+			a.path().is_ident("cfg")
+				&& matches!(&a.meta, syn::Meta::List(l) if l.tokens.to_string().contains("test"))
+		})
+	};
+	let mut exports = Vec::new();
+	for item in &file.items {
+		match item {
+			syn::Item::Fn(f) if cfg_test(&f.attrs) => {}
+			syn::Item::Fn(f) if root2_scoped(&f.vis) => exports.push(f.sig.ident.to_string()),
+			syn::Item::Fn(f) => assert!(matches!(f.vis, syn::Visibility::Inherited)),
+			syn::Item::Enum(e) => assert_eq!(e.ident, "PrefixError2"),
+			syn::Item::Impl(_)
+			| syn::Item::Trait(_)
+			| syn::Item::Static(_)
+			| syn::Item::Mod(_)
+			| syn::Item::Struct(_) => panic!("prefix.rs: no impls, traits, statics, modules or structs"),
+			_ => {}
+		}
+	}
+	assert_eq!(exports, ["check_committed_prefix2"]);
+	// Dormant: nothing outside the module and the root2 tests names it.
+	let tests = root.join("tests");
+	let mut stack = vec![src];
+	while let Some(dir) = stack.pop() {
+		for e in fs::read_dir(dir).unwrap() {
+			let p = e.unwrap().path();
+			if p.is_dir() {
+				if p != tests {
+					stack.push(p);
+				}
+			} else if p.extension().is_some_and(|x| x == "rs") && !p.ends_with("root2/prefix.rs") {
+				let t = fs::read_to_string(&p).unwrap();
+				for name in ["check_committed_prefix2", "PrefixError2", "prefix::"] {
+					assert!(
+						!t.contains(name),
+						"production caller of {name} in {}",
+						p.display()
+					);
+				}
+			}
+		}
+	}
+}
