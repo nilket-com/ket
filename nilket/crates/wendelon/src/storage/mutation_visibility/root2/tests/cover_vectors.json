@@ -1,0 +1,59 @@
+{
+  "generator": "cover_reference.py (hashlib)",
+  "cases": [
+    {
+      "name": "cover_blank_5a",
+      "generation": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "cluster": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+      "kind": 0,
+      "external": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "payload": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c201005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "digest": "6c7d08aad0d54920815f43db1e419749a0b1a7c9cbf197fb8406f83ab7689f0f"
+    },
+    {
+      "name": "cover_blank_01",
+      "generation": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "cluster": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+      "kind": 0,
+      "external": "0101010101010101010101010101010101010101010101010101010101010101",
+      "payload": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c201000101010101010101010101010101010101010101010101010101010101010101",
+      "digest": "e68bde8b735fc171a5216a7c55f14133174073d66a547fb0fac0ef6365251b64"
+    },
+    {
+      "name": "cover_membership_5a",
+      "generation": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "cluster": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+      "kind": 1,
+      "external": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "payload": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c201015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "digest": "d52e864436b6e4a744982d40c59630366d9700b1ed449195b6cce94f5ac01361"
+    },
+    {
+      "name": "cover_membership_01",
+      "generation": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "cluster": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+      "kind": 1,
+      "external": "0101010101010101010101010101010101010101010101010101010101010101",
+      "payload": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c201010101010101010101010101010101010101010101010101010101010101010101",
+      "digest": "0f9e8b06a49420ae3c8f62b3a3e3d2b8b12ea2e2343dd19766eb784d2820b1af"
+    },
+    {
+      "name": "cover_non_root2_5a",
+      "generation": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "cluster": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+      "kind": 2,
+      "external": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "payload": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c201025a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "digest": "12b69dc5271f69ae98c746a9bd13ece72c94d147bea61d8a431db38c05abbe74"
+    },
+    {
+      "name": "cover_non_root2_01",
+      "generation": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "cluster": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+      "kind": 2,
+      "external": "0101010101010101010101010101010101010101010101010101010101010101",
+      "payload": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c201020101010101010101010101010101010101010101010101010101010101010101",
+      "digest": "81584eafae775070f9f2e76aa4c3e0941901260d85db01086403dd7778ffb5ac"
+    }
+  ]
+}
