@@ -783,6 +783,7 @@ fn admin_items(file: &syn::File) -> Option<Vec<String>> {
 						"AdminManifestError2",
 						"BootstrapRecordError2",
 						"BootstrapField2",
+						"ManifestProfile2",
 					]
 					.iter()
 					.any(|n| e.ident == *n)) =>
@@ -798,6 +799,8 @@ fn admin_items(file: &syn::File) -> Option<Vec<String>> {
 						"BootstrapIdentity2",
 						"BootstrapRecord2",
 						"BootstrapObservation2",
+						"GovernanceRole2",
+						"AdminManifestTwo2",
 					]
 					.iter()
 					.any(|n| s.ident == *n)) =>
@@ -882,16 +885,27 @@ fn admin_manifest_math_stays_private_and_has_no_provenance_producer() {
 	assert_eq!(
 		entrypoints,
 		[
+			"actions",
 			"admin_manifest_digest2",
+			"admin_manifest_two_digest2",
+			"base",
 			"check_admin_manifest_digest2",
 			"check_enrollable_admin_key2",
 			"decode",
 			"decode",
 			"decode",
+			"decode",
 			"encode",
 			"encode",
 			"encode",
-			"first_mismatch"
+			"encode",
+			"first_mismatch",
+			"governance",
+			"id",
+			"key",
+			"manifest_profile2",
+			"new",
+			"new"
 		]
 	);
 }
@@ -3585,6 +3599,101 @@ fn admin_command_envelope_is_pure_and_unwired() {
 					assert!(
 						!t.contains(name),
 						"production caller of {name} in {}",
+						p.display()
+					);
+				}
+			}
+		}
+	}
+}
+
+// Profile-2 manifest codec (M1): additive and dormant. Exact census of the new items in
+// admin/manifest.rs (struct fields private, the enum's two variants, the constants) and no
+// production name of them outside src/.../admin and the test modules. Syntax only.
+#[test]
+fn profile_two_manifest_codec_is_additive_and_dormant() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let root = src.join("storage/mutation_visibility/root2");
+	let text = fs::read_to_string(root.join("admin/manifest.rs")).unwrap();
+	let file = syn::parse_file(&text).unwrap();
+	let mut consts = Vec::new();
+	for item in &file.items {
+		match item {
+			syn::Item::Struct(s)
+				if s.ident == "GovernanceRole2" || s.ident == "AdminManifestTwo2" =>
+			{
+				let fields: Vec<_> = s
+					.fields
+					.iter()
+					.map(|f| {
+						assert!(
+							matches!(f.vis, syn::Visibility::Inherited),
+							"private fields"
+						);
+						f.ident.as_ref().unwrap().to_string()
+					})
+					.collect();
+				let want: &[&str] = if s.ident == "GovernanceRole2" {
+					&["id", "key"]
+				} else {
+					&["base", "governance"]
+				};
+				assert_eq!(fields, want);
+			}
+			syn::Item::Enum(e) if e.ident == "ManifestProfile2" => {
+				let v: Vec<_> = e.variants.iter().map(|v| v.ident.to_string()).collect();
+				assert_eq!(v, ["One", "Two"]);
+				assert!(
+					e.variants.iter().all(|v| v.fields.is_empty()),
+					"no role data"
+				);
+			}
+			syn::Item::Const(c) => consts.push((c.ident.to_string(), root2_scoped(&c.vis))),
+			_ => {}
+		}
+	}
+	consts.sort();
+	assert_eq!(
+		consts,
+		[
+			("ACTIONS".to_string(), false),
+			("ADMIN_MANIFEST_BYTES2".to_string(), true),
+			("ADMIN_MANIFEST_P2_BYTES2".to_string(), true),
+			("ADMIN_MANIFEST_READ_BOUND2".to_string(), true),
+			("DOMAIN".to_string(), false),
+			("GOVERNANCE_ACTIONS".to_string(), false),
+			("MAGIC".to_string(), false),
+			("PROFILE_ONE".to_string(), false),
+			("PROFILE_TWO".to_string(), false)
+		]
+	);
+	// The profile-1 decoder is untouched by profile 2: it never names the new items.
+	let decode = fn_body(&text, "decode");
+	assert!(!decode.contains("PROFILE_TWO") && !decode.contains("GovernanceRole2"));
+	// Dormant: no production file outside admin/ names a profile-2 item.
+	let tests = root.join("tests");
+	let admin = root.join("admin");
+	let mut stack = vec![src];
+	while let Some(dir) = stack.pop() {
+		for e in fs::read_dir(dir).unwrap() {
+			let p = e.unwrap().path();
+			if p.is_dir() {
+				if p != tests && p != admin && !p.ends_with("tests") {
+					stack.push(p);
+				}
+			} else if p.extension().is_some_and(|x| x == "rs") {
+				let t = fs::read_to_string(&p).unwrap();
+				for name in [
+					"AdminManifestTwo2",
+					"GovernanceRole2",
+					"ManifestProfile2",
+					"admin_manifest_two_digest2",
+					"manifest_profile2",
+					"ADMIN_MANIFEST_P2_BYTES2",
+				] {
+					assert!(
+						!t.contains(name),
+						"production use of {name} in {}",
 						p.display()
 					);
 				}

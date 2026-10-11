@@ -11,6 +11,10 @@ pub(in crate::storage::mutation_visibility::root2) enum AdminManifestError2 {
 	NonCanonicalKey,
 	NotCanonical,
 	DigestMismatch,
+	/// Profile and length disagree (profile 2 iff 189 bytes; profile 1 iff 137).
+	ProfileLength,
+	/// A profile-2 governance id or key equal to the Admission id or key.
+	RoleReuse,
 }
 pub(in crate::storage::mutation_visibility::root2) type AdminResult2<T> =
 	Result<T, AdminManifestError2>;

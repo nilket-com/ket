@@ -3,6 +3,7 @@ use super::key::check_enrollable_admin_key2;
 use super::manifest::*;
 use super::record::*;
 mod negative;
+mod profile_two;
 mod record;
 mod vectors;
 
