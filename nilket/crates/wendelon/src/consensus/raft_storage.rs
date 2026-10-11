@@ -17262,6 +17262,373 @@ mod recovery_tests {
 	async fn failed_publication_refuses_cleanup_with_no_prior_purge() {
 		failed_publication_refuses(AfterFailedPublication::Cleanup, false).await;
 	}
+
+	/// Test-only file ops that fail opening one path while armed: the builder's open of `current`
+	/// for its returned handle, after a successful rename and directory sync.
+	#[derive(Clone)]
+	struct FailCurrentOpenFileOps {
+		inner: BlockingFileOps,
+		current: PathBuf,
+		armed: Arc<std::sync::atomic::AtomicBool>,
+	}
+
+	#[async_trait::async_trait]
+	impl AsyncFileOps for FailCurrentOpenFileOps {
+		async fn open(&self, path: &Path, flags: OpenFlags) -> std::io::Result<FileHandle> {
+			if path == self.current && self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+				return Err(Error::other("injected open failure of current"));
+			}
+			self.inner.open(path, flags).await
+		}
+
+		async fn read_plain_at(
+			&self,
+			handle: &FileHandle,
+			offset: u64,
+			len: usize,
+		) -> std::io::Result<Vec<u8>> {
+			self.inner.read_plain_at(handle, offset, len).await
+		}
+
+		async fn write_plain_at(
+			&self,
+			handle: &FileHandle,
+			offset: u64,
+			bytes: Vec<u8>,
+		) -> std::io::Result<usize> {
+			self.inner.write_plain_at(handle, offset, bytes).await
+		}
+
+		async fn read_at(
+			&self,
+			handle: &FileHandle,
+			offset: u64,
+			buf: AlignedBuf,
+		) -> std::io::Result<(usize, AlignedBuf)> {
+			self.inner.read_at(handle, offset, buf).await
+		}
+
+		async fn write_at(
+			&self,
+			handle: &FileHandle,
+			offset: u64,
+			buf: AlignedBuf,
+		) -> std::io::Result<(usize, AlignedBuf)> {
+			self.inner.write_at(handle, offset, buf).await
+		}
+
+		async fn fsync(&self, handle: &FileHandle) -> std::io::Result<()> {
+			self.inner.fsync(handle).await
+		}
+
+		async fn fdatasync(&self, handle: &FileHandle) -> std::io::Result<()> {
+			self.inner.fdatasync(handle).await
+		}
+
+		async fn read_all(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+			self.inner.read_all(path).await
+		}
+
+		async fn write_all(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+			self.inner.write_all(path, bytes).await
+		}
+
+		async fn file_len(&self, path: &Path) -> std::io::Result<Option<u64>> {
+			self.inner.file_len(path).await
+		}
+
+		async fn set_len(&self, handle: &FileHandle, len: u64) -> std::io::Result<()> {
+			self.inner.set_len(handle, len).await
+		}
+
+		async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+			self.inner.create_dir_all(path).await
+		}
+
+		async fn read_dir(&self, path: &Path) -> std::io::Result<Vec<DirectoryEntry>> {
+			self.inner.read_dir(path).await
+		}
+
+		async fn fsync_dir(&self, path: &Path) -> std::io::Result<()> {
+			self.inner.fsync_dir(path).await
+		}
+
+		async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+			self.inner.rename(from, to).await
+		}
+
+		async fn link_no_replace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+			self.inner.link_no_replace(from, to).await
+		}
+
+		async fn unlink(&self, path: &Path) -> std::io::Result<()> {
+			self.inner.unlink(path).await
+		}
+	}
+
+	async fn publication_state(store: &WendelonLogStore) -> PublicationState {
+		*store.publication.state.lock().await
+	}
+
+	/// After a terminal publication failure: every reader, publisher, purge, cleanup and export
+	/// refuses, and none of them changes a file.
+	async fn assert_terminal_refusals(
+		store: &mut WendelonLogStore,
+		sm: &mut WendelonStateMachine,
+		dir: &Path,
+		label: &str,
+	) {
+		let files = artifact_bytes(dir);
+		assert!(
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_current_snapshot(
+				sm
+			)
+			.await
+			.is_err(),
+			"{label}: a reader refuses"
+		);
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				sm,
+			)
+			.await;
+		assert!(
+			builder.build_snapshot().await.is_err(),
+			"{label}: a publisher refuses"
+		);
+		assert!(
+			store.purge(log_id(1, 1)).await.is_err(),
+			"{label}: purge refuses"
+		);
+		assert!(
+			store.complete_deferred_purge().await.is_err(),
+			"{label}: cleanup refuses"
+		);
+		assert!(
+			store.export_backup(sm).await.is_err(),
+			"{label}: export refuses"
+		);
+		assert_eq!(
+			artifact_bytes(dir),
+			files,
+			"{label}: no refusal changes a file"
+		);
+	}
+
+	/// Binding note B: the builder's open of the `current` handle fails after a successful rename
+	/// and directory sync. Publication latches terminal failure carrying the durable candidate;
+	/// everything refuses until reopen, which validates and serves the candidate.
+	#[tokio::test]
+	async fn build_handle_open_failure_after_durable_publication_latches() {
+		let dir = tempdir("build-handle-open-failure");
+		let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let file_ops = FailCurrentOpenFileOps {
+			inner: BlockingFileOps,
+			current: artifact_paths(&dir).2,
+			armed: armed.clone(),
+		};
+		let mut store = open_store_with_async_file_ops(&dir, Arc::new(file_ops), WAL_PAGE).await;
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		append_and_apply(&mut store, &mut sm, lease_entry(1, 10, 19, 3)).await;
+		armed.store(true, std::sync::atomic::Ordering::SeqCst);
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		assert!(builder.build_snapshot().await.is_err(), "the build fails");
+		assert_eq!(
+			publication_state(&store).await,
+			PublicationState::Failed {
+				durable: PublishedSnapshot::Artifact(Some(log_id(1, 1))),
+				step: "build handle open",
+			},
+			"terminal failure carries the durable candidate"
+		);
+		assert_terminal_refusals(&mut store, &mut sm, &dir, "build handle open").await;
+		drop(builder);
+		drop(sm);
+		drop(store);
+		let reopened = open_store(&dir).await;
+		let mut recovered = reopened.recovered_state_machine().await.unwrap();
+		assert_current(&mut recovered, 1, "reopen after build handle open failure").await;
+	}
+
+	/// Binding note B: an install whose state update fails after publication, here a real
+	/// conflict between the snapshot's DROP fence and the receiving drain registry. The candidate
+	/// is durable; publication latches terminal failure carrying it; nothing exposes old metadata
+	/// over its bytes; reopen validates and serves it.
+	#[tokio::test]
+	async fn install_state_update_failure_after_durable_publication_latches() {
+		let tenant_id = TenantId::new(7);
+		let table_object_id = TableObjectId::new([5; 16]);
+		let fenced = DropOperationId {
+			tenant_id,
+			table_object_id,
+			schema_generation: SchemaGeneration::new(2),
+		};
+		let other = DropOperationId {
+			schema_generation: SchemaGeneration::new(1),
+			..fenced
+		};
+		let source = tempdir("install-drain-conflict-source");
+		let mut state = SmState::default();
+		state.last_applied_log_id = Some(log_id(1, 3));
+		state.table_drop_fences.prepare(fenced, 3).unwrap();
+		let source_path = source.join("snapshot.wnd");
+		write_snapshot_file(&source_path, &state);
+		let meta = SnapshotMeta {
+			last_log_id: state.last_applied_log_id,
+			last_membership: state.last_membership.clone(),
+			snapshot_id: "drain-conflict".to_string(),
+		};
+		let data = SnapshotDataFile::open(Arc::new(BlockingFileOps), source_path)
+			.await
+			.unwrap();
+
+		let dir = tempdir("install-drain-conflict");
+		let mut store = open_store(&dir).await;
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		sm.mutation_drain.close_committed(other).unwrap();
+		assert!(
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+				&mut sm,
+				&meta,
+				Box::new(data),
+			)
+			.await
+			.is_err(),
+			"the install fails in its state update"
+		);
+		assert_eq!(
+			publication_state(&store).await,
+			PublicationState::Failed {
+				durable: PublishedSnapshot::Artifact(Some(log_id(1, 3))),
+				step: "install state update",
+			},
+			"terminal failure carries the durable candidate"
+		);
+		assert!(
+			sm.inner.read().await.snapshot.is_none(),
+			"the held snapshot was never set to the candidate"
+		);
+		assert_terminal_refusals(&mut store, &mut sm, &dir, "install state update").await;
+		drop(sm);
+		drop(store);
+		let reopened = open_store(&dir).await;
+		let mut recovered = reopened.recovered_state_machine().await.unwrap();
+		assert_current(
+			&mut recovered,
+			3,
+			"reopen after install state update failure",
+		)
+		.await;
+		assert!(
+			recovered
+				.state_snapshot()
+				.await
+				.table_drop_fences
+				.is_fenced(tenant_id, table_object_id),
+			"the candidate's state is what reopen serves"
+		);
+	}
+
+	/// Binding note C: an artifact of empty state (last applied None) is distinct from no
+	/// artifact. It publishes, is served with matching metadata and bytes, survives an equal
+	/// build unchanged, reopens as itself, and gives no authority to delete log.
+	#[tokio::test]
+	async fn empty_state_artifact_is_published_but_authorizes_no_deletion() {
+		let dir = tempdir("empty-state-artifact");
+		let mut store = try_open_store_with_segment_bytes(&dir, WAL_PAGE)
+			.await
+			.unwrap();
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		assert_eq!(
+			publication_state(&store).await,
+			PublicationState::Healthy(PublishedSnapshot::NoArtifact)
+		);
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		let built = builder.build_snapshot().await.unwrap();
+		assert_eq!(built.meta.last_log_id, None);
+		assert_eq!(
+			publication_state(&store).await,
+			PublicationState::Healthy(PublishedSnapshot::Artifact(None))
+		);
+		let current_path = artifact_paths(&dir).2;
+		let published = std::fs::read(&current_path).unwrap();
+		let current =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_current_snapshot(
+				&mut sm,
+			)
+			.await
+			.unwrap()
+			.expect("an empty-state artifact is current");
+		assert_eq!(current.meta.last_log_id, None);
+		let mut served = Vec::new();
+		let mut stream = current.snapshot;
+		tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut served)
+			.await
+			.unwrap();
+		assert_eq!(
+			served, published,
+			"metadata and bytes name the same artifact"
+		);
+
+		let same = builder.build_snapshot().await.unwrap();
+		assert_eq!(same.meta.last_log_id, None);
+		assert_eq!(
+			std::fs::read(&current_path).unwrap(),
+			published,
+			"an equal empty build keeps the authoritative bytes"
+		);
+
+		store
+			.blocking_append(vec![finalize_entry(1, 100), finalize_entry(2, 200)])
+			.await
+			.unwrap();
+		let segments = segment_files(&dir);
+		store.purge(log_id(1, 1)).await.unwrap();
+		assert_eq!(
+			segment_files(&dir),
+			segments,
+			"an empty-state artifact deletes no log"
+		);
+		assert_eq!(store.deferred_log_for_test().await.0, 1);
+		drop(builder);
+		drop(sm);
+		drop(store);
+		let mut reopened = try_open_store_with_segment_bytes(&dir, WAL_PAGE)
+			.await
+			.unwrap();
+		assert_eq!(
+			publication_state(&reopened).await,
+			PublicationState::Healthy(PublishedSnapshot::Artifact(None)),
+			"reopen recovers the empty-state artifact, not no artifact"
+		);
+		let mut recovered_sm = reopened.recovered_state_machine().await.unwrap();
+		let current =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_current_snapshot(
+				&mut recovered_sm,
+			)
+			.await
+			.unwrap()
+			.expect("current after reopen");
+		assert_eq!(current.meta.last_log_id, None);
+		assert_eq!(
+			recovered(&mut reopened, &dir)
+				.await
+				.entries
+				.iter()
+				.map(|(i, _)| *i)
+				.collect::<Vec<_>>(),
+			vec![1, 2],
+			"no prefix was deleted on the empty artifact's authority"
+		);
+	}
 }
 
 // ============================================================
