@@ -562,14 +562,21 @@ async fn full_startup_refuses_incomplete_history() {
 			)
 			.await;
 			let baseline: Option<(std::io::ErrorKind, &str)> = match name {
-				// Zero-length snapshot is no artifact; the receive temp, an
-				// empty legacy file, a relabelled segment 0 and an interior
-				// gap are all accepted by the existing open.
+				// Zero-length snapshot is no artifact; the receive temp and an
+				// empty legacy file are accepted by the existing open.
 				"A1 snapshot artifact (empty file counts)"
 				| "A2 receive temp"
-				| "A3 legacy monolithic WAL"
-				| "B2 first stored entry above 0"
-				| "B3 gap" => None,
+				| "A3 legacy monolithic WAL" => None,
+				// The replay contiguity guard refuses a relabelled segment 0 whose
+				// first entry is past 1, and an interior gap, before any effect.
+				"B2 first stored entry above 0" => Some((
+					std::io::ErrorKind::InvalidData,
+					"not right after the snapshot boundary",
+				)),
+				"B3 gap" => Some((
+					std::io::ErrorKind::InvalidData,
+					"is missing entries between",
+				)),
 				"A4 lowest segment above 0" => Some((
 					std::io::ErrorKind::InvalidData,
 					"no snapshot provides the purged prefix",
@@ -833,9 +840,35 @@ async fn full_storage_backstops_refuse_before_effect() {
 	)
 	.await
 	.unwrap();
+	// Physical deletion needs a durable snapshot covering the purge: a real local build
+	// publishes one, as in production.
+	let built = store
+		.recovered_state_machine()
+		.await
+		.unwrap()
+		.get_snapshot_builder()
+		.await
+		.build_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		built
+			.meta
+			.last_log_id
+			.is_some_and(|id| id.index >= purge_to.index),
+		"the built snapshot covers the purge"
+	);
 	let first_segment = segment_files(&dir)[0].clone();
 	store.purge(purge_to).await.unwrap();
 	assert!(!first_segment.exists());
+	drop(store);
+	WendelonLogStore::open_for_retention_test(
+		&dir,
+		SEGMENT_BYTES,
+		Some(RetentionGuard::new(ControlRetention::Compacting)),
+	)
+	.await
+	.expect("the purged store reopens over its snapshot");
 }
 
 #[tokio::test]

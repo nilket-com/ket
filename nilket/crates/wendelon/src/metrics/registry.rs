@@ -2593,6 +2593,13 @@ pub struct MetricsRegistry {
 	pub data_ring_backpressure_active_actor_requests: Gauge,
 	/// ADR 0096: authoritative replicated physical-erasure obligations.
 	drop_reclaim_debts: Gauge,
+	/// Control WAL segments wholly below the logical purge boundary, kept on disk until a
+	/// durable snapshot covers them.
+	control_wal_deferred_segments: Gauge,
+	/// Bytes of purged Control WAL records kept on disk until a durable snapshot covers them.
+	control_wal_deferred_bytes: Gauge,
+	/// 1 while the Control WAL store is poisoned (an uncertain on-disk state; reopen required).
+	control_wal_store_poisoned: Gauge,
 	/// ADR 0096: settlements live-applied by this daemon process.
 	drop_reclaim_settlements_total: Counter,
 	control_retention_full: Gauge,
@@ -2870,6 +2877,9 @@ impl Default for MetricsRegistry {
 			control_optimizer_facts_get_invalid_request_total: Counter::default(),
 			data_ring_write_outcomes: WriteOutcomeCounters::default(),
 			drop_reclaim_debts: Gauge::default(),
+			control_wal_deferred_segments: Gauge::default(),
+			control_wal_deferred_bytes: Gauge::default(),
+			control_wal_store_poisoned: Gauge::default(),
 			drop_reclaim_settlements_total: Counter::default(),
 			control_retention_full: Gauge::default(),
 			control_retention_violated: Gauge::default(),
@@ -3162,6 +3172,16 @@ impl MetricsRegistry {
 	pub fn set_drop_reclaim_debts(&self, value: usize) {
 		self.drop_reclaim_debts
 			.set(u64::try_from(value).unwrap_or(u64::MAX));
+	}
+
+	pub fn set_control_wal_deferred(&self, segments: usize, bytes: u64) {
+		self.control_wal_deferred_segments
+			.set(u64::try_from(segments).unwrap_or(u64::MAX));
+		self.control_wal_deferred_bytes.set(bytes);
+	}
+
+	pub fn set_control_wal_store_poisoned(&self, poisoned: bool) {
+		self.control_wal_store_poisoned.set(u64::from(poisoned));
 	}
 
 	pub fn observe_drop_reclaim_settlement(&self) {
@@ -4517,6 +4537,24 @@ impl MetricsRegistry {
 			"wendelon_table_drop_reclaim_debts",
 			"Replicated table DROP physical-erasure obligations awaiting settlement.",
 			self.drop_reclaim_debts.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_control_wal_deferred_segments",
+			"Control WAL segments below the purge boundary kept until a durable snapshot covers them.",
+			self.control_wal_deferred_segments.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_control_wal_deferred_bytes",
+			"Bytes of purged Control WAL records kept until a durable snapshot covers them.",
+			self.control_wal_deferred_bytes.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_control_wal_store_poisoned",
+			"1 while the Control WAL store is poisoned and refuses mutation until reopen.",
+			self.control_wal_store_poisoned.get(),
 		);
 		render_counter(
 			&mut out,
@@ -6371,6 +6409,22 @@ mod tests {
 	use std::time::Duration;
 
 	const TEST_BUCKETS_MICROS: &[u64] = &[500, 1_000, 2_500];
+
+	#[test]
+	fn control_wal_deferral_and_poison_gauges_render_their_values() {
+		let registry = MetricsRegistry::default();
+		registry.set_control_wal_deferred(2, 8192);
+		registry.set_control_wal_store_poisoned(true);
+		let rendered = registry.render_prometheus();
+		assert!(rendered.contains("wendelon_control_wal_deferred_segments 2\n"));
+		assert!(rendered.contains("wendelon_control_wal_deferred_bytes 8192\n"));
+		assert!(rendered.contains("wendelon_control_wal_store_poisoned 1\n"));
+		registry.set_control_wal_deferred(0, 0);
+		registry.set_control_wal_store_poisoned(false);
+		let rendered = registry.render_prometheus();
+		assert!(rendered.contains("wendelon_control_wal_deferred_bytes 0\n"));
+		assert!(rendered.contains("wendelon_control_wal_store_poisoned 0\n"));
+	}
 
 	#[test]
 	fn adr0096_drop_reclaim_metrics_are_unlabeled_and_set_sourced() {

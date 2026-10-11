@@ -327,6 +327,8 @@ struct WALReplay {
 	checkpoint: Option<RecoveryCheckpoint>,
 	wal_segments: Vec<WalSegmentMeta>,
 	last_segment_needs_truncate: bool,
+	/// The first retained entry was read from the legacy single-file WAL.
+	legacy_start: bool,
 	/// Each segment holding no log entry, by path. Read only by open-time completion.
 	checkpoint_only_holders: BTreeMap<PathBuf, CheckpointOnlyHolder>,
 }
@@ -392,6 +394,10 @@ struct LogStoreInner {
 	/// Set after any WAL mutation fails once it may have had an on-disk effect. While set, every
 	/// WAL mutator refuses without I/O; only a reopen, which rebuilds state from disk, clears it.
 	poisoned: Option<WalPoison>,
+	/// Physical positions of purged entries whose segments are still on disk because no durable
+	/// snapshot covers them yet. Logical readers never see them; truncate uses them to keep
+	/// those bytes, and the deferred purge drops them with their segments.
+	deferred_positions: BTreeMap<u64, WalRecordPointer>,
 }
 
 /// Which WAL operation and step left the store with uncertain on-disk state.
@@ -399,6 +405,51 @@ struct LogStoreInner {
 struct WalPoison {
 	op: &'static str,
 	step: &'static str,
+}
+
+/// Deferred physical log: (segments wholly at or below the logical purge boundary, bytes of
+/// purged records still on disk, straddling segments included), from tracked store state.
+fn deferred_log(inner: &LogStoreInner) -> (usize, u64) {
+	let segments = match inner.last_purged {
+		Some(boundary) => inner
+			.wal_segments
+			.iter()
+			.filter(|segment| {
+				segment
+					.end_log_index
+					.is_some_and(|end| end <= boundary.index)
+			})
+			.count(),
+		None => 0,
+	};
+	let bytes = inner
+		.deferred_positions
+		.values()
+		.map(|pointer| pointer.len_bytes)
+		.sum();
+	(segments, bytes)
+}
+
+fn report_deferred(inner: &LogStoreInner) {
+	let (segments, bytes) = deferred_log(inner);
+	metrics().set_control_wal_deferred(segments, bytes);
+}
+
+/// The store's side of snapshot publication, called by the publisher after a snapshot is
+/// durable, and at open.
+#[async_trait::async_trait]
+impl DeferredPurge for WendelonLogStore {
+	async fn complete_deferred_purge(&self) -> std::io::Result<()> {
+		let last_purged = self.inner.read().await.last_purged;
+		let Some(last_purged) = last_purged else {
+			return Ok(());
+		};
+		let mut store = self.clone();
+		store
+			.purge(last_purged)
+			.await
+			.map_err(|err| Error::other(format!("deferred purge: {err}")))
+	}
 }
 
 /// Truncate(k), resolved before any effect: r (the greatest retained entry below k) and its
@@ -428,6 +479,9 @@ pub struct WendelonLogStore {
 	wal_gate: Arc<Mutex<()>>,
 	/// The node's Control retention guard; `None` is `Compacting`.
 	retention: Option<Arc<RetentionGuard>>,
+	/// Shared with the state machine: the durable snapshot that alone authorizes physical
+	/// deletion of purged log.
+	publication: Arc<SnapshotPublication>,
 }
 
 impl WendelonLogStore {
@@ -454,9 +508,11 @@ impl WendelonLogStore {
 				wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
 				vote_file: None,
 				poisoned: None,
+				deferred_positions: BTreeMap::new(),
 			})),
 			wal_gate: Arc::new(Mutex::new(())),
 			retention: None,
+			publication: Arc::new(SnapshotPublication::new(PublishedSnapshot::NoArtifact)),
 		}
 	}
 
@@ -613,6 +669,13 @@ impl WendelonLogStore {
 		if let Some(guard) = &retention {
 			guard.record_history(history);
 		}
+		// Read-only, after the typed Full refusals and before any effect.
+		check_retained_log_contiguous(
+			wal_path,
+			snapshot.as_ref().and_then(|loaded| loaded.last_included),
+			replay.legacy_start,
+			&replay.entries,
+		)?;
 		// The first effect of open, after every read-only refusal above.
 		complete_checkpoint_holder_at_open(
 			file_ops.as_ref(),
@@ -646,8 +709,12 @@ impl WendelonLogStore {
 			.last()
 			.map(|segment| segment.len_bytes)
 			.unwrap_or(0);
+		let published = match &snapshot {
+			Some(loaded) => PublishedSnapshot::Artifact(loaded.last_included),
+			None => PublishedSnapshot::NoArtifact,
+		};
 
-		Ok(Self {
+		let store = Self {
 			inner: Arc::new(RwLock::new(LogStoreInner {
 				entries: replay.entries,
 				entry_positions: replay.entry_positions,
@@ -666,10 +733,20 @@ impl WendelonLogStore {
 				wal_segment_bytes: options.segment_bytes,
 				vote_file: Some(vote_file),
 				poisoned: None,
+				deferred_positions: BTreeMap::new(),
 			})),
 			wal_gate: Arc::new(Mutex::new(())),
 			retention,
-		})
+			publication: Arc::new(SnapshotPublication::new(published)),
+		};
+		metrics().set_control_wal_store_poisoned(false);
+		// Log the validated durable snapshot covers, kept by a purge that ran before it was
+		// durable: removed now, after every read-only refusal and completion above, before any
+		// append. A failure aborts open.
+		if !full {
+			store.complete_deferred_purge().await?;
+		}
+		Ok(store)
 	}
 
 	/// Test seam for the retention suite: a store over `dir` with blocking
@@ -695,6 +772,20 @@ impl WendelonLogStore {
 	#[cfg(test)]
 	pub(crate) fn segment_path_for_retention_test(dir: &Path, start_index: u64) -> PathBuf {
 		wal_segment_path(&dir.join("control.wal"), start_index).unwrap()
+	}
+
+	/// Deferred physical log, as the gauges report it.
+	#[cfg(test)]
+	pub(crate) async fn deferred_log_for_test(&self) -> (usize, u64) {
+		deferred_log(&*self.inner.read().await)
+	}
+
+	/// Records a durable snapshot at `last_included`, as a publication would; for tests that
+	/// place a snapshot artifact on disk by hand after open.
+	#[cfg(test)]
+	pub(crate) async fn note_published_snapshot_for_test(&self, last_included: LogId<u32>) {
+		*self.publication.state.lock().await =
+			PublicationState::Healthy(PublishedSnapshot::Artifact(Some(last_included)));
 	}
 
 	pub async fn bootstrap_mode(&self) -> DurableBootstrapMode {
@@ -764,6 +855,7 @@ impl WendelonLogStore {
 			.await
 			.poisoned
 			.get_or_insert(WalPoison { op, step });
+		metrics().set_control_wal_store_poisoned(true);
 		error
 	}
 
@@ -997,6 +1089,8 @@ impl WendelonLogStore {
 				(Some(file_ops), Some(paths)) => SnapshotRuntime::new(
 					file_ops.clone(),
 					SnapshotPaths::from_current(paths.snapshot.clone()),
+					self.publication.clone(),
+					Some(Arc::new(self.clone()) as Arc<dyn DeferredPurge>),
 				),
 				_ => SnapshotRuntime::ephemeral(),
 			};
@@ -1042,7 +1136,12 @@ impl WendelonLogStore {
 		let wal =
 			read_wal_backup_bytes(file_ops.as_ref(), &wal_segments, &artifact_paths.wal).await?;
 		let vote = read_optional_artifact(file_ops.as_ref(), &artifact_paths.vote).await?;
-		let snapshot = read_optional_artifact(file_ops.as_ref(), &artifact_paths.snapshot).await?;
+		// `current` is read under the publication lock; a failed publication refuses.
+		let snapshot = {
+			let publication = self.publication.state.lock().await;
+			SnapshotPublication::healthy(&publication)?;
+			read_optional_artifact(file_ops.as_ref(), &artifact_paths.snapshot).await?
+		};
 		if wal.is_empty() && snapshot.is_empty() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -1648,12 +1747,19 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 				.next_back()
 				.map(|(_, entry)| entry.log_id);
 			let plan = TruncatePlan {
-				retained_position: retained.and_then(|id| {
-					guard
+				// R: the greatest retained entry below k, else the greatest purged record still on
+				// disk, so deferred bytes are shrunk around, never unlinked.
+				retained_position: match retained {
+					Some(id) => guard
 						.entry_positions
 						.get(&id.index)
-						.map(|pointer| (id.index, *pointer))
-				}),
+						.map(|pointer| (id.index, *pointer)),
+					None => guard
+						.deferred_positions
+						.iter()
+						.next_back()
+						.map(|(&index, &pointer)| (index, pointer)),
+				},
 				retained,
 				next: physical_tail_next(retained, guard.last_purged).map_err(refuse)?,
 				tail_next: physical_tail_next(guard.last_log_id, guard.last_purged)
@@ -1746,7 +1852,7 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 						.shrink_retained(file_ops.as_ref(), &wal_segments[at], new_len)
 						.await?;
 					wal_segments[at].len_bytes = new_len;
-					wal_segments[at].end_log_index = plan.retained.map(|id| id.index);
+					wal_segments[at].end_log_index = plan.retained_position.map(|(index, _)| index);
 					(Some(handle), new_len)
 				}
 				None => (None, 0),
@@ -1838,7 +1944,7 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 			self.shrink_retained(file_ops.as_ref(), &wal_segments[at], new_len)
 				.await?;
 			wal_segments[at].len_bytes = new_len;
-			wal_segments[at].end_log_index = plan.retained.map(|id| id.index);
+			wal_segments[at].end_log_index = plan.retained_position.map(|(index, _)| index);
 		}
 		// Step 4: the final checkpoint-only segment, named for the next entry.
 		let (next_path, next_handle, next_len) = match create_wal_holder(
@@ -1932,6 +2038,7 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 		};
 		let mut wal_file = wal_file;
 		let mut wal_cursor = wal_cursor;
+		let mut deleted_starts_all: BTreeSet<u64> = BTreeSet::new();
 		if let Some(file_ops) = file_ops.as_ref() {
 			let artifact_paths = artifact_paths.ok_or_else(|| {
 				refuse(Error::new(
@@ -1939,11 +2046,30 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 					"durable wal purge missing artifact paths",
 				))
 			})?;
-			// A checkpoint-only segment is never in the purged run.
+			// Physical deletion needs both the logical boundary and a durable snapshot covering
+			// the segment; anything else is kept (deferred) until a publication covers it. A
+			// checkpoint-only segment is never in the purged run.
+			let covered = self.publication.covered_index().await;
 			let delete_count = wal_segments
 				.iter()
-				.take_while(|segment| segment.end_log_index.is_some_and(|end| end <= p))
+				.take_while(|segment| {
+					segment
+						.end_log_index
+						.is_some_and(|end| end <= p && covered.is_some_and(|c| end <= c))
+				})
 				.count();
+			deleted_starts_all = wal_segments
+				.iter()
+				.take(delete_count)
+				.map(|segment| segment.start_index)
+				.collect();
+			// A surviving log segment wholly at or below the boundary is deferred: never the
+			// segment new entries or C′ go into.
+			let deferred_log = |segment: &WalSegmentMeta| {
+				segment
+					.end_log_index
+					.is_some_and(|end| end <= last_purged.index)
+			};
 			// A checkpoint-only active segment the new boundary has passed: with C′ it is removed
 			// after a holder at the post-purge name is durable; without, it is removed first.
 			let below = wal_segments
@@ -1982,7 +2108,9 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 			}
 			let survivor = wal_segments
 				.last()
-				.filter(|_| delete_count < wal_segments.len() && below.is_none())
+				.filter(|last| {
+					delete_count < wal_segments.len() && below.is_none() && !deferred_log(last)
+				})
 				.cloned();
 			if delete_count > 0 || below.is_some() {
 				let holder_path =
@@ -2099,16 +2227,34 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 					return Err(self.poisoned_storage("purge", "segment-invariant", e).await);
 				}
 			}
+			// New entries never go into a deferred segment: the next append names its own.
+			if wal_segments.last().is_some_and(deferred_log) {
+				wal_file = None;
+				wal_cursor = 0;
+			}
 		}
 
 		let mut guard = self.inner.write().await;
 		guard.entries.retain(|&idx, _| idx > p);
+		let purged_positions: Vec<(u64, WalRecordPointer)> = guard
+			.entry_positions
+			.range(..=p)
+			.map(|(&index, &pointer)| (index, pointer))
+			.collect();
 		guard.entry_positions.retain(|&idx, _| idx > p);
 		guard.last_purged = Some(last_purged);
 		if guard.file_ops.is_some() {
+			// Positions of purged records whose segments are kept stay known physically.
+			for (index, pointer) in purged_positions {
+				guard.deferred_positions.insert(index, pointer);
+			}
+			guard
+				.deferred_positions
+				.retain(|_, pointer| !deleted_starts_all.contains(&pointer.segment_start_index));
 			guard.wal_segments = wal_segments;
 			guard.wal_file = wal_file;
 			guard.wal_cursor = wal_cursor;
+			report_deferred(&guard);
 		}
 		guard.last_log_id = Some(last_log_id);
 		Ok(())
@@ -2605,16 +2751,158 @@ impl SnapshotPaths {
 struct SnapshotRuntime {
 	file_ops: Arc<dyn AsyncFileOps>,
 	paths: SnapshotPaths,
+	/// The one authority over which artifact `current` names; shared with the log store.
+	publication: Arc<SnapshotPublication>,
+	/// Completes physical log deletion a newly published snapshot now covers.
+	deferred_purge: Option<Arc<dyn DeferredPurge>>,
 }
 
 impl SnapshotRuntime {
-	fn new(file_ops: Arc<dyn AsyncFileOps>, paths: SnapshotPaths) -> Self {
-		Self { file_ops, paths }
+	fn new(
+		file_ops: Arc<dyn AsyncFileOps>,
+		paths: SnapshotPaths,
+		publication: Arc<SnapshotPublication>,
+		deferred_purge: Option<Arc<dyn DeferredPurge>>,
+	) -> Self {
+		Self {
+			file_ops,
+			paths,
+			publication,
+			deferred_purge,
+		}
 	}
 
 	fn ephemeral() -> Self {
-		Self::new(Arc::new(BlockingFileOps), SnapshotPaths::ephemeral())
+		Self::new(
+			Arc::new(BlockingFileOps),
+			SnapshotPaths::ephemeral(),
+			Arc::new(SnapshotPublication::new(PublishedSnapshot::NoArtifact)),
+			None,
+		)
 	}
+
+	/// After a successful publication: physical log deletion the new snapshot covers. Its
+	/// failure fails the publishing call (the node stops); it never un-publishes.
+	async fn complete_deferred_purge(&self) -> std::io::Result<()> {
+		match &self.deferred_purge {
+			Some(store) => store.complete_deferred_purge().await,
+			None => Ok(()),
+		}
+	}
+}
+
+/// What `current` holds, as far as runtime publication knows it to be durable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishedSnapshot {
+	/// No snapshot artifact.
+	NoArtifact,
+	/// An artifact whose state was applied through this log id (None: empty state).
+	Artifact(Option<LogId<u32>>),
+}
+
+impl PublishedSnapshot {
+	/// The log index a durable artifact covers: the only authority to delete log below it.
+	fn covered_index(self) -> Option<u64> {
+		match self {
+			Self::Artifact(Some(id)) => Some(id.index),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationState {
+	Healthy(PublishedSnapshot),
+	/// A step after a rename of `current` failed, leaving the artifact, this state or the
+	/// state machine possibly inconsistent: every reader, publisher and cleanup refuses until
+	/// reopen validates what is on disk. `durable` is what had been published before.
+	Failed {
+		durable: PublishedSnapshot,
+		step: &'static str,
+	},
+}
+
+/// How a candidate artifact compares with the published one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+	/// Strictly newer by index: it may replace `current`.
+	Newer,
+	/// The same full identity: the existing artifact stays authoritative.
+	Same,
+	/// Strictly older by index: it must never replace `current`.
+	Older,
+}
+
+/// The publication authority for the current snapshot artifact. Every rename of `current`,
+/// every update of the state machine's held snapshot, and every opening of a handle on
+/// `current` happens under `state`'s lock, so metadata and the bytes behind it agree.
+///
+/// Lock order: this lock, then the state machine's `inner`; it is released before the
+/// checkpoint observer or the log store's `wal_gate` are taken. The log store only reads it as
+/// a leaf.
+struct SnapshotPublication {
+	state: tokio::sync::Mutex<PublicationState>,
+}
+
+impl SnapshotPublication {
+	fn new(published: PublishedSnapshot) -> Self {
+		Self {
+			state: tokio::sync::Mutex::new(PublicationState::Healthy(published)),
+		}
+	}
+
+	/// The published artifact if publication is healthy, else the refusal.
+	fn healthy(state: &PublicationState) -> std::io::Result<PublishedSnapshot> {
+		match *state {
+			PublicationState::Healthy(published) => Ok(published),
+			PublicationState::Failed { step, .. } => Err(Error::other(format!(
+				"snapshot publication failed at {step}; reopen required"
+			))),
+		}
+	}
+
+	/// Index first; at an equal index the full identity must match.
+	fn admit(
+		published: PublishedSnapshot,
+		candidate: Option<LogId<u32>>,
+	) -> std::io::Result<Admission> {
+		let current = match published {
+			PublishedSnapshot::NoArtifact => return Ok(Admission::Newer),
+			PublishedSnapshot::Artifact(current) => current,
+		};
+		match (current, candidate) {
+			(None, None) => Ok(Admission::Same),
+			(None, Some(_)) => Ok(Admission::Newer),
+			(Some(_), None) => Ok(Admission::Older),
+			(Some(current), Some(candidate)) => match candidate.index.cmp(&current.index) {
+				std::cmp::Ordering::Greater => Ok(Admission::Newer),
+				std::cmp::Ordering::Less => Ok(Admission::Older),
+				std::cmp::Ordering::Equal if candidate == current => Ok(Admission::Same),
+				std::cmp::Ordering::Equal => Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"snapshot at index {} conflicts with the published one: {candidate:?} vs {current:?}",
+						candidate.index
+					),
+				)),
+			},
+		}
+	}
+
+	/// The index below which a durable artifact covers the log, read as a leaf.
+	async fn covered_index(&self) -> Option<u64> {
+		match *self.state.lock().await {
+			PublicationState::Healthy(published) => published.covered_index(),
+			PublicationState::Failed { .. } => None,
+		}
+	}
+}
+
+/// The log store side of a publication: physical deletion of segments that the logical purge
+/// boundary and the newly durable snapshot both cover.
+#[async_trait::async_trait]
+trait DeferredPurge: Send + Sync {
+	async fn complete_deferred_purge(&self) -> std::io::Result<()>;
 }
 
 /// Streaming snapshot artifact backed by [`AsyncFileOps`].
@@ -3625,48 +3913,80 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 			)
 			.into());
 		}
+		// Publication: compare, rename, directory sync and the held-snapshot update happen under
+		// one lock, and any failure after the rename latches until reopen.
+		let write_err = |err: Error| -> StorageError<u32> {
+			StorageIOError::write_snapshot(Some(meta.signature()), AnyError::new(&err)).into()
+		};
+		let mut publication = self.snapshot_runtime.publication.state.lock().await;
+		let published = SnapshotPublication::healthy(&publication).map_err(write_err)?;
+		match SnapshotPublication::admit(published, meta.last_log_id).map_err(write_err)? {
+			Admission::Newer => {}
+			Admission::Same | Admission::Older => {
+				return Err(write_err(Error::new(
+					ErrorKind::InvalidInput,
+					format!(
+						"snapshot install at {:?} does not advance the published {published:?}",
+						meta.last_log_id
+					),
+				)));
+			}
+		}
 		self.snapshot_runtime
 			.file_ops
 			.rename(&receive_path, &self.snapshot_runtime.paths.current)
 			.await
-			.map_err(|err| {
-				StorageIOError::write_snapshot(Some(meta.signature()), AnyError::new(&err))
-			})?;
-		fsync_parent_dir(
+			.map_err(write_err)?;
+		if let Err(err) = fsync_parent_dir(
 			self.snapshot_runtime.file_ops.as_ref(),
 			&self.snapshot_runtime.paths.current,
 		)
 		.await
-		.map_err(|err| {
-			StorageIOError::write_snapshot(Some(meta.signature()), AnyError::new(&err))
-		})?;
+		{
+			*publication = PublicationState::Failed {
+				durable: published,
+				step: "install directory sync",
+			};
+			return Err(write_err(err));
+		}
 		let pending_checkpoint = {
 			let mut guard = self.inner.write().await;
 			state.last_applied_log_id = meta.last_log_id;
 			state.last_membership = meta.last_membership.clone();
-			for fence in state.table_drop_fences.iter() {
-				self.mutation_drain
-					.close_committed(fence.operation_id)
-					.map_err(|error| {
-						StorageIOError::read_snapshot(
-							Some(meta.signature()),
-							AnyError::error(format!(
-								"snapshot DROP fence conflicts with mutation drain state: {error}"
-							)),
-						)
-					})?;
-			}
-			for tombstone in state.table_drop_tombstones.iter() {
-				self.mutation_drain
-					.close_committed(tombstone.operation_id)
-					.map_err(|error| {
-						StorageIOError::read_snapshot(
-							Some(meta.signature()),
-							AnyError::error(format!(
-								"snapshot DROP tombstone conflicts with mutation drain state: {error}"
-							)),
-						)
-					})?;
+			let drained: Result<(), StorageError<u32>> = (|| {
+				for fence in state.table_drop_fences.iter() {
+					self.mutation_drain
+						.close_committed(fence.operation_id)
+						.map_err(|error| {
+							StorageIOError::read_snapshot(
+								Some(meta.signature()),
+								AnyError::error(format!(
+									"snapshot DROP fence conflicts with mutation drain state: {error}"
+								)),
+							)
+						})?;
+				}
+				for tombstone in state.table_drop_tombstones.iter() {
+					self.mutation_drain
+						.close_committed(tombstone.operation_id)
+						.map_err(|error| {
+							StorageIOError::read_snapshot(
+								Some(meta.signature()),
+								AnyError::error(format!(
+									"snapshot DROP tombstone conflicts with mutation drain state: {error}"
+								)),
+							)
+						})?;
+				}
+				Ok(())
+			})();
+			if let Err(err) = drained {
+				// `current` is durable but the state machine does not hold it.
+				*publication = PublicationState::Failed {
+					durable: PublishedSnapshot::Artifact(meta.last_log_id),
+					step: "install state update",
+				};
+				return Err(err);
 			}
 			guard.state = state;
 			guard.snapshot = Some(HeldSnapshot {
@@ -3680,6 +4000,8 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				.set_drop_reclaim_debts(guard.state.table_drop_reclaim_debts.len());
 			checkpoint_observation_from_state(&guard.state, true)
 		};
+		*publication = PublicationState::Healthy(PublishedSnapshot::Artifact(meta.last_log_id));
+		drop(publication);
 		let pending_checkpoint = pending_checkpoint;
 		if let (Some(observer), Some(observation)) =
 			(self.checkpoint_observer.as_ref(), pending_checkpoint)
@@ -3693,12 +4015,23 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				);
 			}
 		}
+		// The new snapshot is durable: log it covers can now be deleted. A failure poisons the
+		// log store and fails this install (the node stops); the snapshot stays published.
+		self.snapshot_runtime
+			.complete_deferred_purge()
+			.await
+			.map_err(write_err)?;
 		Ok(())
 	}
 
 	async fn get_current_snapshot(
 		&mut self,
 	) -> Result<Option<Snapshot<WendelonTypeConfig>>, StorageError<u32>> {
+		// The held metadata and the opened inode are read under the publication lock, so they
+		// name the same artifact; a failed publication refuses until reopen.
+		let publication = self.snapshot_runtime.publication.state.lock().await;
+		SnapshotPublication::healthy(&publication)
+			.map_err(|err| StorageIOError::read_snapshot(None, AnyError::new(&err)))?;
 		let snapshot = {
 			let guard = self.inner.read().await;
 			guard.snapshot.clone()
@@ -3714,6 +4047,7 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		.map_err(|err| {
 			StorageIOError::read_snapshot(Some(snapshot.meta.signature()), AnyError::new(&err))
 		})?;
+		drop(publication);
 		Ok(Some(Snapshot {
 			meta: snapshot.meta,
 			snapshot: Box::new(stream),
@@ -6634,22 +6968,71 @@ impl RaftSnapshotBuilder<WendelonTypeConfig> for WendelonSnapshotBuilder {
 				checkpoint_observation_from_state(&guard.state, true),
 			)
 		};
+		let write_err = |err: Error| -> StorageError<u32> {
+			StorageIOError::write_snapshot(Some(meta.signature()), AnyError::new(&err)).into()
+		};
+		// A failed publication refuses before any effect; it is checked again under the lock.
+		SnapshotPublication::healthy(&*self.snapshot_runtime.publication.state.lock().await)
+			.map_err(write_err)?;
 		persist_snapshot_artifact(
 			self.snapshot_runtime.file_ops.as_ref(),
 			&self.snapshot_runtime.paths,
 			&state,
 		)
 		.await
-		.map_err(|err| {
-			StorageIOError::write_snapshot(Some(meta.signature()), AnyError::new(&err))
-		})?;
+		.map_err(write_err)?;
+		let file_ops = self.snapshot_runtime.file_ops.clone();
+		let paths = &self.snapshot_runtime.paths;
+		let mut publication = self.snapshot_runtime.publication.state.lock().await;
+		let published_before = SnapshotPublication::healthy(&publication).map_err(write_err)?;
+		let admission =
+			SnapshotPublication::admit(published_before, meta.last_log_id).map_err(write_err)?;
+		if admission != Admission::Newer {
+			// A build no newer than `current` publishes nothing. It returns its own metadata over
+			// its own bytes: a handle on the temporary inode, whose name is then removed so the
+			// next build cannot rewrite those bytes.
+			let own = SnapshotDataFile::open(file_ops.clone(), paths.build_tmp.clone())
+				.await
+				.map_err(write_err)?;
+			unlink_wal_artifact(file_ops.as_ref(), &paths.build_tmp)
+				.await
+				.map_err(write_err)?;
+			drop(publication);
+			return Ok(Snapshot {
+				meta,
+				snapshot: Box::new(own),
+			});
+		}
+		file_ops
+			.rename(&paths.build_tmp, &paths.current)
+			.await
+			.map_err(write_err)?;
+		if let Err(err) = fsync_parent_dir(file_ops.as_ref(), &paths.current).await {
+			*publication = PublicationState::Failed {
+				durable: published_before,
+				step: "build directory sync",
+			};
+			return Err(write_err(err));
+		}
 		{
 			let mut guard = self.inner.write().await;
 			guard.snapshot = Some(HeldSnapshot {
 				meta: meta.clone(),
-				path: self.snapshot_runtime.paths.current.clone(),
+				path: paths.current.clone(),
 			});
 		}
+		let snapshot = match SnapshotDataFile::open(file_ops.clone(), paths.current.clone()).await {
+			Ok(snapshot) => snapshot,
+			Err(err) => {
+				*publication = PublicationState::Failed {
+					durable: PublishedSnapshot::Artifact(meta.last_log_id),
+					step: "build handle open",
+				};
+				return Err(write_err(err));
+			}
+		};
+		*publication = PublicationState::Healthy(PublishedSnapshot::Artifact(meta.last_log_id));
+		drop(publication);
 		if let (Some(observer), Some(observation)) =
 			(self.checkpoint_observer.as_ref(), pending_checkpoint)
 		{
@@ -6662,14 +7045,10 @@ impl RaftSnapshotBuilder<WendelonTypeConfig> for WendelonSnapshotBuilder {
 				);
 			}
 		}
-		let snapshot = SnapshotDataFile::open(
-			self.snapshot_runtime.file_ops.clone(),
-			self.snapshot_runtime.paths.current.clone(),
-		)
-		.await
-		.map_err(|err| {
-			StorageIOError::read_snapshot(Some(meta.signature()), AnyError::new(&err))
-		})?;
+		self.snapshot_runtime
+			.complete_deferred_purge()
+			.await
+			.map_err(write_err)?;
 		Ok(Snapshot {
 			meta,
 			snapshot: Box::new(snapshot),
@@ -7266,13 +7645,67 @@ async fn replay_wal(
 	}
 	for (index, segment) in discovered.iter().enumerate() {
 		let allow_torn_tail = index + 1 == discovered.len();
+		let had_entries = !replay.entries.is_empty();
 		if let Some(meta) =
 			replay_wal_segment(file_ops, segment, snapshot, allow_torn_tail, &mut replay).await?
 		{
 			replay.wal_segments.push(meta);
 		}
+		// Where the first retained entry came from: only an entry the legacy file itself holds
+		// keeps the legacy first-entry exemption.
+		if !had_entries && !replay.entries.is_empty() {
+			replay.legacy_start = segment.legacy;
+		}
 	}
 	Ok(replay)
+}
+
+/// The retained log starts right after the validated snapshot boundary (with no snapshot: at 0
+/// or 1), and every index follows its predecessor. Anything else is a missing first or interior
+/// entry, refused before any open effect. This is a refusal only, never a recovery, and passing
+/// it is not evidence of a complete genesis prefix.
+///
+/// Compatibility only: with no snapshot, a first retained entry read from the legacy
+/// single-file WAL keeps the exemption replay already gives that file, so it may start at any
+/// index. A validated snapshot always requires its boundary + 1, legacy or not, and the interior
+/// rule applies to every WAL.
+fn check_retained_log_contiguous(
+	wal_path: &Path,
+	boundary: Option<LogId<u32>>,
+	legacy_start: bool,
+	entries: &BTreeMap<u64, Entry<WendelonTypeConfig>>,
+) -> std::io::Result<()> {
+	let Some(&first) = entries.keys().next() else {
+		return Ok(());
+	};
+	let first_ok = match boundary {
+		Some(boundary) => boundary.index.checked_add(1) == Some(first),
+		None => legacy_start || first <= 1,
+	};
+	if !first_ok {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"wal {} retains its first entry at {first}, not right after the snapshot boundary {:?}",
+				wal_path.display(),
+				boundary.map(|id| id.index)
+			),
+		));
+	}
+	let mut previous = first;
+	for &index in entries.keys().skip(1) {
+		if previous.checked_add(1) != Some(index) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"wal {} is missing entries between {previous} and {index}",
+					wal_path.display()
+				),
+			));
+		}
+		previous = index;
+	}
+	Ok(())
 }
 
 fn resolve_recovered_committed(
@@ -8155,6 +8588,8 @@ async fn sync_snapshot_handle(
 	file_ops.fsync(&handle).await
 }
 
+/// Writes `state` to the build temporary file and syncs it. Publication (rename into `current`)
+/// is the caller's, under the publication lock.
 async fn persist_snapshot_artifact(
 	file_ops: &dyn AsyncFileOps,
 	paths: &SnapshotPaths,
@@ -8194,9 +8629,7 @@ async fn persist_snapshot_artifact(
 		Ok(())
 	})
 	.await?;
-	file_ops.fsync(&handle).await?;
-	file_ops.rename(&paths.build_tmp, &paths.current).await?;
-	fsync_parent_dir(file_ops, &paths.current).await
+	file_ops.fsync(&handle).await
 }
 
 async fn decode_snapshot_file(
@@ -13471,6 +13904,8 @@ mod recovery_tests {
 		let mut snapshot_state = SmState::default();
 		snapshot_state.last_applied_log_id = Some(log_id(1, 2));
 		write_snapshot_file(&snapshot_path, &snapshot_state);
+		// The artifact is durable before the purge, as a publication would have recorded it.
+		store.note_published_snapshot_for_test(log_id(1, 2)).await;
 
 		store.purge(log_id(1, 2)).await.unwrap();
 		let segments = named_segment_paths(&dir);
@@ -14402,7 +14837,7 @@ mod recovery_tests {
 		seed: &Path,
 		segment_bytes: u64,
 		mutation: Mutation,
-		install: Option<&Path>,
+		install: Option<(&Path, u64)>,
 		rounds: usize,
 	) -> Vec<Stop> {
 		let mut out = Vec::new();
@@ -14422,10 +14857,13 @@ mod recovery_tests {
 							.await
 							.unwrap_or_else(|e| panic!("{label}: open in round {round}: {e}"));
 						if round == 0
-							&& let Some(snapshot) = install
+							&& let Some((snapshot, last_included)) = install
 						{
 							std::fs::copy(snapshot, artifact_paths(&dir).2).unwrap();
 							file_ops.fsync_dir(&dir).await.unwrap();
+							store
+								.note_published_snapshot_for_test(log_id(1, last_included))
+								.await;
 						}
 						file_ops.inject(stop_at(op, occurrence));
 						if mutate(&mut store, mutation).await.is_ok() {
@@ -14780,9 +15218,110 @@ mod recovery_tests {
 		}
 	}
 
+	/// A checkpoint-only holder that open-time cleanup may extend by preserving C′: it must start
+	/// with `prefix` and end with `last`, and every page must be an intact checkpoint record.
+	struct ExpectedHolder {
+		start: u64,
+		prefix: Vec<u8>,
+		last: Vec<u8>,
+	}
+
+	impl ExpectedHolder {
+		fn single(start: u64, page: &AlignedBuf) -> Self {
+			Self {
+				start,
+				prefix: page.as_slice().to_vec(),
+				last: page.as_slice().to_vec(),
+			}
+		}
+	}
+
+	/// One page is a complete checkpoint record: header, body shape and checksum.
+	fn is_checkpoint_page(page: &[u8]) -> bool {
+		let header_size = std::mem::size_of::<WALRecordHeader>();
+		let body_size = std::mem::size_of::<WALCheckpointBody>();
+		let header: WALRecordHeader = *bytemuck::from_bytes(&page[..header_size]);
+		if header.record_type != REC_CHECKPOINT || header.body_len != body_size as u64 {
+			return false;
+		}
+		let body_end = header_size + body_size;
+		let checksum = u32::from_le_bytes(page[body_end..body_end + 4].try_into().unwrap());
+		matches_artifact_checksum_u32(&page[..body_end], checksum)
+	}
+
+	/// `seen` (the store at `dir`) recovers exactly `expect`'s entries, checkpoint and segment
+	/// names. A segment named in `holders` may have grown by intact C′ pages, page-aligned and
+	/// within the segment size; every other segment has exactly the expected length and, where
+	/// `pristine` holds a file of that name, exactly its bytes.
+	fn assert_recovered_within(
+		seen: &Recovered,
+		expect: &Recovered,
+		dir: &Path,
+		pristine: Option<&Path>,
+		holders: &[ExpectedHolder],
+		segment_bytes: u64,
+		label: &str,
+	) {
+		assert_eq!(seen.entries, expect.entries, "{label}: entries");
+		assert_eq!(seen.checkpoint, expect.checkpoint, "{label}: checkpoint");
+		assert_eq!(
+			seen.files
+				.iter()
+				.map(|(start, _)| *start)
+				.collect::<Vec<_>>(),
+			expect
+				.files
+				.iter()
+				.map(|(start, _)| *start)
+				.collect::<Vec<_>>(),
+			"{label}: segment names"
+		);
+		for ((start, len), (_, want)) in seen.files.iter().zip(&expect.files) {
+			let bytes = std::fs::read(segment_file(dir, *start)).unwrap();
+			match holders.iter().find(|holder| holder.start == *start) {
+				Some(holder) => {
+					assert!(
+						*len >= *want && *len <= segment_bytes.max(*want) && *len % WAL_PAGE == 0,
+						"{label}: holder {start} is {len} bytes, expected {want} up to {segment_bytes}"
+					);
+					assert!(
+						bytes.starts_with(&holder.prefix),
+						"{label}: holder {start} prefix"
+					);
+					assert!(
+						bytes.ends_with(&holder.last),
+						"{label}: holder {start} last record"
+					);
+					assert!(
+						bytes.chunks(WAL_PAGE as usize).all(is_checkpoint_page),
+						"{label}: holder {start} holds only intact checkpoint records"
+					);
+				}
+				None => {
+					assert_eq!(len, want, "{label}: segment {start} length");
+					if let Some(pristine) = pristine {
+						let original = segment_file(pristine, *start);
+						if original.exists() {
+							assert_eq!(
+								bytes,
+								std::fs::read(original).unwrap(),
+								"{label}: segment {start} bytes"
+							);
+						}
+					}
+				}
+			}
+		}
+	}
+
 	/// Stops at every syscall of open-time completion, each followed by repeated stopped opens and
 	/// a final open that completes.
-	async fn completion_stops(seed: &Path, segment_bytes: u64, expect: &Recovered) {
+	async fn completion_stops(
+		seed: &Path,
+		segment_bytes: u64,
+		expect: &Recovered,
+		holders: &[ExpectedHolder],
+	) {
 		let mut reached_any = false;
 		for op in STOP_OPS {
 			for occurrence in 0.. {
@@ -14809,7 +15348,15 @@ mod recovery_tests {
 						let _ = round;
 					}
 					let (_, seen) = reopen(&dir, segment_bytes, &label).await;
-					assert_eq!(&seen, expect, "{label}");
+					assert_recovered_within(
+						&seen,
+						expect,
+						&dir,
+						Some(seed),
+						holders,
+						segment_bytes,
+						&label,
+					);
 				}
 				if !reached {
 					break;
@@ -14835,7 +15382,14 @@ mod recovery_tests {
 			}),
 			files: vec![(1, 3 * WAL_PAGE), (4, WAL_PAGE)],
 		};
-		completion_stops(&seed, 3 * WAL_PAGE, &expect).await;
+		let c = serialize_checkpoint_page(2, 1, 2, 1);
+		completion_stops(
+			&seed,
+			3 * WAL_PAGE,
+			&expect,
+			&[ExpectedHolder::single(4, &c)],
+		)
+		.await;
 		// The snapshot-explained shape: [1,2,3], Z = "3" holding C, snapshot at 3.
 		let below = tempdir("below-tail-explained");
 		let pages: Vec<AlignedBuf> = (1..=3)
@@ -14853,10 +15407,17 @@ mod recovery_tests {
 				commit_index: 3,
 				e_safe_index: 3,
 			}),
-			files: vec![(1, 3 * WAL_PAGE), (4, WAL_PAGE)],
+			files: vec![(4, WAL_PAGE)],
 		};
-		completion_stops(&below, 3 * WAL_PAGE, &expect).await;
-		let _ = page;
+		let c3 = serialize_checkpoint_page(3, 3, 3, 1);
+		completion_stops(
+			&below,
+			3 * WAL_PAGE,
+			&expect,
+			&[ExpectedHolder::single(4, &c3)],
+		)
+		.await;
+		assert_eq!(page, c.as_slice());
 	}
 
 	#[tokio::test]
@@ -14914,7 +15475,7 @@ mod recovery_tests {
 		// Explained by a valid snapshot at 3: completes.
 		let dir = build(Some(3));
 		let (_, seen) = reopen(&dir, 3 * WAL_PAGE, "explained").await;
-		assert_eq!(seen.files, vec![(1, 3 * WAL_PAGE), (4, WAL_PAGE)]);
+		assert_eq!(seen.files, vec![(4, WAL_PAGE)]);
 		assert!(seen.entries.is_empty());
 		assert_eq!(
 			seen.checkpoint, None,
@@ -15024,6 +15585,7 @@ mod recovery_tests {
 			.unwrap();
 		checkpoint(&store, 2, 2).await;
 		snapshot_at(&dir, 2);
+		store.note_published_snapshot_for_test(log_id(1, 2)).await;
 		store.purge(log_id(1, 2)).await.unwrap();
 		assert_eq!(segment_metadata(&store).await, vec![(3, None, WAL_PAGE)]);
 		// N1: the converted holder has one metadata entry and later purge/truncate keep it.
@@ -15136,7 +15698,7 @@ mod recovery_tests {
 					drop(sm);
 					drop(store);
 					let (mut reopened, seen) = reopen(&dir, WAL_PAGE, &label).await;
-					assert_eq!(seen.files, vec![(1, WAL_PAGE), (4, WAL_PAGE)], "{label}");
+					assert_eq!(seen.files, vec![(4, WAL_PAGE)], "{label}");
 					assert_eq!(seen.checkpoint, expect, "{label}");
 					assert!(seen.entries.is_empty());
 					reopened.purge(log_id(1, 3)).await.unwrap();
@@ -15181,7 +15743,7 @@ mod recovery_tests {
 		let snapshot_dir = tempdir("purge-past-tail-snapshot");
 		snapshot_at(&snapshot_dir, 3);
 		let snapshot = artifact_paths(&snapshot_dir).2;
-		for stop in stops(&seed, WAL_PAGE, Mutation::Purge(3), Some(&snapshot), 1).await {
+		for stop in stops(&seed, WAL_PAGE, Mutation::Purge(3), Some((&snapshot, 3)), 1).await {
 			for seen in &stop.after_stops {
 				assert!(seen.entries.is_empty(), "{}", stop.label);
 				assert_eq!(seen.checkpoint, None, "{}: commit 1 < 3", stop.label);
@@ -15219,7 +15781,7 @@ mod recovery_tests {
 		let snapshot_dir = tempdir("purge-past-tail-empty-snapshot");
 		snapshot_at(&snapshot_dir, 3);
 		let snapshot = artifact_paths(&snapshot_dir).2;
-		for stop in stops(&seed, WAL_PAGE, Mutation::Purge(3), Some(&snapshot), 1).await {
+		for stop in stops(&seed, WAL_PAGE, Mutation::Purge(3), Some((&snapshot, 3)), 1).await {
 			for seen in &stop.after_stops {
 				assert!(seen.entries.is_empty(), "{}", stop.label);
 				assert_eq!(seen.checkpoint, None, "{}", stop.label);
@@ -15240,6 +15802,7 @@ mod recovery_tests {
 			.unwrap();
 		checkpoint(&store, 1, 1).await;
 		snapshot_at(&dir, 3);
+		store.note_published_snapshot_for_test(log_id(1, 3)).await;
 		// A stray file already holds the post-purge name.
 		write_wal_pages(
 			&segment_file(&dir, 4),
@@ -15269,6 +15832,7 @@ mod recovery_tests {
 			.unwrap();
 		checkpoint(&store, 2, 2).await;
 		snapshot_at(&dir, 3);
+		store.note_published_snapshot_for_test(log_id(1, 3)).await;
 		store.purge(log_id(1, 3)).await.unwrap();
 		assert_eq!(
 			segment_metadata(&store).await,
@@ -15319,20 +15883,30 @@ mod recovery_tests {
 				commit_index: 3,
 				e_safe_index: 3,
 			}),
-			files: vec![(1, 3 * WAL_PAGE), (4, WAL_PAGE)],
+			files: vec![(4, WAL_PAGE)],
 		};
 		// Z exactly equal, Z exactly empty, Z wholly validated records ending in the target's.
 		for z in [vec![c3()], Vec::new(), vec![c_old(), c3()]] {
 			let shape = format!("Z of {} pages", z.len());
 			let seed = seed_snapshot_explained(&[(3, z), (4, vec![c3()])]);
-			completion_stops(&seed, 3 * WAL_PAGE, &expect).await;
+			let holders = [ExpectedHolder::single(4, &c3())];
+			completion_stops(&seed, 3 * WAL_PAGE, &expect, &holders).await;
+			let pristine = copy_store(&seed);
 			let (_, seen) = reopen(&seed, 3 * WAL_PAGE, &shape).await;
-			assert_eq!(seen, expect, "{shape}");
+			assert_recovered_within(
+				&seen,
+				&expect,
+				&seed,
+				Some(&pristine),
+				&holders,
+				3 * WAL_PAGE,
+				&shape,
+			);
 		}
 		// A trailing, exactly empty Z below the tail carries nothing: it is only unlinked.
 		let seed = seed_snapshot_explained(&[(3, Vec::new())]);
 		let (_, seen) = reopen(&seed, 3 * WAL_PAGE, "empty trailing").await;
-		assert_eq!(seen.files, vec![(1, 3 * WAL_PAGE)]);
+		assert_eq!(seen.files, Vec::<(u64, u64)>::new());
 		assert_eq!(seen.checkpoint, None);
 	}
 
@@ -15418,7 +15992,7 @@ mod recovery_tests {
 		drop(sm);
 		drop(store);
 		let (mut store, seen) = reopen(&dir, WAL_PAGE, "installed").await;
-		assert_eq!(seen.files, vec![(1, WAL_PAGE)]);
+		assert_eq!(seen.files, Vec::<(u64, u64)>::new());
 		assert_eq!(seen.checkpoint, None);
 		assert!(seen.entries.is_empty());
 		store.purge(log_id(1, 3)).await.unwrap();
@@ -15495,12 +16069,19 @@ mod recovery_tests {
 		snapshot_at(&seed, 2);
 		let seen = reopen(&seed, 2 * WAL_PAGE, "seed").await.1;
 		assert_eq!(seen.checkpoint, None, "commit 1 < snapshot 2");
-		assert_eq!(seen.files, vec![(1, 2 * WAL_PAGE), (3, WAL_PAGE)]);
+		assert_eq!(seen.files, vec![(3, WAL_PAGE)]);
 		let snapshot_dir = tempdir("purge-superseded-holder-snapshot");
 		snapshot_at(&snapshot_dir, 5);
 		let snapshot = artifact_paths(&snapshot_dir).2;
-		let all = stops(&seed, 2 * WAL_PAGE, Mutation::Purge(5), Some(&snapshot), 1).await;
-		assert!(all.iter().any(|stop| stop.label.contains("Unlink #1")));
+		let all = stops(
+			&seed,
+			2 * WAL_PAGE,
+			Mutation::Purge(5),
+			Some((&snapshot, 5)),
+			1,
+		)
+		.await;
+		// Open already removed the log the recovered snapshot covers; only the holder remains.
 		for stop in all {
 			for seen in &stop.after_stops {
 				assert!(seen.entries.is_empty(), "{}", stop.label);
@@ -15602,16 +16183,937 @@ mod recovery_tests {
 				)
 			};
 			let latest_bytes = latest.as_slice().to_vec();
+			let holders = [ExpectedHolder::single(4, &latest)];
 			let dir = seed_trailing_holder(below_tail, &[older, latest], &[]);
+			let pristine = copy_store(&dir);
 			let (_, seen) = reopen(&dir, 3 * WAL_PAGE, "multi-record").await;
-			assert_eq!(
-				seen.files,
-				vec![(1, 3 * WAL_PAGE), (4, WAL_PAGE)],
-				"below tail {below_tail}"
+			let want = Recovered {
+				entries: if below_tail {
+					Vec::new()
+				} else {
+					entry_bytes(
+						&(1..=3)
+							.map(|i| finalize_entry(i, 100 * i))
+							.collect::<Vec<_>>(),
+					)
+				},
+				checkpoint: Some(expect),
+				files: if below_tail {
+					vec![(4, WAL_PAGE)]
+				} else {
+					vec![(1, 3 * WAL_PAGE), (4, WAL_PAGE)]
+				},
+			};
+			assert_recovered_within(
+				&seen,
+				&want,
+				&dir,
+				Some(&pristine),
+				&holders,
+				3 * WAL_PAGE,
+				&format!("below tail {below_tail}"),
 			);
-			assert_eq!(seen.checkpoint, Some(expect), "below tail {below_tail}");
-			assert_eq!(std::fs::read(segment_file(&dir, 4)).unwrap(), latest_bytes);
+			assert!(
+				std::fs::read(segment_file(&dir, 4))
+					.unwrap()
+					.ends_with(&latest_bytes)
+			);
 		}
+	}
+
+	// Snapshot handoff reproductions. A direct `purge` stands in for openraft's unconditioned
+	// `PurgeLog` overtaking the state-machine worker's install (a log-store ordering surrogate
+	// supported by the source trace, not a measured Raft scheduling failure). No snapshot covering
+	// the purge is made durable. Logs starting at index 1 are legacy test fixtures, not
+	// authenticated genesis. Each test asserts the recovery property the handoff must preserve.
+
+	/// T1: with no durable snapshot, a purge must not cost the store its reopenability or any
+	/// entry: the needed log is recovered whole, with identical bytes.
+	#[tokio::test]
+	async fn purge_before_durable_snapshot_keeps_the_store_reopenable() {
+		let dir = tempdir("handoff-t1");
+		let mut store = try_open_store_with_segment_bytes(&dir, 2 * WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(
+				(1..=5)
+					.map(|i| finalize_entry(i, 100 * i))
+					.collect::<Vec<_>>(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![
+				(1, Some(2), 2 * WAL_PAGE),
+				(3, Some(4), 2 * WAL_PAGE),
+				(5, Some(5), WAL_PAGE)
+			]
+		);
+		let original = recovered(&mut store, &dir).await;
+		store.purge(log_id(1, 2)).await.unwrap();
+		drop(store);
+		let reopened = try_open_store_with_segment_bytes(&dir, 2 * WAL_PAGE).await;
+		let mut reopened =
+			reopened.expect("the store reopens: no durable snapshot covers the purge");
+		let seen = recovered(&mut reopened, &dir).await;
+		assert_eq!(
+			seen.entries, original.entries,
+			"every entry recovered, identical bytes"
+		);
+	}
+
+	/// T1b: the install-past-the-tail shape (purge(3) over entry 1 with a checkpoint-only active
+	/// segment "2"), again with no durable snapshot: entry 1 and its checkpoint are recovered.
+	#[tokio::test]
+	async fn purge_past_the_tail_before_durable_snapshot_keeps_the_store_reopenable() {
+		let dir = tempdir("handoff-t1b");
+		let mut store = try_open_store_with_segment_bytes(&dir, WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(1, 100)])
+			.await
+			.unwrap();
+		checkpoint(&store, 1, 1).await;
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![(1, Some(1), WAL_PAGE), (2, None, WAL_PAGE)]
+		);
+		let original = recovered(&mut store, &dir).await;
+		store.purge(log_id(1, 3)).await.unwrap();
+		drop(store);
+		let reopened = try_open_store_with_segment_bytes(&dir, WAL_PAGE).await;
+		let mut reopened =
+			reopened.expect("the store reopens: no durable snapshot covers the purge");
+		let seen = recovered(&mut reopened, &dir).await;
+		assert_eq!(
+			seen.entries, original.entries,
+			"entry 1 recovered, identical bytes"
+		);
+		assert_eq!(
+			seen.checkpoint, original.checkpoint,
+			"the checkpoint is recovered"
+		);
+	}
+
+	/// T2: with an older durable snapshot at j = 2, purge(4) before the newer snapshot is durable
+	/// must leave a recoverable contiguous log: the first retained entry is j + 1 and every entry
+	/// past j is recovered with identical bytes, at the snapshot boundary.
+	#[tokio::test]
+	async fn purge_before_durable_snapshot_with_an_older_snapshot_keeps_the_log_contiguous() {
+		let dir = tempdir("handoff-t2");
+		let mut store = try_open_store_with_segment_bytes(&dir, 2 * WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(
+				(1..=6)
+					.map(|i| finalize_entry(i, 100 * i))
+					.collect::<Vec<_>>(),
+			)
+			.await
+			.unwrap();
+		drop(store);
+		snapshot_at(&dir, 2);
+		let mut store = try_open_store_with_segment_bytes(&dir, 2 * WAL_PAGE)
+			.await
+			.unwrap();
+		let original = recovered(&mut store, &dir).await;
+		assert_eq!(
+			original.entries.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+			vec![3, 4, 5, 6]
+		);
+		store.purge(log_id(1, 4)).await.unwrap();
+		drop(store);
+		let reopened = try_open_store_with_segment_bytes(&dir, 2 * WAL_PAGE).await;
+		let mut reopened =
+			reopened.expect("the store reopens: the older snapshot is still durable");
+		let state = reopened.get_log_state().await.unwrap();
+		assert_eq!(
+			state.last_purged_log_id,
+			Some(log_id(1, 2)),
+			"the durable boundary is j"
+		);
+		let seen = recovered(&mut reopened, &dir).await;
+		assert_eq!(
+			seen.entries.first().map(|(i, _)| *i),
+			Some(3),
+			"the first retained entry is j + 1: no hole past the snapshot"
+		);
+		assert_eq!(
+			seen.entries, original.entries,
+			"every entry past j recovered, identical bytes"
+		);
+	}
+
+	/// Test-only file ops that hold the sync of one temporary snapshot artifact (named by its
+	/// suffix) at a barrier: the candidate is written and synced up to that point, before any
+	/// publication step, and proceeds only when released.
+	#[derive(Clone)]
+	struct GatedSnapshotSyncFileOps {
+		inner: BlockingFileOps,
+		suffix: &'static str,
+		gated_fds: Arc<Mutex<std::collections::HashSet<i32>>>,
+		reached: Arc<Notify>,
+		release: Arc<Notify>,
+	}
+
+	impl GatedSnapshotSyncFileOps {
+		fn new(suffix: &'static str) -> Self {
+			Self {
+				inner: BlockingFileOps,
+				suffix,
+				gated_fds: Arc::new(Mutex::new(std::collections::HashSet::new())),
+				reached: Arc::new(Notify::new()),
+				release: Arc::new(Notify::new()),
+			}
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl AsyncFileOps for GatedSnapshotSyncFileOps {
+		async fn open(&self, path: &Path, flags: OpenFlags) -> std::io::Result<FileHandle> {
+			let handle = self.inner.open(path, flags).await?;
+			if path.to_string_lossy().ends_with(self.suffix) && flags.write {
+				self.gated_fds.lock().unwrap().insert(handle.raw_fd());
+			}
+			Ok(handle)
+		}
+
+		async fn read_plain_at(
+			&self,
+			handle: &FileHandle,
+			offset: u64,
+			len: usize,
+		) -> std::io::Result<Vec<u8>> {
+			self.inner.read_plain_at(handle, offset, len).await
+		}
+
+		async fn write_plain_at(
+			&self,
+			handle: &FileHandle,
+			offset: u64,
+			bytes: Vec<u8>,
+		) -> std::io::Result<usize> {
+			self.inner.write_plain_at(handle, offset, bytes).await
+		}
+
+		async fn read_at(
+			&self,
+			handle: &FileHandle,
+			offset: u64,
+			buf: AlignedBuf,
+		) -> std::io::Result<(usize, AlignedBuf)> {
+			self.inner.read_at(handle, offset, buf).await
+		}
+
+		async fn write_at(
+			&self,
+			handle: &FileHandle,
+			offset: u64,
+			buf: AlignedBuf,
+		) -> std::io::Result<(usize, AlignedBuf)> {
+			self.inner.write_at(handle, offset, buf).await
+		}
+
+		async fn fsync(&self, handle: &FileHandle) -> std::io::Result<()> {
+			let result = self.inner.fsync(handle).await;
+			let gated = self.gated_fds.lock().unwrap().remove(&handle.raw_fd());
+			if gated {
+				self.reached.notify_one();
+				self.release.notified().await;
+			}
+			result
+		}
+
+		async fn fdatasync(&self, handle: &FileHandle) -> std::io::Result<()> {
+			self.inner.fdatasync(handle).await
+		}
+
+		async fn read_all(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+			self.inner.read_all(path).await
+		}
+
+		async fn write_all(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+			self.inner.write_all(path, bytes).await
+		}
+
+		async fn file_len(&self, path: &Path) -> std::io::Result<Option<u64>> {
+			self.inner.file_len(path).await
+		}
+
+		async fn set_len(&self, handle: &FileHandle, len: u64) -> std::io::Result<()> {
+			self.inner.set_len(handle, len).await
+		}
+
+		async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+			self.inner.create_dir_all(path).await
+		}
+
+		async fn read_dir(&self, path: &Path) -> std::io::Result<Vec<DirectoryEntry>> {
+			self.inner.read_dir(path).await
+		}
+
+		async fn fsync_dir(&self, path: &Path) -> std::io::Result<()> {
+			self.inner.fsync_dir(path).await
+		}
+
+		async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+			self.inner.rename(from, to).await
+		}
+
+		async fn link_no_replace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+			self.inner.link_no_replace(from, to).await
+		}
+
+		async fn unlink(&self, path: &Path) -> std::io::Result<()> {
+			self.inner.unlink(path).await
+		}
+	}
+
+	async fn bounded<F: std::future::Future>(future: F) -> F::Output {
+		tokio::time::timeout(Duration::from_secs(30), future)
+			.await
+			.expect("a bounded wait elapsed")
+	}
+
+	/// A source state machine with leases 1..=n applied, and its snapshot.
+	async fn source_snapshot(tag: &str, n: u64) -> Snapshot<WendelonTypeConfig> {
+		let dir = tempdir(tag);
+		let mut store = open_store(&dir).await;
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		for i in 1..=n {
+			append_and_apply(&mut store, &mut sm, lease_entry(i, 10 * i, 10 * i + 9, 3)).await;
+		}
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		builder.build_snapshot().await.unwrap()
+	}
+
+	/// The last-included index in a snapshot artifact's header, read from a returned stream.
+	async fn header_index(mut stream: Box<SnapshotDataFile>) -> u64 {
+		let mut bytes = Vec::new();
+		tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut bytes)
+			.await
+			.unwrap();
+		let header_len = std::mem::size_of::<SnapshotHeader>();
+		bytemuck::from_bytes::<SnapshotHeader>(&bytes[..header_len]).last_included_index
+	}
+
+	/// The current snapshot's metadata and its bytes both name `index`.
+	async fn assert_current(sm: &mut WendelonStateMachine, index: u64, label: &str) {
+		let current =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_current_snapshot(
+				sm,
+			)
+			.await
+			.unwrap()
+			.expect("a current snapshot");
+		assert_eq!(
+			current.meta.last_log_id.map(|id| id.index),
+			Some(index),
+			"{label}: current metadata"
+		);
+		assert_eq!(
+			header_index(current.snapshot).await,
+			index,
+			"{label}: current bytes"
+		);
+	}
+
+	/// F-R: a local build of older state (applied 1) is held after writing and syncing its
+	/// candidate, before publication; a real newer install (3) publishes; the build resumes. The
+	/// published metadata, the current bytes and the durable artifact stay at 3; the stale build
+	/// returns its own metadata over its own bytes; an equal-identity build changes nothing.
+	#[tokio::test]
+	async fn stale_local_build_never_replaces_a_newer_installed_snapshot() {
+		let newer = source_snapshot("fr-source", 3).await;
+		assert_eq!(newer.meta.last_log_id, Some(log_id(1, 3)));
+		let dir = tempdir("fr-target");
+		let gate = GatedSnapshotSyncFileOps::new(".build.tmp");
+		let mut store =
+			open_store_with_async_file_ops(&dir, Arc::new(gate.clone()), 64 * WAL_PAGE).await;
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		append_and_apply(&mut store, &mut sm, lease_entry(1, 10, 19, 3)).await;
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		let build = tokio::spawn(async move { builder.build_snapshot().await });
+		bounded(gate.reached.notified()).await;
+		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+			&mut sm,
+			&newer.meta,
+			newer.snapshot,
+		)
+		.await
+		.unwrap();
+		gate.release.notify_one();
+		let stale = bounded(build)
+			.await
+			.unwrap()
+			.expect("a stale build returns its own snapshot");
+		assert_eq!(stale.meta.last_log_id, Some(log_id(1, 1)));
+		assert_eq!(
+			header_index(stale.snapshot).await,
+			1,
+			"the stale build's bytes are its own"
+		);
+		assert_current(&mut sm, 3, "after the stale build").await;
+
+		// An equal-identity build (applied 3) publishes nothing and returns its own bytes.
+		let current_path = artifact_paths(&dir).2;
+		let before = std::fs::read(&current_path).unwrap();
+		gate.release.notify_one();
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		let same = bounded(builder.build_snapshot()).await.unwrap();
+		assert_eq!(same.meta.last_log_id, Some(log_id(1, 3)));
+		assert_eq!(header_index(same.snapshot).await, 3);
+		assert_eq!(
+			std::fs::read(&current_path).unwrap(),
+			before,
+			"an equal build does not replace current"
+		);
+		assert_current(&mut sm, 3, "after the equal build").await;
+		drop(sm);
+		drop(store);
+		let reopened = open_store(&dir).await;
+		assert_eq!(
+			reopened
+				.recovered_state_machine()
+				.await
+				.unwrap()
+				.state_snapshot()
+				.await
+				.last_applied_log_id,
+			Some(log_id(1, 3)),
+			"the durable artifact stays at 3"
+		);
+	}
+
+	/// While builds and an install publish, every current snapshot a reader obtains has
+	/// metadata and bytes naming the same artifact.
+	#[tokio::test]
+	async fn current_snapshot_metadata_and_bytes_agree_under_contention() {
+		let newer = source_snapshot("contention-source", 3).await;
+		let dir = tempdir("contention-target");
+		let mut store = open_store_with_segment_bytes(&dir, 64 * WAL_PAGE).await;
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		append_and_apply(&mut store, &mut sm, lease_entry(1, 10, 19, 3)).await;
+		let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let mut reader_sm = sm.clone();
+		let reader_stop = stop.clone();
+		let reader = tokio::spawn(async move {
+			let mut observed = 0usize;
+			while !reader_stop.load(std::sync::atomic::Ordering::SeqCst) {
+				if let Some(current) = <WendelonStateMachine as RaftStateMachine<
+					WendelonTypeConfig,
+				>>::get_current_snapshot(&mut reader_sm)
+				.await
+				.unwrap()
+				{
+					let index = current.meta.last_log_id.map_or(0, |id| id.index);
+					assert_eq!(header_index(current.snapshot).await, index);
+					observed += 1;
+				}
+				tokio::task::yield_now().await;
+			}
+			observed
+		});
+		for _ in 0..3 {
+			let mut builder =
+				<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+					&mut sm,
+				)
+				.await;
+			builder.build_snapshot().await.unwrap();
+		}
+		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+			&mut sm,
+			&newer.meta,
+			newer.snapshot,
+		)
+		.await
+		.unwrap();
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		builder.build_snapshot().await.unwrap();
+		stop.store(true, std::sync::atomic::Ordering::SeqCst);
+		assert!(bounded(reader).await.unwrap() > 0);
+		assert_current(&mut sm, 3, "final").await;
+	}
+
+	/// A real install held after syncing its received artifact, before publication: openraft's
+	/// ungated purge runs meanwhile and must keep the log (a crash then recovers it whole). On
+	/// release the install publishes and its own cleanup deletes the covered log before it
+	/// returns; the next entry then appends.
+	#[tokio::test]
+	async fn install_held_before_publication_keeps_the_purged_log() {
+		let newer = source_snapshot("held-source", 3).await;
+		let dir = tempdir("held-target");
+		let gate = GatedSnapshotSyncFileOps::new(".receive.tmp");
+		let mut store =
+			open_store_with_async_file_ops(&dir, Arc::new(gate.clone()), WAL_PAGE).await;
+		store
+			.blocking_append(vec![finalize_entry(1, 100), finalize_entry(2, 200)])
+			.await
+			.unwrap();
+		let original = recovered(&mut store, &dir).await;
+		let sm = store.recovered_state_machine().await.unwrap();
+		let mut installer = sm.clone();
+		let meta = newer.meta.clone();
+		let install = tokio::spawn(async move {
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+				&mut installer,
+				&meta,
+				newer.snapshot,
+			)
+			.await
+		});
+		bounded(gate.reached.notified()).await;
+		store.purge(log_id(1, 3)).await.unwrap();
+		assert_eq!(
+			store.deferred_log_for_test().await,
+			(2, 2 * WAL_PAGE),
+			"both purged segments are kept and counted"
+		);
+		let crashed = copy_store(&dir);
+		let (_, seen) = reopen(&crashed, WAL_PAGE, "crash while held").await;
+		assert_eq!(
+			seen.entries, original.entries,
+			"the old log is recovered whole"
+		);
+		gate.release.notify_one();
+		bounded(install).await.unwrap().unwrap();
+		assert_eq!(
+			store.deferred_log_for_test().await,
+			(0, 0),
+			"cleanup ran in the install"
+		);
+		assert!(segment_files(&dir).is_empty(), "{:?}", segment_files(&dir));
+		store
+			.blocking_append(vec![finalize_entry(4, 400)])
+			.await
+			.unwrap();
+		drop(sm);
+		drop(store);
+		let (_, seen) = reopen(&dir, WAL_PAGE, "after").await;
+		assert_eq!(
+			seen.entries.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+			vec![4]
+		);
+	}
+
+	/// A failure after a rename of `current` latches: readers, publishers and export refuse
+	/// until reopen, which validates what is on disk.
+	#[tokio::test]
+	async fn failed_publication_refuses_readers_and_publishers_until_reopen() {
+		let dir = tempdir("publication-failed");
+		let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+		let mut store = open_store_with_faults(&dir, file_ops.clone(), WAL_PAGE).await;
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		append_and_apply(&mut store, &mut sm, lease_entry(1, 10, 19, 3)).await;
+		file_ops.inject(
+			InjectedFault::on(
+				FaultOp::FsyncDir,
+				FaultAction::Error {
+					kind: ErrorKind::Other,
+					message: "injected snapshot directory sync failure".into(),
+				},
+			)
+			.for_path(dir.clone()),
+		);
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		assert!(builder.build_snapshot().await.is_err());
+		let files = artifact_bytes(&dir);
+		assert!(
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_current_snapshot(
+				&mut sm
+			)
+			.await
+			.is_err(),
+			"a reader refuses"
+		);
+		assert!(
+			builder.build_snapshot().await.is_err(),
+			"a publisher refuses"
+		);
+		assert!(store.export_backup(&sm).await.is_err(), "export refuses");
+		assert_eq!(artifact_bytes(&dir), files, "refusals have no effect");
+		drop(builder);
+		drop(sm);
+		drop(store);
+		let reopened = open_store(&dir).await;
+		let mut recovered_sm = reopened.recovered_state_machine().await.unwrap();
+		assert_current(&mut recovered_sm, 1, "reopen").await;
+	}
+
+	/// A snapshot at the published index with a different full log id is a conflict: refused
+	/// before any effect.
+	#[tokio::test]
+	async fn same_index_conflicting_snapshot_is_refused_before_effects() {
+		let dir = tempdir("conflict-source");
+		let mut source_store = open_store(&dir).await;
+		let mut source_sm = source_store.recovered_state_machine().await.unwrap();
+		let mut entry = lease_entry(1, 10, 19, 3);
+		entry.log_id = log_id(2, 1);
+		append_and_apply(&mut source_store, &mut source_sm, entry).await;
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut source_sm,
+			)
+			.await;
+		let conflicting = builder.build_snapshot().await.unwrap();
+		assert_eq!(conflicting.meta.last_log_id, Some(log_id(2, 1)));
+
+		let target = tempdir("conflict-target");
+		let mut store = open_store(&target).await;
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		append_and_apply(&mut store, &mut sm, lease_entry(1, 10, 19, 3)).await;
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		builder.build_snapshot().await.unwrap();
+		let current = std::fs::read(artifact_paths(&target).2).unwrap();
+		assert!(
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+				&mut sm,
+				&conflicting.meta,
+				conflicting.snapshot,
+			)
+			.await
+			.is_err()
+		);
+		assert_eq!(std::fs::read(artifact_paths(&target).2).unwrap(), current);
+		assert_current(&mut sm, 1, "after the refused conflict").await;
+	}
+
+	/// Purge before any durable snapshot keeps the purged bytes; truncate with no logical entry
+	/// below k shrinks the straddling segment around them, and repeated purge, truncate and
+	/// append keep a contiguous recoverable log with exact bytes.
+	#[tokio::test]
+	async fn truncate_keeps_the_deferred_prefix() {
+		let dir = tempdir("deferred-truncate");
+		let mut store = try_open_store_with_segment_bytes(&dir, 2 * WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(
+				(1..=5)
+					.map(|i| finalize_entry(i, 100 * i))
+					.collect::<Vec<_>>(),
+			)
+			.await
+			.unwrap();
+		let original = recovered(&mut store, &dir).await;
+		store.purge(log_id(1, 3)).await.unwrap();
+		assert_eq!(store.deferred_log_for_test().await, (1, 3 * WAL_PAGE));
+		store.truncate(log_id(1, 4)).await.unwrap();
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![(1, Some(2), 2 * WAL_PAGE), (3, Some(3), WAL_PAGE)],
+			"the straddler shrinks around entry 3; the suffix goes"
+		);
+		let four = finalize_entry(4, 999);
+		store
+			.blocking_append(vec![clone_entry(&four)])
+			.await
+			.unwrap();
+		store.purge(log_id(1, 4)).await.unwrap();
+		let five = finalize_entry(5, 555);
+		store
+			.blocking_append(vec![clone_entry(&five)])
+			.await
+			.unwrap();
+		assert_eq!(
+			segment_metadata(&store)
+				.await
+				.last()
+				.map(|(start, _, _)| *start),
+			Some(5),
+			"after purge, the next entry starts its own segment"
+		);
+		drop(store);
+		let (_, seen) = reopen(&dir, 2 * WAL_PAGE, "deferred truncate").await;
+		let mut expect = original.entries[..3].to_vec();
+		expect.extend(entry_bytes(&[four, five]));
+		assert_eq!(
+			seen.entries, expect,
+			"1..3 original, 4 and 5 replaced, contiguous"
+		);
+	}
+
+	/// A purge past the local tail followed by publication of the covering snapshot: cleanup
+	/// removes the covered log and the next entry starts the segment named for it.
+	#[tokio::test]
+	async fn append_after_purge_past_the_tail_starts_its_own_segment() {
+		let dir = tempdir("purge-past-tail-append");
+		let mut store = try_open_store_with_segment_bytes(&dir, 2 * WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(1, 100), finalize_entry(2, 200)])
+			.await
+			.unwrap();
+		store.purge(log_id(1, 5)).await.unwrap();
+		assert_eq!(
+			segment_files(&dir),
+			vec![(1, 2 * WAL_PAGE)],
+			"kept until durable"
+		);
+		snapshot_at(&dir, 5);
+		store.note_published_snapshot_for_test(log_id(1, 5)).await;
+		store.complete_deferred_purge().await.unwrap();
+		assert!(segment_files(&dir).is_empty());
+		store
+			.blocking_append(vec![finalize_entry(6, 600)])
+			.await
+			.unwrap();
+		assert_eq!(segment_metadata(&store).await, vec![(6, Some(6), WAL_PAGE)]);
+		drop(store);
+		let (_, seen) = reopen(&dir, 2 * WAL_PAGE, "past tail").await;
+		assert_eq!(
+			seen.entries.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+			vec![6]
+		);
+	}
+
+	/// A crash after a snapshot became durable but before its cleanup: open removes exactly the
+	/// log the validated snapshot covers.
+	#[tokio::test]
+	async fn open_cleans_the_log_a_durable_snapshot_covers() {
+		let dir = tempdir("open-cleanup");
+		let mut store = try_open_store_with_segment_bytes(&dir, 2 * WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(
+				(1..=5)
+					.map(|i| finalize_entry(i, 100 * i))
+					.collect::<Vec<_>>(),
+			)
+			.await
+			.unwrap();
+		let original = recovered(&mut store, &dir).await;
+		store.purge(log_id(1, 4)).await.unwrap();
+		assert_eq!(
+			segment_files(&dir).len(),
+			3,
+			"nothing removed before durability"
+		);
+		drop(store);
+		snapshot_at(&dir, 4);
+		let (_, seen) = reopen(&dir, 2 * WAL_PAGE, "open cleanup").await;
+		assert_eq!(seen.files, vec![(5, WAL_PAGE)]);
+		assert_eq!(seen.entries, original.entries[4..].to_vec());
+	}
+
+	/// A cleanup failure after the snapshot is durable poisons the store and fails the install;
+	/// reopen completes the cleanup.
+	#[tokio::test]
+	async fn cleanup_failure_fails_the_install_and_reopen_completes_it() {
+		let newer = source_snapshot("cleanup-fail-source", 3).await;
+		let dir = tempdir("cleanup-fail");
+		let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+		let mut store = open_store_with_faults(&dir, file_ops.clone(), WAL_PAGE).await;
+		store
+			.blocking_append(vec![finalize_entry(1, 100), finalize_entry(2, 200)])
+			.await
+			.unwrap();
+		store.purge(log_id(1, 3)).await.unwrap();
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		file_ops.inject(InjectedFault::on(
+			FaultOp::Unlink,
+			FaultAction::Error {
+				kind: ErrorKind::Other,
+				message: "injected cleanup unlink failure".into(),
+			},
+		));
+		assert!(
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+				&mut sm,
+				&newer.meta,
+				newer.snapshot,
+			)
+			.await
+			.is_err(),
+			"the install fails"
+		);
+		assert!(
+			store.inner.read().await.poisoned.is_some(),
+			"the store is poisoned"
+		);
+		assert!(
+			store
+				.blocking_append(vec![finalize_entry(4, 400)])
+				.await
+				.is_err()
+		);
+		drop(sm);
+		drop(store);
+		let (_, seen) = reopen(&dir, WAL_PAGE, "after cleanup failure").await;
+		assert!(seen.files.is_empty(), "{:?}", seen.files);
+		assert!(seen.entries.is_empty());
+	}
+
+	/// The replay guard refuses a missing first entry or an interior hole before any effect.
+	#[tokio::test]
+	async fn replay_refuses_a_missing_first_or_interior_entry_without_effect() {
+		let page = |i: u64| serialize_entry_page(&finalize_entry(i, 100 * i)).unwrap();
+		let across = tempdir("guard-across");
+		write_wal_pages(&segment_file(&across, 1), &[page(1), page(2)]);
+		write_wal_pages(&segment_file(&across, 4), &[page(4)]);
+		let within = tempdir("guard-within");
+		write_wal_pages(&segment_file(&within, 1), &[page(1), page(2), page(4)]);
+		let first = tempdir("guard-first");
+		write_wal_pages(&segment_file(&first, 3), &[page(3), page(4)]);
+		snapshot_at(&first, 1);
+		for dir in [across, within, first] {
+			let files = artifact_bytes(&dir);
+			let err = try_open_store_with_segment_bytes(&dir, 4 * WAL_PAGE)
+				.await
+				.err()
+				.unwrap_or_else(|| panic!("{} refuses open", dir.display()));
+			assert_eq!(err.kind(), ErrorKind::InvalidData, "{err}");
+			assert_eq!(artifact_bytes(&dir), files, "{}: no effect", dir.display());
+		}
+	}
+
+	/// A local build publishes before openraft schedules its purge, so the purge after it
+	/// deletes immediately, as before.
+	#[tokio::test]
+	async fn purge_after_a_local_build_deletes_immediately() {
+		let dir = tempdir("build-parity");
+		let mut store = open_store_with_segment_bytes(&dir, WAL_PAGE).await;
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		for i in 1..=3 {
+			append_and_apply(&mut store, &mut sm, lease_entry(i, 10 * i, 10 * i + 9, 3)).await;
+		}
+		append_and_apply(&mut store, &mut sm, lease_entry(4, 50, 59, 3)).await;
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		builder.build_snapshot().await.unwrap();
+		store.purge(log_id(1, 3)).await.unwrap();
+		assert_eq!(store.deferred_log_for_test().await, (0, 0));
+		assert_eq!(segment_files(&dir), vec![(4, WAL_PAGE)]);
+	}
+
+	/// The legacy first-entry exemption belongs to an entry the legacy file holds: an empty or
+	/// checkpoint-only legacy file followed by segments starting at 33 is refused before effect.
+	#[tokio::test]
+	async fn legacy_exemption_needs_the_first_entry_from_the_legacy_file() {
+		let page = |i: u64| serialize_entry_page(&finalize_entry(i, 100 * i)).unwrap();
+		for checkpoint_only in [false, true] {
+			let dir = tempdir("legacy-origin");
+			let (wal, _, _) = artifact_paths(&dir);
+			if checkpoint_only {
+				write_wal_pages(&wal, &[serialize_checkpoint_page(0, 0, 0, 0)]);
+			} else {
+				std::fs::File::create(&wal).unwrap();
+			}
+			write_wal_pages(&segment_file(&dir, 33), &[page(33), page(34)]);
+			let files = artifact_bytes(&dir);
+			let err = try_open_store_with_segment_bytes(&dir, 4 * WAL_PAGE)
+				.await
+				.err()
+				.unwrap_or_else(|| panic!("checkpoint-only {checkpoint_only}: refuses open"));
+			assert_eq!(err.kind(), ErrorKind::InvalidData, "{err}");
+			assert_eq!(
+				artifact_bytes(&dir),
+				files,
+				"checkpoint-only {checkpoint_only}: no effect"
+			);
+		}
+	}
+
+	/// Open-time cleanup preserves C′ in the holder before each deletion attempt; interrupted
+	/// again and again, the holder stays within the segment size (full, it is replaced), holds
+	/// only intact checkpoint records ending in C′, and a final open completes.
+	#[tokio::test]
+	async fn interrupted_open_cleanup_never_grows_a_holder_past_the_segment() {
+		let c3 = serialize_checkpoint_page(3, 3, 3, 1);
+		let dir = tempdir("cleanup-bound");
+		let pages: Vec<AlignedBuf> = (1..=3)
+			.map(|i| serialize_entry_page(&finalize_entry(i, 100 * i)).unwrap())
+			.collect();
+		write_wal_pages(&segment_file(&dir, 1), &pages);
+		write_wal_pages(
+			&segment_file(&dir, 4),
+			&[serialize_checkpoint_page(3, 3, 3, 1)],
+		);
+		snapshot_at(&dir, 3);
+		let mut lengths = Vec::new();
+		for round in 0..6 {
+			let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+			file_ops.inject(
+				InjectedFault::on(
+					FaultOp::Unlink,
+					FaultAction::Error {
+						kind: ErrorKind::Other,
+						message: "injected cleanup unlink failure".into(),
+					},
+				)
+				.for_path(segment_file(&dir, 1)),
+			);
+			assert!(
+				try_open_faulty(&dir, file_ops, 3 * WAL_PAGE).await.is_err(),
+				"round {round}: the interrupted cleanup aborts open"
+			);
+			let holder = std::fs::read(segment_file(&dir, 4)).unwrap();
+			assert!(
+				holder.len() as u64 <= 3 * WAL_PAGE,
+				"round {round}: {}",
+				holder.len()
+			);
+			assert!(holder.chunks(WAL_PAGE as usize).all(is_checkpoint_page));
+			assert!(holder.ends_with(c3.as_slice()));
+			assert!(
+				segment_file(&dir, 1).exists(),
+				"round {round}: the log is not yet removed"
+			);
+			lengths.push(holder.len() as u64 / WAL_PAGE);
+		}
+		assert!(
+			lengths.contains(&3) && lengths.contains(&1),
+			"{lengths:?}: full, then replaced"
+		);
+		let (_, seen) = reopen(&dir, 3 * WAL_PAGE, "completed").await;
+		assert_eq!(
+			seen.files
+				.iter()
+				.map(|(start, _)| *start)
+				.collect::<Vec<_>>(),
+			vec![4]
+		);
+		assert_eq!(
+			seen.checkpoint,
+			Some(RecoveryCheckpoint {
+				commit_index: 3,
+				e_safe_index: 3,
+			})
+		);
 	}
 }
 
