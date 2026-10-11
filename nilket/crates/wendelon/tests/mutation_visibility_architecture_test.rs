@@ -3431,3 +3431,164 @@ fn command_verification_is_single_site_and_unwired() {
 		"only verify_command2 returns a VerifiedCommand2"
 	);
 }
+
+// The pure VISADC01 administrator command envelope check: an exact item census; no signing, I/O,
+// clock, network, spawn, serde or authority construction (no VerifiedCommand2, TrustedEntry2,
+// CommittedEntry2 or Root2); the checked token is built only inside check_admin_command2; nothing
+// outside the module and the root2 tests names its surface. Syntax checks, not compiler resolution.
+#[test]
+fn admin_command_envelope_is_pure_and_unwired() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let root = src.join("storage/mutation_visibility/root2");
+	let text = fs::read_to_string(root.join("admin_command.rs")).unwrap();
+	assert!(text.lines().count() <= 250);
+	let flat = without_test_items_deep(text.parse().unwrap())
+		.to_string()
+		.replace(' ', "");
+	// Identifier tokens only: doc comments are literals and may name the types they exclude.
+	fn idents(tokens: proc_macro2::TokenStream, out: &mut Vec<String>) {
+		for t in tokens {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => out.push(id.to_string()),
+				proc_macro2::TokenTree::Group(g) => idents(g.stream(), out),
+				_ => {}
+			}
+		}
+	}
+	let mut names = Vec::new();
+	idents(without_test_items_deep(text.parse().unwrap()), &mut names);
+	for banned in [
+		"SigningKey",
+		"Signer",
+		"sign",
+		"fs",
+		"io",
+		"net",
+		"tokio",
+		"spawn",
+		"Instant",
+		"SystemTime",
+		"unsafe",
+		"serde",
+		"VerifiedCommand2",
+		"TrustedEntry2",
+		"CommittedEntry2",
+		"Root2",
+		"install_admin2",
+	] {
+		assert!(
+			!names.iter().any(|n| n == banned),
+			"admin_command.rs: {banned}"
+		);
+	}
+	// The checked token: declared, given accessors, and constructed exactly once, inside the check.
+	assert_eq!(flat.matches("(CheckedAdminCommand2{").count(), 1);
+	assert!(fn_body(&text, "check_admin_command2").contains("Ok(CheckedAdminCommand2 {"));
+	assert_eq!(flat.matches("verify_strict(").count(), 1);
+	let file = syn::parse_file(&text).unwrap();
+	let (mut types, mut exported, mut private, mut consts) = (vec![], vec![], vec![], vec![]);
+	for item in &file.items {
+		match item {
+			syn::Item::Fn(f) if root2_scoped(&f.vis) => exported.push(f.sig.ident.to_string()),
+			syn::Item::Fn(f) => {
+				assert!(matches!(f.vis, syn::Visibility::Inherited));
+				private.push(f.sig.ident.to_string())
+			}
+			syn::Item::Enum(e) => {
+				assert!(root2_scoped(&e.vis));
+				types.push(e.ident.to_string())
+			}
+			syn::Item::Struct(s) => {
+				assert!(root2_scoped(&s.vis));
+				assert!(
+					s.attrs.iter().all(|a| !a.path().is_ident("derive")),
+					"no derive"
+				);
+				for f in &s.fields {
+					assert!(
+						matches!(f.vis, syn::Visibility::Inherited),
+						"private fields"
+					);
+				}
+				types.push(s.ident.to_string())
+			}
+			syn::Item::Const(c) => consts.push((c.ident.to_string(), root2_scoped(&c.vis))),
+			syn::Item::Impl(i) => {
+				assert!(i.trait_.is_none(), "no trait impls");
+				let mut fns: Vec<_> = i
+					.items
+					.iter()
+					.map(|x| match x {
+						syn::ImplItem::Fn(m) => m.sig.ident.to_string(),
+						_ => panic!("impl items are methods only"),
+					})
+					.collect();
+				fns.sort();
+				assert_eq!(fns, ["command_digest", "context"]);
+			}
+			syn::Item::Use(_) | syn::Item::Macro(_) => {}
+			_ => panic!("admin_command.rs: unexpected item"),
+		}
+	}
+	types.sort();
+	exported.sort();
+	private.sort();
+	consts.sort();
+	assert_eq!(
+		types,
+		["CheckedAdminCommand2", "EnvelopeError2", "EnvelopeField2"]
+	);
+	assert_eq!(
+		exported,
+		[
+			"admin_command_preimage2",
+			"check_admin_command2",
+			"encode_admin_command2"
+		]
+	);
+	assert_eq!(
+		private,
+		["array", "check_context", "parse", "u64_at", "write"]
+	);
+	assert_eq!(
+		consts,
+		[
+			("ADMIN_COMMAND_BYTES2".to_string(), true),
+			("DOMAIN".to_string(), false),
+			("MAGIC".to_string(), false),
+			("SIGNED".to_string(), false),
+			("VERSION".to_string(), false)
+		]
+	);
+	// Dormant: nothing outside the module and the root2 tests names its surface.
+	let tests = root.join("tests");
+	let mut stack = vec![src];
+	while let Some(dir) = stack.pop() {
+		for e in fs::read_dir(dir).unwrap() {
+			let p = e.unwrap().path();
+			if p.is_dir() {
+				if p != tests {
+					stack.push(p);
+				}
+			} else if p.extension().is_some_and(|x| x == "rs")
+				&& !p.ends_with("root2/admin_command.rs")
+			{
+				let t = fs::read_to_string(&p).unwrap();
+				for name in [
+					"check_admin_command2",
+					"admin_command_preimage2",
+					"encode_admin_command2",
+					"CheckedAdminCommand2",
+					"EnvelopeError2",
+					"root2::admin_command",
+				] {
+					assert!(
+						!t.contains(name),
+						"production caller of {name} in {}",
+						p.display()
+					);
+				}
+			}
+		}
+	}
+}
