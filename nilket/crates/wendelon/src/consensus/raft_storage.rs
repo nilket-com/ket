@@ -440,6 +440,8 @@ fn report_deferred(inner: &LogStoreInner) {
 #[async_trait::async_trait]
 impl DeferredPurge for WendelonLogStore {
 	async fn complete_deferred_purge(&self) -> std::io::Result<()> {
+		// A failed publication refuses cleanup even when there is nothing to delete.
+		self.publication.covered_index().await?;
 		let last_purged = self.inner.read().await.last_purged;
 		let Some(last_purged) = last_purged else {
 			return Ok(());
@@ -2039,6 +2041,13 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 		let mut wal_file = wal_file;
 		let mut wal_cursor = wal_cursor;
 		let mut deleted_starts_all: BTreeSet<u64> = BTreeSet::new();
+		// A failed snapshot publication refuses a durable purge before any effect or logical
+		// change, until reopen.
+		let covered = if file_ops.is_some() {
+			self.publication.covered_index().await.map_err(refuse)?
+		} else {
+			None
+		};
 		if let Some(file_ops) = file_ops.as_ref() {
 			let artifact_paths = artifact_paths.ok_or_else(|| {
 				refuse(Error::new(
@@ -2049,7 +2058,6 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 			// Physical deletion needs both the logical boundary and a durable snapshot covering
 			// the segment; anything else is kept (deferred) until a publication covers it. A
 			// checkpoint-only segment is never in the purged run.
-			let covered = self.publication.covered_index().await;
 			let delete_count = wal_segments
 				.iter()
 				.take_while(|segment| {
@@ -2889,12 +2897,11 @@ impl SnapshotPublication {
 		}
 	}
 
-	/// The index below which a durable artifact covers the log, read as a leaf.
-	async fn covered_index(&self) -> Option<u64> {
-		match *self.state.lock().await {
-			PublicationState::Healthy(published) => published.covered_index(),
-			PublicationState::Failed { .. } => None,
-		}
+	/// The index below which a durable artifact covers the log, read as a leaf. A failed
+	/// publication refuses: no cleanup or purge acts until reopen. No artifact, or one of an
+	/// empty state, is healthy with no coverage.
+	async fn covered_index(&self) -> std::io::Result<Option<u64>> {
+		Self::healthy(&*self.state.lock().await).map(PublishedSnapshot::covered_index)
 	}
 }
 
@@ -17114,6 +17121,146 @@ mod recovery_tests {
 				e_safe_index: 3,
 			})
 		);
+	}
+
+	/// The pending-cleanup shape for F-P: entry 1 applied, a checkpoint-only holder "2" (C =
+	/// {1,1}), then a real build whose post-rename directory sync fails, so publication is failed.
+	/// With `purged`, a purge(1) ran first (logical boundary set, the log deferred).
+	async fn failed_publication_with_pending_holder(
+		tag: &str,
+		purged: bool,
+	) -> (PathBuf, WendelonLogStore, WendelonStateMachine) {
+		let dir = tempdir(tag);
+		let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+		let mut store = open_store_with_faults(&dir, file_ops.clone(), WAL_PAGE).await;
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		append_and_apply(&mut store, &mut sm, lease_entry(1, 10, 19, 3)).await;
+		checkpoint(&store, 1, 1).await;
+		if purged {
+			store.purge(log_id(1, 1)).await.unwrap();
+		}
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![(1, Some(1), WAL_PAGE), (2, None, WAL_PAGE)]
+		);
+		file_ops.inject(
+			InjectedFault::on(
+				FaultOp::FsyncDir,
+				FaultAction::Error {
+					kind: ErrorKind::Other,
+					message: "injected snapshot directory sync failure".into(),
+				},
+			)
+			.for_path(dir.clone()),
+		);
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		assert!(
+			builder.build_snapshot().await.is_err(),
+			"publication fails after its rename"
+		);
+		(dir, store, sm)
+	}
+
+	/// Everything the log store holds, logically and physically, for no-change assertions.
+	#[derive(Debug, PartialEq)]
+	struct StoreState {
+		last_log_id: Option<LogId<u32>>,
+		last_purged: Option<LogId<u32>>,
+		entries: Vec<(u64, Vec<u8>)>,
+		entry_positions: BTreeMap<u64, WalRecordPointer>,
+		deferred_positions: BTreeMap<u64, WalRecordPointer>,
+		wal_segments: Vec<WalSegmentMeta>,
+		wal_cursor: u64,
+	}
+
+	async fn store_state(store: &WendelonLogStore) -> StoreState {
+		let guard = store.inner.read().await;
+		StoreState {
+			last_log_id: guard.last_log_id,
+			last_purged: guard.last_purged,
+			entries: entry_bytes(&guard.entries.values().map(clone_entry).collect::<Vec<_>>()),
+			entry_positions: guard.entry_positions.clone(),
+			deferred_positions: guard.deferred_positions.clone(),
+			wal_segments: guard.wal_segments.clone(),
+			wal_cursor: guard.wal_cursor,
+		}
+	}
+
+	#[derive(Clone, Copy, Debug)]
+	enum AfterFailedPublication {
+		/// purge(3): past the checkpoint-only holder "2", which a purge would move to "4".
+		Purge,
+		/// The deferred cleanup a publication triggers.
+		Cleanup,
+	}
+
+	/// F-P: once publication has failed, `op` refuses before any effect or logical change; the
+	/// store, its files and the refusal of readers are unchanged; reopen resolves the artifact.
+	async fn failed_publication_refuses(op: AfterFailedPublication, purged: bool) {
+		let label = format!("{op:?}, purged first {purged}");
+		let (dir, mut store, mut sm) =
+			failed_publication_with_pending_holder("failed-publication", purged).await;
+		let files = artifact_bytes(&dir);
+		let segments_before = segment_files(&dir);
+		let state = store_state(&store).await;
+		let result = match op {
+			AfterFailedPublication::Purge => store
+				.purge(log_id(1, 3))
+				.await
+				.map_err(|err| err.to_string()),
+			AfterFailedPublication::Cleanup => store
+				.complete_deferred_purge()
+				.await
+				.map_err(|err| err.to_string()),
+		};
+		let files_after = artifact_bytes(&dir);
+		let state_after = store_state(&store).await;
+		eprintln!(
+			"{label}: result {result:?}; segments before {segments_before:?} after {:?}; last_purged before {:?} after {:?}",
+			segment_files(&dir),
+			state.last_purged,
+			state_after.last_purged
+		);
+		assert!(result.is_err(), "{label}: refuses, got {result:?}");
+		assert_eq!(files_after, files, "{label}: no file effect");
+		assert_eq!(state_after, state, "{label}: no logical or physical change");
+		assert!(
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_current_snapshot(
+				&mut sm
+			)
+			.await
+			.is_err(),
+			"{label}: readers still refuse"
+		);
+		drop(sm);
+		drop(store);
+		let reopened = open_store(&dir).await;
+		let mut recovered = reopened.recovered_state_machine().await.unwrap();
+		assert_current(&mut recovered, 1, &label).await;
+	}
+
+	#[tokio::test]
+	async fn failed_publication_refuses_purge_past_a_holder_before_effects() {
+		failed_publication_refuses(AfterFailedPublication::Purge, true).await;
+	}
+
+	#[tokio::test]
+	async fn failed_publication_refuses_purge_with_no_prior_purge_before_effects() {
+		failed_publication_refuses(AfterFailedPublication::Purge, false).await;
+	}
+
+	#[tokio::test]
+	async fn failed_publication_refuses_cleanup_before_effects() {
+		failed_publication_refuses(AfterFailedPublication::Cleanup, true).await;
+	}
+
+	#[tokio::test]
+	async fn failed_publication_refuses_cleanup_with_no_prior_purge() {
+		failed_publication_refuses(AfterFailedPublication::Cleanup, false).await;
 	}
 }
 
