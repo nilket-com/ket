@@ -9,7 +9,7 @@ use crate::consensus::{RetentionStatus, WendelonLogStore, WendelonRequest, Wende
 use crate::storage::mutation_visibility::root2::acquisition::*;
 use crate::storage::mutation_visibility::root2::prefix::PrefixError2;
 use openraft::anyerror::AnyError;
-use openraft::storage::{RaftLogReader, RaftLogStorageExt};
+use openraft::storage::{RaftLogReader, RaftLogStorage, RaftLogStorageExt};
 use openraft::{
 	BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, Membership, OptionalSend,
 	StorageError, StorageIOError,
@@ -106,11 +106,13 @@ enum Fault {
 	Error,
 	Pending,
 }
-/// Counts reads (1-based) and lets a hook replace, refuse or stall any read.
+/// Counts reads (1-based) and lets a hook replace, refuse or stall any read. A test-only rewrite
+/// can replace stored entries in the shared in-memory store just before a chosen read.
 struct FaultReader {
 	inner: WendelonLogStore,
 	reads: Arc<AtomicUsize>,
 	hook: Arc<Hook>,
+	rewrite: Option<(usize, Vec<E2>)>,
 }
 impl FaultReader {
 	fn new(
@@ -121,7 +123,14 @@ impl FaultReader {
 			inner,
 			reads: Arc::new(AtomicUsize::new(0)),
 			hook: Arc::new(Box::new(hook)),
+			rewrite: None,
 		}
+	}
+	/// Before read `at`, truncate the store from the first replacement's index and append the
+	/// replacements: a real change to stored entries, not a substituted read result.
+	fn rewrite_before(mut self, at: usize, replacement: Vec<E2>) -> Self {
+		self.rewrite = Some((at, replacement));
+		self
 	}
 	fn plain(inner: WendelonLogStore) -> Self {
 		Self::new(inner, |_, v| Fault::Return(v))
@@ -136,6 +145,12 @@ impl RaftLogReader<WendelonTypeConfig> for FaultReader {
 		range: RB,
 	) -> Result<Vec<E2>, StorageError<u32>> {
 		let n = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
+		if let Some((at, replacement)) = self.rewrite.clone()
+			&& n == at
+		{
+			self.inner.truncate(replacement[0].log_id).await?;
+			self.inner.blocking_append(replacement).await?;
+		}
 		let v = self.inner.try_get_log_entries(range).await?;
 		match (self.hook)(n, v) {
 			Fault::Return(v) => Ok(v),
@@ -259,6 +274,35 @@ async fn late_gap_truncation_and_extra_refuse() {
 			"provisional output discarded"
 		);
 	}
+	// The final batch (read 7, 6..=6) returns nothing, after three batches were folded.
+	let mut r = FaultReader::new(store(entries(8)).await, |n, v| {
+		Fault::Return(if n == 7 { vec![] } else { v })
+	});
+	let folds = Arc::new(AtomicUsize::new(0));
+	let counted = folds.clone();
+	let (a, drops) = acc();
+	let out = acquire_committed_prefix2(&mut r, &Sources::at(c), wide(), a, move |a, b| {
+		counted.fetch_add(1, Ordering::SeqCst);
+		record(a, b)
+	})
+	.await;
+	assert!(
+		matches!(
+			out,
+			Err(AcquisitionError2::Coverage {
+				from: 6,
+				end: 6,
+				got: 0
+			})
+		),
+		"{out:?}"
+	);
+	assert_eq!(folds.load(Ordering::SeqCst), 3);
+	assert_eq!(
+		drops.load(Ordering::SeqCst),
+		1,
+		"no successful accumulator or report"
+	);
 	// Right count, wrong index: S1's contiguity check.
 	let mut r = FaultReader::new(store(entries(8)).await, |n, v| {
 		Fault::Return(if n == 5 {
@@ -719,10 +763,10 @@ async fn cancelled_acquisition_exposes_nothing() {
 	);
 }
 
-/// Documented limit: each index is read once, so an entry below the boundary that changes after
-/// its read is not detected.
+/// A batch that coherently carries different bytes for an entry below the boundary is accepted:
+/// only the boundary is compared against a re-read.
 #[tokio::test]
-async fn altered_after_read_is_not_detected() {
+async fn coherently_altered_earlier_entry_in_batch_is_accepted() {
 	let c = lid(1, 1, 6);
 	let mut r = FaultReader::new(store(entries(8)).await, |n, v| {
 		Fault::Return(if n == 1 {
@@ -733,4 +777,48 @@ async fn altered_after_read_is_not_detected() {
 	});
 	let (out, _) = run(&mut r, &Sources::at(c), wide()).await;
 	assert!(out.is_ok());
+}
+
+/// Documented limit, exercised by a real store mutation. Each index is read once, so an entry
+/// below the boundary that changes in the store after its batch was read and folded is not
+/// detected. The fault violates the assumed committed-prefix immutability and storage integrity;
+/// it is not a supported Raft operation.
+#[tokio::test]
+async fn entry_mutated_in_store_after_its_read_is_not_detected() {
+	let c = lid(1, 1, 6);
+	let original = entries(8);
+	let encoded = |e: &E2| postcard::to_allocvec(e).unwrap();
+	let mut replacement = original[1..].to_vec();
+	replacement[0] = normal(lid(1, 1, 1), 9);
+	let shared = store(original.clone()).await;
+	let mut inspect = shared.clone();
+	// Read 3 is the second batch read; batch 0..=1 was read (read 1) and folded (after read 2).
+	let mut r = FaultReader::plain(shared).rewrite_before(3, replacement.clone());
+	let fold = |mut a: Vec<(u64, Vec<u8>)>, b: &[E2]| {
+		a.extend(b.iter().map(|e| (e.log_id.index, encoded(e))));
+		Ok(a)
+	};
+	let (folded, report) =
+		acquire_committed_prefix2(&mut r, &Sources::at(c), wide(), Vec::new(), fold)
+			.await
+			.unwrap();
+	assert_eq!(report.through(), c);
+	assert_eq!(
+		folded[1],
+		(1, encoded(&original[1])),
+		"the original bytes were folded"
+	);
+	let stored = inspect.try_get_log_entries(1..=1).await.unwrap();
+	assert_eq!(
+		encoded(&stored[0]),
+		encoded(&replacement[0]),
+		"the store really changed"
+	);
+	assert_ne!(encoded(&stored[0]), encoded(&original[1]));
+	let boundary = inspect.try_get_log_entries(6..=6).await.unwrap();
+	assert_eq!(
+		encoded(&boundary[0]),
+		encoded(&original[6]),
+		"boundary unchanged"
+	);
 }
