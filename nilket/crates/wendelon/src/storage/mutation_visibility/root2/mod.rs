@@ -5,6 +5,9 @@ mod acquisition;
 #[allow(dead_code)] // Dormant manifest math; no production caller until reviewed integration.
 mod admin;
 #[allow(dead_code)]
+// Dormant administrator command envelope check; no production caller until reviewed integration.
+mod admin_command;
+#[allow(dead_code)]
 // Dormant derived administrator view; no production caller until reviewed integration.
 mod admin_install;
 #[allow(dead_code)]
