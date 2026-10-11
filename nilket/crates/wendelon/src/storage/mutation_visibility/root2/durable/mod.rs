@@ -6,6 +6,9 @@ mod journal;
 pub(crate) mod loader;
 #[allow(dead_code)]
 mod local_store;
+#[allow(dead_code)]
+// Dormant recovery-mark store; no production caller until reviewed integration.
+pub(crate) mod mark_store;
 mod wire;
 mod witness;
 use super::{

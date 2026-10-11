@@ -2325,6 +2325,9 @@ fn recovery_is_pure_and_dormant() {
 			continue;
 		}
 		let t = fs::read_to_string(&f).unwrap();
+		// The dormant mark store (stage M) is the one consumer of the codec, and only of the
+		// codec; its own guard pins it to zero production callers.
+		let mark_store = f.ends_with("root2/durable/mark_store.rs");
 		for name in [
 			"replay_monitor2",
 			"observe2",
@@ -2332,11 +2335,151 @@ fn recovery_is_pure_and_dormant() {
 			"encode_recovery_mark2",
 			"decode_recovery_mark2",
 		] {
+			if mark_store && name.ends_with("_recovery_mark2") {
+				assert!(t.contains(name), "mark store uses the codec: {name}");
+				continue;
+			}
 			assert!(
 				!t.contains(name),
 				"production caller of {name} in {}",
 				f.display()
 			);
+		}
+	}
+}
+
+// Recovery-mark store: std only, zero unsafe (tests included), libc constants only, no network,
+// clock, env, trust, root or authority-state construction; exactly four root2-scoped methods on
+// MarkStore2, no exported free functions, traits or statics; no caller outside its own module and
+// the root2 tests; bounded. Syntax only; #[cfg(test)] items are excluded from the production surface.
+#[test]
+fn durable_mark_store_is_std_only_with_four_methods() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let path = src.join("storage/mutation_visibility/root2/durable/mark_store.rs");
+	let text = fs::read_to_string(&path).unwrap();
+	assert!(text.lines().count() <= 750);
+	fn walk(tokens: proc_macro2::TokenStream, out: &mut Vec<String>) {
+		let ts: Vec<_> = tokens.into_iter().collect();
+		for (i, t) in ts.iter().enumerate() {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => {
+					let n = id.to_string();
+					if n.starts_with("Trusted")
+						|| n.starts_with("Verified")
+						|| [
+							"unsafe",
+							"net",
+							"tokio",
+							"Instant",
+							"SystemTime",
+							"env",
+							"Root2",
+							"State2",
+							"Command2",
+							"CommittedEntry2",
+							"MutationAuthorityState2",
+						]
+						.contains(&n.as_str())
+					{
+						out.push(n.clone());
+					}
+					if n == "libc" {
+						match (ts.get(i + 1), ts.get(i + 2), ts.get(i + 3)) {
+							(
+								Some(proc_macro2::TokenTree::Punct(a)),
+								Some(proc_macro2::TokenTree::Punct(b)),
+								Some(proc_macro2::TokenTree::Ident(c)),
+							) if a.as_char() == ':' && b.as_char() == ':' => {
+								let name = c.to_string();
+								if !name.chars().all(|c| {
+									c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'
+								}) || matches!(ts.get(i + 4), Some(proc_macro2::TokenTree::Group(g)) if g.delimiter() == proc_macro2::Delimiter::Parenthesis)
+								{
+									out.push(format!("libc::{name}"));
+								}
+							}
+							_ => out.push("libc path".into()),
+						}
+					}
+				}
+				proc_macro2::TokenTree::Group(g) => walk(g.stream(), out),
+				_ => {}
+			}
+		}
+	}
+	let mut found = Vec::new();
+	walk(text.parse().unwrap(), &mut found);
+	assert!(
+		!found.iter().any(|n| n == "unsafe"),
+		"mark_store.rs: unsafe"
+	);
+	let mut production = Vec::new();
+	walk(without_test_items(text.parse().unwrap()), &mut production);
+	assert!(production.is_empty(), "mark_store.rs: {production:?}");
+	let cfg_test = |attrs: &[syn::Attribute]| {
+		attrs.iter().any(|a| {
+			a.path().is_ident("cfg")
+				&& matches!(&a.meta, syn::Meta::List(l) if l.tokens.to_string() == "test")
+		})
+	};
+	let mut methods = Vec::new();
+	for item in syn::parse_file(&text).unwrap().items {
+		match item {
+			syn::Item::Fn(f) if !cfg_test(&f.attrs) => assert!(
+				matches!(f.vis, syn::Visibility::Inherited),
+				"mark_store.rs exports fn {}",
+				f.sig.ident
+			),
+			syn::Item::Impl(i) if !cfg_test(&i.attrs) => {
+				assert!(i.trait_.is_none(), "mark_store.rs: trait impl");
+				for it in &i.items {
+					if let syn::ImplItem::Fn(f) = it
+						&& !matches!(f.vis, syn::Visibility::Inherited)
+					{
+						assert_eq!(quote_type(&i.self_ty), "MarkStore2");
+						assert!(root2_scoped(&f.vis), "{}", f.sig.ident);
+						methods.push(f.sig.ident.to_string());
+					}
+				}
+			}
+			syn::Item::Trait(t) if !cfg_test(&t.attrs) => panic!("mark_store.rs: trait"),
+			syn::Item::Static(s) if !cfg_test(&s.attrs) => panic!("mark_store.rs: static"),
+			syn::Item::Mod(m) if !cfg_test(&m.attrs) => panic!("mark_store.rs: module"),
+			syn::Item::Macro(m) if !cfg_test(&m.attrs) => assert!(
+				m.mac.path.is_ident("redacted_debug"),
+				"mark_store.rs: item macro"
+			),
+			_ => {}
+		}
+	}
+	methods.sort();
+	assert_eq!(methods, ["advance", "durable", "open", "provision"]);
+	// No production caller: outside its own file, only its module declaration and root2's
+	// tests name it.
+	fn files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+		for entry in fs::read_dir(dir).unwrap() {
+			let p = entry.unwrap().path();
+			if p.is_dir() {
+				files(&p, out);
+			} else if p.extension().is_some_and(|e| e == "rs") {
+				out.push(p);
+			}
+		}
+	}
+	let mut all = Vec::new();
+	files(&src, &mut all);
+	let tests = src.join("storage/mutation_visibility/root2/tests");
+	let declaration = src.join("storage/mutation_visibility/root2/durable/mod.rs");
+	for file in all {
+		if file == path || file.starts_with(&tests) {
+			continue;
+		}
+		let text = fs::read_to_string(&file).unwrap();
+		let mentions = text.matches("mark_store").count();
+		if file == declaration {
+			assert_eq!(mentions, 1, "durable/mod.rs: only the module declaration");
+		} else {
+			assert_eq!(mentions, 0, "{}: names mark_store", file.display());
 		}
 	}
 }

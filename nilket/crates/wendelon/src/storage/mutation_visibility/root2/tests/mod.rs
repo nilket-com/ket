@@ -10,6 +10,7 @@ mod entry_identity;
 mod g1c_roundtrip;
 mod goldens;
 mod invariants;
+mod mark_store;
 mod origin;
 mod recovery;
 mod refusals;
