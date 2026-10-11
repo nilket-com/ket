@@ -1,5 +1,6 @@
 use super::*;
 use super::{codec::*, validation::*};
+mod acquisition;
 mod admin_install;
 mod admin_statement;
 mod admission_command;

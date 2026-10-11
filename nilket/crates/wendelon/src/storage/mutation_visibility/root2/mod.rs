@@ -1,4 +1,7 @@
 //! Dormant S1 authority2. No production adapter can construct its private trust tokens.
+#[allow(dead_code)]
+// Dormant committed-prefix acquisition; no production caller until reviewed integration.
+mod acquisition;
 #[allow(dead_code)] // Dormant manifest math; no production caller until reviewed integration.
 mod admin;
 #[allow(dead_code)]
