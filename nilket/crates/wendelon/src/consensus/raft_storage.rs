@@ -13548,7 +13548,7 @@ mod tenant_kek_tests {
 /// `WAL_FORMAT_VERSION`/`SNAPSHOT_FORMAT_VERSION` bump, a frozen fixture of
 /// the outgoing version, and its replay control — never alone.
 #[cfg(test)]
-mod body_format_corpus {
+pub(crate) mod body_format_corpus {
 	use super::*;
 	use crate::consensus::{EpochPeer, RetireTieredSlab};
 	use crate::crypto::WrappedTenantKek;
@@ -13780,7 +13780,7 @@ mod body_format_corpus {
 		]
 	}
 
-	fn canonical_requests() -> Vec<(&'static str, WendelonRequest)> {
+	pub(crate) fn canonical_requests() -> Vec<(&'static str, WendelonRequest)> {
 		let tenant_id = TenantId::new(7);
 		vec![
 			(

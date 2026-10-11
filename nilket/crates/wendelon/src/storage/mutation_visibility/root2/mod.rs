@@ -17,6 +17,9 @@ mod admission_registry;
 mod auth;
 mod codec;
 mod command;
+#[allow(dead_code)]
+// Dormant committed-entry adapter; no production caller until reviewed integration.
+mod committed;
 pub mod durable;
 #[allow(dead_code)] // Dormant entry-identity math; no production caller until reviewed integration.
 mod entry_identity;

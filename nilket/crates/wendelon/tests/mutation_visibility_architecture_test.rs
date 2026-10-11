@@ -186,6 +186,7 @@ fn s1_private_trust_tokens_and_fake_install_are_test_only() {
 	let trust = syn::parse_file(&fs::read_to_string(root.join("trust.rs")).unwrap()).unwrap();
 	let mut tokens = 0;
 	let mut factories = 0;
+	let mut production_factories = 0;
 	for item in trust.items {
 		match item {
 			syn::Item::Struct(s) => {
@@ -208,6 +209,22 @@ fn s1_private_trust_tokens_and_fake_install_are_test_only() {
 							factories += 1;
 							assert!(test_only(&f.attrs));
 							assert!(!matches!(f.vis, syn::Visibility::Public(_)));
+						} else if f.sig.ident == "from_source" {
+							// Stage A0: the one production factory, on CommittedEntry2 only, and
+							// only with the committed-source capability as its first parameter.
+							production_factories += 1;
+							assert!(!test_only(&f.attrs));
+							assert!(
+								matches!(&*i.self_ty, syn::Type::Path(p) if p.path.is_ident("CommittedEntry2"))
+							);
+							assert!(
+								matches!(&f.vis, syn::Visibility::Restricted(r) if r.path.is_ident("super"))
+							);
+							let first = f.sig.inputs.first().expect("capability parameter");
+							assert!(
+								matches!(first, syn::FnArg::Typed(t) if matches!(&*t.ty, syn::Type::Reference(r) if r.mutability.is_none() && matches!(&*r.elem, syn::Type::Path(p) if p.path.is_ident("CommittedSource2")))),
+								"from_source requires &CommittedSource2"
+							);
 						} else {
 							assert!(
 								f.sig.ident == "fields"
@@ -227,6 +244,7 @@ fn s1_private_trust_tokens_and_fake_install_are_test_only() {
 	// Fourth token: CommittedEntry2 (origin contract r4 E1), whose only factory is a test fixture.
 	assert_eq!(tokens, 4);
 	assert_eq!(factories, 6);
+	assert_eq!(production_factories, 1);
 	let state = syn::parse_file(&fs::read_to_string(root.join("state.rs")).unwrap()).unwrap();
 	let mut installs = 0;
 	for item in state.items {
@@ -2482,4 +2500,211 @@ fn durable_mark_store_is_std_only_with_four_methods() {
 			assert_eq!(mentions, 0, "{}: names mark_store", file.display());
 		}
 	}
+}
+
+// Committed-entry adapter (stage A0): a private dormant module; its capability has private fields,
+// no derives and only a test-only mint, and is never written as a literal elsewhere; one
+// root2-scoped entrypoint; no I/O, clock, trust input or authority-state construction; the
+// request classification lists every `WendelonRequest` variant by name, once, with no wildcard;
+// `CommittedEntry2::from_source` is called only here; nothing outside root2 names the adapter.
+#[test]
+fn committed_adapter_is_pure_capability_gated_and_exhaustive() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let root = src.join("storage/mutation_visibility/root2");
+	let text = fs::read_to_string(root.join("committed.rs")).unwrap();
+	assert!(text.lines().count() <= 750);
+	let module = syn::parse_file(&fs::read_to_string(root.join("mod.rs")).unwrap())
+		.unwrap()
+		.items
+		.into_iter()
+		.find_map(|i| match i {
+			syn::Item::Mod(m) if m.ident == "committed" => Some(m),
+			_ => None,
+		})
+		.unwrap();
+	assert!(matches!(module.vis, syn::Visibility::Inherited));
+	let cfg_test = |attrs: &[syn::Attribute]| {
+		attrs.iter().any(|a| {
+			a.path().is_ident("cfg")
+				&& matches!(&a.meta, syn::Meta::List(l) if l.tokens.to_string() == "test")
+		})
+	};
+	let file = syn::parse_file(&text).unwrap();
+	let mut entrypoints = Vec::new();
+	let mut mints = 0;
+	let mut arms: Vec<String> = Vec::new();
+	fn collect(p: &syn::Pat, out: &mut Vec<String>) {
+		match p {
+			syn::Pat::Or(o) => o.cases.iter().for_each(|c| collect(c, out)),
+			syn::Pat::TupleStruct(t) => {
+				// `WendelonRequest::Variant(_)` only: no binding, no field access.
+				assert!(
+					t.elems.len() == 1 && matches!(t.elems.first(), Some(syn::Pat::Wild(_))),
+					"classification patterns bind nothing"
+				);
+				let segs: Vec<String> = t
+					.path
+					.segments
+					.iter()
+					.map(|s| s.ident.to_string())
+					.collect();
+				assert_eq!(segs.len(), 2, "qualified WendelonRequest::Variant");
+				assert_eq!(segs[0], "WendelonRequest");
+				out.push(segs[1].clone());
+			}
+			other => panic!("unexpected classification pattern: {}", quote_pat(other)),
+		}
+	}
+	fn quote_pat(p: &syn::Pat) -> String {
+		match p {
+			syn::Pat::Wild(_) => "_ wildcard".into(),
+			syn::Pat::Ident(i) => format!("binding {}", i.ident),
+			_ => "other".into(),
+		}
+	}
+	for item in &file.items {
+		match item {
+			syn::Item::Struct(s) if s.ident == "CommittedSource2" => {
+				assert!(s.attrs.iter().all(|a| !a.path().is_ident("derive")));
+				for f in &s.fields {
+					assert!(matches!(f.vis, syn::Visibility::Inherited));
+				}
+			}
+			syn::Item::Impl(i) => {
+				assert!(i.trait_.is_none(), "committed.rs: trait impl");
+				assert_eq!(quote_type(&i.self_ty), "CommittedSource2");
+				for it in &i.items {
+					if let syn::ImplItem::Fn(f) = it {
+						assert_eq!(f.sig.ident, "synthetic");
+						assert!(cfg_test(&f.attrs), "the only mint is test-only");
+						mints += 1;
+					}
+				}
+			}
+			syn::Item::Fn(f) if !cfg_test(&f.attrs) => {
+				if !matches!(f.vis, syn::Visibility::Inherited) {
+					assert!(root2_scoped(&f.vis), "{}", f.sig.ident);
+					entrypoints.push(f.sig.ident.to_string());
+				}
+				if f.sig.ident == "request_class" {
+					let syn::Stmt::Expr(syn::Expr::Match(m), _) = f.block.stmts.last().unwrap()
+					else {
+						panic!("request_class is one match");
+					};
+					assert!(
+						matches!(&*m.expr, syn::Expr::Path(p) if p.path.is_ident("request")),
+						"request_class matches its argument"
+					);
+					for arm in &m.arms {
+						assert!(arm.guard.is_none(), "no match guard");
+						assert!(
+							matches!(&*arm.body, syn::Expr::Path(p) if p.path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>() == ["EntryClass2", "NonRoot2"]),
+							"every request classifies NonRoot2"
+						);
+						collect(&arm.pat, &mut arms);
+					}
+					assert_eq!(f.block.stmts.len(), 1, "request_class is only the match");
+				}
+			}
+			syn::Item::Trait(_) | syn::Item::Static(_) | syn::Item::Mod(_) => {
+				panic!("committed.rs: unexpected item")
+			}
+			_ => {}
+		}
+	}
+	assert_eq!(entrypoints, ["committed_entry2"]);
+	assert_eq!(mints, 1);
+	// The declared variants of WendelonRequest, by name.
+	let core =
+		syn::parse_file(&fs::read_to_string(src.join("consensus/core.rs")).unwrap()).unwrap();
+	let mut declared: Vec<String> = core
+		.items
+		.iter()
+		.find_map(|i| match i {
+			syn::Item::Enum(e) if e.ident == "WendelonRequest" => {
+				Some(e.variants.iter().map(|v| v.ident.to_string()).collect())
+			}
+			_ => None,
+		})
+		.unwrap();
+	let mut listed = arms.clone();
+	listed.sort();
+	let before = listed.len();
+	listed.dedup();
+	assert_eq!(listed.len(), before, "a variant is listed twice");
+	declared.sort();
+	assert_eq!(
+		listed, declared,
+		"classification lists exactly the declared variants"
+	);
+	fn idents(tokens: proc_macro2::TokenStream, out: &mut Vec<String>) {
+		for t in tokens {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => out.push(id.to_string()),
+				proc_macro2::TokenTree::Group(g) => idents(g.stream(), out),
+				_ => {}
+			}
+		}
+	}
+	let mut production = Vec::new();
+	idents(without_test_items(text.parse().unwrap()), &mut production);
+	for banned in [
+		"fs",
+		"io",
+		"net",
+		"tokio",
+		"Instant",
+		"SystemTime",
+		"Root2",
+		"State2",
+		"Command2",
+		"TrustedEntry2",
+		"VerifiedCommand2",
+		"TrustedView2",
+		"fixture",
+	] {
+		assert!(
+			!production.iter().any(|w| w == banned),
+			"committed.rs: {banned}"
+		);
+	}
+	// No capability literal or factory call outside this module; nothing outside root2 names it.
+	fn files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+		for entry in fs::read_dir(dir).unwrap() {
+			let p = entry.unwrap().path();
+			if p.is_dir() {
+				files(&p, out);
+			} else if p.extension().is_some_and(|e| e == "rs") {
+				out.push(p);
+			}
+		}
+	}
+	let mut all = Vec::new();
+	files(&src, &mut all);
+	let tests = root.join("tests");
+	for file in all {
+		let t = fs::read_to_string(&file).unwrap();
+		let here = file == root.join("committed.rs");
+		let trust = file == root.join("trust.rs");
+		if !here && !file.starts_with(&tests) {
+			assert!(
+				!t.contains("from_source(") || trust,
+				"{}: calls from_source",
+				file.display()
+			);
+			assert!(
+				!t.contains("CommittedSource2 {"),
+				"{}: capability literal",
+				file.display()
+			);
+		}
+		if !file.starts_with(&root) {
+			assert!(
+				!t.contains("committed_entry2") && !t.contains("CommittedSource2"),
+				"{}",
+				file.display()
+			);
+		}
+	}
+	assert_eq!(text.matches("CommittedEntry2::from_source(").count(), 1);
 }

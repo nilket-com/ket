@@ -9791,8 +9791,22 @@ fn adr0094_write_cap_and_legacy_replay_have_one_authority() {
 			"src/consensus/raft_storage.rs",
 			"src/consensus/wal_body.rs",
 			"src/schema/ctas.rs",
+			"src/storage/mutation_visibility/root2/committed.rs",
 		],
-		"the WAL-v2 bridge may exist only in its type, decoder, and apply seams"
+		"the WAL-v2 bridge may exist only in its type, decoder, and apply seams; the only other \
+		 mention is the committed-entry adapter's exhaustive classification pattern"
+	);
+	// Classification-only exception (ADR0100 stage A0): one mention, as a match pattern. The
+	// mutation-visibility guard proves it sits inside `request_class` and yields NonRoot2.
+	let adapter =
+		fs::read_to_string(manifest_dir.join("src/storage/mutation_visibility/root2/committed.rs"))
+			.unwrap();
+	assert_eq!(adapter.matches("ReplayLegacyCtasRowDispatched").count(), 1);
+	assert_eq!(
+		adapter
+			.matches("WendelonRequest::ReplayLegacyCtasRowDispatched(_)")
+			.count(),
+		1
 	);
 	assert_eq!(
 		client

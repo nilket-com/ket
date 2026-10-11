@@ -1,5 +1,6 @@
 #[cfg(test)]
 use super::command::Command2;
+use super::committed::CommittedSource2;
 use super::entry_identity::EntryPosition2;
 use super::origin::EntryClass2;
 use super::types::*;
@@ -28,7 +29,8 @@ pub struct TrustedView2 {
 	index: u64,
 }
 /// Any committed entry, genesis (0,0,0) included, with its version-1 identity and producer
-/// classification. No decoder/public constructor: the committed-entry producer is held.
+/// classification. No decoder. Its one production factory requires a `CommittedSource2`, which
+/// no runtime code can mint; the committed-entry adapter is its only caller.
 pub struct CommittedEntry2 {
 	position: EntryPosition2,
 	identity: Digest2,
@@ -125,6 +127,19 @@ impl TrustedView2 {
 impl CommittedEntry2 {
 	pub(super) fn entry_fields(&self) -> (EntryPosition2, Digest2, EntryClass2) {
 		(self.position, self.identity, self.class)
+	}
+	/// Called only by `committed_entry2`, which derives every field from a real entry.
+	pub(super) fn from_source(
+		_: &CommittedSource2,
+		position: EntryPosition2,
+		identity: Digest2,
+		class: EntryClass2,
+	) -> Self {
+		Self {
+			position,
+			identity,
+			class,
+		}
 	}
 	#[cfg(test)]
 	pub(super) fn fixture(position: EntryPosition2, identity: Digest2, class: EntryClass2) -> Self {
