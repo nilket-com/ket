@@ -3057,7 +3057,220 @@ fn committed_prefix_check_is_pure_and_unwired() {
 				}
 			} else if p.extension().is_some_and(|x| x == "rs") && !p.ends_with("root2/prefix.rs") {
 				let t = fs::read_to_string(&p).unwrap();
+				// The dormant acquisition driver (S2a) is the one consumer; its own guard pins it
+				// to zero production callers.
+				if p.ends_with("root2/acquisition.rs") {
+					assert!(
+						t.contains("check_committed_prefix2"),
+						"acquisition uses the check"
+					);
+					continue;
+				}
 				for name in ["check_committed_prefix2", "PrefixError2", "prefix::"] {
+					assert!(
+						!t.contains(name),
+						"production caller of {name} in {}",
+						p.display()
+					);
+				}
+			}
+		}
+	}
+}
+
+// Committed-prefix acquisition (S2a): the exact item census of the reviewed contract; no mint,
+// adapter, trust token, authority state, reducer or origin entrypoint, spawn, filesystem or
+// network; the report is never a parameter; no caller outside its own module and the root2 tests.
+// Syntax only; #[cfg(test)] items are excluded from the surface.
+#[test]
+fn committed_prefix_acquisition_is_unminted_and_unwired() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let root = src.join("storage/mutation_visibility/root2");
+	let text = fs::read_to_string(root.join("acquisition.rs")).unwrap();
+	assert!(text.lines().count() <= 250);
+	fn forbidden(tokens: proc_macro2::TokenStream) -> Option<String> {
+		for t in tokens {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => {
+					let n = id.to_string();
+					if [
+						"CommittedSource2",
+						"committed_entry2",
+						"from_source",
+						"CommittedEntry2",
+						"TrustedEntry2",
+						"VerifiedCommand2",
+						"TrustedView2",
+						"MutationAuthorityState2",
+						"StateInner2",
+						"Root2",
+						"bootstrap2",
+						"install_admin2",
+						"advance_root2",
+						"advance_pre_root2",
+						"advance_cover2",
+						"advance_admission2",
+						"reduce",
+						"reduce_admission",
+						"authorized",
+						"spawn",
+						"fs",
+						"net",
+						"unsafe",
+					]
+					.contains(&n.as_str())
+					{
+						return Some(n);
+					}
+				}
+				proc_macro2::TokenTree::Group(g) => {
+					if let Some(n) = forbidden(g.stream()) {
+						return Some(n);
+					}
+				}
+				_ => {}
+			}
+		}
+		None
+	}
+	let surface = without_test_items_deep(text.parse().unwrap());
+	assert_eq!(
+		forbidden(surface.clone()),
+		None,
+		"acquisition.rs: prohibited token"
+	);
+	// No function's parameter list names the report.
+	fn report_parameter(tokens: proc_macro2::TokenStream) -> bool {
+		let flat: Vec<_> = tokens.into_iter().collect();
+		for (i, t) in flat.iter().enumerate() {
+			if let proc_macro2::TokenTree::Group(g) = t {
+				if g.delimiter() == proc_macro2::Delimiter::Parenthesis
+					&& i >= 2 && matches!(&flat[i - 2], proc_macro2::TokenTree::Ident(f) if f == "fn")
+					&& g.stream().to_string().contains("PrefixValidated2")
+				{
+					return true;
+				}
+				if report_parameter(g.stream()) {
+					return true;
+				}
+			}
+		}
+		false
+	}
+	assert!(!report_parameter(surface));
+	let file = syn::parse_file(&text).unwrap();
+	let cfg_test = |attrs: &[syn::Attribute]| {
+		attrs.iter().any(|a| {
+			a.path().is_ident("cfg")
+				&& matches!(&a.meta, syn::Meta::List(l) if l.tokens.to_string().contains("test"))
+		})
+	};
+	let (mut types, mut exported, mut private, mut impls) = (vec![], vec![], vec![], vec![]);
+	for item in &file.items {
+		match item {
+			syn::Item::Fn(f) if cfg_test(&f.attrs) => {}
+			syn::Item::Fn(f) if root2_scoped(&f.vis) => exported.push(f.sig.ident.to_string()),
+			syn::Item::Fn(f) => {
+				assert!(matches!(f.vis, syn::Visibility::Inherited));
+				private.push(f.sig.ident.to_string())
+			}
+			syn::Item::Struct(s) => {
+				assert!(root2_scoped(&s.vis));
+				types.push(s.ident.to_string())
+			}
+			syn::Item::Enum(e) => {
+				assert!(root2_scoped(&e.vis));
+				types.push(e.ident.to_string())
+			}
+			syn::Item::Trait(t) => {
+				assert!(root2_scoped(&t.vis) && t.supertraits.is_empty());
+				let mut methods: Vec<_> = t
+					.items
+					.iter()
+					.map(|i| match i {
+						syn::TraitItem::Fn(m) => {
+							assert!(m.default.is_none(), "no default methods");
+							m.sig.ident.to_string()
+						}
+						_ => panic!("acquisition.rs: trait items are methods only"),
+					})
+					.collect();
+				methods.sort();
+				assert_eq!(methods, ["applied", "retention"]);
+				types.push(t.ident.to_string())
+			}
+			syn::Item::Impl(i) => {
+				assert!(i.trait_.is_none(), "acquisition.rs: no trait impls");
+				let syn::Type::Path(p) = &*i.self_ty else {
+					panic!("impl target")
+				};
+				let mut fns: Vec<_> = i
+					.items
+					.iter()
+					.map(|x| match x {
+						syn::ImplItem::Fn(m) => m.sig.ident.to_string(),
+						_ => panic!("acquisition.rs: impl items are methods only"),
+					})
+					.collect();
+				fns.sort();
+				impls.push((p.path.segments.last().unwrap().ident.to_string(), fns));
+			}
+			syn::Item::Static(_) | syn::Item::Const(_) | syn::Item::Mod(_) => {
+				panic!("acquisition.rs: no statics, consts or modules")
+			}
+			_ => {}
+		}
+	}
+	types.sort();
+	private.sort();
+	assert_eq!(
+		types,
+		[
+			"AcquisitionCaps2",
+			"AcquisitionError2",
+			"AcquisitionSources2",
+			"FoldError2",
+			"PrefixValidated2",
+			"SourceClosed2"
+		]
+	);
+	assert_eq!(exported, ["acquire_committed_prefix2"]);
+	assert_eq!(private, ["add_bytes", "encoded_size", "next_range"]);
+	assert_eq!(
+		impls,
+		[(
+			"PrefixValidated2".to_string(),
+			vec![
+				"encoded_bytes".to_string(),
+				"entries".to_string(),
+				"through".to_string()
+			]
+		)]
+	);
+	// Dormant: nothing outside the module and the root2 tests names its surface.
+	let tests = root.join("tests");
+	let mut stack = vec![src];
+	while let Some(dir) = stack.pop() {
+		for e in fs::read_dir(dir).unwrap() {
+			let p = e.unwrap().path();
+			if p.is_dir() {
+				if p != tests {
+					stack.push(p);
+				}
+			} else if p.extension().is_some_and(|x| x == "rs")
+				&& !p.ends_with("root2/acquisition.rs")
+			{
+				let t = fs::read_to_string(&p).unwrap();
+				for name in [
+					"acquire_committed_prefix2",
+					"AcquisitionSources2",
+					"AcquisitionCaps2",
+					"AcquisitionError2",
+					"PrefixValidated2",
+					"FoldError2",
+					"SourceClosed2",
+					"acquisition::",
+				] {
 					assert!(
 						!t.contains(name),
 						"production caller of {name} in {}",
