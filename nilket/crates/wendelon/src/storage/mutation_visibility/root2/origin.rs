@@ -142,6 +142,24 @@ pub(in crate::storage::mutation_visibility::root2) fn root_and_origin2(
 		_ => None,
 	}
 }
+/// Read-only view of a state's kind and, before the root, its genesis identity. Not a constructor
+/// and not trust: it exposes nothing else of the private state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) enum OriginView2 {
+	Empty,
+	PreRoot { genesis: Digest2 },
+	Root,
+}
+redacted_debug!(OriginView2, "OriginView2");
+pub(in crate::storage::mutation_visibility::root2) fn origin_view2(
+	state: &MutationAuthorityState2,
+) -> OriginView2 {
+	match &state.inner {
+		StateInner2::Empty => OriginView2::Empty,
+		StateInner2::PreRoot(p) => OriginView2::PreRoot { genesis: p.genesis },
+		StateInner2::Root(..) => OriginView2::Root,
+	}
+}
 pub(in crate::storage::mutation_visibility::root2) fn empty_authority2() -> MutationAuthorityState2
 {
 	MutationAuthorityState2 {

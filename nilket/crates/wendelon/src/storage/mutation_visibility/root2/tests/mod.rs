@@ -22,6 +22,7 @@ mod restoration;
 mod review_regressions;
 mod root_profile;
 mod transitions;
+mod verification;
 
 mod support;
 use support::*;

@@ -45,6 +45,9 @@ mod stored;
 mod trust;
 mod types;
 mod validation;
+#[allow(dead_code)]
+// Dormant command verification (C); no production caller until reviewed integration.
+mod verification;
 
 pub use command::{ApplyResult2, Command2};
 pub use state::{Root2, UnverifiedRoot2};
