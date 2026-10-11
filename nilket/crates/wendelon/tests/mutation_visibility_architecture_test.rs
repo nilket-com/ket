@@ -209,6 +209,17 @@ fn s1_private_trust_tokens_and_fake_install_are_test_only() {
 							factories += 1;
 							assert!(test_only(&f.attrs));
 							assert!(!matches!(f.vis, syn::Visibility::Public(_)));
+						} else if f.sig.ident == "verified2" {
+							// Stage C: the one production VerifiedCommand2 constructor; its single
+							// call site is pinned by command_verification_is_single_site_and_unwired.
+							production_factories += 1;
+							assert!(!test_only(&f.attrs));
+							assert!(
+								matches!(&*i.self_ty, syn::Type::Path(p) if p.path.is_ident("VerifiedCommand2"))
+							);
+							assert!(
+								matches!(&f.vis, syn::Visibility::Restricted(r) if r.path.is_ident("super"))
+							);
 						} else if f.sig.ident == "from_source" {
 							// Stage A0: the one production factory, on CommittedEntry2 only, and
 							// only with the committed-source capability as its first parameter.
@@ -244,7 +255,7 @@ fn s1_private_trust_tokens_and_fake_install_are_test_only() {
 	// Fourth token: CommittedEntry2 (origin contract r4 E1), whose only factory is a test fixture.
 	assert_eq!(tokens, 4);
 	assert_eq!(factories, 6);
-	assert_eq!(production_factories, 1);
+	assert_eq!(production_factories, 2);
 	let state = syn::parse_file(&fs::read_to_string(root.join("state.rs")).unwrap()).unwrap();
 	let mut installs = 0;
 	for item in state.items {
@@ -1133,6 +1144,7 @@ fn origin_layer_builds_no_trusted_input_and_promotes_no_bytes() {
 			"empty_authority2",
 			"encode",
 			"encode_authority2",
+			"origin_view2",
 			"root_and_origin2"
 		]
 	);
@@ -2150,7 +2162,18 @@ fn admission_gate_call_graph_is_single_and_dormant() {
 		advance_calls +=
 			t.matches("advance_admission2(").count() - t.matches("fnadvance_admission2(").count();
 	}
-	assert_eq!((reduce_calls, advance_defs, advance_calls), (1, 1, 0));
+	// Stage C: advance_admission2's one production caller is advance_verified2, which is itself
+	// uncalled in production (pinned by command_verification_is_single_site_and_unwired).
+	assert_eq!((reduce_calls, advance_defs, advance_calls), (1, 1, 1));
+	let verification = without_test_items(
+		fs::read_to_string(root.join("verification.rs"))
+			.unwrap()
+			.parse()
+			.unwrap(),
+	)
+	.to_string()
+	.replace(' ', "");
+	assert_eq!(verification.matches("advance_admission2(").count(), 1);
 	// 7. The legacy reducer is untouched by the gate.
 	assert!(!reducer.contains("admission_registry") && !reducer.contains("reduce_admission"));
 	assert!(!reducer.contains("check_admin_statement2"));
@@ -3280,4 +3303,131 @@ fn committed_prefix_acquisition_is_unminted_and_unwired() {
 			}
 		}
 	}
+}
+
+// Stage C (narrow slice): one production VerifiedCommand2 constructor (`verified2`), called only
+// in `verify_command2`, which is private and called once, in `advance_verified2`; no other
+// production function returns a VerifiedCommand2 or builds one by literal; `advance_verified2` is
+// uncalled outside its module and the root2 tests; the module census is exact; no signing, I/O,
+// clock, network or spawn. Syntax checks, not compiler resolution or a general purity proof.
+#[test]
+fn command_verification_is_single_site_and_unwired() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let root = src.join("storage/mutation_visibility/root2");
+	let text = fs::read_to_string(root.join("verification.rs")).unwrap();
+	assert!(text.lines().count() <= 300);
+	let flat = without_test_items_deep(text.parse().unwrap())
+		.to_string()
+		.replace(' ', "");
+	for banned in [
+		"SigningKey",
+		"Signer",
+		"std::fs",
+		"std::io",
+		"std::net",
+		"tokio",
+		"spawn",
+		"Instant::now",
+		"SystemTime::now",
+		"unsafe",
+		"serde",
+		"fixture",
+		"CommittedSource2",
+	] {
+		assert!(!flat.contains(banned), "verification.rs: {banned}");
+	}
+	assert_eq!(
+		flat.matches("verify_command2(").count(),
+		2,
+		"definition + one call"
+	);
+	assert_eq!(flat.matches("fnverify_command2(").count(), 1);
+	let advance = fn_body(&text, "advance_verified2");
+	assert_eq!(calls(advance, "verify_command2"), 1);
+	let verify = fn_body(&text, "verify_command2");
+	assert_eq!(calls(verify, "VerifiedCommand2::verified2"), 1);
+	// The token reaches exactly one consumer per command, by reference.
+	for consumer in ["bootstrap2", "advance_admission2", "advance_root2"] {
+		assert_eq!(calls(advance, consumer), 1, "{consumer}");
+	}
+	assert_eq!(advance.matches("&token").count(), 3);
+	assert!(!advance.contains("token.clone") && !advance.contains("Ok(token"));
+	// Census.
+	let file = syn::parse_file(&text).unwrap();
+	let (mut types, mut exported, mut private) = (vec![], vec![], vec![]);
+	for item in &file.items {
+		match item {
+			syn::Item::Fn(f) if root2_scoped(&f.vis) => exported.push(f.sig.ident.to_string()),
+			syn::Item::Fn(f) => {
+				assert!(matches!(f.vis, syn::Visibility::Inherited));
+				private.push(f.sig.ident.to_string())
+			}
+			syn::Item::Enum(e) => {
+				assert!(root2_scoped(&e.vis));
+				types.push(e.ident.to_string())
+			}
+			syn::Item::Use(_) => {}
+			_ => panic!("verification.rs: only enums, functions and imports"),
+		}
+	}
+	types.sort();
+	private.sort();
+	assert_eq!(types, ["UnsupportedKind2", "VerifyError2"]);
+	assert_eq!(exported, ["advance_verified2"]);
+	assert_eq!(
+		private,
+		[
+			"bootstrap_authorized",
+			"finalize_authorized",
+			"kind",
+			"reserve_authorized",
+			"statement_authorized",
+			"verify_command2"
+		]
+	);
+	// Production-wide: one verified2 call (in verification.rs), VerifiedCommand2 literals only in
+	// trust.rs, no other function returning VerifiedCommand2, no caller of advance_verified2.
+	let tests = root.join("tests");
+	let mut stack = vec![src];
+	let (mut verified2_calls, mut returns) = (0, 0);
+	while let Some(dir) = stack.pop() {
+		for e in fs::read_dir(dir).unwrap() {
+			let p = e.unwrap().path();
+			if p.is_dir() {
+				if p != tests && !p.ends_with("tests") {
+					stack.push(p);
+				}
+				continue;
+			}
+			if p.extension().is_none_or(|x| x != "rs") || p.ends_with("tests.rs") {
+				continue;
+			}
+			let t = without_test_items_deep(fs::read_to_string(&p).unwrap().parse().unwrap())
+				.to_string()
+				.replace(' ', "");
+			verified2_calls += t.matches("::verified2(").count();
+			returns += t.matches("->VerifiedCommand2").count()
+				+ t.matches("->Result<VerifiedCommand2").count()
+				+ t.matches("->Result2<VerifiedCommand2").count();
+			if !p.ends_with("root2/trust.rs") {
+				assert!(
+					!t.contains("VerifiedCommand2{"),
+					"VerifiedCommand2 literal in {}",
+					p.display()
+				);
+			}
+			if !p.ends_with("root2/verification.rs") {
+				assert!(
+					!t.contains("advance_verified2(") && !t.contains("root2::verification"),
+					"production caller of C in {}",
+					p.display()
+				);
+			}
+		}
+	}
+	assert_eq!(verified2_calls, 1);
+	assert_eq!(
+		returns, 1,
+		"only verify_command2 returns a VerifiedCommand2"
+	);
 }

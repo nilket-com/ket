@@ -80,6 +80,25 @@ impl VerifiedCommand2 {
 	pub(super) fn evidence(&self) -> u8 {
 		self.evidence
 	}
+	/// The one production constructor, called only by `verification::verify_command2` (guarded).
+	/// Its arguments are that function's verdict, not an independently supported API.
+	pub(super) fn verified2(
+		generation: [u8; 16],
+		cluster: [u8; 16],
+		command: Digest2,
+		authorized: bool,
+		historical: Option<Digest2>,
+		evidence: u8,
+	) -> Self {
+		Self {
+			generation,
+			cluster,
+			command,
+			authorized,
+			historical,
+			evidence,
+		}
+	}
 	/// Applied trace only, not a signature-only historical grant oracle.
 	#[cfg(test)]
 	pub(super) fn fixture(
