@@ -305,6 +305,61 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_root2(
 	))
 }
 
+/// A committed class that carries a Root2 command, so it belongs to the authenticated command
+/// path and never to coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) enum EntryClass2Kind {
+	Bootstrap,
+	OtherRoot2,
+}
+/// Why a committed entry does not advance coverage of a rooted state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) enum CoverError2 {
+	/// The state has no root yet: entries before the Bootstrap are scanned, not covered.
+	NotRooted,
+	/// A Root2 command class: not coverage.
+	NotCoverable(EntryClass2Kind),
+	/// A Root2 envelope that does not decode, after the root: terminal, never skipped.
+	MalformedAfterRoot,
+	Root(RootError2),
+}
+/// Coverage after the root, derived entirely from one genuine committed entry: its position,
+/// version-1 identity and class. The caller supplies no command, digest, fingerprint or
+/// authorization. Blank, Membership and non-Root2 entries cover with kinds 0, 1 and 2.
+pub(in crate::storage::mutation_visibility::root2) fn advance_cover2(
+	state: &MutationAuthorityState2,
+	entry: &CommittedEntry2,
+) -> Result<(MutationAuthorityState2, ApplyResult2), CoverError2> {
+	let StateInner2::Root(root, origin) = &state.inner else {
+		return Err(CoverError2::NotRooted);
+	};
+	let (position, identity, class) = entry.entry_fields();
+	let kind = match class {
+		EntryClass2::Blank => 0,
+		EntryClass2::Membership => 1,
+		EntryClass2::NonRoot2 => 2,
+		EntryClass2::Bootstrap(_) => {
+			return Err(CoverError2::NotCoverable(EntryClass2Kind::Bootstrap));
+		}
+		EntryClass2::OtherRoot2(_) => {
+			return Err(CoverError2::NotCoverable(EntryClass2Kind::OtherRoot2));
+		}
+		EntryClass2::MalformedRoot2 => return Err(CoverError2::MalformedAfterRoot),
+	};
+	let log = Log2 {
+		term: position.term,
+		node: position.node,
+		index: position.index,
+	};
+	let (next, result) = Root2::cover(root, log, identity, kind).map_err(CoverError2::Root)?;
+	Ok((
+		MutationAuthorityState2 {
+			inner: StateInner2::Root(Box::new(next), *origin),
+		},
+		result,
+	))
+}
+
 /// The one gated path for an Admission permission command: install the administrator from this
 /// pre-entry state (a missing or mismatched prerequisite consumes nothing), then reduce under it
 /// and keep the origin unchanged. No production caller until reviewed integration.
@@ -533,5 +588,26 @@ pub(super) fn lower_limits_for_test(
 	};
 	MutationAuthorityState2 {
 		inner: StateInner2::Root(Box::new((**root).clone().lower_limits(limits)), *origin),
+	}
+}
+/// Test-only: the same rooted state with its root's coverage tip (covered, fingerprint, command
+/// digest) replaced; origin, limits, registries and derived caches unchanged. Normalises the
+/// coverage no-effects comparison, and places a synthetic tip no feasible history reaches.
+#[cfg(test)]
+pub(super) fn with_tip_for_test(
+	state: &MutationAuthorityState2,
+	covered: Log2,
+	fingerprint: Digest2,
+	command_digest: Digest2,
+) -> MutationAuthorityState2 {
+	let StateInner2::Root(root, origin) = &state.inner else {
+		panic!("rooted state required")
+	};
+	let mut root = (**root).clone();
+	root.state.covered = covered;
+	root.state.fingerprint = fingerprint;
+	root.state.command_digest = command_digest;
+	MutationAuthorityState2 {
+		inner: StateInner2::Root(Box::new(root), *origin),
 	}
 }

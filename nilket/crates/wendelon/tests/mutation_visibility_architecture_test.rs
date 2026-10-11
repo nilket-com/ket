@@ -1124,6 +1124,7 @@ fn origin_layer_builds_no_trusted_input_and_promotes_no_bytes() {
 		entrypoints,
 		[
 			"advance_admission2",
+			"advance_cover2",
 			"advance_pre_root2",
 			"advance_root2",
 			"bootstrap2",
@@ -2053,7 +2054,7 @@ fn admission_dispatch_fails_closed() {
 	let replay = reducer.find("if l.index == s.covered.index {").unwrap();
 	let gap = reducer.find("LineageGap").unwrap();
 	let authorized = reducer
-		.find("let mut result = if verified.authorized()")
+		.find("let result = if verified.authorized()")
 		.unwrap();
 	assert!(gate < replay && gate < gap && gate < authorized);
 	for (at, _) in reducer.match_indices("Command2::AdmissionPermission") {
@@ -2707,4 +2708,249 @@ fn committed_adapter_is_pure_capability_gated_and_exhaustive() {
 		}
 	}
 	assert_eq!(text.matches("CommittedEntry2::from_source(").count(), 1);
+}
+
+// Post-root coverage (A1): derived from one genuine committed entry, and unable to authorize.
+// Syntax over origin.rs and reducer.rs outside cfg(test); not name resolution.
+#[test]
+fn post_root_coverage_is_derived_and_cannot_authorize() {
+	let root =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
+	let origin = without_test_items(
+		fs::read_to_string(root.join("origin.rs"))
+			.unwrap()
+			.parse()
+			.unwrap(),
+	)
+	.to_string();
+	let reducer = without_test_items(
+		fs::read_to_string(root.join("reducer.rs"))
+			.unwrap()
+			.parse()
+			.unwrap(),
+	)
+	.to_string();
+	// The entrypoint takes exactly the state and a committed entry, nothing caller-supplied.
+	let signature = origin
+		.split("fn advance_cover2 (")
+		.nth(1)
+		.expect("advance_cover2 present")
+		.split(") ->")
+		.next()
+		.unwrap()
+		.replace(' ', "");
+	assert_eq!(
+		signature.trim_end_matches(','),
+		"state:&MutationAuthorityState2,entry:&CommittedEntry2"
+	);
+	let advance = fn_body(&origin, "advance_cover2 ");
+	// Every class named once, no wildcard, and the malformed class fails closed.
+	for class in [
+		"EntryClass2 :: Blank",
+		"EntryClass2 :: Membership",
+		"EntryClass2 :: NonRoot2",
+		"EntryClass2 :: Bootstrap",
+		"EntryClass2 :: OtherRoot2",
+		"EntryClass2 :: MalformedRoot2",
+	] {
+		assert_eq!(advance.matches(class).count(), 1, "{class}");
+	}
+	assert!(!advance.contains("_ =>"), "no wildcard over the class");
+	assert!(
+		advance.contains(
+			"EntryClass2 :: MalformedRoot2 => return Err (CoverError2 :: MalformedAfterRoot)"
+		),
+		"MalformedRoot2 fails closed"
+	);
+	let cover = fn_body(&reducer, "cover ");
+	for body in [advance, cover] {
+		for token in [
+			"VerifiedCommand2",
+			"TrustedEntry2",
+			"TrustedView2",
+			"apply (",
+			"authorized",
+			"Root2 {",
+		] {
+			assert!(!body.contains(token), "coverage must not use `{token}`");
+		}
+	}
+	assert!(cover.contains("Command2 :: Cover { kind , external : fp }"));
+	assert!(cover.contains("finish_step ("));
+	// One caller of cover; finish_step shared by exactly reduce and cover.
+	assert_eq!(calls(&origin, "Root2 :: cover "), 1);
+	assert_eq!(calls(&reducer, "finish_step "), 2);
+	assert!(fn_body(&reducer, "reduce ").contains("finish_step ("));
+	// Outside the codec, the one Cover construction (not a `{ .. }` pattern) is in cover.
+	let mut constructions = Vec::new();
+	visit_root2_sources(&root, &mut |path, text| {
+		if path.ends_with("command.rs") {
+			return;
+		}
+		let tokens = without_test_items(text.parse().unwrap()).to_string();
+		for (i, _) in tokens.match_indices("Command2 :: Cover {") {
+			if !tokens[i..].starts_with("Command2 :: Cover { .. }") {
+				constructions.push(path.file_name().unwrap().to_string_lossy().to_string());
+			}
+		}
+	});
+	assert_eq!(constructions, ["reducer.rs"]);
+}
+
+// The capacity invariant behind coverage (A1 r2 §3): every non-test Root2 comes from the
+// bootstrap literal or from a reviewed step that re-checks capacity. This pins that census.
+#[test]
+fn root2_constructors_preserve_capacity_invariant() {
+	let root =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
+	let mut literals = Vec::new();
+	let mut limit_writers = Vec::new();
+	let mut producers = Vec::new();
+	visit_root2_sources(&root, &mut |path, text| {
+		let name = path.file_name().unwrap().to_string_lossy().to_string();
+		let tokens = without_test_items_deep(text.parse().unwrap());
+		let flat: Vec<_> = flatten(tokens.clone());
+		for (i, t) in flat.iter().enumerate() {
+			if let proc_macro2::TokenTree::Ident(id) = t {
+				let before = i.checked_sub(1).and_then(|j| flat.get(j));
+				let after = flat.get(i + 1);
+				let definition = matches!(before, Some(proc_macro2::TokenTree::Ident(b)) if ["struct", "impl", "for"].contains(&b.to_string().as_str()));
+				if id == "Root2"
+					&& !definition && matches!(after, Some(proc_macro2::TokenTree::Group(g)) if g.delimiter() == proc_macro2::Delimiter::Brace)
+				{
+					literals.push(name.clone());
+				}
+			}
+		}
+		let text = tokens.to_string();
+		limit_writers.extend(
+			text.matches("limits : Limits2 :: default ()")
+				.map(|_| format!("{name}: initializer")),
+		);
+		limit_writers.extend(
+			text.matches(". limits =")
+				.map(|_| format!("{name}: assignment")),
+		);
+		producers.extend(owned_root2_producers(tokens));
+	});
+	assert_eq!(literals, ["reducer.rs"], "the bootstrap literal only");
+	assert_eq!(
+		limit_writers,
+		["reducer.rs: initializer"],
+		"default limits only"
+	);
+	producers.sort();
+	assert_eq!(
+		producers,
+		[
+			"bootstrap_root",
+			"cover",
+			"finish_step",
+			"reduce",
+			"reduce_admission"
+		],
+		"every non-test producer of an owned Root2 re-checks capacity or is the bootstrap"
+	);
+}
+fn visit_root2_sources(root: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
+	for entry in fs::read_dir(root).unwrap() {
+		let path = entry.unwrap().path();
+		if path.is_dir() {
+			if path.file_name().unwrap() != "tests" {
+				visit_root2_sources(&path, f);
+			}
+		} else if path.extension().is_some_and(|e| e == "rs")
+			&& path.file_name().unwrap() != "tests.rs"
+		{
+			f(&path, &fs::read_to_string(&path).unwrap());
+		}
+	}
+}
+fn flatten(tokens: proc_macro2::TokenStream) -> Vec<proc_macro2::TokenTree> {
+	let mut out = Vec::new();
+	for t in tokens {
+		if let proc_macro2::TokenTree::Group(g) = &t {
+			out.push(t.clone());
+			out.extend(flatten(g.stream()));
+		} else {
+			out.push(t);
+		}
+	}
+	out
+}
+// Names of functions whose return type holds an owned `Root2` (not `&Root2`): `fn name (..) ->`
+// up to the body or `where`, at any nesting depth.
+fn owned_root2_producers(tokens: proc_macro2::TokenStream) -> Vec<String> {
+	let ts: Vec<_> = tokens.into_iter().collect();
+	let mut out = Vec::new();
+	for (i, t) in ts.iter().enumerate() {
+		if let proc_macro2::TokenTree::Group(g) = t {
+			out.extend(owned_root2_producers(g.stream()));
+		}
+		let is_fn = matches!(t, proc_macro2::TokenTree::Ident(id) if id == "fn");
+		let (Some(proc_macro2::TokenTree::Ident(name)), Some(proc_macro2::TokenTree::Group(args))) =
+			(ts.get(i + 1), ts.get(i + 2))
+		else {
+			continue;
+		};
+		if !is_fn || args.delimiter() != proc_macro2::Delimiter::Parenthesis {
+			continue;
+		}
+		let arrow = matches!(ts.get(i + 3), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '-')
+			&& matches!(ts.get(i + 4), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '>');
+		if !arrow {
+			continue;
+		}
+		let ret: Vec<_> = ts[i + 5..]
+			.iter()
+			.take_while(|t| {
+				!matches!(t, proc_macro2::TokenTree::Group(g) if g.delimiter() == proc_macro2::Delimiter::Brace)
+					&& !matches!(t, proc_macro2::TokenTree::Ident(id) if id == "where")
+			})
+			.cloned()
+			.collect();
+		let flat = flatten(ret.into_iter().collect());
+		let owned = flat.iter().enumerate().any(|(j, t)| {
+			matches!(t, proc_macro2::TokenTree::Ident(id) if id == "Root2")
+				&& !matches!(j.checked_sub(1).and_then(|k| flat.get(k)), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '&')
+		});
+		if owned {
+			out.push(name.to_string());
+		}
+	}
+	out
+}
+// Every `#[cfg(test)]` item removed at every nesting depth (a test method inside an impl block
+// too). An item ends at its body group or at `;`, so a bodiless test item never hides the next.
+fn without_test_items_deep(tokens: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+	let ts: Vec<_> = tokens.into_iter().collect();
+	let mut out = Vec::new();
+	let mut i = 0;
+	while i < ts.len() {
+		let cfg_test = matches!(&ts[i], proc_macro2::TokenTree::Punct(p) if p.as_char() == '#')
+			&& matches!(ts.get(i + 1), Some(proc_macro2::TokenTree::Group(g)) if g.delimiter() == proc_macro2::Delimiter::Bracket && g.stream().to_string().replace(' ', "") == "cfg(test)");
+		if cfg_test {
+			i += 2;
+			while i < ts.len() {
+				let end = matches!(&ts[i], proc_macro2::TokenTree::Group(g) if g.delimiter() == proc_macro2::Delimiter::Brace)
+					|| matches!(&ts[i], proc_macro2::TokenTree::Punct(p) if p.as_char() == ';');
+				i += 1;
+				if end {
+					break;
+				}
+			}
+			continue;
+		}
+		out.push(match &ts[i] {
+			proc_macro2::TokenTree::Group(g) => {
+				let mut inner =
+					proc_macro2::Group::new(g.delimiter(), without_test_items_deep(g.stream()));
+				inner.set_span(g.span());
+				proc_macro2::TokenTree::Group(inner)
+			}
+			other => other.clone(),
+		});
+		i += 1;
+	}
+	out.into_iter().collect()
 }

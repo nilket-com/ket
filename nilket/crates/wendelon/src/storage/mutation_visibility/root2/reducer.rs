@@ -90,28 +90,79 @@ impl Root2 {
 		}
 		// Immutable path-copy candidate: prior roots and payloads remain unchanged.
 		let mut next = old.clone();
-		let mut result = if verified.authorized() {
+		let result = if verified.authorized() {
 			apply(&mut next, command, l, verified)?
 		} else {
 			denied(8, None)
 		};
-		next.state.covered = l;
-		next.state.fingerprint = fp;
-		next.state.command_digest = d;
-		match update(s, &mut next.state, command) {
-			Ok(()) => {}
-			Err(RootError2::Limit) => {
-				next = old.clone();
-				next.state.covered = l;
-				next.state.fingerprint = fp;
-				next.state.command_digest = d;
-				result = denied(11, None);
-			}
-			Err(e) => return Err(e),
-		}
-		cached_capacity(&next.state, next.limits)?;
-		Ok((next, result))
+		finish_step(old, next, result, l, fp, d, command)
 	}
+
+	/// Coverage of one committed entry that carries no Root2 command (Blank, Membership or a
+	/// non-Root2 request), after the root. `l`, `fp` and `kind` come from that entry; the command
+	/// and its digest are derived here, under this root's generation and cluster. There is no
+	/// verified command and no `apply`, so coverage cannot reach any effect: it only advances the
+	/// tip, through the same checks, update and capacity as `reduce`, in the same order.
+	#[allow(dead_code)] // Dormant: reached only through advance_cover2; no production caller yet.
+	pub(super) fn cover(
+		root: &Root2,
+		l: Log2,
+		fp: Digest2,
+		kind: u8,
+	) -> Result2<(Root2, ApplyResult2)> {
+		valid_log(l)?;
+		let s = &root.state;
+		let command = Command2::Cover { kind, external: fp };
+		let d = command.digest(s.generation, s.cluster)?;
+		if l.index == s.covered.index {
+			if (l, fp, d) != (s.covered, s.fingerprint, s.command_digest) {
+				return Err(RootError2::TrustMismatch);
+			}
+			return Ok((root.clone(), ApplyResult2::AlreadyProcessed));
+		}
+		if s.covered.index.checked_add(1) != Some(l.index) {
+			return Err(RootError2::LineageGap);
+		}
+		finish_step(
+			root,
+			root.clone(),
+			ApplyResult2::Covered,
+			l,
+			fp,
+			d,
+			&command,
+		)
+	}
+}
+
+/// The end of one rooted step, shared by `reduce` and `cover` in this order: set the tip, update
+/// the derived state (on `Limit`, keep the old state with the new tip and deny with reason 11),
+/// then check this root's own capacity.
+fn finish_step(
+	old: &Root2,
+	mut next: Root2,
+	mut result: ApplyResult2,
+	l: Log2,
+	fp: Digest2,
+	d: Digest2,
+	command: &Command2,
+) -> Result2<(Root2, ApplyResult2)> {
+	next.state.covered = l;
+	next.state.fingerprint = fp;
+	next.state.command_digest = d;
+	match update(&old.state, &mut next.state, command) {
+		Ok(()) => {}
+		Err(RootError2::Limit) => {
+			next = old.clone();
+			next.state.covered = l;
+			next.state.fingerprint = fp;
+			next.state.command_digest = d;
+			result = denied(11, None);
+		}
+		Err(e) => return Err(e),
+	}
+	cached_capacity(&next.state, next.limits)?;
+	Ok((next, result))
 }
 fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Result2<ApplyResult2> {
 	let s = &mut root.state;

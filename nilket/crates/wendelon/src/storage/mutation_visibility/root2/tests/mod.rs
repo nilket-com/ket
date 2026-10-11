@@ -7,6 +7,7 @@ mod admission_gate;
 mod admission_registry;
 mod admission_reserve;
 mod committed;
+mod cover;
 mod entry_identity;
 mod g1c_roundtrip;
 mod goldens;
