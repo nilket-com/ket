@@ -327,6 +327,16 @@ struct WALReplay {
 	checkpoint: Option<RecoveryCheckpoint>,
 	wal_segments: Vec<WalSegmentMeta>,
 	last_segment_needs_truncate: bool,
+	/// Each segment holding no log entry, by path. Read only by open-time completion.
+	checkpoint_only_holders: BTreeMap<PathBuf, CheckpointOnlyHolder>,
+}
+
+/// A segment with no log entry: how many checkpoint records it holds, and the exact bytes of its
+/// last complete record, validated by replay (header, version, checksum, body shape).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CheckpointOnlyHolder {
+	records: usize,
+	last_record: Vec<u8>,
 }
 
 // ============================================================
@@ -379,6 +389,26 @@ struct LogStoreInner {
 	wal_segment_bytes: u64,
 	/// Durable vote artifact, if this is not the in-memory test store.
 	vote_file: Option<FileHandle>,
+	/// Set after any WAL mutation fails once it may have had an on-disk effect. While set, every
+	/// WAL mutator refuses without I/O; only a reopen, which rebuilds state from disk, clears it.
+	poisoned: Option<WalPoison>,
+}
+
+/// Which WAL operation and step left the store with uncertain on-disk state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WalPoison {
+	op: &'static str,
+	step: &'static str,
+}
+
+/// Truncate(k), resolved before any effect: r (the greatest retained entry below k) and its
+/// record, the next index after the cut, the current tail's next index, and C′.
+struct TruncatePlan {
+	retained: Option<LogId<u32>>,
+	retained_position: Option<(u64, WalRecordPointer)>,
+	next: u64,
+	tail_next: u64,
+	checkpoint: Option<CheckpointPage>,
 }
 
 /// Durable log + vote for the Control Ring.
@@ -423,6 +453,7 @@ impl WendelonLogStore {
 				entry_positions: BTreeMap::new(),
 				wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
 				vote_file: None,
+				poisoned: None,
 			})),
 			wal_gate: Arc::new(Mutex::new(())),
 			retention: None,
@@ -561,6 +592,7 @@ impl WendelonLogStore {
 		let vote = load_vote_state(file_ops.as_ref(), vote_path).await?;
 		let snapshot = load_snapshot_artifact(file_ops.as_ref(), snapshot_path).await?;
 		let replay = replay_wal(file_ops.as_ref(), wal_path, snapshot.as_ref()).await?;
+		let mut replay = replay;
 		let recovery_committed =
 			resolve_recovered_committed(snapshot.as_ref(), &replay.entries, replay.checkpoint)?;
 		let history = if full {
@@ -581,6 +613,14 @@ impl WendelonLogStore {
 		if let Some(guard) = &retention {
 			guard.record_history(history);
 		}
+		// The first effect of open, after every read-only refusal above.
+		complete_checkpoint_holder_at_open(
+			file_ops.as_ref(),
+			wal_path,
+			snapshot.as_ref(),
+			&mut replay,
+		)
+		.await?;
 		let wal_file = if replay.last_segment_needs_truncate {
 			let last = replay.wal_segments.last().ok_or_else(|| {
 				Error::new(
@@ -625,6 +665,7 @@ impl WendelonLogStore {
 				wal_cursor,
 				wal_segment_bytes: options.segment_bytes,
 				vote_file: Some(vote_file),
+				poisoned: None,
 			})),
 			wal_gate: Arc::new(Mutex::new(())),
 			retention,
@@ -664,6 +705,68 @@ impl WendelonLogStore {
 		self.inner.read().await.recovery_checkpoint
 	}
 
+	/// `poison`, mapped to the storage error a Raft log mutator returns.
+	async fn poisoned_storage(
+		&self,
+		op: &'static str,
+		step: &'static str,
+		error: Error,
+	) -> StorageError<u32> {
+		let error = self.poison(op, step, error).await;
+		StorageIOError::write_logs(AnyError::new(&error)).into()
+	}
+
+	/// Truncate step 3: shrinks the retained segment R in place to `new_len`, the end of r's
+	/// record, through a handle opened on its current path, then syncs it. Callers hold
+	/// `wal_gate`; any failure poisons.
+	async fn shrink_retained(
+		&self,
+		file_ops: &dyn AsyncFileOps,
+		segment: &WalSegmentMeta,
+		new_len: u64,
+	) -> Result<FileHandle, StorageError<u32>> {
+		let handle = match open_existing_wal_segment(file_ops, &segment.path).await {
+			Ok(handle) => handle,
+			Err(e) => return Err(self.poisoned_storage("truncate", "reopen", e).await),
+		};
+		if let Err(e) = file_ops.set_len(&handle, new_len).await {
+			return Err(self.poisoned_storage("truncate", "set-len", e).await);
+		}
+		if let Err(e) = file_ops.fsync(&handle).await {
+			return Err(self.poisoned_storage("truncate", "fsync", e).await);
+		}
+		Ok(handle)
+	}
+
+	/// Publishes a durable truncate at `k`: only retained entries and positions remain, and the
+	/// tail is r, else the purge boundary.
+	async fn publish_truncate(
+		&self,
+		k: u64,
+		retained: Option<LogId<u32>>,
+		wal_segments: Vec<WalSegmentMeta>,
+		wal_file: Option<FileHandle>,
+		wal_cursor: u64,
+	) {
+		let mut guard = self.inner.write().await;
+		guard.entries.retain(|&idx, _| idx < k);
+		guard.entry_positions.retain(|&idx, _| idx < k);
+		guard.wal_segments = wal_segments;
+		guard.wal_file = wal_file;
+		guard.wal_cursor = wal_cursor;
+		guard.last_log_id = retained.or(guard.last_purged);
+	}
+
+	/// Latches the poison (first cause wins) and returns `error`. Callers hold `wal_gate`.
+	async fn poison(&self, op: &'static str, step: &'static str, error: Error) -> Error {
+		self.inner
+			.write()
+			.await
+			.poisoned
+			.get_or_insert(WalPoison { op, step });
+		error
+	}
+
 	async fn write_recovery_checkpoint(
 		&self,
 		observation: CheckpointObservation,
@@ -671,6 +774,15 @@ impl WendelonLogStore {
 		let Some(last_log_id) = observation.last_log_id else {
 			return Ok(());
 		};
+		if observation.checkpoint.commit_index != last_log_id.index {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"checkpoint observation commits {} but names log index {}",
+					observation.checkpoint.commit_index, last_log_id.index
+				),
+			));
+		}
 		let _gate = self.wal_gate.lock().await;
 		let (
 			file_ops,
@@ -680,8 +792,54 @@ impl WendelonLogStore {
 			mut wal_cursor,
 			segment_bytes,
 			current_checkpoint,
+			next_checkpoint,
+			pointer,
+			tail_next,
 		) = {
 			let guard = self.inner.read().await;
+			if let Some(poison) = guard.poisoned {
+				return Err(poisoned_error(poison));
+			}
+			let current = guard.recovery_checkpoint.unwrap_or_default();
+			let next = RecoveryCheckpoint {
+				commit_index: observation
+					.checkpoint
+					.commit_index
+					.max(current.commit_index),
+				e_safe_index: if observation.checkpoint.commit_index > current.commit_index {
+					observation.checkpoint.e_safe_index
+				} else {
+					observation
+						.checkpoint
+						.e_safe_index
+						.max(current.e_safe_index)
+				},
+			};
+			if next.e_safe_index > next.commit_index {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"checkpoint e_safe {} exceeds its commit {}",
+						next.e_safe_index, next.commit_index
+					),
+				));
+			}
+			let pointer = resolve_committed_pointer(
+				next.commit_index,
+				&[
+					Some(last_log_id),
+					guard.recovery_committed,
+					guard
+						.entries
+						.get(&next.commit_index)
+						.map(|entry| entry.log_id),
+					guard.last_purged,
+					guard
+						.recovered_snapshot
+						.as_ref()
+						.and_then(|snapshot| snapshot.last_included),
+				],
+			)?;
 			(
 				guard.file_ops.clone(),
 				guard.artifact_paths.clone(),
@@ -689,34 +847,22 @@ impl WendelonLogStore {
 				guard.wal_file.clone(),
 				guard.wal_cursor,
 				guard.wal_segment_bytes,
-				guard.recovery_checkpoint,
+				current,
+				next,
+				pointer,
+				physical_tail_next(guard.last_log_id, guard.last_purged),
 			)
-		};
-		let current_checkpoint = current_checkpoint.unwrap_or_default();
-		let next_checkpoint = RecoveryCheckpoint {
-			commit_index: observation
-				.checkpoint
-				.commit_index
-				.max(current_checkpoint.commit_index),
-			e_safe_index: if observation.checkpoint.commit_index > current_checkpoint.commit_index {
-				observation.checkpoint.e_safe_index
-			} else {
-				observation
-					.checkpoint
-					.e_safe_index
-					.max(current_checkpoint.e_safe_index)
-			},
 		};
 		if next_checkpoint == current_checkpoint {
 			let mut guard = self.inner.write().await;
-			guard.recovery_committed = Some(last_log_id);
+			guard.recovery_committed = Some(pointer);
 			return Ok(());
 		}
 		let page = serialize_checkpoint_page(
 			next_checkpoint.commit_index,
 			next_checkpoint.e_safe_index,
-			last_log_id.index,
-			last_log_id.leader_id.term,
+			pointer.index,
+			pointer.leader_id.term,
 		);
 		let file_ops = file_ops.ok_or_else(|| {
 			Error::new(
@@ -740,54 +886,104 @@ impl WendelonLogStore {
 				),
 			));
 		}
-		if wal_file.is_none() || wal_cursor + page.len() as u64 > segment_bytes {
-			let active_is_checkpoint_only = wal_segments
-				.last()
-				.map(|segment| segment.end_log_index.is_none())
-				.unwrap_or(false);
-			if active_is_checkpoint_only {
-				let active_handle = wal_file
-					.clone()
-					.expect("checkpoint-only segment must have an active handle");
-				file_ops.set_len(&active_handle, 0).await?;
-				wal_cursor = 0;
-				if let Some(active_segment) = wal_segments.last_mut() {
-					active_segment.len_bytes = 0;
+		let tail_next = tail_next?;
+		if let Err(e) = check_segment_identities(&wal_segments) {
+			return Err(self.poison("checkpoint", "segment-invariant", e).await);
+		}
+		let page_len = page.len() as u64;
+		let mut page = Some(page);
+		let needs_rotation = wal_file.is_none()
+			|| wal_cursor
+				.checked_add(page_len)
+				.is_none_or(|end| end > segment_bytes);
+		let mut published = false;
+		if needs_rotation {
+			let reuse = match wal_segments.last() {
+				Some(last) if last.end_log_index.is_none() => {
+					if last.start_index != tail_next {
+						let e = Error::new(
+							ErrorKind::InvalidData,
+							format!(
+								"checkpoint-only active segment starts at {} but the WAL tail continues at {}",
+								last.start_index, tail_next
+							),
+						);
+						return Err(self.poison("checkpoint", "active-name", e).await);
+					}
+					Some(last.clone())
 				}
+				_ => None,
+			};
+			if let Some(last) = reuse {
+				let (handle, len) = match replace_checkpoint_only_segment(
+					file_ops.as_ref(),
+					&artifact_paths.wal,
+					&last,
+					vec![page.take().expect("checkpoint page")],
+				)
+				.await
+				{
+					Ok(replaced) => replaced,
+					Err(e) => return Err(self.poison("checkpoint", "replace", e).await),
+				};
+				let active = wal_segments.last_mut().expect("checkpoint-only segment");
+				active.len_bytes = len;
+				wal_file = Some(handle);
+				wal_cursor = len;
 			} else {
-				let next_log_index = last_log_id.index.saturating_add(1);
-				let (segment_path, segment_handle) =
-					create_wal_segment(file_ops.as_ref(), &artifact_paths.wal, next_log_index)
-						.await?;
+				// A complete holder: the page is synced before the name exists.
+				let (segment_path, segment_handle, len) = match create_wal_holder(
+					file_ops.as_ref(),
+					&artifact_paths.wal,
+					tail_next,
+					vec![page.take().expect("checkpoint page")],
+				)
+				.await
+				{
+					Ok(created) => created,
+					Err(e) => return Err(self.poison("checkpoint", "create-holder", e).await),
+				};
 				wal_segments.push(WalSegmentMeta {
 					path: segment_path,
-					start_index: next_log_index,
+					start_index: tail_next,
 					end_log_index: None,
-					len_bytes: 0,
+					len_bytes: len,
 				});
 				wal_file = Some(segment_handle);
-				wal_cursor = 0;
+				wal_cursor = len;
+			}
+			published = true;
+		}
+		if let Some(page) = page.filter(|_| !published) {
+			let active_handle = wal_file.clone().expect("active wal segment handle");
+			let expected_len = page.len();
+			let written = match file_ops.write_at(&active_handle, wal_cursor, page).await {
+				Ok((written, _page)) => written,
+				Err(e) => return Err(self.poison("checkpoint", "write", e).await),
+			};
+			if written != expected_len {
+				let e = Error::new(
+					ErrorKind::WriteZero,
+					format!("short checkpoint write: expected {expected_len} bytes, got {written}"),
+				);
+				return Err(self.poison("checkpoint", "short-write", e).await);
+			}
+			wal_cursor += page_len;
+			wal_segments
+				.last_mut()
+				.expect("active wal segment metadata")
+				.len_bytes = wal_cursor;
+			if let Err(e) = file_ops.fdatasync(&active_handle).await {
+				return Err(self.poison("checkpoint", "fdatasync", e).await);
 			}
 		}
-		let active_handle = wal_file.clone().expect("active wal segment handle");
-		let active_segment = wal_segments
-			.last_mut()
-			.expect("active wal segment metadata");
-		let expected_len = page.len();
-		let (written, _page) = file_ops.write_at(&active_handle, wal_cursor, page).await?;
-		if written != expected_len {
-			return Err(Error::new(
-				ErrorKind::WriteZero,
-				format!("short checkpoint write: expected {expected_len} bytes, got {written}"),
-			));
+		if let Err(e) = check_segment_identities(&wal_segments) {
+			return Err(self.poison("checkpoint", "segment-invariant", e).await);
 		}
-		wal_cursor += expected_len as u64;
-		active_segment.len_bytes = wal_cursor;
-		file_ops.fdatasync(&active_handle).await?;
 
 		let mut guard = self.inner.write().await;
 		guard.recovery_checkpoint = Some(next_checkpoint);
-		guard.recovery_committed = Some(last_log_id);
+		guard.recovery_committed = Some(pointer);
 		guard.wal_segments = wal_segments;
 		guard.wal_file = wal_file;
 		guard.wal_cursor = wal_cursor;
@@ -1164,8 +1360,16 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 			mut wal_file,
 			mut wal_cursor,
 			segment_bytes,
+			checkpoint,
+			committed_pointer,
+			superseded_at_open,
 		) = {
 			let guard = self.inner.read().await;
+			if let Some(poison) = guard.poisoned {
+				let err = poisoned_error(poison);
+				callback.log_io_completed(Err(Error::new(err.kind(), err.to_string())));
+				return Err(StorageIOError::write_logs(AnyError::new(&err)).into());
+			}
 			(
 				guard.file_ops.clone(),
 				guard.artifact_paths.clone(),
@@ -1173,6 +1377,9 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 				guard.wal_file.clone(),
 				guard.wal_cursor,
 				guard.wal_segment_bytes,
+				guard.recovery_checkpoint,
+				guard.recovery_committed,
+				records_superseded_at_open(guard.recovered_snapshot.is_some()),
 			)
 		};
 
@@ -1191,32 +1398,134 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 		let artifact_paths = artifact_paths.ok_or_else(|| {
 			StorageIOError::write_logs(AnyError::error("durable wal append missing artifact paths"))
 		})?;
+		if let Err(e) = check_segment_identities(&wal_segments) {
+			let e = self.poison("append", "segment-invariant", e).await;
+			callback.log_io_completed(Err(Error::new(e.kind(), e.to_string())));
+			return Err(StorageIOError::write_logs(AnyError::new(&e)).into());
+		}
 
+		// Any failure after the first on-disk effect of this batch poisons the store.
+		let mut effects = false;
 		let mut touched_segments: Vec<(u64, FileHandle)> = Vec::new();
 		let mut pending = Vec::with_capacity(batch.len());
 		let wal_append_started = Instant::now();
 		for (entry, page) in batch.iter().zip(pages) {
+			let index = entry.log_id.index;
 			if page.len() as u64 > segment_bytes {
-				let err = Error::new(
+				let mut err = Error::new(
 					ErrorKind::InvalidInput,
 					format!(
 						"wal record {} has {} bytes, exceeding segment size {}",
-						entry.log_id.index,
+						index,
 						page.len(),
 						segment_bytes
 					),
 				);
+				if effects {
+					err = self.poison("append", "oversized-after-writes", err).await;
+				}
 				callback.log_io_completed(Err(Error::new(err.kind(), err.to_string())));
 				return Err(StorageIOError::write_logs(AnyError::new(&err)).into());
 			}
-			if wal_file.is_none() || wal_cursor + page.len() as u64 > segment_bytes {
+			let expected_len = page.len();
+			// I1: a checkpoint-only active segment is named for the next entry it will hold.
+			let active_checkpoint_only = wal_segments
+				.last()
+				.filter(|last| last.end_log_index.is_none() && wal_file.is_some())
+				.cloned();
+			if let Some(active) = &active_checkpoint_only
+				&& active.start_index != index
+			{
+				let err = Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"entry {} would follow checkpoint-only segment {}",
+						index, active.start_index
+					),
+				);
+				let err = self.poison("append", "active-name", err).await;
+				callback.log_io_completed(Err(Error::new(err.kind(), err.to_string())));
+				return Err(StorageIOError::write_logs(AnyError::new(&err)).into());
+			}
+			let needs_rotation = wal_file.is_none()
+				|| wal_cursor
+					.checked_add(expected_len as u64)
+					.is_none_or(|end| end > segment_bytes);
+			if needs_rotation && let Some(active) = active_checkpoint_only {
+				// The checkpoint-only segment named for this entry is full: replace it with the
+				// latest checkpoint followed by the entry, so the checkpoint record survives.
+				// Without an in-memory checkpoint, every record in it was superseded at open by
+				// the validated snapshot, so the entry alone replaces them.
+				let checkpoint = match CheckpointPage::latest(checkpoint, committed_pointer) {
+					Ok(None) if !superseded_at_open => Err(Error::new(
+						ErrorKind::InvalidData,
+						"checkpoint-only segment without an in-memory checkpoint",
+					)),
+					other => other,
+				};
+				let checkpoint = match checkpoint {
+					Ok(checkpoint) => checkpoint,
+					Err(err) => {
+						let err = self.poison("append", "checkpoint-state", err).await;
+						callback.log_io_completed(Err(Error::new(err.kind(), err.to_string())));
+						return Err(StorageIOError::write_logs(AnyError::new(&err)).into());
+					}
+				};
+				let mut replacement = Vec::with_capacity(2);
+				let checkpoint_len = match checkpoint {
+					Some(checkpoint) => {
+						let checkpoint_page = checkpoint.page();
+						let len = checkpoint_page.len() as u64;
+						replacement.push(checkpoint_page);
+						len
+					}
+					None => 0,
+				};
+				replacement.push(page);
+				effects = true;
+				let (handle, len) = match replace_checkpoint_only_segment(
+					file_ops.as_ref(),
+					&artifact_paths.wal,
+					&active,
+					replacement,
+				)
+				.await
+				{
+					Ok(replaced) => replaced,
+					Err(e) => {
+						let e = self.poison("append", "replace", e).await;
+						callback.log_io_completed(Err(Error::new(e.kind(), e.to_string())));
+						return Err(StorageIOError::write_logs(AnyError::new(&e)).into());
+					}
+				};
+				let last = wal_segments.last_mut().expect("checkpoint-only segment");
+				last.len_bytes = len;
+				last.end_log_index = Some(index);
+				wal_file = Some(handle.clone());
+				wal_cursor = len;
+				touched_segments.push((last.start_index, handle));
+				pending.push(PendingWalWrite {
+					entry: clone_entry(entry),
+					pointer: WalRecordPointer {
+						segment_start_index: last.start_index,
+						offset: checkpoint_len,
+						len_bytes: expected_len as u64,
+					},
+				});
+				continue;
+			}
+			if needs_rotation {
 				let (segment_path, segment_handle) =
-					create_wal_segment(file_ops.as_ref(), &artifact_paths.wal, entry.log_id.index)
-						.await
-						.map_err(|e| StorageIOError::write_logs(AnyError::new(&e)))?;
+					match create_wal_segment(file_ops.as_ref(), &artifact_paths.wal, index).await {
+						Ok(created) => created,
+						Err(e) => {
+							let e = self.poison("append", "create-segment", e).await;
+							return Err(StorageIOError::write_logs(AnyError::new(&e)).into());
+						}
+					};
 				wal_segments.push(WalSegmentMeta {
 					path: segment_path,
-					start_index: entry.log_id.index,
+					start_index: index,
 					end_log_index: None,
 					len_bytes: 0,
 				});
@@ -1227,10 +1536,11 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 			let active_segment = wal_segments
 				.last_mut()
 				.expect("active wal segment metadata");
-			let expected_len = page.len();
+			effects = true;
 			let (written, _page) = match file_ops.write_at(&active_handle, wal_cursor, page).await {
 				Ok(result) => result,
 				Err(e) => {
+					let e = self.poison("append", "write", e).await;
 					callback
 						.log_io_completed(Err(std::io::Error::other(format!("wal write: {e}"))));
 					return Err(StorageIOError::write_logs(AnyError::new(&e)).into());
@@ -1241,6 +1551,7 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 					std::io::ErrorKind::WriteZero,
 					format!("short wal write: expected {expected_len} bytes, got {written}"),
 				);
+				let err = self.poison("append", "short-write", err).await;
 				callback.log_io_completed(Err(std::io::Error::new(err.kind(), err.to_string())));
 				return Err(StorageIOError::write_logs(AnyError::new(&err)).into());
 			}
@@ -1261,7 +1572,7 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 			});
 			wal_cursor += expected_len as u64;
 			active_segment.len_bytes = wal_cursor;
-			active_segment.end_log_index = Some(entry.log_id.index);
+			active_segment.end_log_index = Some(index);
 		}
 		metrics().observe_wal_append_latency(wal_append_started.elapsed());
 
@@ -1271,12 +1582,18 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 			// been awaited, so this fdatasync meaningfully covers them
 			// despite `io_uring`'s unordered fsync-vs-write semantics.
 			if let Err(e) = file_ops.fdatasync(handle).await {
+				let e = self.poison("append", "fdatasync", e).await;
 				callback
 					.log_io_completed(Err(std::io::Error::other(format!("wal fdatasync: {e}"))));
 				return Err(StorageIOError::write_logs(AnyError::new(&e)).into());
 			}
 		}
 		metrics().observe_wal_fsync_latency(wal_fsync_started.elapsed());
+		if let Err(e) = check_segment_identities(&wal_segments) {
+			let e = self.poison("append", "segment-invariant", e).await;
+			callback.log_io_completed(Err(Error::new(e.kind(), e.to_string())));
+			return Err(StorageIOError::write_logs(AnyError::new(&e)).into());
+		}
 
 		{
 			let mut guard = self.inner.write().await;
@@ -1299,89 +1616,260 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 	}
 
 	async fn truncate(&mut self, log_id: LogId<u32>) -> Result<(), StorageError<u32>> {
+		let k = log_id.index;
+		let refuse = |e: Error| -> StorageError<u32> {
+			StorageIOError::write_logs(AnyError::new(&e)).into()
+		};
 		let _gate = self.wal_gate.lock().await;
-		let (file_ops, last_purged, last_retained, mut wal_segments) = {
+		let (file_ops, artifact_paths, wal_segments, wal_file, wal_cursor, segment_bytes, plan) = {
 			let guard = self.inner.read().await;
+			if let Some(poison) = guard.poisoned {
+				return Err(refuse(poisoned_error(poison)));
+			}
+			check_segment_identities(&guard.wal_segments).map_err(refuse)?;
+			// Nothing at or above k: no effect, as when nothing is removed.
+			if guard.entries.range(k..).next().is_none() {
+				return Ok(());
+			}
+			if let Some(committed) = guard.recovery_committed
+				&& k <= committed.index
+			{
+				return Err(refuse(Error::new(
+					ErrorKind::InvalidInput,
+					format!(
+						"truncate at {k} would remove committed entry {}",
+						committed.index
+					),
+				)));
+			}
+			let retained = guard
+				.entries
+				.range(..k)
+				.next_back()
+				.map(|(_, entry)| entry.log_id);
+			let plan = TruncatePlan {
+				retained_position: retained.and_then(|id| {
+					guard
+						.entry_positions
+						.get(&id.index)
+						.map(|pointer| (id.index, *pointer))
+				}),
+				retained,
+				next: physical_tail_next(retained, guard.last_purged).map_err(refuse)?,
+				tail_next: physical_tail_next(guard.last_log_id, guard.last_purged)
+					.map_err(refuse)?,
+				checkpoint: CheckpointPage::latest(
+					guard.recovery_checkpoint,
+					guard.recovery_committed,
+				)
+				.map_err(refuse)?,
+			};
 			(
 				guard.file_ops.clone(),
-				guard.last_purged,
-				guard
-					.entry_positions
-					.range(..log_id.index)
-					.next_back()
-					.map(|(&index, pointer)| (index, *pointer)),
+				guard.artifact_paths.clone(),
 				guard.wal_segments.clone(),
+				guard.wal_file.clone(),
+				guard.wal_cursor,
+				guard.wal_segment_bytes,
+				plan,
 			)
 		};
 
-		if let Some(file_ops) = file_ops {
-			if let Some((last_retained_index, pointer)) = last_retained {
-				let keep_segment_index = wal_segments
+		let Some(file_ops) = file_ops else {
+			let mut guard = self.inner.write().await;
+			guard.entries.retain(|&idx, _| idx < k);
+			guard.entry_positions.retain(|&idx, _| idx < k);
+			guard.last_log_id = plan.retained.or(guard.last_purged);
+			return Ok(());
+		};
+		let artifact_paths = artifact_paths.ok_or_else(|| {
+			refuse(Error::new(
+				ErrorKind::Unsupported,
+				"durable wal truncate missing artifact paths",
+			))
+		})?;
+		if plan.retained.is_some() && plan.retained_position.is_none() {
+			return Err(refuse(Error::new(
+				ErrorKind::InvalidData,
+				"wal truncate lost the retained entry position",
+			)));
+		}
+		// R: the segment holding r, and the byte boundary of r's record within it.
+		let keep = match plan.retained_position {
+			Some((_, pointer)) => {
+				let at = wal_segments
 					.iter()
 					.position(|segment| segment.start_index == pointer.segment_start_index)
 					.ok_or_else(|| {
-						StorageIOError::write_logs(AnyError::error(
+						refuse(Error::new(
+							ErrorKind::InvalidData,
 							"wal truncate lost retained segment metadata",
 						))
 					})?;
-				let new_len = pointer.offset + pointer.len_bytes;
-				let keep_path = wal_segments[keep_segment_index].path.clone();
-				for segment in wal_segments.iter().skip(keep_segment_index + 1) {
-					unlink_wal_artifact(file_ops.as_ref(), &segment.path)
-						.await
-						.map_err(|e| StorageIOError::write_logs(AnyError::new(&e)))?;
+				let new_len = pointer
+					.offset
+					.checked_add(pointer.len_bytes)
+					.ok_or_else(|| {
+						refuse(Error::new(
+							ErrorKind::InvalidData,
+							"wal record end overflows",
+						))
+					})?;
+				if new_len > wal_segments[at].len_bytes {
+					return Err(refuse(Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"retained record ends at {new_len}, past segment {} length {}",
+							wal_segments[at].path.display(),
+							wal_segments[at].len_bytes
+						),
+					)));
 				}
-				wal_segments.truncate(keep_segment_index + 1);
-				wal_segments[keep_segment_index].len_bytes = new_len;
-				wal_segments[keep_segment_index].end_log_index = Some(last_retained_index);
-				let handle = open_existing_wal_segment(file_ops.as_ref(), &keep_path)
-					.await
-					.map_err(|e| StorageIOError::write_logs(AnyError::new(&e)))?;
-				file_ops
-					.set_len(&handle, new_len)
-					.await
-					.map_err(|e| StorageIOError::write_logs(AnyError::new(&e)))?;
-				file_ops
-					.fsync(&handle)
-					.await
-					.map_err(|e| StorageIOError::write_logs(AnyError::new(&e)))?;
-				let mut guard = self.inner.write().await;
-				guard.entries.retain(|&idx, _| idx < log_id.index);
-				guard.entry_positions.retain(|&idx, _| idx < log_id.index);
-				guard.wal_segments = wal_segments;
-				guard.wal_file = Some(handle);
-				guard.wal_cursor = new_len;
-				guard.last_log_id = guard
-					.entries
-					.values()
-					.last()
-					.map(|e| e.log_id)
-					.or(last_purged);
-			} else {
-				for segment in &wal_segments {
-					unlink_wal_artifact(file_ops.as_ref(), &segment.path)
-						.await
-						.map_err(|e| StorageIOError::write_logs(AnyError::new(&e)))?;
+				Some((at, new_len))
+			}
+			None => None,
+		};
+		let suffix_from = keep.map_or(0, |(at, _)| at + 1);
+
+		let Some(checkpoint) = plan.checkpoint else {
+			// Without a checkpoint: suffix segments descending, then R shrinks in place.
+			for segment in wal_segments[suffix_from..].iter().rev() {
+				if let Err(e) = unlink_wal_artifact(file_ops.as_ref(), &segment.path).await {
+					return Err(self.poisoned_storage("truncate", "unlink", e).await);
 				}
-				let mut guard = self.inner.write().await;
-				guard.entries.clear();
-				guard.entry_positions.clear();
-				guard.wal_segments.clear();
-				guard.wal_file = None;
-				guard.wal_cursor = 0;
-				guard.last_log_id = guard.last_purged;
+			}
+			let mut wal_segments = wal_segments;
+			wal_segments.truncate(suffix_from);
+			let (wal_file, wal_cursor) = match keep {
+				Some((at, new_len)) => {
+					let handle = self
+						.shrink_retained(file_ops.as_ref(), &wal_segments[at], new_len)
+						.await?;
+					wal_segments[at].len_bytes = new_len;
+					wal_segments[at].end_log_index = plan.retained.map(|id| id.index);
+					(Some(handle), new_len)
+				}
+				None => (None, 0),
+			};
+			self.publish_truncate(k, plan.retained, wal_segments, wal_file, wal_cursor)
+				.await;
+			return Ok(());
+		};
+
+		// With a checkpoint, the last file in sorted order ends with C′ at every step.
+		// Step 1: Z, a complete checkpoint holder that sorts last.
+		let active = wal_segments.last().cloned().ok_or_else(|| {
+			refuse(Error::new(
+				ErrorKind::InvalidData,
+				"wal truncate found entries but no segment",
+			))
+		})?;
+		let z_from_active = active.end_log_index.is_none();
+		if z_from_active && active.start_index != plan.tail_next {
+			return Err(refuse(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"checkpoint-only active segment starts at {} but the WAL tail continues at {}",
+					active.start_index, plan.tail_next
+				),
+			)));
+		}
+		if !z_from_active
+			&& file_ops
+				.file_len(&wal_segment_path(&artifact_paths.wal, plan.tail_next).map_err(refuse)?)
+				.await
+				.map_err(refuse)?
+				.is_some()
+		{
+			return Err(refuse(Error::new(
+				ErrorKind::AlreadyExists,
+				format!("checkpoint holder name {} is occupied", plan.tail_next),
+			)));
+		}
+		let z_path = if z_from_active {
+			let handle = wal_file.clone().ok_or_else(|| {
+				refuse(Error::new(
+					ErrorKind::InvalidData,
+					"checkpoint-only active segment has no handle",
+				))
+			})?;
+			match append_checkpoint_to_active(
+				file_ops.as_ref(),
+				&artifact_paths.wal,
+				&active,
+				&handle,
+				wal_cursor,
+				segment_bytes,
+				checkpoint,
+			)
+			.await
+			{
+				Ok(_) => active.path.clone(),
+				Err(e) => return Err(self.poisoned_storage("truncate", "preserve", e).await),
 			}
 		} else {
-			let mut guard = self.inner.write().await;
-			guard.entries.retain(|&idx, _| idx < log_id.index);
-			guard.entry_positions.retain(|&idx, _| idx < log_id.index);
-			guard.last_log_id = guard
-				.entries
-				.values()
-				.last()
-				.map(|e| e.log_id)
-				.or(guard.last_purged);
+			match create_wal_holder(
+				file_ops.as_ref(),
+				&artifact_paths.wal,
+				plan.tail_next,
+				vec![checkpoint.page()],
+			)
+			.await
+			{
+				Ok((path, _, _)) => path,
+				Err(e) => return Err(self.poisoned_storage("truncate", "create-holder", e).await),
+			}
+		};
+		// Step 2: the suffix, other than Z, descending; one unlink and directory sync each.
+		let suffix_end = if z_from_active {
+			wal_segments.len() - 1
+		} else {
+			wal_segments.len()
+		};
+		for segment in wal_segments[suffix_from..suffix_end].iter().rev() {
+			if let Err(e) = unlink_wal_artifact(file_ops.as_ref(), &segment.path).await {
+				return Err(self.poisoned_storage("truncate", "unlink", e).await);
+			}
 		}
+		let mut wal_segments = wal_segments;
+		wal_segments.truncate(suffix_from);
+		// Step 3: R shrinks in place to the end of r's record.
+		if let Some((at, new_len)) = keep {
+			self.shrink_retained(file_ops.as_ref(), &wal_segments[at], new_len)
+				.await?;
+			wal_segments[at].len_bytes = new_len;
+			wal_segments[at].end_log_index = plan.retained.map(|id| id.index);
+		}
+		// Step 4: the final checkpoint-only segment, named for the next entry.
+		let (next_path, next_handle, next_len) = match create_wal_holder(
+			file_ops.as_ref(),
+			&artifact_paths.wal,
+			plan.next,
+			vec![checkpoint.page()],
+		)
+		.await
+		{
+			Ok(created) => created,
+			Err(e) => return Err(self.poisoned_storage("truncate", "create-next", e).await),
+		};
+		// Step 5: Z goes; "next" is now last and ends with C′.
+		if let Err(e) = unlink_wal_artifact(file_ops.as_ref(), &z_path).await {
+			return Err(self.poisoned_storage("truncate", "unlink-holder", e).await);
+		}
+		wal_segments.push(WalSegmentMeta {
+			path: next_path,
+			start_index: plan.next,
+			end_log_index: None,
+			len_bytes: next_len,
+		});
+		if let Err(e) = check_segment_identities(&wal_segments) {
+			return Err(self
+				.poisoned_storage("truncate", "segment-invariant", e)
+				.await);
+		}
+		// Step 6: publish.
+		self.publish_truncate(k, plan.retained, wal_segments, Some(next_handle), next_len)
+			.await;
 		Ok(())
 	}
 
@@ -1391,70 +1879,238 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 				StorageIOError::write_logs(AnyError::new(&RetentionViolation::Purge)).into(),
 			);
 		}
-		let _gate = self.wal_gate.lock().await;
-		let (file_ops, mut wal_segments) = {
-			let guard = self.inner.read().await;
-			(guard.file_ops.clone(), guard.wal_segments.clone())
+		let p = log_id.index;
+		let refuse = |e: Error| -> StorageError<u32> {
+			StorageIOError::write_logs(AnyError::new(&e)).into()
 		};
+		let _gate = self.wal_gate.lock().await;
+		let (
+			file_ops,
+			artifact_paths,
+			mut wal_segments,
+			wal_file,
+			wal_cursor,
+			segment_bytes,
+			checkpoint,
+			last_purged,
+			last_log_id,
+			post_next,
+			superseded_at_open,
+		) = {
+			let guard = self.inner.read().await;
+			if let Some(poison) = guard.poisoned {
+				return Err(refuse(poisoned_error(poison)));
+			}
+			check_segment_identities(&guard.wal_segments).map_err(refuse)?;
+			// The post-purge boundary and tail: p may pass the local tail (a snapshot install).
+			let last_purged = match guard.last_purged {
+				Some(prev) if prev > log_id => prev,
+				_ => log_id,
+			};
+			let last_log_id = guard
+				.entries
+				.range((std::ops::Bound::Excluded(p), std::ops::Bound::Unbounded))
+				.next_back()
+				.map(|(_, entry)| entry.log_id)
+				.filter(|id| *id >= log_id)
+				.unwrap_or(last_purged);
+			(
+				guard.file_ops.clone(),
+				guard.artifact_paths.clone(),
+				guard.wal_segments.clone(),
+				guard.wal_file.clone(),
+				guard.wal_cursor,
+				guard.wal_segment_bytes,
+				CheckpointPage::latest(guard.recovery_checkpoint, guard.recovery_committed)
+					.map_err(refuse)?,
+				last_purged,
+				last_log_id,
+				physical_tail_next(Some(last_log_id), None).map_err(refuse)?,
+				// Read only with recovery_checkpoint None: see `records_superseded_at_open`.
+				records_superseded_at_open(guard.recovered_snapshot.is_some()),
+			)
+		};
+		let mut wal_file = wal_file;
+		let mut wal_cursor = wal_cursor;
 		if let Some(file_ops) = file_ops.as_ref() {
+			let artifact_paths = artifact_paths.ok_or_else(|| {
+				refuse(Error::new(
+					ErrorKind::Unsupported,
+					"durable wal purge missing artifact paths",
+				))
+			})?;
+			// A checkpoint-only segment is never in the purged run.
 			let delete_count = wal_segments
 				.iter()
-				.take_while(|segment| {
-					segment
-						.end_log_index
-						.map(|index| index <= log_id.index)
-						.unwrap_or(true)
-				})
+				.take_while(|segment| segment.end_log_index.is_some_and(|end| end <= p))
 				.count();
-			for segment in wal_segments.iter().take(delete_count) {
-				unlink_wal_artifact(file_ops.as_ref(), &segment.path)
-					.await
-					.map_err(|e| StorageIOError::write_logs(AnyError::new(&e)))?;
+			// A checkpoint-only active segment the new boundary has passed: with C′ it is removed
+			// after a holder at the post-purge name is durable; without, it is removed first.
+			let below = wal_segments
+				.last()
+				.filter(|last| last.end_log_index.is_none() && last.start_index != post_next)
+				.cloned();
+			if let Some(below) = &below
+				&& below.start_index > post_next
+			{
+				return Err(refuse(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"checkpoint-only active segment {} lies past the post-purge tail {post_next}",
+						below.start_index
+					),
+				)));
 			}
-			if delete_count > 0 {
+			// Without C′, the passed segment is removed first only on evidence that it carries
+			// nothing to keep: it is exactly empty, or every record it holds was superseded at open
+			// by the validated snapshot (`records_superseded_at_open`).
+			if checkpoint.is_none()
+				&& let Some(below) = &below
+				&& !superseded_at_open
+				&& !exactly_empty(file_ops.as_ref(), below)
+					.await
+					.map_err(refuse)?
+			{
+				return Err(refuse(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"checkpoint-only segment {} lies below the post-purge tail {post_next} with \
+						 no checkpoint and no evidence it carries nothing",
+						below.path.display()
+					),
+				)));
+			}
+			let survivor = wal_segments
+				.last()
+				.filter(|_| delete_count < wal_segments.len() && below.is_none())
+				.cloned();
+			if delete_count > 0 || below.is_some() {
+				let holder_path =
+					wal_segment_path(&artifact_paths.wal, post_next).map_err(refuse)?;
+				// Step 1: C′ is preserved in a segment that survives and is last.
+				let mut holder = None;
+				let mut preserved_in_active = false;
+				if let Some(checkpoint) = checkpoint {
+					let appended = match (&survivor, &wal_file) {
+						(Some(active), Some(handle)) => match append_checkpoint_to_active(
+							file_ops.as_ref(),
+							&artifact_paths.wal,
+							active,
+							handle,
+							wal_cursor,
+							segment_bytes,
+							checkpoint,
+						)
+						.await
+						{
+							Ok(appended) => appended,
+							Err(e) => {
+								return Err(self.poisoned_storage("purge", "preserve", e).await);
+							}
+						},
+						_ => None,
+					};
+					if let Some((handle, len)) = appended {
+						wal_segments
+							.last_mut()
+							.expect("surviving segment")
+							.len_bytes = len;
+						wal_file = Some(handle);
+						wal_cursor = len;
+						preserved_in_active = true;
+					} else {
+						if file_ops
+							.file_len(&holder_path)
+							.await
+							.map_err(refuse)?
+							.is_some()
+						{
+							return Err(refuse(Error::new(
+								ErrorKind::AlreadyExists,
+								format!("checkpoint holder name {post_next} is occupied"),
+							)));
+						}
+						holder = match create_wal_holder(
+							file_ops.as_ref(),
+							&artifact_paths.wal,
+							post_next,
+							vec![checkpoint.page()],
+						)
+						.await
+						{
+							Ok(created) => Some(created),
+							Err(e) => {
+								return Err(self
+									.poisoned_storage("purge", "create-holder", e)
+									.await);
+							}
+						};
+					}
+				}
+				// Without C′ nothing is preserved: every checkpoint record on disk was superseded
+				// at open and none was written since, so the passed segment goes first and no
+				// stop can leave it (possibly empty, with no record to carry) last.
+				if checkpoint.is_none()
+					&& let Some(below) = &below
+					&& let Err(e) = unlink_wal_artifact(file_ops.as_ref(), &below.path).await
+				{
+					return Err(self.poisoned_storage("purge", "unlink-holder", e).await);
+				}
+				// Step 2: the purged log segments, ascending.
+				for segment in wal_segments.iter().take(delete_count) {
+					if let Err(e) = unlink_wal_artifact(file_ops.as_ref(), &segment.path).await {
+						return Err(self.poisoned_storage("purge", "unlink", e).await);
+					}
+				}
+				// Step 3: the passed checkpoint-only segment, after the new holder is durable.
+				if checkpoint.is_some()
+					&& let Some(below) = &below
+					&& let Err(e) = unlink_wal_artifact(file_ops.as_ref(), &below.path).await
+				{
+					return Err(self.poisoned_storage("purge", "unlink-holder", e).await);
+				}
 				wal_segments.drain(..delete_count);
+				if below.is_some() {
+					wal_segments.pop();
+				}
+				if let Some((path, handle, len)) = holder {
+					wal_segments.push(WalSegmentMeta {
+						path,
+						start_index: post_next,
+						end_log_index: None,
+						len_bytes: len,
+					});
+					wal_file = Some(handle);
+					wal_cursor = len;
+				} else if preserved_in_active {
+					// The live handle and cursor already name the surviving active segment.
+				} else if let Some(last) = wal_segments.last() {
+					wal_cursor = last.len_bytes;
+					wal_file = match open_existing_wal_segment(file_ops.as_ref(), &last.path).await
+					{
+						Ok(handle) => Some(handle),
+						Err(e) => return Err(self.poisoned_storage("purge", "reopen", e).await),
+					};
+				} else {
+					wal_file = None;
+					wal_cursor = 0;
+				}
+				if let Err(e) = check_segment_identities(&wal_segments) {
+					return Err(self.poisoned_storage("purge", "segment-invariant", e).await);
+				}
 			}
 		}
-		let reopened_file = if let Some(file_ops) = &file_ops {
-			if let Some(last) = wal_segments.last() {
-				Some(
-					open_existing_wal_segment(file_ops.as_ref(), &last.path)
-						.await
-						.map_err(|e| StorageIOError::write_logs(AnyError::new(&e)))?,
-				)
-			} else {
-				None
-			}
-		} else {
-			None
-		};
 
 		let mut guard = self.inner.write().await;
-		guard.entries.retain(|&idx, _| idx > log_id.index);
-		guard.entry_positions.retain(|&idx, _| idx > log_id.index);
-		guard.last_purged = Some(match guard.last_purged {
-			Some(prev) if prev > log_id => prev,
-			_ => log_id,
-		});
+		guard.entries.retain(|&idx, _| idx > p);
+		guard.entry_positions.retain(|&idx, _| idx > p);
+		guard.last_purged = Some(last_purged);
 		if guard.file_ops.is_some() {
 			guard.wal_segments = wal_segments;
-			if let Some(last) = guard.wal_segments.last() {
-				guard.wal_cursor = last.len_bytes;
-				guard.wal_file = reopened_file;
-			} else {
-				guard.wal_file = None;
-				guard.wal_cursor = 0;
-			}
+			guard.wal_file = wal_file;
+			guard.wal_cursor = wal_cursor;
 		}
-		guard.last_log_id = guard
-			.entries
-			.values()
-			.last()
-			.map(|e| e.log_id)
-			.or(guard.last_purged);
-		if guard.last_log_id.map(|id| id < log_id).unwrap_or(true) {
-			guard.last_log_id = guard.last_purged;
-		}
+		guard.last_log_id = Some(last_log_id);
 		Ok(())
 	}
 }
@@ -6169,16 +6825,86 @@ async fn ensure_wal_artifacts_absent(
 	Ok(())
 }
 
-async fn create_wal_segment(
+fn poisoned_error(poison: WalPoison) -> Error {
+	Error::other(format!(
+		"wal store refused: an earlier {} failed at {} with uncertain on-disk state; reopen required",
+		poison.op, poison.step
+	))
+}
+
+/// The next log index of the physical WAL: one past the last retained entry, else one past the
+/// purge boundary, else genesis 0. Never derived from a committed pointer or an observation.
+fn physical_tail_next(
+	last_log_id: Option<LogId<u32>>,
+	last_purged: Option<LogId<u32>>,
+) -> std::io::Result<u64> {
+	match last_log_id.or(last_purged) {
+		Some(tail) => tail.index.checked_add(1).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"wal log index overflows the next segment name",
+			)
+		}),
+		None => Ok(0),
+	}
+}
+
+/// The exact committed log id at `index`, from every source that knows that index. Every such
+/// source must agree; with none, the pointer is unknown and nothing is guessed.
+fn resolve_committed_pointer(
+	index: u64,
+	sources: &[Option<LogId<u32>>],
+) -> std::io::Result<LogId<u32>> {
+	let mut found: Option<LogId<u32>> = None;
+	for candidate in sources.iter().flatten().filter(|id| id.index == index) {
+		match found {
+			None => found = Some(*candidate),
+			Some(known) if known == *candidate => {}
+			Some(known) => {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"committed log id sources disagree at index {index}: {known:?} vs {candidate:?}"
+					),
+				));
+			}
+		}
+	}
+	found.ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("no retained or boundary log id for committed index {index}"),
+		)
+	})
+}
+
+/// I2: no two WAL segments share a start index or a path.
+fn check_segment_identities(segments: &[WalSegmentMeta]) -> std::io::Result<()> {
+	let mut starts = BTreeSet::new();
+	let mut paths = BTreeSet::new();
+	for segment in segments {
+		if !starts.insert(segment.start_index) || !paths.insert(segment.path.clone()) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"duplicate wal segment {} in store metadata",
+					segment.path.display()
+				),
+			));
+		}
+	}
+	Ok(())
+}
+
+/// Opens a fresh, empty staging file for `start_index`, clearing a stale one first.
+async fn open_wal_staging(
 	file_ops: &dyn AsyncFileOps,
 	wal_path: &Path,
 	start_index: u64,
 ) -> std::io::Result<(PathBuf, FileHandle)> {
 	let staging = wal_segment_staging_path(wal_path, start_index)?;
-	let final_path = wal_segment_path(wal_path, start_index)?;
-	match file_ops.file_len(&staging).await? {
-		Some(_) => unlink_wal_artifact(file_ops, &staging).await?,
-		None => {}
+	if file_ops.file_len(&staging).await?.is_some() {
+		unlink_wal_artifact(file_ops, &staging).await?;
 	}
 	let handle = file_ops
 		.open(
@@ -6192,9 +6918,165 @@ async fn create_wal_segment(
 			},
 		)
 		.await?;
+	Ok((staging, handle))
+}
+
+/// Creates segment `start_index` without ever replacing an existing file: the staging file is
+/// published with `link(2)`, which refuses an existing name atomically.
+async fn create_wal_segment(
+	file_ops: &dyn AsyncFileOps,
+	wal_path: &Path,
+	start_index: u64,
+) -> std::io::Result<(PathBuf, FileHandle)> {
+	let final_path = wal_segment_path(wal_path, start_index)?;
+	let (staging, handle) = open_wal_staging(file_ops, wal_path, start_index).await?;
+	file_ops.link_no_replace(&staging, &final_path).await?;
+	unlink_wal_artifact(file_ops, &staging).await?;
+	Ok((final_path, handle))
+}
+
+/// The one sanctioned replacement: rewrites the known checkpoint-only `segment` (same name) with
+/// `pages`, atomically, through a synced staging file. Returns the live handle and new length.
+async fn replace_checkpoint_only_segment(
+	file_ops: &dyn AsyncFileOps,
+	wal_path: &Path,
+	segment: &WalSegmentMeta,
+	pages: Vec<AlignedBuf>,
+) -> std::io::Result<(FileHandle, u64)> {
+	let final_path = wal_segment_path(wal_path, segment.start_index)?;
+	if segment.end_log_index.is_some() || final_path != segment.path {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"refusing to replace {}: not the checkpoint-only segment",
+				segment.path.display()
+			),
+		));
+	}
+	let (staging, handle) = open_wal_staging(file_ops, wal_path, segment.start_index).await?;
+	let len = write_pages_exact(file_ops, &handle, 0, pages).await?;
+	file_ops.fdatasync(&handle).await?;
 	file_ops.rename(&staging, &final_path).await?;
 	fsync_parent_dir(file_ops, &final_path).await?;
-	Ok((final_path, handle))
+	Ok((handle, len))
+}
+
+/// Writes `pages` back to back from `offset`, refusing a short write. Returns the end offset.
+async fn write_pages_exact(
+	file_ops: &dyn AsyncFileOps,
+	handle: &FileHandle,
+	offset: u64,
+	pages: Vec<AlignedBuf>,
+) -> std::io::Result<u64> {
+	let mut end = offset;
+	for page in pages {
+		let expected = page.len();
+		let (written, _page) = file_ops.write_at(handle, end, page).await?;
+		if written != expected {
+			return Err(Error::new(
+				ErrorKind::WriteZero,
+				format!("short wal write: expected {expected} bytes, got {written}"),
+			));
+		}
+		end = end
+			.checked_add(expected as u64)
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "wal length overflows"))?;
+	}
+	Ok(end)
+}
+
+/// Publishes segment `start_index` holding exactly `pages`, written and synced before its name
+/// exists: staging write, `fdatasync`, `link(2)` (never replaces), then the staging name is
+/// removed and the directory synced. A failure leaves at most a staging file, never a partial
+/// segment under the final name. Returns the path, the live handle and the length.
+async fn create_wal_holder(
+	file_ops: &dyn AsyncFileOps,
+	wal_path: &Path,
+	start_index: u64,
+	pages: Vec<AlignedBuf>,
+) -> std::io::Result<(PathBuf, FileHandle, u64)> {
+	let final_path = wal_segment_path(wal_path, start_index)?;
+	let (staging, handle) = open_wal_staging(file_ops, wal_path, start_index).await?;
+	let len = write_pages_exact(file_ops, &handle, 0, pages).await?;
+	file_ops.fdatasync(&handle).await?;
+	file_ops.link_no_replace(&staging, &final_path).await?;
+	unlink_wal_artifact(file_ops, &staging).await?;
+	Ok((final_path, handle, len))
+}
+
+/// C′: the in-memory latest checkpoint and the committed log id that heads its page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CheckpointPage {
+	checkpoint: RecoveryCheckpoint,
+	pointer: LogId<u32>,
+}
+
+impl CheckpointPage {
+	/// None without a checkpoint. A checkpoint at index 0 is recovered without a pointer (open
+	/// resolves none for it), so it is headed by the genesis log id, as when it was written.
+	fn latest(
+		checkpoint: Option<RecoveryCheckpoint>,
+		pointer: Option<LogId<u32>>,
+	) -> std::io::Result<Option<Self>> {
+		let Some(checkpoint) = checkpoint else {
+			return Ok(None);
+		};
+		let pointer = match pointer {
+			Some(pointer) if pointer.index == checkpoint.commit_index => pointer,
+			None if checkpoint.commit_index == 0 => LogId::default(),
+			_ => {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"checkpoint commit {} has no matching committed log id {pointer:?}",
+						checkpoint.commit_index
+					),
+				));
+			}
+		};
+		Ok(Some(Self {
+			checkpoint,
+			pointer,
+		}))
+	}
+
+	fn page(&self) -> AlignedBuf {
+		serialize_checkpoint_page(
+			self.checkpoint.commit_index,
+			self.checkpoint.e_safe_index,
+			self.pointer.index,
+			self.pointer.leader_id.term,
+		)
+	}
+}
+
+/// Preserves C′ in the active segment `active` (the last one), whose live handle and cursor are
+/// given: appended when it fits, else, for a checkpoint-only segment, by the constrained
+/// replacement. Returns the new handle and length, or None when a log segment has no room.
+async fn append_checkpoint_to_active(
+	file_ops: &dyn AsyncFileOps,
+	wal_path: &Path,
+	active: &WalSegmentMeta,
+	handle: &FileHandle,
+	cursor: u64,
+	segment_bytes: u64,
+	page: CheckpointPage,
+) -> std::io::Result<Option<(FileHandle, u64)>> {
+	let page = page.page();
+	let fits = cursor
+		.checked_add(page.len() as u64)
+		.is_some_and(|end| end <= segment_bytes);
+	if fits {
+		let end = write_pages_exact(file_ops, handle, cursor, vec![page]).await?;
+		file_ops.fdatasync(handle).await?;
+		return Ok(Some((handle.clone(), end)));
+	}
+	if active.end_log_index.is_none() {
+		return replace_checkpoint_only_segment(file_ops, wal_path, active, vec![page])
+			.await
+			.map(Some);
+	}
+	Ok(None)
 }
 
 async fn open_existing_wal_segment(
@@ -6421,6 +7303,239 @@ fn resolve_recovered_committed(
 	))
 }
 
+/// Open-time completion of an interrupted checkpoint-holder move. Runs after replay and the
+/// `Full` checks, before any other effect. Z is a named checkpoint-only segment off the tail;
+/// the target is the checkpoint-only segment named `tail_next`. Only these states qualify:
+/// - Z is last and sorts past the tail: a truncate stopped between its steps 1 and 5. A present
+///   target sorts just before Z and must be exactly Z's last validated record;
+/// - Z is last and lies below the tail, explained by the durable snapshot boundary s (Z.start <=
+///   s, no retained entry at or past Z.start, tail_next = s + 1): a snapshot install stopped before
+///   its purge. Z's last validated record is published as the target; an exactly empty Z carries
+///   no record and is only unlinked;
+/// - the target is last and Z, so explained, is immediately before it: the same move stopped
+///   after publishing the target. The target must be exactly one validated record; Z must be
+///   exactly empty, or wholly validated checkpoint records ending in the target's record.
+///
+/// The target is made durable first (published byte for byte, or re-synced with its directory),
+/// then Z is unlinked. Any other checkpoint-only segment off the tail in these shapes, any other
+/// named checkpoint-only segment before them, or any differing target refuses before any effect.
+async fn complete_checkpoint_holder_at_open(
+	file_ops: &dyn AsyncFileOps,
+	wal_path: &Path,
+	snapshot: Option<&LoadedSnapshot>,
+	replay: &mut WALReplay,
+) -> std::io::Result<()> {
+	let segments = &replay.wal_segments;
+	let Some(last) = segments.last().cloned() else {
+		return Ok(());
+	};
+	let named_checkpoint_only = |segment: &WalSegmentMeta| -> std::io::Result<bool> {
+		Ok(segment.end_log_index.is_none()
+			&& segment.path == wal_segment_path(wal_path, segment.start_index)?)
+	};
+	if !named_checkpoint_only(&last)? {
+		return Ok(());
+	}
+	let tail_next = physical_tail_next(replay.last_log_id, replay.last_purged)?;
+	let explained = |z: &WalSegmentMeta| {
+		snapshot
+			.and_then(|loaded| loaded.last_included)
+			.is_some_and(|s| {
+				z.start_index <= s.index
+					&& replay.entries.range(z.start_index..).next().is_none()
+					&& s.index.checked_add(1) == Some(tail_next)
+			})
+	};
+	let refuse = |message: String| Error::new(ErrorKind::InvalidData, message);
+	let below_tail = |z: &WalSegmentMeta| {
+		refuse(format!(
+			"checkpoint-only segment {} lies below the WAL tail {tail_next} and no durable \
+			 snapshot boundary explains it",
+			z.path.display()
+		))
+	};
+	let not_exact = |target: &Path, z: &WalSegmentMeta| {
+		refuse(format!(
+			"{} is not exactly the checkpoint record of {}",
+			target.display(),
+			z.path.display()
+		))
+	};
+	let held = |segment: &WalSegmentMeta| replay.checkpoint_only_holders.get(&segment.path);
+	let target_path = wal_segment_path(wal_path, tail_next)?;
+	// (Z's index, whether the target is to be published, and the record to publish.)
+	let (z_at, publish): (usize, Option<Vec<u8>>) = if last.start_index == tail_next {
+		let Some(z_at) = segments.len().checked_sub(2) else {
+			return Ok(());
+		};
+		let z = &segments[z_at];
+		if !named_checkpoint_only(z)? || z.start_index >= tail_next {
+			return Ok(());
+		}
+		if !explained(z) {
+			return Err(below_tail(z));
+		}
+		let target = held(&last)
+			.filter(|target| {
+				target.records == 1 && last.len_bytes == target.last_record.len() as u64
+			})
+			.ok_or_else(|| not_exact(&target_path, z))?;
+		if !wholly_validated(file_ops, &last, target).await? {
+			return Err(not_exact(&target_path, z));
+		}
+		let z_matches = match held(z) {
+			Some(old) => {
+				old.last_record == target.last_record && wholly_validated(file_ops, z, old).await?
+			}
+			None => exactly_empty(file_ops, z).await?,
+		};
+		if !z_matches {
+			return Err(not_exact(&target_path, z));
+		}
+		(z_at, None)
+	} else {
+		let z_at = segments.len() - 1;
+		let z = &last;
+		if z.start_index < tail_next && !explained(z) {
+			return Err(below_tail(z));
+		}
+		let record = match held(z) {
+			Some(held) => Some(held.last_record.clone()),
+			None if z.start_index < tail_next && exactly_empty(file_ops, z).await? => None,
+			None => {
+				return Err(refuse(format!(
+					"checkpoint-only segment {} off the WAL tail {tail_next} has no validated \
+					 checkpoint record",
+					z.path.display()
+				)));
+			}
+		};
+		let others: Vec<&WalSegmentMeta> = segments[..z_at]
+			.iter()
+			.filter(|segment| segment.start_index >= tail_next.min(z.start_index))
+			.collect();
+		match (others.as_slice(), &record) {
+			([], _) => {
+				if file_ops.file_len(&target_path).await?.is_some() {
+					return Err(refuse(format!(
+						"{} exists but replay did not account for it",
+						target_path.display()
+					)));
+				}
+				(z_at, record)
+			}
+			([target], Some(record)) if target.path == target_path => {
+				let exact = match held(target) {
+					Some(t) => {
+						t.records == 1
+							&& t.last_record == *record
+							&& target.len_bytes == record.len() as u64
+							&& wholly_validated(file_ops, target, t).await?
+					}
+					None => false,
+				};
+				if !exact {
+					return Err(not_exact(&target_path, z));
+				}
+				(z_at, None)
+			}
+			_ => {
+				return Err(refuse(format!(
+					"unexpected segments between the WAL tail {tail_next} and {}",
+					z.path.display()
+				)));
+			}
+		}
+	};
+	let z = segments[z_at].clone();
+	let target_at = if last.start_index == tail_next {
+		Some(segments.len() - 1)
+	} else {
+		segments
+			.iter()
+			.position(|segment| segment.path == target_path)
+	};
+	// No other named checkpoint-only segment may precede these shapes.
+	for (at, segment) in segments.iter().enumerate() {
+		if at != z_at && Some(at) != target_at && named_checkpoint_only(segment)? {
+			return Err(refuse(format!(
+				"unexpected checkpoint-only segment {} beside {}",
+				segment.path.display(),
+				z.path.display()
+			)));
+		}
+	}
+
+	// Effects: the target is durable, contents and name, before Z goes.
+	if let Some(record) = &publish {
+		let mut page = AlignedBuf::new(record.len());
+		page.as_mut_slice().copy_from_slice(record);
+		create_wal_holder(file_ops, wal_path, tail_next, vec![page]).await?;
+	} else if target_at.is_some() {
+		let handle = open_existing_wal_segment(file_ops, &target_path).await?;
+		file_ops.fdatasync(&handle).await?;
+		fsync_parent_dir(file_ops, &target_path).await?;
+	}
+	unlink_wal_artifact(file_ops, &z.path).await?;
+	if z_at + 1 == replay.wal_segments.len() {
+		replay.last_segment_needs_truncate = false;
+	}
+	replay.wal_segments.remove(z_at);
+	replay.checkpoint_only_holders.remove(&z.path);
+	if let Some(record) = publish {
+		replay.wal_segments.push(WalSegmentMeta {
+			path: target_path.clone(),
+			start_index: tail_next,
+			end_log_index: None,
+			len_bytes: record.len() as u64,
+		});
+		replay
+			.wal_segments
+			.sort_by_key(|segment| segment.start_index);
+		replay.checkpoint_only_holders.insert(
+			target_path,
+			CheckpointOnlyHolder {
+				records: 1,
+				last_record: record,
+			},
+		);
+	}
+	Ok(())
+}
+
+/// Whether, given `recovery_checkpoint` is None, every checkpoint record on disk is known to be
+/// superseded. Replay keeps the last record not superseded by the validated snapshot boundary
+/// (strict: commit < boundary), so a None checkpoint after open means every record replay
+/// validated had a commit below the recovered snapshot's boundary; a torn tail was cut to its
+/// validated length at open. Every later checkpoint write sets the checkpoint, so it is still
+/// None only if none was written. Without a recovered snapshot no record can be superseded, so a
+/// None checkpoint then means there is no record at all, and a nonempty checkpoint-only segment
+/// cannot exist; the answer is false so that such a segment is refused, not presumed empty.
+fn records_superseded_at_open(recovered_snapshot: bool) -> bool {
+	recovered_snapshot
+}
+
+/// Every byte of `segment` on disk is one of its replay-validated checkpoint records: the file is
+/// exactly its validated length, and that length is its record count times the record size.
+async fn wholly_validated(
+	file_ops: &dyn AsyncFileOps,
+	segment: &WalSegmentMeta,
+	held: &CheckpointOnlyHolder,
+) -> std::io::Result<bool> {
+	let records_len = (held.records as u64).checked_mul(held.last_record.len() as u64);
+	Ok(segment.end_log_index.is_none()
+		&& records_len == Some(segment.len_bytes)
+		&& file_ops.file_len(&segment.path).await? == Some(segment.len_bytes))
+}
+
+/// A segment of exactly zero length, in metadata and on disk: it carries no record at all.
+async fn exactly_empty(
+	file_ops: &dyn AsyncFileOps,
+	segment: &WalSegmentMeta,
+) -> std::io::Result<bool> {
+	Ok(segment.len_bytes == 0 && file_ops.file_len(&segment.path).await? == Some(0))
+}
+
 async fn replay_wal_segment(
 	file_ops: &dyn AsyncFileOps,
 	segment: &DiscoveredWalSegment,
@@ -6453,6 +7568,8 @@ async fn replay_wal_segment(
 	let mut first_record_index: Option<u64> = None;
 	let mut first_log_entry_index: Option<u64> = None;
 	let mut end_log_index: Option<u64> = None;
+	let mut checkpoint_records: usize = 0;
+	let mut last_checkpoint_record: Option<std::ops::Range<usize>> = None;
 	while offset < bytes.len() {
 		let remaining = bytes.len() - offset;
 		if remaining < header_size {
@@ -6592,6 +7709,8 @@ async fn replay_wal_segment(
 						format!("checkpoint body has {} bytes, expected 16", body.len()),
 					));
 				}
+				checkpoint_records += 1;
+				last_checkpoint_record = Some(offset..offset + padded_len);
 				let mut checkpoint = *bytemuck::from_bytes::<WALCheckpointBody>(body);
 				if checkpoint.e_safe_index > checkpoint.commit_index {
 					checkpoint.e_safe_index = checkpoint.commit_index;
@@ -6629,6 +7748,17 @@ async fn replay_wal_segment(
 	};
 	if last_good == 0 && segment.start_index == 0 {
 		return Ok(None);
+	}
+	if first_log_entry_index.is_none()
+		&& let Some(record) = last_checkpoint_record
+	{
+		replay.checkpoint_only_holders.insert(
+			segment.path.clone(),
+			CheckpointOnlyHolder {
+				records: checkpoint_records,
+				last_record: bytes[record].to_vec(),
+			},
+		);
 	}
 	Ok(Some(WalSegmentMeta {
 		path: segment.path.clone(),
@@ -10566,6 +11696,10 @@ mod recovery_tests {
 			self.inner.rename(from, to).await
 		}
 
+		async fn link_no_replace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+			self.inner.link_no_replace(from, to).await
+		}
+
 		async fn unlink(&self, path: &Path) -> std::io::Result<()> {
 			self.inner.unlink(path).await
 		}
@@ -12518,6 +13652,1858 @@ mod recovery_tests {
 			.map(|entry| entry.log_id.index)
 			.collect::<Vec<_>>();
 		assert_eq!(indexes, vec![1, 2]);
+		// The checkpoint-only segment was replaced by checkpoint + entry, not lost.
+		assert_eq!(
+			reopened_again.recovery_checkpoint().await,
+			Some(RecoveryCheckpoint {
+				commit_index: 1,
+				e_safe_index: 1,
+			})
+		);
+		check_segment_identities(&reopened_again.inner.read().await.wal_segments).unwrap();
+	}
+
+	// Checkpoint-rotation reproductions. Each asserts the invariant that must hold; before the
+	// rotation fix they are expected to fail. Isolated temporary stores, small segments.
+
+	fn entry_bytes(entries: &[Entry<WendelonTypeConfig>]) -> Vec<(u64, Vec<u8>)> {
+		entries
+			.iter()
+			.map(|e| (e.log_id.index, postcard::to_allocvec(e).unwrap()))
+			.collect()
+	}
+
+	/// R1: a checkpoint written while the committed index is behind the WAL tail must not leave a
+	/// segment whose name disagrees with the next entry: every entry survives and the store reopens.
+	#[tokio::test]
+	async fn checkpoint_rotation_behind_tail_keeps_the_store_reopenable() {
+		let dir = tempdir("checkpoint-rotation-behind-tail");
+		let segment = 2 * DIRECT_IO_ALIGN as u64;
+		let mut store = try_open_store_with_segment_bytes(&dir, segment)
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(1, 111), finalize_entry(2, 222)])
+			.await
+			.unwrap();
+		store.save_committed(Some(log_id(1, 1))).await.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(3, 333)])
+			.await
+			.unwrap();
+		let before = entry_bytes(&store.try_get_log_entries(0..=u64::MAX).await.unwrap());
+		drop(store);
+		let mut reopened = try_open_store_with_segment_bytes(&dir, segment)
+			.await
+			.expect("the store reopens after a checkpoint rotation behind the tail");
+		let after = entry_bytes(&reopened.try_get_log_entries(0..=u64::MAX).await.unwrap());
+		assert_eq!(after, before);
+		assert_eq!(
+			after.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+			vec![1, 2, 3]
+		);
+	}
+
+	/// R2: a checkpoint rotation must never replace a segment that already holds flushed entries.
+	/// The evidence is durable-flush evidence (entry bytes and file inventory), not a claim about
+	/// client acknowledgement or quorum commitment.
+	#[tokio::test]
+	async fn checkpoint_rotation_never_replaces_a_flushed_segment() {
+		let dir = tempdir("checkpoint-rotation-clash");
+		let segment = 2 * DIRECT_IO_ALIGN as u64;
+		let mut store = try_open_store_with_segment_bytes(&dir, segment)
+			.await
+			.unwrap();
+		store
+			.blocking_append(
+				(1..=4)
+					.map(|i| finalize_entry(i, 100 * i))
+					.collect::<Vec<_>>(),
+			)
+			.await
+			.unwrap();
+		let flushed = entry_bytes(&store.try_get_log_entries(0..=u64::MAX).await.unwrap());
+		let segments_before = named_segment_paths(&dir);
+		let files_before: Vec<Vec<u8>> = segments_before
+			.iter()
+			.map(|p| std::fs::read(p).unwrap())
+			.collect();
+		store.save_committed(Some(log_id(1, 2))).await.unwrap();
+		for (path, bytes) in segments_before.iter().zip(&files_before) {
+			let now = std::fs::read(path).unwrap();
+			assert!(
+				now.starts_with(bytes),
+				"{} was replaced, not extended",
+				path.display()
+			);
+		}
+		drop(store);
+		let mut reopened = try_open_store_with_segment_bytes(&dir, segment)
+			.await
+			.expect("the store reopens");
+		let after = entry_bytes(&reopened.try_get_log_entries(0..=u64::MAX).await.unwrap());
+		assert_eq!(
+			after, flushed,
+			"every flushed entry survives with identical bytes"
+		);
+	}
+
+	/// R3: rolling over a full checkpoint-only segment must keep the recoverable commit boundary.
+	#[tokio::test]
+	async fn checkpoint_only_rollover_keeps_the_commit_boundary() {
+		let dir = tempdir("checkpoint-only-rollover");
+		let segment = DIRECT_IO_ALIGN as u64;
+		let mut store = try_open_store_with_segment_bytes(&dir, segment)
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(1, 111)])
+			.await
+			.unwrap();
+		store.save_committed(Some(log_id(1, 1))).await.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(2, 222)])
+			.await
+			.unwrap();
+		drop(store);
+		let mut reopened = try_open_store_with_segment_bytes(&dir, segment)
+			.await
+			.expect("the store reopens");
+		assert_eq!(
+			reopened
+				.try_get_log_entries(0..=u64::MAX)
+				.await
+				.unwrap()
+				.iter()
+				.map(|e| e.log_id.index)
+				.collect::<Vec<_>>(),
+			vec![1, 2]
+		);
+		assert_eq!(
+			reopened.recovery_checkpoint().await.map(|c| c.commit_index),
+			Some(1),
+			"the durable commit boundary survives the rollover"
+		);
+		assert_eq!(reopened.read_committed().await.unwrap(), Some(log_id(1, 1)));
+	}
+
+	/// R4: an apply observation older than an already-saved commit must not move the commit pointer
+	/// backwards, in either checkpoint branch, and e_safe never exceeds the commit.
+	#[tokio::test]
+	async fn delayed_older_observation_does_not_regress_the_commit_pointer() {
+		for advance_e_safe in [false, true] {
+			let dir = tempdir("delayed-observation");
+			let mut store = try_open_store_with_segment_bytes(&dir, 64 * DIRECT_IO_ALIGN as u64)
+				.await
+				.unwrap();
+			store
+				.blocking_append(vec![finalize_entry(1, 111), finalize_entry(2, 222)])
+				.await
+				.unwrap();
+			store.save_committed(Some(log_id(1, 2))).await.unwrap();
+			store
+				.write_recovery_checkpoint(CheckpointObservation {
+					last_log_id: Some(log_id(1, 1)),
+					checkpoint: RecoveryCheckpoint {
+						commit_index: 1,
+						e_safe_index: u64::from(advance_e_safe),
+					},
+					force: true,
+				})
+				.await
+				.unwrap();
+			assert_eq!(
+				store.read_committed().await.unwrap(),
+				Some(log_id(1, 2)),
+				"in-memory pointer, e_safe advanced: {advance_e_safe}"
+			);
+			let checkpoint = store.recovery_checkpoint().await.unwrap();
+			assert_eq!(checkpoint.commit_index, 2);
+			assert!(checkpoint.e_safe_index <= checkpoint.commit_index);
+			drop(store);
+			let mut reopened = try_open_store_with_segment_bytes(&dir, 64 * DIRECT_IO_ALIGN as u64)
+				.await
+				.unwrap();
+			assert_eq!(reopened.read_committed().await.unwrap(), Some(log_id(1, 2)));
+			let checkpoint = reopened.recovery_checkpoint().await.unwrap();
+			assert_eq!(checkpoint.commit_index, 2);
+			assert_eq!(checkpoint.e_safe_index, u64::from(advance_e_safe));
+		}
+	}
+
+	// Rotation-fix regressions (X1-X4, I1/I2, poison). Isolated temporary stores.
+
+	fn big_entry(index: u64, bytes: usize) -> Entry<WendelonTypeConfig> {
+		Entry {
+			log_id: log_id(1, index),
+			payload: EntryPayload::Normal(WendelonRequest::SchemaUpdate(vec![0xAB; bytes])),
+		}
+	}
+
+	async fn segment_metadata(store: &WendelonLogStore) -> Vec<(u64, Option<u64>, u64)> {
+		let guard = store.inner.read().await;
+		check_segment_identities(&guard.wal_segments).unwrap();
+		guard
+			.wal_segments
+			.iter()
+			.map(|s| (s.start_index, s.end_log_index, s.len_bytes))
+			.collect()
+	}
+
+	/// N1/X2: appending into a full checkpoint-only segment keeps one metadata entry for that file,
+	/// writes the checkpoint before the entry, and survives reopen with both.
+	#[tokio::test]
+	async fn full_checkpoint_only_segment_takes_checkpoint_then_entry() {
+		let dir = tempdir("checkpoint-only-replacement");
+		let page = DIRECT_IO_ALIGN as u64;
+		let mut store = try_open_store_with_segment_bytes(&dir, page).await.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(1, 111)])
+			.await
+			.unwrap();
+		store.save_committed(Some(log_id(1, 1))).await.unwrap();
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![(1, Some(1), page), (2, None, page)]
+		);
+		store
+			.blocking_append(vec![finalize_entry(2, 222)])
+			.await
+			.unwrap();
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![(1, Some(1), page), (2, Some(2), 2 * page)]
+		);
+		let pointer = store.inner.read().await.entry_positions[&2];
+		assert_eq!(
+			(
+				pointer.segment_start_index,
+				pointer.offset,
+				pointer.len_bytes
+			),
+			(2, page, page)
+		);
+		assert_eq!(named_segment_paths(&dir).len(), 2);
+		let before = entry_bytes(&store.try_get_log_entries(0..=u64::MAX).await.unwrap());
+		drop(store);
+		let mut reopened = try_open_store_with_segment_bytes(&dir, page).await.unwrap();
+		assert_eq!(
+			entry_bytes(&reopened.try_get_log_entries(0..=u64::MAX).await.unwrap()),
+			before
+		);
+		assert_eq!(
+			reopened.recovery_checkpoint().await.map(|c| c.commit_index),
+			Some(1)
+		);
+		assert_eq!(reopened.read_committed().await.unwrap(), Some(log_id(1, 1)));
+	}
+
+	/// X2 with a full-size multi-page entry in a batch that then rotates: the replacement segment
+	/// may exceed segment_bytes by the one checkpoint page, offsets are exact, and reopen agrees.
+	#[tokio::test]
+	async fn multi_page_entry_replaces_checkpoint_only_segment_within_a_batch() {
+		let dir = tempdir("checkpoint-only-multi-page");
+		let page = DIRECT_IO_ALIGN as u64;
+		let segment = 2 * page;
+		let mut store = try_open_store_with_segment_bytes(&dir, segment)
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![big_entry(1, 6000)])
+			.await
+			.unwrap();
+		store.save_committed(Some(log_id(1, 1))).await.unwrap();
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![(1, Some(1), segment), (2, None, page)]
+		);
+		store
+			.blocking_append(vec![big_entry(2, 6000), finalize_entry(3, 333)])
+			.await
+			.unwrap();
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![
+				(1, Some(1), segment),
+				(2, Some(2), page + segment),
+				(3, Some(3), page)
+			]
+		);
+		let positions = store.inner.read().await.entry_positions.clone();
+		assert_eq!(
+			(
+				positions[&2].segment_start_index,
+				positions[&2].offset,
+				positions[&2].len_bytes
+			),
+			(2, page, segment)
+		);
+		assert_eq!(
+			(positions[&3].segment_start_index, positions[&3].offset),
+			(3, 0)
+		);
+		let before = entry_bytes(&store.try_get_log_entries(0..=u64::MAX).await.unwrap());
+		drop(store);
+		let mut reopened = try_open_store_with_segment_bytes(&dir, segment)
+			.await
+			.unwrap();
+		assert_eq!(
+			entry_bytes(&reopened.try_get_log_entries(0..=u64::MAX).await.unwrap()),
+			before
+		);
+		assert_eq!(
+			reopened.recovery_checkpoint().await.map(|c| c.commit_index),
+			Some(1)
+		);
+	}
+
+	/// X3: segment creation never replaces an existing file.
+	#[tokio::test]
+	async fn create_wal_segment_never_replaces_an_existing_name() {
+		let dir = tempdir("segment-no-replace");
+		let wal = dir.join("control.wal");
+		let existing = wal_segment_path(&wal, 5).unwrap();
+		std::fs::write(&existing, b"existing segment bytes").unwrap();
+		let err = match create_wal_segment(&BlockingFileOps, &wal, 5).await {
+			Ok(_) => panic!("an existing segment name must be refused"),
+			Err(err) => err,
+		};
+		assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+		assert_eq!(std::fs::read(&existing).unwrap(), b"existing segment bytes");
+	}
+
+	/// X4: every source that knows the committed index must agree; none means unknown.
+	#[tokio::test]
+	async fn committed_pointer_sources_must_agree() {
+		let a = log_id(1, 4);
+		assert_eq!(
+			resolve_committed_pointer(4, &[Some(a), None, Some(a)]).unwrap(),
+			a
+		);
+		assert_eq!(
+			resolve_committed_pointer(4, &[Some(a), Some(log_id(2, 4))])
+				.unwrap_err()
+				.kind(),
+			ErrorKind::InvalidData
+		);
+		assert_eq!(
+			resolve_committed_pointer(4, &[Some(log_id(1, 3)), None])
+				.unwrap_err()
+				.kind(),
+			ErrorKind::InvalidData
+		);
+		// Genesis comes from a real source at index 0, never from the number alone.
+		let genesis = LogId::default();
+		assert_eq!(
+			resolve_committed_pointer(0, &[Some(genesis)]).unwrap(),
+			genesis
+		);
+		assert!(resolve_committed_pointer(0, &[None]).is_err());
+
+		let dir = tempdir("checkpoint-observation-validation");
+		let mut store = try_open_store_with_segment_bytes(&dir, 64 * DIRECT_IO_ALIGN as u64)
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(1, 111), finalize_entry(2, 222)])
+			.await
+			.unwrap();
+		let mismatched = store
+			.write_recovery_checkpoint(CheckpointObservation {
+				last_log_id: Some(log_id(1, 2)),
+				checkpoint: RecoveryCheckpoint {
+					commit_index: 1,
+					e_safe_index: 0,
+				},
+				force: true,
+			})
+			.await
+			.unwrap_err();
+		assert_eq!(mismatched.kind(), ErrorKind::InvalidData);
+		let unsafe_e = store
+			.write_recovery_checkpoint(CheckpointObservation {
+				last_log_id: Some(log_id(1, 2)),
+				checkpoint: RecoveryCheckpoint {
+					commit_index: 2,
+					e_safe_index: 3,
+				},
+				force: true,
+			})
+			.await
+			.unwrap_err();
+		assert_eq!(unsafe_e.kind(), ErrorKind::InvalidData);
+		// A same-index identity that disagrees with the retained entry is refused.
+		let disagreeing = store
+			.write_recovery_checkpoint(CheckpointObservation {
+				last_log_id: Some(log_id(7, 2)),
+				checkpoint: RecoveryCheckpoint {
+					commit_index: 2,
+					e_safe_index: 0,
+				},
+				force: true,
+			})
+			.await
+			.unwrap_err();
+		assert_eq!(disagreeing.kind(), ErrorKind::InvalidData);
+		assert_eq!(
+			store.recovery_checkpoint().await,
+			None,
+			"pre-effect refusals write nothing"
+		);
+	}
+
+	/// The in-memory store keeps its pre-change behavior: a changed checkpoint is Unsupported,
+	/// an unchanged one only moves the pointer.
+	#[tokio::test]
+	async fn in_memory_store_checkpoint_behavior_is_unchanged() {
+		let store = WendelonLogStore::in_memory();
+		let changed = store
+			.write_recovery_checkpoint(CheckpointObservation {
+				last_log_id: Some(log_id(1, 2)),
+				checkpoint: RecoveryCheckpoint {
+					commit_index: 2,
+					e_safe_index: 0,
+				},
+				force: false,
+			})
+			.await
+			.unwrap_err();
+		assert_eq!(changed.kind(), ErrorKind::Unsupported);
+		store
+			.write_recovery_checkpoint(CheckpointObservation {
+				last_log_id: Some(LogId::default()),
+				checkpoint: RecoveryCheckpoint::default(),
+				force: false,
+			})
+			.await
+			.unwrap();
+		assert_eq!(
+			store.inner.read().await.recovery_committed,
+			Some(LogId::default())
+		);
+	}
+
+	/// D: after an uncertain failure every WAL mutator refuses without touching the disk, and a
+	/// reopen rebuilds a contiguous store from what is on disk.
+	#[tokio::test]
+	async fn poison_after_uncertain_failure_refuses_every_mutator_without_io() {
+		let dir = tempdir("wal-poison");
+		let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+		let mut store =
+			open_store_with_faults(&dir, file_ops.clone(), DIRECT_IO_ALIGN as u64).await;
+		store
+			.blocking_append(vec![finalize_entry(1, 111)])
+			.await
+			.unwrap();
+		file_ops.inject(InjectedFault::on(
+			FaultOp::Fdatasync,
+			FaultAction::Error {
+				kind: ErrorKind::Other,
+				message: "injected fdatasync failure".into(),
+			},
+		));
+		assert!(
+			store
+				.blocking_append(vec![finalize_entry(2, 222)])
+				.await
+				.is_err()
+		);
+		assert!(store.inner.read().await.poisoned.is_some());
+		let files = named_segment_paths(&dir)
+			.iter()
+			.map(|p| (p.clone(), std::fs::read(p).unwrap()))
+			.collect::<Vec<_>>();
+		assert!(
+			store
+				.blocking_append(vec![finalize_entry(3, 333)])
+				.await
+				.is_err()
+		);
+		assert!(store.save_committed(Some(log_id(1, 1))).await.is_err());
+		assert!(store.truncate(log_id(1, 1)).await.is_err());
+		assert!(store.purge(log_id(1, 1)).await.is_err());
+		assert!(
+			store
+				.write_recovery_checkpoint(CheckpointObservation {
+					last_log_id: Some(log_id(1, 1)),
+					checkpoint: RecoveryCheckpoint {
+						commit_index: 1,
+						e_safe_index: 0,
+					},
+					force: true,
+				})
+				.await
+				.is_err()
+		);
+		let after = named_segment_paths(&dir)
+			.iter()
+			.map(|p| (p.clone(), std::fs::read(p).unwrap()))
+			.collect::<Vec<_>>();
+		assert_eq!(after, files, "a poisoned store does no WAL I/O");
+		drop(store);
+		let mut reopened =
+			open_store_with_faults(&dir, file_ops.clone(), DIRECT_IO_ALIGN as u64).await;
+		let indexes = reopened
+			.try_get_log_entries(0..=u64::MAX)
+			.await
+			.unwrap()
+			.iter()
+			.map(|e| e.log_id.index)
+			.collect::<Vec<_>>();
+		assert!(indexes == vec![1] || indexes == vec![1, 2], "{indexes:?}");
+	}
+
+	/// D/X2: a replacement whose rename succeeded but whose directory sync failed poisons the
+	/// store; the published replacement is what a reopen finds, and nothing writes the old inode.
+	#[tokio::test]
+	async fn replacement_directory_sync_failure_poisons_the_store() {
+		let dir = tempdir("replacement-dir-sync");
+		let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+		let mut store =
+			open_store_with_faults(&dir, file_ops.clone(), DIRECT_IO_ALIGN as u64).await;
+		store
+			.blocking_append(vec![finalize_entry(1, 111)])
+			.await
+			.unwrap();
+		store.save_committed(Some(log_id(1, 1))).await.unwrap();
+		file_ops.inject(InjectedFault::on(
+			FaultOp::FsyncDir,
+			FaultAction::Error {
+				kind: ErrorKind::Other,
+				message: "injected directory sync failure".into(),
+			},
+		));
+		assert!(
+			store
+				.blocking_append(vec![finalize_entry(2, 222)])
+				.await
+				.is_err()
+		);
+		assert_eq!(
+			store.inner.read().await.poisoned.map(|p| (p.op, p.step)),
+			Some(("append", "replace"))
+		);
+		assert!(store.save_committed(Some(log_id(1, 1))).await.is_err());
+		assert!(
+			store
+				.blocking_append(vec![finalize_entry(2, 222)])
+				.await
+				.is_err()
+		);
+		drop(store);
+		let mut reopened =
+			open_store_with_faults(&dir, file_ops.clone(), DIRECT_IO_ALIGN as u64).await;
+		assert_eq!(
+			reopened
+				.try_get_log_entries(0..=u64::MAX)
+				.await
+				.unwrap()
+				.iter()
+				.map(|e| e.log_id.index)
+				.collect::<Vec<_>>(),
+			vec![1, 2]
+		);
+		assert_eq!(
+			reopened.recovery_checkpoint().await.map(|c| c.commit_index),
+			Some(1)
+		);
+	}
+
+	// B r3, P1, P2: crash-safe truncate and purge, and open-time completion. A stop is an injected
+	// error at one occurrence of one syscall kind. After a stop the store is reopened from the same
+	// page cache, and again after `crash` keeps only what was synced. This is same-page-cache
+	// interruption evidence with a synced-filesystem model, not physical power-loss testing.
+
+	const WAL_PAGE: u64 = DIRECT_IO_ALIGN as u64;
+	const STOP_OPS: [FaultOp; 6] = [
+		FaultOp::WriteAt,
+		FaultOp::Fdatasync,
+		FaultOp::Fsync,
+		FaultOp::Link,
+		FaultOp::Unlink,
+		FaultOp::FsyncDir,
+	];
+
+	#[derive(Clone, Copy, Debug)]
+	enum Mutation {
+		Truncate(u64),
+		Purge(u64),
+	}
+
+	async fn mutate(
+		store: &mut WendelonLogStore,
+		mutation: Mutation,
+	) -> Result<(), StorageError<u32>> {
+		match mutation {
+			Mutation::Truncate(k) => store.truncate(log_id(1, k)).await,
+			Mutation::Purge(p) => store.purge(log_id(1, p)).await,
+		}
+	}
+
+	/// What a store recovers: its entries (index and bytes), its checkpoint, and every named
+	/// segment file as (start, length).
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	struct Recovered {
+		entries: Vec<(u64, Vec<u8>)>,
+		checkpoint: Option<RecoveryCheckpoint>,
+		files: Vec<(u64, u64)>,
+	}
+
+	fn segment_files(dir: &Path) -> Vec<(u64, u64)> {
+		let mut out: Vec<(u64, u64)> = named_segment_paths(dir)
+			.iter()
+			.map(|path| {
+				let name = path.file_name().unwrap().to_str().unwrap();
+				let start = name
+					.trim_start_matches("control.wal.")
+					.trim_end_matches(".seg")
+					.parse()
+					.unwrap();
+				(start, std::fs::metadata(path).unwrap().len())
+			})
+			.collect();
+		out.sort_unstable();
+		out
+	}
+
+	fn artifact_bytes(dir: &Path) -> Vec<(String, Vec<u8>)> {
+		let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+			.unwrap()
+			.map(|entry| {
+				let entry = entry.unwrap();
+				(
+					entry.file_name().into_string().unwrap(),
+					std::fs::read(entry.path()).unwrap(),
+				)
+			})
+			.collect();
+		out.sort();
+		out
+	}
+
+	async fn recovered(store: &mut WendelonLogStore, dir: &Path) -> Recovered {
+		Recovered {
+			entries: entry_bytes(&store.try_get_log_entries(0..=u64::MAX).await.unwrap()),
+			checkpoint: store.recovery_checkpoint().await,
+			files: segment_files(dir),
+		}
+	}
+
+	async fn reopen(dir: &Path, segment_bytes: u64, label: &str) -> (WendelonLogStore, Recovered) {
+		let mut store = try_open_store_with_segment_bytes(dir, segment_bytes)
+			.await
+			.unwrap_or_else(|e| panic!("{label}: reopen: {e}"));
+		let seen = recovered(&mut store, dir).await;
+		(store, seen)
+	}
+
+	async fn try_open_faulty(
+		dir: &Path,
+		file_ops: Arc<FaultyFileOps>,
+		segment_bytes: u64,
+	) -> std::io::Result<WendelonLogStore> {
+		let (wal, vote, snapshot) = artifact_paths(dir);
+		WendelonLogStore::open_with_file_ops_and_options(
+			&wal,
+			&vote,
+			&snapshot,
+			file_ops,
+			WalOptions { segment_bytes },
+		)
+		.await
+	}
+
+	fn stop_at(op: FaultOp, occurrence: usize) -> InjectedFault {
+		InjectedFault::on(
+			op,
+			FaultAction::Error {
+				kind: ErrorKind::Other,
+				message: format!("stop at {op:?} #{occurrence}"),
+			},
+		)
+		.after_matches(occurrence)
+	}
+
+	fn copy_store(seed: &Path) -> PathBuf {
+		let dir = tempdir("stop");
+		copy_flat_artifacts(seed, &dir, None);
+		dir
+	}
+
+	async fn checkpoint(store: &WendelonLogStore, commit: u64, e_safe: u64) {
+		store
+			.write_recovery_checkpoint(CheckpointObservation {
+				last_log_id: Some(log_id(1, commit)),
+				checkpoint: RecoveryCheckpoint {
+					commit_index: commit,
+					e_safe_index: e_safe,
+				},
+				force: true,
+			})
+			.await
+			.unwrap();
+	}
+
+	fn snapshot_at(dir: &Path, index: u64) {
+		let mut state = SmState::default();
+		state.last_applied_log_id = Some(log_id(1, index));
+		write_snapshot_file(&artifact_paths(dir).2, &state);
+	}
+
+	fn segment_file(dir: &Path, start: u64) -> PathBuf {
+		wal_segment_path(&artifact_paths(dir).0, start).unwrap()
+	}
+
+	fn assert_contiguous_prefix(
+		seen: &[(u64, Vec<u8>)],
+		original: &[(u64, Vec<u8>)],
+		at_least: usize,
+		label: &str,
+	) {
+		assert!(
+			seen.len() >= at_least && seen.len() <= original.len(),
+			"{label}: {} entries recovered",
+			seen.len()
+		);
+		assert_eq!(
+			seen,
+			&original[..seen.len()],
+			"{label}: a contiguous prefix with identical bytes"
+		);
+	}
+
+	/// One stop: where, what each reopen recovered, and what the completed retry recovered.
+	struct Stop {
+		label: String,
+		after_stops: Vec<Recovered>,
+		after_retry: Recovered,
+	}
+
+	/// Runs `mutation` on a copy of `seed`, stopped at every occurrence of every syscall kind
+	/// until an occurrence is never reached. `install`, when given, is a snapshot artifact placed
+	/// and synced after open and before the mutation: an install the store has not seen. Each stop
+	/// must fail the mutation and poison the store (a second attempt refuses with no file change).
+	/// The copy is then reopened; for `rounds` > 1 the retry is stopped again at the same point and
+	/// reopened, before a final retry that must complete.
+	async fn stops(
+		seed: &Path,
+		segment_bytes: u64,
+		mutation: Mutation,
+		install: Option<&Path>,
+		rounds: usize,
+	) -> Vec<Stop> {
+		let mut out = Vec::new();
+		for op in STOP_OPS {
+			for occurrence in 0.. {
+				let mut reached = false;
+				for crash in [false, true] {
+					let label = format!(
+						"{mutation:?} stopped at {op:?} #{occurrence}{}",
+						if crash { " then crash" } else { "" }
+					);
+					let dir = copy_store(seed);
+					let mut after_stops = Vec::new();
+					for round in 0..rounds {
+						let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+						let mut store = try_open_faulty(&dir, file_ops.clone(), segment_bytes)
+							.await
+							.unwrap_or_else(|e| panic!("{label}: open in round {round}: {e}"));
+						if round == 0
+							&& let Some(snapshot) = install
+						{
+							std::fs::copy(snapshot, artifact_paths(&dir).2).unwrap();
+							file_ops.fsync_dir(&dir).await.unwrap();
+						}
+						file_ops.inject(stop_at(op, occurrence));
+						if mutate(&mut store, mutation).await.is_ok() {
+							break;
+						}
+						let files = artifact_bytes(&dir);
+						assert!(
+							mutate(&mut store, mutation).await.is_err(),
+							"{label}: the poisoned store refuses"
+						);
+						assert_eq!(
+							artifact_bytes(&dir),
+							files,
+							"{label}: a refused mutation has no effect"
+						);
+						drop(store);
+						if crash {
+							file_ops.crash().unwrap();
+						}
+						after_stops.push(reopen(&dir, segment_bytes, &label).await.1);
+					}
+					if after_stops.is_empty() {
+						break;
+					}
+					reached = true;
+					let (mut store, _) = reopen(&dir, segment_bytes, &label).await;
+					mutate(&mut store, mutation)
+						.await
+						.unwrap_or_else(|e| panic!("{label}: retry: {e}"));
+					drop(store);
+					let after_retry = reopen(&dir, segment_bytes, &label).await.1;
+					out.push(Stop {
+						label,
+						after_stops,
+						after_retry,
+					});
+				}
+				if !reached {
+					break;
+				}
+			}
+		}
+		out
+	}
+
+	/// Segments of three pages: [1,2,3] [C_old,4,5] [6,C,7], C_old = {1,0}, C = {2,1}.
+	async fn seed_older_checkpoint_in_suffix() -> PathBuf {
+		let dir = tempdir("truncate-older-checkpoint");
+		let mut store = try_open_store_with_segment_bytes(&dir, 3 * WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(
+				(1..=3)
+					.map(|i| finalize_entry(i, 100 * i))
+					.collect::<Vec<_>>(),
+			)
+			.await
+			.unwrap();
+		checkpoint(&store, 1, 0).await;
+		store
+			.blocking_append(vec![finalize_entry(4, 400), finalize_entry(5, 500)])
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(6, 600)])
+			.await
+			.unwrap();
+		checkpoint(&store, 2, 1).await;
+		store
+			.blocking_append(vec![finalize_entry(7, 700)])
+			.await
+			.unwrap();
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![
+				(1, Some(3), 3 * WAL_PAGE),
+				(4, Some(5), 3 * WAL_PAGE),
+				(6, Some(7), 3 * WAL_PAGE)
+			]
+		);
+		dir
+	}
+
+	#[tokio::test]
+	async fn truncate_with_older_checkpoint_in_surviving_suffix_keeps_latest() {
+		let seed = seed_older_checkpoint_in_suffix().await;
+		let original = reopen(&seed, 3 * WAL_PAGE, "seed").await.1;
+		let c = Some(RecoveryCheckpoint {
+			commit_index: 2,
+			e_safe_index: 1,
+		});
+		assert_eq!(original.checkpoint, c);
+		let all = stops(&seed, 3 * WAL_PAGE, Mutation::Truncate(3), None, 1).await;
+		for op in [
+			"Unlink #0",
+			"Unlink #1",
+			"Unlink #2",
+			"FsyncDir #2",
+			"FsyncDir #3",
+		] {
+			assert!(
+				all.iter().any(|stop| stop.label.contains(op)),
+				"a stop at {op}"
+			);
+		}
+		for stop in &all {
+			for seen in &stop.after_stops {
+				assert_eq!(
+					seen.checkpoint, c,
+					"{}: the latest checkpoint wins",
+					stop.label
+				);
+				assert_contiguous_prefix(&seen.entries, &original.entries, 2, &stop.label);
+			}
+			assert_eq!(stop.after_retry.checkpoint, c, "{}", stop.label);
+			assert_eq!(
+				stop.after_retry.entries,
+				original.entries[..2].to_vec(),
+				"{}",
+				stop.label
+			);
+			assert_eq!(
+				stop.after_retry.files,
+				vec![(1, 2 * WAL_PAGE), (3, WAL_PAGE)],
+				"{}",
+				stop.label
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn truncate_first_segment_holds_k_to_m_then_more() {
+		let seed = tempdir("truncate-first-segment");
+		let mut store = try_open_store_with_segment_bytes(&seed, 3 * WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(
+				(1..=5)
+					.map(|i| finalize_entry(i, 100 * i))
+					.collect::<Vec<_>>(),
+			)
+			.await
+			.unwrap();
+		checkpoint(&store, 1, 1).await;
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![(1, Some(3), 3 * WAL_PAGE), (4, Some(5), 3 * WAL_PAGE)]
+		);
+		drop(store);
+		let original = reopen(&seed, 3 * WAL_PAGE, "seed").await.1;
+		let c = Some(RecoveryCheckpoint {
+			commit_index: 1,
+			e_safe_index: 1,
+		});
+		for stop in stops(&seed, 3 * WAL_PAGE, Mutation::Truncate(2), None, 1).await {
+			for seen in &stop.after_stops {
+				assert_eq!(seen.checkpoint, c, "{}", stop.label);
+				assert_contiguous_prefix(&seen.entries, &original.entries, 1, &stop.label);
+			}
+			assert_eq!(stop.after_retry.checkpoint, c, "{}", stop.label);
+			assert_eq!(stop.after_retry.entries, original.entries[..1].to_vec());
+			assert_eq!(
+				stop.after_retry.files,
+				vec![(1, WAL_PAGE), (2, WAL_PAGE)],
+				"{}",
+				stop.label
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn truncate_without_checkpoint_obeys_poison_and_prefix() {
+		let seed = tempdir("truncate-no-checkpoint");
+		let mut store = try_open_store_with_segment_bytes(&seed, 2 * WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(
+				(1..=5)
+					.map(|i| finalize_entry(i, 100 * i))
+					.collect::<Vec<_>>(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(store.recovery_checkpoint().await, None);
+		drop(store);
+		let original = reopen(&seed, 2 * WAL_PAGE, "seed").await.1;
+		let all = stops(&seed, 2 * WAL_PAGE, Mutation::Truncate(2), None, 1).await;
+		assert!(all.iter().any(|stop| stop.label.contains("Unlink #1")));
+		for stop in all {
+			for seen in &stop.after_stops {
+				assert_eq!(seen.checkpoint, None, "{}", stop.label);
+				assert_contiguous_prefix(&seen.entries, &original.entries, 1, &stop.label);
+			}
+			assert_eq!(stop.after_retry.entries, original.entries[..1].to_vec());
+			assert_eq!(
+				stop.after_retry.files,
+				vec![(1, WAL_PAGE)],
+				"{}",
+				stop.label
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn truncate_noop_when_nothing_at_or_above_k() {
+		let dir = tempdir("truncate-noop");
+		let mut store = try_open_store_with_segment_bytes(&dir, 2 * WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(
+				(1..=3)
+					.map(|i| finalize_entry(i, 100 * i))
+					.collect::<Vec<_>>(),
+			)
+			.await
+			.unwrap();
+		checkpoint(&store, 2, 2).await;
+		let files = artifact_bytes(&dir);
+		let before = recovered(&mut store, &dir).await;
+		store.truncate(log_id(1, 4)).await.unwrap();
+		assert_eq!(artifact_bytes(&dir), files, "no file effect");
+		assert_eq!(recovered(&mut store, &dir).await, before);
+		// A committed entry is never truncated: refused before any effect, without poison.
+		assert!(store.truncate(log_id(1, 2)).await.is_err());
+		assert_eq!(artifact_bytes(&dir), files);
+		assert!(store.inner.read().await.poisoned.is_none());
+	}
+
+	#[tokio::test]
+	async fn truncate_retry_after_each_stop_is_bounded() {
+		let seed = tempdir("truncate-retry-bounded");
+		let mut store = try_open_store_with_segment_bytes(&seed, WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(1, 100)])
+			.await
+			.unwrap();
+		checkpoint(&store, 1, 1).await;
+		store
+			.blocking_append(vec![finalize_entry(2, 200)])
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(3, 300)])
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(4, 400)])
+			.await
+			.unwrap();
+		checkpoint(&store, 2, 2).await;
+		// Segment 2 is X2-extended (checkpoint then entry): one page past the segment size.
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![
+				(1, Some(1), WAL_PAGE),
+				(2, Some(2), 2 * WAL_PAGE),
+				(3, Some(3), WAL_PAGE),
+				(4, Some(4), WAL_PAGE),
+				(5, None, WAL_PAGE)
+			]
+		);
+		drop(store);
+		let original = reopen(&seed, WAL_PAGE, "seed").await.1;
+		let c = Some(RecoveryCheckpoint {
+			commit_index: 2,
+			e_safe_index: 2,
+		});
+		for stop in stops(&seed, WAL_PAGE, Mutation::Truncate(3), None, 3).await {
+			for seen in stop.after_stops.iter().chain([&stop.after_retry]) {
+				assert_eq!(seen.checkpoint, c, "{}", stop.label);
+				assert_contiguous_prefix(&seen.entries, &original.entries, 2, &stop.label);
+				assert!(
+					seen.files.iter().all(|(_, len)| *len <= 2 * WAL_PAGE),
+					"{}: no file grows past the segment size plus a page: {:?}",
+					stop.label,
+					seen.files
+				);
+				let tail = seen.entries.last().map_or(0, |(index, _)| *index);
+				assert!(
+					seen.files.iter().filter(|(start, _)| *start > tail).count() <= 2,
+					"{}: at most two checkpoint holders: {:?}",
+					stop.label,
+					seen.files
+				);
+			}
+			assert_eq!(
+				stop.after_retry.files,
+				vec![(1, WAL_PAGE), (2, 2 * WAL_PAGE), (3, WAL_PAGE)],
+				"{}",
+				stop.label
+			);
+		}
+	}
+
+	/// The state a truncate leaves between its steps 2 and 5, built by hand: [1,2,3] and the
+	/// holder Z = "8" holding C, past the tail.
+	fn seed_misnamed_holder(target: Option<Vec<AlignedBuf>>) -> PathBuf {
+		let dir = tempdir("misnamed-holder");
+		let pages: Vec<AlignedBuf> = (1..=3)
+			.map(|i| serialize_entry_page(&finalize_entry(i, 100 * i)).unwrap())
+			.collect();
+		write_wal_pages(&segment_file(&dir, 1), &pages);
+		write_wal_pages(
+			&segment_file(&dir, 8),
+			&[serialize_checkpoint_page(2, 1, 2, 1)],
+		);
+		if let Some(target) = target {
+			write_wal_pages(&segment_file(&dir, 4), &target);
+		}
+		dir
+	}
+
+	#[tokio::test]
+	async fn open_completes_misnamed_trailing_checkpoint_segment() {
+		let c = Some(RecoveryCheckpoint {
+			commit_index: 2,
+			e_safe_index: 1,
+		});
+		let page = serialize_checkpoint_page(2, 1, 2, 1).as_slice().to_vec();
+		// Absent target: published byte for byte, then Z goes.
+		// Present and equal: re-synced, then Z goes.
+		for target in [None, Some(vec![serialize_checkpoint_page(2, 1, 2, 1)])] {
+			let dir = seed_misnamed_holder(target);
+			let (_, seen) = reopen(&dir, 3 * WAL_PAGE, "complete").await;
+			assert_eq!(seen.files, vec![(1, 3 * WAL_PAGE), (4, WAL_PAGE)]);
+			assert_eq!(seen.checkpoint, c);
+			assert_eq!(seen.entries.len(), 3);
+			assert_eq!(std::fs::read(segment_file(&dir, 4)).unwrap(), page);
+		}
+		// Unequal, or more than the one record: refused, with no effect.
+		for target in [
+			vec![serialize_checkpoint_page(1, 0, 1, 1)],
+			vec![
+				serialize_checkpoint_page(2, 1, 2, 1),
+				serialize_checkpoint_page(2, 1, 2, 1),
+			],
+		] {
+			let dir = seed_misnamed_holder(Some(target));
+			let files = artifact_bytes(&dir);
+			let err = try_open_store_with_segment_bytes(&dir, 3 * WAL_PAGE)
+				.await
+				.err()
+				.expect("an unequal target refuses open");
+			assert_eq!(err.kind(), ErrorKind::InvalidData, "{err}");
+			assert_eq!(artifact_bytes(&dir), files);
+		}
+	}
+
+	/// Stops at every syscall of open-time completion, each followed by repeated stopped opens and
+	/// a final open that completes.
+	async fn completion_stops(seed: &Path, segment_bytes: u64, expect: &Recovered) {
+		let mut reached_any = false;
+		for op in STOP_OPS {
+			for occurrence in 0.. {
+				let mut reached = false;
+				for crash in [false, true] {
+					let label = format!(
+						"open stopped at {op:?} #{occurrence}{}",
+						if crash { " then crash" } else { "" }
+					);
+					let dir = copy_store(seed);
+					for round in 0..2 {
+						let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+						file_ops.inject(stop_at(op, occurrence));
+						match try_open_faulty(&dir, file_ops.clone(), segment_bytes).await {
+							Ok(_) => break,
+							Err(_) => {
+								reached = true;
+								reached_any = true;
+								if crash {
+									file_ops.crash().unwrap();
+								}
+							}
+						}
+						let _ = round;
+					}
+					let (_, seen) = reopen(&dir, segment_bytes, &label).await;
+					assert_eq!(&seen, expect, "{label}");
+				}
+				if !reached {
+					break;
+				}
+			}
+		}
+		assert!(reached_any);
+	}
+
+	#[tokio::test]
+	async fn open_completion_stops_are_retry_safe() {
+		let page = serialize_checkpoint_page(2, 1, 2, 1).as_slice().to_vec();
+		let seed = seed_misnamed_holder(None);
+		let expect = Recovered {
+			entries: entry_bytes(
+				&(1..=3)
+					.map(|i| finalize_entry(i, 100 * i))
+					.collect::<Vec<_>>(),
+			),
+			checkpoint: Some(RecoveryCheckpoint {
+				commit_index: 2,
+				e_safe_index: 1,
+			}),
+			files: vec![(1, 3 * WAL_PAGE), (4, WAL_PAGE)],
+		};
+		completion_stops(&seed, 3 * WAL_PAGE, &expect).await;
+		// The snapshot-explained shape: [1,2,3], Z = "3" holding C, snapshot at 3.
+		let below = tempdir("below-tail-explained");
+		let pages: Vec<AlignedBuf> = (1..=3)
+			.map(|i| serialize_entry_page(&finalize_entry(i, 100 * i)).unwrap())
+			.collect();
+		write_wal_pages(&segment_file(&below, 1), &pages);
+		write_wal_pages(
+			&segment_file(&below, 3),
+			&[serialize_checkpoint_page(3, 3, 3, 1)],
+		);
+		snapshot_at(&below, 3);
+		let expect = Recovered {
+			entries: Vec::new(),
+			checkpoint: Some(RecoveryCheckpoint {
+				commit_index: 3,
+				e_safe_index: 3,
+			}),
+			files: vec![(1, 3 * WAL_PAGE), (4, WAL_PAGE)],
+		};
+		completion_stops(&below, 3 * WAL_PAGE, &expect).await;
+		let _ = page;
+	}
+
+	#[tokio::test]
+	async fn open_refuses_unexplained_below_tail_holder_without_effect() {
+		let build = |snapshot: Option<u64>| {
+			let dir = tempdir("below-tail");
+			let pages: Vec<AlignedBuf> = (1..=3)
+				.map(|i| serialize_entry_page(&finalize_entry(i, 100 * i)).unwrap())
+				.collect();
+			write_wal_pages(&segment_file(&dir, 1), &pages);
+			write_wal_pages(
+				&segment_file(&dir, 3),
+				&[serialize_checkpoint_page(2, 2, 2, 1)],
+			);
+			if let Some(index) = snapshot {
+				snapshot_at(&dir, index);
+			}
+			dir
+		};
+		// No snapshot (the pre-fix R1 shape), and a snapshot that leaves entry 3 retained past Z.
+		for snapshot in [None, Some(2)] {
+			let dir = build(snapshot);
+			let files = artifact_bytes(&dir);
+			let err = try_open_store_with_segment_bytes(&dir, 3 * WAL_PAGE)
+				.await
+				.err()
+				.expect("an unexplained below-tail holder refuses open");
+			assert_eq!(err.kind(), ErrorKind::InvalidData, "{snapshot:?}: {err}");
+			assert_eq!(artifact_bytes(&dir), files, "{snapshot:?}");
+		}
+		// A corrupt snapshot refuses before completion.
+		let dir = build(Some(3));
+		let snapshot_path = artifact_paths(&dir).2;
+		let mut bytes = std::fs::read(&snapshot_path).unwrap();
+		let last = bytes.len() - 1;
+		bytes[last] ^= 0xFF;
+		std::fs::write(&snapshot_path, bytes).unwrap();
+		let files = artifact_bytes(&dir);
+		assert!(
+			try_open_store_with_segment_bytes(&dir, 3 * WAL_PAGE)
+				.await
+				.is_err()
+		);
+		assert_eq!(artifact_bytes(&dir), files);
+		// Full retention refuses a snapshot before replay: no completion effect.
+		let dir = build(Some(3));
+		let files = artifact_bytes(&dir);
+		let guard = retention::RetentionGuard::new(crate::consensus::ControlRetention::Full);
+		assert!(
+			WendelonLogStore::open_for_retention_test(&dir, 3 * WAL_PAGE, Some(guard))
+				.await
+				.is_err()
+		);
+		assert_eq!(artifact_bytes(&dir), files);
+		// Explained by a valid snapshot at 3: completes.
+		let dir = build(Some(3));
+		let (_, seen) = reopen(&dir, 3 * WAL_PAGE, "explained").await;
+		assert_eq!(seen.files, vec![(1, 3 * WAL_PAGE), (4, WAL_PAGE)]);
+		assert!(seen.entries.is_empty());
+		assert_eq!(
+			seen.checkpoint, None,
+			"commit 2 < snapshot 3 stays superseded"
+		);
+	}
+
+	#[tokio::test]
+	async fn purge_all_log_segments_with_spare_tail_room() {
+		let seed = tempdir("purge-spare-room");
+		let mut store = try_open_store_with_segment_bytes(&seed, 3 * WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(
+				(1..=4)
+					.map(|i| finalize_entry(i, 100 * i))
+					.collect::<Vec<_>>(),
+			)
+			.await
+			.unwrap();
+		checkpoint(&store, 4, 4).await;
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![(1, Some(3), 3 * WAL_PAGE), (4, Some(4), 2 * WAL_PAGE)]
+		);
+		drop(store);
+		snapshot_at(&seed, 4);
+		let c = Some(RecoveryCheckpoint {
+			commit_index: 4,
+			e_safe_index: 4,
+		});
+		assert_eq!(reopen(&seed, 3 * WAL_PAGE, "seed").await.1.checkpoint, c);
+		for stop in stops(&seed, 3 * WAL_PAGE, Mutation::Purge(4), None, 1).await {
+			for seen in &stop.after_stops {
+				assert_eq!(seen.checkpoint, c, "{}", stop.label);
+				assert!(seen.entries.is_empty());
+			}
+			assert_eq!(stop.after_retry.checkpoint, c, "{}", stop.label);
+			// Preservation went to a new holder named 5, not into the purged tail segment 4; a
+			// retry may append C′ to it once more, within the segment.
+			assert!(
+				matches!(stop.after_retry.files.as_slice(), [(5, len)] if *len <= 3 * WAL_PAGE),
+				"{}: {:?}",
+				stop.label,
+				stop.after_retry.files
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn purge_full_checkpoint_only_tail_replaces_not_collides() {
+		let seed = tempdir("purge-full-holder");
+		let mut store = try_open_store_with_segment_bytes(&seed, WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(1, 100)])
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(2, 200)])
+			.await
+			.unwrap();
+		checkpoint(&store, 2, 2).await;
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![
+				(1, Some(1), WAL_PAGE),
+				(2, Some(2), WAL_PAGE),
+				(3, None, WAL_PAGE)
+			]
+		);
+		drop(store);
+		snapshot_at(&seed, 2);
+		let c = Some(RecoveryCheckpoint {
+			commit_index: 2,
+			e_safe_index: 2,
+		});
+		for stop in stops(&seed, WAL_PAGE, Mutation::Purge(2), None, 1).await {
+			for seen in &stop.after_stops {
+				assert_eq!(seen.checkpoint, c, "{}", stop.label);
+			}
+			assert_eq!(stop.after_retry.checkpoint, c, "{}", stop.label);
+			assert_eq!(
+				stop.after_retry.files,
+				vec![(3, WAL_PAGE)],
+				"{}",
+				stop.label
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn purge_never_deletes_checkpoint_only() {
+		let dir = tempdir("purge-keeps-holder");
+		let mut store = try_open_store_with_segment_bytes(&dir, WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(1, 100)])
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(2, 200)])
+			.await
+			.unwrap();
+		checkpoint(&store, 2, 2).await;
+		snapshot_at(&dir, 2);
+		store.purge(log_id(1, 2)).await.unwrap();
+		assert_eq!(segment_metadata(&store).await, vec![(3, None, WAL_PAGE)]);
+		// N1: the converted holder has one metadata entry and later purge/truncate keep it.
+		store
+			.blocking_append(vec![finalize_entry(3, 300)])
+			.await
+			.unwrap();
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![(3, Some(3), 2 * WAL_PAGE)]
+		);
+		store.purge(log_id(1, 2)).await.unwrap();
+		store.truncate(log_id(1, 4)).await.unwrap();
+		assert!(segment_file(&dir, 3).exists());
+		drop(store);
+		let (_, seen) = reopen(&dir, WAL_PAGE, "holder").await;
+		assert_eq!(
+			seen.entries.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+			vec![3]
+		);
+		assert_eq!(seen.files, vec![(3, 2 * WAL_PAGE)]);
+	}
+
+	#[tokio::test]
+	async fn snapshot_strict_rule_unchanged() {
+		for (snapshot, expect) in [
+			(
+				2,
+				Some(RecoveryCheckpoint {
+					commit_index: 2,
+					e_safe_index: 2,
+				}),
+			),
+			(3, None),
+		] {
+			let dir = tempdir("strict-rule");
+			let mut store = try_open_store_with_segment_bytes(&dir, 4 * WAL_PAGE)
+				.await
+				.unwrap();
+			store
+				.blocking_append(
+					(1..=3)
+						.map(|i| finalize_entry(i, 100 * i))
+						.collect::<Vec<_>>(),
+				)
+				.await
+				.unwrap();
+			checkpoint(&store, 2, 2).await;
+			drop(store);
+			snapshot_at(&dir, snapshot);
+			let (_, seen) = reopen(&dir, 4 * WAL_PAGE, "strict").await;
+			assert_eq!(seen.checkpoint, expect, "snapshot at {snapshot}");
+		}
+	}
+
+	/// A follower with entry 1 and a checkpoint-only active segment "2" installs a real snapshot
+	/// at 3 (s > n). Either it stops before the purge and reopens (P2), or it purges (P1); with and
+	/// without a coordinator checkpoint emitted between the install and the purge.
+	#[tokio::test]
+	async fn snapshot_install_past_the_tail_reopens_and_purges() {
+		let source_dir = tempdir("install-source");
+		let mut source_store = open_store(&source_dir).await;
+		let mut source_sm = source_store.recovered_state_machine().await.unwrap();
+		for (i, start) in [(1, 0), (2, 10), (3, 20)] {
+			append_and_apply(
+				&mut source_store,
+				&mut source_sm,
+				lease_entry(i, start, start + 9, 3),
+			)
+			.await;
+		}
+		for emit in [false, true] {
+			for stop_before_purge in [true, false] {
+				let label = format!("emit {emit}, stop before purge {stop_before_purge}");
+				let mut builder = <WendelonStateMachine as RaftStateMachine<
+					WendelonTypeConfig,
+				>>::get_snapshot_builder(&mut source_sm)
+				.await;
+				let built = builder.build_snapshot().await.unwrap();
+				assert_eq!(built.meta.last_log_id, Some(log_id(1, 3)));
+				let dir = tempdir("install-target");
+				let mut store = try_open_store_with_segment_bytes(&dir, WAL_PAGE)
+					.await
+					.unwrap();
+				store
+					.blocking_append(vec![finalize_entry(1, 100)])
+					.await
+					.unwrap();
+				checkpoint(&store, 1, 1).await;
+				assert_eq!(
+					segment_metadata(&store).await,
+					vec![(1, Some(1), WAL_PAGE), (2, None, WAL_PAGE)]
+				);
+				let mut sm = store.recovered_state_machine().await.unwrap();
+				<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+					&mut sm,
+					&built.meta,
+					built.snapshot,
+				)
+				.await
+				.unwrap();
+				if emit {
+					checkpoint(&store, 3, 3).await;
+				}
+				let expect = emit.then_some(RecoveryCheckpoint {
+					commit_index: 3,
+					e_safe_index: 3,
+				});
+				if stop_before_purge {
+					drop(sm);
+					drop(store);
+					let (mut reopened, seen) = reopen(&dir, WAL_PAGE, &label).await;
+					assert_eq!(seen.files, vec![(1, WAL_PAGE), (4, WAL_PAGE)], "{label}");
+					assert_eq!(seen.checkpoint, expect, "{label}");
+					assert!(seen.entries.is_empty());
+					reopened.purge(log_id(1, 3)).await.unwrap();
+					store = reopened;
+				} else {
+					store.purge(log_id(1, 3)).await.unwrap();
+				}
+				assert_eq!(segment_metadata(&store).await, vec![(4, None, WAL_PAGE)]);
+				store
+					.blocking_append(vec![finalize_entry(4, 400)])
+					.await
+					.unwrap();
+				drop(store);
+				let (_, seen) = reopen(&dir, WAL_PAGE, &label).await;
+				// A checkpoint superseded at open carries no authority: the full holder is then
+				// replaced by the entry alone. Otherwise the checkpoint precedes the entry.
+				let pages = if emit || !stop_before_purge { 2 } else { 1 };
+				assert_eq!(seen.files, vec![(4, pages * WAL_PAGE)], "{label}");
+				assert_eq!(seen.checkpoint, expect, "{label}");
+				assert_eq!(
+					seen.entries.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+					vec![4]
+				);
+			}
+		}
+	}
+
+	/// P1 under every stop: the in-memory store has not seen the install; purge(3) must move the
+	/// checkpoint-only active segment "2" to "4", holder first and "2" last.
+	#[tokio::test]
+	async fn purge_past_local_tail_renames_checkpoint_only_holder() {
+		let seed = tempdir("purge-past-tail");
+		let mut store = try_open_store_with_segment_bytes(&seed, WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(1, 100)])
+			.await
+			.unwrap();
+		checkpoint(&store, 1, 1).await;
+		drop(store);
+		let snapshot_dir = tempdir("purge-past-tail-snapshot");
+		snapshot_at(&snapshot_dir, 3);
+		let snapshot = artifact_paths(&snapshot_dir).2;
+		for stop in stops(&seed, WAL_PAGE, Mutation::Purge(3), Some(&snapshot), 1).await {
+			for seen in &stop.after_stops {
+				assert!(seen.entries.is_empty(), "{}", stop.label);
+				assert_eq!(seen.checkpoint, None, "{}: commit 1 < 3", stop.label);
+			}
+			assert_eq!(
+				stop.after_retry.files,
+				vec![(4, WAL_PAGE)],
+				"{}",
+				stop.label
+			);
+		}
+	}
+
+	/// P1 with no checkpoint: an empty checkpoint-only "2" (an append-rotation residue) is removed
+	/// first, the log after, and no holder is made.
+	#[tokio::test]
+	async fn purge_past_local_tail_without_checkpoint_omits_the_holder() {
+		let seed = tempdir("purge-past-tail-empty");
+		let mut store = try_open_store_with_segment_bytes(&seed, WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(1, 100)])
+			.await
+			.unwrap();
+		drop(store);
+		std::fs::File::create(segment_file(&seed, 2)).unwrap();
+		let (store, seen) = reopen(&seed, WAL_PAGE, "seed").await;
+		assert_eq!(seen.checkpoint, None);
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![(1, Some(1), WAL_PAGE), (2, None, 0)]
+		);
+		drop(store);
+		let snapshot_dir = tempdir("purge-past-tail-empty-snapshot");
+		snapshot_at(&snapshot_dir, 3);
+		let snapshot = artifact_paths(&snapshot_dir).2;
+		for stop in stops(&seed, WAL_PAGE, Mutation::Purge(3), Some(&snapshot), 1).await {
+			for seen in &stop.after_stops {
+				assert!(seen.entries.is_empty(), "{}", stop.label);
+				assert_eq!(seen.checkpoint, None, "{}", stop.label);
+			}
+			assert_eq!(stop.after_retry.files, Vec::new(), "{}", stop.label);
+		}
+	}
+
+	#[tokio::test]
+	async fn purge_refuses_an_occupied_holder_name_before_effects() {
+		let dir = tempdir("purge-occupied");
+		let mut store = try_open_store_with_segment_bytes(&dir, WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(1, 100)])
+			.await
+			.unwrap();
+		checkpoint(&store, 1, 1).await;
+		snapshot_at(&dir, 3);
+		// A stray file already holds the post-purge name.
+		write_wal_pages(
+			&segment_file(&dir, 4),
+			&[serialize_checkpoint_page(1, 0, 1, 1)],
+		);
+		let files = artifact_bytes(&dir);
+		let err = store.purge(log_id(1, 3)).await.err().expect("refused");
+		assert!(err.to_string().contains("occupied"), "{err}");
+		assert_eq!(artifact_bytes(&dir), files);
+		assert!(store.inner.read().await.poisoned.is_none());
+	}
+
+	#[tokio::test]
+	async fn purge_log_bearing_active_and_no_active_file() {
+		// A surviving log tail with room takes C′ at its cursor.
+		let dir = tempdir("purge-log-active");
+		let mut store = try_open_store_with_segment_bytes(&dir, 3 * WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(
+				(1..=4)
+					.map(|i| finalize_entry(i, 100 * i))
+					.collect::<Vec<_>>(),
+			)
+			.await
+			.unwrap();
+		checkpoint(&store, 2, 2).await;
+		snapshot_at(&dir, 3);
+		store.purge(log_id(1, 3)).await.unwrap();
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![(4, Some(4), 3 * WAL_PAGE)]
+		);
+		drop(store);
+		let (_, seen) = reopen(&dir, 3 * WAL_PAGE, "log active").await;
+		assert_eq!(
+			seen.entries.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+			vec![4]
+		);
+		// No active file at all: purge has nothing to remove and no effect.
+		let dir = tempdir("purge-no-file");
+		let mut store = try_open_store_with_segment_bytes(&dir, WAL_PAGE)
+			.await
+			.unwrap();
+		let files = artifact_bytes(&dir);
+		store.purge(log_id(1, 3)).await.unwrap();
+		assert_eq!(artifact_bytes(&dir), files);
+		assert_eq!(segment_metadata(&store).await, Vec::new());
+	}
+
+	/// [1,2,3] in segment 1, a snapshot at 3, and the given checkpoint-only files.
+	fn seed_snapshot_explained(holders: &[(u64, Vec<AlignedBuf>)]) -> PathBuf {
+		let dir = tempdir("snapshot-explained");
+		let pages: Vec<AlignedBuf> = (1..=3)
+			.map(|i| serialize_entry_page(&finalize_entry(i, 100 * i)).unwrap())
+			.collect();
+		write_wal_pages(&segment_file(&dir, 1), &pages);
+		for (start, pages) in holders {
+			if pages.is_empty() {
+				std::fs::File::create(segment_file(&dir, *start)).unwrap();
+			} else {
+				write_wal_pages(&segment_file(&dir, *start), pages);
+			}
+		}
+		snapshot_at(&dir, 3);
+		dir
+	}
+
+	#[tokio::test]
+	async fn open_completes_the_adjacent_target_shape() {
+		let c3 = || serialize_checkpoint_page(3, 3, 3, 1);
+		let c_old = || serialize_checkpoint_page(2, 2, 2, 1);
+		let expect = Recovered {
+			entries: Vec::new(),
+			checkpoint: Some(RecoveryCheckpoint {
+				commit_index: 3,
+				e_safe_index: 3,
+			}),
+			files: vec![(1, 3 * WAL_PAGE), (4, WAL_PAGE)],
+		};
+		// Z exactly equal, Z exactly empty, Z wholly validated records ending in the target's.
+		for z in [vec![c3()], Vec::new(), vec![c_old(), c3()]] {
+			let shape = format!("Z of {} pages", z.len());
+			let seed = seed_snapshot_explained(&[(3, z), (4, vec![c3()])]);
+			completion_stops(&seed, 3 * WAL_PAGE, &expect).await;
+			let (_, seen) = reopen(&seed, 3 * WAL_PAGE, &shape).await;
+			assert_eq!(seen, expect, "{shape}");
+		}
+		// A trailing, exactly empty Z below the tail carries nothing: it is only unlinked.
+		let seed = seed_snapshot_explained(&[(3, Vec::new())]);
+		let (_, seen) = reopen(&seed, 3 * WAL_PAGE, "empty trailing").await;
+		assert_eq!(seen.files, vec![(1, 3 * WAL_PAGE)]);
+		assert_eq!(seen.checkpoint, None);
+	}
+
+	#[tokio::test]
+	async fn open_refuses_adjacent_shapes_outside_the_bounds_without_effect() {
+		let c3 = || serialize_checkpoint_page(3, 3, 3, 1);
+		let c_old = || serialize_checkpoint_page(2, 2, 2, 1);
+		let zero_page = || AlignedBuf::new(DIRECT_IO_ALIGN);
+		let cases: Vec<(&str, Vec<(u64, Vec<AlignedBuf>)>)> = vec![
+			("unequal Z", vec![(3, vec![c_old()]), (4, vec![c3()])]),
+			(
+				"target of two records",
+				vec![(3, vec![c3()]), (4, vec![c3(), c3()])],
+			),
+			(
+				"zero-filled Z",
+				vec![(3, vec![zero_page()]), (4, vec![c3()])],
+			),
+			(
+				"non-adjacent holder",
+				vec![(2, vec![c3()]), (3, vec![c3()]), (4, vec![c3()])],
+			),
+			(
+				"unexplained trailing holder past nothing",
+				vec![(2, vec![c3()]), (3, vec![c3()])],
+			),
+		];
+		for (name, holders) in cases {
+			let dir = seed_snapshot_explained(&holders);
+			let files = artifact_bytes(&dir);
+			assert!(
+				try_open_store_with_segment_bytes(&dir, 3 * WAL_PAGE)
+					.await
+					.is_err(),
+				"{name} refuses open"
+			);
+			assert_eq!(artifact_bytes(&dir), files, "{name}: no effect");
+		}
+	}
+
+	/// An append-rotation residue (an empty segment published before its entry), then a real
+	/// install past the tail, then a crash before the purge: open unlinks the exactly empty
+	/// trailing segment, publishing nothing, and the purge and next append proceed.
+	#[tokio::test]
+	async fn open_unlinks_an_empty_residue_explained_by_an_installed_snapshot() {
+		let source_dir = tempdir("residue-source");
+		let mut source_store = open_store(&source_dir).await;
+		let mut source_sm = source_store.recovered_state_machine().await.unwrap();
+		for (i, start) in [(1, 0), (2, 10), (3, 20)] {
+			append_and_apply(
+				&mut source_store,
+				&mut source_sm,
+				lease_entry(i, start, start + 9, 3),
+			)
+			.await;
+		}
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut source_sm,
+			)
+			.await;
+		let built = builder.build_snapshot().await.unwrap();
+		let dir = tempdir("residue-target");
+		let mut store = try_open_store_with_segment_bytes(&dir, WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(1, 100)])
+			.await
+			.unwrap();
+		drop(store);
+		std::fs::File::create(segment_file(&dir, 2)).unwrap();
+		let (store, seen) = reopen(&dir, WAL_PAGE, "residue").await;
+		assert_eq!(seen.files, vec![(1, WAL_PAGE), (2, 0)]);
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+			&mut sm,
+			&built.meta,
+			built.snapshot,
+		)
+		.await
+		.unwrap();
+		drop(sm);
+		drop(store);
+		let (mut store, seen) = reopen(&dir, WAL_PAGE, "installed").await;
+		assert_eq!(seen.files, vec![(1, WAL_PAGE)]);
+		assert_eq!(seen.checkpoint, None);
+		assert!(seen.entries.is_empty());
+		store.purge(log_id(1, 3)).await.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(4, 400)])
+			.await
+			.unwrap();
+		drop(store);
+		let (_, seen) = reopen(&dir, WAL_PAGE, "appended").await;
+		assert_eq!(seen.files, vec![(4, WAL_PAGE)]);
+		assert_eq!(
+			seen.entries.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+			vec![4]
+		);
+	}
+
+	#[tokio::test]
+	async fn open_refuses_empty_or_torn_holders_outside_the_bounds_without_effect() {
+		let entries = |dir: &Path, last: u64| {
+			let pages: Vec<AlignedBuf> = (1..=last)
+				.map(|i| serialize_entry_page(&finalize_entry(i, 100 * i)).unwrap())
+				.collect();
+			write_wal_pages(&segment_file(dir, 1), &pages);
+		};
+		// An empty segment below the tail with no snapshot to explain it.
+		let no_snapshot = tempdir("empty-no-snapshot");
+		entries(&no_snapshot, 2);
+		std::fs::File::create(segment_file(&no_snapshot, 2)).unwrap();
+		// A zero-filled, nonempty trailing segment: torn, not empty.
+		let zero_filled = tempdir("zero-filled-trailing");
+		entries(&zero_filled, 3);
+		write_wal_pages(
+			&segment_file(&zero_filled, 3),
+			&[AlignedBuf::new(DIRECT_IO_ALIGN)],
+		);
+		snapshot_at(&zero_filled, 3);
+		// Two empty holders: ambiguous.
+		let ambiguous = tempdir("two-empty-holders");
+		entries(&ambiguous, 3);
+		std::fs::File::create(segment_file(&ambiguous, 2)).unwrap();
+		std::fs::File::create(segment_file(&ambiguous, 3)).unwrap();
+		snapshot_at(&ambiguous, 3);
+		for dir in [no_snapshot, zero_filled, ambiguous] {
+			let files = artifact_bytes(&dir);
+			assert!(
+				try_open_store_with_segment_bytes(&dir, 3 * WAL_PAGE)
+					.await
+					.is_err(),
+				"{} refuses open",
+				dir.display()
+			);
+			assert_eq!(artifact_bytes(&dir), files, "{}: no effect", dir.display());
+		}
+	}
+
+	/// P1 with no checkpoint and a nonempty passed holder whose records were all superseded at
+	/// open by the recovered snapshot: it is removed first, then the log, under every stop.
+	#[tokio::test]
+	async fn purge_past_local_tail_removes_a_superseded_holder_first() {
+		let seed = tempdir("purge-superseded-holder");
+		let mut store = try_open_store_with_segment_bytes(&seed, 2 * WAL_PAGE)
+			.await
+			.unwrap();
+		store
+			.blocking_append(vec![finalize_entry(1, 100), finalize_entry(2, 200)])
+			.await
+			.unwrap();
+		checkpoint(&store, 1, 1).await;
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![(1, Some(2), 2 * WAL_PAGE), (3, None, WAL_PAGE)]
+		);
+		drop(store);
+		snapshot_at(&seed, 2);
+		let seen = reopen(&seed, 2 * WAL_PAGE, "seed").await.1;
+		assert_eq!(seen.checkpoint, None, "commit 1 < snapshot 2");
+		assert_eq!(seen.files, vec![(1, 2 * WAL_PAGE), (3, WAL_PAGE)]);
+		let snapshot_dir = tempdir("purge-superseded-holder-snapshot");
+		snapshot_at(&snapshot_dir, 5);
+		let snapshot = artifact_paths(&snapshot_dir).2;
+		let all = stops(&seed, 2 * WAL_PAGE, Mutation::Purge(5), Some(&snapshot), 1).await;
+		assert!(all.iter().any(|stop| stop.label.contains("Unlink #1")));
+		for stop in all {
+			for seen in &stop.after_stops {
+				assert!(seen.entries.is_empty(), "{}", stop.label);
+				assert_eq!(seen.checkpoint, None, "{}", stop.label);
+			}
+			// A stop before the holder is removed leaves it below the new tail; reopen then moves
+			// its superseded record to the holder named 6 (open-time completion), which the retry
+			// keeps. Either way no checkpoint is recovered.
+			assert_eq!(stop.after_retry.checkpoint, None, "{}", stop.label);
+			assert!(
+				matches!(stop.after_retry.files.as_slice(), [] | [(6, WAL_PAGE)]),
+				"{}: {:?}",
+				stop.label,
+				stop.after_retry.files
+			);
+		}
 	}
 }
 

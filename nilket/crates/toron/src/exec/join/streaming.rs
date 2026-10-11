@@ -28286,6 +28286,14 @@ mod tests {
 			self.inner.rename(from, to).await
 		}
 
+		async fn link_no_replace(
+			&self,
+			from: &std::path::Path,
+			to: &std::path::Path,
+		) -> std::io::Result<()> {
+			self.inner.link_no_replace(from, to).await
+		}
+
 		async fn unlink(&self, path: &std::path::Path) -> std::io::Result<()> {
 			self.inner.unlink(path).await
 		}

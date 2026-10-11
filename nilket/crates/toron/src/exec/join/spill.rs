@@ -5748,6 +5748,10 @@ mod tests {
 			self.inner.rename(from, to).await
 		}
 
+		async fn link_no_replace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+			self.inner.link_no_replace(from, to).await
+		}
+
 		async fn unlink(&self, path: &Path) -> std::io::Result<()> {
 			if self.should_fail(CoalescedFileFault::Cleanup) {
 				return Err(Error::new(ErrorKind::Other, "injected coalesced cleanup"));

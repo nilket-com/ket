@@ -107,6 +107,10 @@ pub trait AsyncFileOps: Send + Sync {
 
 	async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
 
+	/// Publishes `from` at `to` only if `to` does not exist: `link(2)`, which fails atomically
+	/// with `AlreadyExists` and never replaces. The caller removes `from` afterwards.
+	async fn link_no_replace(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+
 	async fn unlink(&self, path: &Path) -> std::io::Result<()>;
 }
 
@@ -333,6 +337,13 @@ impl AsyncFileOps for IoUringFileOps {
 		self.run_blocking(move || std::fs::rename(from, to)).await
 	}
 
+	async fn link_no_replace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+		let from = from.to_path_buf();
+		let to = to.to_path_buf();
+		self.run_blocking(move || std::fs::hard_link(from, to))
+			.await
+	}
+
 	async fn unlink(&self, path: &Path) -> std::io::Result<()> {
 		let path = path.to_path_buf();
 		self.run_blocking(move || std::fs::remove_file(path)).await
@@ -487,6 +498,12 @@ impl AsyncFileOps for BlockingFileOps {
 		let from = from.to_path_buf();
 		let to = to.to_path_buf();
 		spawn_blocking_io(move || std::fs::rename(from, to)).await
+	}
+
+	async fn link_no_replace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+		let from = from.to_path_buf();
+		let to = to.to_path_buf();
+		spawn_blocking_io(move || std::fs::hard_link(from, to)).await
 	}
 
 	async fn unlink(&self, path: &Path) -> std::io::Result<()> {
@@ -653,6 +670,7 @@ pub enum FaultOp {
 	Fdatasync,
 	FsyncDir,
 	Rename,
+	Link,
 	Unlink,
 }
 
@@ -1034,6 +1052,23 @@ impl AsyncFileOps for FaultyFileOps {
 		}
 		self.inner.fsync_dir(path).await?;
 		self.snapshot_dir_now(path)
+	}
+
+	async fn link_no_replace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+		if let Some(action) = self.take_fault(FaultOp::Link, to) {
+			self.apply_fault_result(action)?;
+			return Ok(());
+		}
+		self.inner.link_no_replace(from, to).await?;
+		// Writes through a handle opened at `from` now land in the file named `to` as well; the
+		// caller removes `from` next, so attribute those handles to `to`, as rename does.
+		let mut state = self.state.lock().unwrap();
+		for mapped_path in state.handle_paths.values_mut() {
+			if *mapped_path == from {
+				*mapped_path = to.to_path_buf();
+			}
+		}
+		Ok(())
 	}
 
 	async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {

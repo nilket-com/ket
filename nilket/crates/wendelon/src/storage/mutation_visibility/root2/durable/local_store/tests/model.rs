@@ -399,6 +399,9 @@ impl AsyncFileOps for Model {
 		self.snapshot_names(p)?;
 		self.end(Op::DirSync, label, f).await
 	}
+	async fn link_no_replace(&self, a: &Path, b: &Path) -> io::Result<()> {
+		self.base.link_no_replace(a, b).await
+	}
 	async fn rename(&self, a: &Path, b: &Path) -> io::Result<()> {
 		let label = format!("{} -> {}", a.display(), b.display());
 		let f = self.begin(Op::Rename, label.clone()).await?;
