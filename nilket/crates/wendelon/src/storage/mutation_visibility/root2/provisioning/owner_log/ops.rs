@@ -1,5 +1,5 @@
 //! Owner I/O primitives and the owner directory's private steps. Nothing here is visible outside
-//! `owner_log`; the eight exported methods live in the parent.
+//! `owner_log`; the nine exported methods live in the parent.
 use super::{
 	IoStep2, LOG, MARKER, MARKER_MAGIC, MarkerOutcome2, OwnerDir2, OwnerIoError2, REPAIRS,
 	RepairOutcome2,
@@ -14,7 +14,7 @@ use crate::storage::mutation_visibility::root2::types::Digest2;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 pub(super) type Owned<T> = Result<T, OwnerIoError2>;
 
 pub(super) fn io_err(step: IoStep2) -> impl Fn(io::Error) -> OwnerIoError2 {
@@ -441,5 +441,95 @@ impl OwnerDir2 {
 			}
 			_ => Err(OwnerIoError2::RepairVerifyFailed),
 		}
+	}
+}
+
+/// The named steps of one exclusive artifact publication. Only the two sync steps go through
+/// `synced` (poison plus a marker attempt); the others are ordinary I/O errors.
+pub(super) struct PublishSteps {
+	tmp_create: IoStep2,
+	write: IoStep2,
+	sync: IoStep2,
+	link: IoStep2,
+	tmp_unlink: IoStep2,
+	dir_sync: IoStep2,
+}
+/// The snapshot (`export`, and the tuple's second artifact): today's steps, unchanged.
+pub(super) fn snapshot_steps() -> PublishSteps {
+	PublishSteps {
+		tmp_create: IoStep2::ExportTmpCreate,
+		write: IoStep2::ExportWrite,
+		sync: IoStep2::ExportSync,
+		link: IoStep2::ExportLink,
+		tmp_unlink: IoStep2::ExportTmpUnlink,
+		dir_sync: IoStep2::ExportDirSync,
+	}
+}
+/// The tuple's manifest artifact.
+pub(super) fn manifest_steps() -> PublishSteps {
+	PublishSteps {
+		tmp_create: IoStep2::ManifestTmpCreate,
+		write: IoStep2::ManifestWrite,
+		sync: IoStep2::ManifestSync,
+		link: IoStep2::ManifestLink,
+		tmp_unlink: IoStep2::ManifestTmpUnlink,
+		dir_sync: IoStep2::ManifestDirSync,
+	}
+}
+
+impl OwnerDir2 {
+	/// The export directory, canonical and opened, outside the owner directory: component-wise
+	/// containment of canonical paths, then an ancestor identity walk (moved from `export`).
+	pub(super) fn export_dir(&self, out_dir: &Path) -> Owned<(PathBuf, File)> {
+		let out = run(IoStep2::ExportCanonical, || fs::canonicalize(out_dir))
+			.map_err(io_err(IoStep2::ExportCanonical))?;
+		let out_handle = run(IoStep2::ExportDirOpen, || open_dir(&out))
+			.map_err(io_err(IoStep2::ExportDirOpen))?;
+		if out.starts_with(&self.path) {
+			return Err(OwnerIoError2::BadExportDir);
+		}
+		for ancestor in out.ancestors() {
+			let m = run(IoStep2::ExportCanonical, || fs::metadata(ancestor))
+				.map_err(io_err(IoStep2::ExportCanonical))?;
+			if (m.dev(), m.ino()) == self.id {
+				return Err(OwnerIoError2::BadExportDir);
+			}
+		}
+		Ok((out, out_handle))
+	}
+	/// One exclusive publication (moved from `export`): create `<name>.tmp` exclusively, write,
+	/// sync, link to `<name>` (never replacing a final), unlink the tmp, sync the directory.
+	pub(super) fn publish(
+		&mut self,
+		out_handle: &File,
+		out: &Path,
+		name: &str,
+		bytes: &[u8],
+		s: &PublishSteps,
+	) -> Owned<()> {
+		let tmp = out.join(format!("{name}.tmp"));
+		let file = match run(s.tmp_create, || open_file(&tmp, Mode::Create(0o644))) {
+			Ok(f) => regular(f, s.tmp_create)?,
+			Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+				return Err(OwnerIoError2::ExportTmpExists);
+			}
+			Err(e) => return Err(io_err(s.tmp_create)(e)),
+		};
+		run(s.write, || (&file).write_all(bytes)).map_err(io_err(s.write))?;
+		let r = run(s.sync, || file.sync_data());
+		self.synced(s.sync, r)?;
+		match run(s.link, || fs::hard_link(&tmp, out.join(name))) {
+			Ok(()) => {}
+			Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+				// The published file is never replaced. Only this invocation's own tmp is removed,
+				// best effort and not crash-durable (no directory sync on this refusal path).
+				run(s.tmp_unlink, || fs::remove_file(&tmp)).map_err(io_err(s.tmp_unlink))?;
+				return Err(OwnerIoError2::ExportExists);
+			}
+			Err(e) => return Err(io_err(s.link)(e)),
+		}
+		run(s.tmp_unlink, || fs::remove_file(&tmp)).map_err(io_err(s.tmp_unlink))?;
+		let r = run(s.dir_sync, || out_handle.sync_all());
+		self.synced(s.dir_sync, r)
 	}
 }

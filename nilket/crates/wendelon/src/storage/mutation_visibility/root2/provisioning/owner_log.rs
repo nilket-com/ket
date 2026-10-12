@@ -1,5 +1,7 @@
 //! Dormant owner-side I/O over one trusted owner directory: the lock, the inventory log, repair
-//! evidence, the sync-failure latch and marker, and snapshot export. Every decision, encoding and
+//! evidence, the sync-failure latch and marker, snapshot export, and the exported provisioning tuple
+//! (one Bound root's exact manifest plus the snapshot, from one folded state, published as two
+//! independent exclusive files; never atomic as a pair). Every decision, encoding and
 //! classification comes unchanged from the pure core; this layer only reads, writes and syncs.
 //! Supported path model: Linux, a local filesystem, one owner host, and trusted owner and export
 //! parent paths that are not replaced while an operation runs. Nothing here yields a root,
@@ -11,10 +13,11 @@ use super::owner_core::{
 };
 use super::snapshot::encode_snapshot2;
 use crate::storage::mutation_visibility::redacted_debug;
+use crate::storage::mutation_visibility::root2::admin::manifest::ManifestProfile2;
 use crate::storage::mutation_visibility::root2::types::Digest2;
 use std::fs::{self, File, TryLockError};
-use std::io::{ErrorKind, Write};
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::io::ErrorKind;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 const LOCK: &str = "LOCK";
@@ -63,6 +66,13 @@ pub(in crate::storage::mutation_visibility::root2) enum IoStep2 {
 	ExportTmpUnlink,
 	ExportDirSync,
 	ClearDirSync,
+	// The provisioning tuple's manifest artifact (appended: existing marker step codes unchanged).
+	ManifestTmpCreate,
+	ManifestWrite,
+	ManifestSync,
+	ManifestLink,
+	ManifestTmpUnlink,
+	ManifestDirSync,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum MarkerOutcome2 {
@@ -115,6 +125,8 @@ pub(in crate::storage::mutation_visibility::root2) enum OwnerIoError2 {
 	BadExportDir,
 	ExportTmpExists,
 	ExportExists,
+	ExportNoSuchRoot,
+	ExportNotBound(RootState2),
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) struct OpOutcome2 {
@@ -135,6 +147,17 @@ pub(in crate::storage::mutation_visibility::root2) struct OwnerStatus2 {
 	pub log_present: bool,
 }
 redacted_debug!(OwnerStatus2, "OwnerStatus2");
+/// The result of a complete tuple export: both artifacts published and their directory synced.
+/// Descriptive only. The manifest pin is the folded root's whole-manifest pin (the domain-separated
+/// manifest digest the event header and install bind); the inventory pin is the snapshot hash.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) struct TupleExport2 {
+	pub manifest_pin: Digest2,
+	pub inventory_pin: Digest2,
+	pub export_seq: u64,
+	pub profile: ManifestProfile2,
+}
+redacted_debug!(TupleExport2, "TupleExport2");
 pub(in crate::storage::mutation_visibility::root2) struct OwnerDir2 {
 	path: PathBuf,
 	dir: File,
@@ -146,7 +169,8 @@ redacted_debug!(OwnerDir2, "OwnerDir2");
 
 mod ops;
 use ops::{
-	Mode, Owned, checked_dir, export_name_ok, io_err, open_dir, open_file, regular, run, sha,
+	Mode, Owned, checked_dir, export_name_ok, io_err, manifest_steps, open_dir, open_file, regular,
+	run, sha, snapshot_steps,
 };
 
 impl OwnerDir2 {
@@ -321,21 +345,7 @@ impl OwnerDir2 {
 		if !export_name_ok(name) {
 			return Err(OwnerIoError2::BadExportName);
 		}
-		let out = run(IoStep2::ExportCanonical, || fs::canonicalize(out_dir))
-			.map_err(io_err(IoStep2::ExportCanonical))?;
-		let out_handle = run(IoStep2::ExportDirOpen, || open_dir(&out))
-			.map_err(io_err(IoStep2::ExportDirOpen))?;
-		// Component-wise containment of canonical paths, then an ancestor identity walk.
-		if out.starts_with(&self.path) {
-			return Err(OwnerIoError2::BadExportDir);
-		}
-		for ancestor in out.ancestors() {
-			let m = run(IoStep2::ExportCanonical, || fs::metadata(ancestor))
-				.map_err(io_err(IoStep2::ExportCanonical))?;
-			if (m.dev(), m.ino()) == self.id {
-				return Err(OwnerIoError2::BadExportDir);
-			}
-		}
+		let (out, out_handle) = self.export_dir(out_dir)?;
 		let view = self.clean_view()?;
 		self.resync(view.log.is_some(), &[])?;
 		let state = fold_events2(view.bytes()).map_err(|_| OwnerIoError2::RepairVerifyFailed)?;
@@ -343,36 +353,77 @@ impl OwnerDir2 {
 			step: IoStep2::ExportWrite,
 			errno: None,
 		})?;
-		let tmp = out.join(format!("{name}.tmp"));
-		let file = match run(IoStep2::ExportTmpCreate, || {
-			open_file(&tmp, Mode::Create(0o644))
-		}) {
-			Ok(f) => regular(f, IoStep2::ExportTmpCreate)?,
-			Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-				return Err(OwnerIoError2::ExportTmpExists);
-			}
-			Err(e) => return Err(io_err(IoStep2::ExportTmpCreate)(e)),
-		};
-		run(IoStep2::ExportWrite, || (&file).write_all(&bytes))
-			.map_err(io_err(IoStep2::ExportWrite))?;
-		let r = run(IoStep2::ExportSync, || file.sync_data());
-		self.synced(IoStep2::ExportSync, r)?;
-		match run(IoStep2::ExportLink, || fs::hard_link(&tmp, out.join(name))) {
-			Ok(()) => {}
-			Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-				// The published file is never replaced. Only this invocation's own tmp is removed,
-				// best effort and not crash-durable (no directory sync on this refusal path).
-				run(IoStep2::ExportTmpUnlink, || fs::remove_file(&tmp))
-					.map_err(io_err(IoStep2::ExportTmpUnlink))?;
-				return Err(OwnerIoError2::ExportExists);
-			}
-			Err(e) => return Err(io_err(IoStep2::ExportLink)(e)),
-		}
-		run(IoStep2::ExportTmpUnlink, || fs::remove_file(&tmp))
-			.map_err(io_err(IoStep2::ExportTmpUnlink))?;
-		let r = run(IoStep2::ExportDirSync, || out_handle.sync_all());
-		self.synced(IoStep2::ExportDirSync, r)?;
+		self.publish(&out_handle, &out, name, &bytes, &snapshot_steps())?;
 		Ok(sha(&bytes))
+	}
+
+	/// One Bound root's exact canonical manifest and the whole snapshot, both from ONE folded
+	/// state; every refusal before any artifact is written. The manifest is published first, then
+	/// the snapshot, each exclusively with its own directory sync. The pair is not atomic: a
+	/// failure after the manifest leaves it published and returns no pins from this call; finals
+	/// are never replaced or removed. Path-based owner-side publication under the supported path
+	/// model (stable, trusted export parent); not the replica reader's openat2 guarantees.
+	pub(in crate::storage::mutation_visibility::root2) fn export_tuple(
+		&mut self,
+		out_dir: &Path,
+		manifest_name: &str,
+		snapshot_name: &str,
+		generation: [u8; 16],
+		cluster: [u8; 16],
+	) -> Owned<TupleExport2> {
+		self.blocked()?;
+		if !export_name_ok(manifest_name)
+			|| !export_name_ok(snapshot_name)
+			|| manifest_name == snapshot_name
+		{
+			return Err(OwnerIoError2::BadExportName);
+		}
+		let (out, out_handle) = self.export_dir(out_dir)?;
+		let view = self.clean_view()?;
+		self.resync(view.log.is_some(), &[])?;
+		let state = fold_events2(view.bytes()).map_err(|_| OwnerIoError2::RepairVerifyFailed)?;
+		let mut matching = state
+			.roots
+			.iter()
+			.filter(|r| (r.identity.generation, r.identity.cluster) == (generation, cluster));
+		let root = matching.next().ok_or(OwnerIoError2::ExportNoSuchRoot)?;
+		// The fold refuses shared identity components, so a second match is a broken invariant.
+		if matching.next().is_some() {
+			return Err(OwnerIoError2::Decision(OwnerError2::Inconsistent));
+		}
+		if root.state != RootState2::Bound {
+			return Err(OwnerIoError2::ExportNotBound(root.state));
+		}
+		fn encode_failed<E>(_: E) -> OwnerIoError2 {
+			OwnerIoError2::Io {
+				step: IoStep2::ExportWrite,
+				errno: None,
+			}
+		}
+		let manifest = root.manifest.encode().map_err(encode_failed)?;
+		let snapshot = encode_snapshot2(&state).map_err(encode_failed)?;
+		// The folded identity pin is the whole-manifest digest (the fold's Reserve binding).
+		let result = TupleExport2 {
+			manifest_pin: root.identity.pin,
+			inventory_pin: sha(&snapshot),
+			export_seq: state.last_seq,
+			profile: root.manifest.profile(),
+		};
+		self.publish(
+			&out_handle,
+			&out,
+			manifest_name,
+			manifest.as_slice(),
+			&manifest_steps(),
+		)?;
+		self.publish(
+			&out_handle,
+			&out,
+			snapshot_name,
+			&snapshot,
+			&snapshot_steps(),
+		)?;
+		Ok(result)
 	}
 
 	pub(in crate::storage::mutation_visibility::root2) fn clear_sync_failure(

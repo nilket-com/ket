@@ -4,6 +4,7 @@ mod frozen_reader;
 mod inventory;
 mod owner_core;
 mod owner_log;
+mod owner_tuple_export;
 mod profile_two_inventory;
 mod profile_two_owner;
 mod profile_two_refusal;
