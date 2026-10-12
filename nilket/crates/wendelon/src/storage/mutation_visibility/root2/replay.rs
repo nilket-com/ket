@@ -1,15 +1,20 @@
-//! L-S1: private, dormant owned replay composition. No authority, progress capability or recovery
-//! mark is exported. L-S2's binding, closure and durable mark ordering are not implemented here.
+//! Dormant owned replay composition. Output is withheld until closure, administrator binding
+//! and durable recovery-mark confirmation succeed. No runtime caller or serving authority.
 //! Each batch is validated before its fold. Early folds stay provisional until the last batch;
 //! the first boundary fingerprint is compared at the target, with no intermediate-read pinning.
 use crate::consensus::WendelonTypeConfig;
+use crate::consensus::retention::{ControlRetention, HistoryCheck};
 use crate::storage::mutation_visibility::root2::acquisition::{
 	AcquisitionCaps2, AcquisitionError2, AcquisitionSources2, FoldError2, PrefixValidated2,
 	acquire_committed_prefix2,
 };
+use crate::storage::mutation_visibility::root2::admin_install::{InstallError2, install_admin2};
 use crate::storage::mutation_visibility::root2::command::{ApplyResult2, Command2};
 use crate::storage::mutation_visibility::root2::committed::{
 	AdapterError2, CommittedSource2, committed_entry2,
+};
+use crate::storage::mutation_visibility::root2::durable::mark_store::{
+	MarkIoError2, MarkStore2, MarkWrite2,
 };
 use crate::storage::mutation_visibility::root2::origin::{
 	CoverError2, EntryClass2, MutationAuthorityState2, OriginView2, PreRootStep2, advance_cover2,
@@ -17,8 +22,8 @@ use crate::storage::mutation_visibility::root2::origin::{
 };
 use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::PinnedBoundTuple2;
 use crate::storage::mutation_visibility::root2::recovery::{
-	Baseline2, Deployment2, Progress2, RecoveryError2, ReplayMonitor2, ReplayTarget2,
-	TargetCommand2, observe2, replay_monitor2,
+	Baseline2, Deployment2, Progress2, RecoveryError2, RecoveryMark2, ReplayMonitor2,
+	ReplayTarget2, TargetCommand2, mark_of2, observe2, replay_monitor2,
 };
 use crate::storage::mutation_visibility::root2::trust::{
 	BindError2, CommittedEntry2, TrustedEntry2,
@@ -47,7 +52,7 @@ struct Provisional2 {
 	progress: Progress2,
 }
 #[derive(Debug)]
-enum Fault2 {
+pub(in crate::storage::mutation_visibility::root2) enum Fault2 {
 	MonitorInit(RecoveryError2),
 	TargetAdapt(AdapterError2),
 	Adapt(AdapterError2),
@@ -61,13 +66,126 @@ enum Fault2 {
 	Internal,
 }
 #[derive(Debug)]
-enum ReplayError2 {
+pub(in crate::storage::mutation_visibility::root2) enum ReplayError2 {
 	Acquisition(AcquisitionError2),
 	Fault(Fault2),
+	Baseline(BaselineError2),
+	Closure(ClosureError2),
+	Binding(InstallError2),
+	MarkEncode(RecoveryError2),
+	Mark(MarkIoError2),
+	Refused(MarkRefusal2),
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) enum BaselineError2 {
+	Unavailable,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) enum ClosureError2 {
+	SourceClosed,
+	Regressed,
+	Conflict,
+	Retention,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) enum MarkRefusal2 {
+	Identity,
+	Regressed,
+	Conflict,
+	NotConfirmed,
+}
+/// Confirmed replay data at a local cut; it grants neither quorum currentness nor serving.
+pub(in crate::storage::mutation_visibility::root2) struct Replayed2 {
+	state: MutationAuthorityState2,
+	mark: RecoveryMark2,
+	report: PrefixValidated2,
+}
+impl Replayed2 {
+	pub(in crate::storage::mutation_visibility::root2) fn state(&self) -> &MutationAuthorityState2 {
+		&self.state
+	}
+	pub(in crate::storage::mutation_visibility::root2) fn mark(&self) -> RecoveryMark2 {
+		self.mark
+	}
+	pub(in crate::storage::mutation_visibility::root2) fn report(&self) -> &PrefixValidated2 {
+		&self.report
+	}
+}
+/// Captures the confirmed baseline before acquisition. Until the synchronous mark write, all
+/// state is provisional. Dropping the future cannot expose it; a successful mark write remains
+/// durable even if the returned value is subsequently dropped.
+pub(in crate::storage::mutation_visibility::root2) async fn run<
+	Rd: RaftLogReader<WendelonTypeConfig>,
+>(
+	reader: &mut Rd,
+	sources: &impl AcquisitionSources2,
+	caps: AcquisitionCaps2,
+	deployment: Deployment2,
+	pin: &PinnedBoundTuple2,
+	mark_store: &mut MarkStore2,
+) -> Result<Replayed2, ReplayError2> {
+	let baseline = mark_store
+		.durable()
+		.ok_or(ReplayError2::Baseline(BaselineError2::Unavailable))?;
+	let (acc, report) = ReplayDriver2 {
+		deployment,
+		baseline,
+		pin,
+	}
+	.compose(reader, sources, caps)
+	.await?;
+	let a = sources
+		.applied()
+		.map_err(|_| ReplayError2::Closure(ClosureError2::SourceClosed))?
+		.ok_or(ReplayError2::Closure(ClosureError2::Regressed))?;
+	let terminal = report.terminal_applied();
+	if a.index < terminal.index {
+		return Err(ReplayError2::Closure(ClosureError2::Regressed));
+	}
+	if a.index == terminal.index && a != terminal {
+		return Err(ReplayError2::Closure(ClosureError2::Conflict));
+	}
+	let retention = sources.retention();
+	if retention.configured != ControlRetention::Full
+		|| retention.history == HistoryCheck::NotChecked
+		|| retention.violation.is_some()
+	{
+		return Err(ReplayError2::Closure(ClosureError2::Retention));
+	}
+	install_admin2(&acc.state, pin).map_err(ReplayError2::Binding)?;
+	let mark = mark_of2(&acc.state).map_err(ReplayError2::MarkEncode)?;
+	let outcome = mark_store
+		.advance(&deployment, &mark)
+		.map_err(map_mark_error)?;
+	confirm_mark(outcome, mark_store.durable(), mark)?;
+	Ok(Replayed2 {
+		state: acc.state,
+		mark,
+		report,
+	})
+}
+fn map_mark_error(e: MarkIoError2) -> ReplayError2 {
+	match e {
+		MarkIoError2::Identity => ReplayError2::Refused(MarkRefusal2::Identity),
+		MarkIoError2::Regressed => ReplayError2::Refused(MarkRefusal2::Regressed),
+		MarkIoError2::Conflict => ReplayError2::Refused(MarkRefusal2::Conflict),
+		other => ReplayError2::Mark(other),
+	}
+}
+fn confirm_mark(
+	outcome: MarkWrite2,
+	durable: Option<Baseline2>,
+	mark: RecoveryMark2,
+) -> Result<(), ReplayError2> {
+	let expected = Baseline2::Mark(mark);
+	if matches!(outcome, MarkWrite2::Unchanged(b) if b != expected) || durable != Some(expected) {
+		return Err(ReplayError2::Refused(MarkRefusal2::NotConfirmed));
+	}
+	Ok(())
 }
 impl ReplayDriver2<'_> {
-	/// Private intermediate only. A later slice must validate closure/binding and confirm the mark
-	/// before exporting anything. Neither this method nor its output is accessible to siblings.
+	/// Private intermediate only; run validates closure/binding and confirms the mark before
+	/// exporting anything. Neither this method nor its output is accessible to siblings.
 	async fn compose<Rd: RaftLogReader<WendelonTypeConfig>>(
 		&self,
 		reader: &mut Rd,

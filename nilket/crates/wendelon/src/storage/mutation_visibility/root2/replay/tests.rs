@@ -218,7 +218,7 @@ async fn full_composition_matches_per_api_and_observes_each_entry() {
 	let _scope = Root2FixtureScope::install(fixtures);
 	let expected = oracle(&entries, dep, &pin);
 	let sources = Sources(entries.last().unwrap().log_id);
-	let mut reader = store(entries).await;
+	let mut reader = store(entries.clone()).await;
 	let (acc, report) = ReplayDriver2 {
 		deployment: dep,
 		baseline: Baseline2::Provisioned,
@@ -239,6 +239,17 @@ async fn full_composition_matches_per_api_and_observes_each_entry() {
 		ControlRetention::Full
 	);
 	assert!(matches!(acc.progress, Progress2::Ready(_)));
+	let (_d, mut marks) = completion::marks();
+	let mut reader = store(entries).await;
+	let replayed = run(&mut reader, &sources, caps(), dep, &pin, &mut marks)
+		.await
+		.unwrap();
+	assert_eq!(
+		encode_authority2(replayed.state()).unwrap(),
+		encode_authority2(expected.last().unwrap()).unwrap()
+	);
+	assert_eq!(replayed.report().entries(), 7);
+	assert_eq!(marks.durable(), Some(Baseline2::Mark(replayed.mark())));
 }
 #[tokio::test(flavor = "current_thread")]
 async fn saved_mark_at_cut_still_checks_command_and_full_state() {
@@ -617,3 +628,5 @@ async fn binding_fault_is_retained_and_unavailable_carrier_refuses() {
 	let uncarried = CommittedEntry2::fixture(p, fp, EntryClass2::OtherRoot2([7; 32]));
 	assert!(matches!(command_at(&uncarried), Err(Fault2::NoCarrier)));
 }
+
+mod completion;

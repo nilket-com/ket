@@ -2552,7 +2552,11 @@ fn durable_mark_store_is_std_only_with_four_methods() {
 	let tests = src.join("storage/mutation_visibility/root2/tests");
 	let declaration = src.join("storage/mutation_visibility/root2/durable/mod.rs");
 	for file in all {
-		if file == path || file.starts_with(&tests) {
+		if file == path
+			|| file.starts_with(&tests)
+			|| file.ends_with("root2/replay.rs")
+			|| file.starts_with(src.join("storage/mutation_visibility/root2/replay"))
+		{
 			continue;
 		}
 		let text = fs::read_to_string(&file).unwrap();
@@ -4012,23 +4016,49 @@ fn dormant_replay_owns_state_and_has_single_site_factories() {
 					assert!(root2_scoped(&s.vis));
 					exported.push(s.ident.to_string());
 				}
-				if s.ident == "Provisional2" {
+				if s.ident == "Provisional2" || s.ident == "Replayed2" {
 					for f in s.fields {
 						let t = quote_type(&f.ty);
 						assert!(!t.contains("TrustedEntry2") && !t.contains("CommittedEntry2"));
 					}
 				}
 			}
-			syn::Item::Fn(f) => assert!(matches!(f.vis, syn::Visibility::Inherited)),
+			syn::Item::Fn(f) => {
+				if f.sig.ident == "run" {
+					assert!(root2_scoped(&f.vis));
+					assert!(f.sig.asyncness.is_some());
+				} else {
+					assert!(matches!(f.vis, syn::Visibility::Inherited));
+				}
+			}
 			syn::Item::Impl(i) => {
 				assert!(i.trait_.is_none());
 				for m in i.items {
 					if let syn::ImplItem::Fn(f) = m {
-						assert!(matches!(f.vis, syn::Visibility::Inherited));
+						if !matches!(f.vis, syn::Visibility::Inherited) {
+							assert!(root2_scoped(&f.vis));
+							assert_eq!(quote_type(&i.self_ty), "Replayed2");
+							assert!(
+								["state", "mark", "report"]
+									.contains(&f.sig.ident.to_string().as_str())
+							);
+						}
 					}
 				}
 			}
-			syn::Item::Enum(e) => assert!(matches!(e.vis, syn::Visibility::Inherited)),
+			syn::Item::Enum(e) => {
+				assert!(root2_scoped(&e.vis));
+				assert!(
+					[
+						"Fault2",
+						"ReplayError2",
+						"BaselineError2",
+						"ClosureError2",
+						"MarkRefusal2"
+					]
+					.contains(&e.ident.to_string().as_str())
+				);
+			}
 			syn::Item::Mod(m) => {
 				assert_eq!(m.ident, "tests");
 				assert!(m.attrs.iter().any(|a| matches!(&a.meta, syn::Meta::List(l) if l.path.is_ident("cfg") && l.tokens.to_string()=="test")));
@@ -4037,7 +4067,7 @@ fn dormant_replay_owns_state_and_has_single_site_factories() {
 			_ => panic!("unreviewed replay item"),
 		}
 	}
-	assert_eq!(exported, ["PrefixRun2"]);
+	assert_eq!(exported, ["PrefixRun2", "Replayed2"]);
 	let production = without_test_items_deep(text.parse().unwrap())
 		.to_string()
 		.replace(' ', "");
@@ -4046,14 +4076,28 @@ fn dormant_replay_owns_state_and_has_single_site_factories() {
 		"spawn",
 		"std::fs",
 		"std::net",
-		"MarkStore2",
 		"TrustedView2",
 		"VerifiedCommand2::",
 		"Clone",
-		"Replayed2",
 	] {
 		assert!(!production.contains(banned), "replay: {banned}");
 	}
+
+	// S2's sole completion path: baseline -> acquisition -> closure -> binding -> mark -> output.
+	let stages = [
+		"letbaseline=mark_store.durable()",
+		"let(acc,report)=ReplayDriver2",
+		"letterminal=report.terminal_applied()",
+		"letretention=sources.retention()",
+		"install_admin2(&acc.state,pin)",
+		"letmark=mark_of2(&acc.state)",
+		"mark_store.advance(&deployment,&mark)",
+		"confirm_mark(outcome,mark_store.durable(),mark)",
+		"Ok(Replayed2{",
+	];
+	let positions = stages.map(|stage| production.find(stage).expect(stage));
+	assert!(positions.windows(2).all(|w| w[0] < w[1]));
+	assert_eq!(production.matches("mark_store.advance(").count(), 1);
 	assert_eq!(production.matches("observe2(").count(), 1);
 	assert_eq!(production.matches("CommittedSource2::acquired(").count(), 1);
 	assert_eq!(production.matches("TrustedEntry2::bind(").count(), 1);
@@ -4087,6 +4131,8 @@ fn dormant_replay_owns_state_and_has_single_site_factories() {
 					"ReplayDriver2",
 					"PrefixRun2",
 					"Provisional2",
+					"Replayed2",
+					"ReplayError2",
 					"root2::replay",
 				] {
 					assert!(!t.contains(name), "{}", p.display());
