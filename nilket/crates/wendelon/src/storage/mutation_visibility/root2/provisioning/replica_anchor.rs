@@ -10,7 +10,8 @@ use super::snapshot::{SnapshotError2, decode_snapshot2};
 use crate::storage::mutation_visibility::redacted_debug;
 use crate::storage::mutation_visibility::root2::admin::errors::AdminManifestError2;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	ADMIN_MANIFEST_BYTES2, AdminManifest2, admin_manifest_digest2,
+	ADMIN_MANIFEST_BYTES2, ADMIN_MANIFEST_P2_BYTES2, AnyAdminManifest2, admin_manifest_digest2,
+	admin_manifest_two_digest2,
 };
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::codec::hash;
@@ -30,7 +31,7 @@ pub(in crate::storage::mutation_visibility::root2) struct ReplicaInputs2<'a> {
 redacted_debug!(ReplicaInputs2<'_>, "ReplicaInputs2");
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) struct PinnedBoundTuple2 {
-	manifest: AdminManifest2,
+	manifest: AnyAdminManifest2,
 	manifest_pin: Digest2,
 	inventory_pin: Digest2,
 	export_seq: u64,
@@ -52,6 +53,7 @@ pub(in crate::storage::mutation_visibility::root2) enum TupleField2 {
 	Pin,
 	AdminKey,
 	InitialEpoch,
+	Profile,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum ReplicaAnchorError2 {
@@ -81,20 +83,28 @@ pub(in crate::storage::mutation_visibility::root2) fn validate_replica_tuple2(
 	let inventory_pin = *inputs
 		.inventory_pin
 		.ok_or(missing(ReplicaInput2::InventoryPin))?;
-	let Ok(manifest_array) = <&[u8; ADMIN_MANIFEST_BYTES2]>::try_from(manifest_bytes) else {
+	// Exactly one canonical manifest length, settled before any digest; the digest is over the
+	// exact supplied bytes.
+	let manifest_digest = if let Ok(one) = <&[u8; ADMIN_MANIFEST_BYTES2]>::try_from(manifest_bytes)
+	{
+		admin_manifest_digest2(one)
+	} else if let Ok(two) = <&[u8; ADMIN_MANIFEST_P2_BYTES2]>::try_from(manifest_bytes) {
+		admin_manifest_two_digest2(two)
+	} else {
 		return Err(E::Length(ReplicaInput2::Manifest));
 	};
 	if snapshot_bytes.len() > MAX_SNAPSHOT_BYTES2 {
 		return Err(E::Length(ReplicaInput2::Snapshot));
 	}
 	// Integrity before parsing: a wrong pin is never reported as malformed bytes.
-	if admin_manifest_digest2(manifest_array) != manifest_pin {
+	if manifest_digest != manifest_pin {
 		return Err(E::ManifestPinMismatch);
 	}
 	if hash(b"", snapshot_bytes) != inventory_pin {
 		return Err(E::InventoryPinMismatch);
 	}
-	let manifest = AdminManifest2::decode(manifest_bytes).map_err(E::ManifestCodec)?;
+	let any = AnyAdminManifest2::decode(manifest_bytes).map_err(E::ManifestCodec)?;
+	let manifest = any.admission();
 	let snapshot = decode_snapshot2(snapshot_bytes).map_err(E::SnapshotCodec)?;
 	let Some(entry) = snapshot.entries.iter().find(|e| {
 		(e.identity.generation, e.identity.cluster) == (manifest.generation, manifest.cluster)
@@ -106,6 +116,10 @@ pub(in crate::storage::mutation_visibility::root2) fn validate_replica_tuple2(
 	}
 	if entry.identity.admin_key != manifest.admin_key {
 		return Err(E::EntryMismatch(TupleField2::AdminKey));
+	}
+	// The selected manifest's tag only; unseen entries are not authenticated here.
+	if entry.profile != any.profile() {
+		return Err(E::EntryMismatch(TupleField2::Profile));
 	}
 	if entry.state != RootState2::Bound {
 		return Err(E::NotBound(entry.state));
@@ -131,7 +145,7 @@ pub(in crate::storage::mutation_visibility::root2) fn validate_replica_tuple2(
 		}
 	}
 	Ok(PinnedBoundTuple2 {
-		manifest,
+		manifest: any,
 		manifest_pin,
 		inventory_pin,
 		export_seq: snapshot.export_seq,
@@ -141,8 +155,18 @@ pub(in crate::storage::mutation_visibility::root2) fn validate_replica_tuple2(
 }
 pub(in crate::storage::mutation_visibility::root2) fn tuple_manifest2(
 	t: &PinnedBoundTuple2,
-) -> &AdminManifest2 {
+) -> &AnyAdminManifest2 {
 	&t.manifest
+}
+/// The canonical length of the validated manifest variant (137 or 189); the only length source
+/// for install and C's Bootstrap check.
+pub(in crate::storage::mutation_visibility::root2) fn tuple_manifest_len2(
+	t: &PinnedBoundTuple2,
+) -> u64 {
+	match t.manifest {
+		AnyAdminManifest2::One(_) => ADMIN_MANIFEST_BYTES2 as u64,
+		AnyAdminManifest2::Two(_) => ADMIN_MANIFEST_P2_BYTES2 as u64,
+	}
 }
 pub(in crate::storage::mutation_visibility::root2) fn tuple_manifest_pin2(
 	t: &PinnedBoundTuple2,

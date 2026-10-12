@@ -5,11 +5,14 @@
 //! A G1d consumer must bind the whole `AdminContext2`; an administrator key or id alone never
 //! authorizes anything in another root.
 use super::admin::errors::BootstrapRecordError2;
-use super::admin::manifest::{ADMIN_MANIFEST_BYTES2, AdminNamespace2};
+use super::admin::manifest::{
+	ADMIN_MANIFEST_BYTES2, ADMIN_MANIFEST_P2_BYTES2, AdminNamespace2, AnyAdminManifest2,
+	GovernanceRole2, ManifestProfile2,
+};
 use super::admin::record::{BootstrapIdentity2, BootstrapObservation2};
 use super::origin::{MutationAuthorityState2, root_and_origin2};
 use super::provisioning::replica_anchor::{
-	PinnedBoundTuple2, tuple_manifest_pin2, tuple_manifest2, tuple_record2,
+	PinnedBoundTuple2, tuple_manifest_len2, tuple_manifest_pin2, tuple_manifest2, tuple_record2,
 };
 use super::types::{Digest2, Log2};
 use crate::storage::mutation_visibility::redacted_debug;
@@ -20,6 +23,9 @@ pub(in crate::storage::mutation_visibility::root2) struct InstalledAdmin2 {
 	admin_id: [u8; 16],
 	admin_key: [u8; 32],
 	namespace: AdminNamespace2,
+	// Some iff the installed manifest is profile 2: the profile and the canonical length are
+	// derived from this one field. A descriptive copy; nothing here verifies with its key.
+	governance: Option<GovernanceRole2>,
 }
 redacted_debug!(InstalledAdmin2, "InstalledAdmin2");
 /// The exact root, original Bootstrap and genesis an administrator is bound to.
@@ -78,7 +84,8 @@ pub(in crate::storage::mutation_visibility::root2) fn install_admin2(
 	if s.control_digest != pin {
 		return Err(InstallError2::Commitment(CommitmentField2::ControlDigest));
 	}
-	if s.control_len != ADMIN_MANIFEST_BYTES2 as u64 {
+	// Exactly the tuple manifest's canonical length; membership in {137, 189} is not enough.
+	if s.control_len != tuple_manifest_len2(tuple) {
 		return Err(InstallError2::Commitment(CommitmentField2::ControlLength));
 	}
 	let record = tuple_record2(tuple);
@@ -110,7 +117,12 @@ pub(in crate::storage::mutation_visibility::root2) fn install_admin2(
 			return Err(InstallError2::Record(field));
 		}
 	}
-	let manifest = tuple_manifest2(tuple);
+	let any = tuple_manifest2(tuple);
+	let manifest = any.admission();
+	let governance = match any {
+		AnyAdminManifest2::One(_) => None,
+		AnyAdminManifest2::Two(m) => Some(m.governance()),
+	};
 	Ok(InstalledAdmin2 {
 		context: AdminContext2 {
 			generation: s.generation,
@@ -125,6 +137,7 @@ pub(in crate::storage::mutation_visibility::root2) fn install_admin2(
 		admin_id: manifest.admin_id,
 		admin_key: manifest.admin_key,
 		namespace: manifest.namespace,
+		governance,
 	})
 }
 pub(in crate::storage::mutation_visibility::root2) fn admin_context2(
@@ -148,6 +161,29 @@ pub(in crate::storage::mutation_visibility::root2) fn admin_installed_at2(
 ) -> Log2 {
 	a.context.installed_at
 }
+/// The copied descriptive governance role of a profile-2 administrator; never a verifier.
+pub(in crate::storage::mutation_visibility::root2) fn admin_governance2(
+	a: &InstalledAdmin2,
+) -> Option<GovernanceRole2> {
+	a.governance
+}
+pub(in crate::storage::mutation_visibility::root2) fn admin_profile2(
+	a: &InstalledAdmin2,
+) -> ManifestProfile2 {
+	match a.governance {
+		Some(_) => ManifestProfile2::Two,
+		None => ManifestProfile2::One,
+	}
+}
+/// The installed manifest's canonical length, which `install_admin2` bound to `control_len`.
+pub(in crate::storage::mutation_visibility::root2) fn admin_manifest_len2(
+	a: &InstalledAdmin2,
+) -> u64 {
+	match a.governance {
+		Some(_) => ADMIN_MANIFEST_P2_BYTES2 as u64,
+		None => ADMIN_MANIFEST_BYTES2 as u64,
+	}
+}
 
 /// The observation a node offers its owner for approval: the original Bootstrap identity of a
 /// rooted state, with the control digest as the candidate manifest pin. Derived data only: the
@@ -160,7 +196,10 @@ pub(in crate::storage::mutation_visibility::root2) fn observe_bootstrap2(
 		return Err(ObserveError2::PrerequisiteUnavailable);
 	};
 	let s = &root.state;
-	if s.control_len != ADMIN_MANIFEST_BYTES2 as u64 {
+	// State-only and descriptive: either canonical length; the exact match is install's and C's.
+	if s.control_len != ADMIN_MANIFEST_BYTES2 as u64
+		&& s.control_len != ADMIN_MANIFEST_P2_BYTES2 as u64
+	{
 		return Err(ObserveError2::ControlLength);
 	}
 	let observation = BootstrapObservation2 {

@@ -629,3 +629,20 @@ pub(super) fn with_tip_for_test(
 		inner: StateInner2::Root(Box::new(root), *origin),
 	}
 }
+/// Test-only: the same rooted state with only its root's Bootstrap commitment length replaced;
+/// everything else (origin, generation, cluster, bootstrap, epoch, control digest, tip) unchanged.
+/// Isolates the issuer gate's length check from its whole-context check.
+#[cfg(test)]
+pub(super) fn with_control_len_for_test(
+	state: &MutationAuthorityState2,
+	control_len: u64,
+) -> MutationAuthorityState2 {
+	let StateInner2::Root(root, origin) = &state.inner else {
+		panic!("rooted state required")
+	};
+	let mut root = (**root).clone();
+	root.state.control_len = control_len;
+	MutationAuthorityState2 {
+		inner: StateInner2::Root(Box::new(root), *origin),
+	}
+}

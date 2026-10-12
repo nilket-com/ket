@@ -77,7 +77,7 @@ fn the_golden_bound_tuple_matches_the_independent_vectors() {
 	let (m, mp) = manifest("m1");
 	let (s, sp) = snapshot("bound");
 	let t = check(&m, &mp, &s, &sp).unwrap();
-	let manifest = tuple_manifest2(&t);
+	let manifest = tuple_manifest2(&t).admission();
 	assert_eq!(manifest.encode().unwrap().to_vec(), m);
 	let f = &x["fields"];
 	assert_eq!(

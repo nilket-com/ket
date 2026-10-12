@@ -7,6 +7,7 @@ mod owner_log;
 mod profile_two_inventory;
 mod profile_two_owner;
 mod profile_two_refusal;
+mod profile_two_replica;
 mod replica_anchor;
 mod snapshot;
 

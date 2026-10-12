@@ -8,9 +8,8 @@
 //! committed index (steps 6-7), strictly above every existing coordinate; and the key's namespace
 //! generation is the root's (step 5 plus the statement's context and scope checks). No full
 //! validation runs per transition. No production caller exists until reviewed integration.
-use crate::storage::mutation_visibility::root2::admin::manifest::ADMIN_MANIFEST_BYTES2;
 use crate::storage::mutation_visibility::root2::admin_install::{
-	AdminContext2, InstalledAdmin2, admin_context2,
+	AdminContext2, InstalledAdmin2, admin_context2, admin_manifest_len2,
 };
 use crate::storage::mutation_visibility::root2::admin_statement::{
 	AdminAction2, CheckedStatement2, check_admin_statement2, checked_action2, checked_key2,
@@ -80,7 +79,8 @@ impl Root2 {
 			initial_epoch: s.initial_epoch,
 			manifest_pin: s.control_digest,
 		};
-		if s.control_len != ADMIN_MANIFEST_BYTES2 as u64 || admin_context2(admin) != expected {
+		// The installed recorded length, which install bound to its root's commitment.
+		if s.control_len != admin_manifest_len2(admin) || admin_context2(admin) != expected {
 			return Err(RootError2::TrustMismatch);
 		}
 		// 6-7. Replay and gap, only after the administrator is bound.

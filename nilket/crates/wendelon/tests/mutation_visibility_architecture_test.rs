@@ -1466,6 +1466,7 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 			"tuple_export_seq2",
 			"tuple_inventory_pin2",
 			"tuple_manifest2",
+			"tuple_manifest_len2",
 			"tuple_manifest_pin2",
 			"tuple_record2",
 			"validate_replica_tuple2"
@@ -1708,10 +1709,13 @@ fn admin_install_is_a_pure_derivation() {
 		entrypoints,
 		[
 			"admin_context2",
+			"admin_governance2",
 			"admin_id2",
 			"admin_installed_at2",
 			"admin_key2",
+			"admin_manifest_len2",
 			"admin_namespace2",
+			"admin_profile2",
 			"install_admin2",
 			"observe_bootstrap2"
 		]
@@ -3709,13 +3713,12 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 		text.matches("Ok(ManifestBytes2 { storage, len })").count(),
 		1
 	);
-	// Dormant: no production file outside admin/ names a profile-2 item, except these exact M2
-	// allowances (owner request -> event -> fold -> snapshot). Replica, install, gate,
-	// verification and validation stay forbidden.
-	let provisioning = root.join("provisioning");
+	// Dormant: no production file outside admin/ names a profile-2 item, except these exact
+	// allowances: M2 (owner request -> event -> fold -> snapshot) and M3 (replica tuple, install,
+	// the governed marker). The issuer gate and C's verification use the length accessors only.
 	let allowed: &[(&str, &[&str])] = &[
 		(
-			"inventory.rs",
+			"provisioning/inventory.rs",
 			&[
 				"ADMIN_MANIFEST_P2_BYTES2",
 				"AdminManifestTwo2",
@@ -3726,14 +3729,36 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 			],
 		),
 		(
-			"owner_core.rs",
+			"provisioning/owner_core.rs",
 			&[
 				"AnyAdminManifest2",
 				"ManifestBytes2",
 				"any_manifest_digest2",
 			],
 		),
-		("snapshot.rs", &["ManifestProfile2"]),
+		("provisioning/snapshot.rs", &["ManifestProfile2"]),
+		(
+			"provisioning/replica_anchor.rs",
+			&[
+				"ADMIN_MANIFEST_P2_BYTES2",
+				"AnyAdminManifest2",
+				"admin_manifest_two_digest2",
+			],
+		),
+		(
+			"provisioning/replica_read.rs",
+			&["ADMIN_MANIFEST_P2_BYTES2"],
+		),
+		(
+			"admin_install.rs",
+			&[
+				"ADMIN_MANIFEST_P2_BYTES2",
+				"AnyAdminManifest2",
+				"GovernanceRole2",
+				"ManifestProfile2",
+			],
+		),
+		("validation.rs", &["ADMIN_MANIFEST_P2_BYTES2"]),
 	];
 	let tests = root.join("tests");
 	let admin = root.join("admin");
@@ -3749,7 +3774,7 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 				let t = fs::read_to_string(&p).unwrap();
 				let allowance = allowed
 					.iter()
-					.find(|(f, _)| p == provisioning.join(f))
+					.find(|(f, _)| p == root.join(f))
 					.map_or(&[][..], |(_, names)| *names);
 				for name in [
 					"AdminManifestTwo2",
@@ -3829,6 +3854,103 @@ fn frozen_published_codecs_are_test_only() {
 				assert!(declares || !t.contains(".in\")"), "{}", p.display());
 			} else {
 				assert!(!p.extension().is_some_and(|x| x == "in"), "{}", p.display());
+			}
+		}
+	}
+}
+
+// M3: the profile-2 binding surface, exactly. Syntactic regression pins only (no name resolution,
+// no proof against aliases or forwarding): the installed governance role is a descriptive copy
+// that no production code outside the admin codec reads, the installed view's fields and the tuple
+// field variants are exact, and the descriptive accessor has no production caller.
+#[test]
+fn profile_two_binding_surface_is_exact() {
+	let root =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
+	let install = fs::read_to_string(root.join("admin_install.rs")).unwrap();
+	let fields_of = |text: &str, name: &str| -> Vec<String> {
+		let file = syn::parse_file(text).unwrap();
+		file.items
+			.iter()
+			.find_map(|item| match item {
+				syn::Item::Struct(s) if s.ident == name => Some(
+					s.fields
+						.iter()
+						.map(|f| {
+							assert!(
+								matches!(f.vis, syn::Visibility::Inherited),
+								"private fields"
+							);
+							f.ident.as_ref().unwrap().to_string()
+						})
+						.collect(),
+				),
+				_ => None,
+			})
+			.unwrap()
+	};
+	assert_eq!(
+		fields_of(&install, "InstalledAdmin2"),
+		[
+			"context",
+			"admin_id",
+			"admin_key",
+			"namespace",
+			"governance"
+		]
+	);
+	let anchor = fs::read_to_string(root.join("provisioning/replica_anchor.rs")).unwrap();
+	let variants = syn::parse_file(&anchor)
+		.unwrap()
+		.items
+		.iter()
+		.find_map(|item| match item {
+			syn::Item::Enum(e) if e.ident == "TupleField2" => Some(
+				e.variants
+					.iter()
+					.map(|v| v.ident.to_string())
+					.collect::<Vec<_>>(),
+			),
+			_ => None,
+		})
+		.unwrap();
+	assert_eq!(
+		variants,
+		[
+			"Generation",
+			"Cluster",
+			"Pin",
+			"AdminKey",
+			"InitialEpoch",
+			"Profile"
+		]
+	);
+	// The role is copied in install and never read there.
+	for call in [".key()", ".id()", ".actions()"] {
+		assert!(!install.contains(call), "admin_install.rs calls {call}");
+	}
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let admin = root.join("admin");
+	let mut stack = vec![src];
+	while let Some(dir) = stack.pop() {
+		for e in fs::read_dir(dir).unwrap() {
+			let p = e.unwrap().path();
+			if p.is_dir() {
+				if p != admin && !p.ends_with("tests") {
+					stack.push(p);
+				}
+			} else if p.extension().is_some_and(|x| x == "rs") {
+				let t = fs::read_to_string(&p).unwrap();
+				let is_install = p == root.join("admin_install.rs");
+				// Only install reads a manifest's governance role, and only to copy it.
+				assert_eq!(t.contains(".governance()"), is_install, "{}", p.display());
+				// The descriptive accessor has no production caller (only its definition).
+				assert_eq!(
+					t.matches("admin_governance2(").count(),
+					usize::from(is_install),
+					"{}",
+					p.display()
+				);
 			}
 		}
 	}
