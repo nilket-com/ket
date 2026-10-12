@@ -1474,11 +1474,11 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 	);
 }
 // Owner I/O: std only, zero unsafe, libc constants only, no network, clock, env, trust or root
-// construction; exactly eight exported methods on OwnerDir2 and no exported free functions. Its
+// construction; exactly nine exported methods on OwnerDir2 and no exported free functions. Its
 // one private child, owner_log/ops.rs, obeys the same bans and exposes nothing beyond owner_log.
 // Syntax only; #[cfg(test)] items are excluded from the production surface.
 #[test]
-fn provisioning_owner_log_is_std_only_with_eight_methods() {
+fn provisioning_owner_log_is_std_only_with_nine_methods() {
 	let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 		.join("src/storage/mutation_visibility/root2/provisioning");
 	let text = fs::read_to_string(dir.join("owner_log.rs")).unwrap();
@@ -1621,6 +1621,7 @@ fn provisioning_owner_log_is_std_only_with_eight_methods() {
 			"apply",
 			"clear_sync_failure",
 			"export",
+			"export_tuple",
 			"inspect",
 			"open",
 			"repair_check",
@@ -3737,6 +3738,7 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 			],
 		),
 		("provisioning/snapshot.rs", &["ManifestProfile2"]),
+		("provisioning/owner_log.rs", &["ManifestProfile2"]),
 		(
 			"provisioning/replica_anchor.rs",
 			&[
