@@ -210,22 +210,23 @@ impl ToronDaemon {
 		));
 
 		let loopback_task_listener = config.worker.task_listener_bind.ip().is_loopback();
-		let listener = if loopback_task_listener {
-			Some(TcpListener::bind(config.worker.task_listener_bind).await?)
+		let (listener, quic_worker_endpoint) = if loopback_task_listener {
+			#[cfg(not(test))]
+			let (listener, endpoint) = bind_loopback_worker_pair(&config, WORKER_PAIR_ATTEMPTS).await?;
+			#[cfg(test)]
+			let (listener, endpoint) =
+				bind_loopback_worker_pair(&config, WORKER_PAIR_ATTEMPTS, &mut |_| None).await?;
+			(Some(listener), endpoint)
 		} else {
-			None
-		};
-		let worker_bind_endpoint = if let Some(listener) = &listener {
-			listener.local_addr()?
-		} else {
-			config.worker.task_listener_bind
-		};
-		let quic_worker_endpoint = match (&tls_policy, worker_bind_endpoint.ip().is_loopback()) {
-			(Some(policy), false) => QuicEndpoint::bind_authenticated(
-				worker_bind_endpoint,
-				policy.server_config_for(ListenerRole::WorkerTask),
-			)?,
-			_ => QuicEndpoint::bind_loopback(worker_bind_endpoint)?,
+			let worker_bind_endpoint = config.worker.task_listener_bind;
+			let endpoint = match (&tls_policy, worker_bind_endpoint.ip().is_loopback()) {
+				(Some(policy), false) => QuicEndpoint::bind_authenticated(
+					worker_bind_endpoint,
+					policy.server_config_for(ListenerRole::WorkerTask),
+				)?,
+				_ => QuicEndpoint::bind_loopback(worker_bind_endpoint)?,
+			};
+			(None, endpoint)
 		};
 		let worker_endpoint = quic_worker_endpoint.local_addr()?;
 		let advertised_endpoint = config
@@ -2396,6 +2397,54 @@ fn encode_sql_batch(batch: &RecordBatch) -> Result<Vec<u8>, QueryError> {
 	Ok(buffer)
 }
 
+/// Total attempts for the ephemeral loopback worker pair (see `bind_loopback_worker_pair`).
+const WORKER_PAIR_ATTEMPTS: u32 = 8;
+
+/// Binds the loopback worker pair: the TCP compatibility listener at the configured address, then
+/// the QUIC (UDP) endpoint at the TCP-selected port, so the one published `worker_endpoint` reaches
+/// both. A TCP port reserves nothing on UDP: only when the configured port is 0 (kernel-chosen) and
+/// the UDP bind fails with AddrInUse is that attempt's TCP listener dropped and the pair re-chosen,
+/// at most `attempts` attempts in total; every other error, and any failure for an explicit port,
+/// is returned unchanged. Under `cfg(test)` only, `before_udp` runs after each TCP bind and may
+/// substitute the UDP bind's result; production builds have no such parameter.
+async fn bind_loopback_worker_pair(
+	config: &ToronBootstrapConfig,
+	attempts: u32,
+	#[cfg(test)] before_udp: &mut dyn FnMut(SocketAddr) -> Option<std::io::Error>,
+) -> std::io::Result<(TcpListener, QuicEndpoint)> {
+	let ephemeral = config.worker.task_listener_bind.port() == 0;
+	let mut attempt = 1;
+	loop {
+		let listener = TcpListener::bind(config.worker.task_listener_bind).await?;
+		let worker_bind_endpoint = listener.local_addr()?;
+		#[cfg(test)]
+		let bound = match before_udp(worker_bind_endpoint) {
+			Some(error) => Err(error),
+			None => QuicEndpoint::bind_loopback(worker_bind_endpoint),
+		};
+		#[cfg(not(test))]
+		let bound = QuicEndpoint::bind_loopback(worker_bind_endpoint);
+		match bound {
+			Ok(endpoint) => return Ok((listener, endpoint)),
+			Err(error)
+				if ephemeral
+					&& error.kind() == std::io::ErrorKind::AddrInUse
+					&& attempt < attempts =>
+			{
+				tracing::warn!(
+					address = %worker_bind_endpoint,
+					attempt,
+					attempts,
+					"worker UDP port taken after the TCP bind; re-pairing"
+				);
+				drop(listener);
+				attempt += 1;
+			}
+			Err(error) => return Err(error),
+		}
+	}
+}
+
 fn install_tracing(config: &ToronBootstrapConfig) {
 	match config.observability.format {
 		crate::config::TracingFormat::Pretty => {}
@@ -2850,5 +2899,149 @@ mod tests {
 
 		assert_eq!(code, SqlErrorCode::ResourceExhausted);
 		assert_eq!(message, "tenant memory budget exhausted");
+	}
+
+	// The loopback worker pair. Collisions use real sockets held on the TCP-selected UDP port; only
+	// the error-classification case substitutes an error. Free-port acquisition in the fixed-port
+	// cases is a bounded race with other processes on the host, acknowledged where it occurs.
+	fn pair_config(bind: &str) -> ToronBootstrapConfig {
+		let mut config = retention_config();
+		config.worker.task_listener_bind = bind.parse().expect("pair bind");
+		config
+	}
+	fn kind<T>(result: &std::io::Result<T>) -> Option<std::io::ErrorKind> {
+		result.as_ref().err().map(std::io::Error::kind)
+	}
+	// Holds UDP at `addr` if it is free; either way the subsequent UDP bind there is taken.
+	fn hold_udp(held: &mut Vec<std::net::UdpSocket>, addr: SocketAddr) {
+		if let Ok(socket) = std::net::UdpSocket::bind(addr) {
+			held.push(socket);
+		}
+	}
+	// A port free on both TCP and UDP when checked (a bounded race: released before use).
+	fn free_pair_port() -> u16 {
+		for _ in 0..16 {
+			let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("probe TCP");
+			let port = tcp.local_addr().expect("probe addr").port();
+			if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+				return port;
+			}
+		}
+		panic!("no port free on both TCP and UDP in 16 tries");
+	}
+
+	#[tokio::test]
+	async fn ephemeral_pair_re_pairs_past_a_udp_port_held_after_the_tcp_bind() {
+		let (mut held, mut seen) = (Vec::new(), Vec::new());
+		let (tcp, quic) = bind_loopback_worker_pair(
+			&pair_config("127.0.0.1:0"),
+			WORKER_PAIR_ATTEMPTS,
+			&mut |addr| {
+				if seen.is_empty() {
+					hold_udp(&mut held, addr);
+				}
+				seen.push(addr);
+				None
+			},
+		)
+		.await
+		.expect("re-paired");
+		let (t, u) = (tcp.local_addr().unwrap(), quic.local_addr().unwrap());
+		assert_eq!(seen.len(), 2, "exactly one re-pair");
+		assert_eq!(t.port(), u.port(), "one number reaches both");
+		assert_ne!(t.port(), seen[0].port(), "the held port was skipped");
+		assert!(t.ip().is_loopback() && u.ip().is_loopback());
+	}
+
+	#[tokio::test]
+	async fn ephemeral_pair_exhausts_after_eight_attempts_and_releases_each_tcp_listener() {
+		let (mut held, mut seen) = (Vec::new(), Vec::new());
+		let result = bind_loopback_worker_pair(
+			&pair_config("127.0.0.1:0"),
+			WORKER_PAIR_ATTEMPTS,
+			&mut |addr| {
+				hold_udp(&mut held, addr);
+				seen.push(addr);
+				None
+			},
+		)
+		.await;
+		assert_eq!(kind(&result), Some(std::io::ErrorKind::AddrInUse));
+		assert_eq!(seen.len(), 8, "eight attempts in total, no ninth");
+		// Every attempt's TCP listener was dropped (bounded race: another process could take one).
+		for addr in &seen {
+			assert!(
+				std::net::TcpListener::bind(addr).is_ok(),
+				"{addr}: TCP released"
+			);
+		}
+	}
+
+	/// A control, not the old-source regression: one attempt leaves the collision unrepaired.
+	#[tokio::test]
+	async fn a_single_attempt_returns_the_unpaired_collision() {
+		let (mut held, mut seen) = (Vec::new(), Vec::new());
+		let result = bind_loopback_worker_pair(&pair_config("127.0.0.1:0"), 1, &mut |addr| {
+			hold_udp(&mut held, addr);
+			seen.push(addr);
+			None
+		})
+		.await;
+		assert_eq!(kind(&result), Some(std::io::ErrorKind::AddrInUse));
+		assert_eq!(seen.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn an_ephemeral_udp_error_other_than_addr_in_use_is_returned_at_once() {
+		let mut calls = 0;
+		let result = bind_loopback_worker_pair(
+			&pair_config("127.0.0.1:0"),
+			WORKER_PAIR_ATTEMPTS,
+			&mut |_| {
+				calls += 1;
+				Some(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+			},
+		)
+		.await;
+		assert_eq!(kind(&result), Some(std::io::ErrorKind::PermissionDenied));
+		assert_eq!(calls, 1, "not retried");
+	}
+
+	#[tokio::test]
+	async fn a_fixed_port_binds_exactly_that_port_on_both_protocols() {
+		let port = free_pair_port();
+		let mut calls = 0;
+		let (tcp, quic) = bind_loopback_worker_pair(
+			&pair_config(&format!("127.0.0.1:{port}")),
+			WORKER_PAIR_ATTEMPTS,
+			&mut |_| {
+				calls += 1;
+				None
+			},
+		)
+		.await
+		.expect("fixed pair");
+		assert_eq!(tcp.local_addr().unwrap().port(), port);
+		assert_eq!(quic.local_addr().unwrap().port(), port);
+		assert_eq!(calls, 1);
+	}
+
+	#[tokio::test]
+	async fn a_fixed_port_udp_conflict_is_returned_once_and_never_moved() {
+		let port = free_pair_port();
+		let _held = std::net::UdpSocket::bind(("127.0.0.1", port)).expect("hold fixed UDP");
+		let mut seen = Vec::new();
+		let result = bind_loopback_worker_pair(
+			&pair_config(&format!("127.0.0.1:{port}")),
+			WORKER_PAIR_ATTEMPTS,
+			&mut |addr| {
+				seen.push(addr);
+				None
+			},
+		)
+		.await;
+		assert_eq!(kind(&result), Some(std::io::ErrorKind::AddrInUse));
+		assert_eq!(seen.len(), 1, "one attempt for an explicit port");
+		assert_eq!(seen[0].port(), port, "never an alternate port");
 	}
 }
