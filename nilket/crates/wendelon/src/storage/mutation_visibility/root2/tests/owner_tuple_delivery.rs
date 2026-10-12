@@ -29,22 +29,24 @@ use crate::storage::mutation_visibility::root2::trust::CommittedEntry2;
 use crate::storage::mutation_visibility::root2::verification::*;
 use std::ffi::CString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-static NEXT: AtomicUsize = AtomicUsize::new(0);
-
-/// A fresh 0700 directory unique to this process and call; removed on drop.
+/// A fresh 0700 directory under the temp dir, created exclusively under a random name: an existing
+/// path is never adopted or removed (a collision retries with a new name). Drop removes only the
+/// directory this value created.
 pub(super) struct Scratch(pub PathBuf);
 impl Scratch {
 	pub(super) fn new() -> Self {
-		let n = NEXT.fetch_add(1, Ordering::SeqCst);
-		let p = std::env::temp_dir().join(format!("p-s2-delivery-{}-{n}", std::process::id()));
-		let _ = fs::remove_dir_all(&p);
-		fs::create_dir_all(&p).unwrap();
-		fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
-		Self(p)
+		for _ in 0..8 {
+			let p = std::env::temp_dir().join(format!("p-s2-delivery-{}", uuid::Uuid::new_v4()));
+			match fs::DirBuilder::new().mode(0o700).create(&p) {
+				Ok(()) => return Self(p),
+				Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+				Err(e) => panic!("{}: {e}", p.display()),
+			}
+		}
+		panic!("no fresh scratch directory in 8 attempts")
 	}
 	pub(super) fn at(&self, rel: &str) -> PathBuf {
 		self.0.join(rel)

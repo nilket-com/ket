@@ -210,6 +210,16 @@ fn a_root_that_is_not_bound_is_refused_with_its_state() {
 	let mut d = delivered("b", 189);
 	retire(&mut d.owner, id);
 	let retired = Scratch::new();
+	assert_eq!(
+		d.owner
+			.export_tuple(&retired.0, MANIFEST, INVENTORY, id.generation, id.cluster)
+			.err(),
+		Some(OwnerIoError2::ExportNotBound(RootState2::Retired))
+	);
+	assert!(
+		fs::read_dir(&retired.0).unwrap().next().is_none(),
+		"nothing published"
+	);
 	let pin = d.owner.export(&retired.0, INVENTORY).unwrap();
 	fs::copy(d.out.at(MANIFEST), retired.at(MANIFEST)).unwrap();
 	assert_eq!(
