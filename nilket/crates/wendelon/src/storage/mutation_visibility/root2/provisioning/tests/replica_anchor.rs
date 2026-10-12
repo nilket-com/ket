@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
 	AdminManifest2, admin_manifest_digest2,
 };
@@ -47,14 +48,17 @@ fn one_root(
 	state: RootState2,
 	record: Option<BootstrapRecord2>,
 ) -> (Vec<u8>, [u8; 32]) {
-	let EventBody2::Reserve { manifest } = event("reserve").body else {
+	let EventBody2::Reserve {
+		manifest: AnyAdminManifest2::One(manifest),
+	} = event("reserve").body
+	else {
 		unreachable!()
 	};
 	let last_seq = record.map_or(1, |r| r.inventory_seq);
 	let bytes = encode_snapshot2(&LogState2 {
 		roots: vec![RootEntry2 {
 			identity,
-			manifest,
+			manifest: AnyAdminManifest2::One(manifest),
 			state,
 			last_seq,
 			record,

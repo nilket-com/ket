@@ -8,7 +8,7 @@ use super::inventory::{
 };
 use crate::storage::mutation_visibility::redacted_debug;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	ADMIN_MANIFEST_BYTES2, AdminManifest2, admin_manifest_digest2,
+	AnyAdminManifest2, ManifestBytes2, any_manifest_digest2,
 };
 use crate::storage::mutation_visibility::root2::admin::record::{
 	BootstrapIdentity2, BootstrapObservation2, BootstrapRecord2,
@@ -32,7 +32,7 @@ redacted_debug!(OpId2, "OpId2");
 #[derive(Clone)]
 pub(in crate::storage::mutation_visibility::root2) enum OwnerRequest2 {
 	Reserve {
-		manifest: AdminManifest2,
+		manifest: AnyAdminManifest2,
 	},
 	Approve {
 		identity: RootIdentity2,
@@ -47,7 +47,7 @@ redacted_debug!(OwnerRequest2, "OwnerRequest2");
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum RequestKey2 {
 	Reserve {
-		manifest: [u8; ADMIN_MANIFEST_BYTES2],
+		manifest: ManifestBytes2,
 	},
 	Approve {
 		identity: RootIdentity2,
@@ -310,10 +310,10 @@ fn decide(log: &[u8], op_id: &OpId2, req: &OwnerRequest2) -> Result<Decision2, O
 	let (identity, body) = match (req, &key) {
 		(OwnerRequest2::Reserve { manifest }, RequestKey2::Reserve { manifest: bytes }) => {
 			let identity = RootIdentity2 {
-				generation: manifest.generation,
-				cluster: manifest.cluster,
-				pin: admin_manifest_digest2(bytes),
-				admin_key: manifest.admin_key,
+				generation: manifest.admission().generation,
+				cluster: manifest.admission().cluster,
+				pin: any_manifest_digest2(bytes),
+				admin_key: manifest.admission().admin_key,
 			};
 			if state.roots.iter().any(|r| r.identity == identity) {
 				return Err(OwnerError2::AlreadyReserved);
@@ -351,7 +351,7 @@ fn decide(log: &[u8], op_id: &OpId2, req: &OwnerRequest2) -> Result<Decision2, O
 					ordinary()?;
 					let binds = (o.generation, o.cluster, o.pin)
 						== (identity.generation, identity.cluster, identity.pin)
-						&& o.initial_epoch == root.manifest.initial_epoch;
+						&& o.initial_epoch == root.manifest.admission().initial_epoch;
 					let body = if binds {
 						EventBody2::Approve {
 							record: BootstrapRecord2 {

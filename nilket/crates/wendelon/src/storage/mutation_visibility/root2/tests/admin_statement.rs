@@ -1,6 +1,7 @@
 use super::*;
 use crate::storage::mutation_visibility::MutationScope;
 use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::admin_install::*;
 use crate::storage::mutation_visibility::root2::admin_statement::*;
@@ -75,7 +76,7 @@ fn tuple(manifest_bytes: &[u8], record: BootstrapRecord2) -> PinnedBoundTuple2 {
 				pin,
 				admin_key: manifest.admin_key,
 			},
-			manifest,
+			manifest: AnyAdminManifest2::One(manifest),
 			state: RootState2::Bound,
 			last_seq: record.inventory_seq,
 			record: Some(record),

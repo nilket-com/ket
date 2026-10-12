@@ -3,6 +3,7 @@
 use super::inventory::{LogState2, MAX_ROOTS2, RootIdentity2, RootState2};
 use crate::storage::mutation_visibility::redacted_debug;
 use crate::storage::mutation_visibility::root2::admin::key::check_enrollable_admin_key2;
+use crate::storage::mutation_visibility::root2::admin::manifest::ManifestProfile2;
 use crate::storage::mutation_visibility::root2::admin::record::{
 	BOOTSTRAP_RECORD_BYTES2, BootstrapRecord2,
 };
@@ -10,6 +11,8 @@ use crate::storage::mutation_visibility::root2::codec::hash;
 
 const MAGIC: &[u8; 8] = b"VISINV02";
 const VERSION: u16 = 1;
+/// Canonical iff at least one entry is tagged profile 2; version 1 carries no tag.
+const VERSION_TWO: u16 = 2;
 const HEADER: usize = 22;
 const ENTRY: usize = 320;
 const TRAILER: usize = 32;
@@ -17,6 +20,8 @@ const TRAILER: usize = 32;
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) struct SnapshotEntry2 {
 	pub identity: RootIdentity2,
+	/// A tag only: decode cannot authenticate a manifest it never sees.
+	pub profile: ManifestProfile2,
 	pub state: RootState2,
 	pub last_seq: u64,
 	pub record: Option<BootstrapRecord2>,
@@ -45,6 +50,7 @@ pub(in crate::storage::mutation_visibility::root2) enum SnapshotError2 {
 	Binding,
 	Trailer,
 	NotCanonical,
+	ProfileTag,
 }
 
 fn state_byte(s: RootState2) -> u8 {
@@ -116,9 +122,10 @@ fn validate(s: &InventorySnapshot2) -> Result<(), SnapshotError2> {
 fn encode(s: &InventorySnapshot2) -> Result<Vec<u8>, SnapshotError2> {
 	validate(s)?;
 	let len = HEADER + s.entries.len() * ENTRY + TRAILER;
+	let two = s.entries.iter().any(|e| e.profile == ManifestProfile2::Two);
 	let mut b = Vec::with_capacity(len);
 	b.extend(MAGIC);
-	b.extend(VERSION.to_le_bytes());
+	b.extend(if two { VERSION_TWO } else { VERSION }.to_le_bytes());
 	b.extend((s.entries.len() as u32).to_le_bytes());
 	b.extend(s.export_seq.to_le_bytes());
 	for e in &s.entries {
@@ -127,7 +134,13 @@ fn encode(s: &InventorySnapshot2) -> Result<Vec<u8>, SnapshotError2> {
 		b.extend(e.identity.pin);
 		b.extend(e.identity.admin_key);
 		b.push(state_byte(e.state));
-		b.extend([0u8; 7]);
+		// Version 2 writes every tag explicitly; version 1 has none.
+		b.push(match (two, e.profile) {
+			(false, _) => 0,
+			(true, ManifestProfile2::One) => 1,
+			(true, ManifestProfile2::Two) => 2,
+		});
+		b.extend([0u8; 6]);
 		b.extend(e.last_seq.to_le_bytes());
 		match &e.record {
 			Some(r) => b.extend(r.encode().map_err(|_| SnapshotError2::Record)?),
@@ -153,6 +166,7 @@ pub(in crate::storage::mutation_visibility::root2) fn encode_snapshot2(
 			.iter()
 			.map(|r| SnapshotEntry2 {
 				identity: r.identity,
+				profile: r.manifest.profile(),
 				state: r.state,
 				last_seq: r.last_seq,
 				record: r.record,
@@ -170,7 +184,8 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_snapshot2(
 	if &bytes[0..8] != MAGIC {
 		return Err(SnapshotError2::Magic);
 	}
-	if u16::from_le_bytes(array(bytes, 8)) != VERSION {
+	let version = u16::from_le_bytes(array(bytes, 8));
+	if version != VERSION && version != VERSION_TWO {
 		return Err(SnapshotError2::Version);
 	}
 	let count = u32::from_le_bytes(array(bytes, 10)) as usize;
@@ -194,9 +209,22 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_snapshot2(
 			pin: array(e, 32),
 			admin_key: array(e, 64),
 		};
-		if e[97..104].iter().any(|&x| x != 0) {
-			return Err(SnapshotError2::Reserved);
-		}
+		let profile = if version == VERSION {
+			if e[97..104].iter().any(|&x| x != 0) {
+				return Err(SnapshotError2::Reserved);
+			}
+			ManifestProfile2::One
+		} else {
+			let tag = match e[97] {
+				1 => ManifestProfile2::One,
+				2 => ManifestProfile2::Two,
+				_ => return Err(SnapshotError2::ProfileTag),
+			};
+			if e[98..104].iter().any(|&x| x != 0) {
+				return Err(SnapshotError2::Reserved);
+			}
+			tag
+		};
 		let state = match e[96] {
 			1 => RootState2::Prepared,
 			2 => RootState2::Bound,
@@ -213,6 +241,7 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_snapshot2(
 		};
 		entries.push(SnapshotEntry2 {
 			identity,
+			profile,
 			state,
 			last_seq,
 			record,

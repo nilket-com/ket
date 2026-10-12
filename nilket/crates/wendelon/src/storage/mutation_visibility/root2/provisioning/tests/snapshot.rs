@@ -44,8 +44,13 @@ fn every_invariant_is_refused() {
 	assert_eq!(decode(&full[..40]), Err(Length));
 	assert_eq!(decode(&patched("full", 0, b"VISINV03")), Err(Magic));
 	assert_eq!(
-		decode(&patched("full", 8, &2u16.to_le_bytes())),
+		decode(&patched("full", 8, &3u16.to_le_bytes())),
 		Err(Version)
+	);
+	// M2: version 2 is readable; its untagged (version-1) entries fail at the tag.
+	assert_eq!(
+		decode(&patched("full", 8, &2u16.to_le_bytes())),
+		Err(ProfileTag)
 	);
 	assert_eq!(
 		decode(&patched("full", 10, &4097u32.to_le_bytes())),
