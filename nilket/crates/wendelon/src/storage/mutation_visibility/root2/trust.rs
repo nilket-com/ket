@@ -1,10 +1,9 @@
-#[cfg(test)]
-use super::command::Command2;
 use super::committed::CommittedSource2;
 use super::entry_identity::EntryPosition2;
 use super::origin::EntryClass2;
 use super::types::*;
-/// No decoder/public constructor: future committed-entry adapter is deliberately absent.
+use crate::storage::mutation_visibility::root2::command::Command2;
+/// No public constructor. Dormant replay binds entries through one guarded internal caller.
 pub struct TrustedEntry2 {
 	generation: [u8; 16],
 	cluster: [u8; 16],
@@ -30,13 +29,52 @@ pub struct TrustedView2 {
 }
 /// Any committed entry, genesis (0,0,0) included, with its version-1 identity and producer
 /// classification. No decoder. Its one production factory requires a `CommittedSource2`, which
-/// no runtime code can mint; the committed-entry adapter is its only caller.
+/// dormant replay alone can mint; the committed-entry adapter is its only caller.
 pub struct CommittedEntry2 {
 	position: EntryPosition2,
 	identity: Digest2,
 	class: EntryClass2,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BindError2 {
+	NotRoot2Command,
+	DigestMismatch,
+	Position,
+}
 impl TrustedEntry2 {
+	pub(super) fn bind(
+		committed: &CommittedEntry2,
+		command: &Command2,
+		generation: [u8; 16],
+		cluster: [u8; 16],
+	) -> Result<Self, BindError2> {
+		let (p, fingerprint, class) = committed.entry_fields();
+		let digest = match class {
+			EntryClass2::Bootstrap(d) | EntryClass2::OtherRoot2(d) => d,
+			_ => return Err(BindError2::NotRoot2Command),
+		};
+		if command
+			.digest(generation, cluster)
+			.map_err(|_| BindError2::DigestMismatch)?
+			!= digest
+		{
+			return Err(BindError2::DigestMismatch);
+		}
+		if p.term == 0 || p.node == 0 || p.index == 0 {
+			return Err(BindError2::Position);
+		}
+		Ok(Self {
+			generation,
+			cluster,
+			log: Log2 {
+				term: p.term,
+				node: p.node,
+				index: p.index,
+			},
+			fingerprint,
+			command: digest,
+		})
+	}
 	pub(super) fn fields(&self) -> ([u8; 16], [u8; 16], Log2, Digest2, Digest2) {
 		(
 			self.generation,

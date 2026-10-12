@@ -43,10 +43,16 @@ pub(in crate::storage::mutation_visibility::root2) enum Baseline2 {
 }
 redacted_debug!(Baseline2, "Baseline2");
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) enum TargetCommand2 {
+	Expected(Digest2),
+	BoundAtCut,
+}
+redacted_debug!(TargetCommand2, "TargetCommand2");
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) struct ReplayTarget2 {
 	pub cut: Log2,
 	pub fingerprint: Digest2,
-	pub command: Digest2,
+	pub command: TargetCommand2,
 }
 redacted_debug!(ReplayTarget2, "ReplayTarget2");
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,6 +78,7 @@ pub(in crate::storage::mutation_visibility::root2) enum RecoveryError2 {
 	Padding,
 	Field(FieldError2),
 	NotRooted,
+	TargetNotRooted,
 	Unavailable,
 	NotGenesis,
 	Regressed,
@@ -233,7 +240,8 @@ pub(in crate::storage::mutation_visibility::root2) fn replay_monitor2(
 			return Err(E::TargetBelowMark);
 		}
 		if target.cut.index == m.cut.index
-			&& (target.cut, target.fingerprint, target.command) != (m.cut, m.fingerprint, m.command)
+			&& ((target.cut, target.fingerprint) != (m.cut, m.fingerprint)
+				|| matches!(target.command, TargetCommand2::Expected(d) if d != m.command))
 		{
 			return Err(E::Conflict);
 		}
@@ -299,6 +307,9 @@ fn observe(m: &mut ReplayMonitor2, state: &MutationAuthorityState2) -> Result<Pr
 	}
 	// 5. Pre-root.
 	let Some((root, _)) = rooted else {
+		if pos.index == m.target.cut.index && m.target.command == TargetCommand2::BoundAtCut {
+			return Err(E::TargetNotRooted);
+		}
 		return Ok(Progress2::Replaying);
 	};
 	m.rooted = true;
@@ -331,7 +342,8 @@ fn observe(m: &mut ReplayMonitor2, state: &MutationAuthorityState2) -> Result<Pr
 	// 9. The expected target tip, only after the mark.
 	if pos.index == m.target.cut.index {
 		let t = m.target;
-		if (s.covered, s.fingerprint, s.command_digest) != (t.cut, t.fingerprint, t.command)
+		if ((s.covered, s.fingerprint) != (t.cut, t.fingerprint)
+			|| matches!(t.command, TargetCommand2::Expected(d) if d != s.command_digest))
 			|| !m.matched
 		{
 			return Err(E::Conflict);

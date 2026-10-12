@@ -210,7 +210,9 @@ fn profile_two_chain_survives_owner_to_install() {
 		ReplayTarget2 {
 			cut: root.state.covered,
 			fingerprint: root.state.fingerprint,
-			command: root.state.command_digest,
+			command: crate::storage::mutation_visibility::root2::recovery::TargetCommand2::Expected(
+				root.state.command_digest,
+			),
 		},
 	)
 	.unwrap();

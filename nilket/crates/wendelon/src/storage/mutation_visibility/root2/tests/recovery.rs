@@ -420,7 +420,9 @@ fn tip(s: &MutationAuthorityState2) -> ReplayTarget2 {
 	ReplayTarget2 {
 		cut: root.state.covered,
 		fingerprint: root.state.fingerprint,
-		command: root.state.command_digest,
+		command: crate::storage::mutation_visibility::root2::recovery::TargetCommand2::Expected(
+			root.state.command_digest,
+		),
 	}
 }
 fn mark(s: &MutationAuthorityState2) -> RecoveryMark2 {
@@ -680,7 +682,9 @@ fn replay_refusals_latch_and_leave_marks_untouched() {
 	let low = ReplayTarget2 {
 		cut: l(1),
 		fingerprint: [1; 32],
-		command: [1; 32],
+		command: crate::storage::mutation_visibility::root2::recovery::TargetCommand2::Expected(
+			[1; 32],
+		),
 	};
 	let mut m = fresh(Baseline2::Provisioned, low);
 	assert_eq!(
@@ -705,7 +709,9 @@ fn replay_refusals_latch_and_leave_marks_untouched() {
 			..t11
 		},
 		ReplayTarget2 {
-			command: [0x5C; 32],
+			command: crate::storage::mutation_visibility::root2::recovery::TargetCommand2::Expected(
+				[0x5C; 32],
+			),
 			..t11
 		},
 	] {

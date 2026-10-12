@@ -1,4 +1,4 @@
-//! Dormant S1 authority2. No production adapter can construct its private trust tokens.
+//! Dormant authority2. Internal replay can bind trust tokens; no production caller runs it.
 #[allow(dead_code)]
 // Dormant committed-prefix acquisition; no production caller until reviewed integration.
 mod acquisition;
@@ -42,6 +42,8 @@ mod records;
 #[allow(dead_code)]
 // Dormant replay progress and recovery mark; no production caller until reviewed integration.
 mod recovery;
+#[allow(dead_code)] // Dormant owned replay; S1 exports no authority or replay result.
+mod replay;
 mod reducer;
 mod state;
 mod stored;
