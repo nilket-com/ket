@@ -40,7 +40,7 @@ fn vector(name: &str) -> Vec<u8> {
 fn full() -> RetentionStatus {
 	RetentionStatus {
 		configured: ControlRetention::Full,
-		history: HistoryCheck::Fresh,
+		history: HistoryCheck::Complete { stored_last: 9 },
 		violation: None,
 		refusals: RetentionRefusals::default(),
 	}

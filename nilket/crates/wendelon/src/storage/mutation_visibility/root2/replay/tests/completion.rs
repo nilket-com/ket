@@ -313,3 +313,27 @@ async fn cancelled_run_after_provisional_fold_keeps_mark_and_clears_fixture() {
 		crate::storage::mutation_visibility::root2::committed::fixture::command(p, fp).is_none()
 	);
 }
+
+async fn refuses_closure_history(history: HistoryCheck) {
+	let (pin, dep, entries, fixtures) = context();
+	let _scope = Root2FixtureScope::install(fixtures);
+	let (d, mut m) = marks();
+	let prior = bytes(&d);
+	let mut reader = store(entries.clone()).await;
+	let mut sources = Closing::new(entries[3].log_id);
+	sources.status.history = history;
+	assert!(matches!(
+		run(&mut reader, &sources, caps(), dep, &pin, &mut m).await,
+		Err(ReplayError2::Closure(ClosureError2::Retention))
+	));
+	assert_eq!(bytes(&d), prior);
+	assert_eq!(m.durable(), Some(Baseline2::Provisioned));
+}
+#[tokio::test(flavor = "current_thread")]
+async fn closure_fresh_history_contradicts_nonempty_prefix() {
+	refuses_closure_history(HistoryCheck::Fresh).await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn closure_empty_history_contradicts_nonempty_prefix() {
+	refuses_closure_history(HistoryCheck::EmptyLog).await;
+}
