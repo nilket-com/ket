@@ -42,9 +42,9 @@ mod records;
 #[allow(dead_code)]
 // Dormant replay progress and recovery mark; no production caller until reviewed integration.
 mod recovery;
+mod reducer;
 #[allow(dead_code)] // Dormant owned replay; S1 exports no authority or replay result.
 mod replay;
-mod reducer;
 mod state;
 mod stored;
 mod trust;
