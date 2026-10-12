@@ -2912,10 +2912,17 @@ mod tests {
 	fn kind<T>(result: &std::io::Result<T>) -> Option<std::io::ErrorKind> {
 		result.as_ref().err().map(std::io::Error::kind)
 	}
-	// Holds UDP at `addr` if it is free; either way the subsequent UDP bind there is taken.
-	fn hold_udp(held: &mut Vec<std::net::UdpSocket>, addr: SocketAddr) {
-		if let Ok(socket) = std::net::UdpSocket::bind(addr) {
-			held.push(socket);
+	// Holds UDP at `addr`: true when this test now owns the blocking socket, false when the port
+	// is already occupied (AddrInUse, still a real collision). Any other bind error fails the
+	// fixture; it is not evidence of an occupied port.
+	fn hold_udp(held: &mut Vec<std::net::UdpSocket>, addr: SocketAddr) -> bool {
+		match std::net::UdpSocket::bind(addr) {
+			Ok(socket) => {
+				held.push(socket);
+				true
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => false,
+			Err(error) => panic!("{addr}: holding UDP failed: {error}"),
 		}
 	}
 	// A port free on both TCP and UDP when checked (a bounded race: released before use).
@@ -2932,13 +2939,13 @@ mod tests {
 
 	#[tokio::test]
 	async fn ephemeral_pair_re_pairs_past_a_udp_port_held_after_the_tcp_bind() {
-		let (mut held, mut seen) = (Vec::new(), Vec::new());
+		let (mut held, mut seen, mut owned) = (Vec::new(), Vec::new(), None);
 		let (tcp, quic) = bind_loopback_worker_pair(
 			&pair_config("127.0.0.1:0"),
 			WORKER_PAIR_ATTEMPTS,
 			&mut |addr| {
 				if seen.is_empty() {
-					hold_udp(&mut held, addr);
+					owned = Some(hold_udp(&mut held, addr));
 				}
 				seen.push(addr);
 				None
@@ -2947,7 +2954,17 @@ mod tests {
 		.await
 		.expect("re-paired");
 		let (t, u) = (tcp.local_addr().unwrap(), quic.local_addr().unwrap());
-		assert_eq!(seen.len(), 2, "exactly one re-pair");
+		assert_eq!(
+			owned,
+			Some(true),
+			"this test owns the socket blocking the first port"
+		);
+		// Another process may take a later independently selected UDP port; only the first is ours.
+		assert!(
+			(2..=WORKER_PAIR_ATTEMPTS as usize).contains(&seen.len()),
+			"re-paired within the bound: {} attempts",
+			seen.len()
+		);
 		assert_eq!(t.port(), u.port(), "one number reaches both");
 		assert_ne!(t.port(), seen[0].port(), "the held port was skipped");
 		assert!(t.ip().is_loopback() && u.ip().is_loopback());
