@@ -1,9 +1,10 @@
 //! Dormant committed-entry adapter for the classes that exist today: Blank, Membership and every
 //! non-Root2 request. Position, version-1 identity and class are all derived from the real
 //! openraft entry; no caller supplies any of them. Whether an entry is committed is not decided
-//! here: that is the fact a `CommittedSource2` stands for, and no runtime code can mint one until
-//! a reviewed integration reads the retained Control log from genesis under a separately trusted
-//! committed bound. This authenticates neither commitment nor history.
+//! here: that is the fact a `CommittedSource2` stands for. The private dormant replay alone can
+//! mint one inside a lexical run and use it only on validated acquired batches (and the initial
+//! validated boundary). No production caller starts that replay. This adapter authenticates
+//! neither commitment nor history.
 use crate::consensus::{WendelonRequest, WendelonTypeConfig};
 use crate::storage::mutation_visibility::root2::entry_identity::{
 	EntryIdentityError2, EntryPosition2, blank_entry_identity2, membership_entry_identity2,
@@ -14,11 +15,17 @@ use crate::storage::mutation_visibility::root2::trust::CommittedEntry2;
 use openraft::{Entry, EntryPayload};
 
 /// Capability: the entries passed with it were read, in index order, from the committed retained
-/// Control log. Private fields and a test-only mint: unreachable at runtime until reviewed.
+/// Control log. Private fields; the runtime mint is restricted to the private dormant replay.
 pub(in crate::storage::mutation_visibility::root2) struct CommittedSource2 {
 	_scope: (),
 }
 impl CommittedSource2 {
+	pub(in crate::storage::mutation_visibility::root2) fn acquired(
+		_: &crate::storage::mutation_visibility::root2::replay::PrefixRun2,
+	) -> Self {
+		Self { _scope: () }
+	}
+
 	#[cfg(test)]
 	pub(in crate::storage::mutation_visibility::root2) fn synthetic() -> Self {
 		Self { _scope: () }
@@ -52,6 +59,8 @@ pub(in crate::storage::mutation_visibility::root2) fn committed_entry2(
 			request_class(r),
 		),
 	};
+	#[cfg(test)]
+	let class = fixture::class(position, identity).unwrap_or(class);
 	Ok(CommittedEntry2::from_source(
 		source, position, identity, class,
 	))
@@ -89,3 +98,6 @@ fn request_class(request: &WendelonRequest) -> EntryClass2 {
 		| WendelonRequest::TableDropSettlement(_) => EntryClass2::NonRoot2,
 	}
 }
+
+#[cfg(test)]
+pub(in crate::storage::mutation_visibility::root2) mod fixture;

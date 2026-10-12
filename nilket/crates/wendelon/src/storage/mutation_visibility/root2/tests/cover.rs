@@ -392,7 +392,9 @@ fn frontier_target_equals_covered_tip() {
 	let target = ReplayTarget2 {
 		cut: log2(position),
 		fingerprint: identity,
-		command: derived_digest(0, identity),
+		command: crate::storage::mutation_visibility::root2::recovery::TargetCommand2::Expected(
+			derived_digest(0, identity),
+		),
 	};
 	let deployment = Deployment2 {
 		generation: G,
@@ -400,7 +402,7 @@ fn frontier_target_equals_covered_tip() {
 	};
 	let states = [genesis(), scanned(), rooted()];
 	let through = covered_by(&states[2], &frontier);
-	assert!(tip(&through) == (target.cut, target.fingerprint, target.command));
+	assert!(tip(&through) == (target.cut, target.fingerprint, match target.command { crate::storage::mutation_visibility::root2::recovery::TargetCommand2::Expected(d) => d, _ => unreachable!() }));
 	let mut m = replay_monitor2(deployment, Some(Baseline2::Provisioned), target).unwrap();
 	for s in &states {
 		assert!(matches!(observe2(&mut m, s).unwrap(), Progress2::Replaying));

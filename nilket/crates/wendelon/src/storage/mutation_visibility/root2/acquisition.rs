@@ -57,6 +57,8 @@ pub(in crate::storage::mutation_visibility::root2) struct PrefixValidated2 {
 	through: LogId<u32>,
 	entries: u64,
 	encoded_bytes: u64,
+	terminal_applied: LogId<u32>,
+	terminal_retention: RetentionStatus,
 }
 impl PrefixValidated2 {
 	pub(in crate::storage::mutation_visibility::root2) fn through(&self) -> LogId<u32> {
@@ -68,13 +70,21 @@ impl PrefixValidated2 {
 	pub(in crate::storage::mutation_visibility::root2) fn encoded_bytes(&self) -> u64 {
 		self.encoded_bytes
 	}
+	pub(in crate::storage::mutation_visibility::root2) fn terminal_applied(&self) -> LogId<u32> {
+		self.terminal_applied
+	}
+	pub(in crate::storage::mutation_visibility::root2) fn terminal_retention(
+		&self,
+	) -> RetentionStatus {
+		self.terminal_retention
+	}
 }
 
 pub(in crate::storage::mutation_visibility::root2) async fn acquire_committed_prefix2<Rd, Acc>(
 	reader: &mut Rd,
 	sources: &impl AcquisitionSources2,
 	caps: AcquisitionCaps2,
-	init: Acc,
+	init: impl FnOnce(&Entry<WendelonTypeConfig>) -> Result<Acc, FoldError2>,
 	mut fold: impl FnMut(Acc, &[Entry<WendelonTypeConfig>]) -> Result<Acc, FoldError2>,
 ) -> Result<(Acc, PrefixValidated2), AcquisitionError2>
 where
@@ -90,7 +100,9 @@ where
 		.ok_or(E::NoCommittedEntry)?;
 	let count = c.index.checked_add(1).ok_or(E::Overflow)?;
 	let start = sources.retention();
-	let (mut from, mut total, mut acc) = (0u64, 0u64, init);
+	let (mut from, mut total) = (0u64, 0u64);
+	let mut init = Some(init);
+	let mut acc = None;
 	loop {
 		let (end, want) = next_range(from, caps.max_entries, c.index)?;
 		let batch = reader
@@ -134,15 +146,21 @@ where
 		let end_status = sources.retention();
 		check_committed_prefix2(&start, c, &batch, from, &end_status, &boundary, c2)
 			.map_err(E::Prefix)?;
-		acc = fold(acc, &batch).map_err(E::Fold)?;
+		let current = match acc.take() {
+			Some(current) => current,
+			None => init.take().expect("initialization occurs once")(&boundary).map_err(E::Fold)?,
+		};
+		acc = Some(fold(current, &batch).map_err(E::Fold)?);
 		total = next_total;
 		if end == c.index {
 			return Ok((
-				acc,
+				acc.expect("the validated batch was folded"),
 				PrefixValidated2 {
 					through: c,
 					entries: count,
 					encoded_bytes: total,
+					terminal_applied: c2,
+					terminal_retention: end_status,
 				},
 			));
 		}

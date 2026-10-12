@@ -220,6 +220,15 @@ fn s1_private_trust_tokens_and_fake_install_are_test_only() {
 							assert!(
 								matches!(&f.vis, syn::Visibility::Restricted(r) if r.path.is_ident("super"))
 							);
+						} else if f.sig.ident == "bind" {
+							production_factories += 1;
+							assert!(!test_only(&f.attrs));
+							assert!(
+								matches!(&*i.self_ty, syn::Type::Path(p) if p.path.is_ident("TrustedEntry2"))
+							);
+							assert!(
+								matches!(&f.vis, syn::Visibility::Restricted(r) if r.path.is_ident("super"))
+							);
 						} else if f.sig.ident == "from_source" {
 							// Stage A0: the one production factory, on CommittedEntry2 only, and
 							// only with the committed-source capability as its first parameter.
@@ -255,7 +264,7 @@ fn s1_private_trust_tokens_and_fake_install_are_test_only() {
 	// Fourth token: CommittedEntry2 (origin contract r4 E1), whose only factory is a test fixture.
 	assert_eq!(tokens, 4);
 	assert_eq!(factories, 6);
-	assert_eq!(production_factories, 2);
+	assert_eq!(production_factories, 3);
 	let state = syn::parse_file(&fs::read_to_string(root.join("state.rs")).unwrap()).unwrap();
 	let mut installs = 0;
 	for item in state.items {
@@ -2390,7 +2399,10 @@ fn recovery_is_pure_and_dormant() {
 	let mut files = Vec::new();
 	walk(src, &root.join("tests"), &mut files);
 	for f in files {
-		if f.ends_with("root2/recovery.rs") {
+		if f.ends_with("root2/recovery.rs")
+			|| f.ends_with("root2/replay.rs")
+			|| f.starts_with(root.join("replay"))
+		{
 			continue;
 		}
 		let t = fs::read_to_string(&f).unwrap();
@@ -2626,9 +2638,13 @@ fn committed_adapter_is_pure_capability_gated_and_exhaustive() {
 				assert_eq!(quote_type(&i.self_ty), "CommittedSource2");
 				for it in &i.items {
 					if let syn::ImplItem::Fn(f) = it {
-						assert_eq!(f.sig.ident, "synthetic");
-						assert!(cfg_test(&f.attrs), "the only mint is test-only");
-						mints += 1;
+						if f.sig.ident == "synthetic" {
+							assert!(cfg_test(&f.attrs));
+							mints += 1;
+						} else {
+							assert_eq!(f.sig.ident, "acquired");
+							assert!(root2_scoped(&f.vis) && !cfg_test(&f.attrs));
+						}
 					}
 				}
 			}
@@ -2657,6 +2673,7 @@ fn committed_adapter_is_pure_capability_gated_and_exhaustive() {
 					assert_eq!(f.block.stmts.len(), 1, "request_class is only the match");
 				}
 			}
+			syn::Item::Mod(m) if m.ident == "fixture" && cfg_test(&m.attrs) => {}
 			syn::Item::Trait(_) | syn::Item::Static(_) | syn::Item::Mod(_) => {
 				panic!("committed.rs: unexpected item")
 			}
@@ -3293,6 +3310,8 @@ fn committed_prefix_acquisition_is_unminted_and_unwired() {
 			vec![
 				"encoded_bytes".to_string(),
 				"entries".to_string(),
+				"terminal_applied".to_string(),
+				"terminal_retention".to_string(),
 				"through".to_string()
 			]
 		)]
@@ -3309,6 +3328,8 @@ fn committed_prefix_acquisition_is_unminted_and_unwired() {
 				}
 			} else if p.extension().is_some_and(|x| x == "rs")
 				&& !p.ends_with("root2/acquisition.rs")
+				&& !p.ends_with("root2/replay.rs")
+				&& !p.starts_with(root.join("replay"))
 			{
 				let t = fs::read_to_string(&p).unwrap();
 				for name in [
@@ -3443,7 +3464,7 @@ fn command_verification_is_single_site_and_unwired() {
 					p.display()
 				);
 			}
-			if !p.ends_with("root2/verification.rs") {
+			if !p.ends_with("root2/verification.rs") && !p.ends_with("root2/replay.rs") {
 				assert!(
 					!t.contains("advance_verified2(") && !t.contains("root2::verification"),
 					"production caller of C in {}",
@@ -3956,4 +3977,126 @@ fn profile_two_binding_surface_is_exact() {
 			}
 		}
 	}
+}
+
+// L-S1 is private owned composition, not a public unconfirmed authority path. Each factory has
+// exactly one production call site. These are syntax guards, not general name resolution.
+#[test]
+fn dormant_replay_owns_state_and_has_single_site_factories() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let root = src.join("storage/mutation_visibility/root2");
+	let text = fs::read_to_string(root.join("replay.rs")).unwrap();
+	assert!(text.lines().count() <= 750);
+	let file = syn::parse_file(&text).unwrap();
+	let mut exported = Vec::new();
+	for item in file.items {
+		match item {
+			syn::Item::Struct(s) => {
+				assert!(s.attrs.iter().all(|a| !a.path().is_ident("derive")));
+				assert!(
+					s.fields
+						.iter()
+						.all(|f| matches!(f.vis, syn::Visibility::Inherited))
+				);
+				if !matches!(s.vis, syn::Visibility::Inherited) {
+					assert!(root2_scoped(&s.vis));
+					exported.push(s.ident.to_string());
+				}
+				if s.ident == "Provisional2" {
+					for f in s.fields {
+						let t = quote_type(&f.ty);
+						assert!(!t.contains("TrustedEntry2") && !t.contains("CommittedEntry2"));
+					}
+				}
+			}
+			syn::Item::Fn(f) => assert!(matches!(f.vis, syn::Visibility::Inherited)),
+			syn::Item::Impl(i) => {
+				assert!(i.trait_.is_none());
+				for m in i.items {
+					if let syn::ImplItem::Fn(f) = m {
+						assert!(matches!(f.vis, syn::Visibility::Inherited));
+					}
+				}
+			}
+			syn::Item::Enum(e) => assert!(matches!(e.vis, syn::Visibility::Inherited)),
+			syn::Item::Mod(m) => {
+				assert_eq!(m.ident, "tests");
+				assert!(m.attrs.iter().any(|a| matches!(&a.meta, syn::Meta::List(l) if l.path.is_ident("cfg") && l.tokens.to_string()=="test")));
+			}
+			syn::Item::Use(_) => {}
+			_ => panic!("unreviewed replay item"),
+		}
+	}
+	assert_eq!(exported, ["PrefixRun2"]);
+	let production = without_test_items_deep(text.parse().unwrap())
+		.to_string()
+		.replace(' ', "");
+	for banned in [
+		"unsafe",
+		"spawn",
+		"std::fs",
+		"std::net",
+		"MarkStore2",
+		"TrustedView2",
+		"VerifiedCommand2::",
+		"Clone",
+		"Replayed2",
+	] {
+		assert!(!production.contains(banned), "replay: {banned}");
+	}
+	assert_eq!(production.matches("observe2(").count(), 1);
+	assert_eq!(production.matches("CommittedSource2::acquired(").count(), 1);
+	assert_eq!(production.matches("TrustedEntry2::bind(").count(), 1);
+	let mut stack = vec![src];
+	let mut acquired = 0;
+	let mut bind = 0;
+	while let Some(dir) = stack.pop() {
+		for e in fs::read_dir(dir).unwrap() {
+			let p = e.unwrap().path();
+			if p.is_dir() {
+				if p != root.join("tests") && p != root.join("replay") {
+					stack.push(p);
+				}
+				continue;
+			}
+			if p.extension().is_none_or(|x| x != "rs") {
+				continue;
+			}
+			let t = without_test_items_deep(fs::read_to_string(&p).unwrap().parse().unwrap())
+				.to_string()
+				.replace(' ', "");
+			let a = t.matches("CommittedSource2::acquired(").count();
+			let b = t.matches("TrustedEntry2::bind(").count();
+			if !p.ends_with("root2/replay.rs") {
+				assert_eq!(a + b, 0, "factory outside replay {}", p.display());
+			}
+			acquired += a;
+			bind += b;
+			if !p.starts_with(&root) {
+				for name in [
+					"ReplayDriver2",
+					"PrefixRun2",
+					"Provisional2",
+					"root2::replay",
+				] {
+					assert!(!t.contains(name), "{}", p.display());
+				}
+			}
+			if p.ends_with("root2/mod.rs") {
+				continue;
+			}
+			if !p.ends_with("root2/replay.rs") && !p.ends_with("root2/committed.rs") {
+				assert!(!t.contains("PrefixRun2"), "{}", p.display());
+			}
+		}
+	}
+	assert_eq!((acquired, bind), (1, 1));
+	let committed = fs::read_to_string(root.join("committed.rs")).unwrap();
+	let ast = syn::parse_file(&committed).unwrap();
+	assert!(ast.items.iter().any(|i| matches!(i,syn::Item::Mod(m) if m.ident=="fixture" && m.attrs.iter().any(|a|matches!(&a.meta,syn::Meta::List(l) if l.path.is_ident("cfg") && l.tokens.to_string()=="test")))));
+	assert!(
+		!without_test_items_deep(committed.parse().unwrap())
+			.to_string()
+			.contains("fixture")
+	);
 }

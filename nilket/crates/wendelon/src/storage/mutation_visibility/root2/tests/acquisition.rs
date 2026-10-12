@@ -196,7 +196,7 @@ async fn run(
 ) {
 	let (a, drops) = acc();
 	(
-		acquire_committed_prefix2(reader, sources, caps, a, record).await,
+		acquire_committed_prefix2(reader, sources, caps, |_| Ok(a), record).await,
 		drops,
 	)
 }
@@ -281,10 +281,16 @@ async fn late_gap_truncation_and_extra_refuse() {
 	let folds = Arc::new(AtomicUsize::new(0));
 	let counted = folds.clone();
 	let (a, drops) = acc();
-	let out = acquire_committed_prefix2(&mut r, &Sources::at(c), wide(), a, move |a, b| {
-		counted.fetch_add(1, Ordering::SeqCst);
-		record(a, b)
-	})
+	let out = acquire_committed_prefix2(
+		&mut r,
+		&Sources::at(c),
+		wide(),
+		|_| Ok(a),
+		move |a, b| {
+			counted.fetch_add(1, Ordering::SeqCst);
+			record(a, b)
+		},
+	)
 	.await;
 	assert!(
 		matches!(
@@ -433,12 +439,18 @@ async fn terminal_capture_observes_changes_during_last_boundary_read() {
 		let later = sources.clone();
 		let mut r = FaultReader::plain(store(entries(8)).await);
 		let (a, drops) = acc();
-		let out = acquire_committed_prefix2(&mut r, &sources, wide(), a, move |a, b| {
-			if b.last().is_some_and(|e| e.log_id.index == 6) {
-				change(&later);
-			}
-			record(a, b)
-		})
+		let out = acquire_committed_prefix2(
+			&mut r,
+			&sources,
+			wide(),
+			|_| Ok(a),
+			move |a, b| {
+				if b.last().is_some_and(|e| e.log_id.index == 6) {
+					change(&later);
+				}
+				record(a, b)
+			},
+		)
 		.await;
 		assert!(out.is_ok(), "validation cut: later changes belong to L");
 		assert_eq!(drops.load(Ordering::SeqCst), 0);
@@ -469,10 +481,16 @@ async fn retention_and_committed_point_cases() {
 	let folds = Arc::new(AtomicUsize::new(0));
 	let counted = folds.clone();
 	let (a, _) = acc();
-	let out = acquire_committed_prefix2(&mut r, &sources, wide(), a, move |a, b| {
-		counted.fetch_add(1, Ordering::SeqCst);
-		record(a, b)
-	})
+	let out = acquire_committed_prefix2(
+		&mut r,
+		&sources,
+		wide(),
+		|_| Ok(a),
+		move |a, b| {
+			counted.fetch_add(1, Ordering::SeqCst);
+			record(a, b)
+		},
+	)
 	.await;
 	assert!(matches!(
 		out,
@@ -562,13 +580,19 @@ async fn store_and_fold_failures_discard_provisional_output() {
 	// A fold refusal at the last batch, after earlier batches were folded.
 	let mut r = FaultReader::plain(store(entries(8)).await);
 	let (a, drops) = acc();
-	let out = acquire_committed_prefix2(&mut r, &Sources::at(c), wide(), a, |a, b| {
-		if b[0].log_id.index == 6 {
-			Err(FoldError2)
-		} else {
-			record(a, b)
-		}
-	})
+	let out = acquire_committed_prefix2(
+		&mut r,
+		&Sources::at(c),
+		wide(),
+		|_| Ok(a),
+		|a, b| {
+			if b[0].log_id.index == 6 {
+				Err(FoldError2)
+			} else {
+				record(a, b)
+			}
+		},
+	)
 	.await;
 	assert!(matches!(out, Err(AcquisitionError2::Fold(FoldError2))));
 	assert_eq!(
@@ -752,7 +776,7 @@ async fn cancelled_acquisition_exposes_nothing() {
 	let (a, drops) = acc();
 	let timed = tokio::time::timeout(
 		std::time::Duration::from_millis(50),
-		acquire_committed_prefix2(&mut r, &sources, wide(), a, record),
+		acquire_committed_prefix2(&mut r, &sources, wide(), |_| Ok(a), record),
 	)
 	.await;
 	assert!(timed.is_err(), "cancelled");
@@ -799,7 +823,7 @@ async fn entry_mutated_in_store_after_its_read_is_not_detected() {
 		Ok(a)
 	};
 	let (folded, report) =
-		acquire_committed_prefix2(&mut r, &Sources::at(c), wide(), Vec::new(), fold)
+		acquire_committed_prefix2(&mut r, &Sources::at(c), wide(), |_| Ok(Vec::new()), fold)
 			.await
 			.unwrap();
 	assert_eq!(report.through(), c);
