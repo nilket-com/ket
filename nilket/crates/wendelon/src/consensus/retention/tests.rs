@@ -308,7 +308,7 @@ fn default_retention_is_todays_openraft_config() {
 		Some(&RetentionConfigError::UnknownMode)
 	);
 	assert_eq!(
-		crate::node::NodeBootstrapConfig::dev(1, root.clone(), "127.0.0.1:0".into())
+		crate::node::NodeBootstrapConfig::dev(1, root.to_path_buf(), "127.0.0.1:0".into())
 			.control_retention,
 		ControlRetention::Compacting
 	);
