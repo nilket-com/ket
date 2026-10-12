@@ -4098,6 +4098,7 @@ fn dormant_replay_owns_state_and_has_single_site_factories() {
 	let positions = stages.map(|stage| production.find(stage).expect(stage));
 	assert!(positions.windows(2).all(|w| w[0] < w[1]));
 	assert_eq!(production.matches("mark_store.advance(").count(), 1);
+	assert_eq!(production.matches("finish(").count(), 2); // declaration and sole run call
 	assert_eq!(production.matches("observe2(").count(), 1);
 	assert_eq!(production.matches("CommittedSource2::acquired(").count(), 1);
 	assert_eq!(production.matches("TrustedEntry2::bind(").count(), 1);

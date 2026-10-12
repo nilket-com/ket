@@ -149,9 +149,12 @@ async fn baseline_unavailable_precedes_acquisition_and_binding_precedes_mark() {
 			&mut m
 		)
 		.await,
-		Err(ReplayError2::Binding(_))
+		Err(ReplayError2::Fault(Fault2::Verify(VerifyError2::Consumer(
+			RootError2::TrustMismatch
+		))))
 	));
 	assert_eq!(bytes(&d), before);
+	assert_eq!(m.durable(), Some(Baseline2::Provisioned));
 	let vacant = TestDir::new("wendelon-replay-unprovisioned");
 	std::fs::set_permissions(vacant.as_ref(), std::fs::Permissions::from_mode(0o700)).unwrap();
 	let (mut m, _) = MarkStore2::open(vacant.as_ref()).unwrap();
@@ -161,6 +164,25 @@ async fn baseline_unavailable_precedes_acquisition_and_binding_precedes_mark() {
 		Err(ReplayError2::Baseline(BaselineError2::Unavailable))
 	));
 	assert_eq!(sources.calls.get(), 0);
+
+	drop(_scope);
+	let (pin, dep, entries, fixtures) = context();
+	let (other_pin, _, _, _) = context_with_bootstrap_fingerprint(Some([0x7e; 32]));
+	let _scope = Root2FixtureScope::install(fixtures);
+	let mut reader = store(entries.clone()).await;
+	let (acc, report) = ReplayDriver2 {
+		deployment: dep,
+		baseline: Baseline2::Provisioned,
+		pin: &pin,
+	}
+	.compose(&mut reader, &Sources(entries[3].log_id), caps())
+	.await
+	.unwrap();
+	let (d, mut m) = marks();
+	let before = bytes(&d);
+	assert!(matches!(finish(acc,report,dep,&other_pin,&mut m),Err(ReplayError2::Binding(InstallError2::Record(crate::storage::mutation_visibility::root2::admin_install::InstallField2::BootstrapFingerprint)))));
+	assert_eq!(bytes(&d), before);
+	assert_eq!(m.durable(), Some(Baseline2::Provisioned));
 }
 #[tokio::test(flavor = "current_thread")]
 async fn mark_faults_do_not_export_and_poison_is_observed() {
