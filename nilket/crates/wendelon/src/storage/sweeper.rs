@@ -2037,7 +2037,7 @@ mod tests {
 	#[tokio::test]
 	async fn sweeper_tiers_sealed_slabs_and_unlinks_l1() {
 		let l2_root = fresh_dir("l2");
-		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let (l1_dir, manager) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
 
 		let sealed_before = manager.list_sealed_slabs().await;
@@ -2085,7 +2085,7 @@ mod tests {
 	async fn sweeper_tiers_row_tombstone_slab_with_metadata() {
 		let l1_dir = fresh_dir("row-tombstone-tier-l1");
 		let l2_root = fresh_dir("row-tombstone-tier-l2");
-		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
@@ -2185,7 +2185,7 @@ mod tests {
 		use crate::storage::core::StorageEngine;
 
 		let l2_root = fresh_dir("l2");
-		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let (_l1_dir, manager) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
 
 		// Record the location of key=1 before sweeping so we can
@@ -2222,7 +2222,7 @@ mod tests {
 	#[tokio::test]
 	async fn sweeper_skips_slabs_under_min_size() {
 		let l2_root = fresh_dir("l2");
-		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let (_l1_dir, manager) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
 
 		let sm = WendelonStateMachine::new();
@@ -2254,7 +2254,7 @@ mod tests {
 	#[tokio::test]
 	async fn failed_commit_leaves_l1_intact() {
 		let l2_root = fresh_dir("l2");
-		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let (l1_dir, manager) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
 		let sealed_before = manager.list_sealed_slabs().await;
 
@@ -2292,7 +2292,7 @@ mod tests {
 	#[tokio::test]
 	async fn apply_tier_slab_is_idempotent() {
 		let l2_root = fresh_dir("l2");
-		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let (_l1_dir, manager) = build_manager_with_sealed_slabs(Some(l2)).await;
 		let sealed = manager.list_sealed_slabs().await;
 		let info = sealed.first().unwrap().clone();
@@ -2322,7 +2322,7 @@ mod tests {
 		use crate::storage::core::StorageEngine;
 
 		let l2_root = fresh_dir("l2");
-		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let (_l1_dir, manager) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
 		let loc = manager.lookup(tenant(), id(1)).expect("key present");
 		let raw = manager.read_sealed_raw(loc.slab_id).await.unwrap();
@@ -2402,7 +2402,7 @@ mod tests {
 
 		let l1_dir = fresh_dir("tenant-kek-rewrap-l1");
 		let l2_root = fresh_dir("tenant-kek-rewrap-l2");
-		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let crypto = test_crypto();
 		let manager = Arc::new(
@@ -2505,7 +2505,7 @@ mod tests {
 
 		let l1_dir = fresh_dir("tenant-kek-backfill-l1");
 		let l2_root = fresh_dir("tenant-kek-backfill-l2");
-		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
@@ -2612,7 +2612,7 @@ mod tests {
 
 		let l1_dir = fresh_dir("supersession-backfill-l1");
 		let l2_root = fresh_dir("supersession-backfill-l2");
-		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
@@ -2741,7 +2741,7 @@ mod tests {
 			.as_millis() as u64;
 		let l1_dir = fresh_dir("retention-l1");
 		let l2_root = fresh_dir("retention-l2");
-		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
@@ -2889,7 +2889,7 @@ mod tests {
 			.as_millis() as u64;
 		let l1_dir = fresh_dir("retention-retire-l1");
 		let l2_root = fresh_dir("retention-retire-l2");
-		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
@@ -3033,7 +3033,7 @@ mod tests {
 			.as_millis() as u64;
 		let l1_dir = fresh_dir("retention-duplicate-hlc-l1");
 		let l2_root = fresh_dir("retention-duplicate-hlc-l2");
-		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
@@ -3161,7 +3161,7 @@ mod tests {
 			.as_millis() as u64;
 		let l1_dir = fresh_dir("retention-ambiguous-commit-l1");
 		let l2_root = fresh_dir("retention-ambiguous-commit-l2");
-		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
@@ -3330,7 +3330,7 @@ mod tests {
 
 		let l1_dir = fresh_dir("retired-cleanup-retry-l1");
 		let l2_root = fresh_dir("retired-cleanup-retry-l2");
-		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {

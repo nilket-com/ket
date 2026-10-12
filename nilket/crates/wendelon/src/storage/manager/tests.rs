@@ -154,7 +154,7 @@ async fn maintenance_staged_install_retries_and_preserves_s1_for_recovery() {
 
 	// One transient D1′ failure is retried by the shared S1 installer.
 	std::fs::write(&staged, b"staged-replacement").unwrap();
-	let transient = FaultyFileOps::new(&dir).unwrap();
+	let transient = FaultyFileOps::new(&*dir).unwrap();
 	transient.inject(
 		InjectedFault::on(
 			FaultOp::Rename,
@@ -179,7 +179,7 @@ async fn maintenance_staged_install_retries_and_preserves_s1_for_recovery() {
 	// the staged bytes remain for the identical startup reconciler to finish.
 	std::fs::remove_file(&final_path).unwrap();
 	std::fs::write(&staged, b"staged-replacement").unwrap();
-	let persistent = FaultyFileOps::new(&dir).unwrap();
+	let persistent = FaultyFileOps::new(&*dir).unwrap();
 	for _ in 0..3 {
 		persistent.inject(
 			InjectedFault::on(
@@ -2329,7 +2329,7 @@ async fn fresh_manager_with_l2(
 ) {
 	let l1_dir = fresh_dir(&format!("{tag}-l1"));
 	let l2_root = fresh_dir(&format!("{tag}-l2"));
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let manager = Arc::new(
 		SlabManager::open(SlabManagerConfig {
@@ -3105,7 +3105,7 @@ async fn leader_over_real_replica_service_commits_value_visible_through_service(
 		local_id,
 		local.clone(),
 		true,
-		DurableCounterWitnessStore::open(&wdir).unwrap(),
+		DurableCounterWitnessStore::open(&*wdir).unwrap(),
 	);
 	let plan = || CounterParticipantPlan::new(vec![(local_id, local.clone())], 1);
 
@@ -5232,7 +5232,7 @@ async fn stats_advisory_absence_skips_stats_fetch() {
 async fn stats_advisory_drift_fails_closed_to_unavailable() {
 	let l1_dir = fresh_dir("stats-drift-l1");
 	let l2_root = fresh_dir("stats-drift-l2");
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
@@ -5459,7 +5459,7 @@ async fn column_stats_plaintext_does_not_encode_slab_lineage() {
 async fn tiered_retention_rewrite_recomputes_stats_from_survivors() {
 	let l1_dir = fresh_dir("retention-stats-l1");
 	let l2_root = fresh_dir("retention-stats-l2");
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
@@ -5627,7 +5627,7 @@ async fn tiered_retention_rewrite_recomputes_stats_from_survivors() {
 async fn tiered_retention_rewrite_filters_partial_multirow_storage_records() {
 	let l1_dir = fresh_dir("retention-multirow-l1");
 	let l2_root = fresh_dir("retention-multirow-l2");
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
@@ -5978,7 +5978,7 @@ async fn adr0095_table_drop_slice_bounds_examined_work_and_resumes_after_cursor(
 async fn table_drop_reclaim_rewrites_tiered_target_rows() {
 	let l1_dir = fresh_dir("drop-reclaim-l1");
 	let l2_root = fresh_dir("drop-reclaim-l2");
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
@@ -6396,7 +6396,7 @@ async fn l1_retention_pruning_keeps_pair_until_floor_passes_tombstone() {
 async fn tiered_retention_rewrite_pair_gc_drops_data_and_row_tombstone() {
 	let l1_dir = fresh_dir("retention-tombstone-pair-l1");
 	let l2_root = fresh_dir("retention-tombstone-pair-l2");
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
@@ -6518,7 +6518,7 @@ async fn tiered_retention_rewrite_pair_gc_drops_data_and_row_tombstone() {
 async fn tiered_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor() {
 	let l1_dir = fresh_dir("retention-pk-boundary-l1");
 	let l2_root = fresh_dir("retention-pk-boundary-l2");
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
@@ -6663,7 +6663,7 @@ async fn tiered_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor(
 async fn tiered_table_retention_rewrite_prunes_append_only_rows_when_cluster_retention_disabled() {
 	let l1_dir = fresh_dir("retention-table-l1");
 	let l2_root = fresh_dir("retention-table-l2");
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
@@ -6797,7 +6797,7 @@ async fn tiered_table_retention_rewrite_prunes_append_only_rows_when_cluster_ret
 async fn tiered_table_retention_reports_lag_without_rewrite_for_pair_waiting_on_tombstone() {
 	let l1_dir = fresh_dir("retention-table-lag-l1");
 	let l2_root = fresh_dir("retention-table-lag-l2");
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
@@ -7498,7 +7498,7 @@ async fn recovery_reopens_mixed_record_body_compression_slab() {
 async fn l2_reads_mixed_record_body_compression_slab() {
 	let l1_dir = fresh_dir("mixed-compression-l2-l1");
 	let l2_dir = fresh_dir("mixed-compression-l2-objects");
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
 			dir: l1_dir.to_path_buf(),
@@ -7749,7 +7749,7 @@ async fn compression_resident_gauge_tracks_sealed_recluster_convergence() {
 async fn compression_resident_gauge_counts_tiered_uncompressed_frames() {
 	let l1_dir = fresh_dir("compression-gauge-tiered-l1");
 	let l2_dir = fresh_dir("compression-gauge-tiered-l2");
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
 			dir: l1_dir.to_path_buf(),
@@ -7881,7 +7881,7 @@ async fn compression_resident_gauge_counts_tiered_uncompressed_frames() {
 async fn projected_l2_read_materializes_sparse_multirow_record() {
 	let l1_dir = fresh_dir("projected-l2-l1");
 	let l2_dir = fresh_dir("projected-l2-l2");
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
 			dir: l1_dir.to_path_buf(),
@@ -8047,7 +8047,7 @@ async fn projected_l2_read_materializes_sparse_multirow_record() {
 async fn row_group_l2_point_read_materializes_projected_group() {
 	let l1_dir = fresh_dir("row-group-l2-l1");
 	let l2_dir = fresh_dir("row-group-l2-l2");
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
 			dir: l1_dir.to_path_buf(),
@@ -8936,7 +8936,7 @@ fn fsst_row_safe_phase_b_plan_uses_strategy_b_and_declines_overlap() {
 async fn fsst_phase_b_l2_read_filters_a1_and_declines_a2_overlap() {
 	let l1_dir = fresh_dir("fsst-phase-b-l2-l1");
 	let l2_dir = fresh_dir("fsst-phase-b-l2-l2");
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mut encoding_compute = EncodingComputeConfig::default();
 	encoding_compute
 		.enabled_predicate_evaluators
@@ -9470,7 +9470,7 @@ async fn sparse_projection_fetch_materializes_exact_cocd_clustered_pages() {
 	let l1_dir = fresh_dir("sparse-projection-l1");
 	let l2_dir = fresh_dir("sparse-projection-l2");
 	let l2_counter = Arc::new(CountingObjectStore::new(Arc::new(
-		LocalFsObjectStore::new(&l2_dir).unwrap(),
+		LocalFsObjectStore::new(&*l2_dir).unwrap(),
 	)));
 	let l2: Arc<dyn ObjectStore> = l2_counter.clone();
 	let mgr = Arc::new(
@@ -9863,7 +9863,7 @@ async fn sparse_projection_fetch_materializes_exact_cocd_clustered_pages() {
 	let scalar_l1_dir = fresh_dir("sparse-projection-scalar-l1");
 	let scalar_l2_dir = fresh_dir("sparse-projection-scalar-l2");
 	let scalar_l2_counter = Arc::new(CountingObjectStore::new(Arc::new(
-		LocalFsObjectStore::new(&scalar_l2_dir).unwrap(),
+		LocalFsObjectStore::new(&*scalar_l2_dir).unwrap(),
 	)));
 	let scalar_l2: Arc<dyn ObjectStore> = scalar_l2_counter.clone();
 	let scalar_mgr = Arc::new(
@@ -10254,7 +10254,7 @@ async fn adr061_enabled_chunk_layout_writes_16k_encrypted_slab() {
 async fn encoding_secondary_index_fetches_only_selected_simd_pages() {
 	let l1_dir = fresh_dir("encoding-index-l1");
 	let l2_dir = fresh_dir("encoding-index-l2");
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
 			dir: l1_dir.to_path_buf(),
@@ -11105,7 +11105,7 @@ async fn reopen_restores_tiered_rows_from_redb() {
 	let l1_dir = fresh_dir("tiered-reopen-l1");
 	let l2_dir = fresh_dir("tiered-reopen-l2");
 	let io = spawn_io_thread(64).unwrap();
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let crypto = test_crypto();
 
 	let manager = SlabManager::open(SlabManagerConfig {
