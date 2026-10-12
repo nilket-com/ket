@@ -2715,7 +2715,10 @@ fn committed_adapter_is_pure_capability_gated_and_exhaustive() {
 		}
 	}
 	let mut production = Vec::new();
-	idents(without_test_items(text.parse().unwrap()), &mut production);
+	idents(
+		without_test_items_deep(text.parse().unwrap()),
+		&mut production,
+	);
 	for banned in [
 		"fs",
 		"io",
@@ -3783,6 +3786,10 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 		),
 		("validation.rs", &["ADMIN_MANIFEST_P2_BYTES2"]),
 	];
+	// The one new out-of-line test file is excluded only while its declaration is cfg(test).
+	let replay = syn::parse_file(&fs::read_to_string(root.join("replay.rs")).unwrap()).unwrap();
+	assert!(replay.items.iter().any(|i| matches!(i, syn::Item::Mod(m) if m.ident == "tests"
+		&& m.attrs.iter().any(|a| matches!(&a.meta, syn::Meta::List(l) if l.path.is_ident("cfg") && l.tokens.to_string() == "test")))));
 	let tests = root.join("tests");
 	let admin = root.join("admin");
 	let mut stack = vec![src];
@@ -3794,6 +3801,9 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 					stack.push(p);
 				}
 			} else if p.extension().is_some_and(|x| x == "rs") {
+				if p == root.join("replay/tests.rs") {
+					continue;
+				}
 				let t = fs::read_to_string(&p).unwrap();
 				let allowance = allowed
 					.iter()
