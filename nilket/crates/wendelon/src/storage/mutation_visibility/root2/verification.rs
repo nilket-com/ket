@@ -12,7 +12,6 @@
 //! recorded a closure-driven refusal or a terminal replay; that limitation is deliberate and
 //! recorded, not closed.
 use crate::storage::mutation_visibility::MutationIdentity;
-use crate::storage::mutation_visibility::root2::admin::manifest::ADMIN_MANIFEST_BYTES2;
 use crate::storage::mutation_visibility::root2::admin_install::install_admin2;
 use crate::storage::mutation_visibility::root2::admin_statement::{
 	ADMIN_STATEMENT_BYTES2, check_admin_statement2,
@@ -26,7 +25,7 @@ use crate::storage::mutation_visibility::root2::origin::{
 	bootstrap2, origin_view2, root_and_origin2,
 };
 use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::{
-	PinnedBoundTuple2, tuple_manifest_pin2, tuple_record2,
+	PinnedBoundTuple2, tuple_manifest_len2, tuple_manifest_pin2, tuple_record2,
 };
 use crate::storage::mutation_visibility::root2::state::Root2;
 use crate::storage::mutation_visibility::root2::trust::{
@@ -188,7 +187,7 @@ fn bootstrap_authorized(
 		&& r.initial_epoch == *epoch
 		&& r.genesis_fingerprint == genesis
 		&& *control == tuple_manifest_pin2(pin)
-		&& *length == ADMIN_MANIFEST_BYTES2 as u64
+		&& *length == tuple_manifest_len2(pin)
 }
 
 /// The statement checks under the administrator installed from the same pin the gate uses.

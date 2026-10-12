@@ -9,7 +9,7 @@ use super::replica_anchor::{
 	validate_replica_tuple2,
 };
 use crate::storage::mutation_visibility::redacted_debug;
-use crate::storage::mutation_visibility::root2::admin::manifest::ADMIN_MANIFEST_BYTES2;
+use crate::storage::mutation_visibility::root2::admin::manifest::ADMIN_MANIFEST_P2_BYTES2;
 use crate::storage::mutation_visibility::root2::types::Digest2;
 use std::ffi::CStr;
 
@@ -72,7 +72,7 @@ pub(in crate::storage::mutation_visibility::root2) fn read_replica_tuple2(
 		files.anchor,
 		files.manifest,
 		ReplicaInput2::Manifest,
-		ADMIN_MANIFEST_BYTES2,
+		ADMIN_MANIFEST_P2_BYTES2,
 	)?;
 	let snapshot = read(
 		files.anchor,

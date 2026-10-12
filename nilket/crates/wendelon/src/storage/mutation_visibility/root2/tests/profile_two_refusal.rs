@@ -1,143 +1,123 @@
-//! M1 dormancy at the commitment boundary: a root whose Bootstrap committed `length = 189` (built
-//! here with a FIXTURE token; no production producer exists) is refused by every unchanged
-//! consumer: install, observe, the issuer gate and C's Bootstrap verification.
+//! M3 isolated length refusals, superseding the M1 dormancy refusals with coherent fixtures: on
+//! each profile's separately coherent wrong-length chain C's Bootstrap check and install refuse
+//! on the length alone; observe accepts exactly the two canonical lengths; the issuer gate refuses
+//! a state whose only difference is `control_len`. Fixture builders are in `profile_two_binding`.
+use super::profile_two_binding::{
+	ADMISSION_SEED_A, ADMISSION_SEED_B, PROFILES, chain, control_len, enrolled, expected_context,
+	grant, manifest_bytes, non_length_conjuncts, pre_root, reduce_at, rooted,
+};
 use super::*;
-use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
-use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AdminManifest2, admin_manifest_digest2,
-};
-use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::admin_install::*;
-use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
 use crate::storage::mutation_visibility::root2::origin::*;
-use crate::storage::mutation_visibility::root2::provisioning::inventory::{
-	LogState2, RootEntry2, RootIdentity2, RootState2,
-};
 use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::*;
-use crate::storage::mutation_visibility::root2::provisioning::snapshot::encode_snapshot2;
-use crate::storage::mutation_visibility::root2::trust::CommittedEntry2;
 use crate::storage::mutation_visibility::root2::verification::*;
 
-fn unhex(s: &str) -> Vec<u8> {
-	(0..s.len())
-		.step_by(2)
-		.map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-		.collect()
-}
-fn sv(field: &str) -> Vec<u8> {
-	let v: serde_json::Value =
-		serde_json::from_str(include_str!("statement_vectors.json")).unwrap();
-	unhex(v[field].as_str().unwrap())
-}
-fn at(term: u64, node: u32, index: u64) -> EntryPosition2 {
-	EntryPosition2 { term, node, index }
-}
-fn manifest() -> AdminManifest2 {
-	AdminManifest2::decode(&sv("manifest_prime")).unwrap()
-}
-fn pin() -> Digest2 {
-	admin_manifest_digest2(&manifest().encode().unwrap())
-}
-fn tuple() -> PinnedBoundTuple2 {
-	let bytes = manifest().encode().unwrap();
-	let m = manifest();
-	let record = BootstrapRecord2::decode(&sv("record")).unwrap();
-	let snapshot = encode_snapshot2(&LogState2 {
-		roots: vec![RootEntry2 {
-			identity: RootIdentity2 {
-				generation: m.generation,
-				cluster: m.cluster,
-				pin: pin(),
-				admin_key: m.admin_key,
-			},
-			manifest: AnyAdminManifest2::One(m),
-			state: RootState2::Bound,
-			last_seq: record.inventory_seq,
-			record: Some(record),
-		}],
-		last_seq: record.inventory_seq,
-	})
-	.unwrap();
-	let inventory_pin = crate::storage::mutation_visibility::root2::codec::hash(b"", &snapshot);
-	validate_replica_tuple2(&ReplicaInputs2 {
-		manifest: Some(&bytes),
-		manifest_pin: Some(&pin()),
-		snapshot: Some(&snapshot),
-		inventory_pin: Some(&inventory_pin),
-	})
-	.unwrap()
-}
-fn pre_root() -> MutationAuthorityState2 {
-	let first = CommittedEntry2::fixture(
-		at(0, 0, 0),
-		sv("genesis").try_into().unwrap(),
-		EntryClass2::Membership,
-	);
-	let s = advance_pre_root2(&empty_authority2(), &first).unwrap().0;
-	let one = CommittedEntry2::fixture(at(1, 1, 1), [1; 32], EntryClass2::NonRoot2);
-	advance_pre_root2(&s, &one).unwrap().0
-}
-fn bootstrap(length: u64) -> Command2 {
-	Command2::Bootstrap {
-		epoch: manifest().initial_epoch,
-		control: pin(),
-		length,
+/// C1/C4: on each profile's wrong-length chain every non-length conjunct holds against its own
+/// tuple, entry and command, and C refuses; the separately coherent right-length chain is accepted
+/// and reaches exactly the fixture-built root.
+#[test]
+fn c_bootstrap_length_is_isolated_on_two_coherent_chains() {
+	for (name, right, wrong) in PROFILES {
+		let good = chain(name, right);
+		let (got, _) = advance_verified2(
+			&pre_root(),
+			&good.tuple,
+			&good.committed,
+			&good.entry,
+			&good.cmd,
+		)
+		.unwrap();
+		assert_eq!(
+			encode_authority2(&got).unwrap(),
+			encode_authority2(&good.rooted).unwrap(),
+			"{name}"
+		);
+		let bad = chain(name, wrong);
+		assert_eq!(non_length_conjuncts(&bad), [true; 5], "{name}");
+		assert_eq!(tuple_manifest_len2(&bad.tuple), right, "{name}");
+		assert_eq!(
+			advance_verified2(
+				&pre_root(),
+				&bad.tuple,
+				&bad.committed,
+				&bad.entry,
+				&bad.cmd
+			)
+			.err(),
+			Some(VerifyError2::Consumer(RootError2::TrustMismatch)),
+			"{name}"
+		);
+		// The two chains are separately coherent: the length changes the bound command digest.
+		assert_ne!(
+			tuple_record2(&good.tuple).identity.bootstrap_command,
+			tuple_record2(&bad.tuple).identity.bootstrap_command
+		);
 	}
 }
-/// FIXTURE: root the pre-root state with a Bootstrap of `length` and an always-authorized token.
-fn rooted(length: u64) -> MutationAuthorityState2 {
-	let m = manifest();
-	let cmd = bootstrap(length);
-	let e = TrustedEntry2::fixture(m.generation, m.cluster, l(2), &cmd).unwrap();
-	let (_, _, _, fp, d) = e.fields();
-	let v = VerifiedCommand2::fixture(m.generation, m.cluster, &cmd, &[], 0).unwrap();
-	let ce = CommittedEntry2::fixture(at(1, 1, 2), fp, EntryClass2::Bootstrap(d));
-	bootstrap2(&pre_root(), &ce, &e, &v, &cmd).unwrap().0
+
+/// C2/C4: install on each chain's own root and tuple; the wrong chain differs only in length.
+#[test]
+fn install_length_is_isolated_on_two_coherent_chains() {
+	for (name, right, wrong) in PROFILES {
+		let good = chain(name, right);
+		let admin = install_admin2(&good.rooted, &good.tuple).unwrap();
+		assert_eq!(admin_manifest_len2(&admin), right);
+		let bad = chain(name, wrong);
+		let (root, _) = root_and_origin2(&bad.rooted).unwrap();
+		assert_eq!(root.state.control_digest, tuple_manifest_pin2(&bad.tuple));
+		assert_eq!(
+			install_admin2(&bad.rooted, &bad.tuple).err(),
+			Some(InstallError2::Commitment(CommitmentField2::ControlLength)),
+			"{name}"
+		);
+	}
 }
 
+/// Observe stays state-only and descriptive: either canonical length, nothing else.
 #[test]
-fn install_and_observe_refuse_a_189_byte_commitment() {
-	let s = rooted(189);
-	assert_eq!(
-		install_admin2(&s, &tuple()).err(),
-		Some(InstallError2::Commitment(CommitmentField2::ControlLength))
-	);
-	assert_eq!(
-		observe_bootstrap2(&s).err(),
-		Some(ObserveError2::ControlLength)
-	);
+fn observe_accepts_exactly_the_two_canonical_lengths() {
+	let bytes = manifest_bytes("a");
+	for length in [137, 189] {
+		assert!(observe_bootstrap2(&rooted(&bytes, length).3).is_ok());
+	}
+	for length in [136, 138, 188, 190] {
+		assert_eq!(
+			observe_bootstrap2(&rooted(&bytes, length).3).err(),
+			Some(ObserveError2::ControlLength),
+			"{length}"
+		);
+	}
 }
 
+/// C3: the gate compares the root's commitment length with the installed recorded length. Only
+/// `control_len` differs in the mutated state; the whole expected context still equals the
+/// administrator's, so the refusal is the length check alone.
 #[test]
-fn the_issuer_gate_refuses_a_189_byte_commitment() {
-	// The administrator installed from the coherent 137-byte root, presented against the
-	// 189-byte root of the same generation and cluster: the gate's expected-context check.
-	let admin = install_admin2(&rooted(137), &tuple()).unwrap();
-	let s = rooted(189);
-	let v: serde_json::Value =
-		serde_json::from_str(include_str!("statement_vectors.json")).unwrap();
-	let grant: [u8; 337] = unhex(v["grant"]["bytes"].as_str().unwrap())
-		.try_into()
-		.unwrap();
-	let cmd = Command2::AdmissionPermission(grant);
-	let m = manifest();
-	let e = TrustedEntry2::fixture(m.generation, m.cluster, l(3), &cmd).unwrap();
-	let token = VerifiedCommand2::fixture(m.generation, m.cluster, &cmd, &[], 0).unwrap();
-	assert_eq!(
-		Root2::reduce_admission(&s, &admin, &e, &token, &cmd).err(),
-		Some(RootError2::TrustMismatch)
-	);
-}
-
-#[test]
-fn c_bootstrap_verification_refuses_a_189_byte_length() {
-	let m = manifest();
-	let cmd = bootstrap(189);
-	let e = TrustedEntry2::fixture(m.generation, m.cluster, l(2), &cmd).unwrap();
-	let (_, _, _, fp, d) = e.fields();
-	let ce = CommittedEntry2::fixture(at(1, 1, 2), fp, EntryClass2::Bootstrap(d));
-	assert_eq!(
-		advance_verified2(&pre_root(), &tuple(), &ce, &e, &cmd).err(),
-		Some(VerifyError2::Consumer(RootError2::TrustMismatch))
-	);
+fn gate_length_is_isolated_by_a_control_len_only_change() {
+	for (name, right, other) in PROFILES {
+		let c = chain(name, right);
+		let admin = install_admin2(&c.rooted, &c.tuple).unwrap();
+		let seed = if name == "a" {
+			ADMISSION_SEED_A
+		} else {
+			ADMISSION_SEED_B
+		};
+		let state = enrolled(&c.rooted, &c.any);
+		let cmd = grant(&admin, seed);
+		assert!(
+			matches!(
+				reduce_at(&state, &admin, &cmd, 4),
+				Ok(ApplyResult2::Permission { .. })
+			),
+			"{name}"
+		);
+		let mutated = with_control_len_for_test(&state, other);
+		assert_eq!(control_len(&mutated), other);
+		assert!(admin_context2(&admin) == expected_context(&mutated));
+		assert_eq!(
+			reduce_at(&mutated, &admin, &cmd, 4).err(),
+			Some(RootError2::TrustMismatch),
+			"{name}"
+		);
+	}
 }
