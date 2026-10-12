@@ -20,6 +20,7 @@ mod prefix;
 mod profile_two_binding;
 mod profile_two_chain;
 mod profile_two_refusal;
+mod profile_two_reserve;
 mod recovery;
 mod refusals;
 mod restoration;

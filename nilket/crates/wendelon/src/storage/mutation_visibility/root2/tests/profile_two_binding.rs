@@ -103,7 +103,10 @@ pub(super) fn rooted(
 	(cmd, e, ce, s)
 }
 pub(super) fn chain(name: &str, length: u64) -> Chain {
-	let bytes = manifest_bytes(name);
+	chain_of(&manifest_bytes(name), length)
+}
+pub(super) fn chain_of(bytes: &[u8], length: u64) -> Chain {
+	let bytes = bytes.to_vec();
 	let any = AnyAdminManifest2::decode(&bytes).unwrap();
 	let pin = exact_pin(&bytes);
 	let (cmd, entry, committed, rooted) = rooted(&bytes, length);
