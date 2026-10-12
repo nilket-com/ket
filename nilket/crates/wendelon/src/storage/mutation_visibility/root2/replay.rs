@@ -147,7 +147,7 @@ pub(in crate::storage::mutation_visibility::root2) async fn run<
 	}
 	let retention = sources.retention();
 	if retention.configured != ControlRetention::Full
-		|| retention.history == HistoryCheck::NotChecked
+		|| !matches!(retention.history, HistoryCheck::Complete { .. })
 		|| retention.violation.is_some()
 	{
 		return Err(ReplayError2::Closure(ClosureError2::Retention));
