@@ -152,6 +152,17 @@ pub(in crate::storage::mutation_visibility::root2) async fn run<
 	{
 		return Err(ReplayError2::Closure(ClosureError2::Retention));
 	}
+	finish(acc, report, deployment, pin, mark_store)
+}
+// Sole production caller is run, after closure. Kept private so tests can pin the defensive
+// binding refusal which today's Bootstrap verifier already excludes on the same immutable pin.
+fn finish(
+	acc: Provisional2,
+	report: PrefixValidated2,
+	deployment: Deployment2,
+	pin: &PinnedBoundTuple2,
+	mark_store: &mut MarkStore2,
+) -> Result<Replayed2, ReplayError2> {
 	install_admin2(&acc.state, pin).map_err(ReplayError2::Binding)?;
 	let mark = mark_of2(&acc.state).map_err(ReplayError2::MarkEncode)?;
 	let outcome = mark_store

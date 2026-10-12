@@ -98,6 +98,11 @@ fn fixture(e: &E, cmd: Command2, dep: Deployment2) -> Fixture {
 	(p, fp, class, cmd)
 }
 fn context() -> (PinnedBoundTuple2, Deployment2, Vec<E>, Vec<Fixture>) {
+	context_with_bootstrap_fingerprint(None)
+}
+fn context_with_bootstrap_fingerprint(
+	override_fp: Option<Digest2>,
+) -> (PinnedBoundTuple2, Deployment2, Vec<E>, Vec<Fixture>) {
 	let bytes = vector("manifest_prime");
 	let m = AdminManifest2::decode(&bytes).unwrap();
 	let pin = admin_manifest_digest2(bytes.as_slice().try_into().unwrap());
@@ -118,7 +123,7 @@ fn context() -> (PinnedBoundTuple2, Deployment2, Vec<E>, Vec<Fixture>) {
 		node: p.node,
 		index: p.index,
 	};
-	record.identity.bootstrap_fingerprint = fp;
+	record.identity.bootstrap_fingerprint = override_fp.unwrap_or(fp);
 	record.identity.genesis_fingerprint = fields(&entries[0]).1;
 	record.identity.bootstrap_command = cmd.digest(dep.generation, dep.cluster).unwrap();
 	let seq = record.inventory_seq;
