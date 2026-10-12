@@ -1,8 +1,10 @@
 //! Owner inventory event codec and pure fold. Parsed inventory data only: nothing here reads
 //! files, proves provenance, or yields a root, authority state or trust token.
 use crate::storage::mutation_visibility::redacted_debug;
+use crate::storage::mutation_visibility::root2::admin::errors::AdminManifestError2;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	ADMIN_MANIFEST_BYTES2, AdminManifest2, admin_manifest_digest2,
+	ADMIN_MANIFEST_BYTES2, ADMIN_MANIFEST_P2_BYTES2, AdminManifest2, AdminManifestTwo2,
+	AnyAdminManifest2, ManifestProfile2, any_manifest_digest2, manifest_profile2,
 };
 use crate::storage::mutation_visibility::root2::admin::record::{
 	BOOTSTRAP_RECORD_BYTES2, BootstrapObservation2, BootstrapRecord2,
@@ -21,6 +23,8 @@ pub(in crate::storage::mutation_visibility::root2) const MAX_LOG_BYTES2: usize =
 
 const MAGIC: &[u8; 8] = b"VISIEV02";
 const VERSION: u16 = 1;
+/// Written only for a profile-2 Reserve; every other event stays version 1.
+const VERSION_TWO: u16 = 2;
 const RESERVE: u8 = 1;
 const APPROVE: u8 = 2;
 const CONFLICT: u8 = 3;
@@ -40,7 +44,7 @@ redacted_debug!(RootIdentity2, "RootIdentity2");
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum EventBody2 {
 	Reserve {
-		manifest: AdminManifest2,
+		manifest: AnyAdminManifest2,
 	},
 	Approve {
 		record: BootstrapRecord2,
@@ -74,7 +78,7 @@ pub(in crate::storage::mutation_visibility::root2) enum RootState2 {
 #[derive(Clone)]
 pub(in crate::storage::mutation_visibility::root2) struct RootEntry2 {
 	pub identity: RootIdentity2,
-	pub manifest: AdminManifest2,
+	pub manifest: AnyAdminManifest2,
 	pub state: RootState2,
 	pub last_seq: u64,
 	pub record: Option<BootstrapRecord2>,
@@ -140,7 +144,13 @@ pub(in crate::storage::mutation_visibility::root2) fn encode_event2(
 	let bad = |r| corrupt(event.seq, r);
 	let mut b = [0u8; EVENT_BYTES2];
 	b[0..8].copy_from_slice(MAGIC);
-	b[8..10].copy_from_slice(&VERSION.to_le_bytes());
+	let version = match &event.body {
+		EventBody2::Reserve { manifest } if manifest.profile() == ManifestProfile2::Two => {
+			VERSION_TWO
+		}
+		_ => VERSION,
+	};
+	b[8..10].copy_from_slice(&version.to_le_bytes());
 	let op = match event.body {
 		EventBody2::Reserve { .. } => RESERVE,
 		EventBody2::Approve { .. } => APPROVE,
@@ -160,11 +170,10 @@ pub(in crate::storage::mutation_visibility::root2) fn encode_event2(
 	let p = &mut b[PAYLOAD..PAYLOAD + BOOTSTRAP_RECORD_BYTES2];
 	match &event.body {
 		EventBody2::Reserve { manifest } => {
-			p[..ADMIN_MANIFEST_BYTES2].copy_from_slice(
-				&manifest
-					.encode()
-					.map_err(|_| bad(CorruptReason2::Payload))?,
-			);
+			let bytes = manifest
+				.encode()
+				.map_err(|_| bad(CorruptReason2::Payload))?;
+			p[..bytes.as_slice().len()].copy_from_slice(bytes.as_slice());
 		}
 		EventBody2::Approve { record } => {
 			p.copy_from_slice(&record.encode().map_err(|_| bad(CorruptReason2::Payload))?)
@@ -197,8 +206,9 @@ pub(in crate::storage::mutation_visibility::root2) fn encode_event2(
 	Ok(b)
 }
 
-/// Local checks only, in the fixed order: checksum, magic, version, op, reserved bytes, nonzero
-/// op id, header zero iff Repair, typed payload and zero fill, Repair bounds.
+/// Local checks only, in the fixed order: checksum, magic, version (1 or 2), op, version 2 only
+/// for Reserve, reserved bytes, nonzero op id, header zero iff Repair, typed payload and zero
+/// fill, Repair bounds. A profile-2 payload in a version-1 event stays `Payload`.
 pub(in crate::storage::mutation_visibility::root2) fn decode_event2(
 	bytes: &[u8],
 ) -> Result<Event2, LogError2> {
@@ -213,12 +223,16 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_event2(
 	if &bytes[0..8] != MAGIC {
 		return Err(bad(CorruptReason2::Magic));
 	}
-	if u16::from_le_bytes(array(bytes, 8)) != VERSION {
+	let version = u16::from_le_bytes(array(bytes, 8));
+	if version != VERSION && version != VERSION_TWO {
 		return Err(bad(CorruptReason2::Version));
 	}
 	let op = bytes[10];
 	if !(RESERVE..=REPAIR).contains(&op) {
 		return Err(bad(CorruptReason2::UnknownOp));
+	}
+	if version == VERSION_TWO && op != RESERVE {
+		return Err(bad(CorruptReason2::Version));
 	}
 	if bytes[11] != 0 || !zero(&bytes[340..CHECKED]) {
 		return Err(bad(CorruptReason2::Reserved));
@@ -251,13 +265,33 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_event2(
 	};
 	let p = &bytes[PAYLOAD..PAYLOAD + BOOTSTRAP_RECORD_BYTES2];
 	let body = match op {
-		RESERVE => {
+		RESERVE if version == VERSION => {
 			if !zero(&p[ADMIN_MANIFEST_BYTES2..]) {
 				return Err(bad(CorruptReason2::Payload));
 			}
 			let manifest = AdminManifest2::decode(&p[..ADMIN_MANIFEST_BYTES2])
 				.map_err(|_| bad(CorruptReason2::Payload))?;
-			EventBody2::Reserve { manifest }
+			EventBody2::Reserve {
+				manifest: AnyAdminManifest2::One(manifest),
+			}
+		}
+		RESERVE => {
+			let m = &p[..ADMIN_MANIFEST_P2_BYTES2];
+			if !zero(&p[ADMIN_MANIFEST_P2_BYTES2..]) {
+				return Err(bad(CorruptReason2::Payload));
+			}
+			match manifest_profile2(m) {
+				Ok(ManifestProfile2::Two) => {}
+				Ok(ManifestProfile2::One) | Err(AdminManifestError2::ProfileLength) => {
+					return Err(bad(CorruptReason2::Version));
+				}
+				Err(_) => return Err(bad(CorruptReason2::Payload)),
+			}
+			let manifest =
+				AdminManifestTwo2::decode(m).map_err(|_| bad(CorruptReason2::Payload))?;
+			EventBody2::Reserve {
+				manifest: AnyAdminManifest2::Two(manifest),
+			}
 		}
 		APPROVE => EventBody2::Approve {
 			record: BootstrapRecord2::decode(p).map_err(|_| bad(CorruptReason2::Payload))?,
@@ -307,13 +341,15 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_event2(
 	})
 }
 
-fn identity_of(m: &AdminManifest2) -> RootIdentity2 {
+/// The pin binds the whole manifest (governance included); it is never the Admission digest.
+fn identity_of(m: &AnyAdminManifest2) -> RootIdentity2 {
 	let bytes = m.encode().expect("decoded manifest re-encodes");
+	let admission = m.admission();
 	RootIdentity2 {
-		generation: m.generation,
-		cluster: m.cluster,
-		pin: admin_manifest_digest2(&bytes),
-		admin_key: m.admin_key,
+		generation: admission.generation,
+		cluster: admission.cluster,
+		pin: any_manifest_digest2(&bytes),
+		admin_key: admission.admin_key,
 	}
 }
 fn shares_component(a: &RootIdentity2, b: &RootIdentity2) -> bool {
@@ -394,7 +430,7 @@ fn apply(
 			let r = &record.identity;
 			if (r.generation, r.cluster, r.pin)
 				!= (identity.generation, identity.cluster, identity.pin)
-				|| r.initial_epoch != root.manifest.initial_epoch
+				|| r.initial_epoch != root.manifest.admission().initial_epoch
 				|| record.inventory_seq != e.seq
 			{
 				return Err(bad(CorruptReason2::Binding));
@@ -412,7 +448,7 @@ fn apply(
 					identity.generation,
 					identity.cluster,
 					identity.pin,
-					root.manifest.initial_epoch,
+					root.manifest.admission().initial_epoch,
 				) {
 				return Err(bad(CorruptReason2::Binding));
 			}

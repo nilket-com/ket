@@ -1,5 +1,6 @@
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin_install::*;
 use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
 use crate::storage::mutation_visibility::root2::origin::*;
@@ -115,7 +116,7 @@ impl Boot {
 }
 fn reserve_m1() -> OwnerRequest2 {
 	OwnerRequest2::Reserve {
-		manifest: AdminManifest2::decode(&manifest("m1").0).unwrap(),
+		manifest: AnyAdminManifest2::One(AdminManifest2::decode(&manifest("m1").0).unwrap()),
 	}
 }
 fn m1_identity() -> RootIdentity2 {

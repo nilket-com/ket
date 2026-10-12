@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
 	AdminManifest2, admin_manifest_digest2,
 };
@@ -18,7 +19,10 @@ fn owner_vectors() -> serde_json::Value {
 	serde_json::from_str(include_str!("owner_vectors.json")).unwrap()
 }
 fn manifest_of(name: &str) -> AdminManifest2 {
-	let EventBody2::Reserve { manifest } = event(name).body else {
+	let EventBody2::Reserve {
+		manifest: AnyAdminManifest2::One(manifest),
+	} = event(name).body
+	else {
 		unreachable!()
 	};
 	manifest
@@ -64,7 +68,7 @@ fn torn_tail() -> Vec<u8> {
 fn decisions_reproduce_the_independent_golden_events() {
 	let (id1, id2) = (id_of("reserve"), id_of("reserve_second"));
 	let reserve = OwnerRequest2::Reserve {
-		manifest: manifest_of("reserve"),
+		manifest: AnyAdminManifest2::One(manifest_of("reserve")),
 	};
 	assert_eq!(
 		decide2(&[], &op(1), &reserve),
@@ -75,7 +79,7 @@ fn decisions_reproduce_the_independent_golden_events() {
 		Decision2::Append(event("approve"))
 	);
 	let second = OwnerRequest2::Reserve {
-		manifest: manifest_of("reserve_second"),
+		manifest: AnyAdminManifest2::One(manifest_of("reserve_second")),
 	};
 	assert_eq!(
 		decide2(&events(2), &op(3), &second),
@@ -100,7 +104,7 @@ fn retries_are_recognised_from_the_log_alone() {
 		current,
 	};
 	let reserve = OwnerRequest2::Reserve {
-		manifest: manifest_of("reserve"),
+		manifest: AnyAdminManifest2::One(manifest_of("reserve")),
 	};
 	assert_eq!(
 		decide2(&log, &op(1), &reserve),
@@ -186,7 +190,7 @@ fn state_rows_no_ops_and_refusals() {
 		);
 	}
 	let again = OwnerRequest2::Reserve {
-		manifest: manifest_of("reserve"),
+		manifest: AnyAdminManifest2::One(manifest_of("reserve")),
 	};
 	assert_eq!(
 		decide2(&log, &fresh, &again),
@@ -196,7 +200,13 @@ fn state_rows_no_ops_and_refusals() {
 	let mut shared = manifest_of("reserve");
 	shared.generation = [0x3c; 16];
 	assert_eq!(
-		decide2(&log, &fresh, &OwnerRequest2::Reserve { manifest: shared }),
+		decide2(
+			&log,
+			&fresh,
+			&OwnerRequest2::Reserve {
+				manifest: AnyAdminManifest2::One(shared)
+			}
+		),
 		refuse(OwnerError2::IdentityTaken)
 	);
 	let mut mismatch = id1;
@@ -228,13 +238,25 @@ fn invalid_typed_requests_are_refused_before_any_state() {
 	let mut m = manifest_of("reserve_second");
 	m.initial_epoch = 0;
 	assert_eq!(
-		decide2(&log, &op(0x41), &OwnerRequest2::Reserve { manifest: m }),
+		decide2(
+			&log,
+			&op(0x41),
+			&OwnerRequest2::Reserve {
+				manifest: AnyAdminManifest2::One(m)
+			}
+		),
 		codec
 	);
 	let mut m = manifest_of("reserve_second");
 	m.admin_key = [0; 32];
 	assert_eq!(
-		decide2(&log, &op(0x41), &OwnerRequest2::Reserve { manifest: m }),
+		decide2(
+			&log,
+			&op(0x41),
+			&OwnerRequest2::Reserve {
+				manifest: AnyAdminManifest2::One(m)
+			}
+		),
 		codec
 	);
 	let mut zero = id1;
@@ -304,7 +326,7 @@ fn caps_refuse_appends_but_not_retries_or_no_ops() {
 			&log,
 			&op(0x42),
 			&OwnerRequest2::Reserve {
-				manifest: m.clone()
+				manifest: AnyAdminManifest2::One(m.clone())
 			}
 		),
 		full
@@ -335,10 +357,15 @@ fn caps_refuse_appends_but_not_retries_or_no_ops() {
 				admin_key: x.admin_key,
 			}),
 			body: EventBody2::Reserve {
-				manifest: x.clone(),
+				manifest: AnyAdminManifest2::One(x.clone()),
 			},
 		}));
-		first.get_or_insert((o, OwnerRequest2::Reserve { manifest: x }));
+		first.get_or_insert((
+			o,
+			OwnerRequest2::Reserve {
+				manifest: AnyAdminManifest2::One(x),
+			},
+		));
 	}
 	assert_eq!(fold_events2(&roots).unwrap().roots.len(), 4096);
 	let (o, req) = first.unwrap();
@@ -356,7 +383,9 @@ fn caps_refuse_appends_but_not_retries_or_no_ops() {
 		decide2(
 			&roots,
 			&op(0x43),
-			&OwnerRequest2::Reserve { manifest: extra }
+			&OwnerRequest2::Reserve {
+				manifest: AnyAdminManifest2::One(extra)
+			}
 		),
 		Decision2::Refuse(OwnerError2::RootCap)
 	);

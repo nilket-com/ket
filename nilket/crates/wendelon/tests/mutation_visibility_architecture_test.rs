@@ -784,6 +784,7 @@ fn admin_items(file: &syn::File) -> Option<Vec<String>> {
 						"BootstrapRecordError2",
 						"BootstrapField2",
 						"ManifestProfile2",
+						"AnyAdminManifest2",
 					]
 					.iter()
 					.any(|n| e.ident == *n)) =>
@@ -801,6 +802,7 @@ fn admin_items(file: &syn::File) -> Option<Vec<String>> {
 						"BootstrapObservation2",
 						"GovernanceRole2",
 						"AdminManifestTwo2",
+						"ManifestBytes2",
 					]
 					.iter()
 					.any(|n| s.ident == *n)) =>
@@ -888,6 +890,9 @@ fn admin_manifest_math_stays_private_and_has_no_provenance_producer() {
 			"actions",
 			"admin_manifest_digest2",
 			"admin_manifest_two_digest2",
+			"admission",
+			"any_manifest_digest2",
+			"as_slice",
 			"base",
 			"check_admin_manifest_digest2",
 			"check_enrollable_admin_key2",
@@ -895,6 +900,8 @@ fn admin_manifest_math_stays_private_and_has_no_provenance_producer() {
 			"decode",
 			"decode",
 			"decode",
+			"decode",
+			"encode",
 			"encode",
 			"encode",
 			"encode",
@@ -905,7 +912,8 @@ fn admin_manifest_math_stays_private_and_has_no_provenance_producer() {
 			"key",
 			"manifest_profile2",
 			"new",
-			"new"
+			"new",
+			"profile"
 		]
 	);
 }
@@ -3608,8 +3616,9 @@ fn admin_command_envelope_is_pure_and_unwired() {
 }
 
 // Profile-2 manifest codec (M1): additive and dormant. Exact census of the new items in
-// admin/manifest.rs (struct fields private, the enum's two variants, the constants) and no
-// production name of them outside src/.../admin and the test modules. Syntax only.
+// admin/manifest.rs (struct fields private, the enums' two variants, the constants) and no
+// production name of them outside src/.../admin and the test modules, except the exact M2
+// per-file allowances in the owner/inventory/snapshot propagation. Syntax only.
 #[test]
 fn profile_two_manifest_codec_is_additive_and_dormant() {
 	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -3620,7 +3629,9 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 	for item in &file.items {
 		match item {
 			syn::Item::Struct(s)
-				if s.ident == "GovernanceRole2" || s.ident == "AdminManifestTwo2" =>
+				if s.ident == "GovernanceRole2"
+					|| s.ident == "AdminManifestTwo2"
+					|| s.ident == "ManifestBytes2" =>
 			{
 				let fields: Vec<_> = s
 					.fields
@@ -3633,10 +3644,10 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 						f.ident.as_ref().unwrap().to_string()
 					})
 					.collect();
-				let want: &[&str] = if s.ident == "GovernanceRole2" {
-					&["id", "key"]
-				} else {
-					&["base", "governance"]
+				let want: &[&str] = match s.ident.to_string().as_str() {
+					"GovernanceRole2" => &["id", "key"],
+					"AdminManifestTwo2" => &["base", "governance"],
+					_ => &["storage", "len"],
 				};
 				assert_eq!(fields, want);
 			}
@@ -3646,6 +3657,27 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 				assert!(
 					e.variants.iter().all(|v| v.fields.is_empty()),
 					"no role data"
+				);
+			}
+			// M2: exactly one manifest per variant, no conversion and no third shape.
+			syn::Item::Enum(e) if e.ident == "AnyAdminManifest2" => {
+				let v: Vec<_> = e
+					.variants
+					.iter()
+					.map(|v| {
+						let syn::Fields::Unnamed(f) = &v.fields else {
+							panic!("tuple variants")
+						};
+						assert_eq!(f.unnamed.len(), 1);
+						(v.ident.to_string(), quote_type(&f.unnamed[0].ty))
+					})
+					.collect();
+				assert_eq!(
+					v,
+					[
+						("One".to_string(), "AdminManifest2".to_string()),
+						("Two".to_string(), "AdminManifestTwo2".to_string())
+					]
 				);
 			}
 			syn::Item::Const(c) => consts.push((c.ident.to_string(), root2_scoped(&c.vis))),
@@ -3670,7 +3702,39 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 	// The profile-1 decoder is untouched by profile 2: it never names the new items.
 	let decode = fn_body(&text, "decode");
 	assert!(!decode.contains("PROFILE_TWO") && !decode.contains("GovernanceRole2"));
-	// Dormant: no production file outside admin/ names a profile-2 item.
+	// ManifestBytes2 is built at exactly one site (the end of AnyAdminManifest2::encode):
+	// the declaration, its impl and that one literal.
+	assert_eq!(text.matches("ManifestBytes2 {").count(), 3);
+	assert_eq!(
+		text.matches("Ok(ManifestBytes2 { storage, len })").count(),
+		1
+	);
+	// Dormant: no production file outside admin/ names a profile-2 item, except these exact M2
+	// allowances (owner request -> event -> fold -> snapshot). Replica, install, gate,
+	// verification and validation stay forbidden.
+	let provisioning = root.join("provisioning");
+	let allowed: &[(&str, &[&str])] = &[
+		(
+			"inventory.rs",
+			&[
+				"ADMIN_MANIFEST_P2_BYTES2",
+				"AdminManifestTwo2",
+				"AnyAdminManifest2",
+				"ManifestProfile2",
+				"any_manifest_digest2",
+				"manifest_profile2",
+			],
+		),
+		(
+			"owner_core.rs",
+			&[
+				"AnyAdminManifest2",
+				"ManifestBytes2",
+				"any_manifest_digest2",
+			],
+		),
+		("snapshot.rs", &["ManifestProfile2"]),
+	];
 	let tests = root.join("tests");
 	let admin = root.join("admin");
 	let mut stack = vec![src];
@@ -3683,6 +3747,10 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 				}
 			} else if p.extension().is_some_and(|x| x == "rs") {
 				let t = fs::read_to_string(&p).unwrap();
+				let allowance = allowed
+					.iter()
+					.find(|(f, _)| p == provisioning.join(f))
+					.map_or(&[][..], |(_, names)| *names);
 				for name in [
 					"AdminManifestTwo2",
 					"GovernanceRole2",
@@ -3690,13 +3758,77 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 					"admin_manifest_two_digest2",
 					"manifest_profile2",
 					"ADMIN_MANIFEST_P2_BYTES2",
+					"AnyAdminManifest2",
+					"ManifestBytes2",
+					"any_manifest_digest2",
 				] {
-					assert!(
-						!t.contains(name),
-						"production use of {name} in {}",
+					assert_eq!(
+						t.contains(name),
+						allowance.contains(&name),
+						"production use of {name} in {} against its exact allowance",
 						p.display()
 					);
 				}
+			}
+		}
+	}
+}
+
+// M2: the frozen d6ce07b8 codec copy used by the old-reader proof is test-only. It is reached only
+// through `#[cfg(test)] mod tests` in provisioning/mod.rs, its wrapper includes exactly the two
+// frozen excerpts, and no other file under src names it or includes a `.in` file.
+#[test]
+fn frozen_published_codecs_are_test_only() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let provisioning = src.join("storage/mutation_visibility/root2/provisioning");
+	let module =
+		syn::parse_file(&fs::read_to_string(provisioning.join("mod.rs")).unwrap()).unwrap();
+	let tests = module
+		.items
+		.iter()
+		.find_map(|item| match item {
+			syn::Item::Mod(m) if m.ident == "tests" => Some(m),
+			_ => None,
+		})
+		.unwrap();
+	assert!(
+		tests.content.is_none()
+			&& matches!(tests.vis, syn::Visibility::Inherited)
+			&& tests
+				.attrs
+				.iter()
+				.any(|a| matches!(&a.meta, syn::Meta::List(l)
+				if l.path.is_ident("cfg") && l.tokens.to_string() == "test"))
+	);
+	let frozen = provisioning.join("tests/frozen_d6ce07b8");
+	let mut names: Vec<_> = fs::read_dir(&frozen)
+		.unwrap()
+		.map(|e| e.unwrap().file_name().into_string().unwrap())
+		.collect();
+	names.sort();
+	assert_eq!(names, ["inventory.in", "snapshot.in"]);
+	let wrapper_path = provisioning.join("tests/frozen_d6ce07b8.rs");
+	let wrapper = fs::read_to_string(&wrapper_path).unwrap();
+	assert_eq!(wrapper.matches("include!(").count(), 2);
+	assert!(wrapper.contains("include!(\"frozen_d6ce07b8/inventory.in\")"));
+	assert!(wrapper.contains("include!(\"frozen_d6ce07b8/snapshot.in\")"));
+	let mut stack = vec![src];
+	while let Some(dir) = stack.pop() {
+		for e in fs::read_dir(dir).unwrap() {
+			let p = e.unwrap().path();
+			if p.is_dir() {
+				if p != frozen {
+					stack.push(p);
+				}
+			} else if p.extension().is_some_and(|x| x == "rs") {
+				let t = fs::read_to_string(&p).unwrap();
+				let declares = p == provisioning.join("tests/mod.rs")
+					|| p == provisioning.join("tests/frozen_reader.rs")
+					|| p == wrapper_path;
+				assert_eq!(t.contains("frozen_d6ce07b8"), declares, "{}", p.display());
+				assert!(declares || !t.contains(".in\")"), "{}", p.display());
+			} else {
+				assert!(!p.extension().is_some_and(|x| x == "in"), "{}", p.display());
 			}
 		}
 	}

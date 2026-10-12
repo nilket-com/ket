@@ -4,6 +4,7 @@
 //! Python reference `admin_command_reference.py`. FIXTURE: the root is built with
 //! `VerifiedCommand2::fixture`; nothing here is a production authorization path.
 use super::*;
+use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
 	AdminManifest2, admin_manifest_digest2,
 };
@@ -95,7 +96,7 @@ fn tuple() -> PinnedBoundTuple2 {
 				pin,
 				admin_key: m.admin_key,
 			},
-			manifest: m,
+			manifest: AnyAdminManifest2::One(m),
 			state: RootState2::Bound,
 			last_seq: record.inventory_seq,
 			record: Some(record),

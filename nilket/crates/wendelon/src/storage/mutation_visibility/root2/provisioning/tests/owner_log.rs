@@ -1,5 +1,6 @@
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapObservation2;
 use crate::storage::mutation_visibility::root2::provisioning::inventory::*;
 use crate::storage::mutation_visibility::root2::provisioning::owner_core::*;
@@ -56,7 +57,10 @@ fn op(n: u8) -> OpId2 {
 	op_id2([n; 16]).unwrap()
 }
 fn manifest_of(name: &str) -> AdminManifest2 {
-	let EventBody2::Reserve { manifest } = event(name).body else {
+	let EventBody2::Reserve {
+		manifest: AnyAdminManifest2::One(manifest),
+	} = event(name).body
+	else {
 		unreachable!()
 	};
 	manifest
@@ -80,7 +84,7 @@ fn approve(id: RootIdentity2, name: &str) -> OwnerRequest2 {
 }
 fn reserve(name: &str) -> OwnerRequest2 {
 	OwnerRequest2::Reserve {
-		manifest: manifest_of(name),
+		manifest: AnyAdminManifest2::One(manifest_of(name)),
 	}
 }
 fn fifo(p: &Path) {

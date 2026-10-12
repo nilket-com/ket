@@ -2,6 +2,7 @@
 //! here with a FIXTURE token; no production producer exists) is refused by every unchanged
 //! consumer: install, observe, the issuer gate and C's Bootstrap verification.
 use super::*;
+use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
 	AdminManifest2, admin_manifest_digest2,
 };
@@ -49,7 +50,7 @@ fn tuple() -> PinnedBoundTuple2 {
 				pin: pin(),
 				admin_key: m.admin_key,
 			},
-			manifest: m,
+			manifest: AnyAdminManifest2::One(m),
 			state: RootState2::Bound,
 			last_seq: record.inventory_seq,
 			record: Some(record),

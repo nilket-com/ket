@@ -6,6 +6,7 @@
 //! fingerprints are fixture-only and establish no authentication or provenance.
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::admission_registry::PermissionRecord2;
 use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
@@ -111,7 +112,7 @@ fn tuple() -> PinnedBoundTuple2 {
 				pin,
 				admin_key: manifest.admin_key,
 			},
-			manifest,
+			manifest: AnyAdminManifest2::One(manifest),
 			state: RootState2::Bound,
 			last_seq: record.inventory_seq,
 			record: Some(record),

@@ -347,3 +347,77 @@ pub(in crate::storage::mutation_visibility::root2) fn admin_manifest_two_digest2
 ) -> Digest2 {
 	hash(DOMAIN, bytes)
 }
+
+// ---- M2: either profile, with its exact canonical bytes (dormant beyond owner/inventory) ----
+
+/// Either profile. Decoding dispatches structurally and then fully validates the selected
+/// profile; there is no conversion between profiles.
+#[derive(Clone, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) enum AnyAdminManifest2 {
+	One(AdminManifest2),
+	Two(AdminManifestTwo2),
+}
+redacted_debug!(AnyAdminManifest2, "AnyAdminManifest2");
+
+/// The exact canonical bytes of one manifest. Built only by `AnyAdminManifest2::encode`; the
+/// bytes beyond `len` are always zero, so the derived equality is exact-byte equality.
+#[derive(Clone, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) struct ManifestBytes2 {
+	storage: [u8; ADMIN_MANIFEST_P2_BYTES2],
+	len: usize,
+}
+redacted_debug!(ManifestBytes2, "ManifestBytes2");
+impl ManifestBytes2 {
+	pub(in crate::storage::mutation_visibility::root2) fn as_slice(&self) -> &[u8] {
+		&self.storage[..self.len]
+	}
+}
+
+impl AnyAdminManifest2 {
+	/// `manifest_profile2` (steps 1-6), then the selected profile's full decoder.
+	pub(in crate::storage::mutation_visibility::root2) fn decode(
+		input: &[u8],
+	) -> AdminResult2<Self> {
+		Ok(match profile_of(input)? {
+			ManifestProfile2::One => Self::One(AdminManifest2::decode(input)?),
+			ManifestProfile2::Two => Self::Two(AdminManifestTwo2::decode(input)?),
+		})
+	}
+	/// Revalidates the selected profile through its own encoder.
+	pub(in crate::storage::mutation_visibility::root2) fn encode(
+		&self,
+	) -> AdminResult2<ManifestBytes2> {
+		let mut storage = [0u8; ADMIN_MANIFEST_P2_BYTES2];
+		let len = match self {
+			Self::One(m) => {
+				storage[..ADMIN_MANIFEST_BYTES2].copy_from_slice(&m.encode()?);
+				ADMIN_MANIFEST_BYTES2
+			}
+			Self::Two(m) => {
+				storage.copy_from_slice(&m.encode()?);
+				ADMIN_MANIFEST_P2_BYTES2
+			}
+		};
+		Ok(ManifestBytes2 { storage, len })
+	}
+	pub(in crate::storage::mutation_visibility::root2) fn profile(&self) -> ManifestProfile2 {
+		match self {
+			Self::One(_) => ManifestProfile2::One,
+			Self::Two(_) => ManifestProfile2::Two,
+		}
+	}
+	/// The Admission fields, descriptive only: never a whole-manifest pin or request identity.
+	pub(in crate::storage::mutation_visibility::root2) fn admission(&self) -> &AdminManifest2 {
+		match self {
+			Self::One(m) => m,
+			Self::Two(m) => m.base(),
+		}
+	}
+}
+
+/// Digest math over exact canonical bytes (either profile, the same domain); not trust.
+pub(in crate::storage::mutation_visibility::root2) fn any_manifest_digest2(
+	bytes: &ManifestBytes2,
+) -> Digest2 {
+	hash(DOMAIN, bytes.as_slice())
+}

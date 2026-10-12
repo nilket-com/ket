@@ -1,5 +1,6 @@
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::provisioning::inventory::*;
 use CorruptReason2::*;
 
@@ -19,7 +20,10 @@ fn with_seq(mut e: Event2, seq: u64, op: u8) -> Event2 {
 }
 // A distinct, enrollable reservation built from the second golden manifest.
 fn manifest(generation: [u8; 16], cluster: [u8; 16], seed: u8) -> AdminManifest2 {
-	let EventBody2::Reserve { manifest } = event("reserve_second").body else {
+	let EventBody2::Reserve {
+		manifest: AnyAdminManifest2::One(manifest),
+	} = event("reserve_second").body
+	else {
 		unreachable!()
 	};
 	let mut m = manifest;
@@ -44,7 +48,9 @@ fn reserve(m: AdminManifest2, seq: u64, op: [u8; 16]) -> Event2 {
 				),
 			admin_key: m.admin_key,
 		}),
-		body: EventBody2::Reserve { manifest: m },
+		body: EventBody2::Reserve {
+			manifest: AnyAdminManifest2::One(m),
+		},
 	}
 }
 
@@ -223,7 +229,10 @@ fn semantic_rows() {
 		unreachable!()
 	};
 	let mut same = observation;
-	let EventBody2::Reserve { manifest: m2 } = r2.body.clone() else {
+	let EventBody2::Reserve {
+		manifest: AnyAdminManifest2::One(m2),
+	} = r2.body.clone()
+	else {
 		unreachable!()
 	};
 	same.identity.pin = r2.identity.unwrap().pin;
@@ -311,11 +320,17 @@ fn semantic_rows() {
 fn retained_identities_collide_per_component_even_after_retire() {
 	let r = event("reserve");
 	let base = event("reserve_second");
-	let EventBody2::Reserve { manifest: m1 } = r.body.clone() else {
+	let EventBody2::Reserve {
+		manifest: AnyAdminManifest2::One(m1),
+	} = r.body.clone()
+	else {
 		unreachable!()
 	};
 	let retired = cat(&[&encoded(&r), &encoded(&with_seq(event("retire"), 2, 5))]);
-	let EventBody2::Reserve { manifest: m2 } = base.body.clone() else {
+	let EventBody2::Reserve {
+		manifest: AnyAdminManifest2::One(m2),
+	} = base.body.clone()
+	else {
 		unreachable!()
 	};
 	for (label, m) in [
