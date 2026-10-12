@@ -1013,7 +1013,10 @@ async fn retention_status_is_additive_and_shared() {
 		Some(RetentionViolation::SnapshotRequest)
 	);
 	assert!(!after.is_ready());
-	node.shutdown().await.unwrap();
+	tokio::time::timeout(BOUND, node.shutdown())
+		.await
+		.expect("shared node shutdown exceeded the progress bound")
+		.unwrap();
 
 	// Metric names are present.
 	let rendered = crate::metrics::global().render_prometheus();
