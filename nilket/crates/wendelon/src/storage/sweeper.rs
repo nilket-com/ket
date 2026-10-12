@@ -1825,14 +1825,8 @@ mod tests {
 		}
 	}
 
-	fn fresh_dir(tag: &str) -> std::path::PathBuf {
-		let dir = std::env::temp_dir().join(format!(
-			"wendelon-sweeper-{tag}-{}-{}",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
-		std::fs::create_dir_all(&dir).unwrap();
-		dir
+	fn fresh_dir(tag: &str) -> crate::test_support::TestDir {
+		crate::test_support::TestDir::new(&format!("wendelon-sweeper-{tag}"))
 	}
 
 	async fn seed_state_machine_pointer(sm: &WendelonStateMachine, pointer: &TieredSlabPointer) {
@@ -1998,13 +1992,13 @@ mod tests {
 
 	async fn build_manager_with_sealed_slabs(
 		l2: Option<Arc<dyn ObjectStore>>,
-	) -> (Arc<SlabManager>, std::path::PathBuf) {
+	) -> (crate::test_support::TestDir, Arc<SlabManager>) {
 		use crate::storage::core::StorageEngine;
 		let dir = fresh_dir("l1");
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
-				dir: dir.clone(),
+				dir: dir.to_path_buf(),
 				// Tiny cap so two appends produce two sealed slabs.
 				max_slab_bytes: 1,
 				io,
@@ -2037,14 +2031,14 @@ mod tests {
 			.append(tenant(), id(3), hlc(), b"hello-3")
 			.await
 			.unwrap();
-		(manager, dir)
+		(dir, manager)
 	}
 
 	#[tokio::test]
 	async fn sweeper_tiers_sealed_slabs_and_unlinks_l1() {
 		let l2_root = fresh_dir("l2");
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
-		let (manager, l1_dir) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
+		let (l1_dir, manager) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
 
 		let sealed_before = manager.list_sealed_slabs().await;
 		assert!(
@@ -2095,7 +2089,7 @@ mod tests {
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
-				dir: l1_dir,
+				dir: l1_dir.to_path_buf(),
 				max_slab_bytes: 1 << 20,
 				io,
 				l2: Some(l2.clone()),
@@ -2192,7 +2186,7 @@ mod tests {
 
 		let l2_root = fresh_dir("l2");
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
-		let (manager, _l1_dir) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
+		let (_l1_dir, manager) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
 
 		// Record the location of key=1 before sweeping so we can
 		// verify the read path pivots without a re-lookup.
@@ -2229,7 +2223,7 @@ mod tests {
 	async fn sweeper_skips_slabs_under_min_size() {
 		let l2_root = fresh_dir("l2");
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
-		let (manager, _l1_dir) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
+		let (_l1_dir, manager) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
 
 		let sm = WendelonStateMachine::new();
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
@@ -2261,7 +2255,7 @@ mod tests {
 	async fn failed_commit_leaves_l1_intact() {
 		let l2_root = fresh_dir("l2");
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
-		let (manager, l1_dir) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
+		let (l1_dir, manager) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
 		let sealed_before = manager.list_sealed_slabs().await;
 
 		let sm = WendelonStateMachine::new();
@@ -2299,7 +2293,7 @@ mod tests {
 	async fn apply_tier_slab_is_idempotent() {
 		let l2_root = fresh_dir("l2");
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
-		let (manager, _l1_dir) = build_manager_with_sealed_slabs(Some(l2)).await;
+		let (_l1_dir, manager) = build_manager_with_sealed_slabs(Some(l2)).await;
 		let sealed = manager.list_sealed_slabs().await;
 		let info = sealed.first().unwrap().clone();
 
@@ -2329,7 +2323,7 @@ mod tests {
 
 		let l2_root = fresh_dir("l2");
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
-		let (manager, _l1_dir) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
+		let (_l1_dir, manager) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
 		let loc = manager.lookup(tenant(), id(1)).expect("key present");
 		let raw = manager.read_sealed_raw(loc.slab_id).await.unwrap();
 		let old_hash = crate::hash::content::digest(&raw);
@@ -2413,7 +2407,7 @@ mod tests {
 		let crypto = test_crypto();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
-				dir: l1_dir,
+				dir: l1_dir.to_path_buf(),
 				max_slab_bytes: 1 << 20,
 				io,
 				l2: Some(l2.clone()),
@@ -2515,7 +2509,7 @@ mod tests {
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
-				dir: l1_dir,
+				dir: l1_dir.to_path_buf(),
 				max_slab_bytes: 1 << 20,
 				io,
 				l2: Some(l2.clone()),
@@ -2622,7 +2616,7 @@ mod tests {
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
-				dir: l1_dir,
+				dir: l1_dir.to_path_buf(),
 				max_slab_bytes: 1 << 20,
 				io,
 				l2: Some(l2.clone()),
@@ -2751,7 +2745,7 @@ mod tests {
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
-				dir: l1_dir,
+				dir: l1_dir.to_path_buf(),
 				max_slab_bytes: 1 << 20,
 				io,
 				l2: Some(l2.clone()),
@@ -2899,7 +2893,7 @@ mod tests {
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
-				dir: l1_dir,
+				dir: l1_dir.to_path_buf(),
 				max_slab_bytes: 1 << 20,
 				io,
 				l2: Some(l2.clone()),
@@ -3043,7 +3037,7 @@ mod tests {
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
-				dir: l1_dir,
+				dir: l1_dir.to_path_buf(),
 				max_slab_bytes: 1 << 20,
 				io,
 				l2: Some(l2.clone()),
@@ -3171,7 +3165,7 @@ mod tests {
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
-				dir: l1_dir,
+				dir: l1_dir.to_path_buf(),
 				max_slab_bytes: 1 << 20,
 				io,
 				l2: Some(l2.clone()),
@@ -3340,7 +3334,7 @@ mod tests {
 		let io = spawn_io_thread(64).unwrap();
 		let manager = Arc::new(
 			SlabManager::open(SlabManagerConfig {
-				dir: l1_dir,
+				dir: l1_dir.to_path_buf(),
 				max_slab_bytes: 1 << 20,
 				io,
 				l2: Some(l2.clone()),

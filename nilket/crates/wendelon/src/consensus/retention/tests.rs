@@ -31,7 +31,6 @@ use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Bound on every wait for openraft progress. A wait that runs out fails.
@@ -43,16 +42,8 @@ const SEGMENT_BYTES: u64 = 64 * 4096;
 /// default 1000 retained in-snapshot entries.
 const PAST_DEFAULT_THRESHOLD: u64 = 6_100;
 
-fn fresh_dir(tag: &str) -> PathBuf {
-	static NEXT: AtomicU64 = AtomicU64::new(0);
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-retention-{tag}-{}-{}",
-		std::process::id(),
-		NEXT.fetch_add(1, Ordering::Relaxed)
-	));
-	let _ = std::fs::remove_dir_all(&dir);
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+fn fresh_dir(tag: &str) -> crate::test_support::TestDir {
+	crate::test_support::TestDir::new(&format!("wendelon-retention-{tag}"))
 }
 
 /// Every file under `dir`, by relative path, with its exact bytes.
@@ -256,7 +247,7 @@ fn seed(migration_id: u64) -> WendelonRequest {
 
 /// A history with several segments, written under `Compacting` (which purges
 /// nothing at this size) and shut down cleanly.
-async fn written_history(tag: &str, entries: u64) -> PathBuf {
+async fn written_history(tag: &str, entries: u64) -> crate::test_support::TestDir {
 	let dir = fresh_dir(tag);
 	let node = start(&dir, ControlRetention::Compacting).await.unwrap();
 	commit(&node.raft, entries).await;
@@ -372,7 +363,7 @@ async fn full_startup_refuses_incomplete_history() {
 			.parse()
 			.unwrap()
 	};
-	let mut fixtures: Vec<(&str, PathBuf, Expect)> = Vec::new();
+	let mut fixtures: Vec<(&str, crate::test_support::TestDir, Expect)> = Vec::new();
 
 	let dir = copy("a1-snapshot");
 	std::fs::write(dir.join("snapshot.wnd"), b"").unwrap();
@@ -999,7 +990,8 @@ async fn retention_status_is_additive_and_shared() {
 
 	// The node wires one guard to its server and its readiness view.
 	let data_dir = fresh_dir("shared-node");
-	let mut cfg = crate::node::NodeBootstrapConfig::dev(31, data_dir, "127.0.0.1:0".into());
+	let mut cfg =
+		crate::node::NodeBootstrapConfig::dev(31, data_dir.to_path_buf(), "127.0.0.1:0".into());
 	cfg.control_retention = ControlRetention::Full;
 	let node = crate::node::WendelonNode::bootstrap_single_node(cfg)
 		.await
@@ -1021,7 +1013,7 @@ async fn retention_status_is_additive_and_shared() {
 		Some(RetentionViolation::SnapshotRequest)
 	);
 	assert!(!after.is_ready());
-	node.handles.abort();
+	node.shutdown().await.unwrap();
 
 	// Metric names are present.
 	let rendered = crate::metrics::global().render_prometheus();
