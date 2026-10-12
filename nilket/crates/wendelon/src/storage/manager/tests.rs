@@ -45,14 +45,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-fn fresh_dir(tag: &str) -> std::path::PathBuf {
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-manager-{tag}-{}-{}",
-		std::process::id(),
-		uuid::Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+fn fresh_dir(tag: &str) -> crate::test_support::TestDir {
+	crate::test_support::TestDir::new(&format!("wendelon-manager-{tag}"))
 }
 
 fn hlc(ms: u64) -> HybridTimestamp {
@@ -126,7 +120,7 @@ async fn maintenance_staged_publication_recovery_distinguishes_s0_from_s1() {
 		!s0.exists() && !slab_path(&dir, s0_replacement).exists(),
 		"S0 reaps only the invisible staged file; it must never create a final slab"
 	);
-	std::fs::remove_dir_all(dir).unwrap();
+	std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[tokio::test]
@@ -218,12 +212,12 @@ async fn maintenance_staged_install_retries_and_preserves_s1_for_recovery() {
 	.await
 	.unwrap();
 	assert!(final_path.exists() && !staged.exists());
-	std::fs::remove_dir_all(dir).unwrap();
+	std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[tokio::test]
 async fn maintenance_publication_fail_stop_blocks_reads_until_restart() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let key = id(0x5A);
 	manager
 		.append_durable(tenant(), key, hlc(1), b"must-not-serve-half-published")
@@ -1084,7 +1078,7 @@ fn row_upper_bound_saturates_on_overflow() {
 
 #[tokio::test]
 async fn table_optimizer_facts_merges_tiered_small_sets_into_exact_ndv() {
-	let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-exact").await;
+	let (_mgr_dirs, mgr, l2) = fresh_manager_with_l2("optimizer-facts-exact").await;
 	let descriptor = optimizer_fact_region_descriptor();
 	tier_optimizer_fact_batch(
 		&mgr,
@@ -1125,7 +1119,7 @@ async fn table_optimizer_facts_merges_tiered_small_sets_into_exact_ndv() {
 
 #[tokio::test]
 async fn table_optimizer_facts_merges_tiered_heavy_hitters_into_exact_facts() {
-	let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-heavy-hitter").await;
+	let (_mgr_dirs, mgr, l2) = fresh_manager_with_l2("optimizer-facts-heavy-hitter").await;
 	let descriptor = optimizer_fact_utf8_region_heavy_hitter_descriptor();
 	tier_optimizer_fact_batch(
 		&mgr,
@@ -1178,7 +1172,7 @@ async fn table_optimizer_facts_merges_tiered_heavy_hitters_into_exact_facts() {
 
 #[tokio::test]
 async fn adr083_table_optimizer_facts_suppresses_v1_range_distributions() {
-	let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-range-distribution").await;
+	let (_mgr_dirs, mgr, l2) = fresh_manager_with_l2("optimizer-facts-range-distribution").await;
 	let descriptor = optimizer_fact_amount_range_distribution_descriptor(100);
 	tier_optimizer_fact_batch(
 		&mgr,
@@ -1211,7 +1205,7 @@ async fn adr083_table_optimizer_facts_suppresses_v1_range_distributions() {
 
 #[tokio::test]
 async fn table_optimizer_facts_emits_row_bound_for_candidate_less_table() {
-	let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-stat-less-row").await;
+	let (_mgr_dirs, mgr, l2) = fresh_manager_with_l2("optimizer-facts-stat-less-row").await;
 	let descriptor = optimizer_fact_candidate_less_descriptor();
 	tier_optimizer_fact_batch(
 		&mgr,
@@ -1245,7 +1239,7 @@ async fn table_optimizer_facts_emits_row_bound_for_candidate_less_table() {
 
 #[tokio::test]
 async fn table_optimizer_facts_known_empty_emits_zero_row_bound() {
-	let (mgr, _l2) = fresh_manager_with_l2("optimizer-facts-known-empty").await;
+	let (_mgr_dirs, mgr, _l2) = fresh_manager_with_l2("optimizer-facts-known-empty").await;
 	let descriptor = optimizer_fact_candidate_less_descriptor();
 
 	let facts = mgr
@@ -1261,7 +1255,7 @@ async fn table_optimizer_facts_known_empty_emits_zero_row_bound() {
 
 #[tokio::test]
 async fn table_optimizer_facts_missing_tiered_stats_suppresses_row_bound() {
-	let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-missing-row").await;
+	let (_mgr_dirs, mgr, l2) = fresh_manager_with_l2("optimizer-facts-missing-row").await;
 	let descriptor = optimizer_fact_candidate_less_descriptor();
 	let slab_id = tier_optimizer_fact_batch(
 		&mgr,
@@ -1288,7 +1282,7 @@ async fn table_optimizer_facts_missing_tiered_stats_suppresses_row_bound() {
 
 #[tokio::test]
 async fn range_fact_with_empty_stats_policy_is_produced_from_min_max() {
-	let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-range-empty-policy").await;
+	let (_mgr_dirs, mgr, l2) = fresh_manager_with_l2("optimizer-facts-range-empty-policy").await;
 	let descriptor = optimizer_fact_amount_descriptor();
 	assert_eq!(descriptor.stats_policy, ColumnStatsPolicy::default());
 	tier_optimizer_fact_batch(
@@ -1332,7 +1326,7 @@ async fn range_fact_with_empty_stats_policy_is_produced_from_min_max() {
 
 #[tokio::test]
 async fn table_optimizer_facts_emits_float_range_for_finite_values() {
-	let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-float-range").await;
+	let (_mgr_dirs, mgr, l2) = fresh_manager_with_l2("optimizer-facts-float-range").await;
 	let descriptor = optimizer_fact_score_descriptor();
 	tier_optimizer_fact_batch(
 		&mgr,
@@ -1374,7 +1368,7 @@ async fn table_optimizer_facts_emits_float_range_for_finite_values() {
 
 #[tokio::test]
 async fn table_optimizer_facts_suppresses_float_range_with_nan_or_infinity() {
-	let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-float-nonfinite").await;
+	let (_mgr_dirs, mgr, l2) = fresh_manager_with_l2("optimizer-facts-float-nonfinite").await;
 	let descriptor = optimizer_fact_score_descriptor();
 	tier_optimizer_fact_batch(
 		&mgr,
@@ -1404,7 +1398,7 @@ async fn table_optimizer_facts_suppresses_float_range_with_nan_or_infinity() {
 
 #[tokio::test]
 async fn active_l1_without_stats_makes_ndv_unknown() {
-	let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-active-l1").await;
+	let (_mgr_dirs, mgr, l2) = fresh_manager_with_l2("optimizer-facts-active-l1").await;
 	let descriptor = optimizer_fact_region_descriptor();
 	tier_optimizer_fact_batch(
 		&mgr,
@@ -1442,7 +1436,7 @@ async fn active_l1_without_stats_makes_ndv_unknown() {
 
 #[tokio::test]
 async fn range_fact_requires_full_contributor_coverage() {
-	let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-range-active-l1").await;
+	let (_mgr_dirs, mgr, l2) = fresh_manager_with_l2("optimizer-facts-range-active-l1").await;
 	let descriptor = optimizer_fact_amount_descriptor();
 	tier_optimizer_fact_batch(
 		&mgr,
@@ -1905,7 +1899,7 @@ async fn durable_multirow_table_attribution_survives_manager_reopen() {
 	let dir = fresh_dir("adr0539-table-attribution");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let table_object_id = TableObjectId::new([0x53; 16]);
 	let key_identity = id(5_039);
 	let row_hlc = hlc(5_039);
@@ -1936,7 +1930,7 @@ async fn durable_multirow_table_attribution_survives_manager_reopen() {
 	);
 
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	assert_eq!(
 		reopened.published_table_object_id(location),
 		Some(table_object_id)
@@ -1952,7 +1946,7 @@ async fn durable_multirow_table_attribution_survives_manager_reopen() {
 
 #[tokio::test]
 async fn missing_published_reference_fences_the_referencing_typed_table_before_write_ack() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table_object_id = TableObjectId::new([0x54; 16]);
 	let key_identity = id(5_040);
 	let row_hlc = hlc(5_040);
@@ -2029,7 +2023,7 @@ async fn recovery_fences_durable_reference_to_missing_slab() {
 	let dir = fresh_dir("adr0539-recovery-fence");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let table_object_id = TableObjectId::new([0x55; 16]);
 	let key_identity = id(5_041);
 	let row_hlc = hlc(5_041);
@@ -2050,14 +2044,14 @@ async fn recovery_fences_durable_reference_to_missing_slab() {
 	drop(manager);
 	std::fs::remove_file(slab_path(&dir, slab_id)).unwrap();
 
-	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let failure = reopened
 		.table_integrity_failure(tenant(), table_object_id)
 		.expect("recovery must detect the durable reference to the removed slab");
 	assert_eq!(failure.missing_slab_id, slab_id);
 	assert_eq!(failure.origin, PublishedReferenceOrigin::Recovery);
 	drop(reopened);
-	let reopened_again = open_manager_at_dir(dir, io, crypto).await;
+	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	assert_eq!(
 		reopened_again
 			.table_integrity_failure(tenant(), table_object_id)
@@ -2069,7 +2063,7 @@ async fn recovery_fences_durable_reference_to_missing_slab() {
 
 #[tokio::test]
 async fn durable_index_reference_blocks_local_slab_retirement() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table_object_id = TableObjectId::new([0x57; 16]);
 	let key_identity = id(5_043);
 	let row_hlc = hlc(5_043);
@@ -2322,18 +2316,24 @@ fn empty_compaction_catalogs() -> (TableSchemaCatalog, SecondaryIndexCatalog) {
 	)
 }
 
-async fn fresh_manager() -> Arc<SlabManager> {
+async fn fresh_manager() -> (crate::test_support::TestDir, Arc<SlabManager>) {
 	fresh_manager_with_group_commit(GroupCommitConfig::default()).await
 }
 
-async fn fresh_manager_with_l2(tag: &str) -> (Arc<SlabManager>, Arc<dyn ObjectStore>) {
+async fn fresh_manager_with_l2(
+	tag: &str,
+) -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+) {
 	let l1_dir = fresh_dir(&format!("{tag}-l1"));
 	let l2_root = fresh_dir(&format!("{tag}-l2"));
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let manager = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir,
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
 			l2: Some(l2.clone()),
@@ -2351,7 +2351,7 @@ async fn fresh_manager_with_l2(tag: &str) -> (Arc<SlabManager>, Arc<dyn ObjectSt
 		.await
 		.unwrap(),
 	);
-	(manager, l2)
+	([l1_dir, l2_root], manager, l2)
 }
 
 fn optimizer_fact_region_descriptor() -> TableSchemaDescriptor {
@@ -2739,12 +2739,14 @@ impl TierCommitter for FailingLsmCommitter {
 	}
 }
 
-async fn fresh_manager_with_group_commit(group_commit: GroupCommitConfig) -> Arc<SlabManager> {
+async fn fresh_manager_with_group_commit(
+	group_commit: GroupCommitConfig,
+) -> (crate::test_support::TestDir, Arc<SlabManager>) {
 	let dir = fresh_dir("mv");
 	let io = spawn_io_thread(64).unwrap();
-	Arc::new(
+	let manager = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir,
+			dir: dir.to_path_buf(),
 			// Large enough that no rotation fires during tests;
 			// we want every version in the same active slab so
 			// the test targets the multi-version index
@@ -2765,9 +2767,9 @@ async fn fresh_manager_with_group_commit(group_commit: GroupCommitConfig) -> Arc
 		})
 		.await
 		.unwrap(),
-	)
+	);
+	(dir, manager)
 }
-
 async fn open_manager_at_dir(
 	dir: std::path::PathBuf,
 	io: crate::storage::io_uring::IoRingHandle,
@@ -2814,8 +2816,12 @@ async fn counter_tentative_without_marker_does_not_survive_restart() {
 	let crypto = test_crypto();
 	let k = ckey(b"verdict");
 	{
-		let mgr =
-			open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto.clone()).await;
+		let mgr = open_manager_at_dir(
+			dir.to_path_buf(),
+			spawn_io_thread(64).unwrap(),
+			crypto.clone(),
+		)
+		.await;
 		let store = SlabCounterStore::new(mgr.clone(), tenant());
 		store.tentative_append(&k, 5, hlc(1)).await.unwrap();
 		assert_eq!(
@@ -2825,7 +2831,7 @@ async fn counter_tentative_without_marker_does_not_survive_restart() {
 		);
 		mgr.fsync_all_local_slabs().await.unwrap();
 	}
-	let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), crypto).await;
+	let mgr = open_manager_at_dir(dir.to_path_buf(), spawn_io_thread(64).unwrap(), crypto).await;
 	let store = SlabCounterStore::new(mgr, tenant());
 	assert_eq!(
 		store.read_committed(&k).await.unwrap(),
@@ -2844,14 +2850,18 @@ async fn counter_commit_marker_survives_restart_into_manager_index() {
 	let crypto = test_crypto();
 	let k = ckey(b"verdict");
 	{
-		let mgr =
-			open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto.clone()).await;
+		let mgr = open_manager_at_dir(
+			dir.to_path_buf(),
+			spawn_io_thread(64).unwrap(),
+			crypto.clone(),
+		)
+		.await;
 		let store = SlabCounterStore::new(mgr.clone(), tenant());
 		let t = store.tentative_append(&k, 5, hlc(1)).await.unwrap();
 		store.commit_tentative(t).await.unwrap();
 		mgr.fsync_all_local_slabs().await.unwrap();
 	}
-	let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), crypto).await;
+	let mgr = open_manager_at_dir(dir.to_path_buf(), spawn_io_thread(64).unwrap(), crypto).await;
 	// Direct proof: the committed counter is in the manager's key_index.
 	assert!(
 		mgr.lookup(tenant(), counter_identity(&k)).is_some(),
@@ -2866,7 +2876,12 @@ async fn counter_commit_marker_survives_restart_into_manager_index() {
 #[tokio::test]
 async fn counter_manager_rollback_removes_live_tentative_only() {
 	let dir = fresh_dir("adr075-counter-rollback");
-	let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), test_crypto()).await;
+	let mgr = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
 	let store = SlabCounterStore::new(mgr, tenant());
 	let k = ckey(b"verdict");
 	let t = store.tentative_append(&k, 5, hlc(1)).await.unwrap();
@@ -2887,8 +2902,12 @@ async fn counter_manager_marker_failure_rolls_back_and_recovery_skips_orphan() {
 	let crypto = test_crypto();
 	let k = ckey(b"verdict");
 	{
-		let mgr =
-			open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto.clone()).await;
+		let mgr = open_manager_at_dir(
+			dir.to_path_buf(),
+			spawn_io_thread(64).unwrap(),
+			crypto.clone(),
+		)
+		.await;
 		let store = SlabCounterStore::new(mgr.clone(), tenant());
 		let t1 = store.tentative_append(&k, 3, hlc(1)).await.unwrap();
 		store.commit_tentative(t1).await.unwrap();
@@ -2900,7 +2919,7 @@ async fn counter_manager_marker_failure_rolls_back_and_recovery_skips_orphan() {
 		assert_eq!(store.read_committed(&k).await.unwrap(), Some(3));
 		mgr.fsync_all_local_slabs().await.unwrap();
 	}
-	let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), crypto).await;
+	let mgr = open_manager_at_dir(dir.to_path_buf(), spawn_io_thread(64).unwrap(), crypto).await;
 	let store = SlabCounterStore::new(mgr, tenant());
 	assert_eq!(
 		store.read_committed(&k).await.unwrap(),
@@ -2919,8 +2938,12 @@ async fn counter_and_blob_coexist_blob_recovery_unchanged() {
 	let blob_value = b"ordinary-blob-value".to_vec();
 	let k = ckey(b"verdict");
 	{
-		let mgr =
-			open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto.clone()).await;
+		let mgr = open_manager_at_dir(
+			dir.to_path_buf(),
+			spawn_io_thread(64).unwrap(),
+			crypto.clone(),
+		)
+		.await;
 		mgr.append_durable(tenant(), blob_id, hlc(1), &blob_value)
 			.await
 			.unwrap();
@@ -2929,7 +2952,7 @@ async fn counter_and_blob_coexist_blob_recovery_unchanged() {
 		store.commit_tentative(t).await.unwrap();
 		mgr.fsync_all_local_slabs().await.unwrap();
 	}
-	let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), crypto).await;
+	let mgr = open_manager_at_dir(dir.to_path_buf(), spawn_io_thread(64).unwrap(), crypto).await;
 	// Ordinary blob recovers and reads back byte-identical.
 	let loc = mgr
 		.lookup(tenant(), blob_id)
@@ -2952,8 +2975,12 @@ async fn counter_replica_service_replicate_live_then_restart_skips_without_marke
 	let crypto = test_crypto();
 	let id = counter_identity(&ckey(b"verdict"));
 	{
-		let mgr =
-			open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto.clone()).await;
+		let mgr = open_manager_at_dir(
+			dir.to_path_buf(),
+			spawn_io_thread(64).unwrap(),
+			crypto.clone(),
+		)
+		.await;
 		let svc = CounterReplicaService::new(mgr.clone());
 		svc.replicate_tentative(1, tenant(), id, 5, hlc(1))
 			.await
@@ -2965,7 +2992,7 @@ async fn counter_replica_service_replicate_live_then_restart_skips_without_marke
 		);
 		mgr.fsync_all_local_slabs().await.unwrap();
 	}
-	let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), crypto).await;
+	let mgr = open_manager_at_dir(dir.to_path_buf(), spawn_io_thread(64).unwrap(), crypto).await;
 	let svc = CounterReplicaService::new(mgr);
 	assert_eq!(
 		svc.read_committed(tenant(), id).await.unwrap(),
@@ -2979,7 +3006,12 @@ async fn counter_replica_service_replicate_live_then_restart_skips_without_marke
 #[tokio::test]
 async fn counter_replica_service_rollback_removes_matching_op_idempotent() {
 	let dir = fresh_dir("adr075-replica-svc-rollback");
-	let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), test_crypto()).await;
+	let mgr = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
 	let svc = CounterReplicaService::new(mgr);
 	let id = counter_identity(&ckey(b"verdict"));
 	svc.replicate_tentative(1, tenant(), id, 5, hlc(1))
@@ -3006,8 +3038,12 @@ async fn counter_replica_service_commit_makes_value_survive_restart() {
 	let crypto = test_crypto();
 	let id = counter_identity(&ckey(b"verdict"));
 	{
-		let mgr =
-			open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto.clone()).await;
+		let mgr = open_manager_at_dir(
+			dir.to_path_buf(),
+			spawn_io_thread(64).unwrap(),
+			crypto.clone(),
+		)
+		.await;
 		let svc = CounterReplicaService::new(mgr.clone());
 		svc.replicate_tentative(7, tenant(), id, 42, hlc(1))
 			.await
@@ -3016,7 +3052,7 @@ async fn counter_replica_service_commit_makes_value_survive_restart() {
 		assert_eq!(svc.pending_count(), 0, "committed op left the pending set");
 		mgr.fsync_all_local_slabs().await.unwrap();
 	}
-	let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), crypto).await;
+	let mgr = open_manager_at_dir(dir.to_path_buf(), spawn_io_thread(64).unwrap(), crypto).await;
 	let svc = CounterReplicaService::new(mgr);
 	assert_eq!(svc.read_committed(tenant(), id).await.unwrap(), Some(42));
 }
@@ -3049,7 +3085,12 @@ fn wkey(n: u64) -> CounterWriteKey {
 async fn leader_over_real_replica_service_commits_value_visible_through_service() {
 	let dir = fresh_dir("adr075-leader-real-svc");
 	let wdir = fresh_dir("adr075-leader-real-svc-witness");
-	let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), test_crypto()).await;
+	let mgr = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
 	let service = Arc::new(CounterReplicaService::new(mgr));
 
 	// The production participant set: the leader's own local arm over the real
@@ -3279,7 +3320,7 @@ async fn secondary_index_segment_catalog_persists_loads_and_deletes() {
 	let dir = fresh_dir("secondary-index-sidecar");
 	let io = spawn_io_thread(64).unwrap();
 	let crypto = test_crypto();
-	let manager = open_manager_at_dir(dir.clone(), io, crypto.clone()).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io, crypto.clone()).await;
 	let segment = secondary_index_segment_for_test(SlabId::new(41));
 	let info = manager
 		.persist_secondary_index_segment(&segment)
@@ -3310,7 +3351,8 @@ async fn secondary_index_segment_catalog_persists_loads_and_deletes() {
 	assert!(coverage.uncovered_slabs.is_empty());
 
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto).await;
+	let reopened =
+		open_manager_at_dir(dir.to_path_buf(), spawn_io_thread(64).unwrap(), crypto).await;
 	assert_eq!(
 		reopened.list_secondary_index_segments(
 			info.tenant_id,
@@ -3363,8 +3405,12 @@ async fn secondary_index_segment_catalog_persists_loads_and_deletes() {
 async fn recovery_fences_missing_secondary_index_source_slab() {
 	let dir = fresh_dir("adr0539-secondary-source-recovery");
 	let crypto = test_crypto();
-	let manager =
-		open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto.clone()).await;
+	let manager = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		crypto.clone(),
+	)
+	.await;
 	let segment = secondary_index_segment_for_test(SlabId::new(5_039));
 	let info = manager
 		.persist_secondary_index_segment(&segment)
@@ -3372,7 +3418,8 @@ async fn recovery_fences_missing_secondary_index_source_slab() {
 		.unwrap();
 	drop(manager);
 
-	let reopened = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), crypto).await;
+	let reopened =
+		open_manager_at_dir(dir.to_path_buf(), spawn_io_thread(64).unwrap(), crypto).await;
 	assert_eq!(
 		reopened.table_integrity_failure(info.tenant_id, info.table_object_id),
 		Some(PublishedReferenceIntegrityFailure {
@@ -3391,7 +3438,7 @@ async fn secondary_index_corrupt_sidecar_marks_uncovered_and_fails_closed() {
 	let dir = fresh_dir("secondary-index-corrupt-sidecar");
 	let io = spawn_io_thread(64).unwrap();
 	let crypto = test_crypto();
-	let manager = open_manager_at_dir(dir.clone(), io, crypto).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	let segment = secondary_index_segment_for_test(SlabId::new(41));
 	let info = manager
 		.persist_secondary_index_segment(&segment)
@@ -3424,7 +3471,7 @@ async fn secondary_index_drop_gc_deletes_sidecars_and_clears_local_coverage() {
 	let dir = fresh_dir("secondary-index-drop-gc");
 	let io = spawn_io_thread(64).unwrap();
 	let crypto = test_crypto();
-	let manager = open_manager_at_dir(dir.clone(), io, crypto).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	let descriptor = secondary_index_descriptor_for_test();
 	let first = manager
 		.persist_secondary_index_segment(&secondary_index_segment_for_test(SlabId::new(41)))
@@ -3462,7 +3509,7 @@ async fn secondary_index_drop_gc_deletes_sidecars_and_clears_local_coverage() {
 
 #[tokio::test]
 async fn adr0095_slab_rewrite_claim_serializes_both_rewrite_orders() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let source_slab_id = force_seal_active(&manager).await;
 	let source_slab_lease = manager
 		.acquire_slab_rewrite_read_claim(source_slab_id)
@@ -3508,7 +3555,7 @@ async fn adr0095_slab_rewrite_claim_serializes_both_rewrite_orders() {
 
 #[tokio::test]
 async fn secondary_index_coverage_plan_recovers_covered_and_enqueues_missing_sealed_slabs() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let first_sealed = force_seal_active(&manager).await;
 	let second_sealed = force_seal_active(&manager).await;
 	let descriptor = secondary_index_descriptor_for_test();
@@ -3534,7 +3581,7 @@ async fn secondary_index_coverage_plan_recovers_covered_and_enqueues_missing_sea
 
 #[tokio::test]
 async fn secondary_index_active_buffer_seal_persists_sidecar_and_marks_covered() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let descriptor = secondary_index_descriptor_for_test();
 	let active_slab_id = manager.active_slab_id().await;
 	let row_hlc = hlc(50);
@@ -3583,7 +3630,7 @@ async fn secondary_index_active_buffer_seal_persists_sidecar_and_marks_covered()
 
 #[tokio::test]
 async fn secondary_index_declaration_cut_backfills_the_complete_old_active_slab() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	let old_active = manager.active_slab_id().await;
@@ -3720,7 +3767,7 @@ async fn secondary_index_declaration_cut_backfills_the_complete_old_active_slab(
 
 #[tokio::test]
 async fn secondary_index_backfill_source_slab_emits_every_retained_data_version() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	let row_identity =
@@ -3801,7 +3848,7 @@ async fn adr0097_deterministic_class_survives_the_real_failure_path() {
 		DeterministicOrigin, MaintenanceFailureClass, classify_compaction_failure,
 	};
 
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table = adr0097_colocated_table_descriptor_for_test();
 	append_attributed_multirow_frame_for_test(&manager, &table, &[1, 2], hlc(1_000)).await;
 	let slab_id = manager.force_seal_active_for_test().await;
@@ -3916,7 +3963,7 @@ async fn adr0097_lsm_owns_its_inputs_through_publication_and_retention_replans()
 	let dir = fresh_dir("adr0097-ownership-latch");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.clone(), io, crypto).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	let table = adr0097_colocated_table_descriptor_for_test();
 
 	append_attributed_multirow_frame_for_test(&manager, &table, &[1, 2], hlc(1_000)).await;
@@ -4076,7 +4123,7 @@ async fn adr0097_lsm_owns_its_inputs_through_publication_and_retention_replans()
 /// retention kept replacing the slab each pass had just enumerated.
 #[tokio::test]
 async fn adr0097_backfill_candidate_replaced_before_its_claim_is_stale_not_uncovered() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	for id_value in 0..3_i64 {
@@ -4221,7 +4268,7 @@ async fn adr0097_backfill_candidate_replaced_before_its_claim_is_stale_not_uncov
 /// it as stale would silently swallow real damage.
 #[tokio::test]
 async fn adr0097_missing_published_source_is_still_an_integrity_error() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	append_secondary_index_table_row_for_test(&manager, &table, 1, Some(1), hlc(10)).await;
@@ -4253,7 +4300,7 @@ async fn adr0097_missing_published_source_is_still_an_integrity_error() {
 
 #[tokio::test]
 async fn secondary_index_backfill_tick_respects_limit_and_reports_completion() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 
@@ -4295,7 +4342,7 @@ async fn secondary_index_backfill_tick_respects_limit_and_reports_completion() {
 
 #[tokio::test]
 async fn secondary_index_compaction_rebuilds_building_sidecar_and_heals_uncovered_slab() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	let row_identity =
@@ -4371,7 +4418,7 @@ async fn secondary_index_compaction_rebuilds_building_sidecar_and_heals_uncovere
 
 #[tokio::test]
 async fn lsm_compaction_rebuilds_secondary_index_sidecar_with_catalog_context() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	let row_identity =
@@ -4482,7 +4529,7 @@ async fn lsm_compaction_rebuilds_secondary_index_sidecar_with_catalog_context() 
 
 #[tokio::test]
 async fn lsm_compaction_commit_failure_does_not_publish_prepared_sidecar() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	append_secondary_index_table_row_for_test(&manager, &table, 7, Some(10), hlc(10)).await;
@@ -4551,7 +4598,7 @@ async fn lsm_compaction_commit_failure_does_not_publish_prepared_sidecar() {
 
 #[tokio::test]
 async fn lsm_compaction_rejects_secondary_index_sidecar_without_catalog_context() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	append_secondary_index_table_row_for_test(&manager, &table, 7, Some(10), hlc(10)).await;
@@ -4619,7 +4666,7 @@ async fn lsm_compaction_rejects_secondary_index_sidecar_without_catalog_context(
 
 #[tokio::test]
 async fn lsm_compaction_elides_non_visible_primary_key_versions_with_catalog_context() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table = secondary_index_table_descriptor_for_test();
 	let row_identity =
 		append_secondary_index_table_row_for_test(&manager, &table, 7, Some(10), hlc(10)).await;
@@ -4690,7 +4737,7 @@ async fn lsm_compaction_elides_non_visible_primary_key_versions_with_catalog_con
 
 #[tokio::test]
 async fn secondary_index_lookup_point_equal_revalidates_sidecar_candidate() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	let first_identity =
@@ -4734,7 +4781,7 @@ async fn secondary_index_lookup_point_equal_revalidates_sidecar_candidate() {
 
 #[tokio::test]
 async fn secondary_index_lookup_rejects_superseded_candidate_but_honors_as_of() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	let row_identity =
@@ -4785,7 +4832,7 @@ async fn secondary_index_lookup_rejects_superseded_candidate_but_honors_as_of() 
 
 #[tokio::test]
 async fn locality_candidates_recover_after_index_lock_poison() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let key = id(0x4242);
 	let locality = Locality::from(key);
 	manager
@@ -4807,7 +4854,7 @@ async fn locality_candidates_recover_after_index_lock_poison() {
 
 #[tokio::test]
 async fn lookup_returns_latest_version_after_multiple_appends() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let key = id(42);
 	mgr.append(tenant(), key, hlc(10), b"v1").await.unwrap();
 	mgr.append(tenant(), key, hlc(20), b"v2").await.unwrap();
@@ -4819,7 +4866,7 @@ async fn lookup_returns_latest_version_after_multiple_appends() {
 
 #[tokio::test]
 async fn encrypt_tiered_object_blob_uses_adr022_layout() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	mgr.append(tenant(), id(0x1234), hlc(10), b"adr022-row")
 		.await
 		.unwrap();
@@ -4837,7 +4884,7 @@ async fn encrypt_tiered_object_blob_uses_adr022_layout() {
 
 #[tokio::test]
 async fn encrypt_tiered_object_blob_with_table_stats_builds_decryptable_csb() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let schema = Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
 		Field::new("region", DataType::LargeUtf8, true),
@@ -4982,7 +5029,7 @@ async fn table_stats_are_stable_across_record_body_compression() {
 		RecordBodyCompressionPolicy::Uncompressed,
 		RecordBodyCompressionPolicy::Lz4Frame,
 	] {
-		let mgr = fresh_manager().await;
+		let (_mgr_dir, mgr) = fresh_manager().await;
 		for row in 0..batch.num_rows() {
 			let row_batch = batch.slice(row, 1);
 			let frame = encode_batch_with_policy(&row_batch, policy).unwrap().bytes;
@@ -5031,7 +5078,7 @@ async fn table_stats_are_stable_across_record_body_compression() {
 
 #[tokio::test]
 async fn table_stats_ignore_default_kv_descriptor_for_legacy_slabs() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let descriptor = default_kv_table_descriptor_v1().unwrap();
 	let schema = descriptor.arrow_schema().unwrap();
 	let mut keys = LargeBinaryBuilder::new();
@@ -5077,7 +5124,7 @@ async fn table_stats_ignore_default_kv_descriptor_for_legacy_slabs() {
 
 #[tokio::test]
 async fn typed_table_stats_are_mandatory_when_any_row_matches_descriptor() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	mgr.append(tenant(), id(0x44), hlc(9), b"legacy-row")
 		.await
 		.unwrap();
@@ -5146,7 +5193,7 @@ async fn typed_table_stats_are_mandatory_when_any_row_matches_descriptor() {
 
 #[tokio::test]
 async fn stats_advisory_absence_skips_stats_fetch() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
 	let descriptor = TableSchemaDescriptor::new(
 		TableObjectId::new([0x42; 16]),
@@ -5189,7 +5236,7 @@ async fn stats_advisory_drift_fails_closed_to_unavailable() {
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir,
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
 			l2: Some(l2.clone()),
@@ -5299,7 +5346,7 @@ async fn stats_advisory_drift_fails_closed_to_unavailable() {
 
 #[tokio::test]
 async fn column_stats_plaintext_does_not_encode_slab_lineage() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let schema = Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
 		Field::new("region", DataType::LargeUtf8, true),
@@ -5416,7 +5463,7 @@ async fn tiered_retention_rewrite_recomputes_stats_from_survivors() {
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir,
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
 			l2: Some(l2.clone()),
@@ -5584,7 +5631,7 @@ async fn tiered_retention_rewrite_filters_partial_multirow_storage_records() {
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir,
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
 			l2: Some(l2.clone()),
@@ -5727,7 +5774,7 @@ async fn tiered_retention_rewrite_filters_partial_multirow_storage_records() {
 
 #[tokio::test]
 async fn l1_retention_pruning_filters_partial_multirow_storage_records_once() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let key_a = id(0x1A);
 	let key_b = id(0x1B);
 	let key_c = id(0x1C);
@@ -5791,7 +5838,7 @@ async fn l1_retention_pruning_filters_partial_multirow_storage_records_once() {
 
 #[tokio::test]
 async fn table_drop_reclaim_removes_target_table_rows() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let target = append_only_retention_descriptor(TableObjectId::new([0x39; 16]));
 	let other =
 		append_only_retention_descriptor_named(TableObjectId::new([0x40; 16]), "other_events");
@@ -5846,7 +5893,7 @@ async fn table_drop_reclaim_removes_target_table_rows() {
 
 #[tokio::test]
 async fn adr0095_table_drop_slice_bounds_examined_work_and_resumes_after_cursor() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let target = append_only_retention_descriptor(TableObjectId::new([0x95; 16]));
 	let other =
 		append_only_retention_descriptor_named(TableObjectId::new([0x96; 16]), "other_0095");
@@ -5935,7 +5982,7 @@ async fn table_drop_reclaim_rewrites_tiered_target_rows() {
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir,
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
 			l2: Some(l2.clone()),
@@ -6032,7 +6079,7 @@ async fn table_drop_reclaim_rewrites_tiered_target_rows() {
 
 #[tokio::test]
 async fn l1_table_retention_prunes_append_only_rows_when_cluster_retention_disabled() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let descriptor = append_only_retention_descriptor(TableObjectId::new([0x48; 16]));
 	let (schemas, lifecycle) = fixed_table_retention_catalog(&descriptor, 60_000);
 	let old_key = id(0x4801);
@@ -6079,7 +6126,7 @@ async fn l1_table_retention_prunes_append_only_rows_when_cluster_retention_disab
 
 #[tokio::test]
 async fn l1_table_retention_reports_lag_for_retained_rows_below_floor() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let descriptor = append_only_retention_descriptor(TableObjectId::new([0x4A; 16]));
 	let (schemas, lifecycle) = fixed_table_retention_catalog(&descriptor, 60_000);
 	let pruned_key = id(0x4A01);
@@ -6138,7 +6185,7 @@ async fn l1_table_retention_reports_lag_for_retained_rows_below_floor() {
 
 #[tokio::test]
 async fn l1_table_retention_reports_lag_without_rewrite_for_pair_waiting_on_tombstone() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let descriptor = append_only_retention_descriptor(TableObjectId::new([0x4B; 16]));
 	let (schemas, lifecycle) = fixed_table_retention_catalog(&descriptor, 60_000);
 	let retained_key = id(0x4B01);
@@ -6195,7 +6242,7 @@ async fn l1_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor() {
 	let dir = fresh_dir("pk-boundary-tombstone-reopen");
 	let io = spawn_io_thread(64).unwrap();
 	let crypto = test_crypto();
-	let mgr = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let mgr = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let descriptor = pk_retention_descriptor(TableObjectId::new([0x50; 16]));
 	let mut schemas = TableSchemaCatalog::default();
 	schemas.upsert(tenant(), descriptor.clone()).unwrap();
@@ -6248,7 +6295,7 @@ async fn l1_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor() {
 	mgr.fsync_all_local_slabs().await.unwrap();
 	drop(mgr);
 
-	let reopened = open_manager_at_dir(dir, io, crypto).await;
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	assert!(
 		reopened.lookup_as_of(tenant(), key, hlc(10_000)).is_none(),
 		"pruned data row should stay absent after reopen"
@@ -6269,7 +6316,7 @@ async fn l1_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor() {
 
 #[tokio::test]
 async fn l1_retention_pruning_pair_gc_drops_data_and_row_tombstone() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let key = id(0x4701);
 	let loc = Locality::new(47);
 	let data_frame = encode_test_multirow_storage_frame(&[(key, loc, hlc(10), 100)]);
@@ -6304,7 +6351,7 @@ async fn l1_retention_pruning_pair_gc_drops_data_and_row_tombstone() {
 
 #[tokio::test]
 async fn l1_retention_pruning_keeps_pair_until_floor_passes_tombstone() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let key = id(0x4702);
 	let loc = Locality::new(48);
 	let data_frame = encode_test_multirow_storage_frame(&[(key, loc, hlc(10), 100)]);
@@ -6353,7 +6400,7 @@ async fn tiered_retention_rewrite_pair_gc_drops_data_and_row_tombstone() {
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir,
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
 			l2: Some(l2.clone()),
@@ -6475,7 +6522,7 @@ async fn tiered_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor(
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir,
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
 			l2: Some(l2.clone()),
@@ -6620,7 +6667,7 @@ async fn tiered_table_retention_rewrite_prunes_append_only_rows_when_cluster_ret
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir,
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
 			l2: Some(l2.clone()),
@@ -6754,7 +6801,7 @@ async fn tiered_table_retention_reports_lag_without_rewrite_for_pair_waiting_on_
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir,
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
 			l2: Some(l2.clone()),
@@ -6841,7 +6888,7 @@ async fn tiered_table_retention_reports_lag_without_rewrite_for_pair_waiting_on_
 
 #[tokio::test]
 async fn sealed_layout_recluster_single_to_multi_preserves_reads() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let single_descriptor = layout_recluster_descriptor(0x62, 1, RecordLayoutPolicy::SingleRow);
 	let multi_descriptor = layout_recluster_descriptor(
 		0x62,
@@ -6921,7 +6968,7 @@ async fn sealed_layout_recluster_single_to_multi_preserves_reads() {
 
 #[tokio::test]
 async fn sealed_layout_recluster_multi_to_single_preserves_reads() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let multi_descriptor = layout_recluster_descriptor(
 		0x63,
 		1,
@@ -6994,7 +7041,7 @@ async fn assert_sealed_layout_recluster_updates_multirow_codec(
 	from_policy: RecordBodyCompressionPolicy,
 	to_policy: RecordBodyCompressionPolicy,
 ) {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let layout = MultiRowLayoutDescriptor::new(4, 4, 1024 * 1024).unwrap();
 	let source_descriptor = layout_recluster_descriptor_with_codec(
 		object_byte,
@@ -7113,7 +7160,7 @@ async fn sealed_layout_recluster_same_layout_updates_multirow_codec() {
 
 #[tokio::test]
 async fn active_slab_reads_mixed_record_body_compression() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let uncompressed_descriptor = layout_recluster_descriptor_with_codec(
 		0x66,
 		1,
@@ -7189,7 +7236,7 @@ async fn recovery_reopens_pk_delete_and_resurrection_chain() {
 	let key = id(0x5701);
 	let locality = Locality::new(57);
 
-	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let data_frame = encode_test_append_only_storage_frame(
 		descriptor.table_object_id,
 		&[(key, locality, hlc(10), 100, false)],
@@ -7210,7 +7257,7 @@ async fn recovery_reopens_pk_delete_and_resurrection_chain() {
 	manager.fsync_all_local_slabs().await.unwrap();
 	drop(manager);
 
-	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	assert_eq!(
 		reopened.routing_locality_for_existing_key(tenant(), key),
 		Some(locality)
@@ -7248,7 +7295,7 @@ async fn recovery_reopens_pk_delete_and_resurrection_chain() {
 	reopened.fsync_all_local_slabs().await.unwrap();
 	drop(reopened);
 
-	let reopened = open_manager_at_dir(dir, io, crypto).await;
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	assert!(
 		reopened
 			.lookup_as_of(tenant(), key, hlc(20))
@@ -7278,7 +7325,7 @@ async fn recovery_fails_closed_on_cross_slab_consecutive_pk_tombstones() {
 	let key = id(0x5901);
 	let locality = Locality::new(59);
 
-	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let data_frame = encode_test_append_only_storage_frame(
 		descriptor.table_object_id,
 		&[(key, locality, hlc(10), 100, false)],
@@ -7315,7 +7362,7 @@ async fn recovery_fails_closed_on_cross_slab_consecutive_pk_tombstones() {
 	drop(manager);
 
 	let reopened = SlabManager::open(SlabManagerConfig {
-		dir,
+		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io,
 		l2: None,
@@ -7344,7 +7391,7 @@ async fn recovery_reopens_mixed_record_body_compression_slab() {
 	let dir = fresh_dir("mixed-compression-recovery");
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: dir.clone(),
+			dir: dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024,
 			io: spawn_io_thread(64).unwrap(),
 			l2: None,
@@ -7415,7 +7462,7 @@ async fn recovery_reopens_mixed_record_body_compression_slab() {
 	drop(mgr);
 
 	let reopened = SlabManager::open(SlabManagerConfig {
-		dir,
+		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
 		l2: None,
@@ -7454,7 +7501,7 @@ async fn l2_reads_mixed_record_body_compression_slab() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.clone(),
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024,
 			io: spawn_io_thread(64).unwrap(),
 			l2: Some(l2.clone()),
@@ -7602,7 +7649,7 @@ async fn l2_reads_mixed_record_body_compression_slab() {
 
 #[tokio::test]
 async fn compression_resident_gauge_tracks_sealed_recluster_convergence() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let layout = MultiRowLayoutDescriptor::new(4, 4, 1024 * 1024).unwrap();
 	let source_descriptor = layout_recluster_descriptor_with_codec(
 		0x67,
@@ -7705,7 +7752,7 @@ async fn compression_resident_gauge_counts_tiered_uncompressed_frames() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.clone(),
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024,
 			io: spawn_io_thread(64).unwrap(),
 			l2: Some(l2.clone()),
@@ -7837,7 +7884,7 @@ async fn projected_l2_read_materializes_sparse_multirow_record() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.clone(),
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024 * 16,
 			io: spawn_io_thread(64).unwrap(),
 			l2: Some(l2.clone()),
@@ -8003,7 +8050,7 @@ async fn row_group_l2_point_read_materializes_projected_group() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.clone(),
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024 * 16,
 			io: spawn_io_thread(64).unwrap(),
 			l2: Some(l2.clone()),
@@ -8896,7 +8943,7 @@ async fn fsst_phase_b_l2_read_filters_a1_and_declines_a2_overlap() {
 		.insert(crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstWholeBuffer);
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir,
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024 * 16,
 			io: spawn_io_thread(64).unwrap(),
 			l2: Some(l2.clone()),
@@ -9428,7 +9475,7 @@ async fn sparse_projection_fetch_materializes_exact_cocd_clustered_pages() {
 	let l2: Arc<dyn ObjectStore> = l2_counter.clone();
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.clone(),
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024 * 16,
 			io: spawn_io_thread(64).unwrap(),
 			l2: Some(l2.clone()),
@@ -9821,7 +9868,7 @@ async fn sparse_projection_fetch_materializes_exact_cocd_clustered_pages() {
 	let scalar_l2: Arc<dyn ObjectStore> = scalar_l2_counter.clone();
 	let scalar_mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: scalar_l1_dir,
+			dir: scalar_l1_dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024 * 16,
 			io: spawn_io_thread(64).unwrap(),
 			l2: Some(scalar_l2.clone()),
@@ -10045,7 +10092,7 @@ async fn adr061_enabled_chunk_layout_writes_16k_encrypted_slab() {
 	};
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir,
+			dir: dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024 * 16,
 			io: spawn_io_thread(64).unwrap(),
 			l2: None,
@@ -10210,7 +10257,7 @@ async fn encoding_secondary_index_fetches_only_selected_simd_pages() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
 	let mgr = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.clone(),
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024 * 16,
 			io: spawn_io_thread(64).unwrap(),
 			l2: Some(l2.clone()),
@@ -10630,7 +10677,7 @@ fn compaction_rewrites_table_bound_multirow_frame_with_row_group_directory() {
 
 #[tokio::test]
 async fn encrypt_tiered_object_blob_rejects_empty_plain_slab() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let err = mgr
 		.encrypt_tiered_object_blob(SlabId::new(77), &[])
 		.unwrap_err();
@@ -10644,7 +10691,7 @@ async fn encrypt_tiered_object_blob_rejects_empty_plain_slab() {
 
 #[tokio::test]
 async fn decode_tiered_blob_rejects_footer_tenant_mismatch_with_payload_tenant() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let key = id(0xfeed);
 	mgr.append(tenant(), key, hlc(10), b"tenant-bound payload")
 		.await
@@ -10714,7 +10761,7 @@ async fn decode_tiered_blob_rejects_footer_tenant_mismatch_with_payload_tenant()
 
 #[tokio::test]
 async fn lookup_as_of_returns_historical_version() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let key = id(7);
 	mgr.append(tenant(), key, hlc(10), b"v1").await.unwrap();
 	mgr.append(tenant(), key, hlc(20), b"v2").await.unwrap();
@@ -10747,7 +10794,7 @@ async fn lookup_as_of_returns_historical_version() {
 
 #[tokio::test]
 async fn scan_all_versions_returns_every_retained_version_above_floor() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	// Two keys, two versions each — one above floor, one below.
 	let key_a = id(1);
 	let key_b = id(2);
@@ -10784,7 +10831,7 @@ async fn scan_all_versions_returns_every_retained_version_above_floor() {
 
 #[tokio::test]
 async fn append_migration_is_idempotent_on_identical_payload() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let key = id(42);
 	let ts = hlc(100);
 	let frame = b"payload-bytes";
@@ -10810,8 +10857,8 @@ async fn append_migration_is_idempotent_on_identical_payload() {
 
 #[tokio::test]
 async fn append_migration_with_locality_preserves_custom_range_membership() {
-	let source = fresh_manager().await;
-	let destination = fresh_manager().await;
+	let (_source_dir, source) = fresh_manager().await;
+	let (_destination_dir, destination) = fresh_manager().await;
 	let key = id(0xDADA);
 	let identity_locality = Locality::from(key);
 	let routing_locality = Locality::new(identity_locality.get().wrapping_add(1));
@@ -10856,7 +10903,7 @@ async fn append_migration_with_locality_preserves_custom_range_membership() {
 
 #[tokio::test]
 async fn append_migration_rejects_conflicting_payload_for_same_slot() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let key = id(99);
 	let ts = hlc(200);
 	let frame_a = b"original";
@@ -10879,7 +10926,7 @@ async fn append_migration_rejects_conflicting_payload_for_same_slot() {
 
 #[tokio::test]
 async fn scan_as_of_filters_versions_per_key() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	// Two keys in the same range, each with two versions at
 	// different HLCs.
 	let key_a = id(1);
@@ -10912,7 +10959,7 @@ async fn scan_as_of_filters_versions_per_key() {
 
 #[tokio::test]
 async fn scan_as_of_scopes_locality_membership_per_tenant() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let shared_identity = id(0x55);
 	let locality = Locality::from(shared_identity);
 	let other_tenant = TenantId::new(7);
@@ -10940,7 +10987,7 @@ async fn custom_routing_locality_survives_reopen() {
 	let dir = fresh_dir("custom-locality-reopen");
 	let manager = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: dir.clone(),
+			dir: dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024,
 			io: spawn_io_thread(64).unwrap(),
 			l2: None,
@@ -10979,7 +11026,7 @@ async fn custom_routing_locality_survives_reopen() {
 	drop(manager);
 
 	let reopened = SlabManager::open(SlabManagerConfig {
-		dir,
+		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
 		l2: None,
@@ -11019,7 +11066,7 @@ async fn custom_routing_locality_survives_reopen() {
 
 #[tokio::test]
 async fn append_durable_coalesces_concurrent_fdatasyncs() {
-	let mgr = fresh_manager_with_group_commit(GroupCommitConfig {
+	let (_mgr_dir, mgr) = fresh_manager_with_group_commit(GroupCommitConfig {
 		floor: Duration::from_millis(20),
 		ceiling: Duration::from_millis(20),
 		per_write_cost_estimate: Duration::from_millis(20),
@@ -11062,7 +11109,7 @@ async fn reopen_restores_tiered_rows_from_redb() {
 	let crypto = test_crypto();
 
 	let manager = SlabManager::open(SlabManagerConfig {
-		dir: l1_dir.clone(),
+		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: io.clone(),
 		l2: Some(l2.clone()),
@@ -11136,7 +11183,7 @@ async fn reopen_restores_tiered_rows_from_redb() {
 	drop(manager);
 
 	let reopened = SlabManager::open(SlabManagerConfig {
-		dir: l1_dir,
+		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,
 		l2: Some(l2),
@@ -11187,7 +11234,7 @@ async fn cleanup_retention_rewrite_tmp_files_removes_stale_plaintext() {
 
 #[tokio::test]
 async fn adr0095_tiered_cleanup_intent_is_durable_and_budgeted_before_receipt() {
-	let (manager, l2) = fresh_manager_with_l2("adr0095-l2-cleanup-intent").await;
+	let (_manager_dirs, manager, l2) = fresh_manager_with_l2("adr0095-l2-cleanup-intent").await;
 	let slab_id = SlabId::new(0x95);
 	let key = "adr0095/old-target-bearing-slab.wnd";
 	let old_uri = l2.put(key, b"old-target-bytes").await.unwrap();
@@ -11237,7 +11284,7 @@ async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 	let io = spawn_io_thread(64).unwrap();
 	let manager = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: dir.clone(),
+			dir: dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024,
 			io: io.clone(),
 			l2: None,
@@ -11330,7 +11377,7 @@ async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 	drop(manager);
 
 	let reopened = SlabManager::open(SlabManagerConfig {
-		dir,
+		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io,
 		l2: None,
@@ -11363,7 +11410,7 @@ async fn lsm_compaction_does_not_retain_empty_active_slabs() {
 	let io = spawn_io_thread(16).unwrap();
 	let manager = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: dir.clone(),
+			dir: dir.to_path_buf(),
 			max_slab_bytes: 1,
 			io: io.clone(),
 			l2: None,
@@ -11442,7 +11489,7 @@ async fn lsm_compaction_does_not_retain_empty_active_slabs() {
 
 	drop(manager);
 	let reopened = SlabManager::open(SlabManagerConfig {
-		dir,
+		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,
 		l2: None,
@@ -11471,7 +11518,7 @@ async fn recovery_skips_zero_length_sealed_slabs_but_preserves_records_and_activ
 	let io = spawn_io_thread(16).unwrap();
 	let manager = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: dir.clone(),
+			dir: dir.to_path_buf(),
 			max_slab_bytes: 1,
 			io: io.clone(),
 			l2: None,
@@ -11504,7 +11551,7 @@ async fn recovery_skips_zero_length_sealed_slabs_but_preserves_records_and_activ
 	}
 
 	let reopened = SlabManager::open(SlabManagerConfig {
-		dir,
+		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,
 		l2: None,
@@ -11541,7 +11588,7 @@ async fn recovery_refuses_before_opening_more_than_the_slab_bound() {
 	}
 
 	let error = match SlabManager::open(SlabManagerConfig {
-		dir,
+		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,
 		l2: None,
@@ -11572,7 +11619,7 @@ async fn recovery_refuses_before_opening_more_than_the_slab_bound() {
 
 #[tokio::test]
 async fn lsm_compaction_rejects_sidecar_covered_source_runs_without_catalog_context() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	manager
 		.append_durable(tenant(), id(0x55CA), hlc(10), b"sidecar-covered")
 		.await
@@ -11621,7 +11668,7 @@ async fn lsm_compaction_rejects_sidecar_covered_source_runs_without_catalog_cont
 
 #[tokio::test]
 async fn lsm_compaction_copies_whole_multirow_frame_into_output_run() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let first_key = id(0x6001);
 	let second_key = id(0x6002);
 	let frame = encode_test_multirow_storage_frame(&[
@@ -11679,7 +11726,7 @@ async fn lsm_compaction_copies_whole_multirow_frame_into_output_run() {
 
 #[tokio::test]
 async fn migrated_range_tombstone_marks_tiered_slab_visibility_incomplete() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let key = id(0x5151);
 	manager
 		.append_durable(tenant(), key, hlc(10), b"migrated")
@@ -11757,7 +11804,7 @@ async fn migrated_range_tombstone_marks_tiered_slab_visibility_incomplete() {
 
 #[tokio::test]
 async fn post_tier_supersession_updates_tiered_pointer_visibility() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let key = id(0x5151);
 	manager
 		.append_durable(tenant(), key, hlc(10), b"v10")
@@ -11801,7 +11848,7 @@ async fn post_tier_supersession_updates_tiered_pointer_visibility() {
 
 #[tokio::test]
 async fn post_tier_row_tombstone_updates_tiered_pointer_visibility() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let key = id(0x5152);
 	let locality = Locality::new(52);
 	let data_frame = encode_test_multirow_storage_frame(&[(key, locality, hlc(10), 100)]);
@@ -11856,7 +11903,7 @@ async fn post_tier_row_tombstone_updates_tiered_pointer_visibility() {
 
 #[tokio::test]
 async fn tiered_pk_tombstone_slab_records_row_tombstone_and_resurrection_metadata() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let descriptor = pk_retention_descriptor(TableObjectId::new([0x5A; 16]));
 	let key = id(0x5A01);
 	let locality = Locality::new(0x5A);
@@ -11930,7 +11977,7 @@ async fn tiered_pk_tombstone_slab_records_row_tombstone_and_resurrection_metadat
 
 #[tokio::test]
 async fn retention_pruning_keeps_latest_version_before_floor() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let key = id(0x4040);
 	manager
 		.append_durable(tenant(), key, hlc(10), b"v10")
@@ -11979,7 +12026,7 @@ async fn retention_pruning_keeps_latest_version_before_floor() {
 
 #[tokio::test]
 async fn retention_pruning_keeps_latest_when_all_versions_precede_floor() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let key = id(0x5050);
 	manager
 		.append_durable(tenant(), key, hlc(10), b"v10")
@@ -12201,7 +12248,7 @@ async fn prune_compaction_must_not_orphan_secondary_index_sources() {
 	let dir = fresh_dir("adr0539-prune-orphans-secondary-source");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.clone(), io, crypto).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 
@@ -12288,7 +12335,7 @@ async fn recluster_refuses_retirement_without_reconciliation_proof() {
 	let dir = fresh_dir("adr0539-recluster-refuses");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.clone(), io, crypto).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	let single_descriptor = layout_recluster_descriptor(0x64, 1, RecordLayoutPolicy::SingleRow);
 	let multi_descriptor = layout_recluster_descriptor(
 		0x64,
@@ -12374,7 +12421,7 @@ async fn recluster_refuses_retirement_without_reconciliation_proof() {
 /// incomplete) and a key living only in the gap slab (a successful empty lie).
 #[tokio::test]
 async fn secondary_index_lookup_refuses_while_a_source_slab_lacks_a_segment() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	append_secondary_index_table_row_for_test(&manager, &table, 1, Some(10), hlc(10)).await;
@@ -12417,7 +12464,7 @@ async fn secondary_index_lookup_still_refuses_after_reopen() {
 	let dir = fresh_dir("adr0539-lookup-gate-survives-reopen");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	append_secondary_index_table_row_for_test(&manager, &table, 1, Some(10), hlc(10)).await;
@@ -12432,7 +12479,7 @@ async fn secondary_index_lookup_still_refuses_after_reopen() {
 		},
 		hlc(99),
 	);
-	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let err = reopened
 		.table_lookup_by_index(&request, &descriptor, SecondaryIndexState::Ready)
 		.await
@@ -12450,7 +12497,7 @@ async fn secondary_index_lookup_still_refuses_after_reopen() {
 		.unwrap();
 	assert_eq!(report.rows.len(), 1);
 	drop(reopened);
-	let reopened_again = open_manager_at_dir(dir, io, crypto).await;
+	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	let report = reopened_again
 		.table_lookup_by_index(&request, &descriptor, SecondaryIndexState::Ready)
 		.await
@@ -12463,7 +12510,7 @@ async fn secondary_index_lookup_still_refuses_after_reopen() {
 /// and a structural failure burns its budget cheaply and lands where it should.
 #[tokio::test]
 async fn backfill_candidacy_survives_failures_until_the_budget_spends() {
-	let manager = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager().await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	append_secondary_index_table_row_for_test(&manager, &table, 1, Some(10), hlc(10)).await;
@@ -12546,7 +12593,7 @@ async fn repair_fixture_manager(dir: &std::path::Path, io: IoRingHandle) -> Arc<
 }
 
 fn slab_files_on_disk(dir: &std::path::Path) -> Vec<(SlabId, u64)> {
-	let mut found = std::fs::read_dir(dir)
+	let mut found = std::fs::read_dir(&dir)
 		.unwrap()
 		.filter_map(Result::ok)
 		.filter_map(|entry| {
@@ -12719,7 +12766,7 @@ async fn adr0089_locality_intervals_yield_exactly_the_rows_inside_them() {
 	let dir = fresh_dir("adr0089-range-discoverability");
 	let manager = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: dir.clone(),
+			dir: dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024,
 			io: spawn_io_thread(64).unwrap(),
 			l2: None,
@@ -12906,7 +12953,7 @@ async fn adr0097_partial_survivor_frame_is_rewritten_before_installation() {
 	let dir = fresh_dir("adr0097-partial-survivor-rewrite");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.clone(), io, crypto).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	let table = adr0097_colocated_table_descriptor_for_test();
 
 	// Slab A: one physical frame holding k1, k2, k3.
@@ -13095,7 +13142,7 @@ async fn adr0097_rewritten_partial_survivor_frame_survives_install_and_reopen() 
 	let dir = fresh_dir("adr0097-partial-survivor-install");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let table = adr0097_colocated_table_descriptor_for_test();
 
 	let identities =
@@ -13175,7 +13222,7 @@ async fn adr0097_rewritten_partial_survivor_frame_survives_install_and_reopen() 
 
 	// Reopen from disk: nothing below is served from in-memory state.
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.clone(), io, crypto).await;
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 
 	for identity in [k1, k3] {
 		let location = reopened
@@ -13271,7 +13318,7 @@ async fn adr0097_rewritten_partial_survivor_frame_survives_install_and_reopen() 
 /// buffer count equalled the row count and this fails.
 #[tokio::test]
 async fn adr0097_source_frames_are_read_once_per_physical_frame() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let key_a = id(0x9A);
 	let key_b = id(0x9B);
 	let key_c = id(0x9C);
@@ -13361,7 +13408,7 @@ async fn adr0090_compaction_preserves_partitioned_placement() {
 	let io = spawn_io_thread(64).unwrap();
 	let manager = Arc::new(
 		SlabManager::open(SlabManagerConfig {
-			dir: dir.clone(),
+			dir: dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024,
 			io: io.clone(),
 			l2: None,
@@ -13474,7 +13521,7 @@ async fn repro_drop_reclaim_keeps_pinned_slab_backing_readable() {
 	// backing while such a pin is held. Failure here means the reclaim
 	// retirement path bypasses the pin/delete protocol and is a causal
 	// candidate for the live warnings.
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let target = append_only_retention_descriptor(TableObjectId::new([0x77; 16]));
 	let mut schemas = TableSchemaCatalog::default();
 	schemas.upsert(tenant(), target.clone()).unwrap();
@@ -13563,7 +13610,7 @@ async fn retention_prune_defers_pinned_slab_backing_until_release() {
 	// The retention twin of the drop-reclaim pin contract: both routes
 	// funnel through compact_sealed_slab_records, and both must honor a
 	// compaction plan's pins before removing a backing.
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let descriptor = append_only_retention_descriptor(TableObjectId::new([0x79; 16]));
 	let (schemas, lifecycle) = fixed_table_retention_catalog(&descriptor, 60_000);
 	let old_key = id(0x7901);
@@ -13625,7 +13672,7 @@ async fn missing_compaction_source_read_records_compaction_origin() {
 	// Compaction-origin integrity evidence, not masquerade as a client
 	// Read — the generic origin conflated the two during the 2026-08-24
 	// incident triage.
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let descriptor = append_only_retention_descriptor(TableObjectId::new([0x7a; 16]));
 	let mut schemas = TableSchemaCatalog::default();
 	schemas.upsert(tenant(), descriptor.clone()).unwrap();
@@ -13670,7 +13717,7 @@ async fn maintenance_rewrite_publishes_under_reader_pin_and_sweep_defers_disposa
 	// the rewrite publishes, both old and new locations stay readable, and
 	// only Phase D (the GC sweep) defers to the pin, collecting after
 	// release.
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let target = append_only_retention_descriptor(TableObjectId::new([0x81; 16]));
 	let other =
 		append_only_retention_descriptor_named(TableObjectId::new([0x82; 16]), "pinned_reader");
@@ -13776,7 +13823,7 @@ async fn maintenance_publication_refuses_relocation_survivor_mismatch() {
 	// The publication validation's negative arm: a relocation set that does
 	// not equal the declared survivor set is refused before any durable or
 	// in-memory mutation.
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let table = append_only_retention_descriptor(TableObjectId::new([0x83; 16]));
 	let mut schemas = TableSchemaCatalog::default();
 	schemas.upsert(tenant(), table.clone()).unwrap();
@@ -13849,7 +13896,7 @@ async fn maintenance_manifest_reapply_is_a_no_op() {
 	// Idempotent re-apply: the same (old, replacement) publication applied
 	// twice leaves the manifest byte-identical; a conflicting second
 	// publication of a retired source is refused.
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let table = append_only_retention_descriptor(TableObjectId::new([0x84; 16]));
 	let mut schemas = TableSchemaCatalog::default();
 	schemas.upsert(tenant(), table.clone()).unwrap();
@@ -13955,7 +14002,7 @@ async fn l0_pressure(manager: &SlabManager) {
 async fn a_compaction_tick_is_policed_and_its_success_is_recorded() {
 	let dir = fresh_dir("adr0097-policed-tick");
 	let io = spawn_io_thread(16).unwrap();
-	let manager = open_policed_manager(dir, io).await;
+	let manager = open_policed_manager(dir.to_path_buf(), io).await;
 	let policy = manager.maintenance_policy();
 	assert!(policy.is_enabled(), "{:?}", policy.diagnostic());
 	l0_pressure(&manager).await;
@@ -13993,7 +14040,7 @@ async fn a_quarantined_plan_is_skipped_by_the_tick_until_requeued() {
 
 	// Learn which plan the picker chooses for this pressure.
 	let touched = {
-		let manager = open_policed_manager(dir.clone(), io.clone()).await;
+		let manager = open_policed_manager(dir.to_path_buf(), io.clone()).await;
 		l0_pressure(&manager).await;
 		let worker = LsmCompactionWorker::new(worker_config, manager.slab_pin_table()).unwrap();
 		manager
@@ -14026,7 +14073,7 @@ async fn a_quarantined_plan_is_skipped_by_the_tick_until_requeued() {
 			.unwrap();
 	}
 
-	let manager = open_policed_manager(dir, io).await;
+	let manager = open_policed_manager(dir.to_path_buf(), io).await;
 	let policy = manager.maintenance_policy();
 	assert!(policy.is_enabled(), "{:?}", policy.diagnostic());
 	assert_eq!(policy.report().quarantined().count(), 1);
@@ -14087,7 +14134,7 @@ async fn a_manager_with_unreadable_receipt_history_serves_but_admits_no_maintena
 	let dir = fresh_dir("adr0097-unreadable-history");
 	let io = spawn_io_thread(16).unwrap();
 	{
-		let manager = open_policed_manager(dir.clone(), io.clone()).await;
+		let manager = open_policed_manager(dir.to_path_buf(), io.clone()).await;
 		manager
 			.append(tenant(), id(0x9800), hlc(1), b"served")
 			.await
@@ -14105,7 +14152,7 @@ async fn a_manager_with_unreadable_receipt_history_serves_but_admits_no_maintena
 			.unwrap();
 	}
 
-	let manager = open_policed_manager(dir, io).await;
+	let manager = open_policed_manager(dir.to_path_buf(), io).await;
 	let policy = manager.maintenance_policy();
 	assert!(!policy.is_enabled());
 	assert!(
@@ -14149,7 +14196,7 @@ async fn tombstone_reclaim_is_policed() {
 	let open = |dir: std::path::PathBuf, io: crate::storage::io_uring::IoRingHandle| async move {
 		Arc::new(
 			SlabManager::open(SlabManagerConfig {
-				dir,
+				dir: dir.to_path_buf(),
 				max_slab_bytes: 1024 * 1024,
 				io,
 				l2: None,
@@ -14184,7 +14231,7 @@ async fn tombstone_reclaim_is_policed() {
 	};
 	let target = Locality::from(removed_key).get();
 
-	let manager = open(dir.clone(), io.clone()).await;
+	let manager = open(dir.to_path_buf(), io.clone()).await;
 	manager
 		.append_durable(tenant(), removed_key, hlc(10), b"drop-me")
 		.await
@@ -14213,7 +14260,7 @@ async fn tombstone_reclaim_is_policed() {
 	drop(manager);
 
 	// Control arm: the same store, reopened, reclaims once the policy admits.
-	let reopened = open(dir, io).await;
+	let reopened = open(dir.to_path_buf(), io).await;
 	assert!(reopened.maintenance_policy().is_enabled());
 	let report = reopened
 		.reclaim_tombstoned_ranges(&[tombstone(target)], &schemas, &indexes, 1)
@@ -14242,7 +14289,7 @@ async fn tombstone_reclaim_is_policed() {
 async fn retention_pass_budgets_attempts_and_walks_the_sealed_slabs() {
 	use crate::storage::maintenance_policy::MaintenanceOperation;
 
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let mut sealed = Vec::new();
 	for n in 0..3_u64 {
 		mgr.append_durable(tenant(), id(0x9800 + n), hlc(10 + n), b"clean-row")
@@ -14306,7 +14353,7 @@ async fn retention_pass_budgets_attempts_and_walks_the_sealed_slabs() {
 async fn tombstone_pass_budgets_attempts_and_walks_the_sealed_slabs() {
 	use crate::storage::maintenance_policy::MaintenanceOperation;
 
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let mut sealed = Vec::new();
 	for n in 0..2_u64 {
 		mgr.append_durable(tenant(), id(0x9900 + n), hlc(10 + n), b"kept-row")
@@ -14358,7 +14405,7 @@ async fn tombstone_pass_budgets_attempts_and_walks_the_sealed_slabs() {
 /// payload is admitted to the same slab.
 #[tokio::test]
 async fn append_admission_reserves_the_padded_record_under_the_lock() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let cap = mgr.config.max_slab_bytes;
 	let frame_len = 600 * 1024;
 	let (_, padded) = LocalSlabStore::padded_record_size(frame_len).unwrap();
@@ -14399,7 +14446,7 @@ async fn append_admission_reserves_the_padded_record_under_the_lock() {
 /// check it lands in the first slab and carries it over the cap.
 #[tokio::test]
 async fn append_admission_judges_the_padded_record_not_the_frame() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let cap = mgr.config.max_slab_bytes as usize;
 	let page = crate::storage::io_uring::DIRECT_IO_ALIGN;
 
@@ -14432,7 +14479,7 @@ async fn append_admission_judges_the_padded_record_not_the_frame() {
 /// the first slab. A payload larger than the cap still enters an empty slab.
 #[tokio::test]
 async fn append_rotates_before_a_payload_would_cross_the_cap() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	assert_eq!(mgr.config.max_slab_bytes, 1 << 20);
 	let payload = vec![0x5A_u8; 600 * 1024];
 	let mut slab_ids = Vec::new();
@@ -14479,7 +14526,7 @@ async fn durable_append_after_an_unwritten_reservation_survives_reopen() {
 	let dir = fresh_dir("adr0099-interior-hole");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 
 	// A: admitted and reserved, never written. Three pages wide so the hole
 	// is more than one probe page.
@@ -14500,7 +14547,7 @@ async fn durable_append_after_an_unwritten_reservation_survives_reopen() {
 	assert_eq!(location_b.offset, hole_end);
 
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let recovered = reopened
 		.lookup(tenant(), key_b)
 		.expect("a durably acknowledged record is recoverable past an interior hole");
@@ -14529,7 +14576,7 @@ async fn blob_recovery_resumes_only_at_acknowledged_offsets() {
 	let dir = fresh_dir("adr0099-blob-hole");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let page = crate::storage::io_uring::DIRECT_IO_ALIGN;
 
 	let before = manager
@@ -14584,7 +14631,7 @@ async fn blob_recovery_does_not_promote_a_payload_page_after_a_lost_header_page(
 	let dir = fresh_dir("adr0099-blob-embedded");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let page = crate::storage::io_uring::DIRECT_IO_ALIGN;
 	let inner = manager
 		.append_durable(tenant(), id(0x99F0), hlc(130), b"embedded-record")
@@ -14629,7 +14676,7 @@ async fn recovery_resumes_at_the_last_record_over_a_trailing_hole() {
 	let dir = fresh_dir("adr0099-trailing-hole");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let page = crate::storage::io_uring::DIRECT_IO_ALIGN as u64;
 
 	let last = manager
@@ -14647,7 +14694,7 @@ async fn recovery_resumes_at_the_last_record_over_a_trailing_hole() {
 	file.set_len(len + 2 * page).unwrap();
 	drop(file);
 
-	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	assert_eq!(reopened.lookup(tenant(), id(0x9920)), Some(last));
 	let next = reopened
 		.append_durable(tenant(), id(0x9921), hlc(121), b"next-record")
@@ -14673,7 +14720,7 @@ async fn recovery_does_not_promote_a_payload_page_after_a_lost_header_page() {
 	let dir = fresh_dir("adr0099-embedded-record");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let page = crate::storage::io_uring::DIRECT_IO_ALIGN;
 
 	let inner_key = id(0x99F0);
@@ -14699,7 +14746,7 @@ async fn recovery_does_not_promote_a_payload_page_after_a_lost_header_page() {
 	std::os::unix::fs::FileExt::write_all_at(&file, &vec![0_u8; page], outer.offset).unwrap();
 	drop(file);
 
-	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	assert_eq!(reopened.lookup(tenant(), inner_key), Some(inner));
 	assert_eq!(reopened.lookup(tenant(), outer_key), None);
 	assert_eq!(
@@ -14722,7 +14769,7 @@ async fn recovery_resumes_past_a_torn_region_at_the_next_acknowledged_record() {
 	let dir = fresh_dir("adr0099-torn-then-acked");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let page = crate::storage::io_uring::DIRECT_IO_ALIGN;
 
 	let torn_key = id(0x99A0);
@@ -14743,7 +14790,7 @@ async fn recovery_resumes_past_a_torn_region_at_the_next_acknowledged_record() {
 	std::os::unix::fs::FileExt::write_all_at(&file, &[0xEE; 4], torn.offset).unwrap();
 	drop(file);
 
-	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	assert_eq!(reopened.lookup(tenant(), torn_key), None);
 	assert_eq!(reopened.lookup(tenant(), acked_key), Some(acked));
 	assert_eq!(
@@ -14776,7 +14823,7 @@ async fn recovery_without_the_durable_index_stops_at_the_first_anomaly() {
 	std::fs::create_dir_all(persistent_index_path(&dir)).unwrap();
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	assert!(manager.persistent_index.is_none());
 
 	let (slab, reservation) = manager.target_for_append(16).await.unwrap();
@@ -14789,7 +14836,7 @@ async fn recovery_without_the_durable_index_stops_at_the_first_anomaly() {
 	assert_eq!(after.slab_id, slab.slab_id());
 	drop(manager);
 
-	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	assert_eq!(
 		reopened.lookup(tenant(), key),
 		None,
@@ -14804,7 +14851,7 @@ async fn recovery_without_the_durable_index_stops_at_the_first_anomaly() {
 /// finds no record and refuses a blob the node itself produced.
 #[tokio::test]
 async fn encrypted_slab_with_a_leading_hole_round_trips_with_evidence() {
-	let mgr = fresh_manager().await;
+	let (_mgr_dir, mgr) = fresh_manager().await;
 	let (_, reservation) = mgr.target_for_append(16).await.unwrap();
 	drop(reservation);
 	mgr.append_durable(tenant(), id(0x99C0), hlc(160), b"durable-after-hole")

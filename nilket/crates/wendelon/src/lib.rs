@@ -54,3 +54,6 @@ pub mod node;
 pub mod schema;
 pub mod simulator;
 pub mod storage;
+
+#[cfg(test)]
+mod test_support;
