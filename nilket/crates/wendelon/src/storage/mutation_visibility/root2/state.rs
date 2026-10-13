@@ -109,6 +109,7 @@ fn emit_state_body(s: &State2, u: &Usage2, emit: &mut impl FnMut(&[u8])) -> Resu
 	emit(&(u.registry as u64).to_le_bytes());
 	emit_records(s.selectors.values(), s.selectors.len(), emit)?;
 	emit_records(s.authorities.values(), s.authorities.len(), emit)?;
+	emit_records(s.issuers.values(), s.issuers.len(), emit)?;
 	visit_permission_section2(&s.permissions, permission_limits2(), emit).map_err(section_error)?;
 	emit_records(s.lineages.values(), s.lineages.len(), emit)?;
 	emit_records(s.cuts.iter(), s.cuts.len(), emit)?;
@@ -134,8 +135,8 @@ fn encode_state(s: &State2) -> Result2<Vec<u8>> {
 	let body = body.ok_or(RootError2::Overflow)?;
 	let (wire, total) = envelope_size(body, ROOT_BYTES2)?;
 	let mut b = Vec::with_capacity(total);
-	b.extend_from_slice(b"VISAUT03");
-	b.extend_from_slice(&3u16.to_le_bytes());
+	b.extend_from_slice(b"VISAUT04");
+	b.extend_from_slice(&4u16.to_le_bytes());
 	b.extend_from_slice(&[1, 0]);
 	b.extend_from_slice(&wire.to_le_bytes());
 	emit_state_body(s, &u, &mut |part| b.extend_from_slice(part))?;
@@ -212,7 +213,7 @@ impl UnverifiedRoot2 {
 		)
 	}
 	pub fn decode(bytes: &[u8]) -> Result2<Self> {
-		let mut r = Read2::new(open_versioned(bytes, b"VISAUT03", 3, ROOT_BYTES2)?);
+		let mut r = Read2::new(open_versioned(bytes, b"VISAUT04", 4, ROOT_BYTES2)?);
 		let generation = r.array()?;
 		let cluster = r.array()?;
 		let bootstrap = r.log()?;
@@ -234,6 +235,10 @@ impl UnverifiedRoot2 {
 		let authorities = sorted_map(
 			read_vec::<AuthorityRegistration2>(&mut r, REGISTRY_COUNT2, 117)?,
 			|a| authority_key(a.authority),
+		)?;
+		let issuers = sorted_map(
+			read_vec::<IssuerRegistration2>(&mut r, REGISTRY_COUNT2, 77)?,
+			|a| Ok(a.node.to_be_bytes()),
 		)?;
 		let permissions = read_permissions(&mut r)?;
 		let lineages = sorted_map(read_vec::<LineageRecord2>(&mut r, LINEAGES2, 294)?, |g| {
@@ -263,6 +268,7 @@ impl UnverifiedRoot2 {
 			control_len,
 			selectors,
 			authorities,
+			issuers,
 			permissions,
 			lineages,
 			cuts,

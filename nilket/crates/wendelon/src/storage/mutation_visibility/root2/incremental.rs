@@ -47,6 +47,12 @@ impl Derived2 {
 				d.non_grants.insert(l.index, ());
 			}
 		}
+		for a in s.issuers.values() {
+			d.non_grants.insert(a.enrolled.index, ());
+			if let Some(l) = a.revoked {
+				d.non_grants.insert(l.index, ());
+			}
+		}
 		for g in s.lineages.values() {
 			d.nodes.insert(
 				NodeRef2 {
@@ -105,6 +111,7 @@ pub(super) fn cached_capacity(s: &State2, l: Limits2) -> Result2<()> {
 		|| s.cuts.len() > l.cuts
 		|| s.selectors.len() > l.registrations
 		|| s.authorities.len() > l.registrations
+		|| s.issuers.len() > l.registrations
 		|| s.permissions.len() > l.permissions
 		|| permission_section_bytes(s.permissions.len())? > PERMISSION_SECTION_BYTES2
 	{
@@ -145,6 +152,23 @@ pub(super) fn update(old: &State2, next: &mut State2, cmd: &Command2) -> Result2
 				.is_some_and(|a| a.revoked.is_none())
 			{
 				if let Some(l) = next.authorities.get(&key).and_then(|a| a.revoked) {
+					d.non_grants.insert(l.index, ());
+				}
+			}
+		}
+		Command2::EnrollLeaseIssuer { node, .. } => {
+			let key = node.to_be_bytes();
+			if !old.issuers.contains_key(&key) {
+				if let Some(a) = next.issuers.get(&key) {
+					d.usage.registry = add(d.usage.registry, 81)?;
+					d.non_grants.insert(a.enrolled.index, ());
+				}
+			}
+		}
+		Command2::RevokeLeaseIssuer { node } => {
+			let key = node.to_be_bytes();
+			if old.issuers.get(&key).is_some_and(|a| a.revoked.is_none()) {
+				if let Some(l) = next.issuers.get(&key).and_then(|a| a.revoked) {
 					d.non_grants.insert(l.index, ());
 				}
 			}

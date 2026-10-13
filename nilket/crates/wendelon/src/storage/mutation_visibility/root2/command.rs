@@ -3,6 +3,7 @@ use super::admission_registry::{
 	PermissionRecord2, decode_permission_key2, encode_permission_record2,
 };
 use super::{codec::*, types::*, validation::*};
+use crate::storage::mutation_visibility::root2::issuer_registry::valid_node as valid_issuer_node;
 use crate::storage::mutation_visibility::{MutationIdentity, ProofKeyBinding};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -23,6 +24,13 @@ pub enum Command2 {
 		key: Digest2,
 	},
 	RevokeAuthority(AuthorityRef2),
+	EnrollLeaseIssuer {
+		node: u32,
+		key: Digest2,
+	},
+	RevokeLeaseIssuer {
+		node: u32,
+	},
 	Grant {
 		lineage: [u8; 16],
 		incarnation: [u8; 16],
@@ -206,6 +214,17 @@ impl Wire2 for Command2 {
 				b.push(*cause);
 				log(b, *anchor)?
 			}
+			Self::EnrollLeaseIssuer { node, key } => {
+				valid_issuer_node(*node)?;
+				b.push(12);
+				b.extend(node.to_le_bytes());
+				b.extend(key);
+			}
+			Self::RevokeLeaseIssuer { node } => {
+				valid_issuer_node(*node)?;
+				b.push(13);
+				b.extend(node.to_le_bytes());
+			}
 			Self::AdmissionPermission(x) => {
 				inspect_admin_statement2(x).map_err(|_| RootError2::Codec)?;
 				b.push(11);
@@ -305,6 +324,19 @@ impl Wire2 for Command2 {
 				let x: [u8; ADMIN_STATEMENT_BYTES2] = r.array()?;
 				inspect_admin_statement2(&x).map_err(|_| RootError2::Codec)?;
 				Self::AdmissionPermission(x)
+			}
+			12 => {
+				let node = r.u32()?;
+				valid_issuer_node(node)?;
+				Self::EnrollLeaseIssuer {
+					node,
+					key: r.array()?,
+				}
+			}
+			13 => {
+				let node = r.u32()?;
+				valid_issuer_node(node)?;
+				Self::RevokeLeaseIssuer { node }
 			}
 			_ => return Err(RootError2::Codec),
 		})

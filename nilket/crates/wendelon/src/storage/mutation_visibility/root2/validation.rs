@@ -229,8 +229,8 @@ pub(super) fn old_original_fits(old: &OriginalGrant2, latest: &OriginalGrant2) -
 pub(super) fn epoch(s: &State2) -> u64 {
 	s.cuts.last().map_or(s.initial_epoch, |c| c.new)
 }
-/// Fixed header (212) plus six section count words, the permission count included once.
-pub(super) const ROOT_BASE2: usize = 236;
+/// Fixed header (212) plus seven section count words, including issuers and permissions.
+pub(super) const ROOT_BASE2: usize = 240;
 pub(super) fn permission_section_bytes(count: usize) -> Result2<usize> {
 	count
 		.checked_mul(PERMISSION_CHARGE2)
@@ -306,6 +306,12 @@ pub(super) fn usage(s: &State2) -> Result2<Usage2> {
 				.and_then(|m| n.checked_add(m))
 		})
 		.and_then(|n| {
+			s.issuers
+				.len()
+				.checked_mul(81)
+				.and_then(|m| n.checked_add(m))
+		})
+		.and_then(|n| {
 			s.permissions
 				.len()
 				.checked_mul(PERMISSION_CHARGE2)
@@ -329,6 +335,7 @@ pub(super) fn capacity(s: &State2, l: Limits2) -> Result2<()> {
 		|| s.cuts.len() > l.cuts
 		|| s.selectors.len() > l.registrations
 		|| s.authorities.len() > l.registrations
+		|| s.issuers.len() > l.registrations
 		|| s.permissions.len() > l.permissions
 		|| permission_section_bytes(s.permissions.len())? > PERMISSION_SECTION_BYTES2
 	{
@@ -433,6 +440,7 @@ pub(super) fn validate_state(s: &State2) -> Result2<()> {
 			}
 		}
 	}
+	crate::storage::mutation_visibility::root2::issuer_registry::validate(s, &mut coords)?;
 	// Register latest-grant coordinates before closures: a supersession may share
 	// its successor's original grant entry, irrespective of lineage sort order.
 	for g in s.lineages.values() {
@@ -566,6 +574,12 @@ pub(super) fn validate_state(s: &State2) -> Result2<()> {
 		non_grant_coords.insert(a.enrolled.index);
 	}
 	for a in s.authorities.values() {
+		non_grant_coords.insert(a.enrolled.index);
+		if let Some(l) = a.revoked {
+			non_grant_coords.insert(l.index);
+		}
+	}
+	for a in s.issuers.values() {
 		non_grant_coords.insert(a.enrolled.index);
 		if let Some(l) = a.revoked {
 			non_grant_coords.insert(l.index);

@@ -637,3 +637,33 @@ async fn binding_fault_is_retained_and_unavailable_carrier_refuses() {
 mod completion;
 
 mod g2;
+
+#[tokio::test(flavor = "current_thread")]
+async fn issuer_commands_map_to_unsupported_replay_faults() {
+	for (command, kind) in [
+		(
+			Command2::EnrollLeaseIssuer {
+				node: 1,
+				key: [0; 32],
+			},
+			UnsupportedKind2::EnrollLeaseIssuer,
+		),
+		(
+			Command2::RevokeLeaseIssuer { node: 1 },
+			UnsupportedKind2::RevokeLeaseIssuer,
+		),
+	] {
+		let (pin, dep, entries, mut fixtures) = context();
+		fixtures.push(fixture(&entries[3], command, dep));
+		let _scope = Root2FixtureScope::install(fixtures);
+		let mut reader = store(entries).await;
+		let result = ReplayDriver2 {
+			deployment: dep,
+			baseline: Baseline2::Provisioned,
+			pin: &pin,
+		}
+		.compose(&mut reader, &Sources(entry(3).log_id), caps())
+		.await;
+		assert!(matches!(result, Err(ReplayError2::Fault(Fault2::Unsupported(k))) if k == kind));
+	}
+}

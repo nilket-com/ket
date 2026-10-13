@@ -1,4 +1,4 @@
-//! Root profile 3: the permission section, its accounting and the refusal of profile-2 bytes.
+//! Current root profile 4: permission accounting and the frozen profile-2 oracle projection.
 //! States marked "synthetic accounting" exercise arithmetic only and are not authentic roots.
 use super::*;
 use crate::storage::mutation_visibility::MutationScope;
@@ -28,12 +28,12 @@ fn installed(b: &[u8]) -> Root2 {
 	u.fixture_install(g, c, l, fp, hash(b"", b)).unwrap()
 }
 fn body(b: &[u8]) -> Vec<u8> {
-	open_versioned(b, b"VISAUT03", 3, ROOT_BYTES2)
+	open_versioned(b, b"VISAUT04", 4, ROOT_BYTES2)
 		.unwrap()
 		.to_vec()
 }
 fn reseal(body: &[u8]) -> Vec<u8> {
-	envelope_versioned(b"VISAUT03", 3, body, ROOT_BYTES2).unwrap()
+	envelope_versioned(b"VISAUT04", 4, body, ROOT_BYTES2).unwrap()
 }
 fn decode_err(body: &[u8]) -> Option<RootError2> {
 	UnverifiedRoot2::decode(&reseal(body)).err()
@@ -57,11 +57,11 @@ fn with_record(s: &State2, r: PermissionRecord2) -> State2 {
 		.insert(encode_permission_key2(&r.key).unwrap(), r);
 	s
 }
-// Offset of the permission count word in a profile-3 body.
+// Offset of the permission count word after selectors, authorities and issuers.
 fn permission_at(body: &[u8]) -> usize {
 	let mut r = Read2::new(body);
 	r.take(212).unwrap();
-	for _ in 0..2 {
+	for _ in 0..3 {
 		for _ in 0..r.count(4096, 4).unwrap() {
 			r.blob(ROOT_BYTES2).unwrap();
 		}
@@ -78,8 +78,8 @@ fn profile3_goldens_round_trip_and_profile2_bytes_are_refused() {
 		let name = item["name"].as_str().unwrap();
 		let old = unhex(item["hex"].as_str().unwrap());
 		let new = fixture(name);
-		assert_eq!(new.len(), old.len() + 4, "{name}");
-		assert_eq!(&new[..8], b"VISAUT03");
+		assert_eq!(new.len(), old.len() + 8, "{name}");
+		assert_eq!(&new[..8], b"VISAUT04");
 		assert_eq!(
 			UnverifiedRoot2::decode(&new).unwrap().encode().unwrap(),
 			new,
@@ -106,7 +106,7 @@ fn profile3_goldens_round_trip_and_profile2_bytes_are_refused() {
 		UnverifiedAuthority2::decode(&old_origin).err(),
 		Some(RootError2::Codec)
 	);
-	// A profile-3 root with permissions has no profile-2 projection.
+	// A current root with permissions has no profile-2 projection.
 	assert_eq!(
 		super::s1c_oracle::legacy_profile2(&with_permissions()).err(),
 		Some(RootError2::Codec)
@@ -134,7 +134,7 @@ fn permission_section_decodes_bounded_and_maps_errors() {
 	);
 	let body = body(&b);
 	let at = permission_at(&body);
-	assert_eq!(at, 212 + 4 + 4 + 4 + 117);
+	assert_eq!(at, 212 + 4 + 4 + 4 + 117 + 4);
 	let set = |at: usize, x: &[u8]| {
 		let mut b = body.clone();
 		b[at..at + x.len()].copy_from_slice(x);
@@ -282,14 +282,14 @@ fn root_total_and_registry_include_permission_bytes() {
 		s.selectors.len() * 68 + s.authorities.len() * 121 + s.permissions.len() * 117
 	);
 	assert_eq!(u.registry, 355);
-	assert_eq!(ROOT_BASE2, 212 + 6 * 4);
+	assert_eq!(ROOT_BASE2, 212 + 7 * 4);
 	assert_eq!(
 		ROOT_BASE2 - 232,
-		4,
-		"the oracle's base lacks exactly the permission count word"
+		8,
+		"the oracle's base lacks issuer and permission count words"
 	);
 	// Disclosed: with the component caps in force the hard root total cannot be the binding bound,
-	// so 236 versus 232 changes no capacity outcome.
+	// so 240 versus 232 changes no capacity outcome.
 	assert!(PARENT_BYTES2 + HISTORY_BYTES2 + REGISTRY_BYTES2 + ROOT_BASE2 < ROOT_BYTES2);
 	let both = |s: &State2, l: Limits2| {
 		let full = capacity(s, l).err();
@@ -433,7 +433,7 @@ fn bootstrap_and_reduce_keep_permissions_empty() {
 	let v = VerifiedCommand2::fixture(g, c, &boot, &[], 0).unwrap();
 	let (b, _) = Root2::reduce(None, &e, &v, &boot).unwrap();
 	assert_eq!(b.state.permissions.len(), 0);
-	assert_eq!(&b.encode().unwrap()[..8], b"VISAUT03");
+	assert_eq!(&b.encode().unwrap()[..8], b"VISAUT04");
 	let mut r = root("root_reserved");
 	for step in 0..6u8 {
 		let cmd = match step % 3 {

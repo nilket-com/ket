@@ -16,6 +16,7 @@ mod g1c_roundtrip;
 mod goldens;
 mod governance_command;
 mod invariants;
+mod issuer_registry;
 mod lease_payload;
 mod mark_store;
 mod origin;

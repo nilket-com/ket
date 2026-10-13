@@ -161,6 +161,13 @@ pub struct AuthorityRegistration2 {
 	pub revoked: Option<Log2>,
 }
 #[derive(Clone, PartialEq, Eq)]
+pub struct IssuerRegistration2 {
+	pub node: u32,
+	pub key: Digest2,
+	pub enrolled: Log2,
+	pub revoked: Option<Log2>,
+}
+#[derive(Clone, PartialEq, Eq)]
 pub struct EpochCut2 {
 	pub prior: u64,
 	pub new: u64,
@@ -212,6 +219,7 @@ pub(super) struct State2 {
 	pub control_len: u64,
 	pub selectors: Map<[u8; 44], Selector2>,
 	pub authorities: Map<[u8; 24], AuthorityRegistration2>,
+	pub issuers: Map<[u8; 4], IssuerRegistration2>,
 	pub permissions: PermissionMap2,
 	pub lineages: Map<[u8; 16], LineageRecord2>,
 	pub cuts: Cuts2,
@@ -237,6 +245,7 @@ opaque_debug!(
 	ParentRecord2,
 	Selector2,
 	AuthorityRegistration2,
+	IssuerRegistration2,
 	EpochCut2,
 	State2,
 	Usage2

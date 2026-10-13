@@ -293,6 +293,8 @@ fn action_table_matches_current_command_tags_exhaustively() {
 			Command2::EnrollSelector(_) => Some(A::EnrollSelector),
 			Command2::EnrollAuthority { .. } => Some(A::EnrollAuthority),
 			Command2::RevokeAuthority(_) => Some(A::RevokeAuthority),
+			Command2::EnrollLeaseIssuer { .. } => Some(A::EnrollLeaseIssuer),
+			Command2::RevokeLeaseIssuer { .. } => Some(A::RevokeLeaseIssuer),
 			Command2::Grant { .. } => Some(A::Grant),
 			Command2::Release { .. } => Some(A::Release),
 			Command2::Cut { .. } => Some(A::Cut),
@@ -316,7 +318,10 @@ fn action_table_matches_current_command_tags_exhaustively() {
 			seen.insert(a.command_tag());
 		}
 	}
-	assert_eq!(seen.into_iter().collect::<Vec<_>>(), [2, 3, 4, 5, 6, 7, 10]);
+	assert_eq!(
+		seen.into_iter().collect::<Vec<_>>(),
+		[2, 3, 4, 5, 6, 7, 10, 12, 13]
+	);
 	assert_eq!(
 		A::ALL.map(|a| a.command_tag()),
 		[2, 3, 4, 5, 6, 7, 10, 12, 13]

@@ -1,4 +1,4 @@
-//! Frozen current VISAUT03 encoder, compiled only by the state cfg(test) child.
+//! Frozen current VISAUT04 encoder, compiled only by the state cfg(test) child.
 use super::*;
 pub(super) fn encode_state_reference(s: &State2) -> Result2<Vec<u8>> {
 	validate_state(s)?;
@@ -19,6 +19,7 @@ pub(super) fn encode_state_reference(s: &State2) -> Result2<Vec<u8>> {
 	b.extend((u.registry as u64).to_le_bytes());
 	write_vec(&mut b, s.selectors.values().cloned(), s.selectors.len())?;
 	write_vec(&mut b, s.authorities.values().cloned(), s.authorities.len())?;
+	write_vec(&mut b, s.issuers.values().cloned(), s.issuers.len())?;
 	b.extend(
 		crate::storage::mutation_visibility::root2::admission_registry::encode_permission_section2(
 			&s.permissions,
@@ -29,5 +30,5 @@ pub(super) fn encode_state_reference(s: &State2) -> Result2<Vec<u8>> {
 	write_vec(&mut b, s.lineages.values().cloned(), s.lineages.len())?;
 	write_vec(&mut b, s.cuts.iter().cloned(), s.cuts.len())?;
 	write_vec(&mut b, s.parents.values().cloned(), s.parents.len())?;
-	envelope_versioned(b"VISAUT03", 3, &b, ROOT_BYTES2)
+	envelope_versioned(b"VISAUT04", 4, &b, ROOT_BYTES2)
 }

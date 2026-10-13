@@ -657,6 +657,17 @@ fn unsupported_not_applicable_and_precedence() {
 	let o = claim().original;
 	let unsupported = [
 		(
+			Command2::EnrollLeaseIssuer {
+				node: 1,
+				key: [0; 32],
+			},
+			UnsupportedKind2::EnrollLeaseIssuer,
+		),
+		(
+			Command2::RevokeLeaseIssuer { node: 1 },
+			UnsupportedKind2::RevokeLeaseIssuer,
+		),
+		(
 			Command2::EnrollSelector(claim().manifest.binding()),
 			UnsupportedKind2::EnrollSelector,
 		),
