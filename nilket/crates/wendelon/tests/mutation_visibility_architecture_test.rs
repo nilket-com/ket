@@ -3789,6 +3789,7 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 			],
 		),
 		("validation.rs", &["ADMIN_MANIFEST_P2_BYTES2"]),
+		("governance_command.rs", &[]),
 	];
 	// The one new out-of-line test file is excluded only while its declaration is cfg(test).
 	let replay = syn::parse_file(&fs::read_to_string(root.join("replay.rs")).unwrap()).unwrap();
@@ -3962,6 +3963,10 @@ fn profile_two_binding_surface_is_exact() {
 			"Profile"
 		]
 	);
+	let governance = fs::read_to_string(root.join("governance_command.rs")).unwrap();
+	assert_eq!(governance.matches("admin_governance2(admin)").count(), 1);
+	assert_eq!(governance.matches("role.key()").count(), 1);
+	assert_eq!(governance.matches("role.actions()").count(), 1);
 	// The role is copied in install and never read there.
 	for call in [".key()", ".id()", ".actions()"] {
 		assert!(!install.contains(call), "admin_install.rs calls {call}");
@@ -3981,10 +3986,10 @@ fn profile_two_binding_surface_is_exact() {
 				let is_install = p == root.join("admin_install.rs");
 				// Only install reads a manifest's governance role, and only to copy it.
 				assert_eq!(t.contains(".governance()"), is_install, "{}", p.display());
-				// The descriptive accessor has no production caller (only its definition).
+				// One pure governance checker reads the descriptive role; no integration caller.
 				assert_eq!(
 					t.matches("admin_governance2(").count(),
-					usize::from(is_install),
+					usize::from(is_install || p == root.join("governance_command.rs")),
 					"{}",
 					p.display()
 				);
@@ -4156,4 +4161,294 @@ fn dormant_replay_owns_state_and_has_single_site_factories() {
 			.to_string()
 			.contains("fixture")
 	);
+}
+
+#[test]
+fn governance_command_envelope_is_pure_and_unwired() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let root = src.join("storage/mutation_visibility/root2");
+	let text = fs::read_to_string(root.join("governance_command.rs")).unwrap();
+	assert!(text.lines().count() <= 250);
+	let flat = without_test_items_deep(text.parse().unwrap())
+		.to_string()
+		.replace(' ', "");
+	// Identifier tokens only: doc comments are literals and may name the types they exclude.
+	fn idents(tokens: proc_macro2::TokenStream, out: &mut Vec<String>) {
+		for t in tokens {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => out.push(id.to_string()),
+				proc_macro2::TokenTree::Group(g) => idents(g.stream(), out),
+				_ => {}
+			}
+		}
+	}
+	let mut names = Vec::new();
+	idents(without_test_items_deep(text.parse().unwrap()), &mut names);
+	for banned in [
+		"SigningKey",
+		"Signer",
+		"sign",
+		"fs",
+		"io",
+		"net",
+		"tokio",
+		"spawn",
+		"Instant",
+		"SystemTime",
+		"unsafe",
+		"serde",
+		"VerifiedCommand2",
+		"TrustedEntry2",
+		"CommittedEntry2",
+		"Root2",
+		"install_admin2",
+	] {
+		assert!(
+			!names.iter().any(|n| n == banned),
+			"governance_command.rs: {banned}"
+		);
+	}
+	assert_eq!(flat.matches("!permits(role.actions(),action)").count(), 1);
+	// The checked token: declared, given accessors, and constructed exactly once, inside the check.
+	assert_eq!(flat.matches("(CheckedGovernanceCommand2{").count(), 1);
+	assert!(fn_body(&text, "check_governance_command2").contains("Ok(CheckedGovernanceCommand2 {"));
+	assert_eq!(flat.matches("verify_strict(").count(), 1);
+	let file: syn::File = syn::parse2(without_test_items_deep(text.parse().unwrap())).unwrap();
+	let (mut types, mut exported, mut private, mut consts) = (vec![], vec![], vec![], vec![]);
+	for item in &file.items {
+		match item {
+			syn::Item::Fn(f) if root2_scoped(&f.vis) => exported.push(f.sig.ident.to_string()),
+			syn::Item::Fn(f) => {
+				assert!(matches!(f.vis, syn::Visibility::Inherited));
+				private.push(f.sig.ident.to_string())
+			}
+			syn::Item::Enum(e) => {
+				assert!(root2_scoped(&e.vis));
+				types.push(e.ident.to_string())
+			}
+			syn::Item::Struct(s) => {
+				assert!(root2_scoped(&s.vis));
+				assert!(
+					s.attrs.iter().all(|a| !a.path().is_ident("derive")),
+					"no derive"
+				);
+				for f in &s.fields {
+					assert!(
+						matches!(f.vis, syn::Visibility::Inherited),
+						"private fields"
+					);
+				}
+				types.push(s.ident.to_string())
+			}
+			syn::Item::Const(c) => consts.push((c.ident.to_string(), root2_scoped(&c.vis))),
+			syn::Item::Impl(i) => {
+				assert!(i.trait_.is_none());
+				let syn::Type::Path(ty) = i.self_ty.as_ref() else {
+					panic!("named impl type required")
+				};
+				let name = ty.path.get_ident().expect("single type name").to_string();
+				let mut methods = Vec::new();
+				let mut associated = Vec::new();
+				for item in &i.items {
+					match item {
+						syn::ImplItem::Fn(f) => {
+							assert!(root2_scoped(&f.vis));
+							methods.push(f.sig.ident.to_string());
+						}
+						syn::ImplItem::Const(c) => {
+							assert!(root2_scoped(&c.vis));
+							associated.push(c.ident.to_string());
+						}
+						_ => panic!("unexpected associated item"),
+					}
+				}
+				methods.sort();
+				associated.sort();
+				match name.as_str() {
+					"GovernanceAction2" => {
+						assert_eq!(methods, ["bit", "command_tag"]);
+						assert_eq!(associated, ["ALL"]);
+					}
+					"CheckedGovernanceCommand2" => {
+						assert_eq!(methods, ["action", "command_digest", "context"]);
+						assert!(associated.is_empty());
+					}
+					_ => panic!("unexpected impl"),
+				}
+			}
+			syn::Item::Use(_) | syn::Item::Macro(_) => {}
+			_ => panic!("governance_command.rs: unexpected item"),
+		}
+	}
+	types.sort();
+	exported.sort();
+	private.sort();
+	consts.sort();
+	assert_eq!(
+		types,
+		[
+			"CheckedGovernanceCommand2",
+			"GovernanceAction2",
+			"GovernanceCommandError2",
+			"GovernanceField2"
+		]
+	);
+	assert_eq!(
+		exported,
+		[
+			"check_governance_command2",
+			"encode_governance_command2",
+			"governance_command_preimage2"
+		]
+	);
+	assert_eq!(
+		private,
+		[
+			"array",
+			"check_context",
+			"parse",
+			"permits",
+			"u64_at",
+			"write"
+		]
+	);
+	assert_eq!(
+		consts,
+		[
+			("DOMAIN".to_string(), false),
+			("GOVERNANCE_COMMAND_BYTES2".to_string(), true),
+			("MAGIC".to_string(), false),
+			("SIGNED".to_string(), false),
+			("VERSION".to_string(), false)
+		]
+	);
+	// Dormant: nothing outside the module and the root2 tests names its surface.
+	let modules = fs::read_to_string(root.join("mod.rs")).unwrap();
+	assert!(modules.contains("#[allow(dead_code)] // Dormant pure governance check; no production caller.\nmod governance_command;"));
+	let tests = root.join("tests");
+	let mut stack = vec![src];
+	while let Some(dir) = stack.pop() {
+		for e in fs::read_dir(dir).unwrap() {
+			let p = e.unwrap().path();
+			if p.is_dir() {
+				if p != tests {
+					stack.push(p);
+				}
+			} else if p.extension().is_some_and(|x| x == "rs")
+				&& !p.ends_with("root2/governance_command.rs")
+			{
+				let t = fs::read_to_string(&p).unwrap();
+				for name in [
+					"check_governance_command2",
+					"governance_command_preimage2",
+					"encode_governance_command2",
+					"CheckedGovernanceCommand2",
+					"GovernanceCommandError2",
+					"root2::governance_command",
+				] {
+					assert!(
+						!t.contains(name),
+						"production caller of {name} in {}",
+						p.display()
+					);
+				}
+			}
+		}
+	}
+}
+
+#[test]
+fn lease_payload_is_pure_and_unwired() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let root = src.join("storage/mutation_visibility/root2");
+	let path = root.join("lease_payload.rs");
+	let text = fs::read_to_string(&path).unwrap();
+	let tokens = without_test_items_deep(text.parse().unwrap());
+	fn idents(tokens: proc_macro2::TokenStream, out: &mut Vec<String>) {
+		for t in tokens {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => out.push(id.to_string()),
+				proc_macro2::TokenTree::Group(g) => idents(g.stream(), out),
+				_ => {}
+			}
+		}
+	}
+	let mut names = Vec::new();
+	idents(tokens.clone(), &mut names);
+	for banned in [
+		"fs",
+		"io",
+		"net",
+		"tokio",
+		"spawn",
+		"Instant",
+		"SystemTime",
+		"unsafe",
+		"serde",
+		"Signer",
+		"SigningKey",
+		"sign",
+		"Command2",
+		"State2",
+		"Root2",
+		"VerifiedCommand2",
+		"TrustedEntry2",
+		"CommittedEntry2",
+		"reducer",
+		"bytemuck",
+	] {
+		assert!(!names.iter().any(|n| n == banned), "{banned}");
+	}
+	let flat = tokens.to_string().replace(' ', "");
+	assert_eq!(flat.matches("verify_strict(").count(), 1);
+	let file: syn::File = syn::parse2(tokens).unwrap();
+	let (mut types, mut exported, mut constants) = (vec![], vec![], vec![]);
+	for item in file.items {
+		match item {
+			syn::Item::Enum(e) => {
+				assert!(root2_scoped(&e.vis));
+				types.push(e.ident.to_string());
+			}
+			syn::Item::Fn(f) => {
+				assert!(root2_scoped(&f.vis));
+				exported.push(f.sig.ident.to_string());
+			}
+			syn::Item::Const(c) => {
+				assert!(root2_scoped(&c.vis));
+				constants.push(c.ident.to_string());
+			}
+			syn::Item::Use(_) => {}
+			_ => panic!("unexpected lease module item"),
+		}
+	}
+	types.sort();
+	exported.sort();
+	constants.sort();
+	assert_eq!(types, ["LeasePayloadError2"]);
+	assert_eq!(exported, ["lease_payload2", "verify_issuer_signature2"]);
+	assert_eq!(constants, ["LEASE_PAYLOAD_BYTES2"]);
+	let modules = fs::read_to_string(root.join("mod.rs")).unwrap();
+	assert!(modules.contains("#[allow(dead_code)] // Dormant pure lease payload check; no production caller.\nmod lease_payload;"));
+	let mut stack = vec![src];
+	while let Some(dir) = stack.pop() {
+		for e in fs::read_dir(dir).unwrap() {
+			let p = e.unwrap().path();
+			if p.is_dir() {
+				if p != root.join("tests") {
+					stack.push(p);
+				}
+			} else if p.extension().is_some_and(|x| x == "rs") && p != path {
+				let t = fs::read_to_string(&p).unwrap();
+				for name in [
+					"lease_payload2",
+					"verify_issuer_signature2",
+					"LeasePayloadError2",
+					"LEASE_PAYLOAD_BYTES2",
+					"root2::lease_payload",
+				] {
+					assert!(!t.contains(name), "{} names {name}", p.display());
+				}
+			}
+		}
+	}
 }
