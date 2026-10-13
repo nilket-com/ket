@@ -204,7 +204,7 @@ impl WendelonDataServer {
 		.await?;
 		let outcome = WriteOutcome::FinalizationCommitted { response, trailing };
 		self.idempotency.insert(
-			Self::idempotency_key_for(record.write_id),
+			Self::idempotency_key_for(record.finalization.tenant_id, record.write_id),
 			CachedWriteOutcome::new(outcome),
 		);
 		self.cdc_release_pending_finalization(record.id).await;

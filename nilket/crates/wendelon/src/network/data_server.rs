@@ -224,7 +224,7 @@ mod streaming;
 use counter::{CounterParticipantFactory, CounterReplicaNetworkTransport};
 use descriptor_migration::MigrationRegistry;
 
-type IdempotencyKey = ([u8; 16], u64);
+type IdempotencyKey = (u64, [u8; 16], u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DataOperation {
@@ -2746,8 +2746,11 @@ impl WendelonDataServer {
 		.max(1);
 	}
 
-	fn idempotency_key_for(write_id: crate::schema::ClientWriteId) -> IdempotencyKey {
-		(write_id.client_uuid, write_id.sequence_no)
+	fn idempotency_key_for(
+		tenant_id: TenantId,
+		write_id: crate::schema::ClientWriteId,
+	) -> IdempotencyKey {
+		(tenant_id.get(), write_id.client_uuid, write_id.sequence_no)
 	}
 
 	fn pending_finalization_record(
@@ -3081,6 +3084,7 @@ impl WendelonDataServer {
 
 	async fn replay_write_outcome(
 		&self,
+		tenant_id: TenantId,
 		outcome: WriteOutcome,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
 		if let WriteOutcome::FinalizationRecoverablePending {
@@ -3137,7 +3141,10 @@ impl WendelonDataServer {
 				}
 			} else if let Some(cached) = self
 				.idempotency
-				.get(&Self::idempotency_key_for(response.echoed_write_id))
+				.get(&Self::idempotency_key_for(
+					tenant_id,
+					response.echoed_write_id,
+				))
 				.map(|entry| *entry.value())
 			{
 				match cached.outcome() {
@@ -8492,7 +8499,7 @@ impl WendelonDataServer {
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
 		self.observe_node_mutation(async {
 
-		let key = Self::idempotency_key_for(meta.write_id);
+		let key = Self::idempotency_key_for(meta.tenant_id, meta.write_id);
 
 		// Non-primary redirect must happen before the fresh-leader
 		// orphan-witness sweep. A node that does not own this range
@@ -8543,7 +8550,7 @@ impl WendelonDataServer {
 			let outcome = self.recoverable_pending_outcome_for_record(&record);
 			self.idempotency
 				.insert(key, CachedWriteOutcome::new(outcome));
-			return self.replay_write_outcome(outcome).await;
+			return self.replay_write_outcome(meta.tenant_id, outcome).await;
 		}
 
 		// Per-range lease gate (plan 018). When enabled, this node
@@ -8856,7 +8863,7 @@ impl WendelonDataServer {
 			bifurcated.parent_key_identity,
 			bifurcated.charged_bytes,
 		);
-		let key = Self::idempotency_key_for(meta.parent_write_id);
+		let key = Self::idempotency_key_for(meta.tenant_id, meta.parent_write_id);
 		if let Some(replayed) = self.durable_mutation_replay(&meta).await? {
 			return Ok(replayed);
 		}
@@ -8918,7 +8925,7 @@ impl WendelonDataServer {
 			let outcome = self.recoverable_pending_outcome_for_record(&record);
 			self.idempotency
 				.insert(key, CachedWriteOutcome::new(outcome));
-			return self.replay_write_outcome(outcome).await;
+			return self.replay_write_outcome(meta.tenant_id, outcome).await;
 		}
 
 		if self.lease_gate_enabled {
@@ -9306,9 +9313,11 @@ impl WendelonDataServer {
 				));
 			}
 
-			let key = Self::idempotency_key_for(meta.parent_write_id);
+			let key = Self::idempotency_key_for(meta.tenant_id, meta.parent_write_id);
 			if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
-				let (write, trailing) = self.replay_write_outcome(cached.outcome()).await?;
+				let (write, trailing) = self
+					.replay_write_outcome(meta.tenant_id, cached.outcome())
+					.await?;
 				return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
 			}
 			if let Some((write, trailing)) = self.durable_mutation_replay(&meta).await? {
@@ -9823,7 +9832,7 @@ impl WendelonDataServer {
 				));
 			}
 
-			let key = Self::idempotency_key_for(meta.parent_write_id);
+			let key = Self::idempotency_key_for(meta.tenant_id, meta.parent_write_id);
 			if let Some(cached) = self
 				.table_delete_idempotency
 				.get(&key)
@@ -10216,9 +10225,11 @@ impl DataRing for WendelonDataServer {
 			}
 
 			// 3. Idempotency fast path.
-			let key = Self::idempotency_key_for(meta.write_id);
+			let key = Self::idempotency_key_for(meta.tenant_id, meta.write_id);
 			if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
-				return self.replay_write_outcome(cached.outcome()).await;
+				return self
+					.replay_write_outcome(meta.tenant_id, cached.outcome())
+					.await;
 			}
 
 			if self.degraded_reason().is_some() {
