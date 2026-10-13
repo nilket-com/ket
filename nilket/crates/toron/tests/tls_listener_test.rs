@@ -2,7 +2,7 @@ use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rcgen::{
 	BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -34,7 +34,12 @@ use toron::wire::{
 	TaskCancelledPayload, WireEnvelope, decode_payload, encode_payload,
 };
 
+#[path = "../src/test_support/test_dir.rs"]
+mod test_dir;
+use test_dir::{PendingTeardown, TEST_TEARDOWN_BOUND, TestDir};
+
 struct TestPki {
+	scratch: PendingTeardown,
 	ca_cert: PathBuf,
 	daemon_cert: PathBuf,
 	daemon_key: PathBuf,
@@ -98,7 +103,13 @@ async fn remote_sql_listener_accepts_client_san_and_rejects_toron_san() {
 		panic!("SQL listener accepted toron-* daemon cert: {message:?}");
 	}
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("daemon teardown within test ceiling")
+		.expect("shutdown daemon");
+	pki.scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test]
@@ -132,7 +143,13 @@ async fn remote_worker_task_listener_accepts_toron_peer_san() {
 	assert_eq!(response.identity, EnvelopeIdentity::task(identity));
 	assert_eq!(cancelled.identity, identity);
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("daemon teardown within test ceiling")
+		.expect("shutdown daemon");
+	pki.scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test]
@@ -165,7 +182,13 @@ async fn remote_worker_task_listener_rejects_client_san() {
 		panic!("worker listener accepted client-* cert: {response:?}");
 	}
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("daemon teardown within test ceiling")
+		.expect("shutdown daemon");
+	pki.scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test]
@@ -198,7 +221,13 @@ async fn remote_worker_task_listener_rejects_subdomain_injection_san() {
 		panic!("worker listener accepted subdomain SAN: {response:?}");
 	}
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("daemon teardown within test ceiling")
+		.expect("shutdown daemon");
+	pki.scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test]
@@ -262,7 +291,13 @@ async fn remote_sql_listener_rejects_malformed_client_sans_and_unknown_ca() {
 		other => panic!("unexpected SQL response after rejected handshakes: {other:?}"),
 	}
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("daemon teardown within test ceiling")
+		.expect("shutdown daemon");
+	pki.scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test]
@@ -295,7 +330,13 @@ async fn remote_sql_listener_rejects_multiple_valid_client_tenant_sans() {
 		panic!("SQL listener accepted ambiguous client tenant cert: {message:?}");
 	}
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("daemon teardown within test ceiling")
+		.expect("shutdown daemon");
+	pki.scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test]
@@ -312,6 +353,9 @@ async fn daemon_rejects_wildcard_listener_cert() {
 		"tls listener cert SAN does not match node.worker_id",
 	)
 	.await;
+	pki.scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test]
@@ -329,6 +373,9 @@ async fn daemon_rejects_listener_cert_for_different_worker_id() {
 		"tls listener cert SAN does not match node.worker_id",
 	)
 	.await;
+	pki.scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test]
@@ -346,6 +393,9 @@ async fn daemon_rejects_non_pkcs8_listener_key() {
 		"tls listener_key must be unencrypted PEM PKCS#8",
 	)
 	.await;
+	pki.scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test]
@@ -367,12 +417,18 @@ async fn daemon_rejects_encrypted_listener_key() {
 		"tls listener_key must be unencrypted PEM PKCS#8",
 	)
 	.await;
+	pki.scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 async fn expect_daemon_start_error_contains(config: ToronBootstrapConfig, expected: &str) {
 	match ToronDaemon::start(config).await {
 		Ok(daemon) => {
-			daemon.shutdown().await.expect("shutdown unexpected daemon");
+			tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+				.await
+				.expect("daemon teardown within test ceiling")
+				.expect("shutdown unexpected daemon");
 			panic!("daemon start unexpectedly succeeded");
 		}
 		Err(error) => assert!(error.to_string().contains(expected), "{error}"),
@@ -447,6 +503,7 @@ impl TestPki {
 			subdomain_daemon_key: dir.join("subdomain-daemon.key"),
 			unknown_ca_client_cert: dir.join("unknown-ca-client.pem"),
 			unknown_ca_client_key: dir.join("unknown-ca-client.key"),
+			scratch: dir.pending(),
 		};
 		std::fs::write(&pki.ca_cert, ca.serialize_pem().expect("CA PEM")).expect("write CA");
 		write_signed_cert(&pki.daemon_cert, &pki.daemon_key, &daemon, &ca);
@@ -735,12 +792,6 @@ fn connectable_loopback_addr(addr: SocketAddr) -> SocketAddr {
 	SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
 }
 
-fn fresh_dir(tag: &str) -> PathBuf {
-	let nanos = SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.expect("system time after epoch")
-		.as_nanos();
-	let dir = std::env::temp_dir().join(format!("{tag}-{}-{nanos}", std::process::id()));
-	std::fs::create_dir_all(&dir).expect("create temp dir");
-	dir
+fn fresh_dir(tag: &str) -> TestDir {
+	TestDir::new(&format!("{tag}-owned"))
 }
