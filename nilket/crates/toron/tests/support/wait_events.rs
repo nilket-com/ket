@@ -725,6 +725,42 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ObservedStream<S> {
 }
 
 #[cfg(test)]
+#[path = "../../src/test_support/test_dir.rs"]
+mod test_dir;
+
+/// A fixture-owned log: no scratch deletion until every caller's log holder has ended.
+#[cfg(test)]
+pub(crate) struct OwnedLog {
+	log: Arc<EventLog>,
+	dir: test_dir::PendingTeardown,
+}
+
+#[cfg(test)]
+impl OwnedLog {
+	pub(crate) fn new(prefix: &str) -> (Self, Arc<EventLog>, std::path::PathBuf) {
+		let dir = test_dir::TestDir::new(prefix);
+		let path = dir.join("events.jsonl");
+		let log = EventLog::create(&path).expect("fresh log");
+		let owner = Self {
+			log: log.clone(),
+			dir: dir.pending(),
+		};
+		(owner, log, path)
+	}
+
+	pub(crate) async fn finish(self) {
+		let Self { log, dir } = self;
+		assert_eq!(
+			Arc::strong_count(&log),
+			1,
+			"log holders remain; scratch retained"
+		);
+		drop(log);
+		dir.complete(async { Ok::<_, ()>(()) }).await;
+	}
+}
+
+#[cfg(test)]
 mod observer_tests {
 	use super::*;
 	use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -787,14 +823,8 @@ mod observer_tests {
 		}
 	}
 
-	fn fresh_log() -> (Arc<EventLog>, std::path::PathBuf) {
-		static NEXT: AtomicU64 = AtomicU64::new(0);
-		let path = std::env::temp_dir().join(format!(
-			"adr626-observer-{}-{}.jsonl",
-			std::process::id(),
-			NEXT.fetch_add(1, Ordering::Relaxed)
-		));
-		(EventLog::create(&path).expect("fresh log"), path)
+	fn fresh_log() -> (OwnedLog, Arc<EventLog>, std::path::PathBuf) {
+		OwnedLog::new("adr626-observer-owned")
 	}
 
 	fn read_events(path: &std::path::Path) -> Vec<serde_json::Value> {
@@ -895,7 +925,7 @@ mod observer_tests {
 	/// from its own start, and nothing claims it resolved or failed.
 	#[tokio::test]
 	async fn a_dial_dropped_before_it_resolves_is_recorded_as_abandoned() {
-		let (log, path) = fresh_log();
+		let (owner, log, path) = fresh_log();
 		let transport = ObservedTransport {
 			inner: Arc::new(NeverResolves),
 			log: log.clone(),
@@ -908,13 +938,16 @@ mod observer_tests {
 				.is_err()
 		);
 		assert_abandoned_once(&log, &path);
+		drop(transport);
+		drop(log);
+		owner.finish().await;
 	}
 
 	/// ADR 627: a known-pending dial, polled once and then dropped, records the same single
 	/// abandonment; no wall-clock trigger is involved.
 	#[tokio::test]
 	async fn a_pending_dial_polled_once_then_dropped_is_recorded_as_abandoned() {
-		let (log, path) = fresh_log();
+		let (owner, log, path) = fresh_log();
 		let transport = ObservedTransport {
 			inner: Arc::new(NeverResolves),
 			log: log.clone(),
@@ -924,11 +957,14 @@ mod observer_tests {
 		assert!(futures::poll!(dial.as_mut()).is_pending());
 		drop(dial);
 		assert_abandoned_once(&log, &path);
+		drop(transport);
+		drop(log);
+		owner.finish().await;
 	}
 
 	#[tokio::test]
 	async fn fragmented_header_and_payload_yield_one_frame_with_its_envelope() {
-		let (log, path) = fresh_log();
+		let (owner, log, path) = fresh_log();
 		let bytes = frame(MessageKind::PartitionData, 3000);
 		let chunks = vec![
 			Ok(bytes[..1].to_vec()),
@@ -953,11 +989,12 @@ mod observer_tests {
 		assert_eq!(envelope[0]["identity"]["partition"]["producer_task"], 3);
 		assert_eq!(named(&events, "stream_end")[0]["reason"], "eof");
 		assert_eq!(named(&events, "stream_end")[0]["partial_read_frame"], false);
+		owner.finish().await;
 	}
 
 	#[tokio::test]
 	async fn several_frames_in_one_read_are_each_reported() {
-		let (log, path) = fresh_log();
+		let (owner, log, path) = fresh_log();
 		let mut bytes = frame(MessageKind::PartitionMissing, 0);
 		bytes.extend(frame(MessageKind::PartitionData, 10));
 		bytes.extend(frame(MessageKind::PartitionData, 20));
@@ -980,11 +1017,12 @@ mod observer_tests {
 			kinds,
 			vec!["PartitionMissing", "PartitionData", "PartitionData"]
 		);
+		owner.finish().await;
 	}
 
 	#[tokio::test]
 	async fn a_read_error_is_forwarded_and_marks_the_partial_frame() {
-		let (log, path) = fresh_log();
+		let (owner, log, path) = fresh_log();
 		let bytes = frame(MessageKind::PartitionData, 100);
 		let chunks = vec![
 			Ok(bytes[..20].to_vec()),
@@ -1001,11 +1039,12 @@ mod observer_tests {
 		let end = named(&read_events(&path), "stream_end")[0].clone();
 		assert_eq!(end["reason"], "read_error");
 		assert_eq!(end["partial_read_frame"], true);
+		owner.finish().await;
 	}
 
 	#[tokio::test]
 	async fn a_dropped_stream_ends_once_and_a_zero_capacity_read_is_not_eof() {
-		let (log, path) = fresh_log();
+		let (owner, log, path) = fresh_log();
 		let mut stream = ObservedStream::new(script(vec![Ok(vec![1, 2])]), log, "pull", 1);
 		let mut empty = [0u8; 0];
 		let read = stream.read(&mut empty).await.expect("zero-capacity read");
@@ -1017,11 +1056,12 @@ mod observer_tests {
 			.collect::<Vec<_>>();
 		assert_eq!(ends.len(), 1);
 		assert_eq!(ends[0]["reason"], "dropped");
+		owner.finish().await;
 	}
 
 	#[tokio::test]
 	async fn written_frames_are_decoded_and_write_errors_forwarded() {
-		let (log, path) = fresh_log();
+		let (owner, log, path) = fresh_log();
 		let request = frame(MessageKind::PullPartition, 8);
 		let mut stream = ObservedStream::new(script(Vec::new()), log.clone(), "pull", 1);
 		stream.write_all(&request[..3]).await.expect("write");
@@ -1038,7 +1078,10 @@ mod observer_tests {
 		);
 		assert_eq!(named(&events, "frame_payload_written").len(), 1);
 
-		let (log, path) = fresh_log();
+		drop(log);
+		owner.finish().await;
+
+		let (owner, log, path) = fresh_log();
 		let mut failing = script(Vec::new());
 		failing.write_error = Some(std::io::ErrorKind::BrokenPipe);
 		let mut stream = ObservedStream::new(failing, log, "pull", 2);
@@ -1049,11 +1092,12 @@ mod observer_tests {
 			named(&read_events(&path), "stream_end")[0]["reason"],
 			"write_error"
 		);
+		owner.finish().await;
 	}
 
 	#[tokio::test]
 	async fn interval_fields_are_exact_differences_of_captured_instants() {
-		let (log, path) = fresh_log();
+		let (owner, log, path) = fresh_log();
 		let bytes = frame(MessageKind::PartitionData, 50_000);
 		let chunks = bytes.chunks(4096).map(|chunk| Ok(chunk.to_vec())).collect();
 		let mut stream = ObservedStream::new(script(chunks), log, "pull", 1);
@@ -1070,5 +1114,6 @@ mod observer_tests {
 		for event in &events {
 			assert!(event["emitted_us"].as_u64() >= event["at_us"].as_u64());
 		}
+		owner.finish().await;
 	}
 }

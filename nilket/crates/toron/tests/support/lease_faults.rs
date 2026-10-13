@@ -402,14 +402,12 @@ mod gate_tests {
 	use super::*;
 	use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-	fn log() -> (Arc<EventLog>, std::path::PathBuf) {
-		static NEXT: AtomicU64 = AtomicU64::new(0);
-		let path = std::env::temp_dir().join(format!(
-			"adr628-gates-{}-{}.jsonl",
-			std::process::id(),
-			NEXT.fetch_add(1, Ordering::Relaxed)
-		));
-		(EventLog::create(&path).expect("fresh log"), path)
+	fn log() -> (
+		crate::wait_events::OwnedLog,
+		Arc<EventLog>,
+		std::path::PathBuf,
+	) {
+		crate::wait_events::OwnedLog::new("adr628-gates-owned")
 	}
 
 	fn events(path: &std::path::Path) -> Vec<serde_json::Value> {
@@ -433,7 +431,7 @@ mod gate_tests {
 	/// is delayed exactly once per stream, released at its delay.
 	#[tokio::test(start_paused = true)]
 	async fn a_gated_stream_delays_each_phase_once_and_passes_bytes_unchanged() {
-		let (log, path) = log();
+		let (owner, log, path) = log();
 		let (client, mut peer) = tokio::io::duplex(64);
 		let mut stream = PhaseDelayStream::wrap(
 			Box::new(client),
@@ -476,12 +474,15 @@ mod gate_tests {
 			.map(|e| e["phase"].as_str().expect("phase").to_string())
 			.collect::<Vec<_>>();
 		assert_eq!(phases, ["write", "read", "close"]);
+		drop(stream);
+		drop(log);
+		owner.finish().await;
 	}
 
 	/// A stream dropped while a gate sleeps records the phase as cancelled, not released.
 	#[tokio::test(start_paused = true)]
 	async fn a_stream_dropped_mid_delay_records_the_phase_as_cancelled() {
-		let (log, path) = log();
+		let (owner, log, path) = log();
 		let (client, _peer) = tokio::io::duplex(64);
 		let mut stream = PhaseDelayStream::wrap(
 			Box::new(client),
@@ -508,13 +509,15 @@ mod gate_tests {
 			),
 			(Some("write"), Some(3))
 		);
+		drop(log);
+		owner.finish().await;
 	}
 
 	/// The read gate stashes what arrived early and delivers it, in order, once released; stashed,
 	/// delivered and discarded byte counts reconcile (no loss, no double delivery).
 	#[tokio::test(start_paused = true)]
 	async fn early_bytes_are_stashed_and_delivered_after_the_read_gate() {
-		let (log, path) = log();
+		let (owner, log, path) = log();
 		let (client, mut peer) = tokio::io::duplex(1024);
 		let mut stream =
 			PhaseDelayStream::wrap(Box::new(client), delays(0, 100, 0), log, "t".into(), 0);
@@ -535,12 +538,13 @@ mod gate_tests {
 		assert_eq!(sum("fault_read_delivered"), 11);
 		drop(stream);
 		assert_eq!(sum("fault_read_discarded"), 0);
+		owner.finish().await;
 	}
 
 	/// Cancelled while bytes are withheld: they are recorded as discarded, never as delivered.
 	#[tokio::test(start_paused = true)]
 	async fn bytes_withheld_at_cancellation_are_discarded_not_delivered() {
-		let (log, path) = log();
+		let (owner, log, path) = log();
 		let (client, mut peer) = tokio::io::duplex(1024);
 		let mut stream =
 			PhaseDelayStream::wrap(Box::new(client), delays(0, 1_000, 0), log, "t".into(), 0);
@@ -573,5 +577,6 @@ mod gate_tests {
 				.iter()
 				.any(|e| e["event"] == "fault_phase_cancelled" && e["phase"] == "read")
 		);
+		owner.finish().await;
 	}
 }
