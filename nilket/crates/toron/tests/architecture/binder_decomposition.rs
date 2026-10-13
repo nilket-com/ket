@@ -492,6 +492,8 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/tests/support/lease_faults.rs",
 				"crates/toron/tests/support/wait_events.rs",
 				"crates/toron/tests/support/reliance_faults.rs",
+				// TL2 test-only owned scratch guard, cfg(test)/#[path]-included; no binder decomposition surface.
+				"crates/toron/src/test_support/test_dir.rs",
 			];
 			*path != "crates/toron/src/binder.rs"
 				&& !path.starts_with("crates/toron/src/binder/")

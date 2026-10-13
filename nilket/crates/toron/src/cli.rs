@@ -847,8 +847,9 @@ fn print_usage(program: &str) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::test_dir::{PendingTeardown, TEST_TEARDOWN_BOUND, TestDir};
 	use std::net::{IpAddr, Ipv4Addr};
-	use std::time::{Duration, SystemTime, UNIX_EPOCH};
+	use std::time::Duration;
 
 	use rcgen::{
 		BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -1081,6 +1082,7 @@ mod tests {
 	}
 
 	struct CliSqlPki {
+		scratch: PendingTeardown,
 		ca_cert: PathBuf,
 		wrong_ca_cert: PathBuf,
 		daemon_cert: PathBuf,
@@ -1117,6 +1119,7 @@ mod tests {
 				daemon_key: dir.join("daemon.key"),
 				client_cert: dir.join("client.pem"),
 				client_key: dir.join("client.key"),
+				scratch: dir.pending(),
 			};
 			std::fs::write(&pki.ca_cert, ca.serialize_pem().expect("CA PEM")).expect("write CA");
 			std::fs::write(
@@ -1258,15 +1261,8 @@ mod tests {
 		}
 	}
 
-	fn fresh_sql_cli_dir() -> PathBuf {
-		let nanos = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.expect("system time after epoch")
-			.as_nanos();
-		let dir =
-			std::env::temp_dir().join(format!("toron-sql-cli-{}-{nanos}", std::process::id()));
-		std::fs::create_dir_all(&dir).expect("create temp dir");
-		dir
+	fn fresh_sql_cli_dir() -> TestDir {
+		TestDir::new("toron-sql-cli-owned")
 	}
 
 	fn ca_cert() -> Certificate {
@@ -1308,6 +1304,7 @@ mod tests {
 	}
 
 	struct CliInspectPki {
+		scratch: PendingTeardown,
 		ca_cert: PathBuf,
 		daemon_cert: PathBuf,
 		daemon_key: PathBuf,
@@ -1344,6 +1341,7 @@ mod tests {
 				monitor_key: dir.join("monitor.key"),
 				client_cert: dir.join("client.pem"),
 				client_key: dir.join("client.key"),
+				scratch: dir.pending(),
 			};
 			std::fs::write(&pki.ca_cert, ca.serialize_pem().expect("CA PEM")).expect("write CA");
 			write_signed_cert(&pki.daemon_cert, &pki.daemon_key, &daemon, &ca);
@@ -1412,15 +1410,8 @@ mod tests {
 		}
 	}
 
-	fn fresh_inspect_cli_dir() -> PathBuf {
-		let nanos = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.expect("system time after epoch")
-			.as_nanos();
-		let dir =
-			std::env::temp_dir().join(format!("toron-inspectcli-{}-{nanos}", std::process::id()));
-		std::fs::create_dir_all(&dir).expect("create temp dir");
-		dir
+	fn fresh_inspect_cli_dir() -> TestDir {
+		TestDir::new("toron-inspectcli-owned")
 	}
 
 	fn readiness_snapshot(
@@ -1607,13 +1598,20 @@ mod tests {
 		);
 
 		let response = fetch_ready(&options).await.expect("ready response");
-		let request = handle.await.expect("ready server task").expect("request");
+		let request = tokio::time::timeout(TEST_TEARDOWN_BOUND, handle)
+			.await
+			.expect("response task within test teardown ceiling")
+			.expect("ready server task")
+			.expect("request");
 		let request = String::from_utf8(request).expect("request utf8");
 
 		assert_eq!(response.body, body);
 		assert_eq!(response.snapshot, readiness_snapshot(true, None));
 		assert!(request.starts_with("GET /ready HTTP/1.1\r\n"));
 		assert!(request.contains(&format!("Host: {}\r\n", options.endpoint)));
+		pki.scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test]
@@ -1638,13 +1636,20 @@ mod tests {
 		);
 
 		let response = fetch_ready(&options).await.expect("ready response");
-		let request = handle.await.expect("ready server task").expect("request");
+		let request = tokio::time::timeout(TEST_TEARDOWN_BOUND, handle)
+			.await
+			.expect("response task within test teardown ceiling")
+			.expect("ready server task")
+			.expect("request");
 		let request = String::from_utf8(request).expect("request utf8");
 
 		assert_eq!(response.body, body);
 		assert_eq!(response.snapshot, readiness_snapshot(true, None));
 		assert!(request.starts_with("GET /ready HTTP/1.1\r\n"));
 		assert!(request.contains(&format!("Host: {}\r\n", options.endpoint)));
+		pki.scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test]
@@ -1670,8 +1675,9 @@ mod tests {
 		))
 		.await;
 		assert_eq!(ready_exit, ExitCode::SUCCESS);
-		ready_handle
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, ready_handle)
 			.await
+			.expect("response task within test teardown ceiling")
 			.expect("ready server task")
 			.expect("ready request");
 
@@ -1691,10 +1697,14 @@ mod tests {
 		))
 		.await;
 		assert_eq!(degraded_exit, ExitCode::from(1));
-		degraded_handle
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, degraded_handle)
 			.await
+			.expect("response task within test teardown ceiling")
 			.expect("degraded server task")
 			.expect("degraded request");
+		pki.scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test]
@@ -1721,10 +1731,14 @@ mod tests {
 		.await;
 
 		assert_eq!(exit, ExitCode::from(2));
-		handle
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, handle)
 			.await
+			.expect("response task within test teardown ceiling")
 			.expect("teapot server task")
 			.expect("teapot request");
+		pki.scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test]
@@ -1760,6 +1774,9 @@ mod tests {
 				.expect("server task")
 				.is_err()
 		);
+		pki.scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test]
@@ -1787,6 +1804,9 @@ mod tests {
 		.await;
 
 		assert_eq!(exit, ExitCode::from(2));
+		pki.scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test]
@@ -1826,6 +1846,9 @@ mod tests {
 				panic!("unexpected status error from connect timeout: {status}")
 			}
 		}
+		pki.scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[test]
@@ -2071,6 +2094,9 @@ mod tests {
 			.await
 			.expect("override SQL server completed")
 			.expect("override SQL server task");
+		pki.scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test]
@@ -2120,6 +2146,9 @@ mod tests {
 				("SELECT 3".to_string(), "Pacific/Auckland".to_string()),
 			]
 		);
+		pki.scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test]
@@ -2150,9 +2179,15 @@ mod tests {
 			},
 		)
 		.await;
-		handle.await.expect("invalid batch server task");
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, handle)
+			.await
+			.expect("response task within test teardown ceiling")
+			.expect("invalid batch server task");
 
 		assert_eq!(exit, ExitCode::from(SQL_FILE_PARTIAL_APPLICATION));
+		pki.scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test]
@@ -2179,5 +2214,8 @@ mod tests {
 
 		assert_eq!(exit, ExitCode::from(2));
 		server.endpoint.close();
+		pki.scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 }

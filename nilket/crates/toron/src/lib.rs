@@ -34,6 +34,10 @@ mod timestamp;
 pub mod wire;
 
 #[cfg(test)]
+#[path = "test_support/test_dir.rs"]
+mod test_dir;
+
+#[cfg(test)]
 mod tests {
 	use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
 	use arrow::datatypes::{DataType, Field, Schema};
