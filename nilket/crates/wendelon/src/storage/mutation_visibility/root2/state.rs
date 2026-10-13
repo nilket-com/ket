@@ -1,6 +1,7 @@
 use super::admission_registry::{
-	PERMISSION_CHARGE2, PERMISSIONS2, PermissionMap2, RegistryError2, decode_permission_section2,
-	encode_permission_section2, permission_limits2,
+	PERMISSION_CHARGE2, PERMISSION_RECORD_BYTES2, PERMISSION_SECTION_BYTES2, PERMISSIONS2,
+	PermissionLimits2, PermissionMap2, RegistryError2, decode_permission_section2,
+	encode_permission_key2, encode_permission_record2, permission_limits2,
 };
 use super::{codec::*, trust::TrustedView2, types::*, validation::*};
 use super::{
@@ -28,32 +29,128 @@ impl std::fmt::Debug for UnverifiedRoot2 {
 		f.write_str("UnverifiedRoot2 { redacted }")
 	}
 }
+// One layout drives both checked sizing and final writing. Record-sized Wire2 temporaries
+// remain; neither pass stages a whole body or a permission-section Vec.
+fn emit_log(l: Log2, emit: &mut impl FnMut(&[u8])) -> Result2<()> {
+	valid_log(l)?;
+	emit(&l.term.to_le_bytes());
+	emit(&l.node.to_le_bytes());
+	emit(&l.index.to_le_bytes());
+	Ok(())
+}
+fn emit_records<'a, T: Wire2 + 'a>(
+	xs: impl Iterator<Item = &'a T>,
+	count: usize,
+	emit: &mut impl FnMut(&[u8]),
+) -> Result2<()> {
+	emit(
+		&u32::try_from(count)
+			.map_err(|_| RootError2::Overflow)?
+			.to_le_bytes(),
+	);
+	for x in xs {
+		let bytes = x.bytes()?;
+		emit(
+			&u32::try_from(bytes.len())
+				.map_err(|_| RootError2::Overflow)?
+				.to_le_bytes(),
+		);
+		emit(&bytes);
+	}
+	Ok(())
+}
+// The registry's entrypoint set is frozen. Stream its existing key/record codecs
+// privately here, preserving the original section bounds/key/record refusal order.
+fn visit_permission_section2(
+	m: &PermissionMap2,
+	l: PermissionLimits2,
+	emit: &mut impl FnMut(&[u8]),
+) -> Result<(), RegistryError2> {
+	if l.count > PERMISSIONS2
+		|| l.section > PERMISSION_SECTION_BYTES2
+		|| l.registry > REGISTRY_BYTES2
+	{
+		return Err(RegistryError2::Limits);
+	}
+	if m.len() > l.count {
+		return Err(RegistryError2::Count);
+	}
+	let n = m
+		.len()
+		.checked_mul(PERMISSION_CHARGE2)
+		.and_then(|n| n.checked_add(4))
+		.ok_or(RegistryError2::Overflow)?;
+	if n > l.section {
+		return Err(RegistryError2::Count);
+	}
+	emit(&(m.len() as u32).to_le_bytes());
+	for (k, r) in m {
+		if *k != encode_permission_key2(&r.key)? {
+			return Err(RegistryError2::MapKey);
+		}
+		emit(&(PERMISSION_RECORD_BYTES2 as u32).to_le_bytes());
+		emit(&encode_permission_record2(r)?);
+	}
+	Ok(())
+}
+fn emit_state_body(s: &State2, u: &Usage2, emit: &mut impl FnMut(&[u8])) -> Result2<()> {
+	emit(&s.generation);
+	emit(&s.cluster);
+	emit_log(s.bootstrap, emit)?;
+	emit_log(s.covered, emit)?;
+	emit(&s.fingerprint);
+	emit(&s.command_digest);
+	emit(&s.initial_epoch.to_le_bytes());
+	emit(&s.control_digest);
+	emit(&s.control_len.to_le_bytes());
+	emit(&(u.parents as u32).to_le_bytes());
+	emit(&(u.held as u64).to_le_bytes());
+	emit(&(u.history as u64).to_le_bytes());
+	emit(&(u.registry as u64).to_le_bytes());
+	emit_records(s.selectors.values(), s.selectors.len(), emit)?;
+	emit_records(s.authorities.values(), s.authorities.len(), emit)?;
+	visit_permission_section2(&s.permissions, permission_limits2(), emit).map_err(section_error)?;
+	emit_records(s.lineages.values(), s.lineages.len(), emit)?;
+	emit_records(s.cuts.iter(), s.cuts.len(), emit)?;
+	emit_records(s.parents.values(), s.parents.len(), emit)
+}
+fn envelope_size(body: usize, max: usize) -> Result2<(u32, usize)> {
+	// Match envelope_versioned's Limit-before-Overflow refusal order.
+	if body > max {
+		return Err(RootError2::Limit);
+	}
+	let wire = u32::try_from(body).map_err(|_| RootError2::Overflow)?;
+	let total = body.checked_add(48).ok_or(RootError2::Overflow)?;
+	Ok((wire, total))
+}
 fn encode_state(s: &State2) -> Result2<Vec<u8>> {
 	validate_state(s)?;
 	let u = usage(s)?;
-	let mut b = Vec::new();
-	b.extend(s.generation);
-	b.extend(s.cluster);
-	log(&mut b, s.bootstrap)?;
-	log(&mut b, s.covered)?;
-	b.extend(s.fingerprint);
-	b.extend(s.command_digest);
-	b.extend(s.initial_epoch.to_le_bytes());
-	b.extend(s.control_digest);
-	b.extend(s.control_len.to_le_bytes());
-	b.extend((u.parents as u32).to_le_bytes());
-	b.extend((u.held as u64).to_le_bytes());
-	b.extend((u.history as u64).to_le_bytes());
-	b.extend((u.registry as u64).to_le_bytes());
-	write_vec(&mut b, s.selectors.values().cloned(), s.selectors.len())?;
-	write_vec(&mut b, s.authorities.values().cloned(), s.authorities.len())?;
-	b.extend(
-		encode_permission_section2(&s.permissions, permission_limits2()).map_err(section_error)?,
-	);
-	write_vec(&mut b, s.lineages.values().cloned(), s.lineages.len())?;
-	write_vec(&mut b, s.cuts.iter().cloned(), s.cuts.len())?;
-	write_vec(&mut b, s.parents.values().cloned(), s.parents.len())?;
-	envelope_versioned(b"VISAUT03", 3, &b, ROOT_BYTES2)
+	let mut body = Some(0usize);
+	// Finish record validation in its original order before the envelope length refusal.
+	emit_state_body(s, &u, &mut |part| {
+		body = body.and_then(|n| n.checked_add(part.len()));
+	})?;
+	let body = body.ok_or(RootError2::Overflow)?;
+	let (wire, total) = envelope_size(body, ROOT_BYTES2)?;
+	let mut b = Vec::with_capacity(total);
+	b.extend_from_slice(b"VISAUT03");
+	b.extend_from_slice(&3u16.to_le_bytes());
+	b.extend_from_slice(&[1, 0]);
+	b.extend_from_slice(&wire.to_le_bytes());
+	emit_state_body(s, &u, &mut |part| b.extend_from_slice(part))?;
+	assert_eq!(b.len(), total - 32, "snapshot body sizing drift");
+	let sum = hash(b"", &b);
+	b.extend_from_slice(&sum);
+	assert_eq!(b.len(), total, "snapshot envelope sizing drift");
+	Ok(b)
+}
+#[cfg(test)]
+#[path = "tests/encode_reference.rs"]
+mod reference;
+#[cfg(test)]
+pub(super) fn encode_state_reference(s: &State2) -> Result2<Vec<u8>> {
+	reference::encode_state_reference(s)
 }
 // Structural section faults: a count above the absolute cap is a Limit, anything else Codec.
 fn section_error(e: RegistryError2) -> RootError2 {
@@ -284,3 +381,7 @@ impl Root2 {
 		self
 	}
 }
+
+#[cfg(test)]
+#[path = "tests/encoding_size.rs"]
+mod sizing_tests;

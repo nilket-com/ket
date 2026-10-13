@@ -191,6 +191,7 @@ pub(super) trait Wire2: Sized {
 		Ok(v)
 	}
 }
+#[cfg(test)] // Frozen current-wire snapshot reference and codec tests only.
 pub(super) fn write_vec<T: Wire2>(
 	b: &mut Vec<u8>,
 	xs: impl Iterator<Item = T>,
