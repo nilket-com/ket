@@ -42,3 +42,6 @@ impl Drop for TestDir {
 		let _ = fs::remove_dir_all(&self.0);
 	}
 }
+
+// Synthetic measurement tooling; never compiled into the ordinary library.
+pub(crate) mod g2;
