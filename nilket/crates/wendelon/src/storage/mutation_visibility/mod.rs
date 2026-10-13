@@ -22,6 +22,6 @@ use error::redacted_debug;
 #[cfg(test)]
 mod tests;
 
-// G2 shares only allocator counters with cfg(test) measurement helpers.
+// Tracked measurement phases stay below the cfg(test) authority test tree.
 #[cfg(test)]
-pub(crate) use tests::b1_assay::{r0_counters, r0_reset_peak};
+pub(crate) use tests::g2::Phase as G2TrackedPhase;

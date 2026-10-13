@@ -1,3 +1,4 @@
+pub(super) mod g2;
 use super::commitment::TestProofKey;
 use super::*;
 

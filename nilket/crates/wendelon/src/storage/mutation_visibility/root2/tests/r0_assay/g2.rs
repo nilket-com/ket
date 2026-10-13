@@ -1,6 +1,7 @@
 //! A3b direct construction; deliberately separate from replay-derived A3.
 use super::*;
-use crate::test_support::g2::{Phase, case, emit};
+use crate::storage::mutation_visibility::G2TrackedPhase as Phase;
+use crate::test_support::g2::{case, emit};
 #[test]
 #[ignore = "G2 A3b: isolated reviewed synthetic runner only"]
 fn g2_bulk_snapshot() {
