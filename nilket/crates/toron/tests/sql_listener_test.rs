@@ -3144,7 +3144,7 @@ mod mutation_integrity_pins {
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-	async fn configured_tenant_replay_shares_a_cache_key_but_not_a_durable_outcome() {
+	async fn configured_tenant_replay_is_tenant_isolated() {
 		let (fixture, first_daemon, first_client, starter_scratch) = start_owned(6297).await;
 		let second_tenant = WendelonTenantId::new(2);
 		create_live_tenant(&fixture.node, second_tenant).await;
@@ -3213,24 +3213,30 @@ mod mutation_integrity_pins {
 					.await
 					.unwrap();
 				let original_outcome = committed(original, id, "cross-tenant-original").await;
-				let false_success = replay
+				let own_response = replay
 					.execute_with_query_id(id, &second_sql, "UTC")
 					.await
 					.unwrap();
 				assert_eq!(first_response.row_count, 1);
-				assert_eq!(false_success.row_count, 1);
-				assert_eq!(false_success.batches, first_response.batches);
+				assert_eq!(own_response.row_count, 1);
 				let own_rows = visible(replay, key).await;
 				match kind {
-					"insert-identical" => assert!(own_rows.is_empty()),
+					"insert-identical" => assert_eq!(
+						own_rows,
+						vec![(key as i64, Some(10), Some("original".into()))]
+					),
 					"insert-changed" => {
 						assert!(own_rows.is_empty());
-						assert!(visible(replay, key + 1).await.is_empty());
+						assert_eq!(
+							visible(replay, key + 1).await,
+							vec![((key + 1) as i64, Some(20), Some("changed".into()))]
+						);
 					}
-					"update-identical" | "delete-identical" => assert_eq!(
+					"update-identical" => assert_eq!(
 						own_rows,
-						vec![(key as i64, Some(20), Some("replay-tenant".into()))]
+						vec![(key as i64, Some(21), Some("replay-tenant".into()))]
 					),
+					"delete-identical" => assert!(own_rows.is_empty()),
 					_ => unreachable!(),
 				}
 				let original_rows = visible(original, key).await;
@@ -3253,20 +3259,46 @@ mod mutation_integrity_pins {
 				else {
 					panic!("row mutation")
 				};
-				assert_eq!(resolved.resolution, MutationResolution::Unknown);
+				assert_eq!(resolved.resolution, MutationResolution::Present);
+				assert_eq!(resolved.write_status, wendelon::schema::WriteStatus::OK.0);
+				if kind == "delete-identical" {
+					assert_eq!(resolved.delete_counts, Some([1, 0, 0]));
+				}
 				assert_eq!(
-					resolved.write_status,
-					wendelon::schema::WriteStatus::WRITE_OPERATION_UNKNOWN.0
+					committed(original, id, "cross-tenant-original-after").await,
+					original_outcome
 				);
+				let own_replay = replay
+					.execute_with_query_id(id, &second_sql, "UTC")
+					.await
+					.unwrap();
+				if kind == "delete-identical" {
+					// The repeated SQL scan has no candidates and returns before storage.
+					assert_eq!(own_replay.row_count, 0);
+					let after_repeat =
+						committed(replay, id, "cross-tenant-delete-after-repeat").await;
+					assert_eq!(after_repeat, resolved);
+					assert_eq!(after_repeat.delete_counts, Some([1, 0, 0]));
+				} else {
+					assert_eq!(own_replay.row_count, own_response.row_count);
+					assert_eq!(own_replay.batches, own_response.batches);
+				}
+				assert_eq!(visible(replay, key).await, own_rows);
+				if kind == "insert-changed" {
+					assert_eq!(
+						visible(replay, key + 1).await,
+						vec![((key + 1) as i64, Some(20), Some("changed".into()))]
+					);
+				}
 				assert_eq!(resolved.stop_reason, MutationStopReason::None);
 				assert_eq!(
 					resolved.commit_knowledge,
-					MutationCommitKnowledge::Unspecified
+					MutationCommitKnowledge::Committed
 				);
 				println!(
-					"TENANT_REPLAY_PIN original_tenant={original_tenant} replay_tenant={replay_tenant} kind={kind} identical_bytes={} sql_rows={} resolution={:?} write_status={} stop_reason={} commit_knowledge={} expected_own_effect_absent=true authenticated=false",
+					"TENANT_REPLAY_PIN original_tenant={original_tenant} replay_tenant={replay_tenant} kind={kind} identical_bytes={} sql_rows={} resolution={:?} write_status={} stop_reason={} commit_knowledge={} expected_own_effect_present=true authenticated=false",
 					first_sql == second_sql,
-					false_success.row_count,
+					own_response.row_count,
 					resolved.resolution,
 					resolved.write_status,
 					raw_stop_reason(resolved.stop_reason),
@@ -3291,7 +3323,7 @@ mod mutation_integrity_pins {
 			.await;
 	}
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-	async fn certificate_tenant_replay_shares_a_cache_key_but_not_a_durable_outcome() {
+	async fn certificate_tenant_replay_is_tenant_isolated() {
 		use std::os::unix::fs::PermissionsExt;
 		let fixture = LiveWendelonFixture::start(6300).await;
 		for tenant in [1, 2] {
@@ -3430,24 +3462,30 @@ mod mutation_integrity_pins {
 					.await
 					.unwrap();
 				let original_outcome = committed(original, id, "cross-tenant-original").await;
-				let false_success = replay
+				let own_response = replay
 					.execute_with_query_id(id, &second_sql, "UTC")
 					.await
 					.unwrap();
 				assert_eq!(first_response.row_count, 1);
-				assert_eq!(false_success.row_count, 1);
-				assert_eq!(false_success.batches, first_response.batches);
+				assert_eq!(own_response.row_count, 1);
 				let own_rows = visible(replay, key).await;
 				match kind {
-					"insert-identical" => assert!(own_rows.is_empty()),
+					"insert-identical" => assert_eq!(
+						own_rows,
+						vec![(key as i64, Some(10), Some("original".into()))]
+					),
 					"insert-changed" => {
 						assert!(own_rows.is_empty());
-						assert!(visible(replay, key + 1).await.is_empty());
+						assert_eq!(
+							visible(replay, key + 1).await,
+							vec![((key + 1) as i64, Some(20), Some("changed".into()))]
+						);
 					}
-					"update-identical" | "delete-identical" => assert_eq!(
+					"update-identical" => assert_eq!(
 						own_rows,
-						vec![(key as i64, Some(20), Some("replay-tenant".into()))]
+						vec![(key as i64, Some(21), Some("replay-tenant".into()))]
 					),
+					"delete-identical" => assert!(own_rows.is_empty()),
 					_ => unreachable!(),
 				}
 				let original_rows = visible(original, key).await;
@@ -3470,20 +3508,46 @@ mod mutation_integrity_pins {
 				else {
 					panic!("row mutation")
 				};
-				assert_eq!(resolved.resolution, MutationResolution::Unknown);
+				assert_eq!(resolved.resolution, MutationResolution::Present);
+				assert_eq!(resolved.write_status, wendelon::schema::WriteStatus::OK.0);
+				if kind == "delete-identical" {
+					assert_eq!(resolved.delete_counts, Some([1, 0, 0]));
+				}
 				assert_eq!(
-					resolved.write_status,
-					wendelon::schema::WriteStatus::WRITE_OPERATION_UNKNOWN.0
+					committed(original, id, "cross-tenant-original-after").await,
+					original_outcome
 				);
+				let own_replay = replay
+					.execute_with_query_id(id, &second_sql, "UTC")
+					.await
+					.unwrap();
+				if kind == "delete-identical" {
+					// The repeated SQL scan has no candidates and returns before storage.
+					assert_eq!(own_replay.row_count, 0);
+					let after_repeat =
+						committed(replay, id, "cross-tenant-delete-after-repeat").await;
+					assert_eq!(after_repeat, resolved);
+					assert_eq!(after_repeat.delete_counts, Some([1, 0, 0]));
+				} else {
+					assert_eq!(own_replay.row_count, own_response.row_count);
+					assert_eq!(own_replay.batches, own_response.batches);
+				}
+				assert_eq!(visible(replay, key).await, own_rows);
+				if kind == "insert-changed" {
+					assert_eq!(
+						visible(replay, key + 1).await,
+						vec![((key + 1) as i64, Some(20), Some("changed".into()))]
+					);
+				}
 				assert_eq!(resolved.stop_reason, MutationStopReason::None);
 				assert_eq!(
 					resolved.commit_knowledge,
-					MutationCommitKnowledge::Unspecified
+					MutationCommitKnowledge::Committed
 				);
 				println!(
-					"AUTH_TENANT_REPLAY_PIN original_tenant={original_tenant} replay_tenant={replay_tenant} kind={kind} identical_bytes={} sql_rows={} resolution={:?} write_status={} stop_reason={} commit_knowledge={} expected_own_effect_absent=true authenticated=true storage_transport=simulated",
+					"AUTH_TENANT_REPLAY_PIN original_tenant={original_tenant} replay_tenant={replay_tenant} kind={kind} identical_bytes={} sql_rows={} resolution={:?} write_status={} stop_reason={} commit_knowledge={} expected_own_effect_present=true authenticated=true storage_transport=simulated",
 					first_sql == second_sql,
-					false_success.row_count,
+					own_response.row_count,
 					resolved.resolution,
 					resolved.write_status,
 					raw_stop_reason(resolved.stop_reason),

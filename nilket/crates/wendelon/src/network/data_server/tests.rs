@@ -9665,7 +9665,7 @@ async fn duplicate_write_replays_terminal_failure_without_recovery() {
 		hlc(2, 0, 0),
 	);
 	node.data_server.idempotency.insert(
-		WendelonDataServer::idempotency_key_for(meta.write_id),
+		WendelonDataServer::idempotency_key_for(meta.tenant_id, meta.write_id),
 		CachedWriteOutcome::new(WriteOutcome::FinalizationTerminalFailure { response: terminal }),
 	);
 
@@ -17561,3 +17561,6 @@ async fn adr629_p2b_raw_and_table_followers_keep_the_actual_pending_commit_after
 		shutdown_lease_node(node).await;
 	}
 }
+
+#[path = "tests/tenant_cache/tests.rs"]
+mod tenant_cache;
