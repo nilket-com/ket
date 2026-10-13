@@ -1,3 +1,7 @@
+#[path = "../src/test_support/test_dir.rs"]
+mod test_dir;
+use test_dir::{PendingTeardown, TEST_TEARDOWN_BOUND, TestDir};
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -70,10 +74,16 @@ async fn adr629_adapter_records_authenticated_mutation_resolution_and_exact_rows
 	let fixture = LiveWendelonFixture::start(62920).await;
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor()).await;
 	let worker = WorkerId::from_u128(629201);
-	let pki = TestPki::generate(worker, "1");
+	let (pki, pki_scratch) = TestPki::generate(worker, "1");
 	std::fs::set_permissions(&pki.client_key, std::fs::Permissions::from_mode(0o600)).unwrap();
+	let (owned_config_1, descriptor_scratch_1) = owned_toron_config_with_descriptor_tls_for_tenant(
+		descriptor(),
+		ToronTenantId(1),
+		worker,
+		&pki,
+	);
 	let daemon = ToronDaemon::start_with_wendelon_client_for_harness(
-		toron_config_with_descriptor_tls_for_tenant(descriptor(), ToronTenantId(1), worker, &pki),
+		owned_config_1,
 		Arc::clone(&fixture.client),
 	)
 	.await
@@ -123,14 +133,25 @@ async fn adr629_adapter_records_authenticated_mutation_resolution_and_exact_rows
 		"ADR629_ADAPTER_DEVELOPMENT evidence={} authenticated=true storage_transport=simulated RF=1",
 		root.display()
 	);
-	daemon.shutdown().await.unwrap();
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.unwrap();
 	fixture.shutdown();
+	pki_scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_client_health_probe_reaches_a_live_sql_listener_without_query_state() {
 	let fixture = LiveWendelonFixture::start(142).await;
-	let config = toron_config_with_descriptor(descriptor(), true);
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor(descriptor(), true);
+	let config = owned_config_1;
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
 			.await
@@ -143,8 +164,14 @@ async fn public_client_health_probe_reaches_a_live_sql_listener_without_query_st
 		.await
 		.expect("side-effect-free health response");
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
 	fixture.shutdown();
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -334,7 +361,9 @@ async fn adr0094_live_199999_row_chain_materializes_and_reads_back() {
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
 
-	let mut config = toron_config_with_descriptor(descriptor, true);
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor(descriptor, true);
+	let mut config = owned_config_1;
 	config.sql.as_mut().expect("SQL config").statement_timeout = Duration::from_secs(60);
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
@@ -370,13 +399,21 @@ async fn adr0094_live_199999_row_chain_materializes_and_reads_back() {
 	};
 	assert_eq!(readback.row_count, 199_999);
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
 	fixture.shutdown();
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_rune_version_axis_refuses_skew_with_requested_and_supported_versions() {
-	let daemon = ToronDaemon::start(toron_config_with_descriptor(descriptor(), true))
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor(descriptor(), true);
+	let daemon = ToronDaemon::start(owned_config_1)
 		.await
 		.expect("start daemon");
 	let endpoint = daemon.handle().sql_endpoint.expect("query endpoint");
@@ -430,7 +467,13 @@ async fn each_rune_version_axis_refuses_skew_with_requested_and_supported_versio
 		(2, 1, 1),
 		"ADR 574 moves the request-protocol axis alone"
 	);
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -589,7 +632,9 @@ async fn sql_listener_update_complete_frame_carries_row_count() {
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
 
-	let config = toron_config_with_descriptor(descriptor.clone(), true);
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor(descriptor.clone(), true);
+	let config = owned_config_1;
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
 			.await
@@ -618,8 +663,14 @@ async fn sql_listener_update_complete_frame_carries_row_count() {
 		vec![(2, Some(175), Some("east".to_string()))]
 	);
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
 	fixture.shutdown();
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -629,7 +680,9 @@ async fn sql_listener_dml_returning_sends_result_batches_then_complete() {
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
 
-	let config = toron_config_with_descriptor(descriptor.clone(), true);
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor(descriptor.clone(), true);
+	let config = owned_config_1;
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
 			.await
@@ -649,8 +702,14 @@ async fn sql_listener_dml_returning_sends_result_batches_then_complete() {
 		vec![(2, Some(175), Some("east".to_string()))]
 	);
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
 	fixture.shutdown();
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -661,8 +720,10 @@ async fn toron_sql_select_executes_over_authenticated_remote_listener() {
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
 
 	let worker_id = WorkerId::from_u128(45);
-	let pki = TestPki::generate(worker_id, "1");
-	let config = toron_config_with_descriptor_tls(descriptor.clone(), worker_id, &pki);
+	let (pki, pki_scratch) = TestPki::generate(worker_id, "1");
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor_tls(descriptor.clone(), worker_id, &pki);
+	let config = owned_config_1;
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
 			.await
@@ -705,8 +766,17 @@ async fn toron_sql_select_executes_over_authenticated_remote_listener() {
 		"Rune must inherit SQL's authenticated transport and tenant authorization"
 	);
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
 	fixture.shutdown();
+	pki_scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -719,13 +789,14 @@ async fn tenant_7_sql_resolves_tenant_7_bootstrapped_descriptor() {
 	write_rows(&fixture.client, tenant, &descriptor, batch()).await;
 
 	let worker_id = WorkerId::from_u128(46);
-	let pki = TestPki::generate(worker_id, "7");
-	let mut config = toron_config_with_descriptor_tls_for_tenant(
+	let (pki, pki_scratch) = TestPki::generate(worker_id, "7");
+	let (owned_config_1, descriptor_scratch_1) = owned_toron_config_with_descriptor_tls_for_tenant(
 		descriptor.clone(),
 		ToronTenantId(7),
 		worker_id,
 		&pki,
 	);
+	let mut config = owned_config_1;
 	config.node.tenant_id = ToronTenantId(7);
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
@@ -746,8 +817,17 @@ async fn tenant_7_sql_resolves_tenant_7_bootstrapped_descriptor() {
 	.expect("SQL select response over mTLS");
 	assert_eq!(response.complete.row_count, 2);
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
 	fixture.shutdown();
+	pki_scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -760,13 +840,14 @@ async fn tenant_8_sql_resolves_tenant_8_bootstrapped_descriptor() {
 	write_rows(&fixture.client, tenant, &descriptor, batch()).await;
 
 	let worker_id = WorkerId::from_u128(49);
-	let pki = TestPki::generate(worker_id, "8");
-	let mut config = toron_config_with_descriptor_tls_for_tenant(
+	let (pki, pki_scratch) = TestPki::generate(worker_id, "8");
+	let (owned_config_1, descriptor_scratch_1) = owned_toron_config_with_descriptor_tls_for_tenant(
 		descriptor.clone(),
 		ToronTenantId(8),
 		worker_id,
 		&pki,
 	);
+	let mut config = owned_config_1;
 	config.node.tenant_id = ToronTenantId(7);
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
@@ -787,8 +868,17 @@ async fn tenant_8_sql_resolves_tenant_8_bootstrapped_descriptor() {
 	.expect("tenant 8 SQL select response over mTLS");
 	assert_eq!(response.complete.row_count, 2);
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
 	fixture.shutdown();
+	pki_scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -801,9 +891,14 @@ async fn tenant_8_cannot_resolve_tenant_7_only_bootstrapped_descriptor() {
 	write_rows(&fixture.client, tenant, &descriptor, batch()).await;
 
 	let worker_id = WorkerId::from_u128(47);
-	let pki = TestPki::generate(worker_id, "8");
-	let mut config =
-		toron_config_with_descriptor_tls_for_tenant(descriptor, ToronTenantId(7), worker_id, &pki);
+	let (pki, pki_scratch) = TestPki::generate(worker_id, "8");
+	let (owned_config_1, descriptor_scratch_1) = owned_toron_config_with_descriptor_tls_for_tenant(
+		descriptor,
+		ToronTenantId(7),
+		worker_id,
+		&pki,
+	);
+	let mut config = owned_config_1;
 	config.node.tenant_id = ToronTenantId(7);
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
@@ -828,8 +923,17 @@ async fn tenant_8_cannot_resolve_tenant_7_only_bootstrapped_descriptor() {
 		"{error:?}"
 	);
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
 	fixture.shutdown();
+	pki_scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -841,7 +945,9 @@ async fn loopback_sql_uses_config_tenant_for_bootstrapped_descriptor() {
 	install_schema(&fixture.node, tenant, &descriptor).await;
 	write_rows(&fixture.client, tenant, &descriptor, batch()).await;
 
-	let mut config = toron_config_with_descriptor_for_tenant(descriptor, ToronTenantId(7), true);
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor_for_tenant(descriptor, ToronTenantId(7), true);
+	let mut config = owned_config_1;
 	config.node.tenant_id = ToronTenantId(7);
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
@@ -858,13 +964,21 @@ async fn loopback_sql_uses_config_tenant_for_bootstrapped_descriptor() {
 
 	assert_eq!(response.complete.row_count, 2);
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
 	fixture.shutdown();
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn global_sql_connection_cap_refuses_excess_incoming_before_handshake() {
-	let mut config = toron_config_with_descriptor(descriptor(), true);
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor(descriptor(), true);
+	let mut config = owned_config_1;
 	config
 		.sql
 		.as_mut()
@@ -880,12 +994,20 @@ async fn global_sql_connection_cap_refuses_excess_incoming_before_handshake() {
 
 	assert_transport_rejects_without_sql_frame(endpoint).await;
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loopback_sql_tenant_connection_cap_uses_config_tenant() {
-	let mut config = toron_config_with_descriptor(descriptor(), true);
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor(descriptor(), true);
+	let mut config = owned_config_1;
 	config.node.tenant_id = ToronTenantId(7);
 	config.tenant_budgets = TenantBudgetPolicy::new(
 		TenantBudget::new(ByteCount::new(8), ByteCount::new(32)),
@@ -901,19 +1023,26 @@ async fn loopback_sql_tenant_connection_cap_uses_config_tenant() {
 
 	assert_transport_rejects_without_sql_frame(endpoint).await;
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_sql_tenant_connection_cap_closes_excess_after_san_resolution() {
 	let worker_id = WorkerId::from_u128(57);
-	let pki = TestPki::generate(worker_id, "7");
-	let mut config = toron_config_with_descriptor_tls_for_tenant(
+	let (pki, pki_scratch) = TestPki::generate(worker_id, "7");
+	let (owned_config_1, descriptor_scratch_1) = owned_toron_config_with_descriptor_tls_for_tenant(
 		descriptor(),
 		ToronTenantId(7),
 		worker_id,
 		&pki,
 	);
+	let mut config = owned_config_1;
 	config.tenant_budgets = TenantBudgetPolicy::new(
 		TenantBudget::new(ByteCount::new(8), ByteCount::new(32)),
 		HashMap::from([(ToronTenantId(7), tenant_connection_budget(1))]),
@@ -940,7 +1069,16 @@ async fn remote_sql_tenant_connection_cap_closes_excess_after_san_resolution() {
 	)
 	.await;
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
+	pki_scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1098,7 +1236,9 @@ async fn server_result_batches_not_constrained_by_inbound_request_cap() {
 	)
 	.await;
 
-	let mut config = toron_config_with_descriptor(descriptor, true);
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor(descriptor, true);
+	let mut config = owned_config_1;
 	let sql = config.sql.as_mut().expect("sql config");
 	sql.max_request_frame_bytes = NonZeroU32::new(512).expect("request cap");
 	sql.max_statement_bytes = NonZeroU32::new(512).expect("statement cap");
@@ -1145,8 +1285,14 @@ async fn server_result_batches_not_constrained_by_inbound_request_cap() {
 		"outbound result batches must not be constrained by inbound request cap"
 	);
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
 	fixture.shutdown();
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1156,7 +1302,9 @@ async fn query_over_per_task_budget_returns_resource_exhausted() {
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
 
-	let mut config = toron_config_with_descriptor(descriptor, true);
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor(descriptor, true);
+	let mut config = owned_config_1;
 	config.tenant_budgets = TenantBudgetPolicy::new(
 		TenantBudget::new(ByteCount::new(1), ByteCount::new(1)),
 		HashMap::new(),
@@ -1177,14 +1325,22 @@ async fn query_over_per_task_budget_returns_resource_exhausted() {
 	assert_eq!(error.code, SqlErrorCode::ResourceExhausted);
 	assert_eq!(error.message, "tenant memory budget exhausted");
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
 	fixture.shutdown();
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn toron_sql_uses_self_worker_registry_entry() {
 	let descriptor = descriptor();
-	let config = toron_config_with_descriptor(descriptor, false);
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor(descriptor, false);
+	let config = owned_config_1;
 	let daemon = ToronDaemon::start(config).await.expect("start daemon");
 	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
 
@@ -1194,7 +1350,13 @@ async fn toron_sql_uses_self_worker_registry_entry() {
 
 	assert_eq!(error.code, SqlErrorCode::NoLiveWorker);
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1204,7 +1366,9 @@ async fn toron_sql_complete_frame_carries_stable_row_count() {
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
 
-	let config = toron_config_with_descriptor(descriptor, true);
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor(descriptor, true);
+	let config = owned_config_1;
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
 			.await
@@ -1243,8 +1407,14 @@ async fn toron_sql_complete_frame_carries_stable_row_count() {
 	assert_eq!(drop_missing.complete.row_count, 0);
 	assert!(drop_missing.batches.is_empty());
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
 	fixture.shutdown();
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[cfg(feature = "test-support")]
@@ -1448,7 +1618,9 @@ async fn public_sql_client_resolves_a_mutation_by_id_without_replaying_it() {
 	let fixture = LiveWendelonFixture::start(542).await;
 	let descriptor = descriptor();
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
-	let config = toron_config_with_descriptor(descriptor, true);
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor(descriptor, true);
+	let config = owned_config_1;
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
 			.await
@@ -1490,8 +1662,14 @@ async fn public_sql_client_resolves_a_mutation_by_id_without_replaying_it() {
 		"resolution must not submit a second write"
 	);
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
 	fixture.shutdown();
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1500,7 +1678,9 @@ async fn public_sql_client_resolves_all_four_ctas_phases_by_id() {
 	let descriptor = descriptor();
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
-	let config = toron_config_with_descriptor(descriptor, true);
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor(descriptor, true);
+	let config = owned_config_1;
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
 			.await
@@ -1579,13 +1759,21 @@ async fn public_sql_client_resolves_all_four_ctas_phases_by_id() {
 		.expect("replacement remains queryable after old storage retirement");
 	assert_eq!(rows.row_count, 2);
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
 	fixture.shutdown();
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[tokio::test]
 async fn toron_daemon_without_sql_section_preserves_worker_only_start() {
-	let mut config = toron_config_with_descriptor(descriptor(), true);
+	let (owned_config_1, descriptor_scratch_1) =
+		owned_toron_config_with_descriptor(descriptor(), true);
+	let mut config = owned_config_1;
 	config.sql = None;
 
 	let daemon = ToronDaemon::start(config).await.expect("start daemon");
@@ -1593,7 +1781,13 @@ async fn toron_daemon_without_sql_section_preserves_worker_only_start() {
 	assert!(daemon.handle().worker_endpoint.ip().is_loopback());
 	assert!(daemon.handle().sql_endpoint.is_none());
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+		.await
+		.expect("bounded daemon shutdown")
+		.expect("shutdown daemon");
+	descriptor_scratch_1
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
 }
 
 #[derive(Debug)]
@@ -1917,8 +2111,8 @@ struct TestPki {
 }
 
 impl TestPki {
-	fn generate(worker_id: WorkerId, principal: &str) -> Self {
-		let dir = fresh_dir("tls-sql");
+	fn generate(worker_id: WorkerId, principal: &str) -> (Self, PendingTeardown) {
+		let dir = TestDir::new("toron-sql-listener-tls-sql-owned");
 		let ca = ca_cert();
 		let daemon_dns = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
 		let daemon = leaf_cert(
@@ -1940,34 +2134,8 @@ impl TestPki {
 		std::fs::write(&pki.ca_cert, ca.serialize_pem().expect("CA PEM")).expect("write CA");
 		write_signed_cert(&pki.daemon_cert, &pki.daemon_key, &daemon, &ca);
 		write_signed_cert(&pki.client_cert, &pki.client_key, &client, &ca);
-		pki
+		(pki, dir.pending())
 	}
-}
-
-fn toron_config_with_descriptor_tls(
-	descriptor: TableSchemaDescriptor,
-	worker_id: WorkerId,
-	pki: &TestPki,
-) -> ToronBootstrapConfig {
-	toron_config_with_descriptor_tls_for_tenant(descriptor, ToronTenantId(1), worker_id, pki)
-}
-
-fn toron_config_with_descriptor_tls_for_tenant(
-	descriptor: TableSchemaDescriptor,
-	bootstrap_tenant: ToronTenantId,
-	worker_id: WorkerId,
-	pki: &TestPki,
-) -> ToronBootstrapConfig {
-	let mut config = toron_config_with_descriptor_for_tenant(descriptor, bootstrap_tenant, true);
-	config.node.worker_id = worker_id;
-	config.sql.as_mut().expect("sql config").listener_bind = "0.0.0.0:0".parse().expect("sql bind");
-	config.tls = Some(TlsConfig {
-		listener_cert: pki.daemon_cert.clone(),
-		listener_key: pki.daemon_key.clone(),
-		peer_ca: pki.ca_cert.clone(),
-		cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
-	});
-	config
 }
 
 fn toron_config_with_descriptor(
@@ -1983,6 +2151,13 @@ fn toron_config_with_descriptor_for_tenant(
 	include_self_worker: bool,
 ) -> ToronBootstrapConfig {
 	let descriptor_path = write_descriptor_bootstrap_for_tenant(bootstrap_tenant, descriptor);
+	toron_config_with_descriptor_path(descriptor_path, include_self_worker)
+}
+
+fn toron_config_with_descriptor_path(
+	descriptor_path: PathBuf,
+	include_self_worker: bool,
+) -> ToronBootstrapConfig {
 	ToronBootstrapConfig {
 		node: ToronNodeConfig {
 			worker_id: WorkerId::new(),
@@ -2039,6 +2214,63 @@ fn toron_config_with_descriptor_for_tenant(
 		},
 		audit: AuditConfig::Disabled,
 	}
+}
+
+fn owned_toron_config_with_descriptor(
+	descriptor: TableSchemaDescriptor,
+	include_self_worker: bool,
+) -> (ToronBootstrapConfig, PendingTeardown) {
+	owned_toron_config_with_descriptor_for_tenant(descriptor, ToronTenantId(1), include_self_worker)
+}
+
+fn owned_toron_config_with_descriptor_for_tenant(
+	descriptor: TableSchemaDescriptor,
+	tenant: ToronTenantId,
+	include_self_worker: bool,
+) -> (ToronBootstrapConfig, PendingTeardown) {
+	let dir = TestDir::new("toron-sql-listener-descriptor-bootstrap-owned");
+	let path = dir.join("descriptors.json");
+	let bootstrap = DescriptorBootstrap {
+		tables: vec![DescriptorBootstrapEntry {
+			tenant_id: tenant.0,
+			table_id: 1,
+			descriptor,
+			optimizer_facts: None,
+		}],
+	};
+	std::fs::write(&path, serde_json::to_string_pretty(&bootstrap).unwrap())
+		.expect("write descriptor bootstrap");
+	(
+		toron_config_with_descriptor_path(path, include_self_worker),
+		dir.pending(),
+	)
+}
+
+fn owned_toron_config_with_descriptor_tls(
+	descriptor: TableSchemaDescriptor,
+	worker_id: WorkerId,
+	pki: &TestPki,
+) -> (ToronBootstrapConfig, PendingTeardown) {
+	owned_toron_config_with_descriptor_tls_for_tenant(descriptor, ToronTenantId(1), worker_id, pki)
+}
+
+fn owned_toron_config_with_descriptor_tls_for_tenant(
+	descriptor: TableSchemaDescriptor,
+	tenant: ToronTenantId,
+	worker_id: WorkerId,
+	pki: &TestPki,
+) -> (ToronBootstrapConfig, PendingTeardown) {
+	let (mut config, scratch) =
+		owned_toron_config_with_descriptor_for_tenant(descriptor, tenant, true);
+	config.node.worker_id = worker_id;
+	config.sql.as_mut().expect("SQL config").listener_bind = "0.0.0.0:0".parse().expect("sql bind");
+	config.tls = Some(TlsConfig {
+		listener_cert: pki.daemon_cert.clone(),
+		listener_key: pki.daemon_key.clone(),
+		peer_ca: pki.ca_cert.clone(),
+		cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+	});
+	(config, scratch)
 }
 
 fn ca_cert() -> Certificate {
@@ -2569,6 +2801,29 @@ mod mutation_integrity_pins {
 		(fixture, daemon, client)
 	}
 
+	async fn start_owned(
+		node: u32,
+	) -> (
+		LiveWendelonFixture,
+		ToronDaemon,
+		ToronClient,
+		PendingTeardown,
+	) {
+		let fixture = LiveWendelonFixture::start(node).await;
+		let descriptor = descriptor();
+		install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+		let (config, scratch) = owned_toron_config_with_descriptor(descriptor, true);
+		let daemon = ToronDaemon::start_with_wendelon_client_for_harness(
+			config,
+			Arc::clone(&fixture.client),
+		)
+		.await
+		.expect("SQL daemon");
+		let client =
+			ToronClient::loopback(daemon.handle().sql_endpoint.unwrap().to_string()).unwrap();
+		(fixture, daemon, client, scratch)
+	}
+
 	async fn visible(client: &ToronClient, key: i32) -> Vec<(i64, Option<i32>, Option<String>)> {
 		let response = client
 			.execute(&format!(
@@ -2619,7 +2874,7 @@ mod mutation_integrity_pins {
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn duplicate_primary_key_insert_supersedes_instead_of_rejecting() {
-		let (fixture, daemon, client) = start(6291).await;
+		let (fixture, daemon, client, starter_scratch) = start_owned(6291).await;
 		let first = QueryId::new();
 		client
 			.execute_with_query_id(
@@ -2641,13 +2896,19 @@ mod mutation_integrity_pins {
 			visible(&client, 1).await,
 			vec![(1, Some(20), Some("second".into()))]
 		);
-		daemon.shutdown().await.unwrap();
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+			.await
+			.expect("bounded daemon shutdown")
+			.unwrap();
 		fixture.shutdown();
+		starter_scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn insert_identity_replay_ignores_changed_request_contents() {
-		let (fixture, daemon, client) = start(6292).await;
+		let (fixture, daemon, client, starter_scratch) = start_owned(6292).await;
 		let id = QueryId::new();
 		let sql = "INSERT INTO storage_execution (id, amount, region, ts) VALUES (2, 10, 'original', 1599998400000)";
 		let first = client.execute_with_query_id(id, sql, "UTC").await.unwrap();
@@ -2675,13 +2936,19 @@ mod mutation_integrity_pins {
 			committed(&client, id, "insert-changed-replay").await,
 			original
 		);
-		daemon.shutdown().await.unwrap();
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+			.await
+			.expect("bounded daemon shutdown")
+			.unwrap();
 		fixture.shutdown();
+		starter_scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn update_identity_replay_does_not_repeat_an_increment_or_apply_changed_contents() {
-		let (fixture, daemon, client) = start(6293).await;
+		let (fixture, daemon, client, starter_scratch) = start_owned(6293).await;
 		client.execute("INSERT INTO storage_execution (id, amount, region, ts) VALUES (4, 10, 'initial', 1599998400000)").await.unwrap();
 		let id = QueryId::new();
 		let sql = "UPDATE storage_execution SET amount = amount + 1 WHERE id = 4";
@@ -2724,13 +2991,19 @@ mod mutation_integrity_pins {
 			committed(&client, id, "update-changed-replay").await,
 			original
 		);
-		daemon.shutdown().await.unwrap();
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+			.await
+			.expect("bounded daemon shutdown")
+			.unwrap();
 		fixture.shutdown();
+		starter_scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn delete_identity_replay_returns_original_counts_and_does_not_delete_a_different_key() {
-		let (fixture, daemon, client) = start(6294).await;
+		let (fixture, daemon, client, starter_scratch) = start_owned(6294).await;
 		client.execute("INSERT INTO storage_execution (id, amount, region, ts) VALUES (5, 10, 'one', 1599998400000), (6, 20, 'two', 1599998400000)").await.unwrap();
 		let id = QueryId::new();
 		let sql = "DELETE FROM storage_execution WHERE id = 5";
@@ -2775,21 +3048,32 @@ mod mutation_integrity_pins {
 				.delete_counts,
 			first.delete_counts
 		);
-		daemon.shutdown().await.unwrap();
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+			.await
+			.expect("bounded daemon shutdown")
+			.unwrap();
 		fixture.shutdown();
+		starter_scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn mutation_resolution_and_replay_survive_a_coordinator_restart() {
-		let (fixture, daemon, client) = start(6295).await;
+		let (fixture, daemon, client, starter_scratch) = start_owned(6295).await;
 		let id = QueryId::new();
 		let sql = "INSERT INTO storage_execution (id, amount, region, ts) VALUES (7, 10, 'restart', 1599998400000)";
 		let first_response = client.execute_with_query_id(id, sql, "UTC").await.unwrap();
 		committed(&client, id, "before-coordinator-restart").await;
-		daemon.shutdown().await.unwrap();
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+			.await
+			.expect("bounded daemon shutdown")
+			.unwrap();
 		drop(client);
+		let (owned_config_1, descriptor_scratch_1) =
+			owned_toron_config_with_descriptor(descriptor(), true);
 		let restarted = ToronDaemon::start_with_wendelon_client_for_harness(
-			toron_config_with_descriptor(descriptor(), true),
+			owned_config_1,
 			Arc::clone(&fixture.client),
 		)
 		.await
@@ -2808,15 +3092,26 @@ mod mutation_integrity_pins {
 			visible(&client, 7).await,
 			vec![(7, Some(10), Some("restart".into()))]
 		);
-		restarted.shutdown().await.unwrap();
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, restarted.shutdown())
+			.await
+			.expect("bounded daemon shutdown")
+			.unwrap();
 		fixture.shutdown();
+		starter_scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
+		descriptor_scratch_1
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn a_second_coordinator_observes_acknowledged_rows_from_the_same_storage_node() {
-		let (fixture, writer, client) = start(6296).await;
+		let (fixture, writer, client, starter_scratch) = start_owned(6296).await;
+		let (owned_config_1, descriptor_scratch_1) =
+			owned_toron_config_with_descriptor(descriptor(), true);
 		let reader = ToronDaemon::start_with_wendelon_client_for_harness(
-			toron_config_with_descriptor(descriptor(), true),
+			owned_config_1,
 			Arc::clone(&fixture.client),
 		)
 		.await
@@ -2831,19 +3126,32 @@ mod mutation_integrity_pins {
 			vec![(8, Some(10), Some("cross-coordinator".into()))]
 		);
 		println!("VISIBILITY_PIN coordinators=2 storage_nodes=1 effect=exact_after_ack");
-		reader.shutdown().await.unwrap();
-		writer.shutdown().await.unwrap();
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, reader.shutdown())
+			.await
+			.expect("bounded daemon shutdown")
+			.unwrap();
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, writer.shutdown())
+			.await
+			.expect("bounded daemon shutdown")
+			.unwrap();
 		fixture.shutdown();
+		starter_scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
+		descriptor_scratch_1
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn configured_tenant_replay_shares_a_cache_key_but_not_a_durable_outcome() {
-		let (fixture, first_daemon, first_client) = start(6297).await;
+		let (fixture, first_daemon, first_client, starter_scratch) = start_owned(6297).await;
 		let second_tenant = WendelonTenantId::new(2);
 		create_live_tenant(&fixture.node, second_tenant).await;
 		install_schema(&fixture.node, second_tenant, &descriptor()).await;
-		let mut config =
-			toron_config_with_descriptor_for_tenant(descriptor(), ToronTenantId(2), true);
+		let (owned_config_1, descriptor_scratch_1) =
+			owned_toron_config_with_descriptor_for_tenant(descriptor(), ToronTenantId(2), true);
+		let mut config = owned_config_1;
 		config.node.tenant_id = ToronTenantId(2);
 		let second_daemon = ToronDaemon::start_with_wendelon_client_for_harness(
 			config,
@@ -2966,9 +3274,21 @@ mod mutation_integrity_pins {
 				);
 			}
 		}
-		second_daemon.shutdown().await.unwrap();
-		first_daemon.shutdown().await.unwrap();
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, second_daemon.shutdown())
+			.await
+			.expect("bounded daemon shutdown")
+			.unwrap();
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, first_daemon.shutdown())
+			.await
+			.expect("bounded daemon shutdown")
+			.unwrap();
 		fixture.shutdown();
+		starter_scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
+		descriptor_scratch_1
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn certificate_tenant_replay_shares_a_cache_key_but_not_a_durable_outcome() {
@@ -2982,7 +3302,7 @@ mod mutation_integrity_pins {
 		}
 		let ca = ca_cert();
 		let make_pki = |worker: WorkerId, tenant: &str| {
-			let dir = fresh_dir("mutation-auth-tenants");
+			let dir = TestDir::new("toron-sql-listener-mutation-auth-tenants-owned");
 			let pki = TestPki {
 				ca_cert: dir.join("ca.pem"),
 				daemon_cert: dir.join("daemon.pem"),
@@ -3006,25 +3326,29 @@ mod mutation_integrity_pins {
 			write_signed_cert(&pki.client_cert, &pki.client_key, &client, &ca);
 			std::fs::set_permissions(&pki.client_key, std::fs::Permissions::from_mode(0o600))
 				.unwrap();
-			pki
+			(pki, dir.pending())
 		};
 		let first_worker = WorkerId::from_u128(63001);
 		let second_worker = WorkerId::from_u128(63002);
-		let first_pki = make_pki(first_worker, "1");
-		let second_pki = make_pki(second_worker, "2");
-		let first_config = toron_config_with_descriptor_tls_for_tenant(
-			descriptor(),
-			ToronTenantId(1),
-			first_worker,
-			&first_pki,
-		);
+		let (first_pki, first_pki_scratch) = make_pki(first_worker, "1");
+		let (second_pki, second_pki_scratch) = make_pki(second_worker, "2");
+		let (owned_config_1, descriptor_scratch_1) =
+			owned_toron_config_with_descriptor_tls_for_tenant(
+				descriptor(),
+				ToronTenantId(1),
+				first_worker,
+				&first_pki,
+			);
+		let first_config = owned_config_1;
 		// The node fallback stays tenant 1: only the client-2 certificate selects tenant 2.
-		let second_config = toron_config_with_descriptor_tls_for_tenant(
-			descriptor(),
-			ToronTenantId(2),
-			second_worker,
-			&second_pki,
-		);
+		let (owned_config_2, descriptor_scratch_2) =
+			owned_toron_config_with_descriptor_tls_for_tenant(
+				descriptor(),
+				ToronTenantId(2),
+				second_worker,
+				&second_pki,
+			);
+		let second_config = owned_config_2;
 		assert_eq!(second_config.node.tenant_id, ToronTenantId(1));
 		let first_daemon = ToronDaemon::start_with_wendelon_client_for_harness(
 			first_config,
@@ -3167,13 +3491,31 @@ mod mutation_integrity_pins {
 				);
 			}
 		}
-		second_daemon.shutdown().await.unwrap();
-		first_daemon.shutdown().await.unwrap();
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, second_daemon.shutdown())
+			.await
+			.expect("bounded daemon shutdown")
+			.unwrap();
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, first_daemon.shutdown())
+			.await
+			.expect("bounded daemon shutdown")
+			.unwrap();
 		fixture.shutdown();
+		descriptor_scratch_1
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
+		descriptor_scratch_2
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
+		first_pki_scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
+		second_pki_scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn an_old_v7_first_sql_submission_is_expired_and_creates_no_row() {
-		let (fixture, daemon, client) = start(6301).await;
+		let (fixture, daemon, client, starter_scratch) = start_owned(6301).await;
 		let now_ms = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
 			.unwrap()
@@ -3214,12 +3556,18 @@ mod mutation_integrity_pins {
 			raw_stop_reason(outcome.stop_reason),
 			raw_commit_knowledge(outcome.commit_knowledge)
 		);
-		daemon.shutdown().await.unwrap();
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+			.await
+			.expect("bounded daemon shutdown")
+			.unwrap();
 		fixture.shutdown();
+		starter_scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn reusing_a_select_query_id_does_not_hold_a_cross_request_snapshot() {
-		let (fixture, daemon, client) = start(6302).await;
+		let (fixture, daemon, client, starter_scratch) = start_owned(6302).await;
 		client.execute("INSERT INTO storage_execution (id, amount, region, ts) VALUES (6302, 10, 'snapshot-probe', 1599998400000)").await.unwrap();
 		let read_id = QueryId::new();
 		let query = "SELECT id, amount, region FROM storage_execution WHERE id = 6302";
@@ -3256,8 +3604,14 @@ mod mutation_integrity_pins {
 		println!(
 			"SNAPSHOT_PIN scope=cross_request_same_select_id before_amount=10 after_amount=11 held_snapshot=false multi_table_concurrent=unavailable"
 		);
-		daemon.shutdown().await.unwrap();
+		tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
+			.await
+			.expect("bounded daemon shutdown")
+			.unwrap();
 		fixture.shutdown();
+		starter_scratch
+			.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+			.await;
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
