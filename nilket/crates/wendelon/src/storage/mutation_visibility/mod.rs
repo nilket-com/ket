@@ -21,7 +21,3 @@ use error::redacted_debug;
 
 #[cfg(test)]
 mod tests;
-
-// Tracked measurement phases stay below the cfg(test) authority test tree.
-#[cfg(test)]
-pub(crate) use tests::g2::Phase as G2TrackedPhase;
