@@ -874,7 +874,7 @@ async fn table_query_cancelled_before_planning_returns_query_cancelled() {
 	let dir = bootstrap_tempdir("table-query-cancel-pre-plan");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		73,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -898,7 +898,7 @@ async fn table_query_cancelled_before_planning_returns_query_cancelled() {
 
 	assert_eq!(plan.response.status, ReadStatus::QUERY_CANCELLED);
 	assert_eq!(plan.response.rows, 0);
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[test]
@@ -1241,10 +1241,15 @@ async fn aggregate_csb_test_server(
 	temp_tag: &str,
 	clock: Arc<dyn PhysicalClock>,
 	retention_policy: MvccRetentionPolicy,
-) -> (WendelonNode, WendelonDataServer) {
+) -> (
+	crate::test_support::TestDir,
+	WendelonNode,
+	WendelonDataServer,
+) {
+	let node_dir = bootstrap_tempdir(temp_tag);
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		node_id,
-		bootstrap_tempdir(temp_tag),
+		node_dir.to_path_buf(),
 		format!("loopback://{node_id}"),
 	))
 	.await
@@ -1301,7 +1306,7 @@ async fn aggregate_csb_test_server(
 	.unwrap()
 	.with_mvcc_retention_policy(retention_policy);
 
-	(node, server)
+	(node_dir, node, server)
 }
 
 fn fresh_dir(tag: &str) -> std::path::PathBuf {
@@ -1563,7 +1568,7 @@ async fn cdc_live_recovery_upper_is_table_scoped_and_safe_gated() {
 	let dir = bootstrap_tempdir("cdc-live-recovery-upper");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		46,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -1646,7 +1651,7 @@ async fn cdc_live_recovery_upper_is_table_scoped_and_safe_gated() {
 		Some(target_cursor)
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 fn kv_batch(key: &[u8], value: &[u8]) -> RecordBatch {
@@ -1699,19 +1704,22 @@ struct OrphanWitnessFixture {
 	leader: Arc<WendelonDataServer>,
 	follower: Arc<WendelonDataServer>,
 	epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
+	_dirs: Vec<crate::test_support::TestDir>,
 }
 
 async fn build_orphan_witness_fixture(tag: &str) -> OrphanWitnessFixture {
+	let leader_node_dir = bootstrap_tempdir(&format!("{tag}-leader"));
 	let leader_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		26,
-		bootstrap_tempdir(&format!("{tag}-leader")),
+		leader_node_dir.to_path_buf(),
 		"loopback://26".into(),
 	))
 	.await
 	.unwrap();
+	let follower_node_dir = bootstrap_tempdir(&format!("{tag}-follower"));
 	let follower_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		27,
-		bootstrap_tempdir(&format!("{tag}-follower")),
+		follower_node_dir.to_path_buf(),
 		"loopback://27".into(),
 	))
 	.await
@@ -1817,6 +1825,7 @@ async fn build_orphan_witness_fixture(tag: &str) -> OrphanWitnessFixture {
 		leader,
 		follower,
 		epoch_tx,
+		_dirs: vec![leader_node_dir, follower_node_dir],
 	}
 }
 
@@ -3598,109 +3607,37 @@ use crate::schema::{
 	ClientWriteId, Consistency as SchemaConsistency, DurabilityLevel, SlabId, WriteRequestMeta,
 };
 
-/// Removes lease scratch left by test processes that are no longer running.
-///
-/// These directories hold a bootstrapped single-node cluster and reach hundreds
-/// of megabytes each. `std::env::temp_dir()` is a RAM-backed tmpfs here, so
-/// leaked scratch is charged against memory and eventually fails *unrelated*
-/// tests — the worst diagnostic shape, because the failure appears far from its
-/// cause. One observed run had accumulated 8,562 directories.
-///
-/// Liveness, not age, decides: the pid is embedded in the name, so a directory
-/// belonging to a live process is never touched and concurrent cargo
-/// invocations stay safe. Sweeping once per process keeps this off the hot path
-/// of 80-odd call sites.
-fn sweep_dead_lease_scratch() {
-	static SWEPT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-	SWEPT.get_or_init(|| {
-		let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
-			return;
-		};
-		for entry in entries.flatten() {
-			let name = entry.file_name();
-			let Some(name) = name.to_str() else { continue };
-			if !name.starts_with("wendelon-lease-") {
-				continue;
-			}
-			// `wendelon-lease-{tag}-{pid}-{uuid}`; the uuid is five
-			// hyphen-separated segments, so the pid precedes them. The tag may
-			// contain hyphens, which is why this counts from the end.
-			let parts: Vec<&str> = name.split('-').collect();
-			let Some(pid) = parts
-				.len()
-				.checked_sub(6)
-				.and_then(|index| parts.get(index))
-			else {
-				continue;
-			};
-			let Ok(pid) = pid.parse::<u32>() else {
-				continue;
-			};
-			if std::path::Path::new(&format!("/proc/{pid}")).exists() {
-				continue;
-			}
-			let _ = std::fs::remove_dir_all(entry.path());
-		}
-	});
+fn bootstrap_tempdir(tag: &str) -> crate::test_support::TestDir {
+	crate::test_support::TestDir::new(&format!("wendelon-lease-{tag}"))
 }
 
 #[test]
-fn dead_lease_scratch_is_swept_and_live_scratch_is_kept() {
-	// The pid sits between a hyphen-bearing tag and a five-segment uuid, so the
-	// parse counts from the end. A silently wrong parse would either sweep
-	// nothing (the leak persists) or sweep a live run's directory mid-test.
-	let live_pid = std::process::id();
-	let dead_pid = u32::MAX; // /proc/4294967295 cannot exist
-	let uuid = uuid::Uuid::new_v4();
-	let temp = std::env::temp_dir();
-
-	let live = temp.join(format!("wendelon-lease-tag-with-hyphens-{live_pid}-{uuid}"));
-	let dead = temp.join(format!("wendelon-lease-tag-with-hyphens-{dead_pid}-{uuid}"));
-	std::fs::create_dir_all(&live).unwrap();
-	std::fs::create_dir_all(&dead).unwrap();
-	// Non-empty, because the real leak is directories full of slab data.
-	std::fs::write(dead.join("slab"), b"x").unwrap();
-
-	// Call the sweep directly rather than through `bootstrap_tempdir`, whose
-	// OnceLock may already have fired for this process.
-	let entries = std::fs::read_dir(&temp).unwrap();
-	for entry in entries.flatten() {
-		let name = entry.file_name();
-		let Some(name) = name.to_str() else { continue };
-		if !name.starts_with("wendelon-lease-") {
-			continue;
-		}
-		let parts: Vec<&str> = name.split('-').collect();
-		let Some(pid) = parts
-			.len()
-			.checked_sub(6)
-			.and_then(|index| parts.get(index))
-		else {
-			continue;
-		};
-		let Ok(pid) = pid.parse::<u32>() else {
-			continue;
-		};
-		if std::path::Path::new(&format!("/proc/{pid}")).exists() {
-			continue;
-		}
-		let _ = std::fs::remove_dir_all(entry.path());
+fn lease_scratch_guard_removes_only_its_owned_directory() {
+	let other = bootstrap_tempdir("ownership-other");
+	std::fs::write(other.join("slab"), b"keep").unwrap();
+	let owned_path;
+	{
+		let owned = bootstrap_tempdir("ownership-owned");
+		owned_path = owned.to_path_buf();
+		std::fs::write(owned.join("slab"), b"remove").unwrap();
+		assert!(owned_path.exists());
+		assert_eq!(std::fs::read(other.join("slab")).unwrap(), b"keep");
 	}
-
-	assert!(live.exists(), "scratch owned by a live pid must be kept");
-	assert!(!dead.exists(), "scratch owned by a dead pid must be swept");
-	let _ = std::fs::remove_dir_all(&live);
+	assert!(
+		!owned_path.exists(),
+		"dropping the guard removes non-empty scratch"
+	);
+	assert_eq!(std::fs::read(other.join("slab")).unwrap(), b"keep");
 }
 
-fn bootstrap_tempdir(tag: &str) -> std::path::PathBuf {
-	sweep_dead_lease_scratch();
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-lease-{tag}-{}-{}",
-		std::process::id(),
-		uuid::Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+async fn shutdown_lease_node(node: WendelonNode) {
+	node.handles.abort();
+	tokio::time::timeout(Duration::from_secs(10), async {
+		node.raft.shutdown().await.unwrap();
+		node.shutdown().await.unwrap();
+	})
+	.await
+	.expect("lease fixture node shutdown timed out");
 }
 
 fn simple_write_meta(epoch: u64) -> WriteRequestMeta {
@@ -3795,7 +3732,7 @@ async fn write_rejected_when_lease_gate_on_and_cache_empty() {
 	let dir = bootstrap_tempdir("empty-cache");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		11,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -3816,6 +3753,7 @@ async fn write_rejected_when_lease_gate_on_and_cache_empty() {
 		.unwrap();
 	assert_eq!(resp.status, WriteStatus::LEASE_EXPIRED);
 	assert_eq!(resp.leader_hint, node.local_node);
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -3823,7 +3761,7 @@ async fn linearizable_read_rejected_when_lease_missing() {
 	let dir = bootstrap_tempdir("lin-read");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		12,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -3836,6 +3774,7 @@ async fn linearizable_read_rejected_when_lease_missing() {
 		.await
 		.unwrap();
 	assert_eq!(resp.status, ReadStatus::LEASE_EXPIRED);
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -3843,7 +3782,7 @@ async fn refresh_leases_once_clears_stale_epoch_entries() {
 	let dir = bootstrap_tempdir("stale-epoch");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		13,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -3888,6 +3827,7 @@ async fn refresh_leases_once_clears_stale_epoch_entries() {
 		"stale-epoch leases must be evicted; cache={entries:?}"
 	);
 	assert!(entries.iter().any(|l| l.holder.id == node.local_node.id));
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -3895,7 +3835,7 @@ async fn write_accepted_once_lease_manager_has_granted() {
 	let dir = bootstrap_tempdir("accept");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		14,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -3930,6 +3870,7 @@ async fn write_accepted_once_lease_manager_has_granted() {
 		.await
 		.unwrap();
 	assert_eq!(resp.status, WriteStatus::OK, "got resp={resp:?}");
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -3937,7 +3878,7 @@ async fn finalization_marker_preserves_requested_durability_class() {
 	let dir = bootstrap_tempdir("durability-marker");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		15,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -3974,6 +3915,7 @@ async fn finalization_marker_preserves_requested_durability_class() {
 			.durability,
 		DurabilityLevel::LEADER
 	);
+	shutdown_lease_node(node).await;
 }
 
 #[test]
@@ -5395,7 +5337,7 @@ async fn table_write_single_row_commits_typed_arrow_payload() {
 	let dir = bootstrap_tempdir("table-write-single-row");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		37,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -5447,13 +5389,13 @@ async fn table_write_single_row_commits_typed_arrow_payload() {
 		.unwrap();
 	assert_eq!(ids.value(0), 7);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
 async fn terminal_table_outcome_resolves_and_replays_after_server_reopen_without_reapply() {
 	let dir = bootstrap_tempdir("table-write-durable-outcome-reopen");
-	let cfg = NodeBootstrapConfig::dev(38, dir, "127.0.0.1:0".into());
+	let cfg = NodeBootstrapConfig::dev(38, dir.to_path_buf(), "127.0.0.1:0".into());
 	let node = WendelonNode::bootstrap_single_node(cfg.clone())
 		.await
 		.unwrap();
@@ -5486,8 +5428,7 @@ async fn terminal_table_outcome_resolves_and_replays_after_server_reopen_without
 	assert_eq!(first.write.status, WriteStatus::OK);
 	let durable_bytes = node.slab.local_l1_bytes().await;
 
-	node.handles.abort();
-	drop(node);
+	shutdown_lease_node(node).await;
 	tokio::time::sleep(Duration::from_millis(25)).await;
 	let reopened = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -5526,13 +5467,13 @@ async fn terminal_table_outcome_resolves_and_replays_after_server_reopen_without
 		durable_bytes,
 		"restart replay must resolve the retained parent operation, never append again"
 	);
-	reopened.handles.abort();
+	shutdown_lease_node(reopened).await;
 }
 
 #[tokio::test]
 async fn post_dispatch_expiry_resolves_and_replays_as_one_indeterminate_operation_after_restart() {
 	let dir = bootstrap_tempdir("table-write-indeterminate-outcome-reopen");
-	let cfg = NodeBootstrapConfig::dev(39, dir, "127.0.0.1:0".into());
+	let cfg = NodeBootstrapConfig::dev(39, dir.to_path_buf(), "127.0.0.1:0".into());
 	let node = WendelonNode::bootstrap_single_node(cfg.clone())
 		.await
 		.unwrap();
@@ -5583,8 +5524,7 @@ async fn post_dispatch_expiry_resolves_and_replays_as_one_indeterminate_operatio
 	let durable_bytes = node.slab.local_l1_bytes().await;
 	assert!(durable_bytes > 0, "the post-dispatch append must have run");
 
-	node.handles.abort();
-	drop(node);
+	shutdown_lease_node(node).await;
 	tokio::time::sleep(Duration::from_millis(25)).await;
 	let reopened = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
 	let leader_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -5624,13 +5564,13 @@ async fn post_dispatch_expiry_resolves_and_replays_as_one_indeterminate_operatio
 		durable_bytes,
 		"replay must resolve the retained operation, never append a second copy"
 	);
-	reopened.handles.abort();
+	shutdown_lease_node(reopened).await;
 }
 
 #[tokio::test]
 async fn final_attempt_exhaustion_is_a_durable_two_axis_outcome() {
 	let dir = bootstrap_tempdir("table-write-attempt-exhaustion-reopen");
-	let cfg = NodeBootstrapConfig::dev(40, dir, "127.0.0.1:0".into());
+	let cfg = NodeBootstrapConfig::dev(40, dir.to_path_buf(), "127.0.0.1:0".into());
 	let node = WendelonNode::bootstrap_single_node(cfg.clone())
 		.await
 		.unwrap();
@@ -5667,8 +5607,7 @@ async fn final_attempt_exhaustion_is_a_durable_two_axis_outcome() {
 		before_bytes,
 		node.slab.local_l1_bytes().await
 	);
-	node.handles.abort();
-	drop(node);
+	shutdown_lease_node(node).await;
 	let reopened = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
 	let resolved = reopened
 		.data_server
@@ -5695,7 +5634,7 @@ async fn final_attempt_exhaustion_is_a_durable_two_axis_outcome() {
 		resolved.write.mutation_commit_knowledge().0,
 		reopened.slab.local_l1_bytes().await
 	);
-	reopened.handles.abort();
+	shutdown_lease_node(reopened).await;
 }
 
 #[tokio::test]
@@ -5715,7 +5654,7 @@ async fn adr0539_two_ordinary_sampler_sized_ingest_cycles_remain_readable() {
 	let dir = bootstrap_tempdir("adr0539-two-cycle-ingest");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		539,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -5776,7 +5715,7 @@ async fn adr0539_two_ordinary_sampler_sized_ingest_cycles_remain_readable() {
 		);
 	}
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -5784,7 +5723,7 @@ async fn content_hash_table_write_absorbs_visible_duplicate_content() {
 	let dir = bootstrap_tempdir("content-hash-table-write-duplicate");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		49,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -5865,7 +5804,7 @@ async fn content_hash_table_write_absorbs_visible_duplicate_content() {
 		"absorbed duplicate must not replace the visible row location"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -5873,7 +5812,7 @@ async fn content_hash_table_write_filters_duplicate_rows_within_batch() {
 	let dir = bootstrap_tempdir("content-hash-table-write-in-batch-duplicate");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		50,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -5932,7 +5871,7 @@ async fn content_hash_table_write_filters_duplicate_rows_within_batch() {
 		"only one physical row should be packed for duplicate content within the same batch"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -5940,7 +5879,7 @@ async fn content_hash_table_reingest_after_logical_retention_floor_stores_new_ro
 	let dir = bootstrap_tempdir("content-hash-logical-retention-reingest");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		51,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -6093,7 +6032,7 @@ async fn content_hash_table_reingest_after_logical_retention_floor_stores_new_ro
 		Some(reingest_location)
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -6101,7 +6040,7 @@ async fn column_projection_write_preserves_slab_record_header_layout() {
 	let dir = bootstrap_tempdir("column-projection-slab-header");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		38,
-		dir.clone(),
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -6156,7 +6095,7 @@ async fn column_projection_write_preserves_slab_record_header_layout() {
 	assert_eq!(header.tenant_id, tenant());
 	assert_eq!(header.key_identity, key_identity);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -6164,7 +6103,7 @@ async fn table_write_rejects_stale_schema_generation_distinct_from_unknown() {
 	let dir = bootstrap_tempdir("table-write-stale-schema");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		40,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -6206,7 +6145,7 @@ async fn table_write_rejects_stale_schema_generation_distinct_from_unknown() {
 		assert!(trailing.is_none());
 	}
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -6214,7 +6153,7 @@ async fn pk_table_delete_supersedes_single_row_and_allows_resurrection() {
 	let dir = bootstrap_tempdir("pk-delete-single-row-supersession");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		52,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -6362,7 +6301,7 @@ async fn pk_table_delete_supersedes_single_row_and_allows_resurrection() {
 		.unwrap();
 	assert_eq!(names.value(0), "after-delete");
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -6370,7 +6309,7 @@ async fn pk_delete_read_surfaces_track_tombstone_and_resurrection() {
 	let dir = bootstrap_tempdir("pk-delete-read-surfaces");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		53,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -6545,7 +6484,7 @@ async fn pk_delete_read_surfaces_track_tombstone_and_resurrection() {
 	assert_eq!(resurrected_count.status, AggregateStatus::Success);
 	assert_eq!(count_star_partial_value(&resurrected_count), 2);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -6553,7 +6492,7 @@ async fn table_query_plan_carries_ready_secondary_index_access_plan() {
 	let dir = bootstrap_tempdir("table-query-secondary-index-plan");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		54,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -6629,7 +6568,7 @@ async fn table_query_plan_carries_ready_secondary_index_access_plan() {
 		}
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -6637,7 +6576,7 @@ async fn table_write_populates_building_secondary_index_active_buffer() {
 	let dir = bootstrap_tempdir("table-write-secondary-index-active-buffer");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		56,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -6711,7 +6650,7 @@ async fn table_write_populates_building_secondary_index_active_buffer() {
 		.unwrap();
 	assert_eq!(segment.entries[0].encoded_key, b"target".to_vec());
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -6719,7 +6658,7 @@ async fn table_write_seals_secondary_index_active_buffer_after_slab_rotation() {
 	let dir = bootstrap_tempdir("table-write-secondary-index-active-buffer-seal");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		57,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -6808,7 +6747,7 @@ async fn table_write_seals_secondary_index_active_buffer_after_slab_rotation() {
 	assert_eq!(segment.entries.len(), 1);
 	assert_eq!(segment.entries[0].encoded_key, b"first".to_vec());
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -6816,7 +6755,7 @@ async fn table_query_secondary_index_execution_returns_sidecar_rows() {
 	let dir = bootstrap_tempdir("table-query-secondary-index-execution");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		55,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -6912,7 +6851,7 @@ async fn table_query_secondary_index_execution_returns_sidecar_rows() {
 	assert_eq!(ids.value(0), 1);
 	assert_eq!(names.value(0), "target");
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -6920,7 +6859,7 @@ async fn table_delete_emits_tombstone_and_replays_counts() {
 	let dir = bootstrap_tempdir("table-delete-row-tombstone");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		48,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -7045,7 +6984,7 @@ async fn table_delete_emits_tombstone_and_replays_counts() {
 	assert_eq!(already_resp.already_deleted_count, 1);
 	assert_eq!(already_resp.not_found_count, 0);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -7053,7 +6992,7 @@ async fn table_delete_fails_closed_when_target_locality_is_missing() {
 	let dir = bootstrap_tempdir("table-delete-missing-locality");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		49,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -7148,7 +7087,7 @@ async fn table_delete_fails_closed_when_target_locality_is_missing() {
 	assert!(!latest.is_tombstone);
 	assert_eq!(latest.hlc, original_location.hlc);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -7156,7 +7095,7 @@ async fn table_write_multi_row_commits_one_parent_finalization() {
 	let dir = bootstrap_tempdir("table-write-multi-row");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		38,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -7253,7 +7192,7 @@ async fn table_write_multi_row_commits_one_parent_finalization() {
 		assert_eq!(ids.value(0), id_value);
 	}
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -7261,7 +7200,7 @@ async fn table_write_cdc_releases_when_pending_intent_persistence_fails_but_fina
 	let dir = bootstrap_tempdir("table-cdc-pending-upsert-fail-finalize-ok");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		43,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -7324,7 +7263,7 @@ async fn table_write_cdc_releases_when_pending_intent_persistence_fails_but_fina
 		"immediate finalization success must release the pending CDC staging record"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -7332,7 +7271,7 @@ async fn table_write_cdc_evicts_when_pending_intent_persistence_and_finalize_fai
 	let dir = bootstrap_tempdir("table-cdc-pending-upsert-finalize-fail");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		44,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -7398,7 +7337,7 @@ async fn table_write_cdc_evicts_when_pending_intent_persistence_and_finalize_fai
 	);
 	assert!(node.data_server.cdc_pending_live_entries.is_empty());
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -7406,7 +7345,7 @@ async fn table_replica_cdc_releases_when_parent_finalization_marker_applies() {
 	let dir = bootstrap_tempdir("table-replica-cdc-marker-release");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		45,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -7503,7 +7442,7 @@ async fn table_replica_cdc_releases_when_parent_finalization_marker_applies() {
 	assert_eq!(entries[0].cursor.row_hlc, commit_hlc);
 	assert!(entries[0].is_finalized());
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -7511,7 +7450,7 @@ async fn adr0094_p2_provisional_rows_are_unreachable_by_direct_object_query() {
 	let dir = bootstrap_tempdir("adr0094-provisional-direct-query");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		94,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -7612,7 +7551,7 @@ async fn adr0094_p2_provisional_rows_are_unreachable_by_direct_object_query() {
 	assert_eq!(response_meta.status, ReadStatus::QUERY_INVALID_PROGRAM);
 	assert!(response.arrow_payload.is_none());
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -7620,7 +7559,7 @@ async fn adr0094_declared_child_writes_share_the_provisional_descriptor() {
 	let dir = bootstrap_tempdir("adr0094-provisional-write-chain");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		95,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -7719,14 +7658,15 @@ async fn adr0094_declared_child_writes_share_the_provisional_descriptor() {
 		"the declared half-open child range must not authorize its end"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn adr0095_rf1_sweeper_reclaims_attests_and_settles_the_exact_debt() {
+	let node_dir = bootstrap_tempdir("adr0095-rf1-settlement");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		195,
-		bootstrap_tempdir("adr0095-rf1-settlement"),
+		node_dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -7744,7 +7684,7 @@ async fn adr0095_rf1_sweeper_reclaims_attests_and_settles_the_exact_debt() {
 	}
 	// Keep this control deterministic: the production task uses this same method,
 	// but the test drives exactly one pass at a time.
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 	let descriptor = multirow_typed_table_descriptor();
 	let installed = node
 		.raft
@@ -8012,7 +7952,7 @@ async fn table_query_dispatch_materializes_multirow_records_before_pbc() {
 	let dir = bootstrap_tempdir("table-query-rebatch");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		39,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -8184,7 +8124,7 @@ async fn table_query_dispatch_materializes_multirow_records_before_pbc() {
 		.unwrap();
 	assert_eq!(ids.value(0), source_ids[1]);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -8192,7 +8132,7 @@ async fn aggregate_dispatch_folds_filtered_table_rows() {
 	let dir = bootstrap_tempdir("aggregate-dispatch");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		44,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -8330,22 +8270,24 @@ async fn aggregate_dispatch_folds_filtered_table_rows() {
 	.unwrap();
 	assert_eq!(response.partials[1].state, expected_sum);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 async fn aggregate_coordinator_fixture(
 	node_id: u32,
 	peer_capabilities: crate::network::transport::NodeCapabilitySet,
 ) -> (
+	crate::test_support::TestDir,
 	WendelonNode,
 	Arc<WendelonDataServer>,
 	Arc<LoopbackHandlers>,
 	NodeId,
 	AggregateRequest,
 ) {
+	let node_dir = bootstrap_tempdir(&format!("aggregate-coordinator-{node_id}"));
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		node_id,
-		bootstrap_tempdir(&format!("aggregate-coordinator-{node_id}")),
+		node_dir.to_path_buf(),
 		format!("loopback://{node_id}"),
 	))
 	.await
@@ -8454,7 +8396,7 @@ async fn aggregate_coordinator_fixture(
 			max_partial_state_bytes: ByteCount::new(4_096),
 		},
 	};
-	(node, coordinator, handlers, peer, request)
+	(node_dir, node, coordinator, handlers, peer, request)
 }
 
 fn aggregate_request_frame(pool: &Arc<BufPool>, request: &AggregateRequest) -> HrftFrame {
@@ -8564,7 +8506,7 @@ impl crate::network::server::HrftService for StaticAggregateService {
 
 #[tokio::test]
 async fn aggregate_coordinator_rejects_peer_without_partial_capability() {
-	let (node, coordinator, _handlers, _peer, request) =
+	let (_node_dir, node, coordinator, _handlers, _peer, request) =
 		aggregate_coordinator_fixture(45, crate::network::transport::NodeCapabilitySet::empty())
 			.await;
 
@@ -8575,12 +8517,12 @@ async fn aggregate_coordinator_rejects_peer_without_partial_capability() {
 		Some(AggRejectCode::CapabilityUnavailable)
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
 async fn aggregate_coordinator_rejects_remote_failure() {
-	let (node, coordinator, _handlers, _peer, request) = aggregate_coordinator_fixture(
+	let (_node_dir, node, coordinator, _handlers, _peer, request) = aggregate_coordinator_fixture(
 		46,
 		crate::network::transport::NodeCapabilitySet::empty()
 			.with(NodeCapability::PartialAggregatePushdown),
@@ -8591,12 +8533,12 @@ async fn aggregate_coordinator_rejects_remote_failure() {
 	assert_eq!(response.status, AggregateStatus::Rejected);
 	assert_eq!(response.reject_code, Some(AggRejectCode::DeadlineExceeded));
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
 async fn aggregate_coordinator_merges_peer_partial_response() {
-	let (node, coordinator, handlers, peer, request) = aggregate_coordinator_fixture(
+	let (_node_dir, node, coordinator, handlers, peer, request) = aggregate_coordinator_fixture(
 		47,
 		crate::network::transport::NodeCapabilitySet::empty()
 			.with(NodeCapability::PartialAggregatePushdown),
@@ -8617,12 +8559,12 @@ async fn aggregate_coordinator_merges_peer_partial_response() {
 	assert_eq!(response.partials[0].state.as_slice(), &2_u64.to_be_bytes());
 	assert_eq!(response.diagnostics.rows_admitted, 2);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
 async fn aggregate_coordinator_rejects_peer_crossbind_mismatch() {
-	let (node, coordinator, handlers, peer, request) = aggregate_coordinator_fixture(
+	let (_node_dir, node, coordinator, handlers, peer, request) = aggregate_coordinator_fixture(
 		48,
 		crate::network::transport::NodeCapabilitySet::empty()
 			.with(NodeCapability::PartialAggregatePushdown),
@@ -8644,7 +8586,7 @@ async fn aggregate_coordinator_rejects_peer_crossbind_mismatch() {
 		Some(AggRejectCode::PartialCrossbindFailed)
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[test]
@@ -8663,9 +8605,10 @@ fn aggregate_reject_mapping_preserves_retention_expired() {
 async fn aggregate_retention_floor_reject_uses_retention_expired_code() {
 	let mgr = make_manager().await;
 	let descriptor = append_only_table_descriptor();
+	let node_dir = bootstrap_tempdir("aggregate-retention-expired-node");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		52,
-		bootstrap_tempdir("aggregate-retention-expired-node"),
+		node_dir.to_path_buf(),
 		"loopback://52".into(),
 	))
 	.await
@@ -8778,7 +8721,7 @@ async fn aggregate_retention_floor_reject_uses_retention_expired_code() {
 		"aggregate retention admission should increment the read-floor reject metric"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[test]
@@ -8902,9 +8845,10 @@ async fn aggregate_csb_direct_answer_handles_count_min_and_max() {
 	let l2 = Arc::new(MockObjectStore::default());
 	let (mgr, descriptor) =
 		tier_identity_typed_table_batch_with_stats(l2, vec![1, 2], "agg-csb.wnd").await;
+	let node_dir = bootstrap_tempdir("aggregate-csb-node");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		49,
-		bootstrap_tempdir("aggregate-csb-node"),
+		node_dir.to_path_buf(),
 		"loopback://49".into(),
 	))
 	.await
@@ -9013,7 +8957,7 @@ async fn aggregate_csb_direct_answer_handles_count_min_and_max() {
 	assert_eq!(&response.partials[2].state[4..12], min.as_slice());
 	assert_eq!(&response.partials[3].state[4..12], max.as_slice());
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -9022,7 +8966,7 @@ async fn aggregate_csb_retention_floor_below_slab_allows_direct_answer() {
 	let (mgr, descriptor) =
 		tier_identity_typed_table_batch_with_stats(l2, vec![1, 2], "agg-csb-retention-ok.wnd")
 			.await;
-	let (node, server) = aggregate_csb_test_server(
+	let (_node_dir, node, server) = aggregate_csb_test_server(
 		mgr,
 		&descriptor,
 		53,
@@ -9040,7 +8984,7 @@ async fn aggregate_csb_retention_floor_below_slab_allows_direct_answer() {
 	assert_eq!(response.diagnostics.rows_admitted, 2);
 	assert_eq!(count_star_partial_value(&response), 2);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -9049,7 +8993,7 @@ async fn aggregate_csb_retention_floor_above_slab_returns_zero_contribution() {
 	let (mgr, descriptor) =
 		tier_identity_typed_table_batch_with_stats(l2, vec![1, 2], "agg-csb-retention-zero.wnd")
 			.await;
-	let (node, server) = aggregate_csb_test_server(
+	let (_node_dir, node, server) = aggregate_csb_test_server(
 		mgr,
 		&descriptor,
 		54,
@@ -9069,7 +9013,7 @@ async fn aggregate_csb_retention_floor_above_slab_returns_zero_contribution() {
 	assert_eq!(response.diagnostics.rows_filtered_out, 2);
 	assert_eq!(count_star_partial_value(&response), 0);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -9081,7 +9025,7 @@ async fn aggregate_csb_retention_floor_straddling_slab_falls_back_to_row_filter(
 		"agg-csb-retention-straddle.wnd",
 	)
 	.await;
-	let (node, server) = aggregate_csb_test_server(
+	let (_node_dir, node, server) = aggregate_csb_test_server(
 		mgr,
 		&descriptor,
 		55,
@@ -9111,7 +9055,7 @@ async fn aggregate_csb_retention_floor_straddling_slab_falls_back_to_row_filter(
 	assert_eq!(response.diagnostics.rows_admitted, 1);
 	assert_eq!(count_star_partial_value(&response), 1);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -9119,9 +9063,10 @@ async fn aggregate_csb_direct_answer_falls_through_when_sm_tombstone_affects_sla
 	let l2 = Arc::new(MockObjectStore::default());
 	let (mgr, descriptor) =
 		tier_identity_typed_table_batch_with_stats(l2, vec![1, 2], "agg-csb-tombstone.wnd").await;
+	let node_dir = bootstrap_tempdir("aggregate-csb-tombstone-node");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		50,
-		bootstrap_tempdir("aggregate-csb-tombstone-node"),
+		node_dir.to_path_buf(),
 		"loopback://50".into(),
 	))
 	.await
@@ -9222,7 +9167,7 @@ async fn aggregate_csb_direct_answer_falls_through_when_sm_tombstone_affects_sla
 		"state-machine tombstones must fence CSB direct answer even when the pointer says None"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -9280,9 +9225,10 @@ async fn aggregate_csb_direct_answer_falls_through_when_tiered_slab_has_supersed
 	.await
 	.unwrap();
 
+	let node_dir = bootstrap_tempdir("aggregate-csb-supersession-node");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		51,
-		bootstrap_tempdir("aggregate-csb-supersession-node"),
+		node_dir.to_path_buf(),
 		"loopback://51".into(),
 	))
 	.await
@@ -9372,28 +9318,31 @@ async fn aggregate_csb_direct_answer_falls_through_when_tiered_slab_has_supersed
 		"superseded rows in a tiered slab must fence CSB direct answer"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
 async fn table_write_fans_out_child_groups_to_distinct_replica_sets() {
+	let leader_node_dir = bootstrap_tempdir("table-fanout-leader");
 	let leader_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		40,
-		bootstrap_tempdir("table-fanout-leader"),
+		leader_node_dir.to_path_buf(),
 		"loopback://40".into(),
 	))
 	.await
 	.unwrap();
+	let durable_a_node_dir = bootstrap_tempdir("table-fanout-a");
 	let durable_a_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		41,
-		bootstrap_tempdir("table-fanout-a"),
+		durable_a_node_dir.to_path_buf(),
 		"loopback://41".into(),
 	))
 	.await
 	.unwrap();
+	let durable_b_node_dir = bootstrap_tempdir("table-fanout-b");
 	let durable_b_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		42,
-		bootstrap_tempdir("table-fanout-b"),
+		durable_b_node_dir.to_path_buf(),
 		"loopback://42".into(),
 	))
 	.await
@@ -9572,9 +9521,9 @@ async fn table_write_fans_out_child_groups_to_distinct_replica_sets() {
 		"leader must not locally append a child for a replica set it is not in"
 	);
 
-	leader_node.handles.abort();
-	durable_a_node.handles.abort();
-	durable_b_node.handles.abort();
+	shutdown_lease_node(leader_node).await;
+	shutdown_lease_node(durable_a_node).await;
+	shutdown_lease_node(durable_b_node).await;
 }
 
 #[test]
@@ -9612,7 +9561,7 @@ async fn duplicate_write_replays_finalization_marker_and_emits_one_audit_record(
 	let audit_path = dir.join("audit.ndjson");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		16,
-		dir.clone(),
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -9676,6 +9625,7 @@ async fn duplicate_write_replays_finalization_marker_and_emits_one_audit_record(
 		);
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -9683,7 +9633,7 @@ async fn duplicate_write_replays_terminal_failure_without_recovery() {
 	let dir = bootstrap_tempdir("duplicate-terminal-failure");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		18,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -9734,6 +9684,7 @@ async fn duplicate_write_replays_terminal_failure_without_recovery() {
 		node.data_server.pending_finalization_count_for_test().await,
 		0
 	);
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -9741,7 +9692,7 @@ async fn duplicate_write_stays_retryable_while_finalization_is_pending() {
 	let dir = bootstrap_tempdir("duplicate-recoverable-pending");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		19,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -9786,6 +9737,7 @@ async fn duplicate_write_stays_retryable_while_finalization_is_pending() {
 		node.data_server.pending_finalization_count_for_test().await,
 		1
 	);
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -9793,7 +9745,7 @@ async fn duplicate_write_replays_persisted_pending_intent_after_cache_loss() {
 	let dir = bootstrap_tempdir("duplicate-persisted-pending");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		21,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -9859,13 +9811,14 @@ async fn duplicate_write_replays_persisted_pending_intent_after_cache_loss() {
 		"duplicate replay after cache loss must not append the payload again"
 	);
 	assert_eq!(replay_server.pending_finalization_count_for_test().await, 1);
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
 async fn pending_finalization_replays_after_restart_when_control_branch_failed() {
 	let dir = bootstrap_tempdir("pending-finalization-restart");
 	let audit_path = dir.join("audit.ndjson");
-	let cfg = NodeBootstrapConfig::dev(17, dir.clone(), "127.0.0.1:0".into());
+	let cfg = NodeBootstrapConfig::dev(17, dir.to_path_buf(), "127.0.0.1:0".into());
 	let node = WendelonNode::bootstrap_single_node(cfg.clone())
 		.await
 		.unwrap();
@@ -9910,8 +9863,7 @@ async fn pending_finalization_replays_after_restart_when_control_branch_failed()
 		"data branch must stay durable locally across the control-branch failure"
 	);
 
-	node.handles.abort();
-	drop(node);
+	shutdown_lease_node(node).await;
 	tokio::time::sleep(Duration::from_millis(25)).await;
 
 	let recovered = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
@@ -9975,7 +9927,7 @@ async fn pending_finalization_replays_after_restart_when_control_branch_failed()
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}
 
-	recovered.handles.abort();
+	shutdown_lease_node(recovered).await;
 }
 
 #[tokio::test]
@@ -10060,8 +10012,8 @@ async fn leader_recovers_orphan_witnesses_from_peer_before_reconciliation() {
 		"leader must finalize the imported orphan witness"
 	);
 
-	fx.leader_node.handles.abort();
-	fx.follower_node.handles.abort();
+	shutdown_lease_node(fx.leader_node).await;
+	shutdown_lease_node(fx.follower_node).await;
 }
 
 #[tokio::test]
@@ -10084,8 +10036,8 @@ async fn orphan_witness_recovery_barrier_rejects_without_leadership() {
 			.unwrap()
 	);
 
-	fx.leader_node.handles.abort();
-	fx.follower_node.handles.abort();
+	shutdown_lease_node(fx.leader_node).await;
+	shutdown_lease_node(fx.follower_node).await;
 }
 
 #[tokio::test]
@@ -10145,8 +10097,8 @@ async fn fresh_leader_recovers_peer_witness_before_duplicate_write_replays() {
 	);
 	assert!(trailing.is_some());
 
-	fx.leader_node.handles.abort();
-	fx.follower_node.handles.abort();
+	shutdown_lease_node(fx.leader_node).await;
+	shutdown_lease_node(fx.follower_node).await;
 }
 
 #[tokio::test]
@@ -10183,8 +10135,8 @@ async fn cached_duplicate_replays_without_orphan_witness_sweep() {
 	);
 	assert_eq!(trailing, first_trailing);
 
-	fx.leader_node.handles.abort();
-	fx.follower_node.handles.abort();
+	shutdown_lease_node(fx.leader_node).await;
+	shutdown_lease_node(fx.follower_node).await;
 }
 
 #[tokio::test]
@@ -10192,7 +10144,7 @@ async fn write_commits_and_fences_when_pending_intent_persistence_fails() {
 	let dir = bootstrap_tempdir("pending-intent-upsert-fail");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		20,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -10247,6 +10199,7 @@ async fn write_commits_and_fences_when_pending_intent_persistence_fails() {
 		.unwrap();
 	assert_eq!(duplicate.status, WriteStatus::DUPLICATE);
 	assert!(trailing.is_some());
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -10254,7 +10207,7 @@ async fn write_fences_when_pending_intent_persistence_and_immediate_finalization
 	let dir = bootstrap_tempdir("pending-intent-upsert-and-finalize-fail");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		25,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -10313,6 +10266,7 @@ async fn write_fences_when_pending_intent_persistence_and_immediate_finalization
 		.unwrap();
 	assert_eq!(duplicate.status, WriteStatus::INTERNAL_ERROR);
 	assert!(trailing.is_none());
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -10320,7 +10274,7 @@ async fn local_persistence_failure_fences_future_writes() {
 	let dir = bootstrap_tempdir("local-persistence-fence");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		22,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -10379,6 +10333,7 @@ async fn local_persistence_failure_fences_future_writes() {
 		before_second,
 		"fenced node must reject later writes before attempting another local append"
 	);
+	shutdown_lease_node(node).await;
 }
 
 // ========================================================
@@ -10689,7 +10644,7 @@ async fn query_merge_surfaces_migration_incomplete_on_source_failure() {
 	let dir = bootstrap_tempdir("merge-incomplete");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		21,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -10729,6 +10684,7 @@ async fn query_merge_surfaces_migration_incomplete_on_source_failure() {
 		"unreachable source must surface MIGRATION_INCOMPLETE, not a silent OK"
 	);
 	assert!(arrow.is_none());
+	shutdown_lease_node(node).await;
 }
 
 /// Regression for Medium #1: after an OK response that ingested
@@ -10796,7 +10752,7 @@ async fn point_read_surfaces_migration_incomplete_on_source_failure() {
 	let dir = bootstrap_tempdir("point-incomplete");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		23,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -10843,6 +10799,7 @@ async fn point_read_surfaces_migration_incomplete_on_source_failure() {
 		"unreachable source must surface MIGRATION_INCOMPLETE, not KEY_NOT_FOUND"
 	);
 	assert!(arrow.is_none());
+	shutdown_lease_node(node).await;
 }
 
 /// Regression for Medium #2: a query rejected by the epoch /
@@ -10858,7 +10815,7 @@ async fn epoch_stale_gate_short_circuits_before_migration_pull() {
 	let dir = bootstrap_tempdir("gate-first");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		22,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -10905,6 +10862,7 @@ async fn epoch_stale_gate_short_circuits_before_migration_pull() {
 		ReadStatus::EPOCH_STALE,
 		"gate must fire before any pull; otherwise an unreachable source would mask this as MIGRATION_INCOMPLETE"
 	);
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -11645,22 +11603,25 @@ struct DurabilityFixture {
 	_leader_node: WendelonNode,
 	_durable_node: WendelonNode,
 	_epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
+	_dirs: Vec<crate::test_support::TestDir>,
 }
 
 async fn build_durability_fixture(
 	durable_key_locality: u64,
 	append_only_key_locality: u64,
 ) -> DurabilityFixture {
+	let leader_node_dir = bootstrap_tempdir("durability-leader");
 	let leader_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		41,
-		bootstrap_tempdir("durability-leader"),
+		leader_node_dir.to_path_buf(),
 		"loopback://41".into(),
 	))
 	.await
 	.unwrap();
+	let durable_node_dir = bootstrap_tempdir("durability-durable");
 	let durable_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		42,
-		bootstrap_tempdir("durability-durable"),
+		durable_node_dir.to_path_buf(),
 		"loopback://42".into(),
 	))
 	.await
@@ -11778,6 +11739,7 @@ async fn build_durability_fixture(
 		_leader_node: leader_node,
 		_durable_node: durable_node,
 		_epoch_tx: epoch_tx,
+		_dirs: vec![leader_node_dir, durable_node_dir],
 	}
 }
 
@@ -11886,6 +11848,8 @@ async fn write_counts_only_durable_quorum_acks_across_replica_crash_boundary() {
 		append_only_survivors, 1,
 		"without durable quorum, the write must not survive on a quorum after crash recovery"
 	);
+	shutdown_lease_node(fx._leader_node).await;
+	shutdown_lease_node(fx._durable_node).await;
 }
 
 /// Three-node drain-all fixture.
@@ -11911,6 +11875,7 @@ struct DrainAllFixture {
 	// state machines and factory cache don't get dropped.
 	_nodes: Vec<WendelonNode>,
 	_epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
+	_dirs: Vec<crate::test_support::TestDir>,
 }
 
 impl DrainAllFixture {
@@ -11960,23 +11925,26 @@ async fn build_drain_all_fixture(tag: &str) -> DrainAllFixture {
 	//    those handles but rebuild the WendelonDataServer on
 	//    top of a loopback-backed factory so the three nodes
 	//    can talk to each other.
+	let dest_node_dir = bootstrap_tempdir(&format!("{tag}-dest"));
 	let dest_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		31,
-		bootstrap_tempdir(&format!("{tag}-dest")),
+		dest_node_dir.to_path_buf(),
 		"loopback://31".into(),
 	))
 	.await
 	.unwrap();
+	let source_a_node_dir = bootstrap_tempdir(&format!("{tag}-a"));
 	let source_a_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		32,
-		bootstrap_tempdir(&format!("{tag}-a")),
+		source_a_node_dir.to_path_buf(),
 		"loopback://32".into(),
 	))
 	.await
 	.unwrap();
+	let source_b_node_dir = bootstrap_tempdir(&format!("{tag}-b"));
 	let source_b_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		33,
-		bootstrap_tempdir(&format!("{tag}-b")),
+		source_b_node_dir.to_path_buf(),
 		"loopback://33".into(),
 	))
 	.await
@@ -12146,6 +12114,7 @@ async fn build_drain_all_fixture(tag: &str) -> DrainAllFixture {
 		source_b_id,
 		_nodes: vec![dest_node, source_a_node, source_b_node],
 		_epoch_tx: epoch_tx,
+		_dirs: vec![dest_node_dir, source_a_node_dir, source_b_node_dir],
 	}
 }
 
@@ -12194,6 +12163,9 @@ async fn pull_migration_range_unions_disjoint_halves_over_hrft() {
 	assert_eq!(keys.len(), 100, "union must cover every key in 0..=99");
 	assert_eq!(*keys.first().unwrap(), 0);
 	assert_eq!(*keys.last().unwrap(), 99);
+	for node in fx._nodes {
+		shutdown_lease_node(node).await;
+	}
 }
 
 /// Regression for idempotent union: overlapping sources
@@ -12238,6 +12210,9 @@ async fn pull_migration_range_idempotent_across_overlapping_sources() {
 			1,
 			"key {k}: overlap must not duplicate versions"
 		);
+	}
+	for node in fx._nodes {
+		shutdown_lease_node(node).await;
 	}
 }
 
@@ -12294,6 +12269,9 @@ async fn pull_migration_range_pages_through_single_source() {
 		1,
 		"empty source_b should be drained in a single round-trip"
 	);
+	for node in fx._nodes {
+		shutdown_lease_node(node).await;
+	}
 }
 
 /// Regression for mid-drain failure surfacing through the
@@ -12352,6 +12330,9 @@ async fn query_merge_surfaces_migration_incomplete_on_partial_source_failure() {
 		pages_b >= 2,
 		"source_b must have been asked for ≥2 pages before failing; observed {pages_b}"
 	);
+	for node in fx._nodes {
+		shutdown_lease_node(node).await;
+	}
 }
 
 /// Regression for the `source_replicas` self-skip.
@@ -12389,6 +12370,9 @@ async fn pull_migration_range_skips_local_node_in_source_list() {
 	let mut keys: Vec<u64> = merged.iter().map(|(k, _)| *k).collect();
 	keys.sort();
 	assert_eq!(keys, vec![0, 1, 2, 3, 4]);
+	for node in fx._nodes {
+		shutdown_lease_node(node).await;
+	}
 }
 
 #[tokio::test]
@@ -12396,7 +12380,7 @@ async fn dispatcher_rejects_cross_tenant_write_before_handler() {
 	let dir = bootstrap_tempdir("auth-write");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		21,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -12442,7 +12426,7 @@ async fn dispatcher_rejects_cross_tenant_write_before_handler() {
 		*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<WriteResponseMeta>()]);
 	assert_eq!(meta.status, WriteStatus::AUTHORIZATION_FAILED);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 // ADR 075 cut-3b: COUNTER_REPLICATE_REQ dispatch appends a tentative AND
@@ -12454,7 +12438,7 @@ async fn counter_replicate_dispatch_appends_tentative_with_no_witness() {
 	let dir = bootstrap_tempdir("counter-replicate");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		31,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -12520,7 +12504,7 @@ async fn counter_replicate_dispatch_appends_tentative_with_no_witness() {
 		"counter replicate must not create a pending-finalization witness"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 // ADR 075 cut-3b: COUNTER_ROLLBACK_REQ dispatch acks OK; rollback of an
@@ -12530,7 +12514,7 @@ async fn counter_rollback_dispatch_acks_and_is_idempotent() {
 	let dir = bootstrap_tempdir("counter-rollback");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		32,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -12587,7 +12571,7 @@ async fn counter_rollback_dispatch_acks_and_is_idempotent() {
 		0
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 /// Build + dispatch one `COUNTER_ADD_REQ` (key `b"k"`, `seq`/`delta`) and return
@@ -12667,7 +12651,7 @@ async fn counter_add_dispatch_applies_accumulates_and_replays_idempotently() {
 	let dir = bootstrap_tempdir("counter-add");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		33,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -12700,7 +12684,7 @@ async fn counter_add_dispatch_applies_accumulates_and_replays_idempotently() {
 		"the duplicate replayed without re-applying its delta"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 // ADR 075 cut-4b / D5: a zero-delta COUNTER_ADD is rejected and mutates nothing
@@ -12710,7 +12694,7 @@ async fn counter_add_zero_delta_rejects_without_creating() {
 	let dir = bootstrap_tempdir("counter-add-zero");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		34,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -12731,7 +12715,7 @@ async fn counter_add_zero_delta_rejects_without_creating() {
 		"the zero-delta reject created nothing"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 // ADR 075 cut-4b / D5: an overflowing COUNTER_ADD is rejected WITHOUT mutating —
@@ -12742,7 +12726,7 @@ async fn counter_add_overflow_rejects_without_mutating() {
 	let dir = bootstrap_tempdir("counter-add-overflow");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		35,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -12767,7 +12751,7 @@ async fn counter_add_overflow_rejects_without_mutating() {
 		"the overflow reject left the counter unmutated"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 /// Build one `COUNTER_ADD_REQ` frame (key `b"k"`) without dispatching it — for
@@ -12865,6 +12849,7 @@ struct CounterReplicationFixture {
 	follower_node: WendelonNode,
 	leader: Arc<WendelonDataServer>,
 	follower: Arc<WendelonDataServer>,
+	_dirs: Vec<crate::test_support::TestDir>,
 }
 
 async fn build_counter_replication_fixture(
@@ -12879,16 +12864,18 @@ async fn build_counter_replication_fixture_with_remote_registration(
 	key_identity: Identity,
 	register_follower: bool,
 ) -> CounterReplicationFixture {
+	let leader_node_dir = bootstrap_tempdir(&format!("{tag}-leader"));
 	let leader_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		43,
-		bootstrap_tempdir(&format!("{tag}-leader")),
+		leader_node_dir.to_path_buf(),
 		"loopback://43".into(),
 	))
 	.await
 	.unwrap();
+	let follower_node_dir = bootstrap_tempdir(&format!("{tag}-follower"));
 	let follower_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		44,
-		bootstrap_tempdir(&format!("{tag}-follower")),
+		follower_node_dir.to_path_buf(),
 		"loopback://44".into(),
 	))
 	.await
@@ -12990,6 +12977,7 @@ async fn build_counter_replication_fixture_with_remote_registration(
 		follower_node,
 		leader,
 		follower,
+		_dirs: vec![leader_node_dir, follower_node_dir],
 	}
 }
 
@@ -13034,8 +13022,8 @@ async fn counter_add_primary_replicates_to_remote_participant() {
 		"remote participant received the counter commit marker"
 	);
 
-	fx.leader_node.handles.abort();
-	fx.follower_node.handles.abort();
+	shutdown_lease_node(fx.leader_node).await;
+	shutdown_lease_node(fx.follower_node).await;
 }
 
 // ADR 076 required fixture: rf=2 must not return primary-only success. If
@@ -13091,8 +13079,8 @@ async fn no_primary_only_success_under_replication() {
 		"unreachable remote did not receive a committed counter value"
 	);
 
-	fx.leader_node.handles.abort();
-	fx.follower_node.handles.abort();
+	shutdown_lease_node(fx.leader_node).await;
+	shutdown_lease_node(fx.follower_node).await;
 }
 
 // ADR 076 headline: rf=2 over two live data services, with the remote arm
@@ -13169,8 +13157,8 @@ async fn replicated_counter_fetch_add_concurrent_adds_sum_exactly() {
 		"remote replica committed the final counter value"
 	);
 
-	fx.leader_node.handles.abort();
-	fx.follower_node.handles.abort();
+	shutdown_lease_node(fx.leader_node).await;
+	shutdown_lease_node(fx.follower_node).await;
 }
 
 // ADR 076: a non-primary server does not mutate, even when it is in the
@@ -13203,8 +13191,8 @@ async fn counter_add_non_primary_returns_owner_hint_without_mutating() {
 		"non-primary counter add returned before any local mutation"
 	);
 
-	fx.leader_node.handles.abort();
-	fx.follower_node.handles.abort();
+	shutdown_lease_node(fx.leader_node).await;
+	shutdown_lease_node(fx.follower_node).await;
 }
 
 // ADR 075 HEADLINE fixture (D2): N concurrent unique-write_id `+1` adds to one
@@ -13216,7 +13204,7 @@ async fn counter_add_concurrent_unique_writers_sum_exactly() {
 	let dir = bootstrap_tempdir("counter-add-concurrent");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		36,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -13253,7 +13241,7 @@ async fn counter_add_concurrent_unique_writers_sum_exactly() {
 		"all concurrent unique-writer +1 adds summed exactly (no lost increment)"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 // ADR 075 D4 (concurrency): N concurrent adds carrying the SAME canonical
@@ -13267,7 +13255,7 @@ async fn counter_add_concurrent_same_write_id_applies_exactly_once() {
 	let dir = bootstrap_tempdir("counter-add-dup-concurrent");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		38,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -13321,7 +13309,7 @@ async fn counter_add_concurrent_same_write_id_applies_exactly_once() {
 		"the duplicate adds applied the delta exactly once"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 // ADR 075 D4 (across restart): a duplicate `ClientWriteId` retry that lands
@@ -13334,7 +13322,7 @@ async fn counter_add_concurrent_same_write_id_applies_exactly_once() {
 #[tokio::test]
 async fn counter_add_duplicate_replays_across_server_restart() {
 	let dir = bootstrap_tempdir("counter-add-server-restart");
-	let cfg = NodeBootstrapConfig::dev(39, dir, "127.0.0.1:0".into());
+	let cfg = NodeBootstrapConfig::dev(39, dir.to_path_buf(), "127.0.0.1:0".into());
 	let key_identity = crate::storage::counter::counter_identity(
 		&crate::storage::counter::CounterKey(b"k".to_vec()),
 	);
@@ -13345,7 +13333,7 @@ async fn counter_add_duplicate_replays_across_server_restart() {
 		let r1 = dispatch_counter_add(&node, 1, 5, key_identity).await;
 		assert_eq!(r1.status, WriteStatus::OK);
 		assert_eq!((r1.previous_value, r1.current_value), (0, 5));
-		node.handles.abort();
+		shutdown_lease_node(node).await;
 	}
 	tokio::time::sleep(Duration::from_millis(25)).await;
 
@@ -13372,7 +13360,7 @@ async fn counter_add_duplicate_replays_across_server_restart() {
 		"exactly-once held across the restart (5, not 10)"
 	);
 
-	recovered.handles.abort();
+	shutdown_lease_node(recovered).await;
 }
 
 // ADR 075 fixture (D2 critical-section proof): two concurrent adders to an absent
@@ -13383,7 +13371,7 @@ async fn counter_add_two_racing_adders_do_not_share_previous() {
 	let dir = bootstrap_tempdir("counter-add-racing");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		37,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -13415,7 +13403,7 @@ async fn counter_add_two_racing_adders_do_not_share_previous() {
 		"racing adders observed DISTINCT previous values (no shared-previous lost update)"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -13424,7 +13412,7 @@ async fn dispatcher_rejects_read_only_observer_data_read() {
 	let audit_path = dir.join("audit.ndjson");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		22,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -13480,7 +13468,7 @@ async fn dispatcher_rejects_read_only_observer_data_read() {
 	.await;
 	assert!(audit.contains("\"type\":\"data_access\""));
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -13489,7 +13477,7 @@ async fn dispatcher_emits_write_request_and_completion_audit_events() {
 	let audit_path = dir.join("audit.ndjson");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		31,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -13560,7 +13548,7 @@ async fn dispatcher_emits_write_request_and_completion_audit_events() {
 	.await;
 	assert!(audit.contains("\"record_identity\""));
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -13576,7 +13564,7 @@ async fn dispatcher_refuses_write_when_data_access_audit_emit_fails() {
 	let dir = bootstrap_tempdir("audit-write-fail-closed");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		34,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -13639,7 +13627,7 @@ async fn dispatcher_refuses_write_when_data_access_audit_emit_fails() {
 		"failed local-chain emission must reject the write before any payload bytes append"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -13648,7 +13636,7 @@ async fn row_group_corrupt_directory_error_emits_invariant_audit_event() {
 	let audit_path = dir.join("audit.ndjson");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		35,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -13681,7 +13669,7 @@ async fn row_group_corrupt_directory_error_emits_invariant_audit_event() {
 	.await;
 	assert!(audit.contains("\"outcome\":\"denied\""));
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -13690,7 +13678,7 @@ async fn dispatcher_emits_completed_read_audit_event() {
 	let audit_path = dir.join("audit.ndjson");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		32,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -13766,7 +13754,7 @@ async fn dispatcher_emits_completed_read_audit_event() {
 	.await;
 	assert!(audit.contains("\"returned_bytes\":1"));
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -13775,7 +13763,7 @@ async fn dispatcher_emits_completed_range_query_audit_event() {
 	let audit_path = dir.join("audit.ndjson");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		33,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -13850,7 +13838,7 @@ async fn dispatcher_emits_completed_range_query_audit_event() {
 	.await;
 	assert!(audit.contains("\"locality_end\":18446744073709551615"));
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -13860,7 +13848,7 @@ async fn dispatcher_rejects_tenant_scoped_actor_opening_finalization_stream() {
 	let dir = bootstrap_tempdir("auth-stream-fin");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		23,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -13902,7 +13890,7 @@ async fn dispatcher_rejects_tenant_scoped_actor_opening_finalization_stream() {
 	assert_eq!(err.kind(), ErrorKind::PermissionDenied);
 	assert!(err.to_string().contains("STREAM_FIN_REQ"));
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -13910,7 +13898,7 @@ async fn dispatcher_backpressures_write_when_tenant_limit_is_saturated() {
 	let dir = bootstrap_tempdir("bp-write-tenant");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		24,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -13973,7 +13961,7 @@ async fn dispatcher_backpressures_write_when_tenant_limit_is_saturated() {
 		before + 1
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -13981,7 +13969,7 @@ async fn dispatcher_backpressures_cross_tenant_read_when_actor_limit_is_saturate
 	let dir = bootstrap_tempdir("bp-read-actor");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		25,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -14048,7 +14036,7 @@ async fn dispatcher_backpressures_cross_tenant_read_when_actor_limit_is_saturate
 			.get() >= before + 1
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -14058,7 +14046,7 @@ async fn query_stream_backpressure_response_marks_stream_end() {
 	let dir = bootstrap_tempdir("bp-query-stream-end");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		26,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -14110,7 +14098,7 @@ async fn query_stream_backpressure_response_marks_stream_end() {
 		*bytemuck::from_bytes(&response.meta[..std::mem::size_of::<QueryResponseMeta>()]);
 	assert_eq!(meta.status, ReadStatus::BACKPRESSURED);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -14118,7 +14106,7 @@ async fn cached_tenant_policy_recovers_after_cache_lock_poison() {
 	let dir = bootstrap_tempdir("tenant-policy-poison");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		27,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -14132,7 +14120,7 @@ async fn cached_tenant_policy_recovers_after_cache_lock_poison() {
 
 	let _ = node.data_server.cached_tenant_policy(TenantId::ZERO).await;
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
@@ -14140,7 +14128,7 @@ async fn lease_gate_recovers_after_cache_lock_poison() {
 	let dir = bootstrap_tempdir("lease-cache-poison");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		28,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -14169,7 +14157,7 @@ async fn lease_gate_recovers_after_cache_lock_poison() {
 		LeaseGateResult::Valid
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 // ============================================================
@@ -15568,7 +15556,7 @@ pub(super) mod adr0090_route_selection {
 		let dir = bootstrap_tempdir("adr0090-route");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			77,
-			dir,
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -15652,7 +15640,7 @@ pub(super) mod adr0090_route_selection {
 			"the partition value governs, not merely the partitioned stamp"
 		);
 
-		node.handles.abort();
+		shutdown_lease_node(node).await;
 	}
 
 	/// ADR 0090 step 3, real route: an in-flight partition transfer overrides
@@ -15667,7 +15655,7 @@ pub(super) mod adr0090_route_selection {
 		let dir = bootstrap_tempdir("adr0090-transfer-route");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			79,
-			dir,
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -15761,7 +15749,7 @@ pub(super) mod adr0090_route_selection {
 			"a completed transfer hands primacy back to the ring"
 		);
 
-		node.handles.abort();
+		shutdown_lease_node(node).await;
 	}
 
 	/// ADR 0090 ingress control: a REAL partitioned table write, through the
@@ -15773,7 +15761,7 @@ pub(super) mod adr0090_route_selection {
 		let dir = bootstrap_tempdir("adr0090-write-owner");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			78,
-			dir,
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -15898,7 +15886,7 @@ pub(super) mod adr0090_route_selection {
 		// row's owner is the peer, so the write above could not have returned OK
 		// with the row landing locally. Verified by injection: reverting the
 		// fan-out to replicas_for_locality makes this test time out.
-		node.handles.abort();
+		shutdown_lease_node(node).await;
 	}
 }
 
@@ -16507,6 +16495,7 @@ mod adr0091_typed_stream_errors {
 	async fn poisoned_fixture(
 		rows: Vec<i64>,
 	) -> (
+		crate::test_support::TestDir,
 		WendelonNode,
 		WendelonDataServer,
 		Arc<SlabManager>,
@@ -16519,6 +16508,7 @@ mod adr0091_typed_stream_errors {
 		rows: Vec<i64>,
 		poison: bool,
 	) -> (
+		crate::test_support::TestDir,
 		WendelonNode,
 		WendelonDataServer,
 		Arc<SlabManager>,
@@ -16527,7 +16517,7 @@ mod adr0091_typed_stream_errors {
 		let dir = bootstrap_tempdir(&format!("adr0091-{}", rows.len()));
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			81,
-			dir,
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -16587,7 +16577,7 @@ mod adr0091_typed_stream_errors {
 			false,
 		)
 		.await;
-		(node, server, mgr, descriptor)
+		(dir, node, server, mgr, descriptor)
 	}
 
 	fn query_frame(descriptor: &TableSchemaDescriptor, node: &WendelonNode) -> HrftFrame {
@@ -16690,7 +16680,7 @@ mod adr0091_typed_stream_errors {
 
 	#[tokio::test]
 	async fn adr0091_a_pre_frame_execution_error_is_a_typed_terminal() {
-		let (node, server, _mgr, descriptor) = poisoned_fixture(vec![1, 2, 3, 4]).await;
+		let (_node_dir, node, server, _mgr, descriptor) = poisoned_fixture(vec![1, 2, 3, 4]).await;
 		let before = metrics().table_query_execution_error_count("framed");
 		let (outcome, frames) =
 			dispatch_and_read(&node, server, query_frame(&descriptor, &node)).await;
@@ -16704,12 +16694,13 @@ mod adr0091_typed_stream_errors {
 			metrics().table_query_execution_error_count("framed") > before,
 			"the dispatch seam records the framed error"
 		);
-		node.handles.abort();
+		shutdown_lease_node(node).await;
 	}
 
 	#[tokio::test]
 	async fn adr0091_a_mid_stream_execution_error_is_a_typed_terminal() {
-		let (node, server, _mgr, descriptor) = poisoned_fixture((1..=5000).collect()).await;
+		let (_node_dir, node, server, _mgr, descriptor) =
+			poisoned_fixture((1..=5000).collect()).await;
 		let (outcome, frames) =
 			dispatch_and_read(&node, server, query_frame(&descriptor, &node)).await;
 		outcome.expect("a framed error is a handled request, not a transport failure");
@@ -16723,12 +16714,12 @@ mod adr0091_typed_stream_errors {
 			Some(ReadStatus::QUERY_EXECUTION_FAILED),
 			"a mid-stream failure still names itself"
 		);
-		node.handles.abort();
+		shutdown_lease_node(node).await;
 	}
 
 	#[tokio::test]
 	async fn adr0091_a_dead_transport_still_surfaces_as_an_io_error() {
-		let (node, server, _mgr, descriptor) = poisoned_fixture(vec![1, 2, 3, 4]).await;
+		let (_node_dir, node, server, _mgr, descriptor) = poisoned_fixture(vec![1, 2, 3, 4]).await;
 		let before = metrics().table_query_execution_error_count("unframed");
 		let frame = query_frame(&descriptor, &node);
 		let (mut client_side, server_side) = tokio::io::duplex(64 * 1024);
@@ -16758,7 +16749,7 @@ mod adr0091_typed_stream_errors {
 			metrics().table_query_execution_error_count("unframed") > before,
 			"the unframed outcome is still recorded at the seam"
 		);
-		node.handles.abort();
+		shutdown_lease_node(node).await;
 	}
 }
 
@@ -16772,7 +16763,7 @@ async fn secondary_index_read_serves_partitioned_rows() {
 	let dir = bootstrap_tempdir("secondary-index-partitioned-read");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		56,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -16874,7 +16865,7 @@ async fn secondary_index_read_serves_partitioned_rows() {
 		"premise: the read went through the secondary index"
 	);
 
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 /// ADR 0090 follow-up: the durable secondary-index round-trip. The V1 segment
@@ -17047,7 +17038,7 @@ async fn mutation_dedup_entry_counts_grow_for_new_operations_not_replays() {
 	let dir = bootstrap_tempdir("mutation-cache-entry-growth");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		48,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -17170,16 +17161,13 @@ async fn mutation_dedup_entry_counts_grow_for_new_operations_not_replays() {
 		));
 	}
 	println!("CACHE_PIN (distinct_write_delete_pairs, write_entries, delete_entries)={points:?}");
-	node.handles.abort();
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
 async fn expired_table_outcome_keeps_warm_cache_replay_but_cold_replay_is_indeterminate() {
-	let cfg = NodeBootstrapConfig::dev(
-		6298,
-		bootstrap_tempdir("expired-table-warm-cold-replay"),
-		"127.0.0.1:0".into(),
-	);
+	let cfg_dir = bootstrap_tempdir("expired-table-warm-cold-replay");
+	let cfg = NodeBootstrapConfig::dev(6298, cfg_dir.to_path_buf(), "127.0.0.1:0".into());
 	let node = WendelonNode::bootstrap_single_node(cfg.clone())
 		.await
 		.unwrap();
@@ -17293,8 +17281,7 @@ async fn expired_table_outcome_keeps_warm_cache_replay_but_cold_replay_is_indete
 		warm.write.mutation_stop_reason().0,
 		warm.write.mutation_commit_knowledge().0
 	);
-	node.handles.abort();
-	drop(node);
+	shutdown_lease_node(node).await;
 	// Object/server reopen, not a power-loss or process-kill experiment. This bounded
 	// handoff matches the existing durable-outcome reopen fixture in this module.
 	tokio::time::sleep(Duration::from_millis(25)).await;
@@ -17365,15 +17352,16 @@ async fn expired_table_outcome_keeps_warm_cache_replay_but_cold_replay_is_indete
 		durable_bytes,
 		reopened.slab.local_l1_bytes().await
 	);
-	reopened.handles.abort();
+	shutdown_lease_node(reopened).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adr629_p2b_raw_and_table_local_jobs_remain_observed_after_caller_abort() {
 	for table in [false, true] {
+		let node_dir = bootstrap_tempdir("p2b-owned-local");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			62941,
-			bootstrap_tempdir("p2b-owned-local"),
+			node_dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -17447,16 +17435,17 @@ async fn adr629_p2b_raw_and_table_local_jobs_remain_observed_after_caller_abort(
 			"the orphaned job really published local bytes"
 		);
 		assert_eq!(authority.test_state().2, None);
-		node.handles.abort();
+		shutdown_lease_node(node).await;
 	}
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adr629_p2b_raw_and_table_followers_keep_the_actual_pending_commit_after_abort() {
 	for table in [false, true] {
+		let node_dir = bootstrap_tempdir("p2b-follower");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			62942,
-			bootstrap_tempdir("p2b-follower"),
+			node_dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -17566,6 +17555,6 @@ async fn adr629_p2b_raw_and_table_followers_keep_the_actual_pending_commit_after
 			1
 		);
 		assert_eq!(authority.test_state(), (0, 1, None));
-		node.handles.abort();
+		shutdown_lease_node(node).await;
 	}
 }
