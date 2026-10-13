@@ -46,6 +46,8 @@ fn expected(
 			let (next, outcome) = advance_verified2(&state, pin, &ce, &trusted, &command).unwrap();
 			let fact = match outcome {
 				ApplyResult2::Covered => json!({"kind":"Covered"}),
+				ApplyResult2::Registered(first) => json!({"kind":"Registered",
+					"reference":{"term":first.term,"node":first.node,"index":first.index}}),
 				ApplyResult2::Denied { reason, .. } => json!({"kind":"Denied","reason":reason}),
 				ApplyResult2::Permission { outcome, .. } => {
 					json!({"kind":"Permission","outcome":outcome})
