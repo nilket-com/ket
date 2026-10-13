@@ -1,3 +1,7 @@
+#[path = "../src/test_support/test_dir.rs"]
+mod test_dir;
+use test_dir::TestDir;
+
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -402,7 +406,7 @@ fn downstream_cancellation_metrics_are_aggregate_trigger_outcome_only() {
 
 #[test]
 fn toron_config_missing_observability_section_loads_byte_identical_to_adr044() {
-	let dir = fresh_dir("observability-config-missing");
+	let dir = TestDir::new("observability-config-missing-owned");
 	let config_path = dir.join("toron.toml");
 	std::fs::write(&config_path, minimal_toml_without_observability()).expect("write config");
 
@@ -416,7 +420,7 @@ fn toron_config_missing_observability_section_loads_byte_identical_to_adr044() {
 #[test]
 fn toron_health_endpoint_rejects_non_loopback_bind() {
 	let worker_id = WorkerId::from_u128(45);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, _scratch) = TestPki::generate_owned(worker_id, "prometheus");
 	let config_path = pki.dir.join("health-non-loopback.toml");
 	std::fs::write(
 		&config_path,
@@ -443,7 +447,7 @@ fn toron_health_endpoint_rejects_non_loopback_bind() {
 #[test]
 fn toron_config_observability_port_collision_rejected() {
 	let worker_id = WorkerId::from_u128(46);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, _scratch) = TestPki::generate_owned(worker_id, "prometheus");
 	let config_path = pki.dir.join("port-collision.toml");
 	std::fs::write(
 		&config_path,
@@ -470,7 +474,7 @@ fn toron_config_observability_port_collision_rejected() {
 #[test]
 fn toron_ready_and_metrics_require_tls_when_configured() {
 	let worker_id = WorkerId::from_u128(47);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, _scratch) = TestPki::generate_owned(worker_id, "prometheus");
 	let config_path = pki.dir.join("observability-no-tls.toml");
 	std::fs::write(
 		&config_path,
@@ -497,7 +501,8 @@ fn toron_ready_and_metrics_require_tls_when_configured() {
 #[tokio::test]
 async fn toron_health_endpoint_returns_200_ok_with_lowercase_ok_body() {
 	let worker_id = WorkerId::from_u128(48);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, scratch) = TestPki::generate_owned(worker_id, "prometheus");
+	let scratch = scratch.pending();
 	let daemon = ToronDaemon::start(observability_config(worker_id, &pki))
 		.await
 		.expect("start daemon");
@@ -515,13 +520,14 @@ async fn toron_health_endpoint_returns_200_ok_with_lowercase_ok_body() {
 	assert!(response.contains("Content-Length: 3\r\n"));
 	assert_eq!(response_body(&response), "ok\n");
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	scratch.complete(daemon.shutdown()).await;
 }
 
 #[tokio::test]
 async fn toron_ready_endpoint_emits_json_snapshot_with_expected_fields_in_stable_order() {
 	let worker_id = WorkerId::from_u128(49);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, scratch) = TestPki::generate_owned(worker_id, "prometheus");
+	let scratch = scratch.pending();
 	let daemon = ToronDaemon::start(observability_config(worker_id, &pki))
 		.await
 		.expect("start daemon");
@@ -584,13 +590,14 @@ async fn toron_ready_endpoint_emits_json_snapshot_with_expected_fields_in_stable
 		assert!(!body.contains(forbidden), "{forbidden} leaked into /ready");
 	}
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	scratch.complete(daemon.shutdown()).await;
 }
 
 #[tokio::test]
 async fn toron_metrics_endpoint_emits_prometheus_text_format_with_brand_clean_names() {
 	let worker_id = WorkerId::from_u128(50);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, scratch) = TestPki::generate_owned(worker_id, "prometheus");
+	let scratch = scratch.pending();
 	let daemon = ToronDaemon::start(observability_config(worker_id, &pki))
 		.await
 		.expect("start daemon");
@@ -653,7 +660,7 @@ async fn toron_metrics_endpoint_emits_prometheus_text_format_with_brand_clean_na
 		);
 	}
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	scratch.complete(daemon.shutdown()).await;
 }
 
 #[tokio::test]
@@ -1276,7 +1283,8 @@ fn catalog_descriptor_refresh_metrics_are_aggregate_outcome_only() {
 #[tokio::test]
 async fn toron_observability_ready_metrics_preserve_responses_post_extraction() {
 	let worker_id = WorkerId::from_u128(54);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, scratch) = TestPki::generate_owned(worker_id, "prometheus");
+	let scratch = scratch.pending();
 	let daemon = ToronDaemon::start(observability_config(worker_id, &pki))
 		.await
 		.expect("start daemon");
@@ -1316,13 +1324,14 @@ async fn toron_observability_ready_metrics_preserve_responses_post_extraction() 
 	);
 	assert!(response_body(&metrics_response).contains("metrics_scrapes_total 1\n"));
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	scratch.complete(daemon.shutdown()).await;
 }
 
 #[tokio::test]
 async fn toron_ready_and_metrics_reject_peer_without_monitor_san_prefix() {
 	let worker_id = WorkerId::from_u128(51);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, scratch) = TestPki::generate_owned(worker_id, "prometheus");
+	let scratch = scratch.pending();
 	let daemon = ToronDaemon::start(observability_config(worker_id, &pki))
 		.await
 		.expect("start daemon");
@@ -1351,7 +1360,7 @@ async fn toron_ready_and_metrics_reject_peer_without_monitor_san_prefix() {
 	)
 	.await;
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	scratch.complete(daemon.shutdown()).await;
 }
 
 #[test]
@@ -1378,7 +1387,8 @@ fn toron_observability_ready_stdout_line_appended_after_sql_ready_with_pinned_fo
 #[tokio::test]
 async fn toron_observability_listener_closes_slow_client_after_read_timeout() {
 	let worker_id = WorkerId::from_u128(52);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, scratch) = TestPki::generate_owned(worker_id, "prometheus");
+	let scratch = scratch.pending();
 	let daemon = ToronDaemon::start(observability_config(worker_id, &pki))
 		.await
 		.expect("start daemon");
@@ -1401,12 +1411,25 @@ async fn toron_observability_listener_closes_slow_client_after_read_timeout() {
 
 	assert_eq!(read, 0);
 
-	daemon.shutdown().await.expect("shutdown daemon");
+	scratch.complete(daemon.shutdown()).await;
 }
 
 impl TestPki {
 	fn generate(worker_id: WorkerId, monitor_principal: &str) -> Self {
-		let dir = fresh_dir("observability-listener");
+		Self::generate_in(
+			fresh_dir("observability-listener"),
+			worker_id,
+			monitor_principal,
+		)
+	}
+
+	fn generate_owned(worker_id: WorkerId, monitor_principal: &str) -> (Self, TestDir) {
+		let dir = TestDir::new("observability-listener-owned");
+		let pki = Self::generate_in(dir.to_path_buf(), worker_id, monitor_principal);
+		(pki, dir)
+	}
+
+	fn generate_in(dir: PathBuf, worker_id: WorkerId, monitor_principal: &str) -> Self {
 		let ca = ca_cert();
 		let daemon_dns = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
 		let monitor_dns = canonical_monitor_dns_name(monitor_principal, DEFAULT_CLUSTER_DOMAIN);
