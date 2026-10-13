@@ -1,8 +1,8 @@
 //! A2/A3 small-state synthetic replay; never installed or large-capacity evidence.
 use super::*;
-use crate::storage::mutation_visibility::G2TrackedPhase as Phase;
 use crate::storage::mutation_visibility::root2::origin::root_and_origin2;
 use crate::storage::mutation_visibility::root2::state::UnverifiedRoot2;
+use crate::storage::mutation_visibility::tests::g2::Phase;
 use crate::test_support::g2::{case, emit};
 use serde_json::json;
 struct PilotSources(LogId<u32>);
