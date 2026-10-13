@@ -7684,7 +7684,7 @@ async fn adr0095_rf1_sweeper_reclaims_attests_and_settles_the_exact_debt() {
 	}
 	// Keep this control deterministic: the production task uses this same method,
 	// but the test drives exactly one pass at a time.
-	shutdown_lease_node(node).await;
+	node.handles.abort();
 	let descriptor = multirow_typed_table_descriptor();
 	let installed = node
 		.raft
@@ -7945,6 +7945,9 @@ async fn adr0095_rf1_sweeper_reclaims_attests_and_settles_the_exact_debt() {
 			"phase transition lines lack {required}: {transitions:?}"
 		);
 	}
+	drop(transitions);
+	drop(phase_events);
+	shutdown_lease_node(node).await;
 }
 
 #[tokio::test]
