@@ -1,6 +1,8 @@
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "otlp-http")]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "otlp-http")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::{DataType, Field, Schema};
@@ -25,8 +27,22 @@ use wendelon::schema::{
 	TableSchemaDescriptor,
 };
 
+#[expect(
+	dead_code,
+	reason = "synchronous config fixtures reuse the shared async-capable guard"
+)]
+#[path = "../src/test_support/test_dir.rs"]
+mod test_dir;
+use test_dir::TestDir;
+
+fn owned_dir(tag: &str) -> TestDir {
+	TestDir::new(&format!("toron-config-owned-{tag}"))
+}
+
+#[cfg(feature = "otlp-http")]
 static FRESH_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "otlp-http")]
 fn fresh_dir(tag: &str) -> PathBuf {
 	let nanos = SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -93,7 +109,7 @@ fn descriptor_with_identity(
 
 #[test]
 fn toron_example_config_loads() {
-	let dir = fresh_dir("example-loads");
+	let dir = owned_dir("example-loads");
 	let path = dir.join("toron.toml");
 	std::fs::write(&path, render_example_config()).expect("write example config");
 
@@ -185,7 +201,7 @@ fn telemetry_config_accepts_toron_owned_surface_with_otlp_feature() {
 #[cfg(not(feature = "otlp-http"))]
 #[test]
 fn telemetry_config_rejects_unsupported_protocol_without_otlp_feature() {
-	let dir = fresh_dir("telemetry-unsupported");
+	let dir = owned_dir("telemetry-unsupported");
 	write_toron_telemetry_placeholders(&dir);
 	let path = dir.join("toron.toml");
 	let config = format!(
@@ -206,7 +222,7 @@ fn telemetry_config_rejects_unsupported_protocol_without_otlp_feature() {
 
 #[test]
 fn audit_config_enabled_accepts_toron_node_id_and_resolves_paths() {
-	let dir = fresh_dir("audit-enabled");
+	let dir = owned_dir("audit-enabled");
 	let path = dir.join("toron.toml");
 	let config = format!(
 		"{}\n[audit]\nenabled = true\nnode_id = \"toron-n-7\"\nnode_numeric_id = 7\nlocal_path = \"audit/toron.ndjson\"\nqueue_capacity = 8\n\n[audit.archive]\ndirectory = \"audit/archive\"\n",
@@ -237,7 +253,7 @@ fn audit_config_enabled_accepts_toron_node_id_and_resolves_paths() {
 
 #[test]
 fn audit_fail_closed_config_accepts_enabled_and_rejects_disabled_or_zero_timeout() {
-	let dir = fresh_dir("audit-fail-closed");
+	let dir = owned_dir("audit-fail-closed");
 	let path = dir.join("toron.toml");
 	let config = format!(
 		"{}\n[audit]\nenabled = true\nnode_id = \"toron-n-7\"\nnode_numeric_id = 7\nlocal_path = \"audit.ndjson\"\nqueue_capacity = 8\nfail_closed = true\nfail_closed_ack_timeout_ms = 250\n",
@@ -288,7 +304,7 @@ fn audit_fail_closed_config_accepts_enabled_and_rejects_disabled_or_zero_timeout
 #[test]
 fn audit_config_rejects_bare_numeric_and_uuid_node_ids() {
 	for node_id in ["7", "00000000-0000-0000-0000-000000000007"] {
-		let dir = fresh_dir("audit-node-id");
+		let dir = owned_dir("audit-node-id");
 		let path = dir.join("toron.toml");
 		let config = format!(
 			"{}\n[audit]\nenabled = true\nnode_id = \"{node_id}\"\nnode_numeric_id = 7\nlocal_path = \"audit.ndjson\"\nqueue_capacity = 8\n",
@@ -315,7 +331,7 @@ fn audit_config_rejects_numeric_mismatch_and_zero_queue() {
 		),
 	];
 	for (tail, expected) in cases {
-		let dir = fresh_dir("audit-invalid");
+		let dir = owned_dir("audit-invalid");
 		let path = dir.join("toron.toml");
 		let config = format!(
 			"{}\n[audit]\nenabled = true\nnode_id = \"toron-n-7\"\n{tail}",
@@ -331,7 +347,7 @@ fn audit_config_rejects_numeric_mismatch_and_zero_queue() {
 
 #[test]
 fn sql_request_caps_default_to_nonzero_equal_safety_floor() {
-	let dir = fresh_dir("sql-request-cap-defaults");
+	let dir = owned_dir("sql-request-cap-defaults");
 	let path = dir.join("toron.toml");
 	let config = render_example_config().replace(
 		"max_request_frame_bytes = 4194304\nmax_statement_bytes = 4194304\n",
@@ -353,7 +369,7 @@ fn sql_request_caps_default_to_nonzero_equal_safety_floor() {
 #[test]
 fn sql_request_caps_reject_zero() {
 	for field in ["max_request_frame_bytes", "max_statement_bytes"] {
-		let dir = fresh_dir(field);
+		let dir = owned_dir(field);
 		let path = dir.join("toron.toml");
 		let config =
 			render_example_config().replace(&format!("{field} = 4194304"), &format!("{field} = 0"));
@@ -379,7 +395,7 @@ fn sql_request_caps_reject_values_over_hard_ceiling() {
 		),
 		("max_statement_bytes", SQL_STATEMENT_BYTES_HARD_CEILING),
 	] {
-		let dir = fresh_dir(field);
+		let dir = owned_dir(field);
 		let path = dir.join("toron.toml");
 		let too_large = ceiling + 1;
 		let config = render_example_config().replace(
@@ -401,7 +417,7 @@ fn sql_request_caps_reject_values_over_hard_ceiling() {
 
 #[test]
 fn sql_statement_cap_cannot_exceed_request_frame_cap() {
-	let dir = fresh_dir("sql-statement-cap-order");
+	let dir = owned_dir("sql-statement-cap-order");
 	let path = dir.join("toron.toml");
 	let config = render_example_config()
 		.replace(
@@ -426,7 +442,7 @@ fn sql_statement_cap_cannot_exceed_request_frame_cap() {
 
 #[test]
 fn tenant_concurrency_policy_config_round_trips() {
-	let dir = fresh_dir("tenant-budget-round-trip");
+	let dir = owned_dir("tenant-budget-round-trip");
 	let path = dir.join("toron.toml");
 	let config = format!(
 		"{}\n[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_queries = 3\nmax_concurrent_descriptor_syncs = 2\n\n[[tenant_budgets.tenants]]\ntenant_id = 7\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\nmax_concurrent_queries = 2\nmax_concurrent_descriptor_syncs = 1\n",
@@ -490,7 +506,7 @@ fn tenant_concurrency_policy_config_round_trips() {
 
 #[test]
 fn tenant_admission_policy_config_round_trips() {
-	let dir = fresh_dir("tenant-admission-round-trip");
+	let dir = owned_dir("tenant-admission-round-trip");
 	let path = dir.join("toron.toml");
 	let config = format!(
 		"{}\n[admission]\nmax_queued_queries = 8\nmax_queue_wait_ms = 25\nshared_memory_bytes = 4096\nshared_concurrent_queries = 2\n\n[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nadmission_weight = 3\nmax_queued_queries = 4\nmax_borrowed_memory_bytes = 512\nmax_borrowed_concurrent_queries = 1\n\n[[tenant_budgets.tenants]]\ntenant_id = 7\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\nadmission_weight = 2\nmax_queued_queries = 5\nmax_borrowed_memory_bytes = 256\nmax_borrowed_concurrent_queries = 1\n",
@@ -527,7 +543,7 @@ fn tenant_admission_policy_config_round_trips() {
 
 #[test]
 fn tenant_query_rate_policy_config_round_trips() {
-	let dir = fresh_dir("tenant-rate-round-trip");
+	let dir = owned_dir("tenant-rate-round-trip");
 	let path = dir.join("toron.toml");
 	let config = format!(
 		"{}\n[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_queries_per_second = 30\nquery_burst_capacity = 60\n\n[[tenant_budgets.tenants]]\ntenant_id = 7\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\nmax_queries_per_second = 10\nquery_burst_capacity = 0\n",
@@ -548,7 +564,7 @@ fn tenant_query_rate_policy_config_round_trips() {
 
 #[test]
 fn sql_connection_cap_config_round_trips_and_zero_disables() {
-	let dir = fresh_dir("sql-connection-cap-round-trip");
+	let dir = owned_dir("sql-connection-cap-round-trip");
 	let path = dir.join("toron.toml");
 	let config = render_example_config().replace(
 		"statement_timeout_seconds = 60\nmax_concurrent_connections = 0",
@@ -587,7 +603,7 @@ fn sql_connection_cap_config_round_trips_and_zero_disables() {
 
 #[test]
 fn tenant_concurrency_omitted_config_derives_default() {
-	let dir = fresh_dir("tenant-budget-derived-concurrency");
+	let dir = owned_dir("tenant-budget-derived-concurrency");
 	let path = dir.join("toron.toml");
 	let config = format!(
 		"{}\n[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\n\n[[tenant_budgets.tenants]]\ntenant_id = 7\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\n",
@@ -629,7 +645,7 @@ fn tenant_concurrency_omitted_config_derives_default() {
 
 #[test]
 fn tenant_concurrency_config_rejects_zero() {
-	let dir = fresh_dir("tenant-concurrency-zero");
+	let dir = owned_dir("tenant-concurrency-zero");
 	let path = dir.join("toron.toml");
 	let snippet = "[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_queries = 0\n";
 	std::fs::write(&path, format!("{}\n{snippet}", render_example_config())).expect("write config");
@@ -646,7 +662,7 @@ fn tenant_concurrency_config_rejects_zero() {
 
 #[test]
 fn tenant_budget_config_accepts_descriptor_sync_limit() {
-	let dir = fresh_dir("tenant-descriptor-sync-accepts");
+	let dir = owned_dir("tenant-descriptor-sync-accepts");
 	let path = dir.join("toron.toml");
 	let snippet = "[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_queries = 4\nmax_concurrent_descriptor_syncs = 2\n";
 	std::fs::write(&path, format!("{}\n{snippet}", render_example_config())).expect("write config");
@@ -665,7 +681,7 @@ fn tenant_budget_config_accepts_descriptor_sync_limit() {
 
 #[test]
 fn tenant_budget_config_rejects_zero_descriptor_sync_limit() {
-	let dir = fresh_dir("tenant-descriptor-sync-zero");
+	let dir = owned_dir("tenant-descriptor-sync-zero");
 	let path = dir.join("toron.toml");
 	let snippet = "[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_descriptor_syncs = 0\n";
 	std::fs::write(&path, format!("{}\n{snippet}", render_example_config())).expect("write config");
@@ -683,7 +699,7 @@ fn tenant_budget_config_rejects_zero_descriptor_sync_limit() {
 
 #[test]
 fn tenant_budget_config_derives_descriptor_sync_limit_when_omitted() {
-	let dir = fresh_dir("tenant-descriptor-sync-derived");
+	let dir = owned_dir("tenant-descriptor-sync-derived");
 	let path = dir.join("toron.toml");
 	let snippet = "[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_queries = 4\n";
 	std::fs::write(&path, format!("{}\n{snippet}", render_example_config())).expect("write config");
@@ -739,7 +755,7 @@ fn tenant_budget_config_rejects_zero_duplicate_and_per_task_over_aggregate() {
 			"tenant_budgets admission_weight must be greater than 0",
 		),
 	] {
-		let dir = fresh_dir(tag);
+		let dir = owned_dir(tag);
 		let path = dir.join("toron.toml");
 		std::fs::write(&path, format!("{}\n{snippet}", render_example_config()))
 			.expect("write config");
@@ -752,7 +768,7 @@ fn tenant_budget_config_rejects_zero_duplicate_and_per_task_over_aggregate() {
 
 #[test]
 fn toron_sql_listener_rejects_non_loopback_bind() {
-	let dir = fresh_dir("sql-non-loopback");
+	let dir = owned_dir("sql-non-loopback");
 	let path = dir.join("toron.toml");
 	let config = render_example_config().replace(
 		"listener_bind = \"127.0.0.1:7742\"",
@@ -772,7 +788,7 @@ fn toron_sql_listener_rejects_non_loopback_bind() {
 
 #[test]
 fn toron_worker_listener_rejects_non_loopback_bind_without_tls() {
-	let dir = fresh_dir("worker-non-loopback");
+	let dir = owned_dir("worker-non-loopback");
 	let path = dir.join("toron.toml");
 	let config = render_example_config().replace(
 		"task_listener_bind = \"127.0.0.1:0\"",
@@ -792,7 +808,7 @@ fn toron_worker_listener_rejects_non_loopback_bind_without_tls() {
 
 #[test]
 fn toron_worker_listener_allows_non_loopback_bind_with_tls() {
-	let dir = fresh_dir("worker-non-loopback-tls");
+	let dir = owned_dir("worker-non-loopback-tls");
 	write_toron_tls_placeholders(&dir);
 	let path = dir.join("toron.toml");
 	let config = format!(
@@ -813,7 +829,7 @@ fn toron_worker_listener_allows_non_loopback_bind_with_tls() {
 
 #[test]
 fn toron_sql_listener_allows_non_loopback_bind_with_tls() {
-	let dir = fresh_dir("sql-non-loopback-tls");
+	let dir = owned_dir("sql-non-loopback-tls");
 	write_toron_tls_placeholders(&dir);
 	let path = dir.join("toron.toml");
 	let config = format!(
@@ -841,7 +857,7 @@ fn toron_sql_listener_allows_non_loopback_bind_with_tls() {
 
 #[test]
 fn toron_static_worker_rejects_non_loopback_endpoint_without_tls() {
-	let dir = fresh_dir("static-worker-non-loopback");
+	let dir = owned_dir("static-worker-non-loopback");
 	let path = dir.join("toron.toml");
 	let config = render_example_config().replace(
 		"# [[coordinator.static_workers]]\n# worker_id = \"00000000-0000-0000-0000-000000000043\"\n# endpoint = \"127.0.0.1:9101\"",
@@ -862,7 +878,7 @@ fn toron_static_worker_rejects_non_loopback_endpoint_without_tls() {
 
 #[test]
 fn toron_static_worker_allows_non_loopback_endpoint_with_tls() {
-	let dir = fresh_dir("static-worker-non-loopback-tls");
+	let dir = owned_dir("static-worker-non-loopback-tls");
 	write_toron_tls_placeholders(&dir);
 	let path = dir.join("toron.toml");
 	let config = format!(
@@ -889,7 +905,7 @@ fn toron_static_worker_allows_non_loopback_endpoint_with_tls() {
 
 #[test]
 fn toron_tls_missing_cert_file_fails_with_stable_diagnostic() {
-	let dir = fresh_dir("tls-missing-cert");
+	let dir = owned_dir("tls-missing-cert");
 	write_toron_tls_placeholders(&dir);
 	std::fs::remove_file(dir.join("listener.pem")).expect("remove listener cert");
 	let path = dir.join("toron.toml");
@@ -908,7 +924,7 @@ fn toron_tls_missing_cert_file_fails_with_stable_diagnostic() {
 
 #[test]
 fn toron_tls_paths_reject_env_interpolation() {
-	let dir = fresh_dir("tls-env-interpolation");
+	let dir = owned_dir("tls-env-interpolation");
 	write_toron_tls_placeholders(&dir);
 	let path = dir.join("toron.toml");
 	let config = format!(
@@ -929,7 +945,7 @@ fn toron_tls_paths_reject_env_interpolation() {
 
 #[test]
 fn descriptor_bootstrap_requires_tenant_id() {
-	let path = write_descriptor_bootstrap_json(
+	let (_dir, path) = write_descriptor_bootstrap_json(
 		"descriptor-missing-tenant-id",
 		serde_json::json!({
 			"tables": [
@@ -950,7 +966,7 @@ fn descriptor_bootstrap_requires_tenant_id() {
 
 #[test]
 fn descriptor_bootstrap_requires_table_id() {
-	let path = write_descriptor_bootstrap_json(
+	let (_dir, path) = write_descriptor_bootstrap_json(
 		"descriptor-missing-table-id",
 		serde_json::json!({
 			"tables": [
@@ -971,7 +987,7 @@ fn descriptor_bootstrap_requires_table_id() {
 
 #[test]
 fn descriptor_bootstrap_rejects_zero_tenant() {
-	let path = write_descriptor_bootstrap_json(
+	let (_dir, path) = write_descriptor_bootstrap_json(
 		"descriptor-zero-tenant-id",
 		serde_json::json!({
 			"tables": [
@@ -992,7 +1008,7 @@ fn descriptor_bootstrap_rejects_zero_tenant() {
 
 #[test]
 fn descriptor_bootstrap_rejects_zero_table_id() {
-	let path = write_descriptor_bootstrap_json(
+	let (_dir, path) = write_descriptor_bootstrap_json(
 		"descriptor-zero-table-id",
 		serde_json::json!({
 			"tables": [
@@ -1187,7 +1203,7 @@ fn descriptor_bootstrap_preserves_physical_fingerprint() {
 
 #[test]
 fn old_single_tenant_descriptor_bootstrap_shape_is_rejected() {
-	let path = write_descriptor_bootstrap_json(
+	let (_dir, path) = write_descriptor_bootstrap_json(
 		"descriptor-old-single-tenant-shape",
 		serde_json::json!({
 			"tables": [
@@ -1249,7 +1265,7 @@ fn descriptor_bootstrap_optimizer_facts_are_sidecar_optional() {
 			optimizer_facts: Some(facts.clone()),
 		}],
 	};
-	let path = write_descriptor_bootstrap_json(
+	let (_dir, path) = write_descriptor_bootstrap_json(
 		"descriptor-facts",
 		serde_json::to_value(bootstrap).expect("serialize descriptor facts bootstrap"),
 	);
@@ -1296,7 +1312,8 @@ fn descriptor_bootstrap_optimizer_facts_column_ndv_defaults_when_missing() {
 		.as_object_mut()
 		.expect("optimizer facts object")
 		.remove("column_ndv");
-	let path = write_descriptor_bootstrap_json("descriptor-facts-missing-column-ndv", value);
+	let (_dir, path) =
+		write_descriptor_bootstrap_json("descriptor-facts-missing-column-ndv", value);
 
 	let records =
 		load_descriptor_bootstrap_with_optimizer_facts(&path).expect("load facts bootstrap");
@@ -1332,7 +1349,7 @@ fn same_table_object_id_across_different_tenants_is_allowed() {
 fn registry_from_entries(
 	entries: Vec<DescriptorBootstrapEntry>,
 ) -> Result<WendelonDescriptorRegistry, toron::error::CatalogError> {
-	let path = write_descriptor_bootstrap_json(
+	let (_dir, path) = write_descriptor_bootstrap_json(
 		"descriptor-registry",
 		serde_json::to_value(DescriptorBootstrap { tables: entries })
 			.expect("serialize descriptor bootstrap"),
@@ -1341,17 +1358,17 @@ fn registry_from_entries(
 	WendelonDescriptorRegistry::from_tenant_descriptors(descriptors)
 }
 
-fn write_descriptor_bootstrap_json(tag: &str, value: serde_json::Value) -> PathBuf {
-	let dir = fresh_dir(tag);
+fn write_descriptor_bootstrap_json(tag: &str, value: serde_json::Value) -> (TestDir, PathBuf) {
+	let dir = owned_dir(tag);
 	let path = dir.join("descriptors.json");
 	std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap())
 		.expect("write descriptor bootstrap");
-	path
+	(dir, path)
 }
 
 #[test]
 fn adr463_worker_query_budget_knobs_parse_override_and_reject_zero() {
-	let dir = fresh_dir("adr463-query-budget");
+	let dir = owned_dir("adr463-query-budget");
 	let path = dir.join("toron.toml");
 
 	// Absent knobs: the example config leaves them commented out; the budget is
@@ -1420,7 +1437,7 @@ fn adr629_storage_bind_config(bind: &str, tls_mask: u8, domain: &str) -> String 
 
 #[test]
 fn adr629_p1_storage_bind_requires_complete_tls_for_non_loopback() {
-	let dir = fresh_dir("adr629-p1-bind");
+	let dir = owned_dir("adr629-p1-bind");
 	let path = dir.join("toron.toml");
 	for bind in [
 		"127.0.0.1:0",
@@ -1467,7 +1484,7 @@ fn adr629_p1_storage_bind_requires_complete_tls_for_non_loopback() {
 
 #[test]
 fn adr629_p1_storage_tls_domain_and_bind_are_validated() {
-	let dir = fresh_dir("adr629-p1-domain");
+	let dir = owned_dir("adr629-p1-domain");
 	let path = dir.join("toron.toml");
 	for domain in ["", "bad..domain", "bad domain", "-bad.test", "bad-.test"] {
 		std::fs::write(
