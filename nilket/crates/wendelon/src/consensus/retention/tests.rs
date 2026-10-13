@@ -1225,3 +1225,5 @@ fn retention_paths_are_guarded() {
 		vec![(src.join("consensus/raft_server.rs"), true)]
 	);
 }
+
+mod g2;

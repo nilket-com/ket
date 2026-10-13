@@ -21,3 +21,7 @@ use error::redacted_debug;
 
 #[cfg(test)]
 mod tests;
+
+// G2 shares only allocator counters with cfg(test) measurement helpers.
+#[cfg(test)]
+pub(crate) use tests::b1_assay::{r0_counters, r0_reset_peak};

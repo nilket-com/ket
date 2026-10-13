@@ -635,3 +635,5 @@ async fn binding_fault_is_retained_and_unavailable_carrier_refuses() {
 }
 
 mod completion;
+
+mod g2;
