@@ -139,10 +139,14 @@ fn encode_state(s: &State2) -> Result2<Vec<u8>> {
 	b.extend_from_slice(&[1, 0]);
 	b.extend_from_slice(&wire.to_le_bytes());
 	emit_state_body(s, &u, &mut |part| b.extend_from_slice(part))?;
-	assert_eq!(b.len(), total - 32, "snapshot body sizing drift");
+	if b.len() != total - 32 {
+		return Err(RootError2::Codec);
+	}
 	let sum = hash(b"", &b);
 	b.extend_from_slice(&sum);
-	assert_eq!(b.len(), total, "snapshot envelope sizing drift");
+	if b.len() != total {
+		return Err(RootError2::Codec);
+	}
 	Ok(b)
 }
 #[cfg(test)]

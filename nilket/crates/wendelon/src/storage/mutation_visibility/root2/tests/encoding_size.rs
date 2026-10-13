@@ -1,4 +1,3 @@
-
 use super::*;
 #[test]
 fn exact_envelope_size_preserves_limit_then_overflow() {
@@ -75,6 +74,12 @@ fn streamed_permissions_preserve_section_bytes_and_refusals() {
 			..permission_limits2()
 		},
 	] {
+		for r in permissions.values() {
+			assert_eq!(
+				encode_permission_record2(r).unwrap().len(),
+				PERMISSION_RECORD_BYTES2
+			);
+		}
 		let old = encode_permission_section2(&permissions, limits);
 		let mut b = Vec::new();
 		let new = visit_permission_section2(&permissions, limits, &mut |x| b.extend_from_slice(x))
