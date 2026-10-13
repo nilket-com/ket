@@ -29,7 +29,11 @@ mod committed;
 pub mod durable;
 #[allow(dead_code)] // Dormant entry-identity math; no production caller until reviewed integration.
 mod entry_identity;
+#[allow(dead_code)] // Dormant pure governance check; no production caller.
+mod governance_command;
 mod incremental;
+#[allow(dead_code)] // Dormant pure lease payload check; no production caller.
+mod lease_payload;
 #[allow(dead_code)] // Dormant origin layer; no production caller until reviewed integration.
 mod origin;
 mod persistent;
