@@ -1,6 +1,7 @@
 //! A1 real file-backed Full store, synthetic producer; no Raft or state-machine apply.
 use super::*;
 use crate::test_support::g2::{Phase, case, emit};
+use openraft::storage::RaftLogStorageExt;
 use openraft::{CommittedLeaderId, Entry, EntryPayload};
 use std::os::unix::fs::MetadataExt;
 fn files(dir: &Path) -> serde_json::Value {
