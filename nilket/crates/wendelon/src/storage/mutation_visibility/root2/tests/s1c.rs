@@ -344,12 +344,33 @@ fn s1c_bootstrap_and_unauthorized_bootstrap_match_legacy() {
 #[test]
 fn s1c_every_root_golden_and_corrupt_envelope_agree_with_legacy() {
 	let goldens: serde_json::Value = serde_json::from_str(include_str!("goldens.json")).unwrap();
+	let (mut legacy_count, mut issuer_count) = (0, 0);
 	for item in goldens["fixtures"].as_array().unwrap() {
 		let name = item["name"].as_str().unwrap();
 		if !name.starts_with("root_") {
 			continue;
 		}
 		let bytes = fixture(name);
+		if matches!(name, "root_one_issuer" | "root_numeric_issuers") {
+			assert_eq!(
+				super::s1c_oracle::legacy_profile2(&bytes),
+				Err(RootError2::Codec)
+			);
+			assert_eq!(
+				UnverifiedRoot2::decode(&bytes).unwrap().encode().unwrap(),
+				bytes
+			);
+			let mut corrupt = bytes.clone();
+			let last = corrupt.len() - 1;
+			corrupt[last] ^= 1;
+			assert_eq!(
+				UnverifiedRoot2::decode(&corrupt).err(),
+				Some(RootError2::Codec)
+			);
+			issuer_count += 1;
+			continue;
+		}
+		legacy_count += 1;
 		let legacy = super::s1c_oracle::legacy_profile2(&bytes).unwrap();
 		let old = super::s1c_oracle::state::UnverifiedRoot2::decode(&legacy).unwrap();
 		let n = UnverifiedRoot2::decode(&bytes).unwrap();
@@ -367,4 +388,6 @@ fn s1c_every_root_golden_and_corrupt_envelope_agree_with_legacy() {
 		assert_eq!(a, b);
 		assert!(a.is_some());
 	}
+	assert_eq!(legacy_count, 7);
+	assert_eq!(issuer_count, 2);
 }

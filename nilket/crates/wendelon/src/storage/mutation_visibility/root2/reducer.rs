@@ -4,6 +4,7 @@ use super::{
 	persistent::Map,
 	stored::Cuts2,
 };
+use crate::storage::mutation_visibility::root2::issuer_registry;
 fn bootstrap_root(
 	g: [u8; 16],
 	c: [u8; 16],
@@ -36,6 +37,7 @@ fn bootstrap_root(
 		control_len: *length,
 		selectors: Map::new(),
 		authorities: Map::new(),
+		issuers: Map::new(),
 		permissions: Map::new(),
 		lineages: Map::new(),
 		cuts: Cuts2::default(),
@@ -247,6 +249,10 @@ fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Res
 			let first = *a.revoked.get_or_insert(l);
 			Ok(ApplyResult2::Registered(first))
 		}
+		Command2::EnrollLeaseIssuer { node, key } => {
+			issuer_registry::enroll(s, limits, *node, *key, l)
+		}
+		Command2::RevokeLeaseIssuer { node } => issuer_registry::revoke(s, *node, l),
 		Command2::Grant {
 			lineage,
 			incarnation,

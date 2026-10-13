@@ -50,6 +50,9 @@ fn s1_independent_literal_record_root_command_result_goldens() {
 					.unwrap()
 					.encode()
 					.unwrap(),
+				"issuer_registration2" => {
+					IssuerRegistration2::decode(&b).unwrap().encode().unwrap()
+				}
 				"epoch_cut2" => EpochCut2::decode(&b).unwrap().encode().unwrap(),
 				_ => panic!("uncovered golden {name}"),
 			},
@@ -58,7 +61,7 @@ fn s1_independent_literal_record_root_command_result_goldens() {
 		assert_eq!(encoded, b, "{name}");
 		count += 1;
 	}
-	assert_eq!(count, 50);
+	assert_eq!(count, 55);
 }
 #[test]
 fn s1_truncation_every_byte_and_unknown_formats_are_refused() {
@@ -87,14 +90,14 @@ fn s1_declared_counts_and_counters_are_checked_before_trust() {
 	for offset in [184, 188, 196, 204, 212] {
 		let mut payload = b[16..b.len() - 32].to_vec();
 		payload[offset] ^= 1;
-		let b = envelope_versioned(b"VISAUT03", 3, &payload, ROOT_BYTES2).unwrap();
+		let b = envelope_versioned(b"VISAUT04", 4, &payload, ROOT_BYTES2).unwrap();
 		assert!(UnverifiedRoot2::decode(&b).is_err(), "{offset}")
 	}
 	let mut payload = b[16..b.len() - 32].to_vec();
 	payload[212..216].copy_from_slice(&u32::MAX.to_le_bytes());
 	assert!(
 		UnverifiedRoot2::decode(
-			&envelope_versioned(b"VISAUT03", 3, &payload, ROOT_BYTES2).unwrap()
+			&envelope_versioned(b"VISAUT04", 4, &payload, ROOT_BYTES2).unwrap()
 		)
 		.is_err()
 	)

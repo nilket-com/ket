@@ -1,3 +1,4 @@
+//! Matched profile03 evidence is historical; future comparisons require the same root format.
 //! A2/A3 small-state synthetic replay; never installed or large-capacity evidence.
 use super::*;
 use crate::storage::mutation_visibility::root2::origin::root_and_origin2;
@@ -148,7 +149,7 @@ async fn g2_small_state_replay() {
 	assert_eq!(encode_authority2(replayed.state()).unwrap(), want);
 	let (root, _) = root_and_origin2(replayed.state()).unwrap();
 	let bytes = root.encode().unwrap();
-	assert_eq!(&bytes[..8], b"VISAUT03");
+	assert_eq!(&bytes[..8], b"VISAUT04");
 	let u = root.usage().unwrap();
 	emit(
 		json!({"event":"replay","case":c,"fixture_commands":lookup_count,"outcomes":outcomes,

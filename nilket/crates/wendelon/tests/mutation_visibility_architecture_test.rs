@@ -413,6 +413,7 @@ fn s1c_incremental_updates_do_not_scan_or_create_authority_and_oracle_is_test_on
 		"records.rs",
 		"codec.rs",
 		"admission_gate.rs",
+		"issuer_registry.rs",
 	] {
 		let source = fs::read_to_string(root.join(module)).unwrap();
 		syn::parse_file(&source).unwrap();
@@ -2028,7 +2029,8 @@ fn admission_registry_is_a_pure_registry() {
 		assert!(!command.contains(f), "command.rs names {f}");
 	}
 	let state = fs::read_to_string(root.join("state.rs")).unwrap();
-	assert_eq!(state.matches("VISAUT03").count(), 2);
+	assert_eq!(state.matches("VISAUT04").count(), 2);
+	assert!(!state.contains("VISAUT03"));
 	assert!(!state.contains("VISAUT02"));
 	let codec = fs::read_to_string(root.join("codec.rs")).unwrap();
 	assert!(codec.contains("\tenvelope_versioned(magic, 2, body, max)\n}"));

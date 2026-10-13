@@ -1,3 +1,4 @@
+//! Historical matched evidence uses profile 03; future comparisons must use the same format.
 //! A3b direct construction; deliberately separate from replay-derived A3.
 use super::*;
 use crate::storage::mutation_visibility::tests::g2::Phase;
@@ -12,7 +13,7 @@ fn g2_bulk_snapshot() {
 	assert!(["E", "P256", "P4096", "X-small"].contains(&name));
 	let root = model(name);
 	let bytes = root.encode().unwrap();
-	assert_eq!(&bytes[..8], b"VISAUT03");
+	assert_eq!(&bytes[..8], b"VISAUT04");
 	let u = root.usage().unwrap();
 	emit(
 		json!({"event":"fixture","case":c,"scope":"A3b direct construction, NOT replay-derived",

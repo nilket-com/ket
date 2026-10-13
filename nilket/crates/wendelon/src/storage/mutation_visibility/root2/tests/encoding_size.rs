@@ -2,12 +2,12 @@ use super::*;
 #[test]
 fn exact_envelope_size_preserves_limit_then_overflow() {
 	for body in [0, 1, 127, 128, 255, 256, 4096] {
-		let old = envelope_versioned(b"VISAUT03", 3, &vec![0; body], 4096).unwrap();
+		let old = envelope_versioned(b"VISAUT04", 4, &vec![0; body], 4096).unwrap();
 		assert_eq!(envelope_size(body, 4096).unwrap(), (body as u32, old.len()));
 	}
 	assert_eq!(envelope_size(4097, 4096), Err(RootError2::Limit));
 	assert_eq!(
-		envelope_versioned(b"VISAUT03", 3, &vec![0; 4097], 4096),
+		envelope_versioned(b"VISAUT04", 4, &vec![0; 4097], 4096),
 		Err(RootError2::Limit)
 	);
 	assert_eq!(

@@ -159,7 +159,7 @@ fn s1c_multi_defect_decode_keeps_legacy_precedence() {
 	let mut dup = second.clone();
 	dup.log.index = first.log.index;
 	let to = dup.bytes().unwrap();
-	let mut body = open_versioned(&encoded, b"VISAUT03", 3, ROOT_BYTES2)
+	let mut body = open_versioned(&encoded, b"VISAUT04", 4, ROOT_BYTES2)
 		.unwrap()
 		.to_vec();
 	let hits = body
@@ -170,14 +170,14 @@ fn s1c_multi_defect_decode_keeps_legacy_precedence() {
 	assert_eq!(hits.len(), 1);
 	body[hits[0]..hits[0] + to.len()].copy_from_slice(&to);
 	compare_decode(
-		&envelope_versioned(b"VISAUT03", 3, &body, ROOT_BYTES2).unwrap(),
+		&envelope_versioned(b"VISAUT04", 4, &body, ROOT_BYTES2).unwrap(),
 		RootError2::RootInvariant,
 	);
-	// Parse vector boundaries after the fixed header (selectors, authorities, permissions, lineages,
+	// Parse vector boundaries after the fixed header (selectors, authorities, issuers, permissions, lineages,
 	// cuts), then force a later parent-count Limit while the earlier cuts still have duplicate
 	// coordinates.
 	let mut pos = 212usize;
-	for _ in 0..5 {
+	for _ in 0..6 {
 		let count = u32::from_le_bytes(body[pos..pos + 4].try_into().unwrap()) as usize;
 		pos += 4;
 		for _ in 0..count {
@@ -188,25 +188,25 @@ fn s1c_multi_defect_decode_keeps_legacy_precedence() {
 	let mut excessive = body.clone();
 	excessive[pos..pos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
 	compare_decode(
-		&envelope_versioned(b"VISAUT03", 3, &excessive, ROOT_BYTES2).unwrap(),
+		&envelope_versioned(b"VISAUT04", 4, &excessive, ROOT_BYTES2).unwrap(),
 		RootError2::Limit,
 	);
 	let mut zero = body.clone();
 	zero[..16].fill(0);
 	compare_decode(
-		&envelope_versioned(b"VISAUT03", 3, &zero, ROOT_BYTES2).unwrap(),
+		&envelope_versioned(b"VISAUT04", 4, &zero, ROOT_BYTES2).unwrap(),
 		RootError2::Codec,
 	);
 	let mut trailing = body.clone();
 	trailing.push(0);
 	compare_decode(
-		&envelope_versioned(b"VISAUT03", 3, &trailing, ROOT_BYTES2).unwrap(),
+		&envelope_versioned(b"VISAUT04", 4, &trailing, ROOT_BYTES2).unwrap(),
 		RootError2::Codec,
 	);
 	let mut bad_wire = body.clone();
 	bad_wire[16..32].fill(0);
 	compare_decode(
-		&envelope_versioned(b"VISAUT03", 3, &bad_wire, ROOT_BYTES2).unwrap(),
+		&envelope_versioned(b"VISAUT04", 4, &bad_wire, ROOT_BYTES2).unwrap(),
 		RootError2::Codec,
 	);
 }
