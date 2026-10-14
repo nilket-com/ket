@@ -120,7 +120,8 @@ fn governed_root() -> MutationAuthorityState2 {
 	let m = manifest_prime();
 	let cmd = governed(0, None, 137);
 	let (ce, e) = bootstrap_inputs(m.generation, m.cluster, &cmd);
-	let (s, r) = advance_verified2(&pre_root(d32(sv("genesis"))), &tuple(), &ce, &e, &cmd).unwrap();
+	let (s, r) =
+		advance_verified2(&pre_root(d32(sv("genesis"))), &tuple(), &ce, &e, &cmd, None).unwrap();
 	assert!(r == ApplyResult2::Registered(l(2)));
 	s
 }
@@ -137,7 +138,7 @@ fn entry_of(g: [u8; 16], c: [u8; 16], cmd: &Command2, i: u64) -> (CommittedEntry
 /// Through C.
 fn via_c(s: &MutationAuthorityState2, g: [u8; 16], c: [u8; 16], cmd: &Command2, i: u64) -> Out {
 	let (ce, e) = entry_of(g, c, cmd, i);
-	advance_verified2(s, &tuple(), &ce, &e, cmd)
+	advance_verified2(s, &tuple(), &ce, &e, cmd, None)
 }
 /// FIXTURE: the raw consumer with a fixture token (always authorized), for comparison.
 fn raw(
@@ -349,7 +350,7 @@ fn bootstrap_authorized_only_by_exact_pin() {
 		let pin = tuple_for(r);
 		let pre = pre_root(genesis);
 		assert_eq!(
-			advance_verified2(&pre, &pin, &ce, &e, &cmd).err(),
+			advance_verified2(&pre, &pin, &ce, &e, &cmd, None).err(),
 			Some(VerifyError2::Consumer(RootError2::TrustMismatch)),
 			"{name}"
 		);
@@ -370,7 +371,7 @@ fn bootstrap_authorized_only_by_exact_pin() {
 		(empty_authority2(), &wrong),
 	] {
 		assert_eq!(
-			advance_verified2(&s, &tuple(), committed, &e, &cmd).err(),
+			advance_verified2(&s, &tuple(), committed, &e, &cmd, None).err(),
 			Some(VerifyError2::StateKind)
 		);
 	}
@@ -424,7 +425,7 @@ fn admission_permission_advances_a_rooted_state() {
 	other_record.identity.genesis_fingerprint = [0x77; 32];
 	let (ce, e) = entry_of(mg, mc, &cmd, 4);
 	assert_eq!(
-		advance_verified2(&s, &tuple_for(other_record), &ce, &e, &cmd).err(),
+		advance_verified2(&s, &tuple_for(other_record), &ce, &e, &cmd, None).err(),
 		Some(VerifyError2::Consumer(RootError2::TrustMismatch))
 	);
 }
@@ -611,7 +612,7 @@ fn committed_and_entry_binding() {
 		CommittedEntry2::fixture(at(1, 1, 7), [0xcc; 32], EntryClass2::OtherRoot2(d)),
 	] {
 		assert_eq!(
-			advance_verified2(&s, &tuple(), &wrong, &e, &cmd).err(),
+			advance_verified2(&s, &tuple(), &wrong, &e, &cmd, None).err(),
 			Some(VerifyError2::CommittedMismatch)
 		);
 	}
@@ -626,7 +627,15 @@ fn committed_and_entry_binding() {
 		CommittedEntry2::fixture(pos, [0xcc; 32], class),
 	] {
 		assert_eq!(
-			advance_verified2(&pre_root(d32(sv("genesis"))), &tuple(), &wrong, &e, &boot).err(),
+			advance_verified2(
+				&pre_root(d32(sv("genesis"))),
+				&tuple(),
+				&wrong,
+				&e,
+				&boot,
+				None
+			)
+			.err(),
 			Some(VerifyError2::Consumer(RootError2::TrustMismatch))
 		);
 	}
@@ -725,7 +734,7 @@ fn unsupported_not_applicable_and_precedence() {
 		// Even with a mismatched entry digest, the kind refuses first.
 		let (ce, e) = entry_of(g(), c(), &reserve(), 7);
 		assert_eq!(
-			advance_verified2(&s, &tuple(), &ce, &e, &cmd).err(),
+			advance_verified2(&s, &tuple(), &ce, &e, &cmd, None).err(),
 			Some(VerifyError2::Unsupported(kind))
 		);
 	}
@@ -742,14 +751,14 @@ fn unsupported_not_applicable_and_precedence() {
 	let (_, e_other) = entry_of(g(), c(), &revoke(), 7);
 	let blank = CommittedEntry2::fixture(at(1, 1, 7), [0; 32], EntryClass2::Blank);
 	assert_eq!(
-		advance_verified2(&s, &tuple(), &blank, &e_other, &reserve()).err(),
+		advance_verified2(&s, &tuple(), &blank, &e_other, &reserve(), None).err(),
 		Some(VerifyError2::DigestMismatch)
 	);
 	// Committed binding before state kind (rooted kinds), state kind before root.
 	let pre = pre_root([0x11; 32]);
 	let (_, e) = entry_of(g(), c(), &reserve(), 7);
 	assert_eq!(
-		advance_verified2(&pre, &tuple(), &blank, &e, &reserve()).err(),
+		advance_verified2(&pre, &tuple(), &blank, &e, &reserve(), None).err(),
 		Some(VerifyError2::CommittedMismatch)
 	);
 	assert_eq!(

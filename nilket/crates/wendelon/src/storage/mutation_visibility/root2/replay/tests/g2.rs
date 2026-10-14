@@ -34,7 +34,7 @@ fn expected(
 	let source = CommittedSource2::synthetic();
 	let mut outcomes = Vec::new();
 	for e in entries {
-		let ce = committed_entry2(&source, e).unwrap();
+		let ce = committed_entry2(&source, e).unwrap().into_committed();
 		let (pos, fp, class) = ce.entry_fields();
 		state = if matches!(
 			class,
@@ -44,7 +44,8 @@ fn expected(
 				crate::storage::mutation_visibility::root2::committed::fixture::command(pos, fp)
 					.unwrap();
 			let trusted = TrustedEntry2::bind(&ce, &command, dep.generation, dep.cluster).unwrap();
-			let (next, outcome) = advance_verified2(&state, pin, &ce, &trusted, &command).unwrap();
+			let (next, outcome) =
+				advance_verified2(&state, pin, &ce, &trusted, &command, None).unwrap();
 			let fact = match outcome {
 				ApplyResult2::Covered => json!({"kind":"Covered"}),
 				ApplyResult2::Registered(first) => json!({"kind":"Registered",

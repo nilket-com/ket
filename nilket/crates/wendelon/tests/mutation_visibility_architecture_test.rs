@@ -2601,6 +2601,7 @@ fn committed_adapter_is_pure_capability_gated_and_exhaustive() {
 	let file = syn::parse_file(&text).unwrap();
 	let mut entrypoints = Vec::new();
 	let mut mints = 0;
+	let mut sidecar_constants = 0;
 	let mut arms: Vec<String> = Vec::new();
 	fn collect(p: &syn::Pat, out: &mut Vec<String>) {
 		match p {
@@ -2608,7 +2609,14 @@ fn committed_adapter_is_pure_capability_gated_and_exhaustive() {
 			syn::Pat::TupleStruct(t) => {
 				// `WendelonRequest::Variant(_)` only: no binding, no field access.
 				assert!(
-					t.elems.len() == 1 && matches!(t.elems.first(), Some(syn::Pat::Wild(_))),
+					t.elems.len() == 1
+						&& (matches!(t.elems.first(), Some(syn::Pat::Wild(_)))
+							|| (t
+								.path
+								.segments
+								.last()
+								.is_some_and(|s| s.ident == "Root2Command")
+								&& matches!(t.elems.first(), Some(syn::Pat::Ident(i)) if i.ident == "carrier" && i.by_ref.is_none() && i.mutability.is_none() && i.subpat.is_none()))),
 					"classification patterns bind nothing"
 				);
 				let segs: Vec<String> = t
@@ -2631,6 +2639,71 @@ fn committed_adapter_is_pure_capability_gated_and_exhaustive() {
 			_ => "other".into(),
 		}
 	}
+	fn shape(t: &syn::Type) -> String {
+		match t {
+			syn::Type::Path(p) => {
+				assert!(
+					p.qself.is_none()
+						&& p.path.leading_colon.is_none()
+						&& p.path.segments.len() == 1
+				);
+				let s = &p.path.segments[0];
+				let mut out = s.ident.to_string();
+				match &s.arguments {
+					syn::PathArguments::None => {}
+					syn::PathArguments::AngleBracketed(a) => {
+						out.push('<');
+						let args: Vec<_> = a
+							.args
+							.iter()
+							.map(|g| match g {
+								syn::GenericArgument::Lifetime(l) => format!("'{}", l.ident),
+								syn::GenericArgument::Type(t) => shape(t),
+								_ => panic!("unreviewed adapter generic"),
+							})
+							.collect();
+						out.push_str(&args.join(","));
+						out.push('>');
+					}
+					_ => panic!("unreviewed adapter path"),
+				}
+				out
+			}
+			syn::Type::Reference(r) => {
+				assert!(r.mutability.is_none());
+				format!(
+					"&{}{}",
+					r.lifetime
+						.as_ref()
+						.map(|l| format!("'{}", l.ident))
+						.unwrap_or_default(),
+					shape(&r.elem)
+				)
+			}
+			syn::Type::Slice(t) => format!("[{}]", shape(&t.elem)),
+			syn::Type::Array(a) => {
+				let syn::Expr::Lit(l) = &a.len else {
+					panic!("array length")
+				};
+				let syn::Lit::Int(i) = &l.lit else {
+					panic!("array integer")
+				};
+				format!(
+					"[{};{}]",
+					shape(&a.elem),
+					i.base10_parse::<usize>().unwrap()
+				)
+			}
+			syn::Type::Tuple(t) => format!(
+				"({})",
+				t.elems.iter().map(shape).collect::<Vec<_>>().join(",")
+			),
+			_ => panic!("unreviewed adapter type"),
+		}
+	}
+	fn self_field(e: &syn::Expr, name: &str) -> bool {
+		matches!(e,syn::Expr::Field(f) if matches!(&*f.base,syn::Expr::Path(p) if p.path.is_ident("self")) && matches!(&f.member,syn::Member::Named(n) if n==name))
+	}
 	for item in &file.items {
 		match item {
 			syn::Item::Struct(s) if s.ident == "CommittedSource2" => {
@@ -2639,9 +2712,96 @@ fn committed_adapter_is_pure_capability_gated_and_exhaustive() {
 					assert!(matches!(f.vis, syn::Visibility::Inherited));
 				}
 			}
+			syn::Item::Struct(v) if v.ident == "AdaptedEntry2" || v.ident == "CarrierCommand2" => {
+				assert!(root2_scoped(&v.vis));
+				assert!(v.attrs.iter().all(|a| a.path().is_ident("doc")));
+				assert!(
+					v.fields
+						.iter()
+						.all(|f| matches!(f.vis, syn::Visibility::Inherited))
+				);
+				assert!(
+					v.generics.params.len() == 1
+						&& v.generics.where_clause.is_none()
+						&& matches!(v.generics.params.first(),Some(syn::GenericParam::Lifetime(l)) if l.lifetime.ident=="e" && l.bounds.is_empty())
+				);
+				let actual: Vec<_> = v
+					.fields
+					.iter()
+					.map(|f| (f.ident.as_ref().unwrap().to_string(), shape(&f.ty)))
+					.collect();
+				let want: &[(&str, &str)] = if v.ident == "CarrierCommand2" {
+					&[
+						("generation", "[u8;16]"),
+						("cluster", "[u8;16]"),
+						("command", "Command2"),
+						("governance", "Option<&'e[u8]>"),
+					]
+				} else {
+					&[
+						("committed", "CommittedEntry2"),
+						("raw_carrier", "bool"),
+						("carrier", "Option<CarrierCommand2<'e>>"),
+					]
+				};
+				assert_eq!(
+					actual,
+					want.iter()
+						.map(|(n, t)| (n.to_string(), t.to_string()))
+						.collect::<Vec<_>>()
+				);
+			}
+			syn::Item::Const(c) => {
+				assert_eq!(c.ident, "GOVERNANCE_SIDECAR_BYTES2");
+				assert!(root2_scoped(&c.vis));
+				assert!(c.attrs.iter().all(|a| a.path().is_ident("doc")));
+				assert!(c.generics.params.is_empty() && c.generics.where_clause.is_none());
+				assert_eq!(shape(&c.ty), "usize");
+				assert!(
+					matches!(&*c.expr, syn::Expr::Lit(l) if matches!(&l.lit, syn::Lit::Int(i) if i.base10_parse::<usize>().unwrap() == 296))
+				);
+				sidecar_constants += 1;
+			}
 			syn::Item::Impl(i) => {
 				assert!(i.trait_.is_none(), "committed.rs: trait impl");
-				assert_eq!(quote_type(&i.self_ty), "CommittedSource2");
+				let ty = shape(&i.self_ty);
+				if ty == "CarrierCommand2<'e>" || ty == "AdaptedEntry2<'e>" {
+					assert!(
+						i.generics.params.len() == 1
+							&& matches!(i.generics.params.first(),Some(syn::GenericParam::Lifetime(l)) if l.lifetime.ident=="e" && l.bounds.is_empty())
+					);
+					let carrier = ty == "CarrierCommand2<'e>";
+					let allowed: &[&str] = if carrier {
+						&["into_parts"]
+					} else {
+						&["committed", "is_carrier", "into_parts", "into_committed"]
+					};
+					let names: Vec<_> = i.items.iter().map(|item| match item { syn::ImplItem::Fn(f) => {
+                        assert!(root2_scoped(&f.vis));
+                        let name=f.sig.ident.to_string();
+                        assert_eq!(cfg_test(&f.attrs),name=="into_committed");
+                        assert!(f.sig.inputs.len()==1 && f.sig.generics.params.is_empty() && f.sig.asyncness.is_none() && f.sig.constness.is_none() && f.sig.unsafety.is_none() && f.sig.abi.is_none() && f.sig.variadic.is_none());
+                        let Some(syn::FnArg::Receiver(recv))=f.sig.inputs.first() else {panic!("accessor receiver")};
+                        assert!(recv.mutability.is_none() && recv.colon_token.is_none());
+                        assert_eq!(recv.reference.is_some(),name=="committed" || name=="is_carrier");
+                        let syn::ReturnType::Type(_,ret)=&f.sig.output else {panic!("accessor return")};
+                        let want=match name.as_str(){"committed"=>"&CommittedEntry2","is_carrier"=>"bool","into_committed"=>"CommittedEntry2","into_parts" if carrier=>"([u8;16],[u8;16],Command2,Option<&'e[u8]>)","into_parts"=>"(CommittedEntry2,bool,Option<CarrierCommand2<'e>>)",_=>panic!("unreviewed accessor")};
+                        assert_eq!(shape(ret),want);
+                        assert_eq!(f.block.stmts.len(),1);
+                        let syn::Stmt::Expr(body,None)=&f.block.stmts[0] else {panic!("accessor expression only")};
+                        match name.as_str(){
+                            "committed"=>assert!(matches!(body,syn::Expr::Reference(r) if r.mutability.is_none() && self_field(&r.expr,"committed"))),
+                            "is_carrier"=>assert!(self_field(body,"raw_carrier")),
+                            "into_committed"=>assert!(self_field(body,"committed")),
+                            "into_parts"=>{let syn::Expr::Tuple(t)=body else {panic!("accessor fields only")};let fields:&[&str]=if carrier{&["generation","cluster","command","governance"]}else{&["committed","raw_carrier","carrier"]};assert_eq!(t.elems.len(),fields.len());assert!(t.elems.iter().zip(fields).all(|(e,n)|self_field(e,n)));},
+                            _=>unreachable!()
+                        }
+                        name
+                    }, _ => panic!("adapter accessors only") }).collect();
+					assert_eq!(names, allowed);
+					continue;
+				}
+				assert_eq!(ty, "CommittedSource2");
 				for it in &i.items {
 					if let syn::ImplItem::Fn(f) = it {
 						if f.sig.ident == "synthetic" {
@@ -2672,17 +2832,24 @@ fn committed_adapter_is_pure_capability_gated_and_exhaustive() {
 						assert!(arm.guard.is_none(), "no match guard");
 						let mut variants = Vec::new();
 						collect(&arm.pat, &mut variants);
-						let held = variants == ["Root2Command"];
-						let expected = if held { "HeldCarrier" } else { "NonRoot2" };
-						assert!(
-							!variants.iter().any(|v| v == "Root2Command") || held,
-							"carrier has its own exact arm"
-						);
-						assert!(
-							matches!(&*arm.body, syn::Expr::Path(p) if
-                            p.path.segments.iter().map(|s|s.ident.to_string()).collect::<Vec<_>>() == ["EntryClass2",expected]),
-							"only Root2Command classifies HeldCarrier; legacy requests NonRoot2"
-						);
+						let carrier = variants == ["Root2Command"];
+						assert!(!variants.iter().any(|v| v == "Root2Command") || carrier);
+						if carrier {
+							assert!(
+								matches!(&*arm.body, syn::Expr::Block(_)),
+								"one narrow carrier decode arm"
+							);
+							let body = fn_body(&text, "request_class");
+							assert_eq!(calls(body, "Command2::decode"), 1);
+							assert!(body.contains("command.digest(generation, cluster)"));
+							assert!(body.contains("EntryClass2::Bootstrap(digest)"));
+							assert!(body.contains("EntryClass2::OtherRoot2(digest)"));
+							assert!(body.contains("EntryClass2::MalformedRoot2"));
+						} else {
+							assert!(
+								matches!(&*arm.body, syn::Expr::Tuple(t) if t.elems.len()==2 && matches!(&t.elems[0],syn::Expr::Path(p) if exact_path(&p.path,&["EntryClass2","NonRoot2"])) && matches!(&t.elems[1],syn::Expr::Path(p) if p.path.is_ident("None")))
+							);
+						}
 						arms.extend(variants);
 					}
 					assert_eq!(f.block.stmts.len(), 1, "request_class is only the match");
@@ -2697,6 +2864,7 @@ fn committed_adapter_is_pure_capability_gated_and_exhaustive() {
 	}
 	assert_eq!(entrypoints, ["committed_entry2"]);
 	assert_eq!(mints, 1);
+	assert_eq!(sidecar_constants, 1);
 	// The declared variants of WendelonRequest, by name.
 	let core =
 		syn::parse_file(&fs::read_to_string(src.join("consensus/core.rs")).unwrap()).unwrap();
@@ -2729,11 +2897,75 @@ fn committed_adapter_is_pure_capability_gated_and_exhaustive() {
 			}
 		}
 	}
+	let production_tokens = without_test_items_deep(text.parse().unwrap());
 	let mut production = Vec::new();
-	idents(
-		without_test_items_deep(text.parse().unwrap()),
-		&mut production,
+	idents(production_tokens.clone(), &mut production);
+	let compact = production_tokens.to_string().replace(' ', "");
+	assert_eq!(
+		production
+			.iter()
+			.filter(|w| *w == "GOVERNANCE_SIDECAR_BYTES2")
+			.count(),
+		2
 	);
+	assert_eq!(
+		compact
+			.matches("bytes.len()!=GOVERNANCE_SIDECAR_BYTES2")
+			.count(),
+		1
+	);
+	assert!(!production.iter().any(|w| w == "GOVERNANCE_COMMAND_BYTES2"));
+	// Five reviewed Command2 identifiers only: the exact import, carrier field, accessor
+	// return type, decode call and Bootstrap classification pattern. The field and accessor
+	// schemas above pin two occurrences; the remaining three are pinned here. No blanket
+	// Command2 exemption permits another associated method, type use or constructor.
+	assert_eq!(production.iter().filter(|w| *w == "Command2").count(), 5);
+	assert_eq!(
+		compact
+			.matches("usecrate::storage::mutation_visibility::root2::command::Command2;")
+			.count(),
+		1
+	);
+	assert_eq!(compact.matches("Command2::").count(), 2);
+	assert_eq!(
+		compact
+			.matches("Command2::decode(carrier.command())")
+			.count(),
+		1
+	);
+	assert_eq!(
+		compact
+			.matches("matches!(command,Command2::Bootstrap{..})")
+			.count(),
+		1
+	);
+	// Reject any additional method on the retained command, even if it does not spell
+	// Command2. The one digest call must use this decoded envelope's context arguments.
+	fn command_methods(tokens: proc_macro2::TokenStream, out: &mut Vec<String>) {
+		let ts: Vec<_> = tokens.into_iter().collect();
+		for (i, t) in ts.iter().enumerate() {
+			if matches!(t, proc_macro2::TokenTree::Ident(id) if id == "command")
+				&& matches!(ts.get(i + 1), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '.')
+				&& let (
+					Some(proc_macro2::TokenTree::Ident(method)),
+					Some(proc_macro2::TokenTree::Group(args)),
+				) = (ts.get(i + 2), ts.get(i + 3))
+				&& args.delimiter() == proc_macro2::Delimiter::Parenthesis
+			{
+				out.push(format!(
+					"{}({})",
+					method,
+					args.stream().to_string().replace(' ', "")
+				));
+			}
+			if let proc_macro2::TokenTree::Group(g) = t {
+				command_methods(g.stream(), out);
+			}
+		}
+	}
+	let mut methods = Vec::new();
+	command_methods(production_tokens, &mut methods);
+	assert_eq!(methods, ["digest(generation,cluster)"]);
 	for banned in [
 		"fs",
 		"io",
@@ -2743,7 +2975,6 @@ fn committed_adapter_is_pure_capability_gated_and_exhaustive() {
 		"SystemTime",
 		"Root2",
 		"State2",
-		"Command2",
 		"TrustedEntry2",
 		"VerifiedCommand2",
 		"TrustedView2",
@@ -3409,6 +3640,9 @@ fn command_verification_is_single_site_and_unwired() {
 	);
 	assert_eq!(flat.matches("fnverify_command2(").count(), 1);
 	let advance = fn_body(&text, "advance_verified2");
+	assert!(text.contains("governance: Option<&[u8]>"));
+	assert!(advance.find("E::RootMismatch").unwrap() < advance.find("E::ExtraSidecar").unwrap());
+	assert!(advance.find("E::ExtraSidecar").unwrap() < advance.find("verify_command2").unwrap());
 	assert_eq!(calls(advance, "verify_command2"), 1);
 	let verify = fn_body(&text, "verify_command2");
 	assert_eq!(calls(verify, "VerifiedCommand2::verified2"), 1);
@@ -4577,7 +4811,27 @@ fn root2_carrier_is_bounded_private_held_and_response_mappings_are_explicit() {
 	}
 	let root = src.join("storage/mutation_visibility/root2");
 	let committed = fs::read_to_string(root.join("committed.rs")).unwrap();
-	assert!(committed.contains("if class == EntryClass2::HeldCarrier"));
+	assert!(committed.contains("if raw_carrier"));
+	assert!(committed.contains("EntryPayload::Normal(WendelonRequest::Root2Command(_))"));
+	let replay_source = fs::read_to_string(root.join("replay.rs")).unwrap();
+	let header = "fn command_at<'e>(";
+	assert_eq!(replay_source.matches(header).count(), 1);
+	let start = replay_source.find(header).unwrap();
+	let signature = replay_source[start..].split('{').next().unwrap();
+	assert_eq!(
+		signature
+			.chars()
+			.filter(|c| !c.is_whitespace())
+			.collect::<String>(),
+		"fncommand_at<'e>(adapted:AdaptedEntry2<'e>,)->Result<(CommittedEntry2,Command2,Option<&'e[u8]>,Option<([u8;16],[u8;16])>,),Fault2,>"
+	);
+	// Exact local signature normalization only; the shared nongeneric extractor stays unchanged.
+	let extraction_source = replay_source.replacen(header, "fn command_at(", 1);
+	let extraction = fn_body(&extraction_source, "command_at").to_owned();
+	assert!(
+		extraction.find("if raw_carrier").unwrap() < extraction.find("fixture::command").unwrap()
+	);
+	assert!(extraction.contains("carrier.ok_or(Fault2::Carrier)"));
 	let replay = fs::read_to_string(root.join("replay.rs")).unwrap();
 	let dispatch = replay
 		.split("fn dispatch(")
@@ -4586,8 +4840,30 @@ fn root2_carrier_is_bounded_private_held_and_response_mappings_are_explicit() {
 		.split("fn command(")
 		.next()
 		.unwrap();
+	assert!(dispatch.find("Fault2::Carrier").unwrap() < dispatch.find("origin_view2").unwrap());
+	let initialize = fn_body(&replay, "initialize");
 	assert!(
-		dispatch.find("Fault2::CarrierUnavailable").unwrap()
-			< dispatch.find("origin_view2").unwrap()
+		initialize.find("Fault2::Carrier").unwrap() < initialize.find("replay_monitor2").unwrap()
+	);
+	let command = fn_body(&replay, "command");
+	assert!(
+		command.find("VerifyError2::EnvelopeContext").unwrap()
+			< command.find("TrustedEntry2::bind").unwrap()
+	);
+	assert!(extraction.contains("#[cfg(test)]"));
+	assert!(extraction.contains("#[cfg(not(test))]"));
+	assert!(
+		extraction
+			.split("#[cfg(not(test))]")
+			.nth(1)
+			.unwrap()
+			.contains("Err(Fault2::NoCarrier)")
+	);
+	assert!(
+		!extraction
+			.split("#[cfg(not(test))]")
+			.nth(1)
+			.unwrap()
+			.contains("fixture::")
 	);
 }

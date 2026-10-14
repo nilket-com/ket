@@ -25,6 +25,7 @@ fn c_bootstrap_length_is_isolated_on_two_coherent_chains() {
 			&good.committed,
 			&good.entry,
 			&good.cmd,
+			None,
 		)
 		.unwrap();
 		assert_eq!(
@@ -41,7 +42,8 @@ fn c_bootstrap_length_is_isolated_on_two_coherent_chains() {
 				&bad.tuple,
 				&bad.committed,
 				&bad.entry,
-				&bad.cmd
+				&bad.cmd,
+				None
 			)
 			.err(),
 			Some(VerifyError2::Consumer(RootError2::TrustMismatch)),

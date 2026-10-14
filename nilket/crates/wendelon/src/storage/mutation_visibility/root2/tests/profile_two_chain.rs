@@ -150,7 +150,7 @@ fn profile_two_chain_survives_owner_to_install() {
 	// 3. Checked paths. C: the actual Bootstrap verification from the pre-root, over the same
 	// entry and command, reaches exactly the fixture-built root.
 	let (verified_root, _) =
-		advance_verified2(&pre_root(), &tuple, &committed, &entry, &cmd).unwrap();
+		advance_verified2(&pre_root(), &tuple, &committed, &entry, &cmd, None).unwrap();
 	assert_eq!(
 		encode_authority2(&verified_root).unwrap(),
 		encode_authority2(&fixture_root).unwrap()
@@ -199,7 +199,7 @@ fn profile_two_chain_survives_owner_to_install() {
 	let replayed_genesis = advance_pre_root2(&empty_authority2(), &first).unwrap().0;
 	let replayed_pre_root = pre_root();
 	let (replayed_root, _) =
-		advance_verified2(&replayed_pre_root, &tuple, &committed, &entry, &cmd).unwrap();
+		advance_verified2(&replayed_pre_root, &tuple, &committed, &entry, &cmd, None).unwrap();
 	let (root, _) = root_and_origin2(&replayed_root).unwrap();
 	let mut m = replay_monitor2(
 		Deployment2 {

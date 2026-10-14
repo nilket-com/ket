@@ -30,7 +30,6 @@ pub(in crate::storage::mutation_visibility::root2) enum EntryClass2 {
 	Bootstrap(Digest2),
 	OtherRoot2(Digest2),
 	MalformedRoot2,
-	HeldCarrier,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum PreRootStep2 {
@@ -241,7 +240,7 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_pre_root2(
 			q.scanned_through = position;
 			q.last_scanned = identity;
 			let step = match class {
-				EntryClass2::Bootstrap(_) | EntryClass2::HeldCarrier => {
+				EntryClass2::Bootstrap(_) => {
 					return Err(RootError2::TrustMismatch);
 				}
 				EntryClass2::Blank | EntryClass2::Membership | EntryClass2::NonRoot2 => {
@@ -332,7 +331,6 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_root2(
 pub(in crate::storage::mutation_visibility::root2) enum EntryClass2Kind {
 	Bootstrap,
 	OtherRoot2,
-	HeldCarrier,
 }
 /// Why a committed entry does not advance coverage of a rooted state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,9 +363,6 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_cover2(
 		}
 		EntryClass2::OtherRoot2(_) => {
 			return Err(CoverError2::NotCoverable(EntryClass2Kind::OtherRoot2));
-		}
-		EntryClass2::HeldCarrier => {
-			return Err(CoverError2::NotCoverable(EntryClass2Kind::HeldCarrier));
 		}
 		EntryClass2::MalformedRoot2 => return Err(CoverError2::MalformedAfterRoot),
 	};

@@ -54,6 +54,8 @@ pub(in crate::storage::mutation_visibility::root2) enum UnsupportedKind2 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum VerifyError2 {
 	NotApplicable,
+	EnvelopeContext,
+	ExtraSidecar,
 	Unsupported(UnsupportedKind2),
 	DigestMismatch,
 	CommittedMismatch,
@@ -64,13 +66,16 @@ pub(in crate::storage::mutation_visibility::root2) enum VerifyError2 {
 
 /// Verify `command` against the exact pre-entry `state` (and `pin`), then consume the token at
 /// once in the one matching consumer. Order: kind, digest, committed binding (rooted commands;
-/// Bootstrap's is `bootstrap2`'s), state kind, root (generation, cluster), verification, consumer.
+/// Bootstrap's is `bootstrap2`'s), state kind, root (generation, cluster), extra sidecar,
+/// verification, consumer. The replay checks the retained envelope context before trusted bind;
+/// no governance envelope is authorized by this slice.
 pub(in crate::storage::mutation_visibility::root2) fn advance_verified2(
 	state: &MutationAuthorityState2,
 	pin: &PinnedBoundTuple2,
 	committed: &CommittedEntry2,
 	entry: &TrustedEntry2,
 	command: &Command2,
+	governance: Option<&[u8]>,
 ) -> Result<(MutationAuthorityState2, ApplyResult2), VerifyError2> {
 	use VerifyError2 as E;
 	kind(command)?;
@@ -97,6 +102,9 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_verified2(
 			}
 		}
 		_ => return Err(E::StateKind),
+	}
+	if governance.is_some() {
+		return Err(E::ExtraSidecar);
 	}
 	let token = verify_command2(state, pin, entry, command)?;
 	match command {
