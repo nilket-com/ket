@@ -3085,6 +3085,7 @@ impl WendelonDataServer {
 	async fn replay_write_outcome(
 		&self,
 		tenant_id: TenantId,
+		write_id: crate::schema::ClientWriteId,
 		outcome: WriteOutcome,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
 		if let WriteOutcome::FinalizationRecoverablePending {
@@ -3097,6 +3098,9 @@ impl WendelonDataServer {
 				.get(pending_finalization_id)
 				.await?
 			{
+				if record.finalization.tenant_id != tenant_id {
+					return Ok(self.foreign_refusal(write_id));
+				}
 				if let Some(leader_hint) = self
 					.raft
 					.current_leader()
@@ -8498,9 +8502,7 @@ impl WendelonDataServer {
 		bifurcated: BifurcatedWrite,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
 		self.observe_node_mutation(async {
-
 		let key = Self::idempotency_key_for(meta.tenant_id, meta.write_id);
-
 		// Non-primary redirect must happen before the fresh-leader
 		// orphan-witness sweep. A node that does not own this range
 		// should return `NOT_LEADER` cheaply rather than failing on a
@@ -8521,7 +8523,9 @@ impl WendelonDataServer {
 				None,
 			));
 		}
-
+		if let Some(refusal) = self.foreign_pending(meta.tenant_id, meta.write_id).await? {
+			return Ok(refusal);
+		}
 		// Fresh leaders block cache-miss admission until orphan-witness
 		// recovery for the current `(term, membership_epoch)` is
 		// complete. Cached outcomes are already authoritative for this
@@ -8537,7 +8541,6 @@ impl WendelonDataServer {
 				None,
 			));
 		}
-
 		// Restart-safe pending replay path. A recovered server starts
 		// with an empty idempotency cache, so consult the durable
 		// pending-intent store before crossing the bifurcation boundary
@@ -8550,9 +8553,8 @@ impl WendelonDataServer {
 			let outcome = self.recoverable_pending_outcome_for_record(&record);
 			self.idempotency
 				.insert(key, CachedWriteOutcome::new(outcome));
-			return self.replay_write_outcome(meta.tenant_id, outcome).await;
+			return self.replay_write_outcome(meta.tenant_id, meta.write_id, outcome).await;
 		}
-
 		// Per-range lease gate (plan 018). When enabled, this node
 		// accepts the write only if it holds a valid lease covering
 		// the child's routing locality in the client's epoch.
@@ -8580,7 +8582,6 @@ impl WendelonDataServer {
 				}
 			}
 		}
-
 		let _quota_reservation = match self
 			.enforce_write_policy(meta.tenant_id, bifurcated.charged_bytes)
 			.await
@@ -8592,7 +8593,6 @@ impl WendelonDataServer {
 				);
 			}
 		};
-
 		// HLC for this write. The leader is authoritative: it merges
 		// the client's timestamp with its own monotonic HLC view and
 		// stamps `max(leader_hlc, client_hlc) + 1`.
@@ -8925,7 +8925,7 @@ impl WendelonDataServer {
 			let outcome = self.recoverable_pending_outcome_for_record(&record);
 			self.idempotency
 				.insert(key, CachedWriteOutcome::new(outcome));
-			return self.replay_write_outcome(meta.tenant_id, outcome).await;
+			return self.replay_write_outcome(meta.tenant_id, meta.parent_write_id, outcome).await;
 		}
 
 		if self.lease_gate_enabled {
@@ -9316,11 +9316,11 @@ impl WendelonDataServer {
 			let key = Self::idempotency_key_for(meta.tenant_id, meta.parent_write_id);
 			if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
 				let (write, trailing) = self
-					.replay_write_outcome(meta.tenant_id, cached.outcome())
+					.replay_write_outcome(meta.tenant_id, meta.parent_write_id, cached.outcome())
 					.await?;
 				return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
 			}
-			if let Some((write, trailing)) = self.durable_mutation_replay(&meta).await? {
+			if let Some((write, trailing)) = self.a3_or_foreign_write(&meta).await? {
 				return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
 			}
 			let clocks = WriteClocks::from_remaining_millis(meta.deadline_remaining_millis);
@@ -9840,7 +9840,7 @@ impl WendelonDataServer {
 			{
 				return Ok((cached.response, cached.trailing));
 			}
-			if let Some(replayed) = self.durable_delete_replay(&meta).await? {
+			if let Some(replayed) = self.a3_or_foreign_delete(&meta).await? {
 				return Ok(replayed);
 			}
 			let clocks = WriteClocks::from_remaining_millis(meta.deadline_remaining_millis);
@@ -10228,7 +10228,7 @@ impl DataRing for WendelonDataServer {
 			let key = Self::idempotency_key_for(meta.tenant_id, meta.write_id);
 			if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
 				return self
-					.replay_write_outcome(meta.tenant_id, cached.outcome())
+					.replay_write_outcome(meta.tenant_id, meta.write_id, cached.outcome())
 					.await;
 			}
 

@@ -3,6 +3,77 @@
 use super::*;
 
 impl WendelonDataServer {
+	/// B1b checks only the indexed witness visible now; concurrent ownership is B1c.
+	pub(super) async fn foreign_pending(
+		&self,
+		tenant_id: TenantId,
+		write_id: crate::schema::ClientWriteId,
+	) -> std::io::Result<Option<(WriteResponseMeta, Option<FinalizationMarker>)>> {
+		let foreign = self
+			.pending_finalizations
+			.find_by_write_id(write_id)
+			.await?
+			.is_some_and(|record| record.finalization.tenant_id != tenant_id);
+		Ok(foreign.then(|| self.foreign_refusal(write_id)))
+	}
+
+	/// Never route this response through cached outcome / DUPLICATE conversion.
+	pub(super) fn foreign_refusal(
+		&self,
+		write_id: crate::schema::ClientWriteId,
+	) -> (WriteResponseMeta, Option<FinalizationMarker>) {
+		let response = WriteResponseMeta {
+			status: WriteStatus::AUTHORIZATION_FAILED,
+			_pad1: [0; 7],
+			log_index: 0,
+			term: 0,
+			epoch: self.admission_snapshot().current_epoch,
+			commit_hlc: HybridTimestamp {
+				physical_ms: 0,
+				logical: 0,
+				node_id: 0,
+			},
+			leader_hint: self.local_node,
+			echoed_write_id: write_id,
+			has_finalization: 0,
+			_pad2: [0; 7],
+		}
+		.with_mutation_outcome(
+			MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+			MutationStopReason::NONE,
+		);
+		self.counted_write_result(response, None)
+	}
+
+	pub(super) async fn a3_or_foreign_write(
+		&self,
+		meta: &TableWriteRequestMeta,
+	) -> std::io::Result<Option<(WriteResponseMeta, Option<FinalizationMarker>)>> {
+		if let Some(replayed) = self.durable_mutation_replay(meta).await? {
+			return Ok(Some(replayed));
+		}
+		self.foreign_pending(meta.tenant_id, meta.parent_write_id)
+			.await
+	}
+
+	pub(super) async fn a3_or_foreign_delete(
+		&self,
+		meta: &TableDeleteRowsRequestMeta,
+	) -> std::io::Result<Option<(TableDeleteRowsResponseMeta, Option<FinalizationMarker>)>> {
+		if let Some(replayed) = self.durable_delete_replay(meta).await? {
+			return Ok(Some(replayed));
+		}
+		Ok(self
+			.foreign_pending(meta.tenant_id, meta.parent_write_id)
+			.await?
+			.map(|(write, trailing)| {
+				(
+					table_delete_rows_response(write, 0, 0, 0, PbcRejectCode::NONE),
+					trailing,
+				)
+			}))
+	}
+
 	pub(super) async fn handle_mutation_outcome_pin_request(
 		&self,
 		actor: &ActorIdentity,
@@ -360,6 +431,7 @@ impl WendelonDataServer {
 					.pending_finalizations
 					.find_by_write_id(meta.operation_id)
 					.await?
+					.filter(|record| record.finalization.tenant_id == meta.tenant_id)
 				{
 					let delete_counts = self.pending_finalizations.delete_counts(record.id).await?;
 					let counts = delete_counts.unwrap_or([0; 3]);
