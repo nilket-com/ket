@@ -31,6 +31,8 @@ pub mod durable;
 mod entry_identity;
 #[allow(dead_code)] // Dormant pure governance check; no production caller.
 mod governance_command;
+#[allow(dead_code)] // Dormant pure governance verification; no external production caller.
+mod governance_verification;
 mod incremental;
 mod issuer_registry;
 #[allow(dead_code)] // Dormant pure lease payload check; no production caller.

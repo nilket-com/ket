@@ -3646,6 +3646,304 @@ fn command_verification_is_single_site_and_unwired() {
 	assert_eq!(calls(advance, "verify_command2"), 1);
 	let verify = fn_body(&text, "verify_command2");
 	assert_eq!(calls(verify, "VerifiedCommand2::verified2"), 1);
+	assert_eq!(calls(verify, "verify_governance2"), 1);
+	assert!(
+		verify.find("verify_governance2(").unwrap()
+			< verify.find("VerifiedCommand2::verified2(").unwrap()
+	);
+	assert!(
+		verify
+			.replace(char::is_whitespace, "")
+			.contains("verify_governance2(state,pin,command,governance,d)?")
+	);
+	let kind = fn_body(&text, "kind");
+	assert!(!kind.contains("Unsupported"));
+	let governance_kinds = [
+		"EnrollSelector",
+		"EnrollAuthority",
+		"RevokeAuthority",
+		"Grant",
+		"Release",
+		"Cut",
+		"Resolve",
+		"EnrollLeaseIssuer",
+		"RevokeLeaseIssuer",
+	];
+	fn command_variants(p: &syn::Pat, names: &mut Vec<String>) {
+		match p {
+			syn::Pat::Or(p) => p.cases.iter().for_each(|p| command_variants(p, names)),
+			syn::Pat::Struct(p) => {
+				assert_eq!(p.path.segments.len(), 2);
+				assert_eq!(p.path.segments[0].ident, "Command2");
+				names.push(p.path.segments[1].ident.to_string());
+			}
+			syn::Pat::TupleStruct(p) => {
+				assert_eq!(p.path.segments.len(), 2);
+				assert_eq!(p.path.segments[0].ident, "Command2");
+				names.push(p.path.segments[1].ident.to_string());
+			}
+			_ => panic!("exact Command2 pattern required; no wildcard"),
+		}
+	}
+	let kind_file = syn::parse_file(&text).unwrap();
+	let kind_fn = kind_file
+		.items
+		.iter()
+		.find_map(|i| match i {
+			syn::Item::Fn(f) if f.sig.ident == "kind" => Some(f),
+			_ => None,
+		})
+		.unwrap();
+	let syn::Stmt::Expr(syn::Expr::Match(kind_match), _) = kind_fn.block.stmts.last().unwrap()
+	else {
+		panic!("kind match")
+	};
+	let (mut accepted, mut cover) = (Vec::new(), Vec::new());
+	for arm in &kind_match.arms {
+		assert!(arm.guard.is_none());
+		let mut names = Vec::new();
+		command_variants(&arm.pat, &mut names);
+		let syn::Expr::Call(call) = arm.body.as_ref() else {
+			panic!("kind result")
+		};
+		let syn::Expr::Path(path) = call.func.as_ref() else {
+			panic!("kind result path")
+		};
+		if path.path.is_ident("Ok") {
+			accepted.extend(names);
+		} else {
+			assert!(path.path.is_ident("Err"));
+			assert!(
+				matches!(call.args.first(), Some(syn::Expr::Path(p)) if exact_path(&p.path, &["E", "NotApplicable"]))
+			);
+			cover.extend(names);
+		}
+	}
+	let mut expected = governance_kinds
+		.iter()
+		.map(|s| s.to_string())
+		.collect::<Vec<_>>();
+	expected
+		.extend(["Bootstrap", "AdmissionPermission", "Reserve", "Finalize"].map(str::to_string));
+	expected.sort();
+	accepted.sort();
+	assert_eq!(accepted, expected);
+	assert_eq!(cover, ["Cover"]);
+	let helper_text = fs::read_to_string(root.join("governance_verification.rs")).unwrap();
+	assert!(helper_text.lines().count() <= 250);
+	let helper = without_test_items_deep(helper_text.parse().unwrap());
+	let helper_flat = helper.to_string().replace(' ', "");
+	for banned in [
+		"SigningKey",
+		"Signer",
+		"std::fs",
+		"std::io",
+		"std::net",
+		"tokio",
+		"spawn",
+		"unsafe",
+		"serde",
+		"VerifiedCommand2",
+		"TrustedEntry2",
+		"CommittedEntry2",
+		"CommittedSource2",
+		"SystemTime",
+		"Instant",
+		"thread_local",
+		"static",
+	] {
+		assert!(!helper_flat.contains(banned), "governance helper: {banned}");
+	}
+	assert!(helper_flat.contains("fnverify_governance2(state:&MutationAuthorityState2,pin:&PinnedBoundTuple2,command:&Command2,governance:Option<&[u8]>,digest:Digest2,)->Result<bool,VerifyError2>"));
+	assert!(helper_flat.contains("fngovernance_failure2(state:&MutationAuthorityState2,pin:&PinnedBoundTuple2,command:&Command2,governance:Option<&[u8]>,digest:Digest2,)->Result<Option<Denial2>,VerifyError2>"));
+	let helper_file: syn::File = syn::parse2(helper).unwrap();
+	let (mut helper_public, mut helper_private, mut helper_enums) =
+		(Vec::new(), Vec::new(), Vec::new());
+	for item in &helper_file.items {
+		match item {
+			syn::Item::Fn(f) if root2_scoped(&f.vis) => helper_public.push(f.sig.ident.to_string()),
+			syn::Item::Fn(f) => {
+				assert!(matches!(f.vis, syn::Visibility::Inherited));
+				helper_private.push(f.sig.ident.to_string());
+			}
+			syn::Item::Enum(e) => {
+				assert!(matches!(e.vis, syn::Visibility::Inherited));
+				assert_eq!(e.ident, "Denial2");
+				assert_eq!(
+					e.variants
+						.iter()
+						.map(|v| v.ident.to_string())
+						.collect::<Vec<_>>(),
+					[
+						"Envelope",
+						"Scope",
+						"IssuerMissing",
+						"IssuerRevoked",
+						"IssuerKey",
+						"IssuerSignature"
+					]
+				);
+				helper_enums.push(e.ident.to_string());
+			}
+			syn::Item::Use(u) => assert!(!matches!(
+				u.tree,
+				syn::UseTree::Rename(_) | syn::UseTree::Glob(_)
+			)),
+			_ => panic!("helper only imports, private Denial2 and exact two functions"),
+		}
+	}
+	assert_eq!(helper_public, ["verify_governance2"]);
+	assert_eq!(helper_private, ["governance_failure2"]);
+	assert_eq!(helper_enums, ["Denial2"]);
+	fn imports(tree: &syn::UseTree, prefix: &[String], out: &mut Vec<Vec<String>>) {
+		match tree {
+			syn::UseTree::Path(p) => {
+				let mut next = prefix.to_vec();
+				next.push(p.ident.to_string());
+				imports(&p.tree, &next, out);
+			}
+			syn::UseTree::Name(n) => {
+				let mut path = prefix.to_vec();
+				path.push(n.ident.to_string());
+				out.push(path);
+			}
+			syn::UseTree::Group(g) => g.items.iter().for_each(|t| imports(t, prefix, out)),
+			_ => panic!("canonical helper imports only; no alias or glob"),
+		}
+	}
+	let mut imported = Vec::new();
+	for item in &helper_file.items {
+		if let syn::Item::Use(u) = item {
+			imports(&u.tree, &[], &mut imported);
+		}
+	}
+	let mut actual_imports = imported.iter().map(|p| p.join("::")).collect::<Vec<_>>();
+	let mut expected_imports = [
+		"admin_install::admin_namespace2",
+		"admin_install::install_admin2",
+		"command::Command2",
+		"governance_command::GOVERNANCE_COMMAND_BYTES2",
+		"governance_command::GovernanceAction2",
+		"governance_command::GovernanceCommandError2",
+		"governance_command::check_governance_command2",
+		"governance_command::parse_governance_command2",
+		"lease_payload::LeasePayloadError2",
+		"lease_payload::verify_issuer_signature2",
+		"origin::MutationAuthorityState2",
+		"origin::root_and_origin2",
+		"provisioning::replica_anchor::PinnedBoundTuple2",
+		"types::Digest2",
+		"verification::VerifyError2",
+	]
+	.map(|p| format!("crate::storage::mutation_visibility::root2::{p}"));
+	actual_imports.sort();
+	expected_imports.sort();
+	assert_eq!(actual_imports, expected_imports);
+	let failure_fn = helper_file
+		.items
+		.iter()
+		.find_map(|i| match i {
+			syn::Item::Fn(f) if f.sig.ident == "governance_failure2" => Some(f),
+			_ => None,
+		})
+		.unwrap();
+	let action_match = failure_fn
+		.block
+		.stmts
+		.iter()
+		.find_map(|s| match s {
+			syn::Stmt::Local(l) if matches!(&l.pat, syn::Pat::Ident(p) if p.ident == "action") => {
+				match &*l.init.as_ref().unwrap().expr {
+					syn::Expr::Match(m) => Some(m),
+					_ => None,
+				}
+			}
+			_ => None,
+		})
+		.unwrap();
+	assert!(matches!(action_match.expr.as_ref(), syn::Expr::Path(p) if p.path.is_ident("command")));
+	let mut action_kinds = Vec::new();
+	for arm in &action_match.arms {
+		assert!(arm.guard.is_none());
+		let mut names = Vec::new();
+		command_variants(&arm.pat, &mut names);
+		if names.len() == 1 && governance_kinds.contains(&names[0].as_str()) {
+			assert!(
+				matches!(arm.body.as_ref(), syn::Expr::Path(p) if exact_path(&p.path, &["GovernanceAction2", &names[0]]))
+			);
+			action_kinds.extend(names);
+		} else {
+			names.sort();
+			assert_eq!(
+				names,
+				[
+					"AdmissionPermission",
+					"Bootstrap",
+					"Cover",
+					"Finalize",
+					"Reserve"
+				]
+			);
+		}
+	}
+	action_kinds.sort();
+	let mut expected_actions = governance_kinds.map(str::to_string);
+	expected_actions.sort();
+	assert_eq!(action_kinds, expected_actions);
+	assert_eq!(
+		calls(
+			fn_body(&helper_text, "verify_governance2"),
+			"governance_failure2"
+		),
+		1
+	);
+	let failure = fn_body(&helper_text, "governance_failure2");
+	let ordered = [
+		"root_and_origin2(state)",
+		"let action = match command",
+		"governance.ok_or(VerifyError2::MissingSidecar)",
+		"bytes.len() != GOVERNANCE_COMMAND_BYTES2",
+		"parse_governance_command2(bytes)",
+		"install_admin2(state, pin)",
+		"check_governance_command2(&admin, action, bytes, digest)",
+		"admin_namespace2(&admin)",
+		"if !in_scope",
+		"root.state.issuers.get(&lease.issuer.to_be_bytes())",
+		"issuer.revoked.is_some()",
+		"verify_issuer_signature2(&issuer.key, lease)",
+	];
+	let positions = ordered.map(|s| failure.find(s).expect(s));
+	assert!(positions.windows(2).all(|w| w[0] < w[1]));
+	for name in [
+		"parse_governance_command2",
+		"install_admin2",
+		"check_governance_command2",
+		"verify_issuer_signature2",
+	] {
+		assert_eq!(calls(failure, name), 1, "{name}");
+	}
+	assert!(!failure.contains("VerifyError2::Unsupported"));
+	assert!(!failure.contains("UnsupportedKind2"));
+	let failure_flat = failure.replace(char::is_whitespace, "");
+	for scope in [
+		"binding.tenant==namespace.tenant",
+		"binding.generation==root.state.generation",
+		"identity.generation==root.state.generation",
+		"identity.tenant==namespace.tenant",
+		"identity.scope==namespace.scope",
+		"identity.table==namespace.table",
+		"identity.schema_generation==namespace.schema",
+	] {
+		assert!(failure_flat.contains(scope), "scope: {scope}");
+	}
+	assert!(helper_text.contains(
+		"#[cfg(test)]\n#[path = \"tests/governance_verification_private.rs\"]\nmod tests;"
+	));
+	assert!(
+		fs::read_to_string(root.join("mod.rs"))
+			.unwrap()
+			.contains("\nmod governance_verification;\n")
+	);
 	// The token reaches exactly one consumer per command, by reference.
 	for consumer in ["bootstrap2", "advance_admission2", "advance_root2"] {
 		assert_eq!(calls(advance, consumer), 1, "{consumer}");
@@ -3664,6 +3962,47 @@ fn command_verification_is_single_site_and_unwired() {
 			}
 			syn::Item::Enum(e) => {
 				assert!(root2_scoped(&e.vis));
+				if e.ident == "VerifyError2" {
+					assert_eq!(
+						e.variants
+							.iter()
+							.map(|v| v.ident.to_string())
+							.collect::<Vec<_>>(),
+						[
+							"NotApplicable",
+							"EnvelopeContext",
+							"ExtraSidecar",
+							"MissingSidecar",
+							"SidecarLength",
+							"Governance",
+							"Install",
+							"IssuerPayload",
+							"Unsupported",
+							"DigestMismatch",
+							"CommittedMismatch",
+							"StateKind",
+							"RootMismatch",
+							"Consumer"
+						]
+					);
+					for (variant, ty) in [
+						("Governance", "GovernanceCommandError2"),
+						("Install", "InstallError2"),
+					] {
+						let v = e.variants.iter().find(|v| v.ident == variant).unwrap();
+						assert!(
+							matches!(&v.fields, syn::Fields::Unnamed(f) if f.unnamed.len()==1 && quote_type(&f.unnamed.first().unwrap().ty)==ty)
+						);
+					}
+					assert!(matches!(
+						e.variants
+							.iter()
+							.find(|v| v.ident == "IssuerPayload")
+							.unwrap()
+							.fields,
+						syn::Fields::Unit
+					));
+				}
 				types.push(e.ident.to_string())
 			}
 			syn::Item::Use(_) => {}
@@ -3718,8 +4057,32 @@ fn command_verification_is_single_site_and_unwired() {
 			}
 			if !p.ends_with("root2/verification.rs") && !p.ends_with("root2/replay.rs") {
 				assert!(
-					!t.contains("advance_verified2(") && !t.contains("root2::verification"),
+					!t.contains("advance_verified2("),
+					"production C call in {}",
+					p.display()
+				);
+				let remaining = if p == root.join("governance_verification.rs") {
+					let import = "usecrate::storage::mutation_visibility::root2::verification::VerifyError2;";
+					assert_eq!(
+						t.matches(import).count(),
+						1,
+						"canonical type-only helper import"
+					);
+					t.replace(import, "")
+				} else {
+					t.clone()
+				};
+				assert!(
+					!remaining.contains("root2::verification"),
 					"production caller of C in {}",
+					p.display()
+				);
+			}
+			if p != root.join("verification.rs") && p != root.join("governance_verification.rs") {
+				assert!(
+					!t.contains("verify_governance2(")
+						&& !t.contains("root2::governance_verification"),
+					"governance helper caller in {}",
 					p.display()
 				);
 			}
@@ -4543,19 +4906,13 @@ fn governance_command_envelope_is_pure_and_unwired() {
 		[
 			"check_governance_command2",
 			"encode_governance_command2",
-			"governance_command_preimage2"
+			"governance_command_preimage2",
+			"parse_governance_command2"
 		]
 	);
 	assert_eq!(
 		private,
-		[
-			"array",
-			"check_context",
-			"parse",
-			"permits",
-			"u64_at",
-			"write"
-		]
+		["array", "check_context", "permits", "u64_at", "write"]
 	);
 	assert_eq!(
 		consts,
@@ -4583,19 +4940,58 @@ fn governance_command_envelope_is_pure_and_unwired() {
 				&& !p.ends_with("root2/governance_command.rs")
 			{
 				let t = fs::read_to_string(&p).unwrap();
+				let t = without_test_items_deep(t.parse().unwrap())
+					.to_string()
+					.replace(' ', "");
+				let helper = p == root.join("governance_verification.rs");
+				let verifier = p == root.join("verification.rs");
+				let remaining = if verifier {
+					let import = "usecrate::storage::mutation_visibility::root2::governance_command::GovernanceCommandError2;";
+					assert_eq!(t.matches(import).count(), 1);
+					assert_eq!(
+						t.matches("GovernanceCommandError2").count(),
+						2,
+						"import and one error wrapper only"
+					);
+					assert_eq!(t.matches("Governance(GovernanceCommandError2)").count(), 1);
+					t.replace(import, "")
+				} else {
+					t.clone()
+				};
 				for name in [
 					"check_governance_command2",
 					"governance_command_preimage2",
 					"encode_governance_command2",
+					"parse_governance_command2",
+					"GOVERNANCE_COMMAND_BYTES2",
+					"GovernanceAction2",
 					"CheckedGovernanceCommand2",
 					"GovernanceCommandError2",
 					"root2::governance_command",
 				] {
+					let permitted = helper
+						&& [
+							"parse_governance_command2",
+							"check_governance_command2",
+							"GovernanceAction2",
+							"GovernanceCommandError2",
+							"GOVERNANCE_COMMAND_BYTES2",
+							"root2::governance_command",
+						]
+						.contains(&name);
+					let typed_wrapper = verifier && name == "GovernanceCommandError2";
 					assert!(
-						!t.contains(name),
+						permitted || typed_wrapper || !remaining.contains(name),
 						"production caller of {name} in {}",
 						p.display()
 					);
+				}
+				if helper {
+					assert_eq!(calls(&t, "parse_governance_command2"), 1);
+					assert_eq!(calls(&t, "check_governance_command2"), 1);
+					assert!(t.contains(
+						"usecrate::storage::mutation_visibility::root2::governance_command::{"
+					));
 				}
 			}
 		}
@@ -4684,6 +5080,10 @@ fn lease_payload_is_pure_and_unwired() {
 				}
 			} else if p.extension().is_some_and(|x| x == "rs") && p != path {
 				let t = fs::read_to_string(&p).unwrap();
+				let t = without_test_items_deep(t.parse().unwrap())
+					.to_string()
+					.replace(' ', "");
+				let helper = p == root.join("governance_verification.rs");
 				for name in [
 					"lease_payload2",
 					"verify_issuer_signature2",
@@ -4691,7 +5091,21 @@ fn lease_payload_is_pure_and_unwired() {
 					"LEASE_PAYLOAD_BYTES2",
 					"root2::lease_payload",
 				] {
-					assert!(!t.contains(name), "{} names {name}", p.display());
+					let permitted = helper
+						&& [
+							"verify_issuer_signature2",
+							"LeasePayloadError2",
+							"root2::lease_payload",
+						]
+						.contains(&name);
+					assert!(
+						permitted || !t.contains(name),
+						"{} names {name}",
+						p.display()
+					);
+				}
+				if helper {
+					assert_eq!(calls(&t, "verify_issuer_signature2"), 1);
 				}
 			}
 		}

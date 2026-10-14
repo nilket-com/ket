@@ -102,20 +102,6 @@ fn commands(dep: Deployment2) -> Vec<Command2> {
 	}
 	out
 }
-fn unsupported(i: usize) -> UnsupportedKind2 {
-	match i {
-		5 => UnsupportedKind2::EnrollSelector,
-		6 => UnsupportedKind2::EnrollAuthority,
-		7 => UnsupportedKind2::RevokeAuthority,
-		8 => UnsupportedKind2::Grant,
-		9 => UnsupportedKind2::Release,
-		10 => UnsupportedKind2::Cut,
-		11 => UnsupportedKind2::Resolve,
-		12 => UnsupportedKind2::EnrollLeaseIssuer,
-		13 => UnsupportedKind2::RevokeLeaseIssuer,
-		_ => panic!("governance index"),
-	}
-}
 fn snapshot(acc: &Provisional2) -> (Vec<u8>, u64, Progress2, u32) {
 	(
 		encode_authority2(&acc.state).unwrap(),
@@ -298,7 +284,14 @@ fn carrier_all_fourteen_kinds_sidecars_and_origins_obey_selected_first_errors() 
 				let before = snapshot(&acc);
 				let result = driver.dispatch(&mut acc, &source, &e);
 				if i >= 5 {
-					assert!(matches!(result,Err(Fault2::Unsupported(k)) if k==unsupported(i)));
+					let expected = if view != 2 {
+						VerifyError2::StateKind
+					} else if side.is_none() {
+						VerifyError2::MissingSidecar
+					} else {
+						crate::storage::mutation_visibility::root2::tests::governance_verification::support::malformed_sidecar_error()
+					};
+					assert!(matches!(result, Err(Fault2::Verify(e)) if e == expected));
 				} else if i == 4 {
 					assert!(matches!(
 						result,

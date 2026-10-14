@@ -413,8 +413,8 @@ async fn unsupported_command_halts_before_later_batch_error() {
 	.await;
 	assert!(matches!(
 		result,
-		Err(ReplayError2::Fault(Fault2::Unsupported(
-			UnsupportedKind2::Cut
+		Err(ReplayError2::Fault(Fault2::Verify(
+			VerifyError2::MissingSidecar
 		)))
 	));
 }
@@ -655,7 +655,7 @@ mod g2;
 
 #[tokio::test(flavor = "current_thread")]
 async fn issuer_commands_map_to_unsupported_replay_faults() {
-	for (command, kind) in [
+	for (command, _legacy_kind) in [
 		(
 			Command2::EnrollLeaseIssuer {
 				node: 1,
@@ -679,7 +679,12 @@ async fn issuer_commands_map_to_unsupported_replay_faults() {
 		}
 		.compose(&mut reader, &Sources(entry(3).log_id), caps())
 		.await;
-		assert!(matches!(result, Err(ReplayError2::Fault(Fault2::Unsupported(k))) if k == kind));
+		assert!(matches!(
+			result,
+			Err(ReplayError2::Fault(Fault2::Verify(
+				VerifyError2::MissingSidecar
+			)))
+		));
 	}
 }
 
@@ -736,3 +741,6 @@ async fn carrier_malformed_stops_real_log_without_coverage_or_mark_change() {
 }
 
 mod carrier;
+
+#[path = "../tests/governance_verification_replay.rs"]
+mod governance_verification_replay;

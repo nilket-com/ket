@@ -108,7 +108,6 @@ impl CheckedGovernanceCommand2 {
 		self.command_digest
 	}
 }
-
 fn array<const N: usize>(b: &[u8], at: usize) -> [u8; N] {
 	let mut out = [0u8; N];
 	out.copy_from_slice(&b[at..at + N]);
@@ -133,7 +132,6 @@ fn check_context(context: &AdminContext2) -> Result<(), GovernanceCommandError2>
 	}
 	Ok(())
 }
-
 fn write(
 	context: &AdminContext2,
 	command_digest: &Digest2,
@@ -162,9 +160,10 @@ fn write(
 	put(signature);
 	b
 }
-
 /// Structural parse, in order: length, magic, version, reserved, then the zero fields.
-fn parse(bytes: &[u8]) -> Result<(AdminContext2, Digest2, [u8; 64]), GovernanceCommandError2> {
+pub(in crate::storage::mutation_visibility::root2) fn parse_governance_command2(
+	bytes: &[u8],
+) -> Result<(AdminContext2, Digest2, [u8; 64]), GovernanceCommandError2> {
 	use GovernanceCommandError2 as E;
 	if bytes.len() != GOVERNANCE_COMMAND_BYTES2 {
 		return Err(E::Length);
@@ -209,7 +208,7 @@ pub(in crate::storage::mutation_visibility::root2) fn encode_governance_command2
 pub(in crate::storage::mutation_visibility::root2) fn governance_command_preimage2(
 	bytes: &[u8; GOVERNANCE_COMMAND_BYTES2],
 ) -> Result<Vec<u8>, GovernanceCommandError2> {
-	parse(bytes)?;
+	parse_governance_command2(bytes)?;
 	let mut preimage = Vec::with_capacity(DOMAIN.len() + SIGNED);
 	preimage.extend_from_slice(DOMAIN);
 	preimage.extend_from_slice(&bytes[..SIGNED]);
@@ -223,7 +222,7 @@ pub(in crate::storage::mutation_visibility::root2) fn check_governance_command2(
 	bytes: &[u8],
 	command_digest: Digest2,
 ) -> Result<CheckedGovernanceCommand2, GovernanceCommandError2> {
-	let (context, embedded, signature) = parse(bytes)?;
+	let (context, embedded, signature) = parse_governance_command2(bytes)?;
 	let role = admin_governance2(admin).ok_or(GovernanceCommandError2::NoGovernance)?;
 	if !permits(role.actions(), action) {
 		return Err(GovernanceCommandError2::Action);
