@@ -1,0 +1,342 @@
+use super::*;
+use IdentityKeyError as E;
+use IdentityKeyRole::{Lease, Transfer};
+
+fn config() -> NodeBootstrapConfig {
+	let mut cfg = NodeBootstrapConfig::dev(7, std::env::temp_dir(), "127.0.0.1:0".into());
+	cfg.lease_signing_secret = [41; 32];
+	cfg.transfer_signing_secret = [42; 32];
+	cfg.trusted_lease_signers
+		.insert(7, lease_verifying_key_bytes(cfg.lease_signing_secret));
+	cfg.trusted_transfer_signers
+		.insert(7, transfer_verifying_key_bytes(cfg.transfer_signing_secret));
+	cfg.allow_dev_keys = false;
+	cfg
+}
+fn reason(cfg: &NodeBootstrapConfig) -> IdentityKeyError {
+	let err = validate_identity_keys(cfg).unwrap_err();
+	assert_eq!(err.kind(), ErrorKind::InvalidInput);
+	*err.get_ref()
+		.unwrap()
+		.downcast_ref::<IdentityKeyError>()
+		.unwrap()
+}
+
+#[test]
+fn identity_distinct_keys_pass_and_dev_constructor_explicitly_allows_dev() {
+	validate_identity_keys(&config()).unwrap();
+	let cfg = NodeBootstrapConfig::dev(7, std::env::temp_dir(), "127.0.0.1:0".into());
+	assert!(cfg.allow_dev_keys);
+	validate_identity_keys(&cfg).unwrap();
+}
+
+#[test]
+fn identity_missing_local_entries_precede_matches_lease_then_transfer() {
+	let mut cfg = config();
+	cfg.trusted_lease_signers.clear();
+	cfg.trusted_transfer_signers.clear();
+	assert_eq!(
+		reason(&cfg),
+		E::MissingLocal {
+			role: Lease,
+			node: 7
+		}
+	);
+	cfg.trusted_lease_signers.insert(7, [0; 32]);
+	assert_eq!(
+		reason(&cfg),
+		E::MissingLocal {
+			role: Transfer,
+			node: 7
+		}
+	);
+}
+
+#[test]
+fn identity_local_mismatches_precede_reuse_lease_then_transfer() {
+	let mut cfg = config();
+	cfg.trusted_lease_signers.insert(7, [0; 32]);
+	cfg.trusted_transfer_signers.insert(7, [0; 32]);
+	cfg.transfer_signing_secret = cfg.lease_signing_secret;
+	assert_eq!(
+		reason(&cfg),
+		E::LocalKeyMismatch {
+			role: Lease,
+			node: 7
+		}
+	);
+	cfg.trusted_lease_signers
+		.insert(7, lease_verifying_key_bytes(cfg.lease_signing_secret));
+	assert_eq!(
+		reason(&cfg),
+		E::LocalKeyMismatch {
+			role: Transfer,
+			node: 7
+		}
+	);
+}
+
+#[test]
+fn identity_same_secret_precedes_public_role_and_identity_reuse() {
+	let mut cfg = config();
+	cfg.transfer_signing_secret = cfg.lease_signing_secret;
+	let key = lease_verifying_key_bytes(cfg.lease_signing_secret);
+	cfg.trusted_transfer_signers.insert(7, key);
+	cfg.trusted_lease_signers.insert(1, key);
+	assert_eq!(reason(&cfg), E::SecretRoleReuse { node: 7 });
+}
+
+#[test]
+fn identity_cross_role_reuse_covers_different_ids_in_numeric_order() {
+	let mut cfg = config();
+	let key = lease_verifying_key_bytes([43; 32]);
+	cfg.trusted_lease_signers.insert(256, key);
+	cfg.trusted_lease_signers.insert(2, key);
+	cfg.trusted_transfer_signers.insert(257, key);
+	cfg.trusted_transfer_signers.insert(3, key);
+	assert_eq!(
+		reason(&cfg),
+		E::PublicRoleReuse {
+			lease_node: 2,
+			transfer_node: 3
+		}
+	);
+}
+
+#[test]
+fn identity_cross_role_same_id_reuse_is_refused() {
+	let mut cfg = config();
+	let key = lease_verifying_key_bytes([43; 32]);
+	cfg.trusted_lease_signers.insert(2, key);
+	cfg.trusted_transfer_signers.insert(2, key);
+	assert_eq!(
+		reason(&cfg),
+		E::PublicRoleReuse {
+			lease_node: 2,
+			transfer_node: 2
+		}
+	);
+}
+
+#[test]
+fn identity_duplicate_keys_are_refused_lease_then_transfer_and_numeric_id() {
+	let mut cfg = config();
+	let lease = lease_verifying_key_bytes([43; 32]);
+	let transfer = transfer_verifying_key_bytes([44; 32]);
+	for id in [256, 2] {
+		cfg.trusted_lease_signers.insert(id, lease);
+		cfg.trusted_transfer_signers.insert(id, transfer);
+	}
+	assert_eq!(
+		reason(&cfg),
+		E::IdentityReuse {
+			role: Lease,
+			first_node: 2,
+			node: 256
+		}
+	);
+	cfg.trusted_lease_signers.remove(&256);
+	assert_eq!(
+		reason(&cfg),
+		E::IdentityReuse {
+			role: Transfer,
+			first_node: 2,
+			node: 256
+		}
+	);
+}
+
+#[test]
+fn identity_allow_dev_keys_never_bypasses_consistency_or_separation() {
+	let mut cfg = config();
+	cfg.allow_dev_keys = true;
+	cfg.trusted_lease_signers.clear();
+	assert_eq!(
+		reason(&cfg),
+		E::MissingLocal {
+			role: Lease,
+			node: 7
+		}
+	);
+	cfg.trusted_lease_signers.insert(7, [0; 32]);
+	assert_eq!(
+		reason(&cfg),
+		E::LocalKeyMismatch {
+			role: Lease,
+			node: 7
+		}
+	);
+	cfg.trusted_lease_signers
+		.insert(7, lease_verifying_key_bytes(cfg.lease_signing_secret));
+	cfg.trusted_lease_signers
+		.insert(2, cfg.trusted_transfer_signers[&7]);
+	assert_eq!(
+		reason(&cfg),
+		E::PublicRoleReuse {
+			lease_node: 2,
+			transfer_node: 7
+		}
+	);
+	cfg.trusted_lease_signers.remove(&2);
+	cfg.trusted_lease_signers
+		.insert(2, cfg.trusted_lease_signers[&7]);
+	assert_eq!(
+		reason(&cfg),
+		E::IdentityReuse {
+			role: Lease,
+			first_node: 2,
+			node: 7
+		}
+	);
+}
+
+#[test]
+fn identity_dev_locals_check_both_families_and_roles_before_peers() {
+	for (role, secret) in [
+		(Lease, dev_lease_signing_secret(9)),
+		(Lease, dev_transfer_signing_secret(9)),
+		(Transfer, dev_lease_signing_secret(9)),
+		(Transfer, dev_transfer_signing_secret(9)),
+	] {
+		let mut cfg = config();
+		cfg.trusted_transfer_signers
+			.insert(9, transfer_verifying_key_bytes([45; 32]));
+		match role {
+			Lease => {
+				cfg.lease_signing_secret = secret;
+				cfg.trusted_lease_signers
+					.insert(7, lease_verifying_key_bytes(secret));
+			}
+			Transfer => {
+				cfg.transfer_signing_secret = secret;
+				cfg.trusted_transfer_signers
+					.insert(7, transfer_verifying_key_bytes(secret));
+			}
+		}
+		cfg.trusted_lease_signers
+			.insert(2, lease_verifying_key_bytes(dev_lease_signing_secret(2)));
+		assert_eq!(reason(&cfg), E::DevKey { role, node: 7 });
+	}
+	let mut cfg = NodeBootstrapConfig::dev(7, std::env::temp_dir(), "127.0.0.1:0".into());
+	cfg.allow_dev_keys = false;
+	assert_eq!(
+		reason(&cfg),
+		E::DevKey {
+			role: Lease,
+			node: 7
+		}
+	);
+}
+
+#[test]
+fn identity_peer_dev_keys_cover_both_families_roles_and_union_ids() {
+	for role in [Lease, Transfer] {
+		for source_role in [Lease, Transfer] {
+			let mut cfg = config();
+			// Derivation id9 exists only in the opposite role, not under the installed id2.
+			let key = match source_role {
+				Lease => lease_verifying_key_bytes(dev_lease_signing_secret(9)),
+				Transfer => transfer_verifying_key_bytes(dev_transfer_signing_secret(9)),
+			};
+			match role {
+				Lease => {
+					cfg.trusted_lease_signers.insert(2, key);
+					cfg.trusted_transfer_signers
+						.insert(9, transfer_verifying_key_bytes([45; 32]));
+				}
+				Transfer => {
+					cfg.trusted_transfer_signers.insert(2, key);
+					cfg.trusted_lease_signers
+						.insert(9, lease_verifying_key_bytes([45; 32]));
+				}
+			}
+			assert_eq!(reason(&cfg), E::DevKey { role, node: 2 });
+			cfg.allow_dev_keys = true;
+			validate_identity_keys(&cfg).unwrap();
+		}
+	}
+}
+
+#[test]
+fn identity_peer_dev_order_is_role_then_numeric_id_and_after_reuse() {
+	let mut cfg = config();
+	cfg.trusted_lease_signers.insert(
+		256,
+		lease_verifying_key_bytes(dev_lease_signing_secret(256)),
+	);
+	cfg.trusted_lease_signers
+		.insert(2, lease_verifying_key_bytes(dev_lease_signing_secret(2)));
+	cfg.trusted_transfer_signers.insert(
+		1,
+		transfer_verifying_key_bytes(dev_transfer_signing_secret(1)),
+	);
+	assert_eq!(
+		reason(&cfg),
+		E::DevKey {
+			role: Lease,
+			node: 2
+		}
+	);
+	cfg.trusted_lease_signers
+		.insert(3, cfg.trusted_lease_signers[&2]);
+	assert_eq!(
+		reason(&cfg),
+		E::IdentityReuse {
+			role: Lease,
+			first_node: 2,
+			node: 3
+		}
+	);
+}
+
+#[test]
+fn identity_outside_finite_set_is_explicitly_not_detected() {
+	let mut cfg = config();
+	cfg.trusted_lease_signers.insert(
+		2,
+		lease_verifying_key_bytes(dev_transfer_signing_secret(999)),
+	);
+	validate_identity_keys(&cfg).unwrap();
+}
+
+#[test]
+fn identity_error_source_contains_only_role_and_node_metadata() {
+	let error = invalid(E::PublicRoleReuse {
+		lease_node: 2,
+		transfer_node: 3,
+	});
+	assert_eq!(error.kind(), ErrorKind::InvalidInput);
+	assert_eq!(
+		error.get_ref().unwrap().downcast_ref::<IdentityKeyError>(),
+		Some(&E::PublicRoleReuse {
+			lease_node: 2,
+			transfer_node: 3
+		})
+	);
+	assert!(std::mem::size_of::<IdentityKeyError>() < 32);
+}
+
+#[test]
+#[cfg(not(feature = "fips"))]
+fn identity_node_validate_enforces_policy_after_existing_preconditions() {
+	let mut cfg = NodeBootstrapConfig::dev(7, std::env::temp_dir(), "127.0.0.1:0".into());
+	cfg.validate().unwrap();
+	cfg.allow_dev_keys = false;
+	let error = cfg.validate().unwrap_err();
+	assert_eq!(
+		error.get_ref().unwrap().downcast_ref::<IdentityKeyError>(),
+		Some(&E::DevKey {
+			role: Lease,
+			node: 7
+		})
+	);
+	cfg.node_id = 0;
+	let error = cfg.validate().unwrap_err();
+	assert!(
+		error
+			.get_ref()
+			.unwrap()
+			.downcast_ref::<IdentityKeyError>()
+			.is_none()
+	);
+}

@@ -579,6 +579,9 @@ impl Default for RawTimeConfig {
 
 #[derive(Debug, Deserialize)]
 struct RawIdentityConfig {
+	/// Explicit dev-only authorization; absence always refuses recognized dev keys.
+	#[serde(default)]
+	allow_dev_keys: bool,
 	lease_signing_secret: String,
 	trusted_lease_signers: BTreeMap<String, String>,
 	transfer_signing_secret: String,
@@ -933,6 +936,7 @@ impl RawConfig {
 			data_ring_lease_ttl: Duration::from_millis(data_ring_lease_ttl_millis),
 			advertise_address,
 			lease_signing_secret,
+			allow_dev_keys: self.identity.allow_dev_keys,
 			trusted_lease_signers,
 			transfer_signing_secret,
 			trusted_transfer_signers,

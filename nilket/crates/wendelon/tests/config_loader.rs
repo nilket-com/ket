@@ -68,6 +68,7 @@ data_dir = "data"
 {row_group_writer}
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -118,6 +119,7 @@ cdc_locality_heartbeat_interval_millis = 2500
 data_ring_lease_ttl_millis = 9000
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -229,6 +231,7 @@ wal_io_depth = 32
 slab_io_depth = 256
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -340,6 +343,7 @@ max_ranges_per_record = 12
 max_parallel_range_gets = 3
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -495,6 +499,7 @@ max_simd_pages_per_record = 17
 max_parallel_materialize_tasks = 5
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -555,6 +560,7 @@ max_inbound_streams_per_connection = 7
 max_concurrent_stream_tasks = 33
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -602,6 +608,7 @@ advertise_address = "127.0.0.1:4711"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -650,6 +657,7 @@ advertise_address = "127.0.0.1:4715"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -703,6 +711,7 @@ advertise_address = "127.0.0.1:4716"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -766,6 +775,7 @@ advertise_address = "127.0.0.1:4717"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -824,6 +834,7 @@ advertise_address = "127.0.0.1:4712"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -890,6 +901,7 @@ advertise_address = "127.0.0.1:4703"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "not-hex"
 transfer_signing_secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
@@ -930,6 +942,7 @@ data_dir = "data"
 slab_max_bytes = {too_large}
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -983,6 +996,7 @@ address = "loopback://node-1"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -1041,6 +1055,7 @@ advertise_address = "127.0.0.1:4704"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -1126,6 +1141,7 @@ advertise_address = "127.0.0.1:4709"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -1187,6 +1203,7 @@ advertise_address = "127.0.0.1:4707"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -1246,6 +1263,7 @@ advertise_address = "127.0.0.1:4707"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -1319,6 +1337,7 @@ advertise_address = "127.0.0.1:4708"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -1378,6 +1397,7 @@ advertise_address = "127.0.0.1:4708"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -1444,6 +1464,7 @@ advertise_address = "127.0.0.1:4705"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -1492,6 +1513,7 @@ advertise_address = "127.0.0.1:4705"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -1543,6 +1565,7 @@ advertise_address = "127.0.0.1:4706"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -1593,6 +1616,7 @@ advertise_address = "127.0.0.1:4706"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -1646,6 +1670,7 @@ advertise_address = "127.0.0.1:4710"
 data_dir = "data"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -1699,6 +1724,7 @@ advertise_address = "127.0.0.1:0"
 data_dir = "{data_dir}"
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
@@ -1738,6 +1764,7 @@ fn rendered_example_config_loads_after_writing() {
 
 	let cfg = load_node_bootstrap_config(&config_path).unwrap();
 	assert_eq!(cfg.node_id, 1);
+	assert!(cfg.allow_dev_keys);
 	assert_eq!(cfg.data_dir, data_dir);
 	assert_eq!(cfg.advertise_address, "127.0.0.1:7001");
 	assert!(!cfg.lsm_compaction_paused);
@@ -1759,4 +1786,65 @@ fn write_example_config_refuses_to_overwrite() {
 	write_example_config(&config_path).unwrap();
 	let err = write_example_config(&config_path).err().unwrap();
 	assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+}
+
+#[test]
+fn identity_toml_dev_keys_require_explicit_authorization() {
+	use wendelon::node::{IdentityKeyError, IdentityKeyRole};
+	let root = fresh_dir("identity-dev-authorization");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let rendered = render_example_config();
+	for flag in ["", "allow_dev_keys = false\n"] {
+		let body = rendered.replace("allow_dev_keys = true\n", flag);
+		let path = write_config(&root, &body);
+		let error = load_node_bootstrap_config(path).unwrap_err();
+		assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+		assert_eq!(
+			error.get_ref().unwrap().downcast_ref::<IdentityKeyError>(),
+			Some(&IdentityKeyError::DevKey {
+				role: IdentityKeyRole::Lease,
+				node: 1
+			})
+		);
+	}
+	let path = write_config(&root, &rendered);
+	let cfg = load_node_bootstrap_config(path).unwrap();
+	assert!(cfg.allow_dev_keys);
+	cfg.validate().unwrap();
+}
+
+#[test]
+fn identity_toml_peer_dev_key_is_refused_with_authorization_off() {
+	use wendelon::node::{IdentityKeyError, IdentityKeyRole};
+	let root = fresh_dir("identity-peer-dev");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let lease_secret = [41; 32];
+	let transfer_secret = [42; 32];
+	let body = render_example_config()
+		.replace("allow_dev_keys = true", "allow_dev_keys = false")
+		.replace(&hex(dev_lease_signing_secret(1)), &hex(lease_secret))
+		.replace(&hex(dev_transfer_signing_secret(1)), &hex(transfer_secret))
+		.replace(
+			&hex(lease_verifying_key_bytes(dev_lease_signing_secret(1))),
+			&hex(lease_verifying_key_bytes(lease_secret)),
+		)
+		.replace(
+			&hex(transfer_verifying_key_bytes(dev_transfer_signing_secret(1))),
+			&hex(transfer_verifying_key_bytes(transfer_secret)),
+		)
+		.replace(
+			"[identity.trusted_lease_signers]",
+			&format!(
+				"[identity.trusted_lease_signers]\n\"2\" = \"{}\"",
+				hex(lease_verifying_key_bytes(dev_lease_signing_secret(2)))
+			),
+		);
+	let error = load_node_bootstrap_config(write_config(&root, &body)).unwrap_err();
+	assert_eq!(
+		error.get_ref().unwrap().downcast_ref::<IdentityKeyError>(),
+		Some(&IdentityKeyError::DevKey {
+			role: IdentityKeyRole::Lease,
+			node: 2
+		})
+	);
 }

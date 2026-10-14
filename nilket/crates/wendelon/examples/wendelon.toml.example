@@ -99,6 +99,8 @@ cdc_locality_heartbeat_interval_millis = {{CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLI
 data_ring_lease_ttl_millis = {{DATA_RING_LEASE_TTL_MILLIS}}
 
 [identity]
+# Insecure: dev only. Omit or set false after provisioning non-dev signing keys.
+allow_dev_keys = true
 lease_signing_secret = "{{LEASE_SIGNING_SECRET}}"
 transfer_signing_secret = "{{TRANSFER_SIGNING_SECRET}}"
 
