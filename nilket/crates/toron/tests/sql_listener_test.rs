@@ -68,6 +68,9 @@ const BASE_TS: i64 = 1_599_998_400_000;
 #[path = "adr629_probe_test.rs"]
 mod adr629_adapter;
 
+#[path = "support/statement_timeout.rs"]
+mod statement_timeout;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adr629_adapter_records_authenticated_mutation_resolution_and_exact_rows() {
 	use std::os::unix::fs::PermissionsExt;
@@ -572,25 +575,62 @@ async fn real_statement_timeout_is_not_laundered_into_a_planning_refusal() {
 		categorical_batch("Cat1", 1.1),
 	)
 	.await;
-
-	let mut config = toron_config_with_descriptor(descriptor, true);
-	config.sql.as_mut().expect("SQL config").statement_timeout = Duration::from_nanos(1);
-	let audit_path = enable_audit(&mut config, "adr535-real-timeout");
+	let mut worker = statement_timeout::HeldWorker::start();
+	let (mut config, descriptor_scratch) = owned_toron_config_with_descriptor(descriptor, false);
+	config.coordinator.static_workers = vec![worker.config.clone()];
+	config.sql.as_mut().expect("SQL config").statement_timeout = Duration::from_secs(1);
+	let audit_dir = TestDir::new("adr535-held-timeout-audit");
+	let audit_path = audit_dir.join("toron-audit.ndjson");
+	let audit_scratch = audit_dir.pending();
+	config.audit = AuditConfig::Enabled(Box::new(AuditEnabledConfig {
+		node_id: "toron-n-1".into(),
+		node_numeric_id: 1,
+		local_path: audit_path.clone(),
+		queue_capacity: NonZeroUsize::new(64).unwrap(),
+		fail_closed: false,
+		fail_closed_ack_timeout: Duration::from_millis(500),
+		sinks: AuditSinksConfig::default(),
+	}));
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
 			.await
 			.expect("start Toron SQL daemon");
-	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
-
-	let error = execute_sql(endpoint, "SELECT cat, val FROM test2")
+	let query_id = QueryId::new();
+	let request =
+		statement_timeout::SqlRequest::start(daemon.handle().sql_endpoint.unwrap(), query_id);
+	assert_eq!(worker.entered().await, (query_id, ToronTenantId(1)));
+	let outcome = request.outcome().await;
+	assert_eq!(outcome.result_batches, 0);
+	assert_eq!(outcome.completes, 0);
+	assert_eq!(
+		outcome.error.expect("held query must fail").code,
+		SqlErrorCode::StatementTimeout
+	);
+	// The required timeout audit must be visible before closing its only producer.
+	wait_for_audit_records(&audit_path, &["toron.sql.query.timed_out"]).await;
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, daemon.shutdown())
 		.await
-		.expect_err("one-nanosecond statement budget must time out");
-	assert_eq!(error.code, SqlErrorCode::StatementTimeout);
-	let audit = wait_for_audit_records(&audit_path, &["toron.sql.query.timed_out"]).await;
-	assert!(!audit.contains("planning_error"));
-
-	daemon.shutdown().await.expect("shutdown daemon");
-	fixture.shutdown();
+		.expect("SQL daemon shutdown bound")
+		.expect("SQL daemon shutdown");
+	worker.shutdown().await;
+	statement_timeout::assert_query_timeout_audit(&audit_path, query_id);
+	let LiveWendelonFixture {
+		node,
+		client,
+		data_dir,
+	} = fixture;
+	drop(client);
+	tokio::time::timeout(TEST_TEARDOWN_BOUND, node.shutdown())
+		.await
+		.expect("Wendelon shutdown bound")
+		.expect("Wendelon shutdown");
+	std::fs::remove_dir_all(data_dir).expect("remove stopped Wendelon root");
+	descriptor_scratch
+		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
+		.await;
+	// Audit worker has no public join: retain its evidence root even on success.
+	// Producer shutdown is not proof that the detached sink consumer has exited.
+	drop(audit_scratch);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
