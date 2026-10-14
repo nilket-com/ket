@@ -103,12 +103,16 @@ data_ring_lease_ttl_millis = {{DATA_RING_LEASE_TTL_MILLIS}}
 allow_dev_keys = true
 lease_signing_secret = "{{LEASE_SIGNING_SECRET}}"
 transfer_signing_secret = "{{TRANSFER_SIGNING_SECRET}}"
+audit_root_signing_secret = "{{AUDIT_ROOT_SIGNING_SECRET}}"
 
 [identity.trusted_lease_signers]
 "{{NODE_ID}}" = "{{LEASE_VERIFYING_KEY}}"
 
 [identity.trusted_transfer_signers]
 "{{NODE_ID}}" = "{{TRANSFER_VERIFYING_KEY}}"
+
+[identity.trusted_audit_root_keys]
+"{{NODE_ID}}" = "{{AUDIT_ROOT_VERIFYING_KEY}}"
 
 # Root-KEK bootstrap selector.
 #

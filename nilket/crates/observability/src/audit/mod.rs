@@ -9,11 +9,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "fips")]
 use aws_lc_rs::digest::{SHA256, digest};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
+mod root_trust;
 #[cfg(feature = "kafka")]
 use rdkafka::config::ClientConfig;
 #[cfg(feature = "kafka")]
 use rdkafka::producer::{BaseRecord, DefaultProducerContext, ThreadedProducer};
+pub use root_trust::{
+	AuditRootTrust, AuditRootVerifyError, AuditTrustError, verify_signed_chain_root,
+};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use serde_json::Value;
 
@@ -39,6 +43,7 @@ pub struct AuditFormat {
 	pub syslog_enterprise_id: &'static str,
 	pub default_kafka_client_id: &'static str,
 	pub parse_node_numeric: fn(&str) -> std::io::Result<u32>,
+	pub canonical_node_wire: fn(u32) -> String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1500,8 +1505,17 @@ pub struct AuditVerificationIssue {
 	pub message: String,
 }
 
+/// NoRoots is integrity-only evidence; Anchored requires every root to verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RootTrustStatus {
+	NoRoots,
+	Unanchored,
+	Anchored,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditVerificationReport {
+	pub root_trust: RootTrustStatus,
 	pub path: String,
 	pub total_lines: u64,
 	pub parsed_records: u64,
@@ -1548,62 +1562,15 @@ pub fn emit_signed_chain_root(
 	)
 }
 
-pub fn verify_signed_chain_root(
-	format: AuditFormat,
-	root: &SignedAuditChainRoot,
-) -> std::io::Result<()> {
-	if root.signature_algorithm_tag != format.root_signature_tag {
-		return Err(Error::new(
-			ErrorKind::InvalidData,
-			format!(
-				"unsupported audit chain root signature algorithm {}",
-				root.signature_algorithm_tag
-			),
-		));
-	}
-	let node_id = AuditNodeId::new(&root.node_id, (format.parse_node_numeric)(&root.node_id)?);
-	let head = AuditChainHead {
-		sequence_number: root.sequence_number,
-		record_hash: root.chain_head_hash.clone(),
-		hash_algorithm_tag: root.hash_algorithm_tag.clone(),
-	};
-	let payload = signed_root_payload_bytes(format, &node_id, &head);
-	let key_bytes = decode_hex(&root.public_key)?;
-	let key_bytes: [u8; 32] = key_bytes.try_into().map_err(|_| {
-		Error::new(
-			ErrorKind::InvalidData,
-			"audit chain root public key must be 32 bytes",
-		)
-	})?;
-	let signature_bytes = decode_hex(&root.signature)?;
-	let signature_bytes: [u8; 64] = signature_bytes.try_into().map_err(|_| {
-		Error::new(
-			ErrorKind::InvalidData,
-			"audit chain root signature must be 64 bytes",
-		)
-	})?;
-	let verifying_key = VerifyingKey::from_bytes(&key_bytes).map_err(|err| {
-		Error::new(
-			ErrorKind::InvalidData,
-			format!("invalid verifying key: {err}"),
-		)
-	})?;
-	let signature = Signature::from_bytes(&signature_bytes);
-	verifying_key.verify(&payload, &signature).map_err(|err| {
-		Error::new(
-			ErrorKind::InvalidData,
-			format!("invalid audit root signature: {err}"),
-		)
-	})
-}
-
 pub fn verify_local_audit_evidence(
 	format: AuditFormat,
 	path: impl AsRef<Path>,
+	trust: Option<&AuditRootTrust>,
 ) -> std::io::Result<AuditVerificationReport> {
 	let path = path.as_ref();
 	let text = std::fs::read_to_string(path)?;
 	let mut report = AuditVerificationReport {
+		root_trust: RootTrustStatus::NoRoots,
 		path: path.display().to_string(),
 		total_lines: 0,
 		parsed_records: 0,
@@ -1786,20 +1753,31 @@ pub fn verify_local_audit_evidence(
 
 		if record.operation == format.chain_root_operation {
 			report.signed_root_records = report.signed_root_records.saturating_add(1);
+			if trust.is_none() {
+				push_verification_issue(
+					&mut report,
+					line_no,
+					Some(record.sequence_number),
+					"audit_root_unanchored",
+					"signed chain root has no supplied trust anchor".to_string(),
+				);
+			}
 			match record.parameters.get("chain_head") {
 				Some(value) => {
 					match serde_json::from_value::<SignedAuditChainRoot>(value.clone()) {
 						Ok(root) => {
-							let mut root_ok = true;
-							if let Err(err) = verify_signed_chain_root(format, &root) {
-								root_ok = false;
-								push_verification_issue(
-									&mut report,
-									line_no,
-									Some(record.sequence_number),
-									"invalid_signed_root",
-									format!("invalid signed chain root: {err}"),
-								);
+							let mut root_ok = false;
+							if let Some(trust) = trust {
+								match verify_signed_chain_root(format, &root, trust) {
+									Ok(()) => root_ok = true,
+									Err(err) => push_verification_issue(
+										&mut report,
+										line_no,
+										Some(record.sequence_number),
+										err.issue_code(),
+										err.to_string(),
+									),
+								}
 							}
 							if root.node_id != record.node_id {
 								root_ok = false;
@@ -1873,6 +1851,13 @@ pub fn verify_local_audit_evidence(
 		}
 	}
 
+	report.root_trust = if report.signed_root_records == 0 {
+		RootTrustStatus::NoRoots
+	} else if report.signed_roots_verified == report.signed_root_records {
+		RootTrustStatus::Anchored
+	} else {
+		RootTrustStatus::Unanchored
+	};
 	Ok(report)
 }
 

@@ -45,6 +45,7 @@ pub fn toron_audit_format() -> shared_audit::AuditFormat {
 		syslog_enterprise_id: SYSLOG_ENTERPRISE_ID,
 		default_kafka_client_id: DEFAULT_KAFKA_CLIENT_ID,
 		parse_node_numeric: parse_toron_audit_node_numeric,
+		canonical_node_wire: |id| format!("toron-n-{id}"),
 	}
 }
 

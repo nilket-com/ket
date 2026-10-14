@@ -98,6 +98,7 @@ use crate::network::transport::{
 	TransportConnection, TransportProvider, TransportTier, TransportTierSet,
 };
 use crate::network::wire;
+use crate::network::{audit_root_verifying_key_bytes, dev_audit_root_signing_secret};
 use crate::schema::{
 	FrameHeader, MsgType, NodeId, ProtocolVersionWindow, SecondaryIndexDescriptor,
 	SecondaryIndexLifecycleComplete, SecondaryIndexState, SlabId, TenantId, TenantKekId,
@@ -218,6 +219,10 @@ pub struct NodeBootstrapConfig {
 	/// Trusted Ed25519 verifying keys for transfer-token issuers,
 	/// keyed by Raft `NodeId.id`.
 	pub trusted_transfer_signers: BTreeMap<u32, [u8; 32]>,
+	/// Independent audit chain-root signing secret.
+	pub audit_root_signing_secret: [u8; 32],
+	/// Explicit audit root enrollment; historical spans require externally selected keys.
+	pub trusted_audit_root_keys: BTreeMap<u32, [u8; 32]>,
 	/// Fresh-cluster bootstrap or explicit join semantics.
 	pub cluster: ClusterBootstrapConfig,
 	/// Optional L2 backend for sealed-slab tiering.
@@ -297,6 +302,11 @@ impl NodeBootstrapConfig {
 			node_id,
 			transfer_verifying_key_bytes(transfer_signing_secret),
 		);
+		let audit_root_signing_secret = dev_audit_root_signing_secret(node_id);
+		let trusted_audit_root_keys = BTreeMap::from([(
+			node_id,
+			audit_root_verifying_key_bytes(audit_root_signing_secret),
+		)]);
 		Self {
 			node_id,
 			data_dir,
@@ -317,6 +327,8 @@ impl NodeBootstrapConfig {
 			trusted_lease_signers,
 			transfer_signing_secret,
 			trusted_transfer_signers,
+			audit_root_signing_secret,
+			trusted_audit_root_keys,
 			cluster: ClusterBootstrapConfig::Bootstrap,
 			l2: None,
 			tiering: SweeperConfig::default(),
@@ -1566,7 +1578,7 @@ impl WendelonNode {
 		let audit_chain_root_rollup = spawn_signed_chain_root_rollup(
 			audit_sink.clone(),
 			local_node,
-			AuditRootSigner::from_seed(cfg.transfer_signing_secret),
+			AuditRootSigner::from_seed(cfg.audit_root_signing_secret),
 			DEFAULT_CHAIN_ROOT_ROLLUP_INTERVAL,
 		);
 		let (clock_drift_tx, clock_drift_rx) = watch::channel(None);

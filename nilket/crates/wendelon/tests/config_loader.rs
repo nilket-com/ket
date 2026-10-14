@@ -5,8 +5,8 @@ use wendelon::crypto::{
 	DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES, SLAB_MAX_BYTES_HARD_CEILING,
 };
 use wendelon::network::{
-	dev_lease_signing_secret, dev_transfer_signing_secret, lease_verifying_key_bytes,
-	transfer_verifying_key_bytes,
+	audit_root_verifying_key_bytes, dev_audit_root_signing_secret, dev_lease_signing_secret,
+	dev_transfer_signing_secret, lease_verifying_key_bytes, transfer_verifying_key_bytes,
 };
 use wendelon::node::{ClusterBootstrapConfig, WendelonNode};
 use wendelon::storage::{
@@ -53,6 +53,7 @@ fn write_config_with_row_group_writer(
 	std::fs::create_dir_all(root.join("data")).unwrap();
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	write_config(
 		root,
 		&format!(
@@ -71,17 +72,23 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 "#,
 			node_id = node_id,
 			row_group_writer = row_group_writer,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -97,6 +104,7 @@ fn loads_valid_wendelon_toml() {
 	let node_id = 7u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -122,16 +130,22 @@ data_ring_lease_ttl_millis = 9000
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 "#,
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -215,6 +229,7 @@ fn loads_split_io_depth_tuning() {
 	let node_id = 43u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -234,16 +249,22 @@ slab_io_depth = 256
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 "#,
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -317,6 +338,7 @@ fn loads_row_group_tuning() {
 	let node_id = 45u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -346,16 +368,22 @@ max_parallel_range_gets = 3
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 "#,
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -475,6 +503,7 @@ fn loads_encoding_tuning() {
 	let node_id = 46u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -502,16 +531,22 @@ max_parallel_materialize_tasks = 5
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 "#,
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -542,6 +577,7 @@ fn loads_transport_admission_tuning() {
 	let node_id = 44u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -563,16 +599,22 @@ max_concurrent_stream_tasks = 33
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 "#,
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -596,6 +638,7 @@ fn loads_crypto_cache_tuning() {
 	let node_id = 41u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -611,12 +654,16 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 
 [crypto]
 tenant_kek_cache_max_entries = 17
@@ -625,6 +672,8 @@ slab_dek_cache_max_entries = 91
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -645,6 +694,7 @@ fn loads_local_sealed_root_kek_provider_from_secret_file() {
 	let node_id = 45u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -660,6 +710,7 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
@@ -667,12 +718,17 @@ transfer_signing_secret = "{transfer_secret}"
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
 
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
+
 [crypto]
 root_kek_provider = {{ kind = "local-sealed", unlock_secret_file = "root-kek.secret" }}
 "#,
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -699,6 +755,7 @@ fn loads_aws_kms_root_kek_provider_from_config() {
 	let node_id = 46u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -714,6 +771,7 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
@@ -721,12 +779,17 @@ transfer_signing_secret = "{transfer_secret}"
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
 
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
+
 [crypto]
 root_kek_provider = {{ kind = "aws-kms", region = "us-east-1", key_id = "arn:aws:kms:us-east-1:111122223333:key/test", endpoint = "http://127.0.0.1:4566", access_key_id_env = "WENDELON_TEST_AWS_ACCESS_KEY_ID", secret_access_key_env = "WENDELON_TEST_AWS_SECRET_ACCESS_KEY", session_token_env = "WENDELON_TEST_AWS_SESSION_TOKEN" }}
 "#,
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -763,6 +826,7 @@ fn loads_pkcs11_root_kek_provider_from_config() {
 	let node_id = 47u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -778,6 +842,7 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
@@ -785,12 +850,17 @@ transfer_signing_secret = "{transfer_secret}"
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
 
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
+
 [crypto]
 root_kek_provider = {{ kind = "pkcs11", library_path = "libpkcs11-test.so", token_label = "WendelonToken", key_label = "root-kek", pin_env = "{pin_env}", slot = 7 }}
 "#,
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 			pin_env = pin_env,
@@ -822,6 +892,7 @@ fn rejects_zero_crypto_cache_tuning() {
 	let node_id = 42u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -837,6 +908,7 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
@@ -844,12 +916,17 @@ transfer_signing_secret = "{transfer_secret}"
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
 
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
+
 [crypto]
 tenant_kek_cache_max_entries = 0
 "#,
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -904,12 +981,16 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "not-hex"
 transfer_signing_secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+audit_root_signing_secret = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
 
 [identity.trusted_lease_signers]
 "11" = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 [identity.trusted_transfer_signers]
 "11" = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[identity.trusted_audit_root_keys]
+"11" = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
 "#,
 	);
 
@@ -929,6 +1010,7 @@ fn rejects_slab_max_bytes_above_w4_ceiling() {
 	let node_id = 12u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -945,17 +1027,23 @@ slab_max_bytes = {too_large}
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 "#,
 			node_id = node_id,
 			too_large = SLAB_MAX_BYTES_HARD_CEILING + 1,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -977,6 +1065,7 @@ fn loads_join_cluster_configuration() {
 	let node_id = 21u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -999,16 +1088,22 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 "#,
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -1043,6 +1138,7 @@ fn loads_transport_tls_and_observability_configuration() {
 	let node_id = 31u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -1058,12 +1154,16 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 
 [time]
 drift_max_offset_ms = 750
@@ -1086,6 +1186,8 @@ socket_path = "run/syslog.sock"
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -1129,6 +1231,7 @@ fn loads_archive_audit_sink_config() {
 	let node_id = 37u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -1144,12 +1247,16 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 
 [audit.archive]
 directory = "remote-archive"
@@ -1160,6 +1267,8 @@ retain_days = 2555
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -1191,6 +1300,7 @@ fn rejects_http_protobuf_trace_export_without_feature() {
 	let node_id = 35u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -1206,12 +1316,16 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 
 [observability.traces]
 endpoint = "https://otel-collector.internal:4318"
@@ -1223,6 +1337,8 @@ ca_bundle_path = "pki/ca.crt"
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -1251,6 +1367,7 @@ fn loads_http_protobuf_trace_export_with_feature() {
 	let node_id = 35u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -1266,12 +1383,16 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 
 [observability.traces]
 endpoint = "https://otel-collector.internal:4318"
@@ -1286,6 +1407,8 @@ export_timeout_s = 11
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -1325,6 +1448,7 @@ fn rejects_grpc_trace_export_without_feature() {
 	let node_id = 36u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -1340,12 +1464,16 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 
 [observability.traces]
 endpoint = "https://otel-collector.internal:4317"
@@ -1357,6 +1485,8 @@ ca_bundle_path = "pki/ca.crt"
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -1385,6 +1515,7 @@ fn loads_grpc_trace_export_with_feature() {
 	let node_id = 36u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -1400,12 +1531,16 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 
 [observability.traces]
 endpoint = "https://otel-collector.internal:4317"
@@ -1420,6 +1555,8 @@ export_timeout_s = 9
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -1452,6 +1589,7 @@ fn zero_mvcc_retention_window_disables_pruning() {
 	let node_id = 33u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -1467,6 +1605,7 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
@@ -1474,12 +1613,17 @@ transfer_signing_secret = "{transfer_secret}"
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
 
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
+
 [time]
 mvcc_retention_window_secs = 0
 "#,
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -1501,6 +1645,7 @@ fn rejects_observability_without_transport_tls() {
 	let node_id = 32u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -1516,12 +1661,16 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 
 [observability.listeners]
 health = "127.0.0.1:7431"
@@ -1531,6 +1680,8 @@ metrics = "127.0.0.1:7433"
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -1553,6 +1704,7 @@ fn rejects_kafka_audit_sink_without_feature() {
 	let node_id = 34u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -1568,12 +1720,16 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 
 [audit.kafka]
 brokers = "kafka-1.internal:9092"
@@ -1582,6 +1738,8 @@ topic = "wendelon.audit"
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -1604,6 +1762,7 @@ fn loads_kafka_audit_sink_with_feature() {
 	let node_id = 34u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -1619,12 +1778,16 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 
 [audit.kafka]
 brokers = "kafka-1.internal:9092"
@@ -1633,6 +1796,8 @@ topic = "wendelon.audit"
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -1658,6 +1823,7 @@ fn loads_kafka_canonical_audit_sink_with_feature() {
 	let node_id = 38u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -1673,12 +1839,16 @@ data_dir = "data"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 
 [audit.kafka]
 brokers = "kafka-1.internal:9092"
@@ -1688,6 +1858,8 @@ payload_mode = "canonical"
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -1712,6 +1884,7 @@ async fn loaded_config_bootstraps_single_node() {
 	let node_id = 13u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 	let config_path = write_config(
 		&root,
 		&format!(
@@ -1727,17 +1900,23 @@ data_dir = "{data_dir}"
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 "{node_id}" = "{lease_vk}"
 
 [identity.trusted_transfer_signers]
 "{node_id}" = "{transfer_vk}"
+
+[identity.trusted_audit_root_keys]
+"{node_id}" = "{audit_vk}"
 "#,
 			node_id = node_id,
 			data_dir = data_dir.display(),
 			lease_secret = hex(lease_secret),
 			transfer_secret = hex(transfer_secret),
+			audit_secret = hex(audit_secret),
+			audit_vk = hex(audit_root_verifying_key_bytes(audit_secret)),
 			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
 			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
 		),
@@ -1820,10 +1999,18 @@ fn identity_toml_peer_dev_key_is_refused_with_authorization_off() {
 	std::fs::create_dir_all(root.join("data")).unwrap();
 	let lease_secret = [41; 32];
 	let transfer_secret = [42; 32];
+	let audit_secret = [43; 32];
 	let body = render_example_config()
 		.replace("allow_dev_keys = true", "allow_dev_keys = false")
 		.replace(&hex(dev_lease_signing_secret(1)), &hex(lease_secret))
 		.replace(&hex(dev_transfer_signing_secret(1)), &hex(transfer_secret))
+		.replace(&hex(dev_audit_root_signing_secret(1)), &hex(audit_secret))
+		.replace(
+			&hex(audit_root_verifying_key_bytes(
+				dev_audit_root_signing_secret(1),
+			)),
+			&hex(audit_root_verifying_key_bytes(audit_secret)),
+		)
 		.replace(
 			&hex(lease_verifying_key_bytes(dev_lease_signing_secret(1))),
 			&hex(lease_verifying_key_bytes(lease_secret)),
@@ -1847,4 +2034,48 @@ fn identity_toml_peer_dev_key_is_refused_with_authorization_off() {
 			node: 2
 		})
 	);
+}
+
+#[test]
+fn identity_audit_toml_normalizes_ids_and_refuses_alias_duplicates() {
+	use wendelon::audit::AuditTrustError;
+	let root = fresh_dir("audit-alias");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let key = hex(audit_root_verifying_key_bytes(
+		dev_audit_root_signing_secret(1),
+	));
+	let alias = render_example_config().replace(
+		"[identity.trusted_audit_root_keys]",
+		&format!("[identity.trusted_audit_root_keys]\n\"01\" = \"{key}\""),
+	);
+	let error = load_node_bootstrap_config(write_config(&root, &alias)).unwrap_err();
+	assert_eq!(
+		error.get_ref().unwrap().downcast_ref::<AuditTrustError>(),
+		Some(&AuditTrustError::DuplicateNode { node: 1 })
+	);
+	let normalized = render_example_config().replace(
+		&format!("[identity.trusted_audit_root_keys]\n\"1\" = \"{key}\""),
+		&format!("[identity.trusted_audit_root_keys]\n\"01\" = \"{key}\""),
+	);
+	let cfg = load_node_bootstrap_config(write_config(&root, &normalized)).unwrap();
+	assert_eq!(
+		cfg.trusted_audit_root_keys.get(&1),
+		Some(&audit_root_verifying_key_bytes(
+			cfg.audit_root_signing_secret
+		))
+	);
+}
+#[test]
+fn identity_audit_toml_requires_secret_and_trust_map() {
+	let root = fresh_dir("audit-required");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let rendered = render_example_config();
+	let secret = hex(dev_audit_root_signing_secret(1));
+	let without_secret = rendered.replace(&format!("audit_root_signing_secret = \"{secret}\""), "");
+	assert!(load_node_bootstrap_config(write_config(&root, &without_secret)).is_err());
+	let without_map = rendered.replace(
+		"[identity.trusted_audit_root_keys]",
+		"[identity.absent_audit_keys]",
+	);
+	assert!(load_node_bootstrap_config(write_config(&root, &without_map)).is_err());
 }

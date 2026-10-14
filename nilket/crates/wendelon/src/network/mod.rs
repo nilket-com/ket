@@ -1,3 +1,5 @@
+pub mod audit_root_signing;
+pub use audit_root_signing::*;
 pub mod cdc;
 pub mod cert_issuance_policy;
 pub mod control_server;

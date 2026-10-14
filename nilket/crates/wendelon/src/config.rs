@@ -11,8 +11,9 @@ use crate::metrics::telemetry::{
 	TRACE_SAMPLING_RATE_DENOMINATOR, TraceExportConfig, TraceExportProtocol,
 };
 use crate::network::{
-	ServerAdmissionConfig, dev_lease_signing_secret, dev_transfer_signing_secret,
-	lease_verifying_key_bytes, transfer_verifying_key_bytes,
+	ServerAdmissionConfig, audit_root_verifying_key_bytes, dev_audit_root_signing_secret,
+	dev_lease_signing_secret, dev_transfer_signing_secret, lease_verifying_key_bytes,
+	transfer_verifying_key_bytes,
 };
 use crate::node::{
 	ClusterBootstrapConfig, DEFAULT_DATA_RING_LEASE_TTL_MILLIS, DEFAULT_MVCC_RETENTION_WINDOW,
@@ -58,6 +59,7 @@ pub fn render_example_config() -> String {
 		.expect("example config template must be valid UTF-8");
 	let lease_secret = dev_lease_signing_secret(EXAMPLE_NODE_ID);
 	let transfer_secret = dev_transfer_signing_secret(EXAMPLE_NODE_ID);
+	let audit_secret = dev_audit_root_signing_secret(EXAMPLE_NODE_ID);
 
 	template
 		.replace("{{NODE_ID}}", &EXAMPLE_NODE_ID.to_string())
@@ -87,6 +89,11 @@ pub fn render_example_config() -> String {
 		.replace(
 			"{{TRANSFER_VERIFYING_KEY}}",
 			&hex_string(transfer_verifying_key_bytes(transfer_secret)),
+		)
+		.replace("{{AUDIT_ROOT_SIGNING_SECRET}}", &hex_string(audit_secret))
+		.replace(
+			"{{AUDIT_ROOT_VERIFYING_KEY}}",
+			&hex_string(audit_root_verifying_key_bytes(audit_secret)),
 		)
 }
 
@@ -586,6 +593,8 @@ struct RawIdentityConfig {
 	trusted_lease_signers: BTreeMap<String, String>,
 	transfer_signing_secret: String,
 	trusted_transfer_signers: BTreeMap<String, String>,
+	audit_root_signing_secret: String,
+	trusted_audit_root_keys: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -861,6 +870,12 @@ impl RawConfig {
 			"identity.trusted_transfer_signers",
 			&self.identity.trusted_transfer_signers,
 		)?;
+		let audit_root_signing_secret = parse_key_material(
+			"identity.audit_root_signing_secret",
+			&self.identity.audit_root_signing_secret,
+		)?;
+		let trusted_audit_root_keys =
+			parse_trusted_audit_root_keys(&self.identity.trusted_audit_root_keys)?;
 		let cluster = match self.cluster.mode {
 			RawClusterMode::Bootstrap => ClusterBootstrapConfig::Bootstrap,
 			RawClusterMode::Join => ClusterBootstrapConfig::Join {
@@ -940,6 +955,8 @@ impl RawConfig {
 			trusted_lease_signers,
 			transfer_signing_secret,
 			trusted_transfer_signers,
+			audit_root_signing_secret,
+			trusted_audit_root_keys,
 			cluster,
 			l2: None,
 			tiering: crate::storage::SweeperConfig::default(),
@@ -1079,6 +1096,34 @@ fn parse_trusted_signers(
 		let key_bytes = parse_key_material(&format!("{field}.{node_id}"), key)?;
 		parsed.insert(node_id, key_bytes);
 	}
+	Ok(parsed)
+}
+
+// Audit identities are normalized numerically; aliases must never overwrite enrollment.
+fn parse_trusted_audit_root_keys(
+	raw: &BTreeMap<String, String>,
+) -> std::io::Result<BTreeMap<u32, [u8; 32]>> {
+	let mut parsed = BTreeMap::new();
+	for (raw_node, key) in raw {
+		let node = raw_node.parse::<u32>().map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				crate::audit::AuditTrustError::InvalidNode,
+			)
+		})?;
+		if parsed.contains_key(&node) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				crate::audit::AuditTrustError::DuplicateNode { node },
+			));
+		}
+		parsed.insert(
+			node,
+			parse_key_material("identity.trusted_audit_root_keys", key)?,
+		);
+	}
+	crate::audit::audit_root_trust(parsed.iter().map(|(&node, &key)| (node, key)))
+		.map_err(|err| Error::new(ErrorKind::InvalidInput, err))?;
 	Ok(parsed)
 }
 

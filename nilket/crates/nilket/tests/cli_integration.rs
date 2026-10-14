@@ -842,11 +842,27 @@ fn nilket_wendelon_audit_verify_round_trips() {
 	let signer = AuditRootSigner::from_seed([41; 32]);
 	emit_signed_chain_root(&*sink, node(41), &signer).unwrap();
 
+	let trust_path = dir.join("trust.json");
+	std::fs::write(
+		&trust_path,
+		format!(
+			r#"{{"version":1,"keys":{{"n-41":"{}"}}}}"#,
+			signer.verifying_key_hex()
+		),
+	)
+	.unwrap();
+	let unanchored = nilket(&["wendelon", "audit", "verify", good_path.to_str().unwrap()]);
+	assert_eq!(unanchored.status.code(), Some(1));
+	assert!(stdout(&unanchored).contains("audit_root_unanchored"));
+	assert!(stdout(&unanchored).contains("\"signed_roots_verified\": 0"));
+
 	let good_output = nilket(&[
 		"wendelon",
 		"audit",
 		"verify",
 		good_path.to_str().expect("utf8 path"),
+		"--trusted-audit-roots",
+		trust_path.to_str().unwrap(),
 	]);
 	assert!(good_output.status.success(), "{good_output:?}");
 	let good_stdout = stdout(&good_output);
