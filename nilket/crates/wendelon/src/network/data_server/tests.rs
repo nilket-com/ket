@@ -17564,3 +17564,6 @@ async fn adr629_p2b_raw_and_table_followers_keep_the_actual_pending_commit_after
 
 #[path = "tests/tenant_cache/tests.rs"]
 mod tenant_cache;
+
+#[path = "tests/pending_tenant/tests.rs"]
+mod pending_tenant;
