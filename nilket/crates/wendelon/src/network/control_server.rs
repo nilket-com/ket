@@ -820,6 +820,10 @@ impl WendelonControlServer {
 			return match response.data {
 				WendelonResponse::Success => Ok(()),
 				WendelonResponse::Error(message) => Err(Error::new(ErrorKind::Other, message)),
+				WendelonResponse::Root2Dormant => {
+					let message = String::from("Root2 carrier is dormant, not applied");
+					Err(Error::new(ErrorKind::Other, message))
+				}
 				WendelonResponse::LeaseDenied => Err(Error::other(
 					"unexpected lease denial for secondary-index lifecycle mutation",
 				)),
@@ -1055,6 +1059,16 @@ impl WendelonControlServer {
 							CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition),
 							CtasSagaResponse::Rejected,
 						),
+					WendelonResponse::Root2Dormant => {
+						let message = String::from("Root2 carrier is dormant, not applied");
+						message
+							.strip_prefix(CTAS_SAGA_REJECT_PREFIX)
+							.and_then(CtasSagaReject::from_code)
+							.map_or(
+								CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition),
+								CtasSagaResponse::Rejected,
+							)
+					}
 					WendelonResponse::LeaseDenied => {
 						CtasSagaResponse::Rejected(CtasSagaReject::StaleOwner)
 					}
@@ -1801,6 +1815,15 @@ impl WendelonControlServer {
 					message,
 					None,
 				),
+				WendelonResponse::Root2Dormant => {
+					let message = String::from("Root2 carrier is dormant, not applied");
+					self.revocation_admin_rejection(
+						frame,
+						CONTROL_REASON_INVALID_CONFIG,
+						message,
+						None,
+					)
+				}
 				WendelonResponse::LeaseDenied => self.revocation_admin_rejection(
 					frame,
 					CONTROL_REASON_INTERNAL_ERROR,
@@ -2033,6 +2056,15 @@ impl WendelonControlServer {
 					message,
 					None,
 				),
+				WendelonResponse::Root2Dormant => {
+					let message = String::from("Root2 carrier is dormant, not applied");
+					self.schema_update_rejection(
+						&frame,
+						CONTROL_REASON_INVALID_CONFIG,
+						message,
+						None,
+					)
+				}
 				WendelonResponse::LeaseDenied => self.schema_update_rejection(
 					&frame,
 					CONTROL_REASON_INTERNAL_ERROR,
@@ -2988,6 +3020,10 @@ impl WendelonControlServer {
 			Ok(resp) => match resp.data {
 				WendelonResponse::Success => Ok(resp.log_id.index),
 				WendelonResponse::Error(message) => Err(WendelonAdminError::Transport { message }),
+				WendelonResponse::Root2Dormant => {
+					let message = String::from("Root2 carrier is dormant, not applied");
+					Err(WendelonAdminError::Transport { message })
+				}
 				WendelonResponse::LeaseDenied => Err(WendelonAdminError::Transport {
 					message: "unexpected LeaseDenied response from schema drop".to_string(),
 				}),
@@ -3019,6 +3055,15 @@ impl WendelonControlServer {
 					message,
 					None,
 				),
+				WendelonResponse::Root2Dormant => {
+					let message = String::from("Root2 carrier is dormant, not applied");
+					self.tenant_admin_rejection(
+						frame,
+						Self::tenant_admin_error_reason(&message),
+						message,
+						None,
+					)
+				}
 				WendelonResponse::LeaseDenied => self.tenant_admin_rejection(
 					frame,
 					CONTROL_REASON_INTERNAL_ERROR,
@@ -3067,6 +3112,15 @@ impl WendelonControlServer {
 					message,
 					None,
 				),
+				WendelonResponse::Root2Dormant => {
+					let message = String::from("Root2 carrier is dormant, not applied");
+					self.tenant_admin_rejection(
+						frame,
+						Self::tenant_admin_error_reason(&message),
+						message,
+						None,
+					)
+				}
 				WendelonResponse::LeaseDenied => self.tenant_admin_rejection(
 					frame,
 					CONTROL_REASON_INTERNAL_ERROR,
@@ -3155,6 +3209,15 @@ impl WendelonControlServer {
 					message,
 					None,
 				),
+				WendelonResponse::Root2Dormant => {
+					let message = String::from("Root2 carrier is dormant, not applied");
+					self.tenant_admin_rejection(
+						frame,
+						Self::tenant_admin_error_reason(&message),
+						message,
+						None,
+					)
+				}
 				WendelonResponse::LeaseDenied => self.tenant_admin_rejection(
 					frame,
 					CONTROL_REASON_INTERNAL_ERROR,
@@ -3251,6 +3314,15 @@ impl WendelonControlServer {
 					message,
 					None,
 				),
+				WendelonResponse::Root2Dormant => {
+					let message = String::from("Root2 carrier is dormant, not applied");
+					self.tenant_admin_rejection(
+						frame,
+						Self::tenant_admin_error_reason(&message),
+						message,
+						None,
+					)
+				}
 				WendelonResponse::LeaseDenied => self.tenant_admin_rejection(
 					frame,
 					CONTROL_REASON_INTERNAL_ERROR,
@@ -3705,6 +3777,7 @@ impl WendelonControlServer {
 				}
 				WendelonResponse::LeaseDenied => LeaseStatus::DENIED_OVERLAP,
 				WendelonResponse::Error(_) => LeaseStatus::INTERNAL_ERROR,
+				WendelonResponse::Root2Dormant => LeaseStatus::INTERNAL_ERROR,
 			},
 			Err(_) if !self.is_leader().await => LeaseStatus::DENIED_NOT_LEADER,
 			Err(_) => LeaseStatus::INTERNAL_ERROR,
@@ -3741,6 +3814,7 @@ impl WendelonControlServer {
 				WendelonResponse::Success => LeaseStatus::GRANTED,
 				WendelonResponse::LeaseDenied => LeaseStatus::DENIED_INVALID_TARGET,
 				WendelonResponse::Error(_) => LeaseStatus::INTERNAL_ERROR,
+				WendelonResponse::Root2Dormant => LeaseStatus::INTERNAL_ERROR,
 			},
 			Err(_) if !self.is_leader().await => LeaseStatus::DENIED_NOT_LEADER,
 			Err(_) => LeaseStatus::INTERNAL_ERROR,

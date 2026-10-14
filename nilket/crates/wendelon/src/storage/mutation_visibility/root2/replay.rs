@@ -62,6 +62,7 @@ pub(in crate::storage::mutation_visibility::root2) enum Fault2 {
 	Verify(VerifyError2),
 	Unsupported(UnsupportedKind2),
 	NoCarrier,
+	CarrierUnavailable,
 	Observe(RecoveryError2),
 	Internal,
 }
@@ -243,7 +244,10 @@ impl ReplayDriver2<'_> {
 		boundary: &Entry<WendelonTypeConfig>,
 	) -> Result<Provisional2, Fault2> {
 		let committed = committed_entry2(source, boundary).map_err(Fault2::TargetAdapt)?;
-		let (p, fingerprint, _) = committed.entry_fields();
+		let (p, fingerprint, class) = committed.entry_fields();
+		if class == EntryClass2::HeldCarrier {
+			return Err(Fault2::CarrierUnavailable);
+		}
 		let target = ReplayTarget2 {
 			cut: Log2 {
 				term: p.term,
@@ -270,6 +274,9 @@ impl ReplayDriver2<'_> {
 	) -> Result<(), Fault2> {
 		let committed = committed_entry2(source, entry).map_err(Fault2::Adapt)?;
 		let (_, _, class) = committed.entry_fields();
+		if class == EntryClass2::HeldCarrier {
+			return Err(Fault2::CarrierUnavailable);
+		}
 		let state = match (origin_view2(&acc.state), class) {
 			(OriginView2::Empty, _) => pre_root(&acc.state, &committed)?,
 			(OriginView2::PreRoot { .. }, EntryClass2::Bootstrap(_)) => {

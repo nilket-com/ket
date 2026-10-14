@@ -1,4 +1,9 @@
 pub mod core;
+mod root2_carrier;
+pub use root2_carrier::{
+	ROOT2_COMMAND_ENVELOPE_MAX1, ROOT2_ENTRY_MAX1, ROOT2_GOVERNANCE_MAX1, Root2Carrier1,
+	Root2CarrierError1,
+};
 pub(crate) mod drop_reclaim;
 pub mod hlc;
 pub mod monitor;

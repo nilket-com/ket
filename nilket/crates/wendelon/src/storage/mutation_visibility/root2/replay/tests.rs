@@ -667,3 +667,58 @@ async fn issuer_commands_map_to_unsupported_replay_faults() {
 		assert!(matches!(result, Err(ReplayError2::Fault(Fault2::Unsupported(k))) if k == kind));
 	}
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn carrier_unavailable_stops_real_log_without_coverage_or_mark_change() {
+	for carrier_at in [1usize, 3usize] {
+		let (pin, dep, mut entries, fixtures) = context();
+		let _scope = Root2FixtureScope::install(fixtures);
+		let driver = ReplayDriver2 {
+			deployment: dep,
+			baseline: Baseline2::Provisioned,
+			pin: &pin,
+		};
+		let source = CommittedSource2::synthetic();
+		let mut acc = driver.initialize(&source, &entries[3]).unwrap();
+		for entry in &entries[..carrier_at] {
+			driver.dispatch(&mut acc, &source, entry).unwrap();
+		}
+		let before = encode_authority2(&acc.state).unwrap();
+		let traversed = acc.traversed;
+		entries[carrier_at].payload =
+			EntryPayload::Normal(crate::consensus::WendelonRequest::Root2Command(
+				crate::consensus::Root2Carrier1::new(&[1], Some(&[2])).unwrap(),
+			));
+		assert!(matches!(
+			driver.dispatch(&mut acc, &source, &entries[carrier_at]),
+			Err(Fault2::CarrierUnavailable)
+		));
+		assert_eq!(encode_authority2(&acc.state).unwrap(), before);
+		assert_eq!(acc.traversed, traversed);
+		let (d, mut m) = completion::marks();
+		if carrier_at == 3 {
+			m.advance(&dep, &mark_of2(&acc.state).unwrap()).unwrap();
+		}
+		let mark_before = std::fs::read(d.as_ref().join("RECOVERY_MARK")).unwrap();
+		let durable = m.durable();
+		let mut reader = store(entries.clone()).await;
+		let result = run(
+			&mut reader,
+			&Sources(entries[3].log_id),
+			caps(),
+			dep,
+			&pin,
+			&mut m,
+		)
+		.await;
+		assert!(matches!(
+			result,
+			Err(ReplayError2::Fault(Fault2::CarrierUnavailable))
+		));
+		assert_eq!(m.durable(), durable);
+		assert_eq!(
+			std::fs::read(d.as_ref().join("RECOVERY_MARK")).unwrap(),
+			mark_before
+		);
+	}
+}

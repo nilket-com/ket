@@ -2425,6 +2425,13 @@ async fn commit_install_tenant_kek_version(
 			ErrorKind::AlreadyExists,
 			format!("{context}: {message}"),
 		)),
+		crate::consensus::WendelonResponse::Root2Dormant => {
+			let message = String::from("Root2 carrier is dormant, not applied");
+			Err(Error::new(
+				ErrorKind::AlreadyExists,
+				format!("{context}: {message}"),
+			))
+		}
 		crate::consensus::WendelonResponse::LeaseDenied => Err(Error::other(format!(
 			"{context}: unexpected LeaseDenied response from InstallTenantKekVersion"
 		))),
@@ -2446,6 +2453,13 @@ async fn commit_tenant_request(
 			ErrorKind::InvalidInput,
 			format!("{context}: {message}"),
 		)),
+		WendelonResponse::Root2Dormant => {
+			let message = String::from("Root2 carrier is dormant, not applied");
+			Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!("{context}: {message}"),
+			))
+		}
 		WendelonResponse::LeaseDenied => Err(Error::other(format!(
 			"{context}: unexpected LeaseDenied response"
 		))),

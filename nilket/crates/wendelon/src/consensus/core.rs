@@ -626,6 +626,8 @@ pub enum WendelonRequest {
 	TableDropLogicalFinalize(TableDropLogicalFinalizeRequest),
 	/// ADR 0095 physical settlement after the complete stamped set attests.
 	TableDropSettlement(TableDropSettlementRequest),
+	/// V-S1 durable carrier, held without domain-state effects.
+	Root2Command(crate::consensus::Root2Carrier1),
 }
 
 impl WendelonRequest {
@@ -635,7 +637,7 @@ impl WendelonRequest {
 	/// variant moves no existing golden bytes, so the corpus alone cannot see
 	/// it — the count and this list can. Adding a variant here means the WAL
 	/// format version must move with it.
-	pub const ALL_VARIANT_NAMES: [&'static str; 26] = [
+	pub const ALL_VARIANT_NAMES: [&'static str; 27] = [
 		"finalize",
 		"acquire_lease",
 		"release_lease",
@@ -662,6 +664,7 @@ impl WendelonRequest {
 		"replay_legacy_ctas_row_dispatched",
 		"table_drop_logical_finalize",
 		"table_drop_settlement",
+		"root2_command",
 	];
 
 	/// Total by construction: a new variant fails this match at compile time,
@@ -695,6 +698,7 @@ impl WendelonRequest {
 			Self::ReplayLegacyCtasRowDispatched(_) => "replay_legacy_ctas_row_dispatched",
 			Self::TableDropLogicalFinalize(_) => "table_drop_logical_finalize",
 			Self::TableDropSettlement(_) => "table_drop_settlement",
+			Self::Root2Command(_) => "root2_command",
 		}
 	}
 }
@@ -709,6 +713,8 @@ pub enum WendelonResponse {
 	/// The command reached the state machine but was rejected by
 	/// semantic validation (for example a duplicate KEK id).
 	Error(String),
+	/// Committed and held: the Root2 carrier is dormant, not domain-applied.
+	Root2Dormant,
 }
 
 // The Wendelon implementation of the `openraft::RaftTypeConfig` trait.

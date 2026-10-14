@@ -9755,7 +9755,7 @@ fn adr0094_write_cap_and_legacy_replay_have_one_authority() {
 	let client = fs::read_to_string(manifest_dir.join("src/client/core.rs")).unwrap();
 	let schema = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
 	let raft = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
-	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 4;"));
+	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 5;"));
 	assert_eq!(core.matches("pub const MAX_SECTION_BYTES:").count(), 1);
 	assert_eq!(
 		client
