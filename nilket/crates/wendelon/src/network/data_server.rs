@@ -3222,7 +3222,6 @@ impl WendelonDataServer {
 		}
 		Ok(reconciled)
 	}
-
 	pub fn spawn_pending_finalization_reconciler(
 		self: Arc<Self>,
 		tick: Duration,
@@ -3239,7 +3238,6 @@ impl WendelonDataServer {
 			}
 		})
 	}
-
 	async fn submit_drop_reclaim_control_request(
 		&self,
 		request: WendelonRequest,
@@ -3253,12 +3251,12 @@ impl WendelonDataServer {
 			WendelonResponse::Error(message) => Err(Error::other(format!(
 				"drop reclaim {stage} was rejected: {message}"
 			))),
+			WendelonResponse::Root2Dormant => Err(Error::other("Root2 carrier is dormant")),
 			WendelonResponse::LeaseDenied => Err(Error::other(format!(
 				"drop reclaim {stage} returned unexpected lease denial"
 			))),
 		}
 	}
-
 	async fn roll_forward_one_prepared_drop(&self, state: &SmState) -> std::io::Result<bool> {
 		let mut prepared = state
 			.table_drop_fences
@@ -3824,7 +3822,6 @@ impl WendelonDataServer {
 			node_id: self.local_node.id,
 		};
 		let current_leader = self.raft.current_leader().await;
-
 		let mut granted = 0usize;
 		for (range_start, range_end) in ranges {
 			let request = AcquireLeaseRequestMeta {
@@ -3861,6 +3858,9 @@ impl WendelonDataServer {
 								"lease manager: state machine rejected AcquireLease: {message}"
 							),
 						)),
+						WendelonResponse::Root2Dormant => {
+							Err(Error::other("Root2 carrier is dormant"))
+						}
 					},
 					Err(err) => Err(Error::new(
 						ErrorKind::Other,

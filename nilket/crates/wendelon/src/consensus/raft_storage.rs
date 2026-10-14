@@ -4955,13 +4955,15 @@ fn raft_audit_event_with_context(
 			})
 			.with_parameters(audit_outcome_parameters(resp)),
 		),
+		// V-S1: held carriers emit no audit record.
+		WendelonRequest::Root2Command(_) => None,
 		_ => None,
 	}
 }
 
 fn audit_outcome(resp: &WendelonResponse) -> AuditOutcome {
 	match resp {
-		WendelonResponse::Error(_) => AuditOutcome::Error,
+		WendelonResponse::Error(_) | WendelonResponse::Root2Dormant => AuditOutcome::Error,
 		_ => AuditOutcome::Allowed,
 	}
 }
@@ -4969,6 +4971,7 @@ fn audit_outcome(resp: &WendelonResponse) -> AuditOutcome {
 fn audit_outcome_message(resp: &WendelonResponse) -> String {
 	match resp {
 		WendelonResponse::Error(message) => format!("outcome=error reason={message:?}"),
+		WendelonResponse::Root2Dormant => "outcome=held reason=Root2Dormant".to_string(),
 		_ => "outcome=success".to_string(),
 	}
 }
@@ -4978,6 +4981,10 @@ fn audit_outcome_parameters(resp: &WendelonResponse) -> Vec<(&'static str, serde
 		WendelonResponse::Error(message) => {
 			vec![("reason", serde_json::Value::String(format!("{message:?}")))]
 		}
+		WendelonResponse::Root2Dormant => vec![(
+			"reason",
+			serde_json::Value::String("Root2Dormant".to_string()),
+		)],
 		_ => Vec::new(),
 	}
 }
@@ -5114,6 +5121,7 @@ fn apply_request_at_log_index(
 	entry_log_index: u64,
 ) -> (WendelonResponse, Option<TierObserverEvent>) {
 	match req {
+		WendelonRequest::Root2Command(_) => (WendelonResponse::Root2Dormant, None),
 		WendelonRequest::Finalize(finalization) => {
 			// E_safe advances monotonically within an epoch —
 			// keep the later HLC.
@@ -8301,7 +8309,12 @@ fn decode_log_record(
 			.map_err(|err| wal_body_format_mismatch(wal_path, offset, 2, &err.to_string()))?,
 		3 => crate::consensus::wal_body::v3::decode_entry(payload)
 			.map_err(|err| wal_body_format_mismatch(wal_path, offset, 3, &err.to_string()))?,
-		_ => match postcard::take_from_bytes::<Entry<WendelonTypeConfig>>(payload) {
+		0 => crate::consensus::wal_body::v4::decode_entry(payload)
+			.map_err(|err| wal_body_format_mismatch(wal_path, offset, 0, &err.to_string()))?,
+		4 => crate::consensus::wal_body::v4::decode_entry(payload).map_err(|err| {
+			wal_body_format_mismatch(wal_path, offset, header.format_version, &err.to_string())
+		})?,
+		5 => match postcard::take_from_bytes::<Entry<WendelonTypeConfig>>(payload) {
 			Ok((entry, [])) => entry,
 			Ok((_entry, rest)) => {
 				return Err(wal_body_format_mismatch(
@@ -8323,6 +8336,14 @@ fn decode_log_record(
 				));
 			}
 		},
+		version => {
+			return Err(wal_body_format_mismatch(
+				wal_path,
+				offset,
+				version,
+				"unsupported WAL version",
+			));
+		}
 	};
 	if entry.log_id.index != fixed.index
 		|| entry.log_id.leader_id.term != fixed.term
@@ -8417,6 +8438,7 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 			(LogEntryKind::CONFIG, r.to.epoch)
 		}
 		EntryPayload::Normal(WendelonRequest::SchemaUpdate(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::Root2Command(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::CtasSaga(_))
 		| EntryPayload::Normal(WendelonRequest::ReplayLegacyCtasRowDispatched(_)) => {
 			(LogEntryKind::APPEND, 0)
@@ -18650,7 +18672,7 @@ mod tenant_kek_tests {
 /// The WAL body is `postcard(Entry<WendelonTypeConfig>)` and the snapshot body
 /// is `postcard(SmState)` — positional encodings that cannot describe
 /// themselves. These controls pin the CURRENT snapshot (version 5) and WAL
-/// (version 4) shapes two ways: a
+/// (version 5) shapes two ways: a
 /// stored golden encoding per request variant and per changed container, and
 /// an exact-set guard over the variant lists, because an appended enum variant
 /// moves no stored bytes and only the set check can see it. Any failure here
@@ -19108,6 +19130,28 @@ pub(crate) mod body_format_corpus {
 					attested_participants: TableDropParticipantSet::new([node(1)]),
 				}),
 			),
+			(
+				"root2_command",
+				WendelonRequest::Root2Command({
+					let v: serde_json::Value = serde_json::from_str(include_str!(
+						"../storage/mutation_visibility/root2/tests/goldens.json"
+					))
+					.unwrap();
+					let hex = v["fixtures"]
+						.as_array()
+						.unwrap()
+						.iter()
+						.find(|f| f["name"] == "command_bootstrap")
+						.unwrap()["hex"]
+						.as_str()
+						.unwrap();
+					let bytes = (0..hex.len())
+						.step_by(2)
+						.map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+						.collect::<Vec<_>>();
+					crate::consensus::Root2Carrier1::new(&bytes, Some(&[0x67; 296])).unwrap()
+				}),
+			),
 		]
 	}
 
@@ -19337,6 +19381,7 @@ pub(crate) mod body_format_corpus {
 					"replay_legacy_ctas_row_dispatched"
 						| "table_drop_logical_finalize"
 						| "table_drop_settlement"
+						| "root2_command"
 				)
 			})
 			.collect::<Vec<_>>();
@@ -19399,7 +19444,7 @@ pub(crate) mod body_format_corpus {
 			.filter(|(name, _)| {
 				!matches!(
 					*name,
-					"table_drop_logical_finalize" | "table_drop_settlement"
+					"table_drop_logical_finalize" | "table_drop_settlement" | "root2_command"
 				)
 			})
 			.collect::<Vec<_>>();
@@ -19444,7 +19489,10 @@ pub(crate) mod body_format_corpus {
 	#[test]
 	fn adr0095_current_wal_v4_and_snapshot_v5_match_stored_goldens() {
 		let stored_wal = parse_manifest(WAL_V4_MANIFEST);
-		let corpus = wal_corpus();
+		let corpus = wal_corpus()
+			.into_iter()
+			.filter(|(name, _)| *name != "root2_command")
+			.collect::<Vec<_>>();
 		assert_eq!(stored_wal.len(), corpus.len());
 		for (name, bytes) in corpus {
 			assert_eq!(
@@ -19839,7 +19887,7 @@ pub(crate) mod body_format_corpus {
 		for (name, bytes) in wal_corpus() {
 			wal.push_str(&format!("{name}={}\n", hex(&bytes)));
 		}
-		std::fs::write(dir.join("wal_v4_entries.txt"), wal).unwrap();
+		std::fs::write(dir.join("wal_v5_entries.txt"), wal).unwrap();
 		let mut mutations = String::new();
 		for (name, mutation) in canonical_mutations() {
 			mutations.push_str(&format!(
@@ -19862,4 +19910,59 @@ pub(crate) mod body_format_corpus {
 		std::fs::write(dir.join("snapshot_v5.txt"), snapshot).unwrap();
 		println!("manifests written to {}", dir.display());
 	}
+}
+
+#[cfg(test)]
+#[path = "root2_carrier/wal_tests.rs"]
+mod root2_carrier_tests;
+
+// Narrow fixture access for the carrier compatibility controls. Shadow shapes remain
+// confined to this replay/format-control file; no arbitrary body decoder is exported.
+#[cfg(test)]
+pub(crate) fn carrier_legacy_fixture_entry(
+	version: u8,
+	name: &str,
+) -> std::io::Result<Entry<WendelonTypeConfig>> {
+	let manifest = match version {
+		0 | 4 => include_str!("../../tests/fixtures/consensus_body/wal_v4_entries.txt"),
+		1 => include_str!("../../tests/fixtures/consensus_body/wal_v1_entries.txt"),
+		2 => include_str!("../../tests/fixtures/consensus_body/wal_v2_entries.txt"),
+		3 => include_str!("../../tests/fixtures/consensus_body/wal_v3_entries.txt"),
+		_ => {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"unsupported legacy carrier fixture version",
+			));
+		}
+	};
+	let hex = manifest
+		.lines()
+		.filter_map(|line| line.split_once('='))
+		.find_map(|(n, hex)| (n == name).then_some(hex))
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"unknown legacy carrier fixture name",
+			)
+		})?;
+	let bytes = (0..hex.len())
+		.step_by(2)
+		.map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+		.collect::<Result<Vec<_>, _>>()
+		.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+	match version {
+		0 | 4 => crate::consensus::wal_body::v4::decode_entry(&bytes),
+		1 => crate::consensus::wal_body::v1::decode_entry(&bytes),
+		2 => crate::consensus::wal_body::v2::decode_entry(&bytes),
+		3 => crate::consensus::wal_body::v3::decode_entry(&bytes),
+		_ => unreachable!(),
+	}
+}
+#[cfg(test)]
+fn assert_carrier_v4_fixture_round_trip(payload: &[u8]) {
+	let frozen = postcard::from_bytes::<
+		Entry<crate::consensus::wal_body::v4::WendelonWalV4TypeConfig>,
+	>(payload)
+	.unwrap();
+	assert_eq!(postcard::to_stdvec(&frozen).unwrap(), payload);
 }

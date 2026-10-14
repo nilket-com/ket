@@ -2175,9 +2175,9 @@ pub const PRE_VERSIONING_FORMAT: u8 = 0;
 pub const SNAPSHOT_FORMAT_VERSION: u8 = 5;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
-/// `postcard(Entry<..>)` payload of a log record. ADR 0095 version 4 appends
-/// logical-finalize and physical-settlement request variants.
-pub const WAL_FORMAT_VERSION: u8 = 4;
+/// `postcard(Entry<..>)` payload of a log record. ADR0100 V-S1 version 5 appends
+/// the held Root2 carrier; the outgoing version4 spine remains frozen.
+pub const WAL_FORMAT_VERSION: u8 = 5;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

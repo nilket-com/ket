@@ -151,7 +151,7 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 	// Existing live formats are deliberately untouched; no boot/WAL/reader wiring.
 	let core = fs::read_to_string(root.join("src/schema/core.rs")).unwrap();
 	assert!(core.contains("SNAPSHOT_FORMAT_VERSION: u8 = 5"));
-	assert!(core.contains("WAL_FORMAT_VERSION: u8 = 4"));
+	assert!(core.contains("WAL_FORMAT_VERSION: u8 = 5"));
 	fn visit(dir: PathBuf, module: &PathBuf) {
 		for entry in fs::read_dir(&dir).unwrap() {
 			let p = entry.unwrap().path();
@@ -2670,11 +2670,20 @@ fn committed_adapter_is_pure_capability_gated_and_exhaustive() {
 					);
 					for arm in &m.arms {
 						assert!(arm.guard.is_none(), "no match guard");
+						let mut variants = Vec::new();
+						collect(&arm.pat, &mut variants);
+						let held = variants == ["Root2Command"];
+						let expected = if held { "HeldCarrier" } else { "NonRoot2" };
 						assert!(
-							matches!(&*arm.body, syn::Expr::Path(p) if p.path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>() == ["EntryClass2", "NonRoot2"]),
-							"every request classifies NonRoot2"
+							!variants.iter().any(|v| v == "Root2Command") || held,
+							"carrier has its own exact arm"
 						);
-						collect(&arm.pat, &mut arms);
+						assert!(
+							matches!(&*arm.body, syn::Expr::Path(p) if
+                            p.path.segments.iter().map(|s|s.ident.to_string()).collect::<Vec<_>>() == ["EntryClass2",expected]),
+							"only Root2Command classifies HeldCarrier; legacy requests NonRoot2"
+						);
+						arms.extend(variants);
 					}
 					assert_eq!(f.block.stmts.len(), 1, "request_class is only the match");
 				}
@@ -4453,4 +4462,132 @@ fn lease_payload_is_pure_and_unwired() {
 			}
 		}
 	}
+}
+
+#[test]
+fn root2_carrier_is_bounded_private_held_and_response_mappings_are_explicit() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let text = fs::read_to_string(src.join("consensus/root2_carrier.rs")).unwrap();
+	assert!(text.lines().count() <= 750);
+	let file = syn::parse_file(&text).unwrap();
+	for item in &file.items {
+		if let syn::Item::Struct(s) = item {
+			if s.ident == "Root2Bytes" {
+				assert!(matches!(s.vis, syn::Visibility::Inherited));
+			}
+			for field in &s.fields {
+				assert!(
+					matches!(field.vis, syn::Visibility::Inherited),
+					"carrier fields stay private"
+				);
+			}
+		}
+	}
+	assert!(text.contains("d.deserialize_seq(BytesVisitor::<N>)"));
+	assert!(!text.contains("Vec::deserialize"));
+	assert!(!text.contains("deserialize_byte_buf"));
+	assert!(text.contains("try_reserve_exact"));
+	assert!(text.contains("if version != 1"));
+	let core =
+		syn::parse_file(&fs::read_to_string(src.join("consensus/core.rs")).unwrap()).unwrap();
+	for (name, last) in [
+		("WendelonRequest", "Root2Command"),
+		("WendelonResponse", "Root2Dormant"),
+	] {
+		let e = core
+			.items
+			.iter()
+			.find_map(|i| {
+				if let syn::Item::Enum(e) = i {
+					(e.ident == name).then_some(e)
+				} else {
+					None
+				}
+			})
+			.unwrap();
+		assert_eq!(e.variants.last().unwrap().ident.to_string(), last);
+	}
+	let frozen = fs::read_to_string(src.join("consensus/wal_body.rs")).unwrap();
+	let file = syn::parse_file(&frozen).unwrap();
+	let module = file
+		.items
+		.iter()
+		.find_map(|i| {
+			if let syn::Item::Mod(m) = i {
+				(m.ident == "v4").then_some(m)
+			} else {
+				None
+			}
+		})
+		.unwrap();
+	let (_, items) = module.content.as_ref().unwrap();
+	let request = items
+		.iter()
+		.find_map(|i| {
+			if let syn::Item::Enum(e) = i {
+				(e.ident == "WendelonRequest").then_some(e)
+			} else {
+				None
+			}
+		})
+		.unwrap();
+	assert_eq!(request.variants.len(), 26);
+	assert!(request.variants.iter().all(|v| v.ident != "Root2Command"));
+	let storage = fs::read_to_string(src.join("consensus/raft_storage.rs")).unwrap();
+	let dispatch = storage
+		.split("let entry: Entry<WendelonTypeConfig> = match header.format_version {")
+		.nth(1)
+		.unwrap()
+		.split("if entry.log_id.index != fixed.index")
+		.next()
+		.unwrap();
+	for version in 0..=5 {
+		assert!(dispatch.contains(&format!("{version} =>")));
+	}
+	assert!(dispatch.contains("version =>"));
+	assert!(!dispatch.contains("_ => match postcard"));
+	for (path, count) in [
+		("node.rs", 2),
+		("network/control_server.rs", 11),
+		("network/data_server.rs", 2),
+	] {
+		let source = fs::read_to_string(src.join(path)).unwrap();
+		assert_eq!(
+			source.matches("WendelonResponse::Root2Dormant =>").count(),
+			count,
+			"{path}: explicit dormant rejection census"
+		);
+	}
+	for helper in [
+		"audit_outcome",
+		"audit_outcome_message",
+		"audit_outcome_parameters",
+	] {
+		let function = storage
+			.split(&format!("fn {helper}("))
+			.nth(1)
+			.unwrap()
+			.split("\n}\n")
+			.next()
+			.unwrap();
+		assert!(
+			function.contains("WendelonResponse::Root2Dormant"),
+			"{helper}: no generic success for held response"
+		);
+	}
+	let root = src.join("storage/mutation_visibility/root2");
+	let committed = fs::read_to_string(root.join("committed.rs")).unwrap();
+	assert!(committed.contains("if class == EntryClass2::HeldCarrier"));
+	let replay = fs::read_to_string(root.join("replay.rs")).unwrap();
+	let dispatch = replay
+		.split("fn dispatch(")
+		.nth(1)
+		.unwrap()
+		.split("fn command(")
+		.next()
+		.unwrap();
+	assert!(
+		dispatch.find("Fault2::CarrierUnavailable").unwrap()
+			< dispatch.find("origin_view2").unwrap()
+	);
 }

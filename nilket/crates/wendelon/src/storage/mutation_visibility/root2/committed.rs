@@ -60,7 +60,13 @@ pub(in crate::storage::mutation_visibility::root2) fn committed_entry2(
 		),
 	};
 	#[cfg(test)]
-	let class = fixture::class(position, identity).unwrap_or(class);
+	let class = {
+		if class == EntryClass2::HeldCarrier {
+			class
+		} else {
+			fixture::class(position, identity).unwrap_or(class)
+		}
+	};
 	Ok(CommittedEntry2::from_source(
 		source, position, identity, class,
 	))
@@ -70,6 +76,7 @@ pub(in crate::storage::mutation_visibility::root2) fn committed_entry2(
 // to compile here until its class is decided.
 fn request_class(request: &WendelonRequest) -> EntryClass2 {
 	match request {
+		WendelonRequest::Root2Command(_) => EntryClass2::HeldCarrier,
 		WendelonRequest::Finalize(_)
 		| WendelonRequest::AcquireLease(_)
 		| WendelonRequest::ReleaseLease(_)

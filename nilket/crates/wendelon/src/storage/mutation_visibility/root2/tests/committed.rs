@@ -121,7 +121,12 @@ fn every_request_variant_is_non_root2() {
 		let name = request.variant_name();
 		let e = entry(log(1, 1, i as u64 + 1), EntryPayload::Normal(request));
 		assert!(
-			adapt(&e).entry_fields().2 == EntryClass2::NonRoot2,
+			adapt(&e).entry_fields().2
+				== if name == "root2_command" {
+					EntryClass2::HeldCarrier
+				} else {
+					EntryClass2::NonRoot2
+				},
 			"{name}"
 		);
 		if !seen.contains(&name) {
@@ -187,4 +192,104 @@ fn identity_error_is_typed() {
 		mapped,
 		Err(AdapterError2::Identity(EntryIdentityError2::Serialize))
 	);
+}
+
+#[test]
+fn carrier_legacy_wal_decoded_identities_are_frozen_for_versions_zero_through_four() {
+	let oracle: serde_json::Value =
+		serde_json::from_str(include_str!("wal_legacy_identity_vectors.json")).unwrap();
+	let fixtures = [
+		(
+			0,
+			include_str!("../../../../../tests/fixtures/consensus_body/wal_v4_entries.txt"),
+		),
+		(
+			1,
+			include_str!("../../../../../tests/fixtures/consensus_body/wal_v1_entries.txt"),
+		),
+		(
+			2,
+			include_str!("../../../../../tests/fixtures/consensus_body/wal_v2_entries.txt"),
+		),
+		(
+			3,
+			include_str!("../../../../../tests/fixtures/consensus_body/wal_v3_entries.txt"),
+		),
+		(
+			4,
+			include_str!("../../../../../tests/fixtures/consensus_body/wal_v4_entries.txt"),
+		),
+	];
+	for (version, manifest) in fixtures {
+		let mut count = 0;
+		for line in manifest
+			.lines()
+			.filter(|line| !line.is_empty() && !line.starts_with('#'))
+		{
+			let (name, hex) = line.split_once('=').unwrap();
+			let raw = unhex(hex);
+			let entry = crate::consensus::raft_storage::carrier_legacy_fixture_entry(version, name)
+				.unwrap();
+			let expected = &oracle[version.to_string()][name];
+			assert_eq!(
+				hash(b"", &raw).as_slice(),
+				unhex(expected["raw_sha256"].as_str().unwrap())
+			);
+			assert_eq!(
+				postcard::to_stdvec(&entry).unwrap(),
+				unhex(expected["decoded_current_hex"].as_str().unwrap()),
+				"v{version} {name}: frozen upconversion"
+			);
+			let (_, identity, class) = adapt(&entry).entry_fields();
+			assert!(class != EntryClass2::HeldCarrier);
+			assert_eq!(
+				identity.as_slice(),
+				unhex(expected["identity"].as_str().unwrap()),
+				"v{version} {name}: decoded-value identity"
+			);
+			count += 1;
+		}
+		assert_eq!(
+			count,
+			oracle[version.to_string()].as_object().unwrap().len()
+		);
+	}
+}
+#[test]
+fn carrier_held_class_never_binds_trust_or_advances_origin() {
+	let r = root("root_bootstrap_only");
+	let c = command("command_bootstrap");
+	for carrier in [
+		crate::consensus::Root2Carrier1::new(
+			&c.encode(r.state.generation, r.state.cluster).unwrap(),
+			None,
+		)
+		.unwrap(),
+		crate::consensus::Root2Carrier1::new(&[1], Some(&[2])).unwrap(),
+	] {
+		let entry = entry(
+			log(1, 1, 1),
+			EntryPayload::Normal(WendelonRequest::Root2Command(carrier)),
+		);
+		let ce = adapt(&entry);
+		assert!(ce.entry_fields().2 == EntryClass2::HeldCarrier);
+		let (position, identity, _) = ce.entry_fields();
+		let _pollution=crate::storage::mutation_visibility::root2::committed::fixture::Root2FixtureScope::install(vec![(position,identity,EntryClass2::Bootstrap(c.digest(r.state.generation,r.state.cluster).unwrap()),c.clone())]);
+		let ce = adapt(&entry);
+		assert!(ce.entry_fields().2 == EntryClass2::HeldCarrier);
+		assert_eq!(
+			TrustedEntry2::bind(&ce, &c, r.state.generation, r.state.cluster).err(),
+			Some(crate::storage::mutation_visibility::root2::trust::BindError2::NotRoot2Command)
+		);
+		let genesis = genesis(BTreeMap::from([(1, BasicNode::new("n1"))]));
+		let pre = advance_pre_root2(&empty_authority2(), &adapt(&genesis))
+			.unwrap()
+			.0;
+		let before = encode_authority2(&pre).unwrap();
+		assert_eq!(
+			advance_pre_root2(&pre, &ce).err(),
+			Some(RootError2::TrustMismatch)
+		);
+		assert_eq!(encode_authority2(&pre).unwrap(), before);
+	}
 }
