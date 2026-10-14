@@ -3,6 +3,8 @@
 //! This module owns Wendelon's branch grammar for both the legacy
 //! `wendelon` binary and the unified `nilket wendelon` branch.
 
+mod audit_trust;
+
 use std::future::Future;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -150,7 +152,12 @@ where
 			ExitCode::SUCCESS
 		}
 		[cmd, subcmd, audit_path] if cmd == "audit" && subcmd == "verify" => {
-			verify_audit(audit_path)
+			verify_audit(audit_path, None)
+		}
+		[cmd, subcmd, audit_path, flag, trust_path]
+			if cmd == "audit" && subcmd == "verify" && flag == "--trusted-audit-roots" =>
+		{
+			verify_audit(audit_path, Some(trust_path))
 		}
 		[cmd, rest @ ..] if cmd == "inspect" => run_inspect(rest),
 		[cmd, rest @ ..] if cmd == "index" => index::run(rest),
@@ -178,7 +185,7 @@ fn print_usage(program: &str) {
 		eprintln!("This binary is deprecated; use `nilket wendelon` instead.");
 	}
 	eprintln!(
-		"usage:\n  {program} <path/to/wendelon.toml>\n  {program} inspect [--endpoint <addr>] [--server-name <name>] [--cert <path>] [--key <path>] [--ca <path>] [--json]\n  {program} index create --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> --namespace <name> --table <name> --name <name> --column <name> [--id <uuid>]\n  {program} index drop --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> --id <uuid>\n  {program} index status --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--json]\n  {program} tenant create --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--quota-bytes <n>] [--replication-factor <n>] [--json]\n  {program} tenant get --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--json]\n  {program} tenant list --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> [--json]\n  {program} audit verify <path/to/audit.ndjson>\n  {program} --print-example-config\n  {program} --write-example-config <path/to/wendelon.toml>"
+		"usage:\n  {program} <path/to/wendelon.toml>\n  {program} inspect [--endpoint <addr>] [--server-name <name>] [--cert <path>] [--key <path>] [--ca <path>] [--json]\n  {program} index create --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> --namespace <name> --table <name> --name <name> --column <name> [--id <uuid>]\n  {program} index drop --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> --id <uuid>\n  {program} index status --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--json]\n  {program} tenant create --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--quota-bytes <n>] [--replication-factor <n>] [--json]\n  {program} tenant get --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--json]\n  {program} tenant list --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> [--json]\n  {program} audit verify <path/to/audit.ndjson> [--trusted-audit-roots <file>]\n  {program} --print-example-config\n  {program} --write-example-config <path/to/wendelon.toml>"
 	);
 }
 
@@ -610,8 +617,18 @@ fn push_json_line(out: &mut String, field: &str, value: &Value) {
 	out.push('\n');
 }
 
-fn verify_audit(audit_path: &str) -> ExitCode {
-	match verify_local_audit_evidence(audit_path) {
+fn verify_audit(audit_path: &str, trust_path: Option<&str>) -> ExitCode {
+	let trust = match trust_path
+		.map(|path| audit_trust::load(std::path::Path::new(path)))
+		.transpose()
+	{
+		Ok(trust) => trust,
+		Err(err) => {
+			eprintln!("{err}");
+			return ExitCode::from(2);
+		}
+	};
+	match verify_local_audit_evidence(audit_path, trust.as_ref()) {
 		Ok(report) => match serde_json::to_string_pretty(&report) {
 			Ok(json) => {
 				print!("{json}");

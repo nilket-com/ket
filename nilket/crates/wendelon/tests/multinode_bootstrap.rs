@@ -16,8 +16,8 @@ use wendelon::network::server::HrftService;
 use wendelon::network::transport::TransportProvider;
 use wendelon::network::wire;
 use wendelon::network::{
-	dev_lease_signing_secret, dev_transfer_signing_secret, lease_verifying_key_bytes,
-	transfer_verifying_key_bytes,
+	audit_root_verifying_key_bytes, dev_audit_root_signing_secret, dev_lease_signing_secret,
+	dev_transfer_signing_secret, lease_verifying_key_bytes, transfer_verifying_key_bytes,
 };
 use wendelon::node::{ClusterBootstrapConfig, NodeBootstrapConfig, SeedNodeConfig, WendelonNode};
 use wendelon::schema::{
@@ -56,12 +56,22 @@ fn write_node_config(
 
 	let lease_secret = dev_lease_signing_secret(node_id);
 	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let audit_secret = dev_audit_root_signing_secret(node_id);
 
 	let mut trusted_lease = String::new();
 	let mut trusted_transfer = String::new();
+	let mut trusted_audit = String::new();
 	for trusted_node_id in trusted_node_ids {
 		let lease = dev_lease_signing_secret(*trusted_node_id);
 		let transfer = dev_transfer_signing_secret(*trusted_node_id);
+		writeln!(
+			&mut trusted_audit,
+			"\"{trusted_node_id}\" = \"{}\"",
+			hex(audit_root_verifying_key_bytes(
+				dev_audit_root_signing_secret(*trusted_node_id)
+			))
+		)
+		.unwrap();
 		writeln!(
 			&mut trusted_lease,
 			"\"{trusted_node_id}\" = \"{}\"",
@@ -107,11 +117,14 @@ slab_io_depth = 64
 allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
+audit_root_signing_secret = "{audit_secret}"
 
 [identity.trusted_lease_signers]
 {trusted_lease}
 [identity.trusted_transfer_signers]
 {trusted_transfer}
+[identity.trusted_audit_root_keys]
+{trusted_audit}
 
 [crypto]
 root_kek_provider = "dev-insecure"
@@ -122,6 +135,8 @@ root_kek_provider = "dev-insecure"
 		rf = rf,
 		lease_secret = hex(lease_secret),
 		transfer_secret = hex(transfer_secret),
+		audit_secret = hex(audit_secret),
+		trusted_audit = trusted_audit,
 		trusted_lease = trusted_lease,
 		trusted_transfer = trusted_transfer,
 	);

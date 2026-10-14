@@ -32,11 +32,15 @@ max_concurrent_stream_tasks = 4096
 allow_dev_keys = false
 lease_signing_secret = "<64 hex chars>"
 transfer_signing_secret = "<64 hex chars>"
+audit_root_signing_secret = "<64 hex chars>"
 
 [identity.trusted_lease_signers]
 "1" = "<64 hex chars>"
 
 [identity.trusted_transfer_signers]
+"1" = "<64 hex chars>"
+
+[identity.trusted_audit_root_keys]
 "1" = "<64 hex chars>"
 ```
 
@@ -74,16 +78,37 @@ wendelon --write-example-config ./wendelon.toml
 config and `NodeBootstrapConfig::dev()` explicitly enable it for insecure local
 bring-up. Direct `NodeBootstrapConfig` literals must choose the field explicitly.
 The flag bypasses only recognized dev-key refusal: local trusted entries must match
-the signing secrets, lease and transfer public-key sets must be disjoint across all
+the signing secrets, lease, transfer and audit public-key sets must be pairwise disjoint across all
 ids, and each trusted map must use a distinct key per id.
 
-Dev-key recognition checks both lease and transfer derivations for the finite set
-of the local id and all ids in both trusted maps, against both roles. A dev-derived
+Dev-key recognition checks all three role derivations for the finite set
+of the local id and all ids in all three trusted maps, against all three roles. A dev-derived
 key for an id outside that set is not detected; arbitrary weak-key detection needs
 separate key provenance. Startup errors retain a typed `IdentityKeyError` inside
 an `InvalidInput` I/O error and contain roles and node ids, never key material.
 
 Publishing this policy does not rekey a running deployment. Before restarting with
 it, an operator using dev keys must explicitly authorize that insecure configuration
-or provision non-dev keys. Audit-key separation, file custody and key rotation are
-separate work.
+or provision non-dev keys. File custody and key rotation are separate work.
+
+### Audit root trust
+
+`[identity] audit_root_signing_secret` is required and independent of lease and transfer signing.
+`[identity.trusted_audit_root_keys]` is a required numeric-node map. Numeric aliases such as
+`1` and `01` collide and are refused. All three roles require a matching local entry,
+separate secrets and pairwise disjoint public keys, and no repeated key within a role.
+`allow_dev_keys` bypasses only finite-set recognition of the three development derivation
+families (local node plus all three map ID sets); it never bypasses consistency or separation.
+
+Offline verification uses `nilket wendelon audit verify <path> --trusted-audit-roots <file>`.
+The trust file is at most 1 MiB and has exactly `{"version":1,"keys":{"n-01":"<64 lowercase hex>"}}`.
+Node spelling must be canonical, object keys unique, and enrolled public keys canonical,
+nonweak and torsion-free. Signed roots without explicit trust yield Unanchored issues and
+exit 1. Rootless evidence is labelled NoRoots and verifies integrity only. Anchored means
+every root verified against its enrolled key and record metadata; it does not assert custody.
+
+An invocation selects one historical key per node. Old transfer-signed audit evidence can
+be checked only by explicitly selecting that historical transfer public key as audit trust
+for the chosen file/span and recording the migration-of-trust note. No key is inferred from
+records, configuration role fallback or epochs. Logs are never rewritten by verification.
+Custody, rotation, runtime configuration and redeployment are separate operator work.

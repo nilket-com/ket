@@ -8,9 +8,10 @@ pub use observability::audit::KafkaProducer;
 pub use observability::audit::{
 	ArchiveAuditConfig, AuditArchiveLockMode, AuditAuthority, AuditAuthorityModel, AuditChainHead,
 	AuditEvidenceDisposition, AuditOutcome, AuditProjectionSinkKind, AuditRootSigner,
-	AuditSinksConfig, AuditVerificationIssue, AuditVerificationReport,
-	DEFAULT_AUDIT_ARCHIVE_MAX_SEGMENT_BYTES, DEFAULT_CHAIN_ROOT_ROLLUP_INTERVAL, KafkaAuditConfig,
-	KafkaAuditPayloadMode, SignedAuditChainRoot, SyslogAuditConfig,
+	AuditRootTrust, AuditRootVerifyError, AuditSinksConfig, AuditTrustError,
+	AuditVerificationIssue, AuditVerificationReport, DEFAULT_AUDIT_ARCHIVE_MAX_SEGMENT_BYTES,
+	DEFAULT_CHAIN_ROOT_ROLLUP_INTERVAL, KafkaAuditConfig, KafkaAuditPayloadMode, RootTrustStatus,
+	SignedAuditChainRoot, SyslogAuditConfig,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeStruct};
 use serde_json::Value;
@@ -43,6 +44,7 @@ fn wendelon_audit_format() -> shared_audit::AuditFormat {
 		syslog_enterprise_id: SYSLOG_ENTERPRISE_ID,
 		default_kafka_client_id: DEFAULT_KAFKA_CLIENT_ID,
 		parse_node_numeric,
+		canonical_node_wire: |id| NodeId { id, _reserved: 0 }.format_wire(),
 	}
 }
 
@@ -866,14 +868,23 @@ pub fn spawn_signed_chain_root_rollup(
 	})
 }
 
-pub fn verify_signed_chain_root(root: &SignedAuditChainRoot) -> std::io::Result<()> {
-	shared_audit::verify_signed_chain_root(wendelon_audit_format(), root)
+pub fn audit_root_trust(
+	entries: impl IntoIterator<Item = (u32, [u8; 32])>,
+) -> Result<AuditRootTrust, AuditTrustError> {
+	AuditRootTrust::new(wendelon_audit_format(), entries)
+}
+pub fn verify_signed_chain_root(
+	root: &SignedAuditChainRoot,
+	trust: &AuditRootTrust,
+) -> Result<(), AuditRootVerifyError> {
+	shared_audit::verify_signed_chain_root(wendelon_audit_format(), root, trust)
 }
 
 pub fn verify_local_audit_evidence(
 	path: impl AsRef<Path>,
+	trust: Option<&AuditRootTrust>,
 ) -> std::io::Result<AuditVerificationReport> {
-	shared_audit::verify_local_audit_evidence(wendelon_audit_format(), path)
+	shared_audit::verify_local_audit_evidence(wendelon_audit_format(), path, trust)
 }
 
 pub fn replay_audit_chain(path: impl AsRef<Path>) -> std::io::Result<Option<AuditChainHead>> {

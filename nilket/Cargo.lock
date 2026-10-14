@@ -2860,6 +2860,7 @@ dependencies = [
  "aws-lc-rs",
  "blake3",
  "bytes",
+ "curve25519-dalek",
  "ed25519-dalek",
  "h2",
  "http",
