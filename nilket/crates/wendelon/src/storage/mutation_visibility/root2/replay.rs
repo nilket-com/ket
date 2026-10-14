@@ -11,7 +11,7 @@ use crate::storage::mutation_visibility::root2::acquisition::{
 use crate::storage::mutation_visibility::root2::admin_install::{InstallError2, install_admin2};
 use crate::storage::mutation_visibility::root2::command::{ApplyResult2, Command2};
 use crate::storage::mutation_visibility::root2::committed::{
-	AdapterError2, CommittedSource2, committed_entry2,
+	AdaptedEntry2, AdapterError2, CommittedSource2, committed_entry2,
 };
 use crate::storage::mutation_visibility::root2::durable::mark_store::{
 	MarkIoError2, MarkStore2, MarkWrite2,
@@ -62,7 +62,7 @@ pub(in crate::storage::mutation_visibility::root2) enum Fault2 {
 	Verify(VerifyError2),
 	Unsupported(UnsupportedKind2),
 	NoCarrier,
-	CarrierUnavailable,
+	Carrier,
 	Observe(RecoveryError2),
 	Internal,
 }
@@ -243,10 +243,11 @@ impl ReplayDriver2<'_> {
 		source: &CommittedSource2,
 		boundary: &Entry<WendelonTypeConfig>,
 	) -> Result<Provisional2, Fault2> {
-		let committed = committed_entry2(source, boundary).map_err(Fault2::TargetAdapt)?;
+		let adapted = committed_entry2(source, boundary).map_err(Fault2::TargetAdapt)?;
+		let committed = adapted.committed();
 		let (p, fingerprint, class) = committed.entry_fields();
-		if class == EntryClass2::HeldCarrier {
-			return Err(Fault2::CarrierUnavailable);
+		if adapted.is_carrier() && class == EntryClass2::MalformedRoot2 {
+			return Err(Fault2::Carrier);
 		}
 		let target = ReplayTarget2 {
 			cut: Log2 {
@@ -272,27 +273,32 @@ impl ReplayDriver2<'_> {
 		source: &CommittedSource2,
 		entry: &Entry<WendelonTypeConfig>,
 	) -> Result<(), Fault2> {
-		let committed = committed_entry2(source, entry).map_err(Fault2::Adapt)?;
+		let adapted = committed_entry2(source, entry).map_err(Fault2::Adapt)?;
+		let committed = adapted.committed();
 		let (_, _, class) = committed.entry_fields();
-		if class == EntryClass2::HeldCarrier {
-			return Err(Fault2::CarrierUnavailable);
+		if adapted.is_carrier() && class == EntryClass2::MalformedRoot2 {
+			return Err(Fault2::Carrier);
 		}
-		let state = match (origin_view2(&acc.state), class) {
-			(OriginView2::Empty, _) => pre_root(&acc.state, &committed)?,
-			(OriginView2::PreRoot { .. }, EntryClass2::Bootstrap(_)) => {
-				self.command(&acc.state, &committed)?
-			}
-			(OriginView2::PreRoot { .. }, _) => pre_root(&acc.state, &committed)?,
-			(OriginView2::Root, EntryClass2::Bootstrap(_) | EntryClass2::OtherRoot2(_)) => {
-				self.command(&acc.state, &committed)?
-			}
-			(OriginView2::Root, _) => {
-				let (next, result) =
-					advance_cover2(&acc.state, &committed).map_err(Fault2::Cover)?;
-				if matches!(result, ApplyResult2::AlreadyProcessed) {
-					return Err(Fault2::Internal);
+		let state = if adapted.is_carrier() {
+			self.command(&acc.state, adapted)?
+		} else {
+			match (origin_view2(&acc.state), class) {
+				(OriginView2::Empty, _) => pre_root(&acc.state, &committed)?,
+				(OriginView2::PreRoot { .. }, EntryClass2::Bootstrap(_)) => {
+					self.command(&acc.state, adapted)?
 				}
-				next
+				(OriginView2::PreRoot { .. }, _) => pre_root(&acc.state, &committed)?,
+				(OriginView2::Root, EntryClass2::Bootstrap(_) | EntryClass2::OtherRoot2(_)) => {
+					self.command(&acc.state, adapted)?
+				}
+				(OriginView2::Root, _) => {
+					let (next, result) =
+						advance_cover2(&acc.state, &committed).map_err(Fault2::Cover)?;
+					if matches!(result, ApplyResult2::AlreadyProcessed) {
+						return Err(Fault2::Internal);
+					}
+					next
+				}
 			}
 		};
 		// The sole observation in the dispatcher, on the state after this exact traversed entry.
@@ -305,21 +311,27 @@ impl ReplayDriver2<'_> {
 	fn command(
 		&self,
 		state: &MutationAuthorityState2,
-		committed: &CommittedEntry2,
+		adapted: AdaptedEntry2<'_>,
 	) -> Result<MutationAuthorityState2, Fault2> {
-		let command = command_at(committed)?;
+		let (committed, command, governance, context) = command_at(adapted)?;
+		if context
+			.is_some_and(|(g, c)| (g, c) != (self.deployment.generation, self.deployment.cluster))
+		{
+			return Err(Fault2::Verify(VerifyError2::EnvelopeContext));
+		}
 		let trusted = TrustedEntry2::bind(
-			committed,
+			&committed,
 			&command,
 			self.deployment.generation,
 			self.deployment.cluster,
 		)
 		.map_err(Fault2::Bind)?;
-		let (next, result) = advance_verified2(state, self.pin, committed, &trusted, &command)
-			.map_err(|e| match e {
-				VerifyError2::Unsupported(k) => Fault2::Unsupported(k),
-				other => Fault2::Verify(other),
-			})?;
+		let (next, result) =
+			advance_verified2(state, self.pin, &committed, &trusted, &command, governance)
+				.map_err(|e| match e {
+					VerifyError2::Unsupported(k) => Fault2::Unsupported(k),
+					other => Fault2::Verify(other),
+				})?;
 		if matches!(result, ApplyResult2::AlreadyProcessed) {
 			return Err(Fault2::Internal);
 		}
@@ -340,12 +352,29 @@ fn store_fault(slot: &RefCell<Option<Fault2>>, e: Fault2) -> FoldError2 {
 	*slot.borrow_mut() = Some(e);
 	FoldError2
 }
-fn command_at(committed: &CommittedEntry2) -> Result<Command2, Fault2> {
+fn command_at<'e>(
+	adapted: AdaptedEntry2<'e>,
+) -> Result<
+	(
+		CommittedEntry2,
+		Command2,
+		Option<&'e [u8]>,
+		Option<([u8; 16], [u8; 16])>,
+	),
+	Fault2,
+> {
+	let (committed, raw_carrier, carrier) = adapted.into_parts();
+	if raw_carrier {
+		let (g, c, command, governance) = carrier.ok_or(Fault2::Carrier)?.into_parts();
+		return Ok((committed, command, governance, Some((g, c))));
+	}
 	#[cfg(test)]
 	{
 		let (p, fp, _) = committed.entry_fields();
-		return crate::storage::mutation_visibility::root2::committed::fixture::command(p, fp)
-			.ok_or(Fault2::NoCarrier);
+		let command =
+			crate::storage::mutation_visibility::root2::committed::fixture::command(p, fp)
+				.ok_or(Fault2::NoCarrier)?;
+		Ok((committed, command, None, None))
 	}
 	#[cfg(not(test))]
 	{

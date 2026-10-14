@@ -50,7 +50,9 @@ fn genesis(nodes: BTreeMap<u32, BasicNode>) -> Entry<WendelonTypeConfig> {
 	)
 }
 fn adapt(e: &Entry<WendelonTypeConfig>) -> CommittedEntry2 {
-	committed_entry2(&CommittedSource2::synthetic(), e).unwrap()
+	committed_entry2(&CommittedSource2::synthetic(), e)
+		.unwrap()
+		.into_committed()
 }
 
 #[test]
@@ -120,15 +122,17 @@ fn every_request_variant_is_non_root2() {
 	for (i, (_, request)) in corpus.into_iter().enumerate() {
 		let name = request.variant_name();
 		let e = entry(log(1, 1, i as u64 + 1), EntryPayload::Normal(request));
-		assert!(
-			adapt(&e).entry_fields().2
-				== if name == "root2_command" {
-					EntryClass2::HeldCarrier
-				} else {
-					EntryClass2::NonRoot2
-				},
-			"{name}"
-		);
+		let class = adapt(&e).entry_fields().2;
+		if name == "root2_command" {
+			assert!(matches!(
+				class,
+				EntryClass2::Bootstrap(_)
+					| EntryClass2::OtherRoot2(_)
+					| EntryClass2::MalformedRoot2
+			));
+		} else {
+			assert!(class == EntryClass2::NonRoot2, "{name}");
+		}
 		if !seen.contains(&name) {
 			seen.push(name);
 		}
@@ -241,7 +245,15 @@ fn carrier_legacy_wal_decoded_identities_are_frozen_for_versions_zero_through_fo
 				"v{version} {name}: frozen upconversion"
 			);
 			let (_, identity, class) = adapt(&entry).entry_fields();
-			assert!(class != EntryClass2::HeldCarrier);
+			let expected_class = match &entry.payload {
+				EntryPayload::Blank => EntryClass2::Blank,
+				EntryPayload::Membership(_) => EntryClass2::Membership,
+				EntryPayload::Normal(request) => {
+					assert!(!matches!(request, WendelonRequest::Root2Command(_)));
+					EntryClass2::NonRoot2
+				}
+			};
+			assert!(class == expected_class);
 			assert_eq!(
 				identity.as_slice(),
 				unhex(expected["identity"].as_str().unwrap()),
@@ -256,40 +268,71 @@ fn carrier_legacy_wal_decoded_identities_are_frozen_for_versions_zero_through_fo
 	}
 }
 #[test]
-fn carrier_held_class_never_binds_trust_or_advances_origin() {
+fn carrier_classification_ignores_polluted_fixture_map() {
 	let r = root("root_bootstrap_only");
 	let c = command("command_bootstrap");
-	for carrier in [
-		crate::consensus::Root2Carrier1::new(
-			&c.encode(r.state.generation, r.state.cluster).unwrap(),
-			None,
-		)
-		.unwrap(),
-		crate::consensus::Root2Carrier1::new(&[1], Some(&[2])).unwrap(),
+	for (bytes, expected) in [
+		(
+			c.encode(r.state.generation, r.state.cluster).unwrap(),
+			EntryClass2::Bootstrap(c.digest(r.state.generation, r.state.cluster).unwrap()),
+		),
+		(vec![1], EntryClass2::MalformedRoot2),
 	] {
-		let entry = entry(
+		let e = entry(
 			log(1, 1, 1),
-			EntryPayload::Normal(WendelonRequest::Root2Command(carrier)),
+			EntryPayload::Normal(WendelonRequest::Root2Command(
+				crate::consensus::Root2Carrier1::new(&bytes, None).unwrap(),
+			)),
 		);
-		let ce = adapt(&entry);
-		assert!(ce.entry_fields().2 == EntryClass2::HeldCarrier);
-		let (position, identity, _) = ce.entry_fields();
-		let _pollution=crate::storage::mutation_visibility::root2::committed::fixture::Root2FixtureScope::install(vec![(position,identity,EntryClass2::Bootstrap(c.digest(r.state.generation,r.state.cluster).unwrap()),c.clone())]);
-		let ce = adapt(&entry);
-		assert!(ce.entry_fields().2 == EntryClass2::HeldCarrier);
-		assert_eq!(
-			TrustedEntry2::bind(&ce, &c, r.state.generation, r.state.cluster).err(),
-			Some(crate::storage::mutation_visibility::root2::trust::BindError2::NotRoot2Command)
-		);
-		let genesis = genesis(BTreeMap::from([(1, BasicNode::new("n1"))]));
-		let pre = advance_pre_root2(&empty_authority2(), &adapt(&genesis))
-			.unwrap()
-			.0;
-		let before = encode_authority2(&pre).unwrap();
-		assert_eq!(
-			advance_pre_root2(&pre, &ce).err(),
-			Some(RootError2::TrustMismatch)
-		);
-		assert_eq!(encode_authority2(&pre).unwrap(), before);
+		let (p, fp, _) = adapt(&e).entry_fields();
+		let _scope = crate::storage::mutation_visibility::root2::committed::fixture::Root2FixtureScope::install(vec![(p,fp,EntryClass2::OtherRoot2([1;32]),Command2::Cover {kind:0,external:[2;32]})]);
+		assert!(adapt(&e).entry_fields().2 == expected);
 	}
+}
+
+// Narrow test-only bridges retain the exact typed assertions in the prefix guard's
+// existing allowed tests directory. They grant no production capability.
+#[cfg(test)]
+pub(in crate::storage::mutation_visibility::root2) fn assert_carrier_boundary_swap(
+	status: &crate::consensus::RetentionStatus,
+	genesis: &Entry<WendelonTypeConfig>,
+	original: &Entry<WendelonTypeConfig>,
+	swapped: &Entry<WendelonTypeConfig>,
+) {
+	let result = crate::storage::mutation_visibility::root2::prefix::check_committed_prefix2(
+		status,
+		original.log_id,
+		&[genesis.clone(), original.clone()],
+		0,
+		status,
+		swapped,
+		original.log_id,
+	);
+	assert_eq!(
+		result,
+		Err(crate::storage::mutation_visibility::root2::prefix::PrefixError2::BoundaryMismatch)
+	);
+}
+#[cfg(test)]
+pub(in crate::storage::mutation_visibility::root2) fn assert_carrier_missing_genesis(
+	result: &Result<
+		crate::storage::mutation_visibility::root2::replay::Replayed2,
+		crate::storage::mutation_visibility::root2::replay::ReplayError2,
+	>,
+) {
+	assert!(matches!(
+		result,
+		Err(crate::storage::mutation_visibility::root2::replay::ReplayError2::Acquisition(
+			crate::storage::mutation_visibility::root2::acquisition::AcquisitionError2::Prefix(
+				crate::storage::mutation_visibility::root2::prefix::PrefixError2::MissingGenesis
+			)
+		))
+	));
+}
+#[test]
+fn carrier_governance_sidecar_bound_matches_dormant_envelope_bound() {
+	assert_eq!(
+		crate::storage::mutation_visibility::root2::committed::GOVERNANCE_SIDECAR_BYTES2,
+		crate::storage::mutation_visibility::root2::governance_command::GOVERNANCE_COMMAND_BYTES2
+	);
 }

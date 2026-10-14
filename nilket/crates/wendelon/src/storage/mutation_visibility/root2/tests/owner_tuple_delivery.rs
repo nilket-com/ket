@@ -210,7 +210,7 @@ fn owner_export_tuple_feeds_install_for_both_profiles() {
 		);
 		// C: the actual Bootstrap verification from the pre-root reaches exactly the fixture root.
 		let (verified, _) =
-			advance_verified2(&pre_root(), &tuple, &d.committed, &d.entry, &d.cmd).unwrap();
+			advance_verified2(&pre_root(), &tuple, &d.committed, &d.entry, &d.cmd, None).unwrap();
 		assert_eq!(
 			encode_authority2(&verified).unwrap(),
 			encode_authority2(&d.root).unwrap(),
@@ -260,7 +260,7 @@ fn owner_tuples_reach_the_c_and_install_refusals() {
 		let tuple = read_delivered(&d).expect("the tuple prerequisites pass");
 		assert_eq!(tuple_manifest_len2(&tuple), right, "{name}");
 		assert_eq!(
-			advance_verified2(&pre_root(), &tuple, &d.committed, &d.entry, &d.cmd).err(),
+			advance_verified2(&pre_root(), &tuple, &d.committed, &d.entry, &d.cmd, None).err(),
 			Some(VerifyError2::Consumer(RootError2::TrustMismatch)),
 			"{name}"
 		);
@@ -291,7 +291,8 @@ fn owner_tuples_reach_the_c_and_install_refusals() {
 				tuple,
 				&other.committed,
 				&other.entry,
-				&other.cmd
+				&other.cmd,
+				None
 			)
 			.err(),
 			Some(VerifyError2::Consumer(RootError2::TrustMismatch))

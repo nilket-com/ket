@@ -8,7 +8,7 @@ mod admission_command;
 mod admission_gate;
 mod admission_registry;
 mod admission_reserve;
-mod committed;
+pub(crate) mod committed;
 mod cover;
 mod delivery_shapes;
 mod entry_identity;

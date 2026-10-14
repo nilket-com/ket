@@ -2431,7 +2431,11 @@ async fn commit_install_tenant_kek_version(
 		))
 		.await
 		.map_err(|err| Error::new(ErrorKind::Other, format!("{context}: {err}")))?;
-	match response.data {
+	install_tenant_kek_response(response.data, context)
+}
+
+fn install_tenant_kek_response(response: WendelonResponse, context: &str) -> std::io::Result<()> {
+	match response {
 		crate::consensus::WendelonResponse::Success => Ok(()),
 		crate::consensus::WendelonResponse::Error(message) => Err(Error::new(
 			ErrorKind::AlreadyExists,
@@ -2440,7 +2444,7 @@ async fn commit_install_tenant_kek_version(
 		crate::consensus::WendelonResponse::Root2Dormant => {
 			let message = String::from("Root2 carrier is dormant, not applied");
 			Err(Error::new(
-				ErrorKind::AlreadyExists,
+				ErrorKind::Unsupported,
 				format!("{context}: {message}"),
 			))
 		}
@@ -2459,7 +2463,11 @@ async fn commit_tenant_request(
 		.client_write(request)
 		.await
 		.map_err(|err| Error::new(ErrorKind::Other, format!("{context}: {err}")))?;
-	match response.data {
+	tenant_request_response(response.data, context)
+}
+
+fn tenant_request_response(response: WendelonResponse, context: &str) -> std::io::Result<()> {
+	match response {
 		WendelonResponse::Success => Ok(()),
 		WendelonResponse::Error(message) => Err(Error::new(
 			ErrorKind::InvalidInput,
@@ -2468,7 +2476,7 @@ async fn commit_tenant_request(
 		WendelonResponse::Root2Dormant => {
 			let message = String::from("Root2 carrier is dormant, not applied");
 			Err(Error::new(
-				ErrorKind::InvalidInput,
+				ErrorKind::Unsupported,
 				format!("{context}: {message}"),
 			))
 		}
@@ -4061,5 +4069,41 @@ mod tests {
 			.await
 			.unwrap_err();
 		assert_eq!(err.kind(), ErrorKind::InvalidData);
+	}
+}
+
+#[cfg(test)]
+mod dormant_response_tests {
+	use super::*;
+	#[test]
+	fn install_dormant_response_is_unsupported_and_other_mappings_are_preserved() {
+		assert!(install_tenant_kek_response(WendelonResponse::Success, "ctx").is_ok());
+		let e = install_tenant_kek_response(WendelonResponse::Root2Dormant, "ctx").unwrap_err();
+		assert_eq!(e.kind(), ErrorKind::Unsupported);
+		assert_eq!(e.to_string(), "ctx: Root2 carrier is dormant, not applied");
+		let e = install_tenant_kek_response(WendelonResponse::Error("rejected".into()), "ctx")
+			.unwrap_err();
+		assert_eq!(e.kind(), ErrorKind::AlreadyExists);
+		assert_eq!(e.to_string(), "ctx: rejected");
+		let e = install_tenant_kek_response(WendelonResponse::LeaseDenied, "ctx").unwrap_err();
+		assert_eq!(e.kind(), ErrorKind::Other);
+		assert_eq!(
+			e.to_string(),
+			"ctx: unexpected LeaseDenied response from InstallTenantKekVersion"
+		);
+	}
+	#[test]
+	fn tenant_dormant_response_is_unsupported_and_other_mappings_are_preserved() {
+		assert!(tenant_request_response(WendelonResponse::Success, "ctx").is_ok());
+		let e = tenant_request_response(WendelonResponse::Root2Dormant, "ctx").unwrap_err();
+		assert_eq!(e.kind(), ErrorKind::Unsupported);
+		assert_eq!(e.to_string(), "ctx: Root2 carrier is dormant, not applied");
+		let e =
+			tenant_request_response(WendelonResponse::Error("rejected".into()), "ctx").unwrap_err();
+		assert_eq!(e.kind(), ErrorKind::InvalidInput);
+		assert_eq!(e.to_string(), "ctx: rejected");
+		let e = tenant_request_response(WendelonResponse::LeaseDenied, "ctx").unwrap_err();
+		assert_eq!(e.kind(), ErrorKind::Other);
+		assert_eq!(e.to_string(), "ctx: unexpected LeaseDenied response");
 	}
 }

@@ -169,7 +169,9 @@ fn post_bootstrap_entries_cover_contiguously() {
 	];
 	let mut s = rooted();
 	for (raw, kind) in entries.iter().zip([0u8, 2, 1]) {
-		let e = committed_entry2(&CommittedSource2::synthetic(), raw).unwrap();
+		let e = committed_entry2(&CommittedSource2::synthetic(), raw)
+			.unwrap()
+			.into_committed();
 		let (position, identity, _) = e.entry_fields();
 		s = covered_by(&s, &e);
 		assert!(tip(&s) == (log2(position), identity, derived_digest(kind, identity)));

@@ -83,7 +83,9 @@ fn entry(index: u64) -> E {
 	}
 }
 fn fields(e: &E) -> (EntryPosition2, Digest2) {
-	let ce = committed_entry2(&CommittedSource2::synthetic(), e).unwrap();
+	let ce = committed_entry2(&CommittedSource2::synthetic(), e)
+		.unwrap()
+		.into_committed();
 	let (p, fp, _) = ce.entry_fields();
 	(p, fp)
 }
@@ -170,7 +172,7 @@ fn oracle(
 	let source = CommittedSource2::synthetic();
 	for e in entries {
 		let old = out.last().unwrap_or(&empty);
-		let ce = committed_entry2(&source, e).unwrap();
+		let ce = committed_entry2(&source, e).unwrap().into_committed();
 		let (p, fp, class) = ce.entry_fields();
 		let next = match (origin_view2(old), class) {
 			(_, EntryClass2::Bootstrap(_) | EntryClass2::OtherRoot2(_))
@@ -181,7 +183,9 @@ fn oracle(
 					crate::storage::mutation_visibility::root2::committed::fixture::command(p, fp)
 						.unwrap();
 				let trusted = TrustedEntry2::bind(&ce, &cmd, dep.generation, dep.cluster).unwrap();
-				advance_verified2(old, pin, &ce, &trusted, &cmd).unwrap().0
+				advance_verified2(old, pin, &ce, &trusted, &cmd, None)
+					.unwrap()
+					.0
 			}
 			(OriginView2::Root, _) => advance_cover2(old, &ce).unwrap().0,
 			_ => advance_pre_root2(old, &ce).unwrap().0,
@@ -347,9 +351,12 @@ async fn pre_root_target_refuses_and_expected_mode_keeps_old_semantics() {
 	let mut m = replay_monitor2(dep, Some(Baseline2::Provisioned), target).unwrap();
 	let mut state = empty_authority2();
 	for e in &entries[..2] {
-		state = advance_pre_root2(&state, &committed_entry2(&source, e).unwrap())
-			.unwrap()
-			.0;
+		state = advance_pre_root2(
+			&state,
+			&committed_entry2(&source, e).unwrap().into_committed(),
+		)
+		.unwrap()
+		.0;
 		assert!(matches!(
 			observe2(&mut m, &state).unwrap(),
 			Progress2::Replaying
@@ -359,7 +366,9 @@ async fn pre_root_target_refuses_and_expected_mode_keeps_old_semantics() {
 	let mut m = replay_monitor2(dep, Some(Baseline2::Provisioned), target).unwrap();
 	let genesis = advance_pre_root2(
 		&empty_authority2(),
-		&committed_entry2(&source, &entries[0]).unwrap(),
+		&committed_entry2(&source, &entries[0])
+			.unwrap()
+			.into_committed(),
 	)
 	.unwrap()
 	.0;
@@ -475,14 +484,21 @@ async fn other_root_before_bootstrap_uses_existing_malformed_rule() {
 	let source = CommittedSource2::synthetic();
 	let genesis = advance_pre_root2(
 		&empty_authority2(),
-		&committed_entry2(&source, &entries[0]).unwrap(),
+		&committed_entry2(&source, &entries[0])
+			.unwrap()
+			.into_committed(),
 	)
 	.unwrap()
 	.0;
 	assert!(matches!(
-		advance_pre_root2(&genesis, &committed_entry2(&source, &entries[1]).unwrap())
-			.unwrap()
-			.1,
+		advance_pre_root2(
+			&genesis,
+			&committed_entry2(&source, &entries[1])
+				.unwrap()
+				.into_committed()
+		)
+		.unwrap()
+		.1,
 		PreRootStep2::Malformed
 	));
 	assert_eq!(
@@ -629,9 +645,8 @@ async fn binding_fault_is_retained_and_unavailable_carrier_refuses() {
 			BindError2::DigestMismatch
 		)))
 	));
-	let (p, fp) = fields(&entries[3]);
-	let uncarried = CommittedEntry2::fixture(p, fp, EntryClass2::OtherRoot2([7; 32]));
-	assert!(matches!(command_at(&uncarried), Err(Fault2::NoCarrier)));
+	let uncarried = committed_entry2(&CommittedSource2::synthetic(), &entries[3]).unwrap();
+	assert!(matches!(command_at(uncarried), Err(Fault2::NoCarrier)));
 }
 
 mod completion;
@@ -669,7 +684,7 @@ async fn issuer_commands_map_to_unsupported_replay_faults() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn carrier_unavailable_stops_real_log_without_coverage_or_mark_change() {
+async fn carrier_malformed_stops_real_log_without_coverage_or_mark_change() {
 	for carrier_at in [1usize, 3usize] {
 		let (pin, dep, mut entries, fixtures) = context();
 		let _scope = Root2FixtureScope::install(fixtures);
@@ -691,7 +706,7 @@ async fn carrier_unavailable_stops_real_log_without_coverage_or_mark_change() {
 			));
 		assert!(matches!(
 			driver.dispatch(&mut acc, &source, &entries[carrier_at]),
-			Err(Fault2::CarrierUnavailable)
+			Err(Fault2::Carrier)
 		));
 		assert_eq!(encode_authority2(&acc.state).unwrap(), before);
 		assert_eq!(acc.traversed, traversed);
@@ -711,10 +726,7 @@ async fn carrier_unavailable_stops_real_log_without_coverage_or_mark_change() {
 			&mut m,
 		)
 		.await;
-		assert!(matches!(
-			result,
-			Err(ReplayError2::Fault(Fault2::CarrierUnavailable))
-		));
+		assert!(matches!(result, Err(ReplayError2::Fault(Fault2::Carrier))));
 		assert_eq!(m.durable(), durable);
 		assert_eq!(
 			std::fs::read(d.as_ref().join("RECOVERY_MARK")).unwrap(),
@@ -722,3 +734,5 @@ async fn carrier_unavailable_stops_real_log_without_coverage_or_mark_change() {
 		);
 	}
 }
+
+mod carrier;
