@@ -26,6 +26,9 @@
 //!   tasks; [`WendelonNode::shutdown`] aborts and joins them once
 //!   request drain has completed.
 
+mod identity;
+pub use identity::{IdentityKeyError, IdentityKeyRole};
+
 use crate::audit::{
 	AuditAuthority, AuditClockDriftSubscriber, AuditEvent, AuditMaterializationTracker,
 	AuditOperation, AuditRootSigner, AuditSink, AuditSinksConfig,
@@ -202,6 +205,9 @@ pub struct NodeBootstrapConfig {
 	/// Ed25519 secret key used when this node is the control-ring
 	/// leader and signs a `LeaseDescriptor`.
 	pub lease_signing_secret: [u8; 32],
+	/// Explicitly permit recognized insecure dev signing keys. This never bypasses
+	/// local-key consistency or role/identity separation.
+	pub allow_dev_keys: bool,
 	/// Trusted Ed25519 verifying keys for lease issuers, keyed by
 	/// Raft `NodeId.id`. Data-ring lease gates reject descriptors
 	/// from issuers not present here.
@@ -307,6 +313,7 @@ impl NodeBootstrapConfig {
 			)),
 			advertise_address,
 			lease_signing_secret,
+			allow_dev_keys: true,
 			trusted_lease_signers,
 			transfer_signing_secret,
 			trusted_transfer_signers,
@@ -435,24 +442,7 @@ impl NodeBootstrapConfig {
 			));
 		}
 		self.transport_admission.validate()?;
-		if !self.trusted_lease_signers.contains_key(&self.node_id) {
-			return Err(Error::new(
-				ErrorKind::InvalidInput,
-				format!(
-					"trusted_lease_signers must contain this node's verifying key ({})",
-					self.node_id
-				),
-			));
-		}
-		if !self.trusted_transfer_signers.contains_key(&self.node_id) {
-			return Err(Error::new(
-				ErrorKind::InvalidInput,
-				format!(
-					"trusted_transfer_signers must contain this node's verifying key ({})",
-					self.node_id
-				),
-			));
-		}
+		identity::validate_identity_keys(self)?;
 		self.rehydration.validate()?;
 		self.l2_column_fetch.validate()?;
 		self.row_group_writer.validate()?;
@@ -3194,7 +3184,12 @@ mod tests {
 			"crypto_profile={}",
 			crate::build_info::crypto_profile()
 		)));
-		assert!(audit.contains("build_profile=debug"));
+		let expected_profile = if cfg!(debug_assertions) {
+			"debug"
+		} else {
+			"release"
+		};
+		assert!(audit.contains(&format!("build_profile={expected_profile}")));
 		assert!(audit.contains("mlock="));
 	}
 

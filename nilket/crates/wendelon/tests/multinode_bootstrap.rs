@@ -104,6 +104,7 @@ wal_io_depth = 64
 slab_io_depth = 64
 
 [identity]
+allow_dev_keys = true
 lease_signing_secret = "{lease_secret}"
 transfer_signing_secret = "{transfer_secret}"
 
