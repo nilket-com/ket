@@ -2,9 +2,8 @@
 //! tuple), AdmissionPermission (the administrator statement), Reserve (the claim's admission
 //! signature) and Finalize (the holder attestation) it computes a `VerifiedCommand2` from the exact
 //! pre-entry state and hands it at once to the one matching consumer; the token never leaves
-//! `advance_verified2`. Every other command is refused: the administrator command envelope,
-//! lease-issuer verification, committed grant history and authenticated outcome resolution do not
-//! exist yet.
+//! `advance_verified2`. The nine governance kinds use a structurally checked envelope and the
+//! pre-entry administrator/issuer state; Cover remains not applicable here.
 //!
 //! Structural verification and command authorization only: nothing here authenticates that an
 //! entry is committed or that a state is current. Authorization is applied outside the reducer, so
@@ -12,7 +11,7 @@
 //! recorded a closure-driven refusal or a terminal replay; that limitation is deliberate and
 //! recorded, not closed.
 use crate::storage::mutation_visibility::MutationIdentity;
-use crate::storage::mutation_visibility::root2::admin_install::install_admin2;
+use crate::storage::mutation_visibility::root2::admin_install::{InstallError2, install_admin2};
 use crate::storage::mutation_visibility::root2::admin_statement::{
 	ADMIN_STATEMENT_BYTES2, check_admin_statement2,
 };
@@ -20,6 +19,8 @@ use crate::storage::mutation_visibility::root2::auth::signature::{
 	verify_admission_signature2, verify_holder_signature2,
 };
 use crate::storage::mutation_visibility::root2::command::{ApplyResult2, Command2};
+use crate::storage::mutation_visibility::root2::governance_command::GovernanceCommandError2;
+use crate::storage::mutation_visibility::root2::governance_verification::verify_governance2;
 use crate::storage::mutation_visibility::root2::origin::{
 	EntryClass2, MutationAuthorityState2, OriginView2, advance_admission2, advance_root2,
 	bootstrap2, origin_view2, root_and_origin2,
@@ -56,6 +57,11 @@ pub(in crate::storage::mutation_visibility::root2) enum VerifyError2 {
 	NotApplicable,
 	EnvelopeContext,
 	ExtraSidecar,
+	MissingSidecar,
+	SidecarLength,
+	Governance(GovernanceCommandError2),
+	Install(InstallError2),
+	IssuerPayload,
 	Unsupported(UnsupportedKind2),
 	DigestMismatch,
 	CommittedMismatch,
@@ -68,7 +74,7 @@ pub(in crate::storage::mutation_visibility::root2) enum VerifyError2 {
 /// once in the one matching consumer. Order: kind, digest, committed binding (rooted commands;
 /// Bootstrap's is `bootstrap2`'s), state kind, root (generation, cluster), extra sidecar,
 /// verification, consumer. The replay checks the retained envelope context before trusted bind;
-/// no governance envelope is authorized by this slice.
+/// governance structure/install refusals precede authorization and token creation.
 pub(in crate::storage::mutation_visibility::root2) fn advance_verified2(
 	state: &MutationAuthorityState2,
 	pin: &PinnedBoundTuple2,
@@ -103,10 +109,17 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_verified2(
 		}
 		_ => return Err(E::StateKind),
 	}
-	if governance.is_some() {
+	if governance.is_some()
+		&& matches!(
+			command,
+			Command2::Bootstrap { .. }
+				| Command2::AdmissionPermission(_)
+				| Command2::Reserve(_)
+				| Command2::Finalize { .. }
+		) {
 		return Err(E::ExtraSidecar);
 	}
-	let token = verify_command2(state, pin, entry, command)?;
+	let token = verify_command2(state, pin, entry, command, governance)?;
 	match command {
 		Command2::Bootstrap { .. } => bootstrap2(state, committed, entry, &token, command),
 		Command2::AdmissionPermission(_) => advance_admission2(state, pin, entry, &token, command),
@@ -117,7 +130,6 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_verified2(
 
 /// The dispatch census: exhaustive, no wildcard.
 fn kind(command: &Command2) -> Result<(), VerifyError2> {
-	use UnsupportedKind2 as K;
 	use VerifyError2 as E;
 	match command {
 		Command2::Bootstrap { .. }
@@ -125,15 +137,15 @@ fn kind(command: &Command2) -> Result<(), VerifyError2> {
 		| Command2::Reserve(_)
 		| Command2::Finalize { .. } => Ok(()),
 		Command2::Cover { .. } => Err(E::NotApplicable),
-		Command2::EnrollSelector(_) => Err(E::Unsupported(K::EnrollSelector)),
-		Command2::EnrollAuthority { .. } => Err(E::Unsupported(K::EnrollAuthority)),
-		Command2::RevokeAuthority(_) => Err(E::Unsupported(K::RevokeAuthority)),
-		Command2::EnrollLeaseIssuer { .. } => Err(E::Unsupported(K::EnrollLeaseIssuer)),
-		Command2::RevokeLeaseIssuer { .. } => Err(E::Unsupported(K::RevokeLeaseIssuer)),
-		Command2::Grant { .. } => Err(E::Unsupported(K::Grant)),
-		Command2::Release { .. } => Err(E::Unsupported(K::Release)),
-		Command2::Cut { .. } => Err(E::Unsupported(K::Cut)),
-		Command2::Resolve { .. } => Err(E::Unsupported(K::Resolve)),
+		Command2::EnrollSelector(_)
+		| Command2::EnrollAuthority { .. }
+		| Command2::RevokeAuthority(_)
+		| Command2::EnrollLeaseIssuer { .. }
+		| Command2::RevokeLeaseIssuer { .. }
+		| Command2::Grant { .. }
+		| Command2::Release { .. }
+		| Command2::Cut { .. }
+		| Command2::Resolve { .. } => Ok(()),
 	}
 }
 
@@ -143,6 +155,7 @@ fn verify_command2(
 	pin: &PinnedBoundTuple2,
 	entry: &TrustedEntry2,
 	command: &Command2,
+	governance: Option<&[u8]>,
 ) -> Result<VerifiedCommand2, VerifyError2> {
 	let (g, c, _, _, d) = entry.fields();
 	let (authorized, evidence) = match (command, origin_view2(state)) {
@@ -169,6 +182,18 @@ fn verify_command2(
 			let ok = finalize_authorized(root, identity, *digest, *reservation, attestation, c);
 			(ok, if ok { 1 } else { 2 })
 		}
+		(
+			Command2::EnrollSelector(_)
+			| Command2::EnrollAuthority { .. }
+			| Command2::RevokeAuthority(_)
+			| Command2::Grant { .. }
+			| Command2::Release { .. }
+			| Command2::Cut { .. }
+			| Command2::Resolve { .. }
+			| Command2::EnrollLeaseIssuer { .. }
+			| Command2::RevokeLeaseIssuer { .. },
+			OriginView2::Root,
+		) => (verify_governance2(state, pin, command, governance, d)?, 0),
 		_ => return Err(VerifyError2::StateKind),
 	};
 	Ok(VerifiedCommand2::verified2(

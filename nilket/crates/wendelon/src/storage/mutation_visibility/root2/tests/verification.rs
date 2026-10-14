@@ -730,12 +730,17 @@ fn unsupported_not_applicable_and_precedence() {
 			UnsupportedKind2::Resolve,
 		),
 	];
-	for (cmd, kind) in unsupported {
-		// Even with a mismatched entry digest, the kind refuses first.
+	for (cmd, _legacy_kind) in unsupported {
+		// Historical name retained: S3 now accepts these kinds, so digest refuses before missing sidecar.
 		let (ce, e) = entry_of(g(), c(), &reserve(), 7);
 		assert_eq!(
 			advance_verified2(&s, &tuple(), &ce, &e, &cmd, None).err(),
-			Some(VerifyError2::Unsupported(kind))
+			Some(VerifyError2::DigestMismatch)
+		);
+		let (ce, e) = entry_of(g(), c(), &cmd, 7);
+		assert_eq!(
+			advance_verified2(&s, &tuple(), &ce, &e, &cmd, None).err(),
+			Some(VerifyError2::MissingSidecar)
 		);
 	}
 	let cover = Command2::Cover {

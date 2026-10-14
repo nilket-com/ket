@@ -47,8 +47,8 @@ async fn carrier_structural_context_kind_and_extra_refusals_never_update_durable
 			)),
 			2 => assert!(matches!(
 				result,
-				Err(ReplayError2::Fault(Fault2::Unsupported(
-					UnsupportedKind2::Cut
+				Err(ReplayError2::Fault(Fault2::Verify(
+					VerifyError2::MissingSidecar
 				)))
 			)),
 			3 => assert!(matches!(
