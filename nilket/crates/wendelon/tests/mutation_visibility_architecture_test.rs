@@ -795,6 +795,9 @@ fn admin_items(file: &syn::File) -> Option<Vec<String>> {
 						"BootstrapField2",
 						"ManifestProfile2",
 						"AnyAdminManifest2",
+						"ManifestRole3",
+						"RolePair3",
+						"ReuseField3",
 					]
 					.iter()
 					.any(|n| e.ident == *n)) =>
@@ -813,6 +816,8 @@ fn admin_items(file: &syn::File) -> Option<Vec<String>> {
 						"GovernanceRole2",
 						"AdminManifestTwo2",
 						"ManifestBytes2",
+						"RecoveryRole3",
+						"AdminManifestThree3",
 					]
 					.iter()
 					.any(|n| s.ident == *n)) =>
@@ -898,11 +903,13 @@ fn admin_manifest_math_stays_private_and_has_no_provenance_producer() {
 		entrypoints,
 		[
 			"actions",
+			"actions",
 			"admin_manifest_digest2",
 			"admin_manifest_two_digest2",
 			"admission",
 			"any_manifest_digest2",
 			"as_slice",
+			"base",
 			"base",
 			"check_admin_manifest_digest2",
 			"check_enrollable_admin_key2",
@@ -911,6 +918,8 @@ fn admin_manifest_math_stays_private_and_has_no_provenance_producer() {
 			"decode",
 			"decode",
 			"decode",
+			"decode",
+			"encode",
 			"encode",
 			"encode",
 			"encode",
@@ -918,12 +927,18 @@ fn admin_manifest_math_stays_private_and_has_no_provenance_producer() {
 			"encode",
 			"first_mismatch",
 			"governance",
+			"governance",
 			"id",
+			"id",
+			"key",
 			"key",
 			"manifest_profile2",
 			"new",
 			"new",
-			"profile"
+			"new",
+			"new",
+			"profile",
+			"recovery",
 		]
 	);
 }
@@ -1240,7 +1255,7 @@ fn provisioning_reader_has_two_documented_unsafe_blocks_and_no_trust_access() {
 	for item in decl.items {
 		match item {
 			syn::Item::Mod(m) if m.ident == "tests" => assert!(m.attrs.iter().any(|a| matches!(&a.meta, syn::Meta::List(l) if l.path.is_ident("cfg") && l.tokens.to_string() == "test"))),
-			syn::Item::Mod(m) if m.content.is_none() => children.push(m.ident.to_string()),
+			syn::Item::Mod(m) if m.content.is_none() => { if m.ident=="format" {assert!(matches!(m.vis,syn::Visibility::Inherited));} children.push(m.ident.to_string()); },
 			_ => panic!("provisioning/mod.rs must be declarative"),
 		}
 	}
@@ -1248,6 +1263,7 @@ fn provisioning_reader_has_two_documented_unsafe_blocks_and_no_trust_access() {
 		children,
 		[
 			"anchored",
+			"format",
 			"inventory",
 			"owner_core",
 			"owner_log",
@@ -1445,6 +1461,14 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 						}
 					}
 				}
+				syn::Item::Mod(m)
+					if matches!(name, "inventory.rs" | "owner_core.rs") && m.ident == "v2" =>
+				{
+					assert!(m.content.is_none());
+					assert!(
+						matches!(&m.vis, syn::Visibility::Restricted(v) if v.in_token.is_none() && v.path.is_ident("super"))
+					);
+				}
 				syn::Item::Trait(_) | syn::Item::Static(_) | syn::Item::Mod(_) => {
 					panic!("{name}: no traits, statics or modules")
 				}
@@ -1452,6 +1476,105 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 			}
 		}
 	}
+
+	// Exact new private format surface; retain the same no-I/O/no-trust token bans.
+	for name in ["inventory/v2.rs", "owner_core/v2.rs", "format.rs"] {
+		let text = fs::read_to_string(root.join(name)).unwrap();
+		assert_eq!(
+			banned(text.parse().unwrap()),
+			None,
+			"{name}: prohibited token"
+		);
+		let mut functions = Vec::new();
+		let mut methods = Vec::new();
+		let mut constants = Vec::new();
+		for item in syn::parse_file(&text).unwrap().items {
+			match item {
+				syn::Item::Use(_) => {}
+				syn::Item::Const(c) => {
+					assert!(!matches!(c.vis, syn::Visibility::Public(_)));
+					if !matches!(c.vis, syn::Visibility::Inherited) {
+						constants.push(c.ident.to_string());
+					}
+				}
+				syn::Item::Fn(f) => {
+					assert!(!matches!(f.vis, syn::Visibility::Public(_)));
+					if !matches!(f.vis, syn::Visibility::Inherited) {
+						functions.push(f.sig.ident.to_string());
+					}
+				}
+				syn::Item::Enum(e) if name == "format.rs" && e.ident == "DirectoryFormat2" => {
+					assert!(root2_scoped(&e.vis));
+					assert_eq!(
+						e.variants
+							.iter()
+							.map(|v| v.ident.to_string())
+							.collect::<Vec<_>>(),
+						["One", "Two"]
+					);
+					assert!(e.variants.iter().all(|v| v.fields.is_empty()));
+				}
+				syn::Item::Impl(i) if name == "format.rs" => {
+					assert!(i.trait_.is_none());
+					assert_eq!(quote_type(&i.self_ty), "DirectoryFormat2");
+					for item in i.items {
+						let syn::ImplItem::Fn(f) = item else {
+							panic!("format impl methods only")
+						};
+						assert!(
+							matches!(&f.vis,syn::Visibility::Restricted(v) if v.in_token.is_none()&&v.path.is_ident("super"))
+						);
+						methods.push(f.sig.ident.to_string());
+					}
+				}
+				_ => panic!("{name}: unexpected producer/type/module item"),
+			}
+		}
+		functions.sort();
+		methods.sort();
+		constants.sort();
+		let (f, m, c): (&[&str], &[&str], &[&str]) = match name {
+			"inventory/v2.rs" => (
+				&["decode_event2", "encode_event2", "fold_events2"],
+				&[],
+				&["EVENT_BYTES2", "MAX_LOG_BYTES2", "MAX_TAIL2"],
+			),
+			"owner_core/v2.rs" => (
+				&[
+					"classify2",
+					"decide2",
+					"decode_evidence2",
+					"encode_evidence2",
+					"evidence_name2",
+					"expected_repair_event2",
+					"repair_context2",
+					"repair_op_id2",
+				],
+				&[],
+				&["MAX_EVIDENCE_BYTES2"],
+			),
+			_ => (
+				&[],
+				&[
+					"classify",
+					"context",
+					"decide",
+					"decode_evidence",
+					"encode",
+					"encode_evidence",
+					"expected",
+					"fold",
+					"max_evidence",
+					"max_log",
+				],
+				&[],
+			),
+		};
+		assert_eq!(functions, f, "{name}: free functions");
+		assert_eq!(methods, m, "{name}: methods");
+		assert_eq!(constants, c, "{name}: constants");
+	}
+
 	entrypoints.sort();
 	assert_eq!(
 		entrypoints,
@@ -1493,6 +1616,7 @@ fn provisioning_owner_log_is_std_only_with_nine_methods() {
 		.join("src/storage/mutation_visibility/root2/provisioning");
 	let text = fs::read_to_string(dir.join("owner_log.rs")).unwrap();
 	let ops = fs::read_to_string(dir.join("owner_log/ops.rs")).unwrap();
+	let directory = fs::read_to_string(dir.join("owner_log/directory.rs")).unwrap();
 	fn walk(tokens: proc_macro2::TokenStream, out: &mut Vec<String>) {
 		let ts: Vec<_> = tokens.into_iter().collect();
 		for (i, t) in ts.iter().enumerate() {
@@ -1547,7 +1671,11 @@ fn provisioning_owner_log_is_std_only_with_nine_methods() {
 		}
 	}
 	// Both files, tests included, have no unsafe; the other bans apply to production items.
-	for (name, source) in [("owner_log.rs", &text), ("owner_log/ops.rs", &ops)] {
+	for (name, source) in [
+		("owner_log.rs", &text),
+		("owner_log/ops.rs", &ops),
+		("owner_log/directory.rs", &directory),
+	] {
 		let mut found = Vec::new();
 		walk(source.parse().unwrap(), &mut found);
 		assert!(!found.iter().any(|n| n == "unsafe"), "{name}: unsafe");
@@ -1562,7 +1690,12 @@ fn provisioning_owner_log_is_std_only_with_nine_methods() {
 		})
 	};
 	let mut methods = Vec::new();
-	for item in syn::parse_file(&text).unwrap().items {
+	for item in syn::parse_file(&text)
+		.unwrap()
+		.items
+		.into_iter()
+		.chain(syn::parse_file(&directory).unwrap().items)
+	{
 		match item {
 			syn::Item::Fn(f) if !cfg_test(&f.attrs) => assert!(
 				matches!(f.vis, syn::Visibility::Inherited),
@@ -1576,18 +1709,24 @@ fn provisioning_owner_log_is_std_only_with_nine_methods() {
 					{
 						assert!(i.trait_.is_none(), "trait methods carry no visibility");
 						assert_eq!(quote_type(&i.self_ty), "OwnerDir2");
-						assert!(root2_scoped(&f.vis), "{}", f.sig.ident);
-						methods.push(f.sig.ident.to_string());
+						if f.sig.ident == "check_framing" {
+							assert!(
+								matches!(&f.vis,syn::Visibility::Restricted(v) if v.in_token.is_none() && v.path.is_ident("super"))
+							);
+						} else {
+							assert!(root2_scoped(&f.vis), "{}", f.sig.ident);
+							methods.push(f.sig.ident.to_string());
+						}
 					}
 				}
 			}
 			syn::Item::Trait(t) if !cfg_test(&t.attrs) => panic!("owner_log.rs: trait"),
 			syn::Item::Static(s) if !cfg_test(&s.attrs) => panic!("owner_log.rs: static"),
 			syn::Item::Mod(m) if !cfg_test(&m.attrs) => assert!(
-				m.ident == "ops"
+				(m.ident == "ops" || m.ident == "directory")
 					&& m.content.is_none()
 					&& matches!(m.vis, syn::Visibility::Inherited),
-				"owner_log.rs: only the private `mod ops;`"
+				"owner_log.rs: only private ops/directory children"
 			),
 			syn::Item::Macro(m) if !cfg_test(&m.attrs) => assert!(
 				m.mac.path.is_ident("redacted_debug"),
@@ -1630,6 +1769,7 @@ fn provisioning_owner_log_is_std_only_with_nine_methods() {
 		[
 			"apply",
 			"clear_sync_failure",
+			"create_v2",
 			"export",
 			"export_tuple",
 			"inspect",
@@ -1727,6 +1867,7 @@ fn admin_install_is_a_pure_derivation() {
 			"admin_manifest_len2",
 			"admin_namespace2",
 			"admin_profile2",
+			"admin_recovery3",
 			"install_admin2",
 			"observe_bootstrap2"
 		]
@@ -4272,7 +4413,9 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 			syn::Item::Struct(s)
 				if s.ident == "GovernanceRole2"
 					|| s.ident == "AdminManifestTwo2"
-					|| s.ident == "ManifestBytes2" =>
+					|| s.ident == "ManifestBytes2"
+					|| s.ident == "RecoveryRole3"
+					|| s.ident == "AdminManifestThree3" =>
 			{
 				let fields: Vec<_> = s
 					.fields
@@ -4286,7 +4429,8 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 					})
 					.collect();
 				let want: &[&str] = match s.ident.to_string().as_str() {
-					"GovernanceRole2" => &["id", "key"],
+					"GovernanceRole2" | "RecoveryRole3" => &["id", "key"],
+					"AdminManifestThree3" => &["base", "governance", "recovery"],
 					"AdminManifestTwo2" => &["base", "governance"],
 					_ => &["storage", "len"],
 				};
@@ -4294,7 +4438,7 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 			}
 			syn::Item::Enum(e) if e.ident == "ManifestProfile2" => {
 				let v: Vec<_> = e.variants.iter().map(|v| v.ident.to_string()).collect();
-				assert_eq!(v, ["One", "Two"]);
+				assert_eq!(v, ["One", "Two", "Three"]);
 				assert!(
 					e.variants.iter().all(|v| v.fields.is_empty()),
 					"no role data"
@@ -4317,7 +4461,8 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 					v,
 					[
 						("One".to_string(), "AdminManifest2".to_string()),
-						("Two".to_string(), "AdminManifestTwo2".to_string())
+						("Two".to_string(), "AdminManifestTwo2".to_string()),
+						("Three".to_string(), "AdminManifestThree3".to_string())
 					]
 				);
 			}
@@ -4332,12 +4477,14 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 			("ACTIONS".to_string(), false),
 			("ADMIN_MANIFEST_BYTES2".to_string(), true),
 			("ADMIN_MANIFEST_P2_BYTES2".to_string(), true),
+			("ADMIN_MANIFEST_P3_BYTES3".to_string(), true),
 			("ADMIN_MANIFEST_READ_BOUND2".to_string(), true),
 			("DOMAIN".to_string(), false),
 			("GOVERNANCE_ACTIONS".to_string(), false),
 			("MAGIC".to_string(), false),
 			("PROFILE_ONE".to_string(), false),
-			("PROFILE_TWO".to_string(), false)
+			("PROFILE_TWO".to_string(), false),
+			("RECOVERY_ACTIONS3".to_string(), false)
 		]
 	);
 	// The profile-1 decoder is untouched by profile 2: it never names the new items.
@@ -4357,14 +4504,15 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 		(
 			"provisioning/inventory.rs",
 			&[
-				"ADMIN_MANIFEST_P2_BYTES2",
 				"AdminManifestTwo2",
-				"AnyAdminManifest2",
 				"ManifestProfile2",
-				"any_manifest_digest2",
 				"manifest_profile2",
+				"ADMIN_MANIFEST_P2_BYTES2",
+				"AnyAdminManifest2",
+				"any_manifest_digest2",
 			],
 		),
+		("provisioning/inventory/v2.rs", &["AnyAdminManifest2"]),
 		(
 			"provisioning/owner_core.rs",
 			&[
@@ -4373,30 +4521,40 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 				"any_manifest_digest2",
 			],
 		),
+		("provisioning/owner_core/v2.rs", &["any_manifest_digest2"]),
+		("provisioning/format.rs", &[]),
 		("provisioning/snapshot.rs", &["ManifestProfile2"]),
 		("provisioning/owner_log.rs", &["ManifestProfile2"]),
+		("provisioning/owner_log/ops.rs", &[]),
+		("provisioning/owner_log/directory.rs", &[]),
 		(
 			"provisioning/replica_anchor.rs",
 			&[
+				"admin_manifest_two_digest2",
 				"ADMIN_MANIFEST_P2_BYTES2",
 				"AnyAdminManifest2",
-				"admin_manifest_two_digest2",
+				"ADMIN_MANIFEST_P3_BYTES3",
 			],
 		),
 		(
 			"provisioning/replica_read.rs",
-			&["ADMIN_MANIFEST_P2_BYTES2"],
+			&["ADMIN_MANIFEST_P3_BYTES3"],
 		),
 		(
 			"admin_install.rs",
 			&[
-				"ADMIN_MANIFEST_P2_BYTES2",
-				"AnyAdminManifest2",
 				"GovernanceRole2",
 				"ManifestProfile2",
+				"ADMIN_MANIFEST_P2_BYTES2",
+				"AnyAdminManifest2",
+				"RecoveryRole3",
+				"ADMIN_MANIFEST_P3_BYTES3",
 			],
 		),
-		("validation.rs", &["ADMIN_MANIFEST_P2_BYTES2"]),
+		(
+			"validation.rs",
+			&["ADMIN_MANIFEST_P2_BYTES2", "ADMIN_MANIFEST_P3_BYTES3"],
+		),
 		("governance_command.rs", &[]),
 	];
 	// The one new out-of-line test file is excluded only while its declaration is cfg(test).
@@ -4432,6 +4590,9 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 					"AnyAdminManifest2",
 					"ManifestBytes2",
 					"any_manifest_digest2",
+					"AdminManifestThree3",
+					"RecoveryRole3",
+					"ADMIN_MANIFEST_P3_BYTES3",
 				] {
 					assert_eq!(
 						t.contains(name),
@@ -4542,7 +4703,9 @@ fn profile_two_binding_surface_is_exact() {
 			"admin_id",
 			"admin_key",
 			"namespace",
-			"governance"
+			"governance",
+			"profile",
+			"recovery"
 		]
 	);
 	let anchor = fs::read_to_string(root.join("provisioning/replica_anchor.rs")).unwrap();

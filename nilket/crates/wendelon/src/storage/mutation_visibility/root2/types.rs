@@ -27,6 +27,7 @@ pub enum RootError2 {
 	TrustMismatch,
 	LineageGap,
 	RootInvariant,
+	ControlClass,
 }
 pub type Result2<T> = Result<T, RootError2>;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

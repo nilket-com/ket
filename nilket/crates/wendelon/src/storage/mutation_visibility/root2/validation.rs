@@ -1,4 +1,6 @@
-use super::admin::manifest::{ADMIN_MANIFEST_BYTES2, ADMIN_MANIFEST_P2_BYTES2};
+use super::admin::manifest::{
+	ADMIN_MANIFEST_BYTES2, ADMIN_MANIFEST_P2_BYTES2, ADMIN_MANIFEST_P3_BYTES3,
+};
 use super::admin_statement::{AdmissionNamespace2, PermissionKey2};
 use super::admission_registry::{
 	PERMISSION_CHARGE2, PERMISSION_SECTION_BYTES2, RegistryError2, encode_permission_key2,
@@ -258,9 +260,7 @@ pub(super) fn admission_permission(
 	c: &ClaimProjection2,
 	at: u64,
 ) -> Result2<Option<(u16, Option<Log2>)>> {
-	if s.control_len != ADMIN_MANIFEST_BYTES2 as u64
-		&& s.control_len != ADMIN_MANIFEST_P2_BYTES2 as u64
-	{
+	if admin_class_of(s)? == AdminClass2::LegacyNonManifestZero {
 		return Ok(None);
 	}
 	let id = c.manifest.identity;
@@ -383,6 +383,7 @@ pub(super) fn trigger(
 	Ok(candidates.first().copied())
 }
 pub(super) fn validate_state(s: &State2) -> Result2<()> {
+	admin_class_of(s)?;
 	nonzero(s.generation)?;
 	nonzero(s.cluster)?;
 	valid_log(s.bootstrap)?;
@@ -708,4 +709,22 @@ pub(super) fn validate_state(s: &State2) -> Result2<()> {
 		return Err(RootError2::Limit);
 	}
 	Ok(())
+}
+
+/// Immutable state marker only; full tag/manifest/pin eligibility is checked at install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AdminClass2 {
+	LegacyNonManifestZero,
+	One,
+	Two,
+	Three,
+}
+pub(super) fn admin_class_of(s: &State2) -> Result2<AdminClass2> {
+	match s.control_len {
+		0 => Ok(AdminClass2::LegacyNonManifestZero),
+		n if n == ADMIN_MANIFEST_BYTES2 as u64 => Ok(AdminClass2::One),
+		n if n == ADMIN_MANIFEST_P2_BYTES2 as u64 => Ok(AdminClass2::Two),
+		n if n == ADMIN_MANIFEST_P3_BYTES3 as u64 => Ok(AdminClass2::Three),
+		_ => Err(RootError2::ControlClass),
+	}
 }

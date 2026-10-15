@@ -322,7 +322,7 @@ fn bootstrap_authorized_only_by_exact_pin() {
 		("cluster", mg, [0x5b; 16], governed(0, None, 137), none),
 		("initial_epoch", mg, mc, governed(1, None, 137), none),
 		("control", mg, mc, governed(0, Some([0x55; 32]), 137), none),
-		("length", mg, mc, governed(0, None, 136), none),
+		("length", mg, mc, governed(0, None, 189), none),
 		("bootstrap", mg, mc, governed(0, None, 137), |r| {
 			r.identity.bootstrap = l(3)
 		}),

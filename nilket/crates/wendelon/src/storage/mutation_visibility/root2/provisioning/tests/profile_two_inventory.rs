@@ -216,7 +216,36 @@ fn snapshot_v2_tags_and_canonical_version() {
 	);
 	let errors = p2_errors("snapshot_errors");
 	assert_eq!(errors.len(), 19);
+	let v3_names: std::collections::BTreeSet<_> = errors
+		.iter()
+		.filter(|(_, bytes, _)| u16::from_le_bytes([bytes[8], bytes[9]]) == 3)
+		.map(|(name, _, _)| name.as_str())
+		.collect();
+	assert_eq!(
+		v3_names,
+		std::collections::BTreeSet::from(["v3", "v3_bad_trailer"])
+	);
 	for (name, b, want) in errors {
+		if name == "v3" {
+			// C-S4a: the same frozen bytes are readable v3 framing, but lack a Three.
+			assert_eq!(
+				decode_snapshot2(&b).err(),
+				Some(SnapshotError2::NotCanonical)
+			);
+			assert_eq!(
+				super::profile_three::old_v2_snapshot::roundtrip(&b).err(),
+				Some(super::profile_three::old_v2_snapshot::SnapshotError2::Version)
+			);
+			continue;
+		}
+		if name == "v3_bad_trailer" {
+			assert_eq!(decode_snapshot2(&b).err(), Some(SnapshotError2::Trailer));
+			assert_eq!(
+				super::profile_three::old_v2_snapshot::roundtrip(&b).err(),
+				Some(super::profile_three::old_v2_snapshot::SnapshotError2::Version)
+			);
+			continue;
+		}
 		match want {
 			Some(want) => assert_eq!(
 				decode_snapshot2(&b).err(),

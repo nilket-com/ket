@@ -254,8 +254,9 @@ fn observe_refusals() {
 		observe_bootstrap2(&Boot::standard().pre_root()).err(),
 		Some(ObserveError2::PrerequisiteUnavailable)
 	);
+	// Legacy zero is a valid raw-math class but never an installable manifest.
 	let short = Boot {
-		length: 136,
+		length: 0,
 		..Boot::standard()
 	}
 	.rooted();

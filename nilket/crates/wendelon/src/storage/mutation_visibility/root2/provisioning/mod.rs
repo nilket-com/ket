@@ -3,6 +3,7 @@
 //! I/O layer over one trusted owner directory, and pure validation of a replica's pinned tuple. No
 //! config, readiness or trusted output is produced here.
 pub mod anchored;
+mod format;
 pub mod inventory;
 pub mod owner_core;
 pub mod owner_log;

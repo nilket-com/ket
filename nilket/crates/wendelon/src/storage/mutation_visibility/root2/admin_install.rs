@@ -6,8 +6,8 @@
 //! authorizes anything in another root.
 use super::admin::errors::BootstrapRecordError2;
 use super::admin::manifest::{
-	ADMIN_MANIFEST_BYTES2, ADMIN_MANIFEST_P2_BYTES2, AdminNamespace2, AnyAdminManifest2,
-	GovernanceRole2, ManifestProfile2,
+	ADMIN_MANIFEST_BYTES2, ADMIN_MANIFEST_P2_BYTES2, ADMIN_MANIFEST_P3_BYTES3, AdminNamespace2,
+	AnyAdminManifest2, GovernanceRole2, ManifestProfile2, RecoveryRole3,
 };
 use super::admin::record::{BootstrapIdentity2, BootstrapObservation2};
 use super::origin::{MutationAuthorityState2, root_and_origin2};
@@ -23,9 +23,10 @@ pub(in crate::storage::mutation_visibility::root2) struct InstalledAdmin2 {
 	admin_id: [u8; 16],
 	admin_key: [u8; 32],
 	namespace: AdminNamespace2,
-	// Some iff the installed manifest is profile 2: the profile and the canonical length are
-	// derived from this one field. A descriptive copy; nothing here verifies with its key.
+	// Descriptive copied roles; explicit profile fixes the role set and canonical length.
 	governance: Option<GovernanceRole2>,
+	profile: ManifestProfile2,
+	recovery: Option<RecoveryRole3>,
 }
 redacted_debug!(InstalledAdmin2, "InstalledAdmin2");
 /// The exact root, original Bootstrap and genesis an administrator is bound to.
@@ -122,6 +123,7 @@ pub(in crate::storage::mutation_visibility::root2) fn install_admin2(
 	let governance = match any {
 		AnyAdminManifest2::One(_) => None,
 		AnyAdminManifest2::Two(m) => Some(m.governance()),
+		AnyAdminManifest2::Three(m) => Some(m.governance()),
 	};
 	Ok(InstalledAdmin2 {
 		context: AdminContext2 {
@@ -138,6 +140,11 @@ pub(in crate::storage::mutation_visibility::root2) fn install_admin2(
 		admin_key: manifest.admin_key,
 		namespace: manifest.namespace,
 		governance,
+		profile: any.profile(),
+		recovery: match any {
+			AnyAdminManifest2::Three(m) => Some(m.recovery()),
+			_ => None,
+		},
 	})
 }
 pub(in crate::storage::mutation_visibility::root2) fn admin_context2(
@@ -170,18 +177,16 @@ pub(in crate::storage::mutation_visibility::root2) fn admin_governance2(
 pub(in crate::storage::mutation_visibility::root2) fn admin_profile2(
 	a: &InstalledAdmin2,
 ) -> ManifestProfile2 {
-	match a.governance {
-		Some(_) => ManifestProfile2::Two,
-		None => ManifestProfile2::One,
-	}
+	a.profile
 }
 /// The installed manifest's canonical length, which `install_admin2` bound to `control_len`.
 pub(in crate::storage::mutation_visibility::root2) fn admin_manifest_len2(
 	a: &InstalledAdmin2,
 ) -> u64 {
-	match a.governance {
-		Some(_) => ADMIN_MANIFEST_P2_BYTES2 as u64,
-		None => ADMIN_MANIFEST_BYTES2 as u64,
+	match a.profile {
+		ManifestProfile2::One => ADMIN_MANIFEST_BYTES2 as u64,
+		ManifestProfile2::Two => ADMIN_MANIFEST_P2_BYTES2 as u64,
+		ManifestProfile2::Three => ADMIN_MANIFEST_P3_BYTES3 as u64,
 	}
 }
 
@@ -199,6 +204,7 @@ pub(in crate::storage::mutation_visibility::root2) fn observe_bootstrap2(
 	// State-only and descriptive: either canonical length; the exact match is install's and C's.
 	if s.control_len != ADMIN_MANIFEST_BYTES2 as u64
 		&& s.control_len != ADMIN_MANIFEST_P2_BYTES2 as u64
+		&& s.control_len != ADMIN_MANIFEST_P3_BYTES3 as u64
 	{
 		return Err(ObserveError2::ControlLength);
 	}
@@ -216,4 +222,11 @@ pub(in crate::storage::mutation_visibility::root2) fn observe_bootstrap2(
 	};
 	observation.encode().map_err(ObserveError2::Codec)?;
 	Ok(observation)
+}
+
+/// Descriptive inert copy, never a verifier or an executable recovery action.
+pub(in crate::storage::mutation_visibility::root2) fn admin_recovery3(
+	a: &InstalledAdmin2,
+) -> Option<RecoveryRole3> {
+	a.recovery
 }

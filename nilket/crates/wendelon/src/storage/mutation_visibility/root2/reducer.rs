@@ -44,6 +44,7 @@ fn bootstrap_root(
 		parents: Map::new(),
 		derived: Derived2::default(),
 	};
+	admin_class_of(&state)?;
 	state.derived = Derived2::build(&state)?;
 	return Ok((
 		Root2 {
@@ -488,6 +489,7 @@ fn apply_reserve(
 	l: Log2,
 	v: &VerifiedCommand2,
 ) -> Result2<ApplyResult2> {
+	admin_class_of(s)?;
 	valid_claim(c)?;
 	let id = c.manifest.identity;
 	if id.generation != s.generation {

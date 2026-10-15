@@ -1,4 +1,4 @@
-use super::errors::{AdminManifestError2, AdminResult2};
+use super::errors::{AdminManifestError2, AdminResult2, ManifestRole3, ReuseField3, RolePair3};
 use super::key::check_enrollable_admin_key2;
 use crate::storage::mutation_visibility::root2::{codec::hash, types::Digest2};
 use crate::storage::mutation_visibility::{MutationScope, redacted_debug};
@@ -161,6 +161,7 @@ const GOVERNANCE_ACTIONS: u32 = 0x1FF;
 pub(in crate::storage::mutation_visibility::root2) enum ManifestProfile2 {
 	One,
 	Two,
+	Three,
 }
 
 /// The governance role of a profile-2 manifest; its action mask is fixed (`0x1FF`).
@@ -240,6 +241,7 @@ fn profile_of(input: &[u8]) -> AdminResult2<ManifestProfile2> {
 	let expected = match profile {
 		ManifestProfile2::One => ADMIN_MANIFEST_BYTES2,
 		ManifestProfile2::Two => ADMIN_MANIFEST_P2_BYTES2,
+		ManifestProfile2::Three => return Err(AdminManifestError2::UnsupportedProfile),
 	};
 	if input.len() != expected {
 		return Err(AdminManifestError2::ProfileLength);
@@ -356,6 +358,7 @@ pub(in crate::storage::mutation_visibility::root2) fn admin_manifest_two_digest2
 pub(in crate::storage::mutation_visibility::root2) enum AnyAdminManifest2 {
 	One(AdminManifest2),
 	Two(AdminManifestTwo2),
+	Three(AdminManifestThree3),
 }
 redacted_debug!(AnyAdminManifest2, "AnyAdminManifest2");
 
@@ -363,7 +366,7 @@ redacted_debug!(AnyAdminManifest2, "AnyAdminManifest2");
 /// bytes beyond `len` are always zero, so the derived equality is exact-byte equality.
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) struct ManifestBytes2 {
-	storage: [u8; ADMIN_MANIFEST_P2_BYTES2],
+	storage: [u8; ADMIN_MANIFEST_P3_BYTES3],
 	len: usize,
 }
 redacted_debug!(ManifestBytes2, "ManifestBytes2");
@@ -378,24 +381,29 @@ impl AnyAdminManifest2 {
 	pub(in crate::storage::mutation_visibility::root2) fn decode(
 		input: &[u8],
 	) -> AdminResult2<Self> {
-		Ok(match profile_of(input)? {
+		Ok(match profile_of_three(input)? {
 			ManifestProfile2::One => Self::One(AdminManifest2::decode(input)?),
 			ManifestProfile2::Two => Self::Two(AdminManifestTwo2::decode(input)?),
+			ManifestProfile2::Three => Self::Three(AdminManifestThree3::decode(input)?),
 		})
 	}
 	/// Revalidates the selected profile through its own encoder.
 	pub(in crate::storage::mutation_visibility::root2) fn encode(
 		&self,
 	) -> AdminResult2<ManifestBytes2> {
-		let mut storage = [0u8; ADMIN_MANIFEST_P2_BYTES2];
+		let mut storage = [0u8; ADMIN_MANIFEST_P3_BYTES3];
 		let len = match self {
 			Self::One(m) => {
 				storage[..ADMIN_MANIFEST_BYTES2].copy_from_slice(&m.encode()?);
 				ADMIN_MANIFEST_BYTES2
 			}
 			Self::Two(m) => {
-				storage.copy_from_slice(&m.encode()?);
+				storage[..ADMIN_MANIFEST_P2_BYTES2].copy_from_slice(&m.encode()?);
 				ADMIN_MANIFEST_P2_BYTES2
+			}
+			Self::Three(m) => {
+				storage.copy_from_slice(&m.encode()?);
+				ADMIN_MANIFEST_P3_BYTES3
 			}
 		};
 		Ok(ManifestBytes2 { storage, len })
@@ -404,6 +412,7 @@ impl AnyAdminManifest2 {
 		match self {
 			Self::One(_) => ManifestProfile2::One,
 			Self::Two(_) => ManifestProfile2::Two,
+			Self::Three(_) => ManifestProfile2::Three,
 		}
 	}
 	/// The Admission fields, descriptive only: never a whole-manifest pin or request identity.
@@ -411,6 +420,7 @@ impl AnyAdminManifest2 {
 		match self {
 			Self::One(m) => m,
 			Self::Two(m) => m.base(),
+			Self::Three(m) => m.base(),
 		}
 	}
 }
@@ -420,4 +430,226 @@ pub(in crate::storage::mutation_visibility::root2) fn any_manifest_digest2(
 	bytes: &ManifestBytes2,
 ) -> Digest2 {
 	hash(DOMAIN, bytes.as_slice())
+}
+
+// Profile 3 is additive: the profile-1/2 decoders and structural peek retain their exact errors.
+pub(in crate::storage::mutation_visibility::root2) const ADMIN_MANIFEST_P3_BYTES3: usize = 241;
+const RECOVERY_ACTIONS3: u32 = 0x1F;
+// Reserved inert bits: Freeze=1, Unfreeze=2, RotateAdmin=4, RotateGovernance=8, RetireRoot=16.
+// This format slice executes none of them. Unfreeze requires a later operator decision.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) struct RecoveryRole3 {
+	id: [u8; 16],
+	key: [u8; 32],
+}
+redacted_debug!(RecoveryRole3, "RecoveryRole3");
+impl RecoveryRole3 {
+	pub(in crate::storage::mutation_visibility::root2) fn new(
+		id: [u8; 16],
+		key: [u8; 32],
+	) -> AdminResult2<Self> {
+		if id == [0; 16] {
+			return Err(AdminManifestError2::ZeroField);
+		}
+		check_enrollable_admin_key2(&key)
+			.map_err(|_| AdminManifestError2::KeyThree(ManifestRole3::Recovery))?;
+		Ok(Self { id, key })
+	}
+	pub(in crate::storage::mutation_visibility::root2) fn id(&self) -> [u8; 16] {
+		self.id
+	}
+	pub(in crate::storage::mutation_visibility::root2) fn key(&self) -> [u8; 32] {
+		self.key
+	}
+	pub(in crate::storage::mutation_visibility::root2) fn actions(&self) -> u32 {
+		RECOVERY_ACTIONS3
+	}
+}
+#[derive(Clone, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) struct AdminManifestThree3 {
+	base: AdminManifest2,
+	governance: GovernanceRole2,
+	recovery: RecoveryRole3,
+}
+redacted_debug!(AdminManifestThree3, "AdminManifestThree3");
+fn profile_of_three(input: &[u8]) -> AdminResult2<ManifestProfile2> {
+	if input.len() > ADMIN_MANIFEST_READ_BOUND2 {
+		return Err(AdminManifestError2::OverReadBound);
+	}
+	if !matches!(
+		input.len(),
+		ADMIN_MANIFEST_BYTES2 | ADMIN_MANIFEST_P2_BYTES2 | ADMIN_MANIFEST_P3_BYTES3
+	) {
+		return Err(AdminManifestError2::Length);
+	}
+	if &input[..8] != MAGIC {
+		return Err(AdminManifestError2::Magic);
+	}
+	if u16::from_le_bytes(array(input, 8)) != 1 {
+		return Err(AdminManifestError2::UnsupportedFormat);
+	}
+	let (profile, len) = match u16::from_le_bytes(array(input, 10)) {
+		1 => (ManifestProfile2::One, ADMIN_MANIFEST_BYTES2),
+		2 => (ManifestProfile2::Two, ADMIN_MANIFEST_P2_BYTES2),
+		3 => (ManifestProfile2::Three, ADMIN_MANIFEST_P3_BYTES3),
+		_ => return Err(AdminManifestError2::UnsupportedProfile),
+	};
+	if input.len() != len {
+		return Err(AdminManifestError2::ProfileLength);
+	}
+	Ok(profile)
+}
+fn check_three(m: &AdminManifestThree3) -> AdminResult2<()> {
+	let b = &m.base;
+	if b.generation == [0; 16]
+		|| b.cluster == [0; 16]
+		|| b.initial_epoch == 0
+		|| b.admin_id == [0; 16]
+		|| m.governance.id == [0; 16]
+		|| m.recovery.id == [0; 16]
+	{
+		return Err(AdminManifestError2::ZeroField);
+	}
+	check_fields(b)?;
+	for (pair, aid, ak, bid, bk) in [
+		(
+			RolePair3::AdminGovernance,
+			b.admin_id,
+			b.admin_key,
+			m.governance.id,
+			m.governance.key,
+		),
+		(
+			RolePair3::AdminRecovery,
+			b.admin_id,
+			b.admin_key,
+			m.recovery.id,
+			m.recovery.key,
+		),
+		(
+			RolePair3::GovernanceRecovery,
+			m.governance.id,
+			m.governance.key,
+			m.recovery.id,
+			m.recovery.key,
+		),
+	] {
+		if aid == bid {
+			return Err(AdminManifestError2::ReuseThree {
+				pair,
+				field: ReuseField3::Id,
+			});
+		}
+		if ak == bk {
+			return Err(AdminManifestError2::ReuseThree {
+				pair,
+				field: ReuseField3::Key,
+			});
+		}
+	}
+	for (role, key) in [
+		(ManifestRole3::Admin, b.admin_key),
+		(ManifestRole3::Governance, m.governance.key),
+		(ManifestRole3::Recovery, m.recovery.key),
+	] {
+		check_enrollable_admin_key2(&key).map_err(|_| AdminManifestError2::KeyThree(role))?;
+	}
+	Ok(())
+}
+impl AdminManifestThree3 {
+	pub(in crate::storage::mutation_visibility::root2) fn new(
+		base: AdminManifest2,
+		governance: GovernanceRole2,
+		recovery: RecoveryRole3,
+	) -> AdminResult2<Self> {
+		let m = Self {
+			base,
+			governance,
+			recovery,
+		};
+		check_three(&m)?;
+		Ok(m)
+	}
+	pub(in crate::storage::mutation_visibility::root2) fn base(&self) -> &AdminManifest2 {
+		&self.base
+	}
+	pub(in crate::storage::mutation_visibility::root2) fn governance(&self) -> GovernanceRole2 {
+		self.governance
+	}
+	pub(in crate::storage::mutation_visibility::root2) fn recovery(&self) -> RecoveryRole3 {
+		self.recovery
+	}
+	pub(in crate::storage::mutation_visibility::root2) fn decode(
+		input: &[u8],
+	) -> AdminResult2<Self> {
+		if profile_of_three(input)? != ManifestProfile2::Three {
+			return Err(AdminManifestError2::UnsupportedProfile);
+		}
+		if array::<16>(input, 12) == [0; 16]
+			|| array::<16>(input, 28) == [0; 16]
+			|| u64_at(input, 44) == 0
+			|| array::<16>(input, 52) == [0; 16]
+			|| array::<16>(input, 137) == [0; 16]
+			|| array::<16>(input, 189) == [0; 16]
+		{
+			return Err(AdminManifestError2::ZeroField);
+		}
+		for (at, mask, role) in [
+			(100, ACTIONS, ManifestRole3::Admin),
+			(185, GOVERNANCE_ACTIONS, ManifestRole3::Governance),
+			(237, RECOVERY_ACTIONS3, ManifestRole3::Recovery),
+		] {
+			if u32::from_le_bytes(array(input, at)) != mask {
+				return Err(AdminManifestError2::ActionThree(role));
+			}
+		}
+		let scope = match input[112] {
+			0 => MutationScope::Raw,
+			1 => MutationScope::Table,
+			_ => return Err(AdminManifestError2::Namespace),
+		};
+		let m = Self {
+			base: AdminManifest2 {
+				generation: array(input, 12),
+				cluster: array(input, 28),
+				initial_epoch: u64_at(input, 44),
+				admin_id: array(input, 52),
+				admin_key: array(input, 68),
+				namespace: AdminNamespace2 {
+					tenant: u64_at(input, 104),
+					scope,
+					table: array(input, 113),
+					schema: u64_at(input, 129),
+				},
+			},
+			governance: GovernanceRole2 {
+				id: array(input, 137),
+				key: array(input, 153),
+			},
+			recovery: RecoveryRole3 {
+				id: array(input, 189),
+				key: array(input, 205),
+			},
+		};
+		check_three(&m)?;
+		if m.encode()?[..] != *input {
+			return Err(AdminManifestError2::NotCanonical);
+		}
+		Ok(m)
+	}
+	pub(in crate::storage::mutation_visibility::root2) fn encode(
+		&self,
+	) -> AdminResult2<[u8; ADMIN_MANIFEST_P3_BYTES3]> {
+		check_three(self)?;
+		let mut b = [0; ADMIN_MANIFEST_P3_BYTES3];
+		b[..137].copy_from_slice(&self.base.encode()?);
+		b[10..12].copy_from_slice(&3u16.to_le_bytes());
+		b[137..153].copy_from_slice(&self.governance.id);
+		b[153..185].copy_from_slice(&self.governance.key);
+		b[185..189].copy_from_slice(&GOVERNANCE_ACTIONS.to_le_bytes());
+		b[189..205].copy_from_slice(&self.recovery.id);
+		b[205..237].copy_from_slice(&self.recovery.key);
+		b[237..241].copy_from_slice(&RECOVERY_ACTIONS3.to_le_bytes());
+		Ok(b)
+	}
 }

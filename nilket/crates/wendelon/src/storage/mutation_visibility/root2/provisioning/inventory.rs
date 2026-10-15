@@ -100,6 +100,7 @@ pub(in crate::storage::mutation_visibility::root2) enum CorruptReason2 {
 	ZeroOpId,
 	Header,
 	Payload,
+	ProfileUnsupported,
 	Sequence,
 	DuplicateOpId,
 	IdentityTaken,
@@ -142,6 +143,14 @@ pub(in crate::storage::mutation_visibility::root2) fn encode_event2(
 	event: &Event2,
 ) -> Result<[u8; EVENT_BYTES2], LogError2> {
 	let bad = |r| corrupt(event.seq, r);
+	if matches!(
+		&event.body,
+		EventBody2::Reserve {
+			manifest: AnyAdminManifest2::Three(_)
+		}
+	) {
+		return Err(bad(CorruptReason2::ProfileUnsupported));
+	}
 	let mut b = [0u8; EVENT_BYTES2];
 	b[0..8].copy_from_slice(MAGIC);
 	let version = match &event.body {
@@ -282,7 +291,8 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_event2(
 			}
 			match manifest_profile2(m) {
 				Ok(ManifestProfile2::Two) => {}
-				Ok(ManifestProfile2::One) | Err(AdminManifestError2::ProfileLength) => {
+				Ok(ManifestProfile2::One | ManifestProfile2::Three)
+				| Err(AdminManifestError2::ProfileLength) => {
 					return Err(bad(CorruptReason2::Version));
 				}
 				Err(_) => return Err(bad(CorruptReason2::Payload)),
@@ -509,3 +519,5 @@ pub(in crate::storage::mutation_visibility::root2) fn fold_events2(
 	}
 	Ok(state)
 }
+
+pub(super) mod v2;

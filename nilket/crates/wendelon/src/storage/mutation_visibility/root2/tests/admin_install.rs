@@ -226,7 +226,7 @@ fn each_refusal_is_reached_with_every_earlier_check_equal() {
 	);
 	assert_eq!(
 		refuse(Boot {
-			length: 136,
+			length: 189,
 			..Boot::standard()
 		}),
 		Some(InstallError2::Commitment(CommitmentField2::ControlLength))

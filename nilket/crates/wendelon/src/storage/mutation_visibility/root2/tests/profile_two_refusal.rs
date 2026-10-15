@@ -78,14 +78,32 @@ fn install_length_is_isolated_on_two_coherent_chains() {
 /// Observe stays state-only and descriptive: either canonical length, nothing else.
 #[test]
 fn observe_accepts_exactly_the_two_canonical_lengths() {
+	// Frozen historical name: C-S4a adds Three and moves unknown classes before rooting.
 	let bytes = manifest_bytes("a");
-	for length in [137, 189] {
+	for length in [137, 189, 241] {
 		assert!(observe_bootstrap2(&rooted(&bytes, length).3).is_ok());
 	}
+	assert_eq!(
+		observe_bootstrap2(&rooted(&bytes, 0).3).err(),
+		Some(ObserveError2::ControlLength)
+	);
+	let original = root("root_bootstrap_only");
+	let (g, c) = (original.state.generation, original.state.cluster);
 	for length in [136, 138, 188, 190] {
+		let mut cmd = Command2::Bootstrap {
+			epoch: 1,
+			control: [7; 32],
+			length: 137,
+		};
+		let Command2::Bootstrap { length: field, .. } = &mut cmd else {
+			unreachable!()
+		};
+		*field = length;
+		let e = TrustedEntry2::fixture(g, c, l(1), &cmd).unwrap();
+		let v = VerifiedCommand2::fixture(g, c, &cmd, &[], 0).unwrap();
 		assert_eq!(
-			observe_bootstrap2(&rooted(&bytes, length).3).err(),
-			Some(ObserveError2::ControlLength),
+			Root2::reduce(None, &e, &v, &cmd).err(),
+			Some(RootError2::ControlClass),
 			"{length}"
 		);
 	}
