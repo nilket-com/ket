@@ -63,6 +63,10 @@ pub enum Command2 {
 	/// The exact signed administrator statement. Dormant: `Root2::reduce` refuses it until the
 	/// issuer gate exists.
 	AdmissionPermission([u8; ADMIN_STATEMENT_BYTES2]),
+	RotateAdmin(Digest2),
+	RotateGovernance(Digest2),
+	RotateRecovery(Digest2),
+	EpochAdmissionPermission([u8; super::admin_statement::EPOCH_STATEMENT_BYTES3]),
 }
 impl std::fmt::Debug for Command2 {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -225,6 +229,24 @@ impl Wire2 for Command2 {
 				b.push(13);
 				b.extend(node.to_le_bytes());
 			}
+			Self::RotateAdmin(key) => {
+				b.push(14);
+				b.extend(key);
+			}
+			Self::RotateGovernance(key) => {
+				b.push(15);
+				b.extend(key);
+			}
+			Self::RotateRecovery(key) => {
+				b.push(16);
+				b.extend(key);
+			}
+			Self::EpochAdmissionPermission(x) => {
+				super::admin_statement::inspect_epoch_statement3(x)
+					.map_err(|_| RootError2::Codec)?;
+				b.push(17);
+				b.extend(x);
+			}
 			Self::AdmissionPermission(x) => {
 				inspect_admin_statement2(x).map_err(|_| RootError2::Codec)?;
 				b.push(11);
@@ -338,14 +360,30 @@ impl Wire2 for Command2 {
 				valid_issuer_node(node)?;
 				Self::RevokeLeaseIssuer { node }
 			}
+			14 => Self::RotateAdmin(r.array()?),
+			15 => Self::RotateGovernance(r.array()?),
+			16 => Self::RotateRecovery(r.array()?),
+			17 => {
+				let x = r.array()?;
+				super::admin_statement::inspect_epoch_statement3(&x)
+					.map_err(|_| RootError2::Codec)?;
+				Self::EpochAdmissionPermission(x)
+			}
 			_ => return Err(RootError2::Codec),
 		})
 	}
 }
 // The carried statement's context and key namespace must name the envelope's generation/cluster.
 fn admission_relation(c: &Command2, g: [u8; 16], cluster: [u8; 16]) -> Result2<()> {
-	if let Command2::AdmissionPermission(x) = c {
-		let f = inspect_admin_statement2(x).map_err(|_| RootError2::Codec)?;
+	let facts = match c {
+		Command2::AdmissionPermission(x) => Some(inspect_admin_statement2(x)),
+		Command2::EpochAdmissionPermission(x) => {
+			Some(super::admin_statement::inspect_epoch_statement3(x))
+		}
+		_ => None,
+	};
+	if let Some(f) = facts {
+		let f = f.map_err(|_| RootError2::Codec)?;
 		if f.generation != g || f.cluster != cluster || f.key.namespace.generation != g {
 			return Err(RootError2::Codec);
 		}
@@ -407,7 +445,7 @@ fn result_relation(v: &ApplyResult2, g: [u8; 16], p: Log2) -> Result2<()> {
 // Denied reasons 1..=19; 18 (no permission) carries no reference, 19 (revoked) carries one.
 fn denied_shape(reason: u16, reference: Option<Log2>) -> Result2<()> {
 	let shaped = match reason {
-		18 => reference.is_none(),
+		18 | 20..=22 => reference.is_none(),
 		19 => reference.is_some(),
 		1..=17 => true,
 		_ => false,
@@ -589,7 +627,7 @@ impl Wire2 for ApplyResult2 {
 			}
 			6 => {
 				let reason = r.u16()?;
-				if !(1..=19).contains(&reason) {
+				if !(1..=22).contains(&reason) {
 					return Err(RootError2::Codec);
 				}
 				let reference = r.optional_log()?;

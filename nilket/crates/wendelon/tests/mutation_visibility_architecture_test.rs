@@ -251,7 +251,8 @@ fn s1_private_trust_tokens_and_fake_install_are_test_only() {
 									|| f.sig.ident == "matches" || f.sig.ident == "authorized"
 									|| f.sig.ident == "historical"
 									|| f.sig.ident == "evidence"
-									|| f.sig.ident == "entry_fields",
+									|| f.sig.ident == "entry_fields"
+									|| f.sig.ident == "role_seed3",
 								"new factory requires review"
 							);
 						}
@@ -1859,7 +1860,9 @@ fn admin_install_is_a_pure_derivation() {
 	assert_eq!(
 		entrypoints,
 		[
+			"active_role3",
 			"admin_context2",
+			"admin_cut3",
 			"admin_governance2",
 			"admin_id2",
 			"admin_installed_at2",
@@ -1869,7 +1872,8 @@ fn admin_install_is_a_pure_derivation() {
 			"admin_profile2",
 			"admin_recovery3",
 			"install_admin2",
-			"observe_bootstrap2"
+			"observe_bootstrap2",
+			"original_roles3"
 		]
 	);
 }
@@ -2028,16 +2032,24 @@ fn admin_statement_is_pure_authentication() {
 		[
 			"admin_statement_preimage2",
 			"check_admin_statement2",
+			"check_epoch_statement3",
 			"checked_action2",
 			"checked_context2",
 			"checked_key2",
 			"encode_admin_statement2",
-			"inspect_admin_statement2"
+			"epoch_statement_preimage3",
+			"inspect_admin_statement2",
+			"inspect_epoch_statement3"
 		]
 	);
-	// Inspection facts never become a checked statement: the only literal is the declaration plus
-	// the one inside check_admin_statement2.
-	assert_eq!(text.matches("CheckedStatement2 {").count(), 2);
+	// Inspection facts never become checked statements: declaration plus the two strict checkers.
+	assert_eq!(text.matches("CheckedStatement2 {").count(), 3);
+	assert_eq!(
+		fn_body(&text, "check_epoch_statement3")
+			.matches("CheckedStatement2 {")
+			.count(),
+		1
+	);
 	let check = text.split("fn check_admin_statement2(").nth(1).unwrap();
 	let check = check.split("\npub(in").next().unwrap();
 	assert_eq!(check.matches("CheckedStatement2 {").count(), 1);
@@ -2239,18 +2251,29 @@ fn admission_dispatch_fails_closed() {
 	)
 	.unwrap();
 	assert_eq!(reducer.matches("Command2::AdmissionPermission").count(), 2);
-	let gate = reducer
-		.find("if let Command2::AdmissionPermission(_) = command {")
-		.unwrap();
+	assert_eq!(
+		reducer
+			.matches("Command2::EpochAdmissionPermission")
+			.count(),
+		2
+	);
+	let compact = reducer.replace(char::is_whitespace, "");
+	let predicate = "ifmatches!(command,Command2::AdmissionPermission(_)|Command2::EpochAdmissionPermission(_))";
+	assert_eq!(compact.matches(predicate).count(), 1);
+	assert!(compact.contains(&format!(
+		"{predicate}{{returnErr(RootError2::TrustMismatch);}}"
+	)));
+	let gate = reducer.find("if matches!(").unwrap();
 	let replay = reducer.find("if l.index == s.covered.index {").unwrap();
 	let gap = reducer.find("LineageGap").unwrap();
 	let authorized = reducer
 		.find("let result = if verified.authorized()")
 		.unwrap();
 	assert!(gate < replay && gate < gap && gate < authorized);
-	for (at, _) in reducer.match_indices("Command2::AdmissionPermission") {
-		let tail = &reducer[at..(at + 120).min(reducer.len())];
-		assert!(tail.contains("Err(RootError2::TrustMismatch)"), "{tail}");
+	for variant in ["AdmissionPermission", "EpochAdmissionPermission"] {
+		assert!(compact.contains(&format!(
+			"Command2::{variant}(_)=>Err(RootError2::TrustMismatch)"
+		)));
 	}
 	let incremental = fs::read_to_string(
 		PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2307,6 +2330,14 @@ fn admission_gate_call_graph_is_single_and_dormant() {
 	assert_eq!(calls(&gate, "apply_admission"), 1);
 	assert_eq!(calls(reduce, "apply_admission"), 1);
 	assert_eq!(calls(&gate, "check_admin_statement2"), 1);
+	assert_eq!(calls(&gate, "check_epoch_statement3"), 1);
+	assert!(
+		reduce.find("check_epoch_statement3(").unwrap() < reduce.find("apply_admission(").unwrap()
+	);
+	assert!(
+		reduce.find("admin_cut3(admin)").unwrap()
+			< reduce.find("if l.index == s.covered.index").unwrap()
+	);
 	assert!(
 		reduce.find("check_admin_statement2(").unwrap() < reduce.find("apply_admission(").unwrap()
 	);
@@ -3753,7 +3784,7 @@ fn command_verification_is_single_site_and_unwired() {
 	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
 	let root = src.join("storage/mutation_visibility/root2");
 	let text = fs::read_to_string(root.join("verification.rs")).unwrap();
-	assert!(text.lines().count() <= 300);
+	assert!(text.lines().count() <= 350);
 	let flat = without_test_items_deep(text.parse().unwrap())
 		.to_string()
 		.replace(' ', "");
@@ -3864,8 +3895,19 @@ fn command_verification_is_single_site_and_unwired() {
 		.iter()
 		.map(|s| s.to_string())
 		.collect::<Vec<_>>();
-	expected
-		.extend(["Bootstrap", "AdmissionPermission", "Reserve", "Finalize"].map(str::to_string));
+	expected.extend(
+		[
+			"Bootstrap",
+			"AdmissionPermission",
+			"Reserve",
+			"Finalize",
+			"RotateAdmin",
+			"RotateGovernance",
+			"RotateRecovery",
+			"EpochAdmissionPermission",
+		]
+		.map(str::to_string),
+	);
 	expected.sort();
 	accepted.sort();
 	assert_eq!(accepted, expected);
@@ -4021,8 +4063,12 @@ fn command_verification_is_single_site_and_unwired() {
 					"AdmissionPermission",
 					"Bootstrap",
 					"Cover",
+					"EpochAdmissionPermission",
 					"Finalize",
-					"Reserve"
+					"Reserve",
+					"RotateAdmin",
+					"RotateGovernance",
+					"RotateRecovery"
 				]
 			);
 		}
@@ -4116,6 +4162,7 @@ fn command_verification_is_single_site_and_unwired() {
 							"MissingSidecar",
 							"SidecarLength",
 							"Governance",
+							"Role",
 							"Install",
 							"IssuerPayload",
 							"Unsupported",
@@ -4128,9 +4175,15 @@ fn command_verification_is_single_site_and_unwired() {
 					);
 					for (variant, ty) in [
 						("Governance", "GovernanceCommandError2"),
+						("Role", "RoleProofError3"),
 						("Install", "InstallError2"),
 					] {
 						let v = e.variants.iter().find(|v| v.ident == variant).unwrap();
+						if variant == "Role" {
+							assert!(
+								matches!(&v.fields, syn::Fields::Unnamed(f) if matches!(&f.unnamed[0].ty, syn::Type::Path(t) if exact_path(&t.path, &["super", "role_command", "RoleProofError3"])))
+							);
+						}
 						assert!(
 							matches!(&v.fields, syn::Fields::Unnamed(f) if f.unnamed.len()==1 && quote_type(&f.unnamed.first().unwrap().ty)==ty)
 						);
@@ -4556,6 +4609,8 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 			&["ADMIN_MANIFEST_P2_BYTES2", "ADMIN_MANIFEST_P3_BYTES3"],
 		),
 		("governance_command.rs", &[]),
+		("role_epochs.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
+		("role_command.rs", &["ManifestProfile2"]),
 	];
 	// The one new out-of-line test file is excluded only while its declaration is cfg(test).
 	let replay = syn::parse_file(&fs::read_to_string(root.join("replay.rs")).unwrap()).unwrap();
@@ -4705,7 +4760,9 @@ fn profile_two_binding_surface_is_exact() {
 			"namespace",
 			"governance",
 			"profile",
-			"recovery"
+			"recovery",
+			"active",
+			"cut"
 		]
 	);
 	let anchor = fs::read_to_string(root.join("provisioning/replica_anchor.rs")).unwrap();
@@ -4738,8 +4795,21 @@ fn profile_two_binding_surface_is_exact() {
 	assert_eq!(governance.matches("admin_governance2(admin)").count(), 1);
 	assert_eq!(governance.matches("role.key()").count(), 1);
 	assert_eq!(governance.matches("role.actions()").count(), 1);
-	// The role is copied in install and never read there.
-	for call in [".key()", ".id()", ".actions()"] {
+	// Only original profile-3 seed derivation reads the two copied role keys.
+	assert_eq!(install.matches(".key()").count(), 4);
+	assert_eq!(
+		fn_body(&install, "install_admin2")
+			.matches(".key()")
+			.count(),
+		2
+	);
+	assert_eq!(
+		fn_body(&install, "original_roles3")
+			.matches(".key()")
+			.count(),
+		2
+	);
+	for call in [".id()", ".actions()"] {
 		assert!(!install.contains(call), "admin_install.rs calls {call}");
 	}
 	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -4760,7 +4830,11 @@ fn profile_two_binding_surface_is_exact() {
 				// One pure governance checker reads the descriptive role; no integration caller.
 				assert_eq!(
 					t.matches("admin_governance2(").count(),
-					usize::from(is_install || p == root.join("governance_command.rs")),
+					usize::from(
+						is_install
+							|| p == root.join("governance_command.rs")
+							|| p == root.join("governance_verification.rs")
+					),
 					"{}",
 					p.display()
 				);
@@ -5443,4 +5517,170 @@ fn root2_carrier_is_bounded_private_held_and_response_mappings_are_explicit() {
 			.unwrap()
 			.contains("fixture::")
 	);
+}
+
+// C-S4b1 syntax pins; behavioral cuts, signatures and wire bytes have separate tests.
+#[test]
+fn role_epoch_control_is_pre_entry_bounded_and_dormant() {
+	let root =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
+	let read = |name: &str| fs::read_to_string(root.join(name)).unwrap();
+	fn forbidden(tokens: proc_macro2::TokenStream) -> Option<String> {
+		let ts: Vec<_> = tokens.into_iter().collect();
+		for (i, t) in ts.iter().enumerate() {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => {
+					let n = id.to_string();
+					if n == "static"
+						&& !matches!(i.checked_sub(1).and_then(|j| ts.get(j)), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '\'')
+					{
+						return Some(n);
+					}
+					if [
+						"SigningKey",
+						"Signer",
+						"unsafe",
+						"fs",
+						"io",
+						"net",
+						"tokio",
+						"SystemTime",
+						"Instant",
+						"spawn",
+						"serde",
+					]
+					.contains(&n.as_str())
+					{
+						return Some(n);
+					}
+					if [
+						"Root2",
+						"UnverifiedRoot2",
+						"TrustedEntry2",
+						"VerifiedCommand2",
+						"CommittedEntry2",
+						"MutationAuthorityState2",
+						"TrustedView2",
+					]
+					.contains(&n.as_str())
+						&& (matches!(ts.get(i + 1), Some(proc_macro2::TokenTree::Group(g)) if g.delimiter() == proc_macro2::Delimiter::Brace)
+							|| matches!(ts.get(i + 1), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == ':'))
+					{
+						return Some(n);
+					}
+				}
+				proc_macro2::TokenTree::Group(g) => {
+					if let Some(n) = forbidden(g.stream()) {
+						return Some(n);
+					}
+				}
+				_ => {}
+			}
+		}
+		None
+	}
+	for good in [
+		"fn f(x: &Root2) {}",
+		"fn f(x: &mut Root2) {}",
+		r#"fn f() -> &'static [u8] { b"x" }"#,
+	] {
+		assert_eq!(forbidden(good.parse().unwrap()), None);
+	}
+	for bad in [
+		"fn f() { let _ = SigningKey::from_bytes(x); }",
+		"fn f() { let _ = Root2 { state: x }; }",
+		"fn f() { tokio::spawn(x); }",
+		"fn f() { static X: u8 = 0; }",
+	] {
+		assert!(forbidden(bad.parse().unwrap()).is_some());
+	}
+	for name in ["role_epochs.rs", "role_command.rs"] {
+		let text = read(name);
+		assert_eq!(forbidden(text.parse().unwrap()), None, "{name}");
+		for item in syn::parse_file(&text).unwrap().items {
+			let vis = match &item {
+				syn::Item::Fn(x) => Some(&x.vis),
+				syn::Item::Struct(x) => Some(&x.vis),
+				syn::Item::Enum(x) => Some(&x.vis),
+				syn::Item::Type(x) => Some(&x.vis),
+				syn::Item::Const(x) => Some(&x.vis),
+				_ => None,
+			};
+			if let Some(vis) = vis {
+				assert!(
+					matches!(vis, syn::Visibility::Inherited)
+						|| matches!(vis, syn::Visibility::Restricted(v) if v.path.is_ident("super")),
+					"{name}: private root-only items"
+				);
+			}
+		}
+	}
+	let epochs = read("role_epochs.rs");
+	assert!(epochs.contains("const SUCCESSORS3: usize = 64;"));
+	assert!(epochs.contains("if counts == [0; 3]"));
+	assert!(
+		epochs.find("usize::from(n) > SUCCESSORS3").unwrap()
+			< epochs.find("try_reserve_exact").unwrap()
+	);
+	assert!(epochs.contains("if r.take(21)? != [0; 21]"));
+	let rotate = fn_body(&epochs, "rotate");
+	assert!(
+		rotate.find("history > root.limits.history").unwrap()
+			< rotate.find("get_or_insert_with").unwrap()
+	);
+	assert!(
+		rotate.find("e.original != original").unwrap()
+			< rotate.find("successors[role].push").unwrap()
+	);
+	assert!(rotate.contains("(s.covered, s.fingerprint, s.command_digest)"));
+	let install = read("admin_install.rs");
+	assert!(
+		install.find("Some(epochs.original) != original").unwrap()
+			< install.find("Ok(InstalledAdmin2").unwrap()
+	);
+	assert!(install.contains("cut: active.map("));
+	let proof = read("role_command.rs");
+	assert!(proof.contains("const ROLE_PROOF_BYTES3: usize = 224;"));
+	assert_eq!(calls(&proof, "verify_strict"), 1);
+	assert!(proof.contains("&bytes[..86]") && proof.contains("&bytes[150..160]"));
+	let command = syn::parse_file(&read("command.rs")).unwrap();
+	let variants = command
+		.items
+		.iter()
+		.find_map(|i| match i {
+			syn::Item::Enum(e) if e.ident == "Command2" => Some(
+				e.variants
+					.iter()
+					.map(|v| v.ident.to_string())
+					.collect::<Vec<_>>(),
+			),
+			_ => None,
+		})
+		.unwrap();
+	assert_eq!(variants.len(), 18);
+	assert_eq!(
+		&variants[14..],
+		[
+			"RotateAdmin",
+			"RotateGovernance",
+			"RotateRecovery",
+			"EpochAdmissionPermission"
+		]
+	);
+	assert!(read("trust.rs").contains("role_seed: Option<super::role_epochs::Seed3>"));
+	assert_eq!(
+		calls(&read("verification.rs"), "VerifiedCommand2::verified2"),
+		1
+	);
+	let modules = read("mod.rs");
+	assert!(modules.contains("\nmod role_epochs;") && modules.contains("\nmod role_command;"));
+	assert!(modules.contains("#[cfg(test)]\nmod tests;"));
+	assert!(read("tests/mod.rs").contains("mod role_epochs;"));
+	let tests = read("tests/role_epochs/mod.rs");
+	for module in ["codec", "rotation", "verification", "compatibility"] {
+		assert!(tests.contains(&format!("mod {module};")));
+	}
+	let carrier = read("committed.rs");
+	assert!(carrier.contains("296"));
+	assert!(!carrier.contains("RotateAdmin") && !carrier.contains("SigningKey"));
 }

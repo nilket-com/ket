@@ -27,6 +27,8 @@ pub(in crate::storage::mutation_visibility::root2) struct InstalledAdmin2 {
 	governance: Option<GovernanceRole2>,
 	profile: ManifestProfile2,
 	recovery: Option<RecoveryRole3>,
+	active: Option<[(u64, Digest2); 3]>,
+	cut: Option<(Log2, Digest2, Digest2)>,
 }
 redacted_debug!(InstalledAdmin2, "InstalledAdmin2");
 /// The exact root, original Bootstrap and genesis an administrator is bound to.
@@ -68,6 +70,7 @@ pub(in crate::storage::mutation_visibility::root2) enum ObserveError2 {
 pub(in crate::storage::mutation_visibility::root2) enum InstallError2 {
 	PrerequisiteUnavailable,
 	Commitment(CommitmentField2),
+	EpochState,
 	Record(InstallField2),
 }
 
@@ -125,6 +128,24 @@ pub(in crate::storage::mutation_visibility::root2) fn install_admin2(
 		AnyAdminManifest2::Two(m) => Some(m.governance()),
 		AnyAdminManifest2::Three(m) => Some(m.governance()),
 	};
+	let original = match any {
+		AnyAdminManifest2::Three(m) => {
+			Some([manifest.admin_key, m.governance().key(), m.recovery().key()])
+		}
+		_ => None,
+	};
+	if let Some(epochs) = &s.role_epochs {
+		if Some(epochs.original) != original {
+			return Err(InstallError2::EpochState);
+		}
+	}
+	let active = original.map(|keys| {
+		std::array::from_fn(|role| {
+			s.role_epochs
+				.as_ref()
+				.map_or((0, keys[role]), |e| e.active(role))
+		})
+	});
 	Ok(InstalledAdmin2 {
 		context: AdminContext2 {
 			generation: s.generation,
@@ -136,6 +157,8 @@ pub(in crate::storage::mutation_visibility::root2) fn install_admin2(
 			initial_epoch: s.initial_epoch,
 			manifest_pin: pin,
 		},
+		active,
+		cut: active.map(|_| (s.covered, s.fingerprint, s.command_digest)),
 		admin_id: manifest.admin_id,
 		admin_key: manifest.admin_key,
 		namespace: manifest.namespace,
@@ -229,4 +252,22 @@ pub(in crate::storage::mutation_visibility::root2) fn admin_recovery3(
 	a: &InstalledAdmin2,
 ) -> Option<RecoveryRole3> {
 	a.recovery
+}
+
+/// Active epochs describe precisely the state from which this private view was installed.
+pub(in crate::storage::mutation_visibility::root2) fn active_role3(
+	a: &InstalledAdmin2,
+	role: usize,
+) -> Option<(u64, Digest2)> {
+	a.active.and_then(|roles| roles.get(role).copied())
+}
+pub(in crate::storage::mutation_visibility::root2) fn admin_cut3(
+	a: &InstalledAdmin2,
+) -> Option<(Log2, Digest2, Digest2)> {
+	a.cut
+}
+pub(in crate::storage::mutation_visibility::root2) fn original_roles3(
+	a: &InstalledAdmin2,
+) -> Option<[Digest2; 3]> {
+	Some([a.admin_key, a.governance?.key(), a.recovery?.key()])
 }

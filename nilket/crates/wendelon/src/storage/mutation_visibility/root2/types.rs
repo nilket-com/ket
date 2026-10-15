@@ -225,6 +225,7 @@ pub(super) struct State2 {
 	pub lineages: Map<[u8; 16], LineageRecord2>,
 	pub cuts: Cuts2,
 	pub parents: Map<[u8; 73], StoredParent2>,
+	pub role_epochs: Option<Box<super::role_epochs::RoleEpochs3>>,
 	pub derived: super::incremental::Derived2,
 }
 macro_rules! opaque_debug { ($($t:ty),* $(,)?)=>{$(impl std::fmt::Debug for $t {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str(concat!(stringify!($t)," { redacted }"))}})*}; }

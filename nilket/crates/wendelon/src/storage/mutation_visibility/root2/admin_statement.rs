@@ -274,6 +274,9 @@ pub(in crate::storage::mutation_visibility::root2) fn check_admin_statement2(
 	}
 	let preimage =
 		admin_statement_preimage2(bytes.try_into().map_err(|_| StatementError2::Length)?)?;
+	if super::admin_install::active_role3(admin, 0).is_some_and(|(k, _)| k != 0) {
+		return Err(StatementError2::Signature);
+	}
 	VerifyingKey::from_bytes(&admin_key2(admin))
 		.map_err(|_| StatementError2::Signature)?
 		.verify_strict(&preimage, &Signature::from_bytes(&p.signature))
@@ -310,4 +313,72 @@ pub(in crate::storage::mutation_visibility::root2) fn checked_context2(
 	c: &CheckedStatement2,
 ) -> AdminContext2 {
 	c.context
+}
+
+pub(in crate::storage::mutation_visibility::root2) const EPOCH_STATEMENT_BYTES3: usize = 345;
+fn parse_epoch3(bytes: &[u8]) -> Result<(Parsed, u64), StatementError2> {
+	if bytes.len() != EPOCH_STATEMENT_BYTES3 {
+		return Err(StatementError2::Length);
+	}
+	if &bytes[..8] != b"VISADS03" {
+		return Err(StatementError2::Magic);
+	}
+	let mut legacy = [0; ADMIN_STATEMENT_BYTES2];
+	legacy[..273].copy_from_slice(&bytes[..273]);
+	legacy[..8].copy_from_slice(MAGIC);
+	legacy[273..].copy_from_slice(&bytes[281..]);
+	Ok((parse(&legacy)?, u64_at(bytes, 273)))
+}
+pub(in crate::storage::mutation_visibility::root2) fn inspect_epoch_statement3(
+	bytes: &[u8],
+) -> Result<StatementFacts2, StatementError2> {
+	let (p, _) = parse_epoch3(bytes)?;
+	Ok(StatementFacts2 {
+		action: p.action,
+		key: p.key,
+		generation: p.context.generation,
+		cluster: p.context.cluster,
+	})
+}
+pub(in crate::storage::mutation_visibility::root2) fn epoch_statement_preimage3(
+	bytes: &[u8],
+) -> Result<Vec<u8>, StatementError2> {
+	parse_epoch3(bytes)?;
+	let mut b = b"VISROOT2-ROLE3-ADMIN-STATEMENT\0".to_vec();
+	b.push(1);
+	b.extend_from_slice(&bytes[..281]);
+	Ok(b)
+}
+pub(in crate::storage::mutation_visibility::root2) fn check_epoch_statement3(
+	admin: &InstalledAdmin2,
+	bytes: &[u8],
+) -> Result<CheckedStatement2, StatementError2> {
+	let (p, k) = parse_epoch3(bytes)?;
+	if p.context != admin_context2(admin) {
+		return Err(StatementError2::Context);
+	}
+	let ns = admin_namespace2(admin);
+	let n = &p.key.namespace;
+	if n.generation != p.context.generation
+		|| (n.tenant, n.scope, n.table, n.schema) != (ns.tenant, ns.scope, ns.table, ns.schema)
+	{
+		return Err(StatementError2::Scope);
+	}
+	let (active, key) =
+		super::admin_install::active_role3(admin, 0).ok_or(StatementError2::Signature)?;
+	if active != k {
+		return Err(StatementError2::Signature);
+	}
+	VerifyingKey::from_bytes(&key)
+		.map_err(|_| StatementError2::Signature)?
+		.verify_strict(
+			&epoch_statement_preimage3(bytes)?,
+			&Signature::from_bytes(&p.signature),
+		)
+		.map_err(|_| StatementError2::Signature)?;
+	Ok(CheckedStatement2 {
+		action: p.action,
+		key: p.key,
+		context: p.context,
+	})
 }

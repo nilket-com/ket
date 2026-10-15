@@ -113,7 +113,11 @@ fn emit_state_body(s: &State2, u: &Usage2, emit: &mut impl FnMut(&[u8])) -> Resu
 	visit_permission_section2(&s.permissions, permission_limits2(), emit).map_err(section_error)?;
 	emit_records(s.lineages.values(), s.lineages.len(), emit)?;
 	emit_records(s.cuts.iter(), s.cuts.len(), emit)?;
-	emit_records(s.parents.values(), s.parents.len(), emit)
+	emit_records(s.parents.values(), s.parents.len(), emit)?;
+	if let Some(epochs) = &s.role_epochs {
+		epochs.write(emit)?;
+	}
+	Ok(())
 }
 fn envelope_size(body: usize, max: usize) -> Result2<(u32, usize)> {
 	// Match envelope_versioned's Limit-before-Overflow refusal order.
@@ -135,8 +139,12 @@ fn encode_state(s: &State2) -> Result2<Vec<u8>> {
 	let body = body.ok_or(RootError2::Overflow)?;
 	let (wire, total) = envelope_size(body, ROOT_BYTES2)?;
 	let mut b = Vec::with_capacity(total);
-	b.extend_from_slice(b"VISAUT04");
-	b.extend_from_slice(&4u16.to_le_bytes());
+	b.extend_from_slice(if s.role_epochs.is_some() {
+		b"VISAUT05"
+	} else {
+		b"VISAUT04"
+	});
+	b.extend_from_slice(&(if s.role_epochs.is_some() { 5u16 } else { 4u16 }).to_le_bytes());
 	b.extend_from_slice(&[1, 0]);
 	b.extend_from_slice(&wire.to_le_bytes());
 	emit_state_body(s, &u, &mut |part| b.extend_from_slice(part))?;
@@ -213,7 +221,12 @@ impl UnverifiedRoot2 {
 		)
 	}
 	pub fn decode(bytes: &[u8]) -> Result2<Self> {
-		let mut r = Read2::new(open_versioned(bytes, b"VISAUT04", 4, ROOT_BYTES2)?);
+		let extended = bytes.starts_with(b"VISAUT05");
+		let mut r = Read2::new(if extended {
+			open_versioned(bytes, b"VISAUT05", 5, ROOT_BYTES2)?
+		} else {
+			open_versioned(bytes, b"VISAUT04", 4, ROOT_BYTES2)?
+		});
 		let generation = r.array()?;
 		let cluster = r.array()?;
 		let bootstrap = r.log()?;
@@ -255,6 +268,11 @@ impl UnverifiedRoot2 {
 					.map_err(|_| RootError2::Codec)
 			},
 		)?;
+		let role_epochs = if extended {
+			Some(Box::new(super::role_epochs::RoleEpochs3::read(&mut r)?))
+		} else {
+			None
+		};
 		r.end()?;
 		let mut state = State2 {
 			generation,
@@ -273,6 +291,7 @@ impl UnverifiedRoot2 {
 			lineages,
 			cuts,
 			parents,
+			role_epochs,
 			derived: Derived2::default(),
 		};
 		// Build runs the full validator before deriving any trusted summary.

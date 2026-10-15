@@ -95,9 +95,12 @@ fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Res
 	let s = &mut root.state;
 	let limits = root.limits;
 	match cmd {
-		Command2::EnrollLeaseIssuer { .. } | Command2::RevokeLeaseIssuer { .. } => {
-			Err(RootError2::TrustMismatch)
-		}
+		Command2::EnrollLeaseIssuer { .. }
+		| Command2::RevokeLeaseIssuer { .. }
+		| Command2::RotateAdmin(_)
+		| Command2::RotateGovernance(_)
+		| Command2::RotateRecovery(_)
+		| Command2::EpochAdmissionPermission(_) => Err(RootError2::TrustMismatch),
 		Command2::Bootstrap { .. } => Ok(denied(1, Some(s.bootstrap))),
 		Command2::Cover { .. } => Ok(ApplyResult2::Covered),
 		Command2::EnrollSelector(b) => {

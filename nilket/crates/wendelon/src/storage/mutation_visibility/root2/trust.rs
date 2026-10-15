@@ -17,6 +17,7 @@ pub struct VerifiedCommand2 {
 	cluster: [u8; 16],
 	command: Digest2,
 	authorized: bool,
+	role_seed: Option<super::role_epochs::Seed3>,
 	historical: Option<Digest2>,
 	evidence: u8,
 }
@@ -106,6 +107,9 @@ impl TrustedEntry2 {
 	}
 }
 impl VerifiedCommand2 {
+	pub(super) fn role_seed3(&self) -> Option<super::role_epochs::Seed3> {
+		self.role_seed
+	}
 	pub(super) fn matches(&self, g: [u8; 16], c: [u8; 16], command: Digest2) -> bool {
 		(self.generation, self.cluster, self.command) == (g, c, command)
 	}
@@ -127,12 +131,14 @@ impl VerifiedCommand2 {
 		authorized: bool,
 		historical: Option<Digest2>,
 		evidence: u8,
+		role_seed: Option<super::role_epochs::Seed3>,
 	) -> Self {
 		Self {
 			generation,
 			cluster,
 			command,
 			authorized,
+			role_seed,
 			historical,
 			evidence,
 		}
@@ -157,6 +163,7 @@ impl VerifiedCommand2 {
 			cluster: c,
 			command: command.digest(g, c)?,
 			authorized: true,
+			role_seed: None,
 			historical,
 			evidence,
 		})

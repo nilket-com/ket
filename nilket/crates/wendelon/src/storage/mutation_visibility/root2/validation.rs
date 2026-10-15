@@ -289,11 +289,13 @@ pub(super) fn usage(s: &State2) -> Result2<Usage2> {
 		n.checked_add(usize::try_from(p.held_bytes).map_err(|_| RootError2::Overflow)?)
 			.ok_or(RootError2::Overflow)
 	})?;
+	let epoch_charge = super::role_epochs::charge(s)?;
 	let history = s
 		.lineages
 		.len()
 		.checked_mul(298)
 		.and_then(|n| s.cuts.len().checked_mul(72).and_then(|m| n.checked_add(m)))
+		.and_then(|n| n.checked_add(epoch_charge))
 		.ok_or(RootError2::Overflow)?;
 	let registry = s
 		.selectors
@@ -393,6 +395,7 @@ pub(super) fn validate_state(s: &State2) -> Result2<()> {
 	}
 	capacity(s, Limits2::default())?;
 	let mut coords = BTreeSet::from([s.bootstrap.index]);
+	super::role_epochs::validate(s, &mut coords)?;
 	let coord = |l: Log2| -> Result2<()> {
 		valid_log(l)?;
 		if l.index < s.bootstrap.index || l.index > s.covered.index {
