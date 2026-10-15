@@ -1,4 +1,4 @@
-//! Public error mapping only; native tests pin the complete refusal metadata.
+//! A public write with another tenant's pending identity executes independently.
 #[path = "support/control_ring.rs"]
 mod support;
 
@@ -13,10 +13,10 @@ use wendelon::network::transport::{NodeRole, NodeRoleSet, TransportTier, Transpo
 use wendelon::schema::{
 	ClientWriteId, DurabilityLevel, FinalizationMarker, HybridTimestamp, Identity, TenantId,
 };
-use wendelon_client::{Client, ClientError, WriteOptions};
+use wendelon_client::{Client, ReadOptions, WriteOptions};
 
 #[tokio::test]
-async fn existing_foreign_pending_maps_to_public_authorization_failed_both_orders() {
+async fn other_tenant_pending_does_not_suppress_public_write_both_orders() {
 	let node = support::bootstrap_node("b1b-public-refusal", 1).await;
 	support::wait_for_local_leader(&node).await;
 	node.handles.pending_finalization_reconciler.abort();
@@ -30,6 +30,12 @@ async fn existing_foreign_pending_maps_to_public_authorization_failed_both_order
 	node.data_server
 		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
 		.await;
+	for tenant in [7, 8] {
+		node.create_tenant(TenantId::new(tenant), u64::MAX, 1)
+			.await
+			.unwrap();
+	}
+	node.data_server.sync_tenant_policy_cache_once().await;
 	let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
 	let snapshot = ClusterStatusWire {
 		epoch: 1,
@@ -88,19 +94,32 @@ async fn existing_foreign_pending_maps_to_public_authorization_failed_both_order
 		pending.upsert(record.clone()).await.unwrap();
 		let before_bytes = node.slab.local_l1_bytes().await;
 		let client = Client::with_client_uuid(Arc::clone(&inner), uuid);
-		assert!(matches!(
+		let receipt = client
+			.write(
+				TenantId::new(requester),
+				b"pending-collision",
+				b"B-value",
+				WriteOptions::default(),
+			)
+			.await
+			.unwrap();
+		assert_ne!(receipt.commit_hlc, record.finalization.marker.commit_hlc);
+		assert!(!receipt.duplicate);
+		assert_eq!(
 			client
-				.write(
+				.read(
 					TenantId::new(requester),
 					b"pending-collision",
-					b"B-value",
-					WriteOptions::default()
+					ReadOptions::default()
 				)
-				.await,
-			Err(ClientError::AuthorizationFailed)
-		));
+				.await
+				.unwrap()
+				.unwrap()
+				.value,
+			b"B-value"
+		);
 		assert_eq!(pending.get(record.id).await.unwrap(), Some(record.clone()));
-		assert_eq!(node.slab.local_l1_bytes().await, before_bytes);
+		assert!(node.slab.local_l1_bytes().await > before_bytes);
 		pending.remove(record.id).await.unwrap();
 	}
 	drop(inner);

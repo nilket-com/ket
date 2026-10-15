@@ -15,6 +15,8 @@ use tokio::sync::Mutex;
 const PENDING_FINALIZATIONS_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("pending_finalizations_v1");
 const PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE: TableDefinition<&[u8], &[u8]> =
+	TableDefinition::new("pending_finalizations_by_write_id_v2");
+const PENDING_FINALIZATIONS_BY_WRITE_ID_LEGACY_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("pending_finalizations_by_write_id_v1");
 // Sidecar rather than a field on `PendingFinalizationRecord`: postcard encodes that
 // record positionally, so widening it would make pre-ADR-542 pending witnesses
@@ -32,15 +34,9 @@ const PENDING_FINALIZATION_META_TABLE: TableDefinition<&str, u8> =
 const PENDING_FINALIZATION_FORMAT_KEY: &str = "format_version";
 /// Shape of the `postcard(PendingFinalizationRecord)` values this build writes.
 const PENDING_FINALIZATION_FORMAT_VERSION: u8 = 1;
-// Secondary-index key shape: canonical idempotency bytes only
-// (`client_uuid` + `sequence_no`), per the contract documented at
-// `src/schema/core.rs`. `idempotency_ttl_ms` and `_pad` are not
-// part of identity and must not be hashed in. The store's existing
-// open-time self-heal (clear `by_write_id` and re-insert from
-// primary) handles the on-disk migration: a redb opened against an
-// older 32-byte-keyed index is rebuilt with the 24-byte shape on
-// the next open without a table-name version bump.
-const WRITE_ID_KEY_LEN: usize = 24;
+// The local secondary index scopes canonical identities by tenant. Primary
+// records and their serialized format stay unchanged; open rebuilds this index.
+const WRITE_ID_KEY_LEN: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PendingFinalizationId([u8; 32]);
@@ -213,12 +209,17 @@ impl PendingFinalizationStore {
 				let (_key, value) = entry.map_err(redb_to_io)?;
 				let record = decode_pending_finalization_record(value.value(), format_version)?;
 				initial_count = initial_count.saturating_add(1);
-				let write_key = encode_write_id_key(record.write_id);
+				let write_key = encode_write_id_key(record.finalization.tenant_id, record.write_id);
 				by_write_id
 					.insert(write_key.as_slice(), &record.id.as_bytes()[..])
 					.map_err(redb_to_io)?;
 			}
 		}
+		// Rebuild and retire the old namespace atomically with the same transaction.
+		// All table handles above have ended before this deletion.
+		write_txn
+			.delete_table(PENDING_FINALIZATIONS_BY_WRITE_ID_LEGACY_TABLE)
+			.map_err(redb_to_io)?;
 		// Stamp only a store that holds nothing. Marking a populated legacy store
 		// would assert that records written by an older build match this one's
 		// shape — a claim nothing here can support, and exactly the false
@@ -316,6 +317,7 @@ impl PendingFinalizationStore {
 
 	pub async fn find_by_write_id(
 		&self,
+		tenant_id: crate::schema::TenantId,
 		write_id: ClientWriteId,
 	) -> std::io::Result<Option<PendingFinalizationRecord>> {
 		let db = self.db.clone();
@@ -328,7 +330,7 @@ impl PendingFinalizationStore {
 			let primary = read_txn
 				.open_table(PENDING_FINALIZATIONS_TABLE)
 				.map_err(redb_to_io)?;
-			let write_key = encode_write_id_key(write_id);
+			let write_key = encode_write_id_key(tenant_id, write_id);
 			let Some(id_bytes) = by_write_id.get(write_key.as_slice()).map_err(redb_to_io)? else {
 				return Ok(None);
 			};
@@ -345,12 +347,13 @@ impl PendingFinalizationStore {
 			// canonical idempotency identity. TTL / pad may drift
 			// across retries (the index is keyed on canonical
 			// bytes only), so do not compare the full struct.
-			if record.write_id.canonical_idempotency_bytes()
-				!= write_id.canonical_idempotency_bytes()
+			if record.finalization.tenant_id != tenant_id
+				|| record.write_id.canonical_idempotency_bytes()
+					!= write_id.canonical_idempotency_bytes()
 			{
 				return Err(Error::new(
 					ErrorKind::InvalidData,
-					"pending-finalization secondary index returned a mismatched write_id",
+					"pending-finalization secondary index returned a mismatched tenant or write_id",
 				));
 			}
 			Ok(Some(record))
@@ -408,7 +411,7 @@ impl PendingFinalizationStore {
 				let mut by_write_id = write_txn
 					.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
 					.map_err(redb_to_io)?;
-				let write_key = encode_write_id_key(record.write_id);
+				let write_key = encode_write_id_key(record.finalization.tenant_id, record.write_id);
 				by_write_id
 					.insert(write_key.as_slice(), &record.id.as_bytes()[..])
 					.map_err(redb_to_io)?;
@@ -500,7 +503,9 @@ impl PendingFinalizationStore {
 						let (_key, value) = entry.map_err(redb_to_io)?;
 						let candidate =
 							decode_pending_finalization_record(value.value(), format_version)?;
-						if candidate.write_id.canonical_idempotency_bytes() == canonical {
+						if candidate.finalization.tenant_id == record.finalization.tenant_id
+							&& candidate.write_id.canonical_idempotency_bytes() == canonical
+						{
 							replacement = Some(candidate.id);
 							break;
 						}
@@ -513,7 +518,8 @@ impl PendingFinalizationStore {
 					let mut by_write_id = write_txn
 						.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
 						.map_err(redb_to_io)?;
-					let write_key = encode_write_id_key(record.write_id);
+					let write_key =
+						encode_write_id_key(record.finalization.tenant_id, record.write_id);
 					let indexed_id =
 						match by_write_id.get(write_key.as_slice()).map_err(redb_to_io)? {
 							Some(value) => Some(PendingFinalizationId::from_slice(value.value())?),
@@ -636,8 +642,14 @@ fn decode_pending_finalization_record(
 	})
 }
 
-fn encode_write_id_key(write_id: ClientWriteId) -> [u8; WRITE_ID_KEY_LEN] {
-	write_id.canonical_idempotency_bytes()
+fn encode_write_id_key(
+	tenant_id: crate::schema::TenantId,
+	write_id: ClientWriteId,
+) -> [u8; WRITE_ID_KEY_LEN] {
+	let mut key = [0u8; WRITE_ID_KEY_LEN];
+	key[..8].copy_from_slice(&tenant_id.get().to_be_bytes());
+	key[8..].copy_from_slice(&write_id.canonical_idempotency_bytes());
+	key
 }
 
 fn encode_delete_counts(counts: [u32; 3]) -> [u8; 12] {
@@ -729,7 +741,10 @@ mod tests {
 		assert_eq!(store.count(), 1);
 		assert_eq!(store.get(record.id).await.unwrap(), Some(record.clone()));
 		assert_eq!(
-			store.find_by_write_id(record.write_id).await.unwrap(),
+			store
+				.find_by_write_id(record.finalization.tenant_id, record.write_id)
+				.await
+				.unwrap(),
 			Some(record.clone())
 		);
 		assert_eq!(store.load_all().await.unwrap(), vec![record.clone()]);
@@ -738,7 +753,7 @@ mod tests {
 		assert!(store.get(record.id).await.unwrap().is_none());
 		assert!(
 			store
-				.find_by_write_id(record.write_id)
+				.find_by_write_id(record.finalization.tenant_id, record.write_id)
 				.await
 				.unwrap()
 				.is_none()
@@ -813,7 +828,10 @@ mod tests {
 			..record.write_id
 		};
 		assert_eq!(
-			store.find_by_write_id(drifted_write_id).await.unwrap(),
+			store
+				.find_by_write_id(record.finalization.tenant_id, drifted_write_id)
+				.await
+				.unwrap(),
 			Some(record),
 			"find_by_write_id must match across drifted TTL"
 		);
@@ -838,7 +856,10 @@ mod tests {
 		let store = PendingFinalizationStore::open(path).unwrap();
 		assert_eq!(store.count(), 1);
 		assert_eq!(
-			store.find_by_write_id(record.write_id).await.unwrap(),
+			store
+				.find_by_write_id(record.finalization.tenant_id, record.write_id)
+				.await
+				.unwrap(),
 			Some(record)
 		);
 	}
@@ -875,14 +896,20 @@ mod tests {
 		store.upsert(first.clone()).await.unwrap();
 		store.upsert(second.clone()).await.unwrap();
 		assert_eq!(
-			store.find_by_write_id(first.write_id).await.unwrap(),
+			store
+				.find_by_write_id(first.finalization.tenant_id, first.write_id)
+				.await
+				.unwrap(),
 			Some(second.clone()),
 			"newest record stays discoverable while both rows exist"
 		);
 
 		store.remove(second.id).await.unwrap();
 		assert_eq!(
-			store.find_by_write_id(first.write_id).await.unwrap(),
+			store
+				.find_by_write_id(first.finalization.tenant_id, first.write_id)
+				.await
+				.unwrap(),
 			Some(first),
 			"removing the indexed row must fall back to an older row with the same write_id"
 		);
@@ -1111,3 +1138,7 @@ mod tests {
 		);
 	}
 }
+
+#[cfg(test)]
+#[path = "pending_finalizations_tenant_tests.rs"]
+mod tenant_index_tests;

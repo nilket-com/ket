@@ -1,4 +1,4 @@
-//! B1b checks the indexed existing witness, not concurrent or failover ownership.
+//! Tenant-scoped pending identities; corrupt cache entries remain invariant failures.
 use crate::consensus::{TenantFinalization, WendelonRequest};
 use crate::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
@@ -18,7 +18,7 @@ use crate::network::pending_finalizations::PendingFinalizationRecord;
 use crate::network::traits::DataRing;
 use crate::node::{NodeBootstrapConfig, WendelonNode};
 use crate::schema::{
-	ClientWriteId, DurabilityLevel, FinalizationMarker, Identity, MsgType, MutationCommitKnowledge,
+	ClientWriteId, DurabilityLevel, FinalizationMarker, Identity, MutationCommitKnowledge,
 	MutationOutcomeRequestMeta, MutationResolutionStatus, MutationStopReason, NodeId,
 	PbcRejectCode, TableDeleteRowsRequestMeta, TableSchemaDescriptor, TenantId, WriteResponseMeta,
 	WriteStatus, WriterNodeId, encode_table_schema_descriptor_v1,
@@ -138,38 +138,41 @@ async fn seed(
 	record
 }
 
-fn assert_refusal(
-	server: &WendelonDataServer,
-	response: WriteResponseMeta,
-	id: ClientWriteId,
-	marker: Option<FinalizationMarker>,
-) {
-	assert_eq!(response.status, WriteStatus::AUTHORIZATION_FAILED);
+fn assert_own_response(response: WriteResponseMeta, id: ClientWriteId, expired: bool) {
+	assert_eq!(response.echoed_write_id, id);
+	assert_eq!(
+		response.status,
+		if expired {
+			WriteStatus::WRITE_DEADLINE_EXCEEDED
+		} else {
+			WriteStatus::OK
+		}
+	);
 	assert_eq!(
 		response.mutation_commit_knowledge(),
-		MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+		if expired {
+			MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+		} else {
+			MutationCommitKnowledge::COMMITTED
+		}
 	);
-	assert_eq!(response.mutation_stop_reason(), MutationStopReason::NONE);
-	assert_eq!(&response._pad1[..2], &[2, 0]);
-	assert_eq!(response.log_index, 0);
-	assert_eq!(response.term, 0);
-	assert_eq!(response.commit_hlc, hlc(0, 0, 0));
-	assert_eq!(response.echoed_write_id, id);
-	assert_eq!(response.epoch, server.admission_snapshot().current_epoch);
-	assert_eq!(response.leader_hint, server.local_node);
-	assert_eq!(response.has_finalization, 0);
-	assert!(marker.is_none());
-	let frame = server.build_write_response_frame(MsgType::WRITE_RESP, 1, response, marker);
-	let decoded: WriteResponseMeta = *bytemuck::from_bytes(&frame.meta);
 	assert_eq!(
-		(
-			decoded.status.0,
-			decoded.mutation_commit_knowledge().0,
-			decoded.mutation_stop_reason().0
-		),
-		(12, 2, 0)
+		response.mutation_stop_reason(),
+		if expired {
+			MutationStopReason::DEADLINE
+		} else {
+			MutationStopReason::NONE
+		}
 	);
-	assert!(frame.trailing.is_none());
+	assert_ne!(response.commit_hlc, hlc(998, 7, 91));
+}
+
+fn assert_internal(error: std::io::Error) {
+	assert_eq!(error.kind(), std::io::ErrorKind::Other);
+	assert_eq!(
+		error.to_string(),
+		"pending replay tenant invariant violated"
+	);
 }
 
 async fn assert_unresolved(server: &WendelonDataServer, tenant_id: TenantId, id: ClientWriteId) {
@@ -219,7 +222,7 @@ fn delete_meta(
 }
 
 #[tokio::test]
-async fn existing_foreign_pending_refuses_all_fresh_paths_before_persistence_both_orders() {
+async fn other_tenant_pending_does_not_suppress_fresh_paths_both_orders() {
 	let (_dir, node, server) = fixture("b1b-foreign-pending-matrix").await;
 	for (order, (owner, requester)) in [(7, 8), (8, 7)].into_iter().enumerate() {
 		let owner = TenantId::new(owner);
@@ -267,8 +270,7 @@ async fn existing_foreign_pending_refuses_all_fresh_paths_before_persistence_bot
 			}
 			let record = seed(&server, owner, id).await;
 			let before_bytes = node.slab.local_l1_bytes().await;
-			let before_write = server.idempotency.len();
-			let before_delete = server.table_delete_idempotency.len();
+
 			let available = server.mutation_work_slots.available_permits();
 			let held = if kind.ends_with("expiry") {
 				Some(
@@ -288,7 +290,8 @@ async fn existing_foreign_pending_refuses_all_fresh_paths_before_persistence_bot
 				raw.key_identity = Identity::blake3_tenant(requester, b"k");
 				raw.write_id = id;
 				let (response, marker) = server.write(raw, single_kv_batch()).await.unwrap();
-				assert_refusal(&server, response, id, marker);
+				assert_own_response(response, id, false);
+				assert!(marker.is_none() || marker != Some(record.finalization.marker));
 			} else if kind.starts_with("delete") {
 				let mut delete = delete_meta(requester, &descriptor, id);
 				delete.set_attempts_remaining(1);
@@ -302,9 +305,16 @@ async fn existing_foreign_pending_refuses_all_fresh_paths_before_persistence_bot
 						response.already_deleted_count,
 						response.not_found_count
 					],
-					[0; 3]
+					if kind == "delete" {
+						[1, 0, 0]
+					} else if kind == "delete-noop" {
+						[0, 0, 1]
+					} else {
+						[0; 3]
+					}
 				);
-				assert_refusal(&server, response.write, id, marker);
+				assert_own_response(response.write, id, kind == "delete-expiry");
+				assert!(marker.is_none() || marker != Some(record.finalization.marker));
 				let final_response = server
 					.finalize_table_delete_attempt(delete, response)
 					.await
@@ -320,7 +330,8 @@ async fn existing_foreign_pending_refuses_all_fresh_paths_before_persistence_bot
 					meta.deadline_remaining_millis = 1;
 				}
 				let (response, marker) = server.table_write(meta, batch.clone()).await.unwrap();
-				assert_refusal(&server, response.write, id, marker);
+				assert_own_response(response.write, id, kind == "write-expiry");
+				assert!(marker.is_none() || marker != Some(record.finalization.marker));
 				let final_response = server
 					.finalize_table_write_attempt(meta, response)
 					.await
@@ -333,20 +344,37 @@ async fn existing_foreign_pending_refuses_all_fresh_paths_before_persistence_bot
 			}
 			drop(held);
 			assert_eq!(server.mutation_work_slots.available_permits(), available);
-			assert_eq!(node.slab.local_l1_bytes().await, before_bytes);
-			assert_eq!(server.idempotency.len(), before_write);
-			assert_eq!(server.table_delete_idempotency.len(), before_delete);
+			if kind.ends_with("expiry") || kind == "content-noop" || kind == "delete-noop" {
+				assert_eq!(node.slab.local_l1_bytes().await, before_bytes);
+			}
+			// A's durable bytes, pending resolution and own cache namespace are unchanged.
 			assert!(
 				!server
 					.idempotency
-					.contains_key(&WendelonDataServer::idempotency_key_for(requester, id))
+					.contains_key(&WendelonDataServer::idempotency_key_for(owner, id))
 			);
 			assert!(
 				!server
 					.table_delete_idempotency
-					.contains_key(&WendelonDataServer::idempotency_key_for(requester, id))
+					.contains_key(&WendelonDataServer::idempotency_key_for(owner, id))
 			);
-			assert_unresolved(&server, requester, id).await;
+			let a = server
+				.resolve_mutation_outcome(MutationOutcomeRequestMeta {
+					operation_id: id,
+					tenant_id: owner,
+				})
+				.await
+				.unwrap();
+			assert_eq!(a.write.commit_hlc, record.finalization.marker.commit_hlc);
+			let b = server
+				.resolve_mutation_outcome(MutationOutcomeRequestMeta {
+					operation_id: id,
+					tenant_id: requester,
+				})
+				.await
+				.unwrap();
+			assert_ne!(b.write.commit_hlc, a.write.commit_hlc);
+
 			assert_eq!(
 				server.pending_finalizations.get(record.id).await.unwrap(),
 				Some(record.clone())
@@ -356,29 +384,8 @@ async fn existing_foreign_pending_refuses_all_fresh_paths_before_persistence_bot
 				.remove(record.id)
 				.await
 				.unwrap();
-			// Prove these are actual no-op candidates, not merely labels on invalid requests.
-			if kind == "content-noop" {
-				let (response, _) = server.table_write(meta, batch).await.unwrap();
-				assert_eq!(response.write.status, WriteStatus::OK);
-				assert_eq!(node.slab.local_l1_bytes().await, before_bytes);
-			} else if kind == "delete-noop" {
-				let (response, _) = server
-					.table_delete(delete_meta(requester, &descriptor, id), vec![row_key])
-					.await
-					.unwrap();
-				assert_eq!(response.write.status, WriteStatus::OK);
-				assert_eq!(
-					[
-						response.deleted_count,
-						response.already_deleted_count,
-						response.not_found_count
-					],
-					[0, 0, 1]
-				);
-				assert_eq!(node.slab.local_l1_bytes().await, before_bytes);
-			}
 			println!(
-				"PENDING_TENANT_PIN order={order} kind={kind} refusal=12/2/0 resolution=23/3/0 new_state=false"
+				"PENDING_TENANT_PIN order={order} kind={kind} independent=true foreign_state_unchanged=true"
 			);
 		}
 	}
@@ -386,7 +393,7 @@ async fn existing_foreign_pending_refuses_all_fresh_paths_before_persistence_bot
 }
 
 #[tokio::test]
-async fn polluted_pending_cache_refuses_before_redirect_and_preserves_seeded_entry() {
+async fn polluted_pending_cache_is_internal_before_redirect_and_preserves_seeded_entry() {
 	let (_dir, node, server) = fixture("b1b-polluted-pending-cache").await;
 	for (order, (owner, requester)) in [(7, 8), (8, 7)].into_iter().enumerate() {
 		let id = operation(200 + order as u64);
@@ -419,16 +426,16 @@ async fn polluted_pending_cache_refuses_before_redirect_and_preserves_seeded_ent
 		raw.tenant_id = requester;
 		raw.key_identity = Identity::blake3_tenant(requester, b"k");
 		raw.write_id = request_id;
-		let (response, marker) = nonleader.write(raw, single_kv_batch()).await.unwrap();
-		assert_refusal(&nonleader, response, request_id, marker);
+		assert_internal(nonleader.write(raw, single_kv_batch()).await.unwrap_err());
 		let mut table = typed_table_meta(&append_only_table_descriptor(), 1);
 		table.tenant_id = requester;
 		table.parent_write_id = request_id;
-		let (response, marker) = nonleader
-			.table_write(table, typed_table_batch(vec![1]))
-			.await
-			.unwrap();
-		assert_refusal(&nonleader, response.write, request_id, marker);
+		assert_internal(
+			nonleader
+				.table_write(table, typed_table_batch(vec![1]))
+				.await
+				.unwrap_err(),
+		);
 		let retained = server.idempotency.get(&key).unwrap();
 		match retained.outcome() {
 			WriteOutcome::FinalizationRecoverablePending {
@@ -465,7 +472,7 @@ async fn polluted_pending_cache_refuses_before_redirect_and_preserves_seeded_ent
 }
 
 #[tokio::test]
-async fn foreign_pending_first_error_order_preserves_each_request_path() {
+async fn other_tenant_pending_preserves_ordinary_first_error_order() {
 	let (_dir, node, server) = fixture("b1b-pending-first-error").await;
 	for (order, (owner, requester)) in [(7, 8), (8, 7)].into_iter().enumerate() {
 		let id = operation(300 + order as u64);
@@ -479,34 +486,32 @@ async fn foreign_pending_first_error_order_preserves_each_request_path() {
 		table.parent_write_id = id;
 		table.tenant_id = requester;
 		let delete = delete_meta(requester, &append_only_table_descriptor(), id);
-		// Raw keeps degraded and decode failures ahead of the new lower-helper gate.
+		// Raw keeps its ordinary degraded/decode ordering with an unrelated tenant record.
 		*server.local_persistence_distrust_reason.write().unwrap() = Some("test-fence".into());
 		assert_eq!(
 			server.write(raw, single_kv_batch()).await.unwrap().0.status,
 			WriteStatus::INTERNAL_ERROR
 		);
-		// Table/delete foreign refusal is earlier than their degraded fresh work.
-		assert_refusal(
-			&server,
+		// Other tenant's record cannot override degraded fresh-work failures.
+		assert_eq!(
 			server
 				.table_write(table, typed_table_batch(vec![1]))
 				.await
 				.unwrap()
 				.0
-				.write,
-			id,
-			None,
+				.write
+				.status,
+			WriteStatus::INTERNAL_ERROR
 		);
-		assert_refusal(
-			&server,
+		assert_eq!(
 			server
 				.table_delete(delete, vec![Identity::new([1; 32])])
 				.await
 				.unwrap()
 				.0
-				.write,
-			id,
-			None,
+				.write
+				.status,
+			WriteStatus::INTERNAL_ERROR
 		);
 		*server.local_persistence_distrust_reason.write().unwrap() = None;
 		assert!(server.write(raw, typed_table_batch(vec![1])).await.is_err());
@@ -524,16 +529,15 @@ async fn foreign_pending_first_error_order_preserves_each_request_path() {
 				.status,
 			WriteStatus::NOT_LEADER
 		);
-		assert_refusal(
-			&redirect,
+		assert_eq!(
 			redirect
 				.table_write(table, typed_table_batch(vec![1]))
 				.await
 				.unwrap()
 				.0
-				.write,
-			id,
-			None,
+				.write
+				.status,
+			WriteStatus::NOT_LEADER
 		);
 		let mut delete_nonleader = server.clone();
 		delete_nonleader.local_node = NodeId {
@@ -550,7 +554,7 @@ async fn foreign_pending_first_error_order_preserves_each_request_path() {
 				.status,
 			WriteStatus::NOT_LEADER
 		);
-		// Proxy/epoch/validation remain ahead of tenant replay and refusal.
+		// Proxy/epoch/validation retain their own-operation precedence.
 		let mut proxy = raw;
 		proxy.proxy_hop = 2;
 		assert_eq!(
@@ -592,8 +596,9 @@ async fn foreign_pending_first_error_order_preserves_each_request_path() {
 				.status,
 			WriteStatus::INTERNAL_ERROR
 		);
-		// Tenant-owned warm results win over a foreign indexed witness.
-		let mut owned = server.foreign_refusal(id).0;
+		// Tenant-owned warm results are independent of another tenant's witness.
+		let mut owned =
+			crate::network::data_server::error_response(&raw, WriteStatus::OK, server.local_node);
 		owned.status = WriteStatus::OK;
 		owned.commit_hlc = hlc(55, 0, 48);
 		owned = owned
@@ -686,16 +691,17 @@ async fn same_tenant_pending_replay_keeps_original_retryable_outcome() {
 	for tenant_id in [TenantId::new(7), TenantId::new(8)] {
 		let id = operation(400 + tenant_id.get());
 		let record = seed(&server, tenant_id, id).await;
-		assert!(
+		assert_eq!(
 			server
-				.foreign_pending(tenant_id, id)
+				.pending_finalizations
+				.find_by_write_id(tenant_id, id)
 				.await
-				.unwrap()
-				.is_none()
+				.unwrap(),
+			Some(record.clone())
 		);
 		let outcome = server.recoverable_pending_outcome_for_record(&record);
 		let (response, marker) = server
-			.replay_write_outcome(tenant_id, id, outcome)
+			.replay_write_outcome(tenant_id, outcome)
 			.await
 			.unwrap();
 		assert_eq!(response.status, WriteStatus::FINALIZATION_PENDING);
@@ -710,6 +716,172 @@ async fn same_tenant_pending_replay_keeps_original_retryable_outcome() {
 			.remove(record.id)
 			.await
 			.unwrap();
+	}
+	shutdown_lease_node(node).await;
+}
+
+#[tokio::test]
+async fn pending_restart_and_resolution_readers_are_independent_both_orders() {
+	let (_dir, node, server) = fixture("tenant-pending-readers").await;
+	for reverse in [false, true] {
+		for table in [false, true] {
+			let id = operation(2000 + u64::from(reverse) * 2 + u64::from(table));
+			let a = seed(&server, TenantId::new(7), id).await;
+			let mut finalization = a.finalization.clone();
+			finalization.tenant_id = TenantId::new(8);
+			finalization.marker.commit_hlc = hlc(1999, 8, 92);
+			let b = PendingFinalizationRecord::new(id, true, finalization);
+			let ordered = if reverse { [&b, &a] } else { [&a, &b] };
+			for row in ordered {
+				server
+					.pending_finalizations
+					.upsert_with_delete_counts(
+						row.clone(),
+						if row.finalization.tenant_id == TenantId::new(7) {
+							Some([7, 1, 0])
+						} else {
+							Some([8, 2, 0])
+						},
+					)
+					.await
+					.unwrap();
+			}
+			for (row, counts) in [(&a, [7, 1, 0]), (&b, [8, 2, 0])] {
+				let resolution = server
+					.resolve_mutation_outcome(MutationOutcomeRequestMeta {
+						operation_id: id,
+						tenant_id: row.finalization.tenant_id,
+					})
+					.await
+					.unwrap();
+				assert_eq!(resolution.resolution, MutationResolutionStatus::PRESENT);
+				assert_eq!(resolution.write.status, WriteStatus::FINALIZATION_PENDING);
+				assert_eq!(
+					resolution.write.commit_hlc,
+					row.finalization.marker.commit_hlc
+				);
+				assert_eq!(
+					[
+						resolution.deleted_count,
+						resolution.already_deleted_count,
+						resolution.not_found_count
+					],
+					counts
+				);
+			}
+			// A point lookup for B must select B despite A's competing canonical24.
+			let response = if table {
+				let mut meta = typed_table_meta(&append_only_table_descriptor(), 1);
+				meta.tenant_id = TenantId::new(8);
+				meta.parent_write_id = id;
+				server
+					.table_write(meta, typed_table_batch(vec![1]))
+					.await
+					.unwrap()
+					.0
+					.write
+			} else {
+				let mut meta = simple_write_meta(1);
+				meta.tenant_id = TenantId::new(8);
+				meta.key_identity = Identity::blake3_tenant(meta.tenant_id, b"k");
+				meta.write_id = id;
+				server.write(meta, single_kv_batch()).await.unwrap().0
+			};
+			assert_eq!(response.status, WriteStatus::DUPLICATE);
+			assert_eq!(response.commit_hlc, b.finalization.marker.commit_hlc);
+			assert_eq!(
+				server.pending_finalizations.get(a.id).await.unwrap(),
+				Some(a.clone())
+			);
+			assert_eq!(
+				server
+					.pending_finalizations
+					.delete_counts(a.id)
+					.await
+					.unwrap(),
+				Some([7, 1, 0])
+			);
+			assert!(
+				!server
+					.idempotency
+					.contains_key(&WendelonDataServer::idempotency_key_for(
+						TenantId::new(7),
+						id
+					))
+			);
+			let a_response = if table {
+				let mut meta = typed_table_meta(&append_only_table_descriptor(), 1);
+				meta.tenant_id = TenantId::new(7);
+				meta.parent_write_id = id;
+				server
+					.table_write(meta, typed_table_batch(vec![1]))
+					.await
+					.unwrap()
+					.0
+					.write
+			} else {
+				let mut meta = simple_write_meta(1);
+				meta.tenant_id = TenantId::new(7);
+				meta.key_identity = Identity::blake3_tenant(meta.tenant_id, b"k");
+				meta.write_id = id;
+				server.write(meta, single_kv_batch()).await.unwrap().0
+			};
+			assert_eq!(a_response.status, WriteStatus::DUPLICATE);
+			assert_eq!(a_response.commit_hlc, a.finalization.marker.commit_hlc);
+			server.pending_finalizations.remove(a.id).await.unwrap();
+		}
+	}
+	shutdown_lease_node(node).await;
+}
+
+#[tokio::test]
+async fn other_tenant_terminal_outcome_does_not_suppress_own_fresh_write() {
+	let (_dir, node, server) = fixture("tenant-terminal-independence").await;
+	for (owner, requester) in [(7, 8), (8, 7)] {
+		let id = operation(3000 + owner);
+		let mut meta = simple_write_meta(1);
+		meta.write_id = id;
+		meta.tenant_id = TenantId::new(owner);
+		let mut a =
+			crate::network::data_server::error_response(&meta, WriteStatus::OK, server.local_node);
+		a.commit_hlc = hlc(888, 7, 91);
+		a = a.with_mutation_outcome(MutationCommitKnowledge::COMMITTED, MutationStopReason::NONE);
+		server
+			.record_mutation_outcome(id, TenantId::new(owner), a, None, Some([9, 8, 7]))
+			.await
+			.unwrap();
+		let key = WendelonDataServer::idempotency_key_for(TenantId::new(owner), id);
+		server.idempotency.insert(
+			key,
+			CachedWriteOutcome::new(WriteOutcome::NoopCommitted { response: a }),
+		);
+		meta.tenant_id = TenantId::new(requester);
+		meta.key_identity = Identity::blake3_tenant(meta.tenant_id, b"k");
+		let (b, _) = server.write(meta, single_kv_batch()).await.unwrap();
+		assert_own_response(b, id, false);
+		assert_ne!(b.commit_hlc, a.commit_hlc);
+		let unchanged = server
+			.resolve_mutation_outcome(MutationOutcomeRequestMeta {
+				operation_id: id,
+				tenant_id: TenantId::new(owner),
+			})
+			.await
+			.unwrap();
+		assert_eq!(bytemuck::bytes_of(&unchanged.write), bytemuck::bytes_of(&a));
+		assert_eq!(
+			[
+				unchanged.deleted_count,
+				unchanged.already_deleted_count,
+				unchanged.not_found_count
+			],
+			[9, 8, 7]
+		);
+		match server.idempotency.get(&key).unwrap().outcome() {
+			WriteOutcome::NoopCommitted { response } => {
+				assert_eq!(bytemuck::bytes_of(&response), bytemuck::bytes_of(&a))
+			}
+			other => panic!("owner cache changed: {other:?}"),
+		}
 	}
 	shutdown_lease_node(node).await;
 }
