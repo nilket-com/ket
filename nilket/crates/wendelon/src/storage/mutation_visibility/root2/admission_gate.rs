@@ -51,9 +51,12 @@ impl Root2 {
 		command: &Command2,
 	) -> Result2<(Root2, ApplyResult2)> {
 		// 0-1. Only this command, only a rooted state.
-		let Command2::AdmissionPermission(bytes) = command else {
+		if !matches!(
+			command,
+			Command2::AdmissionPermission(_) | Command2::EpochAdmissionPermission(_)
+		) {
 			return Err(RootError2::TrustMismatch);
-		};
+		}
 		let Some((root, origin)) = root_and_origin2(state) else {
 			return Err(RootError2::TrustMismatch);
 		};
@@ -80,7 +83,11 @@ impl Root2 {
 			manifest_pin: s.control_digest,
 		};
 		// The installed recorded length, which install bound to its root's commitment.
-		if s.control_len != admin_manifest_len2(admin) || admin_context2(admin) != expected {
+		if s.control_len != admin_manifest_len2(admin)
+			|| admin_context2(admin) != expected
+			|| super::admin_install::admin_cut3(admin)
+				.is_some_and(|cut| cut != (s.covered, s.fingerprint, s.command_digest))
+		{
 			return Err(RootError2::TrustMismatch);
 		}
 		// 6-7. Replay and gap, only after the administrator is bound.
@@ -98,7 +105,13 @@ impl Root2 {
 		let mut result = if !verified.authorized() {
 			denied(8, None)
 		} else {
-			match check_admin_statement2(admin, bytes) {
+			match match command {
+				Command2::AdmissionPermission(bytes) => check_admin_statement2(admin, bytes),
+				Command2::EpochAdmissionPermission(bytes) => {
+					super::admin_statement::check_epoch_statement3(admin, bytes)
+				}
+				_ => unreachable!("checked admission kind"),
+			} {
 				Err(_) => denied(8, None),
 				Ok(checked) => apply_admission(&mut next, &checked, l)?,
 			}

@@ -42,6 +42,7 @@ fn bootstrap_root(
 		lineages: Map::new(),
 		cuts: Cuts2::default(),
 		parents: Map::new(),
+		role_epochs: None,
 		derived: Derived2::default(),
 	};
 	admin_class_of(&state)?;
@@ -79,7 +80,10 @@ impl Root2 {
 		}
 		// Dormant: no issuer gate exists, so an Admission permission command has no result at all,
 		// not even an exact-replay AlreadyProcessed.
-		if let Command2::AdmissionPermission(_) = command {
+		if matches!(
+			command,
+			Command2::AdmissionPermission(_) | Command2::EpochAdmissionPermission(_)
+		) {
 			return Err(RootError2::TrustMismatch);
 		}
 		if l.index == s.covered.index {
@@ -172,6 +176,14 @@ fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Res
 	let limits = root.limits;
 	match cmd {
 		Command2::Bootstrap { .. } => Ok(denied(1, Some(s.bootstrap))),
+		Command2::RotateAdmin(key) => super::role_epochs::rotate(root, 0, *key, l, v.role_seed3()),
+		Command2::RotateGovernance(key) => {
+			super::role_epochs::rotate(root, 1, *key, l, v.role_seed3())
+		}
+		Command2::RotateRecovery(key) => {
+			super::role_epochs::rotate(root, 2, *key, l, v.role_seed3())
+		}
+		Command2::EpochAdmissionPermission(_) => Err(RootError2::TrustMismatch),
 		Command2::Cover { .. } => Ok(ApplyResult2::Covered),
 		Command2::EnrollSelector(b) => {
 			let k = b.encode().map_err(|_| RootError2::Codec)?;

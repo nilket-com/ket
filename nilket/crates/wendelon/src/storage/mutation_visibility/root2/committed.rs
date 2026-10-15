@@ -133,7 +133,10 @@ fn request_class(request: &WendelonRequest) -> (EntryClass2, Option<CarrierComma
 				return (EntryClass2::MalformedRoot2, None);
 			};
 			let governance = carrier.governance_bytes();
-			if governance.is_some_and(|bytes| bytes.len() != GOVERNANCE_SIDECAR_BYTES2) {
+			if governance.is_some_and(|bytes| {
+				bytes.len() != GOVERNANCE_SIDECAR_BYTES2
+					&& bytes.len() != super::role_command::ROLE_PROOF_BYTES3
+			}) {
 				return (EntryClass2::MalformedRoot2, None);
 			}
 			let Ok(digest) = command.digest(generation, cluster) else {

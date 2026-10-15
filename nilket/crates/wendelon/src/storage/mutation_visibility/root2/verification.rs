@@ -60,6 +60,7 @@ pub(in crate::storage::mutation_visibility::root2) enum VerifyError2 {
 	MissingSidecar,
 	SidecarLength,
 	Governance(GovernanceCommandError2),
+	Role(super::role_command::RoleProofError3),
 	Install(InstallError2),
 	IssuerPayload,
 	Unsupported(UnsupportedKind2),
@@ -114,6 +115,7 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_verified2(
 			command,
 			Command2::Bootstrap { .. }
 				| Command2::AdmissionPermission(_)
+				| Command2::EpochAdmissionPermission(_)
 				| Command2::Reserve(_)
 				| Command2::Finalize { .. }
 		) {
@@ -122,7 +124,9 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_verified2(
 	let token = verify_command2(state, pin, entry, command, governance)?;
 	match command {
 		Command2::Bootstrap { .. } => bootstrap2(state, committed, entry, &token, command),
-		Command2::AdmissionPermission(_) => advance_admission2(state, pin, entry, &token, command),
+		Command2::AdmissionPermission(_) | Command2::EpochAdmissionPermission(_) => {
+			advance_admission2(state, pin, entry, &token, command)
+		}
 		_ => advance_root2(state, entry, &token, command),
 	}
 	.map_err(E::Consumer)
@@ -132,7 +136,11 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_verified2(
 fn kind(command: &Command2) -> Result<(), VerifyError2> {
 	use VerifyError2 as E;
 	match command {
-		Command2::Bootstrap { .. }
+		Command2::RotateAdmin(_)
+		| Command2::RotateGovernance(_)
+		| Command2::RotateRecovery(_)
+		| Command2::EpochAdmissionPermission(_)
+		| Command2::Bootstrap { .. }
 		| Command2::AdmissionPermission(_)
 		| Command2::Reserve(_)
 		| Command2::Finalize { .. } => Ok(()),
@@ -158,12 +166,43 @@ fn verify_command2(
 	governance: Option<&[u8]>,
 ) -> Result<VerifiedCommand2, VerifyError2> {
 	let (g, c, _, _, d) = entry.fields();
+	let mut role_seed = None;
 	let (authorized, evidence) = match (command, origin_view2(state)) {
 		(Command2::Bootstrap { .. }, OriginView2::PreRoot { genesis }) => {
 			(bootstrap_authorized(genesis, pin, entry, command), 0)
 		}
 		(Command2::AdmissionPermission(bytes), OriginView2::Root) => {
 			(statement_authorized(state, pin, bytes), 0)
+		}
+		(Command2::EpochAdmissionPermission(bytes), OriginView2::Root) => {
+			let admin = install_admin2(state, pin).map_err(VerifyError2::Install)?;
+			(
+				super::admin_statement::check_epoch_statement3(&admin, bytes).is_ok(),
+				0,
+			)
+		}
+		(
+			Command2::RotateAdmin(_) | Command2::RotateGovernance(_) | Command2::RotateRecovery(_),
+			OriginView2::Root,
+		) => {
+			let bytes = governance.ok_or(VerifyError2::MissingSidecar)?;
+			super::role_command::parse(bytes).map_err(VerifyError2::Role)?;
+			let admin = install_admin2(state, pin).map_err(VerifyError2::Install)?;
+			let expected = if matches!(command, Command2::RotateRecovery(_)) {
+				[1, 2]
+			} else {
+				[3, 0]
+			};
+			let ok = super::role_command::verify(&admin, bytes, d, expected)
+				.map_err(VerifyError2::Role)?;
+			if ok {
+				let keys =
+					super::admin_install::original_roles3(&admin).ok_or(VerifyError2::StateKind)?;
+				let (covered, fp, digest) =
+					super::admin_install::admin_cut3(&admin).ok_or(VerifyError2::StateKind)?;
+				role_seed = Some((keys, covered, fp, digest));
+			}
+			(ok, 0)
 		}
 		(Command2::Reserve(claim), OriginView2::Root) => {
 			let (root, _) = root_and_origin2(state).ok_or(VerifyError2::StateKind)?;
@@ -197,7 +236,7 @@ fn verify_command2(
 		_ => return Err(VerifyError2::StateKind),
 	};
 	Ok(VerifiedCommand2::verified2(
-		g, c, d, authorized, None, evidence,
+		g, c, d, authorized, None, evidence, role_seed,
 	))
 }
 

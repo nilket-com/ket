@@ -116,7 +116,6 @@ fn array<const N: usize>(b: &[u8], at: usize) -> [u8; N] {
 fn u64_at(b: &[u8], at: usize) -> u64 {
 	u64::from_le_bytes(array(b, at))
 }
-
 fn check_context(context: &AdminContext2) -> Result<(), GovernanceCommandError2> {
 	use GovernanceField2 as F;
 	let l = context.installed_at;
@@ -194,7 +193,6 @@ pub(in crate::storage::mutation_visibility::root2) fn parse_governance_command2(
 	check_context(&context)?;
 	Ok((context, array(bytes, 200), array(bytes, SIGNED)))
 }
-
 pub(in crate::storage::mutation_visibility::root2) fn encode_governance_command2(
 	context: &AdminContext2,
 	command_digest: Digest2,
@@ -237,6 +235,9 @@ pub(in crate::storage::mutation_visibility::root2) fn check_governance_command2(
 		.try_into()
 		.map_err(|_| GovernanceCommandError2::Length)?;
 	let preimage = governance_command_preimage2(fixed)?;
+	if super::admin_install::active_role3(admin, 1).is_some_and(|(k, _)| k != 0) {
+		return Err(GovernanceCommandError2::Signature);
+	}
 	VerifyingKey::from_bytes(&role.key())
 		.map_err(|_| GovernanceCommandError2::Signature)?
 		.verify_strict(&preimage, &Signature::from_bytes(&signature))

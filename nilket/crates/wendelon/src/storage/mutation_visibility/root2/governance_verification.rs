@@ -59,15 +59,32 @@ fn governance_failure2(
 		| Command2::AdmissionPermission(_)
 		| Command2::Reserve(_)
 		| Command2::Finalize { .. }
-		| Command2::Cover { .. } => return Err(VerifyError2::StateKind),
+		| Command2::Cover { .. }
+		| Command2::RotateAdmin(_)
+		| Command2::RotateGovernance(_)
+		| Command2::RotateRecovery(_)
+		| Command2::EpochAdmissionPermission(_) => return Err(VerifyError2::StateKind),
 	};
 	let bytes = governance.ok_or(VerifyError2::MissingSidecar)?;
-	if bytes.len() != GOVERNANCE_COMMAND_BYTES2 {
-		return Err(VerifyError2::SidecarLength);
+	let role_proof = bytes.len() == super::role_command::ROLE_PROOF_BYTES3;
+	if role_proof {
+		super::role_command::parse(bytes).map_err(VerifyError2::Role)?;
+	} else {
+		if bytes.len() != GOVERNANCE_COMMAND_BYTES2 {
+			return Err(VerifyError2::SidecarLength);
+		}
+		parse_governance_command2(bytes).map_err(VerifyError2::Governance)?;
 	}
-	parse_governance_command2(bytes).map_err(VerifyError2::Governance)?;
 	let admin = install_admin2(state, pin).map_err(VerifyError2::Install)?;
-	if let Err(error) = check_governance_command2(&admin, action, bytes, digest) {
+	if role_proof {
+		if !super::admin_install::admin_governance2(&admin)
+			.is_some_and(|r| r.actions() & action.bit() != 0)
+			|| !super::role_command::verify(&admin, bytes, digest, [2, 0])
+				.map_err(VerifyError2::Role)?
+		{
+			return Ok(Some(Denial2::Envelope(GovernanceCommandError2::Signature)));
+		}
+	} else if let Err(error) = check_governance_command2(&admin, action, bytes, digest) {
 		return Ok(Some(Denial2::Envelope(error)));
 	}
 	let namespace = admin_namespace2(&admin);
@@ -93,7 +110,11 @@ fn governance_failure2(
 		| Command2::AdmissionPermission(_)
 		| Command2::Reserve(_)
 		| Command2::Finalize { .. }
-		| Command2::Cover { .. } => return Err(VerifyError2::StateKind),
+		| Command2::Cover { .. }
+		| Command2::RotateAdmin(_)
+		| Command2::RotateGovernance(_)
+		| Command2::RotateRecovery(_)
+		| Command2::EpochAdmissionPermission(_) => return Err(VerifyError2::StateKind),
 	};
 	if !in_scope {
 		return Ok(Some(Denial2::Scope));

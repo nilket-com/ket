@@ -766,13 +766,35 @@ fn denied_eighteen_and_nineteen_codec() {
 		assert_eq!(r.encode(g, c, l(processed)).unwrap(), b);
 	}
 	for (name, value) in rv()["denied_refusals"].as_object().unwrap() {
+		let b = unhex(value.as_str().unwrap());
+		if name == "twenty" {
+			let (dg, dc, dl, result) = ApplyResult2::decode(&b).unwrap();
+			assert_eq!(result, denied(20, None));
+			assert_eq!(result.encode(dg, dc, dl).unwrap(), b);
+		} else {
+			assert_eq!(
+				ApplyResult2::decode(&b).err(),
+				Some(RootError2::Codec),
+				"{name}"
+			);
+		}
+	}
+	for reason in 1..=23 {
+		let result = denied(reason, None).encode(g, c, l(8));
 		assert_eq!(
-			ApplyResult2::decode(&unhex(value.as_str().unwrap())).err(),
-			Some(RootError2::Codec),
-			"{name}"
+			result.is_ok(),
+			matches!(reason, 1..=18 | 20..=22),
+			"{reason}"
 		);
 	}
-	for bad in [denied(18, Some(6)), denied(19, None), denied(20, None)] {
+	for bad in [
+		denied(18, Some(6)),
+		denied(19, None),
+		denied(23, None),
+		denied(20, Some(6)),
+		denied(21, Some(6)),
+		denied(22, Some(6)),
+	] {
 		assert_eq!(bad.encode(g, c, l(8)).err(), Some(RootError2::Codec));
 	}
 	assert_eq!(

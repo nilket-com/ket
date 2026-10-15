@@ -303,7 +303,11 @@ fn action_table_matches_current_command_tags_exhaustively() {
 			| Command2::Cover { .. }
 			| Command2::Reserve(_)
 			| Command2::Finalize { .. }
-			| Command2::AdmissionPermission(_) => None,
+			| Command2::AdmissionPermission(_)
+			| Command2::RotateAdmin(_)
+			| Command2::RotateGovernance(_)
+			| Command2::RotateRecovery(_)
+			| Command2::EpochAdmissionPermission(_) => None,
 		}
 	}
 	let v: serde_json::Value = serde_json::from_str(include_str!("goldens.json")).unwrap();

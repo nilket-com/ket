@@ -180,6 +180,9 @@ pub(in crate::storage::mutation_visibility::root2) fn check_admin_command2(
 	let fixed: &[u8; ADMIN_COMMAND_BYTES2] =
 		bytes.try_into().map_err(|_| EnvelopeError2::Length)?;
 	let preimage = admin_command_preimage2(fixed)?;
+	if super::admin_install::active_role3(admin, 0).is_some_and(|(k, _)| k != 0) {
+		return Err(EnvelopeError2::Signature);
+	}
 	VerifyingKey::from_bytes(&admin_key2(admin))
 		.map_err(|_| EnvelopeError2::Signature)?
 		.verify_strict(&preimage, &Signature::from_bytes(&signature))

@@ -390,7 +390,10 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_admission2(
 	verified: &VerifiedCommand2,
 	command: &Command2,
 ) -> Result2<(MutationAuthorityState2, ApplyResult2)> {
-	if !matches!(command, Command2::AdmissionPermission(_)) {
+	if !matches!(
+		command,
+		Command2::AdmissionPermission(_) | Command2::EpochAdmissionPermission(_)
+	) {
 		return Err(RootError2::TrustMismatch);
 	}
 	let StateInner2::Root(_, origin) = &state.inner else {

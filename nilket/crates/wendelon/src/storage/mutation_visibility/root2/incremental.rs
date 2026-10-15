@@ -74,6 +74,13 @@ impl Derived2 {
 				d.non_grants.insert(l.index, ());
 			}
 		}
+		if let Some(epochs) = &s.role_epochs {
+			for history in &epochs.successors {
+				for e in history {
+					d.non_grants.insert(e.activated.index, ());
+				}
+			}
+		}
 		for p in s.parents.values() {
 			d.parent(p)?;
 			d.non_grants.insert(p.reservation.index, ());
@@ -242,8 +249,15 @@ pub(super) fn update(old: &State2, next: &mut State2, cmd: &Command2) -> Result2
 		}
 		// Summarizes a semantically valid single-key permission transition from `old` to `next`;
 		// one keyed lookup per map. No production caller reaches it until the issuer gate exists.
-		Command2::AdmissionPermission(bytes) => {
-			let f = inspect_admin_statement2(bytes).map_err(|_| RootError2::Codec)?;
+		Command2::AdmissionPermission(_) | Command2::EpochAdmissionPermission(_) => {
+			let f = match cmd {
+				Command2::AdmissionPermission(bytes) => inspect_admin_statement2(bytes),
+				Command2::EpochAdmissionPermission(bytes) => {
+					super::admin_statement::inspect_epoch_statement3(bytes)
+				}
+				_ => unreachable!("checked admission kind"),
+			}
+			.map_err(|_| RootError2::Codec)?;
 			let key = encode_permission_key2(&f.key).map_err(|_| RootError2::Codec)?;
 			match (old.permissions.get(&key), next.permissions.get(&key)) {
 				(None, Some(p)) => {
@@ -256,6 +270,30 @@ pub(super) fn update(old: &State2, next: &mut State2, cmd: &Command2) -> Result2
 					}
 				}
 				_ => {}
+			}
+		}
+		Command2::RotateAdmin(_) | Command2::RotateGovernance(_) | Command2::RotateRecovery(_) => {
+			let before = super::role_epochs::charge(old)?;
+			let after = super::role_epochs::charge(next)?;
+			d.usage.history = add(
+				d.usage.history,
+				after.checked_sub(before).ok_or(RootError2::RootInvariant)?,
+			)?;
+			let role = match cmd {
+				Command2::RotateAdmin(_) => 0,
+				Command2::RotateGovernance(_) => 1,
+				_ => 2,
+			};
+			let old_len = old
+				.role_epochs
+				.as_ref()
+				.map_or(0, |e| e.successors[role].len());
+			if let Some(epoch) = next
+				.role_epochs
+				.as_ref()
+				.and_then(|e| e.successors[role].get(old_len))
+			{
+				d.non_grants.insert(epoch.activated.index, ());
 			}
 		}
 		Command2::Bootstrap { .. } | Command2::Cover { .. } => {}
