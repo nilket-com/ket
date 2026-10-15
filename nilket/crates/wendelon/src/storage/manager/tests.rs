@@ -2982,9 +2982,19 @@ async fn counter_replica_service_replicate_live_then_restart_skips_without_marke
 		)
 		.await;
 		let svc = CounterReplicaService::new(mgr.clone());
-		svc.replicate_tentative(1, tenant(), id, 5, hlc(1))
-			.await
-			.unwrap();
+		svc.replicate_tentative(
+			NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+			1,
+			tenant(),
+			id,
+			5,
+			hlc(1),
+		)
+		.await
+		.unwrap();
 		assert_eq!(
 			svc.read_committed(tenant(), id).await.unwrap(),
 			Some(5),
@@ -3014,19 +3024,59 @@ async fn counter_replica_service_rollback_removes_matching_op_idempotent() {
 	.await;
 	let svc = CounterReplicaService::new(mgr);
 	let id = counter_identity(&ckey(b"verdict"));
-	svc.replicate_tentative(1, tenant(), id, 5, hlc(1))
-		.await
-		.unwrap();
-	svc.replicate_tentative(2, tenant(), id, 9, hlc(2))
-		.await
-		.unwrap();
+	svc.replicate_tentative(
+		NodeId {
+			id: 1,
+			_reserved: 0,
+		},
+		1,
+		tenant(),
+		id,
+		5,
+		hlc(1),
+	)
+	.await
+	.unwrap();
+	svc.replicate_tentative(
+		NodeId {
+			id: 1,
+			_reserved: 0,
+		},
+		2,
+		tenant(),
+		id,
+		9,
+		hlc(2),
+	)
+	.await
+	.unwrap();
 	assert_eq!(svc.pending_count(), 2);
-	svc.rollback(1);
+	svc.rollback(
+		NodeId {
+			id: 1,
+			_reserved: 0,
+		},
+		1,
+		tenant(),
+		id,
+	)
+	.await
+	.unwrap();
 	assert_eq!(svc.pending_count(), 1, "only op 1 removed");
 	// op 2's tentative (value 9, higher HLC) remains the live latest.
 	assert_eq!(svc.read_committed(tenant(), id).await.unwrap(), Some(9));
 	// Idempotent: rolling back op 1 again is a harmless no-op.
-	svc.rollback(1);
+	svc.rollback(
+		NodeId {
+			id: 1,
+			_reserved: 0,
+		},
+		1,
+		tenant(),
+		id,
+	)
+	.await
+	.unwrap();
 	assert_eq!(svc.pending_count(), 1);
 }
 
@@ -3045,10 +3095,30 @@ async fn counter_replica_service_commit_makes_value_survive_restart() {
 		)
 		.await;
 		let svc = CounterReplicaService::new(mgr.clone());
-		svc.replicate_tentative(7, tenant(), id, 42, hlc(1))
-			.await
-			.unwrap();
-		svc.commit(7).await.unwrap();
+		svc.replicate_tentative(
+			NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+			7,
+			tenant(),
+			id,
+			42,
+			hlc(1),
+		)
+		.await
+		.unwrap();
+		svc.commit(
+			NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+			7,
+			tenant(),
+			id,
+		)
+		.await
+		.unwrap();
 		assert_eq!(svc.pending_count(), 0, "committed op left the pending set");
 		mgr.fsync_all_local_slabs().await.unwrap();
 	}
@@ -3099,8 +3169,11 @@ async fn leader_over_real_replica_service_commits_value_visible_through_service(
 		id: 1,
 		_reserved: 0,
 	};
-	let local =
-		CounterParticipantKind::Local(LocalCounterParticipant::new(service.clone(), tenant()));
+	let local = CounterParticipantKind::Local(LocalCounterParticipant::new(
+		service.clone(),
+		tenant(),
+		local_id,
+	));
 	let leader = CounterLeader::new(
 		local_id,
 		local.clone(),

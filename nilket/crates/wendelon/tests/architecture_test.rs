@@ -8851,11 +8851,83 @@ fn adr076_pending_witness_never_expires_on_peer_loss() {
 	assert!(commit.contains("let Some(participant) = resolver.resolve_recorded(i) else"));
 	assert!(commit.contains("continue;"));
 	assert!(
-		commit.contains(".is_ok() && participant.commit(op_id).await.is_ok()"),
+		commit.contains(".is_ok() && participant.commit(op_id, &key).await.is_ok()"),
 		"commit failures must leave the witness pending for a later reconcile"
 	);
 	assert!(!commit.contains("expire"));
 	assert!(!commit.contains("deadline"));
+	// Replica operation scope is private and bound to the checked allocating node.
+	let scope = source_region(&counter, "struct ReplicaOpKey2 {", "impl ReplicaOpKey2");
+	for field in ["tenant: TenantId", "origin_node: u32", "op_id: u64"] {
+		assert!(scope.contains(field));
+	}
+	assert!(!scope.contains("epoch"));
+	assert!(counter.contains("\nstruct ReplicaOpKey2 {"));
+	assert!(counter.contains("origin._reserved != 0"));
+	assert!(
+		counter.contains(
+			"\nenum CounterReplicaRejection {\n\tZeroExpectedKey,\n\tTentativeConflict,\n}"
+		)
+	);
+	assert!(counter.contains("Self::ZeroExpectedKey => std::io::ErrorKind::InvalidInput"));
+	assert!(counter.contains("Self::TentativeConflict => std::io::ErrorKind::AlreadyExists"));
+
+	let service = source_region(
+		&counter,
+		"pub struct CounterReplicaService",
+		"/// The leader's own (local) participant",
+	);
+	assert!(service.contains("pending: DashMap<ReplicaOpKey2, PendingReplicaTentative>"));
+	assert!(service.contains("op_locks: DashMap<ReplicaOpKey2, Arc<Mutex<()>>>"));
+	assert!(!service.contains("lock_owned") && !service.contains("blocking_lock"));
+	assert!(service.contains("self.op_locks.remove_if(&key, |_, stored|"));
+	assert!(service.contains("Arc::ptr_eq(stored, gate) && Arc::strong_count(gate) == 2"));
+	assert!(!service.contains("self.op_locks.remove("));
+	assert!(service.contains("if self.pending.contains_key(&key)"));
+	for marker in ["pub async fn commit(", "pub async fn rollback("] {
+		let start = service.find(marker).unwrap();
+		let next = &service[start..];
+		let zero = next.find("check_expected_key2(expected_key)?;").unwrap();
+		let gate = next.find("let _guard = gate.lock().await;").unwrap();
+		let lookup = next.find("self.pending.get(&key)").unwrap();
+		let compare = next.find("pending.key_identity != expected_key").unwrap();
+		assert!(zero < gate && gate < lookup && lookup < compare);
+	}
+	assert!(counter.contains(
+		"fn counter_replica_rejection2(error: &std::io::Error) -> Option<&CounterReplicaRejection>"
+	));
+	assert!(counter.contains("error.get_ref()?.downcast_ref::<CounterReplicaRejection>()"));
+	let network = data_server_workspace_source();
+	for (handler, next, operation) in [
+		(
+			"async fn handle_counter_replicate",
+			"async fn handle_counter_rollback",
+			"counter replication",
+		),
+		(
+			"async fn handle_counter_rollback",
+			"async fn handle_counter_add",
+			"counter rollback",
+		),
+	] {
+		let body = source_region(&network, handler, next);
+		assert!(body.contains("context: &RequestContext"));
+		let origin = body
+			.find(&format!("require_authenticated_node(\"{operation}\")"))
+			.unwrap();
+		assert!(body.contains("origin._reserved == 0"));
+		assert!(body.contains("CounterReplicaStatus::NOT_AUTHORIZED"));
+		assert!(
+			origin
+				< body
+					.find("self.counter_replica")
+					.or_else(|| body.find(".counter_replica"))
+					.unwrap()
+		);
+		assert!(body.contains("Err(_) => CounterReplicaStatus::INTERNAL_ERROR"));
+	}
+	assert!(network.contains("self.handle_counter_replicate(&context, frame)"));
+	assert!(network.contains("self.handle_counter_rollback(&context, frame)"));
 }
 
 #[test]
