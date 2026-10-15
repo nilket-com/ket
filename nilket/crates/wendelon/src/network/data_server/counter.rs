@@ -82,6 +82,7 @@ impl CounterParticipantFactory {
 			CounterParticipantKind::Local(LocalCounterParticipant::new(
 				self.local.clone(),
 				self.tenant_id,
+				self.local_node,
 			))
 		} else {
 			CounterParticipantKind::Remote(RemoteCounterParticipant::new(
@@ -102,17 +103,37 @@ impl WendelonDataServer {
 	/// replication semantics.
 	pub(super) async fn handle_counter_replicate(
 		&self,
+		context: &RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<HrftFrame> {
 		let meta: CounterReplicateRequestMeta = *bytemuck::from_bytes(
 			&frame.meta[..std::mem::size_of::<CounterReplicateRequestMeta>()],
 		);
+		let origin = match context.require_authenticated_node("counter replication") {
+			Ok(origin) if origin._reserved == 0 => origin,
+			_ => {
+				return Ok(self.counter_ack_frame(
+					frame.header.stream_id,
+					MsgType::COUNTER_REPLICATE_RESP.0,
+					CounterReplicaStatus::NOT_AUTHORIZED,
+					meta.op_id,
+				));
+			}
+		};
+		if meta.phase != CounterReplicaPhase::TENTATIVE && meta.phase != CounterReplicaPhase::COMMIT
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"COUNTER_REPLICATE_REQ unknown phase",
+			));
+		}
 		let status = if self.degraded_reason().is_some() {
 			CounterReplicaStatus::INTERNAL_ERROR
 		} else {
 			let result = if meta.phase == CounterReplicaPhase::TENTATIVE {
 				self.counter_replica
 					.replicate_tentative(
+						origin,
 						meta.op_id,
 						meta.tenant_id,
 						meta.key_identity,
@@ -120,13 +141,10 @@ impl WendelonDataServer {
 						meta.commit_hlc,
 					)
 					.await
-			} else if meta.phase == CounterReplicaPhase::COMMIT {
-				self.counter_replica.commit(meta.op_id).await
 			} else {
-				return Err(Error::new(
-					ErrorKind::InvalidData,
-					"COUNTER_REPLICATE_REQ unknown phase",
-				));
+				self.counter_replica
+					.commit(origin, meta.op_id, meta.tenant_id, meta.key_identity)
+					.await
 			};
 			match result {
 				Ok(()) => CounterReplicaStatus::OK,
@@ -145,15 +163,34 @@ impl WendelonDataServer {
 	/// tentative op (idempotent) and acks.
 	pub(super) async fn handle_counter_rollback(
 		&self,
+		context: &RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<HrftFrame> {
 		let meta: CounterRollbackRequestMeta =
 			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<CounterRollbackRequestMeta>()]);
-		self.counter_replica.rollback(meta.op_id);
+		let origin = match context.require_authenticated_node("counter rollback") {
+			Ok(origin) if origin._reserved == 0 => origin,
+			_ => {
+				return Ok(self.counter_ack_frame(
+					frame.header.stream_id,
+					MsgType::COUNTER_ROLLBACK_RESP.0,
+					CounterReplicaStatus::NOT_AUTHORIZED,
+					meta.op_id,
+				));
+			}
+		};
+		let status = match self
+			.counter_replica
+			.rollback(origin, meta.op_id, meta.tenant_id, meta.key_identity)
+			.await
+		{
+			Ok(()) => CounterReplicaStatus::OK,
+			Err(_) => CounterReplicaStatus::INTERNAL_ERROR,
+		};
 		Ok(self.counter_ack_frame(
 			frame.header.stream_id,
 			MsgType::COUNTER_ROLLBACK_RESP.0,
-			CounterReplicaStatus::OK,
+			status,
 			meta.op_id,
 		))
 	}

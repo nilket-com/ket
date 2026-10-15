@@ -696,28 +696,75 @@ impl<S: CounterSlab> CounterReplica<S> {
 // the pending-finalization / `TenantFinalization` machinery (witness-after-quorum
 // lives in the leader), so a replicated tentative carries no witness.
 
-/// One in-flight tentative on a replica: the tenant, the counter identity, and
-/// the local record location (whose offset is the local commit-marker op-id).
+/// Live operation scope: allocator identity is checked by ingress, never request metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ReplicaOpKey2 {
+	tenant: TenantId,
+	origin_node: u32,
+	op_id: u64,
+}
+impl ReplicaOpKey2 {
+	fn new(origin: NodeId, tenant: TenantId, op_id: u64) -> std::io::Result<Self> {
+		if origin._reserved != 0 {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"counter origin has reserved bits",
+			));
+		}
+		Ok(Self {
+			tenant,
+			origin_node: origin.id,
+			op_id,
+		})
+	}
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CounterReplicaRejection {
+	ZeroExpectedKey,
+	TentativeConflict,
+}
+impl std::fmt::Display for CounterReplicaRejection {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(match self {
+			Self::ZeroExpectedKey => "counter expected key is zero",
+			Self::TentativeConflict => "counter tentative conflicts",
+		})
+	}
+}
+impl std::error::Error for CounterReplicaRejection {}
+impl CounterReplicaRejection {
+	fn into_error(self) -> std::io::Error {
+		let kind = match self {
+			Self::ZeroExpectedKey => std::io::ErrorKind::InvalidInput,
+			Self::TentativeConflict => std::io::ErrorKind::AlreadyExists,
+		};
+		std::io::Error::new(kind, self)
+	}
+}
+#[cfg(test)]
+fn counter_replica_rejection2(error: &std::io::Error) -> Option<&CounterReplicaRejection> {
+	error.get_ref()?.downcast_ref::<CounterReplicaRejection>()
+}
+fn check_expected_key2(expected_key: Identity) -> std::io::Result<()> {
+	if expected_key == Identity::new([0; 32]) {
+		return Err(CounterReplicaRejection::ZeroExpectedKey.into_error());
+	}
+	Ok(())
+}
+/// Pending content and its local marker offset. This is a live map, not a terminal ledger.
 #[derive(Clone, Copy)]
 struct PendingReplicaTentative {
 	tenant_id: TenantId,
 	key_identity: Identity,
+	value: u64,
 	location: RecordLocation,
 }
-
 /// The server-side counter replica over a [`SlabManager`].
 pub struct CounterReplicaService {
 	slab: Arc<crate::storage::manager::SlabManager>,
-	/// Leader-assigned `op_id` → the local tentative it produced. Live-only;
-	/// recovery rebuilds committed state from the slab and skips orphans.
-	pending: DashMap<u64, PendingReplicaTentative>,
-	/// Per-`op_id` gate making `replicate_tentative` idempotent under concurrency
-	/// (same rationale as [`CounterReplica::op_locks`]): without it, concurrent
-	/// retransmits of one `op_id` both miss `pending` and append two live
-	/// tentatives, the first of which `commit`/`rollback` then leak.
-	op_locks: DashMap<u64, Arc<Mutex<()>>>,
+	pending: DashMap<ReplicaOpKey2, PendingReplicaTentative>,
+	op_locks: DashMap<ReplicaOpKey2, Arc<Mutex<()>>>,
 }
-
 impl CounterReplicaService {
 	pub fn new(slab: Arc<crate::storage::manager::SlabManager>) -> Self {
 		Self {
@@ -726,47 +773,79 @@ impl CounterReplicaService {
 			op_locks: DashMap::new(),
 		}
 	}
-
-	/// `COUNTER_REPLICATE_REQ` (phase TENTATIVE): durably append the tentative
-	/// value at the leader's `commit_hlc` and index it live — **no** commit
-	/// marker, **no** pending-finalization witness. Idempotent on `op_id`,
-	/// including under concurrent retransmits (the per-op_id gate).
+	// Called with the borrowed gate guard held and no DashMap refs retained. Under the shard
+	// write lock, two Arc owners mean exactly this caller and the map, with no old waiter.
+	fn reclaim_gate2(&self, key: ReplicaOpKey2, gate: &Arc<Mutex<()>>) {
+		if self.pending.contains_key(&key) {
+			return;
+		}
+		self.op_locks.remove_if(&key, |_, stored| {
+			Arc::ptr_eq(stored, gate) && Arc::strong_count(gate) == 2
+		});
+	}
+	/// Append one tentative; matching retries are idempotent only while pending exists.
 	pub async fn replicate_tentative(
 		&self,
+		origin: NodeId,
 		op_id: u64,
 		tenant_id: TenantId,
 		key_identity: Identity,
 		value: u64,
 		commit_hlc: HybridTimestamp,
 	) -> std::io::Result<()> {
-		let gate = self.op_locks.entry(op_id).or_default().clone();
+		let key = ReplicaOpKey2::new(origin, tenant_id, op_id)?;
+		let gate = self.op_locks.entry(key).or_default().clone();
 		let _guard = gate.lock().await;
-		if self.pending.contains_key(&op_id) {
-			return Ok(());
+		if let Some(pending) = self.pending.get(&key).map(|entry| *entry.value()) {
+			return if (pending.key_identity, pending.value, pending.location.hlc)
+				== (key_identity, value, commit_hlc)
+			{
+				Ok(())
+			} else {
+				Err(CounterReplicaRejection::TentativeConflict.into_error())
+			};
 		}
-		let location = self
+		let result = match self
 			.slab
 			.counter_append_tentative(tenant_id, key_identity, commit_hlc, value)
-			.await?;
-		self.pending.insert(
-			op_id,
-			PendingReplicaTentative {
-				tenant_id,
-				key_identity,
-				location,
-			},
-		);
-		Ok(())
-	}
-
-	/// `COUNTER_REPLICATE_REQ` (phase COMMIT): write the durable commit marker for
-	/// a previously-replicated tentative. Retryable: on failure the pending entry
-	/// is kept so the leader's reconciler can re-drive.
-	pub async fn commit(&self, op_id: u64) -> std::io::Result<()> {
-		let pending = match self.pending.get(&op_id) {
-			Some(entry) => *entry.value(),
-			None => return Ok(()),
+			.await
+		{
+			Ok(location) => {
+				self.pending.insert(
+					key,
+					PendingReplicaTentative {
+						tenant_id,
+						key_identity,
+						value,
+						location,
+					},
+				);
+				Ok(())
+			}
+			Err(error) => Err(error),
 		};
+		self.reclaim_gate2(key, &gate);
+		result
+	}
+	/// Marker failures retain pending state for re-drive. Zero refuses before missing lookup.
+	pub async fn commit(
+		&self,
+		origin: NodeId,
+		op_id: u64,
+		tenant_id: TenantId,
+		expected_key: Identity,
+	) -> std::io::Result<()> {
+		let key = ReplicaOpKey2::new(origin, tenant_id, op_id)?;
+		check_expected_key2(expected_key)?;
+		let gate = self.op_locks.entry(key).or_default().clone();
+		let _guard = gate.lock().await;
+		let Some(pending) = self.pending.get(&key).map(|entry| *entry.value()) else {
+			self.reclaim_gate2(key, &gate);
+			return Ok(());
+		};
+		if pending.tenant_id != tenant_id || pending.key_identity != expected_key {
+			return Err(CounterReplicaRejection::TentativeConflict.into_error());
+		}
 		self.slab
 			.counter_append_commit_marker(
 				pending.tenant_id,
@@ -775,25 +854,39 @@ impl CounterReplicaService {
 				pending.location.offset,
 			)
 			.await?;
-		self.pending.remove(&op_id);
-		self.op_locks.remove(&op_id);
+		self.pending.remove(&key);
+		self.reclaim_gate2(key, &gate);
 		Ok(())
 	}
-
-	/// `COUNTER_ROLLBACK_REQ`: remove only the matching tentative op's live index
-	/// state (recovery skips the orphan). Idempotent — unknown `op_id` is a no-op.
-	pub fn rollback(&self, op_id: u64) {
-		if let Some((_, pending)) = self.pending.remove(&op_id) {
-			self.slab.counter_unindex_tentative(
-				pending.tenant_id,
-				pending.key_identity,
-				pending.location,
-			);
+	/// Remove only this operation's matching tentative; a missing nonzero key is a no-op.
+	pub async fn rollback(
+		&self,
+		origin: NodeId,
+		op_id: u64,
+		tenant_id: TenantId,
+		expected_key: Identity,
+	) -> std::io::Result<()> {
+		let key = ReplicaOpKey2::new(origin, tenant_id, op_id)?;
+		check_expected_key2(expected_key)?;
+		let gate = self.op_locks.entry(key).or_default().clone();
+		let _guard = gate.lock().await;
+		let Some(pending) = self.pending.get(&key).map(|entry| *entry.value()) else {
+			self.reclaim_gate2(key, &gate);
+			return Ok(());
+		};
+		if pending.tenant_id != tenant_id || pending.key_identity != expected_key {
+			return Err(CounterReplicaRejection::TentativeConflict.into_error());
 		}
-		self.op_locks.remove(&op_id);
+		self.pending.remove(&key);
+		self.slab.counter_unindex_tentative(
+			pending.tenant_id,
+			pending.key_identity,
+			pending.location,
+		);
+		self.reclaim_gate2(key, &gate);
+		Ok(())
 	}
-
-	/// Latest committed counter value for an identity (replica-local read).
+	/// Existing live-index read semantics; committed-only crash consistency is a separate slice.
 	pub async fn read_committed(
 		&self,
 		tenant_id: TenantId,
@@ -804,8 +897,6 @@ impl CounterReplicaService {
 			None => Ok(None),
 		}
 	}
-
-	/// In-flight tentative count (test inspection).
 	#[cfg(test)]
 	pub(crate) fn pending_count(&self) -> usize {
 		self.pending.len()
@@ -821,11 +912,16 @@ impl CounterReplicaService {
 pub struct LocalCounterParticipant {
 	service: Arc<CounterReplicaService>,
 	tenant_id: TenantId,
+	origin: NodeId,
 }
 
 impl LocalCounterParticipant {
-	pub fn new(service: Arc<CounterReplicaService>, tenant_id: TenantId) -> Self {
-		Self { service, tenant_id }
+	pub fn new(service: Arc<CounterReplicaService>, tenant_id: TenantId, origin: NodeId) -> Self {
+		Self {
+			service,
+			tenant_id,
+			origin,
+		}
 	}
 }
 
@@ -839,6 +935,7 @@ impl CounterParticipant for LocalCounterParticipant {
 	) -> Result<(), ParticipantError> {
 		self.service
 			.replicate_tentative(
+				self.origin,
 				op_id,
 				self.tenant_id,
 				counter_identity(key),
@@ -848,14 +945,17 @@ impl CounterParticipant for LocalCounterParticipant {
 			.await
 			.map_err(|_| ParticipantError::Unavailable)
 	}
-	async fn commit(&self, op_id: u64) -> Result<(), ParticipantError> {
+	async fn commit(&self, op_id: u64, key: &CounterKey) -> Result<(), ParticipantError> {
 		self.service
-			.commit(op_id)
+			.commit(self.origin, op_id, self.tenant_id, counter_identity(key))
 			.await
 			.map_err(|_| ParticipantError::Unavailable)
 	}
-	async fn rollback(&self, op_id: u64) {
-		self.service.rollback(op_id);
+	async fn rollback(&self, op_id: u64, key: &CounterKey) {
+		let _ = self
+			.service
+			.rollback(self.origin, op_id, self.tenant_id, counter_identity(key))
+			.await;
 	}
 	async fn read_committed(&self, key: &CounterKey) -> Result<Option<u64>, ParticipantError> {
 		self.service
@@ -953,14 +1053,13 @@ impl CounterParticipant for RemoteCounterParticipant {
 			.await
 			.map_err(|()| ParticipantError::Unavailable)
 	}
-	async fn commit(&self, op_id: u64) -> Result<(), ParticipantError> {
-		// COMMIT looks the pending up by `op_id` on the replica; the identity/value/
-		// hlc fields are unused on commit, so they go zero.
+	async fn commit(&self, op_id: u64, key: &CounterKey) -> Result<(), ParticipantError> {
+		// The existing key field binds commit to the original counter; value/HLC stay unused.
 		self.transport
 			.replicate(
 				self.peer,
 				self.tenant_id,
-				Identity::new([0; 32]),
+				counter_identity(key),
 				op_id,
 				0,
 				Self::zero_hlc(),
@@ -970,12 +1069,12 @@ impl CounterParticipant for RemoteCounterParticipant {
 			.await
 			.map_err(|()| ParticipantError::Unavailable)
 	}
-	async fn rollback(&self, op_id: u64) {
+	async fn rollback(&self, op_id: u64, key: &CounterKey) {
 		self.transport
 			.rollback(
 				self.peer,
 				self.tenant_id,
-				Identity::new([0; 32]),
+				counter_identity(key),
 				op_id,
 				self.epoch,
 			)
@@ -1015,16 +1114,16 @@ impl CounterParticipant for CounterParticipantKind {
 			Self::Remote(p) => p.replicate_tentative(op_id, key, value, commit_hlc).await,
 		}
 	}
-	async fn commit(&self, op_id: u64) -> Result<(), ParticipantError> {
+	async fn commit(&self, op_id: u64, key: &CounterKey) -> Result<(), ParticipantError> {
 		match self {
-			Self::Local(p) => p.commit(op_id).await,
-			Self::Remote(p) => p.commit(op_id).await,
+			Self::Local(p) => p.commit(op_id, key).await,
+			Self::Remote(p) => p.commit(op_id, key).await,
 		}
 	}
-	async fn rollback(&self, op_id: u64) {
+	async fn rollback(&self, op_id: u64, key: &CounterKey) {
 		match self {
-			Self::Local(p) => p.rollback(op_id).await,
-			Self::Remote(p) => p.rollback(op_id).await,
+			Self::Local(p) => p.rollback(op_id, key).await,
+			Self::Remote(p) => p.rollback(op_id, key).await,
 		}
 	}
 	async fn read_committed(&self, key: &CounterKey) -> Result<Option<u64>, ParticipantError> {
@@ -1097,9 +1196,14 @@ pub trait CounterParticipant {
 	fn commit(
 		&self,
 		op_id: u64,
+		key: &CounterKey,
 	) -> impl std::future::Future<Output = Result<(), ParticipantError>> + Send;
 	/// Drop the tentative's live index state for `op_id` (recovery skips the orphan).
-	fn rollback(&self, op_id: u64) -> impl std::future::Future<Output = ()> + Send;
+	fn rollback(
+		&self,
+		op_id: u64,
+		key: &CounterKey,
+	) -> impl std::future::Future<Output = ()> + Send;
 	/// Latest committed value (used by the leader to read the local base).
 	fn read_committed(
 		&self,
@@ -1506,7 +1610,7 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 			// quorum subset — so no failed add stays visible on any future primary.
 			for &id in &accepted {
 				if let Some(participant) = plan.get(id) {
-					participant.rollback(op_id).await;
+					participant.rollback(op_id, key).await;
 				}
 			}
 			return Err(CounterLeaderError::QuorumFailed);
@@ -1528,7 +1632,7 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 		if self.witness_store.write(&witness).is_err() {
 			for &id in &accepted {
 				if let Some(participant) = plan.get(id) {
-					participant.rollback(op_id).await;
+					participant.rollback(op_id, key).await;
 				}
 			}
 			return Err(CounterLeaderError::Internal);
@@ -1590,7 +1694,7 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 			if participant
 				.replicate_tentative(op_id, &key, value, commit_hlc)
 				.await
-				.is_ok() && participant.commit(op_id).await.is_ok()
+				.is_ok() && participant.commit(op_id, &key).await.is_ok()
 			{
 				if let Some(mut witness) = self.witnesses.get_mut(&op_id) {
 					witness.committed.insert(i);
@@ -2607,13 +2711,13 @@ mod leader_tests {
 				.await
 				.map_err(|_| ParticipantError::Unavailable)
 		}
-		async fn commit(&self, op_id: u64) -> Result<(), ParticipantError> {
+		async fn commit(&self, op_id: u64, _key: &CounterKey) -> Result<(), ParticipantError> {
 			self.replica
 				.commit(op_id)
 				.await
 				.map_err(|_| ParticipantError::Unavailable)
 		}
-		async fn rollback(&self, op_id: u64) {
+		async fn rollback(&self, op_id: u64, _key: &CounterKey) {
 			self.replica.rollback(op_id);
 		}
 		async fn read_committed(&self, key: &CounterKey) -> Result<Option<u64>, ParticipantError> {
@@ -2804,8 +2908,8 @@ mod leader_tests {
 			.replicate_tentative(7, &key, 5, h(7))
 			.await
 			.unwrap();
-		participant.commit(7).await.unwrap();
-		participant.rollback(8).await;
+		participant.commit(7, &key).await.unwrap();
+		participant.rollback(8, &key).await;
 
 		let reps = mock.replicates.lock().unwrap();
 		assert_eq!(reps.len(), 2);
@@ -3463,3 +3567,7 @@ mod leader_tests {
 		);
 	}
 }
+
+#[cfg(test)]
+#[path = "counter/replica_scope_tests.rs"]
+mod replica_scope_tests;

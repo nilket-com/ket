@@ -6595,16 +6595,11 @@ impl WendelonDataServer {
 		}
 	}
 
-	/// ADR 075/076: the per-tenant counter leader, built lazily — by RECOVERY,
-	/// not fresh construction: it loads the tenant's durable counter state (the
-	/// applied D4 dedup log + any pending finalization witnesses) and reconciles
-	/// partial commits BEFORE serving, so a duplicate `ClientWriteId` retry after
-	/// a node restart replays `DUPLICATE` instead of re-adding, and a
-	/// witnessed-but-unmarked add becomes readable again. Fresh counter adds pass
-	/// a per-key participant plan; recovery resolves the peer identities recorded
-	/// in the witness separately from fresh routing. The per-tenant init gate
-	/// makes concurrent first requests recover exactly once (recovery does file
-	/// I/O — never under a DashMap entry lock across await).
+	/// Per-tenant counter leader: recover durable dedup/witnesses and reconcile before serving.
+	/// This preserves restart DUPLICATE replay and finishes witnessed partial commits.
+	/// Fresh adds use per-key plans; recovery resolves recorded peer identities.
+	/// The per-tenant init gate permits exactly one recovery for concurrent first requests.
+	/// Recovery file I/O never holds a DashMap entry lock across await.
 	async fn counter_leader_for(
 		&self,
 		tenant_id: TenantId,
@@ -6632,6 +6627,7 @@ impl WendelonDataServer {
 		let participant = CounterParticipantKind::Local(LocalCounterParticipant::new(
 			self.counter_replica.clone(),
 			tenant_id,
+			self.local_node,
 		));
 		let witness_dir = self
 			.slab
@@ -7191,7 +7187,9 @@ impl DataRingServer for WendelonDataServer {
 						meta.op_id,
 					)));
 				}
-				self.handle_counter_replicate(frame).await.map(Some)
+				self.handle_counter_replicate(&context, frame)
+					.await
+					.map(Some)
 			}
 			MsgType::COUNTER_ROLLBACK_REQ => {
 				if frame.meta.len() < std::mem::size_of::<CounterRollbackRequestMeta>() {
@@ -7218,7 +7216,9 @@ impl DataRingServer for WendelonDataServer {
 						meta.op_id,
 					)));
 				}
-				self.handle_counter_rollback(frame).await.map(Some)
+				self.handle_counter_rollback(&context, frame)
+					.await
+					.map(Some)
 			}
 			MsgType::COUNTER_ADD_REQ => {
 				if frame.meta.len() < std::mem::size_of::<CounterAddRequestMeta>() {
