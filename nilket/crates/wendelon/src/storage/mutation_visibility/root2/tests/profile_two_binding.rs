@@ -59,6 +59,10 @@ pub(super) fn exact_pin(bytes: &[u8]) -> Digest2 {
 	match bytes.len() {
 		137 => admin_manifest_digest2(bytes.try_into().unwrap()),
 		189 => admin_manifest_two_digest2(bytes.try_into().unwrap()),
+		241 => crate::storage::mutation_visibility::root2::codec::hash(
+			b"VISROOT2-ADMIN-MANIFEST\0",
+			bytes,
+		),
 		n => panic!("no canonical length {n}"),
 	}
 }
@@ -365,6 +369,7 @@ fn admission_governed_marker_is_either_canonical_length() {
 	for (length, governed) in [
 		(137, true),
 		(189, true),
+		(241, true),
 		(0, false),
 		(136, false),
 		(138, false),
@@ -373,6 +378,13 @@ fn admission_governed_marker_is_either_canonical_length() {
 	] {
 		let s = with_control_len_for_test(&base, length);
 		let state = &root_and_origin2(&s).unwrap().0.state;
+		if !matches!(length, 0 | 137 | 189 | 241) {
+			assert_eq!(
+				admission_permission(state, &claim, 5),
+				Err(RootError2::ControlClass)
+			);
+			continue;
+		}
 		let got = admission_permission(state, &claim, 5).unwrap();
 		assert_eq!(got.is_some(), governed, "{length}");
 		if governed {

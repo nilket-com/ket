@@ -72,6 +72,7 @@ pub(in crate::storage::mutation_visibility::root2) struct EventRef2 {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum OwnerError2 {
+	ProfileUnsupported,
 	Log(LogError2),
 	Codec,
 	BadConfirmation,
@@ -124,6 +125,7 @@ pub(in crate::storage::mutation_visibility::root2) enum EvidenceError2 {
 	Event,
 	NotAmbiguous,
 	OpIdCollision,
+	Format,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum RepairStage2 {
@@ -274,6 +276,14 @@ pub(in crate::storage::mutation_visibility::root2) fn decide2(
 	decide(log, op_id, req).unwrap_or_else(Decision2::Refuse)
 }
 fn decide(log: &[u8], op_id: &OpId2, req: &OwnerRequest2) -> Result<Decision2, OwnerError2> {
+	if matches!(
+		req,
+		OwnerRequest2::Reserve {
+			manifest: AnyAdminManifest2::Three(_)
+		}
+	) {
+		return Err(OwnerError2::ProfileUnsupported);
+	}
 	let key = request_key2(req)?;
 	let state = fold_events2(log).map_err(OwnerError2::Log)?;
 	for event in whole_events(log) {
@@ -720,3 +730,5 @@ fn prefix_op_id_helper_matches_only_ids_present_in_the_prefix() {
 	assert!(!prefix_has_op_id(&prefix, &[0x33; 16]));
 	assert!(!prefix_has_op_id(&[], &[0x31; 16]));
 }
+
+pub(super) mod v2;

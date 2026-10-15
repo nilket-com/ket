@@ -241,6 +241,7 @@ fn owner_export_tuple_feeds_install_for_both_profiles() {
 			"{name}"
 		);
 		match &d.any {
+			AnyAdminManifest2::Three(_) => panic!("this historical control selects One/Two only"),
 			AnyAdminManifest2::One(_) => assert!(admin_governance2(&admin).is_none()),
 			AnyAdminManifest2::Two(two) => {
 				assert!(admin_governance2(&admin).unwrap() == two.governance())

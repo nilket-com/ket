@@ -10,8 +10,8 @@ use super::snapshot::{SnapshotError2, decode_snapshot2};
 use crate::storage::mutation_visibility::redacted_debug;
 use crate::storage::mutation_visibility::root2::admin::errors::AdminManifestError2;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	ADMIN_MANIFEST_BYTES2, ADMIN_MANIFEST_P2_BYTES2, AnyAdminManifest2, admin_manifest_digest2,
-	admin_manifest_two_digest2,
+	ADMIN_MANIFEST_BYTES2, ADMIN_MANIFEST_P2_BYTES2, ADMIN_MANIFEST_P3_BYTES3, AnyAdminManifest2,
+	admin_manifest_digest2, admin_manifest_two_digest2,
 };
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::codec::hash;
@@ -90,6 +90,8 @@ pub(in crate::storage::mutation_visibility::root2) fn validate_replica_tuple2(
 		admin_manifest_digest2(one)
 	} else if let Ok(two) = <&[u8; ADMIN_MANIFEST_P2_BYTES2]>::try_from(manifest_bytes) {
 		admin_manifest_two_digest2(two)
+	} else if let Ok(three) = <&[u8; ADMIN_MANIFEST_P3_BYTES3]>::try_from(manifest_bytes) {
+		hash(b"VISROOT2-ADMIN-MANIFEST\0", three)
 	} else {
 		return Err(E::Length(ReplicaInput2::Manifest));
 	};
@@ -166,6 +168,7 @@ pub(in crate::storage::mutation_visibility::root2) fn tuple_manifest_len2(
 	match t.manifest {
 		AnyAdminManifest2::One(_) => ADMIN_MANIFEST_BYTES2 as u64,
 		AnyAdminManifest2::Two(_) => ADMIN_MANIFEST_P2_BYTES2 as u64,
+		AnyAdminManifest2::Three(_) => ADMIN_MANIFEST_P3_BYTES3 as u64,
 	}
 }
 pub(in crate::storage::mutation_visibility::root2) fn tuple_manifest_pin2(

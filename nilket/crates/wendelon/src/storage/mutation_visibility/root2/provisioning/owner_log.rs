@@ -6,10 +6,10 @@
 //! Supported path model: Linux, a local filesystem, one owner host, and trusted owner and export
 //! parent paths that are not replaced while an operation runs. Nothing here yields a root,
 //! authority state or trust token, and a marker's absence never proves no sync failed.
-use super::inventory::{RootState2, encode_event2, fold_events2};
+use super::format::DirectoryFormat2;
+use super::inventory::RootState2;
 use super::owner_core::{
-	Classification2, Decision2, EventRef2, OpId2, OwnerError2, OwnerRequest2, classify2, decide2,
-	decode_evidence2, encode_evidence2, event_request_key2, repair_context2,
+	Classification2, Decision2, EventRef2, OpId2, OwnerError2, OwnerRequest2, event_request_key2,
 };
 use super::snapshot::encode_snapshot2;
 use crate::storage::mutation_visibility::redacted_debug;
@@ -73,6 +73,14 @@ pub(in crate::storage::mutation_visibility::root2) enum IoStep2 {
 	ManifestLink,
 	ManifestTmpUnlink,
 	ManifestDirSync,
+	FormatTempCreate,
+	FormatWrite,
+	FormatSync,
+	FormatPublish,
+	FormatDirSync,
+	FormatLogCreate,
+	FormatLogSync,
+	FormatFinalSync,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum MarkerOutcome2 {
@@ -88,6 +96,10 @@ pub(in crate::storage::mutation_visibility::root2) enum ClearRefusal2 {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum OwnerIoError2 {
+	Incomplete,
+	MarkerCorrupt,
+	ForeignFormat,
+	CreationNotEmpty,
 	Busy,
 	InsecureDir,
 	NotRegular {
@@ -164,9 +176,11 @@ pub(in crate::storage::mutation_visibility::root2) struct OwnerDir2 {
 	id: (u64, u64),
 	lock: File,
 	poisoned: Option<IoStep2>,
+	format: DirectoryFormat2,
 }
 redacted_debug!(OwnerDir2, "OwnerDir2");
 
+mod directory;
 mod ops;
 use ops::{
 	Mode, Owned, checked_dir, export_name_ok, io_err, manifest_steps, open_dir, open_file, regular,
@@ -174,7 +188,7 @@ use ops::{
 };
 
 impl OwnerDir2 {
-	pub(in crate::storage::mutation_visibility::root2) fn open(path: &Path) -> Owned<Self> {
+	fn locked(path: &Path) -> Owned<Self> {
 		let path = fs::canonicalize(path).map_err(io_err(IoStep2::LockOpen))?;
 		let dir = open_dir(&path).map_err(io_err(IoStep2::LockOpen))?;
 		let id = checked_dir(&dir, IoStep2::LockOpen)?;
@@ -217,6 +231,7 @@ impl OwnerDir2 {
 			id,
 			lock,
 			poisoned: None,
+			format: DirectoryFormat2::One,
 		})
 	}
 
@@ -236,9 +251,10 @@ impl OwnerDir2 {
 		op: &OpId2,
 		req: &OwnerRequest2,
 	) -> Owned<OpOutcome2> {
+		self.check_framing()?;
 		self.blocked()?;
 		let view = self.clean_view()?;
-		match decide2(view.bytes(), op, req) {
+		match self.format.decide(view.bytes(), op, req) {
 			Decision2::Refuse(e) => Err(OwnerIoError2::Decision(e)),
 			Decision2::Retry { original, current } => {
 				self.resync(view.log.is_some(), &[])?;
@@ -255,7 +271,9 @@ impl OwnerDir2 {
 				})
 			}
 			Decision2::Append(event) => {
-				let encoded = encode_event2(&event)
+				let encoded = self
+					.format
+					.encode(&event)
 					.map_err(|_| OwnerIoError2::Decision(OwnerError2::Codec))?;
 				let at = view.bytes().len() as u64;
 				let file = self.log_for_write(view.log.is_none())?;
@@ -270,7 +288,7 @@ impl OwnerDir2 {
 					after.classification,
 					Classification2::Clean { last_seq } if last_seq == event.seq
 				);
-				let state = fold_events2(after.bytes()).ok().filter(|_| verified);
+				let state = self.format.fold(after.bytes()).ok().filter(|_| verified);
 				let current = state.and_then(|s| {
 					let id = event.identity?;
 					s.roots.iter().find(|r| r.identity == id).map(|r| r.state)
@@ -294,6 +312,7 @@ impl OwnerDir2 {
 		&mut self,
 		expect_tail: &Digest2,
 	) -> Owned<RepairOutcome2> {
+		self.check_framing()?;
 		self.blocked()?;
 		let view = self.view()?;
 		let Classification2::Unclaimed { tail_sha256, .. } = view.classification else {
@@ -304,18 +323,17 @@ impl OwnerDir2 {
 				actual: tail_sha256,
 			});
 		}
-		let (name, bytes) =
-			encode_evidence2(view.bytes()).map_err(|_| OwnerIoError2::EvidenceInvalid)?;
-		let evidence =
-			decode_evidence2(&name, &bytes).map_err(|_| OwnerIoError2::EvidenceInvalid)?;
+		let (name, bytes) = self
+			.format
+			.encode_evidence(view.bytes())
+			.map_err(|_| OwnerIoError2::EvidenceInvalid)?;
+		let evidence = self
+			.format
+			.decode_evidence(&name, &bytes)
+			.map_err(|_| OwnerIoError2::EvidenceInvalid)?;
 		self.ensure_repairs()?;
 		self.publish_evidence(&name, &bytes)?;
-		let context = repair_context2(
-			&evidence.prefix_sha256,
-			evidence.boundary,
-			evidence.original_len,
-			&evidence.tail_sha256,
-		);
+		let context = self.format.context(&evidence);
 		self.resume(&context)
 	}
 
@@ -323,6 +341,7 @@ impl OwnerDir2 {
 		&mut self,
 		context: &Digest2,
 	) -> Owned<RepairOutcome2> {
+		self.check_framing()?;
 		self.blocked()?;
 		self.resume(context)
 	}
@@ -330,6 +349,7 @@ impl OwnerDir2 {
 	pub(in crate::storage::mutation_visibility::root2) fn repair_check(
 		&mut self,
 	) -> Owned<RepairOutcome2> {
+		self.check_framing()?;
 		self.blocked()?;
 		let view = self.clean_view()?;
 		self.resync(view.log.is_some(), &view.rep_names())?;
@@ -341,6 +361,7 @@ impl OwnerDir2 {
 		out_dir: &Path,
 		name: &str,
 	) -> Owned<Digest2> {
+		self.check_framing()?;
 		self.blocked()?;
 		if !export_name_ok(name) {
 			return Err(OwnerIoError2::BadExportName);
@@ -348,7 +369,10 @@ impl OwnerDir2 {
 		let (out, out_handle) = self.export_dir(out_dir)?;
 		let view = self.clean_view()?;
 		self.resync(view.log.is_some(), &[])?;
-		let state = fold_events2(view.bytes()).map_err(|_| OwnerIoError2::RepairVerifyFailed)?;
+		let state = self
+			.format
+			.fold(view.bytes())
+			.map_err(|_| OwnerIoError2::RepairVerifyFailed)?;
 		let bytes = encode_snapshot2(&state).map_err(|_| OwnerIoError2::Io {
 			step: IoStep2::ExportWrite,
 			errno: None,
@@ -371,6 +395,7 @@ impl OwnerDir2 {
 		generation: [u8; 16],
 		cluster: [u8; 16],
 	) -> Owned<TupleExport2> {
+		self.check_framing()?;
 		self.blocked()?;
 		if !export_name_ok(manifest_name)
 			|| !export_name_ok(snapshot_name)
@@ -381,7 +406,10 @@ impl OwnerDir2 {
 		let (out, out_handle) = self.export_dir(out_dir)?;
 		let view = self.clean_view()?;
 		self.resync(view.log.is_some(), &[])?;
-		let state = fold_events2(view.bytes()).map_err(|_| OwnerIoError2::RepairVerifyFailed)?;
+		let state = self
+			.format
+			.fold(view.bytes())
+			.map_err(|_| OwnerIoError2::RepairVerifyFailed)?;
 		let mut matching = state
 			.roots
 			.iter()
@@ -430,6 +458,7 @@ impl OwnerDir2 {
 		&mut self,
 		expect_log: &Digest2,
 	) -> Owned<()> {
+		self.check_framing()?;
 		let marker = self.marker_stat()?;
 		if self.poisoned.is_none() && marker.is_none() {
 			return Err(OwnerIoError2::NothingToClear);
@@ -461,7 +490,7 @@ impl OwnerDir2 {
 			.iter()
 			.map(|(n, b)| (n.as_str(), b.as_slice()))
 			.collect();
-		let classification = classify2(log.as_deref().unwrap_or(&[]), &refs);
+		let classification = self.format.classify(log.as_deref().unwrap_or(&[]), &refs);
 		if !matches!(
 			classification,
 			Classification2::Clean { .. }

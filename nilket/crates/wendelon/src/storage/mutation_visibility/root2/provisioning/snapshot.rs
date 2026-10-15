@@ -13,6 +13,7 @@ const MAGIC: &[u8; 8] = b"VISINV02";
 const VERSION: u16 = 1;
 /// Canonical iff at least one entry is tagged profile 2; version 1 carries no tag.
 const VERSION_TWO: u16 = 2;
+const VERSION_THREE: u16 = 3;
 const HEADER: usize = 22;
 const ENTRY: usize = 320;
 const TRAILER: usize = 32;
@@ -122,10 +123,20 @@ fn validate(s: &InventorySnapshot2) -> Result<(), SnapshotError2> {
 fn encode(s: &InventorySnapshot2) -> Result<Vec<u8>, SnapshotError2> {
 	validate(s)?;
 	let len = HEADER + s.entries.len() * ENTRY + TRAILER;
-	let two = s.entries.iter().any(|e| e.profile == ManifestProfile2::Two);
+	let version = if s
+		.entries
+		.iter()
+		.any(|e| e.profile == ManifestProfile2::Three)
+	{
+		VERSION_THREE
+	} else if s.entries.iter().any(|e| e.profile == ManifestProfile2::Two) {
+		VERSION_TWO
+	} else {
+		VERSION
+	};
 	let mut b = Vec::with_capacity(len);
 	b.extend(MAGIC);
-	b.extend(if two { VERSION_TWO } else { VERSION }.to_le_bytes());
+	b.extend(version.to_le_bytes());
 	b.extend((s.entries.len() as u32).to_le_bytes());
 	b.extend(s.export_seq.to_le_bytes());
 	for e in &s.entries {
@@ -135,10 +146,11 @@ fn encode(s: &InventorySnapshot2) -> Result<Vec<u8>, SnapshotError2> {
 		b.extend(e.identity.admin_key);
 		b.push(state_byte(e.state));
 		// Version 2 writes every tag explicitly; version 1 has none.
-		b.push(match (two, e.profile) {
+		b.push(match (version != VERSION, e.profile) {
 			(false, _) => 0,
 			(true, ManifestProfile2::One) => 1,
 			(true, ManifestProfile2::Two) => 2,
+			(true, ManifestProfile2::Three) => 3,
 		});
 		b.extend([0u8; 6]);
 		b.extend(e.last_seq.to_le_bytes());
@@ -185,7 +197,7 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_snapshot2(
 		return Err(SnapshotError2::Magic);
 	}
 	let version = u16::from_le_bytes(array(bytes, 8));
-	if version != VERSION && version != VERSION_TWO {
+	if version != VERSION && version != VERSION_TWO && version != VERSION_THREE {
 		return Err(SnapshotError2::Version);
 	}
 	let count = u32::from_le_bytes(array(bytes, 10)) as usize;
@@ -218,6 +230,7 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_snapshot2(
 			let tag = match e[97] {
 				1 => ManifestProfile2::One,
 				2 => ManifestProfile2::Two,
+				3 if version == VERSION_THREE => ManifestProfile2::Three,
 				_ => return Err(SnapshotError2::ProfileTag),
 			};
 			if e[98..104].iter().any(|&x| x != 0) {
