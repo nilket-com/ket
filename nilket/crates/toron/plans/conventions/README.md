@@ -50,6 +50,8 @@ fields, or amending an ADR; flag violations in code review.
   evidence, and command snippets instead of preserving stale
   pre-V1 names.
 
+- [identity-ownership-algebra.md](identity-ownership-algebra.md) — require each new contract to state identity, owners, retry laws, phase visibility and map-key collision checks.
+
 ## Adding a convention
 
 A convention earns its place when the same correction has been

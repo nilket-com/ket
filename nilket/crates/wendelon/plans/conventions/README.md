@@ -19,6 +19,8 @@ ADR; flag violations in code review.
 - [capability-vs-feature-naming.md](capability-vs-feature-naming.md) — code uses "capability" precisely; "feature" is for marketing or casual prose.
 - [no-project-name-in-protocols.md](no-project-name-in-protocols.md) — keep the project's brand name out of protocol acronyms, reject codes, metric prefixes, module names, and struct prefixes; brand lives at the cargo crate / repo / README level only.
 
+- [Identity and ownership algebra](../../../toron/plans/conventions/identity-ownership-algebra.md) — workspace convention: every new contract includes an Algebra section covering identity, owners, laws, visibility and collision checks.
+
 ## Adding a convention
 
 A convention earns its place when the same correction has been given more
