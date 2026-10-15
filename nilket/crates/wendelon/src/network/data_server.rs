@@ -3085,7 +3085,6 @@ impl WendelonDataServer {
 	async fn replay_write_outcome(
 		&self,
 		tenant_id: TenantId,
-		write_id: crate::schema::ClientWriteId,
 		outcome: WriteOutcome,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
 		if let WriteOutcome::FinalizationRecoverablePending {
@@ -3099,7 +3098,7 @@ impl WendelonDataServer {
 				.await?
 			{
 				if record.finalization.tenant_id != tenant_id {
-					return Ok(self.foreign_refusal(write_id));
+					return Err(Error::other("pending replay tenant invariant violated"));
 				}
 				if let Some(leader_hint) = self
 					.raft
@@ -8523,9 +8522,6 @@ impl WendelonDataServer {
 				None,
 			));
 		}
-		if let Some(refusal) = self.foreign_pending(meta.tenant_id, meta.write_id).await? {
-			return Ok(refusal);
-		}
 		// Fresh leaders block cache-miss admission until orphan-witness
 		// recovery for the current `(term, membership_epoch)` is
 		// complete. Cached outcomes are already authoritative for this
@@ -8547,13 +8543,13 @@ impl WendelonDataServer {
 		// again.
 		if let Some(record) = self
 			.pending_finalizations
-			.find_by_write_id(meta.write_id)
+			.find_by_write_id(meta.tenant_id, meta.write_id)
 			.await?
 		{
 			let outcome = self.recoverable_pending_outcome_for_record(&record);
 			self.idempotency
 				.insert(key, CachedWriteOutcome::new(outcome));
-			return self.replay_write_outcome(meta.tenant_id, meta.write_id, outcome).await;
+			return self.replay_write_outcome(meta.tenant_id, outcome).await;
 		}
 		// Per-range lease gate (plan 018). When enabled, this node
 		// accepts the write only if it holds a valid lease covering
@@ -8919,13 +8915,13 @@ impl WendelonDataServer {
 
 		if let Some(record) = self
 			.pending_finalizations
-			.find_by_write_id(meta.parent_write_id)
+			.find_by_write_id(meta.tenant_id, meta.parent_write_id)
 			.await?
 		{
 			let outcome = self.recoverable_pending_outcome_for_record(&record);
 			self.idempotency
 				.insert(key, CachedWriteOutcome::new(outcome));
-			return self.replay_write_outcome(meta.tenant_id, meta.parent_write_id, outcome).await;
+			return self.replay_write_outcome(meta.tenant_id, outcome).await;
 		}
 
 		if self.lease_gate_enabled {
@@ -9316,11 +9312,11 @@ impl WendelonDataServer {
 			let key = Self::idempotency_key_for(meta.tenant_id, meta.parent_write_id);
 			if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
 				let (write, trailing) = self
-					.replay_write_outcome(meta.tenant_id, meta.parent_write_id, cached.outcome())
+					.replay_write_outcome(meta.tenant_id, cached.outcome())
 					.await?;
 				return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
 			}
-			if let Some((write, trailing)) = self.a3_or_foreign_write(&meta).await? {
+			if let Some((write, trailing)) = self.durable_mutation_replay(&meta).await? {
 				return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
 			}
 			let clocks = WriteClocks::from_remaining_millis(meta.deadline_remaining_millis);
@@ -9840,7 +9836,7 @@ impl WendelonDataServer {
 			{
 				return Ok((cached.response, cached.trailing));
 			}
-			if let Some(replayed) = self.a3_or_foreign_delete(&meta).await? {
+			if let Some(replayed) = self.durable_delete_replay(&meta).await? {
 				return Ok(replayed);
 			}
 			let clocks = WriteClocks::from_remaining_millis(meta.deadline_remaining_millis);
@@ -10228,7 +10224,7 @@ impl DataRing for WendelonDataServer {
 			let key = Self::idempotency_key_for(meta.tenant_id, meta.write_id);
 			if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
 				return self
-					.replay_write_outcome(meta.tenant_id, meta.write_id, cached.outcome())
+					.replay_write_outcome(meta.tenant_id, cached.outcome())
 					.await;
 			}
 
