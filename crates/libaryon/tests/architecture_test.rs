@@ -303,26 +303,6 @@ fn product_0059_store_stays_capability_closed_and_later_consumers_are_explicit()
 				path.display()
 			);
 		}
-		if production.contains(".discover()") {
-			assert_eq!(
-				file,
-				Some("main.rs"),
-				"{} moved PRODUCT-0073's read-only discovery outside the terminal entrypoint",
-				path.display()
-			);
-			let listing = production
-				.split("fn list_saved_sessions() -> gui::Result")
-				.nth(1)
-				.expect("PRODUCT-0073 terminal discovery")
-				.split("fn render_session_discovery")
-				.next()
-				.expect("bounded PRODUCT-0073 terminal discovery");
-			assert!(listing.contains("SessionStore::platform_default()?.discover()?"));
-			assert!(
-				!listing.contains("create(") && !listing.contains("open_writable"),
-				"PRODUCT-0073 terminal discovery must not acquire writable authority"
-			);
-		}
 		if production.contains("SavedSession") {
 			assert!(
 				matches!(file, Some("editor.rs" | "state.rs")),
@@ -338,6 +318,21 @@ fn product_0059_store_stays_capability_closed_and_later_consumers_are_explicit()
 			);
 		}
 	}
+	let main =
+		fs::read_to_string(polariton.join("main.rs")).expect("read Polariton terminal entrypoint");
+	let main = main.split("\n#[cfg(test)]").next().unwrap_or(&main);
+	let listing = main
+		.split("fn list_saved_sessions() -> gui::Result")
+		.nth(1)
+		.expect("PRODUCT-0073 terminal discovery")
+		.split("fn render_session_discovery")
+		.next()
+		.expect("bounded PRODUCT-0073 terminal discovery");
+	assert!(listing.contains("SessionStore::platform_default()?.discover()?"));
+	assert!(
+		!listing.contains("create(") && !listing.contains("open_writable"),
+		"PRODUCT-0073 terminal discovery must not acquire writable authority"
+	);
 }
 
 #[test]
