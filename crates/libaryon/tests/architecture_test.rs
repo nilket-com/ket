@@ -295,11 +295,21 @@ fn product_0059_store_stays_capability_closed_and_later_consumers_are_explicit()
 	for path in polariton_sources {
 		let head = fs::read_to_string(&path).expect("read Polariton source");
 		let production = head.split("\n#[cfg(test)]").next().unwrap_or(&head);
+		let relative = path
+			.strip_prefix(&polariton)
+			.expect("Polariton source must remain below its source root");
 		let file = path.file_name().and_then(|name| name.to_str());
 		if production.contains("SessionStore") {
 			assert!(
-				matches!(file, Some("main.rs" | "state.rs")),
+				relative == Path::new("main.rs") || relative == Path::new("gui/state.rs"),
 				"{} consumed session-store authority outside PRODUCT-0063's saved surface or PRODUCT-0073's terminal discovery",
+				path.display()
+			);
+		}
+		if relative == Path::new("gui/state.rs") {
+			assert!(
+				!production.contains(".discover()"),
+				"{} moved PRODUCT-0073's read-only discovery into the writable saved-startup surface",
 				path.display()
 			);
 		}
