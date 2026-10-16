@@ -38,7 +38,7 @@ benchmarking of the host (the tests assert regressions, not speed records), and 
   lines, runs 7 samples in-process and asserts the median is under a fixed limit (100 ms).
 - Every nonempty file opens through `svp::ingest::ingest_svp_file` (1 MiB cold extents). `ci/huge-file-check.sh`
   builds a 200 GiB sparse fixture and runs `sparse_200_gib`; `plans/baryon/huge_file_scaling.md` still states
-  the 80-200 GiB objective and claims open cost does not grow with file size (measured false, section 10).
+  the 80-200 GiB objective that first-viewport time not depend on file size (not yet met, section 10).
 - `scripts/cargo-ctrl` has a controlled CPU lane for timing tests, but it only runs `--workspace --lib`
   tests selected by exact name from `ci/controlled-tests.txt`. An integration-test file such as
   `quit_latency_test.rs` runs in the general (80% CPU, parallel) lane.
@@ -208,16 +208,19 @@ open-and-measure is 28-46 MB at every size.
 First viewport grows about 1 ms per GiB above 4 GiB: open cost is linear in extents (9.3).
 
 Memory with the engine kept alive after open (background line scan running): plateaus at 73 MB (1 GiB),
-454 MB (16 GiB) and 930 MB (64 GiB). At 200 GiB it had not plateaued at 30 s: +~78 MB/s, 1.3 GB at 30 s.
-An earlier version of the probe that never sent `Resize` held the engine open up to 120 s per sample and
-was OOM-killed at 59 GB anonymous RSS (input not recorded); that was not reproduced.
+454 MB (16 GiB), 930 MB (64 GiB) and 1.26 GB (200 GiB, at about 17 s, when the scan drains). This is the
+probe's own backlog, not engine retention: the probe stopped reading viewports after first text, and the
+viewport channel is unbounded. Draining viewports during the hold keeps 64 GiB flat at 48 MB. Each queued
+viewport is about 1 MB because the fixture has no newline and the pane carries the first 1 MiB of that
+line as one token; the engine emits about 90 viewports a second while the scan runs. An earlier version of
+the probe that never sent `Resize` held the engine open up to 120 s per sample and was OOM-killed at 59 GB
+anonymous RSS (input not recorded); the same backlog is the likely cause.
 
 ## 11. Follow-ups outside this plan
 
-- **Post-open memory growth (9.10).** Sample `RegistryStatsSnapshot` (allocated, cold and hot extents,
-  resident bytes, pending scan blocks, sum-tree rebuilds) and `/proc/self/smaps_rollup` at 1 s intervals on
-  64 GiB and 200 GiB sparse files. File a bug if RSS rises materially while `resident_bytes` stays small.
-  Suspects: a backlog of `pending_metric_inflations`, render and refresh work driven by scan notifications,
-  and per-extent index or cache state. Resident-budget eviction does not cover metadata.
+- **Post-open memory growth (9.10): attributed, section 10.** Registry stats stayed flat (resident 1 MiB,
+  `malloc_trim` freed 3.5 MB of 937 MB); the growth was queued viewports. It leaves three follow-ups:
+  clip long lines horizontally in projection, deliver viewports latest-wins instead of through an
+  unbounded channel, then measure whether scan notifications emit frames for an unchanged projection.
 - **1 MiB first-text anomaly (9.11).** Explain it before the S3 numbers are used as a reference.
-- **`huge_file_scaling.md`** claims open cost does not grow with file size; correct it once 9.3 is decided.
+- **`huge_file_scaling.md`** now records that its first-viewport objective is not yet met (9.3).
