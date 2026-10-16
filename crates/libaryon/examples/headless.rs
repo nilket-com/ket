@@ -1,6 +1,6 @@
+use libaryon::engine::viewport_channel::ViewportReceiver;
 use libaryon::engine::{EditorCommand, EngineConfig, EngineHandle};
 use libaryon::uast::Viewport;
-use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 fn projected_text(viewport: &Viewport) -> String {
@@ -14,7 +14,7 @@ fn projected_text(viewport: &Viewport) -> String {
 }
 
 fn receive_until(
-	viewports: &Receiver<Viewport>,
+	viewports: &ViewportReceiver,
 	mut predicate: impl FnMut(&Viewport) -> bool,
 ) -> Viewport {
 	let deadline = Instant::now() + Duration::from_secs(10);

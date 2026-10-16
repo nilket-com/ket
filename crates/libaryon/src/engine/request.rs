@@ -2,7 +2,7 @@ use super::{EditorCommand, InputEvent};
 use crate::core::{BufferId, JobId};
 use std::sync::mpsc;
 
-const ENGINE_REQUEST_QUEUE_LIMIT: usize = 2_048;
+pub(crate) const ENGINE_REQUEST_QUEUE_LIMIT: usize = 2_048;
 
 #[derive(Debug)]
 pub(crate) enum EngineRequest {

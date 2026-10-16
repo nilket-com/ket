@@ -379,7 +379,7 @@ pub(crate) fn spawn_test_engine(
 	_settings_path: Option<PathBuf>,
 ) -> (
 	CommandSender,
-	mpsc::Receiver<Viewport>,
+	crate::engine::viewport_channel::ViewportReceiver,
 	thread::JoinHandle<()>,
 ) {
 	let (tx_cmd, _input, rx_view, handle) = spawn_test_engine_with_input(
@@ -397,11 +397,11 @@ pub(crate) fn spawn_test_engine_with_input(
 ) -> (
 	CommandSender,
 	InputSender,
-	mpsc::Receiver<Viewport>,
+	crate::engine::viewport_channel::ViewportReceiver,
 	thread::JoinHandle<()>,
 ) {
 	let (tx_cmd, input, tx_internal, rx_request) = super::request::channel();
-	let (tx_view, rx_view) = mpsc::channel::<Viewport>();
+	let (tx_view, rx_view) = crate::engine::viewport_channel::channel();
 	let (tx_io_notify, _rx_io_notify) = mpsc::channel::<()>();
 	let registry = Arc::new(UastRegistry::new(1_000_000));
 	let resolver = Arc::new(SvpResolver::new(registry.clone(), tx_io_notify));
@@ -436,7 +436,7 @@ pub(crate) fn spawn_test_engine_with_rust(
 	_settings_path: Option<PathBuf>,
 ) -> (
 	CommandSender,
-	mpsc::Receiver<Viewport>,
+	crate::engine::viewport_channel::ViewportReceiver,
 	thread::JoinHandle<()>,
 ) {
 	spawn_test_engine_with_rust_and_language_themes(BTreeMap::new(), _settings_path)
@@ -447,13 +447,13 @@ pub(crate) fn spawn_test_engine_with_rust_and_language_themes(
 	_settings_path: Option<PathBuf>,
 ) -> (
 	CommandSender,
-	mpsc::Receiver<Viewport>,
+	crate::engine::viewport_channel::ViewportReceiver,
 	thread::JoinHandle<()>,
 ) {
 	use crate::svp::rust_provider::RustProvider;
 
 	let (tx_cmd, _input, tx_internal, rx_request) = super::request::channel();
-	let (tx_view, rx_view) = mpsc::channel::<Viewport>();
+	let (tx_view, rx_view) = crate::engine::viewport_channel::channel();
 	let (tx_io_notify, _rx_io_notify) = mpsc::channel::<()>();
 	let registry = Arc::new(UastRegistry::new(1_000_000));
 	let resolver = Arc::new(SvpResolver::new(registry.clone(), tx_io_notify));
@@ -489,13 +489,13 @@ pub(crate) fn spawn_test_engine_with_csv(
 	_settings_path: Option<PathBuf>,
 ) -> (
 	CommandSender,
-	mpsc::Receiver<Viewport>,
+	crate::engine::viewport_channel::ViewportReceiver,
 	thread::JoinHandle<()>,
 ) {
 	use crate::svp::csv_provider::{CsvProvider, TsvProvider};
 
 	let (tx_cmd, _input, tx_internal, rx_request) = super::request::channel();
-	let (tx_view, rx_view) = mpsc::channel::<Viewport>();
+	let (tx_view, rx_view) = crate::engine::viewport_channel::channel();
 	let (tx_io_notify, _rx_io_notify) = mpsc::channel::<()>();
 	let registry = Arc::new(UastRegistry::new(1_000_000));
 	let resolver = Arc::new(SvpResolver::new(registry.clone(), tx_io_notify));
@@ -528,7 +528,7 @@ pub(crate) fn spawn_test_engine_with_csv(
 
 pub(crate) fn spawn_test_engine_with_sql() -> (
 	CommandSender,
-	mpsc::Receiver<Viewport>,
+	crate::engine::viewport_channel::ViewportReceiver,
 	thread::JoinHandle<()>,
 ) {
 	spawn_test_engine_with_sql_and_divider_reservation(
@@ -540,13 +540,13 @@ pub(crate) fn spawn_test_engine_with_sql_and_divider_reservation(
 	reservation: crate::engine::PaneDividerReservation,
 ) -> (
 	CommandSender,
-	mpsc::Receiver<Viewport>,
+	crate::engine::viewport_channel::ViewportReceiver,
 	thread::JoinHandle<()>,
 ) {
 	use crate::svp::sql_provider::SqlProvider;
 
 	let (tx_cmd, _input, tx_internal, rx_request) = super::request::channel();
-	let (tx_view, rx_view) = mpsc::channel::<Viewport>();
+	let (tx_view, rx_view) = crate::engine::viewport_channel::channel();
 	let (tx_io_notify, _rx_io_notify) = mpsc::channel::<()>();
 	let registry = Arc::new(UastRegistry::new(1_000_000));
 	let resolver = Arc::new(SvpResolver::new(registry.clone(), tx_io_notify));
@@ -579,14 +579,14 @@ pub(crate) fn spawn_test_engine_with_sql_and_divider_reservation(
 
 pub(crate) fn spawn_test_engine_with_python_and_rune() -> (
 	CommandSender,
-	mpsc::Receiver<Viewport>,
+	crate::engine::viewport_channel::ViewportReceiver,
 	thread::JoinHandle<()>,
 ) {
 	use crate::svp::python_provider::PythonProvider;
 	use crate::svp::rune_provider::RuneProvider;
 
 	let (tx_cmd, _input, tx_internal, rx_request) = super::request::channel();
-	let (tx_view, rx_view) = mpsc::channel::<Viewport>();
+	let (tx_view, rx_view) = crate::engine::viewport_channel::channel();
 	let (tx_io_notify, _rx_io_notify) = mpsc::channel::<()>();
 	let registry = Arc::new(UastRegistry::new(1_000_000));
 	let resolver = Arc::new(SvpResolver::new(registry.clone(), tx_io_notify));
@@ -623,13 +623,13 @@ pub(crate) fn spawn_test_engine_with_markdown(
 	_settings_path: Option<PathBuf>,
 ) -> (
 	CommandSender,
-	mpsc::Receiver<Viewport>,
+	crate::engine::viewport_channel::ViewportReceiver,
 	thread::JoinHandle<()>,
 ) {
 	use crate::svp::markdown_provider::MarkdownProvider;
 
 	let (tx_cmd, _input, tx_internal, rx_request) = super::request::channel();
-	let (tx_view, rx_view) = mpsc::channel::<Viewport>();
+	let (tx_view, rx_view) = crate::engine::viewport_channel::channel();
 	let (tx_io_notify, _rx_io_notify) = mpsc::channel::<()>();
 	let registry = Arc::new(UastRegistry::new(1_000_000));
 	let resolver = Arc::new(SvpResolver::new(registry.clone(), tx_io_notify));
@@ -659,7 +659,7 @@ pub(crate) fn spawn_test_engine_with_markdown(
 	(tx_cmd, rx_view, handle)
 }
 
-pub(crate) fn recv_view(rx_view: &mpsc::Receiver<Viewport>) -> Viewport {
+pub(crate) fn recv_view(rx_view: &crate::engine::viewport_channel::ViewportReceiver) -> Viewport {
 	rx_view
 		.recv_timeout(Duration::from_secs(2))
 		.expect("expected viewport update")
