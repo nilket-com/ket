@@ -70,6 +70,106 @@ pub(crate) fn coalesce_frontend_text_tokens(tokens: Vec<RenderToken>) -> Vec<Ren
 	coalesced
 }
 
+/// How much of each line a render query may discover. A hydrated leaf is
+/// published whole and an unloaded one is hydrated on sight, so an unbounded
+/// walk of a newline-free line reaches the end of the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LineDiscovery {
+	Unbounded,
+	/// Take no leaf that starts this many bytes or more past its line's start.
+	/// A byte bound on discovery, not a display-cell bound: one cell may be
+	/// longer than any fixed byte count.
+	PerLineBytes(u64),
+}
+
+/// Display cells kept past an unwrapped pane's right edge. Without horizontal
+/// scroll nothing beyond the edge is drawn; one cell is enough to place an
+/// end-of-line annotation off-screen. It is not a continuation signal.
+pub(crate) const CLIP_LOOKAROUND_COLUMNS: u32 = 1;
+
+/// Drop the bytes of each line past `text_width + CLIP_LOOKAROUND_COLUMNS`
+/// display columns, for a pane without wrap. A hydrated leaf is published
+/// whole, so a newline-free file would otherwise send its entire 1 MiB extent
+/// with every frame. Runs after coalescing, so cuts fall on grapheme
+/// boundaries of valid text. Kept bytes keep their absolute positions; a line's
+/// newline stays with that line and the bytes after it are untouched.
+pub(crate) fn clip_frontend_text_tokens(
+	tokens: Vec<RenderToken>,
+	text_width: u16,
+) -> Vec<RenderToken> {
+	let limit = u32::from(text_width).saturating_add(CLIP_LOOKAROUND_COLUMNS);
+	let mut clipped = Vec::with_capacity(tokens.len());
+	let mut column = 0u32;
+	let mut past_limit = false;
+	for token in tokens {
+		if token.is_folded || token.text.is_empty() {
+			if token.is_folded {
+				column = crate::core::text::display_width(&token.text, column, TAB_SIZE);
+				past_limit = column >= limit;
+			}
+			clipped.push(token);
+			continue;
+		}
+		// Byte ranges of `token.text` to keep, in order, each with the number
+		// of newlines before its start.
+		let mut kept: Vec<(Range<usize>, u64)> = Vec::new();
+		let mut keep = |range: Range<usize>, lines_before: u64| match kept.last_mut() {
+			Some((last, _)) if last.end == range.start => last.end = range.end,
+			_ if range.is_empty() => {}
+			_ => kept.push((range, lines_before)),
+		};
+		let mut lines_before = 0u64;
+		let mut segment_start = 0usize;
+		while segment_start < token.text.len() {
+			let newline = token.text[segment_start..]
+				.iter()
+				.position(|&byte| byte == b'\n')
+				.map(|offset| segment_start + offset);
+			let segment_end = newline.unwrap_or(token.text.len());
+			if !past_limit {
+				let (cut, reached) = crate::core::text::byte_offset_for_display_col(
+					&token.text[segment_start..segment_end],
+					limit,
+					column,
+					TAB_SIZE,
+				);
+				keep(segment_start..segment_start + cut, lines_before);
+				column = reached;
+				past_limit = column >= limit;
+			}
+			match newline {
+				Some(at) => {
+					keep(at..at + 1, lines_before);
+					lines_before += 1;
+					column = 0;
+					past_limit = false;
+					segment_start = at + 1;
+				}
+				None => break,
+			}
+		}
+		if kept.len() == 1 && kept[0].0 == (0..token.text.len()) {
+			clipped.push(token);
+			continue;
+		}
+		for (range, lines_before) in kept {
+			let text = token.text[range.clone()].to_vec();
+			clipped.push(RenderToken {
+				node_id: token.node_id,
+				kind: token.kind,
+				physical_byte_len: u32::try_from(text.len())
+					.expect("a clipped token is no longer than its source token"),
+				text,
+				absolute_start_line: token.absolute_start_line.saturating_add(lines_before),
+				absolute_start_byte: token.absolute_start_byte.saturating_add(range.start as u64),
+				is_virtual: token.is_virtual,
+				is_folded: false,
+			});
+		}
+	}
+	clipped
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeCursorTarget {
 	pub node_id: NodeId,
@@ -1404,7 +1504,9 @@ impl UastProjection for UastRegistry {
 			start_node,
 			start_line,
 			start_byte,
+			LineDiscovery::Unbounded,
 		)
+		.0
 	}
 
 	fn get_next_node_in_walk(&self, node: NodeId) -> Option<NodeId> {
@@ -1555,19 +1657,51 @@ impl UastRegistry {
 			curr,
 			line_accumulator,
 			byte_accumulator,
+			LineDiscovery::Unbounded,
 		)
+		.0
 	}
 
+	/// [`UastProjection::query_viewport`] for a renderer, with a bound on how
+	/// much of each line it may discover. A capped line resumes at the next
+	/// line only when the root's line metrics are exact; otherwise the
+	/// projection ends at the capped line.
+	pub(crate) fn query_viewport_with_line_discovery<F: FoldPolicy + ?Sized>(
+		&self,
+		root: NodeId,
+		folds: &F,
+		target_line: DocLine,
+		line_count: u32,
+		discovery: LineDiscovery,
+	) -> Vec<RenderToken> {
+		let mut tokens = Vec::new();
+		let mut next = Some((target_line, line_count));
+		while let Some((line, count)) = next {
+			let (start_node, start_line, start_byte) =
+				seek_root_child_for_line(self, root, line, None);
+			let (mut part, resume) = self.query_viewport_internal(
+				root, folds, line, count, start_node, start_line, start_byte, discovery,
+			);
+			tokens.append(&mut part);
+			next = resume;
+		}
+		tokens
+	}
+
+	/// Returns the tokens, and the line and count to resume at when
+	/// `discovery` capped a line whose successor is seekable.
+	#[allow(clippy::too_many_arguments)]
 	fn query_viewport_internal<F: FoldPolicy + ?Sized>(
 		&self,
-		_root: NodeId,
+		root: NodeId,
 		folds: &F,
 		target_line: DocLine,
 		line_count: u32,
 		start_node: Option<NodeId>,
 		start_line: DocLine,
 		start_byte: DocByte,
-	) -> Vec<RenderToken> {
+		discovery: LineDiscovery,
+	) -> (Vec<RenderToken>, Option<(DocLine, u32)>) {
 		let mut tokens = Vec::new();
 		let (mut curr, mut line_accumulator, mut byte_accumulator) =
 			(start_node, start_line, start_byte);
@@ -1591,7 +1725,11 @@ impl UastRegistry {
 				if !has_children && !is_folded && target_line == node_end_line {
 					let text = self.resolve_physical_bytes(node);
 					let target_line_in_node = target_line.saturating_sub(line_accumulator.get());
-					if line_starts_at_node_end(&text, target_line_in_node)
+					// A line can begin at this leaf's end only after a newline inside it. Line 0
+					// of the leaf began at or before its start, and an unloaded leaf's empty text
+					// would otherwise look like that newline, skipping to the line's last leaf.
+					if target_line_in_node > DocLine::ZERO
+						&& line_starts_at_node_end(&text, target_line_in_node)
 						&& self.next_node_skipping_children(node).is_some()
 					{
 						line_accumulator = node_end_line;
@@ -1626,6 +1764,14 @@ impl UastRegistry {
 		// PHASE 2: ITERATION
 		let mut collected_lines = 0;
 		let mut visit = curr;
+		let line_cap = match discovery {
+			LineDiscovery::Unbounded => None,
+			LineDiscovery::PerLineBytes(cap) => Some(cap),
+		};
+		// Where the line being collected starts. An unloaded leaf hides where
+		// its newlines are, so a line beginning inside one is counted from that
+		// leaf's end: discovery then takes at most the cap plus that one leaf.
+		let mut open_line_start: Option<DocByte> = None;
 
 		while let Some(node) = visit {
 			let idx = node.index();
@@ -1695,6 +1841,19 @@ impl UastRegistry {
 				token_start_line = target_line;
 			}
 
+			if let (Some(cap), Some(line_start)) = (line_cap, open_line_start)
+				&& !is_folded
+				&& token_start_byte.get().saturating_sub(line_start.get()) >= cap
+			{
+				let remaining = u64::from(line_count).saturating_sub(collected_lines + 1);
+				let next_line = line_accumulator.saturating_add(1);
+				let seekable = remaining > 0
+					&& next_line.get() <= self.get_total_newlines(root)
+					&& !self.inspector_root_metrics_incomplete(root);
+				let remaining = u32::try_from(remaining).expect("remaining lines fit line_count");
+				return (tokens, seekable.then_some((next_line, remaining)));
+			}
+
 			tokens.push(RenderToken {
 				node_id: node,
 				kind,
@@ -1706,6 +1865,16 @@ impl UastRegistry {
 				is_virtual,
 				is_folded,
 			});
+			let pushed = &tokens.last().unwrap().text;
+			if is_folded {
+				open_line_start = Some(token_start_byte.saturating_add(m.byte_length));
+			} else if let Some(newline) = pushed.iter().rposition(|&byte| byte == b'\n') {
+				open_line_start = Some(token_start_byte.saturating_add(newline as u64 + 1));
+			} else if pushed.is_empty() && m.newlines > 0 {
+				open_line_start = Some(token_start_byte.saturating_add(m.byte_length));
+			} else if open_line_start.is_none() {
+				open_line_start = Some(token_start_byte);
+			}
 
 			if is_folded {
 				line_accumulator = line_accumulator.saturating_add(m.newlines);
@@ -1734,7 +1903,7 @@ impl UastRegistry {
 			visit = self.next_node_skipping_children(node);
 		}
 
-		tokens
+		(tokens, None)
 	}
 }
 
@@ -2513,6 +2682,102 @@ mod tests {
 	}
 
 	#[test]
+	fn query_viewport_starts_a_line_spanning_unloaded_leaves_at_its_first_leaf() {
+		let (registry, root) = build_document_with_byte_leaves(&[b"HEAD", b"middle", b"tail"]);
+		let mut leaf = registry.get_first_child(root);
+		while let Some(node) = leaf {
+			unsafe {
+				*registry.virtual_data[node.index()].get() = None;
+			}
+			leaf = registry.get_next_sibling(node);
+		}
+
+		let tokens = registry.query_viewport(root, &crate::uast::NoFolds, DocLine::ZERO, 1);
+
+		assert_eq!(
+			tokens.first().map(|token| token.absolute_start_byte),
+			Some(DocByte::ZERO),
+			"line 0 starts in the first leaf even before it is hydrated: {tokens:?}"
+		);
+	}
+
+	/// A line whose first two 4-byte leaves are unloaded, then two short lines.
+	fn document_with_unloaded_long_line() -> (UastRegistry, crate::ecs::NodeId) {
+		let (registry, root) =
+			build_document_with_byte_leaves(&[b"aaaa", b"bbbb", b"ccc\n", b"next\n", b"last"]);
+		let mut leaf = registry.get_first_child(root);
+		for _ in 0..2 {
+			let node = leaf.expect("unloaded leaf");
+			unsafe {
+				*registry.virtual_data[node.index()].get() = None;
+			}
+			leaf = registry.get_next_sibling(node);
+		}
+		(registry, root)
+	}
+
+	fn starts(tokens: &[super::RenderToken]) -> Vec<(u64, u64)> {
+		tokens
+			.iter()
+			.map(|token| {
+				(
+					token.absolute_start_byte.get(),
+					token.absolute_start_line.get(),
+				)
+			})
+			.collect()
+	}
+
+	#[test]
+	fn unbounded_line_discovery_returns_every_leaf_of_a_long_line() {
+		let (registry, root) = document_with_unloaded_long_line();
+		let tokens = registry.query_viewport_with_line_discovery(
+			root,
+			&crate::uast::NoFolds,
+			DocLine::ZERO,
+			3,
+			super::LineDiscovery::Unbounded,
+		);
+		assert_eq!(
+			starts(&tokens),
+			starts(&registry.query_viewport(root, &crate::uast::NoFolds, DocLine::ZERO, 3))
+		);
+		assert_eq!(
+			starts(&tokens),
+			vec![(0, 0), (4, 0), (8, 0), (12, 1), (17, 2)]
+		);
+	}
+
+	#[test]
+	fn capped_line_discovery_stops_the_line_and_resumes_at_an_exact_next_line() {
+		let (registry, root) = document_with_unloaded_long_line();
+		let tokens = registry.query_viewport_with_line_discovery(
+			root,
+			&crate::uast::NoFolds,
+			DocLine::ZERO,
+			3,
+			super::LineDiscovery::PerLineBytes(4),
+		);
+		// Line 0 stops after its first leaf; nothing of its second or third
+		// leaf is discovered, and the following lines keep their true bytes.
+		assert_eq!(starts(&tokens), vec![(0, 0), (12, 1), (17, 2)]);
+	}
+
+	#[test]
+	fn capped_line_discovery_ends_at_the_capped_line_while_metrics_are_incomplete() {
+		let (registry, root) = document_with_unloaded_long_line();
+		registry.mark_root_metrics_incomplete(root);
+		let tokens = registry.query_viewport_with_line_discovery(
+			root,
+			&crate::uast::NoFolds,
+			DocLine::ZERO,
+			3,
+			super::LineDiscovery::PerLineBytes(4),
+		);
+		assert_eq!(starts(&tokens), vec![(0, 0)]);
+	}
+
+	#[test]
 	fn frontend_projection_reassembles_valid_utf8_across_render_tokens() {
 		let skull = "☠".as_bytes();
 		let chunks = [&skull[..1], &skull[1..2], &skull[2..]];
@@ -3084,5 +3349,151 @@ mod tests {
 			assert!(unsafe { (&*registry.virtual_data[node.index()].get()).is_none() });
 			child = registry.get_next_sibling(node);
 		}
+	}
+
+	fn clip_token(start_byte: u64, start_line: u64, text: &[u8]) -> super::RenderToken {
+		super::RenderToken {
+			node_id: crate::ecs::NodeId::from_index(1),
+			kind: SemanticKind::default(),
+			text: text.to_vec(),
+			physical_byte_len: u32::try_from(text.len()).unwrap(),
+			absolute_start_line: DocLine::new(start_line),
+			absolute_start_byte: DocByte::new(start_byte),
+			is_virtual: false,
+			is_folded: false,
+		}
+	}
+
+	/// (absolute start byte, absolute start line, text) for each clipped token.
+	fn clip(tokens: Vec<super::RenderToken>, text_width: u16) -> Vec<(u64, u64, Vec<u8>)> {
+		super::clip_frontend_text_tokens(tokens, text_width)
+			.into_iter()
+			.map(|token| {
+				assert_eq!(token.physical_byte_len as usize, token.text.len());
+				(
+					token.absolute_start_byte.get(),
+					token.absolute_start_line.get(),
+					token.text,
+				)
+			})
+			.collect()
+	}
+
+	#[test]
+	fn clip_keeps_a_cell_past_the_edge_and_resumes_at_the_newline() {
+		let clipped = clip(vec![clip_token(100, 7, b"abcdefghij\nxyz")], 4);
+		assert_eq!(
+			clipped,
+			vec![(100, 7, b"abcde".to_vec()), (110, 7, b"\nxyz".to_vec())]
+		);
+	}
+
+	#[test]
+	fn clip_leaves_lines_within_the_limit_untouched() {
+		let clipped = super::clip_frontend_text_tokens(vec![clip_token(3, 1, b"ab\ncd\n")], 4);
+		assert_eq!(clipped.len(), 1);
+		assert_eq!(clipped[0].text, b"ab\ncd\n");
+		assert_eq!(clipped[0].absolute_start_byte, DocByte::new(3));
+		assert_eq!(clipped[0].absolute_start_line, DocLine::new(1));
+		assert_eq!(clipped[0].physical_byte_len, 6);
+	}
+
+	#[test]
+	fn clip_counts_display_cells_not_bytes() {
+		// A tab advances to the next stop.
+		let width = u16::try_from(TAB_SIZE + 1).unwrap();
+		assert_eq!(
+			clip(vec![clip_token(0, 0, b"\tabcdef")], width)[0].2,
+			b"\tab"
+		);
+		// A wide cell straddling the limit is kept whole, never split.
+		assert_eq!(
+			clip(vec![clip_token(0, 0, "日本語".as_bytes())], 2)[0].2,
+			"日本".as_bytes()
+		);
+		// A combining mark stays with its base.
+		assert_eq!(
+			clip(
+				vec![clip_token(0, 0, "e\u{301}e\u{301}e\u{301}".as_bytes())],
+				1
+			)[0]
+			.2,
+			"e\u{301}e\u{301}".as_bytes()
+		);
+		// Invalid bytes take one cell each.
+		assert_eq!(clip(vec![clip_token(0, 0, &[0xff; 10])], 2)[0].2, [0xff; 3]);
+	}
+
+	#[test]
+	fn clip_carries_the_column_across_tokens_of_one_line() {
+		let clipped = clip(
+			vec![
+				clip_token(0, 0, b"abc"),
+				clip_token(3, 0, b"defgh\nz"),
+				clip_token(10, 1, b"wxyz"),
+				clip_token(14, 1, b"tail\nok"),
+			],
+			3,
+		);
+		assert_eq!(
+			clipped,
+			vec![
+				(0, 0, b"abc".to_vec()),
+				(3, 0, b"d".to_vec()),
+				(8, 0, b"\nz".to_vec()),
+				(10, 1, b"wxy".to_vec()),
+				(18, 1, b"\nok".to_vec()),
+			]
+		);
+	}
+
+	#[test]
+	fn clip_drops_a_token_wholly_past_the_limit() {
+		let clipped = clip(
+			vec![
+				clip_token(0, 0, b"abcd"),
+				clip_token(4, 0, b"efgh"),
+				clip_token(8, 0, b"\nx"),
+			],
+			1,
+		);
+		assert_eq!(
+			clipped,
+			vec![(0, 0, b"ab".to_vec()), (8, 0, b"\nx".to_vec())]
+		);
+	}
+
+	#[test]
+	fn clip_keeps_following_lines_at_their_absolute_bytes() {
+		let clipped = clip(vec![clip_token(0, 0, b"aaaaaa\nbb\ncccccc\n")], 2);
+		assert_eq!(
+			clipped,
+			vec![
+				(0, 0, b"aaa".to_vec()),
+				(6, 0, b"\nbb\nccc".to_vec()),
+				(16, 2, b"\n".to_vec()),
+			]
+		);
+	}
+
+	#[test]
+	fn clip_keeps_one_cell_in_a_zero_width_pane() {
+		let clipped = clip(vec![clip_token(0, 0, b"abc\ndef")], 0);
+		assert_eq!(
+			clipped,
+			vec![(0, 0, b"a".to_vec()), (3, 0, b"\nd".to_vec())]
+		);
+	}
+
+	#[test]
+	fn clip_never_touches_folded_tokens() {
+		let mut folded = clip_token(0, 0, super::FOLDED_TOKEN_TEXT.as_bytes());
+		folded.is_folded = true;
+		folded.physical_byte_len = 4096;
+		let clipped = super::clip_frontend_text_tokens(vec![folded], 0);
+		assert_eq!(clipped.len(), 1);
+		assert!(clipped[0].is_folded);
+		assert_eq!(clipped[0].text, super::FOLDED_TOKEN_TEXT.as_bytes());
+		assert_eq!(clipped[0].physical_byte_len, 4096);
 	}
 }

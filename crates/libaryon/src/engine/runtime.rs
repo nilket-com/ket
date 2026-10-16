@@ -7962,6 +7962,12 @@ pub fn main(editor) {
 			);
 		}
 
+		// An unwrapped pane publishes each line only to its edge, so make the
+		// inspector's half of the split wide enough for the whole owner header.
+		engine
+			.commands
+			.send(EditorCommand::Resize(400, 60))
+			.expect("widen the screen");
 		engine
 			.commands
 			.send(EditorCommand::OpenUastInspector { mode: None })

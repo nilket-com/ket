@@ -27,13 +27,14 @@ use crate::core::{
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::SplitDirection;
 use crate::svp::SvpResolver;
+use crate::svp::ingest::COLD_INGEST_EXTENT_SIZE;
 use crate::svp::rust_highlight::{HighlightSpan, HighlightSpanIndex, TokenCategory};
 use crate::svp::semantic::SemanticReactor;
 use crate::uast::projection::{
-	GutterLineNumber, HostPanelViewport, PaneDividerViewport, PickerResultViewport, PickerViewport,
-	ProjectedCaret, coalesce_frontend_text_tokens,
+	GutterLineNumber, HostPanelViewport, LineDiscovery, PaneDividerViewport, PickerResultViewport,
+	PickerViewport, ProjectedCaret, clip_frontend_text_tokens, coalesce_frontend_text_tokens,
 };
-use crate::uast::{PaneViewport, RenderToken, UastProjection, Viewport};
+use crate::uast::{PaneViewport, RenderToken, Viewport};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -1043,14 +1044,23 @@ fn render_pane_viewport(
 
 			let virtual_start_line = scroll_line.saturating_sub(60);
 			let virtual_line_count = tab.view.viewport_lines + 120;
-			let virtual_tokens = registry.query_viewport(
+			// One cold extent per line bounds what a frame discovers, hydrates and
+			// publishes; a newline-free line would otherwise be walked to the file's end.
+			let discovery = LineDiscovery::PerLineBytes(COLD_INGEST_EXTENT_SIZE as u64);
+			let virtual_tokens = registry.query_viewport_with_line_discovery(
 				rid,
 				&tab.view.folds,
 				virtual_start_line,
 				virtual_line_count,
+				discovery,
 			);
-			let visible_tokens =
-				registry.query_viewport(rid, &tab.view.folds, scroll_line, tab.view.viewport_lines);
+			let visible_tokens = registry.query_viewport_with_line_discovery(
+				rid,
+				&tab.view.folds,
+				scroll_line,
+				tab.view.viewport_lines,
+				discovery,
+			);
 
 			let render_rows = collect_visible_rows_with_sum_tree(
 				registry,
@@ -1139,6 +1149,11 @@ fn render_pane_viewport(
 				visible_tokens.iter().map(|token| token.node_id),
 			);
 			let visible_tokens = coalesce_frontend_text_tokens(visible_tokens);
+			let visible_tokens = if tab.view.wrap_enabled {
+				visible_tokens
+			} else {
+				clip_frontend_text_tokens(visible_tokens, geometry.text_width)
+			};
 
 			(
 				virtual_tokens,

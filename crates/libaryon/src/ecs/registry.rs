@@ -1698,6 +1698,11 @@ impl UastRegistry {
 			|| self.incomplete_metric_roots.lock().unwrap().contains(&root)
 	}
 
+	#[cfg(test)]
+	pub(crate) fn mark_root_metrics_incomplete(&self, root: NodeId) {
+		self.incomplete_metric_roots.lock().unwrap().insert(root);
+	}
+
 	pub(crate) fn record_high_priority_start(&self, node: NodeId) {
 		self.high_priority_started
 			.lock()
