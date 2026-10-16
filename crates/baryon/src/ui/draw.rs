@@ -232,7 +232,20 @@ fn paint_text_segment(
 			if screen_y >= screen_y_offset.saturating_add(render_height) {
 				return false;
 			}
-			buf.set_stringn(*x as u16, screen_y as u16, grapheme, cell_width, style);
+			// The terminal can resize between receiving an engine viewport and
+			// drawing it. The viewport's pane rectangle then briefly describes the
+			// old terminal, so clip the one direct Buffer write to the current
+			// buffer rather than indexing just past its bottom or right edge.
+			let area = buf.area;
+			if let (Ok(x), Ok(y)) = (u16::try_from(*x), u16::try_from(screen_y))
+				&& x >= area.x
+				&& x < area.right()
+				&& y >= area.y
+				&& y < area.bottom()
+			{
+				let width = cell_width.min(usize::from(area.right() - x));
+				buf.set_stringn(x, y, grapheme, width, style);
+			}
 		}
 		*x = x.saturating_add(cell_width);
 		*current_display_col = current_display_col.saturating_add(cell_width as u32);
@@ -2139,6 +2152,34 @@ mod tests {
 		layout::Rect,
 		style::{Modifier, Style},
 	};
+
+	#[test]
+	fn text_paint_clips_a_stale_pane_below_a_resized_terminal() {
+		let mut buffer = Buffer::empty(Rect::new(0, 0, 180, 54));
+		let mut x = 24;
+		let mut visual_y = 0;
+		let mut display_col = 0;
+		let mut next_render_row = 0;
+
+		assert!(paint_text_segment(
+			&mut buffer,
+			&mut x,
+			&mut visual_y,
+			0,
+			&mut display_col,
+			&mut next_render_row,
+			&[],
+			0,
+			180,
+			1,
+			0,
+			54,
+			"x",
+			Style::default(),
+			false,
+		));
+		assert_eq!(buffer[(24, 53)].symbol(), " ");
+	}
 
 	#[test]
 	fn picker_overlay_marks_the_selected_row_and_places_the_query_cursor() {
