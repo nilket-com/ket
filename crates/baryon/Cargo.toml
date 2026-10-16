@@ -28,3 +28,7 @@ pulldown-cmark.workspace = true
 ratatui.workspace = true
 ratatui-image.workspace = true
 regex-automata.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The startup latency pty harness (tests/startup_latency_pty_test.rs).
+libc.workspace = true

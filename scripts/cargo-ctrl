@@ -15,7 +15,11 @@ Usage: scripts/cargo-ctrl [OPTIONS]
 
 Run workspace library tests in two concurrent resource lanes:
   general     parallel libtest workers on 80% of available CPUs
-  controlled  timing-sensitive libaryon tests, queued one at a time
+  controlled  timing-sensitive tests from the manifest, queued one at a time
+
+Manifest lines are exact library test names, or integration tests written as
+`<package> --test <target> <exact test name>`. Controlled tests run with
+CARGO_CTRL_LANE=controlled.
 
 Options:
   --locked          Pass --locked to Cargo.
@@ -101,6 +105,14 @@ done <"$MANIFEST"
 	exit 2
 }
 
+INTEGRATION_ENTRY='^([^[:space:]]+) --test ([^[:space:]]+) ([^[:space:]]+)$'
+for entry in "${controlled_tests[@]}"; do
+	if [[ "$entry" == *" "* && ! "$entry" =~ $INTEGRATION_ENTRY ]]; then
+		echo "Malformed controlled-test entry (want <package> --test <target> <name>): $entry" >&2
+		exit 2
+	fi
+done
+
 cpu_count() {
 	if command -v nproc >/dev/null 2>&1; then
 		nproc
@@ -174,8 +186,19 @@ general_cmd=("${cargo_base[@]}" --workspace --lib)
 [[ -z "$FILTER" ]] || general_cmd+=("$FILTER")
 general_cmd+=(-- --test-threads="$main_threads")
 for test_name in "${controlled_tests[@]}"; do
-	general_cmd+=(--skip "$test_name")
+	[[ "$test_name" =~ $INTEGRATION_ENTRY ]] || general_cmd+=(--skip "$test_name")
 done
+
+# Sets controlled_cmd to the Cargo invocation for one manifest entry.
+controlled_command() {
+	if [[ "$1" =~ $INTEGRATION_ENTRY ]]; then
+		controlled_cmd=(env CARGO_CTRL_LANE=controlled "${cargo_base[@]}" -p "${BASH_REMATCH[1]}"
+			--test "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" -- --exact --test-threads=1)
+	else
+		controlled_cmd=(env CARGO_CTRL_LANE=controlled "${cargo_base[@]}" --workspace --lib "$1"
+			-- --exact --test-threads=1)
+	fi
+}
 
 selected_controlled_tests=()
 for test_name in "${controlled_tests[@]}"; do
@@ -207,7 +230,7 @@ if ((DRY_RUN == 1)); then
 	printf '[general]\n'
 	print_command "${main_prefix[@]}" "${general_cmd[@]}"
 	for test_name in "${selected_controlled_tests[@]}"; do
-		controlled_cmd=("${cargo_base[@]}" --workspace --lib "$test_name" -- --exact --test-threads=1)
+		controlled_command "$test_name"
 		printf '[controlled] %s\n' "$test_name"
 		print_command "${controlled_prefix[@]}" "${controlled_cmd[@]}"
 	done
@@ -223,7 +246,17 @@ if ((${#selected_controlled_tests[@]} > 0)); then
 	printf '\n==> validating controlled-test manifest\n'
 	test_inventory="$("${cargo_base[@]}" --workspace --lib -- --list)"
 	for test_name in "${selected_controlled_tests[@]}"; do
-		if ! grep -Fqx "$test_name: test" <<<"$test_inventory"; then
+		inventory="$test_inventory"
+		name="$test_name"
+		if [[ "$test_name" =~ $INTEGRATION_ENTRY ]]; then
+			name="${BASH_REMATCH[3]}"
+			inventory="$("${cargo_base[@]}" -p "${BASH_REMATCH[1]}" \
+				--test "${BASH_REMATCH[2]}" -- --list)" || {
+				echo "Controlled integration target does not build: $test_name" >&2
+				exit 2
+			}
+		fi
+		if ! grep -Fqx "$name: test" <<<"$inventory"; then
 			echo "Controlled test is missing or no longer exact: $test_name" >&2
 			exit 2
 		fi
@@ -244,7 +277,7 @@ trap stop_general INT TERM
 controlled_status=0
 for test_name in "${selected_controlled_tests[@]}"; do
 	printf '\n==> controlled: %s\n' "$test_name"
-	controlled_cmd=("${cargo_base[@]}" --workspace --lib "$test_name" -- --exact --test-threads=1)
+	controlled_command "$test_name"
 	if ! "${controlled_prefix[@]}" "${controlled_cmd[@]}"; then
 		controlled_status=1
 		break

@@ -1,7 +1,8 @@
 # Tests in this manifest run one-at-a-time in cargo-ctrl's controlled CPU lane.
 #
-# Keep exact libtest names here. cargo-ctrl validates every selected name before
-# launching either lane, and excludes these tests from the general test process.
+# Keep exact libtest names here; integration targets use the form at the end.
+# cargo-ctrl validates every selected name before launching either lane, and
+# excludes these library tests from the general test process.
 # Add a test only when parallel resource contention can violate one of its
 # timing/projection assertions; ordinary slow tests belong in the general lane.
 
@@ -23,3 +24,6 @@ engine::runtime::system::tests::viewport_top_middle_bottom_sequence_on_real_engi
 engine::runtime::system::tests::search_word_under_cursor_forward_uses_whole_word_matches_in_real_engine_file
 engine::runtime::system::tests::search_word_under_cursor_backward_moves_to_previous_occurrence_in_real_engine_file
 engine::runtime::system::tests::search_word_under_cursor_backward_wraps_from_first_occurrence_in_real_engine_file
+
+# Integration targets: `<package> --test <target> <exact test name>`.
+libaryon --test startup_latency_test engine_startup_latency_stays_within_budget

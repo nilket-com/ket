@@ -58,6 +58,19 @@ BARYON_SVP_BACKEND=blocking scripts/cargo-ctrl --locked
 Set `CARGO_CTRL_MAIN_PERCENT` to tune the split or
 `CARGO_CTRL_NO_AFFINITY=1` to diagnose affinity-specific behavior.
 
+A manifest line is an exact library test name, or an integration test written
+as `<package> --test <target> <exact test name>`. Controlled tests run with
+`CARGO_CTRL_LANE=controlled`, which timing tests use to decide whether to
+enforce their budgets.
+
+## Startup latency
+
+`ci/startup-latency-check.sh` runs the libaryon engine startup test and the
+baryon pty startup test from a release build with their budgets enforced. Run it
+on a quiet machine; `--report-only` measures without failing. The debug engine
+test also runs in cargo-ctrl's controlled lane. See
+`crates/libaryon/plans/impl/startup-latency.md`.
+
 Use this from whichever local runner is convenient: a shell session, a git hook,
 a cron job, a systemd timer, or a small private build service. `.github` and
 provider-specific workflow files are intentionally outside this repository's
