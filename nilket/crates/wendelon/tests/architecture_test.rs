@@ -8557,7 +8557,29 @@ fn adr075_counter_add_has_per_key_read_modify_write_serialization() {
 	assert!(fetch_add.contains("self.locks.entry(key.clone()).or_default().clone()"));
 	assert!(fetch_add.contains("let _guard = lock.lock().await;"));
 	// The base read and the overflow-checked add both happen under the guard.
-	assert!(fetch_add.contains("read_committed(key)"));
+	let serialized = |body: &str| {
+		let markers = [
+			"let _guard = lock.lock().await;",
+			"read_identity(counter_identity(key))",
+			"checked_add(delta)",
+			".replicate_tentative(op_id, key, current, commit_hlc)",
+		];
+		let positions: Option<Vec<_>> = markers.iter().map(|marker| body.find(marker)).collect();
+		positions.is_some_and(|p| p.windows(2).all(|pair| pair[0] < pair[1]))
+			&& !body.contains("drop(_guard)")
+	};
+	assert!(serialized(&fetch_add));
+	for invalid in [
+		fetch_add.replace("let _guard = lock.lock().await;", ""),
+		format!("read_identity(counter_identity(key));{fetch_add}"),
+		fetch_add.replace(
+			"read_identity(counter_identity(key))",
+			"read_committed(key)",
+		),
+		fetch_add.replace("checked_add(delta)", "checked_add(delta); drop(_guard)"),
+	] {
+		assert!(!serialized(&invalid), "serialization violation accepted");
+	}
 	assert!(fetch_add.contains("checked_add(delta)"));
 }
 
@@ -8802,7 +8824,24 @@ fn adr076_counter_leader_has_explicit_local_arm() {
 	assert!(counter.contains("local_id: NodeId"));
 	assert!(counter.contains("local: P"));
 	assert!(counter.contains("plan.get(self.local_id).is_none()"));
-	assert!(counter.contains("self.local\n\t\t\t.read_committed(key)"));
+	let local_union = |body: &str| {
+		let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+		compact.contains("self.local.read_eligible(identity)")
+			&& compact.contains("self.witnessed.read(&identity)")
+			&& compact.contains("winner(marked,witnessed)")
+			&& !compact.contains("participants[0]")
+	};
+	assert!(local_union(&counter));
+	for invalid in [
+		counter.replace(
+			".local\n\t\t\t.read_eligible(identity)",
+			".participants[0].read_eligible(identity)",
+		),
+		counter.replace(".read_eligible(identity)", ".read_raw(identity)"),
+		counter.replace("winner(marked, witnessed)", "winner(None, witnessed)"),
+	] {
+		assert!(!local_union(&invalid), "local-arm violation accepted");
+	}
 	assert!(!counter.contains("participants[0]"));
 }
 
@@ -8850,10 +8889,31 @@ fn adr076_pending_witness_never_expires_on_peer_loss() {
 	);
 	assert!(commit.contains("let Some(participant) = resolver.resolve_recorded(i) else"));
 	assert!(commit.contains("continue;"));
+	let retains_failed = |body: &str| {
+		let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+		compact.contains("letoutcome=matchparticipant.replicate_tentative(op_id,&key,value,commit_hlc).await{Ok(())=>participant.commit(op_id,&key).await,Err(error)=>Err(error),};")
+			&& compact.contains("ifoutcome.is_ok(){ifletSome(mutwitness)=self.witnesses.get_mut(&op_id){witness.committed.insert(i);")
+			&& compact.contains("ifmatches!(outcome,Err(ParticipantError::Visibility(_))){self.witnessed.refuse(&counter_identity(&key),CounterVisibilityError::Poisoned);return;}")
+	};
 	assert!(
-		commit.contains(".is_ok() && participant.commit(op_id, &key).await.is_ok()"),
-		"commit failures must leave the witness pending for a later reconcile"
+		retains_failed(&commit),
+		"failed commits must retain witnesses"
 	);
+	let compact: String = commit.chars().filter(|c| !c.is_whitespace()).collect();
+	for invalid in [
+		compact.replace("ifoutcome.is_ok()", "ifoutcome.is_err()"),
+		compact.replace("Err(error)=>Err(error)", "Err(error)=>Ok(())"),
+		compact.replace("ifoutcome.is_ok()", "iftrue"),
+		compact.replace(
+			"CounterVisibilityError::Poisoned);return;",
+			"CounterVisibilityError::Poisoned);",
+		),
+	] {
+		assert!(
+			!retains_failed(&invalid),
+			"failed-commit violation accepted"
+		);
+	}
 	assert!(!commit.contains("expire"));
 	assert!(!commit.contains("deadline"));
 	// Replica operation scope is private and bound to the checked allocating node.
@@ -9306,6 +9366,7 @@ fn adr078_manager_source_concatenates_submodules() {
 		vec![
 			"manager.rs",
 			"compaction.rs",
+			"counter_visibility.rs",
 			"encoding_compute.rs",
 			"lsm_driver.rs",
 			"maintenance_publication.rs",

@@ -59,6 +59,24 @@ impl MigrationRegistry {
 }
 
 impl WendelonDataServer {
+	pub(super) async fn refuse_counter_migration_rows(
+		&self,
+		locations: &[(
+			TenantId,
+			Identity,
+			Locality,
+			crate::storage::core::RecordLocation,
+		)],
+	) -> std::io::Result<()> {
+		let mut checked_slabs = std::collections::HashSet::new();
+		for (_, _, _, location) in locations {
+			if checked_slabs.insert(location.slab_id) {
+				self.slab.refuse_counter_migration(location.slab_id).await?;
+			}
+		}
+		Ok(())
+	}
+
 	/// Handle an inbound MIGRATE_REQ frame (Plan 019).
 	///
 	/// Administrative peer-to-peer RPC that sources retained

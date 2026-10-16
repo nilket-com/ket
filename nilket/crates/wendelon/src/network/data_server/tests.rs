@@ -11072,6 +11072,8 @@ use tokio::sync::{Mutex as TokioMutex, watch};
 /// via `Arc`, so one fault-injection call affects every
 /// subsequent dispatch.
 struct LoopbackHandlers {
+	// Explicit authenticated sender for selected counter fixtures only.
+	senders: LoopbackDashMap<u32, NodeId>,
 	services: LoopbackDashMap<u32, Arc<dyn HrftService>>,
 	/// Per-target remaining successful pages before the next
 	/// `MIGRATE_REQ` is intercepted with `INTERNAL_ERROR`.
@@ -11092,6 +11094,7 @@ impl LoopbackHandlers {
 	fn new(pool: Arc<BufPool>) -> Arc<Self> {
 		Arc::new(Self {
 			services: LoopbackDashMap::new(),
+			senders: LoopbackDashMap::new(),
 			fail_after: LoopbackDashMap::new(),
 			page_count: LoopbackDashMap::new(),
 			pool,
@@ -11256,11 +11259,16 @@ async fn serve_one_frame(
 		Some(s) => s,
 		None => return,
 	};
+	let sender = handlers
+		.senders
+		.get(&remote.id)
+		.map(|entry| *entry.value())
+		.unwrap_or(ZERO_NODE);
 	let response = match svc
 		.handle_frame(
 			RequestContext {
-				remote: Some(ZERO_NODE),
-				actor: ActorIdentity::data_node(ZERO_NODE),
+				remote: Some(sender),
+				actor: ActorIdentity::data_node(sender),
 			},
 			frame,
 		)
@@ -12899,6 +12907,9 @@ async fn build_counter_replication_fixture_with_remote_registration(
 
 	let pool = leader_node.pool.clone();
 	let handlers = LoopbackHandlers::new(pool.clone());
+	handlers
+		.senders
+		.insert(follower_node.local_node.id, leader_node.local_node);
 	let loopback_provider: Arc<dyn TransportProvider> = Arc::new(LoopbackProvider {
 		handlers: handlers.clone(),
 		tier: TransportTier::QuicIoUring,
@@ -17567,3 +17578,6 @@ mod tenant_cache;
 
 #[path = "tests/pending_tenant/tests.rs"]
 mod pending_tenant;
+
+#[path = "counter_visibility/tests.rs"]
+mod counter_visibility_tests;

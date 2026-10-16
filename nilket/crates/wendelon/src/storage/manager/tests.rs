@@ -2822,7 +2822,14 @@ async fn counter_tentative_without_marker_does_not_survive_restart() {
 			crypto.clone(),
 		)
 		.await;
-		let store = SlabCounterStore::new(mgr.clone(), tenant());
+		let store = SlabCounterStore::new(
+			mgr.clone(),
+			tenant(),
+			NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+		);
 		store.tentative_append(&k, 5, hlc(1)).await.unwrap();
 		assert_eq!(
 			store.read_committed(&k).await.unwrap(),
@@ -2832,7 +2839,14 @@ async fn counter_tentative_without_marker_does_not_survive_restart() {
 		mgr.fsync_all_local_slabs().await.unwrap();
 	}
 	let mgr = open_manager_at_dir(dir.to_path_buf(), spawn_io_thread(64).unwrap(), crypto).await;
-	let store = SlabCounterStore::new(mgr, tenant());
+	let store = SlabCounterStore::new(
+		mgr,
+		tenant(),
+		NodeId {
+			id: 1,
+			_reserved: 0,
+		},
+	);
 	assert_eq!(
 		store.read_committed(&k).await.unwrap(),
 		None,
@@ -2856,7 +2870,14 @@ async fn counter_commit_marker_survives_restart_into_manager_index() {
 			crypto.clone(),
 		)
 		.await;
-		let store = SlabCounterStore::new(mgr.clone(), tenant());
+		let store = SlabCounterStore::new(
+			mgr.clone(),
+			tenant(),
+			NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+		);
 		let t = store.tentative_append(&k, 5, hlc(1)).await.unwrap();
 		store.commit_tentative(t).await.unwrap();
 		mgr.fsync_all_local_slabs().await.unwrap();
@@ -2867,7 +2888,14 @@ async fn counter_commit_marker_survives_restart_into_manager_index() {
 		mgr.lookup(tenant(), counter_identity(&k)).is_some(),
 		"committed counter landed in the manager's authoritative index after open"
 	);
-	let store = SlabCounterStore::new(mgr, tenant());
+	let store = SlabCounterStore::new(
+		mgr,
+		tenant(),
+		NodeId {
+			id: 1,
+			_reserved: 0,
+		},
+	);
 	assert_eq!(store.read_committed(&k).await.unwrap(), Some(5));
 }
 
@@ -2882,7 +2910,14 @@ async fn counter_manager_rollback_removes_live_tentative_only() {
 		test_crypto(),
 	)
 	.await;
-	let store = SlabCounterStore::new(mgr, tenant());
+	let store = SlabCounterStore::new(
+		mgr,
+		tenant(),
+		NodeId {
+			id: 1,
+			_reserved: 0,
+		},
+	);
 	let k = ckey(b"verdict");
 	let t = store.tentative_append(&k, 5, hlc(1)).await.unwrap();
 	assert_eq!(store.read_committed(&k).await.unwrap(), Some(5));
@@ -2908,7 +2943,14 @@ async fn counter_manager_marker_failure_rolls_back_and_recovery_skips_orphan() {
 			crypto.clone(),
 		)
 		.await;
-		let store = SlabCounterStore::new(mgr.clone(), tenant());
+		let store = SlabCounterStore::new(
+			mgr.clone(),
+			tenant(),
+			NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+		);
 		let t1 = store.tentative_append(&k, 3, hlc(1)).await.unwrap();
 		store.commit_tentative(t1).await.unwrap();
 		let t2 = store.tentative_append(&k, 50, hlc(2)).await.unwrap();
@@ -2920,7 +2962,14 @@ async fn counter_manager_marker_failure_rolls_back_and_recovery_skips_orphan() {
 		mgr.fsync_all_local_slabs().await.unwrap();
 	}
 	let mgr = open_manager_at_dir(dir.to_path_buf(), spawn_io_thread(64).unwrap(), crypto).await;
-	let store = SlabCounterStore::new(mgr, tenant());
+	let store = SlabCounterStore::new(
+		mgr,
+		tenant(),
+		NodeId {
+			id: 1,
+			_reserved: 0,
+		},
+	);
 	assert_eq!(
 		store.read_committed(&k).await.unwrap(),
 		Some(3),
@@ -2947,7 +2996,14 @@ async fn counter_and_blob_coexist_blob_recovery_unchanged() {
 		mgr.append_durable(tenant(), blob_id, hlc(1), &blob_value)
 			.await
 			.unwrap();
-		let store = SlabCounterStore::new(mgr.clone(), tenant());
+		let store = SlabCounterStore::new(
+			mgr.clone(),
+			tenant(),
+			NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+		);
 		let t = store.tentative_append(&k, 7, hlc(2)).await.unwrap();
 		store.commit_tentative(t).await.unwrap();
 		mgr.fsync_all_local_slabs().await.unwrap();
@@ -2959,7 +3015,14 @@ async fn counter_and_blob_coexist_blob_recovery_unchanged() {
 		.expect("blob must be re-indexed");
 	assert_eq!(mgr.read(loc).await.unwrap(), blob_value);
 	// The counter recovers independently.
-	let store = SlabCounterStore::new(mgr, tenant());
+	let store = SlabCounterStore::new(
+		mgr,
+		tenant(),
+		NodeId {
+			id: 1,
+			_reserved: 0,
+		},
+	);
 	assert_eq!(store.read_committed(&k).await.unwrap(), Some(7));
 }
 
@@ -2971,6 +3034,7 @@ use crate::storage::counter::CounterReplicaService;
 // skips it without a commit marker.
 #[tokio::test]
 async fn counter_replica_service_replicate_live_then_restart_skips_without_marker() {
+	use crate::storage::counter::CounterSlab;
 	let dir = fresh_dir("adr075-replica-svc-orphan");
 	let crypto = test_crypto();
 	let id = counter_identity(&ckey(b"verdict"));
@@ -2991,14 +3055,24 @@ async fn counter_replica_service_replicate_live_then_restart_skips_without_marke
 			tenant(),
 			id,
 			5,
-			hlc(1),
+			HybridTimestamp {
+				physical_ms: 1,
+				logical: 0,
+				node_id: 0,
+			},
 		)
 		.await
 		.unwrap();
 		assert_eq!(
 			svc.read_committed(tenant(), id).await.unwrap(),
-			Some(5),
-			"replicate created a live tentative"
+			None,
+			"unmarked tentative is not committed"
+		);
+		assert_eq!(
+			mgr.counter_read_value(mgr.counter_lookup(tenant(), id).unwrap())
+				.await
+				.unwrap(),
+			5
 		);
 		mgr.fsync_all_local_slabs().await.unwrap();
 	}
@@ -3015,6 +3089,7 @@ async fn counter_replica_service_replicate_live_then_restart_skips_without_marke
 // op and is idempotent.
 #[tokio::test]
 async fn counter_replica_service_rollback_removes_matching_op_idempotent() {
+	use crate::storage::counter::CounterSlab;
 	let dir = fresh_dir("adr075-replica-svc-rollback");
 	let mgr = open_manager_at_dir(
 		dir.to_path_buf(),
@@ -3022,7 +3097,7 @@ async fn counter_replica_service_rollback_removes_matching_op_idempotent() {
 		test_crypto(),
 	)
 	.await;
-	let svc = CounterReplicaService::new(mgr);
+	let svc = CounterReplicaService::new(mgr.clone());
 	let id = counter_identity(&ckey(b"verdict"));
 	svc.replicate_tentative(
 		NodeId {
@@ -3033,7 +3108,11 @@ async fn counter_replica_service_rollback_removes_matching_op_idempotent() {
 		tenant(),
 		id,
 		5,
-		hlc(1),
+		HybridTimestamp {
+			physical_ms: 1,
+			logical: 0,
+			node_id: 0,
+		},
 	)
 	.await
 	.unwrap();
@@ -3046,7 +3125,11 @@ async fn counter_replica_service_rollback_removes_matching_op_idempotent() {
 		tenant(),
 		id,
 		9,
-		hlc(2),
+		HybridTimestamp {
+			physical_ms: 2,
+			logical: 0,
+			node_id: 0,
+		},
 	)
 	.await
 	.unwrap();
@@ -3064,7 +3147,13 @@ async fn counter_replica_service_rollback_removes_matching_op_idempotent() {
 	.unwrap();
 	assert_eq!(svc.pending_count(), 1, "only op 1 removed");
 	// op 2's tentative (value 9, higher HLC) remains the live latest.
-	assert_eq!(svc.read_committed(tenant(), id).await.unwrap(), Some(9));
+	assert_eq!(svc.read_committed(tenant(), id).await.unwrap(), None);
+	assert_eq!(
+		mgr.counter_read_value(mgr.counter_lookup(tenant(), id).unwrap())
+			.await
+			.unwrap(),
+		9
+	);
 	// Idempotent: rolling back op 1 again is a harmless no-op.
 	svc.rollback(
 		NodeId {
@@ -3104,7 +3193,11 @@ async fn counter_replica_service_commit_makes_value_survive_restart() {
 			tenant(),
 			id,
 			42,
-			hlc(1),
+			HybridTimestamp {
+				physical_ms: 7,
+				logical: 0,
+				node_id: 0,
+			},
 		)
 		.await
 		.unwrap();
@@ -14967,3 +15060,6 @@ async fn encrypted_slab_with_a_leading_hole_round_trips_with_evidence() {
 		"without evidence the leading hole ends the tenant walk: {err}"
 	);
 }
+
+#[path = "counter_visibility/tests.rs"]
+mod counter_visibility_tests;

@@ -1,9 +1,14 @@
 use std::collections::BTreeSet;
 use syn::{ImplItem, Item};
 
-fn read_module_concat(path: impl AsRef<std::path::Path>, include_tests: bool) -> String {
+fn parse_module_files(path: impl AsRef<std::path::Path>, include_tests: bool) -> syn::File {
 	let path = path.as_ref();
-	let mut source = std::fs::read_to_string(path).unwrap();
+	let parse = |path: &std::path::Path| {
+		let source = std::fs::read_to_string(path).unwrap();
+		syn::parse_file(&source)
+			.unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()))
+	};
+	let mut file = parse(path);
 	// ADR 078: storage/manager.rs is now a module dir. Production guards exclude
 	// tests.rs; behavior-coverage guards opt into it explicitly.
 	if path.file_name().and_then(|s| s.to_str()) == Some("manager.rs")
@@ -27,17 +32,15 @@ fn read_module_concat(path: impl AsRef<std::path::Path>, include_tests: bool) ->
 				.collect();
 			subs.sort();
 			for p in subs {
-				source.push('\n');
-				source.push_str(&std::fs::read_to_string(p).unwrap());
+				file.items.extend(parse(&p).items);
 			}
 		}
 	}
-	source
+	file
 }
 
 fn parse_rust_file(path: &str, include_tests: bool) -> syn::File {
-	let source = read_module_concat(path, include_tests);
-	syn::parse_file(&source).unwrap_or_else(|err| panic!("failed to parse {path}: {err}"))
+	parse_module_files(path, include_tests)
 }
 
 fn function_names(path: &str) -> BTreeSet<String> {
