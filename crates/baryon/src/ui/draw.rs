@@ -962,7 +962,6 @@ fn draw_pane(
 	let search_highlight_style = Style::default()
 		.bg(ratatui_color(palette.search_highlight))
 		.fg(contrasting_text_color(palette.search_highlight));
-	let mut current_global_byte = pane.global_start_byte;
 
 	for token in &pane.tokens {
 		if x != text_left
@@ -1050,11 +1049,12 @@ fn draw_pane(
 			) {
 				visual_y = max_visual_rows;
 			}
-			current_global_byte = token
-				.absolute_start_byte
-				.saturating_add(token.physical_byte_len as u64);
 			continue;
 		}
+		// Each token carries its own absolute start: tokens need not be
+		// byte-contiguous, since an unwrapped long line is clipped at the pane
+		// edge and resumes at its newline.
+		let mut current_global_byte = token.absolute_start_byte;
 
 		let mut highlight_ranges: Vec<(usize, usize)> = Vec::new();
 		if !search_pat.is_empty()
