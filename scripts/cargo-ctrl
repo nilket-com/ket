@@ -193,7 +193,7 @@ done
 controlled_command() {
 	if [[ "$1" =~ $INTEGRATION_ENTRY ]]; then
 		controlled_cmd=(env CARGO_CTRL_LANE=controlled "${cargo_base[@]}" -p "${BASH_REMATCH[1]}"
-			--test "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" -- --exact --test-threads=1)
+			--test "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" -- --exact --test-threads=1 --nocapture)
 	else
 		controlled_cmd=(env CARGO_CTRL_LANE=controlled "${cargo_base[@]}" --workspace --lib "$1"
 			-- --exact --test-threads=1)

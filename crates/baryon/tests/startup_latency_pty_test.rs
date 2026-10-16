@@ -62,6 +62,7 @@ struct Pty {
 	child: Child,
 	raw: Vec<u8>,
 	scanned: usize,
+	picker_status_queries: usize,
 }
 
 impl Pty {
@@ -124,6 +125,7 @@ impl Pty {
 			child,
 			raw: Vec::new(),
 			scanned: 0,
+			picker_status_queries: 0,
 		}
 	}
 
@@ -168,6 +170,9 @@ impl Pty {
 				.iter()
 				.find(|(query, _)| rest.starts_with(query))
 			{
+				if *query == b"\x1b[5n" {
+					self.picker_status_queries += 1;
+				}
 				self.master.write_all(reply).expect("answer terminal query");
 				self.scanned = at + query.len();
 			} else if QUERY_REPLIES
@@ -325,6 +330,10 @@ fn sample(scenario: &str, root: &Path, file: &Path) -> Sample {
 		until,
 		0,
 		|screen| screen.contains(TOP_MARKER) && screen.contains(BOTTOM_MARKER),
+	);
+	assert_eq!(
+		pty.picker_status_queries, 1,
+		"{scenario}: expected one picker capability query before first paint"
 	);
 	let painted = Instant::now();
 	let drawn = pty.raw.len();

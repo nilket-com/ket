@@ -30,8 +30,7 @@ struct GraphResponse {
 }
 
 impl UastGraphController {
-	pub fn new() -> Self {
-		let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+	pub fn new(picker: Picker) -> Self {
 		let (tx_request, rx_request) = mpsc::channel::<GraphRequest>();
 		let (tx_ready, rx_ready) = mpsc::channel::<GraphResponse>();
 		thread::spawn(move || {

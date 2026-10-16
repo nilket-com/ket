@@ -7,6 +7,7 @@ use libaryon::core::{DocLine, PaneId};
 use libaryon::engine::{EditorCommand, EditorMode, InputEvent, InputSender, KeyCode, Modifiers};
 use libaryon::uast::projection::Viewport;
 use ratatui::{Terminal, backend::Backend};
+use ratatui_image::picker::Picker;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io;
@@ -85,6 +86,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 		tx_input: InputSender,
 		rx_view: mpsc::Receiver<Viewport>,
 	) -> Self {
+		let image_picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
 		Self {
 			terminal,
 			tx_cmd: Box::new(tx_cmd),
@@ -100,10 +102,10 @@ impl<B: Backend + io::Write> Frontend<B> {
 			last_browser_click: None,
 			last_mouse_position: None,
 			pane_resize_drag: None,
-			minimap: MinimapController::new(),
-			markdown_preview: MarkdownPreviewController::new(),
-			diff_bridge: super::diff::DiffBridgeController::new(),
-			uast_graph: super::uast_graph::UastGraphController::new(),
+			minimap: MinimapController::new(image_picker.clone()),
+			markdown_preview: MarkdownPreviewController::new(image_picker.clone()),
+			diff_bridge: super::diff::DiffBridgeController::new(image_picker.clone()),
+			uast_graph: super::uast_graph::UastGraphController::new(image_picker),
 		}
 	}
 

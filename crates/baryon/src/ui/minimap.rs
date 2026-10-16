@@ -75,8 +75,7 @@ pub(super) struct MinimapController {
 }
 
 impl MinimapController {
-	pub fn new() -> Self {
-		let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+	pub fn new(picker: Picker) -> Self {
 		let font_size = picker.font_size();
 		let font_size = (font_size.width, font_size.height);
 		let (tx_request, rx_request) = mpsc::channel::<PreviewRequest>();
