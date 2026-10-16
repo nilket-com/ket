@@ -6070,14 +6070,14 @@ mod tests {
 		let deadline = std::time::Instant::now() + Duration::from_secs(10);
 		let mut view = send_refresh_and_recv(&tx_cmd, &rx_view);
 		while (view.cursor_abs_pos.col.get() != 3
-			|| view.cursor_pane_col.get() != view.cursor_abs_pos.col.get())
+			|| u64::from(view.cursor_pane_col.get()) != view.cursor_abs_pos.col.get())
 			&& std::time::Instant::now() < deadline
 		{
 			view = send_refresh_and_recv(&tx_cmd, &rx_view);
 		}
 		assert_eq!(view.cursor_abs_pos.col.get(), 3, "caret sits after 'abc'");
 		assert_eq!(
-			view.cursor_pane_col.get(),
+			u64::from(view.cursor_pane_col.get()),
 			view.cursor_abs_pos.col.get(),
 			"pane-projected cursor must sit at the caret, not on the last glyph"
 		);
@@ -8017,7 +8017,7 @@ pub struct Foo {
 
 		// Compute expected end-of-line column from the source.
 		let line_text = content.lines().nth(3).expect("line 3");
-		let expected_eol_col = DocDisplayCol::new(line_text.len() as u32);
+		let expected_eol_col = DocDisplayCol::new(line_text.len() as u64);
 
 		// Send AppendAtLineEnd from col 0.
 		let view = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::AppendAtLineEnd);

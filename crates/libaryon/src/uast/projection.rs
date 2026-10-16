@@ -97,9 +97,9 @@ pub(crate) fn clip_frontend_text_tokens(
 	tokens: Vec<RenderToken>,
 	text_width: u16,
 ) -> Vec<RenderToken> {
-	let limit = u32::from(text_width).saturating_add(CLIP_LOOKAROUND_COLUMNS);
+	let limit = u64::from(text_width).saturating_add(u64::from(CLIP_LOOKAROUND_COLUMNS));
 	let mut clipped = Vec::with_capacity(tokens.len());
-	let mut column = 0u32;
+	let mut column = 0u64;
 	let mut past_limit = false;
 	for token in tokens {
 		if token.is_folded || token.text.is_empty() {
@@ -258,11 +258,11 @@ pub enum IntraLineDiffKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IntraLineDiff {
 	pub line: DocLine,
-	pub col_start: u32,
-	pub col_end: u32,
+	pub col_start: u64,
+	pub col_end: u64,
 	pub partner_line: DocLine,
-	pub partner_col_start: u32,
-	pub partner_col_end: u32,
+	pub partner_col_start: u64,
+	pub partner_col_end: u64,
 	pub kind: IntraLineDiffKind,
 }
 
@@ -2413,7 +2413,7 @@ mod tests {
 			}
 			if b == b'\t' {
 				col = col
-					.checked_add(TAB_SIZE - (col.get() % TAB_SIZE))
+					.checked_add(u64::from(TAB_SIZE) - (col.get() % u64::from(TAB_SIZE)))
 					.expect("DocDisplayCol addition overflow");
 			} else {
 				col = col.checked_add(1).expect("DocDisplayCol addition overflow");

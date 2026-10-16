@@ -553,10 +553,11 @@ fn sort_and_cap(results: &mut Vec<RepoSearchMatch>, truncated: &mut bool) {
 }
 
 fn display_col(line: &str, byte: usize) -> DocDisplayCol {
-	let mut col = 0u32;
+	let tab_size = u64::from(crate::core::TAB_SIZE);
+	let mut col = 0u64;
 	for ch in line[..byte.min(line.len())].chars() {
 		if ch == '\t' {
-			col = (col / crate::core::TAB_SIZE + 1) * crate::core::TAB_SIZE;
+			col = (col / tab_size + 1) * tab_size;
 		} else {
 			col = col.saturating_add(1);
 		}

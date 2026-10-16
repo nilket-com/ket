@@ -318,10 +318,8 @@ fn text_click_target(
 				DocDisplayCol::ZERO,
 			)
 		});
-	let row_start = row.start_offset.map_or(row.start_col, |offset| {
-		DocDisplayCol::new(u32::try_from(offset.get()).unwrap_or(u32::MAX))
-	});
-	let target_col = row_start.saturating_add(u32::from(text_col));
+	let row_start = row.start_offset.unwrap_or(row.start_col);
+	let target_col = row_start.saturating_add(u64::from(text_col));
 	CursorPosition::new(row.line, target_col)
 }
 
@@ -891,7 +889,7 @@ mod tests {
 			line: DocLine::new(7),
 			start_col: DocDisplayCol::new(100),
 			start_byte: Some(libaryon::core::DocByte::new(100)),
-			start_offset: Some(libaryon::core::DisplayOffset::new(100)),
+			start_offset: Some(libaryon::core::DocDisplayCol::new(100)),
 		}];
 		assert_eq!(
 			text_click_target(&rows, 7, 0, 3),

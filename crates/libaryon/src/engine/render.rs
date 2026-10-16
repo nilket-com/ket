@@ -4,9 +4,9 @@ use super::document::selection::resolve_visual_ranges_sparse;
 use super::folding::{pan_scroll_y_to_keep_cursor_visible, visual_line_index_for_doc_line};
 use super::language::{InlineAnnotation, LanguageProvider, LanguageRegistry};
 use super::layout::{
-	LayoutDemand, RowWindow, ViewportAnchor, WrapLayout, collect_visible_rows_with_sum_tree,
-	cursor_view_metrics_with_sum_tree, line_is_indexed_with_sum_tree,
-	pan_viewport_anchor_to_keep_cursor_visible_with_sum_tree,
+	CaretIndex, LayoutDemand, RowWindow, ViewportAnchor, WrapLayout, carry_on,
+	collect_visible_rows_with_sum_tree, cursor_view_metrics_with_sum_tree,
+	line_is_indexed_with_sum_tree, pan_viewport_anchor_to_keep_cursor_visible_with_sum_tree,
 	viewport_geometry_for_viewport_with_numbering, window_origin_with_sum_tree,
 };
 use super::minimap::{
@@ -983,9 +983,48 @@ fn render_pane_viewport(
 			let mut projection_pending = false;
 			let topology_rev = tab.document.topology_rev;
 			let state_id = tab.document.ledger.current_state_id;
-			let folds = &mut tab.view.folds;
+			// Every layout pass below, and caret resolution, shares one
+			// wrap-index read budget (ADR 0009, 0010).
+			tab.view.common.wrap_index.borrow_mut().begin_frame();
+			let wrap_demand = RefCell::new(LayoutDemand::default());
+			let mut geometry = viewport_geometry_for_viewport_with_numbering(
+				DocLine::new(tab.view.scroll_y),
+				tab.view.viewport_lines,
+				DocLine::new(total_lines),
+				tab.view.viewport_width,
+				minimap_enabled,
+				gutter_numbering,
+			);
+			let view = &mut *tab.view;
+			let folds = &mut view.folds;
+			let caret_index = CaretIndex::new(
+				WrapLayout::new(
+					&view.common.wrap_index,
+					state_id,
+					topology_rev,
+					&wrap_demand,
+				),
+				view.common.wrap_enabled,
+				geometry.text_width,
+			);
+			// Work a command left for this document (ADR 0010).
+			{
+				let carried = carry_on(&view.common.carried, caret_index, registry, rid);
+				let mut demand = wrap_demand.borrow_mut();
+				demand.more |= carried.more;
+				for node in carried.pending {
+					demand.note(Some(node));
+				}
+			}
 			tab.cursor.visit_carets_mut(|caret| {
-				if !caret.resolve(registry, rid, folds, topology_rev, state_id) {
+				if !caret.resolve_indexed(
+					registry,
+					rid,
+					folds,
+					topology_rev,
+					state_id,
+					Some(caret_index),
+				) {
 					projection_pending = true;
 					if let Some(node) = caret
 						.pending_target()
@@ -1009,17 +1048,6 @@ fn render_pane_viewport(
 					.expect("non-text render must have a content cache")
 			};
 			let sum_tree = refresh_sum_tree(cached_sum_tree, registry, rid, current_state_id);
-			// Every layout pass below shares one wrap-index read budget (ADR 0009).
-			tab.view.common.wrap_index.borrow_mut().begin_frame();
-			let wrap_demand = RefCell::new(LayoutDemand::default());
-			let mut geometry = viewport_geometry_for_viewport_with_numbering(
-				DocLine::new(tab.view.scroll_y),
-				tab.view.viewport_lines,
-				max_doc_line,
-				tab.view.viewport_width,
-				minimap_enabled,
-				gutter_numbering,
-			);
 			let viewport_anchor = if tab.view.wrap_enabled {
 				let mut anchor = ViewportAnchor {
 					line: DocLine::new(tab.view.scroll_y),
@@ -1441,18 +1469,51 @@ fn render_pane_viewport(
 				(DocByte::ZERO, DocByte::ZERO, 0, Some(1))
 			};
 
+		// A selection on an indexed line is resolved through the index (ADR
+		// 0010); what it could not reach this frame asks for the next.
+		let selection_demand = RefCell::new(LayoutDemand::default());
 		let selection_ranges = match (tab.cursor.active_visual(), tab.document.root_id) {
-			(Some((anchor, kind)), Some(rid)) => resolve_visual_ranges_sparse(
-				registry,
-				rid,
-				&tab.view.folds,
-				anchor,
-				cursor_abs_byte,
-				kind,
-			)
-			.unwrap_or_default(),
+			(Some((anchor, kind)), Some(rid)) => {
+				let text_width = viewport_geometry_for_viewport_with_numbering(
+					DocLine::new(tab.view.scroll_y),
+					tab.view.viewport_lines,
+					DocLine::new(registry.get_total_newlines(rid)),
+					tab.view.viewport_width,
+					minimap_enabled,
+					gutter_numbering,
+				)
+				.text_width;
+				resolve_visual_ranges_sparse(
+					registry,
+					rid,
+					&tab.view.folds,
+					anchor,
+					cursor_abs_byte,
+					kind,
+					Some(CaretIndex::new(
+						WrapLayout::new(
+							&tab.view.common.wrap_index,
+							tab.document.ledger.current_state_id,
+							tab.document.topology_rev,
+							&selection_demand,
+						),
+						tab.view.common.wrap_enabled,
+						text_width,
+					)),
+				)
+				.unwrap_or_default()
+			}
 			_ => Vec::new(),
 		};
+		let selection_demand = selection_demand.into_inner();
+		for &node in &selection_demand.pending {
+			let _ = if is_file_browser {
+				resolver.hydrate_whole_leaf(node)
+			} else {
+				resolver.hydrate_whole_leaf_for_buffer(node, buffer_id)
+			};
+		}
+		*layout_continues |= selection_demand.more && selection_demand.pending.is_empty();
 		let viewport_start_line = viewport_anchor.line;
 		tab.view.scroll_y = viewport_start_line.get();
 		let mut visible_line_starts = Vec::new();
@@ -1939,7 +2000,7 @@ mod tests {
 
 	#[test]
 	fn a_row_window_drops_only_its_own_lines_inline_annotations() {
-		use crate::core::DisplayOffset;
+		use crate::core::DocDisplayCol;
 		use crate::engine::language::{InlineAnnotation, InlineAnnotationKind};
 		use crate::engine::layout::RowWindow;
 		let annotation = |line| InlineAnnotation {
@@ -1960,7 +2021,7 @@ mod tests {
 		let window = RowWindow {
 			line: DocLine::new(3),
 			start_byte: DocByte::new(1 << 20),
-			start_offset: DisplayOffset::new(1 << 20),
+			start_offset: DocDisplayCol::new(1 << 20),
 			tab_phase: 0,
 		};
 		assert_eq!(

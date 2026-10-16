@@ -169,7 +169,7 @@ pub(crate) fn step_left_visual_col(
 	target_line: DocLine,
 	current_col: DocDisplayCol,
 ) -> DocDisplayCol {
-	let mut column = 0u32;
+	let mut column = 0u64;
 	let mut result = DocDisplayCol::ZERO;
 	crate::core::text::visit_display_cells(line_content_slice(doc, target_line), |cell| {
 		let cell_start = column;
@@ -188,7 +188,7 @@ pub(crate) fn step_right_visual_col(
 	target_line: DocLine,
 	current_col: DocDisplayCol,
 ) -> DocDisplayCol {
-	let mut column = 0u32;
+	let mut column = 0u64;
 	let mut result = None;
 	crate::core::text::visit_display_cells(line_content_slice(doc, target_line), |cell| {
 		column = crate::core::text::advance_display_col(column, cell, TAB_SIZE);
@@ -201,6 +201,98 @@ pub(crate) fn step_right_visual_col(
 	result.unwrap_or_else(|| DocDisplayCol::new(column))
 }
 
+/// Where a word motion goes, read from a window beside the caret instead of
+/// the whole document (ADR 0010).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WordTarget {
+	Byte(DocByte),
+	/// Bytes the window needs are not resident: hydrate the node and try again.
+	Pending(NodeId),
+	/// The window is not text the word rules can read; the caret stays.
+	Stay,
+	/// No read budget is left this frame; the caret stays.
+	Wait,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WordMotion {
+	NextStart,
+	PrevStart,
+	NextEnd,
+}
+
+/// The target of `motion` from `caret`, reading at most `window` bytes in the
+/// direction of motion. A boundary inside the window is the whole document's;
+/// a window without one moves the caret to its edge, so the next press goes
+/// on from there. Unavailable bytes are never taken for a boundary.
+pub(crate) fn word_motion_target(
+	registry: &UastRegistry,
+	root: NodeId,
+	caret: DocByte,
+	motion: WordMotion,
+	window: u64,
+) -> WordTarget {
+	if window == 0 {
+		return WordTarget::Wait;
+	}
+	let total = registry.get_total_bytes(root);
+	let caret = DocByte::new(caret.get().min(total));
+	let (start, end) = match motion {
+		WordMotion::NextStart | WordMotion::NextEnd => (
+			caret,
+			DocByte::new(caret.get().saturating_add(window).min(total)),
+		),
+		WordMotion::PrevStart => (caret.saturating_sub(window), caret),
+	};
+	let mut bytes = Vec::new();
+	if registry
+		.for_each_loaded_slice_fragment(root, start, end, |fragment| {
+			bytes.extend_from_slice(fragment)
+		})
+		.is_err()
+	{
+		let at = DocByte::new(start.get().saturating_add(bytes.len() as u64));
+		return WordTarget::Pending(registry.find_node_at_doc_byte_raw(root, at).node_id);
+	}
+	match motion {
+		WordMotion::NextStart | WordMotion::NextEnd => {
+			let truncated = end.get() < total;
+			// A sequence cut off at the window's end is not read.
+			let valid = match std::str::from_utf8(&bytes) {
+				Ok(_) => bytes.len(),
+				Err(error) => error.valid_up_to(),
+			};
+			if valid == 0 && !bytes.is_empty() {
+				return WordTarget::Stay;
+			}
+			let text = std::str::from_utf8(&bytes[..valid]).expect("validated prefix");
+			let offset = match motion {
+				WordMotion::NextStart => next_word_start(text, 0),
+				_ => next_word_end(text, 0),
+			};
+			let offset = if offset == 0 && truncated {
+				valid
+			} else {
+				offset
+			};
+			WordTarget::Byte(caret.saturating_add(offset as u64))
+		}
+		WordMotion::PrevStart => {
+			// The window may start inside a sequence: begin at the next one.
+			let lead = bytes
+				.iter()
+				.take(3)
+				.take_while(|&&byte| byte & 0b1100_0000 == 0b1000_0000)
+				.count();
+			let Ok(text) = std::str::from_utf8(&bytes[lead..]) else {
+				return WordTarget::Stay;
+			};
+			let offset = prev_word_start(text, text.len());
+			WordTarget::Byte(start.saturating_add((lead + offset) as u64))
+		}
+	}
+}
+
 pub(crate) fn page_motion_step(viewport_lines: u32) -> u64 {
 	if viewport_lines > 1 {
 		u64::from(viewport_lines - 1)
@@ -209,6 +301,7 @@ pub(crate) fn page_motion_step(viewport_lines: u32) -> u64 {
 	}
 }
 
+#[cfg(test)]
 pub(crate) fn place_cursor_at_line_col(
 	registry: &UastRegistry,
 	root: NodeId,
@@ -219,7 +312,34 @@ pub(crate) fn place_cursor_at_line_col(
 	cache_revisions: (TopologyRev, StateId),
 	caret: &mut Caret,
 ) -> bool {
-	caret.place_at_line_col(
+	place_cursor_at_line_col_indexed(
+		registry,
+		root,
+		folds,
+		target_line,
+		target_col,
+		reveal_hidden,
+		cache_revisions,
+		caret,
+		None,
+	)
+}
+
+/// [`place_cursor_at_line_col`], taking a line on the wrap index's path
+/// through it (ADR 0010).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn place_cursor_at_line_col_indexed(
+	registry: &UastRegistry,
+	root: NodeId,
+	folds: &mut FoldSet,
+	target_line: DocLine,
+	target_col: DocDisplayCol,
+	reveal_hidden: bool,
+	cache_revisions: (TopologyRev, StateId),
+	caret: &mut Caret,
+	indexed: Option<crate::engine::layout::CaretIndex<'_>>,
+) -> bool {
+	caret.place_at_line_col_indexed(
 		registry,
 		root,
 		folds,
@@ -229,14 +349,16 @@ pub(crate) fn place_cursor_at_line_col(
 		target_col,
 		reveal_hidden,
 		Affinity::After,
+		indexed,
 	)
 }
 
-pub(crate) fn line_col_from_doc_byte_sparse(
+/// The line holding `target_byte`, from metrics and the one leaf holding it.
+pub(crate) fn line_from_doc_byte_sparse(
 	registry: &UastRegistry,
 	root: NodeId,
 	target_byte: DocByte,
-) -> Result<(DocLine, DocDisplayCol), String> {
+) -> Result<DocLine, String> {
 	// The byte descent accumulates exact newline metrics for every complete
 	// left sibling it skips at each topology level. That yields the leaf and
 	// its absolute starting line in one root-to-leaf pass, without a second
@@ -247,10 +369,38 @@ pub(crate) fn line_col_from_doc_byte_sparse(
 	let local_offset = (leaf.node_byte.get() as usize).min(leaf_text.len());
 	let local_prefix = &leaf_text.as_bytes()[..local_offset];
 	let local_lines = local_prefix.iter().filter(|&&b| b == b'\n').count() as u64;
-	let line = leaf
+	Ok(leaf
 		.node_start_line
 		.ok_or_else(|| "Byte-to-line index is still building".to_string())?
-		.saturating_add(local_lines);
+		.saturating_add(local_lines))
+}
+
+/// The line holding `target_byte`, from metrics and the raw bytes of the one
+/// leaf holding it: any bytes, valid UTF-8 or not. `Err` names that leaf when
+/// it is not resident, or is `None` while the line index is still building.
+pub(crate) fn line_from_doc_byte_raw(
+	registry: &UastRegistry,
+	root: NodeId,
+	target_byte: DocByte,
+) -> Result<DocLine, Option<NodeId>> {
+	let leaf = registry.find_node_at_doc_byte_raw(root, target_byte);
+	let first_line = leaf.node_start_line.ok_or(None)?;
+	let leaf_start = target_byte.saturating_sub(u64::from(leaf.node_byte.get()));
+	let mut newlines = 0u64;
+	registry
+		.for_each_loaded_slice_fragment(root, leaf_start, target_byte, |fragment| {
+			newlines += fragment.iter().filter(|&&byte| byte == b'\n').count() as u64;
+		})
+		.map_err(|_| Some(leaf.node_id))?;
+	Ok(first_line.saturating_add(newlines))
+}
+
+pub(crate) fn line_col_from_doc_byte_sparse(
+	registry: &UastRegistry,
+	root: NodeId,
+	target_byte: DocByte,
+) -> Result<(DocLine, DocDisplayCol), String> {
+	let line = line_from_doc_byte_sparse(registry, root, target_byte)?;
 
 	// With the line known, derive the visual column by reading the bytes
 	// from the start of that line up to `target_byte`. Both helpers used
@@ -288,6 +438,33 @@ mod tests {
 			.map_or(0, |newline| newline + 1);
 		let col = crate::core::text::display_width(&bytes[line_start..target], 0, TAB_SIZE);
 		(line, DocDisplayCol::new(col))
+	}
+
+	#[test]
+	fn the_raw_line_of_a_byte_ignores_utf8_validity() {
+		use crate::uast::kind::SemanticKind;
+		use crate::uast::metrics::SpanMetrics;
+		let bytes = b"ab\n\xFF\xFEc\nd\xFF".to_vec();
+		let registry = crate::ecs::UastRegistry::new(4);
+		let mut chunk = registry.reserve_chunk(2).expect("OOM");
+		let metrics = SpanMetrics {
+			byte_length: bytes.len() as u64,
+			newlines: 2,
+		};
+		let root = chunk.spawn_node(SemanticKind::RelationalTable, None, metrics);
+		let leaf = chunk.spawn_node(SemanticKind::Token, None, metrics);
+		chunk.append_local_child(root, leaf);
+		unsafe {
+			*registry.virtual_data[leaf.index()].get() = Some(bytes.clone());
+		}
+		drop(chunk);
+		for (byte, line) in [(0, 0), (3, 1), (5, 1), (7, 2), (8, 2)] {
+			assert_eq!(
+				super::line_from_doc_byte_raw(&registry, root, DocByte::new(byte)),
+				Ok(DocLine::new(line)),
+				"byte {byte}"
+			);
+		}
 	}
 
 	#[test]

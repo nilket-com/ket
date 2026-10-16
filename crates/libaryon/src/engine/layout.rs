@@ -6,11 +6,12 @@ use super::support::{
 	line_start_byte_from_sum_tree, read_line_bytes_from_sum_tree, read_line_bytes_sparse,
 };
 use super::wrap_index::{
-	ByteLookup, ColLookup, LineRead, LineSource, RowCount, RowLookup, WrapIndex, WrapKey,
+	ByteLookup, CellLookup, ColLookup, LineRead, LineSource, RowCount, RowLookup, WrapIndex,
+	WrapKey,
 };
 use crate::core::{
-	DisplayOffset, DisplayRow, DocByte, DocDisplayCol, DocLine, DocLineCount, DocVisualRow,
-	PaneLocalCol, PaneLocalRow, StateId, TAB_SIZE, TopologyRev, VisualRowCount,
+	DisplayRow, DocByte, DocDisplayCol, DocLine, DocLineCount, DocVisualRow, PaneLocalCol,
+	PaneLocalRow, StateId, TAB_SIZE, TopologyRev, VisualRowCount,
 };
 use crate::ecs::{NodeId, UastRegistry};
 use crate::uast::projection::NodeLineLookup;
@@ -25,14 +26,14 @@ const WRAP_CACHE_CAPACITY: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VisibleRow {
 	pub line: DocLine,
-	/// Absolute document column of the row's start, saturating past `u32`.
+	/// Absolute document column of the row's start.
 	pub start_col: DocDisplayCol,
 	/// For rows of a line laid out through the wrap index (ADR 0009): the
 	/// absolute byte of the row's first cell, `None` for a row of trailing
 	/// whitespace...
 	pub start_byte: Option<DocByte>,
 	/// ...and its absolute display offset, which does not saturate.
-	pub start_offset: Option<DisplayOffset>,
+	pub start_offset: Option<DocDisplayCol>,
 }
 
 impl VisibleRow {
@@ -55,7 +56,7 @@ impl VisibleRow {
 pub struct RowWindow {
 	pub line: DocLine,
 	pub start_byte: DocByte,
-	pub start_offset: DisplayOffset,
+	pub start_offset: DocDisplayCol,
 	/// `start_offset` modulo the tab size: the phase of the first tab stop.
 	pub tab_phase: u8,
 }
@@ -205,15 +206,15 @@ pub fn viewport_geometry_for_viewport_with_numbering(
 #[derive(Clone)]
 struct WrappedLine {
 	starts: Rc<[DocDisplayCol]>,
-	visual_width: u32,
+	visual_width: u64,
 }
 
 fn push_word_wraps(
 	starts: &mut Vec<DocDisplayCol>,
-	row_start: &mut u32,
-	word_start: u32,
-	word_end: u32,
-	width: u32,
+	row_start: &mut u64,
+	word_start: u64,
+	word_end: u64,
+	width: u64,
 ) {
 	if word_end.saturating_sub(*row_start) <= width {
 		return;
@@ -245,9 +246,9 @@ fn compute_line_wrap(line: &[u8], text_width: u16) -> WrappedLine {
 	// Keep this visual-cell model aligned with the editor's document columns:
 	// tabs expand to fixed tab stops and valid text advances by grapheme width.
 	// Invalid bytes remain one visible fallback cell.
-	let width = u32::from(text_width);
-	let mut visual_col = 0u32;
-	let mut row_start = 0u32;
+	let width = u64::from(text_width);
+	let mut visual_col = 0u64;
+	let mut row_start = 0u64;
 	let mut word_start = None;
 	crate::core::text::visit_display_cells(line, |cell| {
 		if cell.kind == crate::core::text::DisplayCellKind::Newline {
@@ -294,13 +295,9 @@ fn wrap_row_starts(line: &[u8], text_width: u16) -> Vec<DocDisplayCol> {
 /// Whole-line row starts and visual width, the reference `WrapScanner` must
 /// reproduce.
 #[cfg(test)]
-pub(crate) fn wrap_starts_for_test(line: &[u8], text_width: u16) -> (Vec<u64>, u32) {
+pub(crate) fn wrap_starts_for_test(line: &[u8], text_width: u16) -> (Vec<u64>, u64) {
 	let wrapped = compute_line_wrap(line, text_width);
-	let starts = wrapped
-		.starts
-		.iter()
-		.map(|start| u64::from(start.get()))
-		.collect();
+	let starts = wrapped.starts.iter().map(|start| start.get()).collect();
 	(starts, wrapped.visual_width)
 }
 
@@ -361,7 +358,7 @@ pub(crate) struct LayoutDemand {
 }
 
 impl LayoutDemand {
-	fn note(&mut self, pending: Option<NodeId>) {
+	pub(crate) fn note(&mut self, pending: Option<NodeId>) {
 		self.more = true;
 		if let Some(node) = pending
 			&& !self.pending.contains(&node)
@@ -405,6 +402,348 @@ impl<'a> WrapLayout<'a> {
 			topology,
 			demand,
 			min_line_bytes: WRAP_INDEX_MIN_LINE_BYTES,
+		}
+	}
+}
+
+/// What a caret lookup through the index found: an indexed line's answer, or
+/// that the line is indexed but not reachable this frame (ADR 0010).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaretLookup<T> {
+	Known(T),
+	/// The demand asks for more; the caller keeps its target and must not
+	/// read the line from its start instead.
+	Pending,
+}
+
+/// What carried work is valid for: the document, its state and topology, and
+/// the width the index keys the line at (ADR 0010).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkKey {
+	pub(crate) root: NodeId,
+	pub(crate) state: StateId,
+	pub(crate) topology: TopologyRev,
+	pub(crate) key_width: u16,
+}
+
+/// Work a command could not finish and render carries on (ADR 0010): nodes to
+/// hydrate, whether to refresh again, and a line to scan to its end. It is a
+/// request for data, never a caret intent: the caret moves only on a later
+/// command. Work for another key is discarded.
+#[derive(Debug, Default)]
+pub(crate) struct CarriedWork {
+	key: Option<WorkKey>,
+	demand: LayoutDemand,
+	scan_to_end: Option<DocLine>,
+}
+
+impl CarriedWork {
+	fn for_key(&mut self, key: WorkKey) -> &mut Self {
+		if self.key != Some(key) {
+			*self = Self {
+				key: Some(key),
+				..Self::default()
+			};
+		}
+		self
+	}
+
+	/// Carry what a command's lookups asked for.
+	pub(crate) fn carry(&mut self, key: WorkKey, demand: LayoutDemand) {
+		let work = self.for_key(key);
+		work.demand.more |= demand.more;
+		for node in demand.pending {
+			if !work.demand.pending.contains(&node) {
+				work.demand.pending.push(node);
+			}
+		}
+	}
+
+	pub(crate) fn scan_to_end(&mut self, key: WorkKey, line: DocLine) {
+		self.for_key(key).scan_to_end = Some(line);
+	}
+
+	/// Everything carried for `key`; work for any other key is dropped.
+	pub(crate) fn take(&mut self, key: WorkKey) -> (LayoutDemand, Option<DocLine>) {
+		let work = std::mem::take(self);
+		if work.key == Some(key) {
+			(work.demand, work.scan_to_end)
+		} else {
+			(LayoutDemand::default(), None)
+		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn pending_scan(&self) -> Option<DocLine> {
+		self.scan_to_end
+	}
+}
+
+/// Carry on the work a command left for `index`'s document (ADR 0010):
+/// advance a requested line scan by this frame's budget, asking again while
+/// it is unfinished, and return the nodes and refresh it asked for. Work for
+/// another key is dropped.
+pub(crate) fn carry_on(
+	carried: &RefCell<CarriedWork>,
+	index: CaretIndex<'_>,
+	registry: &UastRegistry,
+	root: NodeId,
+) -> LayoutDemand {
+	let key = index.work_key(root);
+	let (demand, scan_line) = carried.borrow_mut().take(key);
+	if let Some(line) = scan_line
+		&& let Some(CaretLookup::Pending) = index.scan_to_end(registry, root, line)
+	{
+		carried.borrow_mut().scan_to_end(key, line);
+	}
+	demand
+}
+
+/// The wrap index as caret placement uses it (ADR 0010). It answers only for
+/// lines on the indexed path: `None` from a lookup means the line takes
+/// today's code, byte for byte.
+#[derive(Clone, Copy)]
+pub(crate) struct CaretIndex<'a> {
+	wrap: WrapLayout<'a>,
+	key_width: u16,
+}
+
+impl<'a> CaretIndex<'a> {
+	/// With wrap on, `text_width` is the render's, so the caret shares its
+	/// checkpoints. With wrap off the lookups still work, under a fixed width:
+	/// cells do not depend on it.
+	pub(crate) fn new(wrap: WrapLayout<'a>, wrap_enabled: bool, text_width: u16) -> Self {
+		let key_width = if wrap_enabled && text_width > 0 {
+			text_width
+		} else {
+			u16::MAX
+		};
+		Self { wrap, key_width }
+	}
+
+	fn key(&self) -> WrapKey {
+		WrapKey {
+			state: self.wrap.state,
+			topology: self.wrap.topology,
+			text_width: self.key_width,
+		}
+	}
+
+	/// Ask render for `node`, or for another frame when `None` (ADR 0010).
+	pub(crate) fn request(&self, node: Option<NodeId>) {
+		self.wrap.demand.borrow_mut().note(node);
+	}
+
+	/// Grant a read outside the index from this frame's budget.
+	pub(crate) fn reserve_read(&self, max: usize) -> usize {
+		self.wrap.index.borrow_mut().reserve_read(max)
+	}
+
+	/// The key carried work for this index is valid under.
+	pub(crate) fn work_key(&self, root: NodeId) -> WorkKey {
+		WorkKey {
+			root,
+			state: self.wrap.state,
+			topology: self.wrap.topology,
+			key_width: self.key_width,
+		}
+	}
+
+	/// The end of an indexed line, known only once its scan has finished: the
+	/// caret then moves there without a pending intent (ADR 0010).
+	pub(crate) fn line_end(
+		&self,
+		registry: &UastRegistry,
+		root: NodeId,
+		line: DocLine,
+	) -> Option<CaretLookup<(DocByte, DocDisplayCol)>> {
+		match self.scan_to_end(registry, root, line)? {
+			CaretLookup::Known(()) => {
+				self.byte_for_line_col(registry, root, line, DocDisplayCol::new(u64::MAX))
+			}
+			CaretLookup::Pending => Some(CaretLookup::Pending),
+		}
+	}
+
+	/// Advance an indexed line's scan by this frame's budget. Known once the
+	/// scan has reached the line's end.
+	pub(crate) fn scan_to_end(
+		&self,
+		registry: &UastRegistry,
+		root: NodeId,
+		line: DocLine,
+	) -> Option<CaretLookup<()>> {
+		let (start, end) = match self.indexed_line(registry, root, line)? {
+			CaretLookup::Known(range) => range,
+			CaretLookup::Pending => return Some(CaretLookup::Pending),
+		};
+		let source = RegistryLine {
+			registry,
+			root,
+			start: start.get(),
+			end: end.get(),
+		};
+		let count = self
+			.wrap
+			.index
+			.borrow_mut()
+			.row_count(self.key(), line, &source);
+		Some(match count {
+			RowCount::Exact(_) => CaretLookup::Known(()),
+			RowCount::AtLeast { pending, .. } => self.pending(pending),
+		})
+	}
+
+	fn pending<T>(&self, node: Option<NodeId>) -> CaretLookup<T> {
+		self.wrap.demand.borrow_mut().note(node);
+		CaretLookup::Pending
+	}
+
+	/// The line and column of `byte`, when its line is indexed. The line comes
+	/// from metrics and the one leaf holding `byte`.
+	pub(crate) fn line_col_for_byte(
+		&self,
+		registry: &UastRegistry,
+		root: NodeId,
+		byte: DocByte,
+	) -> Option<CaretLookup<(DocLine, DocDisplayCol)>> {
+		Some(match self.cell_at_byte(registry, root, byte)? {
+			CaretLookup::Known((line, _, col)) => CaretLookup::Known((line, col)),
+			CaretLookup::Pending => CaretLookup::Pending,
+		})
+	}
+
+	/// The line of `byte` and the start byte and column of the cell holding
+	/// it, when its line is indexed.
+	pub(crate) fn cell_at_byte(
+		&self,
+		registry: &UastRegistry,
+		root: NodeId,
+		byte: DocByte,
+	) -> Option<CaretLookup<(DocLine, DocByte, DocDisplayCol)>> {
+		let line = match self.line_of_byte(registry, root, byte) {
+			CaretLookup::Known(line) => line,
+			CaretLookup::Pending => return Some(CaretLookup::Pending),
+		};
+		let (start, end) = match self.indexed_line(registry, root, line)? {
+			CaretLookup::Known(range) => range,
+			CaretLookup::Pending => return Some(CaretLookup::Pending),
+		};
+		let offset = byte
+			.get()
+			.saturating_sub(start.get())
+			.min(end.get() - start.get());
+		let source = RegistryLine {
+			registry,
+			root,
+			start: start.get(),
+			end: end.get(),
+		};
+		let lookup = self
+			.wrap
+			.index
+			.borrow_mut()
+			.cell_for_byte(self.key(), line, offset, &source);
+		Some(match lookup {
+			CellLookup::Known(cell) => CaretLookup::Known((
+				line,
+				DocByte::new(start.get().saturating_add(cell.byte)),
+				cell.col,
+			)),
+			CellLookup::Unknown { pending } => self.pending(pending),
+		})
+	}
+
+	/// Where column `col` of `line` resolves, and the column there, when the
+	/// line is indexed.
+	pub(crate) fn byte_for_line_col(
+		&self,
+		registry: &UastRegistry,
+		root: NodeId,
+		line: DocLine,
+		col: DocDisplayCol,
+	) -> Option<CaretLookup<(DocByte, DocDisplayCol)>> {
+		let (start, end) = match self.indexed_line(registry, root, line)? {
+			CaretLookup::Known(range) => range,
+			CaretLookup::Pending => return Some(CaretLookup::Pending),
+		};
+		let source = RegistryLine {
+			registry,
+			root,
+			start: start.get(),
+			end: end.get(),
+		};
+		let lookup = self
+			.wrap
+			.index
+			.borrow_mut()
+			.cell_for_col(self.key(), line, col, &source);
+		Some(match lookup {
+			CellLookup::Known(cell) => CaretLookup::Known((
+				DocByte::new(start.get().saturating_add(cell.byte)),
+				cell.col,
+			)),
+			CellLookup::Unknown { pending } => self.pending(pending),
+		})
+	}
+
+	fn line_of_byte(
+		&self,
+		registry: &UastRegistry,
+		root: NodeId,
+		byte: DocByte,
+	) -> CaretLookup<DocLine> {
+		match crate::engine::document::cursor::line_from_doc_byte_raw(registry, root, byte) {
+			Ok(line) => CaretLookup::Known(line),
+			Err(node) => self.pending(node),
+		}
+	}
+
+	/// `line`'s absolute bytes, newline excluded, if it is on the indexed path:
+	/// at least [`WrapLayout::min_line_bytes`] long, or not all resident.
+	pub(crate) fn indexed_line(
+		&self,
+		registry: &UastRegistry,
+		root: NodeId,
+		line: DocLine,
+	) -> Option<CaretLookup<(DocByte, DocByte)>> {
+		let start = match self.line_start(registry, root, line) {
+			CaretLookup::Known(start) => start,
+			CaretLookup::Pending => return Some(CaretLookup::Pending),
+		};
+		let end = if line.get() >= registry.get_total_newlines(root) {
+			DocByte::new(registry.get_total_bytes(root))
+		} else {
+			match self.line_start(registry, root, line + DocLineCount::new(1)) {
+				// The newline ending this line is not part of it.
+				CaretLookup::Known(next) => {
+					DocByte::new(next.get().saturating_sub(1).max(start.get()))
+				}
+				CaretLookup::Pending => return Some(CaretLookup::Pending),
+			}
+		};
+		let long = end.get() - start.get() >= self.wrap.min_line_bytes;
+		let resident = || {
+			registry
+				.for_each_loaded_slice_fragment(root, start, end, |_| {})
+				.is_ok()
+		};
+		(long || !resident()).then_some(CaretLookup::Known((start, end)))
+	}
+
+	fn line_start(
+		&self,
+		registry: &UastRegistry,
+		root: NodeId,
+		line: DocLine,
+	) -> CaretLookup<DocByte> {
+		match registry.find_node_at_line_col_raw(root, line, DocDisplayCol::ZERO) {
+			NodeLineLookup::Ready(target) => CaretLookup::Known(registry.doc_byte_for_node_offset(
+				root,
+				target.node_id,
+				target.node_byte,
+			)),
+			NodeLineLookup::Pending { required_node, .. } => self.pending(required_node),
 		}
 	}
 }
@@ -768,10 +1107,7 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 				match lookup {
 					RowLookup::Known(start) => Some(VisibleRow {
 						line,
-						start_col: start
-							.col
-							.to_doc_display_col()
-							.unwrap_or(DocDisplayCol::new(u32::MAX)),
+						start_col: start.col,
 						start_byte: start
 							.byte
 							.map(|byte| DocByte::new(line_start.get().saturating_add(byte))),
@@ -790,7 +1126,7 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 
 	/// The byte and display offset a window must start at to show `row`, a row
 	/// of an indexed line; `None` for a row of a line laid out whole.
-	fn window_origin(&self, row: VisibleRow) -> Option<(DocByte, DisplayOffset)> {
+	fn window_origin(&self, row: VisibleRow) -> Option<(DocByte, DocDisplayCol)> {
 		let start_offset = row.start_offset?;
 		if let Some(start_byte) = row.start_byte {
 			return Some((start_byte, start_offset));
@@ -821,7 +1157,7 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 		self.try_cursor_row_and_pane_col(line, col)
 			.unwrap_or_else(|| {
 				let last_pane_col = u32::from(self.text_width).saturating_sub(1);
-				(0, PaneLocalCol::new(col.get().min(last_pane_col)))
+				(0, PaneLocalCol::new(saturate(col.get()).min(last_pane_col)))
 			})
 	}
 
@@ -833,7 +1169,7 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 		col: DocDisplayCol,
 	) -> Option<(u32, PaneLocalCol)> {
 		if !self.wrap_enabled || self.text_width == 0 || self.is_folded_visible_line(line) {
-			return Some((0, PaneLocalCol::new(col.get())));
+			return Some((0, PaneLocalCol::new(saturate(col.get()))));
 		}
 		let last_pane_col = u32::from(self.text_width).saturating_sub(1);
 		let wrapped = match self.line_layout(line) {
@@ -842,12 +1178,7 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 				let wrap = self.wrap.expect("an indexed line has a wrap index");
 				let source = self.line_source(start, end);
 				let key = self.wrap_key(wrap);
-				let lookup = wrap.index.borrow_mut().row_for_col(
-					key,
-					line,
-					DisplayOffset::from(col),
-					&source,
-				);
+				let lookup = wrap.index.borrow_mut().row_for_col(key, line, col, &source);
 				return match lookup {
 					ColLookup::Known { row, start, col } => {
 						let pane_col = col
@@ -870,7 +1201,7 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 			.partition_point(|start| start.get() <= clamped_col)
 			.saturating_sub(1);
 		let start_col = starts[row].get();
-		let pane_col = clamped_col.saturating_sub(start_col).min(last_pane_col);
+		let pane_col = saturate(clamped_col.saturating_sub(start_col)).min(last_pane_col);
 		Some((row as u32, PaneLocalCol::new(pane_col)))
 	}
 
@@ -1079,8 +1410,7 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 				byte: None,
 			});
 		};
-		// The caret's column is `u32` until ADR 0010.
-		let col = offset.to_doc_display_col()?;
+		let col = offset;
 		let byte = match row.start_byte {
 			Some(byte) => byte,
 			// A row of trailing whitespace has no byte of its own: find the cell
@@ -1094,7 +1424,7 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 		})
 	}
 
-	fn trailing_whitespace_byte(&self, line: DocLine, offset: DisplayOffset) -> Option<DocByte> {
+	fn trailing_whitespace_byte(&self, line: DocLine, offset: DocDisplayCol) -> Option<DocByte> {
 		let LineLayout::Indexed { start, end } = self.line_layout(line) else {
 			return None;
 		};
@@ -1178,7 +1508,7 @@ pub(crate) fn window_origin_with_sum_tree<F: FoldPolicy + ?Sized>(
 ) -> Option<RowWindow> {
 	if first_row
 		.start_offset
-		.is_none_or(|offset| offset == DisplayOffset::ZERO)
+		.is_none_or(|offset| offset == DocDisplayCol::ZERO)
 	{
 		return None;
 	}
@@ -1990,7 +2320,7 @@ mod tests {
 						"anchor {anchor:?} delta {delta}"
 					);
 				}
-				let col = DocDisplayCol::new((at as u32 * 37) % 4_000);
+				let col = DocDisplayCol::new((at as u64 * 37) % 4_000);
 				assert_eq!(
 					fixture
 						.indexed()
@@ -2223,6 +2553,250 @@ mod tests {
 				// The row keeps its own place; only the window's origin moves.
 				assert!(offset.get() < row.start_offset.expect("an offset").get());
 			}
+		}
+
+		fn caret_index(fixture: &Fixture, wrap_enabled: bool) -> super::super::CaretIndex<'_> {
+			fixture.index.borrow_mut().begin_frame();
+			let mut wrap = WrapLayout::new(
+				&fixture.index,
+				StateId::new(1),
+				TopologyRev::new(1),
+				&fixture.demand,
+			);
+			wrap.min_line_bytes = THRESHOLD;
+			super::super::CaretIndex::new(wrap, wrap_enabled, WIDTH)
+		}
+
+		/// Call `lookup` once per frame until it is no longer pending.
+		fn settle_caret<T>(
+			fixture: &Fixture,
+			wrap_enabled: bool,
+			lookup: impl Fn(super::super::CaretIndex<'_>) -> Option<super::super::CaretLookup<T>>,
+		) -> Option<T> {
+			for _ in 0..10_000 {
+				match lookup(caret_index(fixture, wrap_enabled)) {
+					Some(super::super::CaretLookup::Known(found)) => return Some(found),
+					Some(super::super::CaretLookup::Pending) => {
+						assert!(
+							fixture.take_demand().pending.is_empty(),
+							"a resident line names nothing to hydrate"
+						);
+					}
+					None => return None,
+				}
+			}
+			panic!("the caret lookup never settled");
+		}
+
+		#[test]
+		fn caret_lookups_match_the_whole_line_helpers_with_wrap_on_and_off() {
+			let long = long_line(3_000);
+			let text = format!("head\n{long}\nshort line");
+			let line_start = "head\n".len() as u64;
+			let bytes = long.as_bytes();
+			let width = crate::core::text::display_width(bytes, 0, crate::core::TAB_SIZE);
+			let line = DocLine::new(1);
+			for wrap_enabled in [true, false] {
+				let fixture = Fixture::new(&text, tight());
+				for step in 0..40u64 {
+					let byte = (step * 211) % (bytes.len() as u64 + 3);
+					let found = settle_caret(&fixture, wrap_enabled, |caret| {
+						caret.line_col_for_byte(
+							&fixture.registry,
+							fixture.root,
+							crate::core::DocByte::new(line_start + byte),
+						)
+					})
+					.expect("the long line is indexed");
+					let col = crate::core::text::display_col_for_byte_offset(
+						bytes,
+						byte as usize,
+						0,
+						crate::core::TAB_SIZE,
+					);
+					assert_eq!(found, (line, DocDisplayCol::new(col)), "byte {byte}");
+					let target = (step * 97) % (width + 5);
+					let found = settle_caret(&fixture, wrap_enabled, |caret| {
+						caret.byte_for_line_col(
+							&fixture.registry,
+							fixture.root,
+							line,
+							DocDisplayCol::new(target),
+						)
+					})
+					.expect("the long line is indexed");
+					let (at, col) = crate::core::text::byte_offset_for_display_col(
+						bytes,
+						target,
+						0,
+						crate::core::TAB_SIZE,
+					);
+					assert_eq!(
+						found,
+						(
+							crate::core::DocByte::new(line_start + at as u64),
+							DocDisplayCol::new(col)
+						),
+						"column {target}"
+					);
+				}
+				// With wrap off the caret keys the line at the fixed width.
+				let keyed = if wrap_enabled { WIDTH } else { u16::MAX };
+				assert!(fixture.index.borrow().fed_bytes(line, keyed).is_some());
+			}
+		}
+
+		#[test]
+		fn an_ordinary_line_takes_todays_caret_path() {
+			let fixture = Fixture::new(&format!("short line\n{}", long_line(500)), tight());
+			let caret = caret_index(&fixture, true);
+			let line = DocLine::ZERO;
+			assert!(
+				caret
+					.line_col_for_byte(
+						&fixture.registry,
+						fixture.root,
+						crate::core::DocByte::new(3)
+					)
+					.is_none()
+			);
+			assert!(
+				caret
+					.byte_for_line_col(&fixture.registry, fixture.root, line, DocDisplayCol::new(3))
+					.is_none()
+			);
+			assert!(fixture.index.borrow().fed_bytes(line, WIDTH).is_none());
+		}
+
+		#[test]
+		fn a_cold_indexed_line_keeps_the_caret_and_names_its_node() {
+			let (registry, root, path) = build_source_backed_line_document(3);
+			let fixture = Fixture {
+				registry,
+				root,
+				index: RefCell::new(WrapIndex::default()),
+				demand: RefCell::new(LayoutDemand::default()),
+			};
+			let caret_index = caret_index(&fixture, true);
+			let line = DocLine::new(1);
+			let lookup = caret_index.byte_for_line_col(
+				&fixture.registry,
+				fixture.root,
+				line,
+				DocDisplayCol::new(1),
+			);
+			assert_eq!(lookup, Some(super::super::CaretLookup::Pending));
+			assert!(
+				!fixture.take_demand().pending.is_empty(),
+				"the cold leaf is named"
+			);
+			let mut caret = crate::engine::session::Caret::at_start();
+			let mut folds = crate::engine::folding::FoldSet::default();
+			let placed = caret.place_at_line_col_indexed(
+				&fixture.registry,
+				fixture.root,
+				&mut folds,
+				TopologyRev::new(1),
+				StateId::new(1),
+				line,
+				DocDisplayCol::new(1),
+				false,
+				crate::engine::session::Affinity::After,
+				Some(caret_index),
+			);
+			assert!(!placed, "a pending indexed line does not place the caret");
+			assert_eq!(
+				caret.byte(),
+				crate::core::DocByte::ZERO,
+				"the caret did not move"
+			);
+			let target = caret.pending_target().expect("the target is kept");
+			assert_eq!((target.line, target.col), (line, DocDisplayCol::new(1)));
+			let _ = std::fs::remove_file(path);
+		}
+
+		#[test]
+		fn a_pending_indexed_line_never_falls_back_to_a_prefix_read() {
+			// The line is resident, so today's path could place the caret by
+			// reading it; the index needs several frames to reach the column.
+			let fixture = Fixture::new(&format!("head\n{}", long_line(6_000)), tight());
+			let line = DocLine::new(1);
+			let target = DocDisplayCol::new(4_000);
+			let mut caret = crate::engine::session::Caret::at_start();
+			let mut folds = crate::engine::folding::FoldSet::default();
+			let place = |caret: &mut crate::engine::session::Caret,
+			             folds: &mut crate::engine::folding::FoldSet| {
+				caret.place_at_line_col_indexed(
+					&fixture.registry,
+					fixture.root,
+					folds,
+					TopologyRev::new(1),
+					StateId::new(1),
+					line,
+					target,
+					false,
+					crate::engine::session::Affinity::After,
+					Some(caret_index(&fixture, true)),
+				)
+			};
+			assert!(
+				!place(&mut caret, &mut folds),
+				"one frame cannot reach the column"
+			);
+			assert_eq!(
+				caret.byte(),
+				crate::core::DocByte::ZERO,
+				"the caret did not move"
+			);
+			assert!(
+				fixture.take_demand().more,
+				"the demand asks for another frame"
+			);
+			let mut frames = 1;
+			while !caret.resolve_indexed(
+				&fixture.registry,
+				fixture.root,
+				&mut folds,
+				TopologyRev::new(1),
+				StateId::new(1),
+				Some(caret_index(&fixture, true)),
+			) {
+				frames += 1;
+				assert!(frames < 1_000, "the target never resolved");
+			}
+			assert!(frames > 2, "the walk spanned frames");
+			assert_eq!(caret.abs_line(), line);
+			assert!(
+				caret.abs_col().get() >= target.get() && caret.abs_col().get() < target.get() + 4
+			);
+		}
+
+		#[test]
+		fn carried_work_for_another_key_is_dropped() {
+			let key = super::super::WorkKey {
+				root: NodeId::from_index(1),
+				state: StateId::new(1),
+				topology: TopologyRev::new(1),
+				key_width: WIDTH,
+			};
+			let later = super::super::WorkKey {
+				state: StateId::new(2),
+				..key
+			};
+			let mut work = super::super::CarriedWork::default();
+			let mut demand = LayoutDemand::default();
+			demand.note(Some(NodeId::from_index(5)));
+			work.carry(key, demand);
+			work.scan_to_end(key, DocLine::new(3));
+			let (demand, scan) = work.take(later);
+			assert!(demand.pending.is_empty() && !demand.more && scan.is_none());
+			// And taking drops it: nothing is left for the old key either.
+			let (demand, scan) = work.take(key);
+			assert!(demand.pending.is_empty() && scan.is_none());
+			// Work for one key replaces work for another.
+			work.scan_to_end(key, DocLine::new(3));
+			work.scan_to_end(later, DocLine::new(4));
+			assert_eq!(work.take(later).1, Some(DocLine::new(4)));
 		}
 
 		#[test]

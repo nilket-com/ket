@@ -112,6 +112,23 @@ impl UndoLedger {
 	/// Allocate a single new state ID for a forward transaction group.
 	/// Sets `state_before`/`state_after` on every delta in the group and advances
 	/// `current_state_id` once for the whole transaction.
+	/// The one delta that took the document from `from` to its current state,
+	/// if the last history entry is exactly that: not after an undo or redo,
+	/// and not for a group of several deltas.
+	pub(crate) fn last_single_delta(&self, from: StateId) -> Option<&TextDelta> {
+		match self.undo_stack.last()? {
+			HistoryEntry::TextDeltas { deltas, .. } => match deltas.as_slice() {
+				[delta]
+					if delta.state_before == from && delta.state_after == self.current_state_id =>
+				{
+					Some(delta)
+				}
+				_ => None,
+			},
+			HistoryEntry::SwapGeneration(_) => None,
+		}
+	}
+
 	pub(crate) fn push_group_pending_cursors(&mut self, mut deltas: Vec<TextDelta>) {
 		if deltas.is_empty() {
 			return;

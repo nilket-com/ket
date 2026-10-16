@@ -1140,12 +1140,13 @@ fn byte_span_from_token_range(tokens: &[(u32, u32)], start: u32, end: u32) -> (u
 	(start_byte, end_byte.max(start_byte))
 }
 
-fn byte_to_visual_col(line_bytes: &[u8], byte_offset: u32) -> u32 {
-	let mut col: u32 = 0;
+fn byte_to_visual_col(line_bytes: &[u8], byte_offset: u32) -> u64 {
+	let tab_size = u64::from(TAB_SIZE);
+	let mut col: u64 = 0;
 	let limit = (byte_offset as usize).min(line_bytes.len());
 	for &b in &line_bytes[..limit] {
 		match b {
-			b'\t' => col = col.saturating_add(TAB_SIZE - (col % TAB_SIZE)),
+			b'\t' => col = col.saturating_add(tab_size - (col % tab_size)),
 			b'\n' => break,
 			_ => col = col.saturating_add(1),
 		}

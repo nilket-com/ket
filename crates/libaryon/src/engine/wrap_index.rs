@@ -18,7 +18,7 @@
 //! in the whitespace run that [`WrapScanner::trailing_whitespace_start`] names.
 
 use crate::core::text::{DisplayCellKind, advance_display_col, visit_display_cells};
-use crate::core::{DisplayOffset, DocLine, StateId, TAB_SIZE, TopologyRev};
+use crate::core::{DocDisplayCol, DocLine, StateId, TAB_SIZE, TopologyRev};
 use crate::ecs::NodeId;
 
 /// Bytes of one display cell the scanner holds back before taking it as
@@ -28,7 +28,7 @@ pub(crate) const MAX_HELD_CELL_BYTES: usize = 64 * 1024;
 /// One wrapped row's start within its line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RowStart {
-	pub(crate) col: DisplayOffset,
+	pub(crate) col: DocDisplayCol,
 	/// Line-relative byte of the cell holding `col`. A start inside a wide cell
 	/// or a tab names that cell. `None` only for trailing-whitespace rows.
 	pub(crate) byte: Option<u64>,
@@ -38,7 +38,14 @@ pub(crate) struct RowStart {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScanPoint {
 	pub(crate) byte: u64,
-	pub(crate) col: DisplayOffset,
+	pub(crate) col: DocDisplayCol,
+}
+
+impl ScanPoint {
+	pub(crate) const LINE_START: Self = Self {
+		byte: 0,
+		col: DocDisplayCol::ZERO,
+	};
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +84,17 @@ impl WrapScanner {
 	/// Scan the next bytes of the line, appending each newly determined row
 	/// start to `rows`. A newline ends the line; bytes after it are ignored.
 	pub(crate) fn feed(&mut self, chunk: &[u8], rows: &mut Vec<RowStart>) {
+		self.feed_observing(chunk, rows, &mut |_, _| {});
+	}
+
+	/// [`Self::feed`], reporting each display cell it completes as the scan
+	/// points before and after it.
+	fn feed_observing(
+		&mut self,
+		chunk: &[u8],
+		rows: &mut Vec<RowStart>,
+		observe: &mut dyn FnMut(ScanPoint, ScanPoint),
+	) {
 		// A zero-width text area has one row and no width, as in
 		// `compute_line_wrap`.
 		if self.ended || chunk.is_empty() || self.width == 0 {
@@ -84,36 +102,44 @@ impl WrapScanner {
 		}
 		let mut buffer = std::mem::take(&mut self.carry);
 		buffer.extend_from_slice(chunk);
-		self.scan(&buffer, false, rows);
+		self.scan(&buffer, false, rows, observe);
 	}
 
 	/// End the line, appending the remaining row starts. Returns the line's
 	/// display width.
-	pub(crate) fn finish(mut self, rows: &mut Vec<RowStart>) -> DisplayOffset {
+	pub(crate) fn finish(self, rows: &mut Vec<RowStart>) -> DocDisplayCol {
+		self.finish_observing(rows, &mut |_, _| {})
+	}
+
+	fn finish_observing(
+		mut self,
+		rows: &mut Vec<RowStart>,
+		observe: &mut dyn FnMut(ScanPoint, ScanPoint),
+	) -> DocDisplayCol {
 		if self.width == 0 {
-			return DisplayOffset::ZERO;
+			return DocDisplayCol::ZERO;
 		}
 		let carry = std::mem::take(&mut self.carry);
 		if !self.ended {
-			self.scan(&carry, true, rows);
+			self.scan(&carry, true, rows, observe);
 		}
 		// Whitespace-only lines and long trailing whitespace still need
 		// reachable continuation rows.
 		while self.visual_col.saturating_sub(self.row_start) > self.width {
 			self.row_start = self.row_start.saturating_add(self.width);
 			rows.push(RowStart {
-				col: DisplayOffset::new(self.row_start),
+				col: DocDisplayCol::new(self.row_start),
 				byte: None,
 			});
 		}
-		DisplayOffset::new(self.visual_col)
+		DocDisplayCol::new(self.visual_col)
 	}
 
 	/// Where the scan stands: everything before this point is final.
 	pub(crate) fn scanned(&self) -> ScanPoint {
 		ScanPoint {
 			byte: self.consumed,
-			col: DisplayOffset::new(self.visual_col),
+			col: DocDisplayCol::new(self.visual_col),
 		}
 	}
 
@@ -134,7 +160,13 @@ impl WrapScanner {
 		self.whitespace_start
 	}
 
-	fn scan(&mut self, buffer: &[u8], last: bool, rows: &mut Vec<RowStart>) {
+	fn scan(
+		&mut self,
+		buffer: &[u8],
+		last: bool,
+		rows: &mut Vec<RowStart>,
+		observe: &mut dyn FnMut(ScanPoint, ScanPoint),
+	) {
 		let end = if last {
 			buffer.len()
 		} else {
@@ -168,7 +200,7 @@ impl WrapScanner {
 			let byte = self.consumed + cell.byte_start as u64;
 			let before = ScanPoint {
 				byte,
-				col: DisplayOffset::new(self.visual_col),
+				col: DocDisplayCol::new(self.visual_col),
 			};
 			let is_whitespace = cell.kind == DisplayCellKind::Tab
 				|| std::str::from_utf8(&scanned[cell.byte_start..cell.byte_end])
@@ -181,14 +213,14 @@ impl WrapScanner {
 				self.whitespace_start = None;
 				self.word_start.get_or_insert(before);
 			}
-			// Display offsets past u32 advance without the u32 helper's limit.
-			let advanced = advance_display_col(
-				(self.visual_col % u64::from(TAB_SIZE)) as u32,
-				*cell,
-				TAB_SIZE,
+			self.visual_col = advance_display_col(self.visual_col, *cell, TAB_SIZE);
+			observe(
+				before,
+				ScanPoint {
+					byte: self.consumed + cell.byte_end as u64,
+					col: DocDisplayCol::new(self.visual_col),
+				},
 			);
-			let step = u64::from(advanced) - self.visual_col % u64::from(TAB_SIZE);
-			self.visual_col = self.visual_col.saturating_add(step);
 			if !is_whitespace {
 				self.break_overrunning_word(byte, rows);
 			}
@@ -220,7 +252,7 @@ impl WrapScanner {
 		while self.visual_col.saturating_sub(self.row_start) > self.width {
 			self.row_start = self.row_start.saturating_add(self.width);
 			rows.push(RowStart {
-				col: DisplayOffset::new(self.row_start),
+				col: DocDisplayCol::new(self.row_start),
 				byte: Some(cell_byte),
 			});
 		}
@@ -275,11 +307,61 @@ pub(crate) enum ColLookup {
 	Known {
 		row: u64,
 		start: RowStart,
-		col: DisplayOffset,
+		col: DocDisplayCol,
 	},
 	Unknown {
 		pending: Option<NodeId>,
 	},
+}
+
+/// A cell boundary found by walking the line's bytes (ADR 0010): a line-relative
+/// byte and the display column there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CellLookup {
+	Known(ScanPoint),
+	Unknown { pending: Option<NodeId> },
+}
+
+/// What a cell walk looks for. Each direction keeps the rule of the whole-line
+/// helper it stands in for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellTarget {
+	/// The start of the cell holding this byte (`display_col_for_byte_offset`).
+	Byte(u64),
+	/// The first cell boundary at or after this column, so a column inside a
+	/// tab or wide cell lands after it (`byte_offset_for_display_col`).
+	Col(u64),
+}
+
+impl CellTarget {
+	/// Whether a walk standing at `point` has not passed the target yet.
+	fn ahead_of(self, point: ScanPoint) -> bool {
+		match self {
+			Self::Byte(byte) => point.byte <= byte,
+			Self::Col(col) => point.col.get() <= col,
+		}
+	}
+
+	/// The answer, if the cell from `before` to `after` settles it.
+	fn settle(self, before: ScanPoint, after: ScanPoint) -> Option<ScanPoint> {
+		match self {
+			Self::Byte(byte) => (before.byte <= byte && byte < after.byte).then_some(before),
+			Self::Col(col) if before.col.get() >= col => Some(before),
+			Self::Col(col) => (after.col.get() >= col).then_some(after),
+		}
+	}
+
+	fn same_kind(self, other: Self) -> bool {
+		std::mem::discriminant(&self) == std::mem::discriminant(&other)
+	}
+}
+
+/// A cell walk resumed across calls: a scanner that emits no rows, and the
+/// last boundary it passed, which is the line's end once the walk finishes.
+struct CellWalk {
+	target: CellTarget,
+	scanner: WrapScanner,
+	last: ScanPoint,
 }
 
 /// The byte of a cell found by walking the line's bytes.
@@ -391,10 +473,11 @@ struct LineWrap {
 	/// Starts emitted by the latest scan or replay, for cheap nearby lookups.
 	recent: Vec<(u64, RowStart)>,
 	replay: Option<Replay>,
+	cell_walk: Option<CellWalk>,
 }
 
 const ROW_ZERO: RowStart = RowStart {
-	col: DisplayOffset::ZERO,
+	col: DocDisplayCol::ZERO,
 	byte: Some(0),
 };
 
@@ -450,6 +533,7 @@ impl LineWrap {
 			whitespace_walk: None,
 			recent: vec![(0, ROW_ZERO)],
 			replay: None,
+			cell_walk: None,
 		}
 	}
 
@@ -458,7 +542,11 @@ impl LineWrap {
 		let replay = self
 			.replay
 			.as_ref()
-			.map_or(0, |replay| replay.scanner.carry.capacity());
+			.map_or(0, |replay| replay.scanner.carry.capacity())
+			+ self
+				.cell_walk
+				.as_ref()
+				.map_or(0, |walk| walk.scanner.carry.capacity());
 		self.checkpoint_memory()
 			+ self.recent.capacity() * std::mem::size_of::<(u64, RowStart)>()
 			+ self.frontier.carry.capacity()
@@ -550,6 +638,106 @@ impl LineWrap {
 			self.checkpoints.shrink_to_fit();
 			self.checkpoint_carry = self.checkpoints.iter().map(Checkpoint::carry_bytes).sum();
 		}
+	}
+
+	/// Walk cells toward `target` from the nearest checkpoint before it, or
+	/// from a walk under way that has not passed it; spends at most `budget`.
+	fn walk(
+		&mut self,
+		target: CellTarget,
+		source: &dyn LineSource,
+		budget: &mut usize,
+	) -> CellLookup {
+		let resumable = self.cell_walk.as_ref().is_some_and(|walk| {
+			walk.target.same_kind(target) && target.ahead_of(walk.scanner.scanned())
+		});
+		let mut walk = match self.cell_walk.take().filter(|_| resumable) {
+			Some(walk) => walk,
+			None => {
+				let at = self
+					.checkpoints
+					.partition_point(|checkpoint| target.ahead_of(checkpoint.scanner.scanned()))
+					.saturating_sub(1);
+				let mut scanner = self.checkpoints[at].scanner.clone();
+				// Rows are not wanted: no width ever overruns.
+				scanner.width = u64::MAX;
+				let last = scanner.scanned();
+				CellWalk {
+					target,
+					scanner,
+					last,
+				}
+			}
+		};
+		walk.target = target;
+		let mut rows = Vec::new();
+		let found = std::cell::Cell::new(None);
+		let last = std::cell::Cell::new(walk.last);
+		let mut observe = |before: ScanPoint, after: ScanPoint| {
+			if found.get().is_none() {
+				found.set(target.settle(before, after));
+			}
+			last.set(after);
+		};
+		let lookup = loop {
+			if *budget == 0 {
+				break CellLookup::Unknown { pending: None };
+			}
+			let finished = match step(source, walk.scanner.fed(), (*budget).min(FEED_STEP)) {
+				Step::Pending(node) => {
+					break CellLookup::Unknown {
+						pending: Some(node),
+					};
+				}
+				Step::End => true,
+				Step::Read(bytes) => {
+					*budget -= bytes.len().min(*budget);
+					walk.scanner.feed_observing(&bytes, &mut rows, &mut observe);
+					rows.clear();
+					walk.scanner.ended()
+				}
+			};
+			if finished {
+				std::mem::replace(&mut walk.scanner, WrapScanner::new(0))
+					.finish_observing(&mut rows, &mut observe);
+				// Past every cell: the target is at or beyond the line's end.
+				break CellLookup::Known(found.get().unwrap_or(last.get()));
+			}
+			if let Some(point) = found.get() {
+				break CellLookup::Known(point);
+			}
+		};
+		walk.last = last.get();
+		// A finished walk's scanner is spent; one that found its cell usually
+		// serves the next lookup, a little further on.
+		if walk.scanner.width != 0 {
+			self.cell_walk = Some(walk);
+		}
+		lookup
+	}
+
+	/// Forget everything that depends on bytes at or after `offset`: keep the
+	/// checkpoints fed only from bytes before it, and the rows they had
+	/// emitted, and scan on from the last of them (ADR 0010).
+	fn truncate_at(&mut self, offset: u64) {
+		self.checkpoints
+			.retain(|checkpoint| checkpoint.scanner.fed() <= offset);
+		let last = self
+			.checkpoints
+			.last()
+			.expect("the line start's checkpoint is fed from no bytes");
+		self.frontier = last.scanner.clone();
+		self.frontier_rows = last.rows_before;
+		self.frontier_last = last.last_start;
+		self.checkpoint_carry = self.checkpoints.iter().map(Checkpoint::carry_bytes).sum();
+		let rows = self.frontier_rows;
+		self.recent.retain(|&(row, _)| row < rows);
+		self.total_rows = None;
+		self.visual_width = None;
+		self.trailing_whitespace = None;
+		self.whitespace_walk = None;
+		self.replay = None;
+		self.cell_walk = None;
 	}
 
 	/// Checkpoint memory as allocated: vector slots plus carry.
@@ -679,6 +867,14 @@ impl LineWrap {
 	}
 }
 
+/// One edit within a line: its line and the line-relative byte where its bytes
+/// begin to differ. It adds or removes no newline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LineEdit {
+	pub(crate) line: DocLine,
+	pub(crate) offset: u64,
+}
+
 /// Wrap rows of long lines, scanned lazily and kept within fixed limits.
 pub(crate) struct WrapIndex {
 	/// The `(state, topology)` the lines are valid for.
@@ -717,6 +913,49 @@ impl WrapIndex {
 	/// however many layout passes consult the same line.
 	pub(crate) fn begin_frame(&mut self) {
 		self.frame_budget = self.limits.read_budget;
+	}
+
+	/// Carry the index across an edit the acting view made (ADR 0010). With an
+	/// `edit` that adds or removes no newline, every other line's entries are
+	/// unchanged, since their line-relative bytes are, and the edited line keeps
+	/// what it learned before the edit offset. Anything else, or an index not
+	/// valid for `from`, starts over.
+	pub(crate) fn carry_over(
+		&mut self,
+		from: (StateId, TopologyRev),
+		to: (StateId, TopologyRev),
+		edit: Option<LineEdit>,
+	) {
+		match edit {
+			Some(edit) if self.valid_for == Some(from) => {
+				self.valid_for = Some(to);
+				for entry in self
+					.lines
+					.iter_mut()
+					.filter(|entry| entry.line == edit.line)
+				{
+					entry.truncate_at(edit.offset);
+				}
+			}
+			_ => {
+				self.valid_for = None;
+				self.lines.clear();
+			}
+		}
+	}
+
+	/// Grant a read outside the index, such as a motion's window, from this
+	/// frame's budget (ADR 0010): at most `max` bytes, and at most half of what
+	/// is left, so the lookup that follows can still make progress.
+	pub(crate) fn reserve_read(&mut self, max: usize) -> usize {
+		let granted = max.min(self.frame_budget / 2);
+		self.frame_budget -= granted;
+		granted
+	}
+
+	#[cfg(test)]
+	pub(crate) fn budget_left(&self) -> usize {
+		self.frame_budget
 	}
 
 	/// The start of wrapped `row` of `line`.
@@ -762,11 +1001,11 @@ impl WrapIndex {
 		&mut self,
 		key: WrapKey,
 		line: DocLine,
-		col: DisplayOffset,
+		col: DocDisplayCol,
 		source: &dyn LineSource,
 	) -> ColLookup {
 		// The line's first column is in its first row: no replay can be needed.
-		if col == DisplayOffset::ZERO {
+		if col == DocDisplayCol::ZERO {
 			return ColLookup::Known {
 				row: 0,
 				start: ROW_ZERO,
@@ -811,13 +1050,72 @@ impl WrapIndex {
 			ReplayOutcome::Col { row, start } => ColLookup::Known {
 				row,
 				start,
-				col: DisplayOffset::new(col),
+				col: DocDisplayCol::new(col),
 			},
 			ReplayOutcome::Unknown { pending } => ColLookup::Unknown { pending },
 			ReplayOutcome::Row(_) | ReplayOutcome::PastEnd { .. } => {
 				unreachable!("a column replay finds a column's row")
 			}
 		}
+	}
+
+	/// The cell of `line` holding line-relative `byte`: its start byte and
+	/// column. A byte at or past the line's end gives the end.
+	pub(crate) fn cell_for_byte(
+		&mut self,
+		key: WrapKey,
+		line: DocLine,
+		byte: u64,
+		source: &dyn LineSource,
+	) -> CellLookup {
+		self.cell(key, line, CellTarget::Byte(byte), source)
+	}
+
+	/// Where display column `col` of `line` resolves: the first cell boundary
+	/// at or after it, so a column inside a tab or a wide cell lands after that
+	/// cell. A column past the line's end gives the end.
+	pub(crate) fn cell_for_col(
+		&mut self,
+		key: WrapKey,
+		line: DocLine,
+		col: DocDisplayCol,
+		source: &dyn LineSource,
+	) -> CellLookup {
+		self.cell(key, line, CellTarget::Col(col.get()), source)
+	}
+
+	fn cell(
+		&mut self,
+		key: WrapKey,
+		line: DocLine,
+		target: CellTarget,
+		source: &dyn LineSource,
+	) -> CellLookup {
+		if target.settle(ScanPoint::LINE_START, ScanPoint::LINE_START)
+			== Some(ScanPoint::LINE_START)
+		{
+			return CellLookup::Known(ScanPoint::LINE_START);
+		}
+		let limits = self.limits;
+		let mut budget = self.frame_budget;
+		let entry = Self::entry(&mut self.lines, &mut self.valid_for, &limits, key, line);
+		// Checkpoints are laid as the scan advances: bring it past the target.
+		let beyond_frontier = |entry: &LineWrap| {
+			entry.total_rows.is_none() && target.ahead_of(entry.frontier.scanned())
+		};
+		let lookup = if beyond_frontier(entry) {
+			match entry.advance(source, &limits, &mut budget) {
+				Some(node) => CellLookup::Unknown {
+					pending: Some(node),
+				},
+				None if beyond_frontier(entry) => CellLookup::Unknown { pending: None },
+				None => entry.walk(target, source, &mut budget),
+			}
+		} else {
+			entry.walk(target, source, &mut budget)
+		};
+		self.frame_budget = budget;
+		lookup
 	}
 
 	/// Where a window must start to show a row that has no byte of its own:
@@ -844,7 +1142,7 @@ impl WrapIndex {
 		&mut self,
 		key: WrapKey,
 		line: DocLine,
-		col: DisplayOffset,
+		col: DocDisplayCol,
 		source: &dyn LineSource,
 	) -> ByteLookup {
 		let limits = self.limits;
@@ -883,7 +1181,7 @@ impl WrapIndex {
 			let mut consumed = 0usize;
 			let mut found = None;
 			visit_display_cells(&bytes[..usable], |cell| {
-				let next = advance_u64(column, cell);
+				let next = advance_display_col(column, cell, TAB_SIZE);
 				if target < next {
 					found = Some(at.byte + cell.byte_start as u64);
 					return false;
@@ -897,7 +1195,7 @@ impl WrapIndex {
 			}
 			at = ScanPoint {
 				byte: at.byte + consumed as u64,
-				col: DisplayOffset::new(column),
+				col: DocDisplayCol::new(column),
 			};
 		};
 		entry.whitespace_walk = Some(at);
@@ -975,14 +1273,6 @@ impl WrapIndex {
 	}
 }
 
-/// `advance_display_col` for offsets past `u32`: the tab rule applies to the
-/// column modulo the tab size.
-fn advance_u64(column: u64, cell: crate::core::text::DisplayCell) -> u64 {
-	let phase = (column % u64::from(TAB_SIZE)) as u32;
-	let step = u64::from(advance_display_col(phase, cell, TAB_SIZE)) - u64::from(phase);
-	column.saturating_add(step)
-}
-
 /// Length of a UTF-8 sequence cut off at the end of `bytes`, which a later
 /// chunk may complete.
 fn incomplete_utf8_tail(bytes: &[u8]) -> usize {
@@ -1005,11 +1295,11 @@ fn incomplete_utf8_tail(bytes: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
 	use super::{
-		LineRead, LineSource, RowCount, RowLookup, RowStart, ScanPoint, WrapIndex, WrapIndexLimits,
-		WrapKey, WrapScanner,
+		LineEdit, LineRead, LineSource, RowCount, RowLookup, RowStart, ScanPoint, WrapIndex,
+		WrapIndexLimits, WrapKey, WrapScanner,
 	};
 	use crate::core::text::{advance_display_col, visit_display_cells};
-	use crate::core::{DisplayOffset, DocLine, StateId, TAB_SIZE, TopologyRev};
+	use crate::core::{DocDisplayCol, DocLine, StateId, TAB_SIZE, TopologyRev};
 	use crate::ecs::NodeId;
 	use std::cell::RefCell;
 	use std::ops::Range;
@@ -1055,11 +1345,11 @@ mod tests {
 		line
 	}
 
-	fn scan_in_chunks(line: &[u8], width: u16, seed: u64) -> (Vec<RowStart>, DisplayOffset) {
+	fn scan_in_chunks(line: &[u8], width: u16, seed: u64) -> (Vec<RowStart>, DocDisplayCol) {
 		let mut rng = XorShift(seed | 1);
 		let mut scanner = WrapScanner::new(width);
 		let mut rows = vec![RowStart {
-			col: DisplayOffset::ZERO,
+			col: DocDisplayCol::ZERO,
 			byte: Some(0),
 		}];
 		let mut at = 0;
@@ -1074,12 +1364,12 @@ mod tests {
 
 	/// The cell starting at `byte` and the display range it covers.
 	fn cell_span(line: &[u8], byte: usize) -> Option<(u64, u64)> {
-		let mut col = 0u32;
+		let mut col = 0u64;
 		let mut span = None;
 		visit_display_cells(line, |cell| {
 			let next = advance_display_col(col, cell, TAB_SIZE);
 			if cell.byte_start == byte {
-				span = Some((u64::from(col), u64::from(next)));
+				span = Some((col, next));
 				return false;
 			}
 			col = next;
@@ -1130,20 +1420,20 @@ mod tests {
 			scanner.scanned(),
 			ScanPoint {
 				byte: 4,
-				col: DisplayOffset::new(5),
+				col: DocDisplayCol::new(5),
 			}
 		);
 		assert_eq!(
 			scanner.trailing_whitespace_start(),
 			Some(ScanPoint {
 				byte: 2,
-				col: DisplayOffset::new(2),
+				col: DocDisplayCol::new(2),
 			})
 		);
 		// `x` ends the run once it is scanned; `y` is now the held cell.
 		scanner.feed(b"xy", &mut rows);
 		assert_eq!(scanner.trailing_whitespace_start(), None);
-		assert_eq!(scanner.finish(&mut rows), DisplayOffset::new(8));
+		assert_eq!(scanner.finish(&mut rows), DocDisplayCol::new(8));
 	}
 
 	#[test]
@@ -1151,7 +1441,7 @@ mod tests {
 		let mut scanner = WrapScanner::new(4);
 		let mut rows = Vec::new();
 		scanner.feed(b"abc\nzzzzzzzzzzzz", &mut rows);
-		assert_eq!(scanner.finish(&mut rows), DisplayOffset::new(3));
+		assert_eq!(scanner.finish(&mut rows), DocDisplayCol::new(3));
 		assert!(rows.is_empty());
 	}
 
@@ -1165,7 +1455,6 @@ mod tests {
 		let width = scanner.finish(&mut rows);
 		assert_eq!(width.get(), u64::from(u32::MAX) - 2 + 200);
 		assert_eq!(rows[0].col.get(), u64::from(u32::MAX) - 2 + 100);
-		assert!(rows[0].col.to_doc_display_col().is_none());
 	}
 
 	/// A line whose bytes in `unloaded` are not resident until hydrated.
@@ -1471,7 +1760,7 @@ mod tests {
 	) -> (u64, RowStart) {
 		for _ in 0..10_000 {
 			index.begin_frame();
-			match index.row_for_col(KEY, line, DisplayOffset::new(col), source) {
+			match index.row_for_col(KEY, line, DocDisplayCol::new(col), source) {
 				super::ColLookup::Known { row, start, .. } => return (row, start),
 				super::ColLookup::Unknown { pending: None } => continue,
 				other => panic!("column {col}: {other:?}"),
@@ -1513,7 +1802,7 @@ mod tests {
 		// Several layout passes ask about the same line within one frame.
 		let _ = index.row_count(KEY, line, &source);
 		let _ = index.row_start(KEY, line, 5_000, &source);
-		let _ = index.row_for_col(KEY, line, DisplayOffset::new(40_000), &source);
+		let _ = index.row_for_col(KEY, line, DocDisplayCol::new(40_000), &source);
 		let _ = index.row_count(KEY, line, &source);
 		assert!(
 			source.take_read() <= tight_limits().read_budget,
@@ -1547,5 +1836,389 @@ mod tests {
 			RowCount::Exact(_)
 		));
 		assert_eq!(source.take_read(), 0, "both widths stayed indexed");
+	}
+
+	fn settle_cell(
+		index: &mut WrapIndex,
+		source: &FakeLine,
+		mut lookup: impl FnMut(&mut WrapIndex) -> super::CellLookup,
+	) -> ScanPoint {
+		source.take_read();
+		for _ in 0..10_000 {
+			index.begin_frame();
+			let found = lookup(index);
+			assert!(
+				source.take_read() <= index.limits.read_budget,
+				"one frame read more than its budget"
+			);
+			match found {
+				super::CellLookup::Known(point) => return point,
+				super::CellLookup::Unknown { pending: None } => continue,
+				other => panic!("{other:?}"),
+			}
+		}
+		panic!("the cell lookup never settled");
+	}
+
+	/// What the whole-line helpers say: the cell boundary a byte maps to, and
+	/// the one a column resolves to.
+	fn whole_cell_for_byte(line: &[u8], byte: usize) -> ScanPoint {
+		let col = crate::core::text::display_col_for_byte_offset(line, byte, 0, TAB_SIZE);
+		let (start, _) = crate::core::text::byte_offset_for_display_col(line, col, 0, TAB_SIZE);
+		ScanPoint {
+			byte: start as u64,
+			col: DocDisplayCol::new(col),
+		}
+	}
+
+	fn whole_cell_for_col(line: &[u8], col: u64) -> ScanPoint {
+		let (byte, col) = crate::core::text::byte_offset_for_display_col(line, col, 0, TAB_SIZE);
+		ScanPoint {
+			byte: byte as u64,
+			col: DocDisplayCol::new(col),
+		}
+	}
+
+	#[test]
+	fn cell_lookups_match_the_whole_line_helpers_in_both_directions() {
+		for seed in 0..40u64 {
+			let mut bytes = long_line(4 * 1024 + seed as usize * 97);
+			bytes.truncate(bytes.len() - (seed as usize % 3));
+			let source = FakeLine::new(bytes);
+			let width = crate::core::text::display_width(&source.bytes, 0, TAB_SIZE);
+			let mut index = WrapIndex::with_limits(tight_limits());
+			let line = DocLine::new(seed);
+			let mut rng = XorShift(seed + 11);
+			for pass in 0..120 {
+				// Half before the scan finishes, half after.
+				if pass == 60 {
+					scan_to_end(&mut index, KEY, line, &source);
+				}
+				let byte = rng.below(source.bytes.len() + 8);
+				let found = settle_cell(&mut index, &source, |index| {
+					index.cell_for_byte(KEY, line, byte as u64, &source)
+				});
+				assert_eq!(
+					found,
+					whole_cell_for_byte(&source.bytes, byte),
+					"seed {seed} byte {byte}"
+				);
+				let col = rng.below(width as usize + 8) as u64;
+				let found = settle_cell(&mut index, &source, |index| {
+					index.cell_for_col(KEY, line, DocDisplayCol::new(col), &source)
+				});
+				assert_eq!(
+					found,
+					whole_cell_for_col(&source.bytes, col),
+					"seed {seed} col {col}"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn cell_lookups_round_trip_at_every_cell_start_and_the_line_end() {
+		for seed in 0..200u64 {
+			let source = FakeLine::new(line(seed));
+			let mut index = WrapIndex::default();
+			let line = DocLine::ZERO;
+			let mut starts = Vec::new();
+			visit_display_cells(&source.bytes, |cell| {
+				if cell.kind == crate::core::text::DisplayCellKind::Newline {
+					return false;
+				}
+				starts.push(cell.byte_start as u64);
+				true
+			});
+			let end = whole_cell_for_byte(&source.bytes, source.bytes.len());
+			for byte in starts.into_iter().chain([end.byte]) {
+				let cell = settle_cell(&mut index, &source, |index| {
+					index.cell_for_byte(KEY, line, byte, &source)
+				});
+				assert_eq!(cell.byte, byte, "seed {seed}: a cell start maps to itself");
+				let back = settle_cell(&mut index, &source, |index| {
+					index.cell_for_col(KEY, line, cell.col, &source)
+				});
+				assert_eq!(back, cell, "seed {seed} byte {byte}");
+			}
+		}
+	}
+
+	#[test]
+	fn an_interior_byte_and_column_quantize_as_the_helpers_do() {
+		// "日" is three bytes and two columns; a tab at column 2 covers 2..4.
+		let source = FakeLine::new("日\tb".as_bytes().to_vec());
+		let mut index = WrapIndex::default();
+		let line = DocLine::ZERO;
+		let at = |byte, col| ScanPoint {
+			byte,
+			col: DocDisplayCol::new(col),
+		};
+		let mut by_byte = |byte| {
+			settle_cell(&mut index, &source, |index| {
+				index.cell_for_byte(KEY, line, byte, &source)
+			})
+		};
+		assert_eq!(by_byte(1), at(0, 0), "inside the wide cell: its start");
+		assert_eq!(by_byte(2), at(0, 0));
+		assert_eq!(by_byte(3), at(3, 2), "the tab");
+		assert_eq!(by_byte(9), at(5, 5), "past the end: the end");
+		let mut index = WrapIndex::default();
+		let mut by_col = |col| {
+			settle_cell(&mut index, &source, |index| {
+				index.cell_for_col(KEY, line, DocDisplayCol::new(col), &source)
+			})
+		};
+		assert_eq!(by_col(1), at(3, 2), "inside the wide cell: after it");
+		assert_eq!(by_col(3), at(4, 4), "inside the tab: after it");
+		assert_eq!(by_col(4), at(4, 4));
+		assert_eq!(by_col(40), at(5, 5), "past the end: the end");
+	}
+
+	#[test]
+	fn a_cell_lookup_waits_for_an_unloaded_range() {
+		let source = FakeLine::new(long_line(32 * 1024));
+		source.unloaded.borrow_mut().push(10_000..20_000);
+		let mut index = WrapIndex::with_limits(tight_limits());
+		let line = DocLine::ZERO;
+		let pending = (0..10_000)
+			.find_map(|_| {
+				index.begin_frame();
+				match index.cell_for_byte(KEY, line, 15_000, &source) {
+					super::CellLookup::Unknown {
+						pending: Some(node),
+					} => Some(node),
+					super::CellLookup::Unknown { pending: None } => None,
+					known => panic!("resolved through an unloaded range: {known:?}"),
+				}
+			})
+			.expect("the lookup asks for the unloaded node");
+		assert_eq!(pending, NodeId::from_index(UNLOADED_NODE));
+		source.unloaded.borrow_mut().clear();
+		let found = settle_cell(&mut index, &source, |index| {
+			index.cell_for_byte(KEY, line, 15_000, &source)
+		});
+		assert_eq!(found, whole_cell_for_byte(&source.bytes, 15_000));
+	}
+
+	#[test]
+	fn a_cell_walk_longer_than_a_frame_resumes_where_it_stopped() {
+		// Checkpoints 16 KiB apart and 1 KiB read per frame: a target between
+		// checkpoints takes several frames, each continuing the walk.
+		let limits = WrapIndexLimits {
+			read_budget: 1024,
+			checkpoint_bytes: 16 * 1024,
+			line_bytes: 4 * 1024 * 1024,
+			max_lines: 2,
+		};
+		let source = FakeLine::new(long_line(64 * 1024));
+		let mut index = WrapIndex::with_limits(limits);
+		let line = DocLine::ZERO;
+		scan_to_end(&mut index, KEY, line, &source);
+		let most_frames = 16 + 2;
+		for byte in [40_000usize, 15_000, 63_000, 25_000] {
+			let mut frames = 0;
+			let found = settle_cell(&mut index, &source, |index| {
+				frames += 1;
+				index.cell_for_byte(KEY, line, byte as u64, &source)
+			});
+			assert_eq!(
+				found,
+				whole_cell_for_byte(&source.bytes, byte),
+				"byte {byte}"
+			);
+			assert!(
+				frames > 3,
+				"byte {byte} settled in {frames} frames: no walk spanned frames"
+			);
+			assert!(
+				frames <= most_frames,
+				"byte {byte}: {frames} frames, so a walk restarted"
+			);
+			let col = found.col.get() + 7;
+			let mut frames = 0;
+			let found = settle_cell(&mut index, &source, |index| {
+				frames += 1;
+				index.cell_for_col(KEY, line, DocDisplayCol::new(col), &source)
+			});
+			assert_eq!(found, whole_cell_for_col(&source.bytes, col), "col {col}");
+			assert!(
+				frames <= most_frames,
+				"col {col}: {frames} frames, so a walk restarted"
+			);
+		}
+	}
+
+	/// Every lookup `index` answers for `line` equals what a fresh index says.
+	fn assert_matches_fresh(
+		index: &mut WrapIndex,
+		key: WrapKey,
+		line: DocLine,
+		source: &FakeLine,
+		label: &str,
+	) {
+		let mut fresh = WrapIndex::with_limits(index.limits);
+		let width = crate::core::text::display_width(&source.bytes, 0, TAB_SIZE);
+		let mut rng = XorShift(source.bytes.len() as u64 | 1);
+		for _ in 0..40 {
+			let byte = rng.below(source.bytes.len() + 2) as u64;
+			let col = rng.below(width as usize + 2) as u64;
+			let ours = settle_cell(index, source, |index| {
+				index.cell_for_byte(key, line, byte, source)
+			});
+			let theirs = settle_cell(&mut fresh, source, |index| {
+				index.cell_for_byte(key, line, byte, source)
+			});
+			assert_eq!(ours, theirs, "{label}: byte {byte}");
+			let ours = settle_cell(index, source, |index| {
+				index.cell_for_col(key, line, DocDisplayCol::new(col), source)
+			});
+			let theirs = settle_cell(&mut fresh, source, |index| {
+				index.cell_for_col(key, line, DocDisplayCol::new(col), source)
+			});
+			assert_eq!(ours, theirs, "{label}: col {col}");
+			let row = rng.below(40) as u64;
+			assert_eq!(
+				settle(index, key, line, row, source),
+				settle(&mut fresh, key, line, row, source),
+				"{label}: row {row}"
+			);
+		}
+		assert_eq!(
+			scan_to_end(index, key, line, source),
+			scan_to_end(&mut fresh, key, line, source),
+			"{label}: row count"
+		);
+	}
+
+	#[test]
+	fn an_edit_within_a_line_carries_the_index_over() {
+		let before = long_line(96 * 1024);
+		let limits = tight_limits();
+		let line = DocLine::new(2);
+		let next = WrapKey {
+			state: StateId::new(2),
+			topology: TopologyRev::new(2),
+			..KEY
+		};
+		let checkpoint = limits.checkpoint_bytes as usize;
+		let at_checkpoints = [checkpoint, 3 * checkpoint, 5 * checkpoint];
+		let offsets = [0, 1, 777, 20_000, 47_000, before.len()]
+			.into_iter()
+			.chain(at_checkpoints)
+			.chain(at_checkpoints.map(|at| at - 1))
+			.chain(at_checkpoints.map(|at| at + 1));
+		for offset in offsets {
+			for insert in [true, false] {
+				let source = FakeLine::new(before.clone());
+				let mut index = WrapIndex::with_limits(limits);
+				scan_to_end(&mut index, KEY, line, &source);
+				// Leave a replay and a cell walk under way past the edit: neither
+				// may survive it.
+				settle(&mut index, KEY, line, 1_000, &source);
+				settle_cell(&mut index, &source, |index| {
+					index.cell_for_byte(KEY, line, 40_000, &source)
+				});
+				let mut after = before.clone();
+				if insert {
+					after.splice(offset..offset, "日\t x".bytes());
+				} else if offset < after.len() {
+					after.drain(offset..(offset + 5).min(after.len()));
+				}
+				index.carry_over(
+					(KEY.state, KEY.topology),
+					(next.state, next.topology),
+					Some(LineEdit {
+						line,
+						offset: offset as u64,
+					}),
+				);
+				let edited = FakeLine::new(after);
+				let label = format!("{} at {offset}", if insert { "insert" } else { "delete" });
+				// Lookups past where the stale replay and walk stopped (each runs
+				// on to the end of its feed chunk): they would resume either one
+				// that survived. The row is scanned past first, and long enough
+				// ago to have left the recent rows, so only a replay answers it.
+				let mut fresh = WrapIndex::with_limits(limits);
+				scan_to_end(&mut index, next, line, &edited);
+				scan_to_end(&mut fresh, next, line, &edited);
+				assert_eq!(
+					settle(&mut index, next, line, 2_500, &edited),
+					settle(&mut fresh, next, line, 2_500, &edited),
+					"{label}: past the replay"
+				);
+				assert_eq!(
+					settle_cell(&mut index, &edited, |index| {
+						index.cell_for_byte(next, line, 46_500, &edited)
+					}),
+					settle_cell(&mut fresh, &edited, |index| {
+						index.cell_for_byte(next, line, 46_500, &edited)
+					}),
+					"{label}: past the walk"
+				);
+				assert_matches_fresh(
+					&mut index,
+					next,
+					line,
+					&edited,
+					&format!("{} at {offset}", if insert { "insert" } else { "delete" }),
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn an_edit_keeps_what_was_learned_before_it_and_other_lines() {
+		let source = FakeLine::new(long_line(48 * 1024));
+		let mut index = WrapIndex::with_limits(tight_limits());
+		let next = WrapKey {
+			state: StateId::new(2),
+			topology: TopologyRev::new(2),
+			..KEY
+		};
+		scan_to_end(&mut index, KEY, DocLine::ZERO, &source);
+		scan_to_end(&mut index, KEY, DocLine::new(1), &source);
+		index.carry_over(
+			(KEY.state, KEY.topology),
+			(next.state, next.topology),
+			Some(LineEdit {
+				line: DocLine::new(1),
+				offset: 30_000,
+			}),
+		);
+		// The untouched line is still fully scanned; the edited one resumes
+		// from a checkpoint before the edit, not from its start.
+		assert_eq!(
+			index.fed_bytes(DocLine::ZERO, KEY.text_width),
+			Some(0),
+			"finished scan"
+		);
+		assert!(matches!(
+			index.row_count(next, DocLine::ZERO, &source),
+			RowCount::Exact(_)
+		));
+		let resumed = index
+			.fed_bytes(DocLine::new(1), KEY.text_width)
+			.expect("the edited line is kept");
+		assert!(resumed > 0 && resumed <= 30_000, "resumes at {resumed}");
+	}
+
+	#[test]
+	fn a_newline_edit_a_stale_key_or_no_edit_starts_over() {
+		let source = FakeLine::new(long_line(8 * 1024));
+		let next = (StateId::new(2), TopologyRev::new(2));
+		let edit = Some(LineEdit {
+			line: DocLine::ZERO,
+			offset: 10,
+		});
+		for (from, edit) in [
+			((KEY.state, KEY.topology), None),
+			((StateId::new(9), KEY.topology), edit),
+		] {
+			let mut index = WrapIndex::with_limits(tight_limits());
+			scan_to_end(&mut index, KEY, DocLine::ZERO, &source);
+			index.carry_over(from, next, edit);
+			assert_eq!(index.fed_bytes(DocLine::ZERO, KEY.text_width), None);
+		}
 	}
 }
