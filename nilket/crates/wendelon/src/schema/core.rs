@@ -1905,6 +1905,9 @@ pub mod record_class {
 	/// A counter commit-marker frame ([`super::CounterCommitFrame`]) naming the
 	/// tentative op-id (offset) that is now committed.
 	pub const COUNTER_COMMIT: u32 = 2;
+	/// Origin-bearing counter frames; legacy classes remain read-only.
+	pub const COUNTER_TENTATIVE_V2: u32 = 3;
+	pub const COUNTER_COMMIT_V2: u32 = 4;
 }
 
 /// ADR 075 counter tentative-value frame: the durable little-endian `u64`

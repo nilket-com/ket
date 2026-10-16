@@ -115,10 +115,11 @@ impl ScopeAdapter for Fixture {
 			.unwrap();
 	}
 	async fn read(&self, s: Scope, key: &[u8]) -> Option<u64> {
-		self.service
-			.read_committed(tenant(s.tenant), identity(key))
-			.await
-			.unwrap()
+		// Raw pending-identity evidence, deliberately separate from committed visibility.
+		match self.slab.counter_lookup(tenant(s.tenant), identity(key)) {
+			Some(location) => Some(self.slab.counter_read_value(location).await.unwrap()),
+			None => None,
+		}
 	}
 }
 #[tokio::test]
@@ -219,7 +220,14 @@ async fn b1d_pending_live_identical_retry_and_key_value_hlc_conflicts_are_atomic
 		assert_eq!(f.slab.local_l1_bytes().await, before);
 		assert_eq!(f.slab.counter_lookup(tenant(7), key), Some(location));
 		assert_eq!(s.pending_count(), 1);
-		assert_eq!(s.read_committed(tenant(7), key).await.unwrap(), Some(11));
+		assert_eq!(s.read_committed(tenant(7), key).await.unwrap(), None);
+		assert_eq!(
+			f.slab
+				.counter_read_value(f.slab.counter_lookup(tenant(7), key).unwrap())
+				.await
+				.unwrap(),
+			11
+		);
 	}
 	assert_eq!(
 		s.read_committed(tenant(7), identity(b"other"))
@@ -551,7 +559,15 @@ async fn b1d_real_local_remote_enum_and_witness_redrive_carry_counter_key() {
 			.read_committed(tenant(7), original)
 			.await
 			.unwrap(),
-		Some(99)
+		None
+	);
+	assert_eq!(
+		local
+			.slab
+			.counter_read_value(local.slab.counter_lookup(tenant(7), original).unwrap())
+			.await
+			.unwrap(),
+		99
 	);
 	let resolver =
 		StaticCounterParticipantResolver::new(vec![(node(1), lp), (node(2), rp.clone())]);
@@ -606,7 +622,15 @@ async fn b1d_real_local_remote_enum_and_witness_redrive_carry_counter_key() {
 			.read_committed(tenant(7), original)
 			.await
 			.unwrap(),
-		Some(44)
+		None
+	);
+	assert_eq!(
+		remote
+			.slab
+			.counter_read_value(remote.slab.counter_lookup(tenant(7), original).unwrap())
+			.await
+			.unwrap(),
+		44
 	);
 }
 #[tokio::test]
@@ -752,3 +776,6 @@ async fn b1d_queued_tentative_and_commit_serialize_while_other_scope_completes()
 		Some(22)
 	);
 }
+
+#[path = "visibility_tests.rs"]
+mod visibility_tests;

@@ -329,9 +329,9 @@ impl WendelonDataServer {
 					CounterLeaderError::NotLeader => WriteStatus::NOT_LEADER,
 					CounterLeaderError::ZeroDelta => WriteStatus::COUNTER_ZERO_DELTA,
 					CounterLeaderError::Overflow => WriteStatus::COUNTER_OVERFLOW,
-					CounterLeaderError::QuorumFailed | CounterLeaderError::Internal => {
-						WriteStatus::INTERNAL_ERROR
-					}
+					CounterLeaderError::QuorumFailed
+					| CounterLeaderError::Internal
+					| CounterLeaderError::Visibility(_) => WriteStatus::INTERNAL_ERROR,
 				};
 				self.counter_add_response(&meta, status, 0, 0, Self::zero_counter_hlc())
 			}
@@ -370,11 +370,26 @@ impl WendelonDataServer {
 		// after a restart: a crash between the durable witness and the commit
 		// marker leaves the committed-by-contract value invisible until the
 		// reconciler re-drives the marker — which leader recovery runs.
-		let _ = self.counter_leader_for(meta.tenant_id).await?;
-		let value = self
-			.counter_replica
-			.read_committed(meta.tenant_id, meta.key_identity)
-			.await?;
+		let leader = self.counter_leader_for(meta.tenant_id).await?;
+		let owner = self
+			.router
+			.replicas_for_locality(Locality::from(meta.key_identity))
+			.first()
+			.copied()
+			.ok_or_else(|| Error::other("counter owner unavailable"))?;
+		let value = if owner.id == self.local_node.id {
+			leader
+				.read_identity(meta.key_identity)
+				.await
+				.map_err(|error| match error {
+					crate::storage::counter::CounterLeaderError::Visibility(error) => error.io(),
+					_ => Error::other("counter read failed"),
+				})?
+		} else {
+			self.counter_replica
+				.read_committed(meta.tenant_id, meta.key_identity)
+				.await?
+		};
 		let resp = match value {
 			Some(v) => self.counter_read_response(ReadStatus::OK, v, current_epoch),
 			None => self.counter_read_response(ReadStatus::KEY_NOT_FOUND, 0, current_epoch),

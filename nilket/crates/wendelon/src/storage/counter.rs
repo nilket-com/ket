@@ -23,6 +23,10 @@
 //! out to peers over the cut-2 counter-replicate frame and awaits quorum); this core
 //! holds the per-key lock across that await and commits or rolls back accordingly.
 
+pub(crate) mod visibility;
+pub use visibility::{CounterVersion, CounterVisibilityError};
+use visibility::{EligibleCells, winner};
+
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -280,8 +284,8 @@ impl<B: CounterBackend> CounterCore<B> {
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::schema::{
-	CounterCommitFrame, CounterReplicaPhase, CounterTentativeFrame, HybridTimestamp, Identity,
-	NodeId, TenantId, record_class,
+	CounterReplicaPhase, CounterTentativeFrame, HybridTimestamp, Identity, NodeId, TenantId,
+	record_class,
 };
 use crate::storage::StorageEngine;
 use crate::storage::core::{LocalSlabStore, RecordLocation};
@@ -329,6 +333,7 @@ pub trait CounterSlab {
 		key_identity: Identity,
 		hlc: HybridTimestamp,
 		value: u64,
+		origin: NodeId,
 	) -> impl std::future::Future<Output = std::io::Result<RecordLocation>> + Send;
 	/// Append a durable commit marker for `tentative_op_id` (not a version, not
 	/// indexed) and make it durable.
@@ -338,6 +343,7 @@ pub trait CounterSlab {
 		key_identity: Identity,
 		hlc: HybridTimestamp,
 		tentative_op_id: u64,
+		origin: NodeId,
 	) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
 	/// Remove a tentative version from the live index (rollback; recovery skips
 	/// the orphan).
@@ -357,6 +363,48 @@ pub trait CounterSlab {
 	) -> impl std::future::Future<Output = std::io::Result<u64>> + Send;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CounterFormatError {
+	InvalidOriginFrame,
+	MaintenanceUnsupported,
+}
+impl std::fmt::Display for CounterFormatError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "counter format {self:?}")
+	}
+}
+impl std::error::Error for CounterFormatError {}
+impl CounterFormatError {
+	pub(crate) fn io(self) -> std::io::Error {
+		std::io::Error::new(std::io::ErrorKind::InvalidData, self)
+	}
+}
+pub(crate) fn encode_origin_frame(value: u64, origin: NodeId) -> std::io::Result<[u8; 16]> {
+	if origin.id == 0 || origin._reserved != 0 {
+		return Err(CounterFormatError::InvalidOriginFrame.io());
+	}
+	let mut bytes = [0; 16];
+	bytes[..8].copy_from_slice(&value.to_le_bytes());
+	bytes[8..12].copy_from_slice(&origin.id.to_le_bytes());
+	Ok(bytes)
+}
+pub(crate) fn decode_origin_frame(bytes: &[u8]) -> std::io::Result<(u64, NodeId)> {
+	if bytes.len() != 16 || bytes[12..16] != [0; 4] {
+		return Err(CounterFormatError::InvalidOriginFrame.io());
+	}
+	let origin = u32::from_le_bytes(bytes[8..12].try_into().expect("fixed origin"));
+	if origin == 0 {
+		return Err(CounterFormatError::InvalidOriginFrame.io());
+	}
+	Ok((
+		u64::from_le_bytes(bytes[..8].try_into().expect("fixed value")),
+		NodeId {
+			id: origin,
+			_reserved: 0,
+		},
+	))
+}
+
 fn parse_counter_value(frame: &[u8]) -> std::io::Result<u64> {
 	if frame.len() < std::mem::size_of::<CounterTentativeFrame>() {
 		return Err(std::io::Error::new(
@@ -374,15 +422,16 @@ impl CounterSlab for LocalSlabStore {
 		key_identity: Identity,
 		hlc: HybridTimestamp,
 		value: u64,
+		origin: NodeId,
 	) -> std::io::Result<RecordLocation> {
-		let frame = CounterTentativeFrame { value };
+		let frame = encode_origin_frame(value, origin)?;
 		let location = self
 			.write_framed(
 				tenant_id,
 				key_identity,
 				hlc,
-				record_class::COUNTER_TENTATIVE,
-				bytemuck::bytes_of(&frame),
+				record_class::COUNTER_TENTATIVE_V2,
+				&frame,
 			)
 			.await?;
 		self.index_location(tenant_id, key_identity, location);
@@ -394,14 +443,15 @@ impl CounterSlab for LocalSlabStore {
 		key_identity: Identity,
 		hlc: HybridTimestamp,
 		tentative_op_id: u64,
+		origin: NodeId,
 	) -> std::io::Result<()> {
-		let marker = CounterCommitFrame { tentative_op_id };
+		let marker = encode_origin_frame(tentative_op_id, origin)?;
 		self.write_framed(
 			tenant_id,
 			key_identity,
 			hlc,
-			record_class::COUNTER_COMMIT,
-			bytemuck::bytes_of(&marker),
+			record_class::COUNTER_COMMIT_V2,
+			&marker,
 		)
 		.await?;
 		self.wait_durable_commit().await?;
@@ -434,8 +484,9 @@ impl CounterSlab for crate::storage::manager::SlabManager {
 		key_identity: Identity,
 		hlc: HybridTimestamp,
 		value: u64,
+		origin: NodeId,
 	) -> std::io::Result<RecordLocation> {
-		self.counter_append_tentative(tenant_id, key_identity, hlc, value)
+		self.counter_append_tentative(tenant_id, key_identity, hlc, value, origin)
 			.await
 	}
 	async fn counter_commit_marker(
@@ -444,8 +495,9 @@ impl CounterSlab for crate::storage::manager::SlabManager {
 		key_identity: Identity,
 		hlc: HybridTimestamp,
 		tentative_op_id: u64,
+		origin: NodeId,
 	) -> std::io::Result<()> {
-		self.counter_append_commit_marker(tenant_id, key_identity, hlc, tentative_op_id)
+		self.counter_append_commit_marker(tenant_id, key_identity, hlc, tentative_op_id, origin)
 			.await
 	}
 	fn counter_unindex(
@@ -473,6 +525,7 @@ impl CounterSlab for crate::storage::manager::SlabManager {
 /// identical for both — only the slab primitives differ.
 pub struct SlabCounterStore<S> {
 	slab: Arc<S>,
+	origin: NodeId,
 	tenant_id: TenantId,
 	/// Test seam: when armed, the next `commit_tentative` models a failed durable
 	/// marker write (no marker frame reaches the slab — the on-disk state is
@@ -482,9 +535,10 @@ pub struct SlabCounterStore<S> {
 }
 
 impl<S: CounterSlab> SlabCounterStore<S> {
-	pub fn new(slab: Arc<S>, tenant_id: TenantId) -> Self {
+	pub fn new(slab: Arc<S>, tenant_id: TenantId, origin: NodeId) -> Self {
 		Self {
 			slab,
+			origin,
 			tenant_id,
 			#[cfg(test)]
 			fail_next_commit_marker: std::sync::atomic::AtomicBool::new(false),
@@ -515,7 +569,7 @@ impl<S: CounterSlab> SlabCounterStore<S> {
 		let identity = counter_identity(key);
 		let location = self
 			.slab
-			.counter_tentative(self.tenant_id, identity, hlc, value)
+			.counter_tentative(self.tenant_id, identity, hlc, value, self.origin)
 			.await?;
 		Ok(SlabTentative {
 			key_identity: identity,
@@ -543,7 +597,13 @@ impl<S: CounterSlab> SlabCounterStore<S> {
 		// slab needs no clock of its own (HLC is caller-owned). `counter_commit_marker`
 		// makes it durable.
 		self.slab
-			.counter_commit_marker(self.tenant_id, t.key_identity, t.location.hlc, t.op_id())
+			.counter_commit_marker(
+				self.tenant_id,
+				t.key_identity,
+				t.location.hlc,
+				t.op_id(),
+				self.origin,
+			)
 			.await
 	}
 
@@ -705,7 +765,7 @@ struct ReplicaOpKey2 {
 }
 impl ReplicaOpKey2 {
 	fn new(origin: NodeId, tenant: TenantId, op_id: u64) -> std::io::Result<Self> {
-		if origin._reserved != 0 {
+		if origin.id == 0 || origin._reserved != 0 {
 			return Err(std::io::Error::new(
 				std::io::ErrorKind::InvalidInput,
 				"counter origin has reserved bits",
@@ -762,12 +822,14 @@ struct PendingReplicaTentative {
 /// The server-side counter replica over a [`SlabManager`].
 pub struct CounterReplicaService {
 	slab: Arc<crate::storage::manager::SlabManager>,
+	marked: Arc<EligibleCells<(TenantId, Identity)>>,
 	pending: DashMap<ReplicaOpKey2, PendingReplicaTentative>,
 	op_locks: DashMap<ReplicaOpKey2, Arc<Mutex<()>>>,
 }
 impl CounterReplicaService {
 	pub fn new(slab: Arc<crate::storage::manager::SlabManager>) -> Self {
 		Self {
+			marked: slab.counter_eligible_cells(),
 			slab,
 			pending: DashMap::new(),
 			op_locks: DashMap::new(),
@@ -794,6 +856,15 @@ impl CounterReplicaService {
 		commit_hlc: HybridTimestamp,
 	) -> std::io::Result<()> {
 		let key = ReplicaOpKey2::new(origin, tenant_id, op_id)?;
+		// Scope validation precedes the production-only canonical producer binding.
+		if commit_hlc
+			!= (HybridTimestamp {
+				physical_ms: op_id,
+				logical: 0,
+				node_id: 0,
+			}) {
+			return Err(CounterReplicaRejection::TentativeConflict.into_error());
+		}
 		let gate = self.op_locks.entry(key).or_default().clone();
 		let _guard = gate.lock().await;
 		if let Some(pending) = self.pending.get(&key).map(|entry| *entry.value()) {
@@ -805,9 +876,21 @@ impl CounterReplicaService {
 				Err(CounterReplicaRejection::TentativeConflict.into_error())
 			};
 		}
+		// Reserve known-origin collision metadata only; this never publishes a value.
+		let _reservation = self
+			.marked
+			.prepare(
+				&(tenant_id, key_identity),
+				CounterVersion {
+					value,
+					hlc: commit_hlc,
+					origin: Some(origin),
+				},
+			)
+			.map_err(CounterVisibilityError::io)?;
 		let result = match self
 			.slab
-			.counter_append_tentative(tenant_id, key_identity, commit_hlc, value)
+			.counter_append_tentative(tenant_id, key_identity, commit_hlc, value, origin)
 			.await
 		{
 			Ok(location) => {
@@ -846,14 +929,27 @@ impl CounterReplicaService {
 		if pending.tenant_id != tenant_id || pending.key_identity != expected_key {
 			return Err(CounterReplicaRejection::TentativeConflict.into_error());
 		}
+		let reservation = self
+			.marked
+			.prepare(
+				&(tenant_id, expected_key),
+				CounterVersion {
+					value: pending.value,
+					hlc: pending.location.hlc,
+					origin: Some(origin),
+				},
+			)
+			.map_err(CounterVisibilityError::io)?;
 		self.slab
 			.counter_append_commit_marker(
 				pending.tenant_id,
 				pending.key_identity,
 				pending.location.hlc,
 				pending.location.offset,
+				origin,
 			)
 			.await?;
+		reservation.publish().map_err(CounterVisibilityError::io)?;
 		self.pending.remove(&key);
 		self.reclaim_gate2(key, &gate);
 		Ok(())
@@ -886,16 +982,43 @@ impl CounterReplicaService {
 		self.reclaim_gate2(key, &gate);
 		Ok(())
 	}
-	/// Existing live-index read semantics; committed-only crash consistency is a separate slice.
+	/// Only marker-eligible values; raw tentative lookup remains a distinct storage API.
 	pub async fn read_committed(
 		&self,
 		tenant_id: TenantId,
 		key_identity: Identity,
 	) -> std::io::Result<Option<u64>> {
-		match self.slab.counter_lookup(tenant_id, key_identity) {
-			Some(location) => Ok(Some(self.slab.counter_read_value(location).await?)),
-			None => Ok(None),
+		Ok(self
+			.read_eligible(tenant_id, key_identity)
+			.await?
+			.map(|v| v.value))
+	}
+	pub(crate) async fn read_eligible(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+	) -> std::io::Result<Option<CounterVersion>> {
+		if !self
+			.slab
+			.counter_eligible_supported(tenant_id, key_identity)
+			.await?
+		{
+			return Err(CounterVisibilityError::Unsupported.io());
 		}
+		self.marked
+			.read(&(tenant_id, key_identity))
+			.map_err(CounterVisibilityError::io)
+	}
+	/// Test-only deterministic remote pause; no production request or authority seam.
+	#[cfg(test)]
+	pub(crate) fn ctr4_pause_operation(
+		&self,
+		origin: NodeId,
+		tenant: TenantId,
+		op: u64,
+	) -> Arc<Mutex<()>> {
+		let key = ReplicaOpKey2::new(origin, tenant, op).expect("fixture scope");
+		self.op_locks.entry(key).or_default().clone()
 	}
 	#[cfg(test)]
 	pub(crate) fn pending_count(&self) -> usize {
@@ -943,13 +1066,13 @@ impl CounterParticipant for LocalCounterParticipant {
 				commit_hlc,
 			)
 			.await
-			.map_err(|_| ParticipantError::Unavailable)
+			.map_err(ParticipantError::from_io)
 	}
 	async fn commit(&self, op_id: u64, key: &CounterKey) -> Result<(), ParticipantError> {
 		self.service
 			.commit(self.origin, op_id, self.tenant_id, counter_identity(key))
 			.await
-			.map_err(|_| ParticipantError::Unavailable)
+			.map_err(ParticipantError::from_io)
 	}
 	async fn rollback(&self, op_id: u64, key: &CounterKey) {
 		let _ = self
@@ -957,11 +1080,26 @@ impl CounterParticipant for LocalCounterParticipant {
 			.rollback(self.origin, op_id, self.tenant_id, counter_identity(key))
 			.await;
 	}
+	fn eligibility_status(&self, identity: Identity) -> Result<(), CounterVisibilityError> {
+		self.service
+			.marked
+			.read(&(self.tenant_id, identity))
+			.map(|_| ())
+	}
+	async fn read_eligible(
+		&self,
+		identity: Identity,
+	) -> Result<Option<CounterVersion>, ParticipantError> {
+		self.service
+			.read_eligible(self.tenant_id, identity)
+			.await
+			.map_err(ParticipantError::from_io)
+	}
 	async fn read_committed(&self, key: &CounterKey) -> Result<Option<u64>, ParticipantError> {
 		self.service
 			.read_committed(self.tenant_id, counter_identity(key))
 			.await
-			.map_err(|_| ParticipantError::Unavailable)
+			.map_err(ParticipantError::from_io)
 	}
 }
 
@@ -1080,6 +1218,15 @@ impl CounterParticipant for RemoteCounterParticipant {
 			)
 			.await;
 	}
+	fn eligibility_status(&self, _identity: Identity) -> Result<(), CounterVisibilityError> {
+		Err(CounterVisibilityError::Unsupported)
+	}
+	async fn read_eligible(
+		&self,
+		_identity: Identity,
+	) -> Result<Option<CounterVersion>, ParticipantError> {
+		Err(ParticipantError::Unavailable)
+	}
 	async fn read_committed(&self, _key: &CounterKey) -> Result<Option<u64>, ParticipantError> {
 		// The leader reads the committed base ONLY from its explicit local arm; a
 		// remote replica is never asked for it.
@@ -1124,6 +1271,21 @@ impl CounterParticipant for CounterParticipantKind {
 		match self {
 			Self::Local(p) => p.rollback(op_id, key).await,
 			Self::Remote(p) => p.rollback(op_id, key).await,
+		}
+	}
+	fn eligibility_status(&self, identity: Identity) -> Result<(), CounterVisibilityError> {
+		match self {
+			Self::Local(p) => p.eligibility_status(identity),
+			Self::Remote(p) => p.eligibility_status(identity),
+		}
+	}
+	async fn read_eligible(
+		&self,
+		identity: Identity,
+	) -> Result<Option<CounterVersion>, ParticipantError> {
+		match self {
+			Self::Local(p) => p.read_eligible(identity).await,
+			Self::Remote(p) => p.read_eligible(identity).await,
 		}
 	}
 	async fn read_committed(&self, key: &CounterKey) -> Result<Option<u64>, ParticipantError> {
@@ -1177,6 +1339,25 @@ use std::path::PathBuf;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParticipantError {
 	Unavailable,
+	Visibility(CounterVisibilityError),
+}
+
+impl ParticipantError {
+	fn from_io(error: std::io::Error) -> Self {
+		match error
+			.get_ref()
+			.and_then(|e| e.downcast_ref::<CounterVisibilityError>())
+		{
+			Some(error) => Self::Visibility(*error),
+			None => Self::Unavailable,
+		}
+	}
+	fn leader(self) -> CounterLeaderError {
+		match self {
+			Self::Visibility(error) => CounterLeaderError::Visibility(error),
+			Self::Unavailable => CounterLeaderError::Internal,
+		}
+	}
 }
 
 /// One participant in a counter add's fan-out: the local primary store or a
@@ -1204,6 +1385,11 @@ pub trait CounterParticipant {
 		op_id: u64,
 		key: &CounterKey,
 	) -> impl std::future::Future<Output = ()> + Send;
+	fn eligibility_status(&self, identity: Identity) -> Result<(), CounterVisibilityError>;
+	fn read_eligible(
+		&self,
+		identity: Identity,
+	) -> impl std::future::Future<Output = Result<Option<CounterVersion>, ParticipantError>> + Send;
 	/// Latest committed value (used by the leader to read the local base).
 	fn read_committed(
 		&self,
@@ -1283,6 +1469,7 @@ impl<P: CounterParticipant + Clone> CounterParticipantResolver<P>
 /// recoverable-pending partial commit) carries the [`CounterAddOutcome`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CounterLeaderError {
+	Visibility(CounterVisibilityError),
 	/// This node is not the key's primary — the caller must redirect.
 	NotLeader,
 	/// `delta == 0` (D5).
@@ -1324,6 +1511,9 @@ struct CounterFinalizationWitness {
 	committed: HashSet<NodeId>,
 }
 
+mod witness;
+use witness::StoredWitness;
+
 /// The durable D4 dedup record a resolved witness compacts into: enough to
 /// replay the original outcome for a duplicate `CounterWriteKey` — plus the
 /// op's id, so recovery seeds the op-id allocator past EVERY resolved op, not
@@ -1360,33 +1550,76 @@ impl DurableCounterWitnessStore {
 		self.dir.join(format!("counter-witness-{op_id:016x}.pw"))
 	}
 
-	fn write(&self, witness: &CounterFinalizationWitness) -> std::io::Result<()> {
-		let bytes = postcard::to_allocvec(witness)
-			.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+	fn origin_path_for(&self, op_id: u64) -> PathBuf {
+		self.dir.join(format!("counter-witness-{op_id:016x}.pw2"))
+	}
+	fn write(&self, witness: &StoredWitness) -> std::io::Result<()> {
+		let (path, other, bytes) = match witness.origin {
+			Some(_) => (
+				self.origin_path_for(witness.op_id),
+				self.path_for(witness.op_id),
+				witness::encode(witness)?,
+			),
+			None => (
+				self.path_for(witness.op_id),
+				self.origin_path_for(witness.op_id),
+				postcard::to_allocvec(&witness.body)
+					.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+			),
+		};
+		if other.try_exists()? {
+			return Err(CounterVisibilityError::Conflict.io());
+		}
 		let tmp = self.dir.join(format!(".tmp-{:016x}", witness.op_id));
 		std::fs::write(&tmp, &bytes)?;
-		std::fs::rename(&tmp, self.path_for(witness.op_id))?;
+		std::fs::rename(&tmp, path)?;
 		Ok(())
 	}
 
 	fn remove(&self, op_id: u64) -> std::io::Result<()> {
-		match std::fs::remove_file(self.path_for(op_id)) {
-			Ok(()) => Ok(()),
-			Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-			Err(e) => Err(e),
+		let old = self.path_for(op_id);
+		let new = self.origin_path_for(op_id);
+		if old.try_exists()? && new.try_exists()? {
+			return Err(CounterVisibilityError::Conflict.io());
 		}
+		for path in [old, new] {
+			match std::fs::remove_file(path) {
+				Ok(()) => (),
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+				Err(e) => return Err(e),
+			}
+		}
+		Ok(())
 	}
 
-	fn load_all(&self) -> std::io::Result<Vec<CounterFinalizationWitness>> {
+	fn load_all(&self) -> std::io::Result<Vec<StoredWitness>> {
 		let mut out = Vec::new();
+		let mut seen = HashSet::new();
 		for entry in std::fs::read_dir(&self.dir)? {
 			let path = entry?.path();
-			if path.extension().and_then(|s| s.to_str()) == Some("pw") {
-				let bytes = std::fs::read(&path)?;
-				let witness = postcard::from_bytes::<CounterFinalizationWitness>(&bytes)
-					.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-				out.push(witness);
+			let extension = path.extension().and_then(|s| s.to_str());
+			if !matches!(extension, Some("pw" | "pw2")) {
+				continue;
 			}
+			let bytes = std::fs::read(&path)?;
+			let w = if extension == Some("pw2") {
+				witness::decode(&bytes)?
+			} else {
+				StoredWitness {
+					origin: None,
+					body: postcard::from_bytes::<CounterFinalizationWitness>(&bytes)
+						.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+				}
+			};
+			let expected = if w.origin.is_some() {
+				self.origin_path_for(w.op_id)
+			} else {
+				self.path_for(w.op_id)
+			};
+			if path != expected || !seen.insert(w.op_id) {
+				return Err(CounterVisibilityError::Conflict.io());
+			}
+			out.push(w);
 		}
 		Ok(out)
 	}
@@ -1448,6 +1681,7 @@ impl DurableCounterWitnessStore {
 /// participant set for a fresh add is supplied per operation from the current
 /// ring, while reconciliation resolves the identities recorded in each witness.
 pub struct CounterLeader<P> {
+	witnessed: EligibleCells<Identity>,
 	local_id: NodeId,
 	local: P,
 	/// Primary-only gate. A non-primary redirects rather than replaying.
@@ -1460,7 +1694,7 @@ pub struct CounterLeader<P> {
 	/// log once resolved) — `recover` rebuilds it, so replay survives restart.
 	idempotency: DashMap<CounterWriteKey, CounterAddOutcome>,
 	/// In-memory mirror of the pending witnesses (durable in `witness_store`).
-	witnesses: DashMap<u64, CounterFinalizationWitness>,
+	witnesses: DashMap<u64, StoredWitness>,
 	/// Durable backing for the witnesses (survives leader restart).
 	witness_store: DurableCounterWitnessStore,
 	/// Leader-assigned op-id allocator (cross-node stable handles). `commit_hlc`
@@ -1476,6 +1710,7 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 		witness_store: DurableCounterWitnessStore,
 	) -> Self {
 		Self {
+			witnessed: EligibleCells::default(),
 			local_id,
 			local,
 			is_primary,
@@ -1518,6 +1753,17 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 			);
 		}
 		for witness in pending {
+			if witness.origin.is_some_and(|origin| origin != local_id) {
+				return Err(CounterVisibilityError::Conflict.io());
+			}
+			leader.witnessed.recover(
+				&counter_identity(&witness.key),
+				CounterVersion {
+					value: witness.value,
+					hlc: witness.commit_hlc,
+					origin: witness.origin,
+				},
+			);
 			max_op = max_op.max(witness.op_id);
 			leader.idempotency.insert(
 				witness.write_key,
@@ -1560,6 +1806,12 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 		if !self.is_primary {
 			return Err(CounterLeaderError::NotLeader);
 		}
+		self.local
+			.eligibility_status(counter_identity(key))
+			.map_err(CounterLeaderError::Visibility)?;
+		self.witnessed
+			.read(&counter_identity(key))
+			.map_err(CounterLeaderError::Visibility)?;
 		// (3) Duplicate replay BEFORE lock/mutation (mandatory).
 		if let Some(cached) = self.idempotency.get(&write_key) {
 			return Ok(CounterAddResult::Replayed(*cached.value()));
@@ -1580,10 +1832,8 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 		}
 
 		let previous = self
-			.local
-			.read_committed(key)
-			.await
-			.map_err(|_| CounterLeaderError::Internal)?
+			.read_identity(counter_identity(key))
+			.await?
 			.unwrap_or(0);
 		let current = previous
 			.checked_add(delta)
@@ -1629,6 +1879,29 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 			accepted: accepted.clone(),
 			committed: HashSet::new(),
 		};
+		let witness = StoredWitness {
+			body: witness,
+			origin: Some(self.local_id),
+		};
+		let reserved = self.witnessed.prepare(
+			&counter_identity(key),
+			CounterVersion {
+				value: current,
+				hlc: commit_hlc,
+				origin: Some(self.local_id),
+			},
+		);
+		let reservation = match reserved {
+			Ok(reservation) => reservation,
+			Err(error) => {
+				for &id in &accepted {
+					if let Some(p) = plan.get(id) {
+						p.rollback(op_id, key).await;
+					}
+				}
+				return Err(CounterLeaderError::Visibility(error));
+			}
+		};
 		if self.witness_store.write(&witness).is_err() {
 			for &id in &accepted {
 				if let Some(participant) = plan.get(id) {
@@ -1638,6 +1911,11 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 			return Err(CounterLeaderError::Internal);
 		}
 		self.witnesses.insert(op_id, witness);
+		// The entry is preallocated and same-key leader updates remain under the add mutex.
+		// Preserve the witness on any residual poison; never roll back a witnessed operation.
+		reservation
+			.publish()
+			.map_err(CounterLeaderError::Visibility)?;
 		// (4/5) Drive commit markers across the accepted set; partial failures
 		// stay pending in the durable witness for the reconciler, never rolled back.
 		let resolver = StaticCounterParticipantResolver::new(
@@ -1646,6 +1924,9 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 				.collect(),
 		);
 		self.drive_commits(op_id, &resolver).await;
+		self.witnessed
+			.read(&counter_identity(key))
+			.map_err(CounterLeaderError::Visibility)?;
 
 		// (3/4) Record the typed idempotency outcome. The value reached quorum
 		// and is either fully committed or recoverable-pending (the durable
@@ -1691,11 +1972,19 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 			let Some(participant) = resolver.resolve_recorded(i) else {
 				continue;
 			};
-			if participant
+			let outcome = match participant
 				.replicate_tentative(op_id, &key, value, commit_hlc)
 				.await
-				.is_ok() && participant.commit(op_id, &key).await.is_ok()
 			{
+				Ok(()) => participant.commit(op_id, &key).await,
+				Err(error) => Err(error),
+			};
+			if matches!(outcome, Err(ParticipantError::Visibility(_))) {
+				self.witnessed
+					.refuse(&counter_identity(&key), CounterVisibilityError::Poisoned);
+				return;
+			}
+			if outcome.is_ok() {
 				if let Some(mut witness) = self.witnesses.get_mut(&op_id) {
 					witness.committed.insert(i);
 					let _ = self.witness_store.write(&witness);
@@ -1746,10 +2035,30 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 
 	/// Point read of the committed counter from the local primary store.
 	pub async fn read(&self, key: &CounterKey) -> Result<Option<u64>, CounterLeaderError> {
-		self.local
-			.read_committed(key)
+		self.read_identity(counter_identity(key)).await
+	}
+
+	/// The caller selects current-key ownership before exposing this leader view publicly.
+	pub async fn read_identity(
+		&self,
+		identity: Identity,
+	) -> Result<Option<u64>, CounterLeaderError> {
+		let marked = self
+			.local
+			.read_eligible(identity)
 			.await
-			.map_err(|_| CounterLeaderError::Internal)
+			.map_err(ParticipantError::leader)?;
+		let witnessed = self
+			.witnessed
+			.read(&identity)
+			.map_err(CounterLeaderError::Visibility)?;
+		match winner(marked, witnessed) {
+			Ok(value) => Ok(value.map(|v| v.value)),
+			Err(error) => {
+				self.witnessed.refuse(&identity, error);
+				Err(CounterLeaderError::Visibility(error))
+			}
+		}
 	}
 
 	/// Number of unresolved counter-finalization witnesses (pending commits).
@@ -2170,7 +2479,14 @@ mod slab_store_tests {
 		let k = ckey(b"evidence");
 		{
 			let store = open_store(&path).await;
-			let counter = SlabCounterStore::new(store.clone(), tenant());
+			let counter = SlabCounterStore::new(
+				store.clone(),
+				tenant(),
+				NodeId {
+					id: 1,
+					_reserved: 0,
+				},
+			);
 			let t1 = counter.tentative_append(&k, 5, h(5)).await.unwrap();
 			counter.commit_tentative(t1).await.unwrap();
 			let t2 = counter.tentative_append(&k, 9, h(9)).await.unwrap(); // +4 -> 9
@@ -2181,7 +2497,14 @@ mod slab_store_tests {
 		// Reopen the same on-disk slab: the production recover_slab rebuilds the
 		// committed counter index.
 		let store = open_store(&path).await;
-		let counter = SlabCounterStore::new(store, tenant());
+		let counter = SlabCounterStore::new(
+			store,
+			tenant(),
+			NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+		);
 		assert_eq!(
 			counter.read_committed(&k).await.unwrap(),
 			Some(9),
@@ -2198,7 +2521,14 @@ mod slab_store_tests {
 		let k = ckey(b"evidence");
 		{
 			let store = open_store(&path).await;
-			let counter = SlabCounterStore::new(store.clone(), tenant());
+			let counter = SlabCounterStore::new(
+				store.clone(),
+				tenant(),
+				NodeId {
+					id: 1,
+					_reserved: 0,
+				},
+			);
 			let t1 = counter.tentative_append(&k, 3, h(3)).await.unwrap();
 			counter.commit_tentative(t1).await.unwrap();
 			assert_eq!(counter.read_committed(&k).await.unwrap(), Some(3));
@@ -2220,7 +2550,14 @@ mod slab_store_tests {
 			store.fsync().await.unwrap();
 		}
 		let store = open_store(&path).await;
-		let counter = SlabCounterStore::new(store, tenant());
+		let counter = SlabCounterStore::new(
+			store,
+			tenant(),
+			NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+		);
 		assert_eq!(
 			counter.read_committed(&k).await.unwrap(),
 			Some(3),
@@ -2237,7 +2574,14 @@ mod slab_store_tests {
 		let k = ckey(b"evidence");
 		{
 			let store = open_store(&path).await;
-			let counter = SlabCounterStore::new(store.clone(), tenant());
+			let counter = SlabCounterStore::new(
+				store.clone(),
+				tenant(),
+				NodeId {
+					id: 1,
+					_reserved: 0,
+				},
+			);
 			let t1 = counter.tentative_append(&k, 3, h(3)).await.unwrap();
 			counter.commit_tentative(t1).await.unwrap();
 
@@ -2261,7 +2605,14 @@ mod slab_store_tests {
 			store.fsync().await.unwrap();
 		}
 		let store = open_store(&path).await;
-		let counter = SlabCounterStore::new(store, tenant());
+		let counter = SlabCounterStore::new(
+			store,
+			tenant(),
+			NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+		);
 		assert_eq!(
 			counter.read_committed(&k).await.unwrap(),
 			Some(3),
@@ -2296,7 +2647,14 @@ mod slab_store_tests {
 				.await
 				.unwrap();
 			blob_offset = loc.offset;
-			let counter = SlabCounterStore::new(store.clone(), tenant());
+			let counter = SlabCounterStore::new(
+				store.clone(),
+				tenant(),
+				NodeId {
+					id: 1,
+					_reserved: 0,
+				},
+			);
 			let t = counter.tentative_append(&k, 42, h(42)).await.unwrap();
 			counter.commit_tentative(t).await.unwrap();
 			store.fsync().await.unwrap();
@@ -2318,7 +2676,14 @@ mod slab_store_tests {
 			.lookup(tenant(), blob_id)
 			.expect("blob must be re-indexed");
 		assert_eq!(store.read(recovered).await.unwrap(), blob_bytes);
-		let counter = SlabCounterStore::new(store, tenant());
+		let counter = SlabCounterStore::new(
+			store,
+			tenant(),
+			NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+		);
 		assert_eq!(counter.read_committed(&k).await.unwrap(), Some(42));
 	}
 }
@@ -2372,7 +2737,14 @@ mod replica_tests {
 	}
 
 	fn replica(store: Arc<LocalSlabStore>) -> CounterReplica<LocalSlabStore> {
-		CounterReplica::new(SlabCounterStore::new(store, TenantId::new(7)))
+		CounterReplica::new(SlabCounterStore::new(
+			store,
+			TenantId::new(7),
+			NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+		))
 	}
 
 	fn ckey(b: &[u8]) -> CounterKey {
@@ -2408,13 +2780,14 @@ mod replica_tests {
 			key_identity: Identity,
 			hlc: HybridTimestamp,
 			value: u64,
+			origin: NodeId,
 		) -> std::io::Result<RecordLocation> {
 			// Yield so a concurrent racer reaches the `pending` check before this
 			// append completes — without the per-op_id gate both would append.
 			tokio::task::yield_now().await;
 			self.tentative_appends.fetch_add(1, Ordering::Relaxed);
 			self.inner
-				.counter_tentative(tenant_id, key_identity, hlc, value)
+				.counter_tentative(tenant_id, key_identity, hlc, value, origin)
 				.await
 		}
 		async fn counter_commit_marker(
@@ -2423,9 +2796,10 @@ mod replica_tests {
 			key_identity: Identity,
 			hlc: HybridTimestamp,
 			tentative_op_id: u64,
+			origin: NodeId,
 		) -> std::io::Result<()> {
 			self.inner
-				.counter_commit_marker(tenant_id, key_identity, hlc, tentative_op_id)
+				.counter_commit_marker(tenant_id, key_identity, hlc, tentative_op_id, origin)
 				.await
 		}
 		fn counter_unindex(
@@ -2466,6 +2840,10 @@ mod replica_tests {
 		let r = Arc::new(CounterReplica::new(SlabCounterStore::new(
 			counting.clone(),
 			TenantId::new(7),
+			NodeId {
+				id: 1,
+				_reserved: 0,
+			},
 		)));
 
 		let (ra, rb) = (r.clone(), r.clone());
@@ -2681,6 +3059,10 @@ mod leader_tests {
 				replica: Arc::new(CounterReplica::new(SlabCounterStore::new(
 					store,
 					TenantId::new(7),
+					NodeId {
+						id: 1,
+						_reserved: 0,
+					},
 				))),
 				fail_tentative: Arc::new(AtomicBool::new(false)),
 			}
@@ -2719,6 +3101,28 @@ mod leader_tests {
 		}
 		async fn rollback(&self, op_id: u64, _key: &CounterKey) {
 			self.replica.rollback(op_id);
+		}
+		fn eligibility_status(&self, _identity: Identity) -> Result<(), CounterVisibilityError> {
+			Ok(())
+		}
+		async fn read_eligible(
+			&self,
+			identity: Identity,
+		) -> Result<Option<CounterVersion>, ParticipantError> {
+			// Historical local-slab harness: raw substrate visibility remains unchanged.
+			let slab = &self.replica.store.slab;
+			let Some(location) = slab.counter_lookup(TenantId::new(7), identity) else {
+				return Ok(None);
+			};
+			let value = slab
+				.counter_read_value(location)
+				.await
+				.map_err(ParticipantError::from_io)?;
+			Ok(Some(CounterVersion {
+				value,
+				hlc: location.hlc,
+				origin: None,
+			}))
 		}
 		async fn read_committed(&self, key: &CounterKey) -> Result<Option<u64>, ParticipantError> {
 			self.replica
@@ -2831,10 +3235,17 @@ mod leader_tests {
 	/// Re-open a participant's slab and read its committed value (durability).
 	async fn read_after_restart(path: &Path, key: &CounterKey) -> Option<u64> {
 		let store = open_store(path).await;
-		SlabCounterStore::new(store, TenantId::new(7))
-			.read_committed(key)
-			.await
-			.unwrap()
+		SlabCounterStore::new(
+			store,
+			TenantId::new(7),
+			NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+		)
+		.read_committed(key)
+		.await
+		.unwrap()
 	}
 
 	/// Build `n` participants over fresh slabs; returns the leader-ready vec and
@@ -3070,7 +3481,14 @@ mod leader_tests {
 			// The leader sent a tentative; remote A accepted it; the leader then
 			// died before reaching quorum (so neither commit nor rollback ran).
 			let store_a = open_store(&path_a).await;
-			let a = CounterReplica::new(SlabCounterStore::new(store_a.clone(), TenantId::new(7)));
+			let a = CounterReplica::new(SlabCounterStore::new(
+				store_a.clone(),
+				TenantId::new(7),
+				NodeId {
+					id: 1,
+					_reserved: 0,
+				},
+			));
 			a.replicate_tentative(1, &k, 5, h(5)).await.unwrap();
 			assert_eq!(
 				a.read_committed(&k).await.unwrap(),

@@ -265,6 +265,13 @@ pub struct LocalSlabStore {
 	/// ascending by HLC. The tail is the latest version; older
 	/// entries are retained for time-travel reads (ADR 013).
 	pub index: DashMap<TenantKey, Vec<RecordLocation>>,
+	/// Counter eligibility observed only by local marker replay, before live tentative appends.
+	pub(crate) recovered_counter_versions:
+		Vec<(TenantId, Identity, super::counter::CounterVersion)>,
+	pub(crate) recovered_non_counter_keys: Vec<TenantKey>,
+	counter_records: std::sync::atomic::AtomicBool,
+	pub(crate) recovered_counter_errors:
+		Vec<(TenantId, Identity, super::counter::CounterVisibilityError)>,
 
 	/// Identity of the active slab file. Written into every
 	/// [`RecordLocation`] so reads can route to the right file once
@@ -338,11 +345,22 @@ impl LocalSlabStore {
 
 		// Scan any existing records so a restart resumes writing
 		// past the last complete record and serves reads immediately.
-		let (index, recovered_localities, write_cursor) =
-			recover_slab(&file, slab_id, acknowledged)?;
+		let (
+			index,
+			recovered_localities,
+			write_cursor,
+			recovered_counter_versions,
+			recovered_non_counter_keys,
+			recovered_counter_errors,
+			has_counter_records,
+		) = recover_slab(&file, slab_id, acknowledged)?;
 
 		Ok(Self {
 			index,
+			recovered_counter_versions,
+			recovered_non_counter_keys,
+			recovered_counter_errors,
+			counter_records: std::sync::atomic::AtomicBool::new(has_counter_records),
 			recovered_localities,
 			slab_id,
 			file,
@@ -358,6 +376,55 @@ impl LocalSlabStore {
 	}
 
 	/// Current write cursor. Exposed for tests and recovery glue.
+	/// Inspect the class under the location's checksum; payload shape is never authority.
+	pub(crate) async fn counter_record_supported(
+		&self,
+		tenant: TenantId,
+		key: Identity,
+		location: RecordLocation,
+	) -> std::io::Result<bool> {
+		if location.slab_id != self.slab_id {
+			return Err(super::counter::CounterFormatError::InvalidOriginFrame.io());
+		}
+		let buf = AlignedBuf::new(page_round_up(location.length as usize));
+		let (read, buf) = self
+			.file_ops
+			.read_at(&self.file, location.offset, buf)
+			.await?;
+		let size = std::mem::size_of::<SlabRecordHeader>();
+		if read < size {
+			return Err(super::counter::CounterFormatError::InvalidOriginFrame.io());
+		}
+		let bytes = &buf.as_slice()[..read];
+		let header: &SlabRecordHeader = bytemuck::from_bytes(&bytes[..size]);
+		let end = size
+			.checked_add(header.frame_len as usize)
+			.filter(|end| *end <= read)
+			.ok_or_else(|| super::counter::CounterFormatError::InvalidOriginFrame.io())?;
+		if header.magic != SLAB_RECORD_MAGIC
+			|| header.tenant_id != tenant
+			|| header.key_identity != key
+		{
+			return Err(super::counter::CounterFormatError::InvalidOriginFrame.io());
+		}
+		verify_record_checksum(header, &bytes[size..end])?;
+		match header.record_class {
+			crate::schema::record_class::COUNTER_TENTATIVE => Ok(bytes[size..end].len() >= 8),
+			crate::schema::record_class::COUNTER_TENTATIVE_V2 => {
+				super::counter::decode_origin_frame(&bytes[size..end])?;
+				Ok(true)
+			}
+			_ => Ok(false),
+		}
+	}
+
+	pub(crate) fn refuse_counter_maintenance(&self) -> std::io::Result<()> {
+		if self.counter_records.load(Ordering::Acquire) {
+			return Err(super::counter::CounterFormatError::MaintenanceUnsupported.io());
+		}
+		Ok(())
+	}
+
 	pub fn write_cursor(&self) -> u64 {
 		self.next_offset.load(Ordering::Acquire)
 	}
@@ -609,6 +676,10 @@ impl LocalSlabStore {
 		record_class: u32,
 		frame: &[u8],
 	) -> std::io::Result<RecordLocation> {
+		// Conservative metadata: failed counter writes still refuse maintenance.
+		if matches!(record_class, 1..=4) {
+			self.counter_records.store(true, Ordering::Release);
+		}
 		let header_size = std::mem::size_of::<SlabRecordHeader>();
 		let AppendReservation {
 			slab_id,
@@ -911,6 +982,10 @@ fn recover_slab(
 	DashMap<TenantKey, Vec<RecordLocation>>,
 	DashMap<TenantKey, Locality>,
 	u64,
+	Vec<(TenantId, Identity, super::counter::CounterVersion)>,
+	Vec<TenantKey>,
+	Vec<(TenantId, Identity, super::counter::CounterVisibilityError)>,
+	bool,
 )> {
 	use std::os::unix::fs::FileExt;
 
@@ -926,8 +1001,21 @@ fn recover_slab(
 	// orphan tentative (rolled back, or crashed before its marker) is never
 	// resurrected. This is the in-process twin of the pure `recover_counter_index`
 	// rule the storage `counter` module proves.
-	let mut counter_tentatives: Vec<(TenantId, Identity, RecordLocation)> = Vec::new();
-	let mut committed_counter_ops: HashMap<(TenantId, Identity, u64), ()> = HashMap::new();
+	let mut counter_tentatives: Vec<(
+		TenantId,
+		Identity,
+		RecordLocation,
+		u64,
+		Option<crate::schema::NodeId>,
+	)> = Vec::new();
+	let mut recovered_counter_versions = Vec::new();
+	let mut recovered_non_counter_keys = Vec::new();
+	let mut committed_counter_ops: HashMap<
+		(TenantId, Identity, u64),
+		Vec<Option<crate::schema::NodeId>>,
+	> = HashMap::new();
+	let mut recovered_counter_errors = Vec::new();
+	let mut has_counter_records = false;
 	let header_size = std::mem::size_of::<SlabRecordHeader>();
 	// One page is enough for the header probe — every record
 	// starts on a page boundary and the header occupies only the
@@ -1014,10 +1102,14 @@ fn recover_slab(
 			placement: PlacementSemantics::RawLocality,
 			partition: None,
 		};
+		if matches!(header.record_class, 1..=4) {
+			has_counter_records = true;
+		}
 		match header.record_class {
 			crate::schema::record_class::STANDARD => {
 				for entry in recover_entries_for_record(&header, base_location, &frame_bytes)? {
 					observe_recovered_row_version(&mut recovered_versions, &entry);
+					recovered_non_counter_keys.push((entry.tenant_id, entry.key_identity));
 					index
 						.entry((entry.tenant_id, entry.key_identity))
 						.and_modify(|versions| insert_version_sorted(versions, entry.location))
@@ -1038,7 +1130,17 @@ fn recover_slab(
 						"counter tentative frame shorter than its fixed value",
 					));
 				}
-				counter_tentatives.push((header.tenant_id, header.key_identity, base_location));
+				counter_tentatives.push((
+					header.tenant_id,
+					header.key_identity,
+					base_location,
+					u64::from_le_bytes(
+						frame_bytes[..8]
+							.try_into()
+							.expect("validated counter value length"),
+					),
+					None,
+				));
 			}
 			crate::schema::record_class::COUNTER_COMMIT => {
 				if frame_bytes.len() < std::mem::size_of::<CounterCommitFrame>() {
@@ -1050,7 +1152,38 @@ fn recover_slab(
 				let op_id = u64::from_le_bytes(frame_bytes[..8].try_into().map_err(|_| {
 					Error::new(ErrorKind::InvalidData, "counter commit marker op-id slice")
 				})?);
-				committed_counter_ops.insert((header.tenant_id, header.key_identity, op_id), ());
+				committed_counter_ops
+					.entry((header.tenant_id, header.key_identity, op_id))
+					.or_default()
+					.push(None);
+			}
+			crate::schema::record_class::COUNTER_TENTATIVE_V2
+			| crate::schema::record_class::COUNTER_COMMIT_V2 => {
+				match super::counter::decode_origin_frame(&frame_bytes) {
+					Ok((value, origin))
+						if header.record_class
+							== crate::schema::record_class::COUNTER_TENTATIVE_V2 =>
+					{
+						counter_tentatives.push((
+							header.tenant_id,
+							header.key_identity,
+							base_location,
+							value,
+							Some(origin),
+						));
+					}
+					Ok((offset, origin)) => {
+						committed_counter_ops
+							.entry((header.tenant_id, header.key_identity, offset))
+							.or_default()
+							.push(Some(origin));
+					}
+					Err(_) => recovered_counter_errors.push((
+						header.tenant_id,
+						header.key_identity,
+						super::counter::CounterVisibilityError::Unsupported,
+					)),
+				}
 			}
 			other => {
 				return Err(Error::new(
@@ -1093,8 +1226,27 @@ fn recover_slab(
 	// ADR 075 recovery rule: index a counter tentative only if a commit marker
 	// for its op-id (offset) was also recovered. Orphans are skipped — never
 	// resurrected. Later committed values supersede earlier ones by HLC.
-	for (tenant_id, key_identity, location) in counter_tentatives {
-		if committed_counter_ops.contains_key(&(tenant_id, key_identity, location.offset)) {
+	for (tenant_id, key_identity, location, value, origin) in counter_tentatives {
+		if let Some(markers) =
+			committed_counter_ops.get(&(tenant_id, key_identity, location.offset))
+		{
+			if markers.iter().any(|marker_origin| *marker_origin != origin) {
+				recovered_counter_errors.push((
+					tenant_id,
+					key_identity,
+					super::counter::CounterVisibilityError::Conflict,
+				));
+				continue;
+			}
+			recovered_counter_versions.push((
+				tenant_id,
+				key_identity,
+				super::counter::CounterVersion {
+					value,
+					hlc: location.hlc,
+					origin,
+				},
+			));
 			index
 				.entry((tenant_id, key_identity))
 				.and_modify(|versions| insert_version_sorted(versions, location))
@@ -1104,7 +1256,15 @@ fn recover_slab(
 	}
 
 	validate_recovered_row_tombstone_chains(&recovered_versions)?;
-	Ok((index, recovered_localities, valid_end))
+	Ok((
+		index,
+		recovered_localities,
+		valid_end,
+		recovered_counter_versions,
+		recovered_non_counter_keys,
+		recovered_counter_errors,
+		has_counter_records,
+	))
 }
 
 /// Largest single write used to zero a skipped region at recovery.
@@ -1186,6 +1346,9 @@ pub(crate) fn recover_slab_entries_from_blob(
 		// Fail closed rather than mis-index a counter frame as a blob (which
 		// would resurrect an orphan tentative). Tiering of counter slabs is a
 		// later integration that must port the committed-only rule here.
+		if matches!(header.record_class, 1..=4) {
+			return Err(super::counter::CounterFormatError::MaintenanceUnsupported.io());
+		}
 		if header.record_class != crate::schema::record_class::STANDARD {
 			return Err(Error::new(
 				ErrorKind::InvalidData,

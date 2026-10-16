@@ -426,6 +426,7 @@ impl SlabManager {
 				compaction: None,
 			});
 		};
+		slab.refuse_counter_maintenance()?;
 		let mut records: Vec<CompactionRecord> = slab
 			.index
 			.iter()
@@ -486,6 +487,7 @@ impl SlabManager {
 			return Ok(None);
 		};
 		self.ensure_live_lsm_run_for_maintenance(slab_id, slab.write_cursor());
+		slab.refuse_counter_maintenance()?;
 		let mut records: Vec<CompactionRecord> = slab
 			.index
 			.iter()
@@ -898,6 +900,7 @@ impl SlabManager {
 				),
 			));
 		}
+		slab.refuse_counter_maintenance()?;
 		if records.is_empty() || records.iter().all(|record| !record.reclaim) {
 			return Ok(None);
 		}

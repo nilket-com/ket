@@ -5165,6 +5165,8 @@ impl WendelonDataServer {
 			}
 		};
 
+		self.refuse_counter_migration_rows(&locations).await?;
+
 		if meta.kind == MigrateRequestKind::POINT_LOOKUP && locations.is_empty() {
 			return Ok((
 				migrate_error_meta(meta, MigrateStatus::KEY_NOT_FOUND, ZERO_NODE),

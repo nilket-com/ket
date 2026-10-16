@@ -58,15 +58,14 @@ use crate::schema::{
 	AggregatePartial, AggregateRequest, BufferValueCount, ByteCount, ColumnGroupNdvFact,
 	ColumnGroupTopKEntry, ColumnGroupTopKFact, ColumnHeavyHitterEntry, ColumnHeavyHitterFact,
 	ColumnNdvFact, ColumnRangeDistributionFact, ColumnRangeFact, CompactionJobId,
-	CompactionLevelIndex, CounterCommitFrame, CounterTentativeFrame, EncodingPageByteOffset,
-	HllPrecision, HybridTimestamp, INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity,
-	IdentityPrefix, IndexObjectId, IpcBufferIndex, IpcColumnOrdinal, Locality,
-	LogicalSchemaFingerprint, ManifestEpoch, NdvFact, RecordBodyByteLen, RecordBodyByteOffset,
-	RecordRowIndex, RowCount, RowGroupIndex, SecondaryIndexCatalog, SecondaryIndexDescriptor,
-	SecondaryIndexState, SelectivityFractionMicros, SimdPageValueCount, SlabId, SlabRecordHeader,
-	SupersessionMetadata, TableLifecycleCatalog, TableOptimizerFacts,
-	TableReferenceIntegrityFailureMeta, TenantId, TenantKekId, TombstoneMetadata, WriterNodeId,
-	range_fact_tag_supported,
+	CompactionLevelIndex, EncodingPageByteOffset, HllPrecision, HybridTimestamp,
+	INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix, IndexObjectId,
+	IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint, ManifestEpoch, NdvFact,
+	NodeId, RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, RowCount, RowGroupIndex,
+	SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState,
+	SelectivityFractionMicros, SimdPageValueCount, SlabId, SlabRecordHeader, SupersessionMetadata,
+	TableLifecycleCatalog, TableOptimizerFacts, TableReferenceIntegrityFailureMeta, TenantId,
+	TenantKekId, TombstoneMetadata, WriterNodeId, range_fact_tag_supported,
 };
 use crate::storage::columnar::{
 	ColumnFetchRequirement, ColumnOrdinalMapping, ColumnOrdinalSet, ColumnarFallbackReason,
@@ -173,6 +172,7 @@ use crate::storage::{
 	compaction_visible_domain_summary, effective_table_retention, required_output_run_count,
 	storage_row_table_object_id_at, survivor_records, write_file,
 };
+use crate::storage::{core, counter};
 use arrow::array::{Array, BooleanArray};
 use arrow::compute::concat_batches;
 use arrow::datatypes::DataType;
@@ -193,6 +193,7 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use zeroize::Zeroizing;
 
+mod counter_visibility;
 mod encoding_compute;
 mod observation;
 mod retention_reclaim;
@@ -608,6 +609,8 @@ pub struct SlabManager {
 	/// active and sealed slabs. Per ADR 013 the chain stores every
 	/// version sorted ascending by HLC; the tail is the current
 	/// value and earlier entries back time-travel reads.
+	counter_eligible: Arc<super::counter::visibility::EligibleCells<(TenantId, Identity)>>,
+	counter_unsupported: DashSet<(TenantId, Identity)>,
 	key_index: DashMap<TenantKey, Vec<RecordLocation>>,
 	/// Tenant-scoped locality membership index for range scans.
 	///
@@ -913,19 +916,18 @@ impl SlabManager {
 		key_identity: Identity,
 		hlc: HybridTimestamp,
 		value: u64,
+		origin: NodeId,
 	) -> std::io::Result<RecordLocation> {
-		let frame = CounterTentativeFrame { value };
-		let (slab, reservation) = self
-			.target_for_append(size_of::<CounterTentativeFrame>())
-			.await?;
+		let frame = super::counter::encode_origin_frame(value, origin)?;
+		let (slab, reservation) = self.target_for_append(frame.len()).await?;
 		let location = slab
 			.write_reserved(
 				reservation,
 				tenant_id,
 				key_identity,
 				hlc,
-				crate::schema::record_class::COUNTER_TENTATIVE,
-				bytemuck::bytes_of(&frame),
+				crate::schema::record_class::COUNTER_TENTATIVE_V2,
+				&frame,
 			)
 			.await?;
 		self.index_appended_location(tenant_id, key_identity, location);
@@ -944,18 +946,17 @@ impl SlabManager {
 		key_identity: Identity,
 		hlc: HybridTimestamp,
 		tentative_op_id: u64,
+		origin: NodeId,
 	) -> std::io::Result<()> {
-		let marker = CounterCommitFrame { tentative_op_id };
-		let (slab, reservation) = self
-			.target_for_append(size_of::<CounterCommitFrame>())
-			.await?;
+		let marker = super::counter::encode_origin_frame(tentative_op_id, origin)?;
+		let (slab, reservation) = self.target_for_append(marker.len()).await?;
 		slab.write_reserved(
 			reservation,
 			tenant_id,
 			key_identity,
 			hlc,
-			crate::schema::record_class::COUNTER_COMMIT,
-			bytemuck::bytes_of(&marker),
+			crate::schema::record_class::COUNTER_COMMIT_V2,
+			&marker,
 		)
 		.await?;
 		slab.wait_durable_commit().await?;
@@ -1474,6 +1475,7 @@ impl SlabManager {
 			(active, active_id.saturating_add(1))
 		};
 
+		let counter_unsupported = DashSet::new();
 		let mut persistent_key_localities: Vec<(TenantId, Identity, Locality)> = Vec::new();
 		let mut recovered_lsm_runs: Vec<LsmRunSummary> = Vec::new();
 		if let Some(index) = &persistent_index {
@@ -1494,6 +1496,7 @@ impl SlabManager {
 						tiered.insert(pointer.slab_id, pointer);
 					}
 					for row in snapshot.tiered_records {
+						counter_unsupported.insert((row.tenant_id, row.key_identity));
 						key_index
 							.entry((row.tenant_id, row.key_identity))
 							.and_modify(|versions| insert_version_sorted(versions, row.location))
@@ -1578,6 +1581,8 @@ impl SlabManager {
 				"no persistent index: maintenance receipts have nowhere to live",
 			),
 		};
+		let counter_eligible =
+			Self::recover_counter_eligible(&active, &sealed, &counter_unsupported);
 		let manager = Self {
 			finality_observation:
 				crate::storage::finality_observation::FinalityObservationRegistry::new(),
@@ -1594,6 +1599,8 @@ impl SlabManager {
 			}),
 			compaction_manifest: RwLock::new(compaction_manifest),
 			slab_pins: Arc::new(SlabPinTable::default()),
+			counter_eligible,
+			counter_unsupported,
 			key_index,
 			locality_index: RwLock::new(locality_index),
 			key_localities,
@@ -3101,6 +3108,11 @@ impl SlabManager {
 		payload_hash: [u8; 32],
 		frame: &[u8],
 	) -> std::io::Result<MigrationIngestOutcome> {
+		self.counter_unsupported.insert((tenant_id, key_identity));
+		self.counter_eligible.refuse(
+			&(tenant_id, key_identity),
+			super::counter::CounterVisibilityError::Unsupported,
+		);
 		// Fast-path collision check before touching disk: walk the
 		// key's existing version chain under a short-lived read
 		// guard and look for an exact HLC match. DashMap's read
@@ -3243,6 +3255,7 @@ impl SlabManager {
 	/// an L2 pointer (tiered). Tiered wins over sealed so a
 	/// post-pivot read never races back against the soon-to-be-
 	/// unlinked L1 file.
+
 	async fn resolve_backing(&self, slab_id: SlabId) -> SlabBacking {
 		let state = self.state.lock().await;
 		if state.active.slab_id() == slab_id {
