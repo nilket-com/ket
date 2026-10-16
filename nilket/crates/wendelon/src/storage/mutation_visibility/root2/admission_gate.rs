@@ -102,7 +102,9 @@ impl Root2 {
 		}
 		// 8-9. Authorization and statement failures are consumed denials.
 		let mut next = root.clone();
-		let mut result = if !verified.authorized() {
+		let mut result = if super::role_freeze::blocked(s, command) {
+			denied(23, None)
+		} else if !verified.authorized() {
 			denied(8, None)
 		} else {
 			match match command {

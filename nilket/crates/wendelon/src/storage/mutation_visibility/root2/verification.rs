@@ -136,7 +136,9 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_verified2(
 fn kind(command: &Command2) -> Result<(), VerifyError2> {
 	use VerifyError2 as E;
 	match command {
-		Command2::RotateAdmin(_)
+		Command2::Freeze(_)
+		| Command2::Unfreeze(_)
+		| Command2::RotateAdmin(_)
 		| Command2::RotateGovernance(_)
 		| Command2::RotateRecovery(_)
 		| Command2::EpochAdmissionPermission(_)
@@ -182,18 +184,31 @@ fn verify_command2(
 			)
 		}
 		(
-			Command2::RotateAdmin(_) | Command2::RotateGovernance(_) | Command2::RotateRecovery(_),
+			Command2::RotateAdmin(_)
+			| Command2::RotateGovernance(_)
+			| Command2::RotateRecovery(_)
+			| Command2::Freeze(_)
+			| Command2::Unfreeze(_),
 			OriginView2::Root,
 		) => {
 			let bytes = governance.ok_or(VerifyError2::MissingSidecar)?;
 			super::role_command::parse(bytes).map_err(VerifyError2::Role)?;
 			let admin = install_admin2(state, pin).map_err(VerifyError2::Install)?;
-			let expected = if matches!(command, Command2::RotateRecovery(_)) {
-				[1, 2]
-			} else {
-				[3, 0]
+			let expected = match command {
+				Command2::RotateRecovery(_) => [1, 2],
+				Command2::Unfreeze(_) if bytes[76] == 1 => [1, 3],
+				Command2::Unfreeze(_) => [2, 3],
+				Command2::RotateAdmin(_) | Command2::RotateGovernance(_) | Command2::Freeze(_) => {
+					[3, 0]
+				}
+				_ => return Err(VerifyError2::StateKind),
 			};
-			let ok = super::role_command::verify(&admin, bytes, d, expected)
+			let form = match command {
+				Command2::Freeze(_) => super::role_command::RoleForm3::Freeze,
+				Command2::Unfreeze(_) => super::role_command::RoleForm3::Unfreeze,
+				_ => super::role_command::RoleForm3::Legacy,
+			};
+			let ok = super::role_command::verify_for(&admin, bytes, d, expected, form)
 				.map_err(VerifyError2::Role)?;
 			if ok {
 				let keys =

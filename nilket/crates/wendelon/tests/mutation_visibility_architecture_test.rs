@@ -2267,8 +2267,26 @@ fn admission_dispatch_fails_closed() {
 	let replay = reducer.find("if l.index == s.covered.index {").unwrap();
 	let gap = reducer.find("LineageGap").unwrap();
 	let authorized = reducer
-		.find("let result = if verified.authorized()")
+		.find("let result = if super::role_freeze::blocked")
 		.unwrap();
+	let result_block = &reducer[authorized..];
+	let result_block = result_block.split_once("};").unwrap().0;
+	fn frozen_before_auth(block: &str) -> bool {
+		let flat = block.replace(char::is_whitespace, "");
+		flat.starts_with("letresult=ifsuper::role_freeze::blocked(&old.state,command){denied(23,None)}elseifverified.authorized(){")
+			&& flat.contains("}else{denied(8,None)")
+	}
+	assert!(frozen_before_auth(result_block));
+	assert!(!frozen_before_auth(
+		&result_block.replace("super::role_freeze::blocked", "removed")
+	));
+	assert!(!frozen_before_auth(&result_block.replace(
+		"if super::role_freeze::blocked",
+		"if verified.authorized"
+	)));
+	assert!(!frozen_before_auth(
+		&result_block.replace("denied(23, None)", "denied(8, None)")
+	));
 	assert!(gate < replay && gate < gap && gate < authorized);
 	for variant in ["AdmissionPermission", "EpochAdmissionPermission"] {
 		assert!(compact.contains(&format!(
@@ -3905,6 +3923,8 @@ fn command_verification_is_single_site_and_unwired() {
 			"RotateGovernance",
 			"RotateRecovery",
 			"EpochAdmissionPermission",
+			"Freeze",
+			"Unfreeze",
 		]
 		.map(str::to_string),
 	);
@@ -4065,10 +4085,12 @@ fn command_verification_is_single_site_and_unwired() {
 					"Cover",
 					"EpochAdmissionPermission",
 					"Finalize",
+					"Freeze",
 					"Reserve",
 					"RotateAdmin",
 					"RotateGovernance",
-					"RotateRecovery"
+					"RotateRecovery",
+					"Unfreeze"
 				]
 			);
 		}
@@ -4610,6 +4632,7 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 		),
 		("governance_command.rs", &[]),
 		("role_epochs.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
+		("role_freeze.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
 		("role_command.rs", &["ManifestProfile2"]),
 	];
 	// The one new out-of-line test file is excluded only while its declaration is cfg(test).
@@ -5594,7 +5617,7 @@ fn role_epoch_control_is_pre_entry_bounded_and_dormant() {
 	] {
 		assert!(forbidden(bad.parse().unwrap()).is_some());
 	}
-	for name in ["role_epochs.rs", "role_command.rs"] {
+	for name in ["role_epochs.rs", "role_command.rs", "role_freeze.rs"] {
 		let text = read(name);
 		assert_eq!(forbidden(text.parse().unwrap()), None, "{name}");
 		for item in syn::parse_file(&text).unwrap().items {
@@ -5617,12 +5640,16 @@ fn role_epoch_control_is_pre_entry_bounded_and_dormant() {
 	}
 	let epochs = read("role_epochs.rs");
 	assert!(epochs.contains("const SUCCESSORS3: usize = 64;"));
-	assert!(epochs.contains("if counts == [0; 3]"));
+	assert!(epochs.contains("frozen || counts == [0; 3]"));
 	assert!(
 		epochs.find("usize::from(n) > SUCCESSORS3").unwrap()
 			< epochs.find("try_reserve_exact").unwrap()
 	);
-	assert!(epochs.contains("if r.take(21)? != [0; 21]"));
+	assert!(epochs.contains("let frozen = match r.u8()?"));
+	assert!(epochs.contains("_ => return Err(RootError2::Codec)"));
+	assert!(epochs.contains("let transition = r.optional_log()?"));
+	assert!(epochs.contains("e.transition.index <= s.bootstrap.index"));
+	assert!(epochs.contains("!coords.insert(e.transition.index)"));
 	let rotate = fn_body(&epochs, "rotate");
 	assert!(
 		rotate.find("history > root.limits.history").unwrap()
@@ -5657,9 +5684,9 @@ fn role_epoch_control_is_pre_entry_bounded_and_dormant() {
 			_ => None,
 		})
 		.unwrap();
-	assert_eq!(variants.len(), 18);
+	assert_eq!(variants.len(), 20);
 	assert_eq!(
-		&variants[14..],
+		&variants[14..18],
 		[
 			"RotateAdmin",
 			"RotateGovernance",
@@ -5667,6 +5694,89 @@ fn role_epoch_control_is_pre_entry_bounded_and_dormant() {
 			"EpochAdmissionPermission"
 		]
 	);
+	assert_eq!(&variants[18..], ["Freeze", "Unfreeze"]);
+	let freeze = read("role_freeze.rs");
+	let transition = fn_body(&freeze, "transition");
+	assert!(
+		transition.find("history > root.limits.history").unwrap()
+			< transition.find("get_or_insert_with").unwrap()
+	);
+	assert!(transition.contains("reason: 24") && transition.contains("*binding == previous"));
+	fn scoped_frozen_order(text: &str, mutable: bool) -> bool {
+		let anchor = if mutable {
+			"let mut result ="
+		} else {
+			"let result ="
+		};
+		let Some((_, tail)) = text.split_once(anchor) else {
+			return false;
+		};
+		let Some((block, _)) = tail.split_once("};") else {
+			return false;
+		};
+		let flat = block.replace(char::is_whitespace, "");
+		let prefix = if mutable {
+			"ifsuper::role_freeze::blocked(s,command){denied(23,None)}elseif!verified.authorized(){denied(8,None)"
+		} else {
+			"ifsuper::role_freeze::blocked(&old.state,command){denied(23,None)}elseifverified.authorized(){"
+		};
+		flat.starts_with(prefix) && (mutable || flat.contains("}else{denied(8,None)"))
+	}
+	for (file, mutable) in [("reducer.rs", false), ("admission_gate.rs", true)] {
+		let text = read(file);
+		assert!(scoped_frozen_order(&text, mutable), "{file}");
+		assert!(!scoped_frozen_order(
+			&text.replace("super::role_freeze::blocked", "removed"),
+			mutable
+		));
+		assert!(!scoped_frozen_order(
+			&text
+				.replace(
+					if mutable {
+						"super::role_freeze::blocked(s, command)"
+					} else {
+						"super::role_freeze::blocked(&old.state, command)"
+					},
+					"SWAP"
+				)
+				.replace(
+					if mutable {
+						"!verified.authorized()"
+					} else {
+						"verified.authorized()"
+					},
+					if mutable {
+						"super::role_freeze::blocked(s, command)"
+					} else {
+						"super::role_freeze::blocked(&old.state, command)"
+					}
+				)
+				.replace(
+					"SWAP",
+					if mutable {
+						"!verified.authorized()"
+					} else {
+						"verified.authorized()"
+					}
+				),
+			mutable
+		));
+		assert!(!scoped_frozen_order(
+			&text.replace("denied(23, None)", "denied(8, None)"),
+			mutable
+		));
+		if !mutable {
+			let bootstrap = text.split_once("let result =").unwrap().0;
+			assert!(bootstrap.contains("verified.authorized()"));
+			assert!(!scoped_frozen_order(bootstrap, false));
+		}
+	}
+	fn proof_has_unsupported_domain(text: &str) -> bool {
+		text.contains("UNSUPPORTED")
+	}
+	assert!(proof_has_unsupported_domain("b\"UNSUPPORTED\""));
+	assert!(!proof_has_unsupported_domain("Err(E::Domain)"));
+	assert!(!proof_has_unsupported_domain(&read("role_command.rs")));
 	assert!(read("trust.rs").contains("role_seed: Option<super::role_epochs::Seed3>"));
 	assert_eq!(
 		calls(&read("verification.rs"), "VerifiedCommand2::verified2"),

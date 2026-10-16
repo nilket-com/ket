@@ -75,6 +75,9 @@ impl Derived2 {
 			}
 		}
 		if let Some(epochs) = &s.role_epochs {
+			if epochs.transition.index != 0 {
+				d.non_grants.insert(epochs.transition.index, ());
+			}
 			for history in &epochs.successors {
 				for e in history {
 					d.non_grants.insert(e.activated.index, ());
@@ -294,6 +297,24 @@ pub(super) fn update(old: &State2, next: &mut State2, cmd: &Command2) -> Result2
 				.and_then(|e| e.successors[role].get(old_len))
 			{
 				d.non_grants.insert(epoch.activated.index, ());
+			}
+		}
+		Command2::Freeze(_) | Command2::Unfreeze(_) => {
+			let before = super::role_epochs::charge(old)?;
+			let after = super::role_epochs::charge(next)?;
+			d.usage.history = add(
+				d.usage.history,
+				after.checked_sub(before).ok_or(RootError2::RootInvariant)?,
+			)?;
+			if let Some(epochs) = &old.role_epochs {
+				if epochs.transition.index != 0 {
+					let _ = d.non_grants.remove(&epochs.transition.index);
+				}
+			}
+			if let Some(epochs) = &next.role_epochs {
+				if epochs.transition.index != 0 {
+					d.non_grants.insert(epochs.transition.index, ());
+				}
 			}
 		}
 		Command2::Bootstrap { .. } | Command2::Cover { .. } => {}

@@ -10,6 +10,7 @@ pub(super) enum RoleProofError3 {
 	Reserved,
 	Role,
 	Presence,
+	Domain,
 }
 fn array<const N: usize>(bytes: &[u8], at: usize) -> [u8; N] {
 	bytes[at..at + N]
@@ -63,23 +64,47 @@ pub(super) fn context_digest(a: &InstalledAdmin2) -> Digest2 {
 	b.extend(c.manifest_pin);
 	hash(b"VISROOT2-ROLE3-CONTEXT\0", &b)
 }
-fn domain(expected: [u8; 2], slot: usize) -> &'static [u8] {
-	match (expected, slot) {
-		([2, 0], 0) => b"VISROOT2-ROLE3-SINGLE-GOVERNANCE\0",
-		([3, 0], 0) => b"VISROOT2-ROLE3-SINGLE-RECOVERY\0",
-		([1, 2], 0) => b"VISROOT2-ROLE3-JOINT-ADMIN-GOVERNANCE-ADMIN\0",
-		([1, 2], 1) => b"VISROOT2-ROLE3-JOINT-ADMIN-GOVERNANCE-GOVERNANCE\0",
-		_ => b"VISROOT2-ROLE3-UNSUPPORTED\0",
-	}
+#[derive(Clone, Copy)]
+pub(super) enum RoleForm3 {
+	Legacy,
+	Freeze,
+	Unfreeze,
+}
+fn domain(
+	form: RoleForm3,
+	expected: [u8; 2],
+	slot: usize,
+) -> Result<&'static [u8], RoleProofError3> {
+	use RoleForm3::*;
+	Ok(match (form, expected, slot) {
+		(Legacy, [2, 0], 0) => b"VISROOT2-ROLE3-SINGLE-GOVERNANCE\0",
+		(Legacy, [3, 0], 0) => b"VISROOT2-ROLE3-SINGLE-RECOVERY\0",
+		(Legacy, [1, 2], 0) => b"VISROOT2-ROLE3-JOINT-ADMIN-GOVERNANCE-ADMIN\0",
+		(Legacy, [1, 2], 1) => b"VISROOT2-ROLE3-JOINT-ADMIN-GOVERNANCE-GOVERNANCE\0",
+		(Freeze, [3, 0], 0) => b"VISROOT2-ROLE3-FREEZE-RECOVERY\0",
+		(Unfreeze, [1, 3], 0) => b"VISROOT2-ROLE3-UNFREEZE-ADMIN\0",
+		(Unfreeze, [1, 3], 1) => b"VISROOT2-ROLE3-UNFREEZE-RECOVERY-WITH-ADMIN\0",
+		(Unfreeze, [2, 3], 0) => b"VISROOT2-ROLE3-UNFREEZE-GOVERNANCE\0",
+		(Unfreeze, [2, 3], 1) => b"VISROOT2-ROLE3-UNFREEZE-RECOVERY-WITH-GOVERNANCE\0",
+		_ => return Err(RoleProofError3::Domain),
+	})
 }
 pub(super) fn preimage(
 	bytes: &[u8],
 	expected: [u8; 2],
 	slot: usize,
 ) -> Result<Vec<u8>, RoleProofError3> {
+	preimage_for(bytes, expected, slot, RoleForm3::Legacy)
+}
+pub(super) fn preimage_for(
+	bytes: &[u8],
+	expected: [u8; 2],
+	slot: usize,
+	form: RoleForm3,
+) -> Result<Vec<u8>, RoleProofError3> {
 	parse(bytes)?;
 	let mut b = Vec::with_capacity(160);
-	b.extend_from_slice(domain(expected, slot));
+	b.extend_from_slice(domain(form, expected, slot)?);
 	b.extend_from_slice(&bytes[..86]);
 	b.extend_from_slice(&bytes[150..160]);
 	Ok(b)
@@ -89,6 +114,15 @@ pub(super) fn verify(
 	bytes: &[u8],
 	command: Digest2,
 	expected: [u8; 2],
+) -> Result<bool, RoleProofError3> {
+	verify_for(a, bytes, command, expected, RoleForm3::Legacy)
+}
+pub(super) fn verify_for(
+	a: &InstalledAdmin2,
+	bytes: &[u8],
+	command: Digest2,
+	expected: [u8; 2],
+	form: RoleForm3,
 ) -> Result<bool, RoleProofError3> {
 	parse(bytes)?;
 	if admin_profile2(a) != super::admin::manifest::ManifestProfile2::Three
@@ -118,7 +152,7 @@ pub(super) fn verify(
 		};
 		if key
 			.verify_strict(
-				&preimage(bytes, expected, i)?,
+				&preimage_for(bytes, expected, i, form)?,
 				&Signature::from_bytes(&array(bytes, at + 10)),
 			)
 			.is_err()

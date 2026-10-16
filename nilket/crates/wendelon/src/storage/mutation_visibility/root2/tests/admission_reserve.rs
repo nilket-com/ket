@@ -779,18 +779,44 @@ fn denied_eighteen_and_nineteen_codec() {
 			);
 		}
 	}
-	for reason in 1..=23 {
+	for reason in [23, 24] {
+		let result = denied(reason, None);
+		let bytes = result.encode(g, c, l(8)).unwrap();
+		assert_eq!(ApplyResult2::decode(&bytes).unwrap().3, result);
+		assert_eq!(
+			denied(reason, Some(6)).encode(g, c, l(8)).err(),
+			Some(RootError2::Codec)
+		);
+		let reference_bytes = denied(17, Some(6)).encode(g, c, l(8)).unwrap();
+		let mut body = open(&reference_bytes, b"VISRES02", COMMAND_BYTES2)
+			.unwrap()
+			.to_vec();
+		assert_eq!(body[52], 6);
+		body[53..55].copy_from_slice(&reason.to_le_bytes());
+		let raw = envelope(b"VISRES02", &body, COMMAND_BYTES2).unwrap();
+		assert_eq!(ApplyResult2::decode(&raw).err(), Some(RootError2::Codec));
+	}
+	let valid = denied(24, None).encode(g, c, l(8)).unwrap();
+	let mut body = open(&valid, b"VISRES02", COMMAND_BYTES2).unwrap().to_vec();
+	body[53..55].copy_from_slice(&25u16.to_le_bytes());
+	assert_eq!(
+		ApplyResult2::decode(&envelope(b"VISRES02", &body, COMMAND_BYTES2).unwrap()).err(),
+		Some(RootError2::Codec)
+	);
+	for reason in 1..=25 {
 		let result = denied(reason, None).encode(g, c, l(8));
 		assert_eq!(
 			result.is_ok(),
-			matches!(reason, 1..=18 | 20..=22),
+			matches!(reason, 1..=18 | 20..=24),
 			"{reason}"
 		);
 	}
 	for bad in [
 		denied(18, Some(6)),
 		denied(19, None),
-		denied(23, None),
+		denied(25, None),
+		denied(23, Some(6)),
+		denied(24, Some(6)),
 		denied(20, Some(6)),
 		denied(21, Some(6)),
 		denied(22, Some(6)),
