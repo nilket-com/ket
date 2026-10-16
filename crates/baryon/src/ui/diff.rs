@@ -134,8 +134,7 @@ struct BridgeResponse {
 }
 
 impl DiffBridgeController {
-	pub fn new() -> Self {
-		let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+	pub fn new(picker: Picker) -> Self {
 		let (tx_request, rx_request) = mpsc::channel::<BridgeRequest>();
 		let (tx_ready, rx_ready) = mpsc::channel::<BridgeResponse>();
 
