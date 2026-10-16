@@ -80,9 +80,15 @@ impl F {
 		}
 		for (i, at) in [76, 150].into_iter().enumerate() {
 			if roles[i] != 0 {
-				let sig = SigningKey::from_bytes(&[self.seeds[usize::from(roles[i] - 1)]; 32])
-					.sign(&role_command::preimage(&b, roles, i).unwrap())
-					.to_bytes();
+				let sig = match role_command::preimage(&b, roles, i) {
+					Ok(preimage) => {
+						SigningKey::from_bytes(&[self.seeds[usize::from(roles[i] - 1)]; 32])
+							.sign(&preimage)
+							.to_bytes()
+					}
+					Err(role_command::RoleProofError3::Domain) => [0; 64],
+					Err(error) => panic!("malformed test proof: {error:?}"),
+				};
 				b[at + 10..at + 74].copy_from_slice(&sig);
 			}
 		}

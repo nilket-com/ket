@@ -215,6 +215,45 @@ fn s1c_persistent_map_order_balance_replacement_and_old_versions() {
 			assert!(a.iter().eq(e.iter()));
 		}
 	}
+	let mut actual = Map::<u64, u64>::new();
+	let mut expected = BTreeMap::new();
+	let mut seed = 0x6295_43b2_91e7_a10du64;
+	let mut saved = Vec::new();
+	for op in 0..10000 {
+		seed = seed
+			.wrapping_mul(6364136223846793005)
+			.wrapping_add(1442695040888963407);
+		let key = (seed >> 17) % 1024;
+		let old = actual.clone();
+		let previous = expected.clone();
+		match seed % 3 {
+			0 => {
+				actual.insert(key, seed);
+				expected.insert(key, seed);
+			}
+			1 => {
+				assert_eq!(actual.remove(&key), expected.remove(&key));
+				for other in expected.keys() {
+					assert!(actual.shares_value(&old, other));
+				}
+			}
+			_ => assert_eq!(actual.get(&key), expected.get(&key)),
+		}
+		actual.audit();
+		old.audit();
+		assert!(actual.iter().eq(expected.iter()));
+		assert!(old.iter().eq(previous.iter()));
+		let unchanged = actual.clone();
+		assert_eq!(actual.remove(&2048), None);
+		assert!(actual.shares_root(&unchanged));
+		if op % 256 == 0 {
+			saved.push((actual.clone(), expected.clone()));
+		}
+	}
+	for (map, reference) in saved {
+		map.audit();
+		assert!(map.iter().eq(reference.iter()));
+	}
 }
 #[test]
 fn s1c_shared_values_are_released_after_all_retained_roots_drop() {

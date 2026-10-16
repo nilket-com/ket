@@ -63,6 +63,8 @@ fn governance_failure2(
 		| Command2::RotateAdmin(_)
 		| Command2::RotateGovernance(_)
 		| Command2::RotateRecovery(_)
+		| Command2::Freeze(_)
+		| Command2::Unfreeze(_)
 		| Command2::EpochAdmissionPermission(_) => return Err(VerifyError2::StateKind),
 	};
 	let bytes = governance.ok_or(VerifyError2::MissingSidecar)?;
@@ -114,6 +116,8 @@ fn governance_failure2(
 		| Command2::RotateAdmin(_)
 		| Command2::RotateGovernance(_)
 		| Command2::RotateRecovery(_)
+		| Command2::Freeze(_)
+		| Command2::Unfreeze(_)
 		| Command2::EpochAdmissionPermission(_) => return Err(VerifyError2::StateKind),
 	};
 	if !in_scope {

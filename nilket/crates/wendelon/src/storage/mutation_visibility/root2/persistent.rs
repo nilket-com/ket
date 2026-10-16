@@ -120,14 +120,10 @@ impl<K: Ord + Clone, V: Clone> Map<K, V> {
 	pub fn clear(&mut self) {
 		self.0 = None;
 	}
-	#[cfg(test)]
 	pub fn remove(&mut self, key: &K) -> Option<V> {
+		// The lookup preserves root identity and allocates nothing for an absent key.
 		let value = self.get(key)?.clone();
-		*self = self
-			.iter()
-			.filter(|(k, _)| *k != key)
-			.map(|(k, v)| (k.clone(), v.clone()))
-			.collect();
+		self.0 = delete(&self.0, key);
 		Some(value)
 	}
 	#[cfg(test)]
@@ -254,6 +250,40 @@ fn insert<K: Ord + Clone, V>(
 			Some(insert(&n.right, key, value)),
 		),
 		Ordering::Equal => node(key, value, n.left.clone(), n.right.clone()),
+	}
+}
+// Delete only the search path; rotations share all untouched children and values.
+fn delete<K: Ord + Clone, V>(at: &Option<Arc<Node<K, V>>>, key: &K) -> Option<Arc<Node<K, V>>> {
+	let n = at.as_ref().expect("located deletion key");
+	match key.cmp(&n.key) {
+		Ordering::Less => Some(balanced(
+			n.key.clone(),
+			n.value.clone(),
+			delete(&n.left, key),
+			n.right.clone(),
+		)),
+		Ordering::Greater => Some(balanced(
+			n.key.clone(),
+			n.value.clone(),
+			n.left.clone(),
+			delete(&n.right, key),
+		)),
+		Ordering::Equal => match (&n.left, &n.right) {
+			(None, _) => n.right.clone(),
+			(_, None) => n.left.clone(),
+			(Some(_), Some(right)) => {
+				let mut successor = right;
+				while let Some(left) = &successor.left {
+					successor = left;
+				}
+				Some(balanced(
+					successor.key.clone(),
+					successor.value.clone(),
+					n.left.clone(),
+					delete(&n.right, &successor.key),
+				))
+			}
+		},
 	}
 }
 pub(super) struct Iter<'a, K, V> {

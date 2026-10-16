@@ -12,13 +12,21 @@ pub(super) struct Epoch3 {
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct RoleEpochs3 {
 	pub(super) original: [Digest2; 3],
+	pub(super) frozen: bool,
+	pub(super) transition: Log2,
 	pub(super) successors: [Vec<Epoch3>; 3],
 }
-// The reserved b2 flag/coordinate is exactly zero in b1. It is not executable freeze state.
+// The retained transition makes freeze/unfreeze envelopes single-use.
 impl RoleEpochs3 {
 	pub(super) fn empty(original: [Digest2; 3]) -> Self {
 		Self {
 			original,
+			frozen: false,
+			transition: Log2 {
+				term: 0,
+				node: 0,
+				index: 0,
+			},
 			successors: std::array::from_fn(|_| Vec::new()),
 		}
 	}
@@ -56,7 +64,10 @@ impl RoleEpochs3 {
 				emit(&e.activated.index.to_le_bytes());
 			}
 		}
-		emit(&[0; 21]);
+		emit(&[u8::from(self.frozen)]);
+		emit(&self.transition.term.to_le_bytes());
+		emit(&self.transition.node.to_le_bytes());
+		emit(&self.transition.index.to_le_bytes());
 		Ok(())
 	}
 	pub(super) fn read(r: &mut Read2<'_>) -> Result2<Self> {
@@ -64,9 +75,6 @@ impl RoleEpochs3 {
 		let counts: [u8; 3] = r.array()?;
 		if counts.iter().any(|&n| usize::from(n) > SUCCESSORS3) {
 			return Err(RootError2::Limit);
-		}
-		if counts == [0; 3] {
-			return Err(RootError2::Codec);
 		}
 		let mut successors = std::array::from_fn(|_| Vec::new());
 		for i in 0..3 {
@@ -80,11 +88,23 @@ impl RoleEpochs3 {
 				});
 			}
 		}
-		if r.take(21)? != [0; 21] {
+		let frozen = match r.u8()? {
+			0 => false,
+			1 => true,
+			_ => return Err(RootError2::Codec),
+		};
+		let transition = r.optional_log()?.unwrap_or(Log2 {
+			term: 0,
+			node: 0,
+			index: 0,
+		});
+		if transition.index == 0 && (frozen || counts == [0; 3]) {
 			return Err(RootError2::Codec);
 		}
 		Ok(Self {
 			original,
+			frozen,
+			transition,
 			successors,
 		})
 	}
@@ -97,9 +117,28 @@ pub(super) fn validate(s: &State2, coords: &mut BTreeSet<u64>) -> Result2<()> {
 		return Ok(());
 	};
 	if s.control_len != super::admin::manifest::ADMIN_MANIFEST_P3_BYTES3 as u64
-		|| e.successors.iter().all(Vec::is_empty)
+		|| (e.successors.iter().all(Vec::is_empty) && e.transition.index == 0)
 	{
 		return Err(RootError2::RootInvariant);
+	}
+	if e.transition.index == 0 {
+		if e.frozen
+			|| e.transition
+				!= (Log2 {
+					term: 0,
+					node: 0,
+					index: 0,
+				}) {
+			return Err(RootError2::RootInvariant);
+		}
+	} else {
+		valid_log(e.transition)?;
+		if e.transition.index <= s.bootstrap.index
+			|| e.transition.index > s.covered.index
+			|| !coords.insert(e.transition.index)
+		{
+			return Err(RootError2::RootInvariant);
+		}
 	}
 	e.charge()?;
 	let mut keys = BTreeSet::new();

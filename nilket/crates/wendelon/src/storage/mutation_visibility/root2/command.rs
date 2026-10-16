@@ -67,6 +67,8 @@ pub enum Command2 {
 	RotateGovernance(Digest2),
 	RotateRecovery(Digest2),
 	EpochAdmissionPermission([u8; super::admin_statement::EPOCH_STATEMENT_BYTES3]),
+	Freeze(Log2),
+	Unfreeze(Log2),
 }
 impl std::fmt::Debug for Command2 {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -229,6 +231,24 @@ impl Wire2 for Command2 {
 				b.push(13);
 				b.extend(node.to_le_bytes());
 			}
+			Self::Freeze(binding) | Self::Unfreeze(binding) => {
+				if *binding
+					!= (Log2 {
+						term: 0,
+						node: 0,
+						index: 0,
+					}) {
+					valid_log(*binding)?;
+				}
+				b.push(if matches!(self, Self::Freeze(_)) {
+					18
+				} else {
+					19
+				});
+				b.extend(binding.term.to_le_bytes());
+				b.extend(binding.node.to_le_bytes());
+				b.extend(binding.index.to_le_bytes());
+			}
 			Self::RotateAdmin(key) => {
 				b.push(14);
 				b.extend(key);
@@ -256,7 +276,8 @@ impl Wire2 for Command2 {
 		Ok(())
 	}
 	fn read(r: &mut Read2<'_>) -> Result2<Self> {
-		Ok(match r.u8()? {
+		let kind = r.u8()?;
+		Ok(match kind {
 			0 => {
 				let epoch = r.u64()?;
 				if epoch == 0 {
@@ -369,6 +390,18 @@ impl Wire2 for Command2 {
 					.map_err(|_| RootError2::Codec)?;
 				Self::EpochAdmissionPermission(x)
 			}
+			18 | 19 => {
+				let binding = r.optional_log()?.unwrap_or(Log2 {
+					term: 0,
+					node: 0,
+					index: 0,
+				});
+				if kind == 18 {
+					Self::Freeze(binding)
+				} else {
+					Self::Unfreeze(binding)
+				}
+			}
 			_ => return Err(RootError2::Codec),
 		})
 	}
@@ -442,10 +475,10 @@ fn result_relation(v: &ApplyResult2, g: [u8; 16], p: Log2) -> Result2<()> {
 	}
 	Ok(())
 }
-// Denied reasons 1..=19; 18 (no permission) carries no reference, 19 (revoked) carries one.
+// Denied reasons 1..=24; 18 and 20..=24 carry no reference, 19 (revoked) carries one.
 fn denied_shape(reason: u16, reference: Option<Log2>) -> Result2<()> {
 	let shaped = match reason {
-		18 | 20..=22 => reference.is_none(),
+		18 | 20..=24 => reference.is_none(),
 		19 => reference.is_some(),
 		1..=17 => true,
 		_ => false,
@@ -627,7 +660,7 @@ impl Wire2 for ApplyResult2 {
 			}
 			6 => {
 				let reason = r.u16()?;
-				if !(1..=22).contains(&reason) {
+				if !(1..=24).contains(&reason) {
 					return Err(RootError2::Codec);
 				}
 				let reference = r.optional_log()?;

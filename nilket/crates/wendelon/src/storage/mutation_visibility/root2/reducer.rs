@@ -97,7 +97,9 @@ impl Root2 {
 		}
 		// Immutable path-copy candidate: prior roots and payloads remain unchanged.
 		let mut next = old.clone();
-		let result = if verified.authorized() {
+		let result = if super::role_freeze::blocked(&old.state, command) {
+			denied(23, None)
+		} else if verified.authorized() {
 			apply(&mut next, command, l, verified)?
 		} else {
 			denied(8, None)
@@ -176,6 +178,9 @@ fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Res
 	let limits = root.limits;
 	match cmd {
 		Command2::Bootstrap { .. } => Ok(denied(1, Some(s.bootstrap))),
+		Command2::Freeze(_) | Command2::Unfreeze(_) => {
+			super::role_freeze::transition(root, cmd, l, v.role_seed3())
+		}
 		Command2::RotateAdmin(key) => super::role_epochs::rotate(root, 0, *key, l, v.role_seed3()),
 		Command2::RotateGovernance(key) => {
 			super::role_epochs::rotate(root, 1, *key, l, v.role_seed3())

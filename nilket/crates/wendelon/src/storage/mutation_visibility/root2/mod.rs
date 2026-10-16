@@ -55,6 +55,7 @@ mod replay;
 #[allow(dead_code)] // Dormant role proof verification; no runtime producer.
 mod role_command;
 mod role_epochs;
+mod role_freeze;
 mod state;
 mod stored;
 mod trust;
