@@ -623,7 +623,9 @@ pub(crate) fn install_local_views(module: &mut Module) -> Result<(), String> {
 		.build()
 		.map_err(module_error)?;
 	module
-		.function("__is_presentation", |value: Value| is_presentation_value(&value))
+		.function("__is_presentation", |value: Value| {
+			is_presentation_value(&value)
+		})
 		.build()
 		.map_err(module_error)?;
 	Ok(())
@@ -4691,16 +4693,27 @@ mod tests {
 		] }";
 		let context = build_context().unwrap();
 		let mut sources = Sources::new();
-		sources.insert(Source::new("guard", source).unwrap()).unwrap();
-		let unit = rune::prepare(&mut sources).with_context(&context).build().unwrap();
+		sources
+			.insert(Source::new("guard", source).unwrap())
+			.unwrap();
+		let unit = rune::prepare(&mut sources)
+			.with_context(&context)
+			.build()
+			.unwrap();
 		let mut vm = Vm::new(Arc::new(context.runtime().unwrap()), Arc::new(unit));
 		let values = vm.call(["main"], ()).unwrap();
 		let values = values.borrow_ref::<rune::runtime::Vec>().unwrap();
 		let recognised: Vec<bool> = values.iter().map(is_presentation_value).collect();
-		assert_eq!(recognised, [true, true, true, true, true, true, false, false]);
+		assert_eq!(
+			recognised,
+			[true, true, true, true, true, true, false, false]
+		);
 		// Every family seen above is a distinct registered type.
-		let families: HashSet<rune::Hash> =
-			values.iter().take(6).map(|value| value.type_hash()).collect();
+		let families: HashSet<rune::Hash> = values
+			.iter()
+			.take(6)
+			.map(|value| value.type_hash())
+			.collect();
 		assert_eq!(families.len(), presentation_type_hashes().len());
 	}
 
