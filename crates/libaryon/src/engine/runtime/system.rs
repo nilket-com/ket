@@ -4884,7 +4884,7 @@ mod tests {
 	/// latest viewport.
 	fn load_rs_and_wait_for_graft(
 		tx_cmd: &crate::engine::CommandSender,
-		rx_view: &std::sync::mpsc::Receiver<crate::uast::Viewport>,
+		rx_view: &crate::engine::viewport_channel::ViewportReceiver,
 		path: &str,
 	) -> crate::uast::Viewport {
 		use std::time::Duration;
@@ -4933,7 +4933,7 @@ mod tests {
 	/// stale viewports from prior renders.
 	fn send_refresh_and_recv(
 		tx_cmd: &crate::engine::CommandSender,
-		rx_view: &std::sync::mpsc::Receiver<crate::uast::Viewport>,
+		rx_view: &crate::engine::viewport_channel::ViewportReceiver,
 	) -> crate::uast::Viewport {
 		use std::time::Duration;
 		while rx_view.try_recv().is_ok() {}
@@ -4952,7 +4952,7 @@ mod tests {
 
 	fn send_cmd_and_recv(
 		tx_cmd: &crate::engine::CommandSender,
-		rx_view: &std::sync::mpsc::Receiver<crate::uast::Viewport>,
+		rx_view: &crate::engine::viewport_channel::ViewportReceiver,
 		cmd: EditorCommand,
 	) -> crate::uast::Viewport {
 		use std::time::Duration;
@@ -5292,7 +5292,7 @@ mod tests {
 	/// wait for `line_count` to become `Some`, or it races the scan.
 	fn wait_for_exact_line_count(
 		tx_cmd: &crate::engine::CommandSender,
-		rx_view: &std::sync::mpsc::Receiver<crate::uast::Viewport>,
+		rx_view: &crate::engine::viewport_channel::ViewportReceiver,
 		mut view: crate::uast::Viewport,
 	) -> crate::uast::Viewport {
 		use std::time::Duration;
@@ -5312,7 +5312,7 @@ mod tests {
 
 	fn wait_for_dma(
 		tx_cmd: &crate::engine::CommandSender,
-		rx_view: &std::sync::mpsc::Receiver<crate::uast::Viewport>,
+		rx_view: &crate::engine::viewport_channel::ViewportReceiver,
 		mut view: crate::uast::Viewport,
 	) -> crate::uast::Viewport {
 		use std::time::Duration;
@@ -5851,7 +5851,7 @@ mod tests {
 	/// which can drop the one-shot field, so this scans every projection.
 	fn query_document_text(
 		tx_cmd: &crate::engine::CommandSender,
-		rx_view: &std::sync::mpsc::Receiver<crate::uast::Viewport>,
+		rx_view: &crate::engine::viewport_channel::ViewportReceiver,
 	) -> String {
 		use std::time::Duration;
 		while rx_view.try_recv().is_ok() {}
@@ -5937,7 +5937,7 @@ mod tests {
 	/// `pane_text` can see them.
 	fn load_and_wait_for_dma(
 		tx_cmd: &crate::engine::CommandSender,
-		rx_view: &std::sync::mpsc::Receiver<crate::uast::Viewport>,
+		rx_view: &crate::engine::viewport_channel::ViewportReceiver,
 		path: &str,
 	) -> crate::uast::Viewport {
 		use std::time::Duration;

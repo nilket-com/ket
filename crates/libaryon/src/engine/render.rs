@@ -26,6 +26,7 @@ use crate::core::{
 };
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::SplitDirection;
+use crate::engine::viewport_channel::ViewportSender;
 use crate::svp::SvpResolver;
 use crate::svp::ingest::COLD_INGEST_EXTENT_SIZE;
 use crate::svp::rust_highlight::{HighlightSpan, HighlightSpanIndex, TokenCategory};
@@ -38,13 +39,13 @@ use crate::uast::{PaneViewport, RenderToken, Viewport};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 
 pub(crate) struct RenderParams<'a> {
 	pub(crate) registry: &'a Arc<UastRegistry>,
 	pub(crate) resolver: &'a Arc<SvpResolver>,
 	pub(crate) tx_internal: &'a super::request::InternalSender,
-	pub(crate) tx_view: &'a mpsc::Sender<Viewport>,
+	pub(crate) tx_view: &'a ViewportSender,
 	pub(crate) reactor: &'a SemanticReactor,
 	pub(crate) lang_registry: &'a Arc<LanguageRegistry>,
 	pub(crate) session: &'a mut EditorSession,

@@ -4,9 +4,9 @@ use crate::engine::language::LanguageRegistry;
 use crate::engine::settings::SaveDurability;
 use crate::engine::ui_colors::UiColorOverrides;
 use crate::engine::undo::TextDelta;
+use crate::engine::viewport_channel::ViewportSender;
 use crate::svp::SvpResolver;
 use crate::svp::semantic::SemanticReactor;
-use crate::uast::Viewport;
 use regex_automata::meta::Regex;
 use regex_automata::util::syntax;
 use std::collections::BTreeMap;
@@ -214,7 +214,7 @@ pub(crate) struct Engine {
 	pub(super) resolver: Arc<SvpResolver>,
 	pub(super) rx_request: mpsc::Receiver<EngineRequest>,
 	pub(super) tx_internal: InternalSender,
-	pub(super) tx_view: mpsc::Sender<Viewport>,
+	pub(super) tx_view: ViewportSender,
 	/// Ordered, non-coalescing frontend stream; absent when no host attached.
 	pub(super) host_events: Option<super::host_event::HostEventSender>,
 	pub(super) reactor: SemanticReactor,
@@ -252,7 +252,7 @@ impl Engine {
 		resolver: Arc<SvpResolver>,
 		rx_request: mpsc::Receiver<EngineRequest>,
 		tx_internal: InternalSender,
-		tx_view: mpsc::Sender<Viewport>,
+		tx_view: ViewportSender,
 		lang_registry: Arc<LanguageRegistry>,
 		initial_theme_name: String,
 		initial_minimap_enabled: bool,

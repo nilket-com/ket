@@ -4,6 +4,7 @@ use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
 use libaryon::core::{DocLine, PaneId};
+use libaryon::engine::viewport_channel::ViewportReceiver;
 use libaryon::engine::{EditorCommand, EditorMode, InputEvent, InputSender, KeyCode, Modifiers};
 use libaryon::uast::projection::Viewport;
 use ratatui::{Terminal, backend::Backend};
@@ -16,8 +17,11 @@ use std::time::{Duration, Instant};
 
 const BUSY_SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 
-fn poll_engine_item<T>(receiver: &mpsc::Receiver<T>, disconnected: &Cell<bool>) -> Option<T> {
-	match receiver.try_recv() {
+fn poll_engine_item<T>(
+	try_recv: impl FnOnce() -> Result<T, mpsc::TryRecvError>,
+	disconnected: &Cell<bool>,
+) -> Option<T> {
+	match try_recv() {
 		Ok(item) => Some(item),
 		Err(mpsc::TryRecvError::Empty) => None,
 		Err(mpsc::TryRecvError::Disconnected) => {
@@ -64,7 +68,7 @@ pub struct Frontend<B: Backend + io::Write> {
 	pub(super) tx_input: InputSender,
 	pending_requests: RefCell<VecDeque<PendingEngineRequest>>,
 	engine_disconnected: Cell<bool>,
-	pub(super) rx_view: mpsc::Receiver<Viewport>,
+	pub(super) rx_view: ViewportReceiver,
 	pub(super) current_viewport: Option<Viewport>,
 	pub(super) status_message: Option<String>,
 	pub(super) needs_redraw: bool,
@@ -84,7 +88,7 @@ impl<B: Backend + io::Write> Frontend<B> {
 		terminal: Terminal<B>,
 		tx_cmd: impl CommandSink + 'static,
 		tx_input: InputSender,
-		rx_view: mpsc::Receiver<Viewport>,
+		rx_view: ViewportReceiver,
 	) -> Self {
 		let image_picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
 		Self {
@@ -130,7 +134,9 @@ impl<B: Backend + io::Write> Frontend<B> {
 			got_new_view |= self.diff_bridge.poll();
 			got_new_view |= self.uast_graph.poll();
 
-			while let Some(view) = poll_engine_item(&self.rx_view, &self.engine_disconnected) {
+			while let Some(view) =
+				poll_engine_item(|| self.rx_view.try_recv(), &self.engine_disconnected)
+			{
 				let completion_finished = self.current_viewport.as_ref().is_some_and(|current| {
 					current.input.completion == libaryon::engine::InputCompletionStatus::Pending
 						&& view.input.completion == libaryon::engine::InputCompletionStatus::Idle
@@ -386,15 +392,15 @@ mod receiver_tests {
 	fn viewport_channel_disconnect_is_observable_without_an_outgoing_request() {
 		let (tx, rx) = mpsc::channel();
 		let disconnected = Cell::new(false);
-		assert_eq!(poll_engine_item(&rx, &disconnected), None);
+		assert_eq!(poll_engine_item(|| rx.try_recv(), &disconnected), None);
 		assert!(
 			!disconnected.get(),
 			"an empty live channel remains connected"
 		);
 		tx.send(7_u8).expect("queue viewport");
-		assert_eq!(poll_engine_item(&rx, &disconnected), Some(7));
+		assert_eq!(poll_engine_item(|| rx.try_recv(), &disconnected), Some(7));
 		drop(tx);
-		assert_eq!(poll_engine_item(&rx, &disconnected), None);
+		assert_eq!(poll_engine_item(|| rx.try_recv(), &disconnected), None);
 		assert!(disconnected.get(), "channel closure must stop the TUI loop");
 	}
 }

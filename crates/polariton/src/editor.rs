@@ -33,6 +33,7 @@ use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, PaneRect, Rgb, View
 #[cfg(feature = "toron")]
 use libaryon::core::{SavedSession, Writable};
 #[cfg(feature = "toron")]
+use libaryon::engine::viewport_channel::{self, ViewportReceiver};
 use libaryon::engine::{ApplicationCheckpointWitness, ApplicationOwnerId, SessionCheckpointError};
 use libaryon::engine::{
 	EditorCommand, EditorMode, EngineConfig, EngineHandle, InputEvent, KeyCode, LanguageId,
@@ -256,11 +257,6 @@ pub(crate) struct PlotWritebackContext {
 	pub(crate) drafts: std::collections::HashMap<crate::presentation_registry::SettingKey, String>,
 }
 
-enum EngineOutput {
-	Viewport(Box<Viewport>),
-	HostEvent(HostEvent),
-}
-
 #[derive(Clone)]
 struct EngineWake {
 	id: usize,
@@ -390,7 +386,11 @@ pub struct CodeEditor {
 	engine: Option<EngineHandle>,
 	commands: libaryon::engine::CommandSender,
 	input: libaryon::engine::InputSender,
-	engine_outputs: Receiver<EngineOutput>,
+	/// Ordered, never coalesced; see `take_host_events`.
+	engine_events: Receiver<HostEvent>,
+	/// Latest-wins, like the engine's own stream, so a stalled update path
+	/// holds one projection rather than every one since it stalled.
+	engine_viewports: ViewportReceiver,
 	engine_wake: EngineWake,
 	viewport: Option<Viewport>,
 	/// Latest complete text snapshot for each buffer the host has observed.
@@ -1076,16 +1076,13 @@ impl CodeEditor {
 		let host_events = engine
 			.take_host_events()
 			.expect("new engine owns host event receiver");
-		let (output_tx, engine_outputs) = std::sync::mpsc::channel();
+		let (event_tx, engine_events) = std::sync::mpsc::channel();
+		let (viewport_tx, engine_viewports) = viewport_channel::channel();
 		let (wake_tx, wake_rx) = iced::futures::channel::mpsc::unbounded();
-		let viewport_output_tx = output_tx.clone();
 		let viewport_wake_tx = wake_tx.clone();
 		std::thread::spawn(move || {
 			while let Ok(viewport) = viewports.recv() {
-				if viewport_output_tx
-					.send(EngineOutput::Viewport(Box::new(viewport)))
-					.is_err()
-				{
+				if viewport_tx.send(viewport).is_err() {
 					break;
 				}
 				let _ = viewport_wake_tx.unbounded_send(());
@@ -1093,7 +1090,7 @@ impl CodeEditor {
 		});
 		std::thread::spawn(move || {
 			while let Ok(event) = host_events.recv() {
-				if output_tx.send(EngineOutput::HostEvent(event)).is_err() {
+				if event_tx.send(event).is_err() {
 					break;
 				}
 				let _ = wake_tx.unbounded_send(());
@@ -1108,7 +1105,8 @@ impl CodeEditor {
 			engine: Some(engine),
 			commands,
 			input,
-			engine_outputs,
+			engine_events,
+			engine_viewports,
 			engine_wake,
 			viewport: None,
 			document_texts: HashMap::new(),
@@ -3028,17 +3026,15 @@ impl CodeEditor {
 	pub fn poll(&mut self) -> bool {
 		let mut changed = false;
 		let mut events = Vec::new();
-		while let Ok(output) = self.engine_outputs.try_recv() {
-			let EngineOutput::Viewport(viewport) = output else {
-				if let EngineOutput::HostEvent(event) = output {
-					if let HostEvent::DocumentEditResult(result) = &event {
-						self.document_edit_results.push_back(result.clone());
-					}
-					events.push(event);
-				}
-				continue;
-			};
-			let viewport = *viewport;
+		while let Ok(event) = self.engine_events.try_recv() {
+			if let HostEvent::DocumentEditResult(result) = &event {
+				self.document_edit_results.push_back(result.clone());
+			}
+			events.push(event);
+		}
+		// No order between the two streams is relied on: events are applied
+		// below, after the latest projection, and edit results queue apart.
+		while let Ok(viewport) = self.engine_viewports.try_recv() {
 			let was_busy = self.viewport.as_ref().is_some_and(|viewport| viewport.busy);
 			if viewport.busy && !was_busy {
 				self.busy_spinner.restart(time::Instant::now());
@@ -8107,6 +8103,41 @@ mod tests {
 
 		assert_eq!(snapshot.buffer_id, editor.active_buffer_id().unwrap());
 		assert_eq!(snapshot.text, expected);
+	}
+
+	#[test]
+	fn document_text_replies_survive_a_stalled_poll_in_request_order() {
+		let original = "select 1";
+		let mut editor = CodeEditor::new(original);
+		wait_for_content(&mut editor, original);
+
+		// Edits, cache queries and execution barriers queue while nothing
+		// polls, so the engine renders many frames no one reads. Every reply
+		// must still arrive and pair with its own request.
+		let first = editor.request_execution_snapshot().expect("first request");
+		send_keys(&mut editor, "A, 2".chars());
+		let second = editor.request_execution_snapshot().expect("second request");
+		send_keys(&mut editor, ", 3".chars());
+		let third = editor.request_execution_snapshot().expect("third request");
+		thread::sleep(Duration::from_millis(500));
+
+		let deadline = Instant::now() + Duration::from_secs(10);
+		let mut snapshots = [None, None, None];
+		while snapshots.iter().any(Option::is_none) {
+			editor.poll();
+			for (slot, request) in snapshots.iter_mut().zip([first, second, third]) {
+				if slot.is_none() {
+					*slot = editor.take_execution_snapshot(request);
+				}
+			}
+			assert!(
+				Instant::now() < deadline,
+				"every execution snapshot completes"
+			);
+			thread::sleep(Duration::from_millis(5));
+		}
+		let texts = snapshots.map(|snapshot| snapshot.expect("snapshot").text);
+		assert_eq!(texts, ["select 1", "select 1, 2", "select 1, 2, 3"]);
 	}
 
 	#[test]

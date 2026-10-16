@@ -47,6 +47,7 @@ mod uast_inspector;
 pub mod uast_query;
 pub mod ui_colors;
 pub mod undo;
+pub mod viewport_channel;
 
 pub(crate) use self::core::MAX_SEMANTIC_BYTES;
 pub use self::document::selection::resolve_visual_ranges;

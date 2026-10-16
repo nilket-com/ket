@@ -1156,7 +1156,7 @@ impl DispatchOutcome {
 struct DispatchContext<'a, 'runtime> {
 	runtime: &'a RuntimeContext<'runtime>,
 	tx_internal: &'a super::request::InternalSender,
-	tx_view: &'a std::sync::mpsc::Sender<crate::uast::Viewport>,
+	tx_view: &'a crate::engine::viewport_channel::ViewportSender,
 	reactor: &'a crate::svp::semantic::SemanticReactor,
 	resolver: &'a std::sync::Arc<SvpResolver>,
 	lang_registry: &'a std::sync::Arc<super::language::LanguageRegistry>,
@@ -5645,7 +5645,7 @@ fn write_encrypted_focused(
 fn load_encrypted_focused(
 	runtime: &RuntimeContext<'_>,
 	tx_internal: &super::request::InternalSender,
-	tx_view: &std::sync::mpsc::Sender<crate::uast::Viewport>,
+	tx_view: &crate::engine::viewport_channel::ViewportSender,
 	reactor: &crate::svp::semantic::SemanticReactor,
 	resolver: &std::sync::Arc<SvpResolver>,
 	lang_registry: &std::sync::Arc<super::language::LanguageRegistry>,
@@ -6245,7 +6245,7 @@ mod event_bus_integration_tests {
 	struct RunningTestEngine {
 		commands: CommandSender,
 		events: mpsc::Receiver<EngineEvent>,
-		_views: mpsc::Receiver<crate::uast::projection::Viewport>,
+		_views: crate::engine::viewport_channel::ViewportReceiver,
 		registry: Arc<UastRegistry>,
 		resolver: Arc<SvpResolver>,
 		thread: thread::JoinHandle<()>,
@@ -6458,7 +6458,7 @@ mod event_bus_integration_tests {
 		navigation_provider: NavigationTestProvider,
 	) -> RunningTestEngine {
 		let (commands, _input, internal, requests) = crate::engine::request::channel();
-		let (tx_view, views) = mpsc::channel();
+		let (tx_view, views) = crate::engine::viewport_channel::channel();
 		let (tx_event, events) = mpsc::channel();
 		let registry = Arc::new(UastRegistry::new(16_384));
 		let (tx_notify, _notifications) = mpsc::channel();
@@ -6508,7 +6508,7 @@ mod event_bus_integration_tests {
 	}
 
 	fn recv_viewport_until(
-		views: &mpsc::Receiver<crate::uast::projection::Viewport>,
+		views: &crate::engine::viewport_channel::ViewportReceiver,
 		timeout: Duration,
 		mut accept: impl FnMut(&crate::uast::projection::Viewport) -> bool,
 	) -> crate::uast::projection::Viewport {
@@ -6597,7 +6597,7 @@ mod event_bus_integration_tests {
 	#[test]
 	fn real_loop_initializes_and_routes_language_neutral_subscribers() {
 		let (commands, _input, internal, requests) = crate::engine::request::channel();
-		let (tx_view, views) = mpsc::channel();
+		let (tx_view, views) = crate::engine::viewport_channel::channel();
 		let (tx_subscriber, subscriber_messages) = mpsc::channel();
 		let registry = Arc::new(UastRegistry::new(16_384));
 		let (tx_notify, _notifications) = mpsc::channel();
@@ -6672,7 +6672,7 @@ mod event_bus_integration_tests {
 	#[test]
 	fn rune_typed_subscriber_never_falls_through_to_the_boxed_dispatcher() {
 		let (commands, _input, internal, requests) = crate::engine::request::channel();
-		let (tx_view, views) = mpsc::channel();
+		let (tx_view, views) = crate::engine::viewport_channel::channel();
 		let (tx_subscriber, subscriber_messages) = mpsc::channel();
 		let registry = Arc::new(UastRegistry::new(16_384));
 		let (tx_notify, _notifications) = mpsc::channel();
@@ -6756,7 +6756,7 @@ pub fn main(editor) {
 		)
 		.expect("write Rune subscriber init");
 		let (commands, _input, internal, requests) = crate::engine::request::channel();
-		let (tx_view, views) = mpsc::channel();
+		let (tx_view, views) = crate::engine::viewport_channel::channel();
 		let (tx_subscriber, subscriber_messages) = mpsc::channel();
 		let registry = Arc::new(UastRegistry::new(16_384));
 		let (tx_notify, _notifications) = mpsc::channel();
@@ -8346,7 +8346,7 @@ pub fn main(editor) {
 	#[test]
 	fn idle_run_loop_delivers_jobs_and_a_callback_can_chain_a_followup() {
 		let (commands, _input, internal, requests) = crate::engine::request::channel();
-		let (tx_view, _views) = mpsc::channel();
+		let (tx_view, _views) = crate::engine::viewport_channel::channel();
 		let (tx_job, rx_job) = mpsc::channel();
 		let registry = Arc::new(UastRegistry::new(16_384));
 		let (tx_notify, _notifications) = mpsc::channel();
@@ -8440,7 +8440,7 @@ pub fn main(editor) {
 	#[test]
 	fn rune_job_payloads_fail_closed_without_reaching_the_boxed_fallback() {
 		let (commands, _input, internal, requests) = crate::engine::request::channel();
-		let (tx_view, views) = mpsc::channel();
+		let (tx_view, views) = crate::engine::viewport_channel::channel();
 		let (tx_called, rx_called) = mpsc::channel();
 		let registry = Arc::new(UastRegistry::new(16_384));
 		let (tx_notify, _notifications) = mpsc::channel();
@@ -8518,7 +8518,7 @@ pub fn main(editor) {
 		let mut samples = Vec::new();
 		for sample in 0..3 {
 			let (commands, input, internal, requests) = crate::engine::request::channel();
-			let (tx_view, views) = mpsc::channel();
+			let (tx_view, views) = crate::engine::viewport_channel::channel();
 			let registry = Arc::new(UastRegistry::new(16_384));
 			let (tx_notify, _notifications) = mpsc::channel();
 			let resolver = Arc::new(SvpResolver::new_blocking_for_tests(
@@ -8703,7 +8703,7 @@ pub fn main(editor) {
 	#[test]
 	fn job_completion_waits_for_a_suspended_event_pass_boundary() {
 		let (commands, _input, internal, requests) = crate::engine::request::channel();
-		let (tx_view, _views) = mpsc::channel();
+		let (tx_view, _views) = crate::engine::viewport_channel::channel();
 		let (tx_order, rx_order) = mpsc::channel();
 		let registry = Arc::new(UastRegistry::new(16_384));
 		let (tx_notify, _notifications) = mpsc::channel();

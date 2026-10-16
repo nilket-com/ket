@@ -9,13 +9,13 @@
 
 use libaryon::core::SessionStore;
 use libaryon::engine::settings::EngineSettings;
+use libaryon::engine::viewport_channel::ViewportReceiver;
 use libaryon::engine::{EditorCommand, EngineConfig, EngineHandle};
 use libaryon::uast::Viewport;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SAMPLES: usize = 9;
@@ -272,7 +272,7 @@ fn has_text(viewport: &Viewport) -> bool {
 		.is_some_and(|pane| pane.tokens.iter().any(|token| !token.text.is_empty()))
 }
 
-fn receive(viewports: &Receiver<Viewport>, until: Instant, scenario: &str, what: &str) -> Viewport {
+fn receive(viewports: &ViewportReceiver, until: Instant, scenario: &str, what: &str) -> Viewport {
 	viewports
 		.recv_timeout(until.saturating_duration_since(Instant::now()))
 		.unwrap_or_else(|error| panic!("{scenario}: no {what} within {DEADLINE:?} ({error})"))

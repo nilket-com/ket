@@ -6,6 +6,7 @@ use super::settings::EngineSettings;
 use crate::core::expand_path;
 use crate::core::{SavedSession, Writable};
 use crate::ecs::registry::UastRegistry;
+use crate::engine::viewport_channel::ViewportReceiver;
 use crate::svp::bash_provider::BashProvider;
 use crate::svp::csv_provider::{CsvProvider, TsvProvider};
 use crate::svp::fs_provider::FsProvider;
@@ -18,7 +19,6 @@ use crate::svp::rune_provider::RuneProvider;
 use crate::svp::rust_provider::RustProvider;
 use crate::svp::sql_provider::SqlProvider;
 use crate::svp::toml_provider::TomlProvider;
-use crate::uast::projection::Viewport;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -80,7 +80,7 @@ pub struct EngineHandle {
 	commands: CommandSender,
 	input: InputSender,
 	internal: InternalSender,
-	viewports: Option<mpsc::Receiver<Viewport>>,
+	viewports: Option<ViewportReceiver>,
 	host_events: Option<mpsc::Receiver<super::host_event::HostEvent>>,
 	engine_thread: Option<thread::JoinHandle<()>>,
 	bridge_thread: Option<thread::JoinHandle<()>>,
@@ -134,7 +134,7 @@ impl EngineHandle {
 		application_owner: Option<super::session_checkpoint::ApplicationOwnerId>,
 	) -> Result<Self, super::session_checkpoint::SessionRestoreError> {
 		let (commands, input, internal, rx_request) = super::request::channel();
-		let (tx_view, rx_view) = mpsc::channel::<Viewport>();
+		let (tx_view, rx_view) = crate::engine::viewport_channel::channel();
 		let (tx_host_events, rx_host_events) = super::host_event::channel();
 		let (tx_io_notify, rx_io_notify) =
 			mpsc::channel::<crate::svp::resolver::ResolverNotification>();
@@ -312,7 +312,7 @@ impl EngineHandle {
 		self.input.clone()
 	}
 
-	pub fn take_viewports(&mut self) -> Option<mpsc::Receiver<Viewport>> {
+	pub fn take_viewports(&mut self) -> Option<ViewportReceiver> {
 		self.viewports.take()
 	}
 
@@ -392,7 +392,7 @@ mod tests {
 	};
 
 	fn document_reply(
-		viewports: &std::sync::mpsc::Receiver<crate::uast::Viewport>,
+		viewports: &crate::engine::viewport_channel::ViewportReceiver,
 	) -> crate::uast::Viewport {
 		let deadline = Instant::now() + Duration::from_secs(10);
 		loop {
@@ -609,7 +609,7 @@ mod tests {
 	}
 
 	fn recv_viewport_until(
-		viewports: &std::sync::mpsc::Receiver<Viewport>,
+		viewports: &crate::engine::viewport_channel::ViewportReceiver,
 		description: &str,
 		predicate: impl FnMut(&Viewport) -> bool,
 	) -> Viewport {
@@ -617,7 +617,7 @@ mod tests {
 	}
 
 	fn recv_viewport_until_with_timeout(
-		viewports: &std::sync::mpsc::Receiver<Viewport>,
+		viewports: &crate::engine::viewport_channel::ViewportReceiver,
 		description: &str,
 		timeout: Duration,
 		mut predicate: impl FnMut(&Viewport) -> bool,
@@ -1679,7 +1679,10 @@ mod tests {
 		dir: &std::path::Path,
 		file_name: &str,
 		worktree: &[u8],
-	) -> (super::CommandSender, std::sync::mpsc::Receiver<Viewport>) {
+	) -> (
+		super::CommandSender,
+		crate::engine::viewport_channel::ViewportReceiver,
+	) {
 		let commands = engine.command_sender();
 		let viewports = engine.take_viewports().expect("viewport receiver");
 		commands
