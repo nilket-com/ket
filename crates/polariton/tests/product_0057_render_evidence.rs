@@ -43,11 +43,11 @@ mod result_registry;
 mod result_summary;
 #[path = "../src/rune_host.rs"]
 mod rune_host;
-#[path = "../src/rune_local.rs"]
-mod rune_local;
 #[cfg(feature = "toron")]
 #[path = "../src/rune_instrument.rs"]
 mod rune_instrument;
+#[path = "../src/rune_local.rs"]
+mod rune_local;
 #[cfg(feature = "toron")]
 #[path = "../src/rune_presentation.rs"]
 mod rune_presentation;

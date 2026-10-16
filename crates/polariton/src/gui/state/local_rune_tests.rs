@@ -555,10 +555,17 @@ fn a_batch_replaces_the_panes_whole() {
 #[test]
 fn run_source_settles_after_the_whole_batch() {
 	use crate::driver::{Command, Outcome};
-	let mut f = Fixture::open("batch-receipt", &panes_source(&[("one", 3), ("two", 4)], false));
+	let mut f = Fixture::open(
+		"batch-receipt",
+		&panes_source(&[("one", 3), ("two", 4)], false),
+	);
 	let receipt = f.app.apply_command(&Command::RunSource {});
 	assert_eq!(receipt.outcome, Outcome::Applied, "{receipt:?}");
-	assert_eq!(receipt.figures.as_ref().map(Vec::len), Some(2), "{receipt:?}");
+	assert_eq!(
+		receipt.figures.as_ref().map(Vec::len),
+		Some(2),
+		"{receipt:?}"
+	);
 }
 
 mod agent_api {
@@ -585,7 +592,9 @@ mod agent_api {
 		if receipt.outcome != Outcome::Applied {
 			return Err(receipt);
 		}
-		Ok(std::fs::read_dir(directory.join("figures")).unwrap().count())
+		Ok(std::fs::read_dir(directory.join("figures"))
+			.unwrap()
+			.count())
 	}
 
 	fn run(f: &mut Fixture) -> CommandReceipt {
@@ -621,12 +630,18 @@ mod agent_api {
 		assert_eq!(statuses(&one), orphaned);
 		let described = f.app.apply_command(&Command::Describe {});
 		assert_eq!(statuses(&described), orphaned);
-		assert_eq!(published(&mut f, "one").unwrap(), 1, "orphans are not published");
+		assert_eq!(
+			published(&mut f, "one").unwrap(),
+			1,
+			"orphans are not published"
+		);
 
 		f.replace_source("pub fn main(workspace, viz) {}\n");
 		let none = run(&mut f);
 		assert!(
-			statuses(&none).iter().all(|(_, status)| status == "orphaned"),
+			statuses(&none)
+				.iter()
+				.all(|(_, status)| status == "orphaned"),
 			"{:?}",
 			statuses(&none)
 		);
@@ -680,7 +695,10 @@ fn views_source(views: &[(&str, &str)]) -> String {
 #[cfg(feature = "toron")]
 #[test]
 fn a_views_batch_commits_named_panes_that_refuse_writeback() {
-	let mut f = Fixture::open("views-commit", &views_source(&[("alpha", "y"), ("beta", "y")]));
+	let mut f = Fixture::open(
+		"views-commit",
+		&views_source(&[("alpha", "y"), ("beta", "y")]),
+	);
 	f.run_settled();
 	assert_eq!(f.view_names(), vec!["alpha", "beta"]);
 	for name in ["alpha", "beta"] {
@@ -691,7 +709,10 @@ fn a_views_batch_commits_named_panes_that_refuse_writeback() {
 			.rune_view_panel_id(f.buffer, &LocalViewIdentity::Named(name.to_owned()))
 			.expect("a named pane");
 		let editor = &f.app.state().code_editor;
-		assert!(editor.plot_writeback_context(panel).is_none(), "{name} is not source-attached");
+		assert!(
+			editor.plot_writeback_context(panel).is_none(),
+			"{name} is not source-attached"
+		);
 		assert_eq!(
 			editor.plot_writeback_status(panel).as_deref(),
 			Some(LOCAL_WRITEBACK_REFUSAL)

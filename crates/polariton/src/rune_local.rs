@@ -27,7 +27,9 @@
 //! type. Unnamed columns are inferred.
 
 use crate::result_artifact::ResultArtifact;
-use crate::rune_host::{RuneCapabilities, RuneCell, RuneExecution, RuneViz, Surface, decode_return};
+use crate::rune_host::{
+	RuneCapabilities, RuneCell, RuneExecution, RuneViz, Surface, decode_return,
+};
 use polars::prelude::{Column, DataFrame};
 use rune::ast::Spanned;
 use rune::runtime::{Object, Value, VmResult};
@@ -64,26 +66,23 @@ impl Mode {
 
 /// Classify a source by its parsed items.
 pub(crate) fn mode(source: &str) -> Mode {
-	let file = match rune::parse::parse_all::<rune::ast::File>(
-		source,
-		rune::SourceId::empty(),
-		false,
-	) {
-		Ok(file) => file,
-		// A view source is statements, which are not file items. It is
-		// unparsed only if it fails as the body the view compiler wraps it in.
-		Err(error) => {
-			let body = format!("pub fn main(workspace) {{\n{source}\n}}\n");
-			return match rune::parse::parse_all::<rune::ast::File>(
-				&body,
-				rune::SourceId::empty(),
-				false,
-			) {
-				Ok(_) => Mode::Views,
-				Err(_) => Mode::Unparsed(error.to_string()),
-			};
-		}
-	};
+	let file =
+		match rune::parse::parse_all::<rune::ast::File>(source, rune::SourceId::empty(), false) {
+			Ok(file) => file,
+			// A view source is statements, which are not file items. It is
+			// unparsed only if it fails as the body the view compiler wraps it in.
+			Err(error) => {
+				let body = format!("pub fn main(workspace) {{\n{source}\n}}\n");
+				return match rune::parse::parse_all::<rune::ast::File>(
+					&body,
+					rune::SourceId::empty(),
+					false,
+				) {
+					Ok(_) => Mode::Views,
+					Err(_) => Mode::Unparsed(error.to_string()),
+				};
+			}
+		};
 	for (item, _) in &file.items {
 		if let rune::ast::Item::Fn(function) = item
 			&& source.get(function.name.span().range()) == Some("main")
@@ -344,7 +343,9 @@ pub(crate) fn cell_views(
 ) -> VmResult<Result<(), String>> {
 	VmResult::Ok(Err(match cell.views {
 		None => VIEWS_LOCAL_ONLY.to_owned(),
-		Some(_) => "views([...]) needs Polariton's toron feature, which this build lacks".to_owned(),
+		Some(_) => {
+			"views([...]) needs Polariton's toron feature, which this build lacks".to_owned()
+		}
 	}))
 }
 
@@ -388,7 +389,9 @@ fn civil_days(text: &str) -> Option<i32> {
 	}
 	let digits = |range: std::ops::Range<usize>| -> Option<i64> {
 		let part = &text[range];
-		part.bytes().all(|b| b.is_ascii_digit()).then(|| part.parse().ok())?
+		part.bytes()
+			.all(|b| b.is_ascii_digit())
+			.then(|| part.parse().ok())?
 	};
 	let (year, month, day) = (digits(0..4)?, digits(5..7)?, digits(8..10)?);
 	let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
@@ -470,7 +473,10 @@ fn typed_column(name: &str, kind: Kind, cells: &[Cell]) -> Result<Column, String
 			Cell::Bool(_) => "bool",
 			Cell::Text(_) => "string",
 		};
-		format!("frame column `{name}` is declared {} but row {row} is {found}", kind.name())
+		format!(
+			"frame column `{name}` is declared {} but row {row} is {found}",
+			kind.name()
+		)
 	};
 	macro_rules! collect {
 		($pattern:pat => $value:expr) => {{
@@ -506,19 +512,19 @@ fn typed_column(name: &str, kind: Kind, cells: &[Cell]) -> Result<Column, String
 			for (row, cell) in cells.iter().enumerate() {
 				days.push(match cell {
 					Cell::Null => None,
-					Cell::Text(text) => {
-						Some(civil_days(text).ok_or_else(|| {
-							format!(
-								"frame column `{name}` is declared date but row {row} is \"{text}\", not YYYY-MM-DD"
-							)
-						})?)
-					}
+					Cell::Text(text) => Some(civil_days(text).ok_or_else(|| {
+						format!(
+							"frame column `{name}` is declared date but row {row} is \"{text}\", not YYYY-MM-DD"
+						)
+					})?),
 					other => return Err(refuse(row, other)),
 				});
 			}
 			Column::new(name.into(), days)
 				.cast(&polars::prelude::DataType::Date)
-				.map_err(|error| format!("frame column `{name}` could not become a date: {error}"))?
+				.map_err(|error| {
+					format!("frame column `{name}` could not become a date: {error}")
+				})?
 		}
 	};
 	Ok(column)
@@ -684,7 +690,8 @@ fn frame_with(rows: &[Value], declared: &BTreeMap<String, Kind>) -> Result<DataF
 		};
 		columns.push(column);
 	}
-	DataFrame::new(objects.len(), columns).map_err(|error| format!("frame could not be built: {error}"))
+	DataFrame::new(objects.len(), columns)
+		.map_err(|error| format!("frame could not be built: {error}"))
 }
 
 #[cfg(test)]
@@ -800,10 +807,16 @@ mod tests {
 	#[test]
 	fn a_declared_main_selects_the_local_path() {
 		assert_eq!(mode("pub async fn main(workspace, viz) {}"), Mode::Local);
-		assert_eq!(mode("fn helper() {}\npub fn main(w, v) { helper() }"), Mode::Local);
+		assert_eq!(
+			mode("fn helper() {}\npub fn main(w, v) { helper() }"),
+			Mode::Local
+		);
 		assert_eq!(mode("pub fn main() {}"), Mode::LocalArity(0));
 		// A body statement is not an item, and a nested main is not top level.
-		assert_eq!(mode("viz.plot(workspace.cell(\"a\")?).show()?;"), Mode::Views);
+		assert_eq!(
+			mode("viz.plot(workspace.cell(\"a\")?).show()?;"),
+			Mode::Views
+		);
 		assert_eq!(mode("let f = || { fn main(a, b) {} };"), Mode::Views);
 		// Unparseable text is never local; it keeps the existing path.
 		let unparsed = mode("pub fn main(workspace, viz) {");
@@ -834,13 +847,24 @@ mod tests {
 		assert_eq!(name, "DGS10");
 		let frame = data.projection().unwrap();
 		assert_eq!(frame.height(), 3);
-		let yields: Vec<Option<f64>> = frame.column("rate").unwrap().f64().unwrap().into_iter().collect();
+		let yields: Vec<Option<f64>> = frame
+			.column("rate")
+			.unwrap()
+			.f64()
+			.unwrap()
+			.into_iter()
+			.collect();
 		assert_eq!(yields, vec![Some(4.96), Some(4.96), Some(5.11)]);
 		let dates = frame.column("date").unwrap().str().unwrap();
 		assert_eq!(dates.get(2), Some("2026-09-23"));
 	}
 
-	fn stalled_run(stall: &Stall) -> (oneshot::Sender<()>, std::thread::JoinHandle<Result<RuneExecution, String>>) {
+	fn stalled_run(
+		stall: &Stall,
+	) -> (
+		oneshot::Sender<()>,
+		std::thread::JoinHandle<Result<RuneExecution, String>>,
+	) {
 		let source = format!(
 			"pub async fn main(workspace, viz) {{ http::get(\"{}/slow\").await?; Ok(1) }}",
 			stall.url
@@ -929,7 +953,10 @@ mod tests {
 		});
 		let started = Instant::now();
 		while !HANG_POLLED.load(std::sync::atomic::Ordering::SeqCst) {
-			assert!(started.elapsed() < Duration::from_secs(5), "hang was never polled");
+			assert!(
+				started.elapsed() < Duration::from_secs(5),
+				"hang was never polled"
+			);
 			std::thread::sleep(Duration::from_millis(5));
 		}
 		cancel.send(()).unwrap();
@@ -942,7 +969,10 @@ mod tests {
 	/// Call a handler appended to the Treasury exhibit, without its fetches,
 	/// instrumented and located exactly as a run would be.
 	fn exhibit(handlers: &str, handler: &str) -> Result<String, String> {
-		let source = format!("{}\n{handlers}", include_str!("../../../uat/treasury_rates.rn"));
+		let source = format!(
+			"{}\n{handlers}",
+			include_str!("../../../uat/treasury_rates.rn")
+		);
 		let instrumented = crate::rune_instrument::instrument(
 			&source,
 			&crate::rune_instrument::Vocabulary::from_registry(&["view"]),
@@ -1128,7 +1158,10 @@ pub fn main(workspace, viz) {{
 "#
 			);
 			let error = run(&source).unwrap_err();
-			assert!(error.contains("view \"same\" is already defined in this run"), "{error}");
+			assert!(
+				error.contains("view \"same\" is already defined in this run"),
+				"{error}"
+			);
 			assert!(error.starts_with("<test>:5:"), "{error}");
 		}
 
@@ -1147,7 +1180,6 @@ pub fn main(workspace, viz) {{
 			assert!(error.contains("tick_every"), "{error}");
 			let excerpt = error.lines().nth(1).unwrap_or("");
 			assert!(excerpt.contains("tick_every(\"soon\")"), "{error}");
-
 		}
 
 		#[test]
@@ -1239,13 +1271,28 @@ pub fn main(workspace, viz) {
 	fn missing_keys_and_unit_are_null_never_zero() {
 		let rows = vec![
 			object(&[("x", Value::from(1_i64)), ("y", Value::from(2.5))]),
-			object(&[("x", Value::from(2_i64)), ("y", rune::to_value(()).unwrap())]),
+			object(&[
+				("x", Value::from(2_i64)),
+				("y", rune::to_value(()).unwrap()),
+			]),
 			object(&[("x", Value::from(3_i64))]),
 		];
 		let frame = frame(&rows).unwrap();
-		let y: Vec<Option<f64>> = frame.column("y").unwrap().f64().unwrap().into_iter().collect();
+		let y: Vec<Option<f64>> = frame
+			.column("y")
+			.unwrap()
+			.f64()
+			.unwrap()
+			.into_iter()
+			.collect();
 		assert_eq!(y, vec![Some(2.5), None, None]);
-		let x: Vec<Option<i64>> = frame.column("x").unwrap().i64().unwrap().into_iter().collect();
+		let x: Vec<Option<i64>> = frame
+			.column("x")
+			.unwrap()
+			.i64()
+			.unwrap()
+			.into_iter()
+			.collect();
 		assert_eq!(x, vec![Some(1), Some(2), Some(3)]);
 	}
 
@@ -1255,7 +1302,14 @@ pub fn main(workspace, viz) {
 			object(&[("v", Value::from(1_i64))]),
 			object(&[("v", Value::from(1.5))]),
 		];
-		let v: Vec<Option<f64>> = frame(&rows).unwrap().column("v").unwrap().f64().unwrap().into_iter().collect();
+		let v: Vec<Option<f64>> = frame(&rows)
+			.unwrap()
+			.column("v")
+			.unwrap()
+			.f64()
+			.unwrap()
+			.into_iter()
+			.collect();
 		assert_eq!(v, vec![Some(1.0), Some(1.5)]);
 	}
 
@@ -1267,7 +1321,10 @@ pub fn main(workspace, viz) {
 			object(&[("v", rune::to_value(String::from("n/a")).unwrap())]),
 		];
 		let error = frame(&rows).unwrap_err();
-		assert_eq!(error, "frame column `v` mixes float (row 0) and string (row 2)");
+		assert_eq!(
+			error,
+			"frame column `v` mixes float (row 0) and string (row 2)"
+		);
 	}
 
 	fn text(value: &str) -> Value {
@@ -1282,7 +1339,10 @@ pub fn main(workspace, viz) {
 	fn a_declared_date_column_becomes_a_date() {
 		let rows = vec![
 			object(&[("d", text("2026-09-23")), ("v", Value::from(5.11))]),
-			object(&[("d", text("2024-02-29")), ("v", rune::to_value(()).unwrap())]),
+			object(&[
+				("d", text("2024-02-29")),
+				("v", rune::to_value(()).unwrap()),
+			]),
 			object(&[("d", rune::to_value(()).unwrap()), ("v", Value::from(4.0))]),
 		];
 		let frame = frame_with(&rows, &schema(&[("d", Kind::Date)])).unwrap();
@@ -1296,19 +1356,37 @@ pub fn main(workspace, viz) {
 	fn dates_are_never_inferred_from_text() {
 		let rows = vec![object(&[("d", text("2026-09-23"))])];
 		let frame = frame(&rows).unwrap();
-		assert_eq!(frame.column("d").unwrap().dtype(), &polars::prelude::DataType::String);
+		assert_eq!(
+			frame.column("d").unwrap().dtype(),
+			&polars::prelude::DataType::String
+		);
 	}
 
 	#[test]
 	fn a_declared_date_refuses_anything_but_strict_iso() {
-		for bad in ["2026-9-23", "2026-02-30", "2025-02-29", "23/09/2026", "2026-09-23T00:00"] {
-			let rows = vec![object(&[("d", text("2026-09-23"))]), object(&[("d", text(bad))])];
+		for bad in [
+			"2026-9-23",
+			"2026-02-30",
+			"2025-02-29",
+			"23/09/2026",
+			"2026-09-23T00:00",
+		] {
+			let rows = vec![
+				object(&[("d", text("2026-09-23"))]),
+				object(&[("d", text(bad))]),
+			];
 			let error = frame_with(&rows, &schema(&[("d", Kind::Date)])).unwrap_err();
-			assert!(error.contains("row 1") && error.contains("not YYYY-MM-DD"), "{bad}: {error}");
+			assert!(
+				error.contains("row 1") && error.contains("not YYYY-MM-DD"),
+				"{bad}: {error}"
+			);
 		}
 		let rows = vec![object(&[("d", Value::from(20_719_i64))])];
 		let error = frame_with(&rows, &schema(&[("d", Kind::Date)])).unwrap_err();
-		assert_eq!(error, "frame column `d` is declared date but row 0 is integer");
+		assert_eq!(
+			error,
+			"frame column `d` is declared date but row 0 is integer"
+		);
 	}
 
 	#[test]
@@ -1319,12 +1397,21 @@ pub fn main(workspace, viz) {
 			object(&[("d", null()), ("v", null()), ("x", Value::from(2_i64))]),
 		];
 		let frame = frame_with(&rows, &schema(&[("d", Kind::Date), ("v", Kind::Float)])).unwrap();
-		assert_eq!(frame.column("d").unwrap().dtype(), &polars::prelude::DataType::Date);
-		assert_eq!(frame.column("v").unwrap().dtype(), &polars::prelude::DataType::Float64);
+		assert_eq!(
+			frame.column("d").unwrap().dtype(),
+			&polars::prelude::DataType::Date
+		);
+		assert_eq!(
+			frame.column("v").unwrap().dtype(),
+			&polars::prelude::DataType::Float64
+		);
 		assert_eq!(frame.column("d").unwrap().null_count(), 2);
 		// Undeclared, the same column still has no type to give.
 		let error = frame_with(&rows, &schema(&[("d", Kind::Date)])).unwrap_err();
-		assert_eq!(error, "frame column `v` has no values; its type cannot be inferred");
+		assert_eq!(
+			error,
+			"frame column `v` has no values; its type cannot be inferred"
+		);
 	}
 
 	#[test]
@@ -1333,9 +1420,15 @@ pub fn main(workspace, viz) {
 		let error = frame_with(&rows, &schema(&[("y", Kind::Float)])).unwrap_err();
 		assert_eq!(error, "frame schema names `y`, which no row has");
 		let error = frame_with(&rows, &schema(&[("x", Kind::Text)])).unwrap_err();
-		assert_eq!(error, "frame column `x` is declared string but row 0 is integer");
+		assert_eq!(
+			error,
+			"frame column `x` is declared string but row 0 is integer"
+		);
 		let float = frame_with(&rows, &schema(&[("x", Kind::Float)])).unwrap();
-		assert_eq!(float.column("x").unwrap().dtype(), &polars::prelude::DataType::Float64);
+		assert_eq!(
+			float.column("x").unwrap().dtype(),
+			&polars::prelude::DataType::Float64
+		);
 	}
 
 	#[test]
@@ -1347,4 +1440,3 @@ pub fn main(workspace, viz) {
 		assert_eq!(frame(&[]).unwrap_err(), "frame needs at least one row");
 	}
 }
-

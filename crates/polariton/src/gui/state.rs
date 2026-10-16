@@ -1359,7 +1359,13 @@ fn run_rune_code_at_generation(
 		return Task::none();
 	}
 	if crate::rune_local::mode(&code).is_local() {
-		return run_local_rune_code(app_state, source_buffer, revision, code, document_generation);
+		return run_local_rune_code(
+			app_state,
+			source_buffer,
+			revision,
+			code,
+			document_generation,
+		);
 	}
 	#[cfg(feature = "toron")]
 	{
@@ -1462,7 +1468,12 @@ fn run_local_rune_code(
 					.map(|((index, request), order)| (order, Output::Request(index, request)))
 					.collect();
 				#[cfg(feature = "toron")]
-				outputs.extend(execution.views.into_iter().map(|set| (set.order, Output::Views(set))));
+				outputs.extend(
+					execution
+						.views
+						.into_iter()
+						.map(|set| (set.order, Output::Views(set))),
+				);
 				outputs.sort_by_key(|(order, _)| *order);
 				let mut panes = Vec::with_capacity(outputs.len());
 				for (_, output) in outputs {
@@ -1727,7 +1738,11 @@ fn commit_local_panes(
 		#[cfg(feature = "toron")]
 		if let Some(continuation) = pane.continuation {
 			app_state.rune_categorical_identities.insert(
-				(source_buffer, pane.identity.clone(), continuation.palette_len),
+				(
+					source_buffer,
+					pane.identity.clone(),
+					continuation.palette_len,
+				),
 				continuation.identity,
 			);
 		}

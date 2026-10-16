@@ -21,9 +21,9 @@ mod result_artifact;
 mod result_registry;
 mod result_summary;
 mod rune_host;
-mod rune_local;
 #[cfg(feature = "toron")]
 mod rune_instrument;
+mod rune_local;
 #[cfg(feature = "toron")]
 mod rune_presentation;
 #[cfg(feature = "toron")]
