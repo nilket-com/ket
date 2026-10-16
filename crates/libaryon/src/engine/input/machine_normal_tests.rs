@@ -449,6 +449,7 @@ mod tests {
 				theme_colors: Default::default(),
 				render_rows: Vec::new(),
 				visible_rows: Vec::new(),
+				row_window: None,
 				visible_line_starts: Vec::new(),
 				dma_pending: false,
 				language_id: Some(crate::engine::language::LanguageId::from_registered("rust")),

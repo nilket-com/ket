@@ -29,7 +29,7 @@ use iced::widget::{
 	Space, button, canvas, column, container, mouse_area, rich_text, row, span, stack, text,
 };
 use iced::{Background, Color, Element, Event, Length, Subscription, Task, Theme, event, time};
-use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, PaneRect, Rgb, ViewId};
+use libaryon::core::{CursorPosition, DocLine, PaneRect, Rgb, ViewId};
 #[cfg(feature = "toron")]
 use libaryon::core::{SavedSession, Writable};
 use libaryon::engine::viewport_channel::{self, ViewportReceiver};
@@ -4158,10 +4158,8 @@ impl CodeEditor {
 		};
 		let column =
 			((local_x - pane_gutter_width(pane)).max(0.0) / metrics::CELL_WIDTH).floor() as u32;
-		let target = CursorPosition::new(
-			visible_row.line,
-			DocDisplayCol::new(visible_row.start_col.get().saturating_add(column)),
-		);
+		let target =
+			CursorPosition::new(visible_row.line, click_column_for_row(visible_row, column));
 		if pane.is_file_browser || pane.is_git_status_panel {
 			let now = time::Instant::now();
 			let double_click = self.last_navigation_click.is_some_and(
@@ -4264,8 +4262,15 @@ fn project_lines(
 	let mut lines = Vec::new();
 	let mut current: Option<ProjectedLine> = None;
 	let mut cursor_rendered = false;
-	let mut display_column = 0u32;
-	let mut line_has_content = false;
+	let initial_window = pane
+		.row_window
+		.filter(|window| window.line.get() == pane.viewport_start_line.get());
+	let mut display_column = initial_window.map_or(0, |window| window.start_offset.get());
+	let mut line_has_content = initial_window.is_some()
+		&& pane
+			.visible_rows
+			.first()
+			.is_some_and(|row| row.line == pane.viewport_start_line && row.start_byte.is_none());
 	let fallback_first_line = pane.viewport_start_line.get();
 	let fallback_last_line = fallback_first_line
 		.saturating_add(u64::from(pane.viewport_line_count.max(1)))
@@ -4397,7 +4402,7 @@ fn project_lines(
 					});
 			let (text, foreground) = match grapheme {
 				"\t" => {
-					let width = TAB_SIZE - (display_column % TAB_SIZE);
+					let width = TAB_SIZE as u64 - (display_column % u64::from(TAB_SIZE));
 					let head = if pane.visible_whitespace {
 						if trailing { '~' } else { '▸' }
 					} else {
@@ -4453,8 +4458,11 @@ fn project_lines(
 			} else {
 				push_fragment(line, text, color(foreground), background, underline);
 			}
-			display_column =
-				libaryon::core::text::advance_display_col(display_column, cell, TAB_SIZE);
+			display_column = display_column.saturating_add(if grapheme == "\t" {
+				TAB_SIZE as u64 - (display_column % u64::from(TAB_SIZE))
+			} else {
+				u64::from(cell.width.max(1))
+			});
 			byte = byte.saturating_add(byte_len);
 		}
 	}
@@ -4499,20 +4507,38 @@ fn wrap_projected_lines(
 	lines
 		.into_iter()
 		.flat_map(|line| {
+			let window = pane
+				.row_window
+				.filter(|window| window.line.get() == line.doc_line);
 			let mut starts = pane
 				.visible_rows
 				.iter()
 				.filter(|row| row.line.get() == line.doc_line)
-				.map(|row| row.start_col.get())
+				.map(|row| {
+					let absolute = row
+						.start_offset
+						.map_or(u64::from(row.start_col.get()), |offset| offset.get());
+					absolute.saturating_sub(window.map_or(0, |window| window.start_offset.get()))
+				})
 				.collect::<Vec<_>>();
 			starts.sort_unstable();
 			starts.dedup();
-			wrap_line_at_starts(line, &starts)
+			let width = ((pane.rect.width.get() as f32 * metrics::CELL_WIDTH
+				- pane_gutter_width(pane)
+				- 8.0) / metrics::CELL_WIDTH)
+				.floor()
+				.max(1.0) as u64;
+			wrap_line_at_starts(line, &starts, width, window.is_some())
 		})
 		.collect()
 }
 
-fn wrap_line_at_starts(line: ProjectedLine, starts: &[u32]) -> Vec<ProjectedLine> {
+fn wrap_line_at_starts(
+	line: ProjectedLine,
+	starts: &[u64],
+	row_width: u64,
+	windowed: bool,
+) -> Vec<ProjectedLine> {
 	if starts.is_empty() {
 		return vec![line];
 	}
@@ -4523,27 +4549,29 @@ fn wrap_line_at_starts(line: ProjectedLine, starts: &[u32]) -> Vec<ProjectedLine
 			fragments: Vec::new(),
 			// A row starting mid-line is a wrap continuation (or a scrolled
 			// partial line); only the physical line start carries the number.
-			show_gutter: line.show_gutter && *start == 0,
+			show_gutter: line.show_gutter && !windowed && *start == 0,
 		})
 		.collect::<Vec<_>>();
-	let mut column = 0u32;
+	let mut column = 0u64;
 	for fragment in line.fragments {
 		for cell in libaryon::core::text::display_cells(fragment.text.as_bytes()) {
 			let grapheme = &fragment.text[cell.byte_start..cell.byte_end];
 			let index = starts.partition_point(|start| *start <= column);
 			if let Some(index) = index.checked_sub(1) {
-				push_fragment(
-					&mut wrapped[index],
-					grapheme.to_owned(),
-					fragment.foreground,
-					fragment.background,
-					fragment.underline,
-				);
+				let row_end = starts[index].saturating_add(row_width);
+				if column < row_end {
+					push_fragment(
+						&mut wrapped[index],
+						grapheme.to_owned(),
+						fragment.foreground,
+						fragment.background,
+						fragment.underline,
+					);
+				}
 			}
 			// Columns before the first visible row are scrolled off above the
 			// viewport; skip them without emitting anything.
-			column =
-				libaryon::core::text::advance_display_col(column, cell, libaryon::core::TAB_SIZE);
+			column = column.saturating_add(u64::from(cell.width.max(1)));
 		}
 	}
 	wrapped
@@ -4586,6 +4614,20 @@ fn pane_gutter_width(pane: &libaryon::uast::projection::PaneViewport) -> f32 {
 	} else {
 		0.0
 	}
+}
+
+fn click_column_for_row(
+	row: &libaryon::engine::VisibleRow,
+	local_column: u32,
+) -> libaryon::core::DocDisplayCol {
+	let absolute_start = row
+		.start_offset
+		.map_or(u64::from(row.start_col.get()), |offset| offset.get());
+	libaryon::core::DocDisplayCol::new(
+		u32::try_from(absolute_start)
+			.unwrap_or(u32::MAX)
+			.saturating_add(local_column),
+	)
 }
 
 fn color(color: Rgb) -> Color {
@@ -11599,7 +11641,7 @@ mod tests {
 			}],
 			show_gutter: true,
 		};
-		let wrapped = wrap_line_at_starts(line, &[0, 4, 8]);
+		let wrapped = wrap_line_at_starts(line, &[0, 4, 8], 4, false);
 		assert_eq!(wrapped.len(), 3);
 		assert_eq!(wrapped[0].fragments[0].text, "sele");
 		assert_eq!(wrapped[1].fragments[0].text, "ct 1");
@@ -11607,6 +11649,85 @@ mod tests {
 		assert!(wrapped[0].show_gutter);
 		assert!(!wrapped[1].show_gutter);
 		assert!(!wrapped[2].show_gutter);
+	}
+
+	#[test]
+	fn row_window_origin_sets_the_tab_phase() {
+		let mut editor = CodeEditor::new("x");
+		wait_for_content(&mut editor, "x");
+		let viewport = editor.viewport.as_mut().expect("viewport");
+		let palette = viewport.ui_palette;
+		let pane = viewport.focused_pane_mut().expect("focused pane");
+		pane.viewport_start_line = libaryon::core::DocLine::ZERO;
+		pane.visible_whitespace = false;
+		pane.row_window = Some(libaryon::engine::RowWindow {
+			line: libaryon::core::DocLine::ZERO,
+			start_byte: libaryon::core::DocByte::new(100),
+			start_offset: libaryon::core::DisplayOffset::new(101),
+			tab_phase: 1,
+		});
+		pane.visible_rows = vec![libaryon::engine::VisibleRow {
+			line: libaryon::core::DocLine::ZERO,
+			start_col: libaryon::core::DocDisplayCol::new(101),
+			start_byte: Some(libaryon::core::DocByte::new(100)),
+			start_offset: Some(libaryon::core::DisplayOffset::new(101)),
+		}];
+		pane.render_rows.clone_from(&pane.visible_rows);
+		pane.tokens.truncate(1);
+		let token = pane.tokens.first_mut().expect("one physical token");
+		token.text = b"\tX".to_vec();
+		token.absolute_start_line = libaryon::core::DocLine::ZERO;
+		token.absolute_start_byte = libaryon::core::DocByte::new(100);
+
+		let lines = super::project_lines(pane, palette.editor_text, palette.accent, false);
+		let projected = lines
+			.iter()
+			.flat_map(|line| &line.fragments)
+			.map(|fragment| fragment.text.as_str())
+			.collect::<String>();
+		assert_eq!(projected, "   X", "tab expansion starts at offset 101");
+		let wrapped = super::wrap_projected_lines(lines, pane);
+		assert!(
+			wrapped.iter().all(|line| !line.show_gutter),
+			"a row window never claims the physical line's gutter"
+		);
+
+		pane.visible_whitespace = true;
+		pane.row_window = Some(libaryon::engine::RowWindow {
+			line: libaryon::core::DocLine::ZERO,
+			start_byte: libaryon::core::DocByte::new(100),
+			start_offset: libaryon::core::DisplayOffset::new(100),
+			tab_phase: 0,
+		});
+		pane.visible_rows[0].start_col = libaryon::core::DocDisplayCol::new(104);
+		pane.visible_rows[0].start_byte = None;
+		pane.visible_rows[0].start_offset = Some(libaryon::core::DisplayOffset::new(104));
+		pane.render_rows.clone_from(&pane.visible_rows);
+		let token = pane.tokens.first_mut().expect("one physical token");
+		token.text = b"        \n".to_vec();
+		token.absolute_start_byte = libaryon::core::DocByte::new(100);
+		let lines = super::project_lines(pane, palette.editor_text, palette.accent, false);
+		let wrapped = super::wrap_projected_lines(lines, pane);
+		let visible = wrapped
+			.iter()
+			.flat_map(|line| &line.fragments)
+			.map(|fragment| fragment.text.as_str())
+			.collect::<String>();
+		assert_eq!(visible, "~~~~¬", "the window keeps trailing-space styling");
+	}
+
+	#[test]
+	fn windowed_text_click_uses_the_rows_absolute_offset() {
+		let row = libaryon::engine::VisibleRow {
+			line: libaryon::core::DocLine::new(7),
+			start_col: libaryon::core::DocDisplayCol::new(100),
+			start_byte: Some(libaryon::core::DocByte::new(100)),
+			start_offset: Some(libaryon::core::DisplayOffset::new(100)),
+		};
+		assert_eq!(
+			super::click_column_for_row(&row, 3),
+			libaryon::core::DocDisplayCol::new(103)
+		);
 	}
 
 	#[test]
@@ -11623,7 +11744,7 @@ mod tests {
 			}],
 			show_gutter: true,
 		};
-		let wrapped = wrap_line_at_starts(line, &[0, 3]);
+		let wrapped = wrap_line_at_starts(line, &[0, 3], 3, false);
 		assert_eq!(wrapped.len(), 2);
 		assert_eq!(wrapped[0].fragments[0].text, "a☠️");
 		assert_eq!(wrapped[1].fragments[0].text, "b");
@@ -11646,13 +11767,40 @@ mod tests {
 			}],
 			show_gutter: true,
 		};
-		let wrapped = wrap_line_at_starts(line, &[4, 8]);
+		let wrapped = wrap_line_at_starts(line, &[4, 8], 4, false);
 		assert_eq!(wrapped.len(), 2);
 		assert_eq!(wrapped[0].fragments[0].text, "ct 1");
 		assert_eq!(wrapped[1].fragments[0].text, "23");
 		// A mid-line row is never the physical line start, so no gutter number.
 		assert!(!wrapped[0].show_gutter);
 		assert!(!wrapped[1].show_gutter);
+	}
+
+	#[test]
+	fn wrapped_rows_stop_at_their_right_bound() {
+		use super::{Color, ProjectedLine, StyledFragment, wrap_line_at_starts};
+
+		let line = ProjectedLine {
+			doc_line: 8,
+			fragments: vec![StyledFragment {
+				text: "abcdefghijklmnop".to_owned(),
+				foreground: Color::WHITE,
+				background: None,
+				underline: false,
+			}],
+			show_gutter: false,
+		};
+		let wrapped = wrap_line_at_starts(line, &[4, 8], 4, false);
+		let text: Vec<String> = wrapped
+			.iter()
+			.map(|line| {
+				line.fragments
+					.iter()
+					.map(|fragment| fragment.text.as_str())
+					.collect()
+			})
+			.collect();
+		assert_eq!(text, ["efgh", "ijkl"]);
 	}
 
 	#[test]

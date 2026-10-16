@@ -48,6 +48,7 @@ pub mod uast_query;
 pub mod ui_colors;
 pub mod undo;
 pub mod viewport_channel;
+mod wrap_index;
 
 pub(crate) use self::core::MAX_SEMANTIC_BYTES;
 pub use self::document::selection::resolve_visual_ranges;
@@ -58,7 +59,7 @@ pub use self::host_event::{
 pub use self::input::{InputCompletionStatus, InputEvent, InputProjection, KeyCode, Modifiers};
 pub use self::input::{help_topic_hint, render_cli_help};
 pub use self::language::{InlineAnnotation, InlineAnnotationKind, LanguageId};
-pub use self::layout::{GutterNumbering, VisibleRow};
+pub use self::layout::{GutterNumbering, RowWindow, VisibleRow};
 pub use self::layout::{
 	ViewportAnchor, clamp_cursor_to_viewport_anchor, collect_visible_rows, cursor_view_metrics,
 	gutter_width_for_max_line, pan_viewport_anchor_to_keep_cursor_visible, scroll_viewport_anchor,

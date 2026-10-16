@@ -373,6 +373,12 @@ pub(crate) fn sync_markdown_image_preview_scroll(
 						true,
 						geometry.text_width,
 						sum_tree,
+						Some(super::layout::WrapLayout::new(
+							&tab.view.common.wrap_index,
+							state_id,
+							tab.document.topology_rev,
+							&std::cell::RefCell::default(),
+						)),
 					);
 					tab.view.scroll_y = anchor.line.get();
 					tab.view.scroll_row_offset = anchor.row_offset;

@@ -3029,6 +3029,7 @@ mod tests {
 			crate::core::TopologyRev::ZERO,
 			ledger.current_state_id,
 			&mut cached_sum_tree,
+			&Default::default(),
 			&mut status_message,
 			&mut mode_override,
 			EditorCommand::SelectAroundFunction,

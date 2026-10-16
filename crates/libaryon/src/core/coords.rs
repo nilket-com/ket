@@ -147,6 +147,9 @@ impl_extent_unit!(DocLineCount, u64);
 impl_position_unit!(DocVisualRow, u64);
 impl_extent_unit!(VisualRowCount, u64);
 impl_position_unit!(DocDisplayCol, u32);
+// A display position within one physical line that may exceed `DocDisplayCol`:
+// a 200 GiB line passes `u32::MAX` columns. Wrap layout (ADR 0009) uses it.
+impl_position_unit!(DisplayOffset, u64);
 impl_extent_unit!(DocDisplayColCount, u32);
 impl_position_unit!(DisplayRow, u32);
 impl_extent_unit!(DisplayRowCount, u32);
@@ -187,6 +190,19 @@ impl_id_unit!(RegistryRev, u64);
 impl_id_unit!(SourceId, u64);
 impl_id_unit!(SubscriptionId, u64);
 impl_id_unit!(JobId, u64);
+
+impl DisplayOffset {
+	/// The same position as a `DocDisplayCol`, or `None` past `u32::MAX`.
+	pub fn to_doc_display_col(self) -> Option<DocDisplayCol> {
+		u32::try_from(self.get()).ok().map(DocDisplayCol::new)
+	}
+}
+
+impl From<DocDisplayCol> for DisplayOffset {
+	fn from(col: DocDisplayCol) -> Self {
+		Self::new(u64::from(col.get()))
+	}
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlendRatio {

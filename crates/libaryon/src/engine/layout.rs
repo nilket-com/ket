@@ -2,12 +2,18 @@ use super::folding::{
 	doc_line_for_visual_index, snap_line_to_visible_boundary, visual_line_index_for_doc_line,
 };
 use super::index::SumTree;
-use super::support::{read_line_bytes_from_sum_tree, read_line_bytes_sparse};
+use super::support::{
+	line_start_byte_from_sum_tree, read_line_bytes_from_sum_tree, read_line_bytes_sparse,
+};
+use super::wrap_index::{
+	ByteLookup, ColLookup, LineRead, LineSource, RowCount, RowLookup, WrapIndex, WrapKey,
+};
 use crate::core::{
-	DisplayRow, DocByte, DocDisplayCol, DocLine, DocLineCount, DocVisualRow, PaneLocalCol,
-	PaneLocalRow, TAB_SIZE, VisualRowCount,
+	DisplayOffset, DisplayRow, DocByte, DocDisplayCol, DocLine, DocLineCount, DocVisualRow,
+	PaneLocalCol, PaneLocalRow, StateId, TAB_SIZE, TopologyRev, VisualRowCount,
 };
 use crate::ecs::{NodeId, UastRegistry};
+use crate::uast::projection::NodeLineLookup;
 use crate::uast::{FoldPolicy, UastProjection};
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
@@ -19,7 +25,39 @@ const WRAP_CACHE_CAPACITY: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VisibleRow {
 	pub line: DocLine,
+	/// Absolute document column of the row's start, saturating past `u32`.
 	pub start_col: DocDisplayCol,
+	/// For rows of a line laid out through the wrap index (ADR 0009): the
+	/// absolute byte of the row's first cell, `None` for a row of trailing
+	/// whitespace...
+	pub start_byte: Option<DocByte>,
+	/// ...and its absolute display offset, which does not saturate.
+	pub start_offset: Option<DisplayOffset>,
+}
+
+impl VisibleRow {
+	/// A row of a line laid out whole, from its first byte.
+	pub fn whole(line: DocLine, start_col: DocDisplayCol) -> Self {
+		Self {
+			line,
+			start_col,
+			start_byte: None,
+			start_offset: None,
+		}
+	}
+}
+
+/// Where a pane's tokens begin when its view starts inside a line laid out
+/// through the wrap index (ADR 0009). The frontend lays that line out from
+/// `start_offset`, not from column 0; a row's position in the window is its
+/// `start_offset` minus this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RowWindow {
+	pub line: DocLine,
+	pub start_byte: DocByte,
+	pub start_offset: DisplayOffset,
+	/// `start_offset` modulo the tab size: the phase of the first tab stop.
+	pub tab_phase: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +228,11 @@ fn push_word_wraps(
 	}
 }
 
+/// A `u64` row count in layout's `u32` rows.
+fn saturate(rows: u64) -> u32 {
+	u32::try_from(rows).unwrap_or(u32::MAX)
+}
+
 fn compute_line_wrap(line: &[u8], text_width: u16) -> WrappedLine {
 	let mut starts = vec![DocDisplayCol::ZERO];
 	if text_width == 0 {
@@ -248,6 +291,19 @@ fn wrap_row_starts(line: &[u8], text_width: u16) -> Vec<DocDisplayCol> {
 	compute_line_wrap(line, text_width).starts.as_ref().to_vec()
 }
 
+/// Whole-line row starts and visual width, the reference `WrapScanner` must
+/// reproduce.
+#[cfg(test)]
+pub(crate) fn wrap_starts_for_test(line: &[u8], text_width: u16) -> (Vec<u64>, u32) {
+	let wrapped = compute_line_wrap(line, text_width);
+	let starts = wrapped
+		.starts
+		.iter()
+		.map(|start| u64::from(start.get()))
+		.collect();
+	(starts, wrapped.visual_width)
+}
+
 fn visible_line_for_layout<F: FoldPolicy + ?Sized>(
 	registry: &UastRegistry,
 	root: NodeId,
@@ -291,6 +347,113 @@ fn line_for_visual_index_for_layout<F: FoldPolicy + ?Sized>(
 	}
 }
 
+/// A wrapped line at least this long goes through the wrap index (ADR 0009).
+pub(crate) const WRAP_INDEX_MIN_LINE_BYTES: u64 =
+	crate::svp::ingest::COLD_INGEST_EXTENT_SIZE as u64;
+
+/// What layout could not finish this frame: nodes to hydrate, and whether a
+/// later frame should continue scanning. Render acts on it; other callers may
+/// drop it, since the next render asks again.
+#[derive(Debug, Default)]
+pub(crate) struct LayoutDemand {
+	pub(crate) pending: Vec<NodeId>,
+	pub(crate) more: bool,
+}
+
+impl LayoutDemand {
+	fn note(&mut self, pending: Option<NodeId>) {
+		self.more = true;
+		if let Some(node) = pending
+			&& !self.pending.contains(&node)
+		{
+			self.pending.push(node);
+		}
+	}
+}
+
+/// Where a scroll moves the cursor. `byte` is the row's start when the row is
+/// on an indexed line: the caret is then placed from it without reading the
+/// line from its start (ADR 0009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorTarget {
+	pub(crate) line: DocLine,
+	pub(crate) col: DocDisplayCol,
+	pub(crate) byte: Option<DocByte>,
+}
+
+/// A view's wrap index and what its lookups are keyed by.
+#[derive(Clone, Copy)]
+pub(crate) struct WrapLayout<'a> {
+	pub(crate) index: &'a RefCell<WrapIndex>,
+	pub(crate) state: StateId,
+	pub(crate) topology: TopologyRev,
+	pub(crate) demand: &'a RefCell<LayoutDemand>,
+	/// [`WRAP_INDEX_MIN_LINE_BYTES`] outside tests.
+	pub(crate) min_line_bytes: u64,
+}
+
+impl<'a> WrapLayout<'a> {
+	pub(crate) fn new(
+		index: &'a RefCell<WrapIndex>,
+		state: StateId,
+		topology: TopologyRev,
+		demand: &'a RefCell<LayoutDemand>,
+	) -> Self {
+		Self {
+			index,
+			state,
+			topology,
+			demand,
+			min_line_bytes: WRAP_INDEX_MIN_LINE_BYTES,
+		}
+	}
+}
+
+/// How a line wraps: whole, from its resident bytes, or through the index.
+#[derive(Clone)]
+enum LineLayout {
+	Whole(WrappedLine),
+	Indexed { start: DocByte, end: DocByte },
+}
+
+/// A line's bytes, read for the wrap index from resident leaves only.
+struct RegistryLine<'a> {
+	registry: &'a UastRegistry,
+	root: NodeId,
+	start: u64,
+	end: u64,
+}
+
+impl LineSource for RegistryLine<'_> {
+	fn read(&self, offset: u64, max: usize) -> LineRead {
+		let from = self.start.saturating_add(offset);
+		if from >= self.end {
+			return LineRead::End;
+		}
+		let to = self.end.min(from.saturating_add(max as u64));
+		let mut bytes = Vec::with_capacity((to - from) as usize);
+		let read = self.registry.for_each_loaded_slice_fragment(
+			self.root,
+			DocByte::new(from),
+			DocByte::new(to),
+			|fragment| bytes.extend_from_slice(fragment),
+		);
+		match read {
+			// Fragments arrive in order, so what came before a cold leaf is valid.
+			Ok(()) | Err(_) if !bytes.is_empty() => LineRead::Bytes(bytes),
+			Ok(()) => LineRead::End,
+			Err(_) => {
+				let at = from.saturating_add(bytes.len() as u64);
+				LineRead::Pending(
+					self.registry
+						.find_node_at_doc_byte_raw(self.root, DocByte::new(at))
+						.node_id,
+				)
+			}
+		}
+	}
+}
+
 #[derive(Clone, Copy)]
 enum LineByteSource<'a> {
 	Sparse,
@@ -305,7 +468,8 @@ struct LayoutContext<'a, F: FoldPolicy + ?Sized> {
 	wrap_enabled: bool,
 	text_width: u16,
 	line_byte_source: LineByteSource<'a>,
-	wrap_cache: RefCell<VecDeque<(DocLine, WrappedLine)>>,
+	wrap_cache: RefCell<VecDeque<(DocLine, LineLayout)>>,
+	wrap: Option<WrapLayout<'a>>,
 }
 
 impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
@@ -326,9 +490,11 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 			text_width,
 			line_byte_source: LineByteSource::Sparse,
 			wrap_cache: RefCell::new(VecDeque::new()),
+			wrap: None,
 		}
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn with_sum_tree(
 		registry: &'a UastRegistry,
 		root: NodeId,
@@ -337,6 +503,7 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 		wrap_enabled: bool,
 		text_width: u16,
 		tree: &'a SumTree,
+		wrap: Option<WrapLayout<'a>>,
 	) -> Self {
 		Self {
 			registry,
@@ -351,7 +518,14 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 				LineByteSource::SumTree(tree)
 			},
 			wrap_cache: RefCell::new(VecDeque::new()),
+			wrap,
 		}
+	}
+
+	#[cfg(test)]
+	fn with_wrap(mut self, wrap: WrapLayout<'a>) -> Self {
+		self.wrap = Some(wrap);
+		self
 	}
 
 	fn visible_line(&self, line: DocLine) -> DocLine {
@@ -427,13 +601,36 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 	}
 
 	fn line_row_count(&self, line: DocLine) -> u32 {
-		if !self.wrap_enabled {
-			return 1;
-		}
-		self.line_wrap(line).starts.len() as u32
+		self.line_rows(line).0
 	}
 
-	fn line_wrap(&self, line: DocLine) -> WrappedLine {
+	/// A line's wrapped rows as far as known, and whether that count is exact.
+	/// An inexact count is a scanned prefix: the line has at least that many.
+	fn line_rows(&self, line: DocLine) -> (u32, bool) {
+		if !self.wrap_enabled {
+			return (1, true);
+		}
+		match self.line_layout(line) {
+			LineLayout::Whole(wrapped) => (wrapped.starts.len() as u32, true),
+			LineLayout::Indexed { start, end } => {
+				let wrap = self.wrap.expect("an indexed line has a wrap index");
+				let source = self.line_source(start, end);
+				match wrap
+					.index
+					.borrow_mut()
+					.row_count(self.wrap_key(wrap), line, &source)
+				{
+					RowCount::Exact(rows) => (saturate(rows), true),
+					RowCount::AtLeast { rows, pending } => {
+						wrap.demand.borrow_mut().note(pending);
+						(saturate(rows), false)
+					}
+				}
+			}
+		}
+	}
+
+	fn line_layout(&self, line: DocLine) -> LineLayout {
 		if let Some((_, cached)) = self
 			.wrap_cache
 			.borrow()
@@ -442,40 +639,230 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 		{
 			return cached.clone();
 		}
-		let wrapped = if !self.wrap_enabled {
-			compute_line_wrap(b"", 0)
+		let layout = if !self.wrap_enabled {
+			LineLayout::Whole(compute_line_wrap(b"", 0))
 		} else if self.is_folded_visible_line(line) {
-			compute_line_wrap(b"...", self.text_width)
+			LineLayout::Whole(compute_line_wrap(b"...", self.text_width))
 		} else {
-			self.read_line_bytes(line)
-				.map(|bytes| compute_line_wrap(&bytes, self.text_width))
-				.unwrap_or_else(|_| compute_line_wrap(b"", self.text_width))
+			self.unfolded_line_layout(line)
 		};
 		let mut cache = self.wrap_cache.borrow_mut();
 		if cache.len() == WRAP_CACHE_CAPACITY {
 			cache.pop_front();
 		}
-		cache.push_back((line, wrapped.clone()));
-		wrapped
+		cache.push_back((line, layout.clone()));
+		layout
 	}
 
-	fn line_row_starts(&self, line: DocLine) -> Rc<[DocDisplayCol]> {
-		self.line_wrap(line).starts
-	}
-
-	fn row_start_col(&self, line: DocLine, row_offset: DisplayRow) -> DocDisplayCol {
-		self.line_row_starts(line)
-			.get(row_offset.get() as usize)
-			.copied()
-			.unwrap_or(DocDisplayCol::ZERO)
-	}
-
-	fn cursor_row_and_pane_col(&self, line: DocLine, col: DocDisplayCol) -> (u32, PaneLocalCol) {
-		if !self.wrap_enabled || self.text_width == 0 || self.is_folded_visible_line(line) {
-			return (0, PaneLocalCol::new(col.get()));
+	/// A line past the index threshold, or one whose bytes are not all
+	/// resident, wraps through the index; any other wraps whole, as before.
+	fn unfolded_line_layout(&self, line: DocLine) -> LineLayout {
+		let range = self.wrap.and_then(|wrap| self.line_byte_range(line, wrap));
+		if let (Some(wrap), Some((start, end))) = (self.wrap, range)
+			&& end.get().saturating_sub(start.get()) >= wrap.min_line_bytes
+		{
+			return LineLayout::Indexed { start, end };
 		}
+		match self.read_line_bytes(line) {
+			Ok(bytes) => LineLayout::Whole(compute_line_wrap(&bytes, self.text_width)),
+			Err(_) => match range {
+				Some((start, end)) => LineLayout::Indexed { start, end },
+				None => LineLayout::Whole(compute_line_wrap(b"", self.text_width)),
+			},
+		}
+	}
 
-		let wrapped = self.line_wrap(line);
+	/// A line's absolute bytes, newline excluded, found without reading them.
+	fn line_byte_range(&self, line: DocLine, wrap: WrapLayout<'_>) -> Option<(DocByte, DocByte)> {
+		let total = self.registry.get_total_bytes(self.root);
+		let start = match self.line_byte_source {
+			LineByteSource::SumTree(tree) => line_start_byte_from_sum_tree(tree, line),
+			LineByteSource::Sparse => self.sparse_line_start(line, wrap)?,
+		};
+		let end = if line >= self.max_doc_line {
+			DocByte::new(total)
+		} else {
+			let next = match self.line_byte_source {
+				LineByteSource::SumTree(tree) => {
+					line_start_byte_from_sum_tree(tree, line + DocLineCount::new(1))
+				}
+				LineByteSource::Sparse => {
+					self.sparse_line_start(line + DocLineCount::new(1), wrap)?
+				}
+			};
+			// The newline ending this line is not part of it.
+			DocByte::new(next.get().saturating_sub(1).max(start.get()))
+		};
+		Some((start, end))
+	}
+
+	fn sparse_line_start(&self, line: DocLine, wrap: WrapLayout<'_>) -> Option<DocByte> {
+		match self
+			.registry
+			.find_node_at_line_col_raw(self.root, line, DocDisplayCol::ZERO)
+		{
+			NodeLineLookup::Ready(target) => Some(self.registry.doc_byte_for_node_offset(
+				self.root,
+				target.node_id,
+				target.node_byte,
+			)),
+			NodeLineLookup::Pending { required_node, .. } => {
+				if required_node.is_some() {
+					wrap.demand.borrow_mut().note(required_node);
+				}
+				None
+			}
+		}
+	}
+
+	fn line_source(&self, start: DocByte, end: DocByte) -> RegistryLine<'a> {
+		RegistryLine {
+			registry: self.registry,
+			root: self.root,
+			start: start.get(),
+			end: end.get(),
+		}
+	}
+
+	fn wrap_key(&self, wrap: WrapLayout<'_>) -> WrapKey {
+		WrapKey {
+			state: wrap.state,
+			topology: wrap.topology,
+			text_width: self.text_width,
+		}
+	}
+
+	/// A row's start column, or `None` when the index cannot reach it this
+	/// frame; the demand then asks for a continuation.
+	#[cfg(test)]
+	fn try_row_start_col(&self, line: DocLine, row_offset: DisplayRow) -> Option<DocDisplayCol> {
+		self.try_visible_row(line, row_offset)
+			.map(|row| row.start_col)
+	}
+
+	/// A row as published, or `None` when the index cannot reach its start this
+	/// frame; the demand then asks for a continuation.
+	fn try_visible_row(&self, line: DocLine, row_offset: DisplayRow) -> Option<VisibleRow> {
+		match self.line_layout(line) {
+			LineLayout::Whole(wrapped) => Some(VisibleRow::whole(
+				line,
+				wrapped
+					.starts
+					.get(row_offset.get() as usize)
+					.copied()
+					.unwrap_or(DocDisplayCol::ZERO),
+			)),
+			LineLayout::Indexed {
+				start: line_start,
+				end,
+			} => {
+				let wrap = self.wrap.expect("an indexed line has a wrap index");
+				let source = self.line_source(line_start, end);
+				let key = self.wrap_key(wrap);
+				let lookup = wrap.index.borrow_mut().row_start(
+					key,
+					line,
+					u64::from(row_offset.get()),
+					&source,
+				);
+				match lookup {
+					RowLookup::Known(start) => Some(VisibleRow {
+						line,
+						start_col: start
+							.col
+							.to_doc_display_col()
+							.unwrap_or(DocDisplayCol::new(u32::MAX)),
+						start_byte: start
+							.byte
+							.map(|byte| DocByte::new(line_start.get().saturating_add(byte))),
+						start_offset: Some(start.col),
+					}),
+					RowLookup::PastEnd { .. } => Some(VisibleRow::whole(line, DocDisplayCol::ZERO)),
+					// Settles on a later frame; the demand asks for it.
+					RowLookup::Unknown { pending, .. } => {
+						wrap.demand.borrow_mut().note(pending);
+						None
+					}
+				}
+			}
+		}
+	}
+
+	/// The byte and display offset a window must start at to show `row`, a row
+	/// of an indexed line; `None` for a row of a line laid out whole.
+	fn window_origin(&self, row: VisibleRow) -> Option<(DocByte, DisplayOffset)> {
+		let start_offset = row.start_offset?;
+		if let Some(start_byte) = row.start_byte {
+			return Some((start_byte, start_offset));
+		}
+		// A row of trailing whitespace: the window starts where the run does.
+		let LineLayout::Indexed {
+			start: line_start, ..
+		} = self.line_layout(row.line)
+		else {
+			return None;
+		};
+		let wrap = self.wrap?;
+		let run = wrap
+			.index
+			.borrow()
+			.trailing_whitespace_origin(self.wrap_key(wrap), row.line)?;
+		Some((
+			DocByte::new(line_start.get().saturating_add(run.byte)),
+			run.col,
+		))
+	}
+
+	/// Where the cursor sits. On an indexed line whose row the index cannot
+	/// reach this frame this falls back to row 0, which is only fit for drawing
+	/// the cursor for one frame; a caller that moves the view uses
+	/// [`Self::try_cursor_row_and_pane_col`].
+	fn cursor_row_and_pane_col(&self, line: DocLine, col: DocDisplayCol) -> (u32, PaneLocalCol) {
+		self.try_cursor_row_and_pane_col(line, col)
+			.unwrap_or_else(|| {
+				let last_pane_col = u32::from(self.text_width).saturating_sub(1);
+				(0, PaneLocalCol::new(col.get().min(last_pane_col)))
+			})
+	}
+
+	/// Where the cursor sits, or `None` when its row is on an indexed line the
+	/// index cannot reach this frame; the demand then asks for a continuation.
+	fn try_cursor_row_and_pane_col(
+		&self,
+		line: DocLine,
+		col: DocDisplayCol,
+	) -> Option<(u32, PaneLocalCol)> {
+		if !self.wrap_enabled || self.text_width == 0 || self.is_folded_visible_line(line) {
+			return Some((0, PaneLocalCol::new(col.get())));
+		}
+		let last_pane_col = u32::from(self.text_width).saturating_sub(1);
+		let wrapped = match self.line_layout(line) {
+			LineLayout::Whole(wrapped) => wrapped,
+			LineLayout::Indexed { start, end } => {
+				let wrap = self.wrap.expect("an indexed line has a wrap index");
+				let source = self.line_source(start, end);
+				let key = self.wrap_key(wrap);
+				let lookup = wrap.index.borrow_mut().row_for_col(
+					key,
+					line,
+					DisplayOffset::from(col),
+					&source,
+				);
+				return match lookup {
+					ColLookup::Known { row, start, col } => {
+						let pane_col = col
+							.get()
+							.saturating_sub(start.col.get())
+							.min(u64::from(last_pane_col));
+						Some((saturate(row), PaneLocalCol::new(pane_col as u32)))
+					}
+					ColLookup::Unknown { pending } => {
+						wrap.demand.borrow_mut().note(pending);
+						None
+					}
+				};
+			}
+		};
 		let line_end = wrapped.visual_width;
 		let clamped_col = col.get().min(line_end);
 		let starts = wrapped.starts;
@@ -483,10 +870,8 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 			.partition_point(|start| start.get() <= clamped_col)
 			.saturating_sub(1);
 		let start_col = starts[row].get();
-		let pane_col = clamped_col
-			.saturating_sub(start_col)
-			.min(u32::from(self.text_width).saturating_sub(1));
-		(row as u32, PaneLocalCol::new(pane_col))
+		let pane_col = clamped_col.saturating_sub(start_col).min(last_pane_col);
+		Some((row as u32, PaneLocalCol::new(pane_col)))
 	}
 
 	fn next_visible_line(&self, line: DocLine) -> Option<DocLine> {
@@ -511,13 +896,18 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 
 	fn normalize_anchor(&self, anchor: ViewportAnchor) -> ViewportAnchor {
 		let line = self.visible_line(anchor.line);
-		let max_row_offset = self.line_row_count(line).saturating_sub(1);
+		let (rows, exact) = self.line_rows(line);
+		let max_row_offset = rows.saturating_sub(1);
 		ViewportAnchor {
 			line,
-			row_offset: if self.wrap_enabled {
+			// Past a scanned prefix the row may still exist: keep it until the
+			// scan reaches it rather than pulling the view back.
+			row_offset: if !self.wrap_enabled {
+				DisplayRow::ZERO
+			} else if exact {
 				DisplayRow::new(anchor.row_offset.get().min(max_row_offset))
 			} else {
-				DisplayRow::ZERO
+				anchor.row_offset
 			},
 		}
 	}
@@ -554,13 +944,20 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 
 		let mut remaining = delta_rows;
 		while remaining > 0 {
-			let line_rows = self.line_row_count(anchor.line);
+			let (line_rows, exact) = self.line_rows(anchor.line);
 			let remaining_in_line = line_rows
 				.saturating_sub(anchor.row_offset.get())
 				.saturating_sub(1);
 			if remaining as u32 <= remaining_in_line {
 				anchor.row_offset =
 					DisplayRow::new(anchor.row_offset.get().saturating_add(remaining as u32));
+				return anchor;
+			}
+			if !exact {
+				// More rows remain unscanned: stop at the last known one and let
+				// the continuation refresh resume, rather than leaving the line.
+				let last_known = DisplayRow::new(line_rows.saturating_sub(1));
+				anchor.row_offset = anchor.row_offset.max(last_known);
 				return anchor;
 			}
 			remaining -= remaining_in_line as i32 + 1;
@@ -602,7 +999,12 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 		let viewport_rows = viewport_rows.max(1);
 		let anchor = self.normalize_anchor(anchor);
 		let cursor_line = self.visible_line(cursor_line);
-		let (cursor_row, _) = self.cursor_row_and_pane_col(cursor_line, cursor_col);
+		// A cursor row the index cannot reach this frame gives no reason to
+		// move the view; the continuation settles it.
+		let Some((cursor_row, _)) = self.try_cursor_row_and_pane_col(cursor_line, cursor_col)
+		else {
+			return anchor;
+		};
 		let anchor_visual = self.visual_index(anchor.line);
 		let cursor_visual = self.visual_index(cursor_line);
 		if cursor_visual < anchor_visual
@@ -629,38 +1031,87 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 		}
 	}
 
+	/// Where the cursor must move to stay in the view: `None` when its row or
+	/// its new place cannot be reached this frame, or lies past the caret's
+	/// `u32` column range, and a caller then keeps both the cursor and the view
+	/// where they were.
 	fn clamp_cursor_to_viewport_anchor(
 		&self,
 		anchor: ViewportAnchor,
 		cursor_line: DocLine,
 		cursor_col: DocDisplayCol,
 		viewport_rows: u32,
-	) -> (DocLine, DocDisplayCol) {
+	) -> Option<CursorTarget> {
 		let viewport_rows = viewport_rows.max(1);
 		let anchor = self.normalize_anchor(anchor);
 		let cursor_line = self.visible_line(cursor_line);
-		let (cursor_row, _) = self.cursor_row_and_pane_col(cursor_line, cursor_col);
+		let (cursor_row, _) = self.try_cursor_row_and_pane_col(cursor_line, cursor_col)?;
 		let anchor_visual = self.visual_index(anchor.line);
 		let cursor_visual = self.visual_index(cursor_line);
 		if cursor_visual < anchor_visual
 			|| (cursor_visual == anchor_visual && cursor_row < anchor.row_offset.get())
 		{
-			return (
-				anchor.line,
-				self.row_start_col(anchor.line, anchor.row_offset),
-			);
+			return self.row_target(anchor);
 		}
 
 		let cursor_offset = self.rows_from_anchor_to_position(anchor, cursor_line, cursor_row);
 		if cursor_offset < viewport_rows {
-			(cursor_line, cursor_col)
+			Some(CursorTarget {
+				line: cursor_line,
+				col: cursor_col,
+				byte: None,
+			})
 		} else {
 			let bottom =
 				self.scroll_viewport_anchor(anchor, viewport_rows.saturating_sub(1) as i32);
-			(
-				bottom.line,
-				self.row_start_col(bottom.line, bottom.row_offset),
-			)
+			self.row_target(bottom)
+		}
+	}
+
+	/// The start of the row at `anchor` as a cursor target.
+	fn row_target(&self, anchor: ViewportAnchor) -> Option<CursorTarget> {
+		let row = self.try_visible_row(anchor.line, anchor.row_offset)?;
+		let Some(offset) = row.start_offset else {
+			// A row of a line laid out whole: the caret is placed by column.
+			return Some(CursorTarget {
+				line: row.line,
+				col: row.start_col,
+				byte: None,
+			});
+		};
+		// The caret's column is `u32` until ADR 0010.
+		let col = offset.to_doc_display_col()?;
+		let byte = match row.start_byte {
+			Some(byte) => byte,
+			// A row of trailing whitespace has no byte of its own: find the cell
+			// holding its start, walking the run, across frames if it is long.
+			None => self.trailing_whitespace_byte(row.line, offset)?,
+		};
+		Some(CursorTarget {
+			line: row.line,
+			col,
+			byte: Some(byte),
+		})
+	}
+
+	fn trailing_whitespace_byte(&self, line: DocLine, offset: DisplayOffset) -> Option<DocByte> {
+		let LineLayout::Indexed { start, end } = self.line_layout(line) else {
+			return None;
+		};
+		let wrap = self.wrap?;
+		let source = self.line_source(start, end);
+		let lookup = wrap.index.borrow_mut().trailing_whitespace_byte(
+			self.wrap_key(wrap),
+			line,
+			offset,
+			&source,
+		);
+		match lookup {
+			ByteLookup::Known(byte) => Some(DocByte::new(start.get().saturating_add(byte))),
+			ByteLookup::Unknown { pending } => {
+				wrap.demand.borrow_mut().note(pending);
+				None
+			}
 		}
 	}
 
@@ -682,16 +1133,25 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 		let viewport_rows = viewport_rows.max(1);
 		let mut anchor = self.normalize_anchor(anchor);
 		loop {
-			let row_starts = self.line_row_starts(anchor.line);
-			let line_rows = row_starts.len() as u32;
-			for row_offset in anchor.row_offset.get()..line_rows {
-				rows.push(VisibleRow {
-					line: anchor.line,
-					start_col: row_starts[row_offset as usize],
-				});
+			let (line_rows, exact) = self.line_rows(anchor.line);
+			// An anchor past a scanned prefix shows the last known row until the
+			// scan reaches it.
+			let first = anchor.row_offset.get().min(line_rows.saturating_sub(1));
+			for row_offset in first..line_rows {
+				// A row whose start the index cannot reach this frame ends the
+				// list: fewer rows now, the continuation refresh adds the rest.
+				let Some(row) = self.try_visible_row(anchor.line, DisplayRow::new(row_offset))
+				else {
+					return rows;
+				};
+				rows.push(row);
 				if rows.len() as u32 >= viewport_rows {
 					return rows;
 				}
+			}
+			// Rows of this line are still unscanned; the next line cannot start.
+			if !exact {
+				return rows;
 			}
 			let Some(next_line) = self.next_visible_line(anchor.line) else {
 				return rows;
@@ -700,6 +1160,75 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 			anchor.row_offset = DisplayRow::ZERO;
 		}
 	}
+}
+
+/// The window a pane must publish to show `first_row` (ADR 0009): `None`
+/// when the row is on a line laid out whole, or starts its line.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn window_origin_with_sum_tree<F: FoldPolicy + ?Sized>(
+	registry: &UastRegistry,
+	root: NodeId,
+	folds: &F,
+	max_doc_line: DocLine,
+	wrap_enabled: bool,
+	text_width: u16,
+	tree: &SumTree,
+	wrap: Option<WrapLayout<'_>>,
+	first_row: VisibleRow,
+) -> Option<RowWindow> {
+	if first_row
+		.start_offset
+		.is_none_or(|offset| offset == DisplayOffset::ZERO)
+	{
+		return None;
+	}
+	let (start_byte, start_offset) = LayoutContext::with_sum_tree(
+		registry,
+		root,
+		folds,
+		max_doc_line,
+		wrap_enabled,
+		text_width,
+		tree,
+		wrap,
+	)
+	.window_origin(first_row)?;
+	Some(RowWindow {
+		line: first_row.line,
+		start_byte,
+		start_offset,
+		tab_phase: (start_offset.get() % u64::from(TAB_SIZE)) as u8,
+	})
+}
+
+/// Whether `line` is laid out through the wrap index (ADR 0009).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn line_is_indexed_with_sum_tree<F: FoldPolicy + ?Sized>(
+	registry: &UastRegistry,
+	root: NodeId,
+	folds: &F,
+	max_doc_line: DocLine,
+	wrap_enabled: bool,
+	text_width: u16,
+	tree: &SumTree,
+	wrap: Option<WrapLayout<'_>>,
+	line: DocLine,
+) -> bool {
+	wrap_enabled
+		&& matches!(
+			LayoutContext::with_sum_tree(
+				registry,
+				root,
+				folds,
+				max_doc_line,
+				wrap_enabled,
+				text_width,
+				tree,
+				wrap,
+			)
+			.line_layout(line),
+			LineLayout::Indexed { .. }
+		)
 }
 
 pub fn scroll_viewport_anchor<F: FoldPolicy + ?Sized>(
@@ -767,6 +1296,8 @@ pub fn clamp_cursor_to_viewport_anchor<F: FoldPolicy + ?Sized>(
 		text_width,
 	)
 	.clamp_cursor_to_viewport_anchor(anchor, cursor_line, cursor_col, viewport_rows)
+	.map(|target| (target.line, target.col))
+	.expect("without a wrap index the clamp always places the cursor")
 }
 
 pub fn cursor_view_metrics<F: FoldPolicy + ?Sized>(
@@ -822,6 +1353,7 @@ pub(crate) fn scroll_viewport_anchor_with_sum_tree<F: FoldPolicy + ?Sized>(
 	wrap_enabled: bool,
 	text_width: u16,
 	tree: &SumTree,
+	wrap: Option<WrapLayout<'_>>,
 ) -> ViewportAnchor {
 	LayoutContext::with_sum_tree(
 		registry,
@@ -831,6 +1363,7 @@ pub(crate) fn scroll_viewport_anchor_with_sum_tree<F: FoldPolicy + ?Sized>(
 		wrap_enabled,
 		text_width,
 		tree,
+		wrap,
 	)
 	.scroll_viewport_anchor(anchor, delta_rows)
 }
@@ -847,6 +1380,7 @@ pub(crate) fn pan_viewport_anchor_to_keep_cursor_visible_with_sum_tree<F: FoldPo
 	wrap_enabled: bool,
 	text_width: u16,
 	tree: &SumTree,
+	wrap: Option<WrapLayout<'_>>,
 ) -> ViewportAnchor {
 	LayoutContext::with_sum_tree(
 		registry,
@@ -856,6 +1390,7 @@ pub(crate) fn pan_viewport_anchor_to_keep_cursor_visible_with_sum_tree<F: FoldPo
 		wrap_enabled,
 		text_width,
 		tree,
+		wrap,
 	)
 	.pan_viewport_anchor_to_keep_cursor_visible(anchor, cursor_line, cursor_col, viewport_rows)
 }
@@ -872,7 +1407,8 @@ pub(crate) fn clamp_cursor_to_viewport_anchor_with_sum_tree<F: FoldPolicy + ?Siz
 	wrap_enabled: bool,
 	text_width: u16,
 	tree: &SumTree,
-) -> (DocLine, DocDisplayCol) {
+	wrap: Option<WrapLayout<'_>>,
+) -> Option<CursorTarget> {
 	LayoutContext::with_sum_tree(
 		registry,
 		root,
@@ -881,6 +1417,7 @@ pub(crate) fn clamp_cursor_to_viewport_anchor_with_sum_tree<F: FoldPolicy + ?Siz
 		wrap_enabled,
 		text_width,
 		tree,
+		wrap,
 	)
 	.clamp_cursor_to_viewport_anchor(anchor, cursor_line, cursor_col, viewport_rows)
 }
@@ -896,6 +1433,7 @@ pub(crate) fn cursor_view_metrics_with_sum_tree<F: FoldPolicy + ?Sized>(
 	wrap_enabled: bool,
 	text_width: u16,
 	tree: &SumTree,
+	wrap: Option<WrapLayout<'_>>,
 ) -> (PaneLocalRow, PaneLocalCol) {
 	LayoutContext::with_sum_tree(
 		registry,
@@ -905,6 +1443,7 @@ pub(crate) fn cursor_view_metrics_with_sum_tree<F: FoldPolicy + ?Sized>(
 		wrap_enabled,
 		text_width,
 		tree,
+		wrap,
 	)
 	.cursor_view_metrics(anchor, cursor_line, cursor_col)
 }
@@ -919,6 +1458,7 @@ pub(crate) fn collect_visible_rows_with_sum_tree<F: FoldPolicy + ?Sized>(
 	wrap_enabled: bool,
 	text_width: u16,
 	tree: &SumTree,
+	wrap: Option<WrapLayout<'_>>,
 ) -> Vec<VisibleRow> {
 	LayoutContext::with_sum_tree(
 		registry,
@@ -928,6 +1468,7 @@ pub(crate) fn collect_visible_rows_with_sum_tree<F: FoldPolicy + ?Sized>(
 		wrap_enabled,
 		text_width,
 		tree,
+		wrap,
 	)
 	.collect_visible_rows(anchor, viewport_rows)
 }
@@ -1161,22 +1702,10 @@ mod tests {
 		assert_eq!(
 			rows,
 			vec![
-				VisibleRow {
-					line: DocLine::ZERO,
-					start_col: DocDisplayCol::new(4),
-				},
-				VisibleRow {
-					line: DocLine::ZERO,
-					start_col: DocDisplayCol::new(8),
-				},
-				VisibleRow {
-					line: DocLine::new(1),
-					start_col: DocDisplayCol::ZERO,
-				},
-				VisibleRow {
-					line: DocLine::new(2),
-					start_col: DocDisplayCol::ZERO,
-				},
+				VisibleRow::whole(DocLine::ZERO, DocDisplayCol::new(4)),
+				VisibleRow::whole(DocLine::ZERO, DocDisplayCol::new(8)),
+				VisibleRow::whole(DocLine::new(1), DocDisplayCol::ZERO),
+				VisibleRow::whole(DocLine::new(2), DocDisplayCol::ZERO),
 			]
 		);
 	}
@@ -1298,5 +1827,438 @@ mod tests {
 		assert_eq!(screen_col, PaneLocalCol::ZERO);
 
 		let _ = std::fs::remove_file(path);
+	}
+
+	mod wrap_index_layout {
+		use super::super::{LayoutContext, LayoutDemand, ViewportAnchor, WrapLayout};
+		use super::{build_document, build_source_backed_line_document};
+		use crate::core::{DisplayRow, DocDisplayCol, DocLine, StateId, TopologyRev};
+		use crate::ecs::{NodeId, UastRegistry};
+		use crate::engine::wrap_index::{WrapIndex, WrapIndexLimits};
+		use std::cell::RefCell;
+
+		const WIDTH: u16 = 13;
+		/// Lines this long take the index in these tests.
+		const THRESHOLD: u64 = 64;
+
+		fn long_line(target: usize) -> String {
+			let words = [
+				"alpha ",
+				"beta\t",
+				"gamma ",
+				"日本 ",
+				"delta  ",
+				"e\u{301}psilon ",
+				"x",
+			];
+			let mut line = String::new();
+			let mut at = 0;
+			while line.len() < target {
+				line.push_str(words[at % words.len()]);
+				at += 1;
+			}
+			line
+		}
+
+		/// Rows as both paths publish them; the index path adds byte origins.
+		fn placed(rows: &[super::super::VisibleRow]) -> Vec<(DocLine, DocDisplayCol)> {
+			rows.iter().map(|row| (row.line, row.start_col)).collect()
+		}
+
+		/// An indexed row's origin names the cell holding its start column.
+		fn assert_origin(text: &str, row: &super::super::VisibleRow) {
+			let offset = row.start_offset.expect("an indexed row has an offset");
+			assert_eq!(offset.get(), u64::from(row.start_col.get()));
+			let Some(byte) = row.start_byte else { return };
+			let line_start = text
+				.split_inclusive('\n')
+				.take(row.line.get() as usize)
+				.map(str::len)
+				.sum::<usize>();
+			let line_bytes = text[line_start..].split('\n').next().unwrap().as_bytes();
+			let in_line = byte.get() as usize - line_start;
+			let at = crate::core::text::display_col_for_byte_offset(
+				line_bytes,
+				in_line,
+				0,
+				crate::core::TAB_SIZE,
+			);
+			let (_, after) = crate::core::text::byte_offset_for_display_col(
+				&line_bytes[in_line..],
+				1,
+				at,
+				crate::core::TAB_SIZE,
+			);
+			assert!(
+				u64::from(at) <= offset.get()
+					&& (u64::from(at) == offset.get() || offset.get() < u64::from(after)),
+				"row {row:?} names a cell at {at}..{after}"
+			);
+		}
+
+		struct Fixture {
+			registry: UastRegistry,
+			root: NodeId,
+			index: RefCell<WrapIndex>,
+			demand: RefCell<LayoutDemand>,
+		}
+
+		impl Fixture {
+			fn new(text: &str, limits: WrapIndexLimits) -> Self {
+				let (registry, root) = build_document(text);
+				Self {
+					registry,
+					root,
+					index: RefCell::new(WrapIndex::with_limits(limits)),
+					demand: RefCell::new(LayoutDemand::default()),
+				}
+			}
+
+			fn max_line(&self) -> DocLine {
+				DocLine::new(self.registry.get_total_newlines(self.root))
+			}
+
+			fn whole(&self) -> LayoutContext<'_, crate::uast::NoFolds> {
+				LayoutContext::sparse(
+					&self.registry,
+					self.root,
+					&crate::uast::NoFolds,
+					self.max_line(),
+					true,
+					WIDTH,
+				)
+			}
+
+			/// A context through the index, at the start of a frame.
+			fn indexed(&self) -> LayoutContext<'_, crate::uast::NoFolds> {
+				self.index.borrow_mut().begin_frame();
+				let mut wrap = WrapLayout::new(
+					&self.index,
+					StateId::new(1),
+					TopologyRev::new(1),
+					&self.demand,
+				);
+				wrap.min_line_bytes = THRESHOLD;
+				self.whole().with_wrap(wrap)
+			}
+
+			fn take_demand(&self) -> LayoutDemand {
+				std::mem::take(&mut *self.demand.borrow_mut())
+			}
+		}
+
+		#[test]
+		fn the_index_path_lays_out_exactly_like_the_whole_line() {
+			let text = format!("{}\nshort line\n{}", long_line(3_000), long_line(1_500));
+			let fixture = Fixture::new(&text, WrapIndexLimits::default());
+			let whole = fixture.whole();
+			let mut anchors = Vec::new();
+			for line in 0..=fixture.max_line().get() {
+				let line = DocLine::new(line);
+				let (rows, exact) = whole.line_rows(line);
+				assert!(exact);
+				assert_eq!(
+					fixture.indexed().line_rows(line),
+					(rows, true),
+					"line {line}"
+				);
+				for row in 0..rows {
+					anchors.push(ViewportAnchor {
+						line,
+						row_offset: DisplayRow::new(row),
+					});
+				}
+			}
+			assert!(anchors.len() > 300, "long lines wrap into many rows");
+			for (at, &anchor) in anchors.iter().enumerate().step_by(7) {
+				let indexed_rows = fixture.indexed().collect_visible_rows(anchor, 9);
+				assert_eq!(
+					placed(&indexed_rows),
+					placed(&whole.collect_visible_rows(anchor, 9)),
+					"anchor {anchor:?}"
+				);
+				for row in indexed_rows
+					.iter()
+					.filter(|row| row.line != DocLine::new(1))
+				{
+					assert_origin(&text, row);
+				}
+				for delta in [-40, -9, -1, 1, 5, 40, 10_000] {
+					assert_eq!(
+						fixture.indexed().scroll_viewport_anchor(anchor, delta),
+						whole.scroll_viewport_anchor(anchor, delta),
+						"anchor {anchor:?} delta {delta}"
+					);
+				}
+				let col = DocDisplayCol::new((at as u32 * 37) % 4_000);
+				assert_eq!(
+					fixture
+						.indexed()
+						.cursor_view_metrics(anchor, anchor.line, col),
+					whole.cursor_view_metrics(anchor, anchor.line, col),
+					"anchor {anchor:?} col {col}"
+				);
+			}
+			assert!(
+				!fixture.take_demand().more,
+				"a resident line finishes in one frame"
+			);
+		}
+
+		fn tight() -> WrapIndexLimits {
+			WrapIndexLimits {
+				read_budget: 512,
+				checkpoint_bytes: 128,
+				line_bytes: 1 << 20,
+				max_lines: 4,
+			}
+		}
+
+		#[test]
+		fn scrolling_stops_at_the_scanned_prefix_and_resumes_on_later_frames() {
+			let text = format!("head\n{}\ntail", long_line(20_000));
+			let fixture = Fixture::new(&text, tight());
+			let long = DocLine::new(1);
+			let (rows, exact) = fixture.whole().line_rows(long);
+			assert!(exact && rows > 1_000);
+
+			// From the line above, a long scroll enters the long line and stops
+			// at its last known row: it must not skip to the tail line.
+			let mut anchor = ViewportAnchor {
+				line: DocLine::ZERO,
+				row_offset: DisplayRow::ZERO,
+			};
+			anchor = fixture.indexed().scroll_viewport_anchor(anchor, 100_000);
+			assert_eq!(
+				anchor.line, long,
+				"the scroll stopped inside the unscanned line"
+			);
+			let first_stop = anchor.row_offset;
+			assert!(
+				fixture.take_demand().more,
+				"the stop asks for a continuation"
+			);
+
+			// Each frame scans one budget further, and the same scroll goes on.
+			let mut frames = 0;
+			while anchor.line == long {
+				anchor = fixture.indexed().scroll_viewport_anchor(anchor, 100_000);
+				frames += 1;
+				assert!(frames < 10_000, "the scroll never left the long line");
+			}
+			assert_eq!(anchor.line, DocLine::new(2), "the scroll reached the tail");
+			assert!(frames > 1, "the scan took several frames");
+			assert!(first_stop.get() < rows - 1);
+
+			// An anchor past a scanned prefix is kept, not pulled back.
+			let fresh = Fixture::new(&text, tight());
+			let deep = ViewportAnchor {
+				line: long,
+				row_offset: DisplayRow::new(rows - 1),
+			};
+			assert_eq!(fresh.indexed().normalize_anchor(deep), deep);
+		}
+
+		#[test]
+		fn one_frame_of_layout_passes_reads_one_budget() {
+			let text = format!("{}\n", long_line(50_000));
+			let fixture = Fixture::new(&text, tight());
+			let context = fixture.indexed();
+			let anchor = ViewportAnchor {
+				line: DocLine::ZERO,
+				row_offset: DisplayRow::ZERO,
+			};
+			// What render does in one frame: pan, visible rows, cursor metrics.
+			let _ = context.pan_viewport_anchor_to_keep_cursor_visible(
+				anchor,
+				DocLine::ZERO,
+				DocDisplayCol::new(9_000),
+				30,
+			);
+			let _ = context.collect_visible_rows(anchor, 30);
+			let _ = context.cursor_view_metrics(anchor, DocLine::ZERO, DocDisplayCol::new(9_000));
+			let _ = context.scroll_viewport_anchor(anchor, 5_000);
+			let fed = fixture
+				.index
+				.borrow()
+				.fed_bytes(DocLine::ZERO, WIDTH)
+				.expect("the line is indexed");
+			assert!(
+				fed <= tight().read_budget as u64,
+				"one frame read {fed} bytes"
+			);
+		}
+
+		#[test]
+		fn visible_rows_never_guess_a_start_the_index_cannot_reach() {
+			// Checkpoints far apart and a tiny frame budget: a replay to an old
+			// row outside the recent ring takes many frames.
+			let limits = WrapIndexLimits {
+				read_budget: 256,
+				checkpoint_bytes: 8 * 1024,
+				line_bytes: 1 << 20,
+				max_lines: 4,
+			};
+			let text = format!("{}\n", long_line(60_000));
+			let fixture = Fixture::new(&text, limits);
+			let whole = fixture.whole();
+			let (rows, _) = whole.line_rows(DocLine::ZERO);
+			assert!(rows > 5_000, "more rows than the recent ring holds");
+			for _ in 0..100_000 {
+				if fixture.indexed().line_rows(DocLine::ZERO).1 {
+					break;
+				}
+			}
+			fixture.take_demand();
+			let anchor = ViewportAnchor {
+				line: DocLine::ZERO,
+				// The ring keeps the latest rows, so row 200 is outside it.
+				row_offset: DisplayRow::new(200),
+			};
+			let expected = placed(&whole.collect_visible_rows(anchor, 20));
+			let mut frames = 0;
+			loop {
+				let got = placed(&fixture.indexed().collect_visible_rows(anchor, 20));
+				// Every emitted row is a true one; a short frame is allowed.
+				assert_eq!(got[..], expected[..got.len()], "frame {frames}");
+				if got.len() == expected.len() {
+					break;
+				}
+				assert!(fixture.take_demand().more, "a short frame asks to continue");
+				frames += 1;
+				assert!(frames < 10_000, "the rows never settled");
+			}
+			assert!(frames > 0, "the replay outlasted at least one frame");
+		}
+
+		#[test]
+		fn an_unplaced_cursor_does_not_move_the_view() {
+			// As in the visible-rows case: a replay to an old row outlasts a frame.
+			let limits = WrapIndexLimits {
+				read_budget: 256,
+				checkpoint_bytes: 8 * 1024,
+				line_bytes: 1 << 20,
+				max_lines: 4,
+			};
+			let text = format!("{}\n", long_line(60_000));
+			let fixture = Fixture::new(&text, limits);
+			let whole = fixture.whole();
+			for _ in 0..100_000 {
+				if fixture.indexed().line_rows(DocLine::ZERO).1 {
+					break;
+				}
+			}
+			fixture.take_demand();
+			let cursor_col = whole
+				.try_row_start_col(DocLine::ZERO, DisplayRow::new(200))
+				.expect("the whole path places every row");
+			let anchor = ViewportAnchor {
+				line: DocLine::ZERO,
+				row_offset: DisplayRow::new(210),
+			};
+			// The cursor's row is unknown this frame: the view stays put rather
+			// than jumping to row 0.
+			let first = fixture
+				.indexed()
+				.pan_viewport_anchor_to_keep_cursor_visible(anchor, DocLine::ZERO, cursor_col, 5);
+			assert_eq!(first, anchor);
+			assert!(fixture.take_demand().more);
+			// Later frames place the cursor and pan to its real row.
+			let expected = whole.pan_viewport_anchor_to_keep_cursor_visible(
+				anchor,
+				DocLine::ZERO,
+				cursor_col,
+				5,
+			);
+			let mut frames = 0;
+			let mut panned = first;
+			while panned != expected {
+				panned = fixture
+					.indexed()
+					.pan_viewport_anchor_to_keep_cursor_visible(
+						anchor,
+						DocLine::ZERO,
+						cursor_col,
+						5,
+					);
+				frames += 1;
+				assert!(frames < 10_000, "the pan never settled");
+				assert!(
+					panned == anchor || panned == expected,
+					"frame {frames}: {panned:?}"
+				);
+			}
+		}
+
+		#[test]
+		fn a_trailing_whitespace_window_starts_at_the_run_and_rows_keep_their_offsets() {
+			let text = format!("{}{}", long_line(200), " ".repeat(60));
+			let fixture = Fixture::new(&text, WrapIndexLimits::default());
+			let whole = fixture.whole();
+			let (rows, _) = whole.line_rows(DocLine::ZERO);
+			let top = ViewportAnchor {
+				line: DocLine::ZERO,
+				row_offset: DisplayRow::ZERO,
+			};
+			let context = fixture.indexed();
+			let all = context.collect_visible_rows(top, rows);
+			assert_eq!(placed(&all), placed(&whole.collect_visible_rows(top, rows)));
+			let trailing: Vec<_> = all.iter().filter(|row| row.start_byte.is_none()).collect();
+			assert!(trailing.len() >= 2, "several rows of trailing whitespace");
+
+			let words = text.trim_end();
+			let run_byte = words.len() as u64;
+			let run_offset = u64::from(crate::core::text::display_width(
+				words.as_bytes(),
+				0,
+				crate::core::TAB_SIZE,
+			));
+			for row in trailing {
+				let (byte, offset) = context.window_origin(*row).expect("the run is recorded");
+				assert_eq!(
+					(byte.get(), offset.get()),
+					(run_byte, run_offset),
+					"row {row:?}"
+				);
+				// The row keeps its own place; only the window's origin moves.
+				assert!(offset.get() < row.start_offset.expect("an offset").get());
+			}
+		}
+
+		#[test]
+		fn a_line_without_resident_bytes_asks_for_its_node() {
+			let (registry, root, path) = build_source_backed_line_document(3);
+			let index = RefCell::new(WrapIndex::default());
+			let demand = RefCell::new(LayoutDemand::default());
+			let context = LayoutContext::sparse(
+				&registry,
+				root,
+				&crate::uast::NoFolds,
+				DocLine::new(registry.get_total_newlines(root)),
+				true,
+				WIDTH,
+			)
+			.with_wrap(WrapLayout::new(
+				&index,
+				StateId::new(1),
+				TopologyRev::new(1),
+				&demand,
+			));
+			let rows = context.collect_visible_rows(
+				ViewportAnchor {
+					line: DocLine::new(1),
+					row_offset: DisplayRow::ZERO,
+				},
+				4,
+			);
+			assert!(!rows.is_empty());
+			let demand = demand.into_inner();
+			assert!(demand.more);
+			assert!(
+				!demand.pending.is_empty(),
+				"the cold leaf is named for hydration"
+			);
+			let _ = std::fs::remove_file(path);
+		}
 	}
 }

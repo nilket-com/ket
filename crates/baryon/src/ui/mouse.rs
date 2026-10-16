@@ -312,14 +312,16 @@ fn text_click_target(
 	let row = visible_rows
 		.get(local_text_row as usize)
 		.copied()
-		.unwrap_or_else(|| libaryon::engine::VisibleRow {
-			line: DocLine::new(scroll_y.saturating_add(u64::from(local_text_row))),
-			start_col: DocDisplayCol::ZERO,
+		.unwrap_or_else(|| {
+			libaryon::engine::VisibleRow::whole(
+				DocLine::new(scroll_y.saturating_add(u64::from(local_text_row))),
+				DocDisplayCol::ZERO,
+			)
 		});
-	let target_col = row
-		.start_col
-		.checked_add(u32::from(text_col))
-		.expect("DocDisplayCol addition overflow");
+	let row_start = row.start_offset.map_or(row.start_col, |offset| {
+		DocDisplayCol::new(u32::try_from(offset.get()).unwrap_or(u32::MAX))
+	});
+	let target_col = row_start.saturating_add(u32::from(text_col));
 	CursorPosition::new(row.line, target_col)
 }
 
@@ -870,14 +872,8 @@ mod tests {
 	#[test]
 	fn wrapped_text_click_uses_the_visible_rows_start_column() {
 		let rows = [
-			VisibleRow {
-				line: DocLine::new(7),
-				start_col: DocDisplayCol::ZERO,
-			},
-			VisibleRow {
-				line: DocLine::new(7),
-				start_col: DocDisplayCol::new(10),
-			},
+			VisibleRow::whole(DocLine::new(7), DocDisplayCol::ZERO),
+			VisibleRow::whole(DocLine::new(7), DocDisplayCol::new(10)),
 		];
 		assert_eq!(
 			text_click_target(&rows, 7, 1, 3),
@@ -886,6 +882,20 @@ mod tests {
 		assert_eq!(
 			text_click_target(&rows, 7, 4, 2),
 			CursorPosition::new(DocLine::new(11), DocDisplayCol::new(2))
+		);
+	}
+
+	#[test]
+	fn windowed_text_click_uses_the_rows_absolute_offset() {
+		let rows = [libaryon::engine::VisibleRow {
+			line: DocLine::new(7),
+			start_col: DocDisplayCol::new(100),
+			start_byte: Some(libaryon::core::DocByte::new(100)),
+			start_offset: Some(libaryon::core::DisplayOffset::new(100)),
+		}];
+		assert_eq!(
+			text_click_target(&rows, 7, 0, 3),
+			CursorPosition::new(DocLine::new(7), DocDisplayCol::new(103))
 		);
 	}
 
