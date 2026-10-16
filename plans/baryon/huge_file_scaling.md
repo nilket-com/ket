@@ -39,6 +39,10 @@ The sparse projection already has several properties worth preserving:
 The current viewport residency is sparse only initially: hydrated physical leaves accumulate in
 `virtual_data` and are not evicted as navigation moves elsewhere.
 
+The first-viewport objective is not yet met. Measured on 2026-10-15 (release, sparse fixtures,
+`crates/libaryon/plans/impl/startup-latency.md` section 10), time to the first usable viewport is
+linear in cold extents: about 1 ms per GiB, 79 ms at 64 GiB and 208 ms at 200 GiB.
+
 Those properties are necessary but not sufficient for the target sizes.
 
 ## Scale findings
