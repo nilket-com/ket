@@ -4620,14 +4620,9 @@ fn click_column_for_row(
 	row: &libaryon::engine::VisibleRow,
 	local_column: u32,
 ) -> libaryon::core::DocDisplayCol {
-	let absolute_start = row
-		.start_offset
-		.map_or(u64::from(row.start_col.get()), |offset| offset.get());
-	libaryon::core::DocDisplayCol::new(
-		u32::try_from(absolute_start)
-			.unwrap_or(u32::MAX)
-			.saturating_add(local_column),
-	)
+	row.start_offset
+		.unwrap_or(row.start_col)
+		.saturating_add(u64::from(local_column))
 }
 
 fn color(color: Rgb) -> Color {
@@ -11663,14 +11658,14 @@ mod tests {
 		pane.row_window = Some(libaryon::engine::RowWindow {
 			line: libaryon::core::DocLine::ZERO,
 			start_byte: libaryon::core::DocByte::new(100),
-			start_offset: libaryon::core::DisplayOffset::new(101),
+			start_offset: libaryon::core::DocDisplayCol::new(101),
 			tab_phase: 1,
 		});
 		pane.visible_rows = vec![libaryon::engine::VisibleRow {
 			line: libaryon::core::DocLine::ZERO,
 			start_col: libaryon::core::DocDisplayCol::new(101),
 			start_byte: Some(libaryon::core::DocByte::new(100)),
-			start_offset: Some(libaryon::core::DisplayOffset::new(101)),
+			start_offset: Some(libaryon::core::DocDisplayCol::new(101)),
 		}];
 		pane.render_rows.clone_from(&pane.visible_rows);
 		pane.tokens.truncate(1);
@@ -11696,12 +11691,12 @@ mod tests {
 		pane.row_window = Some(libaryon::engine::RowWindow {
 			line: libaryon::core::DocLine::ZERO,
 			start_byte: libaryon::core::DocByte::new(100),
-			start_offset: libaryon::core::DisplayOffset::new(100),
+			start_offset: libaryon::core::DocDisplayCol::new(100),
 			tab_phase: 0,
 		});
 		pane.visible_rows[0].start_col = libaryon::core::DocDisplayCol::new(104);
 		pane.visible_rows[0].start_byte = None;
-		pane.visible_rows[0].start_offset = Some(libaryon::core::DisplayOffset::new(104));
+		pane.visible_rows[0].start_offset = Some(libaryon::core::DocDisplayCol::new(104));
 		pane.render_rows.clone_from(&pane.visible_rows);
 		let token = pane.tokens.first_mut().expect("one physical token");
 		token.text = b"        \n".to_vec();
@@ -11722,7 +11717,7 @@ mod tests {
 			line: libaryon::core::DocLine::new(7),
 			start_col: libaryon::core::DocDisplayCol::new(100),
 			start_byte: Some(libaryon::core::DocByte::new(100)),
-			start_offset: Some(libaryon::core::DisplayOffset::new(100)),
+			start_offset: Some(libaryon::core::DocDisplayCol::new(100)),
 		};
 		assert_eq!(
 			super::click_column_for_row(&row, 3),

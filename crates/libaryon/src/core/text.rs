@@ -136,15 +136,18 @@ pub fn display_cells(bytes: &[u8]) -> Vec<DisplayCell> {
 	cells
 }
 
-pub fn advance_display_col(column: u32, cell: DisplayCell, tab_size: u32) -> u32 {
+pub fn advance_display_col(column: u64, cell: DisplayCell, tab_size: u32) -> u64 {
+	let tab_size = u64::from(tab_size);
 	match cell.kind {
 		DisplayCellKind::Newline => 0,
 		DisplayCellKind::Tab => column.saturating_add(tab_size - column % tab_size),
-		DisplayCellKind::Text | DisplayCellKind::InvalidByte => column.saturating_add(cell.width),
+		DisplayCellKind::Text | DisplayCellKind::InvalidByte => {
+			column.saturating_add(u64::from(cell.width))
+		}
 	}
 }
 
-pub fn display_width(bytes: &[u8], initial_column: u32, tab_size: u32) -> u32 {
+pub fn display_width(bytes: &[u8], initial_column: u64, tab_size: u32) -> u64 {
 	let mut column = initial_column;
 	visit_display_cells(bytes, |cell| {
 		if cell.kind == DisplayCellKind::Newline {
@@ -160,10 +163,10 @@ pub fn display_width(bytes: &[u8], initial_column: u32, tab_size: u32) -> u32 {
 /// after that cell, matching the editor's existing tab behavior.
 pub fn byte_offset_for_display_col(
 	bytes: &[u8],
-	target_column: u32,
-	initial_column: u32,
+	target_column: u64,
+	initial_column: u64,
 	tab_size: u32,
-) -> (usize, u32) {
+) -> (usize, u64) {
 	if target_column <= initial_column {
 		return (0, initial_column);
 	}
@@ -189,9 +192,9 @@ pub fn byte_offset_for_display_col(
 pub fn display_col_for_byte_offset(
 	bytes: &[u8],
 	byte_offset: usize,
-	initial_column: u32,
+	initial_column: u64,
 	tab_size: u32,
-) -> u32 {
+) -> u64 {
 	let target = byte_offset.min(bytes.len());
 	if target == 0 {
 		return initial_column;

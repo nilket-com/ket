@@ -1,5 +1,5 @@
 use super::super::core::resolve_byte_range;
-use super::super::document::cursor::{next_word_end, next_word_start, prev_word_start};
+use super::super::document::cursor::line_from_doc_byte_raw;
 use super::super::document::edit::{
 	apply_deltas_to_document, apply_deltas_to_document_internal, delete_char_delta_at_cursor,
 	delete_line_delta_sparse, fold_edits_for_deltas, linewise_put_insertion_sparse,
@@ -8,6 +8,7 @@ use super::super::document::io::read_loaded_document;
 use super::super::document::parse::word_object_delta_at_cursor;
 use super::super::document::selection::{extract_visual_text_sparse, resolve_visual_ranges_sparse};
 use super::super::folding::FoldSet;
+use super::super::layout::{CaretIndex, LayoutDemand};
 use super::super::protocol::{
 	CommandRange, DocumentEditOutcome, DocumentEditRefusal, DocumentTextEdit, EditorCommand,
 	EditorMode, VisualKind, WordMotion,
@@ -24,12 +25,15 @@ use super::super::support::{
 };
 use super::super::uast_query::{UastQuery, is_function_scope};
 use super::super::undo::{HistoryDirection, HistoryReplay, TextDelta, UndoLedger};
+use super::super::wrap_index::LineEdit;
+use super::navigation::caret_index;
 use super::system::load_root_from_path;
 use super::{CommandEffect, RuntimeContext};
 use crate::core::{DocByte, DocDisplayCol, DocLine, DocLineCount, NodeByteOffset, StateId};
 use crate::ecs::{NodeId, UastRegistry};
 use crate::svp::BackingIdentity;
 use crate::svp::diagnostic::DiagnosticSpan;
+use crate::svp::ingest::COLD_INGEST_EXTENT_SIZE;
 use crate::svp::rust_highlight::HighlightSpan;
 use crate::uast::UastProjection;
 use std::collections::HashMap;
@@ -931,49 +935,70 @@ fn next_utf8_boundary(doc: &str, byte: usize) -> usize {
 		.unwrap_or(byte)
 }
 
-fn resolve_word_motion_range(
-	doc: &str,
-	cursor_abs_byte: DocByte,
-	motion: WordMotion,
-) -> Option<(DocByte, DocByte)> {
-	let cursor_byte = clamp_utf8_boundary(doc, cursor_abs_byte.get() as usize);
-	if cursor_byte >= doc.len() {
-		return None;
-	}
-
-	let (start, end) = match motion {
-		WordMotion::NextStart => (cursor_byte, next_word_start(doc, cursor_byte)),
-		WordMotion::PrevStart => (prev_word_start(doc, cursor_byte), cursor_byte),
-		WordMotion::NextEnd => {
-			let word_end = next_word_end(doc, cursor_byte);
-			(cursor_byte, next_utf8_boundary(doc, word_end))
-		}
-	};
-
-	if start >= end {
-		None
-	} else {
-		Some((DocByte::new(start as u64), DocByte::new(end as u64)))
-	}
-}
-
+/// The text a word motion from the caret spans, as a delete, read from a
+/// window beside the caret rather than the whole document (ADR 0010).
 fn word_motion_delta_at_cursor(
 	registry: &UastRegistry,
 	root: NodeId,
 	cursor_abs_byte: DocByte,
 	motion: WordMotion,
+	indexed: Option<CaretIndex<'_>>,
 ) -> Result<Option<(TextDelta, String)>, String> {
-	let bytes = read_loaded_document(registry, root).map_err(|msg| msg.to_string())?;
-	let doc = std::str::from_utf8(&bytes)
-		.map_err(|_| "Loaded document is not valid UTF-8".to_string())?;
-	let Some((start, end)) = resolve_word_motion_range(doc, cursor_abs_byte, motion) else {
+	use super::super::document::cursor::{WordMotion as Window, WordTarget, word_motion_target};
+	let total = registry.get_total_bytes(root);
+	if cursor_abs_byte.get() >= total {
 		return Ok(None);
+	}
+	let window = indexed.map_or(COLD_INGEST_EXTENT_SIZE, |index| {
+		index.reserve_read(COLD_INGEST_EXTENT_SIZE)
+	});
+	let kind = match motion {
+		WordMotion::NextStart => Window::NextStart,
+		WordMotion::PrevStart => Window::PrevStart,
+		WordMotion::NextEnd => Window::NextEnd,
 	};
-	let start_idx = start.get() as usize;
-	let end_idx = end.get() as usize;
-	let deleted_bytes = doc.as_bytes()[start_idx..end_idx].to_vec();
-	let register_text = doc[start_idx..end_idx].to_string();
-
+	let loading = |node| {
+		if let Some(index) = indexed {
+			index.request(node);
+		}
+		Err("Loading text".to_string())
+	};
+	let target = match word_motion_target(registry, root, cursor_abs_byte, kind, window as u64) {
+		WordTarget::Byte(byte) => byte,
+		WordTarget::Pending(node) => return loading(Some(node)),
+		WordTarget::Wait => return loading(None),
+		WordTarget::Stay => return Ok(None),
+	};
+	let (start, end) = match motion {
+		WordMotion::NextStart => (cursor_abs_byte, target),
+		WordMotion::PrevStart => (target, cursor_abs_byte),
+		// Through the end of the word's last character.
+		WordMotion::NextEnd => {
+			let tail = registry
+				.read_loaded_slice(
+					root,
+					target,
+					DocByte::new(target.get().saturating_add(4).min(total)),
+				)
+				.map_err(|msg| msg.to_string())?;
+			let width = match std::str::from_utf8(&tail) {
+				Ok(text) => text,
+				Err(error) => std::str::from_utf8(&tail[..error.valid_up_to()]).expect("validated"),
+			}
+			.chars()
+			.next()
+			.map_or(0, char::len_utf8);
+			(cursor_abs_byte, target.saturating_add(width as u64))
+		}
+	};
+	if start >= end {
+		return Ok(None);
+	}
+	let deleted_bytes = registry
+		.read_loaded_slice(root, start, end)
+		.map_err(|msg| msg.to_string())?;
+	let register_text = String::from_utf8(deleted_bytes.clone())
+		.map_err(|_| "Loaded text is not valid UTF-8".to_string())?;
 	Ok(Some((
 		TextDelta {
 			global_byte_offset: start,
@@ -1077,6 +1102,7 @@ pub(super) fn handle_edit_command(
 	clipboard: &mut super::super::clipboard::ClipboardHandle,
 	status_message: &mut Option<String>,
 	mode_override: &mut Option<EditorMode>,
+	indexed: Option<CaretIndex<'_>>,
 	command: EditorCommand,
 ) -> CommandEffect {
 	let mut needs_render = false;
@@ -1100,6 +1126,7 @@ pub(super) fn handle_edit_command(
 					anchor,
 					cursor_abs_byte,
 					kind,
+					indexed,
 				) {
 					Ok(ranges) => {
 						if ranges.is_empty() {
@@ -1147,6 +1174,7 @@ pub(super) fn handle_edit_command(
 					anchor,
 					cursor_abs_byte,
 					kind,
+					indexed,
 				) {
 					Ok(ranges) => {
 						if ranges.is_empty() {
@@ -1246,7 +1274,7 @@ pub(super) fn handle_edit_command(
 		EditorCommand::DeleteWordMotion { register, motion } => {
 			if let Some(rid) = *root_id {
 				let cursor_abs_byte = caret.byte();
-				match word_motion_delta_at_cursor(registry, rid, cursor_abs_byte, motion) {
+				match word_motion_delta_at_cursor(registry, rid, cursor_abs_byte, motion, indexed) {
 					Ok(Some((delta, deleted_text))) => {
 						store_named_text(
 							registers,
@@ -1280,7 +1308,7 @@ pub(super) fn handle_edit_command(
 		EditorCommand::ChangeWordMotion { register, motion } => {
 			if let Some(rid) = *root_id {
 				let cursor_abs_byte = caret.byte();
-				match word_motion_delta_at_cursor(registry, rid, cursor_abs_byte, motion) {
+				match word_motion_delta_at_cursor(registry, rid, cursor_abs_byte, motion, indexed) {
 					Ok(Some((delta, deleted_text))) => {
 						store_named_text(
 							registers,
@@ -1317,7 +1345,7 @@ pub(super) fn handle_edit_command(
 		EditorCommand::YankWordMotion { register, motion } => {
 			if let Some(rid) = *root_id {
 				let cursor_abs_byte = caret.byte();
-				match word_motion_delta_at_cursor(registry, rid, cursor_abs_byte, motion) {
+				match word_motion_delta_at_cursor(registry, rid, cursor_abs_byte, motion, indexed) {
 					Ok(Some((_delta, yanked_text))) => {
 						store_named_text(
 							registers,
@@ -1847,6 +1875,16 @@ pub(super) fn handle_edit_doctab_command(
 			| EditorCommand::VisualYank { .. }
 			| EditorCommand::YankWordMotion { .. }
 	);
+	// The wrap index holds bytes, not nodes: lookups before the edit key it by
+	// the revision it was built for, and the edit carries it over (ADR 0010).
+	let index_from = (
+		tab.document.ledger.current_state_id,
+		tab.document.topology_rev,
+	);
+	let gutter_numbering = tab.gutter_numbering();
+	let demand = std::cell::RefCell::new(LayoutDemand::default());
+	// A command is its own frame for the wrap index, as in navigation.
+	tab.view.common.wrap_index.borrow_mut().begin_frame();
 	if !preserves_node_map {
 		tab.document.bump_topology_rev();
 	}
@@ -1855,9 +1893,26 @@ pub(super) fn handle_edit_doctab_command(
 		let topology_rev = tab.document.topology_rev;
 		let state_id = tab.document.ledger.current_state_id;
 		let mut pending = false;
-		let folds = &mut tab.view.folds;
+		let view = &mut *tab.view;
+		let indexed = caret_index(
+			registry,
+			root,
+			&view.common,
+			gutter_numbering,
+			&demand,
+			index_from.0,
+			index_from.1,
+		);
+		let folds = &mut view.folds;
 		tab.cursor.visit_carets_mut(|caret| {
-			pending |= !caret.resolve(registry, root, folds, topology_rev, state_id);
+			pending |= !caret.resolve_indexed(
+				registry,
+				root,
+				folds,
+				topology_rev,
+				state_id,
+				Some(indexed),
+			);
 		});
 		if pending {
 			ui.status_message = Some("Loading cursor extent".to_string());
@@ -1903,12 +1958,23 @@ pub(super) fn handle_edit_doctab_command(
 	let root = tab.document.root_id;
 	let topology_rev = tab.document.topology_rev;
 	let state_id_before = tab.document.ledger.current_state_id;
-	if !tab.cursor.primary_mut().resolve(
+	let view = &mut *tab.view;
+	let caret_index_before = caret_index(
 		registry,
 		root,
-		&mut tab.view.folds,
+		&view.common,
+		gutter_numbering,
+		&demand,
+		index_from.0,
+		index_from.1,
+	);
+	if !tab.cursor.primary_mut().resolve_indexed(
+		registry,
+		root,
+		&mut view.folds,
 		topology_rev,
 		state_id_before,
+		Some(caret_index_before),
 	) {
 		ui.status_message = Some("Loading cursor extent".to_string());
 		return CommandEffect::render();
@@ -1927,7 +1993,7 @@ pub(super) fn handle_edit_doctab_command(
 		handle_edit_command(
 			registry,
 			&mut root_id,
-			&mut tab.view.folds,
+			&mut view.folds,
 			tab.cursor.primary_mut(),
 			&mut tab.document.ledger,
 			&mut tab.document.semantic.highlights,
@@ -1937,22 +2003,49 @@ pub(super) fn handle_edit_doctab_command(
 			&mut clipboard_session.clipboard,
 			&mut ui.status_message,
 			&mut ui.mode_override,
+			Some(caret_index_before),
 			command,
 		)
 	};
 	{
 		let root = tab.document.root_id;
+		let index_to = (
+			tab.document.ledger.current_state_id,
+			tab.document.topology_rev,
+		);
+		if index_to != index_from {
+			let edit = single_line_edit(registry, root, &tab.document.ledger, index_from.0);
+			tab.view
+				.common
+				.wrap_index
+				.borrow_mut()
+				.carry_over(index_from, index_to, edit);
+		}
+		let view = &mut *tab.view;
+		let indexed = caret_index(
+			registry,
+			root,
+			&view.common,
+			gutter_numbering,
+			&demand,
+			index_to.0,
+			index_to.1,
+		);
 		let caret = tab.cursor.primary_mut();
 		if caret.pending_target().is_none() {
 			caret.set_byte(caret.byte(), moved_affinity);
 		}
-		caret.resolve(
+		caret.resolve_indexed(
 			registry,
 			root,
-			&mut tab.view.folds,
+			&mut view.folds,
 			topology_rev,
 			tab.document.ledger.current_state_id,
+			Some(indexed),
 		);
+		// What the lookups could not reach, render carries on.
+		let key = indexed.work_key(root);
+		view.common.carried.borrow_mut().carry(key, demand.take());
 	}
 	tab.cursor.set_active_visual(active_visual);
 	if tab.cursor.points().is_some() {
@@ -1964,6 +2057,26 @@ pub(super) fn handle_edit_doctab_command(
 		tab.cursor.snapshot(),
 	);
 	effect
+}
+
+/// The edit the last command made, as the wrap index can carry over: one delta
+/// that adds or removes no newline (ADR 0010). Anything else is `None`.
+fn single_line_edit(
+	registry: &UastRegistry,
+	root: NodeId,
+	ledger: &UndoLedger,
+	from: StateId,
+) -> Option<LineEdit> {
+	let delta = ledger.last_single_delta(from)?;
+	if delta.inserted_bytes.contains(&b'\n') || delta.deleted_bytes.contains(&b'\n') {
+		return None;
+	}
+	let line = line_from_doc_byte_raw(registry, root, delta.global_byte_offset).ok()?;
+	let start = line_start_byte_sparse(registry, root, line).ok()?;
+	Some(LineEdit {
+		line,
+		offset: delta.global_byte_offset.get().checked_sub(start.get())?,
+	})
 }
 
 fn apply_point_edit(
@@ -2400,6 +2513,154 @@ mod tests {
 				assert!(found, "parent {:?} is missing child {:?}", parent, node);
 			}
 			visit = registry.get_next_node_in_walk(node);
+		}
+	}
+
+	#[test]
+	fn edits_deep_in_a_cold_headed_line_place_the_caret_from_the_carried_index() {
+		use crate::engine::layout::LayoutDemand;
+		use crate::uast::kind::SemanticKind;
+		use crate::uast::metrics::SpanMetrics;
+		let _clipboard_guard = CLIPBOARD_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		// One line: a mebibyte head, then a tail longer than the index's
+		// checkpoint spacing, in two leaves.
+		let head = vec![b'a'; 1 << 20];
+		let tail = "x 日本\tb  c\té d foo_bar ".repeat(4_000).into_bytes();
+		let registry = UastRegistry::new(8);
+		let mut chunk = registry.reserve_chunk(3).expect("OOM");
+		let metrics = |bytes: usize| SpanMetrics {
+			byte_length: bytes as u64,
+			newlines: 0,
+		};
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			metrics(head.len() + tail.len()),
+		);
+		let head_node = chunk.spawn_node(SemanticKind::Token, None, metrics(head.len()));
+		let tail_node = chunk.spawn_node(SemanticKind::Token, None, metrics(tail.len()));
+		chunk.append_local_child(root, head_node);
+		chunk.append_local_child(root, tail_node);
+		unsafe {
+			*registry.virtual_data[head_node.index()].get() = Some(head.clone());
+			*registry.virtual_data[tail_node.index()].get() = Some(tail.clone());
+		}
+		drop(chunk);
+
+		let settings = test_settings();
+		let mut fixture = TestTextEditor::new(&registry, &settings, 80, 24);
+		let mut tab = fixture.editor_mut();
+		tab.document.root_id = root;
+		let gutter = tab.gutter_numbering();
+		let (state, topology) = (
+			tab.document.ledger.current_state_id,
+			tab.document.topology_rev,
+		);
+		// Scan the line and place the caret deep in the tail, as rendering would.
+		let demand = std::cell::RefCell::new(LayoutDemand::default());
+		let index = super::super::navigation::caret_index(
+			&registry,
+			root,
+			&tab.view.common,
+			gutter,
+			&demand,
+			state,
+			topology,
+		);
+		for _ in 0..100 {
+			tab.view.common.wrap_index.borrow_mut().begin_frame();
+			if index.scan_to_end(&registry, root, DocLine::ZERO)
+				== Some(crate::engine::layout::CaretLookup::Known(()))
+			{
+				break;
+			}
+		}
+		// A character boundary deep in the tail: the start of a word there.
+		let deep = head.len()
+			+ tail[..tail.len() - 777]
+				.windows(7)
+				.rposition(|window| window == b"foo_bar")
+				.expect("a word near the end");
+		let deep = DocByte::new(deep as u64);
+		let mut folds = FoldSet::default();
+		let caret = tab.cursor.primary_mut();
+		caret.set_byte(deep, crate::engine::session::Affinity::After);
+		tab.view.common.wrap_index.borrow_mut().begin_frame();
+		assert!(caret.resolve_indexed(&registry, root, &mut folds, topology, state, Some(index)));
+
+		// Nothing below can read the line from its start.
+		unsafe {
+			*registry.virtual_data[head_node.index()].get() = None;
+		}
+		let mut clipboard = ClipboardSession {
+			registers: HashMap::new(),
+			clipboard: ClipboardHandle::new(),
+		};
+		let mut ui = test_ui();
+		let mut line = [head.as_slice(), tail.as_slice()].concat();
+		let mut byte = deep.get() as usize;
+		for (command, edit) in [
+			(EditorCommand::InsertChar('z'), "insert"),
+			(EditorCommand::Delete, "delete"),
+			(EditorCommand::Backspace, "backspace"),
+		] {
+			match edit {
+				"insert" => {
+					line.insert(byte, b'z');
+					byte += 1;
+				}
+				"delete" => {
+					line.remove(byte);
+				}
+				_ => {
+					line.remove(byte - 1);
+					byte -= 1;
+				}
+			}
+			// The frame before spent its budget: the command reads within its own.
+			for _ in 0..64 {
+				tab.view
+					.common
+					.wrap_index
+					.borrow_mut()
+					.reserve_read(usize::MAX);
+			}
+			handle_edit_doctab_command(&registry, &mut tab, &mut clipboard, &mut ui, command);
+			let caret = tab.cursor.primary();
+			assert_eq!(caret.byte().get(), byte as u64, "{edit}");
+			assert!(
+				caret.line_cache().is_some(),
+				"{edit}: the column is known within the command"
+			);
+			let col = crate::core::text::display_col_for_byte_offset(
+				&line,
+				byte,
+				0,
+				crate::core::TAB_SIZE,
+			);
+			assert_eq!(caret.abs_col(), DocDisplayCol::new(col), "{edit}");
+			let width = super::super::navigation::caret_index(
+				&registry,
+				root,
+				&tab.view.common,
+				gutter,
+				&demand,
+				tab.document.ledger.current_state_id,
+				tab.document.topology_rev,
+			)
+			.work_key(root)
+			.key_width;
+			assert!(
+				tab.view
+					.common
+					.wrap_index
+					.borrow()
+					.fed_bytes(DocLine::ZERO, width)
+					.is_some(),
+				"{edit}: the index was carried over, not cleared"
+			);
 		}
 	}
 
@@ -2923,6 +3184,7 @@ mod tests {
 			&mut clipboard,
 			&mut status_message,
 			&mut mode_override,
+			None,
 			EditorCommand::ChangeAroundFunction,
 		);
 
@@ -3030,6 +3292,8 @@ mod tests {
 			ledger.current_state_id,
 			&mut cached_sum_tree,
 			&Default::default(),
+			&Default::default(),
+			true,
 			&mut status_message,
 			&mut mode_override,
 			EditorCommand::SelectAroundFunction,
@@ -3040,9 +3304,16 @@ mod tests {
 		assert_eq!(kind, VisualKind::Char);
 
 		let cursor_abs_byte = caret.byte();
-		let ranges =
-			resolve_visual_ranges_sparse(&registry, root, &folds, anchor, cursor_abs_byte, kind)
-				.expect("resolve ranges");
+		let ranges = resolve_visual_ranges_sparse(
+			&registry,
+			root,
+			&folds,
+			anchor,
+			cursor_abs_byte,
+			kind,
+			None,
+		)
+		.expect("resolve ranges");
 		assert_eq!(ranges.len(), 1);
 		let (start, end) = ranges[0];
 		let selected_text = String::from_utf8(
@@ -3068,6 +3339,7 @@ mod tests {
 			&mut clipboard,
 			&mut status_message,
 			&mut mode_override,
+			None,
 			EditorCommand::VisualDelete { anchor, kind },
 		);
 
@@ -3136,6 +3408,7 @@ mod tests {
 			&mut clipboard,
 			&mut status_message,
 			&mut mode_override,
+			None,
 			EditorCommand::DeleteInnerWord,
 		);
 
@@ -3164,6 +3437,7 @@ mod tests {
 			&mut clipboard,
 			&mut status_message,
 			&mut mode_override,
+			None,
 			EditorCommand::DeleteInnerWord,
 		);
 
@@ -3212,6 +3486,7 @@ mod tests {
 			&mut clipboard,
 			&mut status_message,
 			&mut mode_override,
+			None,
 			command,
 		);
 		caret.resolve(
@@ -3295,6 +3570,7 @@ mod tests {
 						&mut clipboard,
 						&mut status_message,
 						&mut mode_override,
+						None,
 						other,
 					);
 					caret.resolve(
@@ -3663,7 +3939,7 @@ mod tests {
 		assert_eq!(text, expected);
 		assert_eq!(cursor_byte, DocByte::new((byte - 1) as u64));
 		assert_eq!(cursor_line, DocLine::new(11));
-		assert_eq!(cursor_col, DocDisplayCol::new((line.len() - 1) as u32));
+		assert_eq!(cursor_col, DocDisplayCol::new((line.len() - 1) as u64));
 	}
 
 	/// Exercises OpenLineBelow against a structurally-grafted Rust
@@ -3717,6 +3993,7 @@ mod tests {
 			&mut clipboard,
 			&mut status_message,
 			&mut mode_override,
+			None,
 			EditorCommand::OpenLineBelow,
 		);
 		assert!(caret.resolve(

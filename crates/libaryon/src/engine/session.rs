@@ -8,7 +8,7 @@ use super::folding::{
 use super::index::SumTree;
 use super::input::InputRuntime;
 use super::jobs::{JobRuntime, JobSpawnError, JobSpec};
-use super::layout::GutterNumbering;
+use super::layout::{CaretIndex, CaretLookup, GutterNumbering};
 use super::minimap::MinimapSnapshot;
 use super::protocol::{
 	CommandRange, EditorMode, HostPanelGroupLayout, HostPanelGroupMember, HostPanelGroupShape,
@@ -1354,7 +1354,38 @@ impl Caret {
 		topology_rev: TopologyRev,
 		state_id: StateId,
 	) -> bool {
-		if let Some(mut pending) = self.pending_target {
+		self.resolve_indexed(registry, root, folds, topology_rev, state_id, None)
+	}
+
+	/// [`Self::resolve`], taking lines on the wrap index's path through it
+	/// (ADR 0010): a pending target or a stale line cache on such a line is
+	/// settled from the index, never from the line's start.
+	pub(crate) fn resolve_indexed(
+		&mut self,
+		registry: &UastRegistry,
+		root: NodeId,
+		folds: &mut FoldSet,
+		topology_rev: TopologyRev,
+		state_id: StateId,
+		indexed: Option<CaretIndex<'_>>,
+	) -> bool {
+		if let Some(pending) = self.pending_target
+			&& let Some(placed) = self.place_indexed(
+				registry,
+				root,
+				folds,
+				topology_rev,
+				state_id,
+				pending.line,
+				pending.col,
+				pending.affinity,
+				pending.reveal_hidden,
+				indexed,
+			) {
+			if !placed {
+				return false;
+			}
+		} else if let Some(mut pending) = self.pending_target {
 			let lookup = if pending.reveal_hidden {
 				let raw = registry.find_node_at_line_col_raw(root, pending.line, pending.col);
 				if let Some(target) = raw.ready() {
@@ -1429,13 +1460,63 @@ impl Caret {
 			});
 			self.cache.node_rev = topology_rev;
 		}
-		if self.cache.line.is_none()
-			&& let Ok((line, col)) = line_col_from_doc_byte_sparse(registry, root, self.anchor.byte)
-		{
-			self.cache.line = Some(CaretLineCache { line, col });
-			self.cache.line_rev = state_id;
+		if self.cache.line.is_none() {
+			let found = match indexed
+				.and_then(|indexed| indexed.line_col_for_byte(registry, root, self.anchor.byte))
+			{
+				Some(CaretLookup::Known(found)) => Some(found),
+				Some(CaretLookup::Pending) => None,
+				None => line_col_from_doc_byte_sparse(registry, root, self.anchor.byte).ok(),
+			};
+			if let Some((line, col)) = found {
+				self.cache.line = Some(CaretLineCache { line, col });
+				self.cache.line_rev = state_id;
+			}
 		}
 		self.cache.node.is_some() && self.cache.line.is_some()
+	}
+
+	/// Place at `line` and `col` through the index when the line is on its
+	/// path and visible. `None`: not such a line, so the caller takes today's
+	/// path. `Some(false)`: indexed but pending, with the target kept.
+	#[allow(clippy::too_many_arguments)]
+	fn place_indexed(
+		&mut self,
+		registry: &UastRegistry,
+		root: NodeId,
+		folds: &mut FoldSet,
+		topology_rev: TopologyRev,
+		state_id: StateId,
+		line: DocLine,
+		col: DocDisplayCol,
+		affinity: Affinity,
+		reveal_hidden: bool,
+		indexed: Option<CaretIndex<'_>>,
+	) -> Option<bool> {
+		// A hidden line keeps today's fold handling.
+		let indexed = indexed
+			.filter(|_| snap_line_to_visible_boundary(registry, root, folds, line) == line)?;
+		match indexed.byte_for_line_col(registry, root, line, col)? {
+			CaretLookup::Known((byte, col)) => {
+				let target = registry.find_node_at_doc_byte_raw(root, byte);
+				self.install_resolved(
+					TextAnchor::new(byte, affinity),
+					self.preferred_col,
+					CaretNodeCache {
+						node: target.node_id,
+						offset: target.node_byte.get(),
+					},
+					CaretLineCache { line, col },
+					topology_rev,
+					state_id,
+				);
+				Some(true)
+			}
+			CaretLookup::Pending => {
+				self.set_pending_target(line, col, affinity, reveal_hidden, None);
+				Some(false)
+			}
+		}
 	}
 
 	/// Place the caret at a position whose line and column are already known,
@@ -1479,6 +1560,50 @@ impl Caret {
 		reveal_hidden: bool,
 		affinity: Affinity,
 	) -> bool {
+		self.place_at_line_col_indexed(
+			registry,
+			root,
+			folds,
+			topology_rev,
+			state_id,
+			target_line,
+			target_col,
+			reveal_hidden,
+			affinity,
+			None,
+		)
+	}
+
+	/// [`Self::place_at_line_col`], taking a line on the wrap index's path
+	/// through it (ADR 0010).
+	#[allow(clippy::too_many_arguments)]
+	pub(crate) fn place_at_line_col_indexed(
+		&mut self,
+		registry: &UastRegistry,
+		root: NodeId,
+		folds: &mut FoldSet,
+		topology_rev: TopologyRev,
+		state_id: StateId,
+		target_line: DocLine,
+		target_col: DocDisplayCol,
+		reveal_hidden: bool,
+		affinity: Affinity,
+		indexed: Option<CaretIndex<'_>>,
+	) -> bool {
+		if let Some(placed) = self.place_indexed(
+			registry,
+			root,
+			folds,
+			topology_rev,
+			state_id,
+			target_line,
+			target_col,
+			affinity,
+			reveal_hidden,
+			indexed,
+		) {
+			return placed;
+		}
 		let lookup = if reveal_hidden {
 			let raw = registry.find_node_at_line_col_raw(root, target_line, target_col);
 			let Some(raw_target) = raw.ready() else {
@@ -2009,6 +2134,8 @@ pub(crate) struct CommonViewState {
 	/// Soft-wrap rows of this view's long lines (ADR 0009). A `RefCell`
 	/// because layout reads the view through shared references.
 	pub(crate) wrap_index: std::cell::RefCell<super::wrap_index::WrapIndex>,
+	/// Work a command could not finish, which render carries on (ADR 0010).
+	pub(crate) carried: std::cell::RefCell<super::layout::CarriedWork>,
 }
 
 impl CommonViewState {
@@ -2190,6 +2317,7 @@ fn new_common_view_state(
 		last_minimap_total_lines: u64::MAX,
 		last_minimap_path: None,
 		wrap_index: std::cell::RefCell::default(),
+		carried: std::cell::RefCell::default(),
 	}
 }
 
@@ -4136,11 +4264,11 @@ pub(crate) enum IntraLineDiffKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IntraLineDiff {
 	pub(crate) line: DocLine,
-	pub(crate) col_start: u32,
-	pub(crate) col_end: u32,
+	pub(crate) col_start: u64,
+	pub(crate) col_end: u64,
 	pub(crate) partner_line: DocLine,
-	pub(crate) partner_col_start: u32,
-	pub(crate) partner_col_end: u32,
+	pub(crate) partner_col_start: u64,
+	pub(crate) partner_col_end: u64,
 	pub(crate) kind: IntraLineDiffKind,
 }
 

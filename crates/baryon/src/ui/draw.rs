@@ -360,7 +360,7 @@ fn status_right_text(
 	file_size: u64,
 	line_count: Option<u64>,
 	cursor_line: u64,
-	cursor_col: u32,
+	cursor_col: u64,
 	cursor_count: usize,
 	language_label: &str,
 ) -> String {
@@ -923,7 +923,7 @@ fn draw_pane(
 						// [start_col, start_col + visible_width). Clip the
 						// intra-line range to this row's window.
 						let row_start_col = row.start_col.get();
-						let visible_width = geometry.text_width as u32;
+						let visible_width = u64::from(geometry.text_width);
 						let row_end_col = row_start_col.saturating_add(visible_width);
 
 						let clip_start = intra.col_start.max(row_start_col);
@@ -941,10 +941,15 @@ fn draw_pane(
 							continue;
 						}
 
-						let gx_start = (text_left as u32)
-							.saturating_add(clip_start.saturating_sub(row_start_col));
-						let gx_end = (text_left as u32)
-							.saturating_add(clip_end.saturating_sub(row_start_col));
+						// Both offsets are within one row, so they fit the screen.
+						let gx_start = (text_left as u32).saturating_add(
+							u32::try_from(clip_start.saturating_sub(row_start_col))
+								.unwrap_or(u32::MAX),
+						);
+						let gx_end = (text_left as u32).saturating_add(
+							u32::try_from(clip_end.saturating_sub(row_start_col))
+								.unwrap_or(u32::MAX),
+						);
 						let pane_right = pane_area.x as u32 + pane_area.width as u32;
 						let gx_end = gx_end.min(text_right as u32).min(pane_right);
 						let gx_start = gx_start.min(gx_end);
@@ -2405,19 +2410,19 @@ mod tests {
 				line: DocLine::ZERO,
 				start_col: DocDisplayCol::new(102),
 				start_byte: Some(DocByte::new(102)),
-				start_offset: Some(libaryon::core::DisplayOffset::new(102)),
+				start_offset: Some(libaryon::core::DocDisplayCol::new(102)),
 			},
 			VisibleRow {
 				line: DocLine::ZERO,
 				start_col: DocDisplayCol::new(106),
 				start_byte: Some(DocByte::new(106)),
-				start_offset: Some(libaryon::core::DisplayOffset::new(106)),
+				start_offset: Some(libaryon::core::DocDisplayCol::new(106)),
 			},
 		];
 		let window = libaryon::engine::RowWindow {
 			line: DocLine::ZERO,
 			start_byte: DocByte::new(100),
-			start_offset: libaryon::core::DisplayOffset::new(100),
+			start_offset: libaryon::core::DocDisplayCol::new(100),
 			tab_phase: 0,
 		};
 
