@@ -32,8 +32,8 @@ use iced::{Background, Color, Element, Event, Length, Subscription, Task, Theme,
 use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, PaneRect, Rgb, ViewId};
 #[cfg(feature = "toron")]
 use libaryon::core::{SavedSession, Writable};
-#[cfg(feature = "toron")]
 use libaryon::engine::viewport_channel::{self, ViewportReceiver};
+#[cfg(feature = "toron")]
 use libaryon::engine::{ApplicationCheckpointWitness, ApplicationOwnerId, SessionCheckpointError};
 use libaryon::engine::{
 	EditorCommand, EditorMode, EngineConfig, EngineHandle, InputEvent, KeyCode, LanguageId,
