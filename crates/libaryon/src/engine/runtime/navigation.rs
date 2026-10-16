@@ -260,6 +260,7 @@ pub(super) fn handle_navigation_doctab_command(
 			topology_rev,
 			tab.document.ledger.current_state_id,
 			&mut tab.document.semantic.cached_sum_tree,
+			&common.wrap_index,
 			&mut ui.status_message,
 			&mut ui.mode_override,
 			command,
@@ -344,6 +345,7 @@ pub(super) fn handle_file_browser_navigation_command(
 		topology_rev,
 		state_id,
 		&mut tab.document.cached_sum_tree,
+		&tab.view.common.wrap_index,
 		&mut ui.status_message,
 		&mut ui.mode_override,
 		command,
@@ -437,6 +439,7 @@ fn move_all_cursors(
 				topology_rev,
 				current_state_id,
 				&mut cached_sum_tree,
+				&tab.view.common.wrap_index,
 				&mut status_message,
 				&mut mode_override,
 				command.clone(),
@@ -652,10 +655,23 @@ pub(super) fn handle_navigation_command(
 	topology_rev: TopologyRev,
 	current_state_id: StateId,
 	cached_sum_tree: &mut Option<CachedSumTree>,
+	wrap_index: &std::cell::RefCell<super::super::wrap_index::WrapIndex>,
 	status_message: &mut Option<String>,
 	mode_override: &mut Option<EditorMode>,
 	command: EditorCommand,
 ) -> CommandEffect {
+	// A command is its own frame for the wrap index: it may read one budget,
+	// so clamping the cursor into a scrolled view can place it (ADR 0009).
+	wrap_index.borrow_mut().begin_frame();
+	let wrap_demand = std::cell::RefCell::new(super::super::layout::LayoutDemand::default());
+	let wrap = || {
+		Some(super::super::layout::WrapLayout::new(
+			wrap_index,
+			current_state_id,
+			topology_rev,
+			&wrap_demand,
+		))
+	};
 	let mut target_line = caret.abs_line();
 	let mut target_col = if matches!(
 		&command,
@@ -1071,6 +1087,7 @@ pub(super) fn handle_navigation_command(
 						true,
 						geometry.text_width,
 						sum_tree,
+						wrap(),
 					);
 					*scroll_y = anchor.line.get();
 					*scroll_row_offset = anchor.row_offset;
@@ -1134,6 +1151,7 @@ pub(super) fn handle_navigation_command(
 						true,
 						geometry.text_width,
 						sum_tree,
+						wrap(),
 					);
 					let sum_tree =
 						refresh_sum_tree(cached_sum_tree, registry, rid, current_state_id);
@@ -1147,36 +1165,60 @@ pub(super) fn handle_navigation_command(
 						true,
 						geometry.text_width,
 						sum_tree,
+						wrap(),
 					);
+					let previous_view = (*scroll_y, *scroll_row_offset);
 					*scroll_y = anchor.line.get();
 					*scroll_row_offset = anchor.row_offset;
 					let sum_tree =
 						refresh_sum_tree(cached_sum_tree, registry, rid, current_state_id);
-					let (clamped_cursor_line, clamped_cursor_col) =
-						clamp_cursor_to_viewport_anchor_with_sum_tree(
-							registry,
-							rid,
-							folds,
-							anchor,
-							target_line,
-							target_col,
-							max_doc_line,
-							*viewport_lines,
-							true,
-							geometry.text_width,
-							sum_tree,
-						);
-					if clamped_cursor_line != target_line || clamped_cursor_col != target_col {
-						place_cursor_at_line_col(
-							registry,
-							rid,
-							folds,
-							clamped_cursor_line,
-							clamped_cursor_col,
-							false,
-							(topology_rev, current_state_id),
-							caret,
-						);
+					let clamped = clamp_cursor_to_viewport_anchor_with_sum_tree(
+						registry,
+						rid,
+						folds,
+						anchor,
+						target_line,
+						target_col,
+						max_doc_line,
+						*viewport_lines,
+						true,
+						geometry.text_width,
+						sum_tree,
+						wrap(),
+					);
+					match clamped {
+						Some(target) if target.line != target_line || target.col != target_col => {
+							match target.byte {
+								// A row of an indexed line: place the caret from the
+								// index, without reading the line from its start.
+								Some(byte) => caret.place_at_known(
+									registry,
+									rid,
+									topology_rev,
+									current_state_id,
+									byte,
+									target.line,
+									target.col,
+								),
+								None => {
+									place_cursor_at_line_col(
+										registry,
+										rid,
+										folds,
+										target.line,
+										target.col,
+										false,
+										(topology_rev, current_state_id),
+										caret,
+									);
+								}
+							}
+						}
+						Some(_) => {}
+						// The cursor's new place is out of reach this command: keep
+						// the view where it was rather than move the cursor somewhere
+						// guessed (ADR 0009). The next command continues.
+						None => (*scroll_y, *scroll_row_offset) = previous_view,
 					}
 				} else {
 					let target_visual =
@@ -1245,36 +1287,60 @@ pub(super) fn handle_navigation_command(
 						true,
 						geometry.text_width,
 						sum_tree,
+						wrap(),
 					);
+					let previous_view = (*scroll_y, *scroll_row_offset);
 					*scroll_y = anchor.line.get();
 					*scroll_row_offset = anchor.row_offset;
 					let sum_tree =
 						refresh_sum_tree(cached_sum_tree, registry, rid, current_state_id);
-					let (clamped_cursor_line, clamped_cursor_col) =
-						clamp_cursor_to_viewport_anchor_with_sum_tree(
-							registry,
-							rid,
-							folds,
-							anchor,
-							target_line,
-							target_col,
-							max_doc_line,
-							*viewport_lines,
-							true,
-							geometry.text_width,
-							sum_tree,
-						);
-					if clamped_cursor_line != target_line || clamped_cursor_col != target_col {
-						place_cursor_at_line_col(
-							registry,
-							rid,
-							folds,
-							clamped_cursor_line,
-							clamped_cursor_col,
-							false,
-							(topology_rev, current_state_id),
-							caret,
-						);
+					let clamped = clamp_cursor_to_viewport_anchor_with_sum_tree(
+						registry,
+						rid,
+						folds,
+						anchor,
+						target_line,
+						target_col,
+						max_doc_line,
+						*viewport_lines,
+						true,
+						geometry.text_width,
+						sum_tree,
+						wrap(),
+					);
+					match clamped {
+						Some(target) if target.line != target_line || target.col != target_col => {
+							match target.byte {
+								// A row of an indexed line: place the caret from the
+								// index, without reading the line from its start.
+								Some(byte) => caret.place_at_known(
+									registry,
+									rid,
+									topology_rev,
+									current_state_id,
+									byte,
+									target.line,
+									target.col,
+								),
+								None => {
+									place_cursor_at_line_col(
+										registry,
+										rid,
+										folds,
+										target.line,
+										target.col,
+										false,
+										(topology_rev, current_state_id),
+										caret,
+									);
+								}
+							}
+						}
+						Some(_) => {}
+						// The cursor's new place is out of reach this command: keep
+						// the view where it was rather than move the cursor somewhere
+						// guessed (ADR 0009). The next command continues.
+						None => (*scroll_y, *scroll_row_offset) = previous_view,
 					}
 				} else {
 					*scroll_y = scroll_viewport(
@@ -1551,6 +1617,132 @@ mod tests {
 	}
 
 	#[test]
+	fn scrolling_into_trailing_whitespace_places_the_caret_without_the_line_start() {
+		use super::handle_navigation_command;
+		use crate::core::{DocByte, DocLine, StateId};
+		use crate::ecs::UastRegistry;
+		use crate::engine::protocol::{EditorCommand, EditorMode, VisualKind};
+		use crate::engine::session::CachedSumTree;
+		use crate::engine::wrap_index::WrapIndex;
+		use crate::uast::kind::SemanticKind;
+		use crate::uast::metrics::SpanMetrics;
+		use std::cell::RefCell;
+
+		// One line: a word long enough for the wrap index, then a trailing run
+		// of spaces and tabs, in two leaves.
+		let word = vec![b'a'; 1 << 20];
+		let run = b"  \t \t\t   ".repeat(300);
+		let registry = UastRegistry::new(8);
+		let mut chunk = registry.reserve_chunk(3).expect("OOM");
+		let metrics = |bytes: usize| SpanMetrics {
+			byte_length: bytes as u64,
+			newlines: 0,
+		};
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			metrics(word.len() + run.len()),
+		);
+		let head = chunk.spawn_node(SemanticKind::Token, None, metrics(word.len()));
+		let tail = chunk.spawn_node(SemanticKind::Token, None, metrics(run.len()));
+		chunk.append_local_child(root, head);
+		chunk.append_local_child(root, tail);
+		unsafe {
+			*registry.virtual_data[head.index()].get() = Some(word.clone());
+			*registry.virtual_data[tail.index()].get() = Some(run.clone());
+		}
+		drop(chunk);
+
+		let wrap_index = RefCell::new(WrapIndex::default());
+		let mut folds = FoldSet::default();
+		let mut active_visual: Option<(DocByte, VisualKind)> = None;
+		let mut scroll_y = 0u64;
+		let mut scroll_row_offset = DisplayRow::ZERO;
+		let mut viewport_width = 80u16;
+		let mut viewport_lines = 24u32;
+		let mut cached_sum_tree: Option<CachedSumTree> = None;
+		let mut status_message: Option<String> = None;
+		let mut mode_override: Option<EditorMode> = None;
+		let mut scroll =
+			|caret: &mut Caret, scroll_y: &mut u64, scroll_row_offset: &mut DisplayRow| {
+				handle_navigation_command(
+					&registry,
+					Some(root),
+					&mut folds,
+					caret,
+					&mut active_visual,
+					scroll_y,
+					scroll_row_offset,
+					&mut viewport_width,
+					&mut viewport_lines,
+					true,
+					false,
+					None,
+					TopologyRev::ZERO,
+					StateId::ZERO,
+					&mut cached_sum_tree,
+					&wrap_index,
+					&mut status_message,
+					&mut mode_override,
+					EditorCommand::ScrollViewport(1_000_000),
+				);
+			};
+
+		// Scan the whole line: scroll until the view stops moving.
+		let mut caret = resolved_caret(&registry, root, DocByte::ZERO);
+		let mut last = None;
+		for _ in 0..100 {
+			scroll(&mut caret, &mut scroll_y, &mut scroll_row_offset);
+			if last == Some((scroll_y, scroll_row_offset)) {
+				break;
+			}
+			last = Some((scroll_y, scroll_row_offset));
+		}
+
+		// From the top again, with the word's leaf no longer resident: nothing
+		// can read the line from its start.
+		let mut caret = resolved_caret(&registry, root, DocByte::ZERO);
+		scroll_y = 0;
+		scroll_row_offset = DisplayRow::ZERO;
+		unsafe {
+			*registry.virtual_data[head.index()].get() = None;
+		}
+		for _ in 0..100 {
+			scroll(&mut caret, &mut scroll_y, &mut scroll_row_offset);
+			if caret.byte().get() >= word.len() as u64 {
+				break;
+			}
+		}
+
+		let byte = caret.byte().get() as usize;
+		let col = caret.abs_col().get();
+		assert!(
+			byte >= word.len(),
+			"the caret is in the trailing run: {byte}"
+		);
+		assert_eq!(caret.abs_line(), DocLine::ZERO);
+		assert!(
+			caret.pending_target().is_none(),
+			"the caret was placed, not left pending"
+		);
+		// The byte names the cell holding the caret's column in the full line.
+		let line = [word.as_slice(), run.as_slice()].concat();
+		let at =
+			crate::core::text::display_col_for_byte_offset(&line, byte, 0, crate::core::TAB_SIZE);
+		let (_, after) = crate::core::text::byte_offset_for_display_col(
+			&line[byte..],
+			1,
+			at,
+			crate::core::TAB_SIZE,
+		);
+		assert!(
+			at <= col && (at == col || col < after),
+			"byte {byte} spans {at}..{after}, caret at {col}"
+		);
+		assert!(matches!(line[byte], b' ' | b'\t'));
+	}
+
+	#[test]
 	fn append_at_line_end_moves_cursor_to_eol_and_sets_insert_mode() {
 		use super::handle_navigation_command;
 		use crate::core::{DocByte, DocDisplayCol, DocLine, StateId};
@@ -1587,6 +1779,7 @@ mod tests {
 			TopologyRev::ZERO,
 			StateId::ZERO,
 			&mut cached_sum_tree,
+			&Default::default(),
 			&mut status_message,
 			&mut mode_override,
 			EditorCommand::AppendAtLineEnd,
@@ -1659,6 +1852,7 @@ mod tests {
 			TopologyRev::ZERO,
 			StateId::ZERO,
 			&mut cached_sum_tree,
+			&Default::default(),
 			&mut status_message,
 			&mut mode_override,
 			EditorCommand::SelectInnerWord,
@@ -1772,6 +1966,7 @@ mod tests {
 			TopologyRev::ZERO,
 			StateId::ZERO,
 			&mut cached_sum_tree,
+			&Default::default(),
 			&mut status_message,
 			&mut mode_override,
 			EditorCommand::AppendAtLineEnd,

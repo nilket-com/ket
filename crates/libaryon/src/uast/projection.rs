@@ -428,6 +428,11 @@ pub struct PaneViewport {
 	pub theme_colors: [Option<Rgb>; CATEGORY_COUNT],
 	pub render_rows: Vec<VisibleRow>,
 	pub visible_rows: Vec<VisibleRow>,
+	/// Set when the view starts inside a line laid out through the wrap index:
+	/// `tokens` then begin at its byte, `render_rows == visible_rows` and
+	/// `viewport_row_offset` is 0. Unset, every other field means what it
+	/// always has.
+	pub row_window: Option<crate::engine::RowWindow>,
 	pub visible_line_starts: Vec<DocLine>,
 	pub dma_pending: bool,
 	/// Stable language provider identifier used by frontends for behavior such
@@ -1505,6 +1510,7 @@ impl UastProjection for UastRegistry {
 			start_line,
 			start_byte,
 			LineDiscovery::Unbounded,
+			None,
 		)
 		.0
 	}
@@ -1658,6 +1664,7 @@ impl UastRegistry {
 			line_accumulator,
 			byte_accumulator,
 			LineDiscovery::Unbounded,
+			None,
 		)
 		.0
 	}
@@ -1680,7 +1687,43 @@ impl UastRegistry {
 			let (start_node, start_line, start_byte) =
 				seek_root_child_for_line(self, root, line, None);
 			let (mut part, resume) = self.query_viewport_internal(
-				root, folds, line, count, start_node, start_line, start_byte, discovery,
+				root, folds, line, count, start_node, start_line, start_byte, discovery, None,
+			);
+			tokens.append(&mut part);
+			next = resume;
+		}
+		tokens
+	}
+
+	/// [`Self::query_viewport_with_line_discovery`] for a view that starts
+	/// inside `line`, at `start_byte` (ADR 0009's row window): the first token
+	/// begins there, and `line`'s discovery cap counts from it.
+	pub(crate) fn query_viewport_from_byte<F: FoldPolicy + ?Sized>(
+		&self,
+		root: NodeId,
+		folds: &F,
+		start_byte: DocByte,
+		line: DocLine,
+		line_count: u32,
+		discovery: LineDiscovery,
+	) -> Vec<RenderToken> {
+		let target = self.find_node_at_doc_byte_raw(root, start_byte);
+		let (mut tokens, mut next) = self.query_viewport_internal(
+			root,
+			folds,
+			line,
+			line_count,
+			Some(target.node_id),
+			line,
+			target.node_start_byte,
+			discovery,
+			Some(start_byte),
+		);
+		while let Some((line, count)) = next {
+			let (start_node, start_line, start_byte) =
+				seek_root_child_for_line(self, root, line, None);
+			let (mut part, resume) = self.query_viewport_internal(
+				root, folds, line, count, start_node, start_line, start_byte, discovery, None,
 			);
 			tokens.append(&mut part);
 			next = resume;
@@ -1701,6 +1744,7 @@ impl UastRegistry {
 		start_line: DocLine,
 		start_byte: DocByte,
 		discovery: LineDiscovery,
+		window_start: Option<DocByte>,
 	) -> (Vec<RenderToken>, Option<(DocLine, u32)>) {
 		let mut tokens = Vec::new();
 		let (mut curr, mut line_accumulator, mut byte_accumulator) =
@@ -1839,6 +1883,21 @@ impl UastRegistry {
 				}
 				line_accumulator = target_line;
 				token_start_line = target_line;
+			}
+
+			// A row window starts mid-line: its first token begins at the window,
+			// and the line's discovery cap counts from there.
+			if tokens.is_empty()
+				&& !is_folded
+				&& let Some(window) = window_start
+				&& window > token_start_byte
+			{
+				let skip = (window.get() - token_start_byte.get()) as usize;
+				if !display_text.is_empty() {
+					display_text = display_text.get(skip..).unwrap_or(&[]).to_vec();
+				}
+				token_start_byte = window;
+				open_line_start = Some(window);
 			}
 
 			if let (Some(cap), Some(line_start)) = (line_cap, open_line_start)
@@ -2726,6 +2785,73 @@ mod tests {
 				)
 			})
 			.collect()
+	}
+
+	fn joined(tokens: &[super::RenderToken]) -> Vec<u8> {
+		tokens
+			.iter()
+			.flat_map(|token| token.text.iter().copied())
+			.collect()
+	}
+
+	#[test]
+	fn a_byte_window_starts_mid_line_at_its_byte() {
+		// One line across leaves, with a three-byte scalar split over two of them.
+		let skull = "☠".as_bytes();
+		let mut first = b"abcd".to_vec();
+		first.push(skull[0]);
+		let mut second = skull[1..].to_vec();
+		second.extend_from_slice(b"efgh");
+		let (registry, root) =
+			build_document_with_byte_leaves(&[&first, &second, b"ijkl\n", b"next"]);
+		let line: Vec<u8> = [&first[..], &second[..], b"ijkl"].concat();
+		// Mid-leaf, at a leaf boundary, on the split scalar, and past it.
+		for start in [2u64, 5, 4, 7, 9] {
+			let tokens = registry.query_viewport_from_byte(
+				root,
+				&crate::uast::NoFolds,
+				DocByte::new(start),
+				DocLine::ZERO,
+				1,
+				super::LineDiscovery::Unbounded,
+			);
+			assert_eq!(tokens[0].absolute_start_byte, DocByte::new(start));
+			assert_eq!(tokens[0].absolute_start_line, DocLine::ZERO);
+			let text = joined(&tokens);
+			assert!(
+				text.starts_with(&line[start as usize..]),
+				"window from {start}: {:?}",
+				String::from_utf8_lossy(&text)
+			);
+		}
+	}
+
+	#[test]
+	fn a_byte_window_counts_its_discovery_cap_from_the_window() {
+		let (registry, root) = build_document_with_byte_leaves(&[
+			b"aaaa", b"bbbb", b"cccc", b"dddd", b"eeee", b"ffff",
+		]);
+		for start in [0u64, 9, 16] {
+			let tokens = registry.query_viewport_from_byte(
+				root,
+				&crate::uast::NoFolds,
+				DocByte::new(start),
+				DocLine::ZERO,
+				1,
+				super::LineDiscovery::PerLineBytes(4),
+			);
+			let starts: Vec<u64> = tokens
+				.iter()
+				.map(|token| token.absolute_start_byte.get())
+				.collect();
+			// Nothing four or more bytes past the window is discovered: a window
+			// deep in a line discovers no more than one at its start does.
+			assert_eq!(starts.first(), Some(&start), "window {start}");
+			assert!(
+				starts.iter().all(|&byte| byte < start + 4),
+				"window {start} discovered {starts:?}"
+			);
+		}
 	}
 
 	#[test]

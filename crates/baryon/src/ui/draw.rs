@@ -172,14 +172,24 @@ fn gutter_number_for_line(pane: &PaneViewport, line_index: u64) -> Option<u64> {
 		.map(|index| pane.gutter_line_numbers[index].number)
 }
 
+fn row_window_starts_in_trailing_whitespace(pane: &PaneViewport, line: u64) -> bool {
+	pane.row_window
+		.is_some_and(|window| window.line.get() == line)
+		&& pane
+			.visible_rows
+			.first()
+			.is_some_and(|row| row.line.get() == line && row.start_byte.is_none())
+}
+
 fn paint_text_segment(
 	buf: &mut Buffer,
 	x: &mut usize,
 	visual_y: &mut usize,
 	current_doc_line: u64,
-	current_display_col: &mut u32,
+	current_display_col: &mut u64,
 	next_render_row: &mut usize,
 	render_rows: &[libaryon::engine::VisibleRow],
+	row_window: Option<libaryon::engine::RowWindow>,
 	text_left: usize,
 	text_right: usize,
 	render_height: usize,
@@ -198,22 +208,39 @@ fn paint_text_segment(
 		let cell_width = cell.width.max(1) as usize;
 		if wrap_enabled {
 			while let Some(row) = render_rows.get(*next_render_row) {
+				let row_start = row
+					.start_offset
+					.map_or(u64::from(row.start_col.get()), |offset| offset.get());
 				if row.line.get() < current_doc_line
-					|| (row.line.get() == current_doc_line
-						&& row.start_col.get() < *current_display_col)
+					|| (row.line.get() == current_doc_line && row_start < *current_display_col)
 				{
 					*next_render_row += 1;
 					continue;
 				}
-				if row.line.get() == current_doc_line && row.start_col.get() == *current_display_col
-				{
-					if row.start_col != libaryon::core::DocDisplayCol::ZERO {
+				if row.line.get() == current_doc_line && row_start == *current_display_col {
+					let first_window_row = *next_render_row == 0
+						&& row_window.is_some_and(|window| window.line.get() == current_doc_line);
+					if row_start != 0 && !first_window_row {
 						*visual_y += 1;
 						*x = text_left;
 					}
 					*next_render_row += 1;
 				}
 				break;
+			}
+			// The engine may start a trailing-whitespace window at the run,
+			// before the first visible row. Consume that prefix to its absolute
+			// row start without drawing it above the viewport.
+			if *next_render_row == 0
+				&& row_window.is_some_and(|window| window.line.get() == current_doc_line)
+				&& render_rows.first().is_some_and(|row| {
+					row.line.get() == current_doc_line
+						&& row
+							.start_offset
+							.is_some_and(|start| start.get() > *current_display_col)
+				}) {
+				*current_display_col = current_display_col.saturating_add(cell_width as u64);
+				continue;
 			}
 		}
 		if *visual_y >= skip_rows.saturating_add(render_height) {
@@ -224,7 +251,7 @@ fn paint_text_segment(
 				return false;
 			}
 			*x = x.saturating_add(cell_width);
-			*current_display_col = current_display_col.saturating_add(cell_width as u32);
+			*current_display_col = current_display_col.saturating_add(cell_width as u64);
 			continue;
 		}
 		if *visual_y >= skip_rows {
@@ -248,7 +275,7 @@ fn paint_text_segment(
 			}
 		}
 		*x = x.saturating_add(cell_width);
-		*current_display_col = current_display_col.saturating_add(cell_width as u32);
+		*current_display_col = current_display_col.saturating_add(cell_width as u64);
 	}
 
 	*visual_y < skip_rows.saturating_add(render_height)
@@ -936,9 +963,12 @@ fn draw_pane(
 	let mut x = text_left;
 	let mut visual_y: usize = 0;
 	let mut current_doc_line = pane.viewport_start_line.get();
-	let mut current_display_col = 0u32;
+	let mut current_display_col = pane
+		.row_window
+		.filter(|window| window.line.get() == current_doc_line)
+		.map_or(0, |window| window.start_offset.get());
 	let mut next_render_row = 0usize;
-	let mut line_has_content = false;
+	let mut line_has_content = row_window_starts_in_trailing_whitespace(pane, current_doc_line);
 	if pane.gutter_numbering.is_some()
 		&& render_height > 0
 		&& skip_rows == 0
@@ -974,7 +1004,11 @@ fn draw_pane(
 		}
 		if x == text_left && token.absolute_start_line.get() != current_doc_line {
 			current_doc_line = token.absolute_start_line.get();
-			current_display_col = 0;
+			line_has_content = row_window_starts_in_trailing_whitespace(pane, current_doc_line);
+			current_display_col = pane
+				.row_window
+				.filter(|window| window.line.get() == current_doc_line)
+				.map_or(0, |window| window.start_offset.get());
 			if pane.gutter_numbering.is_some()
 				&& visual_y >= skip_rows
 				&& visual_y.saturating_sub(skip_rows) < render_height
@@ -1038,6 +1072,7 @@ fn draw_pane(
 				&mut current_display_col,
 				&mut next_render_row,
 				&pane.render_rows,
+				pane.row_window,
 				text_left,
 				text_right,
 				render_height,
@@ -1144,6 +1179,7 @@ fn draw_pane(
 							&mut current_display_col,
 							&mut next_render_row,
 							&pane.render_rows,
+							pane.row_window,
 							text_left,
 							text_right,
 							render_height,
@@ -1202,6 +1238,7 @@ fn draw_pane(
 							&mut current_display_col,
 							&mut next_render_row,
 							&pane.render_rows,
+							pane.row_window,
 							text_left,
 							text_right,
 							render_height,
@@ -1222,6 +1259,7 @@ fn draw_pane(
 								&mut current_display_col,
 								&mut next_render_row,
 								&pane.render_rows,
+								pane.row_window,
 								text_left,
 								text_right,
 								render_height,
@@ -1245,6 +1283,7 @@ fn draw_pane(
 								&mut current_display_col,
 								&mut next_render_row,
 								&pane.render_rows,
+								pane.row_window,
 								text_left,
 								text_right,
 								render_height,
@@ -1277,6 +1316,7 @@ fn draw_pane(
 							&mut current_display_col,
 							&mut next_render_row,
 							&pane.render_rows,
+							pane.row_window,
 							text_left,
 							text_right,
 							render_height,
@@ -1315,6 +1355,7 @@ fn draw_pane(
 							&mut current_display_col,
 							&mut next_render_row,
 							&pane.render_rows,
+							pane.row_window,
 							text_left,
 							text_right,
 							render_height,
@@ -1334,6 +1375,7 @@ fn draw_pane(
 						&mut current_display_col,
 						&mut next_render_row,
 						&pane.render_rows,
+						pane.row_window,
 						text_left,
 						text_right,
 						render_height,
@@ -1361,6 +1403,7 @@ fn draw_pane(
 						&mut current_display_col,
 						&mut next_render_row,
 						&pane.render_rows,
+						pane.row_window,
 						text_left,
 						text_right,
 						render_height,
@@ -2169,6 +2212,7 @@ mod tests {
 			&mut display_col,
 			&mut next_render_row,
 			&[],
+			None,
 			0,
 			180,
 			1,
@@ -2313,17 +2357,11 @@ mod tests {
 		let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 2));
 		let mut x = 0usize;
 		let mut y = 0usize;
-		let mut col = 0u32;
+		let mut col = 0u64;
 		let mut next_row = 0usize;
 		let rows = [
-			VisibleRow {
-				line: DocLine::ZERO,
-				start_col: DocDisplayCol::ZERO,
-			},
-			VisibleRow {
-				line: DocLine::ZERO,
-				start_col: DocDisplayCol::new(6),
-			},
+			VisibleRow::whole(DocLine::ZERO, DocDisplayCol::ZERO),
+			VisibleRow::whole(DocLine::ZERO, DocDisplayCol::new(6)),
 		];
 
 		assert!(paint_text_segment(
@@ -2334,6 +2372,7 @@ mod tests {
 			&mut col,
 			&mut next_row,
 			&rows,
+			None,
 			0,
 			5,
 			2,
@@ -2355,11 +2394,63 @@ mod tests {
 	}
 
 	#[test]
+	fn text_painting_starts_a_row_window_at_its_absolute_origin() {
+		let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 2));
+		let mut x = 0usize;
+		let mut y = 0usize;
+		let mut col = 100u64;
+		let mut next_row = 0usize;
+		let rows = [
+			VisibleRow {
+				line: DocLine::ZERO,
+				start_col: DocDisplayCol::new(102),
+				start_byte: Some(DocByte::new(102)),
+				start_offset: Some(libaryon::core::DisplayOffset::new(102)),
+			},
+			VisibleRow {
+				line: DocLine::ZERO,
+				start_col: DocDisplayCol::new(106),
+				start_byte: Some(DocByte::new(106)),
+				start_offset: Some(libaryon::core::DisplayOffset::new(106)),
+			},
+		];
+		let window = libaryon::engine::RowWindow {
+			line: DocLine::ZERO,
+			start_byte: DocByte::new(100),
+			start_offset: libaryon::core::DisplayOffset::new(100),
+			tab_phase: 0,
+		};
+
+		assert!(paint_text_segment(
+			&mut buffer,
+			&mut x,
+			&mut y,
+			0,
+			&mut col,
+			&mut next_row,
+			&rows,
+			Some(window),
+			0,
+			4,
+			2,
+			0,
+			0,
+			"  abcdef",
+			Style::default(),
+			true,
+		));
+		let first: String = (0..4).map(|x| buffer[(x, 0)].symbol().to_owned()).collect();
+		let second: String = (0..4).map(|x| buffer[(x, 1)].symbol().to_owned()).collect();
+		assert_eq!(first, "abcd");
+		assert_eq!(second, "ef  ");
+	}
+
+	#[test]
 	fn text_painting_keeps_emoji_sequences_in_one_wide_cell() {
 		let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
 		let mut x = 0usize;
 		let mut y = 0usize;
-		let mut col = 0u32;
+		let mut col = 0u64;
 		let mut next_row = 0usize;
 
 		assert!(paint_text_segment(
@@ -2370,6 +2461,7 @@ mod tests {
 			&mut col,
 			&mut next_row,
 			&[],
+			None,
 			0,
 			4,
 			1,

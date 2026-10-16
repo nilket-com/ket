@@ -1438,6 +1438,35 @@ impl Caret {
 		self.cache.node.is_some() && self.cache.line.is_some()
 	}
 
+	/// Place the caret at a position whose line and column are already known,
+	/// such as a row start from the wrap index (ADR 0009). Unlike
+	/// [`Self::place_at_line_col`] this reads nothing from the line's start:
+	/// the node comes from a metrics-only descent.
+	#[allow(clippy::too_many_arguments)]
+	pub(crate) fn place_at_known(
+		&mut self,
+		registry: &UastRegistry,
+		root: NodeId,
+		topology_rev: TopologyRev,
+		state_id: StateId,
+		byte: DocByte,
+		line: DocLine,
+		col: DocDisplayCol,
+	) {
+		let target = registry.find_node_at_doc_byte_raw(root, byte);
+		self.anchor = TextAnchor::new(byte, Affinity::After);
+		self.pending_target = None;
+		self.cache = CaretCache {
+			node: Some(CaretNodeCache {
+				node: target.node_id,
+				offset: target.node_byte.get(),
+			}),
+			node_rev: topology_rev,
+			line: Some(CaretLineCache { line, col }),
+			line_rev: state_id,
+		};
+	}
+
 	pub(crate) fn place_at_line_col(
 		&mut self,
 		registry: &UastRegistry,
@@ -1977,6 +2006,9 @@ pub(crate) struct CommonViewState {
 	pub(crate) last_minimap_semantic_revision: u64,
 	pub(crate) last_minimap_total_lines: u64,
 	pub(crate) last_minimap_path: Option<PathBuf>,
+	/// Soft-wrap rows of this view's long lines (ADR 0009). A `RefCell`
+	/// because layout reads the view through shared references.
+	pub(crate) wrap_index: std::cell::RefCell<super::wrap_index::WrapIndex>,
 }
 
 impl CommonViewState {
@@ -2157,6 +2189,7 @@ fn new_common_view_state(
 		last_minimap_semantic_revision: u64::MAX,
 		last_minimap_total_lines: u64::MAX,
 		last_minimap_path: None,
+		wrap_index: std::cell::RefCell::default(),
 	}
 }
 
@@ -9966,5 +9999,72 @@ mod tests {
 		assert!(error.contains("Wait for reclamation"));
 		assert!(error.contains("restart the editor"));
 		assert_eq!(registry.stats().allocated_nodes, 0);
+	}
+}
+
+#[cfg(test)]
+mod known_position_tests {
+	use super::{Affinity, Caret};
+	use crate::core::{DocByte, DocDisplayCol, DocLine, StateId, TopologyRev};
+	use crate::ecs::UastRegistry;
+	use crate::engine::folding::FoldSet;
+	use crate::uast::kind::SemanticKind;
+	use crate::uast::metrics::SpanMetrics;
+
+	/// One line in two leaves: the first is not loaded, so nothing can read the
+	/// line from its start.
+	fn line_with_unloaded_head() -> (UastRegistry, crate::ecs::NodeId) {
+		let registry = UastRegistry::new(8);
+		let mut chunk = registry.reserve_chunk(3).expect("OOM");
+		let metrics = |byte_length| SpanMetrics {
+			byte_length,
+			newlines: 0,
+		};
+		let root = chunk.spawn_node(SemanticKind::RelationalTable, None, metrics(8));
+		let head = chunk.spawn_node(SemanticKind::Token, None, metrics(4));
+		let tail = chunk.spawn_node(SemanticKind::Token, None, metrics(4));
+		chunk.append_local_child(root, head);
+		chunk.append_local_child(root, tail);
+		unsafe {
+			*registry.virtual_data[tail.index()].get() = Some(b"zzzz".to_vec());
+		}
+		drop(chunk);
+		(registry, root)
+	}
+
+	#[test]
+	fn a_known_position_places_the_caret_without_reading_the_line_start() {
+		let (registry, root) = line_with_unloaded_head();
+		let (topology, state) = (TopologyRev::new(1), StateId::new(1));
+		let mut folds = FoldSet::default();
+
+		// Placing by column must walk the line from its start, which it cannot.
+		let mut walked = Caret::at_start();
+		assert!(!walked.place_at_line_col(
+			&registry,
+			root,
+			&mut folds,
+			topology,
+			state,
+			DocLine::ZERO,
+			DocDisplayCol::new(6),
+			false,
+			Affinity::After,
+		));
+
+		let mut known = Caret::at_start();
+		known.place_at_known(
+			&registry,
+			root,
+			topology,
+			state,
+			DocByte::new(6),
+			DocLine::ZERO,
+			DocDisplayCol::new(6),
+		);
+		assert!(known.resolve(&registry, root, &mut folds, topology, state));
+		assert_eq!(known.byte(), DocByte::new(6));
+		assert_eq!(known.abs_line(), DocLine::ZERO);
+		assert_eq!(known.abs_col(), DocDisplayCol::new(6));
 	}
 }

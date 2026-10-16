@@ -2,11 +2,12 @@ use super::core::{MAX_MINIMAP_TEXT_BYTES, refresh_sum_tree};
 use super::document::io::read_document_snapshot;
 use super::document::selection::resolve_visual_ranges_sparse;
 use super::folding::{pan_scroll_y_to_keep_cursor_visible, visual_line_index_for_doc_line};
-use super::language::{LanguageProvider, LanguageRegistry};
+use super::language::{InlineAnnotation, LanguageProvider, LanguageRegistry};
 use super::layout::{
-	ViewportAnchor, collect_visible_rows_with_sum_tree, cursor_view_metrics_with_sum_tree,
+	LayoutDemand, RowWindow, ViewportAnchor, WrapLayout, collect_visible_rows_with_sum_tree,
+	cursor_view_metrics_with_sum_tree, line_is_indexed_with_sum_tree,
 	pan_viewport_anchor_to_keep_cursor_visible_with_sum_tree,
-	viewport_geometry_for_viewport_with_numbering,
+	viewport_geometry_for_viewport_with_numbering, window_origin_with_sum_tree,
 };
 use super::minimap::{
 	MinimapContentRevision, MinimapOverlay, build_byte_fallback_minimap_snapshot,
@@ -36,6 +37,7 @@ use crate::uast::projection::{
 	PickerViewport, ProjectedCaret, clip_frontend_text_tokens, coalesce_frontend_text_tokens,
 };
 use crate::uast::{PaneViewport, RenderToken, Viewport};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -364,6 +366,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 
 	let mut panes = Vec::with_capacity(pane_layouts.len());
 	let mut semantic_busy = false;
+	let mut layout_continues = false;
 	registry.retain_viewport_pin_owners(
 		&pane_layouts
 			.iter()
@@ -399,7 +402,12 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 			&uast_graphs,
 			git_colors,
 			&mut semantic_busy,
+			&mut layout_continues,
 		));
+	}
+	if layout_continues {
+		// A full queue already holds a render; nothing is lost by dropping this.
+		let _ = tx_internal.try_send(super::request::InternalEvent::Refresh);
 	}
 	let next_hit_test_fingerprint = hit_test_fingerprint_for(&panes);
 	if *hit_test_fingerprint != Some(next_hit_test_fingerprint) {
@@ -592,6 +600,21 @@ fn dividers_for(
 	dividers
 }
 
+/// Inline annotations a pane publishes. A row window's line starts its tokens
+/// mid-line, so no frontend can place that line's end-of-line hint: it is
+/// dropped (ADR 0009). Later lines in the window start at column zero and keep
+/// theirs.
+fn window_inline_annotations(
+	annotations: &[InlineAnnotation],
+	row_window: Option<RowWindow>,
+) -> Vec<InlineAnnotation> {
+	annotations
+		.iter()
+		.filter(|annotation| row_window.is_none_or(|window| annotation.line != window.line))
+		.cloned()
+		.collect()
+}
+
 fn hit_test_fingerprint_for(panes: &[PaneViewport]) -> u64 {
 	let mut hasher = std::collections::hash_map::DefaultHasher::new();
 	for pane in panes {
@@ -603,6 +626,7 @@ fn hit_test_fingerprint_for(panes: &[PaneViewport]) -> u64 {
 		pane.rect.height.hash(&mut hasher);
 		pane.viewport_start_line.hash(&mut hasher);
 		pane.viewport_row_offset.hash(&mut hasher);
+		pane.row_window.hash(&mut hasher);
 		pane.viewport_line_count.hash(&mut hasher);
 		pane.max_doc_line.hash(&mut hasher);
 		pane.wrap_enabled.hash(&mut hasher);
@@ -624,6 +648,9 @@ fn hit_test_fingerprint_for(panes: &[PaneViewport]) -> u64 {
 		for row in &pane.visible_rows {
 			row.line.hash(&mut hasher);
 			row.start_col.hash(&mut hasher);
+			// Deep rows saturate `start_col`; their offset tells them apart.
+			row.start_offset.hash(&mut hasher);
+			row.start_byte.hash(&mut hasher);
 		}
 		for token in &pane.tokens {
 			token.absolute_start_line.hash(&mut hasher);
@@ -655,6 +682,7 @@ fn render_pane_viewport(
 	uast_graphs: &HashMap<BufferId, crate::uast::UastGraphSnapshot>,
 	git_colors: [Rgb; 4],
 	semantic_busy: &mut bool,
+	layout_continues: &mut bool,
 ) -> PaneViewport {
 	let pane_width = pane_layout.rect.width.get().min(u16::MAX as u32) as u16;
 	let pane_text_lines = pane_layout
@@ -712,6 +740,7 @@ fn render_pane_viewport(
 		theme_colors,
 		render_rows,
 		visible_rows,
+		row_window,
 		visible_line_starts,
 		dma_pending,
 		language_id,
@@ -770,6 +799,7 @@ fn render_pane_viewport(
 				preview_view.state.current_theme.syntax_colors,
 				Vec::new(),
 				Vec::new(),
+				None,
 				Vec::new(),
 				false,
 				lang_registry.resolve_language_id("markdown"),
@@ -824,6 +854,7 @@ fn render_pane_viewport(
 				panel_view.state.current_theme.syntax_colors,
 				Vec::new(),
 				Vec::new(),
+				None,
 				Vec::new(),
 				false,
 				None,
@@ -941,6 +972,8 @@ fn render_pane_viewport(
 			viewport_anchor,
 			render_rows,
 			visible_rows,
+			in_indexed_line,
+			row_window,
 			cursor_pane_row,
 			cursor_pane_col,
 			secondary_carets,
@@ -976,6 +1009,9 @@ fn render_pane_viewport(
 					.expect("non-text render must have a content cache")
 			};
 			let sum_tree = refresh_sum_tree(cached_sum_tree, registry, rid, current_state_id);
+			// Every layout pass below shares one wrap-index read budget (ADR 0009).
+			tab.view.common.wrap_index.borrow_mut().begin_frame();
+			let wrap_demand = RefCell::new(LayoutDemand::default());
 			let mut geometry = viewport_geometry_for_viewport_with_numbering(
 				DocLine::new(tab.view.scroll_y),
 				tab.view.viewport_lines,
@@ -1002,6 +1038,12 @@ fn render_pane_viewport(
 						true,
 						geometry.text_width,
 						sum_tree,
+						Some(WrapLayout::new(
+							&tab.view.common.wrap_index,
+							current_state_id,
+							topology_rev,
+							&wrap_demand,
+						)),
 					);
 					let adjusted_geometry = viewport_geometry_for_viewport_with_numbering(
 						anchor.line,
@@ -1043,48 +1085,155 @@ fn render_pane_viewport(
 			tab.view.scroll_row_offset = viewport_anchor.row_offset;
 			let scroll_line = viewport_anchor.line;
 
+			// A view that starts inside a line laid out through the wrap index
+			// publishes a row window from its first row's byte (ADR 0009), not
+			// the line from its first byte and every row above the view.
+			let in_indexed_line = viewport_anchor.row_offset > DisplayRow::ZERO
+				&& line_is_indexed_with_sum_tree(
+					registry,
+					rid,
+					&tab.view.folds,
+					max_doc_line,
+					tab.view.wrap_enabled,
+					geometry.text_width,
+					sum_tree,
+					Some(WrapLayout::new(
+						&tab.view.common.wrap_index,
+						current_state_id,
+						topology_rev,
+						&wrap_demand,
+					)),
+					scroll_line,
+				);
+			let (render_rows, row_window, window_unreachable) = if in_indexed_line {
+				let rows = collect_visible_rows_with_sum_tree(
+					registry,
+					rid,
+					&tab.view.folds,
+					viewport_anchor,
+					max_doc_line,
+					tab.view.viewport_lines,
+					tab.view.wrap_enabled,
+					geometry.text_width,
+					sum_tree,
+					Some(WrapLayout::new(
+						&tab.view.common.wrap_index,
+						current_state_id,
+						topology_rev,
+						&wrap_demand,
+					)),
+				);
+				let window =
+					rows.first()
+						.filter(|row| row.line == scroll_line)
+						.and_then(|&first| {
+							window_origin_with_sum_tree(
+								registry,
+								rid,
+								&tab.view.folds,
+								max_doc_line,
+								tab.view.wrap_enabled,
+								geometry.text_width,
+								sum_tree,
+								Some(WrapLayout::new(
+									&tab.view.common.wrap_index,
+									current_state_id,
+									topology_rev,
+									&wrap_demand,
+								)),
+								first,
+							)
+						});
+				match window {
+					Some(window) => (rows, Some(window), false),
+					// No origin this frame: publish nothing for the line rather
+					// than let a frontend lay it out from its first byte.
+					None => {
+						wrap_demand.borrow_mut().more = true;
+						(Vec::new(), None, true)
+					}
+				}
+			} else {
+				let rows = collect_visible_rows_with_sum_tree(
+					registry,
+					rid,
+					&tab.view.folds,
+					ViewportAnchor {
+						line: viewport_anchor.line,
+						row_offset: DisplayRow::ZERO,
+					},
+					max_doc_line,
+					tab.view
+						.viewport_lines
+						.saturating_add(viewport_anchor.row_offset.get()),
+					tab.view.wrap_enabled,
+					geometry.text_width,
+					sum_tree,
+					Some(WrapLayout::new(
+						&tab.view.common.wrap_index,
+						current_state_id,
+						topology_rev,
+						&wrap_demand,
+					)),
+				);
+				(rows, None, false)
+			};
+			let visible_rows: Vec<_> = if in_indexed_line {
+				render_rows.clone()
+			} else {
+				render_rows
+					.iter()
+					.skip(viewport_anchor.row_offset.get() as usize)
+					.take(tab.view.viewport_lines as usize)
+					.copied()
+					.collect()
+			};
+
 			let virtual_start_line = scroll_line.saturating_sub(60);
 			let virtual_line_count = tab.view.viewport_lines + 120;
 			// One cold extent per line bounds what a frame discovers, hydrates and
 			// publishes; a newline-free line would otherwise be walked to the file's end.
 			let discovery = LineDiscovery::PerLineBytes(COLD_INGEST_EXTENT_SIZE as u64);
-			let virtual_tokens = registry.query_viewport_with_line_discovery(
-				rid,
-				&tab.view.folds,
-				virtual_start_line,
-				virtual_line_count,
-				discovery,
-			);
-			let visible_tokens = registry.query_viewport_with_line_discovery(
-				rid,
-				&tab.view.folds,
-				scroll_line,
-				tab.view.viewport_lines,
-				discovery,
-			);
-
-			let render_rows = collect_visible_rows_with_sum_tree(
-				registry,
-				rid,
-				&tab.view.folds,
-				ViewportAnchor {
-					line: viewport_anchor.line,
-					row_offset: DisplayRow::ZERO,
-				},
-				max_doc_line,
-				tab.view
-					.viewport_lines
-					.saturating_add(viewport_anchor.row_offset.get()),
-				tab.view.wrap_enabled,
-				geometry.text_width,
-				sum_tree,
-			);
-			let visible_rows: Vec<_> = render_rows
-				.iter()
-				.skip(viewport_anchor.row_offset.get() as usize)
-				.take(tab.view.viewport_lines as usize)
-				.copied()
-				.collect();
+			let (virtual_tokens, visible_tokens) = if window_unreachable {
+				(Vec::new(), Vec::new())
+			} else if let Some(window) = row_window {
+				// Highlighting starts at the window too (ADR 0009 consequence).
+				(
+					registry.query_viewport_from_byte(
+						rid,
+						&tab.view.folds,
+						window.start_byte,
+						scroll_line,
+						virtual_line_count,
+						discovery,
+					),
+					registry.query_viewport_from_byte(
+						rid,
+						&tab.view.folds,
+						window.start_byte,
+						scroll_line,
+						tab.view.viewport_lines,
+						discovery,
+					),
+				)
+			} else {
+				(
+					registry.query_viewport_with_line_discovery(
+						rid,
+						&tab.view.folds,
+						virtual_start_line,
+						virtual_line_count,
+						discovery,
+					),
+					registry.query_viewport_with_line_discovery(
+						rid,
+						&tab.view.folds,
+						scroll_line,
+						tab.view.viewport_lines,
+						discovery,
+					),
+				)
+			};
 			let (cursor_pane_row, cursor_pane_col) = cursor_view_metrics_with_sum_tree(
 				registry,
 				rid,
@@ -1096,6 +1245,12 @@ fn render_pane_viewport(
 				tab.view.wrap_enabled,
 				geometry.text_width,
 				sum_tree,
+				Some(WrapLayout::new(
+					&tab.view.common.wrap_index,
+					current_state_id,
+					topology_rev,
+					&wrap_demand,
+				)),
 			);
 			let secondary_carets = tab
 				.cursor
@@ -1114,6 +1269,12 @@ fn render_pane_viewport(
 						tab.view.wrap_enabled,
 						geometry.text_width,
 						sum_tree,
+						Some(WrapLayout::new(
+							&tab.view.common.wrap_index,
+							current_state_id,
+							topology_rev,
+							&wrap_demand,
+						)),
 					);
 					visible_rows
 						.get(pane_row.get() as usize)
@@ -1145,6 +1306,18 @@ fn render_pane_viewport(
 					resolver.hydrate_whole_leaf_for_buffer(node, buffer_id)
 				};
 			}
+			// Wrap rows layout could not reach this frame. Hydration completion
+			// renders again on its own; a scan that only ran out of budget needs
+			// a refresh to continue.
+			let wrap_demand = wrap_demand.into_inner();
+			for &node in &wrap_demand.pending {
+				let _ = if is_file_browser {
+					resolver.hydrate_whole_leaf(node)
+				} else {
+					resolver.hydrate_whole_leaf_for_buffer(node, buffer_id)
+				};
+			}
+			*layout_continues |= wrap_demand.more && wrap_demand.pending.is_empty();
 			registry.set_viewport_resident_pins(
 				pane_layout.pane_id.get(),
 				visible_tokens.iter().map(|token| token.node_id),
@@ -1163,6 +1336,8 @@ fn render_pane_viewport(
 				viewport_anchor,
 				render_rows,
 				visible_rows,
+				in_indexed_line,
+				row_window,
 				cursor_pane_row,
 				cursor_pane_col,
 				secondary_carets,
@@ -1179,6 +1354,8 @@ fn render_pane_viewport(
 				},
 				Vec::new(),
 				Vec::new(),
+				false,
+				None,
 				PaneLocalRow::ZERO,
 				PaneLocalCol::ZERO,
 				Vec::new(),
@@ -1234,6 +1411,14 @@ fn render_pane_viewport(
 			&& !semantic.highlights.is_empty()
 		{
 			highlights = merge_highlights(&highlights, &semantic.highlights);
+		}
+		// A row window publishes nothing before its start, highlights included:
+		// whole-document semantic spans are clipped to it (ADR 0009).
+		if let Some(window) = row_window {
+			highlights.retain(|span| span.end > window.start_byte);
+			for span in &mut highlights {
+				span.start = span.start.max(window.start_byte);
+			}
 		}
 
 		if let Some(first_visible) = tokens.first() {
@@ -1428,7 +1613,12 @@ fn render_pane_viewport(
 			tokens,
 			tab.view.scroll_y,
 			viewport_start_line,
-			viewport_anchor.row_offset,
+			// A row window publishes only its own rows.
+			if in_indexed_line {
+				DisplayRow::ZERO
+			} else {
+				viewport_anchor.row_offset
+			},
 			tab.view.viewport_lines,
 			tab.view.wrap_enabled,
 			visible_whitespace,
@@ -1456,9 +1646,12 @@ fn render_pane_viewport(
 			tab.semantic
 				.as_deref()
 				.map_or_else(Vec::new, |semantic| semantic.diagnostics.clone()),
-			tab.semantic
-				.as_deref()
-				.map_or_else(Vec::new, |semantic| semantic.inline_annotations.clone()),
+			window_inline_annotations(
+				tab.semantic
+					.as_deref()
+					.map_or(&[][..], |semantic| &semantic.inline_annotations),
+				row_window,
+			),
 			selection_ranges,
 			minimap,
 			markdown_cells,
@@ -1475,6 +1668,7 @@ fn render_pane_viewport(
 			},
 			render_rows,
 			visible_rows,
+			row_window,
 			visible_line_starts,
 			dma_pending,
 			tab.document.active_language_id,
@@ -1587,6 +1781,7 @@ fn render_pane_viewport(
 		theme_colors,
 		render_rows,
 		visible_rows,
+		row_window,
 		visible_line_starts,
 		dma_pending,
 		language_id,
@@ -1730,7 +1925,7 @@ pub(crate) fn merge_highlights(
 mod tests {
 	use super::{
 		analysis_depth_for_buffer, merge_highlights, project_gutter_line_numbers,
-		take_capacity_warning, viewport_is_busy,
+		take_capacity_warning, viewport_is_busy, window_inline_annotations,
 	};
 	use crate::core::{BufferId, DocByte, DocLine};
 	use crate::engine::GutterNumbering;
@@ -1741,6 +1936,38 @@ mod tests {
 	use crate::svp::rust_highlight::{HighlightSpan, TokenCategory};
 	use std::collections::HashMap;
 	use std::path::PathBuf;
+
+	#[test]
+	fn a_row_window_drops_only_its_own_lines_inline_annotations() {
+		use crate::core::DisplayOffset;
+		use crate::engine::language::{InlineAnnotation, InlineAnnotationKind};
+		use crate::engine::layout::RowWindow;
+		let annotation = |line| InlineAnnotation {
+			line: DocLine::new(line),
+			text: format!("hint {line}"),
+			kind: InlineAnnotationKind::Info,
+		};
+		let annotations = [annotation(2), annotation(3), annotation(4)];
+		let lines = |kept: Vec<InlineAnnotation>| -> Vec<u64> {
+			kept.iter()
+				.map(|annotation| annotation.line.get())
+				.collect()
+		};
+		assert_eq!(
+			lines(window_inline_annotations(&annotations, None)),
+			[2, 3, 4]
+		);
+		let window = RowWindow {
+			line: DocLine::new(3),
+			start_byte: DocByte::new(1 << 20),
+			start_offset: DisplayOffset::new(1 << 20),
+			tab_phase: 0,
+		};
+		assert_eq!(
+			lines(window_inline_annotations(&annotations, Some(window))),
+			[2, 4]
+		);
+	}
 
 	fn number_for(numbers: &[crate::uast::projection::GutterLineNumber], line: u64) -> u64 {
 		numbers

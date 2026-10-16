@@ -250,18 +250,12 @@ impl DiffBridgeController {
 				left_visible_rows: left_pane
 					.visible_rows
 					.iter()
-					.map(|r| libaryon::engine::VisibleRow {
-						line: r.line,
-						start_col: r.start_col,
-					})
+					.map(|r| libaryon::engine::VisibleRow::whole(r.line, r.start_col))
 					.collect(),
 				right_visible_rows: right_pane
 					.visible_rows
 					.iter()
-					.map(|r| libaryon::engine::VisibleRow {
-						line: r.line,
-						start_col: r.start_col,
-					})
+					.map(|r| libaryon::engine::VisibleRow::whole(r.line, r.start_col))
 					.collect(),
 				blocks: blocks.clone(),
 				text_area_top,
