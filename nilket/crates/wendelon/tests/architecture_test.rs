@@ -9372,6 +9372,7 @@ fn adr078_manager_source_concatenates_submodules() {
 			"maintenance_publication.rs",
 			// ADR 629 counted publication helpers preserve the existing entry points.
 			"observation.rs",
+			"open.rs",
 			"retention_reclaim.rs",
 			"secondary_index_segments.rs",
 			"stats_facts.rs",
@@ -10031,6 +10032,32 @@ fn adr0093_test_support_is_non_default_and_every_hook_site_is_gated() {
 	assert_eq!(control.matches("take_sever_response(").count(), 2);
 	assert_eq!(control.matches("take_reclaim_delay(").count(), 0);
 	assert_eq!(control.matches("delay_next_drop_reclaim(").count(), 0);
+	let node = read_workspace("crates/wendelon/src/node.rs");
+	for site in [
+		"#[cfg(feature = \"test-support\")]\nmod test_support;",
+		"#[cfg(feature = \"test-support\")]\npub use test_support::TestSupportFileOps;",
+		"#[cfg(feature = \"test-support\")]\n\tpub slab_file_ops: Option<TestSupportFileOps>,",
+		"#[cfg(feature = \"test-support\")]\n\t\tlet slab: Arc<SlabManager> = {",
+	] {
+		assert!(
+			node.contains(site),
+			"acceptance-8 ungated test-support site: {site}"
+		);
+	}
+	assert_eq!(node.matches("pub slab_file_ops:").count(), 1);
+	assert_eq!(node.matches("SlabManager::open_with_file_ops(").count(), 1);
+	let manager = read_workspace("crates/wendelon/src/storage/manager.rs");
+	assert!(
+		manager.contains("#[cfg(feature = \"test-support\")]\n\tpub async fn open_with_file_ops(")
+	);
+	assert_eq!(
+		manager.matches("pub async fn open_with_file_ops(").count(),
+		1
+	);
+	let support = read_workspace("crates/wendelon/src/node/test_support.rs");
+	assert!(support.contains("pub struct TestSupportFileOps(Arc<dyn AsyncFileOps>);"));
+	assert!(support.contains("Arc::ptr_eq(&self.0, &other.0)"));
+	assert!(support.contains("f.write_str(\"TestSupportFileOps(..)\")"));
 }
 
 /// ADR 0167: tenant provisioning is an operator command over the existing

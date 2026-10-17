@@ -109,6 +109,13 @@ the presence of appended bytes. Release for teardown is recorded separately
 from the observation. Detached work is not claimed cleaned up merely because a
 caller returned or the harness cutoff elapsed.
 
+### Known duplication
+
+The `test-support` branch in node bootstrap repeats the `SlabManagerConfig`
+literal to preserve the default construction path. Future configuration fields
+must be added to both literals; compiling the feature branch checks that they
+remain complete.
+
 ### Paired observations
 
 1. No injection: exact batch count and successful reads on P and I.
