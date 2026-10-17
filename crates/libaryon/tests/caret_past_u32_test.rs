@@ -127,29 +127,43 @@ fn the_caret_is_placed_and_moves_past_u32_columns() {
 
 	// Left comes back one cell, a word motion moves within one window, and Home goes to the line's
 	// start: none of them reads the line from its start.
-	let step =
-		|engine: &EngineHandle, command: EditorCommand, moved: &dyn Fn(&PaneViewport) -> bool| {
-			send(engine, command);
-			let deadline = Instant::now() + Duration::from_secs(60);
-			loop {
-				let viewport = viewports
-					.recv_timeout(Duration::from_secs(10))
-					.expect("a viewport after a motion");
-				if moved(focused(&viewport)) {
+	// `press_again`: a motion whose window was cold asks for its bytes and leaves the caret, and
+	// the engine then goes quiet: a word motion is pressed again (ADR 0010 P4). Other motions must
+	// resolve from their one command.
+	let step = |engine: &EngineHandle,
+	            command: EditorCommand,
+	            press_again: bool,
+	            moved: &dyn Fn(&PaneViewport) -> bool| {
+		send(engine, command.clone());
+		let deadline = Instant::now() + Duration::from_secs(60);
+		loop {
+			assert!(Instant::now() < deadline, "the caret never moved");
+			match viewports.recv_timeout(Duration::from_secs(3)) {
+				Ok(viewport) if moved(focused(&viewport)) => {
 					break settled(&viewports, viewport);
 				}
-				assert!(Instant::now() < deadline, "the caret never moved");
+				Ok(_) => {}
+				Err(std::sync::mpsc::RecvTimeoutError::Timeout) if press_again => {
+					send(engine, command.clone());
+				}
+				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+					panic!("the engine stopped")
+				}
 			}
-		};
+		}
+	};
 	let left = step(
 		&engine,
 		EditorCommand::MoveCursor(MoveDirection::Left),
+		false,
 		&|pane| pane.cursor_abs_pos.col == origin,
 	);
 	assert_eq!(focused(&left).cursor_abs_byte.get(), origin.get());
 	let word = step(
 		&engine,
 		EditorCommand::MoveCursor(MoveDirection::NextWord),
+		true,
 		&|pane| pane.cursor_abs_byte.get() != origin.get(),
 	);
 	let moved = focused(&word).cursor_abs_byte.get() - origin.get();
@@ -161,7 +175,7 @@ fn the_caret_is_placed_and_moves_past_u32_columns() {
 		focused(&word).cursor_abs_pos.col.get(),
 		focused(&word).cursor_abs_byte.get()
 	);
-	let home = step(&engine, EditorCommand::LineStart, &|pane| {
+	let home = step(&engine, EditorCommand::LineStart, false, &|pane| {
 		pane.cursor_abs_byte.get() == 0
 	});
 	assert_eq!(focused(&home).cursor_abs_pos.col.get(), 0);

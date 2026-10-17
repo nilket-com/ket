@@ -230,6 +230,15 @@ fn push_word_wraps(
 }
 
 /// A `u64` row count in layout's `u32` rows.
+/// How far below the view the cursor's row is counted: any pane is shorter.
+const CURSOR_ROW_DISTANCE_CAP: u32 = 1 << 16;
+
+/// The row after `row_offset` within a line, if a `DisplayRow` can name it:
+/// a long enough line in a narrow pane has rows past `u32::MAX`.
+fn next_row_offset(row_offset: u32) -> Option<u32> {
+	row_offset.checked_add(1)
+}
+
 fn saturate(rows: u64) -> u32 {
 	u32::try_from(rows).unwrap_or(u32::MAX)
 }
@@ -479,23 +488,29 @@ impl CarriedWork {
 	}
 }
 
-/// Carry on the work a command left for `index`'s document (ADR 0010):
-/// advance a requested line scan by this frame's budget, asking again while
-/// it is unfinished, and return the nodes and refresh it asked for. Work for
-/// another key is dropped.
-pub(crate) fn carry_on(
+/// Render's wrap-index work before layout, in its order (ADR 0011): half of
+/// the frame's budget is held for the visible window; within the other half
+/// the carets resolve, then a requested line scan (ADR 0010) advances; the
+/// held half is given back for layout. A scan therefore never leaves the
+/// window or a pending caret without budget. Returns the nodes and refresh
+/// that work a command left asked for; work for another key is dropped.
+pub(crate) fn before_layout(
 	carried: &RefCell<CarriedWork>,
 	index: CaretIndex<'_>,
 	registry: &UastRegistry,
 	root: NodeId,
+	resolve_carets: impl FnOnce(),
 ) -> LayoutDemand {
+	let held = index.reserve_read(usize::MAX);
 	let key = index.work_key(root);
 	let (demand, scan_line) = carried.borrow_mut().take(key);
+	resolve_carets();
 	if let Some(line) = scan_line
 		&& let Some(CaretLookup::Pending) = index.scan_to_end(registry, root, line)
 	{
 		carried.borrow_mut().scan_to_end(key, line);
 	}
+	index.release_read(held);
 	demand
 }
 
@@ -537,6 +552,11 @@ impl<'a> CaretIndex<'a> {
 	/// Grant a read outside the index from this frame's budget.
 	pub(crate) fn reserve_read(&self, max: usize) -> usize {
 		self.wrap.index.borrow_mut().reserve_read(max)
+	}
+
+	/// Give back what [`Self::reserve_read`] granted and was not read.
+	pub(crate) fn release_read(&self, unused: usize) {
+		self.wrap.index.borrow_mut().release_read(unused);
 	}
 
 	/// The key carried work for this index is valid under.
@@ -748,6 +768,13 @@ impl<'a> CaretIndex<'a> {
 	}
 }
 
+/// A row lookup: the row, the line ending before it, or not known this frame.
+enum RowAt {
+	Known(VisibleRow),
+	PastEnd,
+	Unknown,
+}
+
 /// How a line wraps: whole, from its resident bytes, or through the index.
 #[derive(Clone)]
 enum LineLayout {
@@ -939,13 +966,38 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 		}
 	}
 
+	/// The line's rows, scanning toward its end: see [`Self::line_rows_scanning`].
 	fn line_row_count(&self, line: DocLine) -> u32 {
-		self.line_rows(line).0
+		self.line_rows_scanning(line).0
 	}
 
 	/// A line's wrapped rows as far as known, and whether that count is exact.
 	/// An inexact count is a scanned prefix: the line has at least that many.
+	/// It scans nothing (ADR 0011): a caller that needs a row asks for it.
 	fn line_rows(&self, line: DocLine) -> (u32, bool) {
+		if !self.wrap_enabled {
+			return (1, true);
+		}
+		match self.line_layout(line) {
+			LineLayout::Whole(wrapped) => (wrapped.starts.len() as u32, true),
+			LineLayout::Indexed { .. } => {
+				let wrap = self.wrap.expect("an indexed line has a wrap index");
+				match wrap
+					.index
+					.borrow_mut()
+					.known_rows(self.wrap_key(wrap), line)
+				{
+					RowCount::Exact(rows) => (saturate(rows), true),
+					RowCount::AtLeast { rows, .. } => (saturate(rows), false),
+				}
+			}
+		}
+	}
+
+	/// [`Self::line_rows`], scanning toward the line's end with the frame's
+	/// budget: for a consumer that needs the line's total, such as a move into
+	/// the line from below (ADR 0011).
+	fn line_rows_scanning(&self, line: DocLine) -> (u32, bool) {
 		if !self.wrap_enabled {
 			return (1, true);
 		}
@@ -1082,15 +1134,21 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 	/// A row as published, or `None` when the index cannot reach its start this
 	/// frame; the demand then asks for a continuation.
 	fn try_visible_row(&self, line: DocLine, row_offset: DisplayRow) -> Option<VisibleRow> {
+		match self.visible_row_lookup(line, row_offset) {
+			RowAt::Known(row) => Some(row),
+			RowAt::PastEnd => Some(VisibleRow::whole(line, DocDisplayCol::ZERO)),
+			RowAt::Unknown => None,
+		}
+	}
+
+	/// The row at `row_offset` of `line`; on an indexed line this scans toward
+	/// that row only.
+	fn visible_row_lookup(&self, line: DocLine, row_offset: DisplayRow) -> RowAt {
 		match self.line_layout(line) {
-			LineLayout::Whole(wrapped) => Some(VisibleRow::whole(
-				line,
-				wrapped
-					.starts
-					.get(row_offset.get() as usize)
-					.copied()
-					.unwrap_or(DocDisplayCol::ZERO),
-			)),
+			LineLayout::Whole(wrapped) => match wrapped.starts.get(row_offset.get() as usize) {
+				Some(&start) => RowAt::Known(VisibleRow::whole(line, start)),
+				None => RowAt::PastEnd,
+			},
 			LineLayout::Indexed {
 				start: line_start,
 				end,
@@ -1105,7 +1163,7 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 					&source,
 				);
 				match lookup {
-					RowLookup::Known(start) => Some(VisibleRow {
+					RowLookup::Known(start) => RowAt::Known(VisibleRow {
 						line,
 						start_col: start.col,
 						start_byte: start
@@ -1113,11 +1171,11 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 							.map(|byte| DocByte::new(line_start.get().saturating_add(byte))),
 						start_offset: Some(start.col),
 					}),
-					RowLookup::PastEnd { .. } => Some(VisibleRow::whole(line, DocDisplayCol::ZERO)),
+					RowLookup::PastEnd { .. } => RowAt::PastEnd,
 					// Settles on a later frame; the demand asks for it.
 					RowLookup::Unknown { pending, .. } => {
 						wrap.demand.borrow_mut().note(pending);
-						None
+						RowAt::Unknown
 					}
 				}
 			}
@@ -1243,28 +1301,50 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 		}
 	}
 
+	/// Rows from `anchor` to `target_row` of `target_line`, counted only up to
+	/// `cap` (ADR 0011): callers compare the distance with a view, so a long
+	/// line between is scanned only as far as the cap, never to its end. A
+	/// result of `cap` means at least that far.
 	fn rows_from_anchor_to_position(
 		&self,
 		anchor: ViewportAnchor,
 		target_line: DocLine,
 		target_row: u32,
+		cap: u32,
 	) -> u32 {
 		if anchor.line == target_line {
-			return target_row.saturating_sub(anchor.row_offset.get());
+			return target_row.saturating_sub(anchor.row_offset.get()).min(cap);
 		}
 
+		let from = anchor.row_offset.get();
 		let mut rows = self
-			.line_row_count(anchor.line)
-			.saturating_sub(anchor.row_offset.get());
+			.line_rows_up_to(anchor.line, from.saturating_add(cap))
+			.saturating_sub(from);
 		let mut line = anchor.line;
-		while let Some(next_line) = self.next_visible_line(line) {
+		while rows < cap
+			&& let Some(next_line) = self.next_visible_line(line)
+		{
 			line = next_line;
 			if line == target_line {
-				return rows.saturating_add(target_row);
+				return rows.saturating_add(target_row).min(cap);
 			}
-			rows = rows.saturating_add(self.line_row_count(line));
+			rows = rows.saturating_add(self.line_rows_up_to(line, cap - rows));
 		}
-		rows
+		rows.min(cap)
+	}
+
+	/// A line's rows, counted up to `limit`: it scans only toward row `limit`,
+	/// and a short count while that row is still unscanned is a lower bound
+	/// that asks for a continuation.
+	fn line_rows_up_to(&self, line: DocLine, limit: u32) -> u32 {
+		let (known, exact) = self.line_rows(line);
+		if exact || known >= limit || limit == 0 {
+			return known.min(limit);
+		}
+		match self.visible_row_lookup(line, DisplayRow::new(limit - 1)) {
+			RowAt::Known(_) => limit,
+			RowAt::PastEnd | RowAt::Unknown => self.line_rows(line).0.min(limit),
+		}
 	}
 
 	fn scroll_viewport_anchor(&self, anchor: ViewportAnchor, delta_rows: i32) -> ViewportAnchor {
@@ -1285,11 +1365,24 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 				return anchor;
 			}
 			if !exact {
-				// More rows remain unscanned: stop at the last known one and let
+				// Ask for the target row: the index scans toward it only (ADR
+				// 0011). Until it is reached, stop at the last known row and let
 				// the continuation refresh resume, rather than leaving the line.
-				let last_known = DisplayRow::new(line_rows.saturating_sub(1));
-				anchor.row_offset = anchor.row_offset.max(last_known);
-				return anchor;
+				let target = anchor.row_offset.get().saturating_add(remaining as u32);
+				match self.visible_row_lookup(anchor.line, DisplayRow::new(target)) {
+					RowAt::Known(_) => {
+						anchor.row_offset = DisplayRow::new(target);
+						return anchor;
+					}
+					// The line ended before it: its count is exact now.
+					RowAt::PastEnd => continue,
+					RowAt::Unknown => {
+						let last_known =
+							DisplayRow::new(self.line_rows(anchor.line).0.saturating_sub(1));
+						anchor.row_offset = anchor.row_offset.max(last_known);
+						return anchor;
+					}
+				}
 			}
 			remaining -= remaining_in_line as i32 + 1;
 			let Some(next_line) = self.next_visible_line(anchor.line) else {
@@ -1351,13 +1444,19 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 			};
 		}
 
-		let cursor_offset = self.rows_from_anchor_to_position(anchor, cursor_line, cursor_row);
+		let cursor_offset =
+			self.rows_from_anchor_to_position(anchor, cursor_line, cursor_row, viewport_rows);
 		if cursor_offset < viewport_rows {
 			anchor
 		} else {
+			// Below the view: put the cursor on its last row, counting back from
+			// the cursor rather than forward through the lines before it.
 			self.scroll_viewport_anchor(
-				anchor,
-				cursor_offset.saturating_sub(viewport_rows.saturating_sub(1)) as i32,
+				ViewportAnchor {
+					line: cursor_line,
+					row_offset: DisplayRow::new(cursor_row),
+				},
+				-(viewport_rows.saturating_sub(1) as i32),
 			)
 		}
 	}
@@ -1385,7 +1484,8 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 			return self.row_target(anchor);
 		}
 
-		let cursor_offset = self.rows_from_anchor_to_position(anchor, cursor_line, cursor_row);
+		let cursor_offset =
+			self.rows_from_anchor_to_position(anchor, cursor_line, cursor_row, viewport_rows);
 		if cursor_offset < viewport_rows {
 			Some(CursorTarget {
 				line: cursor_line,
@@ -1454,7 +1554,12 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 		let anchor = self.normalize_anchor(anchor);
 		let cursor_line = self.visible_line(cursor_line);
 		let (cursor_row, pane_col) = self.cursor_row_and_pane_col(cursor_line, cursor_col);
-		let row = self.rows_from_anchor_to_position(anchor, cursor_line, cursor_row);
+		let row = self.rows_from_anchor_to_position(
+			anchor,
+			cursor_line,
+			cursor_row,
+			CURSOR_ROW_DISTANCE_CAP,
+		);
 		(PaneLocalRow::new(row), pane_col)
 	}
 
@@ -1463,25 +1568,36 @@ impl<'a, F: FoldPolicy + ?Sized> LayoutContext<'a, F> {
 		let viewport_rows = viewport_rows.max(1);
 		let mut anchor = self.normalize_anchor(anchor);
 		loop {
-			let (line_rows, exact) = self.line_rows(anchor.line);
-			// An anchor past a scanned prefix shows the last known row until the
-			// scan reaches it.
-			let first = anchor.row_offset.get().min(line_rows.saturating_sub(1));
-			for row_offset in first..line_rows {
-				// A row whose start the index cannot reach this frame ends the
-				// list: fewer rows now, the continuation refresh adds the rest.
-				let Some(row) = self.try_visible_row(anchor.line, DisplayRow::new(row_offset))
-				else {
-					return rows;
-				};
-				rows.push(row);
-				if rows.len() as u32 >= viewport_rows {
-					return rows;
-				}
+			// Rows are asked for one by one, so the index scans only as far as
+			// the view needs (ADR 0011). An anchor past the known rows asks for
+			// its row and shows the last known one until the scan reaches it.
+			let mut row_offset = anchor.row_offset.get();
+			if row_offset >= self.line_rows(anchor.line).0
+				&& !matches!(
+					self.visible_row_lookup(anchor.line, DisplayRow::new(row_offset)),
+					RowAt::Known(_)
+				) {
+				row_offset = self.line_rows(anchor.line).0.saturating_sub(1);
 			}
-			// Rows of this line are still unscanned; the next line cannot start.
-			if !exact {
-				return rows;
+			loop {
+				match self.visible_row_lookup(anchor.line, DisplayRow::new(row_offset)) {
+					RowAt::Known(row) => {
+						rows.push(row);
+						if rows.len() as u32 >= viewport_rows {
+							return rows;
+						}
+						// The last representable row ends the list.
+						let Some(next) = next_row_offset(row_offset) else {
+							return rows;
+						};
+						row_offset = next;
+					}
+					RowAt::PastEnd => break,
+					// A row whose start the index cannot reach this frame ends
+					// the list: fewer rows now, the continuation refresh adds the
+					// rest.
+					RowAt::Unknown => return rows,
+				}
 			}
 			let Some(next_line) = self.next_visible_line(anchor.line) else {
 				return rows;
@@ -2288,7 +2404,7 @@ mod tests {
 				let (rows, exact) = whole.line_rows(line);
 				assert!(exact);
 				assert_eq!(
-					fixture.indexed().line_rows(line),
+					fixture.indexed().line_rows_scanning(line),
 					(rows, true),
 					"line {line}"
 				);
@@ -2435,7 +2551,7 @@ mod tests {
 			let (rows, _) = whole.line_rows(DocLine::ZERO);
 			assert!(rows > 5_000, "more rows than the recent ring holds");
 			for _ in 0..100_000 {
-				if fixture.indexed().line_rows(DocLine::ZERO).1 {
+				if fixture.indexed().line_rows_scanning(DocLine::ZERO).1 {
 					break;
 				}
 			}
@@ -2474,7 +2590,7 @@ mod tests {
 			let fixture = Fixture::new(&text, limits);
 			let whole = fixture.whole();
 			for _ in 0..100_000 {
-				if fixture.indexed().line_rows(DocLine::ZERO).1 {
+				if fixture.indexed().line_rows_scanning(DocLine::ZERO).1 {
 					break;
 				}
 			}
@@ -2797,6 +2913,171 @@ mod tests {
 			work.scan_to_end(key, DocLine::new(3));
 			work.scan_to_end(later, DocLine::new(4));
 			assert_eq!(work.take(later).1, Some(DocLine::new(4)));
+		}
+
+		#[test]
+		fn a_cursor_below_a_long_line_does_not_scan_it_to_its_end() {
+			let text = format!("{}\nshort", long_line(3 << 20));
+			let fixture = Fixture::new(&text, WrapIndexLimits::default());
+			let anchor = ViewportAnchor {
+				line: DocLine::ZERO,
+				row_offset: DisplayRow::new(1),
+			};
+			let mut row = 0;
+			for _ in 0..10 {
+				row = fixture
+					.indexed()
+					.cursor_view_metrics(anchor, DocLine::new(1), DocDisplayCol::ZERO)
+					.0
+					.get();
+			}
+			// Far below any view: the distance is capped, and the long line is
+			// scanned only as far as the cap.
+			assert_eq!(row, super::super::CURSOR_ROW_DISTANCE_CAP);
+			assert!(
+				!fixture.indexed().line_rows(DocLine::ZERO).1,
+				"the long line was scanned to its end"
+			);
+		}
+
+		#[test]
+		fn a_visible_window_a_pending_caret_and_an_end_scan_all_progress() {
+			// One small budget shared by all three, in render's order: the
+			// window must stay drawn while the caret and the scan get theirs.
+			let limits = WrapIndexLimits {
+				read_budget: 64 * 1024,
+				checkpoint_bytes: 4 * 1024,
+				line_bytes: 4 << 20,
+				max_lines: 4,
+			};
+			let text = long_line(512 * 1024);
+			let fixture = Fixture::new(&text, limits);
+			fn key_index<'a>(
+				index: &'a RefCell<WrapIndex>,
+				demand: &'a RefCell<LayoutDemand>,
+			) -> WrapLayout<'a> {
+				let mut wrap = WrapLayout::new(index, StateId::new(1), TopologyRev::new(1), demand);
+				wrap.min_line_bytes = THRESHOLD;
+				wrap
+			}
+			let window = || {
+				fixture
+					.whole()
+					.with_wrap(key_index(&fixture.index, &fixture.demand))
+			};
+			let anchor = ViewportAnchor {
+				line: DocLine::ZERO,
+				row_offset: DisplayRow::new(1_000),
+			};
+			let expected = placed(&fixture.whole().collect_visible_rows(anchor, 10));
+			// Draw the window first.
+			for _ in 0..1_000 {
+				fixture.index.borrow_mut().begin_frame();
+				if window().collect_visible_rows(anchor, 10).len() == 10 {
+					break;
+				}
+			}
+			// Then End asks for the line's end, and a caret waits deep in the line.
+			let carried = RefCell::new(super::super::CarriedWork::default());
+			let caret_index = || {
+				super::super::CaretIndex::new(
+					key_index(&fixture.index, &fixture.demand),
+					true,
+					WIDTH,
+				)
+			};
+			let key = caret_index().work_key(fixture.root);
+			carried.borrow_mut().scan_to_end(key, DocLine::ZERO);
+			let deep = crate::core::DocByte::new((text.len() - 1_000) as u64);
+			let mut caret = crate::engine::session::Caret::at_start();
+			caret.set_byte(deep, crate::engine::session::Affinity::After);
+			let mut folds = crate::engine::folding::FoldSet::default();
+			let (mut caret_frames, mut scan_frames) = (None, None);
+			for frame in 0..10_000 {
+				fixture.index.borrow_mut().begin_frame();
+				super::super::before_layout(
+					&carried,
+					caret_index(),
+					&fixture.registry,
+					fixture.root,
+					|| {
+						if caret.resolve_indexed(
+							&fixture.registry,
+							fixture.root,
+							&mut folds,
+							TopologyRev::new(1),
+							StateId::new(1),
+							Some(caret_index()),
+						) {
+							caret_frames.get_or_insert(frame);
+						}
+					},
+				);
+				if carried.borrow().pending_scan().is_none() {
+					scan_frames.get_or_insert(frame);
+				}
+				let rows = placed(&window().collect_visible_rows(anchor, 10));
+				assert_eq!(rows, expected, "frame {frame}: the window stays drawn");
+				fixture.take_demand();
+				if caret_frames.is_some() && scan_frames.is_some() {
+					break;
+				}
+			}
+			let caret_frames = caret_frames.expect("the caret resolves");
+			let scan_frames = scan_frames.expect("the scan finishes");
+			// Each walks at most half a frame's budget at a time: bounded, not starved.
+			let bound = (text.len() / (limits.read_budget / 2)) * 2 + 10;
+			assert!(caret_frames < bound, "the caret took {caret_frames} frames");
+			assert!(scan_frames < bound, "the scan took {scan_frames} frames");
+			let col = crate::core::text::display_col_for_byte_offset(
+				text.as_bytes(),
+				deep.get() as usize,
+				0,
+				crate::core::TAB_SIZE,
+			);
+			assert_eq!(caret.abs_col(), DocDisplayCol::new(col));
+		}
+
+		#[test]
+		fn the_row_step_stops_at_the_last_representable_row() {
+			assert_eq!(super::super::next_row_offset(0), Some(1));
+			assert_eq!(super::super::next_row_offset(u32::MAX - 1), Some(u32::MAX));
+			assert_eq!(super::super::next_row_offset(u32::MAX), None);
+		}
+
+		#[test]
+		fn an_unscanned_line_shows_its_rows_without_scanning_to_its_end() {
+			// The cause ADR 0011 records: asking how many rows a line has used to
+			// scan it to its end with the frame's whole budget, leaving none for
+			// the rows on screen.
+			let text = long_line(3 << 20);
+			let fixture = Fixture::new(&text, WrapIndexLimits::default());
+			let whole = fixture.whole();
+			let anchor = ViewportAnchor {
+				line: DocLine::ZERO,
+				row_offset: DisplayRow::new(1),
+			};
+			let expected = placed(&whole.collect_visible_rows(anchor, 10));
+			for frame in 0..3 {
+				let rows = fixture.indexed().collect_visible_rows(anchor, 10);
+				assert_eq!(placed(&rows), expected, "frame {frame}");
+				let left = fixture.index.borrow().budget_left();
+				assert!(
+					left > WrapIndexLimits::default().read_budget / 2,
+					"frame {frame} spent {} bytes on ten rows",
+					WrapIndexLimits::default().read_budget - left
+				);
+				assert!(
+					!fixture.take_demand().more,
+					"frame {frame} asks for nothing more"
+				);
+			}
+			let fed = fixture
+				.index
+				.borrow()
+				.fed_bytes(DocLine::ZERO, WIDTH)
+				.expect("the line is indexed");
+			assert!(fed < 64 * 1024, "scanned {fed} bytes for the first rows");
 		}
 
 		#[test]

@@ -553,16 +553,18 @@ impl LineWrap {
 			+ replay
 	}
 
-	/// Advance the frontier, spending at most `budget` bytes from the frame's
-	/// remainder.
+	/// Advance the frontier until `reached` holds, spending at most `budget`
+	/// bytes from the frame's remainder (ADR 0011): a lookup scans only as far
+	/// as its target, not to the line's end.
 	fn advance(
 		&mut self,
 		source: &dyn LineSource,
 		limits: &WrapIndexLimits,
 		budget: &mut usize,
+		reached: &dyn Fn(&Self) -> bool,
 	) -> Option<NodeId> {
 		let mut rows = Vec::new();
-		while self.total_rows.is_none() && *budget > 0 {
+		while self.total_rows.is_none() && *budget > 0 && !reached(self) {
 			match step(source, self.frontier.fed(), (*budget).min(FEED_STEP)) {
 				Step::Pending(node) => return Some(node),
 				Step::End => self.finish_frontier(&mut rows),
@@ -953,6 +955,14 @@ impl WrapIndex {
 		granted
 	}
 
+	/// Give back bytes held with [`Self::reserve_read`] and not read.
+	pub(crate) fn release_read(&mut self, unused: usize) {
+		self.frame_budget = self
+			.frame_budget
+			.saturating_add(unused)
+			.min(self.limits.read_budget);
+	}
+
 	#[cfg(test)]
 	pub(crate) fn budget_left(&self) -> usize {
 		self.frame_budget
@@ -974,7 +984,9 @@ impl WrapIndex {
 		let entry = Self::entry(&mut self.lines, &mut self.valid_for, &limits, key, line);
 		let mut pending = None;
 		if row >= entry.frontier_rows && entry.total_rows.is_none() {
-			pending = entry.advance(source, &limits, &mut budget);
+			pending = entry.advance(source, &limits, &mut budget, &|entry| {
+				entry.frontier_rows > row
+			});
 		}
 		let lookup = match entry.total_rows {
 			Some(rows) if row >= rows => RowLookup::PastEnd { rows },
@@ -1023,7 +1035,9 @@ impl WrapIndex {
 			entry.total_rows.is_none() && entry.frontier.scanned().col.get() <= col
 		};
 		let lookup = if beyond_frontier(entry) {
-			match entry.advance(source, &limits, &mut budget) {
+			match entry.advance(source, &limits, &mut budget, &|entry| {
+				!beyond_frontier(entry)
+			}) {
 				Some(node) => ColLookup::Unknown {
 					pending: Some(node),
 				},
@@ -1104,7 +1118,9 @@ impl WrapIndex {
 			entry.total_rows.is_none() && target.ahead_of(entry.frontier.scanned())
 		};
 		let lookup = if beyond_frontier(entry) {
-			match entry.advance(source, &limits, &mut budget) {
+			match entry.advance(source, &limits, &mut budget, &|entry| {
+				!beyond_frontier(entry)
+			}) {
 				Some(node) => CellLookup::Unknown {
 					pending: Some(node),
 				},
@@ -1203,7 +1219,22 @@ impl WrapIndex {
 		lookup
 	}
 
-	/// How many wrapped rows `line` has, as far as it is scanned.
+	/// What is known of `line`'s rows, without scanning it (ADR 0011): exact
+	/// once its end has been scanned, else the rows scanned so far.
+	pub(crate) fn known_rows(&mut self, key: WrapKey, line: DocLine) -> RowCount {
+		let limits = self.limits;
+		let entry = Self::entry(&mut self.lines, &mut self.valid_for, &limits, key, line);
+		match entry.total_rows {
+			Some(rows) => RowCount::Exact(rows),
+			None => RowCount::AtLeast {
+				rows: entry.frontier_rows,
+				pending: None,
+			},
+		}
+	}
+
+	/// How many wrapped rows `line` has, scanning toward its end with this
+	/// frame's budget: for consumers that need the exact count.
 	pub(crate) fn row_count(
 		&mut self,
 		key: WrapKey,
@@ -1214,7 +1245,7 @@ impl WrapIndex {
 		let mut budget = self.frame_budget;
 		let entry = Self::entry(&mut self.lines, &mut self.valid_for, &limits, key, line);
 		let pending = if entry.total_rows.is_none() {
-			entry.advance(source, &limits, &mut budget)
+			entry.advance(source, &limits, &mut budget, &|_| false)
 		} else {
 			None
 		};
