@@ -4,6 +4,8 @@
 
 Accepted and implemented: a5c50bd7 (2026-10-16). The defect was proven by a deterministic test that fails on the unfixed parent 722a951b and passes on the fix.
 
+Decision item 5 (pairing by version identity, F-CTR-6) is implemented: plan eb18e398, impl 53ec94e5 (2026-10-17). Class-preserving compaction (F-CTR-5) remains open.
+
 ## Context
 
 A counter add replicates the ABSOLUTE new value, `current = read(key) + delta`, to its replicas and records it in the leader's finalization witness.

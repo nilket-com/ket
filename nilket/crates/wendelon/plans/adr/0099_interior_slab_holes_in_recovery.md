@@ -1,6 +1,6 @@
 # ADR 0099 - Interior slab holes in recovery
 
-Status: proposed 2026-09-06.
+Status: accepted and implemented 2026-09-07 (plan d429cf3c, impl 26dab80f).
 
 ## Context
 
