@@ -197,7 +197,7 @@ paid for.
    No-injection controls and forced rotation/compaction-retirement fixtures under concurrent
    COUNT(*) reads run on both. This replaces the nondeterministic soak trigger; the prior
    soak records remain historical evidence, and a boundary failure is a separate finding.
-   See [the deterministic fixture plan](../impl/0542_acceptance8_deterministic.md).
+   See [the deterministic fixture plan](../impl/0542_write_path_progress_bounds.md#deterministic-acceptance-8-fixture-plan).
 9. Standard Wendelon, Toron, architecture, format and full `--no-fail-fast` gates pass.
 
 ## Guardrails
