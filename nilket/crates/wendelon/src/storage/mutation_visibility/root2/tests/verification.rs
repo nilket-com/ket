@@ -67,6 +67,7 @@ fn tuple_for(record: BootstrapRecord2) -> PinnedBoundTuple2 {
 	let pin = admin_manifest_digest2(bytes.as_slice().try_into().unwrap());
 	let snapshot = encode_snapshot2(&LogState2 {
 		roots: vec![RootEntry2 {
+			terminal: None,
 			identity: RootIdentity2 {
 				generation: manifest.generation,
 				cluster: manifest.cluster,

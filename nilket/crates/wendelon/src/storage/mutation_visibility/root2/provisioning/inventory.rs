@@ -53,6 +53,9 @@ pub(in crate::storage::mutation_visibility::root2) enum EventBody2 {
 		observation: BootstrapObservation2,
 	},
 	Retire,
+	RetireTerminal {
+		terminal: super::terminal::TerminalRecord3,
+	},
 	Repair {
 		tail_sha256: Digest2,
 		original_len: u64,
@@ -82,6 +85,7 @@ pub(in crate::storage::mutation_visibility::root2) struct RootEntry2 {
 	pub state: RootState2,
 	pub last_seq: u64,
 	pub record: Option<BootstrapRecord2>,
+	pub terminal: Option<super::terminal::TerminalRecord3>,
 }
 redacted_debug!(RootEntry2, "RootEntry2");
 #[derive(Clone)]
@@ -143,6 +147,9 @@ pub(in crate::storage::mutation_visibility::root2) fn encode_event2(
 	event: &Event2,
 ) -> Result<[u8; EVENT_BYTES2], LogError2> {
 	let bad = |r| corrupt(event.seq, r);
+	if matches!(event.body, EventBody2::RetireTerminal { .. }) {
+		return Err(bad(CorruptReason2::ProfileUnsupported));
+	}
 	if matches!(
 		&event.body,
 		EventBody2::Reserve {
@@ -164,7 +171,7 @@ pub(in crate::storage::mutation_visibility::root2) fn encode_event2(
 		EventBody2::Reserve { .. } => RESERVE,
 		EventBody2::Approve { .. } => APPROVE,
 		EventBody2::Conflict { .. } => CONFLICT,
-		EventBody2::Retire => RETIRE,
+		EventBody2::Retire | EventBody2::RetireTerminal { .. } => RETIRE,
 		EventBody2::Repair { .. } => REPAIR,
 	};
 	b[10] = op;
@@ -193,6 +200,7 @@ pub(in crate::storage::mutation_visibility::root2) fn encode_event2(
 				.map_err(|_| bad(CorruptReason2::Payload))?,
 		),
 		EventBody2::Retire => {}
+		EventBody2::RetireTerminal { .. } => return Err(bad(CorruptReason2::ProfileUnsupported)),
 		EventBody2::Repair {
 			tail_sha256,
 			original_len,
@@ -416,6 +424,7 @@ fn apply(
 				state: RootState2::Prepared,
 				last_seq: e.seq,
 				record: None,
+				terminal: None,
 			},
 		);
 		state.last_seq = e.seq;
@@ -463,6 +472,33 @@ fn apply(
 				return Err(bad(CorruptReason2::Binding));
 			}
 			root.state = RootState2::Conflicted;
+		}
+		EventBody2::RetireTerminal { terminal } => {
+			use super::terminal::{TerminalObservation3, encode_terminal3, observation_digest3};
+			if root.manifest.profile() != ManifestProfile2::Three
+				|| root.state != RootState2::Bound
+				|| terminal.inventory_seq != e.seq
+				|| encode_terminal3(terminal).is_err()
+			{
+				return Err(bad(CorruptReason2::Transition));
+			}
+			let record = root.record.ok_or_else(|| bad(CorruptReason2::Binding))?;
+			let observation = TerminalObservation3 {
+				identity: record.identity,
+				original_admin_key: root.identity.admin_key,
+				at: terminal.at,
+				fingerprint: terminal.fingerprint,
+				command_digest: terminal.command_digest,
+				state_digest: terminal.state_digest,
+			};
+			if observation_digest3(&observation).map_err(|_| bad(CorruptReason2::Binding))?
+				!= terminal.observation_digest
+			{
+				return Err(bad(CorruptReason2::Binding));
+			}
+			root.state = RootState2::Retired;
+			root.record = None;
+			root.terminal = Some(*terminal);
 		}
 		EventBody2::Retire => {
 			if root.state == RootState2::Retired {

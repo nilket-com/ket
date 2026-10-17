@@ -41,6 +41,7 @@ pub(in crate::storage::mutation_visibility::root2) enum OwnerRequest2 {
 	},
 	Retire {
 		identity: RootIdentity2,
+		terminal: Option<super::terminal::TerminalObservation3>,
 	},
 }
 redacted_debug!(OwnerRequest2, "OwnerRequest2");
@@ -73,6 +74,10 @@ pub(in crate::storage::mutation_visibility::root2) struct EventRef2 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum OwnerError2 {
 	ProfileUnsupported,
+	CommittedRetirementRequired,
+	RetirementMismatch,
+	RetirementField(super::super::admin::record::BootstrapField2),
+	NotBound,
 	Log(LogError2),
 	Codec,
 	BadConfirmation,
@@ -205,7 +210,7 @@ pub(in crate::storage::mutation_visibility::root2) fn request_key2(
 				observation: observation.identity,
 			})
 		}
-		OwnerRequest2::Retire { identity } => {
+		OwnerRequest2::Retire { identity, .. } => {
 			if !nonzero(identity) {
 				return Err(OwnerError2::Codec);
 			}
@@ -243,7 +248,9 @@ pub(in crate::storage::mutation_visibility::root2) fn event_request_key2(
 				observation: observation.identity,
 			},
 		)),
-		EventBody2::Retire => Some((EventOp2::Retire, RequestKey2::Retire { identity })),
+		EventBody2::Retire | EventBody2::RetireTerminal { .. } => {
+			Some((EventOp2::Retire, RequestKey2::Retire { identity }))
+		}
 		EventBody2::Repair { .. } => None,
 	}
 }
@@ -276,6 +283,15 @@ pub(in crate::storage::mutation_visibility::root2) fn decide2(
 	decide(log, op_id, req).unwrap_or_else(Decision2::Refuse)
 }
 fn decide(log: &[u8], op_id: &OpId2, req: &OwnerRequest2) -> Result<Decision2, OwnerError2> {
+	if matches!(
+		req,
+		OwnerRequest2::Retire {
+			terminal: Some(_),
+			..
+		}
+	) {
+		return Err(OwnerError2::ProfileUnsupported);
+	}
 	if matches!(
 		req,
 		OwnerRequest2::Reserve {
@@ -388,7 +404,7 @@ fn decide(log: &[u8], op_id: &OpId2, req: &OwnerRequest2) -> Result<Decision2, O
 				}
 			}
 		}
-		(OwnerRequest2::Retire { identity }, _) => {
+		(OwnerRequest2::Retire { identity, .. }, _) => {
 			let root = find_root(&state, identity)?;
 			if root.state == RootState2::Retired {
 				return Ok(Decision2::NoOp(RootState2::Retired));

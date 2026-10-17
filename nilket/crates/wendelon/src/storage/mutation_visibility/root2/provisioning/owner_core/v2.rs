@@ -57,6 +57,16 @@ fn decide(log: &[u8], op_id: &OpId2, req: &OwnerRequest2) -> Result<Decision2, O
 			.iter()
 			.find(|r| r.identity == identity)
 			.ok_or(OwnerError2::Inconsistent)?;
+		if let OwnerRequest2::Retire { terminal, .. } = req {
+			if root.manifest.profile()
+				== super::super::super::admin::manifest::ManifestProfile2::Three
+			{
+				return retired_retry(root, terminal.as_ref());
+			}
+			if terminal.is_some() {
+				return Err(OwnerError2::ProfileUnsupported);
+			}
+		}
 		return Ok(Decision2::Retry {
 			original: EventRef2 { op, seq: event.seq },
 			current: root.state,
@@ -141,13 +151,41 @@ fn decide(log: &[u8], op_id: &OpId2, req: &OwnerRequest2) -> Result<Decision2, O
 				}
 			}
 		}
-		(OwnerRequest2::Retire { identity }, _) => {
+		(OwnerRequest2::Retire { identity, terminal }, _) => {
 			let root = find_root(&state, identity)?;
-			if root.state == RootState2::Retired {
-				return Ok(Decision2::NoOp(RootState2::Retired));
+			if root.manifest.profile()
+				== super::super::super::admin::manifest::ManifestProfile2::Three
+			{
+				if root.state == RootState2::Retired {
+					return retired_retry(root, terminal.as_ref());
+				}
+				let o = terminal
+					.as_ref()
+					.ok_or(OwnerError2::CommittedRetirementRequired)?;
+				if root.state != RootState2::Bound {
+					return Err(OwnerError2::NotBound);
+				}
+				let record = root.record.ok_or(OwnerError2::Inconsistent)?;
+				if let Some(field) = record.identity.first_mismatch(&o.identity) {
+					return Err(OwnerError2::RetirementField(field));
+				}
+				if o.original_admin_key != root.identity.admin_key {
+					return Err(OwnerError2::RetirementMismatch);
+				}
+				ordinary()?;
+				let terminal = super::super::terminal::terminal_record3(o, next)
+					.map_err(|_| OwnerError2::Codec)?;
+				(*identity, EventBody2::RetireTerminal { terminal })
+			} else {
+				if terminal.is_some() {
+					return Err(OwnerError2::ProfileUnsupported);
+				}
+				if root.state == RootState2::Retired {
+					return Ok(Decision2::NoOp(RootState2::Retired));
+				}
+				ordinary()?;
+				(*identity, EventBody2::Retire)
 			}
-			ordinary()?;
-			(*identity, EventBody2::Retire)
 		}
 		_ => return Err(OwnerError2::Inconsistent),
 	};
@@ -459,4 +497,24 @@ pub(in crate::storage::mutation_visibility::root2) fn classify2(
 			count: many.len() as u32,
 		},
 	}
+}
+
+fn retired_retry(
+	root: &RootEntry2,
+	observation: Option<&super::super::terminal::TerminalObservation3>,
+) -> Result<Decision2, OwnerError2> {
+	let Some(o) = observation else {
+		return Err(if root.terminal.is_some() {
+			OwnerError2::RetirementMismatch
+		} else {
+			OwnerError2::CommittedRetirementRequired
+		});
+	};
+	let terminal = root.terminal.ok_or(OwnerError2::RetirementMismatch)?;
+	let digest = super::super::terminal::observation_digest3(o)
+		.map_err(|_| OwnerError2::RetirementMismatch)?;
+	if digest != terminal.observation_digest {
+		return Err(OwnerError2::RetirementMismatch);
+	}
+	Ok(Decision2::NoOp(RootState2::Retired))
 }

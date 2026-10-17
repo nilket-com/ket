@@ -409,3 +409,5 @@ fn retired_ordinary_release_has_no_retirement_test_symbols() {
 	assert!(manifest.contains("#[cfg(test)]"));
 	assert!(include_str!("mod.rs").contains("mod retirement;"));
 }
+
+mod owner_binding;

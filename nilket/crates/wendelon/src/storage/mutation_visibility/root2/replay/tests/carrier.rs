@@ -130,6 +130,7 @@ fn real_context() -> (PinnedBoundTuple2, Deployment2, Vec<E>, Vec<Fixture>) {
 	let seq = record.inventory_seq;
 	let data = encode_snapshot2(&LogState2 {
 		roots: vec![RootEntry2 {
+			terminal: None,
 			identity: RootIdentity2 {
 				generation: m.generation,
 				cluster: m.cluster,

@@ -62,6 +62,9 @@ pub(in crate::storage::mutation_visibility::root2) enum InstallField2 {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum ObserveError2 {
+	ProfileUnsupported,
+	NotRetired,
+	InvalidState,
 	PrerequisiteUnavailable,
 	ControlLength,
 	Codec(BootstrapRecordError2),
@@ -341,4 +344,39 @@ pub(in crate::storage::mutation_visibility::root2) fn confirm_terminal2(
 	}
 	super::validation::validate_state(s).map_err(|_| InstallError2::EpochState)?;
 	Ok(())
+}
+
+/// Plain observation, not an authorization token or a claim of owner recording.
+pub(in crate::storage::mutation_visibility::root2) type RetirementObservation3 =
+	super::provisioning::terminal::TerminalObservation3;
+pub(in crate::storage::mutation_visibility::root2) fn observe_retirement3(
+	state: &MutationAuthorityState2,
+) -> Result<RetirementObservation3, ObserveError2> {
+	let Some((root, _)) = root_and_origin2(state) else {
+		return Err(ObserveError2::PrerequisiteUnavailable);
+	};
+	let s = &root.state;
+	if s.control_len != ADMIN_MANIFEST_P3_BYTES3 as u64 {
+		return Err(ObserveError2::ProfileUnsupported);
+	}
+	let retired = s
+		.role_epochs
+		.as_ref()
+		.and_then(|e| e.retired.as_ref())
+		.ok_or(ObserveError2::NotRetired)?;
+	super::validation::validate_state(s).map_err(|_| ObserveError2::InvalidState)?;
+	let original = s
+		.role_epochs
+		.as_ref()
+		.ok_or(ObserveError2::InvalidState)?
+		.original[0];
+	Ok(RetirementObservation3 {
+		identity: observe_bootstrap2(state)?.identity,
+		original_admin_key: original,
+		at: retired.at,
+		fingerprint: retired.fingerprint,
+		command_digest: retired.digest,
+		state_digest: super::retirement::terminal_state_digest3(root)
+			.map_err(|_| ObserveError2::InvalidState)?,
+	})
 }

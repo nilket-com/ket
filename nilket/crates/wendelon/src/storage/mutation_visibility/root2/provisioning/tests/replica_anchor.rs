@@ -57,6 +57,7 @@ fn one_root(
 	let last_seq = record.map_or(1, |r| r.inventory_seq);
 	let bytes = encode_snapshot2(&LogState2 {
 		roots: vec![RootEntry2 {
+			terminal: None,
 			identity,
 			manifest: AnyAdminManifest2::One(manifest),
 			state,

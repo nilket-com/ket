@@ -17,7 +17,7 @@ pub(in crate::storage::mutation_visibility::root2::provisioning) fn encode_event
 		EventBody2::Reserve { .. } => RESERVE,
 		EventBody2::Approve { .. } => APPROVE,
 		EventBody2::Conflict { .. } => CONFLICT,
-		EventBody2::Retire => RETIRE,
+		EventBody2::Retire | EventBody2::RetireTerminal { .. } => RETIRE,
 		EventBody2::Repair { .. } => REPAIR,
 	};
 	b[12..20].copy_from_slice(&e.seq.to_le_bytes());
@@ -43,6 +43,11 @@ pub(in crate::storage::mutation_visibility::root2::provisioning) fn encode_event
 			.map_err(|_| bad(CorruptReason2::Payload))?
 			.to_vec(),
 		EventBody2::Retire => Vec::new(),
+		EventBody2::RetireTerminal { terminal } => {
+			super::super::terminal::encode_terminal3(terminal)
+				.map_err(|_| bad(CorruptReason2::Payload))?
+				.to_vec()
+		}
 		EventBody2::Repair {
 			tail_sha256,
 			original_len,
@@ -119,7 +124,7 @@ pub(in crate::storage::mutation_visibility::root2::provisioning) fn decode_event
 	let valid = match op {
 		RESERVE => matches!(n, 137 | 189 | 241),
 		APPROVE | CONFLICT => n == 208,
-		RETIRE => n == 0,
+		RETIRE => matches!(n, 0 | 156),
 		REPAIR => n == 52,
 		_ => false,
 	};
@@ -138,7 +143,11 @@ pub(in crate::storage::mutation_visibility::root2::provisioning) fn decode_event
 			observation: BootstrapObservation2::decode(p)
 				.map_err(|_| bad(CorruptReason2::Payload))?,
 		},
-		RETIRE => EventBody2::Retire,
+		RETIRE if n == 0 => EventBody2::Retire,
+		RETIRE => EventBody2::RetireTerminal {
+			terminal: super::super::terminal::decode_terminal3(p)
+				.map_err(|_| bad(CorruptReason2::Payload))?,
+		},
 		_ => {
 			let original_len = u64_at(p, 32);
 			let boundary = u64_at(p, 40);

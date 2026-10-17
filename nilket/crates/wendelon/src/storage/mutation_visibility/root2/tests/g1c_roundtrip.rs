@@ -320,6 +320,7 @@ fn retirement_and_pins() {
 		.apply(
 			&op(3),
 			&OwnerRequest2::Retire {
+				terminal: None,
 				identity: m1_identity(),
 			},
 		)

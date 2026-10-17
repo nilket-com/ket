@@ -139,6 +139,7 @@ pub(in crate::storage::mutation_visibility::root2) enum OwnerIoError2 {
 	ExportExists,
 	ExportNoSuchRoot,
 	ExportNotBound(RootState2),
+	ExportNotTerminal(RootState2),
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) struct OpOutcome2 {
@@ -170,6 +171,14 @@ pub(in crate::storage::mutation_visibility::root2) struct TupleExport2 {
 	pub profile: ManifestProfile2,
 }
 redacted_debug!(TupleExport2, "TupleExport2");
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::storage::mutation_visibility::root2) struct TerminalExport3 {
+	pub manifest_pin: Digest2,
+	pub inventory_pin: Digest2,
+	pub terminal_pin: Digest2,
+	pub export_seq: u64,
+}
+redacted_debug!(TerminalExport3, "TerminalExport3");
 pub(in crate::storage::mutation_visibility::root2) struct OwnerDir2 {
 	path: PathBuf,
 	dir: File,
@@ -451,6 +460,74 @@ impl OwnerDir2 {
 			&snapshot,
 			&snapshot_steps(),
 		)?;
+		Ok(result)
+	}
+
+	/// Publish a retired profile-3 manifest followed by its terminal descriptor.
+	/// The snapshot pin describes the same folded state; publication is not atomic.
+	pub(in crate::storage::mutation_visibility::root2) fn export_terminal(
+		&mut self,
+		out_dir: &Path,
+		manifest_name: &str,
+		terminal_name: &str,
+		identity: &super::inventory::RootIdentity2,
+	) -> Owned<TerminalExport3> {
+		self.check_framing()?;
+		self.blocked()?;
+		if !export_name_ok(manifest_name)
+			|| !export_name_ok(terminal_name)
+			|| manifest_name == terminal_name
+		{
+			return Err(OwnerIoError2::BadExportName);
+		}
+		let (out, out_handle) = self.export_dir(out_dir)?;
+		let view = self.clean_view()?;
+		self.resync(view.log.is_some(), &[])?;
+		let state = self
+			.format
+			.fold(view.bytes())
+			.map_err(|_| OwnerIoError2::RepairVerifyFailed)?;
+		let root = state
+			.roots
+			.iter()
+			.find(|r| r.identity == *identity)
+			.ok_or(OwnerIoError2::ExportNoSuchRoot)?;
+		if root.state != RootState2::Retired || root.manifest.profile() != ManifestProfile2::Three {
+			return Err(OwnerIoError2::ExportNotTerminal(root.state));
+		}
+		let terminal = root
+			.terminal
+			.ok_or(OwnerIoError2::ExportNotTerminal(root.state))?;
+		let failed = |_| OwnerIoError2::Decision(OwnerError2::Codec);
+		let manifest = root
+			.manifest
+			.encode()
+			.map_err(|_| OwnerIoError2::Decision(OwnerError2::Codec))?;
+		let snapshot =
+			encode_snapshot2(&state).map_err(|_| OwnerIoError2::Decision(OwnerError2::Codec))?;
+		let inventory_pin = sha(&snapshot);
+		let bytes =
+			super::terminal::encode_terminal_artifact3(&super::terminal::TerminalArtifact3 {
+				identity: root.identity,
+				terminal,
+				inventory_pin,
+				export_seq: state.last_seq,
+			})
+			.map_err(failed)?;
+		let result = TerminalExport3 {
+			manifest_pin: root.identity.pin,
+			inventory_pin,
+			terminal_pin: sha(&bytes),
+			export_seq: state.last_seq,
+		};
+		self.publish(
+			&out_handle,
+			&out,
+			manifest_name,
+			manifest.as_slice(),
+			&manifest_steps(),
+		)?;
+		self.publish(&out_handle, &out, terminal_name, &bytes, &snapshot_steps())?;
 		Ok(result)
 	}
 

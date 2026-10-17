@@ -217,6 +217,7 @@ pub(in crate::storage::mutation_visibility::root2) fn tuple_for(
 	let pin = profile_two_binding::exact_pin(manifest);
 	let snapshot = encode_snapshot2(&LogState2 {
 		roots: vec![RootEntry2 {
+			terminal: None,
 			identity: RootIdentity2 {
 				generation: a.generation,
 				cluster: a.cluster,

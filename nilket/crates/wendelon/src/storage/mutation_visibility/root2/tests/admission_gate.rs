@@ -96,6 +96,7 @@ fn tuple_for(manifest_bytes: &[u8], record: BootstrapRecord2) -> PinnedBoundTupl
 	);
 	let snapshot = encode_snapshot2(&LogState2 {
 		roots: vec![RootEntry2 {
+			terminal: None,
 			identity: RootIdentity2 {
 				generation: manifest.generation,
 				cluster: manifest.cluster,

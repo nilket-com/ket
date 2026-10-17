@@ -1271,7 +1271,8 @@ fn provisioning_reader_has_two_documented_unsafe_blocks_and_no_trust_access() {
 			"owner_log",
 			"replica_anchor",
 			"replica_read",
-			"snapshot"
+			"snapshot",
+			"terminal"
 		]
 	);
 	let text = fs::read_to_string(root.join("provisioning/anchored.rs")).unwrap();
@@ -1430,12 +1431,24 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 		}
 		None
 	}
+	// Scoped negative controls: terminal codecs retain the original token bans.
+	for token in ["Root2", "File", "TrustedTerminal3"] {
+		assert!(
+			banned(
+				format!("fn forbidden() -> {token} {{ todo!() }}")
+					.parse()
+					.unwrap()
+			)
+			.is_some()
+		);
+	}
 	let mut entrypoints = Vec::new();
 	for name in [
 		"inventory.rs",
 		"snapshot.rs",
 		"owner_core.rs",
 		"replica_anchor.rs",
+		"terminal.rs",
 	] {
 		let text = fs::read_to_string(root.join(name)).unwrap();
 		assert_eq!(
@@ -1586,17 +1599,24 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 			"decode_event2",
 			"decode_evidence2",
 			"decode_snapshot2",
+			"decode_terminal3",
 			"encode_event2",
 			"encode_evidence2",
 			"encode_snapshot2",
+			"encode_terminal3",
+			"encode_terminal_artifact3",
+			"encode_terminal_observation3",
 			"event_request_key2",
 			"evidence_name2",
 			"expected_repair_event2",
 			"fold_events2",
+			"observation_digest3",
 			"op_id2",
+			"read_terminal3",
 			"repair_context2",
 			"repair_op_id2",
 			"request_key2",
+			"terminal_record3",
 			"tuple_entry_last_seq2",
 			"tuple_export_seq2",
 			"tuple_inventory_pin2",
@@ -1773,6 +1793,7 @@ fn provisioning_owner_log_is_std_only_with_nine_methods() {
 			"clear_sync_failure",
 			"create_v2",
 			"export",
+			"export_terminal",
 			"export_tuple",
 			"inspect",
 			"open",
@@ -1875,6 +1896,7 @@ fn admin_install_is_a_pure_derivation() {
 			"confirm_terminal2",
 			"install_admin2",
 			"observe_bootstrap2",
+			"observe_retirement3",
 			"original_roles3"
 		]
 	);
@@ -4615,9 +4637,20 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 				"any_manifest_digest2",
 			],
 		),
-		("provisioning/owner_core/v2.rs", &["any_manifest_digest2"]),
+		(
+			"provisioning/owner_core/v2.rs",
+			&["any_manifest_digest2", "ManifestProfile2"],
+		),
 		("provisioning/format.rs", &[]),
 		("provisioning/snapshot.rs", &["ManifestProfile2"]),
+		(
+			"provisioning/terminal.rs",
+			&[
+				"AnyAdminManifest2",
+				"ManifestProfile2",
+				"any_manifest_digest2",
+			],
+		),
 		("provisioning/owner_log.rs", &["ManifestProfile2"]),
 		("provisioning/owner_log/ops.rs", &[]),
 		("provisioning/owner_log/directory.rs", &[]),

@@ -91,7 +91,14 @@ fn decisions_reproduce_the_independent_golden_events() {
 		Decision2::Append(event("conflict"))
 	);
 	assert_eq!(
-		decide2(&events(4), &op(5), &OwnerRequest2::Retire { identity: id1 }),
+		decide2(
+			&events(4),
+			&op(5),
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: id1
+			}
+		),
 		Decision2::Append(event("retire"))
 	);
 }
@@ -120,7 +127,14 @@ fn retries_are_recognised_from_the_log_alone() {
 		retry(EventOp2::Conflict, 4, RootState2::Conflicted)
 	);
 	assert_eq!(
-		decide2(&log, &op(5), &OwnerRequest2::Retire { identity: id1 }),
+		decide2(
+			&log,
+			&op(5),
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: id1
+			}
+		),
 		retry(EventOp2::Retire, 5, RootState2::Retired)
 	);
 	let reused = |seq| Decision2::Refuse(OwnerError2::OpIdReused { seq });
@@ -129,16 +143,37 @@ fn retries_are_recognised_from_the_log_alone() {
 		reused(4)
 	);
 	assert_eq!(
-		decide2(&log, &op(5), &OwnerRequest2::Retire { identity: id2 }),
+		decide2(
+			&log,
+			&op(5),
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: id2
+			}
+		),
 		reused(5)
 	);
 	assert_eq!(
-		decide2(&log, &op(2), &OwnerRequest2::Retire { identity: id1 }),
+		decide2(
+			&log,
+			&op(2),
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: id1
+			}
+		),
 		reused(2)
 	);
 	// The golden Repair event's op id is never a request's.
 	assert_eq!(
-		decide2(&log, &op(6), &OwnerRequest2::Retire { identity: id2 }),
+		decide2(
+			&log,
+			&op(6),
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: id2
+			}
+		),
 		reused(6)
 	);
 	// A bad confirmation is refused before the lookup, even for a recorded op id.
@@ -180,7 +215,14 @@ fn state_rows_no_ops_and_refusals() {
 		refuse(OwnerError2::BadConfirmation)
 	);
 	assert_eq!(
-		decide2(&log, &fresh, &OwnerRequest2::Retire { identity: id1 }),
+		decide2(
+			&log,
+			&fresh,
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: id1
+			}
+		),
 		Decision2::NoOp(RootState2::Retired)
 	);
 	for id in [id1, id2] {
@@ -212,20 +254,41 @@ fn state_rows_no_ops_and_refusals() {
 	let mut mismatch = id1;
 	mismatch.pin[0] ^= 1;
 	assert_eq!(
-		decide2(&log, &fresh, &OwnerRequest2::Retire { identity: mismatch }),
+		decide2(
+			&log,
+			&fresh,
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: mismatch
+			}
+		),
 		refuse(OwnerError2::IdentityMismatch)
 	);
 	let mut unknown = id1;
 	unknown.generation = [0x3d; 16];
 	assert_eq!(
-		decide2(&log, &fresh, &OwnerRequest2::Retire { identity: unknown }),
+		decide2(
+			&log,
+			&fresh,
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: unknown
+			}
+		),
 		refuse(OwnerError2::NoSuchRoot)
 	);
 	// Only a clean log is decided on.
 	let mut torn = events(1);
 	torn.extend([0xab; 10]);
 	assert!(matches!(
-		decide2(&torn, &fresh, &OwnerRequest2::Retire { identity: id1 }),
+		decide2(
+			&torn,
+			&fresh,
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: id1
+			}
+		),
 		Decision2::Refuse(OwnerError2::Log(LogError2::Ambiguous { .. }))
 	));
 	assert!(op_id2([0; 16]).is_none());
@@ -266,7 +329,14 @@ fn invalid_typed_requests_are_refused_before_any_state() {
 		codec
 	);
 	assert_eq!(
-		decide2(&log, &op(0x41), &OwnerRequest2::Retire { identity: zero }),
+		decide2(
+			&log,
+			&op(0x41),
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: zero
+			}
+		),
 		codec
 	);
 	let mut o = approved_observation();
@@ -294,11 +364,25 @@ fn caps_refuse_appends_but_not_retries_or_no_ops() {
 		}
 	);
 	assert_eq!(
-		decide2(&log, &op(0x42), &OwnerRequest2::Retire { identity: id1 }),
+		decide2(
+			&log,
+			&op(0x42),
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: id1
+			}
+		),
 		Decision2::NoOp(RootState2::Retired)
 	);
 	assert_eq!(
-		decide2(&log, &op(0x42), &OwnerRequest2::Retire { identity: id2 }),
+		decide2(
+			&log,
+			&op(0x42),
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: id2
+			}
+		),
 		full
 	);
 	// A Bound root at the same cap: the identical approval is still a no-op; Retire is LogFull.
@@ -312,7 +396,14 @@ fn caps_refuse_appends_but_not_retries_or_no_ops() {
 		Decision2::NoOp(RootState2::Bound)
 	);
 	assert_eq!(
-		decide2(&bound, &op(0x44), &OwnerRequest2::Retire { identity: id1 }),
+		decide2(
+			&bound,
+			&op(0x44),
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: id1
+			}
+		),
 		full
 	);
 	let mut m = manifest_of("reserve_second");

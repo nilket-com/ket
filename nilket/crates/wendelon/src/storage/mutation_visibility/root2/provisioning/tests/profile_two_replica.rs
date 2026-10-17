@@ -66,6 +66,7 @@ fn entry(name: &str, tag_as: AnyAdminManifest2, bound: bool, seq: u64) -> RootEn
 	let id = identity_of(name);
 	let epoch = any(name).admission().initial_epoch;
 	RootEntry2 {
+		terminal: None,
 		identity: id,
 		manifest: tag_as,
 		state: if bound {

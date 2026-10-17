@@ -14,6 +14,7 @@ const VERSION: u16 = 1;
 /// Canonical iff at least one entry is tagged profile 2; version 1 carries no tag.
 const VERSION_TWO: u16 = 2;
 const VERSION_THREE: u16 = 3;
+const VERSION_FOUR: u16 = 4;
 const HEADER: usize = 22;
 const ENTRY: usize = 320;
 const TRAILER: usize = 32;
@@ -26,6 +27,7 @@ pub(in crate::storage::mutation_visibility::root2) struct SnapshotEntry2 {
 	pub state: RootState2,
 	pub last_seq: u64,
 	pub record: Option<BootstrapRecord2>,
+	pub terminal: Option<super::terminal::TerminalRecord3>,
 }
 redacted_debug!(SnapshotEntry2, "SnapshotEntry2");
 #[derive(Clone, PartialEq, Eq)]
@@ -99,6 +101,16 @@ fn validate(s: &InventorySnapshot2) -> Result<(), SnapshotError2> {
 			(RootState2::Bound, None) | (_, Some(_)) => return Err(SnapshotError2::Record),
 			(_, None) => {}
 		}
+		if let Some(t) = &e.terminal {
+			if e.profile != ManifestProfile2::Three
+				|| e.state != RootState2::Retired
+				|| e.record.is_some()
+				|| t.inventory_seq != e.last_seq
+			{
+				return Err(SnapshotError2::Binding);
+			}
+			super::terminal::encode_terminal3(t).map_err(|_| SnapshotError2::Record)?;
+		}
 		if i > 0 {
 			let p = &s.entries[i - 1].identity;
 			if (p.generation, p.cluster) >= (id.generation, id.cluster) {
@@ -123,7 +135,9 @@ fn validate(s: &InventorySnapshot2) -> Result<(), SnapshotError2> {
 fn encode(s: &InventorySnapshot2) -> Result<Vec<u8>, SnapshotError2> {
 	validate(s)?;
 	let len = HEADER + s.entries.len() * ENTRY + TRAILER;
-	let version = if s
+	let version = if s.entries.iter().any(|e| e.terminal.is_some()) {
+		VERSION_FOUR
+	} else if s
 		.entries
 		.iter()
 		.any(|e| e.profile == ManifestProfile2::Three)
@@ -154,6 +168,11 @@ fn encode(s: &InventorySnapshot2) -> Result<Vec<u8>, SnapshotError2> {
 		});
 		b.extend([0u8; 6]);
 		b.extend(e.last_seq.to_le_bytes());
+		if let Some(t) = &e.terminal {
+			b.extend(super::terminal::encode_terminal3(t).map_err(|_| SnapshotError2::Record)?);
+			b.extend([0u8; 52]);
+			continue;
+		}
 		match &e.record {
 			Some(r) => b.extend(r.encode().map_err(|_| SnapshotError2::Record)?),
 			None => b.extend([0u8; BOOTSTRAP_RECORD_BYTES2]),
@@ -182,6 +201,7 @@ pub(in crate::storage::mutation_visibility::root2) fn encode_snapshot2(
 				state: r.state,
 				last_seq: r.last_seq,
 				record: r.record,
+				terminal: r.terminal,
 			})
 			.collect(),
 	})
@@ -197,7 +217,11 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_snapshot2(
 		return Err(SnapshotError2::Magic);
 	}
 	let version = u16::from_le_bytes(array(bytes, 8));
-	if version != VERSION && version != VERSION_TWO && version != VERSION_THREE {
+	if version != VERSION
+		&& version != VERSION_TWO
+		&& version != VERSION_THREE
+		&& version != VERSION_FOUR
+	{
 		return Err(SnapshotError2::Version);
 	}
 	let count = u32::from_le_bytes(array(bytes, 10)) as usize;
@@ -230,7 +254,7 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_snapshot2(
 			let tag = match e[97] {
 				1 => ManifestProfile2::One,
 				2 => ManifestProfile2::Two,
-				3 if version == VERSION_THREE => ManifestProfile2::Three,
+				3 if version >= VERSION_THREE => ManifestProfile2::Three,
 				_ => return Err(SnapshotError2::ProfileTag),
 			};
 			if e[98..104].iter().any(|&x| x != 0) {
@@ -247,7 +271,21 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_snapshot2(
 		};
 		let last_seq = u64::from_le_bytes(array(e, 104));
 		let raw = &e[112..112 + BOOTSTRAP_RECORD_BYTES2];
-		let record = if raw.iter().all(|&x| x == 0) {
+		let terminal = if version == VERSION_FOUR
+			&& state == RootState2::Retired
+			&& raw.iter().any(|&x| x != 0)
+		{
+			if raw[156..].iter().any(|&x| x != 0) {
+				return Err(SnapshotError2::Reserved);
+			}
+			Some(
+				super::terminal::decode_terminal3(&raw[..156])
+					.map_err(|_| SnapshotError2::Record)?,
+			)
+		} else {
+			None
+		};
+		let record = if terminal.is_some() || raw.iter().all(|&x| x == 0) {
 			None
 		} else {
 			Some(BootstrapRecord2::decode(raw).map_err(|_| SnapshotError2::Record)?)
@@ -258,6 +296,7 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_snapshot2(
 			state,
 			last_seq,
 			record,
+			terminal,
 		});
 	}
 	let s = InventorySnapshot2 {

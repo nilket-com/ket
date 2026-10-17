@@ -210,7 +210,13 @@ fn appends_write_the_golden_log_and_report_outcomes() {
 		Ok(at(EventOp2::Conflict, 4, RootState2::Conflicted))
 	);
 	assert_eq!(
-		o.apply(&op(5), &OwnerRequest2::Retire { identity: id1 }),
+		o.apply(
+			&op(5),
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: id1
+			}
+		),
 		Ok(at(EventOp2::Retire, 5, RootState2::Retired))
 	);
 	assert_eq!(
@@ -227,7 +233,13 @@ fn appends_write_the_golden_log_and_report_outcomes() {
 		assert!(in_order(&seam::seen(), &[LogSync, OwnerDirSync]));
 	}
 	assert_eq!(
-		o.apply(&op(0x40), &OwnerRequest2::Retire { identity: id1 }),
+		o.apply(
+			&op(0x40),
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: id1
+			}
+		),
 		Ok(OpOutcome2 {
 			original: None,
 			current: RootState2::Retired
@@ -844,6 +856,7 @@ fn repair_uses_the_reserved_slots_and_refuses_when_they_are_exhausted() {
 		o.apply(
 			&op(9),
 			&OwnerRequest2::Retire {
+				terminal: None,
 				identity: id_of("reserve_second")
 			}
 		),
@@ -863,6 +876,7 @@ fn repair_uses_the_reserved_slots_and_refuses_when_they_are_exhausted() {
 		o.apply(
 			&op(9),
 			&OwnerRequest2::Retire {
+				terminal: None,
 				identity: id_of("reserve_second")
 			}
 		),
