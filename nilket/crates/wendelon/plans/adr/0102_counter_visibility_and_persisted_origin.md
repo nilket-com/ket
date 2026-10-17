@@ -35,6 +35,28 @@ The witness, not the marker, is the leader's durable commitment. Using it as the
 
 ## Consequences
 
-- **F-CTR-5 is open.** Compaction previously rewrote counter records as plain records; now it refuses them. Class-preserving compaction is later work.
+- **F-CTR-5 remains unimplemented.** The earlier one-source maintenance paths still refuse counter rewrites until F-CTR-5a lands. The B1 census and F-CTR-7 reproduction show that multi-source LSM also needs its own pre-output fail-closed guard; see the amendment below.
 - Migration and tiered handling of counters are refused, not supported. Mixed-version clusters are unsupported. Residual F-CTR-1b, unknown origins on equal-value ties, applies to legacy data only.
 - The eligible-version cell is memory-only, rebuilt at reopen from markers and witnesses, and pruned to the winner plus outstanding reservations.
+
+## Amendment — F-CTR-5a class-preserving compaction plan (2026-10-17)
+
+**Status:** planned; implementation source is not changed by this amendment. The existing maintenance refusal remains in effect until the separately reviewed implementation lands.
+
+### Decision
+
+F-CTR-5a will preserve counter record classes at the three selected one-source rewrite paths: sealed-slab compaction, reclustering, and the shared retention/reclaim rewrite path. The rewrite must preserve each counter frame's class, exact payload, tenant/key/HLC/origin identity, and durability semantics. It must not reinterpret V2 pairing by slab-local offset across slabs. For a tentative and its marker that are both in the rewritten slab, the implementation must validate and apply a bounded old-to-new tentative-offset mapping to the marker; absent, conflicting, or ambiguous mappings fail closed. Legacy class-1/2 bytes remain read-only and retain their existing per-slab pairing behavior. Counter frames must prevent a replacement from being discarded merely because all ordinary rows were elided; output manifest/index accounting must represent counter-bearing replacements without fabricating ordinary rows. This work does not add counter pruning, physical erasure, migration, tiering, or mixed-version support; counter debt remains for the later 5b decision.
+
+The class-aware source walk must be bounded and non-mutating. It must validate record header, class, length/checksum, and V2 payload before creating any replacement. It must not call `recover_slab` as an enumeration shortcut because recovery can mutate anomalous bytes. A scan/admission failure leaves source bytes and publication state unchanged.
+
+### F-CTR-7 and multi-source LSM guard
+
+The B1 source census identified a reachable, pre-existing LSM class-loss path. A focused reproduction on clean base `89219e7d` committed a V2 value of 42, sealed its slab, ran one L0→L1 compaction, and read the value live before and after compaction. Reopening returned typed `Unsupported`, not an incorrect value. The test-only patch and raw attempts are retained at `/home/me/work/reviews/adr0102-f-ctr-7-repro-1`.
+
+LSM plans can touch multiple input and overlap slabs and do not enumerate unindexed commit markers. They remain outside the one-source preservation/remap scope. Before LSM output creation, any plan whose touched slabs contain counter frames must return a typed retryable fail-closed refusal, with no output publication or source/manifest mutation. The source regression test will use the same committed-counter/rotation/compaction fixture: the unfixed base accepts and rewrites the LSM job then reopens as `Unsupported`; the fixed implementation refuses before rewriting and still reopens the committed value. No blanket claim that every existing compaction path is one-source is permitted.
+
+### Required implementation tests and gates
+
+The F-CTR-5a source package must cover (a) ordinary-only rewrite compatibility, (b) class-preserving V2 tentative/marker rewrite, (c) valid same-slab offset remap and a disabled-remap negative, (d) cross-slab identity pairing without offset dependence, (e) same-slab offset conflict and orphan-marker fail-closed behavior with bytes unchanged, (f) legacy and malformed/undecodable frames refused without rewrite, (g) counter-only and all-ordinary-elided replacement publication/accounting, and (h) the F-CTR-7 multi-source LSM guard before any output is created. Tests must also pin duplicate marker idempotence, orphan tentative behavior, live eligible reads, and the complete recovered committed/value-bound map after reopen.
+
+The plan commit is docs-only. Run the Wendelon architecture and mutation-visibility architecture tests against that commit before fast-forward. Implementation remains gated on a separately reviewed source package, focused regression suite, changed-area development validation, and the reviewed ladder/external audit sequence.
