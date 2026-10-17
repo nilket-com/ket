@@ -189,8 +189,15 @@ paid for.
    an outcome by id *without* re-submitting the mutation. Retention reclaim is exercised, and a
    replay of a reclaimed id is rejected as expired rather than applied afresh.
 7. Repeated caller expiries do not accumulate unbounded detached server work.
-8. The soak's insert-batch boundary reproduces before the change and completes after it, under
-   concurrent sampler-rate load.
+8. A deterministic post-append durability hold reproduces the pre-change unbounded batch
+   wait at an explicit harness cutoff (reported as cutoff/ambiguous, not silent success),
+   and after the change a transient hold commits the exact batch while a persistent hold
+   returns the typed stop cause and independently asserted commit-knowledge class.
+   The same test-only seam and inputs run at the pinned parent and implementation.
+   No-injection controls and forced rotation/compaction-retirement fixtures under concurrent
+   COUNT(*) reads run on both. This replaces the nondeterministic soak trigger; the prior
+   soak records remain historical evidence, and a boundary failure is a separate finding.
+   See [the deterministic fixture plan](../impl/0542_acceptance8_deterministic.md).
 9. Standard Wendelon, Toron, architecture, format and full `--no-fail-fast` gates pass.
 
 ## Guardrails
