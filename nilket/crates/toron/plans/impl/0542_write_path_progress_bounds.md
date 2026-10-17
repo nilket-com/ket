@@ -152,7 +152,7 @@ change is disclosed for gate selection. No runtime deployment or soak is granted
 
 Commit subjects:
 - plan: adr 0542 deterministic acceptance 8
-- test: adr 0542 deterministic acceptance 8
+- impl: adr 0542 deterministic acceptance 8
 
 After executed acceptance and publication, update the ADR status in the later
 status-closure pass. Until then item 8 remains unresolved. F-CTR-5a follows this

@@ -2,9 +2,10 @@
 
 ## Status
 
-Accepted and partially implemented (2026-10-16).
-- Profile 3, key epochs and freeze are on main: d9f3c8b5 (C-S4a), 722a951b (C-S4b1), and 524db8a2 (C-S4b2, freeze).
-- Retirement (C-S3a/b) is selected and in progress.
+Accepted; code complete (2026-10-17).
+- Profile 3, key epochs and freeze: d9f3c8b5 (C-S4a), 722a951b (C-S4b1), 524db8a2 (C-S4b2).
+- Committed retirement: 6388e2f6 (C-S3a); owner binding and terminal export: c059c3fb (C-S3b).
+- Open, and required before real data: the compromise-audit tool and runbooks including M2 (C-S6), M2 handover (C-S5), and key custody.
 
 The operator chose the recovery-role model (M1 option a) on 2026-10-15, and decided the same day that Unfreeze requires two roles.
 

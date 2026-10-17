@@ -1,5 +1,7 @@
 # ADR 542 - write-path progress bounds and attributable write expiry
 
+Status: accepted and implemented (impl 0987e0f5). Acceptance 8 was discharged on 2026-10-17 by the deterministic fixture: plan 1a36aa29, slug fix 11d6a2c3, impl e3c3dfdd.
+
 The ADR 0539 confirmation soak recorded silent insert-batch failures at roughly the same row
 boundary that made reads fail. ADR 0541 ruled those a separate write-path finding and
 deliberately did not absorb them, because one collapsed symptom had already misattributed two
