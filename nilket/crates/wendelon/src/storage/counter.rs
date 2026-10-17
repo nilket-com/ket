@@ -356,6 +356,15 @@ pub trait CounterSlab {
 	/// Latest indexed version for the counter key.
 	fn counter_lookup(&self, tenant_id: TenantId, key_identity: Identity)
 	-> Option<RecordLocation>;
+	/// A standalone slab has no manager-wide join to resolve leftover markers.
+	/// Manager-backed stores resolve these during recovery and use the default.
+	fn counter_recovery_error(
+		&self,
+		_tenant_id: TenantId,
+		_key_identity: Identity,
+	) -> Option<std::io::Error> {
+		None
+	}
 	/// Read a counter value frame and parse its little-endian `u64`.
 	fn counter_read_value(
 		&self,
@@ -434,6 +443,9 @@ impl CounterSlab for LocalSlabStore {
 				&frame,
 			)
 			.await?;
+		// Keep the LocalSlabStore test adapter's prepare semantics aligned with
+		// SlabManager: an acknowledged tentative has crossed its durability edge.
+		self.wait_durable_commit().await?;
 		self.index_location(tenant_id, key_identity, location);
 		Ok(location)
 	}
@@ -471,6 +483,23 @@ impl CounterSlab for LocalSlabStore {
 		key_identity: Identity,
 	) -> Option<RecordLocation> {
 		self.lookup(tenant_id, key_identity)
+	}
+	fn counter_recovery_error(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+	) -> Option<std::io::Error> {
+		if let Some((_, _, error)) = self
+			.recovered_counter_errors
+			.iter()
+			.find(|(tenant, key, _)| *tenant == tenant_id && *key == key_identity)
+		{
+			return Some(error.io());
+		}
+		self.recovered_counter_markers_v2
+			.iter()
+			.any(|marker| marker.tenant_id == tenant_id && marker.key_identity == key_identity)
+			.then(|| CounterVisibilityError::Conflict.io())
 	}
 	async fn counter_read_value(&self, location: RecordLocation) -> std::io::Result<u64> {
 		parse_counter_value(&self.read(location).await?)
@@ -548,6 +577,9 @@ impl<S: CounterSlab> SlabCounterStore<S> {
 	/// Latest **committed** counter value for `key`, or `None` if absent.
 	pub async fn read_committed(&self, key: &CounterKey) -> std::io::Result<Option<u64>> {
 		let identity = counter_identity(key);
+		if let Some(error) = self.slab.counter_recovery_error(self.tenant_id, identity) {
+			return Err(error);
+		}
 		let Some(location) = self.slab.counter_lookup(self.tenant_id, identity) else {
 			return Ok(None);
 		};
@@ -923,8 +955,21 @@ impl CounterReplicaService {
 		let gate = self.op_locks.entry(key).or_default().clone();
 		let _guard = gate.lock().await;
 		let Some(pending) = self.pending.get(&key).map(|entry| *entry.value()) else {
+			let commit_hlc = HybridTimestamp {
+				physical_ms: op_id,
+				logical: 0,
+				node_id: 0,
+			};
+			let committed = self
+				.marked
+				.committed_identity(&(tenant_id, expected_key), commit_hlc, origin)
+				.map_err(CounterVisibilityError::io)?;
 			self.reclaim_gate2(key, &gate);
-			return Ok(());
+			return if committed.is_some() {
+				Ok(())
+			} else {
+				Err(CounterVisibilityError::TentativeMissing.io())
+			};
 		};
 		if pending.tenant_id != tenant_id || pending.key_identity != expected_key {
 			return Err(CounterReplicaRejection::TentativeConflict.into_error());
@@ -1722,6 +1767,11 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 		}
 	}
 
+	#[cfg(test)]
+	pub(crate) fn set_next_op_id_for_test(&self, next: u64) {
+		self.op_seq.store(next, Ordering::Relaxed);
+	}
+
 	/// Open a leader and LOAD its durable state (restart path): the applied D4
 	/// dedup log and the pending witnesses — BOTH feed the idempotency map, so a
 	/// duplicate retry after restart replays instead of re-adding (a pending
@@ -2446,11 +2496,18 @@ mod slab_store_tests {
 	}
 
 	async fn open_store(path: &Path) -> Arc<LocalSlabStore> {
+		open_store_with_ops(path, Arc::new(BlockingFileOps)).await
+	}
+
+	async fn open_store_with_ops(
+		path: &Path,
+		file_ops: Arc<dyn crate::storage::AsyncFileOps>,
+	) -> Arc<LocalSlabStore> {
 		Arc::new(
 			LocalSlabStore::open(
 				path,
 				SlabId::ZERO,
-				Arc::new(BlockingFileOps),
+				file_ops,
 				GroupCommitConfig {
 					floor: Duration::ZERO,
 					ceiling: Duration::ZERO,
@@ -2460,6 +2517,59 @@ mod slab_store_tests {
 			.await
 			.unwrap(),
 		)
+	}
+
+	#[tokio::test]
+	async fn ctr6_failed_prepare_sync_leaves_no_index_pending_or_recovered_value() {
+		use crate::storage::{FaultAction, FaultOp, FaultyFileOps, InjectedFault};
+		for replica_arm in [false, true] {
+			let dir = slab_dir();
+			let path = dir.join("slab_0000000000000000.wnd");
+			let ops = Arc::new(FaultyFileOps::new(&dir).unwrap());
+			let store = open_store_with_ops(&path, ops.clone()).await;
+			let tenant = TenantId::new(7);
+			let origin = NodeId {
+				id: if replica_arm { 21 } else { 20 },
+				_reserved: 0,
+			};
+			let key = ckey(if replica_arm {
+				b"ctr6-replica-sync"
+			} else {
+				b"ctr6-local-sync"
+			});
+			let identity = counter_identity(&key);
+			ops.inject(InjectedFault::on(
+				FaultOp::Fdatasync,
+				FaultAction::Error {
+					kind: std::io::ErrorKind::Other,
+					message: "CTR-6 injected tentative fdatasync failure".into(),
+				},
+			));
+			if replica_arm {
+				let replica =
+					CounterReplica::new(SlabCounterStore::new(store.clone(), tenant, origin));
+				assert!(
+					replica
+						.replicate_tentative(901, &key, 42, h(901))
+						.await
+						.is_err()
+				);
+				assert_eq!(
+					replica.pending_count(),
+					0,
+					"failed prepare created pending state"
+				);
+			} else {
+				let local = SlabCounterStore::new(store.clone(), tenant, origin);
+				assert!(local.tentative_append(&key, 42, h(902)).await.is_err());
+			}
+			assert_eq!(store.counter_lookup(tenant, identity), None);
+			drop(store);
+			ops.crash().unwrap();
+			let reopened = open_store_with_ops(&path, ops).await;
+			assert_eq!(reopened.counter_lookup(tenant, identity), None);
+			assert!(reopened.recovered_counter_tentatives_v2.is_empty());
+		}
 	}
 
 	fn tenant() -> TenantId {
@@ -3075,6 +3185,9 @@ mod leader_tests {
 		fn arm_commit_failure(&self) {
 			self.replica.arm_commit_marker_failure();
 		}
+		fn lose_pending_for_test(&self, op_id: u64) {
+			self.replica.pending.remove(&op_id);
+		}
 	}
 
 	impl CounterParticipant for TestParticipant {
@@ -3560,6 +3673,46 @@ mod leader_tests {
 				"reconciled value is durable on every accepted participant (5, not lost, not doubled)"
 			);
 		}
+	}
+
+	#[tokio::test]
+	async fn ctr6_redrive_reprepares_lost_replica_pending_before_commit_and_keeps_witness() {
+		let dir = slab_dir();
+		let wdir = dir.join("witnesses");
+		let (ps, paths) = participants(&dir, 2).await;
+		let store = DurableCounterWitnessStore::open(&wdir).unwrap();
+		let leader = LeaderHarness::new(ps, 2, true, store);
+		let key = ckey(b"ctr6-redrive");
+		leader.arm_participant_commit_failure(1);
+		let applied = leader.fetch_add(wk(1), &key, 5).await.unwrap();
+		assert_eq!(applied.outcome().current, 5);
+		assert_eq!(leader.pending_witnesses(), 1);
+		assert_eq!(
+			DurableCounterWitnessStore::open(&wdir)
+				.unwrap()
+				.load_all()
+				.unwrap()
+				.len(),
+			1,
+			"the accepted but uncommitted participant keeps the witness"
+		);
+
+		// Model loss of the replica's volatile pending entry while its tentative
+		// bytes remain. The re-drive must restore the matching prepare first.
+		leader.participants[1].1.lose_pending_for_test(1);
+		leader.reconcile().await;
+		assert_eq!(leader.pending_witnesses(), 0);
+		for path in &paths {
+			assert_eq!(read_after_restart(path, &key).await, Some(5));
+		}
+		assert!(
+			DurableCounterWitnessStore::open(&wdir)
+				.unwrap()
+				.load_all()
+				.unwrap()
+				.is_empty(),
+			"the witness is pruned only after the re-prepared replica commits"
+		);
 	}
 
 	// ADR 076 D3 discriminator: pending witnesses re-drive the recorded peer

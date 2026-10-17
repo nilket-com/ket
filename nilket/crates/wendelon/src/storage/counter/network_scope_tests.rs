@@ -138,7 +138,7 @@ async fn b1d_dispatch_context_then_phase_then_zero_missing_mismatch_order() {
 		.await
 		.unwrap()
 		.status,
-		CounterReplicaStatus::OK
+		CounterReplicaStatus::INTERNAL_ERROR,
 	);
 	assert_eq!(node.slab.local_l1_bytes().await, before);
 	let mut rollback = CounterRollbackRequestMeta {

@@ -2899,6 +2899,553 @@ async fn counter_commit_marker_survives_restart_into_manager_index() {
 	assert_eq!(store.read_committed(&k).await.unwrap(), Some(5));
 }
 
+// ADR 0102: V2 marker/tentative pairing is by persisted version identity across
+// slabs, not by an offset that can be reused after rotation.
+#[tokio::test]
+async fn ctr6_v2_recovery_pairs_across_rotation_and_ignores_same_offset_decoy() {
+	let (dir, manager) = fresh_manager().await;
+	let key = id(6_102);
+	let origin = NodeId {
+		id: 43,
+		_reserved: 0,
+	};
+	let decoy_origin = NodeId {
+		id: 44,
+		_reserved: 0,
+	};
+	let tentative = manager
+		.counter_append_tentative(tenant(), key, hlc(41), 42, origin)
+		.await
+		.unwrap();
+	manager.force_seal_active_for_test().await;
+	let decoy = manager
+		.counter_append_tentative(tenant(), key, hlc(99), 99, decoy_origin)
+		.await
+		.unwrap();
+	assert_eq!(
+		decoy.offset, tentative.offset,
+		"fixture must reuse the slab offset"
+	);
+	manager
+		.counter_append_commit_marker(tenant(), key, hlc(41), tentative.offset, origin)
+		.await
+		.unwrap();
+	manager.fsync_all_local_slabs().await.unwrap();
+	drop(manager);
+
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert_eq!(
+		reopened
+			.counter_eligible_cells()
+			.read(&(tenant(), key))
+			.unwrap()
+			.unwrap()
+			.value,
+		42,
+		"the marker must recover its exact version across rotation"
+	);
+	let recovered = reopened.key_index.get(&(tenant(), key)).unwrap().clone();
+	assert_eq!(
+		recovered.len(),
+		1,
+		"the unmarked decoy must remain unindexed"
+	);
+	assert_eq!(recovered[0], tentative);
+	assert_ne!(recovered[0].slab_id, decoy.slab_id);
+}
+
+#[tokio::test]
+async fn ctr6_v2_orphan_marker_fails_closed_and_duplicate_marker_is_idempotent() {
+	for duplicate in [false, true] {
+		let (dir, manager) = fresh_manager().await;
+		let key = id(if duplicate { 6_104 } else { 6_103 });
+		let origin = NodeId {
+			id: 45,
+			_reserved: 0,
+		};
+		if duplicate {
+			let tentative = manager
+				.counter_append_tentative(tenant(), key, hlc(50), 51, origin)
+				.await
+				.unwrap();
+			for _ in 0..2 {
+				manager
+					.counter_append_commit_marker(tenant(), key, hlc(50), tentative.offset, origin)
+					.await
+					.unwrap();
+			}
+		} else {
+			manager
+				.counter_append_commit_marker(tenant(), key, hlc(50), 1234, origin)
+				.await
+				.unwrap();
+		}
+		manager.fsync_all_local_slabs().await.unwrap();
+		drop(manager);
+		let reopened = open_manager_at_dir(
+			dir.to_path_buf(),
+			spawn_io_thread(64).unwrap(),
+			test_crypto(),
+		)
+		.await;
+		let result = reopened.counter_eligible_cells().read(&(tenant(), key));
+		if duplicate {
+			assert_eq!(result.unwrap().unwrap().value, 51);
+		} else {
+			assert!(result.is_err(), "orphan marker must refuse its key");
+		}
+	}
+}
+
+#[tokio::test]
+async fn ctr6_recovered_committed_identity_allows_redrive_and_rejects_value_conflict() {
+	let (dir, manager) = fresh_manager().await;
+	let key = id(6_105);
+	let origin = NodeId {
+		id: 46,
+		_reserved: 0,
+	};
+	let commit_hlc = HybridTimestamp {
+		physical_ms: 71,
+		logical: 0,
+		node_id: 0,
+	};
+	let service = Arc::new(crate::storage::counter::CounterReplicaService::new(
+		manager.clone(),
+	));
+	service
+		.replicate_tentative(origin, 71, tenant(), key, 72, commit_hlc)
+		.await
+		.unwrap();
+	service.commit(origin, 71, tenant(), key).await.unwrap();
+	service.commit(origin, 71, tenant(), key).await.unwrap();
+	manager.fsync_all_local_slabs().await.unwrap();
+	drop(service);
+	drop(manager);
+
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let service = crate::storage::counter::CounterReplicaService::new(reopened);
+	service.commit(origin, 71, tenant(), key).await.unwrap();
+	let absent = service.commit(origin, 72, tenant(), key).await.unwrap_err();
+	assert_eq!(
+		absent.get_ref().and_then(
+			|source| source.downcast_ref::<crate::storage::counter::CounterVisibilityError>()
+		),
+		Some(&crate::storage::counter::CounterVisibilityError::TentativeMissing),
+		"a commit without a pending or recovered identity is a typed refusal"
+	);
+	let mismatch = service
+		.replicate_tentative(origin, 71, tenant(), key, 73, commit_hlc)
+		.await
+		.unwrap_err();
+	assert_eq!(
+		mismatch.get_ref().and_then(
+			|source| source.downcast_ref::<crate::storage::counter::CounterVisibilityError>()
+		),
+		Some(&crate::storage::counter::CounterVisibilityError::Conflict),
+		"the recovered identity is bound to its committed value"
+	);
+}
+
+#[tokio::test]
+async fn ctr6_recovery_keeps_older_committed_identity_after_supersession() {
+	let (dir, manager) = fresh_manager().await;
+	let key = id(6_106);
+	let origin = NodeId {
+		id: 47,
+		_reserved: 0,
+	};
+	let service = crate::storage::counter::CounterReplicaService::new(manager.clone());
+	for (op_id, value) in [(81, 82), (83, 84)] {
+		let stamp = HybridTimestamp {
+			physical_ms: op_id,
+			logical: 0,
+			node_id: 0,
+		};
+		service
+			.replicate_tentative(origin, op_id, tenant(), key, value, stamp)
+			.await
+			.unwrap();
+		service.commit(origin, op_id, tenant(), key).await.unwrap();
+	}
+	manager.fsync_all_local_slabs().await.unwrap();
+	drop(service);
+	drop(manager);
+
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let service = crate::storage::counter::CounterReplicaService::new(reopened);
+	assert_eq!(
+		service.read_committed(tenant(), key).await.unwrap(),
+		Some(84)
+	);
+	service.commit(origin, 81, tenant(), key).await.unwrap();
+}
+
+#[tokio::test]
+async fn ctr6_same_identity_with_different_tentative_values_refuses_key() {
+	let (dir, manager) = fresh_manager().await;
+	let key = id(6_107);
+	let origin = NodeId {
+		id: 48,
+		_reserved: 0,
+	};
+	let hlc = HybridTimestamp {
+		physical_ms: 85,
+		logical: 0,
+		node_id: 0,
+	};
+	let first = manager
+		.counter_append_tentative(tenant(), key, hlc, 86, origin)
+		.await
+		.unwrap();
+	manager
+		.counter_append_tentative(tenant(), key, hlc, 87, origin)
+		.await
+		.unwrap();
+	for _ in 0..2 {
+		manager
+			.counter_append_commit_marker(tenant(), key, hlc, first.offset, origin)
+			.await
+			.unwrap();
+	}
+	manager.fsync_all_local_slabs().await.unwrap();
+	drop(manager);
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert_eq!(
+		reopened.counter_eligible_cells().read(&(tenant(), key)),
+		Err(crate::storage::counter::CounterVisibilityError::Conflict)
+	);
+}
+
+#[tokio::test]
+async fn ctr6_same_slab_offset_mismatch_refuses_key() {
+	let (dir, manager) = fresh_manager().await;
+	let key = id(6_108);
+	let origin = NodeId {
+		id: 49,
+		_reserved: 0,
+	};
+	let hlc = HybridTimestamp {
+		physical_ms: 88,
+		logical: 0,
+		node_id: 0,
+	};
+	let tentative = manager
+		.counter_append_tentative(tenant(), key, hlc, 89, origin)
+		.await
+		.unwrap();
+	manager
+		.counter_append_commit_marker(tenant(), key, hlc, tentative.offset + 4096, origin)
+		.await
+		.unwrap();
+	manager.fsync_all_local_slabs().await.unwrap();
+	drop(manager);
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert_eq!(
+		reopened.counter_eligible_cells().read(&(tenant(), key)),
+		Err(crate::storage::counter::CounterVisibilityError::Conflict)
+	);
+}
+
+#[tokio::test]
+async fn ctr6_orphan_marker_recovery_does_not_rewrite_slab_bytes() {
+	let (dir, manager) = fresh_manager().await;
+	let key = id(6_109);
+	let origin = NodeId {
+		id: 50,
+		_reserved: 0,
+	};
+	manager
+		.counter_append_commit_marker(
+			tenant(),
+			key,
+			HybridTimestamp {
+				physical_ms: 90,
+				logical: 0,
+				node_id: 0,
+			},
+			1234,
+			origin,
+		)
+		.await
+		.unwrap();
+	manager.fsync_all_local_slabs().await.unwrap();
+	drop(manager);
+	let mut before = std::fs::read_dir(&*dir)
+		.unwrap()
+		.map(|entry| {
+			let path = entry.unwrap().path();
+			(
+				path.file_name().unwrap().to_owned(),
+				std::fs::read(path).unwrap(),
+			)
+		})
+		.filter(|(name, _)| name.to_string_lossy().ends_with(".wnd"))
+		.collect::<Vec<_>>();
+	before.sort_by(|a, b| a.0.cmp(&b.0));
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert!(
+		reopened
+			.counter_eligible_cells()
+			.read(&(tenant(), key))
+			.is_err(),
+		"an orphan marker must fail closed"
+	);
+	drop(reopened);
+	let mut after = std::fs::read_dir(&*dir)
+		.unwrap()
+		.map(|entry| {
+			let path = entry.unwrap().path();
+			(
+				path.file_name().unwrap().to_owned(),
+				std::fs::read(path).unwrap(),
+			)
+		})
+		.filter(|(name, _)| name.to_string_lossy().ends_with(".wnd"))
+		.collect::<Vec<_>>();
+	after.sort_by(|a, b| a.0.cmp(&b.0));
+	assert_eq!(
+		before, after,
+		"recovery must leave orphan marker bytes unchanged"
+	);
+}
+
+#[tokio::test]
+async fn ctr6_leader_local_marker_after_rotation_reopens_at_42() {
+	let (dir, manager) = fresh_manager().await;
+	let key = id(6_110);
+	let origin = NodeId {
+		id: 61,
+		_reserved: 0,
+	};
+	let commit_hlc = HybridTimestamp {
+		physical_ms: 42,
+		logical: 0,
+		node_id: 0,
+	};
+	let tentative = manager
+		.counter_append_tentative(tenant(), key, commit_hlc, 42, origin)
+		.await
+		.unwrap();
+	manager.force_seal_active_for_test().await;
+	manager
+		.counter_append_commit_marker(tenant(), key, commit_hlc, tentative.offset, origin)
+		.await
+		.unwrap();
+	manager.fsync_all_local_slabs().await.unwrap();
+	drop(manager);
+
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert_eq!(
+		reopened
+			.counter_eligible_cells()
+			.read(&(tenant(), key))
+			.unwrap()
+			.unwrap()
+			.value,
+		42,
+		"leader-local marked value must survive a marker written after slab rotation"
+	);
+}
+
+#[tokio::test]
+async fn ctr6_leader_add_after_straddled_reopen_uses_42_as_base_and_commits_43() {
+	let (dir, manager) = fresh_manager().await;
+	let counter_key = crate::storage::counter::CounterKey(b"ctr6-leader-base".to_vec());
+	let key = counter_identity(&counter_key);
+	let origin = NodeId {
+		id: 63,
+		_reserved: 0,
+	};
+	let commit_hlc = HybridTimestamp {
+		physical_ms: 42,
+		logical: 0,
+		node_id: 0,
+	};
+	let tentative = manager
+		.counter_append_tentative(tenant(), key, commit_hlc, 42, origin)
+		.await
+		.unwrap();
+	manager.force_seal_active_for_test().await;
+	manager
+		.counter_append_commit_marker(tenant(), key, commit_hlc, tentative.offset, origin)
+		.await
+		.unwrap();
+	manager.fsync_all_local_slabs().await.unwrap();
+	drop(manager);
+
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let service = Arc::new(crate::storage::counter::CounterReplicaService::new(
+		reopened.clone(),
+	));
+	let local = crate::storage::counter::LocalCounterParticipant::new(service, tenant(), origin);
+	let leader = crate::storage::counter::CounterLeader::new(
+		origin,
+		local.clone(),
+		true,
+		crate::storage::counter::DurableCounterWitnessStore::open(dir.join("counter-witness"))
+			.unwrap(),
+	);
+	// The version at HLC 42 represents the preceding committed op; align the
+	// freshly reconstructed leader's allocator with the next canonical op id.
+	leader.set_next_op_id_for_test(43);
+	let mut write_key = [0; 24];
+	write_key[..8].copy_from_slice(&43u64.to_le_bytes());
+	let result = leader
+		.fetch_add(
+			crate::storage::counter::CounterParticipantPlan::new(vec![(origin, local)], 1),
+			write_key,
+			&counter_key,
+			1,
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		result,
+		crate::storage::counter::CounterAddResult::Applied(
+			crate::storage::counter::CounterAddOutcome {
+				previous: 42,
+				current: 43,
+			}
+		),
+		"the first post-reopen leader add must base on the straddled value"
+	);
+	assert_eq!(
+		reopened
+			.counter_eligible_cells()
+			.read(&(tenant(), key))
+			.unwrap()
+			.unwrap()
+			.value,
+		43
+	);
+}
+
+#[tokio::test]
+async fn ctr6_recovery_is_independent_of_slab_enumeration_order() {
+	let (dir, manager) = fresh_manager().await;
+	let cross_key = id(6_111);
+	let local_key = id(6_112);
+	let origin = NodeId {
+		id: 62,
+		_reserved: 0,
+	};
+	let cross_hlc = HybridTimestamp {
+		physical_ms: 42,
+		logical: 0,
+		node_id: 0,
+	};
+	let cross_tentative = manager
+		.counter_append_tentative(tenant(), cross_key, cross_hlc, 42, origin)
+		.await
+		.unwrap();
+	manager.force_seal_active_for_test().await;
+	manager
+		.counter_append_commit_marker(
+			tenant(),
+			cross_key,
+			cross_hlc,
+			cross_tentative.offset,
+			origin,
+		)
+		.await
+		.unwrap();
+	let local_hlc = HybridTimestamp {
+		physical_ms: 43,
+		logical: 0,
+		node_id: 0,
+	};
+	let local_tentative = manager
+		.counter_append_tentative(tenant(), local_key, local_hlc, 43, origin)
+		.await
+		.unwrap();
+	manager
+		.counter_append_commit_marker(
+			tenant(),
+			local_key,
+			local_hlc,
+			local_tentative.offset,
+			origin,
+		)
+		.await
+		.unwrap();
+	manager.fsync_all_local_slabs().await.unwrap();
+	drop(manager);
+
+	let slab_dir = dir.to_path_buf();
+	let open_slab = |slab_id: SlabId| {
+		let path = slab_dir.join(format!("slab_{:016x}.wnd", slab_id.get()));
+		async move {
+			Arc::new(
+				crate::storage::LocalSlabStore::open(
+					path,
+					slab_id,
+					Arc::new(BlockingFileOps),
+					GroupCommitConfig::default(),
+				)
+				.await
+				.unwrap(),
+			)
+		}
+	};
+	let slab0 = open_slab(SlabId::ZERO).await;
+	let slab1 = open_slab(SlabId::new(1)).await;
+	let first_order = [slab0.clone(), slab1.clone()];
+	let reverse_order = [slab1, slab0];
+	let recover = |slabs: &[Arc<crate::storage::LocalSlabStore>]| {
+		SlabManager::recover_counter_eligible_from_slabs(slabs, &DashSet::new(), &DashMap::new())
+	};
+	let first = recover(&first_order);
+	let reverse = recover(&reverse_order);
+	for key in [cross_key, local_key] {
+		assert_eq!(
+			first.read(&(tenant(), key)).unwrap(),
+			reverse.read(&(tenant(), key)).unwrap(),
+			"eligible dump changed with slab enumeration order for {key:?}"
+		);
+	}
+}
+
 // Acceptance: manager rollback removes the live tentative index entry only
 // (no durable abort marker, no effect on prior committed state).
 #[tokio::test]

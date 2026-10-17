@@ -66,7 +66,7 @@ use arrow::array::{BooleanArray, FixedSizeBinaryArray, UInt64Array};
 use arrow::ipc::reader::StreamReader;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Cursor, Error, ErrorKind};
 use std::path::Path;
 use std::sync::Arc;
@@ -268,6 +268,10 @@ pub struct LocalSlabStore {
 	/// Counter eligibility observed only by local marker replay, before live tentative appends.
 	pub(crate) recovered_counter_versions:
 		Vec<(TenantId, Identity, super::counter::CounterVersion)>,
+	/// V2 counter tentatives are paired across the manager's complete local slab set.
+	pub(crate) recovered_counter_tentatives_v2: Vec<RecoveredCounterTentativeV2>,
+	/// V2 commit markers are paired across the manager's complete local slab set.
+	pub(crate) recovered_counter_markers_v2: Vec<RecoveredCounterMarkerV2>,
 	pub(crate) recovered_non_counter_keys: Vec<TenantKey>,
 	counter_records: std::sync::atomic::AtomicBool,
 	pub(crate) recovered_counter_errors:
@@ -300,6 +304,24 @@ pub struct LocalSlabStore {
 
 	#[cfg(test)]
 	fdatasync_calls: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecoveredCounterTentativeV2 {
+	pub tenant_id: TenantId,
+	pub key_identity: Identity,
+	pub location: RecordLocation,
+	pub value: u64,
+	pub origin: crate::schema::NodeId,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecoveredCounterMarkerV2 {
+	pub tenant_id: TenantId,
+	pub key_identity: Identity,
+	pub location: RecordLocation,
+	pub tentative_offset: u64,
+	pub origin: crate::schema::NodeId,
 }
 
 impl LocalSlabStore {
@@ -350,6 +372,8 @@ impl LocalSlabStore {
 			recovered_localities,
 			write_cursor,
 			recovered_counter_versions,
+			recovered_counter_tentatives_v2,
+			recovered_counter_markers_v2,
 			recovered_non_counter_keys,
 			recovered_counter_errors,
 			has_counter_records,
@@ -358,6 +382,8 @@ impl LocalSlabStore {
 		Ok(Self {
 			index,
 			recovered_counter_versions,
+			recovered_counter_tentatives_v2,
+			recovered_counter_markers_v2,
 			recovered_non_counter_keys,
 			recovered_counter_errors,
 			counter_records: std::sync::atomic::AtomicBool::new(has_counter_records),
@@ -983,6 +1009,8 @@ fn recover_slab(
 	DashMap<TenantKey, Locality>,
 	u64,
 	Vec<(TenantId, Identity, super::counter::CounterVersion)>,
+	Vec<RecoveredCounterTentativeV2>,
+	Vec<RecoveredCounterMarkerV2>,
 	Vec<TenantKey>,
 	Vec<(TenantId, Identity, super::counter::CounterVisibilityError)>,
 	bool,
@@ -1009,10 +1037,12 @@ fn recover_slab(
 		Option<crate::schema::NodeId>,
 	)> = Vec::new();
 	let mut recovered_counter_versions = Vec::new();
+	let mut recovered_counter_tentatives_v2 = Vec::new();
+	let mut recovered_counter_markers_v2 = Vec::new();
 	let mut recovered_non_counter_keys = Vec::new();
 	let mut committed_counter_ops: HashMap<
 		(TenantId, Identity, u64),
-		Vec<Option<crate::schema::NodeId>>,
+		Vec<(Option<crate::schema::NodeId>, HybridTimestamp)>,
 	> = HashMap::new();
 	let mut recovered_counter_errors = Vec::new();
 	let mut has_counter_records = false;
@@ -1155,7 +1185,7 @@ fn recover_slab(
 				committed_counter_ops
 					.entry((header.tenant_id, header.key_identity, op_id))
 					.or_default()
-					.push(None);
+					.push((None, header.hlc));
 			}
 			crate::schema::record_class::COUNTER_TENTATIVE_V2
 			| crate::schema::record_class::COUNTER_COMMIT_V2 => {
@@ -1164,19 +1194,22 @@ fn recover_slab(
 						if header.record_class
 							== crate::schema::record_class::COUNTER_TENTATIVE_V2 =>
 					{
-						counter_tentatives.push((
-							header.tenant_id,
-							header.key_identity,
-							base_location,
+						recovered_counter_tentatives_v2.push(RecoveredCounterTentativeV2 {
+							tenant_id: header.tenant_id,
+							key_identity: header.key_identity,
+							location: base_location,
 							value,
-							Some(origin),
-						));
+							origin,
+						});
 					}
-					Ok((offset, origin)) => {
-						committed_counter_ops
-							.entry((header.tenant_id, header.key_identity, offset))
-							.or_default()
-							.push(Some(origin));
+					Ok((tentative_offset, origin)) => {
+						recovered_counter_markers_v2.push(RecoveredCounterMarkerV2 {
+							tenant_id: header.tenant_id,
+							key_identity: header.key_identity,
+							location: base_location,
+							tentative_offset,
+							origin,
+						});
 					}
 					Err(_) => recovered_counter_errors.push((
 						header.tenant_id,
@@ -1223,14 +1256,189 @@ fn recover_slab(
 		}
 	}
 
-	// ADR 075 recovery rule: index a counter tentative only if a commit marker
-	// for its op-id (offset) was also recovered. Orphans are skipped — never
-	// resurrected. Later committed values supersede earlier ones by HLC.
+	// Legacy classes 1/2 retain their original per-slab offset pairing. Pair
+	// V2 frames locally first: an exact same-slab identity/offset pair is
+	// authoritative within that slab. Only unmatched frames participate in
+	// the manager's cross-slab identity join.
+	type VersionIdentity = (TenantId, Identity, u64, u32, u32, u32);
+	let version_identity =
+		|tenant: TenantId, key: Identity, hlc: HybridTimestamp, origin: crate::schema::NodeId| {
+			(
+				tenant,
+				key,
+				hlc.physical_ms,
+				hlc.logical,
+				hlc.node_id,
+				origin.id,
+			)
+		};
+	let mut tentatives_by_identity: HashMap<VersionIdentity, Vec<RecoveredCounterTentativeV2>> =
+		HashMap::new();
+	for tentative in recovered_counter_tentatives_v2.drain(..) {
+		tentatives_by_identity
+			.entry(version_identity(
+				tentative.tenant_id,
+				tentative.key_identity,
+				tentative.location.hlc,
+				tentative.origin,
+			))
+			.or_default()
+			.push(tentative);
+	}
+	let mut markers_by_identity: HashMap<VersionIdentity, Vec<RecoveredCounterMarkerV2>> =
+		HashMap::new();
+	for marker in recovered_counter_markers_v2.drain(..) {
+		markers_by_identity
+			.entry(version_identity(
+				marker.tenant_id,
+				marker.key_identity,
+				marker.location.hlc,
+				marker.origin,
+			))
+			.or_default()
+			.push(marker);
+	}
+	for (identity, local_markers) in markers_by_identity {
+		let Some(local_tentatives) = tentatives_by_identity.remove(&identity) else {
+			recovered_counter_markers_v2.extend(local_markers);
+			continue;
+		};
+		let mut paired_offsets = HashSet::new();
+		let mut locally_paired = Vec::new();
+		let mut offset_mismatch = false;
+		for marker in local_markers {
+			let Some(tentative) = local_tentatives
+				.iter()
+				.find(|tentative| tentative.location.offset == marker.tentative_offset)
+			else {
+				// An identity match inside this slab with a different offset is
+				// corruption, not a candidate for the cross-slab join.
+				offset_mismatch = true;
+				break;
+			};
+			paired_offsets.insert(tentative.location.offset);
+			locally_paired.push(*tentative);
+		}
+		let first_value = local_tentatives[0].value;
+		let values_match = local_tentatives
+			.iter()
+			.all(|tentative| tentative.value == first_value);
+		if offset_mismatch || !values_match {
+			let (tenant_id, key_identity, ..) = identity;
+			recovered_counter_errors.push((
+				tenant_id,
+				key_identity,
+				super::counter::CounterVisibilityError::Conflict,
+			));
+			continue;
+		}
+		for tentative in locally_paired {
+			recovered_counter_versions.push((
+				tentative.tenant_id,
+				tentative.key_identity,
+				super::counter::CounterVersion {
+					value: tentative.value,
+					hlc: tentative.location.hlc,
+					origin: Some(tentative.origin),
+				},
+			));
+			index
+				.entry((tentative.tenant_id, tentative.key_identity))
+				.and_modify(|versions| insert_version_sorted(versions, tentative.location))
+				.or_insert_with(|| vec![tentative.location]);
+			recovered_localities.insert(
+				(tentative.tenant_id, tentative.key_identity),
+				Locality::from(tentative.key_identity),
+			);
+		}
+		for tentative in local_tentatives {
+			if !paired_offsets.contains(&tentative.location.offset) {
+				recovered_counter_tentatives_v2.push(tentative);
+			}
+		}
+	}
+	for tentatives in tentatives_by_identity.into_values() {
+		recovered_counter_tentatives_v2.extend(tentatives);
+	}
+	// A legacy marker/value cannot satisfy a V2 frame's origin-bound identity,
+	// even when its slab offset or HLC happens to coincide. Refuse such mixed
+	// same-slab pairings instead of accidentally consuming either frame.
+	let mut conflicting_v2_tentatives = vec![false; recovered_counter_tentatives_v2.len()];
+	let mut conflicting_v2_markers = vec![false; recovered_counter_markers_v2.len()];
+	for (index, tentative) in recovered_counter_tentatives_v2.iter().enumerate() {
+		if committed_counter_ops
+			.get(&(
+				tentative.tenant_id,
+				tentative.key_identity,
+				tentative.location.offset,
+			))
+			.is_some_and(|markers| {
+				markers
+					.iter()
+					.any(|(_, hlc)| *hlc == tentative.location.hlc)
+			}) {
+			conflicting_v2_tentatives[index] = true;
+			recovered_counter_errors.push((
+				tentative.tenant_id,
+				tentative.key_identity,
+				super::counter::CounterVisibilityError::Conflict,
+			));
+		}
+	}
+	for (index, marker) in recovered_counter_markers_v2.iter().enumerate() {
+		if counter_tentatives
+			.iter()
+			.any(|(tenant, key, location, _, _)| {
+				*tenant == marker.tenant_id
+					&& *key == marker.key_identity
+					&& location.offset == marker.tentative_offset
+					&& location.hlc == marker.location.hlc
+			}) {
+			conflicting_v2_markers[index] = true;
+			recovered_counter_errors.push((
+				marker.tenant_id,
+				marker.key_identity,
+				super::counter::CounterVisibilityError::Conflict,
+			));
+		}
+	}
+	for (tentative_index, tentative) in recovered_counter_tentatives_v2.iter().enumerate() {
+		for (marker_index, marker) in recovered_counter_markers_v2.iter().enumerate() {
+			if tentative.tenant_id == marker.tenant_id
+				&& tentative.key_identity == marker.key_identity
+				&& tentative.location.hlc == marker.location.hlc
+				&& tentative.location.slab_id == marker.location.slab_id
+				&& tentative.location.offset == marker.tentative_offset
+				&& tentative.origin != marker.origin
+			{
+				conflicting_v2_tentatives[tentative_index] = true;
+				conflicting_v2_markers[marker_index] = true;
+				recovered_counter_errors.push((
+					tentative.tenant_id,
+					tentative.key_identity,
+					super::counter::CounterVisibilityError::Conflict,
+				));
+			}
+		}
+	}
+	recovered_counter_tentatives_v2 = std::mem::take(&mut recovered_counter_tentatives_v2)
+		.into_iter()
+		.enumerate()
+		.filter_map(|(index, tentative)| (!conflicting_v2_tentatives[index]).then_some(tentative))
+		.collect();
+	recovered_counter_markers_v2 = std::mem::take(&mut recovered_counter_markers_v2)
+		.into_iter()
+		.enumerate()
+		.filter_map(|(index, marker)| (!conflicting_v2_markers[index]).then_some(marker))
+		.collect();
 	for (tenant_id, key_identity, location, value, origin) in counter_tentatives {
 		if let Some(markers) =
 			committed_counter_ops.get(&(tenant_id, key_identity, location.offset))
 		{
-			if markers.iter().any(|marker_origin| *marker_origin != origin) {
+			if markers
+				.iter()
+				.any(|(marker_origin, _)| *marker_origin != origin)
+			{
 				recovered_counter_errors.push((
 					tenant_id,
 					key_identity,
@@ -1261,6 +1469,8 @@ fn recover_slab(
 		recovered_localities,
 		valid_end,
 		recovered_counter_versions,
+		recovered_counter_tentatives_v2,
+		recovered_counter_markers_v2,
 		recovered_non_counter_keys,
 		recovered_counter_errors,
 		has_counter_records,

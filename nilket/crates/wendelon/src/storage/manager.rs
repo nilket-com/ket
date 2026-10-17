@@ -906,8 +906,8 @@ impl SlabManager {
 	//  and no second generic append path exists.
 	// ============================================================
 
-	/// Append a tentative counter value to the active slab and index it live in
-	/// the authoritative `key_index`. The record class is fixed
+	/// Append a tentative counter value to the active slab, durably commit that
+	/// exact slab write, then index it live. The record class is fixed
 	/// `COUNTER_TENTATIVE`; recovery indexes it only if a matching commit marker
 	/// is found, so an un-committed tentative does not survive restart.
 	pub async fn counter_append_tentative(
@@ -930,6 +930,10 @@ impl SlabManager {
 				&frame,
 			)
 			.await?;
+		// The prepare acknowledgement must not outrun durability of this exact
+		// tentative slab. A failed barrier leaves no live index entry or pending
+		// replica state; the written frame remains an uncommitted recovery orphan.
+		slab.wait_durable_commit().await?;
 		self.index_appended_location(tenant_id, key_identity, location);
 		Ok(location)
 	}
@@ -1532,6 +1536,8 @@ impl SlabManager {
 				}
 			}
 		}
+		let counter_eligible =
+			Self::recover_counter_eligible(&active, &sealed, &counter_unsupported, &key_index);
 		remove_non_live_lsm_rows_from_index(&key_index, &recovered_lsm_runs);
 		let key_localities = build_key_localities(&key_index);
 		for (tenant_id, key_identity, locality) in recovered_key_localities {
@@ -1581,8 +1587,6 @@ impl SlabManager {
 				"no persistent index: maintenance receipts have nowhere to live",
 			),
 		};
-		let counter_eligible =
-			Self::recover_counter_eligible(&active, &sealed, &counter_unsupported);
 		let manager = Self {
 			finality_observation:
 				crate::storage::finality_observation::FinalityObservationRegistry::new(),
