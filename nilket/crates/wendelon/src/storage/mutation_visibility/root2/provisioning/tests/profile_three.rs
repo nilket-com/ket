@@ -467,3 +467,5 @@ fn deferred_nonregular_probe_never_allows_a_later_foreign_log_write() {
 	assert!(!s.at("snapshot").exists());
 	assert!(!s.at("manifest").exists());
 }
+
+mod terminal_binding;

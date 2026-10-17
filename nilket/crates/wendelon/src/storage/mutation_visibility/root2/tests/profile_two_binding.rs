@@ -122,6 +122,7 @@ pub(super) fn chain_of(bytes: &[u8], length: u64) -> Chain {
 	let a = any.admission();
 	let snapshot = encode_snapshot2(&LogState2 {
 		roots: vec![RootEntry2 {
+			terminal: None,
 			identity: RootIdentity2 {
 				generation: a.generation,
 				cluster: a.cluster,

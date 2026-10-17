@@ -10,6 +10,7 @@ pub mod owner_log;
 pub mod replica_anchor;
 pub mod replica_read;
 pub mod snapshot;
+pub mod terminal;
 
 #[cfg(test)]
 mod tests;

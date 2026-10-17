@@ -97,3 +97,18 @@ pub(super) fn consume(
 		},
 	))
 }
+
+/// Terminal state is independent of the replica's later covered tip.
+pub(super) fn terminal_state_digest3(root: &Root2) -> Result2<Digest2> {
+	let retired = root
+		.state
+		.role_epochs
+		.as_ref()
+		.and_then(|e| e.retired.as_ref())
+		.ok_or(RootError2::TrustMismatch)?;
+	let mut normalized = root.clone();
+	normalized.state.covered = retired.at;
+	normalized.state.fingerprint = retired.fingerprint;
+	normalized.state.command_digest = retired.digest;
+	Ok(hash(b"VISROOT2-TERMINAL-STATE3\0", &normalized.encode()?))
+}

@@ -97,6 +97,7 @@ fn tuple(record: BootstrapRecord2) -> (PinnedBoundTuple2, Vec<u8>) {
 	let manifest = AdminManifest2::decode(&m).unwrap();
 	let snapshot = encode_snapshot2(&LogState2 {
 		roots: vec![RootEntry2 {
+			terminal: None,
 			identity: RootIdentity2 {
 				generation: manifest.generation,
 				cluster: manifest.cluster,

@@ -231,7 +231,10 @@ fn retire(owner: &mut OwnerDir2, identity: RootIdentity2) {
 	let retired = owner
 		.apply(
 			&op_id2([3; 16]).unwrap(),
-			&OwnerRequest2::Retire { identity },
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity,
+			},
 		)
 		.unwrap();
 	assert_eq!(

@@ -132,7 +132,10 @@ fn owner_apply_and_export_over_mixed_log() {
 			outcome(EventOp2::Conflict, 6, RootState2::Conflicted),
 		),
 		(
-			OwnerRequest2::Retire { identity: a },
+			OwnerRequest2::Retire {
+				terminal: None,
+				identity: a,
+			},
 			outcome(EventOp2::Retire, 7, RootState2::Retired),
 		),
 	];
@@ -177,7 +180,13 @@ fn owner_apply_and_export_over_mixed_log() {
 	assert_eq!(pin, hash(b"", &bytes));
 	let b = decode_event2(&events[1]).unwrap().identity.unwrap();
 	assert_eq!(
-		o.apply(&op(9), &OwnerRequest2::Retire { identity: b }),
+		o.apply(
+			&op(9),
+			&OwnerRequest2::Retire {
+				terminal: None,
+				identity: b
+			}
+		),
 		Ok(outcome(EventOp2::Retire, 9, RootState2::Retired))
 	);
 	let log = fs::read(s.at("inventory.log")).unwrap();
