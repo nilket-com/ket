@@ -526,6 +526,16 @@ async fn ctr4_mixed_legacy_origin_records_pair_and_reopen() {
 			.await
 			.unwrap();
 	}
+	let standalone_orphan = CounterKey(b"standalone-orphan-marker".to_vec());
+	s.counter_commit_marker(
+		tenant(7),
+		counter_identity(&standalone_orphan),
+		hlc(4),
+		0,
+		node(3),
+	)
+	.await
+	.unwrap();
 	s.fsync().await.unwrap();
 	drop(s);
 	let s = local(&path).await;
@@ -553,6 +563,11 @@ async fn ctr4_mixed_legacy_origin_records_pair_and_reopen() {
 		s.recovered_counter_errors
 			.iter()
 			.all(|(_, _, e)| *e == CounterVisibilityError::Conflict)
+	);
+	let standalone = SlabCounterStore::new(s.clone(), tenant(7), node(3));
+	assert!(
+		standalone.read_committed(&standalone_orphan).await.is_err(),
+		"a standalone slab has no cross-slab join to resolve an orphan marker"
 	);
 }
 #[test]

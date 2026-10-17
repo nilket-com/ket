@@ -246,7 +246,14 @@ async fn b1d_commit_rollback_zero_before_missing_then_mismatch_preserve_tentativ
 	let before = f.slab.local_l1_bytes().await;
 	zero(s.commit(node(1), 1, tenant(7), empty).await.unwrap_err());
 	zero(s.rollback(node(1), 1, tenant(7), empty).await.unwrap_err());
-	s.commit(node(1), 1, tenant(7), absent).await.unwrap();
+	let missing = s.commit(node(1), 1, tenant(7), absent).await.unwrap_err();
+	assert_eq!(
+		missing
+			.get_ref()
+			.and_then(|source| { source.downcast_ref::<CounterVisibilityError>() }),
+		Some(&CounterVisibilityError::TentativeMissing),
+		"a valid nonzero key with no pending or committed identity is missing"
+	);
 	s.rollback(node(1), 1, tenant(7), absent).await.unwrap();
 	assert_eq!(f.slab.local_l1_bytes().await, before);
 	s.replicate_tentative(node(1), 1, tenant(7), key, 11, hlc(1))

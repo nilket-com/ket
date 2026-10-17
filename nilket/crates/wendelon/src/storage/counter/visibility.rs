@@ -9,6 +9,7 @@ pub enum CounterVisibilityError {
 	Conflict,
 	Poisoned,
 	Unsupported,
+	TentativeMissing,
 }
 impl std::fmt::Display for CounterVisibilityError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -64,6 +65,8 @@ struct Seen {
 struct Cell {
 	version: Option<CounterVersion>,
 	seen: BTreeMap<((u64, u32, u32), Option<u32>), Seen>,
+	/// Committed V2 identities stay value-bound for idempotent commit re-drive.
+	committed_v2: HashMap<((u64, u32, u32), u32), u64>,
 	error: Option<CounterVisibilityError>,
 }
 impl Cell {
@@ -98,6 +101,18 @@ impl Reservation {
 				return Err(CounterVisibilityError::Poisoned);
 			}
 		};
+		if let Some(origin) = self.version.origin {
+			let key = (self.version.stamp(), origin.id);
+			if cell
+				.committed_v2
+				.get(&key)
+				.is_some_and(|value| *value != self.version.value)
+			{
+				cell.error = Some(CounterVisibilityError::Conflict);
+				return Err(CounterVisibilityError::Conflict);
+			}
+			cell.committed_v2.insert(key, self.version.value);
+		}
 		let Some(seen) = cell.seen.get_mut(&self.version.order()) else {
 			cell.error = Some(CounterVisibilityError::Poisoned);
 			return Err(CounterVisibilityError::Poisoned);
@@ -164,6 +179,16 @@ impl<K: Eq + Hash + Clone> EligibleCells<K> {
 			if let Some(error) = c.error {
 				return Err(error);
 			}
+			if let Some(origin) = version.origin {
+				let identity = (version.stamp(), origin.id);
+				if c.committed_v2
+					.get(&identity)
+					.is_some_and(|value| *value != version.value)
+				{
+					c.error = Some(CounterVisibilityError::Conflict);
+					return Err(CounterVisibilityError::Conflict);
+				}
+			}
 			// Known origins order independently. Every unknown-origin tie must still
 			// satisfy the legacy equal-value rule among retained versions. Historical
 			// conflicts wholly below the current winner are deliberately not retained.
@@ -209,5 +234,29 @@ impl<K: Eq + Hash + Clone> EligibleCells<K> {
 		if let Ok(reservation) = self.prepare(key, version) {
 			let _ = reservation.publish();
 		}
+	}
+	pub(crate) fn committed_identity(
+		&self,
+		key: &K,
+		hlc: HybridTimestamp,
+		origin: NodeId,
+	) -> Result<Option<u64>, CounterVisibilityError> {
+		let cell = self
+			.0
+			.lock()
+			.map_err(|_| CounterVisibilityError::Poisoned)?
+			.get(key)
+			.cloned();
+		let Some(cell) = cell else {
+			return Ok(None);
+		};
+		let cell = cell.lock().map_err(|_| CounterVisibilityError::Poisoned)?;
+		if let Some(error) = cell.error {
+			return Err(error);
+		}
+		Ok(cell
+			.committed_v2
+			.get(&((hlc.physical_ms, hlc.logical, hlc.node_id), origin.id))
+			.copied())
 	}
 }
