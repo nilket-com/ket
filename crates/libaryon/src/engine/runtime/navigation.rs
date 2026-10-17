@@ -2117,17 +2117,23 @@ mod tests {
 				true,
 				text_width,
 			);
-			let carried =
-				crate::engine::layout::carry_on(&self.carried, index, self.registry, self.root);
-			self.caret.resolve_indexed(
+			let (caret, folds) = (&mut self.caret, &mut self.folds);
+			crate::engine::layout::before_layout(
+				&self.carried,
+				index,
 				self.registry,
 				self.root,
-				&mut self.folds,
-				TopologyRev::ZERO,
-				StateId::ZERO,
-				Some(index),
-			);
-			carried
+				|| {
+					caret.resolve_indexed(
+						self.registry,
+						self.root,
+						folds,
+						TopologyRev::ZERO,
+						StateId::ZERO,
+						Some(index),
+					);
+				},
+			)
 		}
 
 		fn at(&self) -> (u64, u64) {

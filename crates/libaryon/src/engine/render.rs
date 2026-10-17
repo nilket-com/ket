@@ -4,7 +4,7 @@ use super::document::selection::resolve_visual_ranges_sparse;
 use super::folding::{pan_scroll_y_to_keep_cursor_visible, visual_line_index_for_doc_line};
 use super::language::{InlineAnnotation, LanguageProvider, LanguageRegistry};
 use super::layout::{
-	CaretIndex, LayoutDemand, RowWindow, ViewportAnchor, WrapLayout, carry_on,
+	CaretIndex, LayoutDemand, RowWindow, ViewportAnchor, WrapLayout, before_layout,
 	collect_visible_rows_with_sum_tree, cursor_view_metrics_with_sum_tree,
 	line_is_indexed_with_sum_tree, pan_viewport_anchor_to_keep_cursor_visible_with_sum_tree,
 	viewport_geometry_for_viewport_with_numbering, window_origin_with_sum_tree,
@@ -1007,34 +1007,37 @@ fn render_pane_viewport(
 				view.common.wrap_enabled,
 				geometry.text_width,
 			);
-			// Work a command left for this document (ADR 0010).
+			// The carets resolve and any requested line scan advances within half
+			// the frame's budget; the other half is kept for the window (ADR 0011).
+			let cursor = &mut tab.cursor;
+			let carried = before_layout(&view.common.carried, caret_index, registry, rid, || {
+				cursor.visit_carets_mut(|caret| {
+					if !caret.resolve_indexed(
+						registry,
+						rid,
+						folds,
+						topology_rev,
+						state_id,
+						Some(caret_index),
+					) {
+						projection_pending = true;
+						if let Some(node) = caret
+							.pending_target()
+							.and_then(|target| target.required_node)
+							.or_else(|| caret.node_cache().map(|cache| cache.node))
+						{
+							projection_misses.push(node);
+						}
+					}
+				});
+			});
 			{
-				let carried = carry_on(&view.common.carried, caret_index, registry, rid);
 				let mut demand = wrap_demand.borrow_mut();
 				demand.more |= carried.more;
 				for node in carried.pending {
 					demand.note(Some(node));
 				}
 			}
-			tab.cursor.visit_carets_mut(|caret| {
-				if !caret.resolve_indexed(
-					registry,
-					rid,
-					folds,
-					topology_rev,
-					state_id,
-					Some(caret_index),
-				) {
-					projection_pending = true;
-					if let Some(node) = caret
-						.pending_target()
-						.and_then(|target| target.required_node)
-						.or_else(|| caret.node_cache().map(|cache| cache.node))
-					{
-						projection_misses.push(node);
-					}
-				}
-			});
 			if !projection_pending && let Some(cursors) = tab.cursor.points_mut() {
 				cursors.normalize(registry, rid);
 			}
