@@ -27,7 +27,11 @@
 //!   request drain has completed.
 
 mod identity;
+#[cfg(feature = "test-support")]
+mod test_support;
 pub use identity::{IdentityKeyError, IdentityKeyRole};
+#[cfg(feature = "test-support")]
+pub use test_support::TestSupportFileOps;
 
 use crate::audit::{
 	AuditAuthority, AuditClockDriftSubscriber, AuditEvent, AuditMaterializationTracker,
@@ -195,6 +199,9 @@ pub struct NodeBootstrapConfig {
 	pub wal_io_depth: u32,
 	/// Depth of the dedicated slab-storage `io_uring` submission queue.
 	pub slab_io_depth: u32,
+	/// File operations injected only by deterministic acceptance fixtures.
+	#[cfg(feature = "test-support")]
+	pub slab_file_ops: Option<TestSupportFileOps>,
 	/// ADR 079 cadence for unconditional CDC locality progress markers.
 	pub cdc_locality_heartbeat_interval: Duration,
 	/// ADR 080 HLC fencing window for Data Ring range leases. The
@@ -315,6 +322,8 @@ impl NodeBootstrapConfig {
 			rf: 1,
 			wal_io_depth: 64,
 			slab_io_depth: 64,
+			#[cfg(feature = "test-support")]
+			slab_file_ops: None,
 			cdc_locality_heartbeat_interval: Duration::from_millis(
 				DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS,
 			),
@@ -1430,6 +1439,7 @@ impl WendelonNode {
 			cfg.root_kek_provider.build(&cfg.data_dir)?,
 			cfg.crypto_cache,
 		));
+		#[cfg(not(feature = "test-support"))]
 		let slab: Arc<SlabManager> = Arc::new(
 			SlabManager::open(SlabManagerConfig {
 				dir: cfg.data_dir.clone(),
@@ -1449,6 +1459,31 @@ impl WendelonNode {
 			})
 			.await?,
 		);
+		#[cfg(feature = "test-support")]
+		let slab: Arc<SlabManager> = {
+			let config = SlabManagerConfig {
+				dir: cfg.data_dir.clone(),
+				max_slab_bytes: cfg.slab_max_bytes,
+				io: slab_io.clone(),
+				l2,
+				rehydration: cfg.rehydration.clone(),
+				l2_column_fetch: cfg.l2_column_fetch.clone(),
+				row_group_writer: cfg.row_group_writer.clone(),
+				l2_row_group_fetch: cfg.l2_row_group_fetch.clone(),
+				encoding_writer: cfg.encoding_writer.clone(),
+				l2_chunk_layout: cfg.l2_chunk_layout.clone(),
+				l2_encoding_fetch: cfg.l2_encoding_fetch.clone(),
+				encoding_compute: cfg.encoding_compute.clone(),
+				group_commit: cfg.group_commit.clone(),
+				crypto: crypto.clone(),
+			};
+			Arc::new(match cfg.slab_file_ops.clone() {
+				Some(file_ops) => {
+					SlabManager::open_with_file_ops(config, file_ops.into_inner()).await?
+				}
+				None => SlabManager::open(config).await?,
+			})
+		};
 
 		// 4. Durable Raft storage + recovered state machine.
 		let (wal_path, vote_path, snapshot_path) = control_artifact_paths(&cfg.data_dir);

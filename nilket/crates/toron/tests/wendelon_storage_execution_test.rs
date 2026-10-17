@@ -2645,3 +2645,7 @@ async fn adr0579_projected_limit_returns_exactly_its_limit_of_genuine_rows() {
 	fixture.node.handles.abort();
 	let _ = std::fs::remove_dir_all(fixture.data_dir);
 }
+
+#[cfg(feature = "test-support")]
+#[path = "wendelon_storage_execution_test/acceptance8/mod.rs"]
+mod acceptance8;
