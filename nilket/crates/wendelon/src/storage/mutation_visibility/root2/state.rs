@@ -139,12 +139,23 @@ fn encode_state(s: &State2) -> Result2<Vec<u8>> {
 	let body = body.ok_or(RootError2::Overflow)?;
 	let (wire, total) = envelope_size(body, ROOT_BYTES2)?;
 	let mut b = Vec::with_capacity(total);
-	b.extend_from_slice(if s.role_epochs.is_some() {
+	b.extend_from_slice(if super::retirement::is_retired(s) {
+		b"VISAUT06"
+	} else if s.role_epochs.is_some() {
 		b"VISAUT05"
 	} else {
 		b"VISAUT04"
 	});
-	b.extend_from_slice(&(if s.role_epochs.is_some() { 5u16 } else { 4u16 }).to_le_bytes());
+	b.extend_from_slice(
+		&(if super::retirement::is_retired(s) {
+			6u16
+		} else if s.role_epochs.is_some() {
+			5u16
+		} else {
+			4u16
+		})
+		.to_le_bytes(),
+	);
 	b.extend_from_slice(&[1, 0]);
 	b.extend_from_slice(&wire.to_le_bytes());
 	emit_state_body(s, &u, &mut |part| b.extend_from_slice(part))?;
@@ -221,8 +232,11 @@ impl UnverifiedRoot2 {
 		)
 	}
 	pub fn decode(bytes: &[u8]) -> Result2<Self> {
-		let extended = bytes.starts_with(b"VISAUT05");
-		let mut r = Read2::new(if extended {
+		let terminal = bytes.starts_with(b"VISAUT06");
+		let extended = terminal || bytes.starts_with(b"VISAUT05");
+		let mut r = Read2::new(if terminal {
+			open_versioned(bytes, b"VISAUT06", 6, ROOT_BYTES2)?
+		} else if extended {
 			open_versioned(bytes, b"VISAUT05", 5, ROOT_BYTES2)?
 		} else {
 			open_versioned(bytes, b"VISAUT04", 4, ROOT_BYTES2)?
@@ -269,7 +283,9 @@ impl UnverifiedRoot2 {
 			},
 		)?;
 		let role_epochs = if extended {
-			Some(Box::new(super::role_epochs::RoleEpochs3::read(&mut r)?))
+			Some(Box::new(super::role_epochs::RoleEpochs3::read(
+				&mut r, terminal,
+			)?))
 		} else {
 			None
 		};

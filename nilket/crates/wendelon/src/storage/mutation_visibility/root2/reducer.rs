@@ -68,6 +68,11 @@ impl Root2 {
 		let (g, c, l, fp, d) = entry.fields();
 		valid_log(l)?;
 		let digest = command.digest(g, c)?;
+		if let Some(old) = root {
+			if super::retirement::is_retired(&old.state) {
+				return super::retirement::consume(old, entry, command);
+			}
+		}
 		if digest != d || !verified.matches(g, c, d) {
 			return Err(RootError2::TrustMismatch);
 		}
@@ -100,7 +105,7 @@ impl Root2 {
 		let result = if super::role_freeze::blocked(&old.state, command) {
 			denied(23, None)
 		} else if verified.authorized() {
-			apply(&mut next, command, l, verified)?
+			apply(&mut next, command, l, fp, d, verified)?
 		} else {
 			denied(8, None)
 		};
@@ -173,11 +178,19 @@ fn finish_step(
 	cached_capacity(&next.state, next.limits)?;
 	Ok((next, result))
 }
-fn apply(root: &mut Root2, cmd: &Command2, l: Log2, v: &VerifiedCommand2) -> Result2<ApplyResult2> {
+fn apply(
+	root: &mut Root2,
+	cmd: &Command2,
+	l: Log2,
+	fp: Digest2,
+	d: Digest2,
+	v: &VerifiedCommand2,
+) -> Result2<ApplyResult2> {
 	let s = &mut root.state;
 	let limits = root.limits;
 	match cmd {
 		Command2::Bootstrap { .. } => Ok(denied(1, Some(s.bootstrap))),
+		Command2::RetireRoot => super::retirement::retire(root, l, fp, d, v.role_seed3()),
 		Command2::Freeze(_) | Command2::Unfreeze(_) => {
 			super::role_freeze::transition(root, cmd, l, v.role_seed3())
 		}

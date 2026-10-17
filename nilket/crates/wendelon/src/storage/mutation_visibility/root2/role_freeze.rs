@@ -28,7 +28,8 @@ pub(super) fn blocked(state: &State2, command: &Command2) -> bool {
 		| Command2::RotateGovernance(_)
 		| Command2::RotateRecovery(_)
 		| Command2::Freeze(_)
-		| Command2::Unfreeze(_) => false,
+		| Command2::Unfreeze(_)
+		| Command2::RetireRoot => false,
 	};
 	class
 		&& state

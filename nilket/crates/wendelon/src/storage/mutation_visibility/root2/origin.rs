@@ -307,6 +307,22 @@ pub(in crate::storage::mutation_visibility::root2) fn bootstrap2(
 		result,
 	))
 }
+pub(in crate::storage::mutation_visibility::root2) fn advance_retired2(
+	state: &MutationAuthorityState2,
+	entry: &TrustedEntry2,
+	command: &Command2,
+) -> Result2<(MutationAuthorityState2, ApplyResult2)> {
+	let StateInner2::Root(root, origin) = &state.inner else {
+		return Err(RootError2::TrustMismatch);
+	};
+	let (next, result) = super::retirement::consume(root, entry, command)?;
+	Ok((
+		MutationAuthorityState2 {
+			inner: StateInner2::Root(Box::new(next), *origin),
+		},
+		result,
+	))
+}
 pub(in crate::storage::mutation_visibility::root2) fn advance_root2(
 	state: &MutationAuthorityState2,
 	entry: &TrustedEntry2,
@@ -399,6 +415,9 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_admission2(
 	let StateInner2::Root(_, origin) = &state.inner else {
 		return Err(RootError2::TrustMismatch);
 	};
+	if root_and_origin2(state).is_some_and(|(r, _)| super::retirement::is_retired(&r.state)) {
+		return advance_retired2(state, entry, command);
+	}
 	let admin = install_admin2(state, tuple).map_err(|_| RootError2::TrustMismatch)?;
 	let (next, result) = Root2::reduce_admission(state, &admin, entry, verified, command)?;
 	Ok((

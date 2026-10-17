@@ -69,6 +69,7 @@ pub(super) enum RoleForm3 {
 	Legacy,
 	Freeze,
 	Unfreeze,
+	Retire,
 }
 fn domain(
 	form: RoleForm3,
@@ -86,6 +87,9 @@ fn domain(
 		(Unfreeze, [1, 3], 1) => b"VISROOT2-ROLE3-UNFREEZE-RECOVERY-WITH-ADMIN\0",
 		(Unfreeze, [2, 3], 0) => b"VISROOT2-ROLE3-UNFREEZE-GOVERNANCE\0",
 		(Unfreeze, [2, 3], 1) => b"VISROOT2-ROLE3-UNFREEZE-RECOVERY-WITH-GOVERNANCE\0",
+		(Retire, [3, 0], 0) => b"VISROOT2-ROLE3-RETIRE-RECOVERY\0",
+		(Retire, [1, 2], 0) => b"VISROOT2-ROLE3-RETIRE-ADMIN-WITH-GOVERNANCE\0",
+		(Retire, [1, 2], 1) => b"VISROOT2-ROLE3-RETIRE-GOVERNANCE-WITH-ADMIN\0",
 		_ => return Err(RoleProofError3::Domain),
 	})
 }

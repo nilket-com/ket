@@ -68,6 +68,7 @@ pub(in crate::storage::mutation_visibility::root2) enum ObserveError2 {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum InstallError2 {
+	Retired,
 	PrerequisiteUnavailable,
 	Commitment(CommitmentField2),
 	EpochState,
@@ -84,6 +85,9 @@ pub(in crate::storage::mutation_visibility::root2) fn install_admin2(
 		return Err(InstallError2::PrerequisiteUnavailable);
 	};
 	let s = &root.state;
+	if super::retirement::is_retired(s) {
+		return Err(InstallError2::Retired);
+	}
 	let pin = tuple_manifest_pin2(tuple);
 	if s.control_digest != pin {
 		return Err(InstallError2::Commitment(CommitmentField2::ControlDigest));
@@ -270,4 +274,71 @@ pub(in crate::storage::mutation_visibility::root2) fn original_roles3(
 	a: &InstalledAdmin2,
 ) -> Option<[Digest2; 3]> {
 	Some([a.admin_key, a.governance?.key(), a.recovery?.key()])
+}
+
+pub(in crate::storage::mutation_visibility::root2) fn confirm_terminal2(
+	state: &MutationAuthorityState2,
+	tuple: &PinnedBoundTuple2,
+) -> Result<(), InstallError2> {
+	let Some((root, origin)) = root_and_origin2(state) else {
+		return Err(InstallError2::PrerequisiteUnavailable);
+	};
+	let s = &root.state;
+	if !super::retirement::is_retired(s) {
+		return Err(InstallError2::PrerequisiteUnavailable);
+	}
+	let pin = tuple_manifest_pin2(tuple);
+	if s.control_digest != pin {
+		return Err(InstallError2::Commitment(CommitmentField2::ControlDigest));
+	}
+	// Exactly the tuple manifest's canonical length; membership in {137, 189} is not enough.
+	if s.control_len != tuple_manifest_len2(tuple) {
+		return Err(InstallError2::Commitment(CommitmentField2::ControlLength));
+	}
+	let record = tuple_record2(tuple);
+	let r = &record.identity;
+	// Pin is already bound by the tuple and the commitment rule; it is re-checked, not reachable.
+	for (field, equal) in [
+		(InstallField2::Generation, r.generation == s.generation),
+		(InstallField2::Cluster, r.cluster == s.cluster),
+		(InstallField2::Bootstrap, r.bootstrap == s.bootstrap),
+		(
+			InstallField2::BootstrapFingerprint,
+			r.bootstrap_fingerprint == origin.bootstrap_fingerprint,
+		),
+		(
+			InstallField2::BootstrapCommand,
+			r.bootstrap_command == origin.bootstrap_command,
+		),
+		(
+			InstallField2::Genesis,
+			r.genesis_fingerprint == origin.genesis,
+		),
+		(
+			InstallField2::InitialEpoch,
+			r.initial_epoch == s.initial_epoch,
+		),
+		(InstallField2::Pin, r.pin == pin),
+	] {
+		if !equal {
+			return Err(InstallError2::Record(field));
+		}
+	}
+	let any = tuple_manifest2(tuple);
+	let AnyAdminManifest2::Three(manifest) = any else {
+		return Err(InstallError2::EpochState);
+	};
+	let original = [
+		any.admission().admin_key,
+		manifest.governance().key(),
+		manifest.recovery().key(),
+	];
+	if s.role_epochs
+		.as_ref()
+		.is_none_or(|e| e.original != original)
+	{
+		return Err(InstallError2::EpochState);
+	}
+	super::validation::validate_state(s).map_err(|_| InstallError2::EpochState)?;
+	Ok(())
 }
