@@ -1,6 +1,6 @@
 //! Bounded role history. Parsed history is descriptive, never provenance or an active pin.
 use super::admin::key::check_enrollable_admin_key2;
-use super::{codec::*, state::Root2, types::*};
+use super::{codec::*, state::Root2, types::*, validation::nonzero};
 use std::collections::BTreeSet;
 
 pub(super) const SUCCESSORS3: usize = 64;
@@ -10,9 +10,16 @@ pub(super) struct Epoch3 {
 	pub(super) activated: Log2,
 }
 #[derive(Clone, PartialEq, Eq)]
+pub(super) struct Retirement3 {
+	pub(super) at: Log2,
+	pub(super) fingerprint: Digest2,
+	pub(super) digest: Digest2,
+}
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct RoleEpochs3 {
 	pub(super) original: [Digest2; 3],
 	pub(super) frozen: bool,
+	pub(super) retired: Option<Retirement3>,
 	pub(super) transition: Log2,
 	pub(super) successors: [Vec<Epoch3>; 3],
 }
@@ -22,6 +29,7 @@ impl RoleEpochs3 {
 		Self {
 			original,
 			frozen: false,
+			retired: None,
 			transition: Log2 {
 				term: 0,
 				node: 0,
@@ -45,7 +53,7 @@ impl RoleEpochs3 {
 			n.checked_add(h.len()).ok_or(RootError2::Overflow)
 		})?;
 		n.checked_mul(52)
-			.and_then(|n| n.checked_add(120))
+			.and_then(|n| n.checked_add(120 + if self.retired.is_some() { 84 } else { 0 }))
 			.ok_or(RootError2::Overflow)
 	}
 	pub(super) fn write(&self, emit: &mut impl FnMut(&[u8])) -> Result2<()> {
@@ -68,9 +76,16 @@ impl RoleEpochs3 {
 		emit(&self.transition.term.to_le_bytes());
 		emit(&self.transition.node.to_le_bytes());
 		emit(&self.transition.index.to_le_bytes());
+		if let Some(r) = &self.retired {
+			emit(&r.at.term.to_le_bytes());
+			emit(&r.at.node.to_le_bytes());
+			emit(&r.at.index.to_le_bytes());
+			emit(&r.fingerprint);
+			emit(&r.digest);
+		}
 		Ok(())
 	}
-	pub(super) fn read(r: &mut Read2<'_>) -> Result2<Self> {
+	pub(super) fn read(r: &mut Read2<'_>, terminal: bool) -> Result2<Self> {
 		let original = [r.array()?, r.array()?, r.array()?];
 		let counts: [u8; 3] = r.array()?;
 		if counts.iter().any(|&n| usize::from(n) > SUCCESSORS3) {
@@ -98,10 +113,20 @@ impl RoleEpochs3 {
 			node: 0,
 			index: 0,
 		});
-		if transition.index == 0 && (frozen || counts == [0; 3]) {
+		if transition.index == 0 && (frozen || (counts == [0; 3] && !terminal)) {
 			return Err(RootError2::Codec);
 		}
+		let retired = if terminal {
+			Some(Retirement3 {
+				at: r.log()?,
+				fingerprint: r.array()?,
+				digest: r.array()?,
+			})
+		} else {
+			None
+		};
 		Ok(Self {
+			retired,
 			original,
 			frozen,
 			transition,
@@ -117,7 +142,9 @@ pub(super) fn validate(s: &State2, coords: &mut BTreeSet<u64>) -> Result2<()> {
 		return Ok(());
 	};
 	if s.control_len != super::admin::manifest::ADMIN_MANIFEST_P3_BYTES3 as u64
-		|| (e.successors.iter().all(Vec::is_empty) && e.transition.index == 0)
+		|| (e.successors.iter().all(Vec::is_empty)
+			&& e.transition.index == 0
+			&& e.retired.is_none())
 	{
 		return Err(RootError2::RootInvariant);
 	}
@@ -136,6 +163,17 @@ pub(super) fn validate(s: &State2, coords: &mut BTreeSet<u64>) -> Result2<()> {
 		if e.transition.index <= s.bootstrap.index
 			|| e.transition.index > s.covered.index
 			|| !coords.insert(e.transition.index)
+		{
+			return Err(RootError2::RootInvariant);
+		}
+	}
+	if let Some(r) = &e.retired {
+		valid_log(r.at)?;
+		nonzero(r.fingerprint)?;
+		nonzero(r.digest)?;
+		if r.at.index <= s.bootstrap.index
+			|| r.at.index > s.covered.index
+			|| !coords.insert(r.at.index)
 		{
 			return Err(RootError2::RootInvariant);
 		}

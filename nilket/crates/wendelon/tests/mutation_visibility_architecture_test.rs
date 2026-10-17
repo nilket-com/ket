@@ -1185,6 +1185,7 @@ fn origin_layer_builds_no_trusted_input_and_promotes_no_bytes() {
 			"advance_admission2",
 			"advance_cover2",
 			"advance_pre_root2",
+			"advance_retired2",
 			"advance_root2",
 			"bootstrap2",
 			"coverage2",
@@ -1871,6 +1872,7 @@ fn admin_install_is_a_pure_derivation() {
 			"admin_namespace2",
 			"admin_profile2",
 			"admin_recovery3",
+			"confirm_terminal2",
 			"install_admin2",
 			"observe_bootstrap2",
 			"original_roles3"
@@ -3346,10 +3348,19 @@ fn root2_constructors_preserve_capacity_invariant() {
 		"default limits only"
 	);
 	producers.sort();
+	let retirement = fs::read_to_string(root.join("retirement.rs")).unwrap();
+	let retirement = without_test_items_deep(retirement.parse().unwrap()).to_string();
+	assert_eq!(
+		retirement
+			.matches("cached_capacity (& next . state , next . limits)")
+			.count(),
+		1
+	);
 	assert_eq!(
 		producers,
 		[
 			"bootstrap_root",
+			"consume",
 			"cover",
 			"finish_step",
 			"reduce",
@@ -3872,6 +3883,12 @@ fn command_verification_is_single_site_and_unwired() {
 				assert_eq!(p.path.segments[0].ident, "Command2");
 				names.push(p.path.segments[1].ident.to_string());
 			}
+			syn::Pat::Path(p) => {
+				assert!(p.qself.is_none());
+				assert_eq!(p.path.segments.len(), 2);
+				assert_eq!(p.path.segments[0].ident, "Command2");
+				names.push(p.path.segments[1].ident.to_string());
+			}
 			_ => panic!("exact Command2 pattern required; no wildcard"),
 		}
 	}
@@ -3925,6 +3942,7 @@ fn command_verification_is_single_site_and_unwired() {
 			"EpochAdmissionPermission",
 			"Freeze",
 			"Unfreeze",
+			"RetireRoot",
 		]
 		.map(str::to_string),
 	);
@@ -4087,6 +4105,7 @@ fn command_verification_is_single_site_and_unwired() {
 					"Finalize",
 					"Freeze",
 					"Reserve",
+					"RetireRoot",
 					"RotateAdmin",
 					"RotateGovernance",
 					"RotateRecovery",
@@ -4633,6 +4652,7 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 		("governance_command.rs", &[]),
 		("role_epochs.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
 		("role_freeze.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
+		("retirement.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
 		("role_command.rs", &["ManifestProfile2"]),
 	];
 	// The one new out-of-line test file is excluded only while its declaration is cfg(test).
@@ -4818,8 +4838,8 @@ fn profile_two_binding_surface_is_exact() {
 	assert_eq!(governance.matches("admin_governance2(admin)").count(), 1);
 	assert_eq!(governance.matches("role.key()").count(), 1);
 	assert_eq!(governance.matches("role.actions()").count(), 1);
-	// Only original profile-3 seed derivation reads the two copied role keys.
-	assert_eq!(install.matches(".key()").count(), 4);
+	// Only original profile-3 seed derivation and terminal confirmation read the two copied role keys.
+	assert_eq!(install.matches(".key()").count(), 6);
 	assert_eq!(
 		fn_body(&install, "install_admin2")
 			.matches(".key()")
@@ -4828,6 +4848,12 @@ fn profile_two_binding_surface_is_exact() {
 	);
 	assert_eq!(
 		fn_body(&install, "original_roles3")
+			.matches(".key()")
+			.count(),
+		2
+	);
+	assert_eq!(
+		fn_body(&install, "confirm_terminal2")
 			.matches(".key()")
 			.count(),
 		2
@@ -5204,6 +5230,7 @@ fn governance_command_envelope_is_pure_and_unwired() {
 					.to_string()
 					.replace(' ', "");
 				let helper = p == root.join("governance_verification.rs");
+				let shape = p == root.join("retirement_shape.rs");
 				let verifier = p == root.join("verification.rs");
 				let remaining = if verifier {
 					let import = "usecrate::storage::mutation_visibility::root2::governance_command::GovernanceCommandError2;";
@@ -5229,7 +5256,7 @@ fn governance_command_envelope_is_pure_and_unwired() {
 					"GovernanceCommandError2",
 					"root2::governance_command",
 				] {
-					let permitted = helper
+					let permitted = (helper
 						&& [
 							"parse_governance_command2",
 							"check_governance_command2",
@@ -5238,13 +5265,18 @@ fn governance_command_envelope_is_pure_and_unwired() {
 							"GOVERNANCE_COMMAND_BYTES2",
 							"root2::governance_command",
 						]
-						.contains(&name);
+						.contains(&name)) || (shape
+						&& ["parse_governance_command2", "GOVERNANCE_COMMAND_BYTES2"]
+							.contains(&name));
 					let typed_wrapper = verifier && name == "GovernanceCommandError2";
 					assert!(
 						permitted || typed_wrapper || !remaining.contains(name),
 						"production caller of {name} in {}",
 						p.display()
 					);
+				}
+				if shape {
+					assert_eq!(t.matches("parse_governance_command2(").count(), 1);
 				}
 				if helper {
 					assert_eq!(calls(&t, "parse_governance_command2"), 1);
@@ -5640,7 +5672,7 @@ fn role_epoch_control_is_pre_entry_bounded_and_dormant() {
 	}
 	let epochs = read("role_epochs.rs");
 	assert!(epochs.contains("const SUCCESSORS3: usize = 64;"));
-	assert!(epochs.contains("frozen || counts == [0; 3]"));
+	assert!(epochs.contains("frozen || (counts == [0; 3] && !terminal)"));
 	assert!(
 		epochs.find("usize::from(n) > SUCCESSORS3").unwrap()
 			< epochs.find("try_reserve_exact").unwrap()
@@ -5684,7 +5716,7 @@ fn role_epoch_control_is_pre_entry_bounded_and_dormant() {
 			_ => None,
 		})
 		.unwrap();
-	assert_eq!(variants.len(), 20);
+	assert_eq!(variants.len(), 21);
 	assert_eq!(
 		&variants[14..18],
 		[
@@ -5694,7 +5726,8 @@ fn role_epoch_control_is_pre_entry_bounded_and_dormant() {
 			"EpochAdmissionPermission"
 		]
 	);
-	assert_eq!(&variants[18..], ["Freeze", "Unfreeze"]);
+	assert_eq!(&variants[18..20], ["Freeze", "Unfreeze"]);
+	assert_eq!(variants[20], "RetireRoot");
 	let freeze = read("role_freeze.rs");
 	let transition = fn_body(&freeze, "transition");
 	assert!(

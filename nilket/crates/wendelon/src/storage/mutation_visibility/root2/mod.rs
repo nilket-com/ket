@@ -52,6 +52,8 @@ mod recovery;
 mod reducer;
 #[allow(dead_code)] // Dormant owned replay; S1 exports no authority or replay result.
 mod replay;
+mod retirement;
+mod retirement_shape;
 #[allow(dead_code)] // Dormant role proof verification; no runtime producer.
 mod role_command;
 mod role_epochs;

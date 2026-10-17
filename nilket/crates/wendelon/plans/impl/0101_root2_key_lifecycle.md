@@ -19,7 +19,7 @@ proposer, serving or runtime path.
 
 - `RetireRoot` (kind 20), a unit command. It is authorized by recovery alone or by joint admin + governance. Structural refusals happen before install; authorization failures are a consumed `Denied(8)`.
 - `R/retirement.rs`: `is_retired`, `retire(root, at, seed, fingerprint, digest)` and `consume()`, which diverts every post-coordinate Root2 command to a consumed `Denied(25)` on both reducer paths, after the structural and binding checks and before authorization.
-- State V6: the V5 extension plus an 84 B retired record (Log2, entry fingerprint, command digest). It is written only for a retired root. A repeat retire is `Registered(first)`.
+- State V6: the V5 extension plus an 84 B retired record (Log2, entry fingerprint, command digest). It is written only for a retired root. A repeat RetireRoot after the coordinate is a consumed `Denied(25)`; the first retirement record is preserved.
 - `admin_install.rs`: `InstallError2::Retired`. Replay confirms the terminal state with `confirm_terminal2`.
 - Decoder reason ranges extend to 1..=25. There is an exhaustive-site census for the new kind and the new denial.
 - `R/retirement_shape.rs` is a parse-only guard: no retire path outside `retirement.rs`.

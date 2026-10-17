@@ -164,7 +164,13 @@ fn finish(
 	pin: &PinnedBoundTuple2,
 	mark_store: &mut MarkStore2,
 ) -> Result<Replayed2, ReplayError2> {
-	install_admin2(&acc.state, pin).map_err(ReplayError2::Binding)?;
+	if super::origin::root_and_origin2(&acc.state)
+		.is_some_and(|(r, _)| super::retirement::is_retired(&r.state))
+	{
+		super::admin_install::confirm_terminal2(&acc.state, pin).map_err(ReplayError2::Binding)?;
+	} else {
+		install_admin2(&acc.state, pin).map_err(ReplayError2::Binding)?;
+	}
 	let mark = mark_of2(&acc.state).map_err(ReplayError2::MarkEncode)?;
 	let outcome = mark_store
 		.advance(&deployment, &mark)

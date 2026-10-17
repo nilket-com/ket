@@ -69,6 +69,7 @@ pub enum Command2 {
 	EpochAdmissionPermission([u8; super::admin_statement::EPOCH_STATEMENT_BYTES3]),
 	Freeze(Log2),
 	Unfreeze(Log2),
+	RetireRoot,
 }
 impl std::fmt::Debug for Command2 {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -231,6 +232,7 @@ impl Wire2 for Command2 {
 				b.push(13);
 				b.extend(node.to_le_bytes());
 			}
+			Self::RetireRoot => b.push(20),
 			Self::Freeze(binding) | Self::Unfreeze(binding) => {
 				if *binding
 					!= (Log2 {
@@ -381,6 +383,7 @@ impl Wire2 for Command2 {
 				valid_issuer_node(node)?;
 				Self::RevokeLeaseIssuer { node }
 			}
+			20 => Self::RetireRoot,
 			14 => Self::RotateAdmin(r.array()?),
 			15 => Self::RotateGovernance(r.array()?),
 			16 => Self::RotateRecovery(r.array()?),
@@ -475,10 +478,10 @@ fn result_relation(v: &ApplyResult2, g: [u8; 16], p: Log2) -> Result2<()> {
 	}
 	Ok(())
 }
-// Denied reasons 1..=24; 18 and 20..=24 carry no reference, 19 (revoked) carries one.
+// Denied reasons 1..=25; 18 and 20..=25 carry no reference, 19 (revoked) carries one.
 fn denied_shape(reason: u16, reference: Option<Log2>) -> Result2<()> {
 	let shaped = match reason {
-		18 | 20..=24 => reference.is_none(),
+		18 | 20..=25 => reference.is_none(),
 		19 => reference.is_some(),
 		1..=17 => true,
 		_ => false,
@@ -660,7 +663,7 @@ impl Wire2 for ApplyResult2 {
 			}
 			6 => {
 				let reason = r.u16()?;
-				if !(1..=24).contains(&reason) {
+				if !(1..=25).contains(&reason) {
 					return Err(RootError2::Codec);
 				}
 				let reference = r.optional_log()?;

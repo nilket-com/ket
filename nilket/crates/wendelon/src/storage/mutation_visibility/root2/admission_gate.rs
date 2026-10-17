@@ -60,6 +60,9 @@ impl Root2 {
 		let Some((root, origin)) = root_and_origin2(state) else {
 			return Err(RootError2::TrustMismatch);
 		};
+		if super::retirement::is_retired(&root.state) {
+			return super::retirement::consume(root, entry, command);
+		}
 		let s = &root.state;
 		// 2-4. The entry, its digest and the root it names.
 		let (g, c, l, fp, d) = entry.fields();

@@ -51,3 +51,5 @@ pub(crate) mod governance_verification;
 mod role_epochs;
 
 mod role_freeze;
+
+mod retirement;

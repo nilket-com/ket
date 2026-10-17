@@ -121,6 +121,10 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_verified2(
 		) {
 		return Err(E::ExtraSidecar);
 	}
+	if root_and_origin2(state).is_some_and(|(r, _)| super::retirement::is_retired(&r.state)) {
+		super::retirement_shape::check(command, governance)?;
+		return super::origin::advance_retired2(state, entry, command).map_err(E::Consumer);
+	}
 	let token = verify_command2(state, pin, entry, command, governance)?;
 	match command {
 		Command2::Bootstrap { .. } => bootstrap2(state, committed, entry, &token, command),
@@ -136,7 +140,8 @@ pub(in crate::storage::mutation_visibility::root2) fn advance_verified2(
 fn kind(command: &Command2) -> Result<(), VerifyError2> {
 	use VerifyError2 as E;
 	match command {
-		Command2::Freeze(_)
+		Command2::RetireRoot
+		| Command2::Freeze(_)
 		| Command2::Unfreeze(_)
 		| Command2::RotateAdmin(_)
 		| Command2::RotateGovernance(_)
@@ -188,13 +193,16 @@ fn verify_command2(
 			| Command2::RotateGovernance(_)
 			| Command2::RotateRecovery(_)
 			| Command2::Freeze(_)
-			| Command2::Unfreeze(_),
+			| Command2::Unfreeze(_)
+			| Command2::RetireRoot,
 			OriginView2::Root,
 		) => {
 			let bytes = governance.ok_or(VerifyError2::MissingSidecar)?;
 			super::role_command::parse(bytes).map_err(VerifyError2::Role)?;
 			let admin = install_admin2(state, pin).map_err(VerifyError2::Install)?;
 			let expected = match command {
+				Command2::RetireRoot if bytes[76] == 3 => [3, 0],
+				Command2::RetireRoot => [1, 2],
 				Command2::RotateRecovery(_) => [1, 2],
 				Command2::Unfreeze(_) if bytes[76] == 1 => [1, 3],
 				Command2::Unfreeze(_) => [2, 3],
@@ -204,6 +212,7 @@ fn verify_command2(
 				_ => return Err(VerifyError2::StateKind),
 			};
 			let form = match command {
+				Command2::RetireRoot => super::role_command::RoleForm3::Retire,
 				Command2::Freeze(_) => super::role_command::RoleForm3::Freeze,
 				Command2::Unfreeze(_) => super::role_command::RoleForm3::Unfreeze,
 				_ => super::role_command::RoleForm3::Legacy,

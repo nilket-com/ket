@@ -309,7 +309,8 @@ fn action_table_matches_current_command_tags_exhaustively() {
 			| Command2::RotateRecovery(_)
 			| Command2::EpochAdmissionPermission(_)
 			| Command2::Freeze(_)
-			| Command2::Unfreeze(_) => None,
+			| Command2::Unfreeze(_)
+			| Command2::RetireRoot => None,
 		}
 	}
 	let v: serde_json::Value = serde_json::from_str(include_str!("goldens.json")).unwrap();
