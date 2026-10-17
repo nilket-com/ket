@@ -25,6 +25,7 @@ Persisted counter versions were keyed by HLC alone (`(op_id,0,0)`), which is nar
    - The production service checks that HLC == (op_id, 0, 0).
    - Legacy records and `.pw` witnesses stay readable under an unknown-origin rule and are never rewritten.
 4. **Maintenance refusal.** Raw migration (sender side) and compaction refuse counter records with a typed error before writing. The blob tier rejects them.
+5. **Pair V2 counter frames across slab rotation.** At reopen, pair class-3 tentatives with class-4 markers by the full version identity `(tenant, key, hlc, origin)` across all local slabs, active and sealed. Slab-local offset is not a cross-slab pairing key; if a marker and tentative are in the same slab, a contradictory offset is a typed `Conflict`. Recovery is deterministic and independent of slab enumeration order. A fully paired marker contributes its identity and value to a value-bound committed map; live commits update the same map. An orphan marker fails closed for its key and never enters the map. An orphan tentative remains uncommitted and is skipped. Legacy classes 1/2 keep read-only, per-slab offset pairing because they do not persist origin. Prepare success follows durability of the exact tentative slab; a missing-pending commit succeeds only for an equal committed identity/value, returns `Conflict` for a different value, and otherwise returns generic-retryable `TentativeMissing`. Leader re-drive remains prepare then commit, and the witness remains until all accepted participants commit.
 
 ## Rationale
 
