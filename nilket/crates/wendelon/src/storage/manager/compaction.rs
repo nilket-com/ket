@@ -59,6 +59,57 @@ pub(super) struct RelocatedRecord {
 	pub(super) new_location: RecordLocation,
 }
 
+type CounterVersionIdentity = (TenantId, Identity, u64, u32, u32, u32);
+
+#[derive(Clone)]
+struct CounterRewriteFrame {
+	physical: core::ScannedCounterFrame,
+	value: u64,
+	origin: crate::schema::NodeId,
+	marker_tentative_offset: Option<u64>,
+	indexed: bool,
+}
+
+#[derive(Default)]
+struct CounterRewritePlan {
+	frames: Vec<CounterRewriteFrame>,
+	pending: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct RelocatedCounterFrame {
+	old_location: RecordLocation,
+	new_location: RecordLocation,
+	tenant_id: TenantId,
+	key_identity: Identity,
+	routing_locality: Locality,
+	indexed: bool,
+}
+
+fn counter_version_identity(
+	tenant_id: TenantId,
+	key_identity: Identity,
+	hlc: HybridTimestamp,
+	origin: crate::schema::NodeId,
+) -> CounterVersionIdentity {
+	(
+		tenant_id,
+		key_identity,
+		hlc.physical_ms,
+		hlc.logical,
+		hlc.node_id,
+		origin.id,
+	)
+}
+
+fn counter_frame_is_tentative(frame: &core::ScannedCounterFrame) -> bool {
+	frame.record_class == crate::schema::record_class::COUNTER_TENTATIVE_V2
+}
+
+fn counter_frame_is_marker(frame: &core::ScannedCounterFrame) -> bool {
+	frame.record_class == crate::schema::record_class::COUNTER_COMMIT_V2
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct CompactionOutcome {
 	pub(super) reclaimed_bytes: u64,
@@ -354,6 +405,288 @@ pub(super) fn compaction_row_group_descriptor<'a>(
 }
 
 impl SlabManager {
+	async fn plan_counter_rewrite(
+		&self,
+		slab: &Arc<LocalSlabStore>,
+	) -> std::io::Result<CounterRewritePlan> {
+		// A counter reservation advances the physical cursor before its async write
+		// completes. The manager registers its pending identity under the same state
+		// lock as that reservation, so defer before reading a possible zero/partial
+		// reservation rather than treating it as corrupt slab bytes.
+		if self.counter_slab_has_pending_frames(slab.slab_id()) {
+			return Ok(CounterRewritePlan {
+				frames: Vec::new(),
+				pending: true,
+			});
+		}
+		let scanned = match slab.scan_counter_frames().await {
+			Ok(scanned) => scanned,
+			Err(_error) if self.counter_slab_has_pending_frames(slab.slab_id()) => {
+				return Ok(CounterRewritePlan {
+					frames: Vec::new(),
+					pending: true,
+				});
+			}
+			Err(error) => return Err(error),
+		};
+		if self.counter_slab_has_pending_frames(slab.slab_id()) {
+			return Ok(CounterRewritePlan {
+				frames: Vec::new(),
+				pending: true,
+			});
+		}
+		let mut plan = CounterRewritePlan::default();
+		let mut tentatives_by_identity: HashMap<CounterVersionIdentity, Vec<usize>> =
+			HashMap::new();
+		let mut markers_by_identity: HashMap<CounterVersionIdentity, Vec<usize>> = HashMap::new();
+		for physical in scanned {
+			if matches!(
+				physical.record_class,
+				crate::schema::record_class::COUNTER_TENTATIVE
+					| crate::schema::record_class::COUNTER_COMMIT
+			) {
+				return Err(super::counter::CounterFormatError::MaintenanceUnsupported.io());
+			}
+			let (value, origin) = match physical.record_class {
+				crate::schema::record_class::COUNTER_TENTATIVE_V2
+				| crate::schema::record_class::COUNTER_COMMIT_V2 => {
+					super::counter::decode_origin_frame(&physical.payload)?
+				}
+				other => {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						format!("maintenance frame walk found unsupported record class {other}"),
+					));
+				}
+			};
+			let identity = counter_version_identity(
+				physical.tenant_id,
+				physical.key_identity,
+				physical.location.hlc,
+				origin,
+			);
+			let indexed = counter_frame_is_tentative(&physical)
+				&& self
+					.key_index
+					.get(&(physical.tenant_id, physical.key_identity))
+					.is_some_and(|locations| locations.iter().any(|loc| *loc == physical.location));
+			let marker_tentative_offset = counter_frame_is_marker(&physical).then_some(value);
+			let index = plan.frames.len();
+			if counter_frame_is_tentative(&physical) {
+				tentatives_by_identity
+					.entry(identity)
+					.or_default()
+					.push(index);
+			} else {
+				markers_by_identity.entry(identity).or_default().push(index);
+			}
+			plan.pending |=
+				counter_frame_is_tentative(&physical) && self.counter_frame_is_pending(&physical);
+			plan.frames.push(CounterRewriteFrame {
+				physical,
+				value,
+				origin,
+				marker_tentative_offset,
+				indexed,
+			});
+		}
+
+		// Same-slab V2 pairs retain the recovery reader's strict offset check. The
+		// only permitted offset change is the bounded remap made while writing the
+		// already-validated pair to this one replacement slab.
+		for (identity, marker_indices) in &markers_by_identity {
+			let local_tentatives = tentatives_by_identity
+				.get(identity)
+				.cloned()
+				.unwrap_or_default();
+			if local_tentatives.is_empty() {
+				let first = &plan.frames[marker_indices[0]];
+				let committed = self
+					.counter_eligible
+					.committed_identity(
+						&(first.physical.tenant_id, first.physical.key_identity),
+						first.physical.location.hlc,
+						first.origin,
+					)
+					.map_err(super::counter::CounterVisibilityError::io)?;
+				if committed.is_none() {
+					return Err(super::counter::CounterVisibilityError::Conflict.io());
+				}
+				// This marker pairs with a tentative in another slab. Its stored
+				// offset is intentionally copied verbatim; cross-slab pairing is by
+				// version identity, not by a coincident offset in this rewrite.
+				for marker_index in marker_indices {
+					plan.frames[*marker_index].marker_tentative_offset = None;
+				}
+				continue;
+			}
+			let first_value = plan.frames[local_tentatives[0]].value;
+			if local_tentatives
+				.iter()
+				.any(|index| plan.frames[*index].value != first_value)
+			{
+				return Err(super::counter::CounterVisibilityError::Conflict.io());
+			}
+			let committed = self
+				.counter_eligible
+				.committed_identity(
+					&(
+						plan.frames[local_tentatives[0]].physical.tenant_id,
+						plan.frames[local_tentatives[0]].physical.key_identity,
+					),
+					plan.frames[local_tentatives[0]].physical.location.hlc,
+					plan.frames[local_tentatives[0]].origin,
+				)
+				.map_err(super::counter::CounterVisibilityError::io)?;
+			if committed.is_some_and(|value| value != first_value) {
+				return Err(super::counter::CounterVisibilityError::Conflict.io());
+			}
+			for marker_index in marker_indices {
+				let marker = &plan.frames[*marker_index];
+				let marker_offset = marker.marker_tentative_offset.unwrap_or(u64::MAX);
+				let paired = local_tentatives.iter().any(|tentative_index| {
+					plan.frames[*tentative_index].physical.location.offset == marker_offset
+				});
+				if !paired {
+					return Err(super::counter::CounterVisibilityError::Conflict.io());
+				}
+				// Only a validated pair physically present in this source slab may
+				// have its offset remapped in the replacement.
+				plan.frames[*marker_index].marker_tentative_offset = Some(marker_offset);
+			}
+		}
+		for tentative_indices in tentatives_by_identity.values() {
+			let first = &plan.frames[tentative_indices[0]];
+			if tentative_indices
+				.iter()
+				.any(|index| plan.frames[*index].value != first.value)
+			{
+				return Err(super::counter::CounterVisibilityError::Conflict.io());
+			}
+			let committed = self
+				.counter_eligible
+				.committed_identity(
+					&(first.physical.tenant_id, first.physical.key_identity),
+					first.physical.location.hlc,
+					first.origin,
+				)
+				.map_err(super::counter::CounterVisibilityError::io)?;
+			if committed.is_some_and(|value| value != first.value) {
+				return Err(super::counter::CounterVisibilityError::Conflict.io());
+			}
+		}
+		Ok(plan)
+	}
+
+	fn ordinary_compaction_records(
+		records: &[CompactionRecord],
+		counter_plan: &CounterRewritePlan,
+	) -> Vec<CompactionRecord> {
+		let counter_locations = counter_plan
+			.frames
+			.iter()
+			.map(|frame| frame.physical.location)
+			.collect::<HashSet<_>>();
+		records
+			.iter()
+			.copied()
+			.filter(|record| !counter_locations.contains(&record.old_location))
+			.collect()
+	}
+
+	async fn append_counter_rewrite_frames(
+		&self,
+		replacement: &Arc<LocalSlabStore>,
+		plan: &CounterRewritePlan,
+	) -> std::io::Result<Vec<RelocatedCounterFrame>> {
+		let mut relocated = Vec::with_capacity(plan.frames.len());
+		let mut new_tentative_offsets = HashMap::new();
+		for frame in plan
+			.frames
+			.iter()
+			.filter(|frame| counter_frame_is_tentative(&frame.physical))
+		{
+			let new_location = replacement
+				.append_counter_maintenance_frame(
+					frame.physical.tenant_id,
+					frame.physical.key_identity,
+					frame.physical.location.hlc,
+					core::CounterMaintenanceClass::TentativeV2,
+					&frame.physical.payload,
+				)
+				.await?;
+			let identity = counter_version_identity(
+				frame.physical.tenant_id,
+				frame.physical.key_identity,
+				frame.physical.location.hlc,
+				frame.origin,
+			);
+			new_tentative_offsets.insert(
+				(identity, frame.physical.location.offset),
+				new_location.offset,
+			);
+			if frame.indexed {
+				replacement.index_location(
+					frame.physical.tenant_id,
+					frame.physical.key_identity,
+					new_location,
+				);
+			}
+			relocated.push(RelocatedCounterFrame {
+				old_location: frame.physical.location,
+				new_location,
+				tenant_id: frame.physical.tenant_id,
+				key_identity: frame.physical.key_identity,
+				routing_locality: self.routing_locality_for_key(
+					frame.physical.tenant_id,
+					frame.physical.key_identity,
+				),
+				indexed: frame.indexed,
+			});
+		}
+		for frame in plan
+			.frames
+			.iter()
+			.filter(|frame| counter_frame_is_marker(&frame.physical))
+		{
+			let mut payload = frame.physical.payload.clone();
+			if let Some(old_tentative_offset) = frame.marker_tentative_offset {
+				let identity = counter_version_identity(
+					frame.physical.tenant_id,
+					frame.physical.key_identity,
+					frame.physical.location.hlc,
+					frame.origin,
+				);
+				let new_offset = new_tentative_offsets
+					.get(&(identity, old_tentative_offset))
+					.copied()
+					.ok_or_else(|| super::counter::CounterVisibilityError::Conflict.io())?;
+				payload[..8].copy_from_slice(&new_offset.to_le_bytes());
+			}
+			let new_location = replacement
+				.append_counter_maintenance_frame(
+					frame.physical.tenant_id,
+					frame.physical.key_identity,
+					frame.physical.location.hlc,
+					core::CounterMaintenanceClass::CommitMarkerV2,
+					&payload,
+				)
+				.await?;
+			relocated.push(RelocatedCounterFrame {
+				old_location: frame.physical.location,
+				new_location,
+				tenant_id: frame.physical.tenant_id,
+				key_identity: frame.physical.key_identity,
+				routing_locality: self.routing_locality_for_key(
+					frame.physical.tenant_id,
+					frame.physical.key_identity,
+				),
+				indexed: false,
+			});
+		}
+		Ok(relocated)
+	}
+
 	pub async fn recluster_sealed_table_layout(
 		&self,
 		tenant_id: TenantId,
@@ -426,7 +759,13 @@ impl SlabManager {
 				compaction: None,
 			});
 		};
-		slab.refuse_counter_maintenance()?;
+		let counter_plan = self.plan_counter_rewrite(&slab).await?;
+		if counter_plan.pending {
+			return Ok(TombstoneSlabScanOutcome {
+				scan: SealedSlabScan::Deferred,
+				compaction: None,
+			});
+		}
 		let mut records: Vec<CompactionRecord> = slab
 			.index
 			.iter()
@@ -452,11 +791,19 @@ impl SlabManager {
 					.collect::<Vec<_>>()
 			})
 			.collect();
+		records = Self::ordinary_compaction_records(&records, &counter_plan);
 		records.sort_by_key(|record| record.old_location.offset);
 
 		let scan = SealedSlabScan::after_scan(&records);
 		let compaction = self
-			.compact_sealed_slab_records(slab_id, slab, &records, secondary_index_context, &claims)
+			.compact_sealed_slab_records_planned(
+				slab_id,
+				slab,
+				&records,
+				secondary_index_context,
+				&claims,
+				&counter_plan,
+			)
 			.await?;
 		Ok(TombstoneSlabScanOutcome { scan, compaction })
 	}
@@ -486,8 +833,11 @@ impl SlabManager {
 		let Some((_claims, slab)) = self.claim_sealed_slab_for_maintenance(slab_id).await else {
 			return Ok(None);
 		};
+		let counter_plan = self.plan_counter_rewrite(&slab).await?;
+		if counter_plan.pending {
+			return Ok(None);
+		}
 		self.ensure_live_lsm_run_for_maintenance(slab_id, slab.write_cursor());
-		slab.refuse_counter_maintenance()?;
 		let mut records: Vec<CompactionRecord> = slab
 			.index
 			.iter()
@@ -510,6 +860,7 @@ impl SlabManager {
 					.collect::<Vec<_>>()
 			})
 			.collect();
+		records = Self::ordinary_compaction_records(&records, &counter_plan);
 		if records.is_empty() {
 			return Ok(None);
 		}
@@ -617,6 +968,9 @@ impl SlabManager {
 			)
 			.await?,
 		);
+		let counter_relocations = self
+			.append_counter_rewrite_frames(&replacement, &counter_plan)
+			.await?;
 		let mut relocations = Vec::with_capacity(records.len());
 		let mut rows_to_recluster = Vec::new();
 		let mut rewritten_records = 0_usize;
@@ -844,6 +1198,7 @@ impl SlabManager {
 				replacement.clone(),
 				&records,
 				&relocations,
+				&counter_relocations,
 				&replacement_path,
 			)
 			.await?
@@ -889,6 +1244,27 @@ impl SlabManager {
 		secondary_index_context: SecondaryIndexCompactionContext<'_>,
 		claims: &MaintenanceClaims,
 	) -> std::io::Result<Option<CompactionOutcome>> {
+		let counter_plan = self.plan_counter_rewrite(&slab).await?;
+		self.compact_sealed_slab_records_planned(
+			slab_id,
+			slab,
+			records,
+			secondary_index_context,
+			claims,
+			&counter_plan,
+		)
+		.await
+	}
+
+	async fn compact_sealed_slab_records_planned(
+		&self,
+		slab_id: SlabId,
+		slab: Arc<LocalSlabStore>,
+		records: &[CompactionRecord],
+		secondary_index_context: SecondaryIndexCompactionContext<'_>,
+		claims: &MaintenanceClaims,
+		counter_plan: &CounterRewritePlan,
+	) -> std::io::Result<Option<CompactionOutcome>> {
 		if !claims.covers(slab_id) {
 			return Err(deterministic_failure(
 				ErrorKind::InvalidInput,
@@ -900,8 +1276,13 @@ impl SlabManager {
 				),
 			));
 		}
-		slab.refuse_counter_maintenance()?;
-		if records.is_empty() || records.iter().all(|record| !record.reclaim) {
+		if counter_plan.pending {
+			return Ok(None);
+		}
+		let records = Self::ordinary_compaction_records(records, counter_plan);
+		if records.is_empty() && counter_plan.frames.is_empty()
+			|| records.iter().all(|record| !record.reclaim) && counter_plan.frames.is_empty()
+		{
 			return Ok(None);
 		}
 		// Quarantined work is not retried at every tick; repair is an explicit
@@ -920,7 +1301,7 @@ impl SlabManager {
 		self.ensure_live_lsm_run_for_maintenance(slab_id, slab.write_cursor());
 		let old_bytes = slab.write_cursor();
 		let reclaimed_records = records.iter().filter(|record| record.reclaim).count();
-		let retention_stats = Self::retention_compaction_stats(records);
+		let retention_stats = Self::retention_compaction_stats(&records);
 		let survivors = records.iter().filter(|record| !record.reclaim).count();
 		// Enumerated before any mutation so the descriptors reflect the state the
 		// retiring slab actually published. Failure fails the compaction, untouched.
@@ -930,7 +1311,7 @@ impl SlabManager {
 				secondary_index_context,
 			)
 			.await?;
-		if survivors == 0 {
+		if survivors == 0 && counter_plan.frames.is_empty() {
 			// A fully-dead slab has no legitimate reader after the admission
 			// tombstone. Take the pin gate only at the first irreversible step;
 			// holding it across a survivor rewrite would incorrectly reject
@@ -973,8 +1354,11 @@ impl SlabManager {
 			)
 			.await?,
 		);
+		let counter_relocations = self
+			.append_counter_rewrite_frames(&replacement, counter_plan)
+			.await?;
 		let mut relocations = Vec::with_capacity(survivors);
-		let physical_groups = physical_compaction_groups(records);
+		let physical_groups = physical_compaction_groups(&records);
 		let mut multirow_recompact_count = 0_u64;
 		for group in physical_groups.values() {
 			let Some(first) = group.first().copied() else {
@@ -1038,6 +1422,7 @@ impl SlabManager {
 				replacement.clone(),
 				&records,
 				&relocations,
+				&counter_relocations,
 				&replacement_path,
 			)
 			.await?
@@ -1137,6 +1522,7 @@ impl SlabManager {
 		replacement: Arc<LocalSlabStore>,
 		records: &[CompactionRecord],
 		relocations: &[RelocatedRecord],
+		counter_relocations: &[RelocatedCounterFrame],
 		staged_path: &Path,
 	) -> std::io::Result<bool> {
 		let publication_gate = self
@@ -1162,6 +1548,15 @@ impl SlabManager {
 				"maintenance rewrite relocation set does not equal the declared survivor set",
 			));
 		}
+		if counter_relocations.iter().any(|relocation| {
+			relocation.old_location.slab_id != old_slab_id
+				|| relocation.new_location.slab_id != new_slab_id
+		}) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"counter maintenance relocation escaped its source/replacement slab pair",
+			));
+		}
 		let relocation_tables = relocations
 			.iter()
 			.filter_map(|relocation| {
@@ -1169,7 +1564,7 @@ impl SlabManager {
 					.map(|table_object_id| (relocation.old_location, table_object_id))
 			})
 			.collect::<HashMap<_, _>>();
-		let removed_rows = records
+		let mut removed_rows = records
 			.iter()
 			.map(|record| {
 				self.persistent_record_row(
@@ -1179,7 +1574,19 @@ impl SlabManager {
 				)
 			})
 			.collect::<Vec<_>>();
-		let inserted_rows = relocations
+		removed_rows.extend(
+			counter_relocations
+				.iter()
+				.filter(|relocation| relocation.indexed)
+				.map(|relocation| {
+					self.persistent_record_row(
+						relocation.tenant_id,
+						relocation.key_identity,
+						relocation.old_location,
+					)
+				}),
+		);
+		let mut inserted_rows = relocations
 			.iter()
 			.map(|relocation| PersistentRecordRow {
 				tenant_id: relocation.tenant_id,
@@ -1191,25 +1598,38 @@ impl SlabManager {
 				location: relocation.new_location,
 			})
 			.collect::<Vec<_>>();
-		let (min_row_hlc, max_row_hlc) =
-			relocations
+		inserted_rows.extend(
+			counter_relocations
 				.iter()
-				.fold((None, None), |(min_row_hlc, max_row_hlc), relocation| {
-					(
-						Some(
-							min_row_hlc
-								.map_or(relocation.new_location.hlc, |current: HybridTimestamp| {
-									current.min(relocation.new_location.hlc)
-								}),
-						),
-						Some(
-							max_row_hlc
-								.map_or(relocation.new_location.hlc, |current: HybridTimestamp| {
-									current.max(relocation.new_location.hlc)
-								}),
-						),
-					)
-				});
+				.filter(|relocation| relocation.indexed)
+				.map(|relocation| PersistentRecordRow {
+					tenant_id: relocation.tenant_id,
+					key_identity: relocation.key_identity,
+					routing_locality: relocation.routing_locality,
+					table_object_id: None,
+					placement: relocation.new_location.placement,
+					partition: relocation.new_location.partition,
+					location: relocation.new_location,
+				}),
+		);
+		let min_hlc = relocations
+			.iter()
+			.map(|relocation| relocation.new_location.hlc)
+			.chain(
+				counter_relocations
+					.iter()
+					.map(|relocation| relocation.new_location.hlc),
+			)
+			.min();
+		let max_hlc = relocations
+			.iter()
+			.map(|relocation| relocation.new_location.hlc)
+			.chain(
+				counter_relocations
+					.iter()
+					.map(|relocation| relocation.new_location.hlc),
+			)
+			.max();
 		let old_run = self
 			.compaction_manifest_snapshot()
 			.run(old_slab_id)
@@ -1223,10 +1643,16 @@ impl SlabManager {
 		let replacement_run = LsmRunSummary::new(
 			new_slab_id,
 			old_run.compaction_level,
-			min_row_hlc.expect("non-empty relocation set has a minimum HLC"),
-			max_row_hlc.expect("non-empty relocation set has a maximum HLC"),
+			min_hlc.unwrap_or_else(zero_hlc),
+			max_hlc.unwrap_or_else(zero_hlc),
 			ByteCount::new(replacement.write_cursor()),
-			RowCount::new(relocations.len() as u64),
+			RowCount::new(
+				(relocations.len()
+					+ counter_relocations
+						.iter()
+						.filter(|relocation| relocation.indexed)
+						.count()) as u64,
+			),
 			old_run.manifest_epoch,
 		);
 		let lsm_runs =
@@ -1285,6 +1711,16 @@ impl SlabManager {
 				record.old_location,
 			);
 		}
+		for relocation in counter_relocations
+			.iter()
+			.filter(|relocation| relocation.indexed)
+		{
+			self.rollback_indexed_location(
+				relocation.tenant_id,
+				relocation.key_identity,
+				relocation.old_location,
+			);
+		}
 		for relocation in relocations {
 			self.index_appended_location_with_locality(
 				relocation.tenant_id,
@@ -1302,6 +1738,19 @@ impl SlabManager {
 					relocation.new_location,
 				);
 			}
+		}
+		for relocation in counter_relocations
+			.iter()
+			.filter(|relocation| relocation.indexed)
+		{
+			self.index_appended_location_with_locality(
+				relocation.tenant_id,
+				relocation.key_identity,
+				relocation.routing_locality,
+				relocation.new_location,
+			);
+			self.relocated_reads
+				.insert(relocation.old_location, relocation.new_location);
 		}
 		drop(state);
 		Ok(true)

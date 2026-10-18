@@ -252,6 +252,10 @@ pub struct AppendReservation {
 }
 
 impl AppendReservation {
+	pub(crate) fn offset(&self) -> u64 {
+		self.offset
+	}
+
 	/// Bytes the slab's cursor advanced for this record: header, frame, and
 	/// page padding.
 	pub fn padded_size(&self) -> usize {
@@ -322,6 +326,31 @@ pub(crate) struct RecoveredCounterMarkerV2 {
 	pub location: RecordLocation,
 	pub tentative_offset: u64,
 	pub origin: crate::schema::NodeId,
+}
+
+/// One validated counter-class frame observed by a read-only maintenance walk.
+/// Ordinary frames are checked while walking but are not retained here.
+#[derive(Clone, Debug)]
+pub(crate) struct ScannedCounterFrame {
+	pub tenant_id: TenantId,
+	pub key_identity: Identity,
+	pub location: RecordLocation,
+	pub record_class: u32,
+	pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CounterMaintenanceClass {
+	TentativeV2,
+	CommitMarkerV2,
+}
+impl CounterMaintenanceClass {
+	fn record_class(self) -> u32 {
+		match self {
+			Self::TentativeV2 => crate::schema::record_class::COUNTER_TENTATIVE_V2,
+			Self::CommitMarkerV2 => crate::schema::record_class::COUNTER_COMMIT_V2,
+		}
+	}
 }
 
 impl LocalSlabStore {
@@ -449,6 +478,123 @@ impl LocalSlabStore {
 			return Err(super::counter::CounterFormatError::MaintenanceUnsupported.io());
 		}
 		Ok(())
+	}
+
+	/// Append one of the V2 counter frame kinds during a validated single-slab
+	/// maintenance rewrite. This deliberately does not expose an arbitrary class
+	/// parameter and does not index the frame; callers publish the tentative only
+	/// when its source was indexed.
+	pub(crate) async fn append_counter_maintenance_frame(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+		class: CounterMaintenanceClass,
+		frame: &[u8],
+	) -> std::io::Result<RecordLocation> {
+		let expected = match class {
+			CounterMaintenanceClass::TentativeV2 => 16,
+			CounterMaintenanceClass::CommitMarkerV2 => 16,
+		};
+		if frame.len() != expected {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"V2 maintenance counter frame has an invalid payload length",
+			));
+		}
+		super::counter::decode_origin_frame(frame)?;
+		self.write_framed(tenant_id, key_identity, hlc, class.record_class(), frame)
+			.await
+	}
+
+	/// Walk the complete physical slab without changing bytes, indexes, or recovery
+	/// state. Every header, frame length, and checksum is validated before the next
+	/// page is visited; only counter frames are retained in memory. Maintenance
+	/// callers hold the slab's exclusive rewrite claim, so the write cursor is a
+	/// stable upper bound for this walk.
+	pub(crate) async fn scan_counter_frames(&self) -> std::io::Result<Vec<ScannedCounterFrame>> {
+		let end = self.write_cursor();
+		if end % DIRECT_IO_ALIGN as u64 != 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"slab write cursor is not page aligned",
+			));
+		}
+		let header_size = std::mem::size_of::<SlabRecordHeader>();
+		let mut offset = 0_u64;
+		let mut counters = Vec::new();
+		while offset < end {
+			let probe = AlignedBuf::new(DIRECT_IO_ALIGN);
+			let (probe_read, probe) = self.file_ops.read_at(&self.file, offset, probe).await?;
+			if probe_read < header_size {
+				return Err(Error::new(
+					ErrorKind::UnexpectedEof,
+					"maintenance frame walk reached a short record header",
+				));
+			}
+			let header: SlabRecordHeader =
+				*bytemuck::from_bytes::<SlabRecordHeader>(&probe.as_slice()[..header_size]);
+			if header.magic != SLAB_RECORD_MAGIC {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!("maintenance frame walk found invalid magic at offset {offset}"),
+				));
+			}
+			let payload_size = header_size
+				.checked_add(header.frame_len as usize)
+				.ok_or_else(|| Error::new(ErrorKind::InvalidData, "frame length overflow"))?;
+			let padded_size = page_round_up(payload_size);
+			let next = offset
+				.checked_add(padded_size as u64)
+				.filter(|next| *next <= end)
+				.ok_or_else(|| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!("maintenance frame at offset {offset} exceeds the slab cursor"),
+					)
+				})?;
+			let frame_bytes = if padded_size <= DIRECT_IO_ALIGN {
+				probe.as_slice()[header_size..payload_size].to_vec()
+			} else {
+				let full = AlignedBuf::new(padded_size);
+				let (read, full) = self.file_ops.read_at(&self.file, offset, full).await?;
+				if read < payload_size {
+					return Err(Error::new(
+						ErrorKind::UnexpectedEof,
+						"maintenance frame walk reached a short record payload",
+					));
+				}
+				full.as_slice()[header_size..payload_size].to_vec()
+			};
+			verify_record_checksum(&header, &frame_bytes)?;
+			if header.record_class != crate::schema::record_class::STANDARD {
+				let location = RecordLocation {
+					slab_id: self.slab_id,
+					offset,
+					length: payload_size as u32,
+					hlc: header.hlc,
+					record_row_index: RecordRowIndex::ZERO,
+					is_tombstone: false,
+					placement: PlacementSemantics::RawLocality,
+					partition: None,
+				};
+				counters.push(ScannedCounterFrame {
+					tenant_id: header.tenant_id,
+					key_identity: header.key_identity,
+					location,
+					record_class: header.record_class,
+					payload: frame_bytes,
+				});
+			}
+			offset = next;
+		}
+		if self.write_cursor() != end {
+			return Err(Error::new(
+				ErrorKind::WouldBlock,
+				"slab write cursor changed during maintenance frame walk",
+			));
+		}
+		Ok(counters)
 	}
 
 	pub fn write_cursor(&self) -> u64 {
@@ -1503,6 +1649,27 @@ pub(crate) fn recover_slab_entries_from_blob(
 	slab_id: SlabId,
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<Vec<RecoveredSlabEntry>> {
+	recover_slab_entries_from_blob_inner(blob, slab_id, acknowledged, false)
+}
+
+/// Secondary-index discovery only consumes ordinary table rows. A maintenance
+/// replacement may also contain class-preserved counter frames, which have no
+/// table attribution; skip those validated frames while retaining the default
+/// fail-closed behavior for tiering and other blob-recovery callers.
+pub(crate) fn recover_slab_entries_from_blob_skipping_counters(
+	blob: &[u8],
+	slab_id: SlabId,
+	acknowledged: &BTreeSet<u64>,
+) -> std::io::Result<Vec<RecoveredSlabEntry>> {
+	recover_slab_entries_from_blob_inner(blob, slab_id, acknowledged, true)
+}
+
+fn recover_slab_entries_from_blob_inner(
+	blob: &[u8],
+	slab_id: SlabId,
+	acknowledged: &BTreeSet<u64>,
+	skip_counter_frames: bool,
+) -> std::io::Result<Vec<RecoveredSlabEntry>> {
 	let header_size = std::mem::size_of::<SlabRecordHeader>();
 	let mut entries = Vec::new();
 	let mut recovered_versions = HashMap::new();
@@ -1557,6 +1724,10 @@ pub(crate) fn recover_slab_entries_from_blob(
 		// would resurrect an orphan tentative). Tiering of counter slabs is a
 		// later integration that must port the committed-only rule here.
 		if matches!(header.record_class, 1..=4) {
+			if skip_counter_frames {
+				cursor += padded;
+				continue;
+			}
 			return Err(super::counter::CounterFormatError::MaintenanceUnsupported.io());
 		}
 		if header.record_class != crate::schema::record_class::STANDARD {

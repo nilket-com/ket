@@ -83,6 +83,7 @@ pub(super) fn remove_non_live_lsm_rows_from_index(
 pub(super) fn lsm_compaction_result_from_failure(err: &CompactionFailure) -> LsmCompactionResult {
 	match err {
 		CompactionFailure::ManifestRace => LsmCompactionResult::ManifestRace,
+		CompactionFailure::CounterMaintenanceSkipped => LsmCompactionResult::Aborted,
 		CompactionFailure::SidecarDigestMismatch => LsmCompactionResult::SidecarDigestMismatch,
 		CompactionFailure::VisibleDigestInvariance => LsmCompactionResult::VisibleDigestInvariance,
 		CompactionFailure::BackfillRaceLost | CompactionFailure::IoError(_) => {
@@ -622,13 +623,26 @@ impl SlabManager {
 			policy.disable("policy clock unavailable at selection");
 			return None;
 		};
-		crate::storage::lsm::pick_compaction_where(&snapshot, &worker.config(), now, |plan| {
-			let touched = plan.touched_slabs();
-			!touched
-				.iter()
-				.any(|slab_id| self.is_compaction_slab_quarantined(*slab_id))
-				&& policy.is_eligible(MaintenanceOperation::LsmCompaction, &touched, now_ms)
-		})
+		let live_l0 = snapshot
+			.slabs_at_compaction_level(CompactionLevelIndex::L0)
+			.into_iter()
+			.map(|run| run.slab_id)
+			.collect::<HashSet<_>>();
+		self.counter_deferred_l0_slabs
+			.retain(|slab_id| live_l0.contains(slab_id));
+		crate::storage::lsm::pick_compaction_where_excluding(
+			&snapshot,
+			&worker.config(),
+			now,
+			|slab_id| self.counter_deferred_l0_slabs.contains(&slab_id),
+			|plan| {
+				let touched = plan.touched_slabs();
+				!touched
+					.iter()
+					.any(|slab_id| self.is_compaction_slab_quarantined(*slab_id))
+					&& policy.is_eligible(MaintenanceOperation::LsmCompaction, &touched, now_ms)
+			},
+		)
 	}
 
 	pub async fn run_lsm_compaction_tick(
@@ -715,6 +729,7 @@ impl SlabManager {
 				tracing::debug!(
 					slabs = ?touched,
 					?refusal,
+					pending_counter_frames = self.counter_pending_frame_count(),
 					"LSM compaction plan not admitted this tick"
 				);
 				Ok(None)
@@ -761,6 +776,56 @@ impl SlabManager {
 		Ok(())
 	}
 
+	/// Multi-source LSM rewriting is still classless. Inspect every touched local
+	/// slab after exclusive claims and plan revalidation, but before output ids or
+	/// temporary files are reserved. A counter-bearing (or unavailable) backing
+	/// gets a typed retryable deferral; the original plan and source bytes stay
+	/// untouched.
+	async fn refuse_lsm_counter_inputs(
+		&self,
+		plan: &CompactionPlan,
+	) -> Result<(), CompactionFailure> {
+		for slab_id in plan.touched_slabs() {
+			if self.counter_slab_has_pending_frames(slab_id) {
+				self.note_lsm_counter_deferral(plan, slab_id);
+				return Err(CompactionFailure::CounterMaintenanceSkipped);
+			}
+			match self.resolve_backing(slab_id).await {
+				SlabBacking::Local(slab) => {
+					let scanned = match slab.scan_counter_frames().await {
+						Ok(scanned) => scanned,
+						Err(_error) if self.counter_slab_has_pending_frames(slab_id) => {
+							self.note_lsm_counter_deferral(plan, slab_id);
+							return Err(CompactionFailure::CounterMaintenanceSkipped);
+						}
+						Err(error) => return Err(error.into()),
+					};
+					if self.counter_slab_has_pending_frames(slab_id) || !scanned.is_empty() {
+						self.note_lsm_counter_deferral(plan, slab_id);
+						return Err(CompactionFailure::CounterMaintenanceSkipped);
+					}
+				}
+				// Blob-tier recovery rejects record classes 1..=4 in
+				// recover_slab_entries_from_blob, so an accepted L2 slab is counter-free.
+				SlabBacking::L2(_) => {}
+				SlabBacking::Missing => return Err(CompactionFailure::ManifestRace),
+			}
+		}
+		Ok(())
+	}
+
+	fn note_lsm_counter_deferral(&self, plan: &CompactionPlan, slab_id: SlabId) {
+		if plan.source_level == CompactionLevelIndex::L0 && plan.input_slabs.contains(&slab_id) {
+			self.counter_deferred_l0_slabs.insert(slab_id);
+		}
+		tracing::debug!(
+			slab = %slab_id,
+			deferred_l0 = plan.source_level == CompactionLevelIndex::L0,
+			pending_counter_frames = self.counter_pending_frame_count(),
+			"LSM counter-bearing source deferred"
+		);
+	}
+
 	pub(super) async fn run_lsm_compaction_once_inner(
 		&self,
 		worker: &LsmCompactionWorker,
@@ -774,6 +839,7 @@ impl SlabManager {
 		// picked before the claims existed.
 		let _claims = self.acquire_maintenance_claims(&plan.touched_slabs()).await;
 		self.revalidate_lsm_plan_after_claims(&plan)?;
+		self.refuse_lsm_counter_inputs(&plan).await?;
 		let prepared = self.prepare_lsm_compaction_outputs(worker, &plan).await?;
 		let source_frames = self.read_lsm_single_row_source_frames(&plan).await?;
 		let written = self
@@ -814,6 +880,7 @@ impl SlabManager {
 		// enough on their own.
 		let _claims = self.acquire_maintenance_claims(&plan.touched_slabs()).await;
 		self.revalidate_lsm_plan_after_claims(&plan)?;
+		self.refuse_lsm_counter_inputs(&plan).await?;
 		let table_schemas = secondary_index_context
 			.as_ref()
 			.map(|context| context.table_schemas);
