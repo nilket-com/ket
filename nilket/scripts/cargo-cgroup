@@ -69,6 +69,31 @@ progress="${CARGO_TERM_PROGRESS_WHEN:-never}"
 image="${CARGO_CGROUP_IMAGE:-rust:1}"
 allow_affinity_only="${CARGO_CGROUP_ALLOW_AFFINITY_ONLY:-0}"
 
+# A user systemd manager does not inherit the caller's environment. Preserve
+# the build/runtime inputs needed by Cargo and the tests, but do not pass the
+# wrapper-owned resource knobs: the command below sets those explicitly.
+systemd_env_args=()
+systemd_env_names=(
+	PATH HOME CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN CARGO_TARGET_DIR
+	CARGO_BUILD_TARGET CARGO_ENCODED_RUSTFLAGS RUSTFLAGS CARGO_NET_OFFLINE
+	RUSTC RUSTDOC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER TMPDIR RUST_LOG
+	RUST_BACKTRACE
+)
+for name in "${systemd_env_names[@]}"; do
+	if [[ -v "$name" ]]; then
+		systemd_env_args+=("--setenv=$name")
+	fi
+done
+
+# Forward test/application controls without adding per-ADR names to this
+# generic wrapper. `compgen -e` enumerates exported names; systemd-run's
+# bare-name form takes each value from this caller's environment.
+while IFS= read -r name; do
+	case "$name" in
+		TORON_* | WENDELON_*) systemd_env_args+=("--setenv=$name") ;;
+	esac
+done < <(compgen -e)
+
 wrapped_cmd=(
 	taskset -c "${cpus}"
 	ionice -c 3
@@ -91,6 +116,7 @@ nerdctl_available() {
 
 run_systemd() {
 	exec systemd-run --user --same-dir --wait --collect --quiet --pipe \
+		"${systemd_env_args[@]}" \
 		--nice="${nice_level}" \
 		--property="CPUQuota=${cpu_quota}" \
 		--property="MemoryHigh=${memory_high}" \
