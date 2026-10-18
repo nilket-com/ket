@@ -645,7 +645,12 @@ pub(crate) fn adr043_new_sql_protocol_names_are_brand_clean() {
 
 #[test]
 pub(crate) fn adr043_no_grpc_protobuf_or_arrow_flight() {
-	assert_toron_sources_do_not_contain(&["tonic", "prost", "arrow_flight", "arrow-flight"]);
+	assert_toron_sources_do_not_contain_identifiers(&[
+		"tonic",
+		"prost",
+		"arrow_flight",
+		"arrow-flight",
+	]);
 }
 
 #[test]
