@@ -79,8 +79,8 @@ use crate::storage::columnar::{
 use crate::storage::core::{
 	AppendReservation, GroupCommitConfig, LocalSlabStore, MultiRowIndexEntry, RecordLocation,
 	RecoveredSlabEntry, StorageEngine, insert_version_sorted, newest_version_as_of,
-	recover_slab_entries_from_blob, remove_version_exact,
-	storage_multirow_index_entries_from_frame, validate_row_tombstone_chain,
+	recover_slab_entries_from_blob, recover_slab_entries_from_blob_skipping_counters,
+	remove_version_exact, storage_multirow_index_entries_from_frame, validate_row_tombstone_chain,
 };
 use crate::storage::encoding::compute::{
 	EncodedAggregateContext, EncodedPredicateNode, EncodedRowMask, EncodingComputeFallbackReason,
@@ -240,6 +240,7 @@ use stats_facts::{TieredStatsCacheKey, tiered_stats_cache_key};
 const STORAGE_BACKUP_FORMAT_VERSION: u16 = 1;
 
 type TenantKey = (TenantId, Identity);
+type PendingCounterFrame = (TenantId, Identity, u64, u32, u32, u32, SlabId, u64);
 type TenantLocalityMembers = BTreeMap<TenantId, BTreeSet<(Locality, Identity)>>;
 
 const DEFAULT_L2_TAIL_READ_WINDOW_BYTES: u64 = 64 * 1024;
@@ -612,6 +613,13 @@ pub struct SlabManager {
 	/// value and earlier entries back time-travel reads.
 	counter_eligible: Arc<super::counter::visibility::EligibleCells<(TenantId, Identity)>>,
 	counter_unsupported: DashSet<(TenantId, Identity)>,
+	/// V2 tentatives that have not reached a durable commit marker or rollback.
+	/// This is volatile in-flight state; after restart unmarked tentatives are
+	/// ordinary recovery orphans and can be copied safely.
+	counter_pending_frames: DashSet<PendingCounterFrame>,
+	/// L0 sources whose class-preserving counter work made the current LSM plan
+	/// ineligible. Excluding just these inputs lets ordinary L0 work proceed.
+	counter_deferred_l0_slabs: DashSet<SlabId>,
 	key_index: DashMap<TenantKey, Vec<RecordLocation>>,
 	/// Tenant-scoped locality membership index for range scans.
 	///
@@ -815,7 +823,7 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 		frame: &[u8],
 	) -> std::io::Result<(Arc<LocalSlabStore>, RecordLocation)> {
-		let (slab, reservation) = self.target_for_append(frame.len()).await?;
+		let (slab, reservation) = self.target_for_append(frame.len(), None).await?;
 		let location = slab
 			.append_reserved(reservation, tenant_id, key_identity, hlc, frame)
 			.await?;
@@ -920,8 +928,18 @@ impl SlabManager {
 		origin: NodeId,
 	) -> std::io::Result<RecordLocation> {
 		let frame = super::counter::encode_origin_frame(value, origin)?;
-		let (slab, reservation) = self.target_for_append(frame.len()).await?;
-		let location = slab
+		let (slab, reservation) = self
+			.target_for_append(frame.len(), Some((tenant_id, key_identity, hlc, origin)))
+			.await?;
+		let pending = Self::pending_counter_frame(
+			tenant_id,
+			key_identity,
+			hlc,
+			origin,
+			slab.slab_id(),
+			reservation.offset(),
+		);
+		let location = match slab
 			.write_reserved(
 				reservation,
 				tenant_id,
@@ -930,11 +948,21 @@ impl SlabManager {
 				crate::schema::record_class::COUNTER_TENTATIVE_V2,
 				&frame,
 			)
-			.await?;
+			.await
+		{
+			Ok(location) => location,
+			Err(error) => {
+				self.counter_pending_frames.remove(&pending);
+				return Err(error);
+			}
+		};
 		// The prepare acknowledgement must not outrun durability of this exact
 		// tentative slab. A failed barrier leaves no live index entry or pending
 		// replica state; the written frame remains an uncommitted recovery orphan.
-		slab.wait_durable_commit().await?;
+		if let Err(error) = slab.wait_durable_commit().await {
+			self.counter_pending_frames.remove(&pending);
+			return Err(error);
+		}
 		self.index_appended_location(tenant_id, key_identity, location);
 		Ok(location)
 	}
@@ -954,7 +982,7 @@ impl SlabManager {
 		origin: NodeId,
 	) -> std::io::Result<()> {
 		let marker = super::counter::encode_origin_frame(tentative_op_id, origin)?;
-		let (slab, reservation) = self.target_for_append(marker.len()).await?;
+		let (slab, reservation) = self.target_for_append(marker.len(), None).await?;
 		slab.write_reserved(
 			reservation,
 			tenant_id,
@@ -977,7 +1005,61 @@ impl SlabManager {
 		key_identity: Identity,
 		location: RecordLocation,
 	) {
+		self.counter_pending_frames.retain(|pending| {
+			!(pending.0 == tenant_id
+				&& pending.1 == key_identity
+				&& pending.6 == location.slab_id
+				&& pending.7 == location.offset)
+		});
 		self.rollback_indexed_location(tenant_id, key_identity, location);
+	}
+
+	/// Mark a V2 tentative no longer pending only after the corresponding marker
+	/// is durable and its live eligibility reservation has been published.
+	pub(crate) fn counter_commit_published(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+		origin: NodeId,
+	) {
+		self.counter_pending_frames.retain(|pending| {
+			!(pending.0 == tenant_id
+				&& pending.1 == key_identity
+				&& pending.2 == hlc.physical_ms
+				&& pending.3 == hlc.logical
+				&& pending.4 == hlc.node_id
+				&& pending.5 == origin.id)
+		});
+	}
+
+	pub(crate) fn counter_frame_is_pending(&self, frame: &core::ScannedCounterFrame) -> bool {
+		if frame.record_class != crate::schema::record_class::COUNTER_TENTATIVE_V2 {
+			return false;
+		}
+		let Ok((_, origin)) = super::counter::decode_origin_frame(&frame.payload) else {
+			return false;
+		};
+		self.counter_pending_frames.contains(&(
+			frame.tenant_id,
+			frame.key_identity,
+			frame.location.hlc.physical_ms,
+			frame.location.hlc.logical,
+			frame.location.hlc.node_id,
+			origin.id,
+			frame.location.slab_id,
+			frame.location.offset,
+		))
+	}
+
+	pub(crate) fn counter_slab_has_pending_frames(&self, slab_id: SlabId) -> bool {
+		self.counter_pending_frames
+			.iter()
+			.any(|pending| pending.6 == slab_id)
+	}
+
+	pub(crate) fn counter_pending_frame_count(&self) -> usize {
+		self.counter_pending_frames.len()
 	}
 
 	/// Strict lookup for admission paths that must inherit an
@@ -1688,6 +1770,29 @@ impl SlabManager {
 	fn ensure_live_lsm_run_for_maintenance(&self, slab_id: SlabId, size_bytes: u64) {
 		if self.compaction_manifest_snapshot().run(slab_id).is_none() {
 			self.record_l0_compaction_run(slab_id, size_bytes);
+			// Counter commit markers are physical maintenance frames, but are
+			// intentionally absent from the ordinary row index. Preserve a live
+			// zero-row run for a non-empty marker-only slab so one-source maintenance
+			// can validate and rewrite it rather than treating it as already absent.
+			if size_bytes > 0 {
+				let mut manifest =
+					recover_rwlock_write(&self.compaction_manifest, "compaction_manifest");
+				if manifest.get_run(slab_id).is_none() {
+					let manifest_epoch = manifest.manifest_epoch();
+					manifest.insert_live_run(LsmRunSummary::new(
+						slab_id,
+						CompactionLevelIndex::L0,
+						zero_hlc(),
+						zero_hlc(),
+						ByteCount::new(size_bytes),
+						RowCount::new(0),
+						manifest_epoch,
+					));
+					let snapshot = manifest.snapshot();
+					drop(manifest);
+					refresh_lsm_level_metrics(&snapshot);
+				}
+			}
 		}
 	}
 
@@ -2873,9 +2978,30 @@ impl SlabManager {
 	/// already includes this record. An empty slab admits one complete record of
 	/// any size: the cap bounds overshoot to one padded record and never refuses
 	/// a frame (ADR 0098).
+	fn pending_counter_frame(
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+		origin: NodeId,
+		slab_id: SlabId,
+		offset: u64,
+	) -> PendingCounterFrame {
+		(
+			tenant_id,
+			key_identity,
+			hlc.physical_ms,
+			hlc.logical,
+			hlc.node_id,
+			origin.id,
+			slab_id,
+			offset,
+		)
+	}
+
 	async fn target_for_append(
 		&self,
 		frame_len: usize,
+		pending_counter: Option<(TenantId, Identity, HybridTimestamp, NodeId)>,
 	) -> std::io::Result<(Arc<LocalSlabStore>, AppendReservation)> {
 		let (_, padded) = LocalSlabStore::padded_record_size(frame_len)?;
 		let mut state = self.state.lock().await;
@@ -2884,7 +3010,19 @@ impl SlabManager {
 			cursor == 0 || cursor.saturating_add(padded as u64) <= self.config.max_slab_bytes;
 		if cursor < self.config.max_slab_bytes && fits {
 			let reservation = state.active.reserve_append(frame_len)?;
-			return Ok((state.active.clone(), reservation));
+			let slab = state.active.clone();
+			if let Some((tenant_id, key_identity, hlc, origin)) = pending_counter {
+				self.counter_pending_frames
+					.insert(Self::pending_counter_frame(
+						tenant_id,
+						key_identity,
+						hlc,
+						origin,
+						slab.slab_id(),
+						reservation.offset(),
+					));
+			}
+			return Ok((slab, reservation));
 		}
 
 		// Rotate. The check above and the mutation below happen
@@ -2910,6 +3048,17 @@ impl SlabManager {
 		self.record_l0_compaction_run(sealed_id, sealed_size);
 
 		let reservation = next_slab.reserve_append(frame_len)?;
+		if let Some((tenant_id, key_identity, hlc, origin)) = pending_counter {
+			self.counter_pending_frames
+				.insert(Self::pending_counter_frame(
+					tenant_id,
+					key_identity,
+					hlc,
+					origin,
+					next_slab.slab_id(),
+					reservation.offset(),
+				));
+		}
 		Ok((next_slab, reservation))
 	}
 

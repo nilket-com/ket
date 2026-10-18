@@ -314,9 +314,9 @@ impl MaintenanceFailureClass {
 /// said so.
 pub(crate) fn classify_compaction_failure(failure: &CompactionFailure) -> MaintenanceFailureClass {
 	match failure {
-		CompactionFailure::ManifestRace | CompactionFailure::BackfillRaceLost => {
-			MaintenanceFailureClass::Retryable
-		}
+		CompactionFailure::ManifestRace
+		| CompactionFailure::CounterMaintenanceSkipped
+		| CompactionFailure::BackfillRaceLost => MaintenanceFailureClass::Retryable,
 		CompactionFailure::SidecarDigestMismatch => {
 			MaintenanceFailureClass::Deterministic(DeterministicOrigin::SidecarDigestMismatch)
 		}

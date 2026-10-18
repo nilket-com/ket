@@ -711,6 +711,8 @@ pub struct CompactionOutcome {
 pub enum CompactionFailure {
 	#[error("manifest epoch changed before compaction commit")]
 	ManifestRace,
+	#[error("multi-source compaction deferred because a touched slab has counter frames")]
+	CounterMaintenanceSkipped,
 	#[error("rebuilt secondary-index sidecar digest did not match cold rebuild")]
 	SidecarDigestMismatch,
 	#[error("visible-domain state digest changed across compaction")]
@@ -832,8 +834,21 @@ pub fn pick_compaction_where(
 	now: HybridTimestamp,
 	eligible: impl Fn(&CompactionPlan) -> bool,
 ) -> Option<CompactionPlan> {
+	pick_compaction_where_excluding(manifest, config, now, |_| false, eligible)
+}
+
+/// Variant used when a source-level plan has a known deferred input. L0 plans
+/// can omit that input while retaining the configured minimum run count; other
+/// levels continue through their normal eligibility filter.
+pub(crate) fn pick_compaction_where_excluding(
+	manifest: &ManifestSnapshot,
+	config: &LsmConfig,
+	now: HybridTimestamp,
+	excluded_l0_slab: impl Fn(SlabId) -> bool,
+	eligible: impl Fn(&CompactionPlan) -> bool,
+) -> Option<CompactionPlan> {
 	config.validate().ok()?;
-	pick_l0_compaction(manifest, config, now)
+	pick_l0_compaction(manifest, config, now, &excluded_l0_slab)
 		.filter(&eligible)
 		.or_else(|| {
 			pick_level_pressure_compaction(
@@ -859,8 +874,10 @@ fn pick_l0_compaction(
 	manifest: &ManifestSnapshot,
 	config: &LsmConfig,
 	now: HybridTimestamp,
+	excluded: &impl Fn(SlabId) -> bool,
 ) -> Option<CompactionPlan> {
 	let mut l0 = manifest.slabs_at_compaction_level(CompactionLevelIndex::L0);
+	l0.retain(|run| !excluded(run.slab_id));
 	if l0.len() < config.max_l0_slab_count as usize {
 		return None;
 	}

@@ -337,6 +337,8 @@ impl SlabManager {
 			slab_pins: Arc::new(SlabPinTable::default()),
 			counter_eligible,
 			counter_unsupported,
+			counter_pending_frames: DashSet::new(),
+			counter_deferred_l0_slabs: DashSet::new(),
 			key_index,
 			locality_index: RwLock::new(locality_index),
 			key_localities,

@@ -1277,7 +1277,7 @@ impl SlabManager {
 		plaintext: &[u8],
 	) -> std::io::Result<BTreeSet<(TenantId, TableObjectId)>> {
 		let mut table_ids = BTreeSet::new();
-		for recovered in recover_slab_entries_from_blob(
+		for recovered in recover_slab_entries_from_blob_skipping_counters(
 			plaintext,
 			source_slab_id,
 			&self.acknowledged_offsets_in_slab(source_slab_id),
@@ -1841,22 +1841,16 @@ impl SlabManager {
 			let state = self.state.lock().await;
 			state.sealed.get(&slab_id).map(|slab| slab.value().clone())
 		}?;
-		// The legacy bridge, preserved: a sealed slab with NO manifest run at all
-		// predates the manifest and is adopted here. It used to run inside the
-		// rewrite paths; moving ownership above the scan must not strand such a slab
-		// by mistaking "never recorded" for "retired". It runs against the refetched
-		// slab, so the size it records is the current image's.
-		self.ensure_live_lsm_run_for_maintenance(slab_id, current.write_cursor());
-		// With a run guaranteed to exist, a NON-Live one means a retired source that
-		// a replacement deliberately left sealed for stale readers until the
-		// delete-pending sweep disposes of it. That is exactly the image this job
-		// waited to stop using, and scanning it would be the stale work the wait was
-		// supposed to prevent.
+		// A NON-Live run means a retired source that a replacement deliberately
+		// left sealed for stale readers until the delete-pending sweep disposes of
+		// it. A missing run is different: defer the legacy adoption until after the
+		// caller's physical admission scan, so a malformed source cannot mutate
+		// manifest state merely by being inspected.
 		{
 			let manifest = recover_rwlock_read(&self.compaction_manifest, "compaction_manifest");
-			if !manifest
+			if manifest
 				.get_run(slab_id)
-				.is_some_and(|run| run.state.is_live())
+				.is_some_and(|run| !run.state.is_live())
 			{
 				return None;
 			}
@@ -1948,7 +1942,7 @@ impl SlabManager {
 	) -> std::io::Result<SecondaryIndexSegment> {
 		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
 		let mut index_entries = Vec::new();
-		for recovered in recover_slab_entries_from_blob(
+		for recovered in recover_slab_entries_from_blob_skipping_counters(
 			plaintext,
 			source_slab_id,
 			&self.acknowledged_offsets_in_slab(source_slab_id),

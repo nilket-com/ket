@@ -3446,6 +3446,887 @@ async fn ctr6_recovery_is_independent_of_slab_enumeration_order() {
 	}
 }
 
+async fn compact_sealed_counter_fixture(
+	manager: &Arc<SlabManager>,
+	slab_id: SlabId,
+	records: &[CompactionRecord],
+) -> std::io::Result<Option<CompactionOutcome>> {
+	let slab = manager
+		.state
+		.lock()
+		.await
+		.sealed
+		.get(&slab_id)
+		.map(|entry| entry.value().clone())
+		.expect("counter compaction fixture source is sealed");
+	let claims = manager.acquire_maintenance_claims(&[slab_id]).await;
+	let schemas = TableSchemaCatalog::default();
+	let indexes = SecondaryIndexCatalog::default();
+	manager
+		.compact_sealed_slab_records(
+			slab_id,
+			slab,
+			records,
+			SecondaryIndexCompactionContext {
+				table_schemas: &schemas,
+				secondary_indexes: &indexes,
+			},
+			&claims,
+		)
+		.await
+}
+
+#[tokio::test]
+async fn fctr5a_counter_only_rewrite_preserves_pair_and_remaps_same_slab_marker() {
+	use crate::storage::core::ScannedCounterFrame;
+	use crate::storage::counter::CounterReplicaService;
+
+	let (dir, manager) = fresh_manager().await;
+	let origin = NodeId {
+		id: 0x5a01,
+		_reserved: 0,
+	};
+	let key = id(0x5a02);
+	let ordinary_key = id(0x5a03);
+	let ordinary = manager
+		.append_durable(tenant(), ordinary_key, hlc(9), b"ordinary frame elided")
+		.await
+		.unwrap();
+	let service = CounterReplicaService::new(manager.clone());
+	service
+		.replicate_tentative(
+			origin,
+			10,
+			tenant(),
+			key,
+			42,
+			HybridTimestamp {
+				physical_ms: 10,
+				logical: 0,
+				node_id: 0,
+			},
+		)
+		.await
+		.unwrap();
+	service.commit(origin, 10, tenant(), key).await.unwrap();
+	let source_id = manager.force_seal_active_for_test().await;
+	let source = manager
+		.state
+		.lock()
+		.await
+		.sealed
+		.get(&source_id)
+		.unwrap()
+		.value()
+		.clone();
+	let source_frames = source.scan_counter_frames().await.unwrap();
+	assert_eq!(
+		source_frames
+			.iter()
+			.map(|frame| frame.record_class)
+			.collect::<Vec<_>>(),
+		vec![
+			crate::schema::record_class::COUNTER_TENTATIVE_V2,
+			crate::schema::record_class::COUNTER_COMMIT_V2,
+		]
+	);
+	let source_tentative = source_frames
+		.iter()
+		.find(|frame| frame.record_class == crate::schema::record_class::COUNTER_TENTATIVE_V2)
+		.unwrap()
+		.clone();
+	let source_marker = source_frames
+		.iter()
+		.find(|frame| frame.record_class == crate::schema::record_class::COUNTER_COMMIT_V2)
+		.unwrap()
+		.clone();
+	assert!(source_tentative.location.offset > 0);
+	assert_eq!(
+		u64::from_le_bytes(source_marker.payload[..8].try_into().unwrap()),
+		source_tentative.location.offset
+	);
+
+	let dead = [CompactionRecord {
+		tenant_id: tenant(),
+		key_identity: ordinary_key,
+		routing_locality: Locality::from(ordinary_key),
+		old_location: ordinary,
+		reclaim: true,
+		retention_ambiguous: false,
+		retention_lag_seconds: 0,
+	}];
+	let outcome = compact_sealed_counter_fixture(&manager, source_id, &dead)
+		.await
+		.unwrap()
+		.expect(
+			"counter-bearing source must publish a replacement even when all ordinary rows elide",
+		);
+	assert_eq!(outcome.reclaimed_records, 1);
+	assert_eq!(
+		service.read_committed(tenant(), key).await.unwrap(),
+		Some(42)
+	);
+	assert!(manager.lookup(tenant(), ordinary_key).is_none());
+
+	let moved = manager
+		.lookup(tenant(), key)
+		.expect("counter tentative remains indexed");
+	assert_ne!(moved.slab_id, source_id);
+	let replacement = manager
+		.state
+		.lock()
+		.await
+		.sealed
+		.get(&moved.slab_id)
+		.unwrap()
+		.value()
+		.clone();
+	let frames: Vec<ScannedCounterFrame> = replacement.scan_counter_frames().await.unwrap();
+	let tentative = frames
+		.iter()
+		.find(|frame| frame.record_class == crate::schema::record_class::COUNTER_TENTATIVE_V2)
+		.unwrap();
+	let marker = frames
+		.iter()
+		.find(|frame| frame.record_class == crate::schema::record_class::COUNTER_COMMIT_V2)
+		.unwrap();
+	assert_eq!(tentative.payload, source_tentative.payload);
+	assert_eq!(tentative.location.offset, 0);
+	assert_eq!(
+		u64::from_le_bytes(marker.payload[..8].try_into().unwrap()),
+		tentative.location.offset,
+		"same-slab marker must be remapped to the replacement tentative"
+	);
+	assert_ne!(marker.payload, source_marker.payload);
+	assert_eq!(
+		marker.record_class,
+		crate::schema::record_class::COUNTER_COMMIT_V2
+	);
+	let manifest = manager.compaction_manifest_snapshot();
+	let replacement_run = manifest
+		.run(moved.slab_id)
+		.expect("replacement run published");
+	assert_eq!(replacement_run.row_count.get(), 1);
+	assert!(replacement_run.size_bytes.get() > 0);
+	assert!(
+		manifest
+			.run(source_id)
+			.is_some_and(|run| !run.state.is_live())
+	);
+
+	manager.fsync_all_local_slabs().await.unwrap();
+	drop(service);
+	drop(manager);
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let recovered = crate::storage::counter::CounterReplicaService::new(reopened);
+	assert_eq!(
+		recovered.read_committed(tenant(), key).await.unwrap(),
+		Some(42)
+	);
+}
+
+#[tokio::test]
+async fn fctr5a_cross_slab_marker_is_copied_verbatim_by_identity() {
+	use crate::storage::counter::CounterReplicaService;
+
+	let (dir, manager) = fresh_manager().await;
+	let origin = NodeId {
+		id: 0x5a11,
+		_reserved: 0,
+	};
+	let key = id(0x5a12);
+	let service = CounterReplicaService::new(manager.clone());
+	service
+		.replicate_tentative(
+			origin,
+			20,
+			tenant(),
+			key,
+			43,
+			HybridTimestamp {
+				physical_ms: 20,
+				logical: 0,
+				node_id: 0,
+			},
+		)
+		.await
+		.unwrap();
+	let tentative_slab = manager.force_seal_active_for_test().await;
+	service.commit(origin, 20, tenant(), key).await.unwrap();
+	let marker_slab = manager.force_seal_active_for_test().await;
+	assert_ne!(tentative_slab, marker_slab);
+	let marker_source = manager
+		.state
+		.lock()
+		.await
+		.sealed
+		.get(&marker_slab)
+		.unwrap()
+		.value()
+		.clone();
+	let source_marker = marker_source
+		.scan_counter_frames()
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|frame| frame.record_class == crate::schema::record_class::COUNTER_COMMIT_V2)
+		.unwrap();
+	let original_payload = source_marker.payload.clone();
+
+	compact_sealed_counter_fixture(&manager, marker_slab, &[])
+		.await
+		.unwrap()
+		.expect("marker-only slab must be retained via identity-bound committed state");
+	let tentative = manager.lookup(tenant(), key).unwrap();
+	assert_eq!(tentative.slab_id, tentative_slab);
+	let replacement = {
+		let state = manager.state.lock().await;
+		let mut replacements = state
+			.sealed
+			.iter()
+			.filter(|entry| entry.key() != &tentative_slab && entry.key() != &marker_slab)
+			.map(|entry| entry.value().clone());
+		let replacement = replacements
+			.next()
+			.expect("replacement marker slab installed");
+		assert!(
+			replacements.next().is_none(),
+			"only one replacement slab expected"
+		);
+		replacement
+	};
+	let moved_frame = replacement
+		.scan_counter_frames()
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|frame| frame.record_class == crate::schema::record_class::COUNTER_COMMIT_V2)
+		.unwrap();
+	assert_eq!(moved_frame.payload, original_payload);
+	let manifest = manager.compaction_manifest_snapshot();
+	let marker_run = manifest
+		.run(replacement.slab_id())
+		.expect("counter-only replacement has a manifest run");
+	assert_eq!(marker_run.row_count.get(), 0);
+	assert!(marker_run.size_bytes.get() > 0);
+	assert_eq!(
+		service.read_committed(tenant(), key).await.unwrap(),
+		Some(43)
+	);
+	manager.fsync_all_local_slabs().await.unwrap();
+	drop(service);
+	drop(manager);
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let recovered = crate::storage::counter::CounterReplicaService::new(reopened);
+	assert_eq!(
+		recovered.read_committed(tenant(), key).await.unwrap(),
+		Some(43)
+	);
+}
+
+#[tokio::test]
+async fn fctr5a_legacy_and_orphan_marker_rewrites_refuse_without_mutation() {
+	for legacy in [true, false] {
+		let (dir, manager) = fresh_manager().await;
+		let key = id(if legacy { 0x5a21 } else { 0x5a22 });
+		let origin = NodeId {
+			id: 0x5a23,
+			_reserved: 0,
+		};
+		let slab = manager.state.lock().await.active.clone();
+		let payload = crate::storage::counter::encode_origin_frame(7, origin).unwrap();
+		if legacy {
+			slab.write_framed(
+				tenant(),
+				key,
+				hlc(70),
+				crate::schema::record_class::COUNTER_TENTATIVE,
+				&payload,
+			)
+			.await
+			.unwrap();
+		} else {
+			manager
+				.counter_append_commit_marker(tenant(), key, hlc(70), 1234, origin)
+				.await
+				.unwrap();
+		}
+		let source_id = manager.force_seal_active_for_test().await;
+		let path = slab_path(&dir, source_id);
+		let before = std::fs::read(&path).unwrap();
+		let manifest_epoch = manager.compaction_manifest_snapshot().manifest_epoch;
+		let schemas = TableSchemaCatalog::default();
+		let indexes = SecondaryIndexCatalog::default();
+		let result = manager
+			.compact_one_sealed_slab(
+				source_id,
+				&[],
+				SecondaryIndexCompactionContext {
+					table_schemas: &schemas,
+					secondary_indexes: &indexes,
+				},
+			)
+			.await;
+		assert!(
+			result.is_err(),
+			"invalid counter maintenance source must fail closed"
+		);
+		assert_eq!(
+			std::fs::read(&path).unwrap(),
+			before,
+			"source bytes changed"
+		);
+		assert_eq!(
+			manager.compaction_manifest_snapshot().manifest_epoch,
+			manifest_epoch,
+			"refusal must not publish a replacement manifest"
+		);
+		assert_eq!(
+			std::fs::read_dir(&*dir)
+				.unwrap()
+				.filter_map(Result::ok)
+				.filter(|entry| entry.file_name().to_string_lossy().ends_with(".wnd"))
+				.count(),
+			2,
+			"only source and fresh active slab may exist after refusal"
+		);
+	}
+}
+
+#[tokio::test]
+async fn fctr5a_same_slab_offset_conflict_refuses_before_publication() {
+	use crate::storage::counter::CounterReplicaService;
+
+	let (dir, manager) = fresh_manager().await;
+	let origin = NodeId {
+		id: 0x5a24,
+		_reserved: 0,
+	};
+	let key = id(0x5a25);
+	let commit_hlc = HybridTimestamp {
+		physical_ms: 75,
+		logical: 0,
+		node_id: 0,
+	};
+	let service = CounterReplicaService::new(manager.clone());
+	service
+		.replicate_tentative(origin, 75, tenant(), key, 75, commit_hlc)
+		.await
+		.unwrap();
+	let tentative = manager.lookup(tenant(), key).unwrap();
+	service.commit(origin, 75, tenant(), key).await.unwrap();
+	manager
+		.counter_append_commit_marker(tenant(), key, commit_hlc, tentative.offset + 4096, origin)
+		.await
+		.unwrap();
+	let source_id = manager.force_seal_active_for_test().await;
+	let path = slab_path(&dir, source_id);
+	let source_before = std::fs::read(&path).unwrap();
+	let manifest_before = manager.compaction_manifest_snapshot();
+	let schemas = TableSchemaCatalog::default();
+	let indexes = SecondaryIndexCatalog::default();
+	let result = manager
+		.compact_one_sealed_slab(
+			source_id,
+			&[],
+			SecondaryIndexCompactionContext {
+				table_schemas: &schemas,
+				secondary_indexes: &indexes,
+			},
+		)
+		.await;
+	let error = match result {
+		Err(error) => error,
+		Ok(_) => panic!("same-slab marker offset mismatch must refuse maintenance"),
+	};
+	assert_eq!(
+		error.get_ref().and_then(
+			|inner| inner.downcast_ref::<crate::storage::counter::CounterVisibilityError>()
+		),
+		Some(&crate::storage::counter::CounterVisibilityError::Conflict)
+	);
+	assert_eq!(std::fs::read(&path).unwrap(), source_before);
+	let manifest_after = manager.compaction_manifest_snapshot();
+	assert_eq!(
+		manifest_after.manifest_epoch,
+		manifest_before.manifest_epoch
+	);
+	assert_eq!(
+		manifest_after.run(source_id),
+		manifest_before.run(source_id)
+	);
+	assert_eq!(
+		std::fs::read_dir(&*dir)
+			.unwrap()
+			.filter_map(Result::ok)
+			.filter(|entry| entry.file_name().to_string_lossy().ends_with(".wnd"))
+			.count(),
+		2,
+		"conflict admission must not leave a staged replacement"
+	);
+}
+
+#[tokio::test]
+async fn fctr5a_pending_tentative_defers_without_mutation() {
+	let (dir, manager) = fresh_manager().await;
+	let origin = NodeId {
+		id: 0x5a26,
+		_reserved: 0,
+	};
+	let key = id(0x5a27);
+	manager
+		.counter_append_tentative(
+			tenant(),
+			key,
+			HybridTimestamp {
+				physical_ms: 76,
+				logical: 0,
+				node_id: 0,
+			},
+			76,
+			origin,
+		)
+		.await
+		.unwrap();
+	assert_eq!(manager.counter_pending_frame_count(), 1);
+	let source_id = manager.force_seal_active_for_test().await;
+	let path = slab_path(&dir, source_id);
+	let source_before = std::fs::read(&path).unwrap();
+	let manifest_before = manager.compaction_manifest_snapshot();
+	let schemas = TableSchemaCatalog::default();
+	let indexes = SecondaryIndexCatalog::default();
+	let outcome = manager
+		.compact_one_sealed_slab(
+			source_id,
+			&[],
+			SecondaryIndexCompactionContext {
+				table_schemas: &schemas,
+				secondary_indexes: &indexes,
+			},
+		)
+		.await
+		.unwrap();
+	assert_eq!(outcome.scan, SealedSlabScan::Deferred);
+	assert!(outcome.compaction.is_none());
+	assert_eq!(std::fs::read(&path).unwrap(), source_before);
+	let manifest_after = manager.compaction_manifest_snapshot();
+	assert_eq!(
+		manifest_after.manifest_epoch,
+		manifest_before.manifest_epoch
+	);
+	assert_eq!(
+		manifest_after.run(source_id),
+		manifest_before.run(source_id)
+	);
+	assert_eq!(
+		std::fs::read_dir(&*dir)
+			.unwrap()
+			.filter_map(Result::ok)
+			.filter(|entry| entry.file_name().to_string_lossy().ends_with(".wnd"))
+			.count(),
+		2,
+		"pending counter admission must not create a replacement"
+	);
+	manager.fsync_all_local_slabs().await.unwrap();
+	drop(manager);
+
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert_eq!(reopened.counter_pending_frame_count(), 0);
+	let outcome = reopened
+		.compact_one_sealed_slab(
+			source_id,
+			&[],
+			SecondaryIndexCompactionContext {
+				table_schemas: &schemas,
+				secondary_indexes: &indexes,
+			},
+		)
+		.await
+		.expect("restart discards volatile pending state, leaving the orphan compactable");
+	assert!(outcome.compaction.is_some());
+}
+
+#[tokio::test]
+async fn fctr5a_duplicate_marker_rewrite_remains_idempotent() {
+	use crate::storage::counter::CounterReplicaService;
+
+	let (dir, manager) = fresh_manager().await;
+	let origin = NodeId {
+		id: 0x5a28,
+		_reserved: 0,
+	};
+	let key = id(0x5a29);
+	let commit_hlc = HybridTimestamp {
+		physical_ms: 77,
+		logical: 0,
+		node_id: 0,
+	};
+	let service = CounterReplicaService::new(manager.clone());
+	service
+		.replicate_tentative(origin, 77, tenant(), key, 77, commit_hlc)
+		.await
+		.unwrap();
+	let tentative = manager.lookup(tenant(), key).unwrap();
+	service.commit(origin, 77, tenant(), key).await.unwrap();
+	manager
+		.counter_append_commit_marker(tenant(), key, commit_hlc, tentative.offset, origin)
+		.await
+		.unwrap();
+	let source_id = manager.force_seal_active_for_test().await;
+	let source = manager
+		.state
+		.lock()
+		.await
+		.sealed
+		.get(&source_id)
+		.unwrap()
+		.value()
+		.clone();
+	let source_markers = source
+		.scan_counter_frames()
+		.await
+		.unwrap()
+		.into_iter()
+		.filter(|frame| frame.record_class == crate::schema::record_class::COUNTER_COMMIT_V2)
+		.collect::<Vec<_>>();
+	assert_eq!(source_markers.len(), 2);
+	assert_eq!(source_markers[0].payload, source_markers[1].payload);
+
+	compact_sealed_counter_fixture(&manager, source_id, &[])
+		.await
+		.unwrap()
+		.expect("duplicate committed markers are preserved by one-source rewrite");
+	assert_eq!(
+		service.read_committed(tenant(), key).await.unwrap(),
+		Some(77)
+	);
+	let replacement = {
+		let state = manager.state.lock().await;
+		state
+			.sealed
+			.iter()
+			.find(|entry| *entry.key() != source_id)
+			.expect("replacement slab installed")
+			.value()
+			.clone()
+	};
+	let replacement_markers = replacement
+		.scan_counter_frames()
+		.await
+		.unwrap()
+		.into_iter()
+		.filter(|frame| frame.record_class == crate::schema::record_class::COUNTER_COMMIT_V2)
+		.collect::<Vec<_>>();
+	assert_eq!(replacement_markers.len(), 2);
+	assert_eq!(
+		replacement_markers[0].payload,
+		replacement_markers[1].payload
+	);
+	manager.fsync_all_local_slabs().await.unwrap();
+	drop(service);
+	drop(manager);
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let recovered = crate::storage::counter::CounterReplicaService::new(reopened);
+	assert_eq!(
+		recovered.read_committed(tenant(), key).await.unwrap(),
+		Some(77)
+	);
+}
+
+#[tokio::test]
+async fn fctr5a_malformed_v2_payload_refuses_without_mutation() {
+	let (dir, manager) = fresh_manager().await;
+	let key = id(0x5a2a);
+	let slab = manager.state.lock().await.active.clone();
+	slab.write_framed(
+		tenant(),
+		key,
+		hlc(78),
+		crate::schema::record_class::COUNTER_COMMIT_V2,
+		b"truncated origin frame",
+	)
+	.await
+	.unwrap();
+	let source_id = manager.force_seal_active_for_test().await;
+	let path = slab_path(&dir, source_id);
+	let source_before = std::fs::read(&path).unwrap();
+	let manifest_before = manager.compaction_manifest_snapshot();
+	let schemas = TableSchemaCatalog::default();
+	let indexes = SecondaryIndexCatalog::default();
+	let result = manager
+		.compact_one_sealed_slab(
+			source_id,
+			&[],
+			SecondaryIndexCompactionContext {
+				table_schemas: &schemas,
+				secondary_indexes: &indexes,
+			},
+		)
+		.await;
+	assert!(result.is_err(), "malformed V2 input must fail closed");
+	assert_eq!(std::fs::read(&path).unwrap(), source_before);
+	let manifest_after = manager.compaction_manifest_snapshot();
+	assert_eq!(
+		manifest_after.manifest_epoch,
+		manifest_before.manifest_epoch
+	);
+	assert_eq!(
+		manifest_after.run(source_id),
+		manifest_before.run(source_id)
+	);
+	assert_eq!(
+		std::fs::read_dir(&*dir)
+			.unwrap()
+			.filter_map(Result::ok)
+			.filter(|entry| entry.file_name().to_string_lossy().ends_with(".wnd"))
+			.count(),
+		2,
+		"malformed admission must not create a replacement"
+	);
+}
+
+#[tokio::test]
+async fn fctr7_lsm_rewrite_refuses_counter_input_before_output_creation() {
+	use crate::storage::counter::CounterReplicaService;
+	use crate::storage::lsm::CompactionFailure;
+	use crate::storage::maintenance_policy::{
+		MaintenanceFailureClass, classify_compaction_failure,
+	};
+
+	let (dir, manager) = fresh_manager().await;
+	let key = id(0x5a31);
+	let origin = NodeId {
+		id: 0x5a32,
+		_reserved: 0,
+	};
+	let service = CounterReplicaService::new(manager.clone());
+	service
+		.replicate_tentative(
+			origin,
+			42,
+			tenant(),
+			key,
+			42,
+			HybridTimestamp {
+				physical_ms: 42,
+				logical: 0,
+				node_id: 0,
+			},
+		)
+		.await
+		.unwrap();
+	service.commit(origin, 42, tenant(), key).await.unwrap();
+	let counter_slab = manager.force_seal_active_for_test().await;
+	let ordinary_key = id(0x5a33);
+	manager
+		.append_durable(tenant(), ordinary_key, hlc(43), b"ordinary LSM row")
+		.await
+		.unwrap();
+	manager.force_seal_active_for_test().await;
+	for n in 0..3 {
+		manager
+			.append_durable(
+				tenant(),
+				id(0x5a40 + n),
+				hlc(44 + n),
+				b"another ordinary LSM row",
+			)
+			.await
+			.unwrap();
+		manager.force_seal_active_for_test().await;
+	}
+	let before_manifest = manager.compaction_manifest_snapshot();
+	let mut before_files = std::fs::read_dir(&*dir)
+		.unwrap()
+		.filter_map(Result::ok)
+		.map(|entry| entry.path())
+		.filter(|path| path.extension().is_some_and(|extension| extension == "wnd"))
+		.map(|path| {
+			(
+				path.file_name().unwrap().to_owned(),
+				std::fs::read(path).unwrap(),
+			)
+		})
+		.collect::<Vec<_>>();
+	before_files.sort_by(|a, b| a.0.cmp(&b.0));
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let error = manager
+		.run_lsm_compaction_tick(&worker, hlc(20_000))
+		.await
+		.expect_err("multi-source LSM must defer counter-bearing input before output preparation");
+	assert!(matches!(
+		error,
+		CompactionFailure::CounterMaintenanceSkipped
+	));
+	assert_eq!(
+		classify_compaction_failure(&error),
+		MaintenanceFailureClass::Retryable,
+		"the refusal must return through the existing retryable policy"
+	);
+	assert_eq!(
+		manager.compaction_manifest_snapshot().manifest_epoch,
+		before_manifest.manifest_epoch
+	);
+	let mut after_files = std::fs::read_dir(&*dir)
+		.unwrap()
+		.filter_map(Result::ok)
+		.map(|entry| entry.path())
+		.filter(|path| path.extension().is_some_and(|extension| extension == "wnd"))
+		.map(|path| {
+			(
+				path.file_name().unwrap().to_owned(),
+				std::fs::read(path).unwrap(),
+			)
+		})
+		.collect::<Vec<_>>();
+	after_files.sort_by(|a, b| a.0.cmp(&b.0));
+	assert_eq!(after_files, before_files, "LSM refusal changed slab files");
+	let retryable = manager.maintenance_policy().report().retryable;
+	assert_eq!(
+		retryable.len(),
+		1,
+		"the counter-bearing plan is counted once"
+	);
+	assert_eq!(retryable[0].consecutive_failures, 1);
+	assert!(manager.counter_deferred_l0_slabs.contains(&counter_slab));
+	let next_plan = manager
+		.pick_lsm_compaction_plan(&worker, hlc(20_001))
+		.expect("ordinary L0 inputs remain eligible after the counter deferral");
+	assert_eq!(next_plan.input_slabs.len(), 4);
+	assert!(!next_plan.input_slabs.contains(&counter_slab));
+	let outcome = manager
+		.run_lsm_compaction_tick(&worker, hlc(20_001))
+		.await
+		.unwrap()
+		.expect("ordinary L0 runs compact on the next picker tick");
+	assert!(outcome.rows_out > 0);
+	assert_eq!(
+		service.read_committed(tenant(), key).await.unwrap(),
+		Some(42)
+	);
+	manager.fsync_all_local_slabs().await.unwrap();
+	drop(service);
+	drop(manager);
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let recovered = CounterReplicaService::new(reopened);
+	assert_eq!(
+		recovered.read_committed(tenant(), key).await.unwrap(),
+		Some(42)
+	);
+}
+
+#[tokio::test]
+async fn fctr5a_lsm_compacts_tiered_ordinary_l0_with_local_runs() {
+	let l1_dir = fresh_dir("fctr5a-lsm-l2-l1");
+	let l2_dir = fresh_dir("fctr5a-lsm-l2-l2");
+	let io = spawn_io_thread(64).unwrap();
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
+	let manager = Arc::new(
+		SlabManager::open(SlabManagerConfig {
+			dir: l1_dir.to_path_buf(),
+			max_slab_bytes: 1,
+			io: io.clone(),
+			l2: Some(l2.clone()),
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		})
+		.await
+		.unwrap(),
+	);
+	manager
+		.append_durable(tenant(), id(0x5a50), hlc(10), b"tiered ordinary row")
+		.await
+		.unwrap();
+	let tiered_slab = manager.force_seal_active_for_test().await;
+	let raw = manager.read_sealed_raw(tiered_slab).await.unwrap();
+	let encrypted = manager
+		.encrypt_tiered_object_blob(tiered_slab, &raw)
+		.unwrap();
+	let payload_hash = crate::hash::content::digest(&encrypted.bytes);
+	let uri = l2
+		.put(
+			&format!("sealed/slab_{tiered_slab:016x}.wnd"),
+			&encrypted.bytes,
+		)
+		.await
+		.unwrap();
+	manager
+		.apply_tier_slab(TieredSlabPointer {
+			slab_id: tiered_slab,
+			l2_uri: uri,
+			payload_hash,
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		})
+		.await
+		.unwrap();
+	assert!(manager.is_tiered(tiered_slab).await);
+
+	for n in 0..3 {
+		manager
+			.append_durable(tenant(), id(0x5a51 + n), hlc(11 + n), b"local ordinary row")
+			.await
+			.unwrap();
+		manager.force_seal_active_for_test().await;
+	}
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let plan = manager
+		.pick_lsm_compaction_plan(&worker, hlc(20_000))
+		.expect("four L0 runs including the tiered ordinary run are eligible");
+	assert!(plan.input_slabs.contains(&tiered_slab));
+	let outcome = manager
+		.run_lsm_compaction_tick(&worker, hlc(20_000))
+		.await
+		.unwrap()
+		.expect("counter-free L2 source must not stall ordinary LSM work");
+	assert_eq!(outcome.rows_out, 4);
+}
+
 // Acceptance: manager rollback removes the live tentative index entry only
 // (no durable abort marker, no effect on prior committed state).
 #[tokio::test]
@@ -14588,6 +15469,7 @@ async fn maintenance_publication_refuses_relocation_survivor_mismatch() {
 			replacement,
 			&records,
 			&[],
+			&[],
 			&staged_path,
 		)
 		.await
@@ -15124,7 +16006,7 @@ async fn append_admission_reserves_the_padded_record_under_the_lock() {
 	let (_, padded) = LocalSlabStore::padded_record_size(frame_len).unwrap();
 	assert!((padded as u64) * 2 > cap && (padded as u64) < cap);
 
-	let (first_slab, first) = mgr.target_for_append(frame_len).await.unwrap();
+	let (first_slab, first) = mgr.target_for_append(frame_len, None).await.unwrap();
 	assert_eq!(
 		first_slab.write_cursor(),
 		padded as u64,
@@ -15132,7 +16014,7 @@ async fn append_admission_reserves_the_padded_record_under_the_lock() {
 	);
 	assert_eq!(first.padded_size(), padded);
 
-	let (second_slab, second) = mgr.target_for_append(frame_len).await.unwrap();
+	let (second_slab, second) = mgr.target_for_append(frame_len, None).await.unwrap();
 	assert!(
 		second_slab.slab_id() > first_slab.slab_id(),
 		"the second admission saw the first reservation and rotated"
@@ -15244,7 +16126,10 @@ async fn durable_append_after_an_unwritten_reservation_survives_reopen() {
 	// A: admitted and reserved, never written. Three pages wide so the hole
 	// is more than one probe page.
 	let hole_frame_len = 2 * crate::storage::io_uring::DIRECT_IO_ALIGN + 16;
-	let (slab, reservation) = manager.target_for_append(hole_frame_len).await.unwrap();
+	let (slab, reservation) = manager
+		.target_for_append(hole_frame_len, None)
+		.await
+		.unwrap();
 	let hole_end = reservation.padded_size() as u64;
 	drop(reservation);
 	assert_eq!(slab.write_cursor(), hole_end);
@@ -15296,7 +16181,7 @@ async fn blob_recovery_resumes_only_at_acknowledged_offsets() {
 		.append_durable(tenant(), id(0x9910), hlc(110), b"before-the-hole")
 		.await
 		.unwrap();
-	let (_, reservation) = manager.target_for_append(16).await.unwrap();
+	let (_, reservation) = manager.target_for_append(16, None).await.unwrap();
 	assert_eq!(reservation.padded_size(), page);
 	drop(reservation);
 	let after = manager
@@ -15539,7 +16424,7 @@ async fn recovery_without_the_durable_index_stops_at_the_first_anomaly() {
 	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	assert!(manager.persistent_index.is_none());
 
-	let (slab, reservation) = manager.target_for_append(16).await.unwrap();
+	let (slab, reservation) = manager.target_for_append(16, None).await.unwrap();
 	drop(reservation);
 	let key = id(0x99B0);
 	let after = manager
@@ -15565,7 +16450,7 @@ async fn recovery_without_the_durable_index_stops_at_the_first_anomaly() {
 #[tokio::test]
 async fn encrypted_slab_with_a_leading_hole_round_trips_with_evidence() {
 	let (_mgr_dir, mgr) = fresh_manager().await;
-	let (_, reservation) = mgr.target_for_append(16).await.unwrap();
+	let (_, reservation) = mgr.target_for_append(16, None).await.unwrap();
 	drop(reservation);
 	mgr.append_durable(tenant(), id(0x99C0), hlc(160), b"durable-after-hole")
 		.await

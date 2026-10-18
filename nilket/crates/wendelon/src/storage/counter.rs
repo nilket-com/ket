@@ -345,6 +345,16 @@ pub trait CounterSlab {
 		tentative_op_id: u64,
 		origin: NodeId,
 	) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
+	/// Complete the manager's in-flight tentative admission after the marker is
+	/// durable and any live eligibility reservation has been published.
+	fn counter_commit_published(
+		&self,
+		_tenant_id: TenantId,
+		_key_identity: Identity,
+		_hlc: HybridTimestamp,
+		_origin: NodeId,
+	) {
+	}
 	/// Remove a tentative version from the live index (rollback; recovery skips
 	/// the orphan).
 	fn counter_unindex(
@@ -529,6 +539,21 @@ impl CounterSlab for crate::storage::manager::SlabManager {
 		self.counter_append_commit_marker(tenant_id, key_identity, hlc, tentative_op_id, origin)
 			.await
 	}
+	fn counter_commit_published(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+		origin: NodeId,
+	) {
+		crate::storage::manager::SlabManager::counter_commit_published(
+			self,
+			tenant_id,
+			key_identity,
+			hlc,
+			origin,
+		);
+	}
 	fn counter_unindex(
 		&self,
 		tenant_id: TenantId,
@@ -636,7 +661,14 @@ impl<S: CounterSlab> SlabCounterStore<S> {
 				t.op_id(),
 				self.origin,
 			)
-			.await
+			.await?;
+		self.slab.counter_commit_published(
+			self.tenant_id,
+			t.key_identity,
+			t.location.hlc,
+			self.origin,
+		);
+		Ok(())
 	}
 
 	/// Roll back a tentative: remove the live index entry only. No durable abort
@@ -995,6 +1027,12 @@ impl CounterReplicaService {
 			)
 			.await?;
 		reservation.publish().map_err(CounterVisibilityError::io)?;
+		self.slab.counter_commit_published(
+			pending.tenant_id,
+			pending.key_identity,
+			pending.location.hlc,
+			origin,
+		);
 		self.pending.remove(&key);
 		self.reclaim_gate2(key, &gate);
 		Ok(())
