@@ -7985,6 +7985,33 @@ async fn reliance_control_on_loopback() {
 		for worker in &mut workers {
 			worker.shutdown().await;
 		}
+		// toron_fixture_worker LONG_SCAN default (30 s); a change there must fail here.
+		let expected_long_scan_ms = control.long_scan_ms.unwrap_or(30_000);
+		for worker in &workers {
+			let path = dir.join(format!("worker-{}.jsonl", worker.worker_id.get().as_u128()));
+			let contents = std::fs::read_to_string(&path).expect("worker fixture event log");
+			let fixture_config = contents
+				.lines()
+				.filter(|line| !line.trim().is_empty())
+				.map(|line| {
+					serde_json::from_str::<serde_json::Value>(line)
+						.expect("worker event log line is JSON")
+				})
+				.filter(|event| event["event"] == "fixture_config")
+				.collect::<Vec<_>>();
+			assert_eq!(
+				fixture_config.len(),
+				1,
+				"one fixture_config event for {}",
+				worker.worker_id.get().as_u128()
+			);
+			assert_eq!(
+				fixture_config[0]["long_scan_ms"].as_u64(),
+				Some(expected_long_scan_ms),
+				"configured long scan for {}",
+				worker.worker_id.get().as_u128()
+			);
+		}
 	})
 	.await;
 }
