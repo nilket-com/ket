@@ -1387,7 +1387,7 @@ fn quote_type(ty: &syn::Type) -> String {
 }
 // Pure inventory and snapshot codecs, the pure owner core and replica tuple validation: no I/O,
 // clock, networking, unsafe, trust or root construction; fixed entrypoints. Syntax over these
-// four files only.
+// files only; owner_core/evidence.rs is held to the same checks as owner_core.rs.
 #[test]
 fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1447,6 +1447,7 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 		"inventory.rs",
 		"snapshot.rs",
 		"owner_core.rs",
+		"owner_core/evidence.rs",
 		"replica_anchor.rs",
 		"terminal.rs",
 	] {
@@ -1484,6 +1485,10 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 						matches!(&m.vis, syn::Visibility::Restricted(v) if v.in_token.is_none() && v.path.is_ident("super"))
 					);
 				}
+				syn::Item::Mod(m) if name == "owner_core.rs" && m.ident == "evidence" => {
+					assert!(m.content.is_none());
+					assert!(matches!(m.vis, syn::Visibility::Inherited));
+				}
 				syn::Item::Trait(_) | syn::Item::Static(_) | syn::Item::Mod(_) => {
 					panic!("{name}: no traits, statics or modules")
 				}
@@ -1493,7 +1498,12 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 	}
 
 	// Exact new private format surface; retain the same no-I/O/no-trust token bans.
-	for name in ["inventory/v2.rs", "owner_core/v2.rs", "format.rs"] {
+	for name in [
+		"inventory/v2.rs",
+		"owner_core/v2.rs",
+		"owner_core/evidence.rs",
+		"format.rs",
+	] {
 		let text = fs::read_to_string(root.join(name)).unwrap();
 		assert_eq!(
 			banned(text.parse().unwrap()),
@@ -1567,6 +1577,18 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 				],
 				&[],
 				&["MAX_EVIDENCE_BYTES2"],
+			),
+			"owner_core/evidence.rs" => (
+				&[
+					"decode_evidence2",
+					"encode_evidence2",
+					"evidence_name2",
+					"expected_repair_event2",
+					"repair_context2",
+					"repair_op_id2",
+				],
+				&[],
+				&[],
 			),
 			_ => (
 				&[],
