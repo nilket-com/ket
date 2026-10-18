@@ -787,6 +787,7 @@ impl AuditSink for LocalAuditSink {
 
 struct SharedAuditSinkAdapter {
 	inner: Arc<dyn shared_audit::AuditSink>,
+	_directory_owner: Option<crate::storage::ownership::DataDirectoryOwner>,
 }
 
 impl AuditSink for SharedAuditSinkAdapter {
@@ -812,6 +813,7 @@ impl AuditSink for SharedAuditSinkAdapter {
 	}
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn build_audit_sink(
 	local_path: impl AsRef<Path>,
 	config: &AuditSinksConfig,
@@ -822,7 +824,36 @@ pub fn build_audit_sink(
 		wendelon_audit_format(),
 		Arc::new(WendelonAuditObserver),
 	)?;
-	Ok(Arc::new(SharedAuditSinkAdapter { inner }))
+	Ok(Arc::new(SharedAuditSinkAdapter {
+		inner,
+		_directory_owner: None,
+	}))
+}
+
+pub(crate) fn build_audit_sink_with_owner(
+	local_path: impl AsRef<Path>,
+	config: &AuditSinksConfig,
+	owner: crate::storage::ownership::DataDirectoryOwner,
+) -> std::io::Result<Arc<dyn AuditSink>> {
+	owner.ensure_contains(local_path.as_ref())?;
+	let inner = shared_audit::build_audit_sink_with_admission(
+		local_path,
+		config,
+		wendelon_audit_format(),
+		Arc::new(WendelonAuditObserver),
+		Some(Arc::new(OwnerAuditAdmission(owner.clone()))),
+	)?;
+	Ok(Arc::new(SharedAuditSinkAdapter {
+		inner,
+		_directory_owner: Some(owner),
+	}))
+}
+
+struct OwnerAuditAdmission(crate::storage::ownership::DataDirectoryOwner);
+impl shared_audit::AuditWriteAdmission for OwnerAuditAdmission {
+	fn admit(&self) -> std::io::Result<Box<dyn Send>> {
+		Ok(Box::new(self.0.write_permit()?))
+	}
 }
 
 pub fn emit_signed_chain_root(

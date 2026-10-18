@@ -19,6 +19,8 @@ pub mod manifest;
 pub mod multirow;
 pub(crate) mod mutation_drain;
 pub mod mutation_visibility;
+pub(crate) mod owned_redb;
+pub mod ownership;
 pub mod pk_delete;
 pub mod retention;
 pub mod row_group;

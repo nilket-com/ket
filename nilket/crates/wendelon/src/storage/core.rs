@@ -406,7 +406,12 @@ impl LocalSlabStore {
 			recovered_non_counter_keys,
 			recovered_counter_errors,
 			has_counter_records,
-		) = recover_slab(&file, slab_id, acknowledged)?;
+		) = {
+			// Recovery may zero-fill unacknowledged regions through the raw
+			// handle; that write must be admitted like any other.
+			let _permit = file_ops.write_permit()?;
+			recover_slab(&file, slab_id, acknowledged)?
+		};
 
 		Ok(Self {
 			index,

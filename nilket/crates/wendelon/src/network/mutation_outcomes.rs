@@ -99,24 +99,34 @@ pub(crate) enum MutationResolution {
 }
 
 pub(crate) struct MutationOutcomeStore {
-	db: Arc<Database>,
+	db: crate::storage::owned_redb::OwnedRedb,
 	write_lock: Mutex<()>,
 }
 
 impl MutationOutcomeStore {
+	pub(crate) fn bind_owner(
+		&self,
+		owner: crate::storage::ownership::DataDirectoryOwner,
+	) -> std::io::Result<()> {
+		self.db.bind_owner(owner)
+	}
 	pub(crate) fn open(path: impl Into<PathBuf>) -> std::io::Result<Arc<Self>> {
 		let path = path.into();
 		let mut registry = outcome_store_registry()
 			.lock()
 			.expect("mutation outcome registry poisoned");
-		if let Some(existing) = registry.get(&path).and_then(Weak::upgrade) {
+		if let Some(existing) = registry
+			.get(&path)
+			.and_then(Weak::upgrade)
+			.filter(|store| !store.db.is_closed())
+		{
 			return Ok(existing);
 		}
 		// Keep the registry lock through open/publication. Two concurrent node fixtures
 		// may share a profile path; releasing it after the lookup lets both call redb
 		// `Database::create`, and the loser reports "Database already open" despite the
 		// process intentionally sharing one store.
-		let db = Arc::new(Database::create(path.clone()).map_err(redb_to_io)?);
+		let db = Database::create(path.clone()).map_err(redb_to_io)?;
 		let txn = db.begin_write().map_err(redb_to_io)?;
 		{
 			let _ = txn.open_table(OUTCOMES).map_err(redb_to_io)?;
@@ -126,7 +136,7 @@ impl MutationOutcomeStore {
 		}
 		txn.commit().map_err(redb_to_io)?;
 		let store = Arc::new(Self {
-			db,
+			db: crate::storage::owned_redb::OwnedRedb::new(db, "mutation outcome store"),
 			write_lock: Mutex::new(()),
 		});
 		registry.insert(path, Arc::downgrade(&store));
@@ -135,46 +145,46 @@ impl MutationOutcomeStore {
 
 	pub(crate) async fn upsert(&self, outcome: DurableMutationOutcome) -> std::io::Result<()> {
 		let _guard = self.write_lock.lock().await;
-		let db = self.db.clone();
-		spawn_blocking_io(move || {
-			let encoded = postcard::to_stdvec(&outcome)
-				.map_err(|err| Error::other(format!("encode mutation outcome: {err}")))?;
-			let txn = db.begin_write().map_err(redb_to_io)?;
-			{
-				let key = key(outcome.write_id, outcome.tenant_id);
-				let mut outcomes = txn.open_table(OUTCOMES).map_err(redb_to_io)?;
-				let mut expiry = txn.open_table(OUTCOME_EXPIRY).map_err(redb_to_io)?;
-				if let Some(previous) = outcomes.get(key.as_slice()).map_err(redb_to_io)? {
-					let previous = decode(previous.value())?;
-					let previous_expiry = expiry_key(previous.expires_at_ms, key);
-					let _ = expiry
-						.remove(previous_expiry.as_slice())
+		self.db
+			.run(move |db| {
+				let encoded = postcard::to_stdvec(&outcome)
+					.map_err(|err| Error::other(format!("encode mutation outcome: {err}")))?;
+				let txn = db.begin_write().map_err(redb_to_io)?;
+				{
+					let key = key(outcome.write_id, outcome.tenant_id);
+					let mut outcomes = txn.open_table(OUTCOMES).map_err(redb_to_io)?;
+					let mut expiry = txn.open_table(OUTCOME_EXPIRY).map_err(redb_to_io)?;
+					if let Some(previous) = outcomes.get(key.as_slice()).map_err(redb_to_io)? {
+						let previous = decode(previous.value())?;
+						let previous_expiry = expiry_key(previous.expires_at_ms, key);
+						let _ = expiry
+							.remove(previous_expiry.as_slice())
+							.map_err(redb_to_io)?;
+					}
+					outcomes
+						.insert(key.as_slice(), encoded.as_slice())
 						.map_err(redb_to_io)?;
+					let outcome_expiry = expiry_key(outcome.expires_at_ms, key);
+					let empty: &[u8] = &[];
+					expiry
+						.insert(outcome_expiry.as_slice(), empty)
+						.map_err(redb_to_io)?;
+					let mut expired = txn.open_table(EXPIRED).map_err(redb_to_io)?;
+					let pins = txn.open_table(PINS).map_err(redb_to_io)?;
+					let _ = expired.remove(key.as_slice()).map_err(redb_to_io)?;
+					prune_outcomes(
+						&mut outcomes,
+						&mut expiry,
+						&mut expired,
+						&pins,
+						now_ms(),
+						OUTCOME_CAPACITY,
+					)?;
+					prune_expired(&mut expired, now_ms())?;
 				}
-				outcomes
-					.insert(key.as_slice(), encoded.as_slice())
-					.map_err(redb_to_io)?;
-				let outcome_expiry = expiry_key(outcome.expires_at_ms, key);
-				let empty: &[u8] = &[];
-				expiry
-					.insert(outcome_expiry.as_slice(), empty)
-					.map_err(redb_to_io)?;
-				let mut expired = txn.open_table(EXPIRED).map_err(redb_to_io)?;
-				let pins = txn.open_table(PINS).map_err(redb_to_io)?;
-				let _ = expired.remove(key.as_slice()).map_err(redb_to_io)?;
-				prune_outcomes(
-					&mut outcomes,
-					&mut expiry,
-					&mut expired,
-					&pins,
-					now_ms(),
-					OUTCOME_CAPACITY,
-				)?;
-				prune_expired(&mut expired, now_ms())?;
-			}
-			txn.commit().map_err(redb_to_io)
-		})
-		.await
+				txn.commit().map_err(redb_to_io)
+			})
+			.await
 	}
 
 	/// Retain this operation's terminal evidence independently of its ordinary
@@ -185,29 +195,29 @@ impl MutationOutcomeStore {
 		tenant_id: TenantId,
 	) -> std::io::Result<()> {
 		let _guard = self.write_lock.lock().await;
-		let db = self.db.clone();
-		spawn_blocking_io(move || {
-			let txn = db.begin_write().map_err(redb_to_io)?;
-			{
-				let key = key(write_id, tenant_id);
-				let mut pins = txn.open_table(PINS).map_err(redb_to_io)?;
-				if pins.get(key.as_slice()).map_err(redb_to_io)?.is_none()
-					&& pins.len().map_err(redb_to_io)?
-						>= u64::try_from(OUTCOME_PIN_CAPACITY).unwrap_or(u64::MAX)
+		self.db
+			.run(move |db| {
+				let txn = db.begin_write().map_err(redb_to_io)?;
 				{
-					return Err(Error::new(
-						ErrorKind::WouldBlock,
-						format!(
-							"mutation outcome pin capacity {} exhausted",
-							OUTCOME_PIN_CAPACITY
-						),
-					));
+					let key = key(write_id, tenant_id);
+					let mut pins = txn.open_table(PINS).map_err(redb_to_io)?;
+					if pins.get(key.as_slice()).map_err(redb_to_io)?.is_none()
+						&& pins.len().map_err(redb_to_io)?
+							>= u64::try_from(OUTCOME_PIN_CAPACITY).unwrap_or(u64::MAX)
+					{
+						return Err(Error::new(
+							ErrorKind::WouldBlock,
+							format!(
+								"mutation outcome pin capacity {} exhausted",
+								OUTCOME_PIN_CAPACITY
+							),
+						));
+					}
+					pins.insert(key.as_slice(), now_ms()).map_err(redb_to_io)?;
 				}
-				pins.insert(key.as_slice(), now_ms()).map_err(redb_to_io)?;
-			}
-			txn.commit().map_err(redb_to_io)
-		})
-		.await
+				txn.commit().map_err(redb_to_io)
+			})
+			.await
 	}
 
 	/// Acknowledge that the Control Ring saga ledger now carries the row outcome.
@@ -218,17 +228,17 @@ impl MutationOutcomeStore {
 		tenant_id: TenantId,
 	) -> std::io::Result<()> {
 		let _guard = self.write_lock.lock().await;
-		let db = self.db.clone();
-		spawn_blocking_io(move || {
-			let txn = db.begin_write().map_err(redb_to_io)?;
-			{
-				let key = key(write_id, tenant_id);
-				let mut pins = txn.open_table(PINS).map_err(redb_to_io)?;
-				let _ = pins.remove(key.as_slice()).map_err(redb_to_io)?;
-			}
-			txn.commit().map_err(redb_to_io)
-		})
-		.await
+		self.db
+			.run(move |db| {
+				let txn = db.begin_write().map_err(redb_to_io)?;
+				{
+					let key = key(write_id, tenant_id);
+					let mut pins = txn.open_table(PINS).map_err(redb_to_io)?;
+					let _ = pins.remove(key.as_slice()).map_err(redb_to_io)?;
+				}
+				txn.commit().map_err(redb_to_io)
+			})
+			.await
 	}
 
 	pub(crate) async fn resolve(
@@ -237,61 +247,61 @@ impl MutationOutcomeStore {
 		tenant_id: TenantId,
 	) -> std::io::Result<MutationResolution> {
 		let _guard = self.write_lock.lock().await;
-		let db = self.db.clone();
-		spawn_blocking_io(move || {
-			let now = now_ms();
-			let key = key(write_id, tenant_id);
-			let txn = db.begin_write().map_err(redb_to_io)?;
-			let resolution = {
-				let mut outcomes = txn.open_table(OUTCOMES).map_err(redb_to_io)?;
-				let mut expiry = txn.open_table(OUTCOME_EXPIRY).map_err(redb_to_io)?;
-				let pins = txn.open_table(PINS).map_err(redb_to_io)?;
-				let pinned = pins.get(key.as_slice()).map_err(redb_to_io)?.is_some();
-				let decoded = outcomes
-					.get(key.as_slice())
-					.map_err(redb_to_io)?
-					.map(|value| decode(value.value()))
-					.transpose()?;
-				match decoded {
-					Some(outcome) if pinned || outcome.expires_at_ms > now => {
-						MutationResolution::Present(outcome)
-					}
-					Some(_) => {
-						let removed = outcomes
-							.remove(key.as_slice())
-							.map_err(redb_to_io)?
-							.expect("decoded mutation outcome remains present");
-						let removed = decode(removed.value())?;
-						let expiry_key = expiry_key(removed.expires_at_ms, key);
-						let _ = expiry.remove(expiry_key.as_slice()).map_err(redb_to_io)?;
-						let mut expired = txn.open_table(EXPIRED).map_err(redb_to_io)?;
-						expired.insert(key.as_slice(), now).map_err(redb_to_io)?;
-						prune_expired(&mut expired, now)?;
-						MutationResolution::Expired
-					}
-					None => {
-						let mut expired = txn.open_table(EXPIRED).map_err(redb_to_io)?;
-						prune_expired(&mut expired, now)?;
-						if expired.get(key.as_slice()).map_err(redb_to_io)?.is_some() {
+		self.db
+			.run(move |db| {
+				let now = now_ms();
+				let key = key(write_id, tenant_id);
+				let txn = db.begin_write().map_err(redb_to_io)?;
+				let resolution = {
+					let mut outcomes = txn.open_table(OUTCOMES).map_err(redb_to_io)?;
+					let mut expiry = txn.open_table(OUTCOME_EXPIRY).map_err(redb_to_io)?;
+					let pins = txn.open_table(PINS).map_err(redb_to_io)?;
+					let pinned = pins.get(key.as_slice()).map_err(redb_to_io)?.is_some();
+					let decoded = outcomes
+						.get(key.as_slice())
+						.map_err(redb_to_io)?
+						.map(|value| decode(value.value()))
+						.transpose()?;
+					match decoded {
+						Some(outcome) if pinned || outcome.expires_at_ms > now => {
+							MutationResolution::Present(outcome)
+						}
+						Some(_) => {
+							let removed = outcomes
+								.remove(key.as_slice())
+								.map_err(redb_to_io)?
+								.expect("decoded mutation outcome remains present");
+							let removed = decode(removed.value())?;
+							let expiry_key = expiry_key(removed.expires_at_ms, key);
+							let _ = expiry.remove(expiry_key.as_slice()).map_err(redb_to_io)?;
+							let mut expired = txn.open_table(EXPIRED).map_err(redb_to_io)?;
+							expired.insert(key.as_slice(), now).map_err(redb_to_io)?;
+							prune_expired(&mut expired, now)?;
 							MutationResolution::Expired
-						} else if operation_identity_is_expired(write_id, now) {
-							// Toron mutation identities use the SQL/Rune UUIDv7 query id.
-							// Its issuance time is self-authenticating identity material, so
-							// expiry remains provable even after bounded detail and tombstone
-							// retention have both reclaimed their rows. Without this check an
-							// old replay becomes indistinguishable from a new mutation at the
-							// retention horizon and can double-apply.
-							MutationResolution::Expired
-						} else {
-							MutationResolution::Unknown
+						}
+						None => {
+							let mut expired = txn.open_table(EXPIRED).map_err(redb_to_io)?;
+							prune_expired(&mut expired, now)?;
+							if expired.get(key.as_slice()).map_err(redb_to_io)?.is_some() {
+								MutationResolution::Expired
+							} else if operation_identity_is_expired(write_id, now) {
+								// Toron mutation identities use the SQL/Rune UUIDv7 query id.
+								// Its issuance time is self-authenticating identity material, so
+								// expiry remains provable even after bounded detail and tombstone
+								// retention have both reclaimed their rows. Without this check an
+								// old replay becomes indistinguishable from a new mutation at the
+								// retention horizon and can double-apply.
+								MutationResolution::Expired
+							} else {
+								MutationResolution::Unknown
+							}
 						}
 					}
-				}
-			};
-			txn.commit().map_err(redb_to_io)?;
-			Ok(resolution)
-		})
-		.await
+				};
+				txn.commit().map_err(redb_to_io)?;
+				Ok(resolution)
+			})
+			.await
 	}
 }
 
@@ -458,21 +468,6 @@ fn now_ms() -> u64 {
 		.unwrap_or(u64::MAX)
 }
 
-async fn spawn_blocking_io<T>(
-	f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
-) -> std::io::Result<T>
-where
-	T: Send + 'static,
-{
-	let observation = crate::storage::finality_observation::current_work();
-	tokio::task::spawn_blocking(move || {
-		let _observation = observation;
-		f()
-	})
-	.await
-	.map_err(|err| Error::other(format!("blocking mutation outcome task failed: {err}")))?
-}
-
 fn redb_to_io(error: impl std::fmt::Display) -> std::io::Error {
 	Error::other(format!("redb mutation outcome error: {error}"))
 }
@@ -607,7 +602,7 @@ mod tests {
 		));
 		let tenant = TenantId::new(1);
 		let store = MutationOutcomeStore::open(&path).unwrap();
-		let txn = store.db.begin_write().unwrap();
+		let txn = store.db.test_handle().begin_write().unwrap();
 		{
 			let mut pins = txn.open_table(PINS).unwrap();
 			for sequence in 0..OUTCOME_PIN_CAPACITY {
@@ -622,7 +617,7 @@ mod tests {
 			.await
 			.expect_err("the independent pin ceiling must refuse before insertion");
 		assert_eq!(error.kind(), ErrorKind::WouldBlock);
-		let txn = store.db.begin_read().unwrap();
+		let txn = store.db.test_handle().begin_read().unwrap();
 		assert_eq!(
 			txn.open_table(PINS).unwrap().len().unwrap(),
 			OUTCOME_PIN_CAPACITY as u64
@@ -698,7 +693,7 @@ mod tests {
 		));
 		let store = MutationOutcomeStore::open(path).unwrap();
 		let tenant = TenantId::new(1);
-		let txn = store.db.begin_write().unwrap();
+		let txn = store.db.test_handle().begin_write().unwrap();
 		{
 			let mut outcomes = txn.open_table(OUTCOMES).unwrap();
 			let mut expiry = txn.open_table(OUTCOME_EXPIRY).unwrap();

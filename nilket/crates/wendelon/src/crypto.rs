@@ -4,6 +4,7 @@ use crate::schema::{
 	ChunkSizeBytes, EncryptedChunkCount, EncryptedChunkIndex, IdentityPrefix, NodeId,
 	RecordBodyByteLen, RecordBodyByteOffset, SlabId, TenantId, TenantKekId,
 };
+use crate::storage::ownership::DataDirectoryOwner;
 use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::Utc;
@@ -497,6 +498,7 @@ impl RootKekProviderHealth {
 pub(crate) struct RootKekProviderInit<'a> {
 	data_dir: &'a Path,
 	bootstrap_mode: RootKekBootstrapMode,
+	owner: Option<&'a DataDirectoryOwner>,
 }
 
 impl<'a> RootKekProviderInit<'a> {
@@ -504,6 +506,7 @@ impl<'a> RootKekProviderInit<'a> {
 		Self {
 			data_dir,
 			bootstrap_mode: RootKekBootstrapMode::GenerateOrCreate,
+			owner: None,
 		}
 	}
 }
@@ -819,8 +822,29 @@ impl RootKekProviderConfig {
 		}
 	}
 
+	#[cfg(test)]
 	pub(crate) fn build(&self, data_dir: &Path) -> std::io::Result<Arc<dyn RootKekProvider>> {
 		self.initialize(RootKekProviderInit::generate_or_create(data_dir))
+	}
+
+	pub(crate) fn build_with_owner(
+		&self,
+		data_dir: &Path,
+		owner: &DataDirectoryOwner,
+	) -> std::io::Result<Arc<dyn RootKekProvider>> {
+		owner.ensure_contains(data_dir)?;
+		match self {
+			Self::DevInsecure => {
+				#[cfg(any(test, not(feature = "fips")))]
+				owner.ensure_contains(dev_insecure_root_kek_path(data_dir))?;
+			}
+			Self::LocalSealed(_) => owner.ensure_contains(local_sealed_root_kek_path(data_dir))?,
+			Self::AwsKms(_) => owner.ensure_contains(aws_kms_root_kek_path(data_dir))?,
+			Self::Pkcs11(_) => {}
+		}
+		let mut init = RootKekProviderInit::generate_or_create(data_dir);
+		init.owner = Some(owner);
+		self.initialize(init)
 	}
 
 	pub(crate) fn initialize(
@@ -1388,6 +1412,7 @@ impl TieredStatsBlockReadPlan {
 
 #[derive(Clone)]
 pub struct CryptoManager {
+	_directory_owner: Option<DataDirectoryOwner>,
 	root_kek: Arc<dyn RootKekProvider>,
 	keysets: Arc<Mutex<HashMap<TenantId, TenantKeyset>>>,
 	tenant_kek_cache: Arc<Mutex<KeyCache<(TenantId, TenantKekId), LockedKeyMaterial>>>,
@@ -1420,6 +1445,7 @@ impl CryptoManager {
 		cache_config: CryptoCacheConfig,
 	) -> Self {
 		Self {
+			_directory_owner: None,
 			root_kek,
 			keysets: Arc::new(Mutex::new(HashMap::new())),
 			tenant_kek_cache: Arc::new(Mutex::new(KeyCache::new(
@@ -1434,6 +1460,16 @@ impl CryptoManager {
 			))),
 			audit_context: Arc::new(Mutex::new(None)),
 		}
+	}
+
+	pub(crate) fn new_with_cache_config_and_owner(
+		root_kek: Arc<dyn RootKekProvider>,
+		cache_config: CryptoCacheConfig,
+		owner: DataDirectoryOwner,
+	) -> Self {
+		let mut manager = Self::new_with_cache_config(root_kek, cache_config);
+		manager._directory_owner = Some(owner);
+		manager
 	}
 
 	/// Dev/test-only helper. Production bootstrap must select a root
@@ -4720,7 +4756,14 @@ impl AwsKmsRootKekProvider {
 							key_id: cfg.key_id.clone(),
 							ciphertext_blob,
 						};
-						match persist_new_aws_kms_root_kek_envelope(&path, &envelope) {
+						let persist = {
+							let _permit = init
+								.owner
+								.map(DataDirectoryOwner::write_permit)
+								.transpose()?;
+							persist_new_aws_kms_root_kek_envelope(&path, &envelope)
+						};
+						match persist {
 							Ok(()) => key,
 							Err(persist_error)
 								if persist_error.kind() == ErrorKind::AlreadyExists =>
@@ -5068,7 +5111,14 @@ impl DevRootKekProvider {
 				Ok(key) => key,
 				Err(error) if error.kind() == ErrorKind::NotFound => {
 					let key = KeyMaterialBytes::random()?;
-					match persist_new_dev_insecure_root_kek(&path, &key) {
+					let persist = {
+						let _permit = init
+							.owner
+							.map(DataDirectoryOwner::write_permit)
+							.transpose()?;
+						persist_new_dev_insecure_root_kek(&path, &key)
+					};
+					match persist {
 						Ok(()) => key,
 						Err(persist_error) if persist_error.kind() == ErrorKind::AlreadyExists => {
 							read_dev_insecure_root_kek(&path)?
@@ -5162,8 +5212,14 @@ impl LocalSealedRootKekProvider {
 					Ok(key) => key,
 					Err(error) if error.kind() == ErrorKind::NotFound => {
 						let key = KeyMaterialBytes::random()?;
-						match persist_new_local_sealed_root_kek(&path, unlock_secret.as_ref(), &key)
-						{
+						let persist = {
+							let _permit = init
+								.owner
+								.map(DataDirectoryOwner::write_permit)
+								.transpose()?;
+							persist_new_local_sealed_root_kek(&path, unlock_secret.as_ref(), &key)
+						};
+						match persist {
 							Ok(()) => key,
 							Err(persist_error)
 								if persist_error.kind() == ErrorKind::AlreadyExists =>
@@ -7121,6 +7177,7 @@ mod tests {
 		let err = match RootKekProviderConfig::DevInsecure.initialize(RootKekProviderInit {
 			data_dir: &dir,
 			bootstrap_mode: RootKekBootstrapMode::EnrollExisting,
+			owner: None,
 		}) {
 			Ok(_) => panic!("enrolling an unmateralized dev-insecure root KEK should fail"),
 			Err(err) => err,
@@ -7135,6 +7192,7 @@ mod tests {
 			.initialize(RootKekProviderInit {
 				data_dir: &dir,
 				bootstrap_mode: RootKekBootstrapMode::EnrollExisting,
+				owner: None,
 			})
 			.unwrap();
 		let unwrapped = enrolled.unwrap_tenant_kek(&wrapped).unwrap();

@@ -51,6 +51,24 @@ use wendelon::simulator::network::{
 	SimulatedTransportFaultOp, SimulatedTransportNetwork, SimulatedTransportProvider,
 };
 use wendelon::storage::BlockingFileOps;
+use wendelon::storage::ownership::DataDirectoryOwner;
+
+async fn open_owned_log_store(
+	data_dir: &Path,
+	wal: &Path,
+	vote: &Path,
+	snapshot: &Path,
+) -> Result<WendelonLogStore> {
+	let owner = DataDirectoryOwner::acquire_existing(data_dir)?;
+	WendelonLogStore::open_with_file_ops_and_owner(
+		wal,
+		vote,
+		snapshot,
+		Arc::new(BlockingFileOps),
+		owner,
+	)
+	.await
+}
 use wendelon::storage::l2::{
 	InjectedMockObjectStoreFault, MockObjectStore, MockObjectStoreConfig,
 	MockObjectStoreFaultAction, MockObjectStoreOp, ObjectStore,
@@ -1113,17 +1131,16 @@ async fn run_replay_ordering_scenario(seed: u64, ops: u64) -> std::result::Resul
 		let range_start = 100 * iteration;
 		let expected_hlc = 10_000 + iteration;
 
-		let mut store =
-			WendelonLogStore::open_with_file_ops(&wal, &vote, &snapshot, Arc::new(BlockingFileOps))
-				.await
-				.map_err(|err| {
-					SimFailure::new(
-						"replay_ordering",
-						seed,
-						iteration + 1,
-						format!("open log store failed: {err}"),
-					)
-				})?;
+		let mut store = open_owned_log_store(&dir, &wal, &vote, &snapshot)
+			.await
+			.map_err(|err| {
+				SimFailure::new(
+					"replay_ordering",
+					seed,
+					iteration + 1,
+					format!("open log store failed: {err}"),
+				)
+			})?;
 		store
 			.blocking_append(vec![
 				lease_entry(1, range_start, range_start + 9, 1),
@@ -1152,17 +1169,16 @@ async fn run_replay_ordering_scenario(seed: u64, ops: u64) -> std::result::Resul
 			})?;
 		drop(store);
 
-		let mut reopened =
-			WendelonLogStore::open_with_file_ops(&wal, &vote, &snapshot, Arc::new(BlockingFileOps))
-				.await
-				.map_err(|err| {
-					SimFailure::new(
-						"replay_ordering",
-						seed,
-						iteration + 1,
-						format!("reopen failed: {err}"),
-					)
-				})?;
+		let mut reopened = open_owned_log_store(&dir, &wal, &vote, &snapshot)
+			.await
+			.map_err(|err| {
+				SimFailure::new(
+					"replay_ordering",
+					seed,
+					iteration + 1,
+					format!("reopen failed: {err}"),
+				)
+			})?;
 		let committed = reopened.read_committed().await.map_err(|err| {
 			SimFailure::new(
 				"replay_ordering",
@@ -1244,21 +1260,16 @@ async fn run_apply_order_races_scenario(
 		let wal = target_dir.join("control.wal");
 		let vote = target_dir.join("vote.wnd");
 		let snapshot_path = target_dir.join("snapshot.wnd");
-		let mut target_store = WendelonLogStore::open_with_file_ops(
-			&wal,
-			&vote,
-			&snapshot_path,
-			Arc::new(BlockingFileOps),
-		)
-		.await
-		.map_err(|err| {
-			SimFailure::new(
-				"apply_order_races",
-				seed,
-				iteration + 1,
-				format!("open target log store failed: {err}"),
-			)
-		})?;
+		let mut target_store = open_owned_log_store(&target_dir, &wal, &vote, &snapshot_path)
+			.await
+			.map_err(|err| {
+				SimFailure::new(
+					"apply_order_races",
+					seed,
+					iteration + 1,
+					format!("open target log store failed: {err}"),
+				)
+			})?;
 		let mut target_sm = target_store
 			.recovered_state_machine()
 			.await
@@ -1353,21 +1364,17 @@ async fn run_apply_order_races_scenario(
 		let source_wal = source_dir.join("control.wal");
 		let source_vote = source_dir.join("vote.wnd");
 		let source_snapshot = source_dir.join("snapshot.wnd");
-		let mut source_store = WendelonLogStore::open_with_file_ops(
-			&source_wal,
-			&source_vote,
-			&source_snapshot,
-			Arc::new(BlockingFileOps),
-		)
-		.await
-		.map_err(|err| {
-			SimFailure::new(
-				"apply_order_races",
-				seed,
-				iteration + 1,
-				format!("open source log store failed: {err}"),
-			)
-		})?;
+		let mut source_store =
+			open_owned_log_store(&source_dir, &source_wal, &source_vote, &source_snapshot)
+				.await
+				.map_err(|err| {
+					SimFailure::new(
+						"apply_order_races",
+						seed,
+						iteration + 1,
+						format!("open source log store failed: {err}"),
+					)
+				})?;
 		let mut source_sm = source_store
 			.recovered_state_machine()
 			.await

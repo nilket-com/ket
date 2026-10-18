@@ -12,7 +12,7 @@ mod expectation;
 
 #[derive(Default)]
 struct GateFileOps {
-	inner: BlockingFileOps,
+	inner: Mutex<BlockingFileOps>,
 	unlink_path: Mutex<Option<std::path::PathBuf>>,
 	unlink_hit: AtomicBool,
 	unlink_entered: Notify,
@@ -27,6 +27,9 @@ struct GateFileOps {
 	release: Notify,
 }
 impl GateFileOps {
+	fn inner(&self) -> BlockingFileOps {
+		self.inner.lock().unwrap().clone()
+	}
 	fn arm_unlink(&self, path: std::path::PathBuf) {
 		*self.unlink_path.lock().unwrap() = Some(path);
 		self.unlink_hit.store(false, Ordering::SeqCst);
@@ -73,8 +76,15 @@ impl GateFileOps {
 }
 #[async_trait]
 impl AsyncFileOps for GateFileOps {
+	fn bind_directory_owner(
+		self: Arc<Self>,
+		owner: wendelon::storage::ownership::DataDirectoryOwner,
+	) -> std::io::Result<Arc<dyn AsyncFileOps>> {
+		*self.inner.lock().unwrap() = BlockingFileOps::with_owner(owner);
+		Ok(self)
+	}
 	async fn open(&self, path: &Path, flags: OpenFlags) -> std::io::Result<FileHandle> {
-		self.inner.open(path, flags).await
+		self.inner().open(path, flags).await
 	}
 
 	async fn read_plain_at(
@@ -83,7 +93,7 @@ impl AsyncFileOps for GateFileOps {
 		offset: u64,
 		len: usize,
 	) -> std::io::Result<Vec<u8>> {
-		self.inner.read_plain_at(handle, offset, len).await
+		self.inner().read_plain_at(handle, offset, len).await
 	}
 
 	async fn write_plain_at(
@@ -92,7 +102,7 @@ impl AsyncFileOps for GateFileOps {
 		offset: u64,
 		bytes: Vec<u8>,
 	) -> std::io::Result<usize> {
-		self.inner.write_plain_at(handle, offset, bytes).await
+		self.inner().write_plain_at(handle, offset, bytes).await
 	}
 
 	async fn read_at(
@@ -101,7 +111,7 @@ impl AsyncFileOps for GateFileOps {
 		offset: u64,
 		buf: AlignedBuf,
 	) -> std::io::Result<(usize, AlignedBuf)> {
-		self.inner.read_at(handle, offset, buf).await
+		self.inner().read_at(handle, offset, buf).await
 	}
 
 	async fn write_at(
@@ -110,7 +120,7 @@ impl AsyncFileOps for GateFileOps {
 		offset: u64,
 		buf: AlignedBuf,
 	) -> std::io::Result<(usize, AlignedBuf)> {
-		let result = self.inner.write_at(handle, offset, buf).await;
+		let result = self.inner().write_at(handle, offset, buf).await;
 		if result.is_ok() {
 			self.writes.fetch_add(1, Ordering::SeqCst);
 		}
@@ -118,7 +128,7 @@ impl AsyncFileOps for GateFileOps {
 	}
 
 	async fn fsync(&self, handle: &FileHandle) -> std::io::Result<()> {
-		self.inner.fsync(handle).await
+		self.inner().fsync(handle).await
 	}
 
 	async fn fdatasync(&self, handle: &FileHandle) -> std::io::Result<()> {
@@ -149,46 +159,46 @@ impl AsyncFileOps for GateFileOps {
 				release.await;
 			}
 		}
-		self.inner.fdatasync(handle).await
+		self.inner().fdatasync(handle).await
 	}
 
 	async fn read_all(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-		self.inner.read_all(path).await
+		self.inner().read_all(path).await
 	}
 
 	async fn write_all(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-		self.inner.write_all(path, bytes).await
+		self.inner().write_all(path, bytes).await
 	}
 
 	async fn file_len(&self, path: &Path) -> std::io::Result<Option<u64>> {
-		self.inner.file_len(path).await
+		self.inner().file_len(path).await
 	}
 
 	async fn set_len(&self, handle: &FileHandle, len: u64) -> std::io::Result<()> {
-		self.inner.set_len(handle, len).await
+		self.inner().set_len(handle, len).await
 	}
 
 	async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
-		self.inner.create_dir_all(path).await
+		self.inner().create_dir_all(path).await
 	}
 
 	async fn read_dir(
 		&self,
 		path: &Path,
 	) -> std::io::Result<Vec<wendelon::storage::DirectoryEntry>> {
-		self.inner.read_dir(path).await
+		self.inner().read_dir(path).await
 	}
 
 	async fn fsync_dir(&self, path: &Path) -> std::io::Result<()> {
-		self.inner.fsync_dir(path).await
+		self.inner().fsync_dir(path).await
 	}
 
 	async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-		self.inner.rename(from, to).await
+		self.inner().rename(from, to).await
 	}
 
 	async fn link_no_replace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-		self.inner.link_no_replace(from, to).await
+		self.inner().link_no_replace(from, to).await
 	}
 
 	async fn unlink(&self, path: &Path) -> std::io::Result<()> {
@@ -206,7 +216,7 @@ impl AsyncFileOps for GateFileOps {
 				released.await;
 			}
 		}
-		self.inner.unlink(path).await
+		self.inner().unlink(path).await
 	}
 }
 

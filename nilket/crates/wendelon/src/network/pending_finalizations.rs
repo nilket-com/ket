@@ -101,7 +101,7 @@ impl PendingFinalizationRecord {
 
 pub struct PendingFinalizationStore {
 	observation: Arc<FinalityObservationRegistry>,
-	db: Arc<Database>,
+	db: crate::storage::owned_redb::OwnedRedb,
 	/// Shape this store's record values are known to carry.
 	/// [`PRE_VERSIONING_FORMAT`] means unverifiable, not old.
 	format_version: u8,
@@ -114,6 +114,12 @@ pub struct PendingFinalizationStore {
 }
 
 impl PendingFinalizationStore {
+	pub(crate) fn bind_owner(
+		&self,
+		owner: crate::storage::ownership::DataDirectoryOwner,
+	) -> std::io::Result<()> {
+		self.db.bind_owner(owner)
+	}
 	pub fn open(path: impl Into<PathBuf>) -> std::io::Result<Arc<Self>> {
 		let path = path.into();
 		if let Some(existing) = pending_store_registry()
@@ -121,6 +127,7 @@ impl PendingFinalizationStore {
 			.expect("pending finalization registry poisoned")
 			.get(&path)
 			.and_then(Weak::upgrade)
+			.filter(|store| !store.db.is_closed())
 		{
 			return Ok(existing);
 		}
@@ -137,6 +144,7 @@ impl PendingFinalizationStore {
 			.expect("pending finalization registry poisoned")
 			.get(&path)
 			.and_then(Weak::upgrade)
+			.filter(|store| !store.db.is_closed())
 		{
 			if !Arc::ptr_eq(&existing.observation, &observation) {
 				existing
@@ -147,7 +155,7 @@ impl PendingFinalizationStore {
 			return Ok(existing);
 		}
 
-		let db = Arc::new(Database::create(path.clone()).map_err(redb_to_io)?);
+		let db = Database::create(path.clone()).map_err(redb_to_io)?;
 		let write_txn = db.begin_write().map_err(redb_to_io)?;
 		{
 			let _table = write_txn
@@ -240,7 +248,7 @@ impl PendingFinalizationStore {
 		write_txn.commit().map_err(redb_to_io)?;
 		let store = Arc::new(Self {
 			observation,
-			db,
+			db: crate::storage::owned_redb::OwnedRedb::new(db, "pending finalization store"),
 			format_version,
 			write_lock: Mutex::new(()),
 			count: AtomicU64::new(initial_count),
@@ -275,44 +283,44 @@ impl PendingFinalizationStore {
 	}
 
 	pub async fn load_all(&self) -> std::io::Result<Vec<PendingFinalizationRecord>> {
-		let db = self.db.clone();
 		let format_version = self.format_version;
-		spawn_blocking_io(move || {
-			let read_txn = db.begin_read().map_err(redb_to_io)?;
-			let table = read_txn
-				.open_table(PENDING_FINALIZATIONS_TABLE)
-				.map_err(redb_to_io)?;
-			let mut out = Vec::new();
-			for entry in table.iter().map_err(redb_to_io)? {
-				let (_key, value) = entry.map_err(redb_to_io)?;
-				out.push(decode_pending_finalization_record(
-					value.value(),
-					format_version,
-				)?);
-			}
-			Ok(out)
-		})
-		.await
+		self.db
+			.run(move |db| {
+				let read_txn = db.begin_read().map_err(redb_to_io)?;
+				let table = read_txn
+					.open_table(PENDING_FINALIZATIONS_TABLE)
+					.map_err(redb_to_io)?;
+				let mut out = Vec::new();
+				for entry in table.iter().map_err(redb_to_io)? {
+					let (_key, value) = entry.map_err(redb_to_io)?;
+					out.push(decode_pending_finalization_record(
+						value.value(),
+						format_version,
+					)?);
+				}
+				Ok(out)
+			})
+			.await
 	}
 
 	pub async fn get(
 		&self,
 		id: PendingFinalizationId,
 	) -> std::io::Result<Option<PendingFinalizationRecord>> {
-		let db = self.db.clone();
 		let format_version = self.format_version;
-		spawn_blocking_io(move || {
-			let read_txn = db.begin_read().map_err(redb_to_io)?;
-			let table = read_txn
-				.open_table(PENDING_FINALIZATIONS_TABLE)
-				.map_err(redb_to_io)?;
-			let Some(value) = table.get(&id.as_bytes()[..]).map_err(redb_to_io)? else {
-				return Ok(None);
-			};
-			let record = decode_pending_finalization_record(value.value(), format_version)?;
-			Ok(Some(record))
-		})
-		.await
+		self.db
+			.run(move |db| {
+				let read_txn = db.begin_read().map_err(redb_to_io)?;
+				let table = read_txn
+					.open_table(PENDING_FINALIZATIONS_TABLE)
+					.map_err(redb_to_io)?;
+				let Some(value) = table.get(&id.as_bytes()[..]).map_err(redb_to_io)? else {
+					return Ok(None);
+				};
+				let record = decode_pending_finalization_record(value.value(), format_version)?;
+				Ok(Some(record))
+			})
+			.await
 	}
 
 	pub async fn find_by_write_id(
@@ -320,45 +328,46 @@ impl PendingFinalizationStore {
 		tenant_id: crate::schema::TenantId,
 		write_id: ClientWriteId,
 	) -> std::io::Result<Option<PendingFinalizationRecord>> {
-		let db = self.db.clone();
 		let format_version = self.format_version;
-		spawn_blocking_io(move || {
-			let read_txn = db.begin_read().map_err(redb_to_io)?;
-			let by_write_id = read_txn
-				.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
-				.map_err(redb_to_io)?;
-			let primary = read_txn
-				.open_table(PENDING_FINALIZATIONS_TABLE)
-				.map_err(redb_to_io)?;
-			let write_key = encode_write_id_key(tenant_id, write_id);
-			let Some(id_bytes) = by_write_id.get(write_key.as_slice()).map_err(redb_to_io)? else {
-				return Ok(None);
-			};
-			let pending_id = PendingFinalizationId::from_slice(id_bytes.value())?;
-			let Some(value) = primary
-				.get(&pending_id.as_bytes()[..])
-				.map_err(redb_to_io)?
-			else {
-				return Ok(None);
-			};
-			let record = decode_pending_finalization_record(value.value(), format_version)?;
-			// Defensive consistency check: secondary index value
-			// must point at a record whose `write_id` shares the
-			// canonical idempotency identity. TTL / pad may drift
-			// across retries (the index is keyed on canonical
-			// bytes only), so do not compare the full struct.
-			if record.finalization.tenant_id != tenant_id
-				|| record.write_id.canonical_idempotency_bytes()
-					!= write_id.canonical_idempotency_bytes()
-			{
-				return Err(Error::new(
-					ErrorKind::InvalidData,
-					"pending-finalization secondary index returned a mismatched tenant or write_id",
-				));
-			}
-			Ok(Some(record))
-		})
-		.await
+		self.db
+			.run(move |db| {
+				let read_txn = db.begin_read().map_err(redb_to_io)?;
+				let by_write_id = read_txn
+					.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
+					.map_err(redb_to_io)?;
+				let primary = read_txn
+					.open_table(PENDING_FINALIZATIONS_TABLE)
+					.map_err(redb_to_io)?;
+				let write_key = encode_write_id_key(tenant_id, write_id);
+				let Some(id_bytes) = by_write_id.get(write_key.as_slice()).map_err(redb_to_io)?
+				else {
+					return Ok(None);
+				};
+				let pending_id = PendingFinalizationId::from_slice(id_bytes.value())?;
+				let Some(value) = primary
+					.get(&pending_id.as_bytes()[..])
+					.map_err(redb_to_io)?
+				else {
+					return Ok(None);
+				};
+				let record = decode_pending_finalization_record(value.value(), format_version)?;
+				// Defensive consistency check: secondary index value
+				// must point at a record whose `write_id` shares the
+				// canonical idempotency identity. TTL / pad may drift
+				// across retries (the index is keyed on canonical
+				// bytes only), so do not compare the full struct.
+				if record.finalization.tenant_id != tenant_id
+					|| record.write_id.canonical_idempotency_bytes()
+						!= write_id.canonical_idempotency_bytes()
+				{
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"pending-finalization secondary index returned a mismatched tenant or write_id",
+					));
+				}
+				Ok(Some(record))
+			})
+			.await
 	}
 
 	pub async fn upsert(&self, record: PendingFinalizationRecord) -> std::io::Result<()> {
@@ -386,58 +395,60 @@ impl PendingFinalizationStore {
 				"injected pending finalization upsert failure: {message}"
 			)));
 		}
-		let db = self.db.clone();
 		#[cfg(test)]
 		let mut gate = self
 			.commit_gate
 			.lock()
 			.expect("observation test gate poisoned")
 			.take();
-		let inserted_new = spawn_blocking_io(move || {
-			let encoded = postcard::to_stdvec(&record)
-				.map_err(|err| Error::other(format!("encode pending finalization: {err}")))?;
-			let write_txn = db.begin_write().map_err(redb_to_io)?;
-			let inserted_new = {
-				let mut table = write_txn
-					.open_table(PENDING_FINALIZATIONS_TABLE)
-					.map_err(redb_to_io)?;
-				let existed = table
-					.get(&record.id.as_bytes()[..])
-					.map_err(redb_to_io)?
-					.is_some();
-				table
-					.insert(&record.id.as_bytes()[..], encoded.as_slice())
-					.map_err(redb_to_io)?;
-				let mut by_write_id = write_txn
-					.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
-					.map_err(redb_to_io)?;
-				let write_key = encode_write_id_key(record.finalization.tenant_id, record.write_id);
-				by_write_id
-					.insert(write_key.as_slice(), &record.id.as_bytes()[..])
-					.map_err(redb_to_io)?;
-				if let Some(delete_counts) = delete_counts {
-					let encoded_counts = encode_delete_counts(delete_counts);
-					let mut contexts = write_txn
-						.open_table(PENDING_FINALIZATION_DELETE_COUNTS_TABLE)
+		let inserted_new = self
+			.db
+			.run(move |db| {
+				let encoded = postcard::to_stdvec(&record)
+					.map_err(|err| Error::other(format!("encode pending finalization: {err}")))?;
+				let write_txn = db.begin_write().map_err(redb_to_io)?;
+				let inserted_new = {
+					let mut table = write_txn
+						.open_table(PENDING_FINALIZATIONS_TABLE)
 						.map_err(redb_to_io)?;
-					contexts
-						.insert(&record.id.as_bytes()[..], encoded_counts.as_slice())
+					let existed = table
+						.get(&record.id.as_bytes()[..])
+						.map_err(redb_to_io)?
+						.is_some();
+					table
+						.insert(&record.id.as_bytes()[..], encoded.as_slice())
 						.map_err(redb_to_io)?;
-				}
-				!existed
-			};
-			let shadow = observation.before_durable_commit(*record.id.as_bytes());
-			#[cfg(test)]
-			observation_commit_gate(&mut gate, 0);
-			write_txn.commit().map_err(redb_to_io)?;
-			#[cfg(test)]
-			observation_commit_gate(&mut gate, 1);
-			shadow.committed(true);
-			#[cfg(test)]
-			observation_commit_gate(&mut gate, 2);
-			Ok(inserted_new)
-		})
-		.await?;
+					let mut by_write_id = write_txn
+						.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
+						.map_err(redb_to_io)?;
+					let write_key =
+						encode_write_id_key(record.finalization.tenant_id, record.write_id);
+					by_write_id
+						.insert(write_key.as_slice(), &record.id.as_bytes()[..])
+						.map_err(redb_to_io)?;
+					if let Some(delete_counts) = delete_counts {
+						let encoded_counts = encode_delete_counts(delete_counts);
+						let mut contexts = write_txn
+							.open_table(PENDING_FINALIZATION_DELETE_COUNTS_TABLE)
+							.map_err(redb_to_io)?;
+						contexts
+							.insert(&record.id.as_bytes()[..], encoded_counts.as_slice())
+							.map_err(redb_to_io)?;
+					}
+					!existed
+				};
+				let shadow = observation.before_durable_commit(*record.id.as_bytes());
+				#[cfg(test)]
+				observation_commit_gate(&mut gate, 0);
+				write_txn.commit().map_err(redb_to_io)?;
+				#[cfg(test)]
+				observation_commit_gate(&mut gate, 1);
+				shadow.committed(true);
+				#[cfg(test)]
+				observation_commit_gate(&mut gate, 2);
+				Ok(inserted_new)
+			})
+			.await?;
 		if inserted_new {
 			self.count.fetch_add(1, Ordering::Relaxed);
 		}
@@ -448,23 +459,22 @@ impl PendingFinalizationStore {
 		&self,
 		id: PendingFinalizationId,
 	) -> std::io::Result<Option<[u32; 3]>> {
-		let db = self.db.clone();
-		spawn_blocking_io(move || {
-			let read_txn = db.begin_read().map_err(redb_to_io)?;
-			let table = read_txn
-				.open_table(PENDING_FINALIZATION_DELETE_COUNTS_TABLE)
-				.map_err(redb_to_io)?;
-			let Some(value) = table.get(&id.as_bytes()[..]).map_err(redb_to_io)? else {
-				return Ok(None);
-			};
-			decode_delete_counts(value.value()).map(Some)
-		})
-		.await
+		self.db
+			.run(move |db| {
+				let read_txn = db.begin_read().map_err(redb_to_io)?;
+				let table = read_txn
+					.open_table(PENDING_FINALIZATION_DELETE_COUNTS_TABLE)
+					.map_err(redb_to_io)?;
+				let Some(value) = table.get(&id.as_bytes()[..]).map_err(redb_to_io)? else {
+					return Ok(None);
+				};
+				decode_delete_counts(value.value()).map(Some)
+			})
+			.await
 	}
 
 	pub async fn remove(&self, id: PendingFinalizationId) -> std::io::Result<()> {
 		let _guard = self.write_lock.lock().await;
-		let db = self.db.clone();
 		let format_version = self.format_version;
 		let observation = self.observation.clone();
 		let owner = observation.begin(WorkScope::Node, WorkKind::Persistence);
@@ -474,95 +484,102 @@ impl PendingFinalizationStore {
 			.lock()
 			.expect("observation test gate poisoned")
 			.take();
-		let removed = spawn_blocking_io(move || {
-			let _owner = owner;
-			let removed_tenant;
-			let write_txn = db.begin_write().map_err(redb_to_io)?;
-			let removed_any = {
-				let mut table = write_txn
-					.open_table(PENDING_FINALIZATIONS_TABLE)
-					.map_err(redb_to_io)?;
-				let removed_record = match table.get(&id.as_bytes()[..]).map_err(redb_to_io)? {
-					Some(value) => Some(decode_pending_finalization_record(
-						value.value(),
-						format_version,
-					)?),
-					None => None,
-				};
-				removed_tenant = removed_record
-					.as_ref()
-					.map(|record| record.finalization.tenant_id);
-				let removed_any = table
-					.remove(&id.as_bytes()[..])
-					.map_err(redb_to_io)?
-					.is_some();
-				let replacement_id = if let Some(record) = removed_record.as_ref() {
-					let canonical = record.write_id.canonical_idempotency_bytes();
-					let mut replacement = None;
-					for entry in table.iter().map_err(redb_to_io)? {
-						let (_key, value) = entry.map_err(redb_to_io)?;
-						let candidate =
-							decode_pending_finalization_record(value.value(), format_version)?;
-						if candidate.finalization.tenant_id == record.finalization.tenant_id
-							&& candidate.write_id.canonical_idempotency_bytes() == canonical
-						{
-							replacement = Some(candidate.id);
-							break;
-						}
-					}
-					replacement
-				} else {
-					None
-				};
-				if let Some(record) = removed_record {
-					let mut by_write_id = write_txn
-						.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
+		let removed = self
+			.db
+			.run(move |db| {
+				let _owner = owner;
+				let removed_tenant;
+				let write_txn = db.begin_write().map_err(redb_to_io)?;
+				let removed_any = {
+					let mut table = write_txn
+						.open_table(PENDING_FINALIZATIONS_TABLE)
 						.map_err(redb_to_io)?;
-					let write_key =
-						encode_write_id_key(record.finalization.tenant_id, record.write_id);
-					let indexed_id =
-						match by_write_id.get(write_key.as_slice()).map_err(redb_to_io)? {
+					let removed_record = match table.get(&id.as_bytes()[..]).map_err(redb_to_io)? {
+						Some(value) => Some(decode_pending_finalization_record(
+							value.value(),
+							format_version,
+						)?),
+						None => None,
+					};
+					removed_tenant = removed_record
+						.as_ref()
+						.map(|record| record.finalization.tenant_id);
+					let removed_any = table
+						.remove(&id.as_bytes()[..])
+						.map_err(redb_to_io)?
+						.is_some();
+					let replacement_id = if let Some(record) = removed_record.as_ref() {
+						let canonical = record.write_id.canonical_idempotency_bytes();
+						let mut replacement = None;
+						for entry in table.iter().map_err(redb_to_io)? {
+							let (_key, value) = entry.map_err(redb_to_io)?;
+							let candidate =
+								decode_pending_finalization_record(value.value(), format_version)?;
+							if candidate.finalization.tenant_id == record.finalization.tenant_id
+								&& candidate.write_id.canonical_idempotency_bytes() == canonical
+							{
+								replacement = Some(candidate.id);
+								break;
+							}
+						}
+						replacement
+					} else {
+						None
+					};
+					if let Some(record) = removed_record {
+						let mut by_write_id = write_txn
+							.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
+							.map_err(redb_to_io)?;
+						let write_key =
+							encode_write_id_key(record.finalization.tenant_id, record.write_id);
+						let indexed_id = match by_write_id
+							.get(write_key.as_slice())
+							.map_err(redb_to_io)?
+						{
 							Some(value) => Some(PendingFinalizationId::from_slice(value.value())?),
 							None => None,
 						};
-					if let Some(indexed_id) = indexed_id {
-						if indexed_id == record.id {
-							if let Some(replacement_id) = replacement_id {
-								by_write_id
-									.insert(write_key.as_slice(), &replacement_id.as_bytes()[..])
-									.map_err(redb_to_io)?;
-							} else {
-								let _ = by_write_id
-									.remove(write_key.as_slice())
-									.map_err(redb_to_io)?;
+						if let Some(indexed_id) = indexed_id {
+							if indexed_id == record.id {
+								if let Some(replacement_id) = replacement_id {
+									by_write_id
+										.insert(
+											write_key.as_slice(),
+											&replacement_id.as_bytes()[..],
+										)
+										.map_err(redb_to_io)?;
+								} else {
+									let _ = by_write_id
+										.remove(write_key.as_slice())
+										.map_err(redb_to_io)?;
+								}
 							}
 						}
 					}
+					let mut contexts = write_txn
+						.open_table(PENDING_FINALIZATION_DELETE_COUNTS_TABLE)
+						.map_err(redb_to_io)?;
+					let _ = contexts.remove(&id.as_bytes()[..]).map_err(redb_to_io)?;
+					removed_any
+				};
+				let shadow = removed_tenant.map(|tenant| {
+					observation
+						.begin(WorkScope::Tenant(tenant), WorkKind::Persistence)
+						.before_durable_commit(*id.as_bytes())
+				});
+				#[cfg(test)]
+				observation_commit_gate(&mut gate, 0);
+				write_txn.commit().map_err(redb_to_io)?;
+				#[cfg(test)]
+				observation_commit_gate(&mut gate, 1);
+				if let Some(shadow) = shadow {
+					shadow.committed(false);
 				}
-				let mut contexts = write_txn
-					.open_table(PENDING_FINALIZATION_DELETE_COUNTS_TABLE)
-					.map_err(redb_to_io)?;
-				let _ = contexts.remove(&id.as_bytes()[..]).map_err(redb_to_io)?;
-				removed_any
-			};
-			let shadow = removed_tenant.map(|tenant| {
-				observation
-					.begin(WorkScope::Tenant(tenant), WorkKind::Persistence)
-					.before_durable_commit(*id.as_bytes())
-			});
-			#[cfg(test)]
-			observation_commit_gate(&mut gate, 0);
-			write_txn.commit().map_err(redb_to_io)?;
-			#[cfg(test)]
-			observation_commit_gate(&mut gate, 1);
-			if let Some(shadow) = shadow {
-				shadow.committed(false);
-			}
-			#[cfg(test)]
-			observation_commit_gate(&mut gate, 2);
-			Ok(removed_any)
-		})
-		.await?;
+				#[cfg(test)]
+				observation_commit_gate(&mut gate, 2);
+				Ok(removed_any)
+			})
+			.await?;
 		if removed {
 			self.count.fetch_sub(1, Ordering::Relaxed);
 		}
@@ -600,21 +617,6 @@ fn observation_commit_gate(gate: &mut Option<ObservationCommitGate>, phase: u8) 
 
 pub fn pending_finalizations_path(dir: &Path) -> PathBuf {
 	dir.join("pending_finalizations.redb")
-}
-
-async fn spawn_blocking_io<T>(
-	f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
-) -> std::io::Result<T>
-where
-	T: Send + 'static,
-{
-	let observation = crate::storage::finality_observation::current_work();
-	tokio::task::spawn_blocking(move || {
-		let _observation = observation;
-		f()
-	})
-	.await
-	.map_err(|err| Error::other(format!("blocking redb task failed: {err}")))?
 }
 
 fn redb_to_io(err: impl std::fmt::Display) -> std::io::Error {
@@ -947,7 +949,7 @@ mod tests {
 		let store = PendingFinalizationStore::open(path.clone()).unwrap();
 		store.upsert(record()).await.unwrap();
 		{
-			let write_txn = store.db.begin_write().unwrap();
+			let write_txn = store.db.test_handle().begin_write().unwrap();
 			{
 				let mut meta = write_txn
 					.open_table(PENDING_FINALIZATION_META_TABLE)
@@ -974,7 +976,7 @@ mod tests {
 		let store = PendingFinalizationStore::open(path.clone()).unwrap();
 		store.upsert(record()).await.unwrap();
 		{
-			let write_txn = store.db.begin_write().unwrap();
+			let write_txn = store.db.test_handle().begin_write().unwrap();
 			{
 				let mut meta = write_txn
 					.open_table(PENDING_FINALIZATION_META_TABLE)

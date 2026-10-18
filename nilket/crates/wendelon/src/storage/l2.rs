@@ -114,6 +114,18 @@ pub enum ObjectStoreConfig {
 }
 
 impl ObjectStoreConfig {
+	pub(crate) fn build_with_owner(
+		&self,
+		owner: crate::storage::ownership::DataDirectoryOwner,
+	) -> std::io::Result<Arc<dyn ObjectStore>> {
+		match self {
+			Self::LocalFs { root } => Ok(Arc::new(LocalFsObjectStore::new_with_file_ops(
+				root.clone(),
+				Arc::new(BlockingFileOps::with_owner(owner)),
+			)?)),
+			Self::Remote(config) => Ok(Arc::new(RemoteObjectStore::new(config.clone())?)),
+		}
+	}
 	pub fn build(&self) -> std::io::Result<Arc<dyn ObjectStore>> {
 		match self {
 			Self::LocalFs { root } => Ok(Arc::new(LocalFsObjectStore::new(root.clone())?)),

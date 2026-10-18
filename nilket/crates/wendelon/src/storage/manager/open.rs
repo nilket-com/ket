@@ -3,9 +3,17 @@ use super::*;
 
 impl SlabManager {
 	pub(super) async fn open_shared(
-		config: SlabManagerConfig,
+		mut config: SlabManagerConfig,
+		owner: Option<DataDirectoryOwner>,
 		#[cfg(feature = "test-support")] file_ops_override: Option<Arc<dyn AsyncFileOps>>,
 	) -> std::io::Result<Self> {
+		if let Some(owner) = &owner {
+			owner.ensure_contains(&config.dir)?;
+			config.io = config
+				.io
+				.clone()
+				.try_with_data_directory_owner(owner.clone())?;
+		}
 		config.rehydration.validate()?;
 		config.l2_column_fetch.validate()?;
 		config.row_group_writer.validate()?;
@@ -32,7 +40,10 @@ impl SlabManager {
 		)?);
 		#[cfg(feature = "test-support")]
 		let file_ops: Arc<dyn AsyncFileOps> = match file_ops_override {
-			Some(file_ops) => file_ops,
+			Some(file_ops) => match &owner {
+				Some(owner) => file_ops.bind_directory_owner(owner.clone())?,
+				None => file_ops,
+			},
 			None => Arc::new(IoUringFileOps::with_isolated_blocking(
 				config.io.clone(),
 				"wendelon-fs-meta-slab",
@@ -43,18 +54,22 @@ impl SlabManager {
 		// slab discovery. Reconcile them before every discovery/allocator step so
 		// a committed S1 publication reaches its final path and an S0 file cannot
 		// reserve an id by accident on a rebuilt manager.
-		let persistent_index =
-			match PersistentLocalIndex::open(persistent_index_path(&config.dir)).await {
-				Ok(index) => Some(Arc::new(index)),
-				Err(err) => {
-					tracing::warn!(
-						error = %err,
-						dir = %config.dir.display(),
-						"failed to open redb storage index; continuing with in-memory recovery"
-					);
-					None
-				}
-			};
+		let persistent_index = match PersistentLocalIndex::open_with_owner(
+			persistent_index_path(&config.dir),
+			owner.clone(),
+		)
+		.await
+		{
+			Ok(index) => Some(Arc::new(index)),
+			Err(err) => {
+				tracing::warn!(
+					error = %err,
+					dir = %config.dir.display(),
+					"failed to open redb storage index; continuing with in-memory recovery"
+				);
+				None
+			}
+		};
 		// ADR 0099: the durable rows double as slab recovery's boundary
 		// oracle. A row exists only for a record that was fdatasynced and
 		// then acknowledged, so its offset is a place the walk may resume
@@ -320,6 +335,7 @@ impl SlabManager {
 			),
 		};
 		let manager = Self {
+			_directory_owner: owner,
 			finality_observation:
 				crate::storage::finality_observation::FinalityObservationRegistry::new(),
 			config,

@@ -89,6 +89,7 @@ use crate::schema::{
 };
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoRingHandle};
 use crate::storage::mutation_drain::MutationDrainRegistry;
+use crate::storage::ownership::DataDirectoryOwner;
 use crate::storage::{
 	AsyncFileOps, BlockingFileOps, CompactionCommit, FileHandle, IoUringFileOps, OpenFlags,
 	fsync_parent_dir, is_cdc_locality_heartbeat_finalization, write_file,
@@ -484,6 +485,7 @@ pub struct WendelonLogStore {
 	/// Shared with the state machine: the durable snapshot that alone authorizes physical
 	/// deletion of purged log.
 	publication: Arc<SnapshotPublication>,
+	_directory_owner: Option<DataDirectoryOwner>,
 }
 
 impl WendelonLogStore {
@@ -515,6 +517,7 @@ impl WendelonLogStore {
 			wal_gate: Arc::new(Mutex::new(())),
 			retention: None,
 			publication: Arc::new(SnapshotPublication::new(PublishedSnapshot::NoArtifact)),
+			_directory_owner: None,
 		}
 	}
 
@@ -528,6 +531,7 @@ impl WendelonLogStore {
 	/// Open (or create) the WAL and vote files, load any snapshot
 	/// artifact, replay the WAL tail, and bind the resulting durable
 	/// handles to the production [`AsyncFileOps`] implementation.
+	#[cfg(any(test, feature = "test-support"))]
 	pub async fn open(
 		wal_path: impl AsRef<Path>,
 		vote_path: impl AsRef<Path>,
@@ -549,6 +553,7 @@ impl WendelonLogStore {
 		.await
 	}
 
+	#[cfg(any(test, feature = "test-support"))]
 	pub async fn open_with_file_ops(
 		wal_path: impl AsRef<Path>,
 		vote_path: impl AsRef<Path>,
@@ -568,6 +573,7 @@ impl WendelonLogStore {
 	/// [`Self::open`] under the node's retention guard. Under full retention
 	/// the store refuses to open over a history that is not complete from
 	/// index 0, before any byte of the data directory is modified.
+	#[cfg(any(test, feature = "test-support"))]
 	pub async fn open_with_retention(
 		wal_path: impl AsRef<Path>,
 		vote_path: impl AsRef<Path>,
@@ -587,10 +593,59 @@ impl WendelonLogStore {
 			file_ops,
 			WalOptions::default(),
 			Some(retention),
+			None,
 		)
 		.await
 	}
 
+	/// Open the node's WAL while retaining the same owner token as bootstrap.
+	pub(crate) async fn open_with_retention_and_owner(
+		wal_path: impl AsRef<Path>,
+		vote_path: impl AsRef<Path>,
+		snapshot_path: impl AsRef<Path>,
+		io: IoRingHandle,
+		retention: Arc<RetentionGuard>,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<Self> {
+		let file_ops = Arc::new(IoUringFileOps::with_isolated_blocking(
+			io,
+			"wendelon-fs-meta-wal",
+			crate::storage::BlockingIoClass::WalMetadata,
+		)?);
+		Self::open_with_options_and_retention(
+			wal_path,
+			vote_path,
+			snapshot_path,
+			file_ops,
+			WalOptions::default(),
+			Some(retention),
+			Some(owner),
+		)
+		.await
+	}
+
+	/// Open durable control artifacts while retaining the directory owner.
+	pub async fn open_with_file_ops_and_owner(
+		wal_path: impl AsRef<Path>,
+		vote_path: impl AsRef<Path>,
+		snapshot_path: impl AsRef<Path>,
+		file_ops: Arc<dyn AsyncFileOps>,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<Self> {
+		let file_ops = file_ops.bind_directory_owner(owner.clone())?;
+		Self::open_with_options_and_retention(
+			wal_path,
+			vote_path,
+			snapshot_path,
+			file_ops,
+			WalOptions::default(),
+			None,
+			Some(owner),
+		)
+		.await
+	}
+
+	#[cfg(any(test, feature = "test-support"))]
 	async fn open_with_file_ops_and_options(
 		wal_path: impl AsRef<Path>,
 		vote_path: impl AsRef<Path>,
@@ -605,6 +660,7 @@ impl WendelonLogStore {
 			file_ops,
 			options,
 			None,
+			None,
 		)
 		.await
 	}
@@ -616,11 +672,17 @@ impl WendelonLogStore {
 		file_ops: Arc<dyn AsyncFileOps>,
 		options: WalOptions,
 		retention: Option<Arc<RetentionGuard>>,
+		owner: Option<DataDirectoryOwner>,
 	) -> std::io::Result<Self> {
 		let options = options.validate()?;
 		let wal_path = wal_path.as_ref();
 		let vote_path = vote_path.as_ref();
 		let snapshot_path = snapshot_path.as_ref();
+		if let Some(owner) = &owner {
+			owner.ensure_contains(wal_path)?;
+			owner.ensure_contains(vote_path)?;
+			owner.ensure_contains(snapshot_path)?;
+		}
 		let artifact_paths = ControlArtifactPaths {
 			wal: wal_path.to_path_buf(),
 			vote: vote_path.to_path_buf(),
@@ -740,6 +802,7 @@ impl WendelonLogStore {
 			wal_gate: Arc::new(Mutex::new(())),
 			retention,
 			publication: Arc::new(SnapshotPublication::new(published)),
+			_directory_owner: owner,
 		};
 		metrics().set_control_wal_store_poisoned(false);
 		// Log the validated durable snapshot covers, kept by a purge that ran before it was
@@ -766,6 +829,7 @@ impl WendelonLogStore {
 			Arc::new(crate::storage::BlockingFileOps),
 			WalOptions { segment_bytes },
 			retention,
+			None,
 		)
 		.await
 	}
@@ -1176,11 +1240,13 @@ impl WendelonLogStore {
 		})
 	}
 
-	pub async fn restore_backup(
+	pub(crate) async fn restore_backup(
 		backup: &ControlRingBackupImage,
 		target_dir: impl AsRef<Path>,
+		owner: &DataDirectoryOwner,
 	) -> std::io::Result<()> {
 		let target_dir = target_dir.as_ref();
+		owner.ensure_path(target_dir)?;
 		if !target_dir.is_dir() {
 			return Err(Error::new(
 				ErrorKind::NotFound,
@@ -1198,7 +1264,7 @@ impl WendelonLogStore {
 		}
 
 		let (wal_path, vote_path, snapshot_path) = control_artifact_paths(target_dir);
-		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(BlockingFileOps);
+		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(BlockingFileOps::with_owner(owner.clone()));
 		ensure_wal_artifacts_absent(file_ops.as_ref(), &wal_path).await?;
 		ensure_artifact_absent(&vote_path)?;
 		ensure_artifact_absent(&snapshot_path)?;

@@ -548,7 +548,14 @@ struct ArchiveMirrorState {
 	observer: Arc<dyn AuditObserver>,
 }
 
+/// Admission for local persistence only. Projection/network sinks execute
+/// after this permit has been dropped.
+pub trait AuditWriteAdmission: Send + Sync {
+	fn admit(&self) -> std::io::Result<Box<dyn Send>>;
+}
+
 pub struct LocalAuditSink {
+	write_admission: Option<Arc<dyn AuditWriteAdmission>>,
 	format: AuditFormat,
 	observer: Arc<dyn AuditObserver>,
 	state: Mutex<LocalAuditState>,
@@ -583,6 +590,7 @@ impl LocalAuditSink {
 		Ok(Self {
 			format,
 			observer,
+			write_admission: None,
 			state: Mutex::new(LocalAuditState {
 				file,
 				sequence_number: recovered.sequence_number,
@@ -594,6 +602,11 @@ impl LocalAuditSink {
 	}
 
 	fn persist_event(&self, event: AuditEvent) -> std::io::Result<PreparedAuditEmission> {
+		let _permit = self
+			.write_admission
+			.as_ref()
+			.map(|gate| gate.admit())
+			.transpose()?;
 		let mut state = self.state.lock().expect("audit file mutex poisoned");
 		let sequence_number = state.sequence_number.saturating_add(1);
 		let prev_hash = state
@@ -1180,12 +1193,27 @@ pub fn build_audit_sink(
 	format: AuditFormat,
 	observer: Arc<dyn AuditObserver>,
 ) -> std::io::Result<Arc<dyn AuditSink>> {
-	let local: Arc<dyn AuditSink> = Arc::new(LocalAuditSink::open_with_archive(
-		local_path,
-		config.archive.clone(),
-		format,
-		observer.clone(),
-	)?);
+	build_audit_sink_with_admission(local_path, config, format, observer, None)
+}
+
+pub fn build_audit_sink_with_admission(
+	local_path: impl AsRef<Path>,
+	config: &AuditSinksConfig,
+	format: AuditFormat,
+	observer: Arc<dyn AuditObserver>,
+	admission: Option<Arc<dyn AuditWriteAdmission>>,
+) -> std::io::Result<Arc<dyn AuditSink>> {
+	let local: Arc<dyn AuditSink> = {
+		let _permit = admission.as_ref().map(|gate| gate.admit()).transpose()?;
+		let mut local = LocalAuditSink::open_with_archive(
+			local_path,
+			config.archive.clone(),
+			format,
+			observer.clone(),
+		)?;
+		local.write_admission = admission.clone();
+		Arc::new(local)
+	};
 	let mut additional: Vec<NamedAuditSink> = Vec::new();
 
 	if let Some(syslog) = &config.syslog {

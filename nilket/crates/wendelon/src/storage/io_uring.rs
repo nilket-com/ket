@@ -19,12 +19,15 @@
 //! this driver as its backing.
 
 use crate::metrics::{IoUringClass, global as metrics};
+use crate::storage::ownership::{
+	DataDirectoryOwner, StorageWorker, WorkerJoins, WritePermit, closed_error,
+};
 use io_uring::{IoUring, opcode, types};
 use std::alloc::{self, Layout};
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use tokio::sync::{mpsc, oneshot};
 
@@ -144,6 +147,32 @@ pub struct IoRequest {
 struct QueuedIoRequest {
 	request: IoRequest,
 	observation: Option<crate::storage::finality_observation::WorkToken>,
+	owner: Option<DataDirectoryOwner>,
+	permit: Option<WritePermit>,
+}
+
+enum IoMessage {
+	Request(QueuedIoRequest),
+	Close,
+}
+
+struct RingWorker {
+	tx: mpsc::Sender<IoMessage>,
+	closed: AtomicBool,
+	admission: std::sync::Mutex<()>,
+	joins: Arc<WorkerJoins>,
+}
+
+#[async_trait::async_trait]
+impl StorageWorker for RingWorker {
+	async fn close_and_join(&self) -> std::io::Result<()> {
+		{
+			let _admission = self.admission.lock().unwrap();
+			self.closed.store(true, Ordering::SeqCst);
+		}
+		let _ = self.tx.send(IoMessage::Close).await;
+		self.joins.join().await
+	}
 }
 
 struct InFlightObservation {
@@ -174,6 +203,8 @@ pub struct IoCompletion {
 
 struct InFlightRequest {
 	observation: InFlightObservation,
+	_owner: Option<DataDirectoryOwner>,
+	_permit: Option<WritePermit>,
 	op: IoOp,
 	buf: Option<AlignedBuf>,
 	reply: oneshot::Sender<IoCompletion>,
@@ -199,12 +230,46 @@ type ObservationCompletionGate = Arc<
 pub struct IoRingHandle {
 	#[cfg(test)]
 	cqe_gate: ObservationCompletionGate,
-	tx: mpsc::Sender<QueuedIoRequest>,
+	worker: Arc<RingWorker>,
 	class: IoUringClass,
 	pending_submissions: Arc<AtomicU64>,
+	owner: Option<DataDirectoryOwner>,
 }
 
 impl IoRingHandle {
+	/// Keep the node owner alive in queued and in-flight kernel operations.
+	pub(crate) fn with_data_directory_owner(mut self, owner: DataDirectoryOwner) -> Self {
+		owner
+			.register_worker(self.worker.clone())
+			.expect("register active storage worker");
+		self.owner = Some(owner);
+		self
+	}
+
+	pub(crate) fn try_with_data_directory_owner(
+		mut self,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<Self> {
+		owner.register_worker(self.worker.clone())?;
+		self.owner = Some(owner);
+		Ok(self)
+	}
+
+	pub(crate) fn data_directory_owner(&self) -> Option<DataDirectoryOwner> {
+		self.owner.clone()
+	}
+
+	pub(crate) fn ensure_open(&self) -> std::io::Result<()> {
+		if self.worker.closed.load(Ordering::SeqCst) {
+			return Err(closed_error());
+		}
+		Ok(())
+	}
+
+	pub async fn close_and_join(&self) -> std::io::Result<()> {
+		self.worker.close_and_join().await
+	}
+
 	/// Submit a request. The returned `oneshot::Receiver` fires
 	/// when the kernel completes the I/O.
 	pub async fn submit(
@@ -214,6 +279,18 @@ impl IoRingHandle {
 		buf: AlignedBuf,
 		offset: u64,
 	) -> std::io::Result<oneshot::Receiver<IoCompletion>> {
+		self.ensure_open()?;
+		let slot = self.worker.tx.reserve().await.map_err(|_| closed_error())?;
+		let _admission = self.worker.admission.lock().unwrap();
+		self.ensure_open()?;
+		let permit = if matches!(op, IoOp::Read) {
+			None
+		} else {
+			self.owner
+				.as_ref()
+				.map(DataDirectoryOwner::write_permit)
+				.transpose()?
+		};
 		let (reply_tx, reply_rx) = oneshot::channel();
 		let req = IoRequest {
 			op,
@@ -230,14 +307,10 @@ impl IoRingHandle {
 		let req = QueuedIoRequest {
 			request: req,
 			observation: crate::storage::finality_observation::current_work(),
+			owner: self.owner.clone(),
+			permit,
 		};
-		if self.tx.send(req).await.is_err() {
-			decrement_pending_submissions(&self.pending_submissions, self.class);
-			return Err(std::io::Error::new(
-				std::io::ErrorKind::BrokenPipe,
-				"io_uring thread is gone",
-			));
-		}
+		slot.send(IoMessage::Request(req));
 		Ok(reply_rx)
 	}
 
@@ -266,6 +339,15 @@ impl IoRingHandle {
 		op: IoOp,
 		fd: RawFd,
 	) -> std::io::Result<oneshot::Receiver<IoCompletion>> {
+		self.ensure_open()?;
+		let slot = self.worker.tx.reserve().await.map_err(|_| closed_error())?;
+		let _admission = self.worker.admission.lock().unwrap();
+		self.ensure_open()?;
+		let permit = self
+			.owner
+			.as_ref()
+			.map(DataDirectoryOwner::write_permit)
+			.transpose()?;
 		let (reply_tx, reply_rx) = oneshot::channel();
 		let req = IoRequest {
 			op,
@@ -282,14 +364,10 @@ impl IoRingHandle {
 		let req = QueuedIoRequest {
 			request: req,
 			observation: crate::storage::finality_observation::current_work(),
+			owner: self.owner.clone(),
+			permit,
 		};
-		if self.tx.send(req).await.is_err() {
-			decrement_pending_submissions(&self.pending_submissions, self.class);
-			return Err(std::io::Error::new(
-				std::io::ErrorKind::BrokenPipe,
-				"io_uring thread is gone",
-			));
-		}
+		slot.send(IoMessage::Request(req));
 		Ok(reply_rx)
 	}
 }
@@ -324,14 +402,14 @@ pub fn spawn_io_thread_named_for_class(
 	let ring = IoUring::new(depth)?;
 	// Channel capacity: 2× depth gives slack for bursty submitters
 	// without unbounded memory growth.
-	let (tx, rx) = mpsc::channel::<QueuedIoRequest>((depth as usize).saturating_mul(2).max(1));
+	let (tx, rx) = mpsc::channel::<IoMessage>((depth as usize).saturating_mul(2).max(1));
 	#[cfg(test)]
 	let cqe_gate = Arc::new(std::sync::Mutex::new(None));
 	let pending_submissions = Arc::new(AtomicU64::new(0));
 	let thread_name = thread_name.into();
 	metrics().set_io_uring_submission_queue_depth(class, 0);
 	metrics().set_io_uring_completion_queue_depth(class, 0);
-	thread::Builder::new().name(thread_name).spawn({
+	let thread = thread::Builder::new().name(thread_name).spawn({
 		let pending_submissions = pending_submissions.clone();
 		#[cfg(test)]
 		let thread_gate = cqe_gate.clone();
@@ -349,9 +427,15 @@ pub fn spawn_io_thread_named_for_class(
 	Ok(IoRingHandle {
 		#[cfg(test)]
 		cqe_gate,
-		tx,
+		worker: Arc::new(RingWorker {
+			tx,
+			closed: AtomicBool::new(false),
+			admission: Default::default(),
+			joins: WorkerJoins::new(vec![thread]),
+		}),
 		class,
 		pending_submissions,
+		owner: None,
 	})
 }
 
@@ -377,7 +461,7 @@ pub fn spawn_io_thread_named_for_class(
 // ============================================================
 fn io_thread_loop(
 	mut ring: IoUring,
-	mut rx: mpsc::Receiver<QueuedIoRequest>,
+	mut rx: mpsc::Receiver<IoMessage>,
 	class: IoUringClass,
 	pending_submissions: Arc<AtomicU64>,
 	#[cfg(test)] cqe_gate: ObservationCompletionGate,
@@ -389,7 +473,11 @@ fn io_thread_loop(
 		// 1. Block when idle. Shutdown signalled by channel close.
 		if in_flight.is_empty() {
 			match rx.blocking_recv() {
-				Some(req) => {
+				Some(IoMessage::Close) => {
+					rx.close();
+					continue;
+				}
+				Some(IoMessage::Request(req)) => {
 					decrement_pending_submissions(&pending_submissions, class);
 					push_request(&mut ring, &mut cookie, &mut in_flight, req);
 				}
@@ -406,7 +494,10 @@ fn io_thread_loop(
 				break;
 			}
 			match rx.try_recv() {
-				Ok(req) => {
+				Ok(IoMessage::Close) => {
+					rx.close();
+				}
+				Ok(IoMessage::Request(req)) => {
 					decrement_pending_submissions(&pending_submissions, class);
 					push_request(&mut ring, &mut cookie, &mut in_flight, req);
 				}
@@ -484,7 +575,7 @@ fn io_thread_loop(
 		metrics().set_io_uring_completion_queue_depth(class, in_flight.len() as u64);
 
 		// If the channel is closed and nothing remains in flight, exit.
-		if rx.is_closed() && in_flight.is_empty() {
+		if rx.is_closed() && rx.is_empty() && in_flight.is_empty() {
 			metrics().set_io_uring_completion_queue_depth(class, 0);
 			return;
 		}
@@ -505,6 +596,8 @@ fn push_request(
 	let QueuedIoRequest {
 		request,
 		observation,
+		owner,
+		permit,
 	} = req;
 	let IoRequest {
 		op,
@@ -546,6 +639,8 @@ fn push_request(
 			op,
 			buf,
 			reply,
+			_owner: owner,
+			_permit: permit,
 			observation: InFlightObservation {
 				token: observation,
 				completed: false,
@@ -620,14 +715,86 @@ mod adr629_p2b_observed_ring_tests {
 	};
 
 	#[tokio::test]
+	async fn close_drains_queued_kernel_write_and_revokes_retained_ring_clone() {
+		use std::os::fd::AsRawFd;
+		use std::time::Duration;
+		let dir = std::env::temp_dir().join(format!("owner-ring-close-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir(&dir).unwrap();
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let handle = spawn_io_thread(8)
+			.unwrap()
+			.with_data_directory_owner(owner.clone());
+		let file = std::fs::OpenOptions::new()
+			.create_new(true)
+			.write(true)
+			.open(dir.join("data"))
+			.unwrap();
+		let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+		let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+		*handle.cqe_gate.lock().unwrap() = Some((ready_tx, release_rx));
+		let mut buf = AlignedBuf::new(DIRECT_IO_ALIGN);
+		buf.as_mut_slice().fill(0x61);
+		let reply = handle
+			.submit(IoOp::Write, file.as_raw_fd(), buf, 0)
+			.await
+			.unwrap();
+		tokio::task::spawn_blocking(move || ready_rx.recv().unwrap())
+			.await
+			.unwrap();
+		// The worker is parked at the first completion; the second accepted
+		// write is still in its channel when close begins.
+		let mut queued = AlignedBuf::new(DIRECT_IO_ALIGN);
+		queued.as_mut_slice().fill(0x62);
+		let queued_reply = handle
+			.submit(
+				IoOp::Write,
+				file.as_raw_fd(),
+				queued,
+				DIRECT_IO_ALIGN as u64,
+			)
+			.await
+			.unwrap();
+		let closing = {
+			let owner = owner.clone();
+			tokio::spawn(async move { owner.close(Duration::from_secs(5)).await })
+		};
+		owner.wait_until_closing().await;
+		// Permit remains with the kernel completion even though the caller
+		// retains only the receiver. Release the explicit CQE gate, then join.
+		release_tx.send(()).unwrap();
+		assert_eq!(reply.await.unwrap().result, DIRECT_IO_ALIGN as i32);
+		assert_eq!(queued_reply.await.unwrap().result, DIRECT_IO_ALIGN as i32);
+		closing.await.unwrap().unwrap();
+		assert_eq!(
+			std::fs::read(dir.join("data")).unwrap(),
+			[vec![0x61; DIRECT_IO_ALIGN], vec![0x62; DIRECT_IO_ALIGN]].concat()
+		);
+		DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let error = handle.submit_fsync(file.as_raw_fd()).await.err().unwrap();
+		assert!(
+			error
+				.get_ref()
+				.unwrap()
+				.is::<crate::storage::ownership::Closed>()
+		);
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[tokio::test]
 	async fn adr629_p2b_queue_and_inflight_own_work_after_the_reply_receiver_is_dropped() {
 		let registry = FinalityObservationRegistry::new();
 		let (tx, mut rx) = mpsc::channel(1);
 		let handle = IoRingHandle {
 			cqe_gate: Arc::new(std::sync::Mutex::new(None)),
-			tx,
+			worker: Arc::new(RingWorker {
+				tx,
+				closed: AtomicBool::new(false),
+				admission: Default::default(),
+				joins: WorkerJoins::new(vec![]),
+			}),
 			class: IoUringClass::Generic,
 			pending_submissions: Arc::new(AtomicU64::new(0)),
+			owner: None,
 		};
 		let owner = registry.begin(WorkScope::Node, WorkKind::StoragePublication);
 		// Real submission queue/ownership path, synthetic CQE lifecycle; no kernel claim.
@@ -639,7 +806,9 @@ mod adr629_p2b_observed_ring_tests {
 		.unwrap();
 		drop(reply);
 		assert_eq!(registry.test_state(), (1, 0, None));
-		let queued = rx.recv().await.unwrap();
+		let IoMessage::Request(queued) = rx.recv().await.unwrap() else {
+			panic!("expected request")
+		};
 		decrement_pending_submissions(&handle.pending_submissions, handle.class);
 		let flight = InFlightObservation {
 			token: queued.observation,

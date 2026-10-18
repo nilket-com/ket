@@ -383,7 +383,7 @@ async fn tenant_index_lookup_rejects_wrong_tenant_and_canonical_pointer() {
 		} else {
 			a.write_id
 		};
-		let txn = store.db.begin_write().unwrap();
+		let txn = store.db.test_handle().begin_write().unwrap();
 		{
 			txn.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
 				.unwrap()

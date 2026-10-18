@@ -94,27 +94,37 @@ impl DropReclaimProgressLoad {
 }
 
 pub(crate) struct DropReclaimProgressStore {
-	db: Arc<Database>,
+	db: crate::storage::owned_redb::OwnedRedb,
 	write_lock: Mutex<()>,
 }
 
 impl DropReclaimProgressStore {
+	pub(crate) fn bind_owner(
+		&self,
+		owner: crate::storage::ownership::DataDirectoryOwner,
+	) -> std::io::Result<()> {
+		self.db.bind_owner(owner)
+	}
 	pub(crate) fn open(path: impl Into<PathBuf>) -> std::io::Result<Arc<Self>> {
 		let path = path.into();
 		let mut registry = stores()
 			.lock()
 			.expect("drop reclaim store registry poisoned");
-		if let Some(existing) = registry.get(&path).and_then(Weak::upgrade) {
+		if let Some(existing) = registry
+			.get(&path)
+			.and_then(Weak::upgrade)
+			.filter(|store| !store.db.is_closed())
+		{
 			return Ok(existing);
 		}
-		let db = Arc::new(Database::create(path.clone()).map_err(redb_to_io)?);
+		let db = Database::create(path.clone()).map_err(redb_to_io)?;
 		let txn = db.begin_write().map_err(redb_to_io)?;
 		{
 			let _ = txn.open_table(PROGRESS).map_err(redb_to_io)?;
 		}
 		txn.commit().map_err(redb_to_io)?;
 		let store = Arc::new(Self {
-			db,
+			db: crate::storage::owned_redb::OwnedRedb::new(db, "drop reclaim progress store"),
 			write_lock: Mutex::new(()),
 		});
 		registry.insert(path, Arc::downgrade(&store));
@@ -128,63 +138,65 @@ impl DropReclaimProgressStore {
 		owner_epoch: u64,
 	) -> std::io::Result<DropReclaimProgressLoad> {
 		let _guard = self.write_lock.lock().await;
-		let db = self.db.clone();
-		spawn_blocking_io(move || {
-			let key = operation_key(operation_id);
-			let txn = db.begin_write().map_err(redb_to_io)?;
-			let raw = {
-				let table = txn.open_table(PROGRESS).map_err(redb_to_io)?;
-				table
-					.get(key.as_slice())
-					.map_err(redb_to_io)?
-					.map(|value| value.value().to_vec())
-			};
-			let outcome = match raw {
-				None => DropReclaimProgressLoad::Absent(DropReclaimProgress::start(
-					operation_id,
-					finalize_log_index,
-					owner_epoch,
-				)),
-				Some(bytes) => {
-					match postcard::from_bytes::<DropReclaimProgress>(&bytes).and_then(|progress| {
-						progress
-							.validate_identity(operation_id, finalize_log_index)
-							.map_err(|_| postcard::Error::DeserializeBadEncoding)?;
-						Ok(progress)
-					}) {
-						Ok(progress) => DropReclaimProgressLoad::Present(progress),
-						Err(error) => {
-							let mut reset = DropReclaimProgress::start(
-								operation_id,
-								finalize_log_index,
-								owner_epoch,
-							);
-							reset.corruption_rebuild = true;
-							let encoded = postcard::to_stdvec(&reset).map_err(|encode| {
-								Error::other(format!(
-									"encode drop reclaim corruption marker: {encode}"
-								))
-							})?;
-							{
-								let mut table = txn.open_table(PROGRESS).map_err(redb_to_io)?;
-								table
-									.insert(key.as_slice(), encoded.as_slice())
-									.map_err(redb_to_io)?;
+		self.db
+			.run(move |db| {
+				let key = operation_key(operation_id);
+				let txn = db.begin_write().map_err(redb_to_io)?;
+				let raw = {
+					let table = txn.open_table(PROGRESS).map_err(redb_to_io)?;
+					table
+						.get(key.as_slice())
+						.map_err(redb_to_io)?
+						.map(|value| value.value().to_vec())
+				};
+				let outcome = match raw {
+					None => DropReclaimProgressLoad::Absent(DropReclaimProgress::start(
+						operation_id,
+						finalize_log_index,
+						owner_epoch,
+					)),
+					Some(bytes) => {
+						match postcard::from_bytes::<DropReclaimProgress>(&bytes).and_then(
+							|progress| {
+								progress
+									.validate_identity(operation_id, finalize_log_index)
+									.map_err(|_| postcard::Error::DeserializeBadEncoding)?;
+								Ok(progress)
+							},
+						) {
+							Ok(progress) => DropReclaimProgressLoad::Present(progress),
+							Err(error) => {
+								let mut reset = DropReclaimProgress::start(
+									operation_id,
+									finalize_log_index,
+									owner_epoch,
+								);
+								reset.corruption_rebuild = true;
+								let encoded = postcard::to_stdvec(&reset).map_err(|encode| {
+									Error::other(format!(
+										"encode drop reclaim corruption marker: {encode}"
+									))
+								})?;
+								{
+									let mut table = txn.open_table(PROGRESS).map_err(redb_to_io)?;
+									table
+										.insert(key.as_slice(), encoded.as_slice())
+										.map_err(redb_to_io)?;
+								}
+								tracing::error!(
+									?operation_id,
+									%error,
+									"drop reclaim progress is corrupt; entering bounded reset-from-zero rebuild"
+								);
+								DropReclaimProgressLoad::CorruptReset(reset)
 							}
-							tracing::error!(
-								?operation_id,
-								%error,
-								"drop reclaim progress is corrupt; entering bounded reset-from-zero rebuild"
-							);
-							DropReclaimProgressLoad::CorruptReset(reset)
 						}
 					}
-				}
-			};
-			txn.commit().map_err(redb_to_io)?;
-			Ok(outcome)
-		})
-		.await
+				};
+				txn.commit().map_err(redb_to_io)?;
+				Ok(outcome)
+			})
+			.await
 	}
 
 	pub(crate) async fn store_current_epoch(
@@ -199,21 +211,22 @@ impl DropReclaimProgressStore {
 			));
 		}
 		let _guard = self.write_lock.lock().await;
-		let db = self.db.clone();
-		spawn_blocking_io(move || {
-			let key = operation_key(progress.operation_id);
-			let encoded = postcard::to_stdvec(&progress)
-				.map_err(|error| Error::other(format!("encode drop reclaim progress: {error}")))?;
-			let txn = db.begin_write().map_err(redb_to_io)?;
-			{
-				let mut table = txn.open_table(PROGRESS).map_err(redb_to_io)?;
-				table
-					.insert(key.as_slice(), encoded.as_slice())
-					.map_err(redb_to_io)?;
-			}
-			txn.commit().map_err(redb_to_io)
-		})
-		.await
+		self.db
+			.run(move |db| {
+				let key = operation_key(progress.operation_id);
+				let encoded = postcard::to_stdvec(&progress).map_err(|error| {
+					Error::other(format!("encode drop reclaim progress: {error}"))
+				})?;
+				let txn = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = txn.open_table(PROGRESS).map_err(redb_to_io)?;
+					table
+						.insert(key.as_slice(), encoded.as_slice())
+						.map_err(redb_to_io)?;
+				}
+				txn.commit().map_err(redb_to_io)
+			})
+			.await
 	}
 
 	#[cfg(test)]
@@ -223,19 +236,19 @@ impl DropReclaimProgressStore {
 		bytes: Vec<u8>,
 	) -> std::io::Result<()> {
 		let _guard = self.write_lock.lock().await;
-		let db = self.db.clone();
-		spawn_blocking_io(move || {
-			let key = operation_key(operation_id);
-			let txn = db.begin_write().map_err(redb_to_io)?;
-			{
-				let mut table = txn.open_table(PROGRESS).map_err(redb_to_io)?;
-				table
-					.insert(key.as_slice(), bytes.as_slice())
-					.map_err(redb_to_io)?;
-			}
-			txn.commit().map_err(redb_to_io)
-		})
-		.await
+		self.db
+			.run(move |db| {
+				let key = operation_key(operation_id);
+				let txn = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = txn.open_table(PROGRESS).map_err(redb_to_io)?;
+					table
+						.insert(key.as_slice(), bytes.as_slice())
+						.map_err(redb_to_io)?;
+				}
+				txn.commit().map_err(redb_to_io)
+			})
+			.await
 	}
 }
 
@@ -249,14 +262,6 @@ fn operation_key(operation_id: DropOperationId) -> [u8; 32] {
 
 pub(crate) fn drop_reclaim_progress_path(dir: &Path) -> PathBuf {
 	dir.join("drop_reclaim_progress.redb")
-}
-
-async fn spawn_blocking_io<T: Send + 'static>(
-	f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
-) -> std::io::Result<T> {
-	tokio::task::spawn_blocking(f)
-		.await
-		.map_err(|error| Error::other(format!("drop reclaim progress task failed: {error}")))?
 }
 
 fn redb_to_io(error: impl std::fmt::Display) -> Error {

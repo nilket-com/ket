@@ -2,6 +2,14 @@
 
 This document describes the configuration schema implemented by the config loader.
 
+`tuning.storage_shutdown_timeout_seconds` bounds the request-quiescence wait and,
+separately, storage write drain and worker joins during shutdown (default 30,
+must be positive and at most 3600). If storage cannot prove every writer stopped,
+the daemon terminates itself with exit status 86 instead of lingering with the
+directory lock held; the next start finds no clean-shutdown record and runs
+recovery. Retained storage handles reject new writes once shutdown has closed
+write admission.
+
 Nodes are bootstrapped from a static TOML file such as `wendelon.toml`. The
 current loader is intentionally narrow: it covers the single-node bootstrap and
 identity material required by the Control Ring and Data Ring signing paths.
@@ -48,6 +56,12 @@ audit_root_signing_secret = "<64 hex chars>"
 
 - `data_dir` may be absolute or relative. Relative paths resolve from the
   directory containing the TOML file.
+- A node holds an exclusive, nonblocking `flock` on the persistent
+  `<data_dir>/LOCK` sentinel for its lifetime and while any storage worker can
+  write. A second node using the same canonical directory fails with a busy
+  error. Do not remove or replace `LOCK` during cleanup or reset. NFS behavior
+  is not assumed safe; verify cross-client lock propagation for the exact mount
+  and server before placing a Wendelon data directory there.
 - The trusted signer maps must contain an entry for `node_id`, or bootstrap
   validation fails.
 - `slab_max_bytes`, `rf`, `wal_io_depth`, and `slab_io_depth` default to
@@ -112,3 +126,28 @@ be checked only by explicitly selecting that historical transfer public key as a
 for the chosen file/span and recording the migration-of-trust note. No key is inferred from
 records, configuration role fallback or epochs. Logs are never rewritten by verification.
 Custody, rotation, runtime configuration and redeployment are separate operator work.
+
+### Running under systemd
+
+Run Wendelon so the service manager owns its whole process tree and waits out its
+bounded shutdown before escalating:
+
+```text
+[Service]
+KillMode=control-group
+TimeoutStopSec=100
+Restart=on-failure
+```
+
+- `KillMode=control-group` delivers the stop signal and the final SIGKILL to every
+  process in the unit's cgroup, not only the main PID.
+- `TimeoutStopSec` must exceed Wendelon's own shutdown watchdog, which fires at
+  2 x `tuning.storage_shutdown_timeout_seconds` + 25 s (quiescence wait and storage
+  close are each bounded by the timeout). Use 2 x the timeout + 40 s: 100 for the
+  default 30.
+- The daemon drains on either SIGTERM (systemd's default stop signal) or SIGINT.
+- Exit status 86 means the process self-terminated after a shutdown that could not
+  prove every writer stopped. It is not a configuration error: `Restart=on-failure`
+  restarts it, and the next start finds no clean-shutdown record and runs recovery.
+  `nilket local` applies the same grace and reports a supervisor SIGKILL as
+  "unclean stop (killed by supervisor)".

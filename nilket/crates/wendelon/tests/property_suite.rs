@@ -322,12 +322,12 @@ async fn property_pending_finalization_restart_recovers_without_losing_value() {
 	assert!(trailing.is_none());
 	assert_eq!(store.load_all().await.unwrap().len(), 1);
 
-	support::abort_node(&node);
-	drop(node);
-	tokio::time::sleep(Duration::from_millis(25)).await;
+	node.shutdown().await.unwrap();
 
 	let recovered = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
 	refresh_leases(&recovered).await;
+	// The pre-restart handle is revoked by shutdown; reopen it against the recovered node.
+	let store = PendingFinalizationStore::open(pending_finalizations_path(&dir)).unwrap();
 
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
 	loop {
@@ -405,9 +405,7 @@ async fn property_duplicate_replay_converges_to_a_legal_terminal_state() {
 	assert!(first_marker.is_none());
 	assert!(duplicate_marker.is_none());
 
-	support::abort_node(&node);
-	drop(node);
-	tokio::time::sleep(Duration::from_millis(25)).await;
+	node.shutdown().await.unwrap();
 
 	let recovered = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
 	refresh_leases(&recovered).await;

@@ -186,7 +186,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, mpsc, watch};
-use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, field};
 
@@ -196,6 +196,7 @@ use crate::network::traits::DataRing;
 // ADR 077: handler families and their colocated helpers live in domain submodules;
 // the struct, construction, and MsgType dispatch stay in this module root.
 mod counter;
+mod ownership;
 mod replica_routing;
 use replica_routing::serving_replicas_for_placement;
 pub use replica_routing::{ReplicaRouter, StaticReplicaRouter};
@@ -689,6 +690,7 @@ impl DropReclaimSliceResponseMeta {
 /// [`TransportProviderFactory`] to open HRFT streams to remote
 /// replicas.
 pub struct WendelonDataServer {
+	_directory_owner: Option<ownership::Owner>,
 	slab: Arc<SlabManager>,
 	raft: WendelonRaft,
 	log_store: WendelonLogStore,
@@ -1170,6 +1172,7 @@ impl CdcCheckpointCadence {
 impl Clone for WendelonDataServer {
 	fn clone(&self) -> Self {
 		Self {
+			_directory_owner: self._directory_owner.clone(),
 			slab: self.slab.clone(),
 			raft: self.raft.clone(),
 			log_store: self.log_store.clone(),
@@ -2228,6 +2231,7 @@ impl WendelonDataServer {
 		pool: Arc<BufPool>,
 	) -> std::io::Result<Self> {
 		let hlc = Arc::new(HybridLogicalClockDriver::new(local_node, clock.clone()));
+		let (owner, _initialization) = ownership::admit(&slab)?;
 		let pending_finalizations = PendingFinalizationStore::open_observed(
 			pending_finalizations_path(slab.data_dir()),
 			slab.finality_observation_registry(),
@@ -2248,6 +2252,7 @@ impl WendelonDataServer {
 			None
 		};
 		let server = Self {
+			_directory_owner: None,
 			slab,
 			raft,
 			log_store,
@@ -2335,6 +2340,7 @@ impl WendelonDataServer {
 			);
 			server.apply_local_persistence_runtime_fence();
 		}
+		ownership::bind(&server, &owner)?;
 		Ok(server)
 	}
 
@@ -2431,13 +2437,7 @@ impl WendelonDataServer {
 		detail: String,
 	) -> std::io::Result<()> {
 		let path = self.local_persistence_distrust_path.clone();
-		spawn_blocking(move || std::fs::write(path, detail))
-			.await
-			.map_err(|err| {
-				Error::other(format!(
-					"local persistence distrust marker task failed: {err}"
-				))
-			})?
+		ownership::write_distrust_marker(self._directory_owner.as_ref(), path, detail).await
 	}
 
 	async fn trip_local_persistence_distrust(&self, detail: impl Into<String>) {
@@ -6611,8 +6611,7 @@ impl WendelonDataServer {
 		>,
 	> {
 		use crate::storage::counter::{
-			CounterLeader, CounterParticipantKind, DurableCounterWitnessStore,
-			LocalCounterParticipant,
+			CounterLeader, CounterParticipantKind, LocalCounterParticipant,
 		};
 		if let Some(existing) = self.counter_leaders.get(&tenant_id) {
 			return Ok(existing.clone());
@@ -6636,8 +6635,7 @@ impl WendelonDataServer {
 			.data_dir()
 			.join("counter-witness")
 			.join(format!("tenant-{}", tenant_id.get()));
-		std::fs::create_dir_all(&witness_dir)?;
-		let witness_store = DurableCounterWitnessStore::open(witness_dir)?;
+		let witness_store = ownership::witness_store(witness_dir, self._directory_owner.as_ref())?;
 		let leader = Arc::new(CounterLeader::recover(
 			self.local_node,
 			participant,

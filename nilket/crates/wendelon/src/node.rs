@@ -36,7 +36,8 @@ pub use test_support::TestSupportFileOps;
 use crate::audit::{
 	AuditAuthority, AuditClockDriftSubscriber, AuditEvent, AuditMaterializationTracker,
 	AuditOperation, AuditRootSigner, AuditSink, AuditSinksConfig,
-	DEFAULT_CHAIN_ROOT_ROLLUP_INTERVAL, build_audit_sink, spawn_signed_chain_root_rollup,
+	DEFAULT_CHAIN_ROOT_ROLLUP_INTERVAL, build_audit_sink_with_owner,
+	spawn_signed_chain_root_rollup,
 };
 use crate::backup::{ClusterBackupImage, ClusterNodeBackupImage};
 use crate::build_info;
@@ -116,6 +117,7 @@ use crate::storage::encoding::{
 use crate::storage::io_uring::{IoRingHandle, spawn_io_thread_named_for_class};
 use crate::storage::l2::ObjectStoreConfig;
 use crate::storage::manager::{RehydrationPolicy, SlabManager, SlabManagerConfig};
+use crate::storage::ownership::DataDirectoryOwner;
 use crate::storage::row_group::{L2RowGroupFetchConfig, RowGroupWriterConfig};
 use crate::storage::{
 	DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS, GroupCommitConfig, L2ColumnFetchConfig,
@@ -199,6 +201,8 @@ pub struct NodeBootstrapConfig {
 	pub wal_io_depth: u32,
 	/// Depth of the dedicated slab-storage `io_uring` submission queue.
 	pub slab_io_depth: u32,
+	/// Bound for storage write drain and worker joins; timeout retains LOCK.
+	pub storage_shutdown_timeout: Duration,
 	/// File operations injected only by deterministic acceptance fixtures.
 	#[cfg(feature = "test-support")]
 	pub slab_file_ops: Option<TestSupportFileOps>,
@@ -322,6 +326,7 @@ impl NodeBootstrapConfig {
 			rf: 1,
 			wal_io_depth: 64,
 			slab_io_depth: 64,
+			storage_shutdown_timeout: Duration::from_secs(30),
 			#[cfg(feature = "test-support")]
 			slab_file_ops: None,
 			cdc_locality_heartbeat_interval: Duration::from_millis(
@@ -373,6 +378,19 @@ impl NodeBootstrapConfig {
 	}
 
 	pub fn validate(&self) -> std::io::Result<()> {
+		if self.storage_shutdown_timeout.is_zero() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"storage_shutdown_timeout must be positive",
+			));
+		}
+		if self.storage_shutdown_timeout > Duration::from_secs(3600) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"storage_shutdown_timeout must be at most one hour",
+			));
+		}
+
 		if self.node_id == 0 {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
@@ -674,6 +692,9 @@ impl NodeBootstrapConfig {
 /// subsystem so `main.rs` (or a test) can introspect state and drive
 /// the QUIC listener without reaching across module boundaries.
 pub struct WendelonNode {
+	_directory_owner: DataDirectoryOwner,
+	storage_shutdown_timeout: Duration,
+	recovered_after_unclean_shutdown: bool,
 	pub local_node: NodeId,
 	pub slab: Arc<SlabManager>,
 	pub crypto: Arc<CryptoManager>,
@@ -757,38 +778,57 @@ impl NodeHandles {
 
 	pub async fn shutdown(self) -> std::io::Result<()> {
 		self.abort();
-		await_background_task(self.ring_updater, "ring updater").await?;
-		await_background_task(self.drift_monitor, "drift monitor").await?;
-		await_background_task(self.eviction_watchdog, "eviction watchdog").await?;
-		await_background_task(self.lease_manager, "lease manager").await?;
-		await_background_task(
+		let mut first_error = None;
+		macro_rules! join_all_way {
+			($task:expr, $name:literal) => {
+				if let Err(error) = await_background_task($task, $name).await {
+					if first_error.is_none() {
+						first_error = Some(error);
+					}
+				}
+			};
+		}
+		join_all_way!(self.ring_updater, "ring updater");
+		join_all_way!(self.drift_monitor, "drift monitor");
+		join_all_way!(self.eviction_watchdog, "eviction watchdog");
+		join_all_way!(self.lease_manager, "lease manager");
+		join_all_way!(
 			self.pending_finalization_reconciler,
-			"pending finalization reconciler",
-		)
-		.await?;
-		await_background_task(
+			"pending finalization reconciler"
+		);
+		if let Err(error) = await_background_task(
 			self.cdc_finalization_release_observer,
 			"CDC finalization release observer",
 		)
-		.await?;
-		await_background_task(self.cdc_locality_heartbeat, "CDC locality heartbeat").await?;
-		await_background_task(self.epoch_reconciler, "epoch reconciler").await?;
-		await_background_task(self.tenant_policy_reconciler, "tenant policy reconciler").await?;
-		await_background_task(self.drop_reclaim_sweeper, "drop reclaim sweeper").await?;
-		await_background_task(self.migration_sweeper, "migration sweeper").await?;
-		await_background_task(self.lsm_compaction, "LSM compaction").await?;
-		await_background_task(self.lsm_gc, "LSM GC").await?;
-		await_background_task(self.secondary_index_lifecycle, "secondary-index lifecycle").await?;
+		.await
+		{
+			first_error.get_or_insert(error);
+		}
+		if let Err(error) =
+			await_background_task(self.cdc_locality_heartbeat, "CDC locality heartbeat").await
+		{
+			first_error.get_or_insert(error);
+		}
+		join_all_way!(self.epoch_reconciler, "epoch reconciler");
+		join_all_way!(self.tenant_policy_reconciler, "tenant policy reconciler");
+		join_all_way!(self.drop_reclaim_sweeper, "drop reclaim sweeper");
+		join_all_way!(self.migration_sweeper, "migration sweeper");
+		join_all_way!(self.lsm_compaction, "LSM compaction");
+		join_all_way!(self.lsm_gc, "LSM GC");
+		join_all_way!(self.secondary_index_lifecycle, "secondary-index lifecycle");
 		if let Some(handle) = self.tiering_sweeper {
-			await_background_task(handle, "tiering sweeper").await?;
+			join_all_way!(handle, "tiering sweeper");
 		}
 		if let Some(handle) = self.restore_validation {
-			await_background_task(handle, "restore validation").await?;
+			join_all_way!(handle, "restore validation");
 		}
-		await_background_task(self.audit_chain_root_rollup, "audit chain root rollup").await?;
-		await_background_task(self.default_tenant_seeder, "default tenant seeder").await?;
-		await_background_task(self.checkpoint_emitter, "checkpoint emitter").await?;
-		Ok(())
+		join_all_way!(self.audit_chain_root_rollup, "audit chain root rollup");
+		join_all_way!(self.default_tenant_seeder, "default tenant seeder");
+		join_all_way!(self.checkpoint_emitter, "checkpoint emitter");
+		match first_error {
+			Some(error) => Err(error),
+			None => Ok(()),
+		}
 	}
 }
 
@@ -796,6 +836,7 @@ impl NodeHandles {
 enum RestoreValidationStatus {
 	Complete,
 	Pending,
+	RecoveringAfterUncleanShutdown,
 	Failed(String),
 }
 
@@ -804,6 +845,9 @@ impl RestoreValidationStatus {
 		match self {
 			Self::Complete => None,
 			Self::Pending => Some("RestoreValidationPending".to_string()),
+			Self::RecoveringAfterUncleanShutdown => {
+				Some("RecoveringAfterUncleanShutdown".to_string())
+			}
 			Self::Failed(reason) => Some(reason.clone()),
 		}
 	}
@@ -834,12 +878,13 @@ impl QuicServerHandle {
 
 	pub async fn shutdown(self) -> std::io::Result<()> {
 		self.begin_drain();
-		let result = self.task.await.map_err(|err| {
-			Error::new(
+		let result = match self.task.await {
+			Ok(result) => result,
+			Err(err) => Err(Error::new(
 				ErrorKind::Other,
 				format!("QUIC server task failed during shutdown: {err}"),
-			)
-		})?;
+			)),
+		};
 		self.endpoint.close(0u32.into(), b"shutdown");
 		self.endpoint.wait_idle().await;
 		result
@@ -967,6 +1012,15 @@ impl WendelonNode {
 	/// fresh-cluster step and restarts from the recovered Raft
 	/// artifacts.
 	pub async fn bootstrap(cfg: NodeBootstrapConfig) -> std::io::Result<Self> {
+		cfg.validate()?;
+		let owner = DataDirectoryOwner::acquire_existing(&cfg.data_dir)?;
+		Self::bootstrap_owned(cfg, owner).await
+	}
+
+	async fn bootstrap_owned(
+		cfg: NodeBootstrapConfig,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<Self> {
 		let (revocation_tx, _) = watch::channel(Arc::new(RevocationSnapshot::default()));
 		if let Some(tls) = cfg.transport_tls.clone() {
 			let material = TlsMaterial::load(&tls.cert_path, &tls.key_path, &tls.node_ca_path)?;
@@ -1029,6 +1083,7 @@ impl WendelonNode {
 					},
 				],
 				revocation_tx,
+				owner,
 			)
 			.await;
 		}
@@ -1038,7 +1093,7 @@ impl WendelonNode {
 				"cluster.join requires transport_tls or a caller-supplied real transport provider",
 			));
 		}
-		Self::bootstrap_with_provider(cfg, Arc::new(NoDialTransportProvider)).await
+		Self::bootstrap_with_provider_owned(cfg, Arc::new(NoDialTransportProvider), owner).await
 	}
 
 	/// Compatibility wrapper kept for older tests that want the
@@ -1053,11 +1108,13 @@ impl WendelonNode {
 		backup: &ClusterBackupImage,
 		cfg: NodeBootstrapConfig,
 	) -> std::io::Result<Self> {
-		Self::restore_cluster_backup_artifacts(backup, &cfg).await?;
+		cfg.validate()?;
+		let owner = DataDirectoryOwner::acquire_or_create(&cfg.data_dir)?;
+		Self::restore_cluster_backup_artifacts(backup, &cfg, &owner).await?;
 		// Preserve the caller's cluster mode so the same restore helper can
 		// support both standalone recovery bootstrap and same-identity
 		// replacement into a live cluster.
-		Self::bootstrap(cfg).await
+		Self::bootstrap_owned(cfg, owner).await
 	}
 
 	pub async fn restore_from_cluster_backup_with_provider(
@@ -1065,8 +1122,10 @@ impl WendelonNode {
 		cfg: NodeBootstrapConfig,
 		provider: Arc<dyn TransportProvider>,
 	) -> std::io::Result<Self> {
-		Self::restore_cluster_backup_artifacts(backup, &cfg).await?;
-		Self::bootstrap_with_provider(cfg, provider).await
+		cfg.validate()?;
+		let owner = DataDirectoryOwner::acquire_or_create(&cfg.data_dir)?;
+		Self::restore_cluster_backup_artifacts(backup, &cfg, &owner).await?;
+		Self::bootstrap_with_provider_owned(cfg, provider, owner).await
 	}
 
 	pub async fn restore_replacement_from_cluster_backup(
@@ -1074,8 +1133,11 @@ impl WendelonNode {
 		source_node_id: u32,
 		cfg: NodeBootstrapConfig,
 	) -> std::io::Result<Self> {
-		Self::prepare_replacement_from_cluster_backup(backup, source_node_id, &cfg).await?;
-		Self::bootstrap(cfg).await
+		cfg.validate()?;
+		Self::validate_replacement_target(source_node_id, &cfg)?;
+		let owner = DataDirectoryOwner::acquire_or_create(&cfg.data_dir)?;
+		Self::prepare_replacement_from_cluster_backup(backup, source_node_id, &cfg, &owner).await?;
+		Self::bootstrap_owned(cfg, owner).await
 	}
 
 	pub async fn restore_replacement_from_cluster_backup_with_provider(
@@ -1084,13 +1146,36 @@ impl WendelonNode {
 		cfg: NodeBootstrapConfig,
 		provider: Arc<dyn TransportProvider>,
 	) -> std::io::Result<Self> {
-		Self::prepare_replacement_from_cluster_backup(backup, source_node_id, &cfg).await?;
-		Self::bootstrap_with_provider(cfg, provider).await
+		cfg.validate()?;
+		Self::validate_replacement_target(source_node_id, &cfg)?;
+		let owner = DataDirectoryOwner::acquire_or_create(&cfg.data_dir)?;
+		Self::prepare_replacement_from_cluster_backup(backup, source_node_id, &cfg, &owner).await?;
+		Self::bootstrap_with_provider_owned(cfg, provider, owner).await
+	}
+
+	fn validate_replacement_target(
+		source_node_id: u32,
+		cfg: &NodeBootstrapConfig,
+	) -> std::io::Result<()> {
+		if !matches!(cfg.cluster, ClusterBootstrapConfig::Join { .. }) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"replacement restore requires cluster.join so the node can reattach to a live cluster",
+			));
+		}
+		if cfg.node_id == source_node_id {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"replacement restore requires a fresh node_id distinct from the failed node",
+			));
+		}
+		Ok(())
 	}
 
 	async fn restore_cluster_backup_artifacts(
 		backup: &ClusterBackupImage,
 		cfg: &NodeBootstrapConfig,
+		owner: &DataDirectoryOwner,
 	) -> std::io::Result<()> {
 		std::fs::create_dir_all(&cfg.data_dir)?;
 		backup.validate_integrity()?;
@@ -1107,8 +1192,8 @@ impl WendelonNode {
 					),
 				)
 			})?;
-		WendelonLogStore::restore_backup(&backup.control, &cfg.data_dir).await?;
-		SlabManager::restore_backup(&node_backup.storage, &cfg.data_dir).await?;
+		WendelonLogStore::restore_backup(&backup.control, &cfg.data_dir, owner).await?;
+		SlabManager::restore_backup(&node_backup.storage, &cfg.data_dir, owner).await?;
 		Ok(())
 	}
 
@@ -1116,19 +1201,10 @@ impl WendelonNode {
 		backup: &ClusterBackupImage,
 		source_node_id: u32,
 		cfg: &NodeBootstrapConfig,
+		owner: &DataDirectoryOwner,
 	) -> std::io::Result<()> {
-		if !matches!(cfg.cluster, ClusterBootstrapConfig::Join { .. }) {
-			return Err(Error::new(
-				ErrorKind::InvalidInput,
-				"replacement restore requires cluster.join so the node can reattach to a live cluster",
-			));
-		}
-		if cfg.node_id == source_node_id {
-			return Err(Error::new(
-				ErrorKind::InvalidInput,
-				"replacement restore requires a fresh node_id distinct from the failed node",
-			));
-		}
+		Self::validate_replacement_target(source_node_id, cfg)?;
+		owner.ensure_path(&cfg.data_dir)?;
 		std::fs::create_dir_all(&cfg.data_dir)?;
 		let (wal_path, vote_path, snapshot_path) = control_artifact_paths(&cfg.data_dir);
 		for path in [&wal_path, &vote_path, &snapshot_path] {
@@ -1156,7 +1232,7 @@ impl WendelonNode {
 					),
 				)
 			})?;
-		SlabManager::restore_backup(&node_backup.storage, &cfg.data_dir).await?;
+		SlabManager::restore_backup(&node_backup.storage, &cfg.data_dir, owner).await?;
 		Ok(())
 	}
 
@@ -1349,6 +1425,31 @@ impl WendelonNode {
 		provider: Arc<dyn TransportProvider>,
 		provider_tier: TransportTier,
 	) -> std::io::Result<Self> {
+		cfg.validate()?;
+		let owner = DataDirectoryOwner::acquire_existing(&cfg.data_dir)?;
+		Self::bootstrap_with_provider_owned_at_tier(cfg, provider, provider_tier, owner).await
+	}
+
+	async fn bootstrap_with_provider_owned(
+		cfg: NodeBootstrapConfig,
+		provider: Arc<dyn TransportProvider>,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<Self> {
+		Self::bootstrap_with_provider_owned_at_tier(
+			cfg,
+			provider,
+			TransportTier::QuicIoUring,
+			owner,
+		)
+		.await
+	}
+
+	async fn bootstrap_with_provider_owned_at_tier(
+		cfg: NodeBootstrapConfig,
+		provider: Arc<dyn TransportProvider>,
+		provider_tier: TransportTier,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<Self> {
 		let (revocation_tx, _) = watch::channel(Arc::new(RevocationSnapshot::default()));
 		let startup_listeners = if provider_tier == TransportTier::TcpTls {
 			let tls = cfg.transport_tls.as_ref().ok_or_else(|| {
@@ -1385,6 +1486,7 @@ impl WendelonNode {
 			providers,
 			startup_listeners,
 			revocation_tx,
+			owner,
 		)
 		.await
 	}
@@ -1395,8 +1497,10 @@ impl WendelonNode {
 		providers: HashMap<TransportTier, Arc<dyn TransportProvider>>,
 		startup_listeners: Vec<BootstrapListener>,
 		revocation_tx: watch::Sender<Arc<RevocationSnapshot>>,
+		owner: DataDirectoryOwner,
 	) -> std::io::Result<Self> {
 		cfg.validate()?;
+		owner.ensure_contains(&cfg.data_dir)?;
 		let local_node = NodeId {
 			id: cfg.node_id,
 			_reserved: 0,
@@ -1425,38 +1529,49 @@ impl WendelonNode {
 			cfg.slab_io_depth,
 			"wendelon-io-uring-slab",
 			IoUringClass::Slab,
-		)?;
+		)?
+		.with_data_directory_owner(owner.clone());
 		let wal_io = spawn_io_thread_named_for_class(
 			cfg.wal_io_depth,
 			"wendelon-io-uring-wal",
 			IoUringClass::Wal,
-		)?;
+		)?
+		.with_data_directory_owner(owner.clone());
 
 		// 3. L1 slab storage.
-		let l2 = cfg.l2.as_ref().map(ObjectStoreConfig::build).transpose()?;
+		let l2 = cfg
+			.l2
+			.as_ref()
+			.map(|config| config.build_with_owner(owner.clone()))
+			.transpose()?;
 		let l2_for_sweeper = l2.clone();
-		let crypto = Arc::new(CryptoManager::new_with_cache_config(
-			cfg.root_kek_provider.build(&cfg.data_dir)?,
+		let crypto = Arc::new(CryptoManager::new_with_cache_config_and_owner(
+			cfg.root_kek_provider
+				.build_with_owner(&cfg.data_dir, &owner)?,
 			cfg.crypto_cache,
+			owner.clone(),
 		));
 		#[cfg(not(feature = "test-support"))]
 		let slab: Arc<SlabManager> = Arc::new(
-			SlabManager::open(SlabManagerConfig {
-				dir: cfg.data_dir.clone(),
-				max_slab_bytes: cfg.slab_max_bytes,
-				io: slab_io.clone(),
-				l2,
-				rehydration: cfg.rehydration.clone(),
-				l2_column_fetch: cfg.l2_column_fetch.clone(),
-				row_group_writer: cfg.row_group_writer.clone(),
-				l2_row_group_fetch: cfg.l2_row_group_fetch.clone(),
-				encoding_writer: cfg.encoding_writer.clone(),
-				l2_chunk_layout: cfg.l2_chunk_layout.clone(),
-				l2_encoding_fetch: cfg.l2_encoding_fetch.clone(),
-				encoding_compute: cfg.encoding_compute.clone(),
-				group_commit: cfg.group_commit.clone(),
-				crypto: crypto.clone(),
-			})
+			SlabManager::open_with_owner(
+				SlabManagerConfig {
+					dir: cfg.data_dir.clone(),
+					max_slab_bytes: cfg.slab_max_bytes,
+					io: slab_io.clone(),
+					l2,
+					rehydration: cfg.rehydration.clone(),
+					l2_column_fetch: cfg.l2_column_fetch.clone(),
+					row_group_writer: cfg.row_group_writer.clone(),
+					l2_row_group_fetch: cfg.l2_row_group_fetch.clone(),
+					encoding_writer: cfg.encoding_writer.clone(),
+					l2_chunk_layout: cfg.l2_chunk_layout.clone(),
+					l2_encoding_fetch: cfg.l2_encoding_fetch.clone(),
+					encoding_compute: cfg.encoding_compute.clone(),
+					group_commit: cfg.group_commit.clone(),
+					crypto: crypto.clone(),
+				},
+				owner.clone(),
+			)
 			.await?,
 		);
 		#[cfg(feature = "test-support")]
@@ -1479,21 +1594,27 @@ impl WendelonNode {
 			};
 			Arc::new(match cfg.slab_file_ops.clone() {
 				Some(file_ops) => {
-					SlabManager::open_with_file_ops(config, file_ops.into_inner()).await?
+					SlabManager::open_with_file_ops_and_owner(
+						config,
+						file_ops.into_inner(),
+						owner.clone(),
+					)
+					.await?
 				}
-				None => SlabManager::open(config).await?,
+				None => SlabManager::open_with_owner(config, owner.clone()).await?,
 			})
 		};
 
 		// 4. Durable Raft storage + recovered state machine.
 		let (wal_path, vote_path, snapshot_path) = control_artifact_paths(&cfg.data_dir);
 		let retention = RetentionGuard::new(cfg.control_retention);
-		let log_store = WendelonLogStore::open_with_retention(
+		let log_store = WendelonLogStore::open_with_retention_and_owner(
 			&wal_path,
 			&vote_path,
 			&snapshot_path,
 			wal_io.clone(),
 			retention.clone(),
+			owner.clone(),
 		)
 		.await?;
 		let bootstrap_mode = log_store.bootstrap_mode().await;
@@ -1516,10 +1637,23 @@ impl WendelonNode {
 		let fallback_epoch =
 			seed_single_node_epoch(local_node, &cfg.advertise_address, local_tiers);
 		let recovered_state = state_machine.state_snapshot().await;
-		let requires_restore_validation = bootstrap_mode == DurableBootstrapMode::Recovery
-			&& !recovered_state.tiered_slabs.is_empty();
+		// Recovery mode: the previous owner did not finish a complete shutdown
+		// (crash, kill, or self-termination after an incomplete close). Readiness
+		// stays gated until the existing restore validation has run.
+		let unclean_previous_shutdown = !owner.previous_shutdown_clean();
+		if unclean_previous_shutdown {
+			tracing::warn!(
+				data_dir = %cfg.data_dir.display(),
+				"recovering after unclean shutdown"
+			);
+		}
+		let requires_restore_validation = unclean_previous_shutdown
+			|| (bootstrap_mode == DurableBootstrapMode::Recovery
+				&& !recovered_state.tiered_slabs.is_empty());
 		let (restore_validation_tx, restore_validation_rx) =
-			watch::channel(if requires_restore_validation {
+			watch::channel(if unclean_previous_shutdown {
+				RestoreValidationStatus::RecoveringAfterUncleanShutdown
+			} else if requires_restore_validation {
 				RestoreValidationStatus::Pending
 			} else {
 				RestoreValidationStatus::Complete
@@ -1574,7 +1708,11 @@ impl WendelonNode {
 			}
 			Err(err) => return Err(err),
 		};
-		let audit_sink = build_audit_sink(cfg.data_dir.join("audit.ndjson"), &cfg.audit)?;
+		let audit_sink = build_audit_sink_with_owner(
+			cfg.data_dir.join("audit.ndjson"),
+			&cfg.audit,
+			owner.clone(),
+		)?;
 		crypto.attach_audit_sink(local_node, audit_sink.clone())?;
 		audit_sink.emit(
 			AuditEvent::new(
@@ -1703,7 +1841,8 @@ impl WendelonNode {
 			.with_lease_authority(lease_authority.clone())
 			.with_mvcc_retention_policy(cfg.mvcc_retention_policy)
 			.with_tracker(tracker.clone())
-			.with_lease_gate(true),
+			.with_lease_gate(true)
+			.with_directory_owner(owner.clone()),
 		);
 		let raft_server = Arc::new(
 			WendelonRaftInternalServer::new(raft.clone(), pool.clone(), retention.clone())
@@ -1969,9 +2108,13 @@ impl WendelonNode {
 		});
 		let restore_validation = if requires_restore_validation {
 			let slab = slab.clone();
+			let recovery_owner = owner.clone();
 			Some(tokio::spawn(async move {
 				match slab.validate_tiered_references().await {
 					Ok(()) => {
+						// Only a run that finished its recovery may later leave a
+						// clean-shutdown record.
+						recovery_owner.mark_recovery_complete();
 						let _ = restore_validation_tx.send(RestoreValidationStatus::Complete);
 					}
 					Err(err) => {
@@ -1987,6 +2130,9 @@ impl WendelonNode {
 		};
 
 		let node = Self {
+			_directory_owner: owner,
+			storage_shutdown_timeout: cfg.storage_shutdown_timeout,
+			recovered_after_unclean_shutdown: unclean_previous_shutdown,
 			local_node,
 			slab,
 			crypto,
@@ -2129,17 +2275,50 @@ impl WendelonNode {
 		for server in &transport_servers {
 			server.begin_drain();
 		}
-		// Stop internal maintenance loops before waiting for
-		// quiescence. Otherwise a background lease renewal or
-		// migration commit can keep generating in-flight Control
-		// Ring work while shutdown is waiting for the surface to
-		// drain, especially after a peer has already left.
-		handles.abort();
-		lifecycle.wait_for_quiescence().await;
-		for server in transport_servers {
-			server.shutdown().await?;
+		let mut first_error = None;
+		if let Err(error) = self.raft.shutdown().await {
+			first_error = Some(Error::other(format!("Raft shutdown: {error}")));
 		}
-		handles.shutdown().await
+		if let Err(error) = handles.shutdown().await {
+			first_error.get_or_insert(error);
+		}
+		// Bounded like every other shutdown step: a quiescence that never comes
+		// must not keep the node from reaching its fail-closed storage close.
+		if tokio::time::timeout(
+			self.storage_shutdown_timeout,
+			lifecycle.wait_for_quiescence(),
+		)
+		.await
+		.is_err()
+		{
+			first_error.get_or_insert(Error::new(
+				ErrorKind::TimedOut,
+				"in-flight request quiescence did not complete within the shutdown bound",
+			));
+		}
+		for server in transport_servers {
+			if let Err(error) = server.shutdown().await {
+				if first_error.is_none() {
+					first_error = Some(error);
+				}
+			}
+		}
+		if let Err(error) = self
+			._directory_owner
+			.close(self.storage_shutdown_timeout)
+			.await
+		{
+			// An incomplete storage close outranks every earlier error: callers
+			// decide from it whether writers may still be live (and the process
+			// must terminate rather than run destructors).
+			if let Some(earlier) = first_error.replace(error) {
+				tracing::error!(error = %earlier, "earlier shutdown step failed");
+			}
+		}
+		match first_error {
+			Some(error) => Err(error),
+			None => Ok(()),
+		}
 	}
 
 	pub fn readiness_reporter(&self) -> NodeReadinessView {
@@ -2153,6 +2332,12 @@ impl WendelonNode {
 			restore_validation: self.restore_validation.clone(),
 			retention: self.retention.clone(),
 		}
+	}
+
+	/// True when this boot found no clean-shutdown record from the previous
+	/// owner and therefore started in recovery mode.
+	pub fn recovered_after_unclean_shutdown(&self) -> bool {
+		self.recovered_after_unclean_shutdown
 	}
 
 	/// This node's Control log retention guard.
@@ -3112,6 +3297,183 @@ mod tests {
 		base
 	}
 
+	#[tokio::test]
+	async fn node_bootstrap_refuses_a_second_owner_and_reopens_after_joined_shutdown() {
+		let dir = tempdir("node-data-directory-owner");
+		let cfg = NodeBootstrapConfig::dev(7001, dir.clone(), "127.0.0.1:0".into());
+		let node = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+
+		let second = WendelonNode::bootstrap_single_node(cfg.clone()).await;
+		let error = match second {
+			Ok(node) => {
+				node.shutdown().await.unwrap();
+				panic!("a second node acquired an already-owned directory");
+			}
+			Err(error) => error,
+		};
+		let busy = error.get_ref().and_then(|source| {
+			source.downcast_ref::<crate::storage::ownership::DataDirectoryBusy>()
+		});
+		assert!(busy.is_some(), "expected typed busy error, got {error}");
+
+		node.shutdown().await.unwrap();
+		let reopened = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+		reopened.shutdown().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn an_incomplete_storage_close_outranks_an_earlier_shutdown_error() {
+		let dir = tempdir("shutdown-error-precedence");
+		let mut cfg = NodeBootstrapConfig::dev(7004, dir, "127.0.0.1:0".into());
+		cfg.storage_shutdown_timeout = Duration::from_millis(300);
+		let node = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+		// An in-flight request makes quiescence time out first; a held write
+		// permit then keeps the storage close from completing. The caller must
+		// still see the incomplete close, the one that decides termination.
+		let _in_flight = node.lifecycle.track_work();
+		let _permit = node._directory_owner.write_permit().unwrap();
+		let error = node.shutdown().await.unwrap_err();
+		assert!(
+			error
+				.get_ref()
+				.is_some_and(|inner| inner.is::<crate::storage::ownership::ShutdownIncomplete>()),
+			"expected ShutdownIncomplete, got {error}"
+		);
+	}
+
+	#[tokio::test]
+	async fn unclean_previous_shutdown_boots_in_recovery_mode_and_clean_does_not() {
+		let dir = tempdir("node-recovery-mode");
+		let cfg = NodeBootstrapConfig::dev(7003, dir.clone(), "127.0.0.1:0".into());
+
+		// A never-owned directory has nothing to recover.
+		let first = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+		assert!(!first.recovered_after_unclean_shutdown());
+		first.shutdown().await.unwrap();
+
+		// A complete shutdown leaves the clean record; the next boot is normal
+		// and consumes it.
+		let second = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+		assert!(!second.recovered_after_unclean_shutdown());
+		assert!(!dir.join("CLEAN_SHUTDOWN").exists());
+		second.shutdown().await.unwrap();
+
+		// An owner that ends without a complete close (crash or kill) leaves no
+		// record, so the next boot enters recovery mode and gates readiness.
+		drop(crate::storage::ownership::DataDirectoryOwner::acquire_existing(&dir).unwrap());
+		let recovering = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+		assert!(recovering.recovered_after_unclean_shutdown());
+		// Readiness stays gated until recovery validation finishes, then clears.
+		let mut validation = recovering.restore_validation.clone();
+		validation
+			.wait_for(|status| matches!(status, RestoreValidationStatus::Complete))
+			.await
+			.unwrap();
+		let reason = recovering
+			.readiness_reporter()
+			.snapshot()
+			.await
+			.degraded_reason;
+		assert_ne!(reason.as_deref(), Some("RecoveringAfterUncleanShutdown"));
+		recovering.shutdown().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn shutdown_revokes_retained_slab_and_metadata_write_handles() {
+		use crate::storage::AsyncFileOps;
+		let dir = tempdir("shutdown-retained-handles");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			7002,
+			dir.clone(),
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let slab = node.slab.clone();
+		let file_ops = crate::storage::IoUringFileOps::new(node.slab_io.clone());
+		node.shutdown().await.unwrap();
+		let new_owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let error = file_ops
+			.write_all(&dir.join("late-write"), b"forbidden")
+			.await
+			.unwrap_err();
+		assert!(
+			error
+				.get_ref()
+				.unwrap()
+				.is::<crate::storage::ownership::Closed>()
+		);
+		let error = slab
+			.append_durable(
+				TenantId::ZERO,
+				Identity::blake3_tenant(TenantId::ZERO, b"late"),
+				HybridTimestamp {
+					physical_ms: 1,
+					logical: 0,
+					node_id: 7002,
+				},
+				b"late-write",
+			)
+			.await
+			.unwrap_err();
+		assert!(
+			error
+				.get_ref()
+				.is_some_and(|error| error.is::<crate::storage::ownership::Closed>()),
+			"{error}"
+		);
+		assert!(!dir.join("late-write").exists());
+		drop(new_owner);
+	}
+
+	#[tokio::test]
+	async fn shutdown_collects_task_error_and_still_closes_storage_workers() {
+		struct SignalOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+		impl Drop for SignalOnDrop {
+			fn drop(&mut self) {
+				let _ = self.0.take().unwrap().send(());
+			}
+		}
+		let dir = tempdir("shutdown-error-joins");
+		let mut node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			7003,
+			dir.clone(),
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let retained_io = node.slab_io.clone();
+		let (sent, received) = tokio::sync::oneshot::channel();
+		let failed: JoinHandle<()> = tokio::spawn(async move {
+			let _signal = SignalOnDrop(Some(sent));
+			panic!("injected task failure");
+		});
+		received.await.unwrap();
+		assert!(failed.is_finished());
+		let old = std::mem::replace(&mut node.handles.ring_updater, failed);
+		old.abort();
+		let _ = old.await;
+		assert!(node.shutdown().await.is_err());
+		DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let error = retained_io
+			.submit_fsync(-1)
+			.await
+			.err()
+			.expect("closed worker");
+		assert!(
+			error
+				.get_ref()
+				.unwrap()
+				.is::<crate::storage::ownership::Closed>()
+		);
+	}
+
 	fn park_background_tiering(cfg: &mut NodeBootstrapConfig) {
 		cfg.tiering.scan_interval = Duration::from_secs(300);
 		cfg.tiering.min_slab_bytes = u64::MAX;
@@ -3374,9 +3736,7 @@ mod tests {
 			.trip_local_persistence_distrust_for_test()
 			.await;
 
-		node.handles.abort();
-		drop(node);
-		tokio::time::sleep(Duration::from_millis(25)).await;
+		node.shutdown().await.unwrap();
 
 		let recovered = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			26,
@@ -3471,9 +3831,7 @@ mod tests {
 				.is_some_and(|hlc| hlc >= commit_hlc)
 		);
 
-		node.handles.abort();
-		drop(node);
-		tokio::time::sleep(Duration::from_millis(25)).await;
+		node.shutdown().await.unwrap();
 
 		let recovered = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			11,
@@ -3592,9 +3950,7 @@ mod tests {
 			"tiered slab should be unlinked from L1 after apply"
 		);
 
-		node.handles.abort();
-		drop(node);
-		tokio::time::sleep(Duration::from_millis(25)).await;
+		node.shutdown().await.unwrap();
 
 		let redb_path = dir.join("storage_index.redb");
 		if redb_path.exists() {
@@ -3703,9 +4059,7 @@ mod tests {
 
 		l2.delete(&l2_uri).await.unwrap();
 
-		node.handles.abort();
-		drop(node);
-		tokio::time::sleep(Duration::from_millis(25)).await;
+		node.shutdown().await.unwrap();
 
 		let recovered = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
 		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);

@@ -411,16 +411,14 @@ async fn commit_control_write(
 }
 
 async fn kill_node(node: WendelonNode, registry: &Arc<SimulatedTransportNetwork>) {
-	// In-process crash simulation still needs to stop openraft's
-	// internal runtime explicitly; dropping the node object alone
-	// does not guarantee the consensus tasks vanish before a new
-	// node with the same durable state is booted in the same test
-	// process.
-	let _ = tokio::time::timeout(Duration::from_millis(500), node.raft.shutdown()).await;
+	// Every caller reboots a node on the same data directory, which stays
+	// exclusively owned until shutdown has joined Raft, every worker and
+	// storage. Abort-and-drop leaves the owner held by unjoined tasks.
 	registry.unpublish(node.local_node);
-	node.handles.abort();
-	drop(node);
-	tokio::time::sleep(Duration::from_millis(100)).await;
+	tokio::time::timeout(Duration::from_secs(10), node.shutdown())
+		.await
+		.expect("killed node shutdown should finish")
+		.unwrap();
 }
 
 struct ChaosCluster {
