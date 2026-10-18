@@ -4,7 +4,9 @@
 
 Accepted and implemented: a5c50bd7 (2026-10-16). The defect was proven by a deterministic test that fails on the unfixed parent 722a951b and passes on the fix.
 
-Decision item 5 (pairing by version identity, F-CTR-6) is implemented: plan eb18e398, impl 53ec94e5 (2026-10-17). Class-preserving compaction (F-CTR-5) remains open.
+Decision item 5 (pairing by version identity, F-CTR-6) is implemented: plan eb18e398, impl 53ec94e5 (2026-10-17). F-CTR-5a class-preserving compaction and the F-CTR-7 multi-source LSM guard are implemented: plan 162f76a7, impl beb5c7af (2026-10-17).
+
+F-CTR-5b remains open. The durable `counter-applied.log` is length-prefixed postcard and grows by about 44 bytes per resolved add; it is append-only, has no configured size bound, and is read into memory in full during recovery. Pruning waits for an explicit retention/TTL guarantee and a crash-safe compaction design.
 
 ## Context
 
@@ -35,13 +37,13 @@ The witness, not the marker, is the leader's durable commitment. Using it as the
 
 ## Consequences
 
-- **F-CTR-5 remains unimplemented.** The earlier one-source maintenance paths still refuse counter rewrites until F-CTR-5a lands. The B1 census and F-CTR-7 reproduction show that multi-source LSM also needs its own pre-output fail-closed guard; see the amendment below.
+- **F-CTR-5b remains open.** F-CTR-5a preserves counter classes on the selected one-source maintenance paths, and the F-CTR-7 guard refuses counter-bearing multi-source LSM rewrites before output creation. Counter pruning and its retention/TTL contract remain undecided.
 - Migration and tiered handling of counters are refused, not supported. Mixed-version clusters are unsupported. Residual F-CTR-1b, unknown origins on equal-value ties, applies to legacy data only.
 - The eligible-version cell is memory-only, rebuilt at reopen from markers and witnesses, and pruned to the winner plus outstanding reservations.
 
-## Amendment — F-CTR-5a class-preserving compaction plan (2026-10-17)
+## Amendment — F-CTR-5a class-preserving compaction (2026-10-17)
 
-**Status:** planned; implementation source is not changed by this amendment. The existing maintenance refusal remains in effect until the separately reviewed implementation lands.
+**Status:** implemented in `beb5c7af` after plan commit `162f76a7`.
 
 ### Decision
 
@@ -59,4 +61,4 @@ LSM plans can touch multiple input and overlap slabs and do not enumerate uninde
 
 The F-CTR-5a source package must cover (a) ordinary-only rewrite compatibility, (b) class-preserving V2 tentative/marker rewrite, (c) valid same-slab offset remap and a disabled-remap negative, (d) cross-slab identity pairing without offset dependence, (e) same-slab offset conflict and orphan-marker fail-closed behavior with bytes unchanged, (f) legacy and malformed/undecodable frames refused without rewrite, (g) counter-only and all-ordinary-elided replacement publication/accounting, and (h) the F-CTR-7 multi-source LSM guard before any output is created. Tests must also pin duplicate marker idempotence, orphan tentative behavior, live eligible reads, and the complete recovered committed/value-bound map after reopen.
 
-The plan commit is docs-only. Run the Wendelon architecture and mutation-visibility architecture tests against that commit before fast-forward. Implementation remains gated on a separately reviewed source package, focused regression suite, changed-area development validation, and the reviewed ladder/external audit sequence.
+The plan commit was docs-only; its Wendelon architecture and mutation-visibility architecture tests ran before fast-forward. The separately reviewed implementation passed its focused regression suite, changed-area development validation, and reviewed ladder/external audit sequence before landing.
