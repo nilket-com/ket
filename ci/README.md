@@ -63,6 +63,38 @@ as `<package> --test <target> <exact test name>`. Controlled tests run with
 `CARGO_CTRL_LANE=controlled`, which timing tests use to decide whether to
 enforce their budgets.
 
+## Test concurrency
+
+A test that fails only when tests run concurrently is a **defect candidate**,
+not a flake. The lanes above, the nextest test-group in
+`nilket/.config/nextest.toml`, and `nilket/scripts/cargo-cgroup` exist because
+contention has repeatedly exposed real defects. An intermittent
+`ConcurrencyExhausted` in a quantile test was a coordinator bug: the result
+channel closed before the tenant admission reservation dropped (`e9a92b06`).
+
+1. **Passing in isolation is not exoneration.** Isolation removes the
+   triggering condition.
+2. **Reproduce under load before classifying.** Load the rest of the suite in
+   the background and stress the suspect in the foreground, then record the
+   failure rate with and without load:
+
+   ```bash
+   cargo nextest run -p <crate> -E 'not binary(<target>)'
+   cargo nextest run -p <crate> --test <target> -E 'test(<name>)' --stress-count 30
+   ```
+
+3. **Do not widen serialization to turn a suite green.** Add a nextest
+   test-group or a `controlled-tests.txt` entry only when the test genuinely
+   needs exclusive resources, and write the reason beside the entry.
+4. **A serial run is not concurrency evidence.** Gate runs with
+   `--test-threads=1` give attributable output; they say nothing about a
+   parallel-only failure.
+
+When a test fails only in parallel, open a defect-candidate item naming the
+test and the failure, reproduce it under load, and then fix the product or the
+test's isolation, or record the measured rate and why it is accepted. Never
+call it a flake without that evidence.
+
 ## Startup latency
 
 `ci/startup-latency-check.sh` runs the libaryon engine startup test and the
