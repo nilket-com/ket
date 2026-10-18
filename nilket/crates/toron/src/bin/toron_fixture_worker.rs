@@ -106,9 +106,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 		.as_deref()
 		.map(wait_events::EventLog::create)
 		.transpose()?;
-	// ADR 628 B1.C: the long scan is echoed, so the evidence names the configured duration.
+	// ADR 628 B1.C: the configured long scan is echoed as the structured fixture_config event, so the evidence names the duration.
 	let long_scan_ms = u64::try_from(long_scan().as_millis()).unwrap_or(u64::MAX);
-	host_event("long_scan", format!("ms={long_scan_ms}"));
 	if let Some(log) = &wait_log {
 		log.emit(
 			"fixture_config",
