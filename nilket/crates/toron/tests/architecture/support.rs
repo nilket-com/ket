@@ -118,11 +118,132 @@ pub(crate) fn toron_source_lines_for_adr039_negative_guards() -> Vec<(PathBuf, u
 	lines
 }
 
+fn is_identifier_char(ch: char) -> bool {
+	ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+/// True when `symbol` occurs in `line` as the start of an identifier: the
+/// character before the match must not be `[A-Za-z0-9_]`, and the character
+/// after it must not be alphanumeric. A `_` or `-` continuation still hits, so
+/// `tonic` catches its crate family (`tonic_build`, `tonic-web`) and `prost`
+/// catches `prost_types`, while `monotonic` and `tonically` do not. Checks are
+/// applied only at symbol ends that are identifier characters, so a symbol such
+/// as `.unwrap(` keeps its plain substring meaning at the punctuation end. Every
+/// start position is tried, so overlapping candidates are not skipped.
+pub(crate) fn line_contains_identifier(line: &str, symbol: &str) -> bool {
+	if symbol.is_empty() {
+		return false;
+	}
+	let check_before = symbol.chars().next().is_some_and(is_identifier_char);
+	let check_after = symbol.chars().next_back().is_some_and(is_identifier_char);
+	line.char_indices().any(|(start, _)| {
+		if !line[start..].starts_with(symbol) {
+			return false;
+		}
+		let before_ok = !check_before
+			|| !line[..start]
+				.chars()
+				.next_back()
+				.is_some_and(is_identifier_char);
+		let after_ok = !check_after
+			|| !line[start + symbol.len()..]
+				.chars()
+				.next()
+				.is_some_and(|ch| ch.is_ascii_alphanumeric());
+		before_ok && after_ok
+	})
+}
+
+#[test]
+fn identifier_guard_hits_whole_identifiers() {
+	for line in [
+		"use tonic::",
+		"tonic::transport",
+		"x = tonic::transport::Server",
+		"tonic",
+		"tonic = \"0.12\"",
+		"tonic.workspace = true",
+		"[dependencies.tonic]",
+		"use arrow-flight;",
+		"use arrow_flight::x;",
+		"use tonic_build::configure;",
+		"tonic-web = \"0.12\"",
+		"tonic_health::server",
+	] {
+		let symbol = if line.contains("arrow-flight") {
+			"arrow-flight"
+		} else if line.contains("arrow_flight") {
+			"arrow_flight"
+		} else {
+			"tonic"
+		};
+		assert!(line_contains_identifier(line, symbol), "{line}");
+	}
+}
+
+#[test]
+fn identifier_guard_skips_embedded_names() {
+	for line in [
+		"monotonic",
+		"fn is_monotonic() {}",
+		"try_push_monotonic_signed_range(x)",
+		"nonmonotonic",
+		"tonically",
+		"mytonic_x",
+	] {
+		assert!(!line_contains_identifier(line, "tonic"), "{line}");
+	}
+	assert!(!line_contains_identifier(
+		"my_arrow_flight_x",
+		"arrow_flight"
+	));
+	// Crate-family members still hit.
+	assert!(line_contains_identifier("use prost_types::Any;", "prost"));
+	assert!(line_contains_identifier(
+		"arrow_flight_sql::x",
+		"arrow_flight"
+	));
+	assert!(line_contains_identifier("x.unwrap()", ".unwrap("));
+}
+
+#[test]
+fn substring_guard_still_hits_embedded_fragments() {
+	for line in [
+		"fn hot_reload_cert() {}",
+		"reload_cert_chain(x)",
+		"reload_cert",
+	] {
+		assert!(line_contains_substring(line, "reload_cert"), "{line}");
+	}
+	assert!(!line_contains_identifier(
+		"fn hot_reload_cert() {}",
+		"reload_cert"
+	));
+	assert!(line_contains_substring("FullTableUpdate", "FullTable"));
+	assert!(!line_contains_substring("full_table", "FullTable"));
+}
+
+/// Plain substring match: a forbidden fragment hits anywhere in the line, so
+/// `reload_cert` also catches `hot_reload_cert` and `reload_cert_chain`.
+pub(crate) fn line_contains_substring(line: &str, symbol: &str) -> bool {
+	line.contains(symbol)
+}
+
+/// Forbids each fragment anywhere in a Toron source line (substring match).
 pub(crate) fn assert_toron_sources_do_not_contain(forbidden: &[&str]) {
+	assert_toron_sources_do_not_match(forbidden, line_contains_substring);
+}
+
+/// Forbids each symbol only as a whole identifier (see `line_contains_identifier`).
+pub(crate) fn assert_toron_sources_do_not_contain_identifiers(forbidden: &[&str]) {
+	assert_toron_sources_do_not_match(forbidden, line_contains_identifier);
+}
+
+fn assert_toron_sources_do_not_match(forbidden: &[&str], matches: fn(&str, &str) -> bool) {
 	let manifest_dir = manifest_dir();
 	let offenders = toron_source_lines_for_adr039_negative_guards()
 		.into_iter()
-		.filter(|(_, _, line)| forbidden.iter().any(|symbol| line.contains(symbol)))
+		.filter(|(_, _, line)| forbidden.iter().any(|symbol| matches(line, symbol)))
 		.collect::<Vec<_>>();
 
 	assert!(
