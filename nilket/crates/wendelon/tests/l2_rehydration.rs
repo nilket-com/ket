@@ -1,4 +1,9 @@
 use async_trait::async_trait;
+
+async fn open_test_manager(config: SlabManagerConfig) -> std::io::Result<SlabManager> {
+	let owner = wendelon::storage::ownership::DataDirectoryOwner::acquire_existing(&config.dir)?;
+	SlabManager::open_with_owner(config, owner).await
+}
 use openraft::storage::RaftStateMachine;
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 use std::path::PathBuf;
@@ -186,7 +191,7 @@ async fn build_tiered_manager(
 	let l2 = Arc::new(CountingObjectStore::new(l2_inner));
 	let l2_store: Arc<dyn ObjectStore> = l2.clone();
 	let manager = Arc::new(
-		SlabManager::open(SlabManagerConfig {
+		open_test_manager(SlabManagerConfig {
 			dir: l1_dir.clone(),
 			max_slab_bytes: 1,
 			io,

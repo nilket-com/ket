@@ -138,6 +138,7 @@ use crate::storage::multirow::{
 	has_storage_synthetic_columns, materialize_record_location_batch,
 	pack_multirow_source_rows_with_policy_row_group_encoding_and_chunk_layout_config,
 };
+use crate::storage::ownership::DataDirectoryOwner;
 use crate::storage::secondary_index::{
 	SecondaryIndexCandidateRejectReason, SecondaryIndexCandidateValidation, SecondaryIndexEntry,
 	SecondaryIndexIdentity, SecondaryIndexLookupReport, SecondaryIndexLookupRow,
@@ -601,6 +602,7 @@ pub(crate) enum PreparedTieredTableDropRewrite {
 
 /// Multi-slab composition of [`StorageEngine`].
 pub struct SlabManager {
+	_directory_owner: Option<DataDirectoryOwner>,
 	finality_observation: Arc<crate::storage::finality_observation::FinalityObservationRegistry>,
 	config: SlabManagerConfig,
 	file_ops: Arc<dyn AsyncFileOps>,
@@ -1366,13 +1368,39 @@ impl SlabManager {
 	/// aggregated `key_index`. Last-write-wins across slabs, ordered
 	/// by slab id — so a rewrite that landed in a newer slab
 	/// shadows the stale copy in an older one.
+	#[cfg(any(test, feature = "test-support"))]
 	pub async fn open(config: SlabManagerConfig) -> std::io::Result<Self> {
 		Self::open_shared(
 			config,
+			None,
 			#[cfg(feature = "test-support")]
 			None,
 		)
 		.await
+	}
+
+	/// Open a node-owned store while retaining the directory lease in the
+	/// manager and its I/O handles.
+	pub async fn open_with_owner(
+		config: SlabManagerConfig,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<Self> {
+		Self::open_shared(
+			config,
+			Some(owner),
+			#[cfg(feature = "test-support")]
+			None,
+		)
+		.await
+	}
+
+	#[cfg(feature = "test-support")]
+	pub(crate) async fn open_with_file_ops_and_owner(
+		config: SlabManagerConfig,
+		file_ops: Arc<dyn AsyncFileOps>,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<Self> {
+		Self::open_shared(config, Some(owner), Some(file_ops)).await
 	}
 
 	/// Open with caller-supplied file operations for deterministic acceptance fixtures.
@@ -1381,7 +1409,7 @@ impl SlabManager {
 		config: SlabManagerConfig,
 		file_ops: Arc<dyn AsyncFileOps>,
 	) -> std::io::Result<Self> {
-		Self::open_shared(config, Some(file_ops)).await
+		Self::open_shared(config, None, Some(file_ops)).await
 	}
 
 	/// Test / diagnostic accessor: current active slab id.
@@ -1391,6 +1419,10 @@ impl SlabManager {
 
 	pub fn data_dir(&self) -> &Path {
 		&self.config.dir
+	}
+
+	pub(crate) fn directory_owner(&self) -> Option<DataDirectoryOwner> {
+		self._directory_owner.clone()
 	}
 
 	/// Durable typed-table attribution for a published record location.
@@ -1698,17 +1730,31 @@ impl SlabManager {
 		dir: &Path,
 		io: IoRingHandle,
 	) -> std::io::Result<EmptySlabRepairReport> {
+		// The caller's ring is not adopted into this owner's lifetime (closing the
+		// owner would close the caller's ring). Repair only needs metadata
+		// operations, so it runs them through its own owner-gated executor.
+		let _ = io;
+		let owner = DataDirectoryOwner::acquire_existing(dir)?;
+		let result = Self::repair_empty_slabs_owned(dir, owner.clone()).await;
+		// Close like a node does: drain and join before releasing the lock, and
+		// leave the clean-shutdown record exactly when the directory was clean.
+		let closed = owner.close(std::time::Duration::from_secs(30)).await;
+		let report = result?;
+		closed?;
+		Ok(report)
+	}
+
+	async fn repair_empty_slabs_owned(
+		dir: &Path,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<EmptySlabRepairReport> {
 		if !dir.is_dir() {
 			return Err(Error::new(
 				ErrorKind::NotFound,
 				format!("slab directory does not exist: {}", dir.display()),
 			));
 		}
-		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(IoUringFileOps::with_isolated_blocking(
-			io,
-			"wendelon-fs-meta-repair",
-			BlockingIoClass::SlabMetadata,
-		)?);
+		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(BlockingFileOps::with_owner(owner));
 		let mut existing_ids = discover_slab_ids(file_ops.as_ref(), dir).await?;
 		existing_ids.sort_unstable();
 		let mut report = EmptySlabRepairReport {
@@ -2333,18 +2379,20 @@ impl SlabManager {
 	///
 	/// The caller is responsible for opening a new [`SlabManager`]
 	/// against the target after the files have been materialized.
-	pub async fn restore_backup(
+	pub(crate) async fn restore_backup(
 		backup: &StorageBackupImage,
 		dir: impl AsRef<Path>,
+		owner: &DataDirectoryOwner,
 	) -> std::io::Result<()> {
 		let dir = dir.as_ref();
+		owner.ensure_path(dir)?;
 		if !dir.is_dir() {
 			return Err(Error::new(
 				ErrorKind::NotFound,
 				format!("storage restore target does not exist: {}", dir.display()),
 			));
 		}
-		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(BlockingFileOps);
+		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(BlockingFileOps::with_owner(owner.clone()));
 		if !discover_slab_ids(file_ops.as_ref(), dir).await?.is_empty() {
 			return Err(Error::new(
 				ErrorKind::AlreadyExists,

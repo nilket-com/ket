@@ -52,6 +52,7 @@ pub mod metrics;
 pub mod network;
 pub mod node;
 pub mod schema;
+pub mod shutdown_watchdog;
 pub mod simulator;
 pub mod storage;
 

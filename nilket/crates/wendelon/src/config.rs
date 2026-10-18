@@ -537,6 +537,7 @@ struct RawTuningConfig {
 	wal_io_depth: Option<u32>,
 	#[serde(default)]
 	slab_io_depth: Option<u32>,
+	storage_shutdown_timeout_seconds: Option<u64>,
 	#[serde(default)]
 	cdc_locality_heartbeat_interval_millis: Option<u64>,
 	#[serde(default)]
@@ -557,6 +558,7 @@ impl Default for RawTuningConfig {
 			replication_factor: default_replication_factor(),
 			wal_io_depth: None,
 			slab_io_depth: None,
+			storage_shutdown_timeout_seconds: None,
 			cdc_locality_heartbeat_interval_millis: None,
 			data_ring_lease_ttl_millis: None,
 			max_inbound_connections: None,
@@ -947,6 +949,9 @@ impl RawConfig {
 			rf: self.tuning.replication_factor,
 			wal_io_depth,
 			slab_io_depth,
+			storage_shutdown_timeout: std::time::Duration::from_secs(
+				self.tuning.storage_shutdown_timeout_seconds.unwrap_or(30),
+			),
 			cdc_locality_heartbeat_interval: Duration::from_millis(
 				cdc_locality_heartbeat_interval_millis,
 			),

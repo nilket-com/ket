@@ -103,6 +103,31 @@ Follow `ci/README.md`'s **Test concurrency** rule. A parallel-only failure is a 
 
 ## Risks and mitigations
 
+### Shutdown-completeness finding (LOCAL-6)
+
+The owner lock exposed an existing shutdown gap: `WendelonNode::shutdown`
+returned without awaiting OpenRaft shutdown, while detached io_uring and
+metadata workers could retain storage. Four unchanged restart tests failed
+with `DataDirectoryBusy` after awaited shutdown. Ownership handoff therefore
+requires complete shutdown of those writers, not only NodeHandles.
+
+The selected correction uses one shared Active -> Closing -> Closed owner
+state. Every writer root admits per-operation RAII permits; permits move into
+queued/blocking/kernel work until completion. Reads need no permit. No permit
+may span a channel reservation, another permit wait, or a network event.
+
+Node shutdown collects errors while awaiting Raft, NodeHandles, transports,
+and then owner closure. Closure atomically rejects new writes, drains admitted
+work, explicitly closes/joins ring and metadata workers, and releases the lock
+descriptor last. Retained root clones become invalid write capabilities.
+`tuning.storage_shutdown_timeout_seconds` defaults to 30 seconds; expiration
+returns typed `ShutdownIncomplete { outstanding }` and retains the lock.
+Cancellation/failure also pins the owner until a later successful close.
+
+The reviewed holder census accompanies the source package. Required controls
+cover retained handles, queued ring and metadata writes, concurrent admission
+versus close, timeout retaining LOCK, and cleanup continuing after an error.
+
 - **Premature release during cancellation:** keep a shared token in all writers, await all workers on shutdown/restart, and test the held-lock interval deterministically.
 - **Filesystem lock mismatch:** fail closed for unsupported locking and qualify NFS deployments by verified cross-client behavior.
 - **Sentinel replacement:** preserve the lock inode on reset and never unlink it as part of ordinary cleanup.
@@ -115,3 +140,20 @@ Follow `ci/README.md`'s **Test concurrency** rule. A parallel-only failure is a 
 - `WendelonNode::bootstrap_with_transport_stack` and restore wrappers in `src/node.rs`.
 - `NodeHandles::shutdown` in `src/node.rs`.
 - Existing `flock` precedent in `src/storage/mutation_visibility/root2/durable/local_store/adapter.rs` and the L-1 independent-open test in `src/storage/mutation_visibility/root2/provisioning/tests/owner_log.rs`.
+
+## Amendment — shutdown completeness, hard termination and recovery mode (2026-10-18)
+
+Implementation of the lock surfaced pre-existing defects, now fixed in scope:
+
+- **Shutdown completeness.** `WendelonNode::shutdown` returned while writers could still run: OpenRaft was never shut down, and io_uring and metadata worker threads were detached. Shutdown now runs, each step awaited and none short-circuiting the rest: Raft, node handles, bounded request quiescence, transport servers, then the owner close.
+- **Revocable ownership.** The owner moves Active → Closing → Closed. Every write path, and every redb access, takes a per-operation write permit. Close stops admission, drains permits, closes and joins every registered worker, and only then releases the lock. A retained storage handle gets a typed `Closed` error afterwards.
+- **redb drop writes.** redb's `Drop for Database` commits and flushes. Each redb store keeps its database behind the owner (`OwnedRedb`), and the database is dropped on a joined thread inside close, before the lock is released. A handle still outstanding at close fails the close and keeps the lock.
+- **Clean-shutdown record and recovery mode.** A complete close durably writes `CLEAN_SHUTDOWN` before releasing the lock. The next owner removes it durably before any other write. A directory that was owned before but has no record starts in recovery mode: it is logged, readiness reports `RecoveringAfterUncleanShutdown`, and the existing restore validation runs before the node reports ready.
+- **Hard termination (operator directive: "shutdown hanging forever is a defect, it should hard kill itself and boot into restore mode before becoming a zombie").** This supersedes the earlier "keep the lock and stay up" failure mode.
+  - The daemon arms an OS-thread watchdog for the whole shutdown, with a deadline of 2 × `storage_shutdown_timeout` + 25 s, which also covers a bounded runtime teardown.
+  - On expiry, or on an incomplete storage close, it exits immediately with status 86 (`UNCLEAN_SHUTDOWN_EXIT_CODE`) without running destructors.
+  - Process death releases the lock safely.
+  - The daemon drains on SIGTERM as well as SIGINT.
+- **Supervisor escalation.** `nilket local` sends the stop signal to the child's process group, waits a bounded grace (2 × the timeout + 40 s), then SIGKILLs the group. Every child and reader wait is bounded, and exit 86 means "restart into recovery".
+
+**Lock semantics noted.** A fork in the same process duplicates every descriptor until the child execs, so a lock released while another thread is forking can stay held briefly. Acquisition then reports `DataDirectoryBusy`, which fails closed and never yields two owners. Tests that spawn processes therefore live in their own test binary (`tests/process_ownership.rs`), away from lock release and reacquire tests.

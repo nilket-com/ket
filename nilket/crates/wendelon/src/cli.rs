@@ -662,15 +662,22 @@ fn run_daemon(config_path: PathBuf) -> ExitCode {
 			return ExitCode::from(2);
 		}
 	};
-	runtime.block_on(start_daemon(config_path))
+	let exit = runtime.block_on(start_daemon(config_path));
+	// Bound the runtime teardown too: dropping a runtime waits for every
+	// blocking task, which could otherwise hang the exit after shutdown.
+	runtime.shutdown_timeout(std::time::Duration::from_secs(10));
+	if let Some(watchdog) = exit.watchdog {
+		watchdog.disarm();
+	}
+	exit.code
 }
 
-async fn start_daemon(config_path: PathBuf) -> ExitCode {
+async fn start_daemon(config_path: PathBuf) -> DaemonExit {
 	let cfg: NodeBootstrapConfig = match load_node_bootstrap_config(&config_path) {
 		Ok(cfg) => cfg,
 		Err(e) => {
 			eprintln!("failed to load {}: {e}", config_path.display());
-			return ExitCode::from(2);
+			return DaemonExit::now(ExitCode::from(2));
 		}
 	};
 	let transport_tls = cfg.transport_tls.clone();
@@ -684,14 +691,16 @@ async fn start_daemon(config_path: PathBuf) -> ExitCode {
 		Ok(handle) => handle,
 		Err(e) => {
 			eprintln!("failed to initialize tracing subscriber: {e}");
-			return ExitCode::from(2);
+			return DaemonExit::now(ExitCode::from(2));
 		}
 	};
+	let shutdown_deadline =
+		crate::shutdown_watchdog::daemon_shutdown_deadline(cfg.storage_shutdown_timeout);
 	let node = match WendelonNode::bootstrap(cfg).await {
 		Ok(n) => n,
 		Err(e) => {
 			eprintln!("bootstrap failed: {e}");
-			return ExitCode::from(1);
+			return DaemonExit::now(ExitCode::from(1));
 		}
 	};
 	eprintln!("wendelon: bootstrapped node {}", node.local_node.id);
@@ -708,7 +717,8 @@ async fn start_daemon(config_path: PathBuf) -> ExitCode {
 				Ok(material) => material,
 				Err(e) => {
 					eprintln!("failed to load observability TLS material: {e}");
-					return ExitCode::from(2);
+					return stop_after_failed_start(node, shutdown_deadline, ExitCode::from(2))
+						.await;
 				}
 			};
 			let trust_roots = match ActorTrustRoots::load(&tls.node_ca_path, &tls.operator_ca_path)
@@ -716,7 +726,8 @@ async fn start_daemon(config_path: PathBuf) -> ExitCode {
 				Ok(roots) => Arc::new(roots),
 				Err(e) => {
 					eprintln!("failed to load observability trust roots: {e}");
-					return ExitCode::from(2);
+					return stop_after_failed_start(node, shutdown_deadline, ExitCode::from(2))
+						.await;
 				}
 			};
 			let server_config = match rustls_server_config_with_peer_roots(
@@ -727,7 +738,8 @@ async fn start_daemon(config_path: PathBuf) -> ExitCode {
 				Ok(material) => material,
 				Err(e) => {
 					eprintln!("failed to build observability TLS server config: {e}");
-					return ExitCode::from(2);
+					return stop_after_failed_start(node, shutdown_deadline, ExitCode::from(2))
+						.await;
 				}
 			};
 			let reporter = Arc::new(node.readiness_reporter());
@@ -757,31 +769,113 @@ async fn start_daemon(config_path: PathBuf) -> ExitCode {
 				}
 				Err(e) => {
 					eprintln!("failed to start observability listeners: {e}");
-					return ExitCode::from(1);
+					return stop_after_failed_start(node, shutdown_deadline, ExitCode::from(1))
+						.await;
 				}
 			}
 		}
 		_ => None,
 	};
 
-	tokio::signal::ctrl_c().await.ok();
+	wait_for_stop_signal().await;
 	eprintln!("wendelon: draining");
+	// From here the process must exit within the deadline. A shutdown that
+	// cannot prove every writer stopped terminates instead of lingering with the
+	// lock held; the next start finds no clean-shutdown record and recovers.
+	let watchdog = crate::shutdown_watchdog::ShutdownWatchdog::arm(shutdown_deadline);
 	if let Err(e) = node.shutdown().await {
+		if is_shutdown_incomplete(&e) {
+			crate::shutdown_watchdog::terminate_unclean(&format!(
+				"storage shutdown incomplete: {e}"
+			));
+		}
 		eprintln!("shutdown failed: {e}");
-		return ExitCode::from(1);
+		return DaemonExit::armed(ExitCode::from(1), watchdog);
 	}
 	if let Some(handles) = observability {
 		if let Err(e) = shutdown_observability(handles).await {
 			eprintln!("observability shutdown failed: {e}");
-			return ExitCode::from(1);
+			return DaemonExit::armed(ExitCode::from(1), watchdog);
 		}
 	}
 	if let Err(e) = telemetry.shutdown().await {
 		eprintln!("telemetry shutdown failed: {e}");
-		return ExitCode::from(1);
+		return DaemonExit::armed(ExitCode::from(1), watchdog);
 	}
 	eprintln!("wendelon: shutdown complete");
-	ExitCode::SUCCESS
+	DaemonExit::armed(ExitCode::SUCCESS, watchdog)
+}
+
+/// How the daemon body ended. An armed watchdog stays armed until the runtime
+/// itself has been torn down, so blocking work left behind cannot hang the exit.
+struct DaemonExit {
+	code: ExitCode,
+	watchdog: Option<crate::shutdown_watchdog::ShutdownWatchdog>,
+}
+
+impl DaemonExit {
+	fn now(code: ExitCode) -> Self {
+		Self {
+			code,
+			watchdog: None,
+		}
+	}
+	fn armed(code: ExitCode, watchdog: crate::shutdown_watchdog::ShutdownWatchdog) -> Self {
+		Self {
+			code,
+			watchdog: Some(watchdog),
+		}
+	}
+}
+
+/// A failure after bootstrap still owes the node a bounded shutdown: dropping a
+/// live node would leave Raft and its workers running with the lock held.
+async fn stop_after_failed_start(
+	node: WendelonNode,
+	deadline: std::time::Duration,
+	code: ExitCode,
+) -> DaemonExit {
+	let watchdog = crate::shutdown_watchdog::ShutdownWatchdog::arm(deadline);
+	if let Err(e) = node.shutdown().await {
+		if is_shutdown_incomplete(&e) {
+			crate::shutdown_watchdog::terminate_unclean(&format!(
+				"storage shutdown incomplete: {e}"
+			));
+		}
+		eprintln!("shutdown after failed start failed: {e}");
+	}
+	DaemonExit::armed(code, watchdog)
+}
+
+/// Drain on SIGINT (interactive, and what `nilket local` sends) or SIGTERM
+/// (the default stop signal of systemd and Kubernetes).
+async fn wait_for_stop_signal() {
+	#[cfg(unix)]
+	{
+		let mut term =
+			match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+				Ok(term) => term,
+				Err(error) => {
+					eprintln!(
+						"wendelon: SIGTERM handler unavailable ({error}); draining on SIGINT only"
+					);
+					tokio::signal::ctrl_c().await.ok();
+					return;
+				}
+			};
+		tokio::select! {
+			_ = tokio::signal::ctrl_c() => {}
+			_ = term.recv() => {}
+		}
+	}
+	#[cfg(not(unix))]
+	tokio::signal::ctrl_c().await.ok();
+}
+
+fn is_shutdown_incomplete(error: &std::io::Error) -> bool {
+	error
+		.get_ref()
+		.is_some_and(|inner| inner.is::<crate::storage::ownership::ShutdownIncomplete>())
 }
 
 async fn shutdown_observability(handles: ObservabilityHandles) -> std::io::Result<()> {

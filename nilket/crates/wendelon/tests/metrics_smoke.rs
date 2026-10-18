@@ -1,6 +1,11 @@
 #[path = "support/control_ring.rs"]
 mod support;
 
+async fn open_test_manager(config: SlabManagerConfig) -> std::io::Result<SlabManager> {
+	let owner = wendelon::storage::ownership::DataDirectoryOwner::acquire_existing(&config.dir)?;
+	SlabManager::open_with_owner(config, owner).await
+}
+
 use arrow::array::{LargeBinaryArray, LargeBinaryBuilder};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -179,7 +184,7 @@ async fn build_manager_with_sealed_slabs(
 	let dir = fresh_dir("l1");
 	let io = spawn_io_thread(64).unwrap();
 	let manager = Arc::new(
-		SlabManager::open(SlabManagerConfig {
+		open_test_manager(SlabManagerConfig {
 			dir,
 			max_slab_bytes: 1,
 			io,

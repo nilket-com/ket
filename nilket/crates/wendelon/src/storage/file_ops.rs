@@ -1,5 +1,6 @@
 use crate::metrics::global as metrics;
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoOp, IoRingHandle};
+use crate::storage::ownership::{DataDirectoryOwner, StorageWorker, WorkerJoins, closed_error};
 use async_trait::async_trait;
 use std::ffi::OsString;
 use std::fs::File;
@@ -10,7 +11,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Linux `O_DIRECT` flag for the target architecture. Shared across production
 /// storage paths so callers can request direct I/O without reaching into `libc`.
@@ -57,6 +58,22 @@ pub struct DirectoryEntry {
 
 #[async_trait]
 pub trait AsyncFileOps: Send + Sync {
+	/// Return a backend whose writes use this owner's admission gate.
+	fn bind_directory_owner(
+		self: Arc<Self>,
+		_owner: DataDirectoryOwner,
+	) -> std::io::Result<Arc<dyn AsyncFileOps>> {
+		Err(Error::new(
+			ErrorKind::Unsupported,
+			"file operations do not support owned write admission",
+		))
+	}
+
+	/// Admission for a synchronous write performed directly on an opened
+	/// handle (outside this trait's async methods). `None` when unowned.
+	fn write_permit(&self) -> std::io::Result<Option<crate::storage::ownership::WritePermit>> {
+		Ok(None)
+	}
 	async fn open(&self, path: &Path, flags: OpenFlags) -> std::io::Result<FileHandle>;
 
 	async fn read_plain_at(
@@ -117,7 +134,7 @@ pub trait AsyncFileOps: Send + Sync {
 #[derive(Clone)]
 pub struct IoUringFileOps {
 	io: IoRingHandle,
-	blocking: Option<BlockingIoExecutor>,
+	blocking: Option<Arc<BlockingIoExecutor>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,9 +153,13 @@ impl IoUringFileOps {
 		thread_name: impl Into<String>,
 		class: BlockingIoClass,
 	) -> std::io::Result<Self> {
+		let blocking = Arc::new(BlockingIoExecutor::spawn(thread_name, class)?);
+		if let Some(owner) = io.data_directory_owner() {
+			owner.register_worker(blocking.clone())?;
+		}
 		Ok(Self {
 			io,
-			blocking: Some(BlockingIoExecutor::spawn(thread_name, class)?),
+			blocking: Some(blocking),
 		})
 	}
 
@@ -167,31 +188,89 @@ impl IoUringFileOps {
 		T: Send + 'static,
 		F: FnOnce() -> std::io::Result<T> + Send + 'static,
 	{
+		self.run_blocking_access(false, f).await
+	}
+
+	async fn run_blocking_write<T, F>(&self, f: F) -> std::io::Result<T>
+	where
+		T: Send + 'static,
+		F: FnOnce() -> std::io::Result<T> + Send + 'static,
+	{
+		self.run_blocking_access(true, f).await
+	}
+
+	async fn run_blocking_access<T, F>(&self, write: bool, f: F) -> std::io::Result<T>
+	where
+		T: Send + 'static,
+		F: FnOnce() -> std::io::Result<T> + Send + 'static,
+	{
+		self.io.ensure_open()?;
+		let owner = self.io.data_directory_owner();
 		if let Some(blocking) = &self.blocking {
-			blocking.run(f).await
+			blocking.run_owned(owner, write, f).await
 		} else {
-			spawn_blocking_io(f).await
+			let permit = if write {
+				owner
+					.as_ref()
+					.map(DataDirectoryOwner::write_permit)
+					.transpose()?
+			} else {
+				None
+			};
+			spawn_blocking_io(move || {
+				let _permit = permit;
+				let _owner = owner;
+				f()
+			})
+			.await
 		}
 	}
 }
 
 #[async_trait]
 impl AsyncFileOps for IoUringFileOps {
+	fn write_permit(&self) -> std::io::Result<Option<crate::storage::ownership::WritePermit>> {
+		self.io
+			.data_directory_owner()
+			.as_ref()
+			.map(DataDirectoryOwner::write_permit)
+			.transpose()
+	}
+
+	fn bind_directory_owner(
+		self: Arc<Self>,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<Arc<dyn AsyncFileOps>> {
+		let io = self
+			.io
+			.clone()
+			.try_with_data_directory_owner(owner.clone())?;
+		if let Some(blocking) = &self.blocking {
+			owner.register_worker(blocking.clone())?;
+		}
+		Ok(Arc::new(Self {
+			io,
+			blocking: self.blocking.clone(),
+		}))
+	}
 	async fn open(&self, path: &Path, flags: OpenFlags) -> std::io::Result<FileHandle> {
 		let path = path.to_path_buf();
-		self.run_blocking(move || {
-			let mut options = std::fs::OpenOptions::new();
-			options
-				.read(flags.read)
-				.write(flags.write)
-				.create(flags.create)
-				.create_new(flags.create_new)
-				.truncate(flags.truncate);
-			if flags.direct {
-				options.custom_flags(O_DIRECT);
-			}
-			options.open(path).map(FileHandle::new)
-		})
+		self.run_blocking_access(
+			flags.write || flags.create || flags.create_new || flags.truncate,
+			move || {
+				let mut options = std::fs::OpenOptions::new();
+				options
+					.read(flags.read)
+					.write(flags.write)
+					.create(flags.create)
+					.create_new(flags.create_new)
+					.truncate(flags.truncate);
+				if flags.direct {
+					options.custom_flags(O_DIRECT);
+				}
+				options.open(path).map(FileHandle::new)
+			},
+		)
 		.await
 	}
 
@@ -218,7 +297,7 @@ impl AsyncFileOps for IoUringFileOps {
 		bytes: Vec<u8>,
 	) -> std::io::Result<usize> {
 		let file = handle.try_clone()?;
-		self.run_blocking(move || file.write_at(&bytes, offset))
+		self.run_blocking_write(move || file.write_at(&bytes, offset))
 			.await
 	}
 
@@ -282,7 +361,8 @@ impl AsyncFileOps for IoUringFileOps {
 	async fn write_all(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 		let path = path.to_path_buf();
 		let bytes = bytes.to_vec();
-		self.run_blocking(move || std::fs::write(path, bytes)).await
+		self.run_blocking_write(move || std::fs::write(path, bytes))
+			.await
 	}
 
 	async fn file_len(&self, path: &Path) -> std::io::Result<Option<u64>> {
@@ -297,12 +377,12 @@ impl AsyncFileOps for IoUringFileOps {
 
 	async fn set_len(&self, handle: &FileHandle, len: u64) -> std::io::Result<()> {
 		let file = handle.try_clone()?;
-		self.run_blocking(move || file.set_len(len)).await
+		self.run_blocking_write(move || file.set_len(len)).await
 	}
 
 	async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
 		let path = path.to_path_buf();
-		self.run_blocking(move || std::fs::create_dir_all(path))
+		self.run_blocking_write(move || std::fs::create_dir_all(path))
 			.await
 	}
 
@@ -324,7 +404,7 @@ impl AsyncFileOps for IoUringFileOps {
 
 	async fn fsync_dir(&self, path: &Path) -> std::io::Result<()> {
 		let path = path.to_path_buf();
-		self.run_blocking(move || {
+		self.run_blocking_write(move || {
 			let dir = File::open(path)?;
 			dir.sync_all()
 		})
@@ -334,42 +414,99 @@ impl AsyncFileOps for IoUringFileOps {
 	async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
 		let from = from.to_path_buf();
 		let to = to.to_path_buf();
-		self.run_blocking(move || std::fs::rename(from, to)).await
+		self.run_blocking_write(move || std::fs::rename(from, to))
+			.await
 	}
 
 	async fn link_no_replace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
 		let from = from.to_path_buf();
 		let to = to.to_path_buf();
-		self.run_blocking(move || std::fs::hard_link(from, to))
+		self.run_blocking_write(move || std::fs::hard_link(from, to))
 			.await
 	}
 
 	async fn unlink(&self, path: &Path) -> std::io::Result<()> {
 		let path = path.to_path_buf();
-		self.run_blocking(move || std::fs::remove_file(path)).await
+		self.run_blocking_write(move || std::fs::remove_file(path))
+			.await
 	}
 }
 
 #[derive(Clone, Default)]
-pub struct BlockingFileOps;
+pub struct BlockingFileOps {
+	owner: Option<DataDirectoryOwner>,
+}
+
+#[allow(non_upper_case_globals)]
+pub const BlockingFileOps: BlockingFileOps = BlockingFileOps { owner: None };
+
+impl BlockingFileOps {
+	pub fn with_owner(owner: DataDirectoryOwner) -> Self {
+		Self { owner: Some(owner) }
+	}
+
+	async fn run_blocking<T, F>(&self, f: F) -> std::io::Result<T>
+	where
+		T: Send + 'static,
+		F: FnOnce() -> std::io::Result<T> + Send + 'static,
+	{
+		spawn_blocking_io(f).await
+	}
+
+	async fn run_blocking_write<T, F>(&self, f: F) -> std::io::Result<T>
+	where
+		T: Send + 'static,
+		F: FnOnce() -> std::io::Result<T> + Send + 'static,
+	{
+		spawn_blocking_io_owned(self.owner.clone(), f).await
+	}
+
+	async fn run_blocking_access<T, F>(&self, write: bool, f: F) -> std::io::Result<T>
+	where
+		T: Send + 'static,
+		F: FnOnce() -> std::io::Result<T> + Send + 'static,
+	{
+		if write {
+			self.run_blocking_write(f).await
+		} else {
+			self.run_blocking(f).await
+		}
+	}
+}
 
 #[async_trait]
 impl AsyncFileOps for BlockingFileOps {
+	fn write_permit(&self) -> std::io::Result<Option<crate::storage::ownership::WritePermit>> {
+		self.owner
+			.as_ref()
+			.map(DataDirectoryOwner::write_permit)
+			.transpose()
+	}
+
+	fn bind_directory_owner(
+		self: Arc<Self>,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<Arc<dyn AsyncFileOps>> {
+		Ok(Arc::new(Self::with_owner(owner)))
+	}
 	async fn open(&self, path: &Path, flags: OpenFlags) -> std::io::Result<FileHandle> {
 		let path = path.to_path_buf();
-		spawn_blocking_io(move || {
-			let mut options = std::fs::OpenOptions::new();
-			options
-				.read(flags.read)
-				.write(flags.write)
-				.create(flags.create)
-				.create_new(flags.create_new)
-				.truncate(flags.truncate);
-			if flags.direct {
-				options.custom_flags(O_DIRECT);
-			}
-			options.open(path).map(FileHandle::new)
-		})
+		self.run_blocking_access(
+			flags.write || flags.create || flags.create_new || flags.truncate,
+			move || {
+				let mut options = std::fs::OpenOptions::new();
+				options
+					.read(flags.read)
+					.write(flags.write)
+					.create(flags.create)
+					.create_new(flags.create_new)
+					.truncate(flags.truncate);
+				if flags.direct {
+					options.custom_flags(O_DIRECT);
+				}
+				options.open(path).map(FileHandle::new)
+			},
+		)
 		.await
 	}
 
@@ -380,7 +517,7 @@ impl AsyncFileOps for BlockingFileOps {
 		len: usize,
 	) -> std::io::Result<Vec<u8>> {
 		let file = handle.try_clone()?;
-		spawn_blocking_io(move || {
+		self.run_blocking(move || {
 			let mut buf = vec![0u8; len];
 			let read = file.read_at(&mut buf, offset)?;
 			buf.truncate(read);
@@ -396,7 +533,8 @@ impl AsyncFileOps for BlockingFileOps {
 		bytes: Vec<u8>,
 	) -> std::io::Result<usize> {
 		let file = handle.try_clone()?;
-		spawn_blocking_io(move || file.write_at(&bytes, offset)).await
+		self.run_blocking_write(move || file.write_at(&bytes, offset))
+			.await
 	}
 
 	async fn read_at(
@@ -406,7 +544,7 @@ impl AsyncFileOps for BlockingFileOps {
 		buf: AlignedBuf,
 	) -> std::io::Result<(usize, AlignedBuf)> {
 		let file = handle.try_clone()?;
-		spawn_blocking_io(move || {
+		self.run_blocking(move || {
 			let mut buf = buf;
 			let read = file.read_at(buf.as_mut_slice(), offset)?;
 			Ok((read, buf))
@@ -421,7 +559,7 @@ impl AsyncFileOps for BlockingFileOps {
 		buf: AlignedBuf,
 	) -> std::io::Result<(usize, AlignedBuf)> {
 		let file = handle.try_clone()?;
-		spawn_blocking_io(move || {
+		self.run_blocking_write(move || {
 			let written = file.write_at(buf.as_slice(), offset)?;
 			Ok((written, buf))
 		})
@@ -430,28 +568,29 @@ impl AsyncFileOps for BlockingFileOps {
 
 	async fn fsync(&self, handle: &FileHandle) -> std::io::Result<()> {
 		let file = handle.try_clone()?;
-		spawn_blocking_io(move || file.sync_all()).await
+		self.run_blocking_write(move || file.sync_all()).await
 	}
 
 	async fn fdatasync(&self, handle: &FileHandle) -> std::io::Result<()> {
 		let file = handle.try_clone()?;
-		spawn_blocking_io(move || file.sync_data()).await
+		self.run_blocking_write(move || file.sync_data()).await
 	}
 
 	async fn read_all(&self, path: &Path) -> std::io::Result<Vec<u8>> {
 		let path = path.to_path_buf();
-		spawn_blocking_io(move || std::fs::read(path)).await
+		self.run_blocking(move || std::fs::read(path)).await
 	}
 
 	async fn write_all(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 		let path = path.to_path_buf();
 		let bytes = bytes.to_vec();
-		spawn_blocking_io(move || std::fs::write(path, bytes)).await
+		self.run_blocking_write(move || std::fs::write(path, bytes))
+			.await
 	}
 
 	async fn file_len(&self, path: &Path) -> std::io::Result<Option<u64>> {
 		let path = path.to_path_buf();
-		spawn_blocking_io(move || match std::fs::metadata(path) {
+		self.run_blocking(move || match std::fs::metadata(path) {
 			Ok(meta) => Ok(Some(meta.len())),
 			Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
 			Err(err) => Err(err),
@@ -461,17 +600,18 @@ impl AsyncFileOps for BlockingFileOps {
 
 	async fn set_len(&self, handle: &FileHandle, len: u64) -> std::io::Result<()> {
 		let file = handle.try_clone()?;
-		spawn_blocking_io(move || file.set_len(len)).await
+		self.run_blocking_write(move || file.set_len(len)).await
 	}
 
 	async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
 		let path = path.to_path_buf();
-		spawn_blocking_io(move || std::fs::create_dir_all(path)).await
+		self.run_blocking_write(move || std::fs::create_dir_all(path))
+			.await
 	}
 
 	async fn read_dir(&self, path: &Path) -> std::io::Result<Vec<DirectoryEntry>> {
 		let path = path.to_path_buf();
-		spawn_blocking_io(move || {
+		self.run_blocking(move || {
 			let mut entries = Vec::new();
 			for entry in std::fs::read_dir(path)? {
 				let entry = entry?;
@@ -487,7 +627,7 @@ impl AsyncFileOps for BlockingFileOps {
 
 	async fn fsync_dir(&self, path: &Path) -> std::io::Result<()> {
 		let path = path.to_path_buf();
-		spawn_blocking_io(move || {
+		self.run_blocking_write(move || {
 			let dir = File::open(path)?;
 			dir.sync_all()
 		})
@@ -497,18 +637,21 @@ impl AsyncFileOps for BlockingFileOps {
 	async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
 		let from = from.to_path_buf();
 		let to = to.to_path_buf();
-		spawn_blocking_io(move || std::fs::rename(from, to)).await
+		self.run_blocking_write(move || std::fs::rename(from, to))
+			.await
 	}
 
 	async fn link_no_replace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
 		let from = from.to_path_buf();
 		let to = to.to_path_buf();
-		spawn_blocking_io(move || std::fs::hard_link(from, to)).await
+		self.run_blocking_write(move || std::fs::hard_link(from, to))
+			.await
 	}
 
 	async fn unlink(&self, path: &Path) -> std::io::Result<()> {
 		let path = path.to_path_buf();
-		spawn_blocking_io(move || std::fs::remove_file(path)).await
+		self.run_blocking_write(move || std::fs::remove_file(path))
+			.await
 	}
 }
 
@@ -579,6 +722,26 @@ where
 	.map_err(|err| Error::other(format!("blocking file op task failed: {err}")))?
 }
 
+async fn spawn_blocking_io_owned<T, F>(
+	owner: Option<DataDirectoryOwner>,
+	f: F,
+) -> std::io::Result<T>
+where
+	T: Send + 'static,
+	F: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+	let permit = owner
+		.as_ref()
+		.map(DataDirectoryOwner::write_permit)
+		.transpose()?;
+	spawn_blocking_io(move || {
+		let _owner = owner;
+		let _permit = permit;
+		f()
+	})
+	.await
+}
+
 type BlockingTask = Box<dyn FnOnce() + Send + 'static>;
 
 const ISOLATED_BLOCKING_IO_QUEUE_DEPTH: usize = 1024;
@@ -586,28 +749,52 @@ const ISOLATED_BLOCKING_IO_WORKERS: usize = 4;
 
 #[derive(Clone)]
 struct BlockingIoExecutor {
-	tx: tokio::sync::mpsc::Sender<BlockingTask>,
+	tx: tokio::sync::mpsc::Sender<Option<BlockingTask>>,
 	class: BlockingIoClass,
 	queued_tasks: Arc<AtomicU64>,
+	closed: Arc<AtomicBool>,
+	admission: Arc<std::sync::Mutex<()>>,
+	joins: Arc<WorkerJoins>,
+}
+
+#[async_trait]
+impl StorageWorker for BlockingIoExecutor {
+	async fn close_and_join(&self) -> std::io::Result<()> {
+		{
+			let _admission = self.admission.lock().unwrap();
+			self.closed.store(true, Ordering::SeqCst);
+		}
+		let _ = self.tx.send(None).await;
+		self.joins.join().await
+	}
 }
 
 impl BlockingIoExecutor {
 	fn spawn(thread_name: impl Into<String>, class: BlockingIoClass) -> std::io::Result<Self> {
 		let thread_name = thread_name.into();
-		let (tx, rx) = tokio::sync::mpsc::channel(ISOLATED_BLOCKING_IO_QUEUE_DEPTH);
+		let (tx, rx) =
+			tokio::sync::mpsc::channel::<Option<BlockingTask>>(ISOLATED_BLOCKING_IO_QUEUE_DEPTH);
 		let queued_tasks = Arc::new(AtomicU64::new(0));
 		let rx = Arc::new(std::sync::Mutex::new(rx));
+		let mut handles = Vec::new();
 		for worker_idx in 0..ISOLATED_BLOCKING_IO_WORKERS {
 			let worker_name = format!("{thread_name}-{worker_idx}");
 			let rx = rx.clone();
 			let queued_tasks = queued_tasks.clone();
-			std::thread::Builder::new()
+			let handle = std::thread::Builder::new()
 				.name(worker_name.clone())
 				.spawn(move || {
 					loop {
 						let task = {
 							let mut guard = rx.lock().unwrap();
-							guard.blocking_recv()
+							match guard.blocking_recv() {
+								Some(Some(task)) => Some(task),
+								Some(None) => {
+									guard.close();
+									continue;
+								}
+								None => None,
+							}
 						};
 						let Some(task) = task else {
 							break;
@@ -622,33 +809,68 @@ impl BlockingIoExecutor {
 						"failed to spawn isolated blocking io thread {worker_name}: {err}"
 					))
 				})?;
+			handles.push(handle);
 		}
 		update_blocking_io_queue_depth(class, 0);
 		Ok(Self {
 			tx,
 			class,
 			queued_tasks,
+			closed: Arc::new(AtomicBool::new(false)),
+			admission: Default::default(),
+			joins: WorkerJoins::new(handles),
 		})
 	}
 
+	#[cfg(test)]
 	async fn run<T, F>(&self, f: F) -> std::io::Result<T>
 	where
 		T: Send + 'static,
 		F: FnOnce() -> std::io::Result<T> + Send + 'static,
 	{
-		let (tx, rx) = tokio::sync::oneshot::channel();
-		let observation = crate::storage::finality_observation::current_work();
-		let task: BlockingTask = Box::new(move || {
-			let _observation = observation;
-			let _ = tx.send(f());
-		});
-		let depth = self.queued_tasks.fetch_add(1, Ordering::Relaxed) + 1;
-		update_blocking_io_queue_depth(self.class, depth);
-		self.tx.send(task).await.map_err(|_| {
-			let depth = self.queued_tasks.fetch_sub(1, Ordering::Relaxed) - 1;
+		self.run_owned(None, false, f).await
+	}
+
+	async fn run_owned<T, F>(
+		&self,
+		owner: Option<DataDirectoryOwner>,
+		write: bool,
+		f: F,
+	) -> std::io::Result<T>
+	where
+		T: Send + 'static,
+		F: FnOnce() -> std::io::Result<T> + Send + 'static,
+	{
+		if self.closed.load(Ordering::SeqCst) {
+			return Err(closed_error());
+		}
+		let slot = self.tx.reserve().await.map_err(|_| closed_error())?;
+		let rx = {
+			let _admission = self.admission.lock().unwrap();
+			if self.closed.load(Ordering::SeqCst) {
+				return Err(closed_error());
+			}
+			let permit = if write {
+				owner
+					.as_ref()
+					.map(DataDirectoryOwner::write_permit)
+					.transpose()?
+			} else {
+				None
+			};
+			let (tx, rx) = tokio::sync::oneshot::channel();
+			let observation = crate::storage::finality_observation::current_work();
+			let task: BlockingTask = Box::new(move || {
+				let _observation = observation;
+				let _owner = owner;
+				let _permit = permit;
+				let _ = tx.send(f());
+			});
+			let depth = self.queued_tasks.fetch_add(1, Ordering::Relaxed) + 1;
 			update_blocking_io_queue_depth(self.class, depth);
-			Error::other("isolated blocking io thread stopped before accepting file op")
-		})?;
+			slot.send(Some(task));
+			rx
+		};
 		rx.await
 			.map_err(|_| Error::other("isolated blocking io task was cancelled"))?
 	}
@@ -873,6 +1095,10 @@ impl FaultyFileOps {
 #[cfg(test)]
 #[async_trait]
 impl AsyncFileOps for FaultyFileOps {
+	fn write_permit(&self) -> std::io::Result<Option<crate::storage::ownership::WritePermit>> {
+		self.inner.write_permit()
+	}
+
 	async fn open(&self, path: &Path, flags: OpenFlags) -> std::io::Result<FileHandle> {
 		let handle = self.inner.open(path, flags).await?;
 		self.state
@@ -1144,6 +1370,76 @@ mod tests {
 		// every slab as a directory on arm64 Linux.
 		assert_ne!(super::O_DIRECT, libc::O_DIRECTORY);
 		assert_ne!(super::O_DIRECT, 0);
+	}
+
+	#[tokio::test]
+	async fn owner_close_drains_queued_metadata_job_and_rejects_retained_executor() {
+		use crate::storage::ownership::{Closed, DataDirectoryOwner, StorageWorker};
+		let dir =
+			std::env::temp_dir().join(format!("owner-metadata-close-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir(&dir).unwrap();
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let executor =
+			BlockingIoExecutor::spawn("owner-metadata-test", BlockingIoClass::SlabMetadata)
+				.unwrap();
+		owner
+			.register_worker(Arc::new(executor.clone()) as Arc<dyn StorageWorker>)
+			.unwrap();
+		let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(ISOLATED_BLOCKING_IO_WORKERS);
+		let mut releases = Vec::new();
+		let mut workers = Vec::new();
+		for _ in 0..ISOLATED_BLOCKING_IO_WORKERS {
+			let (release, wait) = std::sync::mpsc::channel();
+			releases.push(release);
+			let executor = executor.clone();
+			let owner = owner.clone();
+			let started = started_tx.clone();
+			workers.push(tokio::spawn(async move {
+				executor
+					.run_owned(Some(owner), true, move || {
+						started.blocking_send(()).unwrap();
+						wait.recv().unwrap();
+						Ok(())
+					})
+					.await
+			}));
+		}
+		for _ in 0..ISOLATED_BLOCKING_IO_WORKERS {
+			started_rx.recv().await.unwrap();
+		}
+		// All four workers are blocked, so this fifth operation is certainly
+		// queued. Admission happens only after reserving its queue slot.
+		let slot = executor.tx.reserve().await.unwrap();
+		let permit = owner.write_permit().unwrap();
+		let path = dir.join("queued-data");
+		let (finished, completed) = tokio::sync::oneshot::channel();
+		executor.queued_tasks.fetch_add(1, Ordering::Relaxed);
+		slot.send(Some(Box::new(move || {
+			let _permit = permit;
+			std::fs::write(path, b"drained").unwrap();
+			finished.send(()).unwrap();
+		})));
+		let closer = {
+			let owner = owner.clone();
+			tokio::spawn(async move { owner.close(Duration::from_secs(5)).await })
+		};
+		owner.wait_until_closing().await;
+		for release in releases {
+			release.send(()).unwrap();
+		}
+		for worker in workers {
+			worker.await.unwrap().unwrap();
+		}
+		completed.await.unwrap();
+		closer.await.unwrap().unwrap();
+		assert_eq!(std::fs::read(dir.join("queued-data")).unwrap(), b"drained");
+		let error = executor
+			.run_owned(Some(owner), true, || Ok(()))
+			.await
+			.unwrap_err();
+		assert!(error.get_ref().unwrap().is::<Closed>());
+		DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		std::fs::remove_dir_all(dir).unwrap();
 	}
 
 	#[tokio::test]

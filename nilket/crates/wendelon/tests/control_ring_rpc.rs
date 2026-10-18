@@ -918,9 +918,7 @@ async fn advance_epoch_status_survives_restart() {
 	let meta: AdvanceEpochResponseWire = wire::decode(&resp.meta).unwrap();
 	assert!(meta.accepted);
 
-	support::abort_node(&node);
-	drop(node);
-	tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+	node.shutdown().await.unwrap();
 
 	let recovered =
 		WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(1, dir, "127.0.0.1:0".into()))
@@ -996,9 +994,7 @@ async fn advance_epoch_commit_emits_raft_audit_once_across_restart() {
 		1
 	);
 
-	node.handles.abort();
-	drop(node);
-	tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+	node.shutdown().await.unwrap();
 
 	let recovered =
 		WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(1, dir, "127.0.0.1:0".into()))

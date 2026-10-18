@@ -194,7 +194,7 @@ impl ServerLifecycle {
 		}
 	}
 
-	fn track_work(&self) -> LifecycleGuard {
+	pub(crate) fn track_work(&self) -> LifecycleGuard {
 		self.update_state(|state| state.in_flight += 1);
 		LifecycleGuard {
 			lifecycle: self.clone(),
@@ -234,7 +234,7 @@ impl ServerLifecycle {
 	}
 }
 
-struct LifecycleGuard {
+pub(crate) struct LifecycleGuard {
 	lifecycle: ServerLifecycle,
 }
 

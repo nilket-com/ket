@@ -10,7 +10,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -29,12 +29,35 @@ use signal_hook::consts::SIGINT;
 use toron_client::blocking_health_loopback;
 use uuid::Uuid;
 use wendelon::cli::ReadinessProbe;
+use wendelon::storage::ownership::{DataDirectoryOwner, UNCLEAN_SHUTDOWN_EXIT_CODE};
 
 const READY_ENDPOINT: &str = "127.0.0.1:7432";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TORON_DRAIN_TIMEOUT: Duration = Duration::from_secs(35);
-const WENDELON_DRAIN_TIMEOUT: Duration = Duration::from_secs(35);
+/// Supervisor margin in Wendelon's stop grace. Wendelon's own shutdown watchdog
+/// fires at 2 x `tuning.storage_shutdown_timeout_seconds` + 25 s (the quiescence
+/// wait and the storage close are each bounded by the timeout, plus 25 s for the
+/// Raft/handle/listener steps and the runtime teardown) and then self-terminates
+/// with [`UNCLEAN_SHUTDOWN_EXIT_CODE`]. The supervisor grace is 2 x timeout + 40 s,
+/// i.e. that watchdog deadline + 15 s, so Wendelon always reports its own
+/// outcome before the supervisor resorts to SIGKILL.
+const WENDELON_STOP_MARGIN: Duration = Duration::from_secs(40);
+/// Grace used when the retained Wendelon config cannot be read at stop time:
+/// 2 x the default 30 s storage shutdown timeout + [`WENDELON_STOP_MARGIN`]. It
+/// must exceed Wendelon's own watchdog deadline (2 x the timeout + 25 s).
+const DEFAULT_WENDELON_STOP_GRACE: Duration = Duration::from_secs(100);
+/// The signal that asks a role to drain. Wendelon drains on SIGINT or SIGTERM;
+/// Toron drains on Ctrl-C (`tokio::signal::ctrl_c`) only, where SIGTERM would end
+/// it without a drain. SIGINT works for both; switch to SIGTERM once Toron
+/// handles it.
+const GRACEFUL_STOP_SIGNAL: Signal = Signal::SIGINT;
+/// Bound on reaping the group leader after SIGKILL.
+const KILL_REAP_DEADLINE: Duration = Duration::from_secs(2);
+/// Bound on joining the stdout/stderr forwarders once the child is gone. A
+/// descendant that escaped the group can hold a pipe open; its reader is detached.
+const READER_DRAIN_DEADLINE: Duration = Duration::from_secs(2);
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_CHILD_LINE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +179,7 @@ fn run_owned_with_requirements(
 
 	let executable = std::env::current_exe()
 		.map_err(|error| format!("failed to resolve current nilket executable: {error}"))?;
+	let wendelon_grace = wendelon_stop_grace(&paths.wendelon_config);
 	let mut wendelon = OwnedChild::spawn(
 		"wendelon",
 		&executable,
@@ -171,7 +195,11 @@ fn run_owned_with_requirements(
 		&pki.node_ca_cert,
 	);
 	if let Err(error) = wait_for_wendelon(&mut wendelon.child, &readiness, &interrupted) {
-		wendelon.stop(Signal::SIGINT, WENDELON_DRAIN_TIMEOUT);
+		let report = wendelon.stop(GRACEFUL_STOP_SIGNAL, wendelon_grace);
+		if report.outcome.needs_recovery() {
+			eprintln!("nilket local: {error}");
+			return Ok(unclean_exit_code());
+		}
 		return Err(error);
 	}
 
@@ -182,13 +210,21 @@ fn run_owned_with_requirements(
 	) {
 		Ok(child) => child,
 		Err(error) => {
-			wendelon.stop(Signal::SIGINT, WENDELON_DRAIN_TIMEOUT);
+			let report = wendelon.stop(GRACEFUL_STOP_SIGNAL, wendelon_grace);
+			if report.outcome.needs_recovery() {
+				eprintln!("nilket local: {error}");
+				return Ok(unclean_exit_code());
+			}
 			return Err(error);
 		}
 	};
 	if let Err(error) = wait_for_toron(&mut toron.child, SQL_ENDPOINT, &interrupted) {
-		toron.stop(Signal::SIGINT, TORON_DRAIN_TIMEOUT);
-		wendelon.stop(Signal::SIGINT, WENDELON_DRAIN_TIMEOUT);
+		toron.stop(GRACEFUL_STOP_SIGNAL, TORON_DRAIN_TIMEOUT);
+		let report = wendelon.stop(GRACEFUL_STOP_SIGNAL, wendelon_grace);
+		if report.outcome.needs_recovery() {
+			eprintln!("nilket local: {error}");
+			return Ok(unclean_exit_code());
+		}
 		return Err(error);
 	}
 
@@ -215,7 +251,13 @@ fn run_owned_with_requirements(
 		.flush()
 		.map_err(|error| format!("publish LOCAL_READY: {error}"))?;
 
-	let exit_code = supervise(&mut toron, &mut wendelon, &interrupted, &paths);
+	let exit_code = supervise(
+		&mut toron,
+		&mut wendelon,
+		wendelon_grace,
+		&interrupted,
+		&paths,
+	);
 	let _ = fs::remove_file(&paths.runtime);
 	drop(lock_file);
 	Ok(exit_code)
@@ -454,8 +496,16 @@ fn reset_locked_profile(paths: &ProfilePaths) -> Result<(), String> {
 	if marker.format_version != FORMAT_VERSION {
 		return Err("refusing reset of unsupported profile format".to_owned());
 	}
+	let data_root = paths.root.join("data");
+	if data_root.exists() {
+		refuse_symlink_tree(&data_root)?;
+	}
+	let _wendelon_owner =
+		DataDirectoryOwner::acquire_or_create(&paths.wendelon_data).map_err(|error| {
+			format!("refusing reset without Wendelon data-directory ownership: {error}")
+		})?;
 	eprintln!("nilket local: resetting {}", canonical.display());
-	for generated in ["config", "pki", "data", "logs"] {
+	for generated in ["config", "pki", "logs"] {
 		let target = paths.root.join(generated);
 		if target.exists() {
 			refuse_symlink_tree(&target)?;
@@ -463,9 +513,54 @@ fn reset_locked_profile(paths: &ProfilePaths) -> Result<(), String> {
 				.map_err(|error| format!("reset {}: {error}", target.display()))?;
 		}
 	}
+	clear_data_preserving_wendelon_lock(&data_root, &paths.wendelon_data)?;
 	if paths.runtime.exists() {
 		fs::remove_file(&paths.runtime)
 			.map_err(|error| format!("reset {}: {error}", paths.runtime.display()))?;
+	}
+	Ok(())
+}
+
+fn clear_data_preserving_wendelon_lock(
+	data_root: &Path,
+	wendelon_data: &Path,
+) -> Result<(), String> {
+	if !data_root.exists() {
+		return Ok(());
+	}
+	for entry in fs::read_dir(data_root)
+		.map_err(|error| format!("inspect reset data {}: {error}", data_root.display()))?
+	{
+		let path = entry
+			.map_err(|error| format!("inspect reset data entry: {error}"))?
+			.path();
+		if path == wendelon_data {
+			for child in fs::read_dir(&path).map_err(|error| {
+				format!("inspect Wendelon reset data {}: {error}", path.display())
+			})? {
+				let child = child
+					.map_err(|error| format!("inspect Wendelon reset entry: {error}"))?
+					.path();
+				if child.file_name().is_some_and(|name| name == "LOCK") {
+					continue;
+				}
+				refuse_symlink_tree(&child)?;
+				if child.is_dir() {
+					fs::remove_dir_all(&child)
+				} else {
+					fs::remove_file(&child)
+				}
+				.map_err(|error| format!("reset {}: {error}", child.display()))?;
+			}
+		} else {
+			refuse_symlink_tree(&path)?;
+			if path.is_dir() {
+				fs::remove_dir_all(&path)
+			} else {
+				fs::remove_file(&path)
+			}
+			.map_err(|error| format!("reset {}: {error}", path.display()))?;
+		}
 	}
 	Ok(())
 }
@@ -678,15 +773,22 @@ fn wait_for_toron(
 fn supervise(
 	toron: &mut OwnedChild,
 	wendelon: &mut OwnedChild,
+	wendelon_grace: Duration,
 	interrupted: &AtomicBool,
 	paths: &ProfilePaths,
 ) -> ExitCode {
 	loop {
 		if interrupted.load(Ordering::Relaxed) {
 			eprintln!("nilket local: draining Toron before Wendelon");
-			toron.stop(Signal::SIGINT, TORON_DRAIN_TIMEOUT);
-			wendelon.stop(Signal::SIGINT, WENDELON_DRAIN_TIMEOUT);
-			return ExitCode::SUCCESS;
+			toron.stop(GRACEFUL_STOP_SIGNAL, TORON_DRAIN_TIMEOUT);
+			let report = wendelon.stop(GRACEFUL_STOP_SIGNAL, wendelon_grace);
+			return if report.outcome.needs_recovery() {
+				unclean_exit_code()
+			} else if matches!(report.outcome, StopOutcome::Failed(_)) {
+				ExitCode::from(1)
+			} else {
+				ExitCode::SUCCESS
+			};
 		}
 		match toron.child.try_wait() {
 			Ok(Some(status)) => {
@@ -694,34 +796,142 @@ fn supervise(
 					"nilket local: Toron exited unexpectedly ({status}); logs/profile: {}",
 					paths.root.display()
 				);
-				wendelon.stop(Signal::SIGINT, WENDELON_DRAIN_TIMEOUT);
-				return ExitCode::from(1);
+				let report = wendelon.stop(GRACEFUL_STOP_SIGNAL, wendelon_grace);
+				return if report.outcome.needs_recovery() {
+					unclean_exit_code()
+				} else {
+					ExitCode::from(1)
+				};
 			}
 			Err(error) => {
 				eprintln!("nilket local: failed to poll Toron: {error}");
-				wendelon.stop(Signal::SIGINT, WENDELON_DRAIN_TIMEOUT);
-				return ExitCode::from(1);
+				let report = wendelon.stop(GRACEFUL_STOP_SIGNAL, wendelon_grace);
+				return if report.outcome.needs_recovery() {
+					unclean_exit_code()
+				} else {
+					ExitCode::from(1)
+				};
 			}
 			Ok(None) => {}
 		}
 		match wendelon.child.try_wait() {
 			Ok(Some(status)) => {
-				eprintln!(
-					"nilket local: Wendelon exited unexpectedly ({status}); logs/profile: {}",
-					paths.root.display()
-				);
-				toron.stop(Signal::SIGINT, TORON_DRAIN_TIMEOUT);
-				return ExitCode::from(1);
+				let outcome = StopOutcome::classify(Some(status), false);
+				if outcome == StopOutcome::UncleanRestartIntoRecovery {
+					eprintln!(
+						"nilket local: Wendelon {outcome}; logs/profile: {}",
+						paths.root.display()
+					);
+				} else {
+					eprintln!(
+						"nilket local: Wendelon exited unexpectedly ({status}); logs/profile: {}",
+						paths.root.display()
+					);
+				}
+				toron.stop(GRACEFUL_STOP_SIGNAL, TORON_DRAIN_TIMEOUT);
+				wendelon.drain_readers(READER_DRAIN_DEADLINE);
+				return if outcome.needs_recovery() {
+					unclean_exit_code()
+				} else {
+					ExitCode::from(1)
+				};
 			}
 			Err(error) => {
 				eprintln!("nilket local: failed to poll Wendelon: {error}");
-				toron.stop(Signal::SIGINT, TORON_DRAIN_TIMEOUT);
+				toron.stop(GRACEFUL_STOP_SIGNAL, TORON_DRAIN_TIMEOUT);
 				return ExitCode::from(1);
 			}
 			Ok(None) => {}
 		}
 		thread::sleep(POLL_INTERVAL);
 	}
+}
+
+/// The supervisor's stop grace for Wendelon: 2 x its configured storage shutdown
+/// timeout plus [`WENDELON_STOP_MARGIN`], so Wendelon's own bounded shutdown
+/// (and its watchdog) always gets to finish before the supervisor kills the group.
+fn wendelon_stop_grace(config: &Path) -> Duration {
+	match wendelon::config::load_node_bootstrap_config(config) {
+		Ok(config) => grace_for_storage_shutdown_timeout(config.storage_shutdown_timeout),
+		Err(error) => {
+			eprintln!(
+				"nilket local: cannot read Wendelon storage shutdown timeout from {} ({error}); \
+				 using a {DEFAULT_WENDELON_STOP_GRACE:?} stop grace",
+				config.display()
+			);
+			DEFAULT_WENDELON_STOP_GRACE
+		}
+	}
+}
+
+fn grace_for_storage_shutdown_timeout(timeout: Duration) -> Duration {
+	timeout
+		.saturating_mul(2)
+		.saturating_add(WENDELON_STOP_MARGIN)
+}
+
+fn unclean_exit_code() -> ExitCode {
+	ExitCode::from(u8::try_from(UNCLEAN_SHUTDOWN_EXIT_CODE).expect("unclean exit code fits u8"))
+}
+
+/// How a supervised role ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopOutcome {
+	/// Exited with status 0.
+	Clean,
+	/// Exited with [`UNCLEAN_SHUTDOWN_EXIT_CODE`]: the role could not prove every
+	/// writer stopped. Not a configuration error; the next start runs recovery.
+	UncleanRestartIntoRecovery,
+	/// Did not exit within its grace and was SIGKILLed with its process group.
+	KilledBySupervisor,
+	/// Any other exit status, or a death by a signal the supervisor did not send.
+	Failed(ExitStatus),
+	/// Could not be reaped within the bounded waits.
+	Unreaped,
+}
+
+impl StopOutcome {
+	fn classify(status: Option<ExitStatus>, sigkill_sent: bool) -> Self {
+		match status.and_then(|status| status.code()) {
+			Some(0) => Self::Clean,
+			Some(UNCLEAN_SHUTDOWN_EXIT_CODE) => Self::UncleanRestartIntoRecovery,
+			_ if sigkill_sent => Self::KilledBySupervisor,
+			_ => status.map_or(Self::Unreaped, Self::Failed),
+		}
+	}
+
+	/// Whether the role ended without a clean shutdown, so its next start recovers.
+	/// A death by any signal (OOM kill, an early signal before the drain handler)
+	/// leaves no clean-shutdown record either.
+	fn needs_recovery(self) -> bool {
+		use std::os::unix::process::ExitStatusExt;
+		match self {
+			Self::UncleanRestartIntoRecovery | Self::KilledBySupervisor | Self::Unreaped => true,
+			Self::Failed(status) => status.signal().is_some(),
+			Self::Clean => false,
+		}
+	}
+}
+
+impl std::fmt::Display for StopOutcome {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Clean => formatter.write_str("clean stop"),
+			Self::UncleanRestartIntoRecovery => write!(
+				formatter,
+				"unclean shutdown (exit {UNCLEAN_SHUTDOWN_EXIT_CODE}): restart into recovery"
+			),
+			Self::KilledBySupervisor => formatter.write_str("unclean stop (killed by supervisor)"),
+			Self::Failed(status) => write!(formatter, "failed stop ({status})"),
+			Self::Unreaped => formatter.write_str("unclean stop (not reaped after SIGKILL)"),
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StopReport {
+	outcome: StopOutcome,
+	sigkill_sent: bool,
 }
 
 struct OwnedChild {
@@ -774,33 +984,74 @@ impl OwnedChild {
 		})
 	}
 
-	fn stop(&mut self, signal: Signal, timeout: Duration) {
-		if self.child.try_wait().ok().flatten().is_none() {
-			let _ = killpg(Pid::from_raw(self.child.id() as i32), signal);
+	/// Ask the child's process group to drain with `signal`, wait up to `grace`,
+	/// then SIGKILL the group. Every wait is bounded; the child's leader is the
+	/// group id (`process_group(0)`), and it is only signalled while unreaped so
+	/// the id cannot have been recycled.
+	fn stop(&mut self, signal: Signal, grace: Duration) -> StopReport {
+		let group = Pid::from_raw(self.child.id() as i32);
+		let mut sigkill_sent = false;
+		let mut status = self.child.try_wait().ok().flatten();
+		if status.is_none() {
+			let _ = killpg(group, signal);
+			status = self.wait_bounded(grace);
 		}
-		let deadline = Instant::now() + timeout;
-		while Instant::now() < deadline {
-			match self.child.try_wait() {
-				Ok(Some(_)) => {
-					self.join_readers();
-					return;
-				}
-				Ok(None) => thread::sleep(Duration::from_millis(50)),
-				Err(error) => {
-					eprintln!("nilket local: failed to reap {}: {error}", self.label);
-					break;
-				}
-			}
+		if status.is_none() {
+			eprintln!(
+				"nilket local: escalating {} to SIGKILL after {grace:?}",
+				self.label
+			);
+			let _ = killpg(group, Signal::SIGKILL);
+			sigkill_sent = true;
+			status = self.wait_bounded(KILL_REAP_DEADLINE);
 		}
-		eprintln!("nilket local: escalating {} after {timeout:?}", self.label);
-		let _ = killpg(Pid::from_raw(self.child.id() as i32), Signal::SIGKILL);
-		let _ = self.child.wait();
-		self.join_readers();
+		self.drain_readers(READER_DRAIN_DEADLINE);
+		let outcome = StopOutcome::classify(status, sigkill_sent);
+		if outcome != StopOutcome::Clean {
+			eprintln!("nilket local: {} {outcome}", self.label);
+		}
+		StopReport {
+			outcome,
+			sigkill_sent,
+		}
 	}
 
-	fn join_readers(&mut self) {
+	/// Poll for the child's exit until `timeout`; `None` if it is still running
+	/// (or cannot be polled) at the deadline.
+	fn wait_bounded(&mut self, timeout: Duration) -> Option<ExitStatus> {
+		let deadline = Instant::now() + timeout;
+		loop {
+			match self.child.try_wait() {
+				Ok(Some(status)) => return Some(status),
+				Ok(None) => {}
+				Err(error) => {
+					eprintln!("nilket local: failed to reap {}: {error}", self.label);
+					return None;
+				}
+			}
+			let now = Instant::now();
+			if now >= deadline {
+				return None;
+			}
+			thread::sleep(STOP_POLL_INTERVAL.min(deadline - now));
+		}
+	}
+
+	/// Join the output forwarders that finish within `timeout`; detach the rest.
+	fn drain_readers(&mut self, timeout: Duration) {
+		let deadline = Instant::now() + timeout;
+		while self.readers.iter().any(|reader| !reader.is_finished()) && Instant::now() < deadline {
+			thread::sleep(STOP_POLL_INTERVAL);
+		}
 		for reader in self.readers.drain(..) {
-			let _ = reader.join();
+			if reader.is_finished() {
+				let _ = reader.join();
+			} else {
+				eprintln!(
+					"nilket local: {} output still open after {timeout:?}; detaching its reader",
+					self.label
+				);
+			}
 		}
 	}
 }
@@ -1279,19 +1530,139 @@ mod tests {
 	#[test]
 	fn child_is_in_its_own_process_group_and_drains_on_owned_signal() {
 		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
-		let mut child = OwnedChild::spawn(
-			"fixture",
-			Path::new("/bin/sh"),
-			["-c", "trap 'exit 0' INT; while :; do sleep 1; done"],
-		)
-		.unwrap();
+		let root = fresh_root("own-group");
+		fs::create_dir_all(&root).unwrap();
+		let ready = root.join("trap.ready");
+		let script = format!(
+			"trap 'exit 0' INT; touch {}; while :; do sleep 1; done",
+			ready.display()
+		);
+		let mut child =
+			OwnedChild::spawn("fixture", Path::new("/bin/sh"), ["-c", &script]).unwrap();
 		let child_pid = Pid::from_raw(child.child.id() as i32);
 		let child_group = nix::unistd::getpgid(Some(child_pid)).unwrap();
 		let parent_group = nix::unistd::getpgid(None).unwrap();
 		assert_eq!(child_group, child_pid);
 		assert_ne!(child_group, parent_group);
-		child.stop(Signal::SIGINT, Duration::from_secs(2));
+		wait_for_file(&ready);
+		let report = child.stop(Signal::SIGINT, Duration::from_secs(2));
+		assert_eq!(report.outcome, StopOutcome::Clean);
 		assert!(child.child.try_wait().unwrap().is_some());
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	fn wait_for_file(path: &Path) {
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while !path.exists() && Instant::now() < deadline {
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(path.exists(), "fixture never reported {}", path.display());
+	}
+
+	#[test]
+	fn a_child_ignoring_sigterm_is_killed_with_its_group_after_the_grace() {
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
+		let root = fresh_root("stop-escalation");
+		fs::create_dir_all(&root).unwrap();
+		let ready = root.join("trap.ready");
+		let script = format!(
+			"trap '' TERM; touch {}; while :; do sleep 1; done",
+			ready.display()
+		);
+		let mut child =
+			OwnedChild::spawn("stubborn-fixture", Path::new("/bin/sh"), ["-c", &script]).unwrap();
+		wait_for_file(&ready);
+		let grace = Duration::from_millis(300);
+		let started = Instant::now();
+		let report = child.stop(Signal::SIGTERM, grace);
+		let elapsed = started.elapsed();
+		assert_eq!(report.outcome, StopOutcome::KilledBySupervisor);
+		assert!(report.sigkill_sent);
+		assert!(report.outcome.needs_recovery());
+		assert_eq!(
+			report.outcome.to_string(),
+			"unclean stop (killed by supervisor)"
+		);
+		assert!(elapsed >= grace, "escalated before the grace: {elapsed:?}");
+		assert!(
+			elapsed < grace + Duration::from_secs(3),
+			"escalation exceeded grace + slack: {elapsed:?}"
+		);
+		assert!(child.readers.is_empty(), "readers drained or detached");
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn a_child_exiting_86_is_unclean_restart_into_recovery_not_a_failure() {
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
+		let mut child =
+			OwnedChild::spawn("unclean-fixture", Path::new("/bin/sh"), ["-c", "exit 86"]).unwrap();
+		let status = child
+			.wait_bounded(Duration::from_secs(5))
+			.expect("fixture exits");
+		assert_eq!(status.code(), Some(UNCLEAN_SHUTDOWN_EXIT_CODE));
+		assert_eq!(
+			StopOutcome::classify(Some(status), false),
+			StopOutcome::UncleanRestartIntoRecovery
+		);
+		// Stopping an already-exited child signals nothing and keeps the class.
+		let report = child.stop(Signal::SIGTERM, Duration::from_secs(5));
+		assert_eq!(report.outcome, StopOutcome::UncleanRestartIntoRecovery);
+		assert!(!report.sigkill_sent);
+		assert!(report.outcome.needs_recovery());
+		assert!(report.outcome.to_string().contains("restart into recovery"));
+
+		// Positive control: an ordinary failure status is not the recovery class.
+		let mut failing =
+			OwnedChild::spawn("failing-fixture", Path::new("/bin/sh"), ["-c", "exit 1"]).unwrap();
+		let status = failing
+			.wait_bounded(Duration::from_secs(5))
+			.expect("fixture exits");
+		failing.drain_readers(READER_DRAIN_DEADLINE);
+		assert_eq!(
+			StopOutcome::classify(Some(status), false),
+			StopOutcome::Failed(status)
+		);
+		assert!(!StopOutcome::Failed(status).needs_recovery());
+	}
+
+	#[test]
+	fn a_child_exiting_promptly_on_sigterm_is_a_clean_stop_without_sigkill() {
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
+		let root = fresh_root("stop-clean");
+		fs::create_dir_all(&root).unwrap();
+		let ready = root.join("trap.ready");
+		let script = format!(
+			"trap 'exit 0' TERM; touch {}; while :; do sleep 1; done",
+			ready.display()
+		);
+		let mut child =
+			OwnedChild::spawn("polite-fixture", Path::new("/bin/sh"), ["-c", &script]).unwrap();
+		wait_for_file(&ready);
+		let grace = Duration::from_secs(10);
+		let started = Instant::now();
+		let report = child.stop(Signal::SIGTERM, grace);
+		assert_eq!(report.outcome, StopOutcome::Clean);
+		assert!(!report.sigkill_sent);
+		assert!(!report.outcome.needs_recovery());
+		assert!(started.elapsed() < grace, "clean stop waited out the grace");
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn wendelon_grace_covers_twice_the_storage_timeout_plus_margin() {
+		assert_eq!(
+			grace_for_storage_shutdown_timeout(Duration::from_secs(30)),
+			DEFAULT_WENDELON_STOP_GRACE
+		);
+		assert_eq!(
+			wendelon_stop_grace(Path::new("/nonexistent/wendelon.toml")),
+			DEFAULT_WENDELON_STOP_GRACE
+		);
+		assert_eq!(
+			grace_for_storage_shutdown_timeout(Duration::from_secs(5)),
+			Duration::from_secs(50)
+		);
 	}
 
 	#[test]
@@ -1412,5 +1783,67 @@ mod tests {
 		drop(lock);
 		fs::remove_dir_all(root).unwrap();
 		fs::remove_dir_all(escape).unwrap();
+	}
+
+	#[test]
+	fn reset_refuses_a_live_wendelon_owner_without_changing_generated_bytes() {
+		let root = fresh_root("reset-live-wendelon-owner");
+		let paths = ProfilePaths::new(root.clone());
+		prepare_root_for_lock(&root).unwrap();
+		let profile_lock = open_lock(&paths.lock).unwrap();
+		profile_lock.lock_exclusive().unwrap();
+		ensure_profile(&paths).unwrap();
+		ensure_artifacts(&paths).unwrap();
+		fs::write(&paths.wendelon_config, b"config-before-reset").unwrap();
+		fs::write(paths.wendelon_data.join("state.bin"), b"state-before-reset").unwrap();
+		let data_owner = DataDirectoryOwner::acquire_existing(&paths.wendelon_data).unwrap();
+
+		let error = reset_locked_profile(&paths).unwrap_err();
+		assert!(
+			error.contains("already owned"),
+			"unexpected reset error: {error}"
+		);
+		assert_eq!(
+			fs::read(&paths.wendelon_config).unwrap(),
+			b"config-before-reset"
+		);
+		assert_eq!(
+			fs::read(paths.wendelon_data.join("state.bin")).unwrap(),
+			b"state-before-reset"
+		);
+
+		drop(data_owner);
+		drop(profile_lock);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn successful_reset_preserves_the_wendelon_lock_inode() {
+		let root = fresh_root("reset-preserves-wendelon-lock");
+		let paths = ProfilePaths::new(root.clone());
+		prepare_root_for_lock(&root).unwrap();
+		let profile_lock = open_lock(&paths.lock).unwrap();
+		profile_lock.lock_exclusive().unwrap();
+		ensure_profile(&paths).unwrap();
+		ensure_artifacts(&paths).unwrap();
+		fs::write(paths.wendelon_data.join("state.bin"), b"old-state").unwrap();
+		let owner = DataDirectoryOwner::acquire_existing(&paths.wendelon_data).unwrap();
+		let lock_inode = fs::metadata(paths.wendelon_data.join("LOCK"))
+			.unwrap()
+			.ino();
+		drop(owner);
+
+		reset_locked_profile(&paths).unwrap();
+
+		assert_eq!(
+			fs::metadata(paths.wendelon_data.join("LOCK"))
+				.unwrap()
+				.ino(),
+			lock_inode
+		);
+		assert!(!paths.wendelon_data.join("state.bin").exists());
+		assert!(!paths.wendelon_config.exists());
+		drop(profile_lock);
+		fs::remove_dir_all(root).unwrap();
 	}
 }

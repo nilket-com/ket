@@ -640,8 +640,7 @@ async fn explicit_join_is_idempotent_and_recovery_rejoins_cleanly() {
 	assert_eq!(node1.ring.current_epoch(), epoch_before);
 	wait_for_voters(&node1, &[1, 2]).await;
 
-	support::abort_node(&node2);
-	drop(node2);
+	node2.shutdown().await.unwrap();
 
 	let node2_restarted = WendelonNode::bootstrap_with_provider(
 		load_node_bootstrap_config(&node2_cfg_path).unwrap(),

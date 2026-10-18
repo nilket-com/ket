@@ -7,11 +7,11 @@ use crate::schema::{
 use crate::storage::RecordLocation;
 use crate::storage::lsm::{LsmRunSummary, SidecarCoverage, SlabState};
 use crate::storage::manager::TieredSlabPointer;
+use crate::storage::ownership::DataDirectoryOwner;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tokio::sync::Mutex;
 
 const RECORDS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("slab_records_v1");
@@ -209,7 +209,7 @@ pub(crate) struct PersistentIndexUpdate {
 }
 
 pub(crate) struct PersistentLocalIndex {
-	db: Arc<Database>,
+	db: crate::storage::owned_redb::OwnedRedb,
 	write_lock: Mutex<()>,
 	/// ADR 0097: false when this store previously held receipts and the table is
 	/// now gone - lost history, not empty history.
@@ -222,12 +222,24 @@ pub(crate) struct PersistentLocalIndex {
 
 impl PersistentLocalIndex {
 	pub(crate) async fn open(path: impl Into<PathBuf>) -> std::io::Result<Self> {
+		Self::open_with_owner(path, None).await
+	}
+
+	pub(crate) async fn open_with_owner(
+		path: impl Into<PathBuf>,
+		owner: Option<DataDirectoryOwner>,
+	) -> std::io::Result<Self> {
 		let path = path.into();
-		let db = spawn_blocking_io(move || Database::create(path).map_err(redb_to_io)).await?;
-		let db = Arc::new(db);
-		let init_db = db.clone();
-		let receipts_available = spawn_blocking_io(move || {
-			let write_txn = init_db.begin_write().map_err(redb_to_io)?;
+		if let Some(owner) = &owner {
+			owner.ensure_contains(&path)?;
+		}
+		// Create, initialize, wrap and bind under one open permit. A failed
+		// initialization or a refused bind drops the raw database inside this
+		// closure, while the permit still holds the owner open.
+		let bind_owner = owner.clone();
+		let (db, receipts_available) = spawn_blocking_owned_io(owner, move || {
+			let db = Database::create(path).map_err(redb_to_io)?;
+			let write_txn = db.begin_write().map_err(redb_to_io)?;
 			{
 				let _table = write_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
 			}
@@ -309,7 +321,11 @@ impl PersistentLocalIndex {
 				}
 			}
 			write_txn.commit().map_err(redb_to_io)?;
-			Ok(receipts_available)
+			let db = crate::storage::owned_redb::OwnedRedb::new(db, "storage index");
+			if let Some(owner) = bind_owner {
+				db.bind_owner(owner)?;
+			}
+			Ok((db, receipts_available))
 		})
 		.await?;
 		Ok(Self {
@@ -332,88 +348,91 @@ impl PersistentLocalIndex {
 	}
 
 	pub(crate) async fn load_snapshot(&self) -> std::io::Result<PersistentIndexSnapshot> {
-		let db = self.db.clone();
-		spawn_blocking_io(move || {
-			let read_txn = db.begin_read().map_err(redb_to_io)?;
-			let tiered_table = read_txn
-				.open_table(TIERED_SLABS_TABLE)
-				.map_err(redb_to_io)?;
-			let mut tiered_slabs = Vec::new();
-			let mut tiered_ids = HashSet::new();
-			for entry in tiered_table.iter().map_err(redb_to_io)? {
-				let (slab_id, value) = entry.map_err(redb_to_io)?;
-				let pointer = decode_tiered_pointer(SlabId::new(slab_id.value()), value.value())?;
-				tiered_ids.insert(pointer.slab_id);
-				tiered_slabs.push(pointer);
-			}
-
-			let records_table = read_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
-			let mut record_rows = Vec::new();
-			let mut tiered_records = Vec::new();
-			let mut locality_by_key: HashMap<(TenantId, Identity), (Locality, HybridTimestamp)> =
-				HashMap::new();
-			for entry in records_table.iter().map_err(redb_to_io)? {
-				let (key, value) = entry.map_err(redb_to_io)?;
-				let row = decode_record_row(key.value(), value.value())?;
-				record_rows.push(row);
-				locality_by_key
-					.entry((row.tenant_id, row.key_identity))
-					.and_modify(|(locality, hlc)| {
-						if row.location.hlc >= *hlc {
-							*locality = row.routing_locality;
-							*hlc = row.location.hlc;
-						}
-					})
-					.or_insert((row.routing_locality, row.location.hlc));
-				if tiered_ids.contains(&row.location.slab_id) {
-					tiered_records.push(row);
+		self.db
+			.run(move |db| {
+				let read_txn = db.begin_read().map_err(redb_to_io)?;
+				let tiered_table = read_txn
+					.open_table(TIERED_SLABS_TABLE)
+					.map_err(redb_to_io)?;
+				let mut tiered_slabs = Vec::new();
+				let mut tiered_ids = HashSet::new();
+				for entry in tiered_table.iter().map_err(redb_to_io)? {
+					let (slab_id, value) = entry.map_err(redb_to_io)?;
+					let pointer =
+						decode_tiered_pointer(SlabId::new(slab_id.value()), value.value())?;
+					tiered_ids.insert(pointer.slab_id);
+					tiered_slabs.push(pointer);
 				}
-			}
-			let mut record_localities = locality_by_key
-				.into_iter()
-				.map(|((tenant_id, key_identity), (locality, _))| {
-					(tenant_id, key_identity, locality)
-				})
-				.collect::<Vec<_>>();
-			record_localities
-				.sort_by_key(|(tenant_id, key_identity, _)| (tenant_id.get(), *key_identity));
-			let secondary_index_segments_table = read_txn
-				.open_table(SECONDARY_INDEX_SEGMENTS_TABLE)
-				.map_err(redb_to_io)?;
-			let mut secondary_index_segments = Vec::new();
-			for entry in secondary_index_segments_table.iter().map_err(redb_to_io)? {
-				let (key, value) = entry.map_err(redb_to_io)?;
-				secondary_index_segments.push(decode_secondary_index_segment_row(
-					key.value(),
-					value.value(),
-				)?);
-			}
-			let lsm_runs_table = read_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
-			let mut lsm_runs = Vec::new();
-			for entry in lsm_runs_table.iter().map_err(redb_to_io)? {
-				let (slab_id, value) = entry.map_err(redb_to_io)?;
-				lsm_runs.push(decode_lsm_run_summary(
-					SlabId::new(slab_id.value()),
-					value.value(),
-				)?);
-			}
-			let meta_table = read_txn.open_table(META_TABLE).map_err(redb_to_io)?;
-			let last_control_log_index = meta_table
-				.get(META_LAST_CONTROL_LOG_INDEX)
-				.map_err(redb_to_io)?
-				.map(|value| value.value());
 
-			Ok(PersistentIndexSnapshot {
-				record_rows,
-				tiered_slabs,
-				tiered_records,
-				record_localities,
-				secondary_index_segments,
-				lsm_runs,
-				last_control_log_index,
+				let records_table = read_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
+				let mut record_rows = Vec::new();
+				let mut tiered_records = Vec::new();
+				let mut locality_by_key: HashMap<
+					(TenantId, Identity),
+					(Locality, HybridTimestamp),
+				> = HashMap::new();
+				for entry in records_table.iter().map_err(redb_to_io)? {
+					let (key, value) = entry.map_err(redb_to_io)?;
+					let row = decode_record_row(key.value(), value.value())?;
+					record_rows.push(row);
+					locality_by_key
+						.entry((row.tenant_id, row.key_identity))
+						.and_modify(|(locality, hlc)| {
+							if row.location.hlc >= *hlc {
+								*locality = row.routing_locality;
+								*hlc = row.location.hlc;
+							}
+						})
+						.or_insert((row.routing_locality, row.location.hlc));
+					if tiered_ids.contains(&row.location.slab_id) {
+						tiered_records.push(row);
+					}
+				}
+				let mut record_localities = locality_by_key
+					.into_iter()
+					.map(|((tenant_id, key_identity), (locality, _))| {
+						(tenant_id, key_identity, locality)
+					})
+					.collect::<Vec<_>>();
+				record_localities
+					.sort_by_key(|(tenant_id, key_identity, _)| (tenant_id.get(), *key_identity));
+				let secondary_index_segments_table = read_txn
+					.open_table(SECONDARY_INDEX_SEGMENTS_TABLE)
+					.map_err(redb_to_io)?;
+				let mut secondary_index_segments = Vec::new();
+				for entry in secondary_index_segments_table.iter().map_err(redb_to_io)? {
+					let (key, value) = entry.map_err(redb_to_io)?;
+					secondary_index_segments.push(decode_secondary_index_segment_row(
+						key.value(),
+						value.value(),
+					)?);
+				}
+				let lsm_runs_table = read_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
+				let mut lsm_runs = Vec::new();
+				for entry in lsm_runs_table.iter().map_err(redb_to_io)? {
+					let (slab_id, value) = entry.map_err(redb_to_io)?;
+					lsm_runs.push(decode_lsm_run_summary(
+						SlabId::new(slab_id.value()),
+						value.value(),
+					)?);
+				}
+				let meta_table = read_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+				let last_control_log_index = meta_table
+					.get(META_LAST_CONTROL_LOG_INDEX)
+					.map_err(redb_to_io)?
+					.map(|value| value.value());
+
+				Ok(PersistentIndexSnapshot {
+					record_rows,
+					tiered_slabs,
+					tiered_records,
+					record_localities,
+					secondary_index_segments,
+					lsm_runs,
+					last_control_log_index,
+				})
 			})
-		})
-		.await
+			.await
 	}
 
 	pub(crate) async fn rebuild(
@@ -474,141 +493,141 @@ impl PersistentLocalIndex {
 		last_control_log_index: Option<u64>,
 	) -> std::io::Result<()> {
 		let _guard = self.write_lock.lock().await;
-		let db = self.db.clone();
-		spawn_blocking_io(move || {
-			let write_txn = db.begin_write().map_err(redb_to_io)?;
-			let _ = write_txn.delete_table(RECORDS_TABLE);
-			let _ = write_txn.delete_table(TIERED_SLABS_TABLE);
-			let _ = write_txn.delete_table(SECONDARY_INDEX_SEGMENTS_TABLE);
-			let _ = write_txn.delete_table(LSM_RUNS_TABLE);
-			{
-				let mut table = write_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
-				for row in rows {
-					let key = encode_record_key(row);
-					let value = encode_record_value(row);
-					table
-						.insert(key.as_slice(), value.as_slice())
+		self.db
+			.run(move |db| {
+				let write_txn = db.begin_write().map_err(redb_to_io)?;
+				let _ = write_txn.delete_table(RECORDS_TABLE);
+				let _ = write_txn.delete_table(TIERED_SLABS_TABLE);
+				let _ = write_txn.delete_table(SECONDARY_INDEX_SEGMENTS_TABLE);
+				let _ = write_txn.delete_table(LSM_RUNS_TABLE);
+				{
+					let mut table = write_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
+					for row in rows {
+						let key = encode_record_key(row);
+						let value = encode_record_value(row);
+						table
+							.insert(key.as_slice(), value.as_slice())
+							.map_err(redb_to_io)?;
+					}
+				}
+				{
+					let mut table = write_txn
+						.open_table(TIERED_SLABS_TABLE)
+						.map_err(redb_to_io)?;
+					for pointer in tiered_slabs {
+						let value = encode_tiered_pointer(&pointer);
+						table
+							.insert(&pointer.slab_id.get(), value.as_slice())
+							.map_err(redb_to_io)?;
+					}
+				}
+				{
+					let mut table = write_txn
+						.open_table(SECONDARY_INDEX_SEGMENTS_TABLE)
+						.map_err(redb_to_io)?;
+					for row in secondary_index_segments {
+						let key = encode_secondary_index_segment_key(row.key);
+						let value = encode_secondary_index_segment_value(&row);
+						table
+							.insert(key.as_slice(), value.as_slice())
+							.map_err(redb_to_io)?;
+					}
+				}
+				{
+					let mut table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
+					for run in lsm_runs {
+						let value = encode_lsm_run_summary(&run)?;
+						table
+							.insert(&run.slab_id.get(), value.as_slice())
+							.map_err(redb_to_io)?;
+					}
+				}
+				if let Some(index) = last_control_log_index {
+					let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+					meta.insert(META_LAST_CONTROL_LOG_INDEX, &index)
 						.map_err(redb_to_io)?;
 				}
-			}
-			{
-				let mut table = write_txn
-					.open_table(TIERED_SLABS_TABLE)
-					.map_err(redb_to_io)?;
-				for pointer in tiered_slabs {
-					let value = encode_tiered_pointer(&pointer);
-					table
-						.insert(&pointer.slab_id.get(), value.as_slice())
-						.map_err(redb_to_io)?;
-				}
-			}
-			{
-				let mut table = write_txn
-					.open_table(SECONDARY_INDEX_SEGMENTS_TABLE)
-					.map_err(redb_to_io)?;
-				for row in secondary_index_segments {
-					let key = encode_secondary_index_segment_key(row.key);
-					let value = encode_secondary_index_segment_value(&row);
-					table
-						.insert(key.as_slice(), value.as_slice())
-						.map_err(redb_to_io)?;
-				}
-			}
-			{
-				let mut table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
-				for run in lsm_runs {
-					let value = encode_lsm_run_summary(&run)?;
-					table
-						.insert(&run.slab_id.get(), value.as_slice())
-						.map_err(redb_to_io)?;
-				}
-			}
-			if let Some(index) = last_control_log_index {
-				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
-				meta.insert(META_LAST_CONTROL_LOG_INDEX, &index)
-					.map_err(redb_to_io)?;
-			}
-			write_txn.commit().map_err(redb_to_io)
-		})
-		.await
+				write_txn.commit().map_err(redb_to_io)
+			})
+			.await
 	}
 
 	pub(crate) async fn apply(&self, update: PersistentIndexUpdate) -> std::io::Result<()> {
 		let _guard = self.write_lock.lock().await;
-		let db = self.db.clone();
-		spawn_blocking_io(move || {
-			let write_txn = db.begin_write().map_err(redb_to_io)?;
-			{
-				let mut table = write_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
-				for row in update.delete_records {
-					let key = encode_record_key(row);
-					let _ = table.remove(key.as_slice()).map_err(redb_to_io)?;
+		self.db
+			.run(move |db| {
+				let write_txn = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = write_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
+					for row in update.delete_records {
+						let key = encode_record_key(row);
+						let _ = table.remove(key.as_slice()).map_err(redb_to_io)?;
+					}
+					for row in update.put_records {
+						let key = encode_record_key(row);
+						let value = encode_record_value(row);
+						table
+							.insert(key.as_slice(), value.as_slice())
+							.map_err(redb_to_io)?;
+					}
 				}
-				for row in update.put_records {
-					let key = encode_record_key(row);
-					let value = encode_record_value(row);
-					table
-						.insert(key.as_slice(), value.as_slice())
+				{
+					let mut table = write_txn
+						.open_table(TIERED_SLABS_TABLE)
 						.map_err(redb_to_io)?;
+					for slab_id in update.delete_tiered_slab_ids {
+						let _ = table.remove(&slab_id.get()).map_err(redb_to_io)?;
+					}
+					for pointer in update.put_tiered_slabs {
+						let value = encode_tiered_pointer(&pointer);
+						table
+							.insert(&pointer.slab_id.get(), value.as_slice())
+							.map_err(redb_to_io)?;
+					}
 				}
-			}
-			{
-				let mut table = write_txn
-					.open_table(TIERED_SLABS_TABLE)
-					.map_err(redb_to_io)?;
-				for slab_id in update.delete_tiered_slab_ids {
-					let _ = table.remove(&slab_id.get()).map_err(redb_to_io)?;
-				}
-				for pointer in update.put_tiered_slabs {
-					let value = encode_tiered_pointer(&pointer);
-					table
-						.insert(&pointer.slab_id.get(), value.as_slice())
+				{
+					let mut table = write_txn
+						.open_table(SECONDARY_INDEX_SEGMENTS_TABLE)
 						.map_err(redb_to_io)?;
+					for key in update.delete_secondary_index_segments {
+						let encoded = encode_secondary_index_segment_key(key);
+						let _ = table.remove(encoded.as_slice()).map_err(redb_to_io)?;
+					}
+					for row in update.put_secondary_index_segments {
+						let key = encode_secondary_index_segment_key(row.key);
+						let value = encode_secondary_index_segment_value(&row);
+						table
+							.insert(key.as_slice(), value.as_slice())
+							.map_err(redb_to_io)?;
+					}
 				}
-			}
-			{
-				let mut table = write_txn
-					.open_table(SECONDARY_INDEX_SEGMENTS_TABLE)
-					.map_err(redb_to_io)?;
-				for key in update.delete_secondary_index_segments {
-					let encoded = encode_secondary_index_segment_key(key);
-					let _ = table.remove(encoded.as_slice()).map_err(redb_to_io)?;
+				{
+					let mut table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
+					for slab_id in update.delete_lsm_run_ids {
+						let _ = table.remove(&slab_id.get()).map_err(redb_to_io)?;
+					}
+					for run in update.put_lsm_runs {
+						let value = encode_lsm_run_summary(&run)?;
+						table
+							.insert(&run.slab_id.get(), value.as_slice())
+							.map_err(redb_to_io)?;
+					}
 				}
-				for row in update.put_secondary_index_segments {
-					let key = encode_secondary_index_segment_key(row.key);
-					let value = encode_secondary_index_segment_value(&row);
-					table
-						.insert(key.as_slice(), value.as_slice())
-						.map_err(redb_to_io)?;
+				if let Some(index) = update.last_control_log_index {
+					let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+					let current = meta
+						.get(META_LAST_CONTROL_LOG_INDEX)
+						.map_err(redb_to_io)?
+						.map(|value| value.value())
+						.unwrap_or(0);
+					if index >= current {
+						meta.insert(META_LAST_CONTROL_LOG_INDEX, &index)
+							.map_err(redb_to_io)?;
+					}
 				}
-			}
-			{
-				let mut table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
-				for slab_id in update.delete_lsm_run_ids {
-					let _ = table.remove(&slab_id.get()).map_err(redb_to_io)?;
-				}
-				for run in update.put_lsm_runs {
-					let value = encode_lsm_run_summary(&run)?;
-					table
-						.insert(&run.slab_id.get(), value.as_slice())
-						.map_err(redb_to_io)?;
-				}
-			}
-			if let Some(index) = update.last_control_log_index {
-				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
-				let current = meta
-					.get(META_LAST_CONTROL_LOG_INDEX)
-					.map_err(redb_to_io)?
-					.map(|value| value.value())
-					.unwrap_or(0);
-				if index >= current {
-					meta.insert(META_LAST_CONTROL_LOG_INDEX, &index)
-						.map_err(redb_to_io)?;
-				}
-			}
-			write_txn.commit().map_err(redb_to_io)
-		})
-		.await
+				write_txn.commit().map_err(redb_to_io)
+			})
+			.await
 	}
 
 	/// ADR 0097: every receipt in the table, as raw key/value bytes.
@@ -629,52 +648,52 @@ impl PersistentLocalIndex {
 		&self,
 		bounds: ReceiptLoadBounds,
 	) -> std::io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-		let db = self.db.clone();
-		spawn_blocking_io(move || {
-			let read_txn = db.begin_read().map_err(redb_to_io)?;
-			let table = read_txn
-				.open_table(MAINTENANCE_RECEIPTS_TABLE)
-				.map_err(redb_to_io)?;
-			let mut out = Vec::new();
-			let mut total_bytes = 0usize;
-			for entry in table.iter().map_err(redb_to_io)? {
-				let (key, value) = entry.map_err(redb_to_io)?;
-				let (key, value) = (key.value(), value.value());
-				if out.len() >= bounds.max_rows {
-					return Err(receipt_load_exceeded(format!(
-						"more than {} maintenance receipts",
-						bounds.max_rows
-					)));
+		self.db
+			.run(move |db| {
+				let read_txn = db.begin_read().map_err(redb_to_io)?;
+				let table = read_txn
+					.open_table(MAINTENANCE_RECEIPTS_TABLE)
+					.map_err(redb_to_io)?;
+				let mut out = Vec::new();
+				let mut total_bytes = 0usize;
+				for entry in table.iter().map_err(redb_to_io)? {
+					let (key, value) = entry.map_err(redb_to_io)?;
+					let (key, value) = (key.value(), value.value());
+					if out.len() >= bounds.max_rows {
+						return Err(receipt_load_exceeded(format!(
+							"more than {} maintenance receipts",
+							bounds.max_rows
+						)));
+					}
+					if key.len() > bounds.max_key_bytes {
+						return Err(receipt_load_exceeded(format!(
+							"a maintenance receipt key of {} bytes exceeds {}",
+							key.len(),
+							bounds.max_key_bytes
+						)));
+					}
+					if value.len() > bounds.max_value_bytes {
+						return Err(receipt_load_exceeded(format!(
+							"a maintenance receipt value of {} bytes exceeds {}",
+							value.len(),
+							bounds.max_value_bytes
+						)));
+					}
+					total_bytes = total_bytes
+						.checked_add(key.len())
+						.and_then(|total| total.checked_add(value.len()))
+						.filter(|total| *total <= bounds.max_total_bytes)
+						.ok_or_else(|| {
+							receipt_load_exceeded(format!(
+								"maintenance receipts exceed {} bytes in total",
+								bounds.max_total_bytes
+							))
+						})?;
+					out.push((key.to_vec(), value.to_vec()));
 				}
-				if key.len() > bounds.max_key_bytes {
-					return Err(receipt_load_exceeded(format!(
-						"a maintenance receipt key of {} bytes exceeds {}",
-						key.len(),
-						bounds.max_key_bytes
-					)));
-				}
-				if value.len() > bounds.max_value_bytes {
-					return Err(receipt_load_exceeded(format!(
-						"a maintenance receipt value of {} bytes exceeds {}",
-						value.len(),
-						bounds.max_value_bytes
-					)));
-				}
-				total_bytes = total_bytes
-					.checked_add(key.len())
-					.and_then(|total| total.checked_add(value.len()))
-					.filter(|total| *total <= bounds.max_total_bytes)
-					.ok_or_else(|| {
-						receipt_load_exceeded(format!(
-							"maintenance receipts exceed {} bytes in total",
-							bounds.max_total_bytes
-						))
-					})?;
-				out.push((key.to_vec(), value.to_vec()));
-			}
-			Ok(out)
-		})
-		.await
+				Ok(out)
+			})
+			.await
 	}
 
 	/// Durably record one receipt. The caller commits this BEFORE exposing the
@@ -695,21 +714,21 @@ impl PersistentLocalIndex {
 		{
 			return Err(Error::other("injected receipt store failure"));
 		}
-		let db = self.db.clone();
-		spawn_blocking_io(move || {
-			let write_txn = db.begin_write().map_err(redb_to_io)?;
-			{
-				let mut table = write_txn
-					.open_table(MAINTENANCE_RECEIPTS_TABLE)
-					.map_err(redb_to_io)?;
-				table
-					.insert(key.as_slice(), value.as_slice())
-					.map_err(redb_to_io)?;
-			}
-			write_txn.commit().map_err(redb_to_io)?;
-			Ok(())
-		})
-		.await
+		self.db
+			.run(move |db| {
+				let write_txn = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = write_txn
+						.open_table(MAINTENANCE_RECEIPTS_TABLE)
+						.map_err(redb_to_io)?;
+					table
+						.insert(key.as_slice(), value.as_slice())
+						.map_err(redb_to_io)?;
+				}
+				write_txn.commit().map_err(redb_to_io)?;
+				Ok(())
+			})
+			.await
 	}
 
 	/// Remove receipts. Used by success (every origin for one slab set) and by the
@@ -730,21 +749,21 @@ impl PersistentLocalIndex {
 		{
 			return Err(Error::other("injected receipt store failure"));
 		}
-		let db = self.db.clone();
-		spawn_blocking_io(move || {
-			let write_txn = db.begin_write().map_err(redb_to_io)?;
-			{
-				let mut table = write_txn
-					.open_table(MAINTENANCE_RECEIPTS_TABLE)
-					.map_err(redb_to_io)?;
-				for key in &keys {
-					table.remove(key.as_slice()).map_err(redb_to_io)?;
+		self.db
+			.run(move |db| {
+				let write_txn = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = write_txn
+						.open_table(MAINTENANCE_RECEIPTS_TABLE)
+						.map_err(redb_to_io)?;
+					for key in &keys {
+						table.remove(key.as_slice()).map_err(redb_to_io)?;
+					}
 				}
-			}
-			write_txn.commit().map_err(redb_to_io)?;
-			Ok(())
-		})
-		.await
+				write_txn.commit().map_err(redb_to_io)?;
+				Ok(())
+			})
+			.await
 	}
 
 	pub(crate) async fn upsert_record(&self, row: PersistentRecordRow) -> std::io::Result<()> {
@@ -808,6 +827,25 @@ where
 	})
 	.await
 	.map_err(|err| Error::other(format!("blocking redb task failed: {err}")))?
+}
+
+async fn spawn_blocking_owned_io<T>(
+	owner: Option<DataDirectoryOwner>,
+	f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T>
+where
+	T: Send + 'static,
+{
+	let permit = owner
+		.as_ref()
+		.map(DataDirectoryOwner::write_permit)
+		.transpose()?;
+	spawn_blocking_io(move || {
+		let _owner = owner;
+		let _permit = permit;
+		f()
+	})
+	.await
 }
 
 fn redb_to_io(err: impl std::fmt::Display) -> std::io::Error {

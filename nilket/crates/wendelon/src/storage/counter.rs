@@ -1620,13 +1620,27 @@ struct AppliedCounterAdd {
 /// state — it never routes through the generic `TenantFinalization` path.)
 pub struct DurableCounterWitnessStore {
 	dir: PathBuf,
+	owner: Option<crate::storage::ownership::DataDirectoryOwner>,
 }
 
 impl DurableCounterWitnessStore {
 	pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
 		let dir = dir.into();
 		std::fs::create_dir_all(&dir)?;
-		Ok(Self { dir })
+		Ok(Self { dir, owner: None })
+	}
+
+	pub(crate) fn open_with_owner(
+		dir: PathBuf,
+		owner: crate::storage::ownership::DataDirectoryOwner,
+	) -> std::io::Result<Self> {
+		owner.ensure_contains(&dir)?;
+		let _permit = owner.write_permit()?;
+		std::fs::create_dir_all(&dir)?;
+		Ok(Self {
+			dir,
+			owner: Some(owner),
+		})
 	}
 
 	fn path_for(&self, op_id: u64) -> PathBuf {
@@ -1637,6 +1651,11 @@ impl DurableCounterWitnessStore {
 		self.dir.join(format!("counter-witness-{op_id:016x}.pw2"))
 	}
 	fn write(&self, witness: &StoredWitness) -> std::io::Result<()> {
+		let _permit = self
+			.owner
+			.as_ref()
+			.map(|owner| owner.write_permit())
+			.transpose()?;
 		let (path, other, bytes) = match witness.origin {
 			Some(_) => (
 				self.origin_path_for(witness.op_id),
@@ -1660,6 +1679,11 @@ impl DurableCounterWitnessStore {
 	}
 
 	fn remove(&self, op_id: u64) -> std::io::Result<()> {
+		let _permit = self
+			.owner
+			.as_ref()
+			.map(|owner| owner.write_permit())
+			.transpose()?;
 		let old = self.path_for(op_id);
 		let new = self.origin_path_for(op_id);
 		if old.try_exists()? && new.try_exists()? {
@@ -1721,6 +1745,11 @@ impl DurableCounterWitnessStore {
 	/// compacted — TTL-based pruning (the wire's `idempotency_ttl_ms`) is an
 	/// explicit follow-on.
 	fn append_applied(&self, applied: &AppliedCounterAdd) -> std::io::Result<()> {
+		let _permit = self
+			.owner
+			.as_ref()
+			.map(|owner| owner.write_permit())
+			.transpose()?;
 		let bytes = postcard::to_allocvec(applied)
 			.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 		use std::io::Write as _;

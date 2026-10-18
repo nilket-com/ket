@@ -9123,6 +9123,9 @@ fn adr077_data_server_source_concatenates_submodules() {
 			"mutation_protocol.rs",
 			// ADR 629 keeps ownership registration and its test barriers out of the root.
 			"observation.rs",
+			// Data-directory ownership plumbing (store binding to the node's owner
+			// and the server's owner-admitted direct writes) stays out of the root.
+			"ownership.rs",
 			// ADR 541's two clocks and its bounded encode quanta: self-contained
 			// mechanisms with their own invariants, carved so the bounded root
 			// keeps ratcheting down rather than absorbing each new one.
@@ -10045,7 +10048,11 @@ fn adr0093_test_support_is_non_default_and_every_hook_site_is_gated() {
 		);
 	}
 	assert_eq!(node.matches("pub slab_file_ops:").count(), 1);
-	assert_eq!(node.matches("SlabManager::open_with_file_ops(").count(), 1);
+	assert_eq!(
+		node.matches("SlabManager::open_with_file_ops_and_owner(")
+			.count(),
+		1
+	);
 	let manager = read_workspace("crates/wendelon/src/storage/manager.rs");
 	assert!(
 		manager.contains("#[cfg(feature = \"test-support\")]\n\tpub async fn open_with_file_ops(")
