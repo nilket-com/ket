@@ -81,7 +81,10 @@ channel closed before the tenant admission reservation dropped (`e9a92b06`).
    ```bash
    cargo nextest run -p <crate> -E 'not binary(<target>)'
    cargo nextest run -p <crate> --test <target> -E 'test(<name>)' --stress-count 30
+   cargo test -p <crate> --lib -- --test-threads=<N>   # in-process; repeat it, and pass N explicitly
    ```
+
+   nextest exercises cross-process contention; repeated in-process `cargo test` runs exercise shared state inside one process. A stress campaign needs both. Pass `--test-threads` explicitly, because cargo-cgroup sets RUST_TEST_THREADS=1.
 
 3. **Do not widen serialization to turn a suite green.** Add a nextest
    test-group or a `controlled-tests.txt` entry only when the test genuinely
