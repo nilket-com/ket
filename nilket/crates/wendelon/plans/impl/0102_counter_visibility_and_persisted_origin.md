@@ -64,3 +64,40 @@ The regression tests will reuse the retained reproduction fixture but assert the
 Test coverage includes: ordinary-only rewrite unchanged; V2 class and payload preservation; successful bounded same-slab offset remap; remap-disabled negative; cross-slab pairing by full identity; same-slab offset conflict; orphan marker refusal with byte preservation; orphan tentative skip; duplicate-marker idempotence; legacy and malformed-frame refusal with byte preservation; counter-only/all-ordinary-elided replacement publication and accounting; live eligible view and full reopened committed/value-bound map; and F-CTR-7 LSM refusal before any output, with bounded ordinary-L0 progress, tiered ordinary compaction, and restart clearing of abandoned volatile pending state. Source validation must prove no rewrite occurs after an admission failure and no selected rewrite loses class or recovery evidence.
 
 **Gate order:** this docs-only plan commit → Wendelon architecture and mutation-visibility architecture checks → fast-forward → focused test-first source package/review → source gates → changed-area DEV → reviewed full ladder → independent external audit → FINAL and separate joint fast-forward. Keep the F-CTR-7 multi-source guard regression in the source package; do not expand 5a into multi-source preservation.
+
+## F-CTR-8 plan — crash-safe counter dedup finalization
+
+**Status:** plan only; this amendment authorizes no implementation source or test changes.
+**Plan base:** current published ADR 0102 status after F-CTR-5a/F-CTR-7 (`b7280e6a`).
+**Accepted contract:** `/home/me/work/.agent-bridge/wendelon-adr0102-f-ctr-8-contract-r1/CONTRACT.md` (r1 with Algebra/ownership and participant-durability precondition).
+**Read-only census:** `/home/me/work/reviews/adr0102-f-ctr-8-census-r1/CENSUS.md`.
+
+### Finding and identity scope
+
+The current counter witness and applied-log paths use ordinary writes/rename/append and unlink without the file and directory durability barriers needed for power-loss recovery. A crash can lose an applied append while preserving witness removal, leaving a retry without the original outcome. The census records the exact source paths and confirms the applied log is append-only with no TTL/pruning policy; F-CTR-5b remains separate.
+
+`CounterWriteKey` is the canonical 24-byte `ClientWriteId` identity `(client_uuid, sequence_no)`; it excludes TTL and padding. The effective durable identity is `(node-owned leader store, tenant_id, CounterWriteKey)`: production creates a leader per tenant and stores both witnesses and `counter-applied.log` in that tenant's directory under the local slab data directory. The applied frame currently contains only `op_id`, write key, and outcome, so the store directory must remain private to one local origin and must not be shared or reassigned across origins. A future shared-store or cross-origin migration must add origin to the durable namespace before proceeding. B1d's replica identity `(tenant, origin_node, op_id)` remains a separate scope. The per-tenant witness directory and applied log are the sole dedup authority; in-memory maps are recovered views.
+
+The local and remote participant paths currently await a durable commit-marker barrier before acknowledging commit, and the leader appends its applied record only after participant commits return. This is a contract precondition, not a protocol change. If evidence shows an acknowledgement can precede durability, stop and report the gap separately as F-CTR-9; do not expand F-CTR-8 silently.
+
+### Selected durability behavior
+
+For every add that may commit a participant, maintain at least one valid durable representation of its exact `{op_id, write_key, previous, current}` outcome: a pending witness or an applied record.
+
+1. **Durable prepare before commit fan-out.** Write a complete witness to a temporary file; sync the file; atomically rename it to the final path; sync the containing directory. If any prepare barrier fails, send no participant commit. Newly created witness-directory names must be durable before use. Use the same replace protocol for witness progress updates.
+2. **Durable applied record before witness removal.** After all accepted participants have durable markers, serialize append operations so length-prefixed frames cannot interleave. Append one complete applied outcome, sync log data, and sync the containing directory if the log was newly created. Do not remove the witness unless every required barrier succeeds. A failed append/sync keeps the witness available for retry/recovery.
+3. **Durable witness removal.** Unlink resolved witness paths only after the applied record is durable, then sync the containing directory. Do not report durable resolution until the directory sync succeeds. If cleanup fails, retain/reconstruct unresolved in-memory state; the applied record remains the dedup authority. Recovery from both records is idempotent, while conflicting identities or outcomes fail closed.
+
+The counter-specific injectable file-ops seam covers temporary and append writes, file syncs, rename, unlink, directory sync, reads, and enumeration. Tests use a deterministic persistence model with volatile bytes/names separated from durable bytes/directory entries. Its crash operation discards unsynced bytes and restores names from the last directory sync. It must reproduce the old lost-applied/persisted-unlink image as a negative control and show that the selected barriers make this image unreachable after a participant commit. This is a logical crash model, not a physical power-cut claim.
+
+### Required tests and performance evidence
+
+Tests must use the real `CounterLeader` path, real recovery, and a retry with the same write key. Cover: prepare failure/cuts after temp write, file sync, rename, and directory sync; commit-to-applied cuts after every participant marker, append bytes, `sync_data`, and newly-created-log directory sync; applied-to-unlink cuts before unlink, after unlink/before directory sync, and after directory sync; idempotent re-resolution and op-id high-water across restarts; file/directory sync failures; conflicting duplicate refusal; concurrent non-interleaved appends for distinct keys; and existing duplicate replay, partial-commit recovery, and fresh-op HLC ordering. A torn final frame may be tolerated only while a durable witness remains. Do not use process-crash-only testing as a substitute for the persistence model.
+
+Measure end-to-end resolved adds/second and per-add latency before and after using the same release build, machine/filesystem, participant/quorum shape, unique-key workload, operation count, and warm/cold conditions. Repeat runs and report medians and sync counts. The measurement must exercise the real file barriers and cannot replace correctness tests. No threshold has been chosen; review the measured impact before accepting performance. Group commit is not required for r1 correctness and is excluded from the initial implementation. Propose it separately if measurements warrant it, preserving all represented witnesses until a batch sync succeeds.
+
+### Scope and gates
+
+F-CTR-8 does not authorize applied-log pruning/TTL, compaction, wire-format changes, runtime enablement, or group commit. The current indefinite-retention policy remains until F-CTR-5b selects a retention guarantee and crash-safe pruning design.
+
+**Gate order:** F-CTR-8 plan commit → read-only census delta → unsigned source and pre-seal/guard checks → source review → sign and SOURCE clearance → focused crash-cut tests → changed-area DEV → reviewed full ladder → independent external audit → FINAL → separate joint fast-forward. This plan commit precedes the C-S6 compromise-audit/runbooks plan commit.
