@@ -5,6 +5,8 @@
 # excludes these library tests from the general test process.
 # Add a test only when parallel resource contention can violate one of its
 # timing/projection assertions; ordinary slow tests belong in the general lane.
+# Never add a test here to hide a parallel-only failure; that is a defect
+# candidate (see "Test concurrency" in ci/README.md).
 
 engine::runtime::system::tests::split_view_resolves_the_shared_buffers_language_theme
 engine::runtime::system::tests::write_file_as_redetects_language_and_re_resolves_theme
