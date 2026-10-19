@@ -118,9 +118,13 @@ identity; L4 explicit coverage; L5 no currentness claim.
     Claims come from the proof form: `VISROL03` explicit; `VISADG01`
     governance epoch 0; legacy admin forms admin epoch 0; `VISADS03`
     explicit admin epoch. `crypto_valid` is checked against the history's
-    key for `(claimed_role, claimed_epoch)` with `auth/signature.rs` and
-    `auth/preimage.rs`; an epoch absent from the history is
-    `crypto_valid = false`, `reason: unknown_epoch`. `active_at_entry` is
+    key for `(claimed_role, claimed_epoch)`, using each form's production
+    preimage function and `role_command::slot_signed`; `auth/signature.rs`
+    and `auth/preimage.rs` cover only admission and holder signatures.
+    `crypto_valid` also requires the proof to bind this root and this
+    entry (context digest and command digest), so a genuine signature
+    replayed onto another entry is `binding_mismatch`, never suspect use;
+    an epoch absent from the history is `crypto_valid = false`, `reason: unknown_epoch`. `active_at_entry` is
     true when the claimed epoch is active in the pre-entry state. No
     sidecar, an unparseable sidecar or a form naming no role gives one
     `{unattributable: reason}` record. Neither `effect` nor
@@ -133,9 +137,13 @@ identity; L4 explicit coverage; L5 no currentness claim.
     `{identity, after_superseded, after_retired, in_freeze_interval}`.
     After supersession or retirement with a non-denial effect, the row
     gets `finding: true` (ADR 0101 says it is impossible).
+- Signature records also carry `form`, `slot` and `reason`. Every row
+  carries `positions` and `finding`, which are empty or false when the row
+  is not suspect use.
 - **Final record:** `{kind:"coverage", snapshot_boundary, first_examined,
-  last_examined, stop_position, uncommitted_past_stop,
-  torn_tail_past_stop, containment, status}`. `status` names the same
+  last_examined, stop_position, stop_scope, uncommitted_past_stop,
+  torn_tail_past_stop, containment, status}`. `stop_scope` states that
+  the stop is local and not quorum-current (L5). `status` names the same
   outcome as the exit code. If the install entry or any entry between it
   and the stop is absent, the result is partial; a snapshot does not
   restore deleted signer evidence, and an unread range is never reported
@@ -152,7 +160,12 @@ independently of first use:
   retired.
 - `freeze_intervals`: `[freeze_log_id, unfreeze_log_id or null]` pairs
   over the examined range; shared and repeated per object. Freeze is
-  partial and reversible, so it is intervals, never one boundary.
+  partial and reversible, so it is intervals, never one boundary. An
+  interval covers (Freeze, Unfreeze]: the entries after the Freeze through
+  the Unfreeze entry, whose pre-entry state is still frozen.
+- `activated_at`: LogId at which that epoch became active (`null` if the
+  epoch never existed), so a nonexistent epoch is not mistaken for "never
+  superseded".
 
 ### Exit codes
 
@@ -161,13 +174,16 @@ Typed; text is never status.
 | Code | Meaning |
 |---|---|
 | 0 | complete coverage, audit done (any number of rows) |
-| 1 | invalid history or binding: checksum, gap or malformed record in range; install or manifest mismatch |
+| 1 | invalid history or binding: checksum, gap or malformed record in range; install or manifest mismatch; or a Root2 entry the production verifier refuses |
 | 2 | I/O, usage or trust-input error (same as `audit verify`) |
-| 3 | partial coverage (audit done over the available range only) |
+| 3 | partial coverage: the coverage record only, with no rows, because there is no pre-entry state without genesis and the install entry. A log with no local committed position is also partial. |
 | 4 | unresolved or ambiguous suspect (`--key` absent from the root or resolving to more than one identity) |
 
-With 1, 2 or 4 a diagnostic goes to stderr; rows already written stay on
-stdout, and no `complete` coverage record is printed.
+With 1, 2 or 4 a diagnostic goes to stderr and nothing is printed on
+stdout. Rows are rendered only after the whole fold, because the position
+flags depend on the full history. A Root2 entry that the production
+verifier refuses outright stops the fold with exit 1, and the diagnostic
+names its LogId.
 
 ### Acceptance
 
