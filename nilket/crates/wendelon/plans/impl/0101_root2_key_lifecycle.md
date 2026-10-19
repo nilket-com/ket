@@ -320,3 +320,45 @@ Non-goal: detecting a bind mount of a data-dir subdirectory.
 - `docs: root2 context export runbook`.
 
 Gate order: independent source review → ladder → log audit → FF, after C-S6 has landed.
+
+## Key custody slice 3 plan: operator proof facade
+
+### Status
+
+Plan only. This section authorizes no source changes.
+- Contract: key custody r4 (`/home/me/work/.agent-bridge/wendelon-adr0101-key-custody-contract-r4/CONTRACT.md`), §2 K7 and §3 item 2.
+- Context reader: C-S6b r2 §5.
+- Slices 1 (C-S6) and 2 (C-S6b) are on main.
+
+### Behavior
+
+This slice is library only. It adds no binary and no signing.
+- **One shared verifier core.** `role_command::verify_for`'s slot loop becomes `verify_core(context_digest, active, …)`, and `verify_for` becomes a wrapper over it. The production verifier still calls `verify_strict` exactly once, through `slot_signed`.
+- **One role view.** The four checkers (`verify_core`, `check_epoch_statement3`, `check_admin_statement2` and `check_governance_command2`) read a `RoleView3 { context, profile, admin_key, namespace, governance: Option<GovernanceRole2>, active: Option<[(u64, Digest2); 3]> }`. Each checker's body is unchanged apart from how it reads these fields: the profile gate, verification under the manifest `admin_key` for VISADS02, and the epoch-0 refusals stay as they are today.
+  - Production obtains it from `InstalledAdmin2::view()`, which copies those fields one-for-one.
+  - The offline facade obtains it from `RoleView3::offline(context, manifest, verified_history)`.
+  - A `RoleView3` cannot produce a `VerifiedCommand2`, and `verification.rs` obtains views only through `install_admin2`.
+- **One role requirement.** `role_requirement(command, slot0_role)` is extracted from `verification.rs`, and both the verifier and the facade use it.
+- **The facade, `root2/operator_proof.rs`.** It is the only new public module, and its signatures use byte arrays only. It provides:
+  - unsigned layouts and preimages for every form (VISROL03 by slot and form, VISADS03, VISADS02, VISADG01);
+  - signature splicing;
+  - `self_check` through the production checkers. For the governance family, `self_check` with a VISROL03 [2,0] sidecar includes the governance action-bit check (`R/governance_verification.rs:83-84`), exactly as `verify_governance2` applies it;
+  - production VISROL03 and VISADS03 encoders, which replace the duplicated test helpers;
+  - the production context-export reader `verify_context_export(bytes, trusted_manifest)`. It runs C-S6b r2 §5 steps 1-4 in order: parse, digest, version, coverage and caps; manifest byte-equality and pin; the full replay (each sub-check listed there); and the return of the history, active epochs, `context_authenticated` (`count ≥ 1`) and the `AuditDerived` fields. `RoleView3::offline` is built only from this reader's `VerifiedContext`, never from caller-supplied history;
+  - validation of a two-host VISROL03 merge. It refuses unless both inputs are byte-equal outside 86..150 and 160..224, each fills exactly one slot, and each slot verifies via `slot_signed` under the history key for its claimed (role, epoch). It then runs `self_check`. A second-slot signer's layout is rebuilt from (command, context) and compared with the partial.
+- **No signing code.** No non-test Root2 module, including the facade, contains signing code.
+
+### Acceptance
+
+- **T-VIEW:** every profile 1/2/3 vector gives identical results through `InstalledAdmin2` and `view()`. Control: altering `profile`, `admin_key`, `active[0]`, `namespace` and `governance` in turn each changes at least one result.
+- **T-K7:** the full cell matrix in contract §5, single and two-slot (merged) VISROL03, the governance family with both sidecars, VISADS02, VISADS03, plus the refused cells. Each accepted cell passes `self_check`, the production verifier and the reducer. Controls: a flipped preimage byte, the wrong role alternative, and an altered command digest are each refused. The action-bit check is exercised on a test-only `RoleView3` whose governance mask lacks the action's bit (built under `cfg(test)` only, never through the public facade), and `self_check` refuses. An architecture pin asserts that the facade's governance VISROL03 path calls the same action-bit predicate as `verify_governance2`.
+- **Merge:** refusals for mismatched commands or contexts, a slot overwritten, an invalid first slot, and a layout differing from the rebuilt one.
+- **Context reader:** the C-S6b T-X2 refusals, now through the production reader. `count = 0` verifies with `context_authenticated = false`.
+- **Architecture pins:** the auth, admin_statement and role-visibility pins, plus the signing-token bans, are amended equally strict. New pins: root2's public surface is exactly the existing re-exports plus `operator_proof`; views come only through `install_admin2`; a view can never become a `VerifiedCommand2`. Every new pin is probed.
+
+### Commits and gate order
+
+- `plan: adr 0101 key custody operator proof facade` (this section). The arch and MV checks pass before FF.
+- `impl: adr 0101 key custody operator proof facade`.
+
+Gate order: independent source review → ladder → log audit → FF.
