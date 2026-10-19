@@ -8552,31 +8552,34 @@ fn adr075_counter_add_has_per_key_read_modify_write_serialization() {
 	let fetch_add = source_region(
 		&counter,
 		"pub async fn fetch_add(",
-		"self.idempotency.insert(write_key, outcome);",
+		"/// Admit one request under `write_key`, waiting while another holds it.",
 	);
 	assert!(fetch_add.contains("self.locks.entry(key.clone()).or_default().clone()"));
-	assert!(fetch_add.contains("let _guard = lock.lock().await;"));
+	// The guard is owned by the add's own task (K5): a caller dropped mid-add
+	// cannot release the fan-out's critical section.
+	assert!(fetch_add.contains("let _key_guard = lock.lock_owned().await;"));
+	assert!(fetch_add.contains("tokio::spawn(body)"));
 	// The base read and the overflow-checked add both happen under the guard.
 	let serialized = |body: &str| {
 		let markers = [
-			"let _guard = lock.lock().await;",
+			"let _key_guard = lock.lock_owned().await;",
 			"read_identity(counter_identity(key))",
 			"checked_add(delta)",
 			".replicate_tentative(op_id, key, current, commit_hlc)",
 		];
 		let positions: Option<Vec<_>> = markers.iter().map(|marker| body.find(marker)).collect();
 		positions.is_some_and(|p| p.windows(2).all(|pair| pair[0] < pair[1]))
-			&& !body.contains("drop(_guard)")
+			&& !body.contains("drop(_key_guard)")
 	};
 	assert!(serialized(&fetch_add));
 	for invalid in [
-		fetch_add.replace("let _guard = lock.lock().await;", ""),
+		fetch_add.replace("let _key_guard = lock.lock_owned().await;", ""),
 		format!("read_identity(counter_identity(key));{fetch_add}"),
 		fetch_add.replace(
 			"read_identity(counter_identity(key))",
 			"read_committed(key)",
 		),
-		fetch_add.replace("checked_add(delta)", "checked_add(delta); drop(_guard)"),
+		fetch_add.replace("checked_add(delta)", "checked_add(delta); drop(_key_guard)"),
 	] {
 		assert!(!serialized(&invalid), "serialization violation accepted");
 	}
@@ -8593,10 +8596,19 @@ fn adr075_counter_add_reuses_client_write_id_idempotency() {
 	// is durable with the witness/applied log (replay survives restart).
 	let handler = adr075_counter_handler_region(&server);
 	assert!(handler.contains("meta.write_id.canonical_idempotency_bytes()"));
-	assert!(handler.contains("leader.fetch_add(plan, write_key, &key, meta.delta)"));
-	assert!(counter.contains("idempotency: DashMap<CounterWriteKey, CounterAddOutcome>"));
+	assert!(handler.contains(".fetch_add_fenced(plan, write_key, &key, meta.delta, fence)"));
+	assert!(counter.contains("idempotency: DashMap<CounterWriteKey, RecordedAdd>"));
 	// Never a hashed/narrowed handle — collisions would break exactly-once.
 	assert!(counter.contains("pub type CounterWriteKey = [u8; 24];"));
+	// The record names the add by its full counter key and delta (K1/K2), and
+	// one add per write key is admitted by the exact 24 bytes (K3).
+	let write_key = read_workspace("crates/wendelon/src/storage/counter/write_key.rs");
+	let recorded = source_region(&write_key, "pub(super) struct RecordedAdd {", "}");
+	assert!(recorded.contains("key: Option<CounterKey>,"));
+	assert!(recorded.contains("delta: NonZeroU64,"));
+	assert!(write_key.contains("Some(recorded) if recorded == key && self.delta.get() == delta"));
+	assert!(!write_key.contains("counter_identity"));
+	assert!(counter.contains("write_gates: DashMap<CounterWriteKey, Arc<Mutex<()>>>"));
 	// The durable witness carries the dedup identity, and a resolved witness is
 	// compacted into the applied log BEFORE pruning (no dedup window).
 	assert!(counter.contains("write_key: CounterWriteKey,"));
@@ -8604,17 +8616,70 @@ fn adr075_counter_add_reuses_client_write_id_idempotency() {
 	assert!(counter.contains("fn recover_applied"));
 }
 
+/// The install point (K3/K5): inside the add's own task, the write-key record
+/// is looked up before the zero-delta check and the counter-key lock, and the
+/// add's record is installed exactly once, after its witness is durable and
+/// before its value is published and its commits are driven.
+#[test]
+fn counter_add_installs_its_record_between_the_durable_witness_and_publish() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	let body = source_region(
+		&counter,
+		"async fn admitted_add(",
+		"impl<P: CounterParticipant + Clone> CounterLeader<P> {",
+	);
+	const INSTALL: &str = "self.idempotency.insert(";
+	const WITNESS: &str = "self.witness_store.write(&witness).await";
+	let ordered = |body: &str| {
+		let markers = [
+			"self.recorded_answer(&write_key, key, delta)?",
+			"NonZeroU64::new(delta)",
+			"lock.lock_owned().await",
+			"checked_add(delta)",
+			WITNESS,
+			INSTALL,
+			".publish()",
+			"self.drive_commits(",
+		];
+		let positions: Option<Vec<_>> = markers.iter().map(|marker| body.find(marker)).collect();
+		positions.is_some_and(|p| p.windows(2).all(|pair| pair[0] < pair[1]))
+			&& body.matches(INSTALL).count() == 1
+	};
+	assert!(ordered(body), "install point out of order");
+	// Outside `recover`, which rebuilds the map through `leader.idempotency`, the
+	// add's install is the only insertion into the record map.
+	assert_eq!(counter.matches(INSTALL).count(), 1);
+	let recover = source_region(&counter, "pub fn recover(", "fn commit_hlc_for(");
+	assert!(recover.contains("leader.idempotency.insert(record.write_key, recorded);"));
+	assert!(recover.contains("leader.idempotency.insert(witness.write_key, recorded);"));
+
+	// Mutation self-tests: the install moved ahead of the witness write, and the
+	// install deleted, must both be refused.
+	let start = body.find(INSTALL).expect("install");
+	let end = start + body[start..].find(");\n").expect("install end") + 3;
+	let install = &body[start..end];
+	let deleted = body.replacen(install, "", 1);
+	let witness = body.find(WITNESS).expect("witness write");
+	let statement = body[..witness].rfind("if ").expect("witness statement");
+	let mut swapped = deleted.clone();
+	swapped.insert_str(statement, install);
+	for (what, invalid) in [("deleted", deleted), ("swapped", swapped)] {
+		assert!(!ordered(&invalid), "{what} install accepted");
+	}
+}
+
 #[test]
 fn adr075_duplicate_counter_add_replays_without_mutating() {
 	let server = data_server_workspace_source();
 	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
-	// The duplicate replay short-circuits inside the leader BEFORE any mutation
-	// (both the unlocked fast path and the under-lock recheck return `Replayed`),
-	// so a retry never re-applies the delta (D4)...
+	// The duplicate replay short-circuits inside the leader BEFORE any mutation:
+	// the one record lookup, made under the write-key gate, returns `Replayed`
+	// before the counter-key lock and the fan-out, so a retry never re-applies
+	// the delta (D4)...
 	let fetch_add = source_region(
 		&counter,
 		"pub async fn fetch_add(",
-		"self.idempotency.insert(write_key, outcome);",
+		"/// Admit one request under `write_key`, waiting while another holds it.",
 	);
 	let replay = fetch_add
 		.find("CounterAddResult::Replayed")
@@ -8639,7 +8704,7 @@ fn adr075_counter_add_goes_through_finalization_not_metric_side_channel() {
 	let fetch_add = source_region(
 		&counter,
 		"pub async fn fetch_add(",
-		"self.idempotency.insert(write_key, outcome);",
+		"/// Admit one request under `write_key`, waiting while another holds it.",
 	);
 	// The durable finalization witness is persisted before the commit fan-out...
 	assert!(fetch_add.contains("self.witness_store.write(&witness)"));

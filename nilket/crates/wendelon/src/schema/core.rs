@@ -149,8 +149,14 @@ impl super::units::WriterNodeId {
 //  Provides exactly-once semantics across client retries.
 //
 //  Idempotency contract:
-//    • client_uuid: 16-byte UUIDv4, immutable for session lifetime.
-//    • sequence_no: strictly monotonic per session.
+//    • client_uuid: 16-byte UUIDv7 (the SDK default), immutable for the
+//      lifetime of one client instance and never shared with another:
+//      no two client instances, concurrent or sequential, in any process,
+//      may issue counter adds under one client_uuid.
+//    • sequence_no: strictly monotonic per client instance.
+//    • (client_uuid, sequence_no) names exactly one logical write. A
+//      counter add presented under a known pair with a different counter
+//      key or delta is refused (WRITE_KEY_CONFLICT), never replayed.
 //    • Leader maintains cache keyed on (client_uuid, sequence_no)
 //      → WriteResponseMeta. Entries expire after idempotency_ttl_ms
 //      OR piggy-backed ack (client's next write implicitly acks
@@ -160,9 +166,9 @@ impl super::units::WriterNodeId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
 #[repr(C)]
 pub struct ClientWriteId {
-	/// 16-byte UUIDv4; immutable per client session
+	/// 16-byte UUIDv7; unique to one client instance for all time
 	pub client_uuid: [u8; 16],
-	/// Strictly monotonic within session
+	/// Strictly monotonic within one client instance
 	pub sequence_no: u64,
 	/// Client-suggested cache retention in ms; server clamps to [1s, 300s]
 	pub idempotency_ttl_ms: u32,
@@ -1034,6 +1040,10 @@ impl WriteStatus {
 	/// ADR 542: the retained outcome was reclaimed; this id may never be applied anew.
 	pub const WRITE_OPERATION_EXPIRED: Self = Self(22);
 	pub const WRITE_OPERATION_UNKNOWN: Self = Self(23);
+	/// This write id already names a different add (`COUNTER_ADD`: another
+	/// counter key or delta). Nothing was applied, and the response carries
+	/// zero values rather than the recorded add's outcome. Not retryable as-is.
+	pub const WRITE_KEY_CONFLICT: Self = Self(24);
 
 	pub const fn as_str(self) -> &'static str {
 		match self {
@@ -1061,6 +1071,7 @@ impl WriteStatus {
 			Self::WRITE_ATTEMPTS_EXHAUSTED => "write_attempts_exhausted",
 			Self::WRITE_OPERATION_EXPIRED => "write_operation_expired",
 			Self::WRITE_OPERATION_UNKNOWN => "write_operation_unknown",
+			Self::WRITE_KEY_CONFLICT => "write_key_conflict",
 			_ => "unknown",
 		}
 	}

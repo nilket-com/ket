@@ -2922,6 +2922,7 @@ fn retry_counter_add_response(response: &CounterAddResponseMeta) -> Option<Retry
 		s if s == WriteStatus::BACKPRESSURED => Some(RetryDirective::backpressure(
 			nonzero_node_id(response.leader_hint),
 		)),
+		// WRITE_KEY_CONFLICT is final: the same write id can only conflict again.
 		_ => None,
 	}
 }
@@ -4231,6 +4232,18 @@ mod tests {
 	use std::pin::Pin;
 	use std::task::{Context, Poll};
 	use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+
+	#[test]
+	fn counter_add_write_key_conflict_is_never_retried() {
+		let mut response: CounterAddResponseMeta = bytemuck::Zeroable::zeroed();
+		response.status = WriteStatus::WRITE_KEY_CONFLICT;
+		assert!(retry_counter_add_response(&response).is_none());
+		response.status = WriteStatus::BACKPRESSURED;
+		assert!(
+			retry_counter_add_response(&response).is_some(),
+			"control: a transient status is retried"
+		);
+	}
 
 	fn tier_bits() -> u8 {
 		TransportTierSet::empty()

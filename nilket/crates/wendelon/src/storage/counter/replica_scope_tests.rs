@@ -529,12 +529,12 @@ async fn b1d_real_local_remote_enum_and_witness_redrive_carry_counter_key() {
 		19,
 	));
 	let witness_dir = TestDir::new("counter-scope-witness-key");
-	let leader = CounterLeader::new(
+	let leader = Arc::new(CounterLeader::new(
 		node(1),
 		lp.clone(),
 		true,
 		DurableCounterWitnessStore::open(witness_dir.to_path_buf()).unwrap(),
-	);
+	));
 	let key = CounterKey(b"new-key".to_vec());
 	let outcome = leader
 		.fetch_add(
@@ -668,12 +668,12 @@ async fn b1d_conflict_below_quorum_rolls_back_only_accepted_scope_with_real_key(
 		19,
 	));
 	let dir = TestDir::new("counter-scope-quorum-witness");
-	let leader = CounterLeader::new(
+	let leader = Arc::new(CounterLeader::new(
 		node(1),
 		lp.clone(),
 		true,
 		DurableCounterWitnessStore::open(dir.to_path_buf()).unwrap(),
-	);
+	));
 	let key = CounterKey(b"new-key".to_vec());
 	assert_eq!(
 		leader

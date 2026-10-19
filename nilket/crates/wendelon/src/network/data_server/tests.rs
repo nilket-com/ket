@@ -17581,3 +17581,6 @@ mod pending_tenant;
 
 #[path = "counter_visibility/tests.rs"]
 mod counter_visibility_tests;
+
+#[path = "counter_write_key/tests.rs"]
+mod counter_write_key_tests;

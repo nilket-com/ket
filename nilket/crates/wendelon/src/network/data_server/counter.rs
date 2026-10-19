@@ -326,7 +326,19 @@ impl WendelonDataServer {
 		// after a node restart (`counter_leader_for` recovers the record).
 		let leader = self.counter_leader_for(meta.tenant_id).await?;
 		let write_key = meta.write_id.canonical_idempotency_bytes();
-		let resp = match leader.fetch_add(plan, write_key, &key, meta.delta).await {
+		// The leader runs the add on its own task and polls the distrust fence
+		// there, so a handler dropped mid-add can neither cut the add short nor
+		// skip a latch the add set.
+		let fence = {
+			let server = self.clone();
+			let leader = leader.clone();
+			let tenant_id = meta.tenant_id;
+			move || async move { server.fence_unsettled_counter(&leader, tenant_id).await }
+		};
+		let added = leader
+			.fetch_add_fenced(plan, write_key, &key, meta.delta, fence)
+			.await;
+		let resp = match added {
 			Ok(result) => {
 				let outcome = result.outcome();
 				let status = if result.is_replay() {
@@ -342,12 +354,14 @@ impl WendelonDataServer {
 					Self::zero_counter_hlc(),
 				)
 			}
-			// All rejects fail closed — the leader mutated nothing (D5/D6).
+			// All rejects fail closed — the leader mutated nothing (D5/D6). A write-key
+			// conflict carries zero values, never the recorded add's outcome.
 			Err(err) => {
 				let status = match err {
 					CounterLeaderError::NotLeader => WriteStatus::NOT_LEADER,
 					CounterLeaderError::ZeroDelta => WriteStatus::COUNTER_ZERO_DELTA,
 					CounterLeaderError::Overflow => WriteStatus::COUNTER_OVERFLOW,
+					CounterLeaderError::WriteKeyConflict => WriteStatus::WRITE_KEY_CONFLICT,
 					CounterLeaderError::QuorumFailed
 					| CounterLeaderError::Internal
 					| CounterLeaderError::Visibility(_) => WriteStatus::INTERNAL_ERROR,
@@ -355,7 +369,6 @@ impl WendelonDataServer {
 				self.counter_add_response(&meta, status, 0, 0, Self::zero_counter_hlc())
 			}
 		};
-		self.fence_unsettled_counter(&leader, meta.tenant_id).await;
 		Ok(self.build_counter_add_response_frame(stream_id, resp))
 	}
 

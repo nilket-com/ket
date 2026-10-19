@@ -28,6 +28,7 @@ pub use visibility::{CounterVersion, CounterVisibilityError};
 use visibility::{EligibleCells, winner};
 
 use std::io::{Error, ErrorKind};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -131,7 +132,7 @@ pub type CounterWriteKey = [u8; 24];
 pub enum CounterAddResult {
 	/// The delta was applied by THIS call.
 	Applied(CounterAddOutcome),
-	/// The write-key was already applied — the original outcome, nothing re-added.
+	/// The write-key already names this same add — the original outcome, nothing re-added.
 	Replayed(CounterAddOutcome),
 }
 
@@ -1565,6 +1566,10 @@ pub enum CounterLeaderError {
 	QuorumFailed,
 	/// A participant read/step failed unrecoverably before any durable mutation.
 	Internal,
+	/// The write key already names a different add (another counter key, another
+	/// delta, or an unkeyed record that cannot show which add it names). Nothing
+	/// was applied and the recorded outcome is withheld. Not retryable as-is.
+	WriteKeyConflict,
 }
 
 /// The counter-finalization witness: the leader's durable record that an add
@@ -1604,6 +1609,9 @@ use applied_log::{
 	AppliedLogFault, AppliedLogImage, validate_witness_set, witness_matches_applied,
 };
 use file_ops::{CounterDurableFileOps, StdCounterDurableFileOps};
+
+mod write_key;
+use write_key::{RecordedAdd, WriteKeyGate};
 
 /// The durable D4 dedup record a resolved witness compacts into: enough to
 /// replay the original outcome for a duplicate `CounterWriteKey` — plus the
@@ -2147,6 +2155,19 @@ impl OffloadedWitnessStore {
 	}
 }
 
+/// Test-only switches that disable one write-key mechanism, so a law test can
+/// show the failure the mechanism prevents.
+#[cfg(test)]
+#[derive(Default)]
+struct WriteKeySwitches {
+	/// Admit every add without its write-key gate.
+	bypass_gate: std::sync::atomic::AtomicBool,
+	/// Never reclaim a released gate's map entry.
+	keep_gate_entries: std::sync::atomic::AtomicBool,
+	/// Run the add's body in the caller's future instead of its own task.
+	inline_body: std::sync::atomic::AtomicBool,
+}
+
 /// The primary-side counter orchestrator. Durable state is per tenant; the
 /// participant set for a fresh add is supplied per operation from the current
 /// ring, while reconciliation resolves the identities recorded in each witness.
@@ -2158,11 +2179,17 @@ pub struct CounterLeader<P> {
 	is_primary: bool,
 	/// Per-key D2 critical section, held across the whole fan-out.
 	locks: DashMap<CounterKey, Arc<Mutex<()>>>,
-	/// Typed idempotency outcomes by canonical public write-key (D4): a
-	/// duplicate replays the original `previous`/`current` without re-applying.
+	/// The add each canonical public write-key names, with its outcome (D4). A
+	/// retry of that add replays the original `previous`/`current` without
+	/// re-applying; any other add under the key is refused (see `write_key`).
 	/// The in-memory view of the durable record (witness while pending, applied
-	/// log once resolved) — `recover` rebuilds it, so replay survives restart.
-	idempotency: DashMap<CounterWriteKey, CounterAddOutcome>,
+	/// log once resolved) — `recover` rebuilds it, so both survive restart.
+	idempotency: DashMap<CounterWriteKey, RecordedAdd>,
+	/// One add in flight per write key, by the exact 24 bytes (never striped or
+	/// hashed). Lock order: write-key gate, then the counter-key lock, then the
+	/// participant op gates, then the store's file mutexes; reconcile and the
+	/// commit driver take neither leader gate.
+	write_gates: DashMap<CounterWriteKey, Arc<Mutex<()>>>,
 	/// In-memory mirror of the pending witnesses (durable in `witness_store`).
 	witnesses: DashMap<u64, StoredWitness>,
 	/// Durable backing for the witnesses (survives leader restart).
@@ -2170,6 +2197,8 @@ pub struct CounterLeader<P> {
 	/// Leader-assigned op-id allocator (cross-node stable handles). `commit_hlc`
 	/// is derived from it, so op-ids and HLCs advance together.
 	op_seq: AtomicU64,
+	#[cfg(test)]
+	write_key_switches: WriteKeySwitches,
 }
 
 impl<P: CounterParticipant + Clone> CounterLeader<P> {
@@ -2186,9 +2215,12 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 			is_primary,
 			locks: DashMap::new(),
 			idempotency: DashMap::new(),
+			write_gates: DashMap::new(),
 			witnesses: DashMap::new(),
 			witness_store: OffloadedWitnessStore(Arc::new(witness_store)),
 			op_seq: AtomicU64::new(1),
+			#[cfg(test)]
+			write_key_switches: WriteKeySwitches::default(),
 		}
 	}
 
@@ -2200,7 +2232,11 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 	/// Open a leader and LOAD its durable state (restart path): the applied D4
 	/// dedup log and the pending witnesses — BOTH feed the idempotency map, so a
 	/// duplicate retry after restart replays instead of re-adding (a pending
-	/// witness is an add that WILL complete, so its outcome already replays).
+	/// witness is an add that WILL complete, so its outcome already replays),
+	/// and a different add under a recorded write key is refused. A witness
+	/// names its counter key, so it also keys an unkeyed record of its own
+	/// operation. Two operations under one write key, in any mix of records and
+	/// witnesses, fail recovery closed with a typed identity conflict.
 	/// The op-id allocator is seeded past the highest op-id across BOTH the
 	/// applied records and the pending witnesses — `commit_hlc_for` derives the
 	/// HLC from the op-id, so reusing one would mint a duplicate HLC and break
@@ -2226,13 +2262,8 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 		let mut max_op = 0;
 		for record in applied {
 			max_op = max_op.max(record.op_id);
-			leader.idempotency.insert(
-				record.write_key,
-				CounterAddOutcome {
-					previous: record.previous,
-					current: record.current,
-				},
-			);
+			let recorded = RecordedAdd::from_durable(record.key, record.previous, record.current)?;
+			leader.idempotency.insert(record.write_key, recorded);
 		}
 		for witness in pending {
 			if witness.origin.is_some_and(|origin| origin != local_id) {
@@ -2247,13 +2278,12 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 				},
 			);
 			max_op = max_op.max(witness.op_id);
-			leader.idempotency.insert(
-				witness.write_key,
-				CounterAddOutcome {
-					previous: witness.previous,
-					current: witness.value,
-				},
-			);
+			let recorded = RecordedAdd::from_durable(
+				Some(witness.key.clone()),
+				witness.previous,
+				witness.value,
+			)?;
+			leader.idempotency.insert(witness.write_key, recorded);
 			leader.witnesses.insert(witness.op_id, witness);
 		}
 		let next_op = max_op.checked_add(1).ok_or_else(|| {
@@ -2275,18 +2305,46 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 			node_id: 0,
 		}
 	}
+}
 
+/// The add itself runs on a spawned task, so its participants must be `'static`.
+impl<P: CounterParticipant + Clone + Send + Sync + 'static> CounterLeader<P> {
 	/// Atomic idempotent `+delta` on `key`, gated by the five boundaries above.
-	/// Keyed by the canonical public `write_key` (D4) — concurrent duplicates
-	/// serialize on the per-key lock and replay under it, and the dedup record
-	/// is durable with the witness/applied log, so replay survives restart.
+	/// Keyed by the canonical public `write_key` (D4): a write key names one add,
+	/// a retry of that add replays it, and any other add under the key is refused
+	/// (`WriteKeyConflict`). Requests under one write key are admitted one at a
+	/// time, and the dedup record is durable with the witness/applied log, so
+	/// replay and refusal survive restart.
 	pub async fn fetch_add(
-		&self,
+		self: &Arc<Self>,
 		plan: CounterParticipantPlan<P>,
 		write_key: CounterWriteKey,
 		key: &CounterKey,
 		delta: u64,
 	) -> Result<CounterAddResult, CounterLeaderError> {
+		self.fetch_add_fenced(plan, write_key, key, delta, || async {})
+			.await
+	}
+
+	/// [`fetch_add`](Self::fetch_add), running `fence` on the add's own task when
+	/// the add leaves the dedup store latched unsettled. Everything after the
+	/// primary and eligibility checks runs on that task, which owns the
+	/// write-key gate and the counter-key lock: a dropped caller cancels no step
+	/// and releases no guard (K5), so a durable witness is never left without its
+	/// record, its pending entry and its published value, and the fence is never
+	/// skipped.
+	pub async fn fetch_add_fenced<F, Fence>(
+		self: &Arc<Self>,
+		plan: CounterParticipantPlan<P>,
+		write_key: CounterWriteKey,
+		key: &CounterKey,
+		delta: u64,
+		fence: F,
+	) -> Result<CounterAddResult, CounterLeaderError>
+	where
+		F: FnOnce() -> Fence + Send + 'static,
+		Fence: std::future::Future<Output = ()> + Send,
+	{
 		// (3) Primary-only FIRST. A non-primary has no authoritative idempotency
 		// record (it never accepted the original), so replaying from it could
 		// return a wrong/absent result — it must redirect to the real primary,
@@ -2300,20 +2358,67 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 		self.witnessed
 			.read(&counter_identity(key))
 			.map_err(CounterLeaderError::Visibility)?;
-		// (3) Duplicate replay BEFORE lock/mutation (mandatory).
-		if let Some(cached) = self.idempotency.get(&write_key) {
-			return Ok(CounterAddResult::Replayed(*cached.value()));
+		let leader = self.clone();
+		let key = key.clone();
+		let body = async move {
+			let result = leader.admitted_add(plan, write_key, &key, delta).await;
+			if leader.durability_unsettled() {
+				fence().await;
+			}
+			result
+		};
+		#[cfg(test)]
+		if self.write_key_switches.inline_body.load(Ordering::Relaxed) {
+			return body.await;
 		}
-		if delta == 0 {
+		match tokio::spawn(body).await {
+			Ok(result) => result,
+			Err(error) => {
+				let payload = if error.is_panic() {
+					let panic = error.into_panic();
+					panic
+						.downcast_ref::<&str>()
+						.map(|message| (*message).to_owned())
+						.or_else(|| panic.downcast_ref::<String>().cloned())
+						.unwrap_or_else(|| "non-string panic payload".to_owned())
+				} else {
+					error.to_string()
+				};
+				tracing::error!(
+					write_key = ?write_key,
+					error = %payload,
+					"counter add task failed; answering internal error"
+				);
+				Err(CounterLeaderError::Internal)
+			}
+		}
+	}
+
+	/// The add's body, on its own task. Lock order: write-key gate, then the
+	/// counter-key lock, both owned by this task until it ends.
+	async fn admitted_add(
+		&self,
+		plan: CounterParticipantPlan<P>,
+		write_key: CounterWriteKey,
+		key: &CounterKey,
+		delta: u64,
+	) -> Result<CounterAddResult, CounterLeaderError> {
+		// One add per write key in flight, admitted before the record lookup so no
+		// concurrent add under this key can install a record after the lookup
+		// misses. Taken before, never while holding, the counter-key lock.
+		let _write_gate = self.admit_write_key(write_key).await;
+		// (3) Duplicate replay BEFORE lock/mutation (mandatory). A known write key
+		// replays only the add it names; any other add under it, a zero delta
+		// included, is refused with nothing applied.
+		if let Some(outcome) = self.recorded_answer(&write_key, key, delta)? {
+			return Ok(CounterAddResult::Replayed(outcome));
+		}
+		let Some(recorded_delta) = NonZeroU64::new(delta) else {
 			return Err(CounterLeaderError::ZeroDelta);
-		}
+		};
 		// (1/2) Per-key lock across read → fan-out → quorum → commit/rollback.
 		let lock = self.locks.entry(key.clone()).or_default().clone();
-		let _guard = lock.lock().await;
-		// Re-check under the lock: a concurrent duplicate may have committed.
-		if let Some(cached) = self.idempotency.get(&write_key) {
-			return Ok(CounterAddResult::Replayed(*cached.value()));
-		}
+		let _key_guard = lock.lock_owned().await;
 
 		if plan.len() == 0 || plan.quorum() == 0 || plan.get(self.local_id).is_none() {
 			return Err(CounterLeaderError::Internal);
@@ -2402,7 +2507,20 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 			}
 			return Err(CounterLeaderError::Internal);
 		}
+		// (3/4) Install point: the witness is durable, so record the add it names
+		// before anything can fail. Every later exit leaves the write key recorded;
+		// no record is ever removed. The DURABLE record is the witness itself,
+		// compacted to the applied log by `drive_commits`.
 		self.witnesses.insert(op_id, witness);
+		let outcome = CounterAddOutcome { previous, current };
+		self.idempotency.insert(
+			write_key,
+			RecordedAdd {
+				key: Some(key.clone()),
+				delta: recorded_delta,
+				outcome,
+			},
+		);
 		// The entry is preallocated and same-key leader updates remain under the add mutex.
 		// Preserve the witness on any residual poison; never roll back a witnessed operation.
 		reservation
@@ -2419,15 +2537,43 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 		self.witnessed
 			.read(&counter_identity(key))
 			.map_err(CounterLeaderError::Visibility)?;
-
-		// (3/4) Record the typed idempotency outcome. The value reached quorum
-		// and is either fully committed or recoverable-pending (the durable
-		// witness will finish it) — never abandoned. The DURABLE dedup record
-		// already exists (the witness above, compacted to the applied log by
-		// `drive_commits`); this is its in-memory fast path.
-		let outcome = CounterAddOutcome { previous, current };
-		self.idempotency.insert(write_key, outcome);
+		// The value reached quorum and is either fully committed or
+		// recoverable-pending (the durable witness will finish it) — never abandoned.
 		Ok(CounterAddResult::Applied(outcome))
+	}
+}
+
+impl<P: CounterParticipant + Clone> CounterLeader<P> {
+	/// Admit one request under `write_key`, waiting while another holds it.
+	async fn admit_write_key(&self, write_key: CounterWriteKey) -> WriteKeyGate<'_> {
+		#[cfg(test)]
+		if self.write_key_switches.bypass_gate.load(Ordering::Relaxed) {
+			return WriteKeyGate::bypassed(&self.write_gates, write_key);
+		}
+		let gate = WriteKeyGate::admit(&self.write_gates, write_key).await;
+		#[cfg(test)]
+		if self
+			.write_key_switches
+			.keep_gate_entries
+			.load(Ordering::Relaxed)
+		{
+			return gate.keep_entry();
+		}
+		gate
+	}
+
+	/// The recorded answer for `write_key`, if it names an add: its outcome for a
+	/// retry of that add, a conflict for any other. The map reference ends here.
+	fn recorded_answer(
+		&self,
+		write_key: &CounterWriteKey,
+		key: &CounterKey,
+		delta: u64,
+	) -> Result<Option<CounterAddOutcome>, CounterLeaderError> {
+		self.idempotency
+			.get(write_key)
+			.map(|recorded| recorded.answer(key, delta))
+			.transpose()
 	}
 
 	/// Drive commit markers for the accepted participants that still owe one,
@@ -2548,6 +2694,13 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 	/// server trips its local-persistence distrust fence when it has.
 	pub(crate) fn durability_unsettled(&self) -> bool {
 		self.witness_store.0.is_unsettled()
+	}
+
+	/// Latch the dedup store as if a persistence barrier had failed.
+	#[cfg(test)]
+	pub(crate) fn latch_unsettled_for_test(&self) {
+		let store = &self.witness_store.0;
+		store.unsettle(&store.dir, &Error::other("test-only persistence failure"));
 	}
 
 	/// Point read of the committed counter from the local primary store.
@@ -3628,7 +3781,23 @@ mod leader_tests {
 	struct TestParticipant {
 		replica: Arc<CounterReplica<LocalSlabStore>>,
 		fail_tentative: Arc<AtomicBool>,
+		/// The next `commit` fails with a visibility error (the key is poisoned).
+		fail_commit_visibility: Arc<AtomicBool>,
+		/// Every `replicate_tentative` call that reached this participant.
+		tentatives: Arc<StdMutex<Vec<(u64, CounterKey)>>>,
+		/// Parks the next `replicate_tentative` until the test releases it.
+		park: Arc<StdMutex<Option<Arc<CallPark>>>>,
+		/// Parks the next `commit` until the test releases it.
+		commit_park: Arc<StdMutex<Option<Arc<CallPark>>>>,
 		observer: Option<Arc<dyn ParticipantObserver>>,
+	}
+
+	/// A parked participant call: `reached` fires when the call parks, and the
+	/// call resumes once `release` is notified.
+	#[derive(Default)]
+	struct CallPark {
+		reached: tokio::sync::Notify,
+		release: tokio::sync::Notify,
 	}
 
 	/// Sees each participant step, so a crash model can order participant
@@ -3653,6 +3822,10 @@ mod leader_tests {
 					},
 				))),
 				fail_tentative: Arc::new(AtomicBool::new(false)),
+				fail_commit_visibility: Arc::new(AtomicBool::new(false)),
+				tentatives: Arc::default(),
+				park: Arc::default(),
+				commit_park: Arc::default(),
 				observer: None,
 			}
 		}
@@ -3695,6 +3868,12 @@ mod leader_tests {
 			if self.leader_crashed() || self.fail_tentative.swap(false, Ordering::Relaxed) {
 				return Err(ParticipantError::Unavailable);
 			}
+			self.tentatives.lock().unwrap().push((op_id, key.clone()));
+			let park = self.park.lock().unwrap().take();
+			if let Some(park) = park {
+				park.reached.notify_one();
+				park.release.notified().await;
+			}
 			self.replica
 				.replicate_tentative(op_id, key, value, commit_hlc)
 				.await
@@ -3703,6 +3882,16 @@ mod leader_tests {
 		async fn commit(&self, op_id: u64, _key: &CounterKey) -> Result<(), ParticipantError> {
 			if self.leader_crashed() {
 				return Err(ParticipantError::Unavailable);
+			}
+			let park = self.commit_park.lock().unwrap().take();
+			if let Some(park) = park {
+				park.reached.notify_one();
+				park.release.notified().await;
+			}
+			if self.fail_commit_visibility.swap(false, Ordering::Relaxed) {
+				return Err(ParticipantError::Visibility(
+					CounterVisibilityError::Poisoned,
+				));
 			}
 			if let Some(observer) = &self.observer {
 				observer.commit_started();
@@ -3753,7 +3942,7 @@ mod leader_tests {
 	}
 
 	struct LeaderHarness {
-		leader: CounterLeader<TestParticipant>,
+		leader: Arc<CounterLeader<TestParticipant>>,
 		participants: Vec<(NodeId, TestParticipant)>,
 		quorum: usize,
 	}
@@ -3775,7 +3964,12 @@ mod leader_tests {
 				.expect("test leader needs a local participant")
 				.1
 				.clone();
-			let leader = CounterLeader::new(node_id(0), local, is_primary, witness_store);
+			let leader = Arc::new(CounterLeader::new(
+				node_id(0),
+				local,
+				is_primary,
+				witness_store,
+			));
 			Self {
 				leader,
 				participants,
@@ -3799,7 +3993,12 @@ mod leader_tests {
 				.expect("test leader needs a local participant")
 				.1
 				.clone();
-			let leader = CounterLeader::recover(node_id(0), local, is_primary, witness_store)?;
+			let leader = Arc::new(CounterLeader::recover(
+				node_id(0),
+				local,
+				is_primary,
+				witness_store,
+			)?);
 			Ok(Self {
 				leader,
 				participants,
@@ -3849,6 +4048,29 @@ mod leader_tests {
 		/// Arm a participant's next tentative to fail.
 		fn arm_participant_tentative_failure(&self, i: usize) {
 			self.participants[i].1.arm_tentative_failure();
+		}
+		/// Arm a participant's next commit to fail with a visibility error.
+		fn arm_participant_commit_visibility_failure(&self, i: usize) {
+			self.participants[i]
+				.1
+				.fail_commit_visibility
+				.store(true, Ordering::Relaxed);
+		}
+		/// Park a participant's next `replicate_tentative`.
+		fn park_participant_tentative(&self, i: usize) -> Arc<CallPark> {
+			let park = Arc::new(CallPark::default());
+			*self.participants[i].1.park.lock().unwrap() = Some(park.clone());
+			park
+		}
+		/// Park a participant's next `commit`.
+		fn park_participant_commit(&self, i: usize) -> Arc<CallPark> {
+			let park = Arc::new(CallPark::default());
+			*self.participants[i].1.commit_park.lock().unwrap() = Some(park.clone());
+			park
+		}
+		/// The `(op_id, key)` of every `replicate_tentative` a participant saw.
+		fn participant_tentatives(&self, i: usize) -> Vec<(u64, CounterKey)> {
+			self.participants[i].1.tentatives.lock().unwrap().clone()
 		}
 	}
 
@@ -4646,6 +4868,7 @@ mod leader_tests {
 	}
 
 	mod crash_cut_tests;
+	mod write_key_reuse_tests;
 
 	mod throughput_measurement;
 }

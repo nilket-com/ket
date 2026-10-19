@@ -461,6 +461,7 @@ Keep resolution classification, write status, stop reason and commit knowledge i
 | 22 / 0 / 3 | WRITE_OPERATION_EXPIRED / NONE / INDETERMINATE; native expiry response. |
 | 22 / 0 / 0 | WRITE_OPERATION_EXPIRED / NONE / UNSPECIFIED; SQL Expired mapping (`storage.rs:1227–1233`). |
 | 23 / 0 / 0 | WRITE_OPERATION_UNKNOWN / NONE / UNSPECIFIED; SQL Unknown mapping. |
+| 24 / — / — | WRITE_KEY_CONFLICT (counter add): the write id already names a different add. Nothing applied; zero values; not retryable as-is. Added after this soak; not observed in it. |
 
 `operation_identity_is_expired` compares a client-chosen UUIDv7 timestamp plus clamped TTL (1000–300000ms)
 against storage wall time. Non-v7 identities do not use that fallback. The native outcome-store v7-age unit
