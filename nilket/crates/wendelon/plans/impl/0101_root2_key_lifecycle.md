@@ -271,3 +271,52 @@ automatic detection, quorum-currentness proofs.
 
 plan commit → unsigned source → review → sign → LOCAL → DEV → full
 18-step ladder → external audit → FINAL → FF.
+
+## C-S6b plan: Root2 context export
+
+### Status
+
+Plan only. This section authorizes no source changes.
+- Contract: `/home/me/work/.agent-bridge/wendelon-adr0101-c-s6b-context-export-contract-r2/CONTRACT.md` (r2, accepted).
+- It amends C-S6 and is the first slice of key custody (contract r4).
+
+### Behavior
+
+`nilket wendelon audit root2 <data-dir> --trusted-manifest <file> --export-context <out> --node-id <n>` writes a versioned file (`WRCTXEXP`, version 1). It holds:
+- the bound `AdminContext2` bytes, through one `context_bytes` encoder that `context_digest` also uses;
+- the trusted manifest;
+- every role-key rotation's committed `Command2` and VISROL03 sidecar, with its activation `LogId20`;
+- the freeze, transition and retirement state, the activation LogIds, the stop, coverage and `node_id`, all typed `AuditDerived` (as is the completeness of the successor list);
+- an integrity digest.
+
+The rules:
+- **Complete fold only.** The export is written only after a complete fold (exit 0).
+- **Path checks first.** They run before the fold. The parent fd is walked by `(dev, ino)`, and a target inside the data dir is refused. A name with the tool's temp prefix is refused, and the data dir's identity is re-checked just before publication.
+- **Publication.** Exclusive 0600 create through the parent fd, fsync, `RENAME_NOREPLACE`, then a directory fsync, all before any row is printed.
+- **Failures.** Any failure leaves no file and prints nothing. A stdout failure after publication withdraws the file. Withdrawal is `unlinkat(parent_fd, name)` only after an `fstatat` shows the same `(dev, ino)` that was published, followed by a directory fsync. It exits 2. If that identity check fails, the file is left in place and the diagnostic names it.
+- **Empty suspect set.** Allowed with `--export-context`, which amends C-S6's "never an empty result".
+
+The export is evidence, not trust. The custody tool re-verifies the rotation chain against the trusted manifest. The context is authenticated only when at least one successor exists. Unverifiable fields are usable only to refuse, failing safe.
+
+### Acceptance
+
+- **T-X1:** every exit path, injected write and sync failures, and stdout failure after publication.
+- **T-X2:** the chain re-verifies with the production verifier, with one refusal per replay check.
+- **T-CTX:** golden context bytes, plus per-field sensitivity.
+- **T-X4:** the output is deterministic.
+- **T-X5:** the data dir stays read-only.
+- **T-PATH:** aliasing, symlinks and temp-prefix names are refused, and a swapped data dir is caught.
+- **T-FMT:** the format is byte-exact, and every malformed input is refused.
+- **T-CLI:** the empty-suspect usage works.
+
+An architecture guard pins the export as pure, run after the fold and published before the rows, along with the publish path's exact syscall discipline.
+
+Non-goal: detecting a bind mount of a data-dir subdirectory.
+
+### Commits and gate order
+
+- `plan: adr 0101 root2 context export` (this section). Arch and MV checks pass before the FF.
+- `impl: adr 0101 root2 context export`.
+- `docs: root2 context export runbook`.
+
+Gate order: independent source review → ladder → log audit → FF, after C-S6 has landed.
