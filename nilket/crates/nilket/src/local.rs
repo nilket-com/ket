@@ -155,6 +155,7 @@ fn run_owned_with_requirements(
 		}
 		Err(error) => return Err(format!("failed to lock {}: {error}", paths.lock.display())),
 	}
+	let lock_file = ProfileLock(lock_file);
 
 	if options.reset {
 		reset_locked_profile(&paths)?;
@@ -297,6 +298,7 @@ fn init_owned(options: LocalInitOptions) -> Result<PathBuf, String> {
 		}
 		Err(error) => return Err(format!("failed to lock {}: {error}", paths.lock.display())),
 	}
+	let lock_file = ProfileLock(lock_file);
 	prepare_profile(&paths)?;
 	drop(lock_file);
 	Ok(paths.root)
@@ -358,6 +360,17 @@ fn validate_profile_root_candidate(paths: &ProfilePaths) -> Result<(), String> {
 		"{} is not an empty directory or a marked Nilket profile",
 		paths.root.display()
 	))
+}
+
+/// The held profile lock. Unlocks explicitly before closing: the lock belongs to
+/// the open file description, which a concurrently forked child (nilket spawns
+/// Wendelon and Toron) shares until it execs, so closing alone could keep it held.
+struct ProfileLock(File);
+
+impl Drop for ProfileLock {
+	fn drop(&mut self) {
+		let _ = fs2::FileExt::unlock(&self.0);
+	}
 }
 
 fn open_lock(path: &Path) -> Result<File, String> {

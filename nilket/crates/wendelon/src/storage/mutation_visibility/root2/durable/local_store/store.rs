@@ -18,7 +18,7 @@ pub(super) struct LocalStore {
 	pub(super) root: PathBuf,
 	pub(super) id: ContainerId,
 	pub(super) io: Io,
-	pub(super) _lock: OwnedFile,
+	pub(super) _lock: LockedFile,
 	pub(super) publisher: Mutex<Publisher>,
 	pub(super) inflight: Arc<Semaphore>,
 	pub(super) owners: Mutex<BTreeSet<Vec<u8>>>,
@@ -84,7 +84,8 @@ impl LocalStore {
 			}
 			let lock = io.open(&root.join("LOCK"), true, true).await?;
 			io.adapter.lock(&lock.handle).await?;
-			io.sync(&lock).await?;
+			let lock = LockedFile::new(lock, io.adapter.clone());
+			io.sync(lock.file()).await?;
 			io.directory_sync(&root).await?;
 			let inventory = Inventory::default();
 			let empty = inventory.checkpoint(id)?;
@@ -126,6 +127,7 @@ impl LocalStore {
 			let io = Io::new(files, adapter);
 			let lock = io.open(&root.join("LOCK"), false, true).await?;
 			io.adapter.lock(&lock.handle).await?;
+			let lock = LockedFile::new(lock, io.adapter.clone());
 			let _buffer = io
 				.buffers
 				.clone()

@@ -158,6 +158,28 @@ fn lock_is_flock_and_released_on_drop() {
 	drop(s.open());
 }
 #[test]
+fn a_forked_child_cannot_extend_a_dropped_owner_lock() {
+	let s = Scratch::new();
+	let owner = s.open();
+	let marker = std::env::temp_dir().join(format!(
+		"wendelon-owner-fork-marker-{}",
+		uuid::Uuid::new_v4()
+	));
+	let child = crate::test_support::hold_child_in_fork_window(
+		marker.clone(),
+		std::time::Duration::from_secs(1),
+	);
+	// The child shares LOCK's open file description; dropping the owner must
+	// still free it immediately.
+	drop(owner);
+	assert!(
+		OwnerDir2::open(&s.0).is_ok(),
+		"a dropped owner's lock is free while a forked child holds the descriptor"
+	);
+	child.join().unwrap();
+	let _ = std::fs::remove_file(marker);
+}
+#[test]
 fn a_fresh_owner_directory_is_empty_and_never_written_by_reads() {
 	let s = Scratch::new();
 	let out = Scratch::new();

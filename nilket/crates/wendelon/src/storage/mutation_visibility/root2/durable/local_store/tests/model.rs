@@ -303,6 +303,9 @@ fn injected() -> io::Error {
 }
 #[async_trait]
 impl LocalAdapter for Model {
+	fn unlock_now(&self, handle: &FileHandle) {
+		LinuxAdapter.unlock_now(handle)
+	}
 	async fn list(&self, p: &Path, limit: usize) -> io::Result<Vec<Entry>> {
 		let label = p.display().to_string();
 		let f = self.begin(Op::List, label.clone()).await?;
