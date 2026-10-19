@@ -27,6 +27,8 @@ use crate::node::{NodeBootstrapConfig, WendelonNode};
 use ::observability::http as observability_http;
 
 mod index;
+// Offline Root2 compromise audit; the root2 tests drive its executor over real WAL fixtures.
+pub(crate) mod root2_audit;
 mod tenant;
 
 const DEFAULT_INSPECT_ENDPOINT: &str = "127.0.0.1:7432";
@@ -159,6 +161,7 @@ where
 		{
 			verify_audit(audit_path, Some(trust_path))
 		}
+		[cmd, subcmd, rest @ ..] if cmd == "audit" && subcmd == "root2" => root2_audit::run(rest),
 		[cmd, rest @ ..] if cmd == "inspect" => run_inspect(rest),
 		[cmd, rest @ ..] if cmd == "index" => index::run(rest),
 		[cmd, rest @ ..] if cmd == "tenant" => tenant::run(rest),
@@ -185,7 +188,7 @@ fn print_usage(program: &str) {
 		eprintln!("This binary is deprecated; use `nilket wendelon` instead.");
 	}
 	eprintln!(
-		"usage:\n  {program} <path/to/wendelon.toml>\n  {program} inspect [--endpoint <addr>] [--server-name <name>] [--cert <path>] [--key <path>] [--ca <path>] [--json]\n  {program} index create --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> --namespace <name> --table <name> --name <name> --column <name> [--id <uuid>]\n  {program} index drop --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> --id <uuid>\n  {program} index status --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--json]\n  {program} tenant create --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--quota-bytes <n>] [--replication-factor <n>] [--json]\n  {program} tenant get --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--json]\n  {program} tenant list --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> [--json]\n  {program} audit verify <path/to/audit.ndjson> [--trusted-audit-roots <file>]\n  {program} --print-example-config\n  {program} --write-example-config <path/to/wendelon.toml>"
+		"usage:\n  {program} <path/to/wendelon.toml>\n  {program} inspect [--endpoint <addr>] [--server-name <name>] [--cert <path>] [--key <path>] [--ca <path>] [--json]\n  {program} index create --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> --namespace <name> --table <name> --name <name> --column <name> [--id <uuid>]\n  {program} index drop --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> --id <uuid>\n  {program} index status --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--json]\n  {program} tenant create --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--quota-bytes <n>] [--replication-factor <n>] [--json]\n  {program} tenant get --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--json]\n  {program} tenant list --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> [--json]\n  {program} audit verify <path/to/audit.ndjson> [--trusted-audit-roots <file>]\n  {program} audit root2 <data-dir> --trusted-manifest <file> (--role <admin|governance|recovery> --epoch <n>)... | --key <file> [--suspect-only]\n  {program} --print-example-config\n  {program} --write-example-config <path/to/wendelon.toml>"
 	);
 }
 

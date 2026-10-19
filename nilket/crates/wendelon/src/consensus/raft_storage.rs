@@ -127,6 +127,12 @@ use crate::hash::blake3 as control_artifact_hash;
 #[cfg(feature = "fips")]
 use crate::hash::sha256 as control_artifact_hash;
 
+// Offline, read-only scan of a node's retained Control log over the same replay readers.
+mod read_only;
+#[cfg(test)]
+pub(crate) use read_only::fixture as read_only_fixture;
+pub(crate) use read_only::scan_control_log_read_only;
+
 /// WAL `record_type` discriminants — mirrored from
 /// `plans/consensus/raft-core.md` §4.
 const REC_LOG_ENTRY: u8 = 0;
