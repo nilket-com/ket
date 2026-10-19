@@ -78,7 +78,7 @@ The current counter witness and applied-log paths use ordinary writes/rename/app
 
 `CounterWriteKey` is the canonical 24-byte `ClientWriteId` identity `(client_uuid, sequence_no)`; it excludes TTL and padding. The effective durable identity is `(node-owned leader store, tenant_id, CounterWriteKey)`: production creates a leader per tenant and stores both witnesses and `counter-applied.log` in that tenant's directory under the local slab data directory. The applied frame currently contains only `op_id`, write key, and outcome, so the store directory must remain private to one local origin and must not be shared or reassigned across origins. A future shared-store or cross-origin migration must add origin to the durable namespace before proceeding. B1d's replica identity `(tenant, origin_node, op_id)` remains a separate scope. The per-tenant witness directory and applied log are the sole dedup authority; in-memory maps are recovered views.
 
-The local and remote participant paths currently await a durable commit-marker barrier before acknowledging commit, and the leader appends its applied record only after participant commits return. This is a contract precondition, not a protocol change. If evidence shows an acknowledgement can precede durability, stop and report the gap separately as F-CTR-9; do not expand F-CTR-8 silently.
+The local and remote participant paths currently await a durable commit-marker barrier before acknowledging commit, and the leader appends its applied record only after participant commits return. This is a contract precondition, not a protocol change. If evidence shows an acknowledgement can precede durability, stop and report the gap separately as a new finding (next free F-CTR id); do not expand F-CTR-8 silently.
 
 ### Selected durability behavior
 
@@ -101,3 +101,56 @@ Measure end-to-end resolved adds/second and per-add latency before and after usi
 F-CTR-8 does not authorize applied-log pruning/TTL, compaction, wire-format changes, runtime enablement, or group commit. The current indefinite-retention policy remains until F-CTR-5b selects a retention guarantee and crash-safe pruning design.
 
 **Gate order:** F-CTR-8 plan commit → read-only census delta → unsigned source and pre-seal/guard checks → source review → sign and SOURCE clearance → focused crash-cut tests → changed-area DEV → reviewed full ladder → independent external audit → FINAL → separate joint fast-forward. This plan commit precedes the C-S6 compromise-audit/runbooks plan commit.
+
+## F-CTR-9 plan: a counter write key names exactly one add
+
+**Status:** plan only. This amendment authorizes no source or test changes.
+**Plan base:** F-CTR-8 implemented (`6cdea9f1`).
+**Accepted contract:** `/home/me/work/.agent-bridge/wendelon-adr0102-f-ctr-9-contract-r2/CONTRACT.md`, r2 with Addendum A (K5) and Addendum B (per-operation table identity).
+**Defect evidence:** `/home/me/work/reviews/adr0102-f-ctr-9-repro-r1/REPORT.md`. Deterministic leader and client tests fail at `e89fcfa3`.
+
+### Finding and identity scope
+
+The leader treats any known `CounterWriteKey` as a retry and returns the recorded outcome, without comparing the counter key or the delta. The recorded outcome carries neither.
+- A caller that reissues `(client_uuid, sequence_no)` loses its delta silently and can receive another counter's value. Any `with_client_uuid` caller reissues it across instances, because the SDK sequence restarts at 1.
+- Two concurrent adds sharing one write key on different counter keys both pass the dedup check, because the counter-key lock does not cover them. Both apply. On the F-CTR-8 base the second resolution is refused, its witness stays pending, and the next recovery fails closed for the tenant.
+- An add whose durable witness is written but whose in-memory record is not yet installed can be applied twice.
+- Shipped Toron is not exposed: its TLS client mints a fresh identity per process. The leader defect is independent of Toron.
+
+Within one `(node data directory, tenant)` leader store, a write key W names exactly one logical add `(counter_key, delta)`. The recorded add holds the full counter key bytes (absent for legacy unkeyed frames) and the exact delta `current − previous`.
+
+### Selected behavior
+
+1. **K1, retry.** A known W with the same key and delta returns the original outcome.
+2. **K2, reuse.** A known W with a different add is refused with the new `WRITE_KEY_CONFLICT` status (24). Nothing is applied and no recorded outcome is returned, live, after restart and in reconcile. A legacy unkeyed record cannot prove which add it records, so its W is always refused.
+   - Check order: primary → key eligibility → per-write-key admission → record lookup → `delta == 0` → overflow.
+3. **K3, one add per write key.** A write-key gate is taken before the counter-key lock (lock order: write-key gate → counter-key lock → participant gates → store mutexes).
+   - The record is installed immediately after the F-CTR-8 durable prepare and before publish. Every rollback returns before the install.
+   - The gate is reclaimed once it is no longer shared.
+4. **K4, client identity (liveness).** The SDK mints a UUIDv7 per `Client`. Toron no longer uses `worker_id` as a write identity. Violating K4 causes refusals, never silent loss.
+   - **Addition beyond contract r2 (Addendum B).** With the v7 default, a default table write or delete would carry the Client's v7 uuid, and ADR 542 would expire it once the Client is older than its TTL (`network/mutation_outcomes.rs:314-323`, `network/data_server/mutation_protocol.rs:242-268`). The SDK therefore mints a fresh UUIDv7 `ClientWriteId` for each table write and delete when no caller id is supplied. Counter adds keep the per-Client uuid (K2/K4). Test: a Client created more than one TTL ago still writes and deletes rows; with a v7 per-Client uuid and no per-operation identity, this test is red.
+5. **K5, install atomicity under cancellation.** After the primary and eligibility checks, one spawned task owns every guard and step. A dropped caller cancels nothing.
+6. **Wire and clients.**
+   - Status 24 travels with zero values. The SDK surfaces it as `WriteFailed`, with no new client error variant, and checks that every OK or DUPLICATE receipt carries its own delta.
+   - Toron's four flush arms treat a conflict as a definite identity fault: they drop the delta, never merge, and latch Degraded.
+
+### Required tests
+
+Every law test is red at 6cdea9f1 (the plan base), or with its named hook disabled, and the K1 retry controls stay green before and after. The tests cover:
+- conflict on another key, on another delta and on zero delta;
+- conflict against a pending witness, live and after restart;
+- conflict against a keyed applied record and against legacy unkeyed records;
+- the window after the durable prepare;
+- deterministic concurrent same-write-key admission: on another counter key (blocked, then conflict), on the same key with the same delta (replay), and on the same key with another delta (conflict), followed by reconcile with no pending witness; plus a gate-bypass control;
+- gate reclamation, with a keep-entries control;
+- prepare-failure rollback;
+- two operations under one write key fail recovery closed, with a typed error;
+- caller cancellation at the witness write, at every store step and at a participant commit, with a marker-eligible participant. An inline-body control reproduces the lost delta.
+- a structural architecture guard on the install order (an addition beyond the contract, from source review);
+- wire status, SDK mapping and receipt checks; v7 client identities; per-operation table identities for a long-lived client; and the Toron flush arms.
+
+### Scope and gates
+
+F-CTR-9 does not authorize pruning, retention, compaction or a participant protocol change. Dedup across a ring-owner change is F-CTR-10, a known gap carried from F-CTR-8. F-CTR-5b's time-bounded retention depends on K4 and lands after F-CTR-9. Its expiry rule uses issue time plus L, but the counter uuid is minted once per Client, so F-CTR-5b must rotate the uuid before L (its accepted contract r3, law E6). Otherwise long-lived clients' counter adds would expire, which is the same hazard as Addendum B.
+
+**Gate order:** this plan commit → Wendelon architecture and mutation-visibility architecture checks → fast-forward → signed source → independent source review → focused and changed-area tests → reviewed full ladder → independent log audit → fast-forward. The Codex-era SOURCE clearance, DEV and FINAL steps are folded into the independent source review, the changed-area tests and the log audit under the current working model (Claude implements; an independent reviewer that did not write the code clears source and evidence).

@@ -6,9 +6,11 @@ Accepted and implemented: a5c50bd7 (2026-10-16). The defect was proven by a dete
 
 Decision item 5 (pairing by version identity, F-CTR-6) is implemented: plan eb18e398, impl 53ec94e5 (2026-10-17). F-CTR-5a class-preserving compaction and the F-CTR-7 multi-source LSM guard are implemented: plan 162f76a7, impl beb5c7af (2026-10-17).
 
-F-CTR-8 crash-safe counter dedup finalization is selected by the plan amendment in `plans/impl/0102_counter_visibility_and_persisted_origin.md`. The accepted contract is `/home/me/work/.agent-bridge/wendelon-adr0102-f-ctr-8-contract-r1/CONTRACT.md`; implementation remains gated and no source changes are authorized by the plan commit.
+F-CTR-8 crash-safe counter dedup finalization is implemented: plan 887e5e89, impl 6cdea9f1 (2026-10-19).
 
-F-CTR-5b remains open. The durable `counter-applied.log` is length-prefixed postcard and grows by about 44 bytes per resolved add; it is append-only, has no configured size bound, and is read into memory in full during recovery. Pruning waits for an explicit retention/TTL guarantee and a crash-safe compaction design.
+F-CTR-9 (a counter write key names exactly one add) is selected by the plan amendment in `plans/impl/0102_counter_visibility_and_persisted_origin.md`. The accepted contract is `/home/me/work/.agent-bridge/wendelon-adr0102-f-ctr-9-contract-r2/CONTRACT.md` with its Addenda A and B. The plan commit authorizes no source change.
+
+F-CTR-5b remains open. The durable `counter-applied.log` is length-prefixed postcard and grows by about 60-120 bytes per resolved add with F-CTR-8 keyed frames (an estimate; F-CTR-5b specifies the measurement); it is append-only, has no configured size bound, and is read into memory in full during recovery. Pruning waits for an explicit retention/TTL guarantee and a crash-safe compaction design.
 
 ## Context
 
