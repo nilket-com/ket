@@ -8601,7 +8601,7 @@ fn adr075_counter_add_reuses_client_write_id_idempotency() {
 	// compacted into the applied log BEFORE pruning (no dedup window).
 	assert!(counter.contains("write_key: CounterWriteKey,"));
 	assert!(counter.contains("fn append_applied"));
-	assert!(counter.contains("fn load_applied"));
+	assert!(counter.contains("fn recover_applied"));
 }
 
 #[test]
