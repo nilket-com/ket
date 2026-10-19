@@ -8,9 +8,9 @@ Decision item 5 (pairing by version identity, F-CTR-6) is implemented: plan eb18
 
 F-CTR-8 crash-safe counter dedup finalization is implemented: plan 887e5e89, impl 6cdea9f1 (2026-10-19).
 
-F-CTR-9 (a counter write key names exactly one add) is selected by the plan amendment in `plans/impl/0102_counter_visibility_and_persisted_origin.md`. The accepted contract is `/home/me/work/.agent-bridge/wendelon-adr0102-f-ctr-9-contract-r2/CONTRACT.md` with its Addenda A and B. The plan commit authorizes no source change.
+F-CTR-9 (a counter write key names exactly one add) is implemented: plan 6e60a406, impl 63cdca83 (2026-10-19).
 
-F-CTR-5b remains open. The durable `counter-applied.log` is length-prefixed postcard and grows by about 60-120 bytes per resolved add with F-CTR-8 keyed frames (an estimate; F-CTR-5b specifies the measurement); it is append-only, has no configured size bound, and is read into memory in full during recovery. Pruning waits for an explicit retention/TTL guarantee and a crash-safe compaction design.
+F-CTR-5b (bounded counter dedup with a time-bounded identity proof) is selected by the plan amendment in `plans/impl/0102_counter_visibility_and_persisted_origin.md`. The accepted contract is `/home/me/work/.agent-bridge/wendelon-adr0102-f-ctr-5b-retention-contract-r3/CONTRACT.md`. The plan commit authorizes no source change. Until it lands, `counter-applied.log` is append-only (about 60-120 bytes per resolved add with keyed frames, an estimate), has no size bound, and is read in full during recovery.
 
 ## Context
 
