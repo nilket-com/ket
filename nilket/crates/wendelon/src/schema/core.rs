@@ -194,7 +194,41 @@ impl ClientWriteId {
 		bytes[16..24].copy_from_slice(&self.sequence_no.to_le_bytes());
 		bytes
 	}
+
+	/// The issuance time of this write id: the unix milliseconds its UUIDv7
+	/// `client_uuid` carries, or `None` when the uuid is not a UUIDv7.
+	pub fn issued_unix_millis(&self) -> Option<u64> {
+		uuid_v7_unix_millis(self.client_uuid)
+	}
 }
+
+/// The unix milliseconds a UUIDv7 carries, or `None` for any other uuid. The one
+/// issuance predicate: a write id is a v7 identity exactly when this is `Some`,
+/// and its issuance time is that value. Mutation-outcome expiry, CTAS operation
+/// ids, the SDK's caller-id check and the counter dedup horizon all use it.
+pub fn uuid_v7_unix_millis(bytes: [u8; 16]) -> Option<u64> {
+	if bytes[6] >> 4 != 7 || bytes[8] >> 6 != 2 {
+		return None;
+	}
+	Some(
+		(u64::from(bytes[0]) << 40)
+			| (u64::from(bytes[1]) << 32)
+			| (u64::from(bytes[2]) << 24)
+			| (u64::from(bytes[3]) << 16)
+			| (u64::from(bytes[4]) << 8)
+			| u64::from(bytes[5]),
+	)
+}
+
+/// How long the SDK may issue counter adds under one client uuid before it
+/// rotates to a fresh one (`L_sdk`). The server's counter dedup horizon must
+/// cover it: a node refuses to start with an expiry shorter than this plus its
+/// attempt horizon and clock-skew allowance.
+pub const COUNTER_INCARNATION_LIFETIME_MS: u64 = 3_600_000;
+
+/// The longest the SDK keeps sending attempts of one counter add, measured from
+/// the moment it allocated the add's write id (`H`, and the server's default).
+pub const COUNTER_ATTEMPT_HORIZON_MS: u64 = 300_000;
 
 // ============================================================
 //  TRANSFER TOKEN — 128 bytes, fixed
@@ -1044,6 +1078,10 @@ impl WriteStatus {
 	/// counter key or delta). Nothing was applied, and the response carries
 	/// zero values rather than the recorded add's outcome. Not retryable as-is.
 	pub const WRITE_KEY_CONFLICT: Self = Self(24);
+	/// A counter add's write id is not a UUIDv7 identity, or was issued further
+	/// in the future than the server's clock-skew allowance. Nothing was applied,
+	/// and the same write id is refused again. Not retryable as-is.
+	pub const WRITE_IDENTITY_INVALID: Self = Self(25);
 
 	pub const fn as_str(self) -> &'static str {
 		match self {
@@ -1072,6 +1110,7 @@ impl WriteStatus {
 			Self::WRITE_OPERATION_EXPIRED => "write_operation_expired",
 			Self::WRITE_OPERATION_UNKNOWN => "write_operation_unknown",
 			Self::WRITE_KEY_CONFLICT => "write_key_conflict",
+			Self::WRITE_IDENTITY_INVALID => "write_identity_invalid",
 			_ => "unknown",
 		}
 	}
@@ -1211,6 +1250,28 @@ pub struct CounterAddResponseMeta {
 	/// 1 if a FinalizationMarker follows this frame; 0 otherwise
 	pub has_finalization: u8, //  1 byte
 	pub _pad2: [u8; 7],      //  7 bytes
+}
+
+impl CounterAddResponseMeta {
+	/// ADR 542's outcome axes in `_pad1`, as [`WriteResponseMeta`] carries them.
+	/// Only `WRITE_OPERATION_EXPIRED` sets them on a counter add.
+	pub fn with_mutation_outcome(
+		mut self,
+		knowledge: MutationCommitKnowledge,
+		reason: MutationStopReason,
+	) -> Self {
+		self._pad1[0] = knowledge.0;
+		self._pad1[1] = reason.0;
+		self
+	}
+
+	pub const fn mutation_commit_knowledge(self) -> MutationCommitKnowledge {
+		MutationCommitKnowledge(self._pad1[0])
+	}
+
+	pub const fn mutation_stop_reason(self) -> MutationStopReason {
+		MutationStopReason(self._pad1[1])
+	}
 }
 
 // ============================================================

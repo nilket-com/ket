@@ -96,9 +96,21 @@ impl CounterParticipantFactory {
 }
 
 impl WendelonDataServer {
+	/// The counter dedup horizon (H, S, E) every tenant leader applies, refused
+	/// at startup when out of range (E0, E1, E3).
+	pub fn with_counter_retention(
+		mut self,
+		retention: crate::storage::counter::CounterRetentionConfig,
+	) -> std::io::Result<Self> {
+		retention.validate()?;
+		self.counter_retention = retention;
+		Ok(self)
+	}
+
 	/// A counter leader whose dedup store latched fail-closed (an applied-log
-	/// barrier failed, or a failed prepare could not withdraw its witness) has
-	/// durable state this process can no longer describe: fence local writes.
+	/// barrier failed, a failed prepare could not withdraw its witness, or a
+	/// compaction failed at or after publishing `CURRENT`) has durable state
+	/// this process can no longer describe: fence local writes.
 	pub(super) async fn fence_unsettled_counter(
 		&self,
 		leader: &crate::storage::counter::CounterLeader<
@@ -338,6 +350,14 @@ impl WendelonDataServer {
 		let added = leader
 			.fetch_add_fenced(plan, write_key, &key, meta.delta, fence)
 			.await;
+		// Applied-log compaction (E5) runs in the background when due, and trips
+		// the same fence if it latches the store.
+		leader.compact_when_due({
+			let server = self.clone();
+			let leader = leader.clone();
+			let tenant_id = meta.tenant_id;
+			move || async move { server.fence_unsettled_counter(&leader, tenant_id).await }
+		});
 		let resp = match added {
 			Ok(result) => {
 				let outcome = result.outcome();
@@ -355,18 +375,32 @@ impl WendelonDataServer {
 				)
 			}
 			// All rejects fail closed — the leader mutated nothing (D5/D6). A write-key
-			// conflict carries zero values, never the recorded add's outcome.
+			// conflict carries zero values, never the recorded add's outcome. An
+			// expired write id (E1) may name an add that committed earlier, so it
+			// answers ADR 542's INDETERMINATE knowledge; every other reject zeroes
+			// the outcome axes.
 			Err(err) => {
 				let status = match err {
 					CounterLeaderError::NotLeader => WriteStatus::NOT_LEADER,
 					CounterLeaderError::ZeroDelta => WriteStatus::COUNTER_ZERO_DELTA,
 					CounterLeaderError::Overflow => WriteStatus::COUNTER_OVERFLOW,
 					CounterLeaderError::WriteKeyConflict => WriteStatus::WRITE_KEY_CONFLICT,
+					CounterLeaderError::InvalidWriteIdentity => WriteStatus::WRITE_IDENTITY_INVALID,
+					CounterLeaderError::OperationExpired => WriteStatus::WRITE_OPERATION_EXPIRED,
 					CounterLeaderError::QuorumFailed
 					| CounterLeaderError::Internal
 					| CounterLeaderError::Visibility(_) => WriteStatus::INTERNAL_ERROR,
 				};
-				self.counter_add_response(&meta, status, 0, 0, Self::zero_counter_hlc())
+				let response =
+					self.counter_add_response(&meta, status, 0, 0, Self::zero_counter_hlc());
+				if err == CounterLeaderError::OperationExpired {
+					response.with_mutation_outcome(
+						MutationCommitKnowledge::INDETERMINATE,
+						MutationStopReason::NONE,
+					)
+				} else {
+					response
+				}
 			}
 		};
 		Ok(self.build_counter_add_response_frame(stream_id, resp))
@@ -428,5 +462,54 @@ impl WendelonDataServer {
 			None => self.counter_read_response(ReadStatus::KEY_NOT_FOUND, 0, current_epoch),
 		};
 		Ok(self.build_counter_read_response_frame(stream_id, resp))
+	}
+
+	/// Per-tenant counter leader: recover durable dedup/witnesses and reconcile before serving.
+	/// This preserves restart DUPLICATE replay and finishes witnessed partial commits.
+	/// Fresh adds use per-key plans; recovery resolves recorded peer identities.
+	/// The per-tenant init gate permits exactly one recovery for concurrent first requests.
+	/// Recovery file I/O never holds a DashMap entry lock across await.
+	/// The leader applies the server's validated dedup horizon on its clock.
+	pub(super) async fn counter_leader_for(
+		&self,
+		tenant_id: TenantId,
+	) -> std::io::Result<
+		Arc<
+			crate::storage::counter::CounterLeader<crate::storage::counter::CounterParticipantKind>,
+		>,
+	> {
+		use crate::storage::counter::{
+			CounterLeader, CounterParticipantKind, LocalCounterParticipant,
+		};
+		if let Some(existing) = self.counter_leaders.get(&tenant_id) {
+			return Ok(existing.clone());
+		}
+		let init_gate = self
+			.counter_leader_init
+			.entry(tenant_id)
+			.or_default()
+			.clone();
+		let _init_guard = init_gate.lock().await;
+		if let Some(existing) = self.counter_leaders.get(&tenant_id) {
+			return Ok(existing.clone());
+		}
+		let participant = CounterParticipantKind::Local(LocalCounterParticipant::new(
+			self.counter_replica.clone(),
+			tenant_id,
+			self.local_node,
+		));
+		let owner = self._directory_owner.as_ref();
+		let witness_store = ownership::witness_store(&self.slab, tenant_id, owner)?;
+		let leader = Arc::new(
+			CounterLeader::recover(self.local_node, participant, true, witness_store)?
+				.with_retention(self.counter_retention, self.clock.clone()),
+		);
+		// Finish any partial commit fan-out (idempotent) before first service.
+		let resolver =
+			self.counter_participant_factory(tenant_id, self.admission_snapshot().current_epoch);
+		leader.reconcile(&resolver).await;
+		self.fence_unsettled_counter(&leader, tenant_id).await;
+		self.counter_leaders.insert(tenant_id, leader.clone());
+		Ok(leader)
 	}
 }

@@ -153,6 +153,17 @@ slab_dek_cache_max_entries = 10000
 # Set to `0` to disable MVCC snapshot pruning. Internally this maps to
 # the bootstrap retention policy's `Disabled` / `FixedWindow` modes.
 #
+# Counter dedup horizon. A counter add's write id is refused once it is
+# older than `expiry_secs`, and when it was issued more than
+# `clock_skew_secs` ahead of this node's clock: keep every node and client
+# clock under NTP within `clock_skew_secs`. The expiry must be at least the
+# SDK's one-hour client incarnation plus the other two; startup refuses less.
+#
+# [counter]
+# attempt_horizon_secs = 300
+# clock_skew_secs = 60
+# expiry_secs = 3960
+#
 # Optional observability listener topology. `/ready` and `/metrics`
 # are mTLS-gated and therefore require `[transport.tls]`.
 #

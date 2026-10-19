@@ -8,16 +8,16 @@ use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 use wendelon::client::{
 	ClusterPeerWire, ClusterStatusWire, ControlRingTopologySource, CounterAddRequest,
-	CounterReadRequest, DATA_RETRY_BUDGET, MutationOutcomePinRequest, MutationOutcomeRequest,
-	ReadRequest, TableDeleteRowsRequest, TableQueryRequest, TableWriteRequest,
-	WendelonClient as InnerClient, WendelonClientConfig, WriteRequest,
+	CounterAttemptBound, CounterAttemptsStopped, CounterReadRequest, DATA_RETRY_BUDGET,
+	MutationOutcomePinRequest, MutationOutcomeRequest, ReadRequest, TableDeleteRowsRequest,
+	TableQueryRequest, TableWriteRequest, WendelonClient as InnerClient, WendelonClientConfig,
+	WriteRequest,
 };
 use wendelon::network::control_server::{
 	CONTROL_REASON_NOT_LEADER, CtasSagaRequestWire, CtasSagaResponseWire, SchemaUpdateResponseWire,
@@ -53,6 +53,15 @@ use wendelon::schema::{
 	write_payload_schema,
 };
 use wendelon::storage::counter::{CounterKey, counter_identity};
+
+pub use wendelon::client::{ClientClock, SystemClientClock};
+/// `H`, in milliseconds: no attempt of a counter add is sent once this long has
+/// passed since its write id was allocated.
+pub use wendelon::schema::COUNTER_ATTEMPT_HORIZON_MS as COUNTER_ATTEMPT_HORIZON;
+/// `L_sdk`, in milliseconds: a client rotates to a fresh counter incarnation
+/// (a new UUIDv7, sequence restarting at 1) before its uuid is this old. The
+/// server's dedup expiry is validated against the same constant.
+pub use wendelon::schema::COUNTER_INCARNATION_LIFETIME_MS as INCARNATION_LIFETIME;
 
 pub use wendelon::client::{
 	CdcFrame, CdcSubscription, QueryLocalityRange, RowIdentityProjection, StreamingQueryResult,
@@ -612,8 +621,7 @@ fn default_table_mutation_id() -> ClientWriteId {
 }
 
 fn validate_caller_mutation_id(operation_id: ClientWriteId) -> Result<(), ClientError> {
-	let uuid = operation_id.client_uuid;
-	if uuid[6] >> 4 == 7 && uuid[8] >> 6 == 2 {
+	if operation_id.issued_unix_millis().is_some() {
 		return Ok(());
 	}
 	Err(ClientError::Io(std::io::Error::new(
@@ -622,18 +630,66 @@ fn validate_caller_mutation_id(operation_id: ClientWriteId) -> Result<(), Client
 	)))
 }
 
+/// One counter incarnation: the uuid a client's write ids carry, when it was
+/// minted, and the next sequence number under it.
+struct Incarnation {
+	uuid: [u8; 16],
+	minted: Instant,
+	next_sequence: u64,
+}
+
+impl Incarnation {
+	/// A fresh UUIDv7 incarnation issued at `clock`'s wall time.
+	fn mint(clock: &dyn ClientClock) -> Self {
+		let millis = clock.unix_millis();
+		let timestamp = uuid::Timestamp::from_unix(
+			uuid::NoContext,
+			millis / 1_000,
+			u32::try_from(millis % 1_000).expect("sub-second millis") * 1_000_000,
+		);
+		Self {
+			uuid: *Uuid::new_v7(timestamp).as_bytes(),
+			minted: clock.now(),
+			next_sequence: 1,
+		}
+	}
+}
+
+/// One allocated write id and when it was allocated.
+struct Allocation {
+	write_id: ClientWriteId,
+	allocated_at: Instant,
+}
+
 pub struct Client {
 	inner: Arc<InnerClient>,
-	client_uuid: [u8; 16],
-	next_sequence: AtomicU64,
+	/// Every write id is allocated from one incarnation under this lock, so a
+	/// rotation never mixes one incarnation's uuid with another's sequence.
+	incarnation: std::sync::Mutex<Incarnation>,
+	/// False for a caller-supplied uuid: its caller carries E6.
+	rotates: bool,
+	clock: Arc<dyn ClientClock>,
 }
 
 impl Client {
 	/// A client with a fresh UUIDv7 `client_uuid`, unique to this instance. Its
 	/// write ids `(client_uuid, sequence_no)` can never be issued by another
-	/// instance, in this process or any other.
+	/// instance, in this process or any other. It rotates to a fresh uuid, its
+	/// sequence restarting at 1, before the uuid is [`INCARNATION_LIFETIME`]
+	/// old, so its counter adds stay inside every node's dedup horizon (E6).
 	pub fn from_inner(inner: Arc<InnerClient>) -> Self {
-		Self::with_client_uuid(inner, *Uuid::now_v7().as_bytes())
+		Self::from_inner_with_clock(inner, Arc::new(SystemClientClock))
+	}
+
+	/// [`from_inner`](Self::from_inner) on a substitute clock (tests).
+	#[doc(hidden)]
+	pub fn from_inner_with_clock(inner: Arc<InnerClient>, clock: Arc<dyn ClientClock>) -> Self {
+		Self {
+			inner,
+			incarnation: std::sync::Mutex::new(Incarnation::mint(clock.as_ref())),
+			rotates: true,
+			clock,
+		}
 	}
 
 	/// A client whose write ids use the caller's `client_uuid`. The uuid must be
@@ -642,19 +698,65 @@ impl Client {
 	/// process, or another live instance) reissues earlier write ids. A counter
 	/// add under a reissued write id that names a different add is refused with
 	/// `WriteFailed { status: WRITE_KEY_CONFLICT }`: never applied, never
-	/// replayed. Prefer [`from_inner`](Self::from_inner).
+	/// replayed. This client never rotates its uuid: the caller must replace it
+	/// before it is [`INCARNATION_LIFETIME`] old, or its counter adds expire
+	/// (`MutationStopped { status: WRITE_OPERATION_EXPIRED }`). Prefer
+	/// [`from_inner`](Self::from_inner).
 	pub fn with_client_uuid(inner: Arc<InnerClient>, client_uuid: [u8; 16]) -> Self {
+		Self::with_client_uuid_and_clock(inner, client_uuid, Arc::new(SystemClientClock))
+	}
+
+	/// [`with_client_uuid`](Self::with_client_uuid) on a substitute clock (tests).
+	#[doc(hidden)]
+	pub fn with_client_uuid_and_clock(
+		inner: Arc<InnerClient>,
+		client_uuid: [u8; 16],
+		clock: Arc<dyn ClientClock>,
+	) -> Self {
 		Self {
 			inner,
-			client_uuid,
-			next_sequence: AtomicU64::new(1),
+			incarnation: std::sync::Mutex::new(Incarnation {
+				uuid: client_uuid,
+				minted: clock.now(),
+				next_sequence: 1,
+			}),
+			rotates: false,
+			clock,
 		}
 	}
 
-	/// The `client_uuid` this instance writes under.
+	/// The `client_uuid` of the current incarnation.
 	#[doc(hidden)]
 	pub fn client_uuid(&self) -> [u8; 16] {
-		self.client_uuid
+		self.lock_incarnation().uuid
+	}
+
+	fn lock_incarnation(&self) -> std::sync::MutexGuard<'_, Incarnation> {
+		self.incarnation
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+
+	/// The next write id: the current incarnation's uuid and sequence, from one
+	/// incarnation, after rotating it once it is [`INCARNATION_LIFETIME`] old.
+	fn allocate_write_id(&self) -> Allocation {
+		let mut incarnation = self.lock_incarnation();
+		let now = self.clock.now();
+		let lifetime = std::time::Duration::from_millis(INCARNATION_LIFETIME);
+		if self.rotates && now.saturating_duration_since(incarnation.minted) >= lifetime {
+			*incarnation = Incarnation::mint(self.clock.as_ref());
+		}
+		let sequence_no = incarnation.next_sequence;
+		incarnation.next_sequence += 1;
+		Allocation {
+			write_id: ClientWriteId {
+				client_uuid: incarnation.uuid,
+				sequence_no,
+				idempotency_ttl_ms: 60_000,
+				_pad: 0,
+			},
+			allocated_at: now,
+		}
 	}
 
 	pub async fn connect_quic(config: ClientConfig) -> Result<Self, ClientError> {
@@ -1320,12 +1422,7 @@ impl Client {
 		let identity = Self::identity_for_key(tenant_id, key);
 		let request = WriteRequest {
 			meta: WriteRequestMeta {
-				write_id: ClientWriteId {
-					client_uuid: self.client_uuid,
-					sequence_no: self.next_sequence.fetch_add(1, Ordering::Relaxed),
-					idempotency_ttl_ms: 60_000,
-					_pad: 0,
-				},
+				write_id: self.allocate_write_id().write_id,
 				client_hlc: options.client_hlc.unwrap_or_else(default_client_hlc),
 				expected_epoch: self.inner.epoch(),
 				tenant_id,
@@ -1383,14 +1480,10 @@ impl Client {
 		options: WriteOptions,
 	) -> Result<CounterAddReceipt, ClientError> {
 		let identity = Self::counter_identity_for_key(key);
+		let allocation = self.allocate_write_id();
 		let request = CounterAddRequest {
 			meta: CounterAddRequestMeta {
-				write_id: ClientWriteId {
-					client_uuid: self.client_uuid,
-					sequence_no: self.next_sequence.fetch_add(1, Ordering::Relaxed),
-					idempotency_ttl_ms: 60_000,
-					_pad: 0,
-				},
+				write_id: allocation.write_id,
 				client_hlc: options.client_hlc.unwrap_or_else(default_client_hlc),
 				expected_epoch: self.inner.epoch(),
 				tenant_id,
@@ -1406,7 +1499,30 @@ impl Client {
 			},
 			payload: key_batch(key)?,
 		};
-		let result = self.inner.counter_add(request).await?;
+		let bound = CounterAttemptBound {
+			allocated_at: allocation.allocated_at,
+			horizon: std::time::Duration::from_millis(COUNTER_ATTEMPT_HORIZON),
+			clock: self.clock.clone(),
+		};
+		let result = match self.inner.counter_add_bounded(request, Some(bound)).await {
+			Ok(result) => result,
+			Err(error) => {
+				let stopped = error
+					.get_ref()
+					.and_then(|source| source.downcast_ref::<CounterAttemptsStopped>())
+					.copied();
+				return Err(match stopped {
+					// E6: the add's next attempt would have outlived its horizon.
+					Some(stopped) => ClientError::MutationStopped {
+						operation_id: stopped.write_id,
+						status: WriteStatus::WRITE_DEADLINE_EXCEEDED,
+						reason: MutationStopReason::DEADLINE,
+						knowledge: stopped.knowledge,
+					},
+					None => ClientError::Io(error),
+				});
+			}
+		};
 		match result.response.status {
 			// Defence in depth: a receipt must describe this add's own delta.
 			s if (s == WriteStatus::OK || s == WriteStatus::DUPLICATE)
@@ -1435,9 +1551,17 @@ impl Client {
 				Err(ClientError::TenantUnavailable { tenant_id })
 			}
 			s if s == WriteStatus::AUTHORIZATION_FAILED => Err(ClientError::AuthorizationFailed),
-			// Counter rejects (COUNTER_ZERO_DELTA / COUNTER_OVERFLOW, D5, and
-			// WRITE_KEY_CONFLICT) surface via the carried status; no Toron-visible
-			// enum growth (D9 producer-only).
+			// E1: the write id is past the node's dedup horizon. Nothing was applied
+			// by this attempt, but an earlier one may have committed: never retried.
+			s if s == WriteStatus::WRITE_OPERATION_EXPIRED => Err(ClientError::MutationStopped {
+				operation_id: result.response.echoed_write_id,
+				status: s,
+				reason: result.response.mutation_stop_reason(),
+				knowledge: result.response.mutation_commit_knowledge(),
+			}),
+			// Counter rejects (COUNTER_ZERO_DELTA / COUNTER_OVERFLOW, D5,
+			// WRITE_KEY_CONFLICT and WRITE_IDENTITY_INVALID) surface via the carried
+			// status; no Toron-visible enum growth (D9 producer-only).
 			status => Err(ClientError::WriteFailed { status }),
 		}
 	}

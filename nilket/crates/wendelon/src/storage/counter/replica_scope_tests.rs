@@ -539,7 +539,7 @@ async fn b1d_real_local_remote_enum_and_witness_redrive_carry_counter_key() {
 	let outcome = leader
 		.fetch_add(
 			CounterParticipantPlan::new(vec![(node(1), lp.clone()), (node(2), rp.clone())], 1),
-			[7; 24],
+			test_write_key(7),
 			&key,
 			5,
 		)
@@ -679,7 +679,7 @@ async fn b1d_conflict_below_quorum_rolls_back_only_accepted_scope_with_real_key(
 		leader
 			.fetch_add(
 				CounterParticipantPlan::new(vec![(node(1), lp), (node(2), rp)], 2),
-				[7; 24],
+				test_write_key(7),
 				&key,
 				5
 			)

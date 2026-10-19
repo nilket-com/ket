@@ -7,6 +7,10 @@
 //! `WENDELON_COUNTER_BENCH_DIR=<dir> nilket/scripts/cargo-cgroup test --release
 //! -p wendelon --lib counter_add_throughput_measurement -- --ignored --nocapture`
 //! (from the `nilket` workspace; never raw `cargo`)
+//!
+//! With `WENDELON_COUNTER_BENCH_COMPACT=1` the leader's applied-log compaction
+//! runs back to back for the whole measured window (the adds' latency with
+//! compaction running); unset, nothing else changes.
 use super::*;
 use std::time::Instant;
 
@@ -34,6 +38,20 @@ async fn counter_add_throughput_measurement() {
 	for n in 0..warmup {
 		leader.fetch_add(wk(n as u64 + 1), &key, 1).await.unwrap();
 	}
+	let compact = std::env::var("WENDELON_COUNTER_BENCH_COMPACT").is_ok_and(|value| value == "1");
+	let stop = Arc::new(AtomicBool::new(false));
+	let compactor = compact.then(|| {
+		let (leader, stop) = (leader.leader.clone(), stop.clone());
+		tokio::spawn(async move {
+			let mut compactions = 0u64;
+			while !stop.load(Ordering::Relaxed) {
+				leader.compact().await.expect("compaction");
+				compactions += 1;
+				tokio::task::yield_now().await;
+			}
+			compactions
+		})
+	});
 	let mut latencies = Vec::with_capacity(ops);
 	let started = Instant::now();
 	for n in 0..ops {
@@ -46,6 +64,11 @@ async fn counter_add_throughput_measurement() {
 		assert!(matches!(result, CounterAddResult::Applied(_)));
 	}
 	let elapsed = started.elapsed();
+	stop.store(true, Ordering::Relaxed);
+	let compactions = match compactor {
+		Some(task) => task.await.unwrap(),
+		None => 0,
+	};
 	assert_eq!(leader.pending_witnesses(), 0, "every add resolved");
 	assert_eq!(
 		leader.read(&key).await.unwrap(),
@@ -55,7 +78,7 @@ async fn counter_add_throughput_measurement() {
 	let micros = |at: usize| latencies[at.min(ops - 1)].as_secs_f64() * 1e6;
 	let mean = latencies.iter().map(|d| d.as_secs_f64()).sum::<f64>() / ops as f64 * 1e6;
 	println!(
-		"COUNTER_BENCH {{\"ops\":{ops},\"warmup\":{warmup},\"elapsed_s\":{:.6},\"adds_per_s\":{:.3},\"lat_mean_us\":{mean:.1},\"lat_p50_us\":{:.1},\"lat_p99_us\":{:.1},\"lat_max_us\":{:.1}}}",
+		"COUNTER_BENCH {{\"compact\":{compact},\"compactions\":{compactions},\"ops\":{ops},\"warmup\":{warmup},\"elapsed_s\":{:.6},\"adds_per_s\":{:.3},\"lat_mean_us\":{mean:.1},\"lat_p50_us\":{:.1},\"lat_p99_us\":{:.1},\"lat_max_us\":{:.1}}}",
 		elapsed.as_secs_f64(),
 		ops as f64 / elapsed.as_secs_f64(),
 		micros(ops / 2),

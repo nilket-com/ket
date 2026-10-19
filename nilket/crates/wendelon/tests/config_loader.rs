@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use wendelon::config::{load_node_bootstrap_config, render_example_config, write_example_config};
 use wendelon::crypto::{
@@ -2078,4 +2079,72 @@ fn identity_audit_toml_requires_secret_and_trust_map() {
 		"[identity.absent_audit_keys]",
 	);
 	assert!(load_node_bootstrap_config(write_config(&root, &without_map)).is_err());
+}
+
+#[test]
+fn counter_retention_defaults_and_overrides_load() {
+	let root = fresh_dir("counter-retention");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let defaults = write_config(&root, &render_example_config());
+	let loaded = load_node_bootstrap_config(&defaults).unwrap();
+	assert_eq!(
+		loaded.counter_retention,
+		wendelon::storage::counter::CounterRetentionConfig::default()
+	);
+	assert_eq!(loaded.counter_retention.expiry_ms, 3_960_000);
+
+	let root = fresh_dir("counter-retention-override");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let body = format!(
+		"{}\n[counter]\nattempt_horizon_secs = 600\nclock_skew_secs = 30\n",
+		render_example_config()
+	);
+	let loaded = load_node_bootstrap_config(write_config(&root, &body)).unwrap();
+	let retention = loaded.counter_retention;
+	assert_eq!(
+		(
+			retention.attempt_horizon_ms,
+			retention.clock_skew_ms,
+			retention.expiry_ms
+		),
+		(600_000, 30_000, 3_600_000 + 600_000 + 30_000),
+		"the expiry defaults to the incarnation lifetime plus H plus S"
+	);
+}
+
+// T-CFGVAL: an out-of-range counter dedup horizon is refused at startup: a zero
+// value, a skew allowance above the attempt horizon, an attempt horizon below
+// the SDK's, an expiry shorter than the incarnation lifetime plus both, and an
+// unknown key.
+#[test]
+fn out_of_range_counter_retention_is_refused_at_startup() {
+	let cases = [
+		("attempt_horizon_secs = 0", ErrorKind::InvalidInput),
+		("clock_skew_secs = 0", ErrorKind::InvalidInput),
+		("expiry_secs = 0", ErrorKind::InvalidInput),
+		(
+			"attempt_horizon_secs = 600\nclock_skew_secs = 601",
+			ErrorKind::InvalidInput,
+		),
+		// Addendum A7: below the SDK's 300 s attempt horizon.
+		("attempt_horizon_secs = 299", ErrorKind::InvalidInput),
+		("expiry_secs = 3959", ErrorKind::InvalidInput),
+		("expiry_secs = 9223372036854775807", ErrorKind::InvalidInput),
+		("expiry_ms = 3960000", ErrorKind::InvalidData),
+	];
+	for (index, (section, kind)) in cases.into_iter().enumerate() {
+		let root = fresh_dir(&format!("counter-retention-invalid-{index}"));
+		std::fs::create_dir_all(root.join("data")).unwrap();
+		let body = format!("{}\n[counter]\n{section}\n", render_example_config());
+		let err = load_node_bootstrap_config(write_config(&root, &body)).unwrap_err();
+		assert_eq!(err.kind(), kind, "{section}: {err}");
+	}
+	// The boundary itself is accepted.
+	let root = fresh_dir("counter-retention-boundary");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let body = format!(
+		"{}\n[counter]\nexpiry_secs = 3960\n",
+		render_example_config()
+	);
+	load_node_bootstrap_config(write_config(&root, &body)).unwrap();
 }

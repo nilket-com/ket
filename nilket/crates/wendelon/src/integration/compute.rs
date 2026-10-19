@@ -1011,6 +1011,9 @@ pub fn map_write_status_for_compute(status: WriteStatus) -> StorageStatusKind {
 		| WriteStatus::INTERNAL_ERROR => StorageStatusKind::TerminalStorageError,
 		// The write id names another add: an identity fault, never a retry.
 		WriteStatus::WRITE_KEY_CONFLICT => StorageStatusKind::TerminalStorageError,
+		// A counter add's write id is not a presentable identity (not UUIDv7, or
+		// issued beyond the clock-skew allowance): the same id is refused again.
+		WriteStatus::WRITE_IDENTITY_INVALID => StorageStatusKind::TerminalStorageError,
 		_ => StorageStatusKind::TerminalStorageError,
 	}
 }

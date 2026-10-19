@@ -312,7 +312,7 @@ fn outcome_store_registry() -> &'static StdMutex<HashMap<PathBuf, Weak<MutationO
 }
 
 fn operation_identity_is_expired(write_id: ClientWriteId, now_ms: u64) -> bool {
-	let Some(issued_at_ms) = uuid_v7_unix_millis(write_id.client_uuid) else {
+	let Some(issued_at_ms) = write_id.issued_unix_millis() else {
 		// Legacy SDK identities are UUIDv4 session ids. They retain their historical
 		// cache semantics; ADR 542's permanent post-reclaim rejection applies to the
 		// Toron SQL/Rune mutation identities, which are UUIDv7 by construction.
@@ -320,20 +320,6 @@ fn operation_identity_is_expired(write_id: ClientWriteId, now_ms: u64) -> bool {
 	};
 	let ttl = u64::from(write_id.idempotency_ttl_ms.clamp(1_000, 300_000));
 	issued_at_ms.saturating_add(ttl) <= now_ms
-}
-
-fn uuid_v7_unix_millis(bytes: [u8; 16]) -> Option<u64> {
-	if bytes[6] >> 4 != 7 || bytes[8] >> 6 != 2 {
-		return None;
-	}
-	Some(
-		(u64::from(bytes[0]) << 40)
-			| (u64::from(bytes[1]) << 32)
-			| (u64::from(bytes[2]) << 24)
-			| (u64::from(bytes[3]) << 16)
-			| (u64::from(bytes[4]) << 8)
-			| u64::from(bytes[5]),
-	)
 }
 
 fn prune_expired(table: &mut redb::Table<'_, &[u8], u64>, now: u64) -> std::io::Result<()> {

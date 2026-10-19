@@ -248,11 +248,27 @@ async fn client_write_and_read_round_trip_over_hrft() {
 	support::abort_node(&node);
 }
 
+/// A UUIDv7 client uuid issued now: a counter add must carry a v7 identity
+/// inside the dedup horizon (E0, E1). Each test mints its own at its start
+/// and reuses it, so a retried write id stays one identity and no test's
+/// identity ages with the process.
+fn counter_client_uuid() -> [u8; 16] {
+	let now_ms = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	let mut uuid = [0u8; 16];
+	uuid[..6].copy_from_slice(&now_ms.to_be_bytes()[2..]);
+	uuid[6] = 0x70;
+	uuid[8] = 0x80;
+	uuid
+}
 // ADR 075 cut-5: the high-level COUNTER_ADD client path end-to-end over HRFT —
 // apply, accumulate on a distinct write_id, and replay a duplicate write_id
 // (the server's D4 cache) without re-applying.
 #[tokio::test]
 async fn client_counter_fetch_add_round_trip_over_hrft() {
+	let client_uuid = counter_client_uuid();
 	let node = support::bootstrap_node("client-counter-add", 1).await;
 	refresh_leases(&node).await;
 
@@ -269,7 +285,7 @@ async fn client_counter_fetch_add_round_trip_over_hrft() {
 	let add = |seq: u64, delta: u64| CounterAddRequest {
 		meta: CounterAddRequestMeta {
 			write_id: ClientWriteId {
-				client_uuid: [9u8; 16],
+				client_uuid,
 				sequence_no: seq,
 				idempotency_ttl_ms: 60_000,
 				_pad: 0,
@@ -323,6 +339,7 @@ async fn client_counter_fetch_add_round_trip_over_hrft() {
 // KEY_NOT_FOUND (absence is absence — the read never fabricates 0).
 #[tokio::test]
 async fn client_counter_read_round_trip_and_absent_over_hrft() {
+	let client_uuid = counter_client_uuid();
 	let node = support::bootstrap_node("client-counter-read", 1).await;
 	refresh_leases(&node).await;
 
@@ -341,7 +358,7 @@ async fn client_counter_read_round_trip_and_absent_over_hrft() {
 			.counter_add(CounterAddRequest {
 				meta: CounterAddRequestMeta {
 					write_id: ClientWriteId {
-						client_uuid: [9u8; 16],
+						client_uuid,
 						sequence_no: seq,
 						idempotency_ttl_ms: 60_000,
 						_pad: 0,

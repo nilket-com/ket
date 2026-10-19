@@ -22,17 +22,7 @@ impl CtasOperationId {
 	/// CTAS requires this shape so expiry remains provable after bounded saga
 	/// detail has been reclaimed.
 	pub fn issued_at_unix_millis(self) -> Option<u64> {
-		if self.0[6] >> 4 != 7 || self.0[8] >> 6 != 2 {
-			return None;
-		}
-		Some(
-			(u64::from(self.0[0]) << 40)
-				| (u64::from(self.0[1]) << 32)
-				| (u64::from(self.0[2]) << 24)
-				| (u64::from(self.0[3]) << 16)
-				| (u64::from(self.0[4]) << 8)
-				| u64::from(self.0[5]),
-		)
+		crate::schema::uuid_v7_unix_millis(self.0)
 	}
 }
 

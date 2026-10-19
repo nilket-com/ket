@@ -3329,8 +3329,7 @@ async fn ctr6_leader_add_after_straddled_reopen_uses_42_as_base_and_commits_43()
 	// The version at HLC 42 represents the preceding committed op; align the
 	// freshly reconstructed leader's allocator with the next canonical op id.
 	leader.set_next_op_id_for_test(43);
-	let mut write_key = [0; 24];
-	write_key[..8].copy_from_slice(&43u64.to_le_bytes());
+	let write_key = crate::storage::counter::test_write_key(43);
 	let result = leader
 		.fetch_add(
 			crate::storage::counter::CounterParticipantPlan::new(vec![(origin, local)], 1),
@@ -4656,11 +4655,10 @@ use crate::storage::counter::{
 	CounterParticipantPlan, CounterWriteKey, DurableCounterWitnessStore, LocalCounterParticipant,
 };
 
-/// Canonical write-key fixture: the test's small id, LE-embedded in 24 bytes.
+/// Canonical write-key fixture: a UUIDv7 test identity with the test's small
+/// id as the sequence number.
 fn wkey(n: u64) -> CounterWriteKey {
-	let mut key = [0u8; 24];
-	key[..8].copy_from_slice(&n.to_le_bytes());
-	key
+	crate::storage::counter::test_write_key(n)
 }
 
 // cut-3 acceptance: a `CounterLeader` over the production `CounterParticipantKind`
