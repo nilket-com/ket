@@ -925,9 +925,24 @@ impl Drop for TempDirectory {
 mod tests {
 	use super::*;
 
+	/// Signing off for every scratch-repository git invocation the tests make.
+	const HERMETIC_GIT_CONFIG: &[&str] = &[
+		"-c",
+		"commit.gpgsign=false",
+		"-c",
+		"tag.gpgsign=false",
+		"-c",
+		"tag.forceSignAnnotated=false",
+	];
+
 	fn git(repo: &Path, args: &[&str]) {
+		// Scratch repositories must not inherit the developer's global or
+		// system git config (e.g. `commit.gpgsign` with an unreachable agent).
 		let status = Command::new("git")
 			.current_dir(repo)
+			.env("GIT_CONFIG_NOSYSTEM", "1")
+			.env("GIT_CONFIG_GLOBAL", "/dev/null")
+			.args(HERMETIC_GIT_CONFIG)
 			.args(args)
 			.env("GIT_AUTHOR_NAME", "ADR 581")
 			.env("GIT_AUTHOR_EMAIL", "adr581@example.invalid")
