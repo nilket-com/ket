@@ -71,6 +71,12 @@ pub(super) fn trusted_manifest2(bytes: &[u8]) -> Result<TrustedManifest2, &'stat
 		pin,
 	})
 }
+impl TrustedManifest2 {
+	/// The operator's exact manifest bytes, as bound; the context export carries them.
+	pub(super) fn bytes(&self) -> &[u8] {
+		&self.bytes
+	}
+}
 fn position(entry: &Entry<WendelonTypeConfig>) -> EntryPosition2 {
 	EntryPosition2 {
 		term: entry.log_id.leader_id.term,

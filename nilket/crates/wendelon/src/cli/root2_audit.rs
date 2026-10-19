@@ -1,13 +1,18 @@
 //! `wendelon audit root2`: the offline, read-only Root2 compromise audit over a node's data
-//! directory. It takes no data-directory owner lock and writes nothing; the trusted manifest and
-//! an optional suspect key are explicit files supplied out of band, never inferred from the log.
+//! directory. It takes no data-directory owner lock and writes nothing there; the trusted manifest
+//! and an optional suspect key are explicit files supplied out of band, never inferred from the
+//! log. `--export-context` writes the context export of a complete fold to a file outside the data
+//! directory, before any row is printed.
+mod publish;
+
 use crate::storage::mutation_visibility::root2::compromise::compromise_audit2;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: audit root2 <data-dir> --trusted-manifest <file> \
-	(--role <admin|governance|recovery> --epoch <n>)... | --key <file> [--suspect-only]";
+	[(--role <admin|governance|recovery> --epoch <n>)... | --key <file>] [--suspect-only] \
+	[--export-context <out> --node-id <n>]; suspects are optional only with --export-context";
 /// Bounded trust-input reads: a manifest is 241 bytes and a key file one hex line.
 const MAX_INPUT_BYTES: u64 = 4096;
 
@@ -18,6 +23,8 @@ struct Options {
 	suspects: Vec<(u8, u64)>,
 	key: Option<PathBuf>,
 	suspect_only: bool,
+	/// The context export's output and the operator-asserted node id it is labelled with.
+	export: Option<(PathBuf, u32)>,
 }
 
 fn role_code(name: &str) -> Option<u8> {
@@ -35,11 +42,12 @@ fn parse(args: &[String]) -> Result<Options, String> {
 		_ => return Err(USAGE.into()),
 	};
 	let (mut manifest, mut key, mut suspects, mut suspect_only) = (None, None, Vec::new(), false);
+	let (mut export, mut node_id) = (None, None);
 	while let Some((flag, tail)) = rest.split_first() {
 		rest = tail;
 		match flag.as_str() {
 			"--suspect-only" if !suspect_only => suspect_only = true,
-			"--trusted-manifest" | "--key" | "--role" => {
+			"--trusted-manifest" | "--key" | "--role" | "--export-context" | "--node-id" => {
 				let Some((value, tail)) = rest.split_first() else {
 					return Err(format!("{flag} requires a value\n{USAGE}"));
 				};
@@ -49,6 +57,14 @@ fn parse(args: &[String]) -> Result<Options, String> {
 						manifest = Some(PathBuf::from(value))
 					}
 					"--key" if key.is_none() => key = Some(PathBuf::from(value)),
+					"--export-context" if export.is_none() => export = Some(PathBuf::from(value)),
+					"--node-id" if node_id.is_none() => {
+						node_id = Some(
+							value
+								.parse::<u32>()
+								.map_err(|_| format!("bad node id {value}\n{USAGE}"))?,
+						)
+					}
 					"--role" => {
 						let role = role_code(value)
 							.ok_or_else(|| format!("unknown role {value}\n{USAGE}"))?;
@@ -73,10 +89,23 @@ fn parse(args: &[String]) -> Result<Options, String> {
 		}
 	}
 	let manifest = manifest.ok_or_else(|| format!("--trusted-manifest is required\n{USAGE}"))?;
-	if key.is_some() == !suspects.is_empty() {
+	let export = match (export, node_id) {
+		(Some(out), Some(node)) => Some((out, node)),
+		(None, None) => None,
+		_ => {
+			return Err(format!(
+				"--export-context and --node-id go together\n{USAGE}"
+			));
+		}
+	};
+	let unnamed = key.is_none() && suspects.is_empty();
+	if key.is_some() && !suspects.is_empty() || unnamed && export.is_none() {
 		return Err(format!(
 			"give either --role/--epoch suspects or one --key\n{USAGE}"
 		));
+	}
+	if unnamed && suspect_only {
+		return Err(format!("--suspect-only needs a suspect\n{USAGE}"));
 	}
 	Ok(Options {
 		data_dir,
@@ -84,6 +113,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
 		suspects,
 		key,
 		suspect_only,
+		export,
 	})
 }
 
@@ -129,6 +159,14 @@ pub(crate) fn execute(args: &[String], out: &mut dyn Write, err: &mut dyn Write)
 		Ok(options) => options,
 		Err(message) => return fail(2, message),
 	};
+	// The output path rule runs first: a bad path is a usage error before anything is read.
+	let target = match &options.export {
+		Some((out, _)) => match publish::target(&options.data_dir, out) {
+			Ok(target) => Some(target),
+			Err(message) => return fail(2, format!("--export-context: {message}")),
+		},
+		None => None,
+	};
 	let manifest = match read_bounded(&options.manifest) {
 		Ok(bytes) => bytes,
 		Err(message) => return fail(2, format!("trusted manifest: {message}")),
@@ -141,24 +179,50 @@ pub(crate) fn execute(args: &[String], out: &mut dyn Write, err: &mut dyn Write)
 		Ok(runtime) => runtime,
 		Err(e) => return fail(2, format!("runtime: {e}")),
 	};
-	let (stdout, diagnostic, code) = runtime.block_on(compromise_audit2(
+	let (stdout, exported, diagnostic, code) = runtime.block_on(compromise_audit2(
 		&options.data_dir,
 		&manifest,
 		&options.suspects,
 		key,
 		options.suspect_only,
+		options.export.as_ref().map(|(_, node)| *node),
 	));
+	// Only a complete fold is exported, and it is published before any row is printed.
+	let mut published = None;
+	if let Some(target) = &target
+		&& code == 0
+	{
+		let Some(bytes) = exported else {
+			return fail(2, "no context export was produced".into());
+		};
+		match publish::publish(target, &bytes) {
+			Ok(file) => published = Some((target, file)),
+			Err(message) => return fail(2, format!("--export-context: {message}")),
+		}
+	}
 	if out
 		.write_all(stdout.as_bytes())
 		.and_then(|()| out.flush())
 		.is_err()
 	{
+		// An exit 2 leaves no export: the one just published is withdrawn, if it is still there.
+		if let Some((target, file)) = published
+			&& let Err(message) = publish::withdraw(target, &file)
+		{
+			fail(2, format!("--export-context: {message}"));
+		}
 		return fail(2, "stdout write failed".into());
 	}
 	match diagnostic {
 		Some(message) => fail(code, message),
 		None => code,
 	}
+}
+
+/// Test-only: makes the context export's publish fail at `step` on this thread.
+#[cfg(test)]
+pub(crate) fn fail_publish_at(step: Option<&'static str>) {
+	publish::fail_at(step);
 }
 
 pub(super) fn run(args: &[String]) -> ExitCode {
@@ -203,11 +267,55 @@ mod tests {
 				suspects: vec![(1, 0), (3, 7)],
 				key: None,
 				suspect_only: true,
+				export: None,
 			}
 		);
 		let o = parse(&args(&["/d", "--key", "/k", "--trusted-manifest", "/m"])).unwrap();
 		assert_eq!(o.key, Some("/k".into()));
 		assert!(o.suspects.is_empty());
+		assert_eq!(o.export, None);
+		// With the export, the suspect set may be empty.
+		let o = parse(&args(&[
+			"/d",
+			"--trusted-manifest",
+			"/m",
+			"--export-context",
+			"/o",
+			"--node-id",
+			"4294967295",
+		]))
+		.unwrap();
+		assert_eq!(o.export, Some(("/o".into(), u32::MAX)));
+		assert!(o.suspects.is_empty() && o.key.is_none());
+	}
+
+	#[test]
+	fn export_usage_errors_are_refused() {
+		let export = ["/d", "--trusted-manifest", "/m", "--export-context", "/o"];
+		for bad in [
+			// Each flag without the other.
+			&export[..],
+			&[
+				"/d",
+				"--trusted-manifest",
+				"/m",
+				"--key",
+				"/k",
+				"--node-id",
+				"1",
+			][..],
+			// Not a u32 node id.
+			&[&export[..], &["--node-id", "x"]].concat()[..],
+			&[&export[..], &["--node-id", "-1"]].concat()[..],
+			&[&export[..], &["--node-id", "4294967296"]].concat()[..],
+			// Given twice.
+			&[&export[..], &["--node-id", "1", "--export-context", "/p"]].concat()[..],
+			&[&export[..], &["--node-id", "1", "--node-id", "2"]].concat()[..],
+			// --suspect-only needs a suspect, export or not.
+			&[&export[..], &["--node-id", "1", "--suspect-only"]].concat()[..],
+		] {
+			assert!(parse(&args(bad)).is_err(), "{bad:?}");
+		}
 	}
 
 	#[test]

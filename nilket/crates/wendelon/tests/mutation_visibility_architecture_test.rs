@@ -227,6 +227,301 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 	);
 }
 
+// C-S6b (ADR 0101 context export). The export is pure bytes in one private child of the audit,
+// produced only after the trace has finished (a complete fold), from the one context encoder the
+// role-proof digest hashes; the CLI checks the output path before anything is read and publishes
+// the file (temp, fsync, RENAME_NOREPLACE, directory fsync) before any row is printed.
+fn context_export_violation(
+	compromise: &str,
+	export: &str,
+	role_command: &str,
+	cli: &str,
+	publish: &str,
+) -> Option<&'static str> {
+	let flat = |t: &str| t.replace(char::is_whitespace, "");
+	// A missing anchor is a violation, never a pass.
+	let ordered = |t: &str, anchors: &[&str]| {
+		let at: Option<Vec<_>> = anchors.iter().map(|a| t.find(a)).collect();
+		at.is_some_and(|at| at.windows(2).all(|w| w[0] < w[1]))
+	};
+	let Some(digest) = role_command
+		.contains("fn context_digest(")
+		.then(|| flat(fn_body(role_command, "context_digest")))
+	else {
+		return Some("role_command.rs: no context_digest");
+	};
+	// The withdrawal removes only the file this run published: fstatat (no symlink follow) of
+	// the name, compared with the recorded identity, strictly before the unlink.
+	let body = |name: &str| {
+		publish
+			.contains(&format!("fn {name}("))
+			.then(|| flat(fn_body(publish, name)))
+	};
+	let (Some(withdraw), Some(identity_at)) = (body("withdraw"), body("identity_at")) else {
+		return Some("root2_audit/publish.rs: withdraw and identity_at");
+	};
+	if !ordered(
+		&withdraw,
+		&[
+			"identity_at(&target.parent,&target.name)",
+			"Ok(found)iffound==published.0=>{unlinkat(&target.parent,&target.name);",
+		],
+	) || withdraw.matches("unlinkat(").count() != 1
+		|| identity_at != "{identity(&openat(dir,name,libc::O_PATH|libc::O_NOFOLLOW,0)?)}"
+	{
+		return Some("root2_audit/publish.rs: withdraw unlinks only its own file");
+	}
+	let (compromise, role_command, cli, publish) = (
+		flat(compromise),
+		flat(role_command),
+		flat(cli),
+		flat(publish),
+	);
+	let Ok(tokens) = export.parse() else {
+		return Some("compromise/export.rs: unparseable");
+	};
+	let production = flat(&without_test_items_deep(tokens).to_string());
+	// The audit: one private child, each entry point called once, the export after `finish`.
+	if compromise.matches("modexport;").count() != 1
+		|| compromise.contains("pubmodexport")
+		|| calls(&compromise, "export::export2") != 1
+		|| calls(&compromise, "export::rotations2") != 1
+		|| !ordered(&compromise, &["trace.finish()", "export::export2("])
+		|| !ordered(&compromise, &["export::rotations2(", "audit::fold2("])
+	{
+		return Some("compromise.rs: the export is one private child, used after a complete fold");
+	}
+	// The export: pure, the context from the shared encoder, one integrity digest.
+	for banned in [
+		"std::fs",
+		"std::io",
+		"std::net",
+		"File",
+		"unsafe",
+		"spawn",
+		"libc",
+		"SystemTime",
+		"Instant",
+		"VISROOT2-ROLE3-CONTEXT",
+		"fncontext_bytes",
+		"c.generation",
+	] {
+		if production.contains(banned) {
+			return Some("compromise/export.rs: pure bytes from the shared context encoder");
+		}
+	}
+	if calls(&production, "context_bytes") != 1 || production.matches("hash(b\"\",&b)").count() != 1
+	{
+		return Some("compromise/export.rs: one context encoding and one integrity digest");
+	}
+	// The single context encoder: `context_digest` hashes exactly `context_bytes`.
+	if role_command.matches("fncontext_bytes(").count() != 1
+		|| !digest.contains("b\"VISROOT2-ROLE3-CONTEXT\\0\",&context_bytes(&admin_context2(a))")
+		|| calls(&digest, "hash") != 1
+		|| digest.contains("extend")
+	{
+		return Some("role_command.rs: context_digest hashes context_bytes and nothing else");
+	}
+	// The CLI order: path check, trust inputs, fold, the exit-0 gate, publish, stdout, and the
+	// withdrawal of a published export when stdout then fails.
+	let order = [
+		"publish::target(",
+		"read_bounded(&options.manifest)",
+		"runtime.block_on(compromise_audit2(",
+		"ifletSome(target)=&target&&code==0{",
+		"publish::publish(target,&bytes)",
+		"out.write_all(",
+		"publish::withdraw(target,&file)",
+	];
+	if !ordered(&cli, &order)
+		|| cli.matches("publish::publish(").count() != 1
+		|| cli.matches("publish::withdraw(").count() != 1
+	{
+		return Some("root2_audit.rs: path check first, publish before any row");
+	}
+	// The publish: exclusive 0600 temp beside the target, no-replace rename, no plain rename.
+	if publish.contains("storage::mutation_visibility")
+		|| publish.contains("std::fs::rename")
+		|| publish.contains("libc::rename(")
+		|| publish.contains("libc::renameat(")
+		|| calls(&publish, "libc::renameat2") != 1
+		|| publish.matches("libc::RENAME_NOREPLACE").count() != 1
+		|| !publish.contains("libc::O_WRONLY|libc::O_CREAT|libc::O_EXCL|libc::O_NOFOLLOW,0o600,")
+		|| !publish.contains("constTEMP_PREFIX:&str=\".wrctxexp.tmp.\";")
+		|| !publish.contains("\"{TEMP_PREFIX}{}.{}\"")
+		|| !publish.contains("name.starts_with(TEMP_PREFIX.as_bytes())")
+		|| publish.matches("unsafe{").count() != 4
+		|| publish.matches("//SAFETY:").count() != 4
+		// The recorded identity is the temp file's own, from its descriptor, before the rename.
+		|| !ordered(
+			&publish,
+			&[
+				"file.metadata()",
+				"Published((meta.dev(),meta.ino()))",
+				"rename_noreplace(&target.parent,&temp,&target.name)",
+			],
+		) {
+		return Some("root2_audit/publish.rs: atomic no-replace publish, documented unsafe");
+	}
+	None
+}
+#[test]
+fn context_export_is_pure_after_a_complete_fold_and_published_before_rows() {
+	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+	let root2 = src.join("storage/mutation_visibility/root2");
+	let read = |p: PathBuf| fs::read_to_string(p).unwrap();
+	let compromise = read(root2.join("compromise.rs"));
+	let export = read(root2.join("compromise/export.rs"));
+	let role_command = read(root2.join("role_command.rs"));
+	let cli = read(src.join("cli/root2_audit.rs"));
+	let publish = read(src.join("cli/root2_audit/publish.rs"));
+	let check =
+		|c: &str, e: &str, r: &str, l: &str, p: &str| context_export_violation(c, e, r, l, p);
+	assert_eq!(
+		check(&compromise, &export, &role_command, &cli, &publish),
+		None
+	);
+	// Probes: each guarded property, broken once, is caught.
+	let probes: [(&str, String, String, String, String, String); 15] = [
+		(
+			"a withdrawal that unlinks without the identity check",
+			compromise.clone(),
+			export.clone(),
+			role_command.clone(),
+			cli.clone(),
+			publish.replace("Ok(found) if found == published.0 =>", "_ if true =>"),
+		),
+		(
+			"a withdrawal that follows a symlink",
+			compromise.clone(),
+			export.clone(),
+			role_command.clone(),
+			cli.clone(),
+			publish.replace(
+				"libc::O_PATH | libc::O_NOFOLLOW, 0)?)",
+				"libc::O_PATH, 0)?)",
+			),
+		),
+		(
+			"no withdrawal when stdout fails after the publish",
+			compromise.clone(),
+			export.clone(),
+			role_command.clone(),
+			cli.replace("publish::withdraw(target, &file)", "Ok::<(), String>(())"),
+			publish.clone(),
+		),
+		(
+			"publishing outside the exit-0 gate",
+			compromise.clone(),
+			export.clone(),
+			role_command.clone(),
+			cli.replace("&& code == 0", "&& code < 5"),
+			publish.clone(),
+		),
+		(
+			"a renameat fallback",
+			compromise.clone(),
+			export.clone(),
+			role_command.clone(),
+			cli.clone(),
+			publish.clone() + "\nfn f() { libc::renameat(0, p, 0, q); }",
+		),
+		(
+			"a temp-prefixed output name accepted",
+			compromise.clone(),
+			export.clone(),
+			role_command.clone(),
+			cli.clone(),
+			publish.replace("name.starts_with(TEMP_PREFIX.as_bytes())", "false"),
+		),
+		(
+			"the export before the fold finished",
+			compromise.replace("trace.finish()", "trace.done()"),
+			export.clone(),
+			role_command.clone(),
+			cli.clone(),
+			publish.clone(),
+		),
+		(
+			"a public export module",
+			compromise.replace("\nmod export;", "\npub mod export;"),
+			export.clone(),
+			role_command.clone(),
+			cli.clone(),
+			publish.clone(),
+		),
+		(
+			"file I/O in the export",
+			compromise.clone(),
+			format!("{export}\nfn w() {{ std::fs::write(\"x\", []).unwrap(); }}"),
+			role_command.clone(),
+			cli.clone(),
+			publish.clone(),
+		),
+		(
+			"a second context encoder in the export",
+			compromise.clone(),
+			export.replace(
+				"b.extend(context_bytes(&context));",
+				"b.extend(context.generation);",
+			),
+			role_command.clone(),
+			cli.clone(),
+			publish.clone(),
+		),
+		(
+			"context_digest with its own encoding",
+			compromise.clone(),
+			export.clone(),
+			role_command.replace(
+				"&context_bytes(&admin_context2(a)),",
+				"&{ let mut b = Vec::new(); b.extend(admin_context2(a).generation); b },",
+			),
+			cli.clone(),
+			publish.clone(),
+		),
+		(
+			"rows printed before the export is published",
+			compromise.clone(),
+			export.clone(),
+			role_command.clone(),
+			cli.replace(
+				"publish::publish(target, &bytes)",
+				"publish::later(target, &bytes)",
+			) + "\nfn z() { publish::publish(target, &bytes); }",
+			publish.clone(),
+		),
+		(
+			"the path check after the trust inputs",
+			compromise.clone(),
+			export.clone(),
+			role_command.clone(),
+			cli.replace("publish::target(", "publish::checked(")
+				+ "\nfn z() { publish::target(); }",
+			publish.clone(),
+		),
+		(
+			"a plain rename fallback",
+			compromise.clone(),
+			export.clone(),
+			role_command.clone(),
+			cli.clone(),
+			publish.clone() + "\nfn f() { let _ = std::fs::rename(\"a\", \"b\"); }",
+		),
+		(
+			"an undocumented unsafe block",
+			compromise.clone(),
+			export.clone(),
+			role_command.clone(),
+			cli.clone(),
+			publish.clone() + "\nfn f() { unsafe { libc::sync() } }",
+		),
+	];
+	for (what, c, e, r, l, p) in &probes {
+		assert!(check(c, e, r, l, p).is_some(), "probe not caught: {what}");
+	}
+}
+
 #[test]
 fn s1_private_trust_tokens_and_fake_install_are_test_only() {
 	let root =

@@ -47,6 +47,20 @@ impl History2 {
 		}
 		out
 	}
+	/// Every successor (epoch 1 and later) as `(role, epoch, key, activation)`, in log order.
+	pub(super) fn successors(&self) -> Vec<(u8, u64, Digest2, Log2)> {
+		let mut out: Vec<_> = (1u8..)
+			.zip(&self.epochs)
+			.flat_map(|(role, history)| {
+				(0u64..)
+					.zip(history)
+					.skip(1)
+					.map(move |(epoch, (key, at))| (role, epoch, *key, *at))
+			})
+			.collect();
+		out.sort_unstable_by_key(|(_, _, _, at)| at.index);
+		out
+	}
 	fn slot(&self, role: u8, epoch: u64) -> Option<(Digest2, Log2)> {
 		let history = self.epochs.get(usize::from(role.checked_sub(1)?))?;
 		history.get(usize::try_from(epoch).ok()?).copied()
@@ -79,6 +93,9 @@ pub(in crate::storage::mutation_visibility::root2) struct Trace2 {
 	steps: Vec<Step2>,
 	freezes: Vec<(Log2, Option<Log2>)>,
 	retired: Option<Log2>,
+	// The reducer's freeze flag and transition coordinate after the last carrier.
+	frozen: bool,
+	transition: Option<Log2>,
 	fault: Option<&'static str>,
 	// One past the index of the last entry the dispatcher took up (0: none). Shared with the
 	// caller, so the entry a refusal stopped at survives the discarded accumulator.
@@ -91,6 +108,9 @@ pub(super) struct Traced2 {
 	pub(super) steps: Vec<Step2>,
 	pub(super) freezes: Vec<(Log2, Option<Log2>)>,
 	pub(super) retired: Option<Log2>,
+	pub(super) frozen: bool,
+	/// The retained transition coordinate, absent while it is the all-zero initial value.
+	pub(super) transition: Option<Log2>,
 }
 fn epochs_of(state: &MutationAuthorityState2) -> Option<&RoleEpochs3> {
 	root_and_origin2(state).and_then(|(root, _)| root.state.role_epochs.as_deref())
@@ -103,6 +123,8 @@ impl Trace2 {
 			steps: Vec::new(),
 			freezes: Vec::new(),
 			retired: None,
+			frozen: false,
+			transition: None,
 			fault: None,
 			attempted: Arc::new(AtomicU64::new(0)),
 		}
@@ -218,6 +240,9 @@ impl Trace2 {
 		if self.retired.is_none() {
 			self.retired = after.and_then(|e| e.retired.as_ref()).map(|r| r.at);
 		}
+		// Only carriers change role state, so the last carrier's post-entry values are final.
+		self.frozen = is;
+		self.transition = after.map(|e| e.transition).filter(|t| t.index != 0);
 		Ok(())
 	}
 	pub(super) fn finish(self) -> Result<Traced2, &'static str> {
@@ -230,6 +255,8 @@ impl Trace2 {
 			steps: self.steps,
 			freezes: self.freezes,
 			retired: self.retired,
+			frozen: self.frozen,
+			transition: self.transition,
 		})
 	}
 }

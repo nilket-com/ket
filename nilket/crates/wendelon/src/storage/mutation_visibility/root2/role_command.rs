@@ -49,9 +49,13 @@ pub(super) fn parse(bytes: &[u8]) -> Result<(), RoleProofError3> {
 	}
 	Ok(())
 }
-pub(super) fn context_digest(a: &InstalledAdmin2) -> Digest2 {
-	let c = admin_context2(a);
-	let mut b = Vec::with_capacity(188);
+/// The bound administrator context's canonical width: generation, cluster, the install LogId
+/// (term u64, node u32, index u64), three digests, the initial epoch and the manifest pin.
+pub(super) const CONTEXT_BYTES3: usize = 188;
+/// The one encoding of an `AdminContext2`: what the role-proof context digest hashes and what the
+/// offline context export carries, so an exported context re-derives the exact digest.
+pub(super) fn context_bytes(c: &AdminContext2) -> [u8; CONTEXT_BYTES3] {
+	let mut b = Vec::with_capacity(CONTEXT_BYTES3);
 	b.extend(c.generation);
 	b.extend(c.cluster);
 	b.extend(c.installed_at.term.to_le_bytes());
@@ -62,7 +66,13 @@ pub(super) fn context_digest(a: &InstalledAdmin2) -> Digest2 {
 	b.extend(c.genesis);
 	b.extend(c.initial_epoch.to_le_bytes());
 	b.extend(c.manifest_pin);
-	hash(b"VISROOT2-ROLE3-CONTEXT\0", &b)
+	b.try_into().expect("fixed administrator context width")
+}
+pub(super) fn context_digest(a: &InstalledAdmin2) -> Digest2 {
+	hash(
+		b"VISROOT2-ROLE3-CONTEXT\0",
+		&context_bytes(&admin_context2(a)),
+	)
 }
 #[derive(Clone, Copy)]
 pub(super) enum RoleForm3 {
