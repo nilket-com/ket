@@ -40,19 +40,26 @@ pub(super) fn bind(server: &WendelonDataServer, owner: &Option<Owner>) -> std::i
 	server.drop_reclaim_progress.bind_owner(owner.clone())
 }
 
-/// Open a tenant's counter witness store, owner-admitted and contained in the
+/// Open a tenant's counter witness store under the slab's
+/// `counter-witness/tenant-{id}` directory, owner-admitted and contained in the
 /// owned directory when the server is owned.
 pub(super) fn witness_store(
-	witness_dir: PathBuf,
+	slab: &crate::storage::manager::SlabManager,
+	tenant_id: crate::schema::TenantId,
 	owner: Option<&DataDirectoryOwner>,
 ) -> std::io::Result<DurableCounterWitnessStore> {
-	match owner {
+	let witness_dir: PathBuf = slab
+		.data_dir()
+		.join("counter-witness")
+		.join(format!("tenant-{}", tenant_id.get()));
+	let store = match owner {
 		Some(owner) => {
 			owner.ensure_contains(&witness_dir)?;
 			DurableCounterWitnessStore::open_with_owner(witness_dir, owner.clone())
 		}
 		None => DurableCounterWitnessStore::open(witness_dir),
-	}
+	}?;
+	Ok(store.with_tenant(tenant_id))
 }
 
 /// Write the local-persistence distrust marker under a write permit.

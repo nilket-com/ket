@@ -27,7 +27,9 @@ pub(crate) mod visibility;
 pub use visibility::{CounterVersion, CounterVisibilityError};
 use visibility::{EligibleCells, winner};
 
-use std::sync::Arc;
+use std::io::{Error, ErrorKind};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use dashmap::DashMap;
 use tokio::sync::Mutex;
@@ -1414,7 +1416,6 @@ impl CounterParticipant for CounterParticipantKind {
 //     completes the counter without double-adding or losing it.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 /// A participant step failed (I/O, epoch, transport). A participant that errors
 /// on `replicate_tentative` is simply excluded from the authoritative accepted
@@ -1597,6 +1598,13 @@ struct CounterFinalizationWitness {
 mod witness;
 use witness::StoredWitness;
 
+mod applied_log;
+mod file_ops;
+use applied_log::{
+	AppliedLogFault, AppliedLogImage, validate_witness_set, witness_matches_applied,
+};
+use file_ops::{CounterDurableFileOps, StdCounterDurableFileOps};
+
 /// The durable D4 dedup record a resolved witness compacts into: enough to
 /// replay the original outcome for a duplicate `CounterWriteKey` — plus the
 /// op's id, so recovery seeds the op-id allocator past EVERY resolved op, not
@@ -1604,30 +1612,68 @@ use witness::StoredWitness;
 /// resets `op_seq` to 1 and the next add re-mints an already-used
 /// `commit_hlc_for(op_id)`, breaking the "later ops always order after earlier
 /// ones" contract the stale-reconcile protection relies on.
-#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+///
+/// `key` is the counter the add resolved. Every record this build appends
+/// carries it (the keyed frame), so recovery binds a record to its witness's
+/// counter as well as its identity and outcome. It is `None` only for an
+/// unkeyed record written before the keyed frame existed; for those, recovery
+/// can compare only the operation id, write key and outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct AppliedCounterAdd {
 	op_id: u64,
 	write_key: CounterWriteKey,
+	key: Option<CounterKey>,
 	previous: u64,
 	current: u64,
 }
 
 /// Durable backing for counter-finalization witnesses: one small file per
-/// pending op-id under a directory, written atomically (temp + rename),
-/// rewritten as participants confirm their markers, and removed on resolve. On
-/// restart `load_all` rebuilds the pending set so the reconciler can finish the
-/// commit-marker fan-out. (This is the counter-specific recoverable-pending
-/// state — it never routes through the generic `TenantFinalization` path.)
+/// pending op-id under a directory, published with a synced temp file, an
+/// atomic rename and a directory sync, rewritten the same way as participants
+/// confirm their markers, and removed (then the directory synced) only after
+/// the op's applied record is durable. On restart `load_all` rebuilds the
+/// pending set so the reconciler can finish the commit-marker fan-out. (This is
+/// the counter-specific recoverable-pending state — it never routes through the
+/// generic `TenantFinalization` path.)
+///
+/// The store is the tenant leader's only dedup authority. When it is owned (the
+/// production path), every mutation holds a write permit of the node's
+/// data-directory owner, whose exclusive lock makes this store the only writer
+/// of its directory for the node's lifetime.
 pub struct DurableCounterWitnessStore {
 	dir: PathBuf,
+	/// The tenant whose leader owns this store, for diagnostics.
+	tenant: Option<TenantId>,
 	owner: Option<crate::storage::ownership::DataDirectoryOwner>,
+	ops: Arc<dyn CounterDurableFileOps>,
+	/// Serializes witness publication, rewrites and removal, and the applied
+	/// append's check that the operation's witness is still published.
+	witness_lock: StdMutex<()>,
+	/// The applied log as this store last wrote it. Holding the lock serializes
+	/// appends, so frames from concurrent resolutions never interleave.
+	applied: StdMutex<AppliedLogState>,
+	/// Latched when the durable state can no longer be described: an applied
+	/// append or barrier failed, or a failed prepare could not withdraw its
+	/// witness. Every later publish, rewrite and append then fails closed with
+	/// `AppliedLogFault::Unsettled` until recovery reopens the store.
+	unsettled: std::sync::atomic::AtomicBool,
+}
+
+enum AppliedLogState {
+	/// Not read yet. A store used without `CounterLeader::recover` loads the log
+	/// once, on its first append.
+	Unloaded,
+	/// Authoritative for the store's lifetime: the owner lock admits no other
+	/// writer, so a length this image does not expect fails closed.
+	Loaded(AppliedLogImage),
+	/// An append or barrier failed, leaving the durable length unknown. Every
+	/// further append fails closed until recovery reopens the store.
+	Unsettled,
 }
 
 impl DurableCounterWitnessStore {
 	pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
-		let dir = dir.into();
-		std::fs::create_dir_all(&dir)?;
-		Ok(Self { dir, owner: None })
+		Self::open_with_file_ops(dir, Arc::new(StdCounterDurableFileOps))
 	}
 
 	pub(crate) fn open_with_owner(
@@ -1635,12 +1681,81 @@ impl DurableCounterWitnessStore {
 		owner: crate::storage::ownership::DataDirectoryOwner,
 	) -> std::io::Result<Self> {
 		owner.ensure_contains(&dir)?;
-		let _permit = owner.write_permit()?;
-		std::fs::create_dir_all(&dir)?;
+		Self::open_inner(dir, Some(owner), Arc::new(StdCounterDurableFileOps))
+	}
+
+	fn open_with_file_ops(
+		dir: impl Into<PathBuf>,
+		ops: Arc<dyn CounterDurableFileOps>,
+	) -> std::io::Result<Self> {
+		Self::open_inner(dir.into(), None, ops)
+	}
+
+	fn open_inner(
+		dir: PathBuf,
+		owner: Option<crate::storage::ownership::DataDirectoryOwner>,
+		ops: Arc<dyn CounterDurableFileOps>,
+	) -> std::io::Result<Self> {
+		let _permit =
+			crate::storage::ownership::DataDirectoryOwner::optional_permit(owner.as_ref())?;
+		// A durable namespace baseline before any operation is written.
+		file_ops::create_dir_durably(ops.as_ref(), &dir)?;
 		Ok(Self {
 			dir,
-			owner: Some(owner),
+			tenant: None,
+			owner,
+			ops,
+			witness_lock: StdMutex::new(()),
+			applied: StdMutex::new(AppliedLogState::Unloaded),
+			unsettled: std::sync::atomic::AtomicBool::new(false),
 		})
+	}
+
+	/// Name the tenant this store serves (diagnostics only).
+	pub(crate) fn with_tenant(mut self, tenant: TenantId) -> Self {
+		self.tenant = Some(tenant);
+		self
+	}
+
+	/// Whether the store has latched fail-closed (see `unsettled`). The data
+	/// server polls this to trip its local-persistence distrust fence.
+	pub(crate) fn is_unsettled(&self) -> bool {
+		self.unsettled.load(Ordering::Acquire)
+	}
+
+	fn check_settled(&self) -> std::io::Result<()> {
+		if self.is_unsettled() {
+			Err(AppliedLogFault::Unsettled.io())
+		} else {
+			Ok(())
+		}
+	}
+
+	fn unsettle(&self, path: &Path, cause: &Error) {
+		if !self.unsettled.swap(true, Ordering::AcqRel) {
+			tracing::warn!(
+				tenant_id = self.tenant.map(|tenant| tenant.get()),
+				path = %path.display(),
+				error = %cause,
+				"counter witness store unsettled; failing closed until recovery"
+			);
+		}
+	}
+
+	fn permit(&self) -> std::io::Result<Option<crate::storage::ownership::WritePermit>> {
+		crate::storage::ownership::DataDirectoryOwner::optional_permit(self.owner.as_ref())
+	}
+
+	fn lock_witnesses(&self) -> std::io::Result<std::sync::MutexGuard<'_, ()>> {
+		self.witness_lock
+			.lock()
+			.map_err(|_| Error::other("counter witness lock poisoned"))
+	}
+
+	fn lock_applied(&self) -> std::io::Result<std::sync::MutexGuard<'_, AppliedLogState>> {
+		self.applied
+			.lock()
+			.map_err(|_| Error::other("counter applied-log lock poisoned"))
 	}
 
 	fn path_for(&self, op_id: u64) -> PathBuf {
@@ -1650,12 +1765,70 @@ impl DurableCounterWitnessStore {
 	fn origin_path_for(&self, op_id: u64) -> PathBuf {
 		self.dir.join(format!("counter-witness-{op_id:016x}.pw2"))
 	}
+
+	fn witness_path(&self, witness: &StoredWitness) -> PathBuf {
+		match witness.origin {
+			Some(_) => self.origin_path_for(witness.op_id),
+			None => self.path_for(witness.op_id),
+		}
+	}
+
+	/// Publish a NEW witness before any participant commit: temp write, file
+	/// sync, atomic rename, directory sync. On failure the operation is rolled
+	/// back, so the partly published name is withdrawn (unlinked, then the
+	/// directory synced) rather than left for a later directory sync to make
+	/// durable. If the withdrawal itself fails, the witness may be durable: the
+	/// store latches unsettled so nothing else is published or resolved before
+	/// recovery decides that operation.
 	fn write(&self, witness: &StoredWitness) -> std::io::Result<()> {
-		let _permit = self
-			.owner
-			.as_ref()
-			.map(|owner| owner.write_permit())
-			.transpose()?;
+		let _permit = self.permit()?;
+		self.check_settled()?;
+		let _witness = self.lock_witnesses()?;
+		let published = self.replace_locked(witness);
+		if published.is_err() {
+			if let Err(cleanup) = self.withdraw_locked(witness) {
+				self.unsettle(&self.witness_path(witness), &cleanup);
+			}
+		}
+		published
+	}
+
+	/// Unlink a failed publication's witness and temp names, then sync the
+	/// directory. Every step is attempted; the first failure is returned.
+	fn withdraw_locked(&self, witness: &StoredWitness) -> std::io::Result<()> {
+		let mut first = None;
+		for path in [
+			self.witness_path(witness),
+			self.temp_path_for(witness.op_id),
+		] {
+			match self.ops.unlink(&path) {
+				Ok(()) => (),
+				Err(error) if error.kind() == ErrorKind::NotFound => (),
+				Err(error) => {
+					first.get_or_insert(error);
+				}
+			}
+		}
+		if let Err(error) = self.ops.sync_dir(&self.dir) {
+			first.get_or_insert(error);
+		}
+		first.map_or(Ok(()), Err)
+	}
+
+	/// Durably replace a published witness with its updated progress. A failure
+	/// leaves the previous durable witness (or the new one) in place.
+	fn rewrite(&self, witness: &StoredWitness) -> std::io::Result<()> {
+		let _permit = self.permit()?;
+		self.check_settled()?;
+		let _witness = self.lock_witnesses()?;
+		self.replace_locked(witness)
+	}
+
+	fn temp_path_for(&self, op_id: u64) -> PathBuf {
+		self.dir.join(format!(".tmp-{op_id:016x}"))
+	}
+
+	fn replace_locked(&self, witness: &StoredWitness) -> std::io::Result<()> {
 		let (path, other, bytes) = match witness.origin {
 			Some(_) => (
 				self.origin_path_for(witness.op_id),
@@ -1669,46 +1842,45 @@ impl DurableCounterWitnessStore {
 					.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
 			),
 		};
-		if other.try_exists()? {
+		if self.ops.exists(&other)? {
 			return Err(CounterVisibilityError::Conflict.io());
 		}
-		let tmp = self.dir.join(format!(".tmp-{:016x}", witness.op_id));
-		std::fs::write(&tmp, &bytes)?;
-		std::fs::rename(&tmp, path)?;
-		Ok(())
+		let tmp = self.temp_path_for(witness.op_id);
+		self.ops.write_file(&tmp, &bytes)?;
+		self.ops.sync_all(&tmp)?;
+		self.ops.rename(&tmp, &path)?;
+		self.ops.sync_dir(&self.dir)
 	}
 
+	/// Unlink a resolved witness, then sync the directory. Only called after
+	/// the op's applied record is durable; an error leaves the caller to retry.
 	fn remove(&self, op_id: u64) -> std::io::Result<()> {
-		let _permit = self
-			.owner
-			.as_ref()
-			.map(|owner| owner.write_permit())
-			.transpose()?;
+		let _permit = self.permit()?;
+		let _witness = self.lock_witnesses()?;
 		let old = self.path_for(op_id);
 		let new = self.origin_path_for(op_id);
-		if old.try_exists()? && new.try_exists()? {
+		if self.ops.exists(&old)? && self.ops.exists(&new)? {
 			return Err(CounterVisibilityError::Conflict.io());
 		}
 		for path in [old, new] {
-			match std::fs::remove_file(path) {
+			match self.ops.unlink(&path) {
 				Ok(()) => (),
-				Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-				Err(e) => return Err(e),
+				Err(error) if error.kind() == ErrorKind::NotFound => (),
+				Err(error) => return Err(error),
 			}
 		}
-		Ok(())
+		self.ops.sync_dir(&self.dir)
 	}
 
 	fn load_all(&self) -> std::io::Result<Vec<StoredWitness>> {
 		let mut out = Vec::new();
 		let mut seen = HashSet::new();
-		for entry in std::fs::read_dir(&self.dir)? {
-			let path = entry?.path();
+		for path in self.ops.read_dir(&self.dir)? {
 			let extension = path.extension().and_then(|s| s.to_str());
 			if !matches!(extension, Some("pw" | "pw2")) {
 				continue;
 			}
-			let bytes = std::fs::read(&path)?;
+			let bytes = self.ops.read_file(&path)?;
 			let w = if extension == Some("pw2") {
 				witness::decode(&bytes)?
 			} else {
@@ -1718,12 +1890,7 @@ impl DurableCounterWitnessStore {
 						.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
 				}
 			};
-			let expected = if w.origin.is_some() {
-				self.origin_path_for(w.op_id)
-			} else {
-				self.path_for(w.op_id)
-			};
-			if path != expected || !seen.insert(w.op_id) {
+			if path != self.witness_path(&w) || !seen.insert(w.op_id) {
 				return Err(CounterVisibilityError::Conflict.io());
 			}
 			out.push(w);
@@ -1736,56 +1903,247 @@ impl DurableCounterWitnessStore {
 	}
 
 	/// Append the durable D4 dedup record for a RESOLVED witness. Called by the
-	/// commit driver BEFORE the witness file is pruned, so the dedup identity is
-	/// never windowless: pending ops replay from the witness, resolved ops from
-	/// this log. Length-prefixed postcard frames; a torn tail (crash mid-append)
-	/// is tolerated by `load_applied` — the same op's witness is still on disk
-	/// in that case (pruning happens after), so nothing is lost.
-	/// Unbounded growth note: one ~44-byte frame per resolved add, never
+	/// commit driver after every accepted participant's marker is durable and
+	/// BEFORE the witness is pruned, so the dedup identity is never windowless:
+	/// pending ops replay from the witness, resolved ops from this log. The
+	/// frame is appended, `sync_data`'d and, when this append created the log,
+	/// its directory entry synced; only then may the witness be unlinked. A
+	/// record already present (a retried resolution) is re-synced, not appended.
+	/// Unbounded growth note: one small keyed frame per resolved add, never
 	/// compacted — TTL-based pruning (the wire's `idempotency_ttl_ms`) is an
 	/// explicit follow-on.
-	fn append_applied(&self, applied: &AppliedCounterAdd) -> std::io::Result<()> {
-		let _permit = self
-			.owner
-			.as_ref()
-			.map(|owner| owner.write_permit())
-			.transpose()?;
-		let bytes = postcard::to_allocvec(applied)
-			.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-		use std::io::Write as _;
-		let mut file = std::fs::OpenOptions::new()
-			.create(true)
-			.append(true)
-			.open(self.applied_log_path())?;
-		file.write_all(&(bytes.len() as u32).to_le_bytes())?;
-		file.write_all(&bytes)?;
+	fn append_applied(
+		&self,
+		applied: &AppliedCounterAdd,
+		witness: &StoredWitness,
+	) -> std::io::Result<()> {
+		let _permit = self.permit()?;
+		self.check_settled()?;
+		let mut state = self.lock_applied()?;
+		if !witness_matches_applied(witness, applied) || applied.key.as_ref() != Some(&witness.key)
+		{
+			return Err(CounterVisibilityError::Conflict.io());
+		}
+		if matches!(*state, AppliedLogState::Unloaded) {
+			*state = AppliedLogState::Loaded(self.read_applied_image()?);
+		}
+		let AppliedLogState::Loaded(image) = &mut *state else {
+			return Err(AppliedLogFault::Unsettled.io());
+		};
+		match self.append_to_image(image, applied, witness) {
+			Ok(()) => Ok(()),
+			Err(AppendFailure::Retained(error)) => Err(error),
+			Err(AppendFailure::Unsettled(error)) => {
+				*state = AppliedLogState::Unsettled;
+				self.unsettle(&self.applied_log_path(), &error);
+				Err(error)
+			}
+		}
+	}
+
+	fn append_to_image(
+		&self,
+		image: &mut AppliedLogImage,
+		applied: &AppliedCounterAdd,
+		witness: &StoredWitness,
+	) -> Result<(), AppendFailure> {
+		let path = self.applied_log_path();
+		let observed_len = match self.ops.file_len(&path) {
+			Ok(len) => Some(len),
+			Err(error) if error.kind() == ErrorKind::NotFound => None,
+			Err(error) => return Err(AppendFailure::Retained(error)),
+		};
+		if observed_len.unwrap_or(0) != image.file_len {
+			tracing::warn!(
+				tenant_id = self.tenant.map(|tenant| tenant.get()),
+				path = %path.display(),
+				expected_len = image.file_len,
+				observed_len,
+				"counter applied log changed outside its owner; failing closed"
+			);
+			return Err(AppendFailure::Retained(
+				AppliedLogFault::Diverged {
+					expected_len: image.file_len,
+					observed_len,
+				}
+				.io(),
+			));
+		}
+		if let Some(tail) = image.torn_tail.as_ref() {
+			// Only a lazily loaded image can still hold a torn tail; recovery
+			// repairs it first. It must be a prefix of this operation's own frame.
+			if image.by_op(applied.op_id).is_some()
+				|| !applied_log::tail_is_prefix_of(tail, applied)
+			{
+				return Err(AppendFailure::Retained(
+					CounterVisibilityError::Conflict.io(),
+				));
+			}
+			let valid_len = tail.valid_len;
+			self.ops
+				.truncate(&path, valid_len)
+				.and_then(|()| self.ops.sync_data(&path))
+				.map_err(AppendFailure::Unsettled)?;
+			image.torn_tail = None;
+			image.file_len = valid_len;
+		}
+		if let Some(existing) = image.by_op(applied.op_id) {
+			if !applied_log::same_applied(existing, applied) {
+				return Err(AppendFailure::Retained(
+					CounterVisibilityError::Conflict.io(),
+				));
+			}
+			// A retried resolution: the frame exists, but it may have been read
+			// back from a crashed process's unsynced page cache. Repeat the
+			// barriers before the caller may unlink the witness.
+			self.ops
+				.sync_data(&path)
+				.map_err(AppendFailure::Unsettled)?;
+			return self.ensure_applied_name_durable(image);
+		}
+		if let Some(existing) = image.by_key(&applied.write_key) {
+			return Err(AppendFailure::Retained(
+				AppliedLogFault::IdentityConflict {
+					write_key: applied.write_key,
+					recorded_op_id: existing.op_id,
+					conflicting_op_id: applied.op_id,
+				}
+				.io(),
+			));
+		}
+		// A new record needs its witness still published: never append for an
+		// operation whose prepare witness is gone. Only this check excludes a
+		// concurrent witness publish or removal.
+		let published = {
+			let _witness = self.lock_witnesses().map_err(AppendFailure::Retained)?;
+			self.ops.exists(&self.witness_path(witness))
+		};
+		match published {
+			Ok(true) => (),
+			Ok(false) => {
+				return Err(AppendFailure::Retained(
+					CounterVisibilityError::Conflict.io(),
+				));
+			}
+			Err(error) => return Err(AppendFailure::Retained(error)),
+		}
+		let frame = applied_log::encode_frame(applied).map_err(AppendFailure::Retained)?;
+		let created = self
+			.ops
+			.append_file(&path, &frame)
+			.map_err(AppendFailure::Unsettled)?;
+		if created {
+			image.name_durable = false;
+		}
+		self.ops
+			.sync_data(&path)
+			.map_err(AppendFailure::Unsettled)?;
+		image.push(applied.clone(), frame.len());
+		self.ensure_applied_name_durable(image)
+	}
+
+	/// Sync the directory once after this store created the log. A failure
+	/// keeps the frame (it is in the file and the image) and leaves the witness
+	/// in place; a retried resolution repeats the barrier.
+	fn ensure_applied_name_durable(
+		&self,
+		image: &mut AppliedLogImage,
+	) -> Result<(), AppendFailure> {
+		if !image.name_durable {
+			self.ops
+				.sync_dir(&self.dir)
+				.map_err(AppendFailure::Retained)?;
+			image.name_durable = true;
+		}
 		Ok(())
 	}
 
-	/// Load every applied dedup record (restart path). Stops cleanly at a torn
-	/// tail frame (crash mid-append) — see `append_applied` for why that loses
-	/// nothing.
-	fn load_applied(&self) -> std::io::Result<Vec<AppliedCounterAdd>> {
-		let bytes = match std::fs::read(self.applied_log_path()) {
-			Ok(bytes) => bytes,
-			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-			Err(e) => return Err(e),
-		};
-		let mut out = Vec::new();
-		let mut at = 0usize;
-		while at + 4 <= bytes.len() {
-			let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-			at += 4;
-			if at + len > bytes.len() {
-				break; // torn tail
-			}
-			match postcard::from_bytes::<AppliedCounterAdd>(&bytes[at..at + len]) {
-				Ok(applied) => out.push(applied),
-				Err(_) => break, // torn/corrupt tail
-			}
-			at += len;
+	fn read_applied_image(&self) -> std::io::Result<AppliedLogImage> {
+		match self.ops.read_file(&self.applied_log_path()) {
+			Ok(bytes) => applied_log::parse(&bytes),
+			Err(error) if error.kind() == ErrorKind::NotFound => applied_log::parse(&[]),
+			Err(error) => Err(error),
 		}
-		Ok(out)
+	}
+
+	/// Load the applied log for recovery, bind it to the pending witnesses,
+	/// repair a torn final frame that a durable witness still represents, and
+	/// make every byte recovery derives state from durable before it is served.
+	/// The resulting image becomes the store's authoritative cache.
+	fn recover_applied(
+		&self,
+		pending: &[StoredWitness],
+	) -> std::io::Result<Vec<AppliedCounterAdd>> {
+		let _permit = self.permit()?;
+		let mut state = self.lock_applied()?;
+		let path = self.applied_log_path();
+		let mut image = self.read_applied_image()?;
+		applied_log::validate_pairs(&image, pending)?;
+		if let Some(tail) = image.torn_tail.take() {
+			applied_log::check_torn_tail_owner(&image, &tail, pending)?;
+			self.ops.truncate(&path, tail.valid_len)?;
+			image.file_len = tail.valid_len;
+		}
+		if self.ops.exists(&path)? {
+			self.ops.sync_data(&path)?;
+		}
+		let records = image.records.clone();
+		*state = AppliedLogState::Loaded(image);
+		Ok(records)
+	}
+
+	#[cfg(test)]
+	fn load_applied(&self) -> std::io::Result<Vec<AppliedCounterAdd>> {
+		Ok(self.read_applied_image()?.records)
+	}
+}
+
+/// How an append attempt failed: `Retained` leaves the file exactly as the
+/// image describes it; `Unsettled` may have changed it, so the image is no
+/// longer authoritative.
+enum AppendFailure {
+	Retained(Error),
+	Unsettled(Error),
+}
+
+/// The leader's handle on its witness store. Every call runs the store's
+/// blocking file I/O and barriers on the blocking pool, never on an async
+/// worker. The store takes its owner write permit inside that blocking task,
+/// so a cancelled caller cannot release admission before the I/O finishes.
+struct OffloadedWitnessStore(Arc<DurableCounterWitnessStore>);
+
+impl OffloadedWitnessStore {
+	async fn run<T: Send + 'static>(
+		&self,
+		operation: impl FnOnce(&DurableCounterWitnessStore) -> std::io::Result<T> + Send + 'static,
+	) -> std::io::Result<T> {
+		let store = self.0.clone();
+		tokio::task::spawn_blocking(move || operation(&store))
+			.await
+			.map_err(|error| Error::other(format!("counter witness store task failed: {error}")))?
+	}
+
+	async fn write(&self, witness: &StoredWitness) -> std::io::Result<()> {
+		let witness = witness.clone();
+		self.run(move |store| store.write(&witness)).await
+	}
+
+	async fn rewrite(&self, witness: StoredWitness) -> std::io::Result<()> {
+		self.run(move |store| store.rewrite(&witness)).await
+	}
+
+	async fn append_applied(
+		&self,
+		applied: &AppliedCounterAdd,
+		witness: &StoredWitness,
+	) -> std::io::Result<()> {
+		let (applied, witness) = (applied.clone(), witness.clone());
+		self.run(move |store| store.append_applied(&applied, &witness))
+			.await
+	}
+
+	async fn remove(&self, op_id: u64) -> std::io::Result<()> {
+		self.run(move |store| store.remove(op_id)).await
 	}
 }
 
@@ -1808,7 +2166,7 @@ pub struct CounterLeader<P> {
 	/// In-memory mirror of the pending witnesses (durable in `witness_store`).
 	witnesses: DashMap<u64, StoredWitness>,
 	/// Durable backing for the witnesses (survives leader restart).
-	witness_store: DurableCounterWitnessStore,
+	witness_store: OffloadedWitnessStore,
 	/// Leader-assigned op-id allocator (cross-node stable handles). `commit_hlc`
 	/// is derived from it, so op-ids and HLCs advance together.
 	op_seq: AtomicU64,
@@ -1829,7 +2187,7 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 			locks: DashMap::new(),
 			idempotency: DashMap::new(),
 			witnesses: DashMap::new(),
-			witness_store,
+			witness_store: OffloadedWitnessStore(Arc::new(witness_store)),
 			op_seq: AtomicU64::new(1),
 		}
 	}
@@ -1855,8 +2213,15 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 		is_primary: bool,
 		witness_store: DurableCounterWitnessStore,
 	) -> std::io::Result<Self> {
-		let applied = witness_store.load_applied()?;
 		let pending = witness_store.load_all()?;
+		validate_witness_set(&pending)?;
+		if pending
+			.iter()
+			.any(|witness| witness.origin.is_some_and(|origin| origin != local_id))
+		{
+			return Err(CounterVisibilityError::Conflict.io());
+		}
+		let applied = witness_store.recover_applied(&pending)?;
 		let leader = Self::new(local_id, local, is_primary, witness_store);
 		let mut max_op = 0;
 		for record in applied {
@@ -1891,7 +2256,13 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 			);
 			leader.witnesses.insert(witness.op_id, witness);
 		}
-		leader.op_seq.store(max_op + 1, Ordering::Relaxed);
+		let next_op = max_op.checked_add(1).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"counter operation id high-water exhausted",
+			)
+		})?;
+		leader.op_seq.store(next_op, Ordering::Relaxed);
 		Ok(leader)
 	}
 
@@ -2019,7 +2390,11 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 				return Err(CounterLeaderError::Visibility(error));
 			}
 		};
-		if self.witness_store.write(&witness).is_err() {
+		// A failed publish answers `Internal`, but that one answer is in doubt when
+		// the store could not withdraw the half-published witness (it latches
+		// unsettled): recovery may then find the witness and complete the add, and
+		// a same-key retry after restart replays it rather than applying it twice.
+		if self.witness_store.write(&witness).await.is_err() {
 			for &id in &accepted {
 				if let Some(participant) = plan.get(id) {
 					participant.rollback(op_id, key).await;
@@ -2104,7 +2479,12 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 			if outcome.is_ok() {
 				if let Some(mut witness) = self.witnesses.get_mut(&op_id) {
 					witness.committed.insert(i);
-					let _ = self.witness_store.write(&witness);
+					let progress = witness.clone();
+					// Release the shard lock before the durable rewrite. A failed or
+					// reordered progress rewrite keeps an older durable witness;
+					// re-driving an already-committed participant is idempotent.
+					drop(witness);
+					let _ = self.witness_store.rewrite(progress).await;
 				}
 			}
 		}
@@ -2113,25 +2493,39 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 				.accepted
 				.iter()
 				.all(|i| witness.committed.contains(i));
-			complete.then(|| AppliedCounterAdd {
-				op_id: witness.op_id,
-				write_key: witness.write_key,
-				previous: witness.previous,
-				current: witness.value,
+			complete.then(|| {
+				(
+					AppliedCounterAdd {
+						op_id: witness.op_id,
+						write_key: witness.write_key,
+						key: Some(witness.key.clone()),
+						previous: witness.previous,
+						current: witness.value,
+					},
+					witness.clone(),
+				)
 			})
 		});
-		if let Some(applied) = resolved {
+		if let Some((applied, witness)) = resolved {
 			// Compact the resolved witness into the durable applied log BEFORE
 			// pruning it, so the D4 dedup record is never windowless: a crash
 			// here leaves witness AND log entry (recover dedups by write-key);
 			// a crash before leaves the witness. An append failure keeps the
 			// witness pending — the reconciler retries the whole resolution.
-			if self.witness_store.append_applied(&applied).is_err() {
+			if self
+				.witness_store
+				.append_applied(&applied, &witness)
+				.await
+				.is_err()
+			{
 				return;
 			}
-			// Remove only after every accepted participant has a commit marker.
-			self.witnesses.remove(&op_id);
-			let _ = self.witness_store.remove(op_id);
+			// Keep the volatile pending witness until the unlink and containing
+			// directory barrier both succeed. If either fails, the applied record
+			// remains authoritative and a retry safely repeats cleanup.
+			if self.witness_store.remove(op_id).await.is_ok() {
+				self.witnesses.remove(&op_id);
+			}
 		}
 	}
 
@@ -2148,6 +2542,12 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 		for op_id in pending {
 			self.drive_commits(op_id, resolver).await;
 		}
+	}
+
+	/// Whether this leader's dedup store has latched fail-closed. The data
+	/// server trips its local-persistence distrust fence when it has.
+	pub(crate) fn durability_unsettled(&self) -> bool {
+		self.witness_store.0.is_unsettled()
 	}
 
 	/// Point read of the committed counter from the local primary store.
@@ -3228,6 +3628,17 @@ mod leader_tests {
 	struct TestParticipant {
 		replica: Arc<CounterReplica<LocalSlabStore>>,
 		fail_tentative: Arc<AtomicBool>,
+		observer: Option<Arc<dyn ParticipantObserver>>,
+	}
+
+	/// Sees each participant step, so a crash model can order participant
+	/// markers against the leader's persistence and stop the world at a cut.
+	trait ParticipantObserver: Send + Sync {
+		/// The leader process crashed: it reaches no participant any more.
+		fn crashed(&self) -> bool;
+		fn commit_started(&self);
+		/// The participant's commit marker is durable and acknowledged.
+		fn marker_durable(&self);
 	}
 
 	impl TestParticipant {
@@ -3242,7 +3653,23 @@ mod leader_tests {
 					},
 				))),
 				fail_tentative: Arc::new(AtomicBool::new(false)),
+				observer: None,
 			}
+		}
+
+		fn over_observed(
+			store: Arc<LocalSlabStore>,
+			observer: Arc<dyn ParticipantObserver>,
+		) -> Self {
+			let mut participant = Self::over(store);
+			participant.observer = Some(observer);
+			participant
+		}
+
+		fn leader_crashed(&self) -> bool {
+			self.observer
+				.as_ref()
+				.is_some_and(|observer| observer.crashed())
 		}
 		/// The next `replicate_tentative` fails (excluded from the accepted set).
 		fn arm_tentative_failure(&self) {
@@ -3265,7 +3692,7 @@ mod leader_tests {
 			value: u64,
 			commit_hlc: HybridTimestamp,
 		) -> Result<(), ParticipantError> {
-			if self.fail_tentative.swap(false, Ordering::Relaxed) {
+			if self.leader_crashed() || self.fail_tentative.swap(false, Ordering::Relaxed) {
 				return Err(ParticipantError::Unavailable);
 			}
 			self.replica
@@ -3274,12 +3701,25 @@ mod leader_tests {
 				.map_err(|_| ParticipantError::Unavailable)
 		}
 		async fn commit(&self, op_id: u64, _key: &CounterKey) -> Result<(), ParticipantError> {
+			if self.leader_crashed() {
+				return Err(ParticipantError::Unavailable);
+			}
+			if let Some(observer) = &self.observer {
+				observer.commit_started();
+			}
 			self.replica
 				.commit(op_id)
 				.await
-				.map_err(|_| ParticipantError::Unavailable)
+				.map_err(|_| ParticipantError::Unavailable)?;
+			if let Some(observer) = &self.observer {
+				observer.marker_durable();
+			}
+			Ok(())
 		}
 		async fn rollback(&self, op_id: u64, _key: &CounterKey) {
+			if self.leader_crashed() {
+				return;
+			}
 			self.replica.rollback(op_id);
 		}
 		fn eligibility_status(&self, _identity: Identity) -> Result<(), CounterVisibilityError> {
@@ -4204,6 +4644,10 @@ mod leader_tests {
 			hlc_before.physical_ms
 		);
 	}
+
+	mod crash_cut_tests;
+
+	mod throughput_measurement;
 }
 
 #[cfg(test)]

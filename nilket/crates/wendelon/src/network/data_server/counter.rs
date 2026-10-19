@@ -96,6 +96,25 @@ impl CounterParticipantFactory {
 }
 
 impl WendelonDataServer {
+	/// A counter leader whose dedup store latched fail-closed (an applied-log
+	/// barrier failed, or a failed prepare could not withdraw its witness) has
+	/// durable state this process can no longer describe: fence local writes.
+	pub(super) async fn fence_unsettled_counter(
+		&self,
+		leader: &crate::storage::counter::CounterLeader<
+			crate::storage::counter::CounterParticipantKind,
+		>,
+		tenant_id: TenantId,
+	) {
+		if leader.durability_unsettled() {
+			self.trip_local_persistence_distrust(format!(
+				"counter dedup store for tenant {} failed closed after a persistence failure",
+				tenant_id.get()
+			))
+			.await;
+		}
+	}
+
 	/// ADR 075 `COUNTER_REPLICATE_REQ` handler. Thin: decode the fixed meta, call
 	/// `CounterReplicaService`, encode the fixed ack. The counter value rides in
 	/// the meta (no arrow payload). NO leader orchestration, NO
@@ -336,6 +355,7 @@ impl WendelonDataServer {
 				self.counter_add_response(&meta, status, 0, 0, Self::zero_counter_hlc())
 			}
 		};
+		self.fence_unsettled_counter(&leader, meta.tenant_id).await;
 		Ok(self.build_counter_add_response_frame(stream_id, resp))
 	}
 

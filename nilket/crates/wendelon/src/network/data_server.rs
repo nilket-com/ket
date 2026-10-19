@@ -6630,12 +6630,8 @@ impl WendelonDataServer {
 			tenant_id,
 			self.local_node,
 		));
-		let witness_dir = self
-			.slab
-			.data_dir()
-			.join("counter-witness")
-			.join(format!("tenant-{}", tenant_id.get()));
-		let witness_store = ownership::witness_store(witness_dir, self._directory_owner.as_ref())?;
+		let owner = self._directory_owner.as_ref();
+		let witness_store = ownership::witness_store(&self.slab, tenant_id, owner)?;
 		let leader = Arc::new(CounterLeader::recover(
 			self.local_node,
 			participant,
@@ -6646,6 +6642,7 @@ impl WendelonDataServer {
 		let resolver =
 			self.counter_participant_factory(tenant_id, self.admission_snapshot().current_epoch);
 		leader.reconcile(&resolver).await;
+		self.fence_unsettled_counter(&leader, tenant_id).await;
 		self.counter_leaders.insert(tenant_id, leader.clone());
 		Ok(leader)
 	}
