@@ -1080,6 +1080,49 @@ impl FaultyFileOps {
 		snapshot_durable_tree(&self.root, dir, &mut state)
 	}
 
+	/// Lands the torn prefix of an injected partial write, and records it as durable when
+	/// `persist_partial` asks. The prefix models bytes that reached the media, not an `O_DIRECT`
+	/// request, so it goes through a buffered descriptor: an unaligned `O_DIRECT` write is
+	/// refused (EINVAL on ext4), and the fault would silently not happen.
+	///
+	/// A prefix that does not land panics here, on the caller's task and outside the blocking
+	/// pool (whose panics `spawn_blocking_io` turns into plain I/O errors). Returned as an error,
+	/// it would pass for the injected failure in a test that only checks `is_err()`.
+	async fn land_torn_prefix(
+		&self,
+		path: &Path,
+		offset: u64,
+		bytes: Vec<u8>,
+		persist_partial: bool,
+	) {
+		let torn_path = path.to_path_buf();
+		let expected = bytes.len();
+		let written = spawn_blocking_io(move || {
+			let file = std::fs::OpenOptions::new().write(true).open(&torn_path)?;
+			file.write_at(&bytes, offset)
+		})
+		.await;
+		match written {
+			Ok(written) if written == expected => {}
+			Ok(written) => panic!(
+				"injected partial write did not happen: torn prefix wrote {written} of {expected} bytes at offset {offset} in {}",
+				path.display()
+			),
+			Err(err) => panic!(
+				"injected partial write did not happen: torn prefix of {expected} bytes at offset {offset} in {} failed: {err}",
+				path.display()
+			),
+		}
+		if persist_partial && self.state.lock().unwrap().durable_paths.contains(path) {
+			if let Err(err) = self.persist_file_now(path) {
+				panic!(
+					"injected partial write did not happen: torn prefix in {} was not made durable: {err}",
+					path.display()
+				);
+			}
+		}
+	}
+
 	fn apply_fault_result(&self, action: FaultAction) -> std::io::Result<()> {
 		match action {
 			FaultAction::Error { kind, message } => Err(Error::new(kind, message)),
@@ -1133,16 +1176,10 @@ impl AsyncFileOps for FaultyFileOps {
 					kind,
 					message,
 				} => {
-					let file = handle.try_clone()?;
 					let partial = bytes[..written_bytes.min(bytes.len())].to_vec();
-					let written =
-						spawn_blocking_io(move || file.write_at(&partial, offset)).await?;
-					if persist_partial && self.state.lock().unwrap().durable_paths.contains(&path) {
-						self.persist_file_now(&path)?;
-					}
-					if written > 0 {
-						return Err(Error::new(kind, message));
-					}
+					self.land_torn_prefix(&path, offset, partial, persist_partial)
+						.await;
+					return Err(Error::new(kind, message));
 				}
 				other => {
 					self.apply_fault_result(other)?;
@@ -1178,25 +1215,8 @@ impl AsyncFileOps for FaultyFileOps {
 					message,
 				} => {
 					let bytes = buf.as_slice()[..written_bytes.min(buf.len())].to_vec();
-					let file = handle.try_clone()?;
-					spawn_blocking_io(move || {
-						let written = file.write_at(&bytes, offset)?;
-						if written != bytes.len() {
-							return Err(Error::new(
-								ErrorKind::WriteZero,
-								format!(
-									"faulty partial write wrote {} of {} bytes",
-									written,
-									bytes.len()
-								),
-							));
-						}
-						Ok(())
-					})
-					.await?;
-					if persist_partial && self.state.lock().unwrap().durable_paths.contains(&path) {
-						self.persist_file_now(&path)?;
-					}
+					self.land_torn_prefix(&path, offset, bytes, persist_partial)
+						.await;
 					return Err(Error::new(kind, message));
 				}
 				other => {

@@ -342,12 +342,15 @@ async fn cancelled_reopened_index_repair_keeps_owner_and_completion_through_barr
 					.await
 			);
 			gate.release.notify_one();
-			for _ in 0..10000 {
-				if store.owners.lock().await.is_empty() {
-					break;
+			// The detached repair finishes real syncs on blocking threads after the release; wait
+			// on wall time, not a yield count, which a slow fsync outlasts.
+			let drained = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+				while !store.owners.lock().await.is_empty() {
+					tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 				}
-				tokio::task::yield_now().await;
-			}
+			})
+			.await;
+			assert!(drained.is_ok(), "detached repair must release its owner");
 			assert!(store.owners.lock().await.is_empty());
 			assert!(!store.observed(sha(&p.owner.bytes().unwrap()), FENCED).await);
 			assert_eq!(store.inflight.available_permits(), 8);
