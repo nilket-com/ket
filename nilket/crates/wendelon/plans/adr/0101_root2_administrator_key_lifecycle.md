@@ -76,7 +76,7 @@ Allowing each of the two roles to rotate the other unilaterally fails: a comprom
 ## Open questions
 
 - C-S3b: the final exported record of a retired root (TerminalRecord2) and owner-binding byte formats.
-- C-S6: planned; see the amendment below.
+- C-S6: planned; see the amendment below. Runbooks: `plans/ops/root2_compromise.md`.
 - C-S5: M2 handover.
 - Key custody: per-role key files with owner-only permissions, an offline recovery key, and encrypted backups. Required before real data.
 
