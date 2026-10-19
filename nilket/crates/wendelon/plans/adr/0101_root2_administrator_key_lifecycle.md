@@ -78,7 +78,7 @@ Allowing each of the two roles to rotate the other unilaterally fails: a comprom
 - C-S3b: the final exported record of a retired root (TerminalRecord2) and owner-binding byte formats.
 - C-S6: planned; see the amendment below. Runbooks: `plans/ops/root2_compromise.md`.
 - C-S5: M2 handover.
-- Key custody: per-role key files with owner-only permissions, an offline recovery key, and encrypted backups. Required before real data.
+- Key custody: per-role key files with owner-only permissions, an offline recovery key, and encrypted backups. Required before real data. Contract accepted (r4): `/home/me/work/.agent-bridge/wendelon-adr0101-key-custody-contract-r4/CONTRACT.md`. It is delivered in seven slices: C-S6 (in gates), then C-S6b (the root context export), then the facade, KG, binary, node-side K1 and runbook slices. See the C-S6b plan section in `plans/impl/0101_root2_key_lifecycle.md`.
 
 ## Amendment — C-S6 compromise audit and runbooks (2026-10-18)
 
