@@ -154,3 +154,80 @@ Every law test is red at 6cdea9f1 (the plan base), or with its named hook disabl
 F-CTR-9 does not authorize pruning, retention, compaction or a participant protocol change. Dedup across a ring-owner change is F-CTR-10, a known gap carried from F-CTR-8. F-CTR-5b's time-bounded retention depends on K4 and lands after F-CTR-9. Its expiry rule uses issue time plus L, but the counter uuid is minted once per Client, so F-CTR-5b must rotate the uuid before L (its accepted contract r3, law E6). Otherwise long-lived clients' counter adds would expire, which is the same hazard as Addendum B.
 
 **Gate order:** this plan commit → Wendelon architecture and mutation-visibility architecture checks → fast-forward → signed source → independent source review → focused and changed-area tests → reviewed full ladder → independent log audit → fast-forward. The Codex-era SOURCE clearance, DEV and FINAL steps are folded into the independent source review, the changed-area tests and the log audit under the current working model (Claude implements; an independent reviewer that did not write the code clears source and evidence).
+
+## F-CTR-5b plan: bounded counter dedup with a time-bounded identity proof
+
+**Status:** plan only. This amendment authorizes no source or test changes.
+**Plan base:** F-CTR-9 implemented (`63cdca83`).
+**Accepted contract:** `/home/me/work/.agent-bridge/wendelon-adr0102-f-ctr-5b-retention-contract-r3/CONTRACT.md` (r3, after reviews of r1 and r2).
+**Surveys:** `/home/me/work/reviews/adr0102-f-ctr-5b-survey-r1/SURVEY.md` (with its correction) and `/home/me/work/reviews/adr0102-f-ctr-5b-survey-r2/SURVEY.md` (pre-source, at `63cdca83`).
+
+### Finding
+
+The applied log is append-only and recovery reads it whole. Pruning a record is safe only if every later presentation of its write key W is refused. r0's per-client sequence watermark was unsound:
+- sequences restart per client instance;
+- no client uuid is ever retired;
+- the watermark is node-local.
+
+### Selected proof
+
+The proof uses the UUIDv7 issuance time embedded in W, plus a durable per-store issuance cutoff `Q`.
+
+- **E0, identity form.** A counter add whose uuid is not v7, or whose issuance time is more than S in the future, is refused with the new `WRITE_IDENTITY_INVALID` (25).
+- **Check order:** primary → eligibility → E0 → write-key gate → lookup → E1 → K1/K2 → `delta == 0` → overflow. This supersedes the F-CTR-9 order above.
+- **E1, no reapply.** Evaluated after the write-key gate and after the record lookup. An identity issued at or before `max(Q_mem, now − E)` gets `WRITE_OPERATION_EXPIRED` (22) with commit knowledge INDETERMINATE, whether or not a record exists.
+- **E3, prune rule.** Compaction prunes only records with `issued(W) ≤ Q_new`, or non-v7 records, and never one whose witness file still exists. Q never decreases, and it is published to memory before any eviction.
+- **Safety theorem.** Safety does not depend on L, H, S, clock skew, a backwards wall clock, or a later change to E. Those affect liveness only.
+- **Defaults.** H = 300 s, S = 60 s, `L_sdk` = 3600 s, E ≥ L_sdk + H + S. Compaction uses `now_c = min(now, max_issued_accepted + E)`, so a forward clock jump cannot over-advance Q. `L_sdk` is a single constant in `wendelon::schema`, re-exported by the SDK. The server refuses out-of-range values at startup.
+- **E6, SDK incarnation.** The SDK rotates its counter incarnation (a fresh v7 uuid, sequence restarting at 1) before `L_sdk`, atomically with allocation. It never sends an attempt older than H; a suppressed attempt returns `MutationStopped{KNOWN_NOT_COMMITTED}` if none was sent, `INDETERMINATE` otherwise.
+- **Clients.** The SDK maps 22 alone to `MutationStopped{INDETERMINATE}`, never retried, and 25 to `WriteFailed{25}`. Toron treats 22 as an ambiguous drop and latches Degraded. Status 25 maps to a terminal error.
+- **Scope.** Dedup across a ring-owner change inside the horizon remains F-CTR-10.
+
+### Compaction
+
+- Generations `counter-applied.<g>` carry a header: generation, Q, and the op-id high-water mark.
+- Compaction is two-phase. The snapshot and the tail copy happen under the applied-log mutex; the generation write and sync happen outside it.
+- `CURRENT = {g, base_len, blake3(base)}` is published by temp file, sync, rename, then directory sync. Only after the `CURRENT` directory fsync has succeeded is generation 0 replaced with a poison frame that old parsers reject.
+- Recovery: if `CURRENT` is present it is the sole authority; delete numbered generations other than it and any `.current-tmp`, and ignore `counter-applied.log`. If `CURRENT` is absent, a valid (non-poison) generation 0 is authoritative and every numbered generation is deleted. If `CURRENT` is absent, recovery fails closed when generation 0 is poisoned, or when it is absent and a numbered generation exists. If all three are absent, the store is empty. Recovery seeds `Q_mem` from the header (0 for generation 0) and `op_seq` from max(header high-water, frames, witnesses) + 1 before serving any add.
+- Pending witnesses are never pruned or evicted.
+- A failure at or after the `CURRENT` rename latches Unsettled and trips the distrust fence.
+
+### Implementation notes from the pre-source survey
+
+- **Test identities.** No production path sends non-v7 counter adds. About 135 test call sites use helpers such as `wk(n)` that build non-v7 keys. These become deterministic per-process v7 keys, with the index in the sequence slot.
+- **Clock and config.** The counter leader reads no clock today. It takes the data server's existing `PhysicalClock`; test constructors default to `SystemClock` and the default retention config, unchanged. Config is a validated `CounterRetentionConfig` on `NodeBootstrapConfig`, wired through `network/data_server/counter.rs`, because the data-server root is at its cap.
+- **Shared v7 decoder.** It lives in `schema/core.rs`; the copies in mutation outcomes, CTAS and the SDK delegate to it.
+- **SDK clock seam.** The SDK needs a new clock seam supplying a monotonic instant and unix milliseconds for E6 tests.
+- **Architecture guards.** The existing guards on `recover_applied`, the single install point and the `fetch_add` region stay as strict. A new guard ensures compaction never inserts idempotency records and evicts only after the `CURRENT` publish and the `Q_mem` store. The `admitted_add` ordered-marker guard is extended with the E1 check between `recorded_answer(...)?` and `NonZeroU64::new(delta)`, and E0 is pinned before `admit_write_key`. Negative control: moving E1 before the lookup fails the guard.
+- **Crash model.** Extend the persistence model's name filters and fault set (today exact names only, `crash_cut_tests.rs:117-125`) to cover generation files, `CURRENT` and `.current-tmp`: torn append, `sync_data`/`sync_all` failure, rename, and directory-sync failure for each. Each new fault must make its T-E5 or T-PUB-FAIL cut red when its barrier is removed.
+
+### Required tests
+
+Every safety-bearing test has a negative control. The contract table lists them all; in summary:
+- E0;
+- E1, including boundaries;
+- the race between lookup and compaction;
+- the prune rule, including unkeyed v7 records;
+- op-id high-water across compaction;
+- a configuration change and a backwards clock;
+- every crash cut of compaction, including the first compaction, and nested cuts in recovery;
+- appending after compaction;
+- publication failure;
+- stale-file cleanup;
+- a missing `CURRENT`;
+- the downgrade poison;
+- a foreign write (Diverged);
+- a pending witness older than E;
+- bounded state and recovery read;
+- SDK rotation;
+- wire mapping;
+- configuration validation;
+- the F-CTR-9 retry controls.
+
+Measure add latency with compaction running against without, using the F-CTR-8 harness. The ladder gains counter stress steps, because both the F-CTR-8 and F-CTR-9 audits noted that the counter concurrency tests ran only once, single-threaded. The steps are `storage::counter` at `--test-threads=8` in each of the 10 lane-B iterations, plus a nextest `--stress-count 20` pass over `storage::counter` and the data-server `counter_write_key` tests, covering T-RACE, T-K3 and T-K5. Any failure is a defect to reproduce, never a flake to retry. The steps are added to the contract's tests and replace none of them. They are delivered as a separately reviewed driver revision (gate tooling), not in this plan.
+
+### Scope and gates
+
+No participant protocol change. No group commit. No change to the F-CTR-8 progress-rewrite policy, which is the operator's decision.
+
+**Gate order:** this plan commit → Wendelon architecture and mutation-visibility architecture checks → fast-forward → signed source → independent source review → focused and changed-area tests → reviewed full ladder → independent log audit → fast-forward.
