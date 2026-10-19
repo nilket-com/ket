@@ -157,8 +157,13 @@ pub struct WriteOptions {
 	/// Absolute caller deadline. The core client derives a fresh remaining duration
 	/// before every attempt; it never places this process-local instant on the wire.
 	pub deadline: Option<std::time::Instant>,
-	/// Caller-minted logical-operation identity. When absent, the SDK retains its
-	/// ordinary per-client sequence allocation for compatibility callers.
+	/// Caller-minted logical-operation identity (a UUIDv7 `client_uuid`). When
+	/// absent, `table_write` and `table_delete` mint a fresh UUIDv7 per call
+	/// (`sequence_no` 0, a 60 s TTL), so its issuance time is the operation's own:
+	/// the server proves a v7 identity expired from that time, and an identity
+	/// minted with the long-lived client would expire with the client's age.
+	/// The SDK's in-call retries resend the same identity; a new call is a new
+	/// operation. Blob writes and counter adds keep the per-client sequence.
 	pub operation_id: Option<ClientWriteId>,
 }
 
@@ -594,6 +599,18 @@ fn mutation_stopped_status(status: WriteStatus) -> bool {
 	)
 }
 
+/// The identity of a table mutation the caller did not name: a fresh UUIDv7
+/// minted for this operation. The server's expiry proof reads the issuance
+/// time from the uuid, so it must be the operation's, never the client's.
+fn default_table_mutation_id() -> ClientWriteId {
+	ClientWriteId {
+		client_uuid: *Uuid::now_v7().as_bytes(),
+		sequence_no: 0,
+		idempotency_ttl_ms: 60_000,
+		_pad: 0,
+	}
+}
+
 fn validate_caller_mutation_id(operation_id: ClientWriteId) -> Result<(), ClientError> {
 	let uuid = operation_id.client_uuid;
 	if uuid[6] >> 4 == 7 && uuid[8] >> 6 == 2 {
@@ -612,16 +629,32 @@ pub struct Client {
 }
 
 impl Client {
+	/// A client with a fresh UUIDv7 `client_uuid`, unique to this instance. Its
+	/// write ids `(client_uuid, sequence_no)` can never be issued by another
+	/// instance, in this process or any other.
 	pub fn from_inner(inner: Arc<InnerClient>) -> Self {
-		Self::with_client_uuid(inner, *Uuid::new_v4().as_bytes())
+		Self::with_client_uuid(inner, *Uuid::now_v7().as_bytes())
 	}
 
+	/// A client whose write ids use the caller's `client_uuid`. The uuid must be
+	/// unique to this `Client` instance for all time: the sequence always
+	/// restarts at 1, so a second instance under the same uuid (a restarted
+	/// process, or another live instance) reissues earlier write ids. A counter
+	/// add under a reissued write id that names a different add is refused with
+	/// `WriteFailed { status: WRITE_KEY_CONFLICT }`: never applied, never
+	/// replayed. Prefer [`from_inner`](Self::from_inner).
 	pub fn with_client_uuid(inner: Arc<InnerClient>, client_uuid: [u8; 16]) -> Self {
 		Self {
 			inner,
 			client_uuid,
 			next_sequence: AtomicU64::new(1),
 		}
+	}
+
+	/// The `client_uuid` this instance writes under.
+	#[doc(hidden)]
+	pub fn client_uuid(&self) -> [u8; 16] {
+		self.client_uuid
 	}
 
 	pub async fn connect_quic(config: ClientConfig) -> Result<Self, ClientError> {
@@ -1375,6 +1408,18 @@ impl Client {
 		};
 		let result = self.inner.counter_add(request).await?;
 		match result.response.status {
+			// Defence in depth: a receipt must describe this add's own delta.
+			s if (s == WriteStatus::OK || s == WriteStatus::DUPLICATE)
+				&& result
+					.response
+					.current_value
+					.checked_sub(result.response.previous_value)
+					!= Some(delta) =>
+			{
+				Err(ClientError::WriteFailed {
+					status: WriteStatus::INTERNAL_ERROR,
+				})
+			}
 			s if s == WriteStatus::OK || s == WriteStatus::DUPLICATE => Ok(CounterAddReceipt {
 				identity,
 				previous_value: result.response.previous_value,
@@ -1390,8 +1435,9 @@ impl Client {
 				Err(ClientError::TenantUnavailable { tenant_id })
 			}
 			s if s == WriteStatus::AUTHORIZATION_FAILED => Err(ClientError::AuthorizationFailed),
-			// Counter rejects (COUNTER_ZERO_DELTA / COUNTER_OVERFLOW, D5) surface via
-			// the carried status; no Toron-visible enum growth (D9 producer-only).
+			// Counter rejects (COUNTER_ZERO_DELTA / COUNTER_OVERFLOW, D5, and
+			// WRITE_KEY_CONFLICT) surface via the carried status; no Toron-visible
+			// enum growth (D9 producer-only).
 			status => Err(ClientError::WriteFailed { status }),
 		}
 	}
@@ -1432,18 +1478,12 @@ impl Client {
 		options: WriteOptions,
 	) -> Result<TableWriteReceipt, ClientError> {
 		let rows = payload.num_rows();
-		let sequence_no = self.next_sequence.fetch_add(1, Ordering::Relaxed);
 		let parent_write_id = match options.operation_id {
 			Some(operation_id) => {
 				validate_caller_mutation_id(operation_id)?;
 				operation_id
 			}
-			None => ClientWriteId {
-				client_uuid: self.client_uuid,
-				sequence_no,
-				idempotency_ttl_ms: 60_000,
-				_pad: 0,
-			},
+			None => default_table_mutation_id(),
 		};
 		let request = TableWriteRequest {
 			meta: TableWriteRequestMeta {
@@ -1518,18 +1558,12 @@ impl Client {
 				"table delete row key count exceeds u32 length",
 			)
 		})?;
-		let sequence_no = self.next_sequence.fetch_add(1, Ordering::Relaxed);
 		let parent_write_id = match options.operation_id {
 			Some(operation_id) => {
 				validate_caller_mutation_id(operation_id)?;
 				operation_id
 			}
-			None => ClientWriteId {
-				client_uuid: self.client_uuid,
-				sequence_no,
-				idempotency_ttl_ms: 60_000,
-				_pad: 0,
-			},
+			None => default_table_mutation_id(),
 		};
 		let request = TableDeleteRowsRequest {
 			meta: TableDeleteRowsRequestMeta {

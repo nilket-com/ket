@@ -134,13 +134,7 @@ impl ToronDaemon {
 		if config.observability.telemetry.is_none() {
 			install_tracing(&config);
 		}
-		let client = Arc::new(
-			build_wendelon_client(
-				&config.storage.wendelon,
-				*config.node.worker_id.get().as_bytes(),
-			)
-			.await?,
-		);
+		let client = Arc::new(build_wendelon_client(&config.storage.wendelon).await?);
 		Self::start_with_client(config, client).await
 	}
 
@@ -2512,9 +2506,11 @@ fn worker_entry(
 	}
 }
 
+/// Every build is a new SDK client instance with its own fresh write identity.
+/// The worker id is never a write identity: it survives restarts, while the
+/// client's sequence restarts at 1, so reusing it would reissue earlier write ids.
 async fn build_wendelon_client(
 	config: &ToronWendelonStorageConfig,
-	client_uuid: [u8; 16],
 ) -> Result<wendelon_client::Client, ToronDaemonError> {
 	if let Some(tls) = &config.tls {
 		let mut client_config = wendelon_client::ClientConfig::new(
@@ -2586,10 +2582,7 @@ async fn build_wendelon_client(
 		pool_max_retained: config.pool_max_retained,
 		pool_max_cap_bytes: config.pool_max_cap_bytes,
 	});
-	Ok(wendelon_client::Client::with_client_uuid(
-		inner,
-		client_uuid,
-	))
+	Ok(wendelon_client::Client::from_inner(inner))
 }
 
 #[cfg(test)]
@@ -2649,6 +2642,31 @@ mod tests {
 			},
 			audit: crate::config::AuditConfig::Disabled,
 		}
+	}
+
+	// Every Wendelon client build is a fresh UUIDv7 write identity, even for the
+	// same worker id: a restarted daemon never reissues an earlier write id.
+	#[tokio::test]
+	async fn wendelon_client_builds_never_share_a_write_identity() {
+		let config = retention_config();
+		assert!(config.storage.wendelon.tls.is_none(), "the non-TLS branch");
+		let first = build_wendelon_client(&config.storage.wendelon)
+			.await
+			.unwrap()
+			.client_uuid();
+		let second = build_wendelon_client(&config.storage.wendelon)
+			.await
+			.unwrap()
+			.client_uuid();
+		for uuid in [first, second] {
+			assert_eq!(
+				uuid::Uuid::from_bytes(uuid).get_version_num(),
+				7,
+				"{uuid:02x?}"
+			);
+			assert_ne!(uuid, *config.node.worker_id.get().as_bytes());
+		}
+		assert_ne!(first, second);
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]

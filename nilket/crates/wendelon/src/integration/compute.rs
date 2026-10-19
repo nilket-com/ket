@@ -1009,6 +1009,8 @@ pub fn map_write_status_for_compute(status: WriteStatus) -> StorageStatusKind {
 		WriteStatus::PAYLOAD_TOO_LARGE
 		| WriteStatus::INVALID_LEASE_SIGNATURE
 		| WriteStatus::INTERNAL_ERROR => StorageStatusKind::TerminalStorageError,
+		// The write id names another add: an identity fault, never a retry.
+		WriteStatus::WRITE_KEY_CONFLICT => StorageStatusKind::TerminalStorageError,
 		_ => StorageStatusKind::TerminalStorageError,
 	}
 }

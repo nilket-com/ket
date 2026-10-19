@@ -451,6 +451,15 @@ impl OptimizerRuntimeEvidence {
 						format!("counter fetch-add failed with status {}", status.as_str()),
 					);
 				}
+				Ok(Err(ClientError::WriteFailed { status }))
+					if status == WriteStatus::WRITE_KEY_CONFLICT =>
+				{
+					self.drop_conflicting_decision_in_flight(
+						key,
+						delta,
+						format!("counter fetch-add failed with status {}", status.as_str()),
+					);
+				}
 				Ok(Err(error)) => {
 					self.drop_ambiguous_decision_in_flight(key, delta, error.to_string())
 				}
@@ -489,6 +498,15 @@ impl OptimizerRuntimeEvidence {
 					if status == WriteStatus::COUNTER_REPLICATION_UNSUPPORTED =>
 				{
 					self.latch_probe_linearity_replication_unsupported(
+						key,
+						delta,
+						format!("counter fetch-add failed with status {}", status.as_str()),
+					);
+				}
+				Ok(Err(ClientError::WriteFailed { status }))
+					if status == WriteStatus::WRITE_KEY_CONFLICT =>
+				{
+					self.drop_conflicting_probe_linearity_in_flight(
 						key,
 						delta,
 						format!("counter fetch-add failed with status {}", status.as_str()),
@@ -537,6 +555,15 @@ impl OptimizerRuntimeEvidence {
 						format!("counter fetch-add failed with status {}", status.as_str()),
 					);
 				}
+				Ok(Err(ClientError::WriteFailed { status }))
+					if status == WriteStatus::WRITE_KEY_CONFLICT =>
+				{
+					self.drop_conflicting_window_in_flight(
+						key,
+						delta,
+						format!("counter fetch-add failed with status {}", status.as_str()),
+					);
+				}
 				Ok(Err(error)) => {
 					self.drop_ambiguous_window_in_flight(key, delta, error.to_string())
 				}
@@ -578,6 +605,15 @@ impl OptimizerRuntimeEvidence {
 					if status == WriteStatus::COUNTER_REPLICATION_UNSUPPORTED =>
 				{
 					self.latch_replication_unsupported(
+						key,
+						delta,
+						format!("counter fetch-add failed with status {}", status.as_str()),
+					);
+				}
+				Ok(Err(ClientError::WriteFailed { status }))
+					if status == WriteStatus::WRITE_KEY_CONFLICT =>
+				{
+					self.drop_conflicting_in_flight(
 						key,
 						delta,
 						format!("counter fetch-add failed with status {}", status.as_str()),
@@ -928,6 +964,62 @@ impl OptimizerRuntimeEvidence {
 		}
 		state.state = OptimizerEvidenceState::Unavailable;
 		state.last_error = Some(error);
+	}
+
+	/// The write id of this flush already names a different add: the delta was
+	/// not applied, and the receipt carries no count to merge. That is an
+	/// identity fault, not an outage, so the circuit opens at once and the delta
+	/// is dropped as known-unapplied rather than ambiguous.
+	fn latch_write_key_conflict(state: &mut RuntimeEvidenceState, delta: u64, error: String) {
+		state.dropped_deltas = state.dropped_deltas.saturating_add(delta);
+		state.circuit_open = true;
+		state.mode = OptimizerEvidenceMode::Degraded;
+		state.state = OptimizerEvidenceState::Unavailable;
+		state.last_error = Some(error);
+	}
+
+	fn drop_conflicting_in_flight(
+		&self,
+		key: OptimizerRuntimeVerdictKey,
+		delta: u64,
+		error: String,
+	) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.in_flight.remove(&key);
+		Self::latch_write_key_conflict(&mut state, delta, error);
+	}
+
+	fn drop_conflicting_decision_in_flight(
+		&self,
+		key: OptimizerRuntimeDecisionKey,
+		delta: u64,
+		error: String,
+	) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.decision_in_flight.remove(&key);
+		Self::latch_write_key_conflict(&mut state, delta, error);
+	}
+
+	fn drop_conflicting_probe_linearity_in_flight(
+		&self,
+		key: OptimizerProbeLinearityFenceKey,
+		delta: u64,
+		error: String,
+	) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.probe_linearity_in_flight.remove(&key);
+		Self::latch_write_key_conflict(&mut state, delta, error);
+	}
+
+	fn drop_conflicting_window_in_flight(
+		&self,
+		key: OptimizerEvidenceWindowCounterKey,
+		delta: u64,
+		error: String,
+	) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.window_in_flight.remove(&key);
+		Self::latch_write_key_conflict(&mut state, delta, error);
 	}
 
 	fn latch_replication_unsupported(
@@ -2215,5 +2307,323 @@ mod tests {
 		assert_eq!(status.dropped_deltas, 2);
 		assert_eq!(status.ambiguous_deltas, 2);
 		assert_eq!(status.state, OptimizerEvidenceState::Unavailable);
+	}
+
+	/// A Wendelon client whose every counter add is answered with
+	/// `WRITE_KEY_CONFLICT`: this flush's write id already names another add.
+	mod conflicting_wire {
+		use std::collections::HashMap;
+		use std::future::Future;
+		use std::pin::Pin;
+		use std::sync::Arc;
+		use std::sync::atomic::{AtomicUsize, Ordering};
+		use std::task::{Context, Poll};
+
+		use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+		use wendelon::client::{
+			ClusterPeerWire, ClusterStatusWire, StaticTopologySource, WendelonClient,
+			WendelonClientConfig,
+		};
+		use wendelon::network::core::{HRFT_MAGIC, write_frame};
+		use wendelon::network::tls::ActorIdentity;
+		use wendelon::network::transport::{
+			NodeRole, NodeRoleSet, TransportConnection, TransportProvider, TransportStream,
+			TransportTier, TransportTierSet,
+		};
+		use wendelon::schema::{CounterAddResponseMeta, FrameHeader, MsgType, NodeId, WriteStatus};
+		use wendelon_client::Client;
+
+		type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+		struct ConflictStream {
+			reply: Vec<u8>,
+			read_at: usize,
+			adds: Arc<AtomicUsize>,
+		}
+
+		impl AsyncRead for ConflictStream {
+			fn poll_read(
+				mut self: Pin<&mut Self>,
+				_cx: &mut Context<'_>,
+				buf: &mut ReadBuf<'_>,
+			) -> Poll<std::io::Result<()>> {
+				let at = self.read_at;
+				let n = buf.remaining().min(self.reply.len() - at);
+				buf.put_slice(&self.reply[at..at + n]);
+				self.read_at += n;
+				Poll::Ready(Ok(()))
+			}
+		}
+
+		impl AsyncWrite for ConflictStream {
+			fn poll_write(
+				self: Pin<&mut Self>,
+				_cx: &mut Context<'_>,
+				buf: &[u8],
+			) -> Poll<std::io::Result<usize>> {
+				Poll::Ready(Ok(buf.len()))
+			}
+
+			fn poll_flush(
+				self: Pin<&mut Self>,
+				_cx: &mut Context<'_>,
+			) -> Poll<std::io::Result<()>> {
+				Poll::Ready(Ok(()))
+			}
+
+			fn poll_shutdown(
+				self: Pin<&mut Self>,
+				_cx: &mut Context<'_>,
+			) -> Poll<std::io::Result<()>> {
+				Poll::Ready(Ok(()))
+			}
+		}
+
+		impl TransportStream for ConflictStream {
+			fn stream_id(&self) -> u64 {
+				0
+			}
+
+			fn finish<'life0, 'async_trait>(
+				&'life0 mut self,
+			) -> BoxFuture<'async_trait, std::io::Result<()>>
+			where
+				'life0: 'async_trait,
+				Self: 'async_trait,
+			{
+				Box::pin(async move {
+					self.adds.fetch_add(1, Ordering::SeqCst);
+					let mut response: CounterAddResponseMeta = bytemuck::Zeroable::zeroed();
+					response.status = WriteStatus::WRITE_KEY_CONFLICT;
+					let meta = bytemuck::bytes_of(&response);
+					let header = FrameHeader {
+						magic: HRFT_MAGIC,
+						version: 1,
+						msg_type: MsgType::COUNTER_ADD_RESP.0,
+						flags: 0,
+						stream_id: 0,
+						meta_len: meta.len() as u32,
+						arrow_len: 0,
+						trailing_len: 0,
+					};
+					let mut reply = Vec::new();
+					write_frame(&mut reply, &header, meta, None, None).await?;
+					self.reply = reply;
+					Ok(())
+				})
+			}
+		}
+
+		struct ConflictConnection {
+			remote: NodeId,
+			actor: ActorIdentity,
+			adds: Arc<AtomicUsize>,
+		}
+
+		impl TransportConnection for ConflictConnection {
+			fn open_bi<'life0, 'async_trait>(
+				&'life0 self,
+			) -> BoxFuture<'async_trait, std::io::Result<Box<dyn TransportStream>>>
+			where
+				'life0: 'async_trait,
+				Self: 'async_trait,
+			{
+				let stream: Box<dyn TransportStream> = Box::new(ConflictStream {
+					reply: Vec::new(),
+					read_at: 0,
+					adds: self.adds.clone(),
+				});
+				Box::pin(async move { Ok(stream) })
+			}
+
+			fn accept_bi<'life0, 'async_trait>(
+				&'life0 self,
+			) -> BoxFuture<'async_trait, std::io::Result<Box<dyn TransportStream>>>
+			where
+				'life0: 'async_trait,
+				Self: 'async_trait,
+			{
+				unimplemented!("the client never accepts inbound streams")
+			}
+
+			fn remote_id(&self) -> Option<NodeId> {
+				Some(self.remote)
+			}
+
+			fn actor_identity(&self) -> &ActorIdentity {
+				&self.actor
+			}
+
+			fn transport_type(&self) -> TransportTier {
+				TransportTier::QuicIoUring
+			}
+
+			fn is_closed(&self) -> bool {
+				false
+			}
+		}
+
+		struct ConflictProvider {
+			adds: Arc<AtomicUsize>,
+		}
+
+		impl TransportProvider for ConflictProvider {
+			fn connect<'life0, 'life1, 'async_trait>(
+				&'life0 self,
+				target: NodeId,
+				_address: &'life1 str,
+			) -> BoxFuture<'async_trait, std::io::Result<Arc<dyn TransportConnection>>>
+			where
+				'life0: 'async_trait,
+				'life1: 'async_trait,
+				Self: 'async_trait,
+			{
+				let connection: Arc<dyn TransportConnection> = Arc::new(ConflictConnection {
+					remote: target,
+					actor: ActorIdentity::data_node(target),
+					adds: self.adds.clone(),
+				});
+				Box::pin(async move { Ok(connection) })
+			}
+		}
+
+		/// The client, and a count of the counter adds that reached the wire.
+		pub(super) fn client() -> (Arc<Client>, Arc<AtomicUsize>) {
+			let adds = Arc::new(AtomicUsize::new(0));
+			let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
+			let snapshot = ClusterStatusWire {
+				epoch: 1,
+				leader: Some(1),
+				replication_factor: 1,
+				peers: vec![ClusterPeerWire {
+					node_id: 1,
+					address: "127.0.0.1:9001".to_string(),
+					tier_bits: tiers.as_u8(),
+					role_bits: NodeRoleSet::empty().with(NodeRole::Data).as_u8(),
+					capability_bits: 0,
+				}],
+			};
+			let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
+			providers.insert(
+				TransportTier::QuicIoUring,
+				Arc::new(ConflictProvider { adds: adds.clone() }),
+			);
+			let inner = WendelonClient::new(WendelonClientConfig {
+				local_tiers: tiers,
+				providers,
+				bootstrap: snapshot.clone(),
+				topology: Arc::new(StaticTopologySource::new(snapshot)),
+				pool_max_retained: 4,
+				pool_max_cap_bytes: 64 * 1024,
+			});
+			(Arc::new(Client::from_inner(inner)), adds)
+		}
+	}
+
+	/// A durable evidence handle whose every flush meets a write-key conflict.
+	fn conflicting_evidence() -> (
+		Arc<OptimizerRuntimeEvidence>,
+		Arc<std::sync::atomic::AtomicUsize>,
+	) {
+		let (client, adds) = conflicting_wire::client();
+		let evidence = OptimizerRuntimeEvidence::with_wendelon(DurableEvidenceBinding::new(
+			client,
+			TenantId::new(7),
+			Duration::from_secs(5),
+		));
+		(evidence, adds)
+	}
+
+	/// A write-key conflict drops the delta as known-unapplied (not ambiguous),
+	/// opens the circuit and degrades at once, records the error, merges nothing
+	/// and leaves nothing in flight; the open circuit stops the next flush.
+	fn assert_conflict_latched(
+		evidence: &OptimizerRuntimeEvidence,
+		adds: &std::sync::atomic::AtomicUsize,
+		lane: &str,
+	) {
+		let status = evidence.status_snapshot();
+		assert_eq!(adds.load(std::sync::atomic::Ordering::SeqCst), 1, "{lane}");
+		assert_eq!(status.mode, OptimizerEvidenceMode::Degraded, "{lane}");
+		assert_eq!(status.state, OptimizerEvidenceState::Unavailable, "{lane}");
+		assert_eq!(status.dropped_deltas, 3, "{lane}");
+		assert_eq!(status.ambiguous_deltas, 0, "{lane}: not ambiguous");
+		assert_eq!(status.pending_deltas, 0, "{lane}");
+		assert!(
+			status
+				.last_error
+				.as_deref()
+				.is_some_and(|error| error.contains("write_key_conflict")),
+			"{lane}: {:?}",
+			status.last_error
+		);
+		let state = evidence.state.lock().expect("optimizer runtime evidence");
+		assert!(state.circuit_open, "{lane}");
+		assert!(state.in_flight.is_empty(), "{lane}");
+		assert!(state.decision_in_flight.is_empty(), "{lane}");
+		assert!(state.probe_linearity_in_flight.is_empty(), "{lane}");
+		assert!(state.window_in_flight.is_empty(), "{lane}");
+		assert!(state.durable_cache.is_empty(), "{lane}: nothing merged");
+		assert!(
+			state.decision_durable_cache.is_empty(),
+			"{lane}: nothing merged"
+		);
+		assert!(state.probe_linearity_durable_cache.is_empty(), "{lane}");
+		assert!(state.window_durable_cache.is_empty(), "{lane}");
+	}
+
+	#[tokio::test]
+	async fn verdict_flush_write_key_conflict_drops_without_merging() {
+		let (evidence, adds) = conflicting_evidence();
+		let key = star_missed();
+		evidence.state.lock().unwrap().pending.insert(key, 3);
+		evidence.flush_keys([key]).await;
+		assert_conflict_latched(&evidence, &adds, "verdict");
+		evidence.state.lock().unwrap().pending.insert(key, 1);
+		evidence.flush_keys([key]).await;
+		assert_eq!(
+			adds.load(std::sync::atomic::Ordering::SeqCst),
+			1,
+			"circuit open"
+		);
+	}
+
+	#[tokio::test]
+	async fn decision_flush_write_key_conflict_drops_without_merging() {
+		let (evidence, adds) = conflicting_evidence();
+		let key = all_decision_counter_keys()[0].0;
+		evidence
+			.state
+			.lock()
+			.unwrap()
+			.decision_pending
+			.insert(key, 3);
+		evidence.flush_decision_deltas().await;
+		assert_conflict_latched(&evidence, &adds, "decision");
+	}
+
+	#[tokio::test]
+	async fn probe_linearity_flush_write_key_conflict_drops_without_merging() {
+		let (evidence, adds) = conflicting_evidence();
+		let key = all_probe_linearity_counter_keys()[0].0;
+		evidence
+			.state
+			.lock()
+			.unwrap()
+			.probe_linearity_pending
+			.insert(key, 3);
+		evidence.flush_probe_linearity_deltas().await;
+		assert_conflict_latched(&evidence, &adds, "probe linearity");
+	}
+
+	#[tokio::test]
+	async fn window_flush_write_key_conflict_drops_without_merging() {
+		let (evidence, adds) = conflicting_evidence();
+		let key =
+			all_window_counter_keys(OptimizerEvidenceWindowId(9), OptimizerEvidenceWindowId(8))[0]
+				.0;
+		evidence.state.lock().unwrap().window_pending.insert(key, 3);
+		evidence.flush_window_deltas().await;
+		assert_conflict_latched(&evidence, &adds, "window");
 	}
 }

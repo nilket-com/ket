@@ -53,6 +53,8 @@ struct ModelImage {
 	faults: Vec<Fault>,
 	unlinked_witness: bool,
 	cut: Option<Cut>,
+	/// Notified after the n-th event since it was armed; the world goes on.
+	signal: Option<(usize, Arc<tokio::sync::Notify>)>,
 	events: usize,
 	label_hits: usize,
 	crashed: bool,
@@ -68,6 +70,39 @@ struct ModelImage {
 struct PersistenceModel {
 	image: StdMutex<ModelImage>,
 	trace: Arc<StdMutex<Vec<String>>>,
+	/// Blocks one file operation, on its own (blocking-pool) thread, until released.
+	park: StdMutex<Option<ModelPark>>,
+}
+
+/// Parks the `nth` file operation whose label starts with `prefix`.
+struct ModelPark {
+	prefix: &'static str,
+	nth: usize,
+	seen: usize,
+	park: Arc<BlockingPark>,
+}
+
+/// A parked file operation: `reached` fires when it parks, and it resumes once
+/// `release` is called. It parks before taking the model's image lock.
+#[derive(Default)]
+struct BlockingPark {
+	reached: tokio::sync::Notify,
+	released: StdMutex<bool>,
+	wake: std::sync::Condvar,
+}
+
+impl BlockingPark {
+	fn release(&self) {
+		*self.released.lock().unwrap() = true;
+		self.wake.notify_all();
+	}
+
+	fn wait(&self) {
+		let mut released = self.released.lock().unwrap();
+		while !*released {
+			released = self.wake.wait(released).unwrap();
+		}
+	}
 }
 
 fn crashed_error() -> Error {
@@ -126,6 +161,59 @@ impl PersistenceModel {
 		image.label_hits = 0;
 	}
 
+	/// Notify `signal` after the n-th (1-based) event from now on, without a
+	/// crash: the caller can drop an operation there while its work goes on.
+	fn signal_after(&self, n: usize, signal: Arc<tokio::sync::Notify>) {
+		let mut image = self.image.lock().unwrap();
+		image.signal = Some((n, signal));
+		image.events = 0;
+	}
+
+	/// Park the `nth` (1-based) file operation from now on whose label (as the
+	/// trace spells it) starts with `prefix`.
+	fn park_at(&self, prefix: &'static str, nth: usize) -> Arc<BlockingPark> {
+		let park = Arc::new(BlockingPark::default());
+		*self.park.lock().unwrap() = Some(ModelPark {
+			prefix,
+			nth,
+			seen: 0,
+			park: park.clone(),
+		});
+		park
+	}
+
+	fn park_if_armed(&self, operation: &str, path: &Path) {
+		let label = format!("{operation}:{}", path.display());
+		let parked = {
+			let mut armed = self.park.lock().unwrap();
+			let hit = armed.as_mut().is_some_and(|park| {
+				label.starts_with(park.prefix) && {
+					park.seen += 1;
+					park.seen == park.nth
+				}
+			});
+			if hit { armed.take() } else { None }
+		};
+		if let Some(parked) = parked {
+			parked.park.reached.notify_one();
+			parked.park.wait();
+		}
+	}
+
+	/// The kernel writes back everything now, as it may at any time.
+	fn writeback_now(&self) {
+		Self::writeback_all(&mut self.image.lock().unwrap());
+	}
+
+	fn has_durable_witness_name(&self) -> bool {
+		self.image
+			.lock()
+			.unwrap()
+			.durable_names
+			.iter()
+			.any(|path| is_witness(path))
+	}
+
 	/// Count events from now on (for sizing a cut sweep).
 	fn reset_events(&self) {
 		self.image.lock().unwrap().events = 0;
@@ -151,6 +239,15 @@ impl PersistenceModel {
 	fn completed(&self, image: &mut ModelImage, operation: &str, path: &Path) {
 		let label = format!("{operation}:{}", path.display());
 		image.events += 1;
+		if image
+			.signal
+			.as_ref()
+			.is_some_and(|(n, _)| *n == image.events)
+		{
+			if let Some((_, signal)) = image.signal.take() {
+				signal.notify_one();
+			}
+		}
 		match image.cut {
 			Some(Cut::Event(n)) if image.events == n => image.crashed = true,
 			Some(Cut::Label(prefix, n)) if label.starts_with(prefix) => {
@@ -196,6 +293,7 @@ impl PersistenceModel {
 		image.unlinked_witness = false;
 		image.faults.clear();
 		image.cut = None;
+		image.signal = None;
 		image.crashed = false;
 	}
 
@@ -294,6 +392,7 @@ impl CounterDurableFileOps for PersistenceModel {
 	}
 
 	fn write_file(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+		self.park_if_armed("write_file", path);
 		let mut image = self.image.lock().unwrap();
 		Self::live(&image)?;
 		image.volatile_names.insert(path.to_path_buf());
@@ -308,6 +407,7 @@ impl CounterDurableFileOps for PersistenceModel {
 	}
 
 	fn append_file(&self, path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+		self.park_if_armed("append_file", path);
 		let mut image = self.image.lock().unwrap();
 		Self::live(&image)?;
 		let created = !image.volatile_names.contains(path);
@@ -396,6 +496,7 @@ impl CounterDurableFileOps for PersistenceModel {
 	}
 
 	fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+		self.park_if_armed("rename", to);
 		let mut image = self.image.lock().unwrap();
 		Self::live(&image)?;
 		let bytes = image
@@ -414,6 +515,7 @@ impl CounterDurableFileOps for PersistenceModel {
 	}
 
 	fn unlink(&self, path: &Path) -> std::io::Result<()> {
+		self.park_if_armed("unlink", path);
 		let mut image = self.image.lock().unwrap();
 		Self::live(&image)?;
 		if !image.volatile_names.contains(path) {
@@ -433,6 +535,7 @@ impl CounterDurableFileOps for PersistenceModel {
 	}
 
 	fn sync_all(&self, path: &Path) -> std::io::Result<()> {
+		self.park_if_armed("sync_all", path);
 		let mut image = self.image.lock().unwrap();
 		Self::live(&image)?;
 		if is_temp(path) {
@@ -456,6 +559,7 @@ impl CounterDurableFileOps for PersistenceModel {
 	}
 
 	fn sync_data(&self, path: &Path) -> std::io::Result<()> {
+		self.park_if_armed("sync_data", path);
 		let mut image = self.image.lock().unwrap();
 		Self::live(&image)?;
 		if is_applied(path) {
@@ -474,6 +578,7 @@ impl CounterDurableFileOps for PersistenceModel {
 	}
 
 	fn sync_dir(&self, path: &Path) -> std::io::Result<()> {
+		self.park_if_armed("sync_dir", path);
 		let mut image = self.image.lock().unwrap();
 		Self::live(&image)?;
 		let applied = path.join("counter-applied.log");
@@ -1192,10 +1297,12 @@ fn fixture_witness(op_id: u64, write_key: CounterWriteKey, key: &[u8]) -> Stored
 	}
 }
 
-// D1: unkeyed records written before the keyed frame are still read, replay
-// their outcomes, and seed the op-id high-water; new appends are keyed.
+// D1: unkeyed records written before the keyed frame are still read and seed
+// the op-id high-water; new appends are keyed. An unkeyed record cannot show
+// which add it records, so a request under its write key is refused even when
+// it is a genuine retry (the documented compatibility limit).
 #[tokio::test]
-async fn unkeyed_records_still_replay_and_new_records_are_keyed() {
+async fn unkeyed_records_are_read_but_refuse_their_write_keys_and_new_records_are_keyed() {
 	let rig = Rig::new(PersistenceModel::new(), 1);
 	model_store(&rig.model);
 	let mut bytes = Vec::new();
@@ -1215,12 +1322,12 @@ async fn unkeyed_records_still_replay_and_new_records_are_keyed() {
 	let recovered = rig.restart().await;
 	let key = ckey(b"unkeyed");
 	assert_eq!(
-		recovered.fetch_add(wk(11), &key, 5).await.unwrap(),
-		CounterAddResult::Replayed(outcome(0, 5))
+		recovered.fetch_add(wk(11), &key, 5).await,
+		Err(CounterLeaderError::WriteKeyConflict)
 	);
 	assert_eq!(
-		recovered.fetch_add(wk(12), &key, 2).await.unwrap(),
-		CounterAddResult::Replayed(outcome(5, 7))
+		recovered.fetch_add(wk(12), &key, 2).await,
+		Err(CounterLeaderError::WriteKeyConflict)
 	);
 	recovered.fetch_add(wk(13), &key, 1).await.unwrap();
 	drop(recovered);
@@ -1634,3 +1741,7 @@ async fn crash_cuts_inside_recovery_and_reconcile_recover_one_outcome() {
 		assert!(nested > total, "the nested sweep ran ({nested} cuts)");
 	}
 }
+
+mod write_key_tests;
+
+mod eligible_park_tests;

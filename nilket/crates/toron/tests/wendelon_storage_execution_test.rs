@@ -48,7 +48,9 @@ use wendelon::schema::{
 	pbc::{OP_GT, OP_PROJECT, OP_PUSH_COL, OP_PUSH_INT},
 };
 use wendelon::simulator::network::{SimulatedTransportNetwork, SimulatedTransportProvider};
-use wendelon_client::{Client, RowIdentityProjection, TableQueryOptions, WriteOptions};
+use wendelon_client::{
+	Client, ClientError, RowIdentityProjection, TableQueryOptions, WriteOptions,
+};
 
 const LIVE_TENANT: WendelonTenantId = WendelonTenantId::new(1);
 const OTHER_TENANT: WendelonTenantId = WendelonTenantId::new(2);
@@ -429,6 +431,118 @@ async fn wendelon_table_query_runtime_filter_reduces_boundary_rows() {
 	println!(
 		"adr013_production_wendelon_runtime_filter rows_off={unfiltered_rows} rows_on={filtered_rows} bytes_off={unfiltered_bytes} bytes_on={filtered_bytes} digest={}",
 		hex32(unfiltered_digest.get()),
+	);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+/// A UUIDv7 issued `age` ago: the identity of a client incarnation that old.
+fn v7_issued_ago(age: Duration) -> [u8; 16] {
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.expect("clock after epoch");
+	let issued_ms = (now - age).as_millis() as u64;
+	let mut uuid = *uuid::Uuid::now_v7().as_bytes();
+	uuid[..6].copy_from_slice(&issued_ms.to_be_bytes()[2..]);
+	uuid
+}
+
+fn assert_expired(what: &str, result: Result<impl std::fmt::Debug, ClientError>) {
+	match result {
+		Err(ClientError::MutationStopped { status, .. })
+			if status == wendelon::schema::WriteStatus::WRITE_OPERATION_EXPIRED => {}
+		other => panic!("{what}: expected WRITE_OPERATION_EXPIRED, got {other:?}"),
+	}
+}
+
+// A client incarnation older than the 60 s identity TTL. The server proves a
+// UUIDv7 table-mutation identity expired from its issuance time, so a default
+// identity built from the incarnation uuid (the negative control, sent here as
+// an explicit operation id exactly as the old default built it) is refused on
+// first presentation and applies nothing. The default now mints a fresh UUIDv7
+// per operation, so the same client's default table write and delete apply.
+#[tokio::test]
+async fn default_table_mutation_identity_does_not_age_with_its_client() {
+	let fixture = LiveWendelonFixture::start(141).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	let incarnation = v7_issued_ago(Duration::from_secs(61));
+	let client = Client::with_client_uuid(fixture.inner.clone(), incarnation);
+	let old_default = |sequence_no| wendelon::schema::ClientWriteId {
+		client_uuid: incarnation,
+		sequence_no,
+		idempotency_ttl_ms: 60_000,
+		_pad: 0,
+	};
+	let refused_options = |sequence_no| WriteOptions {
+		await_finalization: true,
+		operation_id: Some(old_default(sequence_no)),
+		..WriteOptions::default()
+	};
+
+	assert_expired(
+		"the incarnation-uuid write identity",
+		client
+			.table_write(LIVE_TENANT, &descriptor, batch(), refused_options(1))
+			.await,
+	);
+	assert!(
+		query_ids_gt(&fixture, &descriptor, LIVE_TENANT, 0)
+			.await
+			.is_empty(),
+		"the refused write applied nothing"
+	);
+
+	write_rows(&client, LIVE_TENANT, &descriptor, batch()).await;
+	let written = query_ids_gt(&fixture, &descriptor, LIVE_TENANT, 0).await;
+	assert!(!written.is_empty(), "the default write applied");
+
+	let options = TableQueryOptions {
+		physical_descriptor_fingerprint: Some(descriptor.physical_descriptor_fingerprint),
+		row_identity: RowIdentityProjection::Append,
+		..TableQueryOptions::default()
+	};
+	let rows = client
+		.table_query(LIVE_TENANT, &descriptor, pbc_amount_gt_100(), options)
+		.await
+		.expect("row identity table query");
+	let ids: Vec<wendelon::schema::Identity> =
+		row_key_id_bytes(&concat_batches_for_assertion(&rows.batches))
+			.into_iter()
+			.map(wendelon::schema::Identity::new)
+			.collect();
+	assert!(!ids.is_empty());
+
+	assert_expired(
+		"the incarnation-uuid delete identity",
+		client
+			.table_delete(LIVE_TENANT, &descriptor, ids.clone(), refused_options(2))
+			.await,
+	);
+	assert_eq!(
+		query_ids_gt(&fixture, &descriptor, LIVE_TENANT, 0).await,
+		written,
+		"the refused delete applied nothing"
+	);
+
+	let deleted = client
+		.table_delete(
+			LIVE_TENANT,
+			&descriptor,
+			ids.clone(),
+			WriteOptions {
+				await_finalization: true,
+				..WriteOptions::default()
+			},
+		)
+		.await
+		.expect("the default delete applies");
+	assert_eq!(deleted.deleted_count as usize, ids.len());
+	assert_eq!(
+		query_ids_gt(&fixture, &descriptor, LIVE_TENANT, 100).await,
+		Vec::<i64>::new(),
+		"the deleted rows are gone"
 	);
 
 	fixture.node.handles.abort();
@@ -1978,6 +2092,8 @@ async fn wendelon_storage_scan_maps_server_descriptor_evolution() {
 struct LiveWendelonFixture {
 	node: WendelonNode,
 	client: Arc<Client>,
+	/// The SDK connection under `client`, for building other client incarnations.
+	inner: Arc<wendelon::client::WendelonClient>,
 	data_dir: std::path::PathBuf,
 	_serial_permit: tokio::sync::OwnedSemaphorePermit,
 }
@@ -2034,11 +2150,12 @@ impl LiveWendelonFixture {
 			pool_max_retained: 64,
 			pool_max_cap_bytes: 8 * 1024 * 1024,
 		});
-		let client = Arc::new(Client::with_client_uuid(inner, [node_id as u8; 16]));
+		let client = Arc::new(Client::from_inner(inner.clone()));
 
 		Self {
 			node,
 			client,
+			inner,
 			data_dir,
 			_serial_permit: serial_permit,
 		}

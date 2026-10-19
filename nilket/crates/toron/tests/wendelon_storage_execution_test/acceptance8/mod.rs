@@ -288,7 +288,7 @@ impl AcceptanceFixture {
 			pool_max_retained: 64,
 			pool_max_cap_bytes: 8 * 1024 * 1024,
 		});
-		let client = Arc::new(Client::with_client_uuid(inner, [node_id as u8; 16]));
+		let client = Arc::new(Client::from_inner(inner));
 
 		Self {
 			node,

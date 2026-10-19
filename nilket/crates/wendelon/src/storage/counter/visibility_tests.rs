@@ -84,7 +84,12 @@ async fn ctr4_second_add_uses_first_unresolved_witness() {
 	let f = Fixture::new("ctr4-second-witness").await;
 	let dir = TestDir::new("ctr4-second-witness-log");
 	let p = MarkerFault::new(&f);
-	let leader = CounterLeader::new(node(1), p.clone(), true, witness_store(&dir));
+	let leader = Arc::new(CounterLeader::new(
+		node(1),
+		p.clone(),
+		true,
+		witness_store(&dir),
+	));
 	let key = CounterKey(b"sum".to_vec());
 	assert_eq!(
 		leader.fetch_add(plan(&p), [1; 24], &key, 5).await,
@@ -128,7 +133,8 @@ async fn ctr4_second_add_uses_first_unresolved_witness() {
 	drop(p);
 	let f = f.reopened().await;
 	let p = MarkerFault::new(&f);
-	let leader = CounterLeader::recover(node(1), p.clone(), true, witness_store(&dir)).unwrap();
+	let leader =
+		Arc::new(CounterLeader::recover(node(1), p.clone(), true, witness_store(&dir)).unwrap());
 	assert_eq!(leader.read(&key).await, Ok(Some(12)));
 	p.blocked.store(false, Ordering::SeqCst);
 	for step in 1..=64 {
@@ -164,7 +170,12 @@ async fn ctr4_orphan_live_value_never_becomes_base() {
 	let dir = TestDir::new("ctr4-orphan-witness");
 	let p = MarkerFault::new(&f);
 	p.blocked.store(false, Ordering::SeqCst);
-	let leader = CounterLeader::new(node(1), p.clone(), true, witness_store(&dir));
+	let leader = Arc::new(CounterLeader::new(
+		node(1),
+		p.clone(),
+		true,
+		witness_store(&dir),
+	));
 	assert_eq!(
 		leader.fetch_add(plan(&p), [1; 24], &key, 3).await,
 		Ok(CounterAddResult::Applied(CounterAddOutcome {
@@ -191,7 +202,12 @@ async fn ctr4_newer_mark_beats_stale_pending_witness() {
 	let f = Fixture::new("ctr4-stale-witness").await;
 	let dir = TestDir::new("ctr4-stale-witness-log");
 	let p = MarkerFault::new(&f);
-	let leader = CounterLeader::new(node(1), p.clone(), true, witness_store(&dir));
+	let leader = Arc::new(CounterLeader::new(
+		node(1),
+		p.clone(),
+		true,
+		witness_store(&dir),
+	));
 	let key = CounterKey(b"stale".to_vec());
 	assert_eq!(
 		leader.fetch_add(plan(&p), [1; 24], &key, 5).await,
@@ -215,7 +231,8 @@ async fn ctr4_newer_mark_beats_stale_pending_witness() {
 	let f = f.reopened().await;
 	let p = MarkerFault::new(&f);
 	p.blocked.store(false, Ordering::SeqCst);
-	let leader = CounterLeader::recover(node(1), p.clone(), true, witness_store(&dir)).unwrap();
+	let leader =
+		Arc::new(CounterLeader::recover(node(1), p.clone(), true, witness_store(&dir)).unwrap());
 	assert_eq!(leader.pending_witnesses(), 1);
 	assert_eq!(leader.read(&key).await, Ok(Some(12)));
 	leader
@@ -273,7 +290,7 @@ async fn ctr4_local_reopen_rebuilds_marked_and_pending_witness_winner() {
 		Some(10)
 	);
 	let p = MarkerFault::new(&f);
-	let leader = CounterLeader::recover(node(1), p, true, witness_store(&dir)).unwrap();
+	let leader = Arc::new(CounterLeader::recover(node(1), p, true, witness_store(&dir)).unwrap());
 	assert_eq!(leader.read(&CounterKey(vec![9])).await, Ok(Some(20)));
 	assert_eq!(leader.pending_witnesses(), 1);
 	assert_eq!(

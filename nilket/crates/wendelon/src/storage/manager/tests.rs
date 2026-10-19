@@ -3319,13 +3319,13 @@ async fn ctr6_leader_add_after_straddled_reopen_uses_42_as_base_and_commits_43()
 		reopened.clone(),
 	));
 	let local = crate::storage::counter::LocalCounterParticipant::new(service, tenant(), origin);
-	let leader = crate::storage::counter::CounterLeader::new(
+	let leader = Arc::new(crate::storage::counter::CounterLeader::new(
 		origin,
 		local.clone(),
 		true,
 		crate::storage::counter::DurableCounterWitnessStore::open(dir.join("counter-witness"))
 			.unwrap(),
-	);
+	));
 	// The version at HLC 42 represents the preceding committed op; align the
 	// freshly reconstructed leader's allocator with the next canonical op id.
 	leader.set_next_op_id_for_test(43);
@@ -4695,12 +4695,12 @@ async fn leader_over_real_replica_service_commits_value_visible_through_service(
 		tenant(),
 		local_id,
 	));
-	let leader = CounterLeader::new(
+	let leader = Arc::new(CounterLeader::new(
 		local_id,
 		local.clone(),
 		true,
 		DurableCounterWitnessStore::open(&*wdir).unwrap(),
-	);
+	));
 	let plan = || CounterParticipantPlan::new(vec![(local_id, local.clone())], 1);
 
 	let k = ckey(b"verdict");

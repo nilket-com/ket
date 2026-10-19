@@ -6183,6 +6183,7 @@ name = "wendelon-client"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "bytemuck",
  "postcard",
  "serde",
  "thiserror 2.0.18",
