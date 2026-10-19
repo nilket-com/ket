@@ -5,9 +5,7 @@ use crate::consensus::raft_storage::read_only_fixture::{
 	record_len, write_segment, write_snapshot,
 };
 use crate::storage::mutation_visibility::root2::command::Command2;
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::path::Path;
 
 fn history() -> Root {
 	let mut r = Root::new();
@@ -99,27 +97,6 @@ fn a6_two_runs_are_byte_identical() {
 	assert_eq!(ab.stdout, ba.stdout);
 }
 
-/// Every file under `dir`: its bytes and modification time.
-fn listing(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
-	let mut out = BTreeMap::new();
-	let mut stack = vec![dir.to_path_buf()];
-	while let Some(d) = stack.pop() {
-		for e in std::fs::read_dir(&d).unwrap() {
-			let p = e.unwrap().path();
-			let meta = std::fs::symlink_metadata(&p).unwrap();
-			if meta.is_dir() {
-				stack.push(p.clone());
-			}
-			let bytes = if meta.is_file() {
-				std::fs::read(&p).unwrap()
-			} else {
-				Vec::new()
-			};
-			out.insert(p, (bytes, meta.modified().unwrap()));
-		}
-	}
-	out
-}
 fn tear(path: &Path, r: &Root) -> u64 {
 	use std::io::Write;
 	// The first 100 bytes of one more real record: a torn final write.

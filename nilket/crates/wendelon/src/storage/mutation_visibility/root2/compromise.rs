@@ -8,8 +8,12 @@
 //! (the production reducer and verifiers through the dormant replay dispatcher, from a provisioned
 //! baseline, with no recovery mark), suspect resolution, output. Containment is forward-only, so
 //! the audit is how pre-detection entries are found; it undoes nothing.
+//!
+//! A complete fold can also yield the context export (C-S6b): the bound context, the manifest and
+//! every successor's committed rotation, for the offline custody tool to re-verify.
 mod attribution;
 mod binding;
+mod export;
 mod report;
 mod trace;
 
@@ -34,22 +38,29 @@ const UNRESOLVED: u8 = 4;
 
 /// One audit run over `data_dir` for the root `manifest` installs. `suspects` are `(role, epoch)`
 /// with role codes 1 admin, 2 governance, 3 recovery; `key`, when given instead, is resolved to
-/// exactly one identity in the replayed history. Returns stdout, a stderr diagnostic and the exit
-/// code: 0 complete, 1 invalid history or binding, 2 I/O or trust input, 3 partial coverage,
-/// 4 unresolved or ambiguous suspect. No `complete` record is ever written with 1, 2 or 4.
+/// exactly one identity in the replayed history. `export`, the operator-asserted node id, asks for
+/// the context export; only then may the suspect set be empty. Returns stdout, the export bytes
+/// (only with exit 0), a stderr diagnostic and the exit code: 0 complete, 1 invalid history or
+/// binding, 2 I/O or trust input, 3 partial coverage, 4 unresolved or ambiguous suspect. No
+/// `complete` record and no export is ever produced with 1, 2, 3 or 4.
 pub(crate) async fn compromise_audit2(
 	data_dir: &Path,
 	manifest: &[u8],
 	suspects: &[(u8, u64)],
 	key: Option<[u8; 32]>,
 	suspect_only: bool,
-) -> (String, Option<String>, u8) {
-	let fail = |code, message: String| (String::new(), Some(message), code);
-	if key.is_some() == !suspects.is_empty() {
+	export: Option<u32>,
+) -> (String, Option<Vec<u8>>, Option<String>, u8) {
+	let fail = |code, message: String| (String::new(), None, Some(message), code);
+	let unnamed = key.is_none() && suspects.is_empty();
+	if key.is_some() && !suspects.is_empty() || unnamed && export.is_none() {
 		return fail(
 			INPUT,
 			"give either suspect identities or one suspect key".into(),
 		);
+	}
+	if unnamed && suspect_only {
+		return fail(INPUT, "--suspect-only needs a suspect".into());
 	}
 	if suspects.iter().any(|(role, _)| !(1..=3).contains(role)) {
 		return fail(
@@ -96,7 +107,7 @@ pub(crate) async fn compromise_audit2(
 	let Some(stop) = stop
 		.filter(|s| scan.entries.keys().next() == Some(&0) && scan.entries.contains_key(&s.index))
 	else {
-		return (render_partial(&coverage), None, PARTIAL);
+		return (render_partial(&coverage), None, None, PARTIAL);
 	};
 	let (pin, deployment) = match binding::bind2(&manifest, &scan.entries, stop.index) {
 		Ok(bound) => bound,
@@ -109,6 +120,7 @@ pub(crate) async fn compromise_audit2(
 	};
 	let mut entries = scan.entries;
 	entries.retain(|index, _| *index <= stop.index);
+	let rotations = export.map(|_| export::rotations2(&entries));
 	let ids: BTreeMap<u64, Log2> = entries
 		.iter()
 		.map(|(index, e)| (*index, raft_log(e.log_id)))
@@ -154,8 +166,18 @@ pub(crate) async fn compromise_audit2(
 	};
 	identities.sort_unstable();
 	identities.dedup();
+	let exported = match (export, &rotations) {
+		(Some(node), Some(rotations)) => {
+			match export::export2(&traced, manifest.bytes(), node, raft_log(stop), rotations) {
+				Ok(bytes) => Some(bytes),
+				Err(reason) => return fail(INVALID, format!("context export refused: {reason}")),
+			}
+		}
+		_ => None,
+	};
 	(
 		render_complete(&traced, &identities, suspect_only, &coverage),
+		exported,
 		None,
 		COMPLETE,
 	)

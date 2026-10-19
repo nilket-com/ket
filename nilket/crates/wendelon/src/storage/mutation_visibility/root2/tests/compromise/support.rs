@@ -23,7 +23,9 @@ use crate::storage::mutation_visibility::root2::types::{Digest2, Log2};
 use crate::test_support::TestDir;
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 pub(super) const ADMIN: u8 = 1;
 pub(super) const GOVERNANCE: u8 = 2;
@@ -247,6 +249,10 @@ impl Root {
 	pub(super) fn manifest(&self) -> &[u8] {
 		&self.f.manifest
 	}
+	/// The installed administrator view: the root's context.
+	pub(super) fn admin(&self) -> &InstalledAdmin2 {
+		&self.admin
+	}
 	/// Writes the whole history as one real WAL segment committing through `commit` (default:
 	/// the last entry), plus the trusted manifest outside the data directory.
 	pub(super) fn write(&self, commit: Option<u64>) -> Dirs {
@@ -308,6 +314,28 @@ impl Dirs {
 	}
 }
 
+/// Every file under `dir`: its bytes and modification time.
+pub(super) fn listing(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
+	let mut out = BTreeMap::new();
+	let mut stack = vec![dir.to_path_buf()];
+	while let Some(d) = stack.pop() {
+		for e in std::fs::read_dir(&d).unwrap() {
+			let p = e.unwrap().path();
+			let meta = std::fs::symlink_metadata(&p).unwrap();
+			if meta.is_dir() {
+				stack.push(p.clone());
+			}
+			let bytes = if meta.is_file() {
+				std::fs::read(&p).unwrap()
+			} else {
+				Vec::new()
+			};
+			out.insert(p, (bytes, meta.modified().unwrap()));
+		}
+	}
+	out
+}
+
 /// One CLI run: every stdout line parsed, the final coverage record split out.
 pub(super) struct Out {
 	pub(super) stdout: String,
@@ -362,6 +390,15 @@ pub(super) fn suspects(ids: &[(u8, u64)]) -> Vec<String> {
 			]
 		})
 		.collect()
+}
+/// `--export-context <out> --node-id <node>`.
+pub(super) fn export_args(out: &Path, node: u32) -> Vec<String> {
+	vec![
+		"--export-context".into(),
+		out.display().to_string(),
+		"--node-id".into(),
+		node.to_string(),
+	]
 }
 /// Runs `wendelon audit root2 <data> --trusted-manifest <file> <extra...>` in process.
 pub(super) fn audit(dirs: &Dirs, extra: &[String]) -> Out {
