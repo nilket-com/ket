@@ -286,6 +286,7 @@ impl<B: CounterBackend> CounterCore<B> {
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::consensus::monitor::{PhysicalClock, SystemClock};
 use crate::schema::{
 	CounterReplicaPhase, CounterTentativeFrame, HybridTimestamp, Identity, NodeId, TenantId,
 	record_class,
@@ -1570,6 +1571,13 @@ pub enum CounterLeaderError {
 	/// delta, or an unkeyed record that cannot show which add it names). Nothing
 	/// was applied and the recorded outcome is withheld. Not retryable as-is.
 	WriteKeyConflict,
+	/// E0: the write key is not a UUIDv7 identity, or was issued further ahead
+	/// of this node's clock than the skew allowance. Nothing was applied.
+	InvalidWriteIdentity,
+	/// E1: the write key was issued at or before the dedup horizon. Nothing was
+	/// applied by this request; whether an earlier presentation committed is
+	/// indeterminate (its record may have been compacted away).
+	OperationExpired,
 }
 
 /// The counter-finalization witness: the leader's durable record that an add
@@ -1604,11 +1612,14 @@ mod witness;
 use witness::StoredWitness;
 
 mod applied_log;
+mod compaction;
 mod file_ops;
+mod retention;
 use applied_log::{
 	AppliedLogFault, AppliedLogImage, validate_witness_set, witness_matches_applied,
 };
 use file_ops::{CounterDurableFileOps, StdCounterDurableFileOps};
+pub use retention::{CounterRetentionConfig, DEFAULT_COUNTER_CLOCK_SKEW_MS};
 
 mod write_key;
 use write_key::{RecordedAdd, WriteKeyGate};
@@ -1661,10 +1672,19 @@ pub struct DurableCounterWitnessStore {
 	/// appends, so frames from concurrent resolutions never interleave.
 	applied: StdMutex<AppliedLogState>,
 	/// Latched when the durable state can no longer be described: an applied
-	/// append or barrier failed, or a failed prepare could not withdraw its
-	/// witness. Every later publish, rewrite and append then fails closed with
+	/// append or barrier failed, a failed prepare could not withdraw its
+	/// witness, or a compaction failed at or after its `CURRENT` rename. Every
+	/// later publish, rewrite, append and compaction then fails closed with
 	/// `AppliedLogFault::Unsettled` until recovery reopens the store.
 	unsettled: std::sync::atomic::AtomicBool,
+	/// `Q_mem`: the durable issuance cutoff of the current generation. Stored
+	/// with Release ordering once a compacted generation is durable and before
+	/// any record it deleted is evicted; read with Acquire ordering by E1.
+	cutoff: AtomicU64,
+	/// The highest generation number a compaction has tried in this process.
+	attempted_generation: AtomicU64,
+	#[cfg(test)]
+	switches: compaction::CompactionSwitches,
 }
 
 enum AppliedLogState {
@@ -1708,7 +1728,25 @@ impl DurableCounterWitnessStore {
 			crate::storage::ownership::DataDirectoryOwner::optional_permit(owner.as_ref())?;
 		// A durable namespace baseline before any operation is written.
 		file_ops::create_dir_durably(ops.as_ref(), &dir)?;
-		Ok(Self {
+		Ok(Self::unopened(dir, owner, ops))
+	}
+
+	/// Open over an existing directory WITHOUT its open-time directory sync
+	/// (test-only), so a test can show what recovery's own barrier provides.
+	#[cfg(test)]
+	fn open_without_open_sync(
+		dir: impl Into<PathBuf>,
+		ops: Arc<dyn CounterDurableFileOps>,
+	) -> Self {
+		Self::unopened(dir.into(), None, ops)
+	}
+
+	fn unopened(
+		dir: PathBuf,
+		owner: Option<crate::storage::ownership::DataDirectoryOwner>,
+		ops: Arc<dyn CounterDurableFileOps>,
+	) -> Self {
+		Self {
 			dir,
 			tenant: None,
 			owner,
@@ -1716,7 +1754,11 @@ impl DurableCounterWitnessStore {
 			witness_lock: StdMutex::new(()),
 			applied: StdMutex::new(AppliedLogState::Unloaded),
 			unsettled: std::sync::atomic::AtomicBool::new(false),
-		})
+			cutoff: AtomicU64::new(0),
+			attempted_generation: AtomicU64::new(0),
+			#[cfg(test)]
+			switches: compaction::CompactionSwitches::default(),
+		}
 	}
 
 	/// Name the tenant this store serves (diagnostics only).
@@ -1906,10 +1948,6 @@ impl DurableCounterWitnessStore {
 		Ok(out)
 	}
 
-	fn applied_log_path(&self) -> PathBuf {
-		self.dir.join("counter-applied.log")
-	}
-
 	/// Append the durable D4 dedup record for a RESOLVED witness. Called by the
 	/// commit driver after every accepted participant's marker is durable and
 	/// BEFORE the witness is pruned, so the dedup identity is never windowless:
@@ -1917,9 +1955,7 @@ impl DurableCounterWitnessStore {
 	/// frame is appended, `sync_data`'d and, when this append created the log,
 	/// its directory entry synced; only then may the witness be unlinked. A
 	/// record already present (a retried resolution) is re-synced, not appended.
-	/// Unbounded growth note: one small keyed frame per resolved add, never
-	/// compacted — TTL-based pruning (the wire's `idempotency_ttl_ms`) is an
-	/// explicit follow-on.
+	/// Frames go to the current generation; compaction bounds the log (E3).
 	fn append_applied(
 		&self,
 		applied: &AppliedCounterAdd,
@@ -1938,12 +1974,13 @@ impl DurableCounterWitnessStore {
 		let AppliedLogState::Loaded(image) = &mut *state else {
 			return Err(AppliedLogFault::Unsettled.io());
 		};
+		let path = self.generation_path(image.generation);
 		match self.append_to_image(image, applied, witness) {
 			Ok(()) => Ok(()),
 			Err(AppendFailure::Retained(error)) => Err(error),
 			Err(AppendFailure::Unsettled(error)) => {
 				*state = AppliedLogState::Unsettled;
-				self.unsettle(&self.applied_log_path(), &error);
+				self.unsettle(&path, &error);
 				Err(error)
 			}
 		}
@@ -1955,7 +1992,7 @@ impl DurableCounterWitnessStore {
 		applied: &AppliedCounterAdd,
 		witness: &StoredWitness,
 	) -> Result<(), AppendFailure> {
-		let path = self.applied_log_path();
+		let path = self.generation_path(image.generation);
 		let observed_len = match self.ops.file_len(&path) {
 			Ok(len) => Some(len),
 			Err(error) if error.kind() == ErrorKind::NotFound => None,
@@ -1988,6 +2025,11 @@ impl DurableCounterWitnessStore {
 				));
 			}
 			let valid_len = tail.valid_len;
+			if valid_len < image.base_len {
+				return Err(AppendFailure::Retained(
+					CounterVisibilityError::Conflict.io(),
+				));
+			}
 			self.ops
 				.truncate(&path, valid_len)
 				.and_then(|()| self.ops.sync_data(&path))
@@ -2066,28 +2108,30 @@ impl DurableCounterWitnessStore {
 		Ok(())
 	}
 
+	/// The current generation as it stands, without recovery's cleanup: the
+	/// one `CURRENT` names, else generation 0 (§3.6).
 	fn read_applied_image(&self) -> std::io::Result<AppliedLogImage> {
-		match self.ops.read_file(&self.applied_log_path()) {
-			Ok(bytes) => applied_log::parse(&bytes),
-			Err(error) if error.kind() == ErrorKind::NotFound => applied_log::parse(&[]),
-			Err(error) => Err(error),
-		}
+		let image = self.resolve_image(false)?;
+		self.cutoff.fetch_max(image.cutoff, Ordering::Release);
+		Ok(image)
 	}
 
-	/// Load the applied log for recovery, bind it to the pending witnesses,
-	/// repair a torn final frame that a durable witness still represents, and
-	/// make every byte recovery derives state from durable before it is served.
-	/// The resulting image becomes the store's authoritative cache.
-	fn recover_applied(
-		&self,
-		pending: &[StoredWitness],
-	) -> std::io::Result<Vec<AppliedCounterAdd>> {
+	/// Load the current generation for recovery (deleting stale generations
+	/// and temp files), bind it to the pending witnesses, repair a torn final
+	/// frame that a durable witness still represents (never below the
+	/// generation's base), and make every byte recovery derives state from
+	/// durable before it is served. The resulting image becomes the store's
+	/// authoritative cache, and its cutoff `Q_mem`, before any add is served.
+	fn recover_applied(&self, pending: &[StoredWitness]) -> std::io::Result<RecoveredApplied> {
 		let _permit = self.permit()?;
 		let mut state = self.lock_applied()?;
-		let path = self.applied_log_path();
-		let mut image = self.read_applied_image()?;
+		let mut image = self.resolve_image(true)?;
+		let path = self.generation_path(image.generation);
 		applied_log::validate_pairs(&image, pending)?;
 		if let Some(tail) = image.torn_tail.take() {
+			if tail.valid_len < image.base_len {
+				return Err(CounterVisibilityError::Conflict.io());
+			}
 			applied_log::check_torn_tail_owner(&image, &tail, pending)?;
 			self.ops.truncate(&path, tail.valid_len)?;
 			image.file_len = tail.valid_len;
@@ -2095,15 +2139,32 @@ impl DurableCounterWitnessStore {
 		if self.ops.exists(&path)? {
 			self.ops.sync_data(&path)?;
 		}
-		let records = image.records.clone();
+		let recovered = RecoveredApplied {
+			records: image.records.clone(),
+			high_water: image.high_water,
+		};
+		self.cutoff.store(image.cutoff, Ordering::Release);
+		self.attempted_generation
+			.fetch_max(image.generation, Ordering::Relaxed);
+		let current = image.generation >= 1;
 		*state = AppliedLogState::Loaded(image);
-		Ok(records)
+		if current {
+			self.repoison_on_recovery(&mut state);
+		}
+		Ok(recovered)
 	}
 
 	#[cfg(test)]
 	fn load_applied(&self) -> std::io::Result<Vec<AppliedCounterAdd>> {
 		Ok(self.read_applied_image()?.records)
 	}
+}
+
+/// What recovery read from the current generation: its records and the
+/// operation-id high-water its header carries (0 for generation 0).
+struct RecoveredApplied {
+	records: Vec<AppliedCounterAdd>,
+	high_water: u64,
 }
 
 /// How an append attempt failed: `Retained` leaves the file exactly as the
@@ -2168,6 +2229,28 @@ struct WriteKeySwitches {
 	inline_body: std::sync::atomic::AtomicBool,
 }
 
+/// Test-only switches that disable one dedup-horizon rule (E1), so a law test
+/// can show the failure the rule prevents.
+#[cfg(test)]
+#[derive(Default)]
+struct RetentionSwitches {
+	/// Evaluate E1 before the record lookup instead of after it.
+	expiry_before_lookup: std::sync::atomic::AtomicBool,
+	/// E1 ignores `Q_mem` and refuses by `now - E` alone.
+	ignore_cutoff: std::sync::atomic::AtomicBool,
+	/// Parks the next add between its write-key gate and its record lookup.
+	lookup_park: StdMutex<Option<Arc<LookupPark>>>,
+}
+
+/// A parked add: `reached` fires when it parks; it resumes once `release` is
+/// notified.
+#[cfg(test)]
+#[derive(Default)]
+struct LookupPark {
+	reached: tokio::sync::Notify,
+	release: tokio::sync::Notify,
+}
+
 /// The primary-side counter orchestrator. Durable state is per tenant; the
 /// participant set for a fresh add is supplied per operation from the current
 /// ring, while reconciliation resolves the identities recorded in each witness.
@@ -2197,8 +2280,18 @@ pub struct CounterLeader<P> {
 	/// Leader-assigned op-id allocator (cross-node stable handles). `commit_hlc`
 	/// is derived from it, so op-ids and HLCs advance together.
 	op_seq: AtomicU64,
+	/// The dedup horizon (H, S, E) E0, E1 and compaction apply.
+	retention: CounterRetentionConfig,
+	/// The node's wall clock, read by E0, E1 and compaction.
+	clock: Arc<dyn PhysicalClock>,
+	/// The latest issuance over the records loaded at recovery and every add
+	/// accepted since: compaction's clock never runs past it plus E.
+	max_issued_accepted: AtomicU64,
+	compaction: compaction::CompactionSchedule,
 	#[cfg(test)]
 	write_key_switches: WriteKeySwitches,
+	#[cfg(test)]
+	retention_switches: RetentionSwitches,
 }
 
 impl<P: CounterParticipant + Clone> CounterLeader<P> {
@@ -2219,9 +2312,27 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 			witnesses: DashMap::new(),
 			witness_store: OffloadedWitnessStore(Arc::new(witness_store)),
 			op_seq: AtomicU64::new(1),
+			retention: CounterRetentionConfig::default(),
+			clock: default_leader_clock(),
+			max_issued_accepted: AtomicU64::new(0),
+			compaction: compaction::CompactionSchedule::default(),
 			#[cfg(test)]
 			write_key_switches: WriteKeySwitches::default(),
+			#[cfg(test)]
+			retention_switches: RetentionSwitches::default(),
 		}
+	}
+
+	/// The dedup horizon and the wall clock this leader applies. A leader built
+	/// without it uses the default horizon and the system clock.
+	pub fn with_retention(
+		mut self,
+		retention: CounterRetentionConfig,
+		clock: Arc<dyn PhysicalClock>,
+	) -> Self {
+		self.retention = retention;
+		self.clock = clock;
+		self
 	}
 
 	#[cfg(test)]
@@ -2259,9 +2370,13 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 		}
 		let applied = witness_store.recover_applied(&pending)?;
 		let leader = Self::new(local_id, local, is_primary, witness_store);
-		let mut max_op = 0;
-		for record in applied {
+		// The generation header carries the high-water of every operation it
+		// compacted away; frames and witnesses carry the rest.
+		let mut max_op = applied.high_water;
+		let mut max_issued = 0;
+		for record in applied.records {
 			max_op = max_op.max(record.op_id);
+			max_issued = max_issued.max(retention::issued_ms(&record.write_key).unwrap_or(0));
 			let recorded = RecordedAdd::from_durable(record.key, record.previous, record.current)?;
 			leader.idempotency.insert(record.write_key, recorded);
 		}
@@ -2278,6 +2393,7 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 				},
 			);
 			max_op = max_op.max(witness.op_id);
+			max_issued = max_issued.max(retention::issued_ms(&witness.write_key).unwrap_or(0));
 			let recorded = RecordedAdd::from_durable(
 				Some(witness.key.clone()),
 				witness.previous,
@@ -2293,6 +2409,9 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 			)
 		})?;
 		leader.op_seq.store(next_op, Ordering::Relaxed);
+		leader
+			.max_issued_accepted
+			.store(max_issued, Ordering::Relaxed);
 		Ok(leader)
 	}
 
@@ -2358,6 +2477,9 @@ impl<P: CounterParticipant + Clone + Send + Sync + 'static> CounterLeader<P> {
 		self.witnessed
 			.read(&counter_identity(key))
 			.map_err(CounterLeaderError::Visibility)?;
+		// E0, before the write-key gate: only a v7 identity issued no further
+		// ahead than the skew allowance may name an add.
+		self.refuse_unpresentable(&write_key)?;
 		let leader = self.clone();
 		let key = key.clone();
 		let body = async move {
@@ -2407,9 +2529,13 @@ impl<P: CounterParticipant + Clone + Send + Sync + 'static> CounterLeader<P> {
 		// concurrent add under this key can install a record after the lookup
 		// misses. Taken before, never while holding, the counter-key lock.
 		let _write_gate = self.admit_write_key(write_key).await;
-		// (3) Duplicate replay BEFORE lock/mutation (mandatory). A known write key
-		// replays only the add it names; any other add under it, a zero delta
-		// included, is refused with nothing applied.
+		#[cfg(test)]
+		self.before_record_lookup(&write_key).await?;
+		// (3) Duplicate replay BEFORE lock/mutation (mandatory). The record
+		// lookup, then E1, then the record's answer: an expired write key is
+		// refused whether or not its record survives; a known one replays only
+		// the add it names; any other add under it, a zero delta included, is
+		// refused with nothing applied.
 		if let Some(outcome) = self.recorded_answer(&write_key, key, delta)? {
 			return Ok(CounterAddResult::Replayed(outcome));
 		}
@@ -2512,6 +2638,10 @@ impl<P: CounterParticipant + Clone + Send + Sync + 'static> CounterLeader<P> {
 		// no record is ever removed. The DURABLE record is the witness itself,
 		// compacted to the applied log by `drive_commits`.
 		self.witnesses.insert(op_id, witness);
+		if let Some(issued) = retention::issued_ms(&write_key) {
+			self.max_issued_accepted
+				.fetch_max(issued, Ordering::Relaxed);
+		}
 		let outcome = CounterAddOutcome { previous, current };
 		self.idempotency.insert(
 			write_key,
@@ -2562,18 +2692,93 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 		gate
 	}
 
-	/// The recorded answer for `write_key`, if it names an add: its outcome for a
-	/// retry of that add, a conflict for any other. The map reference ends here.
+	/// The recorded answer for `write_key`: the record lookup, then E1 against
+	/// the cutoff and clock read after it, then the record's own answer (its
+	/// outcome for a retry of that add, a conflict for any other). Compaction
+	/// publishes `Q_mem` before it evicts, so a lookup that misses an evicted
+	/// record reads a cutoff that covers it. The map reference ends here.
 	fn recorded_answer(
 		&self,
 		write_key: &CounterWriteKey,
 		key: &CounterKey,
 		delta: u64,
 	) -> Result<Option<CounterAddOutcome>, CounterLeaderError> {
-		self.idempotency
+		let recorded = self
+			.idempotency
 			.get(write_key)
+			.map(|recorded| recorded.clone());
+		self.refuse_expired(write_key)?;
+		recorded
 			.map(|recorded| recorded.answer(key, delta))
 			.transpose()
+	}
+
+	/// E0: refuse a write key that is not a v7 identity issued no more than
+	/// the skew allowance ahead of this node's clock.
+	fn refuse_unpresentable(&self, write_key: &CounterWriteKey) -> Result<(), CounterLeaderError> {
+		if retention::presentable(write_key, self.clock.now_ms(), &self.retention) {
+			Ok(())
+		} else {
+			Err(CounterLeaderError::InvalidWriteIdentity)
+		}
+	}
+
+	/// E1, after the record lookup.
+	fn refuse_expired(&self, write_key: &CounterWriteKey) -> Result<(), CounterLeaderError> {
+		#[cfg(test)]
+		if self
+			.retention_switches
+			.expiry_before_lookup
+			.load(Ordering::Relaxed)
+		{
+			return Ok(());
+		}
+		self.check_unexpired(write_key)
+	}
+
+	/// Refuse a write key issued at or before `max(Q_mem, now - E)`. `Q_mem` is
+	/// read first (Acquire), then the clock.
+	fn check_unexpired(&self, write_key: &CounterWriteKey) -> Result<(), CounterLeaderError> {
+		let issued =
+			retention::issued_ms(write_key).ok_or(CounterLeaderError::InvalidWriteIdentity)?;
+		let cutoff = self.witness_store.0.cutoff();
+		#[cfg(test)]
+		let cutoff = if self
+			.retention_switches
+			.ignore_cutoff
+			.load(Ordering::Relaxed)
+		{
+			0
+		} else {
+			cutoff
+		};
+		if issued <= retention::expiry_cutoff(cutoff, self.clock.now_ms(), &self.retention) {
+			Err(CounterLeaderError::OperationExpired)
+		} else {
+			Ok(())
+		}
+	}
+
+	/// Test hooks between the write-key gate and the record lookup: E1 moved
+	/// ahead of the lookup (a negative control), then an armed park.
+	#[cfg(test)]
+	async fn before_record_lookup(
+		&self,
+		write_key: &CounterWriteKey,
+	) -> Result<(), CounterLeaderError> {
+		if self
+			.retention_switches
+			.expiry_before_lookup
+			.load(Ordering::Relaxed)
+		{
+			self.check_unexpired(write_key)?;
+		}
+		let park = self.retention_switches.lookup_park.lock().unwrap().take();
+		if let Some(park) = park {
+			park.reached.notify_one();
+			park.release.notified().await;
+		}
+		Ok(())
 	}
 
 	/// Drive commit markers for the accepted participants that still owe one,
@@ -2694,6 +2899,21 @@ impl<P: CounterParticipant + Clone> CounterLeader<P> {
 	/// server trips its local-persistence distrust fence when it has.
 	pub(crate) fn durability_unsettled(&self) -> bool {
 		self.witness_store.0.is_unsettled()
+	}
+
+	/// Make the next compaction check due.
+	#[cfg(test)]
+	pub(crate) fn force_compaction_due_for_test(&self) {
+		self.compaction.force_due.store(true, Ordering::Relaxed);
+	}
+
+	/// The applied-log generation the store serves (0 before any compaction).
+	#[cfg(test)]
+	pub(crate) fn served_generation_for_test(&self) -> Option<u64> {
+		match &*self.witness_store.0.lock_applied().ok()? {
+			AppliedLogState::Loaded(image) => Some(image.generation),
+			_ => None,
+		}
 	}
 
 	/// Latch the dedup store as if a persistence barrier had failed.
@@ -3699,6 +3919,53 @@ mod replica_tests {
 	}
 }
 
+/// The wall clock of a leader built without `with_retention`.
+#[cfg(not(test))]
+fn default_leader_clock() -> Arc<dyn PhysicalClock> {
+	Arc::new(SystemClock)
+}
+
+/// In unit tests, a leader built without `with_retention` runs on a clock
+/// frozen at the test identities' issuance, so a [`test_write_key`] never
+/// ages past E however slow the lane. Tests of the horizon itself set their
+/// own clock.
+#[cfg(test)]
+fn default_leader_clock() -> Arc<dyn PhysicalClock> {
+	struct TestIdentityClock;
+	impl PhysicalClock for TestIdentityClock {
+		fn now_ms(&self) -> u64 {
+			test_identity_issued_ms()
+		}
+	}
+	Arc::new(TestIdentityClock)
+}
+
+#[cfg(test)]
+fn test_identity_issued_ms() -> u64 {
+	static ISSUED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+	*ISSUED.get_or_init(|| SystemClock.now_ms())
+}
+
+/// A test write key: a UUIDv7 client uuid issued at the test identities'
+/// issuance (so a key presented again, after a restart say, is the same key),
+/// with `n` as the sequence number. Leaders on the default test clock never
+/// see it age.
+#[cfg(test)]
+pub(crate) fn test_write_key(n: u64) -> CounterWriteKey {
+	test_write_key_at(test_identity_issued_ms(), n)
+}
+
+/// A test write key whose UUIDv7 uuid was issued at `issued_ms`, sequence `n`.
+#[cfg(test)]
+pub(crate) fn test_write_key_at(issued_ms: u64, n: u64) -> CounterWriteKey {
+	let mut key = [0u8; 24];
+	key[..6].copy_from_slice(&issued_ms.to_be_bytes()[2..]);
+	key[6] = 0x70;
+	key[8] = 0x80;
+	key[16..].copy_from_slice(&n.to_le_bytes());
+	key
+}
+
 #[cfg(test)]
 mod leader_tests {
 	//! ADR 075 cut-2b: `CounterLeader` orchestration over a deterministic
@@ -3769,11 +4036,14 @@ mod leader_tests {
 		CounterKey(b.to_vec())
 	}
 
-	/// Canonical write-key fixture: the test's small id, LE-embedded in 24 bytes.
+	/// Canonical write-key fixture: a UUIDv7 client uuid issued at this
+	/// process's first use, with the test's small id as the sequence number.
 	fn wk(n: u64) -> CounterWriteKey {
-		let mut key = [0u8; 24];
-		key[..8].copy_from_slice(&n.to_le_bytes());
-		key
+		test_write_key(n)
+	}
+
+	fn wk_at(issued_ms: u64, n: u64) -> CounterWriteKey {
+		test_write_key_at(issued_ms, n)
 	}
 
 	/// A participant over a real store, with deterministic fault injection.
@@ -3947,12 +4217,48 @@ mod leader_tests {
 		quorum: usize,
 	}
 
+	/// A wall clock a test sets and steps (E0, E1 and compaction read it).
+	#[derive(Default)]
+	struct TestClock {
+		now_ms: AtomicU64,
+	}
+
+	impl TestClock {
+		fn at(now_ms: u64) -> Arc<Self> {
+			Arc::new(Self {
+				now_ms: AtomicU64::new(now_ms),
+			})
+		}
+
+		fn set(&self, now_ms: u64) {
+			self.now_ms.store(now_ms, Ordering::SeqCst);
+		}
+	}
+
+	impl PhysicalClock for TestClock {
+		fn now_ms(&self) -> u64 {
+			self.now_ms.load(Ordering::SeqCst)
+		}
+	}
+
 	impl LeaderHarness {
 		fn new(
 			participants: Vec<TestParticipant>,
 			quorum: usize,
 			is_primary: bool,
 			witness_store: DurableCounterWitnessStore,
+		) -> Self {
+			Self::new_on(participants, quorum, is_primary, witness_store, None)
+		}
+
+		/// A leader on `clock` (the system clock when `None`) with the default
+		/// dedup horizon.
+		fn new_on(
+			participants: Vec<TestParticipant>,
+			quorum: usize,
+			is_primary: bool,
+			witness_store: DurableCounterWitnessStore,
+			clock: Option<Arc<TestClock>>,
 		) -> Self {
 			let participants: Vec<_> = participants
 				.into_iter()
@@ -3964,14 +4270,9 @@ mod leader_tests {
 				.expect("test leader needs a local participant")
 				.1
 				.clone();
-			let leader = Arc::new(CounterLeader::new(
-				node_id(0),
-				local,
-				is_primary,
-				witness_store,
-			));
+			let leader = CounterLeader::new(node_id(0), local, is_primary, witness_store);
 			Self {
-				leader,
+				leader: Arc::new(Self::on_clock(leader, clock)),
 				participants,
 				quorum,
 			}
@@ -3983,6 +4284,16 @@ mod leader_tests {
 			is_primary: bool,
 			witness_store: DurableCounterWitnessStore,
 		) -> std::io::Result<Self> {
+			Self::recover_on(participants, quorum, is_primary, witness_store, None)
+		}
+
+		fn recover_on(
+			participants: Vec<TestParticipant>,
+			quorum: usize,
+			is_primary: bool,
+			witness_store: DurableCounterWitnessStore,
+			clock: Option<Arc<TestClock>>,
+		) -> std::io::Result<Self> {
 			let participants: Vec<_> = participants
 				.into_iter()
 				.enumerate()
@@ -3993,17 +4304,22 @@ mod leader_tests {
 				.expect("test leader needs a local participant")
 				.1
 				.clone();
-			let leader = Arc::new(CounterLeader::recover(
-				node_id(0),
-				local,
-				is_primary,
-				witness_store,
-			)?);
+			let leader = CounterLeader::recover(node_id(0), local, is_primary, witness_store)?;
 			Ok(Self {
-				leader,
+				leader: Arc::new(Self::on_clock(leader, clock)),
 				participants,
 				quorum,
 			})
+		}
+
+		fn on_clock(
+			leader: CounterLeader<TestParticipant>,
+			clock: Option<Arc<TestClock>>,
+		) -> CounterLeader<TestParticipant> {
+			match clock {
+				Some(clock) => leader.with_retention(CounterRetentionConfig::default(), clock),
+				None => leader,
+			}
 		}
 
 		fn plan(&self) -> CounterParticipantPlan<TestParticipant> {

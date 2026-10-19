@@ -30,6 +30,24 @@ enum Fault {
 	AppliedDirectorySync,
 	WitnessUnlink,
 	UnlinkDirectorySync,
+	/// A compaction generation's `create_new` persists part of the file, then fails.
+	GenerationCreateTorn,
+	/// `sync_data` on a numbered generation fails.
+	GenerationDataSync,
+	/// The directory sync that makes a new generation's name durable fails.
+	GenerationDirectorySync,
+	/// Writing `CURRENT`'s temp file fails after its bytes landed.
+	CurrentTempWrite,
+	/// `sync_all` on `CURRENT`'s temp file fails.
+	CurrentTempSync,
+	/// The rename onto `CURRENT` fails after the move.
+	CurrentRename,
+	/// The directory sync after the `CURRENT` rename fails.
+	CurrentDirectorySync,
+	/// The rename of the poison onto generation 0 fails after the move.
+	PoisonRename,
+	/// The directory sync that retires older generations fails.
+	RetireDirectorySync,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,9 +67,20 @@ struct ModelImage {
 	volatile_dirs: HashSet<PathBuf>,
 	durable_dirs: HashSet<PathBuf>,
 	pending_renames: HashMap<PathBuf, PathBuf>,
+	/// Renames a failed directory sync dropped: as after a real `fsync` error,
+	/// a later successful sync does not persist them, so they revert at a crash.
+	lost_renames: HashSet<PathBuf>,
+	/// fsync-error semantics (opt-in): after a failed directory sync, later
+	/// directory syncs report success but persist nothing until power loss.
+	sticky_directory_errors: bool,
+	directory_errored: bool,
 	/// Armed one-shot faults; each fires once at its own operation.
 	faults: Vec<Fault>,
 	unlinked_witness: bool,
+	/// A numbered generation was unlinked since the last crash.
+	unlinked_generation: bool,
+	/// Bytes returned by `read_file` (the recovery read).
+	bytes_read: u64,
 	cut: Option<Cut>,
 	/// Notified after the n-th event since it was armed; the world goes on.
 	signal: Option<(usize, Arc<tokio::sync::Notify>)>,
@@ -105,6 +134,17 @@ impl BlockingPark {
 	}
 }
 
+/// Releases a park when dropped, so a failing assertion unwinds instead of
+/// leaving a blocking-pool thread parked (which would hang the runtime's
+/// shutdown).
+struct ReleaseOnDrop(Arc<BlockingPark>);
+
+impl Drop for ReleaseOnDrop {
+	fn drop(&mut self) {
+		self.0.release();
+	}
+}
+
 fn crashed_error() -> Error {
 	Error::other("model process crashed")
 }
@@ -119,7 +159,31 @@ fn is_temp(path: &Path) -> bool {
 		.is_some_and(|name| name.to_string_lossy().starts_with(".tmp-"))
 }
 
+/// Any applied-log generation: `counter-applied.log` (generation 0) or a
+/// numbered compaction generation `counter-applied.<n>`.
 fn is_applied(path: &Path) -> bool {
+	path.file_name()
+		.is_some_and(|name| name == "counter-applied.log")
+		|| is_generation(path)
+}
+
+/// A numbered compaction generation `counter-applied.<n>`.
+fn is_generation(path: &Path) -> bool {
+	path.file_name()
+		.and_then(|name| name.to_str())
+		.and_then(|name| name.strip_prefix("counter-applied."))
+		.is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn is_current(path: &Path) -> bool {
+	path.file_name().is_some_and(|name| name == "CURRENT")
+}
+
+fn is_current_temp(path: &Path) -> bool {
+	path.file_name().is_some_and(|name| name == ".current-tmp")
+}
+
+fn is_generation_zero(path: &Path) -> bool {
 	path.file_name()
 		.is_some_and(|name| name == "counter-applied.log")
 }
@@ -290,7 +354,10 @@ impl PersistenceModel {
 			image.volatile_files.insert(name, Vec::new());
 		}
 		image.pending_renames.clear();
+		image.lost_renames.clear();
+		image.directory_errored = false;
 		image.unlinked_witness = false;
+		image.unlinked_generation = false;
 		image.faults.clear();
 		image.cut = None;
 		image.signal = None;
@@ -334,11 +401,57 @@ impl PersistenceModel {
 		image.durable_files.insert(path.to_path_buf(), bytes);
 	}
 
+	/// A process restart without power loss: the process dies (at a cut, or
+	/// here) but the kernel keeps its page cache, so every volatile file byte
+	/// and directory entry survives, durable or not. Faults, cuts, parks and
+	/// the stopped world are cleared; nothing is persisted or discarded.
+	fn restart_process(&self) {
+		let mut image = self.image.lock().unwrap();
+		image.faults.clear();
+		image.cut = None;
+		image.signal = None;
+		image.crashed = false;
+		drop(image);
+		*self.park.lock().unwrap() = None;
+	}
+
+	/// fsync-error semantics: a failed directory sync leaves the directory's
+	/// later syncs persisting nothing (while reporting success) until a crash.
+	fn sticky_directory_errors(&self) {
+		self.image.lock().unwrap().sticky_directory_errors = true;
+	}
+
+	/// From now on the kernel persists an unlink's directory entry at once, as
+	/// it may write back metadata at any time.
+	fn eager_unlinks(&self) {
+		self.image.lock().unwrap().eager_unlink = true;
+	}
+
+	/// Cut the power now: every later operation fails, as after a crash cut,
+	/// until `crash` discards what no barrier made durable.
+	fn halt(&self) {
+		self.image.lock().unwrap().crashed = true;
+	}
+
+	/// Remove a file and its name durably, as an out-of-band actor would.
+	fn remove_durable(&self, path: &Path) {
+		let mut image = self.image.lock().unwrap();
+		image.volatile_names.remove(path);
+		image.durable_names.remove(path);
+		image.volatile_files.remove(path);
+		image.durable_files.remove(path);
+	}
+
+	/// Bytes `read_file` has returned since the counter was last reset.
+	fn take_bytes_read(&self) -> u64 {
+		std::mem::take(&mut self.image.lock().unwrap().bytes_read)
+	}
+
 	fn persist_dir_entries(image: &mut ModelImage, dir: &Path) {
 		let renames: Vec<_> = image
 			.pending_renames
 			.iter()
-			.filter(|(to, _)| to.parent() == Some(dir))
+			.filter(|(to, _)| to.parent() == Some(dir) && !image.lost_renames.contains(*to))
 			.map(|(to, from)| (to.clone(), from.clone()))
 			.collect();
 		for (to, from) in renames {
@@ -347,13 +460,14 @@ impl PersistenceModel {
 			}
 			image.pending_renames.remove(&to);
 		}
+		let lost = image.lost_renames.clone();
 		image
 			.durable_names
-			.retain(|entry| entry.parent() != Some(dir));
+			.retain(|entry| entry.parent() != Some(dir) || lost.contains(entry));
 		let children: HashSet<PathBuf> = image
 			.volatile_names
 			.iter()
-			.filter(|entry| entry.parent() == Some(dir))
+			.filter(|entry| entry.parent() == Some(dir) && !lost.contains(*entry))
 			.cloned()
 			.collect();
 		image.durable_names.extend(children.iter().cloned());
@@ -402,7 +516,38 @@ impl CounterDurableFileOps for PersistenceModel {
 		if is_temp(path) {
 			Self::fail_if_armed(&mut image, Fault::TempWriteAfterBytes)?;
 		}
+		if is_current_temp(path) {
+			Self::fail_if_armed(&mut image, Fault::CurrentTempWrite)?;
+		}
 		self.completed(&mut image, "write_file", path);
+		Ok(())
+	}
+
+	fn create_new_file(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+		self.park_if_armed("create_new_file", path);
+		let mut image = self.image.lock().unwrap();
+		Self::live(&image)?;
+		if image.volatile_names.contains(path) || image.volatile_dirs.contains(path) {
+			return Err(Error::new(ErrorKind::AlreadyExists, "model path exists"));
+		}
+		image.volatile_names.insert(path.to_path_buf());
+		image
+			.volatile_files
+			.insert(path.to_path_buf(), bytes.to_vec());
+		if is_generation(path) && image.faults.contains(&Fault::GenerationCreateTorn) {
+			// The kernel persisted the name and part of the bytes before failing.
+			image
+				.faults
+				.retain(|armed| *armed != Fault::GenerationCreateTorn);
+			let partial = bytes[..bytes.len() / 2].to_vec();
+			image
+				.volatile_files
+				.insert(path.to_path_buf(), partial.clone());
+			image.durable_files.insert(path.to_path_buf(), partial);
+			image.durable_names.insert(path.to_path_buf());
+			return Err(Error::other("injected torn generation create"));
+		}
+		self.completed(&mut image, "create_new_file", path);
 		Ok(())
 	}
 
@@ -455,16 +600,18 @@ impl CounterDurableFileOps for PersistenceModel {
 	}
 
 	fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-		let image = self.image.lock().unwrap();
+		let mut image = self.image.lock().unwrap();
 		Self::live(&image)?;
 		if !image.volatile_names.contains(path) {
 			return Err(Error::new(ErrorKind::NotFound, "model file absent"));
 		}
-		image
+		let bytes = image
 			.volatile_files
 			.get(path)
 			.cloned()
-			.ok_or_else(|| Error::new(ErrorKind::NotFound, "model file has no bytes"))
+			.ok_or_else(|| Error::new(ErrorKind::NotFound, "model file has no bytes"))?;
+		image.bytes_read += bytes.len() as u64;
+		Ok(bytes)
 	}
 
 	fn read_dir(&self, path: &Path) -> std::io::Result<Vec<PathBuf>> {
@@ -509,7 +656,13 @@ impl CounterDurableFileOps for PersistenceModel {
 		image
 			.pending_renames
 			.insert(to.to_path_buf(), from.to_path_buf());
-		Self::fail_if_armed(&mut image, Fault::WitnessRenameAfterMove)?;
+		if is_current(to) {
+			Self::fail_if_armed(&mut image, Fault::CurrentRename)?;
+		} else if is_generation_zero(to) {
+			Self::fail_if_armed(&mut image, Fault::PoisonRename)?;
+		} else {
+			Self::fail_if_armed(&mut image, Fault::WitnessRenameAfterMove)?;
+		}
 		self.completed(&mut image, "rename", to);
 		Ok(())
 	}
@@ -524,6 +677,9 @@ impl CounterDurableFileOps for PersistenceModel {
 		if is_witness(path) {
 			Self::fail_if_armed(&mut image, Fault::WitnessUnlink)?;
 			image.unlinked_witness = true;
+		}
+		if is_generation(path) {
+			image.unlinked_generation = true;
 		}
 		image.volatile_names.remove(path);
 		image.volatile_files.remove(path);
@@ -546,6 +702,9 @@ impl CounterDurableFileOps for PersistenceModel {
 			};
 			Self::fail_if_armed(&mut image, fault)?;
 		}
+		if is_current_temp(path) {
+			Self::fail_if_armed(&mut image, Fault::CurrentTempSync)?;
+		}
 		let bytes = image
 			.volatile_files
 			.get(path)
@@ -562,6 +721,9 @@ impl CounterDurableFileOps for PersistenceModel {
 		self.park_if_armed("sync_data", path);
 		let mut image = self.image.lock().unwrap();
 		Self::live(&image)?;
+		if is_generation(path) {
+			Self::fail_if_armed(&mut image, Fault::GenerationDataSync)?;
+		}
 		if is_applied(path) {
 			Self::fail_if_armed(&mut image, Fault::AppliedDataSync)?;
 		}
@@ -604,8 +766,41 @@ impl CounterDurableFileOps for PersistenceModel {
 		if image.unlinked_witness {
 			Self::fail_if_armed(&mut image, Fault::UnlinkDirectorySync)?;
 		}
-		if image.barriers {
+		let current_pending = image.pending_renames.keys().any(|to| is_current(to));
+		if current_pending {
+			if let Err(error) = Self::fail_if_armed(&mut image, Fault::CurrentDirectorySync) {
+				let lost: Vec<PathBuf> = image
+					.pending_renames
+					.keys()
+					.filter(|to| is_current(to))
+					.cloned()
+					.collect();
+				image.lost_renames.extend(lost);
+				return Err(error);
+			}
+		} else if image
+			.volatile_names
+			.iter()
+			.any(|entry| is_generation(entry) && !image.durable_names.contains(entry))
+		{
+			if let Err(error) = Self::fail_if_armed(&mut image, Fault::GenerationDirectorySync) {
+				if image.sticky_directory_errors {
+					image.directory_errored = true;
+				}
+				return Err(error);
+			}
+		}
+		if image.unlinked_generation
+			|| image
+				.pending_renames
+				.keys()
+				.any(|to| is_generation_zero(to))
+		{
+			Self::fail_if_armed(&mut image, Fault::RetireDirectorySync)?;
+		}
+		if image.barriers && !image.directory_errored {
 			Self::persist_dir_entries(&mut image, path);
+			image.unlinked_generation = false;
 		}
 		self.completed(&mut image, "sync_dir", path);
 		Ok(())
@@ -703,6 +898,8 @@ struct Rig {
 	model: Arc<PersistenceModel>,
 	paths: Vec<PathBuf>,
 	quorum: usize,
+	/// The leader's wall clock; the system clock when `None`.
+	clock: Option<Arc<TestClock>>,
 }
 
 impl Rig {
@@ -714,6 +911,15 @@ impl Rig {
 				.map(|i| dir.join(format!("participant-{i}.wnd")))
 				.collect(),
 			quorum: participants / 2 + 1,
+			clock: None,
+		}
+	}
+
+	/// A rig whose every leader runs on `clock`.
+	fn on_clock(model: Arc<PersistenceModel>, participants: usize, clock: Arc<TestClock>) -> Self {
+		Self {
+			clock: Some(clock),
+			..Self::new(model, participants)
 		}
 	}
 
@@ -733,23 +939,37 @@ impl Rig {
 	/// A fresh leader whose participants report to the model.
 	async fn leader(&self) -> LeaderHarness {
 		let participants = self.participants(true).await;
-		LeaderHarness::new(participants, self.quorum, true, model_store(&self.model))
+		LeaderHarness::new_on(
+			participants,
+			self.quorum,
+			true,
+			model_store(&self.model),
+			self.clock.clone(),
+		)
 	}
 
 	/// Power-cut the model, reopen every participant, and recover the leader.
 	async fn restart(&self) -> LeaderHarness {
 		self.model.crash();
-		let participants = self.participants(true).await;
-		LeaderHarness::recover(participants, self.quorum, true, model_store(&self.model)).unwrap()
+		self.recover_in_place().await.unwrap()
 	}
 
 	/// Recover from the image as it stands (no new power cut), so a cut armed
 	/// beforehand can land inside recovery itself.
 	async fn recover_in_place(&self) -> std::io::Result<LeaderHarness> {
-		let participants = self.participants(true).await;
 		let store =
 			DurableCounterWitnessStore::open_with_file_ops(WITNESS_DIR, self.model.clone())?;
-		LeaderHarness::recover(participants, self.quorum, true, store)
+		self.recover_with(store).await
+	}
+
+	/// Recover from the image as it stands through `store` (a store whose
+	/// recovery switches a test has set).
+	async fn recover_with(
+		&self,
+		store: DurableCounterWitnessStore,
+	) -> std::io::Result<LeaderHarness> {
+		let participants = self.participants(true).await;
+		LeaderHarness::recover_on(participants, self.quorum, true, store, self.clock.clone())
 	}
 
 	async fn participant_values(&self, key: &CounterKey) -> Vec<Option<u64>> {
@@ -1745,3 +1965,7 @@ async fn crash_cuts_inside_recovery_and_reconcile_recover_one_outcome() {
 mod write_key_tests;
 
 mod eligible_park_tests;
+
+mod retention_tests;
+
+mod compaction_tests;

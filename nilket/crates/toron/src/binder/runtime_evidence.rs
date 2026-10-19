@@ -460,6 +460,15 @@ impl OptimizerRuntimeEvidence {
 						format!("counter fetch-add failed with status {}", status.as_str()),
 					);
 				}
+				Ok(Err(ClientError::MutationStopped { status, .. }))
+					if status == WriteStatus::WRITE_OPERATION_EXPIRED =>
+				{
+					self.drop_expired_decision_in_flight(
+						key,
+						delta,
+						format!("counter fetch-add failed with status {}", status.as_str()),
+					);
+				}
 				Ok(Err(error)) => {
 					self.drop_ambiguous_decision_in_flight(key, delta, error.to_string())
 				}
@@ -507,6 +516,15 @@ impl OptimizerRuntimeEvidence {
 					if status == WriteStatus::WRITE_KEY_CONFLICT =>
 				{
 					self.drop_conflicting_probe_linearity_in_flight(
+						key,
+						delta,
+						format!("counter fetch-add failed with status {}", status.as_str()),
+					);
+				}
+				Ok(Err(ClientError::MutationStopped { status, .. }))
+					if status == WriteStatus::WRITE_OPERATION_EXPIRED =>
+				{
+					self.drop_expired_probe_linearity_in_flight(
 						key,
 						delta,
 						format!("counter fetch-add failed with status {}", status.as_str()),
@@ -564,6 +582,15 @@ impl OptimizerRuntimeEvidence {
 						format!("counter fetch-add failed with status {}", status.as_str()),
 					);
 				}
+				Ok(Err(ClientError::MutationStopped { status, .. }))
+					if status == WriteStatus::WRITE_OPERATION_EXPIRED =>
+				{
+					self.drop_expired_window_in_flight(
+						key,
+						delta,
+						format!("counter fetch-add failed with status {}", status.as_str()),
+					);
+				}
 				Ok(Err(error)) => {
 					self.drop_ambiguous_window_in_flight(key, delta, error.to_string())
 				}
@@ -614,6 +641,15 @@ impl OptimizerRuntimeEvidence {
 					if status == WriteStatus::WRITE_KEY_CONFLICT =>
 				{
 					self.drop_conflicting_in_flight(
+						key,
+						delta,
+						format!("counter fetch-add failed with status {}", status.as_str()),
+					);
+				}
+				Ok(Err(ClientError::MutationStopped { status, .. }))
+					if status == WriteStatus::WRITE_OPERATION_EXPIRED =>
+				{
+					self.drop_expired_in_flight(
 						key,
 						delta,
 						format!("counter fetch-add failed with status {}", status.as_str()),
@@ -976,6 +1012,59 @@ impl OptimizerRuntimeEvidence {
 		state.mode = OptimizerEvidenceMode::Degraded;
 		state.state = OptimizerEvidenceState::Unavailable;
 		state.last_error = Some(error);
+	}
+
+	/// The flush's write id is past the node's dedup horizon: this attempt was
+	/// not applied, but an earlier one may have been, so the delta is dropped as
+	/// ambiguous and never merged. Under the SDK's incarnation rotation an
+	/// expiry means clock skew beyond the allowance or a rotation fault, so the
+	/// circuit opens and the evidence degrades at once.
+	fn latch_expired_write_id(state: &mut RuntimeEvidenceState, delta: u64, error: String) {
+		state.dropped_deltas = state.dropped_deltas.saturating_add(delta);
+		state.ambiguous_deltas = state.ambiguous_deltas.saturating_add(delta);
+		state.circuit_open = true;
+		state.mode = OptimizerEvidenceMode::Degraded;
+		state.state = OptimizerEvidenceState::Unavailable;
+		state.last_error = Some(error);
+	}
+
+	fn drop_expired_in_flight(&self, key: OptimizerRuntimeVerdictKey, delta: u64, error: String) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.in_flight.remove(&key);
+		Self::latch_expired_write_id(&mut state, delta, error);
+	}
+
+	fn drop_expired_decision_in_flight(
+		&self,
+		key: OptimizerRuntimeDecisionKey,
+		delta: u64,
+		error: String,
+	) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.decision_in_flight.remove(&key);
+		Self::latch_expired_write_id(&mut state, delta, error);
+	}
+
+	fn drop_expired_probe_linearity_in_flight(
+		&self,
+		key: OptimizerProbeLinearityFenceKey,
+		delta: u64,
+		error: String,
+	) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.probe_linearity_in_flight.remove(&key);
+		Self::latch_expired_write_id(&mut state, delta, error);
+	}
+
+	fn drop_expired_window_in_flight(
+		&self,
+		key: OptimizerEvidenceWindowCounterKey,
+		delta: u64,
+		error: String,
+	) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.window_in_flight.remove(&key);
+		Self::latch_expired_write_id(&mut state, delta, error);
 	}
 
 	fn drop_conflicting_in_flight(
@@ -2309,8 +2398,9 @@ mod tests {
 		assert_eq!(status.state, OptimizerEvidenceState::Unavailable);
 	}
 
-	/// A Wendelon client whose every counter add is answered with
-	/// `WRITE_KEY_CONFLICT`: this flush's write id already names another add.
+	/// A Wendelon client whose every counter add is answered with one status:
+	/// `WRITE_KEY_CONFLICT` (this flush's write id already names another add)
+	/// unless a test names another.
 	mod conflicting_wire {
 		use std::collections::HashMap;
 		use std::future::Future;
@@ -2330,7 +2420,10 @@ mod tests {
 			NodeRole, NodeRoleSet, TransportConnection, TransportProvider, TransportStream,
 			TransportTier, TransportTierSet,
 		};
-		use wendelon::schema::{CounterAddResponseMeta, FrameHeader, MsgType, NodeId, WriteStatus};
+		use wendelon::schema::{
+			CounterAddResponseMeta, FrameHeader, MsgType, MutationCommitKnowledge,
+			MutationStopReason, NodeId, WriteStatus,
+		};
 		use wendelon_client::Client;
 
 		type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -2339,6 +2432,7 @@ mod tests {
 			reply: Vec<u8>,
 			read_at: usize,
 			adds: Arc<AtomicUsize>,
+			status: WriteStatus,
 		}
 
 		impl AsyncRead for ConflictStream {
@@ -2394,7 +2488,13 @@ mod tests {
 				Box::pin(async move {
 					self.adds.fetch_add(1, Ordering::SeqCst);
 					let mut response: CounterAddResponseMeta = bytemuck::Zeroable::zeroed();
-					response.status = WriteStatus::WRITE_KEY_CONFLICT;
+					response.status = self.status;
+					if self.status == WriteStatus::WRITE_OPERATION_EXPIRED {
+						response = response.with_mutation_outcome(
+							MutationCommitKnowledge::INDETERMINATE,
+							MutationStopReason::NONE,
+						);
+					}
 					let meta = bytemuck::bytes_of(&response);
 					let header = FrameHeader {
 						magic: HRFT_MAGIC,
@@ -2418,6 +2518,7 @@ mod tests {
 			remote: NodeId,
 			actor: ActorIdentity,
 			adds: Arc<AtomicUsize>,
+			status: WriteStatus,
 		}
 
 		impl TransportConnection for ConflictConnection {
@@ -2432,6 +2533,7 @@ mod tests {
 					reply: Vec::new(),
 					read_at: 0,
 					adds: self.adds.clone(),
+					status: self.status,
 				});
 				Box::pin(async move { Ok(stream) })
 			}
@@ -2465,6 +2567,7 @@ mod tests {
 
 		struct ConflictProvider {
 			adds: Arc<AtomicUsize>,
+			status: WriteStatus,
 		}
 
 		impl TransportProvider for ConflictProvider {
@@ -2482,6 +2585,7 @@ mod tests {
 					remote: target,
 					actor: ActorIdentity::data_node(target),
 					adds: self.adds.clone(),
+					status: self.status,
 				});
 				Box::pin(async move { Ok(connection) })
 			}
@@ -2489,6 +2593,11 @@ mod tests {
 
 		/// The client, and a count of the counter adds that reached the wire.
 		pub(super) fn client() -> (Arc<Client>, Arc<AtomicUsize>) {
+			client_answering(WriteStatus::WRITE_KEY_CONFLICT)
+		}
+
+		/// A client whose every counter add is answered with `status`.
+		pub(super) fn client_answering(status: WriteStatus) -> (Arc<Client>, Arc<AtomicUsize>) {
 			let adds = Arc::new(AtomicUsize::new(0));
 			let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
 			let snapshot = ClusterStatusWire {
@@ -2506,7 +2615,10 @@ mod tests {
 			let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
 			providers.insert(
 				TransportTier::QuicIoUring,
-				Arc::new(ConflictProvider { adds: adds.clone() }),
+				Arc::new(ConflictProvider {
+					adds: adds.clone(),
+					status,
+				}),
 			);
 			let inner = WendelonClient::new(WendelonClientConfig {
 				local_tiers: tiers,
@@ -2625,5 +2737,121 @@ mod tests {
 		evidence.state.lock().unwrap().window_pending.insert(key, 3);
 		evidence.flush_window_deltas().await;
 		assert_conflict_latched(&evidence, &adds, "window");
+	}
+
+	/// A durable evidence handle whose every flush is answered with `status`.
+	fn evidence_answered(
+		status: WriteStatus,
+	) -> (
+		Arc<OptimizerRuntimeEvidence>,
+		Arc<std::sync::atomic::AtomicUsize>,
+	) {
+		let (client, adds) = conflicting_wire::client_answering(status);
+		let evidence = OptimizerRuntimeEvidence::with_wendelon(DurableEvidenceBinding::new(
+			client,
+			TenantId::new(7),
+			Duration::from_secs(5),
+		));
+		(evidence, adds)
+	}
+
+	/// Flush 3 pending on `lane` against `evidence`.
+	async fn flush_lane(evidence: &OptimizerRuntimeEvidence, lane: &str) {
+		match lane {
+			"verdict" => {
+				let key = star_missed();
+				evidence.state.lock().unwrap().pending.insert(key, 3);
+				evidence.flush_keys([key]).await;
+			}
+			"decision" => {
+				let key = all_decision_counter_keys()[0].0;
+				evidence
+					.state
+					.lock()
+					.unwrap()
+					.decision_pending
+					.insert(key, 3);
+				evidence.flush_decision_deltas().await;
+			}
+			"probe linearity" => {
+				let key = all_probe_linearity_counter_keys()[0].0;
+				evidence
+					.state
+					.lock()
+					.unwrap()
+					.probe_linearity_pending
+					.insert(key, 3);
+				evidence.flush_probe_linearity_deltas().await;
+			}
+			_ => {
+				let key = all_window_counter_keys(
+					OptimizerEvidenceWindowId(9),
+					OptimizerEvidenceWindowId(8),
+				)[0]
+				.0;
+				evidence.state.lock().unwrap().window_pending.insert(key, 3);
+				evidence.flush_window_deltas().await;
+			}
+		}
+	}
+
+	const LANES: [&str; 4] = ["verdict", "decision", "probe linearity", "window"];
+
+	// T-WIRE (Toron): an expired flush write id (22) may name an add that
+	// committed earlier, so every lane drops its delta as ambiguous, merges
+	// nothing, and degrades at once (under SDK rotation an expiry means clock
+	// skew or a rotation fault). The request is sent once.
+	#[tokio::test]
+	async fn expired_flush_write_id_drops_ambiguous_and_degrades() {
+		for lane in LANES {
+			let (evidence, adds) = evidence_answered(WriteStatus::WRITE_OPERATION_EXPIRED);
+			flush_lane(&evidence, lane).await;
+			let status = evidence.status_snapshot();
+			assert_eq!(adds.load(std::sync::atomic::Ordering::SeqCst), 1, "{lane}");
+			assert_eq!(status.mode, OptimizerEvidenceMode::Degraded, "{lane}");
+			assert_eq!(status.state, OptimizerEvidenceState::Unavailable, "{lane}");
+			assert_eq!(status.dropped_deltas, 3, "{lane}");
+			assert_eq!(status.ambiguous_deltas, 3, "{lane}: ambiguous");
+			assert_eq!(status.pending_deltas, 0, "{lane}");
+			let state = evidence.state.lock().expect("optimizer runtime evidence");
+			assert!(state.circuit_open, "{lane}");
+			assert!(state.durable_cache.is_empty(), "{lane}: nothing merged");
+			assert!(state.decision_durable_cache.is_empty(), "{lane}");
+			assert!(state.probe_linearity_durable_cache.is_empty(), "{lane}");
+			assert!(state.window_durable_cache.is_empty(), "{lane}");
+		}
+	}
+
+	// T-WIRE (Toron): an invalid write identity (25) reaches the catch-all
+	// ambiguous drop, which does not degrade on one failure. The control: a
+	// write-key conflict (24) stays a known-unapplied drop.
+	#[tokio::test]
+	async fn invalid_flush_write_identity_drops_through_the_ambiguous_catch_all() {
+		for lane in LANES {
+			let (evidence, adds) = evidence_answered(WriteStatus::WRITE_IDENTITY_INVALID);
+			flush_lane(&evidence, lane).await;
+			let status = evidence.status_snapshot();
+			assert_eq!(adds.load(std::sync::atomic::Ordering::SeqCst), 1, "{lane}");
+			assert_eq!(
+				(status.dropped_deltas, status.ambiguous_deltas),
+				(3, 3),
+				"{lane}"
+			);
+			assert_eq!(status.state, OptimizerEvidenceState::Unavailable, "{lane}");
+			assert_eq!(
+				status.mode,
+				OptimizerEvidenceMode::Durable,
+				"{lane}: one failure"
+			);
+
+			let (evidence, _) = evidence_answered(WriteStatus::WRITE_KEY_CONFLICT);
+			flush_lane(&evidence, lane).await;
+			let status = evidence.status_snapshot();
+			assert_eq!(
+				(status.dropped_deltas, status.ambiguous_deltas),
+				(3, 0),
+				"{lane}: control"
+			);
+		}
 	}
 }

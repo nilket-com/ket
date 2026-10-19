@@ -289,6 +289,9 @@ pub struct NodeBootstrapConfig {
 	pub drift_max_offset_ms: u64,
 	/// ADR 013 MVCC history retention policy.
 	pub mvcc_retention_policy: MvccRetentionPolicy,
+	/// Counter dedup horizon: attempt horizon `H`, clock-skew allowance `S`
+	/// (operators keep NTP within it) and expiry `E >= L_sdk + H + S`.
+	pub counter_retention: crate::storage::counter::CounterRetentionConfig,
 	/// Optional three-listener observability topology.
 	pub observability: Option<ObservabilityConfig>,
 	/// Optional additive audit shipping sinks; the local NDJSON chain
@@ -367,6 +370,7 @@ impl NodeBootstrapConfig {
 			// so keep retention disabled unless a caller opts in
 			// explicitly.
 			mvcc_retention_policy: MvccRetentionPolicy::Disabled,
+			counter_retention: crate::storage::counter::CounterRetentionConfig::default(),
 			observability: None,
 			audit: AuditSinksConfig::default(),
 		}
@@ -500,6 +504,7 @@ impl NodeBootstrapConfig {
 			}
 		}
 		self.mvcc_retention_policy.validate()?;
+		self.counter_retention.validate()?;
 		match &self.cluster {
 			ClusterBootstrapConfig::Bootstrap => {}
 			ClusterBootstrapConfig::Join { seeds } => {
@@ -1840,6 +1845,7 @@ impl WendelonNode {
 			.with_audit_sink(audit_sink.clone())
 			.with_lease_authority(lease_authority.clone())
 			.with_mvcc_retention_policy(cfg.mvcc_retention_policy)
+			.with_counter_retention(cfg.counter_retention)?
 			.with_tracker(tracker.clone())
 			.with_lease_gate(true)
 			.with_directory_owner(owner.clone()),

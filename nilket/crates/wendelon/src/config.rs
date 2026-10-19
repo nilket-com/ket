@@ -162,6 +162,8 @@ struct RawConfig {
 	#[serde(default)]
 	time: RawTimeConfig,
 	#[serde(default)]
+	counter: RawCounterConfig,
+	#[serde(default)]
 	cluster: RawClusterConfig,
 	#[serde(default)]
 	crypto: RawCryptoConfig,
@@ -586,6 +588,44 @@ impl Default for RawTimeConfig {
 	}
 }
 
+/// The counter dedup horizon, in seconds. Absent values take the defaults; the
+/// expiry defaults to the SDK incarnation lifetime plus the other two.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCounterConfig {
+	#[serde(default)]
+	attempt_horizon_secs: Option<u64>,
+	#[serde(default)]
+	clock_skew_secs: Option<u64>,
+	#[serde(default)]
+	expiry_secs: Option<u64>,
+}
+
+impl RawCounterConfig {
+	fn into_retention(self) -> std::io::Result<crate::storage::counter::CounterRetentionConfig> {
+		let defaults = crate::storage::counter::CounterRetentionConfig::default();
+		let millis = |secs: Option<u64>, default_ms: u64| {
+			secs.map_or(Ok(default_ms), |secs| {
+				secs.checked_mul(1_000).ok_or_else(|| {
+					Error::new(ErrorKind::InvalidInput, "counter retention value overflows")
+				})
+			})
+		};
+		let attempt_horizon_ms = millis(self.attempt_horizon_secs, defaults.attempt_horizon_ms)?;
+		let clock_skew_ms = millis(self.clock_skew_secs, defaults.clock_skew_ms)?;
+		let floor = crate::schema::COUNTER_INCARNATION_LIFETIME_MS
+			.saturating_add(attempt_horizon_ms)
+			.saturating_add(clock_skew_ms);
+		let retention = crate::storage::counter::CounterRetentionConfig {
+			attempt_horizon_ms,
+			clock_skew_ms,
+			expiry_ms: millis(self.expiry_secs, floor)?,
+		};
+		retention.validate()?;
+		Ok(retention)
+	}
+}
+
 #[derive(Debug, Deserialize)]
 struct RawIdentityConfig {
 	/// Explicit dev-only authorization; absence always refuses recognized dev keys.
@@ -991,6 +1031,7 @@ impl RawConfig {
 				0 => MvccRetentionPolicy::Disabled,
 				secs => MvccRetentionPolicy::FixedWindow(Duration::from_secs(secs)),
 			},
+			counter_retention: self.counter.into_retention()?,
 			observability,
 			audit,
 		};

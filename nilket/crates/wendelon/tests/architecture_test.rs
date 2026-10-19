@@ -8668,6 +8668,245 @@ fn counter_add_installs_its_record_between_the_durable_witness_and_publish() {
 	}
 }
 
+/// The dedup horizon's check order (E0, E1) and compaction's single direction
+/// (E5). E0 runs on the caller's side before the add's task takes its write-key
+/// gate; E1 runs inside the record lookup's answer, after the lookup and before
+/// the record answers K1/K2. Compaction never inserts a record: it evicts, and
+/// only after it has published `CURRENT` and stored the cutoff with Release
+/// ordering. This also closes the receiver gap of the single-install guard
+/// above, which counts only `self.idempotency.insert(`: every receiver counts.
+#[test]
+fn counter_dedup_horizon_is_checked_in_order_and_compaction_only_evicts() {
+	// Whitespace-insensitive, so formatting cannot move a marker.
+	let squeeze = |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+	let counter = squeeze(&read_workspace("crates/wendelon/src/storage/counter.rs"));
+	let compaction = squeeze(&read_workspace(
+		"crates/wendelon/src/storage/counter/compaction.rs",
+	));
+	let retention = squeeze(&read_workspace(
+		"crates/wendelon/src/storage/counter/retention.rs",
+	));
+	let ordered = |body: &str, markers: &[&str]| {
+		let positions: Option<Vec<_>> = markers
+			.iter()
+			.map(|marker| body.find(&squeeze(marker)))
+			.collect();
+		positions.is_some_and(|p| p.windows(2).all(|pair| pair[0] < pair[1]))
+	};
+	let count = |body: &str, marker: &str| body.matches(&squeeze(marker)).count();
+	let region = |body: &str, start: &str, end: &str| -> String {
+		source_region(body, &squeeze(start), &squeeze(end)).to_owned()
+	};
+
+	// E0 before the gate: in `fetch_add_fenced`, before the add's task is
+	// spawned, and so before `admitted_add` admits the write key.
+	const E0: &str = "self.refuse_unpresentable(&write_key)?;";
+	const GATE: &str = "let _write_gate = self.admit_write_key(write_key).await;";
+	let fetch_add = region(
+		&counter,
+		"pub async fn fetch_add(",
+		"/// Admit one request under `write_key`, waiting while another holds it.",
+	);
+	let e0_first =
+		|body: &str| ordered(body, &[E0, "tokio::spawn(body)", GATE]) && count(body, E0) == 1;
+	assert!(e0_first(&fetch_add), "E0 must precede the write-key gate");
+
+	// E1 between the lookup and the record's answer, read after the lookup.
+	const LOOKUP: &str = "let recorded = self.idempotency.get(write_key)";
+	const E1: &str = "self.refuse_expired(write_key)?;";
+	const ANSWER: &str = "recorded.map(|recorded| recorded.answer(key, delta)).transpose()";
+	let answer = region(
+		&counter,
+		"fn recorded_answer(",
+		"/// E0: refuse a write key",
+	);
+	let e1_placed = |body: &str| ordered(body, &[LOOKUP, E1, ANSWER]) && count(body, E1) == 1;
+	assert!(e1_placed(&answer), "E1 must follow the record lookup");
+	// The gate precedes the lookup, which precedes the zero-delta check.
+	let admitted = region(
+		&counter,
+		"async fn admitted_add(",
+		"impl<P: CounterParticipant + Clone> CounterLeader<P> {",
+	);
+	assert!(ordered(
+		&admitted,
+		&[
+			GATE,
+			"self.recorded_answer(&write_key, key, delta)?",
+			"NonZeroU64::new(delta)"
+		]
+	));
+	// E1 reads `Q_mem` (Acquire) then the clock, against the one predicate.
+	let check = region(&counter, "fn check_unexpired(", "/// Test hooks between");
+	assert!(ordered(
+		&check,
+		&[
+			"let cutoff = self.witness_store.0.cutoff();",
+			"retention::expiry_cutoff(cutoff, self.clock.now_ms(), &self.retention)"
+		]
+	));
+	assert!(retention.contains(&squeeze("uuid_v7_unix_millis(uuid)")));
+	assert!(retention.contains(&squeeze(
+		"issued <= now_ms.saturating_add(config.clock_skew_ms)"
+	)));
+
+	// Mutation self-tests: E0 moved behind the gate, E1 moved ahead of the
+	// lookup, and E1 deleted are all refused.
+	let (e0, gate) = (squeeze(E0), squeeze(GATE));
+	let behind_gate = fetch_add
+		.replacen(&e0, "", 1)
+		.replacen(&gate, &format!("{gate}{e0}"), 1);
+	assert!(!e0_first(&behind_gate), "E0 behind the gate accepted");
+	let (e1, lookup) = (squeeze(E1), squeeze(LOOKUP));
+	let early = answer
+		.replacen(&e1, "", 1)
+		.replacen(&lookup, &format!("{e1}{lookup}"), 1);
+	assert!(!e1_placed(&early), "E1 before the lookup accepted");
+	assert!(
+		!e1_placed(&answer.replacen(&e1, "", 1)),
+		"E1 deleted accepted"
+	);
+
+	// E1 itself: `refuse_expired` delegates to the one check.
+	let refuse = region(
+		&counter,
+		"fn refuse_expired(",
+		"/// Refuse a write key issued at or before",
+	);
+	assert!(refuse.contains(&squeeze("self.check_unexpired(write_key)")));
+
+	// counter.rs's production code never removes, retains or clears records:
+	// only compaction's eviction removes, and it lives in compaction.rs.
+	let raw_counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	let production = raw_counter
+		.split("#[cfg(test)]\nmod tests {")
+		.next()
+		.expect("counter.rs production region");
+	for forbidden in ["idempotency.remove", ".retain(", ".clear("] {
+		assert!(
+			!squeeze(production).contains(forbidden),
+			"counter.rs production code must not call `{forbidden}`"
+		);
+	}
+
+	// Addendum A4: in recovery, the barrier (the named generation's sync_data,
+	// then a directory sync) precedes every cleanup unlink.
+	let resolve = region(
+		&compaction,
+		"pub(super) fn resolve_image(",
+		"/// Verify the generation `CURRENT` names",
+	);
+	assert!(ordered(
+		&resolve,
+		&[
+			"if clean {",
+			"if let Some(generation) = authority {",
+			"self.ops.sync_data(&self.generation_path(generation))?;",
+			"self.ops.sync_dir(&self.dir)?;",
+			"for path in stale {",
+			"self.ops.unlink(&path)",
+		]
+	));
+
+	// The record map is written only by the install and by recovery, through
+	// any receiver; compaction never inserts.
+	assert_eq!(count(&counter, "idempotency.insert("), 3);
+	assert_eq!(count(&counter, "self.idempotency.insert("), 1);
+	assert_eq!(count(&counter, "leader.idempotency.insert("), 2);
+	assert!(!compaction.contains("idempotency.insert"));
+	assert!(!compaction.contains(".insert(write_key"));
+
+	// Compaction publishes `CURRENT`, then `Q_mem` (Release), then evicts; the
+	// eviction removes only write keys without a pending witness.
+	let compact = region(
+		&compaction,
+		"pub(super) fn compact(",
+		"/// Phase 3 and the cache switch",
+	);
+	const EVICT: &str = "hooks.evict(&deleted_keys);";
+	const PUBLISH: &str = "let published = self.publish(";
+	let publish_order = |body: &str| {
+		ordered(
+			body,
+			&[
+				PUBLISH,
+				"self.publish_cutoff(header.cutoff);",
+				EVICT,
+				"self.retire_older_generations(header.generation)",
+			],
+		) && count(body, "hooks.evict(") == 1
+	};
+	assert!(
+		publish_order(&compact),
+		"eviction must follow the publish and the cutoff"
+	);
+	let (evict, publish_call) = (squeeze(EVICT), squeeze(PUBLISH));
+	let evict_early = compact.replacen(&evict, "", 1).replacen(
+		&publish_call,
+		&format!("{evict}{publish_call}"),
+		1,
+	);
+	assert!(
+		!publish_order(&evict_early),
+		"eviction before the publish accepted"
+	);
+	let publish = region(
+		&compaction,
+		"fn publish(",
+		"/// A generation number never used",
+	);
+	assert!(ordered(
+		&publish,
+		&[
+			"let synced = self.ops.sync_dir(&self.dir);",
+			".rename(&temp, &self.current_path())",
+			".and_then(|()| self.ops.sync_dir(&self.dir));",
+			"renamed.map_err(Latched)?;",
+			"*state = AppliedLogState::Loaded(next);",
+		]
+	));
+	// Addendum A6: in production a phase-3 directory-sync failure latches.
+	assert!(publish.contains(&squeeze(
+		"#[cfg(not(test))] let synced = synced.map_err(Latched);"
+	)));
+	assert!(!publish.contains(&squeeze("self.ops.sync_dir(&self.dir).map_err(Abandoned)")));
+	assert!(compaction.contains(&squeeze(
+		"self.cutoff.fetch_max(cutoff, Ordering::Release);"
+	)));
+	assert!(compaction.contains(&squeeze("self.cutoff.load(Ordering::Acquire)")));
+	let evict_fn = region(
+		&compaction,
+		"fn evict(&self, deleted: &[CounterWriteKey]) {",
+		"impl<P: CounterParticipant + Clone + Send + Sync + 'static> CounterLeader<P> {",
+	);
+	assert!(evict_fn.contains(&squeeze("if !pending.contains(write_key) {")));
+	assert!(evict_fn.contains(&squeeze("self.0.idempotency.remove(write_key);")));
+	// Generation 0 is poisoned only after `CURRENT` is durable.
+	assert!(ordered(
+		&compact,
+		&[PUBLISH, "self.retire_older_generations("]
+	));
+	let retire = region(
+		&compaction,
+		"fn retire_older_generations(",
+		"/// Replace an unpoisoned",
+	);
+	assert!(retire.contains(&squeeze("self.poison_generation_zero()?;")));
+	// Two call sites in compaction (the retire step and its test-only early
+	// control), plus Addendum A1's recovery re-poison, which runs only once
+	// recovery has loaded the generation `CURRENT` names.
+	assert_eq!(count(&compaction, "self.poison_generation_zero()"), 3);
+	let recover = region(&counter, "fn recover_applied(", "fn load_applied(");
+	assert!(ordered(
+		&recover,
+		&[
+			"let current = image.generation >= 1;",
+			"*state = AppliedLogState::Loaded(image);",
+			"if current { self.repoison_on_recovery(&mut state); }",
+		]
+	));
+}
+
 #[test]
 fn adr075_duplicate_counter_add_replays_without_mutating() {
 	let server = data_server_workspace_source();
@@ -9351,15 +9590,17 @@ fn adr077_dispatch_and_struct_stay_in_root() {
 /// helper regrowth. ADR 0096 adds the bounded participant phase-transition
 /// signal beside the durable progress write whose post-transition cursor and
 /// examined count it reports; moving it would split the observation from the
-/// state transition it describes.
+/// state transition it describes. ADR 0102 F-CTR-5b carved the per-tenant
+/// counter-leader factory into `counter.rs`, and the cap ratchets down to
+/// the size that left (16_287).
 #[test]
 fn adr077_root_is_bounded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
 	let lines = root.lines().count();
 	assert!(
-		lines <= 16_340,
-		"data_server.rs root is {lines} lines (cap 16_340); carve more or justify a deliberate cap bump"
+		lines <= 16_287,
+		"data_server.rs root is {lines} lines (cap 16_287); carve more or justify a deliberate cap bump"
 	);
 }
 

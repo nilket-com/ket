@@ -231,6 +231,11 @@ pub struct WendelonClient {
 	rf: RwLock<usize>,
 	/// Cached epoch from the latest topology fetch.
 	epoch: RwLock<u64>,
+	/// Test-only negative control: skip the attempt-horizon check made just
+	/// before a counter add is sent, keeping only the check at the top of the
+	/// retry loop (before connection setup).
+	#[cfg(test)]
+	skip_counter_send_recheck: std::sync::atomic::AtomicBool,
 }
 
 impl WendelonClient {
@@ -270,6 +275,8 @@ impl WendelonClient {
 			leader: RwLock::new(leader),
 			rf: RwLock::new(rf),
 			epoch: RwLock::new(epoch),
+			#[cfg(test)]
+			skip_counter_send_recheck: std::sync::atomic::AtomicBool::new(false),
 		})
 	}
 
@@ -371,6 +378,58 @@ pub struct CounterAddRequest {
 pub struct CounterAddResult {
 	pub response: CounterAddResponseMeta,
 }
+
+/// The monotonic and wall clocks behind the SDK's counter incarnations (E6):
+/// incarnation and attempt ages are measured on `now`, and a fresh UUIDv7
+/// carries `unix_millis`. Tests substitute a controlled clock.
+pub trait ClientClock: Send + Sync {
+	fn now(&self) -> Instant;
+	fn unix_millis(&self) -> u64;
+}
+
+/// The process clocks.
+pub struct SystemClientClock;
+
+impl ClientClock for SystemClientClock {
+	fn now(&self) -> Instant {
+		Instant::now()
+	}
+
+	fn unix_millis(&self) -> u64 {
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_millis()
+			.try_into()
+			.unwrap_or(u64::MAX)
+	}
+}
+
+/// E6: no attempt of a counter add is sent once more than `horizon` has passed
+/// on `clock` since its write id was allocated at `allocated_at`.
+#[derive(Clone)]
+pub struct CounterAttemptBound {
+	pub allocated_at: Instant,
+	pub horizon: Duration,
+	pub clock: Arc<dyn ClientClock>,
+}
+
+/// A counter add stopped because its next attempt would have been older than
+/// its attempt horizon. Carried as the io error's typed source. `knowledge` is
+/// `KNOWN_NOT_COMMITTED` when no attempt was sent, `INDETERMINATE` otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CounterAttemptsStopped {
+	pub write_id: crate::schema::ClientWriteId,
+	pub knowledge: crate::schema::MutationCommitKnowledge,
+}
+
+impl std::fmt::Display for CounterAttemptsStopped {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "counter add stopped at its attempt horizon: {self:?}")
+	}
+}
+
+impl std::error::Error for CounterAttemptsStopped {}
 
 /// Client-visible `COUNTER_READ` request (ADR 075 cut-5b). Point read of a counter
 /// key by its domain-separated identity — no Arrow payload.
@@ -1641,11 +1700,32 @@ impl WendelonClient {
 		&self,
 		request: CounterAddRequest,
 	) -> std::io::Result<CounterAddResult> {
+		self.counter_add_bounded(request, None).await
+	}
+
+	/// [`counter_add`](Self::counter_add) that sends no attempt older than
+	/// `bound` (E6). Every attempt resends the same built request, so a retry
+	/// never changes its write id.
+	pub async fn counter_add_bounded(
+		&self,
+		request: CounterAddRequest,
+		bound: Option<CounterAttemptBound>,
+	) -> std::io::Result<CounterAddResult> {
 		let key_locality = Locality::from(request.meta.key_identity);
 		let mut preferred_target = None;
+		// Whether any attempt has entered `write_frame` (a partial write counts).
+		let mut sent = false;
 		for attempt in 0..DATA_RETRY_BUDGET {
+			// Checked here so an over-age add opens no connection, and again in
+			// `counter_add_once` just before it sends, after connection setup.
+			check_counter_attempt_age(bound.as_ref(), sent, &request)?;
 			let target = preferred_target.unwrap_or(self.target_for_locality(key_locality)?);
-			let result = self.counter_add_once(target, &request).await?;
+			// A transport error leaves the loop through `?` as an io error
+			// (`ClientError::Io` in the SDK), so a partially written attempt never
+			// reaches a later horizon check: the partial-write stop is unreachable.
+			let result = self
+				.counter_add_once(target, &request, bound.as_ref(), &mut sent)
+				.await?;
 			let Some(retry) = retry_counter_add_response(&result.response) else {
 				return Ok(result);
 			};
@@ -1658,10 +1738,15 @@ impl WendelonClient {
 		unreachable!("bounded retry loop must return within budget")
 	}
 
+	/// One attempt. The attempt horizon is re-checked after connection setup,
+	/// immediately before the request is sent; `sent` is set as the request
+	/// enters `write_frame`, so a partially written request counts as sent.
 	async fn counter_add_once(
 		&self,
 		target: NodeId,
 		request: &CounterAddRequest,
+		bound: Option<&CounterAttemptBound>,
+		sent: &mut bool,
 	) -> std::io::Result<CounterAddResult> {
 		let conn = self.factory.get_connection(target).await?;
 		let mut stream = conn.open_bi().await?;
@@ -1676,6 +1761,14 @@ impl WendelonClient {
 			arrow_len: arrow.len() as u32,
 			trailing_len: 0,
 		};
+		#[cfg(test)]
+		let bound = bound.filter(|_| {
+			!self
+				.skip_counter_send_recheck
+				.load(std::sync::atomic::Ordering::Relaxed)
+		});
+		check_counter_attempt_age(bound, *sent, request)?;
+		*sent = true;
 		write_frame(
 			&mut *stream,
 			&header,
@@ -2908,6 +3001,37 @@ fn retry_write_response(response: &WriteResponseMeta) -> Option<RetryDirective> 
 	}
 }
 
+/// E6: refuse an attempt once the add is older than its horizon. The stop is
+/// `KNOWN_NOT_COMMITTED` when no attempt has been sent, `INDETERMINATE` otherwise.
+fn check_counter_attempt_age(
+	bound: Option<&CounterAttemptBound>,
+	sent: bool,
+	request: &CounterAddRequest,
+) -> std::io::Result<()> {
+	let Some(bound) = bound else {
+		return Ok(());
+	};
+	let age = bound
+		.clock
+		.now()
+		.saturating_duration_since(bound.allocated_at);
+	if age <= bound.horizon {
+		return Ok(());
+	}
+	let knowledge = if sent {
+		crate::schema::MutationCommitKnowledge::INDETERMINATE
+	} else {
+		crate::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+	};
+	Err(Error::new(
+		ErrorKind::TimedOut,
+		CounterAttemptsStopped {
+			write_id: request.meta.write_id,
+			knowledge,
+		},
+	))
+}
+
 fn retry_counter_add_response(response: &CounterAddResponseMeta) -> Option<RetryDirective> {
 	match response.status {
 		s if s == WriteStatus::NOT_LEADER || s == WriteStatus::EPOCH_STALE => Some(
@@ -2923,6 +3047,8 @@ fn retry_counter_add_response(response: &CounterAddResponseMeta) -> Option<Retry
 			nonzero_node_id(response.leader_hint),
 		)),
 		// WRITE_KEY_CONFLICT is final: the same write id can only conflict again.
+		// So are WRITE_OPERATION_EXPIRED (E1) and WRITE_IDENTITY_INVALID (E0): the
+		// server refuses the same write id again.
 		_ => None,
 	}
 }
@@ -5379,6 +5505,228 @@ mod tests {
 		let f = KeyRange::full();
 		assert_eq!(f.start_locality, Locality::ZERO);
 		assert_eq!(f.end_locality, Locality::MAX);
+	}
+
+	/// A clock whose instant a test steps.
+	struct SteppedClientClock {
+		base: Instant,
+		offset_ms: std::sync::atomic::AtomicU64,
+	}
+
+	impl ClientClock for SteppedClientClock {
+		fn now(&self) -> Instant {
+			self.base
+				+ Duration::from_millis(self.offset_ms.load(std::sync::atomic::Ordering::SeqCst))
+		}
+
+		fn unix_millis(&self) -> u64 {
+			1_900_000_000_000 + self.offset_ms.load(std::sync::atomic::Ordering::SeqCst)
+		}
+	}
+
+	/// A peer whose connection setup takes `setup_ms` on the clock, and which
+	/// answers every counter add it receives with `OK`.
+	struct SlowSetupCounterProvider {
+		clock: Arc<SteppedClientClock>,
+		setup_ms: u64,
+		received: Arc<std::sync::atomic::AtomicUsize>,
+	}
+
+	struct SlowSetupCounterConnection {
+		remote: NodeId,
+		actor: ActorIdentity,
+		clock: Arc<SteppedClientClock>,
+		setup_ms: u64,
+		received: Arc<std::sync::atomic::AtomicUsize>,
+	}
+
+	#[async_trait]
+	impl TransportProvider for SlowSetupCounterProvider {
+		async fn connect(
+			&self,
+			target: NodeId,
+			_address: &str,
+		) -> std::io::Result<Arc<dyn TransportConnection>> {
+			Ok(Arc::new(SlowSetupCounterConnection {
+				remote: target,
+				actor: ActorIdentity::data_node(target),
+				clock: self.clock.clone(),
+				setup_ms: self.setup_ms,
+				received: self.received.clone(),
+			}))
+		}
+	}
+
+	#[async_trait]
+	impl TransportConnection for SlowSetupCounterConnection {
+		async fn open_bi(&self) -> std::io::Result<Box<dyn TransportStream>> {
+			// Connection setup is slow: time passes after the loop's own check.
+			self.clock
+				.offset_ms
+				.fetch_add(self.setup_ms, std::sync::atomic::Ordering::SeqCst);
+			let (client, mut server) = tokio::io::duplex(64 * 1024);
+			let received = self.received.clone();
+			tokio::spawn(async move {
+				let pool = BufPool::new(4, 64 * 1024);
+				let Ok(request) = read_frame(&mut server, &pool).await else {
+					return;
+				};
+				received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+				let meta: CounterAddRequestMeta = *bytemuck::from_bytes(
+					&request.meta[..std::mem::size_of::<CounterAddRequestMeta>()],
+				);
+				let mut response: CounterAddResponseMeta = bytemuck::Zeroable::zeroed();
+				response.status = WriteStatus::OK;
+				response.echoed_write_id = meta.write_id;
+				response.current_value = meta.delta;
+				let header = FrameHeader {
+					magic: HRFT_MAGIC,
+					version: 1,
+					msg_type: MsgType::COUNTER_ADD_RESP.0,
+					flags: 0,
+					stream_id: 0,
+					meta_len: std::mem::size_of::<CounterAddResponseMeta>() as u32,
+					arrow_len: 0,
+					trailing_len: 0,
+				};
+				let _ = write_frame(
+					&mut server,
+					&header,
+					bytemuck::bytes_of(&response),
+					None,
+					None,
+				)
+				.await;
+				let _ = server.shutdown().await;
+			});
+			Ok(Box::new(DuplexTransportStream { inner: client }))
+		}
+
+		async fn accept_bi(&self) -> std::io::Result<Box<dyn TransportStream>> {
+			unimplemented!("client tests never accept inbound streams")
+		}
+
+		fn remote_id(&self) -> Option<NodeId> {
+			Some(self.remote)
+		}
+
+		fn actor_identity(&self) -> &ActorIdentity {
+			&self.actor
+		}
+
+		fn transport_type(&self) -> TransportTier {
+			TransportTier::QuicIoUring
+		}
+
+		fn is_closed(&self) -> bool {
+			false
+		}
+	}
+
+	/// One bounded counter add whose connection setup outlasts the attempt
+	/// horizon. Returns the result and how many requests the peer received.
+	async fn counter_add_past_horizon_in_setup(
+		skip_send_recheck: bool,
+	) -> (std::io::Result<CounterAddResult>, usize) {
+		let clock = Arc::new(SteppedClientClock {
+			base: Instant::now(),
+			offset_ms: std::sync::atomic::AtomicU64::new(0),
+		});
+		let horizon = Duration::from_millis(crate::schema::COUNTER_ATTEMPT_HORIZON_MS);
+		let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let provider = Arc::new(SlowSetupCounterProvider {
+			clock: clock.clone(),
+			setup_ms: crate::schema::COUNTER_ATTEMPT_HORIZON_MS + 1,
+			received: received.clone(),
+		});
+		let bootstrap = snapshot(1, Some(1), &[1]);
+		let source = Arc::new(StaticTopologySource::new(bootstrap.clone()));
+		let client = WendelonClient::new(descriptor_get_config(bootstrap, source, provider));
+		client
+			.skip_counter_send_recheck
+			.store(skip_send_recheck, std::sync::atomic::Ordering::Relaxed);
+		let key = crate::storage::counter::CounterKey(b"counter".to_vec());
+		let request = CounterAddRequest {
+			meta: CounterAddRequestMeta {
+				write_id: ClientWriteId {
+					client_uuid: [0; 16],
+					sequence_no: 1,
+					idempotency_ttl_ms: 60_000,
+					_pad: 0,
+				},
+				client_hlc: HybridTimestamp {
+					physical_ms: 1,
+					logical: 0,
+					node_id: 0,
+				},
+				expected_epoch: 1,
+				tenant_id: TenantId::new(7),
+				proxy_hop: 0,
+				durability: crate::schema::DurabilityLevel::QUORUM,
+				await_finalization: 0,
+				_pad1: [0; 5],
+				proxy_source: NodeId {
+					id: 0,
+					_reserved: 0,
+				},
+				key_identity: crate::storage::counter::counter_identity(&key),
+				key_len: key.0.len() as u32,
+				_pad2: [0; 4],
+				delta: 1,
+			},
+			payload: counter_key_batch_for_test(&key.0),
+		};
+		let bound = CounterAttemptBound {
+			allocated_at: clock.now(),
+			horizon,
+			clock: clock.clone(),
+		};
+		let result = client.counter_add_bounded(request, Some(bound)).await;
+		tokio::task::yield_now().await;
+		(result, received.load(std::sync::atomic::Ordering::SeqCst))
+	}
+
+	fn counter_key_batch_for_test(key: &[u8]) -> RecordBatch {
+		let schema = Arc::new(Schema::new(vec![Field::new(
+			"key",
+			DataType::LargeBinary,
+			false,
+		)]));
+		RecordBatch::try_new(schema, vec![Arc::new(LargeBinaryArray::from(vec![key]))]).unwrap()
+	}
+
+	// E6 (from source review): the attempt horizon is re-checked after
+	// connection setup, immediately before the request is sent. A setup that
+	// outlasts the horizon stops the add with KNOWN_NOT_COMMITTED and sends
+	// nothing. The control keeps only the check at the top of the retry loop,
+	// before connection setup: the over-age attempt is sent.
+	#[tokio::test]
+	async fn counter_attempt_horizon_is_rechecked_after_connection_setup() {
+		let (result, received) = counter_add_past_horizon_in_setup(false).await;
+		let error = result.expect_err("the add stops at its horizon");
+		let stopped = error
+			.get_ref()
+			.and_then(|source| source.downcast_ref::<CounterAttemptsStopped>())
+			.copied()
+			.expect("a typed attempt stop");
+		assert_eq!(
+			stopped.knowledge,
+			crate::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+		);
+		assert_eq!(received, 0, "nothing was sent");
+
+		let (result, received) = counter_add_past_horizon_in_setup(true).await;
+		assert_eq!(
+			result
+				.expect("control: the attempt is sent")
+				.response
+				.status,
+			WriteStatus::OK
+		);
+		assert_eq!(
+			received, 1,
+			"control: the over-age attempt reached the peer"
+		);
 	}
 }
 

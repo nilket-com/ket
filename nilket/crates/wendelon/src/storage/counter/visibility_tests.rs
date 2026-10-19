@@ -92,14 +92,14 @@ async fn ctr4_second_add_uses_first_unresolved_witness() {
 	));
 	let key = CounterKey(b"sum".to_vec());
 	assert_eq!(
-		leader.fetch_add(plan(&p), [1; 24], &key, 5).await,
+		leader.fetch_add(plan(&p), test_write_key(1), &key, 5).await,
 		Ok(CounterAddResult::Applied(CounterAddOutcome {
 			previous: 0,
 			current: 5
 		}))
 	);
 	assert_eq!(
-		leader.fetch_add(plan(&p), [2; 24], &key, 7).await,
+		leader.fetch_add(plan(&p), test_write_key(2), &key, 7).await,
 		Ok(CounterAddResult::Applied(CounterAddOutcome {
 			previous: 5,
 			current: 12
@@ -138,9 +138,7 @@ async fn ctr4_second_add_uses_first_unresolved_witness() {
 	assert_eq!(leader.read(&key).await, Ok(Some(12)));
 	p.blocked.store(false, Ordering::SeqCst);
 	for step in 1..=64 {
-		let mut write_key = [0; 24];
-		write_key[..8].copy_from_slice(&(step as u64).to_le_bytes());
-		write_key[23] = 99;
+		let write_key = test_write_key((99 << 56) | step as u64);
 		assert_eq!(
 			leader.fetch_add(plan(&p), write_key, &key, 1).await,
 			Ok(CounterAddResult::Applied(CounterAddOutcome {
@@ -177,7 +175,7 @@ async fn ctr4_orphan_live_value_never_becomes_base() {
 		witness_store(&dir),
 	));
 	assert_eq!(
-		leader.fetch_add(plan(&p), [1; 24], &key, 3).await,
+		leader.fetch_add(plan(&p), test_write_key(1), &key, 3).await,
 		Ok(CounterAddResult::Applied(CounterAddOutcome {
 			previous: 0,
 			current: 3
@@ -210,7 +208,7 @@ async fn ctr4_newer_mark_beats_stale_pending_witness() {
 	));
 	let key = CounterKey(b"stale".to_vec());
 	assert_eq!(
-		leader.fetch_add(plan(&p), [1; 24], &key, 5).await,
+		leader.fetch_add(plan(&p), test_write_key(1), &key, 5).await,
 		Ok(CounterAddResult::Applied(CounterAddOutcome {
 			previous: 0,
 			current: 5
@@ -218,7 +216,7 @@ async fn ctr4_newer_mark_beats_stale_pending_witness() {
 	);
 	p.blocked.store(false, Ordering::SeqCst);
 	assert_eq!(
-		leader.fetch_add(plan(&p), [2; 24], &key, 7).await,
+		leader.fetch_add(plan(&p), test_write_key(2), &key, 7).await,
 		Ok(CounterAddResult::Applied(CounterAddOutcome {
 			previous: 5,
 			current: 12

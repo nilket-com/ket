@@ -781,6 +781,8 @@ pub struct WendelonDataServer {
 	/// `ClientWriteId` bytes, durable with the witness/applied log), NOT in a
 	/// server-side cache that dies with the process.
 	counter_leader_init: Arc<DashMap<TenantId, Arc<tokio::sync::Mutex<()>>>>,
+	/// Counter dedup horizon for every tenant leader (`with_counter_retention`).
+	counter_retention: crate::storage::counter::CounterRetentionConfig,
 	/// In-memory claim set that ensures only one task at a time can
 	/// drive a given persisted pending finalization through Raft.
 	pending_finalization_claims: PendingFinalizationClaims,
@@ -1196,6 +1198,7 @@ impl Clone for WendelonDataServer {
 			counter_replica: self.counter_replica.clone(),
 			counter_leaders: self.counter_leaders.clone(),
 			counter_leader_init: self.counter_leader_init.clone(),
+			counter_retention: self.counter_retention,
 			pending_finalization_claims: self.pending_finalization_claims.clone(),
 			pending_finalization_wakeup: self.pending_finalization_wakeup.clone(),
 			orphan_witness_recovery_stamp: self.orphan_witness_recovery_stamp.clone(),
@@ -2280,6 +2283,7 @@ impl WendelonDataServer {
 			counter_replica,
 			counter_leaders: Arc::new(DashMap::new()),
 			counter_leader_init: Arc::new(DashMap::new()),
+			counter_retention: Default::default(),
 			pending_finalization_claims: PendingFinalizationClaims::default(),
 			pending_finalization_wakeup: Arc::new(Notify::new()),
 			orphan_witness_recovery_stamp: Arc::new(RwLock::new(None)),
@@ -6595,56 +6599,6 @@ impl WendelonDataServer {
 			arrow_payload: None,
 			trailing: None,
 		}
-	}
-
-	/// Per-tenant counter leader: recover durable dedup/witnesses and reconcile before serving.
-	/// This preserves restart DUPLICATE replay and finishes witnessed partial commits.
-	/// Fresh adds use per-key plans; recovery resolves recorded peer identities.
-	/// The per-tenant init gate permits exactly one recovery for concurrent first requests.
-	/// Recovery file I/O never holds a DashMap entry lock across await.
-	async fn counter_leader_for(
-		&self,
-		tenant_id: TenantId,
-	) -> std::io::Result<
-		Arc<
-			crate::storage::counter::CounterLeader<crate::storage::counter::CounterParticipantKind>,
-		>,
-	> {
-		use crate::storage::counter::{
-			CounterLeader, CounterParticipantKind, LocalCounterParticipant,
-		};
-		if let Some(existing) = self.counter_leaders.get(&tenant_id) {
-			return Ok(existing.clone());
-		}
-		let init_gate = self
-			.counter_leader_init
-			.entry(tenant_id)
-			.or_default()
-			.clone();
-		let _init_guard = init_gate.lock().await;
-		if let Some(existing) = self.counter_leaders.get(&tenant_id) {
-			return Ok(existing.clone());
-		}
-		let participant = CounterParticipantKind::Local(LocalCounterParticipant::new(
-			self.counter_replica.clone(),
-			tenant_id,
-			self.local_node,
-		));
-		let owner = self._directory_owner.as_ref();
-		let witness_store = ownership::witness_store(&self.slab, tenant_id, owner)?;
-		let leader = Arc::new(CounterLeader::recover(
-			self.local_node,
-			participant,
-			true,
-			witness_store,
-		)?);
-		// Finish any partial commit fan-out (idempotent) before first service.
-		let resolver =
-			self.counter_participant_factory(tenant_id, self.admission_snapshot().current_epoch);
-		leader.reconcile(&resolver).await;
-		self.fence_unsettled_counter(&leader, tenant_id).await;
-		self.counter_leaders.insert(tenant_id, leader.clone());
-		Ok(leader)
 	}
 
 	fn counter_participant_factory(

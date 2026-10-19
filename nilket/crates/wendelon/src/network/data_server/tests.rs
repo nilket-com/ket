@@ -12585,6 +12585,26 @@ async fn counter_rollback_dispatch_acks_and_is_idempotent() {
 	shutdown_lease_node(node).await;
 }
 
+/// The UUIDv7 client uuid the counter-add fixtures write under for the node
+/// whose data directory is `data_dir`: minted when that node first adds, so a
+/// retry (after a restart over the same directory too) is the same write id,
+/// and its age is the test's, never the process's (E0, E1).
+fn counter_test_client_uuid(data_dir: &std::path::Path) -> [u8; 16] {
+	static MINTED: std::sync::OnceLock<
+		std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, [u8; 16]>>,
+	> = std::sync::OnceLock::new();
+	*MINTED
+		.get_or_init(Default::default)
+		.lock()
+		.unwrap()
+		.entry(data_dir.to_path_buf())
+		.or_insert_with(|| {
+			let now_ms = crate::consensus::monitor::SystemClock.now_ms();
+			let write_key = crate::storage::counter::test_write_key_at(now_ms, 0);
+			write_key[..16].try_into().expect("16-byte client uuid")
+		})
+}
+
 /// Build + dispatch one `COUNTER_ADD_REQ` (key `b"k"`, `seq`/`delta`) and return
 /// the parsed response meta.
 async fn dispatch_counter_add(
@@ -12593,10 +12613,22 @@ async fn dispatch_counter_add(
 	delta: u64,
 	key_identity: Identity,
 ) -> CounterAddResponseMeta {
+	let client_uuid = counter_test_client_uuid(node.data_server.slab.data_dir());
+	dispatch_counter_add_as(node, client_uuid, seq, delta, key_identity).await
+}
+
+/// [`dispatch_counter_add`] under the caller's `client_uuid`.
+async fn dispatch_counter_add_as(
+	node: &WendelonNode,
+	client_uuid: [u8; 16],
+	seq: u64,
+	delta: u64,
+	key_identity: Identity,
+) -> CounterAddResponseMeta {
 	let payload = encode_batch(&single_key_batch()).unwrap();
 	let meta = CounterAddRequestMeta {
 		write_id: ClientWriteId {
-			client_uuid: [7u8; 16],
+			client_uuid,
 			sequence_no: seq,
 			idempotency_ttl_ms: 60_000,
 			_pad: 0,
@@ -12770,6 +12802,7 @@ async fn counter_add_overflow_rejects_without_mutating() {
 /// directly so a spawned (`'static`) task can rebuild a frame on retry.
 fn counter_add_frame(
 	pool: &Arc<BufPool>,
+	client_uuid: [u8; 16],
 	seq: u64,
 	delta: u64,
 	key_identity: Identity,
@@ -12777,7 +12810,7 @@ fn counter_add_frame(
 	let payload = encode_batch(&single_key_batch()).unwrap();
 	let meta = CounterAddRequestMeta {
 		write_id: ClientWriteId {
-			client_uuid: [7u8; 16],
+			client_uuid,
 			sequence_no: seq,
 			idempotency_ttl_ms: 60_000,
 			_pad: 0,
@@ -12833,7 +12866,8 @@ async fn dispatch_counter_add_shared(
 	key_identity: Identity,
 ) -> CounterAddResponseMeta {
 	loop {
-		let frame = counter_add_frame(&pool, seq, delta, key_identity);
+		let client_uuid = counter_test_client_uuid(server.slab.data_dir());
+		let frame = counter_add_frame(&pool, client_uuid, seq, delta, key_identity);
 		let resp = DataRingServer::handle_data_frame(
 			server.as_ref(),
 			RequestContext {

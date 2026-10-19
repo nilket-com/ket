@@ -63,6 +63,15 @@ pub(crate) enum AppliedLogFault {
 		recorded_op_id: u64,
 		conflicting_op_id: u64,
 	},
+	/// No generation can be named the authority: `CURRENT` is absent and
+	/// generation 0 is the downgrade poison, or generation 0 is absent while a
+	/// numbered generation exists. Recovery fails closed and touches nothing.
+	NoAuthority,
+	/// `CURRENT` names a generation whose file is missing, shorter than its base,
+	/// or whose base does not match its checksum or header.
+	GenerationMismatch { generation: u64 },
+	/// Compaction cannot start: the image still holds a torn tail.
+	CompactionNotReady,
 }
 
 impl std::fmt::Display for AppliedLogFault {
@@ -101,7 +110,10 @@ fn identity_conflict(
 	.io()
 }
 
-/// The parsed log plus the length the owning store expects on disk.
+/// The parsed current generation plus the length the owning store expects on
+/// disk. Generation 0 is `counter-applied.log`, with no header; a numbered
+/// generation starts with a header whose cutoff and operation-id high-water
+/// the image carries, and its first `base_len` bytes are what `CURRENT` checks.
 pub(super) struct AppliedLogImage {
 	pub(super) records: Vec<AppliedCounterAdd>,
 	by_op: HashMap<u64, usize>,
@@ -110,10 +122,17 @@ pub(super) struct AppliedLogImage {
 	pub(super) file_len: u64,
 	/// False after this store created the file until its directory entry is synced.
 	pub(super) name_durable: bool,
+	pub(super) generation: u64,
+	/// Header plus compacted body: a torn-tail repair never truncates below it.
+	pub(super) base_len: u64,
+	/// The durable issuance cutoff `Q` this generation was written under.
+	pub(super) cutoff: u64,
+	/// The highest operation id the store had allocated when it was written.
+	pub(super) high_water: u64,
 }
 
 impl AppliedLogImage {
-	fn new(
+	pub(super) fn new(
 		records: Vec<AppliedCounterAdd>,
 		torn_tail: Option<TornAppliedTail>,
 		file_len: u64,
@@ -125,6 +144,10 @@ impl AppliedLogImage {
 			torn_tail,
 			file_len,
 			name_durable: true,
+			generation: 0,
+			base_len: 0,
+			cutoff: 0,
+			high_water: 0,
 		};
 		for record in records {
 			if record.op_id == 0 || record.current <= record.previous {
@@ -291,11 +314,21 @@ fn torn_op_id(partial: &[u8]) -> std::io::Result<Option<u64>> {
 		.map_err(|error| Error::new(ErrorKind::InvalidData, error))
 }
 
-/// Parse a whole log. A complete but undecodable frame is an error; only an
-/// incomplete final frame is reported as a torn tail.
+/// Parse a whole headerless log (generation 0). A complete but undecodable
+/// frame is an error; only an incomplete final frame is reported as a torn tail.
 pub(super) fn parse(bytes: &[u8]) -> std::io::Result<AppliedLogImage> {
+	let (records, torn_tail) = parse_frames(bytes, 0)?;
+	AppliedLogImage::new(records, torn_tail, bytes.len() as u64)
+}
+
+/// The frames of `bytes` from offset `start` on, and the torn final frame if the
+/// last one is incomplete. Offsets in the torn tail are absolute.
+pub(super) fn parse_frames(
+	bytes: &[u8],
+	start: usize,
+) -> std::io::Result<(Vec<AppliedCounterAdd>, Option<TornAppliedTail>)> {
 	let mut records = Vec::new();
-	let mut at = 0usize;
+	let mut at = start;
 	while at < bytes.len() {
 		let rest = &bytes[at..];
 		let torn = |op_id| {
@@ -306,7 +339,7 @@ pub(super) fn parse(bytes: &[u8]) -> std::io::Result<AppliedLogImage> {
 			})
 		};
 		if rest.len() < 4 {
-			return AppliedLogImage::new(records, torn(None), bytes.len() as u64);
+			return Ok((records, torn(None)));
 		}
 		let len = u32::from_le_bytes(rest[..4].try_into().expect("four-byte prefix")) as usize;
 		if len == 0 {
@@ -314,12 +347,12 @@ pub(super) fn parse(bytes: &[u8]) -> std::io::Result<AppliedLogImage> {
 		}
 		let payload = &rest[4..];
 		if len > payload.len() {
-			return AppliedLogImage::new(records, torn(torn_op_id(payload)?), bytes.len() as u64);
+			return Ok((records, torn(torn_op_id(payload)?)));
 		}
 		records.push(decode_payload(&payload[..len])?);
 		at += 4 + len;
 	}
-	AppliedLogImage::new(records, None, bytes.len() as u64)
+	Ok((records, None))
 }
 
 /// Two records of one logical operation: every field both carry is equal.

@@ -1,7 +1,8 @@
-//! The counter-specific persistence seam for the witness directory and the
-//! applied log. Every byte write, rename, unlink and barrier the counter's
-//! dedup authority depends on goes through it, so crash tests can model file
-//! bytes and directory entries as separately durable, and inject failures.
+//! The counter-specific persistence seam for the witness directory, the
+//! applied log and its compaction generations. Every byte write, rename,
+//! unlink and barrier the counter's dedup authority depends on goes through
+//! it, so crash tests can model file bytes and directory entries as
+//! separately durable, and inject failures.
 use std::io::{Error, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
@@ -10,6 +11,9 @@ pub(super) trait CounterDurableFileOps: Send + Sync {
 	fn create_dir(&self, path: &Path) -> std::io::Result<()>;
 	/// Create or replace `path` with `bytes`. Not a durability barrier.
 	fn write_file(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()>;
+	/// Create `path` with `bytes`, failing with `AlreadyExists` if the name
+	/// exists: a compaction generation is never reused. Not a durability barrier.
+	fn create_new_file(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()>;
 	/// Append `bytes`, returning whether this call created the file. Not a
 	/// durability barrier.
 	fn append_file(&self, path: &Path, bytes: &[u8]) -> std::io::Result<bool>;
@@ -44,6 +48,14 @@ impl CounterDurableFileOps for StdCounterDurableFileOps {
 
 	fn write_file(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 		let mut file = std::fs::File::create(path)?;
+		file.write_all(bytes)
+	}
+
+	fn create_new_file(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+		let mut file = std::fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(path)?;
 		file.write_all(bytes)
 	}
 
