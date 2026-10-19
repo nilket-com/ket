@@ -1268,9 +1268,24 @@ mod tests {
 		bytes
 	}
 
+	/// Signing off for every scratch-repository git invocation the tests make.
+	const HERMETIC_GIT_CONFIG: &[&str] = &[
+		"-c",
+		"commit.gpgsign=false",
+		"-c",
+		"tag.gpgsign=false",
+		"-c",
+		"tag.forceSignAnnotated=false",
+	];
+
 	fn git(repo: &Path, args: &[&str]) -> String {
+		// Scratch repositories must not inherit the developer's global or
+		// system git config (e.g. `commit.gpgsign` with an unreachable agent).
 		let output = Command::new("git")
 			.current_dir(repo)
+			.env("GIT_CONFIG_NOSYSTEM", "1")
+			.env("GIT_CONFIG_GLOBAL", "/dev/null")
+			.args(HERMETIC_GIT_CONFIG)
 			.args(args)
 			.env("GIT_AUTHOR_NAME", "ADR 581")
 			.env("GIT_AUTHOR_EMAIL", "adr581@example.invalid")
@@ -1291,6 +1306,19 @@ mod tests {
 		let remote = root.join("remote.git");
 		std::fs::create_dir_all(&repo).unwrap();
 		git(&repo, &["init", "-q"]);
+		// The production seal path (`git tag -a`, `git push`) runs in this repo
+		// with the inherited environment; repo-local config overrides any global
+		// signing or identity settings so it stays hermetic too.
+		for (key, value) in [
+			("commit.gpgsign", "false"),
+			("tag.gpgsign", "false"),
+			("tag.forceSignAnnotated", "false"),
+			("push.gpgsign", "false"),
+			("user.name", "ADR 581"),
+			("user.email", "adr581@example.invalid"),
+		] {
+			git(&repo, &["config", "--local", key, value]);
+		}
 		std::fs::write(repo.join("source.rs"), "fn source() {}\n").unwrap();
 		git(&repo, &["add", "source.rs"]);
 		git(&repo, &["commit", "-qm", "source"]);
