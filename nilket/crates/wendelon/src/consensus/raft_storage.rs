@@ -12286,6 +12286,42 @@ mod recovery_tests {
 		}
 	}
 
+	/// Negative control for an injected torn write: the one named segment holds the first
+	/// `torn_len` bytes of `entry`'s page at `offset`, and not the whole page. When the torn
+	/// prefix went through the WAL's O_DIRECT handle, ext4 refused it and these bytes were absent.
+	fn assert_torn_prefix_on_disk(
+		dir: &Path,
+		entry: &Entry<WendelonTypeConfig>,
+		offset: usize,
+		torn_len: usize,
+	) {
+		let page = serialize_entry_page(entry).unwrap();
+		let page = page.as_slice();
+		let prefix = &page[..torn_len];
+		assert!(
+			prefix.iter().any(|byte| *byte != 0),
+			"the torn prefix must differ from a zero hole"
+		);
+		let segments = named_segment_paths(dir);
+		assert_eq!(segments.len(), 1);
+		let bytes = std::fs::read(&segments[0]).unwrap();
+		assert!(
+			bytes.len() >= offset + torn_len,
+			"the segment must reach the torn prefix, has {} bytes",
+			bytes.len()
+		);
+		assert_eq!(
+			&bytes[offset..offset + torn_len],
+			prefix,
+			"the injected torn prefix must be on disk"
+		);
+		assert_ne!(
+			bytes.get(offset..offset + page.len()),
+			Some(page),
+			"the injected write must be torn, not complete"
+		);
+	}
+
 	fn named_segment_paths(dir: &Path) -> Vec<PathBuf> {
 		let mut out = std::fs::read_dir(dir)
 			.unwrap()
@@ -13715,9 +13751,11 @@ mod recovery_tests {
 		));
 		let append_err = store.blocking_append(vec![lease_entry(2, 10, 19, 2)]).await;
 		assert!(append_err.is_err(), "faulted append must fail");
+		assert_torn_prefix_on_disk(&dir, &lease_entry(2, 10, 19, 2), DIRECT_IO_ALIGN, 128);
 		drop(store);
 
 		file_ops.crash().unwrap();
+		assert_torn_prefix_on_disk(&dir, &lease_entry(2, 10, 19, 2), DIRECT_IO_ALIGN, 128);
 
 		let mut reopened =
 			open_store_with_faults(&dir, file_ops.clone(), (DIRECT_IO_ALIGN as u64) * 2).await;
@@ -13762,9 +13800,11 @@ mod recovery_tests {
 			.blocking_append(vec![lease_entry(1, 0, 9, 1), lease_entry(2, 10, 19, 2)])
 			.await;
 		assert!(append_err.is_err(), "faulted batch append must fail");
+		assert_torn_prefix_on_disk(&dir, &lease_entry(2, 10, 19, 2), DIRECT_IO_ALIGN, 128);
 		drop(store);
 
 		file_ops.crash().unwrap();
+		assert_torn_prefix_on_disk(&dir, &lease_entry(2, 10, 19, 2), DIRECT_IO_ALIGN, 128);
 
 		let mut reopened =
 			open_store_with_faults(&dir, file_ops.clone(), (DIRECT_IO_ALIGN as u64) * 3).await;
