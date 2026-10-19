@@ -26,6 +26,8 @@ mod command;
 #[allow(dead_code)]
 // Dormant committed-entry adapter; no production caller until reviewed integration.
 mod committed;
+// Offline, read-only compromise audit over the retained Control log; its one caller is the CLI.
+pub(crate) mod compromise;
 pub mod durable;
 #[allow(dead_code)] // Dormant entry-identity math; no production caller until reviewed integration.
 mod entry_identity;

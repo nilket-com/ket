@@ -13,6 +13,7 @@ use crate::storage::mutation_visibility::root2::command::{ApplyResult2, Command2
 use crate::storage::mutation_visibility::root2::committed::{
 	AdaptedEntry2, AdapterError2, CommittedSource2, committed_entry2,
 };
+use crate::storage::mutation_visibility::root2::compromise::Trace2;
 use crate::storage::mutation_visibility::root2::durable::mark_store::{
 	MarkIoError2, MarkStore2, MarkWrite2,
 };
@@ -50,6 +51,8 @@ struct Provisional2 {
 	monitor: ReplayMonitor2,
 	traversed: u64,
 	progress: Progress2,
+	// The offline compromise audit's per-entry record; never read by the fold itself.
+	trace: Option<Trace2>,
 }
 #[derive(Debug)]
 pub(in crate::storage::mutation_visibility::root2) enum Fault2 {
@@ -210,6 +213,17 @@ impl ReplayDriver2<'_> {
 		sources: &impl AcquisitionSources2,
 		caps: AcquisitionCaps2,
 	) -> Result<(Provisional2, PrefixValidated2), ReplayError2> {
+		self.compose_traced(reader, sources, caps, None).await
+	}
+	/// `compose`, with the offline audit's record riding the accumulator. The trace observes each
+	/// verified, reduced carrier; it never changes what the fold does or refuses.
+	async fn compose_traced<Rd: RaftLogReader<WendelonTypeConfig>>(
+		&self,
+		reader: &mut Rd,
+		sources: &impl AcquisitionSources2,
+		caps: AcquisitionCaps2,
+		trace: Option<Trace2>,
+	) -> Result<(Provisional2, PrefixValidated2), ReplayError2> {
 		let scope = PrefixRun2 { _scope: () };
 		let source = CommittedSource2::acquired(&scope);
 		let slot = RefCell::new(None);
@@ -219,6 +233,10 @@ impl ReplayDriver2<'_> {
 			caps,
 			|boundary| {
 				self.initialize(&source, boundary)
+					.map(|mut acc| {
+						acc.trace = trace;
+						acc
+					})
 					.map_err(|e| store_fault(&slot, e))
 			},
 			|mut acc: Provisional2, batch| {
@@ -271,6 +289,7 @@ impl ReplayDriver2<'_> {
 			monitor,
 			traversed: 0,
 			progress: Progress2::Replaying,
+			trace: None,
 		})
 	}
 	fn dispatch(
@@ -279,6 +298,10 @@ impl ReplayDriver2<'_> {
 		source: &CommittedSource2,
 		entry: &Entry<WendelonTypeConfig>,
 	) -> Result<(), Fault2> {
+		// The audit names the entry a refusal stops at; the fold never reads this.
+		if let Some(trace) = acc.trace.as_mut() {
+			trace.attempt(entry.log_id.index);
+		}
 		let adapted = committed_entry2(source, entry).map_err(Fault2::Adapt)?;
 		let committed = adapted.committed();
 		let (_, _, class) = committed.entry_fields();
@@ -286,16 +309,16 @@ impl ReplayDriver2<'_> {
 			return Err(Fault2::Carrier);
 		}
 		let state = if adapted.is_carrier() {
-			self.command(&acc.state, adapted)?
+			self.command(&acc.state, adapted, acc.trace.as_mut())?
 		} else {
 			match (origin_view2(&acc.state), class) {
 				(OriginView2::Empty, _) => pre_root(&acc.state, &committed)?,
 				(OriginView2::PreRoot { .. }, EntryClass2::Bootstrap(_)) => {
-					self.command(&acc.state, adapted)?
+					self.command(&acc.state, adapted, acc.trace.as_mut())?
 				}
 				(OriginView2::PreRoot { .. }, _) => pre_root(&acc.state, &committed)?,
 				(OriginView2::Root, EntryClass2::Bootstrap(_) | EntryClass2::OtherRoot2(_)) => {
-					self.command(&acc.state, adapted)?
+					self.command(&acc.state, adapted, acc.trace.as_mut())?
 				}
 				(OriginView2::Root, _) => {
 					let (next, result) =
@@ -318,6 +341,7 @@ impl ReplayDriver2<'_> {
 		&self,
 		state: &MutationAuthorityState2,
 		adapted: AdaptedEntry2<'_>,
+		trace: Option<&mut Trace2>,
 	) -> Result<MutationAuthorityState2, Fault2> {
 		let (committed, command, governance, context) = command_at(adapted)?;
 		if context
@@ -340,6 +364,24 @@ impl ReplayDriver2<'_> {
 				})?;
 		if matches!(result, ApplyResult2::AlreadyProcessed) {
 			return Err(Fault2::Internal);
+		}
+		if let Some(trace) = trace {
+			let (p, fingerprint, _) = committed.entry_fields();
+			let at = Log2 {
+				term: p.term,
+				node: p.node,
+				index: p.index,
+			};
+			trace.entry(
+				self.pin,
+				state,
+				at,
+				fingerprint,
+				&command,
+				governance,
+				&result,
+				&next,
+			);
 		}
 		Ok(next)
 	}
@@ -388,5 +430,7 @@ fn command_at<'e>(
 		Err(Fault2::NoCarrier)
 	}
 }
+// The offline compromise audit's fold over this dispatcher; it writes nothing.
+pub(in crate::storage::mutation_visibility::root2) mod audit;
 #[cfg(test)]
 mod tests;

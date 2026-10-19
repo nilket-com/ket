@@ -53,3 +53,5 @@ mod role_epochs;
 mod role_freeze;
 
 mod retirement;
+
+mod compromise;

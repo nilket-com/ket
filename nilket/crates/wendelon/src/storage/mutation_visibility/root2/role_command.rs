@@ -151,18 +151,30 @@ pub(super) fn verify_for(
 		if u64::from_le_bytes(array(bytes, at + 1)) != epoch {
 			return Ok(false);
 		}
-		let Ok(key) = VerifyingKey::from_bytes(&key) else {
-			return Ok(false);
-		};
-		if key
-			.verify_strict(
-				&preimage_for(bytes, expected, i, form)?,
-				&Signature::from_bytes(&array(bytes, at + 10)),
-			)
-			.is_err()
-		{
+		if !slot_signed(bytes, expected, i, form, &key)? {
 			return Ok(false);
 		}
 	}
 	Ok(true)
+}
+/// Slot `slot`'s strict signature under `key` over the form's canonical preimage: the one role
+/// proof signature check, shared by `verify_for` and the offline compromise audit (which supplies
+/// a historical epoch's key). It checks no role, epoch, presence or binding.
+pub(super) fn slot_signed(
+	bytes: &[u8],
+	expected: [u8; 2],
+	slot: usize,
+	form: RoleForm3,
+	key: &Digest2,
+) -> Result<bool, RoleProofError3> {
+	let Ok(key) = VerifyingKey::from_bytes(key) else {
+		return Ok(false);
+	};
+	let at = if slot == 0 { 76 } else { 150 };
+	Ok(key
+		.verify_strict(
+			&preimage_for(bytes, expected, slot, form)?,
+			&Signature::from_bytes(&array(bytes, at + 10)),
+		)
+		.is_ok())
 }

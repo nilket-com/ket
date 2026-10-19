@@ -152,18 +152,31 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 	let core = fs::read_to_string(root.join("src/schema/core.rs")).unwrap();
 	assert!(core.contains("SNAPSHOT_FORMAT_VERSION: u8 = 5"));
 	assert!(core.contains("WAL_FORMAT_VERSION: u8 = 5"));
-	fn visit(dir: PathBuf, module: &PathBuf) {
+	// The one admitted outside caller is the offline, read-only compromise audit CLI (ADR 0101
+	// C-S6): exactly one mention, its canonical import of the single audit entry point.
+	let audit_cli = root.join("src/cli/root2_audit.rs");
+	fn visit(dir: PathBuf, module: &PathBuf, audit_cli: &PathBuf) {
 		for entry in fs::read_dir(&dir).unwrap() {
 			let p = entry.unwrap().path();
 			if p == *module {
 				continue;
 			}
 			if p.is_dir() {
-				visit(p, module);
+				visit(p, module, audit_cli);
 			} else if p.extension().is_some_and(|e| e == "rs")
 				&& p.file_name().is_some_and(|n| n != "mod.rs")
 			{
-				let text = fs::read_to_string(p).unwrap();
+				let text = fs::read_to_string(&p).unwrap();
+				if p == *audit_cli {
+					assert_eq!(text.matches("storage::mutation_visibility").count(), 1);
+					assert!(
+						text.contains(
+							"\nuse crate::storage::mutation_visibility::root2::compromise::compromise_audit2;\n"
+						),
+						"the audit CLI names only the audit entry point"
+					);
+					continue;
+				}
 				assert!(
 					!text.contains("storage::mutation_visibility"),
 					"no production activation in slice A"
@@ -171,7 +184,47 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 			}
 		}
 	}
-	visit(root.join("src"), &module);
+	visit(root.join("src"), &module, &audit_cli);
+	// The audit module is crate-visible for that one import; its only crate-visible item is the
+	// entry point, the trace is root2-scoped, and its children stay private.
+	let root2_mod = fs::read_to_string(module.join("root2/mod.rs")).unwrap();
+	assert_eq!(root2_mod.matches("mod compromise;").count(), 1);
+	assert!(root2_mod.contains("\npub(crate) mod compromise;\n"));
+	assert!(!root2_mod.contains("use compromise::"));
+	let compromise =
+		syn::parse_file(&fs::read_to_string(module.join("root2/compromise.rs")).unwrap()).unwrap();
+	let mut visible = Vec::new();
+	for item in &compromise.items {
+		let (vis, name) = match item {
+			syn::Item::Fn(f) => (&f.vis, f.sig.ident.to_string()),
+			syn::Item::Mod(m) => (&m.vis, m.ident.to_string()),
+			syn::Item::Use(u) => (&u.vis, "use".to_string()),
+			syn::Item::Const(c) => (&c.vis, c.ident.to_string()),
+			syn::Item::Type(t) => (&t.vis, t.ident.to_string()),
+			syn::Item::Struct(_)
+			| syn::Item::Enum(_)
+			| syn::Item::Trait(_)
+			| syn::Item::Static(_) => {
+				panic!("compromise.rs: no types, traits or statics")
+			}
+			_ => continue,
+		};
+		if !matches!(vis, syn::Visibility::Inherited) {
+			assert!(
+				!matches!(vis, syn::Visibility::Public(_)),
+				"compromise.rs: no pub item"
+			);
+			visible.push(name);
+		}
+	}
+	assert_eq!(visible, ["use", "compromise_audit2"]);
+	assert!(compromise.items.iter().any(|i| matches!(i, syn::Item::Fn(f) if f.sig.ident == "compromise_audit2" && matches!(&f.vis, syn::Visibility::Restricted(r) if r.path.is_ident("crate")))));
+	assert!(
+		compromise
+			.items
+			.iter()
+			.any(|i| matches!(i, syn::Item::Use(u) if root2_scoped(&u.vis)))
+	);
 }
 
 #[test]
@@ -4748,6 +4801,11 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 		("role_freeze.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
 		("retirement.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
 		("role_command.rs", &["ManifestProfile2"]),
+		// C-S6: the audit decodes the operator's trusted manifest (profile 3 only) and pins it.
+		(
+			"compromise/binding.rs",
+			&["AnyAdminManifest2", "any_manifest_digest2"],
+		),
 	];
 	// The one new out-of-line test file is excluded only while its declaration is cfg(test).
 	let replay = syn::parse_file(&fs::read_to_string(root.join("replay.rs")).unwrap()).unwrap();
@@ -5052,6 +5110,11 @@ fn dormant_replay_owns_state_and_has_single_site_factories() {
 					.contains(&e.ident.to_string().as_str())
 				);
 			}
+			// C-S6: the one production child is the offline audit fold, root2-scoped and out of line.
+			syn::Item::Mod(m) if m.ident == "audit" => {
+				assert!(root2_scoped(&m.vis) && m.content.is_none());
+				assert!(m.attrs.iter().all(|a| !a.path().is_ident("cfg")));
+			}
 			syn::Item::Mod(m) => {
 				assert_eq!(m.ident, "tests");
 				assert!(m.attrs.iter().any(|a| matches!(&a.meta, syn::Meta::List(l) if l.path.is_ident("cfg") && l.tokens.to_string()=="test")));
@@ -5095,6 +5158,89 @@ fn dormant_replay_owns_state_and_has_single_site_factories() {
 	assert_eq!(production.matches("observe2(").count(), 1);
 	assert_eq!(production.matches("CommittedSource2::acquired(").count(), 1);
 	assert_eq!(production.matches("TrustedEntry2::bind(").count(), 1);
+	// C-S6: `compose` is `compose_traced` with no trace; the audit's record is set once at
+	// initialization and observed once, in `command`, after verification and the replay check.
+	assert_eq!(production.matches("compose_traced(").count(), 1);
+	assert!(production.contains("self.compose_traced(reader,sources,caps,None)"));
+	assert_eq!(production.matches("acc.trace=trace;").count(), 1);
+	assert_eq!(production.matches("trace.entry(").count(), 1);
+	// The audit also records which entry the dispatcher takes up, first thing in `dispatch`.
+	assert_eq!(production.matches("trace.attempt(").count(), 1);
+	let dispatch = fn_body(&text, "dispatch").replace(char::is_whitespace, "");
+	assert!(
+		dispatch.find("trace.attempt(entry.log_id.index)").unwrap()
+			< dispatch.find("committed_entry2(").unwrap()
+	);
+	let command = fn_body(&text, "command").replace(char::is_whitespace, "");
+	assert!(
+		command.find("advance_verified2(").unwrap()
+			< command.find("ApplyResult2::AlreadyProcessed").unwrap()
+			&& command.find("ApplyResult2::AlreadyProcessed").unwrap()
+				< command.find("trace.entry(").unwrap()
+	);
+	// The audit fold, the one production file below replay/: the shared driver from a provisioned
+	// baseline, then `run`'s closure and binding; no mark, factory, direct verifier call or write.
+	let mut below: Vec<_> = fs::read_dir(root.join("replay"))
+		.unwrap()
+		.map(|e| e.unwrap().file_name().into_string().unwrap())
+		.collect();
+	below.sort();
+	assert_eq!(below, ["audit.rs", "tests", "tests.rs"]);
+	let audit_text = fs::read_to_string(root.join("replay/audit.rs")).unwrap();
+	assert!(audit_text.lines().count() <= 150);
+	let audit = without_test_items_deep(audit_text.parse().unwrap())
+		.to_string()
+		.replace(' ', "");
+	for banned in [
+		"mark_store",
+		"MarkStore2",
+		"advance(",
+		"finish(",
+		"CommittedSource2",
+		"TrustedEntry2",
+		"advance_verified2",
+		"Replayed2",
+		"PrefixRun2",
+		"observe2",
+		"unsafe",
+		"spawn",
+		"std::fs",
+		"std::net",
+	] {
+		assert!(!audit.contains(banned), "replay/audit.rs: {banned}");
+	}
+	assert_eq!(audit.matches("Baseline2::Provisioned").count(), 1);
+	assert_eq!(audit.matches(".compose_traced(").count(), 1);
+	assert_eq!(audit.matches("Some(trace)").count(), 1);
+	let order = [
+		".compose_traced(",
+		"report.terminal_applied()",
+		"confirm_terminal2(&acc.state,pin)",
+		"install_admin2(&acc.state,pin)",
+		"acc.trace.ok_or(",
+	]
+	.map(|s| audit.find(s).expect(s));
+	assert!(order.windows(2).all(|w| w[0] < w[1]));
+	let (mut structs, mut impls, mut fns) = (Vec::new(), Vec::new(), Vec::new());
+	for item in syn::parse_file(&audit_text).unwrap().items {
+		match item {
+			syn::Item::Use(_) => {}
+			syn::Item::Struct(s) => {
+				assert!(matches!(s.vis, syn::Visibility::Inherited));
+				assert!(s.attrs.iter().all(|a| !a.path().is_ident("derive")));
+				structs.push(s.ident.to_string());
+			}
+			syn::Item::Impl(i) => impls.push(quote_type(&i.self_ty)),
+			syn::Item::Fn(f) => {
+				assert!(root2_scoped(&f.vis) && f.sig.asyncness.is_some());
+				fns.push(f.sig.ident.to_string());
+			}
+			_ => panic!("replay/audit.rs: unreviewed item"),
+		}
+	}
+	assert_eq!(structs, ["Retained2", "Scanned2"]);
+	assert_eq!(impls, ["Retained2", "Scanned2"]);
+	assert_eq!(fns, ["fold2"]);
 	let mut stack = vec![src];
 	let mut acquired = 0;
 	let mut bind = 0;
@@ -5326,6 +5472,9 @@ fn governance_command_envelope_is_pure_and_unwired() {
 				let helper = p == root.join("governance_verification.rs");
 				let shape = p == root.join("retirement_shape.rs");
 				let verifier = p == root.join("verification.rs");
+				// C-S6: the offline audit re-verifies a VISADG01 signature under the history's
+				// epoch-0 governance key: the structural parse and the preimage, once each.
+				let audit = p == root.join("compromise/attribution.rs");
 				let remaining = if verifier {
 					let import = "usecrate::storage::mutation_visibility::root2::governance_command::GovernanceCommandError2;";
 					assert_eq!(t.matches(import).count(), 1);
@@ -5361,7 +5510,13 @@ fn governance_command_envelope_is_pure_and_unwired() {
 						]
 						.contains(&name)) || (shape
 						&& ["parse_governance_command2", "GOVERNANCE_COMMAND_BYTES2"]
-							.contains(&name));
+							.contains(&name)) || (audit
+						&& [
+							"parse_governance_command2",
+							"governance_command_preimage2",
+							"root2::governance_command",
+						]
+						.contains(&name));
 					let typed_wrapper = verifier && name == "GovernanceCommandError2";
 					assert!(
 						permitted || typed_wrapper || !remaining.contains(name),
@@ -5371,6 +5526,12 @@ fn governance_command_envelope_is_pure_and_unwired() {
 				}
 				if shape {
 					assert_eq!(t.matches("parse_governance_command2(").count(), 1);
+				}
+				if audit {
+					assert_eq!(calls(&t, "parse_governance_command2"), 1);
+					assert_eq!(calls(&t, "governance_command_preimage2"), 1);
+					assert_eq!(t.matches("root2::governance_command").count(), 1);
+					assert!(t.contains("usecrate::storage::mutation_visibility::root2::governance_command::{governance_command_preimage2,parse_governance_command2,};"));
 				}
 				if helper {
 					assert_eq!(calls(&t, "parse_governance_command2"), 1);
