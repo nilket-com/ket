@@ -187,6 +187,14 @@ pub(in crate::storage::mutation_visibility::root2) struct OwnerDir2 {
 	poisoned: Option<IoStep2>,
 	format: DirectoryFormat2,
 }
+
+impl Drop for OwnerDir2 {
+	/// Unlock before the descriptor closes, so a concurrently forked child that
+	/// shares the open file description cannot extend the lock past this drop.
+	fn drop(&mut self) {
+		let _ = self.lock.unlock();
+	}
+}
 redacted_debug!(OwnerDir2, "OwnerDir2");
 
 mod directory;

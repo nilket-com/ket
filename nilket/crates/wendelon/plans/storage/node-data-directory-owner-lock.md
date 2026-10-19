@@ -156,4 +156,15 @@ Implementation of the lock surfaced pre-existing defects, now fixed in scope:
   - The daemon drains on SIGTERM as well as SIGINT.
 - **Supervisor escalation.** `nilket local` sends the stop signal to the child's process group, waits a bounded grace (2 × the timeout + 40 s), then SIGKILLs the group. Every child and reader wait is bounded, and exit 86 means "restart into recovery".
 
-**Lock semantics noted.** A fork in the same process duplicates every descriptor until the child execs, so a lock released while another thread is forking can stay held briefly. Acquisition then reports `DataDirectoryBusy`, which fails closed and never yields two owners. Tests that spawn processes therefore live in their own test binary (`tests/process_ownership.rs`), away from lock release and reacquire tests.
+**Fork window, fixed at the source.** A flock belongs to the open file description, which a concurrently forked child shares until it execs (`O_CLOEXEC` closes only the child's copy at exec). Closing the descriptor alone could therefore leave a released lock held briefly, so an immediate reacquire saw a spurious busy.
+
+The lock holders below now unlock explicitly (`LOCK_UN`) before closing, including on error paths after the lock is taken:
+- the data-directory owner;
+- `MarkStore2`;
+- `OwnerDir2`;
+- the Root2 local store, through a `LockedFile` guard, with `LocalAdapter::unlock_now` required of every adapter;
+- nilket's profile lock.
+
+redb and `nilket-local` already unlocked explicitly. This was the root cause of the parallel-only `mark_store` Busy defect candidate.
+
+Regression tests hold a child inside its fork-to-exec window for the data-directory owner, `MarkStore2` and `OwnerDir2`, and each fails without its fix. The local store and the nilket profile lock have the same fix but no dedicated fork-window test. Process-spawning ownership tests still live in their own test binary (`tests/process_ownership.rs`).

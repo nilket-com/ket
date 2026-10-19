@@ -110,3 +110,67 @@ fn a_disarmed_watchdog_never_fires() {
 		wendelon::shutdown_watchdog::ShutdownWatchdog::arm(std::time::Duration::from_secs(5));
 	watchdog.disarm();
 }
+
+/// Spawn a child that stays between fork and exec for `hold`, so it holds a
+/// copy of every descriptor this process has open. Returns once the child is
+/// inside that window; the join handle completes when the child has exec'd.
+fn hold_child_in_fork_window(
+	marker: std::path::PathBuf,
+	hold: std::time::Duration,
+) -> std::thread::JoinHandle<()> {
+	use std::os::unix::process::CommandExt;
+	let probe = marker.clone();
+	let thread = std::thread::spawn(move || {
+		let path = std::ffi::CString::new(probe.as_os_str().as_encoded_bytes()).unwrap();
+		let pause = libc::timespec {
+			tv_sec: hold.as_secs() as libc::time_t,
+			tv_nsec: hold.subsec_nanos() as libc::c_long,
+		};
+		let mut command = std::process::Command::new("true");
+		unsafe {
+			command.pre_exec(move || {
+				// Async-signal-safe only: open, close, nanosleep.
+				let fd = libc::open(path.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o600);
+				if fd < 0 {
+					return Err(std::io::Error::last_os_error());
+				}
+				libc::close(fd);
+				libc::nanosleep(&pause, std::ptr::null_mut());
+				Ok(())
+			});
+		}
+		command.status().unwrap();
+	});
+	// Bounded: a child that never reaches the marker fails the test, not hangs it.
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+	while !marker.exists() {
+		assert!(
+			!thread.is_finished(),
+			"child exited before reaching its fork window"
+		);
+		assert!(
+			std::time::Instant::now() < deadline,
+			"child never reached its fork window"
+		);
+		std::thread::yield_now();
+	}
+	thread
+}
+
+#[test]
+fn a_forked_child_cannot_extend_a_released_directory_lock() {
+	let dir = TestDir::new();
+	let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+	// Outside the data directory, which must otherwise hold only the sentinel.
+	let marker =
+		std::env::temp_dir().join(format!("wendelon-fork-marker-{}", uuid::Uuid::new_v4()));
+	let child = hold_child_in_fork_window(marker.clone(), std::time::Duration::from_secs(1));
+	// The child now shares the lock's open file description. Releasing the
+	// owner must still free the lock immediately, not when the child execs.
+	drop(owner);
+	let reacquired = DataDirectoryOwner::acquire_existing(dir.path())
+		.expect("a released lock is free even while a forked child holds the descriptor");
+	drop(reacquired);
+	child.join().unwrap();
+	let _ = std::fs::remove_file(marker);
+}

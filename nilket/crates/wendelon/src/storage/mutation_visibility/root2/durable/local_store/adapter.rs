@@ -24,6 +24,10 @@ pub(super) trait LocalAdapter: Send + Sync {
 	) -> std::io::Result<FileHandle>;
 	async fn length(&self, handle: &FileHandle) -> std::io::Result<u64>;
 	async fn lock(&self, handle: &FileHandle) -> std::io::Result<()>;
+	/// Release a lock taken by [`lock`](Self::lock) at once. Called on drop, so a
+	/// forked child sharing the descriptor cannot keep the lock alive. No default:
+	/// every adapter that can lock must say how it unlocks.
+	fn unlock_now(&self, handle: &FileHandle);
 	async fn space(&self, path: &Path) -> std::io::Result<Space>;
 }
 pub(super) struct LinuxAdapter;
@@ -124,6 +128,11 @@ impl LocalAdapter for LinuxAdapter {
 		})
 		.await
 	}
+	fn unlock_now(&self, handle: &FileHandle) {
+		unsafe {
+			libc::flock(handle.raw_fd(), libc::LOCK_UN);
+		}
+	}
 	async fn space(&self, path: &Path) -> std::io::Result<Space> {
 		use std::os::unix::ffi::OsStrExt;
 		let p = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid())?;
@@ -145,6 +154,25 @@ impl LocalAdapter for LinuxAdapter {
 pub(super) struct OwnedFile {
 	pub(super) handle: FileHandle,
 	pub(super) _permit: OwnedSemaphorePermit,
+}
+/// A locked file that unlocks explicitly before it closes, on every path: the
+/// store's drop and any error after the lock was taken.
+pub(super) struct LockedFile {
+	file: OwnedFile,
+	adapter: Arc<dyn LocalAdapter>,
+}
+impl LockedFile {
+	pub(super) fn new(file: OwnedFile, adapter: Arc<dyn LocalAdapter>) -> Self {
+		Self { file, adapter }
+	}
+	pub(super) fn file(&self) -> &OwnedFile {
+		&self.file
+	}
+}
+impl Drop for LockedFile {
+	fn drop(&mut self) {
+		self.adapter.unlock_now(&self.file.handle);
+	}
 }
 pub(super) struct Io {
 	materialized: std::sync::atomic::AtomicU64,

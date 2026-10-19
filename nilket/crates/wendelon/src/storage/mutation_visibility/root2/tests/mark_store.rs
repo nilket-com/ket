@@ -631,3 +631,21 @@ fn no_accidental_reset() {
 	let _plan = seam::plan(&[], None);
 	assert_eq!(reopen(&d), MarkOpen2::Confirmed(Baseline2::Mark(mark(5))));
 }
+
+#[test]
+fn a_forked_child_cannot_extend_a_dropped_store_lock() {
+	let d = dir("fork-window");
+	let held = open(&d);
+	let child = crate::test_support::hold_child_in_fork_window(
+		d.join(format!("fork-marker-{}", std::process::id())),
+		std::time::Duration::from_secs(1),
+	);
+	drop(held);
+	let reopened = MarkStore2::open(&d);
+	assert!(
+		reopened.is_ok(),
+		"a dropped store's lock is free while a forked child holds the descriptor"
+	);
+	drop(reopened);
+	child.join().unwrap();
+}

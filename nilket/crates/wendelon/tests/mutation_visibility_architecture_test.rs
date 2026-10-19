@@ -2749,6 +2749,45 @@ fn durable_mark_store_is_std_only_with_four_methods() {
 				"mark_store.rs exports fn {}",
 				f.sig.ident
 			),
+			// The one permitted trait impl: Drop for MarkStore2 whose body is exactly
+			// the explicit unlock, so a forked child sharing the lock's descriptor
+			// cannot keep it held past the drop. Anything else is still refused.
+			syn::Item::Impl(i)
+				if !cfg_test(&i.attrs)
+					&& i.trait_
+						.as_ref()
+						.is_some_and(|(_, path, _)| path.is_ident("Drop")) =>
+			{
+				assert_eq!(
+					quote_type(&i.self_ty),
+					"MarkStore2",
+					"mark_store.rs: Drop impl"
+				);
+				let only_unlock = |f: &syn::ImplItemFn| {
+					let [syn::Stmt::Local(local)] = f.block.stmts.as_slice() else {
+						return false;
+					};
+					let Some(init) = &local.init else {
+						return false;
+					};
+					let syn::Expr::MethodCall(call) = &*init.expr else {
+						return false;
+					};
+					let syn::Expr::Field(field) = &*call.receiver else {
+						return false;
+					};
+					matches!(&local.pat, syn::Pat::Wild(_))
+						&& call.method == "unlock"
+						&& call.args.is_empty()
+						&& matches!(&field.member, syn::Member::Named(name) if name == "_lock")
+						&& matches!(&*field.base, syn::Expr::Path(base) if base.path.is_ident("self"))
+				};
+				assert!(
+					i.items.len() == 1
+						&& matches!(&i.items[0], syn::ImplItem::Fn(f) if f.sig.ident == "drop" && only_unlock(f)),
+					"mark_store.rs: Drop must only unlock"
+				);
+			}
 			syn::Item::Impl(i) if !cfg_test(&i.attrs) => {
 				assert!(i.trait_.is_none(), "mark_store.rs: trait impl");
 				for it in &i.items {

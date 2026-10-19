@@ -112,7 +112,21 @@ struct OwnerState {
 	// A failed/cancelled close must retain LOCK even if the caller drops all
 	// external handles. Cleared only after drain and joins actually finish.
 	closing_pin: Option<Arc<OwnerInner>>,
-	lock: Option<File>,
+	lock: Option<HeldFlock>,
+}
+
+/// The flock'd sentinel. Dropping it unlocks explicitly before closing: a lock
+/// belongs to the open file description, which a concurrently forked child
+/// shares until it execs, so closing alone could leave the lock held briefly.
+struct HeldFlock(File);
+
+impl Drop for HeldFlock {
+	fn drop(&mut self) {
+		#[cfg(unix)]
+		unsafe {
+			libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.0), libc::LOCK_UN);
+		}
+	}
 }
 
 /// Admission for exactly one write operation. Move it into queued work and keep
@@ -486,6 +500,8 @@ fn acquire_lock(canonical: PathBuf) -> std::io::Result<DataDirectoryOwner> {
 	// Decided under the lock. A directory is fresh only if it holds nothing but
 	// the sentinel (and a leftover record temp file): a pre-existing data dir
 	// without a LOCK (an older build, or a lock removed by hand) is not fresh.
+	// Held from here: an error below must still unlock explicitly, not by close.
+	let file = HeldFlock(file);
 	let previous_shutdown_clean =
 		consume_clean_shutdown_record(&canonical)? || directory_is_fresh(&canonical)?;
 	Ok(DataDirectoryOwner {

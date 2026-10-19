@@ -96,6 +96,15 @@ pub(in crate::storage::mutation_visibility::root2) struct MarkStore2 {
 	corrupt_at_open: bool,
 	poisoned: Option<MarkStep2>,
 }
+
+impl Drop for MarkStore2 {
+	/// Unlock before the descriptor closes: a forked child shares the open file
+	/// description until it execs, so closing alone could keep the lock held and
+	/// make an immediate reopen report Busy.
+	fn drop(&mut self) {
+		let _ = self._lock.unlock();
+	}
+}
 redacted_debug!(MarkStore2, "MarkStore2");
 
 enum Disk {
