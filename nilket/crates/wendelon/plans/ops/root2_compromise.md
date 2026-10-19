@@ -30,10 +30,11 @@ for that replica to apply further, or pick another replica, and run again. Store
 past the stop are counted in `uncommitted_past_stop` and never audited.
 
 The audit is offline and read-only. It opens every Control artifact read-only, never
-repairs or truncates a torn tail, writes nothing and takes no data-directory owner lock.
-Run it against a stopped node's directory, or a filesystem snapshot or copy taken while
-the node is stopped. A run beside a live node is best-effort: re-run any exit 1 or 3 from
-a live directory on a quiesced copy before acting on it.
+repairs or truncates a torn tail, writes nothing to the data directory and takes no
+data-directory owner lock. Run it against a stopped node's directory, or a filesystem
+snapshot or copy taken while the node is stopped. A run beside a live node is
+best-effort: re-run any exit 1 or 3 from a live directory on a quiesced copy before
+acting on it.
 
 ### The audit command
 
@@ -74,6 +75,40 @@ suspect identity (`activated_at`, `superseded_at`, `retired_at`, `freeze_interva
 | 4 | unresolved or ambiguous suspect key | check the key file against the root's history |
 
 Text is never status: act on the exit code and the record's `status`.
+
+### Context export (C-S6b)
+
+```text
+wendelon audit root2 <data-dir> --trusted-manifest <manifest-file> \
+    [suspects as above] --export-context <out> --node-id <n>
+```
+
+- Writes the root's context export for the offline custody tool: the bound context, the
+  manifest, the reducer's freeze, transition and retirement state, the stop, and every
+  successor's committed rotation command, sidecar and activation LogId. It is evidence, not
+  trust: the custody tool re-verifies the successor chain against your trusted manifest.
+- `--node-id` is required with `--export-context`: the node id from that node's config. It
+  is a label, never verified.
+- With `--export-context` the suspect set may be empty; rows are then unmarked and the
+  coverage record has no containment objects. `--suspect-only` still needs a suspect.
+- `<out>` must not exist, its name must be one file name not starting with
+  `.wrctxexp.tmp.`, and its directory must not be the data directory or inside it (checked
+  by identity through symlinks and `..`). A bad path is exit 2 before anything is read.
+  The data directory is identified again just before the file is written; a swapped
+  directory is exit 2.
+- Not detected (a non-goal): a bind mount of a data-directory *subdirectory* used as the
+  output directory, since `..` from the mount leads away from the data directory. Never
+  write the export through a mount of anything inside the data directory: put `<out>` on a
+  filesystem that holds no data directory, because an export through a bind-mounted
+  data-directory subdirectory would add a file inside the data directory.
+- The file is written only on exit 0, before any row is printed, mode 0600. On exits 1-4,
+  or any write failure (exit 2, nothing on stdout), there is no file at `<out>`. If
+  printing the rows fails after the file was written, the file is removed (exit 2), but
+  only if `<out>` still holds that same file; anything else found there is left in place
+  and named in the diagnostic. A swap in the instant between that check and the removal
+  is not excluded; do not modify `<out>`'s directory while the tool runs.
+- After a crash or kill mid-write, delete any `.wrctxexp.tmp.*` file left in `<out>`'s
+  directory. The tool never reads or reuses one.
 
 ### Reviewing rows
 
