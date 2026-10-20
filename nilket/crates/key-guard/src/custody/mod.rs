@@ -6,7 +6,10 @@
 //!   created whole or not at all, never overwriting. Every mutation needs the directory's lock.
 //! - [`SecretBuf`] is a fixed-capacity heap buffer, best-effort mlocked, zeroed before it is freed.
 //! - [`Terminal`] reads a secret from `/dev/tty` with echo off and restores the terminal on every
-//!   return, error and unwind.
+//!   return, error and unwind; [`install_terminal_restore_hook`] restores it on a panic too, which
+//!   matters where panics abort and no destructor runs.
+//! - [`CustodyDir::names`] lists a directory through its handle, and [`CustodyLock::leftover_temps`]
+//!   reports the temp files a crashed creation left.
 //! - [`harden_process`] and [`non_loopback_interfaces_up`] serve the tool's process and host
 //!   checks.
 //!
@@ -22,12 +25,14 @@ mod test_dir;
 mod tests;
 mod tty;
 
+#[cfg(any(test, feature = "fixture-anchor"))]
+pub use crate::custody::dir::open_custody_dir_anchored;
 pub use crate::custody::dir::{CustodyDir, CustodyLock, open_custody_dir};
 pub use crate::custody::memory::{SecretBuf, lock_memory, unlock_memory};
 pub use crate::custody::process::{
 	core_dump_limit, harden_process, is_dumpable, non_loopback_interfaces_up,
 };
-pub use crate::custody::tty::{MAX_SECRET_LEN, Terminal};
+pub use crate::custody::tty::{MAX_SECRET_LEN, Terminal, install_terminal_restore_hook};
 
 /// Why a custody object was refused. A refusal never changes the object (G1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +75,9 @@ pub enum Refusal {
 		mode: u32,
 	},
 	AncestryTooDeep,
+	/// A move target that is neither the locked directory nor a direct child of it, so the lock
+	/// would not cover the move.
+	OutsideLock,
 }
 
 impl std::fmt::Display for Refusal {
@@ -94,6 +102,12 @@ impl std::fmt::Display for Refusal {
 				)
 			}
 			Self::AncestryTooDeep => write!(f, "its ancestry is too deep"),
+			Self::OutsideLock => {
+				write!(
+					f,
+					"it is neither the locked directory nor a direct child of it"
+				)
+			}
 		}
 	}
 }

@@ -22,3 +22,11 @@ windows-sys = { version = "0.61", features = [
 	"Win32_System_Pipes",
 	"Win32_System_Threading",
 ] }
+
+[features]
+# Downstream test fixtures only: the custody ancestor walk may end at an anchor directory. Only
+# wendelon-key's dev-dependencies may enable it (pinned by tests/fixture_anchor_feature.rs).
+fixture-anchor = []
+
+[dev-dependencies]
+serde_json = "1"

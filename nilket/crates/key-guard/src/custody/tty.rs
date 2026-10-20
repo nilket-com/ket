@@ -2,16 +2,20 @@
 //! canonical mode and terminal-generated signals off.
 //!
 //! The saved terminal settings are restored when the guard drops: on return, on error and on
-//! unwind. Because `ISIG` is off, the INTR, QUIT and SUSP characters arrive as bytes; they end
-//! the read as [`CustodyError::Interrupted`] after the restore, instead of killing the process
-//! with echo off. A fatal signal sent by another process is not caught (stated limit; `stty sane`
-//! recovers the terminal). Erase, kill and end-of-file are handled here, since canonical mode is
-//! off. Passphrase policy (UTF-8, NFC, length) belongs to the caller.
+//! unwind, and by [`install_terminal_restore_hook`] on a panic that aborts, where no guard drops.
+//! Because `ISIG` is off, the INTR, QUIT and SUSP characters arrive as bytes; they end the read as
+//! [`CustodyError::Interrupted`] after the restore, instead of killing the process with echo off.
+//! A fatal signal sent by another process is not caught (stated limit; `stty sane` recovers the
+//! terminal). Erase, kill and end-of-file are handled here, since canonical mode is off. Passphrase
+//! policy (UTF-8, NFC, length) belongs to the caller.
 use crate::custody::memory::SecretBuf;
 use crate::custody::{CustodyError, sys};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, Once, TryLockError};
+use std::thread::ThreadId;
 
 #[cfg(test)]
 mod tests;
@@ -69,10 +73,84 @@ impl Terminal {
 	}
 }
 
+/// One terminal held quiet by an engaged guard: a duplicate of its handle and the settings to
+/// restore, keyed by the guard and tagged with the thread that engaged it.
+struct Engaged {
+	guard: u64,
+	thread: ThreadId,
+	file: File,
+	saved: libc::termios,
+}
+
+/// Every terminal an engaged guard holds quiet right now, for the panic hook (G12).
+static ENGAGED: Mutex<Vec<Engaged>> = Mutex::new(Vec::new());
+static NEXT_GUARD: AtomicU64 = AtomicU64::new(0);
+static HOOK: Once = Once::new();
+
+/// Installs, once per process, a panic hook that restores the terminals engaged guards hold
+/// quiet and then runs the previous hook. Release builds abort on a panic without running any
+/// destructor, so there this hook is the only restore a panic gets (G12). Call it at startup.
+pub fn install_terminal_restore_hook() {
+	HOOK.call_once(|| {
+		let previous = std::panic::take_hook();
+		std::panic::set_hook(Box::new(move |info| {
+			restore_engaged(cfg!(panic = "abort"));
+			previous(info);
+		}));
+	});
+}
+
+/// Restores the terminals the panicking thread engaged, or every engaged terminal when the panic
+/// aborts the process. Under unwinding another thread's guard is still live and restores its own
+/// terminal; touching it here would turn echo back on in the middle of its read. The list is held
+/// only for a push, a removal or this loop, so the wait for it is bounded; if it is still held
+/// after a second (a panic inside one of those), the restore is skipped rather than deadlock.
+/// Returns how many were restored.
+pub(crate) fn restore_engaged(aborting: bool) -> usize {
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+	let engaged = loop {
+		match ENGAGED.try_lock() {
+			Ok(engaged) => break engaged,
+			Err(TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+			Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+				std::thread::sleep(std::time::Duration::from_millis(1));
+			}
+			Err(TryLockError::WouldBlock) => return 0,
+		}
+	};
+	let here = std::thread::current().id();
+	let mut restored = 0;
+	for e in engaged.iter().filter(|e| aborting || e.thread == here) {
+		if sys::tcsetattr(&e.file, &e.saved).is_ok() {
+			restored += 1;
+		}
+	}
+	restored
+}
+
+fn engaged() -> std::sync::MutexGuard<'static, Vec<Engaged>> {
+	ENGAGED
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Removes guard `id`'s registration; its duplicate handle closes with it.
+pub(crate) fn deregister(id: u64) {
+	engaged().retain(|e| e.guard != id);
+}
+
+/// Whether guard `id` is registered.
+#[cfg(test)]
+pub(crate) fn registered(id: u64) -> bool {
+	engaged().iter().any(|e| e.guard == id)
+}
+
 /// Echo, canonical mode, `ISIG` and `IEXTEN` off until drop, which restores the saved settings.
+/// While engaged, the terminal is registered for the panic hook.
 pub(crate) struct EchoOff<'a> {
 	file: &'a File,
 	pub(crate) saved: libc::termios,
+	pub(crate) id: Option<u64>,
 }
 
 impl<'a> EchoOff<'a> {
@@ -84,7 +162,22 @@ impl<'a> EchoOff<'a> {
 		quiet.c_cc[libc::VTIME] = 0;
 		sys::tcsetattr(file, &quiet).map_err(CustodyError::io("/dev/tty: tcsetattr"))?;
 		// From here the guard restores `saved` on every exit, including the refusal below.
-		let guard = Self { file, saved };
+		let mut guard = Self {
+			file,
+			saved,
+			id: None,
+		};
+		let duplicate = file
+			.try_clone()
+			.map_err(CustodyError::io("/dev/tty: duplicate"))?;
+		let id = NEXT_GUARD.fetch_add(1, Ordering::Relaxed);
+		engaged().push(Engaged {
+			guard: id,
+			thread: std::thread::current().id(),
+			file: duplicate,
+			saved,
+		});
+		guard.id = Some(id);
 		let now = sys::tcgetattr(file).map_err(CustodyError::io("/dev/tty: tcgetattr"))?;
 		if !is_quiet(&now) {
 			return Err(CustodyError::io("/dev/tty: tcsetattr")(
@@ -98,6 +191,9 @@ impl<'a> EchoOff<'a> {
 impl Drop for EchoOff<'_> {
 	fn drop(&mut self) {
 		let _ = sys::tcsetattr(self.file, &self.saved);
+		if let Some(id) = self.id {
+			deregister(id);
+		}
 	}
 }
 

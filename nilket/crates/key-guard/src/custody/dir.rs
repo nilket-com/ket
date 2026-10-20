@@ -14,9 +14,10 @@
 //! overwritten (G2). EINVAL from `renameat2` refuses; there is no plain-rename fallback.
 use crate::custody::sys;
 use crate::custody::{CustodyError, Refusal};
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fs::{File, Metadata, OpenOptions, Permissions};
 use std::io::{ErrorKind, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,14 +32,15 @@ const MAX_DEPTH: usize = 4096;
 static TEMPS: AtomicU64 = AtomicU64::new(0);
 
 /// Where the ancestor walk ends. Production code can only name `/`; a fixture anchor exists only
-/// under `cfg(test)` and is unreachable from the public API (pinned in `custody::tests`).
+/// under `cfg(test)` or the `fixture-anchor` feature, which no shipped build enables (pinned in
+/// `custody::tests` and `tests/fixture_anchor_feature.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Stop(Option<(u64, u64)>);
 
 impl Stop {
 	const ROOT: Stop = Stop(None);
 
-	#[cfg(test)]
+	#[cfg(any(test, feature = "fixture-anchor"))]
 	fn at(anchor: (u64, u64)) -> Stop {
 		Stop(Some(anchor))
 	}
@@ -235,6 +237,21 @@ pub fn open_custody_dir(path: &Path) -> Result<CustodyDir, CustodyError> {
 	open_dir_path(path, Stop::ROOT)
 }
 
+/// Downstream test fixtures only (feature `fixture-anchor`, which no shipped build enables): the
+/// production open, except that the ancestor walk also ends at the directory `anchor`, so a
+/// fixture under a group-writable tree can be admitted. Every check below the anchor is unchanged,
+/// and an anchor that is not an ancestor changes nothing.
+#[cfg(any(test, feature = "fixture-anchor"))]
+pub fn open_custody_dir_anchored(path: &Path, anchor: &Path) -> Result<CustodyDir, CustodyError> {
+	let what = anchor.display().to_string();
+	let meta =
+		std::fs::symlink_metadata(anchor).map_err(CustodyError::io(format!("{what}: anchor")))?;
+	if !meta.is_dir() {
+		return Err(refused(&what, Refusal::NotDirectory));
+	}
+	open_dir_path(path, Stop::at((meta.dev(), meta.ino())))
+}
+
 fn open_dir_path(path: &Path, stop: Stop) -> Result<CustodyDir, CustodyError> {
 	let what = path.display().to_string();
 	let dir = OpenOptions::new()
@@ -330,6 +347,15 @@ impl CustodyDir {
 		Self::admit(dir, what, self.stop)
 	}
 
+	/// Every entry name, sorted, read through the handle (G9). No entry is opened, so a FIFO
+	/// cannot block the listing; `.` and `..` are left out.
+	pub fn names(&self) -> Result<Vec<OsString>, CustodyError> {
+		let mut names = sys::read_dir_names(&self.dir)
+			.map_err(CustodyError::io(format!("{}: list", self.what)))?;
+		names.sort();
+		Ok(names)
+	}
+
 	/// Takes the exclusive lock every mutation needs. Another holder, including an earlier guard on
 	/// this same handle, makes this `Busy`; it never waits.
 	pub fn lock(&self) -> Result<CustodyLock<'_>, CustodyError> {
@@ -366,6 +392,38 @@ impl CustodyLock<'_> {
 		dir.dir
 			.sync_all()
 			.map_err(CustodyError::io(format!("{}: directory fsync", dir.what)))
+	}
+
+	/// The temp files a creation left behind when it died between its temp create and its rename
+	/// (G10). Under the lock no custody operation is between the two, so every one listed is a
+	/// leftover. They are reported, never removed: no custody name can open them.
+	pub fn leftover_temps(&self) -> Result<Vec<OsString>, CustodyError> {
+		Ok(self
+			.dir
+			.names()?
+			.into_iter()
+			.filter(|name| name.as_bytes().starts_with(TEMP_PREFIX.as_bytes()))
+			.collect())
+	}
+
+	/// The lock's scope (G11): `to` is the locked directory itself or a direct child of it, by
+	/// the identity of its `..`.
+	fn within_scope(&self, to: &CustodyDir) -> Result<(), CustodyError> {
+		if to.identity == self.dir.identity {
+			return Ok(());
+		}
+		let up = sys::openat(
+			&to.dir,
+			c"..",
+			libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+			0,
+		)
+		.map_err(CustodyError::io(format!("{}: parent", to.what)))?;
+		if facts(&up, &to.what)?.identity() == self.dir.identity {
+			Ok(())
+		} else {
+			Err(refused(&to.what, Refusal::OutsideLock))
+		}
 	}
 
 	/// Publishes `bytes` under the new name `name`, whole or not at all (G2).
@@ -433,14 +491,15 @@ impl CustodyLock<'_> {
 		}
 	}
 
-	/// Moves the custody file `name` to `to_name` in `to` (this directory or one of its
-	/// subdirectories), never replacing anything there.
+	/// Moves the custody file `name` to `to_name` in `to`, never replacing anything there. `to`
+	/// must be this directory or a direct child of it, so this lock covers the move (G11).
 	pub fn move_file(
 		&self,
 		name: &str,
 		to: &CustodyDir,
 		to_name: &str,
 	) -> Result<(), CustodyError> {
+		self.within_scope(to)?;
 		let from = self.dir;
 		self.dir.open_checked(name, libc::O_RDONLY, None)?;
 		let what = from.child(name);
