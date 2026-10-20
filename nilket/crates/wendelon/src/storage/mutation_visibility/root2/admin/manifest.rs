@@ -640,10 +640,23 @@ impl AdminManifestThree3 {
 	pub(in crate::storage::mutation_visibility::root2) fn encode(
 		&self,
 	) -> AdminResult2<[u8; ADMIN_MANIFEST_P3_BYTES3]> {
+		// `check_three` covers every base check, so the base layout is written here directly.
 		check_three(self)?;
+		let base = &self.base;
 		let mut b = [0; ADMIN_MANIFEST_P3_BYTES3];
-		b[..137].copy_from_slice(&self.base.encode()?);
+		b[0..8].copy_from_slice(MAGIC);
+		b[8..10].copy_from_slice(&1u16.to_le_bytes());
 		b[10..12].copy_from_slice(&3u16.to_le_bytes());
+		b[12..28].copy_from_slice(&base.generation);
+		b[28..44].copy_from_slice(&base.cluster);
+		b[44..52].copy_from_slice(&base.initial_epoch.to_le_bytes());
+		b[52..68].copy_from_slice(&base.admin_id);
+		b[68..100].copy_from_slice(&base.admin_key);
+		b[100..104].copy_from_slice(&ACTIONS.to_le_bytes());
+		b[104..112].copy_from_slice(&base.namespace.tenant.to_le_bytes());
+		b[112] = base.namespace.scope as u8;
+		b[113..129].copy_from_slice(&base.namespace.table);
+		b[129..137].copy_from_slice(&base.namespace.schema.to_le_bytes());
 		b[137..153].copy_from_slice(&self.governance.id);
 		b[153..185].copy_from_slice(&self.governance.key);
 		b[185..189].copy_from_slice(&GOVERNANCE_ACTIONS.to_le_bytes());

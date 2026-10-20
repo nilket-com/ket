@@ -5,10 +5,8 @@
 //! the issuer gate and the recovery monitor. Placing the manifest file beside the export is fixture
 //! setup (the owner manifest-export gap stays open). A propagation test only: `Ready` is that
 //! monitor's verdict, not L readiness.
-use super::profile_two_binding::{
-	ADMISSION_SEED_B, GOVERNANCE_SEED_B, enrolled, exact_pin, grant, manifest_bytes, pre_root,
-	reduce_at, rooted,
-};
+use super::profile_three_fixture::{enrolled, exact_pin, grant, pre_root, reduce_at, rooted};
+use super::profile_two_binding::{ADMISSION_SEED_B, GOVERNANCE_SEED_B, manifest_bytes};
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
 	AnyAdminManifest2, ManifestProfile2,

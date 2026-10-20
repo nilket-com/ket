@@ -1,6 +1,5 @@
 //! Coverage, outcomes and the read-only path: A4, A5, A6, A7, A11, A12, and the binding refusals.
 use super::support::*;
-use super::wire;
 use crate::consensus::raft_storage::read_only_fixture::{
 	record_len, write_segment, write_snapshot,
 };
@@ -204,23 +203,9 @@ fn binding_refusals_are_invalid_and_inputs_are_typed() {
 	let dirs = r.write(None);
 	// Another valid profile-3 manifest (a different recovery key): not the one this log installed.
 	let foreign = dirs.inputs.join("other.bin");
-	let alternate = {
-		use crate::storage::mutation_visibility::root2::admin::manifest::{
-			AdminManifestThree3, GovernanceRole2, RecoveryRole3,
-		};
-		let mut base = wire::Fixture::new("b").any.admission().clone();
-		base.admin_key = key(11);
-		AdminManifestThree3::new(
-			base,
-			GovernanceRole2::new([0xd2; 16], key(12)).unwrap(),
-			RecoveryRole3::new([0xd3; 16], key(14)).unwrap(),
-		)
-		.unwrap()
-		.encode()
-		.unwrap()
-		.to_vec()
-	};
-	std::fs::write(&foreign, &alternate).unwrap();
+	let alternate =
+		crate::storage::mutation_visibility::root2::tests::profile_three_fixture::M3_SIBLING;
+	std::fs::write(&foreign, alternate).unwrap();
 	let out = audit_with(&dirs.data, &foreign, &suspects(&[(ADMIN, 0)]));
 	check_outcome(&out);
 	assert_eq!(

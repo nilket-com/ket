@@ -9,20 +9,8 @@ pub(super) struct F {
 }
 impl F {
 	pub(super) fn new() -> Self {
-		let old = wire::Fixture::new("b");
-		let mut base = old.any.admission().clone();
-		base.admin_key = key(11);
-		let m = AdminManifestThree3::new(
-			base,
-			GovernanceRole2::new([0xd2; 16], key(12)).unwrap(),
-			RecoveryRole3::new([0xd3; 16], key(13)).unwrap(),
-		)
-		.unwrap()
-		.encode()
-		.unwrap()
-		.to_vec();
 		Self {
-			f: wire::Fixture::from_manifest(m),
+			f: wire::Fixture::profile_three(&crate::storage::mutation_visibility::root2::tests::profile_three_fixture::M3_PRIMARY),
 		}
 	}
 	pub(super) fn root(&self) -> &Root2 {

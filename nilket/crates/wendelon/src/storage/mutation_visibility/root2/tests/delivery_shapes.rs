@@ -14,7 +14,8 @@
 use super::owner_tuple_delivery::{
 	INVENTORY, MANIFEST, Scratch, delivered, identity_of, read_at, read_delivered, reserved,
 };
-use super::profile_two_binding::{manifest_bytes, rooted};
+use super::profile_three_fixture::rooted;
+use super::profile_two_binding::manifest_bytes;
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin_install::observe_bootstrap2;

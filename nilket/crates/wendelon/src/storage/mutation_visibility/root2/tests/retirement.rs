@@ -227,7 +227,7 @@ fn retired_uniform_command_matrix_both_paths() {
 	for name in ["command_reserve", "command_finalize"] {
 		let mut f = F::new();
 		f.retire([3, 0]);
-		denied(f.terminal(super::support::command(name), None), 25);
+		denied(f.terminal(crate::storage::mutation_visibility::root2::tests::profile_three_fixture::s1_command(name), None), 25);
 	}
 	for epoch in [false, true] {
 		let mut f = F::new();
@@ -254,8 +254,12 @@ fn retired_structural_sidecar_refusals_precede25() {
 	let mut f = F::new();
 	f.retire([3, 0]);
 	for c in [
-		super::support::command("command_bootstrap"),
-		super::support::command("command_cover_blank"),
+		crate::storage::mutation_visibility::root2::tests::profile_three_fixture::s1_command(
+			"command_bootstrap",
+		),
+		crate::storage::mutation_visibility::root2::tests::profile_three_fixture::s1_command(
+			"command_cover_blank",
+		),
 	] {
 		let entry = super::super::trust::TrustedEntry2::fixture(
 			f.f.dep.generation,

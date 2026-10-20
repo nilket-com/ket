@@ -4,9 +4,6 @@
 //! role and epoch and the seed that signs it, so a stale or forged signer is explicit.
 use super::wire;
 use crate::consensus::raft_storage::read_only_fixture;
-use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AdminManifestThree3, GovernanceRole2, RecoveryRole3,
-};
 use crate::storage::mutation_visibility::root2::admin_install::{
 	InstalledAdmin2, admin_context2, admin_namespace2, install_admin2,
 };
@@ -55,19 +52,9 @@ pub(super) struct Root {
 }
 impl Root {
 	pub(super) fn new() -> Self {
-		let old = wire::Fixture::new("b");
-		let mut base = old.any.admission().clone();
-		base.admin_key = key(11);
-		let manifest = AdminManifestThree3::new(
-			base,
-			GovernanceRole2::new([0xd2; 16], key(12)).unwrap(),
-			RecoveryRole3::new([0xd3; 16], key(13)).unwrap(),
-		)
-		.unwrap()
-		.encode()
-		.unwrap()
-		.to_vec();
-		let f = wire::Fixture::from_manifest(manifest);
+		let f = wire::Fixture::profile_three(
+			&crate::storage::mutation_visibility::root2::tests::profile_three_fixture::M3_PRIMARY,
+		);
 		let admin = install_admin2(&f.state, &f.pin).unwrap();
 		Self {
 			f,

@@ -5,23 +5,18 @@
 //! verified builders are test-only FIXTURES; the checked paths they feed are the published ones.
 //! Manifests come from the independent M2 vectors; entry fingerprints and command digests are
 //! Rust-derived through those fixtures.
+use super::profile_three_fixture::{
+	Chain, chain_of, enrolled, exact_pin, genesis, grant, reduce_at,
+};
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AnyAdminManifest2, ManifestProfile2, admin_manifest_digest2, admin_manifest_two_digest2,
+	AnyAdminManifest2, ManifestProfile2,
 };
-use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::admin_command::*;
 use crate::storage::mutation_visibility::root2::admin_install::*;
 use crate::storage::mutation_visibility::root2::admin_statement::*;
-use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
 use crate::storage::mutation_visibility::root2::origin::*;
-use crate::storage::mutation_visibility::root2::provisioning::inventory::{
-	LogState2, RootEntry2, RootIdentity2, RootState2,
-};
 use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::*;
-use crate::storage::mutation_visibility::root2::provisioning::snapshot::encode_snapshot2;
-use crate::storage::mutation_visibility::root2::trust::CommittedEntry2;
-use crate::storage::mutation_visibility::root2::types::{AuthorityRef2, NodeRef2};
 use crate::storage::mutation_visibility::root2::validation::admission_permission;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
@@ -30,9 +25,6 @@ fn unhex(s: &str) -> Vec<u8> {
 		.step_by(2)
 		.map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
 		.collect()
-}
-fn hash(b: &[u8]) -> Digest2 {
-	crate::storage::mutation_visibility::root2::codec::hash(b"", b)
 }
 /// Independent M2 manifests: "a" profile 1 (admin seed 0x21); "b" profile 2 (admin seed 0x42,
 /// governance seed 0x92).
@@ -46,112 +38,8 @@ pub(super) fn manifest_bytes(name: &str) -> Vec<u8> {
 pub(super) const ADMISSION_SEED_A: u8 = 0x21;
 pub(super) const ADMISSION_SEED_B: u8 = 0x42;
 pub(super) const GOVERNANCE_SEED_B: u8 = 0x92;
-fn genesis() -> Digest2 {
-	let v: serde_json::Value =
-		serde_json::from_str(include_str!("statement_vectors.json")).unwrap();
-	unhex(v["genesis"].as_str().unwrap()).try_into().unwrap()
-}
-fn at(term: u64, node: u32, index: u64) -> EntryPosition2 {
-	EntryPosition2 { term, node, index }
-}
-/// The digest over the exact supplied manifest bytes, by length.
-pub(super) fn exact_pin(bytes: &[u8]) -> Digest2 {
-	match bytes.len() {
-		137 => admin_manifest_digest2(bytes.try_into().unwrap()),
-		189 => admin_manifest_two_digest2(bytes.try_into().unwrap()),
-		241 => crate::storage::mutation_visibility::root2::codec::hash(
-			b"VISROOT2-ADMIN-MANIFEST\0",
-			bytes,
-		),
-		n => panic!("no canonical length {n}"),
-	}
-}
-pub(super) fn pre_root() -> MutationAuthorityState2 {
-	let first = CommittedEntry2::fixture(at(0, 0, 0), genesis(), EntryClass2::Membership);
-	let s = advance_pre_root2(&empty_authority2(), &first).unwrap().0;
-	let one = CommittedEntry2::fixture(at(1, 1, 1), [1; 32], EntryClass2::NonRoot2);
-	advance_pre_root2(&s, &one).unwrap().0
-}
-/// One coherent chain: a FIXTURE-rooted state, its observation, the owner-approved record, the
-/// snapshot, its pins and the validated Bound tuple, all derived from this exact command.
-pub(super) struct Chain {
-	pub any: AnyAdminManifest2,
-	pub cmd: Command2,
-	pub entry: TrustedEntry2,
-	pub committed: CommittedEntry2,
-	pub rooted: MutationAuthorityState2,
-	pub tuple: PinnedBoundTuple2,
-}
-/// FIXTURE: root `pre_root` with this Bootstrap through the test-only always-authorized token.
-pub(super) fn rooted(
-	bytes: &[u8],
-	length: u64,
-) -> (
-	Command2,
-	TrustedEntry2,
-	CommittedEntry2,
-	MutationAuthorityState2,
-) {
-	let m = AnyAdminManifest2::decode(bytes).unwrap();
-	let a = m.admission();
-	let cmd = Command2::Bootstrap {
-		epoch: a.initial_epoch,
-		control: exact_pin(bytes),
-		length,
-	};
-	let e = TrustedEntry2::fixture(a.generation, a.cluster, l(2), &cmd).unwrap();
-	let (_, _, _, fp, d) = e.fields();
-	let v = VerifiedCommand2::fixture(a.generation, a.cluster, &cmd, &[], 0).unwrap();
-	let ce = CommittedEntry2::fixture(at(1, 1, 2), fp, EntryClass2::Bootstrap(d));
-	let s = bootstrap2(&pre_root(), &ce, &e, &v, &cmd).unwrap().0;
-	(cmd, e, ce, s)
-}
 pub(super) fn chain(name: &str, length: u64) -> Chain {
 	chain_of(&manifest_bytes(name), length)
-}
-pub(super) fn chain_of(bytes: &[u8], length: u64) -> Chain {
-	let bytes = bytes.to_vec();
-	let any = AnyAdminManifest2::decode(&bytes).unwrap();
-	let pin = exact_pin(&bytes);
-	let (cmd, entry, committed, rooted) = rooted(&bytes, length);
-	let observation = observe_bootstrap2(&rooted).unwrap();
-	let record = BootstrapRecord2 {
-		identity: observation.identity,
-		inventory_seq: 2,
-	};
-	let a = any.admission();
-	let snapshot = encode_snapshot2(&LogState2 {
-		roots: vec![RootEntry2 {
-			terminal: None,
-			identity: RootIdentity2 {
-				generation: a.generation,
-				cluster: a.cluster,
-				pin,
-				admin_key: a.admin_key,
-			},
-			manifest: any.clone(),
-			state: RootState2::Bound,
-			last_seq: 2,
-			record: Some(record),
-		}],
-		last_seq: 2,
-	})
-	.unwrap();
-	let tuple = validate_replica_tuple2(&ReplicaInputs2 {
-		manifest: Some(&bytes),
-		manifest_pin: Some(&pin),
-		snapshot: Some(&snapshot),
-		inventory_pin: Some(&hash(&snapshot)),
-	})
-	.unwrap();
-	Chain {
-		any,
-		cmd,
-		entry,
-		committed,
-		rooted,
-		tuple,
-	}
 }
 /// The published non-length conjuncts of `bootstrap_authorized`, restated test-side.
 pub(super) fn non_length_conjuncts(c: &Chain) -> [bool; 5] {
@@ -167,83 +55,6 @@ pub(super) fn non_length_conjuncts(c: &Chain) -> [bool; 5] {
 		r.genesis_fingerprint == genesis(),
 		*control == tuple_manifest_pin2(&c.tuple),
 	]
-}
-fn authority() -> AuthorityRef2 {
-	AuthorityRef2 {
-		id: [0x41; 16],
-		revision: 1,
-	}
-}
-/// FIXTURE: a rooted state with authority 0x41 rev 1 enrolled at (1,1,3).
-pub(super) fn enrolled(
-	rooted: &MutationAuthorityState2,
-	any: &AnyAdminManifest2,
-) -> MutationAuthorityState2 {
-	let a = any.admission();
-	let cmd = Command2::EnrollAuthority {
-		authority: authority(),
-		node: NodeRef2 {
-			node: 7,
-			incarnation: [0x17; 16],
-		},
-		key: [0x2B; 32],
-	};
-	let e = TrustedEntry2::fixture(a.generation, a.cluster, l(3), &cmd).unwrap();
-	let v = VerifiedCommand2::fixture(a.generation, a.cluster, &cmd, &[], 0).unwrap();
-	advance_root2(rooted, &e, &v, &cmd).unwrap().0
-}
-/// A Grant for authority 0x41 in the administrator's exact context and namespace, signed with
-/// `seed` over the published preimage.
-pub(super) fn grant(admin: &InstalledAdmin2, seed: u8) -> Command2 {
-	let ctx = admin_context2(admin);
-	let ns = admin_namespace2(admin);
-	let key = PermissionKey2 {
-		authority: authority(),
-		namespace: AdmissionNamespace2 {
-			generation: ctx.generation,
-			tenant: ns.tenant,
-			scope: ns.scope,
-			table: ns.table,
-			schema: ns.schema,
-		},
-	};
-	let unsigned = encode_admin_statement2(AdminAction2::Grant, &key, &ctx, &[0; 64]).unwrap();
-	let preimage = admin_statement_preimage2(&unsigned).unwrap();
-	let signature = SigningKey::from_bytes(&[seed; 32])
-		.sign(&preimage)
-		.to_bytes();
-	Command2::AdmissionPermission(
-		encode_admin_statement2(AdminAction2::Grant, &key, &ctx, &signature).unwrap(),
-	)
-}
-pub(super) fn reduce_at(
-	state: &MutationAuthorityState2,
-	admin: &InstalledAdmin2,
-	cmd: &Command2,
-	index: u64,
-) -> Result2<ApplyResult2> {
-	let ctx = admin_context2(admin);
-	let e = TrustedEntry2::fixture(ctx.generation, ctx.cluster, l(index), cmd).unwrap();
-	let v = VerifiedCommand2::fixture(ctx.generation, ctx.cluster, cmd, &[], 0).unwrap();
-	Root2::reduce_admission(state, admin, &e, &v, cmd).map(|(_, r)| r)
-}
-/// The gate's expected context, rebuilt test-side from a state.
-pub(super) fn expected_context(state: &MutationAuthorityState2) -> AdminContext2 {
-	let (root, origin) = root_and_origin2(state).unwrap();
-	let s = &root.state;
-	AdminContext2 {
-		generation: s.generation,
-		cluster: s.cluster,
-		installed_at: s.bootstrap,
-		bootstrap_fingerprint: origin.bootstrap_fingerprint,
-		bootstrap_command: origin.bootstrap_command,
-		genesis: origin.genesis,
-		initial_epoch: s.initial_epoch,
-		manifest_pin: s.control_digest,
-	}
-}
-pub(super) fn control_len(state: &MutationAuthorityState2) -> u64 {
-	root_and_origin2(state).unwrap().0.state.control_len
 }
 pub(super) const PROFILES: [(&str, u64, u64); 2] = [("a", 137, 189), ("b", 189, 137)];
 

@@ -7,7 +7,7 @@
 //! profile-2 constructors; the root, tuple and token builders are test-only FIXTURES, and the
 //! selector/authority/lineage/Reserve commands are the independent `reserve_vectors.json`. The
 //! profile-1 path stays `admission_reserve` (control).
-use super::profile_two_binding::{Chain, chain_of};
+use super::profile_three_fixture::{Chain, chain_of};
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
 	AdminManifest2, AdminManifestTwo2, GovernanceRole2,

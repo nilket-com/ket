@@ -6,7 +6,8 @@
 //! anchor: it does not prove a replica deployment or an operator copy. The intended-root binding
 //! is C's and install's (against the committed root), distinct from the tuple's own-key entry
 //! selection, which the wrong-context case shows passing before C and install refuse.
-use super::profile_two_binding::{exact_pin, expected_context, manifest_bytes, pre_root, rooted};
+use super::profile_three_fixture::{exact_pin, expected_context, pre_root, rooted};
+use super::profile_two_binding::manifest_bytes;
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
 	AnyAdminManifest2, ManifestProfile2,
