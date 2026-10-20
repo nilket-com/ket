@@ -335,6 +335,7 @@ Plan only. This section authorizes no source changes.
 This slice is library only. It adds no binary and no signing.
 - **One shared verifier core.** `role_command::verify_for`'s slot loop becomes `verify_core(context_digest, active, …)`, and `verify_for` becomes a wrapper over it. The production verifier still calls `verify_strict` exactly once, through `slot_signed`.
 - **One role view.** The four checkers (`verify_core`, `check_epoch_statement3`, `check_admin_statement2` and `check_governance_command2`) read a `RoleView3 { context, profile, admin_key, namespace, governance: Option<GovernanceRole2>, active: Option<[(u64, Digest2); 3]> }`. Each checker's body is unchanged apart from how it reads these fields: the profile gate, verification under the manifest `admin_key` for VISADS02, and the epoch-0 refusals stay as they are today.
+  - Amended by the profile-3-only plan (K7 amendment below): from its sub-slice d, `RoleView3 { context, admin_key, namespace, governance: GovernanceRole2, active: [(u64, Digest2); 3] }`, five fields with no `Option` and no `profile`; the profile gate goes with profiles 1/2.
   - Production obtains it from `InstalledAdmin2::view()`, which copies those fields one-for-one.
   - The offline facade obtains it from `RoleView3::offline(context, manifest, verified_history)`.
   - A `RoleView3` cannot produce a `VerifiedCommand2`, and `verification.rs` obtains views only through `install_admin2`.
@@ -351,6 +352,7 @@ This slice is library only. It adds no binary and no signing.
 ### Acceptance
 
 - **T-VIEW:** every profile 1/2/3 vector gives identical results through `InstalledAdmin2` and `view()`. Control: altering `profile`, `admin_key`, `active[0]`, `namespace` and `governance` in turn each changes at least one result.
+  - Amended by the profile-3-only plan: from its sub-slice c2, T-VIEW runs profile-3 vectors only; the `profile` alteration is deleted, `with_governance(None)` becomes another governance key, and each remaining alteration still changes a result.
 - **T-K7:** the full cell matrix in contract §5, single and two-slot (merged) VISROL03, the governance family with both sidecars, VISADS02, VISADS03, plus the refused cells. Each accepted cell passes `self_check`, the production verifier and the reducer. Controls: a flipped preimage byte, the wrong role alternative, and an altered command digest are each refused. The action-bit check is exercised on a test-only `RoleView3` whose governance mask lacks the action's bit (built under `cfg(test)` only, never through the public facade), and `self_check` refuses. An architecture pin asserts that the facade's governance VISROL03 path calls the same action-bit predicate as `verify_governance2`.
 - **Merge:** refusals for mismatched commands or contexts, a slot overwritten, an invalid first slot, and a layout differing from the rebuilt one.
 - **Context reader:** the C-S6b T-X2 refusals, now through the production reader. `count = 0` verifies with `context_authenticated = false`.
@@ -362,3 +364,79 @@ This slice is library only. It adds no binary and no signing.
 - `impl: adr 0101 key custody operator proof facade`.
 
 Gate order: independent source review → ladder → log audit → FF.
+
+## ADR 0100 Root2 profile-3-only plan
+
+### Status
+
+Plan only. This section authorizes no source changes beyond its own test-only corpus.
+- Contract: `/home/me/work/.agent-bridge/wendelon-root2-profile3-only-contract-r5/CONTRACT.md` (r5, accepted). It is slice P3 of the Root → Root2 cutover, before live activation. Census: `de4c86ee2`.
+- It amends the K7 text above (see "K7 amendment").
+
+### Decisions (operator and coordinator, 2026-10-19)
+
+- A pre-release reset with no migration. Every root is profile 3 and bootstraps with a 241-byte manifest committed by its own pin (`control_len` 241).
+- Removed: profiles 1 (137 B) and 2 (189 B); class-0 roots (`control_len` 0); owner directory v1 (`DirectoryFormat2::One`, VISIEV02, VISREP03); plain Retire; snapshot v2 and v1 with entries; the frozen old-reader copies; VISADC01 (D-C1, the facade refusal stays pinned).
+- Kept: state V4 (an unrotated root), V5 and V6; VISADS02/03, VISADG01, VISROL03; directory v2; snapshot v1 (empty only, D-S1), v3 and v4; VISTRM03; the bootstrap record profile word 1.
+- An unmarked owner directory is refused even when empty, as `Unformatted` (D-O1).
+- The S1 goldens keep their names. Their contents are replaced in b3: committed to the new `M3_S1` manifest, with the parent lineage renumbered by +1 from index 4 for an admitting permission (D-G1). The S1c oracle compares through a permission-stripping projection (D-G2).
+- `ManifestProfile2` is deleted, `AnyAdminManifest2` collapses, and the profile-only `Option` fields of `InstalledAdmin2` and `RoleView3` become non-optional (D-T1, d).
+- D-G3: the published test-only seeds are in `R/tests/statement_seeds.rs`: administrator `[0xe1; 32]` (public `25fc32c4…cb78`), governance `[0xe2; 32]` (`c91cb3ce…3e9f`), recovery `[0xe3; 32]` (`4dd9b649…f226`). They sign only for `M3_S1`, `M3_KAT` and `M3_KAT_FOREIGN`. VISADS02 over `M3_PRIMARY` keeps the seed `[11; 32]`.
+- D-K1 (cross-root uniqueness of all three role keys) is a follow-up contract after d.
+
+### Laws
+
+- **P1, one admin form per codec.** Each codec accepts exactly its one form and refuses every other with the contract's typed error at the contract's step (§3). The bootstrap record word stays 1.
+- **P2, lineage unchanged.** V4 → V5 → V6 behave as today; `control_len` other than 241 is `ControlClass`.
+- **P3, no profile-3 behaviour change.** Every kept golden is byte-identical in input and outcome, except the C-S6 message below and `errors[5]` (`ProfileLength` → `UnsupportedProfile`). After a, profile-3 suites never read S1-family bytes.
+- **P4, no loosened guard.** Each architecture pin is narrowed with a probe or deleted under §13.1. The 241 gates stay as tested invariants.
+- **P5, no lost refusal.** Every refusal branch of a kept codec that only profile-1/2, class-0 or v1-directory fixtures cover is ported to profile 3 or directory v2 first, with the same typed error at the same step (the v1-twin rule; R-PIN for the renumbered S1 tests).
+
+### Removed-forms corpus
+
+`R/tests/removed_forms.json` holds the exact bytes of N1-N15 (28 rows), each with its SHA-256, source (vector file and key, or a derivation for N7 and the N14 lengths 137/189) and today's outcome. `R/tests/removed_forms.rs` asserts every outcome holds today and that the file digest is:
+
+`3244bfa6faa088ec63f8433c3faff0b1a8b31747d61fbd5f8dc3bab0884b9f89`
+
+The bytes were copied from the existing vectors with `python3 -I`, outside the repository. In c1 (N4-N12) and c2 (N1-N3, N13-N15) each row flips to its §12.2 typed refusal against an accepted twin, and the digest is re-asserted.
+
+Today the v2 event codec is reachable from R/tests only through `OwnerDir2`, so N9 and N10 are asserted through a v2 directory fold and export.
+
+### Sub-slices
+
+Each is one commit by Joel, through review → ladder → audit → FF.
+
+| # | Commit | Content |
+|---|---|---|
+| a | `impl: adr 0100 root2 profile three fixtures` | neutral `profile_three_fixture` module (`M3_PRIMARY`, `M3_OTHER`, `M3_SIBLING`, `M3_S1`, `M3_KAT`, `M3_KAT_FOREIGN`), manifest base inline, S1 reads frozen; no behaviour change |
+| b1 | `impl: adr 0100 root2 profile three admin coverage` | admin, root and verification ports; the KAT port; the bootstrap length conjunct; T-INV |
+| b2 | `impl: adr 0100 root2 profile three provisioning coverage` | provisioning ports on directory v2; N16 |
+| b3 | `impl: adr 0100 root2 s1 goldens governed` | S1 twins, T-FAMILY, R-PIN, D-G2 |
+| c1 | `impl: adr 0100 root2 profile three provisioning only` | provisioning removals; corpus N4-N12 flip |
+| c2 | `impl: adr 0100 root2 profile three only` | manifest and class-0 removals; corpus N1-N3, N13-N15 flip; completion gate green |
+| d | `impl: adr 0100 root2 profile three types` | `Option` collapse and the K7 pin to five fields |
+
+Recorded R0 assay boards are not comparable across b3: registry usage grows by one permission per parent-lineage root, and encoded digests change.
+
+### Completion gate (green at the end of c2)
+
+From `nilket/crates/wendelon`, contract §16.1, with `removed_forms.{rs,json}` excluded:
+- G1 (removed identifiers, `"a"`/`"b"` and old fixture names), G2 (137/189 literals other than manifest-layout offsets), G3 (length 0 and class 0) and G4 (v1 directory and plain Retire) print nothing.
+- G1-A prints only the tombstone list of `manifest_codec_census_is_exact_and_dormant`.
+- G5 (`VISIEV02`) prints exactly: the marked + VISIEV02 → `ForeignFormat` check in `provisioning/owner_log/directory.rs`, the new architecture pin and its probe, and the T-O1 literal in `provisioning/tests/profile_three.rs`.
+- G6 is `R/tests/state_blob_gate.rs` (c2): every V4/V5/V6 blob in every R JSON file except the corpus has `control_len` 241. Today's census is 29 blobs in 8 files: `goldens.json` 9 (0), `origin_vectors.json` 1 (0), `gate_vectors.json` 1 (137), `root_profile_vectors.json` 1 (137), `role_epochs/vectors.json` 2, `role_freeze/vectors.json` 3, `retirement/vectors.json` 4, `retirement/owner_binding/vectors.json` 8 (241). c2 records the counts after the `p3_` replacements.
+
+Plus the full root2 suite (also at 8 threads; a parallel-only failure is a defect candidate), the wendelon lib, and the architecture and MV tests.
+
+### K7 amendment
+
+The key custody slice 3 "One role view" and T-VIEW bullets above are amended in place: from d, `RoleView3` has five non-optional fields and no `profile`; from c2, T-VIEW is profile 3 only. The architecture pin moves to the same five fields in d, with probes for a re-inserted `Option`, a sixth field and the pin text. Key custody contract r4 (`/home/me/work/.agent-bridge/wendelon-adr0101-key-custody-contract-r4/CONTRACT.md`) disagreed with itself: four fields at line 156 and six at line 161. Five resolves it.
+
+### C-S6 message
+
+From c2, a 137- or 189-byte trusted manifest is refused with "the trusted manifest does not decode as an administrator manifest" (`compromise/binding.rs:63`), not "…is not a profile-3 manifest" (`:65`). The exit code (2) is unchanged. No runbook quotes the old text.
+
+### Commits and gate order
+
+- `plan: adr 0100 root2 profile three only` (this section, the K7 amendment, the corpus and its test, the D-G3 seeds). The crate architecture and MV tests pass before FF.
+- Then a, b1, b2, b3, c1, c2, d, in that order.
