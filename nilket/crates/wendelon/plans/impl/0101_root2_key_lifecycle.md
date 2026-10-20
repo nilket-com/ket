@@ -536,3 +536,63 @@ These are review findings that KG cannot settle alone. Slice 5 must meet each on
 - `impl: adr 0101 key custody guard functions and secret handling`.
 
 Gate order: independent source review → ladder → log audit → FF.
+
+## Key custody slice 5a plan: guard amendments for the key tool
+
+### Status
+
+Plan only. This section authorizes no source changes.
+- Contract: key custody r4 (`/home/me/work/.agent-bridge/wendelon-adr0101-key-custody-contract-r4/CONTRACT.md`), §2 K2 and K3, and the coordinator rulings in `IMPL-NOTES.md` next to it (slice 5 split; D-a).
+- Slice 4 (KG) is on the branch. This slice settles the three "Slice 5 obligations" recorded in the slice 4 section, and adds the test route D-a chose.
+- Slice 5 is split into 5a (this section), 5b (the `wendelon-key` crate without signing), 5c (`build`, `sign`, `sign-statement`, `merge`) and 5d (containment, D-21). Each has its own plan, impl, review, ladder, audit and FF.
+
+### Behavior
+
+Key-guard only. No wendelon source changes.
+- **Directory entries.** `CustodyDir::names()` lists the directory through its handle (`openat(fd, ".")`, `fdopendir`, `readdir`), never by path. It opens no entry, so a FIFO cannot block it. `CustodyLock::leftover_temps()` returns the entries that carry the temp prefix `.wrolekey.tmp.`. It exists only on the lock, because under the lock no other custody operation can be between its temp create and its rename. The tool reports leftovers; nothing removes them (G1).
+- **Lock scope.** `CustodyLock::move_file` refuses with `Refusal::OutsideLock` unless the target directory is the locked directory itself or a direct child of it. A child is decided by identity: `openat(to, "..")` must have the locked directory's `(dev, ino)`. A grandchild or an unrelated custody directory is refused, so one lock covers every move.
+- **Terminal restore on panic.** Release builds use `panic = "abort"`, so no destructor runs on a panic. While an `EchoOff` guard is engaged, its saved settings and a duplicate of the terminal handle are registered in a process-wide list, and the guard's drop removes them. `install_terminal_restore_hook()` installs a panic hook that restores every registered terminal and then calls the previous hook. The panic hook runs before the abort. The hook uses `try_lock`, so a panic while the list is locked skips the restore instead of deadlocking. A fatal signal from another process is still not caught (the existing stated limit).
+- **Fixture anchor (D-a).** A key-guard cargo feature `fixture-anchor` gates `open_custody_dir_anchored(path, anchor)`. It is the production open, except that the ancestor walk also ends at the anchor directory's `(dev, ino)`. Fixtures of a downstream crate under a group-writable tree (`/home/me/work` is 0775) need it. It is not in `default`. Only `wendelon-key`'s `[dev-dependencies]` may enable it. Resolver 3 does not unify dev-dependency features into a non-test build, so no shipped binary links the anchored open.
+
+### Algebra
+
+- **Identity.** A directory is its `(dev, ino)` from the checked handle (unchanged). An entry is one name read through that handle. A move target is admitted by the identity of its `..`, never by a path.
+- **Owner.** The effective uid (unchanged). The terminal-restore list is owned by the process, and its entries by the guard that registered them.
+- **Keys.** The mutation key is still the top-level directory's lock. The lock-scope law makes it the only key: every move stays within the locked directory or one level below it.
+- **Laws.**
+  - **G9, listing is inert.** Listing opens no entry and changes nothing.
+  - **G10, leftovers are reported under the lock and never removed.**
+  - **G11, one lock covers a move.** The target is the locked directory or its direct child.
+    - Limit: a holder of only a child's lock can race a move into that child made under the parent's lock. This is harmless: both sides publish only through create-new names (`RENAME_NOREPLACE`, `O_EXCL`), so the loser gets `Exists` and nothing is overwritten. The tool always takes the parent's lock first.
+  - **G12, a panic restores the terminal** when the hook is installed and the list is not locked. Otherwise the existing stated limit applies.
+  - **G13, the anchor is not shipped.** The anchored open exists only under `cfg(test)` or the `fixture-anchor` feature. No normal or build dependency edge enables the feature, no package feature forwards it, and only `wendelon-key`'s dev edge may enable it.
+- **Visibility.** Entry names and the restore list carry no secret bytes. A name is not a secret.
+
+### Tests (each with a negative control)
+
+| Test | Checks | Negative control |
+|---|---|---|
+| T-ENT | `names()` lists files, subdirectories, a FIFO (without blocking) and a non-UTF-8 name, and excludes `.` and `..` | an empty directory lists nothing |
+| T-LEFT | a planted `.wrolekey.tmp.` file is reported by `leftover_temps()` and still present afterwards | after only `create_file`, nothing is reported |
+| T-SCOPE | a move into a grandchild, a sibling custody directory, and the parent of the locked directory are refused as `OutsideLock`, and the file stays | a move into the locked directory itself and into a direct child succeeds |
+| T-PANIC | with the hook installed, a guard forgotten (simulating abort) and a panic on another thread restores the pty's settings | with no restore, a forgotten guard leaves echo off |
+| T-PANIC list | the drop of a guard removes its registration; the abort branch restores every registered terminal, whichever thread engaged it | while engaged, the registration is present; the unwinding branch leaves another thread's terminal quiet |
+| T-ANCHOR | the anchored open admits a fixture whose group-writable ancestor lies above the anchor | the production open refuses the same fixture with `AncestorWritable` |
+| T-FEATURE | over `cargo metadata --no-deps --offline`: no workspace package enables `key-guard/fixture-anchor` on a normal or build edge, no package feature forwards it (also through a renamed dependency), `key-guard`'s `default` does not hold it, and only `wendelon-key` may enable it on a dev edge | synthetic metadata with a normal edge, a forwarding feature, a feature forwarded through a renamed dependency, a default entry, and a dev edge from another package each fail; a `wendelon-key` dev edge passes |
+
+The source pins are amended equally strict, and each new rule is probed:
+- The anchor pin admits the stop's anchor constructor only under the exact attribute `#[cfg(any(test, feature = "fixture-anchor"))]`, and outside test files only the anchored open calls it.
+- The anchored open and its re-export carry the same exact attribute.
+- Every `unsafe` stays in `sys.rs` with a `SAFETY` comment.
+
+### Dependencies
+
+- `serde_json` 1 becomes a key-guard dev-dependency for T-FEATURE. It is already in `Cargo.lock`, and dev-dependencies do not enter the daemon graph.
+- There is no new normal dependency, and no crate is new to the workspace.
+
+### Commits and gate order
+
+- `plan: adr 0101 key custody guard amendments for the key tool` (this section). The arch and MV checks pass before FF.
+- `impl: adr 0101 key custody guard amendments for the key tool`.
+
+Gate order: independent source review → ladder → log audit → FF.
