@@ -1,6 +1,9 @@
 //! T-TTY over a pseudo-terminal: the line is read with no echo, and the terminal settings are
 //! identical afterwards on success, error, interruption and panic.
-use crate::custody::tty::{EchoOff, MAX_SECRET_LEN, Terminal, is_quiet};
+use crate::custody::tty::{
+	EchoOff, MAX_SECRET_LEN, Terminal, deregister, install_terminal_restore_hook, is_quiet,
+	registered, restore_engaged,
+};
 use crate::custody::{CustodyError, sys};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -63,6 +66,7 @@ const SECRET: &[u8] = b"correct horse battery staple";
 
 #[test]
 fn a_line_is_read_without_echo_and_the_terminal_is_restored() {
+	let _serial = serial();
 	let (result, shown, restored) = entry(b"correct horse battery staple\r", 64);
 	assert_eq!(result.unwrap(), SECRET);
 	assert!(
@@ -75,6 +79,7 @@ fn a_line_is_read_without_echo_and_the_terminal_is_restored() {
 
 #[test]
 fn with_echo_on_the_master_sees_the_typed_bytes() {
+	let _serial = serial();
 	// Control for the echo probe above: the same pty with its default settings echoes.
 	let (master, slave) = sys::open_pty().unwrap();
 	assert_ne!(sys::tcgetattr(&slave).unwrap().c_lflag & libc::ECHO, 0);
@@ -87,6 +92,7 @@ fn with_echo_on_the_master_sees_the_typed_bytes() {
 
 #[test]
 fn erase_and_kill_edit_the_line() {
+	let _serial = serial();
 	let (result, _, restored) = entry(b"wrong\x15ab\xc3\xa9X\x7f\x7fc\n", 64);
 	assert_eq!(result.unwrap(), b"abc");
 	assert!(restored);
@@ -94,6 +100,7 @@ fn erase_and_kill_edit_the_line() {
 
 #[test]
 fn the_interrupt_character_ends_entry_after_restoring_the_terminal() {
+	let _serial = serial();
 	for abort in [b'\x03', b'\x1c', b'\x1a'] {
 		let (result, _, restored) = entry(&[b'a', b'b', abort], 64);
 		assert!(
@@ -106,6 +113,7 @@ fn the_interrupt_character_ends_entry_after_restoring_the_terminal() {
 
 #[test]
 fn end_of_file_on_an_empty_line_ends_entry_and_restores_the_terminal() {
+	let _serial = serial();
 	let (result, _, restored) = entry(b"\x04", 64);
 	assert!(
 		matches!(result, Err(CustodyError::EndOfInput)),
@@ -116,6 +124,7 @@ fn end_of_file_on_an_empty_line_ends_entry_and_restores_the_terminal() {
 
 #[test]
 fn an_overlong_line_is_refused_without_its_bytes_and_restores_the_terminal() {
+	let _serial = serial();
 	let (result, _, restored) = entry(b"correct horse battery staple\n", 8);
 	let error = result.unwrap_err();
 	assert!(
@@ -130,6 +139,7 @@ fn an_overlong_line_is_refused_without_its_bytes_and_restores_the_terminal() {
 
 #[test]
 fn a_panic_while_echo_is_off_restores_the_terminal() {
+	let _serial = serial();
 	let (_master, slave) = sys::open_pty().unwrap();
 	let before = sys::tcgetattr(&slave).unwrap();
 	let unwound = std::panic::catch_unwind(|| {
@@ -143,6 +153,7 @@ fn a_panic_while_echo_is_off_restores_the_terminal() {
 
 #[test]
 fn a_source_that_is_not_a_terminal_is_refused_and_a_terminal_is_admitted() {
+	let _serial = serial();
 	let dir = crate::custody::test_dir::TestDir::new("kg-tty");
 	let file = File::create(dir.join("plain")).unwrap();
 	assert!(matches!(
@@ -161,6 +172,7 @@ fn a_source_that_is_not_a_terminal_is_refused_and_a_terminal_is_admitted() {
 
 #[test]
 fn settings_count_as_quiet_only_with_echo_canonical_mode_and_signals_all_off() {
+	let _serial = serial();
 	let (_master, slave) = sys::open_pty().unwrap();
 	let mut quiet = sys::tcgetattr(&slave).unwrap();
 	quiet.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
@@ -180,6 +192,7 @@ fn settings_count_as_quiet_only_with_echo_canonical_mode_and_signals_all_off() {
 
 #[test]
 fn a_larger_max_is_capped_at_the_secret_limit() {
+	let _serial = serial();
 	let limit = MAX_SECRET_LEN;
 	let line = |len: usize| [vec![b'k'; len], b"\r".to_vec()].concat();
 	let (result, _, restored) = entry(&line(limit + 1), usize::MAX);
@@ -192,4 +205,116 @@ fn a_larger_max_is_capped_at_the_secret_limit() {
 	let (result, _, restored) = entry(&line(limit), usize::MAX);
 	assert_eq!(result.unwrap().len(), limit);
 	assert!(restored);
+}
+
+/// Registrations a probe thread's forgotten guard left, removed after the thread ends.
+static LEAKED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// Engages echo off on a fresh pty in a new thread, forgets the guard there (as an abort would:
+/// no destructor runs) and panics. With `keep_registration` false the registration is removed
+/// first, which is what a process without the restore list would have. Returns whether the pty
+/// is still quiet afterwards.
+fn forgotten_guard_then_panic(keep_registration: bool) -> bool {
+	install_terminal_restore_hook();
+	let (_master, slave) = sys::open_pty().unwrap();
+	let before = sys::tcgetattr(&slave).unwrap();
+	assert!(!is_quiet(&before));
+	let file = slave.try_clone().unwrap();
+	let thread = std::thread::spawn(move || {
+		let guard = EchoOff::engage(&file).unwrap();
+		let id = guard.id.expect("an engaged guard is registered");
+		if keep_registration {
+			LEAKED.lock().unwrap().push(id);
+		} else {
+			deregister(id);
+		}
+		std::mem::forget(guard);
+		assert!(is_quiet(&sys::tcgetattr(&file).unwrap()));
+		panic!("a probe panic with echo off");
+	});
+	assert!(thread.join().is_err(), "the probe thread panicked");
+	let after = sys::tcgetattr(&slave).unwrap();
+	for id in LEAKED.lock().unwrap().drain(..) {
+		deregister(id);
+	}
+	if is_quiet(&after) {
+		return true;
+	}
+	assert!(same(&before, &after), "restored to the saved settings");
+	false
+}
+
+#[test]
+fn the_panic_hook_restores_a_terminal_whose_guard_never_dropped() {
+	let _serial = serial();
+	assert!(
+		!forgotten_guard_then_panic(true),
+		"the hook restored the pty"
+	);
+}
+
+#[test]
+fn without_its_registration_a_forgotten_guard_leaves_echo_off() {
+	let _serial = serial();
+	assert!(
+		forgotten_guard_then_panic(false),
+		"nothing restored the pty"
+	);
+}
+
+#[test]
+fn a_guard_is_registered_while_engaged_and_deregistered_by_its_drop() {
+	let _serial = serial();
+	let (_master, slave) = sys::open_pty().unwrap();
+	let guard = EchoOff::engage(&slave).unwrap();
+	let id = guard.id.unwrap();
+	assert!(registered(id));
+	drop(guard);
+	assert!(!registered(id));
+}
+
+#[test]
+fn an_unwinding_panic_never_restores_another_threads_terminal() {
+	let _serial = serial();
+	install_terminal_restore_hook();
+	let (_master, slave) = sys::open_pty().unwrap();
+	let guard = EchoOff::engage(&slave).unwrap();
+	let other = std::thread::spawn(|| panic!("a panic on another thread"));
+	assert!(other.join().is_err());
+	// This thread's guard is live; the other thread's panic left its terminal quiet.
+	assert!(is_quiet(&sys::tcgetattr(&slave).unwrap()));
+	drop(guard);
+	assert!(!is_quiet(&sys::tcgetattr(&slave).unwrap()));
+}
+
+/// Every test here engages terminals; the abort branch below restores every engaged terminal in
+/// the process, so these tests run one at a time.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+	static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+	SERIAL.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+#[test]
+fn the_abort_branch_restores_every_engaged_terminal_whichever_thread_engaged_it() {
+	let _serial = serial();
+	let (_master, slave) = sys::open_pty().unwrap();
+	let before = sys::tcgetattr(&slave).unwrap();
+	let file = slave.try_clone().unwrap();
+	// Another thread engages the terminal and leaves the guard forgotten, as an abort would.
+	let id = std::thread::spawn(move || {
+		let guard = EchoOff::engage(&file).unwrap();
+		let id = guard.id.unwrap();
+		std::mem::forget(guard);
+		id
+	})
+	.join()
+	.unwrap();
+	assert!(registered(id));
+	// Control: the unwinding branch, run on this thread, leaves another thread's terminal quiet.
+	assert_eq!(restore_engaged(false), 0);
+	assert!(is_quiet(&sys::tcgetattr(&slave).unwrap()));
+	// The abort branch restores it to its saved settings.
+	assert!(restore_engaged(true) >= 1);
+	assert!(same(&before, &sys::tcgetattr(&slave).unwrap()));
+	deregister(id);
 }

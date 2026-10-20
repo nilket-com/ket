@@ -1,9 +1,10 @@
 //! Every system call of the custody modules that std does not wrap. This is the only file in
 //! `custody` with `unsafe`, and each block states why it is sound (pinned in `custody::tests`).
-use std::ffi::CStr;
+use std::ffi::{CStr, OsStr, OsString};
 use std::fs::File;
 use std::io::{Error, Result};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::unix::ffi::OsStrExt;
 
 pub(crate) fn euid() -> u32 {
 	// SAFETY: geteuid takes no arguments, cannot fail and touches no memory of ours.
@@ -161,7 +162,6 @@ pub(crate) fn interfaces() -> Result<Vec<(String, u32)>> {
 /// A new pseudo-terminal pair `(master, slave)` for the terminal tests.
 #[cfg(test)]
 pub(crate) fn open_pty() -> Result<(File, File)> {
-	use std::os::unix::ffi::OsStrExt;
 	use std::os::unix::fs::OpenOptionsExt;
 	// SAFETY: posix_openpt takes flags only and returns a new descriptor or -1.
 	let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
@@ -188,4 +188,42 @@ pub(crate) fn open_pty() -> Result<(File, File)> {
 		.custom_flags(libc::O_NOCTTY)
 		.open(std::ffi::OsStr::from_bytes(path.to_bytes()))?;
 	Ok((master, slave))
+}
+
+/// The entry names of an open directory, read through a fresh descriptor for `.`, so the caller's
+/// handle and its file position are untouched. No entry is opened; `.` and `..` are left out.
+pub(crate) fn read_dir_names(dir: &File) -> Result<Vec<OsString>> {
+	let fd = openat(dir, c".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?.into_raw_fd();
+	// SAFETY: `fd` is an open directory descriptor owned by nothing else; on success the stream
+	// owns it and the closedir below closes it.
+	let stream = unsafe { libc::fdopendir(fd) };
+	if stream.is_null() {
+		let error = Error::last_os_error();
+		// SAFETY: fdopendir failed, so `fd` is still ours; it is closed exactly once, here.
+		unsafe { libc::close(fd) };
+		return Err(error);
+	}
+	let mut names = Vec::new();
+	let read = loop {
+		// SAFETY: errno is this thread's own; clearing it tells the end of the stream from an error.
+		unsafe { *libc::__errno_location() = 0 };
+		// SAFETY: `stream` is the open stream from fdopendir, used by this thread only.
+		let entry = unsafe { libc::readdir(stream) };
+		if entry.is_null() {
+			let error = Error::last_os_error();
+			break match error.raw_os_error() {
+				Some(0) => Ok(()),
+				_ => Err(error),
+			};
+		}
+		// SAFETY: a non-null entry stays valid until the next readdir on this stream, and its
+		// d_name is NUL-terminated within it; the name is copied before that.
+		let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+		if name != b"." && name != b".." {
+			names.push(OsStr::from_bytes(name).to_os_string());
+		}
+	};
+	// SAFETY: `stream` came from fdopendir and is closed once; that closes `fd` with it.
+	unsafe { libc::closedir(stream) };
+	read.map(|()| names)
 }

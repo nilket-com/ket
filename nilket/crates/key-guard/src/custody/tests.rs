@@ -32,14 +32,6 @@ fn all_sources() -> Vec<(String, String)> {
 	out
 }
 
-fn source(name: &str) -> String {
-	all_sources()
-		.into_iter()
-		.find(|(n, _)| n == name)
-		.unwrap_or_else(|| panic!("{name} is not under src/custody"))
-		.1
-}
-
 /// The tokens, spelled so this file does not contain them.
 const U: &str = concat!("un", "safe");
 const STOP: &str = concat!("Stop", "(");
@@ -135,9 +127,17 @@ fn the_unsafe_pin_catches_a_stray_or_undocumented_block() {
 	);
 }
 
+/// The one attribute that may gate the anchor: test builds and the `fixture-anchor` feature.
+const GATE: &str = "#[cfg(any(test, feature = \"fixture-anchor\"))]";
+const ANCHORED: &str = "open_custody_dir_anchored";
+
+fn is_test_file(name: &str) -> bool {
+	name.ends_with("tests.rs") || name == "test_dir.rs"
+}
+
 /// The pin: in every custody file, the stop type is constructed only as `Stop::ROOT`'s `/` and,
-/// with an anchor, only inside the private `#[cfg(test)] fn at`; no non-test file has a `pub`
-/// item naming it.
+/// with an anchor, only inside the private `fn at`, which carries exactly `GATE`; no non-test file
+/// has a `pub` item naming it.
 fn anchor_pin(files: &[(String, String)]) -> Result<(), String> {
 	let root_line = format!("const ROOT: Stop = {STOP}None);");
 	let at_line = "fn at(anchor: (u64, u64)) -> Stop {";
@@ -145,8 +145,7 @@ fn anchor_pin(files: &[(String, String)]) -> Result<(), String> {
 		let lines: Vec<&str> = text.lines().collect();
 		for (index, line) in lines.iter().enumerate() {
 			let line = code(line).trim();
-			let test_file = name.ends_with("tests.rs") || name == "test_dir.rs";
-			if !test_file && line.contains("pub") && line.contains("Stop") {
+			if !is_test_file(name) && line.contains("pub") && line.contains("Stop") {
 				return Err(format!("{name}:{}: a public item names Stop", index + 1));
 			}
 			if !line.contains(STOP) || line.starts_with("struct Stop") {
@@ -159,7 +158,7 @@ fn anchor_pin(files: &[(String, String)]) -> Result<(), String> {
 				&& line == format!("{STOP}Some(anchor))")
 				&& index >= 2
 				&& code(lines[index - 1]).trim() == at_line
-				&& lines[index - 2].trim() == "#[cfg(test)]";
+				&& lines[index - 2].trim() == GATE;
 			if !in_at {
 				return Err(format!("{name}:{}: Stop is built outside fn at", index + 1));
 			}
@@ -168,9 +167,74 @@ fn anchor_pin(files: &[(String, String)]) -> Result<(), String> {
 	Ok(())
 }
 
+/// The pin on the anchored open, over every non-test custody file:
+/// - the feature appears only as exactly `GATE`, on three lines: `fn at`, the anchored open and
+///   its one re-export;
+/// - the anchored open is defined once, in `dir.rs`, directly under `GATE`, and re-exported once,
+///   in `mod.rs`, directly under `GATE`; it is named nowhere else;
+/// - `Stop::at(` is called only inside the anchored open's body.
+fn anchored_pin(files: &[(String, String)]) -> Result<(), String> {
+	let define = format!("pub fn {ANCHORED}(");
+	let export = format!("pub use crate::custody::dir::{ANCHORED};");
+	let at_call = concat!("Stop::", "at(");
+	let (mut gates, mut defines, mut exports) = (0, 0, 0);
+	for (name, text) in files.iter().filter(|(n, _)| !is_test_file(n)) {
+		let lines: Vec<&str> = text.lines().collect();
+		let mut body = None;
+		for (index, raw) in lines.iter().enumerate() {
+			let line = code(raw).trim();
+			let at = || format!("{name}:{}", index + 1);
+			let gated = index >= 1 && lines[index - 1].trim() == GATE;
+			if line.contains("fixture-anchor") {
+				if line != GATE {
+					return Err(format!("{}: the feature gates something else", at()));
+				}
+				gates += 1;
+			}
+			if line.starts_with(&define) && name == "dir.rs" && gated {
+				defines += 1;
+				body = Some(index);
+			} else if line == export && name == "mod.rs" && gated {
+				exports += 1;
+			} else if line.contains(ANCHORED) {
+				return Err(format!(
+					"{}: the anchored open is named outside its gate",
+					at()
+				));
+			}
+			if body.is_some() && *raw == "}" {
+				body = None;
+			}
+			if line.contains(at_call) && (body.is_none() || name != "dir.rs") {
+				return Err(format!(
+					"{}: the anchor is built outside the anchored open",
+					at()
+				));
+			}
+		}
+	}
+	if (gates, defines, exports) != (3, 1, 1) {
+		return Err(format!(
+			"gates {gates}, definitions {defines}, re-exports {exports}; expected 3, 1, 1"
+		));
+	}
+	Ok(())
+}
+
 #[test]
-fn the_walk_anchor_is_test_only_and_unreachable_from_the_public_api() {
+fn the_walk_anchor_is_test_or_feature_only_and_unreachable_from_the_shipped_api() {
 	anchor_pin(&all_sources()).unwrap();
+	anchored_pin(&all_sources()).unwrap();
+}
+
+/// `name` with its first `from` replaced by `to`; the replacement must happen.
+fn replaced(name: &str, from: &str, to: &str) -> Vec<(String, String)> {
+	let mut files = all_sources();
+	let file = &mut files.iter_mut().find(|(n, _)| n == name).unwrap().1;
+	let edited = file.replacen(from, to, 1);
+	assert_ne!(&edited, file, "{name}: {from:?} not found");
+	*file = edited;
+	files
 }
 
 #[test]
@@ -188,12 +252,76 @@ fn the_anchor_pin_catches_a_leak() {
 	] {
 		assert!(anchor_pin(&with(name, leak)).is_err(), "{name}: {leak}");
 	}
-	let dir = source("dir.rs");
-	let ungated = dir.replacen("\t#[cfg(test)]\n\tfn at(", "\tfn at(", 1);
-	assert_ne!(ungated, dir);
-	let mut files = all_sources();
-	files.iter_mut().find(|(n, _)| n == "dir.rs").unwrap().1 = ungated;
-	assert!(anchor_pin(&files).is_err());
+	let gated_at = format!("\t{GATE}\n\tfn at(");
+	assert!(anchor_pin(&replaced("dir.rs", &gated_at, "\tfn at(")).is_err());
+	// The gate is exact: neither the test gate alone nor the feature alone.
+	let test_only = "\t#[cfg(test)]\n\tfn at(";
+	assert!(anchor_pin(&replaced("dir.rs", &gated_at, test_only)).is_err());
+	let shipped = "\t#[cfg(feature = \"fixture-anchor\")]\n\tfn at(";
+	assert!(anchor_pin(&replaced("dir.rs", &gated_at, shipped)).is_err());
+}
+
+#[test]
+fn the_anchored_pin_catches_an_ungated_open_a_stray_anchor_and_a_reused_feature() {
+	let define = format!("{GATE}\npub fn {ANCHORED}(");
+	let export = format!("{GATE}\npub use crate::custody::dir::{ANCHORED};");
+	for (what, files) in [
+		(
+			"ungated open",
+			replaced("dir.rs", &define, &format!("pub fn {ANCHORED}(")),
+		),
+		(
+			"ungated re-export",
+			replaced(
+				"mod.rs",
+				&export,
+				&format!("pub use crate::custody::dir::{ANCHORED};"),
+			),
+		),
+		(
+			"open gated by the feature alone",
+			replaced(
+				"dir.rs",
+				&define,
+				&format!("#[cfg(feature = \"fixture-anchor\")]\npub fn {ANCHORED}("),
+			),
+		),
+		(
+			"anchor built outside the open",
+			with("dir.rs", "\nfn stray() -> Stop {\n\tStop::at((0, 0))\n}\n"),
+		),
+		(
+			"anchor built in another file",
+			with("tty.rs", "\nfn stray() {\n\tlet _ = Stop::at((0, 0));\n}\n"),
+		),
+		(
+			"a second gated item",
+			with(
+				"tty.rs",
+				&format!("\n{GATE}\npub fn also_for_fixtures() {{}}\n"),
+			),
+		),
+		(
+			"the open named elsewhere",
+			with(
+				"tty.rs",
+				&format!("\nfn f() {{ let _ = super::{ANCHORED}; }}\n"),
+			),
+		),
+		(
+			"a glob re-export",
+			replaced(
+				"mod.rs",
+				&export,
+				&format!("{GATE}\npub use crate::custody::dir::*;"),
+			),
+		),
+	] {
+		assert!(anchored_pin(&files).is_err(), "{what}");
+	}
+	// Control: the test files may name and build the anchor freely.
+	let test_use = format!("\nfn f() {{ let _ = super::{ANCHORED}; let _ = Stop::at((0, 0)); }}\n");
+	assert!(anchored_pin(&with("dir/tests.rs", &test_use)).is_ok());
 }
 
 #[test]

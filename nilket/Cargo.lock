@@ -2308,6 +2308,7 @@ name = "key-guard"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "serde_json",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
  "zeroize",

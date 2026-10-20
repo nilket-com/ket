@@ -515,3 +515,125 @@ fn an_execute_only_ancestor_is_admitted_and_a_writable_one_is_not() {
 		}
 	);
 }
+
+fn mkfifo(path: &Path) {
+	let status = std::process::Command::new("mkfifo")
+		.arg("-m")
+		.arg("600")
+		.arg(path)
+		.status()
+		.unwrap();
+	assert!(status.success());
+}
+
+fn os(names: &[&str]) -> Vec<std::ffi::OsString> {
+	names.iter().map(std::ffi::OsString::from).collect()
+}
+
+#[test]
+fn names_list_every_entry_through_the_handle_without_opening_one() {
+	use std::os::unix::ffi::OsStrExt;
+	let fx = fixture();
+	let dir = fx.open().unwrap();
+	// Control: an empty directory lists nothing (not even `.` or `..`).
+	assert!(dir.names().unwrap().is_empty());
+	let lock = dir.lock().unwrap();
+	lock.create_file("key", &[7; 10]).unwrap();
+	lock.create_subdir("retired").unwrap();
+	drop(lock);
+	mkfifo(&fx.keys.join("pipe"));
+	let raw = std::ffi::OsStr::from_bytes(b"not-utf8-\xff");
+	File::create(fx.keys.join(raw)).unwrap();
+	let mut expected = os(&["key", "pipe", "retired"]);
+	expected.push(raw.to_os_string());
+	expected.sort();
+	assert_eq!(dir.names().unwrap(), expected);
+	// The listing changed nothing: the key still opens at its admitted length.
+	dir.open_file("key", &[10]).unwrap();
+}
+
+#[test]
+fn a_leftover_temp_is_reported_and_kept_and_a_clean_creation_leaves_none() {
+	let fx = fixture();
+	let dir = published(&fx, "key", &[7; 10]);
+	// Control: creation alone leaves no temp file.
+	assert!(dir.lock().unwrap().leftover_temps().unwrap().is_empty());
+	let planted = format!("{TEMP_PREFIX}4242.0");
+	fs::write(fx.keys.join(&planted), [1, 2, 3]).unwrap();
+	let lock = dir.lock().unwrap();
+	assert_eq!(lock.leftover_temps().unwrap(), os(&[&planted]));
+	assert_eq!(lock.leftover_temps().unwrap(), os(&[&planted]));
+	assert_eq!(fs::read(fx.keys.join(&planted)).unwrap(), vec![1, 2, 3]);
+	// A leftover is never a custody name.
+	assert_eq!(reason(dir.open_file(&planted, &[3])), Refusal::Name);
+}
+
+#[test]
+fn a_move_outside_the_lock_is_refused_and_one_within_it_succeeds() {
+	let fx = fixture();
+	let dir = published(&fx, "key", &[7; 10]);
+	let lock = dir.lock().unwrap();
+	let retired = lock.create_subdir("retired").unwrap();
+	let deeper = retired.lock().unwrap().create_subdir("deeper").unwrap();
+	fs::DirBuilder::new()
+		.mode(0o700)
+		.create(fx.anc.join("other"))
+		.unwrap();
+	chmod(&fx.anc.join("other"), 0o700);
+	let sibling = fx.open_path(&fx.anc.join("other")).unwrap();
+	for (what, to) in [("grandchild", &deeper), ("sibling", &sibling)] {
+		assert_eq!(
+			reason(lock.move_file("key", to, "key")),
+			Refusal::OutsideLock,
+			"{what}"
+		);
+		dir.open_file("key", &[10]).unwrap();
+	}
+	// The parent of a locked directory is outside its lock too.
+	let retired_lock = retired.lock().unwrap();
+	retired_lock.create_file("old", &[1]).unwrap();
+	assert_eq!(
+		reason(retired_lock.move_file("old", &dir, "old")),
+		Refusal::OutsideLock
+	);
+	retired.open_file("old", &[1]).unwrap();
+	drop(retired_lock);
+	// Controls: the locked directory itself and a direct child.
+	lock.move_file("key", &dir, "key2").unwrap();
+	lock.move_file("key2", &retired, "key").unwrap();
+	retired.open_file("key", &[10]).unwrap();
+	assert!(!fx.keys.join("key").exists() && !fx.keys.join("key2").exists());
+}
+
+#[test]
+fn the_anchored_open_admits_what_lies_below_its_anchor_and_production_refuses_it() {
+	let root = TestDir::new("kg-anchor");
+	let writable = root.join("writable");
+	let anc = writable.join("anc");
+	let keys = anc.join("keys");
+	fs::DirBuilder::new().mode(0o775).create(&writable).unwrap();
+	fs::DirBuilder::new().mode(0o755).create(&anc).unwrap();
+	fs::DirBuilder::new().mode(0o700).create(&keys).unwrap();
+	chmod(&writable, 0o775);
+	chmod(&anc, 0o755);
+	chmod(&keys, 0o700);
+	let dir = super::open_custody_dir_anchored(&keys, &writable).unwrap();
+	assert_eq!(dir.identity(), identity(&keys));
+	// Control: the production open walks past the anchor and refuses the writable ancestor.
+	assert!(matches!(
+		reason(super::open_custody_dir(&keys)),
+		Refusal::AncestorWritable { .. }
+	));
+	// Below the anchor every check still holds.
+	chmod(&anc, 0o775);
+	assert!(matches!(
+		reason(super::open_custody_dir_anchored(&keys, &writable)),
+		Refusal::AncestorWritable { .. }
+	));
+	// An anchor that is not a directory is refused.
+	fs::write(root.join("file"), b"x").unwrap();
+	assert_eq!(
+		reason(super::open_custody_dir_anchored(&keys, &root.join("file"))),
+		Refusal::NotDirectory
+	);
+}
