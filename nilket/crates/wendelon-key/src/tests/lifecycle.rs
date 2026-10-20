@@ -535,3 +535,119 @@ fn destroy_pending_refuses_a_context_other_than_the_pending_files_own() {
 	assert!(ok, "{err}");
 	assert!(!fx.exists("pending/admin1.p"));
 }
+
+/// Holds `<keys>/<sub>`'s lock through an independently opened handle, creating it if absent.
+fn hold(fx: &Fixture, sub: &str) -> key_guard::custody::CustodyDir {
+	let path = fx.keys.join(sub);
+	if !path.exists() {
+		std::fs::create_dir(&path).unwrap();
+		std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+			.unwrap();
+	}
+	key_guard::custody::open_custody_dir_anchored(&path, &fx.root).unwrap()
+}
+
+#[test]
+fn a_busy_destination_child_refuses_before_anything_is_published() {
+	let fx = Fixture::new();
+	let mut io = fx.io();
+	let world = World::genesis();
+	generate(&fx, &mut io, "recovery.p", "recovery", "0", RECOVERY_SEED);
+	let a = fx.file("a", &world.export(1));
+	let b = fx.file("b", &world.export(2));
+	let pending = hold(&fx, "pending");
+	let held = pending.lock().unwrap();
+	let (ok, err) = bind(&fx, &mut io, "recovery.p", "recovery0", &[&a, &b]);
+	assert!(!ok && err.contains("locked by another operation"), "{err}");
+	assert!(fx.exists("recovery.p") && !fx.exists("recovery0") && !fx.exists("pending/recovery.p"));
+	// Control: with the child free, the same bind publishes the Bound file and moves the original.
+	drop(held);
+	let (ok, err) = bind(&fx, &mut io, "recovery.p", "recovery0", &[&a, &b]);
+	assert!(ok, "{err}");
+	assert!(fx.exists("recovery0") && fx.exists("pending/recovery.p"));
+}
+
+#[test]
+fn audit_lines_mark_identities_that_were_never_authenticated() {
+	let fx = Fixture::new();
+	let mut io = fx.io();
+	let mut world = genesis(&fx, &mut io);
+	let line = |fx: &Fixture| {
+		crate::log::verify_chain(&fx.log())
+			.unwrap()
+			.0
+			.pop()
+			.unwrap()
+	};
+	// restore-verify: a refused comparison leaves the Bound file's identity unauthenticated; the
+	// accepted one records the authenticated backup's identity.
+	let backups = fx.backups.display().to_string();
+	let ctx = fx.file("g", &world.export(1));
+	io.say(&[PRIMARY, SECONDARY, SECONDARY]);
+	io.ok(&[
+		"backup",
+		"--dir",
+		&fx.dir(),
+		"--key",
+		"admin0",
+		"--to",
+		&backups,
+		"--out",
+		"admin0.bak",
+	]);
+	let verify = |io: &mut TestIo, key: &str| {
+		io.say(&[SECONDARY]);
+		let r = io.run(&[
+			"restore-verify",
+			"--dir",
+			&fx.dir(),
+			"--key",
+			key,
+			"--from",
+			&backups,
+			"--backup",
+			"admin0.bak",
+			"--context",
+			&ctx,
+			"--trusted-manifest",
+			&fx.manifest(),
+		]);
+		io.secrets.clear();
+		r.0
+	};
+	assert!(!verify(&mut io, "recovery0"));
+	let refused = line(&fx);
+	assert_eq!(refused.identity, None);
+	assert!(refused.unauthenticated_identity.is_some());
+	assert!(verify(&mut io, "admin0"));
+	let accepted = line(&fx);
+	assert_eq!(
+		accepted.identity, accepted.unauthenticated_identity,
+		"the claim, now authenticated"
+	);
+	assert!(accepted.identity.is_some());
+	// retire-epoch decrypts nothing: its identity is logged as unauthenticated only.
+	generate(&fx, &mut io, "admin1.p", "admin", "1", [0x51; 32]);
+	world.rotate(1, [0x51; 32]);
+	let rotated = fx.file("r", &world.export(1));
+	io.say(&["1"]);
+	io.ok(&[
+		"retire-epoch",
+		"--dir",
+		&fx.dir(),
+		"--key",
+		"admin0",
+		"--context",
+		&rotated,
+		"--trusted-manifest",
+		&fx.manifest(),
+	]);
+	let retired = line(&fx);
+	assert_eq!(retired.identity, None);
+	assert_eq!(retired.unauthenticated_identity, accepted.identity);
+	// Control: an operation that decrypts logs the authenticated identity.
+	io.say(&[PRIMARY]);
+	io.ok(&["show-public", "--dir", &fx.dir(), "--key", "recovery0"]);
+	let shown = line(&fx);
+	assert!(shown.identity.is_some() && shown.unauthenticated_identity.is_none());
+}

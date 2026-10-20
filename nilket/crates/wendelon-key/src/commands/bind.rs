@@ -86,6 +86,8 @@ pub(super) fn run(io: &mut dyn Io, a: &Args) -> Result<(), ToolError> {
 			None => s.lock.create_subdir(PENDING)?,
 		};
 		must_be_free(&pending_dir, name)?;
+		// The destination's lock first: a busy pending/ refuses before the Bound file exists.
+		let pending_lock = pending_dir.lock()?;
 		must_be_free(s.dir, out)?;
 		let bound = fresh(
 			io,
@@ -100,7 +102,7 @@ pub(super) fn run(io: &mut dyn Io, a: &Args) -> Result<(), ToolError> {
 		let file = envelope::seal(&bound, &seed, &passphrase)?;
 		s.lock.create_file(out, &file)?;
 		s.output(out, &file);
-		s.lock.move_file(name, &pending_dir, name)?;
+		s.lock.move_file(name, &pending_lock, name)?;
 		writeln!(
 			io.out(),
 			"bound role {} epoch {epoch}: {} (fingerprint {}); the Pending original is in {PENDING}/{name}",

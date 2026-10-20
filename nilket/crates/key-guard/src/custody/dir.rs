@@ -491,14 +491,18 @@ impl CustodyLock<'_> {
 		}
 	}
 
-	/// Moves the custody file `name` to `to_name` in `to`, never replacing anything there. `to`
-	/// must be this directory or a direct child of it, so this lock covers the move (G11).
+	/// Moves the custody file `name` to `to_name` in the directory `to` locks, never replacing
+	/// anything there. `to` is this lock itself (a rename within the directory) or the lock of a
+	/// direct child, so both directories the move mutates are held for it (G11). Callers take the
+	/// child's lock before any effect a refused move would leave behind. Locks never wait, so a
+	/// busy child refuses instead of deadlocking.
 	pub fn move_file(
 		&self,
 		name: &str,
-		to: &CustodyDir,
+		to: &CustodyLock<'_>,
 		to_name: &str,
 	) -> Result<(), CustodyError> {
+		let to = to.dir;
 		self.within_scope(to)?;
 		let from = self.dir;
 		self.dir.open_checked(name, libc::O_RDONLY, None)?;
