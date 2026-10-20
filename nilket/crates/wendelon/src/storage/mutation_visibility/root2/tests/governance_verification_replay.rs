@@ -168,11 +168,11 @@ async fn s3_all_nine_recover_real_wal_and_replay_sidecars_bypassing_both_fixture
 #[tokio::test(flavor = "current_thread")]
 #[cfg(target_endian = "little")]
 async fn s3_all_nine_raw_missing_and_malformed_refusals_leave_accumulator_and_marks() {
-	let f = g::Fixture::new("b");
+	let f = g::Fixture::primary();
 	let boundary = g::entry(4);
 	for c in g::nine(&f) {
 		for mode in 0..4 {
-			let mut side = f.envelope(&f.state, &c, 0x92);
+			let mut side = f.envelope(&f.state, &c, g::GOVERNANCE_SEED);
 			if mode == 2 {
 				side[0] ^= 1;
 			}
@@ -238,7 +238,7 @@ async fn s3_all_nine_raw_missing_and_malformed_refusals_leave_accumulator_and_ma
 #[test]
 #[cfg(target_endian = "little")]
 fn s3_all_nine_raw_state_context_position_and_structure_first_errors() {
-	let f = g::Fixture::new("b");
+	let f = g::Fixture::primary();
 	let boundary = g::entry(4);
 	for c in g::nine(&f) {
 		for n in [0, 2, 3] {
@@ -293,7 +293,7 @@ async fn s3_raw_consumed_denials_scope_and_resigned_issuer_failures_advance_only
 		let side = f.envelope(&f.state, &c, 0x92);
 		assert_denied_run(&f, c, side).await;
 	}
-	let f = g::Fixture::new("b");
+	let f = g::Fixture::primary();
 	let c = Command2::EnrollSelector(g::selector(&f));
 	let ctx = crate::storage::mutation_visibility::root2::admin_install::admin_context2(
 		&crate::storage::mutation_visibility::root2::admin_install::install_admin2(
@@ -314,15 +314,27 @@ async fn s3_raw_consumed_denials_scope_and_resigned_issuer_failures_advance_only
 			6 => context.initial_epoch += 1,
 			_ => context.manifest_pin[0] ^= 1,
 		}
-		assert_denied_run(&f, c.clone(), g::sign_context(context, digest, 0x92)).await;
+		assert_denied_run(
+			&f,
+			c.clone(),
+			g::sign_context(context, digest, g::GOVERNANCE_SEED),
+		)
+		.await;
 	}
 	let mut wrong = digest;
 	wrong[0] ^= 1;
-	assert_denied_run(&f, c.clone(), g::sign_context(ctx, wrong, 0x92)).await;
-	for seed in [0x42, 0x93] {
+	assert_denied_run(
+		&f,
+		c.clone(),
+		g::sign_context(ctx, wrong, g::GOVERNANCE_SEED),
+	)
+	.await;
+	// Another key, and the other two M3_PRIMARY roles' keys.
+	let [admin, recovery] = g::NON_GOVERNANCE_SEEDS;
+	for seed in [0x93, admin, recovery] {
 		assert_denied_run(&f, c.clone(), f.envelope(&f.state, &c, seed)).await;
 	}
-	let mut noncanonical = f.envelope(&f.state, &c, 0x92);
+	let mut noncanonical = f.envelope(&f.state, &c, g::GOVERNANCE_SEED);
 	noncanonical[264..296].fill(0xff);
 	assert_denied_run(&f, c, noncanonical).await;
 	let f = g::Fixture::table_namespace();
@@ -346,12 +358,12 @@ async fn s3_raw_consumed_denials_scope_and_resigned_issuer_failures_advance_only
 			cause: 1,
 			anchor: g::log(2),
 		};
-		let side = f.envelope(&f.state, &c, 0x92);
+		let side = f.envelope(&f.state, &c, g::GOVERNANCE_SEED);
 		assert_denied_run(&f, c, side).await;
 	}
-	let mut f = g::Fixture::new("b");
+	let mut f = g::Fixture::primary();
 	let c = g::grant(&f, g::ISSUER_SEED);
-	let side = f.envelope(&f.state, &c, 0x92);
+	let side = f.envelope(&f.state, &c, g::GOVERNANCE_SEED);
 	assert_denied_run(&f, c, side).await;
 	f.governed(Command2::EnrollLeaseIssuer {
 		node: 7,
@@ -368,21 +380,21 @@ async fn s3_raw_consumed_denials_scope_and_resigned_issuer_failures_advance_only
 		if mode == 2 {
 			lease.signature[32..].fill(0xff);
 		}
-		let side = f.envelope(&f.state, &c, 0x92);
+		let side = f.envelope(&f.state, &c, g::GOVERNANCE_SEED);
 		assert_denied_run(&f, c, side).await;
 	}
 	f.governed(Command2::RevokeLeaseIssuer { node: 7 });
 	let c = g::grant(&f, g::ISSUER_SEED);
-	let side = f.envelope(&f.state, &c, 0x92);
+	let side = f.envelope(&f.state, &c, g::GOVERNANCE_SEED);
 	assert_denied_run(&f, c, side).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 
 async fn s3_raw_reused_envelope_at_next_coordinates_preserves_first_registration() {
-	let mut f = g::Fixture::new("b");
+	let mut f = g::Fixture::primary();
 	let c = Command2::EnrollSelector(g::selector(&f));
-	let side = f.envelope(&f.state, &c, 0x92);
+	let side = f.envelope(&f.state, &c, g::GOVERNANCE_SEED);
 	assert_eq!(
 		f.apply(c.clone(), Some(side.clone())),
 		ApplyResult2::Registered(g::log(3))

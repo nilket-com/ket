@@ -2,9 +2,7 @@
 use super::*;
 use crate::consensus::retention::{ControlRetention, HistoryCheck, RetentionRefusals};
 use crate::consensus::{RetentionStatus, WendelonLogStore, WendelonRequest};
-use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AdminManifest2, AnyAdminManifest2, admin_manifest_digest2,
-};
+use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::committed::fixture::Root2FixtureScope;
 use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
@@ -105,9 +103,11 @@ fn context() -> (PinnedBoundTuple2, Deployment2, Vec<E>, Vec<Fixture>) {
 fn context_with_bootstrap_fingerprint(
 	override_fp: Option<Digest2>,
 ) -> (PinnedBoundTuple2, Deployment2, Vec<E>, Vec<Fixture>) {
-	let bytes = vector("manifest_prime");
-	let m = AdminManifest2::decode(&bytes).unwrap();
-	let pin = admin_manifest_digest2(bytes.as_slice().try_into().unwrap());
+	// M3_PRIME: the profile-1 G1d fixture's admission fields as a profile-3 manifest.
+	let bytes = vector("p3_manifest");
+	let any = AnyAdminManifest2::decode(&bytes).unwrap();
+	let m = any.admission().clone();
+	let pin: Digest2 = vector("p3_manifest_pin").try_into().unwrap();
 	let dep = Deployment2 {
 		generation: m.generation,
 		cluster: m.cluster,
@@ -118,7 +118,7 @@ fn context_with_bootstrap_fingerprint(
 		control: pin,
 		length: bytes.len() as u64,
 	};
-	let mut record = BootstrapRecord2::decode(&vector("record")).unwrap();
+	let mut record = BootstrapRecord2::decode(&vector("p3_record")).unwrap();
 	let (p, fp) = fields(&entries[2]);
 	record.identity.bootstrap = Log2 {
 		term: p.term,
@@ -138,7 +138,7 @@ fn context_with_bootstrap_fingerprint(
 				pin,
 				admin_key: m.admin_key,
 			},
-			manifest: AnyAdminManifest2::One(m),
+			manifest: any,
 			state: RootState2::Bound,
 			last_seq: seq,
 			record: Some(record),
@@ -201,7 +201,7 @@ async fn full_composition_matches_per_api_and_observes_each_entry() {
 	let v: serde_json::Value =
 		serde_json::from_str(include_str!("../tests/statement_vectors.json")).unwrap();
 	let adm = Command2::AdmissionPermission(
-		unhex(v["grant"]["bytes"].as_str().unwrap())
+		unhex(v["p3_grant"]["bytes"].as_str().unwrap())
 			.try_into()
 			.unwrap(),
 	);

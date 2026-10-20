@@ -1,3 +1,9 @@
+//! VISADS02 authentication on the `M3_PRIME` root (the G1d fixture's admission fields, profile 3),
+//! against the independent `p3_` statement vectors.
+use super::profile_three_fixture::key as role_key;
+use super::profile_three_fixture::{
+	PRIME_GOVERNANCE, PRIME_RECOVERY, build_three, exact_pin, tuple_of,
+};
 use super::*;
 use crate::storage::mutation_visibility::MutationScope;
 use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
@@ -7,11 +13,7 @@ use crate::storage::mutation_visibility::root2::admin_install::*;
 use crate::storage::mutation_visibility::root2::admin_statement::*;
 use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
 use crate::storage::mutation_visibility::root2::origin::*;
-use crate::storage::mutation_visibility::root2::provisioning::inventory::{
-	LogState2, RootEntry2, RootIdentity2, RootState2,
-};
 use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::*;
-use crate::storage::mutation_visibility::root2::provisioning::snapshot::encode_snapshot2;
 use crate::storage::mutation_visibility::root2::trust::CommittedEntry2;
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -32,15 +34,18 @@ fn d32(field: &str) -> Digest2 {
 fn statement(name: &str) -> Vec<u8> {
 	unhex(v()[name]["bytes"].as_str().unwrap())
 }
-fn manifest_prime() -> AdminManifest2 {
-	AdminManifest2::decode(&hex("manifest_prime")).unwrap()
+fn prime_admission() -> AdminManifest2 {
+	AnyAdminManifest2::decode(&hex("p3_manifest"))
+		.unwrap()
+		.admission()
+		.clone()
 }
 fn at(term: u64, node: u32, index: u64) -> EntryPosition2 {
 	EntryPosition2 { term, node, index }
 }
 // A root through the existing fixtures: genesis, scanned entries, then the Bootstrap at `index`.
 fn rooted(control: Digest2, genesis: Digest2, index: u64) -> MutationAuthorityState2 {
-	let m = manifest_prime();
+	let m = prime_admission();
 	let (g, c) = (m.generation, m.cluster);
 	let first = CommittedEntry2::fixture(at(0, 0, 0), genesis, EntryClass2::Membership);
 	let mut s = advance_pre_root2(&empty_authority2(), &first).unwrap().0;
@@ -51,7 +56,7 @@ fn rooted(control: Digest2, genesis: Digest2, index: u64) -> MutationAuthoritySt
 	let cmd = Command2::Bootstrap {
 		epoch: m.initial_epoch,
 		control,
-		length: 137,
+		length: 241,
 	};
 	let e = TrustedEntry2::fixture(g, c, l(index), &cmd).unwrap();
 	let (_, _, _, fp, d) = e.fields();
@@ -60,52 +65,24 @@ fn rooted(control: Digest2, genesis: Digest2, index: u64) -> MutationAuthoritySt
 	bootstrap2(&s, &ce, &e, &verified, &cmd).unwrap().0
 }
 fn standard_root() -> MutationAuthorityState2 {
-	rooted(d32("manifest_prime_pin"), d32("genesis"), 2)
+	rooted(d32("p3_manifest_pin"), d32("genesis"), 2)
 }
 // A coherent Part A tuple for `manifest` whose Bound record is `record`; Part A must accept it.
 fn tuple(manifest_bytes: &[u8], record: BootstrapRecord2) -> PinnedBoundTuple2 {
-	let manifest = AdminManifest2::decode(manifest_bytes).unwrap();
-	let pin = crate::storage::mutation_visibility::root2::admin::manifest::admin_manifest_digest2(
-		manifest_bytes.try_into().unwrap(),
-	);
-	let snapshot = encode_snapshot2(&LogState2 {
-		roots: vec![RootEntry2 {
-			terminal: None,
-			identity: RootIdentity2 {
-				generation: manifest.generation,
-				cluster: manifest.cluster,
-				pin,
-				admin_key: manifest.admin_key,
-			},
-			manifest: AnyAdminManifest2::One(manifest),
-			state: RootState2::Bound,
-			last_seq: record.inventory_seq,
-			record: Some(record),
-		}],
-		last_seq: record.inventory_seq,
-	})
-	.unwrap();
-	let inventory_pin = crate::storage::mutation_visibility::root2::codec::hash(b"", &snapshot);
-	validate_replica_tuple2(&ReplicaInputs2 {
-		manifest: Some(manifest_bytes),
-		manifest_pin: Some(&pin),
-		snapshot: Some(&snapshot),
-		inventory_pin: Some(&inventory_pin),
-	})
-	.expect("Part A accepts the coherent tuple")
+	tuple_of(manifest_bytes, record)
 }
 fn vector_record() -> BootstrapRecord2 {
-	BootstrapRecord2::decode(&hex("record")).unwrap()
+	BootstrapRecord2::decode(&hex("p3_record")).unwrap()
 }
 fn admin() -> InstalledAdmin2 {
 	install_admin2(
 		&standard_root(),
-		&tuple(&hex("manifest_prime"), vector_record()),
+		&tuple(&hex("p3_manifest"), vector_record()),
 	)
 	.unwrap()
 }
 fn key() -> PermissionKey2 {
-	let m = manifest_prime();
+	let m = prime_admission();
 	PermissionKey2 {
 		authority: crate::storage::mutation_visibility::root2::types::AuthorityRef2 {
 			id: [0x41; 16],
@@ -133,11 +110,11 @@ fn patched(base: &[u8], at: usize, v: &[u8]) -> Vec<u8> {
 fn independent_statement_vectors_match_and_authenticate() {
 	let state = standard_root();
 	// The independently generated snapshot, pins and origin facts match the accepted pipeline.
-	let snapshot = hex("snapshot");
-	let manifest_pin = d32("manifest_prime_pin");
-	let inventory_pin = d32("inventory_pin");
+	let snapshot = hex("p3_snapshot");
+	let manifest_pin = d32("p3_manifest_pin");
+	let inventory_pin = d32("p3_inventory_pin");
 	let vector_tuple = validate_replica_tuple2(&ReplicaInputs2 {
-		manifest: Some(&hex("manifest_prime")),
+		manifest: Some(&hex("p3_manifest")),
 		manifest_pin: Some(&manifest_pin),
 		snapshot: Some(&snapshot),
 		inventory_pin: Some(&inventory_pin),
@@ -145,17 +122,17 @@ fn independent_statement_vectors_match_and_authenticate() {
 	.unwrap();
 	let (_, origin) = root_and_origin2(&state).unwrap();
 	assert_eq!(origin.genesis, d32("genesis"));
-	assert_eq!(origin.bootstrap_command, d32("bootstrap_command"));
+	assert_eq!(origin.bootstrap_command, d32("p3_bootstrap_command"));
 	assert_eq!(
 		origin.bootstrap_fingerprint,
-		d32("bootstrap_fingerprint_stand_in")
+		d32("p3_bootstrap_fingerprint_stand_in")
 	);
 	let a = install_admin2(&state, &vector_tuple).unwrap();
-	assert_eq!(admin_key2(&a).to_vec(), hex("admin_public"));
+	assert_eq!(admin_key2(&a).to_vec(), hex("p3_admin_public"));
 	let ctx = admin_context2(&a);
 	for (name, action) in [
-		("grant", AdminAction2::Grant),
-		("revoke", AdminAction2::Revoke),
+		("p3_grant", AdminAction2::Grant),
+		("p3_revoke", AdminAction2::Revoke),
 	] {
 		let bytes = statement(name);
 		let encoded = encode_admin_statement2(action, &key(), &ctx, &signature_of(&bytes)).unwrap();
@@ -164,8 +141,8 @@ fn independent_statement_vectors_match_and_authenticate() {
 			admin_statement_preimage2(&encoded).unwrap(),
 			unhex(v()[name]["preimage"].as_str().unwrap())
 		);
-		assert_eq!(&encoded[12..200], hex("context").as_slice());
-		assert_eq!(&encoded[200..273], hex("key").as_slice());
+		assert_eq!(&encoded[12..200], hex("p3_context").as_slice());
+		assert_eq!(&encoded[200..273], hex("p3_key").as_slice());
 		let checked = check_admin_statement2(&a.view(), &bytes).unwrap();
 		assert_eq!(checked_action2(&checked), action);
 		assert!(checked_key2(&checked) == key());
@@ -177,7 +154,7 @@ fn independent_statement_vectors_match_and_authenticate() {
 fn structural_refusals_in_order() {
 	use StatementError2 as E;
 	let a = admin();
-	let good = statement("grant");
+	let good = statement("p3_grant");
 	let check = |b: &[u8]| check_admin_statement2(&a.view(), b).err();
 	assert_eq!(check(&good[..336]), Some(E::Length));
 	for (at, v, want) in [
@@ -225,6 +202,21 @@ fn structural_refusals_in_order() {
 			"offset {at}"
 		);
 	}
+	// The unknown scope tag itself (the step after the shape check): tag 2 with a zero table and
+	// schema passes the shape check as Raw and is refused only for the tag. Control: the same
+	// bytes with tag 0 (Raw) pass every structural check, and only the later scope check (the
+	// administrator's Table namespace) refuses them.
+	let zeroed = patched(&good, 249, &[0; 24]);
+	let unknown = patched(&zeroed, 248, &[2]);
+	let raw = patched(&zeroed, 248, &[0]);
+	let fixed = |b: &[u8]| -> [u8; ADMIN_STATEMENT_BYTES2] { b.try_into().unwrap() };
+	assert_eq!(check(&unknown), Some(E::Namespace));
+	assert_eq!(
+		admin_statement_preimage2(&fixed(&unknown)).err(),
+		Some(E::Namespace)
+	);
+	assert!(admin_statement_preimage2(&fixed(&raw)).is_ok());
+	assert_eq!(check(&raw), Some(E::Scope));
 	// Zero fields outrank the namespace shape.
 	let both = patched(&patched(&good, 216, &0u64.to_le_bytes()), 248, &[2]);
 	assert_eq!(
@@ -263,7 +255,7 @@ fn structural_refusals_in_order() {
 #[test]
 fn context_must_equal_the_installed_context_whole() {
 	let a = admin();
-	let good = statement("grant");
+	let good = statement("p3_grant");
 	for (at, width) in [
 		(12, 16),
 		(28, 16),
@@ -290,7 +282,7 @@ fn context_must_equal_the_installed_context_whole() {
 fn scope_must_equal_the_admin_namespace_exactly() {
 	let a = admin();
 	let ctx = admin_context2(&a);
-	let sig = signature_of(&statement("grant"));
+	let sig = signature_of(&statement("p3_grant"));
 	let raw = AdmissionNamespace2 {
 		scope: MutationScope::Raw,
 		table: [0; 16],
@@ -327,23 +319,23 @@ fn scope_must_equal_the_admin_namespace_exactly() {
 #[test]
 fn signatures_are_strict_and_bound_to_the_admin_key() {
 	let a = admin();
-	let mut flipped = statement("grant");
+	let mut flipped = statement("p3_grant");
 	flipped[300] ^= 1;
 	assert_eq!(
 		check_admin_statement2(&a.view(), &flipped).err(),
 		Some(StatementError2::Signature)
 	);
 	assert_eq!(
-		check_admin_statement2(&a.view(), &statement("other_signer")).err(),
+		check_admin_statement2(&a.view(), &statement("p3_other_signer")).err(),
 		Some(StatementError2::Signature)
 	);
 }
 #[test]
 fn statements_survive_tip_advances_and_do_not_cross_roots() {
-	let grant = statement("grant");
-	let t = tuple(&hex("manifest_prime"), vector_record());
+	let grant = statement("p3_grant");
+	let t = tuple(&hex("p3_manifest"), vector_record());
 	let mut state = standard_root();
-	let m = manifest_prime();
+	let m = prime_admission();
 	for (i, authorized) in [(3u64, true), (4, false)] {
 		let cmd = Command2::Cover {
 			kind: 0,
@@ -366,8 +358,8 @@ fn statements_survive_tip_advances_and_do_not_cross_roots() {
 	let mut other_genesis = vector_record();
 	other_genesis.identity.genesis_fingerprint = [0x77; 32];
 	let b = install_admin2(
-		&rooted(d32("manifest_prime_pin"), [0x77; 32], 2),
-		&tuple(&hex("manifest_prime"), other_genesis),
+		&rooted(d32("p3_manifest_pin"), [0x77; 32], 2),
+		&tuple(&hex("p3_manifest"), other_genesis),
 	)
 	.unwrap();
 	assert_eq!(
@@ -375,32 +367,34 @@ fn statements_survive_tip_advances_and_do_not_cross_roots() {
 		Some(StatementError2::Context)
 	);
 	// Another root whose Bootstrap sits at another log position.
-	let later = rooted(d32("manifest_prime_pin"), d32("genesis"), 3);
+	let later = rooted(d32("p3_manifest_pin"), d32("genesis"), 3);
 	let (_, origin) = root_and_origin2(&later).unwrap();
 	let mut moved = vector_record();
 	moved.identity.bootstrap = l(3);
 	moved.identity.bootstrap_fingerprint = origin.bootstrap_fingerprint;
 	moved.identity.bootstrap_command = origin.bootstrap_command;
-	let c = install_admin2(&later, &tuple(&hex("manifest_prime"), moved)).unwrap();
+	let c = install_admin2(&later, &tuple(&hex("p3_manifest"), moved)).unwrap();
 	assert_eq!(
 		check_admin_statement2(&c.view(), &grant).err(),
 		Some(StatementError2::Context)
 	);
 	// A coherently installed administrator with a different key commits a different manifest pin,
 	// so the whole context differs: Context, not Signature.
-	let original: serde_json::Value =
-		serde_json::from_str(include_str!("../provisioning/tests/anchor_vectors.json")).unwrap();
-	let m1 = unhex(original["manifests"]["m1"]["bytes"].as_str().unwrap());
-	let m1_pin: Digest2 = unhex(original["manifests"]["m1"]["pin"].as_str().unwrap())
-		.try_into()
-		.unwrap();
-	let m1_root = rooted(m1_pin, d32("genesis"), 2);
-	let (_, origin) = root_and_origin2(&m1_root).unwrap();
-	let mut m1_record = vector_record();
-	m1_record.identity.pin = m1_pin;
-	m1_record.identity.bootstrap_fingerprint = origin.bootstrap_fingerprint;
-	m1_record.identity.bootstrap_command = origin.bootstrap_command;
-	let other_key = install_admin2(&m1_root, &tuple(&m1, m1_record)).unwrap();
+	let mut rekeyed = prime_admission();
+	rekeyed.admin_key = role_key(0x2F);
+	let other = build_three(
+		rekeyed,
+		(PRIME_GOVERNANCE.0, role_key(PRIME_GOVERNANCE.1)),
+		(PRIME_RECOVERY.0, role_key(PRIME_RECOVERY.1)),
+	);
+	let other_pin = exact_pin(&other);
+	let other_root = rooted(other_pin, d32("genesis"), 2);
+	let (_, origin) = root_and_origin2(&other_root).unwrap();
+	let mut other_record = vector_record();
+	other_record.identity.pin = other_pin;
+	other_record.identity.bootstrap_fingerprint = origin.bootstrap_fingerprint;
+	other_record.identity.bootstrap_command = origin.bootstrap_command;
+	let other_key = install_admin2(&other_root, &tuple(&other, other_record)).unwrap();
 	assert!(admin_key2(&other_key) != admin_key2(&admin()));
 	assert_eq!(
 		check_admin_statement2(&other_key.view(), &grant).err(),

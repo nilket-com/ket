@@ -42,7 +42,7 @@ fn bootstrap_command() -> Command2 {
 	Command2::Bootstrap {
 		epoch: 1,
 		control: [0x9f; 32],
-		length: 137,
+		length: 241,
 	}
 }
 // Produces the trusted inputs for a Bootstrap at `l` and the committed token bound to them.
@@ -325,7 +325,7 @@ fn established_root_keeps_reducer_semantics_and_origin() {
 	let late = Command2::Bootstrap {
 		epoch: 2,
 		control: [1; 32],
-		length: 137,
+		length: 241,
 	};
 	let te = TrustedEntry2::fixture(G, C, l(7), &late).unwrap();
 	let tv = VerifiedCommand2::fixture(G, C, &late, &[], 0).unwrap();

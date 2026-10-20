@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::mutation_visibility::root2::tests::profile_three_fixture::M3_PRIMARY;
 pub(super) fn key(seed: u8) -> Digest2 {
 	SigningKey::from_bytes(&[seed; 32])
 		.verifying_key()
@@ -10,7 +11,7 @@ pub(super) struct F {
 impl F {
 	pub(super) fn new() -> Self {
 		Self {
-			f: wire::Fixture::profile_three(&crate::storage::mutation_visibility::root2::tests::profile_three_fixture::M3_PRIMARY),
+			f: wire::Fixture::profile_three(&M3_PRIMARY),
 		}
 	}
 	pub(super) fn root(&self) -> &Root2 {

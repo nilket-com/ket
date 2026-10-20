@@ -12,12 +12,9 @@ use crate::storage::mutation_visibility::root2::admission_registry::encode_permi
 use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
 use crate::storage::mutation_visibility::root2::incremental::Derived2;
 use crate::storage::mutation_visibility::root2::origin::*;
-use crate::storage::mutation_visibility::root2::provisioning::inventory::{
-	LogState2, RootEntry2, RootIdentity2, RootState2,
-};
 use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::*;
-use crate::storage::mutation_visibility::root2::provisioning::snapshot::encode_snapshot2;
 use crate::storage::mutation_visibility::root2::recovery::*;
+use crate::storage::mutation_visibility::root2::tests::profile_three_fixture::tuple_of;
 use crate::storage::mutation_visibility::root2::trust::CommittedEntry2;
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -38,8 +35,12 @@ fn rv() -> serde_json::Value {
 fn d32(field: &str) -> Digest2 {
 	unhex(sv()[field].as_str().unwrap()).try_into().unwrap()
 }
+/// `M3_PRIME`: the profile-1 G1d fixture's admission fields as a profile-3 manifest.
 fn manifest() -> AdminManifest2 {
-	AdminManifest2::decode(&unhex(sv()["manifest_prime"].as_str().unwrap())).unwrap()
+	AnyAdminManifest2::decode(&unhex(sv()["p3_manifest"].as_str().unwrap()))
+		.unwrap()
+		.admission()
+		.clone()
 }
 fn gc() -> ([u8; 16], [u8; 16]) {
 	let m = manifest();
@@ -67,37 +68,9 @@ fn statement(name: &str) -> Command2 {
 	)
 }
 fn tuple() -> PinnedBoundTuple2 {
-	let bytes = unhex(sv()["manifest_prime"].as_str().unwrap());
-	let m = manifest();
-	let record = BootstrapRecord2::decode(&unhex(sv()["record"].as_str().unwrap())).unwrap();
-	let pin = crate::storage::mutation_visibility::root2::admin::manifest::admin_manifest_digest2(
-		bytes.as_slice().try_into().unwrap(),
-	);
-	let snapshot = encode_snapshot2(&LogState2 {
-		roots: vec![RootEntry2 {
-			terminal: None,
-			identity: RootIdentity2 {
-				generation: m.generation,
-				cluster: m.cluster,
-				pin,
-				admin_key: m.admin_key,
-			},
-			manifest: AnyAdminManifest2::One(m),
-			state: RootState2::Bound,
-			last_seq: record.inventory_seq,
-			record: Some(record),
-		}],
-		last_seq: record.inventory_seq,
-	})
-	.unwrap();
-	let inventory_pin = crate::storage::mutation_visibility::root2::codec::hash(b"", &snapshot);
-	validate_replica_tuple2(&ReplicaInputs2 {
-		manifest: Some(&bytes),
-		manifest_pin: Some(&pin),
-		snapshot: Some(&snapshot),
-		inventory_pin: Some(&inventory_pin),
-	})
-	.unwrap()
+	let bytes = unhex(sv()["p3_manifest"].as_str().unwrap());
+	let record = BootstrapRecord2::decode(&unhex(sv()["p3_record"].as_str().unwrap())).unwrap();
+	tuple_of(&bytes, record)
 }
 fn pos(term: u64, node: u32, index: u64) -> EntryPosition2 {
 	EntryPosition2 { term, node, index }
@@ -252,7 +225,7 @@ fn replay(entries: &[Entry]) -> Vec<MutationAuthorityState2> {
 	out
 }
 fn k1() -> [u8; 73] {
-	let b = unhex(sv()["grant"]["bytes"].as_str().unwrap());
+	let b = unhex(sv()["p3_grant"]["bytes"].as_str().unwrap());
 	b[200..273].try_into().unwrap()
 }
 fn claim_of(c: &Command2) -> ClaimProjection2 {
@@ -321,8 +294,8 @@ fn governed() -> Vec<Entry> {
 		Entry::Genesis(d32("genesis")),
 		Entry::Scanned,
 		Entry::Bootstrap {
-			control: d32("manifest_prime_pin"),
-			length: 137,
+			control: d32("p3_manifest_pin"),
+			length: 241,
 			changed: false,
 		},
 		Entry::Plain(
@@ -341,14 +314,14 @@ fn governed() -> Vec<Entry> {
 		),
 		Entry::Plain(generated("grant"), 0, granted, vec![], vec![]),
 		Entry::Admit(
-			statement("grant"),
+			statement("p3_grant"),
 			permission(1, None),
 			active.clone(),
 			vec![],
 		),
 		Entry::Plain(reserve, 0, parent(None, false), active, parents.clone()),
 		Entry::Admit(
-			statement("revoke"),
+			statement("p3_revoke"),
 			permission(3, Some(8)),
 			revoked.clone(),
 			parents.clone(),
@@ -829,10 +802,10 @@ fn binding_before_persistence() {
 	assert!(install_admin2(governed.last().unwrap(), &tuple()).is_ok());
 	// A foreign genesis or a foreign original Bootstrap reaches Ready (progress only) but fails
 	// binding: no mark would be persisted and nothing served.
-	let pin = d32("manifest_prime_pin");
+	let pin = d32("p3_manifest_pin");
 	for history in [
-		short([0x77; 32], pin, 137, false, 2),
-		short(d32("genesis"), pin, 137, true, 2),
+		short([0x77; 32], pin, 241, false, 2),
+		short(d32("genesis"), pin, 241, true, 2),
 	] {
 		let states = replay(&history);
 		ready(&states);

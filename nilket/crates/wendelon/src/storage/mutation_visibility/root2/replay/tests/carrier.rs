@@ -30,7 +30,7 @@ fn commands(dep: Deployment2) -> Vec<Command2> {
 	let mut out = vec![
 		fixtures[0].3.clone(),
 		Command2::AdmissionPermission(
-			unhex(v["grant"]["bytes"].as_str().unwrap())
+			unhex(v["p3_grant"]["bytes"].as_str().unwrap())
 				.try_into()
 				.unwrap(),
 		),
@@ -115,10 +115,11 @@ fn real_context() -> (PinnedBoundTuple2, Deployment2, Vec<E>, Vec<Fixture>) {
 	let boot = fixtures[0].3.clone();
 	entries[2] = carried(&boot, dep, 2, None);
 	fixtures[0] = fixture(&entries[2], boot.clone(), dep);
-	let bytes = vector("manifest_prime");
-	let m = AdminManifest2::decode(&bytes).unwrap();
-	let pin = admin_manifest_digest2(bytes.as_slice().try_into().unwrap());
-	let mut record = BootstrapRecord2::decode(&vector("record")).unwrap();
+	let bytes = vector("p3_manifest");
+	let any = AnyAdminManifest2::decode(&bytes).unwrap();
+	let m = any.admission().clone();
+	let pin: Digest2 = vector("p3_manifest_pin").try_into().unwrap();
+	let mut record = BootstrapRecord2::decode(&vector("p3_record")).unwrap();
 	record.identity.bootstrap = Log2 {
 		term: 1,
 		node: 1,
@@ -137,7 +138,7 @@ fn real_context() -> (PinnedBoundTuple2, Deployment2, Vec<E>, Vec<Fixture>) {
 				pin,
 				admin_key: m.admin_key,
 			},
-			manifest: AnyAdminManifest2::One(m),
+			manifest: any,
 			state: RootState2::Bound,
 			last_seq: seq,
 			record: Some(record),

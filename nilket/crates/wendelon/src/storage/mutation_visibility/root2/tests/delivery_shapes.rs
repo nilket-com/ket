@@ -11,10 +11,14 @@
 //!
 //! No freshness, owner authentication, transport or concurrency guarantee is claimed: a coherent
 //! older tuple stays accepted under its original pins.
+//!
+//! The deliveries are profile 3 (`M3_*`) in marked directories, except the two plain-Retire cases,
+//! which stay on the profile-2 manifest "b" until plain Retire is removed.
 use super::owner_tuple_delivery::{
-	INVENTORY, MANIFEST, Scratch, delivered, identity_of, read_at, read_delivered, reserved,
+	INVENTORY, MANIFEST, Scratch, delivered, delivered_three, identity_of, read_at, read_delivered,
+	reserved,
 };
-use super::profile_three_fixture::rooted;
+use super::profile_three_fixture::{M3_OTHER, M3_PRIMARY, rooted};
 use super::profile_two_binding::manifest_bytes;
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
@@ -48,7 +52,7 @@ fn read_err(input: ReplicaInput2, error: AnchoredError2) -> Option<ReplicaReadEr
 /// file, an escape and a symlink. The manifest pin is checked first.
 #[test]
 fn absent_pins_refuse_before_any_file_access() {
-	let d = delivered("b", 189);
+	let d = delivered_three(&M3_PRIMARY);
 	symlink(d.out.at(MANIFEST), d.out.at("link")).unwrap();
 	let (m, i) = (&d.export.manifest_pin, &d.export.inventory_pin);
 	for (manifest, snapshot) in [
@@ -75,7 +79,7 @@ fn absent_pins_refuse_before_any_file_access() {
 /// Both pins present: a missing file is the one missing prerequisite (manifest first).
 #[test]
 fn an_absent_file_is_its_missing_prerequisite() {
-	let d = delivered("b", 189);
+	let d = delivered_three(&M3_PRIMARY);
 	let (m, i) = (Some(&d.export.manifest_pin), Some(&d.export.inventory_pin));
 	assert_eq!(
 		read_at(&d.out.0, "absent", m, INVENTORY, i).err(),
@@ -95,9 +99,12 @@ fn an_absent_file_is_its_missing_prerequisite() {
 /// the manifest's is reported. The wrong pins are real pins of other owner output.
 #[test]
 fn a_wrong_pin_is_its_own_mismatch() {
-	for (name, length, other) in [("a", 137, "b"), ("b", 189, "a")] {
-		let d = delivered(name, length);
-		let o = delivered(other, if other == "a" { 137 } else { 189 });
+	for (name, manifest, other) in [
+		("primary", M3_PRIMARY, M3_OTHER),
+		("other", M3_OTHER, M3_PRIMARY),
+	] {
+		let d = delivered_three(&manifest);
+		let o = delivered_three(&other);
 		let (m, i) = (&d.export.manifest_pin, &d.export.inventory_pin);
 		let (om, oi) = (&o.export.manifest_pin, &o.export.inventory_pin);
 		let at = |mp, ip| read_at(&d.out.0, MANIFEST, Some(mp), INVENTORY, Some(ip)).err();
@@ -114,7 +121,7 @@ fn a_wrong_pin_is_its_own_mismatch() {
 /// pins; the manifest in the snapshot slot fails the inventory pin.
 #[test]
 fn swapped_files_refuse_on_length_or_pin() {
-	let d = delivered("b", 189);
+	let d = delivered_three(&M3_PRIMARY);
 	let (m, i) = (&d.export.manifest_pin, &d.export.inventory_pin);
 	for (mp, ip) in [(m, i), (i, m)] {
 		assert_eq!(
@@ -137,7 +144,7 @@ fn swapped_files_refuse_on_length_or_pin() {
 /// entry for A.
 #[test]
 fn a_mixed_generation_tuple_is_not_in_inventory() {
-	let (a, b) = (delivered("a", 137), delivered("b", 189));
+	let (a, b) = (delivered_three(&M3_OTHER), delivered_three(&M3_PRIMARY));
 	fs::copy(a.out.at(MANIFEST), b.out.at("a.manifest")).unwrap();
 	assert_eq!(
 		read_at(
@@ -244,18 +251,74 @@ fn retire(owner: &mut OwnerDir2, identity: RootIdentity2) {
 	);
 }
 
+/// Prepared and Conflicted profile-3 roots from legitimate owner operations in a marked directory:
+/// `export_tuple` refuses each, so the snapshot is the owner's `export` and the manifest is the
+/// reserved exact bytes. (The Retired case needs a terminal Retire; it moves with plain Retire.)
+#[test]
+fn a_profile_three_root_that_is_not_bound_is_refused_with_its_state() {
+	let bytes = M3_PRIMARY.to_vec();
+	let id = identity_of(&bytes);
+	let not_bound = |dir: &Scratch, pin: &Digest2| {
+		read_at(&dir.0, MANIFEST, Some(&id.pin), INVENTORY, Some(pin)).err()
+	};
+	// Prepared.
+	let (_dir, mut owner) = reserved(&bytes);
+	let out = Scratch::new();
+	assert_eq!(
+		owner
+			.export_tuple(&out.0, MANIFEST, INVENTORY, id.generation, id.cluster)
+			.err(),
+		Some(OwnerIoError2::ExportNotBound(RootState2::Prepared))
+	);
+	let pin = owner.export(&out.0, INVENTORY).unwrap();
+	fs::write(out.at(MANIFEST), &bytes).unwrap();
+	assert_eq!(
+		not_bound(&out, &pin),
+		tuple_err(E::NotBound(RootState2::Prepared))
+	);
+	// Conflicted: approved from the observation of another root's committed Bootstrap.
+	let (_dir, mut owner) = reserved(&bytes);
+	let other = rooted(&M3_OTHER, 241).3;
+	let conflicted = owner
+		.apply(
+			&op_id2([2; 16]).unwrap(),
+			&OwnerRequest2::Approve {
+				identity: id,
+				observation: observe_bootstrap2(&other).unwrap(),
+				confirmed: id,
+			},
+		)
+		.unwrap();
+	assert_eq!(
+		(conflicted.original.map(|e| e.op), conflicted.current),
+		(Some(EventOp2::Conflict), RootState2::Conflicted)
+	);
+	let out = Scratch::new();
+	assert_eq!(
+		owner
+			.export_tuple(&out.0, MANIFEST, INVENTORY, id.generation, id.cluster)
+			.err(),
+		Some(OwnerIoError2::ExportNotBound(RootState2::Conflicted))
+	);
+	let pin = owner.export(&out.0, INVENTORY).unwrap();
+	fs::write(out.at(MANIFEST), &bytes).unwrap();
+	assert_eq!(
+		not_bound(&out, &pin),
+		tuple_err(E::NotBound(RootState2::Conflicted))
+	);
+}
 /// Deliberate post-export mutations of owner output: one byte past the largest manifest is an
 /// oversize read; a short manifest is a non-canonical length; a snapshot past the largest
 /// inventory is an oversize read. Length precedes the pin checks.
 #[test]
 fn mutated_lengths_refuse_before_the_pins() {
-	let d = delivered("b", 189);
+	let d = delivered_three(&M3_PRIMARY);
 	let (m, i) = (&d.export.manifest_pin, &d.export.inventory_pin);
 	let manifest = fs::read(d.out.at(MANIFEST)).unwrap();
 	let snapshot = fs::read(d.out.at(INVENTORY)).unwrap();
 	let long = [&manifest[..], &[0]].concat();
 	fs::write(d.out.at("long.manifest"), &long).unwrap();
-	fs::write(d.out.at("short.manifest"), &manifest[..136]).unwrap();
+	fs::write(d.out.at("short.manifest"), &manifest[..240]).unwrap();
 	let mut big = snapshot.clone();
 	big.resize(MAX_SNAPSHOT_BYTES2 + 1, 0);
 	fs::write(d.out.at("big.inventory"), &big).unwrap();
@@ -282,7 +345,7 @@ fn mutated_lengths_refuse_before_the_pins() {
 /// input; the manifest is read first.
 #[test]
 fn anchored_refusals_are_reported_per_input() {
-	let d = delivered("b", 189);
+	let d = delivered_three(&M3_PRIMARY);
 	let (m, i) = (Some(&d.export.manifest_pin), Some(&d.export.inventory_pin));
 	symlink(d.out.at(MANIFEST), d.out.at("m.link")).unwrap();
 	symlink(d.out.at(INVENTORY), d.out.at("i.link")).unwrap();
@@ -319,10 +382,10 @@ fn anchored_refusals_are_reported_per_input() {
 /// operator's newly supplied pin.
 #[test]
 fn a_replaced_file_needs_the_newly_supplied_pin() {
-	let mut d = delivered("b", 189);
+	let mut d = delivered_three(&M3_PRIMARY);
 	let old = read_delivered(&d).unwrap();
 	// A later owner state: a second root reserved, the delivered root still Bound.
-	let other = manifest_bytes("a");
+	let other = M3_OTHER.to_vec();
 	let added = d
 		.owner
 		.apply(

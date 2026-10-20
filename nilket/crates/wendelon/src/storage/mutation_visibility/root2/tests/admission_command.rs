@@ -1,5 +1,6 @@
 //! Dormant Admission permission command (tag 11) and result (tag 9). Structural inspection is never
 //! authentication, and `Root2::reduce` refuses the command before replay, gap or authorization.
+//! The statements and commands are the `M3_PRIME` (`p3_`) vectors.
 use super::*;
 use crate::storage::mutation_visibility::root2::admin_statement::*;
 use crate::storage::mutation_visibility::root2::admission_registry::*;
@@ -24,7 +25,7 @@ fn hex16(field: &str) -> [u8; 16] {
 fn statement(name: &str) -> [u8; 337] {
 	let s: serde_json::Value =
 		serde_json::from_str(include_str!("statement_vectors.json")).unwrap();
-	unhex(s[name]["bytes"].as_str().unwrap())
+	unhex(s[format!("p3_{name}")]["bytes"].as_str().unwrap())
 		.try_into()
 		.unwrap()
 }
@@ -42,7 +43,7 @@ fn bootstrapped() -> Root2 {
 	let boot = Command2::Bootstrap {
 		epoch: 1,
 		control: [9; 32],
-		length: 137,
+		length: 241,
 	};
 	let e = TrustedEntry2::fixture(g, c, l(1), &boot).unwrap();
 	let v = VerifiedCommand2::fixture(g, c, &boot, &[], 0).unwrap();
@@ -121,17 +122,17 @@ fn inspection_is_structural_and_not_authorizing() {
 fn admission_command_codec_digest_and_goldens() {
 	let (g, c) = gc();
 	for name in ["grant", "revoke", "other_signer"] {
-		let bytes = unhex(v()["commands"][name]["bytes"].as_str().unwrap());
+		let bytes = unhex(v()["p3_commands"][name]["bytes"].as_str().unwrap());
 		let (dg, dc, decoded) = Command2::decode(&bytes).unwrap();
 		assert_eq!((dg, dc), (g, c));
 		assert!(decoded == cmd(name), "{name}");
 		assert_eq!(decoded.encode(g, c).unwrap(), bytes, "{name}");
 		assert_eq!(
 			hex(&decoded.digest(g, c).unwrap()),
-			v()["commands"][name]["digest"].as_str().unwrap()
+			v()["p3_commands"][name]["digest"].as_str().unwrap()
 		);
 	}
-	for (name, value) in v()["command_refusals"].as_object().unwrap() {
+	for (name, value) in v()["p3_command_refusals"].as_object().unwrap() {
 		let bytes = unhex(value.as_str().unwrap());
 		assert_eq!(
 			Command2::decode(&bytes).err(),
@@ -402,7 +403,7 @@ fn permission_update_arm_tracks_grant_and_revoke() {
 	// statement names the same authority and generation with a distinct Table key.
 	let p: serde_json::Value =
 		serde_json::from_str(include_str!("root_profile_vectors.json")).unwrap();
-	let b = unhex(p["root_with_permissions"]["hex"].as_str().unwrap());
+	let b = unhex(p["p3_root_with_permissions"]["hex"].as_str().unwrap());
 	let u = UnverifiedRoot2::decode(&b).unwrap();
 	let (g, c, l0, fp) = u.fixture_fields();
 	let base = u

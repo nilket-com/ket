@@ -20,7 +20,11 @@ fn vectors() -> serde_json::Value {
 	serde_json::from_str(include_str!("root_profile_vectors.json")).unwrap()
 }
 fn with_permissions() -> Vec<u8> {
-	unhex(vectors()["root_with_permissions"]["hex"].as_str().unwrap())
+	unhex(
+		vectors()["p3_root_with_permissions"]["hex"]
+			.as_str()
+			.unwrap(),
+	)
 }
 fn installed(b: &[u8]) -> Root2 {
 	let u = UnverifiedRoot2::decode(b).unwrap();
@@ -123,7 +127,7 @@ fn profile3_goldens_round_trip_and_profile2_bytes_are_refused() {
 #[test]
 fn permission_section_decodes_bounded_and_maps_errors() {
 	let b = with_permissions();
-	let v = &vectors()["root_with_permissions"];
+	let v = &vectors()["p3_root_with_permissions"];
 	assert_eq!(b.len() as u64, v["length"].as_u64().unwrap());
 	assert_eq!(UnverifiedRoot2::decode(&b).unwrap().encode().unwrap(), b);
 	let r = installed(&b);
@@ -427,7 +431,7 @@ fn bootstrap_and_reduce_keep_permissions_empty() {
 	let boot = Command2::Bootstrap {
 		epoch: 1,
 		control: [9; 32],
-		length: 137,
+		length: 241,
 	};
 	let e = TrustedEntry2::fixture(g, c, l(1), &boot).unwrap();
 	let v = VerifiedCommand2::fixture(g, c, &boot, &[], 0).unwrap();

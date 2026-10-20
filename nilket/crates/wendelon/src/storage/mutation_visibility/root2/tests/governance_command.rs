@@ -1,4 +1,6 @@
-//! Independent profile2 governance fixtures; no production authority construction.
+//! Independent governance fixtures on `M3_PRIMARY` (the `p3_` half of governance_vectors.json);
+//! no production authority construction.
+use super::profile_three_fixture::{M3_PRIMARY, PRIMARY_SEEDS, chain_of};
 use super::*;
 use crate::storage::mutation_visibility::root2::admin_command::{
 	EnvelopeError2, admin_command_preimage2, check_admin_command2, encode_admin_command2,
@@ -6,7 +8,8 @@ use crate::storage::mutation_visibility::root2::admin_command::{
 use crate::storage::mutation_visibility::root2::admin_install::*;
 use crate::storage::mutation_visibility::root2::governance_command::*;
 use ed25519_dalek::Signer;
-const SEED: [u8; 32] = [0x92; 32];
+const SEED: [u8; 32] = [PRIMARY_SEEDS[1]; 32];
+const ADMIN_SEED: [u8; 32] = [PRIMARY_SEEDS[0]; 32];
 fn unhex(s: &str) -> Vec<u8> {
 	(0..s.len())
 		.step_by(2)
@@ -19,18 +22,21 @@ fn vectors() -> serde_json::Value {
 fn vv(field: &str) -> Vec<u8> {
 	unhex(vectors()[field].as_str().unwrap())
 }
+fn primary() -> super::profile_three_fixture::Chain {
+	chain_of(&M3_PRIMARY, 241)
+}
 fn d32(v: Vec<u8>) -> Digest2 {
 	v.try_into().unwrap()
 }
 fn admin() -> InstalledAdmin2 {
-	let c = super::profile_two_binding::chain("b", 189);
+	let c = primary();
 	install_admin2(&c.rooted, &c.tuple).unwrap()
 }
 fn context() -> AdminContext2 {
 	admin_context2(&admin())
 }
 fn valid() -> Vec<u8> {
-	vv("valid")
+	vv("p3_valid")
 }
 fn d1() -> Digest2 {
 	d32(vv("digest_1"))
@@ -40,20 +46,17 @@ fn check(bytes: &[u8], digest: Digest2) -> Result<(), GovernanceCommandError2> {
 }
 #[test]
 fn fixture_matches_independent_reference() {
-	let chain = super::profile_two_binding::chain("b", 189);
-	assert_eq!(
-		super::profile_two_binding::manifest_bytes("b"),
-		vv("manifest")
-	);
+	let chain = primary();
+	assert_eq!(M3_PRIMARY.to_vec(), vv("p3_manifest"));
 	let (g, c, _, fp, d) = chain.entry.fields();
-	assert_eq!(chain.cmd.payload(g, c).unwrap(), vv("bootstrap_payload"));
-	assert_eq!(fp.to_vec(), vv("bootstrap_fingerprint"));
-	assert_eq!(d.to_vec(), vv("bootstrap_command"));
+	assert_eq!(chain.cmd.payload(g, c).unwrap(), vv("p3_bootstrap_payload"));
+	assert_eq!(fp.to_vec(), vv("p3_bootstrap_fingerprint"));
+	assert_eq!(d.to_vec(), vv("p3_bootstrap_command"));
 	assert_eq!(
 		admin_governance2(&admin()).unwrap().key().to_vec(),
-		vv("governance_public")
+		vv("p3_governance_public")
 	);
-	assert_eq!(context().manifest_pin.to_vec(), vv("pin"));
+	assert_eq!(context().manifest_pin.to_vec(), vv("p3_pin"));
 }
 /// Re-sign `body` (the first 232 bytes) with `seed` under `domain`.
 fn signed_with(body: &[u8], seed: [u8; 32], domain: &[u8]) -> Vec<u8> {
@@ -83,7 +86,7 @@ fn valid_envelope_checks_and_round_trips() {
 	let fixed: [u8; 296] = valid().try_into().unwrap();
 	assert_eq!(
 		governance_command_preimage2(&fixed).unwrap(),
-		vv("preimage")
+		vv("p3_preimage")
 	);
 }
 
@@ -139,7 +142,11 @@ fn structural_errors_each_and_in_order() {
 	let mut b = zero(56..64);
 	b[64] ^= 1;
 	assert_eq!(check(&b, d1()), Err(E::ZeroField(F::InstalledAt)));
-	let ctx_changed = unhex(vectors()["context_variants"]["genesis"].as_str().unwrap());
+	let ctx_changed = unhex(
+		vectors()["p3_context_variants"]["genesis"]
+			.as_str()
+			.unwrap(),
+	);
 	assert_eq!(check(&ctx_changed, d32(vv("digest_2"))), Err(E::Context));
 	let mut bad_sig = v.clone();
 	bad_sig[240] ^= 1;
@@ -153,7 +160,7 @@ fn structural_errors_each_and_in_order() {
 /// a coherently re-signed envelope, refuses Context (not Signature).
 #[test]
 fn every_context_field_is_bound() {
-	let variants = vectors()["context_variants"].clone();
+	let variants = vectors()["p3_context_variants"].clone();
 	let fields = [
 		"generation",
 		"cluster",
@@ -207,11 +214,11 @@ fn signature_failures_reach_the_signature_check() {
 		Err(E::Signature)
 	);
 	// The same bytes signed by the administrator under the statement domain.
-	let cross = vv("statement_domain_signature");
+	let cross = vv("p3_statement_domain_signature");
 	assert_eq!(cross[..232], v[..232]);
 	assert_eq!(check(&cross, d1()), Err(E::Signature));
 	// A non-canonical S (S + L): rejected by the strict verification.
-	let noncanonical = vv("noncanonical_s");
+	let noncanonical = vv("p3_noncanonical_s");
 	assert_eq!(noncanonical[..264], v[..264]);
 	assert_eq!(check(&noncanonical, d1()), Err(E::Signature));
 	// Sanity: the in-test re-signing reproduces the reference envelope byte for byte.
@@ -263,7 +270,7 @@ fn purpose_separation_reaches_signature_and_preserves_admin_checker() {
 	let mut adc = encode_admin_command2(&context(), d1(), &[0; 64]).unwrap();
 	let preimage = admin_command_preimage2(&adc).unwrap();
 	adc[232..].copy_from_slice(
-		&ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])
+		&ed25519_dalek::SigningKey::from_bytes(&ADMIN_SEED)
 			.sign(&preimage)
 			.to_bytes(),
 	);
@@ -276,7 +283,7 @@ fn purpose_separation_reaches_signature_and_preserves_admin_checker() {
 	);
 	assert_eq!(
 		check(
-			&signed_with(&body, [0x42; 32], b"VISROOT2-GOVERNANCE-COMMAND\0"),
+			&signed_with(&body, ADMIN_SEED, b"VISROOT2-GOVERNANCE-COMMAND\0"),
 			d1()
 		),
 		Err(GovernanceCommandError2::Signature)

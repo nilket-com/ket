@@ -1,3 +1,4 @@
+use super::profile_three_fixture::{M3_OTHER, M3_PRIME, exact_pin};
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
@@ -163,6 +164,63 @@ fn read(
 		inventory_pin,
 	})
 }
+// ---- Profile 3: M3_PRIME (m1's generation, cluster and epoch) in a marked directory ----
+fn three_pin() -> Digest2 {
+	exact_pin(&M3_PRIME)
+}
+impl Boot {
+	fn three() -> Self {
+		Self {
+			control: three_pin(),
+			length: 241,
+			index: 2,
+		}
+	}
+}
+fn reserve_three() -> OwnerRequest2 {
+	OwnerRequest2::Reserve {
+		manifest: AnyAdminManifest2::decode(&M3_PRIME).unwrap(),
+	}
+}
+fn three_identity() -> RootIdentity2 {
+	let any = AnyAdminManifest2::decode(&M3_PRIME).unwrap();
+	let a = any.admission();
+	RootIdentity2 {
+		generation: a.generation,
+		cluster: a.cluster,
+		pin: three_pin(),
+		admin_key: a.admin_key,
+	}
+}
+fn approve_three(state: &MutationAuthorityState2) -> OwnerRequest2 {
+	let id = three_identity();
+	OwnerRequest2::Approve {
+		identity: id,
+		observation: observe_bootstrap2(state).unwrap(),
+		confirmed: id,
+	}
+}
+// Exports into `out` and places the M3_PRIME manifest beside it as "m3.adm".
+fn export_three(owner: &mut OwnerDir2, out: &Path, name: &str) -> Digest2 {
+	let pin = owner.export(out, name).unwrap();
+	assert_eq!(pin, sha(&fs::read(out.join(name)).unwrap()));
+	fs::write(out.join("m3.adm"), M3_PRIME).unwrap();
+	pin
+}
+// A marked owner with M3_PRIME reserved and approved from `state`, exported to `out` as "inv".
+fn bound_export_three(
+	owner_dir: &Scratch,
+	out: &Scratch,
+	state: &MutationAuthorityState2,
+) -> (OwnerDir2, Digest2) {
+	let mut owner = OwnerDir2::create_v2(&owner_dir.0).unwrap();
+	owner.apply(&op(1), &reserve_three()).unwrap();
+	let outcome = owner.apply(&op(2), &approve_three(state)).unwrap();
+	assert_eq!(outcome.original.map(|e| e.op), Some(EventOp2::Approve));
+	assert_eq!(outcome.current, RootState2::Bound);
+	let pin = export_three(&mut owner, &out.0, "inv");
+	(owner, pin)
+}
 // An owner with m1 reserved and approved from `state`, exported to `out` as "inv".
 fn bound_export(
 	owner_dir: &Scratch,
@@ -181,11 +239,11 @@ fn bound_export(
 #[test]
 fn observation_round_trips_through_owner_approval_to_an_installed_admin() {
 	let (owner_dir, out) = (Scratch::new(), Scratch::new());
-	let state = Boot::standard().rooted();
+	let state = Boot::three().rooted();
 	let observation = observe_bootstrap2(&state).unwrap();
-	let (_owner, pin) = bound_export(&owner_dir, &out, &state);
-	let m1_pin = manifest("m1").1;
-	let tuple = read(&out.0, "m1.adm", Some(&m1_pin), "inv", Some(&pin)).unwrap();
+	let (_owner, pin) = bound_export_three(&owner_dir, &out, &state);
+	let pin3 = three_pin();
+	let tuple = read(&out.0, "m3.adm", Some(&pin3), "inv", Some(&pin)).unwrap();
 	let admin = install_admin2(&state, &tuple).unwrap();
 	let ctx = admin_context2(&admin);
 	let o = observation.identity;
@@ -196,13 +254,13 @@ fn observation_round_trips_through_owner_approval_to_an_installed_admin() {
 	assert_eq!(ctx.genesis, o.genesis_fingerprint);
 	assert_eq!(ctx.initial_epoch, o.initial_epoch);
 	assert_eq!(ctx.manifest_pin, o.pin);
-	assert_eq!(o.pin, m1_pin);
+	assert_eq!(o.pin, pin3);
 	assert_eq!(
 		format!(
 			"{:?}",
 			ReplicaFiles2 {
 				anchor: &AnchorDir2::open(&out.0).unwrap(),
-				manifest: c"m1.adm",
+				manifest: c"m3.adm",
 				manifest_pin: None,
 				snapshot: c"inv",
 				inventory_pin: None,
@@ -214,11 +272,11 @@ fn observation_round_trips_through_owner_approval_to_an_installed_admin() {
 #[test]
 fn observation_survives_tip_advances() {
 	let (owner_dir, out) = (Scratch::new(), Scratch::new());
-	let mut state = Boot::standard().rooted();
+	let mut state = Boot::three().rooted();
 	let original = observe_bootstrap2(&state).unwrap();
-	let (_owner, pin) = bound_export(&owner_dir, &out, &state);
-	let m1_pin = manifest("m1").1;
-	let tuple = read(&out.0, "m1.adm", Some(&m1_pin), "inv", Some(&pin)).unwrap();
+	let (_owner, pin) = bound_export_three(&owner_dir, &out, &state);
+	let pin3 = three_pin();
+	let tuple = read(&out.0, "m3.adm", Some(&pin3), "inv", Some(&pin)).unwrap();
 	let tip = |s: &MutationAuthorityState2| {
 		let (root, _) = root_and_origin2(s).unwrap();
 		(
@@ -251,9 +309,19 @@ fn observe_refusals() {
 		Some(ObserveError2::PrerequisiteUnavailable)
 	);
 	assert_eq!(
-		observe_bootstrap2(&Boot::standard().pre_root()).err(),
+		observe_bootstrap2(&Boot::three().pre_root()).err(),
 		Some(ObserveError2::PrerequisiteUnavailable)
 	);
+	// A non-241 length on a profile-3 root, placed by the test hook (no Bootstrap roots it).
+	let three = Boot::three().rooted();
+	assert!(observe_bootstrap2(&three).is_ok());
+	for wrong in [240, 242] {
+		assert_eq!(
+			observe_bootstrap2(&with_control_len_for_test(&three, wrong)).err(),
+			Some(ObserveError2::ControlLength),
+			"{wrong}"
+		);
+	}
 	// Legacy zero is a valid raw-math class but never an installable manifest.
 	let short = Boot {
 		length: 0,
@@ -270,22 +338,22 @@ fn observe_refusals() {
 }
 #[test]
 fn owner_conflict_paths_follow_the_accepted_owner_semantics() {
-	let m1_pin = manifest("m1").1;
+	let pin3 = three_pin();
 	// (a) A differing observation against a Bound root is BoundConflict: refused, no event.
 	let (owner_dir, out) = (Scratch::new(), Scratch::new());
-	let state = Boot::standard().rooted();
-	let (mut owner, _) = bound_export(&owner_dir, &out, &state);
+	let state = Boot::three().rooted();
+	let (mut owner, _) = bound_export_three(&owner_dir, &out, &state);
 	let other = Boot {
 		index: 3,
-		..Boot::standard()
+		..Boot::three()
 	}
 	.rooted();
 	assert_eq!(
-		owner.apply(&op(3), &approve(&other)).err(),
+		owner.apply(&op(3), &approve_three(&other)).err(),
 		Some(OwnerIoError2::Decision(OwnerError2::BoundConflict))
 	);
-	let pin = export(&mut owner, &out.0, "inv-b");
-	let tuple = read(&out.0, "m1.adm", Some(&m1_pin), "inv-b", Some(&pin)).unwrap();
+	let pin = export_three(&mut owner, &out.0, "inv-b");
+	let tuple = read(&out.0, "m3.adm", Some(&pin3), "inv-b", Some(&pin)).unwrap();
 	assert!(install_admin2(&state, &tuple).is_ok());
 	assert_eq!(
 		install_admin2(&other, &tuple).err(),
@@ -293,19 +361,19 @@ fn owner_conflict_paths_follow_the_accepted_owner_semantics() {
 	);
 	// (b) A Prepared root given a non-binding observation records a Conflict event.
 	let (owner_dir, out) = (Scratch::new(), Scratch::new());
-	let mut owner = OwnerDir2::open(&owner_dir.0).unwrap();
-	owner.apply(&op(1), &reserve_m1()).unwrap();
+	let mut owner = OwnerDir2::create_v2(&owner_dir.0).unwrap();
+	owner.apply(&op(1), &reserve_three()).unwrap();
 	let foreign = Boot {
-		control: manifest("m2").1,
-		..Boot::standard()
+		control: exact_pin(&M3_OTHER),
+		..Boot::three()
 	}
 	.rooted();
-	let outcome = owner.apply(&op(2), &approve(&foreign)).unwrap();
+	let outcome = owner.apply(&op(2), &approve_three(&foreign)).unwrap();
 	assert_eq!(outcome.original.map(|e| e.op), Some(EventOp2::Conflict));
 	assert_eq!(outcome.current, RootState2::Conflicted);
-	let pin = export(&mut owner, &out.0, "inv");
+	let pin = export_three(&mut owner, &out.0, "inv");
 	assert_eq!(
-		read(&out.0, "m1.adm", Some(&m1_pin), "inv", Some(&pin)).err(),
+		read(&out.0, "m3.adm", Some(&pin3), "inv", Some(&pin)).err(),
 		Some(ReplicaReadError2::Tuple(ReplicaAnchorError2::NotBound(
 			RootState2::Conflicted
 		)))
@@ -346,9 +414,9 @@ fn retirement_and_pins() {
 #[test]
 fn read_refusals_are_not_normalized() {
 	let (owner_dir, out) = (Scratch::new(), Scratch::new());
-	let state = Boot::standard().rooted();
-	let (_owner, pin) = bound_export(&owner_dir, &out, &state);
-	let (m1, m1_pin) = manifest("m1");
+	let state = Boot::three().rooted();
+	let (_owner, pin) = bound_export_three(&owner_dir, &out, &state);
+	let (manifest3, pin3) = (M3_PRIME.to_vec(), three_pin());
 	let dir = &out.0;
 	let tuple = |e: ReplicaAnchorError2| Some(ReplicaReadError2::Tuple(e));
 	let read_err = |input, error| Some(ReplicaReadError2::Read { input, error });
@@ -360,59 +428,59 @@ fn read_refusals_are_not_normalized() {
 		))
 	);
 	assert_eq!(
-		read(dir, "m1.adm", Some(&m1_pin), "nope", None).err(),
+		read(dir, "m3.adm", Some(&pin3), "nope", None).err(),
 		tuple(ReplicaAnchorError2::PrerequisiteUnavailable(
 			ReplicaInput2::InventoryPin
 		))
 	);
 	assert_eq!(
-		read(dir, "nope", Some(&m1_pin), "inv", Some(&pin)).err(),
+		read(dir, "nope", Some(&pin3), "inv", Some(&pin)).err(),
 		tuple(ReplicaAnchorError2::PrerequisiteUnavailable(
 			ReplicaInput2::Manifest
 		))
 	);
 	assert_eq!(
-		read(dir, "m1.adm", Some(&m1_pin), "nope", Some(&pin)).err(),
+		read(dir, "m3.adm", Some(&pin3), "nope", Some(&pin)).err(),
 		tuple(ReplicaAnchorError2::PrerequisiteUnavailable(
 			ReplicaInput2::Snapshot
 		))
 	);
 	// Reader refusals are reported as themselves.
-	symlink(dir.join("m1.adm"), dir.join("link")).unwrap();
+	symlink(dir.join("m3.adm"), dir.join("link")).unwrap();
 	assert_eq!(
-		read(dir, "link", Some(&m1_pin), "inv", Some(&pin)).err(),
+		read(dir, "link", Some(&pin3), "inv", Some(&pin)).err(),
 		read_err(ReplicaInput2::Manifest, AnchoredError2::Symlink)
 	);
 	fs::create_dir(dir.join("adir")).unwrap();
 	assert_eq!(
-		read(dir, "adir", Some(&m1_pin), "inv", Some(&pin)).err(),
+		read(dir, "adir", Some(&pin3), "inv", Some(&pin)).err(),
 		read_err(ReplicaInput2::Manifest, AnchoredError2::NotRegular)
 	);
 	assert_eq!(
-		read(dir, "../x", Some(&m1_pin), "inv", Some(&pin)).err(),
+		read(dir, "../x", Some(&pin3), "inv", Some(&pin)).err(),
 		read_err(ReplicaInput2::Manifest, AnchoredError2::Escape)
 	);
-	fs::write(dir.join("locked"), &m1).unwrap();
+	fs::write(dir.join("locked"), &manifest3).unwrap();
 	fs::set_permissions(dir.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
 	if fs::read(dir.join("locked")).is_ok() {
 		eprintln!("G1C_SKIP permission: running with privilege that ignores mode 000");
 	} else {
 		assert_eq!(
-			read(dir, "locked", Some(&m1_pin), "inv", Some(&pin)).err(),
+			read(dir, "locked", Some(&pin3), "inv", Some(&pin)).err(),
 			read_err(ReplicaInput2::Manifest, AnchoredError2::Permission)
 		);
 	}
-	// Exact admitted limits: the manifest at 137 bytes is read (the round trip above); one more
+	// Exact admitted limits: the manifest at 241 bytes is read (the round trip above); one more
 	// byte is the reader's TooLarge, reported as Part A's Length.
-	fs::write(dir.join("long.adm"), [m1.as_slice(), &[0]].concat()).unwrap();
+	fs::write(dir.join("long.adm"), [manifest3.as_slice(), &[0]].concat()).unwrap();
 	assert_eq!(
-		read(dir, "long.adm", Some(&m1_pin), "inv", Some(&pin)).err(),
+		read(dir, "long.adm", Some(&pin3), "inv", Some(&pin)).err(),
 		tuple(ReplicaAnchorError2::Length(ReplicaInput2::Manifest))
 	);
 	// A short manifest reaches Part A, whose length check precedes its digest check.
-	fs::write(dir.join("short.adm"), &m1[..10]).unwrap();
+	fs::write(dir.join("short.adm"), &manifest3[..10]).unwrap();
 	assert_eq!(
-		read(dir, "short.adm", Some(&m1_pin), "inv", Some(&pin)).err(),
+		read(dir, "short.adm", Some(&pin3), "inv", Some(&pin)).err(),
 		tuple(ReplicaAnchorError2::Length(ReplicaInput2::Manifest))
 	);
 	// A snapshot of exactly the admitted size passes the reader and, pinned with the hash of those
@@ -420,7 +488,7 @@ fn read_refusals_are_not_normalized() {
 	let exact = vec![0u8; MAX_SNAPSHOT_BYTES2];
 	fs::write(dir.join("exact"), &exact).unwrap();
 	assert!(matches!(
-		read(dir, "m1.adm", Some(&m1_pin), "exact", Some(&sha(&exact))).err(),
+		read(dir, "m3.adm", Some(&pin3), "exact", Some(&sha(&exact))).err(),
 		Some(ReplicaReadError2::Tuple(
 			ReplicaAnchorError2::SnapshotCodec(_)
 		))
@@ -428,14 +496,14 @@ fn read_refusals_are_not_normalized() {
 	let over = vec![0u8; MAX_SNAPSHOT_BYTES2 + 1];
 	fs::write(dir.join("over"), &over).unwrap();
 	assert_eq!(
-		read(dir, "m1.adm", Some(&m1_pin), "over", Some(&sha(&over))).err(),
+		read(dir, "m3.adm", Some(&pin3), "over", Some(&sha(&over))).err(),
 		tuple(ReplicaAnchorError2::Length(ReplicaInput2::Snapshot))
 	);
-	// A binding refusal passes through: m2 with its correct pin against the m1 inventory.
-	let (m2, m2_pin) = manifest("m2");
-	fs::write(dir.join("m2.adm"), &m2).unwrap();
+	// A binding refusal passes through: other with its correct pin against the manifest3 inventory.
+	let (other, other_pin) = (M3_OTHER.to_vec(), exact_pin(&M3_OTHER));
+	fs::write(dir.join("other.adm"), &other).unwrap();
 	assert_eq!(
-		read(dir, "m2.adm", Some(&m2_pin), "inv", Some(&pin)).err(),
+		read(dir, "other.adm", Some(&other_pin), "inv", Some(&pin)).err(),
 		tuple(ReplicaAnchorError2::NotInInventory)
 	);
 }

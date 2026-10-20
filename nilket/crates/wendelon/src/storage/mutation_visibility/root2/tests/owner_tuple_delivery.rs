@@ -6,7 +6,9 @@
 //! anchor: it does not prove a replica deployment or an operator copy. The intended-root binding
 //! is C's and install's (against the committed root), distinct from the tuple's own-key entry
 //! selection, which the wrong-context case shows passing before C and install refuse.
-use super::profile_three_fixture::{exact_pin, expected_context, pre_root, rooted};
+use super::profile_three_fixture::{
+	M3_OTHER, M3_PRIMARY, M3_SIBLING, exact_pin, expected_context, pre_root, rooted,
+};
 use super::profile_two_binding::manifest_bytes;
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
@@ -62,7 +64,7 @@ impl Drop for Scratch {
 pub(super) const MANIFEST: &str = "root2.manifest";
 pub(super) const INVENTORY: &str = "root2.inventory";
 
-/// One owner whose manifest `name` was reserved and approved from the FIXTURE root committed with
+/// One owner whose manifest was reserved and approved from the FIXTURE root committed with
 /// Bootstrap `length`, then exported with `export_tuple` into `out`.
 pub(super) struct Delivered {
 	pub bytes: Vec<u8>,
@@ -87,10 +89,14 @@ pub(super) fn identity_of(bytes: &[u8]) -> RootIdentity2 {
 		admin_key: a.admin_key,
 	}
 }
-/// A real owner with `bytes` reserved (Prepared); nothing exported.
+/// A real owner with `bytes` reserved (Prepared); nothing exported. A profile-3 manifest is
+/// reserved in a marked (v2) directory; a profile-1/2 manifest in an unmarked one.
 pub(super) fn reserved(bytes: &[u8]) -> (Scratch, OwnerDir2) {
 	let dir = Scratch::new();
-	let mut owner = OwnerDir2::open(&dir.0).unwrap();
+	let mut owner = match AnyAdminManifest2::decode(bytes).unwrap() {
+		AnyAdminManifest2::Three(_) => OwnerDir2::create_v2(&dir.0).unwrap(),
+		_ => OwnerDir2::open(&dir.0).unwrap(),
+	};
 	let reserved = owner
 		.apply(
 			&op_id2([1; 16]).unwrap(),
@@ -105,8 +111,15 @@ pub(super) fn reserved(bytes: &[u8]) -> (Scratch, OwnerDir2) {
 	);
 	(dir, owner)
 }
+/// The profile-1/2 manifest `name`, delivered.
 pub(super) fn delivered(name: &str, length: u64) -> Delivered {
-	let bytes = manifest_bytes(name);
+	delivered_bytes(manifest_bytes(name), length)
+}
+/// A profile-3 manifest, delivered from its root committed at length 241.
+pub(super) fn delivered_three(manifest: &[u8]) -> Delivered {
+	delivered_bytes(manifest.to_vec(), 241)
+}
+fn delivered_bytes(bytes: Vec<u8>, length: u64) -> Delivered {
 	let any = AnyAdminManifest2::decode(&bytes).unwrap();
 	let identity = identity_of(&bytes);
 	let (_owner_dir, mut owner) = reserved(&bytes);
@@ -179,6 +192,121 @@ pub(super) fn read_delivered(d: &Delivered) -> Result<PinnedBoundTuple2, Replica
 		INVENTORY,
 		Some(&d.export.inventory_pin),
 	)
+}
+
+#[test]
+fn owner_export_tuple_feeds_install() {
+	let d = delivered_three(&M3_PRIMARY);
+	// The files are the owner's: the exact canonical manifest and nothing placed by the test.
+	assert_eq!(fs::read(d.out.at(MANIFEST)).unwrap(), d.bytes);
+	assert_eq!(d.export.manifest_pin, d.identity.pin);
+	assert_eq!(d.export.profile, ManifestProfile2::Three);
+	let tuple = read_delivered(&d).unwrap();
+	assert!(*tuple_manifest2(&tuple) == d.any);
+	assert_eq!(tuple_manifest_len2(&tuple), 241);
+	assert_eq!(
+		(tuple_manifest_pin2(&tuple), tuple_inventory_pin2(&tuple)),
+		(d.export.manifest_pin, d.export.inventory_pin)
+	);
+	assert_eq!(tuple_export_seq2(&tuple), d.export.export_seq);
+	// The owner-approved record is the observation of the committed root (Approve is seq 2).
+	let record = tuple_record2(&tuple);
+	assert!(record.identity == observe_bootstrap2(&d.root).unwrap().identity);
+	assert_eq!(
+		(record.inventory_seq, tuple_entry_last_seq2(&tuple)),
+		(2, 2)
+	);
+	// C: the actual Bootstrap verification from the pre-root reaches exactly the fixture root.
+	let (verified, _) =
+		advance_verified2(&pre_root(), &tuple, &d.committed, &d.entry, &d.cmd, None).unwrap();
+	assert_eq!(
+		encode_authority2(&verified).unwrap(),
+		encode_authority2(&d.root).unwrap()
+	);
+	// Install: identity, record, manifest binding, profile and the copied roles.
+	let admin = install_admin2(&verified, &tuple).unwrap();
+	let a = d.any.admission();
+	assert_eq!(
+		(admin_id2(&admin), admin_key2(&admin)),
+		(a.admin_id, a.admin_key)
+	);
+	assert!(admin_namespace2(&admin) == a.namespace);
+	assert!(admin_context2(&admin) == expected_context(&verified));
+	assert_eq!(admin_context2(&admin).manifest_pin, d.export.manifest_pin);
+	assert_eq!(
+		admin_context2(&admin).bootstrap_command,
+		record.identity.bootstrap_command
+	);
+	assert_eq!(
+		(admin_profile2(&admin), admin_manifest_len2(&admin)),
+		(ManifestProfile2::Three, 241)
+	);
+	let AnyAdminManifest2::Three(three) = &d.any else {
+		panic!("a profile-3 delivery")
+	};
+	assert!(admin_governance2(&admin).unwrap() == three.governance());
+	assert!(admin_recovery3(&admin).unwrap() == three.recovery());
+}
+
+/// Coherent owner tuples that pass the replica read and refuse only at C or install: a root
+/// committed to a sibling manifest's pin (same admission fields), a wrong length placed by the
+/// test hook, and a wrong context (another root's tuple, valid under its own pins, against this
+/// committed root).
+#[test]
+fn profile_three_owner_tuples_reach_the_c_and_install_refusals() {
+	let d = delivered_three(&M3_PRIMARY);
+	let tuple = read_delivered(&d).expect("the tuple prerequisites pass");
+	assert_eq!(tuple_manifest_len2(&tuple), 241);
+	// Pin swap: the root committed to M3_SIBLING's pin, against M3_PRIMARY's owner tuple.
+	let (cmd, entry, committed, sibling) = rooted(&M3_SIBLING, 241);
+	assert_eq!(
+		advance_verified2(&pre_root(), &tuple, &committed, &entry, &cmd, None).err(),
+		Some(VerifyError2::Consumer(RootError2::TrustMismatch))
+	);
+	let (root, _) = root_and_origin2(&sibling).unwrap();
+	assert_ne!(root.state.control_digest, d.export.manifest_pin);
+	assert_eq!(
+		install_admin2(&sibling, &tuple).err(),
+		Some(InstallError2::Commitment(CommitmentField2::ControlDigest))
+	);
+	// Only 241 roots a profile-3 Bootstrap, so a wrong length is placed by the test hook.
+	for wrong in [240, 242] {
+		assert_eq!(
+			install_admin2(&with_control_len_for_test(&d.root, wrong), &tuple).err(),
+			Some(InstallError2::Commitment(CommitmentField2::ControlLength)),
+			"{wrong}"
+		);
+	}
+	// Wrong context: each owner's tuple is valid by its own key, and refused against the other
+	// owner's committed root. C's Bootstrap authorization refuses: the tuple record names its own
+	// root, not the other entry's generation, cluster and control pin.
+	let (a, b) = (delivered_three(&M3_OTHER), delivered_three(&M3_PRIMARY));
+	let (ta, tb) = (read_delivered(&a).unwrap(), read_delivered(&b).unwrap());
+	for (tuple, other) in [(&tb, &a), (&ta, &b)] {
+		let (g, cl, _, _, _) = other.entry.fields();
+		let r = tuple_record2(tuple).identity;
+		assert_ne!((r.generation, r.cluster), (g, cl));
+		let Command2::Bootstrap { control, .. } = &other.cmd else {
+			unreachable!()
+		};
+		assert_ne!(*control, tuple_manifest_pin2(tuple));
+		assert_eq!(
+			advance_verified2(
+				&pre_root(),
+				tuple,
+				&other.committed,
+				&other.entry,
+				&other.cmd,
+				None
+			)
+			.err(),
+			Some(VerifyError2::Consumer(RootError2::TrustMismatch))
+		);
+		assert_eq!(
+			install_admin2(&other.root, tuple).err(),
+			Some(InstallError2::Commitment(CommitmentField2::ControlDigest))
+		);
+	}
 }
 
 #[test]

@@ -1,25 +1,24 @@
 //! Stage C narrow slice: command verification through `advance_verified2` only. Everything C
 //! cannot produce (enrollment, grants, revocation, coverage, raw comparisons) is built with
 //! clearly labelled FIXTURE transitions that use `VerifiedCommand2::fixture`. Governed Bootstrap
-//! and AdmissionPermission use the G1d gate fixtures; Reserve and Finalize use the auth KAT claim
-//! and holder attestation (RFC 8032 TEST 1 public seed) on an ungoverned root.
+//! and AdmissionPermission use the G1d gate fixtures on `M3_PRIME`; Reserve and Finalize use the
+//! auth KAT claim and holder attestation (RFC 8032 TEST 1 public seed) on the KAT root, governed by
+//! `M3_KAT` (or `M3_KAT_FOREIGN`) with the D-G3 Admission permission.
+use super::profile_three_fixture::{M3_KAT, exact_pin, m3_kat_foreign, tuple_of};
 use super::*;
-use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AdminManifest2, admin_manifest_digest2,
+	AdminManifest2, AnyAdminManifest2,
 };
-use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
+use crate::storage::mutation_visibility::root2::admin::record::{
+	BootstrapIdentity2, BootstrapRecord2,
+};
 use crate::storage::mutation_visibility::root2::admin_statement::admin_statement_preimage2;
 use crate::storage::mutation_visibility::root2::auth::preimage::{
 	admission_preimage2, holder_preimage2,
 };
 use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
 use crate::storage::mutation_visibility::root2::origin::*;
-use crate::storage::mutation_visibility::root2::provisioning::inventory::{
-	LogState2, RootEntry2, RootIdentity2, RootState2,
-};
 use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::*;
-use crate::storage::mutation_visibility::root2::provisioning::snapshot::encode_snapshot2;
 use crate::storage::mutation_visibility::root2::trust::CommittedEntry2;
 use crate::storage::mutation_visibility::root2::verification::*;
 use ed25519_dalek::Signer;
@@ -54,42 +53,18 @@ fn at(term: u64, node: u32, index: u64) -> EntryPosition2 {
 	EntryPosition2 { term, node, index }
 }
 
-// ---- Governed fixtures (G1d gate) ----
-fn manifest_prime() -> AdminManifest2 {
-	AdminManifest2::decode(&sv("manifest_prime")).unwrap()
+// ---- Governed fixtures (G1d gate, on M3_PRIME) ----
+fn prime_admission() -> AdminManifest2 {
+	AnyAdminManifest2::decode(&sv("p3_manifest"))
+		.unwrap()
+		.admission()
+		.clone()
 }
 fn record() -> BootstrapRecord2 {
-	BootstrapRecord2::decode(&sv("record")).unwrap()
+	BootstrapRecord2::decode(&sv("p3_record")).unwrap()
 }
 fn tuple_for(record: BootstrapRecord2) -> PinnedBoundTuple2 {
-	let bytes = sv("manifest_prime");
-	let manifest = AdminManifest2::decode(&bytes).unwrap();
-	let pin = admin_manifest_digest2(bytes.as_slice().try_into().unwrap());
-	let snapshot = encode_snapshot2(&LogState2 {
-		roots: vec![RootEntry2 {
-			terminal: None,
-			identity: RootIdentity2 {
-				generation: manifest.generation,
-				cluster: manifest.cluster,
-				pin,
-				admin_key: manifest.admin_key,
-			},
-			manifest: AnyAdminManifest2::One(manifest),
-			state: RootState2::Bound,
-			last_seq: record.inventory_seq,
-			record: Some(record),
-		}],
-		last_seq: record.inventory_seq,
-	})
-	.unwrap();
-	let inventory_pin = crate::storage::mutation_visibility::root2::codec::hash(b"", &snapshot);
-	validate_replica_tuple2(&ReplicaInputs2 {
-		manifest: Some(&bytes),
-		manifest_pin: Some(&pin),
-		snapshot: Some(&snapshot),
-		inventory_pin: Some(&inventory_pin),
-	})
-	.unwrap()
+	tuple_of(&sv("p3_manifest"), record)
 }
 fn tuple() -> PinnedBoundTuple2 {
 	tuple_for(record())
@@ -103,8 +78,8 @@ fn pre_root(genesis: Digest2) -> MutationAuthorityState2 {
 }
 fn governed(epoch_delta: u64, control: Option<Digest2>, length: u64) -> Command2 {
 	Command2::Bootstrap {
-		epoch: manifest_prime().initial_epoch + epoch_delta,
-		control: control.unwrap_or_else(|| d32(sv("manifest_prime_pin"))),
+		epoch: prime_admission().initial_epoch + epoch_delta,
+		control: control.unwrap_or_else(|| d32(sv("p3_manifest_pin"))),
 		length,
 	}
 }
@@ -118,8 +93,8 @@ fn bootstrap_inputs(g: [u8; 16], c: [u8; 16], cmd: &Command2) -> (CommittedEntry
 }
 /// The governed root, rooted THROUGH C.
 fn governed_root() -> MutationAuthorityState2 {
-	let m = manifest_prime();
-	let cmd = governed(0, None, 137);
+	let m = prime_admission();
+	let cmd = governed(0, None, 241);
 	let (ce, e) = bootstrap_inputs(m.generation, m.cluster, &cmd);
 	let (s, r) =
 		advance_verified2(&pre_root(d32(sv("genesis"))), &tuple(), &ce, &e, &cmd, None).unwrap();
@@ -197,7 +172,7 @@ fn consumed(before: &MutationAuthorityState2, out: Out, reason: u16, i: u64) {
 	assert_eq!(bytes(&normalized), bytes(&after), "no other effect");
 }
 
-// ---- KAT fixtures (ungoverned root: no Admission permission rule) ----
+// ---- KAT fixtures (governed by M3_KAT; the D-G3 permission admits the KAT claim) ----
 fn g() -> [u8; 16] {
 	kat("generation").try_into().unwrap()
 }
@@ -225,19 +200,27 @@ fn finalize(h: HolderAttestation2) -> Command2 {
 fn revoke() -> Command2 {
 	Command2::RevokeAuthority(claim().authority)
 }
-/// FIXTURE history through raw consumers: Bootstrap (2), EnrollSelector (3), Grant (4),
-/// EnrollAuthority with `key` (5, if `enroll`), then a renewal Grant or a Blank cover at 6. Ready
-/// for a Reserve at 7.
+/// FIXTURE history through raw consumers: Bootstrap (2) committing to `M3_KAT` (or, on the foreign
+/// cluster, `M3_KAT_FOREIGN`) at length 241, EnrollSelector (3), Grant (4), EnrollAuthority with
+/// `key` (5, if `enroll`), then at 6 a renewal Grant, or the D-G3 Admission permission for the
+/// claim (`enroll`), or a Blank cover. Ready for a Reserve at 7.
 fn kat_root(cluster: [u8; 16], key: Digest2, enroll: bool, renew: bool) -> MutationAuthorityState2 {
 	let cl = claim();
 	let o = cl.original.clone();
 	assert_eq!(o.log, l(4), "the KAT grant sits at (1,1,4)");
+	let (manifest, statement) = if cluster == c() {
+		(M3_KAT, "p3_kat_grant")
+	} else {
+		(m3_kat_foreign(), "p3_kat_foreign_grant")
+	};
+	let pin = exact_pin(&manifest);
 	let boot = Command2::Bootstrap {
 		epoch: o.lease.epoch,
-		control: [0x9f; 32],
-		length: 0,
+		control: pin,
+		length: 241,
 	};
 	let (ce, e) = bootstrap_inputs(g(), cluster, &boot);
+	let (_, _, _, fp, d) = e.fields();
 	let v = VerifiedCommand2::fixture(g(), cluster, &boot, &[], 0).unwrap();
 	let mut s = bootstrap2(&pre_root([0x11; 32]), &ce, &e, &v, &boot)
 		.unwrap()
@@ -282,11 +265,42 @@ fn kat_root(cluster: [u8; 16], key: Digest2, enroll: bool, renew: bool) -> Mutat
 	if renew {
 		let mut lease = o.lease.clone();
 		lease.expiry.physical_ms += 1000;
-		raw(&s, g(), cluster, &grant(lease), 6, 0).0
-	} else {
-		let blank = CommittedEntry2::fixture(at(1, 1, 6), [6; 32], EntryClass2::Blank);
-		advance_cover2(&s, &blank).unwrap().0
+		return raw(&s, g(), cluster, &grant(lease), 6, 0).0;
 	}
+	if !enroll {
+		let blank = CommittedEntry2::fixture(at(1, 1, 6), [6; 32], EntryClass2::Blank);
+		return advance_cover2(&s, &blank).unwrap().0;
+	}
+	// The tuple binds the KAT manifest to this Bootstrap at (1,1,2) over genesis [0x11; 32].
+	let record = BootstrapRecord2 {
+		identity: BootstrapIdentity2 {
+			generation: g(),
+			cluster,
+			pin,
+			initial_epoch: o.lease.epoch,
+			bootstrap: l(2),
+			bootstrap_fingerprint: fp,
+			bootstrap_command: d,
+			genesis_fingerprint: [0x11; 32],
+		},
+		inventory_seq: 1,
+	};
+	let v: serde_json::Value =
+		serde_json::from_str(include_str!("statement_vectors.json")).unwrap();
+	let cmd = Command2::AdmissionPermission(
+		unhex(v[statement]["bytes"].as_str().unwrap())
+			.try_into()
+			.unwrap(),
+	);
+	let e = TrustedEntry2::fixture(g(), cluster, l(6), &cmd).unwrap();
+	let v = VerifiedCommand2::fixture(g(), cluster, &cmd, &[], 0).unwrap();
+	let (s, r) = advance_admission2(&s, &tuple_of(&manifest, record), &e, &v, &cmd).unwrap();
+	assert!(
+		matches!(r, ApplyResult2::Permission { outcome: 1, .. }),
+		"{}",
+		describe(&r)
+	);
+	s
 }
 fn standard() -> MutationAuthorityState2 {
 	kat_root(c(), d32(kat("public_key")), true, false)
@@ -310,7 +324,7 @@ fn resigned(mut h: HolderAttestation2) -> HolderAttestation2 {
 
 #[test]
 fn bootstrap_authorized_only_by_exact_pin() {
-	let m = manifest_prime();
+	let m = prime_admission();
 	let (mg, mc) = (m.generation, m.cluster);
 	let genesis = d32(sv("genesis"));
 	assert!(origin_view2(&governed_root()) == OriginView2::Root);
@@ -319,25 +333,25 @@ fn bootstrap_authorized_only_by_exact_pin() {
 	type Edit = fn(&mut BootstrapRecord2);
 	let none: Edit = |_| {};
 	let cases: Vec<(&str, [u8; 16], [u8; 16], Command2, Edit)> = vec![
-		("generation", [0x5a; 16], mc, governed(0, None, 137), none),
-		("cluster", mg, [0x5b; 16], governed(0, None, 137), none),
-		("initial_epoch", mg, mc, governed(1, None, 137), none),
-		("control", mg, mc, governed(0, Some([0x55; 32]), 137), none),
-		("length", mg, mc, governed(0, None, 189), none),
-		("bootstrap", mg, mc, governed(0, None, 137), |r| {
+		("generation", [0x5a; 16], mc, governed(0, None, 241), none),
+		("cluster", mg, [0x5b; 16], governed(0, None, 241), none),
+		("initial_epoch", mg, mc, governed(1, None, 241), none),
+		("control", mg, mc, governed(0, Some([0x55; 32]), 241), none),
+		("length", mg, mc, governed(0, None, 242), none),
+		("bootstrap", mg, mc, governed(0, None, 241), |r| {
 			r.identity.bootstrap = l(3)
 		}),
 		(
 			"bootstrap_fingerprint",
 			mg,
 			mc,
-			governed(0, None, 137),
+			governed(0, None, 241),
 			|r| r.identity.bootstrap_fingerprint = [0x99; 32],
 		),
-		("bootstrap_command", mg, mc, governed(0, None, 137), |r| {
+		("bootstrap_command", mg, mc, governed(0, None, 241), |r| {
 			r.identity.bootstrap_command = [0x98; 32]
 		}),
-		("genesis_fingerprint", mg, mc, governed(0, None, 137), |r| {
+		("genesis_fingerprint", mg, mc, governed(0, None, 241), |r| {
 			r.identity.genesis_fingerprint = [0x77; 32]
 		}),
 	];
@@ -355,6 +369,24 @@ fn bootstrap_authorized_only_by_exact_pin() {
 			Some(VerifyError2::Consumer(RootError2::TrustMismatch)),
 			"{name}"
 		);
+		if name == "length" {
+			// Only 241 is a canonical length, so the fixture token refuses 242 too (ControlClass).
+			// The positive control is production verification at 241 against its own record.
+			let v = VerifiedCommand2::fixture(gg, cc, &cmd, &[], 0).unwrap();
+			assert_eq!(
+				bootstrap2(&pre, &ce, &e, &v, &cmd).err(),
+				Some(RootError2::ControlClass)
+			);
+			let cmd = governed(0, None, 241);
+			let (ce, e) = bootstrap_inputs(gg, cc, &cmd);
+			let (_, _, _, fp, d) = e.fields();
+			let mut r = record();
+			r.identity.bootstrap_fingerprint = fp;
+			r.identity.bootstrap_command = d;
+			let (_, out) = advance_verified2(&pre, &tuple_for(r), &ce, &e, &cmd, None).unwrap();
+			assert!(out == ApplyResult2::Registered(l(2)), "{name} control");
+			continue;
+		}
 		// The same inputs with an always-authorized FIXTURE token root: only C's verdict refused.
 		let v = VerifiedCommand2::fixture(gg, cc, &cmd, &[], 0).unwrap();
 		assert!(
@@ -363,7 +395,7 @@ fn bootstrap_authorized_only_by_exact_pin() {
 		);
 	}
 	// State kind, before the consumer's committed binding.
-	let cmd = governed(0, None, 137);
+	let cmd = governed(0, None, 241);
 	let (ce, e) = bootstrap_inputs(mg, mc, &cmd);
 	let wrong = CommittedEntry2::fixture(at(1, 1, 9), [0; 32], EntryClass2::Blank);
 	for (s, committed) in [
@@ -380,7 +412,7 @@ fn bootstrap_authorized_only_by_exact_pin() {
 
 #[test]
 fn admission_permission_advances_a_rooted_state() {
-	let m = manifest_prime();
+	let m = prime_admission();
 	let (mg, mc) = (m.generation, m.cluster);
 	// FIXTURE: enroll the statement's authority at 3 (EnrollAuthority is unsupported by C).
 	let enroll = Command2::EnrollAuthority {
@@ -397,7 +429,7 @@ fn admission_permission_advances_a_rooted_state() {
 	let s = raw(&governed_root(), mg, mc, &enroll, 3, 0).0;
 	let v: serde_json::Value =
 		serde_json::from_str(include_str!("statement_vectors.json")).unwrap();
-	let grant: [u8; 337] = unhex(v["grant"]["bytes"].as_str().unwrap())
+	let grant: [u8; 337] = unhex(v["p3_grant"]["bytes"].as_str().unwrap())
 		.try_into()
 		.unwrap();
 	let cmd = Command2::AdmissionPermission(grant);
@@ -409,7 +441,7 @@ fn admission_permission_advances_a_rooted_state() {
 	// Denied(8); the raw gate with an always-authorized token reports its own statement denial.
 	let mut tampered = grant;
 	tampered[336] ^= 1;
-	let other: [u8; 337] = unhex(v["other_signer"]["bytes"].as_str().unwrap())
+	let other: [u8; 337] = unhex(v["p3_other_signer"]["bytes"].as_str().unwrap())
 		.try_into()
 		.unwrap();
 	for bad in [tampered, other] {
@@ -618,8 +650,8 @@ fn committed_and_entry_binding() {
 		);
 	}
 	// Bootstrap: its binding is bootstrap2's.
-	let m = manifest_prime();
-	let boot = governed(0, None, 137);
+	let m = prime_admission();
+	let boot = governed(0, None, 241);
 	let (ce, e) = bootstrap_inputs(m.generation, m.cluster, &boot);
 	let (pos, id, class) = ce.entry_fields();
 	for wrong in [
@@ -799,4 +831,19 @@ fn vectors_match_reference() {
 	);
 	assert_eq!(grant[273..].to_vec(), vv("statement_signature"));
 	assert_eq!(sv("admin_public"), vv("statement_admin_public"));
+}
+
+#[test]
+fn profile_three_statement_vectors_match_reference() {
+	let v: serde_json::Value =
+		serde_json::from_str(include_str!("statement_vectors.json")).unwrap();
+	let grant: [u8; 337] = unhex(v["p3_grant"]["bytes"].as_str().unwrap())
+		.try_into()
+		.unwrap();
+	assert_eq!(
+		admin_statement_preimage2(&grant).unwrap(),
+		vv("p3_statement_preimage")
+	);
+	assert_eq!(grant[273..].to_vec(), vv("p3_statement_signature"));
+	assert_eq!(sv("p3_admin_public"), vv("p3_statement_admin_public"));
 }

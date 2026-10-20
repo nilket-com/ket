@@ -24,6 +24,7 @@ mod origin;
 mod owner_tuple_delivery;
 mod prefix;
 mod profile_three_fixture;
+mod profile_three_invariants;
 mod profile_three_reserve;
 mod profile_two_binding;
 mod profile_two_chain;

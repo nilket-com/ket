@@ -1,7 +1,11 @@
 //! The dormant Admission issuer gate, end to end through `advance_admission2`, plus direct boundary
-//! cases on `Root2::reduce_admission`. Fixture cut: the G1d-1 rooted state (m1', Bootstrap at
-//! (1,1,2), TEST-S1-ENTRY stand-in), EnrollAuthority 0x41 rev 1 at (1,1,3), statements from the
-//! committed vectors and the independently re-signed variants in gate_vectors.json.
+//! cases on `Root2::reduce_admission`. Fixture cut: the G1d-1 rooted state on `M3_PRIME`
+//! (Bootstrap at (1,1,2), length 241, TEST-S1-ENTRY stand-in), EnrollAuthority 0x41 rev 1 at
+//! (1,1,3), statements from the committed `p3_` vectors and the independently re-signed `p3_`
+//! variants in gate_vectors.json.
+use super::profile_three_fixture::{
+	PRIME_GOVERNANCE, PRIME_RECOVERY, build_three, exact_pin, tuple_of,
+};
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
@@ -11,11 +15,7 @@ use crate::storage::mutation_visibility::root2::admission_registry::encode_permi
 use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
 use crate::storage::mutation_visibility::root2::incremental::Derived2;
 use crate::storage::mutation_visibility::root2::origin::*;
-use crate::storage::mutation_visibility::root2::provisioning::inventory::{
-	LogState2, RootEntry2, RootIdentity2, RootState2,
-};
 use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::*;
-use crate::storage::mutation_visibility::root2::provisioning::snapshot::encode_snapshot2;
 use crate::storage::mutation_visibility::root2::trust::CommittedEntry2;
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -45,11 +45,14 @@ fn statement(name: &str) -> Command2 {
 fn variant(v: &str) -> Command2 {
 	Command2::AdmissionPermission(bytes337(unhex(v)))
 }
-fn manifest_prime() -> AdminManifest2 {
-	AdminManifest2::decode(&hex("manifest_prime")).unwrap()
+fn prime_admission() -> AdminManifest2 {
+	AnyAdminManifest2::decode(&hex("p3_manifest"))
+		.unwrap()
+		.admission()
+		.clone()
 }
 fn gc() -> ([u8; 16], [u8; 16]) {
-	let m = manifest_prime();
+	let m = prime_admission();
 	(m.generation, m.cluster)
 }
 fn at(term: u64, node: u32, index: u64) -> EntryPosition2 {
@@ -64,7 +67,7 @@ fn rooted_as(
 	index: u64,
 	changed: bool,
 ) -> MutationAuthorityState2 {
-	let m = manifest_prime();
+	let m = prime_admission();
 	let first = CommittedEntry2::fixture(at(0, 0, 0), genesis, EntryClass2::Membership);
 	let mut s = advance_pre_root2(&empty_authority2(), &first).unwrap().0;
 	for i in 1..index {
@@ -73,8 +76,8 @@ fn rooted_as(
 	}
 	let cmd = Command2::Bootstrap {
 		epoch: m.initial_epoch,
-		control: d32("manifest_prime_pin"),
-		length: 137,
+		control: d32("p3_manifest_pin"),
+		length: 241,
 	};
 	let mut e = TrustedEntry2::fixture(g, c, l(index), &cmd).unwrap();
 	if changed {
@@ -90,41 +93,13 @@ fn rooted(genesis: Digest2, changed: bool) -> MutationAuthorityState2 {
 	rooted_as(g, c, genesis, 2, changed)
 }
 fn tuple_for(manifest_bytes: &[u8], record: BootstrapRecord2) -> PinnedBoundTuple2 {
-	let manifest = AdminManifest2::decode(manifest_bytes).unwrap();
-	let pin = crate::storage::mutation_visibility::root2::admin::manifest::admin_manifest_digest2(
-		manifest_bytes.try_into().unwrap(),
-	);
-	let snapshot = encode_snapshot2(&LogState2 {
-		roots: vec![RootEntry2 {
-			terminal: None,
-			identity: RootIdentity2 {
-				generation: manifest.generation,
-				cluster: manifest.cluster,
-				pin,
-				admin_key: manifest.admin_key,
-			},
-			manifest: AnyAdminManifest2::One(manifest),
-			state: RootState2::Bound,
-			last_seq: record.inventory_seq,
-			record: Some(record),
-		}],
-		last_seq: record.inventory_seq,
-	})
-	.unwrap();
-	let inventory_pin = crate::storage::mutation_visibility::root2::codec::hash(b"", &snapshot);
-	validate_replica_tuple2(&ReplicaInputs2 {
-		manifest: Some(manifest_bytes),
-		manifest_pin: Some(&pin),
-		snapshot: Some(&snapshot),
-		inventory_pin: Some(&inventory_pin),
-	})
-	.unwrap()
+	tuple_of(manifest_bytes, record)
 }
 fn record() -> BootstrapRecord2 {
-	BootstrapRecord2::decode(&hex("record")).unwrap()
+	BootstrapRecord2::decode(&hex("p3_record")).unwrap()
 }
 fn tuple() -> PinnedBoundTuple2 {
-	tuple_for(&hex("manifest_prime"), record())
+	tuple_for(&hex("p3_manifest"), record())
 }
 fn authority() -> AuthorityRef2 {
 	AuthorityRef2 {
@@ -207,18 +182,18 @@ fn transplanted() -> Vec<InstalledAdmin2> {
 	other_genesis.identity.genesis_fingerprint = [0x77; 32];
 	let a = install_admin2(
 		&rooted([0x77; 32], false),
-		&tuple_for(&hex("manifest_prime"), other_genesis),
+		&tuple_for(&hex("p3_manifest"), other_genesis),
 	)
 	.unwrap();
 	let sibling = rooted(d32("genesis"), true);
 	let (_, origin) = root_and_origin2(&sibling).unwrap();
 	assert_ne!(
 		origin.bootstrap_fingerprint,
-		d32("bootstrap_fingerprint_stand_in")
+		d32("p3_bootstrap_fingerprint_stand_in")
 	);
 	let mut other_fp = record();
 	other_fp.identity.bootstrap_fingerprint = origin.bootstrap_fingerprint;
-	let b = install_admin2(&sibling, &tuple_for(&hex("manifest_prime"), other_fp)).unwrap();
+	let b = install_admin2(&sibling, &tuple_for(&hex("p3_manifest"), other_fp)).unwrap();
 	vec![a, b]
 }
 
@@ -226,7 +201,7 @@ fn transplanted() -> Vec<InstalledAdmin2> {
 fn gate_requires_whole_installed_administrator_context() {
 	let s = enrolled();
 	let before = bytes_of(&s);
-	let grant = statement("grant");
+	let grant = statement("p3_grant");
 	let (e, v) = entry(&grant, 4);
 	// No rooted state, the wrong command, or no installable administrator: nothing consumed.
 	assert_eq!(
@@ -252,15 +227,24 @@ fn gate_requires_whole_installed_administrator_context() {
 		advance_admission2(&s, &tuple(), &ce, &cv, &cover).err(),
 		Some(RootError2::TrustMismatch)
 	);
-	let original: serde_json::Value =
-		serde_json::from_str(include_str!("../provisioning/tests/anchor_vectors.json")).unwrap();
-	let m1 = unhex(original["manifests"]["m1"]["bytes"].as_str().unwrap());
-	let mut m1_record = record();
-	m1_record.identity.pin = unhex(original["manifests"]["m1"]["pin"].as_str().unwrap())
-		.try_into()
-		.unwrap();
+	// Another manifest: M3_PRIME's admission fields under another administrator key.
+	let mut rekeyed = prime_admission();
+	rekeyed.admin_key = super::profile_three_fixture::key(0x2F);
+	let other = build_three(
+		rekeyed,
+		(
+			PRIME_GOVERNANCE.0,
+			super::profile_three_fixture::key(PRIME_GOVERNANCE.1),
+		),
+		(
+			PRIME_RECOVERY.0,
+			super::profile_three_fixture::key(PRIME_RECOVERY.1),
+		),
+	);
+	let mut other_record = record();
+	other_record.identity.pin = exact_pin(&other);
 	assert_eq!(
-		advance_admission2(&s, &tuple_for(&m1, m1_record), &e, &v, &grant).err(),
+		advance_admission2(&s, &tuple_for(&other, other_record), &e, &v, &grant).err(),
 		Some(RootError2::TrustMismatch),
 		"install refused: another manifest"
 	);
@@ -287,7 +271,7 @@ fn gate_order_replay_gap_and_authorization() {
 	let s = enrolled();
 	let before = bytes_of(&s);
 	let admin = install_admin2(&s, &tuple()).unwrap();
-	let grant = statement("grant");
+	let grant = statement("p3_grant");
 	let (e, v) = entry(&grant, 4);
 	// 0. Only this command, even when called directly.
 	let cover = Command2::Cover {
@@ -358,7 +342,7 @@ fn gate_order_replay_gap_and_authorization() {
 		Some(RootError2::TrustMismatch)
 	);
 	// Replay of a consumed invalid-signature denial is metadata idempotence, never a permission.
-	let other_signer = statement("other_signer");
+	let other_signer = statement("p3_other_signer");
 	let (denied, r) = admit(&s, &other_signer, 4).unwrap();
 	assert!(is_denied(&r, 8, None));
 	let (again, r) = admit(&denied, &other_signer, 4).unwrap();
@@ -393,8 +377,8 @@ fn denied_with(reason: u16, reference: Option<u64>) -> ApplyResult2 {
 fn origin_facts() -> OriginFacts2 {
 	OriginFacts2 {
 		genesis: d32("genesis"),
-		bootstrap_fingerprint: d32("bootstrap_fingerprint_stand_in"),
-		bootstrap_command: d32("bootstrap_command"),
+		bootstrap_fingerprint: d32("p3_bootstrap_fingerprint_stand_in"),
+		bootstrap_command: d32("p3_bootstrap_command"),
 	}
 }
 // Every consumed step: the explicit result and its envelope round trip at exactly (g, c, i),
@@ -485,15 +469,15 @@ fn enroll_revision(revision: u64) -> Command2 {
 fn statement_failures_are_consumed_denials() {
 	let s = plain_step(&standard(), &enroll(), 3, &[]);
 	let mut cases = Vec::new();
-	for (name, value) in gv()["context_variants"].as_object().unwrap() {
+	for (name, value) in gv()["p3_context_variants"].as_object().unwrap() {
 		cases.push((name.clone(), variant(value.as_str().unwrap())));
 	}
 	cases.push((
 		"scope".into(),
-		variant(gv()["scope_variant"].as_str().unwrap()),
+		variant(gv()["p3_scope_variant"].as_str().unwrap()),
 	));
-	cases.push(("other_signer".into(), statement("other_signer")));
-	let mut flipped = unhex(sv()["grant"]["bytes"].as_str().unwrap());
+	cases.push(("other_signer".into(), statement("p3_other_signer")));
+	let mut flipped = unhex(sv()["p3_grant"]["bytes"].as_str().unwrap());
 	flipped[336] ^= 1;
 	cases.push((
 		"flipped".into(),
@@ -504,9 +488,9 @@ fn statement_failures_are_consumed_denials() {
 		step(&s, &c, 4, denied_with(8, None), &[]);
 	}
 	// Structural and relation faults are not consumed: Codec at the digest.
-	let mut magic = unhex(sv()["grant"]["bytes"].as_str().unwrap());
+	let mut magic = unhex(sv()["p3_grant"]["bytes"].as_str().unwrap());
 	magic[0] = b'X';
-	let mut namespace = unhex(sv()["grant"]["bytes"].as_str().unwrap());
+	let mut namespace = unhex(sv()["p3_grant"]["bytes"].as_str().unwrap());
 	namespace[224..240].fill(0xB2);
 	for bad in [magic, namespace] {
 		let c = Command2::AdmissionPermission(bytes337(bad));
@@ -522,8 +506,8 @@ fn statement_failures_are_consumed_denials() {
 #[test]
 fn grant_and_revoke_apply_through_the_gate() {
 	let (g, c) = gc();
-	let grant = statement("grant");
-	let revoke = statement("revoke");
+	let grant = statement("p3_grant");
+	let revoke = statement("p3_revoke");
 	let s = plain_step(&standard(), &enroll(), 3, &[]);
 	let s4 = step(
 		&s,
@@ -539,7 +523,7 @@ fn grant_and_revoke_apply_through_the_gate() {
 	// The post-grant root, independently constructed.
 	assert_eq!(
 		hex_of(&root_of(&s4).encode().unwrap()),
-		gv()["post_grant_root"]["hex"].as_str().unwrap()
+		gv()["p3_post_grant_root"]["hex"].as_str().unwrap()
 	);
 	let s5 = step(
 		&s4,
@@ -589,8 +573,8 @@ fn grant_and_revoke_apply_through_the_gate() {
 
 #[test]
 fn timelines_t1_to_t6_end_to_end() {
-	let grant = statement("grant");
-	let revoke = statement("revoke");
+	let grant = statement("p3_grant");
+	let revoke = statement("p3_revoke");
 	let base = plain_step(&standard(), &enroll(), 3, &[]);
 	// T1-T3 with the same statement bytes in later entries.
 	let s = step(
@@ -660,7 +644,7 @@ fn timelines_t1_to_t6_end_to_end() {
 	let s = step(&s, &grant, 5, denied_with(16, Some(4)), &[]);
 	let s = step(&s, &grant, 6, denied_with(16, Some(4)), &[]);
 	let s = plain_step(&s, &enroll_revision(2), 7, &[]);
-	let rev2 = variant(gv()["revision_2"].as_str().unwrap());
+	let rev2 = variant(gv()["p3_revision_2"].as_str().unwrap());
 	let s = step(
 		&s,
 		&rev2,
@@ -675,7 +659,7 @@ fn timelines_t1_to_t6_end_to_end() {
 #[test]
 fn legacy_paths_still_refuse_tag_eleven() {
 	let s = enrolled();
-	let grant = statement("grant");
+	let grant = statement("p3_grant");
 	let (e, v) = entry(&grant, 4);
 	assert_eq!(
 		advance_root2(&s, &e, &v, &grant).err(),
