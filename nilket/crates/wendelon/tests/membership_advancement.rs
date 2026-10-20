@@ -145,9 +145,10 @@ impl LeaderStatus for AlwaysLeader {
 
 #[tokio::test]
 async fn stale_peer_eviction_commits_through_control_ring() {
+	let node_dir = support::tempdir("membership-commit");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		1,
-		support::tempdir("membership-commit"),
+		node_dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -217,9 +218,10 @@ async fn stale_peer_eviction_commits_through_control_ring() {
 
 #[tokio::test]
 async fn minority_watchdog_cannot_force_local_only_eviction() {
+	let node_dir = support::tempdir("membership-minority");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		1,
-		support::tempdir("membership-minority"),
+		node_dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await

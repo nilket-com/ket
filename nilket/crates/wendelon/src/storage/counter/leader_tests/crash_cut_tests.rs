@@ -900,6 +900,9 @@ struct Rig {
 	quorum: usize,
 	/// The leader's wall clock; the system clock when `None`.
 	clock: Option<Arc<TestClock>>,
+	/// Owns the participants' scratch dir for the rig's whole life, across every
+	/// simulated crash and reopen. Last, so it drops after every other field.
+	_dir: crate::test_support::TestDir,
 }
 
 impl Rig {
@@ -912,6 +915,7 @@ impl Rig {
 				.collect(),
 			quorum: participants / 2 + 1,
 			clock: None,
+			_dir: dir,
 		}
 	}
 
@@ -1664,7 +1668,8 @@ async fn concurrent_resolutions_write_complete_identity_bound_frames() {
 // every frame is complete and decodes to the identity that wrote it.
 #[test]
 fn parallel_appends_to_a_real_log_never_interleave() {
-	let dir = slab_dir().join("witnesses");
+	let scratch = slab_dir();
+	let dir = scratch.join("witnesses");
 	let store = Arc::new(DurableCounterWitnessStore::open(&dir).unwrap());
 	let threads = 8u64;
 	let per_thread = 16u64;

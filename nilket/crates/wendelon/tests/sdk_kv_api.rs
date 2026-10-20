@@ -70,7 +70,7 @@ fn extract_single_kv(batch: &RecordBatch) -> (Vec<u8>, Vec<u8>) {
 
 #[tokio::test]
 async fn sdk_write_and_read_round_trip_over_inner_client() {
-	let node = support::bootstrap_node("sdk-roundtrip", 41).await;
+	let (_node_dir, node) = support::bootstrap_node("sdk-roundtrip", 41).await;
 	refresh_leases(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -108,7 +108,7 @@ async fn sdk_write_and_read_round_trip_over_inner_client() {
 
 #[tokio::test]
 async fn sdk_surfaces_quota_exceeded_without_retry_loop() {
-	let node = support::bootstrap_node("sdk-quota", 42).await;
+	let (_node_dir, node) = support::bootstrap_node("sdk-quota", 42).await;
 	refresh_leases(&node).await;
 	node.raft
 		.client_write(WendelonRequest::UpdateTenantQuota(UpdateTenantQuota {
@@ -148,7 +148,7 @@ async fn sdk_surfaces_quota_exceeded_without_retry_loop() {
 
 #[tokio::test]
 async fn sdk_query_reads_retained_snapshot_as_of_hlc() {
-	let node = support::bootstrap_node("sdk-query-time-travel", 43).await;
+	let (_node_dir, node) = support::bootstrap_node("sdk-query-time-travel", 43).await;
 	refresh_leases(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();

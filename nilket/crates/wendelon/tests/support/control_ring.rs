@@ -3,7 +3,6 @@ use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::watch;
 use wendelon::client::{
@@ -28,13 +27,13 @@ const ZERO_NODE: NodeId = NodeId {
 
 pub type LoopbackRegistry = SimulatedTransportNetwork;
 
-pub fn tempdir(tag: &str) -> PathBuf {
-	let base = std::env::temp_dir().join(format!(
-		"wendelon-control-ring-{tag}-{}",
-		uuid::Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&base).unwrap();
-	base
+#[path = "../../src/test_support/test_dir.rs"]
+mod test_dir;
+pub(crate) use test_dir::TestDir;
+
+/// A scratch dir removed on drop; hold it for as long as any node uses it.
+pub fn tempdir(tag: &str) -> TestDir {
+	TestDir::new(&format!("wendelon-control-ring-{tag}"))
 }
 
 #[allow(dead_code)]
@@ -58,15 +57,18 @@ pub fn abort_node(node: &WendelonNode) {
 	node.handles.abort();
 }
 
+/// A single-node cluster and the scratch dir that backs it; keep both for the whole test.
 #[allow(dead_code)]
-pub async fn bootstrap_node(tag: &str, node_id: u32) -> WendelonNode {
-	WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+pub async fn bootstrap_node(tag: &str, node_id: u32) -> (TestDir, WendelonNode) {
+	let dir = tempdir(tag);
+	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		node_id,
-		tempdir(tag),
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
-	.unwrap()
+	.unwrap();
+	(dir, node)
 }
 
 #[allow(dead_code)]

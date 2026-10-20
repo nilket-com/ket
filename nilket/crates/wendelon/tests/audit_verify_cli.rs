@@ -1,22 +1,16 @@
-use std::path::PathBuf;
+#[path = "../src/test_support/test_dir.rs"]
+mod test_dir;
 use std::process::Command;
 use std::sync::Arc;
 
-use uuid::Uuid;
 use wendelon::audit::{
 	AuditAuthority, AuditEvent, AuditOperation, AuditRootSigner, AuditSink, LocalAuditSink,
 	emit_signed_chain_root,
 };
 use wendelon::schema::NodeId;
 
-fn fresh_dir(tag: &str) -> PathBuf {
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-audit-verify-cli-{tag}-{}-{}",
-		std::process::id(),
-		Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+fn fresh_dir(tag: &str) -> test_dir::TestDir {
+	test_dir::TestDir::new(&format!("wendelon-audit-verify-cli-{tag}"))
 }
 
 fn node(id: u32) -> NodeId {

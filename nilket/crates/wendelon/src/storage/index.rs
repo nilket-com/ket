@@ -1669,12 +1669,12 @@ mod tests {
 		}
 	}
 
-	fn temp_path(tag: &str) -> PathBuf {
-		std::env::temp_dir().join(format!(
-			"wendelon-redb-{tag}-{}-{}.redb",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		))
+	/// A fresh index path inside its own scratch dir; hold the guard while the index
+	/// is open or reopened.
+	fn temp_path(tag: &str) -> (crate::test_support::TestDir, PathBuf) {
+		let dir = crate::test_support::TestDir::new(&format!("wendelon-redb-{tag}"));
+		let path = dir.join("index.redb");
+		(dir, path)
 	}
 
 	fn row() -> PersistentRecordRow {
@@ -1931,9 +1931,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn secondary_index_segments_persist_across_snapshot_and_delete() {
-		let index = PersistentLocalIndex::open(temp_path("secondary-index-segment"))
-			.await
-			.unwrap();
+		let (_dir, path) = temp_path("secondary-index-segment");
+		let index = PersistentLocalIndex::open(path).await.unwrap();
 		let row = secondary_index_segment_row();
 		index
 			.upsert_secondary_index_segment(row.clone())
@@ -1949,9 +1948,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn lsm_runs_persist_across_snapshot_and_delete() {
-		let index = PersistentLocalIndex::open(temp_path("lsm-runs"))
-			.await
-			.unwrap();
+		let (_dir, path) = temp_path("lsm-runs");
+		let index = PersistentLocalIndex::open(path).await.unwrap();
 		let run = lsm_run();
 		index
 			.apply(PersistentIndexUpdate {
@@ -1976,9 +1974,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn rebuild_preserves_existing_secondary_index_segments() {
-		let index = PersistentLocalIndex::open(temp_path("secondary-index-preserve"))
-			.await
-			.unwrap();
+		let (_dir, path) = temp_path("secondary-index-preserve");
+		let index = PersistentLocalIndex::open(path).await.unwrap();
 		let segment = secondary_index_segment_row();
 		index
 			.rebuild_with_secondary_index_segments(
@@ -2000,9 +1997,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn snapshot_only_surfaces_tiered_records() {
-		let index = PersistentLocalIndex::open(temp_path("snapshot"))
-			.await
-			.unwrap();
+		let (_dir, path) = temp_path("snapshot");
+		let index = PersistentLocalIndex::open(path).await.unwrap();
 		let tiered_pointer = TieredSlabPointer {
 			slab_id: SlabId::new(41),
 			l2_uri: "file:///tmp/tiered".into(),
@@ -2050,9 +2046,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn tiered_update_stamps_monotonic_control_log_index() {
-		let index = PersistentLocalIndex::open(temp_path("watermark"))
-			.await
-			.unwrap();
+		let (_dir, path) = temp_path("watermark");
+		let index = PersistentLocalIndex::open(path).await.unwrap();
 		let pointer = TieredSlabPointer {
 			slab_id: SlabId::new(9),
 			l2_uri: "file:///tmp/tiered-watermark".into(),
@@ -2099,7 +2094,7 @@ mod tests {
 	/// reset it.
 	#[tokio::test]
 	async fn a_rebuild_leaves_maintenance_receipts_untouched() {
-		let path = temp_path("adr0097-receipt-rebuild");
+		let (_dir, path) = temp_path("adr0097-receipt-rebuild");
 		let index = PersistentLocalIndex::open(path).await.unwrap();
 		index
 			.put_maintenance_receipt(vec![0, 11, 0, 0, 0, 0, 0, 0, 0, 5], vec![1, 2, 3])
@@ -2130,7 +2125,7 @@ mod tests {
 	/// cannot trust.
 	#[tokio::test]
 	async fn receipt_load_refuses_rows_over_its_bounds() {
-		let path = temp_path("adr0097-receipt-bounds");
+		let (_dir, path) = temp_path("adr0097-receipt-bounds");
 		let index = PersistentLocalIndex::open(path).await.unwrap();
 		for slab in 1..=3u8 {
 			index
@@ -2198,7 +2193,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn a_deleted_receipt_table_disables_receipts_but_not_the_index() {
-		let path = temp_path("adr0097-receipt-marker");
+		let (_dir, path) = temp_path("adr0097-receipt-marker");
 
 		// A store with ordinary index history AND a receipt.
 		let index = PersistentLocalIndex::open(path.clone()).await.unwrap();
@@ -2244,7 +2239,7 @@ mod tests {
 	/// them, which must NOT be mistaken for lost history.
 	#[tokio::test]
 	async fn a_fresh_store_initializes_receipts_and_reopens_available() {
-		let path = temp_path("adr0097-receipt-fresh");
+		let (_dir, path) = temp_path("adr0097-receipt-fresh");
 		let index = PersistentLocalIndex::open(path.clone()).await.unwrap();
 		assert!(index.receipts_available());
 		assert!(

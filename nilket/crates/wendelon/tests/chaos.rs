@@ -234,10 +234,11 @@ fn trusted_cfg(
 	rf: usize,
 	all_nodes: &[u32],
 	join_seeds: &[(u32, &str)],
-) -> NodeBootstrapConfig {
+) -> (support::TestDir, NodeBootstrapConfig) {
+	let scratch = support::tempdir(tag);
 	let mut cfg = NodeBootstrapConfig::dev(
 		node_id,
-		support::tempdir(tag),
+		scratch.to_path_buf(),
 		advertise_address.to_string(),
 	);
 	cfg.rf = rf;
@@ -263,7 +264,7 @@ fn trusted_cfg(
 		cfg.trusted_transfer_signers
 			.insert(*trusted_node_id, transfer_verifying_key_bytes(transfer));
 	}
-	cfg
+	(scratch, cfg)
 }
 
 async fn wait_for_cluster(node: &WendelonNode, expected_epoch: u64, expected_nodes: usize) {
@@ -425,6 +426,8 @@ struct ChaosCluster {
 	registry: Arc<SimulatedTransportNetwork>,
 	configs: BTreeMap<u32, NodeBootstrapConfig>,
 	nodes: BTreeMap<u32, WendelonNode>,
+	/// The nodes' data dirs, kept across every restart for the cluster's whole life.
+	_dirs: Vec<support::TestDir>,
 }
 
 impl ChaosCluster {
@@ -452,9 +455,11 @@ impl ChaosCluster {
 		let node2_addr = format!("loopback://{tag}-node-2");
 		let node3_addr = format!("loopback://{tag}-node-3");
 
-		let node1_cfg = trusted_cfg(tag, 1, &node1_addr, 3, &all_nodes, &[]);
-		let node2_cfg = trusted_cfg(tag, 2, &node2_addr, 3, &all_nodes, &[(1, &node1_addr)]);
-		let node3_cfg = trusted_cfg(tag, 3, &node3_addr, 3, &all_nodes, &[(1, &node1_addr)]);
+		let (node1_dir, node1_cfg) = trusted_cfg(tag, 1, &node1_addr, 3, &all_nodes, &[]);
+		let (node2_dir, node2_cfg) =
+			trusted_cfg(tag, 2, &node2_addr, 3, &all_nodes, &[(1, &node1_addr)]);
+		let (node3_dir, node3_cfg) =
+			trusted_cfg(tag, 3, &node3_addr, 3, &all_nodes, &[(1, &node1_addr)]);
 
 		let node1 =
 			Self::bootstrap_node(node1_cfg.clone(), provider_for(1, registry.clone())).await?;
@@ -474,6 +479,7 @@ impl ChaosCluster {
 			registry,
 			configs: BTreeMap::from([(1, node1_cfg), (2, node2_cfg), (3, node3_cfg)]),
 			nodes: BTreeMap::from([(1, node1), (2, node2), (3, node3)]),
+			_dirs: vec![node1_dir, node2_dir, node3_dir],
 		})
 	}
 

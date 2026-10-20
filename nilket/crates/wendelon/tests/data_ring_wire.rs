@@ -201,7 +201,7 @@ fn find_key_for_primary(ring: &wendelon::network::ring::RingRouter, target: Node
 
 #[tokio::test]
 async fn write_then_read_round_trip_over_hrft() {
-	let node = support::bootstrap_node("data-wire-roundtrip", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("data-wire-roundtrip", 1).await;
 	refresh_leases(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -253,7 +253,7 @@ async fn write_then_read_round_trip_over_hrft() {
 
 #[tokio::test]
 async fn write_req_and_read_req_return_epoch_stale_over_hrft() {
-	let node = support::bootstrap_node("data-wire-stale", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("data-wire-stale", 1).await;
 	refresh_leases(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -313,7 +313,7 @@ async fn write_req_and_read_req_return_epoch_stale_over_hrft() {
 
 #[tokio::test]
 async fn read_req_returns_e_safe_behind_over_hrft() {
-	let node = support::bootstrap_node("data-wire-esafe", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("data-wire-esafe", 1).await;
 	let service: Arc<dyn HrftService> = node.router.clone();
 	let (factory, pool) = support::loopback_factory(node.local_node, service);
 	let key = b"esafe-key";
@@ -339,7 +339,7 @@ async fn read_req_returns_e_safe_behind_over_hrft() {
 
 #[tokio::test]
 async fn write_req_and_read_req_return_not_leader_for_non_primary_range() {
-	let node = support::bootstrap_node("data-wire-not-leader", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("data-wire-not-leader", 1).await;
 	refresh_leases(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();

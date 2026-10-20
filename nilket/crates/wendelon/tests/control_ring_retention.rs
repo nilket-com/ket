@@ -81,7 +81,7 @@ fn hlc(physical_ms: u64) -> HybridTimestamp {
 
 #[tokio::test]
 async fn set_table_retention_policy_commits_through_control_ring() {
-	let node = support::bootstrap_node("retention-append", 61).await;
+	let (_node_dir, node) = support::bootstrap_node("retention-append", 61).await;
 	support::wait_for_local_leader(&node).await;
 
 	let descriptor = append_only_descriptor(0x61, "retention_append");
@@ -145,7 +145,7 @@ async fn set_table_retention_policy_commits_through_control_ring() {
 
 #[tokio::test]
 async fn pk_keyed_retention_override_rejects_through_control_ring() {
-	let node = support::bootstrap_node("retention-pk", 62).await;
+	let (_node_dir, node) = support::bootstrap_node("retention-pk", 62).await;
 	support::wait_for_local_leader(&node).await;
 
 	let descriptor = pk_descriptor(0x62, "retention_pk");
@@ -200,7 +200,7 @@ async fn pk_keyed_retention_override_rejects_through_control_ring() {
 
 #[tokio::test]
 async fn stale_policy_generation_rejects_generically_through_control_ring() {
-	let node = support::bootstrap_node("retention-stale", 63).await;
+	let (_node_dir, node) = support::bootstrap_node("retention-stale", 63).await;
 	support::wait_for_local_leader(&node).await;
 
 	let descriptor = append_only_descriptor(0x63, "retention_stale");

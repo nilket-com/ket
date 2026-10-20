@@ -2297,12 +2297,7 @@ mod tests {
 	}
 
 	async fn recovery_error_for_single_frame(tag: &str, frame: &[u8]) -> std::io::Error {
-		let dir = std::env::temp_dir().join(format!(
-			"wendelon-{tag}-{}-{}",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
-		std::fs::create_dir_all(&dir).unwrap();
+		let dir = crate::test_support::TestDir::new(&format!("wendelon-{tag}"));
 		let path = dir.join("slab_0000000000000000.wnd");
 		let file_ops = Arc::new(BlockingFileOps);
 		{
@@ -2428,12 +2423,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn recovery_indexes_multirow_synthetic_aliases() {
-		let dir = std::env::temp_dir().join(format!(
-			"wendelon-multirow-recovery-{}-{}",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
-		std::fs::create_dir_all(&dir).unwrap();
+		let dir = crate::test_support::TestDir::new("wendelon-multirow-recovery");
 		let path = dir.join("slab_0000000000000000.wnd");
 		let file_ops = Arc::new(BlockingFileOps);
 		let row0 = Identity::new([1; 32]);
@@ -2502,12 +2492,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn recovery_allows_row_tombstone_after_resurrection_data() {
-		let dir = std::env::temp_dir().join(format!(
-			"wendelon-resurrected-row-tombstone-recovery-{}-{}",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
-		std::fs::create_dir_all(&dir).unwrap();
+		let dir = crate::test_support::TestDir::new("wendelon-resurrected-row-tombstone-recovery");
 		let path = dir.join("slab_0000000000000000.wnd");
 		let file_ops = Arc::new(BlockingFileOps);
 		let row = Identity::new([6; 32]);
@@ -2584,12 +2569,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn recovery_fails_closed_on_duplicate_row_tombstones() {
-		let dir = std::env::temp_dir().join(format!(
-			"wendelon-duplicate-row-tombstone-recovery-{}-{}",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
-		std::fs::create_dir_all(&dir).unwrap();
+		let dir = crate::test_support::TestDir::new("wendelon-duplicate-row-tombstone-recovery");
 		let path = dir.join("slab_0000000000000000.wnd");
 		let file_ops = Arc::new(BlockingFileOps);
 		let row = Identity::new([3; 32]);
@@ -2798,12 +2778,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn durable_commit_returns_after_fdatasync_completes() {
-		let dir = std::env::temp_dir().join(format!(
-			"wendelon-group-commit-order-{}-{}",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
-		std::fs::create_dir_all(&dir).unwrap();
+		let dir = crate::test_support::TestDir::new("wendelon-group-commit-order");
 		let file_ops = Arc::new(RecordingFileOps::new());
 		let store = Arc::new(
 			LocalSlabStore::open(

@@ -25,14 +25,8 @@ use wendelon::schema::{
 	MsgType, NodeId, ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta, TenantId,
 };
 
-fn fresh_dir(tag: &str) -> PathBuf {
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-multinode-bootstrap-{tag}-{}-{}",
-		std::process::id(),
-		uuid::Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+fn fresh_dir(tag: &str) -> support::TestDir {
+	support::TestDir::new(&format!("wendelon-multinode-bootstrap-{tag}"))
 }
 
 fn hex(bytes: [u8; 32]) -> String {
@@ -166,8 +160,13 @@ fn trusted_cfg(
 	rf: usize,
 	all_nodes: &[u32],
 	join_seeds: &[(u32, &str)],
-) -> NodeBootstrapConfig {
-	let mut cfg = NodeBootstrapConfig::dev(node_id, fresh_dir(tag), advertise_address.to_string());
+) -> (support::TestDir, NodeBootstrapConfig) {
+	let scratch = fresh_dir(tag);
+	let mut cfg = NodeBootstrapConfig::dev(
+		node_id,
+		scratch.to_path_buf(),
+		advertise_address.to_string(),
+	);
 	cfg.rf = rf;
 	cfg.cluster = if join_seeds.is_empty() {
 		ClusterBootstrapConfig::Bootstrap
@@ -190,7 +189,7 @@ fn trusted_cfg(
 		cfg.trusted_transfer_signers
 			.insert(*trusted_node_id, transfer_verifying_key_bytes(transfer));
 	}
-	cfg
+	(scratch, cfg)
 }
 
 async fn wait_for_cluster(node: &WendelonNode, expected_epoch: u64, expected_nodes: usize) {
@@ -471,19 +470,20 @@ async fn bootstrap_partial_sequence(tag: &str, join_order: [u32; 2]) -> Bootstra
 	let node2_addr = "loopback://deterministic-node-2".to_string();
 	let node3_addr = "loopback://deterministic-node-3".to_string();
 
-	let node1 = WendelonNode::bootstrap_with_provider(
-		trusted_cfg(&format!("{tag}-node1"), 1, &node1_addr, 3, &all_nodes, &[]),
-		provider_for(1, registry.clone()),
-	)
-	.await
-	.unwrap();
+	let (_scratch_1, cfg_1) =
+		trusted_cfg(&format!("{tag}-node1"), 1, &node1_addr, 3, &all_nodes, &[]);
+	let node1 = WendelonNode::bootstrap_with_provider(cfg_1, provider_for(1, registry.clone()))
+		.await
+		.unwrap();
 
+	// Declared before the nodes so the dirs drop after them.
+	let mut joiner_dirs = Vec::new();
 	let mut node2 = None;
 	let mut node3 = None;
 	for joiner in join_order {
 		match joiner {
 			2 => {
-				let cfg = trusted_cfg(
+				let (cfg_dir, cfg) = trusted_cfg(
 					&format!("{tag}-node2"),
 					2,
 					&node2_addr,
@@ -491,6 +491,7 @@ async fn bootstrap_partial_sequence(tag: &str, join_order: [u32; 2]) -> Bootstra
 					&all_nodes,
 					&[(1, node1_addr.as_str())],
 				);
+				joiner_dirs.push(cfg_dir);
 				node2 = Some(
 					WendelonNode::bootstrap_with_provider(cfg, provider_for(2, registry.clone()))
 						.await
@@ -498,7 +499,7 @@ async fn bootstrap_partial_sequence(tag: &str, join_order: [u32; 2]) -> Bootstra
 				);
 			}
 			3 => {
-				let cfg = trusted_cfg(
+				let (cfg_dir, cfg) = trusted_cfg(
 					&format!("{tag}-node3"),
 					3,
 					&node3_addr,
@@ -506,6 +507,7 @@ async fn bootstrap_partial_sequence(tag: &str, join_order: [u32; 2]) -> Bootstra
 					&all_nodes,
 					&[(1, node1_addr.as_str())],
 				);
+				joiner_dirs.push(cfg_dir);
 				node3 = Some(
 					WendelonNode::bootstrap_with_provider(cfg, provider_for(3, registry.clone()))
 						.await
@@ -665,8 +667,9 @@ async fn restored_replacement_node_rejoins_live_cluster_and_catches_up() {
 	let node3_addr = "loopback://replacement-node-3".to_string();
 	let node4_addr = "loopback://replacement-node-4".to_string();
 
-	let node1_cfg = trusted_cfg("replacement-node1", 1, &node1_addr, 3, &trusted, &[]);
-	let node2_cfg = trusted_cfg(
+	let (_node1_cfg_dir, node1_cfg) =
+		trusted_cfg("replacement-node1", 1, &node1_addr, 3, &trusted, &[]);
+	let (_node2_cfg_dir, node2_cfg) = trusted_cfg(
 		"replacement-node2",
 		2,
 		&node2_addr,
@@ -674,7 +677,7 @@ async fn restored_replacement_node_rejoins_live_cluster_and_catches_up() {
 		&trusted,
 		&[(1, node1_addr.as_str())],
 	);
-	let node3_cfg = trusted_cfg(
+	let (_node3_cfg_dir, node3_cfg) = trusted_cfg(
 		"replacement-node3",
 		3,
 		&node3_addr,
@@ -727,7 +730,7 @@ async fn restored_replacement_node_rejoins_live_cluster_and_catches_up() {
 	wait_for_cluster(&node2, epoch_before_replacement + 1, 2).await;
 	wait_for_voters(&node1, &[1, 2]).await;
 
-	let replacement_cfg = trusted_cfg(
+	let (_replacement_cfg_dir, replacement_cfg) = trusted_cfg(
 		"replacement-node4-restored",
 		4,
 		&node4_addr,
@@ -776,8 +779,9 @@ async fn leader_failover_recovery_replays_post_failover_commits() {
 	let node2_addr = "loopback://failover-node-2".to_string();
 	let node3_addr = "loopback://failover-node-3".to_string();
 
-	let node1_cfg = trusted_cfg("failover-node1", 1, &node1_addr, 3, &all_nodes, &[]);
-	let node2_cfg = trusted_cfg(
+	let (_node1_cfg_dir, node1_cfg) =
+		trusted_cfg("failover-node1", 1, &node1_addr, 3, &all_nodes, &[]);
+	let (_node2_cfg_dir, node2_cfg) = trusted_cfg(
 		"failover-node2",
 		2,
 		&node2_addr,
@@ -785,7 +789,7 @@ async fn leader_failover_recovery_replays_post_failover_commits() {
 		&all_nodes,
 		&[(1, node1_addr.as_str())],
 	);
-	let node3_cfg = trusted_cfg(
+	let (_node3_cfg_dir, node3_cfg) = trusted_cfg(
 		"failover-node3",
 		3,
 		&node3_addr,

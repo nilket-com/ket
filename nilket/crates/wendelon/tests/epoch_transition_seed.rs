@@ -135,7 +135,7 @@ async fn advance_epoch_via_rpc(
 
 #[tokio::test]
 async fn chained_epoch_transition_preserves_deterministic_ids_and_lineage() {
-	let node = support::bootstrap_node("epoch-seed-lineage", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("epoch-seed-lineage", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -226,7 +226,7 @@ async fn chained_epoch_transition_preserves_deterministic_ids_and_lineage() {
 
 #[tokio::test]
 async fn advance_epoch_rpc_auto_seeds_reassigned_ranges() {
-	let node = support::bootstrap_node("epoch-seed-rpc", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("epoch-seed-rpc", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -270,7 +270,7 @@ async fn advance_epoch_rpc_auto_seeds_reassigned_ranges() {
 
 #[tokio::test]
 async fn replayed_committed_epoch_reconciles_missing_seed_batch_idempotently() {
-	let node = support::bootstrap_node("epoch-seed-replay", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("epoch-seed-replay", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let current = node.epoch_tx.borrow().clone();

@@ -320,7 +320,7 @@ impl TopologySource for CountingTopologySource {
 
 #[tokio::test]
 async fn client_retries_write_after_redirect_with_control_ring_refresh() {
-	let node = support::bootstrap_node("client-retry-write", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("client-retry-write", 1).await;
 	refresh_leases(&node).await;
 
 	let redirect_node = NodeId {
@@ -403,7 +403,7 @@ async fn client_retries_write_after_redirect_with_control_ring_refresh() {
 
 #[tokio::test]
 async fn client_refreshes_and_retries_read_after_e_safe_behind() {
-	let node = support::bootstrap_node("client-retry-read", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("client-retry-read", 1).await;
 	refresh_leases(&node).await;
 
 	let stable_services: Vec<(NodeId, Arc<dyn HrftService>)> =

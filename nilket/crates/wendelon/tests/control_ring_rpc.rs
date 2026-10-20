@@ -246,7 +246,7 @@ fn epoch_config_batch() -> RecordBatch {
 
 #[tokio::test]
 async fn lease_req_commits_through_control_ring_handler() {
-	let node = support::bootstrap_node("lease-rpc", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("lease-rpc", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -304,11 +304,8 @@ async fn lease_req_commits_through_control_ring_handler() {
 #[tokio::test]
 async fn configured_lease_ttl_reaches_local_manager_and_remote_grant_cap() {
 	const CONFIGURED_TTL_MILLIS: u64 = 90_000;
-	let mut config = NodeBootstrapConfig::dev(
-		1,
-		support::tempdir("lease-config-authority"),
-		"127.0.0.1:0".into(),
-	);
+	let node_dir = support::tempdir("lease-config-authority");
+	let mut config = NodeBootstrapConfig::dev(1, node_dir.to_path_buf(), "127.0.0.1:0".into());
 	config.data_ring_lease_ttl = Duration::from_millis(CONFIGURED_TTL_MILLIS);
 	let node = WendelonNode::bootstrap_single_node(config).await.unwrap();
 	support::wait_for_local_leader(&node).await;
@@ -383,7 +380,7 @@ async fn configured_lease_ttl_reaches_local_manager_and_remote_grant_cap() {
 
 #[tokio::test]
 async fn lease_req_rejects_invalid_target_before_commit() {
-	let node = support::bootstrap_node("lease-rpc-invalid-target", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("lease-rpc-invalid-target", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -442,7 +439,7 @@ async fn lease_req_rejects_invalid_target_before_commit() {
 
 #[tokio::test]
 async fn lease_req_rejects_non_canonical_range_for_owner() {
-	let node = support::bootstrap_node("lease-rpc-non-canonical", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("lease-rpc-non-canonical", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -497,7 +494,7 @@ async fn lease_req_rejects_non_canonical_range_for_owner() {
 
 #[tokio::test]
 async fn status_req_includes_topology_and_committed_lease_metadata() {
-	let node = support::bootstrap_node("status-with-lease", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("status-with-lease", 1).await;
 	support::wait_for_local_leader(&node).await;
 	node.handles.lease_manager.abort();
 
@@ -577,7 +574,7 @@ async fn status_req_includes_topology_and_committed_lease_metadata() {
 
 #[tokio::test]
 async fn audit_chain_head_req_returns_local_head_for_operator_auditor_and_observer() {
-	let node = support::bootstrap_node("audit-chain-head-rpc", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("audit-chain-head-rpc", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let operator_resp = node
@@ -628,7 +625,7 @@ async fn audit_chain_head_req_returns_local_head_for_operator_auditor_and_observ
 
 #[tokio::test]
 async fn audit_chain_head_req_rejects_data_node_actor() {
-	let node = support::bootstrap_node("audit-chain-head-authz", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("audit-chain-head-authz", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let err = node
@@ -646,7 +643,7 @@ async fn audit_chain_head_req_rejects_data_node_actor() {
 
 #[tokio::test]
 async fn lease_release_req_removes_committed_lease() {
-	let node = support::bootstrap_node("lease-release-rpc", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("lease-release-rpc", 1).await;
 	support::wait_for_local_leader(&node).await;
 	node.handles.lease_manager.abort();
 
@@ -722,11 +719,9 @@ async fn transfer_leadership_req_routes_to_control_handler() {
 	let target_secret = dev_transfer_signing_secret(2);
 	let leader_vk = transfer_verifying_key_bytes(leader_secret);
 	let target_vk = transfer_verifying_key_bytes(target_secret);
-	let mut leader_cfg = NodeBootstrapConfig::dev(
-		1,
-		support::tempdir("transfer-rpc-leader"),
-		"127.0.0.1:0".into(),
-	);
+	let leader_dir = support::tempdir("transfer-rpc-leader");
+	let mut leader_cfg =
+		NodeBootstrapConfig::dev(1, leader_dir.to_path_buf(), "127.0.0.1:0".into());
 	leader_cfg
 		.trusted_transfer_signers
 		.extend([(1, leader_vk), (2, target_vk)]);
@@ -734,11 +729,9 @@ async fn transfer_leadership_req_routes_to_control_handler() {
 		.await
 		.unwrap();
 	support::wait_for_local_leader(&leader).await;
-	let mut target_cfg = NodeBootstrapConfig::dev(
-		2,
-		support::tempdir("transfer-rpc-target"),
-		"127.0.0.1:1".into(),
-	);
+	let target_dir = support::tempdir("transfer-rpc-target");
+	let mut target_cfg =
+		NodeBootstrapConfig::dev(2, target_dir.to_path_buf(), "127.0.0.1:1".into());
 	target_cfg
 		.trusted_transfer_signers
 		.extend([(1, leader_vk), (2, target_vk)]);
@@ -852,7 +845,7 @@ async fn transfer_leadership_req_routes_to_control_handler() {
 
 #[tokio::test]
 async fn advance_epoch_req_routes_to_control_handler() {
-	let node = support::bootstrap_node("epoch-rpc", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("epoch-rpc", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -894,7 +887,7 @@ async fn advance_epoch_status_survives_restart() {
 	let dir = support::tempdir("epoch-rpc-restart");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		1,
-		dir.clone(),
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -920,10 +913,13 @@ async fn advance_epoch_status_survives_restart() {
 
 	node.shutdown().await.unwrap();
 
-	let recovered =
-		WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(1, dir, "127.0.0.1:0".into()))
-			.await
-			.unwrap();
+	let recovered = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		1,
+		dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
 	support::wait_for_local_leader(&recovered).await;
 
 	let recovered_service: Arc<dyn HrftService> = recovered.router.clone();
@@ -954,7 +950,7 @@ async fn advance_epoch_commit_emits_raft_audit_once_across_restart() {
 	let audit_path = dir.join("audit.ndjson");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		1,
-		dir.clone(),
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -996,10 +992,13 @@ async fn advance_epoch_commit_emits_raft_audit_once_across_restart() {
 
 	node.shutdown().await.unwrap();
 
-	let recovered =
-		WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(1, dir, "127.0.0.1:0".into()))
-			.await
-			.unwrap();
+	let recovered = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		1,
+		dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
 	support::wait_for_local_leader(&recovered).await;
 
 	let recovered_audit = read_audit_log(&audit_path);
@@ -1019,7 +1018,7 @@ async fn advance_epoch_commit_emits_raft_audit_once_across_restart() {
 
 #[tokio::test]
 async fn tenant_admin_create_and_list_flow_commits_through_control_ring() {
-	let node = support::bootstrap_node("tenant-admin-create", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("tenant-admin-create", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let create_resp = node
@@ -1070,7 +1069,7 @@ async fn tenant_admin_create_and_list_flow_commits_through_control_ring() {
 
 #[tokio::test]
 async fn tenant_admin_rotate_tenant_kek_commits_and_returns_new_active_version() {
-	let node = support::bootstrap_node("tenant-admin-rotate-kek", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("tenant-admin-rotate-kek", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let create_resp = node
@@ -1153,7 +1152,7 @@ async fn tenant_admin_rotate_tenant_kek_commits_and_returns_new_active_version()
 
 #[tokio::test]
 async fn tenant_admin_retire_tenant_kek_removes_safe_historical_version() {
-	let node = support::bootstrap_node("tenant-admin-retire-kek", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("tenant-admin-retire-kek", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let create_resp = node
@@ -1254,7 +1253,7 @@ async fn tenant_admin_retire_tenant_kek_removes_safe_historical_version() {
 
 #[tokio::test]
 async fn tenant_delete_requires_break_glass_certificate() {
-	let node = support::bootstrap_node("tenant-admin-delete-break-glass", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("tenant-admin-delete-break-glass", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let create_resp = node
@@ -1351,7 +1350,7 @@ async fn tenant_delete_requires_break_glass_certificate() {
 
 #[tokio::test]
 async fn tenant_admin_rejects_mutation_for_read_only_or_tenant_scoped_actor() {
-	let node = support::bootstrap_node("tenant-admin-authz", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("tenant-admin-authz", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let observer_resp = node
@@ -1441,7 +1440,7 @@ async fn tenant_admin_rejects_mutation_for_read_only_or_tenant_scoped_actor() {
 
 #[tokio::test]
 async fn advance_epoch_rejects_tenant_scoped_operator() {
-	let node = support::bootstrap_node("epoch-rpc-tenant-scoped-authz", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("epoch-rpc-tenant-scoped-authz", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let resp = node
@@ -1463,7 +1462,7 @@ async fn advance_epoch_rejects_tenant_scoped_operator() {
 
 #[tokio::test]
 async fn revocation_admin_commits_and_lists_replicated_revocations() {
-	let node = support::bootstrap_node("revocation-admin", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("revocation-admin", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let revoke_resp = node
@@ -1528,7 +1527,7 @@ async fn revocation_admin_commits_and_lists_replicated_revocations() {
 
 #[tokio::test]
 async fn revocation_admin_rejects_non_ops_and_tenant_scoped_callers() {
-	let node = support::bootstrap_node("revocation-admin-authz", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("revocation-admin-authz", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let data_node_resp = node

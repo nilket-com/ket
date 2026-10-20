@@ -11810,14 +11810,8 @@ mod recovery_tests {
 		}
 	}
 
-	fn tempdir(tag: &str) -> PathBuf {
-		let dir = std::env::temp_dir().join(format!(
-			"wendelon-raft-recovery-{tag}-{}-{}",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
-		std::fs::create_dir_all(&dir).unwrap();
-		dir
+	fn tempdir(tag: &str) -> crate::test_support::TestDir {
+		crate::test_support::TestDir::new(&format!("wendelon-raft-recovery-{tag}"))
 	}
 
 	fn artifact_paths(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
@@ -13732,7 +13726,7 @@ mod recovery_tests {
 	#[tokio::test]
 	async fn fault_injected_torn_tail_truncates_to_last_valid_prefix() {
 		let dir = tempdir("fault-torn-tail");
-		let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+		let file_ops = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
 		let mut store =
 			open_store_with_faults(&dir, file_ops.clone(), (DIRECT_IO_ALIGN as u64) * 2).await;
 
@@ -13780,7 +13774,7 @@ mod recovery_tests {
 	#[tokio::test]
 	async fn fault_injected_partial_commit_recovers_only_crash_durable_batch_prefix() {
 		let dir = tempdir("fault-partial-commit");
-		let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+		let file_ops = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
 		let mut store =
 			open_store_with_faults(&dir, file_ops.clone(), (DIRECT_IO_ALIGN as u64) * 3).await;
 
@@ -13823,7 +13817,7 @@ mod recovery_tests {
 	#[tokio::test]
 	async fn fault_injected_missing_directory_fsync_loses_rotated_segment_on_crash() {
 		let dir = tempdir("fault-missing-dir-fsync");
-		let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+		let file_ops = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
 		let mut store =
 			open_store_with_faults(&dir, file_ops.clone(), DIRECT_IO_ALIGN as u64).await;
 
@@ -13853,7 +13847,7 @@ mod recovery_tests {
 	#[tokio::test]
 	async fn fault_injected_mid_segment_corruption_fails_recovery_loudly() {
 		let dir = tempdir("fault-mid-segment");
-		let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+		let file_ops = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
 		let mut store =
 			open_store_with_faults(&dir, file_ops.clone(), DIRECT_IO_ALIGN as u64).await;
 		store
@@ -14677,7 +14671,7 @@ mod recovery_tests {
 	#[tokio::test]
 	async fn poison_after_uncertain_failure_refuses_every_mutator_without_io() {
 		let dir = tempdir("wal-poison");
-		let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+		let file_ops = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
 		let mut store =
 			open_store_with_faults(&dir, file_ops.clone(), DIRECT_IO_ALIGN as u64).await;
 		store
@@ -14747,7 +14741,7 @@ mod recovery_tests {
 	#[tokio::test]
 	async fn replacement_directory_sync_failure_poisons_the_store() {
 		let dir = tempdir("replacement-dir-sync");
-		let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+		let file_ops = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
 		let mut store =
 			open_store_with_faults(&dir, file_ops.clone(), DIRECT_IO_ALIGN as u64).await;
 		store
@@ -14913,7 +14907,7 @@ mod recovery_tests {
 		.after_matches(occurrence)
 	}
 
-	fn copy_store(seed: &Path) -> PathBuf {
+	fn copy_store(seed: &Path) -> crate::test_support::TestDir {
 		let dir = tempdir("stop");
 		copy_flat_artifacts(seed, &dir, None);
 		dir
@@ -14993,7 +14987,7 @@ mod recovery_tests {
 					let dir = copy_store(seed);
 					let mut after_stops = Vec::new();
 					for round in 0..rounds {
-						let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+						let file_ops = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
 						let mut store = try_open_faulty(&dir, file_ops.clone(), segment_bytes)
 							.await
 							.unwrap_or_else(|e| panic!("{label}: open in round {round}: {e}"));
@@ -15051,7 +15045,7 @@ mod recovery_tests {
 	}
 
 	/// Segments of three pages: [1,2,3] [C_old,4,5] [6,C,7], C_old = {1,0}, C = {2,1}.
-	async fn seed_older_checkpoint_in_suffix() -> PathBuf {
+	async fn seed_older_checkpoint_in_suffix() -> crate::test_support::TestDir {
 		let dir = tempdir("truncate-older-checkpoint");
 		let mut store = try_open_store_with_segment_bytes(&dir, 3 * WAL_PAGE)
 			.await
@@ -15307,7 +15301,7 @@ mod recovery_tests {
 
 	/// The state a truncate leaves between its steps 2 and 5, built by hand: [1,2,3] and the
 	/// holder Z = "8" holding C, past the tail.
-	fn seed_misnamed_holder(target: Option<Vec<AlignedBuf>>) -> PathBuf {
+	fn seed_misnamed_holder(target: Option<Vec<AlignedBuf>>) -> crate::test_support::TestDir {
 		let dir = tempdir("misnamed-holder");
 		let pages: Vec<AlignedBuf> = (1..=3)
 			.map(|i| serialize_entry_page(&finalize_entry(i, 100 * i)).unwrap())
@@ -15474,7 +15468,7 @@ mod recovery_tests {
 					);
 					let dir = copy_store(seed);
 					for round in 0..2 {
-						let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+						let file_ops = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
 						file_ops.inject(stop_at(op, occurrence));
 						match try_open_faulty(&dir, file_ops.clone(), segment_bytes).await {
 							Ok(_) => break,
@@ -15997,7 +15991,7 @@ mod recovery_tests {
 	}
 
 	/// [1,2,3] in segment 1, a snapshot at 3, and the given checkpoint-only files.
-	fn seed_snapshot_explained(holders: &[(u64, Vec<AlignedBuf>)]) -> PathBuf {
+	fn seed_snapshot_explained(holders: &[(u64, Vec<AlignedBuf>)]) -> crate::test_support::TestDir {
 		let dir = tempdir("snapshot-explained");
 		let pages: Vec<AlignedBuf> = (1..=3)
 			.map(|i| serialize_entry_page(&finalize_entry(i, 100 * i)).unwrap())
@@ -16243,7 +16237,11 @@ mod recovery_tests {
 
 	/// The trailing checkpoint-only shapes open-time completion acts on: past the tail (Z = 8 over
 	/// [1,2,3]) or below it, explained by a snapshot at 3 (Z = 3 over [1,2,3]).
-	fn seed_trailing_holder(below_tail: bool, z: &[AlignedBuf], suffix: &[u8]) -> PathBuf {
+	fn seed_trailing_holder(
+		below_tail: bool,
+		z: &[AlignedBuf],
+		suffix: &[u8],
+	) -> crate::test_support::TestDir {
 		let dir = tempdir("trailing-holder");
 		let pages: Vec<AlignedBuf> = (1..=3)
 			.map(|i| serialize_entry_page(&finalize_entry(i, 100 * i)).unwrap())
@@ -16621,7 +16619,10 @@ mod recovery_tests {
 	}
 
 	/// A source state machine with leases 1..=n applied, and its snapshot.
-	async fn source_snapshot(tag: &str, n: u64) -> Snapshot<WendelonTypeConfig> {
+	async fn source_snapshot(
+		tag: &str,
+		n: u64,
+	) -> (crate::test_support::TestDir, Snapshot<WendelonTypeConfig>) {
 		let dir = tempdir(tag);
 		let mut store = open_store(&dir).await;
 		let mut sm = store.recovered_state_machine().await.unwrap();
@@ -16633,7 +16634,8 @@ mod recovery_tests {
 				&mut sm,
 			)
 			.await;
-		builder.build_snapshot().await.unwrap()
+		let snapshot = builder.build_snapshot().await.unwrap();
+		(dir, snapshot)
 	}
 
 	/// The last-included index in a snapshot artifact's header, read from a returned stream.
@@ -16673,7 +16675,7 @@ mod recovery_tests {
 	/// returns its own metadata over its own bytes; an equal-identity build changes nothing.
 	#[tokio::test]
 	async fn stale_local_build_never_replaces_a_newer_installed_snapshot() {
-		let newer = source_snapshot("fr-source", 3).await;
+		let (_newer_dir, newer) = source_snapshot("fr-source", 3).await;
 		assert_eq!(newer.meta.last_log_id, Some(log_id(1, 3)));
 		let dir = tempdir("fr-target");
 		let gate = GatedSnapshotSyncFileOps::new(".build.tmp");
@@ -16746,7 +16748,7 @@ mod recovery_tests {
 	/// metadata and bytes naming the same artifact.
 	#[tokio::test]
 	async fn current_snapshot_metadata_and_bytes_agree_under_contention() {
-		let newer = source_snapshot("contention-source", 3).await;
+		let (_newer_dir, newer) = source_snapshot("contention-source", 3).await;
 		let dir = tempdir("contention-target");
 		let mut store = open_store_with_segment_bytes(&dir, 64 * WAL_PAGE).await;
 		let mut sm = store.recovered_state_machine().await.unwrap();
@@ -16803,7 +16805,7 @@ mod recovery_tests {
 	/// returns; the next entry then appends.
 	#[tokio::test]
 	async fn install_held_before_publication_keeps_the_purged_log() {
-		let newer = source_snapshot("held-source", 3).await;
+		let (_newer_dir, newer) = source_snapshot("held-source", 3).await;
 		let dir = tempdir("held-target");
 		let gate = GatedSnapshotSyncFileOps::new(".receive.tmp");
 		let mut store =
@@ -16863,7 +16865,7 @@ mod recovery_tests {
 	#[tokio::test]
 	async fn failed_publication_refuses_readers_and_publishers_until_reopen() {
 		let dir = tempdir("publication-failed");
-		let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+		let file_ops = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
 		let mut store = open_store_with_faults(&dir, file_ops.clone(), WAL_PAGE).await;
 		let mut sm = store.recovered_state_machine().await.unwrap();
 		append_and_apply(&mut store, &mut sm, lease_entry(1, 10, 19, 3)).await;
@@ -16875,7 +16877,7 @@ mod recovery_tests {
 					message: "injected snapshot directory sync failure".into(),
 				},
 			)
-			.for_path(dir.clone()),
+			.for_path(dir.to_path_buf()),
 		);
 		let mut builder =
 			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
@@ -17072,9 +17074,9 @@ mod recovery_tests {
 	/// reopen completes the cleanup.
 	#[tokio::test]
 	async fn cleanup_failure_fails_the_install_and_reopen_completes_it() {
-		let newer = source_snapshot("cleanup-fail-source", 3).await;
+		let (_newer_dir, newer) = source_snapshot("cleanup-fail-source", 3).await;
 		let dir = tempdir("cleanup-fail");
-		let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+		let file_ops = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
 		let mut store = open_store_with_faults(&dir, file_ops.clone(), WAL_PAGE).await;
 		store
 			.blocking_append(vec![finalize_entry(1, 100), finalize_entry(2, 200)])
@@ -17207,7 +17209,7 @@ mod recovery_tests {
 		snapshot_at(&dir, 3);
 		let mut lengths = Vec::new();
 		for round in 0..6 {
-			let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+			let file_ops = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
 			file_ops.inject(
 				InjectedFault::on(
 					FaultOp::Unlink,
@@ -17263,9 +17265,13 @@ mod recovery_tests {
 	async fn failed_publication_with_pending_holder(
 		tag: &str,
 		purged: bool,
-	) -> (PathBuf, WendelonLogStore, WendelonStateMachine) {
+	) -> (
+		crate::test_support::TestDir,
+		WendelonLogStore,
+		WendelonStateMachine,
+	) {
 		let dir = tempdir(tag);
-		let file_ops = Arc::new(FaultyFileOps::new(dir.clone()).unwrap());
+		let file_ops = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
 		let mut store = open_store_with_faults(&dir, file_ops.clone(), WAL_PAGE).await;
 		let mut sm = store.recovered_state_machine().await.unwrap();
 		append_and_apply(&mut store, &mut sm, lease_entry(1, 10, 19, 3)).await;
@@ -17285,7 +17291,7 @@ mod recovery_tests {
 					message: "injected snapshot directory sync failure".into(),
 				},
 			)
-			.for_path(dir.clone()),
+			.for_path(dir.to_path_buf()),
 		);
 		let mut builder =
 			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(

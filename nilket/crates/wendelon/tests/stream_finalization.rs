@@ -166,7 +166,7 @@ async fn read_marker(
 
 #[tokio::test]
 async fn stream_finalization_replays_after_floor_and_stays_ordered_under_write_load() {
-	let node = support::bootstrap_node("stream-finalization-order", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("stream-finalization-order", 1).await;
 	refresh_leases(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -203,7 +203,7 @@ async fn stream_finalization_replays_after_floor_and_stays_ordered_under_write_l
 
 #[tokio::test]
 async fn slow_finalization_consumer_is_dropped_without_stalling_writes() {
-	let node = support::bootstrap_node("stream-finalization-slow", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("stream-finalization-slow", 1).await;
 	refresh_leases(&node).await;
 
 	let mut rx = node.data_server.stream_finalization(0, 1).await.unwrap();

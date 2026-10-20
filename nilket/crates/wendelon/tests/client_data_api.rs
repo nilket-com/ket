@@ -213,7 +213,7 @@ fn find_key_for_primary(ring: &wendelon::network::ring::RingRouter, target: Node
 
 #[tokio::test]
 async fn client_write_and_read_round_trip_over_hrft() {
-	let node = support::bootstrap_node("client-data-roundtrip", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("client-data-roundtrip", 1).await;
 	refresh_leases(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -269,7 +269,7 @@ fn counter_client_uuid() -> [u8; 16] {
 #[tokio::test]
 async fn client_counter_fetch_add_round_trip_over_hrft() {
 	let client_uuid = counter_client_uuid();
-	let node = support::bootstrap_node("client-counter-add", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("client-counter-add", 1).await;
 	refresh_leases(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -340,7 +340,7 @@ async fn client_counter_fetch_add_round_trip_over_hrft() {
 #[tokio::test]
 async fn client_counter_read_round_trip_and_absent_over_hrft() {
 	let client_uuid = counter_client_uuid();
-	let node = support::bootstrap_node("client-counter-read", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("client-counter-read", 1).await;
 	refresh_leases(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -419,7 +419,7 @@ async fn client_counter_read_round_trip_and_absent_over_hrft() {
 
 #[tokio::test]
 async fn client_bulk_write_round_trips_multiple_items() {
-	let node = support::bootstrap_node("client-data-bulk", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("client-data-bulk", 1).await;
 	refresh_leases(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -467,7 +467,7 @@ async fn client_bulk_write_round_trips_multiple_items() {
 
 #[tokio::test]
 async fn client_surfaces_not_leader_statuses_explicitly() {
-	let node = support::bootstrap_node("client-data-not-leader", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("client-data-not-leader", 1).await;
 	refresh_leases(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();

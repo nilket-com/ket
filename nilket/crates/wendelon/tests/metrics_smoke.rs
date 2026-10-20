@@ -118,14 +118,8 @@ fn extract_value(batch: &RecordBatch) -> Vec<u8> {
 	values.value(0).to_vec()
 }
 
-fn fresh_dir(tag: &str) -> std::path::PathBuf {
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-metrics-smoke-{tag}-{}-{}",
-		std::process::id(),
-		uuid::Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+fn fresh_dir(tag: &str) -> support::TestDir {
+	support::TestDir::new(&format!("wendelon-metrics-smoke-{tag}"))
 }
 
 async fn scrape(addr: std::net::SocketAddr) -> String {
@@ -177,6 +171,7 @@ impl TierCommitter for DirectApplyCommitter {
 async fn build_manager_with_sealed_slabs(
 	l2: Arc<dyn ObjectStore>,
 ) -> (
+	support::TestDir,
 	Arc<SlabManager>,
 	Arc<dyn TierCommitter>,
 	WendelonStateMachine,
@@ -185,7 +180,7 @@ async fn build_manager_with_sealed_slabs(
 	let io = spawn_io_thread(64).unwrap();
 	let manager = Arc::new(
 		open_test_manager(SlabManagerConfig {
-			dir,
+			dir: dir.to_path_buf(),
 			max_slab_bytes: 1,
 			io,
 			l2: Some(l2),
@@ -219,7 +214,7 @@ async fn build_manager_with_sealed_slabs(
 	let sm = WendelonStateMachine::new();
 	let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 	let committer: Arc<dyn TierCommitter> = Arc::new(DirectApplyCommitter { observer });
-	(manager, committer, sm)
+	(dir, manager, committer, sm)
 }
 
 #[tokio::test]
@@ -227,7 +222,7 @@ async fn scrape_endpoint_exposes_data_ring_and_storage_metrics() {
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let exporter = exporter::spawn_on(listener).await.unwrap();
 
-	let node = support::bootstrap_node("metrics", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("metrics", 1).await;
 	support::wait_for_local_leader(&node).await;
 	let granted = node
 		.data_server
@@ -259,8 +254,9 @@ async fn scrape_endpoint_exposes_data_ring_and_storage_metrics() {
 	assert_eq!(extract_value(&read_batch.unwrap()), value);
 
 	let l2_root = fresh_dir("l2");
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
-	let (manager, committer, sm) = build_manager_with_sealed_slabs(l2.clone()).await;
+	let l2: Arc<dyn ObjectStore> =
+		Arc::new(LocalFsObjectStore::new(l2_root.to_path_buf()).unwrap());
+	let (_l1_dir, manager, committer, sm) = build_manager_with_sealed_slabs(l2.clone()).await;
 	let sweeper = SlabSweeper::new(
 		manager,
 		l2,

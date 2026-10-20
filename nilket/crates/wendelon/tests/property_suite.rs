@@ -301,7 +301,7 @@ fn property_register_linearizability_checker_accepts_legal_and_rejects_illegal_h
 async fn property_pending_finalization_restart_recovers_without_losing_value() {
 	let dir = support::tempdir("property-pending-finalization");
 	let audit_path = dir.join("audit.ndjson");
-	let cfg = NodeBootstrapConfig::dev(91, dir.clone(), "127.0.0.1:0".into());
+	let cfg = NodeBootstrapConfig::dev(91, dir.to_path_buf(), "127.0.0.1:0".into());
 	let node = WendelonNode::bootstrap_single_node(cfg.clone())
 		.await
 		.unwrap();
@@ -378,7 +378,7 @@ async fn property_pending_finalization_restart_recovers_without_losing_value() {
 #[tokio::test]
 async fn property_duplicate_replay_converges_to_a_legal_terminal_state() {
 	let dir = support::tempdir("property-replay-terminal");
-	let cfg = NodeBootstrapConfig::dev(92, dir.clone(), "127.0.0.1:0".into());
+	let cfg = NodeBootstrapConfig::dev(92, dir.to_path_buf(), "127.0.0.1:0".into());
 	let node = WendelonNode::bootstrap_single_node(cfg.clone())
 		.await
 		.unwrap();

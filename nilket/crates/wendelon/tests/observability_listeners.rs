@@ -1,3 +1,5 @@
+#[path = "../src/test_support/test_dir.rs"]
+mod test_dir;
 #[path = "support/tls_pki.rs"]
 mod tls_pki;
 
@@ -12,7 +14,6 @@ use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
-use uuid::Uuid;
 use wendelon::audit::{AuditEvent, AuditSink, LocalAuditSink};
 use wendelon::consensus::{RetentionStatus, RevokeActorKey, raft_storage::RevocationSnapshot};
 use wendelon::metrics::observability::{
@@ -23,14 +24,8 @@ use wendelon::network::{
 	rustls_client_config_with_alpn, rustls_server_config_with_peer_roots,
 };
 
-fn fresh_dir(tag: &str) -> std::path::PathBuf {
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-observability-listeners-{tag}-{}-{}",
-		std::process::id(),
-		Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+fn fresh_dir(tag: &str) -> test_dir::TestDir {
+	test_dir::TestDir::new(&format!("wendelon-observability-listeners-{tag}"))
 }
 
 #[derive(Clone)]

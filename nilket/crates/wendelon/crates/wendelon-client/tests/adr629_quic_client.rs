@@ -1,21 +1,17 @@
+#[path = "../../../src/test_support/test_dir.rs"]
+mod test_dir;
 #[path = "../../../tests/support/tls_pki.rs"]
 mod tls_pki;
 
-use std::{
-	collections::BTreeMap,
-	path::{Path, PathBuf},
-	time::Duration,
-};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 use wendelon::node::{
 	ClusterBootstrapConfig, NodeBootstrapConfig, SeedNodeConfig, TransportTlsConfig, WendelonNode,
 };
 use wendelon::schema::{Locality, NodeId, TenantId};
 use wendelon_client::{BootstrapPeer, Client, ClientConfig, ReadOptions, TlsPaths};
 
-fn fresh_dir(tag: &str) -> PathBuf {
-	let path = std::env::temp_dir().join(format!("adr629-p1-{tag}-{}", uuid::Uuid::new_v4()));
-	std::fs::create_dir(&path).unwrap();
-	path
+fn fresh_dir(tag: &str) -> test_dir::TestDir {
+	test_dir::TestDir::new(&format!("adr629-p1-{tag}"))
 }
 fn reserve_socket_addr() -> String {
 	let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -32,7 +28,8 @@ fn bootstrap_cfg(
 	key_path: &Path,
 	node_ca_path: &Path,
 	operator_ca_path: &Path,
-) -> NodeBootstrapConfig {
+) -> (test_dir::TestDir, NodeBootstrapConfig) {
+	let scratch = fresh_dir(tag);
 	let lease_signing_secret = wendelon::network::dev_lease_signing_secret(node_id);
 	let transfer_signing_secret = wendelon::network::dev_transfer_signing_secret(node_id);
 	let mut trusted_lease_signers = BTreeMap::new();
@@ -49,7 +46,7 @@ fn bootstrap_cfg(
 			wendelon::network::transfer_verifying_key_bytes(transfer_secret),
 		);
 	}
-	let mut cfg = NodeBootstrapConfig::dev(node_id, fresh_dir(tag), advertise_address);
+	let mut cfg = NodeBootstrapConfig::dev(node_id, scratch.to_path_buf(), advertise_address);
 	cfg.rf = rf;
 	cfg.lease_signing_secret = lease_signing_secret;
 	cfg.trusted_lease_signers = trusted_lease_signers;
@@ -63,7 +60,7 @@ fn bootstrap_cfg(
 		operator_ca_path: operator_ca_path.to_path_buf(),
 		cluster_domain: tls_pki::CLUSTER_DOMAIN.into(),
 	});
-	cfg
+	(scratch, cfg)
 }
 
 #[tokio::test]
@@ -72,7 +69,7 @@ async fn adr629_p1_production_client_authenticates_a_discovered_data_route() {
 	let pki = tls_pki::write_test_pki(&root.join("pki"));
 	let a = reserve_socket_addr();
 	let b = reserve_socket_addr();
-	let node1 = WendelonNode::bootstrap(bootstrap_cfg(
+	let (_scratch_1, cfg_1) = bootstrap_cfg(
 		"node1",
 		1,
 		a.clone(),
@@ -83,10 +80,9 @@ async fn adr629_p1_production_client_authenticates_a_discovered_data_route() {
 		&pki.server_key,
 		&pki.ca_cert,
 		&pki.ops_ca_cert,
-	))
-	.await
-	.unwrap();
-	let node2 = WendelonNode::bootstrap(bootstrap_cfg(
+	);
+	let node1 = WendelonNode::bootstrap(cfg_1).await.unwrap();
+	let (_scratch_2, cfg_2) = bootstrap_cfg(
 		"node2",
 		2,
 		b,
@@ -102,9 +98,8 @@ async fn adr629_p1_production_client_authenticates_a_discovered_data_route() {
 		&pki.data_client_key,
 		&pki.ca_cert,
 		&pki.ops_ca_cert,
-	))
-	.await
-	.unwrap();
+	);
+	let node2 = WendelonNode::bootstrap(cfg_2).await.unwrap();
 	let mut config = ClientConfig::new(
 		"0.0.0.0:0".parse().unwrap(),
 		vec![BootstrapPeer {

@@ -3296,17 +3296,14 @@ mod tests {
 	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::time::Duration;
 
-	fn tempdir(tag: &str) -> PathBuf {
-		let base =
-			std::env::temp_dir().join(format!("wendelon-bootstrap-{tag}-{}", uuid::Uuid::new_v4()));
-		std::fs::create_dir_all(&base).unwrap();
-		base
+	fn tempdir(tag: &str) -> crate::test_support::TestDir {
+		crate::test_support::TestDir::new(&format!("wendelon-bootstrap-{tag}"))
 	}
 
 	#[tokio::test]
 	async fn node_bootstrap_refuses_a_second_owner_and_reopens_after_joined_shutdown() {
 		let dir = tempdir("node-data-directory-owner");
-		let cfg = NodeBootstrapConfig::dev(7001, dir.clone(), "127.0.0.1:0".into());
+		let cfg = NodeBootstrapConfig::dev(7001, dir.to_path_buf(), "127.0.0.1:0".into());
 		let node = WendelonNode::bootstrap_single_node(cfg.clone())
 			.await
 			.unwrap();
@@ -3332,7 +3329,7 @@ mod tests {
 	#[tokio::test]
 	async fn an_incomplete_storage_close_outranks_an_earlier_shutdown_error() {
 		let dir = tempdir("shutdown-error-precedence");
-		let mut cfg = NodeBootstrapConfig::dev(7004, dir, "127.0.0.1:0".into());
+		let mut cfg = NodeBootstrapConfig::dev(7004, dir.to_path_buf(), "127.0.0.1:0".into());
 		cfg.storage_shutdown_timeout = Duration::from_millis(300);
 		let node = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
 		// An in-flight request makes quiescence time out first; a held write
@@ -3352,7 +3349,7 @@ mod tests {
 	#[tokio::test]
 	async fn unclean_previous_shutdown_boots_in_recovery_mode_and_clean_does_not() {
 		let dir = tempdir("node-recovery-mode");
-		let cfg = NodeBootstrapConfig::dev(7003, dir.clone(), "127.0.0.1:0".into());
+		let cfg = NodeBootstrapConfig::dev(7003, dir.to_path_buf(), "127.0.0.1:0".into());
 
 		// A never-owned directory has nothing to recover.
 		let first = WendelonNode::bootstrap_single_node(cfg.clone())
@@ -3396,7 +3393,7 @@ mod tests {
 		let dir = tempdir("shutdown-retained-handles");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			7002,
-			dir.clone(),
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -3449,7 +3446,7 @@ mod tests {
 		let dir = tempdir("shutdown-error-joins");
 		let mut node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			7003,
-			dir.clone(),
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -3580,7 +3577,7 @@ mod tests {
 		let dir = tempdir("assemble");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			1,
-			dir,
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -3598,7 +3595,7 @@ mod tests {
 		let dir = tempdir("crypto-startup");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			13,
-			dir.clone(),
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -3635,7 +3632,7 @@ mod tests {
 		let dir = tempdir("readiness-no-flap");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			23,
-			dir,
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -3705,7 +3702,7 @@ mod tests {
 		let dir = tempdir("readiness-local-persistence-distrust");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			24,
-			dir,
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -3731,7 +3728,7 @@ mod tests {
 		let dir = tempdir("restart-local-persistence-distrust");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			26,
-			dir.clone(),
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -3746,7 +3743,7 @@ mod tests {
 
 		let recovered = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			26,
-			dir,
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -3775,8 +3772,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn tcp_tls_bootstrap_requires_transport_tls_material() {
+		let dir = tempdir("tcp-tls-missing");
 		let result = WendelonNode::bootstrap_with_provider_at_tier(
-			NodeBootstrapConfig::dev(9, tempdir("tcp-tls-missing"), "127.0.0.1:0".into()),
+			NodeBootstrapConfig::dev(9, dir.to_path_buf(), "127.0.0.1:0".into()),
 			Arc::new(NoDialTransportProvider),
 			TransportTier::TcpTls,
 		)
@@ -3795,7 +3793,7 @@ mod tests {
 	#[tokio::test]
 	async fn single_node_bootstrap_recovers_durable_raft_artifacts() {
 		let dir = tempdir("restart");
-		let cfg = NodeBootstrapConfig::dev(11, dir.clone(), "127.0.0.1:0".into());
+		let cfg = NodeBootstrapConfig::dev(11, dir.to_path_buf(), "127.0.0.1:0".into());
 		let node = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
 
 		wait_for_local_leader(&node).await;
@@ -3841,7 +3839,7 @@ mod tests {
 
 		let recovered = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			11,
-			dir,
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -3865,10 +3863,10 @@ mod tests {
 	async fn single_node_bootstrap_reconciles_tiered_slabs_from_recovered_state() {
 		let dir = tempdir("restart-tiered");
 		let l2_dir = tempdir("restart-tiered-l2");
-		let mut cfg = NodeBootstrapConfig::dev(12, dir.clone(), "127.0.0.1:0".into());
+		let mut cfg = NodeBootstrapConfig::dev(12, dir.to_path_buf(), "127.0.0.1:0".into());
 		cfg.slab_max_bytes = 1;
 		cfg.l2 = Some(ObjectStoreConfig::LocalFs {
-			root: l2_dir.clone(),
+			root: l2_dir.to_path_buf(),
 		});
 		park_background_tiering(&mut cfg);
 		let l2 = cfg.l2.as_ref().unwrap().build().unwrap();
@@ -3980,10 +3978,10 @@ mod tests {
 	async fn recovery_blocks_readiness_when_tiered_reference_validation_fails() {
 		let dir = tempdir("restart-tiered-missing-l2");
 		let l2_dir = tempdir("restart-tiered-missing-l2-store");
-		let mut cfg = NodeBootstrapConfig::dev(15, dir.clone(), "127.0.0.1:0".into());
+		let mut cfg = NodeBootstrapConfig::dev(15, dir.to_path_buf(), "127.0.0.1:0".into());
 		cfg.slab_max_bytes = 1;
 		cfg.l2 = Some(ObjectStoreConfig::LocalFs {
-			root: l2_dir.clone(),
+			root: l2_dir.to_path_buf(),
 		});
 		park_background_tiering(&mut cfg);
 		let l2 = cfg.l2.as_ref().unwrap().build().unwrap();
@@ -4108,10 +4106,10 @@ mod tests {
 	async fn tenant_kek_rotation_is_raft_committed_and_old_l2_slabs_remain_readable() {
 		let dir = tempdir("tenant-kek-rotation");
 		let l2_dir = tempdir("tenant-kek-rotation-l2");
-		let mut cfg = NodeBootstrapConfig::dev(14, dir.clone(), "127.0.0.1:0".into());
+		let mut cfg = NodeBootstrapConfig::dev(14, dir.to_path_buf(), "127.0.0.1:0".into());
 		cfg.slab_max_bytes = 1;
 		cfg.l2 = Some(ObjectStoreConfig::LocalFs {
-			root: l2_dir.clone(),
+			root: l2_dir.to_path_buf(),
 		});
 		park_background_tiering(&mut cfg);
 		let object_store = cfg.l2.as_ref().unwrap().build().unwrap();
@@ -4251,9 +4249,11 @@ mod tests {
 	async fn single_node_bootstrap_starts_background_tiering_when_l2_is_configured() {
 		let dir = tempdir("background-tiering");
 		let l2_dir = tempdir("background-tiering-l2");
-		let mut cfg = NodeBootstrapConfig::dev(15, dir.clone(), "127.0.0.1:0".into());
+		let mut cfg = NodeBootstrapConfig::dev(15, dir.to_path_buf(), "127.0.0.1:0".into());
 		cfg.slab_max_bytes = 1;
-		cfg.l2 = Some(ObjectStoreConfig::LocalFs { root: l2_dir });
+		cfg.l2 = Some(ObjectStoreConfig::LocalFs {
+			root: l2_dir.to_path_buf(),
+		});
 		cfg.tiering.scan_interval = Duration::from_millis(20);
 		let node = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
 
@@ -4317,7 +4317,7 @@ mod tests {
 		let dir = tempdir("drift");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			7,
-			dir,
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -4365,7 +4365,7 @@ mod tests {
 		let dir = tempdir("evict");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			42,
-			dir,
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await
@@ -4425,7 +4425,7 @@ mod tests {
 		let dir = tempdir("router");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			3,
-			dir,
+			dir.to_path_buf(),
 			"127.0.0.1:0".into(),
 		))
 		.await

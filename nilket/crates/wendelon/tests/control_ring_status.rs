@@ -11,7 +11,7 @@ use wendelon::schema::Locality;
 
 #[tokio::test]
 async fn status_req_returns_live_cluster_status_wire() {
-	let node = support::bootstrap_node("status", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("status", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -41,7 +41,7 @@ async fn status_req_returns_live_cluster_status_wire() {
 
 #[tokio::test]
 async fn wendelon_client_refreshes_topology_from_live_control_ring() {
-	let node = support::bootstrap_node("status-client-refresh", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("status-client-refresh", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();

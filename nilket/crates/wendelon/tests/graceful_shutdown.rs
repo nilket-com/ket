@@ -48,12 +48,9 @@ async fn node_rejects_new_requests_after_drain_begins() {
 		},
 		registry,
 	);
+	let node_dir = support::tempdir("graceful-node");
 	let node = WendelonNode::bootstrap_with_provider(
-		NodeBootstrapConfig::dev(
-			1,
-			support::tempdir("graceful-node"),
-			"loopback://node-1".into(),
-		),
+		NodeBootstrapConfig::dev(1, node_dir.to_path_buf(), "loopback://node-1".into()),
 		provider,
 	)
 	.await
