@@ -101,6 +101,15 @@ fn the_fixture_anchor_reaches_no_shipped_build() {
 		.find(|p| p["name"] == "key-guard")
 		.unwrap();
 	assert_eq!(key_guard["features"][FEATURE], json!([]));
+	// The one admitted edge is present: wendelon-key's dev-dependency.
+	let tool = strings_of(&metadata, "packages")
+		.find(|p| p["name"] == ALLOWED)
+		.expect("the custody tool is a workspace member");
+	assert!(strings_of(tool, "dependencies").any(|d| {
+		d["name"] == "key-guard"
+			&& d["kind"] == "dev"
+			&& strings(&d["features"]).any(|f| f == FEATURE)
+	}));
 	assert_eq!(violations(&metadata), Vec::<String>::new());
 }
 
