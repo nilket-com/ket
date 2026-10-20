@@ -30,6 +30,7 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 # expose that metadata rewrite path.
 flatbuffers = "25.12.19"
 io-uring = "0.7.11"
+key-guard = { path = "../key-guard" }
 libc = "0.2"
 lz4_flex = "0.13"
 observability = { path = "../observability", default-features = false, features = ["http", "audit", "telemetry"] }

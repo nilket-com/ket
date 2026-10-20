@@ -2559,12 +2559,10 @@ pub fn selected_cipher_detection_method() -> &'static str {
 pub fn mlock_status_label() -> &'static str {
 	static STATUS: OnceLock<&'static str> = OnceLock::new();
 	STATUS.get_or_init(|| {
-		let mut probe = [0_u8; 32];
-		match best_effort_mlock(probe.as_mut_ptr().cast(), probe.len()) {
+		let probe = [0_u8; 32];
+		match key_guard::custody::lock_memory(&probe) {
 			Ok(()) => {
-				unsafe {
-					libc::munlock(probe.as_mut_ptr().cast(), probe.len());
-				}
+				key_guard::custody::unlock_memory(&probe);
 				"ok"
 			}
 			Err(_) => "unavailable",
@@ -5562,29 +5560,23 @@ impl LockedKeyMaterial {
 	fn new(key: KeyMaterialBytes) -> std::io::Result<Self> {
 		let mut boxed = Box::new(KeyMaterialBytes([0_u8; 32]));
 		boxed.0.copy_from_slice(key.as_ref());
-		let locked =
-			match best_effort_mlock(boxed.0.as_mut_ptr().cast(), std::mem::size_of::<[u8; 32]>()) {
-				Ok(()) => true,
-				Err(error) => {
-					tracing::warn!(
-						error = %error,
-						"mlock unavailable for crypto key material; pages may be swapped to disk"
-					);
-					false
-				}
-			};
+		let locked = match key_guard::custody::lock_memory(&boxed.0) {
+			Ok(()) => true,
+			Err(error) => {
+				tracing::warn!(
+					error = %error,
+					"mlock unavailable for crypto key material; pages may be swapped to disk"
+				);
+				false
+			}
+		};
 		Ok(Self { key: boxed, locked })
 	}
 
 	fn scrub_for_drop(&mut self) {
 		self.key.zeroize();
 		if self.locked {
-			unsafe {
-				libc::munlock(
-					self.key.0.as_mut_ptr().cast(),
-					std::mem::size_of::<[u8; 32]>(),
-				);
-			}
+			key_guard::custody::unlock_memory(&self.key.0);
 			self.locked = false;
 		}
 	}
@@ -5599,14 +5591,6 @@ impl AsRef<[u8]> for LockedKeyMaterial {
 impl Drop for LockedKeyMaterial {
 	fn drop(&mut self) {
 		self.scrub_for_drop();
-	}
-}
-
-fn best_effort_mlock(ptr: *mut libc::c_void, len: usize) -> std::io::Result<()> {
-	if unsafe { libc::mlock(ptr.cast_const(), len) } == 0 {
-		Ok(())
-	} else {
-		Err(Error::last_os_error())
 	}
 }
 

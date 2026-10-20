@@ -11,6 +11,9 @@ thiserror = "2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+zeroize = "1.8"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
 	"Win32_Foundation",
