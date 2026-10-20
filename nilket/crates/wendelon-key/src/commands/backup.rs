@@ -130,7 +130,9 @@ pub(super) fn verify(io: &mut dyn Io, a: &Args) -> Result<(), ToolError> {
 	let manifest = a.path("--trusted-manifest")?;
 	session::run(io, a.path("--dir")?, "restore-verify", |io, s| {
 		let bound = peek(name, &read_key(s.dir, name)?)?;
-		s.identity(&bound);
+		// The Bound file is not decrypted: its identity is a claim until the authenticated backup
+		// matches it.
+		s.line.unauthenticated_identity = Some(hex(&bound.identity()));
 		if bound.state != State::Bound {
 			return Err(ToolError::refused(
 				"restore-verify checks a backup against a Bound file",
@@ -142,6 +144,7 @@ pub(super) fn verify(io: &mut dyn Io, a: &Args) -> Result<(), ToolError> {
 				"the backup's identity is not the Bound file's identity",
 			));
 		}
+		s.identity(&backup);
 		let ctx = context::load(&[context_path], manifest)?.remove(0);
 		if backup.context.as_ref() != Some(ctx.context()) {
 			return Err(ToolError::refused(

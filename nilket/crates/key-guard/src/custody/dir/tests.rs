@@ -450,12 +450,13 @@ fn a_move_never_replaces_and_a_fresh_target_receives_the_file() {
 	let retired = lock.create_subdir("retired").unwrap();
 	lock.create_file("taken", &[1]).unwrap();
 	assert!(matches!(
-		lock.move_file("key", &dir, "taken"),
+		lock.move_file("key", &lock, "taken"),
 		Err(CustodyError::Exists { .. })
 	));
 	assert_eq!(fs::read(fx.keys.join("key")).unwrap(), vec![7; 10]);
 	assert_eq!(fs::read(fx.keys.join("taken")).unwrap(), vec![1]);
-	lock.move_file("key", &retired, "key").unwrap();
+	lock.move_file("key", &retired.lock().unwrap(), "key")
+		.unwrap();
 	assert!(!fx.keys.join("key").exists());
 	retired.open_file("key", &[10]).unwrap();
 }
@@ -583,7 +584,7 @@ fn a_move_outside_the_lock_is_refused_and_one_within_it_succeeds() {
 	let sibling = fx.open_path(&fx.anc.join("other")).unwrap();
 	for (what, to) in [("grandchild", &deeper), ("sibling", &sibling)] {
 		assert_eq!(
-			reason(lock.move_file("key", to, "key")),
+			reason(lock.move_file("key", &to.lock().unwrap(), "key")),
 			Refusal::OutsideLock,
 			"{what}"
 		);
@@ -593,14 +594,15 @@ fn a_move_outside_the_lock_is_refused_and_one_within_it_succeeds() {
 	let retired_lock = retired.lock().unwrap();
 	retired_lock.create_file("old", &[1]).unwrap();
 	assert_eq!(
-		reason(retired_lock.move_file("old", &dir, "old")),
+		reason(retired_lock.move_file("old", &lock, "old")),
 		Refusal::OutsideLock
 	);
 	retired.open_file("old", &[1]).unwrap();
 	drop(retired_lock);
 	// Controls: the locked directory itself and a direct child.
-	lock.move_file("key", &dir, "key2").unwrap();
-	lock.move_file("key2", &retired, "key").unwrap();
+	lock.move_file("key", &lock, "key2").unwrap();
+	lock.move_file("key2", &retired.lock().unwrap(), "key")
+		.unwrap();
 	retired.open_file("key", &[10]).unwrap();
 	assert!(!fx.keys.join("key").exists() && !fx.keys.join("key2").exists());
 }
@@ -636,4 +638,24 @@ fn the_anchored_open_admits_what_lies_below_its_anchor_and_production_refuses_it
 		reason(super::open_custody_dir_anchored(&keys, &root.join("file"))),
 		Refusal::NotDirectory
 	);
+}
+
+#[test]
+fn a_move_into_a_child_needs_that_childs_lock_and_a_busy_child_changes_nothing() {
+	let fx = fixture();
+	let dir = published(&fx, "key", &[7; 10]);
+	let lock = dir.lock().unwrap();
+	let retired = lock.create_subdir("retired").unwrap();
+	// Another, independently opened handle holds the child's lock while the parent is locked.
+	let other = fx.open_path(&fx.keys.join("retired")).unwrap();
+	let held = other.lock().unwrap();
+	assert!(matches!(retired.lock(), Err(CustodyError::Busy)));
+	assert_eq!(fs::read(fx.keys.join("key")).unwrap(), vec![7; 10]);
+	assert!(!fx.keys.join("retired/key").exists());
+	// Control: once the other holder releases it, the move takes the child's lock and proceeds.
+	drop(held);
+	lock.move_file("key", &retired.lock().unwrap(), "key")
+		.unwrap();
+	assert!(!fx.keys.join("key").exists());
+	retired.open_file("key", &[10]).unwrap();
 }

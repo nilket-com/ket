@@ -8,6 +8,8 @@
 //! - [`Terminal`] reads a secret from `/dev/tty` with echo off and restores the terminal on every
 //!   return, error and unwind; [`install_terminal_restore_hook`] restores it on a panic too, which
 //!   matters where panics abort and no destructor runs.
+//! - A move takes the destination directory's lock as a capability: the locked directory itself or
+//!   a locked direct child.
 //! - [`CustodyDir::names`] lists a directory through its handle, and [`CustodyLock::leftover_temps`]
 //!   reports the temp files a crashed creation left.
 //! - [`harden_process`] and [`non_loopback_interfaces_up`] serve the tool's process and host

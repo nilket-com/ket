@@ -48,7 +48,8 @@ pub(super) fn retire(io: &mut dyn Io, a: &Args) -> Result<(), ToolError> {
 	let manifest = a.path("--trusted-manifest")?;
 	session::run(io, a.path("--dir")?, "retire-epoch", |io, s| {
 		let header = peek(name, &read_key(s.dir, name)?)?;
-		s.identity(&header);
+		// Retiring decrypts nothing: the identity is the header's claim, logged as such.
+		s.line.unauthenticated_identity = Some(hex(&header.identity()));
 		let ctx = context::load(&[context_path], manifest)?.remove(0);
 		bound_in(&ctx, &header)?;
 		retired_in(&ctx, &header)?;
@@ -79,7 +80,8 @@ pub(super) fn retire(io: &mut dyn Io, a: &Args) -> Result<(), ToolError> {
 			None => s.lock.create_subdir(RETIRED)?,
 		};
 		must_be_free(&retired, name)?;
-		s.lock.move_file(name, &retired, name)?;
+		let retired_lock = retired.lock()?;
+		s.lock.move_file(name, &retired_lock, name)?;
 		writeln!(
 			io.out(),
 			"retired role {} epoch {}: moved to {RETIRED}/{name}",
