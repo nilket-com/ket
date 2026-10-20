@@ -30,9 +30,11 @@ mod profile_two_refusal;
 mod profile_two_reserve;
 mod recovery;
 mod refusals;
+mod removed_forms;
 mod restoration;
 mod review_regressions;
 mod root_profile;
+mod statement_seeds;
 mod transitions;
 mod verification;
 
