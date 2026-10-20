@@ -11,7 +11,10 @@ mod context;
 mod proof;
 
 pub use context::{AuditDerived, ContextRefusal, VerifiedContext, verify_context_export};
-pub use proof::{ProofRefusal, Unsigned, merge, prepare, prepare_statement, self_check, splice};
+pub use proof::{
+	ProofRefusal, Unsigned, check_new_role_key, merge, prepare, prepare_statement, self_check,
+	splice,
+};
 
 pub(in crate::storage::mutation_visibility::root2) use context::Chain3;
 #[cfg(test)]

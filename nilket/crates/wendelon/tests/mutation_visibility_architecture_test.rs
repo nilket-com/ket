@@ -6666,7 +6666,7 @@ fn facade_violation(files: &std::collections::BTreeMap<String, String>) -> Optio
 	if exported
 		!= [
 			"context::{AuditDerived,ContextRefusal,VerifiedContext,verify_context_export}",
-			"proof::{ProofRefusal,Unsigned,merge,prepare,prepare_statement,self_check,splice}",
+			"proof::{ProofRefusal,Unsigned,check_new_role_key,merge,prepare,prepare_statement,self_check,splice}",
 		] {
 		return Some(format!(
 			"operator_proof.rs: public items changed: {exported:?}"

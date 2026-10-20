@@ -571,3 +571,57 @@ fn t_merge_refuses_each_inconsistency() {
 	assert_eq!(over(&b).err(), Some(P::Overwritten));
 	assert_eq!(over(&invalid).err(), Some(P::SlotSignature));
 }
+
+#[test]
+fn a_new_role_key_is_enrollable_unused_and_below_the_successor_limit() {
+	let mut r = Root::new();
+	let fresh = key(90);
+	// Without a context only enrollment is judged; the role must be one of the three.
+	facade::check_new_role_key(None, ADMIN, &fresh).unwrap();
+	assert_eq!(
+		facade::check_new_role_key(None, ADMIN, &[0; 32]),
+		Err(P::NotEnrollable)
+	);
+	for role in [0, 4] {
+		assert_eq!(
+			facade::check_new_role_key(None, role, &fresh),
+			Err(P::RoleNotNamed)
+		);
+	}
+	let ctx = context(&r);
+	facade::check_new_role_key(Some(&ctx), ADMIN, &fresh).unwrap();
+	// Every original key is history, under any role.
+	for (_, original) in ctx.active() {
+		for role in [ADMIN, GOVERNANCE, RECOVERY] {
+			assert_eq!(
+				facade::check_new_role_key(Some(&ctx), role, &original),
+				Err(P::KeyReused)
+			);
+		}
+	}
+	// The limit: the 64th successor is admitted, a 65th refused, and the other roles are not.
+	for n in 0..64u8 {
+		let next = 100 + n;
+		let ctx = context(&r);
+		facade::check_new_role_key(Some(&ctx), ADMIN, &key(next)).unwrap();
+		single(
+			&mut r,
+			Command2::RotateAdmin(key(next)),
+			RECOVERY,
+			None,
+			None,
+		);
+		rotated(&mut r, ADMIN, next);
+	}
+	let ctx = context(&r);
+	assert_eq!(ctx.active()[0].0, 64);
+	assert_eq!(
+		facade::check_new_role_key(Some(&ctx), ADMIN, &fresh),
+		Err(P::SuccessorLimit)
+	);
+	assert_eq!(
+		facade::check_new_role_key(Some(&ctx), ADMIN, &key(130)),
+		Err(P::KeyReused)
+	);
+	facade::check_new_role_key(Some(&ctx), GOVERNANCE, &fresh).unwrap();
+}

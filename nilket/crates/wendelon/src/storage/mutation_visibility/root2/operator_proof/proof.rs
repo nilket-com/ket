@@ -3,6 +3,7 @@
 //! production preimage function, and every check from the production checkers under the view a
 //! context-export reader built. Nothing here signs: a signature arrives as 64 bytes.
 use super::context::VerifiedContext;
+use crate::storage::mutation_visibility::root2::admin::key::check_enrollable_admin_key2;
 use crate::storage::mutation_visibility::root2::admin_statement::{
 	AdminAction2, AdmissionNamespace2, PermissionKey2, admin_statement_preimage2,
 	check_admin_statement2, check_epoch_statement3, encode_admin_statement2,
@@ -17,6 +18,7 @@ use crate::storage::mutation_visibility::root2::role_command::{
 	ROLE_PROOF_BYTES3, RoleForm3, RoleSlot3, context_digest3, context_from_bytes,
 	encode_role_proof3, parse, preimage_for, role_requirement, slot_signed, verify_core,
 };
+use crate::storage::mutation_visibility::root2::role_epochs::SUCCESSORS3;
 use crate::storage::mutation_visibility::root2::role_view::RoleView3;
 use crate::storage::mutation_visibility::root2::types::{AuthorityRef2, Digest2};
 
@@ -67,6 +69,12 @@ pub enum ProofRefusal {
 	NotJoint,
 	/// The assembled bytes do not pass the production checkers.
 	SelfCheck,
+	/// A new role key that enrollment refuses (a consumed `Denied(20)` as a rotation).
+	NotEnrollable,
+	/// A new role key already in the root's history (a consumed `Denied(21)` as a rotation).
+	KeyReused,
+	/// A role already at its successor limit (a consumed `Denied(22)` as a rotation).
+	SuccessorLimit,
 }
 use ProofRefusal as P;
 
@@ -443,4 +451,34 @@ pub fn merge(context: &VerifiedContext, command: &[u8], a: &[u8], b: &[u8]) -> R
 	merged[SLOT_SIGNATURE[second].clone()].copy_from_slice(&b[SLOT_SIGNATURE[second].clone()]);
 	self_check(context, command, Some(&merged))?;
 	Ok(merged)
+}
+
+/// Whether `key` may become a new key of `role` (1 admin, 2 governance, 3 recovery): enrollable,
+/// and, under a verified `context`, neither anywhere in that root's history nor beyond the role's
+/// successor limit; the rotation's own rules, checked before the key is ever proposed.
+pub fn check_new_role_key(
+	context: Option<&VerifiedContext>,
+	role: u8,
+	key: &[u8; 32],
+) -> Result<(), P> {
+	if !(1..=3).contains(&role) {
+		return Err(P::RoleNotNamed);
+	}
+	check_enrollable_admin_key2(key).map_err(|_| P::NotEnrollable)?;
+	let Some(context) = context else {
+		return Ok(());
+	};
+	if context.identity(key).is_some() {
+		return Err(P::KeyReused);
+	}
+	if context
+		.history()
+		.iter()
+		.filter(|(r, ..)| *r == role)
+		.count()
+		>= SUCCESSORS3
+	{
+		return Err(P::SuccessorLimit);
+	}
+	Ok(())
 }

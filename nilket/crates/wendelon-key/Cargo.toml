@@ -1,0 +1,32 @@
+[package]
+name = "wendelon-key"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Offline custody of Root2 role signing keys: encrypted key files, binding, backup and an operation log."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wendelon-key"
+path = "src/main.rs"
+
+[dependencies]
+# The custody tool builds wendelon and aws-lc-rs as non-FIPS (contract §6); it is never part of the
+# FIPS daemon build, which names only `--bin wendelon`.
+wendelon = { path = "../wendelon", default-features = false, features = ["non-fips"] }
+key-guard = { path = "../key-guard" }
+aws-lc-rs = { version = "1.14", default-features = false, features = ["non-fips"] }
+ed25519-dalek = "2.1"
+scrypt = { version = "0.11.0", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2"
+serde_json = "1.0"
+unicode-normalization = "0.1"
+zeroize = "1.8"
+
+[dev-dependencies]
+# Fixtures under a group-writable TMPDIR end the custody ancestor walk at their own root; no
+# shipped build enables this (pinned in key-guard's tests/fixture_anchor_feature.rs).
+key-guard = { path = "../key-guard", features = ["fixture-anchor"] }

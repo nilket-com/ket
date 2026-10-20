@@ -30,3 +30,12 @@ debug = 0
 
 [profile.fips]
 inherits = "release"
+
+# The custody tool's key files use scrypt at 128 MiB (wendelon-key, K3); unoptimised, one
+# derivation takes many seconds, so test builds compile the KDF optimised. Code generation for
+# every other package is unchanged.
+[profile.dev.package.scrypt]
+opt-level = 3
+
+[profile.dev.package.salsa20]
+opt-level = 3

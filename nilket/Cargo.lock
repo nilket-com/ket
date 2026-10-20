@@ -6196,6 +6196,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wendelon-key"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "ed25519-dalek",
+ "key-guard",
+ "scrypt",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "unicode-normalization",
+ "wendelon",
+ "zeroize",
+]
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
