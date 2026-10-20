@@ -36,7 +36,7 @@ fn d1() -> Digest2 {
 	d32(vv("digest_1"))
 }
 fn check(bytes: &[u8], digest: Digest2) -> Result<(), GovernanceCommandError2> {
-	check_governance_command2(&admin(), GovernanceAction2::Grant, bytes, digest).map(|_| ())
+	check_governance_command2(&admin().view(), GovernanceAction2::Grant, bytes, digest).map(|_| ())
 }
 #[test]
 fn fixture_matches_independent_reference() {
@@ -68,7 +68,8 @@ fn signed_with(body: &[u8], seed: [u8; 32], domain: &[u8]) -> Vec<u8> {
 #[test]
 fn valid_envelope_checks_and_round_trips() {
 	let checked =
-		check_governance_command2(&admin(), GovernanceAction2::Grant, &valid(), d1()).unwrap();
+		check_governance_command2(&admin().view(), GovernanceAction2::Grant, &valid(), d1())
+			.unwrap();
 	assert!(checked.context() == context());
 	assert_eq!(checked.action(), GovernanceAction2::Grant);
 	assert_eq!(checked.command_digest(), d1());
@@ -246,13 +247,13 @@ fn profile_one_refuses_before_context_digest_and_signature() {
 	let c = super::profile_two_binding::chain("a", 137);
 	let a = install_admin2(&c.rooted, &c.tuple).unwrap();
 	assert_eq!(
-		check_governance_command2(&a, GovernanceAction2::Grant, &valid(), [0; 32]).err(),
+		check_governance_command2(&a.view(), GovernanceAction2::Grant, &valid(), [0; 32]).err(),
 		Some(GovernanceCommandError2::NoGovernance)
 	);
 	let mut b = valid();
 	b[10] = 1;
 	assert_eq!(
-		check_governance_command2(&a, GovernanceAction2::Grant, &b, [0; 32]).err(),
+		check_governance_command2(&a.view(), GovernanceAction2::Grant, &b, [0; 32]).err(),
 		Some(GovernanceCommandError2::Reserved)
 	);
 }

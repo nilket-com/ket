@@ -184,7 +184,7 @@ fn verify_command2(
 		(Command2::EpochAdmissionPermission(bytes), OriginView2::Root) => {
 			let admin = install_admin2(state, pin).map_err(VerifyError2::Install)?;
 			(
-				super::admin_statement::check_epoch_statement3(&admin, bytes).is_ok(),
+				super::admin_statement::check_epoch_statement3(&admin.view(), bytes).is_ok(),
 				0,
 			)
 		}
@@ -200,23 +200,8 @@ fn verify_command2(
 			let bytes = governance.ok_or(VerifyError2::MissingSidecar)?;
 			super::role_command::parse(bytes).map_err(VerifyError2::Role)?;
 			let admin = install_admin2(state, pin).map_err(VerifyError2::Install)?;
-			let expected = match command {
-				Command2::RetireRoot if bytes[76] == 3 => [3, 0],
-				Command2::RetireRoot => [1, 2],
-				Command2::RotateRecovery(_) => [1, 2],
-				Command2::Unfreeze(_) if bytes[76] == 1 => [1, 3],
-				Command2::Unfreeze(_) => [2, 3],
-				Command2::RotateAdmin(_) | Command2::RotateGovernance(_) | Command2::Freeze(_) => {
-					[3, 0]
-				}
-				_ => return Err(VerifyError2::StateKind),
-			};
-			let form = match command {
-				Command2::RetireRoot => super::role_command::RoleForm3::Retire,
-				Command2::Freeze(_) => super::role_command::RoleForm3::Freeze,
-				Command2::Unfreeze(_) => super::role_command::RoleForm3::Unfreeze,
-				_ => super::role_command::RoleForm3::Legacy,
-			};
+			let (expected, form) = super::role_command::role_requirement(command, bytes[76])
+				.ok_or(VerifyError2::StateKind)?;
 			let ok = super::role_command::verify_for(&admin, bytes, d, expected, form)
 				.map_err(VerifyError2::Role)?;
 			if ok {
@@ -296,7 +281,8 @@ fn statement_authorized(
 	pin: &PinnedBoundTuple2,
 	bytes: &[u8; ADMIN_STATEMENT_BYTES2],
 ) -> bool {
-	install_admin2(state, pin).is_ok_and(|admin| check_admin_statement2(&admin, bytes).is_ok())
+	install_admin2(state, pin)
+		.is_ok_and(|admin| check_admin_statement2(&admin.view(), bytes).is_ok())
 }
 
 /// The claim's authority is enrolled and not revoked in the pre-entry state, and its key verifies

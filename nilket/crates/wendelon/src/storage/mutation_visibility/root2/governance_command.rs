@@ -3,9 +3,8 @@
 //! S3 derives action exhaustively from the same Command2 whose digest is recomputed and bound
 //! to entry.d; a caller-asserted action is never accepted at integration.
 use crate::storage::mutation_visibility::redacted_debug;
-use crate::storage::mutation_visibility::root2::admin_install::{
-	AdminContext2, InstalledAdmin2, admin_context2, admin_governance2,
-};
+use crate::storage::mutation_visibility::root2::admin_install::AdminContext2;
+use crate::storage::mutation_visibility::root2::role_view::RoleView3;
 use crate::storage::mutation_visibility::root2::types::{Digest2, Log2};
 use ed25519_dalek::{Signature, VerifyingKey};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,17 +214,17 @@ pub(in crate::storage::mutation_visibility::root2) fn governance_command_preimag
 
 /// Order: structure, profile, action, context, digest, strict governance signature.
 pub(in crate::storage::mutation_visibility::root2) fn check_governance_command2(
-	admin: &InstalledAdmin2,
+	view: &RoleView3,
 	action: GovernanceAction2,
 	bytes: &[u8],
 	command_digest: Digest2,
 ) -> Result<CheckedGovernanceCommand2, GovernanceCommandError2> {
 	let (context, embedded, signature) = parse_governance_command2(bytes)?;
-	let role = admin_governance2(admin).ok_or(GovernanceCommandError2::NoGovernance)?;
+	let role = RoleView3::governance_role(view).ok_or(GovernanceCommandError2::NoGovernance)?;
 	if !permits(role.actions(), action) {
 		return Err(GovernanceCommandError2::Action);
 	}
-	if context != admin_context2(admin) {
+	if context != view.context() {
 		return Err(GovernanceCommandError2::Context);
 	}
 	if embedded != command_digest {
@@ -235,7 +234,7 @@ pub(in crate::storage::mutation_visibility::root2) fn check_governance_command2(
 		.try_into()
 		.map_err(|_| GovernanceCommandError2::Length)?;
 	let preimage = governance_command_preimage2(fixed)?;
-	if super::admin_install::active_role3(admin, 1).is_some_and(|(k, _)| k != 0) {
+	if view.active(1).is_some_and(|(k, _)| k != 0) {
 		return Err(GovernanceCommandError2::Signature);
 	}
 	VerifyingKey::from_bytes(&role.key())

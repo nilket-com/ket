@@ -244,11 +244,15 @@ fn context_export_violation(
 		let at: Option<Vec<_>> = anchors.iter().map(|a| t.find(a)).collect();
 		at.is_some_and(|at| at.windows(2).all(|w| w[0] < w[1]))
 	};
-	let Some(digest) = role_command
-		.contains("fn context_digest(")
-		.then(|| flat(fn_body(role_command, "context_digest")))
-	else {
-		return Some("role_command.rs: no context_digest");
+	let (Some(digest), Some(digest3)) = (
+		role_command
+			.contains("fn context_digest(")
+			.then(|| flat(fn_body(role_command, "context_digest"))),
+		role_command
+			.contains("fn context_digest3(")
+			.then(|| flat(fn_body(role_command, "context_digest3"))),
+	) else {
+		return Some("role_command.rs: no context_digest or context_digest3");
 	};
 	// The withdrawal removes only the file this run published: fstatat (no symlink follow) of
 	// the name, compared with the recorded identity, strictly before the unlink.
@@ -314,11 +318,12 @@ fn context_export_violation(
 	{
 		return Some("compromise/export.rs: one context encoding and one integrity digest");
 	}
-	// The single context encoder: `context_digest` hashes exactly `context_bytes`.
+	// The single context encoder: one domain literal, in `context_digest3`, which hashes exactly
+	// `context_bytes`; the installed administrator's `context_digest` is that over its context.
 	if role_command.matches("fncontext_bytes(").count() != 1
-		|| !digest.contains("b\"VISROOT2-ROLE3-CONTEXT\\0\",&context_bytes(&admin_context2(a))")
-		|| calls(&digest, "hash") != 1
-		|| digest.contains("extend")
+		|| role_command.matches("VISROOT2-ROLE3-CONTEXT").count() != 1
+		|| digest3 != "{hash(b\"VISROOT2-ROLE3-CONTEXT\\0\",&context_bytes(c))}"
+		|| digest != "{context_digest3(&admin_context2(a))}"
 	{
 		return Some("role_command.rs: context_digest hashes context_bytes and nothing else");
 	}
@@ -382,7 +387,7 @@ fn context_export_is_pure_after_a_complete_fold_and_published_before_rows() {
 		None
 	);
 	// Probes: each guarded property, broken once, is caught.
-	let probes: [(&str, String, String, String, String, String); 15] = [
+	let probes: [(&str, String, String, String, String, String); 17] = [
 		(
 			"a withdrawal that unlinks without the identity check",
 			compromise.clone(),
@@ -474,9 +479,28 @@ fn context_export_is_pure_after_a_complete_fold_and_published_before_rows() {
 			compromise.clone(),
 			export.clone(),
 			role_command.replace(
-				"&context_bytes(&admin_context2(a)),",
-				"&{ let mut b = Vec::new(); b.extend(admin_context2(a).generation); b },",
+				"&context_bytes(c))",
+				"&{ let mut b = Vec::new(); b.extend(c.generation); b })",
 			),
+			cli.clone(),
+			publish.clone(),
+		),
+		(
+			"context_digest bypassing context_digest3",
+			compromise.clone(),
+			export.clone(),
+			role_command.replace(
+				"context_digest3(&admin_context2(a))",
+				"hash(b\"VISROOT2-ROLE3-CONTEXT\\0\", &context_bytes(&admin_context2(a)))",
+			),
+			cli.clone(),
+			publish.clone(),
+		),
+		(
+			"a second context domain",
+			compromise.clone(),
+			export.clone(),
+			role_command.clone() + "\nconst D: &[u8] = b\"VISROOT2-ROLE3-CONTEXT\\0\";",
 			cli.clone(),
 			publish.clone(),
 		),
@@ -2253,6 +2277,7 @@ fn admin_install_is_a_pure_derivation() {
 		entrypoints,
 		[
 			"active_role3",
+			"admin_active3",
 			"admin_context2",
 			"admin_cut3",
 			"admin_governance2",
@@ -2431,6 +2456,7 @@ fn admin_statement_is_pure_authentication() {
 			"checked_context2",
 			"checked_key2",
 			"encode_admin_statement2",
+			"encode_epoch_statement3",
 			"epoch_statement_preimage3",
 			"inspect_admin_statement2",
 			"inspect_epoch_statement3"
@@ -4278,6 +4304,27 @@ fn command_verification_is_single_site_and_unwired() {
 	assert_eq!(calls(advance, "verify_command2"), 1);
 	let verify = fn_body(&text, "verify_command2");
 	assert_eq!(calls(verify, "VerifiedCommand2::verified2"), 1);
+	// Key custody K7: the role pair and form come from the one shared requirement, and every
+	// checker view comes from an administrator `install_admin2` just installed: no view type, no
+	// offline construction and no facade here.
+	let verify_flat = verify.replace(char::is_whitespace, "");
+	assert_eq!(calls(verify, "super::role_command::role_requirement"), 1);
+	assert!(verify_flat.contains(
+		"super::role_command::role_requirement(command,bytes[76]).ok_or(VerifyError2::StateKind)?"
+	));
+	assert!(!verify_flat.contains("[3,0]") && !verify_flat.contains("RoleForm3"));
+	for banned in ["RoleView3", "offline", "Chain3", "operator_proof"] {
+		assert!(!flat.contains(banned), "verification.rs: {banned}");
+	}
+	assert_eq!(flat.matches(".view()").count(), 2);
+	assert_eq!(
+		flat.matches("letadmin=").count(),
+		flat.matches("letadmin=install_admin2(state,pin)").count()
+	);
+	assert!(flat.contains("check_epoch_statement3(&admin.view(),bytes)"));
+	assert!(flat.contains(
+		"install_admin2(state,pin).is_ok_and(|admin|check_admin_statement2(&admin.view(),bytes)"
+	));
 	assert_eq!(calls(verify, "verify_governance2"), 1);
 	assert!(
 		verify.find("verify_governance2(").unwrap()
@@ -4407,6 +4454,12 @@ fn command_verification_is_single_site_and_unwired() {
 		assert!(!helper_flat.contains(banned), "governance helper: {banned}");
 	}
 	assert!(helper_flat.contains("fnverify_governance2(state:&MutationAuthorityState2,pin:&PinnedBoundTuple2,command:&Command2,governance:Option<&[u8]>,digest:Digest2,)->Result<bool,VerifyError2>"));
+	// The VISROL03 governance path's action bit is the view's one predicate, from the install.
+	assert_eq!(
+		helper_flat.matches("admin.view().governs(action)").count(),
+		1
+	);
+	assert!(!helper_flat.contains("action.bit()") && !helper_flat.contains(".actions()"));
 	assert!(helper_flat.contains("fngovernance_failure2(state:&MutationAuthorityState2,pin:&PinnedBoundTuple2,command:&Command2,governance:Option<&[u8]>,digest:Digest2,)->Result<Option<Denial2>,VerifyError2>"));
 	let helper_file: syn::File = syn::parse2(helper).unwrap();
 	let (mut helper_public, mut helper_private, mut helper_enums) =
@@ -4564,7 +4617,7 @@ fn command_verification_is_single_site_and_unwired() {
 		"bytes.len() != GOVERNANCE_COMMAND_BYTES2",
 		"parse_governance_command2(bytes)",
 		"install_admin2(state, pin)",
-		"check_governance_command2(&admin, action, bytes, digest)",
+		"check_governance_command2(&admin.view(), action, bytes, digest)",
 		"admin_namespace2(&admin)",
 		"if !in_scope",
 		"root.state.issuers.get(&lease.issuer.to_be_bytes())",
@@ -5096,6 +5149,19 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 		("role_freeze.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
 		("retirement.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
 		("role_command.rs", &["ManifestProfile2"]),
+		// Key custody K7: the role view copies the descriptive governance role and profile, and
+		// its offline constructor decodes the trusted profile-3 manifest and checks its pin; the
+		// facade refuses any other manifest profile.
+		(
+			"role_view.rs",
+			&[
+				"GovernanceRole2",
+				"ManifestProfile2",
+				"AnyAdminManifest2",
+				"any_manifest_digest2",
+			],
+		),
+		("operator_proof.rs", &["AnyAdminManifest2"]),
 		// C-S6: the audit decodes the operator's trusted manifest (profile 3 only) and pins it.
 		(
 			"compromise/binding.rs",
@@ -5282,7 +5348,13 @@ fn profile_two_binding_surface_is_exact() {
 		]
 	);
 	let governance = fs::read_to_string(root.join("governance_command.rs")).unwrap();
-	assert_eq!(governance.matches("admin_governance2(admin)").count(), 1);
+	assert_eq!(governance.matches("admin_governance2(").count(), 0);
+	assert_eq!(
+		governance
+			.matches("RoleView3::governance_role(view)")
+			.count(),
+		1
+	);
 	assert_eq!(governance.matches("role.key()").count(), 1);
 	assert_eq!(governance.matches("role.actions()").count(), 1);
 	// Only original profile-3 seed derivation and terminal confirmation read the two copied role keys.
@@ -5321,16 +5393,26 @@ fn profile_two_binding_surface_is_exact() {
 			} else if p.extension().is_some_and(|x| x == "rs") {
 				let t = fs::read_to_string(&p).unwrap();
 				let is_install = p == root.join("admin_install.rs");
-				// Only install reads a manifest's governance role, and only to copy it.
-				assert_eq!(t.contains(".governance()"), is_install, "{}", p.display());
-				// One pure governance checker reads the descriptive role; no integration caller.
+				let is_view = p == root.join("role_view.rs");
+				// Only install and the offline view (once) read a manifest's governance role, and
+				// only to copy it.
+				let reads = t.matches(".governance()").count();
+				assert!(
+					if is_install {
+						reads > 0
+					} else {
+						reads == usize::from(is_view)
+					},
+					"{}",
+					p.display()
+				);
+				if is_view {
+					assert!(fn_body(&t, "offline").contains("m.governance()"));
+				}
+				// The installed copy reaches the checkers only through the view's one-for-one copy.
 				assert_eq!(
 					t.matches("admin_governance2(").count(),
-					usize::from(
-						is_install
-							|| p == root.join("governance_command.rs")
-							|| p == root.join("governance_verification.rs")
-					),
+					usize::from(is_install || is_view),
 					"{}",
 					p.display()
 				);
@@ -5770,6 +5852,11 @@ fn governance_command_envelope_is_pure_and_unwired() {
 				// C-S6: the offline audit re-verifies a VISADG01 signature under the history's
 				// epoch-0 governance key: the structural parse and the preimage, once each.
 				let audit = p == root.join("compromise/attribution.rs");
+				// Key custody K7: the role view names the action type for its one action-bit
+				// predicate; the offline facade builds and checks VISADG01 with the production
+				// encoder, preimage and checker, once each.
+				let view = p == root.join("role_view.rs");
+				let facade = p == root.join("operator_proof/proof.rs");
 				let remaining = if verifier {
 					let import = "usecrate::storage::mutation_visibility::root2::governance_command::GovernanceCommandError2;";
 					assert_eq!(t.matches(import).count(), 1);
@@ -5811,7 +5898,16 @@ fn governance_command_envelope_is_pure_and_unwired() {
 							"governance_command_preimage2",
 							"root2::governance_command",
 						]
-						.contains(&name));
+						.contains(&name)) || (view && name == "GovernanceAction2")
+						|| (facade
+							&& [
+								"check_governance_command2",
+								"governance_command_preimage2",
+								"encode_governance_command2",
+								"GovernanceAction2",
+								"root2::governance_command",
+							]
+							.contains(&name));
 					let typed_wrapper = verifier && name == "GovernanceCommandError2";
 					assert!(
 						permitted || typed_wrapper || !remaining.contains(name),
@@ -5827,6 +5923,20 @@ fn governance_command_envelope_is_pure_and_unwired() {
 					assert_eq!(calls(&t, "governance_command_preimage2"), 1);
 					assert_eq!(t.matches("root2::governance_command").count(), 1);
 					assert!(t.contains("usecrate::storage::mutation_visibility::root2::governance_command::{governance_command_preimage2,parse_governance_command2,};"));
+				}
+				if view {
+					assert_eq!(t.matches("GovernanceAction2").count(), 2);
+					assert_eq!(t.matches("root2::governance_command").count(), 0);
+				}
+				if facade {
+					for name in [
+						"check_governance_command2",
+						"governance_command_preimage2",
+						"encode_governance_command2",
+					] {
+						assert_eq!(calls(&t, name), 1, "{name}");
+					}
+					assert_eq!(t.matches("root2::governance_command").count(), 1);
 				}
 				if helper {
 					assert_eq!(calls(&t, "parse_governance_command2"), 1);
@@ -6199,7 +6309,12 @@ fn role_epoch_control_is_pre_entry_bounded_and_dormant() {
 	] {
 		assert!(forbidden(bad.parse().unwrap()).is_some());
 	}
-	for name in ["role_epochs.rs", "role_command.rs", "role_freeze.rs"] {
+	for name in [
+		"role_epochs.rs",
+		"role_command.rs",
+		"role_freeze.rs",
+		"role_view.rs",
+	] {
 		let text = read(name);
 		assert_eq!(forbidden(text.parse().unwrap()), None, "{name}");
 		for item in syn::parse_file(&text).unwrap().items {
@@ -6251,6 +6366,15 @@ fn role_epoch_control_is_pre_entry_bounded_and_dormant() {
 	let proof = read("role_command.rs");
 	assert!(proof.contains("const ROLE_PROOF_BYTES3: usize = 224;"));
 	assert_eq!(calls(&proof, "verify_strict"), 1);
+	// Key custody K7: `verify_for` is a thin wrapper over the one slot loop, which reaches the
+	// signature only through `slot_signed`; the role requirement is defined once.
+	assert_eq!(
+		fn_body(&proof, "verify_for").replace(char::is_whitespace, ""),
+		"{verify_core(&a.view(),bytes,command,expected,form)}"
+	);
+	assert_eq!(calls(fn_body(&proof, "verify_core"), "slot_signed"), 1);
+	assert_eq!(calls(fn_body(&proof, "slot_signed"), "verify_strict"), 1);
+	assert_eq!(proof.matches("fn role_requirement(").count(), 1);
 	assert!(proof.contains("&bytes[..86]") && proof.contains("&bytes[150..160]"));
 	let command = syn::parse_file(&read("command.rs")).unwrap();
 	let variants = command
@@ -6376,4 +6500,592 @@ fn role_epoch_control_is_pre_entry_bounded_and_dormant() {
 	let carrier = read("committed.rs");
 	assert!(carrier.contains("296"));
 	assert!(!carrier.contains("RotateAdmin") && !carrier.contains("SigningKey"));
+}
+
+// Key custody K7 (ADR 0101): the operator proof facade and the role view. Root2's public surface
+// is exactly the earlier re-exports plus `operator_proof`, whose public signatures carry only byte
+// arrays, primitives and the facade's own result types. No non-test Root2 module names a signing
+// token. A `RoleView3` has exactly the six checker fields, is built only by `InstalledAdmin2::view`
+// and `RoleView3::offline` (called only by the context-export reader), and never meets a command
+// token; the four checkers take it; the facade's governance `VISROL03` self-check applies the same
+// action-bit predicate as `verify_governance2`. Syntax checks over source text, probed below.
+fn facade_violation(files: &std::collections::BTreeMap<String, String>) -> Option<String> {
+	fn idents(tokens: proc_macro2::TokenStream, out: &mut Vec<String>) {
+		for t in tokens {
+			match t {
+				proc_macro2::TokenTree::Ident(id) => out.push(id.to_string()),
+				proc_macro2::TokenTree::Group(g) => idents(g.stream(), out),
+				_ => {}
+			}
+		}
+	}
+	fn type_names(ty: &syn::Type, out: &mut Vec<String>) {
+		match ty {
+			syn::Type::Path(p) => {
+				for s in &p.path.segments {
+					out.push(s.ident.to_string());
+					if let syn::PathArguments::AngleBracketed(a) = &s.arguments {
+						for arg in &a.args {
+							if let syn::GenericArgument::Type(t) = arg {
+								type_names(t, out);
+							}
+						}
+					}
+				}
+			}
+			syn::Type::Reference(r) => type_names(&r.elem, out),
+			syn::Type::Array(a) => type_names(&a.elem, out),
+			syn::Type::Slice(s) => type_names(&s.elem, out),
+			syn::Type::Tuple(t) => t.elems.iter().for_each(|e| type_names(e, out)),
+			other => out.push(format!("unsupported {}", ty_text(other))),
+		}
+	}
+	fn ty_text(ty: &syn::Type) -> String {
+		match ty {
+			syn::Type::Path(p) => p
+				.path
+				.segments
+				.iter()
+				.map(|s| match &s.arguments {
+					syn::PathArguments::AngleBracketed(a) => format!(
+						"{}<{}>",
+						s.ident,
+						a.args
+							.iter()
+							.map(|g| match g {
+								syn::GenericArgument::Type(t) => ty_text(t),
+								_ => "?".into(),
+							})
+							.collect::<Vec<_>>()
+							.join(",")
+					),
+					_ => s.ident.to_string(),
+				})
+				.collect::<Vec<_>>()
+				.join("::"),
+			syn::Type::Array(a) => match &a.len {
+				syn::Expr::Lit(syn::ExprLit {
+					lit: syn::Lit::Int(n),
+					..
+				}) => format!("[{};{}]", ty_text(&a.elem), n.base10_digits()),
+				_ => "?".into(),
+			},
+			syn::Type::Tuple(t) => format!(
+				"({})",
+				t.elems.iter().map(ty_text).collect::<Vec<_>>().join(",")
+			),
+			syn::Type::Reference(r) => format!("&{}", ty_text(&r.elem)),
+			syn::Type::Slice(s) => format!("[{}]", ty_text(&s.elem)),
+			_ => "?".into(),
+		}
+	}
+	fn use_text(tree: &syn::UseTree) -> String {
+		match tree {
+			syn::UseTree::Path(p) => format!("{}::{}", p.ident, use_text(&p.tree)),
+			syn::UseTree::Name(n) => n.ident.to_string(),
+			syn::UseTree::Rename(r) => format!("{}as{}", r.ident, r.rename),
+			syn::UseTree::Glob(_) => "*".into(),
+			syn::UseTree::Group(g) => format!(
+				"{{{}}}",
+				g.items.iter().map(use_text).collect::<Vec<_>>().join(",")
+			),
+		}
+	}
+	fn signature_types(sig: &syn::Signature, out: &mut Vec<String>) {
+		for input in &sig.inputs {
+			if let syn::FnArg::Typed(t) = input {
+				type_names(&t.ty, out);
+			}
+		}
+		if let syn::ReturnType::Type(_, t) = &sig.output {
+			type_names(t, out);
+		}
+	}
+	let flat = |t: &str| {
+		without_test_items_deep(t.parse().unwrap())
+			.to_string()
+			.replace(' ', "")
+	};
+	let get = |name: &str| files.get(name).map(String::as_str).unwrap_or("");
+	// 1. No signing token in any non-test Root2 module, the facade included.
+	for (name, text) in files {
+		let mut names = Vec::new();
+		idents(without_test_items_deep(text.parse().unwrap()), &mut names);
+		for banned in ["SigningKey", "Signer", "sign"] {
+			if names.iter().any(|n| n == banned) {
+				return Some(format!("{name}: signing token {banned}"));
+			}
+		}
+	}
+	// 2. The public surface of root2: the earlier re-exports plus the facade module.
+	let mut surface = Vec::new();
+	for item in syn::parse_file(get("mod.rs")).unwrap().items {
+		match item {
+			syn::Item::Mod(m) if matches!(m.vis, syn::Visibility::Public(_)) => {
+				surface.push(format!("mod {}", m.ident))
+			}
+			syn::Item::Use(u) if matches!(u.vis, syn::Visibility::Public(_)) => {
+				surface.push(use_text(&u.tree))
+			}
+			syn::Item::Mod(m) if matches!(m.vis, syn::Visibility::Restricted(_)) => {
+				surface.push(format!("restricted mod {}", m.ident))
+			}
+			syn::Item::Mod(_) | syn::Item::Use(_) => {}
+			_ => return Some("root2/mod.rs: only modules and re-exports".into()),
+		}
+	}
+	if surface
+		!= [
+			"restricted mod compromise",
+			"mod durable",
+			"mod operator_proof",
+			"command::{ApplyResult2,Command2}",
+			"state::{Root2,UnverifiedRoot2}",
+			"trust::{TrustedEntry2,TrustedView2,VerifiedCommand2}",
+			"types::*",
+		] {
+		return Some(format!("root2 public surface changed: {surface:?}"));
+	}
+	// 3. The facade module: private children, the exact public re-exports, nothing else public.
+	let mut exported = Vec::new();
+	for item in syn::parse_file(get("operator_proof.rs")).unwrap().items {
+		match item {
+			syn::Item::Mod(m) if matches!(m.vis, syn::Visibility::Inherited) => {}
+			syn::Item::Use(u) if matches!(u.vis, syn::Visibility::Public(_)) => {
+				exported.push(use_text(&u.tree))
+			}
+			syn::Item::Use(u) if !matches!(u.vis, syn::Visibility::Public(_)) => {}
+			syn::Item::Fn(f) if matches!(f.vis, syn::Visibility::Inherited) => {}
+			_ => {
+				return Some(
+					"operator_proof.rs: private children, re-exports, private helpers".into(),
+				);
+			}
+		}
+	}
+	if exported
+		!= [
+			"context::{AuditDerived,ContextRefusal,VerifiedContext,verify_context_export}",
+			"proof::{ProofRefusal,Unsigned,merge,prepare,prepare_statement,self_check,splice}",
+		] {
+		return Some(format!(
+			"operator_proof.rs: public items changed: {exported:?}"
+		));
+	}
+	// 4. Public facade signatures: byte arrays, primitives and the facade's own types only.
+	let allowed = [
+		"u8",
+		"u16",
+		"u32",
+		"u64",
+		"usize",
+		"bool",
+		"Vec",
+		"Option",
+		"Result",
+		"Self",
+		"T",
+		"VerifiedContext",
+		"Unsigned",
+		"ProofRefusal",
+		"P",
+		"ContextRefusal",
+		"AuditDerived",
+	];
+	for name in ["operator_proof/context.rs", "operator_proof/proof.rs"] {
+		let file: syn::File =
+			syn::parse2(without_test_items_deep(get(name).parse().unwrap())).unwrap();
+		let mut types = Vec::new();
+		for item in &file.items {
+			match item {
+				syn::Item::Fn(f) if matches!(f.vis, syn::Visibility::Public(_)) => {
+					signature_types(&f.sig, &mut types)
+				}
+				syn::Item::Struct(s) if matches!(s.vis, syn::Visibility::Public(_)) => {
+					if s.fields
+						.iter()
+						.any(|f| !matches!(f.vis, syn::Visibility::Inherited))
+					{
+						return Some(format!("{name}: a public facade struct exposes a field"));
+					}
+				}
+				syn::Item::Impl(i) => {
+					for x in &i.items {
+						if let syn::ImplItem::Fn(f) = x
+							&& matches!(f.vis, syn::Visibility::Public(_))
+						{
+							signature_types(&f.sig, &mut types)
+						}
+					}
+				}
+				_ => {}
+			}
+		}
+		if let Some(t) = types.iter().find(|t| !allowed.contains(&t.as_str())) {
+			return Some(format!("{name}: public signature names {t}"));
+		}
+	}
+	// 5. The view: exactly the six checker fields (a test-only mask aside), private, root2-only.
+	let view = get("role_view.rs");
+	let view_file: syn::File = syn::parse2(without_test_items_deep(view.parse().unwrap())).unwrap();
+	let Some(fields) = view_file.items.iter().find_map(|i| match i {
+		syn::Item::Struct(s) if s.ident == "RoleView3" => Some(s),
+		_ => None,
+	}) else {
+		return Some("role_view.rs: no RoleView3".into());
+	};
+	let shape = fields
+		.fields
+		.iter()
+		.map(|f| {
+			(
+				f.ident.as_ref().unwrap().to_string(),
+				ty_text(&f.ty),
+				matches!(f.vis, syn::Visibility::Inherited),
+			)
+		})
+		.collect::<Vec<_>>();
+	let expected = [
+		("context", "AdminContext2"),
+		("profile", "ManifestProfile2"),
+		("admin_key", "[u8;32]"),
+		("namespace", "AdminNamespace2"),
+		("governance", "Option<GovernanceRole2>"),
+		("active", "Option<[(u64,Digest2);3]>"),
+	]
+	.map(|(n, t)| (n.to_string(), t.to_string(), true));
+	if shape != expected
+		|| !matches!(&fields.vis, syn::Visibility::Restricted(r) if r.path.is_ident("super"))
+	{
+		return Some(format!("role_view.rs: RoleView3 fields changed: {shape:?}"));
+	}
+	// 6. Built only by the one-for-one copy and the offline constructor; `offline` called only
+	// by the context-export reader; the replayed chain constructed only there.
+	for (name, text) in files {
+		let t = flat(text);
+		// Its fields are private to role_view.rs, so a literal anywhere else is a compile error;
+		// within it, exactly view()'s copy and offline()'s `Self` literal.
+		// A literal, not a declaration or a return type before a body (`->RoleView3{`).
+		let literal = |ty: &str| {
+			t.match_indices(&format!("{ty}{{"))
+				.filter(|(i, _)| {
+					let before = &t[..*i];
+					!before.ends_with("struct")
+						&& !before.ends_with("impl")
+						&& !before.ends_with('>')
+						&& !before.ends_with('&')
+				})
+				.count()
+		};
+		let literals = literal("RoleView3");
+		let is_view = name == "role_view.rs";
+		if literals != usize::from(is_view) || (is_view && t.matches("Self{").count() != 1) {
+			return Some(format!(
+				"{name}: RoleView3 built outside view() and offline()"
+			));
+		}
+		let offline = t.matches("RoleView3::offline(").count();
+		if offline != usize::from(name == "operator_proof/context.rs") * 2 {
+			return Some(format!("{name}: RoleView3::offline outside the reader"));
+		}
+		let chains = literal("Chain3");
+		if chains != usize::from(name == "operator_proof/context.rs") {
+			return Some(format!("{name}: Chain3 built outside the reader"));
+		}
+		// A view never meets a command token.
+		if t.contains("RoleView3")
+			&& [
+				"VerifiedCommand2",
+				"verified2(",
+				"TrustedEntry2",
+				"CommittedEntry2",
+			]
+			.iter()
+			.any(|b| t.contains(b))
+		{
+			return Some(format!("{name}: a role view next to a command token"));
+		}
+	}
+	if fn_body(view, "view").replace(char::is_whitespace, "")
+		!= "{RoleView3{context:admin_context2(self),profile:admin_profile2(self),admin_key:admin_key2(self),namespace:admin_namespace2(self),governance:admin_governance2(self),active:admin_active3(self),#[cfg(test)]test_mask:None,}}"
+	{
+		return Some("role_view.rs: view() is not the one-for-one copy".into());
+	}
+	for name in [
+		"role_view.rs",
+		"operator_proof.rs",
+		"operator_proof/context.rs",
+		"operator_proof/proof.rs",
+	] {
+		let t = flat(get(name));
+		for banned in [
+			"VerifiedCommand2",
+			"TrustedEntry2",
+			"CommittedEntry2",
+			"advance_verified2",
+			"install_admin2",
+			"MutationAuthorityState2",
+			"std::fs",
+			"std::io",
+			"std::net",
+			"std::env",
+			"tokio",
+			"unsafe",
+			"SystemTime",
+			"Instant",
+		] {
+			if t.contains(banned) {
+				return Some(format!("{name}: {banned}"));
+			}
+		}
+	}
+	// 7. The four checkers take the view.
+	for (name, check) in [
+		("role_command.rs", "fnverify_core(view:&RoleView3,"),
+		(
+			"admin_statement.rs",
+			"fncheck_admin_statement2(view:&RoleView3,",
+		),
+		(
+			"admin_statement.rs",
+			"fncheck_epoch_statement3(view:&RoleView3,",
+		),
+		(
+			"governance_command.rs",
+			"fncheck_governance_command2(view:&RoleView3,",
+		),
+	] {
+		if !flat(get(name)).contains(check) {
+			return Some(format!("{name}: {check}"));
+		}
+	}
+	// 8. One action-bit predicate: defined on the view, applied by `verify_governance2` and by the
+	// facade's governance VISROL03 self-check (and its prepare), nowhere else.
+	if view.matches("fn governs(").count() != 1
+		|| fn_body(view, "governs").replace(char::is_whitespace, "")
+			!= "{self.governance.is_some_and(|r|self.mask(r)&action.bit()!=0)}"
+	{
+		return Some("role_view.rs: governs is not the action-bit predicate".into());
+	}
+	let proof = get("operator_proof/proof.rs");
+	for (name, text) in files {
+		let t = flat(text);
+		let want = match name.as_str() {
+			"governance_verification.rs" => 1,
+			"operator_proof/proof.rs" => 2,
+			_ => 0,
+		};
+		if t.matches(".governs(action)").count() != want {
+			return Some(format!("{name}: governs calls"));
+		}
+	}
+	let check_under = fn_body(proof, "check_under").replace(char::is_whitespace, "");
+	if !check_under.contains(
+		"parse(s).is_ok()&&view.governs(action)&&verify_core(view,s,digest,[2,0],RoleForm3::Legacy)==Ok(true)",
+	) {
+		return Some("operator_proof/proof.rs: the governance VISROL03 self-check skips the action bit".into());
+	}
+	// 9. One role requirement, used by the verifier, the reader and the facade only.
+	for (name, text) in files {
+		let t = flat(text);
+		let calls =
+			t.matches("role_requirement(").count() - t.matches("fnrole_requirement(").count();
+		let ok = match name.as_str() {
+			"verification.rs" | "operator_proof/context.rs" => calls == 1,
+			"operator_proof/proof.rs" => calls >= 1,
+			_ => calls == 0,
+		};
+		if !ok {
+			return Some(format!("{name}: role_requirement calls"));
+		}
+	}
+	// 10. The facade's governance actions are the verifier's: the same nine pairs.
+	let pairs = |text: &str, function: &str| {
+		let body = fn_body(text, function).replace(char::is_whitespace, "");
+		let mut out = body
+			.split("Command2::")
+			.skip(1)
+			.filter_map(|arm| {
+				let (kind, rest) = arm.split_once(['(', '{', '='])?;
+				let action = rest.split_once("GovernanceAction2::")?.1;
+				let action: String = action.chars().take_while(|c| c.is_alphanumeric()).collect();
+				Some((kind.to_string(), action))
+			})
+			.filter(|(kind, action)| kind == action)
+			.collect::<Vec<_>>();
+		out.sort();
+		out
+	};
+	let facade_pairs = pairs(proof, "governance_action");
+	if facade_pairs.len() != 9
+		|| facade_pairs != pairs(get("governance_verification.rs"), "governance_failure2")
+	{
+		return Some(
+			"operator_proof/proof.rs: governance actions differ from the verifier's".into(),
+		);
+	}
+	None
+}
+#[test]
+fn operator_proof_facade_is_exact_and_never_signs() {
+	let root =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
+	let mut files = std::collections::BTreeMap::new();
+	let mut stack = vec![root.clone()];
+	while let Some(dir) = stack.pop() {
+		for e in fs::read_dir(dir).unwrap() {
+			let p = e.unwrap().path();
+			let name = p.file_name().unwrap().to_string_lossy().to_string();
+			if p.is_dir() {
+				if name != "tests" {
+					stack.push(p);
+				}
+			} else if name.ends_with(".rs") && !name.ends_with("tests.rs") {
+				let rel = p.strip_prefix(&root).unwrap().to_string_lossy().to_string();
+				files.insert(rel, fs::read_to_string(&p).unwrap());
+			}
+		}
+	}
+	assert!(files.contains_key("operator_proof/proof.rs") && files.len() > 40);
+	assert_eq!(facade_violation(&files), None);
+	// Probes: each guarded property, broken once, is caught.
+	let edit = |name: &str, f: &dyn Fn(&str) -> String| {
+		let mut x = files.clone();
+		let text = f(&x[name]);
+		assert_ne!(text, x[name], "probe did not change {name}");
+		x.insert(name.to_string(), text);
+		x
+	};
+	let probes: Vec<(&str, std::collections::BTreeMap<String, String>)> = vec![
+		(
+			"a signing call in the facade",
+			edit("operator_proof/proof.rs", &|t| {
+				format!(
+					"{t}\nfn s(k: &[u8; 32]) {{ let _ = SigningKey::from_bytes(k).sign(b\"x\"); }}"
+				)
+			}),
+		),
+		(
+			"a Signer import in a checker",
+			edit("admin_statement.rs", &|t| {
+				format!("use ed25519_dalek::Signer;\n{t}")
+			}),
+		),
+		(
+			"another public root2 module",
+			edit("mod.rs", &|t| t.replace("\nmod admin;", "\npub mod admin;")),
+		),
+		(
+			"another public re-export",
+			edit("mod.rs", &|t| format!("{t}\npub use role_view::RoleView3;")),
+		),
+		(
+			"a public facade item outside the re-exports",
+			edit("operator_proof.rs", &|t| {
+				t.replace("\nmod proof;", "\npub mod proof;")
+			}),
+		),
+		(
+			"a root2 type in a public facade signature",
+			edit("operator_proof/proof.rs", &|t| {
+				format!("{t}\npub fn leak(v: &RoleView3) -> Digest2 {{ todo!() }}")
+			}),
+		),
+		(
+			"a public field on the verified context",
+			edit("operator_proof/context.rs", &|t| {
+				t.replace(
+					"\thistory: Vec<(u8, u64, [u8; 32])>,",
+					"\tpub history: Vec<(u8, u64, [u8; 32])>,",
+				)
+			}),
+		),
+		(
+			"a seventh view field",
+			edit("role_view.rs", &|t| {
+				t.replace(
+					"\tactive: Option<[(u64, Digest2); 3]>,\n",
+					"\tactive: Option<[(u64, Digest2); 3]>,\n\tcut: Option<Digest2>,\n",
+				)
+			}),
+		),
+		(
+			"a view built in the verifier",
+			edit("verification.rs", &|t| {
+				format!("{t}\nfn v() -> RoleView3 {{ RoleView3 {{ context }} }}")
+			}),
+		),
+		(
+			"an offline view outside the reader",
+			edit("operator_proof/proof.rs", &|t| {
+				format!("{t}\nfn o() {{ RoleView3::offline(&c, &m, &k); }}")
+			}),
+		),
+		(
+			"a chain built outside the reader",
+			edit("operator_proof/proof.rs", &|t| {
+				format!("{t}\nfn o() {{ let _ = Chain3 {{ successors }}; }}")
+			}),
+		),
+		(
+			"a view next to a command token",
+			edit("role_view.rs", &|t| {
+				format!("{t}\nfn t(_: VerifiedCommand2) {{}}")
+			}),
+		),
+		(
+			"view() copying a different field",
+			edit("role_view.rs", &|t| {
+				t.replace("admin_key: admin_key2(self),", "admin_key: [0; 32],")
+			}),
+		),
+		(
+			"a checker taking the installed administrator",
+			edit("admin_statement.rs", &|t| {
+				t.replace(
+					"fn check_admin_statement2(\n\tview: &RoleView3,",
+					"fn check_admin_statement2(\n\tview: &InstalledAdmin2,",
+				)
+			}),
+		),
+		(
+			"the facade's governance self-check without the action bit",
+			edit("operator_proof/proof.rs", &|t| {
+				t.replace("&& view.governs(action)\n", "\n")
+			}),
+		),
+		(
+			"a second action-bit predicate",
+			edit("governance_verification.rs", &|t| {
+				t.replace(
+					"!admin.view().governs(action)",
+					"admin.view().governance_role().is_none_or(|r| r.actions() & action.bit() == 0)",
+				)
+			}),
+		),
+		(
+			"a role requirement copied outside the facade",
+			edit("compromise/attribution.rs", &|t| {
+				format!("{t}\nfn r(c: &Command2) {{ role_requirement(c, 0); }}")
+			}),
+		),
+		(
+			"a facade governance action that is not the verifier's",
+			edit("operator_proof/proof.rs", &|t| {
+				t.replace(
+					"Command2::Cut { .. } => GovernanceAction2::Cut,",
+					"Command2::Cut { .. } => GovernanceAction2::Release,",
+				)
+			}),
+		),
+		(
+			"file I/O in the facade",
+			edit("operator_proof/context.rs", &|t| {
+				format!("{t}\nfn w() {{ std::fs::write(\"x\", []).unwrap(); }}")
+			}),
+		),
+	];
+	for (what, x) in &probes {
+		assert!(facade_violation(x).is_some(), "probe not caught: {what}");
+	}
 }

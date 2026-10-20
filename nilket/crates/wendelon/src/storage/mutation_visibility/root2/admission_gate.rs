@@ -111,9 +111,11 @@ impl Root2 {
 			denied(8, None)
 		} else {
 			match match command {
-				Command2::AdmissionPermission(bytes) => check_admin_statement2(admin, bytes),
+				Command2::AdmissionPermission(bytes) => {
+					check_admin_statement2(&admin.view(), bytes)
+				}
 				Command2::EpochAdmissionPermission(bytes) => {
-					super::admin_statement::check_epoch_statement3(admin, bytes)
+					super::admin_statement::check_epoch_statement3(&admin.view(), bytes)
 				}
 				_ => unreachable!("checked admission kind"),
 			} {

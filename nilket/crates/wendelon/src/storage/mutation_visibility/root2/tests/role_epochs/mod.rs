@@ -10,4 +10,5 @@ mod compatibility;
 mod rotation;
 mod support;
 mod verification;
+mod view;
 use support::*;

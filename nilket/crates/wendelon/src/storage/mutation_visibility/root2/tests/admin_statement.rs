@@ -166,7 +166,7 @@ fn independent_statement_vectors_match_and_authenticate() {
 		);
 		assert_eq!(&encoded[12..200], hex("context").as_slice());
 		assert_eq!(&encoded[200..273], hex("key").as_slice());
-		let checked = check_admin_statement2(&a, &bytes).unwrap();
+		let checked = check_admin_statement2(&a.view(), &bytes).unwrap();
 		assert_eq!(checked_action2(&checked), action);
 		assert!(checked_key2(&checked) == key());
 		assert!(checked_context2(&checked) == ctx);
@@ -178,7 +178,7 @@ fn structural_refusals_in_order() {
 	use StatementError2 as E;
 	let a = admin();
 	let good = statement("grant");
-	let check = |b: &[u8]| check_admin_statement2(&a, b).err();
+	let check = |b: &[u8]| check_admin_statement2(&a.view(), b).err();
 	assert_eq!(check(&good[..336]), Some(E::Length));
 	for (at, v, want) in [
 		(0, &b"VISADS03"[..], E::Magic),
@@ -280,7 +280,7 @@ fn context_must_equal_the_installed_context_whole() {
 		b[at] ^= 0x01;
 		b[at + width - 1] |= 0x01;
 		assert_eq!(
-			check_admin_statement2(&a, &b).err(),
+			check_admin_statement2(&a.view(), &b).err(),
 			Some(StatementError2::Context),
 			"context field at {at}"
 		);
@@ -319,7 +319,7 @@ fn scope_must_equal_the_admin_namespace_exactly() {
 		let k = PermissionKey2 { namespace, ..key() };
 		let bytes = encode_admin_statement2(AdminAction2::Grant, &k, &ctx, &sig).unwrap();
 		assert_eq!(
-			check_admin_statement2(&a, &bytes).err(),
+			check_admin_statement2(&a.view(), &bytes).err(),
 			Some(StatementError2::Scope)
 		);
 	}
@@ -330,11 +330,11 @@ fn signatures_are_strict_and_bound_to_the_admin_key() {
 	let mut flipped = statement("grant");
 	flipped[300] ^= 1;
 	assert_eq!(
-		check_admin_statement2(&a, &flipped).err(),
+		check_admin_statement2(&a.view(), &flipped).err(),
 		Some(StatementError2::Signature)
 	);
 	assert_eq!(
-		check_admin_statement2(&a, &statement("other_signer")).err(),
+		check_admin_statement2(&a.view(), &statement("other_signer")).err(),
 		Some(StatementError2::Signature)
 	);
 }
@@ -357,7 +357,10 @@ fn statements_survive_tip_advances_and_do_not_cross_roots() {
 		}
 		state = advance_root2(&state, &e, &verified, &cmd).unwrap().0;
 		let a = install_admin2(&state, &t).unwrap();
-		assert!(check_admin_statement2(&a, &grant).is_ok(), "entry {i}");
+		assert!(
+			check_admin_statement2(&a.view(), &grant).is_ok(),
+			"entry {i}"
+		);
 	}
 	// Another root with a different genesis, coherently installed, refuses root A's statement.
 	let mut other_genesis = vector_record();
@@ -368,7 +371,7 @@ fn statements_survive_tip_advances_and_do_not_cross_roots() {
 	)
 	.unwrap();
 	assert_eq!(
-		check_admin_statement2(&b, &grant).err(),
+		check_admin_statement2(&b.view(), &grant).err(),
 		Some(StatementError2::Context)
 	);
 	// Another root whose Bootstrap sits at another log position.
@@ -380,7 +383,7 @@ fn statements_survive_tip_advances_and_do_not_cross_roots() {
 	moved.identity.bootstrap_command = origin.bootstrap_command;
 	let c = install_admin2(&later, &tuple(&hex("manifest_prime"), moved)).unwrap();
 	assert_eq!(
-		check_admin_statement2(&c, &grant).err(),
+		check_admin_statement2(&c.view(), &grant).err(),
 		Some(StatementError2::Context)
 	);
 	// A coherently installed administrator with a different key commits a different manifest pin,
@@ -400,7 +403,7 @@ fn statements_survive_tip_advances_and_do_not_cross_roots() {
 	let other_key = install_admin2(&m1_root, &tuple(&m1, m1_record)).unwrap();
 	assert!(admin_key2(&other_key) != admin_key2(&admin()));
 	assert_eq!(
-		check_admin_statement2(&other_key, &grant).err(),
+		check_admin_statement2(&other_key.view(), &grant).err(),
 		Some(StatementError2::Context)
 	);
 }

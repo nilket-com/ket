@@ -30,41 +30,40 @@ impl F {
 	}
 	pub(super) fn proof(&self, c: &Command2, roles: [u8; 2]) -> Vec<u8> {
 		let admin = install_admin2(&self.f.state, &self.f.pin).unwrap();
-		let mut b = vec![0; 224];
-		b[..8].copy_from_slice(b"VISROL03");
-		b[8..10].copy_from_slice(&1u16.to_le_bytes());
-		b[12..44].copy_from_slice(&role_command::context_digest(&admin));
-		b[44..76].copy_from_slice(&c.digest(self.f.dep.generation, self.f.dep.cluster).unwrap());
-		for (i, at) in [76, 150].into_iter().enumerate() {
-			let role = roles[i];
-			b[at] = role;
-			if role != 0 {
-				b[at + 1..at + 9].copy_from_slice(
-					&active_role3(&admin, usize::from(role - 1))
-						.unwrap()
-						.0
-						.to_le_bytes(),
-				);
-				b[at + 9] = 1;
+		let (context, digest) = (
+			role_command::context_digest(&admin),
+			c.digest(self.f.dep.generation, self.f.dep.cluster).unwrap(),
+		);
+		let slot = |i: usize, sig: [u8; 64]| match roles[i] {
+			0 => (0, 0, false, sig),
+			r => (
+				r,
+				active_role3(&admin, usize::from(r - 1)).unwrap().0,
+				true,
+				sig,
+			),
+		};
+		let unsigned =
+			role_command::encode_role_proof3(context, digest, [slot(0, [0; 64]), slot(1, [0; 64])])
+				.unwrap();
+		let form = match c {
+			Command2::RetireRoot => role_command::RoleForm3::Retire,
+			Command2::Freeze(_) => role_command::RoleForm3::Freeze,
+			_ => role_command::RoleForm3::Legacy,
+		};
+		let mut sigs = [[0; 64]; 2];
+		for i in 0..2 {
+			if roles[i] != 0
+				&& let Ok(pre) = role_command::preimage_for(&unsigned, roles, i, form)
+			{
+				sigs[i] = SigningKey::from_bytes(&[[11, 12, 13][usize::from(roles[i] - 1)]; 32])
+					.sign(&pre)
+					.to_bytes();
 			}
 		}
-		for (i, at) in [76, 150].into_iter().enumerate() {
-			if roles[i] != 0 {
-				let form = match c {
-					Command2::RetireRoot => role_command::RoleForm3::Retire,
-					Command2::Freeze(_) => role_command::RoleForm3::Freeze,
-					_ => role_command::RoleForm3::Legacy,
-				};
-				if let Ok(pre) = role_command::preimage_for(&b, roles, i, form) {
-					let sig =
-						SigningKey::from_bytes(&[[11, 12, 13][usize::from(roles[i] - 1)]; 32])
-							.sign(&pre)
-							.to_bytes();
-					b[at + 10..at + 74].copy_from_slice(&sig);
-				}
-			}
-		}
-		b
+		role_command::encode_role_proof3(context, digest, [slot(0, sigs[0]), slot(1, sigs[1])])
+			.unwrap()
+			.to_vec()
 	}
 	pub(super) fn retire(&mut self, roles: [u8; 2]) {
 		let c = Command2::RetireRoot;
@@ -101,21 +100,25 @@ impl F {
 		encode_admin_statement2(AdminAction2::Grant, &k, &c, &sig).unwrap()
 	}
 	pub(super) fn statement(&self) -> [u8; 345] {
-		let old = self.legacy_statement();
-		let mut b = [0; 345];
-		b[..273].copy_from_slice(&old[..273]);
-		b[..8].copy_from_slice(b"VISADS03");
-		b[273..281].copy_from_slice(
-			&active_role3(&install_admin2(&self.f.state, &self.f.pin).unwrap(), 0)
-				.unwrap()
-				.0
-				.to_le_bytes(),
-		);
+		let a = install_admin2(&self.f.state, &self.f.pin).unwrap();
+		let (c, ns) = (admin_context2(&a), admin_namespace2(&a));
+		let k = PermissionKey2 {
+			authority: wire::authority(),
+			namespace: AdmissionNamespace2 {
+				generation: c.generation,
+				tenant: ns.tenant,
+				scope: ns.scope,
+				table: ns.table,
+				schema: ns.schema,
+			},
+		};
+		let epoch = active_role3(&a, 0).unwrap().0;
+		let unsigned =
+			encode_epoch_statement3(AdminAction2::Grant, &k, &c, epoch, &[0; 64]).unwrap();
 		let sig = SigningKey::from_bytes(&[11; 32])
-			.sign(&epoch_statement_preimage3(&b).unwrap())
+			.sign(&epoch_statement_preimage3(&unsigned).unwrap())
 			.to_bytes();
-		b[281..].copy_from_slice(&sig);
-		b
+		encode_epoch_statement3(AdminAction2::Grant, &k, &c, epoch, &sig).unwrap()
 	}
 
 	pub(super) fn terminal(&mut self, c: Command2, p: Option<Vec<u8>>) -> ApplyResult2 {

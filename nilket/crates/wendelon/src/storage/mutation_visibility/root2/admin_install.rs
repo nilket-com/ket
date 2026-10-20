@@ -268,6 +268,12 @@ pub(in crate::storage::mutation_visibility::root2) fn active_role3(
 ) -> Option<(u64, Digest2)> {
 	a.active.and_then(|roles| roles.get(role).copied())
 }
+/// All three active epochs at once, exactly as installed: what a role view copies.
+pub(in crate::storage::mutation_visibility::root2) fn admin_active3(
+	a: &InstalledAdmin2,
+) -> Option<[(u64, Digest2); 3]> {
+	a.active
+}
 pub(in crate::storage::mutation_visibility::root2) fn admin_cut3(
 	a: &InstalledAdmin2,
 ) -> Option<(Log2, Digest2, Digest2)> {
