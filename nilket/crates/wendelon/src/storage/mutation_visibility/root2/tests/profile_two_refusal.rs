@@ -2,9 +2,11 @@
 //! each profile's separately coherent wrong-length chain C's Bootstrap check and install refuse
 //! on the length alone; observe accepts exactly the two canonical lengths; the issuer gate refuses
 //! a state whose only difference is `control_len`. Fixture builders are in `profile_two_binding`.
+use super::profile_three_fixture::{
+	control_len, enrolled, expected_context, grant, pre_root, reduce_at, rooted,
+};
 use super::profile_two_binding::{
-	ADMISSION_SEED_A, ADMISSION_SEED_B, PROFILES, chain, control_len, enrolled, expected_context,
-	grant, manifest_bytes, non_length_conjuncts, pre_root, reduce_at, rooted,
+	ADMISSION_SEED_A, ADMISSION_SEED_B, PROFILES, chain, manifest_bytes, non_length_conjuncts,
 };
 use super::*;
 use crate::storage::mutation_visibility::root2::admin_install::*;

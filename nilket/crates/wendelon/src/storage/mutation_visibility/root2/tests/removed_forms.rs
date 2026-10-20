@@ -14,7 +14,7 @@ use crate::storage::mutation_visibility::root2::provisioning::owner_core::{
 };
 use crate::storage::mutation_visibility::root2::provisioning::owner_log::OwnerDir2;
 use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::{
-	ReplicaInputs2, validate_replica_tuple2,
+	ReplicaInputs2, tuple_manifest_len2, tuple_manifest2, validate_replica_tuple2,
 };
 use crate::storage::mutation_visibility::root2::provisioning::snapshot::decode_snapshot2;
 use serde_json::Value;
@@ -128,14 +128,19 @@ fn removed_tuple_and_snapshots_are_accepted_today() {
 	let manifest_pin = hash(b"VISROOT2-ADMIN-MANIFEST\0", &manifest);
 	let snapshot = bytes(n4);
 	let inventory_pin = hash(b"", &snapshot);
-	assert!(
-		validate_replica_tuple2(&ReplicaInputs2 {
-			manifest: Some(&manifest),
-			manifest_pin: Some(&manifest_pin),
-			snapshot: Some(&snapshot),
-			inventory_pin: Some(&inventory_pin),
-		})
-		.is_ok()
+	let tuple = validate_replica_tuple2(&ReplicaInputs2 {
+		manifest: Some(&manifest),
+		manifest_pin: Some(&manifest_pin),
+		snapshot: Some(&snapshot),
+		inventory_pin: Some(&inventory_pin),
+	})
+	.unwrap();
+	// The tuple carries the 137-byte profile-1 manifest itself.
+	assert_eq!(tuple_manifest_len2(&tuple), 137);
+	assert_eq!(tuple_manifest2(&tuple).profile(), ManifestProfile2::One);
+	assert_eq!(
+		tuple_manifest2(&tuple).encode().unwrap().as_slice(),
+		manifest
 	);
 	for (id, version, count) in [
 		("N5", 2u16, 3usize),
@@ -197,6 +202,7 @@ fn removed_owner_forms_are_accepted_today() {
 		[RootState2::Bound, RootState2::Bound, RootState2::Retired]
 	);
 	assert!(exported.entries[2].terminal.is_none());
+	assert_eq!(exported.entries[2].profile, ManifestProfile2::Three);
 	drop(o);
 	// N11: a VISIEV02 log in an unmarked directory opens as v1.
 	let s = Scratch::new();

@@ -7,10 +7,11 @@
 //! profile-3 constructors; the root, tuple and token builders are test-only FIXTURES, and the
 //! selector/authority/lineage/Reserve commands are the independent `reserve_vectors.json`. The
 //! profile-1 path stays `admission_reserve` (control).
-use super::profile_two_binding::{Chain, chain_of};
+use super::profile_three_fixture::{Chain, chain_of};
 use super::*;
+use crate::storage::mutation_visibility::MutationScope;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AdminManifest2, AdminManifestThree3, GovernanceRole2, RecoveryRole3,
+	AdminManifest2, AdminManifestThree3, AdminNamespace2, GovernanceRole2, RecoveryRole3,
 };
 use crate::storage::mutation_visibility::root2::admin_install::*;
 use crate::storage::mutation_visibility::root2::admin_statement::*;
@@ -34,9 +35,35 @@ fn rv() -> serde_json::Value {
 }
 const ADMIN_SEED: u8 = 0x5A;
 /// `manifest_prime` with the TEST admin key, upgraded to profile 3 with a TEST governance role.
+/// `manifest_prime`'s Admission fields, inline (its own admin key, replaced below by the TEST
+/// administrator seed).
+const PRIME_FIELDS: AdminManifest2 = AdminManifest2 {
+	generation: [0xa1; 16],
+	cluster: [0xc2; 16],
+	initial_epoch: 7,
+	admin_id: [0x0e; 16],
+	admin_key: [
+		0x5e, 0x44, 0x9a, 0xd6, 0xfa, 0x4b, 0x2d, 0x65, 0x74, 0x6e, 0x8c, 0xd4, 0xf9, 0x68, 0xe3,
+		0x8c, 0x5a, 0x96, 0x79, 0xf8, 0x49, 0x5d, 0xb1, 0x14, 0xee, 0x06, 0x31, 0x7f, 0x72, 0xf7,
+		0x17, 0xdb,
+	],
+	namespace: AdminNamespace2 {
+		tenant: 0,
+		scope: MutationScope::Table,
+		table: [0x7a; 16],
+		schema: 2,
+	},
+};
+/// Bridge, deleted with the profile-1 decoder in c2: the inline fields are today's decoded
+/// `manifest_prime`, field for field.
+#[test]
+fn inline_prime_fields_equal_the_decoded_manifest_prime() {
+	let decoded = AdminManifest2::decode(&unhex(sv()["manifest_prime"].as_str().unwrap())).unwrap();
+	assert!(decoded == PRIME_FIELDS);
+	assert_eq!(decoded.encode().unwrap(), PRIME_FIELDS.encode().unwrap());
+}
 fn manifest_three() -> Vec<u8> {
-	let mut base =
-		AdminManifest2::decode(&unhex(sv()["manifest_prime"].as_str().unwrap())).unwrap();
+	let mut base = PRIME_FIELDS;
 	base.admin_key = SigningKey::from_bytes(&[ADMIN_SEED; 32])
 		.verifying_key()
 		.to_bytes();

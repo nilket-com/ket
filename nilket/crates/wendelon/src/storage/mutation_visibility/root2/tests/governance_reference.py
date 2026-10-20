@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Independent VISADG01 and runtime lease LE vectors.
 Run: python3 -I governance_reference.py > governance_vectors.json
-Inputs: existing M2 profile2 manifest (admission42/governance92) and genesis.
+Inputs: the M2 profile2 manifest (admission42/governance92, inlined) and genesis.
 Constructs Bootstrap payload/digests and full context independently of Rust.
 Lease fields, LE offsets, zero reserved words and RFC8032 signatures are explicit.
 """
@@ -31,8 +31,15 @@ def sha(*parts):
 
 key = Ed25519PrivateKey.from_private_bytes(SEED)
 public = key.public_key().public_bytes_raw()
-MV = json.loads((HERE / "../provisioning/tests/profile_two_inventory_vectors.json").read_text())
-manifest = bytes.fromhex(MV["manifests"]["b"]["bytes"])
+# The M2 profile-2 manifest "b" (admission 0x42, governance 0x92), inlined.
+manifest = bytes.fromhex(
+    "56495341444d320001000200424242424242424242424242424242424d4d4d4d"
+    "4d4d4d4d4d4d4d4d4d4d4d4d4201000000000000717171717171717171717171"
+    "717171712152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e06"
+    "9881db1203000000050000000000000000000000000000000000000000000000"
+    "00000000000000000091919191919191919191919191919191c6d0c796bb4c3c"
+    "923615f8dc85e6fc35149eb6b1317de523d3a5085584f5c109ff010000"
+)
 assert len(manifest) == 189 and manifest[153:185] == public
 g, c = manifest[12:28], manifest[28:44]
 epoch = struct.unpack("<Q", manifest[44:52])[0]

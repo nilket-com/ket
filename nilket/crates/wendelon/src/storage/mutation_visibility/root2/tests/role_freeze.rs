@@ -1,8 +1,8 @@
 //! Role epoch tests use actual carrier adaptation and the sole production verification producer.
 use super::governance_verification::support as wire;
 use crate::storage::mutation_visibility::root2::{
-	admin::manifest::*, admin_install::*, admin_statement::*, codec::*, command::*, origin::*,
-	role_command, types::*, verification::*,
+	admin_install::*, admin_statement::*, codec::*, command::*, origin::*, role_command, types::*,
+	verification::*,
 };
 use ed25519_dalek::{Signer, SigningKey};
 mod support;
@@ -238,7 +238,7 @@ fn full_command_profile_frozen_state_matrix() {
 			"command_reserve",
 			"command_finalize",
 		] {
-			commands.push(super::support::command(name));
+			commands.push(crate::storage::mutation_visibility::root2::tests::profile_three_fixture::s1_command(name));
 		}
 		commands.extend([
 			Command2::AdmissionPermission(f.legacy_statement()),
@@ -334,7 +334,10 @@ fn cover_reserve_finalize_and_nonroot_entries_unchanged() {
 	let mut f = F::new();
 	f.freeze();
 	for name in ["command_cover_blank", "command_reserve", "command_finalize"] {
-		let c = super::support::command(name);
+		let c =
+			crate::storage::mutation_visibility::root2::tests::profile_three_fixture::s1_command(
+				name,
+			);
 		assert!(!super::super::role_freeze::blocked(&f.root().state, &c));
 	}
 	let c = Command2::Cover {

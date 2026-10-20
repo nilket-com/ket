@@ -18,7 +18,9 @@ use crate::storage::mutation_visibility::root2::provisioning::inventory::{
 use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::*;
 use crate::storage::mutation_visibility::root2::provisioning::snapshot::encode_snapshot2;
 use crate::storage::mutation_visibility::root2::recovery::Deployment2;
-use crate::storage::mutation_visibility::root2::tests::{profile_two_binding, support};
+use crate::storage::mutation_visibility::root2::tests::{
+	profile_three_fixture, profile_two_binding,
+};
 use crate::storage::mutation_visibility::root2::trust::{TrustedEntry2, VerifiedCommand2};
 use crate::storage::mutation_visibility::root2::types::*;
 use crate::storage::mutation_visibility::root2::verification::{VerifyError2, advance_verified2};
@@ -115,56 +117,6 @@ impl Fixture {
 			.to_vec();
 		Self::from_manifest(manifest)
 	}
-	pub(in crate::storage::mutation_visibility::root2) fn from_manifest(manifest: Vec<u8>) -> Self {
-		let any = AnyAdminManifest2::decode(&manifest).unwrap();
-		let a = any.admission();
-		let dep = Deployment2 {
-			generation: a.generation,
-			cluster: a.cluster,
-		};
-		let boot = Command2::Bootstrap {
-			epoch: a.initial_epoch,
-			control: profile_two_binding::exact_pin(&manifest),
-			length: manifest.len() as u64,
-		};
-		let entries = vec![entry(0), entry(1), carrier(&boot, dep, 2, None)];
-		let source = CommittedSource2::synthetic();
-		let fingerprint = |e: &E| {
-			committed_entry2(&source, e)
-				.unwrap()
-				.committed()
-				.entry_fields()
-				.1
-		};
-		// Rebind the existing owner-approved record fixture to these exact immutable entries.
-		let chain = profile_two_binding::chain_of(&manifest, manifest.len() as u64);
-		let mut record = tuple_record2(&chain.tuple);
-		record.identity.genesis_fingerprint = fingerprint(&entries[0]);
-		record.identity.bootstrap_fingerprint = fingerprint(&entries[2]);
-		record.identity.bootstrap_command = boot.digest(dep.generation, dep.cluster).unwrap();
-		let pin = tuple_for(&manifest, record);
-		let mut state = empty_authority2();
-		for e in &entries[..2] {
-			let ce = committed_entry2(&source, e).unwrap().into_committed();
-			state = advance_pre_root2(&state, &ce).unwrap().0;
-		}
-		let ce = committed_entry2(&source, &entries[2])
-			.unwrap()
-			.into_committed();
-		let trusted = TrustedEntry2::bind(&ce, &boot, dep.generation, dep.cluster).unwrap();
-		state = advance_verified2(&state, &pin, &ce, &trusted, &boot, None)
-			.unwrap()
-			.0;
-		Self {
-			manifest,
-			any,
-			record,
-			pin,
-			dep,
-			state,
-			entries,
-		}
-	}
 	pub(in crate::storage::mutation_visibility::root2) fn envelope(
 		&self,
 		state: &MutationAuthorityState2,
@@ -214,7 +166,7 @@ pub(in crate::storage::mutation_visibility::root2) fn tuple_for(
 ) -> PinnedBoundTuple2 {
 	let any = AnyAdminManifest2::decode(manifest).unwrap();
 	let a = any.admission();
-	let pin = profile_two_binding::exact_pin(manifest);
+	let pin = profile_three_fixture::exact_pin(manifest);
 	let snapshot = encode_snapshot2(&LogState2 {
 		roots: vec![RootEntry2 {
 			terminal: None,
@@ -332,7 +284,7 @@ pub(in crate::storage::mutation_visibility::root2) fn authority() -> AuthorityRe
 	}
 }
 pub(in crate::storage::mutation_visibility::root2) fn enroll_authority() -> Command2 {
-	let c = support::claim();
+	let c = profile_three_fixture::s1_claim();
 	Command2::EnrollAuthority {
 		authority: authority(),
 		node: NodeRef2 {
@@ -346,7 +298,7 @@ pub(in crate::storage::mutation_visibility::root2) fn signed_lease(
 	f: &Fixture,
 	seed: u8,
 ) -> SignedLease2 {
-	let mut lease = support::claim().original.lease;
+	let mut lease = profile_three_fixture::s1_claim().original.lease;
 	lease.epoch = f.any.admission().initial_epoch;
 	lease.issuer = 7;
 	lease.signature = SigningKey::from_bytes(&[seed; 32])
@@ -355,7 +307,7 @@ pub(in crate::storage::mutation_visibility::root2) fn signed_lease(
 	lease
 }
 pub(in crate::storage::mutation_visibility::root2) fn grant(f: &Fixture, seed: u8) -> Command2 {
-	let original = support::claim().original;
+	let original = profile_three_fixture::s1_claim().original;
 	Command2::Grant {
 		lineage: original.lineage,
 		incarnation: original.incarnation,
@@ -450,7 +402,7 @@ pub(in crate::storage::mutation_visibility::root2) fn permission(
 pub(in crate::storage::mutation_visibility::root2) fn prepared_claim(
 	f: &Fixture,
 ) -> ClaimProjection2 {
-	let mut c = support::claim();
+	let mut c = profile_three_fixture::s1_claim();
 	c.manifest.identity = identity(f);
 	c.manifest.key_id = [0x42; 16];
 	c.manifest.key_version = 1;

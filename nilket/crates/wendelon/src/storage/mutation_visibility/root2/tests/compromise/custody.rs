@@ -239,11 +239,14 @@ fn t_k7_refused_cells_are_typed_and_produce_nothing() {
 		|r: &Root, ctx: &VerifiedContext, c: &Command2, role: u8, form: Option<&[u8; 8]>| {
 			facade::prepare(ctx, &bytes(r, c), &key(seed(r, role)), None, form, None).err()
 		};
-	let fixtures = super::super::support::command;
+	let fixtures =
+		crate::storage::mutation_visibility::root2::tests::profile_three_fixture::s1_command;
 	// Bootstrap (the pin), Reserve and Finalize (authority keys), Cover.
 	for c in [
 		fixtures("command_bootstrap"),
-		Command2::Reserve(super::super::support::claim()),
+		Command2::Reserve(
+			crate::storage::mutation_visibility::root2::tests::profile_three_fixture::s1_claim(),
+		),
 		fixtures("command_finalize"),
 		Command2::Cover {
 			kind: 0,
