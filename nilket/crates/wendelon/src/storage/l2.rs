@@ -1135,20 +1135,14 @@ impl ObjectStore for MockObjectStore {
 mod tests {
 	use super::*;
 
-	fn fresh_root() -> PathBuf {
-		let dir = std::env::temp_dir().join(format!(
-			"wendelon-l2-{}-{}",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
-		fs::create_dir_all(&dir).unwrap();
-		dir
+	fn fresh_root() -> crate::test_support::TestDir {
+		crate::test_support::TestDir::new("wendelon-l2")
 	}
 
 	#[tokio::test]
 	async fn put_get_round_trips() {
 		let root = fresh_root();
-		let store = LocalFsObjectStore::new(&root).unwrap();
+		let store = LocalFsObjectStore::new(root.to_path_buf()).unwrap();
 		let uri = store.put("slab_0001.wnd", b"hello wendelon").await.unwrap();
 		assert!(uri.starts_with("file://"));
 		let bytes = store.get(&uri).await.unwrap();
@@ -1158,7 +1152,7 @@ mod tests {
 	#[tokio::test]
 	async fn head_reports_key_uri_and_size() {
 		let root = fresh_root();
-		let store = LocalFsObjectStore::new(&root).unwrap();
+		let store = LocalFsObjectStore::new(root.to_path_buf()).unwrap();
 		let uri = store
 			.put("sealed/slab_0001.wnd", b"hello wendelon")
 			.await
@@ -1172,7 +1166,7 @@ mod tests {
 	#[tokio::test]
 	async fn get_range_reads_requested_span() {
 		let root = fresh_root();
-		let store = LocalFsObjectStore::new(&root).unwrap();
+		let store = LocalFsObjectStore::new(root.to_path_buf()).unwrap();
 		let uri = store.put("slice.wnd", b"abcdefghij").await.unwrap();
 		let slice = store.get_range(&uri, 2..7).await.unwrap();
 		assert_eq!(slice.as_ref(), b"cdefg");
@@ -1181,7 +1175,7 @@ mod tests {
 	#[tokio::test]
 	async fn list_returns_recursive_prefix_matches() {
 		let root = fresh_root();
-		let store = LocalFsObjectStore::new(&root).unwrap();
+		let store = LocalFsObjectStore::new(root.to_path_buf()).unwrap();
 		store.put("sealed/slab_0001.wnd", b"aaa").await.unwrap();
 		store
 			.put("sealed/nested/slab_0002.wnd", b"bbbb")
@@ -1204,7 +1198,7 @@ mod tests {
 	#[tokio::test]
 	async fn put_is_atomic_via_tmp_rename() {
 		let root = fresh_root();
-		let store = LocalFsObjectStore::new(&root).unwrap();
+		let store = LocalFsObjectStore::new(root.to_path_buf()).unwrap();
 		let _uri = store.put("slab.wnd", b"a").await.unwrap();
 		let _uri = store.put("slab.wnd", b"bb").await.unwrap();
 		let tmp_leak = root.join("slab.wnd.tmp");
@@ -1216,7 +1210,7 @@ mod tests {
 	#[tokio::test]
 	async fn delete_removes_object() {
 		let root = fresh_root();
-		let store = LocalFsObjectStore::new(&root).unwrap();
+		let store = LocalFsObjectStore::new(root.to_path_buf()).unwrap();
 		let uri = store.put("gone.wnd", b"x").await.unwrap();
 		store.delete(&uri).await.unwrap();
 		assert!(store.get(&uri).await.is_err());
@@ -1225,7 +1219,7 @@ mod tests {
 	#[tokio::test]
 	async fn rejects_traversal_keys() {
 		let root = fresh_root();
-		let store = LocalFsObjectStore::new(&root).unwrap();
+		let store = LocalFsObjectStore::new(root.to_path_buf()).unwrap();
 		assert!(store.put("../evil", b"x").await.is_err());
 		assert!(store.put("/etc/passwd", b"x").await.is_err());
 		assert!(store.put("", b"x").await.is_err());
@@ -1235,7 +1229,7 @@ mod tests {
 	async fn rejects_uri_outside_root() {
 		let root = fresh_root();
 		let other = fresh_root();
-		let store = LocalFsObjectStore::new(&root).unwrap();
+		let store = LocalFsObjectStore::new(root.to_path_buf()).unwrap();
 		// Point a well-formed file:// URI at a real file outside the root.
 		let outside = other.join("foreign");
 		fs::write(&outside, b"nope").unwrap();

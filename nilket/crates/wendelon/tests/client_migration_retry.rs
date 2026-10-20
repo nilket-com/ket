@@ -312,7 +312,7 @@ impl TopologySource for CountingTopologySource {
 
 #[tokio::test]
 async fn client_retries_read_after_migration_incomplete() {
-	let node = support::bootstrap_node("client-migration-read", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("client-migration-read", 1).await;
 	refresh_leases(&node).await;
 
 	let service = Arc::new(FlakyMigrationService::new(
@@ -355,7 +355,7 @@ async fn client_retries_read_after_migration_incomplete() {
 
 #[tokio::test]
 async fn client_retries_query_after_migration_incomplete() {
-	let node = support::bootstrap_node("client-migration-query", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("client-migration-query", 1).await;
 	refresh_leases(&node).await;
 
 	let service = Arc::new(FlakyMigrationService::new(
@@ -421,7 +421,7 @@ async fn client_retries_query_after_migration_incomplete() {
 
 #[tokio::test]
 async fn client_reports_query_migration_incomplete_after_retry_budget() {
-	let node = support::bootstrap_node("client-migration-query-budget", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("client-migration-query-budget", 1).await;
 	let service = Arc::new(FlakyMigrationService::new(
 		node.router.clone() as Arc<dyn HrftService>,
 		0,

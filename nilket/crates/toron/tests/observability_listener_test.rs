@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rcgen::{
 	BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -666,7 +666,7 @@ async fn toron_metrics_endpoint_emits_prometheus_text_format_with_brand_clean_na
 #[tokio::test]
 async fn observability_ready_allowed_emits_access_audit() {
 	let worker_id = WorkerId::from_u128(71);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, _pki_dir) = TestPki::generate_owned(worker_id, "prometheus");
 	let mut config = observability_config(worker_id, &pki);
 	let audit_path = enable_observability_audit(&mut config, "ready-access-audit");
 	let daemon = ToronDaemon::start(config).await.expect("start daemon");
@@ -714,7 +714,7 @@ async fn observability_ready_allowed_emits_access_audit() {
 #[tokio::test]
 async fn observability_ready_tls_failure_emits_denied_access_audit() {
 	let worker_id = WorkerId::from_u128(72);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, _pki_dir) = TestPki::generate_owned(worker_id, "prometheus");
 	let mut config = observability_config(worker_id, &pki);
 	let audit_path = enable_observability_audit(&mut config, "ready-denied-audit");
 	let daemon = ToronDaemon::start(config).await.expect("start daemon");
@@ -756,7 +756,7 @@ async fn observability_ready_tls_failure_emits_denied_access_audit() {
 #[tokio::test]
 async fn observability_metrics_allowed_emits_access_audit() {
 	let worker_id = WorkerId::from_u128(75);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, _pki_dir) = TestPki::generate_owned(worker_id, "prometheus");
 	let mut config = observability_config(worker_id, &pki);
 	let audit_path = enable_observability_audit(&mut config, "metrics-access-audit");
 	let daemon = ToronDaemon::start(config).await.expect("start daemon");
@@ -806,7 +806,7 @@ async fn observability_metrics_allowed_emits_access_audit() {
 #[tokio::test]
 async fn observability_metrics_audit_failure_returns_503_without_sink_detail() {
 	let worker_id = WorkerId::from_u128(76);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, _pki_dir) = TestPki::generate_owned(worker_id, "prometheus");
 	let mut config = observability_config(worker_id, &pki);
 	enable_observability_fail_closed_unavailable_audit(&mut config, "metrics-fail-closed-audit");
 	let daemon = ToronDaemon::start(config).await.expect("start daemon");
@@ -839,7 +839,7 @@ async fn observability_metrics_audit_failure_returns_503_without_sink_detail() {
 #[tokio::test]
 async fn observability_metrics_method_not_allowed_emits_denied_access_audit() {
 	let worker_id = WorkerId::from_u128(73);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, _pki_dir) = TestPki::generate_owned(worker_id, "prometheus");
 	let mut config = observability_config(worker_id, &pki);
 	let audit_path = enable_observability_audit(&mut config, "metrics-denied-audit");
 	let daemon = ToronDaemon::start(config).await.expect("start daemon");
@@ -883,7 +883,7 @@ async fn observability_metrics_method_not_allowed_emits_denied_access_audit() {
 #[tokio::test]
 async fn observability_access_records_admitted_monitor_principal_only() {
 	let worker_id = WorkerId::from_u128(76);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, _pki_dir) = TestPki::generate_owned(worker_id, "prometheus");
 	let mut config = observability_config(worker_id, &pki);
 	let audit_path = enable_observability_audit(&mut config, "access-principal-only-audit");
 	let daemon = ToronDaemon::start(config).await.expect("start daemon");
@@ -932,7 +932,7 @@ async fn observability_access_records_admitted_monitor_principal_only() {
 #[tokio::test]
 async fn observability_access_audit_omits_raw_san_dn_ip_and_certificate_material() {
 	let worker_id = WorkerId::from_u128(77);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, _pki_dir) = TestPki::generate_owned(worker_id, "prometheus");
 	let mut config = observability_config(worker_id, &pki);
 	let audit_path = enable_observability_audit(&mut config, "access-redaction-audit");
 	let daemon = ToronDaemon::start(config).await.expect("start daemon");
@@ -984,7 +984,7 @@ async fn observability_access_audit_omits_raw_san_dn_ip_and_certificate_material
 #[tokio::test]
 async fn observability_health_does_not_emit_audit() {
 	let worker_id = WorkerId::from_u128(74);
-	let pki = TestPki::generate(worker_id, "prometheus");
+	let (pki, _pki_dir) = TestPki::generate_owned(worker_id, "prometheus");
 	let mut config = observability_config(worker_id, &pki);
 	let audit_path = enable_observability_audit(&mut config, "health-no-audit");
 	let daemon = ToronDaemon::start(config).await.expect("start daemon");
@@ -1415,14 +1415,6 @@ async fn toron_observability_listener_closes_slow_client_after_read_timeout() {
 }
 
 impl TestPki {
-	fn generate(worker_id: WorkerId, monitor_principal: &str) -> Self {
-		Self::generate_in(
-			fresh_dir("observability-listener"),
-			worker_id,
-			monitor_principal,
-		)
-	}
-
 	fn generate_owned(worker_id: WorkerId, monitor_principal: &str) -> (Self, TestDir) {
 		let dir = TestDir::new("observability-listener-owned");
 		let pki = Self::generate_in(dir.to_path_buf(), worker_id, monitor_principal);
@@ -1530,7 +1522,9 @@ fn observability_config(worker_id: WorkerId, pki: &TestPki) -> ToronBootstrapCon
 }
 
 fn enable_observability_audit(config: &mut ToronBootstrapConfig, tag: &str) -> PathBuf {
-	let dir = fresh_dir(tag);
+	// The detached audit sink consumer has no public join, so its root stays retained:
+	// producer shutdown is not proof that the consumer has exited.
+	let dir = TestDir::new(tag).retain();
 	let audit_path = dir.join("toron-audit.ndjson");
 	config.audit = AuditConfig::Enabled(Box::new(AuditEnabledConfig {
 		node_id: "toron-n-1".to_string(),
@@ -1548,7 +1542,8 @@ fn enable_observability_fail_closed_unavailable_audit(
 	config: &mut ToronBootstrapConfig,
 	tag: &str,
 ) {
-	let audit_path_that_is_a_directory = fresh_dir(tag);
+	// Retained like every audit root: the sink consumer has no public join.
+	let audit_path_that_is_a_directory = TestDir::new(tag).retain();
 	config.audit = AuditConfig::Enabled(Box::new(AuditEnabledConfig {
 		node_id: "toron-n-1".to_string(),
 		node_numeric_id: 1,
@@ -1792,14 +1787,4 @@ metrics = \"{}\"
 		metrics,
 		tls
 	)
-}
-
-fn fresh_dir(tag: &str) -> PathBuf {
-	let nanos = SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.expect("system time after epoch")
-		.as_nanos();
-	let dir = std::env::temp_dir().join(format!("{tag}-{}-{nanos}", std::process::id()));
-	std::fs::create_dir_all(&dir).expect("create temp dir");
-	dir
 }

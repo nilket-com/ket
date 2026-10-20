@@ -910,7 +910,6 @@ mod tests {
 	use std::path::{Path, PathBuf};
 	use std::process::Command;
 	use std::sync::Mutex;
-	use std::time::{SystemTime, UNIX_EPOCH};
 
 	use tokio_rustls::TlsAcceptor;
 
@@ -1000,21 +999,13 @@ mod tests {
 		values.iter().map(|value| (*value).to_string()).collect()
 	}
 
-	fn fresh_inspect_test_dir() -> PathBuf {
-		let nanos = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.expect("system time after epoch")
-			.as_nanos();
-		let dir = std::env::temp_dir().join(format!(
-			"wendelon-inspect-cli-{}-{nanos}",
-			std::process::id()
-		));
-		std::fs::create_dir_all(&dir).expect("create inspect test dir");
-		dir
+	fn fresh_inspect_test_dir() -> crate::test_support::TestDir {
+		crate::test_support::TestDir::new("wendelon-inspect-cli")
 	}
 
-	fn generated_pki() -> StaticPki {
-		let dir = fresh_inspect_test_dir().join("pki");
+	fn generated_pki() -> (crate::test_support::TestDir, StaticPki) {
+		let scratch = fresh_inspect_test_dir();
+		let dir = scratch.join("pki");
 		std::fs::create_dir_all(&dir).expect("create pki dir");
 		let pki = StaticPki {
 			ca_cert: dir.join("ca.crt"),
@@ -1052,7 +1043,7 @@ mod tests {
 			ca_key_path: &ops_ca_key,
 			serial: 2001,
 		});
-		pki
+		(scratch, pki)
 	}
 
 	struct LeafSpec<'a> {
@@ -1444,7 +1435,7 @@ authorityKeyIdentifier=keyid,issuer\n",
 
 	#[tokio::test]
 	async fn wendelon_inspect_writes_ready_request_with_host_header() {
-		let pki = generated_pki();
+		let (_pki_dir, pki) = generated_pki();
 		let server = MinimalReadyServer::start(&pki).await;
 		let endpoint = server.connect_addr;
 		let handle = server.spawn_response_once("200 OK", ready_body());
@@ -1463,7 +1454,7 @@ authorityKeyIdentifier=keyid,issuer\n",
 
 	#[tokio::test]
 	async fn wendelon_inspect_accepts_200_and_503_as_expected_statuses() {
-		let pki = generated_pki();
+		let (_pki_dir, pki) = generated_pki();
 		let ready_server = MinimalReadyServer::start(&pki).await;
 		let ready_endpoint = ready_server.connect_addr;
 		let ready_handle = ready_server.spawn_response_once("200 OK", ready_body());
@@ -1492,7 +1483,7 @@ authorityKeyIdentifier=keyid,issuer\n",
 
 	#[tokio::test]
 	async fn wendelon_inspect_unexpected_status_returns_exit_two() {
-		let pki = generated_pki();
+		let (_pki_dir, pki) = generated_pki();
 		let server = MinimalReadyServer::start(&pki).await;
 		let endpoint = server.connect_addr;
 		let handle = server.spawn_response_once("418 I'm a Teapot", ready_body());
@@ -1505,7 +1496,7 @@ authorityKeyIdentifier=keyid,issuer\n",
 
 	#[tokio::test]
 	async fn wendelon_inspect_connect_timeout_maps_to_stable_error() {
-		let pki = generated_pki();
+		let (_pki_dir, pki) = generated_pki();
 		let options = inspect_options("127.0.0.1:7432".parse().expect("endpoint"), &pki, false);
 		let error = fetch_ready_with_tcp_connect(
 			&options,
@@ -1525,7 +1516,7 @@ authorityKeyIdentifier=keyid,issuer\n",
 
 	#[tokio::test]
 	async fn wendelon_inspect_response_read_timeout_maps_to_stable_error() {
-		let pki = generated_pki();
+		let (_pki_dir, pki) = generated_pki();
 		let server = MinimalReadyServer::start(&pki).await;
 		let endpoint = server.connect_addr;
 		let handle = server.spawn_slow_response_once();

@@ -1,3 +1,5 @@
+#[path = "../src/test_support/test_dir.rs"]
+mod test_dir;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use wendelon::config::{load_node_bootstrap_config, render_example_config, write_example_config};
@@ -15,14 +17,8 @@ use wendelon::storage::{
 	ROW_GROUP_SCAN_MIN_PAGED_RECORD_ROWS, ROW_GROUP_SCAN_TARGET_ROWS, RowGroupSizingProfile,
 };
 
-fn fresh_dir(tag: &str) -> PathBuf {
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-config-loader-{tag}-{}-{}",
-		std::process::id(),
-		uuid::Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+fn fresh_dir(tag: &str) -> test_dir::TestDir {
+	test_dir::TestDir::new(&format!("wendelon-config-loader-{tag}"))
 }
 
 fn hex(bytes: [u8; 32]) -> String {

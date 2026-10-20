@@ -25,17 +25,19 @@ fn transfer_bootstrap_cfg(
 	tag: &str,
 	node_id: u32,
 	trusted_transfer_signers: BTreeMap<u32, [u8; 32]>,
-) -> NodeBootstrapConfig {
+) -> (support::TestDir, NodeBootstrapConfig) {
+	let scratch = support::tempdir(tag);
 	let mut cfg = NodeBootstrapConfig::dev(
 		node_id,
-		support::tempdir(tag),
+		scratch.to_path_buf(),
 		format!("127.0.0.1:{node_id}"),
 	);
 	cfg.trusted_transfer_signers = trusted_transfer_signers;
-	cfg
+	(scratch, cfg)
 }
 
 async fn build_transfer_fixture() -> (
+	[support::TestDir; 2],
 	WendelonNode,
 	WendelonNode,
 	Arc<wendelon::network::factory::TransportProviderFactory>,
@@ -48,22 +50,24 @@ async fn build_transfer_fixture() -> (
 	let leader_vk = transfer_verifying_key_bytes(leader_secret);
 	let target_vk = transfer_verifying_key_bytes(target_secret);
 
-	let leader = WendelonNode::bootstrap_single_node(transfer_bootstrap_cfg(
+	let (leader_dir, leader_cfg) = transfer_bootstrap_cfg(
 		"transfer-token-leader",
 		201,
 		BTreeMap::from([(201, leader_vk), (202, target_vk)]),
-	))
-	.await
-	.unwrap();
+	);
+	let leader = WendelonNode::bootstrap_single_node(leader_cfg)
+		.await
+		.unwrap();
 	support::wait_for_local_leader(&leader).await;
 
-	let target = WendelonNode::bootstrap_single_node(transfer_bootstrap_cfg(
+	let (target_dir, target_cfg) = transfer_bootstrap_cfg(
 		"transfer-token-target",
 		202,
 		BTreeMap::from([(201, leader_vk), (202, target_vk)]),
-	))
-	.await
-	.unwrap();
+	);
+	let target = WendelonNode::bootstrap_single_node(target_cfg)
+		.await
+		.unwrap();
 
 	let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
 	let roles = NodeRoleSet::empty()
@@ -113,7 +117,15 @@ async fn build_transfer_fixture() -> (
 	);
 	let (factory, _) = support::loopback_factory(leader.local_node, leader_service);
 
-	(leader, target, factory, pool, leader_secret, target_secret)
+	(
+		[leader_dir, target_dir],
+		leader,
+		target,
+		factory,
+		pool,
+		leader_secret,
+		target_secret,
+	)
 }
 
 fn expires_at(node_id: u32) -> HybridTimestamp {
@@ -172,7 +184,7 @@ async fn call_transfer(
 
 #[tokio::test]
 async fn valid_signed_transfer_token_is_accepted() {
-	let (leader, target, factory, pool, leader_secret, _target_secret) =
+	let (_dirs, leader, target, factory, pool, leader_secret, _target_secret) =
 		build_transfer_fixture().await;
 	let signer = TransferAuthority::from_secret_bytes(
 		leader.local_node,
@@ -202,7 +214,7 @@ async fn valid_signed_transfer_token_is_accepted() {
 
 #[tokio::test]
 async fn missing_transfer_token_is_rejected() {
-	let (leader, target, factory, pool, _leader_secret, _target_secret) =
+	let (_dirs, leader, target, factory, pool, _leader_secret, _target_secret) =
 		build_transfer_fixture().await;
 
 	let meta = call_transfer(
@@ -222,7 +234,7 @@ async fn missing_transfer_token_is_rejected() {
 
 #[tokio::test]
 async fn tampered_transfer_token_is_rejected() {
-	let (leader, target, factory, pool, leader_secret, _target_secret) =
+	let (_dirs, leader, target, factory, pool, leader_secret, _target_secret) =
 		build_transfer_fixture().await;
 	let signer = TransferAuthority::from_secret_bytes(
 		leader.local_node,
@@ -256,7 +268,7 @@ async fn tampered_transfer_token_is_rejected() {
 
 #[tokio::test]
 async fn unauthorized_signer_transfer_token_is_rejected() {
-	let (leader, target, factory, pool, leader_secret, target_secret) =
+	let (_dirs, leader, target, factory, pool, leader_secret, target_secret) =
 		build_transfer_fixture().await;
 	let bad_signer = TransferAuthority::from_secret_bytes(
 		leader.local_node,
@@ -287,7 +299,7 @@ async fn unauthorized_signer_transfer_token_is_rejected() {
 
 #[tokio::test]
 async fn direct_target_call_without_leader_peer_identity_is_rejected() {
-	let (leader, target, _factory, _pool, leader_secret, _target_secret) =
+	let (_dirs, leader, target, _factory, _pool, leader_secret, _target_secret) =
 		build_transfer_fixture().await;
 	let signer = TransferAuthority::from_secret_bytes(
 		leader.local_node,

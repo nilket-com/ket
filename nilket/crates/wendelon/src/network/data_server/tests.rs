@@ -1309,14 +1309,8 @@ async fn aggregate_csb_test_server(
 	(node_dir, node, server)
 }
 
-fn fresh_dir(tag: &str) -> std::path::PathBuf {
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-data-server-{tag}-{}-{}",
-		std::process::id(),
-		uuid::Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+fn fresh_dir(tag: &str) -> crate::test_support::TestDir {
+	crate::test_support::TestDir::new(&format!("wendelon-data-server-{tag}"))
 }
 
 #[test]
@@ -1829,143 +1823,165 @@ async fn build_orphan_witness_fixture(tag: &str) -> OrphanWitnessFixture {
 	}
 }
 
-async fn make_manager() -> Arc<SlabManager> {
-	let dir = fresh_dir("query");
+async fn make_manager() -> (crate::test_support::TestDir, Arc<SlabManager>) {
+	let scratch = fresh_dir("query");
+	let dir = scratch.to_path_buf();
 	let io = spawn_io_thread(64).unwrap();
-	Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir,
-			max_slab_bytes: 1 << 30,
-			io,
-			l2: None,
-			rehydration: crate::storage::manager::RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: crate::storage::GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
+	(
+		scratch,
+		Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir,
+				max_slab_bytes: 1 << 30,
+				io,
+				l2: None,
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
+				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		),
 	)
 }
 
-async fn make_manager_with_l2(l2: Arc<dyn ObjectStore>) -> Arc<SlabManager> {
-	let dir = fresh_dir("query-l2");
+async fn make_manager_with_l2(
+	l2: Arc<dyn ObjectStore>,
+) -> (crate::test_support::TestDir, Arc<SlabManager>) {
+	let scratch = fresh_dir("query-l2");
+	let dir = scratch.to_path_buf();
 	let io = spawn_io_thread(64).unwrap();
 	let mut rehydration = crate::storage::manager::RehydrationPolicy::default();
 	rehydration.promote_after_l2_reads = 0;
 	rehydration.tail_read_window_bytes = 256 + 16;
-	Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir,
-			max_slab_bytes: 1 << 30,
-			io,
-			l2: Some(l2),
-			rehydration,
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: crate::storage::GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
+	(
+		scratch,
+		Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir,
+				max_slab_bytes: 1 << 30,
+				io,
+				l2: Some(l2),
+				rehydration,
+				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
+				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		),
 	)
 }
 
-async fn make_manager_with_l2_projected_fetch(l2: Arc<dyn ObjectStore>) -> Arc<SlabManager> {
-	let dir = fresh_dir("query-l2-projected");
+async fn make_manager_with_l2_projected_fetch(
+	l2: Arc<dyn ObjectStore>,
+) -> (crate::test_support::TestDir, Arc<SlabManager>) {
+	let scratch = fresh_dir("query-l2-projected");
+	let dir = scratch.to_path_buf();
 	let io = spawn_io_thread(64).unwrap();
 	let mut rehydration = crate::storage::manager::RehydrationPolicy::default();
 	rehydration.promote_after_l2_reads = 0;
 	rehydration.tail_read_window_bytes = 256 + 16;
-	Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir,
-			max_slab_bytes: 1 << 30,
-			io,
-			l2: Some(l2),
-			rehydration,
-			l2_column_fetch: crate::storage::columnar::L2ColumnFetchConfig {
-				enabled: true,
-				min_record_bytes: crate::schema::RecordBodyByteLen::try_new(1).unwrap(),
-				..Default::default()
-			},
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: crate::storage::GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
+	(
+		scratch,
+		Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir,
+				max_slab_bytes: 1 << 30,
+				io,
+				l2: Some(l2),
+				rehydration,
+				l2_column_fetch: crate::storage::columnar::L2ColumnFetchConfig {
+					enabled: true,
+					min_record_bytes: crate::schema::RecordBodyByteLen::try_new(1).unwrap(),
+					..Default::default()
+				},
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
+				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		),
 	)
 }
 
-async fn make_manager_with_l2_encoded_compute(l2: Arc<dyn ObjectStore>) -> Arc<SlabManager> {
-	let dir = fresh_dir("query-l2-encoded-compute");
+async fn make_manager_with_l2_encoded_compute(
+	l2: Arc<dyn ObjectStore>,
+) -> (crate::test_support::TestDir, Arc<SlabManager>) {
+	let scratch = fresh_dir("query-l2-encoded-compute");
+	let dir = scratch.to_path_buf();
 	let io = spawn_io_thread(64).unwrap();
 	let mut rehydration = crate::storage::manager::RehydrationPolicy::default();
 	rehydration.promote_after_l2_reads = 0;
 	rehydration.tail_read_window_bytes = 256 + 16;
-	Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir,
-			max_slab_bytes: 1 << 30,
-			io,
-			l2: Some(l2),
-			rehydration,
-			l2_column_fetch: crate::storage::columnar::L2ColumnFetchConfig {
-				enabled: true,
-				min_record_bytes: crate::schema::RecordBodyByteLen::try_new(1).unwrap(),
-				..Default::default()
-			},
-			row_group_writer:
-				crate::storage::row_group::RowGroupWriterConfig::point_read_with_overrides(
-					crate::schema::RowGroupRowCount::new(4),
-					crate::schema::RowGroupRowCount::new(8),
-					RowCount::new(1),
-					crate::schema::RecordBodyByteLen::new(1),
-				)
-				.with_enabled(true),
-			l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
-				enabled: true,
-				max_selected_row_group_fraction_micros:
-					crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
-				..Default::default()
-			},
-			encoding_writer: EncodingWriterConfig {
-				enabled: true,
-				target_simd_page_values: crate::schema::SimdPageValueCount::new(4),
-				min_buffer_bytes_for_encoding: crate::schema::RecordBodyByteLen::new(1),
-				..Default::default()
-			},
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
-				enabled: true,
-				..Default::default()
-			},
-			encoding_compute: crate::storage::encoding::EncodingComputeConfig {
-				enabled: true,
-				..Default::default()
-			},
-			group_commit: crate::storage::GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
+	(
+		scratch,
+		Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir,
+				max_slab_bytes: 1 << 30,
+				io,
+				l2: Some(l2),
+				rehydration,
+				l2_column_fetch: crate::storage::columnar::L2ColumnFetchConfig {
+					enabled: true,
+					min_record_bytes: crate::schema::RecordBodyByteLen::try_new(1).unwrap(),
+					..Default::default()
+				},
+				row_group_writer:
+					crate::storage::row_group::RowGroupWriterConfig::point_read_with_overrides(
+						crate::schema::RowGroupRowCount::new(4),
+						crate::schema::RowGroupRowCount::new(8),
+						RowCount::new(1),
+						crate::schema::RecordBodyByteLen::new(1),
+					)
+					.with_enabled(true),
+				l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
+					enabled: true,
+					max_selected_row_group_fraction_micros:
+						crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+					..Default::default()
+				},
+				encoding_writer: EncodingWriterConfig {
+					enabled: true,
+					target_simd_page_values: crate::schema::SimdPageValueCount::new(4),
+					min_buffer_bytes_for_encoding: crate::schema::RecordBodyByteLen::new(1),
+					..Default::default()
+				},
+				l2_chunk_layout: Default::default(),
+				l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
+					enabled: true,
+					..Default::default()
+				},
+				encoding_compute: crate::storage::encoding::EncodingComputeConfig {
+					enabled: true,
+					..Default::default()
+				},
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		),
 	)
 }
 
@@ -2131,8 +2147,12 @@ async fn tier_typed_table_batch_with_stats(
 	l2: Arc<MockObjectStore>,
 	ids: Vec<i64>,
 	object_name: &str,
-) -> (Arc<SlabManager>, TableSchemaDescriptor) {
-	let mgr = make_manager_with_l2(l2.clone()).await;
+) -> (
+	crate::test_support::TestDir,
+	Arc<SlabManager>,
+	TableSchemaDescriptor,
+) {
+	let (mgr_dir, mgr) = make_manager_with_l2(l2.clone()).await;
 	let descriptor = typed_table_descriptor();
 	let slab_id = append_typed_table_rows(&mgr, &descriptor, ids).await;
 
@@ -2160,15 +2180,19 @@ async fn tier_typed_table_batch_with_stats(
 	.await
 	.unwrap();
 
-	(mgr, descriptor)
+	(mgr_dir, mgr, descriptor)
 }
 
 async fn tier_identity_typed_table_batch_with_stats(
 	l2: Arc<MockObjectStore>,
 	ids: Vec<i64>,
 	object_name: &str,
-) -> (Arc<SlabManager>, TableSchemaDescriptor) {
-	let mgr = make_manager_with_l2(l2.clone()).await;
+) -> (
+	crate::test_support::TestDir,
+	Arc<SlabManager>,
+	TableSchemaDescriptor,
+) {
+	let (mgr_dir, mgr) = make_manager_with_l2(l2.clone()).await;
 	let descriptor = identity_typed_table_descriptor(0x41);
 	let slab_id = append_typed_table_rows(&mgr, &descriptor, ids).await;
 
@@ -2196,15 +2220,19 @@ async fn tier_identity_typed_table_batch_with_stats(
 	.await
 	.unwrap();
 
-	(mgr, descriptor)
+	(mgr_dir, mgr, descriptor)
 }
 
 async fn tier_typed_table_batch_without_stats(
 	l2: Arc<MockObjectStore>,
 	ids: Vec<i64>,
 	object_name: &str,
-) -> (Arc<SlabManager>, TableSchemaDescriptor) {
-	let mgr = make_manager_with_l2(l2.clone()).await;
+) -> (
+	crate::test_support::TestDir,
+	Arc<SlabManager>,
+	TableSchemaDescriptor,
+) {
+	let (mgr_dir, mgr) = make_manager_with_l2(l2.clone()).await;
 	let descriptor = typed_table_descriptor();
 	let slab_id = append_typed_table_rows(&mgr, &descriptor, ids).await;
 
@@ -2228,7 +2256,7 @@ async fn tier_typed_table_batch_without_stats(
 	.await
 	.unwrap();
 
-	(mgr, descriptor)
+	(mgr_dir, mgr, descriptor)
 }
 
 async fn seed_record(
@@ -2294,7 +2322,7 @@ fn static_router_empty_node_list_returns_empty() {
 
 #[tokio::test]
 async fn scan_collects_entries_in_inclusive_range() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 10, hlc(1, 0, 1), b"k10", b"v10").await;
 	seed_record(&mgr, 50, hlc(2, 0, 1), b"k50", b"v50").await;
 	seed_record(&mgr, 99, hlc(3, 0, 1), b"k99", b"v99").await;
@@ -2316,7 +2344,7 @@ async fn scan_collects_entries_in_inclusive_range() {
 
 #[tokio::test]
 async fn query_passthrough_returns_all_rows_in_range() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"v1").await;
 	seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"v2").await;
 	seed_record(&mgr, 3, hlc(3, 0, 1), b"c", b"v3").await;
@@ -2335,7 +2363,7 @@ async fn query_passthrough_returns_all_rows_in_range() {
 
 #[tokio::test]
 async fn query_range_filters_out_of_window_rows() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 5, hlc(1, 0, 1), b"a", b"va").await;
 	seed_record(&mgr, 42, hlc(2, 0, 1), b"b", b"vb").await;
 	seed_record(&mgr, 100, hlc(3, 0, 1), b"c", b"vc").await;
@@ -2353,7 +2381,7 @@ async fn query_range_filters_out_of_window_rows() {
 
 #[tokio::test]
 async fn query_empty_scan_returns_key_not_found() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	let sm = WendelonStateMachine::new();
 	let (resp, arrow) = execute_query_plan(&mgr, &sm, n(1), &base_meta(), &[])
 		.await
@@ -2366,7 +2394,7 @@ async fn query_empty_scan_returns_key_not_found() {
 
 #[tokio::test]
 async fn query_as_of_older_than_retention_window_returns_retention_expired() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 1, hlc(90, 0, 1), b"a", b"va").await;
 
 	let sm = WendelonStateMachine::new();
@@ -2390,7 +2418,7 @@ async fn query_as_of_older_than_retention_window_returns_retention_expired() {
 
 #[tokio::test]
 async fn latest_query_filters_locations_below_logical_retention_floor() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 1, hlc(70, 0, 1), b"old", b"old-value").await;
 	seed_record(&mgr, 2, hlc(90, 0, 1), b"live", b"live-value").await;
 
@@ -2420,7 +2448,7 @@ async fn latest_query_filters_locations_below_logical_retention_floor() {
 
 #[tokio::test]
 async fn table_query_row_limit_bounds_successful_output() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 1, hlc(70, 0, 1), b"a", b"a-value").await;
 	seed_record(&mgr, 2, hlc(80, 0, 1), b"b", b"b-value").await;
 	seed_record(&mgr, 3, hlc(90, 0, 1), b"c", b"c-value").await;
@@ -2458,7 +2486,7 @@ async fn table_query_row_limit_bounds_successful_output() {
 
 #[tokio::test]
 async fn table_query_resp_streams_with_terminal_metadata() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 1, hlc(70, 0, 1), b"a", b"a-value").await;
 	let typed_bytes = encode_batch(&typed_table_batch(vec![20])).unwrap();
 	mgr.append(tenant(), id(2), hlc(80, 0, 1), &typed_bytes)
@@ -2682,9 +2710,15 @@ impl TransportStream for CancelAfterFrameTransport {
 async fn projected_cost_bound_fixture_with_rows(
 	tier_name: &str,
 	rows: usize,
-) -> (Arc<SlabManager>, TableSchemaDescriptor, pbc::Program, usize) {
+) -> (
+	crate::test_support::TestDir,
+	Arc<SlabManager>,
+	TableSchemaDescriptor,
+	pbc::Program,
+	usize,
+) {
 	let l2 = Arc::new(MockObjectStore::default());
-	let mgr = make_manager_with_l2_projected_fetch(l2.clone()).await;
+	let (mgr_dir, mgr) = make_manager_with_l2_projected_fetch(l2.clone()).await;
 	let descriptor = append_only_table_descriptor();
 	append_append_only_rows_for_query(
 		&mgr,
@@ -2705,10 +2739,11 @@ async fn projected_cost_bound_fixture_with_rows(
 	predicate.push(OP_GTE);
 	let program = pbc::Program::compile(&predicate).unwrap();
 	let user_column_count = descriptor.arrow_schema().unwrap().fields().len();
-	(mgr, descriptor, program, user_column_count)
+	(mgr_dir, mgr, descriptor, program, user_column_count)
 }
 
 async fn descriptor_backed_whole_record_cost_bound_fixture() -> (
+	crate::test_support::TestDir,
 	Arc<SlabManager>,
 	TableSchemaDescriptor,
 	pbc::Program,
@@ -2723,13 +2758,14 @@ async fn descriptor_backed_whole_record_cost_bound_fixture() -> (
 async fn descriptor_backed_whole_record_cost_bound_fixture_with_rows(
 	rows: usize,
 ) -> (
+	crate::test_support::TestDir,
 	Arc<SlabManager>,
 	TableSchemaDescriptor,
 	pbc::Program,
 	QueryRequestMeta,
 	[QueryScanRange; 1],
 ) {
-	let mgr = make_manager().await;
+	let (mgr_dir, mgr) = make_manager().await;
 	let descriptor = append_only_table_descriptor();
 	append_append_only_rows_for_query(
 		&mgr,
@@ -2745,7 +2781,7 @@ async fn descriptor_backed_whole_record_cost_bound_fixture_with_rows(
 		start: Locality::ZERO,
 		end: Locality::MAX,
 	}];
-	(mgr, descriptor, program, meta, ranges)
+	(mgr_dir, mgr, descriptor, program, meta, ranges)
 }
 
 #[tokio::test]
@@ -2753,7 +2789,7 @@ async fn cancelled_consumer_stops_before_all_row_groups_scanned() {
 	// ADR 118 headline cost bound: a consumer that cancels mid-stream
 	// makes Wendelon stop scanning before it reaches the remaining
 	// row groups.
-	let (mgr, descriptor, program, user_column_count) =
+	let (_mgr_dir, mgr, descriptor, program, user_column_count) =
 		projected_cost_bound_fixture_with_rows("adr118-cost-bound.wnd", 5_000).await;
 	let mut meta = base_meta();
 	meta.as_of_hlc = hlc(99, 0, 1);
@@ -2849,7 +2885,7 @@ async fn cancelled_consumer_stops_before_all_row_groups_scanned() {
 
 #[tokio::test]
 async fn whole_record_cancelled_consumer_stops_before_all_locations_scanned() {
-	let (mgr, descriptor, program, meta, ranges) =
+	let (_mgr_dir, mgr, descriptor, program, meta, ranges) =
 		descriptor_backed_whole_record_cost_bound_fixture_with_rows(5_000).await;
 
 	let (_full_client, full_server) = tokio::io::duplex(256 * 1024);
@@ -2918,7 +2954,7 @@ async fn whole_record_cancelled_consumer_stops_before_all_locations_scanned() {
 
 #[tokio::test]
 async fn collect_select_star_limit_3_stops_whole_record_scan_before_full_scan() {
-	let (mgr, descriptor, program, meta, ranges) =
+	let (_mgr_dir, mgr, descriptor, program, meta, ranges) =
 		descriptor_backed_whole_record_cost_bound_fixture().await;
 	let full = plan_query_execution_for_ranges_with_program(
 		&mgr,
@@ -2985,7 +3021,7 @@ async fn collect_select_star_limit_3_stops_whole_record_scan_before_full_scan() 
 
 #[tokio::test]
 async fn stream_select_star_consume_one_batch_then_drop_stops_whole_record_scan() {
-	let (mgr, descriptor, program, meta, ranges) =
+	let (_mgr_dir, mgr, descriptor, program, meta, ranges) =
 		descriptor_backed_whole_record_cost_bound_fixture_with_rows(5_000).await;
 
 	let (_full_client, full_server) = tokio::io::duplex(256 * 1024);
@@ -3055,7 +3091,7 @@ async fn stream_select_star_consume_one_batch_then_drop_stops_whole_record_scan(
 
 #[tokio::test]
 async fn whole_record_emitted_batch_matches_descriptor_schema() {
-	let (mgr, descriptor, program, meta, ranges) =
+	let (_mgr_dir, mgr, descriptor, program, meta, ranges) =
 		descriptor_backed_whole_record_cost_bound_fixture().await;
 	let plan = plan_query_execution_for_ranges_with_program(
 		&mgr,
@@ -3081,7 +3117,7 @@ async fn whole_record_emitted_batch_matches_descriptor_schema() {
 
 #[tokio::test]
 async fn whole_record_descriptorless_path_remains_behavior_compatible() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 1, hlc(70, 0, 1), b"a", b"a-value").await;
 	seed_record(&mgr, 2, hlc(80, 0, 1), b"b", b"b-value").await;
 	seed_record(&mgr, 3, hlc(90, 0, 1), b"c", b"c-value").await;
@@ -3122,7 +3158,7 @@ async fn bare_limit_three_bounds_remote_scan_without_row_limit_pushdown() {
 	// executor drops/cancels the scan once it has enough rows and
 	// Wendelon stops before reading the remaining row groups. The
 	// bound comes from the drop, not from pushdown.
-	let (mgr, descriptor, program, user_column_count) =
+	let (_mgr_dir, mgr, descriptor, program, user_column_count) =
 		projected_cost_bound_fixture_with_rows("adr118-bare-limit.wnd", 5_000).await;
 	let mut meta = base_meta();
 	meta.as_of_hlc = hlc(99, 0, 1);
@@ -3217,7 +3253,7 @@ async fn terminal_metadata_totals_match_legacy_materialized_response() {
 	// The streaming producer's authoritative terminal totals
 	// (rows / value_hlc) must equal the legacy materialized
 	// single-response totals for the same fixture.
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 1, hlc(70, 0, 1), b"a", b"a-value").await;
 	seed_record(&mgr, 2, hlc(95, 0, 1), b"b", b"b-value").await;
 	seed_record(&mgr, 3, hlc(88, 0, 1), b"c", b"c-value").await;
@@ -3293,7 +3329,7 @@ async fn terminal_metadata_totals_match_legacy_materialized_response() {
 
 #[tokio::test]
 async fn linearizable_gate_fires_when_watermark_behind() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 1, hlc(1, 0, 1), b"k", b"v").await;
 	let sm = WendelonStateMachine::new();
 	// Watermark remains at default (0,0,0); client demands (5,0,0).
@@ -3310,7 +3346,7 @@ async fn linearizable_gate_fires_when_watermark_behind() {
 
 #[tokio::test]
 async fn linearizable_gate_passes_once_watermark_catches_up() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 1, hlc(1, 0, 1), b"k", b"v").await;
 	let sm = WendelonStateMachine::new();
 	sm.seed_e_safe_for_test(0, hlc(10, 0, 1)).await;
@@ -3326,7 +3362,7 @@ async fn linearizable_gate_passes_once_watermark_catches_up() {
 
 #[tokio::test]
 async fn epoch_stale_returns_redirect() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 1, hlc(1, 0, 1), b"k", b"v").await;
 	let sm = WendelonStateMachine::new();
 	// The SM has advanced to epoch 7; client still thinks we
@@ -3351,7 +3387,7 @@ async fn pbc_filter_drops_rows_below_threshold() {
 	use arrow::array::Int64Array;
 	use arrow::datatypes::{DataType, Field, Schema};
 	let schema = Arc::new(Schema::new(vec![Field::new("age", DataType::Int64, false)]));
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	for (locality, age) in [(1u64, 17i64), (2, 22), (3, 40)] {
 		let ages = Int64Array::from(vec![age]);
 		let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ages)]).unwrap();
@@ -3388,7 +3424,7 @@ async fn pbc_filter_drops_rows_below_threshold() {
 
 #[tokio::test]
 async fn pbc_projection_narrows_schema() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
 	seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
 	// PROJECT column 0 (the `key` column) only — PBC compiles
@@ -3414,7 +3450,7 @@ async fn pbc_projection_narrows_schema() {
 
 #[tokio::test]
 async fn storage_metadata_scalar_pbc_opcodes_return_invalid_program() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
 
 	let sm = WendelonStateMachine::new();
@@ -3430,7 +3466,7 @@ async fn storage_metadata_scalar_pbc_opcodes_return_invalid_program() {
 
 #[tokio::test]
 async fn invalid_pbc_returns_structured_query_status() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
 
 	let sm = WendelonStateMachine::new();
@@ -3447,7 +3483,7 @@ async fn invalid_pbc_returns_structured_query_status() {
 
 #[tokio::test]
 async fn query_budget_exceeded_returns_structured_status() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
 	seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
 
@@ -3481,7 +3517,7 @@ async fn query_budget_counts_scanned_locations_even_when_filter_rejects_rows() {
 	use arrow::array::Int64Array;
 	use arrow::datatypes::{DataType, Field, Schema};
 
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	let schema = Arc::new(Schema::new(vec![Field::new("age", DataType::Int64, false)]));
 	for (locality, age) in [(1_u64, 17_i64), (2, 22)] {
 		let ages = Int64Array::from(vec![age]);
@@ -3527,7 +3563,7 @@ async fn query_budget_counts_scanned_locations_even_when_filter_rejects_rows() {
 
 #[tokio::test]
 async fn query_budget_exceeded_when_single_location_batch_exceeds_row_cap() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	let bytes = encode_batch(&wide_kv_batch(11)).unwrap();
 	mgr.append(tenant(), id(1), hlc(1, 0, 1), &bytes)
 		.await
@@ -4222,7 +4258,7 @@ fn table_query_scan_ranges_prune_column_projection_from_pbc() {
 #[tokio::test]
 async fn table_query_skips_tiered_slab_when_column_stats_cannot_match() {
 	let l2 = Arc::new(MockObjectStore::default());
-	let mgr = make_manager_with_l2(l2.clone()).await;
+	let (_mgr_dir, mgr) = make_manager_with_l2(l2.clone()).await;
 	let descriptor = typed_table_descriptor();
 	let batch = typed_table_batch(vec![1, 2]);
 	let mut write_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
@@ -4392,7 +4428,7 @@ async fn table_query_skips_tiered_slab_when_column_stats_cannot_match() {
 
 #[tokio::test]
 async fn query_request_flag_disables_table_stats_pruning() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	let descriptor = typed_table_descriptor();
 	let batch = typed_table_batch(vec![1, 2]);
 	let mut write_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
@@ -4452,7 +4488,7 @@ async fn query_request_flag_disables_table_stats_pruning() {
 #[tokio::test]
 async fn table_stats_admit_slab_then_pbc_filters_rows() {
 	let l2 = Arc::new(MockObjectStore::default());
-	let mgr = make_manager_with_l2_projected_fetch(l2.clone()).await;
+	let (_mgr_dir, mgr) = make_manager_with_l2_projected_fetch(l2.clone()).await;
 	let descriptor = typed_table_descriptor();
 	let slab_id = append_typed_table_rows(&mgr, &descriptor, vec![1, 2]).await;
 	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
@@ -4541,7 +4577,7 @@ async fn table_stats_admit_slab_then_pbc_filters_rows() {
 #[tokio::test]
 async fn aggregate_plan_folds_projected_l2_inputs() {
 	let l2 = Arc::new(MockObjectStore::default());
-	let mgr = make_manager_with_l2_projected_fetch(l2.clone()).await;
+	let (_mgr_dir, mgr) = make_manager_with_l2_projected_fetch(l2.clone()).await;
 	let descriptor = typed_table_descriptor();
 	let slab_id = append_typed_table_rows(&mgr, &descriptor, vec![1, 2]).await;
 	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
@@ -4667,7 +4703,7 @@ async fn aggregate_plan_folds_projected_l2_inputs() {
 #[tokio::test]
 async fn aggregate_plan_uses_encoded_l2_partials_when_supported() {
 	let l2 = Arc::new(MockObjectStore::default());
-	let mgr = make_manager_with_l2_encoded_compute(l2.clone()).await;
+	let (_mgr_dir, mgr) = make_manager_with_l2_encoded_compute(l2.clone()).await;
 	let mut descriptor = typed_table_descriptor();
 	descriptor.locality_policy =
 		LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptor {
@@ -4844,7 +4880,7 @@ async fn aggregate_plan_uses_encoded_l2_partials_when_supported() {
 #[tokio::test]
 async fn append_only_row_tombstones_are_hidden_from_full_and_projected_queries() {
 	let l2 = Arc::new(MockObjectStore::default());
-	let mgr = make_manager_with_l2_projected_fetch(l2.clone()).await;
+	let (_mgr_dir, mgr) = make_manager_with_l2_projected_fetch(l2.clone()).await;
 	let descriptor = append_only_table_descriptor();
 	let row_key_ids =
 		append_append_only_rows_for_query(&mgr, &descriptor, vec![7, 8, 9], hlc(10, 0, 1)).await;
@@ -4954,7 +4990,7 @@ async fn append_only_row_tombstones_are_hidden_from_full_and_projected_queries()
 #[tokio::test]
 async fn append_only_row_tombstones_are_hidden_from_projected_aggregate_inputs() {
 	let l2 = Arc::new(MockObjectStore::default());
-	let mgr = make_manager_with_l2_projected_fetch(l2.clone()).await;
+	let (_mgr_dir, mgr) = make_manager_with_l2_projected_fetch(l2.clone()).await;
 	let descriptor = append_only_table_descriptor();
 	let row_key_ids =
 		append_append_only_rows_for_query(&mgr, &descriptor, vec![7, 8, 9], hlc(10, 0, 1)).await;
@@ -5055,7 +5091,7 @@ async fn append_only_row_tombstones_are_hidden_from_projected_aggregate_inputs()
 #[tokio::test]
 async fn table_stats_absence_falls_through_to_full_scan() {
 	let l2 = Arc::new(MockObjectStore::default());
-	let (mgr, descriptor) =
+	let (_mgr_dir, mgr, descriptor) =
 		tier_typed_table_batch_without_stats(l2, vec![1, 2], "stats-missing-scan.wnd").await;
 
 	let mut bytecode = Vec::new();
@@ -5111,7 +5147,7 @@ async fn table_stats_absence_falls_through_to_full_scan() {
 #[tokio::test]
 async fn unsupported_stats_predicate_falls_through_to_full_scan() {
 	let l2 = Arc::new(MockObjectStore::default());
-	let (mgr, descriptor) =
+	let (_mgr_dir, mgr, descriptor) =
 		tier_typed_table_batch_with_stats(l2, vec![1, 2], "stats-or-scan.wnd").await;
 
 	let mut bytecode = Vec::new();
@@ -8606,7 +8642,7 @@ fn aggregate_reject_mapping_preserves_retention_expired() {
 
 #[tokio::test]
 async fn aggregate_retention_floor_reject_uses_retention_expired_code() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	let descriptor = append_only_table_descriptor();
 	let node_dir = bootstrap_tempdir("aggregate-retention-expired-node");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
@@ -8846,7 +8882,7 @@ fn aggregate_csb_logical_slot_cliff_is_observable() {
 #[tokio::test]
 async fn aggregate_csb_direct_answer_handles_count_min_and_max() {
 	let l2 = Arc::new(MockObjectStore::default());
-	let (mgr, descriptor) =
+	let (_mgr_dir, mgr, descriptor) =
 		tier_identity_typed_table_batch_with_stats(l2, vec![1, 2], "agg-csb.wnd").await;
 	let node_dir = bootstrap_tempdir("aggregate-csb-node");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
@@ -8966,7 +9002,7 @@ async fn aggregate_csb_direct_answer_handles_count_min_and_max() {
 #[tokio::test]
 async fn aggregate_csb_retention_floor_below_slab_allows_direct_answer() {
 	let l2 = Arc::new(MockObjectStore::default());
-	let (mgr, descriptor) =
+	let (_mgr_dir, mgr, descriptor) =
 		tier_identity_typed_table_batch_with_stats(l2, vec![1, 2], "agg-csb-retention-ok.wnd")
 			.await;
 	let (_node_dir, node, server) = aggregate_csb_test_server(
@@ -8993,7 +9029,7 @@ async fn aggregate_csb_retention_floor_below_slab_allows_direct_answer() {
 #[tokio::test]
 async fn aggregate_csb_retention_floor_above_slab_returns_zero_contribution() {
 	let l2 = Arc::new(MockObjectStore::default());
-	let (mgr, descriptor) =
+	let (_mgr_dir, mgr, descriptor) =
 		tier_identity_typed_table_batch_with_stats(l2, vec![1, 2], "agg-csb-retention-zero.wnd")
 			.await;
 	let (_node_dir, node, server) = aggregate_csb_test_server(
@@ -9022,7 +9058,7 @@ async fn aggregate_csb_retention_floor_above_slab_returns_zero_contribution() {
 #[tokio::test]
 async fn aggregate_csb_retention_floor_straddling_slab_falls_back_to_row_filter() {
 	let l2 = Arc::new(MockObjectStore::default());
-	let (mgr, descriptor) = tier_identity_typed_table_batch_with_stats(
+	let (_mgr_dir, mgr, descriptor) = tier_identity_typed_table_batch_with_stats(
 		l2,
 		vec![1, 2],
 		"agg-csb-retention-straddle.wnd",
@@ -9064,7 +9100,7 @@ async fn aggregate_csb_retention_floor_straddling_slab_falls_back_to_row_filter(
 #[tokio::test]
 async fn aggregate_csb_direct_answer_falls_through_when_sm_tombstone_affects_slab() {
 	let l2 = Arc::new(MockObjectStore::default());
-	let (mgr, descriptor) =
+	let (_mgr_dir, mgr, descriptor) =
 		tier_identity_typed_table_batch_with_stats(l2, vec![1, 2], "agg-csb-tombstone.wnd").await;
 	let node_dir = bootstrap_tempdir("aggregate-csb-tombstone-node");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
@@ -9176,7 +9212,7 @@ async fn aggregate_csb_direct_answer_falls_through_when_sm_tombstone_affects_sla
 #[tokio::test]
 async fn aggregate_csb_direct_answer_falls_through_when_tiered_slab_has_superseded_row() {
 	let l2 = Arc::new(MockObjectStore::default());
-	let (mgr, descriptor) =
+	let (_mgr_dir, mgr, descriptor) =
 		tier_identity_typed_table_batch_with_stats(l2.clone(), vec![1, 2], "agg-csb-old.wnd").await;
 
 	let replacement = typed_table_batch(vec![1]);
@@ -10412,7 +10448,7 @@ fn pending_owned_entry_skips_completed_entries() {
 /// the next key on page boundaries.
 #[tokio::test]
 async fn migrate_range_page_streams_every_version_of_fat_key() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	let key: u64 = 42;
 	let floor = hlc(0, 0, 0);
 	for i in 0..100u32 {
@@ -10470,9 +10506,9 @@ async fn migrate_range_page_streams_every_version_of_fat_key() {
 /// local index carries the key.
 #[tokio::test]
 async fn migrate_point_read_falls_through_missing_source_to_populated_one() {
-	let source_empty = make_manager().await;
-	let source_full = make_manager().await;
-	let destination = make_manager().await;
+	let (_source_empty_dir, source_empty) = make_manager().await;
+	let (_source_full_dir, source_full) = make_manager().await;
+	let (_destination_dir, destination) = make_manager().await;
 	let key: u64 = 7;
 	let v = hlc(100, 0, 1);
 	// Only `source_full` holds the key.
@@ -10524,8 +10560,8 @@ async fn migrate_point_read_falls_through_missing_source_to_populated_one() {
 /// `scan_as_of` on the destination then sees the union.
 #[tokio::test]
 async fn query_merge_over_partially_migrated_range_sees_every_row() {
-	let destination = make_manager().await;
-	let source = make_manager().await;
+	let (_destination_dir, destination) = make_manager().await;
+	let (_source_dir, source) = make_manager().await;
 	let floor = hlc(0, 0, 0);
 	let v = hlc(50, 0, 1);
 
@@ -10589,9 +10625,9 @@ async fn query_merge_over_partially_migrated_range_sees_every_row() {
 /// correct rather than double-counting.
 #[tokio::test]
 async fn drain_all_sources_unions_disjoint_halves() {
-	let destination = make_manager().await;
-	let source_a = make_manager().await;
-	let source_b = make_manager().await;
+	let (_destination_dir, destination) = make_manager().await;
+	let (_source_a_dir, source_a) = make_manager().await;
+	let (_source_b_dir, source_b) = make_manager().await;
 	let floor = hlc(0, 0, 0);
 	let v = hlc(10, 0, 1);
 
@@ -10699,7 +10735,7 @@ async fn query_merge_surfaces_migration_incomplete_on_source_failure() {
 /// which is exactly why the loop must not terminate there.
 #[tokio::test]
 async fn lookup_as_of_miss_after_newer_only_ingest_proves_fallthrough_needed() {
-	let destination = make_manager().await;
+	let (_destination_dir, destination) = make_manager().await;
 	let key: u64 = 13;
 	let newer = hlc(200, 0, 1);
 	let older = hlc(50, 0, 1);
@@ -11737,7 +11773,8 @@ async fn build_durability_fixture(
 			.with_data_ring(durable_data_ring)
 			.build(),
 	);
-	let crashy = CrashyReplicaService::open(fresh_dir("crashy-replica"), pool.clone()).await;
+	let crashy_dir = fresh_dir("crashy-replica");
+	let crashy = CrashyReplicaService::open(crashy_dir.to_path_buf(), pool.clone()).await;
 	let crashy_service: Arc<dyn HrftService> = crashy.clone();
 	handlers.register(durable_id, durable_service);
 	handlers.register(crashy_id, crashy_service);
@@ -11750,7 +11787,7 @@ async fn build_durability_fixture(
 		_leader_node: leader_node,
 		_durable_node: durable_node,
 		_epoch_tx: epoch_tx,
-		_dirs: vec![leader_node_dir, durable_node_dir],
+		_dirs: vec![leader_node_dir, durable_node_dir, crashy_dir],
 	}
 }
 
@@ -14544,7 +14581,7 @@ fn table_write_parent_identity_ignores_idempotency_ttl_and_pad() {
 /// against both retired behaviors at once.
 #[tokio::test]
 async fn full_scan_completes_far_beyond_the_former_lifetime_cap() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	for locality in 0..25_000u64 {
 		seed_record(
 			&mgr,
@@ -14569,7 +14606,7 @@ async fn full_scan_completes_far_beyond_the_former_lifetime_cap() {
 /// lifetime-style failures on a progressing scan.
 #[tokio::test]
 async fn caller_deadline_is_absolute_and_attributable() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	for locality in 0..64u64 {
 		seed_record(
 			&mgr,
@@ -14654,7 +14691,7 @@ async fn no_match_full_scan_progresses_per_examined_location() {
 	use arrow::array::Int64Array;
 	use arrow::datatypes::{DataType, Field, Schema};
 	let schema = Arc::new(Schema::new(vec![Field::new("age", DataType::Int64, false)]));
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	for locality in 0..512u64 {
 		let ages = Int64Array::from(vec![locality as i64]);
 		let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ages)]).unwrap();
@@ -14699,7 +14736,7 @@ async fn no_match_full_scan_progresses_per_examined_location() {
 /// — the conversion re-scoped the caps, it did not delete them.
 #[tokio::test]
 async fn work_caps_bind_totals_only_for_caller_budgets() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	for locality in 0..64u64 {
 		seed_record(
 			&mgr,
@@ -14793,7 +14830,7 @@ fn aggregate_reject_mapping_keeps_expiry_causes_distinct() {
 #[tokio::test]
 async fn stats_pruned_full_scan_progresses_per_examined_location() {
 	let l2 = Arc::new(MockObjectStore::default());
-	let mgr = make_manager_with_l2(l2.clone()).await;
+	let (_mgr_dir, mgr) = make_manager_with_l2(l2.clone()).await;
 	let descriptor = typed_table_descriptor();
 	let batch = typed_table_batch(vec![1, 2]);
 	let mut write_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
@@ -15411,7 +15448,7 @@ async fn adr0579_row_limit_bounds_producer_work_to_exactly_the_limit() {
 		LIMIT < TABLE_QUERY_RESPONSE_TARGET_ROWS,
 		"the limit must fall inside the first quantum or rounding is unobservable"
 	);
-	let (mgr, descriptor, program, meta, ranges) =
+	let (_mgr_dir, mgr, descriptor, program, meta, ranges) =
 		descriptor_backed_whole_record_cost_bound_fixture_with_rows(SOURCE_ROWS).await;
 
 	// Premise: the counter tracks locations one-for-one, so an equality on it below
@@ -15609,7 +15646,7 @@ pub(super) mod adr0090_route_selection {
 		))
 		.await
 		.unwrap();
-		let mgr = make_manager().await;
+		let (_mgr_dir, mgr) = make_manager().await;
 		let local = node.local_node;
 		let key_identity = simple_read_meta(1).key_identity;
 		let raw = Locality::from(key_identity).get();
@@ -15708,7 +15745,7 @@ pub(super) mod adr0090_route_selection {
 		))
 		.await
 		.unwrap();
-		let mgr = make_manager().await;
+		let (_mgr_dir, mgr) = make_manager().await;
 		let local = node.local_node;
 		let key_identity = simple_read_meta(1).key_identity;
 		let raw = Locality::from(key_identity).get();
@@ -15894,7 +15931,7 @@ pub(super) mod adr0090_route_selection {
 			"premise: the raw locality is owned by the peer"
 		);
 
-		let mgr = make_manager().await;
+		let (_mgr_dir, mgr) = make_manager().await;
 		let server =
 			routed_server_with_lease_gate(&node, mgr.clone(), vec![local, peer], false).await;
 		let batch = typed_table_batch(vec![id]);
@@ -15948,7 +15985,7 @@ mod adr0090_mixed_scan {
 
 	#[tokio::test]
 	async fn adr0090_one_interval_scans_both_placements_exactly_once() {
-		let mgr = make_manager().await;
+		let (_mgr_dir, mgr) = make_manager().await;
 		let descriptor = append_only_table_descriptor();
 
 		// Partitioned rows: written through the real builder, which derives the
@@ -16276,7 +16313,7 @@ mod adr0090_membership_transition {
 	async fn adr0090_membership_change_with_an_in_flight_transfer_over_mixed_state() {
 		// The mixed table from the decision-6 control: partitioned rows through
 		// the real builder, legacy rows through the pre-0090 writer shape.
-		let mgr = make_manager().await;
+		let (_mgr_dir, mgr) = make_manager().await;
 		let descriptor = append_only_table_descriptor();
 		let partitioned_keys = append_append_only_rows_for_query(
 			&mgr,
@@ -16480,7 +16517,7 @@ mod adr0090_membership_transition {
 /// partitioned tables, delete every row of the first, scan the second.
 #[tokio::test]
 async fn adr0090_probe_delete_of_one_table_then_scan_of_another() {
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	let old_table = append_only_table_descriptor();
 	let mut new_table = append_only_table_descriptor();
 	new_table.table_object_id = TableObjectId::new([0x48; 16]);
@@ -16585,7 +16622,7 @@ mod adr0091_typed_stream_errors {
 			)))
 			.await
 			.unwrap();
-		let mgr = make_manager().await;
+		let (_mgr_dir, mgr) = make_manager().await;
 		let keys = append_append_only_rows_for_query(&mgr, &descriptor, rows, hlc(10, 0, 1)).await;
 
 		// Poison the row with the HIGHEST locality: scanned last, so larger
@@ -16925,7 +16962,7 @@ async fn adr0090_segment_decoded_locations_resolve_placement_from_the_chain() {
 	use crate::schema::table::PlacementSemantics;
 	use crate::storage::secondary_index::SecondaryIndexLookupRow;
 
-	let mgr = make_manager().await;
+	let (_mgr_dir, mgr) = make_manager().await;
 	let descriptor = append_only_table_descriptor();
 	let keys = append_append_only_rows_for_query(&mgr, &descriptor, vec![7], hlc(10, 0, 1)).await;
 	let key = keys[0];
@@ -16971,7 +17008,7 @@ mod adr0089_scan_coalescing {
 	use super::*;
 
 	async fn packed_scan(rows: usize, row_limit: Option<usize>) -> (QueryExecutionPlan, usize) {
-		let mgr = make_manager().await;
+		let (_mgr_dir, mgr) = make_manager().await;
 		let descriptor = append_only_table_descriptor();
 		append_append_only_rows_for_query(
 			&mgr,

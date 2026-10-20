@@ -11,26 +11,19 @@ use crate::storage::mutation_visibility::root2::recovery::{
 	Baseline2, Deployment2, FieldError2, RecoveryError2, RecoveryMark2, encode_recovery_mark2,
 };
 use crate::storage::mutation_visibility::root2::types::Log2;
+use crate::test_support::TestDir;
 use MarkStep2 as S;
 use std::os::unix::fs::PermissionsExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 const DEPLOYMENT: Deployment2 = Deployment2 {
 	generation: [7; 16],
 	cluster: [9; 16],
 };
 
-fn dir(tag: &str) -> PathBuf {
-	static NEXT: AtomicU64 = AtomicU64::new(0);
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-mark-store-{tag}-{}-{}",
-		std::process::id(),
-		NEXT.fetch_add(1, Ordering::Relaxed)
-	));
-	let _ = std::fs::remove_dir_all(&dir);
-	std::fs::create_dir_all(&dir).unwrap();
+fn dir(tag: &str) -> TestDir {
+	let dir = TestDir::new(&format!("wendelon-mark-store-{tag}"));
 	std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 	dir
 }
@@ -64,7 +57,7 @@ fn reopen(d: &Path) -> MarkOpen2 {
 	open(d).1
 }
 /// A directory whose confirmed mark is `mark(index)`.
-fn at(tag: &str, index: u64) -> PathBuf {
+fn at(tag: &str, index: u64) -> TestDir {
 	let d = dir(tag);
 	let (mut s, _) = open(&d);
 	s.provision().unwrap();
@@ -480,7 +473,8 @@ fn advance_rules() {
 		"exact retry rechecks, writes nothing"
 	);
 
-	let (mut s, _) = open(&dir("unprovisioned"));
+	let d = dir("unprovisioned");
+	let (mut s, _) = open(&d);
 	assert_eq!(
 		s.advance(&DEPLOYMENT, &mark(5)),
 		Err(MarkIoError2::NotProvisioned)
@@ -583,7 +577,8 @@ fn paths_and_identity() {
 
 	let d = at("replaced", 5);
 	let (mut s, _) = open(&d);
-	let moved = d.with_extension("moved");
+	let aside = dir("replaced-aside");
+	let moved = aside.join("moved");
 	std::fs::rename(&d, &moved).unwrap();
 	std::fs::create_dir(&d).unwrap();
 	std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();

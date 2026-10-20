@@ -1,3 +1,5 @@
+#[path = "../src/test_support/test_dir.rs"]
+mod test_dir;
 #[path = "support/tls_pki.rs"]
 mod tls_pki;
 
@@ -13,7 +15,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
-use uuid::Uuid;
 use wendelon::client::{
 	ClusterPeerWire, ClusterStatusWire, TopologySource, WendelonClient, WendelonClientConfig,
 	WriteRequest,
@@ -53,14 +54,8 @@ use wendelon::schema::{
 	TableSchemaDescriptor, encode_table_schema_descriptor_v1,
 };
 
-fn fresh_dir(tag: &str) -> std::path::PathBuf {
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-quic-transport-{tag}-{}-{}",
-		std::process::id(),
-		Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+fn fresh_dir(tag: &str) -> test_dir::TestDir {
+	test_dir::TestDir::new(&format!("wendelon-quic-transport-{tag}"))
 }
 
 fn reserve_socket_addr() -> String {
@@ -310,7 +305,8 @@ fn bootstrap_cfg(
 	key_path: &Path,
 	node_ca_path: &Path,
 	operator_ca_path: &Path,
-) -> NodeBootstrapConfig {
+) -> (test_dir::TestDir, NodeBootstrapConfig) {
+	let scratch = fresh_dir(tag);
 	let lease_signing_secret = wendelon::network::dev_lease_signing_secret(node_id);
 	let transfer_signing_secret = wendelon::network::dev_transfer_signing_secret(node_id);
 	let mut trusted_lease_signers = BTreeMap::new();
@@ -327,7 +323,7 @@ fn bootstrap_cfg(
 			wendelon::network::transfer_verifying_key_bytes(transfer_secret),
 		);
 	}
-	let mut cfg = NodeBootstrapConfig::dev(node_id, fresh_dir(tag), advertise_address);
+	let mut cfg = NodeBootstrapConfig::dev(node_id, scratch.to_path_buf(), advertise_address);
 	cfg.rf = rf;
 	cfg.lease_signing_secret = lease_signing_secret;
 	cfg.trusted_lease_signers = trusted_lease_signers;
@@ -341,7 +337,7 @@ fn bootstrap_cfg(
 		operator_ca_path: operator_ca_path.to_path_buf(),
 		cluster_domain: tls_pki::CLUSTER_DOMAIN.into(),
 	});
-	cfg
+	(scratch, cfg)
 }
 
 async fn wait_for_cluster(node: &WendelonNode, expected_epoch: u64, expected_nodes: usize) {
@@ -460,7 +456,7 @@ async fn adr0095_live_quic_drop_returns_before_asynchronous_reclaim() {
 	let root = fresh_dir("adr0093-live-drop");
 	let pki = tls_pki::write_test_pki(&root.join("pki"));
 	let address = reserve_socket_addr();
-	let node = WendelonNode::bootstrap(bootstrap_cfg(
+	let (_scratch_1, cfg_1) = bootstrap_cfg(
 		"adr0093-live-drop-node",
 		1,
 		address.clone(),
@@ -471,9 +467,10 @@ async fn adr0095_live_quic_drop_returns_before_asynchronous_reclaim() {
 		&pki.server_key,
 		&pki.ca_cert,
 		&pki.ops_ca_cert,
-	))
-	.await
-	.expect("bootstrap live Wendelon node");
+	);
+	let node = WendelonNode::bootstrap(cfg_1)
+		.await
+		.expect("bootstrap live Wendelon node");
 	wait_for_cluster(&node, 1, 1).await;
 	let tenant_id = TenantId::new(93);
 	node.create_tenant(tenant_id, u64::MAX, 1)
@@ -868,7 +865,7 @@ async fn transport_tls_bootstrap_uses_real_quic_join_path() {
 	let node1_addr = reserve_socket_addr();
 	let node2_addr = reserve_socket_addr();
 
-	let node1 = WendelonNode::bootstrap(bootstrap_cfg(
+	let (_scratch_2, cfg_2) = bootstrap_cfg(
 		"node1",
 		1,
 		node1_addr.clone(),
@@ -879,10 +876,9 @@ async fn transport_tls_bootstrap_uses_real_quic_join_path() {
 		&pki.server_key,
 		&pki.ca_cert,
 		&pki.ops_ca_cert,
-	))
-	.await
-	.unwrap();
-	let node2 = WendelonNode::bootstrap(bootstrap_cfg(
+	);
+	let node1 = WendelonNode::bootstrap(cfg_2).await.unwrap();
+	let (_scratch_3, cfg_3) = bootstrap_cfg(
 		"node2",
 		2,
 		node2_addr.clone(),
@@ -898,9 +894,8 @@ async fn transport_tls_bootstrap_uses_real_quic_join_path() {
 		&pki.data_client_key,
 		&pki.ca_cert,
 		&pki.ops_ca_cert,
-	))
-	.await
-	.unwrap();
+	);
+	let node2 = WendelonNode::bootstrap(cfg_3).await.unwrap();
 
 	let node1_epoch = node1.epoch_tx.borrow().clone();
 	let node1_caps = node1_epoch.peers.get(&node1.local_node).unwrap();
@@ -920,7 +915,7 @@ async fn shared_factory_falls_back_to_tcp_tls_against_dual_stack_node() {
 	let pki = tls_pki::write_test_pki(&root.join("pki"));
 	let trusted_nodes = [1u32];
 	let node_addr = reserve_socket_addr();
-	let node = WendelonNode::bootstrap(bootstrap_cfg(
+	let (_scratch_4, cfg_4) = bootstrap_cfg(
 		"fallback-node",
 		1,
 		node_addr.clone(),
@@ -931,9 +926,8 @@ async fn shared_factory_falls_back_to_tcp_tls_against_dual_stack_node() {
 		&pki.server_key,
 		&pki.ca_cert,
 		&pki.ops_ca_cert,
-	))
-	.await
-	.unwrap();
+	);
+	let node = WendelonNode::bootstrap(cfg_4).await.unwrap();
 
 	let local_epoch = node.epoch_tx.borrow().clone();
 	let local_caps = local_epoch.peers.get(&node.local_node).unwrap();
@@ -1035,7 +1029,7 @@ async fn operator_reaches_only_control_ring_over_both_production_transports() {
 	let root = fresh_dir("operator-shared-ingress");
 	let pki = tls_pki::write_test_pki(&root.join("pki"));
 	let node_addr = reserve_socket_addr();
-	let deployment = WendelonNode::bootstrap(bootstrap_cfg(
+	let (_scratch_5, cfg_5) = bootstrap_cfg(
 		"operator-shared-ingress-node",
 		1,
 		node_addr.clone(),
@@ -1046,9 +1040,8 @@ async fn operator_reaches_only_control_ring_over_both_production_transports() {
 		&pki.server_key,
 		&pki.ca_cert,
 		&pki.ops_ca_cert,
-	))
-	.await
-	.unwrap();
+	);
+	let deployment = WendelonNode::bootstrap(cfg_5).await.unwrap();
 
 	let operator_material =
 		TlsMaterial::load(&pki.operator_cert, &pki.operator_key, &pki.ca_cert).unwrap();
@@ -1097,7 +1090,7 @@ async fn shared_listener_rejects_cross_domain_roles_on_both_transports() {
 	let root = fresh_dir("cross-domain-shared-ingress");
 	let pki = tls_pki::write_test_pki(&root.join("pki"));
 	let node_addr = reserve_socket_addr();
-	let deployment = WendelonNode::bootstrap(bootstrap_cfg(
+	let (_scratch_6, cfg_6) = bootstrap_cfg(
 		"cross-domain-shared-ingress-node",
 		1,
 		node_addr.clone(),
@@ -1108,9 +1101,8 @@ async fn shared_listener_rejects_cross_domain_roles_on_both_transports() {
 		&pki.server_key,
 		&pki.ca_cert,
 		&pki.ops_ca_cert,
-	))
-	.await
-	.unwrap();
+	);
+	let deployment = WendelonNode::bootstrap(cfg_6).await.unwrap();
 	let target = node(1);
 
 	for (identity, cert, key) in [

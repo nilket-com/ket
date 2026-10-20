@@ -1505,11 +1505,8 @@ async fn run_interrupted_finalization_recovery_scenario(
 	let iterations = ops.clamp(1, 6);
 	for iteration in 0..iterations {
 		let node_id = 800 + ((seed as u32).wrapping_add(iteration as u32) % 100);
-		let cfg = NodeBootstrapConfig::dev(
-			node_id,
-			tempdir(&format!("interrupted-finalization-{seed}-{iteration}")),
-			"127.0.0.1:0".into(),
-		);
+		let node_dir = tempdir(&format!("interrupted-finalization-{seed}-{iteration}"));
+		let cfg = NodeBootstrapConfig::dev(node_id, node_dir.to_path_buf(), "127.0.0.1:0".into());
 		let initial = WendelonNode::bootstrap_single_node(cfg.clone())
 			.await
 			.map_err(|err| {
@@ -1673,7 +1670,7 @@ async fn run_lazy_migration_pressure_scenario(
 ) -> std::result::Result<u64, SimFailure> {
 	let retries = usize::try_from(ops.max(1).min((DATA_RETRY_BUDGET - 1) as u64)).unwrap();
 	let node_id = 600 + ((seed as u32) % 50);
-	let node = support::bootstrap_node("sim-lazy-migration", node_id).await;
+	let (_node_dir, node) = support::bootstrap_node("sim-lazy-migration", node_id).await;
 	let result = async {
 		refresh_leases(&node).await;
 
@@ -1799,7 +1796,7 @@ async fn run_quota_authorization_boundary_scenario(
 	_ops: u64,
 ) -> std::result::Result<u64, SimFailure> {
 	let node_id = 700 + ((seed as u32) % 50);
-	let node = support::bootstrap_node("sim-quota-auth", node_id).await;
+	let (_node_dir, node) = support::bootstrap_node("sim-quota-auth", node_id).await;
 	let result = async {
 		refresh_leases(&node).await;
 		node.raft
@@ -2021,14 +2018,8 @@ async fn simulator_frozen_seed_registry_replays() {
 	}
 }
 
-fn tempdir(tag: &str) -> PathBuf {
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-simulator-ladder-{tag}-{}-{}",
-		std::process::id(),
-		uuid::Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+fn tempdir(tag: &str) -> support::TestDir {
+	support::TestDir::new(&format!("wendelon-simulator-ladder-{tag}"))
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -161,9 +161,9 @@ impl HrftService for FailingMigrateService {
 
 #[tokio::test]
 async fn seeded_migration_drains_without_client_reads() {
-	let dest = support::bootstrap_node("migration-sweeper-dest", 61).await;
-	let source_a = support::bootstrap_node("migration-sweeper-a", 62).await;
-	let source_b = support::bootstrap_node("migration-sweeper-b", 63).await;
+	let (_dest_dir, dest) = support::bootstrap_node("migration-sweeper-dest", 61).await;
+	let (_source_a_dir, source_a) = support::bootstrap_node("migration-sweeper-a", 62).await;
+	let (_source_b_dir, source_b) = support::bootstrap_node("migration-sweeper-b", 63).await;
 	support::wait_for_local_leader(&dest).await;
 	support::wait_for_local_leader(&source_a).await;
 	support::wait_for_local_leader(&source_b).await;
@@ -228,9 +228,11 @@ async fn seeded_migration_drains_without_client_reads() {
 
 #[tokio::test]
 async fn migration_sweeper_fails_over_to_next_source_and_retries_after_backoff() {
-	let dest = support::bootstrap_node("migration-sweeper-failover-dest", 71).await;
-	let source_a = support::bootstrap_node("migration-sweeper-failover-a", 72).await;
-	let source_b = support::bootstrap_node("migration-sweeper-failover-b", 73).await;
+	let (_dest_dir, dest) = support::bootstrap_node("migration-sweeper-failover-dest", 71).await;
+	let (_source_a_dir, source_a) =
+		support::bootstrap_node("migration-sweeper-failover-a", 72).await;
+	let (_source_b_dir, source_b) =
+		support::bootstrap_node("migration-sweeper-failover-b", 73).await;
 	support::wait_for_local_leader(&dest).await;
 	support::wait_for_local_leader(&source_a).await;
 	support::wait_for_local_leader(&source_b).await;

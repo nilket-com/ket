@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+#[path = "../src/test_support/test_dir.rs"]
+mod test_dir;
 use std::time::Duration;
 use wendelon::audit::replay_audit_chain;
 use wendelon::consensus::raft_storage::DurableBootstrapMode;
@@ -9,14 +10,8 @@ use wendelon::schema::{
 };
 use wendelon::storage::StorageEngine;
 
-fn tempdir(tag: &str) -> PathBuf {
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-backup-restore-{tag}-{}-{}",
-		std::process::id(),
-		uuid::Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+fn tempdir(tag: &str) -> test_dir::TestDir {
+	test_dir::TestDir::new(&format!("wendelon-backup-restore-{tag}"))
 }
 
 async fn bootstrap_single_node(cfg: NodeBootstrapConfig) -> std::io::Result<WendelonNode> {
@@ -93,8 +88,12 @@ fn tenant() -> TenantId {
 #[tokio::test]
 async fn backup_generation_exports_control_and_storage_artifacts() {
 	let dir = tempdir("export");
-	let node = match bootstrap_single_node(NodeBootstrapConfig::dev(41, dir, "127.0.0.1:0".into()))
-		.await
+	let node = match bootstrap_single_node(NodeBootstrapConfig::dev(
+		41,
+		dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
 	{
 		Ok(node) => node,
 		Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -168,8 +167,12 @@ async fn backup_generation_exports_control_and_storage_artifacts() {
 #[tokio::test]
 async fn backup_manifest_detects_tampered_embedded_storage_artifact() {
 	let dir = tempdir("integrity");
-	let node = match bootstrap_single_node(NodeBootstrapConfig::dev(42, dir, "127.0.0.1:0".into()))
-		.await
+	let node = match bootstrap_single_node(NodeBootstrapConfig::dev(
+		42,
+		dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
 	{
 		Ok(node) => node,
 		Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -193,8 +196,12 @@ async fn backup_manifest_detects_tampered_embedded_storage_artifact() {
 #[tokio::test]
 async fn backup_manifest_detects_tampered_control_image() {
 	let dir = tempdir("integrity-control");
-	let node = match bootstrap_single_node(NodeBootstrapConfig::dev(43, dir, "127.0.0.1:0".into()))
-		.await
+	let node = match bootstrap_single_node(NodeBootstrapConfig::dev(
+		43,
+		dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
 	{
 		Ok(node) => node,
 		Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -218,8 +225,12 @@ async fn backup_manifest_detects_tampered_control_image() {
 #[tokio::test]
 async fn backup_manifest_detects_voter_id_mismatch() {
 	let dir = tempdir("integrity-voters");
-	let node = match bootstrap_single_node(NodeBootstrapConfig::dev(44, dir, "127.0.0.1:0".into()))
-		.await
+	let node = match bootstrap_single_node(NodeBootstrapConfig::dev(
+		44,
+		dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
 	{
 		Ok(node) => node,
 		Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -245,7 +256,7 @@ async fn whole_node_loss_restore_bootstraps_in_recovery_mode_and_serves_recovere
 	let source_dir = tempdir("source");
 	let source = match bootstrap_single_node(NodeBootstrapConfig::dev(
 		52,
-		source_dir.clone(),
+		source_dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -309,7 +320,7 @@ async fn whole_node_loss_restore_bootstraps_in_recovery_mode_and_serves_recovere
 	let restore_dir = tempdir("restore");
 	let restored = WendelonNode::restore_from_cluster_backup(
 		&control,
-		NodeBootstrapConfig::dev(52, restore_dir, "127.0.0.1:0".into()),
+		NodeBootstrapConfig::dev(52, restore_dir.to_path_buf(), "127.0.0.1:0".into()),
 	)
 	.await
 	.unwrap();
@@ -385,7 +396,7 @@ async fn replacement_restore_rejects_reusing_failed_node_id() {
 	let dir = tempdir("replacement-same-node-id");
 	let source = match bootstrap_single_node(NodeBootstrapConfig::dev(
 		62,
-		dir,
+		dir.to_path_buf(),
 		"127.0.0.1:0".into(),
 	))
 	.await
@@ -403,7 +414,7 @@ async fn replacement_restore_rejects_reusing_failed_node_id() {
 
 	let backup = source.export_cluster_backup().await.unwrap();
 	let replacement_dir = tempdir("replacement-same-node-id-target");
-	let mut cfg = NodeBootstrapConfig::dev(62, replacement_dir, "127.0.0.1:0".into());
+	let mut cfg = NodeBootstrapConfig::dev(62, replacement_dir.to_path_buf(), "127.0.0.1:0".into());
 	cfg.cluster = ClusterBootstrapConfig::Join {
 		seeds: vec![SeedNodeConfig {
 			node_id: 1,

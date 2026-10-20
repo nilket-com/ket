@@ -516,11 +516,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn durable_outcome_survives_reopen_with_both_axes() {
-		let path = std::env::temp_dir().join(format!(
-			"wendelon-mutation-outcomes-{}-{}.redb",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
+		let path_dir = crate::test_support::TestDir::new("wendelon-mutation-outcomes");
+		let path = path_dir.join("store.redb");
 		let id = write_id(1, 60_000);
 		let store = MutationOutcomeStore::open(&path).unwrap();
 		store
@@ -553,11 +550,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn adr548_pin_survives_restart_and_retains_expired_outcome_until_acknowledged() {
-		let path = std::env::temp_dir().join(format!(
-			"wendelon-mutation-outcomes-pin-{}-{}.redb",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
+		let path_dir = crate::test_support::TestDir::new("wendelon-mutation-outcomes-pin");
+		let path = path_dir.join("store.redb");
 		let id = write_id(548, 1_000);
 		let tenant = TenantId::new(1);
 		let store = MutationOutcomeStore::open(&path).unwrap();
@@ -581,11 +575,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn adr548_pin_capacity_refuses_independently_of_outcome_capacity() {
-		let path = std::env::temp_dir().join(format!(
-			"wendelon-mutation-outcomes-pin-capacity-{}-{}.redb",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
+		let path_dir = crate::test_support::TestDir::new("wendelon-mutation-outcomes-pin-capacity");
+		let path = path_dir.join("store.redb");
 		let tenant = TenantId::new(1);
 		let store = MutationOutcomeStore::open(&path).unwrap();
 		let txn = store.db.test_handle().begin_write().unwrap();
@@ -612,11 +603,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn reclaimed_v7_operation_never_becomes_a_new_mutation() {
-		let path = std::env::temp_dir().join(format!(
-			"wendelon-mutation-outcomes-expired-{}-{}.redb",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
+		let path_dir = crate::test_support::TestDir::new("wendelon-mutation-outcomes-expired");
+		let path = path_dir.join("store.redb");
 		let now = now_ms();
 		let id = v7_write_id(now.saturating_sub(2_000), 1_000);
 		let store = MutationOutcomeStore::open(&path).unwrap();
@@ -629,11 +617,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn tenant_scope_cannot_resolve_another_tenants_operation() {
-		let path = std::env::temp_dir().join(format!(
-			"wendelon-mutation-outcomes-tenant-{}-{}.redb",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
+		let path_dir = crate::test_support::TestDir::new("wendelon-mutation-outcomes-tenant");
+		let path = path_dir.join("store.redb");
 		let id = write_id(9, 60_000);
 		let store = MutationOutcomeStore::open(&path).unwrap();
 		store
@@ -672,11 +657,8 @@ mod tests {
 
 	#[test]
 	fn terminal_capacity_evicts_oldest_into_expired_evidence() {
-		let path = std::env::temp_dir().join(format!(
-			"wendelon-mutation-outcomes-capacity-{}-{}.redb",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
+		let path_dir = crate::test_support::TestDir::new("wendelon-mutation-outcomes-capacity");
+		let path = path_dir.join("store.redb");
 		let store = MutationOutcomeStore::open(path).unwrap();
 		let tenant = TenantId::new(1);
 		let txn = store.db.test_handle().begin_write().unwrap();

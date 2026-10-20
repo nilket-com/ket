@@ -236,14 +236,8 @@ mod tests {
 	use super::*;
 	use crate::simulator::checkers::{RegisterHistoryEntry, RegisterOperation};
 
-	fn tempdir(tag: &str) -> PathBuf {
-		let dir = std::env::temp_dir().join(format!(
-			"wendelon-register-history-{tag}-{}-{}",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
-		fs::create_dir_all(&dir).unwrap();
-		dir
+	fn tempdir(tag: &str) -> crate::test_support::TestDir {
+		crate::test_support::TestDir::new(&format!("wendelon-register-history-{tag}"))
 	}
 
 	#[test]

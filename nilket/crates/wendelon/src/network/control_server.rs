@@ -5519,14 +5519,13 @@ mod tests {
 	}
 
 	async fn quarantined_policy_for_control_test() -> (
+		crate::test_support::TestDir,
 		Arc<MaintenancePolicyInner>,
 		Vec<SlabId>,
 		MaintenanceFingerprint,
 	) {
-		let path = std::env::temp_dir().join(format!(
-			"wendelon-adr0582-control-{}.redb",
-			uuid::Uuid::new_v4()
-		));
+		let path_dir = crate::test_support::TestDir::new("wendelon-adr0582-control");
+		let path = path_dir.join("store.redb");
 		let store = Arc::new(
 			crate::storage::index::PersistentLocalIndex::open(path)
 				.await
@@ -5549,7 +5548,7 @@ mod tests {
 		let fingerprint = policy
 			.quarantine_fingerprint_for_test(MaintenanceOperation::LsmCompaction, &slabs)
 			.unwrap();
-		(policy, slabs, fingerprint)
+		(path_dir, policy, slabs, fingerprint)
 	}
 
 	async fn seed_quarantined_receipt(
@@ -5644,10 +5643,7 @@ mod tests {
 	/// sibling operation over the same slabs.
 	#[tokio::test]
 	async fn maintenance_control_is_node_local_authenticated_and_durable_across_reopen() {
-		let root = std::env::temp_dir().join(format!(
-			"wendelon-adr0582-two-node-{}",
-			uuid::Uuid::new_v4()
-		));
+		let root = crate::test_support::TestDir::new("wendelon-adr0582-two-node");
 		let dir_a = root.join("node-a");
 		let dir_b = root.join("node-b");
 		let slabs_a = [SlabId::new(11), SlabId::new(12)];
@@ -5867,10 +5863,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn maintenance_report_stops_before_the_encoded_frame_budget() {
-		let path = std::env::temp_dir().join(format!(
-			"wendelon-adr0582-page-budget-{}.redb",
-			uuid::Uuid::new_v4()
-		));
+		let path_dir = crate::test_support::TestDir::new("wendelon-adr0582-page-budget");
+		let path = path_dir.join("store.redb");
 		let store = Arc::new(PersistentLocalIndex::open(path).await.unwrap());
 		let receipt = DeterministicReceipt::after_failure(
 			Some(
@@ -5962,7 +5956,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn maintenance_requeue_audit_brackets_mutation_and_fails_closed() {
-		let (ordered_policy, ordered_slabs, ordered_fingerprint) =
+		let (_ordered_dir, ordered_policy, ordered_slabs, ordered_fingerprint) =
 			quarantined_policy_for_control_test().await;
 		let ordered_wire = ordered_slabs
 			.iter()
@@ -6002,7 +5996,7 @@ mod tests {
 			]
 		);
 
-		let (policy, slabs, fingerprint) = quarantined_policy_for_control_test().await;
+		let (_dir, policy, slabs, fingerprint) = quarantined_policy_for_control_test().await;
 		let slabs_wire = slabs.iter().map(|slab| slab.get()).collect::<Vec<_>>();
 		let digest = maintenance_slab_digest(&slabs_wire);
 		let expected_wire = fingerprint.to_bytes();

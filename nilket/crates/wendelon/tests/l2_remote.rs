@@ -1,9 +1,10 @@
+#[path = "../src/test_support/test_dir.rs"]
+mod test_dir;
 use async_trait::async_trait;
 use openraft::storage::RaftStateMachine;
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -22,14 +23,8 @@ use wendelon::storage::{
 	SlabSweeper, SweepReport, SweeperConfig, TierCommitter, spawn_io_thread,
 };
 
-fn fresh_dir(tag: &str) -> PathBuf {
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-l2-remote-{tag}-{}-{}",
-		std::process::id(),
-		uuid::Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+fn fresh_dir(tag: &str) -> test_dir::TestDir {
+	test_dir::TestDir::new(&format!("wendelon-l2-remote-{tag}"))
 }
 
 fn hlc() -> HybridTimestamp {
@@ -527,7 +522,7 @@ async fn handle_request(
 
 async fn build_manager_with_sealed_slabs(
 	l2: Option<Arc<dyn ObjectStore>>,
-) -> (Arc<SlabManager>, PathBuf) {
+) -> (test_dir::TestDir, Arc<SlabManager>) {
 	use wendelon::storage::StorageEngine;
 
 	let dir = fresh_dir("l1");
@@ -535,7 +530,7 @@ async fn build_manager_with_sealed_slabs(
 	let manager = Arc::new(
 		SlabManager::open_with_owner(
 			SlabManagerConfig {
-				dir: dir.clone(),
+				dir: dir.to_path_buf(),
 				max_slab_bytes: 1,
 				io,
 				l2,
@@ -567,7 +562,7 @@ async fn build_manager_with_sealed_slabs(
 		.append(tenant(), id(3), hlc(), b"hello-3")
 		.await
 		.unwrap();
-	(manager, dir)
+	(dir, manager)
 }
 
 #[tokio::test]
@@ -643,7 +638,7 @@ async fn sweeper_persists_remote_uri_shape_in_tier_metadata() {
 	let server = FakeCompatStoreServer::start().await;
 	let remote: Arc<dyn ObjectStore> =
 		Arc::new(RemoteObjectStore::new(compat_config(server.endpoint.clone(), "tiered")).unwrap());
-	let (manager, _dir) = build_manager_with_sealed_slabs(Some(remote.clone())).await;
+	let (_dir, manager) = build_manager_with_sealed_slabs(Some(remote.clone())).await;
 
 	let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 	let state_machine = WendelonStateMachine::new().with_tier_observer(observer);

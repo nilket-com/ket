@@ -41,6 +41,12 @@ use wendelon::schema::{
 mod lease_faults;
 #[path = "support/reliance_faults.rs"]
 mod reliance_faults;
+#[expect(
+	dead_code,
+	reason = "the evidence fixture uses only the owned scratch dir, not the async teardown guard"
+)]
+#[path = "../src/test_support/test_dir.rs"]
+mod test_dir;
 /// ADR 626 Stage A: passive wait events, shared with the fixture worker binary.
 #[path = "support/wait_events.rs"]
 mod wait_events;
@@ -6336,11 +6342,17 @@ async fn host_mode_refuses_a_listener_certificate_for_another_worker_id() {
 #[test]
 #[should_panic(expected = "probe evidence must be a fresh file")]
 fn probe_evidence_is_never_overwritten() {
-	let dir = std::env::temp_dir().join(format!("toron-adr625-evidence-{}", std::process::id()));
-	let _ = std::fs::remove_dir_all(&dir);
-	std::fs::create_dir_all(&dir).expect("evidence dir");
+	let dir = test_dir::TestDir::new("toron-adr625-evidence");
 	write_probe_evidence(&dir, &serde_json::json!({"attempt": 1}));
-	write_probe_evidence(&dir, &serde_json::json!({"attempt": 2}));
+	// The second write is the expected panic. Catch it so the scratch dir is released on this
+	// success path (the guard retains on a live panic), then resume it for `should_panic`.
+	let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+		write_probe_evidence(&dir, &serde_json::json!({"attempt": 2}));
+	}));
+	drop(dir);
+	if let Err(panic) = second {
+		std::panic::resume_unwind(panic);
+	}
 }
 
 /// Create `path` new, with `mode` applied at creation (never widened then narrowed).

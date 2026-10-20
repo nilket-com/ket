@@ -17,7 +17,7 @@ use wendelon_client::{Client, ReadOptions, WriteOptions};
 
 #[tokio::test]
 async fn other_tenant_pending_does_not_suppress_public_write_both_orders() {
-	let node = support::bootstrap_node("b1b-public-refusal", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("b1b-public-refusal", 1).await;
 	support::wait_for_local_leader(&node).await;
 	node.handles.pending_finalization_reconciler.abort();
 	tokio::time::timeout(Duration::from_secs(2), async {

@@ -803,24 +803,25 @@ mod tests {
 	/// A policy over a REAL store: `Enabled` deliberately cannot exist without one,
 	/// so these tests open a temporary index rather than inventing a storeless
 	/// variant that production could never reach.
-	async fn enabled_policy(clock: Arc<ManualClock>) -> Arc<MaintenancePolicyInner> {
-		let path = std::env::temp_dir().join(format!(
-			"wendelon-policy-{}-{}.redb",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
+	async fn enabled_policy(
+		clock: Arc<ManualClock>,
+	) -> (crate::test_support::TestDir, Arc<MaintenancePolicyInner>) {
+		let (dir, path) = temp_index_path("enabled");
 		let store = Arc::new(
 			crate::storage::index::PersistentLocalIndex::open(path)
 				.await
 				.expect("temp index opens"),
 		);
-		MaintenancePolicyInner::enabled(store, BTreeMap::new(), clock)
+		(
+			dir,
+			MaintenancePolicyInner::enabled(store, BTreeMap::new(), clock),
+		)
 	}
 
 	#[tokio::test]
 	async fn a_reservation_bars_a_second_identical_plan() {
 		let clock = Arc::new(ManualClock::at(1_000));
-		let policy = enabled_policy(clock).await;
+		let (_dir, policy) = enabled_policy(clock).await;
 		let slabs = [SlabId::new(3), SlabId::new(1)];
 
 		let first = policy.reserve(OP, &slabs).expect("first admission");
@@ -858,7 +859,7 @@ mod tests {
 	#[tokio::test]
 	async fn dropping_an_unfinalized_reservation_disables_maintenance() {
 		let clock = Arc::new(ManualClock::at(1_000));
-		let policy = enabled_policy(clock).await;
+		let (_dir, policy) = enabled_policy(clock).await;
 		let slabs = [SlabId::new(5)];
 
 		let reservation = policy.reserve(OP, &slabs).expect("admission");
@@ -882,7 +883,7 @@ mod tests {
 	#[tokio::test]
 	async fn finalizing_does_not_disable_and_a_disabled_policy_admits_nothing() {
 		let clock = Arc::new(ManualClock::at(1_000));
-		let policy = enabled_policy(clock).await;
+		let (_dir, policy) = enabled_policy(clock).await;
 		policy.reserve(OP, &[SlabId::new(1)]).unwrap().finalize();
 		assert!(
 			policy.is_enabled(),
@@ -903,7 +904,7 @@ mod tests {
 	#[tokio::test]
 	async fn eligibility_does_not_reserve_so_the_picker_can_inspect_candidates() {
 		let clock = Arc::new(ManualClock::at(1_000));
-		let policy = enabled_policy(clock).await;
+		let (_dir, policy) = enabled_policy(clock).await;
 		let slabs = [SlabId::new(4)];
 		assert!(policy.is_eligible(OP, &slabs, 1_000));
 		assert!(
@@ -962,11 +963,7 @@ mod tests {
 			spent,
 		);
 
-		let path = std::env::temp_dir().join(format!(
-			"wendelon-policy-agg-{}-{}.redb",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
+		let (_dir, path) = temp_index_path("agg");
 		let store = Arc::new(
 			crate::storage::index::PersistentLocalIndex::open(path)
 				.await
@@ -987,7 +984,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn a_plan_naming_no_slabs_is_refused() {
-		let policy = enabled_policy(Arc::new(ManualClock::at(1_000))).await;
+		let (_dir, policy) = enabled_policy(Arc::new(ManualClock::at(1_000))).await;
 		assert_eq!(
 			policy.reserve(OP, &[]).err(),
 			Some(AdmissionRefusal::EmptyWorkSet)
@@ -995,12 +992,12 @@ mod tests {
 		assert!(policy.is_enabled(), "a refusal is not a failure");
 	}
 
-	fn temp_index_path(tag: &str) -> std::path::PathBuf {
-		std::env::temp_dir().join(format!(
-			"wendelon-policy-{tag}-{}-{}.redb",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		))
+	/// A fresh index path inside its own scratch dir; hold the guard for as long as
+	/// the index is open or reopened.
+	fn temp_index_path(tag: &str) -> (crate::test_support::TestDir, std::path::PathBuf) {
+		let dir = crate::test_support::TestDir::new(&format!("wendelon-policy-{tag}"));
+		let path = dir.join("index.redb");
+		(dir, path)
 	}
 
 	/// Recovery publishes the record whole: a quarantine written before restart is
@@ -1008,7 +1005,7 @@ mod tests {
 	/// are admissible.
 	#[tokio::test]
 	async fn recovery_republishes_durable_receipts_as_one_record() {
-		let path = temp_index_path("recover");
+		let (_dir, path) = temp_index_path("recover");
 		let quarantined = [SlabId::new(4), SlabId::new(9)];
 		let key = MaintenanceWorkKey::new(
 			OP,
@@ -1053,7 +1050,7 @@ mod tests {
 	/// receipt simply was not loaded, which is the bound failing silently.
 	#[tokio::test]
 	async fn one_undecodable_receipt_disables_recovery_entirely() {
-		let path = temp_index_path("corrupt");
+		let (_dir, path) = temp_index_path("corrupt");
 		let good_slabs = [SlabId::new(1)];
 		let good_key = MaintenanceWorkKey::new(
 			OP,
@@ -1153,7 +1150,7 @@ mod tests {
 	/// results is bounded no matter how large the offending row was.
 	#[tokio::test]
 	async fn an_oversized_receipt_disables_recovery_with_a_bounded_diagnostic() {
-		let path = temp_index_path("oversized");
+		let (_dir, path) = temp_index_path("oversized");
 		let key = MaintenanceWorkKey::new(
 			OP,
 			[SlabId::new(1)],
@@ -1190,7 +1187,7 @@ mod tests {
 	#[tokio::test]
 	async fn corrupt_receipt_diagnostics_are_summaries_not_dumps() {
 		// A decodable key over many slabs, with an undecodable value.
-		let path = temp_index_path("wide-key");
+		let (_dir, path) = temp_index_path("wide-key");
 		let wide = MaintenanceWorkKey::new(
 			OP,
 			(1..=500u64).map(SlabId::new),
@@ -1221,7 +1218,7 @@ mod tests {
 		assert!(diagnostic.len() <= MAX_DIAGNOSTIC_BYTES, "{diagnostic}");
 
 		// An undecodable raw key, large but under the load bound.
-		let path = temp_index_path("raw-key");
+		let (_dir, path) = temp_index_path("raw-key");
 		let raw_key = vec![0xAB; 10_000];
 		assert!(raw_key.len() <= MAX_RECEIPT_KEY_BYTES);
 		{
@@ -1256,7 +1253,7 @@ mod tests {
 	/// Lost history (marker present, table gone) is not empty history.
 	#[tokio::test]
 	async fn lost_receipt_history_disables_recovery() {
-		let path = temp_index_path("lost");
+		let (_dir, path) = temp_index_path("lost");
 		{
 			let store = crate::storage::index::PersistentLocalIndex::open(path.clone())
 				.await
@@ -1286,17 +1283,19 @@ mod tests {
 	async fn enabled_policy_with_store(
 		clock: Arc<dyn MaintenanceClock>,
 	) -> (
+		crate::test_support::TestDir,
 		Arc<MaintenancePolicyInner>,
 		Arc<crate::storage::index::PersistentLocalIndex>,
 	) {
+		let (dir, path) = temp_index_path("exec");
 		let store = Arc::new(
-			crate::storage::index::PersistentLocalIndex::open(temp_index_path("exec"))
+			crate::storage::index::PersistentLocalIndex::open(path)
 				.await
 				.expect("temp index opens"),
 		);
 		let policy = MaintenancePolicyInner::load(Arc::clone(&store), clock).await;
 		assert!(policy.is_enabled(), "{:?}", policy.diagnostic());
-		(policy, store)
+		(dir, policy, store)
 	}
 
 	/// Like `enabled_policy_with_store`, at a path the test keeps so it can reopen.
@@ -1386,7 +1385,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_deterministic_failure_schedules_from_the_post_outcome_clock() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, _store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, _store) = enabled_policy_with_store(clock.clone()).await;
 		let slabs = [SlabId::new(5), SlabId::new(6)];
 
 		// The build outlasts its own backoff: the tick began at 1,000,000 and the
@@ -1420,7 +1419,7 @@ mod tests {
 	#[tokio::test]
 	async fn three_deterministic_failures_quarantine_and_only_requeue_clears_it() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, store) = enabled_policy_with_store(clock.clone()).await;
 		let slabs = [SlabId::new(7)];
 		let metrics = crate::metrics::global();
 		let before_quarantined =
@@ -1494,7 +1493,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_second_identical_plan_cannot_enter_while_the_first_is_in_flight() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, _store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, _store) = enabled_policy_with_store(clock.clone()).await;
 		let slabs = vec![SlabId::new(3), SlabId::new(1)];
 
 		let (release, released) = tokio::sync::oneshot::channel::<()>();
@@ -1570,7 +1569,7 @@ mod tests {
 	#[tokio::test]
 	async fn retryable_cooldown_is_ephemeral_and_counts_consecutive_failures_only() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, store) = enabled_policy_with_store(clock.clone()).await;
 		let slabs = [SlabId::new(4)];
 		let retry = |policy: Arc<MaintenancePolicyInner>| async move {
 			let attempt = policy
@@ -1645,7 +1644,7 @@ mod tests {
 	#[tokio::test]
 	async fn success_removes_every_origin_receipt_for_the_exact_slab_set_only() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (_policy, store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, _policy, store) = enabled_policy_with_store(clock.clone()).await;
 		let set_a = [SlabId::new(1), SlabId::new(2)];
 		let set_b = [SlabId::new(1)];
 		let receipt = DeterministicReceipt::after_failure(None, 0, "x").unwrap();
@@ -1692,7 +1691,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_receipt_write_failure_admits_no_further_plan() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, store) = enabled_policy_with_store(clock.clone()).await;
 		let slabs = [SlabId::new(5)];
 		store
 			.fail_receipt_mutations
@@ -1735,7 +1734,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_requeue_deletion_failure_leaves_the_quarantine_effective() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, store) = enabled_policy_with_store(clock.clone()).await;
 		let slabs = [SlabId::new(5)];
 		for attempt in 1..=3u32 {
 			clock.set(u64::from(attempt) * 10_000_000);
@@ -1786,7 +1785,7 @@ mod tests {
 	#[tokio::test]
 	async fn reopen_after_each_attempt_preserves_the_schedule_and_the_quarantine() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let path = temp_index_path("reopen-each-attempt");
+		let (_dir, path) = temp_index_path("reopen-each-attempt");
 		let (policy, store) = enabled_policy_at(&path, clock.clone()).await;
 		let slabs = [SlabId::new(11), SlabId::new(12)];
 		let backoff = deterministic_backoff;
@@ -1841,7 +1840,7 @@ mod tests {
 	#[tokio::test]
 	async fn success_cleanup_failure_disables_policy_but_reports_success() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, store) = enabled_policy_with_store(clock.clone()).await;
 		let slabs = [SlabId::new(5)];
 		clock.set(1);
 		fail_deterministically(&policy, &slabs).await;
@@ -1889,7 +1888,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_clock_failure_disables_admission_at_either_end_of_an_attempt() {
 		// Fails at admission.
-		let (policy, _store) =
+		let (_dir, policy, _store) =
 			enabled_policy_with_store(Arc::new(ClockThatFailsAfter(0.into()))).await;
 		let attempt: MaintenanceAttempt<(), Error> = policy
 			.execute(
@@ -1907,7 +1906,7 @@ mod tests {
 		assert!(!policy.is_enabled());
 
 		// Fails after the outcome: one sample for admission, none for the record.
-		let (policy, _store) =
+		let (_dir, policy, _store) =
 			enabled_policy_with_store(Arc::new(ClockThatFailsAfter(1.into()))).await;
 		let attempt = policy
 			.execute(
@@ -1934,7 +1933,7 @@ mod tests {
 	#[tokio::test]
 	async fn an_abandoned_attempt_disables_admission() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, _store) = enabled_policy_with_store(clock).await;
+		let (_dir, policy, _store) = enabled_policy_with_store(clock).await;
 		let task = {
 			let policy = Arc::clone(&policy);
 			tokio::spawn(async move {
@@ -2135,7 +2134,7 @@ mod tests {
 	#[tokio::test]
 	async fn another_operations_rewrite_does_not_clear_this_operations_receipt() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, store) = enabled_policy_with_store(clock.clone()).await;
 		let slabs = [SlabId::new(7)];
 		fail_deterministically(&policy, &slabs).await;
 		assert_eq!(receipt_for(&policy, &slabs).unwrap().attempts, 1);
@@ -2190,7 +2189,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_completion_that_rewrote_nothing_records_nothing() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, store) = enabled_policy_with_store(clock.clone()).await;
 		let metrics = crate::metrics::global();
 		let neutral = |_: &()| SuccessDisposition::Neutral;
 
@@ -2276,7 +2275,7 @@ mod tests {
 	#[tokio::test]
 	async fn admission_is_per_operation_but_in_flight_work_bars_every_operation() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, _store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, _store) = enabled_policy_with_store(clock.clone()).await;
 
 		// Quarantine the LSM over {3}: three deterministic failures on schedule.
 		let quarantined = [SlabId::new(3)];
@@ -2363,7 +2362,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_retryable_counter_that_would_overflow_disables_admission() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, _store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, _store) = enabled_policy_with_store(clock.clone()).await;
 		let slabs = [SlabId::new(6)];
 		{
 			let mut state = policy.lock();
@@ -2486,7 +2485,7 @@ mod tests {
 	#[tokio::test]
 	async fn requeue_clears_only_the_named_operations_quarantine() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let path = temp_index_path("requeue-scope");
+		let (_dir, path) = temp_index_path("requeue-scope");
 		let (policy, store) = enabled_policy_at(&path, clock.clone()).await;
 		drop(policy);
 		let slabs = [SlabId::new(11)];
@@ -2564,7 +2563,7 @@ mod tests {
 	#[tokio::test]
 	async fn report_paging_never_splits_one_work_identity() {
 		let clock = Arc::new(ManualClock::at(10_000));
-		let (policy, store) = enabled_policy_with_store(clock).await;
+		let (_dir, policy, store) = enabled_policy_with_store(clock).await;
 		drop(policy);
 		let slabs = [SlabId::new(4), SlabId::new(9)];
 		let receipt = quarantined_receipt("shape");
@@ -2661,7 +2660,7 @@ mod tests {
 	#[tokio::test]
 	async fn report_cursor_is_invalidated_by_mutation_and_policy_rehydration() {
 		let clock = Arc::new(ManualClock::at(10_000));
-		let path = temp_index_path("report-cursor");
+		let (_dir, path) = temp_index_path("report-cursor");
 		let (policy, store) = enabled_policy_at(&path, clock.clone()).await;
 		drop(policy);
 		for slab in [1_u64, 2] {
@@ -2711,7 +2710,7 @@ mod tests {
 	#[tokio::test]
 	async fn compare_and_clear_reserves_between_validation_and_durable_delete() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, _store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, _store) = enabled_policy_with_store(clock.clone()).await;
 		let slabs = [SlabId::new(71)];
 		for attempt in 1..=3_u64 {
 			clock.set(attempt * 10_000_000);
@@ -2752,7 +2751,7 @@ mod tests {
 	#[tokio::test]
 	async fn every_report_visible_policy_mutation_invalidates_a_cursor() {
 		let clock = Arc::new(ManualClock::at(10_000));
-		let (policy, store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, store) = enabled_policy_with_store(clock.clone()).await;
 		drop(policy);
 		for slab in [1_u64, 2] {
 			let key = MaintenanceWorkKey::new(
@@ -2806,7 +2805,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_recreated_quarantine_makes_the_reviewed_fingerprint_stale() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, _store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, _store) = enabled_policy_with_store(clock.clone()).await;
 		let slabs = [SlabId::new(81)];
 		for attempt in 1..=3_u64 {
 			clock.set(attempt * 10_000_000);
@@ -2863,7 +2862,7 @@ mod tests {
 	#[tokio::test]
 	async fn neutral_completion_cools_the_set_down_and_a_rewrite_clears_it() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, _store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, _store) = enabled_policy_with_store(clock.clone()).await;
 		let slabs = [SlabId::new(4)];
 		let scan_clean = |policy: Arc<MaintenancePolicyInner>| async move {
 			let attempt = policy
@@ -2972,7 +2971,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_failure_replaces_the_neutral_cooldown_and_expired_entries_are_swept() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
-		let (policy, _store) = enabled_policy_with_store(clock.clone()).await;
+		let (_dir, policy, _store) = enabled_policy_with_store(clock.clone()).await;
 		for slab in [1_u64, 2, 3] {
 			let attempt = policy
 				.execute(
@@ -3026,7 +3025,7 @@ mod tests {
 	#[tokio::test]
 	async fn backing_off_receipts_report_as_backing_off_and_page_after_quarantine() {
 		let clock = Arc::new(ManualClock::at(10_000));
-		let (policy, store) = enabled_policy_with_store(clock).await;
+		let (_dir, policy, store) = enabled_policy_with_store(clock).await;
 		drop(policy);
 		let slabs = [SlabId::new(4), SlabId::new(9)];
 		let backing_off = DeterministicReceipt::after_failure(None, 1_000, "shape").unwrap();

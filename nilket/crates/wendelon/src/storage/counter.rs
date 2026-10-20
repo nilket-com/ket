@@ -3322,17 +3322,11 @@ mod slab_store_tests {
 	use crate::storage::core::{GroupCommitConfig, LocalSlabStore};
 	use crate::storage::{BlockingFileOps, StorageEngine};
 	use std::io::{Read, Seek, SeekFrom};
-	use std::path::{Path, PathBuf};
+	use std::path::Path;
 	use std::time::Duration;
 
-	fn slab_dir() -> PathBuf {
-		let dir = std::env::temp_dir().join(format!(
-			"wendelon-adr075-{}-{}",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
-		std::fs::create_dir_all(&dir).unwrap();
-		dir
+	fn slab_dir() -> crate::test_support::TestDir {
+		crate::test_support::TestDir::new("wendelon-adr075")
 	}
 
 	async fn open_store(path: &Path) -> Arc<LocalSlabStore> {
@@ -3365,7 +3359,7 @@ mod slab_store_tests {
 		for replica_arm in [false, true] {
 			let dir = slab_dir();
 			let path = dir.join("slab_0000000000000000.wnd");
-			let ops = Arc::new(FaultyFileOps::new(&dir).unwrap());
+			let ops = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
 			let store = open_store_with_ops(&path, ops.clone()).await;
 			let tenant = TenantId::new(7);
 			let origin = NodeId {
@@ -3648,7 +3642,7 @@ mod replica_tests {
 	use crate::schema::{HybridTimestamp, SlabId, TenantId};
 	use crate::storage::BlockingFileOps;
 	use crate::storage::core::{GroupCommitConfig, LocalSlabStore};
-	use std::path::{Path, PathBuf};
+	use std::path::Path;
 	use std::time::Duration;
 
 	fn h(ms: u64) -> HybridTimestamp {
@@ -3659,14 +3653,8 @@ mod replica_tests {
 		}
 	}
 
-	fn slab_dir() -> PathBuf {
-		let dir = std::env::temp_dir().join(format!(
-			"wendelon-adr075-replica-{}-{}",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
-		std::fs::create_dir_all(&dir).unwrap();
-		dir
+	fn slab_dir() -> crate::test_support::TestDir {
+		crate::test_support::TestDir::new("wendelon-adr075-replica")
 	}
 
 	async fn open_store(path: &Path) -> Arc<LocalSlabStore> {
@@ -3984,14 +3972,8 @@ mod leader_tests {
 	use std::sync::atomic::AtomicBool;
 	use std::time::Duration;
 
-	fn slab_dir() -> PathBuf {
-		let dir = std::env::temp_dir().join(format!(
-			"wendelon-adr075-leader-{}-{}",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		));
-		std::fs::create_dir_all(&dir).unwrap();
-		dir
+	fn slab_dir() -> crate::test_support::TestDir {
+		crate::test_support::TestDir::new("wendelon-adr075-leader")
 	}
 
 	fn h(ms: u64) -> HybridTimestamp {
@@ -4009,10 +3991,10 @@ mod leader_tests {
 		}
 	}
 
-	/// A fresh durable witness store under a unique temp dir (most fixtures
+	/// A fresh durable witness store inside the test's scratch dir (most fixtures
 	/// don't restart; the restart fixture builds its own shared-dir store).
-	fn wstore() -> DurableCounterWitnessStore {
-		DurableCounterWitnessStore::open(slab_dir().join("witnesses")).unwrap()
+	fn wstore(dir: &Path) -> DurableCounterWitnessStore {
+		DurableCounterWitnessStore::open(dir.join("wstore")).unwrap()
 	}
 
 	async fn open_store(path: &Path) -> Arc<LocalSlabStore> {
@@ -4502,7 +4484,7 @@ mod leader_tests {
 	async fn fetch_add_commits_all_accepted_and_resolves_witness() {
 		let dir = slab_dir();
 		let (ps, _paths) = participants(&dir, 3).await;
-		let leader = LeaderHarness::new(ps, 2, true, wstore());
+		let leader = LeaderHarness::new(ps, 2, true, wstore(&dir));
 		let k = ckey(b"verdict");
 		let out = leader.fetch_add(wk(1), &k, 5).await.unwrap();
 		assert_eq!(
@@ -4529,7 +4511,7 @@ mod leader_tests {
 	async fn duplicate_write_id_replays_without_readding() {
 		let dir = slab_dir();
 		let (ps, _paths) = participants(&dir, 3).await;
-		let leader = LeaderHarness::new(ps, 2, true, wstore());
+		let leader = LeaderHarness::new(ps, 2, true, wstore(&dir));
 		let k = ckey(b"verdict");
 		let first = leader.fetch_add(wk(1), &k, 5).await.unwrap();
 		let replay = leader.fetch_add(wk(1), &k, 5).await.unwrap();
@@ -4559,7 +4541,7 @@ mod leader_tests {
 	async fn non_primary_redirects_not_replays() {
 		let dir = slab_dir();
 		let (ps, _paths) = participants(&dir, 1).await;
-		let leader = LeaderHarness::new(ps, 1, false, wstore());
+		let leader = LeaderHarness::new(ps, 1, false, wstore(&dir));
 		let k = ckey(b"verdict");
 		assert_eq!(
 			leader.fetch_add(wk(1), &k, 5).await,
@@ -4574,7 +4556,7 @@ mod leader_tests {
 	async fn quorum_failure_rolls_back_every_accepted_participant() {
 		let dir = slab_dir();
 		let (ps, _paths) = participants(&dir, 3).await;
-		let leader = LeaderHarness::new(ps, 3, true, wstore()); // need all 3
+		let leader = LeaderHarness::new(ps, 3, true, wstore(&dir)); // need all 3
 		let k = ckey(b"verdict");
 		leader.arm_participant_tentative_failure(2); // participant 2 will NOT accept
 		assert_eq!(
@@ -4614,7 +4596,7 @@ mod leader_tests {
 	async fn commit_reaches_every_accepted_participant_beyond_quorum() {
 		let dir = slab_dir();
 		let (ps, paths) = participants(&dir, 3).await;
-		let leader = LeaderHarness::new(ps, 2, true, wstore()); // quorum 2 of 3, all accept
+		let leader = LeaderHarness::new(ps, 2, true, wstore(&dir)); // quorum 2 of 3, all accept
 		let k = ckey(b"verdict");
 		leader.fetch_add(wk(1), &k, 5).await.unwrap();
 		assert_eq!(leader.pending_witnesses(), 0);
@@ -4657,7 +4639,8 @@ mod leader_tests {
 		}
 		// A becomes the primary after restart and takes the next add.
 		let store_a2 = open_store(&path_a).await;
-		let leader = LeaderHarness::new(vec![TestParticipant::over(store_a2)], 1, true, wstore());
+		let leader =
+			LeaderHarness::new(vec![TestParticipant::over(store_a2)], 1, true, wstore(&dir));
 		let out = leader.fetch_add(wk(2), &k, 1).await.unwrap().outcome();
 		assert_eq!(
 			out.previous, 0,
@@ -4673,7 +4656,7 @@ mod leader_tests {
 	async fn partial_commit_reconciles_to_completion_no_double_add_no_loss() {
 		let dir = slab_dir();
 		let (ps, paths) = participants(&dir, 3).await;
-		let leader = LeaderHarness::new(ps, 2, true, wstore());
+		let leader = LeaderHarness::new(ps, 2, true, wstore(&dir));
 		let k = ckey(b"verdict");
 		leader.arm_participant_commit_failure(2); // participant 2's commit marker fails once
 		let out = leader.fetch_add(wk(1), &k, 5).await.unwrap();
@@ -4768,7 +4751,7 @@ mod leader_tests {
 	async fn recorded_redrive_and_fresh_routing_are_distinct_after_ring_shift() {
 		let dir = slab_dir();
 		let (ps, paths) = participants(&dir, 3).await;
-		let leader = LeaderHarness::new(ps, 2, true, wstore());
+		let leader = LeaderHarness::new(ps, 2, true, wstore(&dir));
 		let k = ckey(b"verdict");
 		let p0 = leader.participants.first().unwrap().clone();
 		let p1 = leader.participants.get(1).unwrap().clone();
@@ -4932,7 +4915,7 @@ mod leader_tests {
 	async fn duplicate_retry_during_pending_replays_and_does_not_readd() {
 		let dir = slab_dir();
 		let (ps, _paths) = participants(&dir, 3).await;
-		let leader = LeaderHarness::new(ps, 2, true, wstore());
+		let leader = LeaderHarness::new(ps, 2, true, wstore(&dir));
 		let k = ckey(b"verdict");
 		leader.arm_participant_commit_failure(2); // leave the witness pending
 		let first = leader.fetch_add(wk(1), &k, 5).await.unwrap();
@@ -4958,7 +4941,7 @@ mod leader_tests {
 	async fn repeated_reconcile_is_idempotent() {
 		let dir = slab_dir();
 		let (ps, paths) = participants(&dir, 3).await;
-		let leader = LeaderHarness::new(ps, 2, true, wstore());
+		let leader = LeaderHarness::new(ps, 2, true, wstore(&dir));
 		let k = ckey(b"verdict");
 		leader.arm_participant_commit_failure(2);
 		leader.fetch_add(wk(1), &k, 5).await.unwrap();

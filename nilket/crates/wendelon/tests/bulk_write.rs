@@ -161,7 +161,7 @@ async fn read_bulk_responses(
 
 #[tokio::test]
 async fn bulk_write_round_trips_many_items_over_one_hrft_stream() {
-	let node = support::bootstrap_node("bulk-write-large", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("bulk-write-large", 1).await;
 	refresh_leases(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -221,7 +221,7 @@ async fn bulk_write_round_trips_many_items_over_one_hrft_stream() {
 
 #[tokio::test]
 async fn bulk_write_commit_hlcs_are_merged_by_the_leader() {
-	let node = support::bootstrap_node("bulk-write-hlc", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("bulk-write-hlc", 1).await;
 	refresh_leases(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();

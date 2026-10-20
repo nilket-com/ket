@@ -72,10 +72,15 @@ fn decode_single_value(frame: &[u8]) -> Vec<u8> {
 	values.value(0).to_vec()
 }
 
-async fn bootstrap_custom_node(tag: &str, node_id: u32, slab_max_bytes: u64) -> WendelonNode {
-	let mut cfg = NodeBootstrapConfig::dev(node_id, support::tempdir(tag), "127.0.0.1:0".into());
+async fn bootstrap_custom_node(
+	tag: &str,
+	node_id: u32,
+	slab_max_bytes: u64,
+) -> (support::TestDir, WendelonNode) {
+	let dir = support::tempdir(tag);
+	let mut cfg = NodeBootstrapConfig::dev(node_id, dir.to_path_buf(), "127.0.0.1:0".into());
 	cfg.slab_max_bytes = slab_max_bytes;
-	WendelonNode::bootstrap_single_node(cfg).await.unwrap()
+	(dir, WendelonNode::bootstrap_single_node(cfg).await.unwrap())
 }
 
 async fn bootstrap_retention_node(
@@ -83,12 +88,13 @@ async fn bootstrap_retention_node(
 	node_id: u32,
 	slab_max_bytes: u64,
 	retention_window: Duration,
-) -> WendelonNode {
-	let mut cfg = NodeBootstrapConfig::dev(node_id, support::tempdir(tag), "127.0.0.1:0".into());
+) -> (support::TestDir, WendelonNode) {
+	let dir = support::tempdir(tag);
+	let mut cfg = NodeBootstrapConfig::dev(node_id, dir.to_path_buf(), "127.0.0.1:0".into());
 	cfg.slab_max_bytes = slab_max_bytes;
 	cfg.mvcc_retention_policy =
 		wendelon::storage::MvccRetentionPolicy::FixedWindow(retention_window);
-	WendelonNode::bootstrap_single_node(cfg).await.unwrap()
+	(dir, WendelonNode::bootstrap_single_node(cfg).await.unwrap())
 }
 
 async fn bootstrap_retention_tiered_node(
@@ -96,20 +102,19 @@ async fn bootstrap_retention_tiered_node(
 	node_id: u32,
 	slab_max_bytes: u64,
 	retention_window: Duration,
-) -> (WendelonNode, std::path::PathBuf) {
-	let mut cfg = NodeBootstrapConfig::dev(node_id, support::tempdir(tag), "127.0.0.1:0".into());
+) -> (support::TestDir, support::TestDir, WendelonNode) {
+	let dir = support::tempdir(tag);
+	let mut cfg = NodeBootstrapConfig::dev(node_id, dir.to_path_buf(), "127.0.0.1:0".into());
 	cfg.slab_max_bytes = slab_max_bytes;
 	cfg.mvcc_retention_policy =
 		wendelon::storage::MvccRetentionPolicy::FixedWindow(retention_window);
 	let l2_dir = support::tempdir(&format!("{tag}-l2"));
 	cfg.l2 = Some(wendelon::storage::ObjectStoreConfig::LocalFs {
-		root: l2_dir.clone(),
+		root: l2_dir.to_path_buf(),
 	});
 	cfg.tiering.scan_interval = Duration::from_millis(20);
-	(
-		WendelonNode::bootstrap_single_node(cfg).await.unwrap(),
-		l2_dir,
-	)
+	let node = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+	(dir, l2_dir, node)
 }
 
 async fn seed_source(
@@ -209,8 +214,9 @@ fn stale_read_meta(as_of_hlc: HybridTimestamp, key: &[u8]) -> ReadRequestMeta {
 
 #[tokio::test]
 async fn background_reclaim_rewrites_mixed_slab_and_preserves_live_versions() {
-	let source = bootstrap_custom_node("tombstone-source-mixed", 81, 8 * 1024).await;
-	let dest = bootstrap_custom_node("tombstone-dest-mixed", 82, 64 * 1024 * 1024).await;
+	let (_source_dir, source) = bootstrap_custom_node("tombstone-source-mixed", 81, 8 * 1024).await;
+	let (_dest_dir, dest) =
+		bootstrap_custom_node("tombstone-dest-mixed", 82, 64 * 1024 * 1024).await;
 	support::wait_for_local_leader(&source).await;
 	support::wait_for_local_leader(&dest).await;
 	source.handles.migration_sweeper.abort();
@@ -316,8 +322,10 @@ async fn background_reclaim_rewrites_mixed_slab_and_preserves_live_versions() {
 
 #[tokio::test]
 async fn historical_reads_succeed_from_new_owner_after_source_reclaim() {
-	let source = bootstrap_custom_node("tombstone-source-history", 91, 12 * 1024).await;
-	let dest = bootstrap_custom_node("tombstone-dest-history", 92, 64 * 1024 * 1024).await;
+	let (_source_dir, source) =
+		bootstrap_custom_node("tombstone-source-history", 91, 12 * 1024).await;
+	let (_dest_dir, dest) =
+		bootstrap_custom_node("tombstone-dest-history", 92, 64 * 1024 * 1024).await;
 	support::wait_for_local_leader(&source).await;
 	support::wait_for_local_leader(&dest).await;
 	source.handles.migration_sweeper.abort();
@@ -442,7 +450,7 @@ async fn historical_reads_succeed_from_new_owner_after_source_reclaim() {
 
 #[tokio::test]
 async fn mvcc_retention_pruning_is_audit_logged_and_preserves_retained_window_reads() {
-	let node = bootstrap_retention_node(
+	let (_node_dir, node) = bootstrap_retention_node(
 		"mvcc-retention-prune",
 		93,
 		8 * 1024,
@@ -537,7 +545,7 @@ async fn mvcc_retention_pruning_is_audit_logged_and_preserves_retained_window_re
 /// that were merely read - or gated in the wrong place - fails here.
 #[tokio::test]
 async fn paused_mvcc_retention_prunes_nothing_and_leaves_reads_unchanged() {
-	let node = bootstrap_retention_node(
+	let (_node_dir, node) = bootstrap_retention_node(
 		"mvcc-retention-paused",
 		94,
 		8 * 1024,
@@ -629,7 +637,7 @@ async fn paused_mvcc_retention_prunes_nothing_and_leaves_reads_unchanged() {
 
 #[tokio::test]
 async fn mvcc_retention_fully_pruned_tiered_slab_retires_end_to_end() {
-	let (node, l2_dir) = bootstrap_retention_tiered_node(
+	let (_node_dir, l2_dir, node) = bootstrap_retention_tiered_node(
 		"mvcc-retention-retire-e2e",
 		94,
 		8 * 1024,
@@ -678,7 +686,7 @@ async fn mvcc_retention_fully_pruned_tiered_slab_retires_end_to_end() {
 	seed_source(&node.slab, key, latest, b"latest-value").await;
 
 	let object_store: Arc<dyn wendelon::storage::ObjectStore> =
-		Arc::new(wendelon::storage::LocalFsObjectStore::new(&l2_dir).unwrap());
+		Arc::new(wendelon::storage::LocalFsObjectStore::new(l2_dir.to_path_buf()).unwrap());
 	let sweeper = wendelon::storage::SlabSweeper::new(
 		node.slab.clone(),
 		object_store,

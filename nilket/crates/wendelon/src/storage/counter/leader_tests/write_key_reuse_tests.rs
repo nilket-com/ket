@@ -20,6 +20,8 @@ const REUSED: u64 = 1;
 struct Dirs {
 	wdir: PathBuf,
 	path: PathBuf,
+	/// Keeps both paths alive across the fixture's restarts.
+	_dir: crate::test_support::TestDir,
 }
 
 fn dirs() -> Dirs {
@@ -27,6 +29,7 @@ fn dirs() -> Dirs {
 	Dirs {
 		wdir: dir.join("witnesses"),
 		path: dir.join("slab_p0.wnd"),
+		_dir: dir,
 	}
 }
 
@@ -138,7 +141,7 @@ async fn reused_write_key_on_the_same_key_with_another_delta_after_restart_is_no
 async fn known_write_key_with_zero_delta_conflicts() {
 	let dir = slab_dir();
 	let (ps, _paths) = participants(&dir, 1).await;
-	let leader = LeaderHarness::new(ps, 1, true, wstore());
+	let leader = LeaderHarness::new(ps, 1, true, wstore(&dir));
 	let a = ckey(b"zero");
 	leader.fetch_add(wk(1), &a, 5).await.unwrap();
 	assert_write_key_conflict("zero delta, same key", leader.fetch_add(wk(1), &a, 0).await);
@@ -294,7 +297,7 @@ async fn keyed_applied_record_after_restart_refuses_other_adds() {
 async fn write_key_is_recorded_when_the_add_fails_after_its_witness() {
 	let dir = slab_dir();
 	let (ps, _paths) = participants(&dir, 1).await;
-	let leader = LeaderHarness::new(ps, 1, true, wstore());
+	let leader = LeaderHarness::new(ps, 1, true, wstore(&dir));
 	let a = ckey(b"window-a");
 	let b = ckey(b"window-b");
 	leader.arm_participant_commit_visibility_failure(0);
@@ -330,6 +333,7 @@ async fn race_one_write_key(
 	second_delta: u64,
 	bypass_gate: bool,
 ) -> (
+	crate::test_support::TestDir,
 	Result<CounterAddResult, CounterLeaderError>,
 	Result<CounterAddResult, CounterLeaderError>,
 	Vec<(u64, CounterKey)>,
@@ -337,7 +341,7 @@ async fn race_one_write_key(
 ) {
 	let dir = slab_dir();
 	let (ps, _paths) = participants(&dir, 1).await;
-	let leader = Arc::new(LeaderHarness::new(ps, 1, true, wstore()));
+	let leader = Arc::new(LeaderHarness::new(ps, 1, true, wstore(&dir)));
 	leader
 		.leader
 		.write_key_switches
@@ -398,7 +402,7 @@ async fn race_one_write_key(
 	let first = first.await.unwrap();
 	let second = second.await.unwrap();
 	let tentatives = leader.participant_tentatives(0);
-	(first, second, tentatives, leader)
+	(dir, first, second, tentatives, leader)
 }
 
 // T-K3: one add per write key in flight. The second request under the parked
@@ -433,7 +437,8 @@ async fn concurrent_requests_under_one_write_key_admit_one_add() {
 			Err(CounterLeaderError::WriteKeyConflict),
 		),
 	] {
-		let (first, second, tentatives, leader) = race_one_write_key(&key, delta, false).await;
+		let (_dir, first, second, tentatives, leader) =
+			race_one_write_key(&key, delta, false).await;
 		assert_eq!(first, Ok(CounterAddResult::Applied(applied)), "{what}");
 		assert_eq!(second, expected, "{what}");
 		assert!(
@@ -455,7 +460,7 @@ async fn concurrent_requests_under_one_write_key_admit_one_add() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_the_write_key_gate_one_write_key_applies_two_adds() {
 	let b = ckey(b"race-b");
-	let (first, second, tentatives, leader) = race_one_write_key(&b, 7, true).await;
+	let (_dir, first, second, tentatives, leader) = race_one_write_key(&b, 7, true).await;
 	assert_eq!(
 		first,
 		Ok(CounterAddResult::Applied(CounterAddOutcome {
@@ -484,7 +489,7 @@ async fn write_key_gates_are_reclaimed_after_every_request() {
 	for keep in [false, true] {
 		let dir = slab_dir();
 		let (ps, _paths) = participants(&dir, 1).await;
-		let leader = LeaderHarness::new(ps, 1, true, wstore());
+		let leader = LeaderHarness::new(ps, 1, true, wstore(&dir));
 		leader
 			.leader
 			.write_key_switches

@@ -71,7 +71,8 @@ fn bootstrap_cfg(
 	node_id: u32,
 	secret: [u8; 32],
 	trusted_key: [u8; 32],
-) -> NodeBootstrapConfig {
+) -> (support::TestDir, NodeBootstrapConfig) {
+	let scratch = support::tempdir(tag);
 	let mut trusted_lease_signers = BTreeMap::new();
 	trusted_lease_signers.insert(node_id, trusted_key);
 	let transfer_signing_secret = dev_transfer_signing_secret(node_id);
@@ -80,12 +81,12 @@ fn bootstrap_cfg(
 		node_id,
 		transfer_verifying_key_bytes(transfer_signing_secret),
 	);
-	let mut cfg = NodeBootstrapConfig::dev(node_id, support::tempdir(tag), "127.0.0.1:0".into());
+	let mut cfg = NodeBootstrapConfig::dev(node_id, scratch.to_path_buf(), "127.0.0.1:0".into());
 	cfg.lease_signing_secret = secret;
 	cfg.trusted_lease_signers = trusted_lease_signers;
 	cfg.transfer_signing_secret = transfer_signing_secret;
 	cfg.trusted_transfer_signers = trusted_transfer_signers;
-	cfg
+	(scratch, cfg)
 }
 
 fn unsigned_lease(node: &WendelonNode) -> LeaseDescriptor {
@@ -106,14 +107,8 @@ fn unsigned_lease(node: &WendelonNode) -> LeaseDescriptor {
 async fn leader_issues_signed_lease_that_data_ring_accepts() {
 	let secret = dev_lease_signing_secret(101);
 	let trusted = lease_verifying_key_bytes(secret);
-	let node = WendelonNode::bootstrap_single_node(bootstrap_cfg(
-		"lease-signing-happy",
-		101,
-		secret,
-		trusted,
-	))
-	.await
-	.unwrap();
+	let (_scratch_1, cfg_1) = bootstrap_cfg("lease-signing-happy", 101, secret, trusted);
+	let node = WendelonNode::bootstrap_single_node(cfg_1).await.unwrap();
 	support::wait_for_local_leader(&node).await;
 	node.handles.lease_manager.abort();
 
@@ -152,14 +147,8 @@ async fn leader_issues_signed_lease_that_data_ring_accepts() {
 async fn tampered_signed_lease_is_rejected_at_write_gate() {
 	let secret = dev_lease_signing_secret(111);
 	let trusted = lease_verifying_key_bytes(secret);
-	let node = WendelonNode::bootstrap_single_node(bootstrap_cfg(
-		"lease-signing-tamper",
-		111,
-		secret,
-		trusted,
-	))
-	.await
-	.unwrap();
+	let (_scratch_2, cfg_2) = bootstrap_cfg("lease-signing-tamper", 111, secret, trusted);
+	let node = WendelonNode::bootstrap_single_node(cfg_2).await.unwrap();
 	support::wait_for_local_leader(&node).await;
 	node.handles.lease_manager.abort();
 	node.data_server.lease_cache().write().unwrap().clear();
@@ -191,14 +180,9 @@ async fn wrong_key_signed_lease_is_rejected_at_write_gate() {
 	let trusted_secret = dev_lease_signing_secret(121);
 	let wrong_secret = dev_lease_signing_secret(122);
 	let trusted = lease_verifying_key_bytes(trusted_secret);
-	let node = WendelonNode::bootstrap_single_node(bootstrap_cfg(
-		"lease-signing-wrong-key",
-		121,
-		trusted_secret,
-		trusted,
-	))
-	.await
-	.unwrap();
+	let (_scratch_3, cfg_3) =
+		bootstrap_cfg("lease-signing-wrong-key", 121, trusted_secret, trusted);
+	let node = WendelonNode::bootstrap_single_node(cfg_3).await.unwrap();
 	support::wait_for_local_leader(&node).await;
 	node.handles.lease_manager.abort();
 	node.data_server.lease_cache().write().unwrap().clear();

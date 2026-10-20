@@ -1,3 +1,5 @@
+#[path = "../src/test_support/test_dir.rs"]
+mod test_dir;
 use async_trait::async_trait;
 
 async fn open_test_manager(config: SlabManagerConfig) -> std::io::Result<SlabManager> {
@@ -6,7 +8,6 @@ async fn open_test_manager(config: SlabManagerConfig) -> std::io::Result<SlabMan
 }
 use openraft::storage::RaftStateMachine;
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -22,14 +23,8 @@ use wendelon::storage::{
 	SlabManagerConfig, SlabSweeper, StorageEngine, SweeperConfig, TierCommitter, spawn_io_thread,
 };
 
-fn fresh_dir(tag: &str) -> PathBuf {
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-l2-rehydration-{tag}-{}-{}",
-		std::process::id(),
-		uuid::Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+fn fresh_dir(tag: &str) -> test_dir::TestDir {
+	test_dir::TestDir::new(&format!("wendelon-l2-rehydration-{tag}"))
 }
 
 fn hlc() -> HybridTimestamp {
@@ -177,22 +172,24 @@ impl TierCommitter for DirectApplyCommitter {
 async fn build_tiered_manager(
 	rehydration: RehydrationPolicy,
 ) -> (
+	test_dir::TestDir,
+	test_dir::TestDir,
 	Arc<SlabManager>,
 	Arc<CountingObjectStore>,
 	SlabSweeper,
-	PathBuf,
 	wendelon::storage::RecordLocation,
 	Vec<u8>,
 ) {
 	let l1_dir = fresh_dir("l1");
 	let l2_dir = fresh_dir("l2");
 	let io = spawn_io_thread(64).unwrap();
-	let l2_inner: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+	let l2_inner: Arc<dyn ObjectStore> =
+		Arc::new(LocalFsObjectStore::new(l2_dir.to_path_buf()).unwrap());
 	let l2 = Arc::new(CountingObjectStore::new(l2_inner));
 	let l2_store: Arc<dyn ObjectStore> = l2.clone();
 	let manager = Arc::new(
 		open_test_manager(SlabManagerConfig {
-			dir: l1_dir.clone(),
+			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1,
 			io,
 			l2: Some(l2_store.clone()),
@@ -252,7 +249,7 @@ async fn build_tiered_manager(
 	);
 	assert!(manager.is_tiered(location.slab_id).await);
 
-	(manager, l2, sweeper, l1_dir, location, original)
+	(l2_dir, l1_dir, manager, l2, sweeper, location, original)
 }
 
 #[tokio::test]
@@ -262,7 +259,8 @@ async fn cold_l2_read_uses_head_and_range_fetches_before_rehydration() {
 		min_local_residency: Duration::from_secs(60),
 		tail_read_window_bytes: 280,
 	};
-	let (manager, l2, _sweeper, _l1_dir, location, original) = build_tiered_manager(policy).await;
+	let (_l2_dir, _l1_dir, manager, l2, _sweeper, location, original) =
+		build_tiered_manager(policy).await;
 
 	let before = l2.snapshot();
 	let first = manager.read(location).await.unwrap();
@@ -282,7 +280,8 @@ async fn multiple_l2_reads_trigger_promotion_to_l1() {
 		min_local_residency: Duration::from_secs(60),
 		tail_read_window_bytes: RehydrationPolicy::default().tail_read_window_bytes,
 	};
-	let (manager, _l2, _sweeper, l1_dir, location, original) = build_tiered_manager(policy).await;
+	let (_l2_dir, l1_dir, manager, _l2, _sweeper, location, original) =
+		build_tiered_manager(policy).await;
 
 	assert!(!manager.is_rehydrated(location.slab_id).await);
 
@@ -306,7 +305,8 @@ async fn promoted_slab_is_served_from_local_and_metadata_stays_tiered() {
 		min_local_residency: Duration::from_secs(60),
 		tail_read_window_bytes: RehydrationPolicy::default().tail_read_window_bytes,
 	};
-	let (manager, l2, _sweeper, _l1_dir, location, original) = build_tiered_manager(policy).await;
+	let (_l2_dir, _l1_dir, manager, l2, _sweeper, location, original) =
+		build_tiered_manager(policy).await;
 
 	manager.read(location).await.unwrap();
 	manager.read(location).await.unwrap();
@@ -331,7 +331,8 @@ async fn thrash_guard_blocks_immediate_re_demote() {
 		min_local_residency: Duration::from_millis(50),
 		tail_read_window_bytes: RehydrationPolicy::default().tail_read_window_bytes,
 	};
-	let (manager, _l2, sweeper, l1_dir, location, original) = build_tiered_manager(policy).await;
+	let (_l2_dir, l1_dir, manager, _l2, sweeper, location, original) =
+		build_tiered_manager(policy).await;
 
 	manager.read(location).await.unwrap();
 	manager.read(location).await.unwrap();

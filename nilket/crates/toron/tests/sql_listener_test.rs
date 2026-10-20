@@ -184,7 +184,7 @@ async fn toron_sql_select_from_bootstrapped_descriptor_executes_over_wire() {
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
 
-	let mut config = toron_config_with_descriptor(descriptor.clone(), true);
+	let (mut config, _descriptor_dir) = toron_config_with_descriptor(descriptor.clone(), true);
 	let audit_path = enable_audit(&mut config, "sql-success-audit");
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
@@ -233,7 +233,7 @@ async fn rune_source_executes_over_the_authenticated_query_boundary_with_typed_f
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
 
-	let mut config = toron_config_with_descriptor(descriptor, true);
+	let (mut config, _descriptor_dir) = toron_config_with_descriptor(descriptor, true);
 	let audit_path = enable_audit(&mut config, "product-0003-rune-source");
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
@@ -513,7 +513,7 @@ async fn order_by_and_top_k_return_ordered_rows_over_live_wendelon() {
 	// over a real Wendelon node return the right rows in the right order,
 	// within the statement timeout.
 
-	let mut config = toron_config_with_descriptor(descriptor, true);
+	let (mut config, _descriptor_dir) = toron_config_with_descriptor(descriptor, true);
 	let audit_path = enable_audit(&mut config, "adr535-global-sort");
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
@@ -624,7 +624,7 @@ async fn real_statement_timeout_is_not_laundered_into_a_planning_refusal() {
 		.await
 		.expect("Wendelon shutdown bound")
 		.expect("Wendelon shutdown");
-	std::fs::remove_dir_all(data_dir).expect("remove stopped Wendelon root");
+	std::fs::remove_dir_all(&*data_dir).expect("remove stopped Wendelon root");
 	descriptor_scratch
 		.complete(std::future::ready(Ok::<(), std::io::Error>(())))
 		.await;
@@ -640,7 +640,7 @@ async fn fail_closed_sql_success_audit_failure_returns_internal_before_result_ba
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
 
-	let mut config = toron_config_with_descriptor(descriptor.clone(), true);
+	let (mut config, _descriptor_dir) = toron_config_with_descriptor(descriptor.clone(), true);
 	enable_fail_closed_unavailable_audit(&mut config, "sql-fail-closed-success-audit");
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
@@ -1123,7 +1123,7 @@ async fn remote_sql_tenant_connection_cap_closes_excess_after_san_resolution() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_declared_request_length_rejected_before_allocation_or_decode() {
-	let mut config = toron_config_with_descriptor(descriptor(), true);
+	let (mut config, _descriptor_dir) = toron_config_with_descriptor(descriptor(), true);
 	let sql = config.sql.as_mut().expect("sql config");
 	sql.max_request_frame_bytes = NonZeroU32::new(8).expect("request cap");
 	sql.max_statement_bytes = NonZeroU32::new(8).expect("statement cap");
@@ -1158,7 +1158,7 @@ async fn oversized_declared_request_length_rejected_before_allocation_or_decode(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_decoded_execute_statement_returns_resource_exhausted_without_planning() {
-	let mut config = toron_config_with_descriptor(descriptor(), true);
+	let (mut config, _descriptor_dir) = toron_config_with_descriptor(descriptor(), true);
 	let sql = config.sql.as_mut().expect("sql config");
 	sql.max_request_frame_bytes = NonZeroU32::new(4096).expect("request cap");
 	sql.max_statement_bytes = NonZeroU32::new(8).expect("statement cap");
@@ -1184,7 +1184,7 @@ async fn oversized_decoded_execute_statement_returns_resource_exhausted_without_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audit_records_planned_error_without_raw_sql() {
-	let mut config = toron_config_with_descriptor(descriptor(), true);
+	let (mut config, _descriptor_dir) = toron_config_with_descriptor(descriptor(), true);
 	let audit_path = enable_audit(&mut config, "planned-error-audit");
 	let daemon = ToronDaemon::start(config).await.expect("start daemon");
 	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
@@ -1212,7 +1212,7 @@ async fn audit_records_planned_error_without_raw_sql() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_below_request_frame_cap_is_not_statement_capped() {
-	let mut config = toron_config_with_descriptor(descriptor(), true);
+	let (mut config, _descriptor_dir) = toron_config_with_descriptor(descriptor(), true);
 	let sql = config.sql.as_mut().expect("sql config");
 	sql.max_request_frame_bytes = NonZeroU32::new(4096).expect("request cap");
 	sql.max_statement_bytes = NonZeroU32::new(1).expect("statement cap");
@@ -1466,12 +1466,11 @@ async fn adr0093_severed_drop_response_recovers_across_a_fresh_toron_run() {
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
 
-	let daemon = ToronDaemon::start_with_wendelon_client_for_harness(
-		toron_config_with_descriptor(descriptor.clone(), true),
-		Arc::clone(&fixture.client),
-	)
-	.await
-	.expect("start first Toron run");
+	let (config_1, _descriptor_dir_1) = toron_config_with_descriptor(descriptor.clone(), true);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config_1, Arc::clone(&fixture.client))
+			.await
+			.expect("start first Toron run");
 	let endpoint = daemon.handle().sql_endpoint.expect("SQL endpoint");
 	execute_sql(
 		endpoint,
@@ -1541,12 +1540,11 @@ async fn adr0093_severed_drop_response_recovers_across_a_fresh_toron_run() {
 	// The originating incident crossed process runs. Rebuild Toron's registry
 	// from its persisted bootstrap while Wendelon's finalized outcome remains.
 	daemon.shutdown().await.expect("shutdown first Toron run");
-	let daemon = ToronDaemon::start_with_wendelon_client_for_harness(
-		toron_config_with_descriptor(descriptor, true),
-		Arc::clone(&fixture.client),
-	)
-	.await
-	.expect("start recovery Toron run");
+	let (config_2, _descriptor_dir_2) = toron_config_with_descriptor(descriptor, true);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config_2, Arc::clone(&fixture.client))
+			.await
+			.expect("start recovery Toron run");
 	let endpoint = daemon.handle().sql_endpoint.expect("SQL endpoint");
 	execute_sql(endpoint, "DROP TABLE storage_execution")
 		.await
@@ -1583,12 +1581,11 @@ async fn adr0093_pre_recovery_materialization_is_readable_after_registry_rebuild
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
 
-	let daemon = ToronDaemon::start_with_wendelon_client_for_harness(
-		toron_config_with_descriptor(descriptor.clone(), true),
-		Arc::clone(&fixture.client),
-	)
-	.await
-	.expect("start incident Toron run");
+	let (config_3, _descriptor_dir_3) = toron_config_with_descriptor(descriptor.clone(), true);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config_3, Arc::clone(&fixture.client))
+			.await
+			.expect("start incident Toron run");
 	let endpoint = daemon.handle().sql_endpoint.expect("SQL endpoint");
 	execute_sql(
 		endpoint,
@@ -1621,7 +1618,8 @@ async fn adr0093_pre_recovery_materialization_is_readable_after_registry_rebuild
 	// No stale descriptor bootstrap: this is a fresh coordinator/registry
 	// rebuilt lazily from persisted Wendelon state, matching the multi-run viz
 	// incident rather than a warm same-process TableAlreadyExists result.
-	let mut recovery_config = toron_config_with_descriptor(descriptor, true);
+	let (mut recovery_config, _recovery_descriptor_dir) =
+		toron_config_with_descriptor(descriptor, true);
 	recovery_config.catalog.descriptor_bootstrap_path = None;
 	let daemon = ToronDaemon::start_with_wendelon_client_for_harness(
 		recovery_config,
@@ -1837,7 +1835,9 @@ struct SqlResponse {
 }
 
 fn enable_audit(config: &mut ToronBootstrapConfig, tag: &str) -> PathBuf {
-	let dir = fresh_dir(tag);
+	// The detached audit sink consumer has no public join, so its root stays retained:
+	// producer shutdown is not proof that the consumer has exited.
+	let dir = fresh_dir(tag).retain();
 	let audit_path = dir.join("toron-audit.ndjson");
 	config.audit = AuditConfig::Enabled(Box::new(AuditEnabledConfig {
 		node_id: "toron-n-1".to_string(),
@@ -1852,7 +1852,8 @@ fn enable_audit(config: &mut ToronBootstrapConfig, tag: &str) -> PathBuf {
 }
 
 fn enable_fail_closed_unavailable_audit(config: &mut ToronBootstrapConfig, tag: &str) {
-	let audit_path_that_is_a_directory = fresh_dir(tag);
+	// Retained like every audit root: the sink consumer has no public join.
+	let audit_path_that_is_a_directory = fresh_dir(tag).retain();
 	config.audit = AuditConfig::Enabled(Box::new(AuditEnabledConfig {
 		node_id: "toron-n-1".to_string(),
 		node_numeric_id: 1,
@@ -2181,7 +2182,7 @@ impl TestPki {
 fn toron_config_with_descriptor(
 	descriptor: TableSchemaDescriptor,
 	include_self_worker: bool,
-) -> ToronBootstrapConfig {
+) -> (ToronBootstrapConfig, TestDir) {
 	toron_config_with_descriptor_for_tenant(descriptor, ToronTenantId(1), include_self_worker)
 }
 
@@ -2189,9 +2190,13 @@ fn toron_config_with_descriptor_for_tenant(
 	descriptor: TableSchemaDescriptor,
 	bootstrap_tenant: ToronTenantId,
 	include_self_worker: bool,
-) -> ToronBootstrapConfig {
-	let descriptor_path = write_descriptor_bootstrap_for_tenant(bootstrap_tenant, descriptor);
-	toron_config_with_descriptor_path(descriptor_path, include_self_worker)
+) -> (ToronBootstrapConfig, TestDir) {
+	let (dir, descriptor_path) =
+		write_descriptor_bootstrap_for_tenant(bootstrap_tenant, descriptor);
+	(
+		toron_config_with_descriptor_path(descriptor_path, include_self_worker),
+		dir,
+	)
 }
 
 fn toron_config_with_descriptor_path(
@@ -2350,7 +2355,7 @@ fn connectable_loopback_addr(addr: SocketAddr) -> SocketAddr {
 fn write_descriptor_bootstrap_for_tenant(
 	tenant_id: ToronTenantId,
 	descriptor: TableSchemaDescriptor,
-) -> PathBuf {
+) -> (TestDir, PathBuf) {
 	let dir = fresh_dir("descriptor-bootstrap");
 	let path = dir.join("descriptors.json");
 	let bootstrap = DescriptorBootstrap {
@@ -2363,13 +2368,13 @@ fn write_descriptor_bootstrap_for_tenant(
 	};
 	std::fs::write(&path, serde_json::to_string_pretty(&bootstrap).unwrap())
 		.expect("write descriptor bootstrap");
-	path
+	(dir, path)
 }
 
 struct LiveWendelonFixture {
 	node: WendelonNode,
 	client: Arc<Client>,
-	data_dir: PathBuf,
+	data_dir: TestDir,
 }
 
 impl LiveWendelonFixture {
@@ -2378,7 +2383,7 @@ impl LiveWendelonFixture {
 		let address = format!("sim://node-{node_id}");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			node_id,
-			data_dir.clone(),
+			data_dir.to_path_buf(),
 			address.clone(),
 		))
 		.await
@@ -2426,7 +2431,7 @@ impl LiveWendelonFixture {
 
 	fn shutdown(self) {
 		self.node.handles.abort();
-		let _ = std::fs::remove_dir_all(self.data_dir);
+		drop(self.data_dir);
 	}
 }
 
@@ -2651,14 +2656,8 @@ fn batch_from_rows(rows: &[(i64, Option<i32>, Option<&str>, i64)]) -> RecordBatc
 	.expect("batch")
 }
 
-fn fresh_dir(tag: &str) -> PathBuf {
-	let dir = std::env::temp_dir().join(format!(
-		"toron-sql-listener-{tag}-{}-{}",
-		std::process::id(),
-		rand::random::<u64>()
-	));
-	std::fs::create_dir_all(&dir).expect("create temp dir");
-	dir
+fn fresh_dir(tag: &str) -> TestDir {
+	TestDir::new(&format!("toron-sql-listener-{tag}"))
 }
 
 /// ADR 577 real-time exhibit. Opt-in: it deliberately runs past the 30-second
@@ -2705,7 +2704,7 @@ async fn adr0577_live_long_queries_reach_their_statement_deadline() {
 
 	// Case 1: silent well past 30s, with a statement deadline above it. Before
 	// this cut the connection died at 30.01s regardless of that setting.
-	let mut config = toron_config_with_descriptor(descriptor.clone(), true);
+	let (mut config, _descriptor_dir) = toron_config_with_descriptor(descriptor.clone(), true);
 	config.sql.as_mut().expect("SQL config").statement_timeout = Duration::from_secs(180);
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
@@ -2769,7 +2768,7 @@ async fn adr0577_live_long_queries_reach_their_statement_deadline() {
 	// caller may raise the deadline above whatever number the transport picked.
 	// The override stays under the client's own 120s deadline, so success also
 	// shows that deadline remains the outer bound.
-	let mut config = toron_config_with_descriptor(descriptor, true);
+	let (mut config, _descriptor_dir) = toron_config_with_descriptor(descriptor, true);
 	config.sql.as_mut().expect("SQL config").statement_timeout = Duration::from_secs(60);
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
@@ -2826,19 +2825,20 @@ mod mutation_integrity_pins {
 		}
 	}
 
-	async fn start(node: u32) -> (LiveWendelonFixture, ToronDaemon, ToronClient) {
+	async fn start(node: u32) -> (TestDir, LiveWendelonFixture, ToronDaemon, ToronClient) {
 		let fixture = LiveWendelonFixture::start(node).await;
 		let descriptor = descriptor();
 		install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+		let (config, descriptor_dir) = toron_config_with_descriptor(descriptor, true);
 		let daemon = ToronDaemon::start_with_wendelon_client_for_harness(
-			toron_config_with_descriptor(descriptor, true),
+			config,
 			Arc::clone(&fixture.client),
 		)
 		.await
 		.expect("SQL daemon");
 		let client =
 			ToronClient::loopback(daemon.handle().sql_endpoint.unwrap().to_string()).unwrap();
-		(fixture, daemon, client)
+		(descriptor_dir, fixture, daemon, client)
 	}
 
 	async fn start_owned(
@@ -3721,7 +3721,7 @@ mod mutation_integrity_pins {
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	#[ignore = "4097 public SQL mutations; run separately with an emitting bounded capacity control"]
 	async fn sql_capacity_eviction_keeps_a_warm_replay_but_loses_detailed_resolution() {
-		let (fixture, daemon, client) = start(6303).await;
+		let (_descriptor_dir, fixture, daemon, client) = start(6303).await;
 		let started = std::time::Instant::now();
 		let oldest = QueryId::new();
 		let original = "INSERT INTO storage_execution (id, amount, region, ts) VALUES (6303, 0, 'capacity-probe', 1599998400000)";

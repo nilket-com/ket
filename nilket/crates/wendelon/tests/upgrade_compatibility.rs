@@ -42,10 +42,11 @@ fn trusted_cfg(
 	all_nodes: &[u32],
 	current_protocol: u16,
 	min_compatible_protocol: u16,
-) -> NodeBootstrapConfig {
+) -> (support::TestDir, NodeBootstrapConfig) {
+	let scratch = support::tempdir(tag);
 	let mut cfg = NodeBootstrapConfig::dev(
 		node_id,
-		support::tempdir(tag),
+		scratch.to_path_buf(),
 		advertise_address.to_string(),
 	)
 	.with_protocol_window(current_protocol, min_compatible_protocol);
@@ -58,7 +59,7 @@ fn trusted_cfg(
 		cfg.trusted_transfer_signers
 			.insert(*trusted_node_id, transfer_verifying_key_bytes(transfer));
 	}
-	cfg
+	(scratch, cfg)
 }
 
 async fn bootstrap_node(
@@ -291,15 +292,14 @@ async fn send_join_request(
 #[tokio::test]
 async fn supported_protocol_window_negotiates_and_joined_node_communicates() {
 	let registry = support::shared_loopback_registry();
-	let leader = WendelonNode::bootstrap_with_provider(
-		trusted_cfg("upgrade-leader", 1, "loopback://node-1", &[1, 2], 2, 1),
-		provider_for(1, registry.clone()),
-	)
-	.await
-	.unwrap();
+	let (_scratch_1, cfg_1) = trusted_cfg("upgrade-leader", 1, "loopback://node-1", &[1, 2], 2, 1);
+	let leader = WendelonNode::bootstrap_with_provider(cfg_1, provider_for(1, registry.clone()))
+		.await
+		.unwrap();
 	support::wait_for_local_leader(&leader).await;
 
-	let mut join_cfg = trusted_cfg("upgrade-joiner", 2, "loopback://node-2", &[1, 2], 1, 1);
+	let (_join_cfg_dir, mut join_cfg) =
+		trusted_cfg("upgrade-joiner", 2, "loopback://node-2", &[1, 2], 1, 1);
 	join_cfg.cluster = ClusterBootstrapConfig::Join {
 		seeds: vec![SeedNodeConfig {
 			node_id: 1,
@@ -335,19 +335,17 @@ async fn supported_protocol_window_negotiates_and_joined_node_communicates() {
 #[tokio::test]
 async fn incompatible_protocol_window_fails_fast_and_explicitly() {
 	let registry = support::shared_loopback_registry();
-	let leader = WendelonNode::bootstrap_with_provider(
-		trusted_cfg(
-			"upgrade-incompat-leader",
-			1,
-			"loopback://node-1",
-			&[1],
-			3,
-			2,
-		),
-		provider_for(1, registry.clone()),
-	)
-	.await
-	.unwrap();
+	let (_scratch_2, cfg_2) = trusted_cfg(
+		"upgrade-incompat-leader",
+		1,
+		"loopback://node-1",
+		&[1],
+		3,
+		2,
+	);
+	let leader = WendelonNode::bootstrap_with_provider(cfg_2, provider_for(1, registry.clone()))
+		.await
+		.unwrap();
 	support::wait_for_local_leader(&leader).await;
 
 	let resp = send_join_request(
@@ -365,7 +363,7 @@ async fn incompatible_protocol_window_fails_fast_and_explicitly() {
 	assert_eq!(resp.local_protocol, ProtocolVersionWindow::new(3, 2));
 	assert_eq!(resp.negotiated_protocol, None);
 
-	let mut join_cfg = trusted_cfg(
+	let (_join_cfg_dir, mut join_cfg) = trusted_cfg(
 		"upgrade-incompat-joiner",
 		2,
 		"loopback://node-2",
@@ -400,15 +398,18 @@ async fn rolling_restart_with_compatible_protocol_window_preserves_control_write
 	let node3_addr = "loopback://rolling-upgrade-node-3";
 	let all_nodes = [1u32, 2, 3];
 
-	let node1_v1 = trusted_cfg("rolling-upgrade-node1", 1, node1_addr, &all_nodes, 1, 1);
-	let mut node2_v1 = trusted_cfg("rolling-upgrade-node2", 2, node2_addr, &all_nodes, 1, 1);
+	let (_node1_v1_dir, node1_v1) =
+		trusted_cfg("rolling-upgrade-node1", 1, node1_addr, &all_nodes, 1, 1);
+	let (_node2_v1_dir, mut node2_v1) =
+		trusted_cfg("rolling-upgrade-node2", 2, node2_addr, &all_nodes, 1, 1);
 	node2_v1.cluster = ClusterBootstrapConfig::Join {
 		seeds: vec![SeedNodeConfig {
 			node_id: 1,
 			address: node1_addr.into(),
 		}],
 	};
-	let mut node3_v1 = trusted_cfg("rolling-upgrade-node3", 3, node3_addr, &all_nodes, 1, 1);
+	let (_node3_v1_dir, mut node3_v1) =
+		trusted_cfg("rolling-upgrade-node3", 3, node3_addr, &all_nodes, 1, 1);
 	node3_v1.cluster = ClusterBootstrapConfig::Join {
 		seeds: vec![SeedNodeConfig {
 			node_id: 1,

@@ -279,15 +279,11 @@ mod tests {
 	use super::*;
 	use crate::integration::compute::SchemaGeneration;
 	use crate::schema::{TableObjectId, TenantId};
-	use std::sync::atomic::{AtomicU64, Ordering};
 
-	fn progress_path(tag: &str) -> PathBuf {
-		static NEXT: AtomicU64 = AtomicU64::new(0);
-		std::env::temp_dir().join(format!(
-			"wendelon-{tag}-{}-{}.redb",
-			std::process::id(),
-			NEXT.fetch_add(1, Ordering::Relaxed)
-		))
+	fn progress_path(tag: &str) -> (crate::test_support::TestDir, PathBuf) {
+		let dir = crate::test_support::TestDir::new(&format!("wendelon-{tag}"));
+		let path = dir.join("progress.redb");
+		(dir, path)
 	}
 
 	fn operation() -> DropOperationId {
@@ -300,7 +296,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn adr0095_absent_and_corrupt_progress_are_distinct_and_rebuild_is_explicit() {
-		let store = DropReclaimProgressStore::open(progress_path("drop-progress-corrupt")).unwrap();
+		let (_dir, path) = progress_path("drop-progress-corrupt");
+		let store = DropReclaimProgressStore::open(path).unwrap();
 		let absent = store.load_or_start(operation(), 11, 7).await.unwrap();
 		assert!(matches!(absent, DropReclaimProgressLoad::Absent(_)));
 		store
@@ -314,7 +311,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn adr0095_stale_epoch_cannot_persist_progress() {
-		let store = DropReclaimProgressStore::open(progress_path("drop-progress-epoch")).unwrap();
+		let (_dir, path) = progress_path("drop-progress-epoch");
+		let store = DropReclaimProgressStore::open(path).unwrap();
 		let progress = DropReclaimProgress::start(operation(), 11, 7);
 		let error = store.store_current_epoch(progress, 8).await.unwrap_err();
 		assert_eq!(error.kind(), ErrorKind::PermissionDenied);
@@ -322,7 +320,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn adr0095_progress_reopens_and_old_epoch_cursor_remains_resumable() {
-		let path = progress_path("drop-progress-reopen");
+		let (_dir, path) = progress_path("drop-progress-reopen");
 		let store = DropReclaimProgressStore::open(path.clone()).unwrap();
 		let mut progress = DropReclaimProgress::start(operation(), 11, 7);
 		progress.phase = DropReclaimPhase::TieredL2;

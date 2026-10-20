@@ -1,3 +1,5 @@
+#[path = "../src/test_support/test_dir.rs"]
+mod test_dir;
 #[path = "support/tls_pki.rs"]
 mod tls_pki;
 
@@ -5,7 +7,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use uuid::Uuid;
 use wendelon::network::{
 	TcpTlsTransportProvider, TlsMaterial, TransportProvider, TransportTier,
 	canonical_server_name_resolver, rustls_client_config, rustls_server_config,
@@ -13,14 +14,8 @@ use wendelon::network::{
 };
 use wendelon::schema::NodeId;
 
-fn fresh_dir(tag: &str) -> std::path::PathBuf {
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-tcp-tls-transport-{tag}-{}-{}",
-		std::process::id(),
-		Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+fn fresh_dir(tag: &str) -> test_dir::TestDir {
+	test_dir::TestDir::new(&format!("wendelon-tcp-tls-transport-{tag}"))
 }
 
 #[tokio::test]

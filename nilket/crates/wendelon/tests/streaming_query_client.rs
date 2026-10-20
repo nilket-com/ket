@@ -108,7 +108,7 @@ async fn refresh_leases(node: &wendelon::node::WendelonNode) {
 
 #[tokio::test]
 async fn client_query_streams_multiple_batches_and_terminates() {
-	let node = support::bootstrap_node("streaming-query-client", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("streaming-query-client", 1).await;
 	refresh_leases(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
@@ -177,7 +177,7 @@ async fn client_query_streams_multiple_batches_and_terminates() {
 
 #[tokio::test]
 async fn client_query_empty_result_terminates_cleanly() {
-	let node = support::bootstrap_node("streaming-query-empty", 1).await;
+	let (_node_dir, node) = support::bootstrap_node("streaming-query-empty", 1).await;
 	let service: Arc<dyn HrftService> = node.router.clone();
 	let bootstrap = snapshot(1, Some(1), &[(1, "loopback://node-1")]);
 	let client = WendelonClient::new(support::loopback_client_config(

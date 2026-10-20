@@ -1,3 +1,5 @@
+#[path = "../src/test_support/test_dir.rs"]
+mod test_dir;
 #[path = "support/tls_pki.rs"]
 mod tls_pki;
 
@@ -6,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
-use uuid::Uuid;
 use wendelon::audit::{AuditSink, LocalAuditSink};
 use wendelon::consensus::RetentionStatus;
 use wendelon::metrics::observability::{
@@ -14,14 +15,8 @@ use wendelon::metrics::observability::{
 };
 use wendelon::network::{ActorTrustRoots, TlsMaterial, rustls_server_config_with_peer_roots};
 
-fn fresh_dir(tag: &str) -> PathBuf {
-	let dir = std::env::temp_dir().join(format!(
-		"wendelon-inspect-cli-{tag}-{}-{}",
-		std::process::id(),
-		Uuid::new_v4()
-	));
-	std::fs::create_dir_all(&dir).unwrap();
-	dir
+fn fresh_dir(tag: &str) -> test_dir::TestDir {
+	test_dir::TestDir::new(&format!("wendelon-inspect-cli-{tag}"))
 }
 
 #[derive(Clone)]
@@ -38,7 +33,12 @@ impl ReadinessReporter for FixedReporter {
 
 async fn spawn_ready(
 	snapshot: ReadinessSnapshot,
-) -> (ObservabilityHandles, tls_pki::TestPkiPaths, PathBuf) {
+) -> (
+	test_dir::TestDir,
+	ObservabilityHandles,
+	tls_pki::TestPkiPaths,
+	PathBuf,
+) {
 	let root = fresh_dir("round-trip");
 	let pki = tls_pki::write_test_pki(&root.join("pki"));
 	let audit_path = root.join("audit.ndjson");
@@ -70,7 +70,7 @@ async fn spawn_ready(
 	)
 	.await
 	.unwrap();
-	(handles, pki, audit_path)
+	(root, handles, pki, audit_path)
 }
 
 async fn shutdown(handles: ObservabilityHandles) {
@@ -140,7 +140,7 @@ fn assert_authorization_denied_audit(audit_path: &Path) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wendelon_inspect_actor_authorization_round_trip() {
-	let (handles, pki, audit_path) = spawn_ready(ready_snapshot()).await;
+	let (_root, handles, pki, audit_path) = spawn_ready(ready_snapshot()).await;
 	let success = inspect_output(
 		handles.ready.local_addr,
 		&pki,
@@ -174,7 +174,7 @@ async fn wendelon_inspect_actor_authorization_round_trip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wendelon_inspect_json_mode_preserves_ready_body() {
-	let (handles, pki, _audit_path) = spawn_ready(ready_snapshot()).await;
+	let (_root, handles, pki, _audit_path) = spawn_ready(ready_snapshot()).await;
 	let output = inspect_output(
 		handles.ready.local_addr,
 		&pki,

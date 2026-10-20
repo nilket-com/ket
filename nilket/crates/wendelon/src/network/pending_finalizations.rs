@@ -694,12 +694,11 @@ mod tests {
 		ClientWriteId, DurabilityLevel, FinalizationMarker, HybridTimestamp, Identity, TenantId,
 	};
 
-	fn temp_path(tag: &str) -> PathBuf {
-		std::env::temp_dir().join(format!(
-			"wendelon-pending-finalizations-{tag}-{}-{}.redb",
-			std::process::id(),
-			uuid::Uuid::new_v4()
-		))
+	fn temp_path(tag: &str) -> (crate::test_support::TestDir, PathBuf) {
+		let dir =
+			crate::test_support::TestDir::new(&format!("wendelon-pending-finalizations-{tag}"));
+		let path = dir.join("pending.redb");
+		(dir, path)
 	}
 
 	fn record() -> PendingFinalizationRecord {
@@ -736,7 +735,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn pending_store_roundtrips_records() {
-		let store = PendingFinalizationStore::open(temp_path("roundtrip")).unwrap();
+		let (_dir, path) = temp_path("roundtrip");
+		let store = PendingFinalizationStore::open(path).unwrap();
 		let record = record();
 		assert_eq!(store.count(), 0);
 		store.upsert(record.clone()).await.unwrap();
@@ -764,7 +764,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn delete_context_is_a_durable_sidecar_and_reclaims_with_its_witness() {
-		let path = temp_path("delete-context");
+		let (_dir, path) = temp_path("delete-context");
 		let record = record();
 		let counts = [7, 11, 13];
 		{
@@ -821,7 +821,8 @@ mod tests {
 		// that carries the same canonical identity but a drifted
 		// TTL. The redb secondary index key shape must depend only
 		// on canonical bytes.
-		let store = PendingFinalizationStore::open(temp_path("ttl-drift")).unwrap();
+		let (_dir, path) = temp_path("ttl-drift");
+		let store = PendingFinalizationStore::open(path).unwrap();
 		let record = record();
 		store.upsert(record.clone()).await.unwrap();
 		let drifted_write_id = ClientWriteId {
@@ -841,7 +842,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn open_rebuilds_write_id_index_for_legacy_rows() {
-		let path = temp_path("legacy-rebuild");
+		let (_dir, path) = temp_path("legacy-rebuild");
 		let record = record();
 		let db = redb::Database::create(path.clone()).unwrap();
 		let write_txn = db.begin_write().unwrap();
@@ -868,7 +869,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn remove_repoints_write_id_index_when_alternate_record_remains() {
-		let store = PendingFinalizationStore::open(temp_path("remove-repoint")).unwrap();
+		let (_dir, path) = temp_path("remove-repoint");
+		let store = PendingFinalizationStore::open(path).unwrap();
 		let first = record();
 		let second = PendingFinalizationRecord::new(
 			first.write_id,
@@ -929,7 +931,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn adr0085_fresh_pending_store_declares_its_format_version() {
-		let path = temp_path("format-fresh");
+		let (_dir, path) = temp_path("format-fresh");
 		let store = PendingFinalizationStore::open(path.clone()).unwrap();
 		assert_eq!(store.format_version, PENDING_FINALIZATION_FORMAT_VERSION);
 		assert_ne!(
@@ -945,7 +947,7 @@ mod tests {
 		// A store with records but no marker predates the gate. Stamping it would
 		// assert its records match this build's shape — the exact false assurance
 		// ADR 85 exists to remove.
-		let path = temp_path("format-legacy");
+		let (_dir, path) = temp_path("format-legacy");
 		let store = PendingFinalizationStore::open(path.clone()).unwrap();
 		store.upsert(record()).await.unwrap();
 		{
@@ -972,7 +974,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn adr0085_pending_store_from_a_newer_build_is_refused_by_name() {
-		let path = temp_path("format-newer");
+		let (_dir, path) = temp_path("format-newer");
 		let store = PendingFinalizationStore::open(path.clone()).unwrap();
 		store.upsert(record()).await.unwrap();
 		{
@@ -1060,7 +1062,8 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn adr629_p2b_cancellation_before_spawn_has_no_durable_effect() {
-		let store = PendingFinalizationStore::open(temp_path("p2b-before-spawn")).unwrap();
+		let (_dir, path) = temp_path("p2b-before-spawn");
+		let store = PendingFinalizationStore::open(path).unwrap();
 		let lock = store.write_lock.lock().await;
 		let worker = store.clone();
 		let job = tokio::spawn(async move { worker.upsert(record()).await });
@@ -1080,7 +1083,8 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn adr629_p2b_cancelled_upsert_job_keeps_shadow_while_legacy_gauge_skips_update() {
-		let store = PendingFinalizationStore::open(temp_path("p2b-commit-cancel")).unwrap();
+		let (_dir, path) = temp_path("p2b-commit-cancel");
+		let store = PendingFinalizationStore::open(path).unwrap();
 		let (ready, release) = p2b_gate(&store, 0);
 		let worker = store.clone();
 		let job = tokio::spawn(async move { worker.upsert(record()).await });
@@ -1102,7 +1106,8 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn adr629_p2b_cancelled_after_commit_stays_active_until_shadow_install() {
-		let store = PendingFinalizationStore::open(temp_path("p2b-after-commit")).unwrap();
+		let (_dir, path) = temp_path("p2b-after-commit");
+		let store = PendingFinalizationStore::open(path).unwrap();
 		let (ready, release) = p2b_gate(&store, 1);
 		let worker = store.clone();
 		let job = tokio::spawn(async move { worker.upsert(record()).await });
@@ -1118,7 +1123,8 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn adr629_p2b_actual_redb_late_delete_shadow_cannot_erase_a_newer_commit() {
-		let store = PendingFinalizationStore::open(temp_path("p2b-late-delete")).unwrap();
+		let (_dir, path) = temp_path("p2b-late-delete");
+		let store = PendingFinalizationStore::open(path).unwrap();
 		store.upsert(record()).await.unwrap();
 		let (ready, release) = p2b_gate(&store, 1);
 		let worker = store.clone();
