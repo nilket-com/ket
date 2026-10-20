@@ -11,6 +11,9 @@
 //! of those same three principals. This crate carries the unsafe FFI so
 //! `tls-pki` can keep denying unsafe code.
 
+#[cfg(target_os = "linux")]
+pub mod custody;
+
 use std::fs::File;
 use std::path::{Path, PathBuf};
 

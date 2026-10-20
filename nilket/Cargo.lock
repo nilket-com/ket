@@ -2310,6 +2310,7 @@ dependencies = [
  "libc",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -6145,6 +6146,7 @@ dependencies = [
  "h2",
  "http",
  "io-uring",
+ "key-guard",
  "libc",
  "lz4_flex",
  "observability",
