@@ -596,3 +596,166 @@ The source pins are amended equally strict, and each new rule is probed:
 - `impl: adr 0101 key custody guard amendments for the key tool`.
 
 Gate order: independent source review → ladder → log audit → FF.
+
+## Key custody slice 5b plan: the wendelon-key tool without signing
+
+### Status
+
+Plan only. This section authorizes no source changes.
+- Contract: key custody r4 (`/home/me/work/.agent-bridge/wendelon-adr0101-key-custody-contract-r4/CONTRACT.md`) §2 (identity, K1(a), K2-K6), §3 items 1 (the key-file subcommands), 3 and 4, §5; the coordinator rulings in `IMPL-NOTES.md` (split, D-a, D-b).
+- Slice 5a (guard amendments) is on the branch. 5c adds `build`, `sign`, `sign-statement` and `merge`; 5d adds containment.
+
+### Behavior
+
+A new package `nilket/crates/wendelon-key`: a library holding all logic and a thin `wendelon-key` binary. Both are `#![forbid(unsafe_code)]`; every system call goes through key-guard. It depends on `wendelon` with `default-features = false, features = ["non-fips"]`. Nothing depends on it, and the FIPS daemon build (`--bin wendelon --features fips`) does not contain it.
+
+Subcommands. Every one takes `--dir <custody dir>`, opened with `open_custody_dir`, and holds its lock for the whole operation:
+- `generate --role R --intended-epoch E --out NAME [--context F --trusted-manifest M]`. The seed is 32 bytes from `aws_lc_rs::rand::fill`; a deterministic seed exists only under `cfg(test)`. The passphrase is asked twice. The public key must pass the facade's new-key check: enrollable, and with a context, not already in the history (`Denied(21)`) and the role not at 64 successors (`Denied(22)`). Writes a Pending file and prints the 64-hex public key and its fingerprint.
+- `bind --key NAME --context F [--context F2] --trusted-manifest M --out NAME2 [--epoch E]`. Decrypts the Pending file. Refuses unless:
+  - the verified context's `history[role][epoch] == pk`, where the epoch is the intended one unless `--epoch` names the one actually received;
+  - the Pending context, if it has one, equals the verified context;
+  - with no successors (genesis), a second export has byte-identical context bytes and a different `node_id`.
+
+  Re-encrypts under the same passphrase with a fresh salt and nonce, writes the Bound file `NAME2`, and moves the Pending original into `pending/`.
+- `show-public --key NAME` decrypts and prints exactly one 64-hex line, the key derived from the seed, only if it equals the header key. `show-public --unauthenticated` decrypts nothing and lists every key file in the directory, `pending/` and `retired/`, each line labelled `UNAUTHENTICATED`.
+- `backup --key NAME [--pending] --to DIR2 --out NAME2` decrypts under the primary passphrase. `--pending` reads a Pending original from `pending/`, under the same lock. It writes a second envelope with `backup_of = id` under a backup passphrase, asked twice, which must differ from the primary.
+- `restore --from DIR2 --backup NAME2 --out NAME` decrypts under the backup passphrase and re-encrypts under a new primary passphrase, asked twice, with a fresh salt and nonce.
+- `restore-verify --key NAME --from DIR2 --backup NAME2 --context F --trusted-manifest M` decrypts the backup in memory only. It requires the backup's identity to equal the Bound file's identity and the key to be the verified context's key for that (role, epoch). It writes no key file.
+- `retire-epoch --key NAME --context F --trusted-manifest M` refuses unless the file is Bound, its context equals the verified one, and the verified context shows a later epoch for its role. The operator types the number of backups the log records for this identity. Then the file moves to `retired/`.
+- `destroy --key NAME [--retired] --context F --trusted-manifest M (--context F2 | --successor NAME3)` decrypts the file. It refuses unless the epoch is retired in the verified context and there is second-source evidence:
+  - a second export from a different node showing the same context and the same later epoch; or
+  - the successor's Bound file decrypting on this host to the history key of a later epoch.
+
+  The operator then types the fingerprint, and the file is overwritten and unlinked (hygiene, not secure erasure).
+- `destroy --pending --key NAME --context F --trusted-manifest M --evidence accepted-proof|crypto-valid-row --evidence-digest D` decrypts the Pending original in `pending/`. It refuses unless the Pending header's context, when it carries one, equals the verified context, and the verified context shows the key's epoch active. The operator types the fingerprint; the evidence is logged.
+  - Limit: an orphan Pending file, one that can never bind (its rotation was denied or another landed first), has no destroy route yet, because `destroy --pending` requires its epoch active. The slice-7 runbook carries this as an item (until then: keep it, encrypted, and record it at log review).
+Common rules:
+- **Process and terminal.** Startup installs the terminal-restore hook, then `harden_process`.
+- **Passphrases.** Passphrases and typed confirmations are read only through key-guard's `Terminal`. A passphrase is UTF-8, NFC-normalised into a `SecretBuf`, and at least 16 characters.
+- **Host checks (K4).** They run on every listed operation for a recovery-role file, and on every file `destroy` decrypts (the target, a `--successor` file and a Pending original): a data directory (`<XDG data home>/nilket/local` or `$HOME/.wendelon` exists) or any up, non-loopback interface refuses, unless `--override-host-checks` is given, which is logged.
+- **Swap.** A non-empty `/proc/swaps` prints a warning and is logged.
+- **Leftovers.** Temp files left in the custody directory are reported on stderr and logged, never removed.
+- **Lock scope.** Moves go only from the custody directory into `pending/` or `retired/`, its direct children. Mutations inside a child also hold that child's lock.
+- **Exit codes.** 0 on success, 2 on any refusal.
+
+### File format (K3), version 1, 371 bytes
+
+| Offset | Field |
+|---|---|
+| 0..8 | `WROLEKEY` |
+| 8..10 | version u16 LE = 1 |
+| 10 | state: 1 Pending, 2 Bound |
+| 11 | provider: 1 file |
+| 12 | KDF id: 1 scrypt |
+| 13 / 14 / 15 | log_n (17..=20), r (8), p (1..=4) |
+| 16..48 | salt |
+| 48..60 | nonce |
+| 60 | role (1 admin, 2 governance, 3 recovery) |
+| 61..69 | epoch u64 LE (Pending: intended epoch) |
+| 69 | context present (0/1; Bound: 1) |
+| 70..258 | context, or 188 zero bytes |
+| 258..290 | public key |
+| 290 | `backup_of` present (0/1) |
+| 291..323 | `backup_of`, or zeros |
+| 323..371 | AES-256-GCM over the 32-byte seed: ciphertext 32, tag 16 |
+
+- The AAD is bytes 0..323 exactly as read.
+- The key is scrypt(NFC passphrase, salt, log_n, 8, p) → 32 bytes.
+- New files use log_n 17, p 1 (128 MiB).
+- A header outside the bounds, a non-zero fill, a presence byte other than 0/1, an unknown state, provider, KDF or version, or any length other than 371 refuses before derivation. The size check is key-guard's exact-length admission.
+- After decryption, the key derived from the seed must equal the header key.
+
+Identity digests, as the contract defines them (role u8, epoch u64 LE, key 32 B):
+- Bound: SHA-256(`WROLEKEY-ID\0` ‖ context ‖ role ‖ epoch ‖ key).
+- Pending: SHA-256(`WROLEKEY-PENDING\0` ‖ role ‖ intended epoch ‖ has-context ‖ context or zeros ‖ key).
+
+A backup carries its primary's identity in `backup_of` and has the same identity itself. The display fingerprint is the first 16 hex digits of SHA-256(key); it is never an identity.
+
+### Operation log (`custody.log`)
+
+- **Format.** One JSON line per operation, through key-guard's `open_log`. Fields: `prev`, `time`, `host`, `operation`, `identity`, `command_digest` (null in 5b), `form_slot` (null in 5b), `outputs` (name and SHA-256 of each written file), `backup_of`, `overrides`, `leftovers`, `swap` and `outcome`.
+- **Chain.** `prev` is the SHA-256 of the previous line's bytes, and zeros for the first line.
+- **Coverage.**
+  - Every operation that reaches the locked directory appends exactly one line: successes, refusals and wrong passphrases. This includes a failed host probe and a busy child-directory lock: both happen after the lock is held.
+  - A wrong-passphrase line records the file's identity read from its header, labelled `unauthenticated_identity`, since decryption never authenticated it.
+  - An operation refused before the directory is admitted has no log to write to (stated limit).
+  - Before appending, the whole chain is verified; a broken chain refuses the operation.
+  - The head digest is printed on stderr after every append, for the runbook's review record.
+  - The chain cannot detect a truncated tail (stated limit).
+
+### Algebra
+
+- **Identity.**
+  - A key file is its K3 identity digest: Pending or Bound, from the authenticated header after decryption, never from its name.
+  - A custody directory is its `(dev, ino)` (key-guard).
+  - A log line is its position in the SHA-256 chain.
+  - A backup is the pair (its own identity, which equals the primary's, and `backup_of`).
+- **Owner.** The operator's effective uid. The tool is the only writer; no node reads or links it.
+- **Keys.**
+  - Mutations hold the top-level directory's lock for the whole operation, plus a child's lock when mutating inside it.
+  - A file name is published once (create-new).
+  - Pending → Bound is keyed by the verified history's `(role, epoch) → key`.
+- **Laws.**
+  - **KL1, secrets.** The seed and passphrases live in `SecretBuf`s. The dalek `SigningKey`, the scrypt working set and the AES key schedule are the contract's stated limits.
+  - **KL2, decrypt then authenticate.** No header field enables a key use (bind, backup, restore, show-public, destroy) before decryption succeeds and the derived key equals the header key. An unauthenticated header may only cause a refusal, a listing (`--unauthenticated`, which says so on every line), the comparison `restore-verify` makes against an authenticated backup, or the `retire-epoch` move, which only restricts a key.
+  - **KL3, bind needs history.** A Bound file exists only for a `(context, role, epoch, key)` the re-verified chain holds; genesis needs two node-distinct, byte-identical exports.
+  - **KL4, one line per operation** that reaches the locked directory, chained.
+  - **KL5, exact format.** One length per version; the AAD is the on-disk header bytes.
+  - **KL6, closed process.** No unsafe code, no network, no passphrase source but the terminal.
+  - **KL7, no reimplementation.** Every acceptance decision about keys and contexts comes from the facade (`verify_context_export`, `VerifiedContext`, the new-key check).
+- **Visibility.** stdout carries public keys, fingerprints and listings only. Passphrases, seeds and derived keys never appear in output, `Debug`, errors or the log.
+
+### Facade amendment
+
+`operator_proof::check_new_role_key(context: Option<&VerifiedContext>, role: u8, key: &[u8; 32]) -> Result<(), ProofRefusal>` runs `check_enrollable_admin_key2`. With a context, it also runs the rotation's own reuse and successor-limit rules: the key is anywhere in the history, or `SUCCESSORS3` successors already exist for the role. It adds `ProofRefusal::{NotEnrollable, KeyReused, SuccessorLimit}`. The facade public-items pin is amended to the new export list, equally strict. The facade still contains no signing code.
+- **Follow-up (refactor).** `check_new_role_key` restates the `Denied(21)` and `Denied(22)` predicates of `role_epochs.rs` (reuse anywhere in the history; the per-role successor limit) over the facade's verified history. A later refactor shares one predicate between the two.
+
+### Tests (each with a negative control)
+
+| Test | Checks | Negative control |
+|---|---|---|
+| T-FMT | golden v1 vectors (deterministic seed, salt and nonce, `cfg(test)` only) decode and decrypt to the pinned key | a version+1 file, and each malformed field, refused before derivation |
+| T-K3 | flipping each of the 323 header bytes, one at a time, fails; each valid alternative of a field (state 2→1, role 3→1, p 1→2) fails decryption, so the associated data covers it; log_n 16 and 21, r 9 and p 0 and 5 refused before derivation; trailing and truncated bytes refused; wrong passphrase refused; derived-key mismatch refused | the unmodified file decrypts |
+| T-PASS | the argument parser has no passphrase flag (`--passphrase` is an unknown flag); a set `WENDELON_KEY_PASSPHRASE` has no effect; the binary without a controlling terminal (`setsid`) is refused as not a terminal before anything else; no non-test source reads the environment (except the host probe's `HOME` and `XDG_DATA_HOME`) or stdin; the tool's `startup` leaves its own test process non-dumpable with a zero core limit | the same binary under a pty (`script`) passes the terminal check and reaches the custody directory; the test process is dumpable before `startup`; a short (15-character) or mismatched pair is refused, and a 16-character pair in two normal forms is accepted |
+| T-GEN-BIND | genesis bind with one export refused; two exports with the same `node_id` refused; Pending kept in `pending/` after bind; Pending backup and restore work; `destroy --pending` without a context showing the epoch active refused | genesis bind with two byte-identical exports from different nodes succeeds |
+| T-BIND | Pending → Bound for a successor | mismatched epoch, and a history without the key, refused |
+| T-CTX | partial coverage and a tampered chain refused (facade reader); header context ≠ verified context refused | a verified chain is accepted |
+| T-HOST / T-K4 | each recovery-role operation refuses with a data directory present, and with a non-loopback interface up, including `destroy` of a recovery key (with a `--successor` file) and `destroy --pending` of a recovery Pending original; the override flag is logged | the same operation on a clean host probe succeeds |
+| T-K5 | backup → restore → show-public round trip; restore-verify accepts | a backup for another epoch or context, a wrong backup passphrase, and a backup passphrase equal to the primary are refused |
+| T-K6 | retire succeeds with a verified later epoch; destroy succeeds with each second-source form and the typed fingerprint | retire without a successor, and with a forged (unsigned) successor, refused; destroy without second-source evidence, or with the wrong fingerprint, refused, and the file is intact |
+| T-LOG | every operation, success and refusal, appends one line and the chain verifies | an edited middle line breaks the chain, and the next operation refuses |
+| T-SECRET | the passphrase, the seed bytes and the seed hex appear in no stdout, stderr, log, error `Display` or `Debug` across a full run | the probe finds them in a plainly formatted string |
+| T-LEFT | a planted temp file is reported and logged, and kept | a clean directory reports none |
+| T-K1a | over `cargo metadata --no-deps`, no package but `wendelon-key` depends on `wendelon-key`; the FIPS build lines in `ci/check_fips_symbol_sweep.sh` and `ci/generate_regulated_release_evidence.sh` name only `--bin wendelon`; `src/cli.rs` has no `key` branch | a synthetic metadata fixture where `nilket` depends on `wendelon-key` fails; a probe `--bin wendelon-key` line fails |
+| T-FIPS (D-b) | `cargo tree` of `-p wendelon --no-default-features --features fips`: no `wendelon-key`, no aws-lc-rs `non-fips` feature, no wendelon `non-fips` feature | the default `-p wendelon` graph does show wendelon's `non-fips`, so the matcher sees real output |
+| T-NET | no `net`, `socket`, `reqwest`, `quinn`, `tokio` or `opendal` token in `wendelon-key` sources; `#![forbid(unsafe_code)]` heads the library and the binary | a probe token in a copy of a source fails |
+| T-ANCHOR-USE | `open_custody_dir_anchored` appears only in `cfg(test)` modules of the tool | a probe call in a non-test module fails |
+
+Fixtures:
+- Every fixture lives in a `TMPDIR` directory admitted through key-guard's `fixture-anchor` open, which only `wendelon-key`'s `[dev-dependencies]` enable (5a pin tightened to that).
+- Exports are built by the tests' own encoder of the C-S6b format over the published `M3_S1` manifest (the D-G3 test seeds). Successor proofs come from the facade's `prepare` and `splice`, with signatures from the test seeds.
+- Passphrases, confirmations, the host probe, randomness and the clock are injected through one `cfg(test)` seam; production wires key-guard's `Terminal`, `non_loopback_interfaces_up`, `aws_lc_rs::rand` and the system clock.
+
+### Dependencies
+
+`wendelon-key`:
+- **Normal dependencies.** `wendelon` (path, non-FIPS), `key-guard` (path), `aws-lc-rs`, `scrypt` 0.11, `ed25519-dalek` 2, `serde` and `serde_json`, `thiserror` 2, `unicode-normalization` 0.1, `zeroize`. SHA-256 comes from aws-lc-rs.
+- **Dev-dependency.** `key-guard` with `fixture-anchor`.
+- **Lock file.** All are already in `nilket/Cargo.lock`, and no crate is new to it.
+- **Profile change.** `[profile.dev.package.scrypt]` and `[profile.dev.package.salsa20]` get `opt-level = 3` in the workspace manifest, so the 128 MiB KDF runs in test builds at release speed. Code generation for other packages is unchanged.
+
+### Commits and gate order
+
+- `plan: adr 0101 key custody wendelon-key tool without signing` (this section). The arch and MV checks pass before FF.
+- `impl: adr 0101 key custody wendelon-key tool without signing`.
+
+Gates:
+- the new crate's tests at default threads and at 8;
+- key-guard;
+- the wendelon lib;
+- both wendelon arch tests;
+- `check --workspace`;
+- `fmt --check`;
+- the D-b graph checks.
+
+Order: independent source review → ladder → log audit → FF.
