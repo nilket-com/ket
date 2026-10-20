@@ -440,3 +440,99 @@ From c2, a 137- or 189-byte trusted manifest is refused with "the trusted manife
 
 - `plan: adr 0100 root2 profile three only` (this section, the K7 amendment, the corpus and its test, the D-G3 seeds). The crate architecture and MV tests pass before FF.
 - Then a, b1, b2, b3, c1, c2, d, in that order.
+
+## Key custody slice 4 plan: key-guard custody, terminal and memory helpers
+
+### Status
+
+Plan only. This section authorizes no source changes.
+- Contract: key custody r4 (`/home/me/work/.agent-bridge/wendelon-adr0101-key-custody-contract-r4/CONTRACT.md`), §2 K1(a), K2, K3 (passphrase, process hardening, memory), K4 (host check) and §7 item 4.
+- Slice 3 (the operator proof facade) is on main.
+
+### Placement
+
+KG is `nilket/crates/key-guard`. It holds every syscall the custody tool needs, because `wendelon-key` forbids unsafe code (K1(a)).
+
+The following stay out of KG and belong to slice 5 (`wendelon-key`):
+- key generation;
+- the K3 envelope (AES-256-GCM, scrypt, the identity digests, golden vectors);
+- passphrase policy (NFC, at least 16 characters);
+- the `custody.log` JSON hash chain.
+
+They need non-FIPS aws-lc-rs, ed25519 and the Root2 context. KG is linked into the FIPS daemon through `tls-pki`, and a node links no role-signing path (§2 Owner).
+
+KG is form- and role-agnostic. It never parses key or command bytes, so it adds nothing that limits new proof forms, such as D-21's `RoleForm3::Containment`.
+
+The new modules are Linux-only (`renameat2`, `prctl`). On other platforms the tool refuses (K2, "Unix only").
+
+### Algebra
+
+- **Identity.**
+  - A custody directory is the `(st_dev, st_ino)` of the handle that was checked, never its path.
+  - A custody file is one single-component name resolved through that directory handle. After opening, it is the opened handle.
+  - KG never interprets file contents. Key identity (the K3 Pending and Bound digests) is slice 5.
+- **Owner.** The effective uid:
+  - the directory is mode 0700 and owned by the euid;
+  - every ancestor, reached by `openat(fd, "..", O_PATH|O_DIRECTORY)` and judged on its fstat (so an execute-only ancestor such as a 0711 `/home` is not refused for lack of read permission), is owned by root or the euid and is neither group- nor other-writable;
+  - files are mode 0600, owned by the euid, with `nlink == 1`.
+- **Keys.**
+  - The mutation key is an exclusive `flock` on the directory's open file description. Every mutating function exists only on the lock guard, so an unlocked mutation cannot be written. A handle refuses a second lock while its guard is held, because `flock` on the same open file description would succeed and either guard would unlock both.
+  - A name is published at most once: create-new only, through `RENAME_NOREPLACE`, and never overwritten.
+- **Laws.**
+  - **G1, refuse and never repair.** Any failed check refuses with a typed reason. No mode, owner or link is changed on an existing object.
+  - **G2, whole or nothing.** Creation runs `O_CREAT|O_EXCL|O_NOFOLLOW` 0600 temp, then write, fsync, `renameat2(RENAME_NOREPLACE)` and a directory fsync. EINVAL refuses with no plain-rename fallback, and every failure removes the temp file.
+  - **G3, reads are bounded.** `openat O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`, then an fstat check of a regular file with an admitted exact size. `custody.log` is exempt from the size rule only, and is opened `O_APPEND`. A FIFO never blocks.
+  - **G4, secrets are inert.** A `SecretBuf` has a fixed capacity and never reallocates. It is zeroed (with `zeroize`) before it is freed, and munlocked. Its `Debug` shows only the length, capacity and lock state. No KG error carries secret bytes.
+  - **G5, mlock is best effort and reported.** Per K3, a failed mlock is not fatal. `SecretBuf::is_locked` reports the result so the tool can warn. The daemon's existing mlock and munlock move into KG unchanged in behaviour.
+  - **G6, passphrase entry.** The passphrase is read from `/dev/tty` only, which must be a terminal. Echo, canonical mode and tty signals are off during the read. After `tcsetattr`, the settings are read back, and entry is refused unless ECHO, ICANON and ISIG are all off. `max` is capped at `MAX_SECRET_LEN`. The saved termios is restored when the guard drops, on return, on error and on unwind. The INTR, QUIT and SUSP characters abort the read as typed `Interrupted` after the restore. A fatal signal sent by another process is not caught (stated limit; recovery is `stty sane`).
+  - **G7, hardening.** `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0`, both read back.
+  - **G8, host probe.** `getifaddrs` lists the up, non-loopback interfaces, for K4's refusal in slice 5.
+
+### Tests (each with a negative control)
+
+| Test | Checks | Negative control |
+|---|---|---|
+| T-K2 | each defect is refused with its typed reason: symlink, mode 0644, setuid, wrong uid (on recorded facts), nlink 2, non-0700 directory, group-writable ancestor, symlinked directory, existing target | the same fixture with that one defect fixed is accepted |
+| T-K2 walk | the production ancestor walk agrees with a path-based oracle up to `/` | a fixture-anchored walk with a group-writable ancestor is refused |
+| T-K2 fifo | a FIFO under a custody name is refused without blocking | a regular file is accepted |
+| T-K2 size | a size outside the admitted set is refused | the admitted size is accepted |
+| T-K2 lock | a second lock on the same directory, through another handle or the same one, is `Busy` | after the guard drops, the lock succeeds |
+| T-K2 search-only | an ancestor with search but not read permission is admitted | the same ancestor made group-writable is refused |
+| T-TTY read-back and cap | settings with any of ECHO, ICANON or ISIG on are not quiet; a line over `MAX_SECRET_LEN` is `TooLong` under any larger `max` | engaged settings read back quiet; a line of exactly `MAX_SECRET_LEN` is read whole |
+| T-K2 move/destroy | moving onto an existing name is refused, and a destroyed name is gone | moving onto a fresh name succeeds |
+| T-K3z | after the wipe, the drop probe sees every byte zero | before the wipe, the same probe sees the bytes non-zero |
+| T-SECRET | `Debug` and every error string, including for an overlong passphrase, contain no secret bytes | the probe finds the bytes in a plain formatted string |
+| T-TTY | over a pty, the read returns the line with no echo, and termios is identical afterwards on success, error, `Interrupted` and panic | with echo on, the pty master sees the bytes |
+| T-TTY non-tty | a regular file or a pipe is refused as not a terminal | a pty is accepted |
+| T-HARD | in its own test process, dumpable and the core limit read back as 0 | before hardening, the process is dumpable and the hard core limit is non-zero |
+| T-IF | the classifier admits exactly the up, non-loopback interfaces | loopback and down interfaces are excluded |
+
+There are two KG source pins. Both enumerate every `.rs` file under `custody/`, not a fixed list, and both are probed:
+- every `unsafe` lives in `custody/sys.rs`, and each carries a `SAFETY` comment;
+- the walk's stop type is built only as the `/` constant and, with an anchor, only inside the private `#[cfg(test)] fn at`, and no non-test `pub` item names it.
+
+### Test fixtures
+
+All fixtures live under KG's own self-cleaning `TestDir`, in `TMPDIR`.
+
+Fixture ancestors on a dev host can be group-writable: `/home/me/work` is 0775 under umask 002. A `cfg(test)`-only anchor therefore ends the ancestor walk at the fixture root, and nothing in the public API can stop the walk early. Slice 5 inherits this constraint and decides its own fixture route.
+
+### Slice 5 obligations
+
+These are review findings that KG cannot settle alone. Slice 5 must meet each one, or state it as a limit:
+- **Lock scope.** The tool takes only the top-level custody directory's lock. `move_file` into a subdirectory relies on the parent's lock, so slice 5 either requires holding the target's lock too or enforces that the target is a child of the locked directory.
+- **Panic and the terminal.** Release builds use `panic = "abort"`, so unwinding never runs the termios guard. Slice 5 installs a panic hook that restores the terminal, or states the gap as a limit.
+- **Leftover temp files.** A crash between the temp create and the rename leaves a `.wrolekey.tmp.` file, which no custody name can open. Slice 5 reports any it finds.
+
+### Dependencies
+
+- `zeroize` 1.8 is added to key-guard. It is already in `Cargo.lock`, and the daemon already links it through wendelon.
+- `wendelon` gains a direct path dependency on `key-guard`, which it already links through `tls-pki`.
+- No crate is new to the workspace.
+
+### Commits and gate order
+
+- `plan: adr 0101 key custody guard functions and secret handling` (this section). The arch and MV checks pass before FF.
+- `impl: adr 0101 key custody guard functions and secret handling`.
+
+Gate order: independent source review → ladder → log audit → FF.
