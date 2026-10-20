@@ -759,3 +759,90 @@ Gates:
 - the D-b graph checks.
 
 Order: independent source review → ladder → log audit → FF.
+
+## Key custody slice 5c plan: wendelon-key signing
+
+### Status
+
+Plan only. This section authorizes no source changes.
+- Contract: key custody r4 (`/home/me/work/.agent-bridge/wendelon-adr0101-key-custody-contract-r4/CONTRACT.md`) §3 item 1 (`build`, `sign`, `sign-statement`, `merge`), K3 (the `sign` refusals), K4 (what-you-sign), K5 (the round trip through `sign`), K7 (no reimplementation, operator choices), §5 T-SIGN, T-K7, T-WYS, T-MERGE.
+- Slices 5a and 5b are on main (`c66fcaeb9`). 5d (containment, D-21) follows.
+
+### Behavior
+
+Four subcommands. Every one runs in a locked, logged session on `--dir` (5b). The facade is unchanged: every layout, preimage, splice, merge and self-check is `operator_proof`'s, and the tool adds only the Ed25519 signature over the facade's preimage.
+- **`build --dir D --context F --trusted-manifest M --out NAME <kind> [args]`.** It opens no key. Kinds:
+  - `rotate-admin|rotate-governance|rotate-recovery --key HEX64`;
+  - `freeze` and `unfreeze`, whose binding is the context's `transition` (`freeze_binding`);
+  - `retire-root`.
+
+  It writes the canonical `Command2::encode` bytes as `NAME.command` and prints the full command digest and its what-you-sign code. `build statement --action grant|revoke --permission-key ID32HEX:REVISION [--sidecar visads02|visads03]` writes nothing and prints the statement's code (below).
+  - The nine governance kinds are not built here: their field sets belong to the requesting node's own tooling (stated limit). `sign` accepts their canonical bytes from any producer.
+- **`sign --dir D --key NAME --context F --trusted-manifest M --command FILE [--partial FILE] [--with ROLE] [--sidecar visadg01|visrol03] [--override-host-checks] --out NAME2`.**
+  - **Gates before any output.** Host checks run, then the passphrase is read and the file decrypted. Then come the K3 refusals, in order:
+    - the file is Bound;
+    - its context is the verified context byte for byte;
+    - the history holds its key at its role and epoch.
+
+    The facade's `prepare` then refuses the rest (typed `ProofRefusal`): a stale or retired epoch, a role the requirement does not name, a retired root, a frozen root with a governance command, a wrong `--with` or `--sidecar`, and the non-role-signed kinds.
+  - **Display and confirmation.** The tool prints the kind and its decoded fields, the signer's role, epoch and form and slot, the Freeze/Unfreeze binding, and a TERMINAL warning for RetireRoot. It withholds the command digest and a rotation's new key. The operator types the 32-hex what-you-sign code. A mismatch aborts with nothing written.
+  - **After confirmation.** The tool prints the full command digest, the new key and its fingerprint (rotations), and the SHA-256 of the exact preimage. It then signs that preimage and splices the signature.
+  - **Checks before writing.**
+    - A complete proof must pass `self_check`.
+    - A first joint partial must be accepted by the facade as the partner's `--partial`: `prepare` for the partner's active key verifies the signed slot with the production check.
+    - A second signer's `--partial` is checked by `prepare` against the layout rebuilt from (command, context).
+  - **Output.** `NAME2.command` (the exact command bytes signed over) and `NAME2.sidecar`, create-new 0600 in `D`. Their SHA-256 digests are printed and logged with the command digest and the form and slot.
+- **`sign-statement --dir D --key NAME --context F --trusted-manifest M --action grant|revoke --permission-key ID32HEX:REVISION [--sidecar visads02|visads03] --out NAME2`.** The same gates, then `prepare_statement`: VISADS03 by default, VISADS02 only at administrator epoch 0 and frozen roots refused. The display shows the action, authority and namespace. It writes `NAME2.command`, the full `Command2` with the signature embedded, after `self_check`.
+- **`merge --dir D --context F --trusted-manifest M --command FILE --partial A --partial B --out NAME`.** It opens no key file and calls the facade's `merge`, which refuses any byte difference outside 86..150 and 160..224, a slot filled twice or not at all, a layout other than the one rebuilt from (command, context), and a slot that does not verify under its claimed (role, epoch). The facade's `self_check` runs before `NAME.sidecar` is written.
+
+**What-you-sign code.** K4's two sentences ("it then prints … for rotations, the new key's hex" and "never prints the command digest or the new key before confirmation") are read together: the decoded display is in two parts, and the key and digest are shown only after the code matches. The code is 32 hex digits (128 bits; the K4 amendment in `IMPL-NOTES.md`, "Slice 5c review rulings": 64 bits would let an attacker who alters the command file in transit search for another command with the same prefix):
+- for a rotation, the first 32 hex digits of the new key, which the operator reads from the new key's authenticated `show-public` over a second channel;
+- for every other command, the first 32 hex digits of the command digest, from `build` on the requesting host, or from the command's producer;
+- for a statement, the first 32 hex digits of SHA-256 of the facade's unsigned statement preimage, from `build statement`.
+
+### Algebra
+
+- **Identity.**
+  - A command is its canonical bytes under the context's (generation, cluster). Its digest is `Command2::digest`.
+  - A proof output is (command bytes, sidecar or statement bytes) for one signer (role, epoch, slot, form).
+  - The signed object is exactly the facade's preimage for that layout.
+- **Owner.** The operator signs. A host that merges holds no key.
+- **Keys.** One signature per (proof layout, slot). The slot comes from the key's role; the only operator choices are `--with` and `--sidecar`. A merge combines the two slots of one layout.
+- **Laws.**
+  - **SL1, what-you-sign.** The bytes displayed, the bytes the code is checked against, the preimage signed, and the command bytes written all come from the one command buffer read from `--command`. A wrong code writes nothing.
+  - **SL2, no output without the production check.** No sidecar or statement is written unless the facade has checked it: `self_check` for a complete proof, partner acceptance for a first partial.
+  - **SL3, the facade decides.** Every refusal about a layout, form, slot, epoch, freeze or retirement is the facade's typed `ProofRefusal`. The tool adds only the 5b file checks and the confirmation.
+  - **SL4, outputs are bearer authority.** They are written create-new 0600 into the custody directory and logged by digest, never by content.
+- **Visibility.** stdout and the log carry digests, public keys, decoded command fields and file names. Seeds, passphrases and the 64-byte signature never appear on stdout or in the log; the signature is only in the written file.
+
+### Recorded limits and amendments (coordinator, from the 5a/5b second opinion)
+
+- **Signing authority.** In 5c and 5d, signing requires an authenticated Bound header (decrypted, derived key equal to the header key), its context equal to the verified context, the history holding its key at its role and epoch, and that epoch active. Whether a file is in or out of `retired/` never defines authority: a file moved back out of `retired/` is still refused by the active-epoch rule, and a file never retired is refused once its epoch is stale.
+- **KL4 is completed-invocation logging, not crash-atomic.** A line is appended after the mutation it records. After a crash, or a failed log append or fsync, an operation may have published, moved or destroyed a file with no final line. Recovery is by inspection (the directory listing, `show-public --unauthenticated`, the log head), never a blind retry. Bind's create-then-move has the same rule: a Bound file whose Pending original is still beside it, not in `pending/`, means the move did not happen. The original stays where it is, encrypted, and the operator records it at log review; a repeated `bind` refuses, because its output name exists. Slice 7's runbook carries both as items.
+- **What `restore-verify` proves.** It proves the backup decrypts under its passphrase, carries the Bound file's identity, and holds the verified history's key. It does not decrypt the primary, so it does not prove the primary's ciphertext is usable. The command's output line and slice 7's runbook say so.
+- **G11 as built** (fix `custody move takes the destination lock …`). `move_file` takes the destination directory's `CustodyLock` as a capability, either the locked directory itself or a locked direct child, so both directories a move mutates are held. Locks never wait, so the parent-then-child order cannot deadlock, and a busy child refuses. `bind` and `retire-epoch` take the child's lock first, before checking that the destination name is free and before publishing anything, so the name check runs under the lock that covers the move. A busy `pending/` refuses `bind`, and a busy `retired/` refuses `retire-epoch`, each with nothing changed (tested, each with a control). The 5a limit "a child-only lock can race a parent-locked move" no longer applies.
+- **Audit provenance as built.** `retire-epoch` logs the header's identity as `unauthenticated_identity`, since it decrypts nothing. `restore-verify` logs the Bound file's claimed identity as `unauthenticated_identity` and sets `identity` only after the authenticated backup matches it.
+
+### Tests (each with a negative control)
+
+| Test | Checks | Negative control |
+|---|---|---|
+| T-SIGN | each refusal, with nothing written: Pending file; header context ≠ verified context; key not in history; header epoch ≠ history epoch; stale (retired) epoch; a role the requirement does not name; retired root; frozen root with a statement and with a governance command | each paired with a run that differs only in that condition and signs |
+| T-K7 (tool) | through `sign` and `merge` in the tool: single recovery slot RotateAdmin, RotateGovernance, Freeze, RetireRoot; two-host merged RetireRoot [1,2], RotateRecovery [1,2], Unfreeze [1,3] and [2,3], each also via a second signer over the first's partial; the governance kinds with VISADG01 (governance epoch 0) and VISROL03 [2,0] (epochs 0 and 1); VISADS02 (admin epoch 0) and VISADS03 (epochs 0 and 1). Each output passes the facade's `self_check` independently of the tool | the refused cells: Bootstrap, Cover, VISADC01, VISADG01 after governance rotated, VISADS02 after admin rotated, the wrong `--with`, each with nothing written |
+
+Reserve and Finalize carry authority-key claims whose fixtures belong to wendelon; their refusal (`NotRoleSigned`, the same branch as Bootstrap and Cover) is covered at the facade by slice 3's T-K7, and the tool passes the facade's refusal through unchanged.
+| T-WYS | a wrong code writes nothing, and the log records the refusal; a code that matches only the first 16 hex digits is refused; the signature verifies over the facade preimage rebuilt from the written command and the context; the displayed digest and preimage hash equal those recomputed from the written files; the written command bytes equal the input bytes | the correct code writes; the same signature does not verify over another command's preimage, and another command displays another digest |
+| T-MERGE | a two-host merge passes `self_check` | mismatched commands, partials of another root's context, a slot filled by both partials, an invalid first slot, and a single byte changed outside the slot ranges are each refused; a difference only inside the slot ranges (the normal case) merges |
+| T-K5 (5c leg) | backup → restore → sign round trip: the restored key signs and its proof passes `self_check` | a restored file under the wrong passphrase does not sign |
+| T-HOST (5c rows) | `sign` and `sign-statement` with a recovery or any key on a dirty host: recovery refuses, override logged | a clean host signs |
+
+### Dependencies
+
+None new. The facade's public surface is unchanged, so its pin is not amended.
+
+### Commits and gate order
+
+- `plan: adr 0101 key custody wendelon-key signing` (this section). The arch and MV checks pass before FF.
+- `impl: adr 0101 key custody wendelon-key signing`. It touches no `plans/**` file.
+
+Gates: as 5b. Order: independent source review → ladder → log audit → FF.
