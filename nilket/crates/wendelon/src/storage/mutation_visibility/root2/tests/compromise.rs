@@ -6,6 +6,7 @@ use super::governance_verification::support as wire;
 mod attribution;
 mod containment;
 mod coverage;
+mod custody;
 mod export;
 mod export_chain;
 mod reader;

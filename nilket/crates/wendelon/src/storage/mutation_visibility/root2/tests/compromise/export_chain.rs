@@ -1,6 +1,8 @@
 //! C-S6b context export, content: T-X2 (the successor chain re-verifies), T-CTX (the one context
 //! encoder) and T-FMT (the byte format). Every export is written by the CLI over a real WAL.
-use super::reader::{CONTEXT_DOMAIN, Parsed, Record, Refusal, encode, parse, resealed, verify};
+use super::reader::{
+	CONTEXT_DOMAIN, Parsed, Record, Refusal, encode, log20, parse, resealed, verify,
+};
 use super::support::*;
 use crate::storage::mutation_visibility::root2::admin_install::{AdminContext2, admin_context2};
 use crate::storage::mutation_visibility::root2::codec::hash;
@@ -47,7 +49,7 @@ fn t_x2_every_successor_reverifies_and_each_replay_check_refuses() {
 	let m = r.manifest();
 	let v = verify(&bytes, m).unwrap();
 	assert_eq!(
-		v.history,
+		v.history(),
 		[
 			(ADMIN, 1, key(21)),
 			(GOVERNANCE, 1, key(31)),
@@ -57,12 +59,12 @@ fn t_x2_every_successor_reverifies_and_each_replay_check_refuses() {
 			(RECOVERY, 2, key(42)),
 		]
 	);
-	assert_eq!(v.active, [(2, key(22)), (2, key(32)), (2, key(42))]);
-	assert!(v.context_authenticated);
+	assert_eq!(v.active(), [(2, key(22)), (2, key(32)), (2, key(42))]);
+	assert!(v.context_authenticated());
 	// Audit-derived, readable only through the fail-safe accessors.
-	assert!(!v.frozen.refuses_while_frozen());
-	assert!(!v.retired.refuses_as_retired());
-	assert_eq!(v.transition.freeze_binding(), log(7));
+	assert!(!v.frozen().refuses_while_frozen());
+	assert!(!v.retired().refuses_as_retired());
+	assert_eq!(v.transition().freeze_binding(), log20(log(7)));
 	let p = parse(&bytes).unwrap();
 	assert_eq!(
 		p.successors.iter().map(|s| s.activated).collect::<Vec<_>>(),
@@ -139,18 +141,18 @@ fn t_x2_count_zero_verifies_without_authenticating_the_context() {
 	applied(r.governance_use(r.current(GOVERNANCE)));
 	let bytes = exported(&r, 7);
 	let v = verify(&bytes, r.manifest()).unwrap();
-	assert!(v.history.is_empty());
-	assert!(!v.context_authenticated);
-	assert_eq!(v.active, [(0, key(11)), (0, key(12)), (0, key(13))]);
+	assert!(v.history().is_empty());
+	assert!(!v.context_authenticated());
+	assert_eq!(v.active(), [(0, key(11)), (0, key(12)), (0, key(13))]);
 	// Why: with no successor nothing binds the context, so an altered one passes the chain too.
 	let mut p = parse(&bytes).unwrap();
 	p.context[120] ^= 0x01;
 	let altered = verify(&encode(&p), r.manifest()).unwrap();
-	assert!(!altered.context_authenticated);
+	assert!(!altered.context_authenticated());
 	// Control: one successor binds it.
 	r.rotate(ADMIN, 21);
 	let one = exported(&r, 7);
-	assert!(verify(&one, r.manifest()).unwrap().context_authenticated);
+	assert!(verify(&one, r.manifest()).unwrap().context_authenticated());
 	let mut p = parse(&one).unwrap();
 	p.context[120] ^= 0x01;
 	assert_eq!(
@@ -290,10 +292,11 @@ fn t_fmt_golden_layout_and_refusals() {
 	assert_eq!(encode(&p), bytes);
 	assert_eq!(hex(&hash(b"", &bytes)), GOLDEN_EXPORT_SHA256);
 	// Refusals, each re-sealed so the edited field, not the digest, is what refuses.
+	let m = r.manifest();
 	let edit = |at: usize, value: u8| {
 		let mut b = bytes.clone();
 		b[at] = value;
-		parse(&resealed(&b)).err()
+		verify(&resealed(&b), m).err()
 	};
 	assert_eq!(edit(0, b'X'), Some(Refusal::Magic));
 	assert_eq!(edit(8, 2), Some(Refusal::Version));
@@ -317,12 +320,12 @@ fn t_fmt_golden_layout_and_refusals() {
 	let command_len = 513 + 1 + 8 + 32 + 20;
 	let mut b = bytes.clone();
 	b[command_len..command_len + 4].copy_from_slice(&262_193u32.to_le_bytes());
-	assert_eq!(parse(&resealed(&b)).err(), Some(Refusal::CommandLength));
+	assert_eq!(verify(&resealed(&b), m).err(), Some(Refusal::CommandLength));
 	// Trailing bytes before the digest.
 	let mut b = bytes[..bytes.len() - 32].to_vec();
 	b.push(0);
 	assert_eq!(
-		parse(&super::reader::reseal(b)).err(),
+		verify(&super::reader::reseal(b), m).err(),
 		Some(Refusal::Trailing)
 	);
 	// A wrong-width LogId (the stop one byte short, or one byte long) never parses.
@@ -333,23 +336,35 @@ fn t_fmt_golden_layout_and_refusals() {
 			b.push(0);
 		}
 		b.extend(&bytes[465..bytes.len() - 32]);
-		assert!(parse(&super::reader::reseal(b)).is_err(), "width {width}");
+		assert!(
+			verify(&super::reader::reseal(b), m).is_err(),
+			"width {width}"
+		);
 	}
 	// Counts over the caps, refused before any record is read.
 	let mut b = bytes.clone();
 	b[509..513].copy_from_slice(&193u32.to_le_bytes());
-	assert_eq!(parse(&resealed(&b)).err(), Some(Refusal::Count));
+	assert_eq!(verify(&resealed(&b), m).err(), Some(Refusal::Count));
 	let mut x = p.clone();
 	x.successors = vec![s.clone(); 65];
-	assert_eq!(parse(&encode(&x)).err(), Some(Refusal::RoleCount));
+	assert_eq!(verify(&encode(&x), m).err(), Some(Refusal::RoleCount));
 	x.successors.truncate(64);
 	assert!(parse(&encode(&x)).is_ok(), "64 per role is within the cap");
+	assert!(
+		!matches!(
+			verify(&encode(&x), m).err(),
+			Some(Refusal::RoleCount | Refusal::Count)
+		),
+		"the production reader passes the caps too"
+	);
 	// Integrity: an edit without a re-seal, and truncation.
 	let mut b = bytes.clone();
 	b[300] ^= 1;
-	assert_eq!(parse(&b).err(), Some(Refusal::Digest));
-	assert!(parse(&bytes[..bytes.len() - 1]).is_err());
-	assert_eq!(parse(&bytes[..20]).err(), Some(Refusal::Truncated));
+	assert_eq!(verify(&b, m).err(), Some(Refusal::Digest));
+	assert!(verify(&bytes[..bytes.len() - 1], m).is_err());
+	assert_eq!(verify(&bytes[..20], m).err(), Some(Refusal::Truncated));
+	// Control: the unedited export verifies.
+	assert!(verify(&bytes, m).is_ok());
 }
 /// SHA-256 of the whole export of `retired()` labelled node 0x01020304, pinned.
 const GOLDEN_EXPORT_SHA256: &str =

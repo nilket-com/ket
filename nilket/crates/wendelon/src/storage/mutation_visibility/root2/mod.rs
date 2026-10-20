@@ -39,6 +39,9 @@ mod incremental;
 mod issuer_registry;
 #[allow(dead_code)] // Dormant pure lease payload check; no production caller.
 mod lease_payload;
+#[allow(dead_code)]
+// Dormant offline operator proof facade (key custody); no node caller, and it never signs.
+pub mod operator_proof;
 #[allow(dead_code)] // Dormant origin layer; no production caller until reviewed integration.
 mod origin;
 mod persistent;
@@ -60,6 +63,7 @@ mod retirement_shape;
 mod role_command;
 mod role_epochs;
 mod role_freeze;
+mod role_view;
 mod state;
 mod stored;
 mod trust;

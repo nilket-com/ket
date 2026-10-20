@@ -285,9 +285,9 @@ fn a_profile_two_install_verifies_under_the_admission_key_only() {
 		.unwrap()
 		.verify_strict(&preimage, &sig)
 		.expect("the governance signature is valid over the same preimage");
-	assert!(check_admin_statement2(&admin, &by_admission).is_ok());
+	assert!(check_admin_statement2(&admin.view(), &by_admission).is_ok());
 	assert_eq!(
-		check_admin_statement2(&admin, &by_governance).err(),
+		check_admin_statement2(&admin.view(), &by_governance).err(),
 		Some(StatementError2::Signature)
 	);
 	// Envelopes.

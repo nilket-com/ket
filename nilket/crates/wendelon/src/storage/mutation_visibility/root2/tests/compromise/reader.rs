@@ -1,18 +1,14 @@
-//! Test-only reader of the Root2 context export (C-S6b contract §5). It parses the format
-//! independently of the writer, checks the trusted manifest, and replays the successor chain with
-//! the production role-proof signature check (`slot_signed`, the check `verify_for` itself runs)
-//! under the keys active before each record. The production reader belongs to the key custody
-//! facade slice; this one exists so the §5.3 refusals are exercised now.
+//! The test side of the Root2 context export (C-S6b contract §5): an independent parser and
+//! encoder of the format, used to build exact tampered exports, and `verify`, which is the
+//! production reader (`operator_proof::verify_context_export`, replaying the chain with the real
+//! `verify_core` under `role_requirement`). Every refusal the tests assert is the production one.
 use crate::consensus::ROOT2_COMMAND_ENVELOPE_MAX1;
-use crate::storage::mutation_visibility::root2::admin::key::check_enrollable_admin_key2;
-use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AnyAdminManifest2, any_manifest_digest2,
-};
 use crate::storage::mutation_visibility::root2::codec::hash;
-use crate::storage::mutation_visibility::root2::command::Command2;
-use crate::storage::mutation_visibility::root2::role_command::{
-	CONTEXT_BYTES3, ROLE_PROOF_BYTES3, RoleForm3, parse as parse_proof, slot_signed,
+pub(super) use crate::storage::mutation_visibility::root2::operator_proof::ContextRefusal as Refusal;
+use crate::storage::mutation_visibility::root2::operator_proof::{
+	VerifiedContext, verify_context_export,
 };
+use crate::storage::mutation_visibility::root2::role_command::{CONTEXT_BYTES3, ROLE_PROOF_BYTES3};
 use crate::storage::mutation_visibility::root2::types::{Digest2, Log2};
 
 pub(super) const CONTEXT_DOMAIN: &[u8] = b"VISROOT2-ROLE3-CONTEXT\0";
@@ -39,70 +35,6 @@ pub(super) struct Parsed {
 	pub(super) retired: Option<Log2>,
 	pub(super) successors: Vec<Record>,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Refusal {
-	Truncated,
-	Digest,
-	Magic,
-	Version,
-	Reserved,
-	Coverage,
-	Boolean,
-	Fill,
-	Count,
-	RoleCount,
-	Role,
-	CommandLength,
-	SidecarLength,
-	Trailing,
-	Manifest,
-	Pin,
-	Decode,
-	Deployment,
-	Kind,
-	Key,
-	Enrollable,
-	Duplicate,
-	Epoch,
-	Order,
-	Proof,
-}
-
-/// An audit-derived value: not chain-verified, so there is no accessor that yields it as trusted
-/// history, only the named fail-safe uses.
-#[derive(Debug)]
-pub(super) struct AuditDerived<T>(T);
-impl AuditDerived<bool> {
-	/// A frozen export refuses role actions other than Unfreeze.
-	pub(super) fn refuses_while_frozen(&self) -> bool {
-		self.0
-	}
-}
-impl AuditDerived<Option<Log2>> {
-	/// A retirement refuses every further action.
-	pub(super) fn refuses_as_retired(&self) -> bool {
-		self.0.is_some()
-	}
-	/// The Freeze/Unfreeze binding: a forged value fails safe as a consumed `Denied(24)`.
-	pub(super) fn freeze_binding(&self) -> Log2 {
-		self.0.unwrap_or(Log2 {
-			term: 0,
-			node: 0,
-			index: 0,
-		})
-	}
-}
-pub(super) struct Verified {
-	/// `(role, epoch, key)` of every re-verified successor, in log order.
-	pub(super) history: Vec<(u8, u64, Digest2)>,
-	/// The active `(epoch, key)` per role after the chain.
-	pub(super) active: [(u64, Digest2); 3],
-	pub(super) context_authenticated: bool,
-	pub(super) frozen: AuditDerived<bool>,
-	pub(super) transition: AuditDerived<Option<Log2>>,
-	pub(super) retired: AuditDerived<Option<Log2>>,
-}
-
 struct Cursor<'a>(&'a [u8]);
 impl<'a> Cursor<'a> {
 	fn take(&mut self, n: usize) -> Result<&'a [u8], Refusal> {
@@ -290,113 +222,15 @@ pub(super) fn resealed(sealed: &[u8]) -> Vec<u8> {
 	reseal(sealed[..sealed.len() - 32].to_vec())
 }
 
-fn rotation(command: &Command2) -> Option<(u8, Digest2)> {
-	match command {
-		Command2::RotateAdmin(key) => Some((1, *key)),
-		Command2::RotateGovernance(key) => Some((2, *key)),
-		Command2::RotateRecovery(key) => Some((3, *key)),
-		_ => None,
-	}
+/// The production reader, unchanged.
+pub(super) fn verify(bytes: &[u8], trusted_manifest: &[u8]) -> Result<VerifiedContext, Refusal> {
+	verify_context_export(bytes, trusted_manifest)
 }
-/// The role pair a rotation's `VISROL03` proof must carry, as the production verifier requires:
-/// admin and governance by recovery, recovery jointly by admin and governance.
-fn role_requirement(role: u8) -> [u8; 2] {
-	if role == 3 { [1, 2] } else { [3, 0] }
-}
-/// The proof binds this context and command and verifies under the active keys, slot by slot,
-/// with the production signature check.
-fn proof_verifies(
-	sidecar: &[u8],
-	context: Digest2,
-	command: Digest2,
-	expected: [u8; 2],
-	keys: &[Vec<Digest2>; 3],
-) -> bool {
-	if parse_proof(sidecar).is_err() || sidecar[12..44] != context || sidecar[44..76] != command {
-		return false;
-	}
-	for (slot, at) in [76usize, 150].into_iter().enumerate() {
-		if sidecar[at] != expected[slot] {
-			return false;
-		}
-		if expected[slot] == 0 {
-			continue;
-		}
-		let history = &keys[usize::from(expected[slot] - 1)];
-		let epoch = u64::from_le_bytes(sidecar[at + 1..at + 9].try_into().unwrap());
-		if sidecar[at + 9] != 1 || epoch != history.len() as u64 - 1 {
-			return false;
-		}
-		let key = history.last().expect("an original key");
-		if slot_signed(sidecar, expected, slot, RoleForm3::Legacy, key) != Ok(true) {
-			return false;
-		}
-	}
-	true
-}
-
-/// §5: parse, bind to the trusted manifest, replay the chain.
-pub(super) fn verify(bytes: &[u8], trusted_manifest: &[u8]) -> Result<Verified, Refusal> {
-	let p = parse(bytes)?;
-	if p.manifest != trusted_manifest {
-		return Err(Refusal::Manifest);
-	}
-	let Ok(AnyAdminManifest2::Three(m)) = AnyAdminManifest2::decode(&p.manifest) else {
-		return Err(Refusal::Manifest);
-	};
-	let any = AnyAdminManifest2::Three(m.clone());
-	let pin = any_manifest_digest2(&any.encode().map_err(|_| Refusal::Manifest)?);
-	if pin[..] != p.context[156..188] {
-		return Err(Refusal::Pin);
-	}
-	let generation: [u8; 16] = p.context[..16].try_into().unwrap();
-	let cluster: [u8; 16] = p.context[16..32].try_into().unwrap();
-	let installed = u64::from_le_bytes(p.context[44..52].try_into().unwrap());
-	let context = hash(CONTEXT_DOMAIN, &p.context);
-	let mut keys: [Vec<Digest2>; 3] = [
-		vec![any.admission().admin_key],
-		vec![m.governance().key()],
-		vec![m.recovery().key()],
-	];
-	let mut last = installed;
-	let mut history = Vec::new();
-	for s in &p.successors {
-		let (g, c, command) = Command2::decode(&s.command).map_err(|_| Refusal::Decode)?;
-		if (g, c) != (generation, cluster) {
-			return Err(Refusal::Deployment);
-		}
-		let (role, key) = rotation(&command).ok_or(Refusal::Kind)?;
-		if role != s.role {
-			return Err(Refusal::Kind);
-		}
-		if key != s.key {
-			return Err(Refusal::Key);
-		}
-		check_enrollable_admin_key2(&key).map_err(|_| Refusal::Enrollable)?;
-		if keys.iter().flatten().any(|k| *k == key) {
-			return Err(Refusal::Duplicate);
-		}
-		let i = usize::from(role - 1);
-		if s.epoch != keys[i].len() as u64 {
-			return Err(Refusal::Epoch);
-		}
-		if s.activated.index <= last {
-			return Err(Refusal::Order);
-		}
-		let digest = command.digest(g, c).map_err(|_| Refusal::Decode)?;
-		if !proof_verifies(&s.sidecar, context, digest, role_requirement(role), &keys) {
-			return Err(Refusal::Proof);
-		}
-		last = s.activated.index;
-		keys[i].push(key);
-		history.push((role, s.epoch, key));
-	}
-	Ok(Verified {
-		history,
-		active: std::array::from_fn(|i| (keys[i].len() as u64 - 1, *keys[i].last().unwrap())),
-		context_authenticated: !p.successors.is_empty(),
-		frozen: AuditDerived(p.frozen),
-		transition: AuditDerived(p.transition),
-		retired: AuditDerived(p.retired),
-	})
+/// A LogId20 as the export carries it.
+pub(super) fn log20(l: Log2) -> [u8; 20] {
+	let mut b = [0; 20];
+	b[..8].copy_from_slice(&l.term.to_le_bytes());
+	b[8..12].copy_from_slice(&l.node.to_le_bytes());
+	b[12..].copy_from_slice(&l.index.to_le_bytes());
+	b
 }

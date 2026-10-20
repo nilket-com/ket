@@ -3,7 +3,7 @@ use super::*;
 fn legacy_admin_statement_epoch0_after_rotation_denied8() {
 	let mut f = F::new();
 	let old = f.legacy_statement();
-	assert!(check_admin_statement2(&f.installed(), &old).is_ok());
+	assert!(check_admin_statement2(&f.installed().view(), &old).is_ok());
 	f.rotate(0, 40);
 	deny(f.f.apply(Command2::AdmissionPermission(old), None), 8);
 	assert_eq!(f.root().state.permissions.len(), 0);
@@ -15,7 +15,7 @@ fn legacy_governance_sidecar_epoch0_after_rotation_denied8() {
 	let old = f.f.envelope(&f.f.state, &c, 12);
 	assert!(
 		super::super::super::governance_command::check_governance_command2(
-			&f.installed(),
+			&f.installed().view(),
 			super::super::super::governance_command::GovernanceAction2::EnrollAuthority,
 			&old,
 			c.digest(f.f.dep.generation, f.f.dep.cluster).unwrap()
@@ -170,14 +170,13 @@ fn profile_one_two_new_forms_canonical_auth_denied8() {
 			Command2::RotateGovernance(key(41)),
 			Command2::RotateRecovery(key(42)),
 		] {
-			let mut p = vec![0; 224];
-			p[..8].copy_from_slice(b"VISROL03");
-			p[8] = 1;
-			p[12..44].copy_from_slice(&role_command::context_digest(
-				&install_admin2(&f.state, &f.pin).unwrap(),
-			));
-			p[44..76].copy_from_slice(&c.digest(f.dep.generation, f.dep.cluster).unwrap());
-			deny(f.apply(c, Some(p)), 8);
+			let p = role_command::encode_role_proof3(
+				role_command::context_digest(&install_admin2(&f.state, &f.pin).unwrap()),
+				c.digest(f.dep.generation, f.dep.cluster).unwrap(),
+				[(0, 0, false, [0; 64]); 2],
+			)
+			.unwrap();
+			deny(f.apply(c, Some(p.to_vec())), 8);
 		}
 		let a = install_admin2(&f.state, &f.pin).unwrap();
 		deny(

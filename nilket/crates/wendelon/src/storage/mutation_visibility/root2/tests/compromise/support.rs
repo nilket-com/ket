@@ -12,12 +12,12 @@ use crate::storage::mutation_visibility::root2::admin_install::{
 };
 use crate::storage::mutation_visibility::root2::admin_statement::{
 	AdminAction2, AdmissionNamespace2, PermissionKey2, admin_statement_preimage2,
-	encode_admin_statement2, epoch_statement_preimage3,
+	encode_admin_statement2, encode_epoch_statement3, epoch_statement_preimage3,
 };
 use crate::storage::mutation_visibility::root2::command::{ApplyResult2, Command2};
 use crate::storage::mutation_visibility::root2::origin::root_and_origin2;
 use crate::storage::mutation_visibility::root2::role_command::{
-	RoleForm3, context_digest, preimage_for,
+	RoleForm3, context_digest, encode_role_proof3, preimage_for,
 };
 use crate::storage::mutation_visibility::root2::types::{Digest2, Log2};
 use crate::test_support::TestDir;
@@ -96,28 +96,25 @@ impl Root {
 			Command2::Unfreeze(_) => RoleForm3::Unfreeze,
 			_ => RoleForm3::Legacy,
 		};
-		let mut b = vec![0; 224];
-		b[..8].copy_from_slice(b"VISROL03");
-		b[8..10].copy_from_slice(&1u16.to_le_bytes());
-		b[12..44].copy_from_slice(&context_digest(&self.admin));
-		b[44..76].copy_from_slice(&self.digest(c));
-		for ((role, epoch, _), at) in slots.into_iter().zip([76, 150]) {
-			b[at] = role;
-			if role != 0 {
-				b[at + 1..at + 9].copy_from_slice(&epoch.to_le_bytes());
-				b[at + 9] = 1;
-			}
-		}
+		let (context, digest) = (context_digest(&self.admin), self.digest(c));
+		let slot = |i: usize, sig: [u8; 64]| match slots[i] {
+			(0, ..) => (0, 0, false, sig),
+			(role, epoch, _) => (role, epoch, true, sig),
+		};
+		let unsigned =
+			encode_role_proof3(context, digest, [slot(0, [0; 64]), slot(1, [0; 64])]).unwrap();
 		let roles = [slots[0].0, slots[1].0];
-		for (i, ((role, _, seed), at)) in slots.into_iter().zip([76, 150]).enumerate() {
+		let mut sigs = [[0; 64]; 2];
+		for (i, (role, _, seed)) in slots.into_iter().enumerate() {
 			if role != 0
-				&& let Ok(pre) = preimage_for(&b, roles, i, form)
+				&& let Ok(pre) = preimage_for(&unsigned, roles, i, form)
 			{
-				let sig = SigningKey::from_bytes(&[seed; 32]).sign(&pre).to_bytes();
-				b[at + 10..at + 74].copy_from_slice(&sig);
+				sigs[i] = SigningKey::from_bytes(&[seed; 32]).sign(&pre).to_bytes();
 			}
 		}
-		b
+		encode_role_proof3(context, digest, [slot(0, sigs[0]), slot(1, sigs[1])])
+			.unwrap()
+			.to_vec()
 	}
 	pub(super) fn apply(&mut self, c: Command2, sidecar: Option<Vec<u8>>) -> ApplyResult2 {
 		self.f.apply(c, sidecar)
@@ -189,18 +186,13 @@ impl Root {
 	}
 	/// A `VISADS03` statement claiming admin `epoch`, signed by `seed`.
 	pub(super) fn epoch_statement_use(&mut self, seed: u8, epoch: u64) -> ApplyResult2 {
-		let c = admin_context2(&self.admin);
-		let old =
-			encode_admin_statement2(AdminAction2::Grant, &self.permission_key(), &c, &[0; 64])
-				.unwrap();
-		let mut b = [0; 345];
-		b[..273].copy_from_slice(&old[..273]);
-		b[..8].copy_from_slice(b"VISADS03");
-		b[273..281].copy_from_slice(&epoch.to_le_bytes());
+		let (c, k) = (admin_context2(&self.admin), self.permission_key());
+		let unsigned =
+			encode_epoch_statement3(AdminAction2::Grant, &k, &c, epoch, &[0; 64]).unwrap();
 		let sig = SigningKey::from_bytes(&[seed; 32])
-			.sign(&epoch_statement_preimage3(&b).unwrap())
+			.sign(&epoch_statement_preimage3(&unsigned).unwrap())
 			.to_bytes();
-		b[281..].copy_from_slice(&sig);
+		let b = encode_epoch_statement3(AdminAction2::Grant, &k, &c, epoch, &sig).unwrap();
 		self.apply(Command2::EpochAdmissionPermission(b), None)
 	}
 	/// Rotates `role` to the key of `seed`: admin and governance by recovery, recovery jointly.

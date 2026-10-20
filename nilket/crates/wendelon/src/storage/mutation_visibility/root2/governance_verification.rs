@@ -80,14 +80,13 @@ fn governance_failure2(
 	}
 	let admin = install_admin2(state, pin).map_err(VerifyError2::Install)?;
 	if role_proof {
-		if !super::admin_install::admin_governance2(&admin)
-			.is_some_and(|r| r.actions() & action.bit() != 0)
+		if !admin.view().governs(action)
 			|| !super::role_command::verify(&admin, bytes, digest, [2, 0])
 				.map_err(VerifyError2::Role)?
 		{
 			return Ok(Some(Denial2::Envelope(GovernanceCommandError2::Signature)));
 		}
-	} else if let Err(error) = check_governance_command2(&admin, action, bytes, digest) {
+	} else if let Err(error) = check_governance_command2(&admin.view(), action, bytes, digest) {
 		return Ok(Some(Denial2::Envelope(error)));
 	}
 	let namespace = admin_namespace2(&admin);

@@ -1,4 +1,7 @@
 //! Compact, canonical role proofs. No signing, authority factory or persistent active-key cache.
+use super::admin::manifest::ManifestProfile2;
+use super::command::Command2;
+use super::role_view::RoleView3;
 use super::{admin_install::*, codec::hash, types::Digest2};
 use ed25519_dalek::{Signature, VerifyingKey};
 pub(super) const ROLE_PROOF_BYTES3: usize = 224;
@@ -68,11 +71,29 @@ pub(super) fn context_bytes(c: &AdminContext2) -> [u8; CONTEXT_BYTES3] {
 	b.extend(c.manifest_pin);
 	b.try_into().expect("fixed administrator context width")
 }
+/// The inverse of `context_bytes`: every field is fixed width, so any 188 bytes are one context.
+pub(super) fn context_from_bytes(b: &[u8; CONTEXT_BYTES3]) -> AdminContext2 {
+	AdminContext2 {
+		generation: array(b, 0),
+		cluster: array(b, 16),
+		installed_at: super::types::Log2 {
+			term: u64::from_le_bytes(array(b, 32)),
+			node: u32::from_le_bytes(array(b, 40)),
+			index: u64::from_le_bytes(array(b, 44)),
+		},
+		bootstrap_fingerprint: array(b, 52),
+		bootstrap_command: array(b, 84),
+		genesis: array(b, 116),
+		initial_epoch: u64::from_le_bytes(array(b, 148)),
+		manifest_pin: array(b, 156),
+	}
+}
 pub(super) fn context_digest(a: &InstalledAdmin2) -> Digest2 {
-	hash(
-		b"VISROOT2-ROLE3-CONTEXT\0",
-		&context_bytes(&admin_context2(a)),
-	)
+	context_digest3(&admin_context2(a))
+}
+/// The one role-proof context digest: the domain over exactly `context_bytes`.
+pub(super) fn context_digest3(c: &AdminContext2) -> Digest2 {
+	hash(b"VISROOT2-ROLE3-CONTEXT\0", &context_bytes(c))
 }
 #[derive(Clone, Copy)]
 pub(super) enum RoleForm3 {
@@ -80,6 +101,27 @@ pub(super) enum RoleForm3 {
 	Freeze,
 	Unfreeze,
 	Retire,
+}
+/// The role pair and form a proof for `command` must carry, given the proof's slot-0 role, which
+/// alone separates RetireRoot `[3,0]` from `[1,2]` and Unfreeze `[1,3]` from `[2,3]`. `None` for
+/// a command no role proof authorizes. Shared by `verify_command2` and the offline facade.
+pub(super) fn role_requirement(command: &Command2, slot0_role: u8) -> Option<([u8; 2], RoleForm3)> {
+	let expected = match command {
+		Command2::RetireRoot if slot0_role == 3 => [3, 0],
+		Command2::RetireRoot => [1, 2],
+		Command2::RotateRecovery(_) => [1, 2],
+		Command2::Unfreeze(_) if slot0_role == 1 => [1, 3],
+		Command2::Unfreeze(_) => [2, 3],
+		Command2::RotateAdmin(_) | Command2::RotateGovernance(_) | Command2::Freeze(_) => [3, 0],
+		_ => return None,
+	};
+	let form = match command {
+		Command2::RetireRoot => RoleForm3::Retire,
+		Command2::Freeze(_) => RoleForm3::Freeze,
+		Command2::Unfreeze(_) => RoleForm3::Unfreeze,
+		_ => RoleForm3::Legacy,
+	};
+	Some((expected, form))
 }
 fn domain(
 	form: RoleForm3,
@@ -131,6 +173,7 @@ pub(super) fn verify(
 ) -> Result<bool, RoleProofError3> {
 	verify_for(a, bytes, command, expected, RoleForm3::Legacy)
 }
+/// The installed administrator's check: a thin wrapper over `verify_core` on its view.
 pub(super) fn verify_for(
 	a: &InstalledAdmin2,
 	bytes: &[u8],
@@ -138,9 +181,20 @@ pub(super) fn verify_for(
 	expected: [u8; 2],
 	form: RoleForm3,
 ) -> Result<bool, RoleProofError3> {
+	verify_core(&a.view(), bytes, command, expected, form)
+}
+/// The slot loop: profile 3, the view's context and this command bound, then each expected slot
+/// present at its role's active epoch and signed by that epoch's key.
+pub(super) fn verify_core(
+	view: &RoleView3,
+	bytes: &[u8],
+	command: Digest2,
+	expected: [u8; 2],
+	form: RoleForm3,
+) -> Result<bool, RoleProofError3> {
 	parse(bytes)?;
-	if admin_profile2(a) != super::admin::manifest::ManifestProfile2::Three
-		|| bytes[12..44] != context_digest(a)
+	if view.profile() != ManifestProfile2::Three
+		|| bytes[12..44] != context_digest3(&view.context())
 		|| bytes[44..76] != command
 	{
 		return Ok(false);
@@ -155,7 +209,7 @@ pub(super) fn verify_for(
 		if bytes[at + 9] != 1 {
 			return Ok(false);
 		}
-		let Some((epoch, key)) = active_role3(a, usize::from(expected[i] - 1)) else {
+		let Some((epoch, key)) = view.active(usize::from(expected[i] - 1)) else {
 			return Ok(false);
 		};
 		if u64::from_le_bytes(array(bytes, at + 1)) != epoch {
@@ -166,6 +220,29 @@ pub(super) fn verify_for(
 		}
 	}
 	Ok(true)
+}
+/// One slot as written: role (0 empty), epoch, presence, signature.
+pub(super) type RoleSlot3 = (u8, u64, bool, [u8; 64]);
+/// The canonical `VISROL03` bytes for these bindings and slots; refuses exactly what `parse`
+/// refuses. The one production layout of a role proof.
+pub(super) fn encode_role_proof3(
+	context: Digest2,
+	command: Digest2,
+	slots: [RoleSlot3; 2],
+) -> Result<[u8; ROLE_PROOF_BYTES3], RoleProofError3> {
+	let mut b = [0; ROLE_PROOF_BYTES3];
+	b[..8].copy_from_slice(b"VISROL03");
+	b[8..10].copy_from_slice(&1u16.to_le_bytes());
+	b[12..44].copy_from_slice(&context);
+	b[44..76].copy_from_slice(&command);
+	for ((role, epoch, present, signature), at) in slots.into_iter().zip([76, 150]) {
+		b[at] = role;
+		b[at + 1..at + 9].copy_from_slice(&epoch.to_le_bytes());
+		b[at + 9] = u8::from(present);
+		b[at + 10..at + 74].copy_from_slice(&signature);
+	}
+	parse(&b)?;
+	Ok(b)
 }
 /// Slot `slot`'s strict signature under `key` over the form's canonical preimage: the one role
 /// proof signature check, shared by `verify_for` and the offline compromise audit (which supplies

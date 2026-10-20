@@ -3,9 +3,8 @@
 //! issuer authorization, carries no committed-provenance claim, and implements no lifecycle,
 //! registry or replay semantics. Its whole context must be re-bound to the administrator installed
 //! at the pre-entry cut by the later issuer gate. No signing or key custody happens here.
-use super::admin_install::{
-	AdminContext2, InstalledAdmin2, admin_context2, admin_key2, admin_namespace2,
-};
+use super::admin_install::AdminContext2;
+use super::role_view::RoleView3;
 use super::types::{AuthorityRef2, Log2};
 use crate::storage::mutation_visibility::{MutationScope, redacted_debug};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -258,14 +257,14 @@ pub(in crate::storage::mutation_visibility::root2) fn admin_statement_preimage2(
 }
 /// Order: structure, the whole context, the exact administrator scope, then the strict signature.
 pub(in crate::storage::mutation_visibility::root2) fn check_admin_statement2(
-	admin: &InstalledAdmin2,
+	view: &RoleView3,
 	bytes: &[u8],
 ) -> Result<CheckedStatement2, StatementError2> {
 	let p = parse(bytes)?;
-	if p.context != admin_context2(admin) {
+	if p.context != view.context() {
 		return Err(StatementError2::Context);
 	}
-	let ns = admin_namespace2(admin);
+	let ns = view.namespace();
 	let n = &p.key.namespace;
 	if n.generation != p.context.generation
 		|| (n.tenant, n.scope, n.table, n.schema) != (ns.tenant, ns.scope, ns.table, ns.schema)
@@ -274,10 +273,10 @@ pub(in crate::storage::mutation_visibility::root2) fn check_admin_statement2(
 	}
 	let preimage =
 		admin_statement_preimage2(bytes.try_into().map_err(|_| StatementError2::Length)?)?;
-	if super::admin_install::active_role3(admin, 0).is_some_and(|(k, _)| k != 0) {
+	if view.active(0).is_some_and(|(k, _)| k != 0) {
 		return Err(StatementError2::Signature);
 	}
-	VerifyingKey::from_bytes(&admin_key2(admin))
+	VerifyingKey::from_bytes(&view.admin_key())
 		.map_err(|_| StatementError2::Signature)?
 		.verify_strict(&preimage, &Signature::from_bytes(&p.signature))
 		.map_err(|_| StatementError2::Signature)?;
@@ -340,6 +339,24 @@ pub(in crate::storage::mutation_visibility::root2) fn inspect_epoch_statement3(
 		cluster: p.context.cluster,
 	})
 }
+/// Canonical `VISADS03` bytes: the statement's fields under an explicit administrator epoch, then
+/// the signature; refuses exactly the inputs the parser would refuse.
+pub(in crate::storage::mutation_visibility::root2) fn encode_epoch_statement3(
+	action: AdminAction2,
+	key: &PermissionKey2,
+	context: &AdminContext2,
+	epoch: u64,
+	signature: &[u8; 64],
+) -> Result<[u8; EPOCH_STATEMENT_BYTES3], StatementError2> {
+	check_fields(context, key)?;
+	let fields = write(action, key, context, &[0; 64]);
+	let mut b = [0; EPOCH_STATEMENT_BYTES3];
+	b[..8].copy_from_slice(b"VISADS03");
+	b[8..SIGNED].copy_from_slice(&fields[8..SIGNED]);
+	b[SIGNED..SIGNED + 8].copy_from_slice(&epoch.to_le_bytes());
+	b[SIGNED + 8..].copy_from_slice(signature);
+	Ok(b)
+}
 pub(in crate::storage::mutation_visibility::root2) fn epoch_statement_preimage3(
 	bytes: &[u8],
 ) -> Result<Vec<u8>, StatementError2> {
@@ -350,22 +367,21 @@ pub(in crate::storage::mutation_visibility::root2) fn epoch_statement_preimage3(
 	Ok(b)
 }
 pub(in crate::storage::mutation_visibility::root2) fn check_epoch_statement3(
-	admin: &InstalledAdmin2,
+	view: &RoleView3,
 	bytes: &[u8],
 ) -> Result<CheckedStatement2, StatementError2> {
 	let (p, k) = parse_epoch3(bytes)?;
-	if p.context != admin_context2(admin) {
+	if p.context != view.context() {
 		return Err(StatementError2::Context);
 	}
-	let ns = admin_namespace2(admin);
+	let ns = view.namespace();
 	let n = &p.key.namespace;
 	if n.generation != p.context.generation
 		|| (n.tenant, n.scope, n.table, n.schema) != (ns.tenant, ns.scope, ns.table, ns.schema)
 	{
 		return Err(StatementError2::Scope);
 	}
-	let (active, key) =
-		super::admin_install::active_role3(admin, 0).ok_or(StatementError2::Signature)?;
+	let (active, key) = view.active(0).ok_or(StatementError2::Signature)?;
 	if active != k {
 		return Err(StatementError2::Signature);
 	}
