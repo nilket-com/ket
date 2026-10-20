@@ -40,6 +40,7 @@ use crate::storage::mutation_visibility::root2::verification::advance_verified2;
 use ed25519_dalek::{Signer, SigningKey};
 
 mod moves;
+mod prime;
 
 const fn nibble(c: u8) -> u8 {
 	match c {
@@ -113,6 +114,13 @@ pub(super) const S1_TENANT: u64 = 1;
 pub(super) const SEEDED_ROLE_IDS: [[u8; 16]; 3] = [[0x51; 16], [0x52; 16], [0x53; 16]];
 /// The foreign cluster of the KAT root-mismatch test.
 pub(super) const KAT_FOREIGN_CLUSTER: [u8; 16] = [0x34; 16];
+/// `M3_PRIME`: the profile-1 G1d fixture manifest's admission fields (generation `0xa1`, cluster
+/// `0xc2`, epoch 7, tenant 0, Table `0x7a`, schema 2) with the TEST admin seed 0x5A, governance
+/// id 0x6C / seed 0x6B and recovery id 0x7c / seed 0x7b. Every vector bound to that fixture ports
+/// to it.
+pub(super) const PRIME_ADMIN_SEED: u8 = 0x5A;
+pub(super) const PRIME_GOVERNANCE: ([u8; 16], u8) = ([0x6C; 16], 0x6B);
+pub(super) const PRIME_RECOVERY: ([u8; 16], u8) = ([0x7c; 16], 0x7b);
 
 pub(super) const M3_PRIMARY: [u8; 241] = bytes_of(concat!(
 	"56495341444d320001000300424242424242424242424242424242424d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d",
@@ -145,6 +153,15 @@ pub(super) const M3_S1: [u8; 241] = bytes_of(concat!(
 	"000000000052525252525252525252525252525252c91cb3ce2b84e4ba85f562ece41edfe4e27afc52d88d50",
 	"7f66a18638df823e9fff010000535353535353535353535353535353534dd9b6496a27571acb089a5e3482df",
 	"c86acdeddc4d1f28e15a9b04f026d7f2261f000000",
+));
+
+pub(super) const M3_PRIME: [u8; 241] = bytes_of(concat!(
+	"56495341444d320001000300a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+	"07000000000000000e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0d7550754e0800a5d237eef5826035766b9b3e5a",
+	"15868a940ab289958788e3b0030000000000000000000000017a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a020000",
+	"00000000006c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c8320a51977d8c38ca8a4927c670df5821e449761945e15",
+	"e9efb26a1509d230eaff0100007c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7f747b67bd3fe63c2a736739dfe401",
+	"56d622347346e70f68f51c178a75ce55371f000000",
 ));
 
 /// A profile-3 manifest's canonical bytes from its parts, through the published constructors.
@@ -329,6 +346,37 @@ pub(super) fn exact_pin(bytes: &[u8]) -> Digest2 {
 		),
 		n => panic!("no canonical length {n}"),
 	}
+}
+/// A coherent Part A tuple for this exact profile-3 manifest whose single Bound record is `record`,
+/// over the v3 snapshot; Part A must accept it.
+pub(super) fn tuple_of(manifest: &[u8], record: BootstrapRecord2) -> PinnedBoundTuple2 {
+	let any = AnyAdminManifest2::decode(manifest).unwrap();
+	let a = any.admission();
+	let pin = exact_pin(manifest);
+	let snapshot = encode_snapshot2(&LogState2 {
+		roots: vec![RootEntry2 {
+			terminal: None,
+			identity: RootIdentity2 {
+				generation: a.generation,
+				cluster: a.cluster,
+				pin,
+				admin_key: a.admin_key,
+			},
+			manifest: any.clone(),
+			state: RootState2::Bound,
+			last_seq: record.inventory_seq,
+			record: Some(record),
+		}],
+		last_seq: record.inventory_seq,
+	})
+	.unwrap();
+	validate_replica_tuple2(&ReplicaInputs2 {
+		manifest: Some(manifest),
+		manifest_pin: Some(&pin),
+		snapshot: Some(&snapshot),
+		inventory_pin: Some(&hash(&snapshot)),
+	})
+	.expect("Part A accepts the coherent tuple")
 }
 pub(super) fn pre_root() -> MutationAuthorityState2 {
 	let first = CommittedEntry2::fixture(at(0, 0, 0), genesis(), EntryClass2::Membership);

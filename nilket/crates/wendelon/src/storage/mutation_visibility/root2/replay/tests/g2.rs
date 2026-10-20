@@ -92,7 +92,7 @@ async fn g2_small_state_replay() {
 		let v: serde_json::Value =
 			serde_json::from_str(include_str!("../../tests/statement_vectors.json")).unwrap();
 		let a = Command2::AdmissionPermission(
-			unhex(v["grant"]["bytes"].as_str().unwrap())
+			unhex(v["p3_grant"]["bytes"].as_str().unwrap())
 				.try_into()
 				.unwrap(),
 		);

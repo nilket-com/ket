@@ -1,4 +1,7 @@
 use super::*;
+use crate::storage::mutation_visibility::root2::tests::profile_three_fixture::M3_PRIMARY;
+use crate::storage::mutation_visibility::root2::validation::usage;
+use crate::storage::mutation_visibility::root2::{Root2, UnverifiedRoot2};
 pub(super) fn key(seed: u8) -> Digest2 {
 	SigningKey::from_bytes(&[seed; 32])
 		.verifying_key()
@@ -20,11 +23,11 @@ pub(super) struct F {
 impl F {
 	pub(super) fn new() -> Self {
 		Self {
-			f: wire::Fixture::profile_three(&crate::storage::mutation_visibility::root2::tests::profile_three_fixture::M3_PRIMARY),
+			f: wire::Fixture::profile_three(&M3_PRIMARY),
 			seeds: [11, 12, 13],
 		}
 	}
-	pub(super) fn root(&self) -> &super::super::super::Root2 {
+	pub(super) fn root(&self) -> &Root2 {
 		root_and_origin2(&self.f.state).unwrap().0
 	}
 	pub(super) fn installed(&self) -> InstalledAdmin2 {
@@ -153,16 +156,10 @@ impl F {
 	pub(super) fn roundtrip(&self) {
 		let bytes = self.root().encode().unwrap();
 		assert_eq!(
-			super::super::super::UnverifiedRoot2::decode(&bytes)
-				.unwrap()
-				.encode()
-				.unwrap(),
+			UnverifiedRoot2::decode(&bytes).unwrap().encode().unwrap(),
 			bytes
 		);
-		assert!(
-			super::super::super::validation::usage(&self.root().state).unwrap()
-				== self.root().usage().unwrap()
-		);
+		assert!(usage(&self.root().state).unwrap() == self.root().usage().unwrap());
 	}
 }
 pub(super) fn reseal(mut b: Vec<u8>) -> Vec<u8> {

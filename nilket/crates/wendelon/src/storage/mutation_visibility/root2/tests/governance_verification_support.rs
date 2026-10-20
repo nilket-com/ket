@@ -1,8 +1,6 @@
 //! Test-only real-entry setup; no production capability or token constructors.
 use crate::consensus::{Root2Carrier1, WendelonRequest, WendelonTypeConfig};
-use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AdminManifestTwo2, AnyAdminManifest2,
-};
+use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::admin_install::*;
 use crate::storage::mutation_visibility::root2::admin_statement::*;
@@ -33,6 +31,14 @@ use std::collections::BTreeMap;
 
 pub(in crate::storage::mutation_visibility::root2) type E = Entry<WendelonTypeConfig>;
 pub(in crate::storage::mutation_visibility::root2) const ISSUER_SEED: u8 = 0x33;
+/// The `M3_PRIMARY` governance role's TEST seed: every governance envelope here signs with it.
+pub(in crate::storage::mutation_visibility::root2) const GOVERNANCE_SEED: u8 =
+	profile_three_fixture::PRIMARY_SEEDS[1];
+/// The other two `M3_PRIMARY` role seeds (administrator, recovery): never governance signers.
+pub(in crate::storage::mutation_visibility::root2) const NON_GOVERNANCE_SEEDS: [u8; 2] = [
+	profile_three_fixture::PRIMARY_SEEDS[0],
+	profile_three_fixture::PRIMARY_SEEDS[2],
+];
 pub(in crate::storage::mutation_visibility::root2) const AUTHORITY_SEED: u8 = 0x44;
 pub(in crate::storage::mutation_visibility::root2) fn key(seed: u8) -> Digest2 {
 	SigningKey::from_bytes(&[seed; 32])
@@ -100,22 +106,26 @@ impl Fixture {
 	pub(in crate::storage::mutation_visibility::root2) fn new(profile: &str) -> Self {
 		Self::from_manifest(profile_two_binding::manifest_bytes(profile))
 	}
+	/// The `M3_PRIMARY` root.
+	pub(in crate::storage::mutation_visibility::root2) fn primary() -> Self {
+		Self::profile_three(&profile_three_fixture::M3_PRIMARY)
+	}
+	/// `M3_PRIMARY` with a Table namespace (table `0x51`, schema 7), so a different pin.
 	pub(in crate::storage::mutation_visibility::root2) fn table_namespace() -> Self {
-		let AnyAdminManifest2::Two(m) =
-			AnyAdminManifest2::decode(&profile_two_binding::manifest_bytes("b")).unwrap()
-		else {
-			unreachable!()
+		use profile_three_fixture::{
+			PRIMARY_GOVERNANCE_ID, PRIMARY_RECOVERY_ID, PRIMARY_SEEDS, build_three, key,
 		};
-		let mut base = m.base().clone();
+		let any = AnyAdminManifest2::decode(&profile_three_fixture::M3_PRIMARY).unwrap();
+		let mut base = any.admission().clone();
 		base.namespace.scope = MutationScope::Table;
 		base.namespace.table = [0x51; 16];
 		base.namespace.schema = 7;
-		let manifest = AdminManifestTwo2::new(base, m.governance())
-			.unwrap()
-			.encode()
-			.unwrap()
-			.to_vec();
-		Self::from_manifest(manifest)
+		let manifest = build_three(
+			base,
+			(PRIMARY_GOVERNANCE_ID, key(PRIMARY_SEEDS[1])),
+			(PRIMARY_RECOVERY_ID, key(PRIMARY_SEEDS[2])),
+		);
+		Self::profile_three(&manifest)
 	}
 	pub(in crate::storage::mutation_visibility::root2) fn envelope(
 		&self,
@@ -156,7 +166,7 @@ impl Fixture {
 		&mut self,
 		command: Command2,
 	) -> ApplyResult2 {
-		let envelope = self.envelope(&self.state, &command, 0x92);
+		let envelope = self.envelope(&self.state, &command, GOVERNANCE_SEED);
 		self.apply(command, Some(envelope))
 	}
 }
@@ -225,7 +235,7 @@ pub(in crate::storage::mutation_visibility::root2) fn differential(
 	f: &mut Fixture,
 	command: Command2,
 ) -> ApplyResult2 {
-	let envelope = f.envelope(&f.state, &command, 0x92);
+	let envelope = f.envelope(&f.state, &command, GOVERNANCE_SEED);
 	let e = carrier(&command, f.dep, tip(&f.state).index + 1, Some(&envelope));
 	let ce = committed_entry2(&CommittedSource2::synthetic(), &e)
 		.unwrap()
@@ -392,7 +402,7 @@ pub(in crate::storage::mutation_visibility::root2) fn permission(
 		},
 	};
 	let unsigned = encode_admin_statement2(AdminAction2::Grant, &key, &ctx, &[0; 64]).unwrap();
-	let sig = SigningKey::from_bytes(&[0x42; 32])
+	let sig = SigningKey::from_bytes(&[profile_three_fixture::PRIMARY_SEEDS[0]; 32])
 		.sign(&admin_statement_preimage2(&unsigned).unwrap())
 		.to_bytes();
 	Command2::AdmissionPermission(

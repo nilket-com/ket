@@ -68,6 +68,42 @@ fn v5_profile_one_two_extensions_refused() {
 	}
 }
 #[test]
+fn v5_non_profile_three_lengths_refused() {
+	use crate::storage::mutation_visibility::root2::{UnverifiedRoot2, role_epochs};
+	// Decoded: length 0 passes the class check and reaches the role-epoch gate; 240 and 242 are
+	// refused by the class check first.
+	for (len, want) in [
+		(0u64, RootError2::RootInvariant),
+		(240, RootError2::ControlClass),
+		(242, RootError2::ControlClass),
+	] {
+		let mut b = bytes(&vectors()["state_v5"]);
+		b[16 + 176..16 + 184].copy_from_slice(&len.to_le_bytes());
+		assert_eq!(
+			UnverifiedRoot2::decode(&reseal(b)).err(),
+			Some(want),
+			"{len}"
+		);
+	}
+	// Direct: the role-epoch gate itself refuses each non-241 length on a valid V5 state.
+	let mut f = F::new();
+	f.rotate(0, 40);
+	let state = f.root().state.clone();
+	assert_eq!(
+		role_epochs::validate(&state, &mut std::collections::BTreeSet::new()),
+		Ok(())
+	);
+	for len in [0, 240, 242] {
+		let mut s = state.clone();
+		s.control_len = len;
+		assert_eq!(
+			role_epochs::validate(&s, &mut std::collections::BTreeSet::new()),
+			Err(RootError2::RootInvariant),
+			"{len}"
+		);
+	}
+}
+#[test]
 fn v5_counts_bound_before_record_read() {
 	let mut b = bytes(&vectors()["state_v5"]);
 	b[16 + 240 + 96] = 65;

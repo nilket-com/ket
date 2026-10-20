@@ -43,7 +43,7 @@ fn rooted() -> MutationAuthorityState2 {
 	let cmd = Command2::Bootstrap {
 		epoch: 1,
 		control: [0x9f; 32],
-		length: 137,
+		length: 241,
 	};
 	let e = TrustedEntry2::fixture(G, C, l(2), &cmd).unwrap();
 	let (_, _, _, fp, d) = e.fields();

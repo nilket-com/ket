@@ -1,5 +1,6 @@
 //! Retirement fixtures are not an independent issuer oracle or runtime activation.
 use super::governance_verification::support as wire;
+use super::profile_three_fixture::{M3_OTHER, s1_command};
 use crate::storage::mutation_visibility::root2::{
 	admin::manifest::*, admin_install::*, admin_statement::*, codec::*, command::*, origin::*,
 	role_command, state::Root2, types::*,
@@ -227,7 +228,7 @@ fn retired_uniform_command_matrix_both_paths() {
 	for name in ["command_reserve", "command_finalize"] {
 		let mut f = F::new();
 		f.retire([3, 0]);
-		denied(f.terminal(crate::storage::mutation_visibility::root2::tests::profile_three_fixture::s1_command(name), None), 25);
+		denied(f.terminal(s1_command(name), None), 25);
 	}
 	for epoch in [false, true] {
 		let mut f = F::new();
@@ -356,8 +357,12 @@ fn terminal_confirmation_original_identity_pin_and_cut() {
 fn terminal_confirmation_mismatch_closure_and_mark_refusals() {
 	let mut f = F::new();
 	f.retire([3, 0]);
-	let other = wire::Fixture::new("a");
-	assert!(confirm_terminal2(&f.f.state, &other.pin).is_err());
+	// Another root's tuple: the commitment rule refuses its pin first.
+	let other = wire::Fixture::profile_three(&M3_OTHER);
+	assert_eq!(
+		confirm_terminal2(&f.f.state, &other.pin).err(),
+		Some(InstallError2::Commitment(CommitmentField2::ControlDigest))
+	);
 }
 #[test]
 fn denied25_encode_decode_none_and_reference_refusal() {

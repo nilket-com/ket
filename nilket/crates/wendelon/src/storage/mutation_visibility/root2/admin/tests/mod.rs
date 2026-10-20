@@ -4,6 +4,7 @@ use super::manifest::*;
 use super::record::*;
 mod negative;
 mod profile_three;
+mod profile_three_negative;
 mod profile_two;
 mod record;
 mod vectors;

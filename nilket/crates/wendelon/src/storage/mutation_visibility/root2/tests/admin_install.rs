@@ -1,5 +1,7 @@
+//! The derived administrator view on the `M3_PRIME` root (the G1d fixture's admission fields,
+//! profile 3), against the independent `p3_` install vectors.
+use super::profile_three_fixture::{M3_PRIME, exact_pin};
 use super::*;
-use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::admin_install::*;
@@ -30,17 +32,14 @@ fn v() -> serde_json::Value {
 fn digest(s: &serde_json::Value) -> Digest2 {
 	unhex(s.as_str().unwrap()).try_into().unwrap()
 }
-fn m1() -> (Vec<u8>, Digest2) {
-	let a: serde_json::Value =
-		serde_json::from_str(include_str!("../provisioning/tests/anchor_vectors.json")).unwrap();
-	let m = unhex(a["manifests"]["m1"]["bytes"].as_str().unwrap());
-	(m, digest(&a["manifests"]["m1"]["pin"]))
+fn prime() -> (Vec<u8>, Digest2) {
+	(M3_PRIME.to_vec(), exact_pin(&M3_PRIME))
 }
 fn canonical_genesis() -> Digest2 {
 	digest(&v()["genesis"])
 }
 fn vector_record() -> BootstrapRecord2 {
-	BootstrapRecord2::decode(&unhex(v()["record"].as_str().unwrap())).unwrap()
+	BootstrapRecord2::decode(&unhex(v()["p3_record"].as_str().unwrap())).unwrap()
 }
 fn at(term: u64, node: u32, index: u64) -> EntryPosition2 {
 	EntryPosition2 { term, node, index }
@@ -60,8 +59,8 @@ impl Boot {
 			g: G,
 			c: C,
 			epoch: 7,
-			control: m1().1,
-			length: 137,
+			control: prime().1,
+			length: 241,
 			genesis: canonical_genesis(),
 			flip_fingerprint: false,
 		}
@@ -91,10 +90,11 @@ impl Boot {
 			.0
 	}
 }
-// A coherent Part A tuple for m1 whose Bound record is `record`; Part A must accept it.
+// A coherent Part A tuple for M3_PRIME whose Bound record is `record`; Part A must accept it.
 fn tuple(record: BootstrapRecord2) -> (PinnedBoundTuple2, Vec<u8>) {
-	let (m, pin) = m1();
-	let manifest = AdminManifest2::decode(&m).unwrap();
+	let (m, pin) = prime();
+	let any = AnyAdminManifest2::decode(&m).unwrap();
+	let manifest = any.admission().clone();
 	let snapshot = encode_snapshot2(&LogState2 {
 		roots: vec![RootEntry2 {
 			terminal: None,
@@ -104,7 +104,7 @@ fn tuple(record: BootstrapRecord2) -> (PinnedBoundTuple2, Vec<u8>) {
 				pin,
 				admin_key: manifest.admin_key,
 			},
-			manifest: AnyAdminManifest2::One(manifest),
+			manifest: any,
 			state: RootState2::Bound,
 			last_seq: record.inventory_seq,
 			record: Some(record),
@@ -128,19 +128,19 @@ fn installs_from_the_original_bootstrap_and_matches_the_vectors() {
 	let x = v();
 	let (t, snapshot) = tuple(vector_record());
 	// The generator built the same snapshot bytes independently.
-	assert_eq!(snapshot, unhex(x["snapshot"].as_str().unwrap()));
-	assert_eq!(sha(&snapshot), digest(&x["inventory_pin"]));
+	assert_eq!(snapshot, unhex(x["p3_snapshot"].as_str().unwrap()));
+	assert_eq!(sha(&snapshot), digest(&x["p3_inventory_pin"]));
 	let state = Boot::standard().rooted();
 	let (_, origin) = root_and_origin2(&state).unwrap();
 	assert_eq!(origin.genesis, digest(&x["genesis"]));
-	assert_eq!(origin.bootstrap_command, digest(&x["bootstrap_command"]));
+	assert_eq!(origin.bootstrap_command, digest(&x["p3_bootstrap_command"]));
 	assert_eq!(
 		origin.bootstrap_fingerprint,
-		digest(&x["bootstrap_fingerprint_stand_in"])
+		digest(&x["p3_bootstrap_fingerprint_stand_in"])
 	);
 	let a = install_admin2(&state, &t).unwrap();
 	let ctx = admin_context2(&a);
-	let want = &x["context"];
+	let want = &x["p3_context"];
 	assert_eq!(
 		ctx.generation.to_vec(),
 		unhex(want["generation"].as_str().unwrap())
@@ -161,13 +161,19 @@ fn installs_from_the_original_bootstrap_and_matches_the_vectors() {
 	assert_eq!(ctx.manifest_pin, digest(&want["manifest_pin"]));
 	assert_eq!(
 		admin_id2(&a).to_vec(),
-		unhex(x["admin_id"].as_str().unwrap())
+		unhex(x["p3_admin_id"].as_str().unwrap())
 	);
 	assert_eq!(
 		admin_key2(&a).to_vec(),
-		unhex(x["admin_key"].as_str().unwrap())
+		unhex(x["p3_admin_key"].as_str().unwrap())
 	);
-	assert!(admin_namespace2(&a) == AdminManifest2::decode(&m1().0).unwrap().namespace);
+	assert!(
+		admin_namespace2(&a)
+			== AnyAdminManifest2::decode(&prime().0)
+				.unwrap()
+				.admission()
+				.namespace
+	);
 	assert!(install_admin2(&state, &t).unwrap() == a);
 	assert_eq!(format!("{a:?}"), "InstalledAdmin2 { redacted }");
 	assert_eq!(format!("{ctx:?}"), "AdminContext2 { redacted }");
@@ -201,9 +207,27 @@ fn later_entries_move_the_tip_but_not_the_installed_bootstrap() {
 		assert_eq!(matches!(result, ApplyResult2::Covered), authorized);
 		state = next;
 		assert!(tip(&state) != original_tip, "the tip advanced at {i}");
+		// Reinstalled per tip: the bound context is unchanged; the profile-3 cut is the new tip.
 		let a = install_admin2(&state, &t).unwrap();
-		assert!(a == before, "installed view unchanged after entry {i}");
+		assert!(
+			admin_context2(&a) == admin_context2(&before),
+			"installed context unchanged after entry {i}"
+		);
+		assert_eq!(admin_cut3(&a), Some(tip(&state)), "entry {i}");
 		assert_eq!(admin_installed_at2(&a), l(2));
+		// Identity and the copied roles are unchanged as well.
+		assert_eq!(
+			(admin_id2(&a), admin_key2(&a)),
+			(admin_id2(&before), admin_key2(&before)),
+			"entry {i}"
+		);
+		assert!(
+			admin_governance2(&a) == admin_governance2(&before),
+			"entry {i}"
+		);
+		assert!(admin_recovery3(&a) == admin_recovery3(&before), "entry {i}");
+		assert_eq!(original_roles3(&a), original_roles3(&before), "entry {i}");
+		assert_eq!(admin_active3(&a), admin_active3(&before), "entry {i}");
 	}
 }
 #[test]
@@ -225,13 +249,15 @@ fn each_refusal_is_reached_with_every_earlier_check_equal() {
 		}),
 		Some(InstallError2::Commitment(CommitmentField2::ControlDigest))
 	);
-	assert_eq!(
-		refuse(Boot {
-			length: 189,
-			..Boot::standard()
-		}),
-		Some(InstallError2::Commitment(CommitmentField2::ControlLength))
-	);
+	// Only 241 roots a profile-3 Bootstrap, so a wrong length is placed by the test hook.
+	for wrong in [240, 242] {
+		let state = with_control_len_for_test(&Boot::standard().rooted(), wrong);
+		assert_eq!(
+			install_admin2(&state, &t).err(),
+			Some(InstallError2::Commitment(CommitmentField2::ControlLength)),
+			"{wrong}"
+		);
+	}
 	assert_eq!(
 		refuse(Boot {
 			g: [0xa3; 16],

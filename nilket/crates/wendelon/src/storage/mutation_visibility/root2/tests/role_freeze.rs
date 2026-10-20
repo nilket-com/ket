@@ -1,5 +1,6 @@
 //! Role epoch tests use actual carrier adaptation and the sole production verification producer.
 use super::governance_verification::support as wire;
+use super::profile_three_fixture::s1_command;
 use crate::storage::mutation_visibility::root2::{
 	admin_install::*, admin_statement::*, codec::*, command::*, origin::*, role_command, types::*,
 	verification::*,
@@ -238,7 +239,7 @@ fn full_command_profile_frozen_state_matrix() {
 			"command_reserve",
 			"command_finalize",
 		] {
-			commands.push(crate::storage::mutation_visibility::root2::tests::profile_three_fixture::s1_command(name));
+			commands.push(s1_command(name));
 		}
 		commands.extend([
 			Command2::AdmissionPermission(f.legacy_statement()),

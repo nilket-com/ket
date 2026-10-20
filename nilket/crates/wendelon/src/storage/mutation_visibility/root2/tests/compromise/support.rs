@@ -16,6 +16,7 @@ use crate::storage::mutation_visibility::root2::origin::root_and_origin2;
 use crate::storage::mutation_visibility::root2::role_command::{
 	RoleForm3, context_digest, encode_role_proof3, preimage_for,
 };
+use crate::storage::mutation_visibility::root2::tests::profile_three_fixture::M3_PRIMARY;
 use crate::storage::mutation_visibility::root2::types::{Digest2, Log2};
 use crate::test_support::TestDir;
 use ed25519_dalek::{Signer, SigningKey};
@@ -52,9 +53,7 @@ pub(super) struct Root {
 }
 impl Root {
 	pub(super) fn new() -> Self {
-		let f = wire::Fixture::profile_three(
-			&crate::storage::mutation_visibility::root2::tests::profile_three_fixture::M3_PRIMARY,
-		);
+		let f = wire::Fixture::profile_three(&M3_PRIMARY);
 		let admin = install_admin2(&f.state, &f.pin).unwrap();
 		Self {
 			f,

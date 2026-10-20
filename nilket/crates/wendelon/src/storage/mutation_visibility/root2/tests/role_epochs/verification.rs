@@ -45,6 +45,28 @@ fn legacy_admin_primitive_never_uses_successor_key() {
 	let changed = encode_admin_command2(&ctx, [7; 32], &sig).unwrap();
 	assert!(check_admin_command2(&f.installed(), &changed, [7; 32]).is_err());
 }
+/// VISADS02 port of the VISADC01 case above: the epoch-0 statement path verifies only under the
+/// original administrator key, never the successor's, once the administrator has rotated.
+#[test]
+fn legacy_admin_statement_never_uses_successor_key() {
+	let mut f = F::new();
+	let old = f.legacy_statement();
+	assert!(check_admin_statement2(&f.installed().view(), &old).is_ok());
+	f.rotate(0, 40);
+	assert_eq!(
+		check_admin_statement2(&f.installed().view(), &old).err(),
+		Some(StatementError2::Signature)
+	);
+	let unsigned: [u8; 337] = [&old[..273], &[0; 64][..]].concat().try_into().unwrap();
+	let sig = SigningKey::from_bytes(&[40; 32])
+		.sign(&admin_statement_preimage2(&unsigned).unwrap())
+		.to_bytes();
+	let changed: [u8; 337] = [&old[..273], &sig[..]].concat().try_into().unwrap();
+	assert_eq!(
+		check_admin_statement2(&f.installed().view(), &changed).err(),
+		Some(StatementError2::Signature)
+	);
+}
 #[test]
 fn explicit_admin_permission_current_epoch_and_consumer_join() {
 	let mut f = F::new();

@@ -34,7 +34,6 @@ fn rv() -> serde_json::Value {
 	serde_json::from_str(include_str!("reserve_vectors.json")).unwrap()
 }
 const ADMIN_SEED: u8 = 0x5A;
-/// `manifest_prime` with the TEST admin key, upgraded to profile 3 with a TEST governance role.
 /// `manifest_prime`'s Admission fields, inline (its own admin key, replaced below by the TEST
 /// administrator seed).
 const PRIME_FIELDS: AdminManifest2 = AdminManifest2 {
@@ -62,6 +61,8 @@ fn inline_prime_fields_equal_the_decoded_manifest_prime() {
 	assert!(decoded == PRIME_FIELDS);
 	assert_eq!(decoded.encode().unwrap(), PRIME_FIELDS.encode().unwrap());
 }
+/// `manifest_prime` with the TEST admin key, upgraded to profile 3 with TEST governance and
+/// recovery roles: the shared `M3_PRIME` fixture.
 fn manifest_three() -> Vec<u8> {
 	let mut base = PRIME_FIELDS;
 	base.admin_key = SigningKey::from_bytes(&[ADMIN_SEED; 32])
@@ -89,6 +90,10 @@ fn manifest_three() -> Vec<u8> {
 	.encode()
 	.unwrap()
 	.to_vec()
+}
+#[test]
+fn the_profile_three_build_is_the_shared_prime_fixture() {
+	assert_eq!(manifest_three(), super::profile_three_fixture::M3_PRIME);
 }
 fn governed_three() -> Chain {
 	let c = chain_of(&manifest_three(), 241);

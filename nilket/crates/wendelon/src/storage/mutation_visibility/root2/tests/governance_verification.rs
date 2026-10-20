@@ -9,6 +9,7 @@ use crate::storage::mutation_visibility::root2::committed::{CommittedSource2, co
 use crate::storage::mutation_visibility::root2::governance_command::*;
 use crate::storage::mutation_visibility::root2::governance_verification::verify_governance2;
 use crate::storage::mutation_visibility::root2::origin::*;
+use crate::storage::mutation_visibility::root2::tests::profile_three_fixture::M3_OTHER;
 use crate::storage::mutation_visibility::root2::trust::{TrustedEntry2, VerifiedCommand2};
 use crate::storage::mutation_visibility::root2::types::*;
 use crate::storage::mutation_visibility::root2::verification::*;
@@ -17,7 +18,7 @@ use support::*;
 /// Direct producer over real-carrier identities -> S3 -> current-reducer chain, compared with the EXISTING
 /// fixture-authorized current reducer at the same identity/fingerprint, not an independent oracle.
 pub(in crate::storage::mutation_visibility::root2) fn positive_chain() -> Fixture {
-	let mut f = Fixture::new("b");
+	let mut f = Fixture::primary();
 	let selector = selector(&f);
 	assert!(
 		differential(&mut f, Command2::EnrollSelector(selector))
@@ -166,7 +167,7 @@ fn s3_nine_real_carriers_match_current_reducer_and_explicit_issuer_effects() {
 #[test]
 #[cfg(target_endian = "little")]
 fn s3_presence_length_and_structural_refusals_are_atomic() {
-	let f = Fixture::new("b");
+	let f = Fixture::primary();
 	let before = bytes(&f.state);
 	for command in nine(&f) {
 		let e = carrier(&command, f.dep, 3, None);
@@ -174,7 +175,7 @@ fn s3_presence_length_and_structural_refusals_are_atomic() {
 			step(&f.state, &f.pin, f.dep, &e, &command, None).err(),
 			Some(VerifyError2::MissingSidecar)
 		);
-		let envelope = f.envelope(&f.state, &command, 0x92);
+		let envelope = f.envelope(&f.state, &command, GOVERNANCE_SEED);
 		// The adapter refuses wrong raw size; direct producer can receive these slices.
 		let valid_entry = carrier(&command, f.dep, 3, Some(&envelope));
 		for side in [&envelope[..295], &[0u8; 297][..]] {
@@ -185,7 +186,7 @@ fn s3_presence_length_and_structural_refusals_are_atomic() {
 		}
 	}
 	let command = Command2::EnrollSelector(selector(&f));
-	let valid = f.envelope(&f.state, &command, 0x92);
+	let valid = f.envelope(&f.state, &command, GOVERNANCE_SEED);
 	let cases = [
 		(0..1, GovernanceCommandError2::Magic),
 		(8..10, GovernanceCommandError2::Version),
@@ -245,7 +246,7 @@ fn s3_profile_context_digest_signature_and_scope_denials_are_consumed() {
 		let side = f.envelope(&f.state, &command, 0x92);
 		denied(&f, &command, &side);
 	}
-	let f = Fixture::new("b");
+	let f = Fixture::primary();
 	let command = Command2::EnrollSelector(selector(&f));
 	let ctx = admin_context2(&install_admin2(&f.state, &f.pin).unwrap());
 	let digest = command.digest(f.dep.generation, f.dep.cluster).unwrap();
@@ -261,18 +262,20 @@ fn s3_profile_context_digest_signature_and_scope_denials_are_consumed() {
 			6 => c.initial_epoch += 1,
 			_ => c.manifest_pin[0] ^= 1,
 		}
-		denied(&f, &command, &sign_context(c, digest, 0x92));
+		denied(&f, &command, &sign_context(c, digest, GOVERNANCE_SEED));
 	}
 	let mut wrong = digest;
 	wrong[0] ^= 1;
-	denied(&f, &command, &sign_context(ctx, wrong, 0x92));
-	for seed in [0x42, 0x93] {
+	denied(&f, &command, &sign_context(ctx, wrong, GOVERNANCE_SEED));
+	// Another key, and the other two M3_PRIMARY roles' keys.
+	let [admin, recovery] = NON_GOVERNANCE_SEEDS;
+	for seed in [0x93, admin, recovery] {
 		denied(&f, &command, &f.envelope(&f.state, &command, seed));
 	}
-	let mut side = f.envelope(&f.state, &command, 0x92);
+	let mut side = f.envelope(&f.state, &command, GOVERNANCE_SEED);
 	side[240] ^= 1;
 	denied(&f, &command, &side);
-	let mut side = f.envelope(&f.state, &command, 0x92);
+	let mut side = f.envelope(&f.state, &command, GOVERNANCE_SEED);
 	side[264..296].copy_from_slice(&[0xff; 32]);
 	denied(&f, &command, &side);
 	for i in 0..2 {
@@ -283,7 +286,7 @@ fn s3_profile_context_digest_signature_and_scope_denials_are_consumed() {
 			b.generation[0] ^= 1
 		};
 		let c = Command2::EnrollSelector(b);
-		denied(&f, &c, &f.envelope(&f.state, &c, 0x92));
+		denied(&f, &c, &f.envelope(&f.state, &c, GOVERNANCE_SEED));
 	}
 	for i in 0..3 {
 		let mut id = identity(&f);
@@ -303,7 +306,7 @@ fn s3_profile_context_digest_signature_and_scope_denials_are_consumed() {
 			cause: 1,
 			anchor: log(2),
 		};
-		denied(&f, &c, &f.envelope(&f.state, &c, 0x92));
+		denied(&f, &c, &f.envelope(&f.state, &c, GOVERNANCE_SEED));
 	}
 	let f = Fixture::table_namespace();
 	for i in 0..2 {
@@ -320,16 +323,20 @@ fn s3_profile_context_digest_signature_and_scope_denials_are_consumed() {
 			cause: 1,
 			anchor: log(2),
 		};
-		denied(&f, &c, &f.envelope(&f.state, &c, 0x92));
+		denied(&f, &c, &f.envelope(&f.state, &c, GOVERNANCE_SEED));
 	}
 }
 
 #[test]
 #[cfg(target_endian = "little")]
 fn s3_issuer_failures_after_valid_resigned_envelopes_preserve_effects() {
-	let mut f = Fixture::new("b");
+	let mut f = Fixture::primary();
 	let command = grant(&f, ISSUER_SEED);
-	denied(&f, &command, &f.envelope(&f.state, &command, 0x92));
+	denied(
+		&f,
+		&command,
+		&f.envelope(&f.state, &command, GOVERNANCE_SEED),
+	);
 	f.governed(Command2::EnrollLeaseIssuer {
 		node: 7,
 		key: key(ISSUER_SEED),
@@ -342,7 +349,7 @@ fn s3_issuer_failures_after_valid_resigned_envelopes_preserve_effects() {
 			};
 			lease.expiry.physical_ms += 1;
 		}
-		let side = f.envelope(&f.state, &command, 0x92);
+		let side = f.envelope(&f.state, &command, GOVERNANCE_SEED);
 		denied(&f, &command, &side);
 	}
 	let mut command = grant(&f, ISSUER_SEED);
@@ -350,7 +357,7 @@ fn s3_issuer_failures_after_valid_resigned_envelopes_preserve_effects() {
 		unreachable!()
 	};
 	lease.signature[32..].fill(0xff);
-	let side = f.envelope(&f.state, &command, 0x92);
+	let side = f.envelope(&f.state, &command, GOVERNANCE_SEED);
 	denied(&f, &command, &side);
 	assert!(matches!(
 		f.governed(grant(&f, ISSUER_SEED)),
@@ -381,7 +388,11 @@ fn s3_issuer_failures_after_valid_resigned_envelopes_preserve_effects() {
 		.clone();
 	f.governed(Command2::RevokeLeaseIssuer { node: 7 });
 	let command = grant(&f, ISSUER_SEED);
-	denied(&f, &command, &f.envelope(&f.state, &command, 0x92));
+	denied(
+		&f,
+		&command,
+		&f.envelope(&f.state, &command, GOVERNANCE_SEED),
+	);
 	assert_eq!(
 		root_and_origin2(&f.state)
 			.unwrap()
@@ -399,9 +410,9 @@ fn s3_issuer_failures_after_valid_resigned_envelopes_preserve_effects() {
 
 #[test]
 fn s3_reusable_envelope_registers_first_and_exact_coordinate_replays() {
-	let mut f = Fixture::new("b");
+	let mut f = Fixture::primary();
 	let command = Command2::EnrollSelector(selector(&f));
-	let side = f.envelope(&f.state, &command, 0x92);
+	let side = f.envelope(&f.state, &command, GOVERNANCE_SEED);
 	assert!(f.apply(command.clone(), Some(side.clone())) == ApplyResult2::Registered(log(3)));
 	assert!(f.apply(command.clone(), Some(side.clone())) == ApplyResult2::Registered(log(3)));
 	let e = f.entries.last().unwrap();
@@ -423,11 +434,11 @@ fn s3_reusable_envelope_registers_first_and_exact_coordinate_replays() {
 
 #[test]
 fn s3_install_commitment_and_record_refusals_follow_structure() {
-	let f = Fixture::new("b");
+	let f = Fixture::primary();
 	let command = Command2::EnrollSelector(selector(&f));
-	let side = f.envelope(&f.state, &command, 0x92);
+	let side = f.envelope(&f.state, &command, GOVERNANCE_SEED);
 	let digest = command.digest(f.dep.generation, f.dep.cluster).unwrap();
-	let wrong_length = with_control_len_for_test(&f.state, 137);
+	let wrong_length = with_control_len_for_test(&f.state, 242);
 	let mut bad = side.clone();
 	bad[0] ^= 1;
 	assert_eq!(
@@ -440,7 +451,7 @@ fn s3_install_commitment_and_record_refusals_follow_structure() {
 			CommitmentField2::ControlLength
 		)))
 	);
-	let other = Fixture::new("a");
+	let other = Fixture::profile_three(&M3_OTHER);
 	assert_eq!(
 		verify_governance2(&f.state, &other.pin, &command, Some(&side), digest),
 		Err(VerifyError2::Install(InstallError2::Commitment(
@@ -482,13 +493,13 @@ fn s3_install_commitment_and_record_refusals_follow_structure() {
 
 #[test]
 fn s3_empty_issuer_old_kinds_keep_frozen_oracle_control() {
-	let mut f = Fixture::new("b");
+	let mut f = Fixture::primary();
 	for command in [
 		Command2::EnrollSelector(selector(&f)),
 		enroll_authority(),
 		Command2::RevokeAuthority(authority()),
 	] {
-		let side = f.envelope(&f.state, &command, 0x92);
+		let side = f.envelope(&f.state, &command, GOVERNANCE_SEED);
 		let e = carrier(&command, f.dep, tip(&f.state).index + 1, Some(&side));
 		let ce = committed_entry2(&CommittedSource2::synthetic(), &e)
 			.unwrap()

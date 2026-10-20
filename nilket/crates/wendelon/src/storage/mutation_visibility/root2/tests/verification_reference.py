@@ -47,6 +47,13 @@ statement_preimage = DOMAIN + statement[:SIGNED]
 admin_public = unhex(STATEMENT["admin_public"])
 Ed25519PublicKey.from_public_bytes(admin_public).verify(statement[SIGNED:], statement_preimage)
 
+# The profile-3 (M3_PRIME) grant, verified the same way under its published administrator key.
+p3_statement = unhex(STATEMENT["p3_grant"]["bytes"])
+assert len(p3_statement) == STATEMENT_BYTES
+p3_preimage = DOMAIN + p3_statement[:SIGNED]
+p3_admin_public = unhex(STATEMENT["p3_admin_public"])
+Ed25519PublicKey.from_public_bytes(p3_admin_public).verify(p3_statement[SIGNED:], p3_preimage)
+
 json.dump(
     {
         "generator": "verification_reference.py",
@@ -65,6 +72,10 @@ json.dump(
         "statement_signature": statement[SIGNED:].hex(),
         "statement_admin_public": admin_public.hex(),
         "statement_verified": True,
+        "p3_statement_preimage": p3_preimage.hex(),
+        "p3_statement_signature": p3_statement[SIGNED:].hex(),
+        "p3_statement_admin_public": p3_admin_public.hex(),
+        "p3_statement_verified": True,
     },
     sys.stdout,
     indent=2,
