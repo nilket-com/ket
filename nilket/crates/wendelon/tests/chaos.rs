@@ -324,14 +324,19 @@ async fn wait_for_shared_leader(nodes: &BTreeMap<u32, WendelonNode>, exclude: Op
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
 	loop {
 		let mut leaders = BTreeSet::new();
-		for node in nodes.values() {
-			if let Some(leader) = node.raft.current_leader().await
-				&& exclude != Some(leader)
-			{
-				leaders.insert(leader);
+		let mut all_report_leader = true;
+		for (id, node) in nodes {
+			if exclude == Some(*id) {
+				continue;
+			}
+			match node.raft.current_leader().await {
+				Some(leader) if exclude != Some(leader) => {
+					leaders.insert(leader);
+				}
+				_ => all_report_leader = false,
 			}
 		}
-		if leaders.len() == 1 {
+		if all_report_leader && leaders.len() == 1 {
 			return *leaders.iter().next().unwrap();
 		}
 		assert!(
@@ -472,13 +477,15 @@ impl ChaosCluster {
 		wait_for_cluster(&node2, 3, 3).await;
 		wait_for_cluster(&node3, 3, 3).await;
 		wait_for_voters(&node1, &[1, 2, 3]).await;
-		wait_for_leader(&node2, 1).await;
-		wait_for_leader(&node3, 1).await;
+		// Elections may move leadership away from the founding node while
+		// the remaining voters join, especially under concurrent test load.
+		let nodes = BTreeMap::from([(1, node1), (2, node2), (3, node3)]);
+		wait_for_shared_leader(&nodes, None).await;
 
 		Ok(Self {
 			registry,
 			configs: BTreeMap::from([(1, node1_cfg), (2, node2_cfg), (3, node3_cfg)]),
-			nodes: BTreeMap::from([(1, node1), (2, node2), (3, node3)]),
+			nodes,
 			_dirs: vec![node1_dir, node2_dir, node3_dir],
 		})
 	}
@@ -514,7 +521,29 @@ async fn run_leader_partition_and_rejoin(seed: u64) -> std::result::Result<(), C
 			));
 		}
 	};
-	let original_leader = 1;
+	run_partition_and_rejoin(cluster, seed, None).await
+}
+
+async fn run_partition_and_rejoin(
+	cluster: ChaosCluster,
+	seed: u64,
+	expected_initial_leader: Option<u32>,
+) -> std::result::Result<(), ChaosFailure> {
+	let scenario_event_start = cluster.registry.events().len();
+	let original_leader = wait_for_shared_leader(&cluster.nodes, None).await;
+	if let Some(expected) = expected_initial_leader
+		&& original_leader != expected
+	{
+		cluster.shutdown().await;
+		return Err(ChaosFailure::new(
+			"leader_partition_and_rejoin",
+			seed,
+			0,
+			format!(
+				"setup leadership changed before partition: expected {expected}, observed {original_leader}"
+			),
+		));
+	}
 	commit_control_write(
 		cluster.nodes.get(&original_leader).unwrap(),
 		&cluster.nodes,
@@ -524,7 +553,12 @@ async fn run_leader_partition_and_rejoin(seed: u64) -> std::result::Result<(), C
 	)
 	.await;
 
-	for peer in [2u32, 3] {
+	for peer in cluster
+		.nodes
+		.keys()
+		.copied()
+		.filter(|id| *id != original_leader)
+	{
 		cluster
 			.registry
 			.block_bidirectional(node(original_leader), node(peer));
@@ -562,9 +596,15 @@ async fn run_leader_partition_and_rejoin(seed: u64) -> std::result::Result<(), C
 	};
 
 	let leader = cluster.nodes.get(&new_leader).unwrap();
-	commit_control_write(leader, &cluster.nodes, vec![2, 3], 2, 2_000).await;
+	let survivor_ids = survivors.iter().map(|(id, _)| *id).collect();
+	commit_control_write(leader, &cluster.nodes, survivor_ids, 2, 2_000).await;
 
-	for peer in [2u32, 3] {
+	for peer in cluster
+		.nodes
+		.keys()
+		.copied()
+		.filter(|id| *id != original_leader)
+	{
 		cluster
 			.registry
 			.heal_bidirectional(node(original_leader), node(peer));
@@ -595,10 +635,12 @@ async fn run_leader_partition_and_rejoin(seed: u64) -> std::result::Result<(), C
 	let events = cluster.registry.events();
 	let blocked_events = events
 		.iter()
+		.skip(scenario_event_start)
 		.filter(|event| matches!(event.kind, SimulatedTransportEventKind::RouteBlocked))
 		.count();
 	let healed_events = events
 		.iter()
+		.skip(scenario_event_start)
 		.filter(|event| matches!(event.kind, SimulatedTransportEventKind::RouteHealed))
 		.count();
 	cluster.shutdown().await;
@@ -1311,6 +1353,29 @@ async fn chaos_smoke_catalog() {
 async fn leader_partition_restart_and_rejoin() {
 	let seed = chaos_seed_from_env();
 	run_leader_partition_restart_and_rejoin(seed)
+		.await
+		.unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[tokio::test]
+async fn leader_partition_and_rejoin_after_nonfounder_election() {
+	let cluster = ChaosCluster::bootstrap("chaos-nonfounder-partition")
+		.await
+		.unwrap();
+	// Isolate the founder until the other two voters agree on its
+	// replacement. An election trigger alone cannot override a live leader.
+	for peer in [2u32, 3] {
+		cluster.registry.block_bidirectional(node(1), node(peer));
+	}
+	let nonfounder = wait_for_shared_leader(&cluster.nodes, Some(1)).await;
+	assert_ne!(nonfounder, 1);
+	for peer in [2u32, 3] {
+		cluster.registry.heal_bidirectional(node(1), node(peer));
+	}
+	for node in cluster.nodes.values() {
+		wait_for_leader(node, nonfounder).await;
+	}
+	run_partition_and_rejoin(cluster, chaos_seed_from_env(), Some(nonfounder))
 		.await
 		.unwrap_or_else(|err| panic!("{err}"));
 }
