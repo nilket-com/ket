@@ -1,7 +1,7 @@
 # m06 planning-vs-execution grounding — and a re-pin correction
 
 The fork recorded in the post-497 re-pin (`1c986ca3`) is resolved, and the re-pin
-itself needs a correction: its DuckDB arm was **not** single-threaded.
+itself needs a correction: its DuckDB arm was **not** pinned to one thread.
 
 ## The 178 ms was a thread-count confound, not join elimination
 
@@ -27,7 +27,7 @@ layout/density direction.
 
 ## Corrected ranking
 
-With valid single-thread DuckDB references (the pre-497 ladder's pinned rows,
+With valid one-thread DuckDB references (the pre-497 ladder's pinned rows,
 engine-independent of the Toron commit; m06 re-confirmed by hand at 1,287 ms) and
 the re-pin's Toron/Polars-1t rows, the top of the board flips:
 

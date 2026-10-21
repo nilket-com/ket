@@ -150,7 +150,7 @@ q21, q09, q05, and q01, and `aggregate` holds 57–100% of the span in
 every cell. Toron executes these plans as chains whose scan, filter,
 and join work runs inside the aggregation handler's exclusive span, so
 node attribution by kind cannot separate them. It does separate one
-thing DuckDB's single-thread tree does not have: **exchange**, at 25.0%
+thing DuckDB's one-thread tree does not have: **exchange**, at 25.0%
 of Toron's span on q05, 19.4% on q18, and 4.6% on q09. The plan shapes
 show hash-partitioned joins behind `Exchange(parts=4)` at partition
 parallelism 1.

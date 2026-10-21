@@ -171,7 +171,7 @@ The TIME cluster is not one uniform operator shape:
 - q07 and q17 are dominated by regular inner spilled-build resident accounting.
 - q19 is dominated by spill page read/decrypt/decompress and syscall overhead.
 
-The common systemic issue is still single-threaded execution, but the highest-confidence first cause is more specific:
+The common systemic issue is still one-thread execution, but the highest-confidence first cause is more specific:
 the resident guards repeatedly compute spill-index byte sizes by walking large hash maps. Parallelism would only spread
 that repeated accounting over more cores; it would not remove the wasted O(index-size) scan on every guard. The first
 perf cut should remove the redundant accounting before a broad parallelism cut.

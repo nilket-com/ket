@@ -91,7 +91,7 @@ exactly identical to the retired order.
 Two default-parallel workspace sweeps each surfaced a different libaryon timing
 fixture under the 1,505-test library load (`grandchild pid` before output and a
 post-ABA source timeout). The exact first test and then the complete libaryon
-library passed in isolation; the complete single-thread workspace sweep passed.
+library passed in isolation; the complete one-test-thread workspace sweep passed.
 The failures are disclosed here rather than baselined or repaired inside an
 unrelated renderer record.
 

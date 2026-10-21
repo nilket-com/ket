@@ -357,7 +357,7 @@ other cells with a stamped join-spill path, and all three are `in_memory`.
 The primitive census corrects the plan's inherited reach premise. After ADR 492, production m06
 honors its physical build and commits `in_memory` at the 2 GiB coordinate. It is not a second
 production-reached ADR 510 cell. The m00-m10 ladder nevertheless passed in both Toron and the
-single-thread DuckDB reference. Re-running m06 with ADR 492's documented control
+one-thread DuckDB reference. Re-running m06 with ADR 492's documented control
 `TORON_TPCH_PHYSICAL_SCAN_BUILD=0` re-exposes the legacy partitioned shape. Both ADR 510 arms then
 passed with identical digest, schema, one-row count, plan fingerprint, replay-0
 `partitioned_streaming_scan_build` route, and 88,648,880 spill bytes. This is compatibility

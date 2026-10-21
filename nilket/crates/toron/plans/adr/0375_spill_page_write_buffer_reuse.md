@@ -78,4 +78,4 @@ Only `write_page_batch` (the named site). Do **not** touch the partition path (`
 ## Forward arc
 375 (write_page_batch scratch reuse) -> re-profile q07 -> next stack (partition_bucket/encode_partition_key_value, or
 shmem-write I/O) -> q17 grouped-aggregate fold/finalize + spill-read I/O -> q19 spill-read I/O -> q21 712-byte
-resident-state quick-win -> eventually parallelism (the deeper single-thread systemic). The profile drives each cut.
+resident-state quick-win -> eventually parallelism (the deeper one-thread systemic). The profile drives each cut.

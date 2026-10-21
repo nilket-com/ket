@@ -16,7 +16,7 @@ callers and shares the construction so the two cannot drift.
 allocates an owned `String` per row. That is the separate ownership/layout decision,
 now priced below.
 
-## Measured (sf=8, ADR 473 conditions, references single-threaded)
+## Measured (sf=8, ADR 473 conditions, references on one thread)
 
 | primitive | 476 | 477 | speedup | Toron/best |
 |---|---:|---:|---:|---:|

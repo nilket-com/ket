@@ -84,6 +84,6 @@ Parallelism would spread that waste over cores; per-partition spill writes remov
 
 ## Forward arc
 377 (per-partition build spill, re-scan removed) -> **reassess parallelism** from the cleaned q07 profile: with the
-re-scan waste gone, the residual is real spill/read/write/Arrow work and **parallelism (the deferred single-thread
+re-scan waste gone, the residual is real spill/read/write/Arrow work and **parallelism (the deferred one-thread
 systemic, 373) is the next lever**. q17 (grouped fold + spill-read), q19 (spill-read I/O), q21 (712-byte resident-state)
 remain queued; q03/q05/q10/q12 may green or advance per 377's measured impact.

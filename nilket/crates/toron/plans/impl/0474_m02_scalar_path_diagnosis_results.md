@@ -5,7 +5,7 @@ up to eleven `as_any().downcast_ref::<T>()` type tests **per row**, called from
 plain `for row in 0..batch.num_rows()` loops at seven sites. Subtractions and
 profile agree; ADR 475 acts on it.
 
-## Sub-primitives (sf=8, ADR 473 conditions, references single-threaded)
+## Sub-primitives (sf=8, ADR 473 conditions, references on one thread)
 
 | primitive | Toron | DuckDB 1t | Polars 1t | Toron/best |
 |---|---:|---:|---:|---:|

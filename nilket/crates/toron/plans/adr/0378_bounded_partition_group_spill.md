@@ -95,5 +95,5 @@ overage, a small `P`/`G` should suffice; if it does not, that is the signal.
 
 ## Forward arc
 378 (bounded partition-group spill) makes the spill-budget invariant robust across the inner-build-spill family. Then
-**parallelism** (the deferred single-thread systemic, 373) - the bigger architecture lever for q07, on a cleaner board.
+**parallelism** (the deferred one-thread systemic, 373) - the bigger architecture lever for q07, on a cleaner board.
 q17 (grouped fold + spill-read), q19 (spill-read I/O), q21 (712-byte resident-state) remain queued.

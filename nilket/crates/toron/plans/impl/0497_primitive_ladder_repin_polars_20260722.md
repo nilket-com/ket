@@ -2,11 +2,11 @@
 
 Protocol re-pin of the ADR 473 primitive ladder; no decision is made here. It refreshes the ranking
 after ADR 497 (batched probe with software prefetch, `0f0782a7`) and adds **Polars** as a second
-single-thread reference alongside DuckDB. Live run on the clean sealed binary (built from HEAD
+one-thread reference alongside DuckDB. Live run on the clean sealed binary (built from HEAD
 `0f0782a7`, `--features polars-sql-reference`).
 
 Coordinate: strict, sf=8, persisted parquet, release, 2 GiB task / 2 GiB spill reserve, 1 warmup + 5
-measured runs. DuckDB is single-thread (v1.5.4, `SET threads=1`); **Polars is pinned single-thread
+measured runs. DuckDB runs on one thread (v1.5.4, `SET threads=1`); **Polars is pinned to one thread
 (`POLARS_MAX_THREADS=1`)** so its row is comparable to the DuckDB reference — multi-thread Polars is
 a separate question, deliberately not run here. All 33 engine×primitive rows pass; Toron spill zero.
 Artifacts: `target/tpch/adr497_ladder_refresh/`.

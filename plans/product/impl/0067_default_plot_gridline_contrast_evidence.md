@@ -62,7 +62,7 @@ values even though their grid operations join the new global stratum.
 Two default-parallel workspace sweeps each surfaced a different libaryon timing
 fixture under the 1,505-test library load. The exact process-group test and the
 complete libaryon library both passed immediately in isolation; the complete
-single-thread workspace sweep then passed. No libaryon code or expectation was
+one-test-thread workspace sweep then passed. No libaryon code or expectation was
 changed under this plotting record.
 
 ## Implementation history

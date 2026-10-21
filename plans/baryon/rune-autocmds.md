@@ -62,7 +62,7 @@ baryon::autocmd_for_buffer(editor, buffer, [EventKind::BufferEdited],
 - **This cut supports `Option<BufferId>` filtering only** (`autocmd_for_buffer` resolves the
   `Buffer` handle at registration). Registration functions follow the existing command/option/map
   ABI (`VmResult<()>`): a stale/non-text filter is a bounded registration failure, not a
-  `BufferError` return from the read/edit API. Source evaluation is single-threaded, but the
+  `BufferError` return from the read/edit API. Source evaluation runs on one thread, but the
   validation remains explicit so a retained token cannot silently create a never-matching handler
   if runtime registration is added later.
   Glob/path filtering is deferred with the path-lookup surface (§8).

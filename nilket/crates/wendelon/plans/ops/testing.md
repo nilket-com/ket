@@ -2,6 +2,8 @@
 
 Wendelon makes correctness claims — Raft-committed invariants, fsync ordering, crash recovery, multi-node quorum behavior, per-tenant quota convergence — that a standard unit-test suite cannot validate. The test strategy operationalizes ADR 028: two permanent harnesses (chaos and deterministic simulator) plus a supporting pyramid of unit, property, and integration tests.
 
+Test concurrency follows the repo-wide policy in `nilket/plans/ops/test_parallelism.md`: tests run concurrently by default, and only noise-sensitive tests run alone, in lanes of at most 2 CPUs.
+
 Two rules orient everything below:
 1. **Neither harness deprecates the other.** Chaos finds real-kernel bugs; the simulator finds interleaving bugs. They target disjoint bug classes; shipping one and labeling the other "later" accepts half-finished correctness.
 2. **Every failing run prints its seed.** Every frozen seed becomes a permanent regression scenario — the seed is the asset. A bug found once and regressed once is a cost; a bug found once and pinned as a seed is an asset that accumulates forever.
@@ -47,7 +49,7 @@ These tests are **fast** (seconds per test) and run on every PR. They do not rep
 
 ## 4. Deterministic simulator
 
-The simulator (ADR 028 §2–6) is a single-process, single-threaded scheduler with logical time. Failures reproduce from a seed forever.
+The simulator (ADR 028 §2–6) is a single-process scheduler on one thread with logical time. Failures reproduce from a seed forever.
 
 ### 4.1 `AsyncFileOps` seam
 

@@ -81,5 +81,5 @@ by constructing maps directly. Required (at least):
 
 ## Forward arc
 374 (incremental accounting) -> re-profile -> the next hot stack drives the next perf cut per cell -> ... -> when the
-algorithmic waste is gone, **parallelism** (the deeper single-thread systemic) -> q19 spill-read/decrypt/decompress I/O
+algorithmic waste is gone, **parallelism** (the deeper one-thread systemic) -> q19 spill-read/decrypt/decompress I/O
 (separate) -> harness-rehash `stable_file_hash` (separate, outside execute_ms). The profile evidence drives each cut.

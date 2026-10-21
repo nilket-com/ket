@@ -1,7 +1,7 @@
 # ADR 498 - m04 low-cardinality grouped COUNT attribution
 
 The corrected post-497 primitive-ladder ranking makes m04 the largest recoverable
-single-thread gap: `SELECT l_returnflag, COUNT(1) FROM lineitem GROUP BY l_returnflag`
+one-thread gap: `SELECT l_returnflag, COUNT(1) FROM lineitem GROUP BY l_returnflag`
 takes about 2,015 ms in Toron versus 186 ms in DuckDB 1t at sf=8. m06 remains an
 execution target, but its corrected 1t gap is about 1,032 ms and is second priority.
 

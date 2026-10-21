@@ -159,7 +159,7 @@ proved Toron's smart-storage premise: `point_read_filter` at
 wire); `scan_filter` at 10M rows runs at 1.96× speedup. But
 aggregate paths (`group_sum`, `sum_nullable`, `count_nullable`)
 show PBC-disengaged at ~1.0× speedup — they flow through the
-single-threaded buffered executor at full input cardinality
+one-thread buffered executor at full input cardinality
 because aggregate pushdown is explicitly out of ADR 002 scope.
 Cross-replica determinism was explicitly deferred to ADR 003.
 

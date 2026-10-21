@@ -37,7 +37,7 @@ Scaffold the Toron compute ring as a greenfield, Arrow-native distributed engine
 
 ### M4: Single-Process Morsels (Completed)
 - **Scope:** Introduce `MorselId`, `StageId`, split scans into deterministic morsels, merge `CountAll` results.
-- **Tests:** Single-thread vs multi-thread determinism, idempotent morsel retry.
+- **Tests:** One-thread vs multi-thread determinism, idempotent morsel retry.
 
 ### M5: Coordinator / Worker Boundary (Completed)
 - **Scope:** Split process, define native messages over QUIC, stream incremental Arrow batches.

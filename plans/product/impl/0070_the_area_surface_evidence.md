@@ -43,7 +43,7 @@ requires to remain byte-compatible.
 | 11. Zero, clipping, occlusion | `product_0070_area_reaches_completion_with_cartesian_guides_and_fixed_orientation` sends authored bounds and tick controls through the real Rune completion/factory path. PRODUCT-0069's canonical-matrix gate continues to prove hover and polygon share true-zero accumulation; PRODUCT-0068's strata tests prove opaque marks occlude guides rather than moving them above data | pass |
 | 12. PRODUCT-0068 guides | All four PRODUCT-0068 tests remain green, including resolved `mark_decoration_color` at `0.5px`, guide-before-mark ordering, per-cell clipping, and the disabled-grid byte oracle. The feature-gated Vulkan evidence target also passes its stacked-area and bar probes | pass |
 | 13. Facets and axes | `product_0070_faceted_areas_share_domains_panel_blind_colors_and_one_legend` asserts two asymmetric cells receive identical Cartesian domains, exact panel-blind fills, and one unioned figure-level swatch per assignment | pass |
-| 14. No unrelated movement | Polariton passes 527 unit tests, 44 architecture tests, and the coordinate-space trybuild gate; the five pre-existing live-service tests remain ignored. The serialized workspace sweep passes single-threaded, and the all-feature/all-target check plus PRODUCT-0057/0068 Vulkan evidence target pass | pass |
+| 14. No unrelated movement | Polariton passes 527 unit tests, 44 architecture tests, and the coordinate-space trybuild gate; the five pre-existing live-service tests remain ignored. The serialized workspace sweep passes on one test thread, and the all-feature/all-target check plus PRODUCT-0057/0068 Vulkan evidence target pass | pass |
 
 ## Surface and documentation
 

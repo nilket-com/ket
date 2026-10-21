@@ -297,6 +297,6 @@ implementation seals `a1bf26789afb` and `bf11c6e0b35b` remain the measurement id
 receipt commit is independently revertible.
 
 q17's cumulative arc across ADRs 511-512: 35,541 ms (ADR 508 baseline) → ~11.6 s (511, build-side
-swap) → ~4.24 s (512, reachable-key reduction) against DuckDB's single-thread 765 ms — the cell's
+swap) → ~4.24 s (512, reachable-key reduction) against DuckDB's one-thread 765 ms — the cell's
 engine gap compressed from 46.5x to roughly 5.5x, with the remaining envelope now scan + join0 +
 exchange rather than any single dominant defect.

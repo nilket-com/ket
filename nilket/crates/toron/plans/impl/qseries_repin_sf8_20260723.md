@@ -1,6 +1,6 @@
 # q-series repin — strict sf=8, composed board — 2026-07-23
 
-Protocol re-pin of the composed TPC-H q-series against DuckDB (single-thread) and Polars, at the
+Protocol re-pin of the composed TPC-H q-series against DuckDB (one thread) and Polars, at the
 primitive ladder's coordinate. No decision here; it grounds the next council cycle by pricing the
 composed gap that the saturated ladder (ADR 506) could not see.
 

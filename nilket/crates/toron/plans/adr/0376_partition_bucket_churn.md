@@ -65,6 +65,6 @@ in core.
 
 ## Forward arc
 376 (A + B-or-residual) -> **reassess parallelism** from the cleaned q07 profile: if q07 is now mostly real
-spill/read/write/Arrow work, parallelism (the deferred single-thread systemic, 373) is the next lever rather than
+spill/read/write/Arrow work, parallelism (the deferred one-thread systemic, 373) is the next lever rather than
 peeling further. Else the next named stack. q17 (grouped fold + spill-read), q19 (spill-read I/O), q21 (712-byte
 resident-state) remain queued.

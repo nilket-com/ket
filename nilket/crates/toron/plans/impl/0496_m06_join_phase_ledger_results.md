@@ -27,7 +27,7 @@ COUNT before the next batch is pulled.
   statistically identical. An earlier apparent gap was pure load drift, ruled out by interleaving.
 - **Identical output when disabled.** Same `digest`, `output_row_count=1`, `plan_fingerprint`; no
   `local_join_phase_ledger` field present.
-- **Enabled adds ~0 over disabled** (uncontended single-thread lock), so the ledger's
+- **Enabled adds ~0 over disabled** (uncontended lock taken by one thread), so the ledger's
   `total_execute_micros` tracks the true wall.
 - **One ledger row per execution** carrying `build_rows`, `probe_rows`, `matched_rows`,
   `drive_completed`, `total_execute_micros`, `attributed_micros`, `unattributed_residual_micros`,

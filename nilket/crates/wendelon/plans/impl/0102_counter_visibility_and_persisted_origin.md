@@ -224,7 +224,7 @@ Every safety-bearing test has a negative control. The contract table lists them 
 - configuration validation;
 - the F-CTR-9 retry controls.
 
-Measure add latency with compaction running against without, using the F-CTR-8 harness. The ladder gains counter stress steps, because both the F-CTR-8 and F-CTR-9 audits noted that the counter concurrency tests ran only once, single-threaded. The steps are `storage::counter` at `--test-threads=8` in each of the 10 lane-B iterations, plus a nextest `--stress-count 20` pass over `storage::counter` and the data-server `counter_write_key` tests, covering T-RACE, T-K3 and T-K5. Any failure is a defect to reproduce, never a flake to retry. The steps are added to the contract's tests and replace none of them. They are delivered as a separately reviewed driver revision (gate tooling), not in this plan.
+Measure add latency with compaction running against without, using the F-CTR-8 harness. The ladder gains counter stress steps, because both the F-CTR-8 and F-CTR-9 audits noted that the counter concurrency tests ran only once, on one test thread. The steps are `storage::counter` at `--test-threads=8` in each of the 10 lane-B iterations, plus a nextest `--stress-count 20` pass over `storage::counter` and the data-server `counter_write_key` tests, covering T-RACE, T-K3 and T-K5. Any failure is a defect to reproduce, never a flake to retry. The steps are added to the contract's tests and replace none of them. They are delivered as a separately reviewed driver revision (gate tooling), not in this plan.
 
 ### Scope and gates
 

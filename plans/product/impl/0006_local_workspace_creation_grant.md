@@ -14,7 +14,7 @@ the intended behavior.
 **A. `PR_SET_PDEATHSIG` is per-thread, and Polariton is multithreaded.** The
 parent-death signal fires when the *thread* that forked dies, not when the parent
 process exits. TORON-532 is safe because its supervisor spawns from a
-single-threaded main. Polariton dispatches async work through
+main that runs on one thread. Polariton dispatches async work through
 `iced::Task::perform` on tokio workers, and CPU work through
 `tokio::task::spawn_blocking`, whose pool threads are reaped after an idle
 timeout. Spawning the child from either would arm a contract that fires while
