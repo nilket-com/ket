@@ -181,7 +181,24 @@ const COMMANDS: &[(&str, Spec)] = &[
 	),
 ];
 
-const USAGE: &str = "usage: wendelon-key <generate|bind|show-public|backup|restore|restore-verify|retire-epoch|destroy|build <kind>|sign|sign-statement|merge> --dir <custody dir> [flags]";
+/// `sign containment`: the recovery role's process-local containment override (D-21).
+const CONTAINMENT: Spec = Spec {
+	values: &[
+		"--dir",
+		"--key",
+		"--context",
+		"--trusted-manifest",
+		"--root-key",
+		"--node-id",
+		"--boot-nonce",
+		"--state",
+		"--out",
+	],
+	twice: &[],
+	switches: &[OVERRIDE],
+};
+
+const USAGE: &str = "usage: wendelon-key <generate|bind|show-public|backup|restore|restore-verify|retire-epoch|destroy|build <kind>|sign [containment]|sign-statement|merge> --dir <custody dir> [flags]";
 
 /// Runs one command line; prints a refusal on stderr and returns exit code 2 for it.
 pub(crate) fn run(argv: &[String], io: &mut dyn Io) -> ExitCode {
@@ -212,7 +229,14 @@ fn dispatch(argv: &[String], io: &mut dyn Io) -> Result<(), ToolError> {
 				build::KINDS
 			)));
 		}
+		("sign", Some((kind, rest))) if kind == "containment" => (Some("containment"), rest),
 		_ => (None, rest),
+	};
+	// `sign containment` has its own flags: no command file, the containment inputs instead.
+	let spec = if kind == Some("containment") {
+		&CONTAINMENT
+	} else {
+		spec
 	};
 	let a = args::parse(rest, spec)?;
 	let unauthenticated = *name == "show-public" && a.switch("--unauthenticated");
@@ -230,6 +254,7 @@ fn dispatch(argv: &[String], io: &mut dyn Io) -> Result<(), ToolError> {
 		"retire-epoch" => retire::retire(io, &a),
 		"destroy" => retire::destroy(io, &a),
 		"build" => build::run(io, &a, kind.expect("checked above")),
+		"sign" if kind == Some("containment") => sign::containment(io, &a),
 		"sign" => sign::sign(io, &a),
 		"sign-statement" => sign::statement(io, &a),
 		"merge" => merge::run(io, &a),

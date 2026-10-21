@@ -15,8 +15,9 @@ use crate::storage::mutation_visibility::root2::governance_command::{
 	governance_command_preimage2,
 };
 use crate::storage::mutation_visibility::root2::role_command::{
-	ROLE_PROOF_BYTES3, RoleForm3, RoleSlot3, context_digest3, context_from_bytes,
-	encode_role_proof3, parse, preimage_for, role_requirement, slot_signed, verify_core,
+	ROLE_PROOF_BYTES3, RoleForm3, RoleSlot3, containment_digest3, context_digest3,
+	context_from_bytes, encode_role_proof3, parse, preimage_for, role_requirement, slot_signed,
+	verify_core,
 };
 use crate::storage::mutation_visibility::root2::role_epochs::SUCCESSORS3;
 use crate::storage::mutation_visibility::root2::role_view::RoleView3;
@@ -481,4 +482,55 @@ pub fn check_new_role_key(
 		return Err(P::SuccessorLimit);
 	}
 	Ok(())
+}
+
+/// The unsigned containment proof for `signer`, the active recovery key (D-21): a `VISROL03`
+/// layout binding the context digest and, in place of a command digest, the containment digest
+/// of (`root_key`, `node_id`, `boot_nonce`, `on`), with recovery present in slot 0 at its active
+/// epoch. Never an on-log proof: no command selects this form. A frozen root does not refuse it
+/// (containment is incident response); a retired root does.
+pub fn prepare_containment(
+	context: &VerifiedContext,
+	signer: &[u8; 32],
+	root_key: &[u8; 32],
+	node_id: u32,
+	boot_nonce: &[u8; 16],
+	on: bool,
+) -> Result<Unsigned, P> {
+	if signer_role(context, signer)? != 3 {
+		return Err(P::RoleNotNamed);
+	}
+	let digest = containment_digest3(root_key, node_id, boot_nonce, on);
+	let layout = role_layout(context, digest, [3, 0]).to_vec();
+	let preimage =
+		preimage_for(&layout, [3, 0], 0, RoleForm3::Containment).map_err(|_| P::NotRoleSigned)?;
+	Ok(Unsigned {
+		layout,
+		preimage,
+		signature_at: SLOT_SIGNATURE[0].start,
+		output: Output::Sidecar,
+	})
+}
+
+/// The node's containment check under the reader's view: `proof` is a recovery proof in the
+/// containment domain over the context digest and the containment digest of exactly these inputs.
+pub fn self_check_containment(
+	context: &VerifiedContext,
+	root_key: &[u8; 32],
+	node_id: u32,
+	boot_nonce: &[u8; 16],
+	on: bool,
+	proof: &[u8],
+) -> Result<(), P> {
+	let digest = containment_digest3(root_key, node_id, boot_nonce, on);
+	match verify_core(
+		context.view(),
+		proof,
+		digest,
+		[3, 0],
+		RoleForm3::Containment,
+	) {
+		Ok(true) => Ok(()),
+		_ => Err(P::SelfCheck),
+	}
 }

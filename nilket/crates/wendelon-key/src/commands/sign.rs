@@ -244,3 +244,61 @@ pub(super) fn write(
 	}
 	Ok(())
 }
+
+/// `sign containment` (D-21): the recovery role's process-local containment override for one
+/// node's one boot. The same signing authority as `sign`: an authenticated Bound recovery file,
+/// its context the verified one, its key the history's at its epoch, that epoch active. RootKey
+/// is an explicit input until the identity encoding exists (activation B2). The code is the
+/// containment digest's prefix, which the node's `root2 status` displays (B3).
+pub(super) fn containment(io: &mut dyn Io, a: &Args) -> Result<(), ToolError> {
+	let out = format!("{}.containment", key_name(a.value("--out")?)?);
+	let root_key = unhex::<32>(a.value("--root-key")?)
+		.ok_or_else(|| ToolError::Usage("--root-key is 64 hex digits".into()))?;
+	let node_id: u32 = a
+		.value("--node-id")?
+		.parse()
+		.map_err(|_| ToolError::Usage("--node-id is a u32".into()))?;
+	let nonce = unhex::<16>(a.value("--boot-nonce")?)
+		.ok_or_else(|| ToolError::Usage("--boot-nonce is 32 hex digits".into()))?;
+	let on = match a.value("--state")? {
+		"on" => true,
+		"off" => false,
+		other => return Err(ToolError::Usage(format!("--state {other:?}: on or off"))),
+	};
+	session::run(io, a.path("--dir")?, "sign-containment", |io, s| {
+		let (header, seed, ctx) = signer(io, s, a)?;
+		let unsigned =
+			facade::prepare_containment(&ctx, &header.key, &root_key, node_id, &nonce, on)
+				.map_err(ToolError::Proof)?;
+		let digest = &unsigned.layout()[44..76];
+		s.line.command_digest = Some(hex(digest));
+		s.line.form_slot = Some(format!(
+			"{} containment",
+			describe::form_slot(unsigned.layout(), header.role)
+		));
+		must_be_free(s.dir, &out)?;
+		say(
+			io,
+			&[
+				format!("containment override {}", if on { "ON" } else { "OFF" }),
+				format!("signer role {} epoch {}", header.role, header.epoch),
+				format!("  root key {}", hex(&root_key)),
+				format!("  node {node_id} boot nonce {}", hex(&nonce)),
+			],
+		)?;
+		let code = hex(digest)[..describe::CODE_HEX].to_string();
+		confirm(
+			io,
+			"Type the 32-hex code (the containment context digest's first 32 hex digits, from root2 status on the node): ",
+			&code,
+		)?;
+		let mut lines = vec![format!("containment digest {}", hex(digest))];
+		lines.extend(describe::after(None, unsigned.preimage()));
+		say(io, &lines)?;
+		let output = facade::splice(&unsigned, &signature(&seed, unsigned.preimage()))
+			.map_err(ToolError::Proof)?;
+		facade::self_check_containment(&ctx, &root_key, node_id, &nonce, on, &output)
+			.map_err(ToolError::Proof)?;
+		write(io, s, &[(&out, &output)])
+	})
+}

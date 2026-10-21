@@ -6666,7 +6666,7 @@ fn facade_violation(files: &std::collections::BTreeMap<String, String>) -> Optio
 	if exported
 		!= [
 			"context::{AuditDerived,ContextRefusal,VerifiedContext,verify_context_export}",
-			"proof::{ProofRefusal,Unsigned,check_new_role_key,merge,prepare,prepare_statement,self_check,splice}",
+			"proof::{ProofRefusal,Unsigned,check_new_role_key,merge,prepare,prepare_containment,prepare_statement,self_check,self_check_containment,splice}",
 		] {
 		return Some(format!(
 			"operator_proof.rs: public items changed: {exported:?}"
@@ -7088,4 +7088,181 @@ fn operator_proof_facade_is_exact_and_never_signs() {
 	for (what, x) in &probes {
 		assert!(facade_violation(x).is_some(), "probe not caught: {what}");
 	}
+}
+
+/// The owners (enclosing `fn`, `enum`, `struct`, `trait` or `mod`) of every `target` identifier.
+fn ident_owners(
+	tokens: proc_macro2::TokenStream,
+	owner: &str,
+	target: &str,
+	out: &mut Vec<String>,
+) {
+	let ts: Vec<proc_macro2::TokenTree> = tokens.into_iter().collect();
+	let mut pending: Option<String> = None;
+	for (i, t) in ts.iter().enumerate() {
+		match t {
+			// A raw identifier (`r#Containment`) is the same name.
+			proc_macro2::TokenTree::Ident(id)
+				if id.to_string().trim_start_matches("r#") == target =>
+			{
+				out.push(owner.to_string())
+			}
+			proc_macro2::TokenTree::Ident(id)
+				if matches!(
+					id.to_string().as_str(),
+					"fn" | "enum" | "struct" | "trait" | "mod"
+				) =>
+			{
+				// Owners are item paths (`outer::inner`), so a nested item never passes for an
+				// allowed top-level one.
+				if let Some(proc_macro2::TokenTree::Ident(name)) = ts.get(i + 1) {
+					let name = name.to_string();
+					pending = Some(if owner == "<file>" {
+						name
+					} else {
+						format!("{owner}::{name}")
+					});
+				}
+			}
+			proc_macro2::TokenTree::Group(g) if g.delimiter() == proc_macro2::Delimiter::Brace => {
+				let inner = pending.take().unwrap_or_else(|| owner.to_string());
+				ident_owners(g.stream(), &inner, target, out);
+			}
+			proc_macro2::TokenTree::Group(g) => {
+				let inner = pending.clone().unwrap_or_else(|| owner.to_string());
+				ident_owners(g.stream(), &inner, target, out);
+			}
+			_ => {}
+		}
+	}
+}
+
+/// D-c / activation B1: `RoleForm3::Containment` is named only in `role_command.rs` (the enum and
+/// its domain), in the facade's two containment functions, and in `live.rs::verify_containment`.
+/// Never in `role_requirement`, the on-log verifiers or the audit attribution.
+fn containment_violation(files: &std::collections::BTreeMap<String, String>) -> Option<String> {
+	let allowed = |name: &str| -> Option<&'static [&'static str]> {
+		Some(match name {
+			"role_command.rs" => &["RoleForm3", "domain"],
+			"operator_proof/proof.rs" => &["prepare_containment", "self_check_containment"],
+			n if n == "live.rs" || n.ends_with("/live.rs") => &["verify_containment"],
+			_ => return None,
+		})
+	};
+	for (name, text) in files {
+		let tokens = without_test_items_deep(text.parse().unwrap());
+		let mut owners = Vec::new();
+		ident_owners(tokens, "<file>", "Containment", &mut owners);
+		match allowed(name) {
+			None if !owners.is_empty() => {
+				return Some(format!("{name}: names Containment in {owners:?}"));
+			}
+			None => {}
+			Some(sites) => {
+				if let Some(o) = owners.iter().find(|o| !sites.contains(&o.as_str())) {
+					return Some(format!("{name}: names Containment in {o}"));
+				}
+				let needs_all = name != "live.rs" && !name.ends_with("/live.rs");
+				if needs_all && sites.iter().any(|s| !owners.iter().any(|o| o == s)) {
+					return Some(format!(
+						"{name}: an expected containment site is missing: {owners:?}"
+					));
+				}
+			}
+		}
+	}
+	None
+}
+
+#[test]
+fn containment_form_is_named_only_at_its_three_sites() {
+	let root =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
+	let mut files = std::collections::BTreeMap::new();
+	visit_root2_sources(&root, &mut |p, text| {
+		let rel = p.strip_prefix(&root).unwrap().to_string_lossy().to_string();
+		files.insert(rel, text.to_string());
+	});
+	for required in [
+		"role_command.rs",
+		"operator_proof/proof.rs",
+		"verification.rs",
+		"governance_verification.rs",
+		"compromise/attribution.rs",
+	] {
+		assert!(files.contains_key(required), "{required}");
+	}
+	assert_eq!(containment_violation(&files), None);
+	let edit = |name: &str, f: &dyn Fn(&str) -> String| {
+		let mut x = files.clone();
+		let text = f(&x[name]);
+		assert_ne!(text, x[name], "probe did not change {name}");
+		x.insert(name.to_string(), text);
+		x
+	};
+	let stray = "\nfn stray() -> RoleForm3 { RoleForm3::Containment }\n";
+	for (what, probed) in [
+		(
+			"role_requirement",
+			edit("role_command.rs", &|t| {
+				t.replacen(
+					"\t\t_ => RoleForm3::Legacy,\n\t};\n\tSome((expected, form))",
+					"\t\t_ => RoleForm3::Containment,\n\t};\n\tSome((expected, form))",
+					1,
+				)
+			}),
+		),
+		(
+			"verification.rs",
+			edit("verification.rs", &|t| format!("{t}{stray}")),
+		),
+		(
+			"governance_verification.rs",
+			edit("governance_verification.rs", &|t| format!("{t}{stray}")),
+		),
+		(
+			"attribution.rs",
+			edit("compromise/attribution.rs", &|t| {
+				t.replacen(
+					"\t\t_ => RoleForm3::Legacy,",
+					"\t\t_ => RoleForm3::Containment,",
+					1,
+				)
+			}),
+		),
+		(
+			"another facade function",
+			edit("operator_proof/proof.rs", &|t| format!("{t}{stray}")),
+		),
+		("another live.rs function", {
+			let mut x = files.clone();
+			x.insert("live.rs".into(), stray.into());
+			x
+		}),
+		(
+			"a nested fn named like an allowed site",
+			edit("role_command.rs", &|t| {
+				t.replacen(
+					"\tSome((expected, form))\n}",
+					"\tfn domain() -> RoleForm3 {\n\t\tRoleForm3::Containment\n\t}\n\tSome((expected, form))\n}",
+					1,
+				)
+			}),
+		),
+		(
+			"a raw identifier",
+			edit("verification.rs", &|t| {
+				format!("{t}\nfn stray() -> RoleForm3 {{ RoleForm3::r#Containment }}\n")
+			}),
+		),
+	] {
+		assert!(containment_violation(&probed).is_some(), "{what}");
+	}
+	// Control: the node's future check may name it.
+	let mut live = files.clone();
+	live.insert(
+		"live.rs".into(),
+		"\nfn verify_containment() { let _ = RoleForm3::Containment; }\n".into(),
+	);
+	assert_eq!(containment_violation(&live), None);
 }

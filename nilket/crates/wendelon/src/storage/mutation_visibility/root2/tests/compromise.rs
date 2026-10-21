@@ -5,10 +5,12 @@
 use super::governance_verification::support as wire;
 mod attribution;
 mod containment;
+mod containment_form;
 mod coverage;
 mod custody;
 mod export;
 mod export_chain;
+mod output_pin;
 mod reader;
 mod runbook;
 mod support;
