@@ -35,7 +35,7 @@ final defaults) and four runs of each integration binary. A third, earlier lib r
 | PD-07 | `storage::mutation_visibility::root2::provisioning::tests::owner_log::a_forked_child_cannot_extend_a_dropped_owner_lock` | 1/2 | fork fails with `ENOMEM` | unverified; two competing hypotheses: (a) stack address space reserved by many test threads under heuristic overcommit; (b) a memory-cgroup charge failure at fork (the unit's MemoryMax/MemoryHigh, or the shared slice), which the kernel reports as ENOMEM | open |
 | PD-08 | `network::data_server::tests::table_write_populates_building_secondary_index_active_buffer` | 1/2 | `NotFound` on a file | none yet | open |
 | PD-09 | `network::control_server::tests::maintenance_control_is_node_local_authenticated_and_durable_across_reopen` | 1/2 | `DataDirectoryBusy` on reopen | a forking lib test's child briefly holding the inherited flock (the F-OWN-1 fork window); needs a control | open |
-| PD-10 | `stream_finalization` (`stream_finalization_replays_after_floor_and_stays_ordered_under_write_load`) | 4/4 | replayed sequence differs | none yet | open |
+| PD-10 | `stream_finalization` (`stream_finalization_replays_after_floor_and_stays_ordered_under_write_load`) | 4/4 before oracle repair | replayed sequence differs | write-only expected list omitted other valid Finalize entries; historical unexpected entry identities not recovered | `dd936a775`: full committed-prefix oracle plus real heartbeat controls; focused stress passed, final candidate gate pending |
 | PD-11 | `multinode_bootstrap` (binary) | 4/4 | 1-4 of 5 tests fail (join rejected by seed with a leader hint; epoch wait timeout), or the binary aborts with SIGABRT and prints no result line | none yet | open |
 | PD-12 | `chaos::chaos_smoke_catalog` | 2/4 before fix | timed out waiting for leader 1 (current leader 2) | fixture assumed founding-node leadership | `e508e8a4d`: elected-leader fixture; focused stress passed, final candidate gate pending |
 | PD-13 | `toron` `distributed_process_test` (binary) | 0/25 since | historically two concurrent tests parked every process in a futex wait that never returned | unexplained; the serial nextest group was removed so the binary keeps being tested, and ladder v5 stresses it | open |
@@ -144,3 +144,34 @@ initial election-only setup failure is retained in the firstpass evidence.
 This is focused concurrent evidence, not a full-suite loaded reproduction
 or a completed v5 adoption gate. The signed enter-error P1 checkpoint is
 `58eb2d68a`; neither commit establishes PD-19 causality.
+
+PD-10 focused receipt (2026-10-21): signed test repair `dd936a775` leaves
+product behavior unchanged. It injects real heartbeat finalizations before
+replay and after subscription, derives all expected receipts from independent
+raw committed entries through the final write, and compares the entire marker
+vector with strict ordering and exactly-once write/heartbeat checks. Collection
+has a count cap and correctness hang detectors. Both stream tests passed 30
+nextest repetitions (60 executions) and 10 in-process repetitions at 1024
+threads (20 executions). Receipts:
+`reviews/readiness-pd10-focused-stress-20261021/summary.json`.
+
+Sidecar ordering followup: signed `4b7a17ae0` orders delete and replaced-slab
+retirement against same-key publication. A deterministic missing-guard RED
+control reached unlink while publication was parked; the fresh GREEN executable
+passed. All five publication tests passed 30 nextest repetitions (150 executions)
+and 10 in-process repetitions at 1024 threads (50 executions); catalog and
+architecture checks passed. Receipts:
+`reviews/readiness-sidecar-focused-stress-20261021/summary.json`. A stale RED
+artifact reused by the first GREEN attempt was rejected as invalid provenance;
+package artifacts were invalidated and actual fresh GREEN execution verified.
+The repair preserves restored stored-path behavior. Logical late resurrection,
+blocking work after cancellation, read/publication consistency, and orphan-temp
+recovery remain separate unresolved questions; this is ordering evidence only.
+
+PD-19 evidence recovery: the stopped bigfoot hunt has 40 historical runs at
+intended source `df86421f6`, before both io_uring fixes. One retention reopen
+reported a WAL checksum mismatch; the implicated segment was not retained.
+This is not a current-source rate or causal proof. See
+`reviews/readiness-focused-reviews-20261021/pd19-hunt/REPORT.md` for exact
+provenance limits and all 22 failing test names. Neither old failures nor its
+one passing run close the current candidates.
