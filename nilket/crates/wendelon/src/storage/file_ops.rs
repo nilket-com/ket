@@ -165,8 +165,8 @@ impl IoUringFileOps {
 
 	async fn submit_sync(&self, handle: &FileHandle, op: IoOp) -> std::io::Result<()> {
 		let reply = match op {
-			IoOp::Fsync => self.io.submit_fsync(handle.raw_fd()).await?,
-			IoOp::Fdatasync => self.io.submit_fdatasync(handle.raw_fd()).await?,
+			IoOp::Fsync => self.io.submit_fsync(&handle.file).await?,
+			IoOp::Fdatasync => self.io.submit_fdatasync(&handle.file).await?,
 			IoOp::Read | IoOp::Write => {
 				return Err(Error::new(
 					ErrorKind::InvalidInput,
@@ -309,7 +309,7 @@ impl AsyncFileOps for IoUringFileOps {
 	) -> std::io::Result<(usize, AlignedBuf)> {
 		let reply = self
 			.io
-			.submit(IoOp::Read, handle.raw_fd(), buf, offset)
+			.submit(IoOp::Read, &handle.file, buf, offset)
 			.await?;
 		let completion = reply
 			.await
@@ -331,7 +331,7 @@ impl AsyncFileOps for IoUringFileOps {
 	) -> std::io::Result<(usize, AlignedBuf)> {
 		let reply = self
 			.io
-			.submit(IoOp::Write, handle.raw_fd(), buf, offset)
+			.submit(IoOp::Write, &handle.file, buf, offset)
 			.await?;
 		let completion = reply
 			.await

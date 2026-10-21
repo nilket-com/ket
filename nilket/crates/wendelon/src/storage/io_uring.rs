@@ -25,7 +25,7 @@ use crate::storage::ownership::{
 use io_uring::{IoUring, opcode, types};
 use std::alloc::{self, Layout};
 use std::collections::HashMap;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -146,6 +146,11 @@ pub struct IoRequest {
 // Keep the public request shape unchanged; ownership travels in the private queue.
 struct QueuedIoRequest {
 	request: IoRequest,
+	/// Keeps `request.fd` open until the kernel has finished with it. A bare
+	/// descriptor number in a queue is a dangling reference: if the caller's
+	/// last handle closes it before the ring submits, the number can be reused
+	/// by any other open in the process and the operation lands in that file.
+	file: Arc<std::fs::File>,
 	observation: Option<crate::storage::finality_observation::WorkToken>,
 	owner: Option<DataDirectoryOwner>,
 	permit: Option<WritePermit>,
@@ -203,6 +208,8 @@ pub struct IoCompletion {
 
 struct InFlightRequest {
 	observation: InFlightObservation,
+	/// Held until the CQE is reaped; see `QueuedIoRequest::file`.
+	_file: Arc<std::fs::File>,
 	_owner: Option<DataDirectoryOwner>,
 	_permit: Option<WritePermit>,
 	op: IoOp,
@@ -272,13 +279,17 @@ impl IoRingHandle {
 
 	/// Submit a request. The returned `oneshot::Receiver` fires
 	/// when the kernel completes the I/O.
+	/// Queue `op` against `file`. The ring holds `file` open until the
+	/// operation's completion is reaped, so dropping every caller handle while
+	/// the request waits cannot redirect it to a different file.
 	pub async fn submit(
 		&self,
 		op: IoOp,
-		fd: RawFd,
+		file: &Arc<std::fs::File>,
 		buf: AlignedBuf,
 		offset: u64,
 	) -> std::io::Result<oneshot::Receiver<IoCompletion>> {
+		let fd = file.as_raw_fd();
 		self.ensure_open()?;
 		let slot = self.worker.tx.reserve().await.map_err(|_| closed_error())?;
 		let _admission = self.worker.admission.lock().unwrap();
@@ -306,6 +317,7 @@ impl IoRingHandle {
 		);
 		let req = QueuedIoRequest {
 			request: req,
+			file: Arc::clone(file),
 			observation: crate::storage::finality_observation::current_work(),
 			owner: self.owner.clone(),
 			permit,
@@ -321,24 +333,25 @@ impl IoRingHandle {
 	/// [`submit`]: Self::submit
 	pub async fn submit_fsync(
 		&self,
-		fd: RawFd,
+		file: &Arc<std::fs::File>,
 	) -> std::io::Result<oneshot::Receiver<IoCompletion>> {
-		self.submit_sync(IoOp::Fsync, fd).await
+		self.submit_sync(IoOp::Fsync, file).await
 	}
 
 	/// Submit an `fdatasync(2)` against `fd`.
 	pub async fn submit_fdatasync(
 		&self,
-		fd: RawFd,
+		file: &Arc<std::fs::File>,
 	) -> std::io::Result<oneshot::Receiver<IoCompletion>> {
-		self.submit_sync(IoOp::Fdatasync, fd).await
+		self.submit_sync(IoOp::Fdatasync, file).await
 	}
 
 	async fn submit_sync(
 		&self,
 		op: IoOp,
-		fd: RawFd,
+		file: &Arc<std::fs::File>,
 	) -> std::io::Result<oneshot::Receiver<IoCompletion>> {
+		let fd = file.as_raw_fd();
 		self.ensure_open()?;
 		let slot = self.worker.tx.reserve().await.map_err(|_| closed_error())?;
 		let _admission = self.worker.admission.lock().unwrap();
@@ -363,6 +376,7 @@ impl IoRingHandle {
 		);
 		let req = QueuedIoRequest {
 			request: req,
+			file: Arc::clone(file),
 			observation: crate::storage::finality_observation::current_work(),
 			owner: self.owner.clone(),
 			permit,
@@ -595,6 +609,7 @@ fn push_request(
 
 	let QueuedIoRequest {
 		request,
+		file,
 		observation,
 		owner,
 		permit,
@@ -636,6 +651,7 @@ fn push_request(
 	in_flight.insert(
 		id,
 		InFlightRequest {
+			_file: file,
 			op,
 			buf,
 			reply,
@@ -716,7 +732,6 @@ mod adr629_p2b_observed_ring_tests {
 
 	#[tokio::test]
 	async fn close_drains_queued_kernel_write_and_revokes_retained_ring_clone() {
-		use std::os::fd::AsRawFd;
 		use std::time::Duration;
 		let dir = std::env::temp_dir().join(format!("owner-ring-close-{}", uuid::Uuid::new_v4()));
 		std::fs::create_dir(&dir).unwrap();
@@ -724,20 +739,19 @@ mod adr629_p2b_observed_ring_tests {
 		let handle = spawn_io_thread(8)
 			.unwrap()
 			.with_data_directory_owner(owner.clone());
-		let file = std::fs::OpenOptions::new()
-			.create_new(true)
-			.write(true)
-			.open(dir.join("data"))
-			.unwrap();
+		let file = Arc::new(
+			std::fs::OpenOptions::new()
+				.create_new(true)
+				.write(true)
+				.open(dir.join("data"))
+				.unwrap(),
+		);
 		let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 		let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
 		*handle.cqe_gate.lock().unwrap() = Some((ready_tx, release_rx));
 		let mut buf = AlignedBuf::new(DIRECT_IO_ALIGN);
 		buf.as_mut_slice().fill(0x61);
-		let reply = handle
-			.submit(IoOp::Write, file.as_raw_fd(), buf, 0)
-			.await
-			.unwrap();
+		let reply = handle.submit(IoOp::Write, &file, buf, 0).await.unwrap();
 		tokio::task::spawn_blocking(move || ready_rx.recv().unwrap())
 			.await
 			.unwrap();
@@ -746,12 +760,7 @@ mod adr629_p2b_observed_ring_tests {
 		let mut queued = AlignedBuf::new(DIRECT_IO_ALIGN);
 		queued.as_mut_slice().fill(0x62);
 		let queued_reply = handle
-			.submit(
-				IoOp::Write,
-				file.as_raw_fd(),
-				queued,
-				DIRECT_IO_ALIGN as u64,
-			)
+			.submit(IoOp::Write, &file, queued, DIRECT_IO_ALIGN as u64)
 			.await
 			.unwrap();
 		let closing = {
@@ -770,7 +779,7 @@ mod adr629_p2b_observed_ring_tests {
 			[vec![0x61; DIRECT_IO_ALIGN], vec![0x62; DIRECT_IO_ALIGN]].concat()
 		);
 		DataDirectoryOwner::acquire_existing(&dir).unwrap();
-		let error = handle.submit_fsync(file.as_raw_fd()).await.err().unwrap();
+		let error = handle.submit_fsync(&file).await.err().unwrap();
 		assert!(
 			error
 				.get_ref()
@@ -800,7 +809,12 @@ mod adr629_p2b_observed_ring_tests {
 		// Real submission queue/ownership path, synthetic CQE lifecycle; no kernel claim.
 		let reply = with_work(
 			owner,
-			handle.submit(IoOp::Write, -1, AlignedBuf::new(DIRECT_IO_ALIGN), 0),
+			handle.submit(
+				IoOp::Write,
+				&Arc::new(std::fs::File::open("/dev/null").unwrap()),
+				AlignedBuf::new(DIRECT_IO_ALIGN),
+				0,
+			),
 		)
 		.await
 		.unwrap();
@@ -835,9 +849,68 @@ mod adr629_p2b_observed_ring_tests {
 			(0, 0, Some(Unavailable::UnreadableState))
 		);
 	}
+	/// A write queued behind a busy ring must land in the file it was issued
+	/// for, even if every caller handle to that file is dropped before the ring
+	/// submits it: the descriptor number must not be closed and handed to another
+	/// open in the meantime.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_queued_write_lands_in_its_own_file_after_the_caller_drops_it() {
+		use std::os::fd::AsRawFd;
+		let dir = crate::test_support::TestDir::new("wendelon-ring-fd-lifetime");
+		let handle = spawn_io_thread(8).unwrap();
+		let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+		let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+		*handle.cqe_gate.lock().unwrap() = Some((ready_tx, release_rx));
+		let open = |name: &str| {
+			Arc::new(
+				std::fs::OpenOptions::new()
+					.read(true)
+					.write(true)
+					.create_new(true)
+					.open(dir.join(name))
+					.unwrap(),
+			)
+		};
+		// Park the ring worker on the completion of a first write.
+		let parker = open("parker");
+		let parked = handle
+			.submit(IoOp::Write, &parker, AlignedBuf::new(DIRECT_IO_ALIGN), 0)
+			.await
+			.unwrap();
+		tokio::task::spawn_blocking(move || ready_rx.recv().unwrap())
+			.await
+			.unwrap();
+		// Queue a write for `intended`, then drop the caller's only handle.
+		let intended = open("intended");
+		let mut page = AlignedBuf::new(DIRECT_IO_ALIGN);
+		page.as_mut_slice().fill(0x5a);
+		let queued = handle
+			.submit(IoOp::Write, &intended, page, 0)
+			.await
+			.unwrap();
+		let intended_fd = intended.as_raw_fd();
+		drop(intended);
+		// An unrelated file opened now takes the lowest free descriptor.
+		let bystander = open("bystander");
+		let reused = bystander.as_raw_fd() == intended_fd;
+		release_tx.send(()).unwrap();
+		parked.await.unwrap();
+		let completion = queued.await.unwrap();
+		assert_eq!(completion.result, DIRECT_IO_ALIGN as i32);
+		assert!(
+			std::fs::read(dir.join("bystander")).unwrap().is_empty(),
+			"the queued write landed in an unrelated file (descriptor reused: {reused})"
+		);
+		assert_eq!(
+			std::fs::read(dir.join("intended")).unwrap(),
+			vec![0x5a; DIRECT_IO_ALIGN]
+		);
+		drop(bystander);
+		drop(parker);
+	}
+
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn adr629_p2b_real_kernel_write_keeps_owner_through_cqe_after_waiter_abort() {
-		use std::os::fd::AsRawFd;
 		let registry = FinalityObservationRegistry::new();
 		let owner = registry.begin(WorkScope::Node, WorkKind::StoragePublication);
 		let handle = spawn_io_thread(8).unwrap();
@@ -845,17 +918,22 @@ mod adr629_p2b_observed_ring_tests {
 		let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
 		*handle.cqe_gate.lock().unwrap() = Some((ready_tx, release_rx));
 		let path = std::env::temp_dir().join(format!("adr629-p2b-ring-{}", uuid::Uuid::new_v4()));
-		let file = std::fs::OpenOptions::new()
-			.write(true)
-			.create_new(true)
-			.open(&path)
-			.unwrap();
-		let fd = file.as_raw_fd();
+		let file = Arc::new(
+			std::fs::OpenOptions::new()
+				.write(true)
+				.create_new(true)
+				.open(&path)
+				.unwrap(),
+		);
+		let submitted = Arc::clone(&file);
 		let driver = handle.clone();
 		let caller = tokio::spawn(with_work(owner, async move {
 			let mut buf = AlignedBuf::new(DIRECT_IO_ALIGN);
 			buf.as_mut_slice().fill(0x29);
-			let reply = driver.submit(IoOp::Write, fd, buf, 0).await.unwrap();
+			let reply = driver
+				.submit(IoOp::Write, &submitted, buf, 0)
+				.await
+				.unwrap();
 			reply.await
 		}));
 		tokio::time::timeout(
