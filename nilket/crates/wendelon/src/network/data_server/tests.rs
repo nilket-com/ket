@@ -14595,10 +14595,17 @@ fn table_write_parent_identity_ignores_idempotency_ttl_and_pad() {
 }
 
 /// ADR 541 Acceptance 1 (in-repo form): a full-table scan an order of magnitude past
-/// the former 250 ms-lifetime failure point completes under the DEFAULT budget. The
+/// the former 250 ms-lifetime failure point completes under the DEFAULT caps. The
 /// old semantics fail this twice over — 25,000 locations breaks the 4,096 total cap,
-/// and the scan wall breaks the lifetime clock — so this fixture is discriminating
-/// against both retired behaviors at once.
+/// and a lifetime clock never resets — so this fixture is discriminating against both
+/// retired behaviors at once.
+///
+/// Both are asserted without racing a wall clock. The caps are the defaults. The
+/// clock's sliding nature is asserted from its progress marks: `progressed()` is the
+/// one place that both resets the stall clock and counts a mark, so a mark per
+/// examined location is a reset per location. The stall bound itself is lifted:
+/// 250 ms of wall time between two locations is what a starved scheduler can lose,
+/// and that would measure the host, not the clock.
 #[tokio::test]
 async fn full_scan_completes_far_beyond_the_former_lifetime_cap() {
 	let (_mgr_dir, mgr) = make_manager().await;
@@ -14613,12 +14620,65 @@ async fn full_scan_completes_far_beyond_the_former_lifetime_cap() {
 		.await;
 	}
 	let sm = WendelonStateMachine::new();
-	let (resp, arrow) = execute_query_plan(&mgr, &sm, n(1), &base_meta(), &[])
-		.await
-		.unwrap();
+	let defaults = QueryExecutionBudget::default();
+	assert!(
+		25_000 > defaults.max_locations,
+		"premise: the scan exceeds the default location cap"
+	);
+	let plan = plan_query_execution_with_budget_and_retention_floor(
+		&mgr,
+		&sm,
+		n(1),
+		&base_meta(),
+		&[],
+		QueryExecutionBudget {
+			max_wall_time: Duration::from_secs(3600),
+			..defaults
+		},
+		None,
+	)
+	.await
+	.unwrap();
+	assert_eq!(plan.response.status, ReadStatus::OK);
+	assert_eq!(plan.response.rows, 25_000);
+	assert!(!plan.batches.is_empty());
+	assert!(
+		plan.clocks.progress_marks >= 25_000,
+		"the stall clock must reset per examined location, got {} marks",
+		plan.clocks.progress_marks
+	);
+
+	// The full execution path too: concatenation and wire encoding of all
+	// 25,000 rows, under the same caps and the same lifted stall bound.
+	let (resp, arrow) = execute_query_plan_with_budget_and_retention_floor(
+		&mgr,
+		&sm,
+		n(1),
+		&base_meta(),
+		&[],
+		QueryExecutionBudget {
+			max_wall_time: Duration::from_secs(3600),
+			..defaults
+		},
+		None,
+	)
+	.await
+	.unwrap();
 	assert_eq!(resp.status, ReadStatus::OK);
 	assert_eq!(resp.rows, 25_000);
 	assert!(arrow.is_some());
+}
+
+/// The server-side stall bound is product policy (ADR 541), and the operator is
+/// weighing a change to it: on a starved host 250 ms between two units of
+/// progress fails queries that are still progressing. Pinned so the value only
+/// changes deliberately, together with this test.
+#[test]
+fn the_default_query_stall_bound_is_250_ms() {
+	assert_eq!(
+		QueryExecutionBudget::default().max_wall_time,
+		Duration::from_millis(250)
+	);
 }
 
 /// ADR 541 Acceptance 3: a caller deadline tighter than any server policy is honored
