@@ -36,7 +36,7 @@ final defaults) and four runs of each integration binary. A third, earlier lib r
 | PD-08 | `network::data_server::tests::table_write_populates_building_secondary_index_active_buffer` | 1/2 | `NotFound` on a file | none yet | open |
 | PD-09 | `network::control_server::tests::maintenance_control_is_node_local_authenticated_and_durable_across_reopen` | 1/2 | `DataDirectoryBusy` on reopen | a forking lib test's child briefly holding the inherited flock (the F-OWN-1 fork window); needs a control | open |
 | PD-10 | `stream_finalization` (`stream_finalization_replays_after_floor_and_stays_ordered_under_write_load`) | 4/4 before oracle repair | replayed sequence differs | write-only expected list omitted other valid Finalize entries; historical unexpected entry identities not recovered | `dd936a775`: full committed-prefix oracle plus real heartbeat controls; focused stress passed, final candidate gate pending |
-| PD-11 | `multinode_bootstrap` (binary) | 4/4 | 1-4 of 5 tests fail (join rejected by seed with a leader hint; epoch wait timeout), or the binary aborts with SIGABRT and prints no result line | none yet | open |
+| PD-11 | `multinode_bootstrap` (binary) | 4/4 before scoped repair | join rejection, epoch wait timeout, or SIGABRT without result | completed self-JOIN retry after leader handoff reproduced separately | `e0edea2a0`: guarded completed-state replay; focused stress passed; incomplete epoch, replacement timeout and abort remain separate/open |
 | PD-12 | `chaos::chaos_smoke_catalog` | 2/4 before fix | timed out waiting for leader 1 (current leader 2) | fixture assumed founding-node leadership | `e508e8a4d`: elected-leader fixture; focused stress passed, final candidate gate pending |
 | PD-13 | `toron` `distributed_process_test` (binary) | 0/25 since | historically two concurrent tests parked every process in a futex wait that never returned | unexplained; the serial nextest group was removed so the binary keeps being tested, and ladder v5 stresses it | open |
 
@@ -198,3 +198,42 @@ the pinned module census restored the guard without weakening it. The tests'
 child-process guard bounds execution and reaps children on cancellation. These
 are focused checks, without additional background suite load; full-stack
 concurrency adoption and lifecycle/read-coherence followups remain pending.
+
+PD-11 completed-state retry receipt (2026-10-21): signed `e0edea2a0` repairs
+the reproduced self-ID rejection when an already joined voter becomes leader
+and receives its matching request through a follower. The authenticated request
+passes ordinary framing, shape and protocol checks; the self path then requires
+a fresh quorum/applied-state fence and a coherent completed membership/epoch
+proof before returning success without JOIN mutation. Joint/incomplete state,
+raw field mismatches, incompatible protocol, unauthorized requests and stale
+former leaders remain refused. This is current-state idempotence; no historical
+operation ID or actor-key identity is invented.
+
+The exact primary RED reached reason-5 self-ID rejection with completed epoch3.
+GREEN preserves both retry acceptance and the original pending bootstrap's
+success. Three pure proof tests and the nine-test bootstrap firstpass passed;
+all nine bootstrap tests then passed 30 nextest repetitions (270 executions)
+and 10 in-process repetitions at explicit 1024 threads (90 executions). All
+180 architecture checks passed. Receipts:
+`reviews/readiness-pd11-self-replay-r5-stress-20261021/summary.json`.
+
+Two earlier incomplete-stage controls failed while establishing leadership,
+before invoking the retry; those failures are retained. Diagnostics exposed
+a candidate behind its surviving voter's log. The reviewed setup now partitions
+in stages and waits for the joining voter to apply a fresh incumbent storage
+prefix before the second cut, checking the incumbent's core leadership/vote
+remains stable. A proposed cached-metrics bound was rejected in source review
+before execution. These changes preserve the original timeout and election
+settings. Focused passes do not close the independent incomplete-epoch handoff,
+replacement follower epoch timeout, unexplained SIGABRT, full-suite loaded
+evidence or final v5 adoption gate.
+
+PD-19 capture prerequisite: signed `290131659` retains the exact retention
+fixture on reopen error before temporary-directory cleanup and optionally copies
+root artifacts to an explicitly configured persistent capture directory. It
+records per-file pre/copy/post BLAKE3 hashes, identity/namespace checks and the
+expected raw entries; partial errors retain the original directory and original
+error. This is a checked per-file copy, without an atomic-snapshot or global
+writer-quiescence claim. All three forced-error controls passed. Receipts:
+`reviews/readiness-pd19-capture-focused-20261021/summary.json`. No current-source
+retention hunt or PD-19 causal closure follows from those helper controls.
