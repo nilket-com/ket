@@ -14718,7 +14718,13 @@ async fn no_match_full_scan_progresses_per_examined_location() {
 		n(1),
 		&meta,
 		&bytecode,
-		QueryExecutionBudget::default(),
+		// The marks are what is measured. The server's 250 ms stall bound is a
+		// wall clock a starved scheduler can trip between two locations, which
+		// would end the scan before it examined them all.
+		QueryExecutionBudget {
+			max_wall_time: Duration::from_secs(3600),
+			..QueryExecutionBudget::default()
+		},
 		None,
 	)
 	.await
