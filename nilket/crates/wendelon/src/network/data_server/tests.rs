@@ -3666,6 +3666,22 @@ fn lease_scratch_guard_removes_only_its_owned_directory() {
 	assert_eq!(std::fs::read(other.join("slab")).unwrap(), b"keep");
 }
 
+/// Fixtures that play the secondary-index lifecycle driver's part themselves
+/// (declaration cut, backfill, completion) stop the node's own driver first. It
+/// ticks every second; a test that outlives a tick under load would otherwise
+/// have the driver cut and backfill the slabs its assertions are about.
+async fn stop_secondary_index_lifecycle(node: &WendelonNode) {
+	node.handles.secondary_index_lifecycle.abort();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+	while !node.handles.secondary_index_lifecycle.is_finished() {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the secondary-index lifecycle driver did not stop"
+		);
+		tokio::time::sleep(Duration::from_millis(1)).await;
+	}
+}
+
 async fn shutdown_lease_node(node: WendelonNode) {
 	node.handles.abort();
 	tokio::time::timeout(Duration::from_secs(10), async {
@@ -6533,6 +6549,7 @@ async fn table_query_plan_carries_ready_secondary_index_access_plan() {
 	))
 	.await
 	.unwrap();
+	stop_secondary_index_lifecycle(&node).await;
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 	loop {
 		if node.raft.current_leader().await == Some(node.local_node.id) {
@@ -6617,6 +6634,7 @@ async fn table_write_populates_building_secondary_index_active_buffer() {
 	))
 	.await
 	.unwrap();
+	stop_secondary_index_lifecycle(&node).await;
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 	loop {
 		if node.raft.current_leader().await == Some(node.local_node.id) {
@@ -6699,6 +6717,7 @@ async fn table_write_seals_secondary_index_active_buffer_after_slab_rotation() {
 	))
 	.await
 	.unwrap();
+	stop_secondary_index_lifecycle(&node).await;
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 	loop {
 		if node.raft.current_leader().await == Some(node.local_node.id) {
@@ -6796,6 +6815,7 @@ async fn table_query_secondary_index_execution_returns_sidecar_rows() {
 	))
 	.await
 	.unwrap();
+	stop_secondary_index_lifecycle(&node).await;
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 	loop {
 		if node.raft.current_leader().await == Some(node.local_node.id) {
@@ -16859,6 +16879,7 @@ async fn secondary_index_read_serves_partitioned_rows() {
 	))
 	.await
 	.unwrap();
+	stop_secondary_index_lifecycle(&node).await;
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 	loop {
 		if node.raft.current_leader().await == Some(node.local_node.id) {
