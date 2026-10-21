@@ -223,6 +223,7 @@ use lsm_driver::{
 	cleanup_lsm_compaction_tmp_files, lsm_run_summary_from_index, refresh_lsm_level_metrics,
 	remove_non_live_lsm_rows_from_index,
 };
+mod secondary_index_cleanup;
 mod secondary_index_segments;
 pub(crate) use encoding_compute::{
 	EncodedAggregateL2RecordRead, EncodingMaterializeAuditSample, ProjectedL2RecordRead,

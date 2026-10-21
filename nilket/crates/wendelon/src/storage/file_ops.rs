@@ -722,7 +722,7 @@ where
 	.map_err(|err| Error::other(format!("blocking file op task failed: {err}")))?
 }
 
-async fn spawn_blocking_io_owned<T, F>(
+pub(crate) async fn spawn_blocking_io_owned<T, F>(
 	owner: Option<DataDirectoryOwner>,
 	f: F,
 ) -> std::io::Result<T>
