@@ -198,6 +198,11 @@ struct GroupCommitCoordinator {
 struct GroupCommitState {
 	pending: Vec<oneshot::Sender<std::io::Result<()>>>,
 	driver_running: bool,
+	/// Test-only: when set, a driver whose window has closed waits on it before
+	/// taking its batch, so a test can admit a known set of waiters into one
+	/// window without racing the window's wall-clock length.
+	#[cfg(test)]
+	batch_hold: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// The unified storage interface for Wendelon.
@@ -692,6 +697,15 @@ impl LocalSlabStore {
 				tokio::time::sleep(target - elapsed).await;
 			}
 
+			#[cfg(test)]
+			{
+				let hold = self.group_commit.state.lock().await.batch_hold.clone();
+				if let Some(hold) = hold {
+					// Closing the semaphore is the release; the error is the signal.
+					let _ = hold.acquire().await;
+				}
+			}
+
 			let waiters = {
 				let mut state = self.group_commit.state.lock().await;
 				if state.pending.is_empty() {
@@ -956,6 +970,21 @@ impl LocalSlabStore {
 	#[cfg(test)]
 	pub(crate) fn fdatasync_call_count(&self) -> u64 {
 		self.fdatasync_calls.load(Ordering::Relaxed)
+	}
+
+	/// Hold every group-commit batch after its window closes until the returned
+	/// semaphore is closed.
+	#[cfg(test)]
+	pub(crate) async fn hold_group_commit_batches_for_test(&self) -> Arc<tokio::sync::Semaphore> {
+		let hold = Arc::new(tokio::sync::Semaphore::new(0));
+		self.group_commit.state.lock().await.batch_hold = Some(Arc::clone(&hold));
+		hold
+	}
+
+	/// Durability waiters queued for the next fdatasync.
+	#[cfg(test)]
+	pub(crate) async fn pending_durable_waiters_for_test(&self) -> usize {
+		self.group_commit.state.lock().await.pending.len()
 	}
 }
 
