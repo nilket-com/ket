@@ -324,3 +324,28 @@ stopped after foreground completion and is not a full-suite pass. Receipts:
 `reviews/readiness-counter-replica-green-20261021/summary.json`. Focused repair
 evidence does not close final stacked v5 adoption or establish storage append
 cancellation atomicity.
+
+PD-11 forwarding prerequisite (2026-10-21): signed integration `0194ccc31`
+repairs a separate reproduced routing gap. When epoch 2 lacks promoted leader 3,
+a follower retry previously failed before entering that leader's JOIN handler;
+a direct-ingress control reached it and safely refused incomplete JOIN. The
+JOIN-only fallback now uses the applied uniform voter membership's trusted
+address, rechecks the leader hint, and preserves the normal epoch route and
+authentication errors. It grants no JOIN acceptance or recovery mutation.
+
+The first stress candidate failed once on completed handoff repetition 27,
+before forwarding: survivor log tail 147 exceeded the joining candidate's 146.
+That failure, source and executable remain retained. The reviewed fixture
+revision extends existing staged partition and applied-prefix checks to both
+handoff cuts, preserving completion/bootstrap assertions and all deadlines.
+Final focused receipts: 13 firstpass, 180 nextest stress executions, 60
+in-process executions at explicit 1024 threads, four baseline and eight loaded
+controls, all passed with zero selected ignores or retries. Earlier architecture
+180/180 is reused on unchanged production/guard bytes. Background load was
+deliberately stopped, not a full-suite pass. Evidence:
+`reviews/readiness-pd11-forwarding-20261021/r2/summary.json`; independent audit:
+`reviews/readiness-next-cut-independent-evidence-audit-20261021.json`.
+Incomplete epoch recovery, replacement timeout, historical abort, startup
+lifecycle cleanup and final stacked v5 adoption remain separate/open. State
+nonmutation checks observe the follower plus shared promotion-call count,
+not direct leader durable-state closure.
