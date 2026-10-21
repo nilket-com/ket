@@ -634,8 +634,24 @@ async fn full_retains_genesis_history_past_the_default_threshold() {
 	drop(store);
 	drop(node);
 
-	// Full Raft and state-machine restart from the retained WAL.
-	let node = start(&dir, ControlRetention::Full).await.unwrap();
+	// Full Raft and state-machine restart from the retained WAL. On failure,
+	// preserve the exact directory before TestDir cleanup can erase evidence.
+	let node = match start(&dir, ControlRetention::Full).await {
+		Ok(node) => node,
+		Err(error) => {
+			let capture_root = std::env::var_os(failure_capture::ROOT_ENV).map(PathBuf::from);
+			panic!(
+				"{}",
+				failure_capture::retain_failure(
+					dir,
+					&error,
+					last,
+					&before_entries,
+					capture_root.as_deref()
+				)
+			);
+		}
+	};
 	assert_eq!(
 		node.guard.status().history,
 		HistoryCheck::Complete { stored_last: last }
@@ -1227,3 +1243,5 @@ fn retention_paths_are_guarded() {
 }
 
 mod g2;
+
+mod failure_capture;
