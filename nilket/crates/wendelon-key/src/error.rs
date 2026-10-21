@@ -39,6 +39,10 @@ pub(crate) enum ToolError {
 	Context(ContextRefusal),
 	#[error("the key is refused: {0:?}")]
 	Key(ProofRefusal),
+	#[error("the operator proof facade refuses: {0:?}; nothing was written")]
+	Proof(ProofRefusal),
+	#[error("{what} is not a canonical Root2 command")]
+	Command { what: String },
 	#[error("{0}")]
 	Refused(String),
 	#[error(
