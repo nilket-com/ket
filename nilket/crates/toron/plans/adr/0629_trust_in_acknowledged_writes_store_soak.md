@@ -389,6 +389,10 @@ identity.
 ## Guardrails
 
 - Synthetic data only.
+- A soak driver launched through `nilket/scripts/cargo-cgroup` sets
+  `CARGO_CGROUP_RUNTIME_MAX_SEC` above the campaign's duration (24 h and 72 h
+  here). The wrapper's default of one day otherwise stops the unit partway,
+  reported on stderr with exit 124 (`nilket/plans/ops/test_parallelism.md`).
 - Build and test on bigfoot in isolated ladder worktrees.
 - Every cited figure is read from its artifact.
 - Pin findings stay findings: no silent expectation changes, and no production fix within Stage A.

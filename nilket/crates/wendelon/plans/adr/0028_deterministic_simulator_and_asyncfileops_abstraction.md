@@ -20,7 +20,7 @@ Forces in play:
 
 1. **Dual test harness, both permanent.** Wendelon ships with two correctness harnesses that run concurrently throughout the product's lifetime:
    - **Process-level chaos harness** — real daemons, real QUIC on localhost, controlled network partitions via `nftables`, controlled crashes via `SIGKILL`, real disk with injected faults via a shim layer. Exercises the actual product path. Non-deterministic by design: it catches bugs that depend on real kernel and network behavior.
-   - **Deterministic simulator** — single-process, single-threaded scheduler, logical time, turmoil-style network substitution under `quinn`, custom storage simulator behind `AsyncFileOps`, mocked `ObjectStore` for the L2 path. Every failure prints its seed; every failing seed is reproducible forever.
+   - **Deterministic simulator** — single-process scheduler on one thread, logical time, turmoil-style network substitution under `quinn`, custom storage simulator behind `AsyncFileOps`, mocked `ObjectStore` for the L2 path. Every failure prints its seed; every failing seed is reproducible forever.
 
    Neither is deprecated; neither is "the successor to" the other. They surface different bug classes and the costs are different: chaos is cheap to run and finds real-kernel bugs; simulator is cheap to reproduce and finds interleaving bugs.
 
@@ -70,7 +70,7 @@ Forces in play:
 
 4. **turmoil-style network simulation under `quinn`.** The simulator's network layer replaces `quinn`'s I/O driver with a turmoil-style scheduler. Connections between simulated nodes become in-memory channels with injectable latency, loss, reorder, and partition faults. Real `quinn` encode/decode logic runs unchanged; only the transport substrate is simulated.
 
-   `turmoil` is not used as-is — Wendelon's QUIC layer has dependencies that turmoil does not satisfy — but the scheduler shape (single-thread, cooperative, deterministic message passing) is copied. Whether this reuses an internal crate or forks turmoil is a scope question tracked in Open Questions.
+   `turmoil` is not used as-is — Wendelon's QUIC layer has dependencies that turmoil does not satisfy — but the scheduler shape (one thread, cooperative, deterministic message passing) is copied. Whether this reuses an internal crate or forks turmoil is a scope question tracked in Open Questions.
 
 5. **`ObjectStore` mocking for L2.** The L2 path uses a mock `ObjectStore` trait implementation in the simulator:
    - Configurable latency distributions per operation (put, get, list, delete, multipart).

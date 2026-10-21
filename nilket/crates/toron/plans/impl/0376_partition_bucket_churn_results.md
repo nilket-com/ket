@@ -106,7 +106,7 @@ reducing it requires a broader change to avoid re-reading/repartitioning the bui
 
 ## Parallelism reassessment
 
-The cleaned q07 profile is now mostly real single-threaded work:
+The cleaned q07 profile is now mostly real one-thread work:
 
 - spill page write / tmpfs write
 - Arrow take / memmove

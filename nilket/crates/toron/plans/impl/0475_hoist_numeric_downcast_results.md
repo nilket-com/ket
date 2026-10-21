@@ -21,7 +21,7 @@ reader construction would have errored where the old code succeeded — non-nume
 inputs resolve to `None` and fall back to the original per-row path, preserving the
 exact message and the exact row at which it fires.
 
-## Measured (sf=8, ADR 473 conditions, references single-threaded)
+## Measured (sf=8, ADR 473 conditions, references on one thread)
 
 | primitive | before | after | speedup | Toron/best after |
 |---|---:|---:|---:|---:|

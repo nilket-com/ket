@@ -10,7 +10,7 @@ the first perf cut. **No optimization** (unless a tiny obvious instrumentation f
 
 Leading hypothesis (to confirm, not assume): **missing parallelism** - the executor has no parallelism primitives
 (`par_iter`/`rayon`/`tokio::spawn`/`join_all`/`available_parallelism` absent from `exec.rs`/`exec/`), so Toron likely
-runs single-threaded while DuckDB uses all cores (q04 DuckDB=130ms, reference only).
+runs on one thread while DuckDB uses all cores (q04 DuckDB=130ms, reference only).
 
 ## Decision
 
@@ -19,7 +19,7 @@ Profiling tooling is set up: `cargo-flamegraph` 0.6.13, `inferno` 0.12.6, `perf_
 `kptr_restrict=0`, and `perf record` verified. The profiling smoke must verify the same call-graph mode used for the
 real run (`--call-graph dwarf`), because a frame-pointer-only smoke can pass while optimized Rust stacks are still
 unusable. The flamegraph is the primary method (unbiased CPU sampling); its per-thread stacks answer both the
-hot-operator breakdown and the **single-thread question**.
+hot-operator breakdown and the **one-thread question**.
 
 **The workload must be profiled inside the fixed-cap unit, not the wrapper.** Run `perf record` *inside* a
 `systemd-run --scope` cap so it samples the `toron-tpch` process under the real 4 GB cap - never sample `systemd-run`
@@ -33,7 +33,7 @@ workload.
    hash/key encoding, grouped fold, residual eval, exchange/partition), plus **cores-utilized** (cross-check the
    parallelism hypothesis) and an unclassified-stack share. If wall-vs-operator-sum is needed beyond the flamegraph's
    sample percentages, add only an off-by-default timing complement; do not invent wall-time accounting from samples.
-2. **Controls:** q07/q17/q19/q21 profiled the same way - is the dominant cost **systemic** (shared: single-thread /
+2. **Controls:** q07/q17/q19/q21 profiled the same way - is the dominant cost **systemic** (shared: one-thread execution /
    hash-probe substrate) or **per-query** (isolated)?
 3. **Classification** with evidence: algorithmic bug/quadratic, missing parallelism, slow hash/probe substrate, scan
    throughput, expression/filter overhead, or expected-but-too-slow baseline.
@@ -72,7 +72,7 @@ off-by-default + behavior-neutral; a temporary hook is removed before seal. The 
   requirement guards it.
 - **Truncated/biased window** - a too-short or ramp-phase window misattributes cost; require steady CPU + a window long
   enough to be representative.
-- **Two co-causes** - single-thread AND a slow hash/probe; the named cut picks the higher-leverage one, the other is
+- **Two co-causes** - one-thread execution AND a slow hash/probe; the named cut picks the higher-leverage one, the other is
   queued.
 - **Symbol gaps** - missing debug symbols flatten the flamegraph; `CARGO_PROFILE_RELEASE_DEBUG=true` is required.
 

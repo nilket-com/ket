@@ -2,7 +2,7 @@
 
 ## Context
 
-The big systemic lever, design-first. 373 confirmed single-thread execution; 374-378 removed the algorithmic waste so the
+The big systemic lever, design-first. 373 confirmed one-thread execution; 374-378 removed the algorithmic waste so the
 time cluster's residual is now **real** spill/read/write/Arrow work. The smallest credible first parallel target is the
 **partitioned spill/join family** (q07 + q03/q05/q10) - partition-shaped, already isolated by 377/378. Head start: the
 runtime is **already multi-thread** (`new_multi_thread`: cli.rs:414, daemon.rs:542) but the executor runs **inline**

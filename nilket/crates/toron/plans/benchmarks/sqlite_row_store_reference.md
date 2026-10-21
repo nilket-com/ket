@@ -1,7 +1,7 @@
 # Benchmark finding — SQLite as a row-store reference on the primitive ladder
 
 A row-store B-tree reference added to the ADR 473 primitive ladder. SQLite is a
-different *kind* of reference than DuckDB/Polars: single-threaded, non-vectorized,
+different *kind* of reference than DuckDB/Polars: one-thread, non-vectorized,
 row-oriented, B-tree storage. Where Toron lands relative to it is diagnostic — beating
 it confirms columnar value; losing to it flags a path weaker than the naive baseline.
 
@@ -11,9 +11,9 @@ it confirms columnar value; losing to it flags a path weaker than the naive base
 - Data built from the same sf=8 strict parquet used by the ladder, via DuckDB
   `v1.5.4` sqlite extension. **Not the same physical source** — SQLite reads its own
   B-tree, so this measures engine+storage, not same-data engine-only.
-- Single node, single thread throughout (SQLite is inherently single-threaded; the
+- Single node, one thread throughout (SQLite inherently executes on one thread; the
   DuckDB/Polars ladder numbers it is compared to were pinned to one thread; Toron
-  runs single-threaded).
+  runs on one thread).
 
 ## Reproducible DB build (native types)
 
@@ -48,7 +48,7 @@ Row counts verified equal to the parquet (lineitem 47,989,007; orders 12,000,000
   grouping compute; the raw 9,350 ms included output formatting). m04's 3-row output
   formats instantly, so its number is unaffected.
 
-## The ladder (sf=8, ms; Toron/DuckDB/Polars from the ADR 477 ladder, single-thread)
+## The ladder (sf=8, ms; Toron/DuckDB/Polars from the ADR 477 ladder, one thread)
 
 | primitive | isolates | Toron | DuckDB | Polars | SQLite | Toron ÷ SQLite |
 |---|---|---:|---:|---:|---:|---:|

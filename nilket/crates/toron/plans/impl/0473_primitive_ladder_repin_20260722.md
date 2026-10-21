@@ -7,7 +7,7 @@ and code: m06 moved 23.3 s → 3.54 s across ADRs 490–493.
 Coordinate: strict, sf=8, persisted parquet, release, 2 GiB task / 2 GiB spill
 reserve, 1 warmup + 5 measured runs. Toron rows carry
 `build_commit=f5add54495f2-dirty` (the ADR 493 candidate build). DuckDB is the
-single-thread reference (`SET threads=1`); Polars was not run in this re-pin. All
+one-thread reference (`SET threads=1`); Polars was not run in this re-pin. All
 rows pass with zero spill. Artifacts: `target/tpch/adr494_ladder/{mNN,duckdb_mNN}/`.
 
 | primitive | toron median | duckdb 1t | ratio | absolute gap |

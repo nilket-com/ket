@@ -30,7 +30,7 @@ attribution):
 including ours), while its accumulate step is a null-check and increment.
 
 All four run against DuckDB and Polars under the ADR 473 conditions (same persisted
-Parquet, single-threaded references, recorded versions/threads/coordinates), so
+Parquet, one-thread references, recorded versions/threads/coordinates), so
 each layer gets a ratio, not just a Toron-internal number.
 
 ## Rail 2 — the flame graph, now warranted
@@ -53,7 +53,7 @@ agree.
   between the two is reported as unresolved, not reconciled by narrative.
 - **A named owner for the 20×**, or an explicit statement that the evidence does
   not yet distinguish two candidates and what would.
-- No optimization in this cut. No parallelism work: references were single-threaded
+- No optimization in this cut. No parallelism work: references ran on one thread
   and the scalar path must be understood before multi-core scaling can be priced.
 
 ## Guardrails

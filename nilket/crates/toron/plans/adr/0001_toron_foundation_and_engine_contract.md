@@ -274,7 +274,7 @@ Scope:
 
 Hard gates:
 
-- single-thread and multi-thread runs produce identical output
+- one-thread and multi-thread runs produce identical output
 - retrying a morsel is idempotent
 - morsel order does not affect final result
 - determinism digest matches across independent runs

@@ -118,7 +118,7 @@ wall-mover. The common next wall is spill-byte volume, not memory residency or p
 ## Parallelism reassessment
 
 After ADR 377, the cleaned q07 profile is no longer dominated by the avoidable build re-scan/bucket computation. The
-remaining visible cost is spill read/write, Arrow/copy, allocator, and syscall/futex overhead in a still single-threaded
+remaining visible cost is spill read/write, Arrow/copy, allocator, and syscall/futex overhead in a still one-thread
 execution model. That makes parallelism a reasonable next systemic lever, but the family measurement also identifies a
 separate high-leverage memory/wall cut: reduce the `streamed inner join build spill writer` spill volume for
 q03/q05/q10/q12.

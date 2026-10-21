@@ -668,11 +668,11 @@ Out of scope:
   *Mitigation:* single retry only; clear error message.
   V1.x can add backoff or DDL coordination.
 - **R5: GROUP BY perf on large cardinality.** Hash-
-  aggregation in a single thread (no parallelism in this
+  aggregation on one thread (no parallelism in this
   ADR) is the V1 shape; high-cardinality groups will be
   slow.
   *Mitigation:* ADR 003 (executor model) likely introduces
-  morsel-parallel aggregate; V1 ships single-threaded.
+  morsel-parallel aggregate; V1 ships it on one thread.
 - **R6: Refactor regression in existing M3 / M5 / M6
   paths.** Rewriting `exec.rs` and `storage.rs` is invasive;
   risk of breaking the seed's existing tests.
@@ -751,12 +751,12 @@ Out of scope:
   batch size, or apply a sort-stabilization step) shared
   by every parity test. Document the policy in the bench
   results artifact.
-- **R17: Single-threaded GROUP BY perf on high
+- **R17: One-thread GROUP BY perf on high
   cardinality.** Hash-aggregation in one thread is the V1
   shape.
   *Mitigation:* ADR 002 cares about correctness and
   parity, not throughput. ADR 003 likely introduces
-  morsel-parallel aggregate. V1 ships single-threaded;
+  morsel-parallel aggregate. V1 ships it on one thread;
   bench artifact records cardinality / time as diagnostic.
 - **R18: Removing hardcoded SQL / Rune table mappings breaks
   seed M7 / M8 tests.** The seed's `match name { "sales"

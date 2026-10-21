@@ -9,7 +9,7 @@ also supplies the clean commit identity the ADR 495 receipt lacked (it measured
 `build_commit=44b0c9489754-dirty`).
 
 Coordinate: strict, sf=8, persisted parquet, release, 2 GiB task / 2 GiB spill
-reserve, 1 warmup + 5 measured runs. DuckDB is the single-thread reference
+reserve, 1 warmup + 5 measured runs. DuckDB is the one-thread reference
 (v1.5.4 Variegata); Polars was not run. All rows pass with zero spill. Artifacts:
 `target/tpch/adr495_ladder_refresh/ladder.jsonl`.
 
@@ -33,7 +33,7 @@ remaining CPU-side join + COUNT cost (zero spill, in-memory build — the residu
 is probe/aggregate CPU, per ADR 493's forward note).
 
 ADR 495 moved m05 off the board: the 12M-group count went 8,472 ms (473 repin) →
-2,744 ms here, and Toron now beats DuckDB single-thread (0.79×) at 596 MiB peak
+2,744 ms here, and Toron now beats DuckDB on one thread (0.79×) at 596 MiB peak
 RSS vs DuckDB's 9.7 GiB — the RSS independently reproduces the ADR 495 residency
 claim on the clean binary.
 

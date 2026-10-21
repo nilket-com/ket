@@ -64,7 +64,7 @@ claim no raster truth.
 | 6. Distinct authorities | The existing Ready-discovery gate now requires exactly `Attaching Toron workspace…`; `product_0071_joined_toron_workspace_chrome_omits_the_nonce` drives the success handler and requires exactly `Joined Toron workspace.` with the nonce absent. The durable segment is independently model-gated | pass |
 | 7. PRODUCT-0063 preserved | All PRODUCT-0063 focused tests pass, including Session-menu visibility, production create/open/checkpoint/close/reopen, and the SIGKILL boundary. Only the superseded title assertion was removed | pass |
 | 8. Honest oracle boundary | The plan and this evidence name the assertion gap, absence of a licensed iced recorder, consumed `StatusBar`/`MenuRoot` models, test-only observation, structural wiring guard, and separate clipboard/parser oracle | pass |
-| 9. Bounded suites | Default Polariton, no-default focused, all-feature/all-target check, inherited PRODUCT-0063, complete single-threaded workspace, coordinate trybuild, and PRODUCT-0057 Vulkan evidence all pass. No baseline is refreshed | pass |
+| 9. Bounded suites | Default Polariton, no-default focused, all-feature/all-target check, inherited PRODUCT-0063, complete one-test-thread workspace, coordinate trybuild, and PRODUCT-0057 Vulkan evidence all pass. No baseline is refreshed | pass |
 
 ## Verification
 

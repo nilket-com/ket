@@ -2,7 +2,7 @@
 
 Protocol re-pin on the sealed ADR 503 binary (`e42ab05e`, batched-prefetch insert). No decision
 here; refreshes the board so the next target is chosen on corrected numbers. Live run, DuckDB pinned
-single-thread (`duckdb_threads:"1"` verified in the rows — the ADR 501 provenance rail). Coordinate:
+to one thread (`duckdb_threads:"1"` verified in the rows — the ADR 501 provenance rail). Coordinate:
 strict, sf=8, persisted parquet, 8,192 batch, 2 GiB task / 2 GiB spill, 1 warmup + 5 measured. Polars
 omitted (needs the feature build; it is the floor only on m05, already resolved). Artifacts:
 `target/tpch/adr503_ladder_repin/`.

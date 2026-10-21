@@ -23,7 +23,7 @@ sf=8 (lineitem 47,989,007 rows / 6,817,318,944 logical bytes), strict, persisted
 Parquet, `memory_per_task` 64 MiB explicit, spill reserve 2 GiB explicit, 5 timed
 runs + 1 warmup. **All reference engines pinned to one thread**
 (`TORON_TPCH_DUCKDB_THREADS=1`, `POLARS_MAX_THREADS=1`); Toron measured at 100% CPU
-(single-threaded) on a 24-core box. DuckDB v1.5.4. Output row counts agree across
+(one thread) on a 24-core box. DuckDB v1.5.4. Output row counts agree across
 all three engines on every primitive.
 
 ## The ladder
@@ -58,7 +58,7 @@ real floor** — it must touch a column.
 - **Joins are ~19× off** (m06) — the single largest absolute gap: 23.3 s versus
   1.25 s for one equi-join.
 - Toron used one core throughout while the box has 24; the reference numbers are
-  also single-threaded, so **the ratios above are per-core and parallelism is a
+  also ran on one thread, so **the ratios above are per-core and parallelism is a
   separate, unexploited multiplier on top**.
 
 ## Consequence for the arc
