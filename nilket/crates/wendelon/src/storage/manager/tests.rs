@@ -15559,23 +15559,26 @@ async fn open_policed_manager(
 	io: crate::storage::io_uring::IoRingHandle,
 ) -> Arc<SlabManager> {
 	Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir,
-			// Every append rotates, so five appends are five L0 runs.
-			max_slab_bytes: 1,
-			io,
-			l2: None,
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
+		SlabManager::open_with_maintenance_metrics(
+			SlabManagerConfig {
+				dir,
+				// Every append rotates, so five appends are five L0 runs.
+				max_slab_bytes: 1,
+				io,
+				l2: None,
+				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
+				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			},
+			crate::metrics::isolated_for_test(),
+		)
 		.await
 		.unwrap(),
 	)
@@ -15600,7 +15603,7 @@ async fn a_compaction_tick_is_policed_and_its_success_is_recorded() {
 	assert!(policy.is_enabled(), "{:?}", policy.diagnostic());
 	l0_pressure(&manager).await;
 	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
-	let metrics = crate::metrics::global();
+	let metrics = policy.metrics_for_test();
 	let ok_before = metrics
 		.maintenance_attempts(crate::storage::maintenance_policy::MaintenanceAttemptResult::Ok);
 

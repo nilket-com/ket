@@ -5543,8 +5543,12 @@ mod tests {
 		.unwrap();
 		let mut receipts = BTreeMap::new();
 		receipts.insert(key, receipt);
-		let policy =
-			MaintenancePolicyInner::enabled(store, receipts, Arc::new(SystemMaintenanceClock));
+		let policy = MaintenancePolicyInner::enabled(
+			store,
+			receipts,
+			Arc::new(SystemMaintenanceClock),
+			crate::metrics::isolated_for_test(),
+		);
 		let fingerprint = policy
 			.quarantine_fingerprint_for_test(MaintenanceOperation::LsmCompaction, &slabs)
 			.unwrap();
@@ -5898,8 +5902,12 @@ mod tests {
 				receipt.clone(),
 			);
 		}
-		let policy =
-			MaintenancePolicyInner::enabled(store, receipts, Arc::new(SystemMaintenanceClock));
+		let policy = MaintenancePolicyInner::enabled(
+			store,
+			receipts,
+			Arc::new(SystemMaintenanceClock),
+			crate::metrics::isolated_for_test(),
+		);
 		let page = policy
 			.report_page(
 				None,

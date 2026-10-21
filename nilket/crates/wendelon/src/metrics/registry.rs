@@ -70,6 +70,14 @@ pub fn global() -> &'static MetricsRegistry {
 	METRICS.get_or_init(MetricsRegistry::default)
 }
 
+/// A fresh registry for one test, leaked so components that hold
+/// `&'static MetricsRegistry` can report to it. A test asserting a counter delta
+/// on `global()` races every concurrent test that touches the same counter.
+#[cfg(test)]
+pub fn isolated_for_test() -> &'static MetricsRegistry {
+	Box::leak(Box::new(MetricsRegistry::default()))
+}
+
 #[derive(Default)]
 pub struct Counter(AtomicU64);
 

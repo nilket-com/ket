@@ -1373,6 +1373,25 @@ impl SlabManager {
 		Self::open_shared(
 			config,
 			None,
+			crate::metrics::global(),
+			#[cfg(feature = "test-support")]
+			None,
+		)
+		.await
+	}
+
+	/// Open with the maintenance policy reporting to `maintenance_metrics`, so a
+	/// test can assert exact attempt counts and gauges without racing every
+	/// other concurrently running test on the process registry.
+	#[cfg(test)]
+	pub(crate) async fn open_with_maintenance_metrics(
+		config: SlabManagerConfig,
+		maintenance_metrics: &'static crate::metrics::MetricsRegistry,
+	) -> std::io::Result<Self> {
+		Self::open_shared(
+			config,
+			None,
+			maintenance_metrics,
 			#[cfg(feature = "test-support")]
 			None,
 		)
@@ -1388,6 +1407,7 @@ impl SlabManager {
 		Self::open_shared(
 			config,
 			Some(owner),
+			crate::metrics::global(),
 			#[cfg(feature = "test-support")]
 			None,
 		)
@@ -1400,7 +1420,13 @@ impl SlabManager {
 		file_ops: Arc<dyn AsyncFileOps>,
 		owner: DataDirectoryOwner,
 	) -> std::io::Result<Self> {
-		Self::open_shared(config, Some(owner), Some(file_ops)).await
+		Self::open_shared(
+			config,
+			Some(owner),
+			crate::metrics::global(),
+			Some(file_ops),
+		)
+		.await
 	}
 
 	/// Open with caller-supplied file operations for deterministic acceptance fixtures.
@@ -1409,7 +1435,7 @@ impl SlabManager {
 		config: SlabManagerConfig,
 		file_ops: Arc<dyn AsyncFileOps>,
 	) -> std::io::Result<Self> {
-		Self::open_shared(config, None, Some(file_ops)).await
+		Self::open_shared(config, None, crate::metrics::global(), Some(file_ops)).await
 	}
 
 	/// Test / diagnostic accessor: current active slab id.
