@@ -806,28 +806,46 @@ fn denied_eighteen_and_nineteen_codec() {
 }
 
 #[test]
-fn legacy_ungoverned_reserve_is_unchanged() {
-	// Every committed root golden is ungoverned and has no requirement.
+fn s1_root_goldens_are_governed() {
+	// Every committed root golden is a profile-3 twin: governed (control length 241). The six
+	// parent-lineage roots hold the admitting permission at 4, so their stored parents and a new
+	// claim are admitted; the three roots without a lineage refuse a Reserve at "no lineage".
 	let goldens: serde_json::Value = serde_json::from_str(include_str!("goldens.json")).unwrap();
+	let (mut lineage, mut bare) = (0, 0);
 	for item in goldens["fixtures"].as_array().unwrap() {
 		let name = item["name"].as_str().unwrap();
 		if !name.starts_with("root_") {
 			continue;
 		}
 		let r = root(name);
-		assert_ne!(r.state.control_len, 137, "{name}");
+		assert_eq!(r.state.control_len, 241, "{name}");
 		for p in r.state.parents.values() {
 			assert_eq!(
 				admission_permission(&r.state, &p.claim, p.reservation.index).unwrap(),
-				None
+				None,
+				"{name}"
 			);
 		}
-		assert_eq!(
-			admission_permission(&r.state, &claim(), r.covered().index + 1).unwrap(),
-			None
-		);
+		if r.state.lineages.values().next().is_none() {
+			let c = Command2::Reserve(claim());
+			let (g, cl) = (r.state.generation, r.state.cluster);
+			let e = TrustedEntry2::fixture(g, cl, l(r.covered().index + 1), &c).unwrap();
+			let v = VerifiedCommand2::fixture(g, cl, &c, &[original()], 1).unwrap();
+			let (n, o) = Root2::reduce(Some(&r), &e, &v, &c).unwrap();
+			assert_eq!(o, denied(9, None), "{name}");
+			assert_eq!(n.state.parents.len(), 0, "{name}");
+			bare += 1;
+		} else {
+			assert_eq!(
+				admission_permission(&r.state, &claim(), r.covered().index + 1).unwrap(),
+				None,
+				"{name}"
+			);
+			lineage += 1;
+		}
 	}
-	// A genuinely new Reserve on an ungoverned root takes the whole Reserve path, permission step
+	assert_eq!((lineage, bare), (6, 3));
+	// A genuinely new Reserve on a governed root takes the whole Reserve path, permission step
 	// included, and still byte-matches the frozen oracle (through `next`).
 	let r = root("root_reserved");
 	let mut c = claim();
@@ -835,8 +853,8 @@ fn legacy_ungoverned_reserve_is_unchanged() {
 	let (n, o) = next(&r, &Command2::Reserve(c), &[], 1);
 	assert!(
 		matches!(o, ApplyResult2::Parent { .. }),
-		"reserved without any permission"
+		"reserved under the admitting permission"
 	);
 	assert_eq!(n.state.parents.len(), 2);
-	assert_eq!(n.state.permissions.len(), 0);
+	assert_eq!(n.state.permissions.len(), 1);
 }

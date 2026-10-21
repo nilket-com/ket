@@ -80,7 +80,8 @@ fn independent_wrapper_goldens_round_trip_and_constructed_states_match() {
 		assert_eq!(u.tag_for_test(), tag, "{name}");
 		assert_eq!(u.encode().unwrap(), b, "{name}");
 	}
-	// The nested root is the unchanged committed golden; its scalars feed the origin check.
+	// The nested root is the committed golden (its profile-3 twin); its scalars feed the origin
+	// check, and the p3_ wrapper holds exactly it.
 	let v = vectors();
 	let root = fixture("root_bootstrap_only");
 	let (bootstrap, covered, fp, command) = UnverifiedRoot2::decode(&root)
@@ -92,8 +93,18 @@ fn independent_wrapper_goldens_round_trip_and_constructed_states_match() {
 		v["root_bootstrap"]["index"].as_u64().unwrap()
 	);
 	let hex = |d: &[u8]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
-	assert_eq!(hex(&fp), v["root_fingerprint"].as_str().unwrap());
-	assert_eq!(hex(&command), v["root_command"].as_str().unwrap());
+	assert_eq!(hex(&fp), v["p3_root_fingerprint"].as_str().unwrap());
+	assert_eq!(hex(&command), v["p3_root_command"].as_str().unwrap());
+	let wrapper = bytes("p3_root");
+	let u = UnverifiedAuthority2::decode(&wrapper).unwrap();
+	assert_eq!(u.tag_for_test(), 2);
+	assert_eq!(u.encode().unwrap(), wrapper);
+	let n = v["p3_nested_root_len"].as_u64().unwrap() as usize;
+	assert_eq!(n, root.len());
+	assert_eq!(
+		wrapper[wrapper.len() - 32 - n..wrapper.len() - 32],
+		root[..]
+	);
 }
 #[test]
 fn pre_root_table_rows() {

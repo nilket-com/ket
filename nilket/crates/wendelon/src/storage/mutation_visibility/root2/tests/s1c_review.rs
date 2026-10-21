@@ -12,7 +12,7 @@ fn grant(g: &OriginalGrant2) -> Command2 {
 fn compare_decode(bytes: &[u8], expected: RootError2) {
 	assert_eq!(UnverifiedRoot2::decode(bytes).err(), Some(expected));
 	assert_eq!(
-		s1c_oracle::state::UnverifiedRoot2::decode(&s1c_oracle::legacy_profile2(bytes).unwrap())
+		s1c_oracle::state::UnverifiedRoot2::decode(&s1c_oracle::s1c_projection(bytes).unwrap())
 			.err(),
 		Some(expected)
 	);
@@ -117,6 +117,16 @@ fn s1c_reserve_original_before_bootstrap_matches_legacy_invariant_error() {
 	}
 	for key in r.state.lineages.iter().map(|(k, _)| *k).collect::<Vec<_>>() {
 		r.state.lineages.get_mut(&key).unwrap().latest.log.index += 100;
+	}
+	// The twin's admitting permission moves with the other coordinates.
+	for key in r
+		.state
+		.permissions
+		.iter()
+		.map(|(k, _)| *k)
+		.collect::<Vec<_>>()
+	{
+		r.state.permissions.get_mut(&key).unwrap().enrolled.index += 100;
 	}
 	r.state.derived =
 		crate::storage::mutation_visibility::root2::incremental::Derived2::build(&r.state).unwrap();
@@ -247,7 +257,7 @@ fn s1c_lookup_at_and_epoch_at_agree_with_legacy_at_every_boundary() {
 	)
 	.0;
 	let old =
-		s1c_oracle::install(&s1c_oracle::legacy_profile2(&r.encode().unwrap()).unwrap()).unwrap();
+		s1c_oracle::install(&s1c_oracle::s1c_projection(&r.encode().unwrap()).unwrap()).unwrap();
 	for i in 0..=r.covered().index + 1 {
 		for generation in [r.state.generation, [77; 16]] {
 			let v = TrustedView2::fixture(generation, r.state.cluster, r.state.bootstrap, i);

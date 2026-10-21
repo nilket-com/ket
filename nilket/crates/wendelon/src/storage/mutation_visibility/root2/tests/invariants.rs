@@ -21,6 +21,22 @@ fn s1_generation_tenant_schema_caller_identity_and_selector_are_bound() {
 			assert!(c.encode().is_err())
 		} else if dimension == 2 {
 			let id = c.manifest.identity;
+			// The twin admits only its Raw namespace; this claim's Table namespace gets its own
+			// permission, enrolled at a coordinate taken by a Cover first (O-1 ruling, b3).
+			let (mut r, _) = next(&r, &command("command_cover_blank"), &[], 1);
+			let mut permission = r.state.permissions.values().next().unwrap().clone();
+			permission.key.namespace.scope = id.scope;
+			permission.key.namespace.table = id.table;
+			permission.key.namespace.schema = id.schema_generation;
+			permission.enrolled = r.covered();
+			r.state.permissions.insert(
+				crate::storage::mutation_visibility::root2::admission_registry::encode_permission_key2(
+					&permission.key,
+				)
+				.unwrap(),
+				permission,
+			);
+			assert_eq!(r.state.permissions.len(), 2);
 			let (n, o) = next(&r, &Command2::Reserve(c), &[original()], 1);
 			assert!(matches!(o, ApplyResult2::Parent { .. }));
 			assert!(n.lookup(&id).unwrap().is_some());
@@ -90,17 +106,20 @@ fn s1_zero_or_overflow_limits_do_not_admit_new_parent_and_release_needs_no_capac
 		claim().manifest.identity.encode().unwrap(),
 		ParentRecord2 {
 			claim: claim(),
-			reservation: l(6),
+			reservation: l(7),
 			held_bytes: u64::MAX,
 			terminal: None,
 		},
 	);
-	assert!(capacity(&corrupt, Limits2::default()).is_err());
+	assert_eq!(
+		capacity(&corrupt, Limits2::default()).err(),
+		Some(RootError2::Limit)
+	);
 }
 #[test]
 fn s1_resolver_requires_actual_earliest_closure_and_keeps_reserved_without_one() {
 	let r = root("root_reserved");
-	let (_, o) = next(&r, &closure(&r, 1, l(4)), &[], 1);
+	let (_, o) = next(&r, &closure(&r, 1, l(5)), &[], 1);
 	assert_denied(&o, 14);
 	let (r, _) = next(&r, &command("command_release_grant"), &[], 1);
 	let (_, o) = next(&r, &closure(&r, 1, r.covered()), &[], 1);
@@ -165,6 +184,10 @@ fn s1_restoration_refuses_missing_selector_lineage_and_grant_as_non_grant_entry(
 				std::sync::Arc::make_mut(&mut p.claim).original.log = l(3);
 			}
 		}
-		assert!(validate_state(&s).is_err());
+		assert_eq!(
+			validate_state(&s).err(),
+			Some(RootError2::RootInvariant),
+			"{k}"
+		);
 	}
 }

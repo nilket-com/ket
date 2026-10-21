@@ -128,13 +128,19 @@ fn s1_d4_release_closure_cannot_collide_with_reservation_or_follow_its_epoch_cut
 	let (released, _) = next(&r, &command("command_release_grant"), &[], 1);
 	let old = released.state.lineages.values().next().unwrap().clone();
 	let mut bad = old.clone();
-	bad.closure.as_mut().unwrap().log = l(5);
-	assert!(UnverifiedRoot2::decode(&replace_lineage(&released, &old, &bad)).is_err());
+	bad.closure.as_mut().unwrap().log = l(6);
+	assert_eq!(
+		UnverifiedRoot2::decode(&replace_lineage(&released, &old, &bad)).err(),
+		Some(RootError2::RootInvariant)
+	);
 	let (cut, _) = next(&released, &command("command_advance_epoch"), &[], 1);
 	let (after, _) = next(&cut, &command("command_cover_blank"), &[], 1);
 	let mut bad = old.clone();
 	bad.closure.as_mut().unwrap().log = after.covered();
-	assert!(UnverifiedRoot2::decode(&replace_lineage(&after, &old, &bad)).is_err());
+	assert_eq!(
+		UnverifiedRoot2::decode(&replace_lineage(&after, &old, &bad)).err(),
+		Some(RootError2::RootInvariant)
+	);
 	assert!(UnverifiedRoot2::decode(&after.encode().unwrap()).is_ok());
 }
 #[test]
@@ -151,7 +157,10 @@ fn s1_d4_supersession_coordinate_is_unique_except_its_exact_successor_grant() {
 		.clone();
 	let mut bad = old.clone();
 	bad.closure.as_mut().unwrap().log.term += 1;
-	assert!(UnverifiedRoot2::decode(&replace_lineage(&r, &old, &bad)).is_err());
+	assert_eq!(
+		UnverifiedRoot2::decode(&replace_lineage(&r, &old, &bad)).err(),
+		Some(RootError2::RootInvariant)
+	);
 	let mut grant = r
 		.state
 		.lineages
@@ -164,8 +173,11 @@ fn s1_d4_supersession_coordinate_is_unique_except_its_exact_successor_grant() {
 	let (renewed, _) = next(&r, &grant_of(&grant), &[], 1);
 	assert!(UnverifiedRoot2::decode(&renewed.encode().unwrap()).is_ok());
 	let mut bad = old.clone();
-	bad.closure.as_mut().unwrap().log = l(5);
-	assert!(UnverifiedRoot2::decode(&replace_lineage(&renewed, &old, &bad)).is_err());
+	bad.closure.as_mut().unwrap().log = l(6);
+	assert_eq!(
+		UnverifiedRoot2::decode(&replace_lineage(&renewed, &old, &bad)).err(),
+		Some(RootError2::RootInvariant)
+	);
 }
 #[test]
 fn s1_d5_missing_or_extra_attestation_children_are_rejected_not_pending() {
